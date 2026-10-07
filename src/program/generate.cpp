@@ -64,8 +64,18 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#include <io.h>
+#else
 #include <unistd.h>
 #include <sys/resource.h>
+#endif
 #include <cerrno>
 
 #include "strata/core/gpu.hpp"
@@ -747,10 +757,21 @@ struct GpuStage {
 
 // ---- issue #31: what the watchdog prints before it stops a stalled engine
 struct MemSample {
-    unsigned long long faults = 0, rss_mib = 0, avail_mib = 0, commit_mib = 0;
+    unsigned long long faults = 0, rss_mib = 0, avail_mib = 0, commit_mib = 0;   // faults: hard (Linux) / all (Windows)
 };
 MemSample mem_sample() {
     MemSample m;
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc{};
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) {
+        m.faults = pmc.PageFaultCount;
+        m.rss_mib = pmc.WorkingSetSize >> 20;
+        m.commit_mib = pmc.PagefileUsage >> 20;
+    }
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) m.avail_mib = ms.ullAvailPhys >> 20;
+#else
     if (std::FILE* f = std::fopen("/proc/self/stat", "r")) {
         char buf[4096];
         const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
@@ -774,6 +795,7 @@ MemSample mem_sample() {
     m.rss_mib = kb("/proc/self/status", "VmRSS:") >> 10;
     m.commit_mib = kb("/proc/self/status", "VmSwap:") >> 10;
     m.avail_mib = kb("/proc/meminfo", "MemAvailable:") >> 10;
+#endif
     return m;
 }
 
@@ -1012,7 +1034,11 @@ int main(int argc, char** argv) {
     // default lazy loading, a kernel first used mid-prompt (MMQ for IQ3_XXS at 64K+ on a 12 GB card) found no VRAM
     // left for its code and the engine ended ("out of memory: cudaFuncSetAttribute").  Costs ~30 MB of VRAM.
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) {
+#if defined(_WIN32)
+        _putenv_s("CUDA_MODULE_LOADING", "EAGER");
+#else
         setenv("CUDA_MODULE_LOADING", "EAGER", 0);
+#endif
     }
     Options o;
     bool have_tokens = false;
@@ -4612,7 +4638,11 @@ int main(int argc, char** argv) {
                         buf.erase(0, nlpos + 1);
                         return true;
                     }
+#if defined(_WIN32)
+                    const int n = _read(0, chunk, (unsigned) sizeof chunk);
+#else
                     const ssize_t n = ::read(0, chunk, sizeof chunk);
+#endif
                     if (n < 0 && errno == EINTR) continue;
                     if (n <= 0) {
                         if (buf.empty()) return false;
@@ -6998,7 +7028,12 @@ int main(int argc, char** argv) {
         const double pool_ms0 = drive.cpu_ms;
         // pages read back from disk or swap while decoding: the expert arena is not locked, and two runs whose
         // CPU pool was 6x slower came while tens of GB were being downloaded (bench/results/2026-09-30-xe-swift-iq2xs)
+#if defined(_WIN32)
+        // Windows counts the soft faults with the hard ones
+        const auto major_faults = [] { return (long long) mem_sample().faults; };
+#else
         const auto major_faults = [] { rusage u{}; getrusage(RUSAGE_SELF, &u); return (long long) u.ru_majflt; };
+#endif
         const long long majflt0 = major_faults();
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
         // the low-RAM mode's tiers during the decode only (the startup fill and the prompt read files too)
@@ -7159,12 +7194,17 @@ int main(int argc, char** argv) {
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6,
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6 / (double) rounds);
         if (rounds > 0) {
+#if defined(_WIN32)
+            std::printf("%-24s %lld page faults (soft and hard) while decoding; %llu MiB committed by this process\n",
+                        "host memory", major_faults() - majflt0, mem_sample().commit_mib);
+#else
             long long swap_kb = -1;
             std::ifstream st("/proc/self/status");
             for (std::string l; std::getline(st, l);)
                 if (l.rfind("VmSwap:", 0) == 0) swap_kb = std::atoll(l.c_str() + 7);
             std::printf("%-24s %lld major page faults while decoding; %lld MiB of this process in swap\n",
                         "host memory", major_faults() - majflt0, swap_kb < 0 ? -1 : swap_kb / 1024);
+#endif
         }
         if (rounds > 0)
             std::printf("%-24s gate/up %.3f  quantize %.3f  down %.3f ms/round; %.1f GB/s over the rows phases; "
