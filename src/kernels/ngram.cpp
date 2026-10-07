@@ -9,12 +9,15 @@
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/ngram/ple_reader.hpp"
+#include "strata/platform/memory.hpp"
 
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#if !defined(_WIN32)
 #include <sys/mman.h>
+#endif
 #include <vector>
 #include <stdexcept>
 
@@ -242,6 +245,31 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         impl_->n_rows = n_rows;
     }
     if (io.mode == PleIo::Mmap && io.lock && impl_->data != nullptr) {
+#if defined(_WIN32)
+        // Windows has no mlock: the platform helper raises the process's minimum working set and
+        // VirtualLocks the mapped table instead (ordinary accounts hold the privilege). A failure
+        // falls back to touching the pages, i.e. plain mmap behaviour, with a warning - same as POSIX.
+        // A table that is more than half of the RAM leaves the rest of the process little (the locked pages cannot be
+        // paged out): say so, and go on (recommend, never force).
+        MEMORYSTATUSEX ms;
+        ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms) && need > ms.ullTotalPhys / 2)
+            std::fprintf(stderr, "strata: warning: --ple-io ram locks %.1f GiB, more than half of this PC's %.1f GiB of RAM\n",
+                         (double) need / (1ull << 30), (double) ms.ullTotalPhys / (1ull << 30));
+        const strata::platform::LockResult lr =
+            strata::platform::lock_resident((void*) impl_->data, need);
+        if (lr.ok && lr.locked_bytes >= need) {
+            impl_->locked = true;
+        } else {
+            // a partial lock is not a lock: the unlocked rest would fault on the token path, so give it back
+            if (lr.locked_bytes > 0) strata::platform::unlock_resident((void*) impl_->data, lr.locked_bytes);
+            std::fprintf(stderr, "strata: PLE table lock failed (%s): touching its pages instead\n",
+                         lr.note.c_str());
+            volatile uint8_t sink = 0;
+            for (uint64_t off = 0; off < need; off += 4096) sink = sink + impl_->data[off];
+            (void) sink;
+        }
+#else
         const uint64_t page = 4096;
         const uintptr_t a0 = (uintptr_t) impl_->data & ~(uintptr_t) (page - 1);
         const uintptr_t a1 = (uintptr_t) impl_->data + (uintptr_t) need;
@@ -255,6 +283,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
             for (uintptr_t p = a0; p < a1; p += page) sink = sink + *(const volatile uint8_t*) p;
             (void) sink;
         }
+#endif
     }
     impl_->mode = io.mode;
     return true;

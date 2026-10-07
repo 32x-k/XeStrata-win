@@ -36,10 +36,18 @@
 #include <limits>
 #include <memory>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX   // windows.h's min/max macros would break std::min/std::max in every file that includes this one
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace strata {
 
@@ -368,6 +376,27 @@ public:
 
 private:
     void open() {
+#ifdef _WIN32
+        HANDLE h = CreateFileA(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open " + path_);
+        LARGE_INTEGER li{};
+        GetFileSizeEx(h, &li);
+        size_ = (uint64_t)li.QuadPart;
+        HANDLE m = CreateFileMappingA(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!m) {
+            CloseHandle(h);
+            throw std::runtime_error("CreateFileMapping failed");
+        }
+        base_ = (const uint8_t*)MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+        if (!base_) {
+            CloseHandle(m);
+            CloseHandle(h);
+            throw std::runtime_error("MapViewOfFile failed");
+        }
+        map_ = m;
+        file_ = h;
+#else
         int fd = ::open(path_.c_str(), O_RDONLY);
         if (fd < 0) throw std::runtime_error("cannot open " + path_);
         fd_ = fd;
@@ -377,11 +406,18 @@ private:
         void* p = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
         if (p == MAP_FAILED) throw std::runtime_error("mmap failed");
         base_ = (const uint8_t*)p;
+#endif
         parse();
     }
     void close() {
+#ifdef _WIN32
+        if (base_) UnmapViewOfFile(base_);
+        if (map_) CloseHandle((HANDLE)map_);
+        if (file_) CloseHandle((HANDLE)file_);
+#else
         if (base_) munmap((void*)base_, size_);
         if (fd_ >= 0) ::close(fd_);
+#endif
     }
 
     void parse() {
@@ -428,7 +464,12 @@ private:
     const uint8_t* base_ = nullptr;
     uint64_t size_ = 0, data_start_ = 0, alignment_ = 32;
     uint32_t version_ = 0;
+#ifdef _WIN32
+    void* file_ = nullptr;
+    void* map_ = nullptr;
+#else
     int fd_ = -1;
+#endif
     std::vector<TensorInfo> tensors_;
     std::map<std::string, MetaValue> meta_;
 };
