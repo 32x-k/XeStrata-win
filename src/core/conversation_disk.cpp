@@ -9,10 +9,14 @@
 #endif
 
 #include <fcntl.h>
+#include <sys/stat.h>
+#if defined(_WIN32)
+#include <io.h>
+#else
 #include <pthread.h>
 #include <sched.h>
-#include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -89,6 +93,15 @@ private:
 };
 
 #ifdef STRATA_HAVE_BLOSC2
+#if defined(_WIN32)
+// A thread Windows starts takes the process's CPU Sets, not its creator's selection (SessionLoopScratch's pin), so
+// c-blosc2's threads already have every CPU.
+struct WideAffinity {
+    WideAffinity() {}
+};
+
+int16_t blosc2_threads() { return (int16_t) std::clamp((int) std::thread::hardware_concurrency(), 1, 256); }
+#else
 // The CPUs the process may use, taken before main: the serve loop pins its own thread to one core
 // (SessionLoopScratch), and c-blosc2's threads, started from that thread, would all inherit that one core.
 struct StartAffinity {
@@ -122,6 +135,7 @@ int16_t blosc2_threads() {
     const int n = g_start_affinity.ok ? CPU_COUNT(&g_start_affinity.set) : (int) std::thread::hardware_concurrency();
     return (int16_t) std::clamp(n, 1, 256);
 }
+#endif
 
 struct Blosc2Context {
     blosc2_context* ctx = nullptr;
@@ -418,6 +432,15 @@ std::string hex(uint64_t v) {
     return s;
 }
 
+// fs::path's native string is UTF-16 on Windows, where fopen would take the ANSI code page
+std::FILE* open_read(const fs::path& path) {
+#if defined(_WIN32)
+    return ::_wfopen(path.c_str(), L"rb");
+#else
+    return std::fopen(path.c_str(), "rb");
+#endif
+}
+
 struct Found {
     fs::path path;
     fs::file_time_type time;
@@ -534,7 +557,7 @@ bool ConversationDisk::open(ConversationDiskOptions options, std::string& error)
     enabled_ = true;
     expire();
     for (const Found& found : scan(options_.dir)) {
-        std::FILE* f = std::fopen(found.path.c_str(), "rb");
+        std::FILE* f = open_read(found.path);
         if (f == nullptr) continue;
         Header h;
         const bool ok = read_header(f, h);
@@ -599,7 +622,7 @@ bool ConversationDisk::load(size_t index, SavedConversation& image, std::string&
         remove_file(path);
         return false;
     };
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    std::FILE* f = open_read(path);
     if (f == nullptr) return reject("cannot open");
     struct Close { std::FILE* f; ~Close() { std::fclose(f); } } close{f};
     Header h;
@@ -712,10 +735,18 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
     name.update(&cvec, 1);
     const fs::path path = options_.dir / (hex(name.digest()) + kExtension);
     const fs::path tmp = path.string() + ".tmp";
+#if defined(_WIN32)
+    const int fd = ::_wopen(tmp.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY | _O_NOINHERIT,
+                            _S_IREAD | _S_IWRITE);
+    std::FILE* f = fd < 0 ? nullptr : ::_fdopen(fd, "wb");
+    if (f == nullptr) {
+        if (fd >= 0) ::_close(fd);
+#else
     const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     std::FILE* f = fd < 0 ? nullptr : ::fdopen(fd, "wb");
     if (f == nullptr) {
         if (fd >= 0) ::close(fd);
+#endif
         error = "cannot create " + tmp.string();
         return false;
     }
@@ -757,7 +788,11 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
         w.part(kv.k, kv_type); w.part(kv.v, kv_type); w.part(kv.k_scale); w.part(kv.v_scale);
         w.part(kv.pooled, sizeof(float));
     }
+#if defined(_WIN32)
+    const long long end = ::_ftelli64(f);   // the file's length: the body ends it (ftell's long is 32 bits here)
+#else
     const long end = std::ftell(f);   // the file's length: the body ends it
+#endif
     bool ok = w.ok && end > 0;
     if (ok) {
         h.body_hash = w.hash.digest();
@@ -765,7 +800,11 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
         ok = header.size() == length && std::fseek(f, 0, SEEK_SET) == 0 && prefix();
     }
     ok = std::fflush(f) == 0 && ok;
+#if defined(_WIN32)
+    ok = ::_commit(::_fileno(f)) == 0 && ok;
+#else
     ok = ::fsync(::fileno(f)) == 0 && ok;
+#endif
     ok = std::fclose(f) == 0 && ok;
     std::error_code ec;
     if (ok) fs::rename(tmp, path, ec);
