@@ -10,7 +10,11 @@
 #include "strata/kernels/cpu/expert.hpp"
 
 #include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
 #include <cpuid.h>
+#endif
 
 #include <cmath>
 #include <atomic>
@@ -352,11 +356,17 @@ const char* CpuFeatures::reason() const {
 CpuFeatures cpu_features() {
     CpuFeatures f;
     int reg[4] = {0, 0, 0, 0};
+#if defined(_MSC_VER)
+    __cpuid(reg, 0);
+    if (reg[0] < 7) return f;
+    __cpuidex(reg, 7, 0);
+#else
     unsigned r[4] = {0, 0, 0, 0};
     __cpuid_count(0, 0, r[0], r[1], r[2], r[3]);
     if (r[0] < 7) return f;
     __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
     for (int i = 0; i < 4; ++i) reg[i] = (int) r[i];
+#endif
     const unsigned ebx = (unsigned) reg[1], ecx = (unsigned) reg[2];
     f.avx512f = (ebx >> 16) & 1u;
     f.avx512bw = (ebx >> 30) & 1u;

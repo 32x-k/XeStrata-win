@@ -8,7 +8,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
 #include <cpuid.h>
+#endif
 #include <fstream>
 #include <sstream>
 
@@ -24,15 +28,25 @@ bool cpu_avx512_ok() {
         if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
         unsigned r[4] = {0, 0, 0, 0};
         auto cpuid = [&](unsigned leaf, unsigned sub) {
+#if defined(_MSC_VER)
+            int x[4];
+            __cpuidex(x, (int) leaf, (int) sub);
+            for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
+#else
             __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
+#endif
         };
         cpuid(0, 0);
         if (r[0] < 7) return false;
         cpuid(1, 0);
         if (!((r[2] >> 27) & 1u)) return false;             // OSXSAVE
+#if defined(_MSC_VER)
+        const unsigned long long xcr0 = _xgetbv(0);
+#else
         unsigned lo = 0, hi = 0;
         __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
         const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
+#endif
         if ((xcr0 & 0xE6) != 0xE6) return false;          // the OS saves the AVX-512 state
         cpuid(7, 0);
         const unsigned ebx = r[1], ecx = r[2];
@@ -79,11 +93,20 @@ bool cpu_avxvnni_ok() {
         if (const char* e = std::getenv("STRATA_NO_AVXVNNI"); e != nullptr && e[0] == '1') return false;
         if (!cpu_avx2_ok()) return false;
         unsigned a = 0, b = 0, c = 0, d = 0;
-        __cpuid_count(0, 0, a, b, c, d);
+        auto cpuid = [&](unsigned leaf, unsigned sub) {
+#if defined(_MSC_VER)
+            int x[4];
+            __cpuidex(x, (int) leaf, (int) sub);
+            a = (unsigned) x[0], b = (unsigned) x[1], c = (unsigned) x[2], d = (unsigned) x[3];
+#else
+            __cpuid_count(leaf, sub, a, b, c, d);
+#endif
+        };
+        cpuid(0, 0);
         if (a < 7) return false;
-        __cpuid_count(7, 0, a, b, c, d);
+        cpuid(7, 0);
         if (a < 1) return false;                           // no sub-leaf 1
-        __cpuid_count(7, 1, a, b, c, d);
+        cpuid(7, 1);
         return ((a >> 4) & 1u) != 0;                       // AVX-VNNI
     }();
     return ok;
