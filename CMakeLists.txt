@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 cmake_minimum_required(VERSION 3.24)
 project(XeStrata VERSION 0.1.39 LANGUAGES CXX)
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  message(FATAL_ERROR "Strata supports Linux only")
+if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
+  message(FATAL_ERROR "XeStrata builds for Linux and Windows")
 endif()
 set(STRATA_UPSTREAM_VERSION "0.1.39")
 set(STRATA_UPSTREAM_COMMIT "6f32ec0")
@@ -90,6 +90,10 @@ endif()
 # arithmetic as upstream; a kernel may opt into faster math only with a measured reason.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-ffp-model=precise>)
+endif()
+# Windows' C runtime marks standard C functions (getenv, fopen, sscanf) deprecated in favour of its own _s versions
+if(WIN32)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
 
 option(STRATA_ENABLE_XE "Build the Intel Xe runtime and migrated kernels" ON)
