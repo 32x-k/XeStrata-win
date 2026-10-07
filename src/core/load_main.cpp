@@ -14,11 +14,24 @@
 #include <string>
 #include <fstream>
 #include <memory>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <sys/resource.h>
+#endif
 #include <limits>
 #include <stdexcept>
 
 static void memory_status(const char* phase) {
+#if defined(_WIN32)
+    // Windows locks pages against the working-set minimum, not a memlock limit
+    SIZE_T lo = 0, hi = 0;
+    if (GetProcessWorkingSetSize(GetCurrentProcess(), &lo, &hi))
+        std::printf("%s: working set minimum %llu B, maximum %llu B\n", phase, (unsigned long long) lo,
+                    (unsigned long long) hi);
+#else
     struct rlimit limit{};
     if (getrlimit(RLIMIT_MEMLOCK, &limit) == 0) {
         if (limit.rlim_cur == RLIM_INFINITY) std::printf("%s: memlock unlimited", phase);
@@ -32,6 +45,7 @@ static void memory_status(const char* phase) {
         if (!found) std::printf("; VmLck unavailable");
         std::printf("\n");
     }
+#endif
 }
 
 int run(int argc, char** argv) {

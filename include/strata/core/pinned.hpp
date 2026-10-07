@@ -68,6 +68,7 @@ struct PinnedArena {
     std::vector<uint8_t*> layer_base;   // host USM blocks, one per layer (empty: one mapping)
 
 private:
+    void unmap(bool file_view);   // the mapping, if any; `file_view`: it maps the shared backing file
     int shared_fd_ = -1;
     bool shared_locked_ = false;
     std::vector<uint64_t> bounds_;
