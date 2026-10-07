@@ -34,13 +34,26 @@
 #include <vector>
 
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX   // std::numeric_limits<T>::max() below
+#endif
+#include <windows.h>
+#include <io.h>
+#else
+#include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 // a 64-bit seek (as in pinned.cu): the 32-bit `fseek` wraps past 4 GiB, and the spelling differs per platform
 #ifndef STRATA_FSEEK64
+#if defined(_WIN32)
+#define STRATA_FSEEK64(f, o) _fseeki64((f), (long long) (o), SEEK_SET)
+#else
 #define STRATA_FSEEK64(f, o) fseeko((f), (off_t) (o), SEEK_SET)
+#endif
 #endif
 
 namespace strata::core {
@@ -170,6 +183,41 @@ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t
 
 namespace {
 
+// A whole file mapped read-only: the descriptor is the C runtime's on both systems, the view MapViewOfFile's on
+// Windows and mmap's elsewhere.
+#if defined(_WIN32)
+int open_read_only(const std::string& path) { return ::_open(path.c_str(), _O_RDONLY | _O_BINARY | _O_NOINHERIT); }
+bool file_bytes(int fd, uint64_t& bytes) {
+    struct _stat64 st{};
+    if (::_fstat64(fd, &st) != 0 || st.st_size < 0) return false;
+    bytes = (uint64_t) st.st_size;
+    return true;
+}
+const uint8_t* map_read_only(int fd, uint64_t bytes) {
+    HANDLE mapping = CreateFileMappingW((HANDLE) ::_get_osfhandle(fd), nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (mapping == nullptr) return nullptr;
+    void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, (SIZE_T) bytes);
+    CloseHandle(mapping);   // the view keeps the mapping
+    return (const uint8_t*) view;
+}
+void unmap_read_only(const uint8_t* view, uint64_t) { UnmapViewOfFile(view); }
+void close_file(int fd) { ::_close(fd); }
+#else
+int open_read_only(const std::string& path) { return ::open(path.c_str(), O_RDONLY); }
+bool file_bytes(int fd, uint64_t& bytes) {
+    struct stat st{};
+    if (fstat(fd, &st) != 0 || st.st_size < 0) return false;
+    bytes = (uint64_t) st.st_size;
+    return true;
+}
+const uint8_t* map_read_only(int fd, uint64_t bytes) {
+    void* view = mmap(nullptr, (size_t) bytes, PROT_READ, MAP_SHARED, fd, 0);
+    return view == MAP_FAILED ? nullptr : (const uint8_t*) view;
+}
+void unmap_read_only(const uint8_t* view, uint64_t bytes) { munmap((void*) view, (size_t) bytes); }
+void close_file(int fd) { ::close(fd); }
+#endif
+
 #if defined(__linux__)
 bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current,
                              detail::CgroupMemoryStat& stat) {
@@ -214,6 +262,14 @@ namespace detail {
 bool host_available_memory(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
                            const std::string& cgroup_root) {
     m = HostMemory{};
+#if defined(_WIN32)
+    (void) meminfo; (void) self_cgroup; (void) cgroup_root;
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (!GlobalMemoryStatusEx(&status)) return false;
+    m.available = (uint64_t) status.ullAvailPhys;
+    return m.available > 0;
+#else
     // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
     std::ifstream info(meminfo);
     std::string line;
@@ -290,6 +346,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     }
     m.available = bytes;
     return true;
+#endif
 }
 
 }  // namespace detail
@@ -392,25 +449,24 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         return true;
     }
 
-    const int fd = ::open(path.c_str(), O_RDONLY);
+    const int fd = open_read_only(path);
     if (fd < 0) { err = "FileExpertSource: cannot open " + path; return false; }
-    struct stat st{};
-    if (fstat(fd, &st) != 0) { ::close(fd); err = "FileExpertSource: cannot stat " + path; return false; }
-    if (st.st_size < 0 || (uint64_t) st.st_size != want) {
+    uint64_t have = 0;
+    if (!file_bytes(fd, have)) { close_file(fd); err = "FileExpertSource: cannot stat " + path; return false; }
+    if (have != want) {
         char buf[400];
         std::snprintf(buf, sizeof buf,
                       "FileExpertSource: %s is %llu B but the loaded expert layout requires %llu B - this is not "
                       "the pack this geometry came from",
-                      path.c_str(), (unsigned long long) (st.st_size < 0 ? 0 : st.st_size),
-                      (unsigned long long) want);
-        ::close(fd);
+                      path.c_str(), (unsigned long long) have, (unsigned long long) want);
+        close_file(fd);
         err = buf;
         return false;
     }
-    void* view = mmap(nullptr, (size_t) want, PROT_READ, MAP_SHARED, fd, 0);
-    if (view == MAP_FAILED) { ::close(fd); err = "FileExpertSource: mmap failed on " + path; return false; }
+    const uint8_t* view = map_read_only(fd, want);
+    if (view == nullptr) { close_file(fd); err = "FileExpertSource: mmap failed on " + path; return false; }
     fd_ = fd;
-    base_ = (const uint8_t*) view;
+    base_ = view;
     blobs_ = (int64_t) blob_count;
     n_layers_ = n_layers;
     n_expert_ = n_expert;
@@ -457,8 +513,8 @@ void FileExpertSource::close() {
     complement_lent_slots_ = 0;
     if (!maps_.empty()) {
         for (Map& m : maps_) {
-            if (m.base != nullptr) munmap((void*) m.base, (size_t) m.bytes);
-            if (m.fd >= 0) ::close(m.fd);
+            if (m.base != nullptr) unmap_read_only(m.base, m.bytes);
+            if (m.fd >= 0) close_file(m.fd);
         }
         maps_.clear();
         base_ = nullptr;   // one of the views above
@@ -486,8 +542,8 @@ void FileExpertSource::close() {
     file_read_bytes_.store(0);
     file_blob_bytes_.store(0);
     file_us_.store(0);
-    if (base_ != nullptr) munmap((void*) base_, (size_t) mapped_bytes_);
-    if (fd_ >= 0) ::close(fd_);
+    if (base_ != nullptr) unmap_read_only(base_, mapped_bytes_);
+    if (fd_ >= 0) close_file(fd_);
     fd_ = -1;
     base_ = nullptr;
     blobs_ = 0;
@@ -533,18 +589,18 @@ bool FileExpertSource::open_gguf(std::string& err) {
             auto it = index.find(path);
             if (it == index.end()) {
                 Map m;
-                const int fd = ::open(path.c_str(), O_RDONLY);
-                struct stat st{};
-                if (fd < 0 || fstat(fd, &st) != 0 || st.st_size <= 0) {
-                    if (fd >= 0) ::close(fd);
+                const int fd = open_read_only(path);
+                uint64_t size = 0;
+                if (fd < 0 || !file_bytes(fd, size) || size == 0) {
+                    if (fd >= 0) close_file(fd);
                     err = "FileExpertSource: cannot open " + path;
                     return false;
                 }
-                void* view = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-                if (view == MAP_FAILED) { ::close(fd); err = "FileExpertSource: cannot map " + path; return false; }
+                const uint8_t* view = map_read_only(fd, size);
+                if (view == nullptr) { close_file(fd); err = "FileExpertSource: cannot map " + path; return false; }
                 m.fd = fd;
-                m.bytes = (uint64_t) st.st_size;
-                m.base = (const uint8_t*) view;
+                m.bytes = size;
+                m.base = view;
                 maps_.push_back(m);
                 paths_.push_back(path);
                 it = index.emplace(path, maps_.size() - 1).first;
@@ -1024,12 +1080,14 @@ bool FileExpertSource::pin_cache_complement(
     }
 
     // Copied layer by layer on a few threads: the page faults of the mapped file are the cost, and they overlap.
+#if !defined(_WIN32)
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
         err = "FileExpertSource: cannot determine page size for mapped-page release";
         release();
         return false;
     }
+#endif
     std::atomic<int64_t> next_layer{0}, layers_done{0};
     std::atomic<uint64_t> copied{0};
     std::atomic<bool> failed{false};
@@ -1082,6 +1140,8 @@ bool FileExpertSource::pin_cache_complement(
                 fail("FileExpertSource: an expert could not be read while building the cache complement");
                 return;
             }
+#if !defined(_WIN32)
+            // a copied layer's pages handed back; Windows leaves them to its memory manager, as upstream does
             if (role_ptr_.empty()) {   // experts.bin; the GGUF in place leaves its pages to the OS
             const uint64_t layer_offset = layer_offsets_[(size_t) layer];
             const uint64_t layer_bytes = blob_bytes * (uint64_t) n_expert_;
@@ -1101,6 +1161,7 @@ bool FileExpertSource::pin_cache_complement(
                 return;
             }
             }
+#endif
             const int64_t done = layers_done.fetch_add(1) + 1;
             if (done % 8 == 0 || done == n_layers_)
                 std::fprintf(stderr, "FileExpertSource: copied cache complement through layer %lld/%lld (%.2f GiB)\n",
