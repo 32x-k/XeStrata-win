@@ -554,7 +554,7 @@ void SessionLoopScratch::free() {
     if (pinned) {
         strata::kernels::cpu::restore_thread_affinity(pinned_core);
         pinned = false;
-        pinned_core = -1;
+        pinned_core = {};
     }
     if (probe != nullptr) { strata::gpu::event_destroy(probe); probe = nullptr; }
     if (y_miss != nullptr) { strata::gpu::free(y_miss); y_miss = nullptr; }

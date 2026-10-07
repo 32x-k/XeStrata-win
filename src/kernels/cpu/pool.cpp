@@ -14,8 +14,14 @@
 #include <cstdio>
 #include <cstdlib>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <pthread.h>
 #include <sched.h>
+#endif
 
 namespace strata::kernels::cpu {
 
@@ -27,6 +33,33 @@ constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
 
 std::vector<int> physical_cores(bool skip_first) {
     std::vector<int> cores;
+#if defined(_WIN32)
+    // One logical processor per core from the OS, numbered group * 64 + the processor's bit in its group.  Without
+    // the core list (an old Windows) every active processor counts, group by group.
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    std::vector<char> buf(len);
+    auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data());
+    if (len != 0 && GetLogicalProcessorInformationEx(RelationProcessorCore, info, &len)) {
+        for (const char* p = buf.data(); p < buf.data() + len;) {
+            const auto* e = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(p);
+            if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount > 0) {
+                const GROUP_AFFINITY& g = e->Processor.GroupMask[0];
+                for (int bit = 0; bit < 64; ++bit)
+                    if (g.Mask & (KAFFINITY(1) << bit)) {
+                        cores.push_back((int) g.Group * 64 + bit);
+                        break;
+                    }
+            }
+            p += e->Size;
+        }
+    } else {
+        for (WORD group = 0; group < GetActiveProcessorGroupCount(); ++group) {
+            const DWORD count = GetActiveProcessorCount(group);
+            for (DWORD i = 0; i < count && i < 64; ++i) cores.push_back((int) group * 64 + (int) i);
+        }
+    }
+#else
     // The logical CPUs this process may run on, ONE PER PHYSICAL CORE (issue #40): SMT siblings share a core's
     // load/store bandwidth, so a worker on each would put two workers on one core. sysfs names each CPU's
     // (package, core); the first allowed CPU of each pair is kept, so a taskset
@@ -60,41 +93,101 @@ std::vector<int> physical_cores(bool skip_first) {
         }
         cores.push_back(cpu);
     }
+#endif
     if (skip_first && !cores.empty()) cores.erase(cores.begin());
     return cores;
 }
 
 namespace {
 
+#if defined(_WIN32)
+// The CPU Set of a processor numbered group * 64 + index: CPU Set IDs are opaque, so the entry is found by its group and
+// group-relative index.
+bool cpu_set_for_core(int core, ULONG& id) {
+    ULONG bytes = 0;
+    if (!GetSystemCpuSetInformation(nullptr, 0, &bytes, GetCurrentProcess(), 0) &&
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER) return false;
+    std::vector<unsigned char> buffer(bytes);
+    if (bytes && !GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()), bytes,
+                                            &bytes, GetCurrentProcess(), 0)) return false;
+    constexpr size_t header_size = offsetof(SYSTEM_CPU_SET_INFORMATION, CpuSet);
+    for (size_t offset = 0; offset + header_size <= bytes;) {
+        const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+        if (info->Size < header_size || info->Size > bytes - offset) break;
+        if (info->Type == CpuSetInformation && info->Size >= sizeof(SYSTEM_CPU_SET_INFORMATION) &&
+            info->CpuSet.Group == core / 64 && info->CpuSet.LogicalProcessorIndex == (core & 63) &&
+            (!info->CpuSet.Allocated || info->CpuSet.AllocatedToTargetProcess)) {
+            id = info->CpuSet.Id;
+            return true;
+        }
+        offset += info->Size;
+    }
+    SetLastError(ERROR_NOT_FOUND);
+    return false;
+}
+#endif
+
+// Hard affinity: a pool worker keeps it until it ends; on Linux pin_current_thread saves the mask before it.
 void pin_this_thread(int core) {
     if (core < 0) return;
+#if defined(_WIN32)
+    GROUP_AFFINITY target{};
+    target.Group = (WORD) (core / 64);
+    target.Mask = KAFFINITY(1) << (core & 63);
+    if (!SetThreadGroupAffinity(GetCurrentThread(), &target, nullptr))
+        std::fprintf(stderr, "strata cpu pool: affinity for processor %d failed: %lu; previous affinity kept\n", core,
+                     (unsigned long) GetLastError());
+#else
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(core, &set);
     pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+#endif
 }
 
 }  // namespace
 
-long long pin_current_thread(int core) {
-    if (core < 0) return -1;
+ThreadAffinity pin_current_thread(int core) {
+    if (core < 0) return {};
+    ThreadAffinity previous;
+#if defined(_WIN32)
+    ULONG count = 0, target = 0;
+    if (!GetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0, &count) && GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+        return {};
+    previous.cpu_sets.resize(count);
+    if ((count != 0 && !GetThreadSelectedCpuSets(GetCurrentThread(), previous.cpu_sets.data(), count, &count)) ||
+        !cpu_set_for_core(core, target) || !SetThreadSelectedCpuSets(GetCurrentThread(), &target, 1)) {
+        std::fprintf(stderr, "strata cpu pool: host CPU Set selection for processor %d failed: %lu; previous placement "
+                             "kept\n", core, (unsigned long) GetLastError());
+        return {};
+    }
+    previous.cpu_sets.resize(count);
+#else
     cpu_set_t prev;
     CPU_ZERO(&prev);
-    if (pthread_getaffinity_np(pthread_self(), sizeof prev, &prev) != 0) return -1;
-    unsigned long mask = 0;
+    if (pthread_getaffinity_np(pthread_self(), sizeof prev, &prev) != 0) return {};
     for (int i = 0; i < CPU_SETSIZE && i < 64; ++i)
-        if (CPU_ISSET(i, &prev)) mask |= 1ul << i;
+        if (CPU_ISSET(i, &prev)) previous.mask |= 1ul << i;
     pin_this_thread(core);
-    return (long long) mask;
+#endif
+    previous.valid = true;
+    return previous;
 }
 
-void restore_thread_affinity(long long previous) {
-    if (previous <= 0) return;
+void restore_thread_affinity(const ThreadAffinity& previous) {
+    if (!previous.valid) return;
+#if defined(_WIN32)
+    // an empty selection puts the thread back on the process defaults
+    if (!SetThreadSelectedCpuSets(GetCurrentThread(), previous.cpu_sets.empty() ? nullptr : previous.cpu_sets.data(),
+                                  (ULONG) previous.cpu_sets.size()))
+        std::fprintf(stderr, "strata cpu pool: host CPU Set restoration failed: %lu\n", (unsigned long) GetLastError());
+#else
     cpu_set_t set;
     CPU_ZERO(&set);
     for (int i = 0; i < 64; ++i)
-        if ((previous >> i) & 1) CPU_SET(i, &set);
+        if ((previous.mask >> i) & 1) CPU_SET(i, &set);
     pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+#endif
 }
 
 namespace {

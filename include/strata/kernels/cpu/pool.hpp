@@ -84,9 +84,19 @@ std::vector<int> physical_cores(bool skip_first);
 /// - exactly 5/6 of L9's 44.14 on 6 - and at **26.9 GB/s inside the host loop**, where the unpinned spinning
 /// host is free to land on a worker's core or its SMT sibling.  That 1.35x is not the kernel.
 ///
-/// Returns the PREVIOUS affinity mask, or -1 if the platform refused; pass it to `restore_thread_affinity`.
-long long pin_current_thread(int core);
-void restore_thread_affinity(long long previous);
+/// Returns the PREVIOUS affinity (`valid` false if the platform refused); pass it to `restore_thread_affinity` on the
+/// same thread.  Windows selects a CPU Set, which can be undone, rather than a hard group affinity: a caller's implicit
+/// all-group eligibility (Windows 11) cannot be put back from a group affinity.
+struct ThreadAffinity {
+#if defined(_WIN32)
+    std::vector<unsigned long> cpu_sets;   ///< the thread's selected CPU Sets; empty: the process defaults
+#else
+    unsigned long mask = 0;                ///< CPUs 0..63
+#endif
+    bool valid = false;
+};
+ThreadAffinity pin_current_thread(int core);
+void restore_thread_affinity(const ThreadAffinity& previous);
 
 class ExpertPool {
 public:
