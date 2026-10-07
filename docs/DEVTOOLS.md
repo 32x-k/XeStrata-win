@@ -16,7 +16,7 @@ The commands are for Ubuntu and Debian; the versions are those last used on the 
 | Folder (git ignores it) | What goes there |
 | --- | --- |
 | `.lint/` | lint tools that the distribution does not package |
-| `.tools/` | other tools built from source (intel/llvm, Metrics Discovery) |
+| `.tools/` | other tools built from source (intel/llvm, Metrics Discovery), and what the Windows cross build uses |
 
 ## Lints
 
@@ -124,6 +124,39 @@ sudo usermod -aG docker "$USER"       # after logging in again it runs without s
 The docker group has the same power as root.
 The containers get no GPU, so nothing extra for GPUs (such as nvidia-container-toolkit) is needed.
 A build makes intel/llvm too; for Fedora 44's free packages the container grew to 6.8 GB at most (measured every minute; the cuda variants add the CUDA toolkit). The container is removed at the end.
+
+## Windows cross build
+
+The Windows engine and tests are built on Linux, up to the link (`cmake/toolchain-windows-msvc.cmake`).
+intel/llvm's SYCL runtime takes only the MSVC ABI on Windows, so the target is `x86_64-pc-windows-msvc`.
+intel/llvm's clang++ compiles and lld-link links.
+What it builds does not run here: running it needs a Windows PC.
+
+It needs three things:
+
+- lld-link (LLVM's `lld`): `sudo apt install lld-21` (21.1)
+- the MSVC CRT and the Windows SDK: downloaded from Microsoft with [xwin](https://github.com/Jake-Shadle/xwin) (0.10.0).
+  They are not free software; Microsoft's license is accepted with `--accept-license`. They do not go into the repository.
+- intel/llvm's Windows SYCL headers and import libraries: `sycl_windows.tar.gz` of an intel/llvm nightly.
+  The release (v7.1.1) has no Windows build, so a nightly near the version in `.tools/intel-llvm` is used (nightly-2026-09-16).
+
+```sh
+mkdir -p .tools/xwin .tools/intel-llvm-win
+curl -L https://github.com/Jake-Shadle/xwin/releases/download/0.10.0/xwin-0.10.0-x86_64-unknown-linux-musl.tar.gz |
+    tar -xz -C .tools/xwin
+.tools/xwin/xwin-0.10.0-x86_64-unknown-linux-musl/xwin --accept-license --cache-dir .tools/xwin/cache --arch x86_64 \
+    splat --output .tools/xwin/sdk
+curl -L https://github.com/intel/llvm/releases/download/nightly-2026-09-16/sycl_windows.tar.gz |
+    tar -xz -C .tools/intel-llvm-win
+cmake -S . -B build/win -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-windows-msvc.cmake \
+    -DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++ -DSTRATA_LICENSE=free \
+    -DSTRATA_XWIN=$PWD/.tools/xwin/sdk -DSTRATA_SYCL_WINDOWS=$PWD/.tools/intel-llvm-win
+ninja -C build/win
+```
+
+- xwin's `cache` is not needed after the splat and may be deleted (`sdk` is 0.8 GB).
+- lld-link warns `skipping imported DllMain symbol` about `sycl9.lib`: it comes from lld reading an import library MSVC made, and does not change the link.
 
 ## Intel SDE (the AVX-512 paths)
 

@@ -16,7 +16,7 @@ XeStrata の開発で、リント、確認、測定のために入れる道具�
 | フォルダー（git が無視する） | 置くもの |
 | --- | --- |
 | `.lint/` | ディストリビューションがパッケージにしていないリントの道具 |
-| `.tools/` | ソースからビルドするそのほかの道具（intel/llvm、Metrics Discovery） |
+| `.tools/` | ソースからビルドするそのほかの道具（intel/llvm、Metrics Discovery）と、Windows 向けのクロスビルドに使うもの |
 
 ## リント
 
@@ -124,6 +124,39 @@ sudo usermod -aG docker "$USER"       # ログインし直すと sudo なしで�
 docker グループは root と同じ権限を持ちます。
 コンテナには GPU を渡さないので、GPU のための追加の道具（nvidia-container-toolkit など）は要りません。
 1 回のビルドで intel/llvm も作り、Fedora 44 の free でコンテナは最大 6.8 GB になりました（1 分ごとに測った値。cuda の版は CUDA ツールキットの分だけ増えます）。コンテナは終わると消えます。
+
+## Windows 向けのクロスビルド
+
+Windows 版のエンジンとテストを、Linux の上でリンクまでビルドします（`cmake/toolchain-windows-msvc.cmake`）。
+intel/llvm の SYCL のランタイムは Windows では MSVC の ABI だけに対応するので、ターゲットは `x86_64-pc-windows-msvc` です。
+コンパイルは intel/llvm の clang++、リンクは lld-link が行います。
+できたものはここでは動かせません。動かすには Windows の PC が要ります。
+
+要るものは次の3つです。
+
+- lld-link（LLVM の `lld`）: `sudo apt install lld-21`（21.1）
+- MSVC の CRT と Windows SDK: [xwin](https://github.com/Jake-Shadle/xwin)（0.10.0）で Microsoft から落とします。
+  自由ソフトウェアではなく、Microsoft のライセンスは `--accept-license` で受け入れます。リポジトリには入れません。
+- intel/llvm の Windows 版の SYCL のヘッダとインポートライブラリ: intel/llvm の nightly の `sycl_windows.tar.gz`。
+  リリース（v7.1.1）には Windows 版が付いていないので、`.tools/intel-llvm` の版に近い nightly を使います（nightly-2026-09-16）。
+
+```sh
+mkdir -p .tools/xwin .tools/intel-llvm-win
+curl -L https://github.com/Jake-Shadle/xwin/releases/download/0.10.0/xwin-0.10.0-x86_64-unknown-linux-musl.tar.gz |
+    tar -xz -C .tools/xwin
+.tools/xwin/xwin-0.10.0-x86_64-unknown-linux-musl/xwin --accept-license --cache-dir .tools/xwin/cache --arch x86_64 \
+    splat --output .tools/xwin/sdk
+curl -L https://github.com/intel/llvm/releases/download/nightly-2026-09-16/sycl_windows.tar.gz |
+    tar -xz -C .tools/intel-llvm-win
+cmake -S . -B build/win -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-windows-msvc.cmake \
+    -DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++ -DSTRATA_LICENSE=free \
+    -DSTRATA_XWIN=$PWD/.tools/xwin/sdk -DSTRATA_SYCL_WINDOWS=$PWD/.tools/intel-llvm-win
+ninja -C build/win
+```
+
+- xwin の `cache` は展開のあとは要らず、消してかまいません（`sdk` は 0.8 GB）。
+- lld-link は、`sycl9.lib` について `skipping imported DllMain symbol` と警告します。MSVC で作られたインポートライブラリを lld で読むときに出るもので、リンクの結果には関係しません。
 
 ## AVX-512 の経路を確かめる Intel SDE
 
