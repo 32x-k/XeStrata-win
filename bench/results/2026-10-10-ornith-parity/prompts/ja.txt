@@ -1,0 +1,3 @@
+<|im_start|>user
+日本の首都はどこですか？一文で答えてください。<|im_end|>
+<|im_start|>assistant
