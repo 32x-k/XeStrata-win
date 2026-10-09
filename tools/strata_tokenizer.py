@@ -66,6 +66,27 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# `glm4` and `glm5` (GLM-5.3-Flash): llama.cpp's LLAMA_VOCAB_PRE_TYPE_CHATGLM4 (`src/llama-vocab.cpp` L406 at
+# de7fa0a3), the llama3 shape with `\p{L}` alone, and `ignore_merges` (L2407): a pre-token piece that is itself in
+# the vocabulary is that one token, without running the merges.
+CHATGLM4_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+# The GGUF's `tokenizer.ggml.pre` -> (pattern, ignore_merges, where the pattern was transcribed from).  A `pre` not
+# listed is refused: tokenizing it with another type's pattern gives plausible tokens the model was not trained on.
+PRE_TYPES = {
+    "qwen35": (QWEN35_PATTERN, False, ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
+    "glm4": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
+    "glm5": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
+}
+
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
@@ -89,7 +110,10 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        if pre not in PRE_TYPES:
+            raise ValueError("pre-tokenizer %r is not supported (%s)" % (pre, ", ".join(sorted(PRE_TYPES))))
+        pattern, self.ignore_merges, _ = PRE_TYPES[pre]
+        self._re = regex.compile(pattern)
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -143,6 +167,21 @@ class Tokenizer:
         return cls(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.merges"]),
                    list(md.get("tokenizer.ggml.token_type") or []) or None,
                    md.get("tokenizer.ggml.pre", "qwen35"), special)
+
+    @classmethod
+    def from_dir(cls, path) -> "Tokenizer":
+        """The tokenizer `extract` wrote into a pack's `tokenizer/` folder, with the `pre` it declared (an export
+        older than the field is Qwen3.8's, `qwen35`)."""
+        path = pathlib.Path(path)
+        vocab = json.loads((path / "vocab.json").read_text(encoding="utf-8"))
+        tokens = [""] * len(vocab)
+        for t, i in vocab.items():
+            tokens[i] = t
+        merges = (path / "merges.txt").read_text(encoding="utf-8").split("\n")
+        types = json.loads((path / "token_type.json").read_text())
+        cfg_file = path / "tokenizer.json"
+        cfg = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}
+        return cls(tokens, merges, types, cfg.get("pre", "qwen35"))
 
     # -------------------------------------------------------------- the algorithm
     def _bpe(self, word: str) -> list[str]:
@@ -227,12 +266,16 @@ class Tokenizer:
             got = cache.get(piece)
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
-                got = []
-                for tok in self._bpe(mapped):
-                    i = self.ids.get(tok)
-                    if i is None:
-                        raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
-                    got.append(i)
+                whole = self.ids.get(mapped) if self.ignore_merges else None
+                if whole is not None:
+                    got = [whole]
+                else:
+                    got = []
+                    for tok in self._bpe(mapped):
+                        i = self.ids.get(tok)
+                        if i is None:
+                            raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
+                        got.append(i)
                 if len(cache) < self.PIECE_CACHE_MAX:
                     cache[piece] = got
             out.extend(got)
@@ -322,8 +365,9 @@ def extract(gguf_path, out_dir) -> dict:
         "add_bos_token": False,
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        "pre_pattern": PRE_TYPES[tk.pre][0],
+        "pre_pattern_source": PRE_TYPES[tk.pre][2],
+        "ignore_merges": tk.ignore_merges,
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
