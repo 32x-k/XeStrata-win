@@ -1,0 +1,680 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// src/core/plain_model.cpp - an MoE model with one residual stream, run from its GGUF (plain_model.hpp).
+//
+// The block follows llama.cpp's qwen35moe graph (src/models/qwen35moe.cpp at de7fa0a3) step for step:
+//
+//   GDN:        qkv = attn_qkv(h), z = attn_gate(h), beta = sigmoid(ssm_beta(h)), alpha = ssm_alpha(h)
+//               conv over [history | qkv], SiLU on all of it; q, k l2-normalized (v head j reads q/k head j % h_k)
+//               gate = softplus(alpha + dt) * ssm_a; the delta rule; y = rms_norm(o) * ssm_norm * silu(z)
+//               out = ssm_out(y)
+//   attention:  [q | gate] per head = attn_q(h), k = attn_k(h), v = attn_v(h); q, k rms-normed per head, then
+//               rotated in their first 64 dims (text positions: every IMRoPE section at the same position)
+//               softmax(q k / sqrt(d)) v over every cell, times sigmoid(gate); out = attn_output(.)
+//   MoE:        softmax over the experts, top-k, the k weights renormalized; sum of w_j expert_j(h)
+//               + sigmoid(ffn_gate_inp_shexp . h) * shared(h)
+#include "strata/core/plain_model.hpp"
+
+#include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/device.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/gdn.hpp"
+#include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/native_gdn.hpp"
+#include "strata/kernels/native_gdn_preprocess.hpp"
+#include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/native_qsa.hpp"
+#include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/qsa.hpp"
+#include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/rope_scaling.hpp"
+#include "strata/kernels/router_top10.hpp"
+#include "strata/kernels/sampler.hpp"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <exception>
+#include <utility>
+
+namespace strata::core {
+namespace {
+
+namespace k = strata::kernels;
+
+constexpr int kQ6K = 14;
+constexpr int kF32 = 0;
+
+bool mapped(size_t bytes, void** h, void** d) {
+    if (!strata::gpu::alloc_host(h, bytes)) return false;
+    std::memset(*h, 0, bytes);
+    return strata::gpu::device_pointer(d, *h);
+}
+
+k::QsaShapes attn_shapes(const ModelSpec& s, int64_t n_head_kv) {
+    k::QsaShapes q = k::qsa_real_shapes();
+    q.n_head = s.n_head;
+    q.n_head_kv = n_head_kv;
+    q.head_dim = s.key_length;
+    q.n_rot = s.rope_dims;
+    return q;
+}
+
+}  // namespace
+
+PlainModel::PlainModel() = default;
+
+PlainModel::~PlainModel() {
+    if (cs_ != nullptr) strata::gpu::stream_sync(cs_);
+    for (auto* g : exec_) strata::gpu::graph_destroy(g);
+    for (auto& v : segs_)
+        for (auto* g : v) strata::gpu::graph_destroy(g);
+    for (void* p : allocs_) strata::gpu::free(p);
+    for (void* p : {(void*) h_emb_, (void*) h_step_, (void*) h_pos_, (void*) h_out_, (void*) fill_tmp_})
+        strata::gpu::free(p);
+    if (cs_ != nullptr) strata::gpu::stream_destroy(cs_);
+}
+
+bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::string& err) {
+    size_t at = 0;
+    const TensorInfo* t = m.find(name, &at);
+    if (t == nullptr || t->shape.size() != 2 || !m.in_bounds(*t, at)) {
+        err = "plain model: " + name + " is missing, not 2-D, or truncated";
+        return false;
+    }
+    w.type = (int) t->type;
+    w.n_in = (int) t->shape[0];
+    w.n_out = (int) t->shape[1];
+    if (!k::native_mmvq_supported(w.type)) {
+        err = "plain model: " + name + " is " + t->type_name() + ", which the native matrix-vector kernels do not take";
+        return false;
+    }
+    const uint64_t bytes = tensor_payload_bytes(*t);
+    void* d = nullptr;
+    if (!strata::gpu::alloc_device(&d, bytes)) {
+        err = "plain model: no VRAM for " + name;
+        return false;
+    }
+    allocs_.push_back(d);
+    if (!strata::gpu::copy(d, m.shard(at).tensor_data(*t), bytes)) {
+        err = "plain model: uploading " + name + " failed";
+        return false;
+    }
+    if (w.type == kQ6K && k::native_q6_k_rows_ok(w.n_in)) {   // the same results, each row's loads aligned
+        k::native_q6_k_to_rows(d, w.n_in, w.n_out, cs_);
+        w.type = k::kNativeQ6KRows;
+    }
+    w.data = d;
+    return true;
+}
+
+bool PlainModel::upload_f32(const GgufModel& m, const std::string& name, uint64_t elements, const float*& out,
+                            std::string& err) {
+    size_t at = 0;
+    const TensorInfo* t = m.find(name, &at);
+    if (t == nullptr || t->type != kF32 || t->elements() != elements || !m.in_bounds(*t, at)) {
+        err = "plain model: " + name + " is missing, not F32 or not " + std::to_string(elements) + " values";
+        return false;
+    }
+    void* d = nullptr;
+    if (!strata::gpu::alloc_device(&d, elements * 4)) {
+        err = "plain model: no VRAM for " + name;
+        return false;
+    }
+    allocs_.push_back(d);
+    if (!strata::gpu::copy(d, m.shard(at).tensor_data(*t), elements * 4)) {
+        err = "plain model: uploading " + name + " failed";
+        return false;
+    }
+    out = (const float*) d;
+    return true;
+}
+
+bool PlainModel::load(const PlainOptions& opt, std::string& err) {
+    opt_ = opt;
+    if (opt_.max_t < 1 || opt_.max_t > k::cpu::MAXT || opt_.max_cells < 16) {
+        err = "plain model: the window or the context is out of range";
+        return false;
+    }
+    try {
+        model_ = std::make_unique<GgufModel>(GgufModel::open(opt_.gguf));
+    } catch (const std::exception& e) {
+        err = std::string("plain model: ") + e.what();
+        return false;
+    }
+    if (!read_model_spec(model_->meta(), spec_, err)) return false;
+    const ModelSpec& s = spec_;
+    if (s.arch != ModelArch::Qwen35Moe) {
+        err = "plain model: " + s.arch_name + " is not run by this engine yet";
+        return false;
+    }
+    if (s.key_length != s.value_length || s.rope_dims != 64 || (s.key_length != 128 && s.key_length != 256) ||
+        s.ssm_d_state != 128 || s.ssm_d_conv != 4 || s.ssm_n_group <= 0 || s.ssm_dt_rank % s.ssm_n_group != 0 ||
+        s.ssm_d_inner != s.ssm_dt_rank * s.ssm_d_state || s.n_expert_used > 15 || s.n_ff_shexp <= 0 ||
+        s.n_dense_lead != 0) {
+        err = "plain model: a shape this engine's kernels are not built for";
+        return false;
+    }
+    cs_ = strata::gpu::stream_create();
+    if (cs_ == nullptr) { err = "plain model: stream create failed"; return false; }
+    // process constants, before any graph: the rotation's base, and the GDN output gate (SiLU in qwen35moe)
+    k::RopeScaling rs;
+    rs.freq_base = s.rope_base;
+    k::rope_scaling_set(rs);
+    k::gdn_set_silu_gate(true);
+
+    const GgufModel& m = *model_;
+    // the embedding stays in the mapping: a token's row is dequantized on the host
+    {
+        size_t at = 0;
+        const TensorInfo* t = m.find("token_embd.weight", &at);
+        if (t == nullptr || t->shape.size() != 2 || t->shape[0] != (uint64_t) s.n_embd || !m.in_bounds(*t, at)) {
+            err = "plain model: token_embd.weight is missing or of another width";
+            return false;
+        }
+        emb_type_ = (int) t->type;
+        n_vocab_ = (int64_t) t->shape[1];
+        emb_row_ = k::cpu::native_row_bytes(emb_type_, s.n_embd);
+        if (emb_row_ == 0) { err = "plain model: token_embd.weight's type has no host dequantizer"; return false; }
+        emb_ = m.shard(at).tensor_data(*t);
+    }
+    if (!upload(m, "output.weight", head_, err) ||
+        !upload_f32(m, "output_norm.weight", (uint64_t) s.n_embd, out_norm_, err))
+        return false;
+    if (head_.n_in != s.n_embd || head_.n_out != n_vocab_) { err = "plain model: output.weight's shape"; return false; }
+
+    const uint64_t N = (uint64_t) s.n_embd, E = (uint64_t) s.n_expert;
+    blocks_.resize((size_t) s.n_layer);
+    int64_t n_gdn = 0, n_attn = 0;
+    for (int64_t l = 0; l < s.n_layer; ++l) {
+        Block& b = blocks_[(size_t) l];
+        const std::string p = "blk." + std::to_string(l) + ".";
+        b.recurrent = s.recurrent[(size_t) l];
+        if (!upload_f32(m, p + "attn_norm.weight", N, b.attn_norm, err) ||
+            !upload_f32(m, p + "post_attention_norm.weight", N, b.post_norm, err))
+            return false;
+        if (b.recurrent) {
+            b.gdn = n_gdn++;
+            const uint64_t C = (uint64_t) (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner);
+            if (!upload(m, p + "attn_qkv.weight", b.qkv, err) || !upload(m, p + "attn_gate.weight", b.z, err) ||
+                !upload(m, p + "ssm_alpha.weight", b.alpha, err) || !upload(m, p + "ssm_beta.weight", b.beta, err) ||
+                !upload(m, p + "ssm_out.weight", b.ssm_out, err) ||
+                !upload_f32(m, p + "ssm_conv1d.weight", C * (uint64_t) s.ssm_d_conv, b.conv, err) ||
+                !upload_f32(m, p + "ssm_dt.bias", (uint64_t) s.ssm_dt_rank, b.dt, err) ||
+                !upload_f32(m, p + "ssm_a", (uint64_t) s.ssm_dt_rank, b.a, err) ||
+                !upload_f32(m, p + "ssm_norm.weight", (uint64_t) s.ssm_d_state, b.ssm_norm, err))
+                return false;
+            if ((uint64_t) b.qkv.n_out != C || b.z.n_out != s.ssm_d_inner || b.alpha.n_out != s.ssm_dt_rank ||
+                b.beta.n_out != s.ssm_dt_rank || b.ssm_out.n_in != s.ssm_d_inner) {
+                err = "plain model: block " + std::to_string(l) + "'s GDN projections have other shapes";
+                return false;
+            }
+        } else {
+            b.attn = n_attn++;
+            const int64_t nkv = s.n_head_kv[(size_t) l], hd = s.key_length;
+            if (!upload(m, p + "attn_q.weight", b.q, err) || !upload(m, p + "attn_k.weight", b.k, err) ||
+                !upload(m, p + "attn_v.weight", b.v, err) || !upload(m, p + "attn_output.weight", b.o, err) ||
+                !upload_f32(m, p + "attn_q_norm.weight", (uint64_t) hd, b.q_norm, err) ||
+                !upload_f32(m, p + "attn_k_norm.weight", (uint64_t) hd, b.k_norm, err))
+                return false;
+            if (b.q.n_out != 2 * s.n_head * hd || b.k.n_out != nkv * hd || b.v.n_out != nkv * hd ||
+                b.o.n_in != s.n_head * hd || nkv <= 0 || s.n_head % nkv != 0 || (nkv_ != 0 && nkv != nkv_)) {
+                err = "plain model: block " + std::to_string(l) + "'s attention projections have other shapes";
+                return false;
+            }
+            nkv_ = nkv;
+        }
+        if (!upload_f32(m, p + "ffn_gate_inp.weight", N * E, b.router, err) ||
+            !upload_f32(m, p + "ffn_gate_inp_shexp.weight", N, b.sh_gate_inp, err) ||
+            !upload(m, p + "ffn_gate_shexp.weight", b.sh_gate, err) ||
+            !upload(m, p + "ffn_up_shexp.weight", b.sh_up, err) ||
+            !upload(m, p + "ffn_down_shexp.weight", b.sh_down, err))
+            return false;
+        if (b.sh_gate.type != b.sh_up.type || b.sh_gate.n_out != s.n_ff_shexp || b.sh_down.n_in != s.n_ff_shexp) {
+            err = "plain model: block " + std::to_string(l) + "'s shared expert has other shapes";
+            return false;
+        }
+    }
+
+    if (nkv_ == 0) { err = "plain model: the model has no attention block"; return false; }
+    // per-sequence state
+    const int64_t C = 2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner;
+    const k::QsaShapes qs = attn_shapes(s, nkv_);
+    for (const Block& b : blocks_) {
+        if (b.recurrent) {
+            float *st = nullptr, *cv = nullptr;
+            if (!strata::gpu::alloc_device(&st, (size_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state) * 4) ||
+                !strata::gpu::alloc_device(&cv, (size_t) (C * (s.ssm_d_conv - 1)) * 4)) {
+                err = "plain model: no VRAM for the recurrent states";
+                return false;
+            }
+            allocs_.push_back(st);
+            allocs_.push_back(cv);
+            gdn_state_.push_back(st);
+            gdn_conv_.push_back(cv);
+        }
+    }
+    n_pages_ = (opt_.max_cells + qs.page_size - 1) / qs.page_size;
+    opt_.max_cells = n_pages_ * qs.page_size;
+    {
+        const size_t pool = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size * qs.head_dim) * 2;
+        for (const Block& b : blocks_) {
+            if (b.recurrent) continue;
+            uint16_t *kp = nullptr, *vp = nullptr;
+            if (!strata::gpu::alloc_device(&kp, pool) || !strata::gpu::alloc_device(&vp, pool)) {
+                err = "plain model: no VRAM for the K/V cache (" + std::to_string(opt_.max_cells) + " cells)";
+                return false;
+            }
+            allocs_.push_back(kp);
+            allocs_.push_back(vp);
+            k_pool_.push_back(kp);
+            v_pool_.push_back(vp);
+        }
+        std::vector<int32_t> table((size_t) n_pages_);
+        for (int64_t i = 0; i < n_pages_; ++i) table[(size_t) i] = (int32_t) i;
+        if (!strata::gpu::alloc_device(&page_table_, table.size() * 4) ||
+            !strata::gpu::copy(page_table_, table.data(), table.size() * 4)) {
+            err = "plain model: the page table";
+            return false;
+        }
+        allocs_.push_back(page_table_);
+    }
+
+    // the window's buffers
+    const uint64_t T = (uint64_t) opt_.max_t, NH = (uint64_t) s.n_head, HD = (uint64_t) s.key_length;
+    const uint64_t NKV = (uint64_t) qs.n_head_kv, HV = (uint64_t) s.ssm_dt_rank, ZV = (uint64_t) s.ssm_d_inner;
+    const uint64_t K = (uint64_t) s.n_expert_used, FS = (uint64_t) s.n_ff_shexp;
+    if (!mapped(T * N * 4, (void**) &h_emb_, (void**) &m_emb_) ||
+        !mapped(T * k::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) ||
+        !mapped(T * (NH + NKV) * 4, (void**) &h_pos_, (void**) &m_pos_) ||
+        !mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_)) {
+        err = "plain model: mapped staging allocation failed";
+        return false;
+    }
+    attn_scratch_floats_ = (int64_t) k::qsa_decode_attn_scratch_floats(opt_.max_cells, qs);
+    const uint64_t max_in = std::max<uint64_t>({N, ZV, NH * HD, FS});
+    auto dev = [&](auto** p, uint64_t bytes) {
+        void* d = nullptr;
+        if (!strata::gpu::alloc_device(&d, (size_t) std::max<uint64_t>(bytes, 256))) return false;
+        allocs_.push_back(d);
+        *p = (std::remove_reference_t<decltype(*p)>) d;
+        return true;
+    };
+    if (!dev(&step_, T * k::kStepCount * 4) || !dev(&pos_, T * (NH + NKV) * 4) || !dev(&x_, T * N * 4) ||
+        !dev(&hn_, T * N * 4) || !dev(&mix_, T * N * 4) || !dev(&xq_, k::native_q8_1_bytes((int) max_in, (int) T)) ||
+        !dev(&qkv_, T * (uint64_t) C * 4) || !dev(&craw_, (uint64_t) C * 4) || !dev(&hc_, T * (uint64_t) C * 4) ||
+        !dev(&z_, T * ZV * 4) || !dev(&alpha_, T * HV * 4) || !dev(&beta_, T * HV * 4) || !dev(&gate_, T * HV * 4) ||
+        !dev(&o_, T * ZV * 4) || !dev(&y_, T * ZV * 4) || !dev(&qfull_, T * NH * 2 * HD * 4) ||
+        !dev(&qcur_, T * NH * HD * 4) || !dev(&kraw_, T * NKV * HD * 4) || !dev(&kcur_, T * NKV * HD * 4) ||
+        !dev(&vcur_, T * NKV * HD * 4) || !dev(&attn_, T * NH * HD * 4) || !dev(&attn32_, T * NH * HD * 4) ||
+        !dev(&attn_scratch_, T * (uint64_t) attn_scratch_floats_ * 4) || !dev(&rlog_, T * E * 4) ||
+        !dev(&ids_, T * K * 4) || !dev(&w_, T * K * 4) || !dev(&shared_, T * N * 4) || !dev(&sh_g_, (T + 4) * 4) ||
+        !dev(&sh_gate_, T * FS * 4) || !dev(&sh_up_, T * FS * 4) || !dev(&moe_out_, T * N * 4) ||
+        !dev(&logits_, T * (uint64_t) n_vocab_ * 4)) {
+        err = "plain model: no VRAM for the window's buffers";
+        return false;
+    }
+    if (!strata::gpu::stream_sync(cs_)) { err = "plain model: the uploads failed"; return false; }
+    if (!open_experts(err)) return false;
+    exec_.assign((size_t) opt_.max_t + 1, nullptr);
+    segs_.assign((size_t) opt_.max_t + 1, {});
+    return reset(err);
+}
+
+bool PlainModel::open_experts(std::string& err) {
+    const ModelSpec& s = spec_;
+    const int64_t L = s.n_moe_layers(), E = s.n_expert;
+    std::vector<int64_t> blocks;
+    for (int64_t l = 0; l < s.n_layer; ++l)
+        if (s.layer_routes(l)) blocks.push_back(l);
+    if (!expert_layout_from_gguf(opt_.gguf, blocks, E, s.n_embd, s.n_ff_exp, err)) return false;
+    const auto& lay = k::cpu::expert_layout();
+    for (int64_t l = 0; l < L; ++l)
+        if (!k::native_expert_supported(lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type, s.n_embd, s.n_ff_exp)) {
+            err = "plain model: the GPU has no expert kernel for MoE layer " + std::to_string(l) + "'s types";
+            return false;
+        }
+    src_ = std::make_unique<FileExpertSource>();
+    src_->set_gguf(opt_.gguf);
+    if (!src_->open(std::string(), L, E, err)) return false;
+    pool_ = std::make_unique<k::cpu::ExpertPool>(opt_.threads);
+
+    // the VRAM tier: what the device has left, less the window's arena and a reserve, in slots of each layer's blob,
+    // the same number for every layer
+    uint64_t free_b = 0, total_b = 0;
+    {
+        size_t f = 0, t = 0;
+        if (!strata::gpu::mem_info(&f, &t)) { err = "plain model: the device's memory is unknown"; return false; }
+        free_b = f;
+        total_b = t;
+        apply_vram_limit(free_b, total_b);
+    }
+    const uint64_t window_b = (uint64_t) opt_.max_t * (uint64_t) s.n_expert_used * (uint64_t) s.n_embd * 4 * 3 +
+                              16 * lay.max_blob + (64ull << 20);
+    const uint64_t reserve = (uint64_t) opt_.reserve_mib << 20;
+    const uint64_t room = free_b > window_b + reserve ? free_b - window_b - reserve : 0;
+    uint64_t per_layer_b = 0;
+    for (int64_t l = 0; l < L; ++l) per_layer_b += lay.bytes[(size_t) l];
+    int64_t q = per_layer_b > 0 ? (int64_t) (room / per_layer_b) : 0;
+    q = std::min<int64_t>(q, E);
+    if (q < 1) {
+        err = "plain model: no VRAM is left for the expert tier (" + std::to_string(free_b >> 20) + " MiB free)";
+        return false;
+    }
+    std::vector<int64_t> slot_bytes;
+    free_.assign((size_t) L, {});
+    for (int64_t l = 0; l < L; ++l)
+        for (int64_t i = 0; i < q; ++i) {
+            free_[(size_t) l].push_back((int32_t) slot_bytes.size());
+            slot_bytes.push_back((int64_t) lay.bytes[(size_t) l]);
+        }
+    for (auto& f : free_) std::reverse(f.begin(), f.end());   // taken from the back: the lowest slot first
+    if (!cache_.open_sized(slot_bytes, L, E, err)) return false;
+    n_slots_ = (int64_t) slot_bytes.size();
+    res_.assign((size_t) (L * E), -1);
+    if (!strata::gpu::alloc_host(&fill_tmp_, (size_t) lay.max_blob)) {
+        err = "plain model: pinned staging for the slot fills";
+        return false;
+    }
+
+    MoeWindowShape ws;
+    ws.n_embd = s.n_embd;
+    ws.n_expert = E;
+    ws.k = s.n_expert_used;
+    ws.max_t = opt_.max_t;
+    MoeWindowTier tier;
+    tier.cache_base = cache_.device_slot(0);
+    tier.blob = (int64_t) lay.max_blob;
+    if (!win_.init(ws, tier, err)) return false;
+
+    disp_.pool = pool_.get();
+    disp_.src = src_.get();
+    disp_.n_expert = E;
+    disp_.cache = &cache_;
+    disp_.cache_base = cache_.device_slot(0);
+    disp_.cache_blob = (int64_t) lay.max_blob;
+    disp_.cache_slot_off = cache_.slot_offsets();
+    disp_.host_res = res_.data();
+    disp_.plan = win_.sink();
+    disp_.pcie_num = 0;
+    if (opt_.adapt_every > 0 && opt_.adapt_swaps > 0) disp_.usage.assign((size_t) (L * E), 0.0f);
+    std::fprintf(stderr, "strata plain: %lld MoE layers x %lld experts, %lld VRAM slots (%lld a layer, %.2f GiB), "
+                         "%d CPU workers, %lld MiB free before the tier\n",
+                 (long long) L, (long long) E, (long long) n_slots_, (long long) q, (double) cache_.bytes() / 1073741824.0,
+                 pool_->workers(), (long long) (free_b >> 20));
+    return true;
+}
+
+int64_t PlainModel::resident() const {
+    int64_t n = 0;
+    for (int32_t r : res_) n += r >= 0;
+    return n;
+}
+
+bool PlainModel::reset(std::string& err) {
+    const ModelSpec& s = spec_;
+    const int64_t C = 2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner;
+    bool ok = true;
+    for (float* p : gdn_state_)
+        ok = ok && strata::gpu::memset(p, 0, (size_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state) * 4);
+    for (float* p : gdn_conv_) ok = ok && strata::gpu::memset(p, 0, (size_t) (C * (s.ssm_d_conv - 1)) * 4);
+    const k::QsaShapes qs = attn_shapes(s, nkv_);
+    const size_t pool = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size * qs.head_dim) * 2;
+    for (size_t i = 0; i < k_pool_.size(); ++i)
+        ok = ok && strata::gpu::memset(k_pool_[i], 0, pool) && strata::gpu::memset(v_pool_[i], 0, pool);
+    if (!ok) err = "plain model: resetting the state failed";
+    return ok;
+}
+
+void PlainModel::pool_fn(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                         int64_t layer) {
+    PlainModel* m = (PlainModel*) user;
+    m->disp_.layers = layer;
+    expert_pool_dispatch_multi(m->disp_, x_f, ids, n_tok, k, out);
+}
+
+bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) {
+    const ModelSpec& s = spec_;
+    const int64_t N = s.n_embd, NH = s.n_head, HD = s.key_length, HV = s.ssm_dt_rank, HK = s.ssm_n_group;
+    const int64_t ZV = s.ssm_d_inner, S = s.ssm_d_state, C = 2 * HK * S + ZV, E = s.n_expert, K = s.n_expert_used;
+    const int64_t FS = s.n_ff_shexp;
+    const float eps = (float) s.rms_eps;
+    const k::QsaShapes qs = attn_shapes(s, nkv_);
+    const int64_t NKV = qs.n_head_kv;
+    const k::GdnShapes gs{S, HK, HV};
+    const k::RopeScaling& rs = k::rope_scaling();
+    const int32_t* pos_q = pos_;
+    const int32_t* pos_k = pos_ + (size_t) opt_.max_t * NH;
+    auto proj = [&](const W& w, const float* x, float* y, int ncols, bool quantize) {
+        if (quantize) k::native_quantize_q8_1(x, xq_, w.n_in, ncols, cs);
+        k::native_mmvq(w.type, w.data, xq_, y, w.n_in, w.n_out, ncols, cs);
+    };
+    k::copy_from_mapped(x_, m_emb_, (int64_t) T * N, cs);
+    k::copy_i32_from_mapped(step_, m_step_, (int64_t) T * k::kStepCount, cs);
+    k::copy_i32_from_mapped(pos_, m_pos_, (int64_t) opt_.max_t * (NH + NKV), cs);
+    uint32_t ring = 0;
+    for (int64_t l = 0; l < s.n_layer; ++l) {
+        const Block& b = blocks_[(size_t) l];
+        k::native_qsa_rms_norm_weighted(x_, b.attn_norm, hn_, (int) N, T, eps, cs);
+        if (b.recurrent) {
+            float* state = gdn_state_[(size_t) b.gdn];
+            float* hist = gdn_conv_[(size_t) b.gdn];
+            k::native_quantize_q8_1(hn_, xq_, (int) N, T, cs);
+            proj(b.qkv, hn_, qkv_, T, false);
+            proj(b.z, hn_, z_, T, false);
+            proj(b.alpha, hn_, alpha_, T, false);
+            proj(b.beta, hn_, beta_, T, false);
+            for (int t = 0; t < T; ++t) {   // the recurrence, token by token
+                float* h = hc_ + (size_t) t * C;
+                k::native_gdn_conv_silu(hist, qkv_ + (size_t) t * C, b.conv, craw_, h, C, s.ssm_d_conv, cs);
+                k::native_gdn_l2_norm(h, HK, S, eps, cs);
+                k::native_gdn_l2_norm(h + HK * S, HK, S, eps, cs);
+                k::native_gdn_beta_gate(beta_ + (size_t) t * HV, HV, cs);
+                k::native_gdn_gate(alpha_ + (size_t) t * HV, b.dt, b.a, gate_ + (size_t) t * HV, HV, cs);
+                k::native_gdn_step(state, h, h + HK * S, h + 2 * HK * S, gate_ + (size_t) t * HV, beta_ + (size_t) t * HV,
+                                   o_ + (size_t) t * ZV, gs, cs);
+                k::native_gdn_out_norm(o_ + (size_t) t * ZV, z_ + (size_t) t * ZV, b.ssm_norm, y_ + (size_t) t * ZV, HV, S,
+                                       eps, cs);
+            }
+            proj(b.ssm_out, y_, mix_, T, true);
+        } else {
+            const int64_t a = b.attn;
+            k::native_quantize_q8_1(hn_, xq_, (int) N, T, cs);
+            proj(b.q, hn_, qfull_, T, false);
+            proj(b.k, hn_, kraw_, T, false);
+            proj(b.v, hn_, vcur_, T, false);
+            k::native_qsa_rms_norm_rope(qfull_, (int) (2 * HD), b.q_norm, qcur_, (int) (T * NH), (int) HD,
+                                        (int) s.rope_dims, eps, rs, pos_q, cs);
+            k::native_qsa_rms_norm_rope(kraw_, (int) HD, b.k_norm, kcur_, (int) (T * NKV), (int) HD,
+                                        (int) s.rope_dims, eps, rs, pos_k, cs);
+            for (int t = 0; t < T; ++t)
+                k::kv_append_step(k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_,
+                                  step_ + (size_t) t * k::kStepCount, kcur_ + (size_t) t * NKV * HD,
+                                  vcur_ + (size_t) t * NKV * HD, qs, cs);
+            k::QsaAttnPools pools;
+            pools.k_pool = k_pool_[(size_t) a];
+            pools.v_pool = v_pool_[(size_t) a];
+            pools.page_table = page_table_;
+            k::qsa_dense_attn_batch(qcur_, pools, step_, opt_.max_cells, qs, attn_scratch_, attn_, T, cs);
+            k::native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
+            proj(b.o, attn32_, mix_, T, true);
+        }
+        k::add_inplace(x_, mix_, (int64_t) T * N, cs);
+
+        // the MoE: route, publish, the shared expert while the host serves, then the experts and the combine
+        k::native_qsa_rms_norm_weighted(x_, b.post_norm, hn_, (int) N, T, eps, cs);
+        for (int t = 0; t < T; ++t)
+            k::f32_gemv_fp32_mmvf(hn_ + (size_t) t * N, b.router, rlog_ + (size_t) t * E, N, E, cs);
+        k::router_top10(rlog_, T, (int) E, (int) K, ids_, w_, cs);
+        ++ring;
+        win_.publish(ring, 0, 0, T, hn_, ids_, w_, cs);
+        k::native_quantize_q8_1(hn_, xq_, (int) N, T, cs);
+        if (!k::native_mmvq_pair(b.sh_gate.type, b.sh_gate.data, b.sh_up.data, xq_, sh_gate_, sh_up_, (int) N, (int) FS,
+                                 T, cs)) {
+            k::native_mmvq(b.sh_gate.type, b.sh_gate.data, xq_, sh_gate_, (int) N, (int) FS, T, cs);
+            k::native_mmvq(b.sh_up.type, b.sh_up.data, xq_, sh_up_, (int) N, (int) FS, T, cs);
+        }
+        k::native_swiglu_q8_1(sh_gate_, sh_up_, xq_, (int) FS, T, cs);
+        k::native_mmvq(b.sh_down.type, b.sh_down.data, xq_, shared_, (int) FS, (int) N, T, cs);
+        for (int t = 0; t < T; ++t) k::f32_gemv_fp32_mmvf(hn_ + (size_t) t * N, b.sh_gate_inp, sh_g_ + t, N, 1, cs);
+        if (win_.segmented()) {   // a graph ends where the host must answer the ring
+            strata::gpu::Graph* g = nullptr;
+            if (!strata::gpu::end_capture(cs, &g)) {
+                err = std::string("plain model: segment capture: ") + strata::gpu::last_error();
+                return false;
+            }
+            segs_[(size_t) T].push_back(g);
+            if (!strata::gpu::begin_capture(cs)) { err = "plain model: begin capture failed"; return false; }
+        }
+        if (!win_.experts(s.moe_index(l), ring, 0, 0, T, cs, err)) return false;
+        k::native_moe_combine_multi(win_.parts(), w_, shared_, moe_out_, N, K, T, cs, sh_g_);
+        k::add_inplace(x_, moe_out_, (int64_t) T * N, cs);
+    }
+    k::native_qsa_rms_norm_weighted(x_, out_norm_, hn_, (int) N, T, eps, cs);
+    proj(head_, hn_, logits_, T, true);
+    k::SamplerParams sp;
+    sp.greedy = true;
+    sp.temperature = 0.0f;
+    k::sample_tokens(logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+    return true;
+}
+
+bool PlainModel::record(int T, std::string& err) {
+    if (exec_[(size_t) T] != nullptr || !segs_[(size_t) T].empty()) return true;
+    if (!strata::gpu::begin_capture(cs_)) {
+        err = std::string("plain model: begin capture: ") + strata::gpu::last_error();
+        return false;
+    }
+    bool ok = false;
+    try {
+        ok = record_window(T, cs_, err);
+    } catch (const std::exception& e) {
+        err = std::string("plain model: recording the window: ") + e.what();
+    }
+    if (!ok) {
+        strata::gpu::abandon_capture(cs_);
+        for (auto* g : segs_[(size_t) T]) strata::gpu::graph_destroy(g);
+        segs_[(size_t) T].clear();
+        return false;
+    }
+    strata::gpu::Graph* g = nullptr;
+    if (!strata::gpu::end_capture(cs_, &g)) {
+        err = std::string("plain model: end capture: ") + strata::gpu::last_error();
+        return false;
+    }
+    if (win_.segmented()) segs_[(size_t) T].push_back(g);
+    else exec_[(size_t) T] = g;
+    return true;
+}
+
+bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out, float* logits, std::string& err) {
+    const ModelSpec& s = spec_;
+    if (T < 1 || T > opt_.max_t || pos < 0 || pos + T > opt_.max_cells) {
+        err = "plain model: the window is out of range";
+        return false;
+    }
+    if (!record(T, err)) return false;
+    const int64_t N = s.n_embd, NH = s.n_head;
+    const k::QsaShapes qs = attn_shapes(s, nkv_);
+    for (int t = 0; t < T; ++t) {
+        if (tokens[t] < 0 || tokens[t] >= n_vocab_) { err = "plain model: a token is out of the vocabulary"; return false; }
+        if (!k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tokens[t] * emb_row_, h_emb_ + (size_t) t * N, N)) {
+            err = "plain model: the embedding row could not be dequantized";
+            return false;
+        }
+        k::qsa_step_fill(h_step_ + (size_t) t * k::kStepCount, pos + t, qs);
+        for (int64_t h = 0; h < NH; ++h) h_pos_[(size_t) (t * NH + h)] = (int32_t) (pos + t);
+        int32_t* pk = h_pos_ + (size_t) opt_.max_t * NH;
+        for (int64_t h = 0; h < qs.n_head_kv; ++h) pk[(size_t) (t * qs.n_head_kv + h)] = (int32_t) (pos + t);
+    }
+    win_.reset();
+    const bool seg = win_.segmented();
+    if (!strata::gpu::graph_launch(seg ? segs_[(size_t) T][0] : exec_[(size_t) T], cs_)) {
+        err = std::string("plain model: launch: ") + strata::gpu::last_error();
+        return false;
+    }
+    (void) strata::gpu::stream_idle(cs_);
+    const int64_t L = s.n_moe_layers();
+    std::vector<int64_t> layers((size_t) L);
+    std::vector<int> grps((size_t) L, 0), tbs((size_t) L, 0), ns((size_t) L, T);
+    for (int64_t l = 0; l < L; ++l) layers[(size_t) l] = l;
+    if (seg) win_.set_segments(&segs_[(size_t) T]);
+    if (!win_.serve(L, layers.data(), grps.data(), tbs.data(), ns.data(), &PlainModel::pool_fn, this, cs_, err))
+        return false;
+    if (!strata::gpu::stream_sync(cs_)) {
+        err = std::string("plain model: the window: ") + strata::gpu::last_error();
+        return false;
+    }
+    if (disp_.failed) {
+        err = std::string("plain model: the CPU experts: ") + (disp_.fail ? disp_.fail : "failed");
+        return false;
+    }
+    for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    if (logits != nullptr && !strata::gpu::copy(logits, logits_, (size_t) T * (size_t) n_vocab_ * 4)) {
+        err = "plain model: reading the logits failed";
+        return false;
+    }
+    ++windows_;
+    if (!disp_.usage.empty() && windows_ % opt_.adapt_every == 0 && !adapt(err)) return false;
+    return true;
+}
+
+// XeStrata's adaptive tier (generate.cpp's `adapt`): per MoE layer, a missing expert routed at least twice (decayed
+// counts) replaces the least-routed resident one when it leads by 1.5, or takes a free slot; at most adapt_swaps a
+// round, the largest gains first; then the counts decay.  Runs between windows, so no window reads a slot it changes.
+bool PlainModel::adapt(std::string& err) {
+    const int64_t L = spec_.n_moe_layers(), E = spec_.n_expert;
+    struct Swap { float gain; int32_t layer, in, out; };   // out < 0: a free slot
+    std::vector<Swap> swaps;
+    std::vector<std::pair<float, int32_t>> cand, vict;
+    for (int64_t l = 0; l < L; ++l) {
+        cand.clear();
+        vict.clear();
+        const float* u = disp_.usage.data() + l * E;
+        const int32_t* r = res_.data() + l * E;
+        for (int32_t e = 0; e < (int32_t) E; ++e) {
+            if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
+            else vict.emplace_back(u[e], e);
+        }
+        for (size_t i = 0; i < free_[(size_t) l].size(); ++i) vict.emplace_back(-1.0f, -1);
+        if (cand.empty() || vict.empty()) continue;
+        std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        const size_t nc = std::min(cand.size(), vict.size());
+        std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
+                          [](auto& a, auto& b) { return a.first < b.first; });
+        for (size_t i = 0; i < nc; ++i) {
+            if (cand[i].first < vict[i].first + 1.5f) break;
+            swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
+        }
+    }
+    std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+    if ((int) swaps.size() > opt_.adapt_swaps) swaps.resize((size_t) opt_.adapt_swaps);
+    const auto& lay = k::cpu::expert_layout();
+    for (const Swap& w : swaps) {
+        int32_t slot;
+        if (w.out < 0) {
+            auto& f = free_[(size_t) w.layer];
+            if (f.empty()) continue;
+            slot = f.back();
+            f.pop_back();
+        } else {
+            slot = res_[(size_t) (w.layer * E + w.out)];
+            res_[(size_t) (w.layer * E + w.out)] = -1;
+        }
+        if (!src_->copy_blob(w.layer, w.in, fill_tmp_) ||
+            !cache_.fill_slot_blocking(slot, fill_tmp_, err, (int64_t) lay.blob_bytes(w.layer))) {
+            if (err.empty()) err = "plain model: an expert could not be read for the VRAM tier";
+            return false;
+        }
+        res_[(size_t) (w.layer * E + w.in)] = slot;
+        ++swaps_total_;
+    }
+    for (float& v : disp_.usage) v *= opt_.adapt_decay;
+    return true;
+}
+
+}  // namespace strata::core

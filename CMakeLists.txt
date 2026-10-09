@@ -412,7 +412,7 @@ if(STRATA_ENABLE_XE)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/verify.cpp src/core/moe_window.cpp
-                                   src/core/mtp.cpp
+                                   src/core/plain_model.cpp src/core/mtp.cpp
                                    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/vmm.cpp)
@@ -615,7 +615,7 @@ if(STRATA_ENABLE_XE)
   endif()
 
   # `strata generate` (P2.S6): the program that composes the components into tokens
-  add_executable(strata src/program/generate.cpp)
+  add_executable(strata src/program/generate.cpp src/program/plain_generate.cpp)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 
   if(STRATA_BUILD_TESTS)
