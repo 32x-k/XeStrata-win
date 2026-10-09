@@ -43,6 +43,19 @@ bool iq256_supported(int type) noexcept {
     return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
 }
 
+size_t native_row_bytes(int type, int64_t n) {
+    if (type < 0 || type >= GGML_TYPE_COUNT || n <= 0 || n % ggml_blck_size((ggml_type) type)) return 0;
+    return ggml_row_size((ggml_type) type, n);
+}
+
+bool native_row_to_float(int type, const void* src, float* dst, int64_t n) {
+    if (native_row_bytes(type, n) == 0) return false;
+    const ggml_type_traits* t = ggml_get_type_traits((ggml_type) type);
+    if (t == nullptr || t->to_float == nullptr) return false;
+    t->to_float(src, dst, n);
+    return true;
+}
+
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
     init_once();
     const ggml_type_traits_cpu* tg = traits(gu_type);
