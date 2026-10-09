@@ -1672,7 +1672,7 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
                                         : gu_type == 12 || gu_type == 13 || gu_type == 14 || gu_type == 8 ||
                                           gu_type == 6 || gu_type == 2 || gu_type == 3;
     const bool d = d_type == 20 || d_type == 23 || d_type == 42 || d_type == 6 || d_type == 7 || d_type == 8 ||
-                   d_type == 2 || d_type == 3;
+                   d_type == 2 || d_type == 3 || d_type == 14;
     const auto qk = [](int t) { return t == 20 || t == 6 || t == 7 || t == 8 || t == 2 || t == 3 ? 32 : t == 42 ? 64 : 256; };
     return gu && d && n_embd > 0 && n_ff > 0 && n_embd % qk(gu_type) == 0 && n_ff % qk(d_type) == 0 &&
            n_embd % 256 == 0;   // the dequantizers write whole 256-value pieces of a gate/up row
@@ -1803,6 +1803,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 6: e = launch_native_down<6, down_lpr<6>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 2: e = launch_native_down<2, down_lpr<2>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 3: e = launch_native_down<3, down_lpr<3>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 14: e = launch_native_down<14, down_lpr<14>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         default: throw core::DeviceError("native_expert_grouped: down type " + std::to_string(L.d_type));
     }
     sync_if_needed(stream, e, "native_expert_grouped");
