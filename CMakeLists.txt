@@ -185,6 +185,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
+  # a model's shape from its GGUF metadata, for each architecture the engine is being taught (synthetic GGUFs)
+  add_executable(model_spec_test src/artifact/model_spec_test.cpp)
+  target_link_libraries(model_spec_test PRIVATE strata_artifact)
+  add_test(NAME model_spec_test COMMAND model_spec_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------
