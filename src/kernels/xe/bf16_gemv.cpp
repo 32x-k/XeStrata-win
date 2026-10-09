@@ -25,6 +25,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -86,8 +87,9 @@ struct MmvfAux {
     int64_t ldy = 0;
 };
 
-template<int BLOCK_SIZE, int NT, bool EXACT = false>
-sycl::event launch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+// W: uint16_t for BF16 weights, float for F32 ones (ggml-cuda's mmvf over a float2 pair, the same FMAs and sums).
+template<int BLOCK_SIZE, int NT, bool EXACT = false, class W = uint16_t>
+sycl::event launch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const W* w, float* y, int64_t ldy,
                         int n_in, int64_t n_out, int n_tok_arg, MmvfAux aux = {}) {
     const int n_tok = EXACT ? NT : n_tok_arg;
     return q.submit([&](sycl::handler& h) {
@@ -98,8 +100,9 @@ sycl::event launch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const uint1
             const int t = (int) it.get_local_id(0);
             const size_t rowi = it.get_group(0);
             const bool is_aux = (int64_t) rowi == n_out;
-            const uint16_t* row = is_aux ? aux.w : w + rowi * n_in;
-            const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
+            const W* row = w + rowi * n_in;
+            if constexpr (std::is_same_v<W, uint16_t>)
+                if (is_aux) row = aux.w;
             if constexpr (BLOCK_SIZE > 32) {
                 if (t < 32)
                     for (int k = 0; k < NT; ++k) partials[k * 32 + t] = 0.0f;
@@ -108,8 +111,16 @@ sycl::event launch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const uint1
             float acc[NT];
             for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
             for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
-                const uint32_t weight = weights2[pair];
-                const float w0 = f32_from_bf16((uint16_t) weight), w1 = f32_from_bf16((uint16_t) (weight >> 16));
+                float w0, w1;
+                if constexpr (std::is_same_v<W, uint16_t>) {
+                    const uint32_t weight = reinterpret_cast<const uint32_t*>(row)[pair];
+                    w0 = f32_from_bf16((uint16_t) weight);
+                    w1 = f32_from_bf16((uint16_t) (weight >> 16));
+                } else {
+                    const sycl::float2 weight = reinterpret_cast<const sycl::float2*>(row)[pair];
+                    w0 = weight.x();
+                    w1 = weight.y();
+                }
                 for (int k = 0; k < NT; ++k) {
                     if (k < n_tok) {
                         const float* xin = x + (size_t) k * ldx + 2 * (size_t) pair;
@@ -423,6 +434,30 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
         throw std::invalid_argument("bf16_gemv_fp32_mmvf: null or misaligned pointer");
     auto& q = queue_for(stream);
     dispatch_mmvf<1>(q, x, n_in, w, y, n_out, n_in, n_out, 1);
+    if (!stream) core::Runtime::get().finish(q);
+}
+
+void f32_gemv_fp32_mmvf(const float* x, const float* w, float* y, int64_t n_in, int64_t n_out, void* stream) {
+    if (n_in <= 0 || (n_in & 1) != 0 || n_in > std::numeric_limits<int>::max() ||
+        n_out <= 0 || n_out > std::numeric_limits<int>::max())
+        throw std::invalid_argument("f32_gemv_fp32_mmvf: require positive even n_in and positive n_out <= INT_MAX");
+    if (x == nullptr || w == nullptr || y == nullptr ||
+        (reinterpret_cast<uintptr_t>(x) & 7u) != 0 ||
+        (reinterpret_cast<uintptr_t>(w) & 7u) != 0 ||
+        (reinterpret_cast<uintptr_t>(y) & 3u) != 0)
+        throw std::invalid_argument("f32_gemv_fp32_mmvf: null or misaligned pointer");
+    auto& q = queue_for(stream);
+    const int ni = (int) n_in;
+    switch (mmvf_block_size(n_in)) {
+        case 32: launch_mmvf<32, 1>(q, x, n_in, w, y, n_out, ni, n_out, 1); break;
+        case 64: launch_mmvf<64, 1>(q, x, n_in, w, y, n_out, ni, n_out, 1); break;
+        case 96: launch_mmvf<96, 1>(q, x, n_in, w, y, n_out, ni, n_out, 1); break;
+        case 128: launch_mmvf<128, 1>(q, x, n_in, w, y, n_out, ni, n_out, 1); break;
+        case 160: launch_mmvf<160, 1>(q, x, n_in, w, y, n_out, ni, n_out, 1); break;
+        case 192: launch_mmvf<192, 1>(q, x, n_in, w, y, n_out, ni, n_out, 1); break;
+        case 224: launch_mmvf<224, 1>(q, x, n_in, w, y, n_out, ni, n_out, 1); break;
+        default: launch_mmvf<256, 1>(q, x, n_in, w, y, n_out, ni, n_out, 1); break;
+    }
     if (!stream) core::Runtime::get().finish(q);
 }
 
