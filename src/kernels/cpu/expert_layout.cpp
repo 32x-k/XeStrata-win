@@ -20,6 +20,8 @@ ExpertLayout g_layout;
 
 const ExpertLayout& expert_layout() { return g_layout; }
 
+void expert_layout_set(const ExpertLayout& layout) { g_layout = layout; }
+
 bool cpu_avx512_ok() {
     static const bool ok = [] {
         if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;

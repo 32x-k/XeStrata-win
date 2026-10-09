@@ -2264,7 +2264,84 @@ void ExpertSource::record_inputs(const std::string& pack_experts, const std::str
     // the same resolution open_gguf / load_experts_gguf use: every (layer, role) tensor and the file it is read from
     for (int64_t l = 0; l < lay.n_layers; ++l)
         for (int r = 0; r < 3; ++r)
-            inputs_.push_back({"expert blk." + std::to_string(l) + ".ffn_" + roles[r], expert_gguf_file(gguf, lay, l, r)});
+            inputs_.push_back({"expert blk." + std::to_string(lay.block_of(l)) + ".ffn_" + roles[r],
+                               expert_gguf_file(gguf, lay, l, r)});
+}
+
+bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>& moe_blocks, int64_t n_expert,
+                             int64_t n_embd, int64_t n_ff, std::string& err) {
+    using namespace strata::kernels::cpu;
+    static const char* roles[3] = {"gate", "up", "down"};
+    if (moe_blocks.empty() || n_expert <= 0 || n_embd <= 0 || n_ff <= 0) {
+        err = "experts from the GGUF: the geometry is empty";
+        return false;
+    }
+    try {
+        const strata::GgufModel model = strata::GgufModel::open(gguf);
+        const int64_t n_layers = (int64_t) moe_blocks.size();
+        ExpertLayout L;
+        L.native = true;
+        L.n_layers = n_layers;
+        L.n_expert = n_expert;
+        L.fmt.resize((size_t) n_layers);
+        L.offset.assign((size_t) n_layers, 0);
+        L.bytes.assign((size_t) n_layers, 0);
+        L.gguf_off.assign((size_t) (3 * n_layers), 0);
+        L.gguf_file.assign((size_t) (3 * n_layers), std::string());
+        L.block = moe_blocks;
+        L.max_blob = 0;
+        uint64_t at = 0;
+        for (int64_t l = 0; l < n_layers; ++l) {
+            const strata::TensorInfo* t[3] = {};
+            size_t shard[3] = {};
+            for (int r = 0; r < 3; ++r) {
+                const std::string name = "blk." + std::to_string(moe_blocks[(size_t) l]) + ".ffn_" + roles[r] +
+                                         "_exps.weight";
+                t[r] = model.find(name, &shard[r]);
+                const uint64_t cols = (uint64_t) (r < 2 ? n_embd : n_ff), rows = (uint64_t) (r < 2 ? n_ff : n_embd);
+                if (t[r] == nullptr || t[r]->shape.size() != 3 || t[r]->shape[0] != cols || t[r]->shape[1] != rows ||
+                    t[r]->shape[2] != (uint64_t) n_expert) {
+                    err = "experts from the GGUF: " + name + " is missing or not [" + std::to_string(cols) + ", " +
+                          std::to_string(rows) + ", " + std::to_string(n_expert) + "]";
+                    return false;
+                }
+                if (!model.in_bounds(*t[r], shard[r])) {
+                    err = "experts from the GGUF: " + name + " runs past the end of its file (a truncated shard?)";
+                    return false;
+                }
+            }
+            if (t[0]->type != t[1]->type) {
+                err = "experts from the GGUF: block " + std::to_string(moe_blocks[(size_t) l]) +
+                      " has gate and up of different types";
+                return false;
+            }
+            NativeFmt& f = L.fmt[(size_t) l];
+            if (!native_fmt((int) t[0]->type, (int) t[2]->type, n_embd, n_ff, f, err)) return false;
+            const uint64_t per[3] = {f.up_off, f.up_off, f.bytes - f.down_off};
+            for (int r = 0; r < 3; ++r) {
+                if (strata::tensor_payload_bytes(*t[r]) != per[r] * (uint64_t) n_expert) {
+                    err = "experts from the GGUF: block " + std::to_string(moe_blocks[(size_t) l]) + "'s " + roles[r] +
+                          " tensor is not " + std::to_string(per[r]) + " B per expert";
+                    return false;
+                }
+                const strata::GgufFile& file = model.shard(shard[r]);
+                L.gguf_off[(size_t) (3 * l + r)] = file.data_start() + t[r]->offset;
+                const std::string& path = file.path();
+                const size_t cut = path.find_last_of("/\\");
+                L.gguf_file[(size_t) (3 * l + r)] = cut == std::string::npos ? path : path.substr(cut + 1);
+            }
+            L.offset[(size_t) l] = at;
+            L.bytes[(size_t) l] = f.bytes;
+            L.max_blob = std::max<uint64_t>(L.max_blob, f.bytes);
+            at += (uint64_t) f.bytes * (uint64_t) n_expert;
+        }
+        L.total = at;
+        expert_layout_set(L);
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("experts from the GGUF: ") + e.what();
+        return false;
+    }
 }
 
 bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, std::string& err) {
@@ -2283,7 +2360,7 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
                 const std::string path = expert_gguf_file(gguf, lay, l, r);
                 auto& f = files[path];
                 if (!f) f = std::make_unique<strata::GgufFile>(path);
-                const std::string name = "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight";
+                const std::string name = "blk." + std::to_string(lay.block_of(l)) + ".ffn_" + roles[r] + "_exps.weight";
                 const strata::TensorInfo* t = f->find(name);
                 const uint64_t want_type = (uint64_t) (r < 2 ? fm.gu_type : fm.d_type);
                 // GGUF order: dim 0 is the row (the input), dim 1 the rows, dim 2 the experts

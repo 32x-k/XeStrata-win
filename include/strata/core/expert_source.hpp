@@ -739,6 +739,12 @@ private:
 };
 
 bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, std::string& err);
+/// The routed experts of a GGUF model read in place (no pack, no experts.bin) as the process-wide expert layout: per
+/// MoE layer i (the model's block moe_blocks[i]), the gate / up / down types, the blob, and the tensors' files and
+/// offsets in the shards of `gguf`'s model (any of its shards).  Gate and up are [n_embd, n_ff, n_expert], down
+/// [n_ff, n_embd, n_expert].  A FileExpertSource reads it with set_gguf(`gguf`) and no experts.bin.
+bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>& moe_blocks, int64_t n_expert,
+                             int64_t n_embd, int64_t n_ff, std::string& err);
 LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst,
                           const strata::kernels::cpu::ExpertLayout& lay, int threads);
 

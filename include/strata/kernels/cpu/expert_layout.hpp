@@ -30,10 +30,15 @@ struct ExpertLayout {
     /// the model's shards split the layers (Swift's GGUFs: layers 13-47 in shard 2, and layer 13's down tensor in
     /// shard 1) (3 x n_layers).  Empty = the --native shard itself.
     std::vector<std::string> gguf_file;
+    /// Per layer of this table, the model's block that holds it (`blk.<block>.ffn_*_exps`): a model whose first blocks
+    /// have no routed experts (GLM-5.3's three dense ones) numbers its MoE layers apart from its blocks.  Empty: the
+    /// same numbers.
+    std::vector<int64_t> block;
     int version = 0;                      ///< native_experts.txt's header version (0 = none given)
     uint64_t max_blob = BLOB;
     uint64_t total = 0;                   ///< experts.bin size
 
+    int64_t block_of(int64_t layer) const { return block.empty() ? layer : block[(size_t) layer]; }
     uint64_t blob_bytes(int64_t layer) const { return native ? bytes[(size_t) layer] : (uint64_t) BLOB; }
     uint64_t layer_offset(int64_t layer) const {
         return native ? offset[(size_t) layer] : (uint64_t) layer * (uint64_t) n_expert * (uint64_t) BLOB;
@@ -75,6 +80,8 @@ const ExpertLayout& expert_layout();
 /// Reads `<pack_dir>/native_experts.txt` when it exists (a native pack), else sets the canonical layout.
 /// Versions up to kExpertLayoutVersion are read; a newer one is refused (a newer packer wrote it).
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
+/// Replaces the process-wide layout (expert_layout_from_gguf builds one from a model's GGUF).
+void expert_layout_set(const ExpertLayout& layout);
 /// The newest native_experts.txt this engine reads.  v4 = v3 plus the per-role shard column `gate,up,down`,
 /// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
 inline constexpr int kExpertLayoutVersion = 4;
