@@ -72,6 +72,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/artifact/model_spec.hpp"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/resource.h>
@@ -3347,16 +3348,20 @@ int main(int argc, char** argv) {
     double gguf_rope_base = 0, gguf_rope_factor = 0, gguf_rope_orig_ctx = 0;
     if (!o.native_preset.empty()) {
         // a pruned variant (GSQ-RCO Coder) ships fewer experts than the canonical 512x10; the model file
-        // is the authority on its own MoE shape - everything else in the geometry is unchanged
+        // is the authority on its own MoE shape, and every other value it writes must be the geometry's
         try {
             strata::GgufFile model_gguf(o.native_preset);
-            if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
-            if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
-            if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.freq_base")) gguf_rope_base = v->num();
-            if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.type")) gguf_rope_type = v->s;
-            if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.factor")) gguf_rope_factor = v->num();
-            if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.original_context_length"))
-                gguf_rope_orig_ctx = v->num();
+            strata::ModelSpec spec;
+            std::string err;
+            if (!strata::read_model_spec(model_gguf, spec, err) || !strata::core::geometry_from_spec(spec, g, err)) {
+                std::fprintf(stderr, "strata generate: %s: %s\n", o.native_preset.c_str(), err.c_str());
+                return 1;
+            }
+            K = spec.n_expert_used;
+            gguf_rope_base = spec.rope_base;
+            gguf_rope_type = spec.rope_scaling_type;
+            gguf_rope_factor = spec.rope_scaling_factor;
+            gguf_rope_orig_ctx = spec.rope_scaling_orig_ctx;
         } catch (const std::exception& e) {
             std::fprintf(stderr, "strata generate: reading the model's expert shape from %s: %s\n",
                          o.native_preset.c_str(), e.what());
