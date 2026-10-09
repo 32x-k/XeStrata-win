@@ -1761,6 +1761,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) MAXT);
     const ExpertLayout& lay = expert_layout();
     const bool native = lay.native;
+    // the activation width: a native layer's own (models other than Qwen3.8), else the S2 kernels' compiled H
+    const int64_t W = native ? lay.fmt[(size_t) d.layers].n_embd : (int64_t) H;
     if (native && d.nact_multi.size() < (size_t) MAXT * kNativeActBytes) d.nact_multi.resize((size_t) MAXT * kNativeActBytes);
     if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
     if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
@@ -1937,12 +1939,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const auto c1 = std::chrono::steady_clock::now();
     if (!any_cpu) {
     } else if (native && lay.fmt[(size_t) d.layers].gu_type == 42) {   // a native Q2_0 pack: the Q2_0 kernels' activations
-        for (int64_t t = 0; t < n_tok; ++t) act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+        for (int64_t t = 0; t < n_tok; ++t) act_quant_any(x_f + (size_t) t * W, (int) W, d.act_multi[(size_t) t]);
     } else if (native) {
         for (int64_t t = 0; t < n_tok; ++t)
-            native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
+            native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * W, d.nact_multi.data() + (size_t) t * kNativeActBytes);
     } else {
-        for (int64_t t = 0; t < n_tok; ++t) act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+        for (int64_t t = 0; t < n_tok; ++t) act_quant_q8_1(x_f + (size_t) t * W, (int) W, d.act_multi[(size_t) t]);
     }
     const auto c2 = std::chrono::steady_clock::now();
     if (any_cpu) {   // the experts the CPU computes, fetched together (the GGUF in place reads them on several threads)
@@ -1959,7 +1961,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
             const int64_t e = ids[i];
-            float* row = out + (size_t) i * H;
+            float* row = out + (size_t) i * W;
             if (e < 0 || e >= d.n_expert) {
                 d.failed = true;
                 d.fail = "a routed expert id is out of range";
@@ -1975,7 +1977,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote result staged into this row below
                 if (kind[i] == 0) ++d.cache_hits;
                 else ++d.offload_entries;                       // #588: PCIe or another GPU
-                if (!(gpu_zeroes_hits && kind[i] <= 1)) std::memset(row, 0, (size_t) H * sizeof(float));
+                if (!(gpu_zeroes_hits && kind[i] <= 1)) std::memset(row, 0, (size_t) W * sizeof(float));
                 continue;
             }
             ++d.cache_refused;
