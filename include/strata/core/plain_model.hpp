@@ -144,11 +144,17 @@ private:
         int32_t *src = nullptr, *slot = nullptr, *bounds = nullptr;
         uint16_t *dq_gu = nullptr, *dq_d = nullptr;   ///< kGroup experts' FP16 weights
         uint8_t* stage = nullptr;          ///< kGroup expert blobs copied from RAM
+        uint8_t *xq = nullptr, *hq = nullptr;   ///< the int8 products' activations: the routed rows, the SwiGLU's
+        int32_t* identity = nullptr;       ///< row i is row i (the int8 products' output map)
+        const uint8_t** wtab = nullptr;    ///< a layer's experts' blobs, for the int8 products
+        int32_t* rbounds = nullptr;        ///< each group's bounds from its first row (the down product's)
         uint16_t* gemm_scratch = nullptr;  ///< Gemm::native's dequantized weight
         // pinned host
         float* emb = nullptr;              ///< T rows of n_embd
         int32_t *h_steps = nullptr, *h_pos = nullptr, *h_ids = nullptr, *h_src = nullptr, *h_slot = nullptr,
                 *h_bounds = nullptr;
+        const uint8_t** h_wtab = nullptr;
+        int32_t* h_rbounds = nullptr;
     };
     /// Lays the buffers for chunks of `T` tokens out from `dev` / `host` (null: only counts), returning the device and
     /// host bytes.

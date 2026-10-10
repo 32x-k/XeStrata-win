@@ -31,6 +31,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 
@@ -51,6 +52,8 @@ namespace k = strata::kernels;
 /// The products' state: Gemm over the dequantization scratch carved with the other buffers.
 struct PlainModel::PromptGemm {
     prefill::Gemm gemm;
+    prefill::mmq::Context mmq;
+    bool identity = false;   // pb_.identity written
 };
 
 void PlainModel::prompt_gemm_free(PromptGemm* g) { delete g; }
@@ -134,6 +137,18 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
         gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
     };
     const int attn_batch = std::max(1, std::min(opt_.max_t, 8));   // queries an attention launch takes (its scratch)
+    // the routed experts in their quantized blocks (int8 products, iq_mmq) where the GPU runs them and the layer's
+    // types are theirs, else dequantized to FP16; STRATA_PLAIN_MMQ=0 keeps FP16
+    static const bool mmq_env = [] {
+        const char* v = std::getenv("STRATA_PLAIN_MMQ");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    const bool mmq_on = mmq_env && prefill::mmq::built() && N % 128 == 0 && FF % 128 == 0;
+    PromptGemm& pg = prompt_gemm();
+    if (mmq_on && !pg.identity) {
+        prefill::mmq::iota(P.identity, P.T * K, cs);
+        pg.identity = true;
+    }
     // STRATA_PROMPT_PROFILE=1: the time of each stage, the stream synchronized after each (slower; for finding where it
     // goes): 0 the GDN layers, 4 the attention layers, 1 the router and the host's grouping, 2 the experts, 3 the shared
     // expert and the combine
@@ -266,13 +281,68 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                     err = std::string("plain prompt: the groups: ") + strata::gpu::last_error();
                     return false;
                 }
-                prefill::gather_rows16(P.x16, P.src, P.xs16, T * K, N, cs);
-                mark(1, t_mark);
                 const auto& f = lay.fmt[(size_t) ml];
+                const bool use_mmq = mmq_on && prefill::mmq::supported(f.gu_type) && prefill::mmq::supported(f.d_type) &&
+                                     f.up_off == prefill::mmq::matrix_bytes(f.gu_type, FF, N);   // up right after gate
+                if (use_mmq) prefill::mmq::quantize(P.hn, P.src, P.xq, f.gu_type, N, N, T * K, cs);
+                else prefill::gather_rows16(P.x16, P.src, P.xs16, T * K, N, cs);
+                mark(1, t_mark);
                 const bool transient = src_->transient(ml, experts.empty() ? 0 : experts[0]);
                 int64_t max_rows = 0;
                 for (int32_t e : experts) max_rows = std::max<int64_t>(max_rows, count[(size_t) e]);
-                for (size_t g0 = 0; g0 < experts.size(); g0 += PromptBufs::kGroup) {
+                // int8: as many experts a launch as the staging lets (those in VRAM read where they lie, kGroup from
+                // RAM at most), gate/up, the SwiGLU, its rows to int8, down
+                for (size_t g0 = 0, gi = 0; use_mmq && g0 < experts.size(); ++gi) {
+                    if (transient && !strata::gpu::stream_sync(cs)) {   // the staging's last readers are done
+                        err = std::string("plain prompt: ") + strata::gpu::last_error();
+                        return false;
+                    }
+                    size_t g1 = g0;
+                    int staged = 0;
+                    int64_t mr = 0;
+                    for (; g1 < experts.size(); ++g1) {
+                        const int32_t e = experts[g1];
+                        const int32_t sl = res_[(size_t) (ml * E + e)];
+                        const uint8_t* blob = nullptr;
+                        if (sl >= 0) {
+                            blob = cache_.device_slot(sl);
+                        } else {
+                            if (staged == PromptBufs::kGroup) break;
+                            uint8_t* dst = P.stage + (size_t) staged++ * lay.max_blob;
+                            const uint8_t* hb = src_->blob(ml, e);
+                            const bool copied = hb != nullptr &&
+                                (transient ? strata::gpu::copy(dst, hb, f.bytes) : strata::gpu::copy_async(dst, hb, f.bytes, cs));
+                            if (!copied) { err = "plain prompt: an expert could not be read"; return false; }
+                            blob = dst;
+                        }
+                        P.h_wtab[g1] = blob;
+                        mr = std::max<int64_t>(mr, count[(size_t) e]);
+                    }
+                    const int G = (int) (g1 - g0);
+                    const int32_t r0 = P.h_bounds[g0], nr = P.h_bounds[g1] - r0;
+                    int32_t* hrb = P.h_rbounds + g0 + gi;
+                    for (int q = 0; q <= G; ++q) hrb[q] = P.h_bounds[g0 + (size_t) q] - r0;
+                    if (!strata::gpu::copy_async(P.wtab + g0, P.h_wtab + g0, (size_t) G * sizeof(void*), cs) ||
+                        !strata::gpu::copy_async(P.rbounds + g0 + gi, hrb, (size_t) (G + 1) * 4, cs)) {
+                        err = std::string("plain prompt: the groups: ") + strata::gpu::last_error();
+                        return false;
+                    }
+                    prefill::mmq::Product gu;
+                    gu.type = f.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.n = G; gu.xq = P.xq;
+                    gu.bounds = P.bounds + g0; gu.ids = P.identity; gu.total_rows = T * K; gu.max_rows = mr;
+                    gu.dst = P.gu; gu.ld_dst = 2 * FF; gu.wtab = P.wtab + g0; gu.woff = 0;
+                    pg.mmq.run(gu, cs);
+                    prefill::mmq::swiglu(P.gu + (int64_t) r0 * 2 * FF, P.hh + (int64_t) r0 * FF, nr, FF,
+                                         /*interleaved=*/false, cs);
+                    prefill::mmq::quantize(P.hh + (int64_t) r0 * FF, nullptr, P.hq, f.d_type, FF, FF, nr, cs);
+                    prefill::mmq::Product dn;
+                    dn.type = f.d_type; dn.w_rows = N; dn.w_cols = FF; dn.n = G; dn.xq = P.hq;
+                    dn.bounds = P.rbounds + g0 + gi; dn.ids = P.identity; dn.total_rows = nr; dn.max_rows = mr;
+                    dn.dst = P.dm + (int64_t) r0 * N; dn.ld_dst = N; dn.wtab = P.wtab + g0; dn.woff = f.down_off;
+                    pg.mmq.run(dn, cs);
+                    g0 = g1;
+                }
+                for (size_t g0 = 0; !use_mmq && g0 < experts.size(); g0 += PromptBufs::kGroup) {
                     const int G = (int) std::min<size_t>(PromptBufs::kGroup, experts.size() - g0);
                     if (transient && !strata::gpu::stream_sync(cs)) {   // the staging's last readers are done
                         err = std::string("plain prompt: ") + strata::gpu::last_error();
