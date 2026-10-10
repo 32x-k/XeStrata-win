@@ -48,6 +48,9 @@ struct PlainOptions {
     /// low-RAM mode, taken by itself when the RAM available is less than the experts.  It has no PCIe share.
     bool mmap_experts = false;
     bool pcie_split = true;         ///< split the missed experts between the CPU and PCIe by measured times
+    /// A ranking of (MoE layer, expert) pairs (expert_cache.hpp's profile format) the VRAM tier is filled from at load,
+    /// each layer up to its slots; empty: the tier starts empty and the adaptive rule fills it.
+    std::string profile;
 };
 
 class PlainModel {
@@ -75,6 +78,9 @@ public:
     int64_t hits() const { return disp_.cache_hits; }
     int64_t misses() const { return disp_.cache_refused; }
     int64_t swaps() const { return swaps_total_; }
+    /// Writes what this run learned as a profile (rank_learned_profile: the experts in VRAM now, then by the routing
+    /// counted since the load, then by the profile it started from), for the next load's `profile`.
+    bool save_profile(const std::string& path, std::string& err) const;
 
 private:
     struct W {   // one 2-D projection in VRAM, in its GGUF blocks (or the engine's row order for Q6_K)
@@ -101,6 +107,7 @@ private:
     bool record(int T, std::string& err);
     bool record_window(int T, strata::gpu::Stream cs, std::string& err);
     bool adapt(std::string& err);
+    bool fill_slot(int64_t layer, int32_t expert, std::string& err);
     static void pool_fn(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                         int64_t layer);
 
@@ -126,6 +133,8 @@ private:
     MoeWindow win_;
     std::vector<int32_t> res_;                    ///< [moe layer][expert] slot or -1
     std::vector<std::vector<int32_t>> free_;      ///< per moe layer, its free slots
+    std::vector<double> heat_;                    ///< [moe layer][expert] routed entries since the load
+    std::vector<std::pair<int32_t, int32_t>> prior_;   ///< the profile the tier was filled from
     int64_t n_slots_ = 0;
     int64_t windows_ = 0, swaps_total_ = 0;
     uint8_t* fill_tmp_ = nullptr;                 ///< pinned staging for a slot fill

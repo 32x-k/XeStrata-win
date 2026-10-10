@@ -399,9 +399,23 @@ bool PlainModel::open_experts(std::string& err) {
     if (!cache_.open_sized(slot_bytes, L, E, err)) return false;
     n_slots_ = (int64_t) slot_bytes.size();
     res_.assign((size_t) (L * E), -1);
+    heat_.assign((size_t) (L * E), 0.0);
     if (!strata::gpu::alloc_host(&fill_tmp_, (size_t) lay.max_blob)) {
         err = "plain model: pinned staging for the slot fills";
         return false;
+    }
+
+    if (!opt_.profile.empty()) {   // the tier from a profile: its ranking, each layer up to its slots
+        int64_t ranked_slots = 0;
+        if (!read_expert_profile(opt_.profile, L, E, prior_, ranked_slots, err)) return false;
+        int64_t filled = 0;
+        for (const auto& [l, e] : prior_)
+            if (!free_[(size_t) l].empty()) {
+                if (!fill_slot(l, e, err)) return false;
+                ++filled;
+            }
+        std::fprintf(stderr, "strata plain: the VRAM tier filled from %s: %lld experts\n", opt_.profile.c_str(),
+                     (long long) filled);
     }
 
     MoeWindowShape ws;
@@ -477,6 +491,9 @@ bool PlainModel::reset(std::string& err) {
 void PlainModel::pool_fn(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                          int64_t layer) {
     PlainModel* m = (PlainModel*) user;
+    const int64_t E = m->spec_.n_expert;
+    for (int64_t i = 0; i < n_tok * k; ++i)
+        if (ids[i] >= 0 && ids[i] < E) m->heat_[(size_t) (layer * E + ids[i])] += 1.0;
     m->disp_.layers = layer;
     expert_pool_dispatch_multi(m->disp_, x_f, ids, n_tok, k, out);
 }
@@ -667,6 +684,28 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
     return true;
 }
 
+// One of `layer`'s free slots takes `expert`, read from the expert source (blocking: between windows, or at load).
+bool PlainModel::fill_slot(int64_t layer, int32_t expert, std::string& err) {
+    auto& f = free_[(size_t) layer];
+    if (f.empty()) { err = "plain model: no free slot in the layer"; return false; }
+    const int32_t slot = f.back();
+    if (!src_->copy_blob(layer, expert, fill_tmp_) ||
+        !cache_.fill_slot_blocking(slot, fill_tmp_, err, (int64_t) k::cpu::expert_layout().blob_bytes(layer))) {
+        if (err.empty()) err = "plain model: an expert could not be read for the VRAM tier";
+        return false;
+    }
+    f.pop_back();
+    res_[(size_t) (layer * spec_.n_expert + expert)] = slot;
+    return true;
+}
+
+bool PlainModel::save_profile(const std::string& path, std::string& err) const {
+    const int64_t L = spec_.n_moe_layers(), E = spec_.n_expert;
+    std::vector<uint8_t> resident((size_t) (L * E), 0);
+    for (size_t i = 0; i < res_.size(); ++i) resident[i] = res_[i] >= 0;
+    return write_expert_profile(path, L, E, rank_learned_profile(L, E, resident, heat_, prior_), err);
+}
+
 // XeStrata's adaptive tier (generate.cpp's `adapt`): per MoE layer, a missing expert routed at least twice (decayed
 // counts) replaces the least-routed resident one when it leads by 1.5, or takes a free slot; at most adapt_swaps a
 // round, the largest gains first; then the counts decay.  Runs between windows, so no window reads a slot it changes.
@@ -697,24 +736,15 @@ bool PlainModel::adapt(std::string& err) {
     }
     std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
     if ((int) swaps.size() > opt_.adapt_swaps) swaps.resize((size_t) opt_.adapt_swaps);
-    const auto& lay = k::cpu::expert_layout();
     for (const Swap& w : swaps) {
-        int32_t slot;
         if (w.out < 0) {
-            auto& f = free_[(size_t) w.layer];
-            if (f.empty()) continue;
-            slot = f.back();
-            f.pop_back();
-        } else {
-            slot = res_[(size_t) (w.layer * E + w.out)];
+            if (free_[(size_t) w.layer].empty()) continue;
+        } else {   // the evicted expert's slot becomes the layer's free one, which the fill takes
+            const int32_t slot = res_[(size_t) (w.layer * E + w.out)];
             res_[(size_t) (w.layer * E + w.out)] = -1;
+            free_[(size_t) w.layer].push_back(slot);
         }
-        if (!src_->copy_blob(w.layer, w.in, fill_tmp_) ||
-            !cache_.fill_slot_blocking(slot, fill_tmp_, err, (int64_t) lay.blob_bytes(w.layer))) {
-            if (err.empty()) err = "plain model: an expert could not be read for the VRAM tier";
-            return false;
-        }
-        res_[(size_t) (w.layer * E + w.in)] = slot;
+        if (!fill_slot(w.layer, w.in, err)) return false;
         ++swaps_total_;
     }
     for (float& v : disp_.usage) v *= opt_.adapt_decay;

@@ -4,6 +4,7 @@
 //
 //     strata --native MODEL.gguf --tokens 1,2,3 [--n 32] [--max-context N] [--max-t T] [--threads N]
 //            [--dump-logits FILE] [--adapt-every N] [--mmap-experts] [--no-pcie-split]
+//            [--expert-profile FILE] [--expert-profile-save FILE]
 //
 // The prompt runs in windows of up to T tokens, then one token a window, greedily.  stdout gets one line,
 // `tokens: a,b,c`, the generated ids; --dump-logits writes the logits each generated token was chosen from, n_vocab
@@ -69,7 +70,7 @@ int plain_main(int argc, char** argv) {
     opt.gguf = gguf;
     std::vector<int32_t> prompt;
     int64_t n_new = 32;
-    std::string dump_path;
+    std::string dump_path, profile_save;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -94,6 +95,8 @@ int plain_main(int argc, char** argv) {
         else if (a == "--gpu") (void) next("--gpu");
         else if (a == "--mmap-experts") opt.mmap_experts = true;
         else if (a == "--no-pcie-split") opt.pcie_split = false;
+        else if (a == "--expert-profile") opt.profile = next("--expert-profile");
+        else if (a == "--expert-profile-save") profile_save = next("--expert-profile-save");
         else {
             std::fprintf(stderr, "strata (%s): unknown option %s\n", arch.c_str(), a.c_str());
             return 2;
@@ -153,6 +156,10 @@ int plain_main(int argc, char** argv) {
         if (!emit(0)) return 1;
     }
     const Clock::time_point t3 = Clock::now();
+    if (!profile_save.empty() && !model.save_profile(profile_save, err)) {
+        std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+        return 1;
+    }
     std::printf("tokens: ");
     for (size_t i = 0; i < produced.size(); ++i) std::printf(i ? ",%d" : "%d", produced[i]);
     std::printf("\n");
