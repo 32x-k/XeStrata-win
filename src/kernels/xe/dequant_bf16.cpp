@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/xe/dequant_bf16.cpp - the Xe port of Strata's src/kernels/cuda/dequant_bf16.cu: whole-row dequantization of
 // the legacy, K-quant and IQ4 block formats (and Q2_0) to BF16, FP16 or FP32, one work-item per 32-element group,
-// with the CUDA kernel's expressions.  The i-quant formats go to iq_kernels as in CUDA.
+// with the CUDA kernel's expressions.  The i-quant formats go to iq_kernels as in CUDA.  BF16 (qwen35moe's BF16 files)
+// is widened exactly: into BF16 a copy, into FP16 a conversion that rounds where FP16 has fewer exponent bits.
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -154,6 +155,10 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
             else q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
             put(out, l, d * (float) sc[is + 2 * qu] * (float) (q - 32));
         }
+    } else if constexpr (TYPE == 30) {                             // BF16: 32 values of 2 B, a "block" of 64 B
+        const uint8_t* b = row_blocks + (size_t) gi_in_row * 64;
+        for (int l = 0; l < 32; ++l)
+            put(out, l, sycl::bit_cast<float>((uint32_t) (b[2 * l] | (b[2 * l + 1] << 8)) << 16));
     } else if constexpr (TYPE == kNativeQ6KRows) {                 // Q6_K split by row (native_mmvq.hpp)
         const size_t bpr = (size_t) groups_per_row / 8, blk = (size_t) (gi_in_row / 8);
         const int gi = gi_in_row % 8, n = gi / 4, qu = gi % 4;
@@ -233,6 +238,7 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     case kNativeQ8Rows: block_elems = 64; block_bytes = 68; return true;
     case 23: block_elems = 256; block_bytes = 136; return true;
     case 42: block_elems = 64; block_bytes = 18; return true;
+    case 30: block_elems = 32; block_bytes = 64; return true;   // BF16, in 32-value pieces
     default: return false;
     }
 }
@@ -263,6 +269,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     case 20: STRATA_DQ(20);
     case 23: STRATA_DQ(23);
     case 42: STRATA_DQ(42);
+    case 30: STRATA_DQ(30);
     }
 #undef STRATA_DQ
     if (!stream) core::Runtime::get().wait(e, "dequant");
