@@ -807,8 +807,8 @@ def collect(out: Path, names: dict[str, str], say: Callable = print) -> None:
     if rows or (out / "runs").is_dir():
         (out / "matrix.json").write_text(json.dumps(rows, indent=1) + "\n")
     for gpu in sorted({r["gpu"] for r in rows}):
-        for key, title, fmt in (("prefill_tok_s", "Prompt (tokens/s)", "{:,.0f}"),
-                                ("decode_tok_s", "Output (tokens/s)", "{:.1f}")):
+        for key, title, fmt in (("prefill_tok_s", "Prefill (tokens/s)", "{:,.0f}"),
+                                ("decode_tok_s", "Decode (tokens/s)", "{:.1f}")):
             say(f"\n### {gpu}: {title}\n\n| Engine | " + " | ".join(t.upper() for t in COLLECT_TIERS) + " |")
             say("| --- |" + " ---: |" * len(COLLECT_TIERS))
             for name in names.values():
@@ -843,9 +843,9 @@ def collect(out: Path, names: dict[str, str], say: Callable = print) -> None:
         tiers = [t for t in COLLECT_TIERS if any(r["tier"] == t for r in serve)]
         for gpu in sorted({r["gpu"] for r in serve}):
             for mode in sorted({r["mode"] for r in serve}):
-                for key, title, fmt in (("prefill_tok_s", "Prompt (tokens/s)", "{:,.0f}"),
+                for key, title, fmt in (("prefill_tok_s", "Prefill (tokens/s)", "{:,.0f}"),
                                         ("cont_ms", "Follow-ups (ms)", "{:,.0f}"),
-                                        ("decode_tok_s", "Output (tokens/s)", "{:.1f}")):
+                                        ("decode_tok_s", "Decode (tokens/s)", "{:.1f}")):
                     say(f"\n### {gpu} serve {mode}: {title}\n\n| Engine | " + " | ".join(t.upper() for t in tiers)
                         + " |")
                     say("| --- |" + " ---: |" * len(tiers))
