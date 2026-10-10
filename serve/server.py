@@ -2069,6 +2069,18 @@ def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
     args = list(cfg["args"])
+    # #1322: a config with a "vision" section but without --vision in its args (written by an older setup run, or edited by
+    # hand) advertised images and then refused every picture ("this engine was started without --vision").  The section
+    # says images are wanted: start the engine with them, and keep the encoder's VRAM free as setup does for a GPU encoder
+    # (only when the config has no reserve of its own).
+    if isinstance(cfg.get("vision"), dict) and "--vision" not in args:
+        args.append("--vision")
+        note = "added --vision"
+        if cfg["vision"].get("gpu") and "--vram-reserve-mib" not in args:
+            args += ["--vram-reserve-mib", "700"]
+            note += " and --vram-reserve-mib 700"
+        print(f'[strata] the config has a "vision" section but no --vision in its args: {note} (run setup again with '
+              "--vision to write them)", flush=True)
     if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
     # the Xe engine's layer split (setup --gpus): the later GPUs by PCI address; STRATA_LAYER_SPLIT=off (setup --gpu N

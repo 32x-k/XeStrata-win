@@ -1865,6 +1865,22 @@ class PcieShare(unittest.TestCase):
         self.assertIn("expert cache 60.0% hit (+20.0% of the routed experts over PCIe)", out.getvalue())
 
 
+class VisionSection(unittest.TestCase):
+    """#1322: a config with a "vision" section starts the engine with images even when its args lack --vision."""
+
+    def test_a_vision_section_starts_the_engine_with_images_1322(self):
+        args = ["--native", "x"]
+        got = engine_args({"args": list(args), "vision": {"exe": "v", "gpu": True}})
+        self.assertEqual(got, args + ["--vision", "--vram-reserve-mib", "700"])
+        got = engine_args({"args": list(args), "vision": {"exe": "v", "gpu": False}})
+        self.assertEqual(got, args + ["--vision"])
+        mine = args + ["--vram-reserve-mib", "1500"]
+        self.assertEqual(engine_args({"args": list(mine), "vision": {"gpu": True}}), mine + ["--vision"])
+        done = args + ["--vision", "--vram-reserve-mib", "700"]                  # setup wrote it: unchanged
+        self.assertEqual(engine_args({"args": list(done), "vision": {"gpu": True}}), done)
+        self.assertEqual(engine_args({"args": list(args)}), args)                # no section: no images
+
+
 class LearnedProfile(unittest.TestCase):
     """#477: "expert_profile_save" in the config: the engine saves its learned profile there, and the next start
     begins from it when it is a profile of the same model; without the key the arguments are unchanged."""
