@@ -54,6 +54,7 @@ namespace {
 namespace k = strata::kernels;
 
 constexpr int kQ6K = 14;
+constexpr int kBF16 = 30;   // a BF16 file's projections: bf16_gemv_fp32_mmvf_multi on the FP32 rows
 constexpr int kF32 = 0;
 
 bool mapped(size_t bytes, void** h, void** d) {
@@ -98,7 +99,7 @@ bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::
     w.type = (int) t->type;
     w.n_in = (int) t->shape[0];
     w.n_out = (int) t->shape[1];
-    if (!k::native_mmvq_supported(w.type)) {
+    if (!k::native_mmvq_supported(w.type) && !(w.type == kBF16 && w.n_in % 2 == 0)) {
         err = "plain model: " + name + " is " + t->type_name() + ", which the native matrix-vector kernels do not take";
         return false;
     }
@@ -273,6 +274,17 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     }
 
     if (nkv_ == 0) { err = "plain model: the model has no attention block"; return false; }
+    // the BF16 projections' two GEMV forms timed for each shape a window takes, before any graph is recorded; the
+    // head is left to the default form (its timing would allocate a second copy of it)
+    try {
+        for (const Block& b : blocks_)
+            for (const W* w : {&b.qkv, &b.z, &b.alpha, &b.beta, &b.ssm_out, &b.q, &b.k, &b.v, &b.o, &b.sh_gate, &b.sh_up,
+                               &b.sh_down})
+                if (w->type == kBF16) k::bf16_gemv_fp32_mmvf_multi_tune(w->n_in, w->n_out, cs_);
+    } catch (const std::exception& e) {
+        err = std::string("plain model: timing the BF16 products: ") + e.what();
+        return false;
+    }
     // per-sequence state
     const int64_t C = 2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner;
     const k::QsaShapes qs = attn_shapes(s, nkv_);
@@ -639,6 +651,11 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) 
     const int32_t* pos_q = pos_;
     const int32_t* pos_k = pos_ + (size_t) opt_.max_t * NH;
     auto proj = [&](const W& w, const float* x, float* y, int ncols, bool quantize) {
+        if (w.type == kBF16) {   // from the FP32 rows x (row stride n_in), as llama.cpp's float products
+            k::bf16_gemv_fp32_mmvf_multi(x, w.n_in, static_cast<const uint16_t*>(w.data), y, w.n_out, w.n_in, w.n_out,
+                                         ncols, cs);
+            return;
+        }
         if (quantize) k::native_quantize_q8_1(x, xq_, w.n_in, ncols, cs);
         k::native_mmvq(w.type, w.data, xq_, y, w.n_in, w.n_out, ncols, cs);
     };
@@ -704,7 +721,13 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) 
         k::router_top10(rlog_, T, (int) E, (int) K, ids_, w_, cs);
         ++ring;
         win_.publish(ring, 0, 0, T, hn_, ids_, w_, cs);
-        if (has_shared_) {
+        if (has_shared_ && (b.sh_gate.type == kBF16 || b.sh_down.type == kBF16)) {   // in FP32 between the products
+            proj(b.sh_gate, hn_, sh_gate_, T, true);
+            proj(b.sh_up, hn_, sh_up_, T, false);
+            k::native_swiglu_f32(sh_gate_, sh_up_, sh_gate_, (int) FS, T, cs);
+            proj(b.sh_down, sh_gate_, shared_, T, true);
+            k::f32_gemv_fp32_mmvf_multi(hn_, N, b.sh_gate_inp, sh_g_, 1, N, 1, T, cs);
+        } else if (has_shared_) {
             k::native_quantize_q8_1(hn_, xq_, (int) N, T, cs);
             if (!k::native_mmvq_pair(b.sh_gate.type, b.sh_gate.data, b.sh_up.data, xq_, sh_gate_, sh_up_, (int) N,
                                      (int) FS, T, cs)) {

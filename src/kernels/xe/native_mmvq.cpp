@@ -774,6 +774,20 @@ void native_swiglu_q8_1(const float* gate, const float* up, void* x_q8_1, int n_
     });
 }
 
+void native_swiglu_f32(const float* gate, const float* up, float* out, int n_in, int ncols, void* stream) {
+    validate_shape(n_in, ncols);
+    validate_pointer(gate);
+    validate_pointer(up);
+    validate_pointer(out);
+    auto& q = validate_stream(stream);
+    q.parallel_for(sycl::range<1>((std::size_t) n_in * (std::size_t) ncols), [=](sycl::id<1> id) {
+#pragma clang fp contract(off)
+        const std::size_t i = id[0];
+        const float g = gate[i];
+        out[i] = g / (1.0f + sycl::exp(-g)) * up[i];
+    });
+}
+
 void native_q5_k_mmvq(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* s) { mmvq<Q5KTraits>(w, x, y, n_in, n_out, ncols, s); }
 void native_q5_k_f32(const void* w, const float* x, void* xq, float* y, int n_in, int n_out, int ncols, void* s) { mmvq_f32<Q5KTraits>(w, x, xq, y, n_in, n_out, ncols, s); }
 void native_q2_0_mmvq(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* s) { mmvq<Q20Traits>(w, x, y, n_in, n_out, ncols, s); }
