@@ -75,6 +75,16 @@ For each idea:
 A condition measured only on upstream's GPUs is not a reason to keep it: step 4 measures the idea on XeStrata's GPUs and puts its own condition, from what the device reports.
 A host-side policy upstream keeps behind its backend (`#if` on CUDA, a check of the backend) is ported without that condition, under XeStrata's own (step 4).
 
+**What earlier runs missed.** Earlier runs ported by hand, and the small fixes of setup, serve and tools were the easiest to miss (2026-10-11: eleven of them, from before v0.1.40.2).
+List upstream's commits whose surviving lines XeStrata mostly lacks, over all of upstream's history, not only this range:
+
+```sh
+python .claude/skills/upstream-sync/scripts/carryover.py <tag> --ref dev --ledger .upstream-*.md
+```
+
+It compares the lines each commit added that upstream still has at the tag with the same file in `dev` (comments and short lines left out); a fix of one or two lines is not found this way.
+Read each one listed: what XeStrata does not have and needs goes into the ledger (a line under its own heading) and is ported as in step 3; the rest gets `N/A` and why (CUDA, HIP or Windows only; XeStrata does it another way), so the next run's `--ledger` leaves it out.
+
 **The findings.** upstream's records and community reports of this range (`bench/`, its investigation documents) said something about a GPU or a setting XeStrata runs on (an Intel Arc investigation, a card's bottleneck, a setting users run): a line each, with what XeStrata could take from it. They are worked like ideas in step 4 when they point at something to try.
 
 ## 3. Port the shared changes
