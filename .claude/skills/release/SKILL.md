@@ -27,7 +27,7 @@ Rules for the whole run:
 ## 1. Check the starting point
 
 ```sh
-git status --short                        # must be empty, on dev
+git status --short --untracked-files=no   # must be empty, on dev
 gh auth status 2>&1 | grep -v -i token    # logged in to github.com as MistVVK
 docker info --format '{{.ServerVersion}}' # the package builds run in Docker
 git fetch origin main --tags
@@ -35,7 +35,8 @@ git merge-base --is-ancestor main dev     # main must fast-forward to dev
 git tag -l 'xe*' --sort=-v:refname | head -n 1; git ls-remote --tags origin 'xe*'
 ```
 
-Stop and report if the tree is not clean, gh is not logged in, Docker does not answer, or `main` has commits `dev` lacks.
+Stop and report if a tracked file has changes, gh is not logged in, Docker does not answer, or `main` has commits `dev` lacks.
+Untracked files (a record not yet committed, for example) may stay: the packages are built from the tag, and the push takes only commits.
 The newest `xe*` tag is the previous release (none before the first one).
 
 ## 2. The version
@@ -137,7 +138,7 @@ The table's method stays fixed from release to release so the releases compare: 
 The engines, built from the tags (no package installed), each in a worktree of its own under `.claude/worktrees/`:
 
 - XeStrata: the contrib-llvm build of `xe<VERSION>` (docs/BUILD.md, with `LD_LIBRARY_PATH` to intel/llvm's `lib`); one GPU at a time with `ONEAPI_DEVICE_SELECTOR` (`level_zero:*` for the B70, `cuda:*` for the RTX 4070).
-- upstream on the B70: its `sycl/` port, built and run in its Docker image as its docs/INTEL.md says.
+- upstream on the B70: its `sycl/` port, built in its Docker image as its docs/INTEL.md says (`docker build -t strata-sycl-dev sycl/tools`, then its `build.sh` with `AOT=bmg-g31`), and run through `scripts/up-sycl.sh` (`UP=".claude/skills/release/scripts/up-sycl.sh"` with `UP_TREE`, `DATA` and `IDS` exported).
 - upstream on the RTX 4070: its CUDA build, as its documents say.
 
 Each engine's own shipped expert profile (`data/expert-profile.bin` of its tree).
