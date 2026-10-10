@@ -29,6 +29,7 @@ How it differs from Strata:
 
 - **For Intel Arc,** and it runs on AMD and NVIDIA GPUs too.
 - **One GPU, as a rule.** The layers can also be spread over two or more GPUs in the same PC ([MULTIGPU](docs/MULTIGPU.md)).
+  The GPUs may be of different makers, Intel, AMD and NVIDIA (for example an Intel Arc Battlemage and an NVIDIA Ada; with NVIDIA, in the contrib-llvm build).
 - **Linux only.** Windows is not supported. WSL 2 may work (untested; pull requests welcome).
 - **Runs with free software only, too** (the free build, free enough for Debian main; [made from the source](docs/BUILD.md#the-deb-and-rpm-packages)). The contrib-llvm packages use
   Intel's oneMKL and NVIDIA's cuBLAS, which are not free software, when they are installed ([Install](#install)).

@@ -29,6 +29,7 @@ Strata との主な違い:
 
 - **Intel Arc 向け**で、AMD と NVIDIA の GPU でも動きます。
 - **GPU は 1 枚が基本**です。同じ PC の 2 枚以上の GPU に層を分けて載せることもできます（[MULTIGPU](docs/MULTIGPU.ja.md)）。
+  Intel・AMD・NVIDIA のメーカーの違う GPU も組み合わせられます（例: Intel Arc の Battlemage と NVIDIA の Ada。NVIDIA を含むときは contrib-llvm のビルド）。
 - **Linux だけ**です。Windows には対応しません。WSL 2 は動くかもしれません（未検証です。プルリクエスト歓迎）。
 - **自由ソフトウェアだけでも動きます**（free のビルド、Debian main に入れられる程度に自由な構成。[ソースから作ります](docs/BUILD.ja.md#deb-と-rpm-のパッケージ)）。
   配っている contrib-llvm の版は、自由ソフトウェアでない Intel の oneMKL と NVIDIA の cuBLAS を、入っていれば使います（[インストール](#インストール)）。
