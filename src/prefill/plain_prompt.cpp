@@ -158,7 +158,6 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     auto proj = [&](const W& w, float* y, int64_t T, int64_t ldy = 0) {
         gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
     };
-    const int attn_batch = std::max(1, std::min(opt_.max_t, 8));   // queries an attention launch takes (its scratch)
     // the routed experts in their quantized blocks (int8 products, iq_mmq: on the matrix engines, else by dp4a) where
     // every layer's types are theirs (prompt_int8, decided with the buffers), else dequantized to FP16
     const bool use_mmq = P.int8;
@@ -228,17 +227,21 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                                                 (int) s.rope_dims, eps, rs, P.pos_q, cs);
                     k::native_qsa_rms_norm_rope(P.kraw, (int) HD, b.k_norm, P.kcur, (int) (T * NKV), (int) HD,
                                                 (int) s.rope_dims, eps, rs, P.pos_k, cs);
-                    for (int64_t t = 0; t < T; ++t)
-                        k::kv_append_step(k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_,
-                                          P.steps + t * k::kStepCount, P.kcur + t * NKV * HD, P.vcur + t * NKV * HD, qs, cs);
+                    k::kv_append_steps(k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_, P.steps, k::kStepCount,
+                                       P.kcur, P.vcur, (int) (NKV * HD), (int) T, qs, cs);
                     k::QsaAttnPools pools;
                     pools.k_pool = k_pool_[(size_t) a];
                     pools.v_pool = v_pool_[(size_t) a];
                     pools.page_table = page_table_;
-                    for (int64_t t = 0; t < T; t += attn_batch) {   // every query reads the cells up to its own
-                        const int nq = (int) std::min<int64_t>(attn_batch, T - t);
-                        k::qsa_dense_attn_batch(P.qcur + t * NH * HD, pools, P.steps + t * k::kStepCount,
-                                                opt_.max_cells, qs, attn_scratch_, P.attn + t * NH * HD, nq, cs);
+                    // every query reads the cells up to its own; the grid as wide as the chunk's last context (not
+                    // the cache's capacity: no graph holds it), as many queries a launch as the scratch takes
+                    const int64_t cap = std::min<int64_t>(opt_.max_cells, p0 + T);
+                    const int64_t per_q = (int64_t) k::qsa_decode_attn_scratch_floats(cap, qs);
+                    const int64_t nq_max = std::max<int64_t>(1, std::min<int64_t>((int64_t) opt_.max_t * attn_scratch_floats_ / per_q, 4096));
+                    for (int64_t t = 0; t < T; t += nq_max) {
+                        const int nq = (int) std::min<int64_t>(nq_max, T - t);
+                        k::qsa_dense_attn_batch(P.qcur + t * NH * HD, pools, P.steps + t * k::kStepCount, cap, qs,
+                                                attn_scratch_, P.attn + t * NH * HD, nq, cs);
                     }
                     const float* ao = P.attn;
                     if (has_gate_) {
