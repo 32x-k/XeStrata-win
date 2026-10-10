@@ -24,7 +24,7 @@ bool iq_mmq_dp4a_usable(sycl::queue& q);
 bool iq_mmq_type_ok(int ggml_type);
 /// Bytes of a weight row of `cols` values in ggml_type (iq_mmq_type_ok).
 size_t iq_mmq_row_bytes(int ggml_type, int64_t cols);
-/// Bytes of `rows` activation rows of `cols` values (a multiple of 128): the int8 values, then a scale per 32, then the
+/// Bytes of `rows` activation rows of `cols` values (a multiple of 32): the int8 values, then a scale per 32, then the
 /// sum per 32 (the scale times the int8 values' sum).
 size_t iq_mmq_act_bytes(int64_t rows, int64_t cols);
 /// The activations: row i of xq from row ids[i] of x (row i when ids is null), `ld` floats a row of x.
@@ -33,7 +33,8 @@ sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, 
 
 /// n experts, one launch: expert e's weights ([w_rows, w_cols] in ggml_type's blocks) at w + e * expert_bytes, its
 /// activation rows bounds[e] .. bounds[e + 1] of xq (bounds on the device; xq holds total_rows rows), into dst rows
-/// ids[row] (ld_dst floats apart).  max_rows: the most rows an expert has.  w_rows a multiple of 128, w_cols of 128.
+/// ids[row] (ld_dst floats apart).  max_rows: the most rows an expert has.  w_rows a multiple of 128, w_cols of 32
+/// (and of the type's block).
 /// wtab (on the device, n entries): expert e's weights at wtab[e] + woff instead, wherever each lies.
 sycl::event iq_mmq_grouped(sycl::queue& q, int ggml_type, const void* w, size_t expert_bytes, int64_t w_rows,
                            int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,

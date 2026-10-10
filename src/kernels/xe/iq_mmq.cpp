@@ -82,8 +82,8 @@ constexpr bool built() {
 // ---------------------------------------------------------------- the weights' blocks of 32 values
 // v[j]: values 4j .. 4j + 3 as signed bytes; s0, s1: the scales of values 0-15 and 16-31.
 struct Sub {
-    uint32_t v[8];
-    float s0, s1;
+    uint32_t v[8] = {};
+    float s0 = 0.0f, s1 = 0.0f;
     float m = 0.0f;   // the K-quants' min term: the block's values less m (Q4_K, Q5_K)
 };
 // the grid bytes (below 128) negated where m is 0xFF
@@ -427,18 +427,19 @@ struct Kernel {
                 const int rr = v / (KC / 16), c = v % (KC / 16) * 16;
                 const int64_t row = m0 + rr;
                 u32x4 val = {0u, 0u, 0u, 0u};
-                if (row < rows) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
+                if (row < rows && k0 + c < K) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
                 *reinterpret_cast<u32x4*>(al + rr * LDA + c) = val;
             }
             for (int v = lid; v < WM * NB; v += lanes) {
                 const int b = v / WM, rr = v % WM;
                 const int64_t row = m0 + rr;
-                xsl[v] = row < rows ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
-                if constexpr (MIN) xul[v] = row < rows ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                xsl[v] = row < rows && k0 / 32 + b < kb ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                if constexpr (MIN) xul[v] = row < rows && k0 / 32 + b < kb ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
             }
             for (int v = lid; v < WN * NB; v += lanes) {
                 const int nn = v / NB, b = v % NB;
-                const Sub d = Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b);
+                const Sub d = k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b)
+                                                : Sub{};   // past K (a last step of fewer blocks): zeros
                 u32x4* o = reinterpret_cast<u32x4*>(bl + nn * LDB + b * 32);
                 o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
                 o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
@@ -513,18 +514,19 @@ struct Kernel {
                     const int rr = v / (KC / 16), c = v % (KC / 16) * 16;
                     const int64_t row = m0 + rr;
                     u32x4 val = {0u, 0u, 0u, 0u};
-                    if (row < rows) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
+                    if (row < rows && k0 + c < K) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
                     *reinterpret_cast<u32x4*>(al + static_cast<int>(rr * LDA + c)) = val;
                 }
                 for (int v = lid; v < WM * NB; v += lanes) {
                     const int b = v / WM, rr = v % WM;
                     const int64_t row = m0 + rr;
-                    xsl[v] = row < rows ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
-                    if constexpr (MIN) xul[v] = row < rows ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                    xsl[v] = row < rows && k0 / 32 + b < kb ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                    if constexpr (MIN) xul[v] = row < rows && k0 / 32 + b < kb ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
                 }
                 for (int v = lid; v < WN * NB; v += lanes) {
                     const int nn = v / NB, b = v % NB;
-                    const Sub d = Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b);
+                    const Sub d = k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b)
+                                                : Sub{};   // past K (a last step of fewer blocks): zeros
                     u32x4* o = reinterpret_cast<u32x4*>(bl + static_cast<int>(nn * LDB + b * 32));
                     o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
                     o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
@@ -633,18 +635,19 @@ struct Kernel {
                     const int rr = v / (KC / 16), c = v % (KC / 16) * 16;
                     const int64_t row = m0 + rr;
                     u32x4 val = {0u, 0u, 0u, 0u};
-                    if (row < rows) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
+                    if (row < rows && k0 + c < K) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
                     *reinterpret_cast<u32x4*>(al + rr * LDA + c) = val;
                 }
                 for (int v = lid; v < WM * NB; v += lanes) {
                     const int b = v / WM, rr = v % WM;
                     const int64_t row = m0 + rr;
-                    xsl[v] = row < rows ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
-                    if constexpr (MIN) xul[v] = row < rows ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                    xsl[v] = row < rows && k0 / 32 + b < kb ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                    if constexpr (MIN) xul[v] = row < rows && k0 / 32 + b < kb ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
                 }
                 for (int v = lid; v < WN * NB; v += lanes) {
                     const int nn = v / NB, b = v % NB;
-                    const Sub d = Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b);
+                    const Sub d = k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b)
+                                                : Sub{};   // past K (a last step of fewer blocks): zeros
                     u32x4* o = reinterpret_cast<u32x4*>(bl + nn * LDB + b * 32);
                     o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
                     o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};

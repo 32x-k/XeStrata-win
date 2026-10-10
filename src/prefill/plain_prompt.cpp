@@ -165,7 +165,7 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
         return v == nullptr || std::atoi(v) != 0;
     }();
     const bool mmq_on = mmq_env && (prefill::mmq::built() || prefill::mmq::built_dp4a()) && N % 128 == 0 &&
-                        FF % 128 == 0;
+                        (2 * FF) % 128 == 0 && FF % 32 == 0;   // the products' outputs in 128s, their K in blocks
     PromptGemm& pg = prompt_gemm();
     if (mmq_on && !pg.identity) {
         prefill::mmq::iota(P.identity, P.T * K, cs);
