@@ -2414,6 +2414,23 @@ def check_update() -> int:
     return 0
 
 
+def rotational_disk(path) -> str | None:
+    """upstream #605 (Linux): the disk's name when `path` is on a rotational disk (sysfs queue/rotational), else None.
+    None under WSL too, whose virtual disk says rotational."""
+    if "microsoft" in platform.uname().release.lower():
+        return None
+    try:
+        st = os.stat(path)
+        p = Path(f"/sys/dev/block/{os.major(st.st_dev)}:{os.minor(st.st_dev)}").resolve()
+        for q in (p, p.parent):                        # a partition has its disk's queue
+            f = q / "queue" / "rotational"
+            if f.exists():
+                return q.name if f.read_text().strip() == "1" else None
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
 def hardware_key(cfg: dict) -> str:
     """What a calibration is valid for: this GPU, CPU and RAM, and the model with its context and images setting
     (the context's KV cache and the image encoder take VRAM from the expert cache)."""
@@ -3760,6 +3777,19 @@ def main() -> int:
         args += ["--kv", kv]
     if low_ram:   # the experts from the model files: the ones the GPU does not hold copied into RAM, or mapped
         args += ["--resident-experts" if resident else "--mmap-experts"]
+    disk = rotational_disk(ple)                        # upstream #605
+    if disk:
+        tensor = next((t for t in GGUFFile(ple).tensors if t.name == "per_layer_token_embd.weight"), None)
+        size = getattr(tensor, "expected_bytes", lambda: None)()
+        table_gb = size / 1e9 if size else 28.8
+        if ram >= MODELS[model]["ram_gb"] + table_gb + 4:
+            args += ["--ple-io", "ram"]
+            ok(f"the model is on a rotational disk ({disk}): its {table_gb:.0f} GB n-gram table is kept in RAM "
+               "(--ple-io ram) - read from the disk at random, it can stall prompts for minutes")
+        else:
+            warn(f"the model is on a rotational disk ({disk}): its n-gram table is read from it at random, which can "
+                 f"stall prompts for minutes. An SSD is recommended; with ~{table_gb:.0f} GB more RAM, "
+                 "--ple-io ram in the config's args keeps the table in RAM instead")
     # KV streaming: from 64K up the whole KV cache lives in RAM and only the part the attention reads (32K positions
     # per layer) stays in VRAM; the VRAM it frees holds more experts (+6% at 128K, +23% at 262K with Q2_0). It
     # costs ~13.7 KB of RAM per context token with 8-bit KV (1.7 GB at 128K), 10.6 KB with K8V4, 7.5 KB with 4-bit, so
