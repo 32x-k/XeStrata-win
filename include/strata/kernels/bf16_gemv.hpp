@@ -54,6 +54,11 @@ void f32_gemv_fp32_mmvf(const float* x, const float* w, float* y, int64_t n_in, 
 /// read once, every output bit-identical to its own single-row call.  ldx even.
 void f32_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const float* w, float* y, int64_t ldy, int64_t n_in,
                               int64_t n_out, int n_tok, void* stream);
+/// y[t * ldy + j] = x[t * ldx ..] . w[j * n_in ..] for n_tok rows at once, F32 throughout: the prompt's router and
+/// shared-expert gate, where n_tok is hundreds and the MMVF would read the activations again for every output.  Sums
+/// in another order than the MMVF (the same values to rounding).
+void f32_gemm_rows(const float* x, int64_t ldx, const float* w, float* y, int64_t ldy, int64_t n_in, int64_t n_out,
+                   int64_t n_tok, void* stream);
 /// bf16_gemv_fp32_mmvf for n_tok (1..8) activation rows x[t * ldx], outputs y[t * ldy + j]; one launch,
 /// the weight read once, every output bit-identical to its own single-row call.
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,

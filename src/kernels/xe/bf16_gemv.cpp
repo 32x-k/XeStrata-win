@@ -461,6 +461,37 @@ void f32_gemv_fp32_mmvf(const float* x, const float* w, float* y, int64_t n_in, 
     if (!stream) core::Runtime::get().finish(q);
 }
 
+void f32_gemm_rows(const float* x, int64_t ldx, const float* w, float* y, int64_t ldy, int64_t n_in, int64_t n_out,
+                   int64_t n_tok, void* stream) {
+    if (n_in <= 0 || n_out <= 0 || n_tok <= 0) return;
+    if (x == nullptr || w == nullptr || y == nullptr)
+        throw std::invalid_argument("f32_gemm_rows: null pointer");
+    auto& q = queue_for(stream);
+    // 16 x 16 outputs a work-group, K 16 a step through local memory: work-item (i, j) loads the step's value of
+    // token row i and of output row j, then sums token i against output j (rows padded by one against bank conflicts)
+    constexpr int TS = 16;
+    const size_t gt = (size_t) ((n_tok + TS - 1) / TS) * TS, go = (size_t) ((n_out + TS - 1) / TS) * TS;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 2> xs(sycl::range<2>(TS, TS + 1), h), ws(sycl::range<2>(TS, TS + 1), h);
+        h.parallel_for(sycl::nd_range<2>(sycl::range<2>(gt, go), sycl::range<2>(TS, TS)), [=](sycl::nd_item<2> it) {
+            const int li = (int) it.get_local_id(0), lj = (int) it.get_local_id(1);
+            const int64_t t = (int64_t) it.get_global_id(0), o = (int64_t) it.get_global_id(1);
+            const int64_t wrow = (int64_t) it.get_group(1) * TS + li;
+            float acc = 0.0f;
+            for (int64_t k0 = 0; k0 < n_in; k0 += TS) {
+                const int64_t k = k0 + lj;
+                xs[li][lj] = t < n_tok && k < n_in ? x[t * ldx + k] : 0.0f;
+                ws[li][lj] = wrow < n_out && k < n_in ? w[wrow * n_in + k] : 0.0f;
+                sycl::group_barrier(it.get_group());
+                for (int kk = 0; kk < TS; ++kk) acc = sycl::fma(xs[li][kk], ws[lj][kk], acc);
+                sycl::group_barrier(it.get_group());
+            }
+            if (t < n_tok && o < n_out) y[t * ldy + o] = acc;
+        });
+    });
+    if (!stream) core::Runtime::get().finish(q);
+}
+
 void f32_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const float* w, float* y, int64_t ldy, int64_t n_in,
                               int64_t n_out, int n_tok, void* stream) {
     if (n_tok < 1 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_in > std::numeric_limits<int>::max() ||
