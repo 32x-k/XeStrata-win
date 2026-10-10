@@ -1884,6 +1884,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                     // set_cpu_pool: the experts the CPU computes this layer (their rows last: [T * K - rows_cpu, T * K))
                     std::vector<char> on_cpu;
+                    std::vector<const uint8_t*> cpu_blob;   // their blobs, taken here (the CPU thread calls no ExpertSource)
                     int64_t rows_cpu = 0, n_cpu = 0, n_stream = 0;
                     if (cpu_maybe) {
                         std::vector<std::pair<int32_t, int32_t>> cand;   // (tokens, expert)
@@ -1891,18 +1892,27 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             const int32_t c = m.cnt[(size_t) e];
                             if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0)) continue;
                             ++n_stream;
-                            if (c <= strata::kernels::cpu::MAXT && m.src->pinned(l, e)) cand.emplace_back(c, e);
+                            // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
+                            // short-lived buffer (the arena's unpinned part, the mapped files' pages; upstream 92bce20e)
+                            if (c <= strata::kernels::cpu::MAXT && (m.src->pinned(l, e) || !m.src->transient(l, e)))
+                                cand.emplace_back(c, e);
                         }
                         std::sort(cand.begin(), cand.end());
                         const double share = cpu_share_env() >= 0.0 ? cpu_share_env() : cpu_arm ? m.cpu_share_now : 0.0;
                         const size_t take = std::min(cand.size(), (size_t) std::llround(share * (double) n_stream));
-                        if (take > 0) {
-                            on_cpu.assign((size_t) m.g->n_expert, 0);
-                            for (size_t i = 0; i < take; ++i) {
-                                on_cpu[(size_t) cand[i].second] = 1;
-                                rows_cpu += cand[i].first;
+                        // an expert without a blob stays on the GPU
+                        for (size_t i = 0; i < cand.size() && n_cpu < (int64_t) take; ++i) {
+                            const int32_t e = cand[i].second;
+                            const uint8_t* b = m.src->blob(l, e);
+                            if (b == nullptr) continue;
+                            if (on_cpu.empty()) {
+                                on_cpu.assign((size_t) m.g->n_expert, 0);
+                                cpu_blob.assign((size_t) m.g->n_expert, nullptr);
                             }
-                            n_cpu = (int64_t) take;
+                            on_cpu[(size_t) e] = 1;
+                            cpu_blob[(size_t) e] = b;
+                            rows_cpu += cand[i].first;
+                            ++n_cpu;
                         }
                     }
                     auto gpu_side = [&](int32_t e) { return on_cpu.empty() || !on_cpu[(size_t) e]; };
@@ -1964,8 +1974,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         for (int32_t e = 0; e < m.g->n_expert; ++e) {
                             if (!on_cpu[(size_t) e]) continue;
                             strata::kernels::cpu::ExpertJobMulti j;
-                            j.blob = m.src->blob(l, e);
-                            if (j.blob == nullptr) { err = "prefill: a CPU expert has no blob"; return false; }
+                            j.blob = cpu_blob[(size_t) e];
                             j.nt = m.cnt[(size_t) e];
                             for (int r = 0; r < j.nt; ++r)   // the activations are set on the thread
                                 j.out[r] = m.cpu_rows + (size_t) ((int64_t) m.off[(size_t) e] + r - rows_gpu) * N;
