@@ -346,7 +346,7 @@ Engine options you added to `"args"` by hand are not carried over: setup names t
 ./setup.sh --gpus 1,2                       spread the layers over two or more GPUs (remembered; docs/MULTIGPU.md)
 ./setup.sh --vram-reserve-mib 2048          leave 2 GB of VRAM free for other programs (remembered)
 ./setup.sh --no-browser                     do not open the chat page when the model is ready (remembered; --browser undoes it)
-./setup.sh --calibrate                      tune the engine for this PC (about 5-10 minutes), then start
+./setup.sh --calibrate                      tune the engine for this PC (about 15-30 minutes), then start
 ./setup.sh --check                          only check this PC
 ```
 

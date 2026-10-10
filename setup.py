@@ -2284,7 +2284,8 @@ def calibrate_config(cfg_path: Path) -> bool:
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     say()
     say("  Tuning Strata for this PC: the output speed is measured with a few engine settings (the PCIe share, the")
-    say("  draft depth, the CPU threads, the expert cache). It takes about 10 minutes; the PC is busy meanwhile.")
+    say("  draft depth, the CPU threads, the expert cache). It takes roughly 15-30 minutes (3 rounds of each value); "
+        "the PC is busy meanwhile.")
     try:
         res = CAL.run(cfg, say=say)
     except Exception as e:                             # never stops an install: the defaults stay
@@ -2970,7 +2971,8 @@ def main() -> int:
                          "and code only (~110 MiB less VRAM), cyrillic = English, code and the Cyrillic script, fr = "
                          "English, code and French (French answers draft more)")
     ap.add_argument("--calibrate", action="store_true",
-                    help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
+                    help="tune the engine's settings for this PC (about 15-30 minutes, longer on a slow card), "
+                         "then start the model")
     ap.add_argument("--bench", action="store_true",
                     help="measure the speed of the installed IQ3_XXS (another installed model: --model, --family) on "
                          "this PC (about 40 minutes) and write a record for the developers to the data folder's "
@@ -3671,8 +3673,8 @@ def main() -> int:
         warm_up(cfg_path)
     # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
     if cal is None and not a.no_start and not a.yes and ask(
-            "Tune Strata for this PC now? It measures a few engine settings (about 5-10 minutes; the PC is busy "
-            f"meanwhile; later: {SETUP_CMD} --calibrate)", ["y", "n"], "y", a.yes) == "y":
+            "Tune Strata for this PC now? It measures a few engine settings (about 15-30 minutes, longer on a slow "
+            f"card; the PC is busy meanwhile; later: {SETUP_CMD} --calibrate)", ["y", "n"], "y", a.yes) == "y":
         calibrate_config(cfg_path)
     if script is not None:
         ok(f"start script: {script.name}")

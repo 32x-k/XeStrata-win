@@ -349,7 +349,7 @@ RAM に 23〜50 GB を読み込むのに時間がかかりますが、何もダ�
 ./setup.sh --gpus 1,2                       2 枚以上の GPU に層を分けて載せる（記録される。docs/MULTIGPU.ja.md）
 ./setup.sh --vram-reserve-mib 2048          ほかのプログラムのために VRAM を 2 GB 空けておく（記録される）
 ./setup.sh --no-browser                     準備ができてもチャットのページを開かない（記録される。--browser で戻す）
-./setup.sh --calibrate                      この PC に合わせてエンジンを調整してから起動する（5〜10 分）
+./setup.sh --calibrate                      この PC に合わせてエンジンを調整してから起動する（15〜30 分、遅いカードではもっと）
 ./setup.sh --check                          この PC を調べるだけ
 ```
 
