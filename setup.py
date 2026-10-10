@@ -3190,6 +3190,46 @@ def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
     return scaling or "yarn", scale if scale is not None else derived_factor(ctx, trained)
 
 
+def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
+    """Steps 3 and 4: the Python packages, and the engine (the package's, or compiled here with the image encoders
+    `vision` needs) -> (llama.cpp's folder, the engine's folder, the image encoder's kind, the engine's library
+    folders)."""
+    # ---- 3. python packages
+    step(3, "Python packages")
+    if PACKAGED:                                       # the distribution's, which the package depends on
+        ok("the distribution's Python packages (installed with XeStrata's package)")
+    else:
+        pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
+                    "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
+
+    # ---- 4. the engine
+    step(4, "the Strata engine")
+    if PACKAGED:                                       # the package's: nothing is compiled
+        llama = ROOT / "third_party" / "main" / "llama.cpp"   # gguf-py, for the tools below
+        eng = Path(PACKAGED["engine"])
+        meta = packaged_engine()
+        enc = "vulkan"
+        # the engine's SYCL runtime, and oneMKL's folder when it is installed (oneMath opens its backend at run time;
+        # without it the engine takes its own kernels)
+        lib_dirs = list(meta.get("lib_dirs", []))
+        if meta.get("license") == "contrib" and (mkl := mkl_root()):
+            lib_dirs.append(str(Path(mkl) / "lib"))
+        ok(f"engine: {eng / EXE} ({meta.get('package', 'package')})")
+    else:
+        llama = get_llama_cpp()
+        ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
+        comp = choose_compiler(a, gpu)
+        enc = gpu_encoder(comp)
+        eng = build_engine({"none": [], "gpu": [enc, "cpu"], "cpu": ["cpu"]}[vision], llama, comp)
+        # the runtime of the compiler the engine was built with (none for the distribution's), and oneAPI's only when
+        # this config uses the SYCL image encoder (oneMKL): a free install never puts oneAPI on the engine's library
+        # path
+        lib_dirs = list(dict.fromkeys(comp["lib_dirs"] +
+                                      (oneapi_lib_dirs() if vision == "gpu" and enc == "gpu" else [])))
+        ok(f"engine: {eng / EXE}")
+    return llama, eng, enc, lib_dirs
+
+
 def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images: bool, tune: bool = True,
                  notes: list[str] | tuple = ()) -> int:
     """The end of an install: the model's config written, its start script, the warm-up, the offer to tune the
@@ -3844,39 +3884,7 @@ def main() -> int:
     if free_gb(models_dir) < need:
         fail(f"not enough free disk space in {models_dir}: need ~{need:.0f} GB", "use --models-dir on a bigger drive")
 
-    # ---- 3. python packages
-    step(3, "Python packages")
-    if PACKAGED:                                       # the distribution's, which the package depends on
-        ok("the distribution's Python packages (installed with XeStrata's package)")
-    else:
-        pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
-                    "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
-
-    # ---- 4. the engine
-    step(4, "the Strata engine")
-    if PACKAGED:                                       # the package's: nothing is compiled
-        llama = ROOT / "third_party" / "main" / "llama.cpp"   # gguf-py, for the tools below
-        eng = Path(PACKAGED["engine"])
-        meta = packaged_engine()
-        enc = "vulkan"
-        # the engine's SYCL runtime, and oneMKL's folder when it is installed (oneMath opens its backend at run time;
-        # without it the engine takes its own kernels)
-        lib_dirs = list(meta.get("lib_dirs", []))
-        if meta.get("license") == "contrib" and (mkl := mkl_root()):
-            lib_dirs.append(str(Path(mkl) / "lib"))
-        ok(f"engine: {eng / EXE} ({meta.get('package', 'package')})")
-    else:
-        llama = get_llama_cpp()
-        ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
-        comp = choose_compiler(a, gpu)
-        enc = gpu_encoder(comp)
-        eng = build_engine({"none": [], "gpu": [enc, "cpu"], "cpu": ["cpu"]}[vision], llama, comp)
-        # the runtime of the compiler the engine was built with (none for the distribution's), and oneAPI's only when
-        # this config uses the SYCL image encoder (oneMKL): a free install never puts oneAPI on the engine's library
-        # path
-        lib_dirs = list(dict.fromkeys(comp["lib_dirs"] +
-                                      (oneapi_lib_dirs() if vision == "gpu" and enc == "gpu" else [])))
-        ok(f"engine: {eng / EXE}")
+    llama, eng, enc, lib_dirs = prepare_engine(a, gpu, vision)
 
     # ---- 5. the model files
     step(5, f"downloading {fam['title']} {model}")
