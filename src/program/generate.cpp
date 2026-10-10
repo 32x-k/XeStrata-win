@@ -64,11 +64,14 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/resource.h>
+#include <filesystem>
 #include <cerrno>
 
 #include "strata/core/gpu.hpp"
@@ -642,6 +645,10 @@ void usage() {
                  "  --gpu-only-full      MEASURE: replay pre+post for all 48 layers plus the LM head, no pool.\n"
                  "                       THE TRUE PER-TOKEN GPU FLOOR.  Quote this one, not --graph-only.\n"
                  "  --stats              print the per-stage breakdown\n"
+                 "  --hw-bench           MEASURE (setup's --bench): the RAM, PCIe and SSD bandwidths (with --pack or\n"
+                 "                       --native: the SSD under it), `HW key value` lines; nothing else runs\n"
+                 "  --kernel-bench       MEASURE (setup's --bench): the prompt path's products on synthetic data of\n"
+                 "                       --pack's shapes, `KB kernel path shape us` lines; nothing else runs\n"
                  "  --spec-follow PATH   benchmarks: emit this continuation (token ids) instead of the argmax and\n"
                  "                       accept the drafts that match it, so speculation settings compare on the\n"
                  "                       same text (with --spec; not --serve)\n"
@@ -1241,6 +1248,268 @@ double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
 
+// ---- setup's --bench (tools/bench.py): this machine's bandwidths and the prompt path's products one by one, so a
+// user's record says what the decode and prompt speeds are measured against.  Run alone (`strata --hw-bench`,
+// `strata --kernel-bench`), before any model is loaded; each prints `HW key value` or `KB kernel path shape us` lines.
+
+// The RAM's read bandwidth with `cores.size()` threads, each pinned to one of `cores` and reading its share of
+// `bytes`: the best of three passes, in GB/s.
+double bench_ram_read_gbps(const std::vector<int>& cores, size_t bytes) {
+    const size_t n = cores.size(), words = bytes / 8 / n * n;
+    auto* buf = static_cast<uint64_t*>(std::aligned_alloc(4096, (words * 8 + 4095) / 4096 * 4096));
+    if (buf == nullptr || n == 0) return -1.0;
+    std::memset(buf, 1, words * 8);   // fault the pages in before timing
+    std::atomic<uint64_t> sink{0};
+    double best = -1.0;
+    for (int pass = 0; pass < 3; ++pass) {
+        std::atomic<size_t> ready{0};
+        std::atomic<bool> go{false};
+        std::vector<std::thread> th;
+        th.reserve(n);
+        for (size_t t = 0; t < n; ++t)
+            th.emplace_back([&, t] {
+                strata::kernels::cpu::pin_current_thread(cores[t]);
+                const uint64_t* p = buf + words / n * t;
+                const size_t m = words / n;
+                ready.fetch_add(1);
+                while (!go.load(std::memory_order_acquire)) {}
+                uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+                for (size_t i = 0; i + 4 <= m; i += 4) { s0 += p[i]; s1 += p[i + 1]; s2 += p[i + 2]; s3 += p[i + 3]; }
+                sink.fetch_add(s0 + s1 + s2 + s3, std::memory_order_relaxed);
+            });
+        while (ready.load() < n) {}
+        const auto t0 = std::chrono::steady_clock::now();
+        go.store(true, std::memory_order_release);
+        for (auto& x : th) x.join();
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        best = std::max(best, (double) (words * 8) / s / 1e9);
+    }
+    std::free(buf);
+    return best;   // `sink` only keeps the reads from being optimized away
+}
+
+// Copies of 256 MiB between the device and the host, four timed back to back after a warm-up (as
+// probe_pcie_h2d_gbps), the fastest: `pinned` host USM as the expert arena's reads use, else pageable memory.
+double bench_copy_gbps(bool to_device, bool pinned) {
+    constexpr size_t kBytes = 256ull << 20;
+    constexpr int kBursts = 4;
+    void* h = pinned ? strata::gpu::alloc_host(kBytes) : std::aligned_alloc(4096, kBytes);
+    void* d = strata::gpu::alloc_device(kBytes);
+    double bw = -1.0;
+    if (h != nullptr && d != nullptr) {
+        std::memset(h, 0, kBytes);
+        void* dst = to_device ? d : h;
+        const void* src = to_device ? h : d;
+        strata::gpu::copy_async(dst, src, kBytes, nullptr);
+        strata::gpu::Event* ev[kBursts + 1] = {};
+        int n_ev = 0;
+        while (n_ev <= kBursts && strata::gpu::event_create(&ev[n_ev], true)) ++n_ev;
+        bool ok = n_ev == kBursts + 1 && strata::gpu::event_record(ev[0], nullptr);
+        for (int b = 0; b < kBursts && ok; ++b)
+            ok = strata::gpu::copy_async(dst, src, kBytes, nullptr) && strata::gpu::event_record(ev[b + 1], nullptr);
+        ok = ok && strata::gpu::event_sync(ev[kBursts]);
+        for (int b = 0; b < kBursts && ok; ++b) {
+            float ms = 0.0f;
+            if (strata::gpu::event_elapsed_ms(&ms, ev[b], ev[b + 1]) && ms > 0.01f)
+                bw = std::max(bw, (double) kBytes / (ms * 1e-3) / 1e9);
+        }
+        for (int i = 0; i < n_ev; ++i) strata::gpu::event_destroy(ev[i]);
+    }
+    strata::gpu::free(d);
+    if (pinned) strata::gpu::free(h);
+    else std::free(h);
+    return bw;
+}
+
+// The SSD under the model: `path` read with O_DIRECT (past the page cache) in 8 MiB blocks by four threads, up to
+// 4 GiB of it, in GB/s.
+double bench_ssd_read_gbps(const std::string& path, double* gib_read) {
+    constexpr size_t kBlock = 8ull << 20;
+    constexpr int kThreads = 4;
+    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+    if (fd < 0) return -1.0;
+    const off_t size = ::lseek(fd, 0, SEEK_END);
+    const size_t blocks = (size_t) std::min<off_t>(size, (off_t) 4 << 30) / kBlock;
+    std::atomic<size_t> next{0}, done{0};
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::thread> th;
+    th.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t)
+        th.emplace_back([&] {
+            void* b = std::aligned_alloc(4096, kBlock);
+            if (b == nullptr) return;
+            for (size_t i; (i = next.fetch_add(1)) < blocks;)
+                if (::pread(fd, b, kBlock, (off_t) (i * kBlock)) == (ssize_t) kBlock) done.fetch_add(1);
+            std::free(b);
+        });
+    for (auto& x : th) x.join();
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    ::close(fd);
+    *gib_read = (double) (done.load() * kBlock) / (1ull << 30);
+    return done.load() > 0 ? (double) (done.load() * kBlock) / s / 1e9 : -1.0;
+}
+
+// `strata --hw-bench [--native GGUF | --pack DIR]`: the RAM with the expert pool's threads (every physical core, as
+// the pool and the host thread take them) and with one, the PCIe copies each way, the SSD under the model (the
+// native GGUF, else the pack's largest file).
+int hw_bench(const std::string& pack, const std::string& native) {
+    const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
+    const size_t ram = (size_t) ::sysconf(_SC_PHYS_PAGES) * (size_t) ::sysconf(_SC_PAGESIZE);
+    const size_t bytes = std::min<size_t>(4ull << 30, ram / 8);
+    std::printf("HW ram_threads %zu\n", cores.size());
+    std::printf("HW ram_read_gb_s %.2f\n", bench_ram_read_gbps(cores, bytes));
+    std::printf("HW ram_read_1t_gb_s %.2f\n", bench_ram_read_gbps({cores.empty() ? 0 : cores[0]}, bytes / 4));
+    std::printf("HW h2d_gb_s %.2f\n", bench_copy_gbps(true, true));
+    std::printf("HW d2h_gb_s %.2f\n", bench_copy_gbps(false, true));
+    std::printf("HW h2d_pageable_gb_s %.2f\n", bench_copy_gbps(true, false));
+    std::printf("HW d2h_pageable_gb_s %.2f\n", bench_copy_gbps(false, false));
+    std::string file = native;
+    if (file.empty() && !pack.empty()) {
+        std::error_code ec;
+        uintmax_t biggest = 0;
+        for (const auto& e : std::filesystem::directory_iterator(pack, ec))
+            if (e.is_regular_file(ec) && e.file_size(ec) > biggest) { biggest = e.file_size(ec); file = e.path().string(); }
+    }
+    if (!file.empty()) {
+        double gib = 0.0;
+        const double bw = bench_ssd_read_gbps(file, &gib);
+        std::printf("HW ssd_read_gb_s %.2f\n", bw);
+        std::printf("HW ssd_read_gib %.2f\n", gib);
+    }
+    return 0;
+}
+
+// The hidden size of the pack's model (the token embedding's row length in index.txt), 0 when it cannot be read.
+int64_t bench_hidden(const std::string& pack) {
+    std::ifstream f(pack + "/index.txt");
+    for (std::string line; std::getline(f, line);) {
+        std::istringstream s(line);
+        std::string name;
+        s >> name;
+        if (name != "token_embd.weight") continue;
+        int64_t v[8] = {};
+        for (auto& x : v) s >> x;
+        return v[6];
+    }
+    return 0;
+}
+
+// The ggml type of the first layer's gate/up experts in a native pack (native_experts.txt), -1 without one.
+int bench_expert_type(const std::string& pack) {
+    std::ifstream f(pack + "/native_experts.txt");
+    for (std::string line; std::getline(f, line);) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream s(line);
+        int layer = -1, gu = -1;
+        s >> layer >> gu;
+        return gu;
+    }
+    return -1;
+}
+
+// The products' time on `stream`: three warm-ups, then the median of ten, in microseconds.
+template <class F> double bench_us(void* stream, F&& run) {
+    for (int i = 0; i < 3; ++i) run();
+    strata::gpu::stream_sync(stream);
+    std::vector<double> us;
+    for (int i = 0; i < 10; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        run();
+        strata::gpu::stream_sync(stream);
+        us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+    }
+    std::sort(us.begin(), us.end());
+    return us[us.size() / 2];
+}
+
+// `strata --kernel-bench --pack DIR`: the prompt path's products on synthetic data of the model's shapes, through the
+// paths this device takes now (the caller runs it again with STRATA_NO_XMX=1 and the like to compare them): a dense
+// projection (prefill::Gemm, a 4096-token chunk) and the experts' gate/up and down products of one MMQ launch (16
+// experts of 64 rows, in the type of the native pack's first layer) when the int8 matrix path is built.
+int kernel_bench(const std::string& pack) {
+    const int64_t K = bench_hidden(pack);
+    const int expert_type = bench_expert_type(pack);
+    if (K <= 0 || K % 128 != 0) {
+        std::fprintf(stderr, "strata --kernel-bench: no hidden size in %s/index.txt\n", pack.c_str());
+        return 2;
+    }
+    void* cs = strata::gpu::stream_create();
+    strata::prefill::Gemm::prepare();
+    strata::prefill::Gemm::settle();
+    {   // the dense projection: Y[T, 4K] = X[T, K] . W^T in BF16, as the attention's and the FFN's projections
+        constexpr int64_t T = 4096;
+        const int64_t N = 4 * K;
+        uint16_t *X = nullptr, *W = nullptr;
+        float* Y = nullptr;
+        strata::prefill::Gemm g;
+        std::string err;
+        if (strata::gpu::alloc_device(&X, T * K * 2) && strata::gpu::alloc_device(&W, N * K * 2) &&
+            strata::gpu::alloc_device(&Y, T * N * 4) && g.init(cs, 0, err)) {
+            strata::gpu::memset(X, 0x3c, T * K * 2);   // 0x3c3c: about 1.0 in both FP16 and BF16
+            strata::gpu::memset(W, 0x3c, N * K * 2);
+            const double us = bench_us(cs, [&] { g.bf16(X, W, Y, T, N, K); });
+            std::printf("KB dense-bf16 %s %lldx%lldx%lld %.1f\n", strata::prefill::Gemm::path(), (long long) T,
+                        (long long) N, (long long) K, us);
+        } else {
+            std::printf("KB dense-bf16 - - -\n");
+        }
+        strata::gpu::free(X);
+        strata::gpu::free(W);
+        strata::gpu::free(Y);
+    }
+    namespace mmq = strata::prefill::mmq;
+    if (!mmq::built() || !mmq::supported(expert_type)) {
+        const char* why = !mmq::built() ? "off" : expert_type < 0 ? "no-native-pack" : "unsupported-type";
+        std::printf("KB expert-gate-up %s - -\n", why);
+        std::printf("KB expert-down %s - -\n", why);
+    } else {
+        constexpr int kN = 16;
+        constexpr int64_t kRows = 64, kGU = 1280, kFF = 640;   // the prompt path's shapes (prefill.cpp)
+        const int64_t rows = kN * kRows;
+        const size_t gub = mmq::matrix_bytes(expert_type, kGU, K), db = mmq::matrix_bytes(expert_type, K, kFF);
+        uint8_t *wgu = nullptr, *wd = nullptr, *xq = nullptr, *hq = nullptr;
+        float *x = nullptr, *gu = nullptr, *dn = nullptr;
+        int32_t *bounds = nullptr, *ids = nullptr;
+        bool ok = strata::gpu::alloc_device(&wgu, gub * kN) && strata::gpu::alloc_device(&wd, db * kN) &&
+                  strata::gpu::alloc_device(&xq, mmq::q8_bytes(rows, K)) &&
+                  strata::gpu::alloc_device(&hq, mmq::q8_bytes(rows, kFF)) && strata::gpu::alloc_device(&x, rows * K * 4) &&
+                  strata::gpu::alloc_device(&gu, rows * kGU * 4) && strata::gpu::alloc_device(&dn, rows * K * 4) &&
+                  strata::gpu::alloc_device(&bounds, (size_t) (kN + 1) * 4) && strata::gpu::alloc_device(&ids, rows * 4);
+        if (ok) {
+            std::vector<int32_t> b(kN + 1), id((size_t) rows);
+            for (int e = 0; e <= kN; ++e) b[(size_t) e] = (int32_t) (e * kRows);
+            for (int64_t r = 0; r < rows; ++r) id[(size_t) r] = (int32_t) r;
+            strata::gpu::copy(bounds, b.data(), b.size() * 4);
+            strata::gpu::copy(ids, id.data(), id.size() * 4);
+            strata::gpu::memset(wgu, 0x11, gub * kN);   // any bits are valid blocks; the values do not change the time
+            strata::gpu::memset(wd, 0x11, db * kN);
+            strata::gpu::memset(x, 0, rows * K * 4);
+            mmq::quantize(x, nullptr, xq, expert_type, K, K, rows, cs);
+            mmq::quantize(x, nullptr, hq, expert_type, kFF, K, rows, cs);
+            mmq::Context ctx;
+            mmq::Product p;
+            p.w = wgu; p.type = expert_type; p.w_rows = kGU; p.w_cols = K; p.expert_bytes = gub; p.n = kN;
+            p.xq = xq; p.bounds = bounds; p.ids = ids; p.total_rows = rows; p.max_rows = kRows; p.dst = gu;
+            p.ld_dst = kGU;
+            const double us_gu = bench_us(cs, [&] { ctx.run(p, cs); });
+            p.w = wd; p.w_rows = K; p.w_cols = kFF; p.expert_bytes = db; p.xq = hq; p.dst = dn; p.ld_dst = K;
+            const double us_d = bench_us(cs, [&] { ctx.run(p, cs); });
+            std::printf("KB expert-gate-up int8-matrix %dx%lldx%lldx%lld:t%d %.1f\n", kN, (long long) kRows,
+                        (long long) kGU, (long long) K, expert_type, us_gu);
+            std::printf("KB expert-down int8-matrix %dx%lldx%lldx%lld:t%d %.1f\n", kN, (long long) kRows, (long long) K,
+                        (long long) kFF, expert_type, us_d);
+        } else {
+            std::printf("KB expert-gate-up int8-matrix - -\n");
+            std::printf("KB expert-down int8-matrix - -\n");
+        }
+        for (const void* q : {(const void*) wgu, (const void*) wd, (const void*) xq, (const void*) hq, (const void*) x,
+                              (const void*) gu, (const void*) dn, (const void*) bounds, (const void*) ids})
+            strata::gpu::free(q);
+    }
+    strata::gpu::stream_destroy(cs);
+    return 0;
+}
+
 // The PCIe side of the split of the missed experts (after Project Maya's CPU lane, https://github.com/mw00/project-maya),
 // timed as the verify window reads it: fetch_blobs (the copy kernel) on 1 and 2 experts a launch, taken in turn from 32
 // of the layer the CPU side was measured on (75 MB: past the GPU's cache, as a decode's misses are), 8 launches in a
@@ -1514,6 +1783,16 @@ int main(int argc, char** argv) {
     // below consumes the value again.
     for (int i = 1; i + 1 < argc; ++i)
         if (std::string(argv[i]) == "--gpu") { setenv("STRATA_GPU_PCI", argv[i + 1], 1); break; }
+    for (int i = 1; i < argc; ++i) {   // setup's --bench: the machine and the kernels alone, no model loaded
+        const std::string a = argv[i];
+        if (a != "--hw-bench" && a != "--kernel-bench") continue;
+        std::string pack, native;
+        for (int j = 1; j + 1 < argc; ++j) {
+            if (std::string(argv[j]) == "--pack") pack = argv[j + 1];
+            if (std::string(argv[j]) == "--native") native = argv[j + 1];
+        }
+        return a == "--hw-bench" ? hw_bench(pack, native) : kernel_bench(pack);
+    }
     Options o;
     bool have_tokens = false;
     bool have_logits_stride = false;
