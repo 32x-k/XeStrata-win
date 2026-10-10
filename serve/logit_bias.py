@@ -55,7 +55,8 @@ def validate_request(req, engine, vocab_size):
     normalized = normalize(req.get("logit_bias"), vocab_size)
     if normalized:
         if getattr(engine, "info", {}).get("logit_bias") != 1:
-            raise ValueError("logit_bias: this engine does not support token biases; use a supporting CUDA/HIP build")
+            raise ValueError("logit_bias: this engine does not support token biases; update the engine (it reports "
+                             "logit_bias=1)")
         if getattr(engine, "batch", 0):
             raise ValueError("logit_bias: continuous batching is not supported; run without --batch")
     return normalized
