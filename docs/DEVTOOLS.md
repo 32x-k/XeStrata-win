@@ -56,10 +56,10 @@ An example of the latter is Ubuntu 26.04's 6.2 with the Arc Pro B70 (intel/llvm 
 setup runs it for `--intel-llvm-build`;
 [BUILD.md](BUILD.md#the-sycl-compiler) describes how it reuses a finished build.
 intel/llvm is free software (Apache-2.0 with LLVM exceptions) and builds with free software only.
-It needs these packages (on Fedora 44: `git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static python3`):
+It needs these packages (on Fedora 44: `git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static python3`):
 
 ```sh
-sudo apt install git cmake ninja-build g++ python3 libhwloc-dev libzstd-dev
+sudo apt install git cmake ninja-build g++ lld python3 libhwloc-dev libzstd-dev
 python3 tools/intel_llvm_build.py            # --keep-build keeps the build tree for a quicker update; --jobs N
 ```
 

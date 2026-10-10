@@ -326,7 +326,7 @@ It prints other choices too, as in `./setup.sh --packages fedora44/intel,amd --l
 
 | Choice | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
-| common (free, contrib-llvm) | `python3-venv git cmake ninja-build build-essential libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel` |
+| common (free, contrib-llvm) | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel` |
 | common (contrib-icpx) | `python3-venv build-essential libblosc2-dev intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` | `python3 gcc-c++ blosc2-devel intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` |
 | Intel GPUs | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` |
 | Intel GPUs (contrib-llvm) | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` |

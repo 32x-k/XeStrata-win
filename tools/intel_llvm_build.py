@@ -94,7 +94,7 @@ def run(cmd, cwd=None, env=None):
 def missing_prerequisites() -> list:
     """What intel/llvm's build needs (sycl/doc/GetStartedGuide.md), as Debian / Ubuntu packages."""
     need = []
-    for tool, pkg in (("git", "git"), ("cmake", "cmake"), ("ninja", "ninja-build"), ("g++", "g++")):
+    for tool, pkg in (("git", "git"), ("cmake", "cmake"), ("ninja", "ninja-build"), ("g++", "g++"), ("ld.lld", "lld")):
         if shutil.which(tool) is None:
             need.append(pkg)
     if not Path("/usr/include/hwloc.h").exists():
@@ -200,8 +200,12 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
     # without pkg-config the adapter takes an installed loader without checking its version (Debian 13's 1.20 failed).
     # The links take the most memory: LLVM limits them by the free RAM at configure time (LLVM_RAM_PER_LINK_JOB, in
     # MB; 10000 is the value llvm/docs/CMake.rst suggests), and every other job runs on all the threads
+    # Without assertions, as a distribution's clang is: they check the compiler's own state and do not change the code
+    # it makes, and they slow every compile.  lld links LLVM's many large binaries faster, and with less memory, than
+    # GNU ld.
     options = [f"--cmake-opt=-DCMAKE_INSTALL_PREFIX={INSTALL}", "--cmake-opt=-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON",
-               "--cmake-opt=-DLLVM_ENABLE_ZSTD=FORCE_ON", "--cmake-opt=-DLLVM_RAM_PER_LINK_JOB=10000"] + \
+               "--cmake-opt=-DLLVM_ENABLE_ZSTD=FORCE_ON", "--cmake-opt=-DLLVM_RAM_PER_LINK_JOB=10000",
+               "--cmake-opt=-DLLVM_ENABLE_ASSERTIONS=OFF", "--cmake-opt=-DLLVM_USE_LINKER=lld"] + \
         target_options(contrib)
     # configured again when the tree was configured with other values of these options
     cache = BUILD / "CMakeCache.txt"

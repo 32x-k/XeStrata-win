@@ -639,7 +639,7 @@ def amd_elsewhere() -> str:
 # oneMKL in the contrib mode only, NVIDIA's in the contrib mode only, AMD's not in the contrib-icpx mode).
 PACKAGES = {
     "ubuntu": {
-        "base": "python3-venv git cmake ninja-build build-essential libhwloc-dev libzstd-dev libvulkan-dev glslc "
+        "base": "python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc "
                 "spirv-headers mesa-vulkan-drivers libblosc2-dev",
         "icpx": "python3-venv build-essential libblosc2-dev intel-oneapi-compiler-dpcpp-cpp intel-ocloc "
                 "intel-oneapi-mkl-sycl-devel",
@@ -650,8 +650,8 @@ PACKAGES = {
         "nvidia": "nvidia-cuda-toolkit",
     },
     "fedora": {
-        "base": "python3 git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel "
-                "glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel",
+        "base": "python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static "
+                "vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel",
         "icpx": "python3 gcc-c++ blosc2-devel intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel",
         "intel": "oneapi-level-zero oneapi-level-zero-devel intel-level-zero",
         "intel-contrib": "intel-oneapi-mkl-sycl-devel",
