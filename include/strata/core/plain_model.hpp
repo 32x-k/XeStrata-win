@@ -44,6 +44,10 @@ struct PlainOptions {
     int adapt_every = 4;            ///< windows between adaptive rounds (0: off)
     int adapt_swaps = 96;           ///< the most experts one round moves into the VRAM tier
     float adapt_decay = 0.7f;       ///< the routing counts are multiplied by this after each round
+    /// The experts read from the GGUF in place (the page cache, the drive) instead of loaded into pinned RAM: the
+    /// low-RAM mode, taken by itself when the RAM available is less than the experts.  It has no PCIe share.
+    bool mmap_experts = false;
+    bool pcie_split = true;         ///< split the missed experts between the CPU and PCIe by measured times
 };
 
 class PlainModel {
@@ -114,7 +118,8 @@ private:
     std::vector<void*> allocs_;      ///< every device allocation, freed in the destructor
 
     // the expert tiers
-    std::unique_ptr<FileExpertSource> src_;
+    std::unique_ptr<ExpertSource> src_;
+    PcieSplitTimes split_;
     std::unique_ptr<strata::kernels::cpu::ExpertPool> pool_;
     ExpertCache cache_;
     ExpertDispatch disp_;

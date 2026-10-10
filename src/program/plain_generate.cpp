@@ -3,7 +3,7 @@
 // src/program/plain_generate.cpp - `strata generate` for the models of plain_model.hpp (Ornith-1.5).
 //
 //     strata --native MODEL.gguf --tokens 1,2,3 [--n 32] [--max-context N] [--max-t T] [--threads N]
-//            [--dump-logits FILE] [--adapt-every N]
+//            [--dump-logits FILE] [--adapt-every N] [--mmap-experts] [--no-pcie-split]
 //
 // The prompt runs in windows of up to T tokens, then one token a window, greedily.  stdout gets one line,
 // `tokens: a,b,c`, the generated ids; --dump-logits writes the logits each generated token was chosen from, n_vocab
@@ -92,6 +92,8 @@ int plain_main(int argc, char** argv) {
         else if (a == "--dump-logits") dump_path = next("--dump-logits");
         else if (a == "--adapt-every") opt.adapt_every = (int) std::strtol(next("--adapt-every"), nullptr, 10);
         else if (a == "--gpu") (void) next("--gpu");
+        else if (a == "--mmap-experts") opt.mmap_experts = true;
+        else if (a == "--no-pcie-split") opt.pcie_split = false;
         else {
             std::fprintf(stderr, "strata (%s): unknown option %s\n", arch.c_str(), a.c_str());
             return 2;

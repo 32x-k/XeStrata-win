@@ -338,9 +338,32 @@ bool PlainModel::open_experts(std::string& err) {
             err = "plain model: the GPU has no expert kernel for MoE layer " + std::to_string(l) + "'s types";
             return false;
         }
-    src_ = std::make_unique<FileExpertSource>();
-    src_->set_gguf(opt_.gguf);
-    if (!src_->open(std::string(), L, E, err)) return false;
+    // the RAM tier: every expert loaded into pinned RAM when the host has the room (the GPU reads them over PCIe and
+    // the pool from RAM), else the GGUF read in place through the page cache
+    bool in_ram = !opt_.mmap_experts;
+    if (in_ram) {
+        detail::HostMemory hm;
+        const uint64_t need = lay.total + lay.max_blob + (4ull << 30);   // and room for everything else
+        if (detail::host_available_memory(hm) && std::min(hm.available, hm.cgroup_limit) < need) {
+            std::fprintf(stderr, "strata plain: %.1f GiB of RAM available, the experts need %.1f GiB: read in place\n",
+                         (double) std::min(hm.available, hm.cgroup_limit) / 1073741824.0, (double) need / 1073741824.0);
+            in_ram = false;
+        }
+    }
+    if (in_ram) {
+        auto arena = std::make_unique<ArenaExpertSource>();
+        arena->set_gguf(opt_.gguf);
+        if (!arena->open(std::string(), L, E, /*threads=*/6, err)) return false;
+        if (!arena->ram_warning().empty()) std::fprintf(stderr, "strata plain: WARNING: %s\n", arena->ram_warning().c_str());
+        std::fprintf(stderr, "strata plain: experts in RAM, %.2f GiB at %.2f GiB/s\n", (double) lay.total / 1073741824.0,
+                     arena->load_gib_per_second());
+        src_ = std::move(arena);
+    } else {
+        auto file = std::make_unique<FileExpertSource>();
+        file->set_gguf(opt_.gguf);
+        if (!file->open(std::string(), L, E, err)) return false;
+        src_ = std::move(file);
+    }
     pool_ = std::make_unique<k::cpu::ExpertPool>(opt_.threads);
 
     // the VRAM tier: what the device has left, less the window's arena and a reserve, in slots of each layer's blob,
@@ -390,6 +413,7 @@ bool PlainModel::open_experts(std::string& err) {
     tier.cache_base = cache_.device_slot(0);
     tier.blob = (int64_t) lay.max_blob;
     if (!win_.init(ws, tier, err)) return false;
+    win_.sink()->pcie_mode = 2;   // the PCIe share staged by the copy kernel inside the window (the split's timing)
 
     disp_.pool = pool_.get();
     disp_.src = src_.get();
@@ -402,6 +426,26 @@ bool PlainModel::open_experts(std::string& err) {
     disp_.plan = win_.sink();
     disp_.pcie_num = 0;
     if (opt_.adapt_every > 0 && opt_.adapt_swaps > 0) disp_.usage.assign((size_t) (L * E), 0.0f);
+    // the split of the missed experts between the CPU and PCIe (after Project Maya's CPU lane): the times measured now,
+    // while no expert is in VRAM; only from pinned RAM
+    if (opt_.pcie_split && in_ram) {
+        std::string why;
+        if (measure_pcie_split(disp_, L, split_, why)) {
+            disp_.pcie_split = &split_;
+            disp_.pcie_overlap = false;   // the window reads the PCIe share after its VRAM hits
+            bool any = false;
+            for (int f = 1; f <= 16 && !any; ++f) any = pcie_split_m(split_, false, f, f) > 0;
+            if (any && src_->device_alias(split_.layer, 0) == nullptr && !src_->make_kernel_readable(why)) {
+                std::fprintf(stderr, "strata plain: the experts stay registered for copies (%s): the CPU takes every "
+                                     "missed expert\n", why.c_str());
+                disp_.pcie_split = nullptr;
+            }
+            std::fprintf(stderr, "strata plain: PCIe split: an expert %.3f ms on the CPU, %.3f ms over PCIe, %.3f ms on "
+                                 "the GPU%s\n", split_.c, split_.p, split_.q, any ? "" : " (the CPU takes them all)");
+        } else {
+            std::fprintf(stderr, "strata plain: no PCIe split (%s): the CPU takes every missed expert\n", why.c_str());
+        }
+    }
     std::fprintf(stderr, "strata plain: %lld MoE layers x %lld experts, %lld VRAM slots (%lld a layer, %.2f GiB), "
                          "%d CPU workers, %lld MiB free before the tier\n",
                  (long long) L, (long long) E, (long long) n_slots_, (long long) q, (double) cache_.bytes() / 1073741824.0,
