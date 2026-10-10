@@ -87,8 +87,11 @@ public:
     /// parameters would otherwise be baked forever - so this can change between requests freely.
     void set_sampling(const strata::kernels::SamplerParams& sp) {
         sampling_ = sp;   // row t of a window at pos0 draws Philox(seed, pos0 + t): see run()
+        sampling_.logit_bias = logit_bias_host_.empty() ? nullptr : logit_bias_device_;
         if (next_) next_->set_sampling(sp);
     }
+    // One request's fixed vocabulary bias. Empty clears it; copied only when changed, on the final stage's device.
+    bool set_logit_bias(const std::vector<float>& bias, std::string& err);
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len`
     /// int32 slots at that stride (`strata::kernels::penalty_rows` builds them), most recent token LAST, unused
@@ -268,6 +271,8 @@ private:
     const int32_t* hist_d_ = nullptr;   ///< penalty-history row (set_history); null = no penalties apply
     int hist_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
+    std::vector<float> logit_bias_host_;
+    float* logit_bias_device_ = nullptr;
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)

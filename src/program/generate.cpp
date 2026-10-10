@@ -23,6 +23,7 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/logit_bias.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/expert_source.hpp"
@@ -6867,7 +6868,7 @@ int main(int argc, char** argv) {
         {
             size_t free_b = 0, total_b = 0;
             strata::gpu::mem_info(&free_b, &total_b);
-            std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
+            std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld tail_role_token=%lld "
@@ -7806,6 +7807,8 @@ int main(int argc, char** argv) {
             unsigned long long req_seed = 0;
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
+            std::string req_bias_text;
+            bool req_bias_present = false;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             // ckpt=0: a one-shot call whose turn no later request extends.  No checkpoint at its last turn boundary
             // (so no split there) nor every --prompt-cache-every tokens, and its session is neither continued nor
@@ -7837,7 +7840,8 @@ int main(int argc, char** argv) {
                     if (eq == std::string::npos) { endp = const_cast<char*>(start); break; }
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
-                    if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                    if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
+                    else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::strtoll(tok.c_str() + eq + 1, nullptr, 10));
                     else if (key == "temperature") req_temperature = fv;
@@ -7854,6 +7858,13 @@ int main(int argc, char** argv) {
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
+            }
+            std::vector<float> req_bias;
+            std::string bias_error;
+            if (req_bias_present && (o.batch > 0 ||
+                !strata::core::parse_logit_bias(req_bias_text, (int) n_vocab, req_bias, bias_error))) {
+                std::printf("ERR logit_bias: %s\n", o.batch > 0 ? "continuous batching is not supported" : bias_error.c_str());
+                continue;
             }
             std::string emb_path;
             if (geni && endp != nullptr) {
@@ -8650,6 +8661,10 @@ int main(int argc, char** argv) {
             req_sp.penalty_freq = req_penalty_freq;
             req_sp.penalty_present = req_penalty_present;
             req_sp.counter = 0;
+            if (!ver.set_logit_bias(req_bias, err) || (pipe && !ver_b.set_logit_bias(req_bias, err))) {
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
             if (use_mtp) mtp.set_draft_sampling(req_sp);

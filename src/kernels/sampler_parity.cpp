@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -288,6 +289,73 @@ int main(int argc, char** argv) {
     }
     int bad = 0;
     const int NV = 512, NT = 4;
+
+    // Request bias (upstream dcc6f756) affects every target row, including greedy; without it the logits and the pick
+    // stay as they were.  Compared against an independently pre-biased input through the same sampler.
+    {
+        namespace P = strata::parity;
+        // the picks of n rows of `rows` (each `vocab` wide) with `hist_len` history slots a row, all 7
+        auto picks = [](const std::vector<float>& rows, int n, int vocab, int hist_len,
+                        const strata::kernels::SamplerParams& p, float** keep = nullptr) {
+            auto* d_l = static_cast<float*>(P::alloc_bytes(rows.size() * sizeof(float)));
+            auto* d_o = static_cast<int*>(P::alloc_bytes((size_t) n * sizeof(int)));
+            P::copy_bytes_in(d_l, rows.data(), rows.size() * sizeof(float));
+            int* d_h = nullptr;
+            if (hist_len > 0) {
+                const std::vector<int> hist((size_t) n * hist_len, 7);
+                d_h = static_cast<int*>(P::alloc_bytes(hist.size() * sizeof(int)));
+                P::copy_bytes_in(d_h, hist.data(), hist.size() * sizeof(int));
+            }
+            strata::kernels::sample_tokens(d_l, n, vocab, d_h, hist_len, p, d_o, nullptr);
+            std::vector<int> got((size_t) n);
+            P::copy_bytes_out(got.data(), d_o, got.size() * sizeof(int));
+            if (keep != nullptr) *keep = d_l;
+            return got;
+        };
+        std::vector<float> l(NV * NT), bias(NV, 0.0f), adjusted;
+        for (int t = 0; t < NT; ++t)
+            for (int v = 0; v < NV; ++v) l[t * NV + v] = float(v % 17) / 4;
+        l[0] = 50;
+        bias[0] = -std::numeric_limits<float>::infinity();
+        bias[7] = 20;
+        bias[16] = -9;
+        adjusted = l;
+        for (int t = 0; t < NT; ++t)
+            for (int v = 0; v < NV; ++v) adjusted[t * NV + v] += bias[v];
+        auto* db = static_cast<float*>(P::alloc_bytes(NV * sizeof(float)));
+        P::copy_bytes_in(db, bias.data(), NV * sizeof(float));
+        int bbad = 0;
+        float* raw_l = nullptr;
+        for (bool greedy : {true, false}) for (bool penalty : {false, true}) {
+            strata::kernels::SamplerParams p;
+            p.greedy = greedy; p.temperature = greedy ? 0 : 0.8f; p.seed = 71; p.top_k = 16;
+            if (penalty) { p.penalty_last_n = 4; p.penalty_freq = 3; p.penalty_repeat = 1.1f; }
+            const auto want = picks(adjusted, NT, NV, 4, p);
+            p.logit_bias = db;
+            const auto got = picks(l, NT, NV, 4, p, &raw_l);
+            if (got != want || std::find(got.begin(), got.end(), 0) != got.end()) ++bbad;
+            p.logit_bias = nullptr;
+            if (picks(l, NT, NV, 4, p) != picks(l, NT, NV, 4, p)) ++bbad;
+        }
+        std::vector<float> unchanged(l.size());
+        P::copy_bytes_out(unchanged.data(), raw_l, l.size() * sizeof(float));
+        if (unchanged != l) ++bbad;   // the bias is added on the way in, the logits stay as they were
+        // the reporter's vocabulary size, with one permitted token: the masked entries cannot win the top-k tail
+        const int vocab = 248320;
+        std::vector<float> large(vocab, 100), bans(vocab, -std::numeric_limits<float>::infinity());
+        bans[109266] = 0;
+        large[109266] = -50;
+        auto* dbig = static_cast<float*>(P::alloc_bytes((size_t) vocab * sizeof(float)));
+        P::copy_bytes_in(dbig, bans.data(), bans.size() * sizeof(float));
+        for (bool greedy : {true, false}) {
+            strata::kernels::SamplerParams p;
+            p.greedy = greedy;
+            p.logit_bias = dbig;
+            if (picks(large, 1, vocab, 0, p) != std::vector<int>{109266}) ++bbad;
+        }
+        std::printf("  %-34s %s\n", "logit_bias (request bias)", bbad ? "*** WRONG ***" : "matches");
+        bad += bbad;
+    }
 
     // ---- fixture 1: plain greedy.  top_k = 0 (disabled), top_p = 1 (disabled), T = 1 -> argmax.
     {

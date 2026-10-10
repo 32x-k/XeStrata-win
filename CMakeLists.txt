@@ -751,6 +751,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(memory_guard_test tests/core/memory_guard_test.cpp src/core/conversation_memory.cpp)
   target_include_directories(memory_guard_test PRIVATE include)
   add_test(NAME memory_guard_test COMMAND memory_guard_test)
+  # a request's logit_bias line (upstream dcc6f756): the parser, no GPU
+  add_executable(logit_bias_test src/core/logit_bias_test.cpp)
+  target_include_directories(logit_bias_test PRIVATE include)
+  add_test(NAME logit_bias_test COMMAND logit_bias_test)
   set_tests_properties(memory_guard_test PROPERTIES TIMEOUT 60)
 endif()
 

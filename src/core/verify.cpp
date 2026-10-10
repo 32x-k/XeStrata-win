@@ -164,6 +164,7 @@ Verifier::~Verifier() {
         if (kv.second) strata::gpu::graph_destroy(kv.second);
     if (arena_b_) strata::gpu::free(arena_b_);
     if (h_commitb_) strata::gpu::free(h_commitb_);
+    if (logit_bias_device_) strata::gpu::free(logit_bias_device_);
     if (cs_ && cs_ != ext_stream_) strata::gpu::stream_destroy(cs_);   // set_stream: the stage's stream, shared
     if (ev_done_) strata::gpu::event_destroy(ev_done_);
     if (ev_commit_) strata::gpu::event_destroy(ev_commit_);
@@ -191,6 +192,25 @@ void Verifier::tune_device(const ModelGeometry& g, void* stream) {
     for (const int64_t n_out : {(int64_t) g.n_expert, (int64_t) g.idx_key_dim, (int64_t) g.idx_q_heads * g.idx_key_dim,
                                 (int64_t) strata::kernels::NG_HC_DIM, (int64_t) g.n_embd})
         strata::kernels::bf16_gemv_fp32_mmvf_multi_tune(g.n_embd, n_out, stream);
+}
+
+bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) {
+    if (next_ && !next_->set_logit_bias(bias, err)) return false;
+    if (le_ < g_->n_layers) return true;
+    const OnDevice on_device(device_);
+    if (!bias.empty() && bias.size() != (size_t) n_vocab_) {
+        err = "logit_bias vocabulary size mismatch"; return false;
+    }
+    if (bias != logit_bias_host_ && !bias.empty()) {
+        const size_t bytes = bias.size() * sizeof(float);
+        if ((!logit_bias_device_ && !strata::gpu::alloc_device(&logit_bias_device_, bytes)) ||
+            !strata::gpu::copy(logit_bias_device_, bias.data(), bytes)) {
+            err = "cannot upload logit_bias"; return false;
+        }
+    }
+    logit_bias_host_ = bias;
+    sampling_.logit_bias = bias.empty() ? nullptr : logit_bias_device_;
+    return true;
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
@@ -1580,7 +1600,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
+    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
@@ -2526,7 +2546,7 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
         return true;
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    if (head_sampling_ && (sampled || hist_d_ != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
+    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) last_pos0_;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
