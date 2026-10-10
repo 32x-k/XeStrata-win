@@ -154,7 +154,25 @@ python .claude/skills/release/scripts/bench-collect.py $o xe<VERSION> <upstream 
 A cell that does not fit the GPU's or the machine's memory stays `-` with the reason in the record; an engine that does not start at all stops the run (report it).
 `bench.sh` stops upstream once it is plainly at 10 tok/s or less; such a cell is `too slow`: not measurable, written 計測不能（低速）/ not measurable (too slow) in the notes, with a line saying upstream was stopped at 10 tok/s or less.
 
-The record goes into `$o/` on `dev`: a README (the machines, the two engines' commits and builds, the method, the tables and what the numbers say), `matrix.json`, and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>` (as the speed-matrix record does).
+### serve and everyday use
+
+Beside that table, two smaller ones on the same GPUs and engines, closer to what a user meets, by the upstream merge's scripts (`tools/bench_core.py`), cut down to about 40 minutes a GPU (the AMD container measures meanwhile): `strata --serve` at 32K, sampled at temperature 0.7, and the engines' own `serve/server.py` with the Japanese chat and the coding agent; two rounds each, the engines alternating, each engine writing its own text.
+They go into `$o/serve/`, apart from the table's `matrix.json`; the prompts come from the merge's `sync_prompts.py` (its 32K is the table's 32K, and it writes the follow-up questions).
+
+```sh
+u=.claude/skills/upstream-sync/scripts
+python $u/sync_prompts.py <pack> <ids-serve>                                   # once
+XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids-serve> TIERS=32k MODES=t07 ROUNDS=2 \
+  python $u/bench_serve.py $o/serve <GPU>
+XE="..." UP="..." XE_ROOT=<xe tree> UP_ROOT=<up tree> XE_PROFILE=... UP_PROFILE=... DATA=<data> PY=<python> \
+  ROUNDS=2 CONVS="chat-ja agent" python $u/bench_usage.py $o/serve <GPU>
+python $u/sync_collect.py $o/serve xe<VERSION> <upstream tag>                 # matrix-serve.json, matrix-usage.json
+```
+
+`XE` and `UP` are as above; serve and everyday use pass stdin to them, so upstream's `sycl/` wrapper runs `docker run -i`.
+`XE_ROOT` and `UP_ROOT` are the engines' worktrees (their `serve/server.py`), `PY` a Python with the server's packages (the data folder's `venv`); everyday use runs at a 262144 context with what setup writes for it.
+
+The record goes into `$o/` on `dev`: a README (the machines, the two engines' commits and builds, the method, the tables and what the numbers say), `matrix.json`, `serve/` (its `matrix-serve.json`, `matrix-usage.json` and runs), and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>` (as the speed-matrix record does).
 Lint and commit it on `dev` (it is not in the tag).
 
 ## 10. The final release (確定報)
@@ -174,8 +192,35 @@ Above each table: the GPU (and its memory), and which build of upstream it ran (
 | IQ3_XXS 1K | 509 | 295 | ✅ 1.7 倍 | 48.8 | 46.8 | ✅ +4% |
 ```
 
+Below each GPU's table, its serve and everyday table from `serve/`'s medians, with the same columns (XeStrata, upstream, difference): a row per measure, the prompt as a ratio, the rest as percentages, the wait and the first token better when shorter.
+Equal there is the upstream merge's check (`judge.py`): the prompt speeds within ±1%, the rest within ±5%, both engines writing their own texts. A wait or a first token is judged as a speed, upstream's time over XeStrata's (372 ms against 354 ms: −4.8%, equal), and its column shows the time's own difference: `≒ 同等（+5%）` / `≈ equal (+5%)`.
+Above it: temperature 0.7, each engine writing its own text, the median of two alternating runs; at a sampled temperature a run can land about 10% off the median.
+
+```markdown
+| 計測 | XeStrata xe0.1.40.2.1 | upstream v0.1.41 | 差 |
+| --- | ---: | ---: | --- |
+| serve 32K 最初のプロンプト (tok/s) | 839 | 380 | ✅ 2.2 倍 |
+| serve 32K 会話の続きの待ち (ms) | 372 | 354 | ≒ 同等（+5%） |
+| serve 32K 出力 (tok/s) | 45.3 | 40.3 | ✅ +12% |
+| chat-ja 最初のトークン (s) | 0.68 | 1.05 | ✅ −35% |
+| chat-ja 出力 (tok/s) | 42.8 | 41.0 | ≒ 同等（+4%） |
+| agent 最初のトークン (s) | 5.74 | 11.97 | ✅ −52% |
+| agent プロンプト (tok/s) | 691 | 334 | ✅ 2.1 倍 |
+| agent 出力 (tok/s) | 46.2 | 45.0 | ≒ 同等（+3%） |
+```
+
+After the last GPU's tables, a note on what counts as equal, in each language section:
+
+```markdown
+> ≒ 同等: ±1% 以内（generate のすべて、serve と通常使用のプロンプト）、±5% 以内（serve と通常使用の待ち・出力・最初のトークン）
+```
+
+```markdown
+> ≈ equal: within ±1% (all of generate; serve's and everyday use's prompt), within ±5% (serve's and everyday use's wait, output, first token)
+```
+
 ```sh
 gh release edit xe<VERSION> --repo MistVVK/XeStrata --notes-file build/release/xe<VERSION>/NOTES.md
 ```
 
-Report the release's URL and the table.
+Report the release's URL and the tables.

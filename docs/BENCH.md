@@ -89,3 +89,4 @@ python $S/judge.py --prompt-only B70 $o/IQ3_XXS ...                           # 
 
 The speed table of the release notes is measured by a fixed method so that releases compare (`.claude/skills/release/scripts/bench.sh`: IQ3_XXS at the six tiers from 1K to 262K, two rounds in turns, no `--spec-follow`).
 It is an implementation of its own: changes to the merges' measurements leave it as it is.
+Beside it go two smaller tables of serve and everyday use, by the merges' scripts cut down (serve at 32K and temperature 0.7, everyday use with the Japanese chat and the coding agent; two rounds each, about 40 minutes a GPU).
