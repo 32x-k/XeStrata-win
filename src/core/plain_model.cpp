@@ -730,11 +730,7 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) 
         k::add_inplace(x_, moe_out_, (int64_t) T * N, cs);
     }
     k::native_qsa_rms_norm_weighted(x_, out_norm_, hn_, (int) N, T, eps, cs);
-    proj(head_, hn_, logits_, T, true);
-    k::SamplerParams sp;
-    sp.greedy = true;
-    sp.temperature = 0.0f;
-    k::sample_tokens(logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+    proj(head_, hn_, logits_, T, true);   // the tokens are picked after the graph (forward), with the run's sampler
     return true;
 }
 
@@ -800,6 +796,9 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
     if (seg) win_.set_segments(&segs_[(size_t) T]);
     if (!win_.serve(L, layers.data(), grps.data(), tbs.data(), ns.data(), &PlainModel::pool_fn, this, cs_, err))
         return false;
+    k::SamplerParams sp = sampler_;
+    sp.counter = (uint64_t) pos;   // row t's draw: position pos + t
+    k::sample_tokens(logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs_);
     if (!strata::gpu::stream_sync(cs_)) {
         err = std::string("plain model: the window: ") + strata::gpu::last_error();
         return false;

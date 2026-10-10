@@ -13,8 +13,10 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/plain_model.hpp"
+#include "strata/kernels/sampler.hpp"
 #include "strata/prefill/gemm.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -55,6 +57,23 @@ std::string architecture(const std::string& path) {
     } catch (const std::exception&) {
         return std::string();
     }
+}
+
+// The tokens that end a generation: the GGUF's end-of-sequence, end-of-turn and end-of-message tokens it names
+std::vector<int32_t> eos_tokens(const std::string& path) {
+    std::vector<int32_t> ids;
+    try {
+        const GgufModel m = GgufModel::open(path);
+        for (const char* key :
+             {"tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"}) {
+            const MetaValue* v = m.meta().get(key);
+            if (v != nullptr && v->is_num() &&
+                std::find(ids.begin(), ids.end(), (int32_t) v->u) == ids.end())
+                ids.push_back((int32_t) v->u);
+        }
+    } catch (const std::exception&) {
+    }
+    return ids;
 }
 
 }  // namespace
@@ -103,6 +122,10 @@ int plain_main(int argc, char** argv) {
     opt.gguf = gguf;
     std::vector<int32_t> prompt;
     int64_t n_new = 16;
+    strata::kernels::SamplerParams sp;   // greedy unless --seed
+    sp.greedy = true;
+    bool stop_eos = false;
+    std::vector<int32_t> eos;
     std::string dump_path, profile_save;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -121,6 +144,16 @@ int plain_main(int argc, char** argv) {
         }
         else if (a == "--help" || a == "-h") { plain_usage(arch); return 0; }
         else if (a == "--max-new") n_new = std::strtoll(next("--max-new"), nullptr, 10);
+        else if (a == "--greedy") sp.greedy = true;
+        else if (a == "--seed") { sp.seed = std::strtoull(next("--seed"), nullptr, 10); sp.greedy = false; }
+        else if (a == "--top-k") sp.top_k = (int) std::strtol(next("--top-k"), nullptr, 10);
+        else if (a == "--top-p") sp.top_p = std::strtof(next("--top-p"), nullptr);
+        else if (a == "--temperature") sp.temperature = std::strtof(next("--temperature"), nullptr);
+        else if (a == "--stop-eos") stop_eos = true;
+        else if (a == "--eos-ids") {
+            if (!parse_ids(next("--eos-ids"), eos)) { std::fprintf(stderr, "--eos-ids: a list of token ids\n"); return 2; }
+            stop_eos = true;
+        }
         else if (a == "--max-context") opt.max_cells = std::strtoll(next("--max-context"), nullptr, 10);
         else if (a == "--max-t") opt.max_t = (int) std::strtol(next("--max-t"), nullptr, 10);
         else if (a == "--pool-workers") opt.pool_workers = (int) std::strtol(next("--pool-workers"), nullptr, 10);
@@ -158,7 +191,12 @@ int plain_main(int argc, char** argv) {
     }
     if ((int64_t) prompt.size() + n_new > opt.max_cells) opt.max_cells = (int64_t) prompt.size() + n_new;
 
+    if (sp.greedy) sp.temperature = 0.0f;
+    if (stop_eos && eos.empty()) eos = eos_tokens(gguf);
+    auto at_eos = [&](int32_t t) { return stop_eos && std::find(eos.begin(), eos.end(), t) != eos.end(); };
+
     strata::core::PlainModel model;
+    model.set_sampler(sp);
     std::string err;
     const Clock::time_point t0 = Clock::now();
     if (opt.prompt_chunk > 0) strata::prefill::Gemm::prepare();   // the products' library loads beside the model
@@ -214,7 +252,7 @@ int plain_main(int argc, char** argv) {
         if (pos == (int64_t) prompt.size() && !emit(n - 1)) return 1;
     }
     const Clock::time_point t2 = Clock::now();
-    while ((int64_t) produced.size() < n_new) {
+    while ((int64_t) produced.size() < n_new && !at_eos(produced.back())) {
         const int32_t x = produced.back();
         if (!model.forward(&x, 1, pos, out.data(), lg, err)) {
             std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());

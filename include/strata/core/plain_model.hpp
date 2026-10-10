@@ -24,6 +24,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/moe_window.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/kernels/sampler.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -85,6 +86,9 @@ public:
     /// prompt path's library).  `out`: the greedy token after the last; `logits`: its row (or null).  The state is left
     /// where the windows would have left it.
     bool prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err);
+    /// How forward and prompt pick their tokens (greedy by default): each row's draw counted from its position, so a
+    /// seed repeats a run.
+    void set_sampler(const strata::kernels::SamplerParams& sp) { sampler_ = sp; }
     /// Runs each dense product the prompt takes once, so the products' library has loaded its kernels before the
     /// first prompt (plain_prompt.cpp); nothing when the prompt runs in windows.
     bool prompt_warm(std::string& err);
@@ -236,7 +240,13 @@ private:
     float *h_emb_ = nullptr, *m_emb_ = nullptr;                  ///< mapped: T rows of n_embd
     int32_t *h_step_ = nullptr, *m_step_ = nullptr;              ///< mapped: T x kStepCount
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr;                ///< mapped: T x n_head, then T x n_head_kv
-    int32_t *h_out_ = nullptr, *m_out_ = nullptr;                ///< mapped: T greedy tokens
+    int32_t *h_out_ = nullptr, *m_out_ = nullptr;                ///< mapped: T picked tokens
+    strata::kernels::SamplerParams sampler_ = [] {
+        strata::kernels::SamplerParams p;
+        p.greedy = true;
+        p.temperature = 0.0f;
+        return p;
+    }();
     int32_t *step_ = nullptr, *pos_ = nullptr;
     float *x_ = nullptr, *hn_ = nullptr, *mix_ = nullptr;
     uint8_t* xq_ = nullptr;

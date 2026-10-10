@@ -655,9 +655,8 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 k::native_qsa_rms_norm_weighted(P.x + (T - 1) * N, out_norm_, P.hn, (int) N, 1, eps, cs);
                 k::native_quantize_q8_1(P.hn, xq_, head_.n_in, 1, cs);
                 k::native_mmvq(head_.type, head_.data, xq_, logits_, head_.n_in, head_.n_out, 1, cs);
-                k::SamplerParams sp;
-                sp.greedy = true;
-                sp.temperature = 0.0f;
+                k::SamplerParams sp = sampler_;
+                sp.counter = (uint64_t) (p0 + T - 1);   // the last token's position, as forward counts
                 k::sample_tokens(logits_, 1, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
             }
             if (!routes.empty()) {
