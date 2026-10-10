@@ -236,6 +236,10 @@ a native pack's from the GGUF files in place, the AVX-512 Q2_0 pack's from its `
   It works only with a pack whose experts are all one size (the AVX-512 Q2_0 pack's `experts.bin`) and a fully
   page-locked RAM copy; a native pack, whose blobs differ by layer, says so in the log and keeps the copying exchanges.
 - Otherwise they are read through the OS file cache (`--mmap-experts`), which re-reads them from the SSD as it runs: slower.
+  Reading from the GGUF files, the prefill copies the experts with the SSD profile (many threads, a deep ring). When
+  90% or more of the experts' pages are already in the page cache at the first prefill (Linux: a sample checked with
+  `mincore`), it takes the RAM profile (a few threads) instead and says so in its log (upstream 83a7dbc0, #1353).
+  `STRATA_STAGER_SSD=1` / `0` forces either.
 
 `--low-ram on|off|resident|mmap` overrides the choice, and `./setup.sh --check` shows what each size would use.
 

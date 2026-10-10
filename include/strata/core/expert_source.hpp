@@ -158,6 +158,11 @@ public:
     /// stays valid for the layer it was asked in and the next one or two; a consumer that keeps a blob longer (the
     /// prompt path's stager queues a whole chunk) copies it with `copy_blob` instead.
     virtual bool transient(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
+    /// #1353 (upstream 83a7dbc0): of the bytes `transient` experts would be copied from, the share whose pages are in
+    /// RAM right now (a GGUF read in place whose page cache is warm), measured on a sample of up to `samples` experts;
+    /// -1 when this source cannot tell (not a file source, or no residency query on this OS).  The prompt path's stager
+    /// uses it to pick the SSD profile (many threads, a deep ring) only for blobs that really are page faults on a disk.
+    virtual double cached_share(int64_t samples) const { (void) samples; return -1.0; }
     /// A layer split: makes the blobs copy fast to engine device `device` as well (see PinnedArena::register_on).
     /// True when there is nothing to do; false (and `err`) when the device refuses, the copies then being slower.
     virtual bool register_on(int device, std::string& err) { (void) device; (void) err; return true; }
@@ -541,6 +546,7 @@ public:
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     bool pcie_layer(int64_t layer) const override;
     bool transient(int64_t layer, int64_t expert) const override;
+    double cached_share(int64_t samples) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     /// CS-T: advances the assembled blobs' age (see staged_blob).
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
