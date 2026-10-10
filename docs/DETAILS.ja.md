@@ -1104,6 +1104,7 @@ Monitor は、要求ごとに ESP か stock かを示します。
 
 **有効にする（setup で）**: `./setup.sh --setup` が「Turn on the experimental speed projection?」と尋ねます（既定は no）。
 または `--experimental-speed-projection on`（`off`、または別のベクトルの GGUF のパス）を渡します。
+deb と rpm のパッケージにはベクトルが入っていないので、有効にすると、setup が入れた版のタグから GitHub にあるベクトルとそのライセンスをデータフォルダの `experimental-speed-projection/` にダウンロードします。
 元の Qwen3.8-Flash-Next だけで使え、Swift 1.5 では使えません。
 setup は、次のエンジンの設定（llama.cpp のもの）を `xestrata-<model>.json` に書きます。
 

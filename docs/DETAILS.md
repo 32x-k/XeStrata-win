@@ -1100,6 +1100,7 @@ so measure it on your own prompts; the Monitor marks every request ESP or stock.
 
 **Turning it on (at setup).** `./setup.sh --setup` asks "Turn on the experimental speed projection?" (default: no),
 or pass `--experimental-speed-projection on` (`off`, or a path to another vector GGUF).
+The deb and rpm packages do not carry the vector: with it turned on, setup downloads the vector and its license from the installed version's tag on GitHub into `experimental-speed-projection/` in the data folder.
 Only for the original Qwen3.8-Flash-Next, not Swift 1.5.
 It writes these engine flags (llama.cpp's) into `xestrata-<model>.json`:
 
