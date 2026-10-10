@@ -5,7 +5,9 @@ measure (prompt, output), the median of each engine's rounds; a cell passes when
 One folder per model file.  A folder with a matrix-serve.json (bench_serve.py) is judged on the serve path too: per
 GPU, tier and mode, the prompt, the follow-ups and the output, a cell passing when XeStrata is at most SERVE_LIMIT
 slower (each engine writes its own text there, so the drafts accepted vary from run to run: the limit comes from
-the spread of XeStrata measured against itself).
+the spread of XeStrata measured against itself).  A folder with a matrix-usage.json (bench_usage.py) is judged on
+everyday use too: per GPU and conversation, the time to the first token (lower is better), the prompt and the
+output, with the same SERVE_LIMIT.
 
     python .claude/skills/upstream-sync/scripts/judge.py [--prompt-only GPU]... OUT/IQ3_XXS OUT/IQ2_XS ...
 
@@ -25,6 +27,8 @@ SLOW = 10.0                                   # tok/s: upstream this slow is not
 TIERS = ["1k", "4k", "32k", "64k", "128k", "192k", "262k"]
 MEASURES = (("prefill_tok_s", "prompt"), ("decode_tok_s", "output"))
 SERVE_MEASURES = (("prefill_tok_s", "prompt"), ("cont_tok_s", "follow"), ("decode_tok_s", "output"))
+USAGE_MEASURES = (("ttft_s", "first"), ("prefill_tok_s", "prompt"), ("decode_tok_s", "output"))
+LOWER_BETTER = {"ttft_s"}
 
 
 def median(rows, key):
@@ -58,6 +62,11 @@ def cells(folder):
                     if cell:
                         path = "generate" if mode is None else f"serve-{mode}"
                         yield gpu, f"{folder.name:10s} {path:12s} {gpu:8s} {tier:5s}", cell, measures, limit
+    usage = json.loads((folder / "matrix-usage.json").read_text()) if (folder / "matrix-usage.json").exists() else []
+    for gpu in sorted({r["gpu"] for r in usage}):
+        for conv in dict.fromkeys(r["conv"] for r in usage):
+            cell = [r for r in usage if (r["gpu"], r["conv"]) == (gpu, conv)]
+            yield gpu, f"{folder.name:10s} {'usage':12s} {gpu:8s} {conv:7s}", cell, USAGE_MEASURES, SERVE_LIMIT
 
 
 for folder, _ in matrices:
@@ -73,17 +82,18 @@ for folder, _ in matrices:
                 print(f"{where} SKIP  upstream stopped at {SLOW:g} tok/s or less ({', '.join(sorted(stopped))})")
             elif up is None:
                 print(f"{where} SKIP  upstream did not finish")
-            elif up <= SLOW:
+            elif key not in LOWER_BETTER and up <= SLOW:
                 print(f"{where} SKIP  upstream at {up:.1f} tok/s")
             elif xe is None:
                 fails += 1
                 print(f"{where} FAIL  XeStrata did not finish (upstream {up:.1f})")
             else:
                 judged += 1
-                d = xe / up - 1
+                d = up / xe - 1 if key in LOWER_BETTER else xe / up - 1
                 ok = d >= limit
                 fails += not ok
-                print(f"{where} {'PASS' if ok else 'FAIL'}  {xe:.1f} vs {up:.1f} ({100 * d:+.1f}%)")
+                n = 2 if key in LOWER_BETTER else 1
+                print(f"{where} {'PASS' if ok else 'FAIL'}  {xe:.{n}f} vs {up:.{n}f} ({100 * d:+.1f}%)")
 fails += judged == 0                          # nothing measured is no win
 print("ALL PASS" if fails == 0 else f"FAIL {fails}")
 sys.exit(1 if fails else 0)

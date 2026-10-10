@@ -6,6 +6,8 @@ stdout.  An upstream run bench.sh stopped as too slow has "stopped" (prompt or o
 takes its prompt rate from the last PP line (or, without PP lines, from its "strata generate: prefill" line).
 When bench_serve.py ran too, OUT/serve-runs/*.json go to OUT/matrix-serve.json and three more tables per GPU and mode:
 the tier's prompt, the follow-ups (the tokens they read over their prompt time) and the output of all four turns.
+When bench_usage.py ran too, OUT/usage-runs/*.json go to OUT/matrix-usage.json and a table per GPU: per conversation,
+the time to the first token (the median of its turns), the prompt and the output speed (the server's timings, summed).
 
     python .claude/skills/upstream-sync/scripts/sync_collect.py OUT XE_NAME UP_NAME   # e.g. OUT xe0.1.41 v0.1.41
 """
@@ -96,3 +98,39 @@ if serve:
                         cells.append(fmt.format(statistics.median(v)) if v else
                                      "too slow" if any(r["stopped"] for r in c) else "-")
                     print(f"| {name} | " + " | ".join(cells) + " |")
+
+usage = []
+for f in sorted((out / "usage-runs").glob("*.json")):
+    if f.name.endswith(".config.json"):
+        continue
+    r = json.loads(f.read_text())
+    if r["round"] == 0 or (r["why"] and not r["why"].startswith("stopped")):   # warm-ups, runs that failed
+        continue
+    for conv in dict.fromkeys(t["conv"] for t in r["turns"]):
+        ct = [x for x in r["turns"] if x["conv"] == conv]
+        tot = lambda k: sum(x[k] or 0 for x in ct)   # noqa: E731
+        usage.append({
+            "gpu": r["gpu"], "arm": r["arm"], "engine": NAMES[r["arm"]], "conv": conv, "round": r["round"],
+            "turns": len(ct), "context": r["context"],
+            "ttft_s": statistics.median([x["ttft_s"] for x in ct if x["ttft_s"] is not None] or [0]) or None,
+            "prefill_tok_s": tot("prompt_n") / tot("prompt_ms") * 1e3 if tot("prompt_ms") else None,
+            "decode_tok_s": tot("predicted_n") / tot("predicted_ms") * 1e3 if tot("predicted_ms") else None,
+            "read": tot("prompt_n"), "reused": tot("cache_n"), "generated": tot("predicted_n"),
+            "stopped": (r["why"] or "").removeprefix("stopped: ") or None,
+        })
+        if r["why"]:                          # stopped as too slow: its one answer is no conversation's speed
+            usage[-1].update(ttft_s=None, prefill_tok_s=None, decode_tok_s=None)
+if usage:
+    (out / "matrix-usage.json").write_text(json.dumps(usage, indent=1) + "\n")
+    convs = list(dict.fromkeys(r["conv"] for r in usage))
+    for gpu in sorted({r["gpu"] for r in usage}):
+        print(f"\n### {gpu} everyday use\n\n| Engine | " + " | ".join(
+            f"{c} {m}" for c in convs for m in ("first token (s)", "prompt (tok/s)", "output (tok/s)")) + " |")
+        print("| --- |" + " ---: |" * (3 * len(convs)))
+        for name in NAMES.values():
+            cells = []
+            for c in convs:
+                for key, fmt in (("ttft_s", "{:.2f}"), ("prefill_tok_s", "{:,.0f}"), ("decode_tok_s", "{:.1f}")):
+                    v = [r[key] for r in usage if (r["gpu"], r["engine"], r["conv"]) == (gpu, name, c) and r[key]]
+                    cells.append(fmt.format(statistics.median(v)) if v else "-")
+            print(f"| {name} | " + " | ".join(cells) + " |")
