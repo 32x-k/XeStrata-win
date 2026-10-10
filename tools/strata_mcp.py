@@ -80,6 +80,10 @@ FALLBACK_FAMILIES = {
                                                                   "of RAM part of its experts are read from the SSD "
                                                                   "(UD-Q4_K_XL, 111 GB: experimental)",
                 "tag": "unsloth-", "vision": False},
+    "ornith": {"title": "Ornith-1.5-35B-A3B", "about": "35B, 3B active; a Qwen3.5 MoE: Q4_K_M to BF16, and community "
+                                                       "GSQ-RCO 3 and 3.5 bits", "tag": "ornith-"},
+    "llmjp": {"title": "llm-jp-4.1-32b-a3b-thinking", "about": "32B, 3B active; Japanese and English, a thinking model",
+              "tag": "llmjp-"},
 }
 FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
 BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper who finds a message in a bottle. "
