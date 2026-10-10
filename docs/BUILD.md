@@ -55,6 +55,7 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
   An AMD GPU's dense products run in oneMath's rocBLAS backend, which the fork's change makes hand those with 16-bit inputs to hipBLASLt.
   Without hipBLASLt, CMake warns (and stops with `STRATA_PACKAGE=ON`), and those products run in rocBLAS alone (at about a fifteenth of the speed on gfx12).
   Validated: CTest passes on an RX 9060 XT (gfx1200, Fedora 44, ROCm 7.1.1).
+  Validated to build and run on a gfx1030 card (RX 6800 XT, CachyOS (Arch), ROCm 7.2.4): the setup unit tests pass, and IQ3_XXS decodes at ~64-68 tok/s (2000-token runs, 262144 context, ~65 tok/s with ~215K tokens loaded).
 - **contrib-llvm** (the default, `-DSTRATA_LICENSE=contrib`): intel/llvm built with its CUDA target (`tools/intel_llvm_build.py --contrib`), and with `STRATA_CUDA_ARCHS` (`sm_89`, for example) the code for NVIDIA GPUs as well.
   XeStrata's source is the free mode's and stays free software,
   but the build needs NVIDIA's CUDA toolkit and a run NVIDIA's driver, neither of them free software (XeStrata ships neither).
@@ -312,22 +313,22 @@ The packages it needs are in [the table below](#packages) and in [DEVTOOLS.md](D
 
 ### Packages
 
-setup.py installs no system packages and runs neither apt nor sudo.
-setup.sh installs Python 3 with venv through `sudo apt-get` (`sudo dnf` on Fedora) only when there is none.
+setup.py installs no system packages and runs no package manager and no sudo.
+setup.sh installs Python 3 with venv through `sudo apt-get` (`sudo dnf` on Fedora, `sudo pacman -S` on Arch) only when there is none.
 Install the other packages first.
 
-From the table, take the common row of the mode you build and the rows of the GPU makers the PC has (any number of them), and put them after `sudo apt install` (`sudo dnf install` on Fedora).
+From the table, take the common row of the mode you build and the rows of the GPU makers the PC has (any number of them), and put them after `sudo apt install` (`sudo dnf install` on Fedora, `sudo pacman -S` on Arch).
 `./setup.sh --packages` prints that line for this PC's distribution and GPUs and the mode of `--license` (contrib-llvm unless given).
 It prints other choices too, as in `./setup.sh --packages fedora44/intel,amd --license free`.
 
-| Choice | Ubuntu 26.04 | Fedora 44 |
-| --- | --- | --- |
-| common (free, contrib-llvm) | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel` |
-| common (contrib-icpx) | `python3-venv build-essential libblosc2-dev intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` | `python3 gcc-c++ blosc2-devel intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` |
-| Intel GPUs | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` |
-| Intel GPUs (contrib-llvm) | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` |
-| AMD GPUs (free, contrib-llvm) | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` |
-| NVIDIA GPUs (contrib-llvm) | `nvidia-cuda-toolkit` and NVIDIA's driver | `cuda-toolkit-13-4` (NVIDIA's CUDA repository) and NVIDIA's driver |
+| Choice | Ubuntu 26.04 | Fedora 44 | Arch |
+| --- | --- | --- | --- |
+| common (free, contrib-llvm) | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel` | `python base-devel git cmake ninja lld hwloc zstd vulkan-headers vulkan-icd-loader shaderc spirv-headers opencl-headers blosc2` |
+| common (contrib-icpx) | `python3-venv build-essential libblosc2-dev intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` | `python3 gcc-c++ blosc2-devel intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` | none (Intel oneAPI is not in Arch's repositories) |
+| Intel GPUs | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` | `level-zero-loader intel-compute-runtime vulkan-intel` |
+| Intel GPUs (contrib-llvm) | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` | none (oneMKL is not in Arch's repositories either) |
+| AMD GPUs (free, contrib-llvm) | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` | `hip-runtime-amd rocm-device-libs rocm-llvm rocblas hipblaslt hipblas-common vulkan-radeon` |
+| NVIDIA GPUs (contrib-llvm) | `nvidia-cuda-toolkit` and NVIDIA's driver | `cuda-toolkit-13-4` (NVIDIA's CUDA repository) and NVIDIA's driver | `cuda` and NVIDIA's driver |
 
 - The packages starting with `intel-oneapi-` are in Intel's oneAPI repository (Intel's guides show how to add it: [APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html), [DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)).
 - The common row's Vulkan packages (`libvulkan-dev` and the others) are for the GPU image encoder, and `libblosc2-dev` (`blosc2-devel`) for compressing the saved conversations (optional; [`conversation_save_compress`](DETAILS.md#keeping-parked-conversations-across-restarts-opt-in)).
@@ -336,6 +337,17 @@ It prints other choices too, as in `./setup.sh --packages fedora44/intel,amd --l
   HIP's CMake package, which oneMath's rocBLAS backend reads, asks the compiler for clang's runtime builtins (`libclang_rt.builtins`) to add them to the link.
   intel/llvm has no such builtins, so ROCm's clang is made `HIP_CXX_COMPILER` to answer (`strata_hip_cxx` in `cmake/StrataHip.cmake`).
   They are needed to build only, not to run.
+- On Arch the Vulkan ICD is the GPU maker's own package (`vulkan-intel`, `vulkan-radeon`), not the one `mesa-vulkan-drivers` carries for both on Ubuntu and Fedora.
+- Arch's `zstd` has no `libzstd.a` (`zstd-static` is an AUR package).
+  intel/llvm's `configure.py` asks for the static zstd (`LLVM_USE_STATIC_ZSTD=ON`), so `tools/intel_llvm_build.py` turns that off where there is none and links the shared one (intel/llvm handles it from v7.1.1: [intel/llvm#22294](https://github.com/intel/llvm/pull/22294)).
+- Arch's ROCm clang is in `/opt/rocm/lib/llvm`, and its runtime builtins (`libclang_rt.builtins`) are in the same `rocm-llvm` package (one package where the AMD row's `clang-21` and `libclang-rt-21-dev` are two).
+- Arch's ROCm lies under AMD's own tree, `/opt/rocm` (its CMake packages in `/opt/rocm/lib/cmake`, its libraries in `/opt/rocm/lib`).
+  Neither CMake's default search nor ld.so's looks there, so `cmake/StrataHip.cmake` puts `/opt/rocm` on `CMAKE_PREFIX_PATH`, and setup records `/opt/rocm/lib` among the engine's library folders.
+- On Arch `opencl-headers` is installed as well: intel/llvm's build installs the SYCL tools too, and `sycl-ls` includes `CL/cl.h` through `sycl/detail/cl.h` while its target gets no include for the OpenCL headers the configuration fetches (those belong to the runtime's own objects).
+  Ubuntu's and Fedora's builds have that header (their compilers bring it in); Arch's clang does not.
+- Intel oneAPI (icpx and oneMKL) is not in Arch's repositories: install Intel's offline installer for it if it is wanted.
+  Without it, the free and contrib modes build intel/llvm from the source, and an Intel GPU's dense products are XeStrata's own kernels' work.
+- Not checked (`unverified`): running an AMD GPU on Ubuntu, and contrib-icpx on Fedora.
 
 #### Other distributions
 

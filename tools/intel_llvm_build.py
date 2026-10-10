@@ -20,6 +20,7 @@ Prints the toolchain's folder on its last line.  setup.py runs it for --intel-ll
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -91,20 +92,68 @@ def run(cmd, cwd=None, env=None):
         fail(f"command failed (exit {r.returncode}): {Path(str(cmd[0])).name}")
 
 
+def distro_family() -> str:
+    """Which distribution's package names this PC's are ("ubuntu", "fedora", "arch"), as setup.py's distro_family
+    reads it: ID_LIKE settles Arch's derivatives (CachyOS: ID=cachyos, ID_LIKE=arch), and a distribution none of the
+    three names gets Ubuntu's list (apt)."""
+    try:
+        text = Path("/etc/os-release").read_text()
+    except OSError:
+        return "ubuntu"
+    ids = " ".join(re.findall(r"^ID(?:_LIKE)?=\"?([^\"\n]*)", text, re.M)).split()
+    for family in PREREQUISITES:
+        if any(i == family or i.startswith(family) for i in ids):
+            return family
+    return "ubuntu"
+
+
+# What the build needs (sycl/doc/GetStartedGuide.md) as the distribution's packages, and the command that installs
+# them (setup.py's PACKAGES and INSTALLERS in the same names)
+PREREQUISITES = {
+    "ubuntu": {"git": "git", "cmake": "cmake", "ninja": "ninja-build", "g++": "g++", "ld.lld": "lld",
+               "hwloc": "libhwloc-dev",
+               "zstd": "libzstd-dev", "opencl": "opencl-headers", "cuda": "nvidia-cuda-toolkit",
+               "how": "sudo apt install "},
+    "fedora": {"git": "git", "cmake": "cmake", "ninja": "ninja-build", "g++": "gcc-c++", "ld.lld": "lld",
+               "hwloc": "hwloc-devel",
+               "zstd": "libzstd-devel", "opencl": "opencl-headers", "cuda": "cuda-toolkit-13-4",
+               "how": "sudo dnf install "},
+    "arch": {"git": "git", "cmake": "cmake", "ninja": "ninja", "g++": "base-devel", "ld.lld": "lld",
+             "hwloc": "hwloc",
+             "zstd": "zstd", "opencl": "opencl-headers", "cuda": "cuda", "how": "sudo pacman -S --needed "},
+}
+# where CMake's find_library looks, per distribution
+LIB_DIRS = ("/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib", "/usr/local/lib")
+
+
+def static_zstd() -> bool:
+    """Whether the static zstd library, which the release's configure.py asks for (LLVM_USE_STATIC_ZSTD=ON), is here:
+    Debian's libzstd-dev and Fedora's libzstd-static have it, Arch's zstd does not."""
+    return any(Path(d, "libzstd.a").exists() for d in LIB_DIRS)
+
+
 def missing_prerequisites() -> list:
-    """What intel/llvm's build needs (sycl/doc/GetStartedGuide.md), as Debian / Ubuntu packages."""
+    """What the build needs that is not installed, as this PC's distribution's packages."""
+    p = PREREQUISITES[distro_family()]
     need = []
-    for tool, pkg in (("git", "git"), ("cmake", "cmake"), ("ninja", "ninja-build"), ("g++", "g++"), ("ld.lld", "lld")):
+    for tool in ("git", "cmake", "ninja", "g++", "ld.lld"):
         if shutil.which(tool) is None:
-            need.append(pkg)
+            need.append(p[tool])
     if not Path("/usr/include/hwloc.h").exists():
-        need.append("libhwloc-dev")
+        need.append(p["hwloc"])
+    # intel/llvm's SYCL tools (sycl-ls, which the build installs) include CL/cl.h through sycl/detail/cl.h, and their
+    # target gets no include for the OpenCL headers the configuration fetches (those belong to the runtime's own
+    # objects): Arch's clang does not bring the header in, Ubuntu's and Fedora's builds have it
+    if not Path("/usr/include/CL/cl.h").exists():
+        need.append(p["opencl"])
     # the SYCL runtime reads zstd-compressed device images (oneMKL's, which oneMath calls in the contrib modes); without
-    # the headers the configuration leaves zstd out silently
-    # and links them statically (LLVM_USE_STATIC_ZSTD): Debian's libzstd-dev has libzstd.a, Fedora's is libzstd-static
-    if not Path("/usr/include/zstd.h").exists() or not any(
-            Path(d, "libzstd.a").exists() for d in ("/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib")):
-        need.append("libzstd-dev")
+    # the headers the configuration leaves zstd out silently.  With -DLLVM_ENABLE_ZSTD=FORCE_ON the configuration needs
+    # the library too: configure.py asks for the static one (LLVM_USE_STATIC_ZSTD=ON), and where the distribution has
+    # none (Arch) build() turns that off, which the release's own libraries and SYCL runtime take (intel/llvm#22294, in
+    # v7.1.1: the shared library then).  Either way it is the devel package that has the headers.
+    if not Path("/usr/include/zstd.h").exists() or not (
+            static_zstd() or any(Path(d, "libzstd.so").exists() for d in LIB_DIRS)):
+        need.append(p["zstd"])
     return need
 
 
@@ -152,8 +201,10 @@ def target_options(contrib: bool) -> list:
     opts, libclc = [], []
     if contrib:
         if shutil.which("nvcc") is None and not Path("/usr/local/cuda/include/cuda.h").exists():
+            p = PREREQUISITES[distro_family()]
             fail("the CUDA target needs NVIDIA's CUDA toolkit (not free software)",
-                 "install it: sudo apt install nvidia-cuda-toolkit (Ubuntu: multiverse; Debian: non-free)")
+                 "install it: " + p["how"] + p["cuda"] +
+                 (" (Ubuntu: multiverse; Debian: non-free)" if distro_family() == "ubuntu" else ""))
         opts.append("--cuda")
         libclc.append("nvptx64--nvidiacl")
     rocm = rocm_dirs()
@@ -181,7 +232,8 @@ def fix_sources() -> None:
 def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) -> None:
     need = missing_prerequisites()
     if need:
-        fail("intel/llvm's build needs: " + ", ".join(need), "install them: sudo apt install " + " ".join(need))
+        fail("intel/llvm's build needs: " + ", ".join(need),
+             "install them: " + PREREQUISITES[distro_family()]["how"] + " ".join(need))
     BASE.mkdir(parents=True, exist_ok=True)
     OUT.mkdir(parents=True, exist_ok=True)
     if (SRC / ".git").exists():
@@ -201,12 +253,17 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
     # The links take the most memory: LLVM limits them by the free RAM at configure time (LLVM_RAM_PER_LINK_JOB, in
     # MB; 10000 is the value llvm/docs/CMake.rst suggests), and every other job runs on all the threads
     # Without assertions, as a distribution's clang is: they check the compiler's own state and do not change the code
-    # it makes, and they slow every compile.  lld links LLVM's many large binaries faster, and with less memory, than
-    # GNU ld.
+    # it makes, and they slow every compile.  lld links LLVM's many large binaries faster, and with less memory,
+    # than GNU ld.
+    # configure.py asks for the static zstd library (LLVM_USE_STATIC_ZSTD=ON), which Debian's and Fedora's packages of
+    # it have and Arch's does not: without one the shared library is linked instead, which the release's own libraries
+    # and its SYCL runtime take (intel/llvm#22294, in v7.1.1).  A --cmake-opt comes after configure.py's own -D, so it
+    # settles the answer.
+    zstd = [] if static_zstd() else ["--cmake-opt=-DLLVM_USE_STATIC_ZSTD=OFF"]
     options = [f"--cmake-opt=-DCMAKE_INSTALL_PREFIX={INSTALL}", "--cmake-opt=-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON",
                "--cmake-opt=-DLLVM_ENABLE_ZSTD=FORCE_ON", "--cmake-opt=-DLLVM_RAM_PER_LINK_JOB=10000",
                "--cmake-opt=-DLLVM_ENABLE_ASSERTIONS=OFF", "--cmake-opt=-DLLVM_USE_LINKER=lld"] + \
-        target_options(contrib)
+        zstd + target_options(contrib)
     # configured again when the tree was configured with other values of these options
     cache = BUILD / "CMakeCache.txt"
     text = cache.read_text(errors="replace") if cache.exists() else ""
@@ -215,6 +272,12 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
             not all(any(line.startswith(name + ":") and line.endswith("=" + value) for line in text.splitlines())
                     for name, value in wanted):
         run([sys.executable, SRC / "buildbot" / "configure.py", "-o", BUILD, "-t", "Release"] + options)
+    # The deploy writes one marker per component (install_manifest_<component>.txt) and its steps depend on nothing
+    # but each other (sycl/CMakeLists.txt), so a marker that survived the build that is being redone makes ninja skip
+    # installing what was built since (an older clang, as another build left it) and the toolchain in install/ stops
+    # matching the build tree.  A build that runs installs its components again: the markers go.
+    for marker in BUILD.glob("install_manifest_*.txt"):
+        marker.unlink()
     jobs = jobs or os.cpu_count() or 4
     started = time.time()
     run([sys.executable, SRC / "buildbot" / "compile.py", "-o", BUILD, "-j", str(jobs)])
@@ -257,12 +320,17 @@ def main() -> None:
                        and not patch_id(p).startswith("build-")
                        and (a.contrib or not patch_id(p).startswith("cuda-"))
                        and (hip or not patch_id(p).startswith("hip-"))]
+            # an AMD GPU's code needs the HIP target, which the build gets only when ROCm's HIP is there while it is
+            # built: a record whose backends have none was built before ROCm was installed (and its deploy may be
+            # incomplete, as an interrupted one leaves the record of the build before it)
+            if rocm_dirs() is not None and "hip" not in have.get("backends", []):
+                missing.append("the HIP target")
             if not have.get("zstd"):
                 missing.append("zstd")
             if not missing:
                 say(f"intel/llvm {a.tag} is already built in {INSTALL}")
-            elif ask(f"intel/llvm {a.tag} is built without the fixes {', '.join(missing)}; build it again with them? "
-                     "build = with the fixes (with --keep-build's tree, minutes), keep = as it is", ["build", "keep"],
+            elif ask(f"intel/llvm {a.tag} is built without: {', '.join(missing)}; build it again with them? "
+                     "build = with them (with --keep-build's tree, minutes), keep = as it is", ["build", "keep"],
                      "build", a.yes) == "build":
                 build(a.tag, a.keep_build, a.contrib, a.jobs)
         elif version_key(have.get("tag", "")) < version_key(a.tag):

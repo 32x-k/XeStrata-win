@@ -56,12 +56,15 @@ free のビルドは、intel/llvm の DPC++ でエンジンをコンパイルし
 setup は `--intel-llvm-build` でこれを動かします。
 済んだビルドをどう使い回すかは [BUILD.ja.md](BUILD.ja.md#sycl-のコンパイラ) にあります。
 intel/llvm は自由ソフトウェア（Apache-2.0 with LLVM exceptions）で、自由ソフトウェアだけでビルドできます。
-要るパッケージは次のとおりです（Fedora 44 では `git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static python3`）。
+要るパッケージは次のとおりです（Fedora 44 では `git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static python3`、Arch では `git cmake ninja base-devel lld hwloc zstd opencl-headers python`）。
 
 ```sh
 sudo apt install git cmake ninja-build g++ lld python3 libhwloc-dev libzstd-dev
 python3 tools/intel_llvm_build.py            # --keep-build keeps the build tree for a quicker update; --jobs N
 ```
+
+Arch の `zstd` には `libzstd.a` がありません（`zstd-static` は AUR のパッケージです）。
+そのときスクリプトは `-DLLVM_USE_STATIC_ZSTD=OFF` を渡し、共有の zstd をリンクします（intel/llvm は v7.1.1 からそれを扱います。[BUILD.ja.md](BUILD.ja.md#パッケージ)）。
 
 ビルドの構成は、リリースが指定するもの（Level Zero のヘッダーとローダー、emhash。どれも自由ソフトウェア）を取ってくるので、ネットワークが要ります。
 スクリプトは、Level Zero がすでに入っていても取ってこさせます（`SYCL_UR_FORCE_FETCH_LEVEL_ZERO`）。
