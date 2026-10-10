@@ -551,6 +551,51 @@ inline float vec_dot_q6_K_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx
     }
     return (float) bq6_K->d * sumf;
 }
+// Q2_K and Q3_K experts (Ornith-1.5's GSQ-RCO files, GLM-5.3-Flash's): llama.cpp's vecdotq.cuh vec_dot_q2_K_q8_1 /
+// vec_dot_q3_K_q8_1 with their _impl_mmvq, VDR 1 - QI 16 calls a block, each one 32-bit word of the quants against
+// four q8_1 blocks
+constexpr int VDR_Q2_K = 1, VDR_Q3_K = 1;
+inline float vec_dot_q2_K_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs) {
+    const block_q2_K* bq2_K = (const block_q2_K*) vbq + kbx;
+    const int bq8_offset = QR2_K * (iqs / QI8_1);
+    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
+    const uint8_t* scales = bq2_K->scales + scale_offset;
+    const int v = get_int_b4(bq2_K->qs, iqs);
+    float sumf_d = 0.0f, sumf_m = 0.0f;
+    for (int i = 0; i < QR2_K; ++i) {
+        const block_q8_1* b8 = bq8_1 + bq8_offset + i;
+        const int u = get_int_b4(b8->qs, iqs % QI8_1);
+        const float d8 = low_half(b8->ds);
+        const int sc = scales[(ptrdiff_t) 2 * i];
+        const int vi = (v >> (2 * i)) & 0x03030303;
+        sumf_d += d8 * (float) (dp4a(vi, u, 0) * (sc & 0xF));
+        int m = sc >> 4;   // the min in every byte, against the q8_1 values' sum
+        m |= m << 8;
+        m |= m << 16;
+        sumf_m += d8 * (float) dp4a(m, u, 0);
+    }
+    return (float) bq2_K->dm[0] * sumf_d - (float) bq2_K->dm[1] * sumf_m;
+}
+inline float vec_dot_q3_K_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs) {
+    const block_q3_K* bq3_K = (const block_q3_K*) vbq + kbx;
+    const int bq8_offset = QR3_K * (iqs / (QI3_K / 2));
+    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
+    const int vl = get_int_b2(bq3_K->qs, iqs);
+    const int vh = ~get_int_b2(bq3_K->hmask, iqs % (QI3_K / 2)) >> bq8_offset;   // a 0 bit subtracts 4
+    float sumf = 0.0f;
+    for (int i = 0; i < QR3_K; ++i) {
+        const block_q8_1* b8 = bq8_1 + bq8_offset + i;
+        const int isc = scale_offset + 2 * i;
+        const int sc_low = (bq3_K->scales[isc % 8] >> (4 * (isc / 8))) & 0xF;
+        const int sc_high = ((bq3_K->scales[8 + isc % 4] >> (2 * (isc / 4))) & 3) << 4;
+        const int sc = (sc_low | sc_high) - 32;
+        const int vil = (vl >> (2 * i)) & 0x03030303;
+        const int vih = ((vh >> i) << 2) & 0x04040404;
+        const int vi = xe::vsubss4(vil, vih);
+        sumf += low_half(b8->ds) * (float) (dp4a(vi, get_int_b4(b8->qs, iqs % QI8_1), 0) * sc);
+    }
+    return (float) bq3_K->d * sumf;
+}
 inline float vec_dot_q8_0_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs) {
     const block_q8_0* bq8_0 = (const block_q8_0*) vbq + kbx;
     int sumi = 0;
@@ -572,6 +617,8 @@ template<> struct Split<6> : WholeDot<vec_dot_q5_0_q8_1> {};    // Q5_0
 template<> struct Split<2> : WholeDot<vec_dot_q4_0_q8_1> {};    // Q4_0
 template<> struct Split<3> : WholeDot<vec_dot_q4_1_q8_1> {};    // Q4_1
 template<> struct Split<14> : WholeDot<vec_dot_q6_K_q8_1> {};   // Q6_K
+template<> struct Split<10> : WholeDot<vec_dot_q2_K_q8_1> {};   // Q2_K
+template<> struct Split<11> : WholeDot<vec_dot_q3_K_q8_1> {};   // Q3_K
 
 // ---------------------------------------------------------------- the formats
 // bsz = bytes per block, qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
@@ -600,6 +647,8 @@ template<> struct Fmt<6> : FmtOf<6, (int) sizeof(block_q5_0), 32, QI5_0 / VDR_Q5
 template<> struct Fmt<2> : FmtOf<2, (int) sizeof(block_q4_0), 32, QI4_0 / VDR_Q4_0, VDR_Q4_0> {};
 template<> struct Fmt<3> : FmtOf<3, (int) sizeof(block_q4_1), 32, QI4_1 / VDR_Q4_1, VDR_Q4_1> {};
 template<> struct Fmt<14> : FmtOf<14, (int) sizeof(block_q6_K), 256, QI6_K / VDR_Q6_K, VDR_Q6_K> {};
+template<> struct Fmt<10> : FmtOf<10, (int) sizeof(block_q2_K), 256, QI2_K / VDR_Q2_K, VDR_Q2_K> {};
+template<> struct Fmt<11> : FmtOf<11, (int) sizeof(block_q3_K), 256, QI3_K / VDR_Q3_K, VDR_Q3_K> {};
 
 // A grid format's codebook, for a work-group's copy in local memory (the Volta experts below): its word, its length
 // and the global table.  N = 0: no codebook (IQ4_XS's 16 values stay where they are).
@@ -1545,6 +1594,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 22: return (size_t) (n / 256) * sizeof(block_iq2_s);
         case 29: return (size_t) (n / 256) * sizeof(block_iq1_m);
         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
+        case 10: return (size_t) (n / 256) * sizeof(block_q2_K);
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
@@ -1555,7 +1605,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 2: return (size_t) (n / 32) * sizeof(block_q4_0);
         case 3: return (size_t) (n / 32) * sizeof(block_q4_1);
         case 14: return (size_t) (n / 256) * sizeof(block_q6_K);
-        case 30: return (size_t) n * 2;   // BF16: the token embedding only (iq_embed_rows, iq_dequant_f32)
+        case 30: return (size_t) n * 2;   // BF16: the token embedding (iq_embed_rows, iq_dequant_f32), BF16 experts
         default: return 0;
     }
 }
@@ -1672,9 +1722,10 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
         return gu_type == 30 && d_type == 30 && n_embd > 0 && n_ff > 0 && n_embd % 32 == 0 && n_ff % 32 == 0;
     const bool gu = in_iq_gemm(gu_type) ? gu_type != 20
                                         : gu_type == 12 || gu_type == 13 || gu_type == 14 || gu_type == 8 ||
-                                          gu_type == 6 || gu_type == 2 || gu_type == 3;
+                                          gu_type == 6 || gu_type == 2 || gu_type == 3 || gu_type == 10 || gu_type == 11;
     const bool d = d_type == 20 || d_type == 23 || d_type == 42 || d_type == 6 || d_type == 7 || d_type == 8 ||
-                   d_type == 2 || d_type == 3 || d_type == 14;
+                   d_type == 2 || d_type == 3 || d_type == 14 || d_type == 10 || d_type == 11 || d_type == 12 ||
+                   d_type == 13;
     const auto qk = [](int t) { return t == 20 || t == 6 || t == 7 || t == 8 || t == 2 || t == 3 ? 32 : t == 42 ? 64 : 256; };
     return gu && d && n_embd > 0 && n_ff > 0 && n_embd % qk(gu_type) == 0 && n_ff % qk(d_type) == 0 &&
            n_embd % 256 == 0;   // the dequantizers write whole 256-value pieces of a gate/up row
@@ -1757,6 +1808,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 2: launch_native_gu<2, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 3: launch_native_gu<3, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 14: launch_native_gu<14, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 10: launch_native_gu<10, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 11: launch_native_gu<11, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         default: throw core::DeviceError("native_expert_grouped: gate/up type " + std::to_string(L.gu_type));
     }
     const long long nh = (long long) cap_entries * L.n_ff;
@@ -1806,6 +1859,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 2: e = launch_native_down<2, down_lpr<2>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 3: e = launch_native_down<3, down_lpr<3>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 14: e = launch_native_down<14, down_lpr<14>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 10: e = launch_native_down<10, down_lpr<10>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 11: e = launch_native_down<11, down_lpr<11>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 12: e = launch_native_down<12, down_lpr<12>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 13: e = launch_native_down<13, down_lpr<13>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         default: throw core::DeviceError("native_expert_grouped: down type " + std::to_string(L.d_type));
     }
     sync_if_needed(stream, e, "native_expert_grouped");
