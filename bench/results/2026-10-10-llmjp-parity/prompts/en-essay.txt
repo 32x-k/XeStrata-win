@@ -1,0 +1,7 @@
+<|start|>system<|message|>You are LLM-jp-4, a large language model trained by LLM-jp.
+Knowledge cutoff: 2025-12
+Current date: 2026-10-04
+
+Reasoning: medium
+
+# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>Write a short essay (about 300 words) on whether cities should ban cars from their historic centres. Give arguments on both sides and end with your own view.<|end|><|start|>assistant

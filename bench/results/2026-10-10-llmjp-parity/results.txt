@@ -1,0 +1,210 @@
+### ja-explain
+prompt: 1,10,1116,12,989,660,22241,900,623,3198,623,640,608,616,1024,1728,1378,6074,652,22241,900,623,3198,611,0,136785,46658,632,609,619,617,619,638,623,615,619,0,28264,2813,632,609,619,617,619,649,623,615,617,623,617,640,0,75470,847,632,5822,0,1905,609,59641,9858,632,2202,608,32098,608,2520,611,16875,817,648,3251,631,862,3243,611,11,10,4358,12,609,39787,20259,708,19533,20259,1754,76657,154431,3487,735,620,60020,3487,125995,620,21153,745,107958,7140,6943,621,11,10,12811
+llama.cpp CPU: 9,2202,12,651,4358,11522,618,5310,632,641,106485,614,1023,1444,1757,610,2056,855,2263,625,3347,15997,698,5327,6761,744,5133,15997,608,613,832,676
+XeStrata:      9,2202,12,651,4358,11522,618,5310,632,641,106485,614,1023,1444,1757,610,2056,855,2263,625,3347,15997,698,5327,6761,744,5133,15997,608,613,832,676
+
+32 of 32 leading tokens agree (vocabulary 196608)
+  position  0: token      9 /      9  max |dlogit| / max |logit| 3.37e-02  KL 3.24e-07  top-2 margin 14.385
+  position  1: token   2202 /   2202  max |dlogit| / max |logit| 3.93e-02  KL 6.69e-09  top-2 margin 16.221
+  position  2: token     12 /     12  max |dlogit| / max |logit| 2.11e-02  KL 1.08e-09  top-2 margin 17.758
+  position  3: token    651 /    651  max |dlogit| / max |logit| 1.87e-02  KL 9.97e-06  top-2 margin 6.746
+  position  4: token   4358 /   4358  max |dlogit| / max |logit| 1.67e-02  KL 2.03e-07  top-2 margin 11.478
+  position  5: token  11522 /  11522  max |dlogit| / max |logit| 1.35e-02  KL 1.01e-08  top-2 margin 13.329
+  position  6: token    618 /    618  max |dlogit| / max |logit| 3.23e-02  KL 7.97e-04  top-2 margin 2.169
+  position  7: token   5310 /   5310  max |dlogit| / max |logit| 3.07e-02  KL 4.02e-08  top-2 margin 14.962
+  position  8: token    632 /    632  max |dlogit| / max |logit| 2.05e-02  KL 1.02e-09  top-2 margin 17.252
+  position  9: token    641 /    641  max |dlogit| / max |logit| 2.31e-02  KL 6.03e-06  top-2 margin 9.376
+  position 10: token 106485 / 106485  max |dlogit| / max |logit| 2.33e-02  KL 1.53e-06  top-2 margin 10.282
+  position 11: token    614 /    614  max |dlogit| / max |logit| 4.30e-02  KL 5.48e-04  top-2 margin 1.224
+  position 12: token   1023 /   1023  max |dlogit| / max |logit| 2.61e-02  KL 6.85e-04  top-2 margin 4.975
+  position 13: token   1444 /   1444  max |dlogit| / max |logit| 2.31e-02  KL 3.17e-06  top-2 margin 7.863
+  position 14: token   1757 /   1757  max |dlogit| / max |logit| 4.23e-02  KL 8.92e-06  top-2 margin 10.000
+  position 15: token    610 /    610  max |dlogit| / max |logit| 4.50e-02  KL 1.24e-03  top-2 margin 2.533
+  position 16: token   2056 /   2056  max |dlogit| / max |logit| 2.06e-02  KL 4.27e-04  top-2 margin 3.829
+  position 17: token    855 /    855  max |dlogit| / max |logit| 2.26e-02  KL 2.99e-07  top-2 margin 12.961
+  position 18: token   2263 /   2263  max |dlogit| / max |logit| 3.08e-02  KL 1.19e-05  top-2 margin 9.728
+  position 19: token    625 /    625  max |dlogit| / max |logit| 2.99e-02  KL 1.02e-05  top-2 margin 9.599
+  position 20: token   3347 /   3347  max |dlogit| / max |logit| 3.80e-02  KL 5.37e-03  top-2 margin 0.771
+  position 21: token  15997 /  15997  max |dlogit| / max |logit| 2.23e-02  KL 5.36e-09  top-2 margin 12.111
+  position 22: token    698 /    698  max |dlogit| / max |logit| 1.72e-02  KL 5.23e-07  top-2 margin 8.656
+  position 23: token   5327 /   5327  max |dlogit| / max |logit| 1.73e-02  KL 3.53e-09  top-2 margin 16.513
+  position 24: token   6761 /   6761  max |dlogit| / max |logit| 2.11e-02  KL 5.23e-06  top-2 margin 9.150
+  position 25: token    744 /    744  max |dlogit| / max |logit| 2.06e-02  KL 3.50e-07  top-2 margin 11.869
+  position 26: token   5133 /   5133  max |dlogit| / max |logit| 1.87e-02  KL 1.19e-03  top-2 margin 3.168
+  position 27: token  15997 /  15997  max |dlogit| / max |logit| 2.23e-02  KL 2.96e-05  top-2 margin 8.253
+  position 28: token    608 /    608  max |dlogit| / max |logit| 3.00e-02  KL 1.03e-03  top-2 margin 0.883
+  position 29: token    613 /    613  max |dlogit| / max |logit| 7.22e-02  KL 1.66e-04  top-2 margin 6.850
+  position 30: token    832 /    832  max |dlogit| / max |logit| 2.27e-02  KL 1.80e-04  top-2 margin 5.529
+  position 31: token    676 /    676  max |dlogit| / max |logit| 3.14e-02  KL 9.45e-03  top-2 margin 1.420
+worst relative logit difference 7.22e-02, worst KL 9.45e-03
+
+run: strata plain: 32 MoE layers x 128 experts, 2976 VRAM slots (93 a layer, 13.62 GiB), 7 CPU workers, 14888 MiB free before the tier | load 10.7 s, prompt 105 tokens 2.81 s (37.4 tok/s), 31 generated 1.36 s (22.85 tok/s); VRAM tier 1056 of 2976 slots filled, 9.1% of routed experts hit, 1056 swaps
+
+### en-essay
+prompt: 1,10,1116,12,989,660,22241,900,623,3198,623,640,608,616,1024,1728,1378,6074,652,22241,900,623,3198,611,0,136785,46658,632,609,619,617,619,638,623,615,619,0,28264,2813,632,609,619,617,619,649,623,615,617,623,617,640,0,75470,847,632,5822,0,1905,609,59641,9858,632,2202,608,32098,608,2520,611,16875,817,648,3251,631,862,3243,611,11,10,4358,12,12472,616,1306,6608,654,10423,609,627,617,617,1128,634,650,1313,3704,787,20142,8306,661,682,11055,20791,611,9771,5815,650,939,2698,613,1036,637,737,849,1496,611,11,10,12811
+llama.cpp CPU: 9,2202,12,651,4358,11522,632,641,19893,616,1306,6608,654,10423,609,627,617,617,1128,634,650,1313,3704,787,20142,8306,661,682,11055,20791,611,9771
+XeStrata:      9,2202,12,651,4358,11522,632,641,19893,616,1306,6608,654,10423,609,627,617,617,1128,634,650,1313,3704,787,20142,8306,661,682,11055,20791,611,9771
+
+32 of 32 leading tokens agree (vocabulary 196608)
+  position  0: token      9 /      9  max |dlogit| / max |logit| 3.11e-02  KL 3.57e-07  top-2 margin 14.358
+  position  1: token   2202 /   2202  max |dlogit| / max |logit| 3.79e-02  KL 6.76e-10  top-2 margin 18.035
+  position  2: token     12 /     12  max |dlogit| / max |logit| 1.63e-02  KL 2.32e-09  top-2 margin 16.555
+  position  3: token    651 /    651  max |dlogit| / max |logit| 2.00e-02  KL 4.35e-05  top-2 margin 5.580
+  position  4: token   4358 /   4358  max |dlogit| / max |logit| 2.08e-02  KL 2.78e-07  top-2 margin 10.643
+  position  5: token  11522 /  11522  max |dlogit| / max |logit| 1.73e-02  KL 6.94e-07  top-2 margin 10.754
+  position  6: token    632 /    632  max |dlogit| / max |logit| 3.93e-02  KL 4.77e-05  top-2 margin 5.614
+  position  7: token    641 /    641  max |dlogit| / max |logit| 5.54e-02  KL 1.17e-06  top-2 margin 12.590
+  position  8: token  19893 /  19893  max |dlogit| / max |logit| 4.91e-02  KL 7.14e-07  top-2 margin 14.420
+  position  9: token    616 /    616  max |dlogit| / max |logit| 3.57e-02  KL 1.68e-11  top-2 margin 24.651
+  position 10: token   1306 /   1306  max |dlogit| / max |logit| 3.37e-02  KL 2.68e-08  top-2 margin 15.144
+  position 11: token   6608 /   6608  max |dlogit| / max |logit| 5.46e-02  KL 1.33e-10  top-2 margin 22.104
+  position 12: token    654 /    654  max |dlogit| / max |logit| 2.71e-02  KL 1.93e-07  top-2 margin 14.594
+  position 13: token  10423 /  10423  max |dlogit| / max |logit| 3.51e-02  KL 4.44e-05  top-2 margin 3.778
+  position 14: token    609 /    609  max |dlogit| / max |logit| 3.65e-02  KL 1.45e-09  top-2 margin 17.879
+  position 15: token    627 /    627  max |dlogit| / max |logit| 2.58e-02  KL 1.85e-08  top-2 margin 13.963
+  position 16: token    617 /    617  max |dlogit| / max |logit| 1.01e-01  KL 5.90e-06  top-2 margin 12.021
+  position 17: token    617 /    617  max |dlogit| / max |logit| 2.29e-01  KL 9.81e-06  top-2 margin 12.568
+  position 18: token   1128 /   1128  max |dlogit| / max |logit| 3.44e-02  KL 2.49e-07  top-2 margin 13.924
+  position 19: token    634 /    634  max |dlogit| / max |logit| 2.41e-02  KL 4.92e-08  top-2 margin 14.315
+  position 20: token    650 /    650  max |dlogit| / max |logit| 2.77e-02  KL 6.97e-07  top-2 margin 12.289
+  position 21: token   1313 /   1313  max |dlogit| / max |logit| 5.81e-02  KL 2.40e-07  top-2 margin 14.987
+  position 22: token   3704 /   3704  max |dlogit| / max |logit| 4.92e-02  KL 3.88e-07  top-2 margin 13.107
+  position 23: token    787 /    787  max |dlogit| / max |logit| 4.00e-02  KL 2.89e-06  top-2 margin 10.676
+  position 24: token  20142 /  20142  max |dlogit| / max |logit| 3.57e-02  KL 4.24e-06  top-2 margin 10.555
+  position 25: token   8306 /   8306  max |dlogit| / max |logit| 5.29e-02  KL 2.00e-05  top-2 margin 8.812
+  position 26: token    661 /    661  max |dlogit| / max |logit| 3.70e-02  KL 6.64e-04  top-2 margin 5.123
+  position 27: token    682 /    682  max |dlogit| / max |logit| 2.29e-02  KL 7.62e-05  top-2 margin 6.964
+  position 28: token  11055 /  11055  max |dlogit| / max |logit| 4.53e-02  KL 9.54e-06  top-2 margin 10.386
+  position 29: token  20791 /  20791  max |dlogit| / max |logit| 3.56e-02  KL 5.47e-05  top-2 margin 3.822
+  position 30: token    611 /    611  max |dlogit| / max |logit| 2.71e-02  KL 5.53e-09  top-2 margin 15.841
+  position 31: token   9771 /   9771  max |dlogit| / max |logit| 5.93e-02  KL 4.28e-07  top-2 margin 9.653
+worst relative logit difference 2.29e-01, worst KL 6.64e-04
+
+run: strata plain: 32 MoE layers x 128 experts, 2976 VRAM slots (93 a layer, 13.62 GiB), 7 CPU workers, 14888 MiB free before the tier | load 6.7 s, prompt 118 tokens 3.15 s (37.5 tok/s), 31 generated 1.41 s (21.99 tok/s); VRAM tier 1056 of 2976 slots filled, 8.8% of routed experts hit, 1056 swaps
+
+### math
+prompt: 1,10,1116,12,989,660,22241,900,623,3198,623,640,608,616,1024,1728,1378,6074,652,22241,900,623,3198,611,0,136785,46658,632,609,619,617,619,638,623,615,619,0,28264,2813,632,609,619,617,619,649,623,615,617,623,617,640,0,75470,847,632,5822,0,1905,609,59641,9858,632,2202,608,32098,608,2520,611,16875,817,648,3251,631,862,3243,611,11,10,4358,12,609,615,609,871,609,615,617,617,609,1603,145350,10701,620,627,4825,609,638,4825,27709,75689,10602,804,38507,4980,621,19198,40218,823,10337,6943,621,11,10,12811
+llama.cpp CPU: 9,2202,12,651,4358,11522,618,5310,632,641,30007,610,2623,612,12057,661,609,615,614,609,615,617,617,625,660,656,35180,652,1240,609,627,666
+XeStrata:      9,2202,12,651,4358,11522,618,5310,632,641,30007,610,2623,612,12057,661,609,615,614,609,615,617,617,625,660,656,35180,652,1240,609,627,666
+
+32 of 32 leading tokens agree (vocabulary 196608)
+  position  0: token      9 /      9  max |dlogit| / max |logit| 4.43e-02  KL 1.39e-06  top-2 margin 12.833
+  position  1: token   2202 /   2202  max |dlogit| / max |logit| 4.48e-02  KL 1.07e-08  top-2 margin 14.985
+  position  2: token     12 /     12  max |dlogit| / max |logit| 2.04e-02  KL 1.76e-09  top-2 margin 17.180
+  position  3: token    651 /    651  max |dlogit| / max |logit| 2.97e-02  KL 5.83e-04  top-2 margin 3.577
+  position  4: token   4358 /   4358  max |dlogit| / max |logit| 1.82e-02  KL 5.95e-05  top-2 margin 8.090
+  position  5: token  11522 /  11522  max |dlogit| / max |logit| 2.90e-02  KL 4.23e-09  top-2 margin 16.386
+  position  6: token    618 /    618  max |dlogit| / max |logit| 3.20e-02  KL 1.60e-05  top-2 margin 9.396
+  position  7: token   5310 /   5310  max |dlogit| / max |logit| 4.21e-02  KL 3.06e-09  top-2 margin 18.763
+  position  8: token    632 /    632  max |dlogit| / max |logit| 2.66e-02  KL 1.27e-11  top-2 margin 20.085
+  position  9: token    641 /    641  max |dlogit| / max |logit| 3.63e-02  KL 1.66e-07  top-2 margin 15.358
+  position 10: token  30007 /  30007  max |dlogit| / max |logit| 4.70e-02  KL 9.80e-03  top-2 margin 0.695
+  position 11: token    610 /    610  max |dlogit| / max |logit| 2.01e-02  KL 5.17e-06  top-2 margin 9.603
+  position 12: token   2623 /   2623  max |dlogit| / max |logit| 2.62e-02  KL 2.00e-11  top-2 margin 21.987
+  position 13: token    612 /    612  max |dlogit| / max |logit| 2.48e-02  KL 2.40e-11  top-2 margin 20.849
+  position 14: token  12057 /  12057  max |dlogit| / max |logit| 1.95e-02  KL 5.86e-06  top-2 margin 8.035
+  position 15: token    661 /    661  max |dlogit| / max |logit| 3.57e-02  KL 4.72e-08  top-2 margin 11.645
+  position 16: token    609 /    609  max |dlogit| / max |logit| 4.74e-02  KL 3.11e-11  top-2 margin 23.597
+  position 17: token    615 /    615  max |dlogit| / max |logit| 4.18e-02  KL 1.40e-06  top-2 margin 13.544
+  position 18: token    614 /    614  max |dlogit| / max |logit| 4.33e-02  KL 9.44e-11  top-2 margin 20.350
+  position 19: token    609 /    609  max |dlogit| / max |logit| 5.91e-02  KL 1.10e-07  top-2 margin 15.779
+  position 20: token    615 /    615  max |dlogit| / max |logit| 4.79e-02  KL 7.30e-08  top-2 margin 15.718
+  position 21: token    617 /    617  max |dlogit| / max |logit| 8.34e-02  KL 1.14e-07  top-2 margin 15.037
+  position 22: token    617 /    617  max |dlogit| / max |logit| 4.99e-01  KL 6.31e-05  top-2 margin 11.878
+  position 23: token    625 /    625  max |dlogit| / max |logit| 3.14e-02  KL 1.22e-03  top-2 margin 5.442
+  position 24: token    660 /    660  max |dlogit| / max |logit| 3.45e-02  KL 5.45e-07  top-2 margin 11.045
+  position 25: token    656 /    656  max |dlogit| / max |logit| 2.28e-02  KL 4.98e-04  top-2 margin 6.405
+  position 26: token  35180 /  35180  max |dlogit| / max |logit| 2.43e-02  KL 1.10e-09  top-2 margin 17.513
+  position 27: token    652 /    652  max |dlogit| / max |logit| 2.52e-02  KL 6.49e-08  top-2 margin 12.897
+  position 28: token   1240 /   1240  max |dlogit| / max |logit| 2.61e-02  KL 8.26e-04  top-2 margin 3.375
+  position 29: token    609 /    609  max |dlogit| / max |logit| 4.23e-02  KL 4.79e-07  top-2 margin 13.070
+  position 30: token    627 /    627  max |dlogit| / max |logit| 1.66e-01  KL 8.50e-06  top-2 margin 10.977
+  position 31: token    666 /    666  max |dlogit| / max |logit| 2.44e-02  KL 4.75e-05  top-2 margin 7.054
+worst relative logit difference 4.99e-01, worst KL 9.80e-03
+
+run: strata plain: 32 MoE layers x 128 experts, 2976 VRAM slots (93 a layer, 13.62 GiB), 7 CPU workers, 14888 MiB free before the tier | load 6.0 s, prompt 114 tokens 3.02 s (37.7 tok/s), 31 generated 1.37 s (22.64 tok/s); VRAM tier 1056 of 2976 slots filled, 8.7% of routed experts hit, 1056 swaps
+
+### code-python
+prompt: 1,10,1116,12,989,660,22241,900,623,3198,623,640,608,616,1024,1728,1378,6074,652,22241,900,623,3198,611,0,136785,46658,632,609,619,617,619,638,623,615,619,0,28264,2813,632,609,619,617,619,649,623,615,617,623,617,640,0,75470,847,632,5822,0,1905,609,59641,9858,632,2202,608,32098,608,2520,611,16875,817,648,3251,631,862,3243,611,11,10,4358,12,16144,609,733,620,45861,103818,88571,784,29030,39771,783,739,34906,16341,733,11941,620,5816,2485,8814,624,1626,2814,609,11026,2485,54654,2814,609,53260,735,30053,739,40126,1073,28724,37078,4980,621,1697,39749,735,9721,823,36643,4980,621,11,10,12811
+llama.cpp CPU: 9,2202,12,651,4358,11522,618,5310,632,641,19893,616,16144,1255,625,11650,616,3703,103818,2682,654,34650,612,39771,634,637,3585,2358,608,83971,1525,4128
+XeStrata:      9,2202,12,651,4358,11522,618,5310,632,641,19893,616,16144,1255,625,11650,616,3703,103818,2682,654,34650,612,39771,634,637,3585,2358,608,83971,1525,4128
+
+32 of 32 leading tokens agree (vocabulary 196608)
+  position  0: token      9 /      9  max |dlogit| / max |logit| 4.09e-02  KL 9.08e-07  top-2 margin 13.558
+  position  1: token   2202 /   2202  max |dlogit| / max |logit| 4.23e-02  KL 7.92e-09  top-2 margin 16.178
+  position  2: token     12 /     12  max |dlogit| / max |logit| 1.86e-02  KL 4.93e-09  top-2 margin 16.450
+  position  3: token    651 /    651  max |dlogit| / max |logit| 3.02e-02  KL 8.54e-06  top-2 margin 7.437
+  position  4: token   4358 /   4358  max |dlogit| / max |logit| 2.01e-02  KL 1.22e-05  top-2 margin 8.781
+  position  5: token  11522 /  11522  max |dlogit| / max |logit| 3.37e-02  KL 4.04e-06  top-2 margin 10.332
+  position  6: token    618 /    618  max |dlogit| / max |logit| 5.37e-02  KL 5.59e-04  top-2 margin 2.086
+  position  7: token   5310 /   5310  max |dlogit| / max |logit| 3.87e-02  KL 2.69e-07  top-2 margin 13.230
+  position  8: token    632 /    632  max |dlogit| / max |logit| 4.26e-02  KL 1.73e-09  top-2 margin 17.841
+  position  9: token    641 /    641  max |dlogit| / max |logit| 3.02e-02  KL 2.21e-05  top-2 margin 6.550
+  position 10: token  19893 /  19893  max |dlogit| / max |logit| 2.41e-02  KL 7.49e-05  top-2 margin 6.882
+  position 11: token    616 /    616  max |dlogit| / max |logit| 4.03e-02  KL 1.27e-04  top-2 margin 5.509
+  position 12: token  16144 /  16144  max |dlogit| / max |logit| 4.22e-02  KL 3.85e-04  top-2 margin 4.558
+  position 13: token   1255 /   1255  max |dlogit| / max |logit| 2.72e-02  KL 4.22e-09  top-2 margin 15.520
+  position 14: token    625 /    625  max |dlogit| / max |logit| 3.52e-02  KL 2.63e-06  top-2 margin 3.300
+  position 15: token  11650 /  11650  max |dlogit| / max |logit| 2.41e-02  KL 4.79e-05  top-2 margin 7.428
+  position 16: token    616 /    616  max |dlogit| / max |logit| 2.22e-02  KL 1.56e-04  top-2 margin 3.304
+  position 17: token   3703 /   3703  max |dlogit| / max |logit| 1.86e-02  KL 6.63e-05  top-2 margin 4.369
+  position 18: token 103818 / 103818  max |dlogit| / max |logit| 1.86e-02  KL 1.92e-08  top-2 margin 14.348
+  position 19: token   2682 /   2682  max |dlogit| / max |logit| 3.18e-02  KL 6.37e-04  top-2 margin 3.624
+  position 20: token    654 /    654  max |dlogit| / max |logit| 4.63e-02  KL 7.08e-08  top-2 margin 14.019
+  position 21: token  34650 /  34650  max |dlogit| / max |logit| 1.64e-02  KL 3.80e-04  top-2 margin 4.007
+  position 22: token    612 /    612  max |dlogit| / max |logit| 2.76e-02  KL 3.54e-06  top-2 margin 11.228
+  position 23: token  39771 /  39771  max |dlogit| / max |logit| 2.57e-02  KL 8.65e-04  top-2 margin 5.251
+  position 24: token    634 /    634  max |dlogit| / max |logit| 2.91e-02  KL 4.14e-05  top-2 margin 7.017
+  position 25: token    637 /    637  max |dlogit| / max |logit| 5.93e-02  KL 1.99e-03  top-2 margin 3.356
+  position 26: token   3585 /   3585  max |dlogit| / max |logit| 4.11e-02  KL 5.85e-02  top-2 margin 0.464
+  position 27: token   2358 /   2358  max |dlogit| / max |logit| 2.74e-02  KL 1.45e-07  top-2 margin 11.623
+  position 28: token    608 /    608  max |dlogit| / max |logit| 3.36e-02  KL 1.38e-04  top-2 margin 4.974
+  position 29: token  83971 /  83971  max |dlogit| / max |logit| 2.54e-02  KL 1.46e-02  top-2 margin 0.425
+  position 30: token   1525 /   1525  max |dlogit| / max |logit| 2.91e-02  KL 8.13e-05  top-2 margin 3.268
+  position 31: token   4128 /   4128  max |dlogit| / max |logit| 3.95e-02  KL 1.59e-02  top-2 margin 1.270
+worst relative logit difference 5.93e-02, worst KL 5.85e-02
+
+run: strata plain: 32 MoE layers x 128 experts, 2976 VRAM slots (93 a layer, 13.62 GiB), 7 CPU workers, 14888 MiB free before the tier | load 5.9 s, prompt 130 tokens 3.44 s (37.8 tok/s), 31 generated 1.35 s (23.02 tok/s); VRAM tier 1152 of 2976 slots filled, 9.5% of routed experts hit, 1152 swaps
+
+### ja-summary
+prompt: 1,10,1116,12,989,660,22241,900,623,3198,623,640,608,616,1024,1728,1378,6074,652,22241,900,623,3198,611,0,136785,46658,632,609,619,617,619,638,623,615,619,0,28264,2813,632,609,619,617,619,649,623,615,617,623,617,640,0,75470,847,632,5822,0,1905,609,59641,9858,632,2202,608,32098,608,2520,611,16875,817,648,3251,631,862,3243,611,11,10,4358,12,29135,125200,609,627,609,1948,733,43134,977,620,47584,93776,4669,80573,739,609,615,64012,156593,4980,621,0,59706,61304,691,620,44783,18580,735,68660,677,6653,1243,41033,3487,55701,144706,621,21040,89888,29358,114115,3948,90560,620,9817,3317,691,150373,2253,36650,103341,1425,621,26066,620,71630,821,102460,50361,6300,41161,1073,3073,101870,620,10371,8847,735,9986,153415,85028,4338,9102,621,99673,620,6300,739,87747,108779,16724,5797,33394,27550,620,6784,821,2283,9630,26456,1355,620,148046,74058,11833,159633,135480,174509,28957,621,76231,620,6300,677,3317,9156,739,73076,3310,821,42635,57936,1355,13668,1953,46638,20333,621,11,10,12811
+llama.cpp CPU: 9,2202,12,651,4358,11522,632,641,9453,125200,609,627,609,1948,733,43134,977,620,47584,93776,4669,80573,739,609,615,64012,156593,4980,1295,1085,674,1104
+XeStrata:      9,2202,12,651,4358,11522,632,641,9453,125200,609,627,609,1948,733,43134,977,620,47584,93776,4669,80573,739,609,615,64012,156593,4980,1295,1085,674,1104
+
+32 of 32 leading tokens agree (vocabulary 196608)
+  position  0: token      9 /      9  max |dlogit| / max |logit| 4.69e-02  KL 7.19e-07  top-2 margin 14.166
+  position  1: token   2202 /   2202  max |dlogit| / max |logit| 4.36e-02  KL 3.06e-09  top-2 margin 16.761
+  position  2: token     12 /     12  max |dlogit| / max |logit| 1.86e-02  KL 3.09e-09  top-2 margin 17.609
+  position  3: token    651 /    651  max |dlogit| / max |logit| 8.02e-02  KL 8.42e-06  top-2 margin 6.703
+  position  4: token   4358 /   4358  max |dlogit| / max |logit| 2.55e-02  KL 1.98e-06  top-2 margin 9.032
+  position  5: token  11522 /  11522  max |dlogit| / max |logit| 1.64e-02  KL 4.07e-08  top-2 margin 14.971
+  position  6: token    632 /    632  max |dlogit| / max |logit| 2.28e-02  KL 8.73e-03  top-2 margin 0.876
+  position  7: token    641 /    641  max |dlogit| / max |logit| 3.01e-02  KL 1.95e-06  top-2 margin 7.279
+  position  8: token   9453 /   9453  max |dlogit| / max |logit| 6.36e-02  KL 4.94e-06  top-2 margin 10.721
+  position  9: token 125200 / 125200  max |dlogit| / max |logit| 5.49e-02  KL 1.72e-05  top-2 margin 8.862
+  position 10: token    609 /    609  max |dlogit| / max |logit| 6.82e-02  KL 2.57e-07  top-2 margin 8.938
+  position 11: token    627 /    627  max |dlogit| / max |logit| 1.33e-01  KL 8.65e-05  top-2 margin 11.281
+  position 12: token    609 /    609  max |dlogit| / max |logit| 4.52e-02  KL 1.18e-06  top-2 margin 11.182
+  position 13: token   1948 /   1948  max |dlogit| / max |logit| 8.02e-02  KL 4.45e-06  top-2 margin 11.429
+  position 14: token    733 /    733  max |dlogit| / max |logit| 3.99e-02  KL 4.87e-08  top-2 margin 16.084
+  position 15: token  43134 /  43134  max |dlogit| / max |logit| 5.87e-02  KL 5.03e-06  top-2 margin 10.507
+  position 16: token    977 /    977  max |dlogit| / max |logit| 4.75e-02  KL 1.22e-08  top-2 margin 17.930
+  position 17: token    620 /    620  max |dlogit| / max |logit| 7.42e-02  KL 1.59e-07  top-2 margin 14.091
+  position 18: token  47584 /  47584  max |dlogit| / max |logit| 5.35e-02  KL 1.07e-05  top-2 margin 10.286
+  position 19: token  93776 /  93776  max |dlogit| / max |logit| 1.73e-01  KL 3.13e-07  top-2 margin 15.090
+  position 20: token   4669 /   4669  max |dlogit| / max |logit| 5.55e-02  KL 1.37e-05  top-2 margin 9.735
+  position 21: token  80573 /  80573  max |dlogit| / max |logit| 5.44e-02  KL 2.14e-06  top-2 margin 11.305
+  position 22: token    739 /    739  max |dlogit| / max |logit| 1.36e-01  KL 3.47e-06  top-2 margin 10.186
+  position 23: token    609 /    609  max |dlogit| / max |logit| 5.72e-02  KL 8.14e-06  top-2 margin 11.264
+  position 24: token    615 /    615  max |dlogit| / max |logit| 2.21e-01  KL 5.51e-06  top-2 margin 10.930
+  position 25: token  64012 /  64012  max |dlogit| / max |logit| 3.41e-02  KL 2.17e-05  top-2 margin 6.846
+  position 26: token 156593 / 156593  max |dlogit| / max |logit| 3.24e-02  KL 4.78e-07  top-2 margin 11.734
+  position 27: token   4980 /   4980  max |dlogit| / max |logit| 4.92e-02  KL 1.28e-07  top-2 margin 16.068
+  position 28: token   1295 /   1295  max |dlogit| / max |logit| 5.30e-02  KL 1.01e-06  top-2 margin 13.801
+  position 29: token   1085 /   1085  max |dlogit| / max |logit| 4.28e-02  KL 1.88e-03  top-2 margin 3.772
+  position 30: token    674 /    674  max |dlogit| / max |logit| 3.99e-02  KL 2.14e-02  top-2 margin 1.136
+  position 31: token   1104 /   1104  max |dlogit| / max |logit| 2.85e-02  KL 1.65e-06  top-2 margin 11.246
+worst relative logit difference 2.21e-01, worst KL 2.14e-02
+
+run: strata plain: 32 MoE layers x 128 experts, 2976 VRAM slots (93 a layer, 13.62 GiB), 7 CPU workers, 14888 MiB free before the tier | load 6.0 s, prompt 202 tokens 5.29 s (38.2 tok/s), 31 generated 1.46 s (21.31 tok/s); VRAM tier 1344 of 2976 slots filled, 11.5% of routed experts hit, 1344 swaps
+

@@ -1,0 +1,7 @@
+<|start|>system<|message|>You are LLM-jp-4, a large language model trained by LLM-jp.
+Knowledge cutoff: 2025-12
+Current date: 2026-10-04
+
+Reasoning: medium
+
+# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>Python で、巨大な CSV ファイル（数十 GB）を一定のメモリで読み、列 `user_id` ごとに `amount` の合計と件数を集計する関数を書いてください。型ヒントとテストも付けてください。<|end|><|start|>assistant
