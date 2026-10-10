@@ -39,6 +39,8 @@
 #include "iq_bits.hpp"
 #include "q8_1_finite.hpp"
 #include "sm70_table.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_iq_kernels
+#include "strata/kernels/device_arch_tag.hpp"
 
 #define GGML_COMMON_DECL_SYCL
 #define GGML_COMMON_IMPL_SYCL

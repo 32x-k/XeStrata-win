@@ -8,6 +8,8 @@
 // added in order, then the shared output.
 #include "strata/kernels/native_moe.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_native_moe
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <atomic>
 #include <cstddef>

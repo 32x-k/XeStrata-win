@@ -10,6 +10,8 @@
 #include "strata/kernels/native_router.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_router
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <atomic>
 #include <cfloat>

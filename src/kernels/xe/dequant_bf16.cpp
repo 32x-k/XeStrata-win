@@ -9,6 +9,8 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_dequant_bf16
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <cstdint>
 #include <cstring>

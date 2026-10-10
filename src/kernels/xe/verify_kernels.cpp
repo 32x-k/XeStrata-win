@@ -14,6 +14,8 @@
 #include "device_caps.hpp"
 #include "q8_1_finite.hpp"
 #include "strata/core/per_device.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_verify_kernels
+#include "strata/kernels/device_arch_tag.hpp"
 
 // sycl_ext_oneapi_clock is newer than some DPC++ releases (intel/llvm 6.2 lacks it): without it there is no stamp
 #if __has_include(<sycl/ext/oneapi/experimental/clock.hpp>)

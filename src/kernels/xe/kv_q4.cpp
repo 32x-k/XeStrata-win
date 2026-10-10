@@ -7,6 +7,8 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_kv_q4
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <string>
 

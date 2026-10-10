@@ -12,6 +12,8 @@
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_qsa_select
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <cstdlib>
 #include <string>

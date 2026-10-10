@@ -11,6 +11,8 @@
 #include "strata/core/runtime.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "device_caps.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_sampler
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <cstdlib>
 #include <cstring>

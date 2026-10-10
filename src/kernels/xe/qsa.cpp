@@ -8,6 +8,8 @@
 // separately rounded, which CUDA spelled with __dadd_rn/__dmul_rn.  A warp is a sub-group of 32.  The CUDA entry
 // points exited on a bad argument; these throw core::DeviceError.
 #include "strata/kernels/qsa.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_qsa
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_stream.hpp"

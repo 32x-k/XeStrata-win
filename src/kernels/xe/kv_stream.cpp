@@ -11,6 +11,8 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_kv_stream
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <algorithm>
 #include <string>

@@ -26,6 +26,8 @@
 #include "strata/core/per_device.hpp"
 #include "device_target.hpp"
 #include "mma_gemm.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_qsa_prompt_attn
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>

@@ -19,6 +19,8 @@
 #include "strata/kernels/matrix_report.hpp"
 #include "device_target.hpp"
 #include "strata/core/per_device.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_mma_gemm
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 

@@ -12,6 +12,8 @@
 #include "cuda_intrinsics.hpp"
 #include "device_target.hpp"
 #include "strata/core/per_device.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_dp4a_gemm
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <algorithm>
 #include <cstdlib>

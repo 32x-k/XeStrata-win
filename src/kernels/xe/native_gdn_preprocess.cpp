@@ -12,6 +12,8 @@
 // the fma with a zero addend keeps its signed-zero behaviour.
 #include "strata/kernels/native_gdn_preprocess.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_native_gdn_preprocess
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <cmath>
 #include <cstddef>
