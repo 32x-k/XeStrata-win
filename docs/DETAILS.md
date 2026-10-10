@@ -338,6 +338,9 @@ The app has three tabs:
   Chats stay in your browser.
 - **Monitor**: what the model is doing (prefill, with progress, or decode, at how many tokens/s);
   GPU load, VRAM, temperature, power and PCIe traffic; CPU, RAM and disk; the context in use; the last requests.
+  Its conversation cache card shows how many prefill tokens the cache gave back (in the last request and since the
+  start) and, with `--conversation-cache-mib`, the parked conversations and their memory, and how many were parked,
+  restored and evicted (upstream #596; the same is under `"conversation_cache"` in `/metrics`).
 - **About**: the model and engine settings, and the addresses to connect other apps.
 
 `http://127.0.0.1:8095/?q=your question` opens it with a new chat already asking.
