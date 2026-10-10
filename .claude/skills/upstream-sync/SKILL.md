@@ -34,7 +34,7 @@ grep -n STRATA_UPSTREAM_VERSION CMakeLists.txt
 git tag -l 'xe*' | sort -V | tail -n 1    # the previous XeStrata (step 8)
 ```
 
-The previous integration is the merge `upstream の Strata <version> を Xe に統合する` (or a merge that records an upstream tag as a parent); its upstream parent is the last upstream commit `dev` has (`git log --merges --first-parent --format='%h %p %s' dev`).
+The previous integration is the merge `upstream の Strata <version> を Xe に統合する`, or its last commit, which records the tag as its second parent (step 9); its upstream parent is the last upstream commit `dev` has (`git log --merges --first-parent --format='%h %p %s' dev`).
 upstream rewrote its history on 2026-10-06, so `git merge-base dev upstream/main` can be empty: the base is that parent (or, for history before it, its rewritten counterpart).
 When the tag is already integrated, go to step 7.
 
@@ -192,4 +192,14 @@ On `dev`:
 - `$o/README.md`: the machines, both engines' commits and builds, the method, the tables (`sync_collect.py`), the check's output (against the tag and the previous XeStrata), what the numbers say, and the GPUs skipped; `matrix.json` and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>`. The ideas with step 4's and 5's numbers (kept, opt-in and removed) go into the same record.
 - docs/XE.ja.md, then docs/XE.md: the upstream version and range brought in, what was not taken and why, the approximations on by default and their switches, linking the record.
 
-Lint and commit. Report: the tag; the ideas, each with what was kept and its numbers; the approximations and their checks; what was not taken, by group; the check's table against the tag and the previous XeStrata; the GPUs skipped (`unverified`); the paths ported for GPUs there is no machine for; and anything that needs the user.
+Lint, and commit the record as the run's last commit, with the tag as its second parent (as 1f39304b records v0.1.41), so `dev`'s history shows where the run ended:
+
+```sh
+git add <the record and the documents> && tree=$(git write-tree) && \
+  c=$(git commit-tree -p HEAD -p <tag> -m "upstream の Strata <version> の取り込みを記録する" <tree>) && \
+  git merge --ff-only "$c"
+```
+
+Its message says the range brought in (`<base>..<tag>` and the tag's commit) and that the commit records the tag as its second parent.
+
+Report: the tag; the ideas, each with what was kept and its numbers; the approximations and their checks; what was not taken, by group; the check's table against the tag and the previous XeStrata; the GPUs skipped (`unverified`); the paths ported for GPUs there is no machine for; and anything that needs the user.
