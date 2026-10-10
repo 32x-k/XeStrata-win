@@ -336,6 +336,10 @@ struct ExpertDispatch {
     const PcieSplitTimes* pcie_split = nullptr;
     bool pcie_overlap = false;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
+    /// STRATA_ROUTE_TAIL_SKIP=R: entries skipped (a missed expert every token of the window routes only at rank >= R)
+    /// and the distinct experts behind them (neither copied nor computed)
+    int64_t tail_skipped = 0;
+    int64_t tail_experts = 0;
     /// #588: routed (token, expert) entries the GPU computed from outside its cache in verify windows: read over PCIe
     /// (--pcie-frac, kind 1) or on another GPU (kind 2).  In neither cache_hits nor cache_refused.
     int64_t offload_entries = 0;
