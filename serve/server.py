@@ -2515,7 +2515,7 @@ class Service:
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
 
     def free_vram_mib(self) -> int | None:
-        """Free VRAM on the engine's GPU (the xe driver's card by PCI address, read through Level Zero's sysman);
+        """Free VRAM on the engine's GPU (an Intel card by PCI address, read through Level Zero's sysman);
         None when it can't be read (then nothing is refused)."""
         try:
             from serve.telemetry import free_vram_mib
