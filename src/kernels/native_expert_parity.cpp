@@ -310,8 +310,13 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
         par::copy_bytes_in(dn, &one, 4);
         par::copy_bytes_in(ddst, idx, (size_t) NT * 4);
         par::copy_bytes_in(dtok, idx, (size_t) NT * 4);
-        strata::kernels::quantize_q8_1_rows((const float*) dx, NT, H, dxq, s);
-        strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
+        if (f.gu_type == 30) {   // BF16 experts read the FP32 rows
+            strata::kernels::native_expert_grouped_bf16(L, dptr, dstart, dn, ddst, dtok, 1, NT, (const float*) dx, dscr,
+                                                        dout, s);
+        } else {
+            strata::kernels::quantize_q8_1_rows((const float*) dx, NT, H, dxq, s);
+            strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
+        }
         par::sync();
         par::copy_bytes_out(got_g.data(), dout, got_g.size() * 4);
     }
