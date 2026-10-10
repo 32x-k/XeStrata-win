@@ -20,6 +20,9 @@ It is free software, and on an Intel or AMD GPU it also builds and runs with fre
 
 ## About XeStrata
 
+Software written in CUDA runs only on NVIDIA's GPUs, which ties its users to one maker's hardware.
+XeStrata aims to run on Intel, AMD and NVIDIA GPUs alike, from one code base written in SYCL, an open standard.
+
 A port of [Strata](https://github.com/Niko1221/Strata) (for NVIDIA GPUs) to Intel GPUs.
 Its GPU code is rewritten from CUDA to SYCL and Level Zero, so that it runs on Intel's GPUs.
 The same code is compiled for AMD GPUs (the free and contrib-llvm builds) and NVIDIA GPUs (the contrib-llvm build) as well.

@@ -20,6 +20,9 @@ GPU は Intel Arc、AMD Radeon（RDNA2 以降）、NVIDIA のどれかを 1 枚�
 
 ## XeStrata とは
 
+CUDA で書いたソフトウェアは NVIDIA の GPU でしか動かず、使う人は 1 社の GPU に縛られます。
+XeStrata は、オープンな標準の SYCL で書いた 1 つのコードで、Intel・AMD・NVIDIA のどの GPU でも動くことを目指します。
+
 [Strata](https://github.com/Niko1221/Strata)（NVIDIA の GPU 向け）を、Intel の GPU に移したものです。
 GPU の計算を CUDA から SYCL と Level Zero に書き直し、Intel の GPU で動くようにしました。
 同じコードを、AMD の GPU 向け（free と contrib-llvm のビルド）と NVIDIA の GPU 向け（contrib-llvm のビルド）にもコンパイルします。
