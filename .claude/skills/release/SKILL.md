@@ -161,6 +161,19 @@ Lint and commit it on `dev` (it is not in the tag).
 
 Take the stage lines out of the notes, add the tables (Japanese and English sections) with the engines' versions, the GPUs and the model, and:
 
+The notes' table is one per GPU, from `bench-collect.py`'s medians (the record's README keeps `bench-collect.py`'s own tables): a row per tier, named by the model's weight type and the length (`IQ3_XXS 1K`), and for the prompt and then the output three columns: XeStrata's value, upstream's, and the difference (the value columns named with the engine and its version, `XeStrata xe0.1.40.2.1`, `upstream v0.1.41`), marked ✅ where XeStrata is faster and ❌ where it is slower: the prompt as a ratio (`✅ 2.1 倍`, `✅ ×2.1`), the output as a percentage (`✅ +14%`; slower: `❌ −3%`).
+Within ±1% (either way) the two count as equal: `≒ 同等（−0.1%）` / `≈ equal (−0.1%)`, for the prompt as well.
+A value upstream was stopped in is 計測不能（低速） / not measurable (too slow), its difference `✅`, with the line saying upstream was stopped at 10 tok/s or less; a value that does not fit stays `-`.
+Above each table: the GPU (and its memory), and which build of upstream it ran (`sycl/`, CUDA, HIP); above the first, the engines' versions, the model, the method (256 greedy tokens, the median of two alternating runs) and the unit (tokens/s).
+
+```markdown
+**AMD Radeon RX 9060 XT (16 GB)**: upstream v0.1.41 は HIP 版、トークン/秒
+
+| 形式・長さ | プロンプト XeStrata xe0.1.40.2.1 | プロンプト upstream v0.1.41 | 差 | 出力 XeStrata xe0.1.40.2.1 | 出力 upstream v0.1.41 | 差 |
+| --- | ---: | ---: | --- | ---: | ---: | --- |
+| IQ3_XXS 1K | 509 | 295 | ✅ 1.7 倍 | 48.8 | 46.8 | ✅ +4% |
+```
+
 ```sh
 gh release edit xe<VERSION> --repo MistVVK/XeStrata --notes-file build/release/xe<VERSION>/NOTES.md
 ```
