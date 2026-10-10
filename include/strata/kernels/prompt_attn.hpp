@@ -6,8 +6,9 @@
 // The decode kernel the prompt used before (qsa_dense_attn_batch) reads every cell's K and V again for each query:
 // at 16K tokens llm-jp-4.1's attention took 62 s of a 73 s prompt.  Here a work-group takes BQ queries of one KV head
 // (BQ x the heads that share it: GQA's rows), walks the cells up to its last query 16 at a time through local memory,
-// and keeps an online softmax per row, so a cell's K and V are read once per work-group.  FP32 throughout (K and V
-// enter from FP16); no matrix engines, so every GPU runs the same kernel.
+// and keeps an online softmax per row, so a cell's K and V are read once per work-group.  RDNA3 and RDNA4 take Q.K^T
+// and P.V on their FP16 matrix instructions (WMMA; Q and the probabilities rounded to FP16); every other GPU a kernel
+// in FP32 FMAs (K and V enter from FP16).  STRATA_PROMPT_ATTN_MMA=0 takes the FMA kernel everywhere.
 #pragma once
 
 #include "strata/kernels/qsa.hpp"
