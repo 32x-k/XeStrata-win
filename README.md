@@ -119,33 +119,23 @@ How to convert it is in [docs/ORCA.md](docs/ORCA.md).
 
 ## Install
 
-**1. Choose a package.** Install one of them (one is installed at a time).
+1. Pick the package for your GPU from the table below and download it from [GitHub's Releases](https://github.com/MistVVK/XeStrata/releases) (with `SHA256SUMS`).
+1. Check it: `sha256sum -c SHA256SUMS --ignore-missing`.
+1. Install it: `sudo apt install ./xestrata-contrib-cuda13.1_*.deb` (Ubuntu) or `sudo dnf install ./xestrata-contrib-cuda13.4-*.rpm` (Fedora).
+1. Run `xestrata --setup` in a terminal. If a GPU library or the render group is missing, it prints the command that installs it and stops; run that command, then `xestrata --setup` again.
+
+> [!NOTE]
+> Without an NVIDIA GPU, either CUDA version works the same.
 
 | GPU | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
-| **Recommended**: Intel (for speed), AMD (RDNA2 or later), NVIDIA (Turing or later), or any of them together | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
-| NVIDIA's Pascal and Volta (a P100, P40 or V100, for example), with Intel or AMD or not | `xestrata-contrib-cuda12.4` | none ([from the source](docs/BUILD.md#installing-from-the-source)) |
+| **Recommended**: Intel, AMD (RDNA2 or later), NVIDIA (Turing or later) | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
+| Intel, AMD (RDNA2 or later), NVIDIA Pascal and Volta (P100, P40, GTX 10 series, V100 and others) | `xestrata-contrib-cuda12.4` | none ([from the source](docs/BUILD.md#installing-from-the-source)) |
 
-- **Pascal and Volta GPUs (a P100, P40, GTX 10 series or V100) take `xestrata-contrib-cuda12.4`.**
-  The CUDA 13 packages have no code for them, and NVIDIA's drivers for them end with the 580 series (CUDA 12.4 works with it).
-- The package files are on [GitHub's Releases](https://github.com/MistVVK/XeStrata/releases).
-  The `SHA256SUMS` beside them checks a downloaded file (`sha256sum -c SHA256SUMS --ignore-missing`).
-  To make them yourself, follow [docs/BUILD.md](docs/BUILD.md#the-deb-and-rpm-packages).
-- **The package with free software only** (`xestrata-free`, Intel and AMD GPUs) is not on Releases.
-  Make it yourself the same way (`tools/package/build.sh ubuntu26.04 free`, for example).
+- One package is installed at a time. The CUDA 13 packages have no code for Pascal and Volta, and NVIDIA's drivers for them end with the 580 series (CUDA 12.4 works with it).
+- The package with free software only (`xestrata-free`, Intel and AMD GPUs) is not on Releases. Make it as [docs/BUILD.md](docs/BUILD.md#the-deb-and-rpm-packages) describes (`tools/package/build.sh ubuntu26.04 free`, for example).
 
-**2. Install it.** apt or dnf installs what it needs.
-
-```bash
-sudo apt install ./xestrata-contrib-cuda13.1_*.deb      # Ubuntu
-sudo dnf install ./xestrata-contrib-cuda13.4-*.rpm      # Fedora
-```
-
-The GPU's drivers and the like are installed separately: `xestrata --setup`, the next step, checks the missing packages and
-the render group, and stops with the command that installs them.
-Run that command, then `xestrata --setup` again.
-
-**3. Run `xestrata --setup` in a terminal and answer its questions.** Pressing Enter takes the recommended choice.
+In `xestrata --setup`'s questions, pressing Enter takes the recommended choice.
 
 - **The model and its size:** see [Choosing a model](#choosing-a-model).
 - **The context:** how much text it can keep in mind at once. It suggests one for your GPU.

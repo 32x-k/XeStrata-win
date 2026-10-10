@@ -115,32 +115,23 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
 
 ## インストール
 
-**1. パッケージを選びます。** どれか 1 つを入れます（一度に入るのは 1 つです）。
+1. GPU に合うパッケージを下の表から選んで、[GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) から取ってきます（`SHA256SUMS` も一緒に）。
+1. `sha256sum -c SHA256SUMS --ignore-missing` で確かめます。
+1. 入れます: `sudo apt install ./xestrata-contrib-cuda13.1_*.deb`（Ubuntu）か `sudo dnf install ./xestrata-contrib-cuda13.4-*.rpm`（Fedora）。
+1. 端末で `xestrata --setup` を実行します。足りない GPU のライブラリと render グループは、入れるコマンドを表示して止まるので、それを実行してからもう一度 `xestrata --setup` を実行します。
+
+> [!NOTE]
+> NVIDIA の GPU を使わない場合は、どちらの CUDA のバージョンを使っても変わりありません。
 
 | GPU | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
-| **おすすめ**: Intel（速さを重視する）、AMD（RDNA2 以降）、NVIDIA（Turing 以降）、そのいくつか | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
-| NVIDIA の Pascal と Volta（P100、P40、V100 など）、それと Intel や AMD | `xestrata-contrib-cuda12.4` | なし（[ソースから](docs/BUILD.ja.md#ソースから入れる)） |
+| **おすすめ**: Intel、AMD（RDNA2 以降）、NVIDIA（Turing 以降） | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
+| Intel、AMD（RDNA2 以降）、NVIDIA の Pascal と Volta（P100、P40、GTX 10 シリーズ、V100 など） | `xestrata-contrib-cuda12.4` | なし（[ソースから](docs/BUILD.ja.md#ソースから入れる)） |
 
-- **Pascal と Volta の GPU（P100、P40、GTX 10 シリーズ、V100 など）は `xestrata-contrib-cuda12.4` を使ってください。**
-  CUDA 13 の版にはこれらの GPU のコードがなく、これらを扱う NVIDIA のドライバーも 580 の系列までです（CUDA 12.4 に対応）。
-- パッケージのファイルは [GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) にあります。
-  一緒にある `SHA256SUMS` で、取ってきたファイルを確かめられます（`sha256sum -c SHA256SUMS --ignore-missing`）。
-  自分で作るときは、[docs/BUILD.ja.md](docs/BUILD.ja.md#deb-と-rpm-のパッケージ) の手順で作れます。
-- **自由ソフトウェアだけで動かす版**（`xestrata-free`、Intel と AMD の GPU）は Releases にはありません。
-  同じ手順で自分で作ります（`tools/package/build.sh ubuntu26.04 free` など）。
+- パッケージは一度に 1 つだけ入ります。CUDA 13 の版には Pascal と Volta のコードがなく、これらを扱う NVIDIA のドライバーも 580 の系列（CUDA 12.4 に対応）までです。
+- 自由ソフトウェアだけで動かす版（`xestrata-free`、Intel と AMD の GPU）は Releases にはありません。[docs/BUILD.ja.md](docs/BUILD.ja.md#deb-と-rpm-のパッケージ) の手順で作れます（`tools/package/build.sh ubuntu26.04 free` など）。
 
-**2. 入れます。** 足りない依存は apt や dnf が入れます。
-
-```bash
-sudo apt install ./xestrata-contrib-cuda13.1_*.deb      # Ubuntu
-sudo dnf install ./xestrata-contrib-cuda13.4-*.rpm      # Fedora
-```
-
-GPU のドライバーなどは別に入れます。次の `xestrata --setup` が、足りないパッケージと render グループを確かめ、入れるコマンドを表示して止まります。
-そのコマンドを実行してから、もう一度 `xestrata --setup` を実行します。
-
-**3. 端末で `xestrata --setup` を実行し、質問に答えます。** Enter を押せば、おすすめの選択になります。
+`xestrata --setup` の質問は、Enter を押せばおすすめの選択になります。
 
 - **モデルと大きさ**: [モデルの選び方](#モデルの選び方)を見てください。
 - **文脈の長さ**: 一度に覚えておける文章の量です。GPU に合った長さを勧めます。
