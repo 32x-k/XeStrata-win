@@ -431,19 +431,6 @@ bool PlainModel::open_experts(std::string& err) {
         return false;
     }
 
-    if (!opt_.profile.empty()) {   // the tier from a profile: its ranking, each layer up to its slots
-        int64_t ranked_slots = 0;
-        if (!read_expert_profile(opt_.profile, L, E, prior_, ranked_slots, err)) return false;
-        int64_t filled = 0;
-        for (const auto& [l, e] : prior_)
-            if (!free_[(size_t) l].empty()) {
-                if (!fill_slot(l, e, err)) return false;
-                ++filled;
-            }
-        std::fprintf(stderr, "strata plain: the VRAM tier filled from %s: %lld experts\n", opt_.profile.c_str(),
-                     (long long) filled);
-    }
-
     MoeWindowShape ws;
     ws.n_embd = s.n_embd;
     ws.n_expert = E;
@@ -486,6 +473,21 @@ bool PlainModel::open_experts(std::string& err) {
             std::fprintf(stderr, "strata plain: no PCIe split (%s): the CPU takes every missed expert\n", why.c_str());
         }
     }
+    // the tier from a profile, after the split's timing (which needs experts in RAM outside the VRAM): its ranking,
+    // each layer up to its slots
+    if (!opt_.profile.empty()) {
+        int64_t ranked_slots = 0;
+        if (!read_expert_profile(opt_.profile, L, E, prior_, ranked_slots, err)) return false;
+        int64_t filled = 0;
+        for (const auto& [l, e] : prior_)
+            if (!free_[(size_t) l].empty()) {
+                if (!fill_slot(l, e, err)) return false;
+                ++filled;
+            }
+        std::fprintf(stderr, "strata plain: the VRAM tier filled from %s: %lld experts\n", opt_.profile.c_str(),
+                     (long long) filled);
+    }
+
     std::fprintf(stderr, "strata plain: %lld MoE layers x %lld experts, %lld VRAM slots (%lld a layer, %.2f GiB), "
                          "%d CPU workers, %lld MiB free before the tier\n",
                  (long long) L, (long long) E, (long long) n_slots_, (long long) q, (double) cache_.bytes() / 1073741824.0,
