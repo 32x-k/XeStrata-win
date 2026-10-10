@@ -10,9 +10,9 @@ Three conversations per run, each engine's server started anew for the run:
   required for the first STEPS - 1 steps, then the model answers.
 
 Each turn is at most 1024 tokens (the thinking included), sampled as Qwen recommends (temperature 0.7, top_p 0.8,
-top_k 20; TEMPERATURE sets another temperature, 0 greedy) with a seed per round.  Measured per conversation: the
-time to the first streamed token (median of its turns), the prompt and the output speed (the server's `timings`,
-summed over its turns).  The runs are
+top_k 20; TEMPERATURE sets another temperature, 0 greedy) with a seed per round.  CONVS (default "chat-ja chat-en
+agent"): the conversations to hold.  Measured per conversation: the time to the first streamed token (median of its
+turns), the prompt and the output speed (the server's `timings`, summed over its turns).  The runs are
 tools/bench_core.py's (ab_usage), which setup's --bench makes too.
 
     XE="CMD..." UP="CMD..." XE_ROOT=DIR UP_ROOT=DIR DATA=DIR XE_PROFILE=... UP_PROFILE=... \\
@@ -46,6 +46,9 @@ def cfg(e: B.Engine) -> dict:
             "args": B.engine_args(m.model, e.profile, m.mtp, B.usage_context(ctx))}
 
 
+convs = tuple(os.environ.get("CONVS", " ".join(B.CONVERSATIONS)).split())
+if set(convs) - set(B.CONVERSATIONS):
+    sys.exit(f"CONVS: some of {' '.join(B.CONVERSATIONS)}")
 B.ab_usage(Path(args[0]), args[1], m.engines, cfg, ctx, B.load_corpus()["agent"], m.rounds, m.slow,
            port=int(os.environ.get("PORT", "18095")), dry="--dry-run" in sys.argv,
-           temperature=float(os.environ.get("TEMPERATURE", str(B.TEMPERATURE))))
+           temperature=float(os.environ.get("TEMPERATURE", str(B.TEMPERATURE))), convs=convs)

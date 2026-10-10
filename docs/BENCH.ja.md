@@ -77,7 +77,7 @@ python $S/judge.py --prompt-only B70 $o/IQ3_XXS ...                           # 
 ```
 
 - モデルの既定は IQ3_XXS です。RAM の少ない PC では、setup が書いたモデルの設定を `CONFIG=xestrata-<モデル>.json` で渡すと、そのモデルのファイルと設定（RAM の予算、calibrate の結果）で両エンジンを測ります。
-  ファイルを直接指定するときは `PACK`・`NATIVE`・`PLE`（と両エンジンに足すオプションの `EXTRA`）です。通常使用の文脈は `CONTEXT`（既定 262144）、段は `TIERS` で変えられます。
+  ファイルを直接指定するときは `PACK`・`NATIVE`・`PLE`（と両エンジンに足すオプションの `EXTRA`）です。通常使用の文脈は `CONTEXT`（既定 262144）、会話は `CONVS`（既定 `chat-ja chat-en agent`）、段は `TIERS` で変えられます。
 - `XE` と `UP` は各エンジンのバイナリかラッパーです。前に `env K=V ...` を付けられます。serve と通常使用のラッパーは標準入力を通すこと（`docker run -i`）。
 - 回数は generate が 2 回、serve と通常使用が 3 回です（`ROUNDS` で変えられます）。serve と通常使用は各エンジンが自分のテキストを書くので、温度 0.7 では 1 回ごとに中央値から 10% 前後ずれます。
 - generate は `--spec-follow` で両エンジンに upstream の答えをなぞらせ、テキストの違いを除きます。serve にはこの機能がありません。

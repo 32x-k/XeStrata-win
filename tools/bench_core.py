@@ -91,6 +91,7 @@ CHATS = {
                  "When is the GIL a problem, and when is it not?",
                  "Summarize our conversation in three bullet points."]),
 }
+CONVERSATIONS = (*CHATS, "agent")       # everyday use's conversations, in the order they run
 AGENT_SYSTEM = ("You are a coding agent working in the user's repository, a C++/SYCL inference engine. Use the tools "
                 "to read what you need before answering. Keep changes small and explain them.")
 AGENT_TASK = ("Find where the prompt (prefill) path splits a long prompt into chunks, explain how the chunk size is "
@@ -550,15 +551,20 @@ def usage_post(port: int, body: dict, timeout: float = 1200, temperature: float 
     return msg, first, timings
 
 
-def usage_turns(port: int, seed: int, agent_files: list[str], temperature: float = TEMPERATURE):
-    """Every turn of the three conversations: (conversation, turn, ttft, timings)."""
+def usage_turns(port: int, seed: int, agent_files: list[str], temperature: float = TEMPERATURE,
+                convs: tuple[str, ...] | None = None):
+    """Every turn of the conversations (`convs`, default all three): (conversation, turn, ttft, timings)."""
     for name, (system, questions) in CHATS.items():
+        if convs and name not in convs:
+            continue
         msgs = [{"role": "system", "content": system}]
         for i, q in enumerate(questions):
             msgs.append({"role": "user", "content": q})
             m, ttft, tm = usage_post(port, {"messages": msgs, "seed": seed}, temperature=temperature)
             msgs.append(m)
             yield name, i, ttft, tm
+    if convs and "agent" not in convs:
+        return
     msgs = [{"role": "system", "content": AGENT_SYSTEM}, {"role": "user", "content": AGENT_TASK}]
     for step in range(AGENT_STEPS):
         last = step == AGENT_STEPS - 1
@@ -581,7 +587,7 @@ def usage_context(ctx: int) -> list[str]:
 
 def run_usage(e: Engine, cfg: dict, seed: int, agent_files: list[str], stem: Path, warmup: bool = False,
               slow: float = 0.0, label: str = "", port: int | None = None, dry: bool = False,
-              temperature: float = TEMPERATURE) -> dict:
+              temperature: float = TEMPERATURE, convs: tuple[str, ...] | None = None) -> dict:
     """The engine's own server with `cfg` (written to STEM.config.json, its log to STEM.txt) on local `port` (None: a
     free one), and the conversations: the turns and why it ended early, if it did.  The first answer at `slow` tok/s
     or less ends it ("stopped: output")."""
@@ -613,7 +619,7 @@ def run_usage(e: Engine, cfg: dict, seed: int, agent_files: list[str], stem: Pat
             except OSError:
                 pass
             time.sleep(2)
-        for name, i, ttft, tm in usage_turns(port, seed, agent_files, temperature):
+        for name, i, ttft, tm in usage_turns(port, seed, agent_files, temperature, convs):
             turns.append({"conv": name, "turn": i, "ttft_s": ttft, **{k: (tm or {}).get(k) for k in (
                 "prompt_n", "cache_n", "prompt_ms", "predicted_n", "predicted_ms", "draft_n", "draft_n_accepted")}})
             t = turns[-1]
@@ -745,7 +751,8 @@ def ab_serve(out: Path, gpu: str, engines: list[Engine], args: Callable[[Engine,
 
 def ab_usage(out: Path, gpu: str, engines: list[Engine], cfg: Callable[[Engine], dict], context: int,
              agent_files: list[str], rounds: int = ROUNDS, slow: float = SLOW, on_run: Callable | None = None,
-             port: int | None = None, dry: bool = False, temperature: float = TEMPERATURE) -> None:
+             port: int | None = None, dry: bool = False, temperature: float = TEMPERATURE,
+             convs: tuple[str, ...] | None = None) -> None:
     """bench_usage.py: OUT/usage-runs/GPU-ARM-ROUND.json (the turns), .txt (its server's log) and .config.json,
     each engine's server started anew for each run, one discarded warm-up per engine first (round 0: one answer),
     the engines alternating; seed 1000 + the round.  Upstream whose first answer comes at `slow` tok/s or less is
@@ -757,7 +764,7 @@ def ab_usage(out: Path, gpu: str, engines: list[Engine], cfg: Callable[[Engine],
         if on_run:
             on_run("usage" if rnd else None)
         rec = run_usage(e, cfg(e), 1000 + rnd, agent_files, runs / stem, warmup, slow if e.arm == "up" else 0.0,
-                        f"{gpu} {e.arm} {rnd}", port, dry=dry, temperature=temperature)
+                        f"{gpu} {e.arm} {rnd}", port, dry=dry, temperature=temperature, convs=convs)
         if dry:
             return rec["why"]
         rec = {"gpu": gpu, "arm": e.arm, "round": rnd, "context": context, "temperature": temperature, **rec}

@@ -77,7 +77,7 @@ python $S/judge.py --prompt-only B70 $o/IQ3_XXS ...                           # 
 ```
 
 - The model is IQ3_XXS by default. On a PC with less RAM, `CONFIG=xestrata-<model>.json`, a model config setup wrote, measures both engines with that model's files and settings (its RAM budget, the calibration's results).
-  To name the files instead: `PACK`, `NATIVE`, `PLE` (and `EXTRA`, options both engines take). `CONTEXT` (default 262144) sets everyday use's context, `TIERS` the tiers.
+  To name the files instead: `PACK`, `NATIVE`, `PLE` (and `EXTRA`, options both engines take). `CONTEXT` (default 262144) sets everyday use's context, `CONVS` (default `chat-ja chat-en agent`) its conversations, `TIERS` the tiers.
 - `XE` and `UP` are each engine's binary or wrapper, optionally after `env K=V ...`. For serve and everyday use a wrapper must pass stdin through (`docker run -i`).
 - generate runs twice, serve and everyday use three times (`ROUNDS` changes it). In serve and everyday use each engine writes its own text, so at temperature 0.7 a round lands about 10% off the median.
 - generate makes both engines follow upstream's answer (`--spec-follow`), leaving the texts' difference out; serve has no such option.
