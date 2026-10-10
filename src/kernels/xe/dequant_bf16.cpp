@@ -13,6 +13,7 @@
 #include "strata/kernels/device_arch_tag.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -191,9 +192,40 @@ using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
 inline uint32_t word(uint16_t v) { return v; }
 inline uint32_t word(H16 v) { return v.v; }
 inline uint32_t word(float v) { return sycl::bit_cast<uint32_t>(v); }
+// Q8_0 (upstream e910e410): four work-items a block, eight values each, so neighbouring work-items write neighbouring
+// 16 bytes (one a block wrote its 64 bytes apart from the next).  The same d * q per value: the same bits.
+// STRATA_DQ_Q8_X4=0: one work-item a block, as before.
+inline bool dq_q8_x4() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DQ_Q8_X4"); return v == nullptr || v[0] != '0'; }();
+    return on;
+}
+template <typename T>
+sycl::event dequant_q8_0_x4(sycl::queue& q, const uint8_t* blocks, int64_t row_bytes, int64_t row0, int64_t rows,
+                            int64_t groups_per_row, T* out) {
+    return q.parallel_for(sycl::range<1>((size_t) (rows * groups_per_row * 4)), [=](sycl::id<1> id) {
+        const int64_t g = (int64_t) id[0] >> 2;
+        const int part = (int) (id[0] & 3);
+        const int64_t r = g / groups_per_row, gi = g % groups_per_row;
+        const uint8_t* b = blocks + (row0 + r) * row_bytes + gi * 34;
+        const float d = h2f(b);
+        T v[8];
+        for (int j = 0; j < 8; ++j) put(v, j, (float) (int8_t) b[2 + part * 8 + j] * d);
+        u32x4* o = reinterpret_cast<u32x4*>(out + r * groups_per_row * 32 + gi * 32 + part * 8);
+        if constexpr (sizeof(T) == 4) {
+            for (int i = 0; i < 2; ++i)
+                o[i] = u32x4{word(v[4 * i]), word(v[4 * i + 1]), word(v[4 * i + 2]), word(v[4 * i + 3])};
+        } else {
+            o[0] = u32x4{word(v[0]) | word(v[1]) << 16, word(v[2]) | word(v[3]) << 16,
+                         word(v[4]) | word(v[5]) << 16, word(v[6]) | word(v[7]) << 16};
+        }
+    });
+}
 template <int TYPE, typename T>
 sycl::event dequant_kernel(sycl::queue& q, const uint8_t* blocks, int64_t row_bytes, int64_t row0, int64_t rows,
                            int64_t groups_per_row, T* out) {
+    if constexpr (TYPE == 8)
+        if (reinterpret_cast<uintptr_t>(out) % 16 == 0 && dq_q8_x4())
+            return dequant_q8_0_x4(q, blocks, row_bytes, row0, rows, groups_per_row, out);
     if (reinterpret_cast<uintptr_t>(out) % 16 == 0) {
         return q.parallel_for(sycl::range<1>((size_t) (rows * groups_per_row)), [=](sycl::id<1> id) {
             const int64_t g = (int64_t) id[0];
