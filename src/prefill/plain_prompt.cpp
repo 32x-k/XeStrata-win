@@ -81,9 +81,10 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     };
     const int attn_batch = std::max(1, std::min(opt_.max_t, 8));   // queries an attention launch takes (its scratch)
     // STRATA_PROMPT_PROFILE=1: the time of each stage, the stream synchronized after each (slower; for finding where it
-    // goes): 0 the mixer, 1 the router and the host's grouping, 2 the experts, 3 the shared expert and the combine
+    // goes): 0 the GDN layers, 4 the attention layers, 1 the router and the host's grouping, 2 the experts, 3 the shared
+    // expert and the combine
     static const bool profile = std::getenv("STRATA_PROMPT_PROFILE") != nullptr;
-    double stage_ms[4] = {};
+    double stage_ms[5] = {};
     auto mark = [&](int stage, std::chrono::steady_clock::time_point& t) {
         if (!profile) return;
         strata::gpu::stream_sync(cs);
@@ -158,7 +159,7 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                     proj(b.o, P.mix, T);
                 }
                 k::add_inplace(P.x, P.mix, T * N, cs);
-                mark(0, t_mark);
+                mark(b.recurrent ? 0 : 4, t_mark);
 
                 // the MoE
                 k::native_qsa_rms_norm_weighted(P.x, b.post_norm, P.hn, (int) N, (int) T, eps, cs);
@@ -281,8 +282,9 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
         return false;
     }
     if (profile)
-        std::fprintf(stderr, "strata plain: prompt of %lld tokens: mixer %.1f ms, router and grouping %.1f, experts %.1f, "
-                             "shared and combine %.1f\n", (long long) n, stage_ms[0], stage_ms[1], stage_ms[2], stage_ms[3]);
+        std::fprintf(stderr, "strata plain: prompt of %lld tokens: GDN %.1f ms, attention %.1f, router and grouping %.1f, "
+                             "experts %.1f, shared and combine %.1f\n", (long long) n, stage_ms[0], stage_ms[4], stage_ms[1],
+                     stage_ms[2], stage_ms[3]);
     *out = ((volatile int32_t*) h_out_)[0];
     if (logits != nullptr && !strata::gpu::copy(logits, logits_, (size_t) n_vocab_ * 4)) {
         err = "plain prompt: reading the logits failed";
