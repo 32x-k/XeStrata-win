@@ -62,6 +62,7 @@ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_mess
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import release_check  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
@@ -2383,6 +2384,7 @@ class Service:
         self.latencies = Latencies()                     # GET /metrics in Prometheus text: the latency histograms
         self.last_request_at: float | None = None        # when a request last started or finished
         self.started_at = time.time()
+        self.updates = release_check.Checker()           # GET/POST /update: whether a newer release is out
         self.status_lock = threading.Lock()
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
@@ -4309,6 +4311,10 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "loaded": svc.loaded(), "service": "strata"})
+            elif path == "/update":                         # whether a newer release is out (About > Updates)
+                if not self._authorized():
+                    return
+                self._json(200, svc.updates.check() if release_check.enabled() else svc.updates.info())
             elif path == "/status":
                 if not self._authorized():                  # #212: it shows the end of the last answer
                     return
@@ -4401,6 +4407,10 @@ def make_handler(svc: Service):
                 return
             # the same for the slot files: else any site could overwrite a saved conversation or replace the live one
             if path.startswith("/slots/") and not self._own_page("conversations can be saved or restored"):
+                return
+            if path == "/update":                            # About's "Check now": ask GitHub again
+                if self._control_body() and self._own_page("a check for a new release can be asked"):
+                    self._json(200, svc.updates.check(force=True))
                 return
             if path == "/unload":                            # give the GPU back now (between requests)
                 try:
@@ -5594,6 +5604,8 @@ def main() -> int:
         if not svc.api_key:
             print("       WARNING: no API key - anyone on your network can use this model. Add \"api_key\": \"...\" "
                   "to the config (clients send it as their API key; the web page asks for it)", flush=True)
+    if release_check.enabled():                         # at the start and every six hours, said here once
+        svc.updates.watch(lambda line: print("[strata] " + line, flush=True))
     if a.open and cfg.get("open_browser") is not False:   # #609: the config's "open_browser": false wins (an older
         import webbrowser                                  # run-<model>.sh still passes --open)
         webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
