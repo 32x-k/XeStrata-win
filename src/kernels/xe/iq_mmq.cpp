@@ -21,6 +21,7 @@
 //
 // In a source file of its own, so its kernels are in a device image apart from the Intel-only ones.
 #include "strata/kernels/iq_mmq.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "device_target.hpp"
 #include "strata/core/per_device.hpp"
@@ -92,7 +93,7 @@ inline uint32_t signed_bytes(uint32_t g, uint32_t m) { return (g ^ m) + (m & 0x0
 template<int TY> struct Dec;
 template<> struct Dec<16> {   // IQ2_XXS: d (0.5 + ls) / 4
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq2_xxs);
-    static Sub get(const uint8_t* row, int sb) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
         const block_iq2_xxs* b = reinterpret_cast<const block_iq2_xxs*>(row) + sb / 8;
         const int ib = sb % 8;
         const uint32_t q2 = (uint32_t) get_int_b2(b->qs, 2 * ib), aux = (uint32_t) get_int_b2(b->qs, 2 * ib + 1);
@@ -109,7 +110,7 @@ template<> struct Dec<16> {   // IQ2_XXS: d (0.5 + ls) / 4
 };
 template<> struct Dec<18> {   // IQ3_XXS: d (0.5 + ls) / 2
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq3_xxs);
-    static Sub get(const uint8_t* row, int sb) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
         const block_iq3_xxs* b = reinterpret_cast<const block_iq3_xxs*>(row) + sb / 8;
         const int ib = sb % 8;
         const U2 pk = get_int2_b2(b->qs, 2 * ib);
@@ -127,7 +128,7 @@ template<> struct Dec<18> {   // IQ3_XXS: d (0.5 + ls) / 2
 };
 template<> struct Dec<21> {   // IQ3_S: d (1 + 2 ls)
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq3_s);
-    static Sub get(const uint8_t* row, int sb) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
         const block_iq3_s* b = reinterpret_cast<const block_iq3_s*>(row) + sb / 8;
         const int ib = sb % 8;
         const U2 pk = get_int2_b2(b->qs, 2 * ib);
@@ -147,7 +148,7 @@ template<> struct Dec<21> {   // IQ3_S: d (1 + 2 ls)
 };
 template<> struct Dec<17> {   // IQ2_XS: d (0.5 + ls) / 4, a scale per 16
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq2_xs);
-    static Sub get(const uint8_t* row, int sb) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
         const block_iq2_xs* b = reinterpret_cast<const block_iq2_xs*>(row) + sb / 8;
         const int ib = sb % 8;
         const U2 pk = get_int2_b2(b->qs, 2 * ib);
@@ -168,7 +169,7 @@ template<> struct Dec<17> {   // IQ2_XS: d (0.5 + ls) / 4, a scale per 16
 };
 template<> struct Dec<22> {   // IQ2_S: d (0.5 + ls) / 4, a scale per 16
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq2_s);
-    static Sub get(const uint8_t* row, int sb) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
         const block_iq2_s* b = reinterpret_cast<const block_iq2_s*>(row) + sb / 8;
         const int ib = sb % 8;
         const uint32_t qs = (uint32_t) get_int_b2(b->qs, ib);
@@ -189,7 +190,7 @@ template<> struct Dec<22> {   // IQ2_S: d (0.5 + ls) / 4, a scale per 16
 };
 template<> struct Dec<20> {   // IQ4_NL: d
     static constexpr int QK = 32, BSZ = (int) sizeof(block_iq4_nl);
-    static Sub get(const uint8_t* row, int sb) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
         const block_iq4_nl* b = reinterpret_cast<const block_iq4_nl*>(row) + sb;
         Sub r;
         for (int j = 0; j < 4; ++j) {
@@ -203,7 +204,7 @@ template<> struct Dec<20> {   // IQ4_NL: d
 };
 template<> struct Dec<23> {   // IQ4_XS: d (ls - 32)
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq4_xs);
-    static Sub get(const uint8_t* row, int sb) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
         const block_iq4_xs* b = reinterpret_cast<const block_iq4_xs*>(row) + sb / 8;
         const int ib = sb % 8;
         Sub r;
@@ -219,7 +220,7 @@ template<> struct Dec<23> {   // IQ4_XS: d (ls - 32)
 };
 template<> struct Dec<42> {   // Q2_0: d (code - 1), 64 values a block
     static constexpr int QK = 64, BSZ = (int) sizeof(block_q2_0);
-    static Sub get(const uint8_t* row, int sb) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
         const block_q2_0* b = reinterpret_cast<const block_q2_0*>(row) + sb / 2;
         const uint16_t* qs = reinterpret_cast<const uint16_t*>(b->qs) + (ptrdiff_t) (sb % 2) * 4;
         Sub r;
@@ -236,7 +237,7 @@ template<> struct Dec<42> {   // Q2_0: d (code - 1), 64 values a block
 
 template<> struct Dec<29> {   // IQ1_M: d (2 ls + 1) (grid +- 1/8), a scale per 16
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq1_m);
-    static Sub get(const uint8_t* row, int sb) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
         const block_iq1_m* b = reinterpret_cast<const block_iq1_m*>(row) + sb / 8;
         const int ib = sb % 8;
         Sub r;
@@ -261,7 +262,7 @@ template<> struct Dec<29> {   // IQ1_M: d (2 ls + 1) (grid +- 1/8), a scale per 
 
 template<> struct Dec<8> {   // Q8_0: d
     static constexpr int QK = 32, BSZ = (int) sizeof(block_q8_0);
-    static Sub get(const uint8_t* row, int sb) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
         const block_q8_0* b = reinterpret_cast<const block_q8_0*>(row) + sb;
         Sub r;
         for (int j = 0; j < 8; ++j) r.v[j] = (uint32_t) get_int_b2(b->qs, j);
@@ -271,7 +272,7 @@ template<> struct Dec<8> {   // Q8_0: d
 };
 template<> struct Dec<14> {   // Q6_K: d scale (6-bit value - 32), a scale per 16
     static constexpr int QK = 256, BSZ = (int) sizeof(block_q6_K);
-    static Sub get(const uint8_t* row, int sb) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
         const block_q6_K* b = reinterpret_cast<const block_q6_K*>(row) + sb / 8;
         // block of 32 ib: half n of the 256 (ql, qh and the scales 64, 32 and 8 bytes on), quarter j of the half: the
         // low nibbles (j 0, 1) or high ones (j 2, 3) of ql's first or second 32 bytes, and qh's 2 bits at 2 j
@@ -292,7 +293,7 @@ template<> struct Dec<14> {   // Q6_K: d scale (6-bit value - 32), a scale per 1
 
 template<> struct Dec<6> {   // Q5_0: d ((5-bit value) - 16), the high bits in qh
     static constexpr int QK = 32, BSZ = (int) sizeof(block_q5_0);
-    static Sub get(const uint8_t* row, int sb) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
         const block_q5_0* b = reinterpret_cast<const block_q5_0*>(row) + sb;
         const uint32_t qh = (uint32_t) get_int_b2(b->qh, 0);
         Sub r;
@@ -322,7 +323,7 @@ inline void scale_min_k4(int j, const uint8_t* q, int& d, int& m) {
 }
 template<> struct Dec<12> {   // Q4_K: d sc value - dmin m, block ib the low (even ib) or high nibbles of qs[32 (ib / 2)..]
     static constexpr int QK = 256, BSZ = (int) sizeof(block_q4_K);
-    static Sub get(const uint8_t* row, int sb) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
         const block_q4_K* b = reinterpret_cast<const block_q4_K*>(row) + sb / 8;
         const int ib = sb % 8;
         Sub r;
@@ -337,7 +338,7 @@ template<> struct Dec<12> {   // Q4_K: d sc value - dmin m, block ib the low (ev
 };
 template<> struct Dec<13> {   // Q5_K: Q4_K's nibbles with bit ib of qh as the fifth
     static constexpr int QK = 256, BSZ = (int) sizeof(block_q5_K);
-    static Sub get(const uint8_t* row, int sb) {
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
         const block_q5_K* b = reinterpret_cast<const block_q5_K*>(row) + sb / 8;
         const int ib = sb % 8;
         Sub r;
@@ -354,8 +355,29 @@ template<> struct Dec<13> {   // Q5_K: Q4_K's nibbles with bit ib of qh as the f
     }
 };
 
+template<> struct Dec<kNativeQ6KRows> {   // Q6_K split by row (native_mmvq.hpp): a row's ql, then qh, scales and d
+    static constexpr int QK = 256, BSZ = (int) sizeof(block_q6_K);
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+        const size_t bpr = row_bytes / BSZ, blk = (size_t) sb / 8;
+        const int ib = sb % 8, n = ib / 4, j = ib % 4;
+        const uint8_t* ql = row + blk * 128 + (size_t) 64 * n;
+        const uint8_t* qh = row + bpr * 128 + blk * 64 + (size_t) 32 * n;
+        const int8_t* sc = reinterpret_cast<const int8_t*>(row + bpr * 192 + blk * 16) + (size_t) 8 * n;
+        Sub r;
+        for (int k = 0; k < 8; ++k) {
+            const uint32_t l = (uint32_t) get_int_b2(ql + 32 * (j & 1), k), h = (uint32_t) get_int_b2(qh, k);
+            const uint32_t v = ((l >> (4 * (j >> 1))) & 0x0F0F0F0Fu) | (((h >> (2 * j)) & 0x03030303u) << 4);
+            r.v[k] = ((v | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
+        }
+        const float d = (float) *reinterpret_cast<const sycl::half*>(row + bpr * 208 + blk * 2);
+        r.s0 = d * (float) sc[2 * j];
+        r.s1 = d * (float) sc[2 * j + 1];
+        return r;
+    }
+};
+
 template<int TY>
-constexpr bool half_scales() { return TY == 17 || TY == 22 || TY == 29 || TY == 14; }
+constexpr bool half_scales() { return TY == 17 || TY == 22 || TY == 29 || TY == 14 || TY == kNativeQ6KRows; }
 template<int TY>
 constexpr bool has_min() { return TY == 12 || TY == 13; }
 
@@ -439,7 +461,7 @@ struct Kernel {
             }
             for (int v = lid; v < WN * NB; v += lanes) {
                 const int nn = v / NB, b = v % NB;
-                const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b)
+                const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes)
                                                 : Sub{{}, 0.0f, 0.0f, 0.0f};   // past K: zeros
                 u32x4* o = reinterpret_cast<u32x4*>(bl + static_cast<ptrdiff_t>(nn) * LDB + static_cast<ptrdiff_t>(b) * 32);
                 o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
@@ -527,7 +549,7 @@ struct Kernel {
                 }
                 for (int v = lid; v < WN * NB; v += lanes) {
                     const int nn = v / NB, b = v % NB;
-                    const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b)
+                    const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes)
                                                 : Sub{{}, 0.0f, 0.0f, 0.0f};   // past K: zeros
                     u32x4* o = reinterpret_cast<u32x4*>(bl + static_cast<int>(nn * LDB + b * 32));
                     o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
@@ -649,7 +671,7 @@ struct Kernel {
                 }
                 for (int v = lid; v < WN * NB; v += lanes) {
                     const int nn = v / NB, b = v % NB;
-                    const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b)
+                    const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes)
                                                 : Sub{{}, 0.0f, 0.0f, 0.0f};   // past K: zeros
                     u32x4* o = reinterpret_cast<u32x4*>(bl + nn * LDB + b * 32);
                     o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
@@ -868,7 +890,8 @@ bool iq_mmq_type_sums(int t) { return t == 12 || t == 13; }   // has_min
 
 bool iq_mmq_type_ok(int t) {
     switch (t) {
-        case 6: case 8: case 12: case 13: case 14: case 16: case 17: case 18: case 20: case 21: case 22: case 23: case 29: case 42: return true;
+        case 6: case 8: case 12: case 13: case 14: case kNativeQ6KRows:
+        case 16: case 17: case 18: case 20: case 21: case 22: case 23: case 29: case 42: return true;
         default: return false;
     }
 }
@@ -880,6 +903,7 @@ size_t iq_mmq_row_bytes(int t, int64_t cols) {
         case 13: return (size_t) (cols / Dec<13>::QK) * Dec<13>::BSZ;
         case 8: return (size_t) (cols / Dec<8>::QK) * Dec<8>::BSZ;
         case 14: return (size_t) (cols / Dec<14>::QK) * Dec<14>::BSZ;
+        case kNativeQ6KRows: return (size_t) (cols / Dec<kNativeQ6KRows>::QK) * Dec<kNativeQ6KRows>::BSZ;
         case 16: return (size_t) (cols / Dec<16>::QK) * Dec<16>::BSZ;
         case 17: return (size_t) (cols / Dec<17>::QK) * Dec<17>::BSZ;
         case 18: return (size_t) (cols / Dec<18>::QK) * Dec<18>::BSZ;
@@ -939,6 +963,7 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         STRATA_MMQ_CASE(12);
         STRATA_MMQ_CASE(13);
         STRATA_MMQ_CASE(14);
+        STRATA_MMQ_CASE(kNativeQ6KRows);
         STRATA_MMQ_CASE(16);
         STRATA_MMQ_CASE(17);
         STRATA_MMQ_CASE(18);

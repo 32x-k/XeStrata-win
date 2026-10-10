@@ -151,6 +151,7 @@ private:
         int32_t* identity = nullptr;       ///< row i is row i (the int8 products' output map)
         const uint8_t** wtab = nullptr;    ///< a layer's experts' blobs, for the int8 products
         int32_t* rbounds = nullptr;        ///< each group's bounds from its first row (the down product's)
+        int32_t* dense_bounds = nullptr;   ///< {0, T}: a dense product as one int8 "expert"
         int64_t cpu_cap = 0;               ///< routed rows the CPU's share of a layer may take
         float* cpu = nullptr;              ///< the CPU's rows, sent back to be scattered into parts
         int32_t* cpu_row = nullptr;        ///< the routing entry each of them belongs to
@@ -162,6 +163,7 @@ private:
         const uint8_t** h_wtab = nullptr;
         float *h_hn = nullptr, *h_cpu = nullptr;   ///< the layer's normed rows, the CPU's output rows
         int32_t* h_cpu_row = nullptr;
+        int32_t* h_dense_bounds = nullptr;
         uint8_t* h_nact = nullptr;         ///< the CPU's activations: a token's in the layer's native format
         int32_t* h_rbounds = nullptr;
     };
