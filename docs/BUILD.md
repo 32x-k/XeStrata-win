@@ -27,7 +27,7 @@ setup checks the GPU, RAM and CPU, chooses a SYCL compiler and builds the engine
   When the GPU's XMX cannot be used, it asks whether to build without XMX or stop.
 
   contrib-llvm uses parts that are not free software (oneMKL, and for NVIDIA GPUs the CUDA toolkit).
-  `--license free` builds with free software only (Intel GPUs), `--license contrib-icpx` with Intel oneAPI's icpx.
+  `--license free` builds with free software only (Intel GPUs), `--license contrib-icpx` with Intel oneAPI's icpx (contrib-icpx is deprecated and experimental).
 - **Time**: the first run takes a while for the download (60-110 GB) and the build. If it stops, the next run continues.
 - **Where things go**: the model files in `XeStrata-data` next to the XeStrata folder, the model configs
   (`xestrata-<model>.json`) and logs in the XeStrata folder.
@@ -65,6 +65,7 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
   So it runs without NVIDIA's driver and CUDA on a PC with only Intel GPUs, and without Level Zero on one with only NVIDIA GPUs
   (checked on the development machine with the other maker's libraries made unreadable; on such a PC itself `unverified`).
 - **contrib-icpx** (`-DSTRATA_LICENSE=contrib-icpx`): built with Intel oneAPI's icpx, which is not free software (validated: 2026.1.1).
+  **Deprecated and experimental**, as the developers cannot keep maintaining it. Use free or contrib-llvm, on Intel GPUs too.
   Source oneAPI's environment before building. Intel GPUs only:
   Codeplay's plugins that gave icpx NVIDIA and AMD targets ended with oneAPI 2025.2, and from 2025.3 the CUDA and HIP adapters are not released as binaries.
 
@@ -263,7 +264,7 @@ setup builds in the mode `--license` names ([above](#build-and-run)), contrib-ll
   With an NVIDIA GPU on the machine it uses intel/llvm with its CUDA target (`.tools/intel-llvm-contrib`; without one, setup asks and builds it here),
   without one a compiler chosen as for free.
   The NVIDIA GPUs' architectures come from what nvidia-smi reports (the compute capability), and then NVIDIA's CUDA toolkit (`nvcc`) is needed.
-- **contrib-icpx**: Intel oneAPI's icpx, for Intel GPUs, with the SYCL image encoder.
+- **contrib-icpx**: Intel oneAPI's icpx, for Intel GPUs, with the SYCL image encoder. Deprecated and experimental.
 
 With an AMD GPU on the machine, free and contrib-llvm make the code for its gfx as well (`STRATA_HIP_ARCHS`).
 They then use intel/llvm built here, not the distribution's `dpclang++`.

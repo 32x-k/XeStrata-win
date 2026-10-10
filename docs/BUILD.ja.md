@@ -26,7 +26,7 @@ setup は、GPU と RAM と CPU を確かめ、SYCL のコンパイラを選ん�
   GPU の XMX が使えないときは、XMX なしでビルドするか止めるかを尋ねます。
 
   contrib-llvm は自由ソフトウェアでない部品（oneMKL、NVIDIA の GPU には CUDA ツールキット）を使います。
-  `--license free` で自由ソフトウェアだけ（Intel の GPU）、`--license contrib-icpx` で Intel oneAPI の icpx のビルドにします。
+  `--license free` で自由ソフトウェアだけ（Intel の GPU）、`--license contrib-icpx` で Intel oneAPI の icpx のビルドにします（contrib-icpx は非推奨で、実験的なものです）。
 - **時間**: 初回はダウンロード（60〜110 GB）とビルドに時間がかかります。途中で止めても、次は続きから始まります。
 - **置き場所**: モデルのファイルは XeStrata のフォルダーの隣の `XeStrata-data`、モデルの設定（`xestrata-<モデル>.json`）とログは
   XeStrata のフォルダーに置きます。
@@ -67,6 +67,7 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   そのため、Intel の GPU だけの PC では NVIDIA のドライバーと CUDA がなくても、NVIDIA の GPU だけの PC では Level Zero がなくても動きます
   （開発機で、もう一方のライブラリを読めなくして確かめました。実際にそれだけの PC では `unverified`）。
 - **contrib-icpx**（`-DSTRATA_LICENSE=contrib-icpx`）: 自由ソフトウェアでない Intel oneAPI の icpx でビルドします（2026.1.1 で確かめています）。
+  **非推奨で、実験的なモードです。** 開発者が保守しきれないためです。Intel の GPU でも、free か contrib-llvm を使ってください。
   ビルドの前に oneAPI の環境を読み込みます。Intel の GPU だけを扱います。
   icpx に NVIDIA・AMD のターゲットを足す Codeplay のプラグインは oneAPI 2025.2 で終わり、2025.3 からは CUDA・HIP のアダプタがバイナリで出ないためです。
 
@@ -266,7 +267,7 @@ setup は、`--license` で選んだモード（[上](#ビルド)）でビルド
   NVIDIA の GPU があれば CUDA のターゲット付きの intel/llvm（`.tools/intel-llvm-contrib`、なければ尋ねてからここでビルドします）を、
   なければ free と同じ順で選んだコンパイラを使います。
   NVIDIA の GPU のアーキテクチャは nvidia-smi の報告（compute capability）から決め、そのときは NVIDIA の CUDA ツールキット（`nvcc`）が要ります。
-- **contrib-icpx**: Intel oneAPI の icpx で、Intel の GPU 向けに作り、画像のエンコーダーは SYCL のものにします。
+- **contrib-icpx**: Intel oneAPI の icpx で、Intel の GPU 向けに作り、画像のエンコーダーは SYCL のものにします。非推奨で、実験的なモードです。
 
 AMD の GPU があれば、free と contrib-llvm は、その GPU の gfx 向けのコードも作ります（`STRATA_HIP_ARCHS`）。
 このときはディストリビューションの `dpclang++` を使わず、ここでビルドした intel/llvm を使います。
