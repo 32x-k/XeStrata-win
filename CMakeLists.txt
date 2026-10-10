@@ -746,6 +746,12 @@ if(STRATA_BUILD_TESTS)
   add_executable(session_save_reclaim_test src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp)
   target_include_directories(session_save_reclaim_test PRIVATE include)
   add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
+  # available_host_bytes(): MemAvailable, the cgroup limits and the operator's --memory-limit-mib cap on fixture
+  # directories (upstream daa76552) - no GPU
+  add_executable(memory_guard_test tests/core/memory_guard_test.cpp src/core/conversation_memory.cpp)
+  target_include_directories(memory_guard_test PRIVATE include)
+  add_test(NAME memory_guard_test COMMAND memory_guard_test)
+  set_tests_properties(memory_guard_test PROPERTIES TIMEOUT 60)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp

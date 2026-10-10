@@ -464,6 +464,9 @@ struct Options {
     int64_t conversation_save_mib = 16384;
     int64_t conversation_save_hours = 48;
     bool conversation_save_compress = false;   // the floating-point parts through c-blosc2 (built only when found)
+    /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
+    /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
+    int64_t memory_limit_mib = -1;
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
     bool session_save_reclaim = false;
@@ -599,8 +602,11 @@ void usage() {
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
-                 "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
-                 "                       session file (default 2560)\n"
+                 "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
+                 "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
+                 "  --memory-limit-mib N  --serve: the total RAM (MiB) this engine's container or cgroup may use, when\n"
+                 "                       the container cannot see its real limit (also STRATA_MEMORY_LIMIT_MIB; the flag\n"
+                 "                       wins; 0 = none). Parking and session save/restore keep their floor under it\n"
                  "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens, so\n"
                  "                       short side requests do not take the slots a long one needs (default 0 = park any)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
@@ -898,6 +904,13 @@ struct GpuStage {
     bool adapt_live = false;                             ///< swaps of this request are in flight on it
     int32_t* mrope = nullptr;                            ///< --vision: the image-position table on its device
 };
+
+// what a refusal on the RAM guard says it had: "900 MiB available, source cgroup" (the smallest of MemAvailable, the
+// cgroup limits above the engine and --memory-limit-mib; see strata/core/conversation_memory.hpp)
+static std::string ram_note(const std::optional<strata::core::HostMemoryReading>& mem) {
+    if (!mem) return "RAM telemetry unavailable";
+    return std::to_string(mem->available >> 20) + " MiB available, source " + strata::core::memory_source_name(mem->source);
+}
 
 // ---- issue #31: what the watchdog prints before it stops a stalled engine
 struct MemSample {
@@ -2081,7 +2094,8 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
                  a == "--conversation-save-checkpoints" ||
-                 a == "--conversation-save-mib" || a == "--conversation-save-hours" || a == "--session-min-free-mib") {
+                 a == "--conversation-save-mib" || a == "--conversation-save-hours" || a == "--session-min-free-mib" ||
+                 a == "--memory-limit-mib") {
             const std::string value = next(a.c_str());
             int64_t parsed = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
@@ -2101,6 +2115,7 @@ int main(int argc, char** argv) {
             else if (a == "--conversation-save-mib") o.conversation_save_mib = parsed;
             else if (a == "--conversation-save-hours") o.conversation_save_hours = parsed;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = parsed;
+            else if (a == "--memory-limit-mib") o.memory_limit_mib = parsed;
             else o.conversation_cache_slots = (int) parsed;
         }
         else if (a == "--conversation-save") o.conversation_save = next("--conversation-save");
@@ -2208,6 +2223,38 @@ int main(int argc, char** argv) {
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
     // the next discrete ones); "auto" chooses the K before anything is loaded (below).  The helper caches
     // (--expert-cache-remote) are not carried by the Xe engine at all (remote_experts.cpp).
+    {   // the RAM guard (parking, session save/restore): --memory-limit-mib, else STRATA_MEMORY_LIMIT_MIB, else none
+        int64_t mib = o.memory_limit_mib;
+        if (mib < 0) {
+            const char* env = std::getenv("STRATA_MEMORY_LIMIT_MIB");
+            if (env != nullptr && env[0] != '\0') {
+                const size_t len = std::strlen(env);
+                const auto parsed = std::from_chars(env, env + len, mib);
+                if (parsed.ec != std::errc{} || parsed.ptr != env + len || mib < 0 || mib > INT64_MAX / (1024 * 1024)) {
+                    std::fprintf(stderr, "STRATA_MEMORY_LIMIT_MIB needs a nonnegative integer within range (got \"%s\")\n", env);
+                    return 2;
+                }
+            } else mib = 0;
+        }
+        strata::core::set_memory_limit_bytes((uint64_t) mib << 20);
+        if (o.serve || mib > 0) {
+            constexpr double GiB = 1073741824.0;
+            const auto mem = strata::core::sample_host_memory();
+            if (!mem) {
+                std::fprintf(stderr, "strata generate: memory guard: the available RAM cannot be read; parking and session "
+                                     "save/restore are refused\n");
+            } else {
+                std::fprintf(stderr, "strata generate: memory guard: limit %.1f GiB (source: %s), current %.1f GiB, "
+                                     "reclaimable cache credited %.1f GiB; available %.1f GiB (MemAvailable %.1f GiB%s), "
+                                     "floor %lld MiB\n",
+                             (double) mem->limit / GiB, strata::core::memory_source_name(mem->source),
+                             (double) mem->current / GiB, (double) mem->credit / GiB, (double) mem->available / GiB,
+                             (double) mem->mem_available / GiB,
+                             mib > 0 ? (", --memory-limit-mib " + std::to_string((long long) mib)).c_str() : "",
+                             (long long) o.conversation_cache_min_free_mib);
+            }
+        }
+    }
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
@@ -6039,10 +6086,14 @@ int main(int argc, char** argv) {
                 // recently active parked conversations until it fits, or until none are left (with --conversation-save
                 // each is written first).  Each ConversationBuffer is a list of 16 MiB segments, each its own
                 // allocation, so an evicted entry is back with the kernel before the next check reads /proc/meminfo.
+                // The reading is the memory guard's (MemAvailable, the cgroup limits above the engine,
+                // --memory-limit-mib; upstream daa76552); `mem` keeps the last one for the refusal line.
                 size_t freed = 0;
+                std::optional<strata::core::HostMemoryReading> mem;
                 auto admit = [&] {
-                    return strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
-                                                                   additional, floor);
+                    mem = strata::core::sample_host_memory();
+                    return strata::core::conversation_memory_admit(
+                        mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
                 };
                 while (!admit() && conversations.size() > 0 && freed < conversations.slots() &&
                        conversations.evict_oldest(disk.enabled() ? &evicted : nullptr)) {
@@ -6051,10 +6102,9 @@ int main(int argc, char** argv) {
                 }
                 if (!admit()) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need "
-                                         "%zu MiB plus %lld MiB floor; evicted %zu, %zu still parked, or telemetry "
-                                         "unavailable)\n",
-                                 additional >> 20, (long long) o.conversation_cache_min_free_mib, freed,
-                                 conversations.size());
+                                         "%zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
+                                 additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
+                                 freed, conversations.size());
                     return true;
                 }
                 if (freed)
@@ -6069,9 +6119,12 @@ int main(int argc, char** argv) {
                                         : !strata::core::conversation_split_save(image, view, conv_stages, g,
                                                                                  mtp.kv_state(), err))
                     return false;
-                if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(), 0, floor)) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM floor after "
-                                         "capture, or telemetry unavailable)\n");
+                const auto mem_after = strata::core::sample_host_memory();
+                if (!strata::core::conversation_memory_admit(
+                        mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld "
+                                         "MiB needed, %s)\n",
+                                 (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
@@ -7602,7 +7655,7 @@ int main(int argc, char** argv) {
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         if (o.session_save_reclaim) {
                             const auto freed = strata::core::session_save_reclaim(
-                                checks, conversations, sl, floor, strata::core::conversation_available_memory);
+                                checks, conversations, sl, floor, strata::core::available_host_bytes);
                             if (freed.bytes || freed.checkpoints || freed.parked) {
                                 // A removed tail must not mark a later checkpoint at this length as a tail.
                                 if (tail_ckpt_len >= 0 && std::none_of(checks.begin(), checks.end(), [&](const auto& c) {
@@ -7614,13 +7667,13 @@ int main(int argc, char** argv) {
                             }
                         }
                         auto admit = [&](uint64_t need, std::string& why) {
-                            const auto avail = strata::core::conversation_available_memory();
+                            const auto mem = strata::core::sample_host_memory();
+                            const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
                             why = "not enough RAM to save the session (" +
                                   (need == UINT64_MAX ? std::string("unknown") : std::to_string(need >> 20)) +
                                   " MiB plus a floor of " + std::to_string((long long) o.conversation_cache_min_free_mib) +
-                                  " MiB needed, " + (avail ? std::to_string(*avail >> 20) + " MiB available)"
-                                                           : "RAM telemetry unavailable)");
+                                  " MiB needed, " + ram_note(mem) + ")";
                             return false;
                         };
                         std::vector<ConvCheckpoint> disk_checks;
@@ -7672,11 +7725,12 @@ int main(int argc, char** argv) {
                         limits.progress = moving;
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         limits.admit = [floor, &o](uint64_t need, std::string& why) {
-                            const auto avail = strata::core::conversation_available_memory();
+                            const auto mem = strata::core::sample_host_memory();
+                            const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
                             why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
                                   std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
-                                  (avail ? std::to_string(*avail >> 20) + " MiB available)" : "RAM telemetry unavailable)");
+                                  ram_note(mem) + ")";
                             return false;
                         };
                         if (!strata::core::conversation_session_read_limits(
@@ -7995,7 +8049,7 @@ int main(int argc, char** argv) {
             if (saved.tokens > std::max(resume, slot_tokens) && saved.tokens > parked.tokens) {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t need = disk.load_bytes(saved.index);
-                if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(), need,
+                if (!strata::core::conversation_memory_admit(strata::core::available_host_bytes(), need,
                                                              floor)) {
                     std::fprintf(stderr, "strata serve: conversation save: skip reading %zu MiB (physical RAM "
                                          "admission)\n", need >> 20);
@@ -9840,7 +9894,7 @@ int main(int argc, char** argv) {
                     const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                     size_t estimate = 0;
                     if (!ver.wait_commit(de) || !snapshot_bytes(view, estimate, de)) return false;
-                    if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
+                    if (!strata::core::conversation_memory_admit(strata::core::available_host_bytes(),
                                                                  estimate, floor)) {
                         de = "physical RAM admission";
                         return false;
