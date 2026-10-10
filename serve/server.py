@@ -3670,11 +3670,12 @@ def logprob_entry(tok, t, line: str):
     return e
 
 
-# The engine's last PP line stops short of the prompt: up to `--short-read` tokens (generate.cpp's `short_read`, 64 by
-# default) are read through the verify windows instead of the batched path, so the batched path never reports the whole
-# prompt.  A PP that close to the end says the prompt is read.  It matters because a prompt shorter than one `--prefill`
-# chunk sends exactly one PP, that one: a client would see a bar that appears already full.  Such a line is dropped, and
-# the answer's first token ends the progress for the client anyway.
+# The engine's last PP line stops short of the prompt: a short last part (`--short-read` tokens, or as many as the
+# windows read faster on this machine: from 64, at most 256) is read through the verify windows instead of the batched
+# path, so the batched path never reports the whole prompt.  A PP that close to the end says the prompt is read.  It
+# matters because a prompt shorter than one `--prefill` chunk sends exactly one PP, that one: a client would see a bar
+# that appears already full.  Such a line is dropped, and the answer's first token ends the progress for the client
+# anyway.
 PP_DONE_TAIL = 64
 
 
