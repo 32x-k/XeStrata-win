@@ -315,7 +315,8 @@ The B70 keeps every miss on the CPU, as before; the RX 9060 XT reads 1.0 instead
 
 ## Images
 
-The image encoder (`tools/vision`: llama.cpp's mtmd with the model's mmproj) runs on the GPU by default (`./setup.sh --vision yes` or `gpu`).
+Images are available only when chosen in setup (off by default).
+When they are, the image encoder (`tools/vision`: llama.cpp's mtmd with the model's mmproj) runs on the GPU by default (`./setup.sh --vision yes` or `gpu`).
 When it cannot, the CPU encoder takes over; `--vision cpu` uses the CPU encoder alone.
 The CPU encoder reads the pictures of [the image record](../bench/results/2026-09-30-xe-vision-cpu/README.md) as llama.cpp does, on grids of both shapes.
 Every model that runs was checked with images ([record](../bench/results/2026-09-30-xe-vision-models/README.md)):
