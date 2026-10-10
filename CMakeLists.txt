@@ -215,6 +215,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(direct_file_async_test tests/platform/direct_file_async.cpp)
   target_link_libraries(direct_file_async_test PRIVATE strata_platform)
   add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
+  # --aux-cpus: the CPU-set derivation (pure) and the placement of live threads; header-only, no GPU
+  add_executable(aux_cpus_test tests/platform/aux_cpus_test.cpp)
+  target_link_libraries(aux_cpus_test PRIVATE strata_platform)
+  add_test(NAME aux_cpus_test COMMAND aux_cpus_test)
 endif()
 
 add_executable(platform_memory_test src/platform/memory_test.cpp)

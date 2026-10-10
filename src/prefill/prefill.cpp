@@ -7,6 +7,7 @@
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/platform/aux_cpus.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 
@@ -273,7 +274,15 @@ struct Stager {
             if (!strata::gpu::event_create(&dma_done[i])) return false;
         }
         device = strata::core::current_device();
-        for (int t = 0; t < nthreads; ++t) threads.emplace_back([this] { work(); });
+        for (int t = 0; t < nthreads; ++t)
+            threads.emplace_back([this] {
+                // --aux-cpus: the copy threads go to the spare CPUs with the other helpers; STRATA_AUX_STAGER=0 leaves them where
+                // they were created (a small spare set would then hold all of them: it limits the copy rate of a long read)
+                static const bool keep = [] { const char* v = std::getenv("STRATA_AUX_STAGER"); return v != nullptr && std::atoi(v) == 0; }();
+                if (keep) strata::aux_cpus::note_owned_thread();
+                else strata::aux_cpus::pin_current_thread();
+                work();
+            });
         return true;
     }
     ~Stager() {
@@ -1233,6 +1242,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // tokens: 42 ms)
         if (ple_on && !ple_next.valid())
             ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c0, b = ple_buf] {
+                strata::aux_cpus::pin_current_thread();
                 return ple_gather(c0, b, ple_next_err);
             });
         bool ple_pending = ple_on;
@@ -1250,6 +1260,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             if (c0 + m.T < n) {
                 strata::gpu::event_sync(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
                 ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
+                    strata::aux_cpus::pin_current_thread();
                     return ple_gather(c1, b, ple_next_err);
                 });
             }

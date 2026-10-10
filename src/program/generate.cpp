@@ -35,6 +35,7 @@
 #include "strata/core/weights.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -297,6 +298,8 @@ struct Options {
     bool graph_only = false;
     bool gpu_only_full = false;   ///< R0.3: pre + post + head, the true per-token GPU floor
     int pool_workers = 0;         ///< R2.2: 0 = "all physical cores minus the host's"; >0 overrides
+    /// --aux-cpus off|auto|LIST (STRATA_AUX_CPUS): where the non-pool, non-host threads run (strata/platform/aux_cpus.hpp)
+    std::string aux_cpus;
     int pool_tasks = 0;           ///< Batched CPU expert tasks per phase; 0 keeps the existing policy
     /// R2.2's first half, as an A/B arm.  **ON by default**, because the measurement that justifies it is the
     /// pool's own drain: 33.7 GB/s against 5/6 x 44.14 = 36.8 for five workers, on a machine whose sixth core
@@ -726,6 +729,13 @@ void usage() {
                  "  --pool-workers N     R2.2: CPU expert pool worker count.  Default 0 = every physical core\n"
                  "                       except the one the host loop spins on.  A sweep is how the pool's\n"
                  "                       deviation from `cpu_s2` is attributed.\n"
+                 "  --aux-cpus SET       Where the threads that are neither pool workers nor the host thread run (the\n"
+                 "                       adaptive tier's job thread, the prefill helpers, the GPU runtime's threads, ...):\n"
+                 "                       off (the default: wherever they were created), auto (the SMT siblings of the host's\n"
+                 "                       core, then physical cores with no worker; never a CPU that shares a core with a\n"
+                 "                       worker; nothing is done when none is spare) or a CPU list such as 24,26 (Linux; the\n"
+                 "                       host's and the workers' CPUs are dropped from it).  Moves threads only, never a\n"
+                 "                       result.  STRATA_AUX_CPUS sets it too; a request's strata_tune aux_cpus=0|1 beats it.\n"
                  "  --pool-tasks N       Batched CPU expert tasks per GU/Down phase (0..4096). Default 0 =\n"
                  "                       3 per participating thread; positive counts are capped by row count.\n"
                  "  --mmap-experts       the low-RAM mode: the experts from the files through the OS page cache\n"
@@ -1067,6 +1077,10 @@ private:
         const char* c = std::getenv("STRATA_ADAPT_JOB_CPU");
         const int cpu = c != nullptr ? (int) std::strtol(c, nullptr, 10) : -1;
         if (cpu >= 0) (void) strata::kernels::cpu::pin_current_thread(cpu);
+        // without it, --aux-cpus (off by default) puts the thread on the spare CPUs; an explicit STRATA_ADAPT_JOB_CPU
+        // is the user's word over it
+        if (c != nullptr) strata::aux_cpus::note_owned_thread();
+        else strata::aux_cpus::pin_current_thread();
         for (;;) {
             std::function<void()> f;
             {
@@ -2018,6 +2032,15 @@ int main(int argc, char** argv) {
         else if (a == "--graph-only") o.graph_only = true;
         else if (a == "--gpu-only-full") o.gpu_only_full = true;
         else if (a == "--pool-workers") o.pool_workers = std::atoi(next("--pool-workers"));
+        else if (a == "--aux-cpus") {
+            o.aux_cpus = next("--aux-cpus");
+            std::string aerr;
+            strata::aux_cpus::Config acfg;
+            if (!strata::aux_cpus::parse_spec(o.aux_cpus, acfg, aerr)) {
+                std::fprintf(stderr, "strata generate: %s\n", aerr.c_str());
+                return 2;
+            }
+        }
         else if (a == "--pool-tasks") {
             const char* v = next("--pool-tasks");
             char* end = nullptr;
@@ -3789,6 +3812,17 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --batch-cpu-split is off: it needs --batch with --batch-groups over a "
                              "layer split on two GPUs\n");
     const int pipe_n0 = cpu_split ? o.batch_cpu_split[0] : 0, pipe_n1 = cpu_split ? o.batch_cpu_split[1] : 0;
+    {   // --aux-cpus / STRATA_AUX_CPUS: read the CPUs this process may use now, before any thread is pinned; the plan
+        // follows once the pool exists (it needs the workers' CPUs)
+        std::string ac = o.aux_cpus;
+        if (ac.empty())
+            if (const char* e = std::getenv("STRATA_AUX_CPUS")) ac = e;
+        std::string aerr;
+        if (!strata::aux_cpus::configure(ac, aerr)) {
+            std::fprintf(stderr, "strata generate: STRATA_AUX_CPUS: %s\n", aerr.c_str());
+            return 2;
+        }
+    }
     strata::kernels::cpu::ExpertPool pool(pipe_n0 > 0 ? pipe_n0 : o.pool_workers, /*pin=*/true,
                                           /*host_works=*/!o.no_host_worker, /*first_core=*/0, o.pool_tasks);
     std::fprintf(stderr, "strata generate: CPU pool tasks/phase: %d%s, participating threads: %d\n",
@@ -4506,6 +4540,14 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "strata generate: %d expert-pool workers%s%s\n", pool.workers(),
                  pool.host_works() ? " + the host thread" : "",
                  o.no_pool ? " (UNUSED: --no-pool)" : "");
+    {   // --aux-cpus: the plan, now the workers' CPUs are known (the host takes the first physical core, as
+        // SessionLoopScratch pins it); the threads that exist already (the GPU runtime's) move now when it is on, the
+        // ones created later pin themselves (strata/platform/aux_cpus.hpp)
+        std::vector<int> wc = pool.worker_cpus();
+        if (pool1) wc.insert(wc.end(), pool1->worker_cpus().begin(), pool1->worker_cpus().end());
+        const std::vector<int> hc = strata::kernels::cpu::physical_cores(false);
+        std::fprintf(stderr, "%s\n", strata::aux_cpus::set_topology(hc.empty() ? -1 : hc[0], wc).c_str());
+    }
 
     // **THE MISALIGNMENT WARNING THAT STOOD HERE IS GONE, BECAUSE THE MISALIGNMENT IS FIXED.**
     //
@@ -6784,6 +6826,7 @@ int main(int argc, char** argv) {
         std::deque<std::string> in_lines;
         bool in_eof = false;
         std::thread([&] {
+            strata::aux_cpus::pin_current_thread();
             // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
             // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
             // std::exit) would hang in exit() on Linux, and the server would wait for it forever
@@ -6897,6 +6940,7 @@ int main(int argc, char** argv) {
             const int io_limit = wio ? std::atoi(wio) : limit * 10;
             if (limit > 0)
                 std::thread([limit, io_limit] {
+                    strata::aux_cpus::pin_current_thread();
                     strata::core::Progress& p = strata::core::progress();
                     uint64_t last = p.beats.load(), ticks_at = p.ticks.load();
                     auto since = std::chrono::steady_clock::now();
@@ -7823,6 +7867,7 @@ int main(int argc, char** argv) {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
             bool req_pcie_set = false;   // the request set pcie_frac: its share, not the measured split
             // logprobs=K (0..20; upstream's Intel port 4ba35fd): after each "T id" an "LP logprob id:logprob ..." line
             // with the token's log-probability and the K most likely tokens', from the verify window's head logits
@@ -7856,6 +7901,7 @@ int main(int argc, char** argv) {
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") { req_pcie_frac = std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -8668,6 +8714,17 @@ int main(int argc, char** argv) {
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
             if (use_mtp) mtp.set_draft_sampling(req_sp);
+            {   // aux_cpus=0|1: where the non-pool, non-host threads run for this request (-1 = the start-up --aux-cpus); moves
+                // threads only.  An enabled placement is swept at every request: it catches threads created since.
+                static const bool aux_start = strata::aux_cpus::enabled();
+                const bool was_on = strata::aux_cpus::enabled();
+                const bool want = req_aux_cpus < 0 ? aux_start : req_aux_cpus != 0;
+                strata::aux_cpus::set_enabled(want);
+                if (want != was_on)
+                    std::fprintf(stderr, "strata serve: aux cpus %s for this request%s\n",
+                                 strata::aux_cpus::enabled() ? "ON" : "off",
+                                 want && !strata::aux_cpus::enabled() ? " (asked for, but no CPU is spare: see the start-up line)" : "");
+            }
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             drive.d.pcie_split = req_pcie_set ? nullptr : pcie_split_ptr;
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
@@ -9527,6 +9584,7 @@ int main(int argc, char** argv) {
                 bool adapt_ok = true;
                 if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
                     adapt_thr = std::thread([&] {
+                        strata::aux_cpus::pin_current_thread();
                         const Clock::time_point ta = Clock::now();
                         adapt_ok = adapt();
                         dt_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
@@ -10598,7 +10656,7 @@ int main(int argc, char** argv) {
             std::thread adapt_thr;
             bool adapt_ok = true;
             if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
-                adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+                adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
             if (!ver.commit(a + 1, err)) {
                 if (adapt_thr.joinable()) adapt_thr.join();
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());

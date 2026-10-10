@@ -432,6 +432,16 @@ compare against `0` with the same worker count and workload.
 It changes neither the kernels, the phase barriers nor the PCIe placement; `--calibrate` does not tune it yet.
 For the server, add `"--pool-tasks", "192"` (for example) to the `args` of its configuration and restart it.
 
+`--aux-cpus` decides which CPUs run the threads that are neither CPU pool workers nor the host thread (Linux, `off` by
+default, upstream 91f1e85d): the expert cache's refills, the prefill copies, the file reads, the GPU runtime's threads
+and the like.
+`auto` takes the SMT siblings of the host's core, then the CPUs of physical cores with no worker. It never takes a CPU
+that shares a core with a worker, and does nothing when none is spare.
+A list such as `24,26` is taken as given, minus the host's and the workers' CPUs.
+It moves threads only and does not change the answers.
+`STRATA_AUX_CPUS` sets it too, and the API's `"strata_tune": {"aux_cpus": 1}` (`0` puts them back) switches it per
+request. `STRATA_AUX_STAGER=0` leaves the prefill copy threads where they were started.
+
 ### Chat in the terminal
 
 ```sh

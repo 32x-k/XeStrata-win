@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/cpu/pool.cpp - P2.S3: the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/platform/aux_cpus.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
@@ -150,7 +151,9 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int first_core,
     for (int i = 0; i < n_; ++i) {
         const int c = first_core + i;
         const int core = pin ? (c < (int) cores.size() ? cores[(size_t) c] : -1) : -1;
+        if (core >= 0) worker_cpus_.push_back(core);
         threads_.emplace_back([this, i, core] {
+            strata::aux_cpus::note_owned_thread();   // --aux-cpus never moves a worker
             pin_this_thread(core);
             worker(i);
         });
