@@ -79,7 +79,7 @@ A host-side policy upstream keeps behind its backend (`#if` on CUDA, a check of 
 
 ## 3. Port the shared changes
 
-XeStrata's sources have moved far from upstream's (its own SYCL kernels, prompt path and runtime), so the tag is not merged file by file: every change taken is ported by hand onto `dev`, and the tag is recorded at the end, by a commit that keeps the tree as it is (step 9), as c3aa33ae (v0.1.40.2) and 0509e3e6 did.
+XeStrata's kernels are written from scratch (SYCL) and its prompt path and runtime have moved far from upstream's, so the tag cannot be merged (no `git merge`, no `git merge-tree`): every change taken is ported by hand onto `dev`, and the tag is recorded at the end, by a commit that keeps the tree as it is (step 9), as c3aa33ae (v0.1.40.2) and 0509e3e6 did.
 
 - One commit per upstream change, or per idea (step 2), with upstream's hashes in the message: `... （upstream 1e6cec80、e57c9072）`.
 - Groups E, M and T, and the parts of A, N and P that are shared code, are ported here or in step 4; `sycl/`, the CUDA and HIP sources, the HIP tables and the Windows parts are not taken.
