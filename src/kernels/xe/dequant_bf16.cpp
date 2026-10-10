@@ -155,6 +155,16 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
             else q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
             put(out, l, d * (float) sc[is + 2 * qu] * (float) (q - 32));
         }
+    } else if constexpr (TYPE == 10) {                             // Q2_K: scales[16] qs[64] d dmin
+        const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 84;
+        const int gi = gi_in_row % 8, n = gi / 4, j = gi % 4;      // the 128-value half, the 2-bit plane
+        const float d = h2f(b + 80), dmin = h2f(b + 82);
+        const uint8_t* q = b + 16 + 32 * n;
+        for (int l = 0; l < 32; ++l) {
+            const int sc = b[8 * n + 2 * j + l / 16];
+            const float dl = d * (float) (sc & 0xF), ml = dmin * (float) (sc >> 4);
+            put(out, l, dl * (float) ((q[l] >> (2 * j)) & 3) - ml);
+        }
     } else if constexpr (TYPE == 30) {                             // BF16: 32 values of 2 B, a "block" of 64 B
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 64;
         for (int l = 0; l < 32; ++l)
@@ -230,6 +240,7 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     case 7: block_elems = 32; block_bytes = 24; return true;
     case 8: block_elems = 32; block_bytes = 34; return true;
     case 20: block_elems = 32; block_bytes = 18; return true;
+    case 10: block_elems = 256; block_bytes = 84; return true;
     case 11: block_elems = 256; block_bytes = 110; return true;
     case 12: block_elems = 256; block_bytes = 144; return true;
     case 13: block_elems = 256; block_bytes = 176; return true;
@@ -260,6 +271,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     case 6: STRATA_DQ(6);
     case 7: STRATA_DQ(7);
     case 8: STRATA_DQ(8);
+    case 10: STRATA_DQ(10);
     case 11: STRATA_DQ(11);
     case 12: STRATA_DQ(12);
     case 13: STRATA_DQ(13);
