@@ -12,9 +12,10 @@ tools/bench_core.py's (ab_serve), which setup's --bench makes too.
 
 XE, UP, XE_PROFILE, UP_PROFILE, DATA, IDS, CONFIG, PACK, NATIVE, PLE, EXTRA and TIERS (default "64k 32k 1k") as for
 bench_generate.py; a wrapper command must pass stdin through (docker run -i).  MODES (default "greedy t07"): greedy,
-and t07 = temperature 0.7, top_p 0.95, top_k 20, a seed per round.  ROUNDS (default 3): runs per arm, tier and mode,
-each a new process, the arms alternating; one discarded warm-up per arm first.  No --spec-follow: serve has none, so
-each engine writes its own text and the drafts it accepts count in its output speed, as they do for a user.
+and tNN = temperature NN / 10 (t07 = 0.7, t10 = 1.0), top_p 0.95, top_k 20, a seed per round.  ROUNDS (default 3):
+runs per arm, tier and mode, each a new process, the arms alternating; one discarded warm-up per arm first.  No
+--spec-follow: serve has none, so each engine writes its own text and the drafts it accepts count in its output
+speed, as they do for a user.
 OUT/serve-runs/GPU-ARM-TIER-MODE-ROUND.txt gets each run's log, and .json the four turns' DONE fields;
 sync_collect.py OUT reads them.  An upstream run whose first turn reads its prompt or writes its output at SLOW tok/s
 or less (default 10) is not run again in that tier and mode (marked "stopped"); a run past 2400 s is killed.

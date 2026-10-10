@@ -59,10 +59,11 @@ def cells(folder):
     for rows, measures, limit, modes in (
             (dict(matrices)[folder], MEASURES, LIMIT, [None]),
             (json.loads((folder / "matrix-serve.json").read_text()) if (folder / "matrix-serve.json").exists()
-             else [], SERVE_MEASURES, SERVE_LIMIT, ["greedy", "t07"])):
+             else [], SERVE_MEASURES, SERVE_LIMIT, None)):
         for gpu in sorted({r["gpu"] for r in rows}):
             for tier in TIERS:
-                for mode in modes:
+                # serve's modes as measured: greedy and the temperatures (t07, ...)
+                for mode in modes or sorted({r["mode"] for r in rows}, key=lambda m: (m != "greedy", m)):
                     cell = [r for r in rows if (r["gpu"], r["tier"], r.get("mode")) == (gpu, tier, mode)]
                     if cell:
                         path = "generate" if mode is None else f"serve-{mode}"

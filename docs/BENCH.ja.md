@@ -18,7 +18,7 @@ XeStrata の速さは 3 つの測り方で測ります。
 
 段は、コーディングエージェントのプロンプト（XeStrata のソース 58dbbe5 を読ませたもの）の長さで、1K・4K・32K・64K・128K・192K・262K があります。
 各段の設定は、setup がその文脈に書くもの（8K を超えると K/V を INT8、64K 以上で `--kv-resident 32768`）です。
-通常使用の会話は、日本語と英語のチャット 5 ターンずつと、ツールを呼ぶコーディングエージェント 7 ステップです（1 ターン最大 1,024 トークン、温度 0.7・top_p 0.8・top_k 20）。
+通常使用の会話は、日本語と英語のチャット 5 ターンずつと、ツールを呼ぶコーディングエージェント 7 ステップです（1 ターン最大 1,024 トークン、温度 0.7・top_p 0.8・top_k 20。温度は変えられます）。
 
 ## xestrata --bench
 
@@ -29,6 +29,7 @@ XeStrata の速さは 3 つの測り方で測ります。
 xestrata --bench                                  # 3 つの測り方と、機械の基本の速さ（RAM・PCIe・SSD）
 xestrata --bench-verbose                          # さらに段階ごとの時間、カーネルごとの時間、GPU の負荷と温度、答えの指紋
 xestrata --bench --bench-rounds 3                 # 各計測の回数（既定 2）
+xestrata --bench --bench-temperature 1.0          # serve と通常使用の温度（既定 0.7、0〜2 を 0.1 刻み、0 は greedy だけ）
 xestrata --bench --model IQ2_XS                   # IQ3_XXS 以外の入れたモデル（Coder は --model IQ1_M --family coder）
 xestrata --bench --original-strata v0.1.41        # 同じモデルで upstream Strata のそのタグと交互に測る
 ```
@@ -81,6 +82,7 @@ python $S/judge.py --prompt-only B70 $o/IQ3_XXS ...                           # 
 - 回数は generate が 2 回、serve と通常使用が 3 回です（`ROUNDS` で変えられます）。serve と通常使用は各エンジンが自分のテキストを書くので、温度 0.7 では 1 回ごとに中央値から 10% 前後ずれます。
 - generate は `--spec-follow` で両エンジンに upstream の答えをなぞらせ、テキストの違いを除きます。serve にはこの機能がありません。
 - 合格の幅: generate と、serve・通常使用の最初のプロンプトの速さは、XeStrata が upstream より 1% 以上遅くないこと。serve・通常使用のそれ以外（続きのターンの待ち時間、出力、最初のトークンまでの時間）は 5% 以上悪くないこと。
+- 温度は、serve が `MODES`（既定 `greedy t07`。`t10` は温度 1.0）、通常使用が `TEMPERATURE`（既定 0.7）で変えられます。
 - `--dry-run` を付けると、エンジンを動かさずに起動するコマンドを出します。
 
 ## リリースの表

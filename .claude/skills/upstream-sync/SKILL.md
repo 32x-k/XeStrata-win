@@ -166,6 +166,7 @@ python .claude/skills/upstream-sync/scripts/sync_collect.py $o/IQ3_XXS xe-<commi
 Each run is one chat of four turns: the tier's prompt, then the three follow-ups of `sync_prompts.py`, each sent with the answer before it, as a chat client sends them; 256 tokens a turn.
 It measures the prompt (the first turn), the follow-ups (the median time a follow-up's prompt takes: the wait before its answer, which the conversation checkpoints decide) and the output (all four turns), greedy and at temperature 0.7, three rounds each, the engines alternating.
 Each engine writes its own text, so the drafts it accepts count in its output speed, as they do for a user.
+Another temperature: `MODES` (`t10` is temperature 1.0; everyday use's is `TEMPERATURE`); the merge's check keeps 0.7, the temperature the limits were set at.
 The wrapper commands in `XE` and `UP` must pass stdin through (`docker run -i` for upstream's `sycl/` image).
 
 ### Everyday use

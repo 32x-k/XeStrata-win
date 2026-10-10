@@ -2282,7 +2282,8 @@ def calibrate_config(cfg_path: Path) -> bool:
     return True
 
 
-def bench_config(cfg_path: Path, data: Path, verbose: bool, original: str | None, rounds: int) -> int:
+def bench_config(cfg_path: Path, data: Path, verbose: bool, original: str | None, rounds: int,
+                 temperature: float) -> int:
     """Measure the model `cfg_path` sets up (tools/bench.py) and say where the record is."""
     sys.path.insert(0, str(ROOT / "tools"))
     BENCH = importlib.import_module("bench")           # tools/bench.py (to mypy, `bench` is the records' folder)
@@ -2295,7 +2296,7 @@ def bench_config(cfg_path: Path, data: Path, verbose: bool, original: str | None
         f"{20 * rounds} minutes" + (" and more with --bench-verbose" if verbose else "") +
         (f", twice that with upstream {original}" if original else "") + ". The PC is busy meanwhile.")
     try:
-        md = BENCH.run(cfg_path, data, chosen, verbose, original, say, rounds)
+        md = BENCH.run(cfg_path, data, chosen, verbose, original, say, rounds, temperature)
     except BENCH.BenchError as e:
         fail(str(e))
     say()
@@ -2959,6 +2960,9 @@ def main() -> int:
     ap.add_argument("--bench-rounds", type=int, default=2, metavar="N",
                     help="with --bench or --bench-verbose: measure each case N times (default 2, about 20 minutes "
                          "each); more rounds, steadier medians")
+    ap.add_argument("--bench-temperature", type=float, default=0.7, metavar="T",
+                    help="with --bench or --bench-verbose: the temperature of the sampled runs (default 0.7, as Qwen "
+                         "recommends; 0 to 2 in steps of 0.1, 0 = greedy only)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.source:
@@ -2973,6 +2977,8 @@ def main() -> int:
         ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
     if a.original_strata and not (a.bench or a.bench_verbose):
         ap.error("--original-strata TAG goes with --bench or --bench-verbose, e.g. --bench --original-strata v0.1.41")
+    if not 0 <= a.bench_temperature <= 2 or abs(a.bench_temperature * 10 - round(a.bench_temperature * 10)) > 1e-6:
+        ap.error("--bench-temperature takes 0 to 2 in steps of 0.1, e.g. --bench-temperature 1.0")
     if a.bench_rounds < 1:
         ap.error("--bench-rounds takes a number of rounds, 1 or more, e.g. --bench-rounds 3")
     if a.gpu is not None:                              # --gpu 0,2 means --gpus 0,2 (a user tried it: issue report)
@@ -3044,7 +3050,8 @@ def main() -> int:
                  f"measure an installed model: {installed}" if installed else
                  f"install it first: xestrata --setup --model {model}")
         update_installed_engine()
-        return bench_config(bench_cfgs[0], data, a.bench_verbose, a.original_strata, a.bench_rounds)
+        return bench_config(bench_cfgs[0], data, a.bench_verbose, a.original_strata, a.bench_rounds,
+                            round(a.bench_temperature, 1))
     if have and a.calibrate and not (a.setup or a.model or a.family or a.check):
         update_installed_engine()
         pick_cfg = have[0]

@@ -480,12 +480,13 @@ def summary_md(rec: dict) -> str:
     if rec.get("skipped"):
         out += [f"- {rec['skipped']}", ""]
     srv = mx.get("serve") or []
-    for mode in C.MODES if srv else ():
+    for mode in sorted({r["mode"] for r in srv}, key=lambda m: (m != "greedy", m)):
         rows = [(f"{t.upper()} {label}", kind, [med(srv, key, engine=n, tier=t, mode=mode) for n in names])
                 for key, label, kind in (("prefill_tok_s", "最初のプロンプト (tok/s)", "ratio"),
                                          ("cont_ms", "会話の続きの待ち (ms)", "ms"), ("decode_tok_s", "出力 (tok/s)", "pct"))
                 for t in rec["tiers"]]
-        out += table(f"serve {mode}（4 ターンのチャット、256 トークン）", rows, names, po)
+        how = "greedy" if mode == "greedy" else f"温度 {C.mode_temperature(mode):g}"
+        out += table(f"serve {how}（4 ターンのチャット、256 トークン）", rows, names, po)
     use = mx.get("usage") or []
     if use:
         rows = [(f"{c} {label}", kind, [med(use, key, engine=n, conv=c) for n in names])
@@ -493,7 +494,9 @@ def summary_md(rec: dict) -> str:
                 for key, label, kind in (("ttft_s", "最初のトークン (s)", "lower"),
                                          ("prefill_tok_s", "プロンプト (tok/s)", "ratio"),
                                          ("decode_tok_s", "出力 (tok/s)", "pct"))]
-        out += table("usage（server.py 経由、Qwen の推奨サンプリング）", rows, names, po)
+        t = rec.get("temperature", C.TEMPERATURE)
+        out += table(f"usage（server.py 経由、{'greedy' if not t else f'温度 {t:g}、top_p 0.8、top_k 20'}）", rows,
+                     names, po)
     stopped = [f"generate {r['engine']} {r['tier']} {r['round']}: {r['stopped']}" for r in gen if r.get("stopped")]
     stopped += [f"serve {r['engine']} {r['tier']} {r['mode']} {r['round']}: {r['stopped']}" for r in srv
                 if r.get("stopped")]
@@ -557,7 +560,7 @@ def xe_license(cfg: dict) -> str:
 
 
 def run(cfg_path: Path, data: Path, gpus: list[dict], verbose: bool = False, original: str | None = None,
-        say: Callable = print, rounds: int = C.ROUNDS) -> Path:
+        say: Callable = print, rounds: int = C.ROUNDS, temperature: float = C.TEMPERATURE) -> Path:
     """Measure; write records/bench-<time>/ and return its summary.md."""
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     busy = busy_engines()
@@ -600,7 +603,9 @@ def run(cfg_path: Path, data: Path, gpus: list[dict], verbose: bool = False, ori
     ctx = context_of(cfg["args"])
     tiers = [t for t in TIERS if fits(t, ctx)]
     split = is_split(cfg)
+    modes = tuple(dict.fromkeys(("greedy", C.temperature_mode(temperature))))
     rec: dict = {"date": time.strftime("%Y-%m-%d %H:%M"), "tiers": [] if split else tiers, "rounds": rounds,
+                 "temperature": temperature,
                  "engines": [{"name": e.name, "arm": e.arm, "prompt_only": e.prompt_only} for e in engines],
                  "machine": environment(cfg, gpus, data), "upstream": upstream, "judgment": [],
                  "verbose": {} if verbose else None}
@@ -619,9 +624,10 @@ def run(cfg_path: Path, data: Path, gpus: list[dict], verbose: bool = False, ori
         say("  generate (the merges' bench_generate.py) ...")
         C.ab_generate(out, GPU_LABEL, engines, args, out / "ids", tiers, rounds=rounds, on_run=tagged)
         say("  serve (the merges' bench_serve.py) ...")
-        C.ab_serve(out, GPU_LABEL, engines, args, ids, tiers, rounds=rounds, on_run=tagged)
+        C.ab_serve(out, GPU_LABEL, engines, args, ids, tiers, modes, rounds=rounds, on_run=tagged)
     say("  everyday use (the merges' bench_usage.py) ...")
-    C.ab_usage(out, GPU_LABEL, engines, usage_cfg, ctx, corpus["agent"], rounds=rounds, on_run=tagged)
+    C.ab_usage(out, GPU_LABEL, engines, usage_cfg, ctx, corpus["agent"], rounds=rounds, on_run=tagged,
+               temperature=temperature)
     tagged(None)
     tables: list[str] = []
     C.collect(out, {e.arm: e.name for e in engines}, say=tables.append)

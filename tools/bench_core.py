@@ -8,8 +8,9 @@ Three ways of running an engine:
 - generate: `strata --tokens-file`, one new process a run, 256 greedy tokens after a tier's code-agent prompt; with two
   engines, upstream's first run of a tier writes the text every later run follows (--spec-follow).
 - serve: `strata --serve` over stdin (GEN, DONE), one new process a run: a chat of four turns, the tier's prompt and
-  three follow-ups, 256 tokens a turn, greedy or at temperature 0.7 (t07).
-- usage: the engine's own serve/server.py, streamed /v1/chat/completions: two short chats and a coding agent.
+  three follow-ups, 256 tokens a turn, greedy or at a temperature (t07 = 0.7, the default).
+- usage: the engine's own serve/server.py, streamed /v1/chat/completions: two short chats and a coding agent, at
+  the temperature Qwen recommends (0.7) or another.
 
 The prompts come from XeStrata's sources at commit 58dbbe5.  A package has no git history, so the text is shipped in
 data/bench-corpus.json.xz (written from the repository by `make_corpus`) and tokenized with the pack's tokenizer by
@@ -75,7 +76,7 @@ DEADLINE = 2400.0           # seconds a run may take
 SLOW = 10.0                 # tok/s: upstream this slow is stopped and not run again in that tier
 MODES = ("greedy", "t07")
 USAGE_MAX_TOKENS = 1024     # a turn's tokens, the thinking included
-USAGE_SAMPLING = {"temperature": 0.7, "top_p": 0.8, "top_k": 20}   # what Qwen recommends
+TEMPERATURE = 0.7           # the sampled runs' temperature (serve's t07, everyday use), as Qwen recommends
 CHATS = {
     "chat-ja": ("あなたは親切なアシスタントです。簡潔に日本語で答えてください。",
                 ["週末に東京で雨の日でも楽しめる過ごし方を3つ教えて。",
@@ -394,13 +395,29 @@ def run_generate(e: Engine, args: list[str], ids: Path, log: Path, follow: Path 
     return rc
 
 
-def sampling(mode: str, rnd: int) -> str:
-    """The serve run's sampling keys: greedy, or t07 = temperature 0.7, top_p 0.95, top_k 20, a seed per round."""
+def temperature_mode(t: float) -> str:
+    """A serve mode's name: greedy, or t and ten times the temperature in two digits (t07 = 0.7, t10 = 1.0)."""
+    return "greedy" if t == 0 else f"t{round(t * 10):02d}"
+
+
+def mode_temperature(mode: str) -> float:
     if mode == "greedy":
-        return ""
-    if mode == "t07":
-        return f"temperature=0.7 top_p=0.95 top_k=20 seed={1000 + rnd} "
-    raise ValueError(f"unknown mode {mode!r}")
+        return 0.0
+    if re.fullmatch(r"t\d\d", mode) and mode != "t00":
+        return int(mode[1:]) / 10
+    raise ValueError(f"unknown mode {mode!r} (greedy, or t07 for temperature 0.7, t10 for 1.0, ...)")
+
+
+def sampling(mode: str, rnd: int) -> str:
+    """The serve run's sampling keys: greedy, or tNN = temperature NN / 10, top_p 0.95, top_k 20, a seed per round."""
+    t = mode_temperature(mode)
+    return f"temperature={t:g} top_p=0.95 top_k=20 seed={1000 + rnd} " if t else ""
+
+
+def usage_sampling(t: float) -> dict:
+    """Everyday use's sampling: temperature `t` with what Qwen recommends beside it (top_p 0.8, top_k 20); 0 is
+    greedy."""
+    return {"temperature": t, "top_p": 0.8, "top_k": 20} if t else {"temperature": 0}
 
 
 def run_serve(e: Engine, args: list[str], ids: dict, tier: str, mode: str, rnd: int, log: Path,
@@ -501,11 +518,11 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def usage_post(port: int, body: dict, timeout: float = 1200) -> tuple:
+def usage_post(port: int, body: dict, timeout: float = 1200, temperature: float = TEMPERATURE) -> tuple:
     """One streamed chat completion: (the assistant message, time to the first token, the server's timings)."""
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", method="POST",
                                  data=json.dumps({"model": "bench", "stream": True, "max_tokens": USAGE_MAX_TOKENS,
-                                                  **USAGE_SAMPLING, **body}).encode(),
+                                                  **usage_sampling(temperature), **body}).encode(),
                                  headers={"Content-Type": "application/json"})
     t0, first, text, timings = time.monotonic(), None, "", None
     calls: dict[int, dict] = {}
@@ -533,20 +550,20 @@ def usage_post(port: int, body: dict, timeout: float = 1200) -> tuple:
     return msg, first, timings
 
 
-def usage_turns(port: int, seed: int, agent_files: list[str]):
+def usage_turns(port: int, seed: int, agent_files: list[str], temperature: float = TEMPERATURE):
     """Every turn of the three conversations: (conversation, turn, ttft, timings)."""
     for name, (system, questions) in CHATS.items():
         msgs = [{"role": "system", "content": system}]
         for i, q in enumerate(questions):
             msgs.append({"role": "user", "content": q})
-            m, ttft, tm = usage_post(port, {"messages": msgs, "seed": seed})
+            m, ttft, tm = usage_post(port, {"messages": msgs, "seed": seed}, temperature=temperature)
             msgs.append(m)
             yield name, i, ttft, tm
     msgs = [{"role": "system", "content": AGENT_SYSTEM}, {"role": "user", "content": AGENT_TASK}]
     for step in range(AGENT_STEPS):
         last = step == AGENT_STEPS - 1
         m, ttft, tm = usage_post(port, {"messages": msgs, "seed": seed, "tools": TOOLS,
-                                        "tool_choice": "auto" if last else "required"})
+                                        "tool_choice": "auto" if last else "required"}, temperature=temperature)
         yield "agent", step, ttft, tm
         if last or not m.get("tool_calls"):
             break
@@ -563,7 +580,8 @@ def usage_context(ctx: int) -> list[str]:
 
 
 def run_usage(e: Engine, cfg: dict, seed: int, agent_files: list[str], stem: Path, warmup: bool = False,
-              slow: float = 0.0, label: str = "", port: int | None = None, dry: bool = False) -> dict:
+              slow: float = 0.0, label: str = "", port: int | None = None, dry: bool = False,
+              temperature: float = TEMPERATURE) -> dict:
     """The engine's own server with `cfg` (written to STEM.config.json, its log to STEM.txt) on local `port` (None: a
     free one), and the conversations: the turns and why it ended early, if it did.  The first answer at `slow` tok/s
     or less ends it ("stopped: output")."""
@@ -595,7 +613,7 @@ def run_usage(e: Engine, cfg: dict, seed: int, agent_files: list[str], stem: Pat
             except OSError:
                 pass
             time.sleep(2)
-        for name, i, ttft, tm in usage_turns(port, seed, agent_files):
+        for name, i, ttft, tm in usage_turns(port, seed, agent_files, temperature):
             turns.append({"conv": name, "turn": i, "ttft_s": ttft, **{k: (tm or {}).get(k) for k in (
                 "prompt_n", "cache_n", "prompt_ms", "predicted_n", "predicted_ms", "draft_n", "draft_n_accepted")}})
             t = turns[-1]
@@ -727,7 +745,7 @@ def ab_serve(out: Path, gpu: str, engines: list[Engine], args: Callable[[Engine,
 
 def ab_usage(out: Path, gpu: str, engines: list[Engine], cfg: Callable[[Engine], dict], context: int,
              agent_files: list[str], rounds: int = ROUNDS, slow: float = SLOW, on_run: Callable | None = None,
-             port: int | None = None, dry: bool = False) -> None:
+             port: int | None = None, dry: bool = False, temperature: float = TEMPERATURE) -> None:
     """bench_usage.py: OUT/usage-runs/GPU-ARM-ROUND.json (the turns), .txt (its server's log) and .config.json,
     each engine's server started anew for each run, one discarded warm-up per engine first (round 0: one answer),
     the engines alternating; seed 1000 + the round.  Upstream whose first answer comes at `slow` tok/s or less is
@@ -739,10 +757,10 @@ def ab_usage(out: Path, gpu: str, engines: list[Engine], cfg: Callable[[Engine],
         if on_run:
             on_run("usage" if rnd else None)
         rec = run_usage(e, cfg(e), 1000 + rnd, agent_files, runs / stem, warmup, slow if e.arm == "up" else 0.0,
-                        f"{gpu} {e.arm} {rnd}", port, dry=dry)
+                        f"{gpu} {e.arm} {rnd}", port, dry=dry, temperature=temperature)
         if dry:
             return rec["why"]
-        rec = {"gpu": gpu, "arm": e.arm, "round": rnd, "context": context, **rec}
+        rec = {"gpu": gpu, "arm": e.arm, "round": rnd, "context": context, "temperature": temperature, **rec}
         (runs / f"{stem}.json").write_text(json.dumps(rec, indent=1) + "\n")
         if rec["why"]:
             print(f"{gpu} {e.arm} {rnd}: {rec['why']}", flush=True)

@@ -18,7 +18,7 @@ so a user's record and the development machines' records go into the same tables
 
 The tiers are lengths of a coding agent's prompt (XeStrata's sources at 58dbbe5, read as files): 1K, 4K, 32K, 64K, 128K, 192K and 262K.
 Each tier runs with what setup writes for its context (INT8 K/V above 8K, `--kv-resident 32768` from 64K).
-Everyday use holds a Japanese and an English chat of five turns each and a coding agent of seven steps that calls tools (at most 1,024 tokens a turn; temperature 0.7, top_p 0.8, top_k 20).
+Everyday use holds a Japanese and an English chat of five turns each and a coding agent of seven steps that calls tools (at most 1,024 tokens a turn; temperature 0.7, top_p 0.8, top_k 20; the temperature can be changed).
 
 ## xestrata --bench
 
@@ -29,6 +29,7 @@ It measures IQ3_XXS (so that the record sits beside the release table and the me
 xestrata --bench                                  # the three measurements and the machine's basic speeds (RAM, PCIe, SSD)
 xestrata --bench-verbose                          # also the per-stage timings, each kernel's time, the GPU's load and temperature, a fingerprint of the answers
 xestrata --bench --bench-rounds 3                 # runs per measurement (default 2)
+xestrata --bench --bench-temperature 1.0          # serve's and everyday use's temperature (default 0.7; 0 to 2 in steps of 0.1, 0 = greedy only)
 xestrata --bench --model IQ2_XS                   # an installed model other than IQ3_XXS (the Coder: --model IQ1_M --family coder)
 xestrata --bench --original-strata v0.1.41        # upstream Strata's tag on the same model, the two taking turns
 ```
@@ -81,6 +82,7 @@ python $S/judge.py --prompt-only B70 $o/IQ3_XXS ...                           # 
 - generate runs twice, serve and everyday use three times (`ROUNDS` changes it). In serve and everyday use each engine writes its own text, so at temperature 0.7 a round lands about 10% off the median.
 - generate makes both engines follow upstream's answer (`--spec-follow`), leaving the texts' difference out; serve has no such option.
 - To pass: in generate, and the first prompt's speed in serve and everyday use, XeStrata is at most 1% slower than upstream; the rest of serve and everyday use (the wait before a follow-up's answer, the output, the time to the first token) at most 5% worse.
+- The temperature: serve's `MODES` (default `greedy t07`; `t10` is temperature 1.0), everyday use's `TEMPERATURE` (default 0.7).
 - `--dry-run` prints the commands that would start the engines instead of running them.
 
 ## The release table
