@@ -16,6 +16,8 @@ namespace strata::prefill::mmq {
 
 /// The GPU runs these products (iq_mmq_usable).
 bool built();
+/// The GPU runs them without matrix engines (iq_mmq_dp4a_usable), where built() says no.
+bool built_dp4a();
 /// They cover this ggml type (the i-quants but IQ1_S, Q2_0, Q8_0 and Q6_K).
 bool supported(int ggml_type);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.

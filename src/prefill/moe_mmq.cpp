@@ -19,6 +19,7 @@ sycl::queue& Q(void* stream) { return core::Runtime::get().stream(stream); }
 }  // namespace
 
 bool built() { return kernels::iq_mmq_usable(core::Runtime::get().compute()); }
+bool built_dp4a() { return kernels::iq_mmq_dp4a_usable(core::Runtime::get().compute()); }
 bool supported(int t) { return kernels::iq_mmq_type_ok(t); }
 size_t matrix_bytes(int t, int64_t rows, int64_t cols) { return (size_t) rows * kernels::iq_mmq_row_bytes(t, cols); }
 size_t q8_bytes(int64_t rows, int64_t cols) { return kernels::iq_mmq_act_bytes(rows, cols); }

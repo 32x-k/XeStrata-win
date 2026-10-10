@@ -158,13 +158,14 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
         gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
     };
     const int attn_batch = std::max(1, std::min(opt_.max_t, 8));   // queries an attention launch takes (its scratch)
-    // the routed experts in their quantized blocks (int8 products, iq_mmq) where the GPU runs them and the layer's
-    // types are theirs, else dequantized to FP16; STRATA_PLAIN_MMQ=0 keeps FP16
+    // the routed experts in their quantized blocks (int8 products, iq_mmq: on the matrix engines, else by dp4a) where
+    // the layer's types are theirs, else dequantized to FP16; STRATA_PLAIN_MMQ=0 keeps FP16
     static const bool mmq_env = [] {
         const char* v = std::getenv("STRATA_PLAIN_MMQ");
         return v == nullptr || std::atoi(v) != 0;
     }();
-    const bool mmq_on = mmq_env && prefill::mmq::built() && N % 128 == 0 && FF % 128 == 0;
+    const bool mmq_on = mmq_env && (prefill::mmq::built() || prefill::mmq::built_dp4a()) && N % 128 == 0 &&
+                        FF % 128 == 0;
     PromptGemm& pg = prompt_gemm();
     if (mmq_on && !pg.identity) {
         prefill::mmq::iota(P.identity, P.T * K, cs);

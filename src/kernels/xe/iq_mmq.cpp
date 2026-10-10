@@ -23,6 +23,7 @@
 #include "device_target.hpp"
 #include "strata/core/per_device.hpp"
 #include "iq_bits.hpp"
+#include "cuda_intrinsics.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_iq_mmq
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -306,8 +307,10 @@ constexpr int up128(int b) { return (b + 127) / 128 * 128; }
 // carved at 128-byte boundaries (the matrix loads take 32-byte aligned tiles): the step's activations (WM x KC int8,
 // row stride LDA) and weights (WN x KC, row stride LDB: B column-major), the activations' scales as [block][row] and
 // the weights' as [block][half][output] (so that a tile of either loads with stride 0: the same scale down a column or
-// along a row), and a tile a sub-group on its way out.
-template<int TY, int SGM, int NSGM>
+// along a row), and a tile a sub-group on its way out.  DP4A: the same tiles and steps without matrix engines (the
+// GPUs iq_mmq_usable says no for: RDNA2, Volta, Intel's without XMX), each work-item a column of outputs down
+// WM / (lanes / WN) of the rows, the products by dp4a.
+template<int TY, int SGM, int NSGM, bool DP4A = false>
 struct Kernel {
     static constexpr int SGN = 2, NSGN = 4, NSG = NSGM * NSGN;
     static constexpr int WM = NSGM * SGM * TM, WN = NSGN * SGN * TN;
@@ -327,8 +330,71 @@ struct Kernel {
     int64_t ld_dst, tiles_m, tiles_n;
     sycl::local_accessor<uint8_t, 1> lm;
 
+    void dp4a_body(sycl::nd_item<1> it) const {
+        constexpr int lanes = NSG * SG, RSTEP = lanes / WN, RPT = WM / RSTEP;
+        const int64_t g = (int64_t) it.get_group(0), per = tiles_m * tiles_n, e = g / per, r = g % per;
+        const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
+        const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
+        if (m0 >= rows) return;   // the whole work-group: this expert has fewer rows than the launch
+        const int lid = (int) it.get_local_id(0), n = lid % WN, rbase = lid / WN;
+        const uint8_t* wx = wtab != nullptr ? wtab[e] + woff : w + (size_t) e * expert_bytes;
+        const auto base = lm.template get_multi_ptr<sycl::access::decorated::no>();
+        int8_t* al = local_as<int8_t>(base + A_OFF).get();
+        int8_t* bl = local_as<int8_t>(base + B_OFF).get();
+        float* xsl = local_as<float>(base + XS_OFF).get();
+        float* wsl = local_as<float>(base + WS_OFF).get();
+        float acc[RPT];
+        for (int i = 0; i < RPT; ++i) acc[i] = 0.0f;
+        const int64_t kb = K / 32;   // activation scales a row
+        for (int64_t k0 = 0; k0 < K; k0 += KC) {
+            sycl::group_barrier(it.get_group());   // the last step's tiles are read
+            for (int v = lid; v < WM * (KC / 16); v += lanes) {
+                const int rr = v / (KC / 16), c = v % (KC / 16) * 16;
+                const int64_t row = m0 + rr;
+                u32x4 val = {0u, 0u, 0u, 0u};
+                if (row < rows) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
+                *reinterpret_cast<u32x4*>(al + rr * LDA + c) = val;
+            }
+            for (int v = lid; v < WM * NB; v += lanes) {
+                const int b = v / WM, rr = v % WM;
+                const int64_t row = m0 + rr;
+                xsl[v] = row < rows ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+            }
+            for (int v = lid; v < WN * NB; v += lanes) {
+                const int nn = v / NB, b = v % NB;
+                const Sub d = Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b);
+                u32x4* o = reinterpret_cast<u32x4*>(bl + nn * LDB + b * 32);
+                o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
+                o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
+                wsl[(2 * b) * WN + nn] = d.s0;
+                wsl[(2 * b + 1) * WN + nn] = d.s1;
+            }
+            sycl::group_barrier(it.get_group());
+            for (int b = 0; b < NB; ++b) {
+                int wv[8];   // this work-item's output's block, read once for its rows
+                const int* wp = reinterpret_cast<const int*>(bl + n * LDB + b * 32);
+                for (int i = 0; i < 8; ++i) wv[i] = wp[i];
+                const float ws0 = wsl[(2 * b) * WN + n], ws1 = wsl[(2 * b + 1) * WN + n];
+                for (int i = 0; i < RPT; ++i) {
+                    const int rr = rbase + i * RSTEP;
+                    const int* ap = reinterpret_cast<const int*>(al + rr * LDA + b * 32);
+                    int s0 = 0, s1 = 0;
+                    for (int j = 0; j < 4; ++j) s0 = xe::dp4a(ap[j], wv[j], s0);
+                    for (int j = 4; j < 8; ++j) s1 = xe::dp4a(ap[j], wv[j], s1);
+                    acc[i] += xsl[b * WM + rr] * (ws0 * (float) s0 + ws1 * (float) s1);
+                }
+            }
+        }
+        for (int i = 0; i < RPT; ++i) {
+            const int64_t row = m0 + rbase + i * RSTEP;
+            if (row < rows) dst[(int64_t) ids[row0 + row] * ld_dst + n0 + n] = acc[i];
+        }
+    }
+
     void operator()(sycl::nd_item<1> it) const {
-        if constexpr (!built<TY>()) {
+        if constexpr (DP4A) {
+            dp4a_body(it);
+        } else if constexpr (!built<TY>()) {
             (void) it;
         } else {
 #if STRATA_IQ_MMQ_MATRIX
@@ -531,14 +597,17 @@ struct Kernel {
 #endif
         }
     }
-    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>}; }
+    auto get(syclex::properties_tag) const {
+        if constexpr (DP4A) return syclex::properties{};   // no sub-group operations: the device's own size
+        else return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>};
+    }
 };
 
-template<int TY, int SGM, int NSGM>
+template<int TY, int SGM, int NSGM, bool DP4A>
 sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                    int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
                    int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst) {
-    using KT = Kernel<TY, SGM, NSGM>;
+    using KT = Kernel<TY, SGM, NSGM, DP4A>;
     const int64_t tiles_m = (max_rows + KT::WM - 1) / KT::WM, tiles_n = w_rows / KT::WN;
     const size_t row_bytes = (size_t) (w_cols / Dec<TY>::QK) * (size_t) Dec<TY>::BSZ;
     const auto* x8 = static_cast<const int8_t*>(xq);
@@ -556,12 +625,17 @@ template<int TY>
 sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                     int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
                     int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst) {
-#define STRATA_MMQ_LAUNCH(SGM, NSGM) \
-    launch<TY, SGM, NSGM>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, max_rows, ids, dst, \
-                          ld_dst)
-    if (max_rows <= 16) return STRATA_MMQ_LAUNCH(1, 1);
-    if (max_rows <= 32) return STRATA_MMQ_LAUNCH(2, 1);
-    return STRATA_MMQ_LAUNCH(2, 2);
+#define STRATA_MMQ_LAUNCH(SGM, NSGM, DP4A)                                                                    \
+    launch<TY, SGM, NSGM, DP4A>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, max_rows, \
+                                ids, dst, ld_dst)
+    if (!iq_mmq_usable(q)) {   // iq_mmq_grouped is called where one of the two forms runs
+        if (max_rows <= 16) return STRATA_MMQ_LAUNCH(1, 1, true);
+        if (max_rows <= 32) return STRATA_MMQ_LAUNCH(2, 1, true);
+        return STRATA_MMQ_LAUNCH(2, 2, true);
+    }
+    if (max_rows <= 16) return STRATA_MMQ_LAUNCH(1, 1, false);
+    if (max_rows <= 32) return STRATA_MMQ_LAUNCH(2, 1, false);
+    return STRATA_MMQ_LAUNCH(2, 2, false);
 #undef STRATA_MMQ_LAUNCH
 }
 
@@ -654,6 +728,16 @@ bool iq_mmq_usable(sycl::queue& q) {
         if (!res) std::fprintf(stderr, "strata: the GPU's int8 and FP32 accumulators differ in layout: the experts' "
                                "prompt products stay in FP16\n");
         return res == 1;
+    });
+}
+
+bool iq_mmq_dp4a_usable(sycl::queue& q) {
+    static core::PerDevice<bool> per_device;
+    return per_device.get(q.get_device(), [&q] {
+        const sycl::device d = q.get_device();
+        using Big = Kernel<16, 2, 2, true>;
+        return d.get_info<sycl::info::device::local_mem_size>() >= (size_t) Big::LOCAL &&
+               d.get_info<sycl::info::device::max_work_group_size>() >= (size_t) Big::NSG * SG;
     });
 }
 
