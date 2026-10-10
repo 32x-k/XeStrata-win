@@ -134,8 +134,20 @@ int native_gu_mt_min(int gu_type) {
     // keeps its rule.
     static const bool avx2_one = env == nullptr && cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr &&
                                  !cpu_avx512_ok();
-    return avx2_one && gu_type != 16 ? 1 : mt_min;   // 16: IQ2_XXS
+    // The K-quants and Q8_0 (kq256_* / q80_256_*) share only the unpacking between tokens: one token keeps ggml-cpu's
+    // dot until a measurement says otherwise.
+    return avx2_one && iq256_supported(gu_type) && gu_type != 16 ? 1 : mt_min;   // 16: IQ2_XXS
 }
+
+namespace {
+// The K-quants (Q4_K, Q5_K, Q6_K) and Q8_0 of the other models' experts on the AVX-2 multi-token kernels (iq_avx2.cpp,
+// the AVX-VNNI copy where the CPU has it): every CPU with AVX2, AVX-512 ones too (ggml-cpu's dots for these are
+// single-token there as well).  STRATA_NO_KQ256=1: ggml-cpu's dot for every token count.
+bool kq_on(int type) {
+    static const bool on = cpu_avx2_ok() && std::getenv("STRATA_NO_KQ256") == nullptr;
+    return on && (kq256_supported(type) || type == (int) GGML_TYPE_Q8_0);
+}
+}  // namespace
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
@@ -165,6 +177,11 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             return;
         }
     }
+    if (nt >= mt_min && kq_on(f.gu_type)) {
+        if (f.gu_type == (int) GGML_TYPE_Q8_0) q80_256_gu_rows(blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        else kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        return;
+    }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const int n = (int) f.n_embd;
     for (int r = r0; r < r1; ++r) {
@@ -187,6 +204,11 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     static const int mt_min = [] { const char* e = std::getenv("STRATA_IQ_MT_MIN"); return e ? (int) std::strtol(e, nullptr, 10) : 2; }();
     if (nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
+    if (nt >= mt_min && kq_on(f.d_type)) {   // the K-quant and Q8_0 down rows: the same rule
+        if (f.d_type == (int) GGML_TYPE_Q8_0) q80_256_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        else kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
