@@ -412,7 +412,7 @@ if(STRATA_ENABLE_XE)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/verify.cpp src/core/moe_window.cpp
-                                   src/core/plain_model.cpp src/core/mtp.cpp
+                                   src/core/plain_model.cpp src/core/pcie_split.cpp src/core/mtp.cpp
                                    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/vmm.cpp)
