@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class QueueKeepAlive(unittest.TestCase):
     def setUp(self):
         tok = ByteTokenizer()
-        self.svc = Service(MockEngine(tok, "ok"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc = Service(MockEngine(tok, "ok"), tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
         self.httpd = serve(self.svc, port=0)
         self.addCleanup(self.httpd.server_close)
         self.addCleanup(self.httpd.shutdown)

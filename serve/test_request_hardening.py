@@ -24,7 +24,7 @@ class Hardening(unittest.TestCase):
     def setUpClass(cls):
         tok = ByteTokenizer()
         cls.svc = Service(MockEngine(tok, "hello there", max_context=4096), tok,
-                          ChatTemplate(ROOT / "serve/chat_template.jinja"))
+                          ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
         cls.httpd = serve(cls.svc, port=0)
         cls.port = cls.httpd.server_address[1]
 

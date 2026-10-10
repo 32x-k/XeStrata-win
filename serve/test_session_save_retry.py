@@ -198,7 +198,7 @@ class HTTP(unittest.TestCase):
         self.engine = FakeEngine()
         self.engine.session_save_reclaim = True
         self.engine.proc = AdmissionProc(self.engine)
-        self.svc = Service(self.engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        self.svc = Service(self.engine, tok, ChatTemplate(Path(__file__).parent / "test_chat_template.jinja"))
         self.svc.slot_save_path = self.directory.name
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"

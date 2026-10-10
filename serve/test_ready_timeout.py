@@ -68,7 +68,7 @@ class ReadyTimeout(unittest.TestCase):
     def service(self, script, extra_args=()):
         eng = StrataEngine(script, list(extra_args), lazy=True)
         self.addCleanup(eng.close)
-        return Service(eng, ByteTokenizer(), ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        return Service(eng, ByteTokenizer(), ChatTemplate(Path(__file__).parent / "test_chat_template.jinja"))
 
     def post(self, base):
         body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8}

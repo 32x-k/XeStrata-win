@@ -26,7 +26,7 @@ class ContextOverflow(unittest.TestCase):
     def setUpClass(cls):
         tok = ByteTokenizer()
         cls.engine = MockEngine(tok, "ok", max_context=CTX)
-        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
         cls.httpd = serve(cls.svc, port=0)
         cls.port = cls.httpd.server_address[1]
 

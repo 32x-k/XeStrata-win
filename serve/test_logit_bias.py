@@ -66,7 +66,7 @@ class LogitBias(unittest.TestCase):
     def test_http_rejects_before_stream(self):
         tok = ByteTokenizer()
         engine = MockEngine(tok, "ok", max_context=4096)
-        service = Service(engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        service = Service(engine, tok, ChatTemplate(Path(__file__).parent / "test_chat_template.jinja"))
         httpd = serve(service, port=0)
         try:
             for bias in [True, {"1": -100}, [[1, True]]]:

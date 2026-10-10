@@ -85,7 +85,7 @@ class UnreadContentParts(unittest.TestCase):
     and messages used to drop it without a word, and the model answered about a file it had never seen."""
 
     def setUp(self):
-        self.template = ChatTemplate(Path(__file__).with_name("chat_template.jinja"))
+        self.template = ChatTemplate(Path(__file__).with_name("test_chat_template.jinja"))
         tok = ByteTokenizer()
         self.service = Service(MockEngine(tok, "ok"), tok, self.template)
 

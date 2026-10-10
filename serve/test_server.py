@@ -1853,7 +1853,7 @@ class PrometheusMetrics(unittest.TestCase):
         engine = DoneLineEngine(tok, "</think>\n\nok", max_context=CTX, done_lines=[
             "DONE 4 20 400.0 200.0 stop 7 12 5",                # 5 of the prompt's tokens reused
             "DONE 4 20 400.0 200.0 stop 3 5 0"])
-        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         try:
@@ -2146,7 +2146,7 @@ class HeldBackArgKeepalive(unittest.TestCase):
         # a call inside the thinking is held whole until </tool_call> (the frontend's rcall state): every token
         # after the opener produces no stream event - the same silence a long array argument makes
         svc = Service(HeldEngine(tok, "<tool_call><function=f>" + "x" * 30, max_context=CTX), tok,
-                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
         with mock.patch("serve.server.time.perf_counter", lambda: clock[0]):
             kinds = [k for k, _ in svc.run(tok.encode("hi"), True, self.TOOLS, 60, {}, threading.Event())]
         self.assertIn("ping", kinds)
@@ -2155,7 +2155,7 @@ class HeldBackArgKeepalive(unittest.TestCase):
     def test_an_ordinary_answer_does_not_ping(self):
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, "ok", max_context=CTX), tok,
-                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
         kinds = [k for k, _ in svc.run(tok.encode("hi"), False, None, 10, {}, threading.Event())]
         self.assertNotIn("ping", kinds)
         self.assertIn("done", kinds)
@@ -2366,7 +2366,8 @@ class ConfigReasoningEffort(unittest.TestCase):
 
     def svc(self, effort=None, shared=None):
         tok = ByteTokenizer()
-        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
         svc.config_effort = effort
         svc.shared = shared or {}
         return svc
