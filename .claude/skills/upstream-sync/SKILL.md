@@ -162,7 +162,7 @@ python .claude/skills/upstream-sync/scripts/sync_collect.py $o/IQ3_XXS xe-<commi
 ```
 
 Each run is one chat of four turns: the tier's prompt, then the three follow-ups of `sync_prompts.py`, each sent with the answer before it, as a chat client sends them; 256 tokens a turn.
-It measures the prompt (the first turn), the follow-ups (the tokens they read over their prompt time; the conversation checkpoints) and the output (all four turns), greedy and at temperature 0.7, three rounds each, the engines alternating.
+It measures the prompt (the first turn), the follow-ups (the median time a follow-up's prompt takes: the wait before its answer, which the conversation checkpoints decide) and the output (all four turns), greedy and at temperature 0.7, three rounds each, the engines alternating.
 Each engine writes its own text, so the drafts it accepts count in its output speed, as they do for a user.
 The wrapper commands in `XE` and `UP` must pass stdin through (`docker run -i` for upstream's `sycl/` image).
 
@@ -193,7 +193,7 @@ python .claude/skills/upstream-sync/scripts/judge.py --prompt-only B70 $o/IQ3_XX
 ```
 
 A cell (file, GPU, tier, prompt or output) passes when XeStrata's median is at most 1% below upstream's.
-The serve cells (GPU, tier, greedy or t07; prompt, follow-ups, output), read from `matrix-serve.json`, and the everyday cells (GPU, conversation; first token, prompt, output), read from `matrix-usage.json`, pass at most `SERVE_LIMIT` (`judge.py`) below upstream's: each engine writes its own text there, so the speeds vary with the text from round to round, and the limit comes from that spread (the rounds' seeds differ). Running XeStrata against itself shows nothing: with the same seed both write the same text at the same speed.
+The serve cells (GPU, tier, greedy or t07; prompt, follow-ups, output), read from `matrix-serve.json`, and the everyday cells (GPU, conversation; first token, prompt, output), read from `matrix-usage.json`, pass at most `SERVE_LIMIT` (`judge.py`, 5%) below upstream's, the prompt speed at 1%: each engine writes its own text there, so the other measures vary with the text from round to round (the rounds' seeds differ), up to 10% off a cell's median at temperature 0.7 on 2026-10-10. Running XeStrata against itself shows nothing: with the same seed both write the same text at the same speed.
 A cell upstream does not finish, finishes at 10 tok/s or less, or is stopped as that slow, is left out; one only XeStrata does not finish fails.
 A file whose experts do not fit in a machine's RAM budget, so that they are read from the SSD while it answers (SSD offload: UD-Q4_K_XL on the AMD container's 62 GB), is not run on that machine (the user's decision of 2026-10-09): as for GPUs there is no machine for (step 4), its paths are checked by the tests and the builds only, and the record lists its cells `unverified`.
 The B70's output cells are left out (`--prompt-only B70`, the user's decision of 2026-10-09): upstream's `sycl/` port reads the experts that do not fit in VRAM over PCIe from its kernels, a few tok/s, which says nothing about XeStrata's speed.

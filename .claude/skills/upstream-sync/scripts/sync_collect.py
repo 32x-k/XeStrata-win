@@ -5,7 +5,8 @@
 stdout.  An upstream run bench.sh stopped as too slow has "stopped" (prompt or output); one stopped in its output
 takes its prompt rate from the last PP line (or, without PP lines, from its "strata generate: prefill" line).
 When bench_serve.py ran too, OUT/serve-runs/*.json go to OUT/matrix-serve.json and three more tables per GPU and mode:
-the tier's prompt, the follow-ups (the tokens they read over their prompt time) and the output of all four turns.
+the tier's prompt, the follow-ups (the median time a follow-up's prompt takes, in ms) and the output of all four
+turns.
 When bench_usage.py ran too, OUT/usage-runs/*.json go to OUT/matrix-usage.json and a table per GPU: per conversation,
 the time to the first token (the median of its turns), the prompt and the output speed (the server's timings, summed).
 
@@ -75,7 +76,8 @@ for f in sorted((out / "serve-runs").glob("*.json")):
         "gpu": r["gpu"], "arm": r["arm"], "engine": NAMES[r["arm"]], "tier": r["tier"], "mode": r["mode"],
         "round": r["round"],
         "prefill_tok_s": rate(t[0]["read"], t[0]["prompt_ms"]) if t else None,
-        "cont_tok_s": rate(sum(x["read"] for x in t[1:]), sum(x["prompt_ms"] for x in t[1:])) if whole else None,
+        # the wait before a follow-up's answer: a rate would reward reading more (a missed checkpoint reads in a batch)
+        "cont_ms": statistics.median(x["prompt_ms"] for x in t[1:]) if whole else None,
         "decode_tok_s": rate(sum(x["generated"] for x in t), sum(x["decode_ms"] for x in t)) if whole else None,
         "spec_accept": (sum(x["accepted"] for x in t) / max(sum(x["offered"] for x in t), 1)) if whole else None,
         "stopped": (r["why"] or "").removeprefix("stopped: ") if (r["why"] or "").startswith("stopped") else None,
@@ -86,7 +88,7 @@ if serve:
     for gpu in sorted({r["gpu"] for r in serve}):
         for mode in sorted({r["mode"] for r in serve}):
             for key, title, fmt in (("prefill_tok_s", "Prompt (tokens/s)", "{:,.0f}"),
-                                    ("cont_tok_s", "Follow-ups (tokens/s)", "{:,.0f}"),
+                                    ("cont_ms", "Follow-ups (ms)", "{:,.0f}"),
                                     ("decode_tok_s", "Output (tokens/s)", "{:.1f}")):
                 print(f"\n### {gpu} serve {mode}: {title}\n\n| Engine | " + " | ".join(t.upper() for t in tiers) + " |")
                 print("| --- |" + " ---: |" * len(tiers))

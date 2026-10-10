@@ -3,11 +3,11 @@
 """Judges XeStrata against upstream from sync_collect.py's matrix.json files: per model file, GPU, tier and
 measure (prompt, output), the median of each engine's rounds; a cell passes when XeStrata is at most 1% slower.
 One folder per model file.  A folder with a matrix-serve.json (bench_serve.py) is judged on the serve path too: per
-GPU, tier and mode, the prompt, the follow-ups and the output, a cell passing when XeStrata is at most SERVE_LIMIT
-slower (each engine writes its own text there, so the drafts accepted vary from round to round: the limit comes
-from that spread).  A folder with a matrix-usage.json (bench_usage.py) is judged on everyday use too: per GPU
-and conversation, the time to the first token (lower is better), the prompt and the output, with the same
-SERVE_LIMIT.
+GPU, tier and mode, the prompt, the follow-ups' prompt time (lower is better) and the output.  A folder with a
+matrix-usage.json (bench_usage.py) is judged on everyday use too: per GPU and conversation, the time to the first
+token (lower is better), the prompt and the output.  There each engine writes its own text, so all but the prompt
+speed move with it from round to round: those cells pass when XeStrata is at most SERVE_LIMIT worse, the prompt
+still at 1%.
 
     python .claude/skills/upstream-sync/scripts/judge.py [--prompt-only GPU]... OUT/IQ3_XXS OUT/IQ2_XS ...
 
@@ -22,13 +22,16 @@ import statistics
 import sys
 
 LIMIT = -0.01
-SERVE_LIMIT = -0.01
+# serve and everyday use, the measures that move with the text (each engine writes its own): on the B70 and the
+# RX 9060 XT (2026-10-10) a round sat up to 10% off its cell's median at temperature 0.7, 1.5% greedy.  Their
+# prompt speed does not move with the text (under 1%) and keeps LIMIT.
+SERVE_LIMIT = -0.05
 SLOW = 10.0                                   # tok/s: upstream this slow is not a speed to compare with
 TIERS = ["1k", "4k", "32k", "64k", "128k", "192k", "262k"]
 MEASURES = (("prefill_tok_s", "prompt"), ("decode_tok_s", "output"))
-SERVE_MEASURES = (("prefill_tok_s", "prompt"), ("cont_tok_s", "follow"), ("decode_tok_s", "output"))
+SERVE_MEASURES = (("prefill_tok_s", "prompt"), ("cont_ms", "follow"), ("decode_tok_s", "output"))
 USAGE_MEASURES = (("ttft_s", "first"), ("prefill_tok_s", "prompt"), ("decode_tok_s", "output"))
-LOWER_BETTER = {"ttft_s"}
+LOWER_BETTER = {"ttft_s", "cont_ms"}
 
 
 def median(rows, key):
@@ -92,9 +95,9 @@ for folder, _ in matrices:
             else:
                 judged += 1
                 d = up / xe - 1 if key in LOWER_BETTER else xe / up - 1
-                ok = d >= limit
+                ok = d >= (LIMIT if key == "prefill_tok_s" else limit)
                 fails += not ok
-                n = 2 if key in LOWER_BETTER else 1
+                n = {"ttft_s": 2, "cont_ms": 0}.get(key, 1)
                 print(f"{where} {'PASS' if ok else 'FAIL'}  {xe:.{n}f} vs {up:.{n}f} ({100 * d:+.1f}%)")
 fails += judged == 0                          # nothing measured is no win
 print("ALL PASS" if fails == 0 else f"FAIL {fails}")
