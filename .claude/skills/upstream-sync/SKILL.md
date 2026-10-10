@@ -1,6 +1,6 @@
 ---
 name: upstream-sync
-description: Bring upstream Strata's newest release tag into XeStrata on dev - read its commits as ideas, merge, port each idea to the SYCL paths and keep it where an A/B of its switch shows it faster (whether XeStrata already wins there or not), take output-changing approximations by upstream's own quality check, build and test the free and contrib-llvm modes - and end with XeStrata at least as fast as that tag (at most 1% slower) and as the previous XeStrata on the Intel, NVIDIA and AMD GPUs, on the generate path, the serve path and everyday use. Only when the user asks (/upstream-sync).
+description: Bring upstream Strata's newest release tag into XeStrata on dev - read its commits as ideas, port the shared changes and each idea to the SYCL paths and keep it where an A/B of its switch shows it faster (whether XeStrata already wins there or not), take output-changing approximations by upstream's own quality check, build and test the free and contrib-llvm modes - and end with XeStrata at least as fast as that tag (at most 1% slower) and as the previous XeStrata on the Intel, NVIDIA and AMD GPUs, on the generate path, the serve path and everyday use. Only when the user asks (/upstream-sync).
 disable-model-invocation: true
 argument-hint: "[upstream TAG, e.g. v0.1.42]"
 ---
@@ -34,7 +34,7 @@ grep -n STRATA_UPSTREAM_VERSION CMakeLists.txt
 git tag -l 'xe*' | sort -V | tail -n 1    # the previous XeStrata (step 8)
 ```
 
-The previous integration is the merge `upstream の Strata <version> を Xe に統合する`, or its last commit, which records the tag as its second parent (step 9); its upstream parent is the last upstream commit `dev` has (`git log --merges --first-parent --format='%h %p %s' dev`).
+The previous integration is the last commit of its run, which records the tag as its second parent and keeps the tree (step 9; `upstream の Strata <version> を Xe に統合する` before 2026-10-11); that parent is the last upstream commit `dev` has (`git log --merges --first-parent --format='%h %p %s' dev`).
 upstream rewrote its history on 2026-10-06, so `git merge-base dev upstream/main` can be empty: the base is that parent (or, for history before it, its rewritten counterpart).
 When the tag is already integrated, go to step 7.
 
@@ -53,8 +53,8 @@ Write `.upstream-<version>.md` (add it to `.git/info/exclude`, as `.upstream-014
 | M | several GPUs | all |
 | N | NVIDIA, every generation (Pascal, Volta, Turing included) | as ideas (below) |
 | P | speed paths | as ideas (below) |
-| S | upstream's `sycl/` | not taken: it stays deleted in the merge and is measured as a competitor (step 7) |
-| T | serve, setup, tools | the merge |
+| S | upstream's `sycl/` | not taken: measured as a competitor (step 7) |
+| T | serve, setup, tools | ported (step 3) |
 | W | Windows | not taken |
 
 Each line ends with what became of it: the idea it belongs to, a commit, or `N/A` and why.
@@ -69,23 +69,23 @@ For each idea:
 | Where it is on | upstream's condition (CUDA only, not HIP, single GPU, an architecture, a size) and why: measured only there, or true only there (an instruction, a library, a hardware limit); from the commit messages, the code and upstream's records |
 | Where it works | the setting it is for (a tier, the serve path's output, the follow-ups, a model file, experts that do not fit in VRAM) and upstream's measurement |
 | Output | exact, or changes the output (step 5) |
-| In XeStrata | taken in the merge (shared code), to port, or not applicable and why |
+| In XeStrata | to port (shared code, step 3; a speed path, step 4), or not applicable and why |
 | Result | step 4's and 5's numbers and what was kept |
 
 A condition measured only on upstream's GPUs is not a reason to keep it: step 4 measures the idea on XeStrata's GPUs and puts its own condition, from what the device reports.
-A host-side policy usually comes in with the merge but behind upstream's backend condition (`#if` on CUDA, a check of the backend): it is an idea to port all the same.
+A host-side policy upstream keeps behind its backend (`#if` on CUDA, a check of the backend) is ported without that condition, under XeStrata's own (step 4).
 
 **The findings.** upstream's records and community reports of this range (`bench/`, its investigation documents) said something about a GPU or a setting XeStrata runs on (an Intel Arc investigation, a card's bottleneck, a setting users run): a line each, with what XeStrata could take from it. They are worked like ideas in step 4 when they point at something to try.
 
-## 3. The merge
+## 3. Port the shared changes
 
-```sh
-tree=$(git merge-tree --write-tree --merge-base=<base> dev <tag>)   # resolve the conflicts it reports
-git commit-tree -p dev -p <tag> -m "upstream の Strata <version> を Xe に統合する" <tree>
-```
+XeStrata's sources have moved far from upstream's (its own SYCL kernels, prompt path and runtime), so the tag is not merged file by file: every change taken is ported by hand onto `dev`, and the tag is recorded at the end, by a commit that keeps the tree as it is (step 9), as c3aa33ae (v0.1.40.2) and 0509e3e6 did.
 
-`sycl/` and the CUDA and HIP sources stay deleted (modify/delete conflicts are taken as deletes); their changes are ported by hand in step 4.
-Set `STRATA_UPSTREAM_VERSION` in `CMakeLists.txt` and `XESTRATA_REVISION` back to 1 (AGENTS.md, "Versions"), and replace any old upstream hash a document names with the rewritten one.
+- One commit per upstream change, or per idea (step 2), with upstream's hashes in the message: `... （upstream 1e6cec80、e57c9072）`.
+- Groups E, M and T, and the parts of A, N and P that are shared code, are ported here or in step 4; `sycl/`, the CUDA and HIP sources, the HIP tables and the Windows parts are not taken.
+- Each ledger line gets the commit that took it, or `N/A` and why (the code is not in XeStrata, or XeStrata does it another way).
+- The documents XeStrata has (Japanese first) get what is true of XeStrata; upstream's new documents are not copied as files.
+- Once the ledger is done, set `STRATA_UPSTREAM_VERSION` in `CMakeLists.txt` to the tag and `XESTRATA_REVISION` back to 1 (AGENTS.md, "Versions"), and replace any old upstream hash a document names with the rewritten one.
 
 ## 4. Port each idea and measure it
 
@@ -192,7 +192,7 @@ On `dev`:
 - `$o/README.md`: the machines, both engines' commits and builds, the method, the tables (`sync_collect.py`), the check's output (against the tag and the previous XeStrata), what the numbers say, and the GPUs skipped; `matrix.json` and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>`. The ideas with step 4's and 5's numbers (kept, opt-in and removed) go into the same record.
 - docs/XE.ja.md, then docs/XE.md: the upstream version and range brought in, what was not taken and why, the approximations on by default and their switches, linking the record.
 
-Lint, and commit the record as the run's last commit, with the tag as its second parent (as 1f39304b records v0.1.41), so `dev`'s history shows where the run ended:
+Lint, and commit the record as the run's last commit, with the tag as its second parent and the tree unchanged (as c3aa33ae records v0.1.40.2), so `dev`'s history shows where the run ended:
 
 ```sh
 git add <the record and the documents> && tree=$(git write-tree) && \
