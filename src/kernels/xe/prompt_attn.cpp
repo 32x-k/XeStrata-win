@@ -16,7 +16,7 @@ constexpr int NT = 256;   // work-items a work-group
 
 // the device's own conversion (f16_bits.hpp's exact one branches and loops: in the inner loops it took most of the
 // time); the pools hold no subnormals worth the difference
-inline float h2f(uint16_t bits) { return (float) sycl::bit_cast<sycl::half>(bits); }
+[[maybe_unused]] inline float h2f(uint16_t bits) { return (float) sycl::bit_cast<sycl::half>(bits); }
 
 // BQ queries of one KV head: R = BQ x G rows (query, head), Q in local memory as FP32 (scaled), the step's BK cells of
 // K and V as FP16, the step's scores (then probabilities) per row.  Work-item t owns column d = t % HD of rows t / HD,
@@ -25,6 +25,7 @@ inline float h2f(uint16_t bits) { return (float) sycl::bit_cast<sycl::half>(bits
 template <int HD, int G, int BQ, int BK>
 struct Kernel {
     static constexpr int R = BQ * G, RS = NT / HD, OPT = R / RS, QS = HD + 1, KS = HD + 2;
+    static constexpr int SG = NT / BK, SR = (R + SG - 1) / SG;   // the scores: row groups, rows a work-item
     static_assert(NT % HD == 0 && R % RS == 0, "the output columns and rows split evenly");
     const float* q;
     const uint16_t* kp;
@@ -76,15 +77,24 @@ struct Kernel {
                 V[i] = vv;
             }
             sycl::group_barrier(it.get_group());
-            for (int i = t; i < R * BK; i += NT) {   // scores, masked past each row's own position
-                const int r = i / BK, j = i - r * BK;
-                const int64_t c = c0 + j, qpos = pos0 + qbase + r / G;
-                float s = -std::numeric_limits<float>::infinity();
-                if (c <= qpos && c < n_cells) {
-                    s = 0.0f;
-                    for (int dd = 0; dd < HD; ++dd) s = sycl::fma(Q[r * QS + dd], h2f(K[j * KS + dd]), s);
+            {   // scores, masked past each row's own position: work-item t takes cell t % BK of rows t / BK,
+                // + NT / BK, ...: neighbouring work-items read neighbouring K rows and the same Q row, each K value
+                // read once for its rows
+                const int j = t % BK, rg = t / BK;
+                const int64_t c = c0 + j;
+                float acc[SR];
+                for (int k = 0; k < SR; ++k) acc[k] = 0.0f;
+                for (int dd = 0; dd < HD; ++dd) {
+                    const float kv = h2f(K[j * KS + dd]);
+                    for (int k = 0; k < SR; ++k)
+                        if (rg + k * SG < R) acc[k] = sycl::fma(Q[(rg + k * SG) * QS + dd], kv, acc[k]);
                 }
-                S[i] = s;
+                for (int k = 0; k < SR; ++k) {
+                    const int r = rg + k * SG;
+                    if (r >= R) break;
+                    const int64_t qpos = pos0 + qbase + r / G;
+                    S[r * BK + j] = c <= qpos && c < n_cells ? acc[k] : -std::numeric_limits<float>::infinity();
+                }
             }
             sycl::group_barrier(it.get_group());
             if (t < R) {   // the row's online softmax: its new maximum, the old sum's factor, the step's probabilities
