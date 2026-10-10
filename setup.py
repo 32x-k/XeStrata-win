@@ -1216,8 +1216,17 @@ def get_llama_cpp():
     download(LLAMA_CPP_ZIP, z, "llama.cpp source")
     tmp = ROOT / "third_party" / "main" / "_unpack"
     shutil.rmtree(tmp, ignore_errors=True)
-    with zipfile.ZipFile(z) as f:
-        f.extractall(tmp)
+    try:
+        with zipfile.ZipFile(z) as f:
+            f.extractall(tmp)
+    except zipfile.BadZipFile:
+        # upstream #1797: do not let the .done mark make every later run reuse a damaged source archive.
+        try:
+            z.unlink(missing_ok=True)
+            z.with_name(z.name + ".done").unlink(missing_ok=True)
+        except OSError as e:
+            warn(f"cannot remove damaged {z.name} ({e}): delete it and its .done mark before running setup again")
+        raise
     top = next(tmp.iterdir())
     if llama.exists():
         shutil.rmtree(llama)
