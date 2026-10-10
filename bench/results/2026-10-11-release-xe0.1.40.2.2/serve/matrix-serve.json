@@ -1,0 +1,54 @@
+[
+ {
+  "gpu": "RX9060XT",
+  "arm": "up",
+  "engine": "v0.1.42",
+  "tier": "32k",
+  "mode": "t07",
+  "round": 1,
+  "prefill_tok_s": 382.35678881346576,
+  "cont_ms": 393.7,
+  "decode_tok_s": 41.91031193246453,
+  "spec_accept": 0.753315649867374,
+  "stopped": null
+ },
+ {
+  "gpu": "RX9060XT",
+  "arm": "up",
+  "engine": "v0.1.42",
+  "tier": "32k",
+  "mode": "t07",
+  "round": 2,
+  "prefill_tok_s": 380.2271292767421,
+  "cont_ms": 477.3,
+  "decode_tok_s": 38.84968682395316,
+  "spec_accept": 0.6296875,
+  "stopped": null
+ },
+ {
+  "gpu": "RX9060XT",
+  "arm": "xe",
+  "engine": "xe0.1.40.2.2",
+  "tier": "32k",
+  "mode": "t07",
+  "round": 1,
+  "prefill_tok_s": 834.9048743781061,
+  "cont_ms": 466.9,
+  "decode_tok_s": 39.932898143758436,
+  "spec_accept": 0.6531165311653117,
+  "stopped": null
+ },
+ {
+  "gpu": "RX9060XT",
+  "arm": "xe",
+  "engine": "xe0.1.40.2.2",
+  "tier": "32k",
+  "mode": "t07",
+  "round": 2,
+  "prefill_tok_s": 837.4454808824935,
+  "cont_ms": 589.7,
+  "decode_tok_s": 25.79971129843926,
+  "spec_accept": 0.6730769230769231,
+  "stopped": null
+ }
+]
