@@ -20,6 +20,9 @@ GPU は Intel Arc、AMD Radeon（RDNA2 以降）、NVIDIA のどれかを 1 枚�
 
 ## XeStrata とは
 
+CUDA で書いたソフトウェアは NVIDIA の GPU でしか動かず、使う人は 1 社の GPU に縛られます。
+XeStrata は、オープンな標準の SYCL で書いた 1 つのコードで、Intel・AMD・NVIDIA のどの GPU でも動くことを目指します。
+
 [Strata](https://github.com/Niko1221/Strata)（NVIDIA の GPU 向け）を、Intel の GPU に移したものです。
 GPU の計算を CUDA から SYCL と Level Zero に書き直し、Intel の GPU で動くようにしました。
 同じコードを、AMD の GPU 向け（free と contrib-llvm のビルド）と NVIDIA の GPU 向け（contrib-llvm のビルド）にもコンパイルします。
@@ -154,7 +157,9 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
 **ログインしている間ずっと動かす**: `systemctl --user enable --now xestrata` で、最後に設定したモデルを起動しておきます
 （ブラウザは開きません）。先に `xestrata` で一度設定しておきます。
 
-**更新**: `sudo apt upgrade` か `sudo dnf upgrade` で更新します。モデルの設定は次の起動で更新します。
+**更新**: 新しいリリースが出ると、起動したときと、動いている間は 6 時間ごとに調べて、端末とチャットのページの About に表示します（`xestrata --check-update` でも調べられます）。
+新しいパッケージを [Releases](https://github.com/MistVVK/XeStrata/releases) から取ってきて、インストールと同じく `sudo apt install ./<ファイル>.deb` か `sudo dnf install ./<ファイル>.rpm` で入れます。
+モデルの設定は次の起動で更新します。
 
 **自分の PC に合わせる**: `xestrata --calibrate` は、エンジンの設定のいくつかをこの PC で測り、速いものを残します
 （5〜10 分ほど）。
@@ -270,6 +275,10 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 - **速さの測り方**: `xestrata --bench`、upstream 追従の計測、リリースの表の測り方は [docs/BENCH.ja.md](docs/BENCH.ja.md) にあります。
 - **守ること**: 機器に依存しないこと（GPU と CPU が報告する能力で経路を選ぶ）、リント（`tools/lint/run.sh`）、
   テストの実行、ライセンスの表示は [AGENTS.md](AGENTS.md) にまとめてあります。
+- **取り込む変更**: 誰が書いたものでも（自分のコミット、プルリクエスト、upstream からの移植）、intel/llvm の free と contrib-llvm の両方式でビルドと試験をしたもので、
+  機器への依存ができるだけ少ないもの（CUDA などメーカーの API に頼らない、1 枚のカードで測った値を決め打ちしない）だけを入れます。
+  そうでないものはそのままは入れず、参考にして XeStrata のコードとして書き直します（[AGENTS.md](AGENTS.md#what-goes-in)）。
+  プルリクエストには、ビルドした方式（free、contrib-llvm、contrib-icpx）と、動かした GPU と CPU を書き、確かめていないことには `unverified` と付けてください。
 - **upstream の取り込み**: Strata 0.1.40.2 までの変更を、Windows の実装を除いて Xe に移しています。
   速くするための経路は、B70・RTX 4070・RX 9060 XT で測って速くなったものを移します（[docs/XE.ja.md](docs/XE.ja.md#strata-0140-の取り込み)）。
 - **README と docs**: 日本語版（README.ja.md、docs/*.ja.md）を先に書き、英語版（README.md、docs/*.md）はその訳です。

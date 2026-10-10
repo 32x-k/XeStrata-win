@@ -20,6 +20,9 @@ It is free software, and on an Intel or AMD GPU it also builds and runs with fre
 
 ## About XeStrata
 
+Software written in CUDA runs only on NVIDIA's GPUs, which ties its users to one maker's hardware.
+XeStrata aims to run on Intel, AMD and NVIDIA GPUs alike, from one code base written in SYCL, an open standard.
+
 A port of [Strata](https://github.com/Niko1221/Strata) (for NVIDIA GPUs) to Intel GPUs.
 Its GPU code is rewritten from CUDA to SYCL and Level Zero, so that it runs on Intel's GPUs.
 The same code is compiled for AMD GPUs (the free and contrib-llvm builds) and NVIDIA GPUs (the contrib-llvm build) as well.
@@ -159,7 +162,10 @@ In `xestrata --setup`'s questions, pressing Enter takes the recommended choice.
 **Running it while you are logged in:** `systemctl --user enable --now xestrata` keeps the model set up last running
 (no browser opens). Set it up with `xestrata` once first.
 
-**Updating:** `sudo apt upgrade` or `sudo dnf upgrade`. The model's settings are updated at the next start.
+**Updating:** when a new release is out, XeStrata says so in its window and on the chat page's About tab (it checks
+at the start and every six hours while it runs; `xestrata --check-update` checks now). Download the new package from
+[Releases](https://github.com/MistVVK/XeStrata/releases) and install it as before, with `sudo apt install ./<file>.deb`
+or `sudo dnf install ./<file>.rpm`. The model's settings are updated at the next start.
 
 **Fitting it to your PC:** `xestrata --calibrate` measures some of the engine's settings on this PC and keeps the
 fastest (about 5-10 minutes).
@@ -281,6 +287,12 @@ what has been checked in [docs/XE.md](docs/XE.md).
 - **Measuring the speed:** `xestrata --bench`, the upstream merges' measurements and the release table are in [docs/BENCH.md](docs/BENCH.md).
 - **Rules:** [AGENTS.md](AGENTS.md) covers them: independence from the hardware (code paths chosen from what the GPU
   and CPU report), the lints (`tools/lint/run.sh`), the tests, and the license notices.
+- **What goes in:** whoever wrote it (the maintainer's commits, pull requests, ports from upstream), a change goes in only when
+  built and tested with intel/llvm in both the free and contrib-llvm modes, and depending on the hardware as little as it can
+  (no CUDA or other maker's API relied on, no value measured on one card hard-coded). Others do not go in as they are: they
+  are a reference, written again as XeStrata's code ([AGENTS.md](AGENTS.md#what-goes-in)).
+  A pull request says which modes it was built in (free, contrib-llvm, contrib-icpx) and on which GPUs and CPUs it ran,
+  and marks what was not checked `unverified`.
 - **Upstream integration:** the changes of Strata up to 0.1.40.2 are carried into Xe, except the Windows
   implementation. Of the paths meant to be faster, those measured faster on the B70, the RTX 4070 or the RX 9060 XT
   are carried ([docs/XE.md](docs/XE.md#integration-through-strata-0140)).

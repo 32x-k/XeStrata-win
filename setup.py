@@ -30,7 +30,8 @@ Options: --family qwen|swift, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S, --context 32768
 answers, no questions), --setup (install another model / change settings instead of starting), --no-start,
 --host 0.0.0.0 --api-key KEY (reach it from other devices on your network), --experimental-speed-projection on|off
 (EXPERIMENTAL, off by default),
---models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --check (only check this PC).
+--models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --check (only check this PC), --check-update
+(whether a newer XeStrata release is out).
 
 Setup recommends, it never forces: the recommended answers are the defaults (--yes, or Enter), and a bigger choice
 than it recommends - a longer context, a size it thinks will not fit - is kept, with what it risks.  With --yes, an
@@ -58,6 +59,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Any, NoReturn
+
+from serve import release_check
 
 ROOT = Path(__file__).resolve().parent
 
@@ -2260,16 +2263,8 @@ def installed_configs():
 
 
 def source_version() -> str:
-    """The engine version the source tree builds (CMakeLists.txt's XESTRATA_VERSION: the upstream version, and the
-    release on it after the first)."""
-    if PACKAGED:
-        return str(PACKAGED.get("version", "0"))
-    text = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
-    m = re.search(r'set\(STRATA_UPSTREAM_VERSION "([\d.]+)"\)', text)
-    r = re.search(r"set\(XESTRATA_REVISION (\d+)\)", text)
-    if not m:
-        return "0"
-    return m.group(1) + (f".{int(r.group(1)) - 1}" if r and int(r.group(1)) > 1 else "")
+    """The engine version the source tree builds, or the package's (serve/release_check.py)."""
+    return release_check.current_version(ROOT)
 
 
 def engine_version(exe: Path) -> tuple:
@@ -2290,6 +2285,22 @@ def engine_version(exe: Path) -> tuple:
         except OSError:
             v = "0"
     return tuple(int(x) for x in v.split(".")[:3] if x.isdigit())
+
+
+def check_update() -> int:
+    """--check-update: this copy's version against GitHub's latest release; 1 when GitHub cannot be asked."""
+    current = source_version()
+    try:
+        latest = release_check.fetch_latest(current)
+    except (OSError, ValueError) as e:
+        say(f"This is XeStrata xe{current}. {release_check.error_text(e)}: see {release_check.RELEASES}")
+        return 1
+    if not release_check.is_newer(latest, current):
+        say(f"XeStrata xe{current} is up to date (the latest release is {latest['tag']}).")
+        return 0
+    say(f"XeStrata {latest['tag']} is out (this is xe{current}): {latest['url']}")
+    say(f"To update: {release_check.how_to_update(ROOT)}.")
+    return 0
 
 
 def hardware_key(cfg: dict) -> str:
@@ -2989,6 +3000,9 @@ def main() -> int:
                          "request then compiles it: ~30 s more)")
     ap.add_argument("--build", action="store_true", help=argparse.SUPPRESS)   # the engine is always compiled here
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
+    ap.add_argument("--check-update", action="store_true",
+                    help="ask GitHub whether a newer XeStrata release is out and exit (the server also asks at the "
+                         "start and every six hours; XESTRATA_UPDATE_CHECK=0 turns that off)")
     ap.add_argument("--packages", nargs="?", const="", metavar="DISTRO/MAKERS",
                     help="print the command that installs the distribution packages building from the source needs, "
                          "for the build mode (--license) and DISTRO/MAKERS, e.g. ubuntu26.04/intel,amd or "
@@ -3049,6 +3063,8 @@ def main() -> int:
         return print_packages(a.packages, a.license or "contrib")
     if a.remove_data:
         return remove_data()
+    if a.check_update:
+        return check_update()
     say("Strata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
     data, elsewhere = data_folder(a.data_dir)          # the model files: in the data folder, found from any copy
     roots = [data, *elsewhere]

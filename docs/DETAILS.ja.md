@@ -360,6 +360,10 @@ RAM に 23〜50 GB を読み込むのに時間がかかりますが、何もダ�
 git で取得したものなら `git pull` してから、エンジン、Python のパッケージ、モデルの設定を更新します（モデルは起動しません）。
 エンジンのソースが変わっていればコンパイルし直し、それに失敗したらそう言って、前のエンジンのままにします。
 
+**新しいリリースの確認**: サーバーは起動したときと、その後 6 時間ごとに GitHub に MistVVK/XeStrata の最新のリリースを問い合わせ、今のものより新しければ端末に 1 行出して、チャットのページの About に表示します。
+About の「Check now」と `./setup.sh --check-update`（パッケージでは `xestrata --check-update`）は、いつでもその場で調べます。
+環境変数 `XESTRATA_UPDATE_CHECK=0` で自動の確認を止めます（「Check now」と `--check-update` は使えます）。
+
 ### ほかのプログラムのために VRAM を空ける
 
 XeStrata は、GPU の空いている VRAM をエキスパートで埋め（エキスパートのキャッシュ）、`--vram-reserve-mib` MiB だけを空けておきます。

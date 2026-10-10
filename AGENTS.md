@@ -17,7 +17,7 @@ A GPU with matrix engines (XMX) takes the XMX paths; one without (an older Arc, 
 The contrib-llvm build (below) runs on NVIDIA GPUs as well, through the same kernels: their tensor cores take the matrix path that reads its tile shape from the device (`mma_gemm`), not Intel's.
 
 - Choose code paths from what the hardware reports: the CPUID feature bits (as `cpu_avx512_ok` does); the device's matrix combinations, sub-group sizes, GRF modes, local memory, memory size and largest allocation. Never from a vendor string, a model number, a device ID or a product name.
-- Sizes and thresholds measured on one machine (tile shapes, chunk sizes, ring slots, cache sizes, thread counts, memory reserves) are derived from those reports at run time, or have a fallback that works on a smaller device. A constant tuned on the B70 says so in a comment, with what it depends on.
+- Sizes and thresholds (tile shapes, chunk sizes, ring slots, cache sizes, thread counts, memory reserves, spin bounds) are not hard-coded, as far as they can be: they are derived from those reports at run time. A value that has to be measured is measured on the three makers' GPUs the maintainer has, the Arc Pro B70, the RTX 4070 and the RX 9060 XT, not on the B70 alone; it has a fallback that works on a smaller device, and a comment says where it was measured and what it depends on.
 - A feature some devices lack (XMX, large GRF mode, a SYCL extension) is checked before use, with a working fallback.
 - Check a change on a smaller configuration as well: on the B70 with `STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1` (the memory, the largest allocation and the matrix engines of a small card) and fewer CPU threads; at milestones also on the processor's own graphics (the UHD 770, a check only: start and a short answer). Mark what was not checked `unverified`.
 
@@ -50,6 +50,15 @@ Rules:
 - `third_party/nonfree/` (below) stays optional in every mode.
 - The model itself (Qwen3.8-Flash-Next) is excluded from these rules.
 - Non-free tools a developer runs by hand, such as Intel SDE below, are allowed as long as they are not bundled and neither the build nor the tests require them.
+
+## What goes in
+
+Every change goes in only on these two conditions, whoever writes it: the maintainer, a coding agent, a pull request, a port from upstream or another project.
+
+- It was built and tested with intel/llvm, in the free and contrib-llvm modes (above). intel/llvm is the compiler that reaches every GPU maker's devices: a change built only with icpx (the contrib-icpx mode), or not built, does not go in.
+- It depends on the hardware it was written on as little as it can (the first rule, above): not only no CUDA or other maker's API outside the paths only the contrib modes reach, but no value measured on one card (the B70's spin bounds or tile shapes, for example) hard-coded where it can be derived from what the device reports.
+
+A change that does not meet them, a pull request among others, does not go in as it is: it is a reference, and what it does is written again in XeStrata's code.
 
 ## Licenses
 
@@ -128,6 +137,8 @@ Work with the repository through `git`, not the GitHub CLI (`gh`), with these ex
 - closing and reopening issues: `gh issue close` and `gh issue reopen`.
 
 Do not create, comment on or edit issues and pull requests with `gh`.
+
+A pull request says which modes it was built in (free, contrib-llvm, contrib-icpx) and on which GPUs and CPUs it ran, and marks what was not checked `unverified`; one that does not is asked for it ([What goes in](#what-goes-in)).
 
 ## Packages
 
