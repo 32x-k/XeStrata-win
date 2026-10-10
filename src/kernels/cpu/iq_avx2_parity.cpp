@@ -85,6 +85,9 @@ void q2_rows_v(int, const uint8_t* w, size_t row_bytes, const cpu::ActQ* const* 
     cpu::q2_0_gguf_rows_multi_avx2(w, row_bytes, (int) (kFF / 64), a, nt, out, 0, (int) kH);
 }
 std::string variant_name(int) { return "dispatch"; }
+bool kq_type(int) { return false; }
+void kq_gu_v(int, int, const uint8_t*, size_t, size_t, const void* const*, int, float* const*) {}
+void kq_dn_v(int, int, const uint8_t*, size_t, const void* const*, int, float* const*) {}
 #else
 constexpr bool kVariants = true;
 int gu_variants() { return cpu::iq256_variants(); }
@@ -108,6 +111,17 @@ std::string variant_name(int v) {
     if (v & cpu::kIq256Gather) s += "gather";
     if (v & cpu::kIq256Vnni) s += s.empty() ? "vnni" : "+vnni";
     return s;
+}
+// the K-quants' and Q8_0's multi-token kernels (kq256_*, q80_256_*): AVX2 or AVX-VNNI, no other variant
+bool kq_type(int type) { return cpu::kq256_supported(type) || type == 8; }
+void kq_gu_v(int v, int type, const uint8_t* blob, size_t gu_row, size_t up_off, const void* const* act, int nt,
+             float* const* ff) {
+    if (type == 8) cpu::q80_256_gu_rows_v(v, blob, gu_row, up_off, (int) kH, act, nt, ff, 0, (int) kFF);
+    else cpu::kq256_gu_rows_v(v, type, blob, gu_row, up_off, (int) kH, act, nt, ff, 0, (int) kFF);
+}
+void kq_dn_v(int v, int type, const uint8_t* w, size_t row_bytes, const void* const* hq, int nt, float* const* out) {
+    if (type == 8) cpu::q80_256_rows_v(v, w, row_bytes, (int) kFF, hq, nt, out, 0, (int) kH);
+    else cpu::kq256_rows_v(v, type, w, row_bytes, (int) kFF, hq, nt, out, 0, (int) kH);
 }
 #endif
 
@@ -456,21 +470,32 @@ int bench(const std::vector<std::string>& pairs, const std::vector<int>& nts, in
                               else cpu::q2_0_gguf_rows_multi_avx2(blob + f.down_off, f.d_row, (int) (kFF / 64), a.q2p, nt, out, 0, (int) kH);
                           }});
         }
-        ms.push_back({"ggml",   // ggml-cpu's dot, token by token: the engine's one-token path (#152's rule)
-                      [&](const uint8_t* blob, int nt) {
-                          for (int64_t r = 0; r < kFF; ++r)
-                              for (int t = 0; t < nt; ++t) {
-                                  float g = 0.f, u = 0.f;
-                                  gdot((int) kH, &g, 0, blob + (size_t) r * f.gu_row, 0, a.gup[t], 0, 1);
-                                  gdot((int) kH, &u, 0, blob + f.up_off + (size_t) r * f.gu_row, 0, a.gup[t], 0, 1);
-                                  ff[t][r] = (g / (1.f + std::exp(-g))) * u;
-                              }
-                      },
-                      [&](const uint8_t* blob, int nt) {
-                          for (int64_t r = 0; r < kH; ++r)
-                              for (int t = 0; t < nt; ++t)
-                                  ddot((int) kFF, &out[t][r], 0, blob + f.down_off + (size_t) r * f.d_row, 0, a.dnp[t], 0, 1);
-                      }});
+        // ggml-cpu's dot, token by token: the engine's one-token path (#152's rule)
+        const std::function<void(const uint8_t*, int)> ggml_gu = [&](const uint8_t* blob, int nt) {
+            for (int64_t r = 0; r < kFF; ++r)
+                for (int t = 0; t < nt; ++t) {
+                    float g = 0.f, u = 0.f;
+                    gdot((int) kH, &g, 0, blob + (size_t) r * f.gu_row, 0, a.gup[t], 0, 1);
+                    gdot((int) kH, &u, 0, blob + f.up_off + (size_t) r * f.gu_row, 0, a.gup[t], 0, 1);
+                    ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+                }
+        };
+        const std::function<void(const uint8_t*, int)> ggml_dn = [&](const uint8_t* blob, int nt) {
+            for (int64_t r = 0; r < kH; ++r)
+                for (int t = 0; t < nt; ++t)
+                    ddot((int) kFF, &out[t][r], 0, blob + f.down_off + (size_t) r * f.d_row, 0, a.dnp[t], 0, 1);
+        };
+        // the K-quant and Q8_0 kernels in each variant (scalar: the AVX2 copy), ggml-cpu for a side they do not take
+        if (!own && !dispatch_only && kVariants && (kq_type(gt) || kq_type(dt)))
+            for (int v : subsets(down_variants()))
+                ms.push_back({variant_name(v),
+                              kq_type(gt) ? std::function<void(const uint8_t*, int)>([&, v, gt](const uint8_t* blob, int nt) {
+                                  kq_gu_v(v, gt, blob, f.gu_row, f.up_off, a.gup, nt, ff);
+                              }) : ggml_gu,
+                              kq_type(dt) ? std::function<void(const uint8_t*, int)>([&, v, dt](const uint8_t* blob, int nt) {
+                                  kq_dn_v(v, dt, blob + f.down_off, f.d_row, a.dnp, nt, out);
+                              }) : ggml_dn});
+        ms.push_back({"ggml", ggml_gu, ggml_dn});
         ms.push_back({"engine",   // what the pool calls: native_gu_rows, native_down_rows or (Q2_0) q2_rows_any
                       [&](const uint8_t* blob, int nt) { cpu::native_gu_rows(f, blob, a.gup, nt, ff, 0, (int) kFF); },
                       [&, dt](const uint8_t* blob, int nt) {

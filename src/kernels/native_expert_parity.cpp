@@ -253,6 +253,39 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
                         NT, usn, (double) (f.bytes - f.down_off) / usn / 1e3, usg,
                         (double) (f.bytes - f.down_off) / usg / 1e3);
         }
+        // (b4) the K-quant and Q8_0 multi-token kernels (kq256_*, q80_256_*), the AVX2 copy and the AVX-VNNI one where
+        // the CPU has it, against ggml-cpu's vec_dot on the same activations: gate rows and down rows, rel <= 1e-5
+        auto kq = [](int t) { return cpu::kq256_supported(t) || t == 8; };
+        if (cpu::cpu_avx2_ok() && (kq(f.gu_type) || kq(f.d_type))) {
+            std::vector<int> variants = {0};
+            if (cpu::iq256_variants() & cpu::kIq256Vnni) variants.push_back(cpu::kIq256Vnni);
+            auto rows_vs_ggml = [&](const char* what, int type, const uint8_t* w, size_t row_bytes, int64_t n,
+                                    int64_t rows, const void* const* acts) {
+                const auto* tc = ggml_get_type_traits_cpu((ggml_type) type);
+                std::vector<float> want((size_t) (NT * rows)), got((size_t) (NT * rows));
+                float* gp[NT];
+                for (int k = 0; k < NT; ++k) {
+                    gp[k] = got.data() + k * rows;
+                    for (int64_t r = 0; r < rows; ++r)
+                        tc->vec_dot((int) n, &want[(size_t) (k * rows + r)], 0, w + (size_t) r * row_bytes, 0, acts[k], 0, 1);
+                }
+                for (int v : variants) {
+                    if (type == 8) cpu::q80_256_rows_v(v, w, row_bytes, (int) n, acts, NT, gp, 0, (int) rows);
+                    else cpu::kq256_rows_v(v, type, w, row_bytes, (int) n, acts, NT, gp, 0, (int) rows);
+                    const double rr = rel(got, want);
+                    const char* tag = v ? "avx2+vnni" : "avx2";
+                    std::printf("          %s %s %s rows vs ggml vec_dot: rel %.2e\n", ggml_type_name((ggml_type) type),
+                                tag, what, rr);
+                    if (rr > 1e-5) {   // float-order differences only, as for the i-quants above
+                        std::printf("          %s %s %s rows MISMATCH (rel %.2e > 1e-5)\n",
+                                    ggml_type_name((ggml_type) type), tag, what, rr);
+                        ++failures;
+                    }
+                }
+            };
+            if (kq(f.gu_type)) rows_vs_ggml("gate", f.gu_type, blob.data(), f.gu_row, H, FF, a);
+            if (kq(f.d_type)) rows_vs_ggml("down", f.d_type, blob.data() + f.down_off, f.d_row, FF, H, hp);
+        }
     }
     // (c) the GPU: one group holding the NT entries
     {
