@@ -206,6 +206,99 @@ class _XeGpu:
         return out
 
 
+# ------------------------------------------------------------------------------------------------ an AMD GPU
+SYSFS = "/sys"
+
+
+class _AmdGpu:
+    """An AMD GPU on the amdgpu driver, from its sysfs files (no ROCm library needed; upstream #301): load
+    (gpu_busy_percent), VRAM (mem_info_vram_used / _total), and from its hwmon folder the temperature (temp1_input, the
+    edge sensor, m°C), power (power1_average or power1_input, µW) and its cap (power1_cap).  `pci` is the card's
+    address as the config gives it; without one, the first card on the amdgpu driver."""
+
+    def __init__(self, pci=None, sysfs=None):
+        self.dev = None
+        for card in sorted(glob.glob(os.path.join(sysfs or SYSFS, "class", "drm", "card[0-9]*"))):
+            dev = os.path.realpath(os.path.join(card, "device"))
+            if os.path.basename(os.path.realpath(os.path.join(dev, "driver"))) != "amdgpu":
+                continue
+            if pci is None or os.path.basename(dev) == pci:
+                self.dev = dev
+                break
+        self.hwmon = None
+        if self.dev:
+            hw = sorted(glob.glob(os.path.join(self.dev, "hwmon", "hwmon*")))
+            self.hwmon = hw[0] if hw else None
+
+    def ok(self):
+        return self.dev is not None
+
+    def name(self):
+        return (_read(os.path.join(self.dev, "product_name"), str) or "AMD Radeon") if self.ok() else None
+
+    @staticmethod
+    def _gen(text):
+        """The PCIe generation of a link-speed file's contents ("16.0 GT/s PCIe" -> 4), or None."""
+        try:
+            return {2.5: 1, 5.0: 2, 8.0: 3, 16.0: 4, 32.0: 5, 64.0: 6}[float(str(text).split()[0])]
+        except (ValueError, TypeError, IndexError, KeyError):
+            return None
+
+    @staticmethod
+    def _bdf(s):
+        """True for a sysfs pci device name ("0000:03:00.0")."""
+        return (len(s) == 12 and s[4] == ":" and s[7] == ":" and s[10] == "." and s[11] in "01234567"
+                and all(c in "0123456789abcdef" for c in s[0:4] + s[5:7] + s[8:10]))
+
+    def _hops(self):
+        """The PCIe devices between the root port and this card, the card last."""
+        out, prefix = [], []
+        for part in os.path.realpath(self.dev or "").split("/"):
+            prefix.append(part)
+            if self._bdf(part):
+                out.append("/".join(prefix))
+        return out
+
+    def link(self):
+        """The PCIe link the card actually gets (upstream 7f3c0da2): the narrowest and slowest hop between the root
+        port and the card, from each hop's max_link_speed / max_link_width (a card that is Gen4 on its own hop behind
+        a Gen3 root port runs at Gen3).  pcie_own_gen keeps the card's own hop aside.  The bottleneck is claimed only
+        when every hop could be read (pcie_path: how many were, "4/4"); else the card's own negotiated link."""
+        hops = self._hops()
+        gens, widths, seen = [], [], 0
+        for d in hops:
+            g = self._gen(_read(os.path.join(d, "max_link_speed"), str))
+            w = _read(os.path.join(d, "max_link_width"))
+            seen += 1 if (g is not None or w is not None) else 0
+            if g:
+                gens.append(g)
+            if w:
+                widths.append(w)
+        own_gen = self._gen(_read(os.path.join(self.dev or "", "current_link_speed"), str))
+        whole = bool(hops) and seen == len(hops)
+        gen = min(gens) if (whole and gens) else own_gen
+        width = min(widths) if (whole and widths) else _read(os.path.join(self.dev or "", "current_link_width"))
+        return {"pcie_gen": gen, "pcie_gen_max": gen, "pcie_own_gen": own_gen, "pcie_width": width,
+                "pcie_path": "%d/%d" % (seen, len(hops))}
+
+    def read(self):
+        out = {"util": _read(os.path.join(self.dev, "gpu_busy_percent")),
+               "mem_used": _read(os.path.join(self.dev, "mem_info_vram_used")),
+               "mem_total": _read(os.path.join(self.dev, "mem_info_vram_total"))}
+        if self.hwmon:
+            t = _read(os.path.join(self.hwmon, "temp1_input"))
+            out["temp"] = t / 1000.0 if t is not None else None
+            p = _read(os.path.join(self.hwmon, "power1_average"))
+            if p is None:
+                p = _read(os.path.join(self.hwmon, "power1_input"))
+            out["power"] = p / 1e6 if p is not None else None
+            cap = _read(os.path.join(self.hwmon, "power1_cap"))
+            out["power_limit"] = cap / 1e6 if cap is not None else None
+        out.update(self.link())
+        out["pcie_rx_mb"] = out["pcie_tx_mb"] = None   # no counters for the link's traffic
+        return out
+
+
 # ------------------------------------------------------------------------------------------------ an NVIDIA GPU
 class _NvGpu:
     """An NVIDIA GPU through NVML, with _XeGpu's interface.  `pci` is the card's address as the config gives it
@@ -293,10 +386,14 @@ class _NvGpu:
 
 
 def _gpu(pci=None):
-    """The card the engine runs on: the Intel GPU at `pci` (or the first on the xe driver), else the NVIDIA one."""
+    """The card the engine runs on: the Intel GPU at `pci` (or the first on the xe driver), else the AMD one (amdgpu),
+    else the NVIDIA one."""
     g = _XeGpu(pci)
     if g.ok():
         return g
+    a = _AmdGpu(pci)
+    if a.ok():
+        return a
     n = _NvGpu(pci)
     return n if n.ok() else g
 

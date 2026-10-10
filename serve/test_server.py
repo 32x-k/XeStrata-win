@@ -3825,6 +3825,77 @@ class ModelAliases(unittest.TestCase):
             httpd.server_close()
 
 
+class AmdTelemetry(unittest.TestCase):
+    """upstream #301 and #1733: an AMD card's readings from a fake amdgpu sysfs tree, chosen by its PCI address."""
+
+    def tree(self, d):
+        bus = Path(d) / "devices" / "pci0000:00"
+        drv = Path(d) / "bus" / "pci" / "drivers"
+        for minor, pci, driver in ((0, "0000:03:00.0", "xe"), (1, "0000:0a:00.0", "amdgpu")):
+            dev = bus / "0000:00:01.0" / pci
+            (dev / "hwmon" / "hwmon4").mkdir(parents=True)
+            (drv / driver).mkdir(parents=True, exist_ok=True)
+            (dev / "driver").symlink_to(drv / driver)
+            card = Path(d) / "class" / "drm" / f"card{minor}"
+            card.mkdir(parents=True)
+            (card / "device").symlink_to(dev)
+        amd = bus / "0000:00:01.0" / "0000:0a:00.0"
+        for name, text in (("gpu_busy_percent", "37"), ("mem_info_vram_used", str(2 << 30)),
+                           ("mem_info_vram_total", str(16 << 30)), ("product_name", "AMD Radeon RX 9060 XT"),
+                           ("current_link_speed", "16.0 GT/s PCIe"), ("current_link_width", "16"),
+                           ("max_link_speed", "16.0 GT/s PCIe"), ("max_link_width", "16")):
+            (amd / name).write_text(text + "\n")
+        for name, text in (("max_link_speed", "8.0 GT/s PCIe"), ("max_link_width", "16")):   # a Gen3 root port
+            (bus / "0000:00:01.0" / name).write_text(text + "\n")
+        hw = amd / "hwmon" / "hwmon4"
+        for name, text in (("temp1_input", "51000"), ("power1_average", "85000000"), ("power1_cap", "160000000")):
+            (hw / name).write_text(text + "\n")
+
+    def test_readings(self):
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            self.assertFalse(telemetry._AmdGpu("0000:03:00.0", sysfs=d).ok())      # the Intel card is not amdgpu's
+            g = telemetry._AmdGpu("0000:0a:00.0", sysfs=d)
+            self.assertTrue(g.ok())
+            self.assertEqual(g.name(), "AMD Radeon RX 9060 XT")
+            self.assertEqual(g.read(), {"util": 37, "mem_used": 2 << 30, "mem_total": 16 << 30, "temp": 51.0,
+                                        "power": 85.0, "power_limit": 160.0, "pcie_gen": 3, "pcie_gen_max": 3,
+                                        "pcie_own_gen": 4, "pcie_width": 16, "pcie_path": "2/2",
+                                        "pcie_rx_mb": None, "pcie_tx_mb": None})
+            self.assertTrue(telemetry._AmdGpu(None, sysfs=d).ok())                 # the first amdgpu card
+        with tempfile.TemporaryDirectory() as d:                     # no amdgpu: nothing, and nothing breaks
+            self.assertFalse(telemetry._AmdGpu(None, sysfs=d).ok())
+
+    def test_pcie_link_is_the_narrowest_slowest_hop(self):
+        """#1733: the link is the slowest/narrowest hop between the root port and the card; the bottleneck is only
+        claimed when every hop could be read (pcie_path says how many were)."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            hops = []
+            for i, (speed, width) in enumerate((("8.0 GT/s PCIe", "16"), ("8.0 GT/s PCIe", "8"),
+                                                ("16.0 GT/s PCIe", "16"))):
+                h = Path(d) / f"hop{i}"
+                h.mkdir()
+                (h / "max_link_speed").write_text(speed + "\n")
+                (h / "max_link_width").write_text(width + "\n")
+                hops.append(str(h))
+            (Path(hops[-1]) / "current_link_speed").write_text("16.0 GT/s PCIe\n")
+            (Path(hops[-1]) / "current_link_width").write_text("16\n")
+            a = telemetry._AmdGpu(None, sysfs=d)
+            a.dev = hops[-1]
+            with mock.patch.object(telemetry._AmdGpu, "_hops", lambda self: hops):
+                self.assertEqual(a.link(), {"pcie_gen": 3, "pcie_gen_max": 3, "pcie_own_gen": 4, "pcie_width": 8,
+                                            "pcie_path": "3/3"})
+            with mock.patch.object(telemetry._AmdGpu, "_hops", lambda self: hops[:2] + [str(Path(d) / "hidden")]):
+                got = a.link()             # an unreadable hop: fall back to the card's own negotiated link
+                self.assertEqual((got["pcie_gen"], got["pcie_width"], got["pcie_path"]), (4, 16, "2/3"))
+            self.assertEqual(telemetry._AmdGpu._gen("32.0 GT/s PCIe"), 5)
+            self.assertIsNone(telemetry._AmdGpu._gen("unknown"))
+            self.assertTrue(telemetry._AmdGpu._bdf("0000:03:00.0"))
+            self.assertFalse(telemetry._AmdGpu._bdf("pci0000:00"))
+
+
 class TelemetryNoDisks(unittest.TestCase):
     """psutil.disk_io_counters() returns None where it finds no disk (a gVisor container; Windows with its disk counters
     off): the sampler goes on without a disk reading instead of its thread ending at the first sample, which left
