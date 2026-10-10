@@ -305,6 +305,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     // expert and the combine
     static const bool profile = std::getenv("STRATA_PROMPT_PROFILE") != nullptr;
     double stage_ms[5] = {};
+    int64_t cpu_n = 0, cpu_rows = 0, miss_n = 0;   // for the profile: the CPU's experts and rows, the missed experts
     auto mark = [&](int stage, std::chrono::steady_clock::time_point& t) {
         if (!profile) return;
         strata::gpu::stream_sync(cs);
@@ -564,6 +565,9 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     g0 = g1;
                 }
                 if (!cpu_experts.empty() && !prompt_cpu_experts(ml, cpu_experts, count, start, err)) return false;
+                cpu_n += (int64_t) cpu_experts.size();
+                for (int32_t e : cpu_experts) cpu_rows += count[(size_t) e];
+                for (int64_t e = 0; e < E; ++e) miss_n += count[(size_t) e] > 0 && res_[(size_t) (ml * E + e)] < 0;
                 for (size_t g0 = 0; !use_mmq && g0 < experts.size(); g0 += PromptBufs::kGroup) {
                     const int G = (int) std::min<size_t>(PromptBufs::kGroup, experts.size() - g0);
                     if (transient && !strata::gpu::stream_sync(cs)) {   // the staging's last readers are done
@@ -649,6 +653,9 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
         std::fprintf(stderr, "strata plain: prompt of %lld tokens: GDN %.1f ms, attention %.1f, router and grouping %.1f, "
                              "experts %.1f, shared and combine %.1f\n", (long long) n, stage_ms[0], stage_ms[4], stage_ms[1],
                      stage_ms[2], stage_ms[3]);
+    if (profile)
+        std::fprintf(stderr, "strata plain: prompt experts not in VRAM %lld, of them on the CPU %lld (%lld rows)\n",
+                     (long long) miss_n, (long long) cpu_n, (long long) cpu_rows);
     *out = ((volatile int32_t*) h_out_)[0];
     if (logits != nullptr && !strata::gpu::copy(logits, logits_, (size_t) n_vocab_ * 4)) {
         err = "plain prompt: reading the logits failed";
