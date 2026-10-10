@@ -4,10 +4,10 @@
 measure (prompt, output), the median of each engine's rounds; a cell passes when XeStrata is at most 1% slower.
 One folder per model file.  A folder with a matrix-serve.json (bench_serve.py) is judged on the serve path too: per
 GPU, tier and mode, the prompt, the follow-ups and the output, a cell passing when XeStrata is at most SERVE_LIMIT
-slower (each engine writes its own text there, so the drafts accepted vary from run to run: the limit comes from
-the spread of XeStrata measured against itself).  A folder with a matrix-usage.json (bench_usage.py) is judged on
-everyday use too: per GPU and conversation, the time to the first token (lower is better), the prompt and the
-output, with the same SERVE_LIMIT.
+slower (each engine writes its own text there, so the drafts accepted vary from round to round: the limit comes
+from that spread).  A folder with a matrix-usage.json (bench_usage.py) is judged on everyday use too: per GPU
+and conversation, the time to the first token (lower is better), the prompt and the output, with the same
+SERVE_LIMIT.
 
     python .claude/skills/upstream-sync/scripts/judge.py [--prompt-only GPU]... OUT/IQ3_XXS OUT/IQ2_XS ...
 

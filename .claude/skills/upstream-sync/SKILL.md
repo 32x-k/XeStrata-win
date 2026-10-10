@@ -114,6 +114,14 @@ The engines, each built in a worktree of its own under `.claude/worktrees/` (or 
 
 Each engine's own shipped expert profile. No other work on a machine while it measures.
 
+Every GPU runs three measurements, each with both engines, and step 7 judges all three:
+
+| Measurement | Script | What it covers |
+| --- | --- | --- |
+| generate | `bench.sh` | the kernels and the speculative loop, both engines writing one text (`--spec-follow`); every model file below |
+| serve | `bench_serve.py` | `strata --serve`'s own decode loop and the conversation checkpoints, a chat of four turns; IQ3_XXS |
+| everyday use | `bench_usage.py` | the whole path a user meets: `serve/server.py`, the chat template, streaming, chats and a coding agent; IQ3_XXS |
+
 Each GPU is one matrix path (the B70 XMX, the RTX 4070 tensor cores, the RX 9060 XT WMMA), and every GPU runs the same model files (their paths on each machine: `LOCAL.md`):
 
 | File | Tiers (`TIERS`) | What it covers |
@@ -185,7 +193,7 @@ python .claude/skills/upstream-sync/scripts/judge.py --prompt-only B70 $o/IQ3_XX
 ```
 
 A cell (file, GPU, tier, prompt or output) passes when XeStrata's median is at most 1% below upstream's.
-The serve cells (GPU, tier, greedy or t07; prompt, follow-ups, output), read from `matrix-serve.json`, and the everyday cells (GPU, conversation; first token, prompt, output), read from `matrix-usage.json`, pass at most `SERVE_LIMIT` (`judge.py`) below upstream's: each engine writes its own text there, so the speeds vary more from run to run, and the limit is set from the spread of XeStrata measured against itself (the same scripts with `UP`, `UP_ROOT` and `UP_PROFILE` set to XeStrata's).
+The serve cells (GPU, tier, greedy or t07; prompt, follow-ups, output), read from `matrix-serve.json`, and the everyday cells (GPU, conversation; first token, prompt, output), read from `matrix-usage.json`, pass at most `SERVE_LIMIT` (`judge.py`) below upstream's: each engine writes its own text there, so the speeds vary with the text from round to round, and the limit comes from that spread (the rounds' seeds differ). Running XeStrata against itself shows nothing: with the same seed both write the same text at the same speed.
 A cell upstream does not finish, finishes at 10 tok/s or less, or is stopped as that slow, is left out; one only XeStrata does not finish fails.
 A file whose experts do not fit in a machine's RAM budget, so that they are read from the SSD while it answers (SSD offload: UD-Q4_K_XL on the AMD container's 62 GB), is not run on that machine (the user's decision of 2026-10-09): as for GPUs there is no machine for (step 4), its paths are checked by the tests and the builds only, and the record lists its cells `unverified`.
 The B70's output cells are left out (`--prompt-only B70`, the user's decision of 2026-10-09): upstream's `sycl/` port reads the experts that do not fit in VRAM over PCIe from its kernels, a few tok/s, which says nothing about XeStrata's speed.
