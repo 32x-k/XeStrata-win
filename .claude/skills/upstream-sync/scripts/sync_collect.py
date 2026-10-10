@@ -4,6 +4,8 @@
 (the median of the rounds; a cell no run finished is "-", one bench.sh stopped as too slow "too slow") as Markdown to
 stdout.  An upstream run bench.sh stopped as too slow has "stopped" (prompt or output); one stopped in its output
 takes its prompt rate from the last PP line (or, without PP lines, from its "strata generate: prefill" line).
+When bench_serve.py ran too, OUT/serve-runs/*.json go to OUT/matrix-serve.json and three more tables per GPU and mode:
+the tier's prompt, the follow-ups (the tokens they read over their prompt time) and the output of all four turns.
 
     python .claude/skills/upstream-sync/scripts/sync_collect.py OUT XE_NAME UP_NAME   # e.g. OUT xe0.1.41 v0.1.41
 """
@@ -58,3 +60,39 @@ for gpu in sorted({r["gpu"] for r in rows}):
                 slow = [r for r in rows if (r["gpu"], r["engine"], r["tier"]) == (gpu, name, t) and r["stopped"]]
                 cells.append(fmt.format(statistics.median(v)) if v else "too slow" if slow else "-")
             print(f"| {name} | " + " | ".join(cells) + " |")
+
+serve = []
+for f in sorted((out / "serve-runs").glob("*.json")):
+    r = json.loads(f.read_text())
+    if r["round"] == 0:                       # the warm-ups
+        continue
+    t = r["turns"]
+    whole = len(t) > 1 and not r["why"]
+    rate = lambda n, ms: n / ms * 1e3 if ms > 0 else None   # noqa: E731
+    serve.append({
+        "gpu": r["gpu"], "arm": r["arm"], "engine": NAMES[r["arm"]], "tier": r["tier"], "mode": r["mode"],
+        "round": r["round"],
+        "prefill_tok_s": rate(t[0]["read"], t[0]["prompt_ms"]) if t else None,
+        "cont_tok_s": rate(sum(x["read"] for x in t[1:]), sum(x["prompt_ms"] for x in t[1:])) if whole else None,
+        "decode_tok_s": rate(sum(x["generated"] for x in t), sum(x["decode_ms"] for x in t)) if whole else None,
+        "spec_accept": (sum(x["accepted"] for x in t) / max(sum(x["offered"] for x in t), 1)) if whole else None,
+        "stopped": (r["why"] or "").removeprefix("stopped: ") if (r["why"] or "").startswith("stopped") else None,
+    })
+if serve:
+    (out / "matrix-serve.json").write_text(json.dumps(serve, indent=1) + "\n")
+    tiers = [t for t in TIERS if any(r["tier"] == t for r in serve)]
+    for gpu in sorted({r["gpu"] for r in serve}):
+        for mode in sorted({r["mode"] for r in serve}):
+            for key, title, fmt in (("prefill_tok_s", "Prompt (tokens/s)", "{:,.0f}"),
+                                    ("cont_tok_s", "Follow-ups (tokens/s)", "{:,.0f}"),
+                                    ("decode_tok_s", "Output (tokens/s)", "{:.1f}")):
+                print(f"\n### {gpu} serve {mode}: {title}\n\n| Engine | " + " | ".join(t.upper() for t in tiers) + " |")
+                print("| --- |" + " ---: |" * len(tiers))
+                for name in NAMES.values():
+                    cells = []
+                    for t in tiers:
+                        c = [r for r in serve if (r["gpu"], r["engine"], r["tier"], r["mode"]) == (gpu, name, t, mode)]
+                        v = [r[key] for r in c if r[key]]
+                        cells.append(fmt.format(statistics.median(v)) if v else
+                                     "too slow" if any(r["stopped"] for r in c) else "-")
+                    print(f"| {name} | " + " | ".join(cells) + " |")

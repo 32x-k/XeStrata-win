@@ -7,7 +7,8 @@ bench/results/2026-10-04-speed-matrix with a 192K tier added (the same tokens up
     python .claude/skills/upstream-sync/scripts/sync_prompts.py PACK_DIR OUT_DIR
 
 Run from the repository root.  PACK_DIR is any pack (its `tokenizer/` is read).  Writes OUT_DIR/<tier>.ids,
-comma-separated, for `strata generate --tokens-file`.
+comma-separated, for `strata generate --tokens-file`, and OUT_DIR/turn<N>.ids, the user's next messages of the same
+chat for bench_serve.py (each opens with the <|im_end|> that closes the assistant's answer before it).
 """
 import json
 import pathlib
@@ -66,3 +67,10 @@ for tier, n in TIERS.items():
     ids = head + body[:n - len(head) - len(tail)] + tail
     (out / f"{tier}.ids").write_text(",".join(map(str, ids)))
     print(tier, len(ids))
+followups = ("Show the patch as a unified diff.",
+             "How would you test that the size is logged only once per prompt?",
+             "Summarize the change in two sentences for the commit message.")
+for i, text in enumerate(followups, 2):
+    ids = enc(f"<|im_end|>\n<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    (out / f"turn{i}.ids").write_text(",".join(map(str, ids)))
+    print(f"turn{i}", len(ids))

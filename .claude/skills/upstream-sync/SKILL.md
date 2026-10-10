@@ -1,6 +1,6 @@
 ---
 name: upstream-sync
-description: Bring upstream Strata's newest release tag into XeStrata on dev - sort its commits, merge, port the CUDA and HIP changes to the SYCL kernels, build the three modes - and make XeStrata at least as fast as that tag (at most 1% slower) on the Intel, NVIDIA and AMD GPUs: IQ3_XXS at 1K, 32K and 64K, and the other weight types at 32K. Only when the user asks (/upstream-sync).
+description: Bring upstream Strata's newest release tag into XeStrata on dev - sort its commits, merge, port the CUDA and HIP changes to the SYCL kernels, build the three modes - and make XeStrata at least as fast as that tag (at most 1% slower) on the Intel, NVIDIA and AMD GPUs: IQ3_XXS at 1K, 32K and 64K, and the other weight types at 32K, on the generate path and IQ3_XXS at 1K, 32K and 64K on the serve path. Only when the user asks (/upstream-sync).
 disable-model-invocation: true
 argument-hint: "[upstream TAG, e.g. v0.1.41]"
 ---
@@ -142,6 +142,22 @@ Both engines write one text a tier (the user's decision of 2026-10-10): upstream
 The rounds and the drafts accepted are then the same, so the output speeds compare the engines and not which text each happened to write: the two engines round differently, their answers part after a few dozen tokens, and on UD-Q4_K_XL that alone moved the output by 5%.
 It stops upstream mid-run once its progress shows it at 10 tok/s or less (the prompt, from its `PP` lines after 30 s; the output, when 256 tokens at 10 tok/s and a minute have passed since the prompt) and does not run it again in that tier.
 
+### The serve path
+
+`strata --serve`, what users run, has a decode loop of its own (`src/program/generate.cpp`: the `--serve` block, apart from generate's speculative loop) and no `--spec-follow`, so bench.sh does not cover it.
+`bench_serve.py` runs both engines with `--serve` and the options setup writes, over stdin (`GEN`, `DONE`), for IQ3_XXS at 64K, 32K and 1K (the three kinds of prompt above), per GPU, in the same folder as the IQ3_XXS table:
+
+```sh
+XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> \
+  python .claude/skills/upstream-sync/scripts/bench_serve.py $o/IQ3_XXS <GPU>
+python .claude/skills/upstream-sync/scripts/sync_collect.py $o/IQ3_XXS xe-<commit> <tag>
+```
+
+Each run is one chat of four turns: the tier's prompt, then the three follow-ups of `sync_prompts.py`, each sent with the answer before it, as a chat client sends them; 256 tokens a turn.
+It measures the prompt (the first turn), the follow-ups (the tokens they read over their prompt time; the conversation checkpoints) and the output (all four turns), greedy and at temperature 0.7, three rounds each, the engines alternating.
+Each engine writes its own text, so the drafts it accepts count in its output speed, as they do for a user.
+The wrapper commands in `XE` and `UP` must pass stdin through (`docker run -i` for upstream's `sycl/` image).
+
 ## 7. The check
 
 ```sh
@@ -149,12 +165,13 @@ python .claude/skills/upstream-sync/scripts/judge.py --prompt-only B70 $o/IQ3_XX
 ```
 
 A cell (file, GPU, tier, prompt or output) passes when XeStrata's median is at most 1% below upstream's.
+The serve cells (GPU, tier, greedy or t07; prompt, follow-ups, output), read from `matrix-serve.json`, pass at most `SERVE_LIMIT` (`judge.py`) below upstream's: each engine writes its own text there, so the speeds vary more from run to run, and the limit is set from the spread of XeStrata measured against itself (the same script with `UP` and `UP_PROFILE` set to XeStrata's).
 A cell upstream does not finish, finishes at 10 tok/s or less, or is stopped as that slow, is left out; one only XeStrata does not finish fails.
 A file whose experts do not fit in a machine's RAM budget, so that they are read from the SSD while it answers (SSD offload: UD-Q4_K_XL on the AMD container's 62 GB), is not run on that machine (the user's decision of 2026-10-09): as for GPUs there is no machine for (step 4), its paths are checked by the tests and the builds only, and the record lists its cells `unverified`.
 The B70's output cells are left out (`--prompt-only B70`, the user's decision of 2026-10-09): upstream's `sycl/` port reads the experts that do not fit in VRAM over PCIe from its kernels, a few tok/s, which says nothing about XeStrata's speed.
 
 For each failing cell: find where the time goes (the GPU profilers of docs/DEVTOOLS.md, the engine's timing lines), read how upstream does that part, make XeStrata's faster (step 4's rules), and measure that cell again.
-The run is done only when a full run of step 6 on the final HEAD, every file and tier of the table (IQ3_XXS with 262K) and every reachable GPU, gives `ALL PASS`: a cell fixed earlier can lose again to a later change.
+The run is done only when a full run of step 6 on the final HEAD, every file and tier of the table (IQ3_XXS with 262K), the serve path and every reachable GPU, gives `ALL PASS`: a cell fixed earlier can lose again to a later change.
 
 ## 8. The record and the report
 
