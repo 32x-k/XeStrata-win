@@ -1,0 +1,16 @@
+cpumoe rc=0 1617.48 ms /   514 tokens (    3.15 ms per token,   317.78 tokens per second) 10128.81 ms /   255 runs   (   39.72 ms per token,    25.18 tokens per second) 
+cpumoe-cache12g rc=0 1579.22 ms /   514 tokens (    3.07 ms per token,   325.48 tokens per second) 6642.31 ms /   255 runs   (   26.05 ms per token,    38.39 tokens per second) 
+ncmoe26 rc=0 1205.41 ms /   514 tokens (    2.35 ms per token,   426.41 tokens per second) 9355.04 ms /   255 runs   (   36.69 ms per token,    27.26 tokens per second) 
+ncmoe22 rc=0 1069.07 ms /   514 tokens (    2.08 ms per token,   480.79 tokens per second) 7911.38 ms /   255 runs   (   31.03 ms per token,    32.23 tokens per second) 
+ncmoe18 rc=1 
+ncmoe14 rc=1 
+fit rc=0 960.90 ms /   514 tokens (    1.87 ms per token,   534.91 tokens per second) 7987.81 ms /   255 runs   (   31.32 ms per token,    31.92 tokens per second) 
+xs1 rc=0 prompt 515 tokens 23.44 s (22.0 tok/s), 255 generated 9.33 s (27.32 tok/s); VRAM tier 4464 of 5400 slots filled, 52.7% of routed experts hit, 4493 swaps
+xs2 rc=0 prompt 515 tokens 23.41 s (22.0 tok/s), 255 generated 9.30 s (27.41 tok/s); VRAM tier 4464 of 5400 slots filled, 52.7% of routed experts hit, 4493 swaps
+ALL DONE
+profile rc=0 prompt 22 tokens 0.50 s (43.9 tok/s), 511 generated 11.22 s (45.53 tok/s); VRAM tier 4514 of 5400 slots filled, 75.3% of routed experts hit, 4588 swaps
+split 1 rc=0 prompt 515 tokens 7.76 s (66.4 tok/s), 255 generated 5.74 s (44.41 tok/s); VRAM tier 4464 of 5400 slots filled, 52.7% of routed experts hit, 4493 swaps
+split+profile 1 rc=0 prompt 515 tokens 4.48 s (114.9 tok/s), 255 generated 4.97 s (51.31 tok/s); VRAM tier 5400 of 5400 slots filled, 86.0% of routed experts hit, 2802 swaps
+split 2 rc=0 prompt 515 tokens 7.80 s (66.0 tok/s), 255 generated 5.76 s (44.28 tok/s); VRAM tier 4464 of 5400 slots filled, 52.7% of routed experts hit, 4493 swaps
+split+profile 2 rc=0 prompt 515 tokens 4.49 s (114.7 tok/s), 255 generated 5.02 s (50.83 tok/s); VRAM tier 5400 of 5400 slots filled, 86.0% of routed experts hit, 2802 swaps
+ALL DONE
