@@ -1161,6 +1161,19 @@ void dq_q3_k(const void* vx, int64_t ibs, const Out& o, int tid) {
         o.template put<4>(128 * n + 32 * j + l0, v);
     }
 }
+// Q2_K (Ornith-1.5's GSQ-RCO experts): llama.cpp's dequantize_block_q2_K, 8 consecutive values a work-item - value
+// 128 n + 32 k + l is plane k (bits 2k) of qs[32 n + l], under scale byte 8 n + 2 k + l / 16
+template<typename Out>
+void dq_q2_k(const void* vx, int64_t ibs, const Out& o, int tid) {
+    const block_q2_K* x = (const block_q2_K*) vx + ibs;
+    const int n = tid / 16, k = (tid % 16) / 4, l0 = 8 * (tid % 4);
+    const uint8_t sc = x->scales[8 * n + 2 * k + l0 / 16];
+    const float dl = (float) x->dm[0] * (float) (sc & 0xF), ml = (float) x->dm[1] * (float) (sc >> 4);
+    const uint8_t* q = x->qs + 32 * n;
+    float v[8];
+    for (int j = 0; j < 8; ++j) v[j] = dl * (float) ((int8_t) ((q[l0 + j] >> (2 * k)) & 3)) - ml;
+    o.template put<8>(128 * n + 32 * k + l0, v);
+}
 template<typename Out>
 void dq_iq4_xs(const void* vx, int64_t ibs, const Out& o, int tid) {
     const block_iq4_xs* x = (const block_iq4_xs*) vx + ibs;
@@ -1356,6 +1369,7 @@ inline void dq_dispatch(int ty, const void* vx, int64_t ibs, const Out& o, int t
         case 29: dq_iq1_m(vx, ibs, o, tid); break;
         case 23: dq_iq4_xs(vx, ibs, o, tid); break;
         case 11: dq_q3_k(vx, ibs, o, tid); break;
+        case 10: dq_q2_k(vx, ibs, o, tid); break;
         case 42: dq_q2_0(vx, ibs, o, tid); break;
         case 30: dq_bf16(vx, ibs, o, tid); break;   // the token embedding only (embed_type_supported)
         case 12: dq_q4_k(vx, ibs, o, tid); break;
@@ -1571,7 +1585,7 @@ sycl::event launch_iq_gemm(sycl::queue& q, const sycl::half* X, const IqGemmPtrs
 // dequant and xmx_gemm_grouped instead
 bool in_iq_gemm(int t) { return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42; }
 bool is_iq(int t) {
-    return in_iq_gemm(t) || t == 11 || t == 12 || t == 13 || t == 14 || t == 6 || t == 7 || t == 8 || t == 2 ||
+    return in_iq_gemm(t) || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 6 || t == 7 || t == 8 || t == 2 ||
            t == 3;
 }
 
