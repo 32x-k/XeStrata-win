@@ -387,8 +387,13 @@ def mark(path: Path, text=""):
 
 
 # ------------------------------------------------------------------------------------------------ the PC
-def is_wsl() -> bool:
-    return "microsoft" in platform.uname().release.lower()
+def wsl_version() -> int:
+    """0 on native Linux; 1 or 2 under WSL (WSL 2's kernel is Microsoft's build of Linux, "...-microsoft-standard-WSL2";
+    WSL 1 has no Linux kernel and reports "...-Microsoft")."""
+    release = platform.uname().release.lower()
+    if "microsoft" not in release:
+        return 0
+    return 2 if "wsl2" in release or "microsoft-standard" in release else 1
 
 
 def ram_gb():
@@ -2826,8 +2831,11 @@ def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
 def main() -> int:
     if sys.platform != "linux":
         fail("Strata supports Linux only")
-    if is_wsl():
-        fail("Strata does not support WSL", "run it on a native Linux installation")
+    if wsl_version() == 1:
+        fail("Strata does not run on WSL 1 (it has no GPU access)", "use WSL 2, or a native Linux installation")
+    if wsl_version() == 2:
+        warn("WSL 2 has not been tested: XeStrata may work there, or not. If you get it working (or fix what stops "
+             "it), a pull request is welcome")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5")
     ap.add_argument("--model", choices=list(MODELS))

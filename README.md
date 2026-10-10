@@ -29,7 +29,7 @@ How it differs from Strata:
 
 - **For Intel Arc,** and it runs on AMD and NVIDIA GPUs too.
 - **One GPU, as a rule.** The layers can also be spread over two or more GPUs in the same PC ([MULTIGPU](docs/MULTIGPU.md)).
-- **Linux only.** Windows and WSL are not supported.
+- **Linux only.** Windows is not supported. WSL 2 may work (untested; pull requests welcome).
 - **Runs with free software only, too** (the free build, free enough for Debian main; [made from the source](docs/BUILD.md#the-deb-and-rpm-packages)). The contrib-llvm packages use
   Intel's oneMKL and NVIDIA's cuBLAS, which are not free software, when they are installed ([Install](#install)).
 
@@ -41,7 +41,7 @@ How it differs from Strata:
 | CPU | x86-64 with AVX2. With AVX-512 (F, BW, VL, VNNI, VBMI) the CPU's part runs on AVX-512. |
 | RAM | 32-62 GB, depending on the model's size ([Choosing a model](#choosing-a-model)). |
 | Disk | About 60-110 GB for the model, and about 6 GB for the MTP layer. An SSD (NVMe) is strongly recommended. |
-| OS | Linux (not WSL). The packages are for Ubuntu 26.04 and Fedora 44; on other distributions, [install from the source](docs/BUILD.md#installing-from-the-source). |
+| OS | Linux (WSL 2 may work: untested, pull requests welcome). The packages are for Ubuntu 26.04 and Fedora 44; on other distributions, [install from the source](docs/BUILD.md#installing-from-the-source). |
 | BIOS | For a discrete GPU: Above 4G Decoding and Re-Size BAR on, CSM off. |
 
 - **Matrix engines:** Intel's XMX, AMD's WMMA (RDNA3 or later) and NVIDIA's tensor cores are used; a GPU without
