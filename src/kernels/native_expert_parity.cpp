@@ -4,7 +4,8 @@
 // src/kernels/native_expert_parity.cpp - plan v0.3 P6: one native expert three ways.
 //
 //     build/native_expert_parity <shard.gguf> [layer ...]     real rows (a split model's shards are found by name)
-//     build/native_expert_parity --synthetic GU/DOWN ...      random weights quantized by ggml (e.g. q4_K/q5_1)
+//     build/native_expert_parity --synthetic GU/DOWN[@HxFF]   random weights quantized by ggml (e.g. q4_K/q5_1,
+//                                                             q6_K/q6_K@2048x512); 2560x640 when no shape is given
 //     build/native_expert_parity --q5_1-min                   the Q5_1 min term on crafted activations
 //
 // (a) float reference: ggml's own dequantizer (`to_float`) and a float SwiGLU expert, (b) the CPU path
@@ -309,10 +310,19 @@ static uint32_t float_bits(float f) {
     return u;
 }
 
-// --synthetic GU/DOWN (e.g. q4_K/q5_1, upstream efeffd8): one expert of random weights quantized by ggml into those
-// formats at 2560/640, three ways as above; then the GPU's f32 dequantizer against ggml's to_float, bit for bit, on
+// --synthetic GU/DOWN[@HxFF] (e.g. q4_K/q5_1, upstream efeffd8): one expert of random weights quantized by ggml into
+// those formats at n_embd H and width FF (2560/640 unless given), three ways as above; then the GPU's f32 dequantizer against ggml's to_float, bit for bit, on
 // the gate rows and the down rows.  A pair the GPU has no kernels for is refused (native_expert_supported): 1.
-static int check_synthetic(const std::string& pair, void* s) {
+static int check_synthetic(const std::string& arg, void* s) {
+    const size_t at = arg.find('@');
+    const std::string pair = arg.substr(0, at);
+    int64_t H = 2560, FF = 640;
+    if (at != std::string::npos) {
+        const size_t x = arg.find('x', at);
+        H = std::strtoll(arg.c_str() + at + 1, nullptr, 10);
+        FF = x == std::string::npos ? 0 : std::strtoll(arg.c_str() + x + 1, nullptr, 10);
+        if (H <= 0 || FF <= 0) { std::printf("synthetic: %s is not GU/DOWN@HxFF\n", arg.c_str()); return 2; }
+    }
     const size_t slash = pair.find('/');
     auto type_of = [](const std::string& n) {
         for (int t = 0; t < GGML_TYPE_COUNT; ++t)
@@ -322,7 +332,6 @@ static int check_synthetic(const std::string& pair, void* s) {
     };
     const int gu = slash == std::string::npos ? -1 : type_of(pair.substr(0, slash));
     const int dt = slash == std::string::npos ? -1 : type_of(pair.substr(slash + 1));
-    const int64_t H = 2560, FF = 640;
     if (gu < 0 || dt < 0) { std::printf("synthetic: %s is not GU/DOWN ggml type names\n", pair.c_str()); return 2; }
     if (!strata::kernels::native_expert_supported(gu, dt, H, FF)) {
         std::printf("synthetic %s: refused (no GPU expert kernels for the pair)\n", pair.c_str());
@@ -363,7 +372,7 @@ static int check_synthetic(const std::string& pair, void* s) {
     };
     failures += dequant_check(gu, blob.data(), FF * H, "gate");
     failures += dequant_check(dt, blob.data() + f.down_off, H * FF, "down");
-    std::printf("native_expert_parity --synthetic %s: %d failures\n", pair.c_str(), failures);
+    std::printf("native_expert_parity --synthetic %s: %d failures\n", arg.c_str(), failures);
     return failures ? 1 : 0;
 }
 
@@ -371,13 +380,12 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);   // keep the trail on a crash
     if (argc == 2 && std::string(argv[1]) == "--bf16-embd") return check_bf16_embd(strata::parity::stream());
     if (argc == 3 && std::string(argv[1]) == "--synthetic") return check_synthetic(argv[2], strata::parity::stream());
-    if (argc < 2) { std::fprintf(stderr, "usage: native_expert_parity <shard1.gguf> [layer ...] | --bf16-embd | --synthetic GU/DOWN\n"); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: native_expert_parity <shard1.gguf> [layer ...] | --bf16-embd | --synthetic GU/DOWN[@HxFF]\n"); return 2; }
     strata::GgufFile gguf(argv[1]);
     std::vector<int> layers;
     for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
     if (layers.empty()) layers = {0, 1, 2, 3, 20, 47};
     const int E = 7;
-    const int64_t H = 2560, FF = 640;
     int failures = 0;
     void* s = strata::parity::stream();
     for (int l : layers) {
@@ -387,6 +395,9 @@ int main(int argc, char** argv) {
             for (int r = 0; r < 3; ++r)
                 if (ti.name == "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight") t[r] = &ti;
         if (!t[0] || !t[1] || !t[2]) { std::printf("layer %d: no expert tensors\n", l); ++failures; continue; }
+        // the model's own geometry: a gate tensor is [n_embd, n_ff, n_expert]
+        const int64_t H = t[0]->shape.size() > 1 ? (int64_t) t[0]->shape[0] : 0;
+        const int64_t FF = t[0]->shape.size() > 1 ? (int64_t) t[0]->shape[1] : 0;
         cpu::NativeFmt f;
         std::string err;
         if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF, f, err)) {
