@@ -302,7 +302,7 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
                "models": {
                    "Q4_K_M": {"repo": _ORNITH, "file": "Ornith-1.5-35B-Q4_K_M.gguf", "size": 21713463040,
                               "sha256": "42739874cc2ccfdb8523b23fbe52e29b2a7555c8176737ca9ca0b5d59859d41f",
-                              "about": "4-bit"},
+                              "about": "4-bit", "tested": True},
                    "Q5_K_M": {"repo": _ORNITH, "file": "Ornith-1.5-35B-Q5_K_M.gguf", "size": 25347532544,
                               "sha256": "91df97de5845100e850b4b5ec5ff35695382020b880fad6f7f51787b3a953bd0",
                               "about": "5-bit"},
