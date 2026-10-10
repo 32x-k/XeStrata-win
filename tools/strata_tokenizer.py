@@ -181,7 +181,7 @@ class Tokenizer:
         types = json.loads((path / "token_type.json").read_text())
         cfg_file = path / "tokenizer.json"
         cfg = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}
-        return cls(tokens, merges, types, cfg.get("pre", "qwen35"))
+        return cls(tokens, merges, types, cfg.get("pre", "qwen35"), cfg.get("special_ids"))
 
     # -------------------------------------------------------------- the algorithm
     def _bpe(self, word: str) -> list[str]:

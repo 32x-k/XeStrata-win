@@ -507,7 +507,24 @@ def btrace(*a):
         print("[batch-trace]", threading.get_ident() % 10000, *a, file=sys.stderr, flush=True)
 
 
-EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
+EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids (Qwen3.8-Flash-Next's)
+
+
+def stop_token_ids(tok) -> set[int]:
+    """The tokens that end a reply: the model's end-of-sequence, end-of-turn and end-of-message tokens as its GGUF
+    names them (the engine stops at the same ones), and `<|im_end|>` / `<|endoftext|>` where the vocabulary has them
+    as single tokens.  Qwen3.8-Flash-Next's EOS_IDS when the tokenizer names none."""
+    special = getattr(tok, "special_ids", None) or {}
+    ids = {int(v) for k, v in special.items()
+           if k in ("tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id")}
+    for text in (IM_END, "<|endoftext|>"):
+        try:
+            one = tok.encode(text, parse_special=True)
+        except (KeyError, ValueError):
+            continue
+        if len(one) == 1:
+            ids.add(one[0])
+    return ids or set(EOS_IDS)
 
 
 # The engine's own words for a verifier that cannot go on (its GPU waits were released, or an earlier window never
@@ -600,6 +617,7 @@ class StrataEngine:
     gpu_busy = None
     last_err: str | None = None          # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
+    eos_ids = EOS_IDS                    # the tokens that end a reply (Service sets the model's: stop_token_ids)
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
@@ -1333,7 +1351,7 @@ class StrataEngine:
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
-                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
+                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in self.eos_ids):
                             return
                         if reused0 is None:
                             reused0 = (self.last or {}).get("reused")
@@ -1469,7 +1487,7 @@ class StrataEngine:
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
-                                and not (out and out[-1] in EOS_IDS)):
+                                and not (out and out[-1] in self.eos_ids)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
                             # last token are in them) and decodes with MTP drafts again
                             self.slot_live[slot] = None
@@ -2697,8 +2715,9 @@ class Service:
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        self.stop_ids = stop_token_ids(tokenizer)
+        if hasattr(engine, "eos_ids"):
+            engine.eos_ids = self.stop_ids
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
