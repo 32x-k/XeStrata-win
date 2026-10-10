@@ -2512,9 +2512,12 @@ def settings_summary(cfg: dict, port=None) -> str:
 
 
 def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_browser=True, yes=False,
-          layer_split=None, reserve: int | None = None, browser: bool | None = None) -> int:
+          layer_split=None, reserve: int | None = None, browser: bool | None = None, host: str | None = None,
+          api_key: str | None = None) -> int:
     """reserve: --vram-reserve-mib given on this start, kept in the model's args from now on (#493).  browser:
-    --no-browser (False) or --browser (True) given on this start, kept in the config's "open_browser" (#609)."""
+    --no-browser (False) or --browser (True) given on this start, kept in the config's "open_browser" (#609).  host,
+    api_key: --host and --api-key given on this start, kept in the config's "host" and "api_key" (as setup writes
+    them)."""
     cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
     if missing:
@@ -2531,6 +2534,14 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
         cfg["open_browser"] = browser
         cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
         ok("saved for this model: " + ("the browser opens" if browser else "no browser"))
+    if host and cfg.get("host") != host:
+        cfg["host"] = host
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        ok(f"saved for this model: the server listens on {host} (--host)")
+    if api_key and cfg.get("api_key") != api_key:
+        cfg["api_key"] = api_key
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        ok("saved for this model: the API key (--api-key)")
     cfg_path.touch()                                     # the most recently used model
     if "--mtp" in cfg["args"][:-1]:
         refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
@@ -3102,12 +3113,13 @@ def main() -> int:
             pick_cfg = have[int(ask("Tune which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
         calibrate_config(pick_cfg)
         return 0 if a.no_start else start(pick_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
-                                          reserve=a.vram_reserve_mib, browser=a.browser)
+                                          reserve=a.vram_reserve_mib, browser=a.browser, host=a.host,
+                                          api_key=a.api_key)
     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
         update_installed_engine()
         if len(have) == 1:
             return start(have[0], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split, reserve=a.vram_reserve_mib,
-                         browser=a.browser)
+                         browser=a.browser, host=a.host, api_key=a.api_key)
         say()
         for i, c in enumerate(have, 1):
             say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
@@ -3115,7 +3127,7 @@ def main() -> int:
         pick = int(ask("Which one?", [str(i) for i in range(1, len(have) + 2)], "1", a.yes))
         if pick <= len(have):
             return start(have[pick - 1], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
-                         reserve=a.vram_reserve_mib, browser=a.browser)
+                         reserve=a.vram_reserve_mib, browser=a.browser, host=a.host, api_key=a.api_key)
 
     # ---- 1. the PC
     step(1, "checking your PC")
