@@ -81,6 +81,9 @@ It tells Strix Halo (gfx1151) apart by name, names the Radeon 8060S / 8050S / 80
 The kernel's boot options `ttm.pages_limit` and `ttm.page_pool_size` (in 4 KiB pages) give the GPU more of the shared memory.
 Setup changes no host setting.
 The engine counts an integrated GPU's free memory as the smaller of what its runtime reports and what Linux can give back (`MemAvailable`) less 6 GiB (upstream 004b15cd; `STRATA_UMA_HEADROOM_GIB` changes the 6).
+For the models that keep a RAM budget of their experts (UD-Q4_K_XL, UD-IQ4_XS), setup writes the expert cache as a number, not `auto` (upstream #1715).
+The cache and the budget draw on the same RAM, so `auto`, sized from the memory free at start, would count what the budget has not taken yet and leave the OS nothing.
+The number is the RAM less 24 GB and the budget (and a KV cache streamed to RAM), in slots; `--expert-cache N` in the config's `args` sets another.
 
 ### Where the KV cache lives, and its precision
 
@@ -159,7 +162,7 @@ The experimental speed projection loaded and ran on it upstream (it was made for
 setup's first question also offers **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)**,
 UkisAI's fine-tune of Qwen3.8-Flash-Next, trained to reach the answer with much less thinking.
 Its authors report 63% fewer thinking tokens, answers 1.8× sooner, and under 1% accuracy loss.
-The same architecture; three sizes (Q2_0, IQ2_XS, IQ3_XXS; no IQ3_S); its own image encoder.
+The same architecture; four sizes (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S); its own image encoder.
 Its authors recommend **IQ2_XS** (their Q2_0 is marked experimental).
 Its license is the Swift Open License 1.0: read it on the model page.
 
@@ -511,6 +514,7 @@ To switch between it and other model servers behind one address, see [LLAMA_SWAP
 | Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
 | What the model is doing right now | `GET /status`, `GET /slots` (a single slot, busy or idle) |
 | Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
+| The same for Prometheus, with vLLM's metric names (`Accept: text/plain` or `?format=prometheus`) | `GET /metrics` |
 | The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
 
 `/models` and `/v1/models` list only the loaded model, with its context limit and input modalities.
@@ -548,6 +552,8 @@ in the chat page (the "Thinking" menu), in `chat.py` (`/think low`), or over the
 | Anthropic | `"output_config": {"effort": "low" \| "medium" \| "high"}`, `"thinking": {"type": "disabled"}`, or `"thinking": {"type": "enabled", "budget_tokens": N}` (under 2K = low, under 8K = medium, more = high) |
 
 Without a setting the model uses its own default, **high**.
+`"reasoning_effort": "low"` (or `none`, `medium`, `high`) in the run config sets the level of every request that names none (upstream #1641).
+A `--reasoning-effort` in `args` is moved there by the server, with a note.
 `none` answers at once (fastest); `low` keeps the thinking short.
 The levels are instructions the model was trained with, not a hard token limit:
 on easy questions all three think briefly, on hard ones `high` thinks longest and is most accurate.
@@ -644,6 +650,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   `cloudflared tunnel --url http://127.0.0.1:8095`.
   **Set a key first**, or anyone with the link can use your PC:
   add `"api_key": "some-long-secret"` to `xestrata-<model>.json` (or set the `STRATA_API_KEY` environment variable); clients then send it as their API key.
+  Several keys, separated by commas, are all accepted (`"key1,key2"`, as llama.cpp does; `--api-key key1,key2` likewise).
   An API key that is given but empty refuses to start the server (it would switch authentication off).
   Streamed answers carry `X-Accel-Buffering: no`, so nginx-style proxies pass each token on at once.
   The web app's settings and MCP tools only answer XeStrata's own page.
@@ -727,11 +734,25 @@ A chat and an agent's subagent can then alternate without re-reading each other.
   Nothing tells conversations apart but their tokens, pictures and control-vector setting.
 - The default is 0 (off); `--prompt-cache 0` turns it off too.
   Parked conversations are not kept across restarts, unless [the next section](#keeping-parked-conversations-across-restarts-opt-in) is set up.
-- Before each copy the engine checks that `--conversation-cache-min-free-mib N` (default 2560) of RAM stays free (`MemAvailable`).
-  If it does not, or the copy does not fit the budget, it skips parking and reads the prompt as before.
-  The oldest parked conversation is dropped first.
+- Before each copy the engine checks that `--conversation-cache-min-free-mib N` (default 2560) of RAM stays free (the figure is read as below).
+  If it does not, it evicts the oldest parked conversations and checks again (upstream 940011da).
+  If that is still not enough, or the copy does not fit the budget, it skips parking and reads the prompt as before.
+  To fit the budget, too, the oldest parked conversation is dropped first.
+- `--conversation-cache-min-tokens N` (default 0 = every one) parks only conversations of at least N tokens (upstream 624070c5).
+  A parked conversation takes one of the slots whatever its length, so a client that puts short side requests between the turns of a long conversation filled the slots with them and evicted the long one.
 - A copy that fails to go back stops the engine instead of letting it answer from half a state.
 - After a restore, the K/V pages a conversation has not changed are reused for its next copy (`STRATA_SNAPSHOT_FULL_CAPTURE=1` turns that off).
+
+**How the available RAM is read** (upstream daa76552): the RAM checked before parking a conversation and before saving or restoring a conversation file is the smallest of:
+
+1. `MemAvailable`
+1. The room under the memory limits of the engine's cgroup and of every cgroup above it (v2 `memory.max` and `memory.high`, v1 `memory.limit_in_bytes`), less what is in use.
+   The clean inactive file cache (`inactive_file` in `memory.stat`) is not counted as in use.
+   A cgroup file that cannot be read makes the guard warn once and use `MemAvailable` alone without `--memory-limit-mib`; with it, the figure is unknown and nothing is parked.
+1. `--memory-limit-mib N` (or `STRATA_MEMORY_LIMIT_MIB=N`; the flag wins, 0 = no limit) less what the engine's container uses now.
+   For a container that cannot see its own limit: the total, in MiB, it may use.
+
+Started with `--serve`, the engine prints this breakdown in one `memory guard:` line.
 
 Measured on the B70 with IQ2_XS: a 970-token conversation (8K context, FP16 KV) is 251 MiB parked, copied out in 70–104 ms and back in 21–23 ms.
 Its answers and state match a run without parking byte for byte:
@@ -789,6 +810,9 @@ curl -X POST "http://127.0.0.1:8095/slots/0?action=restore" -H "Content-Type: ap
   The files hold the conversation's tokens and state and are created with mode 0600. Nothing deletes them.
 - `filename` is a file name inside DIR only: no path, drive, `:`, Windows device name, control character, leading `.`, or trailing `.` or space.
 - Before a save, the disk must have room for the new file plus `--session-min-free-mib` (an engine argument; default 4096, 0 = no check).
+- `--session-save-reclaim` (an engine argument, off by default; upstream 73ed39ae): a save that fails its RAM check first releases host caches that can be rebuilt, then checks again.
+  In this order: the retained K/V copies, the oldest unpinned parked conversations, the unpinned checkpoints other than the one written to the file.
+  Pinned prefixes and the checkpoint written stay. The server gives the released RAM up to 30 seconds to show in the figures before it tries again.
 - A file is restored only by the same engine version with the same model files and settings (KV precision, context length, MTP, control vector and so on).
   A file that does not match, or a damaged one, is refused, and the engine's conversation stays as it was.
 - Only the checkpoint at the start of the last turn is saved: a continuation that edits an earlier turn reads again from there.
@@ -816,10 +840,14 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
   With no block at all, a request without sampling keys decodes greedy.
 - The penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`) ride the same path.
   `penalty_last_n` caps how many recent tokens they count over, 64 by default when any penalty is set.
+  llama.cpp's names `repeat_penalty` and `repeat_last_n` work too, in the config's `sampling` block and in a request (upstream #1819).
   They count the tokens the request has consumed, so a repetition penalty suppresses what the model itself just said, not the prompt alone.
   They apply to every token speculative decoding checks at once, exactly as if it decoded one token at a time.
   The draft layer guesses without penalties, so more of its guesses are rejected and requests with penalties run slower.
 - `top_k` keeps at most 64 candidates: `0` ("off") or anything above 64 uses all 64.
+- A sampling field sent as a numeric string (`"0.7"`) is read and used; a value that cannot be read as a number, or of another type (`true`), is a 400 that names the field (upstream #1663).
+- **logit_bias**: `"logit_bias"` in `/v1/chat/completions` (`{"<token id>": -100 to 100}`, or a list of `[id, bias]` pairs) is added before the penalties and filters (upstream dcc6f756).
+  -100 (`false` in a pair list) keeps the token out. Not with parallel requests (`"parallel"`).
 - `STRATA_SPEC_GUMBEL=1` (opt-in, upstream 6381df34) picks a sampled request's token by Gumbel-max.
   The noise is drawn per token id instead of along the probability-sorted list, so the tokens follow the same distribution while `--coupled-draft` drafts agree more often with the target's pick.
   With `--coupled-draft`, temperature 1.0 / top_p 0.95 / top_k 20 and eight 200-token story and code answers, three runs each, the median decode went from 51.05 to 52.05 tokens/s (+2.0%) on an RTX 4070 and from 80.25 to 72.75 tokens/s (-9%) on the B70.
@@ -1159,6 +1187,7 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 | Pictures are slow | The encoder runs on the CPU: run setup again with `--vision gpu`. |
 | A request never finishes (`no progress for ... s`) | When the engine stops making progress, the request ends with an error (after 1 minute) and the next request starts the engine again. The log says where it stopped and what every CPU pool thread and the GPU handshake were doing. If you see it, please open an issue with that report. (`STRATA_WATCHDOG_S` sets the time in seconds; 0 turns it off.) |
 | `the engine said nothing for ... s during the request` | The engine and the server lost step (the engine waits for its next command, the server for the request's end; GPU at 0%, nothing in the log; upstream #481). The server ends the engine after 300 s without a line from it during a request, the request ends with an error and the next request starts the engine again. `"engine_silence_s": 600` in `xestrata-<model>.json` sets the time (0 = wait forever, as before). |
+| `the engine said nothing for ... s and used no CPU or disk in that time (frozen ...)` | A quicker version of the check above (upstream #1317): an engine that prints nothing and uses no CPU or disk for 90 s is taken as stuck, ended, and started again by the next request. One whose GPU is busy (10% or more) or that is silent but working is not ended, only reported once. `STRATA_ENGINE_STALL_S` sets the time (0 = off). While a prompt layer reads the file tier again (low RAM), the engine's own watchdog also waits up to 10 times as long (`STRATA_WATCHDOG_IO_S`, upstream #1407). |
 | Anything else | The engine log is `xestrata-<model>.log` in the XeStrata folder; attach it to an issue. |
 
 ---
