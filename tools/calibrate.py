@@ -41,6 +41,7 @@ sys.path.insert(0, str(ROOT))
 MIN_GAIN = 0.03                    # a setting must beat the default by this much to be kept
 PCIE_FRACS = (0.0, 0.2, 0.35, 0.55, 0.75, 0.9, 1.0)   # 1.0: every miss over PCIe, the CPU pool gets no expert
 SPEC_MIN_PS = (0.3, 0.5, 0.7)
+SWEEP_ROUNDS = 3                   # how many times the sweep visits each value (see `sweep`)
 # the adaptive tier's candidates (every, swaps, decay) against the engine's own (None): swapping more and remembering
 # longer, the rest of the set as the engine has it
 ADAPT_CANDIDATES = (None, ("1", "80", "0.97"), ("1", "160", "0.97"))
@@ -212,6 +213,28 @@ def share_name(pcie) -> str:
     return "split (the engine's own)" if pcie is None else f"share {pcie:.2f}"
 
 
+def sweep(s, values: list, tune, name, label: str, say) -> dict:
+    """Every value, `SWEEP_ROUNDS` times, one round visiting all of them and every other round in reverse order
+    (upstream d1990da1).  `tune(v)`: the request's tuning keys for value v; `name(v)`: how it is printed.
+
+    A single rate per value cannot order neighbours.  upstream #1332 has 0.75 to 0.95 inside each other's noise at
+    72.7, 69.0, 71.0 and 71.9, and that box moved 8-28% between engine starts at an unchanged setting.  Rotating the
+    values inside one engine start puts that drift on every value the same number of times, and the median over the
+    rounds keeps a single bad sample from deciding.  The caller takes the winner from the medians.
+    """
+    out = {v: [] for v in values}
+    for r in range(SWEEP_ROUNDS):
+        for v in (values if r % 2 == 0 else values[::-1]):
+            out[v].append(s.rate(tune(v)))
+        say(f"    round {r + 1}/{SWEEP_ROUNDS} {label}: " +
+            "  ".join(f"{name(v)} {statistics.median(out[v]):.1f}" for v in values))
+    med = {v: statistics.median(out[v]) for v in values}
+    say(f"    {label}, median of {SWEEP_ROUNDS}: " +
+        ", ".join(f"{name(v)}: {med[v]:.1f} ({min(out[v]):.1f}-{max(out[v]):.1f})" for v in values) +
+        f" -> best {name(max(med, key=lambda k: med[k]))}")
+    return out
+
+
 def measure(base_args: list[str], ids_list, start_engine, say=print, extra_workers=()) -> dict:
     t0 = time.time()
     report: dict = {}
@@ -226,22 +249,17 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
         s.warm_up()
         # 1. the PCIe share, at the default draft floor, against the engine's own split of the missed experts (None:
         #    no share given - the split it measured at start, or its link's share where it measures none)
-        by_pcie = {}
-        for f in [None] + sorted(PCIE_FRACS):
-            by_pcie[f] = [s.rate(tune_of(f, d_minp))]
-            say(f"    PCIe {share_name(f)}: {by_pcie[f][0]:.1f} tok/s")
-        best_pcie = max(by_pcie, key=lambda k: by_pcie[k][0])
+        by_pcie = sweep(s, [None] + sorted(PCIE_FRACS), lambda f: tune_of(f, d_minp), share_name, "PCIe", say)
+        best_pcie = max(by_pcie, key=lambda k: statistics.median(by_pcie[k]))
         # 2. the draft floor, at that share
-        by_minp = {}
-        for p in sorted(set(SPEC_MIN_PS) | {round(d_minp, 2)}):
-            by_minp[p] = [s.rate(tune_of(best_pcie, p))]
-            say(f"    draft floor {p:.2f}: {by_minp[p][0]:.1f} tok/s")
-        best_minp = max(by_minp, key=lambda k: by_minp[k][0])
-        # 3. the winner against the default, interleaved, three times each
+        by_minp = sweep(s, sorted(set(SPEC_MIN_PS) | {round(d_minp, 2)}), lambda p: tune_of(best_pcie, p),
+                        lambda p: f"{p:.2f}", "draft floor", say)
+        best_minp = max(by_minp, key=lambda k: statistics.median(by_minp[k]))
+        # 3. the winner against the default, interleaved, the same number of rounds
         dflt, cand = (None, round(d_minp, 2)), (best_pcie, best_minp)
         confirm: dict[tuple, list[float]] = {dflt: [], cand: []}
         if cand != dflt:
-            for _ in range(3):
+            for _ in range(SWEEP_ROUNDS):
                 for k in (dflt, cand):
                     confirm[k].append(s.rate(tune_of(k[0], k[1])))
         chosen = pick(confirm, dflt) if cand != dflt else dflt
