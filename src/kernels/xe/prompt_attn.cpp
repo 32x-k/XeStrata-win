@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/xe/prompt_attn.cpp - see include/strata/kernels/prompt_attn.hpp.
 #include "strata/kernels/prompt_attn.hpp"
-#include "strata/kernels/f16_bits.hpp"
 #include "strata/core/runtime.hpp"
 
 #include <sycl/sycl.hpp>
@@ -14,6 +13,10 @@ namespace strata::kernels {
 namespace {
 
 constexpr int NT = 256;   // work-items a work-group
+
+// the device's own conversion (f16_bits.hpp's exact one branches and loops: in the inner loops it took most of the
+// time); the pools hold no subnormals worth the difference
+inline float h2f(uint16_t bits) { return (float) sycl::bit_cast<sycl::half>(bits); }
 
 // BQ queries of one KV head: R = BQ x G rows (query, head), Q in local memory as FP32 (scaled), the step's BK cells of
 // K and V as FP16, the step's scores (then probabilities) per row.  Work-item t owns column d = t % HD of rows t / HD,
@@ -79,7 +82,7 @@ struct Kernel {
                 float s = -std::numeric_limits<float>::infinity();
                 if (c <= qpos && c < n_cells) {
                     s = 0.0f;
-                    for (int dd = 0; dd < HD; ++dd) s = sycl::fma(Q[r * QS + dd], f32_from_f16(K[j * KS + dd]), s);
+                    for (int dd = 0; dd < HD; ++dd) s = sycl::fma(Q[r * QS + dd], h2f(K[j * KS + dd]), s);
                 }
                 S[i] = s;
             }
@@ -103,7 +106,7 @@ struct Kernel {
             for (int k = 0; k < OPT; ++k) {
                 const int r = r0 + k * RS;
                 float acc = o[k] * A[r];
-                for (int j = 0; j < BK; ++j) acc = sycl::fma(S[r * BK + j], f32_from_f16(V[j * HD + d]), acc);
+                for (int j = 0; j < BK; ++j) acc = sycl::fma(S[r * BK + j], h2f(V[j * HD + d]), acc);
                 o[k] = acc;
             }
         }
