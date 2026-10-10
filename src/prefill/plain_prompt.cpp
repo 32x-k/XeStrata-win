@@ -163,15 +163,17 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
 
                 // the MoE
                 k::native_qsa_rms_norm_weighted(P.x, b.post_norm, P.hn, (int) N, (int) T, eps, cs);
-                for (int64_t t = 0; t < T; ++t)
-                    k::f32_gemv_fp32_mmvf(P.hn + t * N, b.router, P.rlog + t * E, N, E, cs);
+                for (int64_t t = 0; t < T; t += 8)
+                    k::f32_gemv_fp32_mmvf_multi(P.hn + t * N, N, b.router, P.rlog + t * E, E, N, E,
+                                                (int) std::min<int64_t>(8, T - t), cs);
                 k::router_top10(P.rlog, (int) T, (int) E, (int) K, P.ids, P.w, cs);
                 f16(P.hn, T, N);
                 if (has_shared_) {
                     proj(b.sh_gate, P.sh_gate, T);
                     proj(b.sh_up, P.sh_up, T);
-                    for (int64_t t = 0; t < T; ++t)
-                        k::f32_gemv_fp32_mmvf(P.hn + t * N, b.sh_gate_inp, P.sh_g + t, N, 1, cs);
+                    for (int64_t t = 0; t < T; t += 8)
+                        k::f32_gemv_fp32_mmvf_multi(P.hn + t * N, N, b.sh_gate_inp, P.sh_g + t, 1, N, 1,
+                                                    (int) std::min<int64_t>(8, T - t), cs);
                 }
                 // the routed experts grouped by expert, on the host from this layer's ids
                 if (!strata::gpu::copy_async(P.h_ids, P.ids, (size_t) (T * K) * 4, cs) || !strata::gpu::stream_sync(cs)) {

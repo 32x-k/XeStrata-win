@@ -461,4 +461,26 @@ void f32_gemv_fp32_mmvf(const float* x, const float* w, float* y, int64_t n_in, 
     if (!stream) core::Runtime::get().finish(q);
 }
 
+void f32_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const float* w, float* y, int64_t ldy, int64_t n_in,
+                              int64_t n_out, int n_tok, void* stream) {
+    if (n_tok < 1 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_in > std::numeric_limits<int>::max() ||
+        n_out <= 0 || n_out > std::numeric_limits<int>::max() || (ldx & 1) != 0 || x == nullptr || w == nullptr ||
+        y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0 || (reinterpret_cast<uintptr_t>(w) & 7u) != 0 ||
+        (reinterpret_cast<uintptr_t>(y) & 3u) != 0)
+        throw std::invalid_argument("f32_gemv_fp32_mmvf_multi: 1..8 rows, even n_in/ldx, aligned pointers");
+    auto& q = queue_for(stream);
+    const int ni = (int) n_in;
+    switch (mmvf_block_size(n_in)) {
+        case 32: launch_mmvf<32, 8>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
+        case 64: launch_mmvf<64, 8>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
+        case 96: launch_mmvf<96, 8>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
+        case 128: launch_mmvf<128, 8>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
+        case 160: launch_mmvf<160, 8>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
+        case 192: launch_mmvf<192, 8>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
+        case 224: launch_mmvf<224, 8>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
+        default: launch_mmvf<256, 8>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
+    }
+    if (!stream) core::Runtime::get().finish(q);
+}
+
 }  // namespace strata::kernels

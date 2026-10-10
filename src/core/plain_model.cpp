@@ -666,8 +666,7 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) 
 
         // the MoE: route, publish, the shared expert while the host serves, then the experts and the combine
         k::native_qsa_rms_norm_weighted(x_, b.post_norm, hn_, (int) N, T, eps, cs);
-        for (int t = 0; t < T; ++t)
-            k::f32_gemv_fp32_mmvf(hn_ + (size_t) t * N, b.router, rlog_ + (size_t) t * E, N, E, cs);
+        k::f32_gemv_fp32_mmvf_multi(hn_, N, b.router, rlog_, E, N, E, T, cs);
         k::router_top10(rlog_, T, (int) E, (int) K, ids_, w_, cs);
         ++ring;
         win_.publish(ring, 0, 0, T, hn_, ids_, w_, cs);
@@ -680,7 +679,7 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) 
             }
             k::native_swiglu_q8_1(sh_gate_, sh_up_, xq_, (int) FS, T, cs);
             k::native_mmvq(b.sh_down.type, b.sh_down.data, xq_, shared_, (int) FS, (int) N, T, cs);
-            for (int t = 0; t < T; ++t) k::f32_gemv_fp32_mmvf(hn_ + (size_t) t * N, b.sh_gate_inp, sh_g_ + t, N, 1, cs);
+            k::f32_gemv_fp32_mmvf_multi(hn_, N, b.sh_gate_inp, sh_g_, 1, N, 1, T, cs);
         }
         if (win_.segmented()) {   // a graph ends where the host must answer the ring
             strata::gpu::Graph* g = nullptr;
