@@ -541,16 +541,7 @@ if(STRATA_ENABLE_XE)
     # values set above on a first configure (the rocBLAS backend then got an empty --offload-arch= and the compiler
     # failed; the cuBLAS backend got its default architecture): CMP0126 keeps them
     set(CMAKE_POLICY_DEFAULT_CMP0126 NEW)
-    # the cuBLAS backend's own GPU code in the same PTX version: this directory's options while oneMath is added
-    get_directory_property(_strata_copts COMPILE_OPTIONS)
-    get_directory_property(_strata_lopts LINK_OPTIONS)
-    if(_strata_hip_opts)   # ROCm's device libraries, for the rocBLAS backend's own GPU code
-      add_compile_options(${_strata_hip_opts})
-      add_link_options(${_strata_hip_opts})
-    endif()
     if(_strata_cuda_base_opts)
-      add_compile_options(${_strata_cuda_base_opts})
-      add_link_options(${_strata_cuda_base_opts})
       set(CUDA_TOOLKIT_ROOT_DIR "${_strata_cuda_root}" CACHE PATH "the CUDA toolkit (cmake/StrataCuda.cmake)" FORCE)
     endif()
     # oneMath is not in the repository: XeStrata's fork (https://github.com/MistVVK/oneMath, branch xestrata: oneMath's
@@ -574,7 +565,17 @@ if(STRATA_ENABLE_XE)
     set(_STRATA_ONEMATH_KEY "${_strata_onemath_url}" CACHE INTERNAL "the archive the oneMath tree came from")
     add_subdirectory(${strata_onemath_SOURCE_DIR} ${CMAKE_BINARY_DIR}/onemath EXCLUDE_FROM_ALL)
     unset(CMAKE_POLICY_DEFAULT_CMP0126)
-    set_directory_properties(PROPERTIES COMPILE_OPTIONS "${_strata_copts}" LINK_OPTIONS "${_strata_lopts}")
+    # ROCm's device libraries for the rocBLAS backend's own GPU code, and the CUDA toolkit and PTX version for the
+    # cuBLAS backend's: on those backends only, as the others (oneMKL's, the loader) build no AMD or NVIDIA code and
+    # the compiler warns of the unused arguments
+    if(_strata_hip_opts AND TARGET onemath_blas_rocblas)
+      target_compile_options(onemath_blas_rocblas_obj PRIVATE ${_strata_hip_opts})
+      target_link_options(onemath_blas_rocblas PRIVATE ${_strata_hip_opts})
+    endif()
+    if(_strata_cuda_base_opts AND TARGET onemath_blas_cublas)
+      target_compile_options(onemath_blas_cublas_obj PRIVATE ${_strata_cuda_base_opts})
+      target_link_options(onemath_blas_cublas PRIVATE ${_strata_cuda_base_opts})
+    endif()
     unset(BUILD_SHARED_LIBS)
     if(_strata_libcuda_stubs)
       list(REMOVE_ITEM CMAKE_LIBRARY_PATH "${_strata_libcuda_stubs}")
