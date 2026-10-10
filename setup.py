@@ -288,6 +288,30 @@ MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # under the Qwen Community License, so in third_party/nonfree (XeStrata runs without that folder)
 ESP_VECTOR = (ROOT / "third_party" / "nonfree" / "experimental-speed-projection" /
               "Qwen3.8-Flash-Next-experimental-speed-projection.gguf")
+ESP_SIZE, ESP_SHA256 = 483520, "ef0724c5b79297e481017be85769832bc26eb220c984ecba2b0e1b0c8426312b"
+
+
+def esp_release_url(name: str) -> str:
+    """A file of the vector's folder at the installed version's tag on GitHub: the package leaves third_party/nonfree
+    out, so its setup downloads the vector from there."""
+    return (f"https://raw.githubusercontent.com/MistVVK/XeStrata/xe{source_version()}/"
+            f"third_party/nonfree/experimental-speed-projection/{name}")
+
+
+def esp_download(data: Path) -> Path | None:
+    """The package's copy of ESP_VECTOR in the data folder, downloaded with its license; None when the version's tag
+    is not on GitHub (a package built from an unreleased tree)."""
+    dst = data / "experimental-speed-projection" / ESP_VECTOR.name
+    if not (dst.exists() and done(dst)) and not reachable(esp_release_url(ESP_VECTOR.name), timeout=30):
+        warn(f"the experimental speed projection's vector is not at {esp_release_url(ESP_VECTOR.name)}: left off. "
+             "Pass --experimental-speed-projection <its GGUF>")
+        return None
+    download(esp_release_url("LICENSE"), dst.with_name("LICENSE"), "the experimental speed projection's license")
+    download(esp_release_url(ESP_VECTOR.name), dst, "the experimental speed projection's vector")
+    verify_sha256(dst, ESP_SIZE, ESP_SHA256)
+    return dst
+
+
 # the image encoder on the GPU (~1.2 GB at 1024 image tokens) warms up before the engine starts, so the engine
 # sizes its expert slots around it and the default reserve (700 MiB) is enough; engines before 0.1.2 need more
 VISION = {"gpu": {"max_tokens": 1024, "reserve_mib": 700},
@@ -3357,13 +3381,16 @@ def main() -> int:
             say("  EXPERIMENTAL - speed projection: a small control vector applied while the model runs (layers 4-44).")
             say("  It changes how the model answers: its package describes it as a refusal-direction projection (the")
             say("  model declines far fewer requests). Off unless you choose it; when on, the web app can switch it")
-            say("  off per chat. Details: third_party/nonfree/experimental-speed-projection/README.md")
+            say("  off per chat. Details: " + (esp_release_url("README.md") if PACKAGED else
+                                               "third_party/nonfree/experimental-speed-projection/README.md"))
             esp_choice = ("on" if ask("Turn on the experimental speed projection?", ["y", "n"], "n", a.yes) == "y"
                           else "off")
         if esp_choice.lower() not in ("off", "no", "n", "0"):
             esp = (ESP_VECTOR if esp_choice.lower() in ("on", "yes", "y", "1")
                    else Path(esp_choice).expanduser().resolve())
-            if not esp.is_file() and esp == ESP_VECTOR:   # third_party/nonfree removed: the rest works without it
+            if not esp.is_file() and esp == ESP_VECTOR and PACKAGED:
+                esp = esp_download(data)
+            elif not esp.is_file() and esp == ESP_VECTOR:   # third_party/nonfree removed: the rest works without it
                 warn(f"the experimental speed projection's vector is not here ({esp}): left off. Put the vector "
                      "there, or pass --experimental-speed-projection <its GGUF>")
                 esp = None
