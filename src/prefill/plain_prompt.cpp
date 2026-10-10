@@ -35,7 +35,9 @@
 #include "strata/prefill/moe_mmq.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <vector>
@@ -78,6 +80,18 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
         gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
     };
     const int attn_batch = std::max(1, std::min(opt_.max_t, 8));   // queries an attention launch takes (its scratch)
+    // STRATA_PROMPT_PROFILE=1: the time of each stage, the stream synchronized after each (slower; for finding where it
+    // goes): 0 the mixer, 1 the router and the host's grouping, 2 the experts, 3 the shared expert and the combine
+    static const bool profile = std::getenv("STRATA_PROMPT_PROFILE") != nullptr;
+    double stage_ms[4] = {};
+    auto mark = [&](int stage, std::chrono::steady_clock::time_point& t) {
+        if (!profile) return;
+        strata::gpu::stream_sync(cs);
+        const auto now = std::chrono::steady_clock::now();
+        stage_ms[stage] += std::chrono::duration<double, std::milli>(now - t).count();
+        t = now;
+    };
+    auto t_mark = std::chrono::steady_clock::now();
     try {
         for (int64_t c0 = 0; c0 < n; c0 += P.T) {
             const int64_t T = std::min<int64_t>(P.T, n - c0), p0 = pos + c0;
@@ -144,6 +158,7 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                     proj(b.o, P.mix, T);
                 }
                 k::add_inplace(P.x, P.mix, T * N, cs);
+                mark(0, t_mark);
 
                 // the MoE
                 k::native_qsa_rms_norm_weighted(P.x, b.post_norm, P.hn, (int) N, (int) T, eps, cs);
@@ -195,6 +210,7 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                     return false;
                 }
                 prefill::gather_rows16(P.x16, P.src, P.xs16, T * K, N, cs);
+                mark(1, t_mark);
                 const auto& f = lay.fmt[(size_t) ml];
                 const bool transient = src_->transient(ml, experts.empty() ? 0 : experts[0]);
                 int64_t max_rows = 0;
@@ -233,6 +249,7 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                     if (!prefill::Gemm::f16_groups(P.h16, P.dq_d, P.d_elems, P.dm, hbnd, G, N, FF, cs))
                         k::xmx_gemm_grouped(P.h16, P.dq_d, P.d_elems, P.dm, dbnd, G, max_rows, N, FF, cs);
                 }
+                mark(2, t_mark);
                 // routing entry i's output into row i, then the weighted sum (and the gated shared expert)
                 k::gather_rows(reinterpret_cast<const uint8_t*>(P.dm), N * 4, P.slot, T * K,
                                reinterpret_cast<uint8_t*>(P.parts), cs);
@@ -243,6 +260,7 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                 k::native_moe_combine_multi(P.parts, P.w, has_shared_ ? P.shared : nullptr, P.moe_out, N, K, (int) T,
                                             cs, has_shared_ ? P.sh_g : nullptr);
                 k::add_inplace(P.x, P.moe_out, T * N, cs);
+                mark(3, t_mark);
             }
             if (c0 + T >= n) {   // the last token's logits, by the decode's head
                 k::native_qsa_rms_norm_weighted(P.x + (T - 1) * N, out_norm_, P.hn, (int) N, 1, eps, cs);
@@ -262,6 +280,9 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
         err = std::string("plain prompt: ") + strata::gpu::last_error();
         return false;
     }
+    if (profile)
+        std::fprintf(stderr, "strata plain: prompt of %lld tokens: mixer %.1f ms, router and grouping %.1f, experts %.1f, "
+                             "shared and combine %.1f\n", (long long) n, stage_ms[0], stage_ms[1], stage_ms[2], stage_ms[3]);
     *out = ((volatile int32_t*) h_out_)[0];
     if (logits != nullptr && !strata::gpu::copy(logits, logits_, (size_t) n_vocab_ * 4)) {
         err = "plain prompt: reading the logits failed";
