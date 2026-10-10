@@ -176,12 +176,19 @@ Lint and commit it on `dev` (it is not in the tag).
 
 ## 10. The final release (確定報)
 
-Take the stage lines out of the notes, add the tables (Japanese and English sections) with the engines' versions, the GPUs and the model, and:
+The final release is reached a GPU at a time (the user's decision, 2026-10-11): as soon as one GPU's tables are complete (its generate table and its serve and everyday table both), add them to the notes (Japanese and English sections) and update the release (`gh release edit`, below), without waiting for the other GPUs.
+
+- The comparison section comes after the notes' other sections: its opening lines (the engines' versions, the model, the method), then the note on temperatures and what counts as equal (below) right after them, once, then the GPUs in a fixed order, the B70, the RTX 4070, the RX 9060 XT, each as its tables are done.
+- While some are missing, one line under the done ones names them: B70・RTX 4070: 計測中（後で足す） / B70, RTX 4070: being measured (added later).
+- The first update replaces the preliminary stage line with that section; when the last GPU is in, the line of the missing GPUs goes too.
+- Report the release's URL and the GPU's tables at each update.
+
+The tables:
 
 The notes' table is one per GPU, from `bench-collect.py`'s medians (the record's README keeps `bench-collect.py`'s own tables): a row per tier, named by the model's weight type and the length (`IQ3_XXS 1K`), and for prefill and then decode three columns (the LLM terms, in both languages; the user's decision, 2026-10-11): XeStrata's value, upstream's, and the difference (the value columns named with the engine and its version, `XeStrata xe0.1.40.2.1`, `upstream v0.1.41`), marked ✅ where XeStrata is faster and ❌ where it is slower: prefill as a ratio (`✅ 2.1 倍`, `✅ ×2.1`), decode as a percentage (`✅ +14%`; slower: `❌ −3%`).
 Within ±1% (either way) the two count as equal: `≒ 同等（−0.1%）` / `≈ equal (−0.1%)`, for prefill as well.
 A value upstream was stopped in is 計測不能（低速） / not measurable (too slow), its difference `✅`, with the line saying upstream was stopped at 10 tok/s or less; a value that does not fit stays `-`.
-Above each GPU's tables: the GPU (and its memory) and which build of upstream it ran (`sycl/`, CUDA, HIP); above the first GPU, the engines' versions, the model and the method (256 tokens, the median of two alternating runs).
+Above each GPU's tables: the GPU (and its memory) and which build of upstream it ran (`sycl/`, CUDA, HIP).
 Each table has a heading line with its temperature: **generate**（温度 0、トークン/秒） / **generate** (temperature 0, tokens/s), and **serve と通常使用**（温度 0.7） / **serve and everyday use** (temperature 0.7).
 
 ```markdown
@@ -212,7 +219,7 @@ Equal there is the upstream merge's check (`judge.py`): prefill within ±1%, the
 | agent decode (tok/s) | 46.2 | 45.0 | ≒ 同等（+3%） |
 ```
 
-Below the first GPU's tables only (not repeated for the others), one note in each language section, with the temperatures and what counts as equal:
+Right after the section's opening lines, once (not repeated for each GPU), one note in each language section, with the temperatures and what counts as equal:
 
 ```markdown
 > [!NOTE]
@@ -231,5 +238,3 @@ Below the first GPU's tables only (not repeated for the others), one note in eac
 ```sh
 gh release edit xe<VERSION> --repo MistVVK/XeStrata --notes-file build/release/xe<VERSION>/NOTES.md
 ```
-
-Report the release's URL and the tables.
