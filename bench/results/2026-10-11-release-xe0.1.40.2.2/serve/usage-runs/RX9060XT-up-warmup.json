@@ -1,0 +1,22 @@
+{
+ "gpu": "RX9060XT",
+ "arm": "up",
+ "round": 0,
+ "context": 262144,
+ "temperature": 0.7,
+ "turns": [
+  {
+   "conv": "chat-ja",
+   "turn": 0,
+   "ttft_s": 1.0932662569975946,
+   "prompt_n": 84,
+   "cache_n": 0,
+   "prompt_ms": 1023.5,
+   "predicted_n": 165,
+   "predicted_ms": 8112.8,
+   "draft_n": 120,
+   "draft_n_accepted": 82
+  }
+ ],
+ "why": null
+}
