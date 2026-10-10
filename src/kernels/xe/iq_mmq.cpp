@@ -82,8 +82,8 @@ constexpr bool built() {
 // ---------------------------------------------------------------- the weights' blocks of 32 values
 // v[j]: values 4j .. 4j + 3 as signed bytes; s0, s1: the scales of values 0-15 and 16-31.
 struct Sub {
-    uint32_t v[8] = {};
-    float s0 = 0.0f, s1 = 0.0f;
+    uint32_t v[8];
+    float s0, s1;
     float m = 0.0f;   // the K-quants' min term: the block's values less m (Q4_K, Q5_K)
 };
 // the grid bytes (below 128) negated where m is 0xFF
@@ -379,7 +379,7 @@ constexpr int up128(int b) { return (b + 127) / 128 * 128; }
 // along a row), and a tile a sub-group on its way out.  DP4A: the same tiles and steps without matrix engines (the
 // GPUs iq_mmq_usable says no for: RDNA2, Volta, Intel's without XMX), each work-item a column of outputs down
 // WM / (lanes / WN) of the rows, the products by dp4a.
-template<int TY, int SGM, int NSGM, bool DP4A = false>
+template<int TY, int SGM, int NSGM, bool DP4A = false, bool TAIL = false>
 struct Kernel {
     static constexpr int SGN = 2, NSGN = 4, NSG = NSGM * NSGN;
     static constexpr int WM = NSGM * SGM * TM, WN = NSGN * SGN * TN;
@@ -423,7 +423,7 @@ struct Kernel {
         const int64_t kb = K / 32;   // activation scales a row
         for (int64_t k0 = 0; k0 < K; k0 += KC) {
             sycl::group_barrier(it.get_group());   // the last step's tiles are read
-            const bool last = k0 + KC > K;   // a last step past K: what lies past it is zeros
+            const bool last = TAIL && k0 + KC > K;   // TAIL: a last step past K, zeros past it
             for (int v = lid; v < WM * (KC / 16); v += lanes) {
                 const int rr = v / (KC / 16), c = v % (KC / 16) * 16;
                 const int64_t row = m0 + rr;
@@ -440,7 +440,7 @@ struct Kernel {
             for (int v = lid; v < WN * NB; v += lanes) {
                 const int nn = v / NB, b = v % NB;
                 const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b)
-                                                : Sub{};   // past K (a last step of fewer blocks): zeros
+                                                : Sub{{}, 0.0f, 0.0f, 0.0f};   // past K: zeros
                 u32x4* o = reinterpret_cast<u32x4*>(bl + nn * LDB + b * 32);
                 o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
                 o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
@@ -511,7 +511,7 @@ struct Kernel {
             const int64_t kb = K / 32;   // activation scales a row
             for (int64_t k0 = 0; k0 < K; k0 += KC) {
                 sycl::group_barrier(it.get_group());   // the last step's tiles are read
-                const bool last = k0 + KC > K;   // a last step past K: what lies past it is zeros
+                const bool last = TAIL && k0 + KC > K;   // TAIL: a last step past K, zeros past it
                 for (int v = lid; v < WM * (KC / 16); v += lanes) {
                     const int rr = v / (KC / 16), c = v % (KC / 16) * 16;
                     const int64_t row = m0 + rr;
@@ -528,7 +528,7 @@ struct Kernel {
                 for (int v = lid; v < WN * NB; v += lanes) {
                     const int nn = v / NB, b = v % NB;
                     const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b)
-                                                : Sub{};   // past K (a last step of fewer blocks): zeros
+                                                : Sub{{}, 0.0f, 0.0f, 0.0f};   // past K: zeros
                     u32x4* o = reinterpret_cast<u32x4*>(bl + static_cast<int>(nn * LDB + b * 32));
                     o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
                     o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
@@ -633,7 +633,7 @@ struct Kernel {
             const int64_t kb = K / 32;   // activation scales a row
             for (int64_t k0 = 0; k0 < K; k0 += KC) {
                 sycl::group_barrier(it.get_group());   // the last step's tiles are read
-                const bool last = k0 + KC > K;   // a last step past K: what lies past it is zeros
+                const bool last = TAIL && k0 + KC > K;   // TAIL: a last step past K, zeros past it
                 for (int v = lid; v < WM * (KC / 16); v += lanes) {
                     const int rr = v / (KC / 16), c = v % (KC / 16) * 16;
                     const int64_t row = m0 + rr;
@@ -650,7 +650,7 @@ struct Kernel {
                 for (int v = lid; v < WN * NB; v += lanes) {
                     const int nn = v / NB, b = v % NB;
                     const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b)
-                                                : Sub{};   // past K (a last step of fewer blocks): zeros
+                                                : Sub{{}, 0.0f, 0.0f, 0.0f};   // past K: zeros
                     u32x4* o = reinterpret_cast<u32x4*>(bl + nn * LDB + b * 32);
                     o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
                     o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
@@ -717,11 +717,11 @@ struct Kernel {
     }
 };
 
-template<int TY, int SGM, int NSGM, bool DP4A>
+template<int TY, int SGM, int NSGM, bool DP4A, bool TAIL>
 sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                    int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
                    int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst) {
-    using KT = Kernel<TY, SGM, NSGM, DP4A>;
+    using KT = Kernel<TY, SGM, NSGM, DP4A, TAIL>;
     const int64_t tiles_m = (max_rows + KT::WM - 1) / KT::WM, tiles_n = w_rows / KT::WN;
     const size_t row_bytes = (size_t) (w_cols / Dec<TY>::QK) * (size_t) Dec<TY>::BSZ;
     const auto* x8 = static_cast<const int8_t*>(xq);
@@ -740,17 +740,25 @@ template<int TY>
 sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                     int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
                     int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst) {
-#define STRATA_MMQ_LAUNCH(SGM, NSGM, DP4A)                                                                    \
-    launch<TY, SGM, NSGM, DP4A>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, max_rows, \
-                                ids, dst, ld_dst)
-    if (!iq_mmq_usable(q)) {   // iq_mmq_grouped is called where one of the two forms runs
-        if (max_rows <= 16) return STRATA_MMQ_LAUNCH(1, 1, true);
-        if (max_rows <= 32) return STRATA_MMQ_LAUNCH(2, 1, true);
-        return STRATA_MMQ_LAUNCH(2, 2, true);
+#define STRATA_MMQ_LAUNCH(SGM, NSGM, DP4A, TAIL)                                                                     \
+    launch<TY, SGM, NSGM, DP4A, TAIL>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds,     \
+                                      max_rows, ids, dst, ld_dst)
+#define STRATA_MMQ_ROWS(DP4A, TAIL)                                                        \
+    do {                                                                                    \
+        if (max_rows <= 16) return STRATA_MMQ_LAUNCH(1, 1, DP4A, TAIL);                     \
+        if (max_rows <= 32) return STRATA_MMQ_LAUNCH(2, 1, DP4A, TAIL);                     \
+        return STRATA_MMQ_LAUNCH(2, 2, DP4A, TAIL);                                         \
+    } while (0)
+    // dp4a where the matrix form does not run (iq_mmq_grouped is called where one of the two does); the K-tail form
+    // only for a K that is no multiple of the step, so that the others keep their loads unguarded
+    const bool tail = w_cols % KC != 0;
+    if (!iq_mmq_usable(q)) {
+        if (tail) STRATA_MMQ_ROWS(true, true);
+        STRATA_MMQ_ROWS(true, false);
     }
-    if (max_rows <= 16) return STRATA_MMQ_LAUNCH(1, 1, false);
-    if (max_rows <= 32) return STRATA_MMQ_LAUNCH(2, 1, false);
-    return STRATA_MMQ_LAUNCH(2, 2, false);
+    if (tail) STRATA_MMQ_ROWS(false, true);
+    STRATA_MMQ_ROWS(false, false);
+#undef STRATA_MMQ_ROWS
 #undef STRATA_MMQ_LAUNCH
 }
 
