@@ -85,3 +85,5 @@ for t in 1k 4k 32k 64k 128k 262k; do
     done
   done
 done
+
+exit 0

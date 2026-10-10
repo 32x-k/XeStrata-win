@@ -1,0 +1,14 @@
+loading the model (the first start takes a minute or two) ...
+ready: http://127.0.0.1:18095/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, context 262144 tokens)
+       open http://127.0.0.1:18095/ in a browser to chat; close this window to stop the model
+[strata] reading the prompt: 83 of 84 tokens, 1 s so far
+[strata] thinking: 27 of max 1024 tokens, 28.2 tok/s, 2 s
+[strata] thinking: 57 of max 1024 tokens, 29.0 tok/s, 3 s
+[strata] thinking: 89 of max 1024 tokens, 29.3 tok/s, 4 s
+[strata] thinking: 124 of max 1024 tokens, 30.5 tok/s, 5 s
+[strata] answering: 158 of max 1024 tokens, 30.9 tok/s, 6 s
+[strata] answering: 200 of max 1024 tokens, 32.7 tok/s, 7 s
+[strata] done: 223 tokens in 8 s (32.5 tok/s) (stop, cancel=False), expert cache 85.5% hit (+19.5% of the routed experts over PCIe)
+
+[strata] stopping (Ctrl+C again to end the engine at once) ...
+[strata] stopped
