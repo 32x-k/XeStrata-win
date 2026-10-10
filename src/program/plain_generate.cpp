@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/program/plain_generate.cpp - `strata generate` for the models of plain_model.hpp (Ornith-1.5).
+// src/program/plain_generate.cpp - `strata generate` for the models of plain_model.hpp (Ornith-1.5, llm-jp-4.1).
 //
 //     strata --native MODEL.gguf --tokens 1,2,3 [--n 32] [--max-context N] [--max-t T] [--threads N]
 //            [--dump-logits FILE] [--adapt-every N] [--mmap-experts] [--no-pcie-split]
-//            [--expert-profile FILE] [--expert-profile-save FILE]
+//            [--expert-profile FILE] [--expert-profile-save FILE] [--rope-scaling yarn --rope-scale F --yarn-orig-ctx N]
 //
 // The prompt runs in windows of up to T tokens, then one token a window, greedily.  stdout gets one line,
 // `tokens: a,b,c`, the generated ids; --dump-logits writes the logits each generated token was chosen from, n_vocab
@@ -96,6 +96,9 @@ int plain_main(int argc, char** argv) {
         else if (a == "--mmap-experts") opt.mmap_experts = true;
         else if (a == "--no-pcie-split") opt.pcie_split = false;
         else if (a == "--expert-profile") opt.profile = next("--expert-profile");
+        else if (a == "--rope-scaling") opt.rope_scaling = next("--rope-scaling");
+        else if (a == "--rope-scale") opt.rope_scale = std::strtod(next("--rope-scale"), nullptr);
+        else if (a == "--yarn-orig-ctx") opt.yarn_orig_ctx = std::strtod(next("--yarn-orig-ctx"), nullptr);
         else if (a == "--expert-profile-save") profile_save = next("--expert-profile-save");
         else {
             std::fprintf(stderr, "strata (%s): unknown option %s\n", arch.c_str(), a.c_str());

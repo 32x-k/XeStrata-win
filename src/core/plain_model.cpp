@@ -13,6 +13,9 @@
 //               softmax(q k / sqrt(d)) v over every cell, times sigmoid(gate); out = attn_output(.)
 //   MoE:        softmax over the experts, top-k, the k weights renormalized; sum of w_j expert_j(h)
 //               + sigmoid(ffn_gate_inp_shexp . h) * shared(h)
+//
+// and qwen3moe's (llm-jp-4.1, src/models/qwen3moe.cpp): every block a full attention without the gate, rotated over the
+// whole head; the MoE without the shared expert; the second norm named ffn_norm.
 #include "strata/core/plain_model.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -148,24 +151,46 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     }
     if (!read_model_spec(model_->meta(), spec_, err)) return false;
     const ModelSpec& s = spec_;
-    if (s.arch != ModelArch::Qwen35Moe) {
+    if (s.arch != ModelArch::Qwen35Moe && s.arch != ModelArch::Qwen3Moe) {
         err = "plain model: " + s.arch_name + " is not run by this engine yet";
         return false;
     }
-    if (s.key_length != s.value_length || s.rope_dims != 64 || (s.key_length != 128 && s.key_length != 256) ||
-        s.ssm_d_state != 128 || s.ssm_d_conv != 4 || s.ssm_n_group <= 0 || s.ssm_dt_rank % s.ssm_n_group != 0 ||
-        s.ssm_d_inner != s.ssm_dt_rank * s.ssm_d_state || s.n_expert_used > 15 || s.n_ff_shexp <= 0 ||
-        s.n_dense_lead != 0) {
+    const bool q35 = s.arch == ModelArch::Qwen35Moe;
+    has_gate_ = q35;
+    has_shared_ = q35;
+    bool shape_ok = s.key_length == s.value_length && (s.key_length == 128 || s.key_length == 256) &&
+                    (s.rope_dims == 64 || s.rope_dims == s.key_length) && s.n_expert_used <= 15 && s.n_dense_lead == 0;
+    if (q35)
+        shape_ok = shape_ok && s.ssm_d_state == 128 && s.ssm_d_conv == 4 && s.ssm_n_group > 0 &&
+                   s.ssm_dt_rank % s.ssm_n_group == 0 && s.ssm_d_inner == s.ssm_dt_rank * s.ssm_d_state &&
+                   s.n_ff_shexp > 0;
+    if (!shape_ok) {
         err = "plain model: a shape this engine's kernels are not built for";
         return false;
     }
     cs_ = strata::gpu::stream_create();
     if (cs_ == nullptr) { err = "plain model: stream create failed"; return false; }
-    // process constants, before any graph: the rotation's base, and the GDN output gate (SiLU in qwen35moe)
-    k::RopeScaling rs;
-    rs.freq_base = s.rope_base;
-    k::rope_scaling_set(rs);
-    k::gdn_set_silu_gate(true);
+    // process constants, before any graph: the rotation (its base, and the scaling the options or the file ask for, as
+    // generate.cpp resolves it), and the GDN output gate (SiLU in qwen35moe)
+    {
+        using RST = k::RopeScalingType;
+        k::RopeScaling rs;
+        rs.freq_base = s.rope_base;
+        const std::string type = !opt_.rope_scaling.empty() ? opt_.rope_scaling : s.rope_scaling_type;
+        rs.type = type == "yarn" ? RST::YaRN : type == "linear" ? RST::Linear : RST::None;
+        if (rs.type != RST::None) {
+            rs.factor = opt_.rope_scale > 0 ? opt_.rope_scale : s.rope_scaling_factor > 1.0 ? s.rope_scaling_factor : 1.0;
+            rs.orig_ctx = opt_.yarn_orig_ctx > 0 ? opt_.yarn_orig_ctx
+                          : s.rope_scaling_orig_ctx >= 1 ? s.rope_scaling_orig_ctx : (double) s.context_length;
+            rs.ext_factor = rs.type == RST::YaRN ? 1.0 : 0.0;
+        }
+        if (const char* why = k::rope_scaling_invalid(rs)) {
+            err = std::string("plain model: the rope scaling: ") + why;
+            return false;
+        }
+        k::rope_scaling_set(rs);
+    }
+    k::gdn_set_silu_gate(q35);
 
     const GgufModel& m = *model_;
     // the embedding stays in the mapping: a token's row is dequantized on the host
@@ -195,7 +220,7 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         const std::string p = "blk." + std::to_string(l) + ".";
         b.recurrent = s.recurrent[(size_t) l];
         if (!upload_f32(m, p + "attn_norm.weight", N, b.attn_norm, err) ||
-            !upload_f32(m, p + "post_attention_norm.weight", N, b.post_norm, err))
+            !upload_f32(m, p + (q35 ? "post_attention_norm.weight" : "ffn_norm.weight"), N, b.post_norm, err))
             return false;
         if (b.recurrent) {
             b.gdn = n_gdn++;
@@ -221,15 +246,16 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
                 !upload_f32(m, p + "attn_q_norm.weight", (uint64_t) hd, b.q_norm, err) ||
                 !upload_f32(m, p + "attn_k_norm.weight", (uint64_t) hd, b.k_norm, err))
                 return false;
-            if (b.q.n_out != 2 * s.n_head * hd || b.k.n_out != nkv * hd || b.v.n_out != nkv * hd ||
+            if (b.q.n_out != (has_gate_ ? 2 : 1) * s.n_head * hd || b.k.n_out != nkv * hd || b.v.n_out != nkv * hd ||
                 b.o.n_in != s.n_head * hd || nkv <= 0 || s.n_head % nkv != 0 || (nkv_ != 0 && nkv != nkv_)) {
                 err = "plain model: block " + std::to_string(l) + "'s attention projections have other shapes";
                 return false;
             }
             nkv_ = nkv;
         }
-        if (!upload_f32(m, p + "ffn_gate_inp.weight", N * E, b.router, err) ||
-            !upload_f32(m, p + "ffn_gate_inp_shexp.weight", N, b.sh_gate_inp, err) ||
+        if (!upload_f32(m, p + "ffn_gate_inp.weight", N * E, b.router, err)) return false;
+        if (!has_shared_) continue;
+        if (!upload_f32(m, p + "ffn_gate_inp_shexp.weight", N, b.sh_gate_inp, err) ||
             !upload(m, p + "ffn_gate_shexp.weight", b.sh_gate, err) ||
             !upload(m, p + "ffn_up_shexp.weight", b.sh_up, err) ||
             !upload(m, p + "ffn_down_shexp.weight", b.sh_down, err))
@@ -548,7 +574,7 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) 
             proj(b.q, hn_, qfull_, T, false);
             proj(b.k, hn_, kraw_, T, false);
             proj(b.v, hn_, vcur_, T, false);
-            k::native_qsa_rms_norm_rope(qfull_, (int) (2 * HD), b.q_norm, qcur_, (int) (T * NH), (int) HD,
+            k::native_qsa_rms_norm_rope(qfull_, (int) ((has_gate_ ? 2 : 1) * HD), b.q_norm, qcur_, (int) (T * NH), (int) HD,
                                         (int) s.rope_dims, eps, rs, pos_q, cs);
             k::native_qsa_rms_norm_rope(kraw_, (int) HD, b.k_norm, kcur_, (int) (T * NKV), (int) HD,
                                         (int) s.rope_dims, eps, rs, pos_k, cs);
@@ -561,8 +587,12 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) 
             pools.v_pool = v_pool_[(size_t) a];
             pools.page_table = page_table_;
             k::qsa_dense_attn_batch(qcur_, pools, step_, opt_.max_cells, qs, attn_scratch_, attn_, T, cs);
-            k::native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
-            proj(b.o, attn32_, mix_, T, true);
+            if (has_gate_) {
+                k::native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
+                proj(b.o, attn32_, mix_, T, true);
+            } else {
+                proj(b.o, attn_, mix_, T, true);
+            }
         }
         k::add_inplace(x_, mix_, (int64_t) T * N, cs);
 
@@ -573,15 +603,17 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) 
         k::router_top10(rlog_, T, (int) E, (int) K, ids_, w_, cs);
         ++ring;
         win_.publish(ring, 0, 0, T, hn_, ids_, w_, cs);
-        k::native_quantize_q8_1(hn_, xq_, (int) N, T, cs);
-        if (!k::native_mmvq_pair(b.sh_gate.type, b.sh_gate.data, b.sh_up.data, xq_, sh_gate_, sh_up_, (int) N, (int) FS,
-                                 T, cs)) {
-            k::native_mmvq(b.sh_gate.type, b.sh_gate.data, xq_, sh_gate_, (int) N, (int) FS, T, cs);
-            k::native_mmvq(b.sh_up.type, b.sh_up.data, xq_, sh_up_, (int) N, (int) FS, T, cs);
+        if (has_shared_) {
+            k::native_quantize_q8_1(hn_, xq_, (int) N, T, cs);
+            if (!k::native_mmvq_pair(b.sh_gate.type, b.sh_gate.data, b.sh_up.data, xq_, sh_gate_, sh_up_, (int) N,
+                                     (int) FS, T, cs)) {
+                k::native_mmvq(b.sh_gate.type, b.sh_gate.data, xq_, sh_gate_, (int) N, (int) FS, T, cs);
+                k::native_mmvq(b.sh_up.type, b.sh_up.data, xq_, sh_up_, (int) N, (int) FS, T, cs);
+            }
+            k::native_swiglu_q8_1(sh_gate_, sh_up_, xq_, (int) FS, T, cs);
+            k::native_mmvq(b.sh_down.type, b.sh_down.data, xq_, shared_, (int) FS, (int) N, T, cs);
+            for (int t = 0; t < T; ++t) k::f32_gemv_fp32_mmvf(hn_ + (size_t) t * N, b.sh_gate_inp, sh_g_ + t, N, 1, cs);
         }
-        k::native_swiglu_q8_1(sh_gate_, sh_up_, xq_, (int) FS, T, cs);
-        k::native_mmvq(b.sh_down.type, b.sh_down.data, xq_, shared_, (int) FS, (int) N, T, cs);
-        for (int t = 0; t < T; ++t) k::f32_gemv_fp32_mmvf(hn_ + (size_t) t * N, b.sh_gate_inp, sh_g_ + t, N, 1, cs);
         if (win_.segmented()) {   // a graph ends where the host must answer the ring
             strata::gpu::Graph* g = nullptr;
             if (!strata::gpu::end_capture(cs, &g)) {
@@ -592,7 +624,8 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) 
             if (!strata::gpu::begin_capture(cs)) { err = "plain model: begin capture failed"; return false; }
         }
         if (!win_.experts(s.moe_index(l), ring, 0, 0, T, cs, err)) return false;
-        k::native_moe_combine_multi(win_.parts(), w_, shared_, moe_out_, N, K, T, cs, sh_g_);
+        k::native_moe_combine_multi(win_.parts(), w_, has_shared_ ? shared_ : nullptr, moe_out_, N, K, T, cs,
+                                    has_shared_ ? sh_g_ : nullptr);
         k::add_inplace(x_, moe_out_, (int64_t) T * N, cs);
     }
     k::native_qsa_rms_norm_weighted(x_, out_norm_, hn_, (int) N, T, eps, cs);

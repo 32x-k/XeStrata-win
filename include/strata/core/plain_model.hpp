@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/core/plain_model.hpp - an MoE model with one residual stream, run from its GGUF.
 //
-// qwen35moe (Ornith-1.5: Gated DeltaNet layers and full-attention layers, a shared expert) - the models whose block is
+// qwen35moe (Ornith-1.5: Gated DeltaNet layers and full-attention layers, a shared expert) and qwen3moe (llm-jp-4.1:
+// full attention in every block, no shared expert) - the models whose block is
 //
 //     x += mixer(rms_norm(x))            the mixer a GDN layer or a gated, partly rotated full attention
 //     x += moe(rms_norm(x))              routed experts (softmax top-k, renormalized) + the gated shared expert
@@ -51,6 +52,11 @@ struct PlainOptions {
     /// A ranking of (MoE layer, expert) pairs (expert_cache.hpp's profile format) the VRAM tier is filled from at load,
     /// each layer up to its slots; empty: the tier starts empty and the adaptive rule fills it.
     std::string profile;
+    /// The rope scaling, as llama.cpp's options: "yarn" / "linear" / "none" (empty: the file's), the factor (0: the
+    /// file's), the trained context (0: the file's, else its context length).  llm-jp-4.1 at 256K: yarn, 4, 65536.
+    std::string rope_scaling;
+    double rope_scale = 0;
+    double yarn_orig_ctx = 0;
 };
 
 class PlainModel {
@@ -116,6 +122,8 @@ private:
     std::unique_ptr<GgufModel> model_;
     int64_t n_vocab_ = 0;
     int64_t nkv_ = 0;                ///< the attention blocks' K/V heads (the same in every one)
+    bool has_gate_ = false;          ///< the attention's output gate: [q | gate] per head (qwen35moe)
+    bool has_shared_ = false;        ///< the gated shared expert (qwen35moe)
     int emb_type_ = -1;
     const uint8_t* emb_ = nullptr;   ///< token_embd in the GGUF mapping (rows dequantized on the host)
     size_t emb_row_ = 0;
