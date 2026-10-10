@@ -76,6 +76,7 @@ The README and the documents in `docs/` are written in Japanese first: `README.j
 A change goes into the Japanese file first and then into the English one in the same commit, so the two keep the same sections and content.
 The English files keep the headings that code, records and links point to (`docs/BUILD.md#packages`, for example); a Japanese file's anchors come from its own headings.
 Where the README or a document states something that was not checked, do not add that it is unverified (`unverified`, 未検証); that mark is for reports and commit messages.
+The two stages of generation are prefill and decode, the LLM terms, in Japanese as in English (the README, the documents, the release notes): not プロンプト・出力・デコード or prompt and output speed. 推測デコード (speculative decoding) and a prompt as the text that is read stay as they are.
 
 ## Lints
 
