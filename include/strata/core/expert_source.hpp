@@ -396,6 +396,9 @@ bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, doub
 /// lost on the B70 with the VRAM of a small card); else 0.
 int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h);
 
+/// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
+int tail_skip_rank();
+void set_tail_skip_rank(int r);
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out);
 

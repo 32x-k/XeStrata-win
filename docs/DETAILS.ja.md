@@ -62,6 +62,24 @@ decode の速さは文章によっても変わります。
 （B70、IQ2_XS、K=3: 文書の書き直し 109.6 → 129.2、ふつうの会話 71.1 → 68.3 トークン/秒）。
 `--lookup-chain-min M` は、続きを足すのに要る一致の長さです（既定 3 トークン）。
 
+サーバーの decode では、VRAM にないエキスパートのうち、検証の窓のどのトークンも順位 7 以下（上位 10 のうち重みの小さい 8〜10 番目）でしか選ばないものを、読まず計算もしません（`STRATA_ROUTE_TAIL_SKIP`、既定 7、upstream b4e3407b）。
+寄与は 0 になり、残りのエキスパートの重みは正規化し直しません。そのぶん答えが少し変わります。
+全エキスパートが VRAM にあるとき（読み飛ばすものがない）、`--batch` のとき、補助のキャッシュ（`--expert-cache-device1..3`）を使うときは働きません。層の分割では、各段が自分の分を読み飛ばします。
+`STRATA_ROUTE_TAIL_SKIP=0` で切れ、1〜9 で順位を変えられます。起動時に 1 行出します。
+
+測った結果（IQ3_XXS、[記録](../bench/results/2026-10-11-route-tail-skip/README.md)）:
+
+| | B70 | RTX 4070 | RX 9060 XT |
+| --- | --- | --- | --- |
+| KL の平均（窓のずれ。同じ設定を 2 回の下限） | 0.0027（0.0000） | 0.0053（0.0009） | 0.0049（0.0012） |
+| top-1 の一致 | 99.1% | 97.8% | 98.4% |
+| HumanEval 82 問と計算の課題 30 問の正答（なし / あり） | 75・25 / 76・24 | 77・25 / 79・25 | 77・24 / 77・24 |
+| serve の decode（なし → あり、1K と 32K、greedy と温度 0.7） | −1.0〜+12.7% | +7.5〜+24.5% | +6.3〜+55.4% |
+
+`STRATA_ROUTE_RESIDENT=<margin>`（upstream 5df35dcb、実験的、opt-in）は、検証の窓で上位 10 のうち順位 6〜9 の VRAM にないエキスパートを、ロジットの差が margin 以内なら VRAM にあるエキスパートに入れ替えます（`STRATA_ROUTE_RESIDENT_RANKS=lo-hi`）。
+`STRATA_ROUTE_PRIOR=<lambda>`（upstream 2de9ae06、opt-in）は、VRAM にあるエキスパートのロジットに lambda を足して選び直します（重みはルーターのもの）。
+どちらも答えが変わります。
+
 ### 小さい GPU と XMX のない GPU
 
 B70 を小さい GPU に見せた設定（`STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1`、VRAM 8 GB、XMX なし）で、

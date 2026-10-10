@@ -63,6 +63,28 @@ It speeds up handing back a given text nearly as it was, and slows ordinary chat
 (B70, IQ2_XS, K=3: rewriting a document 109.6 → 129.2, ordinary chat 71.1 → 68.3 tokens/s).
 `--lookup-chain-min M` is the match it needs before adding any (default 3 tokens).
 
+In the server's decode, a missed expert (not in VRAM) that every token of a verify window routes only at rank 7 or
+lower (the 8th to 10th of the top 10, the smallest weights) is neither read nor computed (`STRATA_ROUTE_TAIL_SKIP`,
+default 7, upstream b4e3407b). Its contribution is zero and the other experts keep their weights (no renormalisation),
+so the answers differ slightly.
+It does nothing when every expert is in VRAM (nothing is skipped), with `--batch` and with a helper cache
+(`--expert-cache-device1..3`); on a layer split each stage skips its own.
+`STRATA_ROUTE_TAIL_SKIP=0` turns it off and 1-9 sets the rank; the start prints one line.
+
+Measured (IQ3_XXS, [record](../bench/results/2026-10-11-route-tail-skip/README.md)):
+
+| | B70 | RTX 4070 | RX 9060 XT |
+| --- | --- | --- | --- |
+| Mean KL of the decode path (floor: the same setting twice) | 0.0027 (0.0000) | 0.0053 (0.0009) | 0.0049 (0.0012) |
+| Top-1 agreement | 99.1% | 97.8% | 98.4% |
+| HumanEval (82) and arithmetic tasks (30) passed, off / on | 75, 25 / 76, 24 | 77, 25 / 79, 25 | 77, 24 / 77, 24 |
+| Serve decode, off to on (1K and 32K, greedy and temperature 0.7) | -1.0 to +12.7% | +7.5 to +24.5% | +6.3 to +55.4% |
+
+`STRATA_ROUTE_RESIDENT=<margin>` (upstream 5df35dcb, experimental, opt-in) swaps a verify window's missed experts at
+ranks 6-9 of the top 10 for resident ones whose logit is within the margin (`STRATA_ROUTE_RESIDENT_RANKS=lo-hi`).
+`STRATA_ROUTE_PRIOR=<lambda>` (upstream 2de9ae06, opt-in) picks the top 10 again with lambda added to the resident
+experts' logits (the weights stay the router's). Both change the answers.
+
 ### Small cards and GPUs without XMX
 
 With the B70 made to look like a small card (`STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1`: 8 GB of VRAM, no XMX),

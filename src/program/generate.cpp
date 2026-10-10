@@ -6503,6 +6503,24 @@ int main(int argc, char** argv) {
         strata::core::PcieSplitTimes pcie_split;   // the measured split, kept for the requests that set no share
         setup_pcie_split(drive.d, g.n_layers, o, pcie_given, !split_devs.empty(), ver.fetch_branch(), pcie_split);
         const strata::core::PcieSplitTimes* const pcie_split_ptr = drive.d.pcie_split;
+        {   // STRATA_ROUTE_TAIL_SKIP: ON BY DEFAULT (rank 7, upstream b4e3407b; measured on XeStrata's GPUs, docs/DETAILS.md): a
+            // missed expert that every token of a verify window routes at rank 7 or lower is neither copied nor computed
+            // (answers differ slightly; =0 restores the bytes of a build without it).  No default and no line when every
+            // expert is in VRAM (nothing to skip); off with --batch slots (a window then mixes requests, and one request's
+            // skip would depend on another's tokens) and with a helper GPU (the dispatch skips nothing there).  A layer
+            // split is fine: each stage skips by itself.
+            const char* tse = std::getenv("STRATA_ROUTE_TAIL_SKIP");
+            const bool all_experts_resident = !host_res.empty() &&
+                std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
+            const bool helper = std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
+                                            [](int n) { return n > 0; });
+            if (tse == nullptr && !all_experts_resident && o.batch <= 0 && !helper) strata::core::set_tail_skip_rank(7);
+            if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
+                std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert that every token of a "
+                                     "verify window routes at rank %d or lower is skipped (answers differ slightly); "
+                                     "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
+                             tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
+        }
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         // #477 --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays
         // empty and nothing below runs).  It needs the adaptive tier's counts and the residency table.

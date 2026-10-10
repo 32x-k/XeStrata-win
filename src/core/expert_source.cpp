@@ -1668,6 +1668,24 @@ int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h) {
     return best <= 0.9 * all_cpu ? pick : 0;
 }
 
+namespace {
+// STRATA_ROUTE_TAIL_SKIP: the rank from which a missed expert that every token of the window routes that low is
+// skipped (upstream b4e3407b).  An explicit environment value is read once; the serve start-up (generate.cpp) sets the
+// default where it applies.
+std::atomic<int> g_tail_skip_rank{-1};   // -1: not resolved yet
+}  // namespace
+int tail_skip_rank() {
+    int r = g_tail_skip_rank.load(std::memory_order_relaxed);
+    if (r < 0) {
+        const char* v = std::getenv("STRATA_ROUTE_TAIL_SKIP");
+        r = v != nullptr ? std::atoi(v) : 0;
+        r = r > 0 && r < 10 ? r : 0;
+        g_tail_skip_rank.store(r, std::memory_order_relaxed);
+    }
+    return r;
+}
+void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
@@ -1733,11 +1751,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // the window routes only at rank >= R (the smallest weights of the top-k) is neither copied nor computed; its
         // contribution is zero, without renormalisation (the others keep the weight the router gave them).  Less PCIe
         // and CPU work.  Not with a helper GPU, which may hold it.
-        static const int tail_rank = [] {
-            const char* v = std::getenv("STRATA_ROUTE_TAIL_SKIP");
-            const int r = v != nullptr ? std::atoi(v) : 0;
-            return r > 0 && r < 10 ? r : 0;
-        }();
+        const int tail_rank = tail_skip_rank();
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
         if (tail_rank > 0 && tail_rank < k && d.remote_count == 0) {
