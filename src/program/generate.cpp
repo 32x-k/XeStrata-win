@@ -451,6 +451,10 @@ struct Options {
     int64_t conversation_cache_mib = 0;
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
+    /// --serve: park only conversations of at least this many tokens.  Every parked conversation costs one of
+    /// conversation_cache_slots whatever its length, so without it a client that interleaves short side requests
+    /// with one long conversation evicts the long one (oldest first).  0 = park every conversation.
+    int64_t conversation_cache_min_tokens = 0;
     /// --serve: write parked conversations to this folder (when the RAM cache pushes one out, and at QUIT) and
     /// read them back after a restart; empty = off.  Checkpoints per conversation (the deepest, the chain's root,
     /// then the most recently used), the folder's budget, and the age after its last use at which a file goes.
@@ -595,6 +599,8 @@ void usage() {
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
                  "                       session file (default 2560)\n"
+                 "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens, so\n"
+                 "                       short side requests do not take the slots a long one needs (default 0 = park any)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --conversation-save DIR  --serve: also keep parked conversations in DIR across restarts (default off;\n"
                  "                       needs --conversation-cache-mib)\n"
@@ -2069,12 +2075,14 @@ int main(int argc, char** argv) {
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
-                 a == "--conversation-cache-min-free-mib" || a == "--conversation-save-checkpoints" ||
+                 a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
+                 a == "--conversation-save-checkpoints" ||
                  a == "--conversation-save-mib" || a == "--conversation-save-hours" || a == "--session-min-free-mib") {
             const std::string value = next(a.c_str());
             int64_t parsed = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
-            const int64_t limit = a == "--conversation-cache-slots" || a == "--conversation-save-checkpoints"
+            const int64_t limit = a == "--conversation-cache-slots" || a == "--conversation-save-checkpoints" ||
+                                          a == "--conversation-cache-min-tokens"
                                       ? INT32_MAX
                                   : a == "--conversation-save-hours" ? INT64_MAX / 3600
                                                                      : INT64_MAX / (int64_t{1024} * 1024);
@@ -2084,6 +2092,7 @@ int main(int argc, char** argv) {
             }
             if (a == "--conversation-cache-mib") o.conversation_cache_mib = parsed;
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = parsed;
+            else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = parsed;
             else if (a == "--conversation-save-checkpoints") o.conversation_save_checkpoints = (int) parsed;
             else if (a == "--conversation-save-mib") o.conversation_save_mib = parsed;
             else if (a == "--conversation-save-hours") o.conversation_save_hours = parsed;
@@ -5816,7 +5825,7 @@ int main(int argc, char** argv) {
         // ordinary host vectors).
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 && use_mtp ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
-            (size_t) o.conversation_cache_slots);
+            (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
         // a layer split parks every GPU's session (its layers), each copied on its own device
         std::vector<strata::core::ConversationStage> conv_stages;
         if (multi_gpu) {
@@ -5975,6 +5984,16 @@ int main(int argc, char** argv) {
         };
         auto park_current = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            // --conversation-cache-min-tokens (upstream 624070c5): a short conversation is not worth one of the slots.
+            // Parking is a switch-time decision, so a client's small side requests would otherwise park themselves
+            // and, once the cache is full, evict the long conversation they were interleaved with (oldest first) - the
+            // reuse it wanted.  Returning true is the same non-error skip the byte-budget and RAM-floor paths take.
+            if (!conversations.wants((int64_t) live.size())) {
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (%zu tokens, below the %lld "
+                                     "minimum; parked=%zu)\n",
+                             live.size(), (long long) o.conversation_cache_min_tokens, conversations.size());
+                return true;
+            }
             const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
             auto reuse = conversations.take_reuse();
             size_t estimate = 0;
@@ -6794,8 +6813,8 @@ int main(int argc, char** argv) {
             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
-                        "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d batch_slots=%d slot_cache=%d "
-                        "engine=" STRATA_VERSION "\n",
+                        "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld tail_role_token=%lld "
+                        "vram_elastic=%d batch_slots=%d slot_cache=%d engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -6803,8 +6822,9 @@ int main(int argc, char** argv) {
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
                         (long long) (strata::kernels::cpu::expert_layout().total >> 20), pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
-                        (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token,
-                        xcache.segmented() ? 1 : 0, o.batch, o.batch > 0 && o.prompt_cache > 0 ? 1 : 0);
+                        (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
+                        (long long) o.tail_role_token, xcache.segmented() ? 1 : 0, o.batch,
+                        o.batch > 0 && o.prompt_cache > 0 ? 1 : 0);
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
