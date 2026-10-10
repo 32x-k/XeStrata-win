@@ -92,7 +92,6 @@ class UnreadContentParts(unittest.TestCase):
     def test_chat_file_and_audio_parts_are_left_out(self):
         parts = ({"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,AA"}},
                  {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}})
-        plain = [{"role": "user", "content": "summarize"}, {"role": "user", "content": "this one"}]
         for part in parts:
             with self.subTest(kind=part["type"]):
                 got = openai_to_messages({"messages": [
@@ -128,7 +127,8 @@ class UnreadContentParts(unittest.TestCase):
                 {"role": "user", "content": "find a tool"},
                 {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "ToolSearch", "input": {}}]},
                 {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": "found"}] + extra}]}]})
+                    {"type": "tool_result", "tool_use_id": "t1",
+                     "content": [{"type": "text", "text": "found"}] + extra}]}]})
         self.assertEqual(run([{"type": "tool_reference", "tool_name": "mcp__x"}]), run([]))
 
     def test_a_system_prompt_with_an_image_part_is_read_as_text_as_before(self):

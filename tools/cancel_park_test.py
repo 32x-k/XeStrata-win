@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """#1620: a request cancelled right after it restored a parked conversation must not lose that conversation.
 
   A (long answer) -> B (an unrelated chat parks A) -> A2 = A + a short next turn, STOPped as soon as the engine
@@ -11,13 +14,20 @@ the parked entry and A3 fell back to the turn checkpoint (the prompt, not the an
   STRATA_EXTRA_ARGS="--prompt-cache 4 --conversation-cache-mib 2048 --conversation-cache-slots 3"
 Prints PASS / FAIL and the reused token counts.  Exit status 0 on PASS.
 """
-import json, os, queue, sys, threading, time
+
+import json
+import os
+import queue
+import sys
+import threading
+import time
 from pathlib import Path
 
 REPO = Path(os.environ.get("STRATA_REPO", Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(REPO / "tools")); sys.path.insert(0, str(REPO))
-import strata_tokenizer as ST
-from serve.server import StrataEngine, child_env
+sys.path.insert(0, str(REPO / "tools"))
+sys.path.insert(0, str(REPO))
+import strata_tokenizer as ST  # noqa: E402
+from serve.server import StrataEngine, child_env  # noqa: E402
 
 cfg = json.load(open(sys.argv[1]))
 tp = Path(cfg["tokenizer"])
@@ -27,8 +37,13 @@ for t, i in vocab.items():
     toks[i] = t
 tok = ST.Tokenizer(toks, (tp / "merges.txt").read_text().split("\n"), json.loads((tp / "token_type.json").read_text()))
 args = cfg["args"] + os.environ.get("STRATA_EXTRA_ARGS", "").split()
-eng = StrataEngine(os.environ.get("STRATA_EXE", cfg["exe"]), args, cwd=cfg.get("cwd"),
-                   log=os.environ.get("SMOKE_LOG", cfg["log"]), env=child_env(cfg))
+eng = StrataEngine(
+    os.environ.get("STRATA_EXE", cfg["exe"]),
+    args,
+    cwd=cfg.get("cwd"),
+    log=os.environ.get("SMOKE_LOG", cfg["log"]),
+    env=child_env(cfg),
+)
 
 HEAD = "<|im_start|>user\n"
 GEN = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -58,7 +73,9 @@ def run_cancelled(ids):
             raise SystemExit("FAIL: the engine died")
         if line.startswith("RESUME "):
             reused = int(line.split()[1])
-            eng.proc.stdin.write("STOP\n"); eng.proc.stdin.flush(); stopped = True
+            eng.proc.stdin.write("STOP\n")
+            eng.proc.stdin.flush()
+            stopped = True
         elif line.startswith("DONE "):
             fin = line.split()[5] if len(line.split()) > 5 else "?"
             break
@@ -80,7 +97,10 @@ cont3 = enc("<|im_end|>\n<|im_start|>user\nNow say only the word finished." + GE
 A3 = A1 + outA + cont3
 outA3, reused3 = run(A3, 20)
 want = len(A1) + len(outA) - 3
-print(f"A3: prompt {len(A3)} tokens, reused {reused3} (A + its answer = {len(A1) + len(outA)}; need >= {want})", flush=True)
+print(
+    f"A3: prompt {len(A3)} tokens, reused {reused3} (A + its answer = {len(A1) + len(outA)}; need >= {want})",
+    flush=True,
+)
 eng.proc.stdin.close()
 try:
     eng.proc.wait(60)

@@ -1949,8 +1949,9 @@ def uma_expert_cache(model, ram, budget_gib, kv_ram_gb=0.0):
     `--expert-cache auto` sizes the cache from the memory the OS can give back at start, which counts all the RAM the
     budget has not taken yet: a 128 GB box with a 55 GiB budget and the desktop open was killed by the OOM killer.  So
     there setup writes a number, not `auto`: the RAM less UNSLOTH_RAM_LEFT_GB less the budget (and a KV cache streamed
-    to RAM), in slots (an expert is priced at 1.1x the average one: the Q8_0 downs are bigger).  None when no room is left
-    (the config keeps `auto`).  A recommendation: the number is in the config's args, and --expert-cache N there sets it."""
+    to RAM), in slots (an expert is priced at 1.1x the average one: the Q8_0 downs are bigger).  None when no room is
+    left (the config keeps `auto`).  A recommendation: the number is in the config's args, and --expert-cache N there
+    sets it."""
     slot_gib = MODELS[model]["arena_gb"] * 1e9 / UMA_EXPERTS * 1.1 / 2**30
     room = ram - UNSLOTH_RAM_LEFT_GB - budget_gib - math.ceil(kv_ram_gb)
     slots = min(UMA_EXPERTS, int(room / slot_gib))
@@ -2935,7 +2936,8 @@ def main() -> int:
                          "that uses the API; remembered for this model, also in run-<model>.sh)")
     ap.add_argument("--browser", dest="browser", action="store_true",
                     help="open the chat page again when the model is ready (the default; undoes --no-browser)")
-    ap.add_argument("--api-key", help="require this key from clients (recommended with --host 0.0.0.0); several keys: key1,key2")
+    ap.add_argument("--api-key", help="require this key from clients (recommended with --host 0.0.0.0); several "
+                                      "keys: key1,key2")
     ap.add_argument("--data-dir", help="where the model files go (~70-120 GB): default XeStrata-data next to this "
                                        "folder, remembered for every Strata folder on this PC")
     ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")

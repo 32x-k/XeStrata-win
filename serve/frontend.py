@@ -415,7 +415,8 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
             # AttributeError in the request thread - after the 200 and whatever the model had said before the call
             raise ValueError(f'tools[{i}] ({fn["name"]}): "{key}" must be an object (the JSON schema of its '
                              f"parameters), not {type(schema).__name__}")
-    return _stable_tool_order(tools, lambda t: (t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t)["name"])
+    return _stable_tool_order(tools,
+                              lambda t: (t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t)["name"])
 
 
 def tool_arguments(raw) -> dict:

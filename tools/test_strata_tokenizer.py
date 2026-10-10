@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """The tokenizer's piece cache (0.1.41): the ids are the ones the merge loop gives, cache cold, warm or switched off.
 
     python -m unittest tools.test_strata_tokenizer
@@ -84,6 +87,7 @@ class ByteCache(unittest.TestCase):
         t = toy()
         texts = ["café", "日本語", "🙂\r\n", "\x00plain"]
         barrier = threading.Barrier(len(texts))
+
         def decode(text):
             ids = list(text.encode("utf-8"))
             barrier.wait(timeout=5)

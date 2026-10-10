@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Exact token-ID parity for protected literals, including general caller span inputs."""
 import random
 import sys
@@ -5,7 +8,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import strata_tokenizer as ST
+import strata_tokenizer as ST  # noqa: E402
 
 
 class ReferenceTokenizer(ST.Tokenizer):

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Decode A/B on coding-agent turns over this repository: arms restarted per round, per-turn ratios.
 
     python tools/agent_turns_bench.py strata-iq2_xs.json base: hcq8:STRATA_HC_Q8=2 [--rounds 2]
@@ -40,7 +43,8 @@ SYSTEM = ("You are an autonomous coding agent working in the user's repository. 
 TOOLS = [
     {"type": "function", "function": {
         "name": "read_file", "description": "Read a file of the repository (UTF-8 text).",
-        "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "path from the repository root"}},
+        "parameters": {"type": "object",
+                       "properties": {"path": {"type": "string", "description": "path from the repository root"}},
                        "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "grep", "description": "Search the repository for a regular expression; returns matching lines.",
@@ -49,7 +53,8 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "edit_file", "description": "Replace an exact string in a file with a new one.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old": {"type": "string"},
-                                                        "new": {"type": "string"}}, "required": ["path", "old", "new"]}}},
+                                                        "new": {"type": "string"}},
+                       "required": ["path", "old", "new"]}}},
     {"type": "function", "function": {
         "name": "run", "description": "Run a shell command in the repository and return its output.",
         "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
@@ -89,8 +94,8 @@ SESSIONS = [
       ("grep", "fused_gr_read_multi", "Where are they called from?"),
       ("read_file", "src/core/verify.cpp", "The verify window calls them; reading it.")]),
     ("tokenizer-fr",
-     "Écris une suite de tests pytest pour le tokenizer Python (encodage, décodage, tokens spéciaux, texte multilingue, "
-     "cas limites), puis corrige les bugs que les tests révèlent. Réponds en français.",
+     "Écris une suite de tests pytest pour le tokenizer Python (encodage, décodage, tokens spéciaux, texte "
+     "multilingue, cas limites), puis corrige les bugs que les tests révèlent. Réponds en français.",
      [("read_file", "tools/strata_tokenizer.py", "Je lis d'abord le tokenizer."),
       ("grep", "strata_tokenizer", "Je cherche qui l'utilise."),
       ("read_file", "serve/frontend.py", "Le frontend l'appelle ; je le lis pour voir les usages réels."),
@@ -170,8 +175,9 @@ def main() -> int:
             cfg["log"] = str(Path(tempfile.gettempdir()) / f"agent_turns_{name}_r{rnd}.log")
             cpath = Path(tempfile.gettempdir()) / f"agent_turns_{name}.json"
             cpath.write_text(json.dumps(cfg, indent=1))
-            proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config",
-                                     str(cpath), "--port", str(a.port)], cwd=str(ROOT), env=dict(os.environ, **e),
+            proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata",
+                                     "--config", str(cpath), "--port", str(a.port)],
+                                    cwd=str(ROOT), env=dict(os.environ, **e),
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
                 t0 = time.time()

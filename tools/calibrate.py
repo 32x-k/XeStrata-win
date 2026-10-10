@@ -282,8 +282,8 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
         by_workers = {}
         for w in worker_candidates(d_workers, extra_workers):
             say(f"  Measuring with {w} CPU workers (restarts the engine) ...")
-            e = restart(start_engine, with_arg(tuned, "--pool-workers", None if w == d_workers else str(w)), f"{w} workers",
-                        say, report)
+            e = restart(start_engine, with_arg(tuned, "--pool-workers", None if w == d_workers else str(w)),
+                        f"{w} workers", say, report)
             if e is None:
                 continue
             try:

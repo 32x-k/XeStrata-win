@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Tracking state must be identical at every streamed fragment, not just at the end."""
 import itertools
 import random
@@ -41,8 +44,8 @@ class TrackTests(unittest.TestCase):
         fragments = ("", "a", "é🙂", "`", "``", "```", "~~~", "\r", "\n", "\r\n",
                      "\n\n", "  ```python\n", "```quoted```\n", "~\ntext", "\t\nrest")
         for fence, line, ticks, text in itertools.product(("", "`", "~"),
-                                                         ("", "  ", "``", "code `"),
-                                                         (0, 1, 2, 3), fragments):
+                                                          ("", "  ", "``", "code `"),
+                                                          (0, 1, 2, 3), fragments):
             actual, expected = OutputParser(), ReferenceParser()
             for parser in (actual, expected):
                 parser.fence, parser.line, parser.ticks = fence, line, ticks
@@ -88,6 +91,7 @@ class TrackTests(unittest.TestCase):
         for recover, stream in itertools.product((False, True), repeat=2):
             kwargs = dict(thinking=False, tools=[{"name": "write"}], recover=recover, stream_tools=stream)
             actual, expected = OutputParser(**kwargs), ReferenceParser(**kwargs)
+
             def normalized(events):
                 return [(e.kind, e.text, (e.call.name, e.call.arguments) if e.call else None) for e in events]
             for pos in range(0, len(text), 17):

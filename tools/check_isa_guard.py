@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Check that no code reachable on an AVX2-only CPU can contain wider-ISA instructions (#795).
 
 Strata compiles a few translation units for AVX-512 (expert.cpp, iq_avx512.cpp) and some for AVX2 + AVX-VNNI
@@ -41,7 +44,8 @@ WIDE_OBJECTS = ("expert.cpp", "iq_avx512.cpp", "iq_avx2.cpp", "q2_avx2.cpp", "kq
 
 # An instruction is "wide" if it is EVEX encoded (first byte 0x62 in 64-bit mode), or one of these VEX / legacy
 # extensions that an AVX2 CPU may lack.  AVX-VNNI is VEX encoded (vpdpbusd, vpdpwssd ...).
-WIDE_MNEMONIC = re.compile(r"^(vpdp|vgf2p8|vaes|vpclmul|sha(1|256)|vp2intersect|vpmadd52|vcvtne|vbcstnebf16|vsha512|vsm[34]|tdp|ldtilecfg)")
+WIDE_MNEMONIC = re.compile(r"^(vpdp|vgf2p8|vaes|vpclmul|sha(1|256)|vp2intersect|vpmadd52|vcvtne|vbcstnebf16|vsha512"
+                           r"|vsm[34]|tdp|ldtilecfg)")
 WIDE_OPERAND = re.compile(r"\bzmm|\bk[0-7]\b|[xy]mm(1[6-9]|2\d|3[01])\b|\{k[0-7]\}")
 
 
@@ -61,7 +65,8 @@ def judge(name, obj, wide_text, guarded, weak, is_elf):
     anon = ("(anonymous namespace)" in name) or ("?A0x" in name)
     if weak:
         return "weak / COMDAT symbol: the linker may pick this wide copy for every caller (ODR)"
-    if obj is not None and not any(obj.endswith(o + ".obj") or obj.endswith(o + ".o") or o in obj for o in WIDE_OBJECTS):
+    if obj is not None and not any(obj.endswith(o + ".obj") or obj.endswith(o + ".o") or o in obj
+                                   for o in WIDE_OBJECTS):
         return "wide-ISA code outside the wide-ISA translation units (object %s)" % obj
     if anon or base in WIDE_PUBLIC:
         return None
@@ -156,7 +161,8 @@ def run_pe(path, mapf):
         for ins in md.disasm(pe.get_data(b, e - b), b):
             if isa_rva is not None and "[rip" in ins.op_str:
                 m = re.search(r"\[rip ([+-]) 0x([0-9a-f]+)\]", ins.op_str)
-                if m:                    # the function reads __isa_available: MSVC's own run-time guard for its vectorizer
+                # the function reads __isa_available: MSVC's own run-time guard for its vectorizer
+                if m:
                     disp = int(m.group(2), 16) * (1 if m.group(1) == "+" else -1)
                     guarded = guarded or ins.address + ins.size + disp == isa_rva
             if is_wide(ins.bytes[0], ins.mnemonic, ins.op_str):
@@ -172,7 +178,7 @@ def run_pe(path, mapf):
         why = judge(sym, obj.split(":")[-1], "", guarded, False, False)
         # an inline function defined in a header comes out of the map as `f i`; the wide-ISA files must have none
         in_wide_obj = any(o in obj for o in WIDE_OBJECTS)
-        if why is None and in_wide_obj and not guarded and re.search(r"std@@|\?\$", sym) and not ("?A0x" in sym):
+        if why is None and in_wide_obj and not guarded and re.search(r"std@@|\?\$", sym) and "?A0x" not in sym:
             why = "template / std:: instantiation inside a wide-ISA object (COMDAT: the linker may share it)"
         if why:
             bad.append((sym, n, first, why + " [rva %x, %s]" % (b, obj)))

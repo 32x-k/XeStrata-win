@@ -3297,7 +3297,8 @@ class ThinkingBudget(unittest.TestCase):
         self.assertTrue(b["choices"][0]["message"]["reasoning_content"].startswith(ThinkingEngine.THOUGHT[:20] + "\n"))
 
     def test_the_thinking_progress_line_shows_the_budget_not_max_tokens(self):
-        """#984: 'thinking: x of max 6400' read as if the budget was ignored; while a budget applies the line shows it."""
+        """#984: 'thinking: x of max 6400' read as if the budget was ignored; while a budget applies the line shows
+        it."""
         st = {"phase": "thinking", "generated": 10, "first_token": time.time() - 1, "started": time.time() - 2,
               "max_tokens": 6400, "thinking_budget": 2048}
         out = io.StringIO()
@@ -3321,7 +3322,8 @@ class ThinkingBudget(unittest.TestCase):
         self.assertTrue(msg["reasoning_content"].startswith(ThinkingEngine.THOUGHT[:150] + "\n"), msg)
         self.assertEqual((msg["content"], b["choices"][0]["finish_reason"]), (ThinkingEngine.ANSWER, "stop"))
         self.assertEqual(len(self.engine.prompts), 2)
-        self.assertIn("thinking capped at 150 of max_tokens 300 to leave room for the answer (budget 5000)", out.getvalue())
+        self.assertIn("thinking capped at 150 of max_tokens 300 to leave room for the answer (budget 5000)",
+                      out.getvalue())
 
     def test_a_budget_well_below_max_tokens_is_not_capped(self):
         out = io.StringIO()

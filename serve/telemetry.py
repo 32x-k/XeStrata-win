@@ -535,7 +535,8 @@ class Telemetry:
         return s
 
     def close(self):
-        """Ends the sampler thread (a server that stops, a test's service): it used to run for the life of the process."""
+        """Ends the sampler thread (a server that stops, a test's service): it used to run for the life of the
+        process."""
         self._stop.set()
 
     def _loop(self):

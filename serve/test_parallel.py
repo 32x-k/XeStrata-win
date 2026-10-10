@@ -567,6 +567,7 @@ class ParallelService(unittest.TestCase):
             e.slot_busy[0] = e.slot_busy[1] = True       # the leak: busy, claimed by nobody, nothing ending them
         # the solo path needs a quiet engine; a busy flag sends the request to the slot path, which waits
         res, errs = {}, []
+
         def go():
             try:
                 res["r"] = self.chat("after the leak", max_tokens=16)

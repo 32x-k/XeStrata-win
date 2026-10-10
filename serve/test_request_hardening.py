@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """0.1.41 server hardening: a JSON body of the wrong shape is a 400 (not a dropped connection), an oversized body is a
 413 before it is read, a bad Content-Length is a 400, and a sampling field of the wrong type is a 400 that names it.
 
@@ -58,7 +61,8 @@ class Hardening(unittest.TestCase):
         self.assertEqual(code, 400, out)
 
     def test_a_good_request_still_answers(self):
-        code, out = self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8})
+        code, out = self.post("/v1/chat/completions",
+                              {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8})
         self.assertEqual(code, 200, out)
 
     def test_oversized_content_length_is_413_unread(self):

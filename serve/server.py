@@ -144,7 +144,8 @@ VISION_START = "<|vision_start|>"
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
-ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
+# #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
+ANSWER_RESERVE_MIN = 512
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
@@ -244,12 +245,13 @@ def _timeout_env(name: str, default: float) -> float | None:
     return None if v <= 0 else v
 
 
-# #1317 part 2: the quick watchdog for a FROZEN engine.  engine_silence_s (above) is generous on purpose: a slow PC reads a
-# prompt chunk for minutes without a line.  But an engine that prints nothing for ENGINE_STALL_S and also uses no CPU time and
-# moves no bytes of I/O in that time is not slow, it is idle or frozen (a deadlock in a CUDA call, a driver stall, a lost
-# step), and waiting longer cannot help: it is ended, and the next request starts it again.  An engine that is silent but
-# still working is never ended by this, only reported once (the recommendation: engine_silence_s, or this variable).
-# STRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs it); without it nothing is ended.
+# #1317 part 2: the quick watchdog for a FROZEN engine.  engine_silence_s (above) is generous on purpose: a slow PC
+# reads a prompt chunk for minutes without a line.  But an engine that prints nothing for ENGINE_STALL_S and also uses
+# no CPU time and moves no bytes of I/O in that time is not slow, it is idle or frozen (a deadlock in a CUDA call, a
+# driver stall, a lost step), and waiting longer cannot help: it is ended, and the next request starts it again.  An
+# engine that is silent but still working is never ended by this, only reported once (the recommendation:
+# engine_silence_s, or this variable). STRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs it);
+# without it nothing is ended.
 ENGINE_STALL_S = _timeout_env("STRATA_ENGINE_STALL_S", 90.0)
 STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
 STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
@@ -522,7 +524,8 @@ class StrataEngine:
     """
     silence_s = ENGINE_SILENCE_S         # #481: main() sets the config's engine_silence_s (survives restart())
     silent_note: str | None = None       # #481: why the server ended a silent engine (death_note says it)
-    gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
+    # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
+    gpu_busy = None
     last_err: str | None = None          # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
 
@@ -682,7 +685,8 @@ class StrataEngine:
         if "slot_cv" not in self.__dict__:
             self.slot_cv = threading.Condition()
             self.waiting = 0                            # requests waiting for the control lines (ctl)
-            self.admitting = 0                          # #1603: ... and those that gave the lines back to wait for a slot
+            # #1603: ... and those that gave the lines back to wait for a slot
+            self.admitting = 0
             self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
             self.ctl_epoch = 0                          # how often the control lines were taken
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
@@ -1105,7 +1109,8 @@ class StrataEngine:
             else:
                 self._orphan_seen.pop(b, None)
         if freed:
-            print(f"[strata] parallel: slot(s) {', '.join(map(str, freed))} were marked busy with no request using them "
+            print(f"[strata] parallel: slot(s) {', '.join(map(str, freed))} were marked busy with no request "
+                  "using them "
                   "(issue #1603); freed, the waiting request goes on", flush=True)
             self.slot_cv.notify_all()
         return freed
@@ -1285,7 +1290,8 @@ class StrataEngine:
                                         if not admit_said:
                                             admit_said = True
                                             busy = [b for b, v in enumerate(self.slot_busy) if v]
-                                            print(f"[strata] parallel: a request has waited {time.monotonic() - admit_since:.0f} s "
+                                            waited = time.monotonic() - admit_since
+                                            print(f"[strata] parallel: a request has waited {waited:.0f} s "
                                                   f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
                                                   f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
                                     self._reap_orphan_slots()
@@ -1618,8 +1624,9 @@ class StrataEngine:
             return None
 
     def _stall_check(self, heard: float, state: dict, stall_s: float) -> None:
-        """#1317: called while the engine is silent.  Takes a baseline soon after the last line, and at stall_s of silence
-        compares: no CPU and no I/O in all that time -> the engine is ended (EngineSilent); work going on -> one warning."""
+        """#1317: called while the engine is silent.  Takes a baseline soon after the last line, and at stall_s of
+        silence compares: no CPU and no I/O in all that time -> the engine is ended (EngineSilent); work going on -> one
+        warning."""
         age = time.monotonic() - heard
         if state.get("base") is None:
             state["base"] = self._activity()
@@ -1638,8 +1645,9 @@ class StrataEngine:
             state["base"], state["next"] = now, age + stall_s
             if not state.get("warned"):
                 state["warned"] = True
-                print(f"[strata] the engine has said nothing for {age:.0f} s but is still working; it is not ended (the "
-                      "limit is engine_silence_s). If it is stuck, \"engine_silence_s\" can be set lower.", flush=True)
+                print(f"[strata] the engine has said nothing for {age:.0f} s but is still working; it is not ended "
+                      "(the limit is engine_silence_s). If it is stuck, \"engine_silence_s\" can be set lower.",
+                      flush=True)
         else:
             state["next"] = float("inf")   # no reading (psutil missing): nothing to decide on
 
@@ -2169,10 +2177,10 @@ def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
     args = list(cfg["args"])
-    # #1322: a config with a "vision" section but without --vision in its args (written by an older setup run, or edited by
-    # hand) advertised images and then refused every picture ("this engine was started without --vision").  The section
-    # says images are wanted: start the engine with them, and keep the encoder's VRAM free as setup does for a GPU encoder
-    # (only when the config has no reserve of its own).
+    # #1322: a config with a "vision" section but without --vision in its args (written by an older setup run, or edited
+    # by hand) advertised images and then refused every picture ("this engine was started without --vision").  The
+    # section says images are wanted: start the engine with them, and keep the encoder's VRAM free as setup does for a
+    # GPU encoder (only when the config has no reserve of its own).
     if isinstance(cfg.get("vision"), dict) and "--vision" not in args:
         args.append("--vision")
         note = "added --vision"
@@ -2511,7 +2519,8 @@ class Service:
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
-        self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
+        # #1641: the config's "reasoning_effort": the level for requests with none
+        self.config_effort = None
         self.fifo = threading.Lock()
         self.vram_reserve: int | None = None           # #533: the last POST /v1/vram reserve (None: the start's)
         self.slot_save_path: str | None = None        # --slot-save-path: /slots/0?action=save|restore (off when None)
@@ -2793,7 +2802,8 @@ class Service:
             return
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
-        with self.status_lock:                          # #1603: waiting for the fifo to start the engine is queued, not nothing
+        # #1603: waiting for the fifo to start the engine is queued, not nothing
+        with self.status_lock:
             self.status["queued"] += 1
         counted = True
         try:
@@ -2899,8 +2909,8 @@ class Service:
                                                       "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_pci=getattr(self, "gpu_pci", None))
             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
-                # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
-                # slow card keeps the GPU at work while the host thread sleeps)
+                # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on
+                # a slow card keeps the GPU at work while the host thread sleeps)
                 self.engine.gpu_busy = lambda: (self.telemetry.snapshot()["now"].get("gpu_util") or 0) >= 10
 
     def _tok_s(self):
@@ -5343,8 +5353,8 @@ class Server(ThreadingHTTPServer):
     # either one (a forgotten second start of run-<model>.bat).  Without it the second start fails loudly instead.
     allow_reuse_address = os.name != "nt"
     # socketserver listens with a backlog of 5: a burst of 30-40 clients at once got "connection reset by peer" on the
-    # first ones (measured on 4 x R9700, also with one request at a time); the requests wait in the server, not the kernel
-    # (STRATA_HTTP_BACKLOG overrides it)
+    # first ones (measured on 4 x R9700, also with one request at a time); the requests wait in the server, not the
+    # kernel (STRATA_HTTP_BACKLOG overrides it)
     request_queue_size = max(5, int(os.environ.get("STRATA_HTTP_BACKLOG") or 256))
 
     def handle_error(self, request, client_address):
@@ -5353,7 +5363,8 @@ class Server(ThreadingHTTPServer):
 
     def server_close(self):
         # the hardware sampler serve() started for this server stops with it (test isolation: every Service a test
-        # started used to leave its sampler running, 21 of them after test_responses, which slowed test_parallel's timing)
+        # started used to leave its sampler running, 21 of them after test_responses, which slowed test_parallel's
+        # timing)
         tel = getattr(getattr(self, "svc", None), "telemetry", None)
         if tel is not None and hasattr(tel, "close"):
             tel.close()
@@ -5932,7 +5943,8 @@ def main() -> int:
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
         try:
-            svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get("reasoning_effort")
+            svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get(
+                "reasoning_effort")
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         if svc.config_effort:
