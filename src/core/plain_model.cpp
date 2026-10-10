@@ -78,7 +78,6 @@ PlainModel::PlainModel() = default;
 PlainModel::~PlainModel() {
     if (cs_ != nullptr) strata::gpu::stream_sync(cs_);
     prompt_gemm_.reset();   // the products' state before the stream
-    strata::gpu::free(prompt_dev_);
     strata::gpu::free(prompt_host_);
     for (auto* g : exec_) strata::gpu::graph_destroy(g);
     for (auto& v : segs_)
@@ -485,21 +484,17 @@ bool PlainModel::open_experts(std::string& err) {
         total_b = t;
         apply_vram_limit(free_b, total_b);
     }
-    // the prompt path's buffers, before the tier takes what is left
+    // the prompt path's host buffers, for its longest chunk; the device ones are borrowed from the tier a prompt at a
+    // time (prompt_borrow), so the tier is sized from all the free memory
     if (opt_.prompt_chunk > 0) {
         uint64_t db = 0, hb = 0;
         prompt_carve(opt_.prompt_chunk, pb_, nullptr, nullptr, db, hb);
-        if (!strata::gpu::alloc_device(&prompt_dev_, db) || !strata::gpu::alloc_host(&prompt_host_, hb)) {
-            err = "plain model: no memory for the prompt path's chunks of " + std::to_string(opt_.prompt_chunk) +
-                  " tokens (" + std::to_string(db >> 20) + " MiB; --prompt-chunk sets a smaller one, 0 none)";
+        if (!strata::gpu::alloc_host(&prompt_host_, hb)) {
+            err = "plain model: no pinned memory for the prompt path's chunks of " + std::to_string(opt_.prompt_chunk) +
+                  " tokens (" + std::to_string(hb >> 20) + " MiB; --prompt-chunk sets a smaller one, 0 none)";
             return false;
         }
-        prompt_carve(opt_.prompt_chunk, pb_, (uint8_t*) prompt_dev_, (uint8_t*) prompt_host_, db, hb);
-        size_t f = 0, t = 0;
-        if (!strata::gpu::mem_info(&f, &t)) { err = "plain model: the device's memory is unknown"; return false; }
-        free_b = f;
-        total_b = t;
-        apply_vram_limit(free_b, total_b);
+        prompt_carve(opt_.prompt_chunk, pb_, nullptr, (uint8_t*) prompt_host_, db, hb);
     }
     const uint64_t window_b = (uint64_t) opt_.max_t * (uint64_t) s.n_expert_used * (uint64_t) s.n_embd * 4 * 3 +
                               16 * lay.max_blob + (64ull << 20);
@@ -515,8 +510,8 @@ bool PlainModel::open_experts(std::string& err) {
     }
     std::vector<int64_t> slot_bytes;
     free_.assign((size_t) L, {});
-    for (int64_t l = 0; l < L; ++l)
-        for (int64_t i = 0; i < q; ++i) {
+    for (int64_t i = 0; i < q; ++i)   // the layers in turn: slot s is layer s % L's (prompt_borrow takes the last ones)
+        for (int64_t l = 0; l < L; ++l) {
             free_[(size_t) l].push_back((int32_t) slot_bytes.size());
             slot_bytes.push_back((int64_t) lay.bytes[(size_t) l]);
         }

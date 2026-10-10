@@ -57,8 +57,9 @@ struct PlainOptions {
     std::string rope_scaling;
     double rope_scale = 0;
     double yarn_orig_ctx = 0;
-    /// Tokens a prompt chunk takes through the batched products (`prompt`); 0: the prompt runs in windows.
-    int64_t prompt_chunk = 512;
+    /// The most tokens a prompt chunk takes through the batched products (`prompt`; a shorter prompt, one chunk of its
+    /// length); 0: the prompt runs in windows.
+    int64_t prompt_chunk = 4096;
 };
 
 class PlainModel {
@@ -124,8 +125,8 @@ private:
     bool record_window(int T, strata::gpu::Stream cs, std::string& err);
     bool adapt(std::string& err);
     bool fill_slot(int64_t layer, int32_t expert, std::string& err);
-    /// The prompt path's buffers for chunks of `T` tokens, carved by prompt_carve from one device block and one pinned
-    /// host block allocated at load, before the VRAM tier is sized (plain_prompt.cpp uses them).
+    /// The prompt path's buffers for chunks of `T` tokens, carved by prompt_carve: the pinned host block allocated at
+    /// load for the longest chunk, the device block borrowed from the tier for each prompt (plain_prompt.cpp uses them).
     struct PromptBufs {
         static constexpr int kGroup = 8;   ///< experts dequantized and multiplied in one grouped product
         int64_t T = 0, gu_elems = 0, d_elems = 0, gemm_elems = 0;
@@ -165,8 +166,16 @@ private:
     void prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* host, uint64_t& dev_bytes,
                       uint64_t& host_bytes) const;
     PromptBufs pb_;
-    void* prompt_dev_ = nullptr;
     void* prompt_host_ = nullptr;
+    /// The prompt's device buffers, carved from the tier's last slots for one prompt (prompt_borrow) and given back
+    /// after it (prompt_return), with the experts that were in them put back: the tier keeps that memory between
+    /// prompts.  The slots go to the layers in turn (slot s is layer s % L's), so the last ones are every layer's.
+    bool prompt_borrow(int64_t T, std::string& err);
+    bool prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err);
+    bool prompt_warm_products(std::string& err);
+    bool prompt_return(std::string& err);
+    int64_t borrow_first_ = -1;
+    std::vector<std::pair<int32_t, int32_t>> borrowed_res_;   // (layer, expert) the borrowed slots held
     struct PromptGemm;   // plain_prompt.cpp: the products' state over pb_.gemm_scratch
     static void prompt_gemm_free(PromptGemm* g);
     PromptGemm& prompt_gemm();

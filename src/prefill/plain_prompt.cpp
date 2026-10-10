@@ -89,8 +89,77 @@ PlainModel::PromptGemm& PlainModel::prompt_gemm() {
     return *prompt_gemm_;
 }
 
+bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
+    const int64_t L = spec_.n_moe_layers(), E = spec_.n_expert, n = n_slots_;
+    const uint64_t* off = cache_.slot_offsets();
+    if (borrow_first_ >= 0 || off == nullptr || L <= 0 || n < 2) { err = "plain prompt: no tier to borrow from"; return false; }
+    // the chunk's device bytes from the tier's last slots: halved until they take at most half the tier
+    uint64_t db = 0, hb = 0;
+    int64_t first = n;
+    for (;; T /= 2) {
+        if (T < 16) { err = "plain prompt: the VRAM tier is too small for the prompt's buffers"; return false; }
+        prompt_carve(T, pb_, nullptr, nullptr, db, hb);
+        first = n;
+        while (first > n / 2 && off[n] - off[first] < db) --first;
+        if (off[n] - off[first] >= db) break;
+    }
+    borrowed_res_.clear();
+    for (int64_t l = 0; l < L; ++l)
+        for (int64_t e = 0; e < E; ++e) {
+            int32_t& r = res_[(size_t) (l * E + e)];
+            if (r >= first) {
+                borrowed_res_.emplace_back((int32_t) l, (int32_t) e);
+                r = -1;
+            }
+        }
+    for (auto& f : free_) f.erase(std::remove_if(f.begin(), f.end(), [&](int32_t x) { return x >= first; }), f.end());
+    borrow_first_ = first;
+    prompt_carve(T, pb_, cache_.device_slot((int32_t) first), (uint8_t*) prompt_host_, db, hb);
+    PromptGemm& g = prompt_gemm();
+    g.gemm.rebind(pb_.gemm_scratch, pb_.gemm_elems);
+    g.identity = false;   // the identity map is rewritten where the buffers now lie
+    return true;
+}
+
+bool PlainModel::prompt_return(std::string& err) {
+    if (borrow_first_ < 0) return true;
+    const int64_t L = spec_.n_moe_layers(), n = n_slots_;
+    const auto& lay = k::cpu::expert_layout();
+    if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain prompt: ") + strata::gpu::last_error(); return false; }
+    for (int64_t s = borrow_first_; s < n; ++s) free_[(size_t) (s % L)].push_back((int32_t) s);
+    borrow_first_ = -1;
+    // the experts the prompt displaced, back into the slots: straight from pinned RAM, else through fill_slot
+    for (const auto& [l, e] : borrowed_res_) {
+        auto& f = free_[(size_t) l];
+        if (f.empty()) break;
+        const uint8_t* hb = src_->transient(l, e) ? nullptr : src_->blob(l, e);
+        if (hb != nullptr && strata::gpu::is_host_usm(hb)) {
+            const int32_t slot = f.back();
+            if (!strata::gpu::copy_async(cache_.device_slot(slot), hb, lay.blob_bytes(l), cs_)) {
+                err = std::string("plain prompt: ") + strata::gpu::last_error();
+                return false;
+            }
+            f.pop_back();
+            res_[(size_t) (l * spec_.n_expert + e)] = slot;
+        } else if (!fill_slot(l, e, err)) {
+            return false;
+        }
+    }
+    borrowed_res_.clear();
+    if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain prompt: ") + strata::gpu::last_error(); return false; }
+    return true;
+}
+
 bool PlainModel::prompt_warm(std::string& err) {
-    if (opt_.prompt_chunk <= 0 || prompt_dev_ == nullptr) return true;
+    if (opt_.prompt_chunk <= 0 || prompt_host_ == nullptr) return true;
+    if (!prompt_borrow(std::min<int64_t>(opt_.prompt_chunk, 512), err)) return false;
+    const bool ok = prompt_warm_products(err);
+    std::string err2;
+    if (!prompt_return(err2) && ok) { err = err2; return false; }
+    return ok;
+}
+
+bool PlainModel::prompt_warm_products(std::string& err) {
     // A library's first product of a kind loads its kernels for it, inside whichever prompt comes first (rocBLAS on
     // the RX 9060 XT: 0.5 s for the first product, 0.9 s more for the first of 32 rows): each dense shape the prompt
     // takes, once, on a chunk of zeros into the buffers the prompt overwrites.
@@ -138,8 +207,18 @@ bool PlainModel::prompt_warm(std::string& err) {
 }
 
 bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err) {
-    if (opt_.prompt_chunk <= 0 || n <= 0 || prompt_dev_ == nullptr) { err.clear(); return false; }
+    if (opt_.prompt_chunk <= 0 || n <= 0 || prompt_host_ == nullptr) { err.clear(); return false; }
     if (pos < 0 || pos + n > opt_.max_cells) { err = "plain prompt: past the context"; return false; }
+    // one chunk the prompt's length, up to prompt_chunk (prompt_borrow may take fewer)
+    if (!prompt_borrow(std::min<int64_t>(n, opt_.prompt_chunk), err)) return false;
+    const bool ok = prompt_chunks(tokens, n, pos, out, logits, err);
+    std::string err2;
+    if (!prompt_return(err2) && ok) { err = err2; return false; }
+    return ok;
+}
+
+bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits,
+                               std::string& err) {
     PromptBufs& P = pb_;
     const ModelSpec& s = spec_;
     const auto& lay = k::cpu::expert_layout();
