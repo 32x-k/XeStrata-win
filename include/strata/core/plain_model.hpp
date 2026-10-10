@@ -143,7 +143,7 @@ private:
         uint16_t* h16 = nullptr;
         int32_t *src = nullptr, *slot = nullptr, *bounds = nullptr;
         uint16_t *dq_gu = nullptr, *dq_d = nullptr;   ///< kGroup experts' FP16 weights
-        uint8_t* stage = nullptr;          ///< kGroup expert blobs copied from RAM
+        uint8_t* stage = nullptr;          ///< 2 kGroup expert blobs copied from RAM (two halves)
         uint8_t *xq = nullptr, *hq = nullptr;   ///< the int8 products' activations: the routed rows, the SwiGLU's
         int32_t* identity = nullptr;       ///< row i is row i (the int8 products' output map)
         const uint8_t** wtab = nullptr;    ///< a layer's experts' blobs, for the int8 products

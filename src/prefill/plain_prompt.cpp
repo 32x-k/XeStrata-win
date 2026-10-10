@@ -54,6 +54,20 @@ struct PlainModel::PromptGemm {
     prefill::Gemm gemm;
     prefill::mmq::Context mmq;
     bool identity = false;   // pb_.identity written
+    // the int8 products' copies from RAM on a stream of their own, into the staging's two halves in turn: ready[h]
+    // when half h holds its group, used[h] when that group's products are done with it
+    strata::gpu::Stream xs = nullptr;
+    strata::gpu::Event *ready[2] = {}, *used[2] = {};
+    bool used_live[2] = {};
+    ~PromptGemm() {
+        if (xs != nullptr) strata::gpu::stream_sync(xs);
+        for (int h = 0; h < 2; ++h) {
+            if (ready[h] != nullptr) strata::gpu::event_destroy(ready[h]);
+            if (used[h] != nullptr) strata::gpu::event_destroy(used[h]);
+        }
+        if (xs != nullptr) strata::gpu::stream_destroy(xs);
+    }
+    bool overlap() const { return xs != nullptr && ready[0] && ready[1] && used[0] && used[1]; }
 };
 
 void PlainModel::prompt_gemm_free(PromptGemm* g) { delete g; }
@@ -62,6 +76,13 @@ PlainModel::PromptGemm& PlainModel::prompt_gemm() {
     if (!prompt_gemm_) {
         prompt_gemm_ = std::unique_ptr<PromptGemm, void (*)(PromptGemm*)>(new PromptGemm, &PlainModel::prompt_gemm_free);
         prompt_gemm_->gemm.init_external(cs_, pb_.gemm_scratch, pb_.gemm_elems);
+        PromptGemm& g = *prompt_gemm_;
+        g.xs = strata::gpu::stream_create();
+        for (int h = 0; h < 2; ++h) {
+            if (!strata::gpu::event_create(&g.ready[h])) g.ready[h] = nullptr;
+            if (!strata::gpu::event_create(&g.used[h])) g.used[h] = nullptr;
+        }
+        // without them the copies stay on the compute stream, in order with the products
     }
     return *prompt_gemm_;
 }
@@ -300,6 +321,14 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                     size_t g1 = g0;
                     int staged = 0;
                     int64_t mr = 0;
+                    // the half of the staging this group takes; its copies wait for the products two groups back
+                    const bool ovl = !transient && pg.overlap();
+                    const int h = (int) (gi % 2);
+                    strata::gpu::Stream ccs = ovl ? pg.xs : cs;
+                    if (ovl && pg.used_live[h] && !strata::gpu::stream_wait_event(ccs, pg.used[h])) {
+                        err = std::string("plain prompt: ") + strata::gpu::last_error();
+                        return false;
+                    }
                     for (; g1 < experts.size(); ++g1) {
                         const int32_t e = experts[g1];
                         const int32_t sl = res_[(size_t) (ml * E + e)];
@@ -308,15 +337,19 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                             blob = cache_.device_slot(sl);
                         } else {
                             if (staged == PromptBufs::kGroup) break;
-                            uint8_t* dst = P.stage + (size_t) staged++ * lay.max_blob;
+                            uint8_t* dst = P.stage + (size_t) ((ovl ? h * PromptBufs::kGroup : 0) + staged++) * lay.max_blob;
                             const uint8_t* hb = src_->blob(ml, e);
                             const bool copied = hb != nullptr &&
-                                (transient ? strata::gpu::copy(dst, hb, f.bytes) : strata::gpu::copy_async(dst, hb, f.bytes, cs));
+                                (transient ? strata::gpu::copy(dst, hb, f.bytes) : strata::gpu::copy_async(dst, hb, f.bytes, ccs));
                             if (!copied) { err = "plain prompt: an expert could not be read"; return false; }
                             blob = dst;
                         }
                         P.h_wtab[g1] = blob;
                         mr = std::max<int64_t>(mr, count[(size_t) e]);
+                    }
+                    if (ovl && (!strata::gpu::event_record(pg.ready[h], ccs) || !strata::gpu::stream_wait_event(cs, pg.ready[h]))) {
+                        err = std::string("plain prompt: ") + strata::gpu::last_error();
+                        return false;
                     }
                     const int G = (int) (g1 - g0);
                     const int32_t r0 = P.h_bounds[g0], nr = P.h_bounds[g1] - r0;
@@ -340,6 +373,13 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                     dn.bounds = P.rbounds + g0 + gi; dn.ids = P.identity; dn.total_rows = nr; dn.max_rows = mr;
                     dn.dst = P.dm + (int64_t) r0 * N; dn.ld_dst = N; dn.wtab = P.wtab + g0; dn.woff = f.down_off;
                     pg.mmq.run(dn, cs);
+                    if (ovl) {
+                        if (!strata::gpu::event_record(pg.used[h], cs)) {
+                            err = std::string("plain prompt: ") + strata::gpu::last_error();
+                            return false;
+                        }
+                        pg.used_live[h] = true;
+                    }
                     g0 = g1;
                 }
                 for (size_t g0 = 0; !use_mmq && g0 < experts.size(); g0 += PromptBufs::kGroup) {
