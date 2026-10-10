@@ -323,7 +323,8 @@ B70 も全部 CPU（以前と同じ）で、RX 9060 XT は PCIe に回す数が 
 
 ## 画像
 
-画像のエンコーダー（`tools/vision`。llama.cpp の mtmd とモデルの mmproj）は、既定で GPU で動きます（`./setup.sh --vision yes` または `gpu`）。
+画像は、setup で選んだときだけ使えます（既定はオフ）。
+選ぶと、画像のエンコーダー（`tools/vision`。llama.cpp の mtmd とモデルの mmproj）は既定で GPU で動きます（`./setup.sh --vision yes` または `gpu`）。
 GPU で動かせないときは CPU のエンコーダーに切り替わり、`--vision cpu` では CPU のエンコーダーだけを使います。
 CPU のエンコーダーは、[画像の記録](../bench/results/2026-09-30-xe-vision-cpu/README.md)の画像を、2 つの形の格子で llama.cpp と同じに読みます。
 動くモデルはすべて画像でも確かめました（[記録](../bench/results/2026-09-30-xe-vision-models/README.md)）。
