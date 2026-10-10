@@ -11,9 +11,9 @@ still at 1%.
 
     python .claude/skills/upstream-sync/scripts/judge.py [--prompt-only GPU]... OUT/IQ3_XXS OUT/IQ2_XS ...
 
-A cell where upstream did not finish, ran at SLOW tok/s or less, or was stopped by bench.sh as that slow, is left
-out (not measurable); one where only XeStrata did not finish fails.  --prompt-only GPU: that GPU's output cells are
-left out too (a GPU no matrix.json names is an error: bench.sh's GPU argument, spelled the same).
+A cell where upstream did not finish, ran at SLOW tok/s or less, or was stopped by bench_generate.py as that slow, is
+left out (not measurable); one where only XeStrata did not finish fails.  --prompt-only GPU: that GPU's output cells are
+left out too (a GPU no matrix.json names is an error: bench_generate.py's GPU argument, spelled the same).
 Prints a line per cell and, last, "ALL PASS" (exit 0) or "FAIL <n>" (exit 1; also when no cell was compared).
 """
 import json

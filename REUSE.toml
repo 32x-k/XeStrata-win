@@ -17,6 +17,12 @@ path = ["bench/**", "data/**", "docs/paper/**", "serve/fixtures/**", "serve/web/
 SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors"]
 SPDX-License-Identifier = "LGPL-3.0-or-later"
 
+# setup's --bench prompts: XeStrata's sources at commit 58dbbe5, two of them with code from ggml (its MIT notice kept)
+[[annotations]]
+path = ["data/bench-corpus.json.xz"]
+SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors", "2023-2026 The ggml authors"]
+SPDX-License-Identifier = "LGPL-3.0-or-later"
+
 [[annotations]]
 path = ["cmake/BUILD.json.in", ".claude/skills/**/SKILL.md"]
 SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"

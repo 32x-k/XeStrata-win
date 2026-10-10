@@ -118,7 +118,7 @@ Every GPU runs three measurements, each with both engines, and step 7 judges all
 
 | Measurement | Script | What it covers |
 | --- | --- | --- |
-| generate | `bench.sh` | the kernels and the speculative loop, both engines writing one text (`--spec-follow`); every model file below |
+| generate | `bench_generate.py` | the kernels and the speculative loop, both engines writing one text (`--spec-follow`); every model file below |
 | serve | `bench_serve.py` | `strata --serve`'s own decode loop and the conversation checkpoints, a chat of four turns; IQ3_XXS |
 | everyday use | `bench_usage.py` | the whole path a user meets: `serve/server.py`, the chat template, streaming, chats and a coding agent; IQ3_XXS |
 
@@ -140,19 +140,21 @@ The other files run at 32K: the products' shapes follow the chunk (from 32K a pr
 o=bench/results/<date>-upstream-<version>
 python .claude/skills/upstream-sync/scripts/sync_prompts.py <pack> <ids>               # the prompts, once
 XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> \
-  [PACK=... NATIVE=... PLE=... EXTRA="..."] [TIERS="..."] \
-  .claude/skills/upstream-sync/scripts/bench.sh $o/<file> <GPU>                    # per file and GPU: B70, RTX4070, RX9060XT
+  [CONFIG=xestrata-<model>.json | PACK=... NATIVE=... PLE=...] [EXTRA="..."] [TIERS="..."] \
+  python .claude/skills/upstream-sync/scripts/bench_generate.py $o/<file> <GPU>    # per file and GPU: B70, RTX4070, RX9060XT
 python .claude/skills/upstream-sync/scripts/sync_collect.py $o/<file> xe-<commit> <tag>
 ```
 
-`bench.sh` alternates the engines, two rounds per tier, after a warm-up each.
+`bench_generate.py` alternates the engines, two rounds per tier, after a warm-up each.
+A model other than IQ3_XXS comes from a model config setup wrote (`CONFIG`: its files, its draft layer and the settings setup and the calibration chose, such as the RAM budget) or from its files (`PACK`, `NATIVE`, `PLE`); the same variables work for the serve and everyday scripts.
+The three scripts are entry points to `tools/bench_core.py`, which setup's `--bench` runs too: the prompts, the conversations and how the runs are made and read are defined there once.
 Both engines write one text a tier (the user's decision of 2026-10-10): upstream runs first in the tier and writes its own answer, and every later run of both engines follows it with `--spec-follow` (upstream's own tool, ac131a3a).
 The rounds and the drafts accepted are then the same, so the output speeds compare the engines and not which text each happened to write: the two engines round differently, their answers part after a few dozen tokens, and on UD-Q4_K_XL that alone moved the output by 5%.
 It stops upstream mid-run once its progress shows it at 10 tok/s or less (the prompt, from its `PP` lines after 30 s; the output, when 256 tokens at 10 tok/s and a minute have passed since the prompt) and does not run it again in that tier.
 
 ### The serve path
 
-`strata --serve`, what users run, has a decode loop of its own (`src/program/generate.cpp`: the `--serve` block, apart from generate's speculative loop) and no `--spec-follow`, so bench.sh does not cover it.
+`strata --serve`, what users run, has a decode loop of its own (`src/program/generate.cpp`: the `--serve` block, apart from generate's speculative loop) and no `--spec-follow`, so bench_generate.py does not cover it.
 `bench_serve.py` runs both engines with `--serve` and the options setup writes, over stdin (`GEN`, `DONE`), for IQ3_XXS at 64K, 32K and 1K (the three kinds of prompt above), per GPU, in the same folder as the IQ3_XXS table:
 
 ```sh
