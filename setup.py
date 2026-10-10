@@ -1954,6 +1954,34 @@ LOW_RAM_HEADROOM_GB = 10   # RAM beside the experts: the OS, the engine's other 
 SMALL_CARD_GB = 7.5            # #496: a card under 8 GB gets a tip (an 8 GB card lists 7.99)
 
 
+DISPLAY_RESERVE_MIB = 1500     # upstream #779: the tip for an NVIDIA card that also drives a display
+DESKTOP_RESERVE_MIB = 3072     # upstream #560 #516: what kept a KDE/Wayland desktop alive beside a full expert cache
+
+
+def linux_desktop(env=None) -> bool:
+    """A graphical session on Linux (Wayland or X)."""
+    env = os.environ if env is None else env
+    return sys.platform.startswith("linux") and bool(env.get("WAYLAND_DISPLAY") or env.get("DISPLAY"))
+
+
+def desktop_reserve_note() -> list[str]:
+    """upstream #560 #516: an AMD card that also drives a Linux desktop - with the default 700 MiB reserve the expert
+    cache fills it, and when the desktop needs more VRAM amdgpu moves the cache to system RAM, where the OOM killer then
+    ends the compositor.  A recommendation, setup changes nothing."""
+    return [f"If this AMD card also drives your desktop and the desktop or apps crash once the model is loaded, keep "
+            f"more VRAM free: {SETUP_CMD} --vram-reserve-mib {DESKTOP_RESERVE_MIB}",
+            "  (remembered for this model; the expert cache gets ~2.3 GB less, a few % of speed)"]
+
+
+def gpu_drives_display(g) -> bool:
+    """upstream #779: True when nvidia-smi says this NVIDIA card has a display attached (display_active Enabled): its
+    desktop needs VRAM too, and a full expert cache beside it has crashed laptops."""
+    if g.get("vendor") != "nvidia" or not g.get("pci"):
+        return False
+    text = out(["nvidia-smi", "-i", str(g["pci"]), "--query-gpu=display_active", "--format=csv,noheader"])
+    return (text or "").strip().lower() == "enabled"
+
+
 def small_card_note(ctx: int, draft_vocab: str | None) -> list[str]:
     """#496 (upstream e1ee248, 4731a9b): what frees VRAM on a card under 8 GB when the start stops with "no VRAM is
     left for the expert cache" (the engine already lowers its own reserve on such a card) - a recommendation, setup
@@ -3836,6 +3864,12 @@ def main() -> int:
         # is what it takes, and says what is short when even that is not enough.  Setup only says what helps.
         for line in small_card_note(ctx, draft_vocab):   # a recommendation: nothing changes
             say("  " + line)
+    elif gpu.get("vendor") == "amd" and a.vram_reserve_mib is None and linux_desktop():
+        for line in desktop_reserve_note():              # upstream #560 #516: a recommendation: nothing changes
+            say("  " + line)
+    if a.vram_reserve_mib is None and gpu_drives_display(gpu):
+        say("  tip: this card drives a display. If the PC freezes or the screen goes black once the model is loaded "
+            f"(upstream #779), keep more VRAM free: run setup again with --vram-reserve-mib {DISPLAY_RESERVE_MIB}")
     if esp is not None:
         # the package's profile, with llama.cpp's flags (the engine takes the same ones)
         args += ["--control-vector-scaled", f"{esp}:1.0", "--control-vector-layer-range", "4", "44",

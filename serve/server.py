@@ -5502,6 +5502,44 @@ class Server(ThreadingHTTPServer):
         super().server_close()
 
 
+DESKTOP_FREE_MIB = 2048          # upstream #560 #516: below this, an AMD card that also drives a Linux desktop can run out
+DESKTOP_RESERVE_MIB = 3072       # what kept KDE/Wayland alive beside a full expert cache in both reports
+
+
+def linux_desktop(env=None) -> bool:
+    """A graphical session on Linux (Wayland or X): its compositor, browser and apps take VRAM after the model has."""
+    env = os.environ if env is None else env
+    return sys.platform.startswith("linux") and bool(env.get("WAYLAND_DISPLAY") or env.get("DISPLAY"))
+
+
+def amd_card(pci) -> bool:
+    """The card at PCI address `pci` is AMD's (sysfs vendor 0x1002)."""
+    try:
+        return bool(pci) and Path(f"/sys/bus/pci/devices/{pci}/vendor").read_text().strip() == "0x1002"
+    except OSError:
+        return False
+
+
+def desktop_vram_note(amd: bool, vram_free_mib, args: list, desktop: bool) -> str:
+    """upstream #560 #516: on Linux, when the desktop needs VRAM the AMD card does not have, amdgpu moves GPU memory
+    (the expert cache) to system RAM, which the experts already fill - the OOM killer then ends the compositor.  The
+    default reserve (700 MiB) is sized for a card without a desktop.  A recommendation, nothing changes: "" when it
+    does not apply."""
+    if not amd or not desktop or not isinstance(vram_free_mib, int) or vram_free_mib >= DESKTOP_FREE_MIB:
+        return ""
+    try:
+        reserve = int(args[args.index("--vram-reserve-mib") + 1]) if "--vram-reserve-mib" in args else 700
+    except (ValueError, IndexError):
+        reserve = 700
+    if reserve >= DESKTOP_RESERVE_MIB:
+        return ""
+    return (f"[strata] note: {vram_free_mib} MiB of VRAM free with the model loaded. If this AMD card also drives your "
+            "desktop and the desktop or apps crash after the start (the driver moves the expert cache to RAM and "
+            "the OOM killer ends the session), keep more VRAM free: setup with --vram-reserve-mib "
+            f"{DESKTOP_RESERVE_MIB} (remembered; the expert cache gets "
+            f"{(DESKTOP_RESERVE_MIB - reserve) / 1024:.1f} GB less, a few % of speed)")
+
+
 def warn_tight_ram(arena_mib) -> None:
     """The model's experts live in RAM (INFO arena_mib, engine 0.1.10+).  With less than ~6 GB left beside them for the
     system, the engine and this server, Linux may end the engine mid-answer when memory runs out (issue #27);
@@ -6057,6 +6095,10 @@ def main() -> int:
                               env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
+        note = desktop_vram_note(amd_card(cfg.get("gpu_pci")), engine.info.get("vram_free_mib"), engine_args(cfg),
+                                 linux_desktop())
+        if note:                                        # upstream #560 #516: before --open starts a browser on that card
+            print(note, flush=True)
     else:
         effort_end = None
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [

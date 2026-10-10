@@ -1957,6 +1957,32 @@ class LayerSplit(unittest.TestCase):
                          ["--native", "x"])
 
 
+class DesktopVramNote(unittest.TestCase):
+    """upstream #560 #516: an AMD card on a Linux desktop with little VRAM left after the start gets a recommended
+    reserve."""
+
+    def test_when_it_applies(self):
+        from serve.server import desktop_vram_note
+        note = desktop_vram_note(True, 624, ["--kv", "int8"], True)
+        self.assertIn("624 MiB of VRAM free", note)
+        self.assertIn("--vram-reserve-mib 3072", note)
+        self.assertIn("2.3 GB less", note)
+
+    def test_when_it_does_not(self):
+        from serve.server import desktop_vram_note
+        self.assertEqual(desktop_vram_note(False, 624, [], True), "")              # not an AMD card
+        self.assertEqual(desktop_vram_note(True, 624, [], False), "")              # no desktop session
+        self.assertEqual(desktop_vram_note(True, 2994, [], True), "")              # room left
+        self.assertEqual(desktop_vram_note(True, None, [], True), "")              # lazy start: no INFO yet
+        self.assertEqual(desktop_vram_note(True, 900, ["--vram-reserve-mib", "4000"], True), "")   # already raised
+
+    def test_desktop_detection(self):
+        from serve import server
+        with mock.patch.object(server.sys, "platform", "linux"):
+            self.assertTrue(server.linux_desktop({"WAYLAND_DISPLAY": "wayland-0"}))
+            self.assertFalse(server.linux_desktop({}))
+
+
 class LearnedProfile(unittest.TestCase):
     """#477: "expert_profile_save" in the config: the engine saves its learned profile there, and the next start
     begins from it when it is a profile of the same model; without the key the arguments are unchanged."""
