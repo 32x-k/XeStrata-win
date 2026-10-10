@@ -118,14 +118,25 @@ void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
 
 // ---- the doorbell (see the header).  bench/results/2026-09-30-xe-doorbell measured what a spinning kernel sees:
 // a volatile read followed by a system-scope acquire fence observes the host's write; a system-scope atomic load
-// alone sometimes never does.  The GPU-to-host direction is a system-scope release fence, then the store.
+// alone sometimes never does.  The GPU-to-host direction is a system-scope fence, then a plain volatile store,
+// not an atomic one: no GPU here reports usm_atomic_host_allocations, and the xe driver serves a discrete
+// GPU's atomic page fault on system memory only by moving the page to VRAM (a userptr cannot move), where a read or
+// a write is simply bound again (xe_vma_need_vram_for_atomic).  The ring has one writer, so it needs no atomicity;
+// the B70 saw the store while the kernel ran in 2,000 of 2,000 runs, sooner than the atomic one (median 4.9 us
+// against 11.0; bench/results/2026-10-11-xe-doorbell-store).
 namespace {
-using sys_ref = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
-                                 sycl::access::address_space::global_space>;
 inline uint32_t read_host(const uint32_t* p) {
     const uint32_t v = *reinterpret_cast<const volatile uint32_t*>(p);
     sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
     return v;
+}
+// *p += 1, with one fence between the load and the store: a release fence right after read_host's acquire fence
+// crashed intel/llvm 7.1's sycl-optimize-barriers pass (an assertion in CallBase::setArgOperand).
+inline void bump_host(uint32_t* p) {
+    volatile uint32_t* v = p;
+    const uint32_t n = *v + 1u;
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+    *v = n;
 }
 }  // namespace
 
@@ -133,8 +144,7 @@ inline uint32_t read_host(const uint32_t* p) {
 void doorbell_ring(uint32_t* d_seq, void* stream) {
     if (d_seq == nullptr) return;
     const auto event = queue_for(stream).single_task([=] {
-        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-        sys_ref(*d_seq).store(read_host(d_seq) + 1u);
+        bump_host(d_seq);
     });
     sync_if_needed(stream, event);
 }
@@ -199,7 +209,7 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
         sycl::group_barrier(it.get_group());
         if (t == 0) {
             sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
-            sys_ref(*d_seq).store(read_host(d_seq) + 1u);
+            bump_host(d_seq);
         }
     });
 }

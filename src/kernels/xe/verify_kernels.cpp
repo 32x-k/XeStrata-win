@@ -728,9 +728,8 @@ bool doorbell_visible(void* stream) {
     uint32_t* flag = m + 1;
     uint32_t* seen = m + 2;
     // at most 2^21 reads (well under a second on the UHD 770, a few microseconds where the flag arrives)
-    q.single_task([=] {
-        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
-                         sycl::access::address_space::global_space>(*ring).store(1u);
+    q.single_task([=] {   // the ring as doorbell_ring stores it: volatile, not atomic (elementwise.cpp says why)
+        *reinterpret_cast<volatile uint32_t*>(ring) = 1u;
         sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
         for (uint32_t i = 0; i < (1u << 21); ++i)
             if (read_host(flag) == 1u) { *seen = 1u; break; }
