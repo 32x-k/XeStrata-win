@@ -351,8 +351,12 @@ if(STRATA_ENABLE_XE)
   if(_strata_sycl_targets)
     set(_strata_spirv_translator -Xspirv-translator=spir64)
   endif()
+  # The device code of every target (SPIR-V, each NVIDIA and AMD architecture) is made when the executable links, one
+  # target after another on one thread unless the compiler is let run them side by side (a contrib package's strata
+  # took 10-15 minutes so).
+  cmake_host_system_information(RESULT _strata_link_jobs QUERY NUMBER_OF_LOGICAL_CORES)
   target_link_options(strata_sycl INTERFACE -fsycl ${_strata_sycl_targets} -foffload-fp32-prec-div
-                      -foffload-fp32-prec-sqrt
+                      -foffload-fp32-prec-sqrt -fsycl-max-parallel-link-jobs=${_strata_link_jobs}
                       "SHELL:${_strata_spirv_translator} --spirv-ext=+SPV_KHR_integer_dot_product")
 
   add_library(strata_core STATIC src/core/device.cpp src/core/pinned.cpp src/core/gpu.cpp src/core/graph.cpp
