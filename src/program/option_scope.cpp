@@ -26,7 +26,7 @@ const char* const kQwen38Only[] = {
 
 // the engine's options every model could take, which the other models' path does not have yet
 const char* const kNotYet[] = {
-    "--serve", "--slots", "--batch", "--batch-cpu-split", "--batch-groups", "--batch-mtp", "--no-batch-mtp",
+    "--slots", "--batch", "--batch-cpu-split", "--batch-groups", "--batch-mtp", "--no-batch-mtp",
     "--stream-token", "--check-logits", "--prompt-cache", "--prompt-cache-every", "--prompt-cache-root",
     "--prompt-cache-tail", "--conversation-cache-mib", "--conversation-cache-min-free-mib",
     "--conversation-cache-slots", "--conversation-save", "--conversation-save-checkpoints",

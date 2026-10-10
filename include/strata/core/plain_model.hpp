@@ -75,6 +75,9 @@ public:
     bool load(const PlainOptions& opt, std::string& err);
     const ModelSpec& spec() const { return spec_; }
     int64_t vocab() const { return n_vocab_; }
+    /// The model carries a recurrent state (GDN layers): a sequence can be extended, not cut back to a prefix.
+    bool recurrent() const { return !gdn_state_.empty(); }
+    int64_t max_cells() const { return opt_.max_cells; }
 
     /// Zeroes the recurrent states and the K/V cache: the next window starts a sequence at position 0.
     bool reset(std::string& err);

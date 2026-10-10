@@ -17,15 +17,21 @@
 #include "strata/prefill/gemm.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace strata::program {
@@ -78,7 +84,172 @@ std::vector<int32_t> eos_tokens(const std::string& path) {
 
 }  // namespace
 
-void plain_usage(const std::string& arch) {
+// `--serve` for these models: generate.cpp's --serve protocol (server.py's StrataEngine) for text requests.  READY
+// <context> stop; then `GEN <max_new> [temperature=F top_p=F top_k=N min_p=F seed=N] <ids>` -> RESUME <reused>,
+// one `T <id>` a token, DONE (generate.cpp's fields; the drafts, tiers and offload ones zero); STOP ends a request,
+// QUIT the engine.  The commands of Qwen3.8-Flash-Next's engine this one has no part for (VRAM, SAVE, RESTORE,
+// GENI, BGEN) answer ERR.  The conversation's tokens stay read between requests: a request that starts with them
+// reads only what follows (a model with a recurrent state only when it extends them all; else it starts over).
+static int plain_serve(strata::core::PlainModel& model, const strata::core::PlainOptions& opt, const std::string& arch,
+                       const std::vector<int32_t>& eos, const std::string& profile_save) {
+    std::atomic<bool> stop_req{false};
+    std::mutex in_mu;
+    std::condition_variable in_cv;
+    std::deque<std::string> in_lines;
+    bool in_eof = false;
+    std::thread([&] {   // stdin: STOP takes effect mid-request, every other line queues
+        std::string l;
+        while (std::getline(std::cin, l)) {
+            if (!l.empty() && l.back() == '\r') l.pop_back();
+            if (l == "STOP") { stop_req.store(true); continue; }
+            std::lock_guard<std::mutex> lk(in_mu);
+            in_lines.push_back(l);
+            in_cv.notify_one();
+        }
+        std::lock_guard<std::mutex> lk(in_mu);
+        in_eof = true;
+        in_cv.notify_one();
+    }).detach();
+    auto next_line = [&](std::string& out) {
+        std::unique_lock<std::mutex> lk(in_mu);
+        in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
+        if (in_lines.empty()) return false;
+        out = std::move(in_lines.front());
+        in_lines.pop_front();
+        return true;
+    };
+    const int64_t ctx = model.max_cells(), V = model.vocab();
+    std::vector<int32_t> live;   // the tokens the state holds, positions 0 .. live.size() - 1
+    std::vector<int32_t> out((size_t) opt.max_t);
+    std::string err;
+    std::printf("INFO context=%lld expert_slots=%lld\n", (long long) ctx, (long long) model.slots());
+    std::printf("READY %lld stop\n", (long long) ctx);
+    std::fflush(stdout);
+    std::string line;
+    while (next_line(line)) {
+        if (line == "QUIT") break;
+        if (line.empty()) continue;
+        stop_req.store(false);   // a STOP between requests ends nothing
+        if (line.rfind("GEN ", 0) != 0) {
+            const std::string head = line.substr(0, line.find(' '));
+            std::printf("ERR %s is not available for %s (this engine takes GEN, STOP and QUIT)\n", head.c_str(),
+                        arch.c_str());
+            std::fflush(stdout);
+            continue;
+        }
+        char* endp = nullptr;
+        const long long max_new = std::strtoll(line.c_str() + 4, &endp, 10);
+        strata::kernels::SamplerParams sp;   // greedy unless the request sets a temperature
+        sp.greedy = true;
+        sp.temperature = 0.0f;
+        sp.top_p = 1.0f;
+        for (;;) {   // the sampling keys between max_new and the ids; the ids start at the first token without '='
+            while (endp != nullptr && *endp == ' ') ++endp;
+            const char* start = endp;
+            while (endp != nullptr && *endp != '\0' && *endp != ' ') ++endp;
+            if (endp == nullptr || endp == start) break;
+            const std::string tok(start, (size_t) (endp - start));
+            const size_t eq = tok.find('=');
+            if (eq == std::string::npos) { endp = const_cast<char*>(start); break; }
+            const std::string key = tok.substr(0, eq), val = tok.substr(eq + 1);
+            if (key == "temperature") sp.temperature = std::strtof(val.c_str(), nullptr);
+            else if (key == "top_p") sp.top_p = std::strtof(val.c_str(), nullptr);
+            else if (key == "top_k") sp.top_k = (int) std::strtol(val.c_str(), nullptr, 10);
+            else if (key == "min_p") sp.min_p = std::strtof(val.c_str(), nullptr);
+            else if (key == "seed") sp.seed = std::strtoull(val.c_str(), nullptr, 10);
+        }
+        sp.greedy = sp.temperature <= 0.0f;
+        std::vector<int32_t> ids;
+        if (max_new < 1 || endp == nullptr || !parse_ids(endp, ids) || ids.empty()) {
+            std::printf("ERR bad request: max_new or the ids\n");
+            std::fflush(stdout);
+            continue;
+        }
+        const int64_t n = (int64_t) ids.size();
+        if (n + max_new + 8 > ctx) {
+            std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
+                        max_new, (long long) ctx);
+            std::fflush(stdout);
+            continue;
+        }
+        if (std::any_of(ids.begin(), ids.end(), [&](int32_t t) { return t < 0 || t >= V; })) {
+            std::printf("ERR a token id is outside the vocabulary\n");
+            std::fflush(stdout);
+            continue;
+        }
+        // what of the conversation to keep: the common prefix, at least the last prompt token read again (its
+        // logits pick the first token); with a recurrent state, all of it or nothing
+        size_t common = 0;
+        while (common < live.size() && common < (size_t) n && live[common] == ids[common]) ++common;
+        int64_t resume = std::min<int64_t>((int64_t) common, n - 1);
+        if (model.recurrent() && resume != (int64_t) live.size()) resume = 0;
+        if (resume == 0 && !live.empty() && !model.reset(err)) {
+            std::printf("FATAL %s\n", err.c_str());
+            std::fflush(stdout);
+            return 1;
+        }
+        live.resize((size_t) resume);
+        std::printf("RESUME %lld\n", (long long) resume);
+        std::fflush(stdout);
+        model.set_sampler(sp);
+        const Clock::time_point t0 = Clock::now();
+        const int64_t hits0 = model.hits(), look0 = model.hits() + model.misses();
+        bool ok = true;
+        int32_t next = -1;
+        if (opt.prompt_chunk > 0) {
+            ok = model.prompt(ids.data() + resume, n - resume, resume, out.data(), nullptr, err);
+            next = out[0];
+        } else {
+            for (int64_t p = resume; ok && p < n;) {
+                const int w = (int) std::min<int64_t>(opt.max_t, n - p);
+                ok = model.forward(ids.data() + p, w, p, out.data(), nullptr, err);
+                p += w;
+                next = out[(size_t) w - 1];
+            }
+        }
+        if (!ok) {   // the state is the device's, half written: the next request starts over
+            live.clear();
+            std::printf("ERR %s\n", err.c_str());
+            std::fflush(stdout);
+            continue;
+        }
+        live.assign(ids.begin(), ids.end());
+        const Clock::time_point t1 = Clock::now();
+        const char* finish = "length";
+        long long produced = 0;
+        for (;;) {
+            std::printf("T %d\n", next);
+            std::fflush(stdout);
+            ++produced;
+            if (std::find(eos.begin(), eos.end(), next) != eos.end()) { finish = "stop"; break; }
+            if (produced >= max_new) break;
+            if (stop_req.load()) { finish = "cancel"; break; }
+            if (!model.forward(&next, 1, (int64_t) live.size(), out.data(), nullptr, err)) { ok = false; break; }
+            live.push_back(next);
+            next = out[0];
+        }
+        if (!ok) {
+            live.clear();
+            std::printf("ERR %s\n", err.c_str());
+            std::fflush(stdout);
+            continue;
+        }
+        const Clock::time_point t2 = Clock::now();
+        const double prompt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        const double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        std::printf("DONE %lld %lld %.1f %.1f %s 0 0 %lld %lld %lld 0 0 0.0 %lld 0\n", produced, (long long) n,
+                    prompt_ms, decode_ms, finish, (long long) resume, (long long) (model.hits() - hits0),
+                    (long long) (model.hits() + model.misses() - look0), (long long) (n - resume));
+        std::fflush(stdout);
+    }
+    if (!profile_save.empty() && !model.save_profile(profile_save, err)) {
+        std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+        return 1;
+    }
+    return 0;
+}
+
+static void plain_usage(const std::string& arch) {
     std::fprintf(stderr,
                  "strata --native GGUF --tokens \"1,2,3\" [options]   (%s: the models other than Qwen3.8-Flash-Next)\n"
                  "\n"
@@ -106,6 +277,7 @@ void plain_usage(const std::string& arch) {
                  "  --max-t N            the decode window's most tokens (default 8)\n"
                  "  --rope-scaling none|linear|yarn, --rope-scale F, --yarn-orig-ctx N   context extension\n"
                  "  --dump-logits PATH   each generated token's logits, FP32 rows\n"
+                 "  --serve              stay resident and take requests on stdin (server.py's protocol, text requests)\n"
                  "  --gpu PCI            the GPU (its PCI address)\n",
                  arch.c_str());
 }
@@ -124,7 +296,7 @@ int plain_main(int argc, char** argv) {
     int64_t n_new = 16;
     strata::kernels::SamplerParams sp;   // greedy unless --seed
     sp.greedy = true;
-    bool stop_eos = false;
+    bool stop_eos = false, serve = false;
     std::vector<int32_t> eos;
     std::string dump_path, profile_save;
     for (int i = 1; i < argc; ++i) {
@@ -144,6 +316,7 @@ int plain_main(int argc, char** argv) {
         }
         else if (a == "--help" || a == "-h") { plain_usage(arch); return 0; }
         else if (a == "--max-new") n_new = std::strtoll(next("--max-new"), nullptr, 10);
+        else if (a == "--serve") serve = true;
         else if (a == "--greedy") sp.greedy = true;
         else if (a == "--seed") { sp.seed = std::strtoull(next("--seed"), nullptr, 10); sp.greedy = false; }
         else if (a == "--top-k") sp.top_k = (int) std::strtol(next("--top-k"), nullptr, 10);
@@ -185,7 +358,7 @@ int plain_main(int argc, char** argv) {
             return 2;
         }
     }
-    if (prompt.empty() || n_new < 1) {
+    if (!serve && (prompt.empty() || n_new < 1)) {
         std::fprintf(stderr, "strata (%s): needs --tokens and --max-new >= 1\n", arch.c_str());
         return 2;
     }
@@ -206,6 +379,7 @@ int plain_main(int argc, char** argv) {
     }
     if (opt.prompt_chunk > 0) std::fprintf(stderr, "strata (%s): prompt matrix products on %s\n", arch.c_str(),
                                            strata::prefill::Gemm::path());
+    if (serve) return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> dump_file(nullptr, &std::fclose);
     if (!dump_path.empty()) {
