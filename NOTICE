@@ -52,6 +52,9 @@ Every copyright holder whose work is in this repository, its license and where t
 The deb and rpm packages (cmake/packaging.cmake) also carry, each with its license text: the SYCL runtime of
 intel/llvm (Apache-2.0 WITH LLVM-exception) built with XeStrata's fixes, llama.cpp's gguf-py (MIT, Copyright (c)
 2023-2026 The ggml authors), and in the contrib-llvm ones oneMath (Apache-2.0) with XeStrata's changes.
+The engine in the contrib-llvm packages is compiled with NVIDIA's CUDA Toolkit, and its code for NVIDIA GPUs can contain
+parts of NVIDIA's libdevice; those parts are NVIDIA's, distributed under the NVIDIA CUDA Toolkit End User License
+Agreement.
 
 The models are not part of this repository; each model's own license applies to its files.
 Neither are the vendors' libraries the contrib-llvm and contrib-icpx modes link (Intel oneMKL and the runtime libraries of
