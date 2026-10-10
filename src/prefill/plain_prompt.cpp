@@ -278,24 +278,6 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     strata::gpu::Stream cs = cs_;
     prefill::Gemm& gm = prompt_gemm().gemm;
     auto f16 = [&](const float* x, int64_t rows, int64_t cols) { prefill::to_f16(x, P.x16, rows * cols, cs); };
-    // a dense product from float rows x (ldx a row) in int8 (iq_mmq, as one expert of T rows) where the weight's type
-    // and shape are the int8 products'; false: the caller takes Gemm::native from the FP16 copy
-    static const bool dense_env = [] {   // STRATA_PLAIN_DENSE_MMQ=0: every dense product through Gemm::native
-        const char* v = std::getenv("STRATA_PLAIN_DENSE_MMQ");
-        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-    }();
-    const bool dense_on = dense_env && (prefill::mmq::built() || prefill::mmq::built_dp4a());
-    auto dense = [&](const W& w, const float* x, int64_t ldx, float* y, int64_t T, int64_t ldy = 0) {
-        if (!dense_on || w.data == nullptr || !prefill::mmq::supported(w.type) || w.n_out % 128 != 0 || w.n_in % 32 != 0)
-            return false;
-        prefill::mmq::quantize(x, nullptr, P.xq, w.type, w.n_in, ldx, T, cs);
-        prefill::mmq::Product p;
-        p.w = w.data; p.type = w.type; p.w_rows = w.n_out; p.w_cols = w.n_in; p.n = 1; p.xq = P.xq;
-        p.bounds = P.dense_bounds; p.ids = P.identity; p.total_rows = T; p.max_rows = T;
-        p.dst = y; p.ld_dst = ldy > 0 ? ldy : w.n_out;
-        prompt_gemm().mmq.run(p, cs);
-        return true;
-    };
     auto proj = [&](const W& w, float* y, int64_t T, int64_t ldy = 0) {
         gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
     };
@@ -357,40 +339,25 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 err = std::string("plain prompt: staging: ") + strata::gpu::last_error();
                 return false;
             }
-            P.h_dense_bounds[0] = 0;
-            P.h_dense_bounds[1] = (int32_t) T;
-            if (!strata::gpu::copy_async(P.dense_bounds, P.h_dense_bounds, 2 * 4, cs)) {
-                err = std::string("plain prompt: staging: ") + strata::gpu::last_error();
-                return false;
-            }
-            if (dense_on && !pg.identity) {   // the dense products' row map (the experts' sets it too)
-                prefill::mmq::iota(P.identity, P.T * K, cs);
-                pg.identity = true;
-            }
-            // from the normed rows: int8 where it can, else FP16 (x16, written once a layer if any product needs it)
-            auto proj_hn = [&](const W& w, float* y, int64_t ldy = 0) {
-                if (!dense(w, P.hn, N, y, T, ldy)) proj(w, y, T, ldy);
-            };
             for (int64_t l = 0; l < s.n_layer; ++l) {
                 const Block& b = blocks_[(size_t) l];
                 k::native_qsa_rms_norm_weighted(P.x, b.attn_norm, P.hn, (int) N, (int) T, eps, cs);
                 f16(P.hn, T, N);
                 if (b.recurrent) {
-                    proj_hn(b.qkv, P.qkv);
-                    proj_hn(b.z, P.z);
+                    proj(b.qkv, P.qkv, T);
+                    proj(b.z, P.z, T);
                     proj(b.alpha, P.ab, T, 2 * HV);
                     proj(b.beta, P.ab + HV, T, 2 * HV);
                     prefill::gdn_gates(P.ab, b.dt, b.a, P.gate, P.beta, T, cs, HK, HV);
                     prefill::gdn_conv(gdn_conv_[(size_t) b.gdn], P.qkv, b.conv, P.h, T, eps, cs, HK, HV);
                     prefill::gdn_recurrence(gdn_state_[(size_t) b.gdn], P.h, P.gate, P.beta, P.z, b.ssm_norm, eps, P.y,
                                             P.y16, T, cs, HK, HV, /*silu=*/true);
-                    if (!dense(b.ssm_out, P.y, b.ssm_out.n_in, P.mix, T))
-                        gm.native(P.y16, b.ssm_out.type, b.ssm_out.data, P.mix, T, b.ssm_out.n_out, b.ssm_out.n_in);
+                    gm.native(P.y16, b.ssm_out.type, b.ssm_out.data, P.mix, T, b.ssm_out.n_out, b.ssm_out.n_in);
                 } else {
                     const int64_t a = b.attn;
-                    proj_hn(b.q, P.qfull);
-                    proj_hn(b.k, P.kraw);
-                    proj_hn(b.v, P.vcur);
+                    proj(b.q, P.qfull, T);
+                    proj(b.k, P.kraw, T);
+                    proj(b.v, P.vcur, T);
                     // the norm and RoPE take at most 65535 rows a launch: the chunk's heads in token slices
                     auto norm_rope = [&](const float* in, int64_t in_row, const float* gamma, float* out, int64_t heads,
                                          const int32_t* pos) {
@@ -427,10 +394,8 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         k::native_qsa_gate_apply(P.attn, P.qfull, P.attn32, (int) (T * NH), (int) HD, cs);
                         ao = P.attn32;
                     }
-                    if (!dense(b.o, ao, NH * HD, P.mix, T)) {
-                        f16(ao, T, NH * HD);
-                        proj(b.o, P.mix, T);
-                    }
+                    f16(ao, T, NH * HD);
+                    proj(b.o, P.mix, T);
                 }
                 k::add_inplace(P.x, P.mix, T * N, cs);
                 mark(b.recurrent ? 0 : 4, t_mark);
@@ -441,8 +406,8 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 k::router_top10(P.rlog, (int) T, (int) E, (int) K, P.ids, P.w, cs);
                 f16(P.hn, T, N);
                 if (has_shared_) {
-                    proj_hn(b.sh_gate, P.sh_gate);
-                    proj_hn(b.sh_up, P.sh_up);
+                    proj(b.sh_gate, P.sh_gate, T);
+                    proj(b.sh_up, P.sh_up, T);
                     k::f32_gemm_rows(P.hn, N, b.sh_gate_inp, P.sh_g, 1, N, 1, T, cs);
                 }
                 // the routed experts grouped by expert, on the host from this layer's ids (and the normed rows, for the
