@@ -1011,9 +1011,9 @@ void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream)
         h16[i] = hf_sat(g / (1.0f + sycl::exp(-g)) * u);
     });
 }
-void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream) {
+void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream, int64_t width) {
     if (n <= 0) return;
-    Q(stream).parallel_for(sycl::range<1>((size_t) (n * 640)), [=](sycl::id<1> i) {
+    Q(stream).parallel_for(sycl::range<1>((size_t) (n * width)), [=](sycl::id<1> i) {
         const float a = g[i];
         h16[i] = hf_sat(a / (1.0f + sycl::exp(-a)) * u[i]);
     });
