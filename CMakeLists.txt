@@ -545,13 +545,13 @@ if(STRATA_ENABLE_XE)
       set(CUDA_TOOLKIT_ROOT_DIR "${_strata_cuda_root}" CACHE PATH "the CUDA toolkit (cmake/StrataCuda.cmake)" FORCE)
     endif()
     # oneMath is not in the repository: XeStrata's fork (https://github.com/MistVVK/oneMath, branch xestrata: oneMath's
-    # 6ff3a43 with XeStrata's changes as commits) at the tag pinned here
+    # 6ff3a43 with XeStrata's changes as commits, and oneMath's develop merged up to 1308c5e) at the tag pinned here
     if(STRATA_ONEMATH_SOURCE)
       set(_strata_onemath_url URL ${STRATA_ONEMATH_SOURCE})
     else()
       set(_strata_onemath_url
-        URL https://github.com/MistVVK/oneMath/archive/refs/tags/xestrata-2.tar.gz
-        URL_HASH SHA256=304da86bd8e9b67791ae633bcbabf37a50b244bd0def7df3b661574aae5065f3)
+        URL https://github.com/MistVVK/oneMath/archive/refs/tags/xestrata-3.tar.gz
+        URL_HASH SHA256=9a5203102002e5e85f1ad4a8b91b9f6134365f016bba1a430b038df95517e61d)
     endif()
     # another archive is another tree: start from it again
     if(NOT "${_strata_onemath_url}" STREQUAL "${_STRATA_ONEMATH_KEY}")
