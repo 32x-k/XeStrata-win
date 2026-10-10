@@ -287,6 +287,12 @@ what has been checked in [docs/XE.md](docs/XE.md).
 - **Measuring the speed:** `xestrata --bench`, the upstream merges' measurements and the release table are in [docs/BENCH.md](docs/BENCH.md).
 - **Rules:** [AGENTS.md](AGENTS.md) covers them: independence from the hardware (code paths chosen from what the GPU
   and CPU report), the lints (`tools/lint/run.sh`), the tests, and the license notices.
+- **What goes in:** whoever wrote it (the maintainer's commits, pull requests, ports from upstream), a change goes in only when
+  built and tested with intel/llvm in both the free and contrib-llvm modes, and depending on the hardware as little as it can
+  (no CUDA or other maker's API relied on, no value measured on one card hard-coded). Others do not go in as they are: they
+  are a reference, written again as XeStrata's code ([AGENTS.md](AGENTS.md#what-goes-in)).
+  A pull request says which modes it was built in (free, contrib-llvm, contrib-icpx) and on which GPUs and CPUs it ran,
+  and marks what was not checked `unverified`.
 - **Upstream integration:** the changes of Strata up to 0.1.40.2 are carried into Xe, except the Windows
   implementation. Of the paths meant to be faster, those measured faster on the B70, the RTX 4070 or the RX 9060 XT
   are carried ([docs/XE.md](docs/XE.md#integration-through-strata-0140)).

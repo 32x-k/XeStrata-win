@@ -275,6 +275,10 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 - **速さの測り方**: `xestrata --bench`、upstream 追従の計測、リリースの表の測り方は [docs/BENCH.ja.md](docs/BENCH.ja.md) にあります。
 - **守ること**: 機器に依存しないこと（GPU と CPU が報告する能力で経路を選ぶ）、リント（`tools/lint/run.sh`）、
   テストの実行、ライセンスの表示は [AGENTS.md](AGENTS.md) にまとめてあります。
+- **取り込む変更**: 誰が書いたものでも（自分のコミット、プルリクエスト、upstream からの移植）、intel/llvm の free と contrib-llvm の両方式でビルドと試験をしたもので、
+  機器への依存ができるだけ少ないもの（CUDA などメーカーの API に頼らない、1 枚のカードで測った値を決め打ちしない）だけを入れます。
+  そうでないものはそのままは入れず、参考にして XeStrata のコードとして書き直します（[AGENTS.md](AGENTS.md#what-goes-in)）。
+  プルリクエストには、ビルドした方式（free、contrib-llvm、contrib-icpx）と、動かした GPU と CPU を書き、確かめていないことには `unverified` と付けてください。
 - **upstream の取り込み**: Strata 0.1.40.2 までの変更を、Windows の実装を除いて Xe に移しています。
   速くするための経路は、B70・RTX 4070・RX 9060 XT で測って速くなったものを移します（[docs/XE.ja.md](docs/XE.ja.md#strata-0140-の取り込み)）。
 - **README と docs**: 日本語版（README.ja.md、docs/*.ja.md）を先に書き、英語版（README.md、docs/*.md）はその訳です。
