@@ -169,18 +169,22 @@ class Tokenizer:
                    md.get("tokenizer.ggml.pre", "qwen35"), special)
 
     @classmethod
-    def from_dir(cls, path) -> "Tokenizer":
+    def from_dir(cls, path):
         """The tokenizer `extract` wrote into a pack's `tokenizer/` folder, with the `pre` it declared (an export
-        older than the field is Qwen3.8's, `qwen35`)."""
+        older than the field is Qwen3.8's, `qwen35`); a Unigram one (`model` t5: llm-jp-4.1) is strata_unigram's."""
         path = pathlib.Path(path)
+        cfg_file = path / "tokenizer.json"
+        cfg = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}
+        if cfg.get("model") == "t5":
+            sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+            from strata_unigram import UnigramTokenizer
+            return UnigramTokenizer.from_dir(path, cfg)
         vocab = json.loads((path / "vocab.json").read_text(encoding="utf-8"))
         tokens = [""] * len(vocab)
         for t, i in vocab.items():
             tokens[i] = t
         merges = (path / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((path / "token_type.json").read_text())
-        cfg_file = path / "tokenizer.json"
-        cfg = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}
         return cls(tokens, merges, types, cfg.get("pre", "qwen35"), cfg.get("special_ids"))
 
     # -------------------------------------------------------------- the algorithm
@@ -355,6 +359,17 @@ def extract(gguf_path, out_dir) -> dict:
     """Write the tokenizer into `<out_dir>/tokenizer/` so the engine never opens the weight shards for it."""
     out = pathlib.Path(out_dir) / "tokenizer"
     out.mkdir(parents=True, exist_ok=True)
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    from gguf_reader import GGUFFile
+    md = GGUFFile(pathlib.Path(gguf_path)).metadata
+    if md.get("tokenizer.ggml.model") == "t5":   # SentencePiece Unigram (llm-jp-4.1)
+        from strata_unigram import UnigramTokenizer
+        cfg = UnigramTokenizer.from_gguf(gguf_path).write_dir(out)
+        (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+        tpl = md.get("tokenizer.chat_template")
+        if tpl:
+            (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
+        return cfg
     tk = Tokenizer.from_gguf(gguf_path)
     cfg = {
         "model": "gpt2",
@@ -391,6 +406,11 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="round-trip a corpus and report")
     args = ap.parse_args()
     cfg = extract(args.gguf, args.out)
+    if cfg["model"] == "t5":
+        print("tokenizer/: Unigram, vocab %d, specials %s" % (cfg["vocab_size"], cfg["special_ids"]))
+        if args.check:   # the round trip is byte-level BPE's property: Unigram normalizes its input
+            print("--check: a Unigram tokenizer has no exact round trip (its input is normalized)")
+        return 0
     print("tokenizer/: vocab %d, merges %d, pre %s, specials %s"
           % (cfg["vocab_size"], cfg["n_merges"], cfg["pre"], cfg["special_ids"]))
     if args.check:
