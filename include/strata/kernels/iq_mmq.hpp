@@ -17,7 +17,7 @@ namespace strata::kernels {
 /// accumulators) at its sub-group size, and its accumulators of int32 and of FP32 hold their elements in the same
 /// places (checked on the device once).  STRATA_NO_XMX=1 says no.
 bool iq_mmq_usable(sycl::queue& q);
-/// The ggml types whose weights these products decode (the i-quants but IQ1_S, and Q2_0).
+/// The ggml types whose weights these products decode (the i-quants but IQ1_S, Q2_0, Q8_0 and Q6_K).
 bool iq_mmq_type_ok(int ggml_type);
 /// Bytes of a weight row of `cols` values in ggml_type (iq_mmq_type_ok).
 size_t iq_mmq_row_bytes(int ggml_type, int64_t cols);
@@ -30,8 +30,10 @@ sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, 
 /// n experts, one launch: expert e's weights ([w_rows, w_cols] in ggml_type's blocks) at w + e * expert_bytes, its
 /// activation rows bounds[e] .. bounds[e + 1] of xq (bounds on the device; xq holds total_rows rows), into dst rows
 /// ids[row] (ld_dst floats apart).  max_rows: the most rows an expert has.  w_rows a multiple of 128, w_cols of 128.
+/// wtab (on the device, n entries): expert e's weights at wtab[e] + woff instead, wherever each lies.
 sycl::event iq_mmq_grouped(sycl::queue& q, int ggml_type, const void* w, size_t expert_bytes, int64_t w_rows,
                            int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
-                           int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst);
+                           int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst,
+                           const uint8_t* const* wtab = nullptr, size_t woff = 0);
 
 }  // namespace strata::kernels

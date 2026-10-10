@@ -32,7 +32,7 @@ Context::~Context() {}
 void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
     kernels::iq_mmq_grouped(Q(stream), p.type, p.w, p.expert_bytes, p.w_rows, p.w_cols, p.n, p.xq, p.total_rows,
-                            p.bounds, p.max_rows, p.ids, p.dst, p.ld_dst);
+                            p.bounds, p.max_rows, p.ids, p.dst, p.ld_dst, p.wtab, p.woff);
 }
 
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,

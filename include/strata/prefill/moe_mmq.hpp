@@ -16,7 +16,7 @@ namespace strata::prefill::mmq {
 
 /// The GPU runs these products (iq_mmq_usable).
 bool built();
-/// They cover this ggml type (the i-quants but IQ1_S, and Q2_0).
+/// They cover this ggml type (the i-quants but IQ1_S, Q2_0, Q8_0 and Q6_K).
 bool supported(int ggml_type);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
@@ -44,6 +44,8 @@ struct Product {
     int64_t total_rows = 0, max_rows = 0;
     float* dst = nullptr;
     int64_t ld_dst = 0;
+    const uint8_t* const* wtab = nullptr;   ///< on the device: expert e's weights at wtab[e] + woff instead of w's
+    size_t woff = 0;
 };
 
 /// The launch context.  One per prompt path.

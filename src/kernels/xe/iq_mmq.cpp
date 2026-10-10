@@ -6,7 +6,8 @@
 // The weights' values and scales follow llama.cpp's dequantizers (ggml/src/ggml-quants.c, dequantize_row_*; MIT
 // license, third_party/main/ggml/LICENSE, quoted in iq_kernels.cpp): a block of 32 values (16 for IQ2_XS, IQ2_S and
 // IQ1_M) is its grid or table bytes, signed, times d and the block's scale (IQ1_M's values times 8, its scales over 8).
-// The activations are rounded as its q8_1 (amax / 127 a block of 32).
+// Q8_0 and Q6_K (dequantize_row_q8_0, dequantize_row_q6_K) are their bytes, and Q6_K's 6-bit values less 32, times d
+// and the scale of each 16.  The activations are rounded as its q8_1 (amax / 127 a block of 32).
 //
 // A work-group takes a tile of one expert's rows (16, 32 or 64, by the group's largest) and 128 of its outputs, K 128
 // values a step: the step's activation rows copied to local memory, the weight rows decoded there (a work-item a block
@@ -254,8 +255,39 @@ template<> struct Dec<29> {   // IQ1_M: d (2 ls + 1) (grid +- 1/8), a scale per 
     }
 };
 
+template<> struct Dec<8> {   // Q8_0: d
+    static constexpr int QK = 32, BSZ = (int) sizeof(block_q8_0);
+    static Sub get(const uint8_t* row, int sb) {
+        const block_q8_0* b = reinterpret_cast<const block_q8_0*>(row) + sb;
+        Sub r;
+        for (int j = 0; j < 8; ++j) r.v[j] = (uint32_t) get_int_b2(b->qs, j);
+        r.s0 = r.s1 = (float) b->d;
+        return r;
+    }
+};
+template<> struct Dec<14> {   // Q6_K: d scale (6-bit value - 32), a scale per 16
+    static constexpr int QK = 256, BSZ = (int) sizeof(block_q6_K);
+    static Sub get(const uint8_t* row, int sb) {
+        const block_q6_K* b = reinterpret_cast<const block_q6_K*>(row) + sb / 8;
+        // block of 32 ib: half n of the 256 (ql, qh and the scales 64, 32 and 8 bytes on), quarter j of the half: the
+        // low nibbles (j 0, 1) or high ones (j 2, 3) of ql's first or second 32 bytes, and qh's 2 bits at 2 j
+        const int ib = sb % 8, n = ib / 4, j = ib % 4;
+        Sub r;
+        for (int k = 0; k < 8; ++k) {
+            const uint32_t ql = (uint32_t) get_int_b2(b->ql, 16 * n + 8 * (j & 1) + k);
+            const uint32_t qh = (uint32_t) get_int_b2(b->qh, 8 * n + k);
+            const uint32_t v = ((ql >> (4 * (j >> 1))) & 0x0F0F0F0Fu) | (((qh >> (2 * j)) & 0x03030303u) << 4);
+            r.v[k] = ((v | 0x80808080u) - 0x20202020u) ^ 0x80808080u;   // less 32 in each byte, no borrow across
+        }
+        const float d = (float) b->d;
+        r.s0 = d * (float) b->scales[8 * n + 2 * j];
+        r.s1 = d * (float) b->scales[8 * n + 2 * j + 1];
+        return r;
+    }
+};
+
 template<int TY>
-constexpr bool half_scales() { return TY == 17 || TY == 22 || TY == 29; }
+constexpr bool half_scales() { return TY == 17 || TY == 22 || TY == 29 || TY == 14; }
 
 // ---------------------------------------------------------------- the products
 template<typename T>
@@ -284,7 +316,8 @@ struct Kernel {
                          WS_OFF = up128(XS_OFF + NB * WM * 4), ST_OFF = up128(WS_OFF + 2 * NB * WN * 4),
                          LOCAL = up128(ST_OFF + NSG * TM * TN * 4);
     const uint8_t* w;
-    size_t expert_bytes, row_bytes;
+    const uint8_t* const* wtab;   // expert e's weights at wtab[e] + woff when set, else at w + e expert_bytes
+    size_t woff, expert_bytes, row_bytes;
     const int8_t* xq;
     const float* xs;
     int64_t K;
@@ -308,7 +341,7 @@ struct Kernel {
             const int lane = (int) sg.get_local_linear_id();
             constexpr int lanes = NSG * SG;
             const int ms = sgid / NSGN * SGM * TM, ns = sgid % NSGN * SGN * TN;
-            const uint8_t* wx = w + (size_t) e * expert_bytes;
+            const uint8_t* wx = wtab != nullptr ? wtab[e] + woff : w + (size_t) e * expert_bytes;
             const auto base = lm.template get_multi_ptr<sycl::access::decorated::no>();
             const auto ap = local_as<int8_t>(base + A_OFF);
             const auto bp = local_as<int8_t>(base + B_OFF);
@@ -407,7 +440,7 @@ struct Kernel {
             const int lane = (int) sg.get_local_linear_id(), lo = lane & 15, hi = lane >> 4;
             constexpr int lanes = NSG * SG;
             const int ms = sgid / NSGN * SGM * TM, ns = sgid % NSGN * SGN * TN;
-            const uint8_t* wx = w + (size_t) e * expert_bytes;
+            const uint8_t* wx = wtab != nullptr ? wtab[e] + woff : w + (size_t) e * expert_bytes;
             const auto base = lm.template get_multi_ptr<sycl::access::decorated::no>();
             int8_t* al = local_as<int8_t>(base + A_OFF).get();
             int8_t* bl = local_as<int8_t>(base + B_OFF).get();
@@ -502,9 +535,9 @@ struct Kernel {
 };
 
 template<int TY, int SGM, int NSGM>
-sycl::event launch(sycl::queue& q, const void* w, size_t expert_bytes, int64_t w_rows, int64_t w_cols, int n,
-                   const void* xq, int64_t total_rows, const int32_t* bounds, int64_t max_rows, const int32_t* ids,
-                   float* dst, int64_t ld_dst) {
+sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
+                   int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
+                   int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst) {
     using KT = Kernel<TY, SGM, NSGM>;
     const int64_t tiles_m = (max_rows + KT::WM - 1) / KT::WM, tiles_n = w_rows / KT::WN;
     const size_t row_bytes = (size_t) (w_cols / Dec<TY>::QK) * (size_t) Dec<TY>::BSZ;
@@ -514,20 +547,22 @@ sycl::event launch(sycl::queue& q, const void* w, size_t expert_bytes, int64_t w
         sycl::local_accessor<uint8_t, 1> lm(sycl::range<1>((size_t) KT::LOCAL), h);
         const size_t wg = (size_t) KT::NSG * SG;
         h.parallel_for(sycl::nd_range<1>((size_t) n * (size_t) (tiles_m * tiles_n) * wg, wg),
-                       KT{static_cast<const uint8_t*>(w), expert_bytes, row_bytes, x8, xs, w_cols, bounds, ids, dst,
+                       KT{static_cast<const uint8_t*>(w), wtab, woff, expert_bytes, row_bytes, x8, xs, w_cols, bounds, ids, dst,
                           ld_dst, tiles_m, tiles_n, lm});
     });
 }
 
 template<int TY>
-sycl::event by_rows(sycl::queue& q, const void* w, size_t expert_bytes, int64_t w_rows, int64_t w_cols, int n,
-                    const void* xq, int64_t total_rows, const int32_t* bounds, int64_t max_rows, const int32_t* ids,
-                    float* dst, int64_t ld_dst) {
-    if (max_rows <= 16)
-        return launch<TY, 1, 1>(q, w, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, max_rows, ids, dst, ld_dst);
-    if (max_rows <= 32)
-        return launch<TY, 2, 1>(q, w, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, max_rows, ids, dst, ld_dst);
-    return launch<TY, 2, 2>(q, w, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, max_rows, ids, dst, ld_dst);
+sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
+                    int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
+                    int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst) {
+#define STRATA_MMQ_LAUNCH(SGM, NSGM) \
+    launch<TY, SGM, NSGM>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, max_rows, ids, dst, \
+                          ld_dst)
+    if (max_rows <= 16) return STRATA_MMQ_LAUNCH(1, 1);
+    if (max_rows <= 32) return STRATA_MMQ_LAUNCH(2, 1);
+    return STRATA_MMQ_LAUNCH(2, 2);
+#undef STRATA_MMQ_LAUNCH
 }
 
 bool env_on(const char* name) {
@@ -624,13 +659,15 @@ bool iq_mmq_usable(sycl::queue& q) {
 
 bool iq_mmq_type_ok(int t) {
     switch (t) {
-        case 16: case 17: case 18: case 20: case 21: case 22: case 23: case 29: case 42: return true;
+        case 8: case 14: case 16: case 17: case 18: case 20: case 21: case 22: case 23: case 29: case 42: return true;
         default: return false;
     }
 }
 
 size_t iq_mmq_row_bytes(int t, int64_t cols) {
     switch (t) {
+        case 8: return (size_t) (cols / Dec<8>::QK) * Dec<8>::BSZ;
+        case 14: return (size_t) (cols / Dec<14>::QK) * Dec<14>::BSZ;
         case 16: return (size_t) (cols / Dec<16>::QK) * Dec<16>::BSZ;
         case 17: return (size_t) (cols / Dec<17>::QK) * Dec<17>::BSZ;
         case 18: return (size_t) (cols / Dec<18>::QK) * Dec<18>::BSZ;
@@ -672,10 +709,14 @@ sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, 
 
 sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_bytes, int64_t w_rows, int64_t w_cols,
                            int n, const void* xq, int64_t total_rows, const int32_t* bounds, int64_t max_rows,
-                           const int32_t* ids, float* dst, int64_t ld_dst) {
-#define STRATA_MMQ_CASE(TY) \
-    case TY: return by_rows<TY>(q, w, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, max_rows, ids, dst, ld_dst)
+                           const int32_t* ids, float* dst, int64_t ld_dst, const uint8_t* const* wtab, size_t woff) {
+#define STRATA_MMQ_CASE(TY)                                                                                           \
+    case TY:                                                                                                          \
+        return by_rows<TY>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, max_rows, ids, \
+                           dst, ld_dst)
     switch (t) {
+        STRATA_MMQ_CASE(8);
+        STRATA_MMQ_CASE(14);
         STRATA_MMQ_CASE(16);
         STRATA_MMQ_CASE(17);
         STRATA_MMQ_CASE(18);
