@@ -1932,6 +1932,22 @@ def resident_budget_gib(model, ram, kv_ram_gb=0.0) -> int:
     return max(8, min(gib, int(MODELS[model]["arena_gb"] / 1.073741824)))
 
 
+UMA_EXPERTS = 24576            # the Flash-Next model's experts (48 layers x 512): the most an expert cache can hold
+
+
+def uma_expert_cache(model, ram, budget_gib, kv_ram_gb=0.0):
+    """On a unified-memory APU the GPU's expert cache and the RAM budget of experts are both RAM (upstream #1715).
+    `--expert-cache auto` sizes the cache from the memory the OS can give back at start, which counts all the RAM the
+    budget has not taken yet: a 128 GB box with a 55 GiB budget and the desktop open was killed by the OOM killer.  So
+    there setup writes a number, not `auto`: the RAM less UNSLOTH_RAM_LEFT_GB less the budget (and a KV cache streamed
+    to RAM), in slots (an expert is priced at 1.1x the average one: the Q8_0 downs are bigger).  None when no room is left
+    (the config keeps `auto`).  A recommendation: the number is in the config's args, and --expert-cache N there sets it."""
+    slot_gib = MODELS[model]["arena_gb"] * 1e9 / UMA_EXPERTS * 1.1 / 2**30
+    room = ram - UNSLOTH_RAM_LEFT_GB - budget_gib - math.ceil(kv_ram_gb)
+    slots = min(UMA_EXPERTS, int(room / slot_gib))
+    return slots if slots >= 256 else None
+
+
 def budget_choice(model, ram, asked) -> float:
     """UD-Q4_K_XL's or UD-IQ4_XS's RAM budget: --resident-budget-gib N as given, else the recommendation
     (resident_budget_gib).  More than the recommendation is kept, with what it risks (setup recommends, it never
@@ -3588,6 +3604,18 @@ def main() -> int:
            f"uses, and this PC has {ram:.0f}; the KV cache stays in VRAM (fewer cached experts)")
     if budget is not None:     # UD-Q4_K_XL: the experts read from the GGUF in place, the most-used N GiB kept in RAM
         args += ["--resident-budget-gib", f"{budget:g}"]
+        if gpu.get("integrated") and "--expert-cache" in args:
+            # the cache and the budget draw on the same RAM: a number that leaves the OS its room, not `auto`
+            slots = uma_expert_cache(model, ram, budget, kv_ram_gb if "--kv-resident" in args else 0.0)
+            if slots is not None:
+                args[args.index("--expert-cache") + 1] = str(slots)
+                ok(f"expert cache: {slots} slots (not auto): this GPU shares the RAM with the {budget:g} GiB budget, "
+                   f"so setup leaves {UNSLOTH_RAM_LEFT_GB} GB of the RAM for the OS and the desktop. "
+                   "--expert-cache N in the config's args sets it")
+            else:
+                warn(f"this GPU shares the RAM, and the {budget:g} GiB RAM budget leaves almost none for the expert "
+                     "cache: it stays on auto, which may take the room the OS needs. A smaller "
+                     "--resident-budget-gib leaves room")
     if vision != "none":
         args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
     if a.vram_reserve_mib is not None:                 # #493: VRAM left free for other programs (only when given)
