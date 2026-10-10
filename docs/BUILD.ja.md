@@ -150,12 +150,12 @@ free の方式では次のとおりです（intel/llvm は `.tools/intel-llvm/in
 
 ```bash
 L=$PWD/.tools/intel-llvm/install
-cmake -S . -B build/llvm7 \
+cmake -S . -B build/free \
   -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_LICENSE=free \
   -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=OFF \
   -DSTRATA_BUILD_TESTS=ON
-cmake --build build/llvm7 --target strata-device strata-load elementwise_parity \
+cmake --build build/free --target strata-device strata-load elementwise_parity \
   gguf_reader_test suffix_drafter_test controller_test draft_policy_test conv_cache_test \
   platform_memory_test ple_reader_test -j4
 ```
@@ -164,16 +164,16 @@ icpx（contrib-icpx）では次のとおりです。
 
 ```bash
 source /opt/intel/oneapi/setvars.sh
-cmake -S . -B build/xe \
+cmake -S . -B build/contrib-icpx \
   -DCMAKE_CXX_COMPILER=icpx -DSTRATA_LICENSE=contrib-icpx \
   -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=OFF \
   -DSTRATA_BUILD_TESTS=ON
-cmake --build build/xe --target strata-device strata-load elementwise_parity \
+cmake --build build/contrib-icpx --target strata-device strata-load elementwise_parity \
   gguf_reader_test suffix_drafter_test controller_test draft_policy_test conv_cache_test \
   platform_memory_test ple_reader_test -j4
-build/xe/strata-device --version
-ctest --test-dir build/xe \
+build/contrib-icpx/strata-device --version
+ctest --test-dir build/contrib-icpx \
   -R '^(device_selftest|elementwise_parity|gguf_reader_test|suffix_drafter_test|controller_test|draft_policy_test|conv_cache_test|ple_reader_selftest|platform_memory_test)$' \
   --output-on-failure
 ```
@@ -183,7 +183,7 @@ ctest --test-dir build/xe \
 - ホスト側のプラットフォームのライブラリ（`memory.cpp`、`direct_file.cpp`）と PLE の n-gram の読み取りは、GPU のツールチェーンなしでビルドできます。
   CPU だけの道具は `STRATA_ENABLE_XE=OFF` で構成できます。
 - CPU の正準形のエキスパートのテストは、AVX-512 かモデルのファイルを必要とするので、上のコマンドには含みません。
-- `build/xe/BUILD.json` には、バックエンド、版、移植元、コンパイラ、ビルドの範囲が記録されます。
+- `build/contrib-icpx/BUILD.json` には、バックエンド、版、移植元、コンパイラ、ビルドの範囲が記録されます。
 - **free のビルドは、oneAPI の環境（`setvars.sh`）を読み込んでいないシェルで、`LD_LIBRARY_PATH` に intel/llvm の `lib` を置いて動かします。**
   oneAPI の環境では、`LD_LIBRARY_PATH` の先にある oneAPI のアダプター（`libur_adapter_level_zero` など）と `libumf` が読み込まれます。
   版の合わない組み合わせ（dpclang 6.2 の `libsycl.so.8`）では、GPU を使うテストが起動してすぐにセグメンテーション違反で止まりました。
@@ -197,9 +197,9 @@ setup.py が取ってきます。画像のエンコーダーは、その `tools/
 
 ```bash
 L=$PWD/.tools/intel-llvm/install
-cmake -S . -B build/llvm7 -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
+cmake -S . -B build/free -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_LICENSE=free -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
-cmake --build build/llvm7 --target strata -j6
+cmake --build build/free --target strata -j6
 ```
 
 icpx では、`source /opt/intel/oneapi/setvars.sh` を読み込み、`-DCMAKE_CXX_COMPILER=icpx -DSTRATA_LICENSE=contrib-icpx` に替えます。
@@ -207,11 +207,11 @@ NVIDIA の GPU 向け（contrib-llvm）では、`tools/intel_llvm_build.py --con
 
 ```bash
 C=$PWD/.tools/intel-llvm-contrib/install
-cmake -S . -B build/contrib -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
+cmake -S . -B build/contrib-llvm -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
   -DSTRATA_LICENSE=contrib \
   -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
-cmake --build build/contrib --target strata -j6
-LD_LIBRARY_PATH=$C/lib build/contrib/strata-device
+cmake --build build/contrib-llvm --target strata -j6
+LD_LIBRARY_PATH=$C/lib build/contrib-llvm/strata-device
 ```
 
 別の機械向けには、`STRATA_CUDA_ARCHS` に GPU のアーキテクチャを並べます（RTX 40 は `sm_89`、RTX 30 は `sm_86`）。

@@ -112,11 +112,11 @@ B70（32 GB）、i7-14700、Qwen3.8-Flash-Next IQ2_XS、エンジンへ直接、
 厳密に比べるには `--pcie-frac 0 --adapt-every 1000000` を渡します（スクリプトが `STRATA_IQ_MT_MIN=1` を設定します）。
 
 ```sh
-python3 tools/batch_test.py --exe build/xe/strata --config xestrata-<model>.json --batch 3 --n 3 \
+python3 tools/batch_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json --batch 3 --n 3 \
     --extra "--pcie-frac 0 --adapt-every 1000000"
-python3 tools/batch_interleave_test.py --exe build/xe/strata --config xestrata-<model>.json \
+python3 tools/batch_interleave_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json \
     --extra "--pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow"
-python3 tools/parking_test.py --exe build/xe/strata --config xestrata-<model>.json \
+python3 tools/parking_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json \
     --extra "--conversation-cache-mib 8192 --conversation-cache-slots 4 --pcie-frac 0 --adapt-every 1000000"
 STRATA_KEY=<key> python3 tools/early_close_test.py http://127.0.0.1:8095
 ```

@@ -30,10 +30,10 @@ sudo apt install gitleaks shellcheck clang-tidy cppcheck flake8 mypy python3-pyf
 ```
 
 `tools/lint/run.sh` は、ディストリビューションの clang-tidy ではなく、SYCL を理解する oneAPI の clang-tidy（`/opt/intel/oneapi/compiler` の下）を使います。
-clang-tidy はビルドフォルダーの `compile_commands.json` を読みます。
+clang-tidy はビルドフォルダー（既定は `build/free`、`STRATA_LINT_BUILD` で変えられます）の `compile_commands.json` を読みます。
 
 ```sh
-cmake -S . -B build/xe -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake -S . -B build/free -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 ```
 
 ディストリビューションにないもの、またはあっても古すぎるものは `.lint/` に入れます。
@@ -157,11 +157,11 @@ sudo apt install ninja-build ccache
 ```
 
 構成するときに `-G Ninja -DCMAKE_CXX_COMPILER_LAUNCHER=ccache` を足します。
-ジェネレーターは既存のビルドフォルダーでは変えられないので、フォルダーを作り直します（`build/contrib` なら、消してから同じ選択肢で構成し直します）。
+ジェネレーターは既存のビルドフォルダーでは変えられないので、フォルダーを作り直します（`build/contrib-llvm` なら、消してから同じ選択肢で構成し直します）。
 
 ```sh
-cmake -S . -B build/contrib -G Ninja -DCMAKE_CXX_COMPILER_LAUNCHER=ccache <ほかの選択肢>
-cmake --build build/contrib -j 28
+cmake -S . -B build/contrib-llvm -G Ninja -DCMAKE_CXX_COMPILER_LAUNCHER=ccache <ほかの選択肢>
+cmake --build build/contrib-llvm -j 28
 ccache -s          # ヒットの数
 ```
 

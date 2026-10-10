@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Real rows of every i-quant format and their reference values, for src/kernels/iq_parity.cpp.
 
-    python tools/iq_fixture.py --out logs/iq_fixture && build/xe/iq_parity logs/iq_fixture
+    python tools/iq_fixture.py --out logs/iq_fixture && build/contrib-llvm/iq_parity logs/iq_fixture
 
 For each format the parity test names, the first tensor stored in that format is found in a pinned revision of the
 model repository, `--rows` of its rows are fetched with HTTP range requests (no shard is downloaded), and they are

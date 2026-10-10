@@ -5,7 +5,7 @@
 """Batching test: the same prompts decoded alone (GEN, the usual path with drafts) and together in the batch
 windows (BGEN), greedy.  Every slot's tokens must equal its solo tokens; prints the aggregate decode rate.
 
-  python3 tools/batch_test.py --exe build/xe/strata --config xestrata-<model>.json --batch 4 --n 4 \
+  python3 tools/batch_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json --batch 4 --n 4 \
       --extra "--pcie-frac 0 --adapt-every 1000000"
 """
 import argparse

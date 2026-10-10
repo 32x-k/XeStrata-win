@@ -30,6 +30,7 @@ The dense matrix products, by mode and GPU maker:
 | contrib-icpx | Intel's runtime (oneMKL) | — | — |
 
 In reports, commit messages and documents, call the three modes free, contrib-llvm and contrib-icpx: "contrib" alone could be either of the last two.
+Name a build by its mode, not by its compiler or a former folder name ("llvm7", "contrib", "xe"): "built and tested in the free and contrib-llvm modes". The build folders carry the modes' names: `build/free`, `build/contrib-llvm` and `build/contrib-icpx`.
 contrib-llvm is the mode the code calls `contrib` (`STRATA_LICENSE=contrib`, `--license contrib`, the packages `xestrata-contrib-cuda<version>`); those names stay as they are.
 
 Rules:
@@ -37,7 +38,7 @@ Rules:
 - XeStrata itself stays free software, and the free mode must build, run and pass its tests. Do not write anything that only the contrib-llvm or contrib-icpx mode can build or run, other than the paths for the GPUs only those modes reach (NVIDIA's, in the contrib-llvm mode).
 - A non-free dependency goes only on a path the contrib-llvm or contrib-icpx mode switches on, never in the free mode, and is never bundled. The free mode may be slower without it (an older free compiler, for example), never broken.
 - Keep one code path where the modes can share it: the engine's dense matrix products (`src/prefill/gemm.cpp`) go through oneMath in the contrib-llvm and contrib-icpx modes, and in the free mode where oneMath's backend for the GPU is free software (rocBLAS for AMD GPUs); elsewhere (and where oneMath has no backend for the GPU) through XeStrata's own kernels. The AMD path is the same in the free and contrib-llvm modes. Every other product is XeStrata's own kernels, or a DFSG-free library's, in every mode.
-- Build and test a change to the SYCL code in the free and contrib-icpx modes: a free build (`build/llvm7`, intel/llvm built from source as [docs/DEVTOOLS.md](docs/DEVTOOLS.md#intelllvm-from-source) describes) and a contrib-icpx one (`build/xe`, icpx). A change that NVIDIA's device compile sees is also built in the contrib-llvm mode (`build/contrib`, `STRATA_CUDA_ARCHS`), and run on an NVIDIA GPU where one is there (else `unverified`). The compilers differ in version: an extension one of them lacks needs a fallback (as `sycl_ext_oneapi_clock` in `verify_kernels.cpp`), and a warning one of them gives counts as new.
+- Build and test a change to the SYCL code with intel/llvm only, in the free and contrib-llvm modes: a free build (`build/free`, intel/llvm built from source as [docs/DEVTOOLS.md](docs/DEVTOOLS.md#intelllvm-from-source) describes) and a contrib-llvm one (`build/contrib-llvm`, `STRATA_CUDA_ARCHS`). A change that NVIDIA's device compile sees is also run on an NVIDIA GPU where one is there (else `unverified`). The contrib-icpx mode is not built or tested. The compilers differ in version: an extension one of them lacks needs a fallback (as `sycl_ext_oneapi_clock` in `verify_kernels.cpp`), and a warning one of them gives counts as new.
 - `third_party/nonfree/` (below) stays optional in every mode.
 - The model itself (Qwen3.8-Flash-Next) is excluded from these rules.
 - Non-free tools a developer runs by hand, such as Intel SDE below, are allowed as long as they are not bundled and neither the build nor the tests require them.
@@ -95,10 +96,10 @@ It picks the lints by file kind, with the configurations in `tools/lint/`:
 
 The files a change touches must get no new findings; findings that were there before may stay.
 The records that came from upstream's `bench/results` (other people's measurements, listed in `tools/lint/records.txt`) and other projects' files in `third_party/<area>/<project>/` (kept as they are; XeStrata's `patches/` there excepted) get only gitleaks and `reuse lint`.
-clang-tidy reads `compile_commands.json` from the build folder (`build/xe`, or `STRATA_LINT_BUILD`): configure it with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
+clang-tidy reads `compile_commands.json` from the build folder (`build/free`, or `STRATA_LINT_BUILD`): configure it with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
 
 Then run the existing tests the change can affect (CTest in the build folder, `python -m unittest` for `serve/` and `tools/`).
-For memory and undefined-behavior bugs, build in a folder of its own with `-DSTRATA_SANITIZE=address,undefined` (for example `build/xe-asan`) and run CTest there.
+For memory and undefined-behavior bugs, build in a folder of its own with `-DSTRATA_SANITIZE=address,undefined` (for example `build/free-asan`) and run CTest there.
 It instruments the project's own host code only, not ggml or the SYCL device code; do not run its binaries under Intel SDE.
 
 Do not reformat code with clang-format or a similar tool: the code is formatted by hand, a reformat would rewrite about a quarter of the C++ lines and make Strata's changes hard to carry over. Match the style of the surrounding code.
@@ -147,9 +148,9 @@ This covers:
 - the run-time choice between the AVX-512 and AVX-2 kernels: `cpu_avx512_ok` and its callers (`src/kernels/cpu/expert_layout.cpp`, `src/kernels/cpu/native_expert.cpp`, `src/program/generate.cpp`)
 
 ```sh
-sde64 -icx -- ./build/xe/expert_multi_test
-sde64 -icx -- ./build/xe/expert_parity --selftest   # from the repository root
-sde64 -icx -- ./build/xe/pool_test --selftest       # from the repository root
+sde64 -icx -- ./build/free/expert_multi_test
+sde64 -icx -- ./build/free/expert_parity --selftest   # from the repository root
+sde64 -icx -- ./build/free/pool_test --selftest       # from the repository root
 ```
 
 The same tests must also still pass or skip natively, so the AVX-2 path is checked as well.

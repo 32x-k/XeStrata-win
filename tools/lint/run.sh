@@ -5,12 +5,12 @@
 # tools/lint/run.sh [FILE...] - the lints of AGENTS.md on the given files, by kind; without files, on the files that
 # differ from HEAD (changed or new, not deleted).  Run from the repository root.  Exits 1 when any lint reports.
 # The tools come from apt, except ruff, lychee and stylelint, which are in .lint/ (see AGENTS.md, Lints).
-# STRATA_LINT_BUILD names the build folder whose compile_commands.json clang-tidy reads (default build/xe; configure
-# it with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON).
+# STRATA_LINT_BUILD names the build folder whose compile_commands.json clang-tidy reads (default build/free;
+# configure it with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON).
 set -u
 cd "$(git rev-parse --show-toplevel)" || exit 2
 C=tools/lint
-BUILD=${STRATA_LINT_BUILD:-build/xe}
+BUILD=${STRATA_LINT_BUILD:-build/free}
 CLANG_TIDY=$(find /opt/intel/oneapi/compiler -path '*/bin/compiler/clang-tidy' 2>/dev/null | sort -V | tail -1)
 
 if [ $# -gt 0 ]; then

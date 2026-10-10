@@ -30,10 +30,10 @@ sudo apt install gitleaks shellcheck clang-tidy cppcheck flake8 mypy python3-pyf
 ```
 
 `tools/lint/run.sh` runs oneAPI's clang-tidy, which knows SYCL (found under `/opt/intel/oneapi/compiler`), not the distribution's.
-clang-tidy reads `compile_commands.json` from the build folder:
+clang-tidy reads `compile_commands.json` from the build folder (by default `build/free`; `STRATA_LINT_BUILD` changes it):
 
 ```sh
-cmake -S . -B build/xe -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake -S . -B build/free -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 ```
 
 The ones the distribution does not package, or packages too old, go into `.lint/`:
@@ -157,11 +157,11 @@ sudo apt install ninja-build ccache
 ```
 
 Configure with `-G Ninja -DCMAKE_CXX_COMPILER_LAUNCHER=ccache` added.
-An existing build folder cannot change its generator, so make it again (for `build/contrib`: delete it and configure with the same options).
+An existing build folder cannot change its generator, so make it again (for `build/contrib-llvm`: delete it and configure with the same options).
 
 ```sh
-cmake -S . -B build/contrib -G Ninja -DCMAKE_CXX_COMPILER_LAUNCHER=ccache <the other options>
-cmake --build build/contrib -j 28
+cmake -S . -B build/contrib-llvm -G Ninja -DCMAKE_CXX_COMPILER_LAUNCHER=ccache <the other options>
+cmake --build build/contrib-llvm -j 28
 ccache -s          # the hits
 ```
 

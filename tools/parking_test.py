@@ -6,7 +6,7 @@
 live (reference engine: A, then the follow-up) or came back from the parking cache (second engine: A, then B, which
 parks A, then the follow-up).  Greedy; run with --extra "--pcie-frac 0 --adapt-every 1000000" for exactness.
 
-  python3 tools/parking_test.py --exe build/xe/strata --config xestrata-<model>.json \
+  python3 tools/parking_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json \
       --extra "--conversation-cache-mib 8192 --conversation-cache-slots 4 --pcie-frac 0"
 """
 import argparse

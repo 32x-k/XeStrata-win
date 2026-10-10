@@ -148,12 +148,12 @@ The free mode (intel/llvm in `.tools/intel-llvm/install`):
 
 ```bash
 L=$PWD/.tools/intel-llvm/install
-cmake -S . -B build/llvm7 \
+cmake -S . -B build/free \
   -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_LICENSE=free \
   -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=OFF \
   -DSTRATA_BUILD_TESTS=ON
-cmake --build build/llvm7 --target strata-device strata-load elementwise_parity \
+cmake --build build/free --target strata-device strata-load elementwise_parity \
   gguf_reader_test suffix_drafter_test controller_test draft_policy_test conv_cache_test \
   platform_memory_test ple_reader_test -j4
 ```
@@ -162,16 +162,16 @@ With icpx (contrib-icpx):
 
 ```bash
 source /opt/intel/oneapi/setvars.sh
-cmake -S . -B build/xe \
+cmake -S . -B build/contrib-icpx \
   -DCMAKE_CXX_COMPILER=icpx -DSTRATA_LICENSE=contrib-icpx \
   -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=OFF \
   -DSTRATA_BUILD_TESTS=ON
-cmake --build build/xe --target strata-device strata-load elementwise_parity \
+cmake --build build/contrib-icpx --target strata-device strata-load elementwise_parity \
   gguf_reader_test suffix_drafter_test controller_test draft_policy_test conv_cache_test \
   platform_memory_test ple_reader_test -j4
-build/xe/strata-device --version
-ctest --test-dir build/xe \
+build/contrib-icpx/strata-device --version
+ctest --test-dir build/contrib-icpx \
   -R '^(device_selftest|elementwise_parity|gguf_reader_test|suffix_drafter_test|controller_test|draft_policy_test|conv_cache_test|ple_reader_selftest|platform_memory_test)$' \
   --output-on-failure
 ```
@@ -181,7 +181,7 @@ ctest --test-dir build/xe \
 - The host platform library (`memory.cpp`, `direct_file.cpp`) and the PLE n-gram reader build without the GPU toolchain.
   CPU-only tools can be configured with `STRATA_ENABLE_XE=OFF`.
 - The CPU canonical expert tests need AVX-512 or model files and are not in the commands above.
-- `build/xe/BUILD.json` records the backend, version, upstream reference, compiler and build scope.
+- `build/contrib-icpx/BUILD.json` records the backend, version, upstream reference, compiler and build scope.
 - **Run a free build in a shell without oneAPI's environment (`setvars.sh`), with intel/llvm's `lib` on `LD_LIBRARY_PATH`.**
   With oneAPI's environment, oneAPI's adapters (`libur_adapter_level_zero` and others) and `libumf` come first on `LD_LIBRARY_PATH` and are loaded.
   With a runtime they did not match (dpclang 6.2's `libsycl.so.8`), the tests that use the GPU stopped with a segmentation fault as they started.
@@ -195,9 +195,9 @@ setup.py fetches it; the image encoder also uses its `tools/mtmd`.
 
 ```bash
 L=$PWD/.tools/intel-llvm/install
-cmake -S . -B build/llvm7 -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
+cmake -S . -B build/free -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_LICENSE=free -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
-cmake --build build/llvm7 --target strata -j6
+cmake --build build/free --target strata -j6
 ```
 
 With icpx: `source /opt/intel/oneapi/setvars.sh`, then `-DCMAKE_CXX_COMPILER=icpx -DSTRATA_LICENSE=contrib-icpx` instead.
@@ -205,11 +205,11 @@ For NVIDIA GPUs (contrib-llvm), with intel/llvm built by `tools/intel_llvm_build
 
 ```bash
 C=$PWD/.tools/intel-llvm-contrib/install
-cmake -S . -B build/contrib -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
+cmake -S . -B build/contrib-llvm -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
   -DSTRATA_LICENSE=contrib \
   -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
-cmake --build build/contrib --target strata -j6
-LD_LIBRARY_PATH=$C/lib build/contrib/strata-device
+cmake --build build/contrib-llvm --target strata -j6
+LD_LIBRARY_PATH=$C/lib build/contrib-llvm/strata-device
 ```
 
 For another machine, `STRATA_CUDA_ARCHS` lists the GPUs' architectures (`sm_89` for the RTX 40 series, `sm_86` for the RTX 30).

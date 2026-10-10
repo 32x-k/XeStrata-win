@@ -67,7 +67,7 @@ Set `STRATA_UPSTREAM_VERSION` in `CMakeLists.txt` and `XESTRATA_REVISION` back t
 ## 4. Port and measure
 
 Build folders are configured with Ninja and ccache (docs/DEVTOOLS.md, "Faster builds"); check the hits with `ccache -s`.
-While porting, build and measure with the contrib-llvm build (`build/contrib`) only; the free and contrib-icpx modes come once at the end (step 5).
+While porting, build and measure with the contrib-llvm build (`build/contrib-llvm`) only; the free mode comes once at the end (step 5).
 
 - Port related items as a group, each item behind an environment switch so the group can be split.
 - A change that can be checked bitwise is checked by a probe alone; an opt-in feature is run once to see it works.
@@ -100,7 +100,7 @@ Paths an earlier merge left out for want of a machine (the `移さない` lines 
 tools/lint/run.sh                          # the files that differ from HEAD
 ```
 
-Then build and run CTest in `build/contrib`, `build/llvm7` (intel/llvm, without oneAPI's environment) and `build/xe` (icpx), and in the AMD container its contrib-llvm build with HIP (`STRATA_HIP_ARCHS`).
+Then build and run CTest in `build/contrib-llvm` and `build/free` (intel/llvm, without oneAPI's environment; the contrib-icpx mode is not built or tested), and in the AMD container its contrib-llvm build with HIP (`STRATA_HIP_ARCHS`).
 A warning or a mismatch only one mode shows is traced back to the commit that caused it and fixed there.
 AVX-512 code touched: AGENTS.md's Intel SDE runs.
 
