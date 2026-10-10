@@ -303,6 +303,27 @@ class ParallelService(unittest.TestCase):
         self.assertEqual(self.engine.batch, 2)
         self.assertEqual(self.get("/v1/status")["concurrency"]["serving"], 2)
 
+    def test_a_burst_of_connections_is_not_reset(self):
+        """30-40 clients at once got "connection reset by peer" with the listen backlog of 5 (4 x R9700 burst): the
+        server listens with a deep backlog (STRATA_HTTP_BACKLOG, 256), so 60 simultaneous requests all get answers."""
+        import serve.server as server
+        self.assertGreaterEqual(server.Server.request_queue_size, 64)
+        self.start(2)
+        errs, ok = [], []
+
+        def one(i):
+            try:
+                self.chat(f"burst {i}", max_tokens=8)
+                ok.append(i)
+            except Exception as e:                      # noqa: BLE001
+                errs.append(repr(e))
+        th = [threading.Thread(target=one, args=(i,)) for i in range(60)]
+        for t in th:
+            t.start()
+        for t in th:
+            t.join()
+        self.assertEqual((len(ok), errs[:2]), (60, []))
+
     def test_stop_strings_in_a_batch_slot(self):
         """#454: a stop string cuts the answer in --batch mode too, and the slot is freed for the next request."""
         self.start(2)
