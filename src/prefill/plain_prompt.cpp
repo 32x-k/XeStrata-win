@@ -22,6 +22,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_qsa.hpp"
+#include "strata/kernels/prompt_attn.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -161,6 +162,10 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     // the routed experts in their quantized blocks (int8 products, iq_mmq: on the matrix engines, else by dp4a) where
     // every layer's types are theirs (prompt_int8, decided with the buffers), else dequantized to FP16
     const bool use_mmq = P.int8;
+    static const bool prompt_attn_on = [] {   // STRATA_PLAIN_PROMPT_ATTN=0: the decode's attention kernel
+        const char* v = std::getenv("STRATA_PLAIN_PROMPT_ATTN");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
     PromptGemm& pg = prompt_gemm();
     if (use_mmq && !pg.identity) {
         prefill::mmq::iota(P.identity, P.T * K, cs);
@@ -233,12 +238,16 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                     pools.k_pool = k_pool_[(size_t) a];
                     pools.v_pool = v_pool_[(size_t) a];
                     pools.page_table = page_table_;
-                    // every query reads the cells up to its own; the grid as wide as the chunk's last context (not
+                    // the prompt attention (prompt_attn: K and V read once a block of queries), else the decode's
+                    // kernel: every query reads the cells up to its own; the grid as wide as the chunk's last context (not
                     // the cache's capacity: no graph holds it), as many queries a launch as the scratch takes
                     const int64_t cap = std::min<int64_t>(opt_.max_cells, p0 + T);
                     const int64_t per_q = (int64_t) k::qsa_decode_attn_scratch_floats(cap, qs);
                     const int64_t nq_max = std::max<int64_t>(1, std::min<int64_t>((int64_t) opt_.max_t * attn_scratch_floats_ / per_q, 4096));
-                    for (int64_t t = 0; t < T; t += nq_max) {
+                    const bool batched = prompt_attn_on &&
+                                         k::prompt_attn(P.qcur, k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_, p0,
+                                                        T, qs, P.attn, cs);
+                    for (int64_t t = 0; !batched && t < T; t += nq_max) {
                         const int nq = (int) std::min<int64_t>(nq_max, T - t);
                         k::qsa_dense_attn_batch(P.qcur + t * NH * HD, pools, P.steps + t * k::kStepCount, cap, qs,
                                                 attn_scratch_, P.attn + t * NH * HD, nq, cs);
