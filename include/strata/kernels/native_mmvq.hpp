@@ -60,6 +60,12 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
 void native_q2_0_f32(const void* weights, const float* x, void* scratch_q8_1,
                      float* y, int n_in, int n_out, int ncols, void* stream);
 
+void native_q2_k_mmvq(const void* weights, const void* x_q8_1, float* y,
+                      int n_in, int n_out, int ncols, void* stream);
+
+void native_q2_k_f32(const void* weights, const float* x, void* scratch_q8_1,
+                     float* y, int n_in, int n_out, int ncols, void* stream);
+
 void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream);
 
