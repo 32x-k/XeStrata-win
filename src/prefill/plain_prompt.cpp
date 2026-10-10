@@ -185,6 +185,10 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     };
     auto t_mark = std::chrono::steady_clock::now();
     try {
+        // the chunk's routes, every MoE layer's, for the adaptive tier: replayed once the chunk is done, a window's
+        // tokens at a time, so that its counts and rounds come as the windows would have made them
+        const int64_t L = s.n_moe_layers();
+        std::vector<int32_t> routes(disp_.usage.empty() ? 0 : (size_t) (L * P.T * K));
         for (int64_t c0 = 0; c0 < n; c0 += P.T) {
             const int64_t T = std::min<int64_t>(P.T, n - c0), p0 = pos + c0;
             // the chunk's inputs: embedding rows, per-token step counts and rotary positions
@@ -274,8 +278,8 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                     if (e < 0 || e >= E) { err = "plain prompt: a routed expert is out of range"; return false; }
                     ++count[(size_t) e];
                     heat_[(size_t) (ml * E + e)] += 1.0;
-                    if (!disp_.usage.empty()) disp_.usage[(size_t) (ml * E + e)] += 1.0f;
                 }
+                if (!routes.empty()) std::copy(P.h_ids, P.h_ids + T * K, routes.begin() + ml * P.T * K);
                 std::vector<int32_t> experts, start((size_t) E + 1, 0);
                 for (int64_t e = 0; e < E; ++e) {
                     start[(size_t) e + 1] = start[(size_t) e] + count[(size_t) e];
@@ -435,6 +439,19 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                 sp.greedy = true;
                 sp.temperature = 0.0f;
                 k::sample_tokens(logits_, 1, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+            }
+            if (!routes.empty()) {   // the tier's rounds change slots the chunk read: after it is done
+                if (!strata::gpu::stream_sync(cs)) {
+                    err = std::string("plain prompt: ") + strata::gpu::last_error();
+                    return false;
+                }
+                const int64_t W = opt_.max_t;
+                for (int64_t t0 = 0; t0 < T; t0 += W) {
+                    for (int64_t ml = 0; ml < L; ++ml)
+                        for (int64_t i = t0 * K; i < std::min(T, t0 + W) * K; ++i)
+                            disp_.usage[(size_t) (ml * E + routes[(size_t) (ml * P.T * K + i)])] += 1.0f;
+                    if (++windows_ % opt_.adapt_every == 0 && !adapt(err)) return false;
+                }
             }
         }
     } catch (const std::exception& e) {
