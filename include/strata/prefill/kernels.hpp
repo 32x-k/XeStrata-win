@@ -69,6 +69,8 @@ void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream)
 void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream, int64_t width = 640);
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
+/// Scatter rows: dst[dst_row[i], :] = src[i, :] (n rows of `width` floats).
+void scatter_rows(const float* src, const int32_t* dst_row, float* dst, int64_t n, int64_t width, void* stream);
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);

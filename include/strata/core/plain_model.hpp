@@ -151,12 +151,18 @@ private:
         int32_t* identity = nullptr;       ///< row i is row i (the int8 products' output map)
         const uint8_t** wtab = nullptr;    ///< a layer's experts' blobs, for the int8 products
         int32_t* rbounds = nullptr;        ///< each group's bounds from its first row (the down product's)
+        int64_t cpu_cap = 0;               ///< routed rows the CPU's share of a layer may take
+        float* cpu = nullptr;              ///< the CPU's rows, sent back to be scattered into parts
+        int32_t* cpu_row = nullptr;        ///< the routing entry each of them belongs to
         uint16_t* gemm_scratch = nullptr;  ///< Gemm::native's dequantized weight
         // pinned host
         float* emb = nullptr;              ///< T rows of n_embd
         int32_t *h_steps = nullptr, *h_pos = nullptr, *h_ids = nullptr, *h_src = nullptr, *h_slot = nullptr,
                 *h_bounds = nullptr, *h_entry = nullptr;
         const uint8_t** h_wtab = nullptr;
+        float *h_hn = nullptr, *h_cpu = nullptr;   ///< the layer's normed rows, the CPU's output rows
+        int32_t* h_cpu_row = nullptr;
+        uint8_t* h_nact = nullptr;         ///< the CPU's activations: a token's in the layer's native format
         int32_t* h_rbounds = nullptr;
     };
     /// Lays the buffers for chunks of `T` tokens out from `dev` / `host` (null: only counts), returning the device and
@@ -173,6 +179,8 @@ private:
     bool prompt_borrow(int64_t T, std::string& err);
     bool prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err);
     bool prompt_warm_products(std::string& err);
+    bool prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& experts, const std::vector<int32_t>& count,
+                            const std::vector<int32_t>& start, std::string& err);
     bool prompt_return(std::string& err);
     int64_t borrow_first_ = -1;
     std::vector<std::pair<int32_t, int32_t>> borrowed_res_;   // (layer, expert) the borrowed slots held

@@ -150,6 +150,49 @@ bool PlainModel::prompt_return(std::string& err) {
     return true;
 }
 
+bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& experts, const std::vector<int32_t>& count,
+                                    const std::vector<int32_t>& start, std::string& err) {
+    // On the host while the GPU computes its share: each routed row's token quantized once to the layer's native
+    // activation, one multi-token job an expert, the outputs back to the GPU into their routing entries' rows of parts.
+    namespace kc = k::cpu;
+    PromptBufs& P = pb_;
+    const int64_t N = spec_.n_embd;
+    const kc::NativeFmt& f = kc::expert_layout().fmt[(size_t) ml];
+    std::vector<char> quantized((size_t) P.T, 0);
+    std::vector<kc::ExpertJobMulti> jobs;
+    jobs.reserve(experts.size());
+    int64_t q = 0;
+    for (int32_t e : experts) {
+        kc::ExpertJobMulti j;
+        j.blob = src_->blob(ml, e);
+        if (j.blob == nullptr) { err = "plain prompt: an expert could not be read for the CPU"; return false; }
+        for (int32_t r = start[(size_t) e]; r < start[(size_t) e] + count[(size_t) e]; ++r) {
+            const int32_t tok = P.h_src[r];
+            uint8_t* act = P.h_nact + (size_t) tok * kc::kNativeActBytes;
+            if (!quantized[(size_t) tok]) {
+                kc::native_quant_act(f, P.h_hn + (size_t) tok * N, act);
+                quantized[(size_t) tok] = 1;
+            }
+            j.nact[j.nt] = act;
+            j.out[j.nt] = P.h_cpu + q * N;
+            P.h_cpu_row[q] = P.h_entry[r];
+            ++j.nt;
+            ++q;
+        }
+        jobs.push_back(j);
+    }
+    for (size_t i = 0; i < jobs.size(); i += kc::ExpertPool::kMaxSplitMulti)
+        pool_->run_split_multi_native(f, jobs.data() + i,
+                                      (int) std::min<size_t>(kc::ExpertPool::kMaxSplitMulti, jobs.size() - i));
+    if (!strata::gpu::copy_async(P.cpu, P.h_cpu, (size_t) (q * N) * 4, cs_) ||
+        !strata::gpu::copy_async(P.cpu_row, P.h_cpu_row, (size_t) q * 4, cs_)) {
+        err = std::string("plain prompt: the CPU's rows: ") + strata::gpu::last_error();
+        return false;
+    }
+    prefill::scatter_rows(P.cpu, P.cpu_row, P.parts, q, N, cs_);
+    return true;
+}
+
 bool PlainModel::prompt_warm(std::string& err) {
     if (opt_.prompt_chunk <= 0 || prompt_host_ == nullptr) return true;
     if (!prompt_borrow(std::min<int64_t>(opt_.prompt_chunk, 512), err)) return false;
@@ -241,6 +284,13 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     // the routed experts in their quantized blocks (int8 products, iq_mmq: on the matrix engines, else by dp4a) where
     // every layer's types are theirs (prompt_int8, decided with the buffers), else dequantized to FP16
     const bool use_mmq = P.int8;
+    // the CPU's share of the missed experts needs the split's times (measured at load from pinned RAM) and the int8
+    // path's grouping; STRATA_PLAIN_CPU_SHARE=0: every expert on the GPU
+    static const bool cpu_env = [] {
+        const char* v = std::getenv("STRATA_PLAIN_CPU_SHARE");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    const bool cpu_share = cpu_env && use_mmq && split_.c > 0.0 && split_.p > 0.0 && P.cpu_cap > 0;
     static const bool prompt_attn_on = [] {   // STRATA_PLAIN_PROMPT_ATTN=0: the decode's attention kernel
         const char* v = std::getenv("STRATA_PLAIN_PROMPT_ATTN");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
@@ -359,8 +409,10 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     proj(b.sh_up, P.sh_up, T);
                     k::f32_gemm_rows(P.hn, N, b.sh_gate_inp, P.sh_g, 1, N, 1, T, cs);
                 }
-                // the routed experts grouped by expert, on the host from this layer's ids
-                if (!strata::gpu::copy_async(P.h_ids, P.ids, (size_t) (T * K) * 4, cs) || !strata::gpu::stream_sync(cs)) {
+                // the routed experts grouped by expert, on the host from this layer's ids (and the normed rows, for the
+                // CPU's share)
+                if ((cpu_share && !strata::gpu::copy_async(P.h_hn, P.hn, (size_t) (T * N) * 4, cs)) ||
+                    !strata::gpu::copy_async(P.h_ids, P.ids, (size_t) (T * K) * 4, cs) || !strata::gpu::stream_sync(cs)) {
                     err = std::string("plain prompt: the routes: ") + strata::gpu::last_error();
                     return false;
                 }
@@ -373,13 +425,48 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     heat_[(size_t) (ml * E + e)] += 1.0;
                 }
                 if (!routes.empty()) std::copy(P.h_ids, P.h_ids + T * K, routes.begin() + ml * P.T * K);
-                std::vector<int32_t> experts, start((size_t) E + 1, 0);
-                for (int64_t e = 0; e < E; ++e) {
-                    start[(size_t) e + 1] = start[(size_t) e] + count[(size_t) e];
-                    if (count[(size_t) e] > 0) experts.push_back((int32_t) e);
+                const auto& f = lay.fmt[(size_t) ml];
+                // the CPU's share of the missed experts (after Project Maya's CPU lane, as the windows split them): of
+                // the f experts not in VRAM, pcie_split_m's count over PCIe from the times measured at load, the rest
+                // on the CPU pool beside the GPU, those with the fewest rows first (a window's tokens at most: one
+                // multi-token job, its weights read once)
+                std::vector<char> on_cpu((size_t) E, 0);
+                std::vector<int32_t> cpu_experts;
+                if (cpu_share && f.gu_type != 42) {
+                    std::vector<std::pair<int32_t, int32_t>> missed;
+                    int hits = 0;
+                    for (int64_t e = 0; e < E; ++e)
+                        if (count[(size_t) e] > 0) {
+                            if (res_[(size_t) (ml * E + e)] >= 0) ++hits;
+                            else missed.emplace_back(count[(size_t) e], (int32_t) e);
+                        }
+                    int want = (int) missed.size() - pcie_split_m(split_, true, (int) missed.size(), hits);
+                    std::sort(missed.begin(), missed.end());
+                    int64_t rows = 0;
+                    for (const auto& [c, e] : missed) {
+                        if (want <= 0 || c > k::cpu::MAXT || rows + c > P.cpu_cap) break;
+                        on_cpu[(size_t) e] = 1;
+                        cpu_experts.push_back(e);
+                        rows += c;
+                        --want;
+                    }
+                }
+                // rows in expert order, the GPU's experts first (their bounds one run), the CPU's after them
+                std::vector<int32_t> experts, start((size_t) E, 0);
+                int64_t gpu_rows = 0;
+                {
+                    int32_t at = 0;
+                    for (int pass = 0; pass < 2; ++pass)
+                        for (int64_t e = 0; e < E; ++e)
+                            if (count[(size_t) e] > 0 && on_cpu[(size_t) e] == pass) {
+                                start[(size_t) e] = at;
+                                at += count[(size_t) e];
+                                if (pass == 0) experts.push_back((int32_t) e);
+                            }
+                    for (int32_t e : experts) gpu_rows += count[(size_t) e];
                 }
                 {
-                    std::vector<int32_t> fill(start.begin(), start.end() - 1);
+                    std::vector<int32_t> fill(start);
                     for (int64_t i = 0; i < T * K; ++i) {
                         const int32_t e = P.h_ids[i], row = fill[(size_t) e]++;
                         P.h_src[row] = (int32_t) (i / K);   // the token whose row it reads
@@ -390,7 +477,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 // the group bounds: the routed rows of the experts in `experts` order, absolute
                 int64_t nb = 0;
                 for (int32_t e : experts) P.h_bounds[nb++] = start[(size_t) e];
-                P.h_bounds[nb] = (int32_t) (T * K);
+                P.h_bounds[nb] = (int32_t) gpu_rows;
                 if (!strata::gpu::copy_async(P.src, P.h_src, (size_t) (T * K) * 4, cs) ||
                     !(use_mmq ? strata::gpu::copy_async(P.entry, P.h_entry, (size_t) (T * K) * 4, cs)
                               : strata::gpu::copy_async(P.slot, P.h_slot, (size_t) (T * K) * 4, cs)) ||
@@ -398,7 +485,6 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     err = std::string("plain prompt: the groups: ") + strata::gpu::last_error();
                     return false;
                 }
-                const auto& f = lay.fmt[(size_t) ml];
                 if (use_mmq) prefill::mmq::quantize(P.hn, P.src, P.xq, f.gu_type, N, N, T * K, cs);
                 else prefill::gather_rows16(P.x16, P.src, P.xs16, T * K, N, cs);
                 mark(1, t_mark);
@@ -477,6 +563,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     }
                     g0 = g1;
                 }
+                if (!cpu_experts.empty() && !prompt_cpu_experts(ml, cpu_experts, count, start, err)) return false;
                 for (size_t g0 = 0; !use_mmq && g0 < experts.size(); g0 += PromptBufs::kGroup) {
                     const int G = (int) std::min<size_t>(PromptBufs::kGroup, experts.size() - g0);
                     if (transient && !strata::gpu::stream_sync(cs)) {   // the staging's last readers are done

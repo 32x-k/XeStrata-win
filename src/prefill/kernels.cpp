@@ -1028,6 +1028,13 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
         dst[r * per + j] = x[(int64_t) src[r] * per + j];
     });
 }
+void scatter_rows(const float* src, const int32_t* dst_row, float* dst, int64_t n, int64_t width, void* stream) {
+    if (n <= 0) return;
+    Q(stream).parallel_for(sycl::range<1>((size_t) (n * width)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], r = i / width, j = i % width;
+        dst[(int64_t) dst_row[r] * width + j] = src[i];
+    });
+}
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream) {
     Q(stream).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
