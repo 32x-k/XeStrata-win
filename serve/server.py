@@ -1006,9 +1006,9 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     keys += f" {k}={float(v)!r}"
-            # --aux-cpus for this request: 1 puts the engine's threads that are neither pool workers nor the host on the
-            # spare CPUs, 0 leaves them where they were created (true/false or 1/0; the engine started without a spare CPU
-            # ignores a 1).  Anything else is not sent.
+            # --aux-cpus for this request: 1 puts the engine's threads that are neither pool workers nor the host on
+            # the spare CPUs, 0 leaves them where they were created (true/false or 1/0; the engine started without a
+            # spare CPU ignores a 1).  Anything else is not sent.
             ac = tune.get("aux_cpus")
             if isinstance(ac, bool) or (isinstance(ac, (int, float)) and ac in (0, 1)):
                 keys += f" aux_cpus={int(ac)}"
@@ -2266,20 +2266,21 @@ def layer_split_value(cfg: dict) -> str:
     if n <= 1:
         n = 1 + len(cfg.get("split_pci") or [])
     items = v if isinstance(v, (list, tuple)) else str(v).split(",") if isinstance(v, (str, int)) else None
-    vals = []
+    vals: list[int] = []
     for x in items or []:
         try:
             if isinstance(x, bool) or isinstance(x, float):
                 raise ValueError
             vals.append(int(str(x).strip()))
         except ValueError:
-            vals = None
+            vals = []
             break
     want = max(n - 1, 1)
     example = ",".join(str(round(48 * (i + 1) / (want + 1))) for i in range(want))
     hint = (f'"layer_split" is the first layer of each later GPU, one rising number per GPU after the first '
-            f'({want} for {n} GPUs), not a count of layers per card - e.g. "{example}" (or [{example.replace(",", ", ")}])'
-            f' for an even share of 48 layers, or "auto" (the default) to place them by each card\'s free VRAM')
+            f'({want} for {n} GPUs), not a count of layers per card - e.g. "{example}" '
+            f'(or [{example.replace(",", ", ")}]) for an even share of 48 layers, or "auto" (the default) to place '
+            'them by each card\'s free VRAM')
     if not vals:
         raise ValueError(f"{hint}; got {v!r}")
     if n > 1 and len(vals) != n - 1:
@@ -5502,7 +5503,8 @@ class Server(ThreadingHTTPServer):
         super().server_close()
 
 
-DESKTOP_FREE_MIB = 2048          # upstream #560 #516: below this, an AMD card that also drives a Linux desktop can run out
+# upstream #560 #516: below this, an AMD card that also drives a Linux desktop can run out
+DESKTOP_FREE_MIB = 2048
 DESKTOP_RESERVE_MIB = 3072       # what kept KDE/Wayland alive beside a full expert cache in both reports
 
 
@@ -6097,7 +6099,7 @@ def main() -> int:
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(amd_card(cfg.get("gpu_pci")), engine.info.get("vram_free_mib"), engine_args(cfg),
                                  linux_desktop())
-        if note:                                        # upstream #560 #516: before --open starts a browser on that card
+        if note:                                        # upstream #560 #516: before --open starts a browser there
             print(note, flush=True)
     else:
         effort_end = None

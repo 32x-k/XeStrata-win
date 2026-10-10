@@ -13,7 +13,7 @@ static int failed = 0;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); ++failed; } } while (0)
 
 int main() {
-    const long long pairs = 48 * 512;
+    const long long pairs = 48LL * 512;
     CHECK(default_share_has_work(pairs - 1, pairs));       // one expert streams: the share has something to take
     CHECK(default_share_has_work(1500, pairs));            // a 12 GB card: most of them stream
     CHECK(!default_share_has_work(pairs, pairs));          // every expert resident: nothing to take

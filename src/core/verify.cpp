@@ -96,10 +96,10 @@ struct RouteResidentCfg {
                     if (c.blocks.size() > 1) std::snprintf(who, sizeof who, " (GPU %d)", kv.first);
                     std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T>8 (prompt reads): tail_nonres=%llu "
                                          "swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
-                                 who, c.margin, c.lo, c.hi, h[0], h[1], h[0] ? 100.0 * h[1] / h[0] : 0.0, h[2], h[3]);
+                                 who, c.margin, c.lo, c.hi, h[0], h[1], h[0] ? 100.0 * (double) h[1] / (double) h[0] : 0.0, h[2], h[3]);
                     std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T<=8 (decode): tail_nonres=%llu "
                                          "swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
-                                 who, c.margin, c.lo, c.hi, h[4], h[5], h[4] ? 100.0 * h[5] / h[4] : 0.0, h[6], h[7]);
+                                 who, c.margin, c.lo, c.hi, h[4], h[5], h[4] ? 100.0 * (double) h[5] / (double) h[4] : 0.0, h[6], h[7]);
                 }
             });
         }
@@ -110,8 +110,16 @@ struct RouteResidentCfg {
 RouteResidentCfg& route_resident_cfg() {
     static RouteResidentCfg c;
     static const bool parsed = [] {
-        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) c.margin = (float) std::atof(v);
-        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &c.lo, &c.hi);
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) c.margin = (float) std::strtod(v, nullptr);
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) {   // lo-hi
+            char* end = nullptr;
+            const long lo = std::strtol(v, &end, 10);
+            if (end != v && *end == '-') {
+                const char* h = end + 1;
+                const long hi = std::strtol(h, &end, 10);
+                if (end != h) { c.lo = (int) lo; c.hi = (int) hi; }
+            }
+        }
         return true;
     }();
     (void) parsed;
@@ -1068,7 +1076,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         }
         // STRATA_ROUTE_PRIOR=lambda (upstream 2de9ae06, opt-in, changes the output): the top-10 picked again with a
         // logit bonus for the resident experts; the weights stay the router's (router.cpp)
-        static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
+        static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::strtod(v, nullptr) : 0.0f; }();
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
             try {
                 route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);

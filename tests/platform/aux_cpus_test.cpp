@@ -35,6 +35,7 @@ std::vector<LogicalCpu> cpus(std::initializer_list<std::array<long, 3>> rows) {
 // SMT machine: CPU i and i + n are the two threads of core i
 std::vector<LogicalCpu> smt(int n_cores, int n_threads_total) {
     std::vector<LogicalCpu> out;
+    out.reserve((size_t) n_threads_total);
     for (int c = 0; c < n_threads_total; ++c) out.push_back({c, 0, c % n_cores});
     return out;
 }
@@ -63,6 +64,7 @@ void test_derive() {
     // are cores 0-15 and 22-29 the second threads of cores 0-7: the host's sibling (CPU 24) is the only spare one
     {
         std::vector<LogicalCpu> a;
+        a.reserve(24);
         for (int c = 0; c < 16; ++c) a.push_back({c, 0, c});
         for (int c = 22; c < 30; ++c) a.push_back({c, 0, c - 22});
         V workers;

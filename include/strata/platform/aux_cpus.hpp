@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <set>
@@ -202,7 +203,7 @@ inline std::vector<int> task_ids() {
     std::vector<int> ids;
     if (DIR* d = opendir("/proc/self/task")) {
         while (const dirent* e = readdir(d))
-            if (e->d_name[0] >= '0' && e->d_name[0] <= '9') ids.push_back(std::atoi(e->d_name));
+            if (e->d_name[0] >= '0' && e->d_name[0] <= '9') ids.push_back((int) std::strtol(e->d_name, nullptr, 10));
         closedir(d);
     }
     return ids;
@@ -302,13 +303,17 @@ inline std::vector<LogicalCpu> read_topology(const std::vector<int>& cpus) {
         char path[96];
         std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/%s", cpu, what);
         long v = -1;
-        if (std::FILE* f = std::fopen(path, "r")) {
-            if (std::fscanf(f, "%ld", &v) != 1) v = -1;
-            std::fclose(f);
+        std::ifstream f(path);
+        std::string text;
+        if (f >> text) {
+            char* end = nullptr;
+            const long r = std::strtol(text.c_str(), &end, 10);
+            if (end != text.c_str()) v = r;
         }
         return v;
     };
     std::vector<LogicalCpu> out;
+    out.reserve(cpus.size());
     for (int c : cpus) out.push_back({c, read_id(c, "physical_package_id"), read_id(c, "core_id")});
     return out;
 }

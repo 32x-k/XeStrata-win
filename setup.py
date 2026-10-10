@@ -1164,8 +1164,8 @@ def whole_shard(s: Path) -> bool:
     from gguf_reader import GGUFFile
     try:
         g = GGUFFile(s)
-        return s.stat().st_size >= g.data_start + max((t.offset + (t.expected_bytes() or 0) for t in g.tensors),
-                                                     default=0)
+        end = max((t.offset + (t.expected_bytes() or 0) for t in g.tensors), default=0)
+        return s.stat().st_size >= g.data_start + end
     except (OSError, ValueError, struct.error):
         return False
 
@@ -1228,9 +1228,12 @@ def gguf_dir_problem(folder: Path, first: Path, fam: dict, model: str) -> tuple 
         return f"{first.name} is {bad}, a GGUF XeStrata cannot run", SUPPORTED_GGUFS
     if first.exists():
         return None
+
+    def first_shard(name: str) -> bool:                 # not split, or the first shard of a split
+        m = SHARD_NAME.search(name)
+        return m is None or m.group(1) == "00001"
     firsts = sorted(p.name for p in folder.glob("*.gguf")
-                    if not p.name.lower().startswith("mmproj") and (not SHARD_NAME.search(p.name)
-                                                                     or SHARD_NAME.search(p.name).group(1) == "00001"))
+                    if not p.name.lower().startswith("mmproj") and first_shard(p.name))
     usable = list(dict.fromkeys(c for c in map(gguf_choice, firsts) if c))
     unusable = [n for n in firsts if gguf_unsupported(n)]
     if not usable and not unusable:
@@ -2479,7 +2482,7 @@ def linux_core_classes(sys_root: str = "/sys"):
     one under 90% of the largest - Turbo Boost Max 3.0 gives the "favored" P-cores a slightly higher capacity (1024
     against 1012), so "below the maximum" counted 2 of a Core Ultra 7 270K Plus's 8 P-cores."""
     pmu = linux_hybrid_pmu(sys_root + "/devices")
-    seen = {}
+    seen: dict = {}
     for cpu in sorted((Path(sys_root) / "devices" / "system" / "cpu").glob("cpu[0-9]*"), key=lambda p: int(p.name[3:])):
         cap = cpu / "cpu_capacity"
         pkg, core = cpu / "topology" / "physical_package_id", cpu / "topology" / "core_id"
@@ -2500,7 +2503,7 @@ def linux_core_classes(sys_root: str = "/sys"):
 
 def cpulist(text: str) -> set:
     """A kernel cpulist ("0-7,16") as a set of CPU numbers."""
-    out = set()
+    out: set = set()
     for part in text.strip().split(","):
         lo, _, hi = part.strip().partition("-")
         if lo.isdigit():
@@ -2509,8 +2512,8 @@ def cpulist(text: str) -> set:
 
 
 def linux_hybrid_pmu(root: str = "/sys/devices"):
-    """upstream #798: (P-core CPUs, E-core CPUs) from Intel's hybrid PMU lists (cpu_core/cpus, cpu_atom/cpus), or None on a CPU
-    that has no such lists."""
+    """upstream #798: (P-core CPUs, E-core CPUs) from Intel's hybrid PMU lists (cpu_core/cpus, cpu_atom/cpus), or None
+    on a CPU that has no such lists."""
     try:
         p = cpulist((Path(root) / "cpu_core" / "cpus").read_text(encoding="utf-8"))
         e = cpulist((Path(root) / "cpu_atom" / "cpus").read_text(encoding="utf-8"))
@@ -2520,12 +2523,12 @@ def linux_hybrid_pmu(root: str = "/sys/devices"):
 
 
 def hybrid_pool_workers(cores) -> int | None:
-    """upstream #642 (Hardin22's measurement): on a hybrid CPU the expert pool runs best on the P-cores but the host loop's one
-    plus HALF of the E-cores - an E-core runs the expert kernels ~2.2x slower and each layer waits for its slowest
-    part (i9-14900KF, 8P + 16E: 15 workers decoded 165 / 116 tok/s against 106 / 84 with all 23).  Only on a CPU with
-    more E-cores than P-cores: on an i7-13700KF (8P + 8E, docs/AMD_HIP.md's gfx1030 report) all 15 workers decoded
-    38-42 tok/s against 36 with 8, so there the engine's own count stays.  None: the engine's own default (one worker
-    per physical core but the host's) stays."""
+    """upstream #642 (Hardin22's measurement): on a hybrid CPU the expert pool runs best on the P-cores but the host
+    loop's one plus HALF of the E-cores - an E-core runs the expert kernels ~2.2x slower and each layer waits for its
+    slowest part (i9-14900KF, 8P + 16E: 15 workers decoded 165 / 116 tok/s against 106 / 84 with all 23). Only on a
+    CPU with more E-cores than P-cores: on an i7-13700KF (8P + 8E, docs/AMD_HIP.md's gfx1030 report) all 15 workers
+    decoded 38-42 tok/s against 36 with 8, so there the engine's own count stays. None: the engine's own default
+    (one worker per physical core but the host's) stays."""
     if not cores:
         return None
     p, e = cores
@@ -2548,11 +2551,12 @@ def recommend_pool_workers(args: list) -> list:
 
 def linux_sockets(sys_root: str = "/sys"):
     """(sockets, physical cores per socket) from the kernel's topology files, or None when they do not say."""
-    cores = {}
+    cores: dict = {}
     for cpu in (Path(sys_root) / "devices" / "system" / "cpu").glob("cpu[0-9]*"):
         pkg, core = cpu / "topology" / "physical_package_id", cpu / "topology" / "core_id"
         try:
-            cores.setdefault(pkg.read_text(encoding="utf-8").strip(), set()).add(core.read_text(encoding="utf-8").strip())
+            socket = pkg.read_text(encoding="utf-8").strip()
+            cores.setdefault(socket, set()).add(core.read_text(encoding="utf-8").strip())
         except OSError:
             return None
     return (len(cores), min(len(c) for c in cores.values())) if cores else None
@@ -3770,7 +3774,7 @@ def main() -> int:
         if s.exists() and not done(s) and whole_shard(s):
             try:
                 mark(s, "whole (checked against its own tensor directory)")
-            except OSError as e:                       # a read-only folder (--gguf-dir on a share): the file is still whole
+            except OSError as e:                       # a read-only folder (--gguf-dir on a share): still whole
                 warn(f"{s.name} is whole but its finish mark cannot be written ({e})")
     have_model = all(s.exists() and (done(s) or a.gguf_dir) for s in shards)
     # upstream #425: a download that resumes needs room only for what is still missing - the finished shards and the
@@ -4059,7 +4063,7 @@ def main() -> int:
         import calibrate as CAL
         cfg["args"] = CAL.apply(cfg["args"], cal.get("settings") or {})
         ok("the settings tuned for this PC earlier are used" + (f" ({cal['date']})" if cal.get("date") else ""))
-    else:                                              # upstream #642: measured counts (a calibration) win over the rule
+    else:                                              # upstream #642: a calibration's measured count wins
         cfg["args"] = recommend_pool_workers(cfg["args"])
         for line in two_socket_note(linux_sockets()):  # tips: text only, the config is not touched
             say("  " + line)

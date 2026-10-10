@@ -1678,7 +1678,7 @@ int tail_skip_rank() {
     int r = g_tail_skip_rank.load(std::memory_order_relaxed);
     if (r < 0) {
         const char* v = std::getenv("STRATA_ROUTE_TAIL_SKIP");
-        r = v != nullptr ? std::atoi(v) : 0;
+        r = v != nullptr ? (int) std::strtol(v, nullptr, 10) : 0;
         r = r > 0 && r < 10 ? r : 0;
         g_tail_skip_rank.store(r, std::memory_order_relaxed);
     }

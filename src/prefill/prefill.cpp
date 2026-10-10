@@ -286,7 +286,7 @@ struct Stager {
             threads.emplace_back([this] {
                 // --aux-cpus: the copy threads go to the spare CPUs with the other helpers; STRATA_AUX_STAGER=0 leaves them where
                 // they were created (a small spare set would then hold all of them: it limits the copy rate of a long read)
-                static const bool keep = [] { const char* v = std::getenv("STRATA_AUX_STAGER"); return v != nullptr && std::atoi(v) == 0; }();
+                static const bool keep = [] { const char* v = std::getenv("STRATA_AUX_STAGER"); return v != nullptr && std::strtol(v, nullptr, 10) == 0; }();
                 if (keep) strata::aux_cpus::note_owned_thread();
                 else strata::aux_cpus::pin_current_thread();
                 work();
@@ -1804,7 +1804,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                     return false;
                                 }
                         cpu_set = (int) (i & 1);
-                        strata::gpu::event_record(m.cpu_wall[2 * cpu_set], m.cs);
+                        strata::gpu::event_record(m.cpu_wall[(size_t) 2 * cpu_set], m.cs);
                     }
                     if (cpu_maybe && cpu_arm) {   // the MoE input, for the CPU's experts
                         const size_t want = (size_t) T * N;
@@ -1852,7 +1852,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                     if (m.pend_wall) {   // the last eligible layer's wall, and its ratio to the one before it
                         float w_ms = 0;
-                        if (strata::gpu::event_elapsed_ms(&w_ms, m.cpu_wall[2 * m.pend_set], m.cpu_wall[2 * m.pend_set + 1])) {
+                        if (strata::gpu::event_elapsed_ms(&w_ms, m.cpu_wall[(size_t) 2 * m.pend_set], m.cpu_wall[(size_t) 2 * m.pend_set + 1])) {
                             const double w = w_ms / (double) m.pend_wall_n;
                             if (m.last_arm != 0 && m.last_arm != m.pend_wall && m.pend_l > m.last_l) {   // same chunk
                                 std::rotate(m.cpu_ratio, m.cpu_ratio + 1, m.cpu_ratio + Impl::CPU_RATIOS);
@@ -2342,7 +2342,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                     // no reading from a layer the share could not change (nothing taken) or with one-time costs
                     if (cpu_set >= 0 && n_stream > 0 && (!cpu_arm || n_cpu > 0) && !cpu_cold) {
-                        strata::gpu::event_record(m.cpu_wall[2 * cpu_set + 1], m.cs);
+                        strata::gpu::event_record(m.cpu_wall[(size_t) 2 * cpu_set + 1], m.cs);
                         m.pend_wall = cpu_arm ? 2 : 1;
                         m.pend_set = cpu_set;
                         m.pend_l = (int) l;

@@ -1926,7 +1926,8 @@ class VisionSection(unittest.TestCase):
 
 
 class LayerSplit(unittest.TestCase):
-    """upstream #644: "layer_split" is the first layer of each later GPU; a list is accepted, counts per card are not."""
+    """upstream #644: "layer_split" is the first layer of each later GPU; a list is accepted, counts per card are
+    not."""
 
     def cfg(self, split, gpus=(2, 0, 1, 3)):
         c = {"args": ["--native", "x"], "gpu": list(gpus)}
