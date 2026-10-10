@@ -470,6 +470,22 @@ struct Prefill::Impl {
     bool cpu_pend = false;
     double pend_cpu_ms = 0;
     int64_t pend_n_cpu = 0, pend_n_gpu = 0;
+    // ... and whether sharing pays at all (auto, upstream f2a3b946, #1282): an eligible layer's wall time per
+    // non-resident expert, from before its routing sync to its combine (events, two sets: a layer's start is recorded
+    // before the last one's is read); two adjacent layers of the two arms give a ratio (with / without), and the median
+    // of the last CPU_RATIOS decides.  Layers differ up to 8x in that cost, the same in every run, which is why adjacent
+    // layers are compared rather than a running mean per arm.
+    static constexpr int CPU_RATIOS = 5;
+    int64_t cpu_layers = 0;     // the eligible layers so far (the arms' schedule)
+    int64_t cpu_first_l = -1;   // the model's first eligible layer: 2x the others' cost in both arms, never read
+    strata::gpu::Event* cpu_wall[4] = {};
+    int pend_wall = 0, pend_set = 0, pend_l = 0;   // pend_wall 1: the last eligible layer ran without the share, 2: with
+    int64_t pend_wall_n = 0;
+    int last_arm = 0, last_l = 0;
+    double last_w = 0;
+    double cpu_ratio[CPU_RATIOS] = {};
+    int cpu_nratio = 0;
+    bool cpu_gate = false;   // the median ratio is below 1: the layers that share are the cheaper ones
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
     float* hand[2] = {};
@@ -530,6 +546,8 @@ void Prefill::release() {
     for (float* p : {impl_->cpu_x, impl_->cpu_rows})
         if (p) strata::gpu::free(p);
     for (strata::gpu::Event* e : impl_->cpu_ev)
+        if (e) strata::gpu::event_destroy(e);
+    for (strata::gpu::Event* e : impl_->cpu_wall)
         if (e) strata::gpu::event_destroy(e);
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) strata::gpu::event_destroy(impl_->copied[i]);
@@ -1751,9 +1769,36 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const strata::kernels::cpu::ExpertLayout& lay_c = strata::kernels::cpu::expert_layout();
                     const bool cpu_maybe = cpu_pool_ != nullptr && cpu_share_on() && !stream_all && m.src != nullptr &&
                                            lay_c.native && !lay_c.fmt.empty();
-                    if (cpu_maybe) {   // the MoE input, for the CPU's experts
+                    bool cpu_arm = true;     // auto: this layer may share (false: the arm without)
+                    int cpu_set = -1;        // auto: the wall events' set, -1 when not measured
+                    bool cpu_cold = false;   // auto: one-time costs in the window (no reading)
+                    // auto shares only while the layers that share cost less per non-resident expert than their
+                    // neighbours that do not.  #1282 (upstream, RX 7900 GRE + 5700X3D): every share lost, auto's 0.47 by
+                    // 4.5%, the host's issue time per streamed expert rising 107 -> 200 us with the CPU busy - a cost
+                    // g / (c + g) cannot see, as both sides are measured with the share on.  The first eligible layers
+                    // alternate, without first, until CPU_MIN_RATIOS ratios are in; then the cheaper arm, and every
+                    // CPU_PROBE-th layer the other one (a prime: the probes move across the layers from one chunk to the
+                    // next), so both stay measured.
+                    if (cpu_maybe && cpu_share_env() < 0.0) {
+                        constexpr int64_t CPU_PROBE = 29;
+                        constexpr int CPU_MIN_RATIOS = 3;
+                        const int64_t i = m.cpu_layers++;
+                        cpu_arm = m.cpu_nratio < CPU_MIN_RATIOS ? (i & 1) != 0 : (i % CPU_PROBE == 0) != m.cpu_gate;
+                        if (m.cpu_first_l < 0) m.cpu_first_l = l;
+                        cpu_cold = l == m.cpu_first_l;
+                        if (m.cpu_wall[0] == nullptr)
+                            for (strata::gpu::Event*& e : m.cpu_wall)
+                                if (!strata::gpu::event_create(&e, true)) {
+                                    err = "prefill: CPU share events";
+                                    return false;
+                                }
+                        cpu_set = (int) (i & 1);
+                        strata::gpu::event_record(m.cpu_wall[2 * cpu_set], m.cs);
+                    }
+                    if (cpu_maybe && cpu_arm) {   // the MoE input, for the CPU's experts
                         const size_t want = (size_t) T * N;
                         if (m.cpu_x_n < want) {
+                            cpu_cold = true;
                             if (m.cpu_x) strata::gpu::free(m.cpu_x);
                             m.cpu_x_n = 0;
                             if (!strata::gpu::alloc_host(&m.cpu_x, want * sizeof(float))) {
@@ -1777,6 +1822,30 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             m.cpu_share_now = std::clamp(m.cpu_g_ms / (m.cpu_c_ms + m.cpu_g_ms), 0.05, 0.9);
                         }
                     }
+                    if (m.pend_wall) {   // the last eligible layer's wall, and its ratio to the one before it
+                        float w_ms = 0;
+                        if (strata::gpu::event_elapsed_ms(&w_ms, m.cpu_wall[2 * m.pend_set], m.cpu_wall[2 * m.pend_set + 1])) {
+                            const double w = w_ms / (double) m.pend_wall_n;
+                            if (m.last_arm != 0 && m.last_arm != m.pend_wall && m.pend_l > m.last_l) {   // same chunk
+                                std::rotate(m.cpu_ratio, m.cpu_ratio + 1, m.cpu_ratio + Impl::CPU_RATIOS);
+                                m.cpu_ratio[Impl::CPU_RATIOS - 1] = m.pend_wall == 2 ? w / m.last_w : m.last_w / w;
+                                m.cpu_nratio = std::min(m.cpu_nratio + 1, Impl::CPU_RATIOS);
+                                double v[Impl::CPU_RATIOS];
+                                std::copy(m.cpu_ratio + Impl::CPU_RATIOS - m.cpu_nratio, m.cpu_ratio + Impl::CPU_RATIOS, v);
+                                std::nth_element(v, v + m.cpu_nratio / 2, v + m.cpu_nratio);   // even: the upper one
+                                m.cpu_gate = v[m.cpu_nratio / 2] < 1.0;
+                            }
+                            // debug: STRATA_DBG_CPU_GATE=1 prints each reading and what the next layers do
+                            if (static const bool dbg = std::getenv("STRATA_DBG_CPU_GATE") != nullptr; dbg)
+                                std::fprintf(stderr, "cpu gate: layer %d %s, %lld non-resident, %.2f ms (%.4f a expert) -> %s\n",
+                                             m.pend_l, m.pend_wall == 2 ? "shared" : "not shared", (long long) m.pend_wall_n,
+                                             w_ms, w, m.cpu_gate ? "share" : "do not share");
+                            m.last_arm = m.pend_wall;
+                            m.last_l = m.pend_l;
+                            m.last_w = w;
+                        }
+                        m.pend_wall = 0;
+                    }
                     std::fill(m.cnt.begin(), m.cnt.end(), 0);
                     for (int64_t i = 0; i < T * K; ++i) {
                         const int32_t e = m.ids_host[(size_t) i];
@@ -1797,7 +1866,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             if (c <= strata::kernels::cpu::MAXT && m.src->pinned(l, e)) cand.emplace_back(c, e);
                         }
                         std::sort(cand.begin(), cand.end());
-                        const double share = cpu_share_env() >= 0.0 ? cpu_share_env() : m.cpu_share_now;
+                        const double share = cpu_share_env() >= 0.0 ? cpu_share_env() : cpu_arm ? m.cpu_share_now : 0.0;
                         const size_t take = std::min(cand.size(), (size_t) std::llround(share * (double) n_stream));
                         if (take > 0) {
                             on_cpu.assign((size_t) m.g->n_expert, 0);
@@ -1861,6 +1930,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (rows_cpu > 0) {
                         const size_t want = (size_t) rows_cpu * N;
                         if (m.cpu_rows_n < want) {
+                            cpu_cold = true;
                             if (m.cpu_rows) strata::gpu::free(m.cpu_rows);
                             m.cpu_rows_n = 0;
                             const size_t cap_rows = (size_t) rows_cpu * 2;   // headroom: few reallocations
@@ -2243,6 +2313,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                          "%lld streamed experts (share %.2f)\n", (long long) n_cpu, (long long) n_stream,
                                          stats_.cpu_share);
                         }
+                    }
+                    // no reading from a layer the share could not change (nothing taken) or with one-time costs
+                    if (cpu_set >= 0 && n_stream > 0 && (!cpu_arm || n_cpu > 0) && !cpu_cold) {
+                        strata::gpu::event_record(m.cpu_wall[2 * cpu_set + 1], m.cs);
+                        m.pend_wall = cpu_arm ? 2 : 1;
+                        m.pend_set = cpu_set;
+                        m.pend_l = (int) l;
+                        m.pend_wall_n = n_stream;
                     }
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
