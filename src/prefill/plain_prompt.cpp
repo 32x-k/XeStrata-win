@@ -38,118 +38,27 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
-#include <type_traits>
 #include <vector>
 
 namespace strata::core {
 
 namespace k = strata::kernels;
 
-/// The prompt path's buffers, sized for chunks of T tokens.
-struct PlainModel::Prompt {
-    static constexpr int kGroup = 8;   ///< experts dequantized and multiplied in one grouped product
-    int64_t T = 0;
+/// The products' state: Gemm over the dequantization scratch carved with the other buffers.
+struct PlainModel::PromptGemm {
     prefill::Gemm gemm;
-    std::vector<void*> dev;            ///< every device allocation
-    void* host_block = nullptr;        ///< the pinned host staging, one allocation
-    // device
-    float *x = nullptr, *hn = nullptr, *mix = nullptr;
-    uint16_t* x16 = nullptr;           ///< T rows of the widest projection input, FP16
-    float *qkv = nullptr, *z = nullptr, *ab = nullptr, *gate = nullptr, *beta = nullptr, *h = nullptr, *y = nullptr;
-    uint16_t* y16 = nullptr;
-    float *qfull = nullptr, *qcur = nullptr, *kraw = nullptr, *kcur = nullptr, *vcur = nullptr, *attn = nullptr,
-          *attn32 = nullptr;
-    int32_t *steps = nullptr, *pos_q = nullptr, *pos_k = nullptr;
-    float *rlog = nullptr, *w = nullptr, *shared = nullptr, *sh_g = nullptr, *sh_gate = nullptr, *sh_up = nullptr;
-    int32_t* ids = nullptr;
-    uint16_t* xs16 = nullptr;          ///< the routed rows grouped by expert, FP16 [T * K, n_embd]
-    float *gu = nullptr, *hh = nullptr, *dm = nullptr, *parts = nullptr, *moe_out = nullptr;
-    uint16_t* h16 = nullptr;
-    int32_t *src = nullptr, *slot = nullptr, *bounds = nullptr;
-    uint16_t *dq_gu = nullptr, *dq_d = nullptr;   ///< kGroup experts' FP16 weights
-    uint8_t* stage = nullptr;          ///< kGroup expert blobs copied from RAM
-    // pinned host
-    float* emb = nullptr;              ///< T rows of n_embd
-    int32_t *h_steps = nullptr, *h_pos = nullptr, *h_ids = nullptr, *h_src = nullptr, *h_slot = nullptr,
-            *h_bounds = nullptr;
-    int64_t gu_elems = 0, d_elems = 0;
 };
 
-void PlainModel::prompt_free(Prompt* p) {
-    if (p == nullptr) return;
-    for (void* d : p->dev) strata::gpu::free(d);
-    strata::gpu::free(p->host_block);
-    delete p;
-}
-
-bool PlainModel::prompt_init(std::string& err) {
-    if (prompt_) return true;
-    const ModelSpec& s = spec_;
-    const auto& lay = k::cpu::expert_layout();
-    const int64_t T = opt_.prompt_chunk, N = s.n_embd, NH = s.n_head, HD = s.key_length, NKV = nkv_;
-    const int64_t HV = s.ssm_dt_rank, ZV = s.ssm_d_inner, C = 2 * s.ssm_n_group * s.ssm_d_state + ZV;
-    const int64_t E = s.n_expert, K = s.n_expert_used, FS = s.n_ff_shexp, FF = s.n_ff_exp;
-    if (T < 1 || T > 65535 / std::max<int64_t>(NH, 1)) { err = "plain prompt: the chunk is out of range"; return false; }
-    std::unique_ptr<Prompt, void (*)(Prompt*)> p(new Prompt, &PlainModel::prompt_free);
-    p->T = T;
-    bool ok = true;
-    auto dev = [&](auto** ptr, uint64_t bytes) {
-        void* d = nullptr;
-        if (ok && strata::gpu::alloc_device(&d, (size_t) std::max<uint64_t>(bytes, 256))) {
-            p->dev.push_back(d);
-            *ptr = (std::remove_reference_t<decltype(*ptr)>) d;
-        } else {
-            ok = false;
-        }
-    };
-    const uint64_t TK = (uint64_t) (T * K), max_in = (uint64_t) std::max<int64_t>({N, ZV, NH * HD, FS, FF});
-    const int64_t qw = (has_gate_ ? 2 : 1) * NH * HD;
-    dev(&p->x, T * N * 4); dev(&p->hn, T * N * 4); dev(&p->mix, T * N * 4); dev(&p->x16, T * max_in * 2);
-    dev(&p->qkv, T * C * 4); dev(&p->z, T * ZV * 4); dev(&p->ab, T * 2 * HV * 4); dev(&p->gate, T * HV * 4);
-    dev(&p->beta, T * HV * 4); dev(&p->h, T * C * 4); dev(&p->y, T * ZV * 4); dev(&p->y16, T * ZV * 2);
-    dev(&p->qfull, T * qw * 4); dev(&p->qcur, T * NH * HD * 4); dev(&p->kraw, T * NKV * HD * 4);
-    dev(&p->kcur, T * NKV * HD * 4); dev(&p->vcur, T * NKV * HD * 4); dev(&p->attn, T * NH * HD * 4);
-    dev(&p->attn32, T * NH * HD * 4);
-    dev(&p->steps, T * k::kStepCount * 4); dev(&p->pos_q, T * NH * 4); dev(&p->pos_k, T * NKV * 4);
-    dev(&p->rlog, T * E * 4); dev(&p->ids, TK * 4); dev(&p->w, TK * 4); dev(&p->shared, T * N * 4);
-    dev(&p->sh_g, (T + 4) * 4); dev(&p->sh_gate, T * FS * 4); dev(&p->sh_up, T * FS * 4);
-    dev(&p->xs16, TK * N * 2); dev(&p->gu, TK * 2 * FF * 4); dev(&p->hh, TK * FF * 4); dev(&p->h16, TK * FF * 2);
-    dev(&p->dm, TK * N * 4); dev(&p->parts, TK * N * 4); dev(&p->moe_out, T * N * 4);
-    dev(&p->src, TK * 4); dev(&p->slot, TK * 4); dev(&p->bounds, (E + 1) * 4);
-    p->gu_elems = 2 * FF * N;
-    p->d_elems = N * FF;
-    dev(&p->dq_gu, (uint64_t) Prompt::kGroup * p->gu_elems * 2);
-    dev(&p->dq_d, (uint64_t) Prompt::kGroup * p->d_elems * 2);
-    dev(&p->stage, (uint64_t) Prompt::kGroup * lay.max_blob);
-    if (!ok) { err = "plain prompt: no VRAM for chunks of " + std::to_string(T) + " tokens"; return false; }
-    {   // the pinned host staging, carved from one block
-        const uint64_t parts[] = {(uint64_t) T * N * 4, (uint64_t) T * k::kStepCount * 4, (uint64_t) T * (NH + NKV) * 4,
-                                  TK * 4, TK * 4, TK * 4, (uint64_t) (E + 1) * 4};
-        uint64_t total = 0;
-        for (uint64_t b : parts) total += (b + 255) & ~255ull;
-        if (!strata::gpu::alloc_host(&p->host_block, total)) { err = "plain prompt: pinned staging"; return false; }
-        uint8_t* q = (uint8_t*) p->host_block;
-        void* out[7];
-        for (int i = 0; i < 7; ++i) { out[i] = q; q += (parts[i] + 255) & ~255ull; }
-        p->emb = (float*) out[0];
-        p->h_steps = (int32_t*) out[1];
-        p->h_pos = (int32_t*) out[2];
-        p->h_ids = (int32_t*) out[3];
-        p->h_src = (int32_t*) out[4];
-        p->h_slot = (int32_t*) out[5];
-        p->h_bounds = (int32_t*) out[6];
-    }
-    // the dequantization scratch of Gemm::native: the largest dense weight, in row slices past 32M values
-    if (!p->gemm.init(cs_, (int64_t) 1 << 25, err)) return false;
-    prompt_ = std::move(p);
-    return true;
-}
+void PlainModel::prompt_gemm_free(PromptGemm* g) { delete g; }
 
 bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err) {
-    if (opt_.prompt_chunk <= 0 || n <= 0) { err.clear(); return false; }
+    if (opt_.prompt_chunk <= 0 || n <= 0 || prompt_dev_ == nullptr) { err.clear(); return false; }
     if (pos < 0 || pos + n > opt_.max_cells) { err = "plain prompt: past the context"; return false; }
-    if (!prompt_init(err)) return false;
-    Prompt& P = *prompt_;
+    if (!prompt_gemm_) {
+        prompt_gemm_ = std::unique_ptr<PromptGemm, void (*)(PromptGemm*)>(new PromptGemm, &PlainModel::prompt_gemm_free);
+        prompt_gemm_->gemm.init_external(cs_, pb_.gemm_scratch, pb_.gemm_elems);
+    }
+    PromptBufs& P = pb_;
     const ModelSpec& s = spec_;
     const auto& lay = k::cpu::expert_layout();
     const int64_t N = s.n_embd, NH = s.n_head, HD = s.key_length, NKV = nkv_, HV = s.ssm_dt_rank, HK = s.ssm_n_group;
@@ -163,7 +72,7 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     }();
     const k::RopeScaling& rs = k::rope_scaling();
     strata::gpu::Stream cs = cs_;
-    prefill::Gemm& gm = P.gemm;
+    prefill::Gemm& gm = prompt_gemm_->gemm;
     auto f16 = [&](const float* x, int64_t rows, int64_t cols) { prefill::to_f16(x, P.x16, rows * cols, cs); };
     auto proj = [&](const W& w, float* y, int64_t T, int64_t ldy = 0) {
         gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
@@ -290,8 +199,8 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                 const bool transient = src_->transient(ml, experts.empty() ? 0 : experts[0]);
                 int64_t max_rows = 0;
                 for (int32_t e : experts) max_rows = std::max<int64_t>(max_rows, count[(size_t) e]);
-                for (size_t g0 = 0; g0 < experts.size(); g0 += Prompt::kGroup) {
-                    const int G = (int) std::min<size_t>(Prompt::kGroup, experts.size() - g0);
+                for (size_t g0 = 0; g0 < experts.size(); g0 += PromptBufs::kGroup) {
+                    const int G = (int) std::min<size_t>(PromptBufs::kGroup, experts.size() - g0);
                     if (transient && !strata::gpu::stream_sync(cs)) {   // the staging's last readers are done
                         err = std::string("plain prompt: ") + strata::gpu::last_error();
                         return false;

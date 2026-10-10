@@ -42,6 +42,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <type_traits>
 #include <utility>
 
 namespace strata::core {
@@ -73,7 +74,9 @@ PlainModel::PlainModel() = default;
 
 PlainModel::~PlainModel() {
     if (cs_ != nullptr) strata::gpu::stream_sync(cs_);
-    prompt_.reset();   // its buffers before the stream and the weights
+    prompt_gemm_.reset();   // the products' state before the stream
+    strata::gpu::free(prompt_dev_);
+    strata::gpu::free(prompt_host_);
     for (auto* g : exec_) strata::gpu::graph_destroy(g);
     for (auto& v : segs_)
         for (auto* g : v) strata::gpu::graph_destroy(g);
@@ -352,6 +355,52 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     return reset(err);
 }
 
+void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* host, uint64_t& dev_bytes,
+                              uint64_t& host_bytes) const {
+    const ModelSpec& s = spec_;
+    const auto& lay = k::cpu::expert_layout();
+    const uint64_t N = (uint64_t) s.n_embd, NH = (uint64_t) s.n_head, HD = (uint64_t) s.key_length, NKV = (uint64_t) nkv_;
+    const uint64_t HV = (uint64_t) s.ssm_dt_rank, ZV = (uint64_t) s.ssm_d_inner;
+    const uint64_t C = (uint64_t) (2 * s.ssm_n_group * s.ssm_d_state) + ZV, E = (uint64_t) s.n_expert;
+    const uint64_t K = (uint64_t) s.n_expert_used, FS = (uint64_t) s.n_ff_shexp, FF = (uint64_t) s.n_ff_exp;
+    const uint64_t U = (uint64_t) T, TK = U * K, QW = (has_gate_ ? 2u : 1u) * NH * HD;
+    const uint64_t max_in = std::max<uint64_t>({N, ZV, NH * HD, FS, FF});
+    b.T = T;
+    b.gu_elems = (int64_t) (2 * FF * N);
+    b.d_elems = (int64_t) (N * FF);
+    b.gemm_elems = (int64_t) 1 << 25;   // the largest dense weight dequantized at once (Gemm::native slices past it)
+    uint64_t at = 0;
+    auto take = [&](auto*& ptr, uint64_t bytes) {
+        ptr = dev ? (std::remove_reference_t<decltype(ptr)>) (dev + at) : nullptr;
+        at += (std::max<uint64_t>(bytes, 1) + 255) & ~255ull;
+    };
+    take(b.x, U * N * 4); take(b.hn, U * N * 4); take(b.mix, U * N * 4); take(b.x16, U * max_in * 2);
+    take(b.qkv, U * C * 4); take(b.z, U * ZV * 4); take(b.ab, U * 2 * HV * 4); take(b.gate, U * HV * 4);
+    take(b.beta, U * HV * 4); take(b.h, U * C * 4); take(b.y, U * ZV * 4); take(b.y16, U * ZV * 2);
+    take(b.qfull, U * QW * 4); take(b.qcur, U * NH * HD * 4); take(b.kraw, U * NKV * HD * 4);
+    take(b.kcur, U * NKV * HD * 4); take(b.vcur, U * NKV * HD * 4); take(b.attn, U * NH * HD * 4);
+    take(b.attn32, U * NH * HD * 4);
+    take(b.steps, U * k::kStepCount * 4); take(b.pos_q, U * NH * 4); take(b.pos_k, U * NKV * 4);
+    take(b.rlog, U * E * 4); take(b.ids, TK * 4); take(b.w, TK * 4); take(b.shared, U * N * 4);
+    take(b.sh_g, (U + 4) * 4); take(b.sh_gate, U * FS * 4); take(b.sh_up, U * FS * 4);
+    take(b.xs16, TK * N * 2); take(b.gu, TK * 2 * FF * 4); take(b.hh, TK * FF * 4); take(b.h16, TK * FF * 2);
+    take(b.dm, TK * N * 4); take(b.parts, TK * N * 4); take(b.moe_out, U * N * 4);
+    take(b.src, TK * 4); take(b.slot, TK * 4); take(b.bounds, (E + 1) * 4);
+    take(b.dq_gu, (uint64_t) PromptBufs::kGroup * (uint64_t) b.gu_elems * 2);
+    take(b.dq_d, (uint64_t) PromptBufs::kGroup * (uint64_t) b.d_elems * 2);
+    take(b.stage, (uint64_t) PromptBufs::kGroup * lay.max_blob);
+    take(b.gemm_scratch, (uint64_t) b.gemm_elems * 2);
+    dev_bytes = at;
+    at = 0;
+    auto hold = [&](auto*& ptr, uint64_t bytes) {
+        ptr = host ? (std::remove_reference_t<decltype(ptr)>) (host + at) : nullptr;
+        at += (std::max<uint64_t>(bytes, 1) + 255) & ~255ull;
+    };
+    hold(b.emb, U * N * 4); hold(b.h_steps, U * k::kStepCount * 4); hold(b.h_pos, U * (NH + NKV) * 4);
+    hold(b.h_ids, TK * 4); hold(b.h_src, TK * 4); hold(b.h_slot, TK * 4); hold(b.h_bounds, (E + 1) * 4);
+    host_bytes = at;
+}
+
 bool PlainModel::open_experts(std::string& err) {
     const ModelSpec& s = spec_;
     const int64_t L = s.n_moe_layers(), E = s.n_expert;
@@ -397,6 +446,22 @@ bool PlainModel::open_experts(std::string& err) {
     // the same number for every layer
     uint64_t free_b = 0, total_b = 0;
     {
+        size_t f = 0, t = 0;
+        if (!strata::gpu::mem_info(&f, &t)) { err = "plain model: the device's memory is unknown"; return false; }
+        free_b = f;
+        total_b = t;
+        apply_vram_limit(free_b, total_b);
+    }
+    // the prompt path's buffers, before the tier takes what is left
+    if (opt_.prompt_chunk > 0) {
+        uint64_t db = 0, hb = 0;
+        prompt_carve(opt_.prompt_chunk, pb_, nullptr, nullptr, db, hb);
+        if (!strata::gpu::alloc_device(&prompt_dev_, db) || !strata::gpu::alloc_host(&prompt_host_, hb)) {
+            err = "plain model: no memory for the prompt path's chunks of " + std::to_string(opt_.prompt_chunk) +
+                  " tokens (" + std::to_string(db >> 20) + " MiB; --prompt-chunk sets a smaller one, 0 none)";
+            return false;
+        }
+        prompt_carve(opt_.prompt_chunk, pb_, (uint8_t*) prompt_dev_, (uint8_t*) prompt_host_, db, hb);
         size_t f = 0, t = 0;
         if (!strata::gpu::mem_info(&f, &t)) { err = "plain model: the device's memory is unknown"; return false; }
         free_b = f;

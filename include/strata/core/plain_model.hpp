@@ -121,10 +121,42 @@ private:
     bool record_window(int T, strata::gpu::Stream cs, std::string& err);
     bool adapt(std::string& err);
     bool fill_slot(int64_t layer, int32_t expert, std::string& err);
-    struct Prompt;   // plain_prompt.cpp: the prompt path's buffers
-    bool prompt_init(std::string& err);
-    static void prompt_free(Prompt* p);
-    std::unique_ptr<Prompt, void (*)(Prompt*)> prompt_{nullptr, nullptr};
+    /// The prompt path's buffers for chunks of `T` tokens, carved by prompt_carve from one device block and one pinned
+    /// host block allocated at load, before the VRAM tier is sized (plain_prompt.cpp uses them).
+    struct PromptBufs {
+        static constexpr int kGroup = 8;   ///< experts dequantized and multiplied in one grouped product
+        int64_t T = 0, gu_elems = 0, d_elems = 0, gemm_elems = 0;
+        float *x = nullptr, *hn = nullptr, *mix = nullptr;
+        uint16_t* x16 = nullptr;           ///< T rows of the widest projection input, FP16
+        float *qkv = nullptr, *z = nullptr, *ab = nullptr, *gate = nullptr, *beta = nullptr, *h = nullptr, *y = nullptr;
+        uint16_t* y16 = nullptr;
+        float *qfull = nullptr, *qcur = nullptr, *kraw = nullptr, *kcur = nullptr, *vcur = nullptr, *attn = nullptr,
+              *attn32 = nullptr;
+        int32_t *steps = nullptr, *pos_q = nullptr, *pos_k = nullptr;
+        float *rlog = nullptr, *w = nullptr, *shared = nullptr, *sh_g = nullptr, *sh_gate = nullptr, *sh_up = nullptr;
+        int32_t* ids = nullptr;
+        uint16_t* xs16 = nullptr;          ///< the routed rows grouped by expert, FP16 [T * k, n_embd]
+        float *gu = nullptr, *hh = nullptr, *dm = nullptr, *parts = nullptr, *moe_out = nullptr;
+        uint16_t* h16 = nullptr;
+        int32_t *src = nullptr, *slot = nullptr, *bounds = nullptr;
+        uint16_t *dq_gu = nullptr, *dq_d = nullptr;   ///< kGroup experts' FP16 weights
+        uint8_t* stage = nullptr;          ///< kGroup expert blobs copied from RAM
+        uint16_t* gemm_scratch = nullptr;  ///< Gemm::native's dequantized weight
+        // pinned host
+        float* emb = nullptr;              ///< T rows of n_embd
+        int32_t *h_steps = nullptr, *h_pos = nullptr, *h_ids = nullptr, *h_src = nullptr, *h_slot = nullptr,
+                *h_bounds = nullptr;
+    };
+    /// Lays the buffers for chunks of `T` tokens out from `dev` / `host` (null: only counts), returning the device and
+    /// host bytes.
+    void prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* host, uint64_t& dev_bytes,
+                      uint64_t& host_bytes) const;
+    PromptBufs pb_;
+    void* prompt_dev_ = nullptr;
+    void* prompt_host_ = nullptr;
+    struct PromptGemm;   // plain_prompt.cpp: the products' state over pb_.gemm_scratch
+    static void prompt_gemm_free(PromptGemm* g);
+    std::unique_ptr<PromptGemm, void (*)(PromptGemm*)> prompt_gemm_{nullptr, nullptr};
     static void pool_fn(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                         int64_t layer);
 
