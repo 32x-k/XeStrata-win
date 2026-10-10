@@ -113,7 +113,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   いくつかのアーキテクチャのコードを持つ実行ファイルでは、その像より古い GPU は動かず、新しい GPU は古いコードを走らせていました。
   修正後は、ランタイムが HIP と同じく像そのものを CUDA のアダプタに渡し、アダプタは PTX の `.target` のうち GPU が走らせられる最も新しいものを選び、新しすぎるものを断ります（`cuda-select-binary-2` ほか。fatbin（CUDA 13 は中の PTX を圧縮します）では、要素の見出しのアーキテクチャを読みます）。
   3 つ目: CUDA のアダプタは、ホストのメモリの登録（`urUSMImportExp`・`urUSMReleaseExp`）を、何もしない関数のまま関数表から漏らしていて、ローダーが `UR_RESULT_ERROR_UNINITIALIZED` で断っていました。
-  修正後は `cuMemHostRegister` でページを固定し、そこからの転送が DMA になります（`cuda-host-register` ほか。RTX 4070 のデコードで約 4% 速くなりました）。
+  修正後は `cuMemHostRegister` でページを固定し、そこからの転送が DMA になります（`cuda-host-register` ほか。RTX 4070 の decode で約 4% 速くなりました）。
   4 つ目: SYCL のランタイムの NVIDIA のアーキテクチャの表は sm_90 までで、それより新しい GPU（RTX 50 の CC 12.0 など）は行列演算の組み合わせを報告せず、エンジンは Tensor Core の経路を使いませんでした。
   修正後は、表にない CC 9.0 以上を、sm_90 と同じ組み合わせ（sm_80 以降の mma の命令）として報告します（`cuda-newer-matrix`。4070 に CC 12.0 を装わせて確かめました）。
   5 つ目: NVIDIA の対象を含むリンクのたびに、ドライバーが分割したビットコード・PTX・cubin を TMPDIR に残していました（RAM の上の `/tmp` で 1 日に 22 GB）。
@@ -198,9 +198,9 @@ sde64 -version
 
 ### 道具を足さずにできること
 
-- エンジン自身の時間の計測: プロンプトの経路は `STRATA_PREFILL_TIMING=1` で出ます。
-  デコードの `verify window` の行（ホストが GPU を待つ時間、CPU のプール）は、いつも出ます。
-- `STRATA_VERIFY_NODES=1` は、デコードの窓のグラフに入るカーネルの数を出します。
+- エンジン自身の時間の計測: prefill の経路は `STRATA_PREFILL_TIMING=1` で出ます。
+  decode の `verify window` の行（ホストが GPU を待つ時間、CPU のプール）は、いつも出ます。
+- `STRATA_VERIFY_NODES=1` は、decode の窓のグラフに入るカーネルの数を出します。
 - SYCL のイベントのプロファイリングで単独のカーネルを測る使い捨てのプローブ（`bench/results/2026-10-02-xe-decode-gpu` の記録）。
 - `STRATA_VERIFY_PROFILE=1` はデバイス全体で共通の時計を必要とし、B70 にはそれがありません。
 
@@ -258,7 +258,7 @@ GPU のハードウェアカウンター（カーネルごとのメモリの帯�
    結果のフォルダー（`r000hs/` など）は git が無視します。
 
 Metrics Discovery は、xe ドライバー経由で B70 のカウンターを読めました（Linux 7.0、2026-10-02）。
-VTune の `xpu-offload` の収集と unitrace は、どちらもエンジンをプロンプトのところで数分止めてしまいました。
+VTune の `xpu-offload` の収集と unitrace は、どちらもエンジンを prefill のところで数分止めてしまいました。
 この 2 つは小さなプログラムやプローブに使い、エンジンには使いません。
 
 ### NVIDIA の GPU の測定（nsys と ncu）

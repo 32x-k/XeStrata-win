@@ -42,7 +42,7 @@ NVIDIA の GPU では contrib-llvm のビルドで同じカーネルが動きま
 - PLE の表は GGUF にある形式のまま読みます: IQ4_NL（既定の表）、Q4_0、Q5_0、Q5_1、Q8_0、FP8（E4M3 とスケール）、BF16。
   upstream の測定では、BF16 の表と比べた行ごとの平均誤差は Q8_0 0.53%、FP8 2.64%、Q5_1 3.78%、Q5_0 4.25%、IQ4_NL 7.60%、Q4_0 8.55% です。
 - ネイティブのエキスパートの Q4_0、Q4_1、Q5_0、Q6_K の gate/up の GPU カーネル。CPU のエキスパートの AVX-2 の i-quant と Q2_0 のカーネル。
-- 検証の窓とプロンプトの経路で起動の数を減らすカーネルの融合（#783 ほか）。
+- 検証の窓と prefill の経路で起動の数を減らすカーネルの融合（#783 ほか）。
 - `STRATA_PREFILL_CPU_SHARE=auto`（既定）: 短いチャンクで、ほとんど選ばれないエキスパートを空いている CPU のプールで計算します。
 - `--kv-grow`: K/V は要求が届いたセルの分だけ VRAM を取り、残りをエキスパートのキャッシュが使います。
   デバイスの仮想メモリの対応づけの粒度が 2 MiB 以上なら既定で有効です（RTX 4070 は有効、B70 は 64 KiB で無効）。
@@ -56,7 +56,7 @@ NVIDIA の GPU では contrib-llvm のビルドで同じカーネルが動きま
 AVX-512 の経路は Intel SDE（`-icx`）で `expert_multi_test` が通ります。
 `expert_parity --selftest` と `pool_test --selftest` は正準形の pack がないので SDE では動かせません（AVX2 では通ります）。
 B70 では icpx と free のビルドが 8 つの答え（思考あり・なし）をすべて最後まで出し、6 つが一致しました。
-プロンプト 1,148 tok/s、その後のデコード 98.6 tok/s、短い会話 77.3 tok/s（icpx）です。
+prefill 1,148 tok/s、その後の decode 98.6 tok/s、短い会話 77.3 tok/s（icpx）です。
 8 GiB・4 GiB・XMX なし・CPU のワーカー 6 つの構成と、RTX 4070 でも答えを最後まで出しました。
 UHD 770 では free と icpx のビルドが起動し、短い答えを返しました。
 
@@ -84,7 +84,7 @@ CUDA、HIP、Windows の実装は移していません。複数の GPU の実装
 
 | 経路 | B70 での結果 |
 | --- | --- |
-| プロンプトの量子化したエキスパートの積（`STRATA_PREFILL_MMQ`） | 既定の XMX の FP16 の経路の 0.34 倍 |
+| prefill の量子化したエキスパートの積（`STRATA_PREFILL_MMQ`） | 既定の XMX の FP16 の経路の 0.34 倍 |
 | 融合 MoE（`STRATA_PF_FUSED`） | 既定の経路の 0.25 倍 |
 | GDN の key-head の共有（`STRATA_GDN_KEYHEAD`） | 既定の経路の 0.54 倍 |
 | hyper-connection の分割読み出し（`STRATA_GR_V3`） | decode が約 18% 遅い |
@@ -198,7 +198,7 @@ NumPy で求めた FP16 の境界の確認も含む `quantize_act_parity` は、
 
 `iq_kernels.hpp` はすべて移植しました（`src/kernels/xe/iq_kernels.cpp`）。
 q8_1 の量子化、IQ1_M、IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ3_S、IQ4_NL、IQ4_XS、Q3_K、Q2_0 の展開、その MMVQ、
-埋め込みの行、プロンプトの経路の gate と up の展開、まとめて計算するネイティブのエキスパートです。
+埋め込みの行、prefill の経路の gate と up の展開、まとめて計算するネイティブのエキスパートです。
 ワープは 32 幅のサブグループにし、その和は CUDA のバタフライの順に取り、CUDA のバイトの組み込み関数は書き下しました。
 まとめて計算するエキスパートの SwiGLU は、CUDA の `__expf` の代わりに精度の高い指数関数を使います。
 
@@ -215,7 +215,7 @@ MMVQ は `iq_parity` の基準 `2e-2` の中（4.2e-3〜5.8e-3）で、`iq_parit
 Q6_K、Q8_0、Q4_K、Q5_K、Q4_0、Q5_0 の MMVQ は、ランダムなブロックで FP64 から `2e-2` 以内です。
 2〜8 列は、正確な配置で 1 列の呼び出しとビット単位で同じです。
 
-### デコードのそのほかのカーネル
+### decode のそのほかのカーネル
 
 - `src/kernels/xe/rope.cpp`: `rope.hpp`、`native_rope.hpp`、`mrope.hpp` の M-RoPE の表（Xe のデバイスは 1 つなので、ポインターも 1 つ）
 - `src/kernels/xe/router.cpp`: `router_top10.hpp` と `native_router.hpp`
@@ -226,7 +226,7 @@ Q6_K、Q8_0、Q4_K、Q5_K、Q4_0、Q5_0 の MMVQ は、ランダムなブロッ�
 KV のホスト側のプール（`KvHostPools`）はカーネルが読み書きするので、Xe ではホストの USM でなければなりません。
 デバイスへのコピー用に登録しただけのメモリは、カーネルから参照できません。
 `native_rope` と `native_router` は、CUDA が高速な数学関数を使っていたところで精度の高い `pow`、`cos`、`sin`、`exp` を使います。
-[デコードのカーネルの確認](../bench/results/2026-09-30-xe-kernels/README.md)では、`rope_parity`、`router_top10_parity`、`bf16_gemv_parity` が通り、どれも CTest に登録しています。
+[decode のカーネルの確認](../bench/results/2026-09-30-xe-kernels/README.md)では、`rope_parity`、`router_top10_parity`、`bf16_gemv_parity` が通り、どれも CTest に登録しています。
 
 ## B70 で確かめたモデル
 
@@ -278,7 +278,7 @@ llama.cpp と分かれるのは、どれも参照の上位 2 候補が僅差の�
 どのエキスパートを CPU で計算するかはキャッシュの大きさで決まり、それが出力の最後の数ビットを変えます。
 `auto` は空いている VRAM からキャッシュの大きさを決めるので、起動ごとの VRAM の揺れでスロットが 1〜2 個動き、出力が変わることがあります
 （[記録](../bench/results/2026-10-02-new-machine/README.md#outputs-that-change-from-run-to-run)）。
-64 スロット単位に切り捨てれば同じ機械では同じキャッシュになりますが、RTX 4070 でデコードが 3〜4% 遅くなったので、速さを取って切り捨てていません。
+64 スロット単位に切り捨てれば同じ機械では同じキャッシュになりますが、RTX 4070 で decode が 3〜4% 遅くなったので、速さを取って切り捨てていません。
 同じ出力が要るとき（機械や設定をまたいだ比較も）は、`--expert-cache N` で固定します。
 
 ### 出力ヘッドの VRAM の確保が断られる
@@ -291,7 +291,7 @@ llama.cpp と分かれるのは、どれも参照の上位 2 候補が僅差の�
 
 ### 小さい GPU での VRAM の予約
 
-小さい GPU では（upstream #496）、既定の 700 MiB の予約のせいで、プロンプトの経路に 256 トークンの塊を貸すだけのスロットがキャッシュに残らないことがあります。
+小さい GPU では（upstream #496）、既定の 700 MiB の予約のせいで、prefill の経路に 256 トークンの塊を貸すだけのスロットがキャッシュに残らないことがあります。
 そのときエンジンは、それだけ残るところまで予約を下げます。
 下限は 300 MiB で、`--vram-reserve-mib` で指定した予約より下げることはありません。
 それでも足りなければ起動を止め、何 MiB 足りないか、何を減らせば空くかを示します。
@@ -309,7 +309,7 @@ llama.cpp と分かれるのは、どれも参照の上位 2 候補が僅差の�
   窓の読み込みのカーネル（`fetch_blobs`）が PCIe 越しに 1 個読む時間、窓のエキスパートのカーネルが VRAM の 1 個を計算する時間、
   CPU がエキスパートを読むメモリの帯域。
 - **取り合い**: CPU と PCIe は同じメモリを読みます。2 つの速さの合計がメモリの帯域を超えるとき、両方がその比で遅くなるとみなします。
-  B70 では、PCIe の 1 個が単独の 0.066 ms から 0.13 ms になる見積もりで、デコードから逆算した値と合いました。
+  B70 では、PCIe の 1 個が単独の 0.066 ms から 0.13 ms になる見積もりで、decode から逆算した値と合いました。
 - **分け方**: 窓のグループごとに、GPU が VRAM 上のエキスパートを計算した後（読み込みを並べられる GPU では並べて）PCIe の分を読んで計算し、
   CPU が残りを計算するとして、遅い方が最も早く終わる数を選びます。
   CPU だけの場合より 10% 以上早く終わる見積もりのときだけ PCIe に回します。
@@ -364,7 +364,7 @@ server は、どれかが準備できるまで、エンコーダーを次の順�
 [モデルの一覧](../bench/results/2026-09-30-b70/iq2-xs-baseline.json)は、Hugging Face のリビジョンと、各 GGUF のヘッダー全体の SHA-256 を記録しています。
 [テンソルの CSV](../bench/results/2026-09-30-b70/iq2-xs-tensors.csv) は、各テンソルの実際の型、形、オフセット、バイト数を記録しています。
 この一覧のために取ってきたのはヘッダーだけで、ヘッダーの先頭部分はモデルのシャードとしては使えません。
-モデル全体での生成、プロンプトの経路、MTP とプロンプト照合の推測、server、KV のストリーミングつきの 26k トークンのプロンプトは、
+モデル全体での生成、prefill の経路、MTP とプロンプト照合の推測、server、KV のストリーミングつきの 26k トークンのプロンプトは、
 [IQ2_XS の記録](../bench/results/2026-09-30-xe-iq2xs/README.md)にあります。
 貪欲生成のトークンは CPU の llama.cpp と比べました。
 
@@ -416,6 +416,6 @@ XeStrata はそのまま使っていて、Xe での調整は一部しか済ん�
 | `src/program/generate.cpp` | ネイティブの pack で、キャッシュにないエキスパートを PCIe で運ぶ割合 0.55（正準形は 0.2）。リンクの速さ（256 MiB の転送 4 回の最良）/ 20 GB/s で縮める | 新しい開発機で測ると、0.15 で 2〜4% 速く、それより大きい割合はどれも遅かった。0.55 はこの測定に支持されない（[記録](../bench/results/2026-10-02-new-machine/README.md#the-expert-arena-and-the-pcie-share)） |
 | `tools/calibrate.py` | 基準は Ryzen 5 7600 と RTX 5070。PCIe の割合の候補 0、0.2、0.35、0.55、0.75、推測の下限 0.3、0.5、0.7、ワーカー数の候補。交互の確認で 3% を超えて速いときだけ採用 | 候補と基準は upstream のまま |
 | `setup.py` | `--spec 4`、`--spec-min-p 0.5`、`--expert-cache auto`、`--prefill auto` | `--prefill auto` は 32768 トークンの塊まで選ぶように変えた（[記録](../bench/results/2026-10-03-prompt-upstream/README.md)）。既定のリングで収まらない塊は、リングを 96 スロットにして選ぶ（upstream #583。B70 を 8 GB に絞った IQ3_S で、8K と 32K のプロンプトが 1.5〜2 倍）。ほかは upstream のまま |
-| `src/program/generate.cpp` | VRAM の予約 700 MiB（小さい GPU では 300 まで）、プロンプトの経路のスロットの借り方と塊の選び方、4 ラウンドごとのキャッシュの入れ替え（最大 96 個） | upstream のまま |
+| `src/program/generate.cpp` | VRAM の予約 700 MiB（小さい GPU では 300 まで）、prefill の経路のスロットの借り方と塊の選び方、4 ラウンドごとのキャッシュの入れ替え（最大 96 個） | upstream のまま |
 | `src/program/generate.cpp` と CPU のプール | 物理コア数に基づくワーカー数とホストのワーカー、キャッシュのヒットの通知、グラフとドアベルの段取り | ワーカー数は新しい開発機で測り、7〜19 で速さが変わらなかったので既定のまま（[記録](../bench/results/2026-10-02-new-machine/README.md#cpu-worker-threads)） |
 | `src/kernels/cpu/iq_avx512.cpp` | ソフトウェアのプリフェッチの距離と、AVX-512 向けの調整 | 開発機は AVX-512 を持たないので測っていない |

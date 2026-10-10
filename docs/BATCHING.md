@@ -53,10 +53,10 @@ At a 32K context that is 4 slots from a 24 GB card; a smaller card stays at one 
 - **A request left alone in a slot** (the others finished, nobody waits) goes back to the solo path.
   The slot is stopped, the engine copies its sessions back and decodes with MTP drafts again (at most twice per request; with `--prompt-cache 0` it stays in the slot; `STRATA_PARALLEL_SOLO=0` turns it off).
 - **More requests than slots** wait for a free one (`/metrics` -> `live.slots` shows each slot: idle, reading or decoding, its tokens and tok/s).
-- **Each admission** reads the request's prompt through the usual prompt path (prompt cache and conversation checkpoints included) and produces its first token there; the state is then copied into the slot.
-  Admissions are taken one at a time, and **the slots decode between the prompt's chunks**.
+- **Each admission** reads the request's prompt through the usual prefill path (prompt cache and conversation checkpoints included) and produces its first token there; the state is then copied into the slot.
+  Admissions are taken one at a time, and **the slots decode between prefill's chunks**.
   After each chunk they decode for half as long as the chunk took (`STRATA_BATCH_DECODE_SHARE`, default 0.5), so a long prompt slows the others down instead of stopping them.
-  The chunks are the ones one uninterrupted read takes, so the prompt's arithmetic is unchanged.
+  The chunks are the ones one uninterrupted read takes, so prefill's arithmetic is unchanged.
 - **A long prompt gives way to a short one**: when a request with a prompt under half as long is waiting, the server sends `BYIELD`.
   At its next chunk boundary the long read stops, the part read so far is copied into a slot, the short request is admitted, and the long one then goes on from its slot with the same chunks (at most twice per request).
 - **Each slot is a conversation cache.** A finished slot keeps what it holds (the prompt, the answer, and the checkpoint at the prompt's last turn boundary).

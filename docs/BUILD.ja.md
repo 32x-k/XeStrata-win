@@ -48,7 +48,7 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   自由ソフトウェアだけで済み、oneAPI の環境は使いません。
   `tools/intel_llvm_build.py` でソースからビルドしたもの（v7.1.1）で確かめています（[setup](#setup) を参照）。
   ディストリビューションのパッケージも 7 以降なら使えます。それより古いもの（Ubuntu 26.04 の `dpclang++` 6.2）は、CMake と setup が断ります。
-  6.2 の SYCL ランタイムは Arc Pro B70 に XMX がないと報告し、プロンプトの経路が約 1.6 倍遅くなっていました
+  6.2 の SYCL ランタイムは Arc Pro B70 に XMX がないと報告し、prefill の経路が約 1.6 倍遅くなっていました
   （[記録](../bench/results/2026-10-02-dp4a/README.md)）。
   ROCm の HIP 付きでビルドした intel/llvm なら、`STRATA_HIP_ARCHS`（例 `gfx1200`）で AMD の GPU（RDNA2 以降: gfx103x、gfx11xx、gfx12xx）向けのコードも作ります。
   ROCm は自由ソフトウェアなので、free でも contrib-llvm でも同じです（[DEVTOOLS.ja.md](DEVTOOLS.ja.md#hipamd-の-gpu)）。
@@ -71,7 +71,7 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   ビルドの前に oneAPI の環境を読み込みます。Intel の GPU だけを扱います。
   icpx に NVIDIA・AMD のターゲットを足す Codeplay のプラグインは oneAPI 2025.2 で終わり、2025.3 からは CUDA・HIP のアダプタがバイナリで出ないためです。
 
-contrib-llvm と contrib-icpx では、プロンプトの経路の密な行列積（`src/prefill/gemm.cpp`）を oneMath（Apache-2.0）経由で、
+contrib-llvm と contrib-icpx では、prefill の経路の密な行列積（`src/prefill/gemm.cpp`）を oneMath（Apache-2.0）経由で、
 Intel の GPU では oneMKL、NVIDIA の GPU では cuBLAS に任せます。
 どの後端を作るかは、ビルドする機械の GPU で決めます（メーカーが複数あればすべて）。
 Intel の GPU があれば oneMKL の後端（`STRATA_ONEMKL`）を作り、oneMKL（oneAPI の `intel-oneapi-mkl-devel`。場所は `MKL_ROOT`、なければ `MKLROOT`、なければ `/opt/intel/oneapi/mkl/latest`）が要ります。
@@ -111,19 +111,19 @@ A380 では DP4a より 17〜38% 速く、FP64 との相対誤差も小さくな
 `STRATA_NO_BLAS=1` は、contrib-llvm と contrib-icpx のモードでも密な行列積を自前のカーネルで計算します（比べるためのものです）。
 RTX 4070 で、それぞれの組み合わせでも CTest は変わらず、16 トークンの最上位はすべて一致しました。
 oneMath がある GPU の BF16 の積で失敗したとき（起動時に小さな積で試します）は、BF16 の積だけを自前のカーネルに任せます。
-行列エンジンが FP16 を扱い BF16 を扱わない GPU（NVIDIA の sm_80 より前、Volta と Turing）では、プロンプトの経路の BF16 の積を、両方を FP16 に変換して FP16 の積として計算します（`src/prefill/gemm.cpp`、upstream の f2fb7c1・ff6f9f1）。
+行列エンジンが FP16 を扱い BF16 を扱わない GPU（NVIDIA の sm_80 より前、Volta と Turing）では、prefill の経路の BF16 の積を、両方を FP16 に変換して FP16 の積として計算します（`src/prefill/gemm.cpp`、upstream の f2fb7c1・ff6f9f1）。
 そのような GPU の BF16 の積を、cuBLAS は Tensor Core を使わずに計算し、自前のカーネルでは DP4a に落ちるためです。
 変換は FP16 の正規数の範囲では正確で、それを超える有限の値は ±65504 に飽和させます。累積する積と出力が 1 行の積は BF16 のままです。
 RTX 4070 で sm_70 のコードを動かし `STRATA_NO_BF16_MMA=1` で模すと、FP64 との相対誤差は 2e-6 以下で、DP4a の経路（0.7%）より 2.5〜3.2 倍速くなりました。
 `STRATA_BF16_TC=0` で止まります。
 `tools/xmx_probe.cpp` は、エンジンをビルドせずに、同じ問い合わせをすべての GPU にします。
 
-プロンプトの経路のエキスパートの積は、GPU が int8 の 16 x 16 x 16（32 レーン）の組み合わせを報告すれば（NVIDIA の Tensor Core）、int8 の行列エンジンで計算します（`src/kernels/xe/iq_mmq.cpp`、llama.cpp の MMQ を `joint_matrix` で書き直したもの）。
+prefill の経路のエキスパートの積は、GPU が int8 の 16 x 16 x 16（32 レーン）の組み合わせを報告すれば（NVIDIA の Tensor Core）、int8 の行列エンジンで計算します（`src/kernels/xe/iq_mmq.cpp`、llama.cpp の MMQ を `joint_matrix` で書き直したもの）。
 重みは GGUF のブロックのまま読み、活性は 32 値ごとに int8 に丸めます。
 FP16 に展開してから掛ける経路より読み書きが少なく、FP64 との相対誤差は約 0.4% です（活性を int8 に丸めた分）。
 対象は IQ1_M を除く i-quant と Q2_0 で、それ以外の型の層は FP16 の経路のままです。
 
-プロンプトの注意は、XMX のない GPU でも FP16 の 16 x 16 x 16（32 レーン）の組み合わせを報告すれば（NVIDIA の Tensor Core、sm_70 から）、`joint_matrix` の標準の API で書いた版で計算します（`src/kernels/xe/qsa_prompt_attn.cpp`）。
+prefill の注意は、XMX のない GPU でも FP16 の 16 x 16 x 16（32 レーン）の組み合わせを報告すれば（NVIDIA の Tensor Core、sm_70 から）、`joint_matrix` の標準の API で書いた版で計算します（`src/kernels/xe/qsa_prompt_attn.cpp`）。
 KV は FP16・INT8・K8V4 で、Q4_0 は FP32 のカーネルのままです（upstream の Volta のカーネル 06a90a2 と同じ範囲）。
 INT8 と Q4_0 の符号は FP16 で正確に表せるのでそのまま行列エンジンに渡し、尺度は FP32 で掛けます。
 RTX 4070 で sm_70 のコードを動かすと、`qsa_prompt_attn_parity` の FP64 との誤差は FP32 のカーネルの 3 倍以内で、2,048 クエリ・32K セルの塊が INT8 で 1.6 倍、FP16 と K8V4 で 1.5 倍速くなりました。
@@ -135,7 +135,7 @@ Tensor Core がないので、行列エンジンの経路は選ばれず、DP4a 
 sm_60 には dp4a の命令がないので、その積だけを 1 バイトずつの計算にしていて、和は同じ整数です（`src/kernels/xe/cuda_intrinsics.hpp`、upstream の e200e08f）。
 Tensor Core を使うカーネルは、sm_70 より前のコードでは空の本体になり、そのような GPU では起動されません。
 sm_60 だけのコードを作って RTX 4070 で動かすと（ドライバーが PTX をコンパイル）、CTest 59 件が通り、
-`STRATA_NO_XMX=1` で行列エンジンを外して IQ2_XS で答えさせると、sm_89 のコードと 8 問すべて同じ答えになりました（エキスパートのキャッシュの大きさを固定、出力の速さは 3〜5% 遅い）。
+`STRATA_NO_XMX=1` で行列エンジンを外して IQ2_XS で答えさせると、sm_89 のコードと 8 問すべて同じ答えになりました（エキスパートのキャッシュの大きさを固定、decode の速さは 3〜5% 遅い）。
 
 Volta（sm_70）では、upstream が V100 で測った出力のカーネル 2 つを `STRATA_SM70_TABLE=1` で使います（upstream の c85b7c87 と同じく、確認が済むまで opt-in）。
 ひとつはルーティングされたエキスパートの「モード 8」で、gate/up の積と SwiGLU・q8_1 への量子化を 1 回で行い、格子の表と活性を作業グループのローカルメモリに置きます（`src/kernels/xe/iq_kernels.cpp`、upstream の f6330507: V100 で 227 → 159 µs）。
@@ -223,7 +223,7 @@ AMD の GPU は `STRATA_HIP_ARCHS` に並べます（RX 6800 は `gfx1030`、RX 
   setup は RAM 12 GB あたり 1 ジョブまでにします。
 - **`STRATA_PORTABLE`**（既定 ON）: ggml-cpu を AVX2 のある CPU ならどれでも動くようにビルドします。
   `-DSTRATA_PORTABLE=OFF` はこの機械に合わせた `-march=native` でビルドするので、CPU を替えると動かなくなることがあります。
-  i7-14700 では、どちらもデコードの速さは同じでした。
+  i7-14700 では、どちらも decode の速さは同じでした。
   setup はいつも ON を渡します（渡さないと、既存のビルドフォルダーはキャッシュした値を使い続けます）。
   AVX-512 の翻訳単位は、これとは別にコンパイルし、実行時に選びます。
 - **GPU のコード**: デバイスのコードは SPIR-V の JIT です。
@@ -436,6 +436,7 @@ xe0.1.40.2.1 は `0.1.40.2-2`（rpm は Version が 0.1.40.2、Release が 2）�
   アダプターを作り、アダプターを同梱します。エンジンが持つ AMD のコードは `BUILD.json` の `hip_archs` に記録し、setup はそれで GPU が使えるかを判断します。
 - 推奨と提案に入れたメーカーのものは、メーカーごとに `BUILD.json` の `runtime` にも記録します。setup は、使う GPU のメーカーのもので入っていないものを apt か dnf に尋ねて調べ、入れ方（要るならリポジトリの登録から）を表示します。GPU のランタイムがなければ止まり、oneMKL と cuBLAS がなければ表示だけして続けます。
 - `third_party/nonfree/` は入れません。チャットテンプレートは、setup がモデルの pack に書いたものを使います。
+  実験的な速度向上用の射影のベクトルは、有効にしたときに setup が版のタグから GitHub でダウンロードします。
 - Python はビルドのときにバイトコンパイルし、`xestrata` は `PYTHONDONTWRITEBYTECODE=1` で動かします。`/usr` に後から何も書かず、
   `/etc` にも何も置かないので、パッケージを消せば何も残りません。
 

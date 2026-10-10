@@ -59,7 +59,7 @@ xestrata --bench --original-strata v0.1.41        # 同じモデルで upstream 
 | Intel | upstream の `sycl/` を Docker でビルド（sudo なしで docker が使えること） |
 
 - NVIDIA の配布物と Intel の Docker イメージは自由ソフトウェアでないので、free のビルドでは NVIDIA と Intel の比較はしません。
-- Intel では出力の速さを比べません。upstream の `sycl/` は、VRAM に入らないエキスパートを PCIe 越しに読むためです。
+- Intel では decode の速さを比べません。upstream の `sycl/` は、VRAM に入らないエキスパートを PCIe 越しに読むためです。
 
 ## upstream 追従の計測
 
@@ -82,7 +82,7 @@ A="..." B="..." PROFILE=... DATA=<data> IDS=<ids> python $S/ab_pair.py generate|
 - `XE` と `UP` は各エンジンのバイナリかラッパーです。前に `env K=V ...` を付けられます。serve と通常使用のラッパーは標準入力を通すこと（`docker run -i`）。
 - 回数は generate が 2 回、serve と通常使用が 3 回です（`ROUNDS` で変えられます）。serve と通常使用は各エンジンが自分のテキストを書くので、温度 0.7 では 1 回ごとに中央値から 10% 前後ずれます。
 - generate は `--spec-follow` で両エンジンに upstream の答えをなぞらせ、テキストの違いを除きます。serve にはこの機能がありません。
-- 合格の幅: generate と、serve・通常使用の最初のプロンプトの速さは、XeStrata が upstream より 1% 以上遅くないこと。serve・通常使用のそれ以外（続きのターンの待ち時間、出力、最初のトークンまでの時間）は 5% 以上悪くないこと。
+- 合格の幅: generate と、serve・通常使用の最初の prefill の速さは、XeStrata が upstream より 1% 以上遅くないこと。serve・通常使用のそれ以外（続きのターンの待ち時間、decode、最初のトークンまでの時間）は 5% 以上悪くないこと。
 - 温度は、serve が `MODES`（既定 `greedy t07`。`t10` は温度 1.0）、通常使用が `TEMPERATURE`（既定 0.7）で変えられます。
 - `--prev <ファイル>=<フォルダー>` を付けると、前の XeStrata の記録（前回の追従の記録か、リリースの記録）とも比べます。両方にあるマスごとに、プロンプトの速さは 1%、それ以外は 5% 以上悪くないこと。B70 の出力も比べます。
 - `ab_pair.py` は XeStrata どうしを交互に測ります。A が基準、B が候補です（スイッチの有無や、前の版と HEAD）。同じシードなので、出力が変わらない限り同じテキストを書きます。`judge.py <out>` で B を A と比べます。

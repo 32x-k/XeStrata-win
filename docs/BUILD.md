@@ -47,7 +47,7 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
   Free software only; no oneAPI environment is used.
   Validated with intel/llvm v7.1.1 built from source by `tools/intel_llvm_build.py` (see [Setup](#setup)).
   A distribution's package of version 7 or later serves as well; an older one (Ubuntu 26.04's `dpclang++` 6.2) is refused by CMake and setup.
-  6.2's SYCL runtime reported no XMX for the Arc Pro B70, and the prompt path took about 1.6 times as long
+  6.2's SYCL runtime reported no XMX for the Arc Pro B70, and the prefill path took about 1.6 times as long
   ([record](../bench/results/2026-10-02-dp4a/README.md)).
   With intel/llvm built with ROCm's HIP, `STRATA_HIP_ARCHS` (`gfx1200`, for example) makes the code for AMD GPUs (RDNA2 and later: gfx103x, gfx11xx, gfx12xx) as well.
   ROCm is free software, so this is the same in the free and contrib-llvm modes ([DEVTOOLS.md](DEVTOOLS.md#hip-amd-gpus)).
@@ -69,7 +69,7 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
   Source oneAPI's environment before building. Intel GPUs only:
   Codeplay's plugins that gave icpx NVIDIA and AMD targets ended with oneAPI 2025.2, and from 2025.3 the CUDA and HIP adapters are not released as binaries.
 
-The contrib-llvm and contrib-icpx modes hand the prompt path's dense matrix products (`src/prefill/gemm.cpp`) to oneMath (Apache-2.0):
+The contrib-llvm and contrib-icpx modes hand the prefill path's dense matrix products (`src/prefill/gemm.cpp`) to oneMath (Apache-2.0):
 oneMKL on Intel GPUs, cuBLAS on NVIDIA ones.
 Which backends are built follows the GPUs of the machine it is built on (every maker it has).
 An Intel GPU brings the oneMKL backend (`STRATA_ONEMKL`), which needs oneMKL (oneAPI's `intel-oneapi-mkl-devel`, found at `MKL_ROOT`, else `MKLROOT`, else `/opt/intel/oneapi/mkl/latest`).
@@ -109,19 +109,19 @@ With `STRATA_NO_BF16_MMA=1` the contrib-llvm and contrib-icpx modes do not hand 
 `STRATA_NO_BLAS=1` computes the dense matrix products with the own kernels in the contrib-llvm and contrib-icpx modes too (to compare).
 On the RTX 4070 CTest gave the same results under each of them, and the top token of all 16 positions agreed.
 Where oneMath fails a BF16 product on the GPU (a small one is tried at start), the BF16 products alone take the own kernels.
-On a GPU whose matrix engines take FP16 and not BF16 (NVIDIA's before sm_80, Volta and Turing), the prompt path's BF16 products convert both operands to FP16 and run as FP16 products (`src/prefill/gemm.cpp`, upstream f2fb7c1 and ff6f9f1).
+On a GPU whose matrix engines take FP16 and not BF16 (NVIDIA's before sm_80, Volta and Turing), the prefill path's BF16 products convert both operands to FP16 and run as FP16 products (`src/prefill/gemm.cpp`, upstream f2fb7c1 and ff6f9f1).
 On such a GPU cuBLAS computes BF16 products without the tensor cores, and the own kernels fall to DP4a.
 The conversion is exact within FP16's normal range; finite values past it saturate at ±65504. An accumulating product and one of a single output row stay BF16.
 With sm_70 code on the RTX 4070 and `STRATA_NO_BF16_MMA=1` to imitate it, the relative error against FP64 was 2e-6 or less, 2.5–3.2 times as fast as the DP4a path (0.7%).
 `STRATA_BF16_TC=0` turns it off.
 `tools/xmx_probe.cpp` asks every GPU the same without building the engine.
 
-Where the GPU reports the int8 combination 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores), the prompt path's expert products run on the int8 matrix engines (`src/kernels/xe/iq_mmq.cpp`, llama.cpp's MMQ written anew on joint_matrix).
+Where the GPU reports the int8 combination 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores), the prefill path's expert products run on the int8 matrix engines (`src/kernels/xe/iq_mmq.cpp`, llama.cpp's MMQ written anew on joint_matrix).
 The weights are read in their GGUF blocks and the activations rounded to int8, a scale for each 32 values.
 That reads and writes less than dequantizing to FP16 and multiplying, and the relative error against FP64 is about 0.4% (the activations' rounding).
 It covers the i-quants but IQ1_M, and Q2_0; a layer of another type keeps the FP16 path.
 
-On a GPU without XMX that reports the FP16 combination 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores, from sm_70 on), the prompt attention runs a kernel written on joint_matrix's portable API (`src/kernels/xe/qsa_prompt_attn.cpp`).
+On a GPU without XMX that reports the FP16 combination 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores, from sm_70 on), prefill's attention runs a kernel written on joint_matrix's portable API (`src/kernels/xe/qsa_prompt_attn.cpp`).
 It takes FP16, INT8 and K8V4 KV; Q4_0 keeps the FP32 kernel (the range of upstream's Volta kernel 06a90a2).
 INT8's and Q4_0's codes are exact in FP16 and go to the matrix engines as they are, with the scales applied in FP32.
 With sm_70 code on the RTX 4070, `qsa_prompt_attn_parity` was off FP64 by at most 3 times the FP32 kernel's error, and a chunk of 2,048 queries over 32K cells ran 1.6 times as fast at INT8 and 1.5 times at FP16 and K8V4.
@@ -436,6 +436,7 @@ xe0.1.40.2.1 is `0.1.40.2-2` (for rpm, Version 0.1.40.2 and Release 2).
   (`hip_archs`), from which setup decides whether a GPU can be used.
 - The makers' packages the package recommends or suggests are recorded in `BUILD.json` too, by maker (`runtime`). setup asks apt or dnf which of those of the GPUs it uses are missing, and shows how to install them (adding a repository first where needed). Without the GPU's runtime it stops; without oneMKL or cuBLAS it only shows them and goes on.
 - `third_party/nonfree/` is not packaged: the chat template is the one setup writes into the model's pack.
+  The experimental speed projection's vector is downloaded by setup from the version's tag on GitHub when it is turned on.
 - The Python files are compiled when the package is built, and `xestrata` runs with `PYTHONDONTWRITEBYTECODE=1`: nothing is written
   under `/usr` later and nothing goes in `/etc`, so removing the packages leaves nothing behind.
 

@@ -46,16 +46,16 @@ Strata との主な違い:
 | BIOS | 単体の GPU では Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
 
 - **行列エンジン**: Intel の XMX、AMD の WMMA（RDNA3 以降）、NVIDIA の Tensor Core を使い、ない GPU では DP4a などの整数の内積の命令で計算します。
-  どれを使うかは、GPU が報告する能力で決めます。行列エンジンがないとプロンプトの読み込みが遅くなりますが、動きます。
+  どれを使うかは、GPU が報告する能力で決めます。行列エンジンがないと prefill が遅くなりますが、動きます。
 - **確かめた GPU**: 開発と確認は Arc Pro B70（Xe2、32 GB）で行っています。NVIDIA は RTX 4070 と RTX 3070、AMD は RX 9060 XT（RDNA4）で確かめています。
   Arc A380 では計算の正しさだけを確かめ、モデルは動かしていません。
   小さな GPU は、B70 で使えるメモリと XMX を制限して確かめています。
-- **CPU 内蔵のグラフィックス**: 起動とプロンプトの読み込みまでを確かめています。メモリが RAM と共有で、
+- **CPU 内蔵のグラフィックス**: 起動と prefill までを確かめています。メモリが RAM と共有で、
   XMX のないものが多いので、遅くなります。
 
 ### AMD の GPU
 
-AMD の GPU では、プロンプトの密な行列積をディストリビューションの ROCm の rocBLAS と hipBLASLt で計算します。
+AMD の GPU では、prefill の密な行列積をディストリビューションの ROCm の rocBLAS と hipBLASLt で計算します。
 そのため、XeStrata が動くのは、ディストリビューションの rocBLAS がコードを持っている GPU だけです。
 
 | GPU | gfx | Ubuntu 26.04 | Fedora 44 |
@@ -218,7 +218,7 @@ sudo dnf remove xestrata-contrib-cuda13.4    # Fedora（同じ）
 
 **XMX が使えないと言われた**
 今のコンパイラでは、その GPU の行列エンジンが使えません。setup が出す選択肢から選んでください。
-XMX なしでも動き、プロンプトの読み込みが遅くなります（約 1.6 倍の時間）。
+XMX なしでも動き、prefill が遅くなります（約 1.6 倍の時間）。
 
 **起動時に VRAM の確保が拒否された（`alloc_device: ... refused`）**
 B70 では、まれに起きることがあります。もう一度起動すれば、たいていは動きます。
