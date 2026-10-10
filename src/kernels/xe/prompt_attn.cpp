@@ -143,10 +143,11 @@ struct Kernel {
 // RDNA3 and RDNA4 (GFX11, GFX12): Q.K^T and P.V through the FP16 WMMA instructions (16 x 16 x 16, FP32
 // accumulators; the layouts as iq_mmq.cpp's int8 ones: lane l holds row l % 16 of A and column l % 16 of B and of the
 // accumulator; GFX12 8 of the 16 K values a lane (l / 16 picks which) and accumulator rows 8 (l / 16) + e, GFX11 all
-// 16 and rows 2 e + l / 16).  BQ queries of one KV head, R = BQ x G rows in 16-row tiles; 32 cells a step: K, then V
-// transposed, through one local buffer; the scores to FP32 local memory, the softmax by a work-item a row, the
-// probabilities to FP16 for P.V.  The output tiles stay in the waves' accumulators across the steps, rescaled by
-// each row's factor where the layout puts the row.
+// 16 and rows 2 e + l / 16).  As flash attention 2: each wave owns 16 rows (query, head) of the BQ queries' R = BQ x G,
+// with their Q in registers (head_dim 128: FP16 high and low parts, two products, for FP32's precision), and keeps
+// the scores, the online softmax (the rows' maxima and sums across the 16 lanes by shuffles) and the output in its
+// accumulators; the waves share only the step's 32 cells of K and V (transposed) in local memory.  The probabilities
+// go through a wave's own local rows to become the A operand of P.V.
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__) && (defined(__GFX11__) || defined(__GFX12__))
 #define STRATA_PA_WMMA 1
 #else
@@ -155,10 +156,10 @@ struct Kernel {
 
 template <int HD, int G, int BQ>
 struct WmmaKernel {
-    static constexpr int BK = 32, W = NT / 32, R = BQ * G, RT = R / 16, DT = HD / 16, NO = RT * DT / W;
-    static constexpr int QS = HD + 8, KS = HD + 8, VS = BK + 8, PS = BK + 8;   // local row strides (halves)
-    static constexpr int KV = BK * KS > HD * VS ? BK * KS : HD * VS;
-    static_assert(R % 16 == 0 && (RT * DT) % W == 0 && HD % 16 == 0, "whole tiles, shared evenly by the waves");
+    static constexpr int BK = 32, R = BQ * G, W = R / 16, DT = HD / 16, CT = BK / 16;
+    static constexpr int KS = HD + 8, VS = BK + 8, PS = BK + 8;   // local row strides (halves), 16-byte multiples
+    static constexpr bool LO = HD <= 128;                         // Q's low part (registers permitting)
+    static_assert(R % 16 == 0 && HD % 16 == 0, "whole tiles");
     using h8 = sycl::vec<uint16_t, 8>;
     const float* q;
     const uint16_t* kp;
@@ -168,15 +169,13 @@ struct WmmaKernel {
     int64_t pos0, T;
     int n_head, n_kv, page_size;
     float scale;
-    sycl::local_accessor<uint16_t, 1> qs, kv, ps;
-    sycl::local_accessor<float, 1> sc, mrow, lrow, arow;
+    sycl::local_accessor<uint16_t, 1> ks, vs, ps;
 
     void operator()(sycl::nd_item<2> it) const {
 #if STRATA_PA_WMMA
-        using hv8 = _Float16 __attribute__((ext_vector_type(8)));
         using fv8 = float __attribute__((ext_vector_type(8)));
 #if defined(__GFX12__)
-        using frag = hv8;
+        using frag = _Float16 __attribute__((ext_vector_type(8)));
         constexpr int KOFF = 8, KN = 8;   // a lane's K values: 8 of the 16, the half l / 16 picks
         auto row_of = [](int hi, int e) { return 8 * hi + e; };
 #else
@@ -192,97 +191,96 @@ struct WmmaKernel {
 #endif
         };
         constexpr float NEG = -std::numeric_limits<float>::infinity();
+        const auto sg = it.get_sub_group();
         const int t = (int) it.get_local_id(1), h = (int) it.get_group(0);
         const int wave = t / 32, lane = t % 32, lo = lane & 15, hi = lane >> 4;
         const int64_t qbase = (int64_t) it.get_group(1) * BQ;
-        uint16_t* Q = qs.get_multi_ptr<sycl::access::decorated::no>().get();
-        uint16_t* KVb = kv.get_multi_ptr<sycl::access::decorated::no>().get();
-        uint16_t* P = ps.get_multi_ptr<sycl::access::decorated::no>().get();
-        float* S = sc.get_multi_ptr<sycl::access::decorated::no>().get();
-        float* M = mrow.get_multi_ptr<sycl::access::decorated::no>().get();
-        float* L = lrow.get_multi_ptr<sycl::access::decorated::no>().get();
-        float* A = arow.get_multi_ptr<sycl::access::decorated::no>().get();
+        uint16_t* K = ks.get_multi_ptr<sycl::access::decorated::no>().get();
+        uint16_t* Vt = vs.get_multi_ptr<sycl::access::decorated::no>().get();
+        uint16_t* P = ps.get_multi_ptr<sycl::access::decorated::no>().get() + wave * 16 * PS;
         auto frag_at = [](const uint16_t* p) { return *reinterpret_cast<const frag*>(p); };
-        for (int i = t; i < R * HD; i += NT) {
-            const int r = i / HD, dd = i - r * HD;
+        // the wave's Q rows as A fragments: row lo of its tile, K values k0 + hi KOFF .. + KN
+        frag qh[DT], ql[LO ? DT : 1];
+        {
+            const int r = wave * 16 + lo;
             const int64_t tq = qbase + r / G;
-            const float v = tq < T ? q[(tq * n_head + (int64_t) h * G + r % G) * HD + dd] * scale : 0.0f;
-            Q[r * QS + dd] = sycl::bit_cast<uint16_t>(sycl::half(v));
+            const float* src = q + (tq * n_head + (int64_t) h * G + r % G) * HD;
+            for (int k = 0; k < DT; ++k)
+                for (int e = 0; e < KN; ++e) {
+                    const float v = tq < T ? src[k * 16 + hi * KOFF + e] * scale : 0.0f;
+                    const _Float16 vh = (_Float16) v;
+                    qh[k][e] = vh;
+                    if constexpr (LO) ql[k][e] = (_Float16) (v - (float) vh);
+                }
         }
-        if (t < R) {
-            M[t] = NEG;
-            L[t] = 0.0f;
+        float m[8], l[8];
+        fv8 o[DT];
+        for (int e = 0; e < 8; ++e) {
+            m[e] = NEG;
+            l[e] = 0.0f;
         }
-        fv8 o[NO];
-        for (int k = 0; k < NO; ++k) o[k] = fv8{0, 0, 0, 0, 0, 0, 0, 0};
+        for (int k = 0; k < DT; ++k) o[k] = fv8{0, 0, 0, 0, 0, 0, 0, 0};
         const int64_t n_cells = pos0 + sycl::min<int64_t>(qbase + BQ, T);   // through the block's last query
+        const int nt = W * 32;
         for (int64_t c0 = 0; c0 < n_cells; c0 += BK) {
-            sycl::group_barrier(it.get_group());   // the last step's V and probabilities are read
-            for (int i = t; i < BK * HD / 8; i += NT) {   // K: [cell][dim]
+            sycl::group_barrier(it.get_group());   // the last step's K and V are read
+            for (int i = t; i < BK * HD / 8; i += nt) {   // K as [cell][dim], V transposed as [dim][cell]
                 const int j = i / (HD / 8), dd = (i - j * (HD / 8)) * 8;
                 const int64_t c = c0 + j;
-                h8 v(0);
+                h8 kv(0), vv(0);
                 if (c < n_cells) {
-                    const int64_t page = table[c / page_size];
-                    v = *reinterpret_cast<const h8*>(kp + ((page * n_kv + h) * page_size + c % page_size) * HD + dd);
+                    const int64_t row = ((int64_t) table[c / page_size] * n_kv + h) * page_size + c % page_size;
+                    kv = *reinterpret_cast<const h8*>(kp + row * HD + dd);
+                    vv = *reinterpret_cast<const h8*>(vp + row * HD + dd);
                 }
-                *reinterpret_cast<h8*>(KVb + j * KS + dd) = v;
+                *reinterpret_cast<h8*>(K + j * KS + dd) = kv;
+                for (int e = 0; e < 8; ++e) Vt[(dd + e) * VS + j] = vv[e];
             }
             sycl::group_barrier(it.get_group());
-            for (int tile = wave; tile < RT * (BK / 16); tile += W) {   // S = Q . K^T, a 16 x 16 tile a wave
-                const int rt = tile / (BK / 16), ct = tile % (BK / 16);
+            fv8 sc[CT];
+            for (int ct = 0; ct < CT; ++ct) {   // S = Q . K^T for the wave's rows
                 fv8 acc = fv8{0, 0, 0, 0, 0, 0, 0, 0};
-                for (int k0 = 0; k0 < HD; k0 += 16)
-                    acc = mma(frag_at(Q + (rt * 16 + lo) * QS + k0 + hi * KOFF),
-                              frag_at(KVb + (ct * 16 + lo) * KS + k0 + hi * KOFF), acc);
-                for (int e = 0; e < 8; ++e) S[(rt * 16 + row_of(hi, e)) * BK + ct * 16 + lo] = acc[e];
-            }
-            sycl::group_barrier(it.get_group());
-            for (int i = t; i < BK * HD / 8; i += NT) {   // V transposed: [dim][cell]
-                const int j = i / (HD / 8), dd = (i - j * (HD / 8)) * 8;
-                const int64_t c = c0 + j;
-                h8 v(0);
-                if (c < n_cells) {
-                    const int64_t page = table[c / page_size];
-                    v = *reinterpret_cast<const h8*>(vp + ((page * n_kv + h) * page_size + c % page_size) * HD + dd);
+                for (int k = 0; k < DT; ++k) {
+                    const frag b = frag_at(K + (ct * 16 + lo) * KS + k * 16 + hi * KOFF);
+                    acc = mma(qh[k], b, acc);
+                    if constexpr (LO) acc = mma(ql[k], b, acc);
                 }
-                for (int e = 0; e < 8; ++e) KVb[(dd + e) * VS + j] = v[e];
+                sc[ct] = acc;
             }
-            if (t < R) {   // the row's online softmax: its new maximum, the old sum's factor, the step's probabilities
-                const int64_t qpos = pos0 + qbase + t / G;
-                float mx = M[t];
-                for (int j = 0; j < BK; ++j)
-                    if (c0 + j <= qpos && c0 + j < n_cells) mx = sycl::fmax(mx, S[t * BK + j]);
-                const float a = M[t] == NEG ? 0.0f : sycl::exp(M[t] - mx);
+            float alpha[8];
+            for (int e = 0; e < 8; ++e) {   // row 16 wave + row_of(hi, e): its 16 lanes hold its BK columns
+                const int64_t qpos = pos0 + qbase + (wave * 16 + row_of(hi, e)) / G;
+                float mx = m[e];
+                for (int ct = 0; ct < CT; ++ct) {
+                    const int64_t c = c0 + ct * 16 + lo;
+                    if (c > qpos || c >= n_cells) sc[ct][e] = NEG;
+                    mx = sycl::fmax(mx, sc[ct][e]);
+                }
+                for (int x = 1; x < 16; x <<= 1) mx = sycl::fmax(mx, sycl::permute_group_by_xor(sg, mx, x));
+                alpha[e] = m[e] == NEG ? 0.0f : sycl::exp(m[e] - mx);
                 float sum = 0.0f;
-                for (int j = 0; j < BK; ++j) {
-                    const float p = c0 + j <= qpos && c0 + j < n_cells ? sycl::exp(S[t * BK + j] - mx) : 0.0f;
-                    const sycl::half ph(p);
-                    P[t * PS + j] = sycl::bit_cast<uint16_t>(ph);
-                    sum += (float) ph;
+                for (int ct = 0; ct < CT; ++ct) {
+                    const _Float16 p = (_Float16) (sc[ct][e] == NEG ? 0.0f : sycl::exp(sc[ct][e] - mx));
+                    P[row_of(hi, e) * PS + ct * 16 + lo] = sycl::bit_cast<uint16_t>(p);
+                    sum += (float) p;
                 }
-                L[t] = L[t] * a + sum;
-                M[t] = mx;
-                A[t] = a;
+                for (int x = 1; x < 16; x <<= 1) sum += sycl::permute_group_by_xor(sg, sum, x);
+                l[e] = l[e] * alpha[e] + sum;
+                m[e] = mx;
             }
-            sycl::group_barrier(it.get_group());
-            for (int k = 0; k < NO; ++k) {   // O += P . V on the wave's own output tiles
-                const int tile = wave + k * W, rt = tile / DT, dt = tile % DT;
-                for (int e = 0; e < 8; ++e) o[k][e] *= A[rt * 16 + row_of(hi, e)];
+            sycl::group_barrier(sg);   // the wave's probabilities are written
+            for (int k = 0; k < DT; ++k) {   // O += P . V
+                for (int e = 0; e < 8; ++e) o[k][e] *= alpha[e];
                 for (int k0 = 0; k0 < BK; k0 += 16)
-                    o[k] = mma(frag_at(P + (rt * 16 + lo) * PS + k0 + hi * KOFF),
-                               frag_at(KVb + (dt * 16 + lo) * VS + k0 + hi * KOFF), o[k]);
+                    o[k] = mma(frag_at(P + lo * PS + k0 + hi * KOFF), frag_at(Vt + (k * 16 + lo) * VS + k0 + hi * KOFF), o[k]);
             }
         }
-        (void) KN;
-        for (int k = 0; k < NO; ++k) {
-            const int tile = wave + k * W, rt = tile / DT, dt = tile % DT;
+        for (int k = 0; k < DT; ++k)
             for (int e = 0; e < 8; ++e) {
-                const int r = rt * 16 + row_of(hi, e);
+                const int r = wave * 16 + row_of(hi, e);
                 const int64_t tq = qbase + r / G;
-                if (tq < T) attn[(tq * n_head + (int64_t) h * G + r % G) * HD + dt * 16 + lo] = o[k][e] / L[r];
+                if (tq < T) attn[(tq * n_head + (int64_t) h * G + r % G) * HD + k * 16 + lo] = o[k][e] / l[e];
             }
-        }
 #else
         (void) it;
 #endif
@@ -305,15 +303,13 @@ template <int HD, int G, int BQ>
 void launch_wmma(sycl::queue& q, const float* qv, const uint16_t* kp, const uint16_t* vp, const int32_t* table,
                  int64_t pos0, int64_t T, const QsaShapes& s, float* attn) {
     using KT = WmmaKernel<HD, G, BQ>;
-    const size_t blocks = (size_t) ((T + BQ - 1) / BQ);
+    const size_t blocks = (size_t) ((T + BQ - 1) / BQ), nt = (size_t) KT::W * 32;
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<uint16_t, 1> qs(sycl::range<1>((size_t) KT::R * KT::QS), h), kv(sycl::range<1>((size_t) KT::KV), h),
-            ps(sycl::range<1>((size_t) KT::R * KT::PS), h);
-        sycl::local_accessor<float, 1> sc(sycl::range<1>((size_t) KT::R * KT::BK), h), mrow(sycl::range<1>(KT::R), h),
-            lrow(sycl::range<1>(KT::R), h), arow(sycl::range<1>(KT::R), h);
-        h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) s.n_head_kv, blocks * NT), sycl::range<2>(1, NT)),
+        sycl::local_accessor<uint16_t, 1> ks(sycl::range<1>((size_t) KT::BK * KT::KS), h),
+            vs(sycl::range<1>((size_t) HD * KT::VS), h), ps(sycl::range<1>((size_t) KT::W * 16 * KT::PS), h);
+        h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) s.n_head_kv, blocks * nt), sycl::range<2>(1, nt)),
                        KT{qv, kp, vp, table, attn, pos0, T, (int) s.n_head, (int) s.n_head_kv, (int) s.page_size,
-                          1.0f / std::sqrt((float) HD), qs, kv, ps, sc, mrow, lrow, arow});
+                          1.0f / std::sqrt((float) HD), ks, vs, ps});
     });
 }
 
@@ -346,10 +342,11 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
     }();
     bool mma = false;
     if (!no_mma && amd_wmma(queue.get_device())) {
-        // local memory: Q, K or V, the scores and probabilities, 44 to 50 KiB (RDNA's work-groups have 64)
+        // a wave per 16 rows: 5 for llm-jp's 8 queries of 10 heads, 4 for 8 queries of 8 (local memory 25 to 43 KiB)
         mma = true;
         if (s.head_dim == 128 && g == 10) launch_wmma<128, 10, 8>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
-        else if (s.head_dim == 256 && g == 8) launch_wmma<256, 8, 4>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
+        else if (s.head_dim == 256 && g == 8) launch_wmma<256, 8, 8>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
+        else if (s.head_dim == 256 && g == 12) launch_wmma<256, 12, 4>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
         else mma = false;
     }
     // local memory: BQ x G rows of FP32 Q and BK cells of K and V, 37 to 42 KiB: within the 48 KiB every GPU gives
