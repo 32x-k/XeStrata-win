@@ -27,9 +27,12 @@ size_t iq_mmq_row_bytes(int ggml_type, int64_t cols);
 /// Bytes of `rows` activation rows of `cols` values (a multiple of 32): the int8 values, then a scale per 32, then the
 /// sum per 32 (the scale times the int8 values' sum).
 size_t iq_mmq_act_bytes(int64_t rows, int64_t cols);
-/// The activations: row i of xq from row ids[i] of x (row i when ids is null), `ld` floats a row of x.
+/// Whether products of ggml_type read the activations' sums (the K-quants with a min term).
+bool iq_mmq_type_sums(int ggml_type);
+/// The activations: row i of xq from row ids[i] of x (row i when ids is null), `ld` floats a row of x; `sums`: their
+/// block sums too (iq_mmq_type_sums), else that part is left unwritten.
 sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
-                            int64_t rows);
+                            int64_t rows, bool sums);
 
 /// n experts, one launch: expert e's weights ([w_rows, w_cols] in ggml_type's blocks) at w + e * expert_bytes, its
 /// activation rows bounds[e] .. bounds[e + 1] of xq (bounds on the device; xq holds total_rows rows), into dst rows

@@ -423,22 +423,23 @@ struct Kernel {
         const int64_t kb = K / 32;   // activation scales a row
         for (int64_t k0 = 0; k0 < K; k0 += KC) {
             sycl::group_barrier(it.get_group());   // the last step's tiles are read
+            const bool last = k0 + KC > K;   // a last step past K: what lies past it is zeros
             for (int v = lid; v < WM * (KC / 16); v += lanes) {
                 const int rr = v / (KC / 16), c = v % (KC / 16) * 16;
                 const int64_t row = m0 + rr;
                 u32x4 val = {0u, 0u, 0u, 0u};
-                if (row < rows && k0 + c < K) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
+                if (row < rows && (!last || k0 + c < K)) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
                 *reinterpret_cast<u32x4*>(al + rr * LDA + c) = val;
             }
             for (int v = lid; v < WM * NB; v += lanes) {
                 const int b = v / WM, rr = v % WM;
                 const int64_t row = m0 + rr;
-                xsl[v] = row < rows && k0 / 32 + b < kb ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
-                if constexpr (MIN) xul[v] = row < rows && k0 / 32 + b < kb ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                xsl[v] = row < rows && (!last || k0 / 32 + b < kb) ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                if constexpr (MIN) xul[v] = row < rows && (!last || k0 / 32 + b < kb) ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
             }
             for (int v = lid; v < WN * NB; v += lanes) {
                 const int nn = v / NB, b = v % NB;
-                const Sub d = k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b)
+                const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b)
                                                 : Sub{};   // past K (a last step of fewer blocks): zeros
                 u32x4* o = reinterpret_cast<u32x4*>(bl + nn * LDB + b * 32);
                 o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
@@ -510,22 +511,23 @@ struct Kernel {
             const int64_t kb = K / 32;   // activation scales a row
             for (int64_t k0 = 0; k0 < K; k0 += KC) {
                 sycl::group_barrier(it.get_group());   // the last step's tiles are read
+                const bool last = k0 + KC > K;   // a last step past K: what lies past it is zeros
                 for (int v = lid; v < WM * (KC / 16); v += lanes) {
                     const int rr = v / (KC / 16), c = v % (KC / 16) * 16;
                     const int64_t row = m0 + rr;
                     u32x4 val = {0u, 0u, 0u, 0u};
-                    if (row < rows && k0 + c < K) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
+                    if (row < rows && (!last || k0 + c < K)) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
                     *reinterpret_cast<u32x4*>(al + static_cast<int>(rr * LDA + c)) = val;
                 }
                 for (int v = lid; v < WM * NB; v += lanes) {
                     const int b = v / WM, rr = v % WM;
                     const int64_t row = m0 + rr;
-                    xsl[v] = row < rows && k0 / 32 + b < kb ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
-                    if constexpr (MIN) xul[v] = row < rows && k0 / 32 + b < kb ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                    xsl[v] = row < rows && (!last || k0 / 32 + b < kb) ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                    if constexpr (MIN) xul[v] = row < rows && (!last || k0 / 32 + b < kb) ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
                 }
                 for (int v = lid; v < WN * NB; v += lanes) {
                     const int nn = v / NB, b = v % NB;
-                    const Sub d = k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b)
+                    const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b)
                                                 : Sub{};   // past K (a last step of fewer blocks): zeros
                     u32x4* o = reinterpret_cast<u32x4*>(bl + static_cast<int>(nn * LDB + b * 32));
                     o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
@@ -631,22 +633,23 @@ struct Kernel {
             const int64_t kb = K / 32;   // activation scales a row
             for (int64_t k0 = 0; k0 < K; k0 += KC) {
                 sycl::group_barrier(it.get_group());   // the last step's tiles are read
+                const bool last = k0 + KC > K;   // a last step past K: what lies past it is zeros
                 for (int v = lid; v < WM * (KC / 16); v += lanes) {
                     const int rr = v / (KC / 16), c = v % (KC / 16) * 16;
                     const int64_t row = m0 + rr;
                     u32x4 val = {0u, 0u, 0u, 0u};
-                    if (row < rows && k0 + c < K) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
+                    if (row < rows && (!last || k0 + c < K)) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
                     *reinterpret_cast<u32x4*>(al + rr * LDA + c) = val;
                 }
                 for (int v = lid; v < WM * NB; v += lanes) {
                     const int b = v / WM, rr = v % WM;
                     const int64_t row = m0 + rr;
-                    xsl[v] = row < rows && k0 / 32 + b < kb ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
-                    if constexpr (MIN) xul[v] = row < rows && k0 / 32 + b < kb ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                    xsl[v] = row < rows && (!last || k0 / 32 + b < kb) ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                    if constexpr (MIN) xul[v] = row < rows && (!last || k0 / 32 + b < kb) ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
                 }
                 for (int v = lid; v < WN * NB; v += lanes) {
                     const int nn = v / NB, b = v % NB;
-                    const Sub d = k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b)
+                    const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b)
                                                 : Sub{};   // past K (a last step of fewer blocks): zeros
                     u32x4* o = reinterpret_cast<u32x4*>(bl + nn * LDB + b * 32);
                     o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
@@ -853,6 +856,8 @@ bool iq_mmq_dp4a_usable(sycl::queue& q) {
     });
 }
 
+bool iq_mmq_type_sums(int t) { return t == 12 || t == 13; }   // has_min
+
 bool iq_mmq_type_ok(int t) {
     switch (t) {
         case 6: case 8: case 12: case 13: case 14: case 16: case 17: case 18: case 20: case 21: case 22: case 23: case 29: case 42: return true;
@@ -883,7 +888,7 @@ size_t iq_mmq_row_bytes(int t, int64_t cols) {
 size_t iq_mmq_act_bytes(int64_t rows, int64_t cols) { return (size_t) (rows * cols + 2 * rows * (cols / 32) * 4); }
 
 sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
-                            int64_t rows) {
+                            int64_t rows, bool sums) {
     auto* x8 = static_cast<int8_t*>(xq);
     auto* xs = reinterpret_cast<float*>(x8 + rows * cols);
     const int64_t nb = cols / 32;
@@ -909,7 +914,7 @@ sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, 
         o[0] = u32x4{p[0], p[1], p[2], p[3]};
         o[1] = u32x4{p[4], p[5], p[6], p[7]};
         xs[r * nb + b] = d;
-        xu[r * nb + b] = d * (float) sum;
+        if (sums) xu[r * nb + b] = d * (float) sum;
     });
 }
 
