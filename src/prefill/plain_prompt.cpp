@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -185,8 +186,7 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     };
     auto t_mark = std::chrono::steady_clock::now();
     try {
-        // the chunk's routes, every MoE layer's, for the adaptive tier: replayed once the chunk is done, a window's
-        // tokens at a time, so that its counts and rounds come as the windows would have made them
+        // the chunk's routes, every MoE layer's, for the adaptive tier's counts (below, after the chunk)
         const int64_t L = s.n_moe_layers();
         std::vector<int32_t> routes(disp_.usage.empty() ? 0 : (size_t) (L * P.T * K));
         for (int64_t c0 = 0; c0 < n; c0 += P.T) {
@@ -440,17 +440,18 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                 sp.temperature = 0.0f;
                 k::sample_tokens(logits_, 1, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
             }
-            if (!routes.empty()) {   // the tier's rounds change slots the chunk read: after it is done
-                if (!strata::gpu::stream_sync(cs)) {
-                    err = std::string("plain prompt: ") + strata::gpu::last_error();
-                    return false;
-                }
-                const int64_t W = opt_.max_t;
+            if (!routes.empty()) {
+                // each window's counts as the windows would leave them at the prompt's end: times the decay of every
+                // round that would come after it; the rounds themselves are left to the decode (their swaps would
+                // cost the prompt more than they save)
+                const int64_t W = opt_.max_t, last = (n - 1) / W;
                 for (int64_t t0 = 0; t0 < T; t0 += W) {
+                    const int64_t win = (c0 + t0) / W;
+                    const float wgt = std::pow(opt_.adapt_decay, (float) ((windows_ + last + 1) / opt_.adapt_every -
+                                                                          (windows_ + win) / opt_.adapt_every));
                     for (int64_t ml = 0; ml < L; ++ml)
                         for (int64_t i = t0 * K; i < std::min(T, t0 + W) * K; ++i)
-                            disp_.usage[(size_t) (ml * E + routes[(size_t) (ml * P.T * K + i)])] += 1.0f;
-                    if (++windows_ % opt_.adapt_every == 0 && !adapt(err)) return false;
+                            disp_.usage[(size_t) (ml * E + routes[(size_t) (ml * P.T * K + i)])] += wgt;
                 }
             }
         }
@@ -462,6 +463,7 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
         err = std::string("plain prompt: ") + strata::gpu::last_error();
         return false;
     }
+    windows_ += (n + opt_.max_t - 1) / opt_.max_t;
     if (profile)
         std::fprintf(stderr, "strata plain: prompt of %lld tokens: GDN %.1f ms, attention %.1f, router and grouping %.1f, "
                              "experts %.1f, shared and combine %.1f\n", (long long) n, stage_ms[0], stage_ms[4], stage_ms[1],
