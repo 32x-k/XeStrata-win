@@ -178,8 +178,8 @@ Lint and commit it on `dev` (it is not in the tag).
 
 Take the stage lines out of the notes, add the tables (Japanese and English sections) with the engines' versions, the GPUs and the model, and:
 
-The notes' table is one per GPU, from `bench-collect.py`'s medians (the record's README keeps `bench-collect.py`'s own tables): a row per tier, named by the model's weight type and the length (`IQ3_XXS 1K`), and for the prompt and then the output three columns: XeStrata's value, upstream's, and the difference (the value columns named with the engine and its version, `XeStrata xe0.1.40.2.1`, `upstream v0.1.41`), marked ✅ where XeStrata is faster and ❌ where it is slower: the prompt as a ratio (`✅ 2.1 倍`, `✅ ×2.1`), the output as a percentage (`✅ +14%`; slower: `❌ −3%`).
-Within ±1% (either way) the two count as equal: `≒ 同等（−0.1%）` / `≈ equal (−0.1%)`, for the prompt as well.
+The notes' table is one per GPU, from `bench-collect.py`'s medians (the record's README keeps `bench-collect.py`'s own tables): a row per tier, named by the model's weight type and the length (`IQ3_XXS 1K`), and for prefill and then decode three columns (the LLM terms, in both languages; the user's decision, 2026-10-11): XeStrata's value, upstream's, and the difference (the value columns named with the engine and its version, `XeStrata xe0.1.40.2.1`, `upstream v0.1.41`), marked ✅ where XeStrata is faster and ❌ where it is slower: prefill as a ratio (`✅ 2.1 倍`, `✅ ×2.1`), decode as a percentage (`✅ +14%`; slower: `❌ −3%`).
+Within ±1% (either way) the two count as equal: `≒ 同等（−0.1%）` / `≈ equal (−0.1%)`, for prefill as well.
 A value upstream was stopped in is 計測不能（低速） / not measurable (too slow), its difference `✅`, with the line saying upstream was stopped at 10 tok/s or less; a value that does not fit stays `-`.
 Above each GPU's tables: the GPU (and its memory) and which build of upstream it ran (`sycl/`, CUDA, HIP); above the first GPU, the engines' versions, the model and the method (256 tokens, the median of two alternating runs).
 Each table has a heading line with its temperature: **generate**（温度 0、トークン/秒） / **generate** (temperature 0, tokens/s), and **serve と通常使用**（温度 0.7） / **serve and everyday use** (temperature 0.7).
@@ -189,27 +189,27 @@ Each table has a heading line with its temperature: **generate**（温度 0、�
 
 **generate**（温度 0、トークン/秒）
 
-| 形式・長さ | プロンプト XeStrata xe0.1.40.2.1 | プロンプト upstream v0.1.41 | 差 | 出力 XeStrata xe0.1.40.2.1 | 出力 upstream v0.1.41 | 差 |
+| 形式・長さ | prefill XeStrata xe0.1.40.2.1 | prefill upstream v0.1.41 | 差 | decode XeStrata xe0.1.40.2.1 | decode upstream v0.1.41 | 差 |
 | --- | ---: | ---: | --- | ---: | ---: | --- |
 | IQ3_XXS 1K | 509 | 295 | ✅ 1.7 倍 | 48.8 | 46.8 | ✅ +4% |
 ```
 
-Below each GPU's table, its serve and everyday table from `serve/`'s medians, with the same columns (XeStrata, upstream, difference): a row per measure, the prompt as a ratio, the rest as percentages, the wait and the first token better when shorter.
-Equal there is the upstream merge's check (`judge.py`): the prompt speeds within ±1%, the rest within ±5%, both engines writing their own texts. A wait or a first token is judged as a speed, upstream's time over XeStrata's (372 ms against 354 ms: −4.8%, equal), and its column shows the time's own difference: `≒ 同等（+5%）` / `≈ equal (+5%)`.
+Below each GPU's table, its serve and everyday table from `serve/`'s medians, with the same columns (XeStrata, upstream, difference): a row per measure, prefill as a ratio, the rest as percentages, the wait and the first token better when shorter.
+Equal there is the upstream merge's check (`judge.py`): prefill within ±1%, the rest within ±5%, both engines writing their own texts. A wait or a first token is judged as a speed, upstream's time over XeStrata's (372 ms against 354 ms: −4.8%, equal), and its column shows the time's own difference: `≒ 同等（+5%）` / `≈ equal (+5%)`.
 
 ```markdown
 **serve と通常使用**（温度 0.7）
 
 | 計測 | XeStrata xe0.1.40.2.1 | upstream v0.1.41 | 差 |
 | --- | ---: | ---: | --- |
-| serve 32K 最初のプロンプト (tok/s) | 839 | 380 | ✅ 2.2 倍 |
+| serve 32K 最初の prefill (tok/s) | 839 | 380 | ✅ 2.2 倍 |
 | serve 32K 会話の続きの待ち (ms) | 372 | 354 | ≒ 同等（+5%） |
-| serve 32K 出力 (tok/s) | 45.3 | 40.3 | ✅ +12% |
+| serve 32K decode (tok/s) | 45.3 | 40.3 | ✅ +12% |
 | chat-ja 最初のトークン (s) | 0.68 | 1.05 | ✅ −35% |
-| chat-ja 出力 (tok/s) | 42.8 | 41.0 | ≒ 同等（+4%） |
+| chat-ja decode (tok/s) | 42.8 | 41.0 | ≒ 同等（+4%） |
 | agent 最初のトークン (s) | 5.74 | 11.97 | ✅ −52% |
-| agent プロンプト (tok/s) | 691 | 334 | ✅ 2.1 倍 |
-| agent 出力 (tok/s) | 46.2 | 45.0 | ≒ 同等（+3%） |
+| agent prefill (tok/s) | 691 | 334 | ✅ 2.1 倍 |
+| agent decode (tok/s) | 46.2 | 45.0 | ≒ 同等（+3%） |
 ```
 
 Below the first GPU's tables only (not repeated for the others), one note in each language section, with the temperatures and what counts as equal:
@@ -217,14 +217,14 @@ Below the first GPU's tables only (not repeated for the others), one note in eac
 ```markdown
 > [!NOTE]
 > - **generate**：温度 0（greedy）。差が ±1% 以内なら ≒ 同等です。
-> - **serve と通常使用**：温度 0.7 で、それぞれのエンジンが自分の文を書くので、1 回ごとに中央値から 10% 前後ずれることがあります。差がプロンプトは ±1% 以内、待ち・出力・最初のトークンは ±5% 以内なら ≒ 同等です。
+> - **serve と通常使用**：温度 0.7 で、それぞれのエンジンが自分の文を書くので、1 回ごとに中央値から 10% 前後ずれることがあります。差が prefill は ±1% 以内、待ち・decode・最初のトークンは ±5% 以内なら ≒ 同等です。
 > - どちらも、交互に 2 回ずつ測った中央値です。
 ```
 
 ```markdown
 > [!NOTE]
 > - **generate**: temperature 0 (greedy). Within ±1% counts as ≈ equal.
-> - **serve and everyday use**: temperature 0.7, each engine writing its own text, so a run can land about 10% off the median. Within ±1% for the prompt and ±5% for the wait, output and first token counts as ≈ equal.
+> - **serve and everyday use**: temperature 0.7, each engine writing its own text, so a run can land about 10% off the median. Within ±1% for prefill and ±5% for the wait, decode and first token counts as ≈ equal.
 > - Both are the median of two alternating runs.
 ```
 
