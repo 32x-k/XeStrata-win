@@ -1,6 +1,14 @@
 # Notes for coding agents
 
-Read `LOCAL.md` in the repository root when it is there: this machine's hosts, containers and paths, kept out of git.
+## LOCAL.md: this machine's facts (read it first, keep it current)
+
+`LOCAL.md` in the repository root holds what is true of this machine and the machines it works with, and nothing else holds it; git ignores it.
+
+- **Read it before any work that runs something** (a build, a test, a measurement, a container, another machine).
+- **Facts of a machine go there and only there:** host names, users, IP addresses, containers and how to run in them, paths (the data folder, the model files, the toolchains, the venvs), the GPUs' PCI addresses, what a machine lacks or needs set up, and its quirks (naming a GPU or CPU model, as everywhere, is fine).
+  Never write them into AGENTS.md, a skill, a script, a document or a commit message; these name the fact and send the reader to `LOCAL.md` (`<data>: LOCAL.md`), and scripts take such values from the environment or their arguments.
+- **Keep it current in the same turn:** a fact learned or found changed (a new container, a moved folder, something a machine lacks) goes into `LOCAL.md` before the work moves on. A fact that is missing there is looked up, and asked of the user only when it cannot be found, then written down.
+- It is written in Japanese, by machine, facts only, as it is now.
 
 ## Hardware independence (the first rule)
 
