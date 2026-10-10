@@ -108,6 +108,17 @@ Do not reformat code with clang-format or a similar tool: the code is formatted 
 Install the lint tools, Intel SDE and the GPU profilers as [docs/DEVTOOLS.md](docs/DEVTOOLS.md) describes, and keep that file current when a tool or its installation changes.
 Tools the distribution does not package go into `.lint/` (lints) or `.tools/` (anything else built from source), which git ignores; nothing in the build or the tests may depend on either.
 
+## GitHub
+
+Work with the repository through `git`, not the GitHub CLI (`gh`), with these exceptions:
+
+- `gh release`, to create and edit releases;
+- fetching issues and pull requests: `gh issue list`, `gh issue view`, `gh pr list`, `gh pr view`, `gh pr diff` and `gh pr checks`;
+- merging, rejecting and reopening pull requests: `gh pr merge`, `gh pr close` and `gh pr reopen`;
+- closing and reopening issues: `gh issue close` and `gh issue reopen`.
+
+Do not create, comment on or edit issues and pull requests with `gh`.
+
 ## Packages
 
 Build the deb and rpm packages with `tools/package/build.sh` ([docs/BUILD.md](docs/BUILD.md#the-deb-and-rpm-packages)) and leave `XESTRATA_JOBS` unset: its default compiles as many files at once as there are threads, and intel/llvm's links limit themselves to the free RAM.
