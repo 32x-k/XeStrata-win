@@ -62,7 +62,7 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     const ModelSpec& s = spec_;
     const auto& lay = k::cpu::expert_layout();
     const int64_t N = s.n_embd, NH = s.n_head, HD = s.key_length, NKV = nkv_, HV = s.ssm_dt_rank, HK = s.ssm_n_group;
-    const int64_t ZV = s.ssm_d_inner, SS = s.ssm_d_state, C = 2 * HK * SS + ZV, E = s.n_expert, K = s.n_expert_used;
+    const int64_t E = s.n_expert, K = s.n_expert_used;
     const int64_t FS = s.n_ff_shexp, FF = s.n_ff_exp, qw = (has_gate_ ? 2 : 1) * NH * HD;
     const float eps = (float) s.rms_eps;
     const k::QsaShapes qs = [&] {
