@@ -2546,6 +2546,43 @@ def recommend_pool_workers(args: list) -> list:
     return [*args, "--pool-workers", str(n)]
 
 
+def linux_sockets(sys_root: str = "/sys"):
+    """(sockets, physical cores per socket) from the kernel's topology files, or None when they do not say."""
+    cores = {}
+    for cpu in (Path(sys_root) / "devices" / "system" / "cpu").glob("cpu[0-9]*"):
+        pkg, core = cpu / "topology" / "physical_package_id", cpu / "topology" / "core_id"
+        try:
+            cores.setdefault(pkg.read_text(encoding="utf-8").strip(), set()).add(core.read_text(encoding="utf-8").strip())
+        except OSError:
+            return None
+    return (len(cores), min(len(c) for c in cores.values())) if cores else None
+
+
+def two_socket_note(sockets) -> list[str]:
+    """upstream bench #674 #707 (2-socket Xeons: 17-18 workers beat 35 by ~20%): a tip to keep the expert pool on one
+    socket's cores, one fewer for the host loop.  Nothing is written to the config."""
+    if not sockets or sockets[0] < 2 or sockets[1] < 3:
+        return []
+    n = sockets[1] - 1
+    return [f"tip: this PC has {sockets[0]} CPU sockets of {sockets[1]} cores. Expert workers on the other socket have "
+            f"been measured slower than fewer, local ones (35 vs 17-18 on 2-socket Xeons): try --pool-workers {n} in "
+            f"the config's args ({SETUP_CMD} --calibrate measures it on this PC)"]
+
+
+AGENT_CACHE_FREE_GB = 24       # upstream bench #882 #440: RAM left beside the model for the conversation cache
+AGENT_CACHE_MIB = 8192
+
+
+def agent_cache_note(args, ram: float, model_ram_gb: float) -> list[str]:
+    """upstream 3772ded7c (bench #882 #440): for several agents or clients at once, a tip to keep each one's
+    conversation.  Text only: the config is not touched."""
+    if "--conversation-cache-mib" in args or ram - model_ram_gb < AGENT_CACHE_FREE_GB:
+        return []
+    return [f"tip: for several agents or clients at once, --conversation-cache-mib {AGENT_CACHE_MIB} in the config's "
+            "args keeps each one's conversation; without it they were measured re-reading ~90% of their prompts "
+            "(docs/DETAILS.md)"]
+
+
 def hardware_key(cfg: dict) -> str:
     """What a calibration is valid for: this GPU, CPU and RAM, and the model with its context and images setting
     (the context's KV cache and the image encoder take VRAM from the expert cache)."""
@@ -4024,6 +4061,10 @@ def main() -> int:
         ok("the settings tuned for this PC earlier are used" + (f" ({cal['date']})" if cal.get("date") else ""))
     else:                                              # upstream #642: measured counts (a calibration) win over the rule
         cfg["args"] = recommend_pool_workers(cfg["args"])
+        for line in two_socket_note(linux_sockets()):  # tips: text only, the config is not touched
+            say("  " + line)
+    for line in agent_cache_note(cfg["args"], ram, MODELS[model]["ram_gb"]):
+        say("  " + line)
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
     script = None if PACKAGED else write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     if not a.no_warmup:
