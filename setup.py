@@ -3190,6 +3190,59 @@ def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
     return scaling or "yarn", scale if scale is not None else derived_factor(ctx, trained)
 
 
+def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images: bool, tune: bool = True,
+                 notes: list[str] | tuple = ()) -> int:
+    """The end of an install: the model's config written, its start script, the warm-up, the offer to tune the
+    engine's settings for this PC (`tune`: Qwen3.8-Flash-Next's engine options only), what to do next, and the start.
+    `notes`: the model's own tips, printed with the CPU's."""
+    cfg_path = CONF / f"xestrata-{tag.lower()}.json"
+    CONF.mkdir(parents=True, exist_ok=True)
+    STATE.mkdir(parents=True, exist_ok=True)
+    cal = saved_calibration(cfg) if tune else None
+    if cal is not None:
+        sys.path.insert(0, str(ROOT / "tools"))
+        import calibrate as CAL
+        cfg["args"] = CAL.apply(cfg["args"], cal.get("settings") or {})
+        ok("the settings tuned for this PC earlier are used" + (f" ({cal['date']})" if cal.get("date") else ""))
+    else:                                              # upstream #642: a calibration's measured count wins
+        cfg["args"] = recommend_pool_workers(cfg["args"])
+        for line in two_socket_note(linux_sockets()):  # tips: text only, the config is not touched
+            say("  " + line)
+    for line in notes:
+        say("  " + line)
+    write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
+    script = None if PACKAGED else write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
+    if not a.no_warmup:
+        warm_up(cfg_path)
+    # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
+    if tune and cal is None and not a.no_start and not a.yes and ask(
+            "Tune Strata for this PC now? It measures a few engine settings (about 15-30 minutes, longer on a slow "
+            f"card; the PC is busy meanwhile; later: {SETUP_CMD} --calibrate)", ["y", "n"], "y", a.yes) == "y":
+        tuned = calibrate_config(cfg_path)
+    else:
+        tuned = None                                   # not asked for: nothing to repeat below
+    if script is not None:
+        ok(f"start script: {script.name}")
+
+    say()
+    say("All set.")
+    say(f"  API (OpenAI):     http://127.0.0.1:{port}/v1   (any API key; model name: anything)")
+    say(f"  API (Anthropic):  http://127.0.0.1:{port}/v1/messages")
+    if a.host and a.host not in ("127.0.0.1", "localhost"):
+        say(f"  Other devices:    the server window prints this PC's address (http://<IP>:{port}/)"
+            + ("" if a.api_key else " - no API key set: anyone on your network can use it"))
+    say(f"  Next time:        just run {SETUP_CMD}" + (f" (or {script.name})" if script else "") +
+        " - it starts right away")
+    if images:
+        say("  Images:           send them in the chat page, in chat.py (/image <path>) or over the API")
+    if tuned is False:                                 # upstream #447: a failed tuning is repeated here, not only above
+        say(f"  Tuning:           FAILED (the reason is above): the default settings stay - {SETUP_CMD} --calibrate "
+            "tries again")
+    if a.no_start:
+        return 0
+    return start(cfg_path, port)
+
+
 def main() -> int:
     if sys.platform != "linux":
         fail("Strata supports Linux only")
@@ -4054,52 +4107,8 @@ def main() -> int:
                              "fallback": cpu_enc}   # the server starts it when the GPU encoder does not start
     elif a.vision_tokens is not None:
         warn("--vision-tokens: images are off for this model, so it is not used")
-    cfg_path = CONF / f"xestrata-{tag.lower()}.json"
-    CONF.mkdir(parents=True, exist_ok=True)
-    STATE.mkdir(parents=True, exist_ok=True)
-    cal = saved_calibration(cfg)
-    if cal is not None:
-        sys.path.insert(0, str(ROOT / "tools"))
-        import calibrate as CAL
-        cfg["args"] = CAL.apply(cfg["args"], cal.get("settings") or {})
-        ok("the settings tuned for this PC earlier are used" + (f" ({cal['date']})" if cal.get("date") else ""))
-    else:                                              # upstream #642: a calibration's measured count wins
-        cfg["args"] = recommend_pool_workers(cfg["args"])
-        for line in two_socket_note(linux_sockets()):  # tips: text only, the config is not touched
-            say("  " + line)
-    for line in agent_cache_note(cfg["args"], ram, MODELS[model]["ram_gb"]):
-        say("  " + line)
-    write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
-    script = None if PACKAGED else write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
-    if not a.no_warmup:
-        warm_up(cfg_path)
-    # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
-    if cal is None and not a.no_start and not a.yes and ask(
-            "Tune Strata for this PC now? It measures a few engine settings (about 15-30 minutes, longer on a slow "
-            f"card; the PC is busy meanwhile; later: {SETUP_CMD} --calibrate)", ["y", "n"], "y", a.yes) == "y":
-        tuned = calibrate_config(cfg_path)
-    else:
-        tuned = None                                   # not asked for: nothing to repeat below
-    if script is not None:
-        ok(f"start script: {script.name}")
-
-    say()
-    say("All set.")
-    say(f"  API (OpenAI):     http://127.0.0.1:{port}/v1   (any API key; model name: anything)")
-    say(f"  API (Anthropic):  http://127.0.0.1:{port}/v1/messages")
-    if a.host and a.host not in ("127.0.0.1", "localhost"):
-        say(f"  Other devices:    the server window prints this PC's address (http://<IP>:{port}/)"
-            + ("" if a.api_key else " - no API key set: anyone on your network can use it"))
-    say(f"  Next time:        just run {SETUP_CMD}" + (f" (or {script.name})" if script else "") +
-        " - it starts right away")
-    if vision != "none":
-        say("  Images:           send them in the chat page, in chat.py (/image <path>) or over the API")
-    if tuned is False:                                 # upstream #447: a failed tuning is repeated here, not only above
-        say(f"  Tuning:           FAILED (the reason is above): the default settings stay - {SETUP_CMD} --calibrate "
-            "tries again")
-    if a.no_start:
-        return 0
-    return start(cfg_path, port)
+    return finish_setup(a, cfg, tag, port, adopted, vision != "none",
+                        notes=agent_cache_note(cfg["args"], ram, MODELS[model]["ram_gb"]))
 
 
 if __name__ == "__main__":
