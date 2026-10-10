@@ -55,6 +55,8 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
+        # the Harmony format's templates (llm-jp-4.1, GPT-OSS): its replies are channels, read by HarmonyParser
+        self.harmony = "<|channel|>" in self.source
         self.caps = self._detect_caps()
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
@@ -67,6 +69,16 @@ class ChatTemplate:
                                                                     and not _text_of(m.get("content")).strip()
                                                                     and not _has_image(m.get("content"))
                                                                     and not m.get("tool_calls"))]
+        if self.harmony:   # as llama.cpp's LLM-jp-4.1 path: the reasoning in the field the template reads, `thinking`,
+            # and no content beside the calls of a turn that made them
+            adjusted = []
+            for m in messages:
+                if isinstance(m, dict) and isinstance(m.get("reasoning_content"), str):
+                    m = {**m, "thinking": m["reasoning_content"]}
+                    if m.get("tool_calls"):
+                        m.pop("content", None)
+                adjusted.append(m)
+            messages = adjusted
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
 
@@ -773,6 +785,115 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
             except ValueError:
                 args[pname] = value
     return ToolCall(name=name, arguments=args)
+
+
+# ------------------------------------------------------------------------------------------------ harmony
+HARMONY_ENDS = ("<|end|>", "<|return|>", "<|call|>")
+HARMONY_MESSAGE = "<|message|>"
+
+
+class HarmonyParser:
+    """The output parser for the Harmony format (llm-jp-4.1's `chat_format=llm-jp-harmony-v1`; GPT-OSS's), with
+    OutputParser's interface (feed, finish, state).  After the generation prompt the model writes messages
+    `[<|start|>assistant[ to=functions.NAME]]<|channel|>CHANNEL[ to=functions.NAME][<|constrain|>TYPE]<|message|>BODY`
+    ended by <|end|>, <|return|> or <|call|>: the analysis channel's body is the reasoning, final's and a commentary
+    without a recipient (a preamble) the answer, a body to `functions.NAME` that tool's JSON arguments.  As llama.cpp's
+    LLM-jp-4.1 parser (common/parsers/llm-jp-harmony.cpp): a space after a special token is the tokenizer's, and
+    parallel calls are consecutive messages, each ended by <|end|>."""
+
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, **_):
+        self.thinking = thinking
+        self.names = {t.get("name") for t in tools or []}
+        self.head = True             # reading a message's header (up to <|message|>)
+        self.buf = ""                # text held: a header, or a body's tail that may begin a terminator
+        self.channel, self.to = "", None
+        self.args = ""               # a call's body so far
+        self.lead = False            # the body's first character is the tokenizer's space after <|message|>
+        self.pending: list = []      # OutputParser's: calls waiting in the reasoning (none here)
+        self.rescued = self.refused = 0
+
+    @property
+    def state(self) -> str:
+        if self.head:
+            return "content" if self.channel in ("final", "commentary") else "reasoning" if self.thinking else "content"
+        if self.to is not None:
+            return "call"
+        return "reasoning" if self.channel == "analysis" else "content"
+
+    def _header(self, text: str) -> None:
+        to = re.search(r"to=functions\.([A-Za-z0-9_.\-]+)", text)
+        self.to = to.group(1) if to else None
+        ch = re.search(r"<\|channel\|>\s*([A-Za-z]+)", text)
+        self.channel = ch.group(1) if ch else self.channel or "final"
+
+    def _body_event(self, text: str) -> list[Event]:
+        if not text:
+            return []
+        if self.to is not None:
+            self.args += text
+            return []
+        return [Event("reasoning" if self.channel == "analysis" else "content", text)]
+
+    def _end_message(self) -> list[Event]:
+        out = []
+        if self.to is not None:
+            try:
+                args = json.loads(self.args) if self.args.strip() else {}
+            except ValueError:
+                args = None
+            if isinstance(args, dict):
+                out.append(Event("tool_call", call=ToolCall(name=self.to, arguments=args)))
+            else:                    # not a call's JSON: the text it is
+                out.append(Event("content", self.args))
+        self.head, self.to, self.args = True, None, ""
+        return out
+
+    def feed(self, delta: str) -> list[Event]:
+        self.buf += delta
+        out: list[Event] = []
+        while self.buf:
+            if self.head:
+                at = self.buf.find(HARMONY_MESSAGE)
+                if at < 0:
+                    return out       # the header is still arriving
+                self._header(self.buf[:at])
+                self.buf = self.buf[at + len(HARMONY_MESSAGE):]
+                self.head, self.lead = False, True
+                continue
+            if self.lead:
+                if self.buf.startswith(" "):
+                    self.buf = self.buf[1:]
+                self.lead = False
+            ends = [(self.buf.find(e), e) for e in HARMONY_ENDS if e in self.buf]
+            if ends:
+                at, tag = min(ends)
+                out += self._body_event(self.buf[:at])
+                self.buf = self.buf[at + len(tag):]
+                out += self._end_message()
+                continue
+            # hold back a tail that could start a terminator
+            keep = 0
+            for e in HARMONY_ENDS:
+                for k in range(min(len(e) - 1, len(self.buf)), 0, -1):
+                    if self.buf.endswith(e[:k]):
+                        keep = max(keep, k)
+                        break
+            out += self._body_event(self.buf[:len(self.buf) - keep])
+            self.buf = self.buf[len(self.buf) - keep:]
+            return out
+        return out
+
+    def finish(self, reason: str | None = None) -> list[Event]:
+        out: list[Event] = []
+        if not self.head:
+            out += self._body_event(self.buf)
+            self.buf = ""
+            if self.to is not None:  # a call the output ended inside: its text, never a call
+                out.append(Event("content", self.args))
+                self.to, self.args = None, ""
+        elif self.buf.strip() and HARMONY_MESSAGE not in self.buf:
+            self.buf = ""            # an unfinished header carries no text
+        return out
 
 
 RCALL_MAX = 32768        # the most of a `<tool_call>` inside the reasoning held while waiting for its end (#804)
