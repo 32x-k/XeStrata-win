@@ -162,7 +162,10 @@ In `xestrata --setup`'s questions, pressing Enter takes the recommended choice.
 **Running it while you are logged in:** `systemctl --user enable --now xestrata` keeps the model set up last running
 (no browser opens). Set it up with `xestrata` once first.
 
-**Updating:** `sudo apt upgrade` or `sudo dnf upgrade`. The model's settings are updated at the next start.
+**Updating:** when a new release is out, XeStrata says so in its window and on the chat page's About tab (it checks
+at the start and every six hours while it runs; `xestrata --check-update` checks now). Download the new package from
+[Releases](https://github.com/MistVVK/XeStrata/releases) and install it as before, with `sudo apt install ./<file>.deb`
+or `sudo dnf install ./<file>.rpm`. The model's settings are updated at the next start.
 
 **Fitting it to your PC:** `xestrata --calibrate` measures some of the engine's settings on this PC and keeps the
 fastest (about 5-10 minutes).

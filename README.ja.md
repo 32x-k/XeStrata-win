@@ -157,7 +157,9 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
 **ログインしている間ずっと動かす**: `systemctl --user enable --now xestrata` で、最後に設定したモデルを起動しておきます
 （ブラウザは開きません）。先に `xestrata` で一度設定しておきます。
 
-**更新**: `sudo apt upgrade` か `sudo dnf upgrade` で更新します。モデルの設定は次の起動で更新します。
+**更新**: 新しいリリースが出ると、起動したときと、動いている間は 6 時間ごとに調べて、端末とチャットのページの About に表示します（`xestrata --check-update` でも調べられます）。
+新しいパッケージを [Releases](https://github.com/MistVVK/XeStrata/releases) から取ってきて、インストールと同じく `sudo apt install ./<ファイル>.deb` か `sudo dnf install ./<ファイル>.rpm` で入れます。
+モデルの設定は次の起動で更新します。
 
 **自分の PC に合わせる**: `xestrata --calibrate` は、エンジンの設定のいくつかをこの PC で測り、速いものを残します
 （5〜10 分ほど）。
