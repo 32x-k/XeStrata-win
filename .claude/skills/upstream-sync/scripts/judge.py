@@ -42,10 +42,12 @@ while len(args) >= 2 and args[0] == "--prompt-only":
     prompt_only.add(args[1])
     args = args[2:]
 matrices = [(pathlib.Path(a), json.loads((pathlib.Path(a) / "matrix.json").read_text())) for a in args]
-unknown = prompt_only - {r["gpu"] for _, rows in matrices for r in rows}
+gpus = {r["gpu"] for folder, rows in matrices for r in rows + [
+    x for name in ("matrix-serve.json", "matrix-usage.json") if (folder / name).exists()
+    for x in json.loads((folder / name).read_text())]}
+unknown = prompt_only - gpus
 if unknown:
-    sys.exit(f"--prompt-only: no measurements of {', '.join(sorted(unknown))} (GPUs: "
-             f"{', '.join(sorted({r['gpu'] for _, rows in matrices for r in rows}))})")
+    sys.exit(f"--prompt-only: no measurements of {', '.join(sorted(unknown))} (GPUs: {', '.join(sorted(gpus))})")
 fails = judged = 0
 
 
