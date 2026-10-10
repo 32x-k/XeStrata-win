@@ -1,0 +1,100 @@
+{
+  "xe": {
+    "exe": "<HOME>/XeStrata-xe0.1.40.2.1/build/contrib/strata",
+    "cwd": "<HOME>/XeStrata-xe0.1.40.2.1",
+    "tokenizer": "<HOME>/Strata-data/packs/iq3_s/tokenizer",
+    "model_name": "qwen3.8-flash-next-iq3_s",
+    "lib_dirs": [
+      "<HOME>/XeStrata-xe0.1.40.2.1/.tools/intel-llvm-contrib/install/lib",
+      "<HOME>/qwen-flash-dual-v100-prep/cuda-12.8/lib",
+      "<HOME>/qwen-flash-dual-v100-prep/cuda-12.8/lib64"
+    ],
+    "gpus_asked": true,
+    "lazy_load": false,
+    "idle_unload_s": 0,
+    "cuda": 12,
+    "env": {
+      "CUDA_VISIBLE_DEVICES": "<GPU_UUID>,<GPU_UUID>"
+    },
+    "layer_split": "24",
+    "parallel": 2,
+    "gpu_pci": "0000:01:00.0",
+    "split_pci": [
+      "0000:0a:00.0"
+    ],
+    "log": "<HOME>/xestrata-new-vs-new-20261011/xe-engine.log",
+    "port": 52673,
+    "args": [
+      "--pack",
+      "<HOME>/Strata-data/packs/iq3_s",
+      "--native",
+      "<HOME>/Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+      "--ple-gguf",
+      "<HOME>/Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+      "--expert-profile",
+      "<HOME>/xestrata-new-vs-new-20261011/expert-profile.bin",
+      "--expert-cache",
+      "auto",
+      "--prefill",
+      "auto",
+      "--spec",
+      "4",
+      "--spec-min-p",
+      "0.5",
+      "--mtp",
+      "<HOME>/Strata-data/mtp/rt",
+      "--max-context",
+      "32768",
+      "--kv",
+      "int8"
+    ]
+  },
+  "up": {
+    "exe": "<HOME>/Strata-v0.1.42/build-cuda12/strata",
+    "cwd": "<HOME>/Strata-v0.1.42",
+    "tokenizer": "<HOME>/Strata-data/packs/iq3_s/tokenizer",
+    "model_name": "qwen3.8-flash-next-iq3_s",
+    "lib_dirs": [
+      "<HOME>/qwen-flash-dual-v100-prep/cuda-12.8/lib"
+    ],
+    "gpu": [
+      0,
+      1
+    ],
+    "gpus_asked": true,
+    "lazy_load": false,
+    "idle_unload_s": 0,
+    "cuda": 12,
+    "env": {
+      "CUDA_VISIBLE_DEVICES": "<GPU_UUID>,<GPU_UUID>"
+    },
+    "layer_split": "24",
+    "parallel": 2,
+    "log": "<HOME>/xestrata-new-vs-new-20261011/up-engine.log",
+    "port": 44551,
+    "args": [
+      "--pack",
+      "<HOME>/Strata-data/packs/iq3_s",
+      "--native",
+      "<HOME>/Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+      "--ple-gguf",
+      "<HOME>/Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+      "--expert-profile",
+      "<HOME>/xestrata-new-vs-new-20261011/expert-profile.bin",
+      "--expert-cache",
+      "auto",
+      "--prefill",
+      "auto",
+      "--spec",
+      "4",
+      "--spec-min-p",
+      "0.5",
+      "--mtp",
+      "<HOME>/Strata-data/mtp/rt",
+      "--max-context",
+      "32768",
+      "--kv",
+      "int8"
+    ]
+  }
+}

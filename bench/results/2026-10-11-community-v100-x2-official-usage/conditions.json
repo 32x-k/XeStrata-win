@@ -1,0 +1,18 @@
+{
+  "xe_tag": "xe0.1.40.2.2",
+  "xe_commit": "e32b8b0594095352365db0e140a68d5bf56d8b0f",
+  "upstream": "v0.1.42",
+  "method": "Unmodified tools/bench_core.py ab_usage; explicit per-engine dual-GPU configs to avoid bench.py usage_cfg dropping split_pci and upstream GPU visibility",
+  "rounds": 2,
+  "temperature": 0.7,
+  "context": 32768,
+  "parallel_slots": 2,
+  "actual_concurrency": 1,
+  "power_limit_w_per_gpu": 150,
+  "layer_split": "24+24",
+  "model": "IQ3_S",
+  "generate_serve_skipped": "official multi-GPU limitation",
+  "hardware": "name, uuid, pci.bus_id, memory.total [MiB], power.limit [W]\nTesla V100-PCIE-32GB, <GPU_UUID>, 00000000:01:00.0, 32768 MiB, 150.00 W\nTesla V100-PCIE-32GB, <GPU_UUID>, 00000000:0A:00.0, 32768 MiB, 150.00 W\n",
+  "upstream_commit": "61b3fb5dd3f1e8ec09cf7e4e05208bc6d3c46406",
+  "engine_logs": "xe-engine.log and up-engine.log (without diagnostic timing flags)"
+}
