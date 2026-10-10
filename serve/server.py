@@ -510,6 +510,7 @@ class StrataEngine:
     """
     silence_s = ENGINE_SILENCE_S         # #481: main() sets the config's engine_silence_s (survives restart())
     silent_note: str | None = None       # #481: why the server ended a silent engine (death_note says it)
+    gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
     last_err: str | None = None          # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
 
@@ -1544,7 +1545,11 @@ class StrataEngine:
         if age < state.get("next", stall_s) or state["base"] is None:
             return
         now = self._activity()
-        if now is not None and engine_frozen(state["base"], now):
+        try:
+            gpu_working = bool(self.gpu_busy()) if self.gpu_busy is not None else False
+        except Exception:  # noqa: BLE001 - a telemetry hiccup must not decide anything
+            gpu_working = False
+        if now is not None and not gpu_working and engine_frozen(state["base"], now):
             raise self._silent(f"the engine said nothing for {age:.0f} s and used no CPU or disk in that time (frozen; "
                                "STRATA_ENGINE_STALL_S sets this, 0 = off)")
         if now is not None:   # working: look again after another window from here, and say so once
@@ -2795,6 +2800,10 @@ class Service:
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
                                                       "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_pci=getattr(self, "gpu_pci", None))
+            if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
+                # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
+                # slow card keeps the GPU at work while the host thread sleeps)
+                self.engine.gpu_busy = lambda: (self.telemetry.snapshot()["now"].get("gpu_util") or 0) >= 10
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:
