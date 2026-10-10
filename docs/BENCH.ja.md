@@ -73,7 +73,7 @@ XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> python $S/
 XE="..." UP="..." XE_ROOT=... UP_ROOT=... XE_PROFILE=... UP_PROFILE=... DATA=<data> PY=<python> \
   python $S/bench_usage.py $o/IQ3_XXS <GPU>
 python $S/sync_collect.py $o/<file> xe-<commit> <tag>                         # matrix*.json と表
-python $S/judge.py --prompt-only B70 $o/IQ3_XXS ...                           # ALL PASS か FAIL <n>
+python $S/judge.py --prompt-only B70 --prev IQ3_XXS=<前の記録> $o/IQ3_XXS ...  # ALL PASS か FAIL <n>
 ```
 
 - モデルの既定は IQ3_XXS です。RAM の少ない PC では、setup が書いたモデルの設定を `CONFIG=xestrata-<モデル>.json` で渡すと、そのモデルのファイルと設定（RAM の予算、calibrate の結果）で両エンジンを測ります。
@@ -83,6 +83,7 @@ python $S/judge.py --prompt-only B70 $o/IQ3_XXS ...                           # 
 - generate は `--spec-follow` で両エンジンに upstream の答えをなぞらせ、テキストの違いを除きます。serve にはこの機能がありません。
 - 合格の幅: generate と、serve・通常使用の最初のプロンプトの速さは、XeStrata が upstream より 1% 以上遅くないこと。serve・通常使用のそれ以外（続きのターンの待ち時間、出力、最初のトークンまでの時間）は 5% 以上悪くないこと。
 - 温度は、serve が `MODES`（既定 `greedy t07`。`t10` は温度 1.0）、通常使用が `TEMPERATURE`（既定 0.7）で変えられます。
+- `--prev <ファイル>=<フォルダー>` を付けると、前の XeStrata の記録（前回の追従の記録か、リリースの記録）とも比べます。両方にあるマスごとに、プロンプトの速さは 1%、それ以外は 5% 以上悪くないこと。B70 の出力も比べます。
 - `--dry-run` を付けると、エンジンを動かさずに起動するコマンドを出します。
 
 ## リリースの表
