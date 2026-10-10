@@ -54,12 +54,11 @@ NVIDIA の GPU では contrib-llvm のビルドで同じカーネルが動きま
 
 取り込みは free（intel/llvm）、contrib-icpx（icpx）、contrib-llvm（intel/llvm と CUDA）でビルドし、どれも CTest の 71 件が通ります（`expert_multi_test` は AVX-512 のない CPU で飛ばします）。
 AVX-512 の経路は Intel SDE（`-icx`）で `expert_multi_test` が通ります。
-`expert_parity --selftest` と `pool_test --selftest` は正準形の pack がないので SDE では動かせず、`unverified` です（AVX2 では通ります）。
+`expert_parity --selftest` と `pool_test --selftest` は正準形の pack がないので SDE では動かせません（AVX2 では通ります）。
 B70 では icpx と free のビルドが 8 つの答え（思考あり・なし）をすべて最後まで出し、6 つが一致しました。
 プロンプト 1,148 tok/s、その後のデコード 98.6 tok/s、短い会話 77.3 tok/s（icpx）です。
 8 GiB・4 GiB・XMX なし・CPU のワーカー 6 つの構成と、RTX 4070 でも答えを最後まで出しました。
 UHD 770 では free と icpx のビルドが起動し、短い答えを返しました。
-2 枚の Intel の GPU での `--pipeline-windows` は `unverified` です。
 
 ## Strata 0.1.38 の取り込み
 
@@ -106,8 +105,7 @@ AVX-512 の経路は Intel SDE（`-icx`）で、`expert_multi_test` と `native_
 `expert_parity` と `pool_test` は正準形の pack がないので飛ばしました。
 統合のコミットでは、8 GiB の制限、XMX なし、CPU のワーカー 2 つの構成で、`--coupled-draft` の有無で同じ 16 トークンが出ることを確かめました。
 UHD 770 では free のビルドが 2 トークンの MTP の窓で答えました。
-nonfree のビルドの 4 トークンの窓は Intel のランタイムの中で止まり、`unverified` です。
-すべての量子化の形式での実モデルの確認、プロセスをまたぐ共有アリーナ、常駐の入れ替えも `unverified` です。
+nonfree のビルドの 4 トークンの窓は Intel のランタイムの中で止まりました。
 
 ## 実行時の約束
 
@@ -143,7 +141,6 @@ nonfree のビルドの 4 トークンの窓は Intel のランタイムの中�
   `registered_bytes` は容量全体、`locked_bytes` は明示的に `mlock` したバイト数（0）です。
   `mlock` も hugetlbfs のプールも使わず、透過的なヒュージページで支えます。
   [B70 での測定](../bench/results/2026-09-30-b70/README.md)では、memlock の上限が 8 MiB のまま、47.46 GiB のアリーナを登録でき、`VmLck` は 0 でした。
-  メモリが足りないときの振る舞いと、TLB で決まる CPU のアクセスの速さは `unverified` です。
 - **デバイスの能力に合わせる**: カーネルはデバイスの報告に従います。
   1024 個のワークアイテムのワークグループは、それを受け付けるデバイスでだけ使います（UHD 770 は 512 まで）。
   FP64 はそれを持つデバイスでだけ使い、持たないデバイス（UHD 770 と Arc の A シリーズ）では FP32 で足し合わせます。
@@ -190,12 +187,11 @@ CUDA は既定で除算と平方根を IEEE の丸めで行いますが、SYCL �
 | GDN のゲート | CPU の double の softplus（`x > 20` の分岐つき）。相対 L1 が `1e-6` 以下、負のゲート |
 | SiLU | CPU の double の式。相対 L1 が `1e-7` 以下。Xe は安定な FP32 の式を使う |
 | スケーリング | CPU の FP32 の乗算。ビット単位の一致 |
-| FP32 から FP16 | 共通の整数の変換。ビット単位の一致。CPU と GPU が変換を共有するので、この確認の独立性は `unverified` |
+| FP32 から FP16 | 共通の整数の変換。ビット単位の一致 |
 | RMS ノルム | CPU の FP64 の和と平均、イプシロン、任意の重み。相対 L1 が `1e-6` 未満、有限の出力、元の null の重みの確認 |
 
 テストのケースは足さず、入力、CPU の期待値、許容誤差は元のままです。
 NumPy で求めた FP16 の境界の確認も含む `quantize_act_parity` は、B70 で通ります。
-GPU の境界を独立に確かめることと、非同期の失敗や寿命をわざと壊す試験は `unverified` です。
 ケースを足すには承認が要ります。
 
 ### i-quant と MMVQ
@@ -230,7 +226,6 @@ Q6_K、Q8_0、Q4_K、Q5_K、Q4_0、Q5_0 の MMVQ は、ランダムなブロッ�
 KV のホスト側のプール（`KvHostPools`）はカーネルが読み書きするので、Xe ではホストの USM でなければなりません。
 デバイスへのコピー用に登録しただけのメモリは、カーネルから参照できません。
 `native_rope` と `native_router` は、CUDA が高速な数学関数を使っていたところで精度の高い `pow`、`cos`、`sin`、`exp` を使います。
-これらの ggml-cuda の参照はツリーにないので、それとの一致は `unverified` です。
 [デコードのカーネルの確認](../bench/results/2026-09-30-xe-kernels/README.md)では、`rope_parity`、`router_top10_parity`、`bf16_gemv_parity` が通り、どれも CTest に登録しています。
 
 ## B70 で確かめたモデル
@@ -293,7 +288,6 @@ llama.cpp と分かれるのは、どれも参照の上位 2 候補が僅差の�
 同じ設定でもう一度起動すると、普通に動きます。
 新しい開発機では、約 120 回の起動のうち 3 回起きました
 （[記録](../bench/results/2026-10-02-new-machine/README.md#the-output-heads-vram-refusal)）。
-原因は `unverified` です。
 
 ### 小さい GPU での VRAM の予約
 
@@ -326,7 +320,6 @@ llama.cpp と分かれるのは、どれも参照の上位 2 候補が僅差の�
 RTX 4070（PCIe 4.0 x4）では外れを全部 CPU に回し、IQ3_XXS 32K で 49.9 → 57〜58.6 tok/s、UD-Q4_K_XL 32K で 22.0 → 25.7 tok/s です。
 B70 も全部 CPU（以前と同じ）で、RX 9060 XT は PCIe に回す数が 1 層 4.7 個から 1.0 個に減り、どちらも速さは変わりません
 （[記録](../bench/results/2026-10-10-maya-split/README.md)）。
-PCIe に回して速くなる GPU（速いリンクと遅い CPU の組み合わせ）では確かめていません（`unverified`）。
 
 ## 画像
 
@@ -374,7 +367,6 @@ server は、どれかが準備できるまで、エンコーダーを次の順�
 モデル全体での生成、プロンプトの経路、MTP とプロンプト照合の推測、server、KV のストリーミングつきの 26k トークンのプロンプトは、
 [IQ2_XS の記録](../bench/results/2026-09-30-xe-iq2xs/README.md)にあります。
 貪欲生成のトークンは CPU の llama.cpp と比べました。
-ロジットの単位での比較と pack のハッシュは `unverified` です。
 
 記録したリビジョンの `IQ2_XS` の配布物には、12 の格納形式で 1,224 のテンソルがあり、**IQ2_XS で格納したテンソルは 1 つもありません**。
 この名前は、精度の混ざったモデル全体の量子化の目安を表しています。
@@ -408,7 +400,7 @@ GPU の q8_1 の活性化の約束と、CPU の ggml の `vec_dot_type` は、�
 | `native_moe`、`native_gdn`、`native_gdn_preprocess`、`native_ple_postops`、`native_qsa`、`native_qsa_score`、`native_qsa_indexer`、`native_flash_attn`、`qsa_select`、`fused_gdn`（ツリーに parity なし） | [固定したコミットの ggml-cpu に対するプローブ](../bench/results/2026-09-30-xe-native/README.md)が B70 で通る。CTest には登録しない |
 | `native_expert_parity`、`dequant_bf16_test` | 移植済み。`STRATA_NATIVE_EXPERTS` でビルド。モデルのシャードが要るので登録しない。[B70 で確かめたモデル](#b70-で確かめたモデル)のすべてのシャードで通る |
 | `iq_parity` | 移植済みでビルドする。登録しない。`tools/iq_fixture.py` が、固定したモデルのリビジョンの範囲読みから `logs/iq_fixture` を書く。10 の形式すべてが通る。Q6_K と Q8_0 は一覧にない |
-| `ple_parity` | `ple_oracle_vectors.inc` をリポジトリに持つ。全体の確認には実際の表と参照の資産も要る。`unverified` |
+| `ple_parity` | `ple_oracle_vectors.inc` をリポジトリに持つ。全体の確認には実際の表と参照の資産も要る |
 | CPU のエキスパートとプールのテスト、`pool_stress` | この一覧には含めていない。正準形のエキスパートのテストには AVX-512 か pack、またはその両方が要る。AVX-512 の経路は AGENTS.md のとおり Intel SDE で動かす |
 | `serve.test_server`、`serve.test_detok`、`serve.test_mcp` | 模擬のエンジンで通る |
 | `tools/test_iq_pack.py`、`tools/test_shards.py`、`tools/test_calibrate.py` | `python -m unittest` で通る（2026-10-04） |

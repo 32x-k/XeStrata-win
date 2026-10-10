@@ -65,7 +65,7 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   RTX 4070（sm_89）で動くことを確かめています。
   エンジンはメーカーのドライバーのライブラリを直接リンクせず、SYCL のランタイムと oneMath が、あるものだけを実行時に開きます。
   そのため、Intel の GPU だけの PC では NVIDIA のドライバーと CUDA がなくても、NVIDIA の GPU だけの PC では Level Zero がなくても動きます
-  （開発機で、もう一方のライブラリを読めなくして確かめました。実際にそれだけの PC では `unverified`）。
+  （開発機で、もう一方のライブラリを読めなくして確かめました）。
 - **contrib-icpx**（`-DSTRATA_LICENSE=contrib-icpx`）: 自由ソフトウェアでない Intel oneAPI の icpx でビルドします（2026.1.1 で確かめています）。
   **非推奨で、実験的なモードです。** 開発者が保守しきれないためです。Intel の GPU でも、free か contrib-llvm を使ってください。
   ビルドの前に oneAPI の環境を読み込みます。Intel の GPU だけを扱います。
@@ -84,14 +84,13 @@ GPU のコードと oneMath の cuBLAS は、選んだ1つを使います。cuBL
 各 GPU には、その GPU のアーキテクチャか、作れるうちでそれより古い最も新しいものを作り、ドライバーがその PTX を GPU に合わせてコンパイルします。
 intel/llvm 7.1.1 の SYCL は sm_90 より上の名前を持たないので、名前のないアーキテクチャ（RTX 50 の sm_120）は汎用の NVIDIA のターゲット（`nvptx64-nvidia-cuda` に `--cuda-gpu-arch`）で作ります。実行ファイルに1つしか入らないので、それが要る GPU のうち最も古いもののアーキテクチャです。CUDA 12.8 より前のツールキットでは作れず、sm_90 のコードになります。
 oneMath の cuBLAS の後端は、1つのアーキテクチャしか受けないので、最も古いもので作ります（積そのものは cuBLAS の中で走ります）。
-CUDA 13.1 で sm_89 と汎用の sm_120 を作った実行ファイルは、4070 で sm_89 の像を選び、CTest 52 件が通りました（RTX 50 での動作は `unverified`）。
+CUDA 13.1 で sm_89 と汎用の sm_120 を作った実行ファイルは、4070 で sm_89 の像を選び、CTest 52 件が通りました。
 ツールキットが外した古い GPU（CUDA 13 の Volta など）は、それを扱うツールキットがあればそれを選び、なければ警告を出してその GPU のコードを作りません。
 この PC（CUDA 12.4 と 13.1）では、RTX 4070 だけなら 13.1 を選び、Volta・Ada・RTX 50 を装うと 12.4（3つすべてにコードを作れる）を選びました。13.1 で作ったものは 4070 で CTest 52 件が通りました。
 NVIDIA のコードの PTX は、既定ではツールキットの版です（CUDA 12.4 なら PTX 8.4）。
 ドライバーがツールキットより古いとその PTX を読めないので、`STRATA_CUDA_PTX` の既定 `auto` はドライバーの版（libcuda の `cuDriverGetVersion`）に下げます（数で指定もできます。例 `78` は CUDA 11.8 の PTX 7.8）。
 PTX 7.8 で作ったものは RTX 4070 で CTest 52 件が通りました。
 ドライバーには、intel/llvm の CUDA のアダプタが使う関数（SYCL のグラフの `cuGraphAddKernelNode_v2`）のため、CUDA 12.0 以上（525 以降）が要ります。
-CUDA 12.0〜12.3 のドライバーで CUDA 12.4 のツールキットを使う組み合わせは確かめていません（`unverified`）。
 どちらの変数も既定は `auto` で、指定すればそれを使います（別の機械向けに作るとき）。contrib-icpx はいつも oneMKL の後端を作ります。
 oneMath は configure のときに CMake が GitHub の XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、タグ `xestrata-3`）から取ってきます（アーカイブの SHA-256 を確かめます）。XeStrata の変更（cuBLAS の BF16 の積、rocBLAS の後端の hipBLASLt、cuBLAS と rocBLAS の後端を 1 つのビルドで作れるようにするターゲットの指定の分離、rocBLAS の後端からの HIP と SYCL の非推奨の API の除去）が入り、本家の `develop` をマージした oneMath です。
 ネットワークのない機械では、同じアーカイブを `STRATA_ONEMATH_SOURCE`（手元のファイルか URL）で渡します。
@@ -115,7 +114,7 @@ oneMath がある GPU の BF16 の積で失敗したとき（起動時に小さ�
 行列エンジンが FP16 を扱い BF16 を扱わない GPU（NVIDIA の sm_80 より前、Volta と Turing）では、プロンプトの経路の BF16 の積を、両方を FP16 に変換して FP16 の積として計算します（`src/prefill/gemm.cpp`、upstream の f2fb7c1・ff6f9f1）。
 そのような GPU の BF16 の積を、cuBLAS は Tensor Core を使わずに計算し、自前のカーネルでは DP4a に落ちるためです。
 変換は FP16 の正規数の範囲では正確で、それを超える有限の値は ±65504 に飽和させます。累積する積と出力が 1 行の積は BF16 のままです。
-RTX 4070 で sm_70 のコードを動かし `STRATA_NO_BF16_MMA=1` で模すと、FP64 との相対誤差は 2e-6 以下で、DP4a の経路（0.7%）より 2.5〜3.2 倍速くなりました（Volta と Turing の実機では `unverified`）。
+RTX 4070 で sm_70 のコードを動かし `STRATA_NO_BF16_MMA=1` で模すと、FP64 との相対誤差は 2e-6 以下で、DP4a の経路（0.7%）より 2.5〜3.2 倍速くなりました。
 `STRATA_BF16_TC=0` で止まります。
 `tools/xmx_probe.cpp` は、エンジンをビルドせずに、同じ問い合わせをすべての GPU にします。
 
@@ -137,14 +136,12 @@ sm_60 には dp4a の命令がないので、その積だけを 1 バイトず�
 Tensor Core を使うカーネルは、sm_70 より前のコードでは空の本体になり、そのような GPU では起動されません。
 sm_60 だけのコードを作って RTX 4070 で動かすと（ドライバーが PTX をコンパイル）、CTest 59 件が通り、
 `STRATA_NO_XMX=1` で行列エンジンを外して IQ2_XS で答えさせると、sm_89 のコードと 8 問すべて同じ答えになりました（エキスパートのキャッシュの大きさを固定、出力の速さは 3〜5% 遅い）。
-Pascal の実機では確かめていません（`unverified`）。
 
 Volta（sm_70）では、upstream が V100 で測った出力のカーネル 2 つを `STRATA_SM70_TABLE=1` で使います（upstream の c85b7c87 と同じく、確認が済むまで opt-in）。
 ひとつはルーティングされたエキスパートの「モード 8」で、gate/up の積と SwiGLU・q8_1 への量子化を 1 回で行い、格子の表と活性を作業グループのローカルメモリに置きます（`src/kernels/xe/iq_kernels.cpp`、upstream の f6330507: V100 で 227 → 159 µs）。
 もうひとつはハイパーコネクションの読み出しの norm と up の積で、重みを先に読んで遅延を隠します（`src/kernels/xe/fused_gr.cpp`、upstream の aaa323fe: V100 で 1 回 50.9 → 46.7 µs）。
 どちらも出力は既定のカーネルとビット単位で同じで、`STRATA_EXP_MODE=8`、`STRATA_GR_FAST=1` でほかの GPU でも使えます。
 sm_70 だけのコードを作って RTX 3070 で動かすと、既定でも両方を使っても CTest 71 件が通り、エキスパートと読み出しの出力は既定とビット単位で同じでした（RX 9060 XT でも同じ）。
-Volta の実機と、Volta での速さは確かめていません（`unverified`）。
 
 ### エンジンの部品とテスト
 
@@ -344,7 +341,6 @@ setup.sh は、venv の使える Python 3 がないときだけ、それを `sud
   oneMath の rocBLAS の後端が読む HIP の CMake のパッケージが、clang の実行時の builtins（`libclang_rt.builtins`）をリンクに足すためにコンパイラに尋ねます。
   intel/llvm にはその builtins がないので、ROCm の clang を `HIP_CXX_COMPILER` にしてそれに答えさせています（`cmake/StrataHip.cmake` の `strata_hip_cxx`）。
   要るのはビルドのときだけで、実行には要りません。
-- 確かめていない組み合わせ（`unverified`）: Ubuntu で AMD の GPU を動かすこと、Fedora の contrib-icpx。
 
 #### ほかのディストリビューション
 

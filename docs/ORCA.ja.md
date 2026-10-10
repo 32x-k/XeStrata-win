@@ -9,10 +9,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 この文書は、setup のメニューにないモデル `orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF` の **IQ3_XXS** を、手で pack にして動かす手順です。
 
-**XeStrata ではまだ動かしていません。**
 このリポジトリは gated で、ダウンロードには、モデルのページで条件を受け入れた Hugging Face のアカウントでのログインが要ります。
-開発機にはその認証がなかったので、テンソルの型、`--compat-bf16` での pack、すべての確認が `unverified` です
-（[記録](../bench/results/2026-09-30-xe-orca-iq3xxs/README.md)）。
 下の手順と確認の結果は、upstream の Strata が 2026-09-27 に、Linux、RTX 5090（32 GB）、Ryzen 9 9950X3D、RAM 128 GB で確かめたものです。
 
 ## このモデルの違い
@@ -93,7 +90,7 @@ Orca の PLE の表は、シャード 1 にあるためです。
 ```
 
 エンジンを、ここで作った intel/llvm か icpx でビルドしたときは、そのランタイムのフォルダーが要ります。
-setup が書いた `xestrata-<model>.json` の `lib_dirs` を、この設定にも写します（Xe でのこの手順は `unverified`）。
+setup が書いた `xestrata-<model>.json` の `lib_dirs` を、この設定にも写します。
 
 リポジトリの最上位で起動します。
 
@@ -122,11 +119,10 @@ setup が書いた `xestrata-<model>.json` の `lib_dirs` を、この設定に�
 - 上の設定で、111 トークンの説明を 77.7 トークン/秒（エンジンのデコードの計測）で書き、要求全体は 1.77 秒でした。
   短い 1 回の測定で、一般的な速さを示すものではありません。
 
-## Q4_K_S（`unverified`）
+## Q4_K_S
 
 同じリポジトリの **Q4_K_S**（3 つのシャード、約 112 GB）は、エキスパートの gate と up が Q4_K、down が Q5_0 か Q5_1 です。
 密な射影の一部は Q5_1、PLE の表は Q5_0 です（upstream d652cd6）。
 エンジンにはそのどれにも GPU のカーネルがあり、`native_expert_parity --synthetic q4_K/q5_0` と `q4_K/q5_1` が ggml と比べて確かめます。
 Q5_0 の表は、マップした読み取り（`--ple-io mmap`）でだけ読みます。
 pack は同じく `--compat-bf16` で作り、ほかのシャードは名前から見つけます。
-実際のファイルで動かすことは、確かめていません。

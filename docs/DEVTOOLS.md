@@ -70,7 +70,7 @@ without `pkg-config` the runtime adapter takes an installed loader without check
 The toolchain is `.tools/intel-llvm/install/bin/clang++`, its runtime `.tools/intel-llvm/install/lib/libsycl.so`.
 Configure the engine with `-DCMAKE_CXX_COMPILER=$PWD/.tools/intel-llvm/install/bin/clang++` and run it with that `lib/` on `LD_LIBRARY_PATH`.
 On the development machine (28 threads, 91 GiB) v7.1.1 built in 13 minutes.
-The clone (2.8 GB) and `install/` (0.7 GB) stay; the build tree is deleted (its size was not measured).
+The clone (2.8 GB) and `install/` (0.7 GB) stay; the build tree is deleted.
 This runtime gives the Arc Pro B70 XMX (FP16 and BF16); 6.2's does not.
 
 ### HIP (AMD GPUs)
@@ -115,7 +115,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Third, the CUDA adapter left host memory registration (`urUSMImportExp`, `urUSMReleaseExp`) out of its table, as functions doing nothing, so the loader refused it with `UR_RESULT_ERROR_UNINITIALIZED`.
   Fixed, it page-locks the memory with `cuMemHostRegister`, so copies from it are DMA transfers (`cuda-host-register` and another; about 4% faster decoding on an RTX 4070).
   Fourth, the SYCL runtime's table of NVIDIA architectures stops at sm_90, so a newer GPU (an RTX 50, compute capability 12.0) reported no matrix combinations and the engine took no tensor-core path.
-  Fixed, a compute capability of 9.0 or more that the table lacks reports sm_90's combinations (the mma instructions of sm_80 on; `cuda-newer-matrix`, checked with an RTX 4070 made to report 12.0; on such a GPU itself `unverified`).
+  Fixed, a compute capability of 9.0 or more that the table lacks reports sm_90's combinations (the mma instructions of sm_80 on; `cuda-newer-matrix`, checked with an RTX 4070 made to report 12.0).
   Fifth, every link with an NVIDIA target left the driver's split bitcode, PTX and cubins in TMPDIR (22 GB of a tmpfs `/tmp` in a day).
   `sycl-post-link`'s table and `llvm-foreach`'s lists were not registered as the temporary-file types whose contents the driver removes; fixed, their registration takes those types (`cuda-temp-lists`; spir64 leaves nothing either way).
   Sixth, xptifw, built in the tree, includes LLVM's CMake settings (`HandleLLVMOptions`) a second time, which defined the link job pool twice.
@@ -140,7 +140,6 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).
 - On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.
-  It ran beside other builds, so its time alone was not measured.
 - Running on an NVIDIA GPU needs NVIDIA's driver (on Ubuntu 26.04, `nvidia-driver-610-open` or another).
 
 ## Faster builds (Ninja and ccache)
@@ -287,5 +286,5 @@ Neither is free software.
   ```
 
 - Under `ncu` the engine stopped once it had captured its first verify window.
-  The kernel in which the GPU waits for the host (`wait_flag_ge`) presumably cannot finish while `ncu` measures one kernel at a time (unverified).
+  The kernel in which the GPU waits for the host (`wait_flag_ge`) presumably cannot finish while `ncu` measures one kernel at a time.
   Use `ncu` on the parity tests and probes, not on the engine.

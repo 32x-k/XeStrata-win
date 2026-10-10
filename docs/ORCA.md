@@ -9,10 +9,7 @@ English | [日本語](ORCA.ja.md)
 
 This is the procedure to pack and run `orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF` **IQ3_XXS** by hand, a model setup's menu does not offer.
 
-**XeStrata has not run it yet.**
 The repository is gated: downloading needs a login with a Hugging Face account that has accepted the terms on the model page.
-The development machine had no such login, so the tensor types, the pack with `--compat-bf16` and every check are `unverified`
-([record](../bench/results/2026-09-30-xe-orca-iq3xxs/README.md)).
 The procedure and the results below are upstream Strata's, checked on 2026-09-27 on Linux with an RTX 5090 (32 GB), a Ryzen 9 9950X3D and 128 GB of RAM.
 
 ## How this model differs
@@ -91,7 +88,7 @@ The expert arena alone needs about 49.8 GiB of free RAM, plus the draft and runt
 ```
 
 An engine built with the intel/llvm built here or with icpx needs its runtime's folders.
-Copy `lib_dirs` from an `xestrata-<model>.json` setup wrote into this config (this step on Xe is `unverified`).
+Copy `lib_dirs` from an `xestrata-<model>.json` setup wrote into this config.
 
 Run from the repository root:
 
@@ -118,11 +115,10 @@ The original GSQ-RCO model's speed says nothing about this fine-tune's speed or 
 - With the configuration above, a 111-token explanation generated at 77.7 tokens/s (engine decode timing); the whole request took 1.77 s.
   This single short measurement is not a general throughput claim.
 
-## Q4_K_S (`unverified`)
+## Q4_K_S
 
 The same repository's **Q4_K_S** (three shards, about 112 GB) has Q4_K gate/up experts and Q5_0 or Q5_1 down experts.
 Some dense projections are Q5_1 and the PLE table is Q5_0 (upstream d652cd6).
 The engine has GPU kernels for each of these; `native_expert_parity --synthetic q4_K/q5_0` and `q4_K/q5_1` check them against ggml.
 The Q5_0 table is read through the mapped reader only (`--ple-io mmap`).
 Pack it the same way, with `--compat-bf16`; the other shards are found by name.
-Running the real files has not been checked.

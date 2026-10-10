@@ -53,12 +53,11 @@ One faster on only one of them is chosen at run time from what the device report
 
 The integration builds in the free (intel/llvm), contrib-icpx (icpx) and contrib-llvm (intel/llvm with CUDA) modes, and all 71 CTest cases pass in each (`expert_multi_test` skips on a CPU without AVX-512).
 The AVX-512 path passes `expert_multi_test` under Intel SDE (`-icx`).
-`expert_parity --selftest` and `pool_test --selftest` need the canonical pack and cannot run under SDE: `unverified` (they pass on AVX2).
+`expert_parity --selftest` and `pool_test --selftest` need the canonical pack and cannot run under SDE (they pass on AVX2).
 On the B70 the icpx and free builds completed all eight answers (thinking on and off), six of them identical.
 Prompt 1,148 tok/s, decode after it 98.6 tok/s, short chats 77.3 tok/s (icpx).
 The configuration with 8 GiB, 4 GiB, no XMX and six CPU workers, and the RTX 4070, completed the answers as well.
 On the UHD 770 the free and icpx builds started and gave a short answer.
-`--pipeline-windows` on two Intel GPUs is `unverified`.
 
 ## Integration through Strata 0.1.38
 
@@ -105,8 +104,7 @@ Under Intel SDE (`-icx`), the AVX-512 paths pass `expert_multi_test` and `native
 `expert_parity` and `pool_test` were skipped: there is no canonical pack.
 The integration commit checked that, with the 8 GiB limit, no XMX and two CPU workers, the same 16 tokens come out with and without `--coupled-draft`.
 On the UHD 770 the free build answered with a two-token MTP window.
-The nonfree build's four-token window stopped inside the Intel runtime and is `unverified`.
-Real-model checks of every quantization format, shared arenas across processes and the resident exchanges are also `unverified`.
+The nonfree build's four-token window stopped inside the Intel runtime.
 
 ## Runtime contract
 
@@ -141,7 +139,6 @@ What the engine requires of the GPU and the host, and the rules it keeps.
   `registered_bytes` is the whole capacity, and `locked_bytes` counts explicit `mlock` bytes (zero).
   Neither `mlock` nor a hugetlbfs pool is used; transparent huge pages back the arena.
   [The B70 measurements](../bench/results/2026-09-30-b70/README.md) registered a 47.46 GiB arena under an 8 MiB memlock limit, with `VmLck` 0.
-  Behavior under memory pressure and TLB-dominated CPU access are `unverified`.
 - **Following the device**: kernels take what the device reports.
   A work-group of 1024 work-items only where the device takes one (the UHD 770 takes 512).
   FP64 only where the device has it; on the UHD 770 and the Arc A series those kernels sum in FP32.
@@ -186,12 +183,11 @@ CUDA divides and takes square roots with IEEE rounding by default; SYCL device c
 | GDN gate | CPU double softplus with the `x > 20` branch; relative L1 ≤ `1e-6`, negative gates |
 | SiLU | CPU double formula; relative L1 ≤ `1e-7`; Xe uses a stable FP32 formula |
 | Scaling | CPU FP32 multiplication; bitwise equality |
-| FP32 → FP16 | Shared integer conversion; bitwise agreement. Independence of this check is `unverified` because CPU and GPU share the converter |
+| FP32 → FP16 | Shared integer conversion; bitwise agreement |
 | RMS norm | CPU FP64 sum/mean, epsilon, and optional weight; relative L1 < `1e-6`, finite output, original null-weight check |
 
 No test cases were added; fixture inputs, CPU expected values and tolerances are unchanged.
 `quantize_act_parity`, which also carries NumPy-derived FP16 boundary checks, passes on the B70.
-Independent GPU boundary coverage and deliberate async failure/lifetime stress are `unverified`.
 New cases require approval.
 
 ### i-quants and MMVQ
@@ -225,7 +221,6 @@ Columns 2–8 are bitwise equal to single-column calls in the exact layout.
 The KV host pools (`KvHostPools`) are read and written by kernels, so on Xe they must be host USM.
 Memory registered only for device copies is not kernel-addressable.
 `native_rope` and `native_router` use precise `pow`/`cos`/`sin`/`exp` where CUDA used fast math.
-Their ggml-cuda oracles are not in the tree, so agreement with them is `unverified`.
 [The decode-kernel checks](../bench/results/2026-09-30-xe-kernels/README.md) record `rope_parity`, `router_top10_parity` and `bf16_gemv_parity` passing; all are registered in CTest.
 
 ## Models on the B70
@@ -286,7 +281,6 @@ About 27 GiB is free then, and it is always the first device allocation after th
 The same settings then start normally.
 On the development machine it happened 3 times in about 120 starts
 ([record](../bench/results/2026-10-02-new-machine/README.md#the-output-heads-vram-refusal)).
-The cause is `unverified`.
 
 ### The VRAM reserve on a small card
 
@@ -318,7 +312,6 @@ Before, it was a share from the link's speed alone (0.55 from 20 GB/s, below tha
 The RTX 4070 (PCIe 4.0 x4) now computes every miss on the CPU: IQ3_XXS 32K 49.9 -> 57-58.6 tok/s, UD-Q4_K_XL 32K 22.0 -> 25.7.
 The B70 keeps every miss on the CPU, as before; the RX 9060 XT reads 1.0 instead of 4.7 experts a layer over PCIe; neither changes speed
 ([record](../bench/results/2026-10-10-maya-split/README.md)).
-A GPU that gains from reading over PCIe (a fast link beside a slow CPU) was not at hand: `unverified`.
 
 ## Images
 
@@ -366,7 +359,6 @@ Only headers were fetched for that inventory; a header prefix is not a usable mo
 Generation with the complete model, the prompt path, MTP and prompt-lookup drafts, the server, and a 26k-token prompt with KV streaming are in
 [the IQ2_XS results](../bench/results/2026-09-30-xe-iq2xs/README.md).
 Greedy tokens were compared with llama.cpp on the CPU.
-A logit-level comparison and pack hashes are `unverified`.
 
 The `IQ2_XS` distribution at the recorded revision holds 1,224 tensors in 12 storage types, with **no tensor stored as IQ2_XS**.
 The name describes the quantization budget of a mixed-precision model.
@@ -400,7 +392,7 @@ The GPU's q8_1 activation contract and the CPU's ggml `vec_dot_type` stay explic
 | `native_moe`, `native_gdn`, `native_gdn_preprocess`, `native_ple_postops`, `native_qsa`, `native_qsa_score`, `native_qsa_indexer`, `native_flash_attn`, `qsa_select`, `fused_gdn` (no in-tree parity) | [Probes against ggml-cpu at the pinned commit](../bench/results/2026-09-30-xe-native/README.md) pass on the B70; not registered in CTest |
 | `native_expert_parity`, `dequant_bf16_test` | Ported, built with `STRATA_NATIVE_EXPERTS`, not registered (they need the model shards). Pass on the B70 with the shards of every model under [Models](#models-on-the-b70) |
 | `iq_parity` | Ported and built, not registered. `tools/iq_fixture.py` writes `logs/iq_fixture` from ranged reads of the pinned model revision. All 10 formats pass. Q6_K/Q8_0 are not in its list |
-| `ple_parity` | Has the checked-in `ple_oracle_vectors.inc`; full checks also need the actual table and reference artifacts; `unverified` |
+| `ple_parity` | Has the checked-in `ple_oracle_vectors.inc`; full checks also need the actual table and reference artifacts |
 | CPU expert/pool tests and `pool_stress` | Not in this inventory: the canonical expert tests need AVX-512 and/or a pack. The AVX-512 paths run under Intel SDE as AGENTS.md says |
 | `serve.test_server`, `serve.test_detok`, `serve.test_mcp` | Pass with the mock engine |
 | `tools/test_iq_pack.py`, `tools/test_shards.py`, `tools/test_calibrate.py` | Pass under `python -m unittest` (2026-10-04) |

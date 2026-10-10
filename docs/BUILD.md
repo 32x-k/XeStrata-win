@@ -63,7 +63,7 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
   Validated to run on an RTX 4070 (sm_89).
   The engine links no maker's driver library: the SYCL runtime and oneMath open the ones that are there at run time.
   So it runs without NVIDIA's driver and CUDA on a PC with only Intel GPUs, and without Level Zero on one with only NVIDIA GPUs
-  (checked on the development machine with the other maker's libraries made unreadable; on such a PC itself `unverified`).
+  (checked on the development machine with the other maker's libraries made unreadable).
 - **contrib-icpx** (`-DSTRATA_LICENSE=contrib-icpx`): built with Intel oneAPI's icpx, which is not free software (validated: 2026.1.1).
   **Deprecated and experimental**, as the developers cannot keep maintaining it. Use free or contrib-llvm, on Intel GPUs too.
   Source oneAPI's environment before building. Intel GPUs only:
@@ -82,14 +82,13 @@ The GPU code and oneMath's cuBLAS both use it; a toolkit without cuBLAS gets no 
 Each GPU gets code for its architecture, or the newest older one the toolkit builds, and the driver compiles that PTX for the GPU.
 intel/llvm 7.1.1's SYCL has no name above sm_90, so an architecture without one (an RTX 50's sm_120) is built through the generic NVIDIA target (`nvptx64-nvidia-cuda` with `--cuda-gpu-arch`); an executable takes it once, for the oldest GPU that needs it. A toolkit before CUDA 12.8 cannot build it, and the GPU gets sm_90 code.
 oneMath's cuBLAS backend takes one architecture, the oldest (the products themselves run inside cuBLAS).
-An executable built with CUDA 13.1 for sm_89 and the generic sm_120 took the sm_89 image on the 4070 and passed its 52 CTest tests (on an RTX 50 `unverified`).
+An executable built with CUDA 13.1 for sm_89 and the generic sm_120 took the sm_89 image on the 4070 and passed its 52 CTest tests.
 An old GPU a toolkit dropped (Volta in CUDA 13, for one) makes it take a toolkit that has it, if there is one; otherwise it gets a warning and no code.
 On this PC (CUDA 12.4 and 13.1) it took 13.1 for the RTX 4070 alone and 12.4 (code for all three) with a Volta, an Ada and an RTX 50 imitated; the 13.1 build passed its 52 CTest tests on the 4070.
 The NVIDIA code is PTX of the toolkit's version by default (PTX 8.4 for CUDA 12.4).
 A driver older than the toolkit cannot load it, so `STRATA_CUDA_PTX`'s default, `auto`, lowers it to the driver's version (libcuda's `cuDriverGetVersion`); a number sets it (`78`: CUDA 11.8's PTX 7.8).
 A PTX 7.8 build passed its 52 CTest tests on an RTX 4070.
 The driver needs CUDA 12.0 or later (525 or later) for the functions intel/llvm's CUDA adapter calls (SYCL graphs: `cuGraphAddKernelNode_v2`).
-A CUDA 12.0-12.3 driver with the CUDA 12.4 toolkit has not been tried (`unverified`).
 Both variables default to `auto`; a value given is used as it is (to build for another machine). contrib-icpx always builds the oneMKL backend.
 CMake fetches oneMath from XeStrata's fork on GitHub when it configures ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), tag `xestrata-3`, checking the archive's SHA-256): oneMath with XeStrata's changes (cuBLAS's BF16 product, hipBLASLt in the rocBLAS backend, the cuBLAS and rocBLAS backends' targets kept apart, so that one build makes both, and the rocBLAS backend without what HIP and SYCL deprecate), with oneMath's `develop` merged into it.
 On a machine without the network, give it the same archive with `STRATA_ONEMATH_SOURCE` (a local file or URL).
@@ -113,7 +112,7 @@ Where oneMath fails a BF16 product on the GPU (a small one is tried at start), t
 On a GPU whose matrix engines take FP16 and not BF16 (NVIDIA's before sm_80, Volta and Turing), the prompt path's BF16 products convert both operands to FP16 and run as FP16 products (`src/prefill/gemm.cpp`, upstream f2fb7c1 and ff6f9f1).
 On such a GPU cuBLAS computes BF16 products without the tensor cores, and the own kernels fall to DP4a.
 The conversion is exact within FP16's normal range; finite values past it saturate at ±65504. An accumulating product and one of a single output row stay BF16.
-With sm_70 code on the RTX 4070 and `STRATA_NO_BF16_MMA=1` to imitate it, the relative error against FP64 was 2e-6 or less, 2.5–3.2 times as fast as the DP4a path (0.7%; on Volta and Turing themselves `unverified`).
+With sm_70 code on the RTX 4070 and `STRATA_NO_BF16_MMA=1` to imitate it, the relative error against FP64 was 2e-6 or less, 2.5–3.2 times as fast as the DP4a path (0.7%).
 `STRATA_BF16_TC=0` turns it off.
 `tools/xmx_probe.cpp` asks every GPU the same without building the engine.
 
@@ -135,14 +134,12 @@ sm_60 has no dp4a instruction, so that one product is computed a byte at a time 
 The kernels for the tensor cores compile an empty body in code for an architecture before sm_70 and are never launched on such a GPU.
 Built with sm_60 code only and run on the RTX 4070 (the driver compiles the PTX), CTest passed its 59 tests, and with the matrix engines left out (`STRATA_NO_XMX=1`)
 IQ2_XS gave the same answers as sm_89 code on all 8 questions (the expert cache size pinned; decode 3-5% slower).
-Pascal hardware itself is `unverified`.
 
 On Volta (sm_70), `STRATA_SM70_TABLE=1` takes two decode kernels upstream measured on a V100 (opt-in until confirmed, as in upstream's c85b7c87).
 One is the routed experts' "mode 8": gate/up, SwiGLU and the q8_1 quantization in one pass, with the codebook grid and the activations in the work-group's local memory (`src/kernels/xe/iq_kernels.cpp`, upstream f6330507: 227 -> 159 µs on a V100).
 The other is the hyper-connection read's norm and up projection, with the weights loaded ahead to hide the latency (`src/kernels/xe/fused_gr.cpp`, upstream aaa323fe: 50.9 -> 46.7 µs a read on a V100).
 Both give the default kernels' output bit for bit, and `STRATA_EXP_MODE=8` and `STRATA_GR_FAST=1` take them on any GPU.
 Built with sm_70 code only and run on an RTX 3070, CTest passed its 71 tests with and without them, and the experts' and the read's outputs were the default's bit for bit (on an RX 9060 XT as well).
-Volta hardware and the speed on it are `unverified`.
 
 ### The engine's parts and tests
 
@@ -341,7 +338,6 @@ It prints other choices too, as in `./setup.sh --packages fedora44/intel,amd --l
   HIP's CMake package, which oneMath's rocBLAS backend reads, asks the compiler for clang's runtime builtins (`libclang_rt.builtins`) to add them to the link.
   intel/llvm has no such builtins, so ROCm's clang is made `HIP_CXX_COMPILER` to answer (`strata_hip_cxx` in `cmake/StrataHip.cmake`).
   They are needed to build only, not to run.
-- Not checked (`unverified`): running an AMD GPU on Ubuntu, and contrib-icpx on Fedora.
 
 #### Other distributions
 

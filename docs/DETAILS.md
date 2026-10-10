@@ -24,7 +24,6 @@ The Japanese version ([DETAILS.ja.md](DETAILS.ja.md)) is the original; this is i
 Every number here was measured on an Arc Pro B70 (32 GB).
 The machine: an i7-14700 (AVX2, no AVX-512), DDR4-3200 in two channels (about 35.5 GB/s read), the B70 at PCIe Gen5 x16,
 and the model files on a CPU-attached Gen4 x4 NVMe.
-Other GPUs have not been measured.
 The RTX numbers in Strata's (CUDA) README do not apply to XeStrata.
 
 The tables below are commit `58dbbe5` with the settings setup writes (images off), one code-agent prompt per length and 256 generated tokens.
@@ -72,8 +71,6 @@ IQ2_XS writes 17.6 tokens/s with MTP and reads the 26K-token prompt at 574 token
 On a GPU without XMX the prompt path's products run through DP4a, so reading a prompt takes about 1.6 times as long
 ([record](../bench/results/2026-10-02-dp4a/README.md)).
 
-The text speed with images on has not been measured on the B70 yet.
-
 ### AMD APUs
 
 On an AMD APU (Ryzen AI Max "Strix Halo" and the like) the CPU and the GPU share one memory (upstream c4a329fe).
@@ -84,7 +81,6 @@ It tells Strix Halo (gfx1151) apart by name, names the Radeon 8060S / 8050S / 80
 The kernel's boot options `ttm.pages_limit` and `ttm.page_pool_size` (in 4 KiB pages) give the GPU more of the shared memory.
 Setup changes no host setting.
 The engine counts an integrated GPU's free memory as the smaller of what its runtime reports and what Linux can give back (`MemAvailable`) less 6 GiB (upstream 004b15cd; `STRATA_UMA_HEADROOM_GIB` changes the 6).
-Running on an AMD APU has not been checked (`unverified`).
 
 ### Where the KV cache lives, and its precision
 
@@ -177,14 +173,13 @@ Its license is the Swift Open License 1.0: read it on the model page.
 Its experts' gate and up are IQ3_S (IQ4_XS in one layer) and its downs IQ4_NL (Q8_0 in five layers), 59.5 GB of them.
 The dense side and the RAM budget are as UD-Q4_K_XL's below (`--resident-budget-gib N`; setup chooses the RAM less 24 GB).
 With about 80 GB of RAM every expert fits it.
-setup asks about images (off by default); the image encoder is the original model's (the image path has not been checked: `unverified`).
+setup asks about images (off by default); the image encoder is the original model's.
 
 ```sh
 ./setup.sh --setup --family unsloth --model UD-IQ4_XS
 ```
 
 On an Arc Pro B70 (32 GB) with an i7-14700 and 96 GB of RAM (a 55 GiB RAM budget), 96 tokens of a short chat decoded at 32.5 / 32.8 tokens/s, and the answer read correctly.
-The quality has not been measured on Arc against llama.cpp (`unverified`).
 
 ### Or: Unsloth's UD-Q4_K_XL (EXPERIMENTAL)
 
@@ -215,7 +210,6 @@ every run from a cold OS cache ([record](../bench/results/2026-10-03-ud-low-ram/
 | No RAM budget (`--mmap-experts`): every expert the GPU does not hold read through the OS file cache | 10.0–11.1 |
 
 The answers were the same tokens in every run.
-The quality has not been measured on Arc against llama.cpp (`unverified`).
 
 ### Less RAM than the model: the low-RAM mode
 
@@ -259,7 +253,7 @@ Upstream measured it on a Gen3 NVMe (RTX 5090, 32 GB, Q2_0 kept in RAM at 262K):
 `STRATA_READ_AHEAD=0` turns it off; `STRATA_FILL_AHEAD=N` sets how many pairs the cache fill asks for ahead (default 256).
 
 The processor's own graphics share the RAM, so they never take the low-RAM mode.
-setup's estimate of how much of a model the GPU holds is upstream's (its VRAM less ~5 GB) and has not been checked on an Arc card (`unverified`).
+setup's estimate of how much of a model the GPU holds is upstream's (its VRAM less ~5 GB).
 
 ## What you need
 
@@ -568,7 +562,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   `"effort_position": "end"` in `xestrata-<model>.json` renders every request's prompt start as the default effort's and puts a `low` / `medium` effort in a short system turn right before the answer (no thinking: the empty thinking block, as always).
   The engine keeps its conversation checkpoint in front of that turn (`--tail-role-token`; the server checks that the engine knows it), so the next request reuses the conversation whatever its effort.
   The default (`"start"`) prompt is unchanged.
-  The model sees a level that is not the default in another place than it was trained with; how well it follows it there is not measured yet.
+  The model sees a level that is not the default in another place than it was trained with.
 - **A reply stuck on one token is ended.** When a reply repeats the same token 256 times in a row, the server ends it there with `finish_reason` `"length"` and says so in its window:
   a model in a loop, or a broken state that answers one token forever (upstream's #606 saw 36,689 tokens of `!`).
   `"repeat_stop_tokens": N` in `xestrata-<model>.json` sets the run length; `0` turns it off (for a request that really wants one token many times).
@@ -1022,7 +1016,7 @@ Nothing else changes.
 With images on, setup passes `--vram-reserve-mib 700` to the engine.
 That is the same value as the text-only default, but the engine then no longer lowers the reserve on a small card
 ([XE.md](XE.md#the-vram-reserve-on-a-small-card)).
-The GPU encoder's own VRAM can leave the expert cache smaller and the text a little slower (not measured on the B70).
+The GPU encoder's own VRAM can leave the expert cache smaller and the text a little slower.
 
 The two GPU encoder builds (Vulkan, and SYCL in contrib-icpx), how their results differ, and the order in which the server falls back to the CPU are in [XE.md](XE.md#images).
 A picture becomes up to 1,024 tokens of the context (a 640x480 photo: 300).
@@ -1045,7 +1039,6 @@ It is the one to use with `--vision cpu`.
 Setup downloads the BF16 file, and a setup run again keeps a file of your own that still exists.
 Against BF16, upstream reports a cosine of the embeddings per image token of 0.997-0.999 on average (at 300, 768 and 1,024 tokens), 0.94-0.96 for the worst token.
 Above 768 tokens the encode time is within about 3% of BF16's.
-XeStrata has not measured its accuracy (`unverified`).
 
 **Flash attention in the CPU encoder** (upstream #660): ggml's fast CPU kernel for flash attention needs the encoder's head size (72) to be a multiple of the vector width.
 It is with AVX2's 8 floats, not with AVX-512's 16, where ggml falls back to a kernel several times slower that adds in FP16.

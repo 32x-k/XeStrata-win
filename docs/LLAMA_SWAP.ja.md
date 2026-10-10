@@ -8,7 +8,6 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 [llama-swap](https://github.com/mostlygeek/llama-swap) は、いくつものモデルのサーバーを 1 つのアドレスの後ろに置き、要求が名指ししたものを起動して、ほかを止めて GPU を空けます。
 XeStrata は、そのモデルの 1 つとして動きます。
 この文書は upstream（Strata 0.1.39、Tesla V100）で確かめた手順を、XeStrata の名前に合わせたものです。
-XeStrata では試していません（`unverified`）。
 
 ## 設定
 

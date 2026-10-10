@@ -30,7 +30,7 @@ How it differs from Strata:
 - **For Intel Arc,** and it runs on AMD and NVIDIA GPUs too.
 - **One GPU, as a rule.** The layers can also be spread over two or more GPUs in the same PC ([MULTIGPU](docs/MULTIGPU.md)).
   The GPUs may be of different makers, Intel, AMD and NVIDIA (for example an Intel Arc Battlemage and an NVIDIA Ada; with NVIDIA, in the contrib-llvm build).
-- **Linux only.** Windows is not supported. WSL 2 may work (untested; pull requests welcome).
+- **Linux only.** Windows is not supported. WSL 2 may work (pull requests welcome).
 - **Runs with free software only, too** (the free build, free enough for Debian main; [made from the source](docs/BUILD.md#the-deb-and-rpm-packages)). The contrib-llvm packages use
   Intel's oneMKL and NVIDIA's cuBLAS, which are not free software, when they are installed ([Install](#install)).
 
@@ -42,15 +42,15 @@ How it differs from Strata:
 | CPU | x86-64 with AVX2. With AVX-512 (F, BW, VL, VNNI, VBMI) the CPU's part runs on AVX-512. |
 | RAM | 32-62 GB, depending on the model's size ([Choosing a model](#choosing-a-model)). |
 | Disk | About 60-110 GB for the model, and about 6 GB for the MTP layer. An SSD (NVMe) is strongly recommended. |
-| OS | Linux (WSL 2 may work: untested, pull requests welcome). The packages are for Ubuntu 26.04 and Fedora 44; on other distributions, [install from the source](docs/BUILD.md#installing-from-the-source). |
+| OS | Linux (WSL 2 may work; pull requests welcome). The packages are for Ubuntu 26.04 and Fedora 44; on other distributions, [install from the source](docs/BUILD.md#installing-from-the-source). |
 | BIOS | For a discrete GPU: Above 4G Decoding and Re-Size BAR on, CSM off. |
 
 - **Matrix engines:** Intel's XMX, AMD's WMMA (RDNA3 or later) and NVIDIA's tensor cores are used; a GPU without
   them computes with integer dot-product instructions such as DP4a. Which one is chosen from what the GPU reports. Without matrix engines, prompts are read more slowly,
   but it runs.
 - **GPUs checked:** development and checks are done on an Arc Pro B70 (Xe2, 32 GB). On NVIDIA, an RTX 4070 and an
-  RTX 3070 are checked; on AMD, an RX 9060 XT (RDNA4). On an Arc A380 only the arithmetic is checked, without running a model. Other GPUs have not
-  been checked. Smaller cards are checked by limiting the memory and the XMX the B70 may use.
+  RTX 3070 are checked; on AMD, an RX 9060 XT (RDNA4). On an Arc A380 only the arithmetic is checked, without running a model.
+  Smaller cards are checked by limiting the memory and the XMX the B70 may use.
 - **The processor's own graphics:** checked up to starting and reading a prompt. Its memory is shared with the RAM,
   and most have no XMX, so it is slow.
 

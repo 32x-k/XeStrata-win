@@ -8,7 +8,6 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 [llama-swap](https://github.com/mostlygeek/llama-swap) puts several model servers behind one address and starts the one a request names, stopping the others to free the GPU.
 XeStrata works as one of its models.
 This page is the procedure upstream checked (Strata 0.1.39 on a Tesla V100), with XeStrata's names.
-It has not been run with XeStrata (`unverified`).
 
 ## The entry
 

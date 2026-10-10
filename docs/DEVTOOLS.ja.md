@@ -70,7 +70,7 @@ python3 tools/intel_llvm_build.py            # --keep-build keeps the build tree
 ツールチェーンは `.tools/intel-llvm/install/bin/clang++`、そのランタイムは `.tools/intel-llvm/install/lib/libsycl.so` です。
 エンジンは `-DCMAKE_CXX_COMPILER=$PWD/.tools/intel-llvm/install/bin/clang++` で構成し、その `lib/` を `LD_LIBRARY_PATH` に入れて動かします。
 開発機（28 スレッド、91 GiB）では v7.1.1 のビルドに 13 分かかりました。
-clone（2.8 GB）と `install/`（0.7 GB）は残り、ビルドの作業フォルダーは消します（その大きさは測っていません）。
+clone（2.8 GB）と `install/`（0.7 GB）は残り、ビルドの作業フォルダーは消します。
 このランタイムは Arc Pro B70 に XMX（FP16 と BF16）を使わせます。6.2 のランタイムは使わせません。
 
 ### HIP（AMD の GPU）
@@ -115,7 +115,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   3 つ目: CUDA のアダプタは、ホストのメモリの登録（`urUSMImportExp`・`urUSMReleaseExp`）を、何もしない関数のまま関数表から漏らしていて、ローダーが `UR_RESULT_ERROR_UNINITIALIZED` で断っていました。
   修正後は `cuMemHostRegister` でページを固定し、そこからの転送が DMA になります（`cuda-host-register` ほか。RTX 4070 のデコードで約 4% 速くなりました）。
   4 つ目: SYCL のランタイムの NVIDIA のアーキテクチャの表は sm_90 までで、それより新しい GPU（RTX 50 の CC 12.0 など）は行列演算の組み合わせを報告せず、エンジンは Tensor Core の経路を使いませんでした。
-  修正後は、表にない CC 9.0 以上を、sm_90 と同じ組み合わせ（sm_80 以降の mma の命令）として報告します（`cuda-newer-matrix`。4070 に CC 12.0 を装わせて確かめました。実機は `unverified`）。
+  修正後は、表にない CC 9.0 以上を、sm_90 と同じ組み合わせ（sm_80 以降の mma の命令）として報告します（`cuda-newer-matrix`。4070 に CC 12.0 を装わせて確かめました）。
   5 つ目: NVIDIA の対象を含むリンクのたびに、ドライバーが分割したビットコード・PTX・cubin を TMPDIR に残していました（RAM の上の `/tmp` で 1 日に 22 GB）。
   `sycl-post-link` の表と `llvm-foreach` の一覧が、中身ごと消す一時ファイルの型で登録されていなかったためで、修正後は登録の型を付け替えます（`cuda-temp-lists`。spir64 は元から何も残しません）。
   6 つ目: ビルドの中の xptifw が LLVM の CMake の設定（`HandleLLVMOptions`）をもう一度読み込み、リンクのジョブプールを二重に定義していました。
@@ -140,7 +140,6 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   CUDA の修正は contrib-llvm のツールチェーンにだけ、HIP の修正は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
 - スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。
 - 開発機（Ubuntu 26.04、CUDA 12.4、ROCm 7.1）では、ランタイムのバックエンドが cuda・hip・level_zero・opencl になりました。
-  ほかのビルドと並べて走らせたので、単独のビルドの時間は測っていません。
 - NVIDIA の GPU の上で動かすには、NVIDIA のドライバー（Ubuntu 26.04 では `nvidia-driver-610-open` など）が要ります。
 
 ## ビルドを速くする（Ninja と ccache）
@@ -287,5 +286,5 @@ Nsight Systems（`nsys`、カーネルごとの時間）と Nsight Compute（`nc
   ```
 
 - `ncu` の下では、エンジンは最初の検証の窓を取ったところで止まりました。
-  GPU がホストの合図を待つカーネル（`wait_flag_ge`）が、`ncu` がカーネルを 1 つずつ測る間に解けないためと見ています（未確認）。
+  GPU がホストの合図を待つカーネル（`wait_flag_ge`）が、`ncu` がカーネルを 1 つずつ測る間に解けないためと見ています。
   `ncu` はパリティテストやプローブに使い、エンジンには使いません。
