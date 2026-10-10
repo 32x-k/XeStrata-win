@@ -377,6 +377,8 @@ tools/package/build.sh fedora44 cuda13.4
   with the HIP target, and the CUDA target for the cuda variants), the image encoders (CPU and Vulkan) and the engine, and CPack makes the packages
   (`tools/package/container.sh`, `cmake/packaging.cmake`).
   The container is removed at the end. intel/llvm is built every time, so a build takes a while.
+  The one thing kept between builds is the compiler cache (ccache, `build/pkg-ccache/<distro>/`, at most `XESTRATA_CCACHE_MAX`, default 30G):
+  a second package of the same distribution takes most of intel/llvm's and the engine's objects from it. Deleting the folder makes the next build compile everything again.
   `XESTRATA_JOBS=16 tools/package/build.sh …` sets how many files compile at once (default: the threads; intel/llvm links as many at once as the free RAM allows).
 - **No GPU needed**: the container gets no GPU and nothing of this PC's.
   CMake values that come from this PC's GPUs or CPU (`auto` for `STRATA_CUDA_ARCHS`, `STRATA_HIP_ARCHS`, `STRATA_ONEMKL`, `STRATA_CUDA_PATH` and
@@ -385,7 +387,7 @@ tools/package/build.sh fedora44 cuda13.4
 - **Network**: it fetches the distribution's packages, intel/llvm, llama.cpp, oneMath, and for the cuda variants NVIDIA's
   and Intel's repositories (the CUDA toolkit and oneMKL).
 - **What comes out**: `build/pkg/<distro>-<variant>/` with the packages and `BUILDINFO` (the commit, the image, the intel/llvm
-  and llama.cpp versions, the versions of the packages the build had).
+  and llama.cpp versions, the compiles taken from ccache and not, the versions of the packages the build had).
 
 | Variant | Distribution | CUDA toolkit | NVIDIA code |
 | --- | --- | --- | --- |

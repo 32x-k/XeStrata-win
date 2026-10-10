@@ -29,7 +29,7 @@ case "$distro" in
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -q
     apt-get install -y -q --no-install-recommends git cmake ninja-build g++ libhwloc-dev libzstd-dev python3 \
-      patchelf curl ca-certificates unzip libblosc2-dev libvulkan-dev glslc spirv-headers dpkg-dev file gpg lld
+      patchelf curl ca-certificates unzip libblosc2-dev libvulkan-dev glslc spirv-headers dpkg-dev file gpg ccache lld
     python_deps="python3 (>= 3.10), python3-numpy, python3-jinja2, python3-regex, python3-yaml, python3-tqdm, \
 python3-requests, python3-pil, python3-psutil"
     # Ubuntu's libze-intel-gpu1 does not depend on the graphics compiler it opens (libigc2, libigdfcl2): without them
@@ -58,7 +58,7 @@ python3-requests, python3-pil, python3-psutil"
     ;;
   fedora*)
     dnf install -y -q git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static python3 patchelf curl unzip \
-      blosc2-devel vulkan-loader-devel glslc spirv-headers-devel rpm-build file findutils lld
+      blosc2-devel vulkan-loader-devel glslc spirv-headers-devel rpm-build file findutils ccache lld
     python_deps="python3 >= 3.10, python3-numpy, python3-jinja2, python3-regex, python3-pyyaml, python3-tqdm, \
 python3-requests, python3-pillow, python3-psutil"
     level_zero="oneapi-level-zero, intel-level-zero"
@@ -87,6 +87,15 @@ EOF
       hipblas-common-devel
     ;;
 esac
+# build.sh's compiler cache (/ccache, CCACHE_DIR), shared by the packages of a distribution: every compile of
+# intel/llvm, the image encoders and the engine goes through it.  ccache uses an object only for the same
+# preprocessed source (with -fsycl the device side's too), flags and compiler, so the CUDA versions' adapters stay
+# apart; the compilers are compared by their content, as intel/llvm's clang is built anew in each container.
+if [ -n "${CCACHE_DIR:-}" ]; then
+  export CMAKE_C_COMPILER_LAUNCHER=ccache CMAKE_CXX_COMPILER_LAUNCHER=ccache CCACHE_COMPILERCHECK=content
+  trap 'chown -R "$XESTRATA_UID:$XESTRATA_GID" "$CCACHE_DIR"' EXIT
+  ccache -z
+fi
 if [ "$license" = contrib ]; then
   export PATH="$cuda_path/bin:$PATH"
   [ -x "$cuda_path/bin/nvcc" ] || export PATH="/usr/bin:$PATH"   # Debian's toolkit: /usr/lib/cuda, nvcc in /usr/bin
@@ -207,6 +216,8 @@ find . -maxdepth 1 \( -name '*.deb' -o -name '*.rpm' \) -exec cp {} /out/ \;
   echo "intel/llvm: $(sed -n 's/.*"tag": "\(.*\)".*/\1/p' "$llvm/install/XESTRATA.json")"
   echo "llama.cpp: $commit"
   echo "jobs: ${XESTRATA_JOBS:-default}"
+  [ -z "${CCACHE_DIR:-}" ] || ccache --print-stats | awk -F'\t' '/^(direct|preprocessed)_cache_hit\t/ { h += $2 }
+    /^cache_miss\t/ { m = $2 } END { print "ccache: " h + 0 " hits, " m + 0 " misses" }'
   echo "packages:"
   case "$distro" in
     ubuntu*) dpkg-query -W -f '  ${Package} ${Version}\n' ;;

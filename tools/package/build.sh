@@ -14,6 +14,11 @@
 # the build tools, builds intel/llvm, the image encoders and the engine, and runs CPack (tools/package/container.sh);
 # it gets no GPU and nothing of this PC's, and is removed afterwards.  Only build/pkg/<distro>-<variant>/ comes out:
 # the packages and BUILDINFO (the commit, the image, the packages the build had).
+#
+# The one thing kept between builds is the compiler cache, build/pkg-ccache/<distro>/ (ccache, one per distribution
+# as their compilers differ; at most XESTRATA_CCACHE_MAX, default 30G): a package built after another of the same
+# distribution takes most of intel/llvm's and the engine's objects from it.  Deleting the folder makes the next
+# build compile everything again.
 set -eu
 
 usage() {
@@ -48,9 +53,13 @@ out=build/pkg/$distro-$variant
 rm -rf "$out"
 mkdir -p "$out"
 
+cache=build/pkg-ccache/$distro
+mkdir -p "$cache"
+
 echo "building $distro $variant from $rev in $image ..."
 git archive --format=tar "$rev" | docker run --rm -i --pull missing \
-  -v "$PWD/$out:/out" \
+  -v "$PWD/$out:/out" -v "$PWD/$cache:/ccache" -e CCACHE_DIR=/ccache \
+  -e CCACHE_MAXSIZE="${XESTRATA_CCACHE_MAX:-30G}" \
   -e XESTRATA_DISTRO="$distro" -e XESTRATA_VARIANT="$variant" -e XESTRATA_COMMIT="$rev" \
   -e XESTRATA_IMAGE="$image" -e XESTRATA_UID="$(id -u)" -e XESTRATA_GID="$(id -g)" \
   -e XESTRATA_JOBS="${XESTRATA_JOBS:-}" \

@@ -379,6 +379,8 @@ tools/package/build.sh fedora44 cuda13.4
   コンテナの中でビルドの道具とディストリビューションの ROCm を入れ、intel/llvm（`tools/intel_llvm_build.py`、HIP のターゲット付き、cuda の版では CUDA のターゲットも）、
   画像のエンコーダー（CPU と Vulkan）、エンジンをビルドし、CPack でパッケージにします（`tools/package/container.sh`、`cmake/packaging.cmake`）。
   コンテナは終わると消えます。intel/llvm を毎回ビルドするので時間がかかります。
+  ビルドの間に残すのはコンパイラのキャッシュ（ccache、`build/pkg-ccache/<distro>/`、上限は `XESTRATA_CCACHE_MAX`、既定 30G）だけで、
+  同じディストリビューションの 2 つ目からは intel/llvm とエンジンのほとんどをそこから取ります。フォルダを消すと、次は全部コンパイルし直します。
   `XESTRATA_JOBS=16 tools/package/build.sh …` のように、同時にコンパイルするファイルの数を決められます（既定はスレッドの数。intel/llvm のリンクは、空いている RAM に収まる数まで）。
 - **GPU なしでビルドできます**: コンテナには GPU も手元の PC のものも渡しません。
   手元の GPU や CPU から決まる CMake の値（`STRATA_CUDA_ARCHS`、`STRATA_HIP_ARCHS`、`STRATA_ONEMKL`、`STRATA_CUDA_PATH`、`STRATA_CUDA_PTX` の `auto`、
@@ -387,7 +389,7 @@ tools/package/build.sh fedora44 cuda13.4
 - **ネットワーク**: ディストリビューションのパッケージ、intel/llvm、llama.cpp、oneMath、cuda の版では NVIDIA と Intel のリポジトリ
   （CUDA ツールキットと oneMKL）を取ってきます。
 - **出てくるもの**: `build/pkg/<distro>-<variant>/` に、パッケージと `BUILDINFO`（コミット、イメージ、intel/llvm と llama.cpp の版、
-  ビルドに入れたパッケージの版）を置きます。
+  ccache から取った数と取らなかった数、ビルドに入れたパッケージの版）を置きます。
 
 | 版 | ディストリビューション | CUDA ツールキット | NVIDIA のコード |
 | --- | --- | --- | --- |
