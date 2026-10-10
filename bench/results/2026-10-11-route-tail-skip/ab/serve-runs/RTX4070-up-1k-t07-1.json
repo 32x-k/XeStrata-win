@@ -1,0 +1,54 @@
+{
+ "gpu": "RTX4070",
+ "arm": "up",
+ "tier": "1k",
+ "mode": "t07",
+ "round": 1,
+ "turns": [
+  {
+   "generated": 208,
+   "prompt": 1017,
+   "prompt_ms": 3527.1,
+   "decode_ms": 3828.2,
+   "finish": "stop",
+   "accepted": 138,
+   "offered": 184,
+   "reused": 0,
+   "read": 1017
+  },
+  {
+   "generated": 106,
+   "prompt": 1246,
+   "prompt_ms": 279.6,
+   "decode_ms": 1638.9,
+   "finish": "stop",
+   "accepted": 74,
+   "offered": 90,
+   "reused": 1224,
+   "read": 22
+  },
+  {
+   "generated": 78,
+   "prompt": 1379,
+   "prompt_ms": 356.0,
+   "decode_ms": 1342.7,
+   "finish": "stop",
+   "accepted": 51,
+   "offered": 68,
+   "reused": 1351,
+   "read": 28
+  },
+  {
+   "generated": 135,
+   "prompt": 1483,
+   "prompt_ms": 339.5,
+   "decode_ms": 1942.6,
+   "finish": "stop",
+   "accepted": 95,
+   "offered": 116,
+   "reused": 1456,
+   "read": 27
+  }
+ ],
+ "why": null
+}

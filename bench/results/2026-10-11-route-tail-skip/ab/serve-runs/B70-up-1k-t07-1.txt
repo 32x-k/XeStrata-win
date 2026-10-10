@@ -1,0 +1,80 @@
+# <repo>/build/contrib-llvm/strata --serve --pack <data>/packs/qwen-iq3_xxs --native <data>/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf --ple-gguf <data>/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf --expert-profile <repo>/data/expert-profile.bin --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp <data>/mtp/rt --max-context 8192
+strata generate: memory guard: limit 123.2 GiB (source: meminfo), current 17.0 GiB, reclaimable cache credited 0.0 GiB; available 106.2 GiB (MemAvailable 106.2 GiB), floor 2560 MiB
+strata generate: GPU Intel(R) Graphics [0xe223], 256 compute units, 30.3 GiB, prompt matrix products on oneMath (oneMKL), XeStrata's own kernels (XMX) for the rest
+strata generate: PCIe probe: 27.8 GB/s host->device (best of 27.1 27.6 27.3 27.8) -> pcie_frac 0.55 (default 0.55)
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2 (multi-token for the i-quant gate/up rows)
+strata generate: native pack: <data>/packs/qwen-iq3_xxs experts (largest blob 2.33 MB), token embedding IQ3_S in mapped host memory (260 MiB, 0.1 s)
+strata generate: 1466 MiB of weights loaded from <data>/packs/qwen-iq3_xxs in 0.2 s (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 1781.11 MiB of weights, in 0.3 s
+strata generate: PLE table format IQ4_NL
+strata generate: the SSD is kept awake while rows are read: one page of the table after 100 ms without a read, until 60 s after the last request (STRATA_SSD_KEEPALIVE=0 turns it off)
+strata generate: PLE on, table 320001536 rows of <data>/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf
+strata mtp: draft layer loaded, 809 MiB of VRAM (experts 675, dense 111), files read in 0.24 s (3247 MiB/s)
+strata generate: experimental native Q5_K head, 437043200 bytes, in 0.1 s
+strata generate: expert arena: one mapping registered for device copies in 2 pieces (the GPU's largest allocation); transparent huge pages requested (madvise); no mlock
+strata generate: loaded 39.97 GiB at 9.24 GiB/s
+strata generate: CPU pool tasks/phase: 60 (automatic), participating threads: 20
+strata generate: profile <repo>/data/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: expert cache auto: 26.63 GiB free, 700 MiB reserved (+184 MiB for the draft head; 0 MiB of it the matrix library's) -> 11874 slots
+strata generate: expert cache 15841 slots, 25.76 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: pre-filled 15841 of 15841 slots from the profile in 1.1 s (24608 MB/s); slot 0 verified
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 19 expert-pool workers + the host thread
+strata: GDN step forms for windows of 1..8 tokens: 11111111 (0 one group a head, 1 split, 2 prefetch)
+strata: the PCIe share's fetch runs 18 work-groups (27.3 GB/s; 512: 27.0 GB/s)
+strata: the 2560 x 10240 BF16 GEMV takes 4 rows a work-group for 2,3 rows
+strata: the 2560 x 2560 BF16 GEMV takes 4 rows a work-group for 2 rows
+strata generate: session is up (engine xe0.1.40.2.2)
+strata generate: token graph hit path: 15841 resident experts, decided on the device
+strata serve: prompt chunk auto: 8192 tokens
+strata serve: the prompt path borrows 2480 cache slots (4.04 GiB)
+strata: graph side branches: 226.3 us in a row, 263.3 us branched: not used
+strata verify: window up to 6 tokens, 69.2 MiB of device buffers
+strata mtp: draft head over 106299 tokens (178.4 MiB)
+strata generate: PCIe split, measured: an expert 0.041 ms on the CPU (0.078 beside the link), 0.068 ms over PCIe (0.128 beside the CPU), 0.008 ms on the GPU, layer 0 -> of 1..16 missed experts (as many hits) PCIe takes 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+strata serve: 785 MiB of VRAM free with everything loaded
+INFO logit_bias=1 context=8192 kv=fp16 kv_resident=0 expert_slots=15841 expert_cache_mib=26378 spec=6 mtp_max=4 lookup=3 vram_free_mib=785 cvec=0 arena_mib=40925 pool_workers=19 pcie_frac=0.55 spec_min_p=0.50 conversation_cache_mib=0 conversation_cache_slots=4 conversation_cache_min_free_mib=2560 conversation_cache_min_tokens=0 tail_role_token=-1 vram_elastic=0 batch_slots=0 slot_cache=0 engine=xe0.1.40.2.2
+READY 8192 stop
+RESUME 0
+strata: STRATA_PREFILL_CPU_SHARE: the CPU pool computes 31 of a layer's 61 streamed experts (share 0.50)
+PP 1010 1017 1170 863.3
+strata verify: capturing the 6-token window (689 MiB of VRAM free)
+strata verify: captured the 6-token window (sync ok)
+PP 1016 1017 1285 790.8
+REUSED 0
+strata verify: capturing the 1-token window (476 MiB of VRAM free)
+strata verify: captured the 1-token window (sync ok)
+strata verify: capturing the 4-token window (454 MiB of VRAM free)
+strata verify: captured the 4-token window (sync ok)
+strata verify: capturing the 2-token window (450 MiB of VRAM free)
+strata verify: captured the 2-token window (sync ok)
+strata verify: capturing the 3-token window (446 MiB of VRAM free)
+strata verify: captured the 3-token window (sync ok)
+DONE 161 1017 1284.8 2164.3 stop 99 151 0 99687 102720 0 0 0.0 1017 0
+strata serve: prompt 1017 tokens = 0 reused + 1017 read in 1285 ms (791.6 tok/s), 161 generated in 2164 ms (74.4 tok/s), drafts accepted 99 of 151, 1 checkpoints
+strata serve: decode expert cache hit rate: 97.0% (99687 hits / 102720 lookups)
+strata serve: suffix drafts: 1 windows, 2 of 3 drafts accepted
+RESUME 1178
+PP 1192 1199 102 137.0
+PP 1198 1199 191 104.9
+REUSED 1178
+DONE 101 1199 190.6 1160.9 stop 70 81 1178 52945 55200 0 0 0.0 21 0
+strata serve: prompt 1199 tokens = 1178 reused + 21 read in 191 ms (110.2 tok/s), 101 generated in 1161 ms (87.0 tok/s), drafts accepted 70 of 81, 2 checkpoints
+strata serve: decode expert cache hit rate: 95.9% (52945 hits / 55200 lookups)
+strata serve: suffix drafts: 14 windows, 38 of 42 drafts accepted
+RESUME 1302
+PP 1320 1327 117 153.8
+PP 1326 1327 204 117.6
+REUSED 1302
+DONE 256 1327 204.0 4079.5 length 122 213 1302 164655 166560 0 0 0.0 25 0
+strata serve: prompt 1327 tokens = 1302 reused + 25 read in 204 ms (122.5 tok/s), 256 generated in 4079 ms (62.8 tok/s), drafts accepted 122 of 213, 3 checkpoints
+strata serve: decode expert cache hit rate: 98.9% (164655 hits / 166560 lookups)
+RESUME 1582
+PP 1603 1610 276 76.1
+PP 1609 1610 375 72.0
+REUSED 1582
+DONE 256 1610 374.9 3608.8 length 148 233 1582 162805 164640 0 0 0.0 28 0

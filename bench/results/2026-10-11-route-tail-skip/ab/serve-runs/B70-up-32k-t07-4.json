@@ -1,0 +1,54 @@
+{
+ "gpu": "B70",
+ "arm": "up",
+ "tier": "32k",
+ "mode": "t07",
+ "round": 4,
+ "turns": [
+  {
+   "generated": 118,
+   "prompt": 31566,
+   "prompt_ms": 13749.6,
+   "decode_ms": 1429.3,
+   "finish": "stop",
+   "accepted": 81,
+   "offered": 106,
+   "reused": 0,
+   "read": 31566
+  },
+  {
+   "generated": 118,
+   "prompt": 31705,
+   "prompt_ms": 196.5,
+   "decode_ms": 1305.5,
+   "finish": "stop",
+   "accepted": 87,
+   "offered": 102,
+   "reused": 31683,
+   "read": 22
+  },
+  {
+   "generated": 107,
+   "prompt": 31850,
+   "prompt_ms": 202.7,
+   "decode_ms": 1399.3,
+   "finish": "stop",
+   "accepted": 73,
+   "offered": 102,
+   "reused": 31825,
+   "read": 25
+  },
+  {
+   "generated": 111,
+   "prompt": 31983,
+   "prompt_ms": 351.4,
+   "decode_ms": 1305.5,
+   "finish": "stop",
+   "accepted": 76,
+   "offered": 98,
+   "reused": 31960,
+   "read": 23
+  }
+ ],
+ "why": null
+}

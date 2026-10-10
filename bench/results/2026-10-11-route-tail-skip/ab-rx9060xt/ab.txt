@@ -1,0 +1,84 @@
+RX9060XT xe 1k greedy 0: read 1017 at 458.6, out 53 at 36.3 | read 19 at 70.8, out 100 at 47.3 | read 28 at 67.4, out 57 at 47.0 | read 27 at 48.2, out 78 at 49.3
+RX9060XT up 1k greedy 0: read 1017 at 367.2, out 85 at 19.2 | read 22 at 37.6, out 172 at 24.4 | read 25 at 34.2, out 256 at 23.4 | read 290 at 232.0, out 256 at 26.3
+RX9060XT xe 1k greedy 1: read 1017 at 429.0, out 53 at 33.3 | read 21 at 36.6, out 58 at 24.7 | read 24 at 33.7, out 73 at 31.4 | read 25 at 40.0, out 256 at 29.4
+RX9060XT up 1k greedy 1: read 1017 at 369.4, out 72 at 34.3 | read 22 at 62.2, out 168 at 42.4 | read 28 at 53.3, out 256 at 39.3 | read 290 at 195.5, out 256 at 41.5
+RX9060XT up 1k greedy 2: read 1017 at 339.8, out 67 at 30.0 | read 22 at 63.9, out 193 at 45.5 | read 28 at 62.9, out 205 at 41.7 | read 26 at 57.1, out 256 at 43.3
+RX9060XT xe 1k greedy 2: read 1017 at 336.3, out 64 at 32.2 | read 22 at 65.1, out 50 at 28.3 | read 24 at 45.8, out 256 at 32.4 | read 290 at 231.5, out 202 at 43.5
+RX9060XT xe 1k greedy 3: read 1017 at 340.8, out 55 at 37.7 | read 22 at 68.3, out 93 at 52.0 | read 27 at 70.3, out 107 at 52.8 | read 26 at 55.1, out 121 at 56.7
+RX9060XT up 1k greedy 3: read 1017 at 419.0, out 91 at 34.0 | read 21 at 64.6, out 50 at 36.4 | read 26 at 73.7, out 148 at 45.6 | read 24 at 59.0, out 147 at 53.8
+RX9060XT up 1k greedy 4: read 1017 at 424.1, out 74 at 33.7 | read 19 at 64.8, out 65 at 47.5 | read 24 at 58.4, out 93 at 46.0 | read 24 at 53.6, out 42 at 51.7
+RX9060XT xe 1k greedy 4: read 1017 at 456.3, out 53 at 41.0 | read 21 at 68.2, out 56 at 44.9 | read 28 at 74.3, out 117 at 50.6 | read 27 at 57.5, out 98 at 53.1
+RX9060XT xe 1k greedy 5: read 1017 at 517.4, out 52 at 45.8 | read 22 at 74.1, out 64 at 54.2 | read 25 at 80.1, out 50 at 68.4 | read 27 at 52.5, out 95 at 50.7
+RX9060XT up 1k greedy 5: read 1017 at 436.6, out 104 at 32.8 | read 22 at 58.0, out 137 at 46.0 | read 28 at 67.5, out 256 at 42.8 | read 290 at 248.8, out 235 at 39.1
+RX9060XT xe 1k t07 1: read 1017 at 515.7, out 52 at 37.9 | read 22 at 70.0, out 107 at 54.5 | read 28 at 79.5, out 104 at 54.9 | read 27 at 66.6, out 188 at 49.1
+RX9060XT up 1k t07 1: read 1017 at 474.1, out 91 at 38.8 | read 22 at 67.0, out 91 at 44.0 | read 28 at 62.4, out 87 at 42.4 | read 27 at 55.0, out 112 at 45.6
+RX9060XT up 1k t07 2: read 1017 at 503.2, out 256 at 39.0 | read 285 at 302.8, out 61 at 36.1 | read 28 at 61.9, out 256 at 40.8 | read 28 at 61.0, out 225 at 39.2
+RX9060XT xe 1k t07 2: read 1017 at 521.8, out 256 at 37.2 | read 22 at 58.4, out 90 at 36.3 | read 25 at 39.5, out 146 at 35.6 | read 27 at 46.4, out 107 at 44.5
+RX9060XT xe 1k t07 3: read 1017 at 326.8, out 83 at 43.1 | read 22 at 72.3, out 256 at 51.4 | read 28 at 76.5, out 256 at 39.3 | read 28 at 56.7, out 256 at 45.3
+RX9060XT up 1k t07 3: read 1017 at 430.8, out 63 at 22.2 | read 21 at 38.0, out 76 at 30.0 | read 27 at 52.6, out 89 at 56.1 | read 25 at 53.3, out 110 at 35.7
+RX9060XT up 1k t07 4: read 1017 at 444.8, out 90 at 32.0 | read 19 at 53.1, out 99 at 27.3 | read 26 at 43.2, out 57 at 31.6 | read 26 at 44.3, out 92 at 30.3
+RX9060XT xe 1k t07 4: read 1017 at 347.2, out 213 at 41.5 | read 22 at 81.3, out 256 at 39.5 | read 29 at 45.7, out 256 at 37.8 | read 28 at 57.0, out 256 at 36.8
+RX9060XT xe 1k t07 5: read 1017 at 343.3, out 59 at 39.0 | read 21 at 63.5, out 81 at 48.9 | read 27 at 80.2, out 150 at 45.0 | read 25 at 46.5, out 102 at 35.6
+RX9060XT up 1k t07 5: read 1017 at 340.6, out 143 at 37.7 | read 22 at 57.5, out 177 at 53.4 | read 25 at 62.7, out 91 at 46.5 | read 27 at 55.5, out 139 at 51.6
+RX9060XT xe 32k greedy 1: read 31566 at 833.6, out 120 at 43.4 | read 22 at 78.6, out 78 at 48.6 | read 28 at 66.8, out 256 at 36.4 | read 28 at 64.8, out 256 at 41.3
+RX9060XT up 32k greedy 1: read 31566 at 842.8, out 126 at 29.3 | read 22 at 51.7, out 77 at 27.9 | read 25 at 34.7, out 100 at 29.5 | read 27 at 45.3, out 256 at 28.3
+RX9060XT up 32k greedy 2: read 31566 at 842.2, out 126 at 37.5 | read 22 at 56.9, out 64 at 37.3 | read 27 at 41.1, out 115 at 28.3 | read 25 at 40.6, out 120 at 34.5
+RX9060XT xe 32k greedy 2: read 31566 at 833.7, out 119 at 37.8 | read 22 at 69.1, out 50 at 53.9 | read 28 at 62.8, out 82 at 58.8 | read 24 at 52.4, out 54 at 60.0
+RX9060XT xe 32k greedy 3: read 31566 at 838.1, out 120 at 16.9 | read 19 at 61.2, out 77 at 21.9 | read 28 at 34.5, out 256 at 30.5 | read 27 at 48.6, out 256 at 23.5
+RX9060XT up 32k greedy 3: read 31566 at 840.9, out 126 at 42.3 | read 22 at 64.7, out 147 at 41.3 | read 28 at 66.6, out 256 at 34.4 | read 28 at 55.1, out 256 at 41.7
+RX9060XT up 32k greedy 4: read 31566 at 838.1, out 126 at 41.8 | read 22 at 63.0, out 80 at 43.9 | read 26 at 61.2, out 100 at 38.6 | read 26 at 51.1, out 256 at 48.2
+RX9060XT xe 32k greedy 4: read 31566 at 840.5, out 119 at 41.4 | read 22 at 68.2, out 77 at 58.9 | read 28 at 73.3, out 63 at 58.1 | read 24 at 49.3, out 40 at 58.8
+RX9060XT xe 32k greedy 5: read 31566 at 840.0, out 119 at 43.4 | read 22 at 66.7, out 142 at 55.4 | read 28 at 73.1, out 111 at 46.6 | read 27 at 52.1, out 104 at 54.4
+RX9060XT up 32k greedy 5: read 31566 at 795.1, out 119 at 34.9 | read 22 at 66.9, out 50 at 40.8 | read 26 at 59.5, out 93 at 44.0 | read 25 at 56.8, out 256 at 17.9
+RX9060XT xe 32k t07 1: read 31566 at 829.6, out 77 at 23.8 | read 22 at 30.9, out 141 at 30.4 | read 26 at 40.9, out 117 at 42.1 | read 24 at 50.3, out 256 at 32.7
+RX9060XT up 32k t07 1: read 31566 at 839.4, out 147 at 24.8 | read 22 at 38.3, out 106 at 27.7 | read 27 at 34.8, out 113 at 29.0 | read 24 at 33.9, out 74 at 36.7
+RX9060XT up 32k t07 2: read 31566 at 842.5, out 184 at 24.1 | read 19 at 43.1, out 40 at 28.1 | read 26 at 43.4, out 72 at 45.2 | read 27 at 56.3, out 256 at 23.8
+RX9060XT xe 32k t07 2: read 31566 at 836.3, out 161 at 31.6 | read 22 at 50.8, out 165 at 40.0 | read 27 at 40.6, out 195 at 55.7 | read 24 at 49.5, out 142 at 57.6
+RX9060XT xe 32k t07 3: read 31566 at 837.0, out 75 at 34.6 | read 22 at 54.8, out 65 at 45.4 | read 27 at 74.2, out 76 at 48.8 | read 27 at 64.0, out 256 at 44.3
+RX9060XT up 32k t07 3: read 31566 at 810.6, out 64 at 34.1 | read 22 at 56.0, out 148 at 36.9 | read 25 at 62.0, out 256 at 37.9 | read 28 at 57.0, out 174 at 38.8
+RX9060XT up 32k t07 4: read 31566 at 839.6, out 193 at 41.0 | read 22 at 65.4, out 95 at 44.0 | read 28 at 69.5, out 256 at 37.4 | read 28 at 65.0, out 256 at 44.2
+RX9060XT xe 32k t07 4: read 31566 at 804.0, out 256 at 39.4 | read 23 at 71.4, out 105 at 46.1 | read 25 at 66.5, out 100 at 58.6 | read 25 at 60.6, out 256 at 44.9
+RX9060XT xe 32k t07 5: read 31566 at 837.0, out 160 at 45.5 | read 22 at 77.1, out 28 at 56.9 | read 26 at 75.0, out 117 at 57.7 | read 27 at 57.2, out 112 at 61.9
+RX9060XT up 32k t07 5: read 31566 at 839.4, out 207 at 40.1 | read 22 at 64.7, out 54 at 27.6 | read 28 at 25.5, out 203 at 15.1 | read 27 at 59.7, out 158 at 42.8
+
+### RX9060XT serve greedy: Prefill (tokens/s)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 429 | 838 |
+| skip0 | 419 | 841 |
+
+### RX9060XT serve greedy: Follow-ups (ms)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 384 | 419 |
+| skip0 | 415 | 437 |
+
+### RX9060XT serve greedy: Decode (tokens/s)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 48.4 | 47.9 |
+| skip0 | 41.7 | 33.7 |
+
+### RX9060XT serve t07: Prefill (tokens/s)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 347 | 836 |
+| skip0 | 445 | 839 |
+
+### RX9060XT serve t07: Follow-ups (ms)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 366 | 402 |
+| skip0 | 459 | 452 |
+
+### RX9060XT serve t07: Decode (tokens/s)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 41.8 | 43.7 |
+| skip0 | 39.4 | 28.1 |

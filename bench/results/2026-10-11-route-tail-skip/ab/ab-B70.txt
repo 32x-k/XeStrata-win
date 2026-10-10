@@ -1,0 +1,126 @@
+B70 xe 1k greedy 0: read 1017 at 789.3, out 69 at 74.1 | read 22 at 108.5, out 108 at 96.5 | read 28 at 120.8, out 126 at 78.3 | read 27 at 72.3, out 256 at 66.3
+B70 up 1k greedy 0: read 1017 at 787.3, out 91 at 79.6 | read 21 at 107.8, out 185 at 80.9 | read 28 at 120.6, out 135 at 73.9 | read 27 at 72.5, out 256 at 70.6
+B70 xe 1k greedy 1: read 1017 at 791.0, out 69 at 74.0 | read 22 at 108.8, out 108 at 96.5 | read 28 at 121.0, out 126 at 78.4 | read 27 at 72.3, out 256 at 66.3
+B70 up 1k greedy 1: read 1017 at 785.1, out 91 at 79.5 | read 21 at 107.9, out 185 at 80.9 | read 28 at 120.8, out 135 at 73.9 | read 27 at 72.6, out 256 at 70.6
+B70 up 1k greedy 2: read 1017 at 788.4, out 91 at 79.3 | read 21 at 108.7, out 185 at 82.0 | read 28 at 121.0, out 256 at 71.2 | read 28 at 73.7, out 247 at 68.8
+B70 xe 1k greedy 2: read 1017 at 789.9, out 69 at 74.0 | read 22 at 109.1, out 108 at 96.5 | read 28 at 121.0, out 126 at 78.4 | read 27 at 72.3, out 256 at 66.3
+B70 xe 1k greedy 3: read 1017 at 789.9, out 69 at 74.0 | read 22 at 109.8, out 108 at 96.5 | read 28 at 121.1, out 126 at 78.3 | read 27 at 72.2, out 256 at 66.3
+B70 up 1k greedy 3: read 1017 at 785.7, out 91 at 79.4 | read 21 at 107.6, out 185 at 80.9 | read 28 at 121.0, out 135 at 73.9 | read 27 at 72.6, out 256 at 70.7
+B70 up 1k greedy 4: read 1017 at 786.5, out 91 at 79.5 | read 21 at 108.6, out 185 at 80.9 | read 28 at 121.0, out 135 at 73.7 | read 27 at 72.6, out 256 at 70.6
+B70 xe 1k greedy 4: read 1017 at 788.5, out 69 at 74.0 | read 22 at 108.9, out 108 at 96.5 | read 28 at 120.2, out 126 at 78.3 | read 27 at 72.3, out 256 at 66.3
+B70 xe 1k greedy 5: read 1017 at 791.4, out 69 at 73.9 | read 22 at 109.2, out 108 at 96.5 | read 28 at 121.0, out 126 at 78.3 | read 27 at 72.3, out 256 at 66.3
+B70 up 1k greedy 5: read 1017 at 786.3, out 91 at 79.4 | read 21 at 108.8, out 185 at 80.8 | read 28 at 121.0, out 135 at 73.9 | read 27 at 72.4, out 256 at 70.6
+B70 xe 1k t07 1: read 1017 at 791.4, out 137 at 78.6 | read 20 at 106.4, out 34 at 100.8 | read 27 at 115.2, out 92 at 86.8 | read 26 at 69.3, out 112 at 86.9
+B70 up 1k t07 1: read 1017 at 791.6, out 161 at 74.4 | read 21 at 110.2, out 101 at 87.0 | read 25 at 122.5, out 256 at 62.8 | read 28 at 74.7, out 256 at 70.9
+B70 up 1k t07 2: read 1017 at 791.1, out 139 at 76.5 | read 20 at 106.7, out 34 at 100.0 | read 27 at 117.8, out 69 at 78.8 | read 26 at 68.9, out 143 at 86.1
+B70 xe 1k t07 2: read 1017 at 796.3, out 199 at 72.1 | read 21 at 107.5, out 160 at 82.2 | read 26 at 115.1, out 146 at 83.4 | read 25 at 68.2, out 227 at 89.9
+B70 xe 1k t07 3: read 1017 at 791.1, out 63 at 71.0 | read 21 at 105.4, out 85 at 85.8 | read 27 at 117.4, out 123 at 79.7 | read 23 at 65.5, out 96 at 80.4
+B70 up 1k t07 3: read 1017 at 792.9, out 63 at 74.9 | read 21 at 102.2, out 64 at 77.5 | read 26 at 111.6, out 79 at 77.6 | read 25 at 69.1, out 256 at 67.7
+B70 up 1k t07 4: read 1017 at 790.5, out 53 at 77.0 | read 19 at 114.1, out 69 at 75.1 | read 26 at 114.1, out 256 at 70.7 | read 27 at 74.1, out 232 at 68.0
+B70 xe 1k t07 4: read 1017 at 789.4, out 55 at 72.6 | read 22 at 113.5, out 186 at 78.4 | read 24 at 114.0, out 256 at 65.1 | read 27 at 74.1, out 256 at 67.6
+B70 xe 1k t07 5: read 1017 at 791.3, out 56 at 67.8 | read 22 at 113.5, out 155 at 86.9 | read 28 at 121.1, out 158 at 79.0 | read 27 at 73.7, out 256 at 66.1
+B70 up 1k t07 5: read 1017 at 786.9, out 30 at 75.1 | read 22 at 108.3, out 82 at 73.8 | read 26 at 112.7, out 123 at 65.4 | read 23 at 64.9, out 117 at 72.0
+B70 xe 32k greedy 1: read 31566 at 2290.4, out 119 at 80.1 | read 22 at 115.9, out 93 at 85.0 | read 27 at 118.4, out 256 at 66.2 | read 28 at 75.1, out 256 at 68.1
+B70 up 32k greedy 1: read 31566 at 2295.6, out 179 at 68.4 | read 22 at 113.9, out 96 at 75.2 | read 26 at 114.4, out 256 at 69.4 | read 28 at 72.9, out 256 at 66.5
+B70 up 32k greedy 2: read 31566 at 2294.9, out 179 at 68.3 | read 22 at 112.8, out 96 at 75.3 | read 26 at 114.3, out 256 at 69.4 | read 28 at 72.9, out 256 at 66.4
+B70 xe 32k greedy 2: read 31566 at 2295.9, out 119 at 80.1 | read 22 at 115.9, out 93 at 85.0 | read 27 at 118.4, out 256 at 66.2 | read 28 at 74.9, out 256 at 68.1
+B70 xe 32k greedy 3: read 31566 at 2296.8, out 119 at 79.6 | read 22 at 114.2, out 93 at 85.0 | read 27 at 118.4, out 256 at 66.1 | read 28 at 73.0, out 256 at 68.1
+B70 up 32k greedy 3: read 31566 at 2294.6, out 179 at 68.3 | read 22 at 113.9, out 96 at 75.2 | read 26 at 114.3, out 256 at 69.4 | read 28 at 72.8, out 256 at 66.5
+B70 up 32k greedy 4: read 31566 at 2293.8, out 179 at 68.3 | read 22 at 113.7, out 96 at 75.2 | read 26 at 114.4, out 256 at 69.4 | read 28 at 72.9, out 256 at 66.5
+B70 xe 32k greedy 4: read 31566 at 2294.0, out 119 at 80.1 | read 22 at 115.7, out 93 at 85.0 | read 27 at 118.4, out 256 at 66.1 | read 28 at 74.7, out 256 at 68.1
+B70 xe 32k greedy 5: read 31566 at 2294.3, out 119 at 80.1 | read 22 at 115.7, out 93 at 85.0 | read 27 at 118.4, out 256 at 66.1 | read 28 at 74.8, out 256 at 68.1
+B70 up 32k greedy 5: read 31566 at 2294.2, out 179 at 68.4 | read 22 at 114.0, out 96 at 75.2 | read 26 at 114.4, out 256 at 69.4 | read 28 at 72.8, out 256 at 66.5
+B70 xe 32k t07 1: read 31566 at 2295.7, out 135 at 83.3 | read 22 at 110.6, out 127 at 92.3 | read 28 at 121.3, out 133 at 82.5 | read 27 at 73.3, out 86 at 77.7
+B70 up 32k t07 1: read 31566 at 2296.2, out 167 at 64.6 | read 20 at 106.3, out 27 at 82.8 | read 26 at 115.1, out 60 at 74.0 | read 24 at 67.9, out 74 at 75.2
+B70 up 32k t07 2: read 31566 at 2289.7, out 163 at 73.0 | read 21 at 112.2, out 180 at 75.0 | read 28 at 121.3, out 256 at 56.8 | read 27 at 72.7, out 256 at 70.3
+B70 xe 32k t07 2: read 31566 at 2295.3, out 161 at 82.0 | read 22 at 115.2, out 152 at 85.1 | read 26 at 115.4, out 196 at 81.6 | read 27 at 71.1, out 200 at 74.9
+B70 xe 32k t07 3: read 31566 at 2288.5, out 87 at 66.6 | read 19 at 115.9, out 78 at 76.0 | read 28 at 120.8, out 101 at 79.4 | read 27 at 71.9, out 101 at 79.3
+B70 up 32k t07 3: read 31566 at 2294.8, out 80 at 68.9 | read 22 at 110.2, out 256 at 60.4 | read 29 at 123.4, out 137 at 64.6 | read 27 at 72.1, out 104 at 59.9
+B70 up 32k t07 4: read 31566 at 2295.8, out 118 at 82.6 | read 22 at 112.0, out 118 at 90.4 | read 25 at 123.3, out 107 at 76.5 | read 23 at 65.5, out 111 at 85.0
+B70 xe 32k t07 4: read 31566 at 2293.8, out 95 at 80.5 | read 22 at 114.3, out 97 at 79.8 | read 28 at 120.7, out 256 at 59.3 | read 28 at 73.9, out 256 at 64.8
+B70 xe 32k t07 5: read 31566 at 2295.7, out 78 at 84.1 | read 20 at 107.9, out 65 at 76.4 | read 24 at 115.0, out 82 at 79.7 | read 24 at 67.9, out 256 at 66.5
+B70 up 32k t07 5: read 31566 at 2295.4, out 150 at 70.2 | read 22 at 115.2, out 53 at 79.4 | read 26 at 114.7, out 72 at 72.4 | read 25 at 68.0, out 92 at 73.2
+
+### B70 serve greedy: Prefill (tokens/s)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 790 | 2,294 |
+| skip0 | 786 | 2,295 |
+
+### B70 serve greedy: Follow-ups (ms)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 231 | 228 |
+| skip0 | 232 | 227 |
+
+### B70 serve greedy: Decode (tokens/s)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 74.3 | 70.9 |
+| skip0 | 75.1 | 68.8 |
+
+### B70 serve t07: Prefill (tokens/s)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 791 | 2,295 |
+| skip0 | 791 | 2,295 |
+
+### B70 serve t07: Follow-ups (ms)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 230 | 231 |
+| skip0 | 229 | 227 |
+
+### B70 serve t07: Decode (tokens/s)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 79.5 | 75.2 |
+| skip0 | 70.6 | 69.7 |
+
+### RTX4070 serve greedy: Prefill (tokens/s)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 289 | 1,135 |
+| skip0 | 288 | 1,134 |
+
+### RTX4070 serve greedy: Follow-ups (ms)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 291 | 282 |
+| skip0 | 353 | 342 |
+
+### RTX4070 serve greedy: Decode (tokens/s)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 64.2 | 61.5 |
+| skip0 | 51.5 | 50.1 |
+
+### RTX4070 serve t07: Prefill (tokens/s)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 289 | 1,135 |
+| skip0 | 288 | 1,139 |
+
+### RTX4070 serve t07: Follow-ups (ms)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 296 | 274 |
+| skip0 | 340 | 352 |
+
+### RTX4070 serve t07: Decode (tokens/s)
+
+| Engine | 1K | 32K |
+| --- | ---: | ---: |
+| skip7 | 59.0 | 61.4 |
+| skip0 | 54.8 | 51.7 |

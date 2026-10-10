@@ -1,0 +1,54 @@
+{
+ "gpu": "RX9060XT",
+ "arm": "up",
+ "tier": "1k",
+ "mode": "greedy",
+ "round": 0,
+ "turns": [
+  {
+   "generated": 85,
+   "prompt": 1017,
+   "prompt_ms": 2769.5,
+   "decode_ms": 4418.1,
+   "finish": "stop",
+   "accepted": 53,
+   "offered": 86,
+   "reused": 0,
+   "read": 1017
+  },
+  {
+   "generated": 172,
+   "prompt": 1123,
+   "prompt_ms": 584.7,
+   "decode_ms": 7040.4,
+   "finish": "stop",
+   "accepted": 115,
+   "offered": 161,
+   "reused": 1101,
+   "read": 22
+  },
+  {
+   "generated": 256,
+   "prompt": 1322,
+   "prompt_ms": 731.2,
+   "decode_ms": 10960.3,
+   "finish": "length",
+   "accepted": 126,
+   "offered": 240,
+   "reused": 1297,
+   "read": 25
+  },
+  {
+   "generated": 256,
+   "prompt": 1605,
+   "prompt_ms": 1250.0,
+   "decode_ms": 9720.3,
+   "finish": "length",
+   "accepted": 144,
+   "offered": 230,
+   "reused": 1315,
+   "read": 290
+  }
+ ],
+ "why": null
+}
