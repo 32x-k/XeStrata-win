@@ -1,0 +1,14 @@
+cpumoe rc=0 1744.56 ms /   554 tokens (    3.15 ms per token,   317.56 tokens per second) 11559.27 ms /   255 runs   (   45.33 ms per token,    22.06 tokens per second) 
+cpumoe-cache12g rc=0 1923.17 ms /   554 tokens (    3.47 ms per token,   288.07 tokens per second) 7694.96 ms /   255 runs   (   30.18 ms per token,    33.14 tokens per second) 
+ncmoe26 rc=0 1485.46 ms /   554 tokens (    2.68 ms per token,   372.95 tokens per second) 9953.49 ms /   255 runs   (   39.03 ms per token,    25.62 tokens per second) 
+ncmoe22 rc=0 1314.85 ms /   554 tokens (    2.37 ms per token,   421.34 tokens per second) 8933.63 ms /   255 runs   (   35.03 ms per token,    28.54 tokens per second) 
+ncmoe18 rc=0 1132.95 ms /   554 tokens (    2.05 ms per token,   488.99 tokens per second) 7986.53 ms /   255 runs   (   31.32 ms per token,    31.93 tokens per second) 
+ncmoe14 rc=0 956.82 ms /   554 tokens (    1.73 ms per token,   579.00 tokens per second) 7083.83 ms /   255 runs   (   27.78 ms per token,    36.00 tokens per second) 
+fit rc=0 704.39 ms /   554 tokens (    1.27 ms per token,   786.49 tokens per second) 6051.30 ms /   255 runs   (   23.73 ms per token,    42.14 tokens per second) 
+xs 1 rc=0 prompt 555 tokens 11.52 s (48.2 tok/s), 255 generated 5.23 s (48.77 tok/s); VRAM tier 2944 of 2944 slots filled, 47.9% of routed experts hit, 3849 swaps
+xs+profile 1 rc=0 prompt 555 tokens 4.54 s (122.3 tok/s), 255 generated 4.61 s (55.34 tok/s); VRAM tier 2944 of 2944 slots filled, 84.1% of routed experts hit, 3241 swaps
+xs 2 rc=0 prompt 555 tokens 11.50 s (48.2 tok/s), 255 generated 5.17 s (49.33 tok/s); VRAM tier 2944 of 2944 slots filled, 47.9% of routed experts hit, 3849 swaps
+xs+profile 2 rc=0 prompt 555 tokens 4.51 s (123.0 tok/s), 255 generated 4.70 s (54.23 tok/s); VRAM tier 2944 of 2944 slots filled, 84.1% of routed experts hit, 3241 swaps
+ALL DONE
+xs+profile, the split measured 1 prompt 555 tokens 4.52 s (122.9 tok/s), 255 generated 4.65 s (54.79 tok/s); VRAM tier 2944 of 2944 slots filled, 84.1% of routed experts hit, 3241 swaps
+xs+profile, the split measured 2 prompt 555 tokens 4.42 s (125.5 tok/s), 255 generated 4.66 s (54.74 tok/s); VRAM tier 2944 of 2944 slots filled, 84.1% of routed experts hit, 3241 swaps
