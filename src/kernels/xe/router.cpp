@@ -226,6 +226,56 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
     launch_native_router(queue_for(stream, true), logits, ids, weights, 1);
 }
 
+// STRATA_ROUTE_RESIDENT (upstream 5df35dcb, EXPERIMENTAL, opt-in, changes the output): residency-biased routing for
+// 512 x 10.  After the top-10: for the ranks lo..hi a non-resident expert is replaced by the best resident expert not
+// already picked when its logit is within `margin` of the replaced one; the weights are then the softmax of the selected
+// logits (the router's renormalisation).  Tokens without a swap keep the router's exact bits.
+// stats (device, 4 x uint64): [0] tail entries seen, [1] swaps, [2] non-resident entries before, [3] after.
+void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
+                           float margin, int rank_lo, int rank_hi, unsigned long long* stats, void* stream) {
+    if (!stream || n_tok < 1 || res_layer == nullptr)
+        throw std::invalid_argument("route-resident requires a stream, tokens and the residency row");
+    const int lo = rank_lo, hi = rank_hi;
+    queue_for(stream, true).parallel_for(sycl::range<1>((size_t) n_tok), [=](sycl::id<1> i) {
+        const size_t t = i[0];
+        const float* l = logits + t * 512;
+        int32_t* id = ids + t * 10;
+        int swaps = 0, tail = 0, before = 0;
+        for (int r = 0; r < 10; ++r) before += res_layer[id[r]] < 0;
+        for (int r = lo; r <= hi && r < 10; ++r) {
+            const int e = id[r];
+            if (res_layer[e] >= 0) continue;
+            ++tail;
+            int best = -1;
+            float bl = -INFINITY;
+            for (int f = 0; f < 512; ++f) {
+                if (res_layer[f] < 0 || l[f] <= bl) continue;
+                bool used = false;
+                for (int q = 0; q < 10; ++q) used |= id[q] == f;
+                if (!used) { best = f; bl = l[f]; }
+            }
+            if (best >= 0 && l[e] - bl <= margin) { id[r] = best; ++swaps; }
+        }
+        int after = 0;
+        for (int r = 0; r < 10; ++r) after += res_layer[id[r]] < 0;
+        if (swaps) {
+            float m = -INFINITY;
+            for (int r = 0; r < 10; ++r) m = sycl::fmax(m, l[id[r]]);
+            float ex[10], sum = 0.0f;
+            for (int r = 0; r < 10; ++r) { ex[r] = sycl::exp(l[id[r]] - m); sum += ex[r]; }
+            for (int r = 0; r < 10; ++r) weights[t * 10 + r] = ex[r] / sum;
+        }
+        if (stats) {
+            using A = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                       sycl::access::address_space::global_space>;
+            A(stats[0]).fetch_add((unsigned long long) tail);
+            A(stats[1]).fetch_add((unsigned long long) swaps);
+            A(stats[2]).fetch_add((unsigned long long) before);
+            A(stats[3]).fetch_add((unsigned long long) after);
+        }
+    });
+}
+
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream) {
     if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
         !valid(weights, (size_t) n_tok * 10 * 4))

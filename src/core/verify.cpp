@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <atomic>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <chrono>
@@ -56,6 +57,66 @@ constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
+// STRATA_ROUTE_RESIDENT=<margin logits> (+ STRATA_ROUTE_RESIDENT_RANKS=lo-hi, default 6-9; upstream 5df35dcb, 8bf203f5):
+// residency-biased routing (opt-in, changes the output).
+struct RouteResidentCfg;
+RouteResidentCfg& route_resident_cfg();
+struct RouteResidentCfg {
+    float margin = 0.0f;
+    int lo = 6, hi = 9;
+    // #1578: one counter block per GPU.  A layer split inits a verifier per stage; the Verifier asks for its device's
+    // block in init (outside graph capture) and keeps the pointer, so a launch never picks the block by the host
+    // thread's current device.  nullptr (the allocation failed): the kernel runs without counters.
+    std::mutex mu;
+    std::map<int, unsigned long long*> blocks;
+    unsigned long long* stats_on(int dev) {
+        if (margin <= 0.0f || dev < 0) return nullptr;
+        std::lock_guard<std::mutex> lk(mu);
+        const auto it = blocks.find(dev);
+        if (it != blocks.end()) return it->second;
+        unsigned long long* p = nullptr;
+        {
+            const OnDevice on(dev);
+            if (!strata::gpu::alloc_device(&p, 8 * sizeof(unsigned long long)) ||
+                !strata::gpu::memset(p, 0, 8 * sizeof(unsigned long long))) {
+                if (p != nullptr) strata::gpu::free(p);
+                p = nullptr;
+                std::fprintf(stderr, "route-resident: the counters could not be allocated on GPU %d; it runs without them\n", dev);
+            }
+        }
+        if (blocks.empty()) {
+            std::atexit([] {
+                RouteResidentCfg& c = route_resident_cfg();
+                for (const auto& kv : c.blocks) {
+                    if (kv.second == nullptr) continue;
+                    unsigned long long h[8] = {};
+                    const OnDevice on(kv.first);
+                    if (!strata::gpu::device_sync() || !strata::gpu::copy(h, kv.second, sizeof(h))) continue;
+                    char who[32] = "";
+                    if (c.blocks.size() > 1) std::snprintf(who, sizeof who, " (GPU %d)", kv.first);
+                    std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T>8 (prompt reads): tail_nonres=%llu "
+                                         "swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
+                                 who, c.margin, c.lo, c.hi, h[0], h[1], h[0] ? 100.0 * h[1] / h[0] : 0.0, h[2], h[3]);
+                    std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T<=8 (decode): tail_nonres=%llu "
+                                         "swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
+                                 who, c.margin, c.lo, c.hi, h[4], h[5], h[4] ? 100.0 * h[5] / h[4] : 0.0, h[6], h[7]);
+                }
+            });
+        }
+        blocks[dev] = p;
+        return p;
+    }
+};
+RouteResidentCfg& route_resident_cfg() {
+    static RouteResidentCfg c;
+    static const bool parsed = [] {
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) c.margin = (float) std::atof(v);
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &c.lo, &c.hi);
+        return true;
+    }();
+    (void) parsed;
+    return c;
+}
 // A one-token window always keeps its token, so its graph advances the GDN conv history and recurrence state itself
 // (its indexer append and PLE history are final already) and Verifier::commit launches no commit graph after it
 // (upstream 352cad8f): the draft round then runs alone instead of beside the commit's kernels, which read and write
@@ -218,6 +279,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     g_diag_verifier.store(this);
     diag_verify_fn().store(&diag_active_verifier);
     device_ = current_device();   // a layer split's stage on another GPU: init runs on it (OnDevice)
+    rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -1003,6 +1065,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             MoEBuffers mb = ss.moe;
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
+        }
+        if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+            // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
+            try {
+                native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
+                                      route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
+                                      rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
+            } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
