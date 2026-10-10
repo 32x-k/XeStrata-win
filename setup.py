@@ -2089,7 +2089,7 @@ def repoint_config(cfg_file: Path, old: Path, new: Path) -> None:
 
     new_cfg = fix(cfg)
     if new_cfg != cfg:
-        cfg_file.write_text(json.dumps(new_cfg, indent=1), encoding="utf-8")
+        write_config(cfg_file, new_cfg)
 
 
 def default_data_dir() -> Path:
@@ -2194,13 +2194,39 @@ def model_config_files(folder: Path) -> list:
     return [p for p in folder.glob("xestrata-*.json") if not p.name.endswith(".shared-settings.json")]
 
 
+def write_config(path: Path, cfg: dict):
+    """A run config, written whole or not at all (upstream #459): to a temporary file first, then moved over the old
+    one, so a setup stopped half-way (a closed window, a full disk) never leaves an empty config behind."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def readable_config(path: Path) -> bool:
+    """#459: a config that parses as a JSON object; any other gets a one-line warning naming it."""
+    text = None
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+        if isinstance(json.loads(text), dict):
+            return True
+        why = "not a JSON object"
+    except OSError as e:
+        why = e.strerror or str(e)
+    except ValueError:                                 # JSONDecodeError, or bytes that are not UTF-8
+        why = "the file is empty" if text is not None and not text.strip() else "not valid JSON"
+    warn(f"skipped the earlier config {path} ({why}): setting this copy up without it")
+    return False
+
+
 def previous_config(elsewhere_first: list, settings: dict):
-    """The most recently used model config of another Strata folder on this PC, for a folder that has none yet."""
+    """The most recently used model config of another Strata folder on this PC, for a folder that has none yet.  One
+    that does not parse (an empty or cut-off file, upstream #459) is skipped with a warning: the newest readable one is
+    used, and with none this copy is set up as a fresh install."""
     cands = []
     for folder in [*elsewhere_first, *other_installs(settings)]:
         cands += model_config_files(folder)
     cands = [c for c in dict.fromkeys(cands) if c.is_file()]
-    return max(cands, key=lambda p: p.stat().st_mtime) if cands else None
+    return next((c for c in sorted(cands, key=lambda p: p.stat().st_mtime, reverse=True) if readable_config(c)), None)
 
 
 def choices_from_config(cfg_path: Path) -> dict:
@@ -2333,7 +2359,7 @@ def calibrate_config(cfg_path: Path) -> bool:
         warn(f"the tuning did not finish ({e}): the default settings stay")
         return False
     cfg["args"] = CAL.apply(cfg["args"], res["settings"])
-    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    write_config(cfg_path, cfg)
     st = load_settings()
     st.setdefault("calibration", {})[hardware_key(cfg)] = {"settings": res["settings"],
                                                            "tok_s": res["report"].get("tok_s"),
@@ -2398,7 +2424,7 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
         warn(f"the installed engine is {'.'.join(map(str, ver))}: prompts are read in 2048-token chunks until it is "
              "updated")
     if changed:
-        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        write_config(cfg_path, cfg)
     return cfg
 
 
@@ -2558,11 +2584,11 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
             args[args.index("--vram-reserve-mib") + 1] = str(reserve)
         else:
             args += ["--vram-reserve-mib", str(reserve)]
-        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        write_config(cfg_path, cfg)
         ok(f"saved for this model: {reserve} MiB of VRAM kept free for other programs (--vram-reserve-mib)")
     if keep and any(cfg.get(k) != v for k, v in keep.items()):   # #179: a --host/--api-key on a start was ignored
         cfg.update(keep)
-        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        write_config(cfg_path, cfg)
         ok("saved for this model: " + ", ".join(
             "api key" if k == "api_key" else ("the browser opens" if v else "no browser") if k == "open_browser"
             else f"{k.replace('_', ' ')} {v}" for k, v in keep.items()))
@@ -2580,7 +2606,7 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
         cfg["gpu_pci"], cfg["split_pci"] = cards[0]["pci"], [x["pci"] for x in cards[1:]]
         if layer_split:
             cfg["layer_split"] = str(layer_split)
-        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        write_config(cfg_path, cfg)
         ok("saved for this model: the layers split across " + " + ".join(gpu_name(x) for x in cards) +
            f" ({cfg.get('layer_split') or 'auto'})")
     elif gpu is not None:                              # --gpu N: this start only, by the card's PCI address
@@ -2850,7 +2876,7 @@ def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None) ->
         except OSError as e:
             warn(f"could not keep a copy of the earlier {cfg_path.name} ({e.strerror or e})")
             bak = None
-    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    write_config(cfg_path, cfg)
     if kept and old_path is not None:
         ok(f"kept from your earlier {old_path.name}: " + ", ".join(kept))
     if bak is not None:
