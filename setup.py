@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -2276,6 +2277,29 @@ def calibrate_config(cfg_path: Path) -> bool:
     return True
 
 
+def bench_config(cfg_path: Path, data: Path, verbose: bool, original: str | None, rounds: int) -> int:
+    """Measure the model `cfg_path` sets up (tools/bench.py) and say where the record is."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    BENCH = importlib.import_module("bench")           # tools/bench.py (to mypy, `bench` is the records' folder)
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    found = gpus()
+    pcis = [cfg.get("gpu_pci"), *(cfg.get("split_pci") or [])]
+    chosen = ([x for p in pcis if p for x in found if x["pci"] == p] or [gpu_info()]) if found else []
+    say()
+    say(f"  Measuring {cfg.get('model_name', cfg_path.stem)} on this PC: the engine is started many times, about "
+        f"{20 * rounds} minutes" + (" and more with --bench-verbose" if verbose else "") +
+        (f", twice that with upstream {original}" if original else "") + ". The PC is busy meanwhile.")
+    try:
+        md = BENCH.run(cfg_path, data, chosen, verbose, original, say, rounds)
+    except BENCH.BenchError as e:
+        fail(str(e))
+    say()
+    say(md.read_text(encoding="utf-8"))
+    ok(f"the record: {md.parent} (summary.md to paste into a report, record.json with everything; read them first: "
+       "nothing is sent anywhere)")
+    return 0
+
+
 def saved_calibration(cfg: dict) -> dict | None:
     """The settings an earlier calibration found for this PC and model, if any."""
     return (load_settings().get("calibration") or {}).get(hardware_key(cfg))
@@ -2914,6 +2938,19 @@ def main() -> int:
                          "English, code and French (French answers draft more)")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
+    ap.add_argument("--bench", action="store_true",
+                    help="measure the speed of the installed IQ3_XXS (another installed model: --model, --family) on "
+                         "this PC (about 40 minutes) and write a record for the developers to the data folder's "
+                         "records/; the model is not started")
+    ap.add_argument("--bench-verbose", action="store_true",
+                    help="--bench, and where the time goes in more detail: the engine's per-stage timings, its "
+                         "kernels one by one, the GPU's load and temperature, a fingerprint of the answers")
+    ap.add_argument("--original-strata", metavar="TAG",
+                    help="with --bench or --bench-verbose: also measure upstream Strata's release TAG (e.g. v0.1.41, "
+                         "fetched with git) on the same model files, the two engines taking turns")
+    ap.add_argument("--bench-rounds", type=int, default=2, metavar="N",
+                    help="with --bench or --bench-verbose: measure each case N times (default 2, about 20 minutes "
+                         "each); more rounds, steadier medians")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.source:
@@ -2926,6 +2963,10 @@ def main() -> int:
         ap.error("--vision-tokens takes a number of image tokens, 1 or more, e.g. --vision-tokens 768")
     if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
         ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
+    if a.original_strata and not (a.bench or a.bench_verbose):
+        ap.error("--original-strata TAG goes with --bench or --bench-verbose, e.g. --bench --original-strata v0.1.41")
+    if a.bench_rounds < 1:
+        ap.error("--bench-rounds takes a number of rounds, 1 or more, e.g. --bench-rounds 3")
     if a.gpu is not None:                              # --gpu 0,2 means --gpus 0,2 (a user tried it: issue report)
         if "," in a.gpu:
             a.gpus, a.gpu = a.gpus or a.gpu, None
@@ -2980,6 +3021,22 @@ def main() -> int:
     # choice, and asked once when the PC has cards that could share the model
     run_gpu = (parse_gpus(a.gpus, gpus()) if a.gpus else None) or a.gpu
     port = a.port or 8095                              # a new install's port (issue #32: --port for an existing one)
+    if a.bench or a.bench_verbose:
+        if not have:
+            fail("no model is installed yet", "run setup without --bench first, then --bench")
+        # the model the release table and the upstream merges measure, so a record compares with theirs; --model and
+        # --family pick another installed one (a PC with less RAM)
+        family, model = a.family or "qwen", a.model or "IQ3_XXS"
+        bench_cfgs = [c for c in have if (ch := choices_from_config(c))["family"] == family and ch["model"] == model]
+        if not bench_cfgs:
+            installed = "; ".join(f"xestrata --bench --model {ch['model']}" +
+                                  (f" --family {ch['family']}" if ch["family"] != "qwen" else "")
+                                  for c in have if (ch := choices_from_config(c))["model"])
+            fail(f"{FAMILIES[family]['title']} {model} is not installed",
+                 f"measure an installed model: {installed}" if installed else
+                 f"install it first: xestrata --setup --model {model}")
+        update_installed_engine()
+        return bench_config(bench_cfgs[0], data, a.bench_verbose, a.original_strata, a.bench_rounds)
     if have and a.calibrate and not (a.setup or a.model or a.family or a.check):
         update_installed_engine()
         pick_cfg = have[0]

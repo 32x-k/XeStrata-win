@@ -167,6 +167,13 @@ GPU のドライバーなどは別に入れます。次の `xestrata --setup` �
 **自分の PC に合わせる**: `xestrata --calibrate` は、エンジンの設定のいくつかをこの PC で測り、速いものを残します
 （5〜10 分ほど）。
 
+**速さを測る**: `xestrata --bench` は、入れた IQ3_XXS（ほかのモデルは `--model IQ2_XS` などで指定）のこの PC での速さと、どこに時間がかかっているかを測り、
+データフォルダの `records/bench-<日時>/` に記録を書きます（40 分ほど。動いている xestrata は先に止めます）。
+各計測は 2 回ずつで、`--bench-rounds 3` のように回数を変えられます（1 回あたり 20 分ほど増えます）。
+`--bench-verbose` はカーネルごとの時間や GPU の温度も取ります。`--original-strata v0.1.41` を足すと、そのタグの upstream Strata を
+git で取ってきて、同じモデルで交互に測ります。記録はどこにも送りません。報告に貼るときは `summary.md` の中身を確かめてから貼ります。
+測るものと記録の中身は [docs/BENCH.ja.md](docs/BENCH.ja.md) にあります。
+
 **別のパッケージに替える**: Ubuntu では入れたい方を `sudo apt install` すると入れ替わります。
 Fedora では `sudo dnf swap xestrata-contrib-cuda13.4 ./xestrata-free-*.rpm` のように、入っているものと入れたいものを指定します。
 
@@ -268,6 +275,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 - **ビルド**: ソースから入れる方法、ビルドの 3 つの方式（free、contrib-llvm、contrib-icpx）、setup の振る舞いと要るパッケージ、
   deb と rpm のパッケージの作り方は [docs/BUILD.ja.md](docs/BUILD.ja.md) にあります。
   開発に使う道具（リント、Intel SDE、GPU のプロファイラー）は [docs/DEVTOOLS.ja.md](docs/DEVTOOLS.ja.md) にあります。
+- **速さの測り方**: `xestrata --bench`、upstream 追従の計測、リリースの表の測り方は [docs/BENCH.ja.md](docs/BENCH.ja.md) にあります。
 - **守ること**: 機器に依存しないこと（GPU と CPU が報告する能力で経路を選ぶ）、リント（`tools/lint/run.sh`）、
   テストの実行、ライセンスの表示は [AGENTS.md](AGENTS.md) にまとめてあります。
 - **upstream の取り込み**: Strata 0.1.40.2 までの変更を、Windows の実装を除いて Xe に移しています。

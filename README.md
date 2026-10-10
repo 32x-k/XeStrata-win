@@ -173,6 +173,14 @@ Run that command, then `xestrata --setup` again.
 **Fitting it to your PC:** `xestrata --calibrate` measures some of the engine's settings on this PC and keeps the
 fastest (about 5-10 minutes).
 
+**Measuring its speed:** `xestrata --bench` measures the installed IQ3_XXS's speed on this PC (another model: `--model IQ2_XS`, for example) and where the time goes,
+and writes a record to the data folder's `records/bench-<time>/` (about 40 minutes; stop a running xestrata first).
+Each case runs twice; `--bench-rounds 3`, for example, changes that (about 20 minutes more a round).
+`--bench-verbose` also takes each kernel's time and the GPU's temperature. With `--original-strata v0.1.41` it fetches that tag of
+upstream Strata with git and measures the two in turns on the same model. The record is not sent anywhere: read
+`summary.md` before you paste it into a report.
+What it measures and what the record holds: [docs/BENCH.md](docs/BENCH.md).
+
 **Changing the package:** on Ubuntu, `sudo apt install` the other one and it replaces the first.
 On Fedora, name the installed one and the new one, for example `sudo dnf swap xestrata-contrib-cuda13.4 ./xestrata-free-*.rpm`.
 
@@ -279,6 +287,7 @@ what has been checked in [docs/XE.md](docs/XE.md).
 - **Building:** installing from the source, the three build modes (free, contrib-llvm, contrib-icpx), what setup does and the
   packages it needs, and how the deb and rpm packages are made are in [docs/BUILD.md](docs/BUILD.md).
   The development tools (lints, Intel SDE, GPU profilers): [docs/DEVTOOLS.md](docs/DEVTOOLS.md).
+- **Measuring the speed:** `xestrata --bench`, the upstream merges' measurements and the release table are in [docs/BENCH.md](docs/BENCH.md).
 - **Rules:** [AGENTS.md](AGENTS.md) covers them: independence from the hardware (code paths chosen from what the GPU
   and CPU report), the lints (`tools/lint/run.sh`), the tests, and the license notices.
 - **Upstream integration:** the changes of Strata up to 0.1.40.2 are carried into Xe, except the Windows
