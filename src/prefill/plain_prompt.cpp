@@ -40,6 +40,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <set>
+#include <tuple>
 #include <vector>
 
 namespace strata::core {
@@ -53,13 +55,65 @@ struct PlainModel::PromptGemm {
 
 void PlainModel::prompt_gemm_free(PromptGemm* g) { delete g; }
 
-bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err) {
-    if (opt_.prompt_chunk <= 0 || n <= 0 || prompt_dev_ == nullptr) { err.clear(); return false; }
-    if (pos < 0 || pos + n > opt_.max_cells) { err = "plain prompt: past the context"; return false; }
+PlainModel::PromptGemm& PlainModel::prompt_gemm() {
     if (!prompt_gemm_) {
         prompt_gemm_ = std::unique_ptr<PromptGemm, void (*)(PromptGemm*)>(new PromptGemm, &PlainModel::prompt_gemm_free);
         prompt_gemm_->gemm.init_external(cs_, pb_.gemm_scratch, pb_.gemm_elems);
     }
+    return *prompt_gemm_;
+}
+
+bool PlainModel::prompt_warm(std::string& err) {
+    if (opt_.prompt_chunk <= 0 || prompt_dev_ == nullptr) return true;
+    // A library's first product of a kind loads its kernels for it, inside whichever prompt comes first (rocBLAS on
+    // the RX 9060 XT: 0.5 s for the first product, 0.9 s more for the first of 32 rows): each dense shape the prompt
+    // takes, once, on a chunk of zeros into the buffers the prompt overwrites.
+    PromptBufs& P = pb_;
+    prefill::Gemm& gm = prompt_gemm().gemm;
+    const int64_t T = P.T, HV = spec_.ssm_dt_rank;
+    std::set<std::tuple<int, int, int, int64_t>> seen;
+    auto warm = [&](const W& w, float* y, int64_t ldy = 0) {
+        if (w.data != nullptr && seen.insert({w.type, w.n_out, w.n_in, ldy}).second)
+            gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
+    };
+    try {
+        if (!strata::gpu::memset_async(P.x16, 0, (size_t) (T * spec_.n_embd) * 2, cs_)) {
+            err = std::string("plain prompt: warming: ") + strata::gpu::last_error();
+            return false;
+        }
+        for (const Block& b : blocks_) {
+            if (b.recurrent) {
+                warm(b.qkv, P.qkv);
+                warm(b.z, P.z);
+                warm(b.alpha, P.ab, 2 * HV);
+                warm(b.beta, P.ab + HV, 2 * HV);
+                warm(b.ssm_out, P.mix);
+            } else {
+                warm(b.q, P.qfull);
+                warm(b.k, P.kraw);
+                warm(b.v, P.vcur);
+                warm(b.o, P.mix);
+            }
+            if (has_shared_) {
+                warm(b.sh_gate, P.sh_gate);
+                warm(b.sh_up, P.sh_up);
+                warm(b.sh_down, P.shared);
+            }
+        }
+    } catch (const std::exception& e) {
+        err = std::string("plain prompt: warming: ") + e.what();
+        return false;
+    }
+    if (!strata::gpu::stream_sync(cs_)) {
+        err = std::string("plain prompt: warming: ") + strata::gpu::last_error();
+        return false;
+    }
+    return true;
+}
+
+bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err) {
+    if (opt_.prompt_chunk <= 0 || n <= 0 || prompt_dev_ == nullptr) { err.clear(); return false; }
+    if (pos < 0 || pos + n > opt_.max_cells) { err = "plain prompt: past the context"; return false; }
     PromptBufs& P = pb_;
     const ModelSpec& s = spec_;
     const auto& lay = k::cpu::expert_layout();
@@ -74,7 +128,7 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     }();
     const k::RopeScaling& rs = k::rope_scaling();
     strata::gpu::Stream cs = cs_;
-    prefill::Gemm& gm = prompt_gemm_->gemm;
+    prefill::Gemm& gm = prompt_gemm().gemm;
     auto f16 = [&](const float* x, int64_t rows, int64_t cols) { prefill::to_f16(x, P.x16, rows * cols, cs); };
     auto proj = [&](const W& w, float* y, int64_t T, int64_t ldy = 0) {
         gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);

@@ -15,6 +15,7 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/plain_model.hpp"
+#include "strata/prefill/gemm.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -114,7 +115,13 @@ int plain_main(int argc, char** argv) {
     strata::core::PlainModel model;
     std::string err;
     const Clock::time_point t0 = Clock::now();
-    if (!model.load(opt, err)) { std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str()); return 1; }
+    if (opt.prompt_chunk > 0) strata::prefill::Gemm::prepare();   // the products' library loads beside the model
+    if (!model.load(opt, err) || !model.prompt_warm(err)) {
+        std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+        return 1;
+    }
+    if (opt.prompt_chunk > 0) std::fprintf(stderr, "strata (%s): prompt matrix products on %s\n", arch.c_str(),
+                                           strata::prefill::Gemm::path());
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> dump_file(nullptr, &std::fclose);
     if (!dump_path.empty()) {

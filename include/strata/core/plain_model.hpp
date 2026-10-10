@@ -84,6 +84,9 @@ public:
     /// prompt path's library).  `out`: the greedy token after the last; `logits`: its row (or null).  The state is left
     /// where the windows would have left it.
     bool prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err);
+    /// Runs each dense product the prompt takes once, so the products' library has loaded its kernels before the
+    /// first prompt (plain_prompt.cpp); nothing when the prompt runs in windows.
+    bool prompt_warm(std::string& err);
 
     /// The VRAM tier, for the report: slots, slots holding an expert, and the routed entries it served so far.
     int64_t slots() const { return n_slots_; }
@@ -156,6 +159,7 @@ private:
     void* prompt_host_ = nullptr;
     struct PromptGemm;   // plain_prompt.cpp: the products' state over pb_.gemm_scratch
     static void prompt_gemm_free(PromptGemm* g);
+    PromptGemm& prompt_gemm();
     std::unique_ptr<PromptGemm, void (*)(PromptGemm*)> prompt_gemm_{nullptr, nullptr};
     static void pool_fn(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                         int64_t layer);
