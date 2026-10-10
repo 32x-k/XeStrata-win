@@ -47,7 +47,7 @@ struct ModelSpec {
     int64_t n_head = 0;
     std::vector<int64_t> n_head_kv;       ///< per layer, block_count entries
     int64_t key_length = 0, value_length = 0;
-    int64_t rope_dims = 0;                ///< rotated dimensions of a head (0: NoPE)
+    int64_t rope_dims = 0;                ///< rotated dimensions of a head (llama.cpp's default: the whole key)
     std::vector<int64_t> rope_sections;   ///< MRoPE sections, empty when not written
     double rope_base = 0;
     std::string rope_scaling_type;
@@ -165,9 +165,12 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     }
     s.n_head_kv.assign((size_t) n_all, 0);
     for (size_t i = 0; i < kv.size(); ++i) s.n_head_kv[i] = (int64_t) kv[i];
-    s.key_length = spec_int(g, A, "attention.key_length");
-    s.value_length = spec_int(g, A, "attention.value_length");
-    s.rope_dims = spec_int(g, A, "rope.dimension_count");
+    // llama.cpp's defaults (llama_model::load_hparams): a head is n_embd / n_head wide unless the file says, and
+    // rotated over its whole key unless the file says (qwen3moe writes no rope.dimension_count)
+    const int64_t head_w = s.n_head > 0 ? s.n_embd / s.n_head : 0;
+    s.key_length = spec_int(g, A, "attention.key_length", head_w);
+    s.value_length = spec_int(g, A, "attention.value_length", head_w);
+    s.rope_dims = spec_int(g, A, "rope.dimension_count", s.key_length);
     if (const MetaValue* v = spec_get(g, A, "rope.dimension_sections"); v && v->type == MetaType::ARRAY)
         for (const MetaValue& e : v->items) s.rope_sections.push_back((int64_t) e.u);
     s.rope_base = spec_num(g, A, "rope.freq_base");
