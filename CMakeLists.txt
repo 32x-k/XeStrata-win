@@ -905,9 +905,9 @@ if(STRATA_NATIVE_EXPERTS)
       add_test(NAME native_expert_parity_${pair_name} COMMAND native_expert_parity --synthetic ${pair})
       set_tests_properties(native_expert_parity_${pair_name} PROPERTIES TIMEOUT 120)
     endforeach()
-    # a pair without GPU kernels (Q3_K gate/up) is refused by native_expert_supported, not run
-    add_test(NAME native_expert_parity_refuses_q3_K COMMAND native_expert_parity --synthetic q3_K/q8_0)
-    set_tests_properties(native_expert_parity_refuses_q3_K PROPERTIES WILL_FAIL TRUE)
+    # a pair native_expert_supported refuses on purpose (IQ4_NL gate/up) is refused, not run
+    add_test(NAME native_expert_parity_refuses_iq4_nl_gate COMMAND native_expert_parity --synthetic iq4_nl/q8_0)
+    set_tests_properties(native_expert_parity_refuses_iq4_nl_gate PROPERTIES WILL_FAIL TRUE)
     # the device dequantizers on one real tensor of each type: needs the model's shards, so not in CTest
     add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
     target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact)
