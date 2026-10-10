@@ -110,9 +110,9 @@ def main() -> int:
                     continue
                 for label, found in nvidia_entries(image, cuobjdump):
                     for raw in found:
-                        m = MARK.search(raw)
-                        if m:
-                            marks[label][m.group(2).decode()].add(m.group(1).decode())
+                        hit = MARK.search(raw)
+                        if hit:
+                            marks[label][hit.group(2).decode()].add(hit.group(1).decode())
     if nvidia_seen and cuobjdump is None:
         print("NVIDIA: not checked (no cuobjdump)")
     bad = 0
@@ -132,7 +132,8 @@ def main() -> int:
             for src in sorted(missing):
                 print(f"         {src}: no mark (other architectures have one)")
     if not marks:
-        print("no marks found: an engine built before include/strata/kernels/device_arch_tag.hpp, or no NVIDIA/AMD code")
+        print("no marks found: an engine built before include/strata/kernels/device_arch_tag.hpp, or no NVIDIA "
+              "or AMD code")
         return 1
     print("ALL OK" if bad == 0 else f"WRONG {bad}")
     return 1 if bad else 0
