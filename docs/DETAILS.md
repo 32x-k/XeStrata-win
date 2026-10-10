@@ -425,6 +425,8 @@ Four engine settings depend on the PC more than on the model:
 - how sure the draft layer must be to add another guess to a check (`--spec-min-p`);
 - how many CPU threads compute experts (`--pool-workers`): on CPUs with efficiency cores, fewer can be faster;
   it also tries one fewer than the P-cores, and one fewer than one socket's cores on a 2-socket PC;
+  on a CPU with more efficiency cores than performance cores, setup writes the performance cores (but the host's
+  one) and half the efficiency cores into the config before any tuning (upstream #642);
 - how busily the VRAM expert cache follows the conversation (`--adapt-every`, `--adapt-swaps`, `--adapt-decay`, upstream #907):
   a PC whose CPU reads the missed experts slowly (DDR3, or DDR4 in few channels) gains from swapping more.
   Upstream measured 160 swaps every window 7.9% faster than the default on a Xeon E5-2673 v3 with DDR3 and an RTX 4060 Ti on PCIe 3.0 x8.

@@ -2459,6 +2459,93 @@ def rotational_disk(path) -> str | None:
     return None
 
 
+def cpu_cores():
+    """upstream #642: (performance cores, efficiency cores) of a hybrid CPU (Intel 12th gen+, AMD Zen 5 + Zen 5c),
+    counted as physical cores from the kernel's reports (Intel's hybrid PMU lists, else cpu_capacity); None on a CPU
+    whose cores are all alike, or when the kernel does not say."""
+    try:
+        classes = linux_core_classes()
+    except (OSError, ValueError):
+        return None
+    if not classes or max(classes) == min(classes):
+        return None
+    p = sum(1 for c in classes if c == max(classes))
+    return p, len(classes) - p
+
+
+def linux_core_classes(sys_root: str = "/sys"):
+    """One class per physical core on Linux: 1 for a P-core, 0 for an E-core; None when the kernel does not say.
+    #798: Intel's hybrid PMU lists (cpu_core/cpus, cpu_atom/cpus) when they exist; else cpu_capacity, where an E-core is
+    one under 90% of the largest - Turbo Boost Max 3.0 gives the "favored" P-cores a slightly higher capacity (1024
+    against 1012), so "below the maximum" counted 2 of a Core Ultra 7 270K Plus's 8 P-cores."""
+    pmu = linux_hybrid_pmu(sys_root + "/devices")
+    seen = {}
+    for cpu in sorted((Path(sys_root) / "devices" / "system" / "cpu").glob("cpu[0-9]*"), key=lambda p: int(p.name[3:])):
+        cap = cpu / "cpu_capacity"
+        pkg, core = cpu / "topology" / "physical_package_id", cpu / "topology" / "core_id"
+        if not cap.exists() and pmu is None:
+            return None
+        key = (pkg.read_text(encoding="utf-8").strip(), core.read_text(encoding="utf-8").strip()) \
+            if pkg.exists() and core.exists() else cpu.name
+        if pmu is not None:
+            seen.setdefault(key, 0 if int(cpu.name[3:]) in pmu[1] else 1)
+        else:
+            seen.setdefault(key, int(cap.read_text(encoding="utf-8").strip()))
+    classes = list(seen.values())
+    if pmu is None:
+        top = max(classes, default=0)
+        classes = [1 if c * 10 >= top * 9 else 0 for c in classes]
+    return classes
+
+
+def cpulist(text: str) -> set:
+    """A kernel cpulist ("0-7,16") as a set of CPU numbers."""
+    out = set()
+    for part in text.strip().split(","):
+        lo, _, hi = part.strip().partition("-")
+        if lo.isdigit():
+            out.update(range(int(lo), int(hi or lo) + 1))
+    return out
+
+
+def linux_hybrid_pmu(root: str = "/sys/devices"):
+    """upstream #798: (P-core CPUs, E-core CPUs) from Intel's hybrid PMU lists (cpu_core/cpus, cpu_atom/cpus), or None on a CPU
+    that has no such lists."""
+    try:
+        p = cpulist((Path(root) / "cpu_core" / "cpus").read_text(encoding="utf-8"))
+        e = cpulist((Path(root) / "cpu_atom" / "cpus").read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    return (p, e) if p and e else None
+
+
+def hybrid_pool_workers(cores) -> int | None:
+    """upstream #642 (Hardin22's measurement): on a hybrid CPU the expert pool runs best on the P-cores but the host loop's one
+    plus HALF of the E-cores - an E-core runs the expert kernels ~2.2x slower and each layer waits for its slowest
+    part (i9-14900KF, 8P + 16E: 15 workers decoded 165 / 116 tok/s against 106 / 84 with all 23).  Only on a CPU with
+    more E-cores than P-cores: on an i7-13700KF (8P + 8E, docs/AMD_HIP.md's gfx1030 report) all 15 workers decoded
+    38-42 tok/s against 36 with 8, so there the engine's own count stays.  None: the engine's own default (one worker
+    per physical core but the host's) stays."""
+    if not cores:
+        return None
+    p, e = cores
+    if e <= p:
+        return None
+    return max(1, p - 1 + e // 2)
+
+
+def recommend_pool_workers(args: list) -> list:
+    """`args` with setup's recommended `--pool-workers` for a hybrid CPU, unless they set one already (a calibration's
+    measured count, or the user's own).  A recommendation: the config line can be edited or removed."""
+    n = hybrid_pool_workers(cpu_cores())
+    if n is None or "--pool-workers" in args:
+        return args
+    p, e = cpu_cores()
+    ok(f"hybrid CPU ({p} performance + {e} efficiency cores): {n} CPU expert workers - the performance cores and half "
+       f"of the efficiency cores (--pool-workers in the config; {SETUP_CMD} --calibrate measures it on this PC)")
+    return [*args, "--pool-workers", str(n)]
+
+
 def hardware_key(cfg: dict) -> str:
     """What a calibration is valid for: this GPU, CPU and RAM, and the model with its context and images setting
     (the context's KV cache and the image encoder take VRAM from the expert cache)."""
@@ -3935,6 +4022,8 @@ def main() -> int:
         import calibrate as CAL
         cfg["args"] = CAL.apply(cfg["args"], cal.get("settings") or {})
         ok("the settings tuned for this PC earlier are used" + (f" ({cal['date']})" if cal.get("date") else ""))
+    else:                                              # upstream #642: measured counts (a calibration) win over the rule
+        cfg["args"] = recommend_pool_workers(cfg["args"])
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
     script = None if PACKAGED else write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     if not a.no_warmup:
