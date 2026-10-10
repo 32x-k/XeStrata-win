@@ -389,7 +389,8 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     take(b.dq_gu, (uint64_t) PromptBufs::kGroup * (uint64_t) b.gu_elems * 2);
     take(b.dq_d, (uint64_t) PromptBufs::kGroup * (uint64_t) b.d_elems * 2);
     take(b.stage, 2 * (uint64_t) PromptBufs::kGroup * lay.max_blob);   // two halves: one copied while one is read
-    take(b.xq, TK * N + TK * (N / 32) * 4); take(b.hq, TK * FF + TK * (FF / 32) * 4); take(b.identity, TK * 4);
+    // the int8 activations: values, then a scale and a sum per 32 (iq_mmq_act_bytes)
+    take(b.xq, TK * N + 2 * TK * (N / 32) * 4); take(b.hq, TK * FF + 2 * TK * (FF / 32) * 4); take(b.identity, TK * 4);
     take(b.wtab, E * sizeof(void*)); take(b.rbounds, (2 * E + 2) * 4);
     take(b.gemm_scratch, (uint64_t) b.gemm_elems * 2);
     dev_bytes = at;

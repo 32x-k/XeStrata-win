@@ -20,11 +20,12 @@ bool iq_mmq_usable(sycl::queue& q);
 /// Whether the same products run on `q`'s device without matrix engines (dp4a; local memory and work-group size
 /// permitting): iq_mmq_grouped takes that form where iq_mmq_usable says no.
 bool iq_mmq_dp4a_usable(sycl::queue& q);
-/// The ggml types whose weights these products decode (the i-quants but IQ1_S, Q2_0, Q8_0 and Q6_K).
+/// The ggml types whose weights these products decode (the i-quants but IQ1_S, Q2_0, Q8_0, Q5_0, Q4_K, Q5_K and Q6_K).
 bool iq_mmq_type_ok(int ggml_type);
 /// Bytes of a weight row of `cols` values in ggml_type (iq_mmq_type_ok).
 size_t iq_mmq_row_bytes(int ggml_type, int64_t cols);
-/// Bytes of `rows` activation rows of `cols` values (a multiple of 128): the int8 values, then a float per 32.
+/// Bytes of `rows` activation rows of `cols` values (a multiple of 128): the int8 values, then a scale per 32, then the
+/// sum per 32 (the scale times the int8 values' sum).
 size_t iq_mmq_act_bytes(int64_t rows, int64_t cols);
 /// The activations: row i of xq from row ids[i] of x (row i when ids is null), `ld` floats a row of x.
 sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,

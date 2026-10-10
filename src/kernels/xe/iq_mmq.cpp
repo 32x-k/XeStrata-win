@@ -6,8 +6,10 @@
 // The weights' values and scales follow llama.cpp's dequantizers (ggml/src/ggml-quants.c, dequantize_row_*; MIT
 // license, third_party/main/ggml/LICENSE, quoted in iq_kernels.cpp): a block of 32 values (16 for IQ2_XS, IQ2_S and
 // IQ1_M) is its grid or table bytes, signed, times d and the block's scale (IQ1_M's values times 8, its scales over 8).
-// Q8_0 and Q6_K (dequantize_row_q8_0, dequantize_row_q6_K) are their bytes, and Q6_K's 6-bit values less 32, times d
-// and the scale of each 16.  The activations are rounded as its q8_1 (amax / 127 a block of 32).
+// Q8_0, Q5_0 and Q6_K (dequantize_row_q8_0, _q5_0, _q6_K) are their bytes, Q5_0's 5-bit values less 16 and Q6_K's
+// 6-bit values less 32, times d and the scale of each 16.  Q4_K and Q5_K (dequantize_row_q4_K, _q5_K) are their 4- or
+// 5-bit values times d sc, less dmin m: a block's product is d sc times the int8 sum, less dmin m times the
+// activations' block sum, which the activations carry beside their scales (q8_1's s).  The activations are rounded as its q8_1 (amax / 127 a block of 32).
 //
 // A work-group takes a tile of one expert's rows (16, 32 or 64, by the group's largest) and 128 of its outputs, K 128
 // values a step: the step's activation rows copied to local memory, the weight rows decoded there (a work-item a block
@@ -82,6 +84,7 @@ constexpr bool built() {
 struct Sub {
     uint32_t v[8];
     float s0, s1;
+    float m = 0.0f;   // the K-quants' min term: the block's values less m (Q4_K, Q5_K)
 };
 // the grid bytes (below 128) negated where m is 0xFF
 inline uint32_t signed_bytes(uint32_t g, uint32_t m) { return (g ^ m) + (m & 0x01010101u); }
@@ -287,8 +290,74 @@ template<> struct Dec<14> {   // Q6_K: d scale (6-bit value - 32), a scale per 1
     }
 };
 
+template<> struct Dec<6> {   // Q5_0: d ((5-bit value) - 16), the high bits in qh
+    static constexpr int QK = 32, BSZ = (int) sizeof(block_q5_0);
+    static Sub get(const uint8_t* row, int sb) {
+        const block_q5_0* b = reinterpret_cast<const block_q5_0*>(row) + sb;
+        const uint32_t qh = (uint32_t) get_int_b2(b->qh, 0);
+        Sub r;
+        for (int k = 0; k < 4; ++k) {   // values 4k .. 4k + 3 in the low nibbles, 16 + 4k .. in the high ones
+            const uint32_t ql = (uint32_t) get_int_b2(b->qs, k);
+            uint32_t h0 = 0, h1 = 0;
+            for (int t = 0; t < 4; ++t) {
+                h0 |= ((qh >> (4 * k + t)) & 1u) << (8 * t + 4);
+                h1 |= ((qh >> (4 * k + t + 16)) & 1u) << (8 * t + 4);
+            }
+            r.v[k] = ((((ql & 0x0F0F0F0Fu) | h0) | 0x80808080u) - 0x10101010u) ^ 0x80808080u;
+            r.v[4 + k] = (((((ql >> 4) & 0x0F0F0F0Fu) | h1) | 0x80808080u) - 0x10101010u) ^ 0x80808080u;
+        }
+        r.s0 = r.s1 = (float) b->d;
+        return r;
+    }
+};
+// Q4_K and Q5_K's 6-bit scale and min of block j (get_scale_min_k4)
+inline void scale_min_k4(int j, const uint8_t* q, int& d, int& m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+template<> struct Dec<12> {   // Q4_K: d sc value - dmin m, block ib the low (even ib) or high nibbles of qs[32 (ib / 2)..]
+    static constexpr int QK = 256, BSZ = (int) sizeof(block_q4_K);
+    static Sub get(const uint8_t* row, int sb) {
+        const block_q4_K* b = reinterpret_cast<const block_q4_K*>(row) + sb / 8;
+        const int ib = sb % 8;
+        Sub r;
+        for (int k = 0; k < 8; ++k)
+            r.v[k] = ((uint32_t) get_int_b4(b->qs, 8 * (ib / 2) + k) >> (4 * (ib & 1))) & 0x0F0F0F0Fu;
+        int sc, mn;
+        scale_min_k4(ib, b->scales, sc, mn);
+        r.s0 = r.s1 = (float) b->dm[0] * (float) sc;
+        r.m = (float) b->dm[1] * (float) mn;
+        return r;
+    }
+};
+template<> struct Dec<13> {   // Q5_K: Q4_K's nibbles with bit ib of qh as the fifth
+    static constexpr int QK = 256, BSZ = (int) sizeof(block_q5_K);
+    static Sub get(const uint8_t* row, int sb) {
+        const block_q5_K* b = reinterpret_cast<const block_q5_K*>(row) + sb / 8;
+        const int ib = sb % 8;
+        Sub r;
+        for (int k = 0; k < 8; ++k) {
+            const uint32_t ql = (uint32_t) get_int_b4(b->qs, 8 * (ib / 2) + k) >> (4 * (ib & 1));
+            const uint32_t qh = (uint32_t) get_int_b4(b->qh, k) >> ib;
+            r.v[k] = (ql & 0x0F0F0F0Fu) | ((qh & 0x01010101u) << 4);
+        }
+        int sc, mn;
+        scale_min_k4(ib, b->scales, sc, mn);
+        r.s0 = r.s1 = (float) b->dm[0] * (float) sc;
+        r.m = (float) b->dm[1] * (float) mn;
+        return r;
+    }
+};
+
 template<int TY>
 constexpr bool half_scales() { return TY == 17 || TY == 22 || TY == 29 || TY == 14; }
+template<int TY>
+constexpr bool has_min() { return TY == 12 || TY == 13; }
 
 // ---------------------------------------------------------------- the products
 template<typename T>
@@ -315,14 +384,18 @@ struct Kernel {
     static constexpr int SGN = 2, NSGN = 4, NSG = NSGM * NSGN;
     static constexpr int WM = NSGM * SGM * TM, WN = NSGN * SGN * TN;
     static constexpr bool HALF = half_scales<TY>();
+    static constexpr bool MIN = has_min<TY>();
+    // MIN: the activations' block sums as [block][row] and the weights' min terms as [block][output] after the rest
     static constexpr int A_OFF = 0, B_OFF = up128(A_OFF + WM * LDA), XS_OFF = up128(B_OFF + WN * LDB),
                          WS_OFF = up128(XS_OFF + NB * WM * 4), ST_OFF = up128(WS_OFF + 2 * NB * WN * 4),
-                         LOCAL = up128(ST_OFF + NSG * TM * TN * 4);
+                         XU_OFF = up128(ST_OFF + NSG * TM * TN * 4), WM_OFF = up128(XU_OFF + NB * WM * 4),
+                         LOCAL = MIN ? up128(WM_OFF + NB * WN * 4) : XU_OFF;
     const uint8_t* w;
     const uint8_t* const* wtab;   // expert e's weights at wtab[e] + woff when set, else at w + e expert_bytes
     size_t woff, expert_bytes, row_bytes;
     const int8_t* xq;
     const float* xs;
+    const float* xu;   // the activations' block sums (d times the int8 values' sum), MIN
     int64_t K;
     const int32_t* bounds;
     const int32_t* ids;
@@ -342,6 +415,8 @@ struct Kernel {
         int8_t* al = local_as<int8_t>(base + A_OFF).get();
         int8_t* bl = local_as<int8_t>(base + B_OFF).get();
         float* xsl = local_as<float>(base + XS_OFF).get();
+        [[maybe_unused]] float* xul = local_as<float>(base + XU_OFF).get();
+        [[maybe_unused]] float* wml = local_as<float>(base + WM_OFF).get();
         float* wsl = local_as<float>(base + WS_OFF).get();
         float acc[RPT];
         for (int i = 0; i < RPT; ++i) acc[i] = 0.0f;
@@ -359,6 +434,7 @@ struct Kernel {
                 const int b = v / WM, rr = v % WM;
                 const int64_t row = m0 + rr;
                 xsl[v] = row < rows ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                if constexpr (MIN) xul[v] = row < rows ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
             }
             for (int v = lid; v < WN * NB; v += lanes) {
                 const int nn = v / NB, b = v % NB;
@@ -368,6 +444,7 @@ struct Kernel {
                 o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
                 wsl[(2 * b) * WN + nn] = d.s0;
                 wsl[(2 * b + 1) * WN + nn] = d.s1;
+                if constexpr (MIN) wml[b * WN + nn] = d.m;
             }
             sycl::group_barrier(it.get_group());
             for (int b = 0; b < NB; ++b) {
@@ -382,6 +459,7 @@ struct Kernel {
                     for (int j = 0; j < 4; ++j) s0 = xe::dp4a(ap[j], wv[j], s0);
                     for (int j = 4; j < 8; ++j) s1 = xe::dp4a(ap[j], wv[j], s1);
                     acc[i] += xsl[b * WM + rr] * (ws0 * (float) s0 + ws1 * (float) s1);
+                    if constexpr (MIN) acc[i] -= wml[b * WN + n] * xul[b * WM + rr];
                 }
             }
         }
@@ -417,6 +495,10 @@ struct Kernel {
             int8_t* al = ap.get();
             int8_t* bl = bp.get();
             float* xsl = xsp.get();
+            const auto xup = local_as<float>(base + XU_OFF);
+            const auto wmp = local_as<float>(base + WM_OFF);
+            [[maybe_unused]] float* xul = xup.get();
+            [[maybe_unused]] float* wml = wmp.get();
             float* wsl = wsp.get();
 
             mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> acc[SGM][SGN];
@@ -438,6 +520,7 @@ struct Kernel {
                     const int b = v / WM, rr = v % WM;
                     const int64_t row = m0 + rr;
                     xsl[v] = row < rows ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                    if constexpr (MIN) xul[v] = row < rows ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
                 }
                 for (int v = lid; v < WN * NB; v += lanes) {
                     const int nn = v / NB, b = v % NB;
@@ -447,6 +530,7 @@ struct Kernel {
                     o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
                     wsl[(2 * b) * WN + nn] = d.s0;
                     wsl[(2 * b + 1) * WN + nn] = d.s1;
+                    if constexpr (MIN) wml[b * WN + nn] = d.m;
                 }
                 sycl::group_barrier(it.get_group());
                 for (int b = 0; b < NB; ++b) {
@@ -477,6 +561,19 @@ struct Kernel {
                                 mx::joint_matrix_apply(sg, acc[i][j], sc, [](float& a, float& s) { a += s; });
                             }
                     }
+                    if constexpr (MIN)   // less the weights' min of column c times row r's sum
+                        for (int i = 0; i < SGM; ++i) {
+                            mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> xuf;
+                            mx::joint_matrix_load(sg, xuf, xup + static_cast<int>(b * WM + ms + i * TM), 0,
+                                                  mx::layout::col_major);
+                            for (int j = 0; j < SGN; ++j) {
+                                mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> mn;
+                                mx::joint_matrix_load(sg, mn, wmp + static_cast<int>(b * WN + ns + j * TN), 0,
+                                                      mx::layout::row_major);
+                                mx::joint_matrix_apply(sg, mn, xuf, [](float& m, float& x) { m *= x; });
+                                mx::joint_matrix_apply(sg, acc[i][j], mn, [](float& a, float& m) { a -= m; });
+                            }
+                        }
                 }
             }
             // out through local memory, the rows past the expert's last not written
@@ -511,6 +608,8 @@ struct Kernel {
             int8_t* al = local_as<int8_t>(base + A_OFF).get();
             int8_t* bl = local_as<int8_t>(base + B_OFF).get();
             float* xsl = local_as<float>(base + XS_OFF).get();
+            [[maybe_unused]] float* xul = local_as<float>(base + XU_OFF).get();
+            [[maybe_unused]] float* wml = local_as<float>(base + WM_OFF).get();
             float* wsl = local_as<float>(base + WS_OFF).get();
             using i8v = int __attribute__((ext_vector_type(8)));
 #if defined(__GFX12__)
@@ -541,6 +640,7 @@ struct Kernel {
                     const int b = v / WM, rr = v % WM;
                     const int64_t row = m0 + rr;
                     xsl[v] = row < rows ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                    if constexpr (MIN) xul[v] = row < rows ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
                 }
                 for (int v = lid; v < WN * NB; v += lanes) {
                     const int nn = v / NB, b = v % NB;
@@ -550,6 +650,7 @@ struct Kernel {
                     o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
                     wsl[(2 * b) * WN + nn] = d.s0;
                     wsl[(2 * b + 1) * WN + nn] = d.s1;
+                    if constexpr (MIN) wml[b * WN + nn] = d.m;
                 }
                 sycl::group_barrier(it.get_group());
                 for (int b = 0; b < NB; ++b) {
@@ -583,6 +684,13 @@ struct Kernel {
                                     acc[i][j][el] += ws * xsr[i][el] * exact_float(ci[i][j][el]);
                         }
                     }
+                    if constexpr (MIN)
+                        for (int j = 0; j < SGN; ++j) {
+                            const float wm = wml[b * WN + ns + j * TN + lo];
+                            for (int i = 0; i < SGM; ++i)
+                                for (int el = 0; el < 8; ++el)
+                                    acc[i][j][el] -= wm * xul[b * WM + ms + i * TM + row_of(el)];
+                        }
                 }
             }
             // straight out, the rows past the expert's last not written
@@ -612,11 +720,12 @@ sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, si
     const size_t row_bytes = (size_t) (w_cols / Dec<TY>::QK) * (size_t) Dec<TY>::BSZ;
     const auto* x8 = static_cast<const int8_t*>(xq);
     const auto* xs = reinterpret_cast<const float*>(x8 + total_rows * w_cols);
+    const auto* xu = xs + total_rows * (w_cols / 32);
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint8_t, 1> lm(sycl::range<1>((size_t) KT::LOCAL), h);
         const size_t wg = (size_t) KT::NSG * SG;
         h.parallel_for(sycl::nd_range<1>((size_t) n * (size_t) (tiles_m * tiles_n) * wg, wg),
-                       KT{static_cast<const uint8_t*>(w), wtab, woff, expert_bytes, row_bytes, x8, xs, w_cols, bounds, ids, dst,
+                       KT{static_cast<const uint8_t*>(w), wtab, woff, expert_bytes, row_bytes, x8, xs, xu, w_cols, bounds, ids, dst,
                           ld_dst, tiles_m, tiles_n, lm});
     });
 }
@@ -743,13 +852,16 @@ bool iq_mmq_dp4a_usable(sycl::queue& q) {
 
 bool iq_mmq_type_ok(int t) {
     switch (t) {
-        case 8: case 14: case 16: case 17: case 18: case 20: case 21: case 22: case 23: case 29: case 42: return true;
+        case 6: case 8: case 12: case 13: case 14: case 16: case 17: case 18: case 20: case 21: case 22: case 23: case 29: case 42: return true;
         default: return false;
     }
 }
 
 size_t iq_mmq_row_bytes(int t, int64_t cols) {
     switch (t) {
+        case 6: return (size_t) (cols / Dec<6>::QK) * Dec<6>::BSZ;
+        case 12: return (size_t) (cols / Dec<12>::QK) * Dec<12>::BSZ;
+        case 13: return (size_t) (cols / Dec<13>::QK) * Dec<13>::BSZ;
         case 8: return (size_t) (cols / Dec<8>::QK) * Dec<8>::BSZ;
         case 14: return (size_t) (cols / Dec<14>::QK) * Dec<14>::BSZ;
         case 16: return (size_t) (cols / Dec<16>::QK) * Dec<16>::BSZ;
@@ -765,13 +877,14 @@ size_t iq_mmq_row_bytes(int t, int64_t cols) {
     }
 }
 
-size_t iq_mmq_act_bytes(int64_t rows, int64_t cols) { return (size_t) (rows * cols + rows * (cols / 32) * 4); }
+size_t iq_mmq_act_bytes(int64_t rows, int64_t cols) { return (size_t) (rows * cols + 2 * rows * (cols / 32) * 4); }
 
 sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
                             int64_t rows) {
     auto* x8 = static_cast<int8_t*>(xq);
     auto* xs = reinterpret_cast<float*>(x8 + rows * cols);
     const int64_t nb = cols / 32;
+    float* xu = xs + rows * nb;
     return q.parallel_for(sycl::range<1>((size_t) (rows * nb)), [=](sycl::id<1> i) {
         const int64_t r = (int64_t) i[0] / nb, b = (int64_t) i[0] % nb;
         const float* xr = x + (int64_t) (ids ? ids[r] : r) * ld + b * 32;
@@ -779,15 +892,21 @@ sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, 
         for (int j = 0; j < 32; ++j) { v[j] = xr[j]; amax = sycl::fmax(amax, sycl::fabs(v[j])); }
         const float d = amax / 127.0f, id = amax > 0.0f ? 1.0f / d : 0.0f;
         uint32_t p[8];
+        int sum = 0;
         for (int j = 0; j < 8; ++j) {
             uint32_t u = 0;
-            for (int k = 0; k < 4; ++k) u |= (uint32_t) (uint8_t) (int8_t) sycl::round(v[4 * j + k] * id) << (8 * k);
+            for (int k = 0; k < 4; ++k) {
+                const int q = (int) sycl::round(v[4 * j + k] * id);
+                sum += q;
+                u |= (uint32_t) (uint8_t) (int8_t) q << (8 * k);
+            }
             p[j] = u;
         }
         u32x4* o = reinterpret_cast<u32x4*>(x8 + r * cols + b * 32);
         o[0] = u32x4{p[0], p[1], p[2], p[3]};
         o[1] = u32x4{p[4], p[5], p[6], p[7]};
         xs[r * nb + b] = d;
+        xu[r * nb + b] = d * (float) sum;
     });
 }
 
@@ -799,7 +918,10 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         return by_rows<TY>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, max_rows, ids, \
                            dst, ld_dst)
     switch (t) {
+        STRATA_MMQ_CASE(6);
         STRATA_MMQ_CASE(8);
+        STRATA_MMQ_CASE(12);
+        STRATA_MMQ_CASE(13);
         STRATA_MMQ_CASE(14);
         STRATA_MMQ_CASE(16);
         STRATA_MMQ_CASE(17);
