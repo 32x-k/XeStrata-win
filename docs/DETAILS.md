@@ -71,6 +71,14 @@ IQ2_XS writes 17.6 tokens/s with MTP and reads the 26K-token prompt at 574 token
 On a GPU without XMX the prefill path's products run through DP4a, so prefill takes about 1.6 times as long
 ([record](../bench/results/2026-10-02-dp4a/README.md)).
 
+The prefill path's half-output buffer shares the embedding buffer, which is dead after the first hyper-connection
+broadcast (upstream 199fd1d5, #1454): T x 2560 floats less VRAM per chunk (320 MiB at 32,768 tokens).
+The planner still counts those bytes by default, so the chunk and the cache slots the prefill path borrows stay as
+they were, and so do the prefill's bits.
+`STRATA_EMB_REUSE_ACCOUNT=1` lets the planner use them: a chunk that VRAM limits grows (upstream 55dee8ed, RTX 3060,
+IQ3_XXS: 6,400 to 6,656 tokens, prefill about 3.9% faster).
+A different chunk changes the prefill's rounding.
+
 ### AMD APUs
 
 On an AMD APU (Ryzen AI Max "Strix Halo" and the like) the CPU and the GPU share one memory (upstream c4a329fe).

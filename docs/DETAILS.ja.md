@@ -70,6 +70,12 @@ IQ2_XS は MTP で 17.6 トークン/秒を書き、26K トークンのプロン
 XMX のない GPU では、prefill の経路の行列積を DP4a で計算するので、prefill に約 1.6 倍の時間がかかります
 （[記録](../bench/results/2026-10-02-dp4a/README.md)）。
 
+prefill の経路は、半精度の出力のバッファを、最初の hyper-connection の配り（broadcast）のあとは使わない埋め込みのバッファと共有します（upstream 199fd1d5、#1454）。
+チャンクあたり T × 2560 個の float（32,768 トークンで 320 MiB）の VRAM が空きます。
+チャンクの大きさを決めるときは既定でその分も数えるので、チャンクと借りるキャッシュの枠は前と同じで、prefill の結果のビットも変わりません。
+`STRATA_EMB_REUSE_ACCOUNT=1` にすると、空いた分も使って、VRAM で決まるチャンクを大きくします（upstream 55dee8ed、RTX 3060・IQ3_XXS で 6,400 から 6,656 トークン、prefill が約 3.9% 速い）。
+チャンクが変わると prefill の丸めも変わります。
+
 ### AMD の APU
 
 AMD の APU（Ryzen AI Max の Strix Halo など）では、CPU と GPU が 1 つのメモリを分け合います（upstream c4a329fe）。
