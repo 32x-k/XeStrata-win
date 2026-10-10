@@ -58,6 +58,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/share_rules.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
@@ -1902,6 +1903,46 @@ void setup_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, const O
                  t.c, t.cb, t.p, t.pb, t.q, (long long) t.layer, row.c_str(), overlap ? " (beside the hits)" : "");
 }
 }  // namespace
+
+// Whether the prompt path gets the CPU pool for its share (STRATA_PREFILL_CPU_SHARE, auto by default).  An explicit
+// setting is the user's: the pool is given (0 turns the share off in the prompt path), with a warning when host memory
+// is short.  The default is not armed when the expert cache holds every expert (upstream eaaa237e, #1595: nothing
+// streams, so nothing to take) or when the host lacks the memory for it (upstream 04dbe561: chats failed on a machine
+// with tight RAM).  `src`: the file source when it is the one in use (its experts the CPU would read as file pages).
+static bool cpu_share_default_ok(const strata::core::ModelGeometry& g, const strata::core::ExpertCache& xcache,
+                                 const strata::core::FileExpertSource* src) {
+    namespace sr = strata::prefill::share_rules;
+    const char* ev = std::getenv("STRATA_PREFILL_CPU_SHARE");
+    const int64_t pairs = g.n_layers * g.n_expert;
+    if (ev == nullptr && !sr::default_share_has_work((int64_t) xcache.slots(), pairs)) {
+        std::fprintf(stderr, "strata: every expert is in the GPU cache (%lld of %lld): the CPU prefill share has nothing "
+                             "to take, so it is not armed by default (STRATA_PREFILL_CPU_SHARE=auto forces it)\n",
+                     (long long) xcache.slots(), (long long) pairs);
+        return false;
+    }
+    sr::ShareMemory sm;
+    if (const auto avail = strata::core::available_host_bytes()) sm.avail_ram = *avail;
+    sm.buffer_bytes = (uint64_t) (1024 + 8 * g.n_expert) * (uint64_t) g.n_embd * 4 + (256ull << 20);
+    if (src != nullptr) {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            for (int64_t e = 0; e < g.n_expert; ++e)
+                if (xcache.slot_of(l, e) < 0 && src->resident_blob(l, e) == nullptr && !src->transient(l, e))
+                    sm.inplace_bytes += (uint64_t) lay.blob_bytes(l);
+    }
+    const sr::ShareVerdict v = sr::default_share_memory_verdict(sm);
+    if (v.arm) return true;
+    if (ev == nullptr) {
+        std::fprintf(stderr, "strata: the CPU prefill share is not armed by default: %s. STRATA_PREFILL_CPU_SHARE=auto "
+                             "turns it on anyway\n", v.why.c_str());
+        return false;
+    }
+    if (std::strcmp(ev, "0") != 0)
+        std::fprintf(stderr, "strata: WARNING STRATA_PREFILL_CPU_SHARE=%s is set and kept, but %s: the share can slow "
+                             "prompts or fail on a machine this short of memory (STRATA_PREFILL_CPU_SHARE=0 turns it off)\n",
+                     ev, v.why.c_str());
+    return true;
+}
 
 // #1425 #1549 #1629 (upstream 30017336): --ple-io direct (the default) does unbuffered random reads of the n-gram
 // table; on some drives (DRAM-less NVMe) they run at 34 MB/s and a prompt reads layer 1 for minutes.  Rows per second
@@ -5612,7 +5653,8 @@ int main(int argc, char** argv) {
         }
         if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
         // the pool is idle while a prompt is read unless batch slots decode between its parts
-        if (!multi_gpu && o.batch <= 0 && !o.no_pool) sp.set_cpu_pool(&pool);
+        if (!multi_gpu && o.batch <= 0 && !o.no_pool && cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr))
+            sp.set_cpu_pool(&pool);
         if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             if (err.find("fit") != std::string::npos)   // #85: say what frees VRAM
@@ -10098,7 +10140,8 @@ int main(int argc, char** argv) {
         }
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
-        if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
+        if (!multi_gpu && !o.no_pool && cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr))
+            prefill.set_cpu_pool(&pool);
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                           borrow_bytes)) {

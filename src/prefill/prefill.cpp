@@ -461,6 +461,7 @@ struct Prefill::Impl {
     // writes (the tail of Dm, in Dm's row order), both in host memory; the pool's activations and jobs
     float *cpu_x = nullptr, *cpu_rows = nullptr;
     size_t cpu_x_n = 0, cpu_rows_n = 0;
+    bool cpu_dead = false;   // a pinned buffer of the share could not be had (host memory is short): the GPU does it all
     std::vector<uint8_t> cpu_nact;
     std::vector<strata::kernels::cpu::ActQ> cpu_actq;   // a Q2_0 layer's activations (the pool's Q2_0 kernels read ActQ)
     std::vector<strata::kernels::cpu::ExpertJobMulti> cpu_jobs;
@@ -1767,8 +1768,18 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     m.ids_host.resize((size_t) T * K);
                     m.ids_host.from_device(m.ids, m.cs);
                     const strata::kernels::cpu::ExpertLayout& lay_c = strata::kernels::cpu::expert_layout();
-                    const bool cpu_maybe = cpu_pool_ != nullptr && cpu_share_on() && !stream_all && m.src != nullptr &&
-                                           lay_c.native && !lay_c.fmt.empty();
+                    bool cpu_maybe = cpu_pool_ != nullptr && cpu_share_on() && !stream_all && m.src != nullptr && !m.cpu_dead &&
+                                     lay_c.native && !lay_c.fmt.empty();
+                    // The share's two pinned buffers are small (~50 MB) but are had mid-request, when the host may have
+                    // nothing left (upstream 04dbe561, 0.1.41 report: tight RAM, chats failing).  A buffer that cannot be
+                    // had ends the share for this engine - the GPU takes every expert, as with STRATA_PREFILL_CPU_SHARE=0
+                    // - instead of failing the request.
+                    auto cpu_share_off = [&](const char* what) {
+                        m.cpu_dead = true;
+                        cpu_maybe = false;
+                        std::fprintf(stderr, "prefill: the CPU share is off for this run: the host could not give %s "
+                                             "(RAM is short); the GPU streams every expert\n", what);
+                    };
                     bool cpu_arm = true;     // auto: this layer may share (false: the arm without)
                     int cpu_set = -1;        // auto: the wall events' set, -1 when not measured
                     bool cpu_cold = false;   // auto: one-time costs in the window (no reading)
@@ -1800,14 +1811,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (m.cpu_x_n < want) {
                             cpu_cold = true;
                             if (m.cpu_x) strata::gpu::free(m.cpu_x);
+                            m.cpu_x = nullptr;
                             m.cpu_x_n = 0;
                             if (!strata::gpu::alloc_host(&m.cpu_x, want * sizeof(float))) {
-                                err = "prefill: cannot allocate the CPU experts' activations";
-                                return false;
+                                m.cpu_x = nullptr;
+                                cpu_share_off("the activation buffer");
+                            } else {
+                                m.cpu_x_n = want;
                             }
-                            m.cpu_x_n = want;
                         }
-                        strata::gpu::copy_async(m.cpu_x, m.mixed, want * sizeof(float), m.cs);
+                        if (cpu_maybe) strata::gpu::copy_async(m.cpu_x, m.mixed, want * sizeof(float), m.cs);
                     }
                     strata::gpu::stream_sync(m.cs);
                     pt.fold();
@@ -1820,6 +1833,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             m.cpu_c_ms = m.cpu_c_ms > 0 ? m.cpu_c_ms + a * (c - m.cpu_c_ms) : c;
                             m.cpu_g_ms = m.cpu_g_ms > 0 ? m.cpu_g_ms + a * (gm - m.cpu_g_ms) : gm;
                             m.cpu_share_now = std::clamp(m.cpu_g_ms / (m.cpu_c_ms + m.cpu_g_ms), 0.05, 0.9);
+                        }
+                    }
+                    if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most MAXT tokens' rows)
+                        const size_t cap = (size_t) std::min<int64_t>(T * K, (int64_t) strata::kernels::cpu::MAXT * m.g->n_expert) * N;
+                        if (m.cpu_rows_n < cap) {
+                            cpu_cold = true;
+                            if (m.cpu_rows) strata::gpu::free(m.cpu_rows);
+                            m.cpu_rows = nullptr;
+                            m.cpu_rows_n = 0;
+                            if (!strata::gpu::alloc_host(&m.cpu_rows, cap * sizeof(float))) {
+                                m.cpu_rows = nullptr;
+                                cpu_share_off("the rows buffer");
+                            } else {
+                                m.cpu_rows_n = cap;
+                            }
                         }
                     }
                     if (m.pend_wall) {   // the last eligible layer's wall, and its ratio to the one before it
@@ -1928,18 +1956,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     std::future<bool> cpu_fut;
                     double cpu_ms = 0;
                     if (rows_cpu > 0) {
-                        const size_t want = (size_t) rows_cpu * N;
-                        if (m.cpu_rows_n < want) {
-                            cpu_cold = true;
-                            if (m.cpu_rows) strata::gpu::free(m.cpu_rows);
-                            m.cpu_rows_n = 0;
-                            const size_t cap_rows = (size_t) rows_cpu * 2;   // headroom: few reallocations
-                            if (!strata::gpu::alloc_host(&m.cpu_rows, cap_rows * N * sizeof(float))) {
-                                err = "prefill: cannot allocate the CPU experts' rows";
-                                return false;
-                            }
-                            m.cpu_rows_n = cap_rows * N;
-                        }
+                        // (the rows buffer was had at its largest after the routing sync)
                         const strata::kernels::cpu::NativeFmt& cf = lay.fmt[(size_t) l];
                         const bool q2 = cf.gu_type == 42;   // a native Q2_0 layer: the pool's Q2_0 kernels read ActQ
                         constexpr size_t AB = strata::kernels::cpu::kNativeActBytes;
