@@ -228,10 +228,17 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                     proj(b.q, P.qfull, T);
                     proj(b.k, P.kraw, T);
                     proj(b.v, P.vcur, T);
-                    k::native_qsa_rms_norm_rope(P.qfull, (int) (qw / NH), b.q_norm, P.qcur, (int) (T * NH), (int) HD,
-                                                (int) s.rope_dims, eps, rs, P.pos_q, cs);
-                    k::native_qsa_rms_norm_rope(P.kraw, (int) HD, b.k_norm, P.kcur, (int) (T * NKV), (int) HD,
-                                                (int) s.rope_dims, eps, rs, P.pos_k, cs);
+                    // the norm and RoPE take at most 65535 rows a launch: the chunk's heads in token slices
+                    auto norm_rope = [&](const float* in, int64_t in_row, const float* gamma, float* out, int64_t heads,
+                                         const int32_t* pos) {
+                        const int64_t per = 65535 / heads;
+                        for (int64_t t0 = 0; t0 < T; t0 += per)
+                            k::native_qsa_rms_norm_rope(in + t0 * heads * in_row, (int) in_row, gamma, out + t0 * heads * HD,
+                                                        (int) (std::min(per, T - t0) * heads), (int) HD,
+                                                        (int) s.rope_dims, eps, rs, pos + t0 * heads, cs);
+                    };
+                    norm_rope(P.qfull, qw / NH, b.q_norm, P.qcur, NH, P.pos_q);
+                    norm_rope(P.kraw, HD, b.k_norm, P.kcur, NKV, P.pos_k);
                     k::kv_append_steps(k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_, P.steps, k::kStepCount,
                                        P.kcur, P.vcur, (int) (NKV * HD), (int) T, qs, cs);
                     k::QsaAttnPools pools;
