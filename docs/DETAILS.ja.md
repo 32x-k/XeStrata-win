@@ -647,7 +647,7 @@ print(r.choices[0].message.content)
   ファイルのほかのキーはそのまま残し、前のファイルを `xestrata-<model>.json.bak` に残し、モデルは次の起動から変更を使います。
   保存できるのは XeStrata 自身のページだけです（JSON、API キーがあればそれも。Chat の設定と同じ）。ネットワーク、キー、MCP、プログラムのキーは、そこでは変えられません。
 - **同じネットワークのほかの機器から**: 指定しなければ、server はこの PC（`127.0.0.1`）でだけ待ち受けます。
-  `./setup.sh --setup --host 0.0.0.0 --api-key 長い秘密の文字列` で setup するか、`xestrata-<model>.json` に `"host": "0.0.0.0"` と `"api_key": "..."` を書きます。
+  `./setup.sh --host 0.0.0.0 --api-key 長い秘密の文字列` で起動するか（モデルの設定に保存され、次からも使われます）、`xestrata-<model>.json` に `"host": "0.0.0.0"` と `"api_key": "..."` を書きます。
   server のウィンドウに、この PC のアドレスが出ます（`from other devices: http://192.168.x.x:8095/`）。
   ほかの機器でそれを開くか、`.../v1` を API のベース URL に使います。
 - **インターネットから**: 前にトンネルを置きます。

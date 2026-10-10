@@ -640,7 +640,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   Every other key of the file stays as it is, the earlier file is kept as `xestrata-<model>.json.bak`, and the model uses the change from its next start.
   Only XeStrata's own page can save (JSON, with the API key when one is set, as for the Chat settings); the network, key, MCP and program keys are not editable there.
 - **From other devices on your network.** The server listens on your PC only (`127.0.0.1`) unless you say otherwise:
-  run `./setup.sh --setup --host 0.0.0.0 --api-key some-long-secret`, or add `"host": "0.0.0.0"` and `"api_key": "..."` to `xestrata-<model>.json`.
+  run `./setup.sh --host 0.0.0.0 --api-key some-long-secret` (kept in the model's config for the next starts), or add `"host": "0.0.0.0"` and `"api_key": "..."` to `xestrata-<model>.json`.
   The server window then prints this PC's addresses (`from other devices: http://192.168.x.x:8095/`).
   Open that on the other device, or use `.../v1` as an API base URL.
 - **From the internet.** Put a tunnel in front of it, for example
