@@ -478,7 +478,7 @@ bool PlainModel::open_experts(std::string& err) {
         if (!file->open(std::string(), L, E, err)) return false;
         src_ = std::move(file);
     }
-    pool_ = std::make_unique<k::cpu::ExpertPool>(opt_.threads);
+    pool_ = std::make_unique<k::cpu::ExpertPool>(opt_.pool_workers);
 
     // the VRAM tier: what the device has left, less the window's arena and a reserve, in slots of each layer's blob,
     // the same number for every layer

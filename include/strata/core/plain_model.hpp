@@ -40,7 +40,7 @@ struct PlainOptions {
     std::string gguf;               ///< any shard of the model
     int64_t max_cells = 4096;       ///< the context the K/V cache holds
     int max_t = 8;                  ///< the largest window
-    int threads = 0;                ///< CPU pool workers (0: every physical core but the first)
+    int pool_workers = 0;           ///< CPU pool workers (0: every physical core but the first)
     int64_t reserve_mib = 768;      ///< VRAM left free after the expert slots
     int adapt_every = 4;            ///< windows between adaptive rounds (0: off)
     int adapt_swaps = 96;           ///< the most experts one round moves into the VRAM tier

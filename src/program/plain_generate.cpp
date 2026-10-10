@@ -2,16 +2,14 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/program/plain_generate.cpp - `strata generate` for the models of plain_model.hpp (Ornith-1.5, llm-jp-4.1).
 //
-//     strata --native MODEL.gguf --tokens 1,2,3 [--n 32] [--max-context N] [--max-t T] [--threads N]
-//            [--dump-logits FILE] [--adapt-every N] [--mmap-experts] [--no-pcie-split]
-//            [--expert-profile FILE] [--expert-profile-save FILE] [--rope-scaling yarn --rope-scale F --yarn-orig-ctx N]
-//            [--prompt-chunk N]
+//     strata --native MODEL.gguf --tokens 1,2,3 [options: plain_usage, --help]
 //
-// The prompt runs in chunks of N tokens through the batched products (--prompt-chunk, default 512; 0: in windows of
-// up to T tokens), then one token a window, greedily.  stdout gets one line,
+// The prompt runs in chunks of up to N tokens through the batched products (--prompt-chunk, default 4096; 0: in
+// windows of up to T tokens), then one token a window.  stdout gets one line,
 // `tokens: a,b,c`, the generated ids; --dump-logits writes the logits each generated token was chosen from, n_vocab
 // floats a row.  The report goes to stderr.
 #include "strata/program/plain_generate.hpp"
+#include "strata/program/option_scope.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/plain_model.hpp"
@@ -61,6 +59,38 @@ std::string architecture(const std::string& path) {
 
 }  // namespace
 
+void plain_usage(const std::string& arch) {
+    std::fprintf(stderr,
+                 "strata --native GGUF --tokens \"1,2,3\" [options]   (%s: the models other than Qwen3.8-Flash-Next)\n"
+                 "\n"
+                 "  --native PATH        the model's GGUF (its first shard)\n"
+                 "  --tokens LIST        the prompt as comma-separated token ids\n"
+                 "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
+                 "  --max-new N          tokens to generate (default 16)\n"
+                 "  --max-context N      the K/V cache's cells (default 4096; raised to the prompt and --max-new)\n"
+                 "  --greedy             the most likely token (the default)\n"
+                 "  --seed N             sample, from this seed (with --temperature, --top-k, --top-p)\n"
+                 "  --temperature F      sampling temperature (default 1.0)\n"
+                 "  --top-k N            sample from the N most likely (default 20)\n"
+                 "  --top-p F            sample from the smallest set of this probability (default 0.95)\n"
+                 "  --stop-eos           stop at an end-of-generation token\n"
+                 "  --eos-ids LIST       those tokens (default the GGUF's end-of-sequence and end-of-turn tokens;\n"
+                 "                       implies --stop-eos)\n"
+                 "  --pool-workers N     the CPU's expert threads (default every physical core but one)\n"
+                 "  --expert-profile PATH        fill the VRAM tier from this profile at load\n"
+                 "  --expert-profile-save PATH   write what this run learned as a profile\n"
+                 "  --adapt-every N      windows between the tier's adaptive rounds (default 4; 0 off)\n"
+                 "  --mmap-experts       read the experts from the GGUF through mmap instead of pinned RAM\n"
+                 "  --no-pcie-split      the CPU computes every expert the VRAM tier misses\n"
+                 "  --prompt-chunk N     the prompt's most tokens a chunk through the batched products (default\n"
+                 "                       4096; 0: the prompt in windows)\n"
+                 "  --max-t N            the decode window's most tokens (default 8)\n"
+                 "  --rope-scaling none|linear|yarn, --rope-scale F, --yarn-orig-ctx N   context extension\n"
+                 "  --dump-logits PATH   each generated token's logits, FP32 rows\n"
+                 "  --gpu PCI            the GPU (its PCI address)\n",
+                 arch.c_str());
+}
+
 int plain_main(int argc, char** argv) {
     std::string gguf;
     for (int i = 1; i + 1 < argc; ++i)
@@ -72,7 +102,7 @@ int plain_main(int argc, char** argv) {
     strata::core::PlainOptions opt;
     opt.gguf = gguf;
     std::vector<int32_t> prompt;
-    int64_t n_new = 32;
+    int64_t n_new = 16;
     std::string dump_path, profile_save;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -89,10 +119,11 @@ int plain_main(int argc, char** argv) {
             if (!in.good() && !in.eof()) { std::fprintf(stderr, "cannot read the token file\n"); return 2; }
             if (!parse_ids(text, prompt)) { std::fprintf(stderr, "--tokens-file: a list of token ids\n"); return 2; }
         }
-        else if (a == "--n") n_new = std::strtoll(next("--n"), nullptr, 10);
+        else if (a == "--help" || a == "-h") { plain_usage(arch); return 0; }
+        else if (a == "--max-new") n_new = std::strtoll(next("--max-new"), nullptr, 10);
         else if (a == "--max-context") opt.max_cells = std::strtoll(next("--max-context"), nullptr, 10);
         else if (a == "--max-t") opt.max_t = (int) std::strtol(next("--max-t"), nullptr, 10);
-        else if (a == "--threads") opt.threads = (int) std::strtol(next("--threads"), nullptr, 10);
+        else if (a == "--pool-workers") opt.pool_workers = (int) std::strtol(next("--pool-workers"), nullptr, 10);
         else if (a == "--dump-logits") dump_path = next("--dump-logits");
         else if (a == "--adapt-every") opt.adapt_every = (int) std::strtol(next("--adapt-every"), nullptr, 10);
         else if (a == "--gpu") (void) next("--gpu");
@@ -105,11 +136,26 @@ int plain_main(int argc, char** argv) {
         else if (a == "--yarn-orig-ctx") opt.yarn_orig_ctx = std::strtod(next("--yarn-orig-ctx"), nullptr);
         else if (a == "--expert-profile-save") profile_save = next("--expert-profile-save");
         else {
-            std::fprintf(stderr, "strata (%s): unknown option %s\n", arch.c_str(), a.c_str());
+            switch (option_scope(a)) {
+                case OptionScope::qwen38_only:
+                    std::fprintf(stderr, "strata (%s): %s is Qwen3.8-Flash-Next's (qwen4exp) only: this model has no "
+                                         "such part\n", arch.c_str(), a.c_str());
+                    break;
+                case OptionScope::not_yet:
+                    std::fprintf(stderr, "strata (%s): %s is not available for this model yet (--help lists what is)\n",
+                                 arch.c_str(), a.c_str());
+                    break;
+                case OptionScope::unknown:
+                    std::fprintf(stderr, "strata (%s): unknown option %s\n", arch.c_str(), a.c_str());
+                    break;
+            }
             return 2;
         }
     }
-    if (prompt.empty() || n_new < 1) { std::fprintf(stderr, "strata (%s): needs --tokens and --n >= 1\n", arch.c_str()); return 2; }
+    if (prompt.empty() || n_new < 1) {
+        std::fprintf(stderr, "strata (%s): needs --tokens and --max-new >= 1\n", arch.c_str());
+        return 2;
+    }
     if ((int64_t) prompt.size() + n_new > opt.max_cells) opt.max_cells = (int64_t) prompt.size() + n_new;
 
     strata::core::PlainModel model;

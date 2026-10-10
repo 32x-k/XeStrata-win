@@ -615,7 +615,7 @@ if(STRATA_ENABLE_XE)
   endif()
 
   # `strata generate` (P2.S6): the program that composes the components into tokens
-  add_executable(strata src/program/generate.cpp src/program/plain_generate.cpp)
+  add_executable(strata src/program/generate.cpp src/program/plain_generate.cpp src/program/option_scope.cpp)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 
   if(STRATA_BUILD_TESTS)
