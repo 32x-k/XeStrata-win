@@ -741,6 +741,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(conversation_file_test src/core/conversation_file_test.cpp src/core/conversation_file.cpp)
   target_include_directories(conversation_file_test PRIVATE include)
   add_test(NAME conversation_file_test COMMAND conversation_file_test)
+  # SAVE's opt-in reclaim (--session-save-reclaim, upstream 73ed39ae): which host caches go, in which order, and that
+  # the RAM check runs again after each step
+  add_executable(session_save_reclaim_test src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp)
+  target_include_directories(session_save_reclaim_test PRIVATE include)
+  add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp

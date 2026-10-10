@@ -23,6 +23,7 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -465,6 +466,7 @@ struct Options {
     bool conversation_save_compress = false;   // the floating-point parts through c-blosc2 (built only when found)
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
+    bool session_save_reclaim = false;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
@@ -609,6 +611,7 @@ void usage() {
                  "  --conversation-save-hours N  --serve: delete a file N hours after its last use (default 48)\n"
                  "  --conversation-save-compress  --serve: compress the files' floating-point parts (c-blosc2 ZSTD;\n"
                  "                       10-15%% smaller; only in a build that found libblosc2)\n"
+                 "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
                  "  --prompt-cache-tail  --serve, single GPU: one extra checkpoint near the prompt's end, at an existing\n"
                  "                       chunk boundary (default off; requires --prompt-cache and --prompt-cache-every > 0)\n"
@@ -2073,6 +2076,7 @@ int main(int argc, char** argv) {
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
+        else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
@@ -7596,6 +7600,19 @@ int main(int argc, char** argv) {
                             sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                        if (o.session_save_reclaim) {
+                            const auto freed = strata::core::session_save_reclaim(
+                                checks, conversations, sl, floor, strata::core::conversation_available_memory);
+                            if (freed.bytes || freed.checkpoints || freed.parked) {
+                                // A removed tail must not mark a later checkpoint at this length as a tail.
+                                if (tail_ckpt_len >= 0 && std::none_of(checks.begin(), checks.end(), [&](const auto& c) {
+                                        return int64_t(c.ids.size()) == tail_ckpt_len;
+                                    })) tail_ckpt_len = -1;
+                                std::fprintf(stderr, "strata serve: save reclaimed %zu checkpoints, %zu parked, "
+                                                     "%zu host bytes; checking RAM again\n",
+                                             freed.checkpoints, freed.parked, freed.bytes);
+                            }
+                        }
                         auto admit = [&](uint64_t need, std::string& why) {
                             const auto avail = strata::core::conversation_available_memory();
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
