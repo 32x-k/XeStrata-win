@@ -118,6 +118,8 @@ private:
     float* hit_out_ = nullptr;
     uint8_t* staging_ = nullptr;
     uint8_t* nat_xq_ = nullptr;
+    float* nat_xf_ = nullptr;      ///< the tokens' FP32 rows, for BF16 experts (bf16_)
+    bool bf16_ = false;            ///< a MoE layer's experts are BF16 (native_expert_grouped_bf16)
     uint8_t* hit_xq_ = nullptr;
     float* hit_xs_ = nullptr;
     uint8_t* hit_scratch_ = nullptr;

@@ -74,8 +74,11 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
     sh_ = shape;
     tier_ = tier;
     int64_t max_ff = 0;
-    for (int64_t l = 0; l < lay.n_layers; ++l)
+    bf16_ = false;
+    for (int64_t l = 0; l < lay.n_layers; ++l) {
         max_ff = std::max<int64_t>(max_ff, lay.native ? lay.fmt[(size_t) l].n_ff : strata::kernels::cpu::FF);
+        bf16_ = bf16_ || (lay.native && lay.fmt[(size_t) l].gu_type == 30);
+    }
 
     const uint64_t T = (uint64_t) shape.max_t, N = (uint64_t) shape.n_embd, K = (uint64_t) shape.k;
     bool ok = mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
@@ -105,6 +108,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
         hit_out_ = b.take<float>(T * K * N);
         staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * lay.max_blob);
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
+        nat_xf_ = b.take<float>(bf16_ ? T * N : 0);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34);
         hit_xs_ = b.take<float>(T * (N / 32));
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
@@ -185,6 +189,7 @@ void MoeWindow::publish(uint32_t ring, int grp, int tb, int n, const float* x, c
                      m_w_ + (size_t) tb * K, m_seq_, cs);
     if (cpu::expert_layout().native) quantize_q8_1_rows(x, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
     else quantize_q8_0_scaled(x, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
+    if (bf16_) copy_from_mapped(nat_xf_ + (size_t) tb * N, x, (int64_t) n * N, cs);   // the BF16 experts' FP32 rows
 }
 
 bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, strata::gpu::Stream cs, std::string& err) {
@@ -211,8 +216,12 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, st
             if (lay.native) {
                 const auto& f = lay.fmt[(size_t) layer];
                 const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-                native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xq_ + (size_t) tb * (N / 32) * 36,
-                                      hit_scratch_, hit_out, cs, grid_groups);
+                if (f.gu_type == 30)
+                    native_expert_grouped_bf16(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xf_ + (size_t) tb * N,
+                                               hit_scratch_, hit_out, cs, grid_groups);
+                else
+                    native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xq_ + (size_t) tb * (N / 32) * 36,
+                                          hit_scratch_, hit_out, cs, grid_groups);
             } else {
                 moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);

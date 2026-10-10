@@ -84,5 +84,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups = 0);
+/// The same for BF16 experts (gate/up and down both BF16: qwen35moe's and qwen3moe's BF16 files), against the tokens'
+/// FP32 rows `x` (n_embd floats a token) as llama.cpp's float products take a BF16 weight; the same scratch.
+void native_expert_grouped_bf16(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                                const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const float* x,
+                                void* scratch, float* out, void* stream, int64_t grid_groups = 0);
 
 }  // namespace strata::kernels

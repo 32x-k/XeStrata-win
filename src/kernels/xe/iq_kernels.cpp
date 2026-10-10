@@ -1668,6 +1668,8 @@ void iq_gemm_grouped_f16(int t, const uint16_t* X, const void* const* W, int64_t
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
     // the cases of native_expert_grouped's two switches, and the prompt path's dequantizer (iq_dequant_gu_f16 and the
     // down rows) for both
+    if (gu_type == 30 || d_type == 30)   // BF16 (native_expert_grouped_bf16): both sides, rows of whole value pairs
+        return gu_type == 30 && d_type == 30 && n_embd > 0 && n_ff > 0 && n_embd % 32 == 0 && n_ff % 32 == 0;
     const bool gu = in_iq_gemm(gu_type) ? gu_type != 20
                                         : gu_type == 12 || gu_type == 13 || gu_type == 14 || gu_type == 8 ||
                                           gu_type == 6 || gu_type == 2 || gu_type == 3;
@@ -1807,6 +1809,92 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         default: throw core::DeviceError("native_expert_grouped: down type " + std::to_string(L.d_type));
     }
     sync_if_needed(stream, e, "native_expert_grouped");
+}
+
+namespace {
+// sum_i w[i] * x[i] over a BF16 row of `len` values for `n` (<= kEntriesPass) FP32 rows xs[j]: the lanes over the row's
+// value pairs, then a sub-group sum
+inline void bf16_dot_multi(const sycl::sub_group& sg, const uint32_t* w, const float* const* xs, int n, int64_t len,
+                           int lane, float* s) {
+    for (int j = 0; j < kEntriesPass; ++j) s[j] = 0.0f;
+    for (int64_t i = lane; i < len / 2; i += kWarp) {
+        const uint32_t p = w[i];
+        const float w0 = sycl::bit_cast<float>(p << 16), w1 = sycl::bit_cast<float>(p & 0xffff0000u);
+        for (int j = 0; j < kEntriesPass; ++j)
+            if (j < n) s[j] += w0 * xs[j][2 * i] + w1 * xs[j][2 * i + 1];
+    }
+    for (int j = 0; j < kEntriesPass; ++j) s[j] = sycl::reduce_over_group(sg, s[j], sycl::plus<float>());
+}
+}  // namespace
+
+void native_expert_grouped_bf16(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                                const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const float* x,
+                                void* scratch, float* out, void* stream, int64_t grid_groups) {
+    if (cap_groups <= 0 || cap_entries <= 0) return;
+    if (L.gu_type != 30 || L.d_type != 30) throw core::DeviceError("native_expert_grouped_bf16: not a BF16 expert");
+    auto& q = queue_for(stream);
+    const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
+    float* gate = (float*) scratch;
+    float* up = (float*) ((uint8_t*) scratch + fa);
+    float* h = (float*) ((uint8_t*) scratch + 2 * fa);
+    const size_t cg = (size_t) (grid_groups <= 0 ? cap_groups : std::min(grid_groups, cap_groups));
+    const int64_t N = L.n_embd, FF = L.n_ff;
+    constexpr int kRows = 8;   // rows (sub-groups) a work-group
+    // gate/up: row r of the gate, then of the up, against each entry's token row
+    q.parallel_for(sycl::nd_range<2>({cg, (size_t) ((2 * FF + kRows - 1) / kRows) * kRows * kWarp}, {1, kRows * kWarp}),
+                   [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int64_t row = (int64_t) it.get_group(1) * kRows + (int64_t) sg.get_group_linear_id();
+        const int lane = (int) sg.get_local_linear_id();
+        if (row >= 2 * FF) return;   // the whole sub-group
+        const bool is_up = row >= FF;
+        const int64_t r = is_up ? row - FF : row;
+        for (int g = (int) it.get_group(0); g < *n_groups; g += (int) it.get_group_range(0)) {
+            const auto* wr = (const uint32_t*) ((const uint8_t*) grp_ptr[g] + (is_up ? L.up_off : 0) + (size_t) r * L.gu_row);
+            const int e0 = grp_start[g], e1 = grp_start[g + 1];
+            for (int e = e0; e < e1; e += kEntriesPass) {
+                const int n = sycl::min(kEntriesPass, e1 - e);
+                const float* xs[kEntriesPass];
+                for (int j = 0; j < kEntriesPass; ++j) xs[j] = x + (size_t) ent_tok[j < n ? e + j : e] * N;
+                float s[kEntriesPass];
+                bf16_dot_multi(sg, wr, xs, n, N, lane, s);
+                if (lane == 0)
+                    for (int j = 0; j < n; ++j) (is_up ? up : gate)[(size_t) (e + j) * FF + r] = s[j];
+            }
+        }
+    });
+    // SwiGLU over the call's entries, in FP32 (the down rows read floats)
+    const int64_t nh = cap_entries * FF;
+    q.parallel_for(sycl::range<1>((size_t) nh), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], e = i / FF;
+        if (e < grp_start[0] || e >= grp_start[*n_groups]) return;
+        const float g = gate[i];
+        h[i] = (g / (1.0f + sycl::exp(-g))) * up[i];
+    });
+    // down: row r of the output for each entry, written to row ent_dst[e]
+    const sycl::event e = q.parallel_for(
+        sycl::nd_range<2>({cg, (size_t) ((N + kRows - 1) / kRows) * kRows * kWarp}, {1, kRows * kWarp}),
+        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int64_t r = (int64_t) it.get_group(1) * kRows + (int64_t) sg.get_group_linear_id();
+        const int lane = (int) sg.get_local_linear_id();
+        if (r >= N) return;
+        for (int g = (int) it.get_group(0); g < *n_groups; g += (int) it.get_group_range(0)) {
+            const auto* wr = (const uint32_t*) ((const uint8_t*) grp_ptr[g] + L.down_off + (size_t) r * L.d_row);
+            const int e0 = grp_start[g], e1 = grp_start[g + 1];
+            for (int en = e0; en < e1; en += kEntriesPass) {
+                const int n = sycl::min(kEntriesPass, e1 - en);
+                const float* xs[kEntriesPass];
+                for (int j = 0; j < kEntriesPass; ++j) xs[j] = h + (size_t) (j < n ? en + j : en) * FF;
+                float s[kEntriesPass];
+                bf16_dot_multi(sg, wr, xs, n, FF, lane, s);
+                if (lane == 0)
+                    for (int j = 0; j < n; ++j) out[(size_t) ent_dst[en + j] * N + r] = s[j];
+            }
+        }
+    });
+    sync_if_needed(stream, e, "native_expert_grouped_bf16");
 }
 
 }  // namespace strata::kernels
