@@ -18,7 +18,6 @@
 #include <future>
 #include <memory>
 #include <mutex>
-#include <string>
 #include <type_traits>
 #include <unordered_map>
 #endif
@@ -27,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace strata::prefill {
 
@@ -160,10 +160,23 @@ void Gemm::settle() {
 }
 
 const char* Gemm::path() {
+    // what runs the products on the current GPU, said as the report finds it: oneMath with the library its backend
+    // for the device's SYCL backend uses, or XeStrata's own kernels in the form they take; the own kernels also run
+    // the products oneMath does not (the experts' grouped ones), so that form is said beside oneMath
+    static thread_local std::string text;
+    const std::string own = std::string("XeStrata's own kernels (") + strata::kernels::gemm_path(XmxType::f16) + ")";
+    text = own;
 #if STRATA_ONEMATH
-    if (backend(core::Runtime::get().device()).blas) return "oneMath";
+    const sycl::device dev = core::Runtime::get().device();
+    if (backend(dev).blas) {
+        const sycl::backend be = dev.get_backend();
+        const char* lib = be == sycl::backend::ext_oneapi_hip ? "rocBLAS"
+                          : be == sycl::backend::ext_oneapi_cuda ? "cuBLAS"
+                                                                 : "oneMKL";
+        text = std::string("oneMath (") + lib + "), " + own + " for the rest";
+    }
 #endif
-    return strata::kernels::gemm_path(XmxType::f16);
+    return text.c_str();
 }
 
 Gemm::~Gemm() {

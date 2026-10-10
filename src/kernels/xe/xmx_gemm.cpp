@@ -232,8 +232,8 @@ bool large_grf_ok(const sycl::device& d) {
             ctx, {d}, {sycl::get_kernel_id<GemmKernel<sycl::half, 128, 256, 3>>()});
         return true;
     } catch (const sycl::exception& e) {
-        std::fprintf(stderr, "strata: the GPU does not build kernels with the large register file (%s): the prompt "
-                     "path's matrix products run through DP4a\n", e.what());
+        std::fprintf(stderr, "strata: the GPU does not build kernels with the large register file (%s): XeStrata's own "
+                     "matrix-product kernels take their DP4a form\n", e.what());
         return false;
     }
 }
@@ -249,16 +249,8 @@ bool use_xmx(XmxType t) {
         const sycl::device dev = q.get_device();
         const bool grf = (device_has_xmx(dev, mx::matrix_type::fp16) || device_has_xmx(dev, mx::matrix_type::bf16))
                          && large_grf_ok(dev);
-        const XmxUse use{grf && device_has_xmx(dev, mx::matrix_type::fp16),
-                         grf && device_has_xmx(dev, mx::matrix_type::bf16)};
-        if (!use.f16 || !use.bf16) {
-            const bool mma = xe::mma_usable(q, /*bf16=*/use.f16);   // the type without XMX: FP16, else BF16
-            std::fprintf(stderr, "strata: the GPU (or its SYCL runtime) reports no XMX for %s: the prompt path's matrix "
-                         "products run through %s\n", !use.f16 && !use.bf16 ? "FP16 and BF16" : !use.f16 ? "FP16" : "BF16",
-                         mma ? "the matrix engines it reports (joint_matrix, mma_gemm)"
-                             : "DP4a (on the B70, 1.6 times slower than XMX)");
-        }
-        return use;
+        // (the path the products take is reported once, from the prompt path's Gemm::path: oneMath may run them)
+        return XmxUse{grf && device_has_xmx(dev, mx::matrix_type::fp16), grf && device_has_xmx(dev, mx::matrix_type::bf16)};
     });
     return t == XmxType::f16 ? u.f16 : u.bf16;
 }
