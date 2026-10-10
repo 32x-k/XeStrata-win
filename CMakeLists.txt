@@ -602,7 +602,7 @@ if(STRATA_ENABLE_XE)
   # src/kernels/xe/iq_mmq.cpp is written for, and the FP16 GEMM path elsewhere.  Upstream 0.1.38's quantized and fused
   # expert products on the decode kernels' DP4a dots ran at 0.34x and 0.25x of it on the B70 and were dropped.
   add_library(strata_prefill STATIC src/prefill/gemm.cpp src/prefill/kernels.cpp src/prefill/prefill.cpp
-                                    src/prefill/moe_mmq.cpp)
+                                    src/prefill/moe_mmq.cpp src/prefill/plain_prompt.cpp)
   target_include_directories(strata_prefill PUBLIC include)
   target_link_libraries(strata_prefill PUBLIC strata_engine)
   if(TARGET onemath)

@@ -57,6 +57,8 @@ struct PlainOptions {
     std::string rope_scaling;
     double rope_scale = 0;
     double yarn_orig_ctx = 0;
+    /// Tokens a prompt chunk takes through the batched products (`prompt`); 0: the prompt runs in windows.
+    int64_t prompt_chunk = 512;
 };
 
 class PlainModel {
@@ -77,6 +79,11 @@ public:
     /// Tokens [0, T) at positions pos .. pos + T - 1 (T <= max_t): out[t] is the greedy token after token t, and with
     /// `logits` the T rows of n_vocab logits.  Positions must follow the previous window's.
     bool forward(const int32_t* tokens, int T, int64_t pos, int32_t* out, float* logits, std::string& err);
+    /// The prompt: tokens [0, n) at positions pos .. pos + n - 1 in chunks of `prompt_chunk` tokens, every projection a
+    /// matrix product and the routed experts grouped by expert, all on the GPU (src/prefill/plain_prompt.cpp, in the
+    /// prompt path's library).  `out`: the greedy token after the last; `logits`: its row (or null).  The state is left
+    /// where the windows would have left it.
+    bool prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err);
 
     /// The VRAM tier, for the report: slots, slots holding an expert, and the routed entries it served so far.
     int64_t slots() const { return n_slots_; }
@@ -114,6 +121,10 @@ private:
     bool record_window(int T, strata::gpu::Stream cs, std::string& err);
     bool adapt(std::string& err);
     bool fill_slot(int64_t layer, int32_t expert, std::string& err);
+    struct Prompt;   // plain_prompt.cpp: the prompt path's buffers
+    bool prompt_init(std::string& err);
+    static void prompt_free(Prompt* p);
+    std::unique_ptr<Prompt, void (*)(Prompt*)> prompt_{nullptr, nullptr};
     static void pool_fn(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                         int64_t layer);
 

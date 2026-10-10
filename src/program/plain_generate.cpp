@@ -5,8 +5,10 @@
 //     strata --native MODEL.gguf --tokens 1,2,3 [--n 32] [--max-context N] [--max-t T] [--threads N]
 //            [--dump-logits FILE] [--adapt-every N] [--mmap-experts] [--no-pcie-split]
 //            [--expert-profile FILE] [--expert-profile-save FILE] [--rope-scaling yarn --rope-scale F --yarn-orig-ctx N]
+//            [--prompt-chunk N]
 //
-// The prompt runs in windows of up to T tokens, then one token a window, greedily.  stdout gets one line,
+// The prompt runs in chunks of N tokens through the batched products (--prompt-chunk, default 512; 0: in windows of
+// up to T tokens), then one token a window, greedily.  stdout gets one line,
 // `tokens: a,b,c`, the generated ids; --dump-logits writes the logits each generated token was chosen from, n_vocab
 // floats a row.  The report goes to stderr.
 #include "strata/program/plain_generate.hpp"
@@ -96,6 +98,7 @@ int plain_main(int argc, char** argv) {
         else if (a == "--mmap-experts") opt.mmap_experts = true;
         else if (a == "--no-pcie-split") opt.pcie_split = false;
         else if (a == "--expert-profile") opt.profile = next("--expert-profile");
+        else if (a == "--prompt-chunk") opt.prompt_chunk = std::strtoll(next("--prompt-chunk"), nullptr, 10);
         else if (a == "--rope-scaling") opt.rope_scaling = next("--rope-scaling");
         else if (a == "--rope-scale") opt.rope_scale = std::strtod(next("--rope-scale"), nullptr);
         else if (a == "--yarn-orig-ctx") opt.yarn_orig_ctx = std::strtod(next("--yarn-orig-ctx"), nullptr);
@@ -139,6 +142,15 @@ int plain_main(int argc, char** argv) {
     float* lg = dump != nullptr ? logits.data() : nullptr;
     const Clock::time_point t1 = Clock::now();
     int64_t pos = 0;
+    // the prompt through the batched products (all but nothing left for the windows), else in windows
+    if (opt.prompt_chunk > 0) {
+        if (!model.prompt(prompt.data(), (int64_t) prompt.size(), 0, out.data(), lg, err)) {
+            std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+            return 1;
+        }
+        pos = (int64_t) prompt.size();
+        if (!emit(0)) return 1;
+    }
     while (pos < (int64_t) prompt.size()) {
         const int n = (int) std::min<int64_t>(T, (int64_t) prompt.size() - pos);
         if (!model.forward(prompt.data() + pos, n, pos, out.data(), lg, err)) {

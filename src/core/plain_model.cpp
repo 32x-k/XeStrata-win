@@ -73,6 +73,7 @@ PlainModel::PlainModel() = default;
 
 PlainModel::~PlainModel() {
     if (cs_ != nullptr) strata::gpu::stream_sync(cs_);
+    prompt_.reset();   // its buffers before the stream and the weights
     for (auto* g : exec_) strata::gpu::graph_destroy(g);
     for (auto& v : segs_)
         for (auto* g : v) strata::gpu::graph_destroy(g);
