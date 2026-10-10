@@ -429,7 +429,7 @@ struct Kernel {
                 const int64_t row = m0 + rr;
                 u32x4 val = {0u, 0u, 0u, 0u};
                 if (row < rows && (!last || k0 + c < K)) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
-                *reinterpret_cast<u32x4*>(al + rr * LDA + c) = val;
+                *reinterpret_cast<u32x4*>(al + static_cast<ptrdiff_t>(rr) * LDA + c) = val;
             }
             for (int v = lid; v < WM * NB; v += lanes) {
                 const int b = v / WM, rr = v % WM;
@@ -441,7 +441,7 @@ struct Kernel {
                 const int nn = v / NB, b = v % NB;
                 const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b)
                                                 : Sub{{}, 0.0f, 0.0f, 0.0f};   // past K: zeros
-                u32x4* o = reinterpret_cast<u32x4*>(bl + nn * LDB + b * 32);
+                u32x4* o = reinterpret_cast<u32x4*>(bl + static_cast<ptrdiff_t>(nn) * LDB + static_cast<ptrdiff_t>(b) * 32);
                 o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
                 o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
                 wsl[(2 * b) * WN + nn] = d.s0;
@@ -451,12 +451,12 @@ struct Kernel {
             sycl::group_barrier(it.get_group());
             for (int b = 0; b < NB; ++b) {
                 int wv[8];   // this work-item's output's block, read once for its rows
-                const int* wp = reinterpret_cast<const int*>(bl + n * LDB + b * 32);
+                const int* wp = reinterpret_cast<const int*>(bl + static_cast<ptrdiff_t>(n) * LDB + static_cast<ptrdiff_t>(b) * 32);
                 for (int i = 0; i < 8; ++i) wv[i] = wp[i];
                 const float ws0 = wsl[(2 * b) * WN + n], ws1 = wsl[(2 * b + 1) * WN + n];
                 for (int i = 0; i < RPT; ++i) {
                     const int rr = rbase + i * RSTEP;
-                    const int* ap = reinterpret_cast<const int*>(al + rr * LDA + b * 32);
+                    const int* ap = reinterpret_cast<const int*>(al + static_cast<ptrdiff_t>(rr) * LDA + static_cast<ptrdiff_t>(b) * 32);
                     int s0 = 0, s1 = 0;
                     for (int j = 0; j < 4; ++j) s0 = xe::dp4a(ap[j], wv[j], s0);
                     for (int j = 4; j < 8; ++j) s1 = xe::dp4a(ap[j], wv[j], s1);
@@ -466,7 +466,7 @@ struct Kernel {
             }
         }
         for (int i = 0; i < RPT; ++i) {
-            const int64_t row = m0 + rbase + i * RSTEP;
+            const int64_t row = m0 + rbase + (int64_t) i * RSTEP;
             if (row < rows) dst[(int64_t) ids[row0 + row] * ld_dst + n0 + n] = acc[i];
         }
     }

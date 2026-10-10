@@ -162,7 +162,7 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     // the layer's types are theirs, else dequantized to FP16; STRATA_PLAIN_MMQ=0 keeps FP16
     static const bool mmq_env = [] {
         const char* v = std::getenv("STRATA_PLAIN_MMQ");
-        return v == nullptr || std::atoi(v) != 0;
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     const bool mmq_on = mmq_env && (prefill::mmq::built() || prefill::mmq::built_dp4a()) && N % 128 == 0 &&
                         (2 * FF) % 128 == 0 && FF % 32 == 0;   // the products' outputs in 128s, their K in blocks
@@ -352,7 +352,8 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                     const int32_t r0 = P.h_bounds[g0], nr = P.h_bounds[g1] - r0;
                     int32_t* hrb = P.h_rbounds + g0 + gi;
                     for (int q = 0; q <= G; ++q) hrb[q] = P.h_bounds[g0 + (size_t) q] - r0;
-                    if (!strata::gpu::copy_async(P.wtab + g0, P.h_wtab + g0, (size_t) G * sizeof(void*), cs) ||
+                    if (!strata::gpu::copy_async(static_cast<void*>(P.wtab + g0), static_cast<const void*>(P.h_wtab + g0),
+                                                 (size_t) G * sizeof(void*), cs) ||
                         !strata::gpu::copy_async(P.rbounds + g0 + gi, hrb, (size_t) (G + 1) * 4, cs)) {
                         err = std::string("plain prompt: the groups: ") + strata::gpu::last_error();
                         return false;
