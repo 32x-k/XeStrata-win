@@ -96,7 +96,7 @@ The AMD GPU is in another machine, so its part of the speed table (step 9) is pr
 Prepare the two engines in the AMD development container (where it is and how to run in it: `LOCAL.md` in the repository root, kept out of git; when it is missing, ask the user and write the answer there):
 
 - XeStrata: bring the tag into the container's clone (it has no access to origin: a `git bundle` of `xe<VERSION>` copied in) and build the contrib-llvm mode with HIP for its GPU (`STRATA_HIP_ARCHS`, docs/BUILD.md) in a folder of the tag's own.
-- upstream: its newest release tag (`git fetch upstream --tags; git tag -l 'v*' --sort=-v:refname | head -n 1`), built with HIP as its own documents say.
+- upstream: its newest release tag (`git ls-remote --tags --refs upstream 'v*' | sed 's#.*refs/tags/##' | sort -V | tail -n 1`; not `git tag -l 'v*'`, which also lists other remotes' tags (Project Maya's `upstream-maya` has v1.0.x)), built with HIP as its own documents say.
 
 Run step 9's script there as soon as both are built; the development machine's GPUs wait until the packages are built (step 8).
 

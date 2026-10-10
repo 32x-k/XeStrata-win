@@ -12,7 +12,7 @@ A run brings one of its release tags into `dev` and ends when XeStrata is at lea
 
 Rules for the whole run:
 
-- The tag is `$ARGUMENTS` when given, else the newest: `git fetch upstream --tags; git tag -l 'v*' --sort=-v:refname | head -n 1`.
+- The tag is `$ARGUMENTS` when given, else upstream's newest: `git ls-remote --tags --refs upstream 'v*' | sed 's#.*refs/tags/##' | sort -V | tail -n 1`; not `git tag -l 'v*'`, which also lists other remotes' tags (Project Maya's `upstream-maya` has v1.0.x). Then `git fetch upstream --tags`.
 - Work and commits are on `dev` (Japanese commit messages, one logical change per commit, `git add` and `git commit` joined with `&&`). Nothing is pushed; a release is /release, not this.
 - Only merged commits: upstream's open pull requests wait until upstream merges them.
 - The GPUs: the Intel Arc Pro B70 and the RTX 4070 in the development machine, the RX 9060 XT in the AMD container. Where they are and how to run there: `LOCAL.md` in the repository root (kept out of git; when it is missing, ask the user and write it there).
