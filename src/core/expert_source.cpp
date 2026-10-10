@@ -1537,10 +1537,10 @@ namespace {
 // `layer` < 0 picks the first such layer.
 struct CpuCalJobs {
     static constexpr int kCall = 8, kRing = 64;
+    strata::kernels::cpu::ActQ qact{};   // a Q2_0 layer's gate/up activation: its rows read `act`, not `nact`
     strata::kernels::cpu::NativeFmt f{};
     std::vector<float> x, out;
     std::vector<uint8_t> act;
-    strata::kernels::cpu::ActQ qact{};   // a Q2_0 layer's gate/up activation: its rows read `act`, not `nact`
     const uint8_t* ring[kRing] = {};
     int cursor = 0;
     strata::kernels::cpu::ExpertJobMulti jobs[kCall];
