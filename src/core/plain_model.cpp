@@ -20,12 +20,14 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/device.hpp"
+#include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_gdn_preprocess.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -40,6 +42,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <type_traits>
@@ -355,6 +358,21 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     return reset(err);
 }
 
+bool PlainModel::prompt_int8() const {
+    const char* v = std::getenv("STRATA_PLAIN_MMQ");
+    if (v != nullptr && std::strtol(v, nullptr, 10) == 0) return false;
+    sycl::queue& q = Runtime::get().compute();
+    if (!k::iq_mmq_usable(q) && !k::iq_mmq_dp4a_usable(q)) return false;
+    // the products' outputs in 128s (2 n_ff and n_embd), their K in blocks of 32; gate's rows right before up's
+    const int64_t N = spec_.n_embd, FF = spec_.n_ff_exp;
+    if (N % 128 != 0 || (2 * FF) % 128 != 0 || FF % 32 != 0) return false;
+    for (const auto& f : k::cpu::expert_layout().fmt)
+        if (!k::iq_mmq_type_ok(f.gu_type) || !k::iq_mmq_type_ok(f.d_type) ||
+            f.up_off != (size_t) FF * k::iq_mmq_row_bytes(f.gu_type, N))
+            return false;
+    return true;
+}
+
 void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* host, uint64_t& dev_bytes,
                               uint64_t& host_bytes) const {
     const ModelSpec& s = spec_;
@@ -368,7 +386,14 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     b.T = T;
     b.gu_elems = (int64_t) (2 * FF * N);
     b.d_elems = (int64_t) (N * FF);
-    b.gemm_elems = (int64_t) 1 << 25;   // the largest dense weight dequantized at once (Gemm::native slices past it)
+    b.int8 = prompt_int8();
+    // the largest dense weight, dequantized at once (Gemm::native slices past 2^25 values)
+    b.gemm_elems = 1;
+    for (const Block& bl : blocks_)
+        for (const W* w : {&bl.qkv, &bl.z, &bl.alpha, &bl.beta, &bl.ssm_out, &bl.q, &bl.k, &bl.v, &bl.o, &bl.sh_gate,
+                           &bl.sh_up, &bl.sh_down})
+            b.gemm_elems = std::max<int64_t>(b.gemm_elems, (int64_t) w->n_in * w->n_out);
+    b.gemm_elems = std::min<int64_t>(b.gemm_elems, (int64_t) 1 << 25);
     uint64_t at = 0;
     auto take = [&](auto*& ptr, uint64_t bytes) {
         ptr = dev ? (std::remove_reference_t<decltype(ptr)>) (dev + at) : nullptr;
@@ -383,11 +408,14 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     take(b.steps, U * k::kStepCount * 4); take(b.pos_q, U * NH * 4); take(b.pos_k, U * NKV * 4);
     take(b.rlog, U * E * 4); take(b.ids, TK * 4); take(b.w, TK * 4); take(b.shared, U * N * 4);
     take(b.sh_g, (U + 4) * 4); take(b.sh_gate, U * FS * 4); take(b.sh_up, U * FS * 4);
-    take(b.xs16, TK * N * 2); take(b.gu, TK * 2 * FF * 4); take(b.hh, TK * FF * 4); take(b.h16, TK * FF * 2);
-    take(b.dm, TK * N * 4); take(b.parts, TK * N * 4); take(b.moe_out, U * N * 4);
-    take(b.src, TK * 4); take(b.slot, TK * 4); take(b.bounds, (E + 1) * 4);
-    take(b.dq_gu, (uint64_t) PromptBufs::kGroup * (uint64_t) b.gu_elems * 2);
-    take(b.dq_d, (uint64_t) PromptBufs::kGroup * (uint64_t) b.d_elems * 2);
+    // the FP16 path's: the routed rows and the SwiGLU in FP16, kGroup experts' FP16 weights, the down product's rows
+    // in grouped order (the int8 one writes them in routing order, straight into parts)
+    const uint64_t f16 = b.int8 ? 0 : 1;
+    take(b.xs16, f16 * TK * N * 2); take(b.gu, TK * 2 * FF * 4); take(b.hh, TK * FF * 4); take(b.h16, f16 * TK * FF * 2);
+    take(b.dm, f16 * TK * N * 4); take(b.parts, TK * N * 4); take(b.moe_out, U * N * 4);
+    take(b.src, TK * 4); take(b.slot, TK * 4); take(b.bounds, (E + 1) * 4); take(b.entry, TK * 4);
+    take(b.dq_gu, f16 * (uint64_t) PromptBufs::kGroup * (uint64_t) b.gu_elems * 2);
+    take(b.dq_d, f16 * (uint64_t) PromptBufs::kGroup * (uint64_t) b.d_elems * 2);
     take(b.stage, 2 * (uint64_t) PromptBufs::kGroup * lay.max_blob);   // two halves: one copied while one is read
     // the int8 activations: values, then a scale and a sum per 32 (iq_mmq_act_bytes)
     take(b.xq, TK * N + 2 * TK * (N / 32) * 4); take(b.hq, TK * FF + 2 * TK * (FF / 32) * 4); take(b.identity, TK * 4);
@@ -401,6 +429,7 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     };
     hold(b.emb, U * N * 4); hold(b.h_steps, U * k::kStepCount * 4); hold(b.h_pos, U * (NH + NKV) * 4);
     hold(b.h_ids, TK * 4); hold(b.h_src, TK * 4); hold(b.h_slot, TK * 4); hold(b.h_bounds, (E + 1) * 4);
+    hold(b.h_entry, TK * 4);
     hold(b.h_wtab, E * sizeof(void*)); hold(b.h_rbounds, (2 * E + 2) * 4);
     host_bytes = at;
 }

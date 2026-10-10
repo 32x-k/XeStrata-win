@@ -129,6 +129,7 @@ private:
     struct PromptBufs {
         static constexpr int kGroup = 8;   ///< experts dequantized and multiplied in one grouped product
         int64_t T = 0, gu_elems = 0, d_elems = 0, gemm_elems = 0;
+        bool int8 = false;                 ///< every MoE layer's experts through the int8 products (no FP16 buffers)
         float *x = nullptr, *hn = nullptr, *mix = nullptr;
         uint16_t* x16 = nullptr;           ///< T rows of the widest projection input, FP16
         float *qkv = nullptr, *z = nullptr, *ab = nullptr, *gate = nullptr, *beta = nullptr, *h = nullptr, *y = nullptr;
@@ -142,6 +143,7 @@ private:
         float *gu = nullptr, *hh = nullptr, *dm = nullptr, *parts = nullptr, *moe_out = nullptr;
         uint16_t* h16 = nullptr;
         int32_t *src = nullptr, *slot = nullptr, *bounds = nullptr;
+        int32_t* entry = nullptr;          ///< grouped row -> routing entry: where the int8 down product writes
         uint16_t *dq_gu = nullptr, *dq_d = nullptr;   ///< kGroup experts' FP16 weights
         uint8_t* stage = nullptr;          ///< 2 kGroup expert blobs copied from RAM (two halves)
         uint8_t *xq = nullptr, *hq = nullptr;   ///< the int8 products' activations: the routed rows, the SwiGLU's
@@ -152,12 +154,14 @@ private:
         // pinned host
         float* emb = nullptr;              ///< T rows of n_embd
         int32_t *h_steps = nullptr, *h_pos = nullptr, *h_ids = nullptr, *h_src = nullptr, *h_slot = nullptr,
-                *h_bounds = nullptr;
+                *h_bounds = nullptr, *h_entry = nullptr;
         const uint8_t** h_wtab = nullptr;
         int32_t* h_rbounds = nullptr;
     };
     /// Lays the buffers for chunks of `T` tokens out from `dev` / `host` (null: only counts), returning the device and
     /// host bytes.
+    /// Whether every MoE layer's experts take the int8 products on this GPU (iq_mmq; STRATA_PLAIN_MMQ=0: no).
+    bool prompt_int8() const;
     void prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* host, uint64_t& dev_bytes,
                       uint64_t& host_bytes) const;
     PromptBufs pb_;

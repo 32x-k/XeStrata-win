@@ -160,15 +160,10 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     };
     const int attn_batch = std::max(1, std::min(opt_.max_t, 8));   // queries an attention launch takes (its scratch)
     // the routed experts in their quantized blocks (int8 products, iq_mmq: on the matrix engines, else by dp4a) where
-    // the layer's types are theirs, else dequantized to FP16; STRATA_PLAIN_MMQ=0 keeps FP16
-    static const bool mmq_env = [] {
-        const char* v = std::getenv("STRATA_PLAIN_MMQ");
-        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-    }();
-    const bool mmq_on = mmq_env && (prefill::mmq::built() || prefill::mmq::built_dp4a()) && N % 128 == 0 &&
-                        (2 * FF) % 128 == 0 && FF % 32 == 0;   // the products' outputs in 128s, their K in blocks
+    // every layer's types are theirs (prompt_int8, decided with the buffers), else dequantized to FP16
+    const bool use_mmq = P.int8;
     PromptGemm& pg = prompt_gemm();
-    if (mmq_on && !pg.identity) {
+    if (use_mmq && !pg.identity) {
         prefill::mmq::iota(P.identity, P.T * K, cs);
         pg.identity = true;
     }
@@ -291,6 +286,7 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                         const int32_t e = P.h_ids[i], row = fill[(size_t) e]++;
                         P.h_src[row] = (int32_t) (i / K);   // the token whose row it reads
                         P.h_slot[i] = row;                  // where routing entry i finds its expert's output
+                        P.h_entry[row] = (int32_t) i;       // the int8 down product's: the row it writes
                     }
                 }
                 // the group bounds: the routed rows of the experts in `experts` order, absolute
@@ -298,14 +294,13 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                 for (int32_t e : experts) P.h_bounds[nb++] = start[(size_t) e];
                 P.h_bounds[nb] = (int32_t) (T * K);
                 if (!strata::gpu::copy_async(P.src, P.h_src, (size_t) (T * K) * 4, cs) ||
-                    !strata::gpu::copy_async(P.slot, P.h_slot, (size_t) (T * K) * 4, cs) ||
+                    !(use_mmq ? strata::gpu::copy_async(P.entry, P.h_entry, (size_t) (T * K) * 4, cs)
+                              : strata::gpu::copy_async(P.slot, P.h_slot, (size_t) (T * K) * 4, cs)) ||
                     !strata::gpu::copy_async(P.bounds, P.h_bounds, (size_t) (nb + 1) * 4, cs)) {
                     err = std::string("plain prompt: the groups: ") + strata::gpu::last_error();
                     return false;
                 }
                 const auto& f = lay.fmt[(size_t) ml];
-                const bool use_mmq = mmq_on && prefill::mmq::supported(f.gu_type) && prefill::mmq::supported(f.d_type) &&
-                                     f.up_off == prefill::mmq::matrix_bytes(f.gu_type, FF, N);   // up right after gate
                 if (use_mmq) prefill::mmq::quantize(P.hn, P.src, P.xq, f.gu_type, N, N, T * K, cs);
                 else prefill::gather_rows16(P.x16, P.src, P.xs16, T * K, N, cs);
                 mark(1, t_mark);
@@ -372,8 +367,8 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                     prefill::mmq::quantize(P.hh + (int64_t) r0 * FF, nullptr, P.hq, f.d_type, FF, FF, nr, cs);
                     prefill::mmq::Product dn;
                     dn.type = f.d_type; dn.w_rows = N; dn.w_cols = FF; dn.n = G; dn.xq = P.hq;
-                    dn.bounds = P.rbounds + g0 + gi; dn.ids = P.identity; dn.total_rows = nr; dn.max_rows = mr;
-                    dn.dst = P.dm + (int64_t) r0 * N; dn.ld_dst = N; dn.wtab = P.wtab + g0; dn.woff = f.down_off;
+                    dn.bounds = P.rbounds + g0 + gi; dn.ids = P.entry + r0; dn.total_rows = nr; dn.max_rows = mr;
+                    dn.dst = P.parts; dn.ld_dst = N; dn.wtab = P.wtab + g0; dn.woff = f.down_off;   // routing order
                     pg.mmq.run(dn, cs);
                     if (ovl) {
                         if (!strata::gpu::event_record(pg.used[h], cs)) {
@@ -420,8 +415,9 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
                 }
                 mark(2, t_mark);
                 // routing entry i's output into row i, then the weighted sum (and the gated shared expert)
-                k::gather_rows(reinterpret_cast<const uint8_t*>(P.dm), N * 4, P.slot, T * K,
-                               reinterpret_cast<uint8_t*>(P.parts), cs);
+                if (!use_mmq)
+                    k::gather_rows(reinterpret_cast<const uint8_t*>(P.dm), N * 4, P.slot, T * K,
+                                   reinterpret_cast<uint8_t*>(P.parts), cs);
                 if (has_shared_) {   // shared = down(silu(gate) * up): the SwiGLU into FP16 (x16 is free again)
                     prefill::swiglu_pair(P.sh_gate, P.sh_up, P.x16, T, cs, FS);
                     proj(b.sh_down, P.shared, T);
