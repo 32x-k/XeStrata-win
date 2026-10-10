@@ -11,7 +11,7 @@ The extra VRAM keeps more experts on GPUs, so fewer are computed on the CPU.
 GPUs of different makers can be combined (Intel, AMD and NVIDIA; with NVIDIA, in the contrib-llvm build).
 
 The GPUs hand off once per verify window, through the CPU's memory (12,804 floats a token).
-The prompt path borrows its buffers from each GPU's expert cache, as on one GPU (with one chunk size on every GPU).
+The prefill path borrows its buffers from each GPU's expert cache, as on one GPU (with one chunk size on every GPU).
 
 It is opt-in and changes nothing when the options are absent (a port of upstream's layer split).
 
@@ -59,7 +59,7 @@ The start-up log names the GPUs by these numbers, as `CUDA0`, `CUDA1` (upstream'
 
 - how fast each GPU reads its VRAM, and how much VRAM is free;
 - how fast the CPU reads the RAM (which sets the speed of the experts the CPU computes);
-- what each GPU holds: weights and sessions (both of its own layers only), the output head (the last GPU), and the room the prompt path keeps.
+- what each GPU holds: weights and sessions (both of its own layers only), the output head (the last GPU), and the room the prefill path keeps.
 
 From these it works out how many experts each GPU holds and, filling the caches in the order of `--expert-profile`,
 predicts the time of one window for every placement; the shortest wins.
@@ -100,7 +100,7 @@ The next window is a guess: that this window is accepted whole and that its bonu
 When the guess holds, half of the next window is already done.
 When it does not, the first GPU puts its state back (a copy of its recurrent state taken while the window ran) and the next window is built from the real tokens.
 A guessed window is only started when the draft layer's estimate says it is likely to be kept.
-`--pipeline-windows 1` overlaps only the short prompt reads that go through the verify windows (`--short-read`).
+`--pipeline-windows 1` overlaps only the short prefills that go through the verify windows (`--short-read`).
 
 It works with two GPUs, exactly two stages and `--serve`.
 
@@ -111,7 +111,7 @@ It works with two GPUs, exactly two stages and `--serve`.
 - **Off, with one line in the log saying why**, with `--batch` slots, the helper caches (`--expert-cache-device1..3`), a split into three or more stages or onto one GPU (`--split-device 0`), or no draft layer.
   A request with repetition penalties (`penalty_last_n`), coupled draft sampling or log-probabilities (`logprobs`), and `--lookup-chain`, decode serially.
 - **Nothing is queued on a card behind a window there that waits for the host.** On the B70 a graph or a copy submitted to the card while such a window ran did not return, and the engine stalled.
-  So a prompt read queues a window's commit after the window has completed (upstream queues the window, its commit and the next window back to back).
+  So prefill queues a window's commit after the window has completed (upstream queues the window, its commit and the next window back to back).
   The adaptive tier runs at a verdict with no window in flight on either card (upstream runs it on a thread beside the windows).
   With `--adapt-async 1` the decode loop queues each card's copies while that card has no window in flight (upstream 13eee452).
 - The `STRATA_PIPELINE_*` tuning and test variables (THETA, FORCE_MISS, SWITCH, LOG, TRACE and the like) are read only with `STRATA_PIPELINE_DEBUG=1` (upstream 2bfac510).

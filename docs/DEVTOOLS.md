@@ -198,7 +198,7 @@ sde64 -version
 
 ### What works without extra tools
 
-- The engine's own timings: `STRATA_PREFILL_TIMING=1` for the prompt path.
+- The engine's own timings: `STRATA_PREFILL_TIMING=1` for the prefill path.
   The decode's `verify window` line (the host's wait for the GPU, the CPU pool) is always printed.
 - `STRATA_VERIFY_NODES=1` prints how many kernels a decode window's graph holds.
 - Scratch probes that time single kernels with SYCL event profiling (the records in `bench/results/2026-10-02-xe-decode-gpu`).
@@ -258,7 +258,7 @@ Reading the GPU's hardware counters (memory bandwidth per kernel) needs three th
    Result folders (`r000hs/` and so on) are ignored by git.
 
 Metrics Discovery read the B70's counters through the xe driver (Linux 7.0, 2026-10-02).
-VTune's `xpu-offload` collection and unitrace both left the engine stalled at its prompt for minutes.
+VTune's `xpu-offload` collection and unitrace both left the engine stalled in prefill for minutes.
 They are for small programs and probes, not the engine.
 
 ### Measuring NVIDIA GPUs (nsys and ncu)

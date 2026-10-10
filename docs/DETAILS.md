@@ -31,7 +31,7 @@ MTP speculative decoding is on.
 "262K" is the model's full context window (a 259,942-token prompt).
 One run per cell ([record](../bench/results/2026-10-04-speed-matrix/README.md)).
 
-### Prompt processing (tokens/s)
+### Prefill (tokens/s)
 
 | Model | 1K | 4K | 32K | 64K | 128K | 262K |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -43,7 +43,7 @@ One run per cell ([record](../bench/results/2026-10-04-speed-matrix/README.md)).
 
 While a short prompt (a chunk below 2,048 tokens) is read, the decode CPU pool, idle then, computes the experts outside VRAM that few of its tokens route to (opt-in upstream, the default here: `STRATA_PREFILL_CPU_SHARE=auto`). It measures the CPU's and the GPU's time per expert and hands over the share at which both end together. The CPU computes in its own activation format, so an answer can differ a little from the GPU-only one. `STRATA_PREFILL_CPU_SHARE=0` keeps every expert on the GPU, `0.4` and the like a fixed share. 262- / 914-token prompts went from 319.2 to 383.1 / 736.3 to 828.0 tokens/s on the B70 and from 109.9 to 266.1 / 275.9 to 457.8 tokens/s on the RTX 4070 (one run each).
 
-### Output (tokens/s)
+### Decode (tokens/s)
 
 | Model | 1K | 4K | 32K | 64K | 128K | 262K |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -53,7 +53,7 @@ While a short prompt (a chunk below 2,048 tokens) is read, the decode CPU pool, 
 | **IQ3_S** | 77.1 | 73.9 | 72.5 | 68.8 | 63.2 | 50.3 |
 | **Coder** | 72.8 | 73.8 | 71.0 | 69.3 | 69.7 | 59.1 |
 
-Output speed depends on the text as well.
+Decode speed depends on the text as well.
 Speculative decoding runs faster when more of the drafted tokens are accepted, so a difference of a few percent between neighbouring cells means nothing
 (IQ2_XS is faster at 128K than at 64K because it accepted 0.768 of its drafts there against 0.683).
 
@@ -68,7 +68,7 @@ It speeds up handing back a given text nearly as it was, and slows ordinary chat
 With the B70 made to look like a small card (`STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1`: 8 GB of VRAM, no XMX),
 IQ2_XS writes 17.6 tokens/s with MTP and reads the 26K-token prompt at 574 tokens/s
 ([record](../bench/results/2026-10-03-prompt-upstream/README.md)).
-On a GPU without XMX the prompt path's products run through DP4a, so reading a prompt takes about 1.6 times as long
+On a GPU without XMX the prefill path's products run through DP4a, so prefill takes about 1.6 times as long
 ([record](../bench/results/2026-10-02-dp4a/README.md)).
 
 ### AMD APUs
@@ -96,7 +96,7 @@ It needs one GPU with virtual memory, an expert profile, no KV streaming and eve
 `STRATA_KV_GROW_HOLD=1` keeps the longest parked conversation's cells in the K/V until it comes back.
 At a 128K context, int8, IQ2_XS and a 4,945-token prompt (one run each) the result differs by card:
 
-| | prompt (tokens/s) | decode after it | short chat decode | slots |
+| | prefill (tokens/s) | decode after it | short chat decode | slots |
 | --- | ---: | ---: | ---: | ---: |
 | RTX 4070, KV streaming (default) | 791.6 | 73.60 | 58.50 | 4,102 |
 | RTX 4070, the whole K/V in VRAM | 770.2 | 66.70 | 56.70 | 3,149 |
@@ -105,7 +105,7 @@ At a 128K context, int8, IQ2_XS and a 4,945-token prompt (one run each) the resu
 | B70, the whole K/V in VRAM | 1245.9 | 101.00 | 78.60 | 18,347 |
 | B70, `--kv-grow` | 681.9 | 98.90 | 73.40 | 19,303 |
 
-On the B70 the slow side is the cache in virtual memory: with the K/V alone in it the prompt ran at 1291.5 and the decode after it at 105.10, faster than the whole K/V in VRAM.
+On the B70 the slow side is the cache in virtual memory: with the K/V alone in it prefill ran at 1291.5 and the decode after it at 105.10, faster than the whole K/V in VRAM.
 Unless asked, the device's reported virtual-memory granularity decides: on at 2 MiB or more, off below (the B70 reports 64 KiB).
 `--kv-grow` and `--no-kv-grow` (`STRATA_KV_GROW=1` and `0`) take precedence over it.
 
@@ -245,7 +245,7 @@ With a native pack whose experts the GPU mostly holds, `STRATA_ARENA_MMAP=1` in 
 The first start writes the arena to `experts.bin` (only when the drive has its size and 2 GiB more free); later starts map it.
 The pages of the experts in VRAM are handed back to the OS (`STRATA_ARENA_RELEASE=0` keeps them) and the rest are read ahead.
 The GPU does not read the mapping directly: run with `--pcie-frac 0`.
-With the Coder on the B70 (a 23.4 GiB arena, all in VRAM) it handed 23.38 GiB back, gave the same output, decoded as fast (28.3 tok/s) and read the prompt a little slower (54 to 48 tok/s).
+With the Coder on the B70 (a 23.4 GiB arena, all in VRAM) it handed 23.38 GiB back, gave the same output, decoded as fast (28.3 tok/s) and ran prefill a little slower (54 to 48 tok/s).
 
 The loads at start (the weights, the native dense matrices, the GPU cache's fill from the profile, the experts kept in RAM, the MTP draft files) ask the kernel to read ahead before they read (madvise / posix_fadvise WILLNEED in 128 KiB steps, upstream cb33c0ba).
 The drive then sees a deep queue instead of one page fault at a time.
@@ -321,7 +321,7 @@ The app has three tabs:
 - **Chat**: streaming answers; the model's thinking (folded away once it answers); code with a copy button;
   pictures when images are on; sampling and thinking-level settings.
   Chats stay in your browser.
-- **Monitor**: what the model is doing (reading the prompt, with progress, or writing, at how many tokens/s);
+- **Monitor**: what the model is doing (prefill, with progress, or decode, at how many tokens/s);
   GPU load, VRAM, temperature, power and PCIe traffic; CPU, RAM and disk; the context in use; the last requests.
 - **About**: the model and engine settings, and the addresses to connect other apps.
 
@@ -411,7 +411,7 @@ Four engine settings depend on the PC more than on the model:
 The defaults were measured by upstream on a Ryzen 5 7600 with an RTX 5070.
 Some have been measured again on the B70 ([XE.md](XE.md#upstream-settings-not-remeasured-on-xe)).
 setup offers to measure them on your PC after an install; `./setup.sh --calibrate` does it any time.
-It measures the output speed with each setting and keeps one only when it is more than 3% faster.
+It measures the decode speed with each setting and keeps one only when it is more than 3% faster.
 The result is remembered per PC and model in the settings file, so updates keep it.
 Measuring the worker count needs a fresh engine, so the model is loaded more than once, and the PC can stop responding for a minute or two each time (upstream #1197).
 When it finishes it starts the model (not with `--no-start`): do not start it a second time.
@@ -479,7 +479,7 @@ A setup run again keeps the key, and `--expert-profile` (a file that still exist
 An expert the adaptive tier swaps in is used on the GPU by the next window, which waits for its copy first.
 `STRATA_ADAPT_LAG=2` in the engine's environment uses it from the second window, so nothing waits (upstream #764; the
 answers change by that much, and are the same run to run with the same settings).
-The output went from 59.1 to 64.2 tokens/s on an RTX 4070 and from 76.5 to 76.9 on the B70 (IQ2_XS).
+Decode went from 59.1 to 64.2 tokens/s on an RTX 4070 and from 76.5 to 76.9 on the B70 (IQ2_XS).
 
 ### When the draft head does not fit
 
@@ -1141,7 +1141,7 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 | `... has no HIP target (AMD GPUs)` | intel/llvm was built before ROCm was installed. Let setup build it again when it asks, or run `python3 tools/intel_llvm_build.py --rebuild`. |
 | `an AMD GPU needs the free or contrib build` | `--license contrib-icpx` is chosen. icpx has no AMD target: run setup again with `--license free` or `--license contrib`. |
 | `the SYCL runtime of ... lists no GPU` | The GPU's Level Zero driver (`libze-intel-gpu1`, Intel's compute-runtime) is missing or too old for it; install a newer one ([BUILD.md](BUILD.md#packages)). |
-| `... gives this GPU no XMX` | The compiler gives the GPU no XMX; choose from setup's options. It runs without XMX, with prompts taking about 1.6 times as long ([BUILD.md](BUILD.md#the-sycl-compiler)). |
+| `... gives this GPU no XMX` | The compiler gives the GPU no XMX; choose from setup's options. It runs without XMX, with prefill taking about 1.6 times as long ([BUILD.md](BUILD.md#the-sycl-compiler)). |
 | `no SYCL compiler for the engine` | There is no SYCL compiler: install the distribution's DPC++, or pass `--intel-llvm-build`. |
 | `alloc_device: ... refused` at start | Happens rarely on the B70 (3 in about 120 starts); starting again usually works ([XE.md](XE.md#the-output-heads-vram-refusal)). |
 | Python or the build tools could not be installed | Install what it names, then run it again. Everything already done is kept and skipped. |
@@ -1150,7 +1150,7 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 | The PC freezes for a few minutes at the start | Normal, most of all the first time (the server window says when it happens): the engine loads the experts into RAM, registers part of it for the GPU and sizes the expert cache. Wait; don't close the window. Still frozen after 10 minutes: restart the PC, close other programs, try again, or pick a smaller size. |
 | The start takes many minutes while the kernel is busy compacting memory (`kcompactd`) | With transparent huge pages on `madvise`, the engine asks for `MADV_HUGEPAGE` on its arena, and on fragmented RAM every fault can then compact memory (upstream #771). `STRATA_NO_ARENA_THP=1` stops the request (with THP on `always` the engine does not make it at all). |
 | `the engine stopped unexpectedly (exit code ...)` | The engine process ended mid-answer, usually out of RAM (Linux ends the biggest program: `journalctl -k \| grep -i -E 'killed process\|out of memory'`). The next request starts it again by itself. If it repeats, close other programs or pick a smaller size. The server also warns at start when the model's experts leave less than ~6 GB of RAM for everything else. |
-| Slow output, disk light busy | Not enough free RAM: close other programs, or choose Q2_0 / IQ2_XS. |
+| Slow decode, disk light busy | Not enough free RAM: close other programs, or choose Q2_0 / IQ2_XS. |
 | `prompt ... exceeds the context` | The request is longer than the context you chose: run setup again with a bigger `--context`. |
 | Slower than expected | A monitor plugged into the GPU and other GPU programs take VRAM from the expert cache; RAM below its rated speed (check XMP in the BIOS) slows the CPU half. Check setup's `SYCL compiler: ...` line for a build without XMX. |
 | `this server was started without the vision encoder` | The model was set up for text only: run setup again with `--vision gpu`. |
@@ -1180,7 +1180,7 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
   When the reply repeats the context (code edits, quoted text), **prompt lookup** drafts up to 5 tokens from the earlier copy,
   but only where its measured acceptance and cost say it pays.
   The drafts are checked like the MTP's, so the output is the same.
-- **Prompts** are processed in chunks of up to 32,768 tokens, with the experts streamed to the GPU over PCIe.
+- **Prefill** runs in chunks of up to 32,768 tokens, with the experts streamed to the GPU over PCIe.
   The matrix products run on XMX on Intel GPUs, on WMMA on AMD GPUs (RDNA3 or later) and on tensor cores on NVIDIA
   GPUs, and the dense ones go through oneMath: to oneMKL or cuBLAS in the contrib-llvm and contrib-icpx builds, and to
   rocBLAS and hipBLASLt on AMD GPUs.

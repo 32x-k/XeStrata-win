@@ -46,17 +46,17 @@ How it differs from Strata:
 | BIOS | For a discrete GPU: Above 4G Decoding and Re-Size BAR on, CSM off. |
 
 - **Matrix engines:** Intel's XMX, AMD's WMMA (RDNA3 or later) and NVIDIA's tensor cores are used; a GPU without
-  them computes with integer dot-product instructions such as DP4a. Which one is chosen from what the GPU reports. Without matrix engines, prompts are read more slowly,
+  them computes with integer dot-product instructions such as DP4a. Which one is chosen from what the GPU reports. Without matrix engines, prefill is slower,
   but it runs.
 - **GPUs checked:** development and checks are done on an Arc Pro B70 (Xe2, 32 GB). On NVIDIA, an RTX 4070 and an
   RTX 3070 are checked; on AMD, an RX 9060 XT (RDNA4). On an Arc A380 only the arithmetic is checked, without running a model.
   Smaller cards are checked by limiting the memory and the XMX the B70 may use.
-- **The processor's own graphics:** checked up to starting and reading a prompt. Its memory is shared with the RAM,
+- **The processor's own graphics:** checked up to starting and prefill. Its memory is shared with the RAM,
   and most have no XMX, so it is slow.
 
 ### AMD GPUs
 
-On AMD GPUs, the prompt's dense matrix products run in the distribution's ROCm rocBLAS and hipBLASLt.
+On AMD GPUs, prefill's dense matrix products run in the distribution's ROCm rocBLAS and hipBLASLt.
 So XeStrata runs only on the GPUs the distribution's rocBLAS has code for.
 
 | GPU | gfx | Ubuntu 26.04 | Fedora 44 |
@@ -227,7 +227,7 @@ Check these three things:
 
 **It says XMX cannot be used.**
 The current compiler cannot use that GPU's matrix engines. Choose one of the options setup offers. Without XMX it
-still runs; prompts take about 1.6 times as long to read.
+still runs; prefill takes about 1.6 times as long.
 
 **A VRAM allocation was refused at start (`alloc_device: ... refused`).**
 This happens now and then on the B70. Starting again usually works.

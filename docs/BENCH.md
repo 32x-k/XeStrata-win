@@ -59,7 +59,7 @@ Its engine is made as upstream's setup makes it:
 | Intel | upstream's `sycl/` built in Docker (docker must work without sudo) |
 
 - NVIDIA's prebuilt engine and the Intel Docker image are not free software: a free build does not compare on NVIDIA and Intel GPUs.
-- On Intel GPUs the output speed is not compared: upstream's `sycl/` reads the experts that do not fit in VRAM over PCIe.
+- On Intel GPUs the decode speed is not compared: upstream's `sycl/` reads the experts that do not fit in VRAM over PCIe.
 
 ## The upstream merges' measurements
 
@@ -81,7 +81,7 @@ python $S/judge.py --prompt-only B70 $o/IQ3_XXS ...                           # 
 - `XE` and `UP` are each engine's binary or wrapper, optionally after `env K=V ...`. For serve and everyday use a wrapper must pass stdin through (`docker run -i`).
 - generate runs twice, serve and everyday use three times (`ROUNDS` changes it). In serve and everyday use each engine writes its own text, so at temperature 0.7 a round lands about 10% off the median.
 - generate makes both engines follow upstream's answer (`--spec-follow`), leaving the texts' difference out; serve has no such option.
-- To pass: in generate, and the first prompt's speed in serve and everyday use, XeStrata is at most 1% slower than upstream; the rest of serve and everyday use (the wait before a follow-up's answer, the output, the time to the first token) at most 5% worse.
+- To pass: in generate, and the first prefill's speed in serve and everyday use, XeStrata is at most 1% slower than upstream; the rest of serve and everyday use (the wait before a follow-up's answer, decode, the time to the first token) at most 5% worse.
 - The temperature: serve's `MODES` (default `greedy t07`; `t10` is temperature 1.0), everyday use's `TEMPERATURE` (default 0.7).
 - `--dry-run` prints the commands that would start the engines instead of running them.
 

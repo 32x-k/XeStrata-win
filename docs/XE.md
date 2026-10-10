@@ -20,7 +20,7 @@ Upstream Strata (`3ce2523`) keeps them, and each Xe source names the CUDA file i
 It is developed and measured on an Intel Arc Pro B70 (Xe2, 32 GB); the speeds in the records are that card's unless they say otherwise.
 On NVIDIA it is checked on an RTX 4070 and an RTX 3070.
 The engine chooses its paths from what the GPU reports (AGENTS.md, the first rule).
-The prompt path's matrix products use a kernel of their own on Xe2's XMX (xmx_gemm), a joint_matrix product that takes the reported tile shape on the Arc A series' XMX and NVIDIA's tensor cores (mma_gemm), and the DP4a paths on a GPU without matrix engines.
+The prefill path's matrix products use a kernel of their own on Xe2's XMX (xmx_gemm), a joint_matrix product that takes the reported tile shape on the Arc A series' XMX and NVIDIA's tensor cores (mma_gemm), and the DP4a paths on a GPU without matrix engines.
 
 A smaller card is checked by making the B70 look like one.
 `STRATA_VRAM_LIMIT_MIB` caps the VRAM the engine sees, `STRATA_MAX_ALLOC_MIB` the largest allocation it assumes, and
@@ -41,7 +41,7 @@ The main things carried:
 - The PLE table is read in the format the GGUF has it: IQ4_NL (the default table), Q4_0, Q5_0, Q5_1, Q8_0, FP8 (E4M3 with a scale) or BF16.
   Upstream measured the mean per-row error against the BF16 table: Q8_0 0.53%, FP8 2.64%, Q5_1 3.78%, Q5_0 4.25%, IQ4_NL 7.60%, Q4_0 8.55%.
 - GPU kernels for the gate/up of native Q4_0, Q4_1, Q5_0 and Q6_K experts; the CPU experts' AVX-2 i-quant and Q2_0 kernels.
-- Fused kernels with fewer launches in the verify windows and the prompt path (#783 and others).
+- Fused kernels with fewer launches in the verify windows and the prefill path (#783 and others).
 - `STRATA_PREFILL_CPU_SHARE=auto` (the default): a short chunk's least-routed experts are computed by the idle CPU pool.
 - `--kv-grow`: the K/V takes VRAM only for the cells a request has reached, and the expert cache uses the rest.
   It is on by default where the device's virtual memory mapping granularity is 2 MiB or more (on for the RTX 4070; the B70's is 64 KiB, off).
@@ -55,7 +55,7 @@ The integration builds in the free (intel/llvm), contrib-icpx (icpx) and contrib
 The AVX-512 path passes `expert_multi_test` under Intel SDE (`-icx`).
 `expert_parity --selftest` and `pool_test --selftest` need the canonical pack and cannot run under SDE (they pass on AVX2).
 On the B70 the icpx and free builds completed all eight answers (thinking on and off), six of them identical.
-Prompt 1,148 tok/s, decode after it 98.6 tok/s, short chats 77.3 tok/s (icpx).
+Prefill 1,148 tok/s, decode after it 98.6 tok/s, short chats 77.3 tok/s (icpx).
 The configuration with 8 GiB, 4 GiB, no XMX and six CPU workers, and the RTX 4070, completed the answers as well.
 On the UHD 770 the free and icpx builds started and gave a short answer.
 
@@ -83,7 +83,7 @@ The paths meant to be faster are not carried: measured on the B70, none was fast
 
 | Path | On the B70 |
 | --- | --- |
-| Quantized expert products in the prompt path (`STRATA_PREFILL_MMQ`) | 0.34x of the default XMX FP16 path |
+| Quantized expert products in the prefill path (`STRATA_PREFILL_MMQ`) | 0.34x of the default XMX FP16 path |
 | Fused MoE (`STRATA_PF_FUSED`) | 0.25x of the default path |
 | GDN key-head sharing (`STRATA_GDN_KEYHEAD`) | 0.54x of the default path |
 | Split hyper-connection read (`STRATA_GR_V3`) | Decode about 18% slower |
@@ -93,7 +93,7 @@ The paths meant to be faster are not carried: measured on the B70, none was fast
 | Routing-aware prefetch of the file tier (`STRATA_LOOKAHEAD`) | Decode about 2% slower |
 
 The quantized products and the fused MoE compute on the decode kernels' DP4a dots, without XMX.
-A GPU with XMX therefore reads the prompt faster on the default path.
+A GPU with XMX therefore runs prefill faster on the default path.
 
 The integration builds in both modes, free (dpclang++) and nonfree (icpx), and both pass the 52 CTest cases.
 The default configuration's output (IQ2_XS, nonfree) was compared with the pre-integration build (`bae99bd`).
@@ -194,7 +194,7 @@ New cases require approval.
 
 All of `iq_kernels.hpp` is ported (`src/kernels/xe/iq_kernels.cpp`):
 the q8_1 quantizer, dequantization of IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, Q3_K and Q2_0, their MMVQ,
-embedding rows, the prompt path's gate/up expansion, and the grouped native experts.
+embedding rows, the prefill path's gate/up expansion, and the grouped native experts.
 A warp is a sub-group of 32; its sums use CUDA's butterfly order, and CUDA's byte intrinsics are written out.
 SwiGLU in the grouped experts uses the precise exponential where CUDA used `__expf`.
 
@@ -284,7 +284,7 @@ On the development machine it happened 3 times in about 120 starts
 
 ### The VRAM reserve on a small card
 
-On a small card (upstream #496), the default 700 MiB reserve can leave the cache too few slots to lend the prompt path a 256-token chunk.
+On a small card (upstream #496), the default 700 MiB reserve can leave the cache too few slots to lend the prefill path a 256-token chunk.
 The engine then lowers the reserve to what leaves that many:
 down to 300 MiB, and not below a reserve given with `--vram-reserve-mib`.
 When even that is not enough, the start stops and says how many MiB are short and what makes room.
@@ -356,7 +356,7 @@ When none starts, or the serving encoder stops later, the server keeps serving t
 The [frozen model inventory](../bench/results/2026-09-30-b70/iq2-xs-baseline.json) records the Hugging Face revision and the SHA-256 of each complete GGUF header.
 The [tensor CSV](../bench/results/2026-09-30-b70/iq2-xs-tensors.csv) records every tensor's actual type, shape, offset and byte size.
 Only headers were fetched for that inventory; a header prefix is not a usable model shard.
-Generation with the complete model, the prompt path, MTP and prompt-lookup drafts, the server, and a 26k-token prompt with KV streaming are in
+Generation with the complete model, the prefill path, MTP and prompt-lookup drafts, the server, and a 26k-token prompt with KV streaming are in
 [the IQ2_XS results](../bench/results/2026-09-30-xe-iq2xs/README.md).
 Greedy tokens were compared with llama.cpp on the CPU.
 

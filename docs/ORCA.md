@@ -63,7 +63,7 @@ Save the following as `strata-orca-iq3_xxs.json` at the repository root.
 Replace both `/path/to/` entries with the **same first shard**: Orca's PLE table is in shard 1.
 The name does not start with `xestrata-` because setup takes such files for the configs of the models it installed.
 
-Start with a 32K context and 512-token prompt chunks.
+Start with a 32K context and 512-token prefill chunks.
 The expert cache sizes itself to the free VRAM.
 The expert arena alone needs about 49.8 GiB of free RAM, plus the draft and runtime buffers and other programs.
 
