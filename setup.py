@@ -1170,6 +1170,29 @@ def whole_shard(s: Path) -> bool:
         return False
 
 
+SHARD_NAME = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
+
+
+def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
+    """--gguf-dir's shards (upstream 5a18f83a1, #305): every -0000i-of-0000N file of the model, N read from the first
+    shard's name as the engine and tools/iq_pack.py do.  The published name first; else the one first shard in the
+    folder whose name has the size in it (an upload split or named differently).  A missing shard is check_shards'
+    error later, as before."""
+    first = folder / model_file(fam, model, 1)
+    if not first.exists():
+        found = sorted(p for p in folder.glob("*-00001-of-*.gguf") if SHARD_NAME.search(p.name))
+        mine = [p for p in found if model.lower() in p.name.lower()]
+        pick = mine if mine else found
+        if len(pick) == 1:
+            first = pick[0]
+    m = SHARD_NAME.search(first.name)
+    total = int(m.group(2)) if m else 1
+    if not m or total < 1:
+        return [first]
+    stem = first.name[:m.start()]
+    return [first.with_name("%s-%05d-of-%05d.gguf" % (stem, i, total)) for i in range(1, total + 1)]
+
+
 def check_shards(shards):
     """Every shard present and whole, or setup stops naming the file and the numbers.  Whole means as long as
     its own tensor directory says (the header is read, the data is not): a truncated copy (--gguf-dir, a .part
@@ -2994,7 +3017,8 @@ def main() -> int:
     ap.add_argument("--data-dir", help="where the model files go (~70-120 GB): default XeStrata-data next to this "
                                        "folder, remembered for every Strata folder on this PC")
     ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
-    ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with the two shards)")
+    ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with every shard: "
+                                       "<name>-00001-of-0000N.gguf ... -0000N-of-0000N.gguf)")
     ap.add_argument("--inspect", nargs="+", metavar=("SOURCE", "VARIANT"),
                     help="what a GGUF is and whether XeStrata runs it, from its headers only (no download): a file, a "
                          "folder, a URL, ms:owner/repo (ModelScope) or hf:owner/repo, and optionally a variant name")
@@ -3495,7 +3519,8 @@ def main() -> int:
         warn("the experimental speed projection is made for the original Qwen3.8-Flash-Next, not Swift 1.5: left off"
              if family == "swift" else f"the experimental speed projection is not tested with {model}: left off")
     models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
-    shards = [models_dir / model_file(fam, model, i) for i in range(1, model_shards(fam, model) + 1)]
+    shards = gguf_dir_shards(models_dir, fam, model) if a.gguf_dir else \
+        [models_dir / model_file(fam, model, i) for i in range(1, model_shards(fam, model) + 1)]
     if not a.gguf_dir and not all(sh.exists() and done(sh) for sh in shards):
         for r in elsewhere:                            # already downloaded in a Strata folder on another drive
             cand = [r / "models" / tag / sh.name for sh in shards]
