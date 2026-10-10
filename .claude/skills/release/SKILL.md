@@ -75,9 +75,8 @@ Steps 5 and 6 are done while it builds.
 Write `build/release/xe<VERSION>/NOTES.md`: the Japanese section first, then the same content in English.
 
 - What changed for users since the previous release tag (`git log --no-merges <previous>..xe<VERSION>`; for the first release, since `origin/main`), grouped by what a user notices, not a list of commits.
-- Which package to install: the table in README's install section (`xestrata-contrib-cuda13.1` / `cuda13.4` on Fedora; `xestrata-contrib-cuda12.4` for Volta), and that `xestrata --setup` shows the GPU makers' packages that are missing and the command that installs them (AGENTS.md, "Packages": the notes do not list them).
+- How to install: README's install section, as it is there (the user's decision, 2026-10-11): the four numbered steps (download from the table with `SHA256SUMS`, `sha256sum -c SHA256SUMS --ignore-missing`, `sudo apt install ./…deb` or `sudo dnf install ./…rpm` with the release's file names, `xestrata --setup`, which shows the GPU makers' packages that are missing and the command that installs them: AGENTS.md, "Packages", the notes do not list them), then the `> [!NOTE]` that without an NVIDIA GPU either CUDA version works the same, then the package table (Intel, AMD (RDNA2 or later), NVIDIA (Turing or later): `xestrata-contrib-cuda13.1`, `cuda13.4` on Fedora; Intel, AMD (RDNA2 or later), NVIDIA Pascal and Volta: `xestrata-contrib-cuda12.4`). A change to one goes into the other.
 - When the version changed: saved conversations from another version are not read.
-- How to check a download: `sha256sum -c SHA256SUMS`.
 - That the release has no free packages: a free build is made from the source (docs/BUILD.md).
 
 Shape the notes with the user's `i-have-adhd` skill (the user's decision, 2026-10-09): read its `SKILL.md` in the user's skills folder (`~/.claude/skills/i-have-adhd/` or `~/.codex/skills/i-have-adhd/`; it cannot be invoked as a tool) and follow its rules for the reader of the notes.
@@ -182,10 +181,13 @@ Take the stage lines out of the notes, add the tables (Japanese and English sect
 The notes' table is one per GPU, from `bench-collect.py`'s medians (the record's README keeps `bench-collect.py`'s own tables): a row per tier, named by the model's weight type and the length (`IQ3_XXS 1K`), and for the prompt and then the output three columns: XeStrata's value, upstream's, and the difference (the value columns named with the engine and its version, `XeStrata xe0.1.40.2.1`, `upstream v0.1.41`), marked ✅ where XeStrata is faster and ❌ where it is slower: the prompt as a ratio (`✅ 2.1 倍`, `✅ ×2.1`), the output as a percentage (`✅ +14%`; slower: `❌ −3%`).
 Within ±1% (either way) the two count as equal: `≒ 同等（−0.1%）` / `≈ equal (−0.1%)`, for the prompt as well.
 A value upstream was stopped in is 計測不能（低速） / not measurable (too slow), its difference `✅`, with the line saying upstream was stopped at 10 tok/s or less; a value that does not fit stays `-`.
-Above each table: the GPU (and its memory), and which build of upstream it ran (`sycl/`, CUDA, HIP); above the first, the engines' versions, the model, the method (256 greedy tokens, the median of two alternating runs) and the unit (tokens/s).
+Above each GPU's tables: the GPU (and its memory) and which build of upstream it ran (`sycl/`, CUDA, HIP); above the first GPU, the engines' versions, the model and the method (256 tokens, the median of two alternating runs).
+Each table has a heading line with its temperature: **generate**（温度 0、トークン/秒） / **generate** (temperature 0, tokens/s), and **serve と通常使用**（温度 0.7） / **serve and everyday use** (temperature 0.7).
 
 ```markdown
-**AMD Radeon RX 9060 XT (16 GB)**: upstream v0.1.41 は HIP 版、トークン/秒
+**AMD Radeon RX 9060 XT (16 GB)**: upstream v0.1.41 は HIP 版
+
+**generate**（温度 0、トークン/秒）
 
 | 形式・長さ | プロンプト XeStrata xe0.1.40.2.1 | プロンプト upstream v0.1.41 | 差 | 出力 XeStrata xe0.1.40.2.1 | 出力 upstream v0.1.41 | 差 |
 | --- | ---: | ---: | --- | ---: | ---: | --- |
@@ -194,9 +196,10 @@ Above each table: the GPU (and its memory), and which build of upstream it ran (
 
 Below each GPU's table, its serve and everyday table from `serve/`'s medians, with the same columns (XeStrata, upstream, difference): a row per measure, the prompt as a ratio, the rest as percentages, the wait and the first token better when shorter.
 Equal there is the upstream merge's check (`judge.py`): the prompt speeds within ±1%, the rest within ±5%, both engines writing their own texts. A wait or a first token is judged as a speed, upstream's time over XeStrata's (372 ms against 354 ms: −4.8%, equal), and its column shows the time's own difference: `≒ 同等（+5%）` / `≈ equal (+5%)`.
-Above it: temperature 0.7, each engine writing its own text, the median of two alternating runs; at a sampled temperature a run can land about 10% off the median.
 
 ```markdown
+**serve と通常使用**（温度 0.7）
+
 | 計測 | XeStrata xe0.1.40.2.1 | upstream v0.1.41 | 差 |
 | --- | ---: | ---: | --- |
 | serve 32K 最初のプロンプト (tok/s) | 839 | 380 | ✅ 2.2 倍 |
@@ -209,14 +212,20 @@ Above it: temperature 0.7, each engine writing its own text, the median of two a
 | agent 出力 (tok/s) | 46.2 | 45.0 | ≒ 同等（+3%） |
 ```
 
-After the last GPU's tables, a note on what counts as equal, in each language section:
+Below the first GPU's tables only (not repeated for the others), one note in each language section, with the temperatures and what counts as equal:
 
 ```markdown
-> ≒ 同等: ±1% 以内（generate のすべて、serve と通常使用のプロンプト）、±5% 以内（serve と通常使用の待ち・出力・最初のトークン）
+> [!NOTE]
+> - **generate**：温度 0（greedy）。差が ±1% 以内なら ≒ 同等です。
+> - **serve と通常使用**：温度 0.7 で、それぞれのエンジンが自分の文を書くので、1 回ごとに中央値から 10% 前後ずれることがあります。差がプロンプトは ±1% 以内、待ち・出力・最初のトークンは ±5% 以内なら ≒ 同等です。
+> - どちらも、交互に 2 回ずつ測った中央値です。
 ```
 
 ```markdown
-> ≈ equal: within ±1% (all of generate; serve's and everyday use's prompt), within ±5% (serve's and everyday use's wait, output, first token)
+> [!NOTE]
+> - **generate**: temperature 0 (greedy). Within ±1% counts as ≈ equal.
+> - **serve and everyday use**: temperature 0.7, each engine writing its own text, so a run can land about 10% off the median. Within ±1% for the prompt and ±5% for the wait, output and first token counts as ≈ equal.
+> - Both are the median of two alternating runs.
 ```
 
 ```sh
