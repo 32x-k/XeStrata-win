@@ -14,14 +14,14 @@ namespace strata::kernels {
 namespace {
 
 constexpr int NT = 256;   // work-items a work-group
-constexpr int BK = 16;    // cells a step
 
-// BQ queries of one KV head: R = BQ x G rows (query, head), Q in local memory as FP32 (scaled), the step's K and V as
-// FP16, the step's scores (then probabilities) per row.  Work-item t owns column d = t % HD of rows t / HD, + NT / HD,
-// ... of the output in registers.
-template <int HD, int G, int BQ>
+// BQ queries of one KV head: R = BQ x G rows (query, head), Q in local memory as FP32 (scaled), the step's BK cells of
+// K and V as FP16, the step's scores (then probabilities) per row.  Work-item t owns column d = t % HD of rows t / HD,
+// + NT / HD, ... of the output in registers.  The rows of Q and K are a word longer than HD in local memory: the
+// scores' neighbouring work-items read neighbouring rows, which would all fall in one bank at a stride of HD.
+template <int HD, int G, int BQ, int BK>
 struct Kernel {
-    static constexpr int R = BQ * G, RS = NT / HD, OPT = R / RS;
+    static constexpr int R = BQ * G, RS = NT / HD, OPT = R / RS, QS = HD + 1, KS = HD + 2;
     static_assert(NT % HD == 0 && R % RS == 0, "the output columns and rows split evenly");
     const float* q;
     const uint16_t* kp;
@@ -48,7 +48,7 @@ struct Kernel {
         for (int i = t; i < R * HD; i += NT) {
             const int r = i / HD, dd = i - r * HD;
             const int64_t tq = qbase + r / G;
-            Q[i] = tq < T ? q[(tq * n_head + (int64_t) h * G + r % G) * HD + dd] * scale : 0.0f;
+            Q[r * QS + dd] = tq < T ? q[(tq * n_head + (int64_t) h * G + r % G) * HD + dd] * scale : 0.0f;
         }
         if (t < R) {
             M[t] = -std::numeric_limits<float>::infinity();
@@ -69,7 +69,7 @@ struct Kernel {
                     kv = kp[row * HD + dd];
                     vv = vp[row * HD + dd];
                 }
-                K[i] = kv;
+                K[j * KS + dd] = kv;
                 V[i] = vv;
             }
             sycl::group_barrier(it.get_group());
@@ -79,7 +79,7 @@ struct Kernel {
                 float s = -std::numeric_limits<float>::infinity();
                 if (c <= qpos && c < n_cells) {
                     s = 0.0f;
-                    for (int dd = 0; dd < HD; ++dd) s = sycl::fma(Q[r * HD + dd], f32_from_f16(K[j * HD + dd]), s);
+                    for (int dd = 0; dd < HD; ++dd) s = sycl::fma(Q[r * QS + dd], f32_from_f16(K[j * KS + dd]), s);
                 }
                 S[i] = s;
             }
@@ -115,15 +115,15 @@ struct Kernel {
     }
 };
 
-template <int HD, int G, int BQ>
+template <int HD, int G, int BQ, int BK>
 void launch(sycl::queue& q, const float* qv, const uint16_t* kp, const uint16_t* vp, const int32_t* table, int64_t pos0,
             int64_t T, const QsaShapes& s, float* attn) {
-    using KT = Kernel<HD, G, BQ>;
+    using KT = Kernel<HD, G, BQ, BK>;
     const size_t blocks = (size_t) ((T + BQ - 1) / BQ);
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> qs(sycl::range<1>((size_t) KT::R * HD), h), sc(sycl::range<1>((size_t) KT::R * BK), h),
+        sycl::local_accessor<float, 1> qs(sycl::range<1>((size_t) KT::R * KT::QS), h), sc(sycl::range<1>((size_t) KT::R * BK), h),
             mrow(sycl::range<1>(KT::R), h), lrow(sycl::range<1>(KT::R), h), arow(sycl::range<1>(KT::R), h);
-        sycl::local_accessor<uint16_t, 1> ks(sycl::range<1>((size_t) BK * HD), h), vs(sycl::range<1>((size_t) BK * HD), h);
+        sycl::local_accessor<uint16_t, 1> ks(sycl::range<1>((size_t) BK * KT::KS), h), vs(sycl::range<1>((size_t) BK * HD), h);
         h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) s.n_head_kv, blocks * NT), sycl::range<2>(1, NT)),
                        KT{qv, kp, vp, table, attn, pos0, T, (int) s.n_head, (int) s.n_head_kv, (int) s.page_size,
                           1.0f / std::sqrt((float) HD), qs, sc, mrow, lrow, arow, ks, vs});
@@ -138,10 +138,10 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
     if (s.n_head_kv <= 0 || s.n_head % s.n_head_kv != 0 || s.page_size <= 0) return false;
     const int64_t g = s.n_head / s.n_head_kv;
     sycl::queue& queue = core::Runtime::get().stream(stream);
-    // local memory: BQ x G rows of FP32 Q (20 to 24 KiB), within the 48 KiB every GPU gives a work-group
-    if (s.head_dim == 128 && g == 10) launch<128, 10, 4>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
-    else if (s.head_dim == 256 && g == 8) launch<256, 8, 2>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
-    else if (s.head_dim == 256 && g == 12) launch<256, 12, 2>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
+    // local memory: BQ x G rows of FP32 Q and BK cells of K and V, 37 to 42 KiB: within the 48 KiB every GPU gives
+    if (s.head_dim == 128 && g == 10) launch<128, 10, 4, 32>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
+    else if (s.head_dim == 256 && g == 8) launch<256, 8, 2, 16>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
+    else if (s.head_dim == 256 && g == 12) launch<256, 12, 2, 16>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
     else return false;
     if (stream == nullptr) queue.wait_and_throw();
     return true;
