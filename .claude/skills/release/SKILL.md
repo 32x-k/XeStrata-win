@@ -1,6 +1,6 @@
 ---
 name: release
-description: Make a GitHub release of XeStrata in stages - the version, main fast-forwarded to dev, the tag (xe and the version, e.g. xe0.1.39); first the three contrib-llvm packages published with the notes (Japanese then English), then a speed table against upstream on Intel, NVIDIA and AMD GPUs. Only when the user asks for a release (/release).
+description: Make a GitHub release of XeStrata in stages - the version, main fast-forwarded to dev, the tag (xe and the version, e.g. xe0.1.39); first the three contrib-llvm packages published with the notes (English then Japanese), then a speed table against upstream on Intel, NVIDIA and AMD GPUs. Only when the user asks for a release (/release).
 disable-model-invocation: true
 argument-hint: "[VERSION, e.g. 0.1.39 or 0.1.39.1]"
 ---
@@ -73,7 +73,7 @@ Steps 5 and 6 are done while it builds.
 
 ## 5. The release notes
 
-Write `build/release/xe<VERSION>/NOTES.md`: the Japanese section first, then the same content in English.
+Write `build/release/xe<VERSION>/NOTES.md`: the English section first, then the same content in Japanese (the user's decision, 2026-10-12), under a first line linking the two: `[English](#english) | [日本語](#日本語)`.
 
 - What changed for users since the previous release tag (`git log --no-merges <previous>..xe<VERSION>`; for the first release, since `origin/main`), grouped by what a user notices, not a list of commits.
 - How to install: README's install section, as it is there (the user's decision, 2026-10-11): the four numbered steps (download from the table with `SHA256SUMS`, `sha256sum -c SHA256SUMS --ignore-missing`, `sudo apt install ./…deb` or `sudo dnf install ./…rpm` with the release's file names, `xestrata --setup`, which shows the GPU makers' packages that are missing and the command that installs them: AGENTS.md, "Packages", the notes do not list them), then the `> [!NOTE]` that without an NVIDIA GPU either CUDA version works the same, then the package table (Intel, AMD (RDNA2 or later), NVIDIA (Turing or later): `xestrata-contrib-cuda13.1`, `cuda13.4` on Fedora; Intel, AMD (RDNA2 or later), NVIDIA Pascal and Volta: `xestrata-contrib-cuda12.4`). A change to one goes into the other.
@@ -177,7 +177,7 @@ It is not committed; the release notes carry the tables.
 
 ## 10. The final release (確定報)
 
-The final release is reached a GPU at a time (the user's decision, 2026-10-11): as soon as one GPU's tables are complete (its generate table and its serve and everyday table both), add them to the notes (Japanese and English sections) and update the release (`gh release edit`, below), without waiting for the other GPUs.
+The final release is reached a GPU at a time (the user's decision, 2026-10-11): as soon as one GPU's tables are complete (its generate table and its serve and everyday table both), add them to the notes (English and Japanese sections) and update the release (`gh release edit`, below), without waiting for the other GPUs.
 
 - The comparison section comes after the notes' other sections: its opening lines (the engines' versions, the model, the method), then the note on temperatures and what counts as equal (below) right after them, once, then the GPUs in a fixed order, the B70, the RTX 4070, the RX 9060 XT, each as its tables are done.
 - While some are missing, one line under the done ones names them: B70・RTX 4070: 計測中（後で足す） / B70, RTX 4070: being measured (added later).
