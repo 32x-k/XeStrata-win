@@ -739,10 +739,10 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
   # the layer split's pure rules (header-only, no GPU; upstream 1c6c82ef, cb6c549c, a22a0e8c): the automatic split's
   # minimum stage size, the --batch-groups resolution and which path builds the draft layer's prompt K/V
-  foreach(t split_rules_test batch_groups_test draft_kv_plan_test)
-    add_executable(${t} src/program/${t}.cpp)
-    target_include_directories(${t} PRIVATE include)
-    add_test(NAME ${t} COMMAND ${t})
+  foreach(rule_test split_rules_test batch_groups_test draft_kv_plan_test)
+    add_executable(${rule_test} src/program/${rule_test}.cpp)
+    target_include_directories(${rule_test} PRIVATE include)
+    add_test(NAME ${rule_test} COMMAND ${rule_test})
   endforeach()
   # --serve's parked conversations (upstream ccc660b-cecf697): the cache's ownership and matching, and the RAM
   # admission's MemAvailable parsing (host only)

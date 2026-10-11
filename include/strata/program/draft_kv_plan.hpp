@@ -18,7 +18,7 @@ namespace strata::program::draft_kv {
 
 /// `STRATA_SPLIT_MTP_BATCH`'s value: any whole number other than 0 turns it on; unset, empty, `0` and text
 /// that is not a number leave it off.
-inline bool split_env_on(const char* value) { return value != nullptr && std::atoi(value) != 0; }
+inline bool split_env_on(const char* value) { return value != nullptr && std::strtol(value, nullptr, 10) != 0; }
 
 struct Plan {
     bool try_batched = false;      ///< call Prefill::draft_kv for this chunk

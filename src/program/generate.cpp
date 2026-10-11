@@ -3413,7 +3413,8 @@ int main(int argc, char** argv) {
             const std::vector<int64_t> first = best;
             const double first_ms = best_ms, first_mass = best_mass;
             const int64_t first_held = best_held, first_room = best_room;
-            auto first_priced = std::move(priced);
+            std::vector<std::pair<double, std::vector<int64_t>>> first_priced;
+            first_priced.swap(priced);
             best.clear();
             best_ms = 1e30; best_mass = 0; best_held = 0; best_room = 0;
             min_stage_layers = strata::program::split_rules::kMinStageLayers;
