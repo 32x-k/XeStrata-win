@@ -62,6 +62,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/batch_groups.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -405,6 +406,8 @@ struct Options {
     /// With a layer split: the --batch slots in this many groups pipelined through the stages (stage k runs one group
     /// while stage k+1 runs another; upstream PR #559).  1 = every slot in one window, stage after stage.
     int batch_groups = 1;
+    bool batch_groups_set = false;    ///< --batch-groups was given (a number or auto): no default then
+    bool batch_groups_auto = false;   ///< --batch-groups auto: one group per stage of a layer split (dividing --batch)
     int batch_mtp = -1;          ///< one MTP proposal per batch slot: --batch-mtp 1, --no-batch-mtp 0, -1 = with --mtp
     /// EXPERIMENTAL, off by default: with --batch-groups over two GPUs, the CPU expert workers in two pools on separate
     /// cores (N0 for the first stage, N1 for the second), each stage's windows served by a host thread of its own, so
@@ -710,9 +713,9 @@ void usage() {
                  "  --gpu ADDR           the GPU by PCI address (domain:bus:device.function), as STRATA_GPU_PCI\n"
                  "  --split-device D[,D2..]  the GPU for each split point, by engine number or PCI address\n"
                  "                       (default: the other discrete GPUs)\n"
-                 "  --batch-groups G     with a layer split: the --batch slots in G groups pipelined through the GPUs\n"
-                 "                       (each GPU on another group at once; G divides N; 1 = one window, GPU\n"
-                 "                       after GPU)\n"
+                 "  --batch-groups G|auto  with a layer split: the --batch slots in G groups pipelined through the\n"
+                 "                       GPUs (each GPU on another group at once; G divides N; 1 = one window, GPU\n"
+                 "                       after GPU); auto, the default with a layer split: one group per GPU\n"
                  "  --pipeline-windows N --serve with a layer split on two GPUs (opt-in): one conversation's verify windows\n"
                  "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
                  "                       (stage 0 runs the next window while stage 1 verifies this one); docs/MULTIGPU.md\n"
@@ -2253,7 +2256,12 @@ int main(int argc, char** argv) {
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
         else if (a == "--batch" || a == "--slots") o.batch = (int) std::strtol(next(a.c_str()), nullptr, 10);
-        else if (a == "--batch-groups") o.batch_groups = (int) std::strtol(next(a.c_str()), nullptr, 10);
+        else if (a == "--batch-groups") {
+            const char* bgv = next(a.c_str());
+            o.batch_groups_set = true;
+            if (std::strcmp(bgv, "auto") == 0) o.batch_groups_auto = true;
+            else o.batch_groups = (int) std::strtol(bgv, nullptr, 10);
+        }
         else if (a == "--batch-mtp") o.batch_mtp = 1;
         else if (a == "--no-batch-mtp") o.batch_mtp = 0;
         else if (a == "--batch-cpu-split") {
@@ -3972,6 +3980,37 @@ int main(int argc, char** argv) {
             bslot_buf.clear();
         }
         o.batch = (int) bslot_ss.size();
+        // --batch-groups (upstream 1bf6344c, ca001df5, cb6c549c, b5d52031): a number, or auto - the most groups, at
+        // most one per GPU of the layer split, that divide the slots, so every card is busy (upstream, 4 x R9700, 8
+        // clients: 90 tok/s in one group, 136 in 2, 166 in 4); auto is the default for a layer split with 2 or more
+        // slots, and that default gives way to --batch-mtp (one group), whose drafts the pipelined groups do not run.
+        // Resolved here, with the slots that fit, so INFO batch_groups says what the serve loop runs.  (upstream also
+        // gives way to --adapt-async 1; the engine turns it off beside --batch slots anyway.)
+        if (o.batch > 0) {
+            strata::program::batch_groups::Input bin;
+            bin.set = o.batch_groups_set;
+            bin.auto_given = o.batch_groups_auto;
+            bin.given = o.batch_groups;
+            bin.batch = o.batch;
+            bin.later_stages = (int) stages.size();
+            bin.batch_mtp = batch_mtp;
+            const auto r = strata::program::batch_groups::resolve(bin);
+            if (r.from_auto) {
+                o.batch_groups = r.groups;
+                if (r.serial != strata::program::batch_groups::Serial::None)
+                    std::fprintf(stderr, "strata generate: --batch-groups auto: 1 group of %d slots - %s does not run "
+                                         "in pipelined groups; --batch-groups %d would pipeline them and turn it off\n",
+                                 o.batch, strata::program::batch_groups::serial_what(r.serial), r.would_be);
+                else
+                    std::fprintf(stderr, "strata generate: --batch-groups auto: %d group%s of %d slot%s\n", r.groups,
+                                 r.groups == 1 ? "" : "s", o.batch / r.groups, o.batch / r.groups == 1 ? "" : "s");
+            }
+            if (o.batch_groups > 1 && (stages.empty() || o.batch % o.batch_groups != 0)) {
+                std::fprintf(stderr, "strata generate: --batch-groups %d is off: it needs a layer split over GPUs of "
+                                     "their own and to divide --batch %d\n", o.batch_groups, o.batch);
+                o.batch_groups = 1;
+            }
+        }
         if (o.batch > 0) {
             strata::gpu::stream_sync(main_cs);
             size_t fb = 0, tb = 0;
@@ -7269,7 +7308,7 @@ int main(int argc, char** argv) {
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld tail_role_token=%lld "
-                        "vram_elastic=%d batch_slots=%d slot_cache=%d engine=" STRATA_VERSION "\n",
+                        "vram_elastic=%d batch_slots=%d batch_groups=%d slot_cache=%d engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -7279,7 +7318,7 @@ int main(int argc, char** argv) {
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
                         (long long) o.tail_role_token, xcache.segmented() ? 1 : 0, o.batch,
-                        o.batch > 0 && o.prompt_cache > 0 ? 1 : 0);
+                        o.batch > 0 ? o.batch_groups : 1, o.batch > 0 && o.prompt_cache > 0 ? 1 : 0);
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -7685,12 +7724,7 @@ int main(int argc, char** argv) {
         // ---- --batch-groups: the slot groups pipelined through the stages (upstream PR #559).  A group's window runs
         // on one stage at a time, its commit right behind it; when it is done there it moves to the next stage, and the
         // stage it left takes the next group.  Each stage on its own GPU, so the GPUs work on different groups at once.
-        const int n_pipe = n_stages;
-        if (o.batch > 0 && o.batch_groups > 1 && (n_pipe < 2 || split_same || o.batch % o.batch_groups != 0)) {
-            std::fprintf(stderr, "strata serve: --batch-groups %d is off: it needs a layer split over GPUs of their "
-                                 "own and to divide --batch %d\n", o.batch_groups, o.batch);
-            o.batch_groups = 1;
-        }
+        const int n_pipe = n_stages;   // (--batch-groups was checked against the split when it was resolved)
         const bool piped = o.batch > 0 && o.batch_groups > 1;
         const int GS = piped ? o.batch / o.batch_groups : o.batch;
         // --batch-cpu-split (experimental): stage 1's CPU experts through a Drive and a pool of their own, and each
