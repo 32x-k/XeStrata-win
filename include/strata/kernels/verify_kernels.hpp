@@ -121,6 +121,11 @@ void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int6
 void map_ids(int32_t* ids, const int32_t* table, int n, void* stream);
 /// probs[t] = softmax(logits[t])[ids[t]] for n_rows rows of n_vocab (the probability of each row's argmax).
 void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* stream);
+/// #879 guard (upstream f332a855): flags[t * kNonfiniteBlocks + b] = 1 when slice b of row t (n floats a row) holds a
+/// NaN or an infinity, else 0, for n_rows rows.  Every word is written on every launch (nothing to clear between
+/// windows), so `flags` can be mapped host memory read after the window's own sync.  Graph-capturable.
+inline constexpr int kNonfiniteBlocks = 16;
+void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* flags, void* stream);
 /// Dense-attention step records for `n` cells: [cell, cell+1, (cell+1)/4, cell+1] from cells[i] (device memory).
 void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);
 /// A sliding attention window: for `n` step records (kStepCount ints each, n_kv at [1]) the selection becomes the

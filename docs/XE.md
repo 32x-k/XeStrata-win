@@ -10,7 +10,7 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md); how to build it, what setup does and the packages it needs, in [BUILD](BUILD.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata xe0.1.42 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version follows the upstream version it has integrated, and another release on the same upstream version adds a number (xe0.1.40.2.1).
+XeStrata xe0.1.43 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version follows the upstream version it has integrated, and another release on the same upstream version adds a number (xe0.1.40.2.1).
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
@@ -26,6 +26,41 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_VRAM_LIMIT_MIB` caps the VRAM the engine sees, `STRATA_MAX_ALLOC_MIB` the largest allocation it assumes, and
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
+
+## Integration through Strata 0.1.43
+
+The changes of upstream Strata 0.1.42 to 0.1.43 (`7695859a`) are carried into Xe, except the Windows implementation.
+They were ported one at a time; each speed idea was A/B-measured on one GPU and taken when it was faster or no slower.
+
+The main ones:
+
+- A guard on the windows whose logits are NaN or infinite: the request ends and the state it would reuse is dropped (upstream #879, on by default; `STRATA_NAN_GUARD=0` turns it off).
+- Prompt path: the host copy of the K/V written 4 bytes a lane (`STRATA_KV_WIDE_HOST=0` for the old form; on the B70 at 64K, 1,974 → 2,399 tok/s),
+  the expert copies on the GPU's copy-only engine (Level Zero, `STRATA_COPY_ENGINE=0`),
+  an expert's gate/up and down dequantized in one launch (`STRATA_PF_DQ_FUSED=0`; +9% on the B70's UD-Q4_K_XL at 32K),
+  the chunk's step records and token ids sent from page-locked buffers (upstream #1712).
+- Decode: the expert hits folded into the multi-row combine (`STRATA_FUSE_HITS=0`), Q3_K's GEMV unpacking once a block,
+  the route-resident swap one sub-group a token (inside the opt-in feature, +3.9% on the B70).
+- serve's tail skip off by default when 90% or more of the experts are in VRAM (upstream #1884, `STRATA_TAIL_SKIP_MAX_CACHED`).
+- serve's reports (time and tokens of a request that moved between the solo path and a batch slot, `timings.prompt_n`; upstream #1869 and #1870),
+  `STRATA_DROP_CACHE_ON_EXIT`, the file-cache hint when RAM is short, `STRATA_TRACE`'s VRAM marks.
+- `xestrata --setup --bench-original-compat`, which runs upstream's benchmark mode (`strata_bench.py`) as it measures ([BENCH](BENCH.md)).
+
+Fixed on XeStrata's side during this integration:
+
+- The split of the missed experts between the CPU and PCIe refines the CPU's times from the decode ([Splitting the missed experts between the CPU and PCIe](#splitting-the-missed-experts-between-the-cpu-and-pcie)).
+- When the RAM cannot hold the whole expert arena, the engine starts as with `--resident-experts` instead of loading it, and moves layers into host USM only while the RAM has room for them (issue #10, [DETAILS](DETAILS.md)).
+- An engine that stops on an exception says in one line what it was doing, the SYCL and Unified Runtime codes, the VRAM free and whether the GPU still answers, and the web app shows it (issue #10).
+- The web app's GPU readings agree across the three makers (Intel's temperature is the GPU's own, a layer split's other cards, product names, the PCIe path's limit).
+- serve writes the checkpoint at the start of the assistant turn into RAM after the reply ([DETAILS](DETAILS.md)). On the RTX 4070 a continuing request waits 222 instead of 288 ms at 1K and 253 instead of 317 ms at 64K.
+
+Measured against upstream v0.1.43 on the three makers' GPUs (generate with five model files, serve, everyday use): XeStrata is equal or faster in every measure.
+On the RX 9060 XT, IQ3_XXS decodes 9-13% faster from 1K to 262K (25-45% faster than xe0.1.42) and reads the prompt 2.9-3.5 times as fast.
+The RTX 4070's serve follow-ups wait 222 and 253 ms, against upstream's 240 and 282 ms.
+
+Not taken: the Windows implementation, upstream's `sycl/`, the HIP and CUDA kernels' tuning tables and the paths for GPUs there is no machine for (Pascal's rows table, gfx12's fused int8 prompt experts, gfx12's decode HC norm and folded flag waits, HIP layer-split defaults),
+the mixed expert profile upstream made for `sycl/` (generate's 32K decode: B70 −2.0%, RTX 4070 +6.2%, RX 9060 XT −5.3%),
+and what has nothing to act on in XeStrata (`STRATA_ADAPT_OVERLAP`, PcieAuto's share, skipping the GEMM operand staging, refilling lent slots by DMA).
 
 ## Integration through Strata 0.1.42
 
@@ -335,6 +370,9 @@ Before, it was a share from the link's speed alone (0.55 from 20 GB/s, below tha
 - **The split**: for each group of a window, the GPU computes its VRAM hits, then (beside them where the window's fetch branch runs) reads and computes the PCIe experts,
   and the CPU computes the rest; the number read over PCIe makes the later side earliest.
   Experts go over PCIe only when that is at least 10% earlier than the CPU taking them all.
+- **Refined from the decode**: the CPU's time at start is measured a token at a time, and the window's pool calls can run slower (1.27-1.29x on the RX 9060 XT, 3.5x beside a busy host).
+  The decode's calls are set against the time the split expected for them, and when they are more than 15% off, the CPU's times are scaled by the ratio (after 512 calls with experts on the CPU, then 1,024 and 2,048 more, three updates at most; as upstream's PcieAuto refines its share).
+  On the RX 9060 XT, IQ3_XXS decodes at 52.2 instead of 50.3 tok/s at 1K, 51.3 instead of 48.5 at 64K and 44.7 instead of 42.5 at 262K; on the B70 and the RTX 4070, whose times at start match the decode's, nothing changes. `STRATA_PCIE_SPLIT_REFINE=0` keeps the times taken at start.
 - **The arena**: on Level Zero, GPU kernels cannot read the arena registered for device copies.
   Only when the split reads experts over PCIe, the arena moves into host USM a layer at a time (about 7.5 s for IQ3_XXS's 40 GB). `STRATA_ARENA_HOST_USM=1` puts it in host USM from the start.
 - **The share stays**: with `--pcie-frac` (also as `--calibrate` saved it), over a layer split, with `--pcie-mode dma` or `direct`, and when the times cannot be measured.

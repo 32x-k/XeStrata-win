@@ -92,7 +92,10 @@ async function refresh() {
     $("load").disabled = operating || Boolean(inflight) || status.loaded; $("unload").disabled = operating || Boolean(inflight) || !status.loaded;
     list(); if (selected) await showDetail();
     text("updated", `Live · updated ${new Date().toLocaleTimeString()}`);
-    if (!operating) notice(actionError);
+    // issue #10: the last engine that stopped in a request, and why (the next request starts it again)
+    const fail = status.engine_failure;
+    const failText = fail ? `The engine stopped at ${new Date(fail.at * 1000).toLocaleString()}: ${fail.message}` : "";
+    if (!operating) notice(actionError || failText);
   } catch (error) { notice(error.message); text("updated", "Disconnected · retrying"); $("load").disabled = $("unload").disabled = true; }
 }
 async function control(load) {

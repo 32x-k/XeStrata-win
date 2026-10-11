@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -54,6 +55,58 @@ void launch(void* stream, const float* parts, const float* weights, const float*
 }
 
 }  // namespace
+
+bool native_moe_fuse_hits() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_FUSE_HITS");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
+
+void native_moe_combine_multi_hits(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
+                                   const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k,
+                                   int n_tok, void* stream, const float* shared_gate) {
+    if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1 || (shared_gate && !shared) || !hits || !dst || !count)
+        throw std::invalid_argument("native MoE combine (hits) requires a stream, width, 1..15 experts, tokens, hits");
+    constexpr int WG = 256;
+    const int cap = n_tok * (int) k;
+    const size_t cols = (size_t) ((n_embd + WG - 1) / WG) * WG;
+    core::Runtime::get().stream(stream).submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint8_t, 1> hit(sycl::range<1>((size_t) cap), h);   // entry -> its part has a hit row
+        h.parallel_for(sycl::nd_range<2>({size_t(n_tok), cols}, {1, WG}), [=](sycl::nd_item<2> it) {
+            const int lid = (int) it.get_local_id(1);
+            for (int i = lid; i < cap; i += WG) hit[i] = 0;
+            sycl::group_barrier(it.get_group());
+            const int n_hit = *count;
+            for (int i = lid; i < n_hit; i += WG)
+                if (dst[i] >= 0 && dst[i] < cap) hit[dst[i]] = 1;
+            sycl::group_barrier(it.get_group());
+            const int64_t tk = int64_t(it.get_group(0)), col = int64_t(it.get_global_id(1));
+            if (col >= n_embd) return;
+            const float* p = parts + tk * k * n_embd;
+            const float* hp = hits + tk * k * n_embd;
+            const float* w = weights + tk * k;
+            const uint8_t* ht = &hit[(size_t) (tk * k)];
+            const float p0 = ht[0] ? p[col] + hp[col] : p[col];   // moe_hit_add's sum, then its product
+            float sum = p0 * w[0];
+            for (int expert = 1; expert < k; ++expert) {
+                const int64_t o = int64_t(expert) * n_embd + col;
+                const float pe = ht[expert] ? p[o] + hp[o] : p[o];
+                sum += pe * w[expert];
+            }
+            if (shared) {
+                float sv = shared[tk * n_embd + col];
+                if (shared_gate) {
+                    const float gt = 1.0f / (1.0f + sycl::exp(-shared_gate[tk]));
+                    sv = sv * gt;
+                }
+                sum += sv;
+            }
+            output[tk * n_embd + col] = sum;
+        });
+    });
+}
 
 void native_moe_combine_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_moe_combine_enabled() { return enabled.load(std::memory_order_relaxed); }

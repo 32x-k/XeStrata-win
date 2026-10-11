@@ -69,6 +69,9 @@ default 7, upstream b4e3407b). Its contribution is zero and the other experts ke
 so the answers differ slightly.
 It does nothing when every expert is in VRAM (nothing is skipped), with `--batch` and with a helper cache
 (`--expert-cache-device1..3`); on a layer split each stage skips its own.
+It is not on by default either when 90% or more of the experts are in VRAM (upstream's #1884: the misses are few and the
+skip costs more draft acceptance than it saves; a V100 32 GB with Coder IQ1_M at 94.8% decoded 1-2% slower);
+`STRATA_TAIL_SKIP_MAX_CACHED=<percent>` moves that line (101: always on).
 `STRATA_ROUTE_TAIL_SKIP=0` turns it off and 1-9 sets the rank; the start prints one line.
 
 Measured (IQ3_XXS):
@@ -249,6 +252,9 @@ When the experts do not fit the RAM (with about 10 GB left for the rest) but the
 setup chooses the low-RAM mode (`--low-ram auto`, the default).
 The engine then reads the experts from the model files instead of copying them all into RAM:
 a native pack's from the GGUF files in place, the AVX-512 Q2_0 pack's from its `experts.bin`.
+An engine started by hand with neither `--resident-experts` nor `--mmap-experts` starts as with `--resident-experts`, and says so in one line, when the free RAM cannot hold all the experts (issue #10: the whole set swapped while it loaded, and on an Intel GPU, once moved into the GPU driver's memory, the OS could not take the RAM back and the host stopped).
+`STRATA_ARENA_LOW_RAM=keep` loads the whole set anyway.
+With every expert in RAM, the move into the GPU driver's memory (host USM) for the PCIe share takes a layer only while the RAM has room for it and `STRATA_HOST_USM_RESERVE_MIB` (default 1024) more; otherwise nothing moves and the CPU computes the missed experts.
 
 - If the experts the GPU does not hold fit the RAM, they are copied into RAM once at start (`--resident-experts`).
   The server then moves the adaptive tier's swaps (exchanges between the RAM copy and the GPU cache) on a helper
@@ -625,6 +631,14 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
 - **A reply stuck on one token is ended.** When a reply repeats the same token 256 times in a row, the server ends it there with `finish_reason` `"length"` and says so in its window:
   a model in a loop, or a broken state that answers one token forever (upstream's #606 saw 36,689 tokens of `!`).
   `"repeat_stop_tokens": N` in `xestrata-<model>.json` sets the run length; `0` turns it off (for a request that really wants one token many times).
+- **Non-finite logits end the request and drop the cached state (on by default).** Rarely a window's logits become NaN and the reply degenerates into token 0 (`!`) repeated (upstream's #606, #879).
+  The poison sits in the conversation's K/V and recurrent state, so every later turn that reuses it stays broken.
+  Every window of `--serve` (decode, a layer split's `--pipeline-windows`, the prompt's short tail, batch slots) checks its head logits on the GPU beside the greedy pick (one small kernel into page-locked flags, read after the sync the window already does).
+  A flagged window emits none of its tokens; the engine prints a line with the position and ends the request with `DONE ... nonfinite` (a slot: `BDONE <slot> <n> nonfinite`).
+  The next request first drops the live session, every checkpoint, every parked conversation and every idle slot, and reads its prompt from token 0 (a slot still running finishes its reply and is not kept after it).
+  The server sends a request that has sent nothing yet again once, transparently; a reply that had started ends as `"length"`; a second fire on the retry ends the request with an error (503 before an answer, an error event in a stream).
+  The kernel only writes flags, so an answer without a NaN is the one the engine gives with `STRATA_NAN_GUARD=0` (no kernel recorded).
+  Debug switch: `STRATA_NAN_INJECT=<n>[,<n>...]` reports the n-th window the engine checks as non-finite.
 - **Anthropic requests that don't ask for thinking (opt-in).** By default a `/v1/messages` request with no `"thinking"`, effort or budget thinks as the model's template does.
   `"anthropic_thinking": "on_request"` in `xestrata-<model>.json` renders such a request without thinking.
   That is Anthropic's own rule, and what Claude Code's short helper calls (a session title in a few dozen tokens) need.
@@ -743,6 +757,7 @@ A request that continues a chat reads only the part after what the engine alread
 the live session, or one of the checkpoints it keeps in RAM (up to 6, about 118 MB each).
 Checkpoints are taken at the start of each new assistant turn and every 16K prompt tokens.
 A checkpoint is used only when the prompt starts with exactly its tokens and pictures.
+The checkpoint at the start of the assistant turn is copied in one batch into a pinned staging buffer, and written into ordinary RAM after the reply (on the RTX 4070 a continuing request waits 30-40 ms less each time; `STRATA_CKPT_STAGE=0` writes it before the reply).
 
 The oldest checkpoint is kept for good.
 In practice it is the end of the system prompt, which every chat of the same client shares.
@@ -1240,6 +1255,7 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 | A picture is refused or `cannot read the image` | The file is not a picture Pillow can open (JPEG, PNG, WebP, GIF, BMP, TIFF, AVIF work). |
 | Pictures are slow | The encoder runs on the CPU: run setup again with `--vision gpu`. |
 | A request never finishes (`no progress for ... s`) | When the engine stops making progress, the request ends with an error (after 1 minute) and the next request starts the engine again. The log says where it stopped and what every CPU pool thread and the GPU handshake were doing. If you see it, please open an issue with that report. (`STRATA_WATCHDOG_S` sets the time in seconds; 0 turns it off.) |
+| The engine stopped in the middle of a request (a toast in the web app, "Engine stopped" in the Monitor's state) | An exception such as a kernel launch the GPU runtime refused (device memory or resources short) or a GPU that stopped answering. The engine writes one line with what it was doing (the stage and the prompt chunk), the SYCL and Unified Runtime error codes, the VRAM free and whether the GPU still answers (Level Zero's `zeDeviceGetStatus`), ends, and the next request starts it again (issue #10). On Level Zero `level_zero backend failed with error: 40` stands for device memory and for resources alike. If the GPU is "lost", please open an issue with the xe lines and the PCIe AER lines of `sudo dmesg`. |
 | `the engine said nothing for ... s during the request` | The engine and the server lost step (the engine waits for its next command, the server for the request's end; GPU at 0%, nothing in the log; upstream #481). The server ends the engine after 300 s without a line from it during a request, the request ends with an error and the next request starts the engine again. `"engine_silence_s": 600` in `xestrata-<model>.json` sets the time (0 = wait forever, as before). |
 | `the engine said nothing for ... s and used no CPU or disk in that time (frozen ...)` | A quicker version of the check above (upstream #1317): an engine that prints nothing and uses no CPU or disk for 90 s is taken as stuck, ended, and started again by the next request. One whose GPU is busy (10% or more) or that is silent but working is not ended, only reported once. `STRATA_ENGINE_STALL_S` sets the time (0 = off). While a prompt layer reads the file tier again (low RAM), the engine's own watchdog also waits up to 10 times as long (`STRATA_WATCHDOG_IO_S`, upstream #1407). |
 | Anything else | The engine log is `xestrata-<model>.log` in the XeStrata folder; attach it to an issue. |

@@ -53,7 +53,7 @@ Write `.upstream-<version>.md` (add it to `.git/info/exclude`, as `.upstream-014
 | M | several GPUs | all |
 | N | NVIDIA, every generation (Pascal, Volta, Turing included) | as ideas (below) |
 | P | speed paths | as ideas (below) |
-| S | upstream's `sycl/` | not taken: measured as a competitor (step 7) |
+| S | upstream's `sycl/` | not taken, and not measured in a merge (the release's table compares it) |
 | T | serve, setup, tools | ported (step 3) |
 | W | Windows | not taken |
 
@@ -107,7 +107,7 @@ Every idea is ported and measured, whether XeStrata wins or loses against upstre
 - Port it behind an environment switch (`STRATA_<NAME>=0|1`, or the option upstream gave it), so it can be measured on and off and turned off later. Related ideas go in as a group, each behind its own switch.
 - Its condition is XeStrata's: what the device reports (matrix units, memory, the PCIe link, the CPU pool's measured speed), not upstream's backend.
 - An exact change that can be checked bitwise is checked by a probe; an opt-in feature is run once to see it works.
-- A speed idea is measured with `scripts/ab_pair.py`: the same binary with its switch off (A) and on (B), alternating, in the setting the idea is for (its tier, the serve path, a conversation; `TIERS`, `MODES`, `CONVS`), on all three GPUs and on each with its matrix units off (`STRATA_NO_XMX`, `STRATA_NO_BF16_MMA`, `STRATA_NO_INT8_MMA`).
+- A speed idea is measured with `scripts/ab_pair.py`: the same binary with its switch off (A) and on (B), in the setting the idea is for (its tier, the serve path, a conversation; `TIERS`, `MODES`, `CONVS`), once (`ROUNDS=1`) on one GPU, the one the idea is most likely to help (the user's decision of 2026-10-12).
   Both runs are XeStrata with one seed: they write one text unless the switch changes the output, so the difference is the switch's alone and a difference of 1 to 2% shows.
 
 ```sh
@@ -117,7 +117,9 @@ A="env STRATA_X=0 build/contrib-llvm/strata" B="env STRATA_X=1 build/contrib-llv
 python .claude/skills/upstream-sync/scripts/judge.py <out>        # B against A per cell
 ```
 
-- Kept on where it is faster on a GPU and slower on none (chosen at run time from what the device reports where it helps only some); opt-in where it is faster nowhere but upstream keeps it as an option; removed otherwise. The numbers go into the idea's line, the commit and the record.
+- Faster on that GPU, or equal (within ±1%): kept, on by default.
+  Slower: measured once on each of the two other GPUs; kept on where it is faster or equal there (chosen at run time from what the device reports, when it helps only some); opt-in where it is slower everywhere but upstream keeps it as an option; removed otherwise.
+  The numbers go into the idea's line, the commit and the record.
 - Probes on the B70 and the RTX 4070 may run together; whole-engine A/B runs one card at a time.
 
 ### GPUs there is no machine for
@@ -187,10 +189,10 @@ Against the tag, a cell (file, GPU, tier, prompt or output) passes when XeStrata
 The serve cells (GPU, tier, greedy or t07; prompt, follow-ups, output), read from `matrix-serve.json`, and the everyday cells (GPU, conversation; first token, prompt, output), read from `matrix-usage.json`, pass at most `SERVE_LIMIT` (`judge.py`, 5%) below upstream's, the prompt speed at 1%: each engine writes its own text there, so the other measures vary with the text from round to round (the rounds' seeds differ), up to 10% off a cell's median at temperature 0.7 on 2026-10-10.
 A cell upstream does not finish, finishes at 10 tok/s or less, or is stopped as that slow, is left out; one only XeStrata does not finish fails.
 A file whose experts do not fit in a machine's RAM budget, so that they are read from the SSD while it answers (SSD offload: UD-Q4_K_XL on the AMD container's 62 GB), is not run on that machine (the user's decision of 2026-10-09): as for GPUs there is no machine for (step 4), its paths are checked by the tests and the builds only, and the record lists its cells `unverified`.
-The B70's output cells are judged like the others (the user's decision of 2026-10-11, which replaces the `--prompt-only B70` of 2026-10-09): only the 10 tok/s rule above leaves a cell out.
+The B70 is not measured against upstream in a merge (the user's decision of 2026-10-12, to save time; it replaces the B70 rules of 2026-10-09 and 2026-10-11): it runs XeStrata alone (`UP=none`) and every cell of it is judged against the previous XeStrata (`prev` lines) only. The RTX 4070 and the RX 9060 XT are judged against both. The release's speed table (/release) still compares the B70 with upstream's `sycl/`.
 
 Against the previous XeStrata (`prev` lines), every cell both records have is judged: the prompt at 1%, the rest at `SERVE_LIMIT`, since the text changes with the version (on the generate path it is the tag's).
-The two records were measured on different days, so a `prev` failure is measured again before it is worked: `ab_pair.py` with the previous XeStrata's binary (A, built from its tag in a worktree) and HEAD's (B), in that cell's setting, one seed. That A/B decides.
+The previous XeStrata is not measured again: its record is the reference (the user's decision of 2026-10-12). A `prev` failure suspected of noise (another cell of the same run moved the other way, or upstream moved as much in the same run) is measured once more in the same setting; one still slower then, or not suspected of noise, is worked at once, the ideas' switches off one at a time with `ab_pair.py` (only the side that changed is measured: a greedy run of the same binary, settings and text is read from its record, AGENTS.md).
 
 For each failing cell: find where the time goes (the GPU profilers of docs/DEVTOOLS.md, the engine's timing lines), read how upstream does that part (for a `prev` failure: what changed since the previous XeStrata, `git log <xe tag>..HEAD`), make XeStrata faster (step 4's rules), and measure that cell again.
 The run is done only when a full run of step 7 on the final HEAD, every file and tier of the table (IQ3_XXS with 262K), the serve path, everyday use and every reachable GPU, gives `ALL PASS` with the `--prev` records: a cell fixed earlier can lose again to a later change.
