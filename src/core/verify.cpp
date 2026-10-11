@@ -1974,7 +1974,9 @@ bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolM
 bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
                            std::string& err) {
     using namespace strata::kernels;
-    if (S < 1 || S > max_t_ || hbase < 0 || (next_ != nullptr && hbase + S > (int) slots_.size())) {
+    // a slot may own a contiguous group of rows (--batch-mtp), also across the stages of a layer split, whose hand-off
+    // buffers hold kVerifyMaxT rows (a stage that hands rows on or takes them; upstream 48f2c47d)
+    if (S < 1 || S > max_t_ || hbase < 0 || ((next_ != nullptr || lb_ > 0) && hbase + S > kVerifyMaxT)) {
         err = "verify: batch rows out of range (init_slots)";
         return false;
     }
@@ -1991,10 +1993,6 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             }
         if (t > 0 && rows[t] == rows[t - 1] && pos[t] != pos[t - 1] + 1) {
             err = "verify: proposed rows must have consecutive positions";
-            return false;
-        }
-        if (t > 0 && rows[t] == rows[t - 1] && next_ != nullptr) {
-            err = "verify: grouped slot rows do not support a layer split yet";
             return false;
         }
         if (pos[t] < 0 || pos[t] + 1 > slots_[(size_t) rows[t]]->max_cells) {
