@@ -105,6 +105,11 @@ Stream stream_create() {
     catch (const std::exception& e) { fail("stream_create", e); return nullptr; }
 }
 
+Stream stream_create_copy() {
+    try { return rt().create_copy_stream(); }
+    catch (const std::exception& e) { fail("stream_create_copy", e); return nullptr; }
+}
+
 void stream_destroy(Stream s) {
     try { rt_of(s).destroy_stream(static_cast<sycl::queue*>(s)); }
     catch (const std::exception& e) { fail("stream_destroy", e); }

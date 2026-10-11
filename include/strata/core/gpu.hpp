@@ -35,6 +35,8 @@ struct Graph;
 const char* last_error();
 
 Stream stream_create();
+/// A stream for copies and events alone (Runtime::create_copy_stream): the copy engine where the device has one.
+Stream stream_create_copy();
 void stream_destroy(Stream s);
 bool stream_sync(Stream s);
 /// True when every command submitted to `s` has completed (cudaStreamQuery == cudaSuccess).

@@ -719,7 +719,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.tok_host.resize((size_t) chunk);
         m.tok_up.init((size_t) chunk);
     }
-    if (!(m.copy = strata::gpu::stream_create())) { err = "prefill: copy stream"; return false; }
+    if (!(m.copy = strata::gpu::stream_create_copy())) { err = "prefill: copy stream"; return false; }
     const size_t T = (size_t) chunk;
     m.T_max = chunk;
     m.borrowed = borrow != nullptr;

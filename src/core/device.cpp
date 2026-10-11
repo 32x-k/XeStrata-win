@@ -7,7 +7,17 @@
 #include "strata/kernels/device_arch_tag.hpp"
 
 
+#if defined(__has_include)
+#if __has_include(<level_zero/ze_api.h>) && __has_include(<sycl/ext/oneapi/backend/level_zero.hpp>)
+#include <level_zero/ze_api.h>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+#include <dlfcn.h>
+#define STRATA_HAVE_ZE_API 1
+#endif
+#endif
+
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -225,6 +235,69 @@ bool Runtime::measure_marks() {
 sycl::queue* Runtime::create_stream() {
     std::lock_guard<std::mutex> lock(streams_mutex_);
     return &streams_.emplace_back(context_, device_, handler(), sycl::property::queue::in_order{});
+}
+
+// The prompt path's expert copies on the GPU's copy engine (upstream 01fe68dd, in its sycl/ port): Level Zero's v2
+// adapter runs an in-order queue's memcpy on the compute engine.  A device that reports a copy-only queue group gets an
+// immediate command list on it, wrapped as a SYCL queue; any other device (CUDA, HIP, no such group, a build without
+// the Level Zero headers) an ordinary engine stream.  On the B70 the prompt read as fast either way (4K 1,504 tok/s,
+// 32K 2,312 and 2,305, 2026-10-12): the copies were already behind the kernels there.  STRATA_COPY_ENGINE=0: off.
+sycl::queue* Runtime::create_copy_stream() {
+#ifdef STRATA_HAVE_ZE_API
+    static const bool off = [] {
+        const char* v = std::getenv("STRATA_COPY_ENGINE");
+        return v != nullptr && std::strtol(v, nullptr, 10) == 0;
+    }();
+    if (!off && device_.get_backend() == sycl::backend::ext_oneapi_level_zero) {
+        try {
+            void* lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);   // the SYCL runtime has loaded it
+            if (lib == nullptr) lib = dlopen("libze_loader.so.1", RTLD_NOW);
+            using GroupsFn = decltype(&zeDeviceGetCommandQueueGroupProperties);
+            using ImmFn = decltype(&zeCommandListCreateImmediate);
+            auto groups = lib ? reinterpret_cast<GroupsFn>(dlsym(lib, "zeDeviceGetCommandQueueGroupProperties")) : nullptr;
+            auto imm = lib ? reinterpret_cast<ImmFn>(dlsym(lib, "zeCommandListCreateImmediate")) : nullptr;
+            const auto zdev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(device_);
+            const auto zctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(context_);
+            uint32_t n = 0;
+            std::vector<ze_command_queue_group_properties_t> g;
+            if (groups != nullptr && imm != nullptr && groups(zdev, &n, nullptr) == ZE_RESULT_SUCCESS && n > 0) {
+                ze_command_queue_group_properties_t blank;
+                std::memset(&blank, 0, sizeof blank);
+                blank.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_GROUP_PROPERTIES;
+                g.assign(n, blank);
+                if (groups(zdev, &n, g.data()) != ZE_RESULT_SUCCESS) g.clear();
+            }
+            for (uint32_t i = 0; i < (uint32_t) g.size(); ++i) {
+                if (!(g[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY) ||
+                    (g[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE) || g[i].numQueues == 0)
+                    continue;
+                ze_command_queue_desc_t d;
+                std::memset(&d, 0, sizeof d);
+                d.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
+                d.ordinal = i;
+                d.flags = ZE_COMMAND_QUEUE_FLAG_IN_ORDER;
+                d.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+                d.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+                ze_command_list_handle_t cl = nullptr;
+                if (imm(zctx, zdev, &d, &cl) != ZE_RESULT_SUCCESS || cl == nullptr) break;
+                sycl::backend_input_t<sycl::backend::ext_oneapi_level_zero, sycl::queue> in(
+                    cl, device_, sycl::ext::oneapi::level_zero::ownership::transfer,
+                    sycl::property_list{sycl::property::queue::in_order{}});
+                std::lock_guard<std::mutex> lock(streams_mutex_);
+                sycl::queue* q = &streams_.emplace_back(
+                    sycl::make_queue<sycl::backend::ext_oneapi_level_zero>(in, context_, handler()));
+                static std::atomic<bool> said{false};
+                if (!said.exchange(true))
+                    std::fprintf(stderr, "strata: the prompt's expert copies on the GPU's copy engine (queue group %u; "
+                                         "STRATA_COPY_ENGINE=0 turns it off)\n", i);
+                return q;
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata: no copy-engine queue (%s): an ordinary stream\n", e.what());
+        }
+    }
+#endif
+    return create_stream();
 }
 
 void Runtime::destroy_stream(sycl::queue* stream) {
