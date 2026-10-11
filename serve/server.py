@@ -6284,6 +6284,11 @@ def main() -> int:
                 proc = getattr(engine, "proc", None)
                 if proc:
                     proc.kill()
+        try:
+            from serve import cache_drop
+            cache_drop.drop_after_exit(engine)           # opt-in (STRATA_DROP_CACHE_ON_EXIT=1), default unchanged
+        except Exception as e:  # noqa: BLE001 - never block the exit
+            print(f"[strata] could not release the model files' cache: {e}", flush=True)
         print("[strata] stopped", flush=True)
     return 0
 
