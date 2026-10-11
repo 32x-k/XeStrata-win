@@ -2396,6 +2396,9 @@ def engine_args(cfg: dict) -> list[str]:
     # for one start) runs on the first card alone
     if cfg.get("split_pci") and "--layer-split" not in args and os.environ.get("STRATA_LAYER_SPLIT") != "off":
         args += ["--layer-split", layer_split_value(cfg), "--split-device", ",".join(cfg["split_pci"])]
+        # "gpu_order": "as_given": the auto split keeps the cards in the config's order (upstream be8db787)
+        if cfg.get("gpu_order") == "as_given" and "--split-order" not in args:
+            args += ["--split-order", "as-given"]
     if "coupled_draft" in cfg and "--coupled-draft" not in args and "--no-coupled-draft" not in args:
         args += ["--coupled-draft" if cfg["coupled_draft"] else "--no-coupled-draft"]
     # #533 (opt-in): "vram_elastic": true - the expert cache in segments, so POST /v1/vram can give VRAM back to other

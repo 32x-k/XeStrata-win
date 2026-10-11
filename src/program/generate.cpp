@@ -89,6 +89,7 @@
 #include <exception>
 #include <chrono>
 #include <algorithm>
+#include <numeric>
 #include <memory>
 #include <iostream>
 #include <limits>
@@ -452,6 +453,7 @@ struct Options {
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
+    bool split_order_given = false;   ///< --split-order as-given: the auto layer split keeps the GPUs' order
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
@@ -716,6 +718,8 @@ void usage() {
                  "                       auto chooses K from what this PC measures, before loading\n"
                  "  --gpu ADDR           the GPU by PCI address (domain:bus:device.function), as STRATA_GPU_PCI\n"
                  "  --split-device D[,D2..]  the GPU for each split point, by engine number or PCI address\n"
+                 "  --split-order auto|as-given  auto (default): --layer-split auto also chooses which of the later\n"
+                 "                       GPUs runs which stage; as-given keeps the order of --split-device\n"
                  "                       (default: the other discrete GPUs)\n"
                  "  --batch-groups G|auto  with a layer split: the --batch slots in G groups pipelined through the\n"
                  "                       GPUs (each GPU on another group at once; G divides N; 1 = one window, GPU\n"
@@ -1452,6 +1456,31 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
     strata::gpu::free(d);
     strata::gpu::free(h);
     return bw;
+}
+
+// The time of one small host->device copy (64 KiB, the median of 16 after a warmup): the fixed part of a layer
+// split's hand-off on this GPU's link, for --layer-split auto.  < 0 when the probe cannot run.
+double probe_copy_latency_ms() {
+    constexpr size_t kBytes = (size_t) 64 << 10;
+    void* h = nullptr;
+    void* d = nullptr;
+    if (!strata::gpu::alloc_host(&h, kBytes)) return -1.0;
+    if (!strata::gpu::alloc_device(&d, kBytes)) {
+        strata::gpu::free(h);
+        return -1.0;
+    }
+    std::memset(h, 0, kBytes);
+    std::vector<double> ms;
+    for (int i = 0; i < 17; ++i) {
+        const Clock::time_point t0 = Clock::now();
+        if (!strata::gpu::copy(d, h, kBytes)) break;
+        if (i > 0) ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    }
+    strata::gpu::free(d);
+    strata::gpu::free(h);
+    if (ms.empty()) return -1.0;
+    std::sort(ms.begin(), ms.end());
+    return ms[ms.size() / 2];
 }
 
 // The PCIe share of the missed experts for a link measured at `gbps`: `base` (the share measured on x16 links) from
@@ -2325,6 +2354,7 @@ int main(int argc, char** argv) {
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
         else if (a == "--gpu") (void) next("--gpu");   // applied at startup, before the runtime
         else if (a == "--split-device") o.split_device = next("--split-device");
+        else if (a == "--split-order") o.split_order_given = std::strcmp(next("--split-order"), "as-given") == 0;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
@@ -3017,6 +3047,10 @@ int main(int argc, char** argv) {
             return 1;
         }
         auto dev_of_stage = [&](int i) { return i == 0 ? 0 : split_devs[(size_t) i - 1]; };
+        // the measurements below are per GPU (i: CUDA0, then --split-device's order); `ord` says which GPU runs each
+        // stage of the placement being priced (the order search below)
+        std::vector<int> ord((size_t) ns);
+        std::iota(ord.begin(), ord.end(), 0);
         // the weights a range holds: the canonical arena's and the native projections'
         uint64_t canon_all = 0;
         if (!strata::core::WeightTable::pool_bytes(o.pack, canon_all, err, skip.empty() ? nullptr : &skip)) {
@@ -3097,7 +3131,8 @@ int main(int argc, char** argv) {
             const int64_t reserve = (base_reserve + (i > 0 ? 1024 : kPipeSnapMib) + kPipeWindowMib) << 20;
             const int64_t sess = (int64_t) strata::core::session_bytes(ga, o.max_context, Ka, lo, hi) *
                                  (1 + std::max(o.batch, 0));
-            return free0[(size_t) i] - reserve - (int64_t) weights_of(lo, hi) - sess - prompt[(size_t) i] -
+            return free0[(size_t) ord[(size_t) i]] - reserve - (int64_t) weights_of(lo, hi) - sess -
+                   prompt[(size_t) ord[(size_t) i]] -
                    (last ? (int64_t) head_bytes : 0);
         };
         // what a stage needs at least for its prompt path: its own buffers are in prompt[] already; a stage that
@@ -3166,13 +3201,17 @@ int main(int argc, char** argv) {
         // reference of pcie_frac_for_gbps) over the probed link, never below 1, so a machine whose links all read
         // 20 GB/s or more keeps the formula as it was (upstream: 2x 4090 D, CUDA1 on a x1 link at 1.6 GB/s, K=22 ->
         // 38, prompts ~350 -> ~1410 tok/s).
-        std::vector<double> link_scale((size_t) ns, 1.0);
+        std::vector<double> link_scale((size_t) ns, 1.0), link_gbps((size_t) ns, -1.0);
+        std::vector<double> copy_ms((size_t) ns, -1.0);
         for (int i = 0; i < ns; ++i) {
             const strata::core::OnDevice on(dev_of_stage(i));
             const double lbw = native_pack ? probe_pcie_h2d_gbps() : -1.0;
             if (lbw > 0.0) link_scale[(size_t) i] = std::clamp(20.0 / lbw, 1.0, 64.0);
-            std::fprintf(stderr, "strata generate: layer split auto: CUDA%d link %.1f GB/s -> miss cost x%.2f\n",
-                         dev_of_stage(i), lbw, link_scale[(size_t) i]);
+            link_gbps[(size_t) i] = lbw;
+            copy_ms[(size_t) i] = probe_copy_latency_ms();
+            std::fprintf(stderr, "strata generate: layer split auto: CUDA%d link %.1f GB/s (a 64 KiB copy %.3f ms) -> "
+                                 "miss cost x%.2f\n",
+                         dev_of_stage(i), lbw, copy_ms[(size_t) i], link_scale[(size_t) i]);
         }
         const double rows = std::getenv("STRATA_SPLIT_ROWS") ? std::strtod(std::getenv("STRATA_SPLIT_ROWS"), nullptr) : 3.0;
         const double dense_layer = (double) (canon_all + nat_all) / (double) L;
@@ -3187,7 +3226,15 @@ int main(int argc, char** argv) {
         auto cost = [&](int64_t l) -> int64_t {
             return native_pack ? ((int64_t) lay.blob_bytes(l) + 255) / 256 * 256 : (int64_t) lay.max_blob;
         };
-        const double hop_ms = 0.1;   // a hand-off between two GPUs (5 tokens: ~60 us measured, B70 -> RTX 4070)
+        // a hand-off between two stages: a window's rows of the hand-off copied to the host by one GPU and from it by
+        // the next, each side its probed link and one small copy's time (5 tokens B70 -> RTX 4070 measured ~60 us
+        // in all; 0.05 ms a side where a probe could not run)
+        const double hand_bytes = rows * (double) strata::core::Verifier::handoff_floats(ga) * sizeof(float);
+        auto side_ms = [&](int d) -> double {
+            return link_gbps[(size_t) d] > 0.0 && copy_ms[(size_t) d] >= 0.0
+                       ? copy_ms[(size_t) d] + hand_bytes / (link_gbps[(size_t) d] * 1e6) : 0.05;
+        };
+        const bool drafts = !o.mtp.empty();
         // the predicted window time (ms) of a placement (`at`: the split points; empty: CUDA0 alone)
         std::vector<int64_t> cap((size_t) ns), used((size_t) ns);
         bool startable = true;   // predict's: every stage can start its prompt path
@@ -3214,18 +3261,23 @@ int main(int argc, char** argv) {
                 layer_held[(size_t) l] += mass[r];
                 ++held;
             }
-            double ms = hop_ms * (double) (nst - 1), all = 0, kept = 0;
+            double ms = 0, all = 0, kept = 0;
+            for (int i = 1; i < nst; ++i) ms += side_ms(ord[(size_t) i - 1]) + side_ms(ord[(size_t) i]);
             for (int64_t l = 0; l < L; ++l) {
                 int st = 0;
                 while (st + 1 < nst && l >= at[(size_t) st]) ++st;
+                const int d = ord[(size_t) st];
                 const double hit = layer_mass[(size_t) l] > 0 ? layer_held[(size_t) l] / layer_mass[(size_t) l] : 1.0;
                 const double experts = (double) Ka * rows * (double) lay.blob_bytes(l);
-                ms += dense_layer / bw[(size_t) st] +
-                      std::max(experts * hit / bw[(size_t) st],
-                               experts * (1.0 - hit) / cpu_bw * link_scale[(size_t) st]);
+                ms += dense_layer / bw[(size_t) d] +
+                      std::max(experts * hit / bw[(size_t) d], experts * (1.0 - hit) / cpu_bw * link_scale[(size_t) d]);
                 all += layer_mass[(size_t) l];
                 kept += layer_held[(size_t) l];
             }
+            // the last stage's own work: the head once a window and, with --mtp, the draft layer for each draft
+            // (taken as one layer's dense weights: its experts are left out)
+            const int last = ord[(size_t) nst - 1];
+            ms += ((double) head_bytes + (drafts ? (rows - 1.0) * dense_layer : 0.0)) / bw[(size_t) last];
             held_mass = all > 0 ? kept / all : 1.0;
             return ms;
         };
@@ -3281,6 +3333,76 @@ int main(int argc, char** argv) {
             consider();
         }
         };
+        // which GPU runs which stage (upstream be8db787, efe3bfcf, 184012ca: the faster card last, as the last stage
+        // runs the head and the draft layer).  Chosen with the split points, from the same prediction: every order of
+        // the later GPUs up to four GPUs, beyond that the later ones by bandwidth, the fastest last.  The given order
+        // stays unless another is predicted 2% faster (upstream keeps cards within 5% of speed in the config's order);
+        // --split-order as-given keeps it always.  A placement that starves a stage cannot start its prompt path and
+        // is not taken (what efe3bfcf guards against).  CUDA0 stays the first stage, as the engine's GPU is chosen at
+        // its start: an order with another GPU first is only predicted, and said when it is faster.
+        auto run_order = [&](const std::vector<int>& order) -> double {
+            ord = order;
+            best.clear();
+            best_ms = 1e30; best_mass = 0; best_held = 0; best_room = 0;
+            search();
+            return best.empty() ? 1e30 : best_ms;
+        };
+        auto order_text = [&](const std::vector<int>& order) {
+            std::string str;
+            for (const int d : order) str += (str.empty() ? "CUDA" : ", CUDA") + std::to_string(dev_of_stage(d));
+            return str;
+        };
+        std::vector<int> given(ord), pick(ord);
+        auto by_bw = [&](int x, int y) { return bw[(size_t) x] < bw[(size_t) y]; };   // the slower GPU first
+        if (!o.split_order_given && ns > 1) {
+            const double given_ms = run_order(given);
+            double pick_ms = given_ms;
+            std::vector<int> rest(given.begin() + 1, given.end());
+            std::vector<std::vector<int>> orders;
+            if (ns <= 4) {
+                std::sort(rest.begin(), rest.end());
+                do {
+                    std::vector<int> c{0};
+                    c.insert(c.end(), rest.begin(), rest.end());
+                    if (c != given) orders.push_back(c);
+                } while (std::next_permutation(rest.begin(), rest.end()));
+            } else {
+                std::stable_sort(rest.begin(), rest.end(), by_bw);
+                std::vector<int> c{0};
+                c.insert(c.end(), rest.begin(), rest.end());
+                if (c != given) orders.push_back(c);
+            }
+            for (const auto& c : orders)
+                if (const double m = run_order(c); m < pick_ms) { pick_ms = m; pick = c; }
+            if (pick_ms >= given_ms * 0.98) pick = given;
+            else
+                std::fprintf(stderr, "strata generate: layer split auto: stage order %s (%.1f ms per decode window, "
+                                     "%.1f in the given order %s; --split-order as-given keeps that)\n",
+                             order_text(pick).c_str(), pick_ms, given_ms, order_text(given).c_str());
+            // another GPU first: predicted only (up to four GPUs), the later ones by bandwidth
+            if (ns <= 4) {
+                std::vector<int> first_best;
+                double first_ms = pick == given ? given_ms : pick_ms;
+                for (int f = 1; f < ns; ++f) {
+                    std::vector<int> c{f};
+                    for (int d = 0; d < ns; ++d)
+                        if (d != f) c.push_back(d);
+                    std::stable_sort(c.begin() + 1, c.end(), by_bw);
+                    if (const double m = run_order(c); m < first_ms * 0.98) { first_ms = m; first_best = c; }
+                }
+                if (!first_best.empty()) {
+                    std::string pcis;
+                    for (const int d : first_best)
+                        pcis += (pcis.empty() ? "" : ",") + strata::core::device_info(dev_of_stage(d)).pci;
+                    std::fprintf(stderr, "strata generate: layer split auto: with %s first the window is predicted at "
+                                         "%.1f ms: setup --gpus in that order (the cards %s) would be faster\n",
+                                 order_text(first_best).c_str(), first_ms, pcis.c_str());
+                }
+            }
+        }
+        ord = pick;
+        best.clear();
+        best_ms = 1e30; best_mass = 0; best_held = 0; best_room = 0;
         search();
         // a stage with one or two layers holds a handful of expert slots, and every card's prompt chunk is clamped to
         // what the smallest cache can lend (upstream 1c6c82ef, #1616: a 12 GB 3060 with one layer held 512 slots,
@@ -3329,6 +3451,11 @@ int main(int argc, char** argv) {
                          own_prompt ? ", its own buffers counted in" : " lent from its cache");
         }
         split_at = best;
+        if (ord != given) {   // the later GPUs in the order chosen above
+            std::vector<int> devs;
+            for (int i = 1; i < ns; ++i) devs.push_back(dev_of_stage(ord[(size_t) i]));
+            split_devs = devs;
+        }
         split_auto = false;   // from here on, as an explicit --layer-split
         std::string ks;
         for (const int64_t k : split_at) ks += (ks.empty() ? "" : ",") + std::to_string(k);

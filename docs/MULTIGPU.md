@@ -34,6 +34,7 @@ The engine's own options:
 | `--layer-split auto` | The split points are chosen from what this PC measures ([below](#choosing-the-split-points)). With one GPU visible there is no split. |
 | `--layer-split K[,K2..]` | The next GPU takes over at layer K (K from 2, rising). One GPU per split point. K is the **first layer** of each later GPU, not a count of layers per card (`24,36,42` for 4 GPUs). The config's `"layer_split"` may be a string or a JSON list (`[24, 36, 42]`); the server checks it before the start and says the format when it is wrong (upstream #644). |
 | `--split-device D[,D2..]` | The GPU for each split point, by engine number (from 1, see [GPU numbers](#gpu-numbers)) or PCI address. Without it, the GPUs that are not the processor's own graphics, in their order. |
+| `--split-order auto` / `as-given` | `auto` (the default): `--layer-split auto` also chooses which of the later GPUs runs which stage. `as-given` keeps the order of `--split-device` (`"gpu_order": "as_given"` in the config). |
 | `--batch-groups G` / `auto` | With `--batch N`: the slots in G groups, each GPU on another group at once ([below](#decoding-several-conversations)). |
 | `--batch-cpu-split N0,N1` | Experimental, off by default ([below](#the-cpu-experts-per-stage-experimental)). |
 
@@ -75,6 +76,11 @@ The log shows the choice (`layer split auto: K=...`); from there on it runs as i
   A GPU with few layers has a small cache, and the prefill chunk shrinks to it.
 - On GPUs of different speed or link, when another placement whose split points lie three or more layers away is predicted within 4%, the log names it (`NEAR TIE`, upstream 8bb250d8).
   The prediction prices decode, not prefill, so it is worth a try; the choice stays.
+- Which of the later GPUs runs which stage is chosen from the same prediction (what upstream's "the faster card last", be8db787 and others, does).
+  The last stage also runs the head and the draft layer, and the prediction counts their time.
+  Up to four GPUs every order is tried, from five on the order by bandwidth (the fastest last); the config's order changes only for one predicted 2% faster or more.
+  The first GPU is set when the engine starts and is not swapped, but when another first GPU is predicted faster, the log names the cards' order to set.
+- A hand-off between stages is priced from each GPU's link speed and the time of a small copy.
 
 Environment variables change the model's assumptions:
 
