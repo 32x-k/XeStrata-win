@@ -86,8 +86,13 @@ strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
     return s;
 }
 
+#if defined(_WIN32)
+#define STRATA_FILE_SEEK64(f, o, w) _fseeki64((f), (__int64) (o), (w))
+#define STRATA_FILE_TELL64(f) _ftelli64(f)
+#else
 #define STRATA_FILE_SEEK64(f, o, w) fseeko((f), (off_t) (o), (w))
 #define STRATA_FILE_TELL64(f) ftello(f)
+#endif
 
 bool read_file(const std::string& path, std::vector<uint8_t>& out) {
     // Read the dense blob in large chunks through fread.

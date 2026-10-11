@@ -6,19 +6,24 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 
+#if !defined(STRATA_ADAPTIVECPP)
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <sycl/ext/oneapi/experimental/profiling_tag.hpp>
 #include <sycl/ext/oneapi/virtual_mem/physical_mem.hpp>
 #include <sycl/ext/oneapi/virtual_mem/virtual_mem.hpp>
+#endif
 
 #include <algorithm>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 namespace strata::gpu {
 
+#if !defined(STRATA_ADAPTIVECPP)
 namespace sx = sycl::ext::oneapi::experimental;
+#endif
 
 struct Event {
     std::optional<sycl::event> ev;
@@ -26,12 +31,16 @@ struct Event {
 };
 
 struct Graph {
+#if !defined(STRATA_ADAPTIVECPP)
     sx::command_graph<sx::graph_state::executable> exec;
-    size_t nodes;
+#endif
+    size_t nodes = 0;
 };
 
 struct VmemSegment {
+#if !defined(STRATA_ADAPTIVECPP)
     sx::physical_mem mem;
+#endif
 };
 
 namespace {
@@ -51,12 +60,15 @@ std::string refusal_state() {
         held = g_live_bytes;
         n = g_live.size();
     }
-    std::string free_mib = "unknown (set ZES_ENABLE_SYSMAN=1)";
+    std::string free_mib = "unknown";
+#if !defined(STRATA_ADAPTIVECPP)
+    free_mib += " (set ZES_ENABLE_SYSMAN=1)";
     try {
         const auto& d = strata::core::Runtime::get().device();
         if (d.has(sycl::aspect::ext_intel_free_memory))
             free_mib = std::to_string(d.get_info<sycl::ext::intel::info::device::free_memory>() >> 20) + " MiB";
     } catch (const std::exception& e) { free_mib = std::string("unreadable: ") + e.what(); }
+#endif
     return "; device free " + free_mib + ", this process holds " + std::to_string(held >> 20) + " MiB in " +
            std::to_string(n) + " blocks";
 }
@@ -71,6 +83,13 @@ core::Runtime& rt() { return core::Runtime::get(); }
 // A single memset of more than 4 GiB never completes on the B70; the same bytes in 1 GiB pieces do, and a 5 GiB memcpy
 // and kernels addressing past 4 GiB work normally (bench/results/2026-09-30-xe-large-alloc).
 constexpr size_t kPiece = size_t(1) << 30;
+sycl::event marker(sycl::queue& queue, const std::vector<sycl::event>& dependencies = {}) {
+    return queue.submit([&](sycl::handler& h) {
+        if (!dependencies.empty()) h.depends_on(dependencies);
+        h.single_task([] {});
+    });
+}
+
 sycl::event memset_pieces(sycl::queue& queue, void* dst, int value, size_t bytes) {
     sycl::event e;
     for (size_t o = 0; o < bytes; o += kPiece) e = queue.memset((uint8_t*) dst + o, value, std::min(kPiece, bytes - o));
@@ -91,8 +110,10 @@ core::Runtime& rt_of(Stream s) {
 }
 
 // the recordings in progress, by queue
+#if !defined(STRATA_ADAPTIVECPP)
 std::mutex g_capture_mutex;
 std::map<const sycl::queue*, sx::command_graph<sx::graph_state::modifiable>> g_captures;
+#endif
 
 }  // namespace
 
@@ -114,8 +135,14 @@ bool stream_sync(Stream s) {
 }
 
 bool stream_idle(Stream s) {
-    try { return q(s).ext_oneapi_empty(); }
-    catch (const std::exception& e) { return fail("stream_idle", e); }
+    try {
+#if defined(STRATA_ADAPTIVECPP)
+        return marker(q(s)).get_info<sycl::info::event::command_execution_status>() ==
+               sycl::info::event_command_status::complete;
+#else
+        return q(s).ext_oneapi_empty();
+#endif
+    } catch (const std::exception& e) { return fail("stream_idle", e); }
 }
 
 bool device_sync() {
@@ -159,26 +186,52 @@ void free(const void* p) {
 }
 
 bool vmem_supported() {
+#if defined(STRATA_ADAPTIVECPP)
+    return false;
+#else
     try { return rt().device().has(sycl::aspect::ext_oneapi_virtual_mem); }
     catch (const std::exception& e) { return fail("vmem_supported", e); }
+#endif
 }
 
 size_t vmem_granularity() {
+#if defined(STRATA_ADAPTIVECPP)
+    g_error = "vmem_granularity: virtual memory is unavailable with AdaptiveCpp";
+    return 0;
+#else
     try { return sx::get_mem_granularity(rt().device(), rt().context(), sx::granularity_mode::recommended); }
     catch (const std::exception& e) { fail("vmem_granularity", e); return 0; }
+#endif
 }
 
 void* vmem_reserve(size_t bytes) {
+#if defined(STRATA_ADAPTIVECPP)
+    (void) bytes;
+    g_error = "vmem_reserve: virtual memory is unavailable with AdaptiveCpp";
+    return nullptr;
+#else
     try { return reinterpret_cast<void*>(sx::reserve_virtual_mem(bytes, rt().context())); }
     catch (const std::exception& e) { fail("vmem_reserve", e); return nullptr; }
+#endif
 }
 
 void vmem_free(void* va, size_t bytes) {
+#if defined(STRATA_ADAPTIVECPP)
+    (void) va;
+    (void) bytes;
+#else
     try { sx::free_virtual_mem(reinterpret_cast<uintptr_t>(va), bytes, rt().context()); }
     catch (const std::exception& e) { fail("vmem_free", e); }
+#endif
 }
 
 VmemSegment* vmem_map(void* va, size_t bytes) {
+#if defined(STRATA_ADAPTIVECPP)
+    (void) va;
+    (void) bytes;
+    g_error = "vmem_map: virtual memory is unavailable with AdaptiveCpp";
+    return nullptr;
+#else
     try {
         auto* seg = new VmemSegment{sx::physical_mem(rt().device(), rt().context(), bytes)};
         try {
@@ -189,31 +242,58 @@ VmemSegment* vmem_map(void* va, size_t bytes) {
         }
         return seg;
     } catch (const std::exception& e) { fail("vmem_map", e); return nullptr; }
+#endif
 }
 
 void vmem_unmap(void* va, size_t bytes, VmemSegment* seg) {
+#if defined(STRATA_ADAPTIVECPP)
+    (void) va;
+    (void) bytes;
+#else
     try { sx::unmap(va, bytes, rt().context()); }
     catch (const std::exception& e) { fail("vmem_unmap", e); }
+#endif
     delete seg;
 }
 
 VmemSegment* vmem_new(size_t bytes) {
+#if defined(STRATA_ADAPTIVECPP)
+    (void) bytes;
+    g_error = "vmem_new: virtual memory is unavailable with AdaptiveCpp";
+    return nullptr;
+#else
     try { return new VmemSegment{sx::physical_mem(rt().device(), rt().context(), bytes)}; }
     catch (const std::exception& e) { fail("vmem_new", e); return nullptr; }
+#endif
 }
 
 bool vmem_attach(VmemSegment* seg, void* va, size_t bytes) {
+#if defined(STRATA_ADAPTIVECPP)
+    (void) seg;
+    (void) va;
+    (void) bytes;
+    g_error = "vmem_attach: virtual memory is unavailable with AdaptiveCpp";
+    return false;
+#else
     try {
         seg->mem.map(reinterpret_cast<uintptr_t>(va), bytes, sx::address_access_mode::read_write);
         return true;
     } catch (const std::exception& e) { return fail("vmem_attach", e); }
+#endif
 }
 
 bool vmem_detach(void* va, size_t bytes) {
+#if defined(STRATA_ADAPTIVECPP)
+    (void) va;
+    (void) bytes;
+    g_error = "vmem_detach: virtual memory is unavailable with AdaptiveCpp";
+    return false;
+#else
     try {
         sx::unmap(va, bytes, rt().context());
         return true;
     } catch (const std::exception& e) { return fail("vmem_detach", e); }
+#endif
 }
 
 void vmem_delete(VmemSegment* seg) { delete seg; }
@@ -288,6 +368,12 @@ bool memset_async(void* dst, int value, size_t bytes, Stream s) {
 bool mem_info(size_t* free_bytes, size_t* total_bytes) {
     try {
         const auto& d = rt().device();
+#if defined(STRATA_ADAPTIVECPP)
+        (void) free_bytes;
+        (void) total_bytes;
+        g_error = "mem_info: AdaptiveCpp does not report currently free device memory";
+        return false;
+#else
         if (!d.has(sycl::aspect::ext_intel_free_memory)) {
             g_error = "mem_info: the device does not report free memory (set ZES_ENABLE_SYSMAN=1)";
             return false;
@@ -299,6 +385,7 @@ bool mem_info(size_t* free_bytes, size_t* total_bytes) {
         if (free_bytes) *free_bytes = (size_t) free;
         if (total_bytes) *total_bytes = (size_t) total;
         return true;
+#endif
     } catch (const std::exception& e) { return fail("mem_info", e); }
 }
 
@@ -312,18 +399,33 @@ bool device_speed(int device, int* units, int* khz) {
 }
 
 bool host_register(void* p, size_t bytes) {
+#if defined(STRATA_ADAPTIVECPP)
+    (void) p;
+    (void) bytes;
+    g_error = "host_register: arbitrary host registration is unavailable with AdaptiveCpp";
+    return false;
+#else
     try { sx::prepare_for_device_copy(p, bytes, rt().context()); return true; }
     catch (const std::exception& e) { return fail("host_register", e); }
+#endif
 }
 
 void host_unregister(void* p) {
+#if defined(STRATA_ADAPTIVECPP)
+    (void) p;
+#else
     try { sx::release_from_device_copy(p, rt().context()); }
     catch (const std::exception& e) { fail("host_unregister", e); }
+#endif
 }
 
 bool launch_host(Stream s, std::function<void()> fn) {
     try {
+#if defined(STRATA_ADAPTIVECPP)
+        q(s).AdaptiveCpp_enqueue_custom_operation([fn = std::move(fn)](auto&) { fn(); });
+#else
         q(s).submit([&](sycl::handler& h) { h.host_task([fn = std::move(fn)] { fn(); }); });
+#endif
         return true;
     } catch (const std::exception& e) { return fail("launch_host", e); }
 }
@@ -340,8 +442,12 @@ bool event_record(Event* e, Stream s) {
     // an event without timing is a barrier where the runtime measured timestamps to slow the waits (measure_marks)
     try {
         auto& queue = q(s);
+#if defined(STRATA_ADAPTIVECPP)
+        e->ev = marker(queue);
+#else
         e->ev = e->timing || !rt_of(s).marks_by_barrier() ? sx::submit_profiling_tag(queue)
                                                           : queue.ext_oneapi_submit_barrier();
+#endif
         return true;
     }
     catch (const std::exception& ex) { return fail("event_record", ex); }
@@ -363,8 +469,14 @@ bool event_sync(const Event* e) {
 
 bool stream_wait_event(Stream s, const Event* e) {
     if (!e->ev) return true;
-    try { q(s).ext_oneapi_submit_barrier({*e->ev}); return true; }
-    catch (const std::exception& ex) { return fail("stream_wait_event", ex); }
+    try {
+#if defined(STRATA_ADAPTIVECPP)
+        (void) marker(q(s), {*e->ev});
+#else
+        q(s).ext_oneapi_submit_barrier({*e->ev});
+#endif
+        return true;
+    } catch (const std::exception& ex) { return fail("stream_wait_event", ex); }
 }
 
 bool event_elapsed_ms(float* ms, const Event* from, const Event* to) {
@@ -379,6 +491,11 @@ bool event_elapsed_ms(float* ms, const Event* from, const Event* to) {
 }
 
 bool begin_capture(Stream s) {
+#if defined(STRATA_ADAPTIVECPP)
+    (void) s;
+    g_error = "begin_capture: command graphs are unavailable with AdaptiveCpp";
+    return false;
+#else
     try {
         auto& queue = q(s);
         std::lock_guard<std::mutex> lock(g_capture_mutex);
@@ -388,10 +505,16 @@ bool begin_capture(Stream s) {
         it->second.begin_recording(queue);
         return true;
     } catch (const std::exception& e) { return fail("begin_capture", e); }
+#endif
 }
 
 bool end_capture(Stream s, Graph** out) {
     *out = nullptr;
+#if defined(STRATA_ADAPTIVECPP)
+    (void) s;
+    g_error = "end_capture: command graphs are unavailable with AdaptiveCpp";
+    return false;
+#else
     try {
         auto& queue = q(s);
         std::lock_guard<std::mutex> lock(g_capture_mutex);
@@ -405,9 +528,13 @@ bool end_capture(Stream s, Graph** out) {
         *out = new Graph{graph.finalize(), nodes};
         return true;
     } catch (const std::exception& e) { return fail("end_capture", e); }
+#endif
 }
 
 void abandon_capture(Stream s) {
+#if defined(STRATA_ADAPTIVECPP)
+    (void) s;
+#else
     try {
         auto& queue = q(s);
         std::lock_guard<std::mutex> lock(g_capture_mutex);
@@ -423,12 +550,14 @@ void abandon_capture(Stream s) {
             }
         }
     } catch (const std::exception& e) { fail("abandon_capture", e); }
+#endif
 }
 
 bool stream_fork(Stream from, Stream to) {
     try {
         auto& a = q(from);
         auto& b = q(to);
+#if !defined(STRATA_ADAPTIVECPP)
         {
             std::lock_guard<std::mutex> lock(g_capture_mutex);
             auto it = g_captures.find(&a);
@@ -441,6 +570,10 @@ bool stream_fork(Stream from, Stream to) {
         }
         const sycl::event e = a.ext_oneapi_submit_barrier();
         b.ext_oneapi_submit_barrier({e});
+#else
+        const sycl::event e = marker(a);
+        (void) marker(b, {e});
+#endif
         return true;
     } catch (const std::exception& e) { return fail("stream_fork", e); }
 }
@@ -449,6 +582,7 @@ bool stream_join(Stream into, Stream from) {
     try {
         auto& a = q(into);
         auto& b = q(from);
+#if !defined(STRATA_ADAPTIVECPP)
         const sycl::event e = b.ext_oneapi_submit_barrier();
         a.ext_oneapi_submit_barrier({e});
         std::lock_guard<std::mutex> lock(g_capture_mutex);
@@ -457,22 +591,37 @@ bool stream_join(Stream into, Stream from) {
             it->second.end_recording(b);
             g_captures.erase(it);
         }
+#else
+        const sycl::event e = marker(b);
+        (void) marker(a, {e});
+#endif
         return true;
     } catch (const std::exception& e) { return fail("stream_join", e); }
 }
 
 bool is_capturing(Stream s) {
+#if defined(STRATA_ADAPTIVECPP)
+    (void) s;
+    return false;
+#else
     try {
         auto& queue = q(s);
         std::lock_guard<std::mutex> lock(g_capture_mutex);
         return g_captures.count(&queue) != 0;
     } catch (const std::exception& e) { return fail("is_capturing", e); }
+#endif
 }
 
 bool graph_launch(const Graph* g, Stream s) {
     if (!g) { g_error = "graph_launch: null graph"; return false; }
+#if defined(STRATA_ADAPTIVECPP)
+    (void) s;
+    g_error = "graph_launch: command graphs are unavailable with AdaptiveCpp";
+    return false;
+#else
     try { q(s).ext_oneapi_graph(g->exec); return true; }
     catch (const std::exception& e) { return fail("graph_launch", e); }
+#endif
 }
 
 size_t graph_nodes(const Graph* g) { return g ? g->nodes : 0; }

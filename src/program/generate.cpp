@@ -69,8 +69,16 @@
 #include "strata/core/progress.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include <fcntl.h>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <io.h>
+#else
 #include <unistd.h>
 #include <sys/resource.h>
+#endif
 #include <filesystem>
 #include <cerrno>
 
@@ -85,8 +93,10 @@
 #include <functional>
 #include <future>
 #include <thread>
+#if !defined(_WIN32)
 #include <pthread.h>
 #include <sched.h>
+#endif
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -1324,7 +1334,11 @@ double pcie_frac_for_gbps(double gbps, double base) {
 // `bytes`: the best of three passes, in GB/s.
 double bench_ram_read_gbps(const std::vector<int>& cores, size_t bytes) {
     const size_t n = cores.size(), words = bytes / 8 / n * n;
+#if defined(_WIN32)
+    auto* buf = static_cast<uint64_t*>(::_aligned_malloc((words * 8 + 4095) / 4096 * 4096, 4096));
+#else
     auto* buf = static_cast<uint64_t*>(std::aligned_alloc(4096, (words * 8 + 4095) / 4096 * 4096));
+#endif
     if (buf == nullptr || n == 0) return -1.0;
     std::memset(buf, 1, words * 8);   // fault the pages in before timing
     std::atomic<uint64_t> sink{0};
@@ -1352,7 +1366,11 @@ double bench_ram_read_gbps(const std::vector<int>& cores, size_t bytes) {
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         best = std::max(best, (double) (words * 8) / s / 1e9);
     }
+#if defined(_WIN32)
+    ::_aligned_free(buf);
+#else
     std::free(buf);
+#endif
     return best;   // `sink` only keeps the reads from being optimized away
 }
 
@@ -1361,7 +1379,11 @@ double bench_ram_read_gbps(const std::vector<int>& cores, size_t bytes) {
 double bench_copy_gbps(bool to_device, bool pinned) {
     constexpr size_t kBytes = 256ull << 20;
     constexpr int kBursts = 4;
+#if defined(_WIN32)
+    void* h = pinned ? strata::gpu::alloc_host(kBytes) : ::_aligned_malloc(kBytes, 4096);
+#else
     void* h = pinned ? strata::gpu::alloc_host(kBytes) : std::aligned_alloc(4096, kBytes);
+#endif
     void* d = strata::gpu::alloc_device(kBytes);
     double bw = -1.0;
     if (h != nullptr && d != nullptr) {
@@ -1385,13 +1407,23 @@ double bench_copy_gbps(bool to_device, bool pinned) {
     }
     strata::gpu::free(d);
     if (pinned) strata::gpu::free(h);
+#if defined(_WIN32)
+    else ::_aligned_free(h);
+#else
     else std::free(h);
+#endif
     return bw;
 }
 
 // The SSD under the model: `path` read with O_DIRECT (past the page cache) in 8 MiB blocks by four threads, up to
 // 4 GiB of it, in GB/s.
 double bench_ssd_read_gbps(const std::string& path, double* gib_read) {
+#if defined(_WIN32)
+    // The initial Windows port does not yet have a synchronous wrapper for the overlapped DirectFile benchmark.
+    (void) path;
+    *gib_read = 0.0;
+    return -1.0;
+#else
     constexpr size_t kBlock = 8ull << 20;
     constexpr int kThreads = 4;
     const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
@@ -1415,6 +1447,7 @@ double bench_ssd_read_gbps(const std::string& path, double* gib_read) {
     ::close(fd);
     *gib_read = (double) (done.load() * kBlock) / (1ull << 30);
     return done.load() > 0 ? (double) (done.load() * kBlock) / s / 1e9 : -1.0;
+#endif
 }
 
 // `strata --hw-bench [--native GGUF | --pack DIR]`: the RAM with the expert pool's threads (every physical core, as
@@ -1422,7 +1455,13 @@ double bench_ssd_read_gbps(const std::string& path, double* gib_read) {
 // native GGUF, else the pack's largest file).
 int hw_bench(const std::string& pack, const std::string& native) {
     const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
+#if defined(_WIN32)
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof memory;
+    const size_t ram = GlobalMemoryStatusEx(&memory) ? (size_t) memory.ullTotalPhys : (size_t) (8ull << 30);
+#else
     const size_t ram = (size_t) ::sysconf(_SC_PHYS_PAGES) * (size_t) ::sysconf(_SC_PAGESIZE);
+#endif
     const size_t bytes = std::min<size_t>(4ull << 30, ram / 8);
     std::printf("HW ram_threads %zu\n", cores.size());
     std::printf("HW ram_read_gb_s %.2f\n", bench_ram_read_gbps(cores, bytes));
@@ -1742,12 +1781,8 @@ double memory_read_rate(const std::vector<const uint8_t*>& blobs, size_t bytes, 
     pool.reserve((size_t) threads);
     for (int w = 0; w < threads; ++w)
         pool.emplace_back([&, w] {
-            if (!cores.empty()) {
-                cpu_set_t one;
-                CPU_ZERO(&one);
-                CPU_SET(cores[(size_t) w % cores.size()], &one);
-                pthread_setaffinity_np(pthread_self(), sizeof one, &one);
-            }
+            if (!cores.empty())
+                strata::kernels::cpu::pin_current_thread(cores[(size_t) w % cores.size()]);
             uint64_t x = 0, counted = 0;
             for (size_t i = (size_t) w; phase.load(std::memory_order_relaxed) < 2; i += (size_t) threads) {
                 const bool counting = phase.load(std::memory_order_relaxed) == 1;
@@ -1835,7 +1870,7 @@ void setup_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, const O
 }
 }  // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
@@ -1844,13 +1879,24 @@ int main(int argc, char** argv) {
     // default lazy loading, a kernel first used mid-prompt (MMQ for IQ3_XXS at 64K+ on a 12 GB card) found no VRAM
     // left for its code and the engine ended ("out of memory: cudaFuncSetAttribute").  Costs ~30 MB of VRAM.
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) {
+#if defined(_WIN32)
+        ::_putenv_s("CUDA_MODULE_LOADING", "EAGER");
+#else
         setenv("CUDA_MODULE_LOADING", "EAGER", 0);
+#endif
     }
     // --gpu ADDR: the GPU by PCI address from the command line instead of the caller's environment (upstream #852).
     // The runtime reads STRATA_GPU_PCI when it starts, so this has to happen before anything else; the option loop
     // below consumes the value again.
     for (int i = 1; i + 1 < argc; ++i)
-        if (std::string(argv[i]) == "--gpu") { setenv("STRATA_GPU_PCI", argv[i + 1], 1); break; }
+        if (std::string(argv[i]) == "--gpu") {
+#if defined(_WIN32)
+            ::_putenv_s("STRATA_GPU_PCI", argv[i + 1]);
+#else
+            setenv("STRATA_GPU_PCI", argv[i + 1], 1);
+#endif
+            break;
+        }
     for (int i = 1; i < argc; ++i) {   // setup's --bench: the machine and the kernels alone, no model loaded
         const std::string a = argv[i];
         if (a != "--hw-bench" && a != "--kernel-bench") continue;
@@ -2154,6 +2200,13 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+#if defined(STRATA_ADAPTIVECPP)
+    // Command graphs are unavailable: keep input, PLE, layers and head on one in-order queue.
+    o.no_capture = true;
+    o.no_token_graph = true;
+    o.stream_token = true;
+    o.check_logits = true;
+#endif
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
     // the next discrete ones); "auto" chooses the K before anything is loaded (below).  The helper caches
     // (--expert-cache-remote) are not carried by the Xe engine at all (remote_experts.cpp).
@@ -4431,25 +4484,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    // **`--no-capture` AND THE EXPERTS ARE MUTUALLY EXCLUSIVE, AND SILENTLY SO.**
-    //
-    // The CPU expert pool is wired into `session_loop` - the host loop around the captured graphs - and
-    // `session_token` has no pool hook at all.  So `--no-capture` did not merely change HOW the layers were
-    // launched: it ran the whole model with `parts` left at whatever the buffer held, which is ZERO, and the
-    // only symptom was `expert blobs 0` in a stats line nobody had to read.  A run that silently omits the
-    // routed experts is not a slow measurement of this model, it is a measurement of a different model.
-    //
-    // Refusing is the fix.  `--no-pool` is the explicit way to say "I want the GPU-only floor".
-    if (o.no_capture && !o.no_pool) {
-        std::fprintf(stderr,
-                     "strata generate: --no-capture runs `session_token`, which has NO CPU expert pool hook, so "
-                     "the routed experts would silently contribute nothing. Pass --no-pool as well if the "
-                     "GPU-only floor is what you want.\n");
-        return 2;
-    }
-    // The ladder is written by `session_loop`, and `session_token` does not touch the staging buffer at all - so
-    // accepting the flag there would produce a file of uninitialised memory, which reads as a wrong answer rather
-    // than as a mistake.  `--no-capture` without `--no-pool` is already refused above, so this catches the pair.
+    // The direct path with a pool uses session_token_pool: each layer's routing is downloaded, computed
+    // and combined before the next layer. session_token remains the explicit --no-pool ablation.
+    // Neither direct path fills the per-layer dump staging, so refuse that diagnostic here.
     if (o.no_capture && !o.dump_layers.empty()) {
         std::fprintf(stderr,
                      "strata generate: --dump-layers is written by `session_loop`; `--no-capture` runs "
@@ -4501,7 +4538,7 @@ int main(int argc, char** argv) {
     // At `pos == 0` that is `session_zero`, which is the reference's own initial condition - the embedding
     // broadcast to all `hc` streams.  After that `session_zero` would also wipe the recurrence, so the
     // broadcast is done directly.  Getting this wrong is invisible for exactly one token.
-    void* token_stream = o.stream_token ? main_cs : nullptr;
+    void* token_stream = o.stream_token || o.no_capture ? main_cs : nullptr;
     auto put_input = [&](int64_t tok, int64_t pos) -> bool {
         if (!strata::core::embed_row(wt, g, tok, d_emb, token_stream, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -6659,7 +6696,11 @@ int main(int argc, char** argv) {
                         buf.erase(0, nlpos + 1);
                         return true;
                     }
+#if defined(_WIN32)
+                    const int n = ::_read(0, chunk, (unsigned int) sizeof chunk);
+#else
                     const ssize_t n = ::read(0, chunk, sizeof chunk);
+#endif
                     if (n < 0 && errno == EINTR) continue;
                     if (n <= 0) {
                         if (buf.empty()) return false;
@@ -9915,9 +9956,13 @@ int main(int argc, char** argv) {
         drive.d.failed = false;
         err.clear();
         if (o.no_capture) {
-            if (!strata::core::session_token(wt, g, pos, /*pos_base=*/0, ss, d_parts, main_cs,
-                                             o.sync_every_layer, err)) {
-                std::fprintf(stderr, "strata generate: session_token: %s\n", err.c_str());
+            const bool ok = pool_fn != nullptr
+                ? strata::core::session_token_pool(wt, g, pos, /*pos_base=*/0, ss, d_parts, pool_fn, hit_fn,
+                                                    pool_user, loop_scratch, main_cs, o.sync_every_layer, err)
+                : strata::core::session_token(wt, g, pos, /*pos_base=*/0, ss, d_parts, main_cs,
+                                               o.sync_every_layer, err);
+            if (!ok) {
+                std::fprintf(stderr, "strata generate: direct session: %s\n", err.c_str());
                 return 1;
             }
         } else {
@@ -10283,7 +10328,11 @@ int main(int argc, char** argv) {
         const double pool_ms0 = drive.cpu_ms;
         // pages read back from disk or swap while decoding: the expert arena is not locked, and two runs whose
         // CPU pool was 6x slower came while tens of GB were being downloaded (bench/results/2026-09-30-xe-swift-iq2xs)
+#if defined(_WIN32)
+        const auto major_faults = [] { return 0LL; };   // Windows hard-fault telemetry is not wired yet.
+#else
         const auto major_faults = [] { rusage u{}; getrusage(RUSAGE_SELF, &u); return (long long) u.ru_majflt; };
+#endif
         const long long majflt0 = major_faults();
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
         // the low-RAM mode's tiers during the decode only (the startup fill and the prompt read files too)
@@ -10712,4 +10761,7 @@ int main(int argc, char** argv) {
     strata::gpu::free(sbuf);
     strata::gpu::free(arena);
     return 0;
+} catch (const std::exception& e) {
+    std::fprintf(stderr, "strata generate: %s\n", e.what());
+    return 1;
 }

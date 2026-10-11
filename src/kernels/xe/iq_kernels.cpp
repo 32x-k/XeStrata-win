@@ -44,7 +44,9 @@
 #define GGML_COMMON_IMPL_SYCL
 #include "ggml-common.h"
 
+#if !defined(STRATA_ADAPTIVECPP)
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -865,7 +867,7 @@ sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsi
                     const int8_t qv = xe::q8_1_quant(xi, d, amax);
                     block_q8_1* y = hq + (size_t) (c0 + warp) * hb + it.get_group(1);
                     y->qs[lane] = qv;
-                    if (lane == 0) y->ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+                    if (lane == 0) y->ds = xe::make_half2(d, xe::q8_1_finite(sum));
                 }
             }
         });
@@ -950,7 +952,7 @@ sycl::event launch_quantize_q8_1(sycl::queue& q, const float* x, block_q8_1* y, 
         const int8_t qv = xe::q8_1_quant(xi, d, amax);
         const long long ib = i / 32, iqs = i % 32;
         y[ib].qs[iqs] = qv;
-        if (iqs == 0) y[ib].ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+        if (iqs == 0) y[ib].ds = xe::make_half2(d, xe::q8_1_finite(sum));
     });
 }
 
@@ -1337,9 +1339,11 @@ sycl::event launch_dequant_flat(sycl::queue& q, int ty, const void* vx, int64_t 
 // memory (FP16, the dequantizers above: the values iq_dequant_f16 writes), and its sub-groups multiply them, each a
 // 32 x 64 tile of Y as 4 x 4 XMX accumulators, A read from X in global memory, B row-major from local memory.
 // The dequantization and the products do not overlap (bench/results/2026-10-02-iq-gemm).
+#if !defined(STRATA_ADAPTIVECPP)
 namespace mx = sycl::ext::oneapi::experimental::matrix;
 namespace ix = sycl::ext::intel::experimental::matrix;
 namespace syclex = sycl::ext::oneapi::experimental;
+#endif
 
 // [[maybe_unused]]: the device compiles for other GPUs leave out the code that uses GT_K (device_target.hpp)
 [[maybe_unused]] constexpr int GT_M = 8, GT_N = 16, GT_K = 16, G_SGM = 4, G_SGN = 4;
@@ -1412,8 +1416,7 @@ struct IqGemmKernel {
             for (int j = 0; j < 8; ++j) {
                 const int k = off[j / 4] + j % 4 - piece;
                 *reinterpret_cast<sycl::vec<sycl::half, 4>*>(&wt[(size_t) k * LDN + (size_t) r4]) =
-                    sycl::vec<sycl::half, 4>(sycl::half(v[0][j]), sycl::half(v[1][j]), sycl::half(v[2][j]),
-                                             sycl::half(v[3][j]));
+                    xe::make_half4(v[0][j], v[1][j], v[2][j], v[3][j]);
             }
         }
     }
@@ -1498,9 +1501,11 @@ struct IqGemmKernel {
             }
 #endif
     }
+#if !defined(STRATA_ADAPTIVECPP)
     auto get(syclex::properties_tag) const {
         return syclex::properties{sycl::ext::intel::experimental::grf_size<256>, syclex::sub_group_size<16>};
     }
+#endif
 };
 
 template<int TYPE>
@@ -1782,7 +1787,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             const int8_t qv = xe::q8_1_quant(xi, d, amax);
             const long long ib = i / 32, iqs = i % 32;
             hq[ib].qs[iqs] = qv;
-            if (iqs == 0) hq[ib].ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+            if (iqs == 0) hq[ib].ds = xe::make_half2(d, xe::q8_1_finite(sum));
         });
     }
     }

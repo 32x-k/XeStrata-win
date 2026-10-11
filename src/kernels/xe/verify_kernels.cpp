@@ -60,7 +60,7 @@ inline void q8_1_store(const sycl::sub_group& sg, const float xi, uint8_t* block
     }
     const float d = xe::q8_1_finite(amax / 127.0f);
     block[4 + lane] = (uint8_t) xe::q8_1_quant(xi, d, amax);
-    if (lane == 0) *reinterpret_cast<sycl::half2*>(block) = sycl::half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+    if (lane == 0) *reinterpret_cast<sycl::half2*>(block) = xe::make_half2(d, xe::q8_1_finite(sum));
 }
 inline uint32_t read_host(const uint32_t* p) {
     const uint32_t v = *reinterpret_cast<const volatile uint32_t*>(p);
@@ -261,7 +261,13 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
         });
     });
     const int rows = T - t_out_begin;
-    if (rows <= 0) return q.ext_oneapi_submit_barrier();
+    if (rows <= 0) {
+#if defined(STRATA_ADAPTIVECPP)
+        return q.single_task([] {});
+#else
+        return q.ext_oneapi_submit_barrier();
+#endif
+    }
     // y = oc * rsqrt(mean(oc^2) + eps) * gamma * sigmoid(z) a head and token, with the one-group kernel's sums
     return q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> wsum(sycl::range<1>(S / WARP), hd);
@@ -545,6 +551,10 @@ void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
             c.form.fill((int8_t) forced);
             return c;
         }
+#if defined(STRATA_ADAPTIVECPP)
+        c.form.fill((int8_t) kGdnPlain);
+        return c;   // command-graph tuning is optional; keep the portable plain form
+#else
         // scratch inputs of the model's shape; small values keep the recurrence finite
         const size_t n_state = (size_t) S * S * h_v, n_h = (size_t) kVerifyMaxT * C;
         const size_t n_g = (size_t) kVerifyMaxT * h_v, n_y = (size_t) kVerifyMaxT * S * h_v;
@@ -588,6 +598,7 @@ void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
         std::fprintf(stderr, "strata: GDN step forms for windows of 1..%d tokens: %s (0 one group a head, 1 split, "
                      "2 prefetch)\n", kVerifyMaxT, forms);
         return c;
+#endif
     });
 }
 
@@ -647,6 +658,12 @@ void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* ga
 }
 
 bool graph_branch_pays(void* stream, void* side0, void* side1) {
+#if defined(STRATA_ADAPTIVECPP)
+    (void) stream;
+    (void) side0;
+    (void) side1;
+    return false;
+#else
     namespace sx = sycl::ext::oneapi::experimental;
     auto& q = Q(stream);
     sycl::queue* side[2] = {&Q(side0), &Q(side1)};
@@ -707,6 +724,7 @@ bool graph_branch_pays(void* stream, void* side0, void* side1) {
     std::fprintf(stderr, "strata: graph side branches: %.1f us in a row, %.1f us branched: %s\n", t_min[0], t_min[1],
                  t_min[1] <= 0.95 * t_min[0] ? "used" : "not used");
     return t_min[1] <= 0.95 * t_min[0];
+#endif
 }
 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
@@ -1235,12 +1253,16 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
 }
 
 bool gpu_stamp_available() {
+#if defined(STRATA_ADAPTIVECPP)
+    return false;
+#else
     const sycl::device d = core::Runtime::get().compute().get_device();
     if (d.get_backend() == sycl::backend::ext_oneapi_cuda) return true;   // %globaltimer
 #ifdef SYCL_EXT_ONEAPI_CLOCK
     return d.has(sycl::aspect::ext_oneapi_clock_device);
 #else
     return false;
+#endif
 #endif
 }
 

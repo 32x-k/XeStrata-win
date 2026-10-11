@@ -3,8 +3,12 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 cmake_minimum_required(VERSION 3.24)
 project(XeStrata LANGUAGES CXX)
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  message(FATAL_ERROR "Strata supports Linux only")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT WIN32)
+  message(FATAL_ERROR "XeStrata supports Linux and the experimental Windows port")
+endif()
+option(STRATA_ADAPTIVECPP "Build the SYCL engine with AdaptiveCpp (experimental Windows port)" ${WIN32})
+if(WIN32 AND NOT STRATA_ADAPTIVECPP)
+  message(FATAL_ERROR "The experimental Windows port requires -DSTRATA_ADAPTIVECPP=ON")
 endif()
 set(STRATA_UPSTREAM_VERSION "0.1.40.2")
 set(STRATA_UPSTREAM_COMMIT "e8ca9af")
@@ -53,6 +57,7 @@ set(STRATA_CUDA_ARCHS auto CACHE STRING "NVIDIA architectures to build for, e.g.
 set(STRATA_ONEMKL auto CACHE STRING "the oneMKL backend for Intel GPUs (contrib): ON, OFF or auto (this PC has one)")
 set(STRATA_HIP_ARCHS auto CACHE STRING
     "AMD architectures to build for, e.g. gfx1200 (free, contrib); auto: this PC's; rocblas: those rocBLAS has")
+set(STRATA_ROCM_ROOT "" CACHE PATH "ROCm installation root for the AdaptiveCpp Windows port")
 set(STRATA_CUDA_PATH auto CACHE STRING
     "the CUDA toolkit for the NVIDIA code and cuBLAS (contrib), e.g. /usr/local/cuda-13.1; auto: the best one here")
 set(STRATA_CUDA_PTX auto CACHE STRING
@@ -229,7 +234,11 @@ add_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
 # ---- Intel Xe foundation --------------------------------------------------
 if(STRATA_ENABLE_XE)
   include(CheckCXXSourceCompiles)
-  if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+  if(STRATA_ADAPTIVECPP)
+    if(NOT _strata_hip_archs)
+      message(FATAL_ERROR "The AdaptiveCpp port needs an AMD target in STRATA_HIP_ARCHS, for example gfx1201")
+    endif()
+  elseif(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
     if(NOT STRATA_LICENSE STREQUAL "contrib-icpx")
       message(FATAL_ERROR "icpx is not free software: configure with intel/llvm's DPC++ 7 or later "
                           "(tools/intel_llvm_build.py; -DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++), "
@@ -260,6 +269,20 @@ if(STRATA_ENABLE_XE)
                           "-DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++")
     endif()
   endif()
+  if(STRATA_ADAPTIVECPP)
+    list(JOIN _strata_hip_archs "," _strata_acpp_hip_archs)
+    set(ACPP_TARGETS "hip:${_strata_acpp_hip_archs}" CACHE STRING "AdaptiveCpp targets" FORCE)
+    if(STRATA_ROCM_ROOT)
+      set(ACPP_ROCM_PATH "${STRATA_ROCM_ROOT}" CACHE STRING "ROCm installation for AdaptiveCpp" FORCE)
+    endif()
+    find_package(AdaptiveCpp CONFIG REQUIRED)
+    add_library(strata_sycl INTERFACE)
+    target_link_libraries(strata_sycl INTERFACE AdaptiveCpp::acpp-rt)
+    target_compile_definitions(strata_sycl INTERFACE STRATA_ADAPTIVECPP=1)
+    function(strata_enable_sycl target)
+      add_sycl_to_target(TARGET ${target})
+    endfunction()
+  else()
   # The device targets: SPIR-V for Intel GPUs (compiled when the program starts), and with STRATA_CUDA_ARCHS and
   # STRATA_HIP_ARCHS each NVIDIA and AMD architecture's code.  Without them no -fsycl-targets: the compiler's default,
   # SPIR-V alone.
@@ -358,17 +381,30 @@ if(STRATA_ENABLE_XE)
   target_link_options(strata_sycl INTERFACE -fsycl ${_strata_sycl_targets} -foffload-fp32-prec-div
                       -foffload-fp32-prec-sqrt -fsycl-max-parallel-link-jobs=${_strata_link_jobs}
                       "SHELL:${_strata_spirv_translator} --spirv-ext=+SPV_KHR_integer_dot_product")
+    function(strata_enable_sycl target)
+    endfunction()
+  endif()
 
   add_library(strata_core STATIC src/core/device.cpp src/core/pinned.cpp src/core/gpu.cpp src/core/graph.cpp
                                  src/core/weights.cpp src/core/layout.cpp)
   target_include_directories(strata_core PUBLIC include)
   target_link_libraries(strata_core PUBLIC strata_sycl strata_warnings strata_plan strata_platform)
+  strata_enable_sycl(strata_core)
 
   add_executable(strata-device src/core/device_main.cpp)
   target_link_libraries(strata-device PRIVATE strata_core)
+  strata_enable_sycl(strata-device)
   add_executable(strata-load src/core/load_main.cpp)
   target_link_libraries(strata-load PRIVATE strata_core)
+  strata_enable_sycl(strata-load)
 
+  if(STRATA_ADAPTIVECPP)
+    set(_strata_matrix_sources src/kernels/xe/adaptivecpp_matrix.cpp)
+  else()
+    set(_strata_matrix_sources src/kernels/xe/qsa_prompt_attn.cpp src/kernels/xe/xmx_gemm.cpp
+                               src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp
+                               src/kernels/xe/matrix_report.cpp)
+  endif()
   add_library(strata_kernels STATIC src/kernels/xe/elementwise.cpp src/kernels/xe/iq_kernels.cpp
                                     src/kernels/xe/native_mmvq.cpp src/kernels/xe/rope.cpp
                                     src/kernels/xe/router.cpp src/kernels/xe/bf16_gemv.cpp
@@ -385,13 +421,15 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/native_qsa_score.cpp src/kernels/xe/native_qsa_indexer.cpp
                                     src/kernels/xe/native_flash_attn.cpp src/kernels/xe/qsa_select.cpp
                                     src/kernels/xe/dequant_bf16.cpp src/kernels/xe/ple.cpp
-                                    src/kernels/xe/s2_expert_grouped.cpp src/kernels/xe/qsa_prompt_attn.cpp
-                                    src/kernels/xe/xmx_gemm.cpp src/kernels/xe/dp4a_gemm.cpp
-                                    src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp
-                                    src/kernels/xe/matrix_report.cpp)
+                                    src/kernels/xe/s2_expert_grouped.cpp src/kernels/xe/dp4a_gemm.cpp
+                                    ${_strata_matrix_sources})
   target_link_libraries(strata_kernels PUBLIC strata_core strata_ngram)
+  strata_enable_sycl(strata_kernels)
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/main/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/main/ggml)
+  if(STRATA_ADAPTIVECPP)
+    target_include_directories(strata_kernels PRIVATE include/adaptivecpp)
+  endif()
   # Packed embeddings require separate multiply/add rounding; parity also checks signed zero.
   target_compile_options(strata_kernels PRIVATE -fno-fast-math -ffp-contract=off)
 
@@ -405,6 +443,7 @@ if(STRATA_ENABLE_XE)
                                    src/core/conversation_file.cpp src/core/vmm.cpp)
   target_include_directories(strata_engine PUBLIC include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu)
+  strata_enable_sycl(strata_engine)
   # c-blosc2 (libblosc2-dev; free, BSD-3), optional: --conversation-save-compress stores the saved conversations'
   # floating-point parts compressed.  Without it the engine builds and runs, and refuses that option.
   find_path(STRATA_BLOSC2_INCLUDE blosc2.h)
@@ -480,7 +519,8 @@ if(STRATA_ENABLE_XE)
   if(NOT STRATA_LICENSE MATCHES "^(contrib|contrib-icpx)$")
     set(_strata_onemkl OFF)   # oneMKL is not free software
   endif()
-  if(_strata_onemkl OR _strata_cuda_archs OR _strata_hip_archs)
+  option(STRATA_ENABLE_ONEMATH "Build oneMath dense-product backends" ON)
+  if(STRATA_ENABLE_ONEMATH AND (_strata_onemkl OR _strata_cuda_archs OR _strata_hip_archs))
     if(_strata_onemkl AND NOT MKL_ROOT)
       if(DEFINED ENV{MKLROOT})
         set(MKL_ROOT $ENV{MKLROOT})
@@ -592,6 +632,7 @@ if(STRATA_ENABLE_XE)
                                     src/prefill/moe_mmq.cpp)
   target_include_directories(strata_prefill PUBLIC include)
   target_link_libraries(strata_prefill PUBLIC strata_engine)
+  strata_enable_sycl(strata_prefill)
   if(TARGET onemath)
     # the library and its headers without its usage requirements: oneMath's cuBLAS backend puts
     # -fsycl-targets=nvptx64-nvidia-cuda on them, which would replace the engine's own targets
@@ -604,6 +645,7 @@ if(STRATA_ENABLE_XE)
   # `strata generate` (P2.S6): the program that composes the components into tokens
   add_executable(strata src/program/generate.cpp)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
+  strata_enable_sycl(strata)
 
   if(STRATA_BUILD_TESTS)
     add_executable(elementwise_parity src/kernels/elementwise_parity.cpp)

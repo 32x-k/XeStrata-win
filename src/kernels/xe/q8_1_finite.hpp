@@ -22,6 +22,30 @@ constexpr float kHalfMax = 65504.0f;
 
 inline float q8_1_finite(const float v) { return sycl::fabs(v) > kHalfMax ? sycl::copysign(kHalfMax, v) : v; }
 
+inline sycl::half2 make_half2(float x, float y) {
+#if defined(STRATA_ADAPTIVECPP)
+    sycl::half2 out;
+    out[0] = sycl::half(x);
+    out[1] = sycl::half(y);
+    return out;
+#else
+    return sycl::half2(sycl::half(x), sycl::half(y));
+#endif
+}
+
+inline sycl::vec<sycl::half, 4> make_half4(float x, float y, float z, float w) {
+#if defined(STRATA_ADAPTIVECPP)
+    sycl::vec<sycl::half, 4> out;
+    out[0] = sycl::half(x);
+    out[1] = sycl::half(y);
+    out[2] = sycl::half(z);
+    out[3] = sycl::half(w);
+    return out;
+#else
+    return sycl::vec<sycl::half, 4>(sycl::half(x), sycl::half(y), sycl::half(z), sycl::half(w));
+#endif
+}
+
 /// The block's quantized value of `xi` for the (finite) scale `d`; `amax` = 0 is an all-zero block.
 inline int8_t q8_1_quant(const float xi, const float d, const float amax) {
     if (amax == 0.0f) return 0;

@@ -8,7 +8,8 @@
 // device's matrix_combinations, its sub-group sizes, the large register file mode) never launch them on such a GPU.
 #pragma once
 
-#if defined(__SYCL_DEVICE_ONLY__) && (defined(__NVPTX__) || defined(__AMDGCN__))
+#if defined(STRATA_ADAPTIVECPP) || \
+    (defined(__SYCL_DEVICE_ONLY__) && (defined(__NVPTX__) || defined(__AMDGCN__)))
 #define STRATA_DEVICE_NOT_INTEL 1
 #else
 #define STRATA_DEVICE_NOT_INTEL 0

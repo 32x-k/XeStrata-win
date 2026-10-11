@@ -15,8 +15,15 @@
 #include <cstdlib>
 #include <stdexcept>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <pthread.h>
 #include <sched.h>
+#endif
 
 namespace strata::kernels::cpu {
 
@@ -28,6 +35,35 @@ constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
 
 std::vector<int> physical_cores(bool skip_first) {
     std::vector<int> cores;
+#if defined(_WIN32)
+    DWORD bytes = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+    std::vector<uint8_t> storage(bytes);
+    if (bytes != 0 && GetLogicalProcessorInformationEx(RelationProcessorCore,
+            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(storage.data()), &bytes)) {
+        DWORD_PTR process = 0, system = 0;
+        GetProcessAffinityMask(GetCurrentProcess(), &process, &system);
+        for (size_t off = 0; off < bytes;) {
+            const auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(storage.data() + off);
+            if (info->Relationship == RelationProcessorCore) {
+                for (WORD g = 0; g < info->Processor.GroupCount; ++g) {
+                    if (info->Processor.GroupMask[g].Group != 0) continue;
+                    KAFFINITY mask = info->Processor.GroupMask[g].Mask & process;
+                    if (mask != 0) {
+                        int cpu = 0;
+                        while ((mask & (KAFFINITY(1) << cpu)) == 0) ++cpu;
+                        cores.push_back(cpu);
+                        break;
+                    }
+                }
+            }
+            if (info->Size == 0) break;
+            off += info->Size;
+        }
+    }
+    if (cores.empty())
+        for (unsigned i = 0; i < std::thread::hardware_concurrency() && i < 64; ++i) cores.push_back((int) i);
+#else
     // The logical CPUs this process may run on, ONE PER PHYSICAL CORE (issue #40): SMT siblings share a core's
     // load/store bandwidth, so a worker on each would put two workers on one core. sysfs names each CPU's
     // (package, core); the first allowed CPU of each pair is kept, so a taskset
@@ -61,6 +97,7 @@ std::vector<int> physical_cores(bool skip_first) {
         }
         cores.push_back(cpu);
     }
+#endif
     if (skip_first && !cores.empty()) cores.erase(cores.begin());
     return cores;
 }
@@ -69,16 +106,25 @@ namespace {
 
 void pin_this_thread(int core) {
     if (core < 0) return;
+#if defined(_WIN32)
+    if (core < 64) SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << core);
+#else
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(core, &set);
     pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+#endif
 }
 
 }  // namespace
 
 long long pin_current_thread(int core) {
     if (core < 0) return -1;
+#if defined(_WIN32)
+    if (core >= 64) return -1;
+    const DWORD_PTR previous = SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << core);
+    return previous != 0 ? (long long) previous : -1;
+#else
     cpu_set_t prev;
     CPU_ZERO(&prev);
     if (pthread_getaffinity_np(pthread_self(), sizeof prev, &prev) != 0) return -1;
@@ -87,15 +133,20 @@ long long pin_current_thread(int core) {
         if (CPU_ISSET(i, &prev)) mask |= 1ul << i;
     pin_this_thread(core);
     return (long long) mask;
+#endif
 }
 
 void restore_thread_affinity(long long previous) {
     if (previous <= 0) return;
+#if defined(_WIN32)
+    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) previous);
+#else
     cpu_set_t set;
     CPU_ZERO(&set);
     for (int i = 0; i < 64; ++i)
         if ((previous >> i) & 1) CPU_SET(i, &set);
     pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+#endif
 }
 
 namespace {

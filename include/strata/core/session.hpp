@@ -380,6 +380,21 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
                   PoolFn pool, HitFn hits, void* user, bool overlap, void* stream, std::string& err,
                   float* dump_layers = nullptr, SessionLoopScratch* scratch = nullptr);
 
+/// Direct full-model token with the CPU pool and optional VRAM hits, available in every build mode.
+/// No graphs or doorbell polling: `pre[l]` runs without a doorbell, then explicit D2H copies of
+/// `block.mixed`, router IDs and weights into `s.db`'s HOST staging are event-waited before any callback.
+/// Order matches `session_loop`: hits(Launch) -> pool -> H2D parts -> hits(Combine) -> post[l].
+/// Requires an initialized full single-device session (no layer-range carve), DEVICE `parts` (k*n_embd),
+/// matching `s.db` host staging and initialized `scratch` of exactly k*n_embd*sizeof(float) bytes.
+/// Callbacks must use this stream and leave the block/router buffers intact; the pool fills all output
+/// rows, zeroing hit rows. A null pool supplies zeros. Callback-side failures remain caller-owned (void hooks).
+/// The caller stages PLE rows/token history as for `session_token`; QSA position staging is done by `pre`.
+/// Always drains the stream before returning after submissions, including failures, for staging lifetime.
+/// `sync_every_layer` additionally checks each post; `session_token`'s caller-filled parts contract is unchanged.
+bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,
+                        SessionState& s, float* parts, PoolFn pool, HitFn hits, void* user,
+                        SessionLoopScratch& scratch, void* stream, bool sync_every_layer, std::string& err);
+
 // ================================ plan v0.3 P3: THE WHOLE TOKEN AS ONE GRAPH ================================
 //
 // The per-layer loop above makes 96 graph launches per token. The token graph holds

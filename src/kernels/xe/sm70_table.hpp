@@ -17,6 +17,10 @@ namespace strata::kernels::xe {
 
 /// STRATA_SM70_TABLE=1 is set and the queue's device reports Volta (sm_70).
 inline bool sm70_table(sycl::queue& q) {
+#if defined(STRATA_ADAPTIVECPP)
+    (void) q;
+    return false;
+#else
     namespace syclex = sycl::ext::oneapi::experimental;
     static const bool on = [] {
         const char* v = std::getenv("STRATA_SM70_TABLE");
@@ -29,6 +33,7 @@ inline bool sm70_table(sycl::queue& q) {
         return d.get_backend() == sycl::backend::ext_oneapi_cuda &&
                d.get_info<syclex::info::device::architecture>() == syclex::architecture::nvidia_gpu_sm_70;
     });
+#endif
 }
 
 }  // namespace strata::kernels::xe

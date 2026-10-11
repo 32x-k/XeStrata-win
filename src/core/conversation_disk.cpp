@@ -9,10 +9,22 @@
 #endif
 
 #include <fcntl.h>
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <io.h>
+#include <sys/stat.h>
+#else
 #include <pthread.h>
 #include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -89,6 +101,17 @@ private:
 };
 
 #ifdef STRATA_HAVE_BLOSC2
+#if defined(_WIN32)
+// The Windows initial port does not change the caller's affinity while c-blosc2 runs.
+class WideAffinity {
+public:
+    WideAffinity() = default;
+};
+
+int16_t blosc2_threads() {
+    return (int16_t) std::clamp((int) std::thread::hardware_concurrency(), 1, 256);
+}
+#else
 // The CPUs the process may use, taken before main: the serve loop pins its own thread to one core
 // (SessionLoopScratch), and c-blosc2's threads, started from that thread, would all inherit that one core.
 struct StartAffinity {
@@ -122,6 +145,7 @@ int16_t blosc2_threads() {
     const int n = g_start_affinity.ok ? CPU_COUNT(&g_start_affinity.set) : (int) std::thread::hardware_concurrency();
     return (int16_t) std::clamp(n, 1, 256);
 }
+#endif
 
 struct Blosc2Context {
     blosc2_context* ctx = nullptr;
@@ -534,7 +558,11 @@ bool ConversationDisk::open(ConversationDiskOptions options, std::string& error)
     enabled_ = true;
     expire();
     for (const Found& found : scan(options_.dir)) {
+#if defined(_WIN32)
+        std::FILE* f = ::_wfopen(found.path.c_str(), L"rb");
+#else
         std::FILE* f = std::fopen(found.path.c_str(), "rb");
+#endif
         if (f == nullptr) continue;
         Header h;
         const bool ok = read_header(f, h);
@@ -599,7 +627,11 @@ bool ConversationDisk::load(size_t index, SavedConversation& image, std::string&
         remove_file(path);
         return false;
     };
+#if defined(_WIN32)
+    std::FILE* f = ::_wfopen(path.c_str(), L"rb");
+#else
     std::FILE* f = std::fopen(path.c_str(), "rb");
+#endif
     if (f == nullptr) return reject("cannot open");
     struct Close { std::FILE* f; ~Close() { std::fclose(f); } } close{f};
     Header h;
@@ -711,11 +743,22 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
     const uint8_t cvec = h.cvec;
     name.update(&cvec, 1);
     const fs::path path = options_.dir / (hex(name.digest()) + kExtension);
+#if defined(_WIN32)
+    const fs::path tmp = path.native() + L".tmp";
+    const int fd = ::_wopen(tmp.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY | _O_NOINHERIT,
+                            _S_IREAD | _S_IWRITE);
+    std::FILE* f = fd < 0 ? nullptr : ::_fdopen(fd, "wb");
+#else
     const fs::path tmp = path.string() + ".tmp";
     const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     std::FILE* f = fd < 0 ? nullptr : ::fdopen(fd, "wb");
+#endif
     if (f == nullptr) {
+#if defined(_WIN32)
+        if (fd >= 0) ::_close(fd);
+#else
         if (fd >= 0) ::close(fd);
+#endif
         error = "cannot create " + tmp.string();
         return false;
     }
@@ -757,18 +800,35 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
         w.part(kv.k, kv_type); w.part(kv.v, kv_type); w.part(kv.k_scale); w.part(kv.v_scale);
         w.part(kv.pooled, sizeof(float));
     }
-    const long end = std::ftell(f);   // the file's length: the body ends it
+#if defined(_WIN32)
+    const __int64 end = ::_ftelli64(f);   // the file's length: the body ends it
+#else
+    const off_t end = ::ftello(f);
+#endif
     bool ok = w.ok && end > 0;
     if (ok) {
         h.body_hash = w.hash.digest();
         header = encode(h);
-        ok = header.size() == length && std::fseek(f, 0, SEEK_SET) == 0 && prefix();
+#if defined(_WIN32)
+        ok = header.size() == length && ::_fseeki64(f, 0, SEEK_SET) == 0 && prefix();
+#else
+        ok = header.size() == length && ::fseeko(f, 0, SEEK_SET) == 0 && prefix();
+#endif
     }
     ok = std::fflush(f) == 0 && ok;
+#if defined(_WIN32)
+    ok = ::_commit(::_fileno(f)) == 0 && ok;
+#else
     ok = ::fsync(::fileno(f)) == 0 && ok;
+#endif
     ok = std::fclose(f) == 0 && ok;
     std::error_code ec;
+#if defined(_WIN32)
+    // Replace the deterministic destination after flushing the file; Windows has no directory flush.
+    if (ok) ok = ::MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
     if (ok) fs::rename(tmp, path, ec);
+#endif
     if (!ok || ec) {
         fs::remove(tmp, ec);
         error = "cannot write " + path.string();

@@ -51,7 +51,7 @@ RopeTab rope_table_for(const RopeScaling& scaling);
 __device__ __forceinline__ int mrope_pos(const int32_t* tab, int pos, int pair) {
     return tab ? __ldg(tab + (size_t) pos * 3 + pair % 3) : pos;
 }
-#elif defined(SYCL_LANGUAGE_VERSION)
+#elif (defined(SYCL_LANGUAGE_VERSION) || defined(STRATA_ADAPTIVECPP))
 /// The same sector rule for the Xe kernels.
 inline int mrope_pos(const int32_t* tab, int pos, int pair) {
     return tab ? tab[(std::size_t) pos * 3 + pair % 3] : pos;

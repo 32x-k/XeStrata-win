@@ -27,8 +27,8 @@ constexpr int KMAX = 64;
 
 // Philox 4x32-10, counter-based on (seed, position)
 inline void philox4x32_round(uint32_t& c0, uint32_t& c1, uint32_t& c2, uint32_t& c3, uint32_t k0, uint32_t k1) {
-    const uint32_t hi0 = sycl::mul_hi(0x9E3779B9u, c0);
-    const uint32_t hi1 = sycl::mul_hi(0xBB67AE85u, c2);
+    const uint32_t hi0 = (uint32_t) (((uint64_t) 0x9E3779B9u * c0) >> 32);
+    const uint32_t hi1 = (uint32_t) (((uint64_t) 0xBB67AE85u * c2) >> 32);
     const uint32_t lo0 = 0x9E3779B9u * c0;
     const uint32_t lo1 = 0xBB67AE85u * c2;
     const uint32_t n0 = hi1 ^ c1 ^ k0;

@@ -741,7 +741,7 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
         const float d = xe::q8_1_finite(amax / 127.0f);   // #606: finite blocks bit for bit
         const int8_t qv = xe::q8_1_quant(xi, d, amax);
         y[i / Q8K].qs[i % Q8K] = qv;
-        if (i % Q8K == 0) y[i / Q8K].ds = half2(half(d), half(xe::q8_1_finite(sum)));
+        if (i % Q8K == 0) y[i / Q8K].ds = xe::make_half2(d, xe::q8_1_finite(sum));
     });
 }
 
@@ -768,7 +768,7 @@ void native_swiglu_q8_1(const float* gate, const float* up, void* x_q8_1, int n_
         const float d = xe::q8_1_finite(amax / 127.0f);
         const int8_t qv = xe::q8_1_quant(xi, d, amax);
         y[i / Q8K].qs[i % Q8K] = qv;
-        if (i % Q8K == 0) y[i / Q8K].ds = half2(half(d), half(xe::q8_1_finite(sum)));
+        if (i % Q8K == 0) y[i / Q8K].ds = xe::make_half2(d, xe::q8_1_finite(sum));
     });
 }
 

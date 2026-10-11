@@ -20,6 +20,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <limits>
 #include <vector>
 
 // `_mm_pause` for the doorbell spin.  Guarded because it is x86-only; a target without it still builds, the
@@ -768,6 +770,123 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
     }
     if (!strata::gpu::stream_sync(cs)) { err = "session_loop: final sync"; return false; }
     return true;
+}
+
+bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,
+                        SessionState& s, float* parts, PoolFn pool, HitFn hits, void* user,
+                        SessionLoopScratch& scratch, void* stream, bool sync_every_layer, std::string& err) {
+    err.clear();
+    if (g.n_layers <= 0 || g.qsa_interval <= 0 || g.n_embd <= 0 || s.k < 1 || s.k > 64 ||
+        s.k > g.n_expert || (uint64_t) g.n_embd > std::numeric_limits<size_t>::max() / (s.k * sizeof(float))) {
+        err = "session_token_pool: invalid geometry or k";
+        return false;
+    }
+    const int64_t nq = g.n_qsa_layers(), ng = g.n_gdn_layers();
+    if (s.layer_lo != 0 || s.layer_hi != g.n_layers || s.qsa_ord0 != 0 || s.gdn_ord0 != 0 ||
+        s.qsa_alloc != nq || s.gdn_alloc != ng || (nq > 0 && s.qsa_states == nullptr) ||
+        (ng > 0 && s.gdn_state == nullptr)) {
+        err = "session_token_pool: requires a full single-device session";
+        return false;
+    }
+    const size_t x_bytes = (size_t) g.n_embd * sizeof(float);
+    const size_t parts_bytes = (size_t) s.k * x_bytes;
+    if (parts == nullptr || scratch.y_miss == nullptr || scratch.probe == nullptr ||
+        scratch.parts_bytes != parts_bytes) {
+        err = "session_token_pool: requires parts and matching initialized scratch";
+        return false;
+    }
+    if (s.db == nullptr || s.db->n_embd != g.n_embd || s.db->k != s.k ||
+        s.db->h_x_f == nullptr || s.db->h_ids == nullptr || s.db->h_weights == nullptr) {
+        err = "session_token_pool: requires matching doorbell host staging";
+        return false;
+    }
+    if (s.block.R == nullptr || s.block.mixed == nullptr || s.block.block_out == nullptr ||
+        s.moe.ids == nullptr || s.moe.weights == nullptr) {
+        err = "session_token_pool: uninitialized block or router buffers";
+        return false;
+    }
+    if (pos < 0 || pos_base < 0 || pos >= s.max_cells || pos_base > s.max_cells - 1 - pos ||
+        pos > std::numeric_limits<int32_t>::max() - (int64_t) pos_base) {
+        err = "session_token_pool: position is outside the session capacity";
+        return false;
+    }
+    for (int64_t j = 0; j < nq; ++j) {
+        const QsaState& q = s.qsa_states[j];
+        if (q.host_step == nullptr || q.host_pos == nullptr || q.step == nullptr || q.pos_dev == nullptr ||
+            q.max_cells <= pos || pos_base > q.max_cells - 1 - pos) {
+            err = "session_token_pool: uninitialized or undersized QSA state " + std::to_string(j);
+            return false;
+        }
+    }
+    strata::gpu::Stream cs = stream;
+    if (strata::gpu::is_capturing(cs)) {
+        err = "session_token_pool: cannot run inside a capture";
+        return false;
+    }
+
+    int64_t layer = 0;
+    auto gpu_error = [&](const char* what) {
+        err = "session_token_pool: layer " + std::to_string(layer) + ": " + what + ": " +
+              strata::gpu::last_error();
+        return false;
+    };
+    // Keep a harmless reference for all-GDN geometries; no QSA state is consumed by those blocks.
+    QsaState unused_qsa;
+    auto run = [&]() -> bool {
+        int64_t qsa_index = 0;
+        for (layer = 0; layer < g.n_layers; ++layer) {
+            gdn_point_at(g, layer, s);
+            const bool qsa = is_qsa_layer(g, layer);
+            QsaState& qst = nq == 0 ? unused_qsa : s.qsa_states[qsa ? qsa_index : s.qsa_primary()];
+            // Null db deliberately disables both mapped device publication and ringing. qsa_layer stages
+            // this token's pos/pos_base itself; gdn_point_at selects this layer's persistent recurrence.
+            if (!block_layer_pre(tables, g, layer, pos, pos_base, s.gdn, qst, s.qsa_bufs, s.moe, s.k,
+                                 s.block, cs, err, nullptr, s.ple.ready() ? &s.ple : nullptr)) {
+                err = "session_token_pool: pre layer " + std::to_string(layer) + ": " + err;
+                return false;
+            }
+            if (qsa) ++qsa_index;
+            // FIFO copies, not device writes to mapped memory. The event also completes the previous
+            // layer's H2D read of y_miss before the host reuses any staging for this layer.
+            if (!strata::gpu::copy_async(s.db->h_x_f, s.block.mixed, x_bytes, cs)) return gpu_error("D2H mixed");
+            if (!strata::gpu::copy_async(s.db->h_ids, s.moe.ids, (size_t) s.k * sizeof(int32_t), cs))
+                return gpu_error("D2H IDs");
+            if (!strata::gpu::copy_async(s.db->h_weights, s.moe.weights, (size_t) s.k * sizeof(float), cs))
+                return gpu_error("D2H weights");
+            if (!strata::gpu::event_record(scratch.probe, cs)) return gpu_error("record staging event");
+            if (!strata::gpu::event_sync(scratch.probe)) return gpu_error("wait staging event");
+
+            if (hits != nullptr) hits(user, cs, HitPhase::Launch, s.db->h_ids, s.k);
+            if (pool != nullptr)
+                pool(user, s.db->h_x_f, s.db->h_ids, s.db->h_weights, g.n_embd, s.k, scratch.y_miss);
+            else
+                std::memset(scratch.y_miss, 0, parts_bytes);
+            if (!strata::gpu::copy_async(parts, scratch.y_miss, parts_bytes, cs)) return gpu_error("H2D parts");
+            if (hits != nullptr) hits(user, cs, HitPhase::Combine, nullptr, 0);
+            if (!block_layer_post(tables, g, layer, s.k, s.moe, s.block, parts, cs, err)) {
+                err = "session_token_pool: post layer " + std::to_string(layer) + ": " + err;
+                return false;
+            }
+            if (sync_every_layer && !strata::gpu::stream_sync(cs)) return gpu_error("post sync");
+        }
+        return true;
+    };
+    bool ok = false;
+    try {
+        ok = run();
+    } catch (const std::exception& e) {
+        err = "session_token_pool: layer " + std::to_string(layer) + ": " + e.what();
+    } catch (...) {
+        err = "session_token_pool: layer " + std::to_string(layer) + ": unknown exception";
+    }
+    // Even a failed pre/copy/callback can leave staging transfers queued. Drain on every submitted path,
+    // preserving the original diagnostic if the cleanup wait also fails; callers may now reuse/free staging.
+    if (!strata::gpu::stream_sync(cs)) {
+        if (!err.empty()) err += "; ";
+        err += "session_token_pool: final sync: " + std::string(strata::gpu::last_error());
+        return false;
+    }
+    return ok;
 }
 
 bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,

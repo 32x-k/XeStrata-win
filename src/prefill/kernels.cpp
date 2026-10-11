@@ -14,7 +14,9 @@
 #include "strata/core/runtime.hpp"
 #include "strata/core/per_device.hpp"
 
+#if !defined(STRATA_ADAPTIVECPP)
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#endif
 
 #include <cfloat>
 #include <chrono>
@@ -605,10 +607,12 @@ struct GdnRecLane {
 #pragma unroll
         for (int r = 0; r < S; ++r) base[r * rs] = s[r];
     }
+#if !defined(STRATA_ADAPTIVECPP)
     auto get(sycl::ext::oneapi::experimental::properties_tag) const {
         return sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>,
                                                            sycl::ext::oneapi::experimental::sub_group_size<SG>};
     }
+#endif
 };
 
 // The key-head form (upstream's gdn_rec_kh_kernel): a work-group takes one key head's VPK value heads and CB of their
@@ -754,6 +758,7 @@ namespace {
 // Whether GdnRecLane<16> runs on this device: a GRF holds 16 floats only where the EU is 16 wide (Xe2; the 8-wide
 // EUs of Xe-LP and Xe-HPG would spill the 128 state rows), and the device must build the large register file.
 // STRATA_GDN_REC_LANE=0: the D-2 kernel (A/B).
+#if !defined(STRATA_ADAPTIVECPP)
 bool gdn_lane_ok(sycl::queue& q) {
     static core::PerDevice<bool> per_device;
     return per_device.get(q.get_device(), [&] {
@@ -774,6 +779,7 @@ bool gdn_lane_ok(sycl::queue& q) {
         }
     });
 }
+#endif
 }  // namespace
 
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
@@ -905,9 +911,12 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     // the first call of at least 64 tokens.  RTX 4070: 2175 -> 459 us for 512 tokens (+2.4% prompt speed); the B70
     // without GdnRecLane: 56 -> 92 ms a prompt (the key-head form keeps 3 x 32 state rows a work-item in registers).
     static int pick = -1;   // 1: the key-head form
+#if !defined(STRATA_ADAPTIVECPP)
     if (gdn_lane_ok(q))
         q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{state, h, gate, beta, y, T});
-    else {
+    else
+#endif
+    {
         if (pick < 0 && kh_on && T >= 64) {
             const size_t ns = (size_t) S * HV * S, ny = (size_t) T * HV * S;
             float* st = sycl::malloc_device<float>(ns, q);

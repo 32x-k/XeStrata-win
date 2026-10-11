@@ -16,7 +16,14 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <sys/mman.h>
+#endif
 #include <algorithm>
 #include <atomic>
 #include <thread>
@@ -318,7 +325,9 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         const uint64_t page = 4096;
         const uintptr_t a0 = (uintptr_t) impl_->data & ~(uintptr_t) (page - 1);
         const uintptr_t a1 = (uintptr_t) impl_->data + (uintptr_t) need;
+#if !defined(_WIN32)
         madvise((void*) a0, a1 - a0, MADV_WILLNEED);
+#endif
         // Fault the table in with several threads first: mlock (and a single toucher) brings it in one page at a time
         // from one thread, ~0.5 GB/s from a cold file - 106 s for a 54 GB Q8_0 table.  The pages are then resident
         // and mlock only pins them.
@@ -339,12 +348,21 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
             for (unsigned t = 0; t < threads; ++t) pool.emplace_back(touch);
             for (auto& t : pool) t.join();
         }
+#if defined(_WIN32)
+        if (VirtualLock((void*) a0, a1 - a0) != 0) {
+            impl_->locked = true;
+        } else {
+            std::fprintf(stderr, "strata: PLE table VirtualLock failed (error %lu): its pages stay faulted in but may "
+                                 "be reclaimed\n", (unsigned long) GetLastError());
+        }
+#else
         if (mlock((const void*) a0, a1 - a0) == 0) {
             impl_->locked = true;
         } else {
             std::fprintf(stderr, "strata: PLE table mlock failed (%s; raise `ulimit -l`): its pages stay faulted in "
                                  "but may be reclaimed\n", std::strerror(errno));
         }
+#endif
     }
     impl_->mode = io.mode;
     return true;

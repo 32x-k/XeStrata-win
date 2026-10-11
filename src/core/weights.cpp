@@ -17,7 +17,11 @@
 #include <cstring>
 #include <sstream>
 
+#if defined(_WIN32)
+#define fseeko _fseeki64
+#else
 #include <unistd.h>
+#endif
 
 namespace strata::core {
 namespace {
@@ -74,7 +78,7 @@ const char* file_name(int id) {
 }
 
 bool read_at(std::FILE* f, uint64_t off, void* dst, size_t n, std::string& err, const char* what) {
-    if (fseeko(f, (off_t) off, SEEK_SET) != 0) { err = std::string(what) + ": seek failed"; return false; }
+    if (fseeko(f, (int64_t) off, SEEK_SET) != 0) { err = std::string(what) + ": seek failed"; return false; }
     if (std::fread(dst, 1, n, f) != n) { err = std::string(what) + ": short read"; return false; }
     return true;
 }

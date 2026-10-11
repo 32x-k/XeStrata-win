@@ -33,14 +33,58 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
+#define fstat _fstat64
+#define stat _stat64
+#define off_t __int64
+#define O_RDONLY (_O_RDONLY | _O_BINARY)
+#define MAP_FAILED ((void*) -1)
+#define PROT_READ 1
+#define MAP_SHARED 1
+#define MADV_WILLNEED 1
+#define MADV_DONTNEED 2
+#define POSIX_FADV_DONTNEED 1
+static void* mmap(void*, size_t bytes, int, int, int fd, off_t) {
+    const HANDLE file = (HANDLE) _get_osfhandle(fd);
+    const HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY,
+                                               (DWORD) ((uint64_t) bytes >> 32), (DWORD) bytes, nullptr);
+    if (mapping == nullptr) return MAP_FAILED;
+    void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, bytes);
+    CloseHandle(mapping);
+    return view ? view : MAP_FAILED;
+}
+static int munmap(void* view, size_t) { return UnmapViewOfFile(view) ? 0 : -1; }
+static int madvise(void* base, size_t bytes, int advice) {
+    if (advice == MADV_WILLNEED) {
+        WIN32_MEMORY_RANGE_ENTRY range{base, bytes};
+        (void) PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
+    }
+    return 0;
+}
+static int posix_fadvise(int, off_t, off_t, int) { return 0; }
+static int strata_open(const char* path, int flags) { return _open(path, flags); }
+static int strata_close(int fd) { return _close(fd); }
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 // a 64-bit seek (as in pinned.cu): the 32-bit `fseek` wraps past 4 GiB, and the spelling differs per platform
 #ifndef STRATA_FSEEK64
+#if defined(_WIN32)
+#define STRATA_FSEEK64(f, o) _fseeki64((f), (__int64) (o), SEEK_SET)
+#else
 #define STRATA_FSEEK64(f, o) fseeko((f), (off_t) (o), SEEK_SET)
+#endif
 #endif
 
 namespace strata::core {
@@ -214,6 +258,16 @@ namespace detail {
 bool host_available_memory(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
                            const std::string& cgroup_root) {
     m = HostMemory{};
+#if defined(_WIN32)
+    (void) meminfo;
+    (void) self_cgroup;
+    (void) cgroup_root;
+    MEMORYSTATUSEX state{};
+    state.dwLength = sizeof state;
+    if (!GlobalMemoryStatusEx(&state)) return false;
+    m.available = state.ullAvailPhys;
+    return m.available > 0;
+#else
     // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
     std::ifstream info(meminfo);
     std::string line;
@@ -290,6 +344,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     }
     m.available = bytes;
     return true;
+#endif
 }
 
 }  // namespace detail
@@ -393,7 +448,11 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         return true;
     }
 
+#if defined(_WIN32)
+    const int fd = strata_open(path.c_str(), O_RDONLY);
+#else
     const int fd = ::open(path.c_str(), O_RDONLY);
+#endif
     if (fd < 0) { err = "FileExpertSource: cannot open " + path; return false; }
     struct stat st{};
     if (fstat(fd, &st) != 0) { ::close(fd); err = "FileExpertSource: cannot stat " + path; return false; }
@@ -537,7 +596,11 @@ bool FileExpertSource::open_gguf(std::string& err) {
             auto it = index.find(path);
             if (it == index.end()) {
                 Map m;
+#if defined(_WIN32)
+                const int fd = strata_open(path.c_str(), O_RDONLY);
+#else
                 const int fd = ::open(path.c_str(), O_RDONLY);
+#endif
                 struct stat st{};
                 if (fd < 0 || fstat(fd, &st) != 0 || st.st_size <= 0) {
                     if (fd >= 0) ::close(fd);
@@ -1040,7 +1103,13 @@ bool FileExpertSource::pin_cache_complement(
     }
 
     // Copied layer by layer on a few threads: the page faults of the mapped file are the cost, and they overlap.
+#if defined(_WIN32)
+    SYSTEM_INFO system_info{};
+    GetSystemInfo(&system_info);
+    const long page_size = (long) system_info.dwPageSize;
+#else
     const long page_size = sysconf(_SC_PAGESIZE);
+#endif
     if (page_size <= 0) {
         err = "FileExpertSource: cannot determine page size for mapped-page release";
         release();
@@ -2317,7 +2386,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             if (f) have = (uint64_t) f.tellg();
         }
         if (have == file_bytes) {
+#if defined(_WIN32)
+            const int fd = strata_open(path.c_str(), O_RDONLY);
+#else
             const int fd = ::open(path.c_str(), O_RDONLY);
+#endif
             void* v = fd >= 0 ? mmap(nullptr, (size_t) file_bytes, PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED;
             if (fd >= 0) ::close(fd);
             if (v == MAP_FAILED) { err = "ArenaExpertSource: mmap of " + path + " failed"; return false; }
