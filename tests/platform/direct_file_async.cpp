@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "strata/platform/direct_file.hpp"
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -10,22 +11,36 @@
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 using strata::platform::DirectFile;
 using strata::platform::Completion;
 static void check(bool ok, const char* why) { if (!ok) throw std::runtime_error(why); }
 int main() {
+#if defined(_WIN32)
+    char dir[MAX_PATH], name[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, dir) == 0 || GetTempFileNameA(dir, "sd", 0, name) == 0) return 1;
+#else
     char name[] = "/tmp/strata-direct-test-XXXXXX";
     int fd = mkstemp(name);
     if (fd < 0) return 1;
     close(fd);
+#endif
     void* memory = DirectFile::alloc_aligned(size_t(4096) * 18);
     try {
         check(memory != nullptr, "buffer allocation");
         { std::ofstream f(name, std::ios::binary); std::string bytes(4096 * 16 + 17, 'x'); f.write(bytes.data(), (std::streamsize) bytes.size()); }
         DirectFile f;
         std::string error;
-        setenv("STRATA_IO_THREADS", "4", 1);   // the pool's size (out-of-range values are clamped to 1..64)
+#if defined(_WIN32)
+        _putenv_s("STRATA_IO_THREADS", "4");
+#else
+        setenv("STRATA_IO_THREADS", "4", 1);
+#endif   // the pool's size (out-of-range values are clamped to 1..64)
         check(f.open(name, error), error.c_str());
         check(!f.submit(1, memory, 4096, 0, error), "unaligned request accepted");
         for (unsigned i = 0; i < 17; ++i)
@@ -53,11 +68,11 @@ int main() {
         check(f.submit(0, memory, 4096, 100, error), error.c_str());
         check(f.wait(&c, 1, 5000) == 1 && c.ok && c.tag == 100, "reopened read failed");
         f.close();
-        DirectFile::free_aligned(memory); unlink(name);
+        DirectFile::free_aligned(memory); std::remove(name);
         std::cout << "direct_file_async: passed queued reads, short EOF, wake, close drain, reopen\n";
         return 0;
     } catch (const std::exception& e) {
-        DirectFile::free_aligned(memory); unlink(name);
+        DirectFile::free_aligned(memory); std::remove(name);
         std::cerr << e.what() << '\n'; return 1;
     }
 }

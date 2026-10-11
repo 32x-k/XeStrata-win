@@ -301,7 +301,11 @@ void test_cgroup_memory_budget() {
 void test_rotating_source(bool rotate, bool pin) {
     using namespace strata::core;
     using namespace strata::kernels::cpu;
+#if defined(_WIN32)
+    _putenv_s("STRATA_EXCHANGE_ROTATE", rotate ? "1" : "0");
+#else
     setenv("STRATA_EXCHANGE_ROTATE", rotate ? "1" : "0", 1);
+#endif
     TempDirectory dir;
     std::string err;
     require(expert_layout_load(dir.path.string(), 1, 5, err), err);
