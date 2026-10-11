@@ -6642,7 +6642,7 @@ int main(int argc, char** argv) {
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
         strata::core::PcieSplitTimes pcie_split;   // the measured split, kept for the requests that set no share
         setup_pcie_split(drive.d, g.n_layers, o, pcie_given, !split_devs.empty(), ver.fetch_branch(), pcie_split);
-        const strata::core::PcieSplitTimes* const pcie_split_ptr = drive.d.pcie_split;
+        strata::core::PcieSplitTimes* const pcie_split_ptr = drive.d.pcie_split;
         {   // STRATA_ROUTE_TAIL_SKIP: ON BY DEFAULT (rank 7, upstream b4e3407b; measured on XeStrata's GPUs, docs/DETAILS.md): a
             // missed expert that every token of a verify window routes at rank 7 or lower is neither copied nor computed
             // (answers differ slightly; =0 restores the bytes of a build without it).  No default and no line when every

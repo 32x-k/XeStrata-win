@@ -344,9 +344,17 @@ struct ExpertDispatch {
     int pcie_num = 0;
     /// The measured split (after Project Maya's CPU lane): the times taken at start, from which `pcie_split_m` gives
     /// the number of a group's missed experts read over PCIe; `pcie_overlap`: the GPU reads them beside its VRAM hits
-    /// (the verify window's fetch branch).  Null: the share `pcie_num`/256.
-    const PcieSplitTimes* pcie_split = nullptr;
+    /// (the verify window's fetch branch).  Null: the share `pcie_num`/256.  Its CPU times are refined from the decode's
+    /// own pool calls (`expert_pool_dispatch_multi`, STRATA_PCIE_SPLIT_REFINE=0 keeps the start-up times).
+    PcieSplitTimes* pcie_split = nullptr;
     bool pcie_overlap = false;
+    /// The pool calls the split's CPU times are checked against: their wall time, the time the split's times gave
+    /// them, the calls and their experts since the last update, and the updates made (three at most).
+    struct SplitRefine {
+        double ms = 0.0, ms_model = 0.0;
+        int64_t calls = 0, experts = 0;
+        int updates = 0;
+    } split_refine;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     /// STRATA_ROUTE_TAIL_SKIP=R: entries skipped (a missed expert every token of the window routes only at rank >= R)
     /// and the distinct experts behind them (neither copied nor computed)
