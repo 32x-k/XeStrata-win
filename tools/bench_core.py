@@ -284,6 +284,8 @@ class Merge:
         self.engines = []
         for arm in ("xe", "up"):
             a = arm.upper()
+            if arm == "up" and os.environ.get("UP") == "none":   # XeStrata alone, judged against its previous record
+                continue
             root = Path(need(f"{a}_ROOT")) if usage else None
             e = Engine.from_spec(arm, arm, need(a), need(f"{a}_PROFILE"), root, os.environ.get("PY"))
             if usage and len(e.cmd) != 1:

@@ -5,7 +5,7 @@ The tables of step 7 of SKILL.md: how they are run. The check that reads them is
 The engines, each built in a worktree of its own under `.claude/worktrees/` (or in the AMD container):
 
 - XeStrata: `dev`'s HEAD, the contrib-llvm build; one GPU at a time with `ONEAPI_DEVICE_SELECTOR` (`level_zero:*`, `cuda:*`; `hip:*` in the container).
-- upstream on the B70: the tag's `sycl/` port, built and run in its Docker image as its docs/INTEL.md says.
+- upstream on the B70: not measured (the user's decision of 2026-10-12, to save time): the B70 runs XeStrata alone, with `UP=none`, and is judged against the previous XeStrata's record (`judge.py --prev`, step 8).
 - upstream on the RTX 4070: the tag's CUDA build; on the RX 9060 XT: its HIP build; both as its documents say.
 
 Each engine's own shipped expert profile. No other work on a machine while it measures.
@@ -63,7 +63,7 @@ Each run is one chat of four turns: the tier's prompt, then the three follow-ups
 It measures the prompt (the first turn), the follow-ups (the median time a follow-up's prompt takes: the wait before its answer, which the conversation checkpoints decide) and the output (all four turns), greedy and at temperature 0.7, one round each (`ROUNDS=1`), the engines alternating.
 Each engine writes its own text, so the drafts it accepts count in its output speed, as they do for a user.
 Another temperature: `MODES` (`t10` is temperature 1.0; everyday use's is `TEMPERATURE`); the merge's check keeps 0.7, the temperature the limits were set at.
-The wrapper commands in `XE` and `UP` must pass stdin through (`docker run -i` for upstream's `sycl/` image).
+The wrapper commands in `XE` and `UP` must pass stdin through.
 
 ## Everyday use
 
