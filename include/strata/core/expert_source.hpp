@@ -29,6 +29,7 @@
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstddef>
@@ -38,6 +39,7 @@
 #include <unordered_map>
 #include <utility>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 namespace strata::kernels::cpu {
@@ -620,6 +622,22 @@ private:
     uint64_t mapped_bytes_ = 0;
     std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
     void* complement_arena_ = nullptr;
+    /// The complement in page-locked parts when one host allocation of it was refused: [start, end) of the offsets.
+    struct ComplementChunk { uint64_t start, end; uint8_t* host; const uint8_t* device; };
+    std::vector<ComplementChunk> complement_chunks_;
+    static const ComplementChunk* chunk_of(const std::vector<ComplementChunk>& chunks, uint64_t offset) {
+        auto it = std::upper_bound(chunks.begin(), chunks.end(), offset,
+                                   [](uint64_t o, const ComplementChunk& c) { return o < c.start; });
+        return &*(it - 1);
+    }
+    static uint8_t* chunk_at(const std::vector<ComplementChunk>& chunks, uint64_t offset) {
+        const ComplementChunk* c = chunk_of(chunks, offset);
+        return c->host + (size_t) (offset - c->start);
+    }
+    uint8_t* complement_at(uint64_t offset) const {
+        return complement_chunks_.empty() ? (uint8_t*) complement_host_ + (size_t) offset
+                                          : chunk_at(complement_chunks_, offset);
+    }
     const uint8_t* complement_host_ = nullptr;
     const uint8_t* complement_device_ = nullptr;
     uint64_t complement_bytes_ = 0;

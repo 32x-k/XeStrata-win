@@ -425,7 +425,10 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 void FileExpertSource::close() {
     if (complement_arena_ || xstage_) strata::gpu::device_sync();
     inputs_.clear();
-    if (complement_arena_ != nullptr) {
+    if (!complement_chunks_.empty()) {
+        for (const ComplementChunk& c : complement_chunks_) (void) strata::gpu::free(c.host);
+        complement_chunks_.clear();
+    } else if (complement_arena_ != nullptr) {
         if (complement_pinned_ && !complement_partial_) (void) strata::gpu::free(complement_arena_);
         else {
             if (complement_partial_) (void) strata::gpu::host_unregister(complement_arena_);
@@ -1022,9 +1025,13 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t partial_pin = 0;   ///< CS-T: a registered prefix of a locked arena
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
     std::string note;
+    std::vector<ComplementChunk> chunks;   ///< the arena in parts when one allocation was refused
     auto release = [&]() {
         if (arena == nullptr) return;
-        if (pinned_ok) (void) strata::gpu::free(arena);
+        if (!chunks.empty()) {
+            for (const ComplementChunk& c : chunks) (void) strata::gpu::free(c.host);
+            chunks.clear();
+        } else if (pinned_ok) (void) strata::gpu::free(arena);
         else {
             if (partial_pin > 0) (void) strata::gpu::host_unregister(arena);
             if (locked > 0) strata::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
@@ -1052,15 +1059,54 @@ bool FileExpertSource::pin_cache_complement(
                     arena = nullptr;
                 }
             } else {
-                // Refused (the driver's page-locked limit): the same bytes in ordinary memory, copied by the CPU
-                // instead of by DMA.  Not locked in the working set: on the B70 (Level Zero refused 48 GiB of
-                // UD-Q4_K_XL) the locked copy read a 32K prompt 1.6% slower than the plain one.
+                // Refused: a single host allocation has a ceiling below the RAM (the B70's Level Zero took 30 GiB and
+                // refused 32, 2026-10-11), so the same bytes in parts, each page-locked and mapped, cut between
+                // blobs; the experts stay where the PCIe share reads them.  Only when the parts are refused too: the
+                // same bytes in ordinary memory, copied by the CPU instead of by DMA, not locked in the working set
+                // (on the B70 the locked copy read a 32K prompt 1.6% slower than the plain one).
                 note = std::string("page-locking refused (") + strata::gpu::last_error() + ")";
-
                 arena = nullptr;
+                std::vector<std::pair<uint64_t, uint64_t>> blobs;   // (offset, bytes), in arena order
+                for (size_t i = 0; i < offsets.size(); ++i)
+                    if (offsets[i] != kNoComplement)
+                        blobs.emplace_back(offsets[i], layer_blob_bytes_[i / (size_t) n_expert_]);
+                std::sort(blobs.begin(), blobs.end());
+                const char* parts_env = std::getenv("STRATA_PIN_PARTS");   // 0: one allocation or none (A/B)
+                const int max_parts = parts_env != nullptr ? std::atoi(parts_env) : 32;
+                for (int parts = 2; parts <= max_parts && chunks.empty(); ++parts) {
+                    std::vector<ComplementChunk> got;
+                    uint64_t start = 0;
+                    bool ok = true;
+                    for (size_t b = 0; b <= blobs.size() && ok; ++b) {
+                        const uint64_t at = b < blobs.size() ? blobs[b].first : bytes;
+                        const bool cut = b == blobs.size() ||
+                                         at - start >= (bytes + (uint64_t) parts - 1) / (uint64_t) parts;
+                        if (!cut || at == start) continue;
+                        ComplementChunk c{start, at, nullptr, nullptr};
+                        void* h = nullptr;
+                        void* d = nullptr;
+                        ok = strata::gpu::alloc_host(&h, (size_t) (at - start));
+                        if (ok) c.host = (uint8_t*) h;
+                        ok = ok && strata::gpu::device_pointer(&d, h) && d != nullptr;
+                        if (h != nullptr) got.push_back(c);
+                        if (ok) got.back().device = (const uint8_t*) d;
+                        start = at;
+                    }
+                    if (ok) chunks.swap(got);
+                    else
+                        for (const ComplementChunk& c : got) (void) strata::gpu::free(c.host);
+                }
+                if (!chunks.empty()) {
+                    pinned_ok = true;
+                    note = "page-locked and mapped in " + std::to_string(chunks.size()) + " parts (one " +
+                           std::to_string(bytes) + "-byte allocation refused)";
+                }
             }
         }
-        if (arena == nullptr) {
+        if (!chunks.empty()) {
+            arena = chunks[0].host;
+            device = chunks[0].device;
+        } else if (arena == nullptr) {
             arena = std::malloc((size_t) bytes);
             if (arena == nullptr) {
                 err = "FileExpertSource: pageable resident complement allocation failed";
@@ -1118,7 +1164,7 @@ bool FileExpertSource::pin_cache_complement(
                     fail("FileExpertSource: invalid blob bounds while building the cache complement");
                     return;
                 }
-                uint8_t* dst = (uint8_t*) host + (size_t) offset;
+                uint8_t* dst = chunks.empty() ? (uint8_t*) host + (size_t) offset : chunk_at(chunks, offset);
                 if (!direct_.empty()) {
                     batch.push_back({0, layer, expert, dst});
                     if (batch.size() == 32 && !flush()) {
@@ -1178,6 +1224,7 @@ bool FileExpertSource::pin_cache_complement(
     }
 
     complement_arena_ = arena;
+    complement_chunks_ = std::move(chunks);
     complement_host_ = host;
     complement_device_ = device;
     complement_bytes_ = bytes;
@@ -1244,7 +1291,8 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     const bool uniform = std::all_of(layer_blob_bytes_.begin(), layer_blob_bytes_.end(),
                                      [blob](uint64_t b) { return b == blob; });
     const bool eligible = requested && uniform && complement_pinned_ && !complement_partial_ &&
-                          complement_host_ != nullptr && complement_device_ != nullptr && complement_bytes_ > 0;
+                          complement_host_ != nullptr && complement_device_ != nullptr && complement_bytes_ > 0 &&
+                          complement_chunks_.empty();
     const size_t total = (size_t) n * (size_t) blob;
     void* p = nullptr;
     if (strata::gpu::alloc_host(&p, total) == true && p != nullptr) {
@@ -1259,7 +1307,7 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     xstage_cap_ = n;
     xstage_blob_ = blob;
     if (requested) {
-        std::string reason = "it needs equal-size expert blobs and a fully page-locked RAM copy";
+        std::string reason = "it needs equal-size expert blobs and a fully page-locked RAM copy in one part";
         void* device = nullptr;   // host USM: the device reads it at the same address
         if (eligible && xstage_pinned_ && strata::gpu::device_pointer(&device, p) && device != nullptr) {
             try {
@@ -1317,7 +1365,7 @@ int64_t FileExpertSource::commit_exchanges() {
         const uint64_t at = complement_offsets_[x.in];
         if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
             complement_host_ != nullptr) {
-            std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
+            std::memcpy(complement_at(at), src, (size_t) x.bytes);
             if (detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) ++n;
         }
         override_[x.out] = nullptr;
@@ -1334,7 +1382,7 @@ void FileExpertSource::commit_copies() {
         const uint64_t at = complement_offsets_[x.in];
         if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
             complement_host_ != nullptr)
-            std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
+            std::memcpy(complement_at(at), src, (size_t) x.bytes);
     }
 }
 
@@ -1373,6 +1421,9 @@ const uint8_t* FileExpertSource::resident_blob(int64_t layer, int64_t expert) co
 
 const uint8_t* FileExpertSource::resident_blob(size_t index) const {
     if (exchange_storage_.active()) return exchange_storage_.resident(index).host;
+    if (!complement_chunks_.empty())
+        return index < complement_offsets_.size() && complement_offsets_[index] != kNoComplement
+                   ? complement_at(complement_offsets_[index]) : nullptr;
     return detail::cache_complement_blob_or_fallback(index, complement_offsets_, complement_host_, nullptr);
 }
 
@@ -1420,6 +1471,11 @@ const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) con
     if (!pinned(layer, expert) || complement_device_ == nullptr) return nullptr;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     if (exchange_storage_.active()) return exchange_storage_.resident(index).device;
+    if (!complement_chunks_.empty()) {
+        const uint64_t off = complement_offsets_[index];
+        const ComplementChunk& c = *chunk_of(complement_chunks_, off);
+        return c.device + (size_t) (off - c.start);
+    }
     return complement_device_ + (size_t) complement_offsets_[index];
 }
 
