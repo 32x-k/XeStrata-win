@@ -2289,9 +2289,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (lay.native) {
                             // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                             const auto& f = lay.fmt[(size_t) l];
-                            strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                                               gu16, m.cs);
-                            strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, d16, m.cs);
+                            // STRATA_PF_DQ_FUSED=0: the two launches (upstream 75109596 fused them)
+                            static const bool dq_fused = [] {
+                                const char* v = std::getenv("STRATA_PF_DQ_FUSED");
+                                return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+                            }();
+                            if (dq_fused) {
+                                strata::kernels::iq_dequant_expert_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff,
+                                                                       f.n_embd, gu16, f.d_type, blob_dev + f.down_off,
+                                                                       d16, m.cs);
+                            } else {
+                                strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff,
+                                                                   f.n_embd, gu16, m.cs);
+                                strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, d16,
+                                                                m.cs);
+                            }
                         } else {
                             blob_dequant_f16(blob_dev, gu16, d16, m.cs);
                         }
