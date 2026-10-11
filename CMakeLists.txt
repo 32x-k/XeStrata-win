@@ -6,14 +6,14 @@ project(XeStrata LANGUAGES CXX)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "Strata supports Linux only")
 endif()
-set(STRATA_UPSTREAM_VERSION "0.1.40.2")
-set(STRATA_UPSTREAM_COMMIT "e8ca9af")
+set(STRATA_UPSTREAM_VERSION "0.1.42")
+set(STRATA_UPSTREAM_COMMIT "61b3fb5")
 # XeStrata's version follows the upstream version it has integrated, marked "xe" so it is not taken for upstream's.
 # XESTRATA_REVISION counts XeStrata's releases on that upstream version from 1, as a Debian revision does: the packages
 # are <upstream>-<revision> (rpm: Version and Release), the version name xe<upstream> for the first release and
 # xe<upstream>.<revision - 1> for a later one (xe0.1.40.2.1 is the package 0.1.40.2-2), more numbers than project()
 # can hold.
-set(XESTRATA_REVISION 3)
+set(XESTRATA_REVISION 1)
 if(XESTRATA_REVISION GREATER 1)
   math(EXPR _xe_later "${XESTRATA_REVISION} - 1")
   set(XESTRATA_VERSION "${STRATA_UPSTREAM_VERSION}.${_xe_later}")
