@@ -107,7 +107,7 @@ Every idea is ported and measured, whether XeStrata wins or loses against upstre
 - Port it behind an environment switch (`STRATA_<NAME>=0|1`, or the option upstream gave it), so it can be measured on and off and turned off later. Related ideas go in as a group, each behind its own switch.
 - Its condition is XeStrata's: what the device reports (matrix units, memory, the PCIe link, the CPU pool's measured speed), not upstream's backend.
 - An exact change that can be checked bitwise is checked by a probe; an opt-in feature is run once to see it works.
-- A speed idea is measured with `scripts/ab_pair.py`: the same binary with its switch off (A) and on (B), alternating, in the setting the idea is for (its tier, the serve path, a conversation; `TIERS`, `MODES`, `CONVS`), on all three GPUs and on each with its matrix units off (`STRATA_NO_XMX`, `STRATA_NO_BF16_MMA`, `STRATA_NO_INT8_MMA`).
+- A speed idea is measured with `scripts/ab_pair.py`: the same binary with its switch off (A) and on (B), in the setting the idea is for (its tier, the serve path, a conversation; `TIERS`, `MODES`, `CONVS`), once (`ROUNDS=1`) on one GPU, the one the idea is most likely to help (the user's decision of 2026-10-12).
   Both runs are XeStrata with one seed: they write one text unless the switch changes the output, so the difference is the switch's alone and a difference of 1 to 2% shows.
 
 ```sh
@@ -117,7 +117,9 @@ A="env STRATA_X=0 build/contrib-llvm/strata" B="env STRATA_X=1 build/contrib-llv
 python .claude/skills/upstream-sync/scripts/judge.py <out>        # B against A per cell
 ```
 
-- Kept on where it is faster on a GPU and slower on none (chosen at run time from what the device reports where it helps only some); opt-in where it is faster nowhere but upstream keeps it as an option; removed otherwise. The numbers go into the idea's line, the commit and the record.
+- Faster on that GPU, or equal (within ±1%): kept, on by default.
+  Slower: measured once on each of the two other GPUs; kept on where it is faster or equal there (chosen at run time from what the device reports, when it helps only some); opt-in where it is slower everywhere but upstream keeps it as an option; removed otherwise.
+  The numbers go into the idea's line, the commit and the record.
 - Probes on the B70 and the RTX 4070 may run together; whole-engine A/B runs one card at a time.
 
 ### GPUs there is no machine for
