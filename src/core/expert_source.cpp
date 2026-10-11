@@ -292,6 +292,31 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     return true;
 }
 
+std::string page_cache_hint(const std::string& meminfo_text) {
+    const auto kib = [&](const char* key) -> uint64_t {
+        std::istringstream in(meminfo_text);
+        std::string line;
+        const std::string want = std::string(key) + ":";
+        while (std::getline(in, line)) {
+            std::istringstream f(line);
+            std::string k;
+            uint64_t v = 0;
+            if (f >> k >> v && k == want) return v;
+        }
+        return 0;
+    };
+    const uint64_t cache = (kib("Cached") + kib("Buffers")) * 1024;
+    if (cache < (1ull << 30)) return "";
+    char msg[420];
+    std::snprintf(msg, sizeof msg,
+                  "; %.1f GiB of the RAM is file cache (earlier runs' model files, which Linux gives back on demand - "
+                  "'free' showing little is normal). If the start still fails, free it with: "
+                  "sync; echo 1 | sudo tee /proc/sys/vm/drop_caches   (or start the server with "
+                  "STRATA_DROP_CACHE_ON_EXIT=1 so it releases its model files when it stops)",
+                  (double) cache / 1073741824.0);
+    return msg;
+}
+
 }  // namespace detail
 
 namespace {
@@ -997,6 +1022,13 @@ bool FileExpertSource::pin_cache_complement(
                           (double) bytes / 1073741824.0, (double) physical / 1073741824.0,
                           (double) headroom_bytes / 1073741824.0);
             err = message;
+#if defined(__linux__)
+            if (std::ifstream mi("/proc/meminfo"); mi) {
+                std::stringstream mt;
+                mt << mi.rdbuf();
+                err += detail::page_cache_hint(mt.str());
+            }
+#endif
             return false;
         }
     }

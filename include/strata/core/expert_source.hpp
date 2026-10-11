@@ -110,6 +110,11 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
 /// (the caller copies out's bytes there).  False, and nothing changed, unless `in` is in the copy and `out` is not.
 bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out);
 
+/// The sentence appended to a "not enough RAM" start failure: how much of the RAM is file cache (Cached + Buffers of
+/// `meminfo_text`, a /proc/meminfo text, mapped pages included) and what to do about it; "" when under 1 GiB of cache
+/// (nothing to say).  upstream 8c80a3ba.
+std::string page_cache_hint(const std::string& meminfo_text);
+
 }  // namespace detail
 
 

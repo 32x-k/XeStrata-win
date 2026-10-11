@@ -295,6 +295,17 @@ void test_cgroup_memory_budget() {
             "missing memory.stat counters did not fail closed");
 }
 
+// upstream 8c80a3ba (and ed5536ea): the file cache named in a "not enough RAM" start failure
+void test_page_cache_hint() {
+    using namespace strata::core::detail;
+    const std::string info =
+        "MemTotal:       65011484 kB\nMemFree:         1284096 kB\nMemAvailable:   33463296 kB\nCached:         54507520 kB\n";
+    require(page_cache_hint(info).find("drop_caches") != std::string::npos &&
+            page_cache_hint(info).find("STRATA_DROP_CACHE_ON_EXIT") != std::string::npos &&
+            page_cache_hint(info).find("52.0 GiB") != std::string::npos, "the cache hint is incomplete");
+    require(page_cache_hint("MemFree: 100 kB\nCached: 1000 kB\n").empty(), "a small cache was reported");
+}
+
 // STRATA_EXCHANGE_ROTATE (upstream 1e6cec80): 32 rounds of two swaps through a GPU cache, with and without the
 // rotation and with an unpinned copy (the rotation then stays off); the bytes, the residency, the RAM and device
 // aliases and the accounting after each
@@ -395,6 +406,7 @@ int main(int argc, char** argv) {
         test_resident_lend_region();
         test_resident_exchange();
         test_cgroup_memory_budget();
+        test_page_cache_hint();
         test_canonical_layout();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
