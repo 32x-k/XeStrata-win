@@ -3331,6 +3331,11 @@ def main() -> int:
     ap.add_argument("--bench-temperature", type=float, default=0.7, metavar="T",
                     help="with --bench or --bench-verbose: the temperature of the sampled runs (default 0.7, as Qwen "
                          "recommends; 0 to 2 in steps of 0.1, 0 = greedy only)")
+    ap.add_argument("--bench-original-compat", nargs=argparse.REMAINDER, metavar="ARGS",
+                    help="measure the installed model the way upstream Strata's benchmark mode (tools/strata_bench.py) "
+                         "does, through the server's HTTP API (about 3-10 minutes), and write a report in its "
+                         "community format to the data folder's records/; ARGS after it go to that tool (--long, "
+                         "--clients N, --compare DIR). --bench is XeStrata's own measurement")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.source:
@@ -3343,6 +3348,9 @@ def main() -> int:
         ap.error("--vision-tokens takes a number of image tokens, 1 or more, e.g. --vision-tokens 768")
     if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
         ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
+    if a.bench_original_compat is not None and (a.bench or a.bench_verbose or a.original_strata):
+        ap.error("--bench-original-compat is a measurement of its own: give it without --bench, --bench-verbose and "
+                 "--original-strata")
     if a.original_strata and not (a.bench or a.bench_verbose):
         ap.error("--original-strata TAG goes with --bench or --bench-verbose, e.g. --bench --original-strata v0.1.41")
     if not 0 <= a.bench_temperature <= 2 or abs(a.bench_temperature * 10 - round(a.bench_temperature * 10)) > 1e-6:
@@ -3405,6 +3413,18 @@ def main() -> int:
     # choice, and asked once when the PC has cards that could share the model
     run_gpu = (parse_gpus(a.gpus, gpus()) if a.gpus else None) or a.gpu
     port = a.port or 8095                              # a new install's port (issue #32: --port for an existing one)
+    if a.bench_original_compat is not None:
+        # upstream's benchmark mode (dfaebd9d), as it is: the newest installed model (--model and --family pick
+        # another), the server started with its config and stopped after
+        if not have:
+            fail("no model is installed yet", "run setup first, then --bench-original-compat")
+        cfgs = [c for c in have if (not a.model or choices_from_config(c)["model"] == a.model) and
+                (not a.family or choices_from_config(c)["family"] == a.family)]
+        if not cfgs:
+            fail("that model is not installed", "leave out --model and --family to measure the newest one")
+        update_installed_engine()
+        return subprocess.call([sys.executable, str(ROOT / "tools" / "strata_bench.py"), "--config", str(cfgs[0]),
+                                "--out", str(data / "records"), *a.bench_original_compat])
     if a.bench or a.bench_verbose:
         if not have:
             fail("no model is installed yet", "run setup without --bench first, then --bench")

@@ -61,6 +61,25 @@ Its engine is made as upstream's setup makes it:
 - NVIDIA's prebuilt engine and the Intel Docker image are not free software: a free build does not compare on NVIDIA and Intel GPUs.
 - On Intel GPUs the decode speed is not compared: upstream's `sycl/` reads the experts that do not fit in VRAM over PCIe.
 
+## xestrata --bench-original-compat
+
+A compatibility mode that runs upstream Strata's benchmark mode (`tools/strata_bench.py`, upstream v0.1.43) as upstream measures.
+Use it to compare with upstream users' reports (the format of upstream's `docs/COMMUNITY_BENCHMARKS.md`).
+XeStrata's own measurement is `--bench`.
+
+```sh
+xestrata --setup --bench-original-compat                        # the newest installed model (--model, --family: another)
+xestrata --setup --bench-original-compat --long --clients 4     # the arguments after it go to strata_bench.py as they are
+xestrata --setup --bench-original-compat --compare <an earlier results folder>
+```
+
+- It starts the server with the installed model's config (or uses the one running) and sends a fixed suite through the HTTP API, the median of three runs each, with thinking off (`--think` turns it on).
+- The tests are upstream's: three short questions (up to 100 tokens), a 4K and a 16K prompt, a 5-turn agent session that adds a file each turn. `--long` adds a 32K prompt, `--clients N` N requests at once.
+- It takes about 3 to 10 minutes after the model has loaded.
+- The results go to the data folder's `records/<date>-community-<GPU>-<model>/` (`README.md`, `results.json`, `engine-log-excerpt.txt`). Home folders, user and host names, IP addresses and API keys are replaced before anything is written. Nothing is sent anywhere.
+- What differs from upstream: the config files (`xestrata-*.json`), the version the report gives (XeStrata's) and where it writes.
+- It does not go with `--bench`, `--bench-verbose` or `--original-strata`.
+
 ## The upstream merges' measurements
 
 When an upstream release is brought in (`.claude/skills/upstream-sync/SKILL.md`), XeStrata and upstream take turns in all three measurements on the B70, the RTX 4070 and the RX 9060 XT, and `judge.py` judges them.

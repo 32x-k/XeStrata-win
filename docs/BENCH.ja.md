@@ -61,6 +61,25 @@ xestrata --bench --original-strata v0.1.41        # 同じモデルで upstream 
 - NVIDIA の配布物と Intel の Docker イメージは自由ソフトウェアでないので、free のビルドでは NVIDIA と Intel の比較はしません。
 - Intel では decode の速さを比べません。upstream の `sycl/` は、VRAM に入らないエキスパートを PCIe 越しに読むためです。
 
+## xestrata --bench-original-compat
+
+upstream Strata のベンチマークのモード（`tools/strata_bench.py`、upstream v0.1.43）を、そのままの測り方で動かす互換モードです。
+upstream の利用者の報告（upstream の `docs/COMMUNITY_BENCHMARKS.md` の形）と並べて比べるときに使います。
+XeStrata 自身の測り方は `--bench` です。
+
+```sh
+xestrata --setup --bench-original-compat                        # 一番新しく入れたモデル（--model・--family で別のモデル）
+xestrata --setup --bench-original-compat --long --clients 4     # 後ろの引数は strata_bench.py にそのまま渡す
+xestrata --setup --bench-original-compat --compare <前の結果のフォルダ>
+```
+
+- 入れたモデルの設定でサーバーを起動し（動いていればそれを使い）、HTTP API に決まった要求を送ります。各 3 回の中央値です。考えは切ります（`--think` で入れます）。
+- 試験は upstream と同じです: 短い質問 3 つ（最大 100 トークン）、4K と 16K のプロンプト、ファイルを足していく 5 ターンのエージェント。`--long` で 32K のプロンプト、`--clients N` で N 件の同時の要求を足します。
+- 時間はモデルを読んだ後 3〜10 分ほどです。
+- 結果はデータフォルダの `records/<日付>-community-<GPU>-<モデル>/` に書きます（`README.md`、`results.json`、`engine-log-excerpt.txt`）。ホームフォルダ、ユーザー名、ホスト名、IP アドレス、API キーは書く前に置き換えます。どこにも送りません。
+- upstream と違うのは、設定ファイル（`xestrata-*.json`）、報告に書く版（XeStrata の版）、書き出す場所だけです。
+- `--bench`、`--bench-verbose`、`--original-strata` とは一緒に使えません。
+
 ## upstream 追従の計測
 
 upstream のリリースを取り込むとき（`.claude/skills/upstream-sync/SKILL.md`）は、B70・RTX 4070・RX 9060 XT のそれぞれで、3 つの測り方すべてで XeStrata と upstream を交互に測り、`judge.py` で判定します。
