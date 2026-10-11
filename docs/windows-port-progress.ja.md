@@ -148,6 +148,22 @@ prefillとdecodeは別に集計しています。decodeの平均は、待機352.
 
 ユーザーの指定に従い、Phase 2の記録と検証を終えた時点で停止します。Phase 3の高速化、DPC++への移行、他GPUへの対応、大規模なリファクタリングには着手していません。
 
+## Phase 3開始前: AdaptiveCppの暫定async-handlerパッチ
+
+使用中のAdaptiveCpp `0ea863abe1af4422593583f91e5608ef75044a16`では、node付き`sycl::event` constructorが受け取った`async_handler`を保存していませんでした。非空のerror一覧を通知すると、元の例外ではなく`std::bad_function_call`になり得ます。
+
+`third_party/main/adaptivecpp/patches/0001-event-async-handler.patch`で、constructorの1行だけを変更します。元のBSD-2-Clause copyright・license表示は維持しました。`tools/adaptivecpp_build.py`はSHAとheader全文を確認してからビルド前に適用し、適用済みならスキップ、不整合なら停止します。LF/CRLFを区別し、source/build/prefixの重複や正常版installの上書きも拒否します。install後のheader全文とSHA-256をreceiptへ記録します。手順は`third_party/main/adaptivecpp/README.ja.md`にあります。
+
+既存環境を上書きせず、同じcommitの別worktree `.tools/AdaptiveCpp-eventfix-src`からCPU backendのみのruntimeをビルドし、`.tools/adaptivecpp-eventfix`へinstallしました。installed headerが修正済みsourceと一致することを確認しました。最初の単独Windowsビルドは例外を無効にした設定で停止したため、別ビルドのcompiler flagに`/EHsc`を明示しました。XeStrata本体やAdaptiveCppのqueue/DAG/schedulerは変更していません。
+
+隔離テスト`tests/platform/adaptivecpp_event_async.cpp`は、実際のinstalled headerとruntimeの共有error一覧を使います。nodeはnullで、device queue、device allocation、kernel、DMA、HIP直接呼出しはありません。synthetic errorの元diagnostic・SYCL errc、handler呼出し回数、複数error、event copy、再通知なし、throwするhandlerを確認しました。同じCPU runtimeと未修正headerのnegative controlでは、handler未通知と`std::bad_function_call`を再現しました。両方とも20秒timeout内で正常終了し、出力したruntime DLL pathは新prefixでした。Windowsでは再throw後の`exception_ptr`同一性は保証されないため、type/code/diagnosticを検査しています。
+
+wrapperの26件のhostテストは成功しました。主な記録は`build/windows-acpp/async-eventfix-build-v2.log`、`async-eventfix-receipt.json`、最終wrapperで再適用をスキップした`async-eventfix-receipt-v3.json`、`async-eventfix-installed-check.json`、`async-eventfix-wrapper-tests-final-v2.log`、`async-eventfix-installed-final-v2.json`、`async-eventfix-skip-final-v2.json`、`async-eventfix-fixed-test-v2.txt`、`async-eventfix-broken-test-v2.txt`です。
+
+正常版のAdaptiveCpp source/header、HIP install、生成実行ファイルと既存の復元用コピーは維持しています。新prefixは隔離検証用で、正常版のHIP環境へ切り替えたものではありません。GPU実行や意図的なhang、driver更新、Phase 3の性能最適化は行っていません。
+
+この修正が対象とするのは、handlerを渡したnode付きeventの通知です。default生成eventのhandler挙動、process-global error一覧の競合、cancelされたnodeのcomplete扱い、HIP待機失敗後やDMA完了不明時のcleanupは別課題として残します。今回の成功をGPU障害時のbuffer寿命や実モデル生成の検証とは扱わず、ここで停止します。
+
 ## 2026-10-11: ツールチェーンの確認
 
 使用したリポジトリは `e32b8b0594095352365db0e140a68d5bf56d8b0f` です。作業開始時のワークツリーに変更はありませんでした。

@@ -30,6 +30,11 @@ SPDX-License-Identifier = "LGPL-3.0-or-later"
 
 # free third-party material: under its own license
 [[annotations]]
+path = ["third_party/main/adaptivecpp/LICENSE"]
+SPDX-FileCopyrightText = "The AdaptiveCpp Contributors"
+SPDX-License-Identifier = "BSD-2-Clause"
+
+[[annotations]]
 path = ["third_party/main/ggml/**"]
 SPDX-FileCopyrightText = "2023-2026 The ggml authors"
 SPDX-License-Identifier = "MIT"

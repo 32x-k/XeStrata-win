@@ -148,6 +148,22 @@ The Phase 0 executable and the numerically checked Phase 1 recovery copies are p
 
 At the user's request, work stops after Phase 2 records and validation. Phase 3 optimization, migration to DPC++, other-GPU support and major refactoring have not started.
 
+## Before Phase 3: temporary AdaptiveCpp async-handler patch
+
+In the AdaptiveCpp version in use, `0ea863abe1af4422593583f91e5608ef75044a16`, the node-bearing `sycl::event` constructor did not retain its supplied `async_handler`. Delivering a nonempty error list could produce `std::bad_function_call` instead of the original exception.
+
+`third_party/main/adaptivecpp/patches/0001-event-async-handler.patch` changes only that constructor line, preserving the original BSD-2-Clause copyright/license notice. `tools/adaptivecpp_build.py` checks the commit SHA and complete header before applying the patch ahead of the build. It skips an already-applied patch and stops on inconsistency. It distinguishes LF/CRLF and refuses source/build/prefix overlap or overwriting the working installation. Installed-header contents and SHA-256 are recorded in the receipt. Instructions are in `third_party/main/adaptivecpp/README.md`.
+
+Without overwriting the existing environment, a separate worktree at the same commit, `.tools/AdaptiveCpp-eventfix-src`, was built with only the CPU backend and installed into `.tools/adaptivecpp-eventfix`. The installed header matches the patched source. The initial standalone Windows build stopped because exceptions were disabled; `/EHsc` was then explicitly supplied in this separate build's compiler flags. Neither the XeStrata engine nor AdaptiveCpp queue/DAG/scheduler implementations were changed.
+
+The isolated `tests/platform/adaptivecpp_event_async.cpp` uses real installed headers/runtime and the shared error list. Its nodes are null; it uses no device queue, device allocation, kernel, DMA or direct HIP call. Controlled synthetic errors verify original diagnostics and SYCL errc, handler counts, batching, event copies, no redelivery and throwing handlers. The negative control, using the same CPU runtime with the original header, reproduces an uncalled handler and `std::bad_function_call`. Both complete successfully within a 20-second timeout and report the new prefix's runtime DLL path. Windows does not guarantee `exception_ptr` identity across rethrows, so the test checks type/code/diagnostics instead.
+
+All 26 host wrapper tests pass. Main records are `build/windows-acpp/async-eventfix-build-v2.log`, `async-eventfix-receipt.json`, `async-eventfix-receipt-v3.json` (the final wrapper's already-applied build/install rerun), `async-eventfix-installed-check.json`, `async-eventfix-wrapper-tests-final-v2.log`, `async-eventfix-installed-final-v2.json`, `async-eventfix-skip-final-v2.json`, `async-eventfix-fixed-test-v2.txt`, and `async-eventfix-broken-test-v2.txt`.
+
+The working AdaptiveCpp source/header, HIP installation, generation executable and existing recovery copies remain intact. The new prefix is for isolated validation, not a switch of the working HIP environment. No GPU execution, intentional hang, driver update or Phase 3 optimization was performed.
+
+This fix covers notification by node-bearing events supplied with a handler. Default-constructed-event handler behavior, competing consumers of the process-global error list, cancelled nodes reporting complete, and cleanup after failed HIP waits or uncertain DMA remain separate issues. These passing tests do not establish GPU-fault buffer lifetime or real-model correctness. Work stops here.
+
 ## 2026-10-11: toolchain check
 
 The repository revision is `e32b8b0594095352365db0e140a68d5bf56d8b0f`. The worktree was unchanged at the start of this work.
