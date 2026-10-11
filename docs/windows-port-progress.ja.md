@@ -259,9 +259,74 @@ default 4 slotsでは25,440 lookupsに対し既存resident hit 4、新規admissi
 
 ### 撤退判断と再開条件
 
-今回cache-onを採用しません。既存pathはGPUで動作しますが、事前に定義した実モデルの数値条件を満たさず、原因を限定した互換修正がないためです。sourceや正常版に変更はなく、cache-offとPhase 3Bの基準を維持します。再開には、実routingと同じ入力・同じexpertのGPU hit／CPU miss中間出力を照合し、差が拡大する最初のquantization・state・dispatchを限定したうえで、同じ数値基準を満たす小さい修正が必要です。性能評価はその後の別指示で行います。
+今回cache-onを採用しません。既存pathはGPUで動作しますが、事前に定義した実モデルの数値条件を満たさず、原因を限定した互換修正がないためです。sourceや正常版に変更はなく、cache-offとPhase 3Bの基準を維持します。再開には、実routingと同じ入力・同じexpertのGPU hit／CPU miss中間出力を照合し、差が拡大する最初のquantization・state・dispatchを限定したうえで、同じ数値基準を満たす小さい修正が必要です。cache-onの性能評価はその後の別指示で行います。
 
 開始・保護対象は`build/windows-acpp/phase3c-start-state.json`、事前基準は`phase3c-predeclared-contract.json`、数値比較は`phase3c-on4-initial-vs-phase3c-off-initial.json`と`phase3c-on4-cpuorder-vs-phase3c-off-initial-v2.json`、raw結果は`phase3c-raw-default.txt`と`phase3c-raw-cpuorder.txt`、診断集計は`phase3c-diagnostic-metrics.json`、integrityは`phase3c-final-integrity.json`です。ログ・モデル・実行ファイル・ローカルfixtureはcommitせず、`git diff --check`と日本語lintは成功しました。全体lintは必要ツール不足で完了せず、REUSEの残る指摘は既存の`.agents/skills`のcheckout状態だけです。日英の撤退記録だけをcommitして停止します。Phase 3D、WMMA、Command Graph、VMM、DPC++移行、他GPU対応には着手していません。
+
+## Phase 3P: 性能内訳と次の調査地点
+
+### 基準、測定方法、終了判断
+
+開始HEADは`570fc69a690d9a9a311fc943a1644a798553c281`、branchは`feature/windows-r9700-sycl`、作業ツリーはcleanでした。Windows 11 Pro build 26200、Ryzen AI 9 HX 370（12 cores／24 logical processors）、R9700 driver `32.0.32015.2008`を記録しました。free modeのLLVM 24は`4f43f4746ede4cc49ab4129f473dbd54e0d9db4f`、AdaptiveCppは`0ea863abe1af4422593583f91e5608ef75044a16`です。SDK headerのHIP versionは7.17.26391です。実際にロードしたHIP DLLはSystem32の`amdhip64_7.dll`で、Windows FileVersion／ProductVersionの`10.0.3683.0`をHIP API versionとは呼びません。新しい2モデルprocessでも主要DLLのhashは同じでした。
+
+Phase 2、3B、3C cache-offの保存済み11実行を再集計しました。現行の速度基準には、dumpなし・3B candidateの3実行だけを使います。共通条件は既存Q2_0 packとIQ4_NL PLE、13 input IDs、41生成token、context 256、cap 64、greedy/EOS、3 workers＋caller、mmap、cache 0、no-capture、DAG方式、no-XMX、VRAM表示上限8 GiBです。旧3B baseはmarker 192、現行candidateは144 calls/位置です。Phase 2の診断dump付き時間を、dumpなしの3Bと高速化の前後比較には使いません。OSページcache温度や外部負荷は制御していません。
+
+追加計測は既存3B実行ファイルでの正常な診断実行1回、model-free SYCL profiling確認1回、ETW記録下の推論1回に限定しました。正常診断は全13,160,960 logits・26,593,280残差値が保存済みcache-offとbitwise一致し、finite、41 sampled argmax／tokenも一致しました。診断時Decodeは1.76 tok/sで、過去のdumpなし中央値2.525 tok/sとの差を回帰とは扱いません。
+
+AMD profilerは確認したPATH・install場所に見つかりませんでした。Windowsの[公式component表](https://rocm.docs.amd.com/projects/install-on-windows/en/latest/conceptual/component-support.html)はRadeon GPU Profilerを挙げますが、この環境に導入済みとは限りません。代替は標準SYCL profilingとETWの2種類に限りました。標準profilingは既存のlast-copy wait後にだけ取得し、6,144 readback値が完全一致しました。HIP backendはstart/endにstream eventを置き、`hipEventElapsedTime`から差を計算します。ただしこれはstream上の操作を囲む時間で、API発行中の空白も含み得ます。hardware kernel dispatch時間やDMA bus占有時間そのものではありません。絶対時刻は`steady_clock`とhost基準eventから構成され、laneをまたぐ比較には基準点誤差があります。
+
+最後のeventからDAGをたどる方法では、weak dependencyの先行nodeがGC済みの場合、全submissionを回収できません。queue observerのローカルprototypeは作りましたが、統一header overlayと全node保持が必要になるため、実モデル用にbuild・実行・採用していません。正常版や推論sourceは変更していません。
+
+ETWはユーザーのUAC承認を受け、WPR `10.0.26100`で専用instanceの`GPU.light`・`CPU.light`・`DiskIO.light`をmemory modeで開始しました。記録中にtraceを書き込んでSSD計測を汚さないための選択でしたが、35.938秒時点で使用可能RAMが3,022.6 MiBとなり、3 GiBのJob guardで推論を停止しました。31位置のtimingが残りましたが、完全なDecode実行ではありません。記録中のメモリ圧迫を確認しただけで、ETWだけが低下の原因だとは断定していません。追加GPU実行は中止し、自分のWPR instanceをstop=0で終了、not recordingを確認しました。新しい正常診断にはdumpがあり、ETW実行はdumpなしで途中停止したため、両者の速度差をprofiling overheadの率として比較できません。完走した同条件の通常／profiling性能比較は未成立です。
+
+WPAExporter `11.8.423.12582`で停止済みtraceをoffline解析しました。JSON configの最初の試行は`Invalid output format`でload前に失敗したため、CLIへ変えて1回だけ再試行しました。PID 10020をcommand lineで確認し、CPU、process、disk、lost-eventのCSVを取得しましたが、GPU presetはno dataでexport失敗しました。終了code 0を全table成功とは扱いません。このpresetではGPU時間を得られず、trace自体にGPU eventがないとは判断していません。lost-event CSVに行がないことも、loss=0の証明ではありません。exporterはprivate 4 GiB・RAM空き3 GiB・120秒・kill-on-close Jobで制限し、23.984秒、peak private約2,468 MiBで終了しました。
+
+### 測定済みの内訳
+
+以下は3B candidate 2、41 Decode位置のhost側内訳です。この実行は3実行の中央値に当たり、16,239.4 ms／41＝396.083 ms/位置です。複数実行の区間ごとの中央値を足して1実行の内訳にはしていません。
+
+| Host区間 | ms/位置 | wall比 | 含まれる処理・限界 |
+| --- | ---: | ---: | --- |
+| Routing/Input wait | 288.519 | 72.84% | queued pre、前のpost／H2D、転送、DAG/runtimeを含む |
+| CPU Expert callback | 72.724 | 18.36% | mmap fault、入力quantization、2段Expert計算、dispatch・barrierを含む |
+| GPU操作のsubmit合計 | 25.308 | 6.39% | kernelとcopyのhost呼び出し。GPU実行時間ではない |
+| Final drain等の残りの計測区間 | 0.781 | 0.20% | 既存の終了待機。上の区間とhost側では重ならない |
+| Token timer内の未分解分 | 8.751 | 2.21% | PLE、head readback／finite scan／sampling、制御処理等。GPU idleではない |
+
+現行3実行のRouting/Input waitは267.042〜330.200 ms/Decode位置、wallの71.81〜75.34%です。CPU callbackは72.676〜75.349 ms、16.58〜20.26%でした。両者のhost区間が大きいことは確実ですが、routing waitの内訳がGPU演算なのかruntimeなのかは分離できていません。pre/post/embedding/headのsubmit API数も、内部のGPU kernel数ではありません。
+
+転送payloadはRouting D2Hが495,360 bytes/位置（48層×3 copies）、parts H2Dが4,915,200 bytes/位置（48 copies）です。代表実行のhost submit平均はD2H 1.152 ms、H2D 2.038 msです。48回のrouting event waitと最後のsession drainを維持しています。`parts_wait(post)=0`でも、次のrouting gateが前のparts H2Dとstaging寿命を保護しているため、転送のcostが0とは言えません。host stagingは既存`malloc_host`経路で、HIP backend source上は`hipHostMalloc`です。Expert mmapは別の通常pageable mappingです。実DMA時間・転送依存待機だけの時間・physical bus bytesは未測定です。
+
+CPU poolの全53位置平均drは3B candidate 2で71.752 ms、外側callbackは71.916 msです。しかしdefaultの`run_split`は中間quantizationと2段のdispatch/barrierをすべてdrへ入れ、wp/rpを別計測しません。表示上のwp/rp=0を「worker待機や同期が軽い」と解釈しません。dequantization、Expert演算、hard fault、SSD service、メモリ帯域、task／workerごとの時間は未分解です。Expert要求量632.8125 MiB/位置は論理blob bytesで、SSD／DRAMの実トラフィックではありません。
+
+新しい正常診断の最終process counterはuser 106.297＋kernel 61.719＝約168.016 CPU秒、sample間の平均は4.79 logical core相当でした。page fault累積は2,233,038ですがsoft/hardを区別しません。`GetProcessIoCounters`のread約6.32 GBもロード等を含み、mmapのphysical SSD read量ではありません。4計算threadのcallback内CPU時間の理論上限は、全callback 9.759秒×4＝39.037 CPU秒です。その計算区間だけではprocess全体の168 CPU秒を説明できませんが、残りをruntimeやworker idleへ割り当てるにはthread別の記録が必要です。
+
+途中ETWのsampled CPUは169.763 CPU秒／process lifetime 36.054秒＝約4.71 logical core相当でした。通常実行と別の途中実行であり、samplingと厳密counterも別の量です。CSVはprocess集計で、Strataのstackが空、thread/module列もありませんでした。diskもdisk単位集計でProcess/Pathが空でした。これらからCPU Expert、driver、DAG scheduler、SSDを個別原因にはできません。
+
+Attention／GDN／QSA、Router、Shared Expert、post、embedding／LM Head、quantization／GEMVのGPU時間・各層kernel数は未測定です。GPUの実idle区間、HIP API時間、submissionから実行開始までの遅延、DAG scheduler時間も未測定です。320 ms前後のwaitや4.79 coreというprocess CPU使用量を、そのままAdaptiveCppのoverheadとは呼びません。
+
+### ボトルネック順位と改善候補
+
+順位は「確認できたhost区間と次に調べる価値」に基づきます。GPU演算対runtimeの原因順位を確定したものではありません。単一区間をcost 0にし他を不変とした理論上限は`1/(1-f)`で、予測改善率ではなく、複数候補の上限も足しません。
+
+| 順位・候補 | 根拠と確信度 | 改善上限・負担・数値リスク・追従性 |
+| --- | --- | --- |
+| 1. Routing critical windowのGPU対runtime分離 | 71.81〜75.34%という区間は高確信、内部原因は未確定 | 代表区間の理想除去上限3.68倍。安全に消せる時間は不明。kernel融合／WMMAは負担・回帰リスク・本家との差分が大きく、演算占有の証拠を得るまで実装候補を確定しない |
+| 2. CPU poolのidle spin設定を独立A/B | process CPU約4.8 core、source default spin 20 ms。routing平均は約5.56〜6.88 ms/層でspin閾値より短い。spin寄与はsource上の仮説で、thread attributionは未取得 | 速度改善上限は未測定。既存`STRATA_POOL_SPIN_US`の測定ならsource差分0、負担小、数値リスク低。ただしwake遅延で悪化もあり得る。旧測定の全envは未保存なので20 ms実適用の断定はしない |
+| 3. CPU Expertのwork／fault／barrier分離 | callback 16.58〜20.26%は高確信、各内訳は未確定 | callback全除去でも1.20〜1.25倍という独立理論上限。CPU layout/dequant最適化は中程度の負担と数値リスク。GPU cacheは3Cの数値ゲート解決とGPU追加cost検証が必要で、今回は無効のまま |
+| 4. Host submissionの小差分削減 | 代表実行の全submit 6.39%は高確信、runtime全体の割合ではない | 全submit理想除去上限約1.068倍。D2H submitだけは約1.003倍。small API整理は比較的追従しやすいが、DAG orderingや必要waitは変更しない |
+
+AdaptiveCpp／ROCmの上流修正でscheduler／driver側が改善する可能性はありますが、未分離の時間から改善率は見積もれません。SDMA順序修正を理由にDAG回避策を外すこともしません。CPU pool設定／layoutは主に本家側と共有できる候補で、GPU専用の別engineにする必要はありません。Strata本家を実行したり、その速度をruntime overheadのoracleにしたりしていません。
+
+### 成果物、再開地点、停止
+
+採用したコードはoffline専用の`tools/profile_pool_timing.py`とそのstandard-library testです。UTF-8 logからactual rowsを検証し、prefill／decode／全位置のhost accounting、payload／API counts、未分解分、独立理論上限をJSONへ出します。engineやGPUを起動せず、cacheやprofiling設定をlogの不在から推定しません。9 testsと現行3Bの3ログ・新正常診断で検証しました。`git diff --check`と日本語lintは成功し、全体lintはツール不足で未完了、REUSEは既存の`.agents/skills` checkoutの指摘が残ります。ローカルobserverやETW controllerをproductionへ採用していません。
+
+再開の最小候補は、実envとworker threadを確認したうえで、cache-offのまま既存spin設定を1要因だけ変えるA/Bです。source実装はまだ選定していません。数値bitwise gate、同条件の反復、CPU-thread時間、必要なwake遅延を確認してから採用判断をします。最大host windowの原因分離には、bufferを小さくした専用ETW profileとGPU table対応の確認が必要です。これは次の別指示で行い、今回のRAM guardを緩めません。
+
+再集計は`phase3p-saved-host-report.json/.txt`、開始保護は`phase3p-start-state.json`、新正常診断は`phase3p-normal-diag.*`、数値gateは`phase3p-normal-numerical.json`と`phase3p-normal-argmax.json`、process counterは`phase3p-process-counters.json`です。途中traceは`phase3p-etw-once.etl`、停止確認は`phase3p-etw-once.done`と`-poststatus.txt`、offline部分exportは`phase3p-offline/cli-once-report.md`です。これらは`build/windows-acpp/`に保持し、生成ログ・trace・model・実行ファイル・toolchainはcommitしません。正常版と使用header/runtimeのhash一致、ロード済みDLLの一致、推論source無変更を`phase3p-final-integrity.json`へ保存しました。共有SDKや復元用コピーには変更を加えていませんが、このJSONでその全file hashを再検証したとは扱いません。
+
+性能の単一原因は確定していませんが、最大host window、CPU全体の負担、確認済みの上限と不足する証拠を整理した時点でPhase 3Pを終了します。計測の追加GPU実行と高速化実装には進まず、採用したoffline parserと日英文書だけをcommitして停止します。Phase 3D、cache再有効化、WMMA、Command Graph、VMM、native in-order、DPC++移行、driver／SDK更新には着手していません。
 
 ## 2026-10-11: ツールチェーンの確認
 
