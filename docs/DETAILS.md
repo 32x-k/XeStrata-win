@@ -625,6 +625,14 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
 - **A reply stuck on one token is ended.** When a reply repeats the same token 256 times in a row, the server ends it there with `finish_reason` `"length"` and says so in its window:
   a model in a loop, or a broken state that answers one token forever (upstream's #606 saw 36,689 tokens of `!`).
   `"repeat_stop_tokens": N` in `xestrata-<model>.json` sets the run length; `0` turns it off (for a request that really wants one token many times).
+- **Non-finite logits end the request and drop the cached state (on by default).** Rarely a window's logits become NaN and the reply degenerates into token 0 (`!`) repeated (upstream's #606, #879).
+  The poison sits in the conversation's K/V and recurrent state, so every later turn that reuses it stays broken.
+  Every window of `--serve` (decode, a layer split's `--pipeline-windows`, the prompt's short tail, batch slots) checks its head logits on the GPU beside the greedy pick (one small kernel into page-locked flags, read after the sync the window already does).
+  A flagged window emits none of its tokens; the engine prints a line with the position and ends the request with `DONE ... nonfinite` (a slot: `BDONE <slot> <n> nonfinite`).
+  The next request first drops the live session, every checkpoint, every parked conversation and every idle slot, and reads its prompt from token 0 (a slot still running finishes its reply and is not kept after it).
+  The server sends a request that has sent nothing yet again once, transparently; a reply that had started ends as `"length"`; a second fire on the retry ends the request with an error (503 before an answer, an error event in a stream).
+  The kernel only writes flags, so an answer without a NaN is the one the engine gives with `STRATA_NAN_GUARD=0` (no kernel recorded).
+  Debug switch: `STRATA_NAN_INJECT=<n>[,<n>...]` reports the n-th window the engine checks as non-finite.
 - **Anthropic requests that don't ask for thinking (opt-in).** By default a `/v1/messages` request with no `"thinking"`, effort or budget thinks as the model's template does.
   `"anthropic_thinking": "on_request"` in `xestrata-<model>.json` renders such a request without thinking.
   That is Anthropic's own rule, and what Claude Code's short helper calls (a session title in a few dozen tokens) need.
