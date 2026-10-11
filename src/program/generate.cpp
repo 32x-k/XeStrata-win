@@ -5754,10 +5754,34 @@ int main(int argc, char** argv) {
         const uint64_t budget = o.resident_gib < 0 ? strata::core::FileExpertSource::kResidentWhatFits
                                 : (uint64_t) (o.resident_gib * 1073741824.0);
         int64_t lend_from = -1;
+        int64_t lend_chunk = 0;
         if (o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res && xcache.slots() > 0) {
             int64_t chunk = o.prefill_chunk;
             const int64_t slots = plan_lend(chunk);
-            if (slots > 0) lend_from = xcache.slots() - slots;
+            if (slots > 0) { lend_from = xcache.slots() - slots; lend_chunk = chunk; }
+        }
+        // a layer split: the prompt path borrows the tail slots of every part's cache, CUDA0's and each stage's, at
+        // the chunk plan_lend chose (each stage as below at its prompt path's start), and the RAM copy turns its
+        // single lend region off once the stages' experts are left out of it: each part's region is handed to it,
+        // the highest slot first, as the borrowing takes them (upstream 51d55a9a, aea9dc3e)
+        if (lend_from >= 0 && !stages.empty()) {
+            auto tail = [&](const strata::core::ExpertCache& c, int64_t lb, int64_t le, int64_t k) {
+                std::vector<std::pair<int32_t, int32_t>> region;
+                for (int64_t l = lb; l < le; ++l)
+                    for (int64_t e = 0; e < g.n_expert; ++e)
+                        if (c.slot_of(l, e) >= c.slots() - k) region.emplace_back((int32_t) l, (int32_t) e);
+                std::sort(region.begin(), region.end(),
+                          [&](const std::pair<int32_t, int32_t>& x, const std::pair<int32_t, int32_t>& y) {
+                              return c.slot_of(x.first, x.second) > c.slot_of(y.first, y.second);
+                          });
+                return region;
+            };
+            std::vector<std::vector<std::pair<int32_t, int32_t>>> regions;
+            regions.push_back(tail(xcache, 0, split_at[0], xcache.slots() - lend_from));
+            for (const auto& st : stages)
+                regions.push_back(
+                    tail(st->cache, st->lb, st->le, lend_slots_of(st->cache, st->ss, st->dev, lend_chunk)));
+            src.stage_lend_regions(std::move(regions));
         }
         // with a layer split the RAM tier serves every stage's layers: ranked by the whole profile, without the experts
         // the later stages' caches hold (CUDA0's `profile` is its own layers' only; B70 + 4070, UD-Q4_K_XL: 26 GiB
