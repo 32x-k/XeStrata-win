@@ -10,7 +10,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 エンジンが GPU に求めること、移植した計算と検証の一覧をまとめます。
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md)、ビルドの方法、setup の振る舞い、要るパッケージは [BUILD](BUILD.ja.md) にあります。
 
-XeStrata xe0.1.42 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版の数字は、取り込んだ upstream の版に合わせています。同じ upstream の版での 2 回目からのリリースは、末尾に番号を足します（xe0.1.40.2.1）。
+XeStrata xe0.1.43 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版の数字は、取り込んだ upstream の版に合わせています。同じ upstream の版での 2 回目からのリリースは、末尾に番号を足します（xe0.1.40.2.1）。
 移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.39（`6f32ec07`）までの変更の一部を取り込んでいます
 （[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
 同じ SYCL のコードを、intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib-llvm のビルド、[ビルド](BUILD.ja.md#ビルド)）。
@@ -27,6 +27,41 @@ CUDA のソースは upstream の Strata（`3ce2523`）に残っていて、Xe �
 `STRATA_VRAM_LIMIT_MIB` はエンジンから見える VRAM を、`STRATA_MAX_ALLOC_MIB` は想定する最大の確保量を制限し、
 `STRATA_NO_XMX=1` は XMX を使わない経路を選ばせます。
 CPU 内蔵のグラフィックス（開発機では UHD 770）は、確認用の 2 つ目の実機として使います。
+
+## Strata 0.1.43 の取り込み
+
+upstream の Strata 0.1.42 から 0.1.43（`7695859a`）までの変更を、Windows の実装を除いて Xe に移しています。
+取り込みは 1 件ずつ手で移し、速さの経路は考え方ごとに 1 つの GPU で A/B を測って、速いか差がなければ入れました。
+
+移したものの主なものは次のとおりです。
+
+- logits が NaN や無限大になった窓を見張り、その要求を終えて使い回す状態を捨てる仕組み（upstream #879、既定。`STRATA_NAN_GUARD=0` で切る）。
+- prefill: K/V のホストの写しを 1 レーン 4 バイトで書く（`STRATA_KV_WIDE_HOST=0` で以前の形。B70 の 64K で 1,974 → 2,399 tok/s）、
+  エキスパートのコピーを GPU のコピー専用のエンジンで流す（Level Zero、`STRATA_COPY_ENGINE=0`）、
+  1 つのエキスパートの gate/up と down を 1 回の起動で逆量子化する（`STRATA_PF_DQ_FUSED=0`。B70 の UD-Q4_K_XL の 32K で +9%）、
+  塊の step 記録とトークン id を page-lock したバッファから送る（upstream #1712）。
+- decode: エキスパートの足し込みを複数行の combine に畳む（`STRATA_FUSE_HITS=0`）、Q3_K の GEMV の展開をブロックごとに 1 回にする、
+  route-resident の入れ替えを 1 トークン 1 sub-group にする（opt-in の機能の中、B70 で +3.9%）。
+- serve の tail skip を、エキスパートの 90% 以上が VRAM にあるときは既定で切る（upstream #1884、`STRATA_TAIL_SKIP_MAX_CACHED`）。
+- serve の報告（単独の経路とバッチの枠を移った要求の時間とトークン数、`timings.prompt_n`。upstream #1869・#1870）、
+  `STRATA_DROP_CACHE_ON_EXIT`、RAM が足りないときのファイルキャッシュの案内、`STRATA_TRACE` の VRAM の残り。
+- upstream のベンチマークのモード（`strata_bench.py`）を、そのままの測り方で動かす `xestrata --setup --bench-original-compat`（[BENCH](BENCH.ja.md)）。
+
+この取り込みの間に XeStrata の側で直したもの:
+
+- 外れたエキスパートの CPU と PCIe の分け方で、CPU の時間を decode の実測で詰め直す（[外れたエキスパートの CPU と PCIe への分け方](#外れたエキスパートの-cpu-と-pcie-への分け方)）。
+- RAM がエキスパートの全体に足りないときは、全体を読み込まずに `--resident-experts` と同じ形で起動し、ホスト USM へ移すのは層ごとに RAM の空きがあるときだけにする（issue #10、[DETAILS](DETAILS.ja.md)）。
+- エンジンが例外で止まったときに、何をしていたか、SYCL と Unified Runtime の番号、VRAM の空き、GPU が応答するかを 1 行で報告し、Web アプリにも出す（issue #10）。
+- Web アプリの GPU の情報を 3 社でそろえる（Intel の温度は GPU 本体、層の分割の 2 枚目以降、製品名、PCIe の経路の上限）。
+- serve で、発言の始まりのチェックポイントの RAM への書き込みを返答の後に回す（[DETAILS](DETAILS.ja.md)）。RTX 4070 で続きの要求の待ちが 1K 288 → 222 ms、64K 317 → 253 ms。
+
+upstream v0.1.43 と 3 社の GPU で比べました（generate は 5 つのモデルファイル、serve、通常使用）。すべての項目で upstream と同等以上です。
+RX 9060 XT は、decode が IQ3_XXS の 1K〜262K で 9〜13% 速く（xe0.1.42 からは 25〜45% 速く）、prefill は 2.9〜3.5 倍です。
+RTX 4070 の serve の続きの待ちは 222 ms と 253 ms で、upstream の 240 ms と 282 ms より短くなりました。
+
+移していないのは、Windows の実装、upstream の `sycl/`、HIP と CUDA の専用のカーネルの調整表と試せる機器のない GPU のための経路（Pascal の行の表、gfx12 の prompt の融合 int8 のエキスパート、gfx12 の decode の HC norm とフラグ待ちの畳み込み、HIP の層分割の既定）、
+upstream が `sycl/` 向けに作った混ぜたエキスパートのプロファイル（generate の 32K の decode が B70 で −2.0%、RTX 4070 で +6.2%、RX 9060 XT で −5.3%）、
+XeStrata で効く所のないもの（`STRATA_ADAPT_OVERLAP`、PcieAuto の割合、GEMM の operand の段取りを省く変更、貸した枠を DMA で埋め直す変更）です。
 
 ## Strata 0.1.42 の取り込み
 
