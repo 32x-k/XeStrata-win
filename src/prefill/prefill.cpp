@@ -1789,8 +1789,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // g / (c + g) cannot see, as both sides are measured with the share on.  The first eligible layers
                     // alternate, without first, until CPU_MIN_RATIOS ratios are in; then the cheaper arm, and every
                     // CPU_PROBE-th layer the other one (a prime: the probes move across the layers from one chunk to the
-                    // next), so both stay measured.  STRATA_PREFILL_CPU_GATE=0: auto without the comparison (0.1.41's).
-                    static const bool cpu_gate_on = [] { const char* e = std::getenv("STRATA_PREFILL_CPU_GATE"); return e == nullptr || e[0] != '0'; }();
+                    // next), so both stay measured.  Opt-in (STRATA_PREFILL_CPU_GATE=1): the arms without the share cost
+                    // more than the gate saved on XeStrata's GPUs, 1K IQ3_XXS prompts 844 -> 833 tok/s on a B70 and
+                    // 296 -> 283 on an RTX 4070 (2026-10-11, four interleaved rounds).
+                    static const bool cpu_gate_on = [] { const char* e = std::getenv("STRATA_PREFILL_CPU_GATE"); return e != nullptr && e[0] == '1'; }();
                     if (cpu_maybe && cpu_share_env() < 0.0 && cpu_gate_on) {
                         constexpr int64_t CPU_PROBE = 29;
                         constexpr int CPU_MIN_RATIOS = 3;
