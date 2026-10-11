@@ -6,13 +6,13 @@ import unittest
 from serve.frontend import HarmonyParser
 
 
-def run(text: str, **kw) -> list[tuple]:
-    """Every event of `text` fed character by character, then finish; consecutive texts of one kind joined."""
+def run(text: str, reason: str = "stop", **kw) -> list[tuple]:
+    """Every event of `text` fed character by character, then finish(reason); consecutive texts of one kind joined."""
     p = HarmonyParser(**kw)
     events = []
     for ch in text:
         events += p.feed(ch)
-    events += p.finish("stop")
+    events += p.finish(reason)
     out: list[tuple] = []
     for e in events:
         if e.kind == "tool_call":
@@ -38,9 +38,14 @@ class HarmonyOutput(unittest.TestCase):
         self.assertEqual(run(text, tools=[{"name": "get_weather"}]),
                          [("reasoning", "天気を調べる。"), ("tool_call", "get_weather", {"city": "東京"})])
 
+    def test_call_ended_by_the_stop_token(self):
+        # the server stops at <|call|> without passing it to the parser
+        text = '<|channel|>commentary to=functions.f<|message|> {"a": 1}'
+        self.assertEqual(run(text, tools=[{"name": "f"}]), [("tool_call", "f", {"a": 1})])
+
     def test_cut_inside_a_call_is_text(self):
         text = '<|channel|>commentary to=functions.f<|message|> {"a": 1'
-        self.assertEqual(run(text, tools=[{"name": "f"}]), [("content", '{"a": 1')])
+        self.assertEqual(run(text, reason="length", tools=[{"name": "f"}]), [("content", '{"a": 1')])
 
 
 if __name__ == "__main__":

@@ -513,11 +513,13 @@ EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default -
 def stop_token_ids(tok) -> set[int]:
     """The tokens that end a reply: the model's end-of-sequence, end-of-turn and end-of-message tokens as its GGUF
     names them (the engine stops at the same ones), and `<|im_end|>` / `<|endoftext|>` where the vocabulary has them
-    as single tokens.  Qwen3.8-Flash-Next's EOS_IDS when the tokenizer names none."""
+    as single tokens; the Harmony format's `<|return|>` and `<|call|>` too (llm-jp-4.1: llama.cpp ends the generation
+    at them, not at `<|end|>`, which closes the reasoning).  Qwen3.8-Flash-Next's EOS_IDS when the tokenizer names
+    none."""
     special = getattr(tok, "special_ids", None) or {}
     ids = {int(v) for k, v in special.items()
            if k in ("tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id")}
-    for text in (IM_END, "<|endoftext|>"):
+    for text in (IM_END, "<|endoftext|>", "<|return|>", "<|call|>"):
         try:
             one = tok.encode(text, parse_special=True)
         except (KeyError, ValueError):

@@ -899,7 +899,10 @@ class HarmonyParser:
         if not self.head:
             out += self._body_event(self.buf)
             self.buf = ""
-            if self.to is not None:  # a call the output ended inside: its text, never a call
+            if self.to is not None and reason in (None, "stop"):
+                # the stop token ended it: `<|call|>` is one (as in llama.cpp), and the engine does not pass it on
+                out += self._end_message()
+            elif self.to is not None:   # a call the output was cut inside: its text, never a call
                 out.append(Event("content", self.args))
                 self.to, self.args = None, ""
         elif self.buf.strip() and HARMONY_MESSAGE not in self.buf:
