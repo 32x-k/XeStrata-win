@@ -129,15 +129,18 @@ The next window is a guess: that this window is accepted whole and that its bonu
 When the guess holds, half of the next window is already done.
 When it does not, the first GPU puts its state back (a copy of its recurrent state taken while the window ran) and the next window is built from the real tokens.
 A guessed window is only started when the draft layer's estimate says it is likely to be kept.
-`--pipeline-windows 1` overlaps only the short prefills that go through the verify windows (`--short-read`).
+With three or more stages every stage before the last runs guessed windows, the next window following the one before it one stage behind (upstream 553b0b78).
+Only the last stage waits for the verdict.
+`--pipeline-windows 1` overlaps only the short prefills that go through the verify windows (`--short-read`), with two stages only.
 
-It works with two GPUs, exactly two stages and `--serve`.
+It works with a split of two or more stages, each on its own GPU, and `--serve`.
+With three or more stages `--pipeline-windows 2` turns `--adapt-async` off, and the adaptive tier runs at a verdict.
 
-- **Cost**: a second verify window on each GPU, 160 MiB more kept out of each GPU's expert cache, and with `2` two copies of the first GPU's recurrent state on it (about 3 MiB per GDN layer of that GPU).
+- **Cost**: a second verify window on each GPU, 160 MiB more kept out of each GPU's expert cache, and with `2` two copies of the recurrent state on every GPU before the last stage (about 3 MiB per GDN layer of that GPU).
 - **Same text**: the last GPU only runs windows that are verified, and every window row computes what it would in any other window, so the tokens are the serial loop's.
   With `STRATA_IQ_MT_MIN=1 --pcie-frac 0 --adapt-every 0` and the same expert caches the greedy output is identical bit for bit (measurements below).
   The pipeline keeps its VRAM out of the caches, so against a run without the flag a few experts move from a GPU to the CPU, which rounds them differently, and a near-tie can flip.
-- **Off, with one line in the log saying why**, with `--batch` slots, the helper caches (`--expert-cache-device1..3`), a split into three or more stages or onto one GPU (`--split-device 0`), or no draft layer.
+- **Off, with one line in the log saying why**, with `--batch` slots, the helper caches (`--expert-cache-device1..3`), a split onto one GPU (`--split-device 0`), `--pipeline-windows 1` on three or more stages, or no draft layer.
   A request with repetition penalties (`penalty_last_n`), coupled draft sampling or log-probabilities (`logprobs`), and `--lookup-chain`, decode serially.
 - **Nothing is queued on a card behind a window there that waits for the host.** On the B70 a graph or a copy submitted to the card while such a window ran did not return, and the engine stalled.
   So prefill queues a window's commit after the window has completed (upstream queues the window, its commit and the next window back to back).
