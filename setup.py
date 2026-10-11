@@ -319,7 +319,7 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
                                     "size": 12992461216,
                                     "sha256": "9cae3b59a34308664b53e5b80fd74914cd0c1cf504bcd05609498b0f9126a74f",
                                     "about": "3-bit GSQ-RCO by pfeifferj (a community reproduction of the method, not "
-                                             "IST-DASLab's)"},
+                                             "IST-DASLab's)", "tested": True},
                    "GSQ-RCO-3.5BIT": {"repo": _ORNITH_GSQ, "file": "Ornith-1.5-35B-A3B-GSQ-RCO-3.5bit.gguf",
                                       "size": 15163013536,
                                       "sha256": "69191d3d2c402f7c13950815bf20d826d7066c8d7f1bef4594cf70c13ea56ccc",
