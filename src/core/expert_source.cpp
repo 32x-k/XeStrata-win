@@ -1829,6 +1829,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 ++d.tail_experts;
             }
         }
+        // STRATA_FREE_MISSES=1 (measuring only, the output is wrong; after nextsycl's NS_FREE_MISSES): a missed expert
+        // is computed on the GPU from the slot of a resident expert of the layer instead of fetched or computed on the
+        // CPU, so a run times the decode as if every expert were in VRAM - the bound the CPU / PCIe split works toward
+        static const bool free_misses = [] {
+            const char* v = std::getenv("STRATA_FREE_MISSES");
+            return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+        }();
+        int32_t standin = -1;
+        if (free_misses && d.remote_count == 0) {
+            for (int32_t e = 0; e < d.n_expert && standin < 0; ++e)
+                standin = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
+            if (standin >= 0) nmiss = 0;
+        }
         const bool pcie_ok = d.pcie_num > 0 && d.src->device_alias(d.layers, 0) != nullptr;
         // from the times measured at start (pcie_split_m); else the share pcie_num/256
         const int m = !pcie_ok ? 0
@@ -1849,7 +1862,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             int kd = -1;
             unsigned long long ptr = 0;
             if (e >= 0 && e < d.n_expert) {
-                const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
+                int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
+                if (slot < 0) slot = standin;   // STRATA_FREE_MISSES
                 if (slot >= 0) {
                     kd = 0;
                     ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
