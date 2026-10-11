@@ -1908,7 +1908,13 @@ bool measure_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, strat
     for (int64_t e = 0; e < d.n_expert && blobs.size() < 64; ++e)
         if (d.host_res[(size_t) layer * (size_t) d.n_expert + (size_t) e] < 0 && d.src->pinned(layer, e))
             if (const uint8_t* b = d.src->blob(layer, e)) blobs.push_back(b);
-    const double mem = blobs.empty() ? 0.0 : memory_read_rate(blobs, (size_t) bytes, d.pool != nullptr ? d.pool->workers() : 1);
+    // the fastest of five readings 100 ms apart: one beside other work (the machine's, not the engine's) read the rate
+    // up to 3x low on the RX 9060 XT's machine, and one such reading made the split give the CPU every missed expert
+    double mem = 0.0;
+    for (int i = 0; i < 5 && !blobs.empty(); ++i) {
+        if (i > 0) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        mem = std::max(mem, memory_read_rate(blobs, (size_t) bytes, d.pool != nullptr ? d.pool->workers() : 1));
+    }
     const double cpu_rate = bytes / t.c, link_rate = bytes / t.p;   // bytes a ms
     const double factor = mem > 0.0 ? std::max(1.0, (cpu_rate + link_rate) / mem) : 1.0;
     t.cb0 = t.c0; t.cb = t.c * factor;
