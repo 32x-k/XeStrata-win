@@ -178,7 +178,7 @@ The previous XeStrata is the newest `xe*` release before this run (step 1). Its 
 - the last merge's record, `bench/results/<date>-upstream-<version>/<file>`, for the other files (and for `IQ3_XXS` when no release record is newer).
 
 ```sh
-python .claude/skills/upstream-sync/scripts/judge.py --prompt-only B70 \
+python .claude/skills/upstream-sync/scripts/judge.py \
   --prev IQ3_XXS=bench/results/<date>-release-<xe tag> --prev Q2_0=<last merge>/Q2_0 ... \
   $o/IQ3_XXS $o/Q2_0 $o/IQ2_XS $o/IQ3_S $o/UD-Q4_K_XL
 ```
@@ -187,9 +187,9 @@ Against the tag, a cell (file, GPU, tier, prompt or output) passes when XeStrata
 The serve cells (GPU, tier, greedy or t07; prompt, follow-ups, output), read from `matrix-serve.json`, and the everyday cells (GPU, conversation; first token, prompt, output), read from `matrix-usage.json`, pass at most `SERVE_LIMIT` (`judge.py`, 5%) below upstream's, the prompt speed at 1%: each engine writes its own text there, so the other measures vary with the text from round to round (the rounds' seeds differ), up to 10% off a cell's median at temperature 0.7 on 2026-10-10.
 A cell upstream does not finish, finishes at 10 tok/s or less, or is stopped as that slow, is left out; one only XeStrata does not finish fails.
 A file whose experts do not fit in a machine's RAM budget, so that they are read from the SSD while it answers (SSD offload: UD-Q4_K_XL on the AMD container's 62 GB), is not run on that machine (the user's decision of 2026-10-09): as for GPUs there is no machine for (step 4), its paths are checked by the tests and the builds only, and the record lists its cells `unverified`.
-The B70's output cells are left out against the tag (`--prompt-only B70`, the user's decision of 2026-10-09): upstream's `sycl/` port reads the experts that do not fit in VRAM over PCIe from its kernels, a few tok/s, which says nothing about XeStrata's speed.
+The B70's output cells are judged like the others (the user's decision of 2026-10-11, which replaces the `--prompt-only B70` of 2026-10-09): only the 10 tok/s rule above leaves a cell out.
 
-Against the previous XeStrata (`prev` lines), every cell both records have is judged, the B70's output included: the prompt at 1%, the rest at `SERVE_LIMIT`, since the text changes with the version (on the generate path it is the tag's).
+Against the previous XeStrata (`prev` lines), every cell both records have is judged: the prompt at 1%, the rest at `SERVE_LIMIT`, since the text changes with the version (on the generate path it is the tag's).
 The two records were measured on different days, so a `prev` failure is measured again before it is worked: `ab_pair.py` with the previous XeStrata's binary (A, built from its tag in a worktree) and HEAD's (B), in that cell's setting, one seed. That A/B decides.
 
 For each failing cell: find where the time goes (the GPU profilers of docs/DEVTOOLS.md, the engine's timing lines), read how upstream does that part (for a `prev` failure: what changed since the previous XeStrata, `git log <xe tag>..HEAD`), make XeStrata faster (step 4's rules), and measure that cell again.
