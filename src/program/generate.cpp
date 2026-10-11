@@ -10312,10 +10312,10 @@ int main(int argc, char** argv) {
             kvg_start(xcache.slots());
             if (!kvg_ensure(n_prompt + o.max_new + 64, [] { strata::gpu::device_sync(); })) return 1;
         }
+        if (!pcie_given && split_devs.empty() && o.pcie_mode != "dma" && o.pcie_mode != "direct")
+            read_memory_rate_before(drive.d, g.n_layers);   // before the prompt's clock: it is not the prompt's time
         const Clock::time_point tp0 = Clock::now();
         const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
-        if (!pcie_given && split_devs.empty() && o.pcie_mode != "dma" && o.pcie_mode != "direct")
-            read_memory_rate_before(drive.d, g.n_layers);
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
