@@ -2149,6 +2149,12 @@ int main(int argc, char** argv) {
         else {
             // An unknown flag is an ERROR and not a warning: a typo'd `--max-neww` that silently generated 16
             // tokens would look like a working run.
+            if (a == "--stream-experts") {   // upstream's sycl/ engine's flag, in configs carried over from it
+                std::fprintf(stderr, "unknown argument: %s (an option of upstream's SYCL port; the nearest here is "
+                                     "--mmap-experts, the experts read from the files through the OS page cache)\n",
+                             a.c_str());
+                return 2;
+            }
             std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
             usage();
             return 2;
