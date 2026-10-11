@@ -384,6 +384,44 @@ struct Stager {
     }
 };
 
+// #1712 (upstream b97a36a4): a chunk's small int32 tables (the QSA step records, the token ids) go up from a pinned
+// buffer.  A copy from pageable memory is staged by the runtime; on gfx1100 the first text prompt after a picture one
+// was seen to read stale step records that way.  The event holds the next upload back until the last one has left the
+// buffer.  No pinned RAM: the copy is made from the caller's memory, as before.
+struct PinnedUpload {
+    int32_t* p = nullptr;
+    size_t n = 0;
+    strata::gpu::Event* ev = nullptr;
+    void init(size_t count) {
+        if (p || force_pageable()) return;
+        if (!strata::gpu::alloc_host(&p, count * sizeof(int32_t))) {
+            p = nullptr;
+            return;
+        }
+        n = count;
+        if (!strata::gpu::event_create(&ev)) {
+            strata::gpu::free(p);
+            p = nullptr;
+            n = 0;
+            ev = nullptr;
+        }
+    }
+    bool upload(void* dst, const int32_t* src, size_t count, strata::gpu::Stream s) {
+        const size_t bytes = count * sizeof(int32_t);
+        if (!p || count > n) return strata::gpu::copy_async(dst, src, bytes, s);
+        if (!strata::gpu::event_sync(ev)) return false;   // the previous upload is out of the buffer
+        std::memcpy(p, src, bytes);
+        return strata::gpu::copy_async(dst, p, bytes, s) && strata::gpu::event_record(ev, s);
+    }
+    void release() {
+        if (ev) strata::gpu::event_destroy(ev);
+        if (p) strata::gpu::free(p);
+        p = nullptr;
+        ev = nullptr;
+        n = 0;
+    }
+};
+
 struct Prefill::Impl {
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
@@ -411,6 +449,7 @@ struct Prefill::Impl {
     uint16_t* attn_h = nullptr;
     int32_t* steps_dev = nullptr;
     std::vector<int32_t> steps_host;
+    PinnedUpload steps_up;
     int32_t* sel_ids = nullptr;
     float* sel_scores = nullptr;          // [sel_batch, max_blocks]
     int64_t sel_batch = 256, max_blocks = 0;
@@ -493,6 +532,7 @@ struct Prefill::Impl {
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
+    PinnedUpload tok_up;
 };
 
 namespace {
@@ -544,6 +584,8 @@ void Prefill::release() {
     impl_->stager.reset();
     if (impl_->cs) strata::gpu::stream_sync(impl_->cs);
     if (impl_->copy) strata::gpu::stream_sync(impl_->copy);
+    impl_->steps_up.release();
+    impl_->tok_up.release();
     for (float* p : {impl_->cpu_x, impl_->cpu_rows})
         if (p) strata::gpu::free(p);
     for (strata::gpu::Event* e : impl_->cpu_ev)
@@ -675,6 +717,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         }
         m.owned.push_back(m.tok_dev);
         m.tok_host.resize((size_t) chunk);
+        m.tok_up.init((size_t) chunk);
     }
     if (!(m.copy = strata::gpu::stream_create())) { err = "prefill: copy stream"; return false; }
     const size_t T = (size_t) chunk;
@@ -719,6 +762,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
+    m.steps_up.init(T * strata::kernels::kStepCount);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
     for (int b = 0; b < 2; ++b) {
         if (!m.ple_emb_host[b] &&
@@ -1252,7 +1296,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             else m.tok_host[(size_t) t] = (int32_t) tok;
         }
         if (batched) {
-            if (!strata::gpu::copy_async(m.tok_dev, m.tok_host.data(), (size_t) T * sizeof(int32_t), m.cs)) {
+            if (!m.tok_up.upload(m.tok_dev, m.tok_host.data(), (size_t) T, m.cs)) {
                 err = "prefill: the token id upload failed";
                 return false;
             }
@@ -1316,7 +1360,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
         // ---- the QSA step records of every position in the chunk
         for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
-        strata::gpu::copy_async(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount * 4, m.cs);
+        if (!m.steps_up.upload(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount, m.cs)) {
+            err = "prefill: the QSA step records' upload failed";
+            return false;
+        }
 
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < LB; ++l) (core::is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
