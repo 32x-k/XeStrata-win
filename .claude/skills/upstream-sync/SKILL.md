@@ -199,7 +199,6 @@ The run is done only when a full run of step 7 on the final HEAD, every file and
 
 XeStrata's own measurements are not shared (the user's decision of 2026-10-11): the record stays in the data folder, `$o` = `<data>/records/bench-results/<date>-upstream-<version>` (`LOCAL.md`), and never goes into git; only upstream's records (`tools/lint/records.txt`) and community records live in `bench/results`.
 
-
 - `$o/README.md`: the machines, both engines' commits and builds, the method, the tables (`sync_collect.py`), the check's output (against the tag and the previous XeStrata), what the numbers say, and the GPUs skipped; `matrix.json` and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>`. The ideas with step 4's and 5's numbers (kept, opt-in and removed) go into the same record.
 - docs/XE.ja.md, then docs/XE.md: the upstream version and range brought in, what was not taken and why, the approximations on by default and their switches, without a link to the record (it is not in the repository).
 
