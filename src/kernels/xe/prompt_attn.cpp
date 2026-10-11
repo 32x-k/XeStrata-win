@@ -81,9 +81,9 @@ struct Kernel {
                     kv = *reinterpret_cast<const h8*>(kp + row);
                     vv = *reinterpret_cast<const h8*>(vp + row);
                 }
-                *reinterpret_cast<h4*>(K + jj * KS + dd) = kv.template swizzle<0, 1, 2, 3>();
-                *reinterpret_cast<h4*>(K + jj * KS + dd + 4) = kv.template swizzle<4, 5, 6, 7>();
-                *reinterpret_cast<h8*>(V + jj * HD + dd) = vv;
+                *reinterpret_cast<h4*>(K + (ptrdiff_t) jj * KS + dd) = kv.template swizzle<0, 1, 2, 3>();
+                *reinterpret_cast<h4*>(K + (ptrdiff_t) jj * KS + dd + 4) = kv.template swizzle<4, 5, 6, 7>();
+                *reinterpret_cast<h8*>(V + (ptrdiff_t) jj * HD + dd) = vv;
             }
             sycl::group_barrier(it.get_group());
             {   // scores, masked past each row's own position
@@ -91,12 +91,12 @@ struct Kernel {
                 float acc[SR];
                 for (int k = 0; k < SR; ++k) acc[k] = 0.0f;
                 for (int dd = 0; dd < HD; dd += 4) {
-                    const h4 kh = *reinterpret_cast<const h4*>(K + j * KS + dd);
+                    const h4 kh = *reinterpret_cast<const h4*>(K + (ptrdiff_t) j * KS + dd);
                     const float k0 = h2f(kh[0]), k1 = h2f(kh[1]), k2 = h2f(kh[2]), k3 = h2f(kh[3]);
                     for (int k = 0; k < SR; ++k) {
                         const int r = rg + k * SG;
                         if (SR * SG > R && r >= R) break;
-                        const f4 qv = *reinterpret_cast<const f4*>(Q + r * QS + dd);
+                        const f4 qv = *reinterpret_cast<const f4*>(Q + (ptrdiff_t) r * QS + dd);
                         acc[k] = sycl::fma(qv[0], k0, sycl::fma(qv[1], k1, sycl::fma(qv[2], k2, sycl::fma(qv[3], k3, acc[k]))));
                     }
                 }
@@ -127,7 +127,7 @@ struct Kernel {
                 const float v0 = h2f(V[jj * HD + d]), v1 = h2f(V[(jj + 1) * HD + d]), v2 = h2f(V[(jj + 2) * HD + d]),
                             v3 = h2f(V[(jj + 3) * HD + d]);
                 for (int k = 0; k < OPT; ++k) {
-                    const f4 p = *reinterpret_cast<const f4*>(S + (r0 + k * RS) * BK + jj);
+                    const f4 p = *reinterpret_cast<const f4*>(S + (ptrdiff_t) (r0 + k * RS) * BK + jj);
                     o[k] = sycl::fma(p[0], v0, sycl::fma(p[1], v1, sycl::fma(p[2], v2, sycl::fma(p[3], v3, o[k]))));
                 }
             }

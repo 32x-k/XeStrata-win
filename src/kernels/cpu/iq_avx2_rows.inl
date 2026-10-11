@@ -181,7 +181,7 @@ inline void row_dot_q45k(const uint8_t* row, int nblocks, const block_q8_K* cons
         __m256i acci[NT];
         for (int t = 0; t < NT; ++t) acci[t] = _mm256_setzero_si256();
         for (int j = 0; j < 4; ++j) {
-            const __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk + qs_off + 32 * j));
+            const __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk + qs_off + 32 * (ptrdiff_t) j));
             for (int half = 0; half < 2; ++half) {
                 const int H = 2 * j + half;   // values 32H..32H+31: the low nibbles, then the high ones
                 __m256i g = half ? _mm256_and_si256(_mm256_srli_epi16(q, 4), m4) : _mm256_and_si256(q, m4);
@@ -192,7 +192,7 @@ inline void row_dot_q45k(const uint8_t* row, int nblocks, const block_q8_K* cons
                 }
                 const __m256i s = sc32(sc[H]);
                 for (int t = 0; t < NT; ++t) {
-                    const __m256i yv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y[t][i].qs + 32 * H));
+                    const __m256i yv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y[t][i].qs + 32 * (ptrdiff_t) H));
                     acci[t] = madd_add(acci[t], _mm256_maddubs_epi16(g, yv), s);
                 }
             }
@@ -226,9 +226,9 @@ inline void row_dot_q6k(const uint8_t* row, int nblocks, const block_q8_K* const
         __m256i acci[NT];
         for (int t = 0; t < NT; ++t) acci[t] = _mm256_setzero_si256();
         for (int j2 = 0; j2 < 2; ++j2) {   // two 128-value chunks: 64 ql bytes and 32 qh bytes each
-            const __m256i l0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk + 64 * j2));
-            const __m256i l1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk + 64 * j2 + 32));
-            const __m256i hh = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk + 128 + 32 * j2));
+            const __m256i l0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk + 64 * (ptrdiff_t) j2));
+            const __m256i l1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk + 64 * (ptrdiff_t) j2 + 32));
+            const __m256i hh = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk + 128 + 32 * (ptrdiff_t) j2));
             __m256i g[4];   // values 128*j2 + 32k .. +31: qh bits 2k, 2k+1 above the nibbles
             g[0] = _mm256_or_si256(_mm256_and_si256(l0, m4), _mm256_slli_epi16(_mm256_and_si256(hh, m3), 4));
             g[1] = _mm256_or_si256(_mm256_and_si256(l1, m4), _mm256_slli_epi16(_mm256_and_si256(hh, mc), 2));
@@ -240,7 +240,7 @@ inline void row_dot_q6k(const uint8_t* row, int nblocks, const block_q8_K* const
                 const __m256i sc = sc16(scs[s], scs[s + 1]);
                 for (int t = 0; t < NT; ++t) {
                     const __m256i yv = _mm256_loadu_si256(
-                        reinterpret_cast<const __m256i*>(y[t][i].qs + 128 * j2 + 32 * k));
+                        reinterpret_cast<const __m256i*>(y[t][i].qs + 128 * (ptrdiff_t) j2 + 32 * (ptrdiff_t) k));
                     acci[t] = madd_add(acci[t], _mm256_maddubs_epi16(g[k], yv), sc);
                 }
             }

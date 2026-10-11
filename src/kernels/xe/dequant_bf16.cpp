@@ -159,7 +159,7 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 84;
         const int gi = gi_in_row % 8, n = gi / 4, j = gi % 4;      // the 128-value half, the 2-bit plane
         const float d = h2f(b + 80), dmin = h2f(b + 82);
-        const uint8_t* q = b + 16 + 32 * n;
+        const uint8_t* q = b + 16 + 32 * (ptrdiff_t) n;
         for (int l = 0; l < 32; ++l) {
             const int sc = b[8 * n + 2 * j + l / 16];
             const float dl = d * (float) (sc & 0xF), ml = dmin * (float) (sc >> 4);
@@ -168,7 +168,7 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
     } else if constexpr (TYPE == 30) {                             // BF16: 32 values of 2 B, a "block" of 64 B
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 64;
         for (int l = 0; l < 32; ++l)
-            put(out, l, sycl::bit_cast<float>((uint32_t) (b[2 * l] | (b[2 * l + 1] << 8)) << 16));
+            put(out, l, sycl::bit_cast<float>((uint32_t) (b[2 * (ptrdiff_t) l] | (b[2 * (ptrdiff_t) l + 1] << 8)) << 16));
     } else if constexpr (TYPE == kNativeQ6KRows) {                 // Q6_K split by row (native_mmvq.hpp)
         const size_t bpr = (size_t) groups_per_row / 8, blk = (size_t) (gi_in_row / 8);
         const int gi = gi_in_row % 8, n = gi / 4, qu = gi % 4;

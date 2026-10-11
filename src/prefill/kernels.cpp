@@ -439,15 +439,15 @@ struct Gdn {
             // one work-item per channel walks the chunk
             q.parallel_for(sycl::range<1>(C), [=](sycl::id<1> id) {
                 const int c = (int) id[0];
-                float v0 = hist[c * 3], v1 = hist[c * 3 + 1], v2 = hist[c * 3 + 2];
-                const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+                float v0 = hist[(ptrdiff_t) c * 3], v1 = hist[(ptrdiff_t) c * 3 + 1], v2 = hist[(ptrdiff_t) c * 3 + 2];
+                const float w0 = w[(ptrdiff_t) c * 4], w1 = w[(ptrdiff_t) c * 4 + 1], w2 = w[(ptrdiff_t) c * 4 + 2], w3 = w[(ptrdiff_t) c * 4 + 3];
                 for (int64_t t = 0; t < T; ++t) {
                     const float x = qkv[t * C + c];
                     const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
                     h[t * C + c] = s / (1.0f + sycl::exp(-s));
                     v0 = v1; v1 = v2; v2 = x;
                 }
-                hist[c * 3] = v0; hist[c * 3 + 1] = v1; hist[c * 3 + 2] = v2;
+                hist[(ptrdiff_t) c * 3] = v0; hist[(ptrdiff_t) c * 3 + 1] = v1; hist[(ptrdiff_t) c * 3 + 2] = v2;
             });
         } else {
             // C-3: tiled over tokens, each tile reading its 3 predecessors from the chunk (or the history before it);
@@ -510,7 +510,7 @@ struct Gdn {
                 const int64_t t1 = t0 + CONV_TILE < T ? t0 + CONV_TILE : T;
                 auto input = [&](int64_t t) -> float { return t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)]; };
                 float v0 = input(t0 - 3), v1 = input(t0 - 2), v2 = input(t0 - 1);
-                const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+                const float w0 = w[(ptrdiff_t) c * 4], w1 = w[(ptrdiff_t) c * 4 + 1], w2 = w[(ptrdiff_t) c * 4 + 2], w3 = w[(ptrdiff_t) c * 4 + 3];
                 for (int64_t t = t0; t < t1; ++t) {
                     const float x = qkv[t * C + c];
                     const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
@@ -525,7 +525,7 @@ struct Gdn {
                     const int64_t t = T - 3 + k;
                     v[k] = t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)];
                 }
-                hist[c * 3] = v[0]; hist[c * 3 + 1] = v[1]; hist[c * 3 + 2] = v[2];
+                hist[(ptrdiff_t) c * 3] = v[0]; hist[(ptrdiff_t) c * 3 + 1] = v[1]; hist[(ptrdiff_t) c * 3 + 2] = v[2];
             });
         }
         // the L2 norm of the 32 q/k heads per token, 128 work-items each
@@ -535,7 +535,7 @@ struct Gdn {
                 const sycl::sub_group sg = it.get_sub_group();
                 const int64_t t = (int64_t) it.get_group(0);
                 const int head = (int) it.get_group(1), tid = (int) it.get_local_id(1);
-                float* x = h + t * C + head * S;
+                float* x = h + t * C + (int64_t) head * S;
                 const float v = x[tid];
                 const float sq = warp_sum(sg, v * v);
                 if ((tid & 31) == 0) part[tid >> 5] = sq;
@@ -791,8 +791,8 @@ struct Gdn {
         if (serial || T <= 0) {
             q.submit([&](sycl::handler& hd) {
                 sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
-                    red(sycl::range<1>(RG * S), hd), wsum(sycl::range<1>(16), hd);
-                hd.parallel_for(sycl::nd_range<1>((size_t) HV * S * RG, S * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                    red(sycl::range<1>((size_t) RG * S), hd), wsum(sycl::range<1>(16), hd);
+                hd.parallel_for(sycl::nd_range<1>((size_t) HV * S * RG, (size_t) S * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
                     const sycl::sub_group sg = it.get_sub_group();
                     const int head = (int) it.get_group(0), tid = (int) it.get_local_id(0), col = tid % S, rg = tid / S;
                     const int qh = head % HK;
@@ -811,9 +811,9 @@ struct Gdn {
                         sycl::group_barrier(it.get_group());
                         if (rg == 0) {
                             const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-                            const float v = oc * sycl::rsqrt(ss / (float) S + eps) * g_col * zgate(z[t * HV * S + head * S + col], silu);
-                            y[t * HV * S + head * S + col] = v;
-                            y16[t * HV * S + head * S + col] = hf(v);
+                            const float v = oc * sycl::rsqrt(ss / (float) S + eps) * g_col * zgate(z[t * HV * S + (int64_t) head * S + col], silu);
+                            y[t * HV * S + (int64_t) head * S + col] = v;
+                            y16[t * HV * S + (int64_t) head * S + col] = hf(v);
                         }
                     }
                     for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
@@ -851,8 +851,8 @@ struct Gdn {
         auto launch_d2 = [&](float* st, float* yy) {
             q.submit([&](sycl::handler& hd) {
             sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
-                red(sycl::range<1>(RG * CB), hd);
-            hd.parallel_for(sycl::nd_range<1>((size_t) HV * NCB * CB * RG, CB * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                red(sycl::range<1>((size_t) RG * CB), hd);
+            hd.parallel_for(sycl::nd_range<1>((size_t) HV * NCB * CB * RG, (size_t) CB * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
                 const int head = (int) it.get_group(0) / NCB, cb = (int) it.get_group(0) % NCB;
                 const int tid = (int) it.get_local_id(0), c = tid % CB, rg = tid / CB, col = cb * CB + c;
                 const int qh = head % HK;

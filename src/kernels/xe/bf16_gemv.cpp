@@ -102,7 +102,7 @@ sycl::event launch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const W* w,
             const bool is_aux = (int64_t) rowi == n_out;
             const W* row = w + rowi * n_in;
             if constexpr (std::is_same_v<W, uint16_t>)
-                if (is_aux) row = aux.w;
+                if (is_aux && aux.w != nullptr) row = aux.w;   // the extra row exists only with aux.w
             if constexpr (BLOCK_SIZE > 32) {
                 if (t < 32)
                     for (int k = 0; k < NT; ++k) partials[k * 32 + t] = 0.0f;

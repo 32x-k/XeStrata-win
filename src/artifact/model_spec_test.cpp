@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -160,7 +161,7 @@ std::vector<Kv> qwen3moe() {
 }
 }  // namespace
 
-int main() {
+static int run() {
     std::string err;
 
     std::printf("qwen35moe (Ornith-1.5)\n");
@@ -218,4 +219,13 @@ int main() {
 
     std::printf("%s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
+}
+
+int main() {
+    try {
+        return run();
+    } catch (const std::exception& e) {
+        std::printf("model_spec_test: %s\n", e.what());
+        return 1;
+    }
 }

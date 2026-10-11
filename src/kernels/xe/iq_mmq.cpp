@@ -365,12 +365,12 @@ template<> struct Dec<kNativeQ6KRows> {   // Q6_K split by row (native_mmvq.hpp)
         const int8_t* sc = reinterpret_cast<const int8_t*>(row + bpr * 192 + blk * 16) + (size_t) 8 * n;
         Sub r;
         for (int k = 0; k < 8; ++k) {
-            const uint32_t l = (uint32_t) get_int_b2(ql + 32 * (j & 1), k), h = (uint32_t) get_int_b2(qh, k);
+            const uint32_t l = (uint32_t) get_int_b2(ql + 32 * (ptrdiff_t) (j & 1), k), h = (uint32_t) get_int_b2(qh, k);
             const uint32_t v = ((l >> (4 * (j >> 1))) & 0x0F0F0F0Fu) | (((h >> (2 * j)) & 0x03030303u) << 4);
             r.v[k] = ((v | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
         }
         const float d = (float) *reinterpret_cast<const sycl::half*>(row + bpr * 208 + blk * 2);
-        r.s0 = d * (float) sc[2 * j];
+        r.s0 = d * (float) sc[2 * (ptrdiff_t) j];
         r.s1 = d * (float) sc[2 * j + 1];
         return r;
     }

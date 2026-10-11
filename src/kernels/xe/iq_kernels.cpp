@@ -1169,7 +1169,7 @@ void dq_q2_k(const void* vx, int64_t ibs, const Out& o, int tid) {
     const int n = tid / 16, k = (tid % 16) / 4, l0 = 8 * (tid % 4);
     const uint8_t sc = x->scales[8 * n + 2 * k + l0 / 16];
     const float dl = (float) x->dm[0] * (float) (sc & 0xF), ml = (float) x->dm[1] * (float) (sc >> 4);
-    const uint8_t* q = x->qs + 32 * n;
+    const uint8_t* q = x->qs + 32 * (ptrdiff_t) n;
     float v[8];
     for (int j = 0; j < 8; ++j) v[j] = dl * (float) ((int8_t) ((q[l0 + j] >> (2 * k)) & 3)) - ml;
     o.template put<8>(128 * n + 32 * k + l0, v);
@@ -1907,13 +1907,13 @@ void native_expert_grouped_bf16(const NativeExpertLayout& L, const unsigned long
     auto& q = queue_for(stream);
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
     float* gate = (float*) scratch;
-    float* up = (float*) ((uint8_t*) scratch + fa);
-    float* h = (float*) ((uint8_t*) scratch + 2 * fa);
+    float* up = reinterpret_cast<float*>(static_cast<uint8_t*>(scratch) + fa);
+    float* h = reinterpret_cast<float*>(static_cast<uint8_t*>(scratch) + 2 * fa);
     const size_t cg = (size_t) (grid_groups <= 0 ? cap_groups : std::min(grid_groups, cap_groups));
     const int64_t N = L.n_embd, FF = L.n_ff;
     constexpr int kRows = 8;   // rows (sub-groups) a work-group
     // gate/up: row r of the gate, then of the up, against each entry's token row
-    q.parallel_for(sycl::nd_range<2>({cg, (size_t) ((2 * FF + kRows - 1) / kRows) * kRows * kWarp}, {1, kRows * kWarp}),
+    q.parallel_for(sycl::nd_range<2>({cg, (size_t) ((2 * FF + kRows - 1) / kRows) * kRows * kWarp}, {1, (size_t) kRows * kWarp}),
                    [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int64_t row = (int64_t) it.get_group(1) * kRows + (int64_t) sg.get_group_linear_id();
@@ -1945,7 +1945,7 @@ void native_expert_grouped_bf16(const NativeExpertLayout& L, const unsigned long
     });
     // down: row r of the output for each entry, written to row ent_dst[e]
     const sycl::event e = q.parallel_for(
-        sycl::nd_range<2>({cg, (size_t) ((N + kRows - 1) / kRows) * kRows * kWarp}, {1, kRows * kWarp}),
+        sycl::nd_range<2>({cg, (size_t) ((N + kRows - 1) / kRows) * kRows * kWarp}, {1, (size_t) kRows * kWarp}),
         [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int64_t r = (int64_t) it.get_group(1) * kRows + (int64_t) sg.get_group_linear_id();

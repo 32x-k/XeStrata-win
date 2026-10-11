@@ -122,8 +122,8 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
 }
 
 bool PlainModel::prompt_return(std::string& err) {
-    if (borrow_first_ < 0) return true;
     const int64_t L = spec_.n_moe_layers(), n = n_slots_;
+    if (borrow_first_ < 0 || L <= 0) return true;   // a borrow needs slots, and slots need MoE layers
     const auto& lay = k::cpu::expert_layout();
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain prompt: ") + strata::gpu::last_error(); return false; }
     for (int64_t s = borrow_first_; s < n; ++s) free_[(size_t) (s % L)].push_back((int32_t) s);
@@ -359,7 +359,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
             }
             P.h_dense_bounds[0] = 0;
             P.h_dense_bounds[1] = (int32_t) T;
-            if (!strata::gpu::copy_async(P.dense_bounds, P.h_dense_bounds, 2 * 4, cs)) {
+            if (!strata::gpu::copy_async(P.dense_bounds, P.h_dense_bounds, 2 * sizeof(int32_t), cs)) {
                 err = std::string("plain prompt: staging: ") + strata::gpu::last_error();
                 return false;
             }
@@ -671,8 +671,9 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 const int64_t W = opt_.max_t, last = (n - 1) / W;
                 for (int64_t t0 = 0; t0 < T; t0 += W) {
                     const int64_t win = (c0 + t0) / W;
-                    const float wgt = std::pow(opt_.adapt_decay, (float) ((windows_ + last + 1) / opt_.adapt_every -
-                                                                          (windows_ + win) / opt_.adapt_every));
+                    // the adaptive rounds after this window: whole rounds, so integer divisions
+                    const int64_t rounds = (windows_ + last + 1) / opt_.adapt_every - (windows_ + win) / opt_.adapt_every;
+                    const float wgt = std::pow(opt_.adapt_decay, (float) rounds);
                     for (int64_t ml = 0; ml < L; ++ml)
                         for (int64_t i = t0 * K; i < std::min(T, t0 + W) * K; ++i)
                             disp_.usage[(size_t) (ml * E + routes[(size_t) (ml * P.T * K + i)])] += wgt;

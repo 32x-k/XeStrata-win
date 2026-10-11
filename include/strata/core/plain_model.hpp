@@ -63,6 +63,7 @@ struct PlainOptions {
     int64_t prompt_chunk = 4096;
 };
 
+// NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding): one object, its members grouped by what they serve
 class PlainModel {
 public:
     PlainModel();

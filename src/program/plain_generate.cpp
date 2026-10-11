@@ -78,6 +78,7 @@ std::vector<int32_t> eos_tokens(const std::string& path) {
                 ids.push_back((int32_t) v->u);
         }
     } catch (const std::exception&) {
+        return {};   // an unreadable file has no stop ids to add; loading it reports why
     }
     return ids;
 }

@@ -172,13 +172,13 @@ inline float q2_q8_dot_impl(int v, const int* u, const uint8_t* scales, const ha
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
     for (int i = 0; i < 4; ++i) {
-        const int sc = scales[2 * i];
+        const int sc = scales[2 * (ptrdiff_t) i];
         const int vi = (v >> (2 * i)) & 0x03030303;
-        sumf_d += d8[i] * (dp4a(vi, u[i], 0) * (sc & 0xF));
+        sumf_d += d8[i] * (float) (dp4a(vi, u[i], 0) * (sc & 0xF));
         int m = sc >> 4;
         m |= m << 8;
         m |= m << 16;
-        sumf_m += d8[i] * dp4a(m, u[i], 0);
+        sumf_m += d8[i] * (float) dp4a(m, u[i], 0);
     }
     return low(dm2) * sumf_d - high(dm2) * sumf_m;
 }
