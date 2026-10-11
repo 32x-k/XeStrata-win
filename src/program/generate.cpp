@@ -1887,6 +1887,42 @@ double memory_read_rate(const std::vector<const uint8_t*>& blobs, size_t bytes, 
     return ms > 0.0 ? (double) read.load() / ms : 0.0;
 }
 
+// The memory's rate for the split, read before a long prompt where the split is set up after it (generate): after
+// a 64K prompt the reading came out up to 3x low on the RX 9060 XT's machine, the split giving the CPU every missed
+// expert (decode 23 against 34-41 tok/s), where 1K prompts read it steadily.  0: not read.
+double g_memory_rate_before = 0.0;
+
+std::vector<const uint8_t*> split_blobs(const strata::core::ExpertDispatch& d, int64_t layer) {
+    std::vector<const uint8_t*> blobs;
+    for (int64_t e = 0; e < d.n_expert && blobs.size() < 64; ++e)
+        if (d.host_res[(size_t) layer * (size_t) d.n_expert + (size_t) e] < 0 && d.src->pinned(layer, e))
+            if (const uint8_t* b = d.src->blob(layer, e)) blobs.push_back(b);
+    return blobs;
+}
+
+// the fastest of five readings 100 ms apart: one beside other work (the machine's, not the engine's) read the rate up
+// to 3x low on the RX 9060 XT's machine
+double split_memory_rate(const strata::core::ExpertDispatch& d, const std::vector<const uint8_t*>& blobs, size_t bytes) {
+    double mem = 0.0;
+    for (int i = 0; i < 5 && !blobs.empty(); ++i) {
+        if (i > 0) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        mem = std::max(mem, memory_read_rate(blobs, bytes, d.pool != nullptr ? d.pool->workers() : 1));
+    }
+    return mem;
+}
+
+void read_memory_rate_before(const strata::core::ExpertDispatch& d, int64_t n_layers) {
+    if (d.src == nullptr || d.host_res == nullptr) return;
+    strata::core::Runtime::get().wait_preload();
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    for (int64_t layer = 0; layer < n_layers; ++layer) {
+        const std::vector<const uint8_t*> blobs = split_blobs(d, layer);
+        if (blobs.size() < 16) continue;
+        g_memory_rate_before = split_memory_rate(d, blobs, (size_t) lay.blob_bytes(layer));
+        return;
+    }
+}
+
 bool measure_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, strata::core::PcieSplitTimes& t, std::string& why) {
     // the kernels' preload builds on a core of its own: beside it the CPU's expert time read 2x and the memory's rate
     // up to 3x low on an RX 9060 XT with a Ryzen 7 5700X, and the split then gave the CPU every missed expert
@@ -1904,17 +1940,7 @@ bool measure_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, strat
     // the link's rates together pass it, both slow down by the same factor.
     const auto& lay = strata::kernels::cpu::expert_layout();
     const double bytes = (double) lay.blob_bytes(layer);
-    std::vector<const uint8_t*> blobs;
-    for (int64_t e = 0; e < d.n_expert && blobs.size() < 64; ++e)
-        if (d.host_res[(size_t) layer * (size_t) d.n_expert + (size_t) e] < 0 && d.src->pinned(layer, e))
-            if (const uint8_t* b = d.src->blob(layer, e)) blobs.push_back(b);
-    // the fastest of five readings 100 ms apart: one beside other work (the machine's, not the engine's) read the rate
-    // up to 3x low on the RX 9060 XT's machine, and one such reading made the split give the CPU every missed expert
-    double mem = 0.0;
-    for (int i = 0; i < 5 && !blobs.empty(); ++i) {
-        if (i > 0) std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        mem = std::max(mem, memory_read_rate(blobs, (size_t) bytes, d.pool != nullptr ? d.pool->workers() : 1));
-    }
+    const double mem = std::max(g_memory_rate_before, split_memory_rate(d, split_blobs(d, layer), (size_t) bytes));
     const double cpu_rate = bytes / t.c, link_rate = bytes / t.p;   // bytes a ms
     const double factor = mem > 0.0 ? std::max(1.0, (cpu_rate + link_rate) / mem) : 1.0;
     t.cb0 = t.c0; t.cb = t.c * factor;
@@ -10267,6 +10293,8 @@ int main(int argc, char** argv) {
         }
         const Clock::time_point tp0 = Clock::now();
         const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
+        if (!pcie_given && split_devs.empty() && o.pcie_mode != "dma" && o.pcie_mode != "direct")
+            read_memory_rate_before(drive.d, g.n_layers);
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
