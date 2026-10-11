@@ -72,6 +72,8 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/platform/direct_file.hpp"
+#include "strata/platform/memory.hpp"
 #include <fcntl.h>
 #include <filesystem>
 #if defined(_WIN32)
@@ -82,6 +84,8 @@
 #include <windows.h>
 #include <psapi.h>
 #include <io.h>
+#undef near   // windows.h's 16-bit pointer qualifiers, not used here, would take ShortReadCost::near
+#undef far
 #else
 #include <unistd.h>
 #include <sys/resource.h>
@@ -101,8 +105,10 @@
 #include <functional>
 #include <future>
 #include <thread>
+#if !defined(_WIN32)
 #include <pthread.h>
 #include <sched.h>
+#endif
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -1044,6 +1050,7 @@ void pl_diag_print(std::FILE* f) {
             if (d.v[st][par] != nullptr) d.v[st][par]->diag_pipelined(f, names[st][par]);
 }
 
+#if !defined(_WIN32)
 // upstream #605: whether `path` is on a rotational disk (1), not (0) or unknown (-1), from sysfs; `dev` is the disk's name
 int on_rotational_disk(const std::string& path, std::string& dev) {
     struct stat st{};
@@ -1090,6 +1097,7 @@ void disk_wait_threads(std::FILE* f) {
                  waiting > 0 ? " - the engine is waiting for the drive: a rotational or failing disk with --ple-io "
                                "direct (#605: --ple-io ram), or a drive too slow for the reads asked of it" : "");
 }
+#endif
 
 void stall_report(std::FILE* f, uint64_t layers_during) {
     strata::core::Progress& p = strata::core::progress();
@@ -1104,7 +1112,9 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
         }
         if (auto fn = strata::core::diag_pool_fn().load()) fn(f);
         if (auto fn = strata::core::diag_verify_fn().load()) fn(f);
+#if !defined(_WIN32)
         disk_wait_threads(f);
+#endif
         if (auto fn = strata::core::diag_pipeline_fn().load()) fn(f);
         const MemSample m = mem_sample();
         std::fprintf(f, "  memory: %llu MiB resident, %llu MiB %s, %llu MiB RAM available; %llu %s\n", m.rss_mib,
@@ -1484,7 +1494,7 @@ double pcie_frac_for_gbps(double gbps, double base) {
 // `bytes`: the best of three passes, in GB/s.
 double bench_ram_read_gbps(const std::vector<int>& cores, size_t bytes) {
     const size_t n = cores.size(), words = bytes / 8 / n * n;
-    auto* buf = static_cast<uint64_t*>(std::aligned_alloc(4096, (words * 8 + 4095) / 4096 * 4096));
+    auto* buf = static_cast<uint64_t*>(strata::platform::DirectFile::alloc_aligned(words * 8));
     if (buf == nullptr || n == 0) return -1.0;
     std::memset(buf, 1, words * 8);   // fault the pages in before timing
     std::atomic<uint64_t> sink{0};
@@ -1512,7 +1522,7 @@ double bench_ram_read_gbps(const std::vector<int>& cores, size_t bytes) {
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         best = std::max(best, (double) (words * 8) / s / 1e9);
     }
-    std::free(buf);
+    strata::platform::DirectFile::free_aligned(buf);
     return best;   // `sink` only keeps the reads from being optimized away
 }
 
@@ -1521,7 +1531,7 @@ double bench_ram_read_gbps(const std::vector<int>& cores, size_t bytes) {
 double bench_copy_gbps(bool to_device, bool pinned) {
     constexpr size_t kBytes = 256ull << 20;
     constexpr int kBursts = 4;
-    void* h = pinned ? strata::gpu::alloc_host(kBytes) : std::aligned_alloc(4096, kBytes);
+    void* h = pinned ? strata::gpu::alloc_host(kBytes) : strata::platform::DirectFile::alloc_aligned(kBytes);
     void* d = strata::gpu::alloc_device(kBytes);
     double bw = -1.0;
     if (h != nullptr && d != nullptr) {
@@ -1545,7 +1555,7 @@ double bench_copy_gbps(bool to_device, bool pinned) {
     }
     strata::gpu::free(d);
     if (pinned) strata::gpu::free(h);
-    else std::free(h);
+    else strata::platform::DirectFile::free_aligned(h);
     return bw;
 }
 
@@ -1554,25 +1564,49 @@ double bench_copy_gbps(bool to_device, bool pinned) {
 double bench_ssd_read_gbps(const std::string& path, double* gib_read) {
     constexpr size_t kBlock = 8ull << 20;
     constexpr int kThreads = 4;
+#if defined(_WIN32)
+    // unbuffered, as O_DIRECT; positioned reads through an OVERLAPPED offset on a synchronous handle
+    const HANDLE fh = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                  FILE_FLAG_NO_BUFFERING, nullptr);
+    LARGE_INTEGER sz{};
+    if (fh == INVALID_HANDLE_VALUE || !GetFileSizeEx(fh, &sz)) {
+        if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
+        return -1.0;
+    }
+    const size_t blocks = (size_t) std::min<long long>(sz.QuadPart, 4ll << 30) / kBlock;
+    auto read_block = [&](void* b, size_t i) {
+        OVERLAPPED ov{};
+        ov.Offset = (DWORD) (i * kBlock);
+        ov.OffsetHigh = (DWORD) ((uint64_t) (i * kBlock) >> 32);
+        DWORD got = 0;
+        return ReadFile(fh, b, (DWORD) kBlock, &got, &ov) && got == kBlock;
+    };
+#else
     const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
     if (fd < 0) return -1.0;
     const off_t size = ::lseek(fd, 0, SEEK_END);
     const size_t blocks = (size_t) std::min<off_t>(size, (off_t) 4 << 30) / kBlock;
+    auto read_block = [&](void* b, size_t i) { return ::pread(fd, b, kBlock, (off_t) (i * kBlock)) == (ssize_t) kBlock; };
+#endif
     std::atomic<size_t> next{0}, done{0};
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<std::thread> th;
     th.reserve(kThreads);
     for (int t = 0; t < kThreads; ++t)
         th.emplace_back([&] {
-            void* b = std::aligned_alloc(4096, kBlock);
+            void* b = strata::platform::DirectFile::alloc_aligned(kBlock);
             if (b == nullptr) return;
             for (size_t i; (i = next.fetch_add(1)) < blocks;)
-                if (::pread(fd, b, kBlock, (off_t) (i * kBlock)) == (ssize_t) kBlock) done.fetch_add(1);
-            std::free(b);
+                if (read_block(b, i)) done.fetch_add(1);
+            strata::platform::DirectFile::free_aligned(b);
         });
     for (auto& x : th) x.join();
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+#if defined(_WIN32)
+    CloseHandle(fh);
+#else
     ::close(fd);
+#endif
     *gib_read = (double) (done.load() * kBlock) / (1ull << 30);
     return done.load() > 0 ? (double) (done.load() * kBlock) / s / 1e9 : -1.0;
 }
@@ -1582,7 +1616,7 @@ double bench_ssd_read_gbps(const std::string& path, double* gib_read) {
 // native GGUF, else the pack's largest file).
 int hw_bench(const std::string& pack, const std::string& native) {
     const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
-    const size_t ram = (size_t) ::sysconf(_SC_PHYS_PAGES) * (size_t) ::sysconf(_SC_PAGESIZE);
+    const size_t ram = (size_t) strata::platform::total_physical_memory();
     const size_t bytes = std::min<size_t>(4ull << 30, ram / 8);
     std::printf("HW ram_threads %zu\n", cores.size());
     std::printf("HW ram_read_gb_s %.2f\n", bench_ram_read_gbps(cores, bytes));
@@ -1903,10 +1937,18 @@ double memory_read_rate(const std::vector<const uint8_t*>& blobs, size_t bytes, 
     for (int w = 0; w < threads; ++w)
         pool.emplace_back([&, w] {
             if (!cores.empty()) {
+#if defined(_WIN32)
+                const int core = cores[(size_t) w % cores.size()];
+                GROUP_AFFINITY one{};
+                one.Group = (WORD) (core / 64);
+                one.Mask = KAFFINITY(1) << (core & 63);
+                SetThreadGroupAffinity(GetCurrentThread(), &one, nullptr);
+#else
                 cpu_set_t one;
                 CPU_ZERO(&one);
                 CPU_SET(cores[(size_t) w % cores.size()], &one);
                 pthread_setaffinity_np(pthread_self(), sizeof one, &one);
+#endif
             }
             uint64_t x = 0, counted = 0;
             for (size_t i = (size_t) w; phase.load(std::memory_order_relaxed) < 2; i += (size_t) threads) {
@@ -2122,7 +2164,14 @@ int main(int argc, char** argv) {
     // The runtime reads STRATA_GPU_PCI when it starts, so this has to happen before anything else; the option loop
     // below consumes the value again.
     for (int i = 1; i + 1 < argc; ++i)
-        if (std::string(argv[i]) == "--gpu") { setenv("STRATA_GPU_PCI", argv[i + 1], 1); break; }
+        if (std::string(argv[i]) == "--gpu") {
+#if defined(_WIN32)
+            _putenv_s("STRATA_GPU_PCI", argv[i + 1]);
+#else
+            setenv("STRATA_GPU_PCI", argv[i + 1], 1);
+#endif
+            break;
+        }
     for (int i = 1; i < argc; ++i) {   // setup's --bench: the machine and the kernels alone, no model loaded
         const std::string a = argv[i];
         if (a != "--hw-bench" && a != "--kernel-bench") continue;
@@ -3618,6 +3667,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
+#if !defined(_WIN32)
         if (pio.mode == strata::kernels::PleIo::Direct) {
             // upstream #605: --ple-io direct's random reads (up to --ple-inflight at once) are for SSDs; a rotational
             // disk can take longer than the stall watchdog's 60 s for one prompt chunk's rows.  Recommended, not
@@ -3632,6 +3682,7 @@ int main(int argc, char** argv) {
                                      "--ple-io ram (it then needs RAM for the table) or the model on an SSD is "
                                      "recommended\n", o.ple_gguf.c_str(), dev.c_str());
         }
+#endif
         if (pio.lock)
             std::fprintf(stderr, "strata generate: PLE table %s (--ple-io ram) in %.1f s\n",
                          ple_table.locked() ? "locked in RAM" : "loaded (not locked)",
