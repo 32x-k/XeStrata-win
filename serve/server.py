@@ -2754,6 +2754,7 @@ class Service:
         self.last_request_at: float | None = None        # when a request last started or finished
         self.started_at = time.time()
         self.engine_failure: dict | None = None   # issue #10: the last engine that died in a request, for the web app
+        self.split_pci: list | None = None   # a layer split's other cards (the Monitor reads them too)
         self.updates = release_check.Checker()           # GET/POST /update: whether a newer release is out
         self.status_lock = threading.Lock()
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
