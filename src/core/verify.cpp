@@ -1184,7 +1184,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
-                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
                                       nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs, grid_groups);
             } else {

@@ -215,7 +215,7 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, st
         auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t grid_groups) {
             if (lay.native) {
                 const auto& f = lay.fmt[(size_t) layer];
-                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
                 if (f.gu_type == 30)
                     native_expert_grouped_bf16(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xf_ + (size_t) tb * N,
                                                hit_scratch_, hit_out, cs, grid_groups);

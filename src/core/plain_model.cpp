@@ -460,7 +460,8 @@ bool PlainModel::open_experts(std::string& err) {
     if (!expert_layout_from_gguf(opt_.gguf, blocks, E, s.n_embd, s.n_ff_exp, err)) return false;
     const auto& lay = k::cpu::expert_layout();
     for (int64_t l = 0; l < L; ++l)
-        if (!k::native_expert_supported(lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type, s.n_embd, s.n_ff_exp)) {
+        if (!k::native_expert_supported(lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type, s.n_embd, s.n_ff_exp,
+                                        lay.fmt[(size_t) l].up_type)) {
             err = "plain model: the GPU has no expert kernel for MoE layer " + std::to_string(l) + "'s types";
             return false;
         }

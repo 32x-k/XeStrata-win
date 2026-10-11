@@ -779,27 +779,30 @@ constexpr int kEntriesPass = 4;
 // The experts' projections: LPR lanes a row (seg_dot), GU_ROWS sub-groups a work-group, so a work-group covers
 // GU_ROWS * kWarp / LPR rows.  A row in range for some lanes of a sub-group and not others is masked per segment,
 // with no early return, so the segment shuffles see the whole sub-group.
+// `part`: -1 the gate and up rows, 0 the gate rows only, 1 the up rows only (a layer whose gate and up differ in type
+// takes one launch a type)
 template<int TG, int LPR>
 sycl::event launch_native_gu(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                              const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok,
-                             const block_q8_1* xq, NativeExpertLayout L, float* gate, float* up) {
+                             const block_q8_1* xq, NativeExpertLayout L, float* gate, float* up, int part = -1) {
     constexpr int RPW = kWarp / LPR;
-    const size_t xgroups = (size_t) ((2 * L.n_ff + (int64_t) GU_ROWS * RPW - 1) / ((int64_t) GU_ROWS * RPW));
+    const int row_lo = part == 1 ? (int) L.n_ff : 0, row_hi = part == 0 ? (int) L.n_ff : (int) (2 * L.n_ff);
+    const size_t xgroups = (size_t) ((row_hi - row_lo + (int64_t) GU_ROWS * RPW - 1) / ((int64_t) GU_ROWS * RPW));
     return q.parallel_for(sycl::nd_range<2>({cap_groups, xgroups * GU_ROWS * kWarp}, {1, GU_ROWS * kWarp}),
                           [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int warp = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
-        const int row0 = ((int) it.get_group(1) * GU_ROWS + warp) * RPW;
-        if (row0 >= 2 * L.n_ff) return;                                      // the whole sub-group
+        const int row0 = row_lo + ((int) it.get_group(1) * GU_ROWS + warp) * RPW;
+        if (row0 >= row_hi) return;                                          // the whole sub-group
         const int row = row0 + lane / LPR, seg_lane = lane % LPR;
-        const bool valid = row < 2 * L.n_ff;
+        const bool valid = row < row_hi;
         const bool is_up = row >= L.n_ff;
         const int r = valid ? (is_up ? row - (int) L.n_ff : row) : 0;
         const int nb = valid ? (int) (L.n_embd / Fmt<TG>::qk) : 0, xb = (int) (L.n_embd / 32);
         // the groups g, g + grid rows, ...: a group's rows are the same code in the same order whatever the grid
         for (int g = (int) it.get_group(0); g < *n_groups; g += (int) it.get_group_range(0)) {
             const uint8_t* blob = (const uint8_t*) grp_ptr[g];
-            const uint8_t* wr = blob + (is_up && valid ? L.up_off : 0) + (size_t) r * L.gu_row;
+            const uint8_t* wr = blob + (is_up && valid ? L.up_off + (size_t) r * L.up_row : (size_t) r * L.gu_row);
             const int e0 = grp_start[g], e1 = grp_start[g + 1];
             for (int e = e0; e < e1; e += kEntriesPass) {   // the row's blocks decoded once for kEntriesPass entries
                 const int n = sycl::min(kEntriesPass, e1 - e);
@@ -1729,7 +1732,10 @@ void iq_gemm_grouped_f16(int t, const uint16_t* X, const void* const* W, int64_t
     sync_if_needed(stream, e, "iq_gemm_grouped_f16");
 }
 
-bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
+bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type) noexcept {
+    if (up_type >= 0 && up_type != gu_type)   // a mixed layer: each of gate and up as a gate/up type of its own
+        return up_type != 30 && gu_type != 30 && native_expert_supported(gu_type, d_type, n_embd, n_ff) &&
+               native_expert_supported(up_type, d_type, n_embd, n_ff);
     // the cases of native_expert_grouped's two switches, and the prompt path's dequantizer (iq_dequant_gu_f16 and the
     // down rows) for both
     if (gu_type == 30 || d_type == 30)   // BF16 (native_expert_grouped_bf16): both sides, rows of whole value pairs
@@ -1745,16 +1751,18 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
            n_embd % 256 == 0;   // the dequantizers write whole 256-value pieces of a gate/up row
 }
 
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type) {
     NativeExpertLayout L;
     L.gu_type = gu_type;
     L.d_type = d_type;
+    L.up_type = up_type >= 0 ? up_type : gu_type;
     L.n_embd = n_embd;
     L.n_ff = n_ff;
     L.gu_row = iq_row_bytes(gu_type, n_embd);
+    L.up_row = iq_row_bytes(L.up_type, n_embd);
     L.d_row = iq_row_bytes(d_type, n_ff);
     L.up_off = (size_t) n_ff * L.gu_row;
-    L.down_off = 2 * L.up_off;
+    L.down_off = L.up_off + (size_t) n_ff * L.up_row;
     L.bytes = L.down_off + (size_t) n_embd * L.d_row;
     return L;
 }
@@ -1791,7 +1799,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const size_t xbytes = (size_t) kEntriesPass * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
     const size_t grid_bytes = L.gu_type == 22 ? sizeof(iq2s_grid) : L.gu_type == 16 ? sizeof(iq2xxs_grid)
                               : L.gu_type == 18 ? sizeof(iq3xxs_grid) : L.gu_type == 21 ? sizeof(iq3s_grid) : 0;
-    const bool fused_gu = m8 && (L.gu_type == 16 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
+    const bool fused_gu = m8 && (L.up_type < 0 || L.up_type == L.gu_type) && (L.gu_type == 16 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
                                  L.gu_type == 23) &&
                           grid_bytes + xbytes + (size_t) kEntriesPass * kM8Rows * sizeof(float) <= local_mem_bytes(q);
     const bool lds_down = m8 && (L.d_type == 20 || L.d_type == 42) &&
@@ -1806,25 +1814,34 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             default: launch_native_gu_fused<23, GU_LPR>(q, cgs, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
         }
     } else {
-    switch (L.gu_type) {
-        case 16: launch_native_gu<16, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 17: launch_native_gu<17, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 18: launch_native_gu<18, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 21: launch_native_gu<21, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 22: launch_native_gu<22, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 23: launch_native_gu<23, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 29: launch_native_gu<29, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 42: launch_native_gu<42, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 12: launch_native_gu<12, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 13: launch_native_gu<13, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 8: launch_native_gu<8, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 6: launch_native_gu<6, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 2: launch_native_gu<2, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 3: launch_native_gu<3, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 14: launch_native_gu<14, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 10: launch_native_gu<10, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 11: launch_native_gu<11, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        default: throw core::DeviceError("native_expert_grouped: gate/up type " + std::to_string(L.gu_type));
+    // the gate and up rows in one launch, or one a type where they differ (native_mixed_gu's layers)
+    auto gu_rows = [&](int ty, int part) {
+        switch (ty) {
+            case 16: launch_native_gu<16, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 17: launch_native_gu<17, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 18: launch_native_gu<18, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 21: launch_native_gu<21, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 22: launch_native_gu<22, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 23: launch_native_gu<23, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 29: launch_native_gu<29, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 42: launch_native_gu<42, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 12: launch_native_gu<12, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 13: launch_native_gu<13, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 8: launch_native_gu<8, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 6: launch_native_gu<6, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 2: launch_native_gu<2, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 3: launch_native_gu<3, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 14: launch_native_gu<14, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 10: launch_native_gu<10, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 11: launch_native_gu<11, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            default: throw core::DeviceError("native_expert_grouped: gate/up type " + std::to_string(ty));
+        }
+    };
+    if (L.up_type >= 0 && L.up_type != L.gu_type) {
+        gu_rows(L.gu_type, 0);
+        gu_rows(L.up_type, 1);
+    } else {
+        gu_rows(L.gu_type, -1);
     }
     const long long nh = (long long) cap_entries * L.n_ff;
     if (v1) {

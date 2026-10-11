@@ -112,7 +112,7 @@ struct PcieFetchProbe {
 bool measure_gpu_expert_ms(const strata::core::ExpertDispatch& d, int64_t layer, double& q0, double& q, std::string& why) {
     namespace sk = strata::kernels;
     const auto& f = sk::cpu::expert_layout().fmt[(size_t) layer];
-    const sk::NativeExpertLayout L = sk::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+    const sk::NativeExpertLayout L = sk::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
     constexpr int kRing = 16, kCap = 8;
     const int64_t bytes = (int64_t) sk::cpu::expert_layout().blob_bytes(layer);
     const size_t scratch = sk::native_expert_scratch_bytes(kCap, f.n_ff);

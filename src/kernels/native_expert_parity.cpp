@@ -289,7 +289,7 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
     }
     // (c) the GPU: one group holding the NT entries
     {
-        const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF);
+        const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF, f.up_type);
         namespace par = strata::parity;
         void* dblob = par::alloc_bytes(blob.size());
         void* dx = par::alloc_bytes(x.size() * 4);
