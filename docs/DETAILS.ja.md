@@ -235,6 +235,54 @@ Arc Pro B70（32 GB）と i7-14700、RAM 96 GB で、setup の設定のまま、
 
 答えは、どの実行でも同じトークンでした。
 
+### Qwen3.8-Flash-Next 以外のモデル（Ornith-1.5、llm-jp-4.1）
+
+setup の最初の質問では、Qwen3.8-Flash-Next とは作りの違う 2 つの MoE モデルも選べます。
+どちらも GGUF のファイル 1 つで、エキスパートを RAM に置き、よく使うものを GPU の VRAM に置きます（VRAM にないものの扱いは Qwen3.8-Flash-Next と同じです）。
+
+- **[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)**（Ornith AI、MIT）: 35B、1 トークンで使うのは 3B の Qwen3.5 系の MoE です。文脈は 256K まで。
+  公式の Q4_K_M〜BF16 と、pfeifferj による GSQ-RCO の 3 ビットと 3.5 ビット（[コミュニティの再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)で、ISTA-DASLab のものではありません）があります。
+- **[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)**（LLM-jp、Apache-2.0）: 32B、1 トークンで使うのは 3B の、日本語と英語の思考するモデルです。文脈は 256K まで。
+
+| モデル | 大きさ | ダウンロード |
+| --- | --- | ---: |
+| Ornith-1.5 | **Q4_K_M** | 21.7 GB |
+| | Q5_K_M | 25.3 GB |
+| | **Q6_K** | 29.2 GB |
+| | Q8_0 | 37.8 GB |
+| | **BF16** | 71.1 GB |
+| | **GSQ-RCO-3BIT** | 13.0 GB |
+| | GSQ-RCO-3.5BIT | 15.2 GB |
+| llm-jp-4.1 | **Q4_K_M** | 21.5 GB |
+| | BF16 | 64.3 GB |
+
+太字は、このリリースで llama.cpp と答えを比べた版です。
+ほかの版も同じ型のテンソルでできていて、その型は太字の版とカーネルの試験で確かめています（setup は「untested」と表示します）。
+
+```sh
+./setup.sh --setup --family ornith --model Q4_K_M
+./setup.sh --setup --family llmjp
+```
+
+API は、思考と答えの分離、ストリーミング、ツールの呼び出しを含めて使えます。
+まだ使えないのは、画像、推測デコード（MTP）、2 枚以上の GPU（setup は最初の GPU を使います）、KV キャッシュの精度や省 RAM モードなど Qwen3.8-Flash-Next のためのオプションです。
+RAM がエキスパートに足りないとき、エンジンはエキスパートを RAM に読み込まず、モデルのファイルから OS のファイルキャッシュ越しに読みます（遅くなります。setup はそのことを警告します）。
+
+エンジンのオプション（設定の `args` に足します）:
+
+| オプション | 意味 |
+| --- | --- |
+| `--max-context N` | KV キャッシュのトークン数（setup が GPU の VRAM から選びます） |
+| `--expert-profile PATH` | 起動時に、このプロファイルの順で VRAM のエキスパートを埋める |
+| `--expert-profile-save PATH` | この実行で学んだことをプロファイルとして書き出す |
+| `--adapt-every N` | VRAM のエキスパートを入れ替える間隔（窓の数、既定 4。0 で入れ替えない） |
+| `--mmap-experts` | エキスパートを RAM に読み込まず、モデルのファイルから読む |
+| `--no-pcie-split` | VRAM にないエキスパートを、すべて CPU で計算する |
+| `--pool-workers N` | エキスパートを計算する CPU のスレッドの数（既定は物理コアの数より 1 少ない） |
+| `--prompt-chunk N` | prefill で一度にまとめて計算する最大のトークン数（既定 4096、0 でまとめない） |
+| `--max-t N` | decode の窓の最大のトークン数（既定 8） |
+| `--rope-scaling none\|linear\|yarn`、`--rope-scale F`、`--yarn-orig-ctx N` | 文脈の延長 |
+
 ### RAM がモデルより少ないとき（省 RAM モード）
 
 Unsloth の 2 つ以外のモデルは、すべてのエキスパートを RAM に置き、GPU はよく使うもののコピーを持ちます。

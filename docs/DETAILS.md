@@ -242,6 +242,61 @@ every run from a cold OS cache:
 
 The answers were the same tokens in every run.
 
+### Or: models other than Qwen3.8-Flash-Next (Ornith-1.5, llm-jp-4.1)
+
+setup's first question also offers two MoE models built differently from Qwen3.8-Flash-Next.
+Each is one GGUF file; the experts are kept in RAM and the most used ones in the GPU's VRAM (the ones VRAM does not hold
+are handled as for Qwen3.8-Flash-Next).
+
+- **[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)** (Ornith AI, MIT): a Qwen3.5-family
+  MoE of 35B with 3B active per token, context up to 256K. The official Q4_K_M to BF16, and pfeifferj's GSQ-RCO 3 and
+  3.5 bits (a [community reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF), not
+  ISTA-DASLab's).
+- **[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)** (LLM-jp,
+  Apache-2.0): a thinking model of 32B with 3B active per token, in Japanese and English, context up to 256K.
+
+| Model | Size | Download |
+| --- | --- | ---: |
+| Ornith-1.5 | **Q4_K_M** | 21.7 GB |
+| | Q5_K_M | 25.3 GB |
+| | **Q6_K** | 29.2 GB |
+| | Q8_0 | 37.8 GB |
+| | **BF16** | 71.1 GB |
+| | **GSQ-RCO-3BIT** | 13.0 GB |
+| | GSQ-RCO-3.5BIT | 15.2 GB |
+| llm-jp-4.1 | **Q4_K_M** | 21.5 GB |
+| | BF16 | 64.3 GB |
+
+The sizes in bold are the files whose answers this release compared with llama.cpp's.
+The others are made of the same tensor types, checked on those files and in the kernels' tests (setup marks them
+"untested").
+
+```sh
+./setup.sh --setup --family ornith --model Q4_K_M
+./setup.sh --setup --family llmjp
+```
+
+The API works, with the thinking kept apart from the answer, streaming and tool calls.
+Not yet: images, speculative decoding (MTP), more than one GPU (setup uses the first), and the options made for
+Qwen3.8-Flash-Next such as the KV cache's precision and the low-RAM modes.
+When RAM is short for the experts, the engine does not load them and reads them from the model file through the OS
+file cache instead (slower; setup warns of it).
+
+The engine's options (added to the settings' `args`):
+
+| Option | Meaning |
+| --- | --- |
+| `--max-context N` | the KV cache's tokens (setup picks it from the GPU's VRAM) |
+| `--expert-profile PATH` | fill the experts in VRAM in this profile's order at start |
+| `--expert-profile-save PATH` | write what this run learned as a profile |
+| `--adapt-every N` | windows between swaps of the experts in VRAM (default 4; 0: no swaps) |
+| `--mmap-experts` | read the experts from the model file instead of loading them into RAM |
+| `--no-pcie-split` | the CPU computes every expert VRAM does not hold |
+| `--pool-workers N` | the CPU threads that compute experts (default one fewer than the physical cores) |
+| `--prompt-chunk N` | the most tokens prefill computes at once (default 4096; 0: none at once) |
+| `--max-t N` | the decode window's most tokens (default 8) |
+| `--rope-scaling none\|linear\|yarn`, `--rope-scale F`, `--yarn-orig-ctx N` | context extension |
+
 ### Less RAM than the model: the low-RAM mode
 
 Every model but Unsloth's two keeps all of its experts in RAM, and the GPU holds a copy of the most-used ones.

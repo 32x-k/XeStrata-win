@@ -111,6 +111,7 @@ AMD の GPU では、prefill の密な行列積をディストリビューショ
   2〜3 ビットの大きさより遅くなります（[詳細](docs/DETAILS.ja.md#unsloth-の-ud-q4_k_xl実験的)）。
 
 迷ったら **IQ2_XS** を選んでください。RAM が 32 GB しかない PC では、Coder が選べます。
+Qwen3.8-Flash-Next のほかに、Ornith-1.5 と llm-jp-4.1 も選べます（[詳細](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41)）。
 あとから別のモデルを足すときは `xestrata --setup` を実行します。
 
 OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューにはありません。
