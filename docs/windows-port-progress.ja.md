@@ -146,7 +146,7 @@ prefillとdecodeは別に集計しています。decodeの平均は、待機352.
 
 既存のPhase 0版と、数値再現性を確認したPhase 1版の復元用コピーは維持しています。repository lintは必要ツールが不足しており完了していません。gitleaks未導入時の`possible secret`表示は、秘密情報を検出した証拠ではありません。REUSEで新しいファイルの指摘は解消し、残る指摘は以前からあるWindows上の`.agents/skills`のcheckout状態です。Linuxのfree/contrib-llvm、NVIDIA、内蔵GPU、ASan/UBSan、context境界、ほかの量子化、GPUの実障害cleanup、物理転送時間とhard faultの分離は引き続き確認が必要です。
 
-ユーザーの指定に従い、Phase 2の記録と検証を終えた時点で停止します。Phase 3の高速化、DPC++への移行、他GPUへの対応、大規模なリファクタリングには着手していません。
+ユーザーの指定に従い、Phase 2の記録と検証を終えた時点で停止しました。その時点ではPhase 3の高速化、DPC++への移行、他GPUへの対応、大規模なリファクタリングには着手していません。
 
 ## Phase 3開始前: AdaptiveCppの暫定async-handlerパッチ
 
@@ -160,9 +160,54 @@ prefillとdecodeは別に集計しています。decodeの平均は、待機352.
 
 wrapperの26件のhostテストは成功しました。主な記録は`build/windows-acpp/async-eventfix-build-v2.log`、`async-eventfix-receipt.json`、最終wrapperで再適用をスキップした`async-eventfix-receipt-v3.json`、`async-eventfix-installed-check.json`、`async-eventfix-wrapper-tests-final-v2.log`、`async-eventfix-installed-final-v2.json`、`async-eventfix-skip-final-v2.json`、`async-eventfix-fixed-test-v2.txt`、`async-eventfix-broken-test-v2.txt`です。
 
-正常版のAdaptiveCpp source/header、HIP install、生成実行ファイルと既存の復元用コピーは維持しています。新prefixは隔離検証用で、正常版のHIP環境へ切り替えたものではありません。GPU実行や意図的なhang、driver更新、Phase 3の性能最適化は行っていません。
+正常版のAdaptiveCpp source/header、HIP install、生成実行ファイルと既存の復元用コピーは維持しています。新prefixは隔離検証用で、正常版のHIP環境へ切り替えたものではありません。このCPU隔離検証ではGPU実行や意図的なhang、driver更新、Phase 3の性能最適化は行っていません。
 
 この修正が対象とするのは、handlerを渡したnode付きeventの通知です。default生成eventのhandler挙動、process-global error一覧の競合、cancelされたnodeのcomplete扱い、HIP待機失敗後やDMA完了不明時のcleanupは別課題として残します。今回の成功をGPU障害時のbuffer寿命や実モデル生成の検証とは扱わず、ここで停止します。
+
+## Phase 3B: Routing D2H marker削減
+
+### 基準と変更範囲
+
+開始時のHEADは`ae1d3ac7be3b1e2eba6ccae75f32f8c9ca1c2968`、branchは`feature/windows-r9700-sycl`で、作業ツリーはcleanでした。AdaptiveCppは`0ea863abe1af4422593583f91e5608ef75044a16`、LLVMは24です。変更前のsourceを別worktreeへ固定し、`build/windows-phase3b-baseline`と`build/windows-phase3b-candidate`へ同じfreeモードの設定でビルドしました。両版とも正常版からコピーしたHIP対応header一式に、SHA限定のasync-handler修正headerだけを重ねています。正常版installを置き換える構成ではありません。
+
+モデルprocessでロード済みmoduleを列挙しました。`acpp-rt.dll`とHIP backendは`.tools/adaptivecpp-amd24/bin`から、HIP DLLは共有SDK直下ではなく`C:\Windows\System32\amdhip64_7.dll`からロードされました。パスとSHA-256は各実行のJSONに記録しています。このWindows DLLのFileVersionは`10.0.3683.0`で、HIP APIやROCmのversionを表す値としては扱いません。
+
+`src/core/session.cpp`のweights D2Hを既存の`copy_async_after(..., cs, nullptr, scratch.probe)`へまとめ、直後の空markerとその失敗分岐だけを削除しました。pre → mixed D2H → IDs D2H → weights D2Hの順序、最後のcopy eventを待つ位置、CPU Expert callback、parts H2D、post、最終drain、バッファは変えていません。Windows＋AdaptiveCppのDAG依存方式も維持しています。演算、量子化、sampling、cache、GPUの選択方法は変更していません。
+
+### 正確性・順序・寿命の確認
+
+Phase 3Bに先立つ小規模GPUテストでは、R9700で1 kernelと3回D2Hの6,144値が一致しました。先行kernelやqueue全体を待たず、最後のcopy eventだけで完了を確認しています。GPU完了後に共有error一覧へ合成エラーを登録し、そのcopy eventから元の例外型・code・diagnosticがhandlerへ届くことも確認しました。記録は`async-eventfix-gpu-once.txt`です。実GPU障害を発生させたテストではありません。
+
+実モデルの変更前後は13 input IDs、41生成token、53位置です。全logits 13,160,960値と、input＋48層の残差26,593,280値がbitwise一致し、非有限値は0でした。最大logit差は0、生成tokenも一致し、両版の41 sampled argmaxがGPUの選択IDと一致しました。変更前の新ビルドも保存済みPhase 2の全logits・残差とbitwise一致しています。EOSで打ち切られた実際の行数を使い、既存logit headerの予定行数76を53実行行と混同していません。
+
+FIFO host fixtureは、最後のcopyのevent公開、callback前の3コピー完了、前層のparts DMA後のstaging再利用、event公開失敗時のcallback抑止とdrain試行を確認します。sessionとdequantの既存hostテスト7件が成功しました。mockのdrain成功を、実障害時のDMA完了保証とは扱いません。両ビルドのwarning診断集計は同じで、新しいwarning messageはありませんでした。`git diff --check`と日本語lintは成功しました。全体lintは必要ツール不足で完了せず、REUSEの残る指摘は既存の`.agents/skills`のcheckout状態だけです。
+
+Routing D2Hの成功時API呼び出し数は1位置あたり192から144へ減りました。48層×53位置で2,544個の空markerを削除し、payloadは両版とも495,360 bytes/位置です。parts H2Dは4,915,200 bytes/位置で変わりません。既存の`routing_D2H_submit+record`という表示名は維持しています。bytesは成功を返したAPIのpayload集計で、物理bus転送量ではありません。
+
+### 同条件の反復性能比較
+
+数値確認の診断dump付き2実行は性能集計から除外しました。その後、診断dumpなしで各版3回をA1 → B1 → B2 → A2 → A3 → B3の順に単独実行しました。Aがmarker版、Bが最後のweights copy eventを使う版です。同じQ2_0 pack、13 input IDs、generation cap 64、context 256、greedy/EOS、3 workers＋caller、mmap、固定GPU cache 0、no-capture、no-XMX、8 GiBのVRAM reporting制限を使い、`--check-logits --stats`と既存境界のhost timingを有効にしました。各processはprivate Job内で150秒と従来のmemory guardに制限しています。prefillは12位置、decodeは41位置です。
+
+| 実行順 | Prefill tok/s | Decode tok/s |
+| --- | ---: | ---: |
+| A1 | 2.083 | 2.073 |
+| B1 | 2.265 | 2.282 |
+| B2 | 2.275 | 2.525 |
+| A2 | 2.471 | 2.636 |
+| A3 | 2.546 | 2.684 |
+| B3 | 2.517 | 2.689 |
+
+中央値はprefillがA 2.471、B 2.275 tok/s、decodeがA 2.636、B 2.525 tok/sでした。候補の中央値は低いものの範囲は重なり、時間経過に伴う変動もあります。OS/file cache温度や外部負荷は制御していないため、cold/warmを割り当てず、marker削減による高速化とも性能回帰とも断定しません。Routing D2H submitの平均ms/位置を実行ごとに集計した中央値はA 1.603、B 1.094でした。これはhostのAPI時間で、純粋なGPU演算や転送時間ではありません。
+
+8実行すべてでmemory guardに達せず、非同期エラーの診断や生成tokenの差はありませんでした。最大process privateは約5,020 MiB、GPU dedicated集計は約6,627 MiBです。性能6実行の最小空きRAMは約6,002 MiB、空きcommitは約12,456 MiBで、終了後GPU dedicated集計は約1,522 MiBへ戻りました。
+
+### 採用判断と停止点
+
+全体の高速化は確認できませんでしたが、依存関係・バッファ・数値処理を変えずに空markerと失敗分岐を減らせたため、この小さい変更を採用します。上記の中央値低下を含め、性能への効果は保証しません。重大な新規回帰は観測していません。cancel／DMA完了不明時のcleanup、global error一覧の競合、長いcontext、他の量子化、Linuxのfree/contrib-llvm、NVIDIA、内蔵GPU、ASan/UBSanは引き続き別に確認する課題です。上流SDMA修正は取り込まず、DAG方式も外していません。
+
+正常版のAdaptiveCpp source/header、HIP/ROCm環境、`build/windows-acpp/strata.exe`、既存のPhase 0・1復元用コピーは変更していません。基準記録は`build/windows-acpp/phase3b-start-state.json`、数値比較は`phase3b-numerical-comparison.json`と両版のargmax JSON、性能集計は`phase3b-performance.json`、hostテストは`phase3b-combined-host-contracts.log`です。各実行のlog、monitor、module path/hash、最終の正常版integrity記録も同じdirectoryに保存します。これらの生成物はcommit対象から除外します。
+
+Phase 3Bの記録と採用変更だけをcommitして停止します。Phase 3CのGPU Expert cache、Phase 3Dの整理や上流更新取り込みには着手していません。
 
 ## 2026-10-11: ツールチェーンの確認
 

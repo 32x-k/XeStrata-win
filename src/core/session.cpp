@@ -890,11 +890,9 @@ bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64
                 }, ids_bytes)) return gpu_error("D2H IDs");
             const size_t weights_bytes = (size_t) s.k * sizeof(float);
             if (!measured(&PoolTiming::routing_d2h_submit, [&] {
-                    return strata::gpu::copy_async(s.db->h_weights, s.moe.weights, weights_bytes, cs);
+                    return strata::gpu::copy_async_after(
+                        s.db->h_weights, s.moe.weights, weights_bytes, cs, nullptr, scratch.probe);
                 }, weights_bytes)) return gpu_error("D2H weights");
-            if (!measured(&PoolTiming::routing_d2h_submit, [&] {
-                    return strata::gpu::event_record(scratch.probe, cs);
-                })) return gpu_error("record staging event");
             if (!measured(&PoolTiming::routing_wait, [&] {
                     return strata::gpu::event_sync(scratch.probe);
                 })) return gpu_error("wait staging event");

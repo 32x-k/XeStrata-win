@@ -146,7 +146,7 @@ Main records are `build/windows-acpp/phase2-timing-summary.json`, `phase2-timing
 
 The Phase 0 executable and the numerically checked Phase 1 recovery copies are preserved. Repository lint is incomplete because required tools are missing. The `possible secret` message when gitleaks is absent is not evidence of a detected secret. New-file REUSE findings are resolved; only the pre-existing Windows checkout state of `.agents/skills` remains. Linux free/contrib-llvm, NVIDIA, integrated graphics, ASan/UBSan, context boundaries, other quantization formats, real GPU fault cleanup, physical transfer timing and hard-fault attribution still need checking.
 
-At the user's request, work stops after Phase 2 records and validation. Phase 3 optimization, migration to DPC++, other-GPU support and major refactoring have not started.
+At the user's request, work stopped after Phase 2 records and validation. At that point, Phase 3 optimization, migration to DPC++, other-GPU support and major refactoring had not started.
 
 ## Before Phase 3: temporary AdaptiveCpp async-handler patch
 
@@ -160,9 +160,54 @@ The isolated `tests/platform/adaptivecpp_event_async.cpp` uses real installed he
 
 All 26 host wrapper tests pass. Main records are `build/windows-acpp/async-eventfix-build-v2.log`, `async-eventfix-receipt.json`, `async-eventfix-receipt-v3.json` (the final wrapper's already-applied build/install rerun), `async-eventfix-installed-check.json`, `async-eventfix-wrapper-tests-final-v2.log`, `async-eventfix-installed-final-v2.json`, `async-eventfix-skip-final-v2.json`, `async-eventfix-fixed-test-v2.txt`, and `async-eventfix-broken-test-v2.txt`.
 
-The working AdaptiveCpp source/header, HIP installation, generation executable and existing recovery copies remain intact. The new prefix is for isolated validation, not a switch of the working HIP environment. No GPU execution, intentional hang, driver update or Phase 3 optimization was performed.
+The working AdaptiveCpp source/header, HIP installation, generation executable and existing recovery copies remain intact. The new prefix is for isolated validation, not a switch of the working HIP environment. This CPU-only isolated check performed no GPU execution, intentional hang, driver update or Phase 3 optimization.
 
 This fix covers notification by node-bearing events supplied with a handler. Default-constructed-event handler behavior, competing consumers of the process-global error list, cancelled nodes reporting complete, and cleanup after failed HIP waits or uncertain DMA remain separate issues. These passing tests do not establish GPU-fault buffer lifetime or real-model correctness. Work stops here.
+
+## Phase 3B: Routing D2H marker reduction
+
+### Baseline and change scope
+
+At the start, HEAD was `ae1d3ac7be3b1e2eba6ccae75f32f8c9ca1c2968`, branch `feature/windows-r9700-sycl`, with a clean worktree. AdaptiveCpp is `0ea863abe1af4422593583f91e5608ef75044a16` and LLVM is 24. The baseline source was frozen in a separate worktree, and both `build/windows-phase3b-baseline` and `build/windows-phase3b-candidate` were built with the same free-mode configuration. Both use HIP-enabled headers copied from the working installation, overlaid only with the SHA-pinned async-handler fix. This does not replace the working installation.
+
+Loaded modules were enumerated in the model process. `acpp-rt.dll` and the HIP backend came from `.tools/adaptivecpp-amd24/bin`; the HIP DLL was loaded from `C:\Windows\System32\amdhip64_7.dll`, not directly from the shared SDK. Each run's JSON records paths and SHA-256 hashes. This Windows DLL's FileVersion is `10.0.3683.0`; it is not treated as the HIP API or ROCm version.
+
+In `src/core/session.cpp`, the weights D2H now uses the existing `copy_async_after(..., cs, nullptr, scratch.probe)`, removing only the immediately following empty marker and its failure branch. The pre → mixed D2H → IDs D2H → weights D2H order, final-copy event wait, CPU Expert callback, parts H2D, post, final drain and buffers remain unchanged. Windows/AdaptiveCpp DAG dependencies remain in place. Arithmetic, quantization, sampling, caches and capability-based device selection were not changed.
+
+### Numerical, ordering and lifetime checks
+
+Before Phase 3B, a small R9700 test verified all 6,144 values from one kernel and three D2H copies. Only the last copy event was waited on, without first waiting for the kernel or the whole queue. A controlled error injected into the shared error list after healthy GPU completion also reached the handler from that copy event, preserving exception type, code and diagnostics. The record is `async-eventfix-gpu-once.txt`. This was not a real GPU fault test.
+
+The real-model comparison covers 13 input IDs, 41 generated tokens and 53 positions. All 13,160,960 logits and 26,593,280 residual floats for the input plus 48 layers are bitwise identical, with zero nonfinite values. Maximum logit difference is zero, generated tokens match, and all 41 sampled argmaxes in each run match the GPU-selected IDs. The new baseline build also matches the saved Phase 2 logits and residuals bitwise. EOS-shortened actual rows are used; the existing logit header's 76 planned rows are not mistaken for the 53 executed rows.
+
+The FIFO host fixture checks last-copy event publication, completion of all three copies before callbacks, staging reuse after the preceding layer's parts DMA, and callback suppression/drain attempts when event publication fails. All seven existing session/dequant host tests pass. Successful mock drains are not evidence of physical DMA completion during real faults. Both builds have the same aggregate warning diagnostics, with no new warning messages. `git diff --check` and Japanese lint pass. Full repository lint remains incomplete because required tools are missing; the only remaining REUSE finding is the pre-existing `.agents/skills` checkout state.
+
+Successful routing D2H API counts drop from 192 to 144 per position. Across 48 layers and 53 positions, 2,544 empty markers are removed; payload remains 495,360 bytes per position in both builds. Parts H2D remains 4,915,200 bytes per position. The existing `routing_D2H_submit+record` display label is retained. Bytes count payload for API calls that report success, not physical bus traffic.
+
+### Repeated performance comparison under matching settings
+
+The two numerical runs with diagnostic dumps were excluded from performance aggregation. Each build then ran three times without diagnostic dumps, sequentially in A1 → B1 → B2 → A2 → A3 → B3 order. A is the marker baseline and B waits on the last weights copy event. Both use the same Q2_0 pack, 13 input IDs, generation cap 64, context 256, greedy/EOS, three workers plus caller, mmap, fixed GPU cache 0, no-capture, no-XMX and 8 GiB VRAM reporting limit, with `--check-logits --stats` and host timing at existing boundaries. Each process runs in a private Job with a 150-second timeout and existing memory guards. Prefill covers 12 positions and decode 41.
+
+| Run order | Prefill tok/s | Decode tok/s |
+| --- | ---: | ---: |
+| A1 | 2.083 | 2.073 |
+| B1 | 2.265 | 2.282 |
+| B2 | 2.275 | 2.525 |
+| A2 | 2.471 | 2.636 |
+| A3 | 2.546 | 2.684 |
+| B3 | 2.517 | 2.689 |
+
+Median prefill is A 2.471 and B 2.275 tok/s; median decode is A 2.636 and B 2.525 tok/s. Candidate medians are lower, but ranges overlap and performance also varies with run order. OS/file-cache temperature and external load were not controlled; no cold/warm designation or causal speedup/regression claim is made. The median of per-run mean routing D2H submit times is A 1.603 and B 1.094 ms per position. These are host API timings, not pure GPU arithmetic or transfer time.
+
+All eight runs stay below memory guards, with no async-error diagnostics or generated-token differences. Peak process private memory is approximately 5,020 MiB and aggregate GPU dedicated usage 6,627 MiB. Across the six timing runs, minimum available RAM is approximately 6,002 MiB and available commit 12,456 MiB; post-exit aggregate GPU dedicated usage returns to approximately 1,522 MiB.
+
+### Adoption decision and stopping point
+
+An overall speedup was not established. The small change is adopted because it removes empty markers and a failure branch without changing dependencies, buffers or numerical processing. No performance benefit is guaranteed, including the observed lower medians above. No major new regression was observed. Cancellation/uncertain-DMA cleanup, competing global error consumers, long contexts, other quantization formats, Linux free/contrib-llvm, NVIDIA, integrated graphics and ASan/UBSan remain separate checks. No upstream SDMA fix was integrated, and DAG ordering was not removed.
+
+The working AdaptiveCpp source/header, HIP/ROCm environment, `build/windows-acpp/strata.exe` and existing Phase 0/1 recovery copies remain unchanged. Baseline records are in `build/windows-acpp/phase3b-start-state.json`; numerical comparisons in `phase3b-numerical-comparison.json` and both argmax JSONs; performance in `phase3b-performance.json`; host tests in `phase3b-combined-host-contracts.log`. Run logs, monitors, module paths/hashes and final working-version integrity records are saved in the same directory. Generated artifacts are excluded from the commit.
+
+Work stops after committing only Phase 3B records and the adopted change. Phase 3C GPU Expert caching, Phase 3D cleanup and upstream-update integration were not started.
 
 ## 2026-10-11: toolchain check
 

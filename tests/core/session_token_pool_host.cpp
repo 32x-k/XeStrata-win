@@ -54,6 +54,9 @@ struct Fixture {
     std::array<float, 8> parts{}, answer{};
     std::deque<std::function<void()>> fifo;
     size_t submitted = 0, executed = 0;
+    size_t last_copy_sequence = 0, last_copy_completed = 0;
+    size_t parts_copy_sequence = 0, parts_copy_completed = 0;
+    size_t published_sequence = 0;
     std::vector<std::string> calls;
     std::vector<std::pair<std::string, size_t>> transfers;
     PoolTiming timing{};
@@ -127,10 +130,17 @@ struct Fixture {
         diagnostic = err;
         return ok;
     }
+    void check_staging_ready() const {
+        CHECK(event.end == last_copy_sequence && published_sequence == last_copy_sequence);
+        CHECK(last_copy_completed == last_copy_sequence && executed >= last_copy_sequence);
+        // The previous layer's DMA must have read answer before this callback overwrites it.
+        CHECK(parts_copy_completed == parts_copy_sequence);
+    }
     static void pool(void* user, const float* x, const int32_t* id, const float* w,
                      int64_t n, int64_t k, float* out) {
         auto& f = *static_cast<Fixture*>(user);
         f.calls.push_back("pool");
+        f.check_staging_ready();
         CHECK(n == 4 && k == 2 && out == f.answer.data());
         CHECK(x == f.db.h_x_f && id == f.db.h_ids && w == f.db.h_weights);
         CHECK(!f.use_hits || f.launch_layer == f.layer);
@@ -154,6 +164,7 @@ struct Fixture {
         const int l = f.layer;
         if (phase == HitPhase::Launch) {
             f.calls.push_back("launch");
+            f.check_staging_ready();
             CHECK(id == f.hids.data() && k == 2 && id[0] == l * 3);
             if (f.fail("launch throw")) throw std::runtime_error("launch callback original");
             f.launch_layer = l;
@@ -186,7 +197,7 @@ bool PleTable::is_open() const { CHECK(false); return false; }
 namespace strata::gpu {
 const char* last_error() { return active->diagnostic.c_str(); }
 bool is_capturing(Stream s) { CHECK(s == active); return active->capturing; }
-bool copy_async(void* dst, const void* src, size_t bytes, Stream s) {
+static bool submit_copy(void* dst, const void* src, size_t bytes, Stream s, bool fused) {
     auto& f = *active; CHECK(s == &f);
     std::string what;
     if (f.dump_target != nullptr && src == f.R.data())
@@ -198,21 +209,46 @@ bool copy_async(void* dst, const void* src, size_t bytes, Stream s) {
     else what = "QSA upload";
     f.calls.push_back(what);
     if (f.fail(what)) return false;
-    f.transfers.emplace_back(what, bytes);
-    f.enqueue([dst, src, bytes] { std::memcpy(dst, src, bytes); });
+    if (!fused) f.transfers.emplace_back(what, bytes);
+    const size_t sequence = f.submitted + 1;
+    if (dst == f.hw.data()) f.last_copy_sequence = sequence;
+    if (dst == f.parts.data()) f.parts_copy_sequence = sequence;
+    f.enqueue([&f, dst, src, bytes, sequence] {
+        std::memcpy(dst, src, bytes);
+        if (dst == f.hw.data()) f.last_copy_completed = sequence;
+        if (dst == f.parts.data()) f.parts_copy_completed = sequence;
+    });
     return true;
 }
-bool event_record(Event* e, Stream s) {
-    auto& f = *active; CHECK(s == &f && e == &f.event);
-    f.calls.push_back("record");
-    if (f.fail("record staging event")) return false;
-    e->end = f.submitted; return true;
+bool copy_async(void* dst, const void* src, size_t bytes, Stream s) {
+    CHECK(dst != active->hw.data()); // Weights must use the fused last-copy API.
+    return submit_copy(dst, src, bytes, s, false);
+}
+bool copy_async_after(void* dst, const void* src, size_t bytes, Stream s,
+                      const Event* after, Event* done) {
+    auto& f = *active;
+    CHECK(s == &f && after == nullptr && done == &f.event);
+    CHECK(dst == f.hw.data() && src == f.weights.data());
+    CHECK(bytes == size_t(f.s.k) * sizeof(float) && bytes > 0);
+    if (!submit_copy(dst, src, bytes, s, true)) return false;
+    f.calls.push_back("publish");
+    // Model a copy already enqueued when publishing its completion event fails.
+    // This is a mock failure path, not a claim about real driver fault safety.
+    if (f.fail("publish staging event")) return false;
+    done->end = f.last_copy_sequence;
+    CHECK(done->end == f.submitted);
+    f.published_sequence = done->end;
+    f.transfers.emplace_back("D2H weights", bytes); // Successful fused call bytes only.
+    return true;
 }
 bool event_sync(const Event* e) {
     auto& f = *active; CHECK(e == &f.event);
     f.calls.push_back("wait");
     if (f.fail("wait staging event")) return false;
-    f.drain(e->end); return true;
+    CHECK(e->end == f.last_copy_sequence && e->end == f.published_sequence);
+    f.drain(e->end);
+    f.check_staging_ready(); // Also covers the no-pool/no-hits overwrite path.
+    return true;
 }
 bool stream_sync(Stream s) {
     auto& f = *active; CHECK(s == &f);
@@ -298,8 +334,8 @@ bool block_layer_post(const WeightTable&, const ModelGeometry&, int64_t l, int64
 namespace {
 static_assert(std::is_trivial_v<PoolTiming> && std::is_standard_layout_v<PoolTiming>, "timing must be POD");
 
-// Independent oracle: counts from the unchanged mock call trace, bytes from successful production
-// copy_async arguments. Failed copies contribute an attempt but no submitted bytes; throws count too.
+// Independent oracle: counts from the mock call trace, bytes from successful production
+// copy API arguments. Failed fused publication contributes an attempt but no charged bytes; throws count too.
 void check_timing(const Fixture& f, uint64_t drains = 1) {
     auto count = [&](const char* name) -> uint64_t {
         return (uint64_t) std::count(f.calls.begin(), f.calls.end(), name);
@@ -315,7 +351,7 @@ void check_timing(const Fixture& f, uint64_t drains = 1) {
     };
     span(f.timing.pre_submit, count("pre"));
     span(f.timing.routing_d2h_submit,
-         count("D2H mixed") + count("D2H IDs") + count("D2H weights") + count("record"),
+         count("D2H mixed") + count("D2H IDs") + count("D2H weights"),
          bytes("D2H mixed") + bytes("D2H IDs") + bytes("D2H weights"));
     span(f.timing.routing_wait, count("wait"));
     span(f.timing.cpu_pool, count("pool"));
@@ -355,7 +391,7 @@ void orchestration() {
         std::vector<std::string> filtered;
         for (const auto& c : f.calls) if (c != "QSA upload" && c != "sync") filtered.push_back(c);
         const std::vector<std::string> expected = {
-            "pre", "D2H mixed", "D2H IDs", "D2H weights", "record", "wait",
+            "pre", "D2H mixed", "D2H IDs", "D2H weights", "publish", "wait",
             "launch", "pool", "H2D parts", "combine", "post"};
         CHECK(filtered.size() == 96 * expected.size());
         for (size_t i = 0; i < filtered.size(); ++i) CHECK(filtered[i] == expected[i % expected.size()]);
@@ -370,13 +406,18 @@ void orchestration() {
     Fixture f;
     f.answer.fill(3);
     CHECK(strata::gpu::copy_async(f.parts.data(), f.answer.data(), sizeof(f.answer), &f));
-    CHECK(strata::gpu::event_record(&f.event, &f));
-    f.answer.fill(9);
-    f.enqueue([&f] { f.parts[0] = 123; });
+    f.weights.fill(4);
+    CHECK(strata::gpu::copy_async_after(f.hw.data(), f.weights.data(), sizeof(f.weights),
+                                       &f, nullptr, &f.event));
+    CHECK(f.event.end == 2 && f.event.end == f.last_copy_sequence);
+    CHECK(f.executed == 0); // Publishing the copy event must not execute the FIFO.
+    f.answer.fill(9); f.weights.fill(7);
+    f.enqueue([&f] { f.hw[0] = 123; });
     CHECK(strata::gpu::event_sync(&f.event));
     for (float v : f.parts) CHECK(v == 9);
-    CHECK(f.fifo.size() == 1);
-    CHECK(strata::gpu::stream_sync(&f)); CHECK(f.parts[0] == 123);
+    for (float v : f.hw) CHECK(v == 7);
+    CHECK(f.executed == 2 && f.fifo.size() == 1);
+    CHECK(strata::gpu::stream_sync(&f)); CHECK(f.hw[0] == 123);
 }
 
 void guards() {
@@ -386,6 +427,7 @@ void guards() {
         {[](Fixture& f) { f.g.qsa_interval = 0; }, "invalid geometry or k"},
         {[](Fixture& f) { f.g.n_embd = 0; }, "invalid geometry or k"},
         {[](Fixture& f) { f.s.k = 0; }, "invalid geometry or k"},
+        {[](Fixture& f) { f.s.k = -1; }, "invalid geometry or k"},
         {[](Fixture& f) { f.s.k = 65; }, "invalid geometry or k"},
         {[](Fixture& f) { f.g.n_expert = 1; }, "invalid geometry or k"},
         {[](Fixture& f) { f.g.n_embd = std::numeric_limits<int64_t>::max(); }, "invalid geometry or k"},
@@ -453,7 +495,7 @@ void failures() {
         {"D2H mixed", "layer 1: D2H mixed: injected D2H mixed"},
         {"D2H IDs", "layer 1: D2H IDs: injected D2H IDs"},
         {"D2H weights", "layer 1: D2H weights: injected D2H weights"},
-        {"record staging event", "layer 1: record staging event: injected record staging event"},
+        {"publish staging event", "layer 1: D2H weights: injected publish staging event"},
         {"wait staging event", "layer 1: wait staging event: injected wait staging event"},
         {"H2D parts", "layer 1: H2D parts: injected H2D parts"},
         {"post", "post layer 1: post original"},
@@ -472,6 +514,13 @@ void failures() {
         CHECK(f.diagnostic == expected);
         CHECK(f.syncs == (each ? 3 : 1));
         CHECK(f.calls.back() == "sync" && f.fifo.empty() && f.executed == f.submitted);
+        if (c.first == "publish staging event") {
+            CHECK(f.last_copy_sequence > f.event.end); // Previous event was not republished.
+            CHECK(f.published_sequence == f.event.end);
+            CHECK(f.last_copy_completed == f.last_copy_sequence); // Cleanup drained queued weights.
+            CHECK(f.pools == 1 && f.launch_layer == 0);
+            CHECK(std::count(f.calls.begin(), f.calls.end(), "wait") == 1);
+        }
         if (timed) check_timing(f);
         std::cout << "  failure: " << c.first << (cleanup_fails ? " + failed cleanup" : "")
                   << (timed ? " + timing" : "") << '\n';
@@ -551,7 +600,7 @@ void timing() {
                     CHECK(f.parts == original_parts && ladder == original_ladder);
                     check_timing(f);
                     CHECK(f.timing.pre_submit.count == 48 && f.timing.post_submit.count == 48);
-                    CHECK(f.timing.routing_d2h_submit.count == 192);
+                    CHECK(f.timing.routing_d2h_submit.count == 144);
                     CHECK(f.timing.routing_d2h_submit.bytes == 48 * (4 * sizeof(float) +
                           2 * sizeof(int32_t) + 2 * sizeof(float)));
                     CHECK(f.timing.parts_h2d_submit.bytes == 48 * 8 * sizeof(float));
