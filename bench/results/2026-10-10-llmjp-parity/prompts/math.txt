@@ -1,7 +1,0 @@
-<|start|>system<|message|>You are LLM-jp-4, a large language model trained by LLM-jp.
-Knowledge cutoff: 2025-12
-Current date: 2026-10-04
-
-Reasoning: medium
-
-# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>1 から 100 までの整数のうち、3 でも 5 でも割り切れないものの和を求めてください。途中の考え方も示してください。<|end|><|start|>assistant

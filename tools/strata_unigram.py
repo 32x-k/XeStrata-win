@@ -4,7 +4,7 @@
 """tools/strata_unigram.py - SentencePiece's Unigram tokenizer (a GGUF's `tokenizer.ggml.model` = `t5`), llm-jp-4.1's.
 
 Transcribed from llama.cpp's llm_tokenizer_ugm and llm_tokenizer_ugm_session (src/llama-vocab.cpp at the llama.cpp
-commit bench/results/2026-10-10-llmjp-parity compares with, de7fa0a3): the normalization through the precompiled
+commit the 2026-10-10-llmjp-parity record compares with, de7fa0a3): the normalization through the precompiled
 charsmap (a XOR-compressed compact double array of prefix replacements), the whitespace rules, the Viterbi search over
 the vocabulary's trie with the unknown token's penalty, and the special tokens split off first
 (llama_vocab::impl::tokenizer_st_partition).  The interface is strata_tokenizer.Tokenizer's: encode, decode,
