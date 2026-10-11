@@ -1888,6 +1888,9 @@ double memory_read_rate(const std::vector<const uint8_t*>& blobs, size_t bytes, 
 }
 
 bool measure_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, strata::core::PcieSplitTimes& t, std::string& why) {
+    // the kernels' preload builds on a core of its own: beside it the CPU's expert time read 2x and the memory's rate
+    // up to 3x low on an RX 9060 XT with a Ryzen 7 5700X, and the split then gave the CPU every missed expert
+    strata::core::Runtime::get().wait_preload();
     int64_t layer = -1;
     if (!strata::core::measure_cpu_expert_ms(d, n_layers, t.c0, t.c, layer, why)) return false;
     t.layer = layer;

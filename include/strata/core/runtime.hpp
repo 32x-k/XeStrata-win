@@ -61,6 +61,8 @@ public:
     // verify window took 22 module loads, 30 ms of its first token, on the RTX 4070.  A kernel the device cannot run
     // (another GPU's matrix shape) is skipped.  Once.
     void preload_kernels();
+    // Waits for preload_kernels' thread to end (timings taken beside it read its CPU work as theirs).
+    void wait_preload() { if (preload_.joinable()) preload_.join(); }
     // Whether an event only ordered or waited on (gpu::event_record without timing) is recorded as an in-order
     // barrier rather than a timestamp (submit_profiling_tag): measured when the runtime is made (measure_marks).
     bool marks_by_barrier() const { return marks_by_barrier_; }
