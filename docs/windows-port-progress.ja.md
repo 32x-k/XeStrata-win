@@ -207,7 +207,61 @@ Routing D2Hの成功時API呼び出し数は1位置あたり192から144へ減�
 
 正常版のAdaptiveCpp source/header、HIP/ROCm環境、`build/windows-acpp/strata.exe`、既存のPhase 0・1復元用コピーは変更していません。基準記録は`build/windows-acpp/phase3b-start-state.json`、数値比較は`phase3b-numerical-comparison.json`と両版のargmax JSON、性能集計は`phase3b-performance.json`、hostテストは`phase3b-combined-host-contracts.log`です。各実行のlog、monitor、module path/hash、最終の正常版integrity記録も同じdirectoryに保存します。これらの生成物はcommit対象から除外します。
 
-Phase 3Bの記録と採用変更だけをcommitして停止します。Phase 3CのGPU Expert cache、Phase 3Dの整理や上流更新取り込みには着手していません。
+Phase 3Bの記録と採用変更だけをcommitして停止しました。その時点ではPhase 3CのGPU Expert cache、Phase 3Dの整理や上流更新取り込みには着手していません。
+
+## Phase 3C: canonical GPU Expert cacheの調査と撤退
+
+### 開始時の基準と既存実装
+
+開始時のHEADは`f4f2350ce9f50d65169644991dfbe898464f8702`、branchは`feature/windows-r9700-sycl`で、作業ツリーはcleanでした。AdaptiveCppのSHAは引き続き`0ea863abe1af4422593583f91e5608ef75044a16`、compilerはLLVM 24です。Phase 3Bで検証した別buildの実行ファイルをそのまま使い、正常版、Phase 0・1の復元用コピー、共有ROCm環境は維持しました。修正済みasync-handler headerと既存DAG方式、3BのD2H event再利用も同じです。モデルprocessがロードした主要runtime DLLのhashは3実行で一致し、HIP DLLは引き続き`C:\Windows\System32\amdhip64_7.dll`でした。
+
+既存の`ExpertCache`と`expert_hit_run`はWindowsでもコンパイルされており、positive cache countとCPU pool、canonical geometry、全hit bufferが揃えば`moe_hit_grouped_s2`へ進みます。graph、VMM、native layoutは必要ありません。「まだconsumer/kernelがない」というcache headerの古い説明は、現在の実行経路を表していません。
+
+`--expert-cache N`はMiBではなくexpertのslot数です。Q2_0 canonical blobはH=2560、FF=640、1 expertあたり1,382,400 bytesで、uniform cacheはN個の個別allocationではなくN×blob bytesの単一device-USM arenaです。今回は4 slots、5,529,600 bytes（約5.27 MiB）から始めました。hit用のscratch、slot/destination list、入力Q8、FP32 scale、outputの6 allocationは合計165,440 bytesです。SYCL queryのglobal memoryと最大単一allocationはともに34,208,743,424 bytes、sub-group sizeは32でした。新しいcache arenaはこの値を下回ります。
+
+AdaptiveCppの`mem_info()`はfree VRAMを返さず、cache内部のfree-memory preflightは動きません。既存allocatorも最大単一allocationの強制制限は行いません。そのため自動サイズを使わず、外部のGPU dedicated集計と従来の8 GiB memory guardで余裕を確認しました。このqueryは既存dense arenaや4 GiB制限の問題を解消するものではありません。
+
+global admissionは最初に出た(layer, expert)を順に入れ、満杯後はevictionしません。新規admissionは同じstreamでblob H2Dをkernelより先に置き、その呼び出しからGPU計算になります。CPUはhit行を0にし、miss行だけを計算します。parts H2D後にGPU hit outputを加え、postでrouter weightsを適用する経路は維持しています。既存のper-layer policyはN/48を各層に割り当て、余りを最後の層へ置きます。N=4でそれを選ぶと前47層のquotaが0になるため、今回はglobal policyだけを使いました。
+
+cache arenaの所有・解放は既存のRAIIとruntime drainに任せます。raw allocationされた6 hit bufferとprobe eventには終了時の個別解放がなく、process終了まで残る既存の所有権上の制限があります。新規admission後のfill失敗も安全な再利用としては確認されていません。cancel／DMA完了不明時のcleanupと合わせ、今回それらを修正したとは扱いません。
+
+### 比較前に固定した数値基準
+
+最初のcache-onより前に、全logits・全層残差の各値について`abs(a-b) <= 0.001 + 0.001 * max(abs(a), abs(b))`、全値finite、sampled argmaxと生成token一致を必須としました。GPU/CPUのreductionとquantization順序が異なるためbitwise一致は必須にしませんが、結果を見て許容値は緩めません。基準は`phase3c-predeclared-contract.json`に保存しました。
+
+まずsourceを変えず、同じQ2_0 packと13 input IDs、CPU pool 3 workers＋caller、mmap、no-capture、context 256、greedy/EOS、cap 64、no-XMX、診断dumpとhost timingでcache-offと4 slotsのdefault cache-onを各1回実行しました。`--adapt-every 0 --pcie-frac 0`を両方へ指定し、auto cache、profile、elastic、VMM、Command Graphは使っていません。
+
+### 数値結果と限定調査
+
+cache-offは保存済み3Bの全logits・全層残差とbitwise一致しました。default cache-onは正常終了し、生成41 tokenと全53位置のargmaxは同じでした。しかし全logits 13,160,960値のうち12,738,073値、残差26,593,280値のうち8,699,164値が事前基準を超えました。最大差はlogits約0.827092、残差約0.391922で、数値ゲートは不合格です。token一致だけを成功と扱いません。
+
+次は4 slotsと許容値を固定し、既存の`--expert-cache-cpu-order`だけを切り替えました。こちらも正常終了しましたが、生成は40 token・52位置となり、tokenとargmaxが変わりました。共通位置の比較でも基準を満たさず、最大差はlogits約34.5925、残差約15.0584でした。EOSによる行数差を記録し、52位置のpayloadを53位置と同じ形状とは扱っていません。
+
+最初の位置のinput checkpointは両cache-onとも完全一致でした。1層後の最大差はどちらも約2.24e-8で、defaultでは4層後に約0.001345へ拡大しています。これは微小差が後続のquantizationやstateで拡大する可能性を示しますが、根本原因や全dispatchの正しさを確定する証拠ではありません。
+
+実モデルのcache-on反復は止め、小規模のraw Expert fixtureへ切り替えました。canonical layer 0/expert 0の1 blobと固定runtime入力を使い、既存のproduction CPU/GPU quantizerとExpert kernelをリンクしました。DAG queueの小さいadapterを使い、engineのdiscovery・probe・teardownは置き換えているため、fixtureを実モデルやcache全体の検証とは扱いません。device allocationは1,413,120 bytes、単一の制限付きprocessです。defaultとCPU-orderを各1回実行し、入力int8 2,560値・FP32 scale 80値・FP16 block header 80値がすべて一致しました。Expert output 2,560値は両方とも基準内で、最大差は約3.35e-8／5.96e-8、非有限値は0でした。
+
+5判断の時点で、cacheの実行経路、CPU-orderだけでは直らないこと、初期checkpointの微小差、raw kernelの局所parityまでは確認できました。実routing/inputでの複数hitや後続stateを含む原因は限定できておらず、安全な小さいWindows互換修正は特定していません。許容値変更、容量拡大、新しいcache algorithmやGPU kernelへの書き換えで回避することはしません。
+
+### hit率、診断時間、メモリ
+
+default 4 slotsでは25,440 lookupsに対し既存resident hit 4、新規admission 4、CPU miss 25,432でした。表示上のhit率は約0.0157%、admissionを含むGPU計算率は約0.0314%、miss率は約99.9686%です。初回routingで4 slotsが埋まり、global first-seenの偏りもあるため、小容量のenablement確認であって実用的なcache配置の評価ではありません。`expert blobs`はhitを含むsource要求数で、物理SSD read数ではありません。
+
+| 診断実行 | Prefill tok/s | Decode tok/s | CPU callback平均 ms/位置 | Routing wait平均 ms/位置 | 推論合計 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| cache-off | 1.71 | 1.87 | 177.260 | 330.578 | 28,952.0 |
+| default 4 slots | 2.01 | 2.31 | 107.132 | 303.978 | 23,716.6 |
+| CPU-order 4 slots | 1.65 | 1.20 | 203.666 | 529.283 | 40,598.0 |
+
+これは各1回の診断dump付き時間で、反復性能比較ではありません。CPU-orderは生成数も違います。OSページcache温度は制御しておらず、CPU callback短縮やdefaultの速度表示を高速化成功と判定しません。既存timingにはGPU hit launch/combineとcache setupの独立区間がなく、初期fillはhit Launch内に含まれます。その時間を他の区間から推定したり、ロード時間をcache初期化時間と呼んだりしません。数値ゲート不合格のため各3回の性能測定・定常状態評価・容量拡大には進んでいません。
+
+3モデル実行は非同期エラー診断やmemory guard違反なく終了しました。最大process privateは約5,020 MiB、GPU dedicated集計は約6,716 MiBで、終了後は約1,474〜1,546 MiBへ戻りました。これらは新たな実障害時の同期・寿命保証ではありません。
+
+### 撤退判断と再開条件
+
+今回cache-onを採用しません。既存pathはGPUで動作しますが、事前に定義した実モデルの数値条件を満たさず、原因を限定した互換修正がないためです。sourceや正常版に変更はなく、cache-offとPhase 3Bの基準を維持します。再開には、実routingと同じ入力・同じexpertのGPU hit／CPU miss中間出力を照合し、差が拡大する最初のquantization・state・dispatchを限定したうえで、同じ数値基準を満たす小さい修正が必要です。性能評価はその後の別指示で行います。
+
+開始・保護対象は`build/windows-acpp/phase3c-start-state.json`、事前基準は`phase3c-predeclared-contract.json`、数値比較は`phase3c-on4-initial-vs-phase3c-off-initial.json`と`phase3c-on4-cpuorder-vs-phase3c-off-initial-v2.json`、raw結果は`phase3c-raw-default.txt`と`phase3c-raw-cpuorder.txt`、診断集計は`phase3c-diagnostic-metrics.json`、integrityは`phase3c-final-integrity.json`です。ログ・モデル・実行ファイル・ローカルfixtureはcommitせず、`git diff --check`と日本語lintは成功しました。全体lintは必要ツール不足で完了せず、REUSEの残る指摘は既存の`.agents/skills`のcheckout状態だけです。日英の撤退記録だけをcommitして停止します。Phase 3D、WMMA、Command Graph、VMM、DPC++移行、他GPU対応には着手していません。
 
 ## 2026-10-11: ツールチェーンの確認
 

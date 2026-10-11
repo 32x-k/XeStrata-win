@@ -207,7 +207,61 @@ An overall speedup was not established. The small change is adopted because it r
 
 The working AdaptiveCpp source/header, HIP/ROCm environment, `build/windows-acpp/strata.exe` and existing Phase 0/1 recovery copies remain unchanged. Baseline records are in `build/windows-acpp/phase3b-start-state.json`; numerical comparisons in `phase3b-numerical-comparison.json` and both argmax JSONs; performance in `phase3b-performance.json`; host tests in `phase3b-combined-host-contracts.log`. Run logs, monitors, module paths/hashes and final working-version integrity records are saved in the same directory. Generated artifacts are excluded from the commit.
 
-Work stops after committing only Phase 3B records and the adopted change. Phase 3C GPU Expert caching, Phase 3D cleanup and upstream-update integration were not started.
+Work stopped after committing only Phase 3B records and the adopted change. At that point, Phase 3C GPU Expert caching, Phase 3D cleanup and upstream-update integration had not started.
+
+## Phase 3C: canonical GPU Expert cache investigation and withdrawal
+
+### Starting baseline and existing implementation
+
+Starting HEAD was `f4f2350ce9f50d65169644991dfbe898464f8702`, branch `feature/windows-r9700-sycl`, with a clean worktree. AdaptiveCpp remains `0ea863abe1af4422593583f91e5608ef75044a16`, compiled with LLVM 24. The separate executable validated in Phase 3B was reused unchanged, preserving the working version, Phase 0/1 recovery copies and shared ROCm environment. Patched async-handler headers, existing DAG ordering and Phase 3B D2H event reuse remain the same. The loaded core runtime DLL hashes match across all three model runs; the HIP DLL is still `C:\Windows\System32\amdhip64_7.dll`.
+
+Existing `ExpertCache` and `expert_hit_run` are compiled on Windows. A positive cache count, enabled CPU pool, canonical geometry and complete hit buffers reach `moe_hit_grouped_s2`. Graphs, VMM and native layout are not required. The cache header's old claim of no consumer/kernel does not describe the current executable path.
+
+`--expert-cache N` counts expert slots, not MiB. Canonical Q2_0 has H=2560, FF=640 and 1,382,400 bytes per expert. The uniform cache uses one device-USM arena of N×blob bytes, not N separate allocations. The initial test uses four slots: 5,529,600 bytes, approximately 5.27 MiB. Six hit allocations—scratch, slot/destination lists, input Q8, FP32 scales and output—total 165,440 bytes. SYCL reports both global memory and largest single allocation as 34,208,743,424 bytes, with subgroup size 32. The new cache arena is below that reported limit.
+
+AdaptiveCpp `mem_info()` does not return free VRAM, so the cache's internal free-memory preflight is inactive. The existing allocator also does not enforce the largest-single-allocation limit. Auto sizing was therefore avoided; external aggregate GPU dedicated telemetry and the existing 8 GiB memory guard provided the safety margin check. This query does not resolve the existing dense-arena or simulated 4-GiB-limit issue.
+
+Global admission fills consecutive slots with the first distinct (layer, expert) pairs; there is no eviction once full. A new admission queues blob H2D before the kernel on the same stream and computes on GPU on that call. CPU dispatch writes zero to hit rows and computes only miss rows. GPU hit output is added after parts H2D, with router weights applied in post; that existing path is unchanged. The per-layer policy assigns N/48 to each layer and all remainder to the final layer. With N=4, the first 47 layers would have zero quota, so only global policy was used.
+
+The cache arena retains existing RAII ownership and runtime drains. Six raw hit buffers and the probe event have no individual final cleanup and remain until process exit, an existing ownership limitation. Failed filling after admission is also not established as safely reusable. These issues and cancellation/uncertain-DMA cleanup were not fixed in this work.
+
+### Numerical contract fixed before comparison
+
+Before the first cache-on run, every logit/residual value was required to satisfy `abs(a-b) <= 0.001 + 0.001 * max(abs(a), abs(b))`, with all values finite and sampled argmax/generated tokens matching. Bitwise equality was not mandatory because CPU/GPU reduction and quantization orders differ; tolerances were not relaxed after results. The contract is saved in `phase3c-predeclared-contract.json`.
+
+Without source changes, cache-off and the default four-slot cache each ran once with the same Q2_0 pack and 13 input IDs, CPU pool with three workers plus caller, mmap, no-capture, context 256, greedy/EOS, cap 64, no-XMX, diagnostic dumps and host timing. Both explicitly use `--adapt-every 0 --pcie-frac 0`; no auto cache, profile, elastic cache, VMM or Command Graph was used.
+
+### Numerical results and bounded investigation
+
+Cache-off matches the saved Phase 3B logits and residuals bitwise. Default cache-on exits normally, generating the same 41 tokens and argmaxes at all 53 positions. However, 12,738,073 of 13,160,960 logits and 8,699,164 of 26,593,280 residual floats violate the predeclared rule. Maximum differences are approximately 0.827092 for logits and 0.391922 for residuals. The numerical gate fails; token agreement alone is not success.
+
+The next run keeps four slots and the same tolerances, changing only the existing `--expert-cache-cpu-order` option. It also exits normally, but produces 40 tokens and 52 positions, with different tokens and argmaxes. Common-position comparisons still fail, with maximum differences approximately 34.5925 for logits and 15.0584 for residuals. The EOS row-count difference is recorded rather than treating 52-position payloads as the same shape as 53.
+
+The first position's input checkpoint is exact in both cache-on variants. Maximum difference after one layer is approximately 2.24e-8 in both; the default path reaches approximately 0.001345 after four layers. This suggests possible amplification through subsequent quantization/state, but does not establish the root cause or correctness of all dispatches.
+
+Further cache-on model repetitions were stopped in favor of a small raw Expert fixture. It links existing production CPU/GPU quantizers and Expert kernels, using one canonical layer-0/expert-0 blob and fixed runtime input. A small DAG-queue adapter replaces engine discovery/probes/teardown, so this fixture is not a model or complete-cache validation. Explicit device allocation is 1,413,120 bytes in one bounded process. Default and CPU-order each run once: all 2,560 input int8 values, 80 FP32 scales and 80 FP16 block headers match exactly. All 2,560 Expert output values meet the contract in both, with maximum differences approximately 3.35e-8 and 5.96e-8 and zero nonfinite values.
+
+At the five-judgment review, progress includes confirming the cache path, rejecting CPU-order alone as a fix, locating small initial checkpoint differences and verifying local raw-kernel parity. Causes involving actual routing/input, multiple hits and subsequent state are not isolated, and no safe small Windows compatibility correction was identified. No tolerance increase, capacity escalation, new cache algorithm or GPU-kernel rewrite was used as a workaround.
+
+### Hit rates, diagnostic timings and memory
+
+The default four-slot run has 25,440 lookups, four already-resident hits, four admissions and 25,432 CPU misses. Its displayed resident hit rate is approximately 0.0157%; GPU execution including admissions is 0.0314%, and miss rate 99.9686%. The first routing fills all four slots, and global first-seen admission is biased. This is a small enablement check, not a useful cache-placement evaluation. `expert blobs` counts source requests including hits, not physical SSD reads.
+
+| Diagnostic run | Prefill tok/s | Decode tok/s | Mean CPU callback ms/position | Mean routing wait ms/position | Total inference ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| cache-off | 1.71 | 1.87 | 177.260 | 330.578 | 28,952.0 |
+| default four slots | 2.01 | 2.31 | 107.132 | 303.978 | 23,716.6 |
+| CPU-order four slots | 1.65 | 1.20 | 203.666 | 529.283 | 40,598.0 |
+
+These are single diagnostic-dump runs, not repeated performance comparisons. CPU-order also generates a different token count. OS page-cache temperature is uncontrolled; neither shorter CPU callbacks nor the default run's displayed throughput establish speedup. Existing instrumentation has no separate GPU hit launch/combine or cache-setup spans; initial fills occur inside hit Launch. These times are not inferred from other spans, and loading time is not called cache initialization time. Numerical gate failures prevented three-runs-per-side benchmarking, steady-state evaluation or capacity escalation.
+
+All three model processes exit without async-error diagnostics or memory-guard violations. Peak private memory is approximately 5,020 MiB and aggregate GPU dedicated usage 6,716 MiB, returning to approximately 1,474–1,546 MiB after exit. These observations do not establish new real-fault synchronization or lifetime guarantees.
+
+### Withdrawal decision and restart conditions
+
+Cache-on is not adopted. The existing path executes on GPU but fails the predeclared full-model numerical contract, with no isolated compatibility correction. Sources and working binaries remain unchanged; cache-off and the Phase 3B baseline are retained. Restart requires comparing GPU hit/CPU miss intermediate outputs using the same experts and real routing inputs, locating the first amplifying quantization/state/dispatch, and validating a small correction under the same numerical contract. Performance evaluation follows only under a separate instruction.
+
+Starting/protected state is in `build/windows-acpp/phase3c-start-state.json`; the contract in `phase3c-predeclared-contract.json`; comparisons in `phase3c-on4-initial-vs-phase3c-off-initial.json` and `phase3c-on4-cpuorder-vs-phase3c-off-initial-v2.json`; raw results in `phase3c-raw-default.txt` and `phase3c-raw-cpuorder.txt`; diagnostic metrics in `phase3c-diagnostic-metrics.json`; integrity in `phase3c-final-integrity.json`. Logs, models, executables and local fixtures are not committed. `git diff --check` and Japanese lint pass. Full repository lint remains incomplete because required tools are missing; REUSE retains only the existing `.agents/skills` checkout finding. Only bilingual withdrawal records are committed, then work stops. Phase 3D, WMMA, Command Graph, VMM, DPC++ migration and other-GPU support were not started.
 
 ## 2026-10-11: toolchain check
 
