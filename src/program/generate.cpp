@@ -6599,7 +6599,22 @@ int main(int argc, char** argv) {
                 std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
             const bool helper = std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
                                             [](int n) { return n > 0; });
-            if (tse == nullptr && !all_experts_resident && o.batch <= 0 && !helper) strata::core::set_tail_skip_rank(7);
+            // #1884 (upstream 6ab541f6): with nearly every expert in the GPU cache the few misses are cheap and the skip
+            // costs more draft acceptance than it saves (upstream: V100 32 GB, Coder IQ1_M, 94.8% cached, -1..2% decode).
+            // STRATA_TAIL_SKIP_MAX_CACHED=<percent> (default 90) moves the line; 101 = never.
+            size_t cached_experts = 0;
+            for (int32_t r : host_res) cached_experts += r >= 0 ? 1 : 0;
+            const char* mcs = std::getenv("STRATA_TAIL_SKIP_MAX_CACHED");
+            const double max_cached = mcs != nullptr && mcs[0] != 0 ? std::strtod(mcs, nullptr) / 100.0 : 0.90;
+            const bool nearly_all_cached = !host_res.empty() && !all_experts_resident &&
+                                           (double) cached_experts >= max_cached * (double) host_res.size();
+            if (tse == nullptr && nearly_all_cached && o.batch <= 0 && !helper)
+                std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP is off by default: %.1f%% of the experts are in "
+                                     "the GPU cache, so few are missed and skipping them costs more draft acceptance than "
+                                     "it saves; STRATA_ROUTE_TAIL_SKIP=7 turns it on\n",
+                             100.0 * (double) cached_experts / (double) host_res.size());
+            if (tse == nullptr && !all_experts_resident && !nearly_all_cached && o.batch <= 0 && !helper)
+                strata::core::set_tail_skip_rank(7);
             if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
                 std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert that every token of a "
                                      "verify window routes at rank %d or lower is skipped (answers differ slightly); "

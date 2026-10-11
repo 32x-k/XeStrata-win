@@ -69,6 +69,9 @@ default 7, upstream b4e3407b). Its contribution is zero and the other experts ke
 so the answers differ slightly.
 It does nothing when every expert is in VRAM (nothing is skipped), with `--batch` and with a helper cache
 (`--expert-cache-device1..3`); on a layer split each stage skips its own.
+It is not on by default either when 90% or more of the experts are in VRAM (upstream's #1884: the misses are few and the
+skip costs more draft acceptance than it saves; a V100 32 GB with Coder IQ1_M at 94.8% decoded 1-2% slower);
+`STRATA_TAIL_SKIP_MAX_CACHED=<percent>` moves that line (101: always on).
 `STRATA_ROUTE_TAIL_SKIP=0` turns it off and 1-9 sets the rank; the start prints one line.
 
 Measured (IQ3_XXS):
