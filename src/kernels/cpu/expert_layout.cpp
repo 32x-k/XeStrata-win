@@ -117,7 +117,15 @@ bool cpu_avxvnni_ok() {
 }
 
 namespace {
-void cpuid_regs(unsigned leaf, unsigned sub, unsigned r[4]) { __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]); }
+void cpuid_regs(unsigned leaf, unsigned sub, unsigned r[4]) {
+#if defined(_MSC_VER)
+    int x[4];
+    __cpuidex(x, (int) leaf, (int) sub);
+    for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
+#else
+    __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
+#endif
+}
 }  // namespace
 
 int iq256_gather_setting() {
