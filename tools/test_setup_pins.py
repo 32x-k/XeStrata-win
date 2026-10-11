@@ -54,6 +54,11 @@ def quiet(fn, *args, **kw):
 class HuggingFacePins(unittest.TestCase):
     def test_every_model_url_is_pinned(self):
         for name, fam in setup.FAMILIES.items():
+            if fam.get("plain"):   # Ornith-1.5, llm-jp-4.1: each version names its repository, pinned in HF_REVISIONS
+                for version, m in fam["models"].items():
+                    with self.subTest(family=name, version=version):
+                        self.assertRegex(setup.hf(m["repo"]), SHA)
+                continue
             for key in ("hf", "mmproj_hf"):
                 with self.subTest(family=name, key=key):
                     self.assertRegex(fam[key], SHA)
