@@ -3100,7 +3100,8 @@ class Service:
             from serve.telemetry import Telemetry
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
                                                       "prefill_tok_s_mean": self._prefill_tok_s_mean()},
-                                       gpu_pci=getattr(self, "gpu_pci", None))
+                                       gpu_pci=getattr(self, "gpu_pci", None),
+                                       split_pci=getattr(self, "split_pci", None))
             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on
                 # a slow card keeps the GPU at work while the host thread sleeps)
@@ -6350,6 +6351,7 @@ def main() -> int:
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
     svc.gpu_pci = os.environ.get("STRATA_GPU_PCI") or cfg.get("gpu_pci")   # the Monitor reads the engine's card
+    svc.split_pci = cfg.get("split_pci") or None       # and a layer split's other cards
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
     # A host that runs one model at a time and swaps them (a GPU shared with other work) can name the RPC that does
