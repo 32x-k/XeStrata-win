@@ -3319,7 +3319,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     if a.context:
         ctx = a.context
         if ctx > fam["max_context"]:
-            fail(f"{fam['title']} takes up to {fam['max_context']} tokens of context", f"--context {fam['max_context']}")
+            fail(f"{fam['title']} takes up to {fam['max_context']} tokens of context",
+                 f"--context {fam['max_context']}")
     else:
         say()
         say("  Context length = how much text the model can see at once. Longer needs more VRAM for it, so fewer")
@@ -3447,8 +3448,8 @@ def main() -> int:
              "it), a pull request is welcome")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5")
-    ap.add_argument("--model", choices=list(dict.fromkeys([*MODELS, *(m for f in PLAIN_FAMILIES.values()
-                                                                       for m in f["models"])])))
+    plain_models = [m for f in PLAIN_FAMILIES.values() for m in f["models"]]
+    ap.add_argument("--model", choices=list(dict.fromkeys([*MODELS, *plain_models])))
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
                     help="the RoPE extension for a context past the model's trained 262144: linear (position "

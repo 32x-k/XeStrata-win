@@ -806,7 +806,8 @@ class HarmonyParser:
         self.names = {t.get("name") for t in tools or []}
         self.head = True             # reading a message's header (up to <|message|>)
         self.buf = ""                # text held: a header, or a body's tail that may begin a terminator
-        self.channel, self.to = "", None
+        self.channel = ""
+        self.to: str | None = None
         self.args = ""               # a call's body so far
         self.lead = False            # the body's first character is the tokenizer's space after <|message|>
         self.pending: list = []      # OutputParser's: calls waiting in the reasoning (none here)
@@ -835,7 +836,7 @@ class HarmonyParser:
         return [Event("reasoning" if self.channel == "analysis" else "content", text)]
 
     def _end_message(self) -> list[Event]:
-        out = []
+        out: list[Event] = []
         if self.to is not None:
             try:
                 args = json.loads(self.args) if self.args.strip() else {}

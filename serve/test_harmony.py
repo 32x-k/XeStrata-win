@@ -16,6 +16,7 @@ def run(text: str, **kw) -> list[tuple]:
     out: list[tuple] = []
     for e in events:
         if e.kind == "tool_call":
+            assert e.call is not None
             out.append(("tool_call", e.call.name, e.call.arguments))
         elif out and out[-1][0] == e.kind:
             out[-1] = (e.kind, out[-1][1] + e.text)

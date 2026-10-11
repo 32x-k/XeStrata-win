@@ -1351,7 +1351,8 @@ class StrataEngine:
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
-                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in self.eos_ids):
+                        stopped = bool(out) and out[-1] in self.eos_ids
+                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or stopped:
                             return
                         if reused0 is None:
                             reused0 = (self.last or {}).get("reused")

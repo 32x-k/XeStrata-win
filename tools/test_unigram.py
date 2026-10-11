@@ -37,6 +37,7 @@ TEXTS = [
 
 
 def llama_ids(text: str) -> list[int]:
+    assert GGUF and LLAMA_TOKENIZE
     out = subprocess.run([LLAMA_TOKENIZE, "-m", GGUF, "-p", text, "--ids", "--no-bos", "--no-escape",
                           "--no-parse-special", "--log-disable"],
                          check=True, capture_output=True, text=True).stdout

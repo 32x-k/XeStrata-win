@@ -53,7 +53,7 @@ class _Trie:
     """llama.cpp's naive_trie over bytes: a node's children by byte, and the token id it ends (or None)."""
     __slots__ = ("children", "value")
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.children: dict[int, _Trie] = {}
         self.value: int | None = None
 
@@ -68,9 +68,10 @@ class _Trie:
         """The length of the longest key that `data[start:]` starts with (0: none)."""
         node, best, i = self, 0, start
         while i < len(data):
-            node = node.children.get(data[i])
-            if node is None:
+            nxt = node.children.get(data[i])
+            if nxt is None:
                 break
+            node = nxt
             i += 1
             if node.value is not None:
                 best = i - start
@@ -251,9 +252,10 @@ class UnigramTokenizer:
             score0 = best[off][2]
             node, k = self._matcher, off
             while k < n:
-                node = node.children.get(data[k])
-                if node is None:
+                nxt = node.children.get(data[k])
+                if nxt is None:
                     break
+                node = nxt
                 k += 1
                 if node.value is not None and node.value >= 0:
                     if k - off == units:
@@ -286,12 +288,12 @@ class UnigramTokenizer:
         """Tokenize `text`: the special tokens' texts split off first (CONTROL and UNKNOWN ones only with
         `parse_special`), the text between them searched.  `plain`: (start, end) spans of `text` that are ordinary
         text even where they spell a special token."""
-        fragments: list[object] = [(0, len(text))]   # (start, end) of raw text, or a token id
+        fragments: list[tuple[int, int] | int] = [(0, len(text))]   # (start, end) of raw text, or a token id
         for sp in self._specials:
             ty = self.token_types[self.special_tokens[sp]]
             if not parse_special and ty in (CONTROL, UNKNOWN):
                 continue
-            nxt: list[object] = []
+            nxt: list[tuple[int, int] | int] = []
             for f in fragments:
                 if not isinstance(f, tuple):
                     nxt.append(f)
