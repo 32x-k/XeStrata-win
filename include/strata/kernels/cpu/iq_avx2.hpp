@@ -50,8 +50,8 @@ void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* c
 void iq4nl256_down_rows_v(int variant, const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
                           float* const* out, int r0, int r1);
 
-/// The K-quants Q4_K (12), Q5_K (13) and Q6_K (14) against Q8_K activations, several tokens at once: iq256_gu_rows /
-/// iq256_rows for these types (the AVX-VNNI copy where cpu_avxvnni_ok).
+/// The K-quants Q4_K (12), Q5_K (13) and Q6_K (14) against Q8_K activations, several tokens together, in the form of
+/// iq256_gu_rows and iq256_rows (the AVX-VNNI copy where cpu_avxvnni_ok).
 bool kq256_supported(int ggml_type) noexcept;
 void kq256_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                    int nt, float* const* ff, int r0, int r1);
