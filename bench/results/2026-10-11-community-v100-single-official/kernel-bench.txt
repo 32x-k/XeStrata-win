@@ -1,0 +1,12 @@
+# default: <HOME>/XeStrata-xe0.1.40.2.1/build/contrib/strata --kernel-bench --pack <HOME>/Strata-data/packs/iq3_s
+KB dense-bf16 oneMath (cuBLAS), XeStrata's own kernels (joint_matrix) for the rest 4096x10240x2560 2726.0
+KB expert-gate-up off - -
+KB expert-down off - -
+# no-xmx: <HOME>/XeStrata-xe0.1.40.2.1/build/contrib/strata --kernel-bench --pack <HOME>/Strata-data/packs/iq3_s
+KB dense-bf16 oneMath (cuBLAS), XeStrata's own kernels (DP4a) for the rest 4096x10240x2560 22511.5
+KB expert-gate-up off - -
+KB expert-down off - -
+# no-bf16-mma: <HOME>/XeStrata-xe0.1.40.2.1/build/contrib/strata --kernel-bench --pack <HOME>/Strata-data/packs/iq3_s
+KB dense-bf16 oneMath (cuBLAS), XeStrata's own kernels (joint_matrix) for the rest 4096x10240x2560 2908.5
+KB expert-gate-up off - -
+KB expert-down off - -
