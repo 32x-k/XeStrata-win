@@ -1312,6 +1312,18 @@ bool FileExpertSource::pin_cache_complement(
                              "too%s\n", (long long) complement_lent_slots_, (long long) (n_slots - lend_from_slot),
                      complement_lent_slots_ < n_slots - lend_from_slot
                          ? " (the others are read from the file when lent: not enough RAM for them)" : "");
+    if (lend && complement_lent_slots_ < n_slots - lend_from_slot) {
+        // below full coverage the uncovered experts are read from the files during a long prompt, which routes
+        // through nearly all of them, so the reads repeat (upstream 14d9d2e1, f780961c, #1389: 18% uncovered cost 26%
+        // of the prompt speed on a gfx1100; short prompts barely touch them).  A warning, not a refusal.
+        const long long lendable = (long long) (n_slots - lend_from_slot);
+        const long long missing = lendable - (long long) complement_lent_slots_;
+        std::fprintf(stderr, "FileExpertSource: WARNING: %lld of %lld lendable slots (%.0f%%) will read their experts "
+                             "from the files during a long prompt; expect a slower prompt read on 50K+ token prompts "
+                             "(one measurement: 18%% uncovered cost 26%%).  Free RAM and restart; the line above "
+                             "should read N of N\n",
+                     missing, lendable, 100.0 * (double) missing / (double) std::max<long long>(1, lendable));
+    }
     if (!stage_lend_regions_.empty()) {
         int64_t offered = 0;
         for (const auto& region : stage_lend_regions_) offered += (int64_t) region.size();
