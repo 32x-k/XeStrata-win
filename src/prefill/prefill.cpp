@@ -1173,10 +1173,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
-    // the next stage reads chunk c on a thread while this one reads chunk c + 1 (declared first: an early return
-    // waits for it before anything it reads goes away)
-    std::string next_err;
-    std::future<bool> next_run;
+    // the next stage reads chunk c while this one reads chunk c + 1 (declared first: an early return waits for it
+    // before anything it reads goes away)
+    struct NextWait {
+        PrefillLink* l;
+        ~NextWait() {
+            std::string e;
+            if (l != nullptr) (void) l->wait(e);
+        }
+    } next_wait{next_};
     int hand_buf = 0;
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
@@ -2432,11 +2437,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
             // this stage's state is at the chunk's end now (synced) and moves on with the next chunk below
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
-            if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
-            next_->hand_in_ = h;
-            next_run = std::async(std::launch::async, [this, tokens, c0, T, p0, &next_err] {
-                return next_->run(tokens + c0, T, p0, next_err);
-            });
+            if (!next_->wait(err) || !next_->chunk(h, tokens + c0, T, p0, err)) return false;
             hand_buf ^= 1;
             continue;   // the last stage reports the chunk (on_chunk)
         }
@@ -2489,7 +2490,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             host_chunk_ms += ms_since(toc2);
         }
     }
-    if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
+    if (next_ != nullptr && !next_->wait(err)) return false;
     ss.ple_prev[0] = prev[0];
     ss.ple_prev[1] = prev[1];
     if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
@@ -2547,6 +2548,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         std::fprintf(stderr, "strata prefill: GDN_HASH %s\n", line.c_str());
     }
     return true;
+}
+
+// ---- the next stage in this process (PrefillLink)
+
+bool InProcessPrefill::chunk(const float* rows, const int64_t* tokens, int64_t T, int64_t p0, std::string& err) {
+    (void) err;
+    next_->hand_in_ = rows;
+    run_ = std::async(std::launch::async, [this, tokens, T, p0] { return next_->run(tokens, T, p0, err_); });
+    return true;
+}
+
+bool InProcessPrefill::wait(std::string& err) {
+    if (!run_.valid() || run_.get()) return true;
+    err = err_;
+    return false;
 }
 
 }  // namespace strata::prefill

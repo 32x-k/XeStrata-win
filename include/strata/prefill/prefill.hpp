@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <string>
 
@@ -44,6 +45,34 @@ struct PrefillStats {
 }  // namespace strata::prefill
 namespace strata::core { class MtpDrafter; }
 namespace strata::prefill {
+
+class Prefill;
+
+/// LAYER SPLIT: what a prompt path's stage asks of the stage after it - a chunk's rows at the split point with the
+/// chunk's tokens and position, and the end of that chunk - and nothing else, so a next stage that shares nothing
+/// else with this one (another process, another machine) can stand behind it.
+class PrefillLink {
+public:
+    virtual ~PrefillLink() = default;
+    /// The next stage reads the chunk: `rows` (T x hc*n_embd floats, pinned host memory, untouched until the
+    /// `wait` after the next `chunk`), `tokens[0..T)` at positions p0...  Returns once it has started.
+    virtual bool chunk(const float* rows, const int64_t* tokens, int64_t T, int64_t p0, std::string& err) = 0;
+    /// Waits for the last chunk the next stage was given (none: true); false with `err` when it failed.
+    virtual bool wait(std::string& err) = 0;
+};
+
+/// The next stage in this process: its `run` on a thread, so it reads chunk c while this stage reads chunk c + 1.
+class InProcessPrefill final : public PrefillLink {
+public:
+    void bind(Prefill* next) { next_ = next; }
+    bool chunk(const float* rows, const int64_t* tokens, int64_t T, int64_t p0, std::string& err) override;
+    bool wait(std::string& err) override;
+
+private:
+    Prefill* next_ = nullptr;
+    std::future<bool> run_;
+    std::string err_;
+};
 
 class Prefill {
 public:
@@ -134,13 +163,18 @@ public:
     /// previous stage instead of embedding the tokens; a stage that does not end at the last layer copies its rows
     /// to pinned host buffers (two, allocated by `init`) and runs `next` on them - on a thread, so the next stage
     /// reads chunk c while this one reads chunk c + 1.  `on_chunk` belongs on the last stage.  Set before `init`.
+    /// Everything goes to `next` through a PrefillLink (an InProcessPrefill here).
     void set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
-        stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
+        stage_lb_ = layer_begin; stage_le_ = layer_end;
+        local_next_.bind(next);
+        next_ = next != nullptr ? &local_next_ : nullptr;
     }
 
 private:
     int64_t stage_lb_ = 0, stage_le_ = -1;
-    Prefill* next_ = nullptr;
+    PrefillLink* next_ = nullptr;       ///< set_stage: the next stage, through this link only
+    InProcessPrefill local_next_;
+    friend class InProcessPrefill;      ///< it points the next stage at the rows (hand_in_)
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
