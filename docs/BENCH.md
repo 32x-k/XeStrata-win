@@ -59,7 +59,7 @@ Its engine is made as upstream's setup makes it:
 | Intel | upstream's `sycl/` built in Docker (docker must work without sudo) |
 
 - NVIDIA's prebuilt engine and the Intel Docker image are not free software: a free build does not compare on NVIDIA and Intel GPUs.
-- On Intel GPUs the decode speed is not compared: upstream's `sycl/` reads the experts that do not fit in VRAM over PCIe.
+- A cell where upstream turns out to run at 10 tok/s or less is stopped in that tier and not compared (it is listed under the runs that stopped).
 
 ## xestrata --bench-original-compat
 
@@ -92,7 +92,7 @@ XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> python $S/
 XE="..." UP="..." XE_ROOT=... UP_ROOT=... XE_PROFILE=... UP_PROFILE=... DATA=<data> PY=<python> \
   python $S/bench_usage.py $o/IQ3_XXS <GPU>
 python $S/sync_collect.py $o/<file> xe-<commit> <tag>                         # matrix*.json and the tables
-python $S/judge.py --prompt-only B70 --prev IQ3_XXS=<older record> $o/IQ3_XXS ... # ALL PASS or FAIL <n>
+python $S/judge.py --prev IQ3_XXS=<older record> $o/IQ3_XXS ... # ALL PASS or FAIL <n>
 A="..." B="..." PROFILE=... DATA=<data> IDS=<ids> python $S/ab_pair.py generate|serve|usage <out> <GPU>
 ```
 

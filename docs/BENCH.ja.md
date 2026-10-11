@@ -59,7 +59,7 @@ xestrata --bench --original-strata v0.1.41        # 同じモデルで upstream 
 | Intel | upstream の `sycl/` を Docker でビルド（sudo なしで docker が使えること） |
 
 - NVIDIA の配布物と Intel の Docker イメージは自由ソフトウェアでないので、free のビルドでは NVIDIA と Intel の比較はしません。
-- Intel では decode の速さを比べません。upstream の `sycl/` は、VRAM に入らないエキスパートを PCIe 越しに読むためです。
+- upstream が 10 tok/s 以下と分かった欄は、その段の途中で止めて比べません（「止まった回」に出ます）。
 
 ## xestrata --bench-original-compat
 
@@ -92,7 +92,7 @@ XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> python $S/
 XE="..." UP="..." XE_ROOT=... UP_ROOT=... XE_PROFILE=... UP_PROFILE=... DATA=<data> PY=<python> \
   python $S/bench_usage.py $o/IQ3_XXS <GPU>
 python $S/sync_collect.py $o/<file> xe-<commit> <tag>                         # matrix*.json と表
-python $S/judge.py --prompt-only B70 --prev IQ3_XXS=<前の記録> $o/IQ3_XXS ...  # ALL PASS か FAIL <n>
+python $S/judge.py --prev IQ3_XXS=<前の記録> $o/IQ3_XXS ...  # ALL PASS か FAIL <n>
 A="..." B="..." PROFILE=... DATA=<data> IDS=<ids> python $S/ab_pair.py generate|serve|usage <out> <GPU>
 ```
 
