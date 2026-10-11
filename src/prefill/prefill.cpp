@@ -1789,8 +1789,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // g / (c + g) cannot see, as both sides are measured with the share on.  The first eligible layers
                     // alternate, without first, until CPU_MIN_RATIOS ratios are in; then the cheaper arm, and every
                     // CPU_PROBE-th layer the other one (a prime: the probes move across the layers from one chunk to the
-                    // next), so both stay measured.
-                    if (cpu_maybe && cpu_share_env() < 0.0) {
+                    // next), so both stay measured.  STRATA_PREFILL_CPU_GATE=0: auto without the comparison (0.1.41's).
+                    static const bool cpu_gate_on = [] { const char* e = std::getenv("STRATA_PREFILL_CPU_GATE"); return e == nullptr || e[0] != '0'; }();
+                    if (cpu_maybe && cpu_share_env() < 0.0 && cpu_gate_on) {
                         constexpr int64_t CPU_PROBE = 29;
                         constexpr int CPU_MIN_RATIOS = 3;
                         const int64_t i = m.cpu_layers++;
