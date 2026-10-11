@@ -1,6 +1,6 @@
 ---
 name: release
-description: Make a GitHub release of XeStrata in stages - the version, main fast-forwarded to dev, the tag (xe and the version, e.g. xe0.1.39); first the three contrib-llvm packages published with the notes (English then Japanese), then a speed table against upstream on Intel, NVIDIA and AMD GPUs. Only when the user asks for a release (/release).
+description: Make a GitHub release of XeStrata in stages - the version, main fast-forwarded to dev, the tag (xe and the version, e.g. xe0.1.39); first the three contrib-llvm packages published with the notes (English then Japanese) and the older releases marked as old, then a speed table against upstream on Intel, NVIDIA and AMD GPUs. Only when the user asks for a release (/release).
 disable-model-invocation: true
 argument-hint: "[VERSION, e.g. 0.1.39 or 0.1.39.1]"
 ---
@@ -126,9 +126,19 @@ gh release view xe<VERSION> --repo MistVVK/XeStrata --json url,isDraft
 
 Retry a push only for a network failure (up to four times, waiting 2, 4, 8, 16 s).
 `--verify-tag` makes gh refuse rather than create a tag of its own.
-Then mark the previous release as old: `.claude/skills/release/scripts/mark-old.sh <previous tag>` puts a note at the top of its notes that sends the reader to the latest release (`releases/latest`, so the older ones marked before stay right).
 Report the release's URL, then prepare the development machine's engines for step 9.
 A wrong asset or note is fixed with `gh release upload --clobber`, `gh release delete-asset` or `gh release edit --notes-file`.
+
+### The older releases
+
+Once the new release is published (it is then the latest), mark every older one:
+
+```sh
+gh release list --repo MistVVK/XeStrata --limit 1000 --json tagName,isLatest -q '.[] | select(.isLatest | not) | .tagName' |
+  while read -r t; do .claude/skills/release/scripts/mark-old.sh "$t"; done
+```
+
+`mark-old.sh` puts a warning at the top of a release's notes, in English and Japanese, that sends the reader to the latest release (`releases/latest`, so a note put in before stays right); a release that has it already is left as it is, so in practice only the previous release changes.
 
 ## 9. The speed table
 
