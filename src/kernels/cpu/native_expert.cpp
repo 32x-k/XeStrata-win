@@ -43,6 +43,8 @@ bool iq256_supported(int type) noexcept {
     return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
 }
 
+bool kq256_supported(int type) noexcept { return type == 12 || type == 13 || type == 14; }
+
 size_t native_row_bytes(int type, int64_t n) {
     if (type < 0 || type >= GGML_TYPE_COUNT || n <= 0 || n % ggml_blck_size((ggml_type) type)) return 0;
     return ggml_row_size((ggml_type) type, n);

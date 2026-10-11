@@ -530,8 +530,6 @@ void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* c
     iq4nl256_down_rows_v(vnni_on() ? kIq256Vnni : 0, w, row_bytes, n, hq, nt, out, r0, r1);
 }
 
-bool kq256_supported(int type) noexcept { return type == 12 || type == 13 || type == 14; }
-
 void kq256_gu_rows_v(int variant, int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
                      const void* const* act, int nt, float* const* ff, int r0, int r1) {
 #if STRATA_AVXVNNI
