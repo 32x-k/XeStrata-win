@@ -1965,7 +1965,7 @@ class Vision:
             args += ["--min-tokens", str(cfg["min_tokens"])]
         if cfg.get("gpu"):
             # ggml-sycl uses oneDNN whenever it was built with it; off unless asked for: without it the same image
-            # gives the same embeddings every time (bench/results/2026-09-30-xe-vision-sycl)
+            # gives the same embeddings every time (the 2026-09-30-xe-vision-sycl record)
             flag = "1" if cfg.get("onednn") else "0"
             env = dict(os.environ if env is None else env, GGML_SYCL_ENABLE_DNN=flag, GGML_SYCL_FA_ONEDNN=flag)
         self.label = vision_label(cfg)

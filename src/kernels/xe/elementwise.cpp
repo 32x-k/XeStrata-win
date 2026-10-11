@@ -118,14 +118,14 @@ void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
     sync_if_needed(stream, event);
 }
 
-// ---- the doorbell (see the header).  bench/results/2026-09-30-xe-doorbell measured what a spinning kernel sees:
+// ---- the doorbell (see the header).  the 2026-09-30-xe-doorbell record measured what a spinning kernel sees:
 // a volatile read followed by a system-scope acquire fence observes the host's write; a system-scope atomic load
 // alone sometimes never does.  The GPU-to-host direction is a system-scope fence, then a plain volatile store,
 // not an atomic one: no GPU here reports usm_atomic_host_allocations, and the xe driver serves a discrete
 // GPU's atomic page fault on system memory only by moving the page to VRAM (a userptr cannot move), where a read or
 // a write is simply bound again (xe_vma_need_vram_for_atomic).  The ring has one writer, so it needs no atomicity;
 // the B70 saw the store while the kernel ran in 2,000 of 2,000 runs, sooner than the atomic one (median 4.9 us
-// against 11.0; bench/results/2026-10-11-xe-doorbell-store).
+// against 11.0; the 2026-10-11-xe-doorbell-store record).
 namespace {
 inline uint32_t read_host(const uint32_t* p) {
     const uint32_t v = *reinterpret_cast<const volatile uint32_t*>(p);

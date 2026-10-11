@@ -29,7 +29,7 @@ The RTX numbers in Strata's (CUDA) README do not apply to XeStrata.
 The tables below are commit `58dbbe5` with the settings setup writes (images off), one code-agent prompt per length and 256 generated tokens.
 MTP speculative decoding is on.
 "262K" is the model's full context window (a 259,942-token prompt).
-One run per cell ([record](../bench/results/2026-10-04-speed-matrix/README.md)).
+One run per cell.
 
 ### Prefill (tokens/s)
 
@@ -71,7 +71,7 @@ It does nothing when every expert is in VRAM (nothing is skipped), with `--batch
 (`--expert-cache-device1..3`); on a layer split each stage skips its own.
 `STRATA_ROUTE_TAIL_SKIP=0` turns it off and 1-9 sets the rank; the start prints one line.
 
-Measured (IQ3_XXS, [record](../bench/results/2026-10-11-route-tail-skip/README.md)):
+Measured (IQ3_XXS):
 
 | | B70 | RTX 4070 | RX 9060 XT |
 | --- | --- | --- | --- |
@@ -88,10 +88,8 @@ experts' logits (the weights stay the router's). Both change the answers.
 ### Small cards and GPUs without XMX
 
 With the B70 made to look like a small card (`STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1`: 8 GB of VRAM, no XMX),
-IQ2_XS writes 17.6 tokens/s with MTP and reads the 26K-token prompt at 574 tokens/s
-([record](../bench/results/2026-10-03-prompt-upstream/README.md)).
-On a GPU without XMX the prefill path's products run through DP4a, so prefill takes about 1.6 times as long
-([record](../bench/results/2026-10-02-dp4a/README.md)).
+IQ2_XS writes 17.6 tokens/s with MTP and reads the 26K-token prompt at 574 tokens/s.
+On a GPU without XMX the prefill path's products run through DP4a, so prefill takes about 1.6 times as long.
 
 The prefill path's half-output buffer shares the embedding buffer, which is dead after the first hyper-connection
 broadcast (upstream 199fd1d5, #1454): T x 2560 floats less VRAM per chunk (320 MiB at 32,768 tokens).
@@ -234,7 +232,7 @@ Images can be chosen, with a warning that this file has not been run with them (
 ```
 
 Measured on an Arc Pro B70 (32 GB) and an i7-14700 with 96 GB of RAM, with setup's configuration, 64 generated tokens of a short chat,
-every run from a cold OS cache ([record](../bench/results/2026-10-03-ud-low-ram/README.md)):
+every run from a cold OS cache:
 
 | | Decode tokens/s |
 | --- | ---: |
@@ -845,7 +843,7 @@ Measured on the B70 with IQ2_XS, a conversation of 9,183 tokens (INT8 KV, two ch
 After a restart it was read back from the CPU-attached NVMe in 0.28 s, and only the 7 new tokens were read (without the file, the 9,167 tokens are read again in 7.9 s).
 The answer matches a run without the restart, also on the small configuration (8 GB, no XMX).
 Writing a conversation of 300-360 MiB takes 0.10-0.16 s; when the RAM cache pushes one out, the next request waits that long.
-Compressed, the same conversation takes 421 MiB, 0.30 s to read back and 0.23 s to write ([the record](../bench/results/2026-10-04-conversation-save-compress/README.md)).
+Compressed, the same conversation takes 421 MiB, 0.30 s to read back and 0.23 s to write.
 
 ### Saving a conversation to a file and restoring it (opt-in)
 
@@ -1262,7 +1260,7 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
   `STRATA_NO_AVXVNNI=1` goes back to AVX2).
 - **SSD:** the 28.8 GB n-gram table, read a few rows per token through the OS cache.
 - **Speculation:** the model's own MTP layer drafts up to 3 tokens; one pass over all 48 layers checks them.
-  On the B70 a check advances 2.1–3.4 tokens on average ([record](../bench/results/2026-10-03-mtp-accept/README.md)).
+  On the B70 a check advances 2.1–3.4 tokens on average.
   When the reply repeats the context (code edits, quoted text), **prompt lookup** drafts up to 5 tokens from the earlier copy,
   but only where its measured acceptance and cost say it pays.
   The drafts are checked like the MTP's, so the output is the same.

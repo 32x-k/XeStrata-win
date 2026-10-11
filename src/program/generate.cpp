@@ -4190,7 +4190,7 @@ int main(int argc, char** argv) {
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         // Not rounded: free VRAM moves the cache by a slot or two between starts, and with it the last bits of the
-        // output (bench/results/2026-10-02-new-machine), but rounding to 64 slots cost the RTX 4070 3-4% of its decode.
+        // output (the 2026-10-02-new-machine record), but rounding to 64 slots cost the RTX 4070 3-4% of its decode.
         // Runs that must give the same tokens fix the size with --expert-cache N.
         int64_t slots = ((int64_t) free_b - reserve) / blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
@@ -10790,7 +10790,7 @@ int main(int argc, char** argv) {
         }
         const double pool_ms0 = drive.cpu_ms;
         // pages read back from disk or swap while decoding: the expert arena is not locked, and two runs whose
-        // CPU pool was 6x slower came while tens of GB were being downloaded (bench/results/2026-09-30-xe-swift-iq2xs)
+        // CPU pool was 6x slower came while tens of GB were being downloaded (the 2026-09-30-xe-swift-iq2xs record)
         const auto major_faults = [] { rusage u{}; getrusage(RUSAGE_SELF, &u); return (long long) u.ru_majflt; };
         const long long majflt0 = major_faults();
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;

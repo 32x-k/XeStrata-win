@@ -207,7 +207,7 @@ sde64 -version
 - エンジン自身の時間の計測: prefill の経路は `STRATA_PREFILL_TIMING=1` で出ます。
   decode の `verify window` の行（ホストが GPU を待つ時間、CPU のプール）は、いつも出ます。
 - `STRATA_VERIFY_NODES=1` は、decode の窓のグラフに入るカーネルの数を出します。
-- SYCL のイベントのプロファイリングで単独のカーネルを測る使い捨てのプローブ（`bench/results/2026-10-02-xe-decode-gpu` の記録）。
+- SYCL のイベントのプロファイリングで単独のカーネルを測る使い捨てのプローブ。
 - `STRATA_VERIFY_PROFILE=1` はデバイス全体で共通の時計を必要とし、B70 にはそれがありません。
 
 ### xe ドライバーのカーネルのログ
@@ -219,8 +219,7 @@ xe ドライバーはエラーをカーネルのログに出します。
 journalctl -k --since "-1h" --no-pager | grep "xe 0000"
 ```
 
-出力ヘッドの VRAM の確保が断られた起動では、どれもその約 8 秒前に `VM worker error: -16` が出ていました
-（`bench/results/2026-10-02-xe-decode-gpu`）。
+出力ヘッドの VRAM の確保が断られた起動では、どれもその約 8 秒前に `VM worker error: -16` が出ていました。
 
 ### VTune と GPU のハードウェアカウンター
 

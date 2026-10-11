@@ -1406,7 +1406,7 @@ def oneapi_lib_dirs() -> list:
 # and cuBLAS for the dense products.  contrib-icpx: Intel oneAPI's icpx and oneMKL, Intel GPUs only.  Whether the
 # Intel GPU has its matrix engines (XMX) for a compiler is asked of the GPU itself (tools/xmx_probe.cpp), not read from
 # a version number.  Without XMX the engine still runs, its prompt path about 1.6
-# times slower (bench/results/2026-10-02-dp4a); setup asks before building it so.
+# times slower (the 2026-10-02-dp4a record); setup asks before building it so.
 LICENSES = ("free", "contrib", "contrib-icpx")
 INTEL_LLVM_BUILD = ROOT / "tools" / "intel_llvm_build.py"
 INTEL_LLVM_DEFAULT = ROOT / ".tools" / "intel-llvm" / "install"
@@ -2055,7 +2055,7 @@ def resident_budget_gib(model, ram, kv_ram_gb=0.0) -> int:
     """UD-Q4_K_XL, UD-IQ4_XS: the GiB of experts the engine keeps in RAM (--resident-budget-gib): the RAM (GB,
     ram_gb()) less 24 for the OS, the engine and the file cache the other experts are read through, less a KV cache
     streamed to RAM; at most all of them, at least 8.  A 64 GB PC (~62 GiB): 38, 36 with a 128K context
-    (bench/results/2026-10-03-ud-low-ram)."""
+    (the 2026-10-03-ud-low-ram record)."""
     gib = round(ram) - UNSLOTH_RAM_LEFT_GB - math.ceil(kv_ram_gb)
     return max(8, min(gib, int(MODELS[model]["arena_gb"] / 1.073741824)))
 
@@ -2935,7 +2935,7 @@ def tiny_png(w=64, h=48) -> bytes:
 def warm_up(cfg_path: Path) -> None:
     """Start the model once and answer a long prompt (and a picture): the GPU code is SPIR-V that the driver compiles
     on first use and keeps in its cache (~/.cache/neo_compiler_cache), so the first real request does not wait for it
-    (on the B70 about 30 s more for the first reply, 11 s more to start: bench/results/2026-09-30-xe-setup).
+    (on the B70 about 30 s more for the first reply, 11 s more to start: the 2026-09-30-xe-setup record).
     Best effort: a failure is reported and setup goes on."""
     import base64
     import socket
@@ -3692,7 +3692,7 @@ def main() -> int:
             warn(f"images are not available with {model} yet: off")
     elif a.vision:
         # yes = the GPU encoder, the CPU encoder its fallback.  Adopted without a tolerance on the embeddings (they
-        # differ from the CPU encoder's by a few percent; the answers agree): bench/results/*-xe-vision-sycl
+        # differ from the CPU encoder's by a few percent; the answers agree): the 2026-09-30-xe-vision-sycl record
         vision = {"yes": "gpu", "no": "none"}.get(a.vision, a.vision)
     else:
         say()

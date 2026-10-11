@@ -41,7 +41,7 @@ namespace {
 thread_local std::string g_error;
 
 // The live alloc_device blocks, so a refusal can say how much this process holds (the refusals seen so far came
-// with ~26 GiB free in the runs that passed, cause unknown: bench/results/2026-09-30-xe-iq3xxs)
+// with ~26 GiB free in the runs that passed, cause unknown: the 2026-09-30-xe-iq3xxs record)
 std::mutex g_live_mu;
 std::map<const void*, size_t> g_live;
 size_t g_live_bytes = 0;
@@ -71,7 +71,7 @@ bool fail(const char* what, const std::exception& e) {
 core::Runtime& rt() { return core::Runtime::get(); }
 
 // A single memset of more than 4 GiB never completes on the B70; the same bytes in 1 GiB pieces do, and a 5 GiB memcpy
-// and kernels addressing past 4 GiB work normally (bench/results/2026-09-30-xe-large-alloc).
+// and kernels addressing past 4 GiB work normally (the 2026-09-30-xe-large-alloc record).
 constexpr size_t kPiece = size_t(1) << 30;
 sycl::event memset_pieces(sycl::queue& queue, void* dst, int value, size_t bytes) {
     sycl::event e;

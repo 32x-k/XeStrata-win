@@ -31,7 +31,7 @@ The processor's own graphics (a UHD 770 on the development machine) is a second,
 
 The changes of upstream Strata 0.1.39 to 0.1.40.2 (`e8ca9afd`) are carried into Xe, except the Windows implementation.
 Of the AMD (HIP) changes, those that apply to XeStrata's AMD path (the same SYCL kernels) are carried: an AMD APU's unified memory (setup, and the engine's free memory of an integrated GPU) and the fused RMSNorm + RoPE, which was meant for every GPU.
-Upstream's HIP-only speed switches were measured on and off on an RX 9060 XT (gfx1200); those for gfx11 (RDNA3) and gfx103x (RDNA2) only are not carried, with no such card to try them on ([record](../bench/results/2026-10-09-upstream-0140/README.md)).
+Upstream's HIP-only speed switches were measured on and off on an RX 9060 XT (gfx1200); those for gfx11 (RDNA3) and gfx103x (RDNA2) only are not carried, with no such card to try them on.
 Upstream's `sycl/` (another port to Intel GPUs) is not taken in: it is measured against on the same B70.
 On NVIDIA GPUs the same kernels run in the contrib-llvm build ([BUILD](BUILD.md)).
 
@@ -49,7 +49,7 @@ The main things carried:
 - Setup's additions (`--inspect`, `--source modelscope`, a 200K context and more) and the server's changes.
 
 Of the paths meant to be faster, those faster on the B70 or the RTX 4070 without being slower on the other are carried.
-One faster on only one of them is chosen at run time from what the device reports, or is opt-in ([record](../bench/results/2026-10-09-upstream-0140/README.md)).
+One faster on only one of them is chosen at run time from what the device reports, or is opt-in.
 
 The integration builds in the free (intel/llvm), contrib-icpx (icpx) and contrib-llvm (intel/llvm with CUDA) modes, and all 71 CTest cases pass in each (`expert_multi_test` skips on a CPU without AVX-512).
 The AVX-512 path passes `expert_multi_test` under Intel SDE (`-icx`).
@@ -79,7 +79,7 @@ Carried:
 - Native RoPE follows the request's scaling configuration.
 - MTP downloads verify the pinned checkpoint and refuse invalid ranges.
 
-The paths meant to be faster are not carried: measured on the B70, none was faster ([record](../bench/results/2026-10-04-upstream-0138/README.md)).
+The paths meant to be faster are not carried: measured on the B70, none was faster.
 
 | Path | On the B70 |
 | --- | --- |
@@ -138,7 +138,7 @@ What the engine requires of the GPU and the host, and the rules it keeps.
   Past that size the UHD 770 (4 GiB) registered without an error and copied wrong bytes.
   `registered_bytes` is the whole capacity, and `locked_bytes` counts explicit `mlock` bytes (zero).
   Neither `mlock` nor a hugetlbfs pool is used; transparent huge pages back the arena.
-  [The B70 measurements](../bench/results/2026-09-30-b70/README.md) registered a 47.46 GiB arena under an 8 MiB memlock limit, with `VmLck` 0.
+  The B70 measurements registered a 47.46 GiB arena under an 8 MiB memlock limit, with `VmLck` 0.
 - **Following the device**: kernels take what the device reports.
   A work-group of 1024 work-items only where the device takes one (the UHD 770 takes 512).
   FP64 only where the device has it; on the UHD 770 and the Arc A series those kernels sum in FP32.
@@ -205,7 +205,7 @@ One column also runs the multi-column kernel in the CUDA single-column layout; t
 The CUDA file kept the two bitwise equal as well.
 Calls require an explicit runtime stream and enqueue without waiting, as the CUDA contract required a non-null stream.
 
-[The i-quant measurements](../bench/results/2026-09-30-xe-iq/README.md) show all ten formats dequantizing real model rows exactly as gguf-py does (Q2_0: the definition mirrored from ggml).
+The i-quant measurements show all ten formats dequantizing real model rows exactly as gguf-py does (Q2_0: the definition mirrored from ggml).
 Their MMVQ is within `iq_parity`'s `2e-2` bound (4.2e-3–5.8e-3), and `iq_parity` reports 0 failures.
 Q6_K, Q8_0, Q4_K, Q5_K, Q4_0 and Q5_0 MMVQ are within `2e-2` of FP64 on random blocks.
 Columns 2–8 are bitwise equal to single-column calls in the exact layout.
@@ -221,11 +221,11 @@ Columns 2–8 are bitwise equal to single-column calls in the exact layout.
 The KV host pools (`KvHostPools`) are read and written by kernels, so on Xe they must be host USM.
 Memory registered only for device copies is not kernel-addressable.
 `native_rope` and `native_router` use precise `pow`/`cos`/`sin`/`exp` where CUDA used fast math.
-[The decode-kernel checks](../bench/results/2026-09-30-xe-kernels/README.md) record `rope_parity`, `router_top10_parity` and `bf16_gemv_parity` passing; all are registered in CTest.
+The decode-kernel checks record `rope_parity`, `router_top10_parity` and `bf16_gemv_parity` passing; all are registered in CTest.
 
 ## Models on the B70
 
-Each model went through the same checks ([the procedure](../bench/results/2026-09-30-xe-iq3xxs/README.md)):
+Each model went through the same checks (the procedure):
 
 - `native_expert_parity` on layers covering every expert type pairing, and `dequant_bf16_test`
 - a short prompt, and 96 greedy tokens against llama.cpp at the pinned commit on the CPU
@@ -233,18 +233,18 @@ Each model went through the same checks ([the procedure](../bench/results/2026-0
 - the server (streaming, a cancel, a three-turn conversation)
 - a 26,293-token prompt with and without KV streaming
 
-[The tensor inventory](../bench/results/2026-09-30-model-inventory/README.md) pins the files.
+The tensor inventory pins the files.
 
 | Model | Result | Against llama.cpp: tokens before the first split (the reference's top-two gap there) | Draft modes |
 | --- | --- | --- | --- |
-| Qwen3.8-Flash-Next IQ2_XS | [runs](../bench/results/2026-09-30-xe-iq2xs/README.md) | 96 of 96 without drafts | the same tokens |
-| Qwen3.8-Flash-Next IQ3_XXS | [runs](../bench/results/2026-09-30-xe-iq3xxs/README.md) | 6 (0.090) | differ; see below |
-| Qwen3.8-Flash-Next IQ3_S | [runs](../bench/results/2026-09-30-xe-iq3s/README.md) | 61 (0.051) | no drafts = suffix; MTP differs at the same near-tie |
-| Qwen3.8-Flash-Next Q2_0 | [runs](../bench/results/2026-09-30-xe-q2_0/README.md) (the native pack; the canonical AVX-512 pack is not run on this CPU) | 47 (0.050) | the same tokens |
-| Qwen3.8-Flash-Next Coder IQ1_M | [runs](../bench/results/2026-09-30-xe-coder-iq1m/README.md) | 20 (0.238) | the same tokens |
-| Swift 1.5 IQ2_XS | [runs](../bench/results/2026-09-30-xe-swift-iq2xs/README.md) | 7 (0.151) | no drafts = suffix; MTP differs |
-| Swift 1.5 IQ3_XXS | [runs](../bench/results/2026-09-30-xe-swift-iq3xxs/README.md) | 62 (0.058, three candidates) | differ (the cache size also differed between runs) |
-| Swift 1.5 Q2_0 | [runs](../bench/results/2026-09-30-xe-swift-q2_0/README.md) (note) | 25 (0.273) | no drafts = suffix; MTP differs |
+| Qwen3.8-Flash-Next IQ2_XS | runs | 96 of 96 without drafts | the same tokens |
+| Qwen3.8-Flash-Next IQ3_XXS | runs | 6 (0.090) | differ; see below |
+| Qwen3.8-Flash-Next IQ3_S | runs | 61 (0.051) | no drafts = suffix; MTP differs at the same near-tie |
+| Qwen3.8-Flash-Next Q2_0 | runs (the native pack; the canonical AVX-512 pack is not run on this CPU) | 47 (0.050) | the same tokens |
+| Qwen3.8-Flash-Next Coder IQ1_M | runs | 20 (0.238) | the same tokens |
+| Swift 1.5 IQ2_XS | runs | 7 (0.151) | no drafts = suffix; MTP differs |
+| Swift 1.5 IQ3_XXS | runs | 62 (0.058, three candidates) | differ (the cache size also differed between runs) |
+| Swift 1.5 Q2_0 | runs (note) | 25 (0.273) | no drafts = suffix; MTP differs |
 | OrcaRouter IQ3_XXS (compatibility procedure) | **not run**: the repository is gated and needs a Hugging Face login to download | — | — |
 
 Note: in Swift 1.5 Q2_0, layer 13's expert tensors span both shards.
@@ -262,15 +262,13 @@ Where the draft modes differ, there are two causes:
 - On Qwen IQ3_XXS, the suffix run differs from the no-draft run even with the same cache.
   The CPU's multi-token expert kernels (IQ3_XXS gate/up and IQ4_NL down) sum in a different order from ggml's single-token dot.
   With the CPU held to ggml's dot (`STRATA_NO_IQ256=1 STRATA_NO_IQ512=1 STRATA_NO_IQ4NL=1`) the draft modes give bit-identical logits,
-  so the GPU side of a multi-token window adds no difference
-  ([record](../bench/results/2026-09-30-xe-iq3xxs/README.md#the-cause-with-the-logits-added-later-on-2026-09-30)).
+  so the GPU side of a multi-token window adds no difference.
   The difference is kept: it moves only near-ties.
 
 ### Why outputs change from run to run
 
 Which experts run on the CPU follows the cache size, and that changes the output's last bits.
-`auto` sizes the cache from the free VRAM, so free VRAM moving between starts moves it by a slot or two and can change the output
-([record](../bench/results/2026-10-02-new-machine/README.md#outputs-that-change-from-run-to-run)).
+`auto` sizes the cache from the free VRAM, so free VRAM moving between starts moves it by a slot or two and can change the output.
 Rounding it down to 64 slots gave every start on a machine the same cache, but it slowed the RTX 4070's decode by 3-4%, so it is not rounded.
 When the same output is needed (comparisons across machines or settings too), fix it with `--expert-cache N`.
 
@@ -279,8 +277,7 @@ When the same output is needed (comparisons across machines or settings too), fi
 Sometimes the upload of the output head is refused VRAM at start.
 About 27 GiB is free then, and it is always the first device allocation after the arena is registered for device copies.
 The same settings then start normally.
-On the development machine it happened 3 times in about 120 starts
-([record](../bench/results/2026-10-02-new-machine/README.md#the-output-heads-vram-refusal)).
+On the development machine it happened 3 times in about 120 starts.
 
 ### The VRAM reserve on a small card
 
@@ -310,16 +307,15 @@ Before, it was a share from the link's speed alone (0.55 from 20 GB/s, below tha
 - **The share stays**: with `--pcie-frac` (also as `--calibrate` saved it), over a layer split, with `--pcie-mode dma` or `direct`, and when the times cannot be measured.
 
 The RTX 4070 (PCIe 4.0 x4) now computes every miss on the CPU: IQ3_XXS 32K 49.9 -> 57-58.6 tok/s, UD-Q4_K_XL 32K 22.0 -> 25.7.
-The B70 keeps every miss on the CPU, as before; the RX 9060 XT reads 1.0 instead of 4.7 experts a layer over PCIe; neither changes speed
-([record](../bench/results/2026-10-10-maya-split/README.md)).
+The B70 keeps every miss on the CPU, as before; the RX 9060 XT reads 1.0 instead of 4.7 experts a layer over PCIe; neither changes speed.
 
 ## Images
 
 Images are available only when chosen in setup (off by default).
 When they are, the image encoder (`tools/vision`: llama.cpp's mtmd with the model's mmproj) runs on the GPU by default (`./setup.sh --vision yes` or `gpu`).
 When it cannot, the CPU encoder takes over; `--vision cpu` uses the CPU encoder alone.
-The CPU encoder reads the pictures of [the image record](../bench/results/2026-09-30-xe-vision-cpu/README.md) as llama.cpp does, on grids of both shapes.
-Every model that runs was checked with images ([record](../bench/results/2026-09-30-xe-vision-models/README.md)):
+The CPU encoder reads the pictures checked as llama.cpp does, on grids of both shapes.
+Every model that runs was checked with images:
 two grid shapes, two images in one request, and a conversation that sends the image again and reuses its cache.
 
 The GPU encoder comes in two builds.
@@ -329,13 +325,11 @@ with Vulkan the first GPU can be the processor's graphics or another card.
 - **Vulkan** (ggml-vulkan, `-DSTRATA_VISION_VULKAN=ON`): the free build's.
   Its driver is Mesa, free software.
   It encodes 7–9× faster than the CPU encoder (8 threads) and about half as fast as the SYCL one.
-  Its embeddings differ from the CPU encoder's by 2.4–3.1% (relative L2), less than the SYCL encoder's, and repeat bit for bit
-  ([record](../bench/results/2026-10-02-vision-vulkan/README.md)).
+  Its embeddings differ from the CPU encoder's by 2.4–3.1% (relative L2), less than the SYCL encoder's, and repeat bit for bit.
 - **SYCL** (ggml-sycl, `-DSTRATA_VISION_SYCL=ON`): in the contrib-icpx mode (`--license contrib-icpx`), when oneMKL is installed.
   ggml-sycl links oneMKL, which is not free software.
   Every node runs on the GPU; it encodes 13–20× faster than the CPU encoder, with the same answers or a rewording at a near-tie.
-  Its embeddings differ from the CPU encoder's by 3–6% (relative L2); it was adopted without a tolerance for that
-  ([record](../bench/results/2026-09-30-xe-vision-sycl/README.md)).
+  Its embeddings differ from the CPU encoder's by 3–6% (relative L2); it was adopted without a tolerance for that.
 
 ggml-sycl takes oneDNN (`intel-oneapi-dnnl-devel`) when it is installed at build time.
 With it the SYCL encoder is 1.2–1.5× faster per image, but the same image gives slightly different embeddings from run to run.
@@ -354,11 +348,11 @@ When none starts, or the serving encoder stops later, the server keeps serving t
 
 ## The IQ2_XS file's tensors
 
-The [frozen model inventory](../bench/results/2026-09-30-b70/iq2-xs-baseline.json) records the Hugging Face revision and the SHA-256 of each complete GGUF header.
-The [tensor CSV](../bench/results/2026-09-30-b70/iq2-xs-tensors.csv) records every tensor's actual type, shape, offset and byte size.
+The frozen model inventory records the Hugging Face revision and the SHA-256 of each complete GGUF header.
+The tensor CSV records every tensor's actual type, shape, offset and byte size.
 Only headers were fetched for that inventory; a header prefix is not a usable model shard.
-Generation with the complete model, the prefill path, MTP and prompt-lookup drafts, the server, and a 26k-token prompt with KV streaming are in
-[the IQ2_XS results](../bench/results/2026-09-30-xe-iq2xs/README.md).
+Generation with the complete model, the prefill path, MTP and prompt-lookup drafts, the server, and a 26k-token prompt with KV streaming were checked
+with IQ2_XS too.
 Greedy tokens were compared with llama.cpp on the CPU.
 
 The `IQ2_XS` distribution at the recorded revision holds 1,224 tensors in 12 storage types, with **no tensor stored as IQ2_XS**.
@@ -389,8 +383,8 @@ The GPU's q8_1 activation contract and the CPU's ggml `vec_dot_type` stay explic
 | `rope_parity`, `router_top10_parity`, `bf16_gemv_parity`, `quantize_act_parity`, `qsa_parity`, `kv_q8_parity`, `kv_q4_parity`, `kv_stream_parity`, `gdn_parity`, `gr_parity`, `cvec_parity` | Ported, registered in CTest, pass on the B70 |
 | `shared_expert_parity` | Ported, registered in CTest, passes on the B70, including the SYCL-graph replay of the native scalar gate |
 | `sampler_parity` | Ported, registered in CTest, passes on the B70 |
-| `qsa_prompt_attn_parity` | The existing FP64 reference and FP32 baseline, ported to SYCL (built, not a CTest case: it is also a benchmark). The XMX kernel passes it at int8 and FP16 KV ([record](../bench/results/2026-10-02-prompt-attn-xmx/README.md)), the tensor-core one at INT8, FP16 and K8V4 (Q4_0 skipped); without the matrix engines the caller keeps `qsa_decode_attn_batch` |
-| `native_moe`, `native_gdn`, `native_gdn_preprocess`, `native_ple_postops`, `native_qsa`, `native_qsa_score`, `native_qsa_indexer`, `native_flash_attn`, `qsa_select`, `fused_gdn` (no in-tree parity) | [Probes against ggml-cpu at the pinned commit](../bench/results/2026-09-30-xe-native/README.md) pass on the B70; not registered in CTest |
+| `qsa_prompt_attn_parity` | The existing FP64 reference and FP32 baseline, ported to SYCL (built, not a CTest case: it is also a benchmark). The XMX kernel passes it at int8 and FP16 KV, the tensor-core one at INT8, FP16 and K8V4 (Q4_0 skipped); without the matrix engines the caller keeps `qsa_decode_attn_batch` |
+| `native_moe`, `native_gdn`, `native_gdn_preprocess`, `native_ple_postops`, `native_qsa`, `native_qsa_score`, `native_qsa_indexer`, `native_flash_attn`, `qsa_select`, `fused_gdn` (no in-tree parity) | Probes against ggml-cpu at the pinned commit pass on the B70; not registered in CTest |
 | `native_expert_parity`, `dequant_bf16_test` | Ported, built with `STRATA_NATIVE_EXPERTS`, not registered (they need the model shards). Pass on the B70 with the shards of every model under [Models](#models-on-the-b70) |
 | `iq_parity` | Ported and built, not registered. `tools/iq_fixture.py` writes `logs/iq_fixture` from ranged reads of the pinned model revision. All 10 formats pass. Q6_K/Q8_0 are not in its list |
 | `ple_parity` | Has the checked-in `ple_oracle_vectors.inc`; full checks also need the actual table and reference artifacts |
@@ -406,9 +400,9 @@ XeStrata uses them as they are; only some have been tuned on Xe.
 
 | Source | Setting | On Xe |
 | --- | --- | --- |
-| `src/program/generate.cpp` | Native missed-expert PCIe share 0.55 (canonical 0.2), scaled by min(1, link GB/s / 20), the link read as the best of four 256 MiB bursts | On the new development machine 0.15 was 2–4% faster and every larger share slower; the measurement does not support 0.55 ([record](../bench/results/2026-10-02-new-machine/README.md#the-expert-arena-and-the-pcie-share)) |
+| `src/program/generate.cpp` | Native missed-expert PCIe share 0.55 (canonical 0.2), scaled by min(1, link GB/s / 20), the link read as the best of four 256 MiB bursts | On the new development machine 0.15 was 2–4% faster and every larger share slower; the measurement does not support 0.55 |
 | `tools/calibrate.py` | Baseline Ryzen 5 7600 + RTX 5070; PCIe candidates 0/0.2/0.35/0.55/0.75, draft floor 0.3/0.5/0.7, worker candidates; interleaved confirmation requires >3% gain | Candidates and baseline unchanged from upstream |
-| `setup.py` | `--spec 4`, `--spec-min-p 0.5`, `--expert-cache auto`, `--prefill auto` | `--prefill auto` now picks chunks up to 32768 tokens ([record](../bench/results/2026-10-03-prompt-upstream/README.md)); a chunk that does not fit with the default ring takes a 96-slot ring (upstream #583; IQ3_S on the B70 limited to 8 GB: 8K and 32K prompts 1.5-2x); the rest as upstream |
+| `setup.py` | `--spec 4`, `--spec-min-p 0.5`, `--expert-cache auto`, `--prefill auto` | `--prefill auto` now picks chunks up to 32768 tokens; a chunk that does not fit with the default ring takes a 96-slot ring (upstream #583; IQ3_S on the B70 limited to 8 GB: 8K and 32K prompts 1.5-2x); the rest as upstream |
 | `src/program/generate.cpp` | 700 MiB VRAM reserve (down to 300 on a small card); prefill borrowing and chunk selection; cache adaptation every 4 rounds and up to 96 swaps | As upstream |
-| `src/program/generate.cpp` and the CPU pool | Physical-core worker heuristic plus host worker; cache-hit pokes and graph/doorbell scheduling | The worker count was measured on the new machine: 7 to 19 workers decode equally fast, so the default stays ([record](../bench/results/2026-10-02-new-machine/README.md#cpu-worker-threads)) |
+| `src/program/generate.cpp` and the CPU pool | Physical-core worker heuristic plus host worker; cache-hit pokes and graph/doorbell scheduling | The worker count was measured on the new machine: 7 to 19 workers decode equally fast, so the default stays |
 | `src/kernels/cpu/iq_avx512.cpp` | Software prefetch distance and AVX-512-specific tuning | Not measured: the development machine has no AVX-512 |

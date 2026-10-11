@@ -7,7 +7,7 @@
 //
 // The per-token arithmetic of each kernel is its single-token original's (fused_gdn, elementwise) with the same
 // operation order, so a verify window reproduces plain decode.  The flag waits use the reading measured in
-// bench/results/2026-09-30-xe-doorbell: a volatile read followed by a system-scope acquire fence.  gpu_stamp writes
+// the 2026-09-30-xe-doorbell record: a volatile read followed by a system-scope acquire fence.  gpu_stamp writes
 // device-clock ticks, not the nanoseconds of CUDA's %globaltimer.
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/core/runtime.hpp"
