@@ -1129,6 +1129,31 @@ class StrataEngine:
                 return line
         return None
 
+    def _apply_bdone(self, f: list[str]) -> None:
+        """`BDONE <slot> <produced> <finish> <ms>` into this request's figures."""
+        if len(f) >= 5 and isinstance(self.last, dict):
+            self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
+                         "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+
+    def _bdone_after_eos(self, slot: int, wait_s: float = 2.0):
+        """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine
+        prints it in the same window).  Read it here, so the request's figures are the slot leg's (the background wait
+        would eat it, and the request kept the admission's single token).  None when it does not come in `wait_s`: then
+        the background wait takes over."""
+        if slot >= len(self.slot_q):
+            return None
+        end = time.monotonic() + wait_s
+        while time.monotonic() < end:
+            try:
+                line = self.slot_q[slot].get(timeout=max(0.05, end - time.monotonic()))
+            except queue.Empty:
+                return None
+            if line is None:
+                return None
+            if line.startswith("BDONE "):
+                return line
+        return None
+
     def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
@@ -1272,6 +1297,8 @@ class StrataEngine:
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
+        # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
+        carry = {}
         ok = yield from self._take_control(cancel, len(prompt))
         if not ok:
             return
@@ -1337,6 +1364,9 @@ class StrataEngine:
                             return
                         if reused0 is None:
                             reused0 = (self.last or {}).get("reused")
+                        # #1869: the solo leg's figures; the slot's admission (a copy of the held prefix:
+                        # prompt_read 1) and BDONE replace them
+                        carry_leg(carry, self.last)
                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
                 while True:
                     if slot is None:
@@ -1463,15 +1493,14 @@ class StrataEngine:
                     elif line.startswith("BDONE "):
                         phase = "none"
                         f = line.split()
-                        if len(f) >= 5 and isinstance(self.last, dict):
-                            self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
-                                         "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+                        self._apply_bdone(f)
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in EOS_IDS)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
                             # last token are in them) and decodes with MTP drafts again
+                            carry_leg(carry, self.last)         # #1869: the solo path's DONE replaces these figures
                             self.slot_live[slot] = None
                             self.slot_used[slot] = time.time()
                             with self.slot_cv:
@@ -1503,8 +1532,16 @@ class StrataEngine:
                         phase = "slot"
             except EngineDied:
                 pass
+            bdone_in = False
+            if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
+                bd = self._bdone_after_eos(slot)            # (#1869) the slot's figures, not the admission's
+                if bd is not None:
+                    self._apply_bdone(bd.split())
+                    bdone_in = True
             if reused0 is not None and isinstance(self.last, dict):
                 self.last = {**self.last, "reused": reused0}
+            if carry and isinstance(self.last, dict):
+                self.last = add_carry(carry, self.last)
             if holding:
                 self.ctl.release()
             if admit_wait:
@@ -1518,7 +1555,14 @@ class StrataEngine:
             if slot is not None:
                 self.slot_live[slot] = None
                 self.slot_used[slot] = time.time()
-                if phase == "slot":
+                if phase == "slot" and bdone_in:
+                    stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
+                    self.slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
+                    with self.slot_cv:
+                        self.slot_busy[slot] = False
+                        self.slot_claims.discard(slot)
+                        self.slot_cv.notify_all()
+                elif phase == "slot":
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
                     self._release_slot_when_done(slot, stream)    # freed at its BDONE
@@ -3924,6 +3968,27 @@ def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
     return min(prompt_tokens, int(last.get("reused") or 0) + int(read))
 
 
+def carry_leg(carry: dict, leg: dict) -> None:
+    """#1869: a request that decoded in a batch slot and went back to the solo path ends with the solo path's DONE,
+    which replaces the engine's figures: keep the slot leg's decode time, tokens and prompt figures to add to it."""
+    carry["decode_ms"] = carry.get("decode_ms", 0.0) + float(leg.get("decode_ms") or 0.0)
+    carry["generated"] = carry.get("generated", 0) + int(leg.get("generated") or 0)
+    carry.setdefault("prompt_ms", float(leg.get("prompt_ms") or 0.0))
+    if leg.get("prompt_read") is not None:
+        carry.setdefault("prompt_read", int(leg["prompt_read"]))
+
+
+def add_carry(carry: dict, last: dict) -> dict:
+    """The request's totals: the earlier legs' decode time and tokens plus the final one's; the prompt figures of the
+    leg that read the prompt (the solo continuation reads next to nothing)."""
+    out = {**last, "decode_ms": float(last.get("decode_ms") or 0.0) + carry.get("decode_ms", 0.0),
+           "generated": int(last.get("generated") or 0) + carry.get("generated", 0),
+           "prompt_ms": max(float(last.get("prompt_ms") or 0.0), carry.get("prompt_ms", 0.0))}
+    if "prompt_read" in carry:
+        out["prompt_read"] = carry["prompt_read"]
+    return out
+
+
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
     """One request's `timings` in llama.cpp's names (what its clients show as speed), from the engine's own clock
     (StrataEngine.last): prompt_n is what was read, cache_n what the conversation cache already held.  None when the
@@ -3931,6 +3996,10 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
     if last.get("prompt_ms") is None:
         return None
     cache_n = int(last.get("reused") or 0)
+    if last.get("prompt_read") is not None and last.get("finish") != "cancel":
+        # #1870: the engine says how many prompt tokens it read: the slot's own session may have held the rest
+        # (not the conversation cache), so the rate is not made of tokens it never read
+        cache_n = max(cache_n, max(0, prompt_tokens - int(last["prompt_read"])))
     prompt_n, prompt_ms, decode_ms = max(0, prompt_tokens - cache_n), float(last["prompt_ms"]), float(last.get("decode_ms") or 0)
     decoded = int(last.get("generated") or generated)          # the engine's count gives its rate, as /metrics does
     return {"cache_n": cache_n, "prompt_n": prompt_n, "prompt_ms": round(prompt_ms, 1),
