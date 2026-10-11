@@ -480,6 +480,8 @@ A list such as `24,26` is taken as given, minus the host's and the workers' CPUs
 It moves threads only and does not change the answers.
 `STRATA_AUX_CPUS` sets it too, and the API's `"strata_tune": {"aux_cpus": 1}` (`0` puts them back) switches it per
 request. `STRATA_AUX_STAGER=0` leaves the prefill copy threads where they were started.
+On an RX 9060 XT with a Ryzen 7 5700X (serve, IQ3_XXS, five interleaved rounds) `auto` sped up the 1K prefill and the
+wait before a 32K follow-up, but the 32K prefill read 3.2% slower, so the default stays `off`.
 
 ### Chat in the terminal
 

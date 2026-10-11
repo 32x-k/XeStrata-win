@@ -472,6 +472,7 @@ worker の数を測るにはエンジンを起動し直すので、モデルを�
 スレッドを動かすだけで、答えは変わりません。
 `STRATA_AUX_CPUS` でも設定でき、API の `"strata_tune": {"aux_cpus": 1}`（`0` で元に戻す）で要求ごとに切り替えられます。
 `STRATA_AUX_STAGER=0` にすると、prefill のコピーのスレッドだけは動かしません。
+RX 9060 XT と Ryzen 7 5700X の serve（IQ3_XXS、5 回交互）では、`auto` で 1K の prefill と 32K の追質問の待ちは速くなりましたが、32K の prefill が 3.2% 遅くなったので、既定は `off` のままです。
 
 ### 端末で会話する
 
