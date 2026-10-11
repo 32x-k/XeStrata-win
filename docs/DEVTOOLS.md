@@ -207,7 +207,7 @@ sde64 -version
 - The engine's own timings: `STRATA_PREFILL_TIMING=1` for the prefill path.
   The decode's `verify window` line (the host's wait for the GPU, the CPU pool) is always printed.
 - `STRATA_VERIFY_NODES=1` prints how many kernels a decode window's graph holds.
-- Scratch probes that time single kernels with SYCL event profiling (the records in `bench/results/2026-10-02-xe-decode-gpu`).
+- Scratch probes that time single kernels with SYCL event profiling.
 - `STRATA_VERIFY_PROFILE=1` needs a device-scope clock, which the B70 does not have.
 
 ### The xe driver's kernel log
@@ -219,8 +219,7 @@ The xe driver reports its errors in the kernel log.
 journalctl -k --since "-1h" --no-pager | grep "xe 0000"
 ```
 
-`VM worker error: -16` there came about 8 s before each start that had the output head's VRAM refused
-(`bench/results/2026-10-02-xe-decode-gpu`).
+`VM worker error: -16` there came about 8 s before each start that had the output head's VRAM refused.
 
 ### VTune and the GPU's hardware counters
 

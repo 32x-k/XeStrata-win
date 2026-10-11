@@ -13,6 +13,8 @@
 // path, as the CUDA source says of that fallback.
 #include "strata/kernels/native_qsa_score.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_native_qsa_score
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <atomic>
 #include <cstddef>

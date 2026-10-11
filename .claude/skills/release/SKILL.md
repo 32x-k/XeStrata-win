@@ -132,7 +132,7 @@ A wrong asset or note is fixed with `gh release upload --clobber`, `gh release d
 ## 9. The speed table
 
 The release against upstream's newest release tag, IQ3_XXS, on each maker's GPU: the Intel Arc Pro B70 and the RTX 4070 in the development machine, the RX 9060 XT in the AMD container (step 6).
-The six tiers and the settings of `bench/results/2026-10-04-speed-matrix` (1K to 262K, what setup writes for each context, 256 greedy tokens); its `prompts.py` writes the prompts (`python bench/results/2026-10-04-speed-matrix/prompts.py <pack> <ids folder>`).
+The six tiers and the settings of the 2026-10-04-speed-matrix record (1K to 262K, what setup writes for each context, 256 greedy tokens); its `prompts.py`, now `.claude/skills/release/scripts/prompts.py`, writes the prompts (`python .claude/skills/release/scripts/prompts.py <pack> <ids folder>`).
 The table's method stays fixed from release to release so the releases compare: the upstream merge's measurements (/upstream-sync) have scripts of their own, and a change to them does not change this table.
 
 The engines, built from the tags (no package installed), each in a worktree of its own under `.claude/worktrees/`:
@@ -145,7 +145,7 @@ Each engine's own shipped expert profile (`data/expert-profile.bin` of its tree)
 No other work on a machine while it measures (no build, no other engine).
 
 ```sh
-o=bench/results/<date>-release-xe<VERSION>
+o=<data>/records/bench-results/<date>-release-xe<VERSION>   # outside git (the user's decision of 2026-10-11)
 XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> .claude/skills/release/scripts/bench.sh $o B70   # <data>: LOCAL.md
 python .claude/skills/release/scripts/bench-collect.py $o xe<VERSION> <upstream tag>
 ```
@@ -172,8 +172,8 @@ python $u/sync_collect.py $o/serve xe<VERSION> <upstream tag>                 # 
 `XE` and `UP` are as above; serve and everyday use pass stdin to them, so upstream's `sycl/` wrapper runs `docker run -i`.
 `XE_ROOT` and `UP_ROOT` are the engines' worktrees (their `serve/server.py`), `PY` a Python with the server's packages (the data folder's `venv`); everyday use runs at a 262144 context with what setup writes for it.
 
-The record goes into `$o/` on `dev`: a README (the machines, the two engines' commits and builds, the method, the tables and what the numbers say), `matrix.json`, `serve/` (its `matrix-serve.json`, `matrix-usage.json` and runs), and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>` (as the speed-matrix record does).
-Lint and commit it on `dev` (it is not in the tag).
+The record goes into `$o/`, in the data folder and never into git (XeStrata's own measurements are not shared, the user's decision of 2026-10-11): a README (the machines, the two engines' commits and builds, the method, the tables and what the numbers say), `matrix.json`, `serve/` (its `matrix-serve.json`, `matrix-usage.json` and runs), and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>` (as the speed-matrix record does).
+It is not committed; the release notes carry the tables.
 
 ## 10. The final release (確定報)
 

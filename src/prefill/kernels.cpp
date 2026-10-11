@@ -13,6 +13,8 @@
 #include "strata/kernels/router_top10.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/per_device.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU prefill_kernels
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 

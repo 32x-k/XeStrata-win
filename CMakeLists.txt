@@ -6,14 +6,14 @@ project(XeStrata LANGUAGES CXX)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "Strata supports Linux only")
 endif()
-set(STRATA_UPSTREAM_VERSION "0.1.40.2")
-set(STRATA_UPSTREAM_COMMIT "e8ca9af")
+set(STRATA_UPSTREAM_VERSION "0.1.42")
+set(STRATA_UPSTREAM_COMMIT "61b3fb5")
 # XeStrata's version follows the upstream version it has integrated, marked "xe" so it is not taken for upstream's.
 # XESTRATA_REVISION counts XeStrata's releases on that upstream version from 1, as a Debian revision does: the packages
 # are <upstream>-<revision> (rpm: Version and Release), the version name xe<upstream> for the first release and
 # xe<upstream>.<revision - 1> for a later one (xe0.1.40.2.1 is the package 0.1.40.2-2), more numbers than project()
 # can hold.
-set(XESTRATA_REVISION 3)
+set(XESTRATA_REVISION 1)
 if(XESTRATA_REVISION GREATER 1)
   math(EXPR _xe_later "${XESTRATA_REVISION} - 1")
   set(XESTRATA_VERSION "${STRATA_UPSTREAM_VERSION}.${_xe_later}")
@@ -215,6 +215,14 @@ if(STRATA_BUILD_TESTS)
   add_executable(direct_file_async_test tests/platform/direct_file_async.cpp)
   target_link_libraries(direct_file_async_test PRIVATE strata_platform)
   add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
+  # --aux-cpus: the CPU-set derivation (pure) and the placement of live threads; header-only, no GPU
+  add_executable(aux_cpus_test tests/platform/aux_cpus_test.cpp)
+  target_link_libraries(aux_cpus_test PRIVATE strata_platform)
+  add_test(NAME aux_cpus_test COMMAND aux_cpus_test)
+  # when the default CPU prefill share is armed (#1595, the host's memory): header-only rules, no GPU
+  add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
+  target_include_directories(share_rules_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME share_rules_test COMMAND share_rules_test)
 endif()
 
 add_executable(platform_memory_test src/platform/memory_test.cpp)
@@ -741,6 +749,21 @@ if(STRATA_BUILD_TESTS)
   add_executable(conversation_file_test src/core/conversation_file_test.cpp src/core/conversation_file.cpp)
   target_include_directories(conversation_file_test PRIVATE include)
   add_test(NAME conversation_file_test COMMAND conversation_file_test)
+  # SAVE's opt-in reclaim (--session-save-reclaim, upstream 73ed39ae): which host caches go, in which order, and that
+  # the RAM check runs again after each step
+  add_executable(session_save_reclaim_test src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp)
+  target_include_directories(session_save_reclaim_test PRIVATE include)
+  add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
+  # available_host_bytes(): MemAvailable, the cgroup limits and the operator's --memory-limit-mib cap on fixture
+  # directories (upstream daa76552) - no GPU
+  add_executable(memory_guard_test tests/core/memory_guard_test.cpp src/core/conversation_memory.cpp)
+  target_include_directories(memory_guard_test PRIVATE include)
+  add_test(NAME memory_guard_test COMMAND memory_guard_test)
+  # a request's logit_bias line (upstream dcc6f756): the parser, no GPU
+  add_executable(logit_bias_test src/core/logit_bias_test.cpp)
+  target_include_directories(logit_bias_test PRIVATE include)
+  add_test(NAME logit_bias_test COMMAND logit_bias_test)
+  set_tests_properties(memory_guard_test PROPERTIES TIMEOUT 60)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
@@ -900,6 +923,34 @@ if(STRATA_BUILD_TESTS)
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
+
+  # #795 (upstream 90dd021a): nothing an AVX2-only CPU can reach may hold AVX-512 / AVX-VNNI-class instructions.  (1) the
+  # kernel library is disassembled and any function with such instructions must be a kernel of a wide-ISA file, not a
+  # weak / COMDAT copy and not a probe or helper that every CPU runs; (2) with -DSTRATA_SDE=<sde> (Intel SDE) the CPU
+  # tests run on an emulated AVX2-only Haswell and on an Alder Lake (AVX-VNNI, no AVX-512): SDE stops at the first
+  # instruction the chip does not have.
+  if(TARGET iq_avx2_parity)
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+      add_test(NAME isa_guard_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_isa_guard.py
+               $<TARGET_FILE:strata_kernels_cpu>)
+      set_tests_properties(isa_guard_check PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+    endif()
+  endif()
+  set(STRATA_SDE "" CACHE FILEPATH "Intel SDE (sde / sde64): also run the CPU tests on an emulated AVX2-only and an AVX-VNNI-only CPU")
+  if(STRATA_SDE AND TARGET iq_avx2_parity)
+    foreach(_chip hsw adl)
+      foreach(_t iq_avx2_parity q8k_quant_parity router_dot_parity pool_tasks_test q2_bitplane_parity)
+        if(TARGET ${_t})
+          add_test(NAME sde_${_chip}_${_t} COMMAND ${STRATA_SDE} -${_chip} -- $<TARGET_FILE:${_t}>)
+          set_tests_properties(sde_${_chip}_${_t} PROPERTIES TIMEOUT 900)
+        endif()
+      endforeach()
+      if(TARGET q2_bitplane_parity)
+        set_tests_properties(sde_${_chip}_q2_bitplane_parity PROPERTIES ENVIRONMENT "STRATA_Q2_BITPLANE=1")
+      endif()
+    endforeach()
+  endif()
 endif()
 
 if(STRATA_BUILD_TESTS)

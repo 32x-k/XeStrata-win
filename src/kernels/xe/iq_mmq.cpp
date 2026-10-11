@@ -22,6 +22,8 @@
 #include "device_target.hpp"
 #include "strata/core/per_device.hpp"
 #include "iq_bits.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_iq_mmq
+#include "strata/kernels/device_arch_tag.hpp"
 
 #define GGML_COMMON_DECL_SYCL
 #define GGML_COMMON_IMPL_SYCL

@@ -32,7 +32,7 @@ The engine's own options:
 | Option | Meaning |
 | --- | --- |
 | `--layer-split auto` | The split points are chosen from what this PC measures ([below](#choosing-the-split-points)). With one GPU visible there is no split. |
-| `--layer-split K[,K2..]` | The next GPU takes over at layer K (K from 2, rising). One GPU per split point. |
+| `--layer-split K[,K2..]` | The next GPU takes over at layer K (K from 2, rising). One GPU per split point. K is the **first layer** of each later GPU, not a count of layers per card (`24,36,42` for 4 GPUs). The config's `"layer_split"` may be a string or a JSON list (`[24, 36, 42]`); the server checks it before the start and says the format when it is wrong (upstream #644). |
 | `--split-device D[,D2..]` | The GPU for each split point, by engine number (from 1, see [GPU numbers](#gpu-numbers)) or PCI address. Without it, the GPUs that are not the processor's own graphics, in their order. |
 | `--batch-groups G` | With `--batch N`: the slots in G groups, each GPU on another group at once ([below](#decoding-several-conversations)). |
 | `--batch-cpu-split N0,N1` | Experimental, off by default ([below](#the-cpu-experts-per-stage-experimental)). |

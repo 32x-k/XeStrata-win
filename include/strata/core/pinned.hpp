@@ -10,7 +10,7 @@
 //   * LARGE PAGES (2 MB) - transparent huge pages via `madvise(MADV_HUGEPAGE)`.  34 GB at 4 KB pages is 8.3 million
 //     TLB entries, which does not fit in any TLB.  THP needs no hugetlbfs pool to be reserved by the user.
 //   * NORMAL PAGES - correct, and it must be REPORTED rather than silently accepted: an unregistered 4 KB-page
-//     source copied at 4.3 GB/s against 14.4 GB/s on the B70's x8 link (bench/results/2026-09-30-b70).
+//     source copied at 4.3 GB/s against 14.4 GB/s on the B70's x8 link (the 2026-09-30-b70 record).
 //
 // The arena is ONE mapping registered for device copies, not host USM: the Level Zero driver refuses a single USM
 // allocation above the device's max_mem_alloc_size (the VRAM size, 32.5 GB on the B70), which every model but the

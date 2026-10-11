@@ -39,6 +39,8 @@
 #include "iq_bits.hpp"
 #include "q8_1_finite.hpp"
 #include "sm70_table.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_iq_kernels
+#include "strata/kernels/device_arch_tag.hpp"
 
 #define GGML_COMMON_DECL_SYCL
 #define GGML_COMMON_IMPL_SYCL
@@ -713,7 +715,7 @@ sycl::event launch_mmvq(sycl::queue& q, const uint8_t* w, size_t row_bytes, cons
 }
 
 // ---------------------------------------------------------------- grouped native experts
-// Lanes a row in the experts' projections, measured on the B70 (bench/results/2026-10-02-xe-decode-gpu): 16 for the
+// Lanes a row in the experts' projections, measured on the B70 (the 2026-10-02-xe-decode-gpu record): 16 for the
 // 2560-wide gate/up rows, 8 for the 640-wide down rows (32 lanes left most of a 180-360 byte row's lanes idle).  A
 // down row of under 12 bytes per 32 values (Q2_0's 180) takes 4: a verify window's grouped experts 3-6% faster on the
 // B70 and on an RTX 4070 (scratch lpr_probe), where IQ4_NL's 360-byte rows were 11% slower with 4 (8 and 16 for gate
@@ -961,7 +963,7 @@ template<typename dst_t> inline dst_t cvt(float v);
 template<> inline float cvt<float>(float v) { return v; }
 template<> inline sycl::half cvt<sycl::half>(float v) { return sycl::half(v); }
 // N consecutive values in one vector store instead of N scalar ones (y is aligned to N values in every caller): the
-// dequant's fp16 writes were 128-163 GB/s with one 2-byte store per value (bench/results/2026-10-02-xe-decode-gpu).
+// dequant's fp16 writes were 128-163 GB/s with one 2-byte store per value (the 2026-10-02-xe-decode-gpu record).
 template<int N, typename dst_t>
 inline void store(dst_t* y, const float* v) {
     sycl::vec<dst_t, N> o;

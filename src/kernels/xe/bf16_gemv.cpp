@@ -12,6 +12,8 @@
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/per_device.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_bf16_gemv
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <chrono>
 #include <cstdint>

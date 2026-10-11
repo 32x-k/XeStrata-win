@@ -60,7 +60,7 @@ bool copy_async(void* dst, const void* src, size_t bytes, Stream s);
 /// stream_wait_event(s, after), copy_async and event_record(done, s) as one submission: the copy waits for `after`
 /// (null or not recorded: for nothing) and `done` marks the copy (an event without timing; null: not kept).  Three
 /// submissions a copy filled the RTX 4070's stream when the prompt path queued its ring's 384 copies, and each copy
-/// held its issuer for about 160 us (bench/results/2026-10-09-xe-event-record).
+/// held its issuer for about 160 us (the 2026-10-09-xe-event-record record).
 bool copy_async_after(void* dst, const void* src, size_t bytes, Stream s, const Event* after, Event* done);
 /// `height` rows of `width` bytes between pitched buffers (cudaMemcpy2DAsync).
 bool copy2d_async(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, Stream s);

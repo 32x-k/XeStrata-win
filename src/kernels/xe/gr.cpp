@@ -16,6 +16,8 @@
 #include "strata/kernels/native_gr_postops.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_gr
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <cmath>
 #include <cstdint>

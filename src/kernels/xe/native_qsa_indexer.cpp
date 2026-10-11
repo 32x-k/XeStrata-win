@@ -14,6 +14,8 @@
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_native_qsa_indexer
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <atomic>
 #include <cmath>

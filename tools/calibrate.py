@@ -39,8 +39,9 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
 
 MIN_GAIN = 0.03                    # a setting must beat the default by this much to be kept
-PCIE_FRACS = (0.0, 0.2, 0.35, 0.55, 0.75)
+PCIE_FRACS = (0.0, 0.2, 0.35, 0.55, 0.75, 0.9, 1.0)   # 1.0: every miss over PCIe, the CPU pool gets no expert
 SPEC_MIN_PS = (0.3, 0.5, 0.7)
+SWEEP_ROUNDS = 3                   # how many times the sweep visits each value (see `sweep`)
 # the adaptive tier's candidates (every, swaps, decay) against the engine's own (None): swapping more and remembering
 # longer, the rest of the set as the engine has it
 ADAPT_CANDIDATES = (None, ("1", "80", "0.97"), ("1", "160", "0.97"))
@@ -212,6 +213,28 @@ def share_name(pcie) -> str:
     return "split (the engine's own)" if pcie is None else f"share {pcie:.2f}"
 
 
+def sweep(s, values: list, tune, name, label: str, say) -> dict:
+    """Every value, `SWEEP_ROUNDS` times, one round visiting all of them and every other round in reverse order
+    (upstream d1990da1).  `tune(v)`: the request's tuning keys for value v; `name(v)`: how it is printed.
+
+    A single rate per value cannot order neighbours.  upstream #1332 has 0.75 to 0.95 inside each other's noise at
+    72.7, 69.0, 71.0 and 71.9, and that box moved 8-28% between engine starts at an unchanged setting.  Rotating the
+    values inside one engine start puts that drift on every value the same number of times, and the median over the
+    rounds keeps a single bad sample from deciding.  The caller takes the winner from the medians.
+    """
+    out = {v: [] for v in values}
+    for r in range(SWEEP_ROUNDS):
+        for v in (values if r % 2 == 0 else values[::-1]):
+            out[v].append(s.rate(tune(v)))
+        say(f"    round {r + 1}/{SWEEP_ROUNDS} {label}: " +
+            "  ".join(f"{name(v)} {out[v][-1]:.1f}" for v in values))
+    med = {v: statistics.median(out[v]) for v in values}
+    say(f"    {label}, median of {SWEEP_ROUNDS}: " +
+        ", ".join(f"{name(v)}: {med[v]:.1f} ({min(out[v]):.1f}-{max(out[v]):.1f})" for v in values) +
+        f" -> best {name(max(med, key=lambda k: med[k]))}")
+    return out
+
+
 def measure(base_args: list[str], ids_list, start_engine, say=print, extra_workers=()) -> dict:
     t0 = time.time()
     report: dict = {}
@@ -226,22 +249,17 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
         s.warm_up()
         # 1. the PCIe share, at the default draft floor, against the engine's own split of the missed experts (None:
         #    no share given - the split it measured at start, or its link's share where it measures none)
-        by_pcie = {}
-        for f in [None] + sorted(PCIE_FRACS):
-            by_pcie[f] = [s.rate(tune_of(f, d_minp))]
-            say(f"    PCIe {share_name(f)}: {by_pcie[f][0]:.1f} tok/s")
-        best_pcie = max(by_pcie, key=lambda k: by_pcie[k][0])
+        by_pcie = sweep(s, [None] + sorted(PCIE_FRACS), lambda f: tune_of(f, d_minp), share_name, "PCIe", say)
+        best_pcie = max(by_pcie, key=lambda k: statistics.median(by_pcie[k]))
         # 2. the draft floor, at that share
-        by_minp = {}
-        for p in sorted(set(SPEC_MIN_PS) | {round(d_minp, 2)}):
-            by_minp[p] = [s.rate(tune_of(best_pcie, p))]
-            say(f"    draft floor {p:.2f}: {by_minp[p][0]:.1f} tok/s")
-        best_minp = max(by_minp, key=lambda k: by_minp[k][0])
-        # 3. the winner against the default, interleaved, three times each
+        by_minp = sweep(s, sorted(set(SPEC_MIN_PS) | {round(d_minp, 2)}), lambda p: tune_of(best_pcie, p),
+                        lambda p: f"{p:.2f}", "draft floor", say)
+        best_minp = max(by_minp, key=lambda k: statistics.median(by_minp[k]))
+        # 3. the winner against the default, interleaved, the same number of rounds
         dflt, cand = (None, round(d_minp, 2)), (best_pcie, best_minp)
         confirm: dict[tuple, list[float]] = {dflt: [], cand: []}
         if cand != dflt:
-            for _ in range(3):
+            for _ in range(SWEEP_ROUNDS):
                 for k in (dflt, cand):
                     confirm[k].append(s.rate(tune_of(k[0], k[1])))
         chosen = pick(confirm, dflt) if cand != dflt else dflt
@@ -264,7 +282,10 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
         by_workers = {}
         for w in worker_candidates(d_workers, extra_workers):
             say(f"  Measuring with {w} CPU workers (restarts the engine) ...")
-            e = start_engine(with_arg(tuned, "--pool-workers", None if w == d_workers else str(w)))
+            e = restart(start_engine, with_arg(tuned, "--pool-workers", None if w == d_workers else str(w)),
+                        f"{w} workers", say, report)
+            if e is None:
+                continue
             try:
                 sw = Session(e, ids_list)
                 sw.warm_up(1)
@@ -272,8 +293,8 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
                 say(f"    {w} workers: {statistics.median(by_workers[w]):.1f} tok/s")
             finally:
                 close(e)
-        w_best = pick(by_workers, d_workers)
         report["workers"] = {str(k): v for k, v in by_workers.items()}
+        w_best = pick(by_workers, d_workers) if by_workers else d_workers
         if w_best != d_workers:
             settings["--pool-workers"] = str(w_best)
             base_rate = statistics.median(by_workers[w_best])
@@ -289,7 +310,9 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
             args = with_arg(args, flag, v)
         which = "(the engine default)" if adapt is None else f"every {adapt[0]}, {adapt[1]} swaps, decay {adapt[2]}"
         say(f"  Measuring the expert tier {which} (restarts the engine) ...")
-        e = start_engine(args)
+        e = restart(start_engine, args, "the expert tier " + key, say, report)
+        if e is None:
+            continue
         try:
             sa = Session(e, ids_list)
             sa.warm_up(1)
@@ -297,7 +320,7 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
             say(f"    {statistics.median(by_adapt[key]):.1f} tok/s")
         finally:
             close(e)
-    a_best = pick(by_adapt, "default")
+    a_best = pick(by_adapt, "default") if by_adapt else "default"
     report["adapt"] = by_adapt
     if a_best != "default":
         for flag, v in zip(ADAPT_FLAGS, a_best.split("/")):
@@ -308,6 +331,20 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
     report["seconds"] = round(time.time() - t0)
     report["tok_s"] = round(base_rate, 1) if base_rate else None
     return {"settings": settings, "report": report}
+
+
+def restart(start_engine, args, what, say, report):
+    """#1337: a later step's engine start that fails is a candidate that loses, not a failed run: what the earlier
+    steps measured (and the settings they chose) must survive it.  Returns the engine, or None after saying why and
+    noting it in report["failed_starts"].  (The first start, for steps 1-3, is not covered: with no engine there is
+    nothing measured.)"""
+    try:
+        return start_engine(args)
+    except Exception as e:  # noqa: BLE001 - whatever the start raised (RuntimeError, EngineDied, OSError ...)
+        why = str(e).strip().splitlines()[0][:300] if str(e).strip() else type(e).__name__
+        say(f"    the engine did not start for {what}: {why} - this candidate is dropped, the earlier results are kept")
+        report.setdefault("failed_starts", {})[what] = why
+        return None
 
 
 def close(eng):

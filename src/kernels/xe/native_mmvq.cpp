@@ -38,6 +38,8 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/runtime.hpp"
 #include "cuda_intrinsics.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_native_mmvq
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <cstdint>
 #include <cstddef>
@@ -593,7 +595,7 @@ void launch_n(sycl::queue& q, const void* weights, const void* x_q8_1, float* y,
     }
     // A sub-group alone walks a row in ceil(blocks / (WARP / T)) dependent steps: up to 10 (the 2560-wide rows) it
     // beats the work-group layout, beyond (the 6144-wide rows, 12-24 steps) the work-group's four sub-groups win
-    // (bench/results/2026-10-02-xe-decode-gpu).
+    // (the 2026-10-02-xe-decode-gpu record).
     const int steps = (n_in / F::DIV + WARP / F::T - 1) / (WARP / F::T);
     if (steps <= 10) {
         launch_row<F, NCOLS, 8>(q, weights, x_q8_1, y, n_in, n_out);

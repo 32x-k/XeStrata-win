@@ -8,7 +8,7 @@
 // so the ones running at once share both their A and their B tiles in the cache: without the strips the wide products
 // (N 10240) ran at 105 TFLOP/s, with them at 140-150, oneMKL at 158.  W is the B operand read column-major straight
 // from its rows, as fast as the VNNI-packed layout the XMX engines take natively (143-153 TFLOP/s against 142-147 for
-// the wide products), while the dequantizers write row-major twice as fast as packed (bench/results/2026-10-02-xmx-gemm).
+// the wide products), while the dequantizers write row-major twice as fast as packed (the 2026-10-02-xmx-gemm record).
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/per_device.hpp"
@@ -16,6 +16,8 @@
 #include "mma_gemm.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "device_target.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_xmx_gemm
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>

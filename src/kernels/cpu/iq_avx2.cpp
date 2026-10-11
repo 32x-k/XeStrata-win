@@ -456,10 +456,6 @@ void q8k_quant_avx2(const float* x, void* vy, int64_t k) {
     }
 }
 
-bool iq256_supported(int type) noexcept {
-    return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
-}
-
 // The variant a format takes.  Unset STRATA_IQ256_GATHER gathers only IQ3_S's grid: on an i7-14700's P-core the
 // gathered IQ3_S gate/up rows took 0.163 ms an expert against 0.229 (1 token) and 0.261 against 0.335 (4), but
 // IQ3_XXS's were slower from 3 tokens (0.263 against 0.227) and IQ2_S's at every count (0.174 against 0.146 at 1)

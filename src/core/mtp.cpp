@@ -724,7 +724,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         } else
         for (int t = 0; t < T; ++t) {
             bf16_gemv_fp32_mmvf(mixed_ + t * N, bf16("mlp.gate.weight"), logits_ + t * g.n_expert, (int) N, (int) g.n_expert, cs);
-            if (native_router_enabled()) native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
+            if (native_router_enabled() && g.n_expert == 512 && K == 10)
+                native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }
         moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
@@ -1034,7 +1035,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (!mtp_catchup_all()) T = a + 1;
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
     if (!capture_round(T, cp, err)) return false;
-    const int max_steps = std::min(max_t_ - 1, max_drafts_);
+    // Draft j writes its K/V at cell p + a + j, and the K/V ends at max_cells (its page table has no page past it):
+    // near the context's end the round drafts only the cells that exist
+    const int max_steps = (int) std::min<int64_t>(std::min(max_t_ - 1, max_drafts_), st_.max_cells - (p + a));
     for (int j = 1; j < max_steps; ++j)
         if (!capture_step(j, cp, err)) return false;
     const Clock::time_point t0 = Clock::now();

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # .claude/skills/release/scripts/bench.sh - a release's speed table on one GPU: the release and upstream's latest
-# release, IQ3_XXS, the six tiers of bench/results/2026-10-04-speed-matrix (1K to 262K) with what setup writes for
+# release, IQ3_XXS, the six tiers of the 2026-10-04-speed-matrix record (1K to 262K) with what setup writes for
 # each context (images off), 256 greedy tokens, each run a new process.
 #
 #   XE="CMD..." UP="CMD..." DATA=DIR IDS=DIR .claude/skills/release/scripts/bench.sh OUT GPU
@@ -10,7 +10,7 @@
 # XE and UP: the command that starts each engine (its strata binary, or a wrapper that runs it in its container);
 # the generate options are appended.  XE_PROFILE and UP_PROFILE: each engine's shipped expert profile (its
 # data/expert-profile.bin).  DATA: the data folder (packs/qwen-iq3_xxs, models/...IQ3_XXS-0000N-of-00002.gguf,
-# mtp/rt).  IDS: the prompts of the speed-matrix record's prompts.py.  ROUNDS (default 2): runs per arm and tier.
+# mtp/rt).  IDS: the prompts of prompts.py beside this script.  ROUNDS (default 2): runs per arm and tier.
 # OUT/runs/GPU-ARM-TIER-ROUND.txt gets each log; one discarded warm-up per arm first (JIT); the arms alternate,
 # the first arm changing from round to round.  bench-collect.py OUT reads them.
 # upstream plainly at SLOW tok/s or less (default 10) is stopped mid-run and not run again in that tier: its prompt

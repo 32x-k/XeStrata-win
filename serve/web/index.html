@@ -9,6 +9,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>XeStrata</title>
+<link rel="icon" href="web/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="web/tokens.css">
 <link rel="stylesheet" href="web/components.css">
 <link rel="stylesheet" href="web/app.css">
@@ -127,12 +128,24 @@ SPDX-License-Identifier: LGPL-3.0-or-later
           <div class="table-wrap" id="req-wrap">
             <table class="st-table">
               <thead><tr><th>Time</th><th>Status</th><th class="num">Prompt</th><th class="num">Reused</th><th class="num">Output</th>
-                <th class="num">Tok/s</th><th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM. Experts the GPU read over PCIe (--pcie-frac) are not counted in it; their share of all routed experts is shown after it (+N% PCIe)">VRAM hit rate</th><th class="num">Duration</th></tr></thead>
-              <tbody id="req-body"><tr><td colspan="8" class="muted">No requests yet</td></tr></tbody>
+                <th class="num" title="New prompt tokens per second, excluding reused cache tokens (engine prompt time)">Prefill t/s</th><th class="num">Decode t/s</th><th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM. Experts the GPU read over PCIe (--pcie-frac) are not counted in it; their share of all routed experts is shown after it (+N% PCIe)">VRAM hit rate</th><th class="num">Duration</th></tr></thead>
+              <tbody id="req-body"><tr><td colspan="9" class="muted">No requests yet</td></tr></tbody>
             </table>
           </div>
           <p class="muted req-totals" id="req-totals"></p>
         </div>
+      </div>
+
+      <div class="st-card cc-card" id="cc-card">
+        <div class="req-head"><span class="card-title">Conversation cache</span><span class="muted small" id="cc-sum"></span></div>
+        <div class="cc-bars" id="cc-bars" hidden>
+          <div><div class="bar-row"><span>Parked conversations</span><span class="muted" id="cc-slots-text">&ndash;</span></div>
+            <div class="st-progress"><div class="st-progress__bar" id="cc-slots-bar" style="width:0%"></div></div></div>
+          <div><div class="bar-row"><span>Their memory (RAM)</span><span class="muted" id="cc-mem-text">&ndash;</span></div>
+            <div class="st-progress"><div class="st-progress__bar" id="cc-mem-bar" style="width:0%"></div></div></div>
+        </div>
+        <dl class="facts" id="cc-facts"></dl>
+        <p class="muted small cc-note" id="cc-note"></p>
       </div>
 
       <div class="st-card mcp-card" id="mcp-card" hidden>

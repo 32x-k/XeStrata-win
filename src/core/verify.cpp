@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <atomic>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <chrono>
@@ -56,6 +57,74 @@ constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
+// STRATA_ROUTE_RESIDENT=<margin logits> (+ STRATA_ROUTE_RESIDENT_RANKS=lo-hi, default 6-9; upstream 5df35dcb, 8bf203f5):
+// residency-biased routing (opt-in, changes the output).
+struct RouteResidentCfg;
+RouteResidentCfg& route_resident_cfg();
+struct RouteResidentCfg {
+    float margin = 0.0f;
+    int lo = 6, hi = 9;
+    // #1578: one counter block per GPU.  A layer split inits a verifier per stage; the Verifier asks for its device's
+    // block in init (outside graph capture) and keeps the pointer, so a launch never picks the block by the host
+    // thread's current device.  nullptr (the allocation failed): the kernel runs without counters.
+    std::mutex mu;
+    std::map<int, unsigned long long*> blocks;
+    unsigned long long* stats_on(int dev) {
+        if (margin <= 0.0f || dev < 0) return nullptr;
+        std::lock_guard<std::mutex> lk(mu);
+        const auto it = blocks.find(dev);
+        if (it != blocks.end()) return it->second;
+        unsigned long long* p = nullptr;
+        {
+            const OnDevice on(dev);
+            if (!strata::gpu::alloc_device(&p, 8 * sizeof(unsigned long long)) ||
+                !strata::gpu::memset(p, 0, 8 * sizeof(unsigned long long))) {
+                if (p != nullptr) strata::gpu::free(p);
+                p = nullptr;
+                std::fprintf(stderr, "route-resident: the counters could not be allocated on GPU %d; it runs without them\n", dev);
+            }
+        }
+        if (blocks.empty()) {
+            std::atexit([] {
+                RouteResidentCfg& c = route_resident_cfg();
+                for (const auto& kv : c.blocks) {
+                    if (kv.second == nullptr) continue;
+                    unsigned long long h[8] = {};
+                    const OnDevice on(kv.first);
+                    if (!strata::gpu::device_sync() || !strata::gpu::copy(h, kv.second, sizeof(h))) continue;
+                    char who[32] = "";
+                    if (c.blocks.size() > 1) std::snprintf(who, sizeof who, " (GPU %d)", kv.first);
+                    std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T>8 (prompt reads): tail_nonres=%llu "
+                                         "swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
+                                 who, c.margin, c.lo, c.hi, h[0], h[1], h[0] ? 100.0 * (double) h[1] / (double) h[0] : 0.0, h[2], h[3]);
+                    std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T<=8 (decode): tail_nonres=%llu "
+                                         "swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
+                                 who, c.margin, c.lo, c.hi, h[4], h[5], h[4] ? 100.0 * (double) h[5] / (double) h[4] : 0.0, h[6], h[7]);
+                }
+            });
+        }
+        blocks[dev] = p;
+        return p;
+    }
+};
+RouteResidentCfg& route_resident_cfg() {
+    static RouteResidentCfg c;
+    static const bool parsed = [] {
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) c.margin = (float) std::strtod(v, nullptr);
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) {   // lo-hi
+            char* end = nullptr;
+            const long lo = std::strtol(v, &end, 10);
+            if (end != v && *end == '-') {
+                const char* h = end + 1;
+                const long hi = std::strtol(h, &end, 10);
+                if (end != h) { c.lo = (int) lo; c.hi = (int) hi; }
+            }
+        }
+        return true;
+    }();
+    (void) parsed;
+    return c;
+}
 // A one-token window always keeps its token, so its graph advances the GDN conv history and recurrence state itself
 // (its indexer append and PLE history are final already) and Verifier::commit launches no commit graph after it
 // (upstream 352cad8f): the draft round then runs alone instead of beside the commit's kernels, which read and write
@@ -164,6 +233,7 @@ Verifier::~Verifier() {
         if (kv.second) strata::gpu::graph_destroy(kv.second);
     if (arena_b_) strata::gpu::free(arena_b_);
     if (h_commitb_) strata::gpu::free(h_commitb_);
+    if (logit_bias_device_) strata::gpu::free(logit_bias_device_);
     if (cs_ && cs_ != ext_stream_) strata::gpu::stream_destroy(cs_);   // set_stream: the stage's stream, shared
     if (ev_done_) strata::gpu::event_destroy(ev_done_);
     if (ev_commit_) strata::gpu::event_destroy(ev_commit_);
@@ -193,11 +263,31 @@ void Verifier::tune_device(const ModelGeometry& g, void* stream) {
         strata::kernels::bf16_gemv_fp32_mmvf_multi_tune(g.n_embd, n_out, stream);
 }
 
+bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) {
+    if (next_ && !next_->set_logit_bias(bias, err)) return false;
+    if (le_ < g_->n_layers) return true;
+    const OnDevice on_device(device_);
+    if (!bias.empty() && bias.size() != (size_t) n_vocab_) {
+        err = "logit_bias vocabulary size mismatch"; return false;
+    }
+    if (bias != logit_bias_host_ && !bias.empty()) {
+        const size_t bytes = bias.size() * sizeof(float);
+        if ((!logit_bias_device_ && !strata::gpu::alloc_device(&logit_bias_device_, bytes)) ||
+            !strata::gpu::copy(logit_bias_device_, bias.data(), bytes)) {
+            err = "cannot upload logit_bias"; return false;
+        }
+    }
+    logit_bias_host_ = bias;
+    sampling_.logit_bias = bias.empty() ? nullptr : logit_bias_device_;
+    return true;
+}
+
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
     g_diag_verifier.store(this);
     diag_verify_fn().store(&diag_active_verifier);
     device_ = current_device();   // a layer split's stage on another GPU: init runs on it (OnDevice)
+    rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -984,6 +1074,22 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
+        // STRATA_ROUTE_PRIOR=lambda (upstream 2de9ae06, opt-in, changes the output): the top-10 picked again with a
+        // logit bonus for the resident experts; the weights stay the router's (router.cpp)
+        static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::strtod(v, nullptr) : 0.0f; }();
+        if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+            try {
+                route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
+            } catch (const std::exception& e) { err = "verify route-prior: " + std::string(e.what()); return false; }
+        }
+        if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+            // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
+            try {
+                native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
+                                      route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
+                                      rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
+            } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
+        }
         if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -1580,7 +1686,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
+    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
@@ -2435,6 +2541,15 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
 
 int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
     if (!fl_active_ || fl_k_ >= fl_total_) return 1;
+    // Nothing rang yet and neither the dead-graph check nor the timeout below is due: return before the device switch
+    // (upstream 6b392641).  The pipelined loop asks both stages' windows this millions of times a second while they
+    // wait on their doorbells; upstream's host stalled inside one of those device switches with both stages waiting
+    // on it.  The same answer as the loop below gives.  (A pipelined window always rings: always_publish_ keeps the
+    // zero-doorbell graph off, see init.)
+    if (*(volatile uint32_t*) h_seq_ < (uint32_t) (fl_k_ + 1)) {
+        const double now = now_ms();
+        if (now - fl_flush_ms_ <= 2.0 && now - fl_since_ms_ <= 20000.0) return 0;
+    }
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -2518,7 +2633,7 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
         return true;
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    if (head_sampling_ && (sampled || hist_d_ != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
+    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) last_pos0_;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);

@@ -73,7 +73,8 @@ XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> python $S/
 XE="..." UP="..." XE_ROOT=... UP_ROOT=... XE_PROFILE=... UP_PROFILE=... DATA=<data> PY=<python> \
   python $S/bench_usage.py $o/IQ3_XXS <GPU>
 python $S/sync_collect.py $o/<file> xe-<commit> <tag>                         # matrix*.json and the tables
-python $S/judge.py --prompt-only B70 $o/IQ3_XXS ...                           # ALL PASS or FAIL <n>
+python $S/judge.py --prompt-only B70 --prev IQ3_XXS=<older record> $o/IQ3_XXS ... # ALL PASS or FAIL <n>
+A="..." B="..." PROFILE=... DATA=<data> IDS=<ids> python $S/ab_pair.py generate|serve|usage <out> <GPU>
 ```
 
 - The model is IQ3_XXS by default. On a PC with less RAM, `CONFIG=xestrata-<model>.json`, a model config setup wrote, measures both engines with that model's files and settings (its RAM budget, the calibration's results).
@@ -83,6 +84,8 @@ python $S/judge.py --prompt-only B70 $o/IQ3_XXS ...                           # 
 - generate makes both engines follow upstream's answer (`--spec-follow`), leaving the texts' difference out; serve has no such option.
 - To pass: in generate, and the first prefill's speed in serve and everyday use, XeStrata is at most 1% slower than upstream; the rest of serve and everyday use (the wait before a follow-up's answer, decode, the time to the first token) at most 5% worse.
 - The temperature: serve's `MODES` (default `greedy t07`; `t10` is temperature 1.0), everyday use's `TEMPERATURE` (default 0.7).
+- `--prev <file>=<folder>` compares with the previous XeStrata's record as well (the last merge's record, or a release's): per cell both have, the prefill speed at most 1% slower, the rest at most 5% worse. The B70's decode is compared too.
+- `ab_pair.py` runs XeStrata against itself in turns: A the base, B the candidate (a switch off and on, or the previous version and HEAD). With one seed they write one text unless the change alters the text. `judge.py <out>` judges B against A.
 - `--dry-run` prints the commands that would start the engines instead of running them.
 
 ## The release table

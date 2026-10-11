@@ -7,6 +7,7 @@
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/platform/aux_cpus.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 
@@ -69,6 +70,14 @@ constexpr int RING_MAX = 1024;          // the arrays; the ring itself is ring_s
 // STRATA_TEST_PAGEABLE=1 (upstream cfe09ab5) makes every pinned host allocation with a pageable fallback in
 // Prefill::init fail, so the fallbacks (what a container's memlock limit forces) run on a PC that can pin - for ASan /
 // MALLOC_CHECK_=3 runs.
+// #1454 (upstream 199fd1d5, 55dee8ed): `bo` shares `emb`'s storage (carve), which frees T * N floats per chunk.  The
+// planner keeps counting them by default, so the auto chunk and the borrowed cache slots (and with them the prompt
+// path's bits) stay as before; STRATA_EMB_REUSE_ACCOUNT=1 lets it use the saved bytes: a larger chunk or more borrowed
+// slots where VRAM is the limit (upstream, RTX 3060, IQ3_XXS: chunk 6400 -> 6656, prompt +3.9%).
+inline bool emb_reuse_account() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_EMB_REUSE_ACCOUNT"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 inline bool force_pageable() {
     static const bool v = [] { const char* e = std::getenv("STRATA_TEST_PAGEABLE"); return e != nullptr && e[0] == '1'; }();
     return v;
@@ -273,7 +282,15 @@ struct Stager {
             if (!strata::gpu::event_create(&dma_done[i])) return false;
         }
         device = strata::core::current_device();
-        for (int t = 0; t < nthreads; ++t) threads.emplace_back([this] { work(); });
+        for (int t = 0; t < nthreads; ++t)
+            threads.emplace_back([this] {
+                // --aux-cpus: the copy threads go to the spare CPUs with the other helpers; STRATA_AUX_STAGER=0 leaves them where
+                // they were created (a small spare set would then hold all of them: it limits the copy rate of a long read)
+                static const bool keep = [] { const char* v = std::getenv("STRATA_AUX_STAGER"); return v != nullptr && std::strtol(v, nullptr, 10) == 0; }();
+                if (keep) strata::aux_cpus::note_owned_thread();
+                else strata::aux_cpus::pin_current_thread();
+                work();
+            });
         return true;
     }
     ~Stager() {
@@ -444,6 +461,7 @@ struct Prefill::Impl {
     // writes (the tail of Dm, in Dm's row order), both in host memory; the pool's activations and jobs
     float *cpu_x = nullptr, *cpu_rows = nullptr;
     size_t cpu_x_n = 0, cpu_rows_n = 0;
+    bool cpu_dead = false;   // a pinned buffer of the share could not be had (host memory is short): the GPU does it all
     std::vector<uint8_t> cpu_nact;
     std::vector<strata::kernels::cpu::ActQ> cpu_actq;   // a Q2_0 layer's activations (the pool's Q2_0 kernels read ActQ)
     std::vector<strata::kernels::cpu::ExpertJobMulti> cpu_jobs;
@@ -453,6 +471,22 @@ struct Prefill::Impl {
     bool cpu_pend = false;
     double pend_cpu_ms = 0;
     int64_t pend_n_cpu = 0, pend_n_gpu = 0;
+    // ... and whether sharing pays at all (auto, upstream f2a3b946, #1282): an eligible layer's wall time per
+    // non-resident expert, from before its routing sync to its combine (events, two sets: a layer's start is recorded
+    // before the last one's is read); two adjacent layers of the two arms give a ratio (with / without), and the median
+    // of the last CPU_RATIOS decides.  Layers differ up to 8x in that cost, the same in every run, which is why adjacent
+    // layers are compared rather than a running mean per arm.
+    static constexpr int CPU_RATIOS = 5;
+    int64_t cpu_layers = 0;     // the eligible layers so far (the arms' schedule)
+    int64_t cpu_first_l = -1;   // the model's first eligible layer: 2x the others' cost in both arms, never read
+    strata::gpu::Event* cpu_wall[4] = {};
+    int pend_wall = 0, pend_set = 0, pend_l = 0;   // pend_wall 1: the last eligible layer ran without the share, 2: with
+    int64_t pend_wall_n = 0;
+    int last_arm = 0, last_l = 0;
+    double last_w = 0;
+    double cpu_ratio[CPU_RATIOS] = {};
+    int cpu_nratio = 0;
+    bool cpu_gate = false;   // the median ratio is below 1: the layers that share are the cheaper ones
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
     float* hand[2] = {};
@@ -513,6 +547,8 @@ void Prefill::release() {
     for (float* p : {impl_->cpu_x, impl_->cpu_rows})
         if (p) strata::gpu::free(p);
     for (strata::gpu::Event* e : impl_->cpu_ev)
+        if (e) strata::gpu::event_destroy(e);
+    for (strata::gpu::Event* e : impl_->cpu_wall)
         if (e) strata::gpu::event_destroy(e);
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) strata::gpu::event_destroy(impl_->copied[i]);
@@ -663,6 +699,20 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         bool files = false;
         for (int64_t l = 0; src != nullptr && !files && l < g.n_layers; ++l)
             for (int64_t e = 0; !files && e < g.n_expert; ++e) files = src->transient(l, e);
+        // #1353 (upstream 83a7dbc0): ... but a source answers transient() for every blob it copies out of the GGUF,
+        // including the ones whose pages are already in the page cache (a Q8 pack on a big-RAM box with a warm cache).
+        // Those copies are memcpy from RAM, where 32 threads and a 128-deep ring ran 4-7x slower than the defaults.  So
+        // ask the OS: the SSD profile only when fewer than 90% of a sample of the blobs' pages are resident (-1: it
+        // cannot tell, keep it).
+        if (files && !stv) {
+            const char* ev = std::getenv("STRATA_STAGER_SSD");   // 1 / 0: force the profile (A/B, support)
+            if (ev != nullptr && ev[0] != '\0') files = ev[0] != '0';
+            else if (const double warm = src->cached_share(256); warm >= 0.9) {
+                files = false;
+                std::fprintf(stderr, "prefill: the GGUF experts are %.0f%% in the page cache; the stager takes the RAM profile\n",
+                             warm * 100.0);
+            }
+        }
         const int threads = stv ? std::clamp((int) std::strtol(stv, nullptr, 10), 1, 32)
                           : files ? std::clamp(hw, 4, 32) : std::max(2, std::min(4, hw / 4));
         if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
@@ -722,7 +772,10 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.xn16 = o.take<uint16_t>(T * D, ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
     m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
-    m.mixed_h = o.take<uint16_t>(T * N, ok); m.bo = o.take<float>(T * N, ok);
+    m.mixed_h = o.take<uint16_t>(T * N, ok);
+    // the embedding rows are dead once gr_broadcast has read them on m.cs; the half outputs written into bo come after
+    // it on the same in-order queue (the GEMMs' too)
+    m.bo = m.emb;
     if (bf16x2_hc()) { m.xn16_lo = o.take<uint16_t>(T * D, ok); m.lo16_lo = o.take<uint16_t>(T * LR, ok); }
     if (bf16x2()) m.mixed_bf_lo = o.take<uint16_t>(T * N, ok);
     m.steps_dev = o.take<int32_t>(T * strata::kernels::kStepCount, ok);
@@ -1006,7 +1059,8 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     auto f = [&](size_t n) { o.take<float>(n, ok); };
     f(T * N); f(T * D); f(T * HC); o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
-    f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
+    f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok);
+    if (!emb_reuse_account()) f(T * N);   // bo: aliases emb in carve; still counted unless STRATA_EMB_REUSE_ACCOUNT=1
     if (bf16x2_hc()) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
     if (bf16x2()) o.take<uint16_t>(T * N, ok);
     o.take<int32_t>(T * strata::kernels::kStepCount, ok);
@@ -1233,6 +1287,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // tokens: 42 ms)
         if (ple_on && !ple_next.valid())
             ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c0, b = ple_buf] {
+                strata::aux_cpus::pin_current_thread();
                 return ple_gather(c0, b, ple_next_err);
             });
         bool ple_pending = ple_on;
@@ -1250,6 +1305,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             if (c0 + m.T < n) {
                 strata::gpu::event_sync(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
                 ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
+                    strata::aux_cpus::pin_current_thread();
                     return ple_gather(c1, b, ple_next_err);
                 });
             }
@@ -1712,20 +1768,62 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     m.ids_host.resize((size_t) T * K);
                     m.ids_host.from_device(m.ids, m.cs);
                     const strata::kernels::cpu::ExpertLayout& lay_c = strata::kernels::cpu::expert_layout();
-                    const bool cpu_maybe = cpu_pool_ != nullptr && cpu_share_on() && !stream_all && m.src != nullptr &&
-                                           lay_c.native && !lay_c.fmt.empty();
-                    if (cpu_maybe) {   // the MoE input, for the CPU's experts
+                    bool cpu_maybe = cpu_pool_ != nullptr && cpu_share_on() && !stream_all && m.src != nullptr && !m.cpu_dead &&
+                                     lay_c.native && !lay_c.fmt.empty();
+                    // The share's two pinned buffers are small (~50 MB) but are had mid-request, when the host may have
+                    // nothing left (upstream 04dbe561, 0.1.41 report: tight RAM, chats failing).  A buffer that cannot be
+                    // had ends the share for this engine - the GPU takes every expert, as with STRATA_PREFILL_CPU_SHARE=0
+                    // - instead of failing the request.
+                    auto cpu_share_off = [&](const char* what) {
+                        m.cpu_dead = true;
+                        cpu_maybe = false;
+                        std::fprintf(stderr, "prefill: the CPU share is off for this run: the host could not give %s "
+                                             "(RAM is short); the GPU streams every expert\n", what);
+                    };
+                    bool cpu_arm = true;     // auto: this layer may share (false: the arm without)
+                    int cpu_set = -1;        // auto: the wall events' set, -1 when not measured
+                    bool cpu_cold = false;   // auto: one-time costs in the window (no reading)
+                    // auto shares only while the layers that share cost less per non-resident expert than their
+                    // neighbours that do not.  #1282 (upstream, RX 7900 GRE + 5700X3D): every share lost, auto's 0.47 by
+                    // 4.5%, the host's issue time per streamed expert rising 107 -> 200 us with the CPU busy - a cost
+                    // g / (c + g) cannot see, as both sides are measured with the share on.  The first eligible layers
+                    // alternate, without first, until CPU_MIN_RATIOS ratios are in; then the cheaper arm, and every
+                    // CPU_PROBE-th layer the other one (a prime: the probes move across the layers from one chunk to the
+                    // next), so both stay measured.  Opt-in (STRATA_PREFILL_CPU_GATE=1): the arms without the share cost
+                    // more than the gate saved on XeStrata's GPUs, 1K IQ3_XXS prompts 844 -> 833 tok/s on a B70 and
+                    // 296 -> 283 on an RTX 4070 (2026-10-11, four interleaved rounds).
+                    static const bool cpu_gate_on = [] { const char* e = std::getenv("STRATA_PREFILL_CPU_GATE"); return e != nullptr && e[0] == '1'; }();
+                    if (cpu_maybe && cpu_share_env() < 0.0 && cpu_gate_on) {
+                        constexpr int64_t CPU_PROBE = 29;
+                        constexpr int CPU_MIN_RATIOS = 3;
+                        const int64_t i = m.cpu_layers++;
+                        cpu_arm = m.cpu_nratio < CPU_MIN_RATIOS ? (i & 1) != 0 : (i % CPU_PROBE == 0) != m.cpu_gate;
+                        if (m.cpu_first_l < 0) m.cpu_first_l = l;
+                        cpu_cold = l == m.cpu_first_l;
+                        if (m.cpu_wall[0] == nullptr)
+                            for (strata::gpu::Event*& e : m.cpu_wall)
+                                if (!strata::gpu::event_create(&e, true)) {
+                                    err = "prefill: CPU share events";
+                                    return false;
+                                }
+                        cpu_set = (int) (i & 1);
+                        strata::gpu::event_record(m.cpu_wall[(size_t) 2 * cpu_set], m.cs);
+                    }
+                    if (cpu_maybe && cpu_arm) {   // the MoE input, for the CPU's experts
                         const size_t want = (size_t) T * N;
                         if (m.cpu_x_n < want) {
+                            cpu_cold = true;
                             if (m.cpu_x) strata::gpu::free(m.cpu_x);
+                            m.cpu_x = nullptr;
                             m.cpu_x_n = 0;
                             if (!strata::gpu::alloc_host(&m.cpu_x, want * sizeof(float))) {
-                                err = "prefill: cannot allocate the CPU experts' activations";
-                                return false;
+                                m.cpu_x = nullptr;
+                                cpu_share_off("the activation buffer");
+                            } else {
+                                m.cpu_x_n = want;
                             }
-                            m.cpu_x_n = want;
                         }
-                        strata::gpu::copy_async(m.cpu_x, m.mixed, want * sizeof(float), m.cs);
+                        if (cpu_maybe) strata::gpu::copy_async(m.cpu_x, m.mixed, want * sizeof(float), m.cs);
                     }
                     strata::gpu::stream_sync(m.cs);
                     pt.fold();
@@ -1740,6 +1838,45 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             m.cpu_share_now = std::clamp(m.cpu_g_ms / (m.cpu_c_ms + m.cpu_g_ms), 0.05, 0.9);
                         }
                     }
+                    if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most MAXT tokens' rows)
+                        const size_t cap = (size_t) std::min<int64_t>(T * K, (int64_t) strata::kernels::cpu::MAXT * m.g->n_expert) * N;
+                        if (m.cpu_rows_n < cap) {
+                            cpu_cold = true;
+                            if (m.cpu_rows) strata::gpu::free(m.cpu_rows);
+                            m.cpu_rows = nullptr;
+                            m.cpu_rows_n = 0;
+                            if (!strata::gpu::alloc_host(&m.cpu_rows, cap * sizeof(float))) {
+                                m.cpu_rows = nullptr;
+                                cpu_share_off("the rows buffer");
+                            } else {
+                                m.cpu_rows_n = cap;
+                            }
+                        }
+                    }
+                    if (m.pend_wall) {   // the last eligible layer's wall, and its ratio to the one before it
+                        float w_ms = 0;
+                        if (strata::gpu::event_elapsed_ms(&w_ms, m.cpu_wall[(size_t) 2 * m.pend_set], m.cpu_wall[(size_t) 2 * m.pend_set + 1])) {
+                            const double w = w_ms / (double) m.pend_wall_n;
+                            if (m.last_arm != 0 && m.last_arm != m.pend_wall && m.pend_l > m.last_l) {   // same chunk
+                                std::rotate(m.cpu_ratio, m.cpu_ratio + 1, m.cpu_ratio + Impl::CPU_RATIOS);
+                                m.cpu_ratio[Impl::CPU_RATIOS - 1] = m.pend_wall == 2 ? w / m.last_w : m.last_w / w;
+                                m.cpu_nratio = std::min(m.cpu_nratio + 1, Impl::CPU_RATIOS);
+                                double v[Impl::CPU_RATIOS];
+                                std::copy(m.cpu_ratio + Impl::CPU_RATIOS - m.cpu_nratio, m.cpu_ratio + Impl::CPU_RATIOS, v);
+                                std::nth_element(v, v + m.cpu_nratio / 2, v + m.cpu_nratio);   // even: the upper one
+                                m.cpu_gate = v[m.cpu_nratio / 2] < 1.0;
+                            }
+                            // debug: STRATA_DBG_CPU_GATE=1 prints each reading and what the next layers do
+                            if (static const bool dbg = std::getenv("STRATA_DBG_CPU_GATE") != nullptr; dbg)
+                                std::fprintf(stderr, "cpu gate: layer %d %s, %lld non-resident, %.2f ms (%.4f a expert) -> %s\n",
+                                             m.pend_l, m.pend_wall == 2 ? "shared" : "not shared", (long long) m.pend_wall_n,
+                                             w_ms, w, m.cpu_gate ? "share" : "do not share");
+                            m.last_arm = m.pend_wall;
+                            m.last_l = m.pend_l;
+                            m.last_w = w;
+                        }
+                        m.pend_wall = 0;
+                    }
                     std::fill(m.cnt.begin(), m.cnt.end(), 0);
                     for (int64_t i = 0; i < T * K; ++i) {
                         const int32_t e = m.ids_host[(size_t) i];
@@ -1750,6 +1887,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                     // set_cpu_pool: the experts the CPU computes this layer (their rows last: [T * K - rows_cpu, T * K))
                     std::vector<char> on_cpu;
+                    std::vector<const uint8_t*> cpu_blob;   // their blobs, taken here (the CPU thread calls no ExpertSource)
                     int64_t rows_cpu = 0, n_cpu = 0, n_stream = 0;
                     if (cpu_maybe) {
                         std::vector<std::pair<int32_t, int32_t>> cand;   // (tokens, expert)
@@ -1757,18 +1895,27 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             const int32_t c = m.cnt[(size_t) e];
                             if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0)) continue;
                             ++n_stream;
-                            if (c <= strata::kernels::cpu::MAXT && m.src->pinned(l, e)) cand.emplace_back(c, e);
+                            // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
+                            // short-lived buffer (the arena's unpinned part, the mapped files' pages; upstream 92bce20e)
+                            if (c <= strata::kernels::cpu::MAXT && (m.src->pinned(l, e) || !m.src->transient(l, e)))
+                                cand.emplace_back(c, e);
                         }
                         std::sort(cand.begin(), cand.end());
-                        const double share = cpu_share_env() >= 0.0 ? cpu_share_env() : m.cpu_share_now;
+                        const double share = cpu_share_env() >= 0.0 ? cpu_share_env() : cpu_arm ? m.cpu_share_now : 0.0;
                         const size_t take = std::min(cand.size(), (size_t) std::llround(share * (double) n_stream));
-                        if (take > 0) {
-                            on_cpu.assign((size_t) m.g->n_expert, 0);
-                            for (size_t i = 0; i < take; ++i) {
-                                on_cpu[(size_t) cand[i].second] = 1;
-                                rows_cpu += cand[i].first;
+                        // an expert without a blob stays on the GPU
+                        for (size_t i = 0; i < cand.size() && n_cpu < (int64_t) take; ++i) {
+                            const int32_t e = cand[i].second;
+                            const uint8_t* b = m.src->blob(l, e);
+                            if (b == nullptr) continue;
+                            if (on_cpu.empty()) {
+                                on_cpu.assign((size_t) m.g->n_expert, 0);
+                                cpu_blob.assign((size_t) m.g->n_expert, nullptr);
                             }
-                            n_cpu = (int64_t) take;
+                            on_cpu[(size_t) e] = 1;
+                            cpu_blob[(size_t) e] = b;
+                            rows_cpu += cand[i].first;
+                            ++n_cpu;
                         }
                     }
                     auto gpu_side = [&](int32_t e) { return on_cpu.empty() || !on_cpu[(size_t) e]; };
@@ -1822,17 +1969,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     std::future<bool> cpu_fut;
                     double cpu_ms = 0;
                     if (rows_cpu > 0) {
-                        const size_t want = (size_t) rows_cpu * N;
-                        if (m.cpu_rows_n < want) {
-                            if (m.cpu_rows) strata::gpu::free(m.cpu_rows);
-                            m.cpu_rows_n = 0;
-                            const size_t cap_rows = (size_t) rows_cpu * 2;   // headroom: few reallocations
-                            if (!strata::gpu::alloc_host(&m.cpu_rows, cap_rows * N * sizeof(float))) {
-                                err = "prefill: cannot allocate the CPU experts' rows";
-                                return false;
-                            }
-                            m.cpu_rows_n = cap_rows * N;
-                        }
+                        // (the rows buffer was had at its largest after the routing sync)
                         const strata::kernels::cpu::NativeFmt& cf = lay.fmt[(size_t) l];
                         const bool q2 = cf.gu_type == 42;   // a native Q2_0 layer: the pool's Q2_0 kernels read ActQ
                         constexpr size_t AB = strata::kernels::cpu::kNativeActBytes;
@@ -1840,8 +1977,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         for (int32_t e = 0; e < m.g->n_expert; ++e) {
                             if (!on_cpu[(size_t) e]) continue;
                             strata::kernels::cpu::ExpertJobMulti j;
-                            j.blob = m.src->blob(l, e);
-                            if (j.blob == nullptr) { err = "prefill: a CPU expert has no blob"; return false; }
+                            j.blob = cpu_blob[(size_t) e];
                             j.nt = m.cnt[(size_t) e];
                             for (int r = 0; r < j.nt; ++r)   // the activations are set on the thread
                                 j.out[r] = m.cpu_rows + (size_t) ((int64_t) m.off[(size_t) e] + r - rows_gpu) * N;
@@ -2206,6 +2342,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                          "%lld streamed experts (share %.2f)\n", (long long) n_cpu, (long long) n_stream,
                                          stats_.cpu_share);
                         }
+                    }
+                    // no reading from a layer the share could not change (nothing taken) or with one-time costs
+                    if (cpu_set >= 0 && n_stream > 0 && (!cpu_arm || n_cpu > 0) && !cpu_cold) {
+                        strata::gpu::event_record(m.cpu_wall[(size_t) 2 * cpu_set + 1], m.cs);
+                        m.pend_wall = cpu_arm ? 2 : 1;
+                        m.pend_set = cpu_set;
+                        m.pend_l = (int) l;
+                        m.pend_wall_n = n_stream;
                     }
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values

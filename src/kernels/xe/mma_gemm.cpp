@@ -10,7 +10,7 @@
 // there; one that crosses the last row or column goes out through local memory, row by row, so the rows and columns
 // past the last are not written (straight stores made the A380's products 0-4% faster than all through local memory).
 //
-// On the A380 (Xe-HPG; bench/results/2026-10-04-dg2-dp4a) a 4096 x 2560 x 2560 FP16 product took 52 ms with W read
+// On the A380 (Xe-HPG; the 2026-10-04-dg2-dp4a record) a 4096 x 2560 x 2560 FP16 product took 52 ms with W read
 // from global memory by every sub-group; with W in local memory 116 (column-major), 33 (transposed), 23 (VNNI-packed),
 // 21 (neighbouring lanes storing side by side), 20 (two buffers), 16 (4 x 4 tiles a sub-group in the large register
 // file; in the default 128 registers they spilled), 14.2 (a fragment's rows contiguous) and 13.6 (16-byte stores).
@@ -19,6 +19,8 @@
 #include "strata/kernels/matrix_report.hpp"
 #include "device_target.hpp"
 #include "strata/core/per_device.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_mma_gemm
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
@@ -43,7 +45,7 @@ using bf16_t = sycl::ext::oneapi::bfloat16;
 // code there; xmx_gemm.cpp's kernels are the fast ones on Xe2), Intel Xe-HPG's 8 x 8 x 16 on 8 (the Arc A series, whose
 // runtime refuses xmx_gemm's prefetches and checked loads) and NVIDIA's 16 x 16 x 16 on 32 (a warp); the work-group's
 // layout for a product (dense) and for the experts' groups (grouped); packed: B in Intel's VNNI layout.  Xe-HPG's
-// layouts from the A380's timings (bench/results/2026-10-04-dg2-dp4a): a product 4 x 8 sub-groups of 4 x 4 tiles in the
+// layouts from the A380's timings (the 2026-10-04-dg2-dp4a record): a product 4 x 8 sub-groups of 4 x 4 tiles in the
 // large register file (13.6 ms for the product above; 8 x 4: 14.4, 4 x 4: 15.4; 2 x 2 tiles in 128 registers, 8 x 8
 // sub-groups: 19 before the contiguous fragments), the groups of 160 rows 2 x 8 of 2 x 2 (6.8 ms for 16 experts of
 // 1280 x 2560; none of the large-register ones was faster).  The others untuned.

@@ -29,6 +29,7 @@
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstddef>
@@ -38,6 +39,7 @@
 #include <unordered_map>
 #include <utility>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 namespace strata::kernels::cpu {
@@ -158,6 +160,11 @@ public:
     /// stays valid for the layer it was asked in and the next one or two; a consumer that keeps a blob longer (the
     /// prompt path's stager queues a whole chunk) copies it with `copy_blob` instead.
     virtual bool transient(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
+    /// #1353 (upstream 83a7dbc0): of the bytes `transient` experts would be copied from, the share whose pages are in
+    /// RAM right now (a GGUF read in place whose page cache is warm), measured on a sample of up to `samples` experts;
+    /// -1 when this source cannot tell (not a file source, or no residency query on this OS).  The prompt path's stager
+    /// uses it to pick the SSD profile (many threads, a deep ring) only for blobs that really are page faults on a disk.
+    virtual double cached_share(int64_t samples) const { (void) samples; return -1.0; }
     /// A layer split: makes the blobs copy fast to engine device `device` as well (see PinnedArena::register_on).
     /// True when there is nothing to do; false (and `err`) when the device refuses, the copies then being slower.
     virtual bool register_on(int device, std::string& err) { (void) device; (void) err; return true; }
@@ -336,6 +343,10 @@ struct ExpertDispatch {
     const PcieSplitTimes* pcie_split = nullptr;
     bool pcie_overlap = false;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
+    /// STRATA_ROUTE_TAIL_SKIP=R: entries skipped (a missed expert every token of the window routes only at rank >= R)
+    /// and the distinct experts behind them (neither copied nor computed)
+    int64_t tail_skipped = 0;
+    int64_t tail_experts = 0;
     /// #588: routed (token, expert) entries the GPU computed from outside its cache in verify windows: read over PCIe
     /// (--pcie-frac, kind 1) or on another GPU (kind 2).  In neither cache_hits nor cache_refused.
     int64_t offload_entries = 0;
@@ -387,6 +398,9 @@ bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, doub
 /// lost on the B70 with the VRAM of a small card); else 0.
 int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h);
 
+/// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
+int tail_skip_rank();
+void set_tail_skip_rank(int r);
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out);
 
@@ -537,6 +551,7 @@ public:
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     bool pcie_layer(int64_t layer) const override;
     bool transient(int64_t layer, int64_t expert) const override;
+    double cached_share(int64_t samples) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     /// CS-T: advances the assembled blobs' age (see staged_blob).
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
@@ -607,6 +622,22 @@ private:
     uint64_t mapped_bytes_ = 0;
     std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
     void* complement_arena_ = nullptr;
+    /// The complement in page-locked parts when one host allocation of it was refused: [start, end) of the offsets.
+    struct ComplementChunk { uint64_t start, end; uint8_t* host; const uint8_t* device; };
+    std::vector<ComplementChunk> complement_chunks_;
+    static const ComplementChunk* chunk_of(const std::vector<ComplementChunk>& chunks, uint64_t offset) {
+        auto it = std::upper_bound(chunks.begin(), chunks.end(), offset,
+                                   [](uint64_t o, const ComplementChunk& c) { return o < c.start; });
+        return &*(it - 1);
+    }
+    static uint8_t* chunk_at(const std::vector<ComplementChunk>& chunks, uint64_t offset) {
+        const ComplementChunk* c = chunk_of(chunks, offset);
+        return c->host + (size_t) (offset - c->start);
+    }
+    uint8_t* complement_at(uint64_t offset) const {
+        return complement_chunks_.empty() ? (uint8_t*) complement_host_ + (size_t) offset
+                                          : chunk_at(complement_chunks_, offset);
+    }
     const uint8_t* complement_host_ = nullptr;
     const uint8_t* complement_device_ = nullptr;
     uint64_t complement_bytes_ = 0;

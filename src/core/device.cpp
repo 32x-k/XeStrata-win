@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU core_device
+#include "strata/kernels/device_arch_tag.hpp"
 
 
 #include <algorithm>
@@ -191,7 +193,7 @@ Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), d
 // A timestamp (submit_profiling_tag, the timing event's record) whose event is still held costs the next wait about
 // 65 us on the B70 with Level Zero (the prompt path holds 384, its streamed ring's: 25 ms on each layer's sync, the
 // prompt at 1,248 against 1,594 tok/s with barriers) and about 2 us on the RTX 4070 with CUDA, where the prompt reads
-// 1% faster with timestamps than with barriers (bench/results/2026-10-09-xe-event-record).  So the wait after 64 held
+// 1% faster with timestamps than with barriers (the 2026-10-09-xe-event-record record).  So the wait after 64 held
 // timestamps is timed on a queue of its own, and events without timing are barriers where it is above 20 us each.
 // STRATA_EVENT_MARK=tag or barrier chooses instead.
 bool Runtime::measure_marks() {

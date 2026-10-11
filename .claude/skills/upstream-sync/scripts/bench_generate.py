@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """The generate table of an upstream merge on one GPU: XeStrata and upstream's release, IQ3_XXS by default, the
-tiers of bench/results/2026-10-04-speed-matrix and 192K (1K to 262K) with what setup writes for each context (images
+tiers of the 2026-10-04-speed-matrix record and 192K (1K to 262K) with what setup writes for each context (images
 off), 256 greedy tokens, each run a new process.  The runs are tools/bench_core.py's (ab_generate), which setup's
 --bench makes too.
 

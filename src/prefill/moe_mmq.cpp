@@ -5,6 +5,8 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/iq_mmq.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU prefill_moe_mmq
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <sycl/sycl.hpp>
 

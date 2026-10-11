@@ -23,6 +23,8 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/logit_bias.hpp"
+#include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -33,6 +35,7 @@
 #include "strata/core/weights.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -55,6 +58,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/share_rules.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
@@ -71,6 +75,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <filesystem>
 #include <cerrno>
 
@@ -256,6 +262,7 @@ struct Options {
     std::string native_preset;
     /// Plan v0.3 P2: how the n-gram table is read. Direct (default) = unbuffered SSD reads, table never in RAM.
     std::string ple_io = "direct";
+    bool ple_io_explicit = false;      ///< --ple-io was given: the engine only warns when direct measures slow
     /// The token embedding from this GGUF instead of --native's (tools/embd_bf16_pack.py: BF16 as shipped)
     std::string embd_gguf;
     int64_t ple_row_cache = 1 << 20;   ///< bounded row cache (rows of 90 B); 0 disables
@@ -295,6 +302,8 @@ struct Options {
     bool graph_only = false;
     bool gpu_only_full = false;   ///< R0.3: pre + post + head, the true per-token GPU floor
     int pool_workers = 0;         ///< R2.2: 0 = "all physical cores minus the host's"; >0 overrides
+    /// --aux-cpus off|auto|LIST (STRATA_AUX_CPUS): where the non-pool, non-host threads run (strata/platform/aux_cpus.hpp)
+    std::string aux_cpus;
     int pool_tasks = 0;           ///< Batched CPU expert tasks per phase; 0 keeps the existing policy
     /// R2.2's first half, as an A/B arm.  **ON by default**, because the measurement that justifies it is the
     /// pool's own drain: 33.7 GB/s against 5/6 x 44.14 = 36.8 for five workers, on a machine whose sixth core
@@ -451,6 +460,10 @@ struct Options {
     int64_t conversation_cache_mib = 0;
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
+    /// --serve: park only conversations of at least this many tokens.  Every parked conversation costs one of
+    /// conversation_cache_slots whatever its length, so without it a client that interleaves short side requests
+    /// with one long conversation evicts the long one (oldest first).  0 = park every conversation.
+    int64_t conversation_cache_min_tokens = 0;
     /// --serve: write parked conversations to this folder (when the RAM cache pushes one out, and at QUIT) and
     /// read them back after a restart; empty = off.  Checkpoints per conversation (the deepest, the chain's root,
     /// then the most recently used), the folder's budget, and the age after its last use at which a file goes.
@@ -459,8 +472,12 @@ struct Options {
     int64_t conversation_save_mib = 16384;
     int64_t conversation_save_hours = 48;
     bool conversation_save_compress = false;   // the floating-point parts through c-blosc2 (built only when found)
+    /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
+    /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
+    int64_t memory_limit_mib = -1;
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
+    bool session_save_reclaim = false;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
@@ -593,8 +610,13 @@ void usage() {
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
-                 "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
-                 "                       session file (default 2560)\n"
+                 "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
+                 "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
+                 "  --memory-limit-mib N  --serve: the total RAM (MiB) this engine's container or cgroup may use, when\n"
+                 "                       the container cannot see its real limit (also STRATA_MEMORY_LIMIT_MIB; the flag\n"
+                 "                       wins; 0 = none). Parking and session save/restore keep their floor under it\n"
+                 "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens, so\n"
+                 "                       short side requests do not take the slots a long one needs (default 0 = park any)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --conversation-save DIR  --serve: also keep parked conversations in DIR across restarts (default off;\n"
                  "                       needs --conversation-cache-mib)\n"
@@ -603,6 +625,7 @@ void usage() {
                  "  --conversation-save-hours N  --serve: delete a file N hours after its last use (default 48)\n"
                  "  --conversation-save-compress  --serve: compress the files' floating-point parts (c-blosc2 ZSTD;\n"
                  "                       10-15%% smaller; only in a build that found libblosc2)\n"
+                 "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
                  "  --prompt-cache-tail  --serve, single GPU: one extra checkpoint near the prompt's end, at an existing\n"
                  "                       chunk boundary (default off; requires --prompt-cache and --prompt-cache-every > 0)\n"
@@ -710,6 +733,13 @@ void usage() {
                  "  --pool-workers N     R2.2: CPU expert pool worker count.  Default 0 = every physical core\n"
                  "                       except the one the host loop spins on.  A sweep is how the pool's\n"
                  "                       deviation from `cpu_s2` is attributed.\n"
+                 "  --aux-cpus SET       Where the threads that are neither pool workers nor the host thread run (the\n"
+                 "                       adaptive tier's job thread, the prefill helpers, the GPU runtime's threads, ...):\n"
+                 "                       off (the default: wherever they were created), auto (the SMT siblings of the host's\n"
+                 "                       core, then physical cores with no worker; never a CPU that shares a core with a\n"
+                 "                       worker; nothing is done when none is spare) or a CPU list such as 24,26 (Linux; the\n"
+                 "                       host's and the workers' CPUs are dropped from it).  Moves threads only, never a\n"
+                 "                       result.  STRATA_AUX_CPUS sets it too; a request's strata_tune aux_cpus=0|1 beats it.\n"
                  "  --pool-tasks N       Batched CPU expert tasks per GU/Down phase (0..4096). Default 0 =\n"
                  "                       3 per participating thread; positive counts are capped by row count.\n"
                  "  --mmap-experts       the low-RAM mode: the experts from the files through the OS page cache\n"
@@ -890,6 +920,13 @@ struct GpuStage {
     int32_t* mrope = nullptr;                            ///< --vision: the image-position table on its device
 };
 
+// what a refusal on the RAM guard says it had: "900 MiB available, source cgroup" (the smallest of MemAvailable, the
+// cgroup limits above the engine and --memory-limit-mib; see strata/core/conversation_memory.hpp)
+static std::string ram_note(const std::optional<strata::core::HostMemoryReading>& mem) {
+    if (!mem) return "RAM telemetry unavailable";
+    return std::to_string(mem->available >> 20) + " MiB available, source " + strata::core::memory_source_name(mem->source);
+}
+
 // ---- issue #31: what the watchdog prints before it stops a stalled engine
 struct MemSample {
     unsigned long long faults = 0, rss_mib = 0, avail_mib = 0, commit_mib = 0;
@@ -923,6 +960,36 @@ MemSample mem_sample() {
 }
 
 // the stage the watchdog names: "<where> <detail>", and the prompt chunk a batched read is in (upstream 9631c96)
+// upstream #1407: the file tier's activity as the OS counts it (Linux: major page faults and bytes read from storage). The
+// watchdog treats a growing count as "the step is slow, not stuck": a prompt layer whose experts are re-read from the
+// pack (low RAM, mmap experts) can take minutes while the heartbeat stands still. Zero where unavailable.
+static uint64_t file_tier_activity() {
+#if defined(__linux__)
+    uint64_t total = 0;
+    if (FILE* f = std::fopen("/proc/self/stat", "r")) {
+        char buf[1024] = {};
+        const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+        std::fclose(f);
+        const char* p = std::strrchr(buf, ')');
+        if (p != nullptr && n > 0) {
+            // after "(comm)": state ppid pgrp session tty tpgid flags minflt cminflt majflt
+            unsigned long long majflt = 0;
+            if (std::sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %llu", &majflt) == 1) total += majflt;
+        }
+    }
+    if (FILE* f = std::fopen("/proc/self/io", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), f) != nullptr) {
+            unsigned long long v = 0;
+            if (std::sscanf(line, "read_bytes: %llu", &v) == 1) total += v >> 20;   // MiB
+        }
+        std::fclose(f);
+    }
+    return total;
+#else
+    return 0;
+#endif
+}
 std::string stage_text() {
     const strata::core::Progress& p = strata::core::progress();
     std::string s = std::string(p.where.load()) + " " + std::to_string((long long) p.detail.load());
@@ -955,6 +1022,53 @@ void pl_diag_print(std::FILE* f) {
             if (d.v[st][par] != nullptr) d.v[st][par]->diag_pipelined(f, names[st][par]);
 }
 
+// upstream #605: whether `path` is on a rotational disk (1), not (0) or unknown (-1), from sysfs; `dev` is the disk's name
+int on_rotational_disk(const std::string& path, std::string& dev) {
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0) return -1;
+    char sys[64];
+    std::snprintf(sys, sizeof sys, "/sys/dev/block/%u:%u", (unsigned) major(st.st_dev), (unsigned) minor(st.st_dev));
+    std::error_code ec;
+    std::filesystem::path p = std::filesystem::canonical(sys, ec);
+    for (int up = 0; !ec && up < 2; ++up, p = p.parent_path()) {   // a partition has its disk's queue
+        std::ifstream q(p / "queue" / "rotational");
+        int r = -1;
+        if (q >> r) {
+            dev = p.filename().string();
+            return r;
+        }
+    }
+    return -1;
+}
+
+// upstream #605: the engine's threads in uninterruptible sleep (state D - almost always waiting for the disk), and where
+// (wchan): 16 threads in blk_io_schedule is a disk that cannot keep up, not a deadlock in the engine
+void disk_wait_threads(std::FILE* f) {
+    std::map<std::string, int> where;
+    int waiting = 0, threads = 0;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator("/proc/self/task", ec)) {
+        ++threads;
+        std::ifstream st(e.path() / "stat");
+        std::string line;
+        std::getline(st, line);
+        const size_t rp = line.rfind(')');
+        if (rp == std::string::npos || rp + 2 >= line.size() || line[rp + 2] != 'D') continue;
+        ++waiting;
+        std::ifstream w(e.path() / "wchan");
+        std::string wc;
+        std::getline(w, wc);
+        ++where[wc.empty() || wc == "0" ? "?" : wc];
+    }
+    if (threads == 0) return;
+    std::string list;
+    for (const auto& [name, n] : where) list += (list.empty() ? " (" : ", ") + name + " x" + std::to_string(n);
+    if (!list.empty()) list += ")";
+    std::fprintf(f, "  threads waiting on the disk (state D): %d of %d%s%s\n", waiting, threads, list.c_str(),
+                 waiting > 0 ? " - the engine is waiting for the drive: a rotational or failing disk with --ple-io "
+                               "direct (#605: --ple-io ram), or a drive too slow for the reads asked of it" : "");
+}
+
 void stall_report(std::FILE* f, uint64_t layers_during) {
     strata::core::Progress& p = strata::core::progress();
     std::fprintf(f, "strata serve: stall report (engine %s): stage \"%s\" for %lld s; %llu layers served since the "
@@ -968,6 +1082,7 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
         }
         if (auto fn = strata::core::diag_pool_fn().load()) fn(f);
         if (auto fn = strata::core::diag_verify_fn().load()) fn(f);
+        disk_wait_threads(f);
         if (auto fn = strata::core::diag_pipeline_fn().load()) fn(f);
         const MemSample m = mem_sample();
         std::fprintf(f, "  memory: %llu MiB resident, %llu MiB %s, %llu MiB RAM available; %llu %s\n", m.rss_mib,
@@ -1014,6 +1129,10 @@ private:
         const char* c = std::getenv("STRATA_ADAPT_JOB_CPU");
         const int cpu = c != nullptr ? (int) std::strtol(c, nullptr, 10) : -1;
         if (cpu >= 0) (void) strata::kernels::cpu::pin_current_thread(cpu);
+        // without it, --aux-cpus (off by default) puts the thread on the spare CPUs; an explicit STRATA_ADAPT_JOB_CPU
+        // is the user's word over it
+        if (c != nullptr) strata::aux_cpus::note_owned_thread();
+        else strata::aux_cpus::pin_current_thread();
         for (;;) {
             std::function<void()> f;
             {
@@ -1065,61 +1184,80 @@ void mem_mark(const char* where) {
 // 135-150 ms + 3.5-5 ms a token on all three, so the windows pay up to ~50 tokens on the B70 and ~20 on the other two.
 // No constant fits every card: the serve loop measures both paths as it reads and picks the cheaper one per part.
 struct ShortReadCost {
-    std::vector<double> win_ms_tok;                       ///< the last window reads, ms a token
-    std::vector<std::pair<int64_t, double>> batched;      ///< the last batched reads: (tokens, ms with lend and refill)
+    // Both paths' costs grow with where the read starts (the attention over the context before it), so a reading is
+    // kept with its position and a prediction uses only those within a factor of 2 of it: on the RTX 4070 at 64K a
+    // 20-token batched read took 357 ms against 240 ms through the windows, where at 1K it was the faster one.
+    struct Win { double ms_tok; int64_t pos; };
+    struct Bat { int64_t tokens; double ms; int64_t pos; };
+    std::vector<Win> win_ms_tok;                          ///< the last window reads, ms a token
+    std::vector<Bat> batched;                             ///< the last batched reads (ms with lend and refill)
     bool win_seen = false, batched_seen = false;          ///< each path's first read (JIT, first uploads) is left out
     int64_t said = -1;                                    ///< the limit last written to the log
-    static constexpr size_t kKeep = 16;
+    static constexpr size_t kKeep = 32;
     static constexpr int64_t kMaxShort = 1024;            ///< longer reads say nothing about the fixed part
     static constexpr int64_t kMaxWindows = 256;           ///< the windows never take a longer part
     static constexpr int kTrust = 3;                      ///< reads of each path before they decide
     static constexpr double kExploreMs = 100;             ///< a part the windows would take this long is tried batched
+    /// ... while the read starts this early: at 64K a batched try of 20-27 tokens took 470-505 ms against 300 ms
+    /// through the windows on the RTX 4070 (2026-10-11), and each try is a request that waits longer
+    static constexpr int64_t kExploreUpTo = 16384;
 
-    void add_windows(int64_t tokens, double ms) {
+    static bool near(int64_t a, int64_t b) { return a <= 2 * std::max<int64_t>(b, 1) && b <= 2 * std::max<int64_t>(a, 1); }
+    void add_windows(int64_t tokens, double ms, int64_t pos) {
         if (tokens <= 0) return;
         if (!win_seen) { win_seen = true; return; }
-        win_ms_tok.push_back(ms / (double) tokens);
+        win_ms_tok.push_back({ms / (double) tokens, pos});
         if (win_ms_tok.size() > kKeep) win_ms_tok.erase(win_ms_tok.begin());
     }
-    void add_batched(int64_t tokens, double ms) {
+    void add_batched(int64_t tokens, double ms, int64_t pos) {
         if (tokens <= 0 || tokens > kMaxShort) return;
         if (!batched_seen) { batched_seen = true; return; }
-        batched.emplace_back(tokens, ms);
+        batched.push_back({tokens, ms, pos});
         if (batched.size() > kKeep) batched.erase(batched.begin());
     }
-    /// a window token's ms: the median of the recent reads (-1 before kTrust of them)
-    double window_ms() const {
-        if ((int) win_ms_tok.size() < kTrust) return -1;
-        std::vector<double> v = win_ms_tok;
+    /// a window token's ms near `pos`: the median of the recent reads there (-1 before kTrust of them)
+    double window_ms(int64_t pos) const {
+        std::vector<double> v;
+        for (const Win& w : win_ms_tok)
+            if (near(w.pos, pos)) v.push_back(w.ms_tok);
+        if ((int) v.size() < kTrust) return -1;
         std::nth_element(v.begin(), v.begin() + (long) v.size() / 2, v.end());
         return v[v.size() / 2];
     }
-    /// the batched path's ms for `tokens`: a least-squares line through the recent reads (flat with one length only)
-    double batched_ms(int64_t tokens) const {
+    int batched_near(int64_t pos) const {
+        return (int) std::count_if(batched.begin(), batched.end(), [&](const Bat& x) { return near(x.pos, pos); });
+    }
+    /// the batched path's ms for `tokens` near `pos`: a least-squares line through the recent reads there (flat with
+    /// one length only)
+    double batched_ms(int64_t tokens, int64_t pos) const {
         double n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
-        for (const auto& [k, ms] : batched) {
-            n += 1; sx += (double) k; sy += ms; sxx += (double) k * (double) k; sxy += (double) k * ms;
+        for (const Bat& x : batched) {
+            if (!near(x.pos, pos)) continue;
+            const double k = (double) x.tokens;
+            n += 1; sx += k; sy += x.ms; sxx += k * k; sxy += k * x.ms;
         }
+        if (n == 0) return 0.0;
         const double den = n * sxx - sx * sx;
         double slope = den > 1e-9 ? (n * sxy - sx * sy) / den : 0.0;
         slope = std::max(slope, 0.0);
         const double fixed = std::max((sy - slope * sx) / n, 0.0);
         return fixed + slope * (double) tokens;
     }
-    /// whether `tokens` fresh text tokens go through the windows; `limit` is --short-read (or its default)
-    bool windows(int64_t tokens, int64_t limit, bool given) const {
-        const double w = window_ms();
+    /// whether `tokens` fresh text tokens from `pos` go through the windows; `limit` is --short-read (or its default)
+    bool windows(int64_t tokens, int64_t limit, bool given, int64_t pos) const {
+        const double w = window_ms(pos);
         if (given || w < 0) return tokens <= limit;
         if (tokens > kMaxWindows) return false;
-        if ((int) batched.size() < kTrust) return w * (double) tokens < kExploreMs ? tokens <= limit : false;
-        return w * (double) tokens <= batched_ms(tokens);
+        if (batched_near(pos) < kTrust)
+            return pos <= kExploreUpTo && w * (double) tokens >= kExploreMs ? false : tokens <= limit;
+        return w * (double) tokens <= batched_ms(tokens, pos);
     }
-    /// the longest part the windows take now (for the log), or -1 before both paths are measured
-    int64_t limit_now() const {
-        const double w = window_ms();
-        if (w < 0 || (int) batched.size() < kTrust) return -1;
+    /// the longest part the windows take now near `pos` (for the log), or -1 before both paths are measured there
+    int64_t limit_now(int64_t pos) const {
+        const double w = window_ms(pos);
+        if (w < 0 || batched_near(pos) < kTrust) return -1;
         int64_t k = 0;
-        while (k < kMaxWindows && w * (double) (k + 1) <= batched_ms(k + 1)) ++k;
+        while (k < kMaxWindows && w * (double) (k + 1) <= batched_ms(k + 1, pos)) ++k;
         return k;
     }
 };
@@ -1768,7 +1906,46 @@ double memory_read_rate(const std::vector<const uint8_t*>& blobs, size_t bytes, 
     return ms > 0.0 ? (double) read.load() / ms : 0.0;
 }
 
+// The memory's rate for the split, read before a long prompt where the split is set up after it (generate): after
+// a 64K prompt the reading came out up to 3x low on the RX 9060 XT's machine, the split giving the CPU every missed
+// expert (decode 23 against 34-41 tok/s), where 1K prompts read it steadily.  0: not read.
+double g_memory_rate_before = 0.0;
+
+std::vector<const uint8_t*> split_blobs(const strata::core::ExpertDispatch& d, int64_t layer) {
+    std::vector<const uint8_t*> blobs;
+    for (int64_t e = 0; e < d.n_expert && blobs.size() < 64; ++e)
+        if (d.host_res[(size_t) layer * (size_t) d.n_expert + (size_t) e] < 0 && d.src->pinned(layer, e))
+            if (const uint8_t* b = d.src->blob(layer, e)) blobs.push_back(b);
+    return blobs;
+}
+
+// the fastest of five readings 100 ms apart: one beside other work (the machine's, not the engine's) read the rate up
+// to 3x low on the RX 9060 XT's machine
+double split_memory_rate(const strata::core::ExpertDispatch& d, const std::vector<const uint8_t*>& blobs, size_t bytes) {
+    double mem = 0.0;
+    for (int i = 0; i < 5 && !blobs.empty(); ++i) {
+        if (i > 0) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        mem = std::max(mem, memory_read_rate(blobs, bytes, d.pool != nullptr ? d.pool->workers() : 1));
+    }
+    return mem;
+}
+
+void read_memory_rate_before(const strata::core::ExpertDispatch& d, int64_t n_layers) {
+    if (d.src == nullptr || d.host_res == nullptr) return;
+    strata::core::Runtime::get().wait_preload();
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    for (int64_t layer = 0; layer < n_layers; ++layer) {
+        const std::vector<const uint8_t*> blobs = split_blobs(d, layer);
+        if (blobs.size() < 16) continue;
+        g_memory_rate_before = split_memory_rate(d, blobs, (size_t) lay.blob_bytes(layer));
+        return;
+    }
+}
+
 bool measure_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, strata::core::PcieSplitTimes& t, std::string& why) {
+    // the kernels' preload builds on a core of its own: beside it the CPU's expert time read 2x and the memory's rate
+    // up to 3x low on an RX 9060 XT with a Ryzen 7 5700X, and the split then gave the CPU every missed expert
+    strata::core::Runtime::get().wait_preload();
     int64_t layer = -1;
     if (!strata::core::measure_cpu_expert_ms(d, n_layers, t.c0, t.c, layer, why)) return false;
     t.layer = layer;
@@ -1782,11 +1959,7 @@ bool measure_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, strat
     // the link's rates together pass it, both slow down by the same factor.
     const auto& lay = strata::kernels::cpu::expert_layout();
     const double bytes = (double) lay.blob_bytes(layer);
-    std::vector<const uint8_t*> blobs;
-    for (int64_t e = 0; e < d.n_expert && blobs.size() < 64; ++e)
-        if (d.host_res[(size_t) layer * (size_t) d.n_expert + (size_t) e] < 0 && d.src->pinned(layer, e))
-            if (const uint8_t* b = d.src->blob(layer, e)) blobs.push_back(b);
-    const double mem = blobs.empty() ? 0.0 : memory_read_rate(blobs, (size_t) bytes, d.pool != nullptr ? d.pool->workers() : 1);
+    const double mem = std::max(g_memory_rate_before, split_memory_rate(d, split_blobs(d, layer), (size_t) bytes));
     const double cpu_rate = bytes / t.c, link_rate = bytes / t.p;   // bytes a ms
     const double factor = mem > 0.0 ? std::max(1.0, (cpu_rate + link_rate) / mem) : 1.0;
     t.cb0 = t.c0; t.cb = t.c * factor;
@@ -1835,11 +2008,84 @@ void setup_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, const O
 }
 }  // namespace
 
+// Whether the prompt path gets the CPU pool for its share (STRATA_PREFILL_CPU_SHARE, auto by default).  An explicit
+// setting is the user's: the pool is given (0 turns the share off in the prompt path), with a warning when host memory
+// is short.  The default is not armed when the expert cache holds every expert (upstream eaaa237e, #1595: nothing
+// streams, so nothing to take) or when the host lacks the memory for it (upstream 04dbe561: chats failed on a machine
+// with tight RAM).  `src`: the file source when it is the one in use (its experts the CPU would read as file pages).
+static bool cpu_share_default_ok(const strata::core::ModelGeometry& g, const strata::core::ExpertCache& xcache,
+                                 const strata::core::FileExpertSource* src) {
+    namespace sr = strata::prefill::share_rules;
+    const char* ev = std::getenv("STRATA_PREFILL_CPU_SHARE");
+    const int64_t pairs = g.n_layers * g.n_expert;
+    if (ev == nullptr && !sr::default_share_has_work((int64_t) xcache.slots(), pairs)) {
+        std::fprintf(stderr, "strata: every expert is in the GPU cache (%lld of %lld): the CPU prefill share has nothing "
+                             "to take, so it is not armed by default (STRATA_PREFILL_CPU_SHARE=auto forces it)\n",
+                     (long long) xcache.slots(), (long long) pairs);
+        return false;
+    }
+    sr::ShareMemory sm;
+    if (const auto avail = strata::core::available_host_bytes()) sm.avail_ram = *avail;
+    sm.buffer_bytes = (uint64_t) (1024 + 8 * g.n_expert) * (uint64_t) g.n_embd * 4 + (256ull << 20);
+    if (src != nullptr) {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            for (int64_t e = 0; e < g.n_expert; ++e)
+                if (xcache.slot_of(l, e) < 0 && src->resident_blob(l, e) == nullptr && !src->transient(l, e))
+                    sm.inplace_bytes += (uint64_t) lay.blob_bytes(l);
+    }
+    const sr::ShareVerdict v = sr::default_share_memory_verdict(sm);
+    if (v.arm) return true;
+    if (ev == nullptr) {
+        std::fprintf(stderr, "strata: the CPU prefill share is not armed by default: %s. STRATA_PREFILL_CPU_SHARE=auto "
+                             "turns it on anyway\n", v.why.c_str());
+        return false;
+    }
+    if (std::strcmp(ev, "0") != 0)
+        std::fprintf(stderr, "strata: WARNING STRATA_PREFILL_CPU_SHARE=%s is set and kept, but %s: the share can slow "
+                             "prompts or fail on a machine this short of memory (STRATA_PREFILL_CPU_SHARE=0 turns it off)\n",
+                     ev, v.why.c_str());
+    return true;
+}
+
+// #1425 #1549 #1629 (upstream 30017336): --ple-io direct (the default) does unbuffered random reads of the n-gram
+// table; on some drives (DRAM-less NVMe) they run at 34 MB/s and a prompt reads layer 1 for minutes.  Rows per second
+// of a short cold probe: a few batches of random rows through the same batched reader a prompt chunk uses, stopped
+// after ~0.6 s.  Returns <= 0 when nothing could be measured.
+static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
+    const uint64_t n = t.rows();
+    if (n < 4096) return -1.0;
+    constexpr size_t kTok = 4;   // 64 rows a batch
+    std::vector<uint32_t> rows(kTok * 16);
+    std::vector<float> out(kTok * 2560);
+    uint64_t x = 0x9E3779B97F4A7C15ull ^ n;
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t done = 0;
+    double el = 0;
+    for (int b = 0; b < 64; ++b) {
+        for (auto& r : rows) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; r = (uint32_t) (x % n); }
+        std::string e;
+        if (!t.gather_batch(rows.data(), kTok, out.data(), e)) return -1.0;
+        done += rows.size();
+        el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (el > 0.6) break;
+    }
+    return el > 0 ? (double) done / el : -1.0;
+}
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is
+    // touched (upstream b7dd070d)
+    for (int i = 1; i < argc && i < 3; ++i) {
+        if (std::strcmp(argv[i], "--version") == 0 || std::strcmp(argv[i], "-V") == 0) {
+            std::printf("strata %s\n", STRATA_VERSION);
+            return 0;
+        }
+    }
     // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With the
     // default lazy loading, a kernel first used mid-prompt (MMQ for IQ3_XXS at 64K+ on a 12 GB card) found no VRAM
     // left for its code and the engine ended ("out of memory: cudaFuncSetAttribute").  Costs ~30 MB of VRAM.
@@ -1921,7 +2167,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
         else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
         else if (a == "--no-ple") o.no_ple = true;
-        else if (a == "--ple-io") o.ple_io = next("--ple-io");
+        else if (a == "--ple-io") { o.ple_io = next("--ple-io"); o.ple_io_explicit = true; }
         else if (a == "--embd-gguf") o.embd_gguf = next("--embd-gguf");
         else if (a == "--ple-row-cache") o.ple_row_cache = std::atoll(next("--ple-row-cache"));
         else if (a == "--ple-inflight") o.ple_inflight = std::atoi(next("--ple-inflight"));
@@ -1957,6 +2203,15 @@ int main(int argc, char** argv) {
         else if (a == "--graph-only") o.graph_only = true;
         else if (a == "--gpu-only-full") o.gpu_only_full = true;
         else if (a == "--pool-workers") o.pool_workers = std::atoi(next("--pool-workers"));
+        else if (a == "--aux-cpus") {
+            o.aux_cpus = next("--aux-cpus");
+            std::string aerr;
+            strata::aux_cpus::Config acfg;
+            if (!strata::aux_cpus::parse_spec(o.aux_cpus, acfg, aerr)) {
+                std::fprintf(stderr, "strata generate: %s\n", aerr.c_str());
+                return 2;
+            }
+        }
         else if (a == "--pool-tasks") {
             const char* v = next("--pool-tasks");
             char* end = nullptr;
@@ -2029,14 +2284,18 @@ int main(int argc, char** argv) {
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
+        else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
-                 a == "--conversation-cache-min-free-mib" || a == "--conversation-save-checkpoints" ||
-                 a == "--conversation-save-mib" || a == "--conversation-save-hours" || a == "--session-min-free-mib") {
+                 a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
+                 a == "--conversation-save-checkpoints" ||
+                 a == "--conversation-save-mib" || a == "--conversation-save-hours" || a == "--session-min-free-mib" ||
+                 a == "--memory-limit-mib") {
             const std::string value = next(a.c_str());
             int64_t parsed = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
-            const int64_t limit = a == "--conversation-cache-slots" || a == "--conversation-save-checkpoints"
+            const int64_t limit = a == "--conversation-cache-slots" || a == "--conversation-save-checkpoints" ||
+                                          a == "--conversation-cache-min-tokens"
                                       ? INT32_MAX
                                   : a == "--conversation-save-hours" ? INT64_MAX / 3600
                                                                      : INT64_MAX / (int64_t{1024} * 1024);
@@ -2046,10 +2305,12 @@ int main(int argc, char** argv) {
             }
             if (a == "--conversation-cache-mib") o.conversation_cache_mib = parsed;
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = parsed;
+            else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = parsed;
             else if (a == "--conversation-save-checkpoints") o.conversation_save_checkpoints = (int) parsed;
             else if (a == "--conversation-save-mib") o.conversation_save_mib = parsed;
             else if (a == "--conversation-save-hours") o.conversation_save_hours = parsed;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = parsed;
+            else if (a == "--memory-limit-mib") o.memory_limit_mib = parsed;
             else o.conversation_cache_slots = (int) parsed;
         }
         else if (a == "--conversation-save") o.conversation_save = next("--conversation-save");
@@ -2163,6 +2424,38 @@ int main(int argc, char** argv) {
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
     // the next discrete ones); "auto" chooses the K before anything is loaded (below).  The helper caches
     // (--expert-cache-remote) are not carried by the Xe engine at all (remote_experts.cpp).
+    {   // the RAM guard (parking, session save/restore): --memory-limit-mib, else STRATA_MEMORY_LIMIT_MIB, else none
+        int64_t mib = o.memory_limit_mib;
+        if (mib < 0) {
+            const char* env = std::getenv("STRATA_MEMORY_LIMIT_MIB");
+            if (env != nullptr && env[0] != '\0') {
+                const size_t len = std::strlen(env);
+                const auto parsed = std::from_chars(env, env + len, mib);
+                if (parsed.ec != std::errc{} || parsed.ptr != env + len || mib < 0 || mib > INT64_MAX / (1024 * 1024)) {
+                    std::fprintf(stderr, "STRATA_MEMORY_LIMIT_MIB needs a nonnegative integer within range (got \"%s\")\n", env);
+                    return 2;
+                }
+            } else mib = 0;
+        }
+        strata::core::set_memory_limit_bytes((uint64_t) mib << 20);
+        if (o.serve || mib > 0) {
+            constexpr double GiB = 1073741824.0;
+            const auto mem = strata::core::sample_host_memory();
+            if (!mem) {
+                std::fprintf(stderr, "strata generate: memory guard: the available RAM cannot be read; parking and session "
+                                     "save/restore are refused\n");
+            } else {
+                std::fprintf(stderr, "strata generate: memory guard: limit %.1f GiB (source: %s), current %.1f GiB, "
+                                     "reclaimable cache credited %.1f GiB; available %.1f GiB (MemAvailable %.1f GiB%s), "
+                                     "floor %lld MiB\n",
+                             (double) mem->limit / GiB, strata::core::memory_source_name(mem->source),
+                             (double) mem->current / GiB, (double) mem->credit / GiB, (double) mem->available / GiB,
+                             (double) mem->mem_available / GiB,
+                             mib > 0 ? (", --memory-limit-mib " + std::to_string((long long) mib)).c_str() : "",
+                             (long long) o.conversation_cache_min_free_mib);
+            }
+        }
+    }
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
@@ -2246,7 +2539,9 @@ int main(int argc, char** argv) {
         }
         if (!ok) {
             std::fprintf(stderr, "strata generate: --layer-split K[,K2..]|auto needs --serve, rising K from 2, and one "
-                                 "distinct GPU per K in --split-device (1..%d; or 0 with one K: the same GPU)\n", n_dev - 1);
+                                 "distinct GPU per K in --split-device (1..%d; or 0 with one K: the same GPU). K is the "
+                                 "FIRST LAYER of each later GPU, not a count of layers per card: \"24,36,42\" for 4 "
+                                 "GPUs, not \"24,12,6,6\" (got \"%s\")\n", n_dev - 1, o.layer_split.c_str());
             return 2;
         }
     }
@@ -3269,6 +3564,48 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        // Recommend, never force: when the default direct reads measure slow, switch to the mapped reads (40-100x
+        // faster on the reporters' drives); an explicit --ple-io direct is kept and only warned about.
+        if (pio.mode == strata::kernels::PleIo::Direct && std::getenv("STRATA_PLE_PROBE") == nullptr) {
+            constexpr double kSlowRowsPerS = 15000.0;   // ~60 MB/s of 4 KiB pages; a healthy NVMe is >100k
+            const double rps = ple_direct_rows_per_s(ple_table);
+            if (rps >= kSlowRowsPerS)
+                std::fprintf(stderr, "strata generate: PLE direct read probe: %.0f rows/s (fine)\n", rps);
+            if (rps > 0 && rps < kSlowRowsPerS) {
+                if (!o.ple_io_explicit) {
+                    std::fprintf(stderr, "strata generate: --ple-io direct measures slow here (%.0f rows/s, about %.0f MB/s of "
+                                         "random 4 KiB reads): using --ple-io mmap instead (the OS file cache holds the pages; "
+                                         "--ple-io direct forces the old mode, --ple-io ram keeps the table in RAM)\n",
+                                 rps, rps * 4096.0 / 1e6);
+                    ple_table.close();
+                    pio.mode = strata::kernels::PleIo::Mmap;
+                    pio.keepalive_ms = 0;
+                    if (!ple_table.open(o.ple_gguf, err, pio)) {
+                        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                        return 1;
+                    }
+                } else {
+                    std::fprintf(stderr, "strata generate: WARNING: --ple-io direct measures slow here (%.0f rows/s, about %.0f "
+                                         "MB/s of random 4 KiB reads): a prompt can spend minutes reading layer 1 and trip the "
+                                         "stall watchdog (#1425, #1629). --ple-io mmap was 40-100x faster on such drives; "
+                                         "--ple-io ram needs the RAM for the table\n", rps, rps * 4096.0 / 1e6);
+                }
+            }
+        }
+        if (pio.mode == strata::kernels::PleIo::Direct) {
+            // upstream #605: --ple-io direct's random reads (up to --ple-inflight at once) are for SSDs; a rotational
+            // disk can take longer than the stall watchdog's 60 s for one prompt chunk's rows.  Recommended, not
+            // forced.  (WSL's virtual disk says rotational: not there.)
+            std::string dev, rel;
+            std::ifstream osr("/proc/sys/kernel/osrelease");
+            std::getline(osr, rel);
+            const bool wsl = rel.find("microsoft") != std::string::npos || rel.find("Microsoft") != std::string::npos;
+            if (!wsl && on_rotational_disk(o.ple_gguf, dev) == 1)
+                std::fprintf(stderr, "strata generate: WARNING: the n-gram table (%s) is on a rotational disk (%s): "
+                                     "--ple-io direct reads it at random and can stall a prompt for minutes (#605). "
+                                     "--ple-io ram (it then needs RAM for the table) or the model on an SSD is "
+                                     "recommended\n", o.ple_gguf.c_str(), dev.c_str());
+        }
         if (pio.lock)
             std::fprintf(stderr, "strata generate: PLE table %s (--ple-io ram) in %.1f s\n",
                          ple_table.locked() ? "locked in RAM" : "loaded (not locked)",
@@ -3696,6 +4033,17 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --batch-cpu-split is off: it needs --batch with --batch-groups over a "
                              "layer split on two GPUs\n");
     const int pipe_n0 = cpu_split ? o.batch_cpu_split[0] : 0, pipe_n1 = cpu_split ? o.batch_cpu_split[1] : 0;
+    {   // --aux-cpus / STRATA_AUX_CPUS: read the CPUs this process may use now, before any thread is pinned; the plan
+        // follows once the pool exists (it needs the workers' CPUs)
+        std::string ac = o.aux_cpus;
+        if (ac.empty())
+            if (const char* e = std::getenv("STRATA_AUX_CPUS")) ac = e;
+        std::string aerr;
+        if (!strata::aux_cpus::configure(ac, aerr)) {
+            std::fprintf(stderr, "strata generate: STRATA_AUX_CPUS: %s\n", aerr.c_str());
+            return 2;
+        }
+    }
     strata::kernels::cpu::ExpertPool pool(pipe_n0 > 0 ? pipe_n0 : o.pool_workers, /*pin=*/true,
                                           /*host_works=*/!o.no_host_worker, /*first_core=*/0, o.pool_tasks);
     std::fprintf(stderr, "strata generate: CPU pool tasks/phase: %d%s, participating threads: %d\n",
@@ -3842,7 +4190,7 @@ int main(int argc, char** argv) {
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         // Not rounded: free VRAM moves the cache by a slot or two between starts, and with it the last bits of the
-        // output (bench/results/2026-10-02-new-machine), but rounding to 64 slots cost the RTX 4070 3-4% of its decode.
+        // output (the 2026-10-02-new-machine record), but rounding to 64 slots cost the RTX 4070 3-4% of its decode.
         // Runs that must give the same tokens fix the size with --expert-cache N.
         int64_t slots = ((int64_t) free_b - reserve) / blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
@@ -4413,6 +4761,14 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "strata generate: %d expert-pool workers%s%s\n", pool.workers(),
                  pool.host_works() ? " + the host thread" : "",
                  o.no_pool ? " (UNUSED: --no-pool)" : "");
+    {   // --aux-cpus: the plan, now the workers' CPUs are known (the host takes the first physical core, as
+        // SessionLoopScratch pins it); the threads that exist already (the GPU runtime's) move now when it is on, the
+        // ones created later pin themselves (strata/platform/aux_cpus.hpp)
+        std::vector<int> wc = pool.worker_cpus();
+        if (pool1) wc.insert(wc.end(), pool1->worker_cpus().begin(), pool1->worker_cpus().end());
+        const std::vector<int> hc = strata::kernels::cpu::physical_cores(false);
+        std::fprintf(stderr, "%s\n", strata::aux_cpus::set_topology(hc.empty() ? -1 : hc[0], wc).c_str());
+    }
 
     // **THE MISALIGNMENT WARNING THAT STOOD HERE IS GONE, BECAUSE THE MISALIGNMENT IS FIXED.**
     //
@@ -5423,7 +5779,8 @@ int main(int argc, char** argv) {
         }
         if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
         // the pool is idle while a prompt is read unless batch slots decode between its parts
-        if (!multi_gpu && o.batch <= 0 && !o.no_pool) sp.set_cpu_pool(&pool);
+        if (!multi_gpu && o.batch <= 0 && !o.no_pool && cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr))
+            sp.set_cpu_pool(&pool);
         if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             if (err.find("fit") != std::string::npos)   // #85: say what frees VRAM
@@ -5784,7 +6141,7 @@ int main(int argc, char** argv) {
         // ordinary host vectors).
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 && use_mtp ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
-            (size_t) o.conversation_cache_slots);
+            (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
         // a layer split parks every GPU's session (its layers), each copied on its own device
         std::vector<strata::core::ConversationStage> conv_stages;
         if (multi_gpu) {
@@ -5943,6 +6300,16 @@ int main(int argc, char** argv) {
         };
         auto park_current = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            // --conversation-cache-min-tokens (upstream 624070c5): a short conversation is not worth one of the slots.
+            // Parking is a switch-time decision, so a client's small side requests would otherwise park themselves
+            // and, once the cache is full, evict the long conversation they were interleaved with (oldest first) - the
+            // reuse it wanted.  Returning true is the same non-error skip the byte-budget and RAM-floor paths take.
+            if (!conversations.wants((int64_t) live.size())) {
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (%zu tokens, below the %lld "
+                                     "minimum; parked=%zu)\n",
+                             live.size(), (long long) o.conversation_cache_min_tokens, conversations.size());
+                return true;
+            }
             const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
             auto reuse = conversations.take_reuse();
             size_t estimate = 0;
@@ -5977,13 +6344,39 @@ int main(int argc, char** argv) {
             try {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t additional = estimate - reuse.bytes();
-                if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
-                                                             additional, floor)) {
+                // The physical-RAM gate (upstream 940011da): the incoming snapshot has to fit beside the floor.
+                // make_room() above only balanced the cache's own budget, so a full cache leaves this one short even
+                // though every parked conversation could give its RAM back - and refusing here throws away the whole
+                // prompt read that produced this snapshot (measured upstream: 270k tokens, 96 s).  Evict the least
+                // recently active parked conversations until it fits, or until none are left (with --conversation-save
+                // each is written first).  Each ConversationBuffer is a list of 16 MiB segments, each its own
+                // allocation, so an evicted entry is back with the kernel before the next check reads /proc/meminfo.
+                // The reading is the memory guard's (MemAvailable, the cgroup limits above the engine,
+                // --memory-limit-mib; upstream daa76552); `mem` keeps the last one for the refusal line.
+                size_t freed = 0;
+                std::optional<strata::core::HostMemoryReading> mem;
+                auto admit = [&] {
+                    mem = strata::core::sample_host_memory();
+                    return strata::core::conversation_memory_admit(
+                        mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
+                };
+                while (!admit() && conversations.size() > 0 && freed < conversations.slots() &&
+                       conversations.evict_oldest(disk.enabled() ? &evicted : nullptr)) {
+                    ++freed;
+                    save_evicted();
+                }
+                if (!admit()) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need "
-                                         "%zu MiB plus %lld MiB floor, or telemetry unavailable)\n",
-                                 additional >> 20, (long long) o.conversation_cache_min_free_mib);
+                                         "%zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
+                                 additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
+                                 freed, conversations.size());
                     return true;
                 }
+                if (freed)
+                    std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit "
+                                         "this snapshot (%zu MiB plus %lld MiB floor)\n",
+                                 freed, freed == 1 ? "" : "s", additional >> 20,
+                                 (long long) o.conversation_cache_min_free_mib);
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
                 if (conv_stages.empty() ? !strata::core::conversation_snapshot_save(image, view, ss, g, mtp.kv_state(),
@@ -5991,9 +6384,12 @@ int main(int argc, char** argv) {
                                         : !strata::core::conversation_split_save(image, view, conv_stages, g,
                                                                                  mtp.kv_state(), err))
                     return false;
-                if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(), 0, floor)) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM floor after "
-                                         "capture, or telemetry unavailable)\n");
+                const auto mem_after = strata::core::sample_host_memory();
+                if (!strata::core::conversation_memory_admit(
+                        mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld "
+                                         "MiB needed, %s)\n",
+                                 (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
@@ -6167,6 +6563,24 @@ int main(int argc, char** argv) {
         strata::core::PcieSplitTimes pcie_split;   // the measured split, kept for the requests that set no share
         setup_pcie_split(drive.d, g.n_layers, o, pcie_given, !split_devs.empty(), ver.fetch_branch(), pcie_split);
         const strata::core::PcieSplitTimes* const pcie_split_ptr = drive.d.pcie_split;
+        {   // STRATA_ROUTE_TAIL_SKIP: ON BY DEFAULT (rank 7, upstream b4e3407b; measured on XeStrata's GPUs, docs/DETAILS.md): a
+            // missed expert that every token of a verify window routes at rank 7 or lower is neither copied nor computed
+            // (answers differ slightly; =0 restores the bytes of a build without it).  No default and no line when every
+            // expert is in VRAM (nothing to skip); off with --batch slots (a window then mixes requests, and one request's
+            // skip would depend on another's tokens) and with a helper GPU (the dispatch skips nothing there).  A layer
+            // split is fine: each stage skips by itself.
+            const char* tse = std::getenv("STRATA_ROUTE_TAIL_SKIP");
+            const bool all_experts_resident = !host_res.empty() &&
+                std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
+            const bool helper = std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
+                                            [](int n) { return n > 0; });
+            if (tse == nullptr && !all_experts_resident && o.batch <= 0 && !helper) strata::core::set_tail_skip_rank(7);
+            if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
+                std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert that every token of a "
+                                     "verify window routes at rank %d or lower is skipped (answers differ slightly); "
+                                     "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
+                             tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
+        }
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         // #477 --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays
         // empty and nothing below runs).  It needs the adaptive tier's counts and the residency table.
@@ -6652,6 +7066,7 @@ int main(int argc, char** argv) {
         std::deque<std::string> in_lines;
         bool in_eof = false;
         std::thread([&] {
+            strata::aux_cpus::pin_current_thread();
             // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
             // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
             // std::exit) would hang in exit() on Linux, and the server would wait for it forever
@@ -6736,11 +7151,11 @@ int main(int argc, char** argv) {
         {
             size_t free_b = 0, total_b = 0;
             strata::gpu::mem_info(&free_b, &total_b);
-            std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
+            std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
-                        "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d batch_slots=%d slot_cache=%d "
-                        "engine=" STRATA_VERSION "\n",
+                        "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld tail_role_token=%lld "
+                        "vram_elastic=%d batch_slots=%d slot_cache=%d engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -6748,8 +7163,9 @@ int main(int argc, char** argv) {
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
                         (long long) (strata::kernels::cpu::expert_layout().total >> 20), pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
-                        (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token,
-                        xcache.segmented() ? 1 : 0, o.batch, o.batch > 0 && o.prompt_cache > 0 ? 1 : 0);
+                        (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
+                        (long long) o.tail_role_token, xcache.segmented() ? 1 : 0, o.batch,
+                        o.batch > 0 && o.prompt_cache > 0 ? 1 : 0);
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -6758,17 +7174,39 @@ int main(int argc, char** argv) {
         {
             const char* ws = std::getenv("STRATA_WATCHDOG_S");
             const int limit = ws ? std::atoi(ws) : 60;   // one step (a prompt layer, a verify window) takes seconds
+            // #1407: while the OS is still reading the file tier (major faults / bytes read advance), a silent step is
+            // slow, not stuck; it gets up to STRATA_WATCHDOG_IO_S (default 10 x the limit) of such time. 0 = no allowance.
+            const char* wio = std::getenv("STRATA_WATCHDOG_IO_S");
+            const int io_limit = wio ? std::atoi(wio) : limit * 10;
             if (limit > 0)
-                std::thread([limit] {
+                std::thread([limit, io_limit] {
+                    strata::aux_cpus::pin_current_thread();
                     strata::core::Progress& p = strata::core::progress();
                     uint64_t last = p.beats.load(), ticks_at = p.ticks.load();
                     auto since = std::chrono::steady_clock::now();
+                    auto io_since = since;
+                    uint64_t io_last = file_tier_activity();
+                    bool io_noted = false;
                     for (;;) {
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                         const auto now = std::chrono::steady_clock::now();
                         const uint64_t b = p.beats.load();
-                        if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; continue; }
+                        if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; io_since = now; io_noted = false; io_last = file_tier_activity(); continue; }
                         if (now - since < std::chrono::seconds(limit)) continue;
+                        if (io_limit > limit && now - io_since < std::chrono::seconds(io_limit)) {
+                            const uint64_t a = file_tier_activity();
+                            if (a >= io_last + 16) {   // 16 = faults + MiB read in the last second: the file tier is busy
+                                io_last = a;
+                                if (!io_noted) {
+                                    io_noted = true;
+                                    std::fprintf(stderr, "strata serve: no step finished for %d s, but the file tier is still being read "
+                                                         "(slow storage or low RAM): waiting up to %d s in all (STRATA_WATCHDOG_IO_S) (#1407)\n",
+                                                 limit, io_limit);
+                                }
+                                continue;
+                            }
+                            io_last = a;
+                        }
                         // a blocking step's explicit allowance (session files): still within it, not yet stuck
                         if (strata::core::progress_now_ms() < p.allow_until_ms.load()) continue;
                         std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s) - stopping "
@@ -7500,14 +7938,27 @@ int main(int argc, char** argv) {
                             sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                        if (o.session_save_reclaim) {
+                            const auto freed = strata::core::session_save_reclaim(
+                                checks, conversations, sl, floor, strata::core::available_host_bytes);
+                            if (freed.bytes || freed.checkpoints || freed.parked) {
+                                // A removed tail must not mark a later checkpoint at this length as a tail.
+                                if (tail_ckpt_len >= 0 && std::none_of(checks.begin(), checks.end(), [&](const auto& c) {
+                                        return int64_t(c.ids.size()) == tail_ckpt_len;
+                                    })) tail_ckpt_len = -1;
+                                std::fprintf(stderr, "strata serve: save reclaimed %zu checkpoints, %zu parked, "
+                                                     "%zu host bytes; checking RAM again\n",
+                                             freed.checkpoints, freed.parked, freed.bytes);
+                            }
+                        }
                         auto admit = [&](uint64_t need, std::string& why) {
-                            const auto avail = strata::core::conversation_available_memory();
+                            const auto mem = strata::core::sample_host_memory();
+                            const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
                             why = "not enough RAM to save the session (" +
                                   (need == UINT64_MAX ? std::string("unknown") : std::to_string(need >> 20)) +
                                   " MiB plus a floor of " + std::to_string((long long) o.conversation_cache_min_free_mib) +
-                                  " MiB needed, " + (avail ? std::to_string(*avail >> 20) + " MiB available)"
-                                                           : "RAM telemetry unavailable)");
+                                  " MiB needed, " + ram_note(mem) + ")";
                             return false;
                         };
                         std::vector<ConvCheckpoint> disk_checks;
@@ -7559,11 +8010,12 @@ int main(int argc, char** argv) {
                         limits.progress = moving;
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         limits.admit = [floor, &o](uint64_t need, std::string& why) {
-                            const auto avail = strata::core::conversation_available_memory();
+                            const auto mem = strata::core::sample_host_memory();
+                            const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
                             why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
                                   std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
-                                  (avail ? std::to_string(*avail >> 20) + " MiB available)" : "RAM telemetry unavailable)");
+                                  ram_note(mem) + ")";
                             return false;
                         };
                         if (!strata::core::conversation_session_read_limits(
@@ -7639,6 +8091,8 @@ int main(int argc, char** argv) {
             unsigned long long req_seed = 0;
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
+            std::string req_bias_text;
+            bool req_bias_present = false;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             // ckpt=0: a one-shot call whose turn no later request extends.  No checkpoint at its last turn boundary
             // (so no split there) nor every --prompt-cache-every tokens, and its session is neither continued nor
@@ -7653,6 +8107,7 @@ int main(int argc, char** argv) {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
             bool req_pcie_set = false;   // the request set pcie_frac: its share, not the measured split
             // logprobs=K (0..20; upstream's Intel port 4ba35fd): after each "T id" an "LP logprob id:logprob ..." line
             // with the token's log-probability and the K most likely tokens', from the verify window's head logits
@@ -7670,7 +8125,8 @@ int main(int argc, char** argv) {
                     if (eq == std::string::npos) { endp = const_cast<char*>(start); break; }
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
-                    if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                    if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
+                    else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::strtoll(tok.c_str() + eq + 1, nullptr, 10));
                     else if (key == "temperature") req_temperature = fv;
@@ -7685,8 +8141,16 @@ int main(int argc, char** argv) {
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") { req_pcie_frac = std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "aux_cpus") req_aux_cpus = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0 ? 1 : 0;
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
+            }
+            std::vector<float> req_bias;
+            std::string bias_error;
+            if (req_bias_present && (o.batch > 0 ||
+                !strata::core::parse_logit_bias(req_bias_text, (int) n_vocab, req_bias, bias_error))) {
+                std::printf("ERR logit_bias: %s\n", o.batch > 0 ? "continuous batching is not supported" : bias_error.c_str());
+                continue;
             }
             std::string emb_path;
             if (geni && endp != nullptr) {
@@ -7882,7 +8346,7 @@ int main(int argc, char** argv) {
             if (saved.tokens > std::max(resume, slot_tokens) && saved.tokens > parked.tokens) {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t need = disk.load_bytes(saved.index);
-                if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(), need,
+                if (!strata::core::conversation_memory_admit(strata::core::available_host_bytes(), need,
                                                              floor)) {
                     std::fprintf(stderr, "strata serve: conversation save: skip reading %zu MiB (physical RAM "
                                          "admission)\n", need >> 20);
@@ -8122,7 +8586,7 @@ int main(int argc, char** argv) {
             int64_t req_short_read = o.short_read;   // STRATA_PIPELINE_SWITCH may set it per request (short_read=)
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
                 if (no_short || !sr_cost.windows(b - a, req_short_read,
-                                                 o.short_read_given || req_short_read != o.short_read))
+                                                 o.short_read_given || req_short_read != o.short_read, a))
                     return false;
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
@@ -8483,9 +8947,24 @@ int main(int argc, char** argv) {
             req_sp.penalty_freq = req_penalty_freq;
             req_sp.penalty_present = req_penalty_present;
             req_sp.counter = 0;
+            if (!ver.set_logit_bias(req_bias, err) || (pipe && !ver_b.set_logit_bias(req_bias, err))) {
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
             if (use_mtp) mtp.set_draft_sampling(req_sp);
+            {   // aux_cpus=0|1: where the non-pool, non-host threads run for this request (-1 = the start-up --aux-cpus); moves
+                // threads only.  An enabled placement is swept at every request: it catches threads created since.
+                static const bool aux_start = strata::aux_cpus::enabled();
+                const bool was_on = strata::aux_cpus::enabled();
+                const bool want = req_aux_cpus < 0 ? aux_start : req_aux_cpus != 0;
+                strata::aux_cpus::set_enabled(want);
+                if (want != was_on)
+                    std::fprintf(stderr, "strata serve: aux cpus %s for this request%s\n",
+                                 strata::aux_cpus::enabled() ? "ON" : "off",
+                                 want && !strata::aux_cpus::enabled() ? " (asked for, but no CPU is spare: see the start-up line)" : "");
+            }
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             drive.d.pcie_split = req_pcie_set ? nullptr : pcie_split_ptr;
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
@@ -8586,7 +9065,7 @@ int main(int argc, char** argv) {
                     const auto now = Clock::now();
                     if (win) {   // a refill before the windows is the batched part's
                         bat_ms += std::chrono::duration<double, std::milli>(tsp - tpart).count();
-                        if (sp_ok) sr_cost.add_windows(to - at, std::chrono::duration<double, std::milli>(now - tsp).count());
+                        if (sp_ok) sr_cost.add_windows(to - at, std::chrono::duration<double, std::milli>(now - tsp).count(), at);
                     } else {
                         bat_tokens += to - at;
                         bat_ms += std::chrono::duration<double, std::milli>(now - tpart).count();
@@ -8626,14 +9105,16 @@ int main(int argc, char** argv) {
             }
             if (bat_tokens > 0 && !cancelled) {
                 sr_cost.add_batched(bat_tokens,
-                                    bat_ms + std::chrono::duration<double, std::milli>(Clock::now() - tref).count());
+                                    bat_ms + std::chrono::duration<double, std::milli>(Clock::now() - tref).count(),
+                                    read_from);
             }
             if (!o.short_read_given) {
-                const int64_t lim = sr_cost.limit_now();
+                const int64_t lim = sr_cost.limit_now(read_from);
                 if (lim >= 0 && (sr_cost.said < 0 || std::llabs(lim - sr_cost.said) * 4 > std::max<int64_t>(sr_cost.said, 4))) {
                     std::fprintf(stderr, "strata serve: short reads go through the verify windows up to %lld tokens (a "
                                  "window token %.1f ms, a batched read %.0f ms + %.1f ms a token)\n", (long long) lim,
-                                 sr_cost.window_ms(), sr_cost.batched_ms(0), sr_cost.batched_ms(1) - sr_cost.batched_ms(0));
+                                 sr_cost.window_ms(read_from), sr_cost.batched_ms(0, read_from),
+                                 sr_cost.batched_ms(1, read_from) - sr_cost.batched_ms(0, read_from));
                     sr_cost.said = lim;
                 }
             }
@@ -9316,6 +9797,20 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
+                // Diagnostics (as in generate): STRATA_DUMP_FIRST_LOGITS=<path> writes the logits of each request's first
+                // window to <path>.<n>, so the prompt paths (a peer card's share, a split) can be compared by KL
+                if (first_window) {
+                    static const char* fl = std::getenv("STRATA_DUMP_FIRST_LOGITS");
+                    static int fl_n = 0;
+                    if (fl != nullptr) {
+                        std::vector<float> row((size_t) ver.vocab());
+                        const std::string path = std::string(fl) + "." + std::to_string(fl_n++);
+                        std::FILE* f = ver.copy_logits(0, row.data()) ? std::fopen(path.c_str(), "wb") : nullptr;
+                        if (f == nullptr || std::fwrite(row.data(), sizeof(float), row.size(), f) != row.size())
+                            std::fprintf(stderr, "strata serve: STRATA_DUMP_FIRST_LOGITS: cannot write %s\n", path.c_str());
+                        if (f) std::fclose(f);
+                    }
+                }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
@@ -9331,6 +9826,7 @@ int main(int argc, char** argv) {
                 bool adapt_ok = true;
                 if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
                     adapt_thr = std::thread([&] {
+                        strata::aux_cpus::pin_current_thread();
                         const Clock::time_point ta = Clock::now();
                         adapt_ok = adapt();
                         dt_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
@@ -9645,6 +10141,9 @@ int main(int argc, char** argv) {
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
             }
+            if (drive.d.tail_experts > 0)   // STRATA_ROUTE_TAIL_SKIP, cumulative
+                std::fprintf(stderr, "strata serve: route tail skip: %lld missed experts skipped (%lld entries) since the "
+                                     "start\n", (long long) drive.d.tail_experts, (long long) drive.d.tail_skipped);
             if (ajob)   // --adapt-async, cumulative (a round may still be in flight: it lands before the next request)
                 std::fprintf(stderr, "strata serve: asynchronous adaptive tier: %lld rounds, %lld experts swapped in, "
                                      "%.1f ms per round (start to flip, between windows)\n",
@@ -9713,7 +10212,7 @@ int main(int argc, char** argv) {
                     const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                     size_t estimate = 0;
                     if (!ver.wait_commit(de) || !snapshot_bytes(view, estimate, de)) return false;
-                    if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
+                    if (!strata::core::conversation_memory_admit(strata::core::available_host_bytes(),
                                                                  estimate, floor)) {
                         de = "physical RAM admission";
                         return false;
@@ -9787,7 +10286,8 @@ int main(int argc, char** argv) {
         }
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
-        if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
+        if (!multi_gpu && !o.no_pool && cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr))
+            prefill.set_cpu_pool(&pool);
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                           borrow_bytes)) {
@@ -9812,6 +10312,8 @@ int main(int argc, char** argv) {
             kvg_start(xcache.slots());
             if (!kvg_ensure(n_prompt + o.max_new + 64, [] { strata::gpu::device_sync(); })) return 1;
         }
+        if (!pcie_given && split_devs.empty() && o.pcie_mode != "dma" && o.pcie_mode != "direct")
+            read_memory_rate_before(drive.d, g.n_layers);   // before the prompt's clock: it is not the prompt's time
         const Clock::time_point tp0 = Clock::now();
         const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
@@ -10288,7 +10790,7 @@ int main(int argc, char** argv) {
         }
         const double pool_ms0 = drive.cpu_ms;
         // pages read back from disk or swap while decoding: the expert arena is not locked, and two runs whose
-        // CPU pool was 6x slower came while tens of GB were being downloaded (bench/results/2026-09-30-xe-swift-iq2xs)
+        // CPU pool was 6x slower came while tens of GB were being downloaded (the 2026-09-30-xe-swift-iq2xs record)
         const auto major_faults = [] { rusage u{}; getrusage(RUSAGE_SELF, &u); return (long long) u.ru_majflt; };
         const long long majflt0 = major_faults();
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
@@ -10313,13 +10815,18 @@ int main(int argc, char** argv) {
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
                 }
             }
+            // The window's rows sit at p .. p + T - 1, and past the context there is no cell to verify them in: near
+            // its end the window takes only the rows that fit (the admission checked the prompt and max_new, which a
+            // full window can overrun)
+            const int room = (int) std::min<int64_t>(o.spec, o.max_context - p);
+            T = std::min(T, room);
             // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
             int chain_n = 0, cm = 0;
-            if (o.lookup_chain > 0 && use_mtp && !first_window && !from_sfx && T < o.spec) {
+            if (o.lookup_chain > 0 && use_mtp && !first_window && !from_sfx && T < room) {
                 int csrc = -1;
                 const int nt = chain_tail(sfx, drafts.data(), T - 1, ctail);
                 chain_n = strata::spec::propose_from_sources(lookup_src, ctail.data(), nt, T - 1,
-                                                             std::min(o.lookup_chain, o.spec - T), o.lookup_chain_min,
+                                                             std::min(o.lookup_chain, room - T), o.lookup_chain_min,
                                                              cbuf.data(), &cm, &csrc);
                 if (chain_n > 0 && std::getenv("STRATA_LOOKUP_CHAIN_FIXED") == nullptr) {
                     double p_mtp = 1.0;
@@ -10394,7 +10901,7 @@ int main(int argc, char** argv) {
             std::thread adapt_thr;
             bool adapt_ok = true;
             if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
-                adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+                adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
             if (!ver.commit(a + 1, err)) {
                 if (adapt_thr.joinable()) adapt_thr.join();
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());

@@ -131,10 +131,14 @@ int DraftPolicy::chain(int t_mtp, double p_mtp, int k_avail, int match) const {
         const double r = (e0 + p_mtp * gain) / cost_ms(t_mtp + k);
         if (r > best) { best = r; best_k = k; }
     }
-    if (best_k > 0 && best > base * (1.0 + margin_)) return best_k;
-    // as choose(): a size whose cost is only guessed is tried a few times when the continuation looks likely
     const int t_full = t_mtp + kmax;
-    if (cost_n_[t_full] < kProbes && p_mtp * c >= 0.6) return kmax;
+    if (best_k > 0 && best > base * (1.0 + margin_)) {
+        // As choose(): a profitable shorter chain must not keep a stale full size from being measured again.
+        if (best_k < kmax && p_mtp * c >= 0.6 && stale(t_full)) return kmax;
+        return best_k;
+    }
+    // as choose(): a size whose cost is only guessed is tried a few times when the continuation looks likely
+    if ((cost_n_[t_full] < kProbes || stale(t_full)) && p_mtp * c >= 0.6) return kmax;
     return 0;
 }
 
@@ -143,7 +147,9 @@ void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, doubl
     if (round_ms > 0) {
         cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
         cost_n_[t] += 1.0;
+        last_[t] = rounds_;
     }
+    rounds_ += 1.0;
     // the MTP part is an ordinary MTP window as far as its own drafts go
     const int mtp_acc = std::min(accepted, t_mtp - 1);
     const double got = mtp_acc + 1.0;
