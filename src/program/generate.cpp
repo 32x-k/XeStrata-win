@@ -62,6 +62,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/split_rules.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
@@ -3199,7 +3200,9 @@ int main(int argc, char** argv) {
         // 2 and 3 GPUs: every placement priced, kept (a few hundred) so the near-tie warning below can name the best
         // placement that is really a different one, not the neighbour one layer over (upstream 8bb250d8)
         std::vector<std::pair<double, std::vector<int64_t>>> priced;
+        int64_t min_stage_layers = 1;   // 3 in the second search below, when the first pick has a 1- or 2-layer stage
         auto consider = [&]() {
+            if (min_stage_layers > 1 && strata::program::split_rules::smallest_stage(at, L) < min_stage_layers) return;
             double hm = 0;
             int64_t held = 0;
             const double ms = predict(at, hm, held);
@@ -3236,6 +3239,42 @@ int main(int argc, char** argv) {
         }
         };
         search();
+        // a stage with one or two layers holds a handful of expert slots, and every card's prompt chunk is clamped to
+        // what the smallest cache can lend (upstream 1c6c82ef, #1616: a 12 GB 3060 with one layer held 512 slots,
+        // 576 -> 347 tok/s): when the pick has such a stage, search again among placements that give every stage at
+        // least kMinStageLayers layers and keep that pick, said.  With none startable the first pick stays.
+        if (!best.empty() && strata::program::split_rules::restriction_possible(L, ns) &&
+            strata::program::split_rules::has_tiny_stage(best, L)) {
+            const std::vector<int64_t> first = best;
+            const double first_ms = best_ms, first_mass = best_mass;
+            const int64_t first_held = best_held, first_room = best_room;
+            auto first_priced = std::move(priced);
+            best.clear();
+            best_ms = 1e30; best_mass = 0; best_held = 0; best_room = 0;
+            min_stage_layers = strata::program::split_rules::kMinStageLayers;
+            search();
+            min_stage_layers = 1;
+            auto fmt = [](const std::vector<int64_t>& v) {
+                std::string str;
+                for (const int64_t k : v) str += (str.empty() ? "" : ",") + std::to_string(k);
+                return str;
+            };
+            if (best.empty()) {
+                best = first; best_ms = first_ms; best_mass = first_mass;
+                best_held = first_held; best_room = first_room;
+                priced = std::move(first_priced);
+                std::fprintf(stderr, "strata generate: layer split auto: K=%s gives a stage fewer than %lld layers (a "
+                                     "tiny expert cache clamps the prompt chunk), but no placement with at least that "
+                                     "many layers can start; keeping it\n", fmt(first).c_str(),
+                             (long long) strata::program::split_rules::kMinStageLayers);
+            } else {
+                std::fprintf(stderr, "strata generate: layer split auto: K=%s would give a stage fewer than %lld "
+                                     "layers (a tiny expert cache there clamps the prompt chunk of every card); chose "
+                                     "K=%s instead (%.1f ms per decode window, not %.1f)\n", fmt(first).c_str(),
+                             (long long) strata::program::split_rules::kMinStageLayers, fmt(best).c_str(), best_ms,
+                             first_ms);
+            }
+        }
         if (best.empty()) {   // no placement can start on paper: the choice without the gate, and what is short
             gate = false;
             search();
