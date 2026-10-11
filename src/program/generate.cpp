@@ -1184,61 +1184,80 @@ void mem_mark(const char* where) {
 // 135-150 ms + 3.5-5 ms a token on all three, so the windows pay up to ~50 tokens on the B70 and ~20 on the other two.
 // No constant fits every card: the serve loop measures both paths as it reads and picks the cheaper one per part.
 struct ShortReadCost {
-    std::vector<double> win_ms_tok;                       ///< the last window reads, ms a token
-    std::vector<std::pair<int64_t, double>> batched;      ///< the last batched reads: (tokens, ms with lend and refill)
+    // Both paths' costs grow with where the read starts (the attention over the context before it), so a reading is
+    // kept with its position and a prediction uses only those within a factor of 2 of it: on the RTX 4070 at 64K a
+    // 20-token batched read took 357 ms against 240 ms through the windows, where at 1K it was the faster one.
+    struct Win { double ms_tok; int64_t pos; };
+    struct Bat { int64_t tokens; double ms; int64_t pos; };
+    std::vector<Win> win_ms_tok;                          ///< the last window reads, ms a token
+    std::vector<Bat> batched;                             ///< the last batched reads (ms with lend and refill)
     bool win_seen = false, batched_seen = false;          ///< each path's first read (JIT, first uploads) is left out
     int64_t said = -1;                                    ///< the limit last written to the log
-    static constexpr size_t kKeep = 16;
+    static constexpr size_t kKeep = 32;
     static constexpr int64_t kMaxShort = 1024;            ///< longer reads say nothing about the fixed part
     static constexpr int64_t kMaxWindows = 256;           ///< the windows never take a longer part
     static constexpr int kTrust = 3;                      ///< reads of each path before they decide
     static constexpr double kExploreMs = 100;             ///< a part the windows would take this long is tried batched
+    /// ... while the read starts this early: at 64K a batched try of 20-27 tokens took 470-505 ms against 300 ms
+    /// through the windows on the RTX 4070 (2026-10-11), and each try is a request that waits longer
+    static constexpr int64_t kExploreUpTo = 16384;
 
-    void add_windows(int64_t tokens, double ms) {
+    static bool near(int64_t a, int64_t b) { return a <= 2 * std::max<int64_t>(b, 1) && b <= 2 * std::max<int64_t>(a, 1); }
+    void add_windows(int64_t tokens, double ms, int64_t pos) {
         if (tokens <= 0) return;
         if (!win_seen) { win_seen = true; return; }
-        win_ms_tok.push_back(ms / (double) tokens);
+        win_ms_tok.push_back({ms / (double) tokens, pos});
         if (win_ms_tok.size() > kKeep) win_ms_tok.erase(win_ms_tok.begin());
     }
-    void add_batched(int64_t tokens, double ms) {
+    void add_batched(int64_t tokens, double ms, int64_t pos) {
         if (tokens <= 0 || tokens > kMaxShort) return;
         if (!batched_seen) { batched_seen = true; return; }
-        batched.emplace_back(tokens, ms);
+        batched.push_back({tokens, ms, pos});
         if (batched.size() > kKeep) batched.erase(batched.begin());
     }
-    /// a window token's ms: the median of the recent reads (-1 before kTrust of them)
-    double window_ms() const {
-        if ((int) win_ms_tok.size() < kTrust) return -1;
-        std::vector<double> v = win_ms_tok;
+    /// a window token's ms near `pos`: the median of the recent reads there (-1 before kTrust of them)
+    double window_ms(int64_t pos) const {
+        std::vector<double> v;
+        for (const Win& w : win_ms_tok)
+            if (near(w.pos, pos)) v.push_back(w.ms_tok);
+        if ((int) v.size() < kTrust) return -1;
         std::nth_element(v.begin(), v.begin() + (long) v.size() / 2, v.end());
         return v[v.size() / 2];
     }
-    /// the batched path's ms for `tokens`: a least-squares line through the recent reads (flat with one length only)
-    double batched_ms(int64_t tokens) const {
+    int batched_near(int64_t pos) const {
+        return (int) std::count_if(batched.begin(), batched.end(), [&](const Bat& x) { return near(x.pos, pos); });
+    }
+    /// the batched path's ms for `tokens` near `pos`: a least-squares line through the recent reads there (flat with
+    /// one length only)
+    double batched_ms(int64_t tokens, int64_t pos) const {
         double n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
-        for (const auto& [k, ms] : batched) {
-            n += 1; sx += (double) k; sy += ms; sxx += (double) k * (double) k; sxy += (double) k * ms;
+        for (const Bat& x : batched) {
+            if (!near(x.pos, pos)) continue;
+            const double k = (double) x.tokens;
+            n += 1; sx += k; sy += x.ms; sxx += k * k; sxy += k * x.ms;
         }
+        if (n == 0) return 0.0;
         const double den = n * sxx - sx * sx;
         double slope = den > 1e-9 ? (n * sxy - sx * sy) / den : 0.0;
         slope = std::max(slope, 0.0);
         const double fixed = std::max((sy - slope * sx) / n, 0.0);
         return fixed + slope * (double) tokens;
     }
-    /// whether `tokens` fresh text tokens go through the windows; `limit` is --short-read (or its default)
-    bool windows(int64_t tokens, int64_t limit, bool given) const {
-        const double w = window_ms();
+    /// whether `tokens` fresh text tokens from `pos` go through the windows; `limit` is --short-read (or its default)
+    bool windows(int64_t tokens, int64_t limit, bool given, int64_t pos) const {
+        const double w = window_ms(pos);
         if (given || w < 0) return tokens <= limit;
         if (tokens > kMaxWindows) return false;
-        if ((int) batched.size() < kTrust) return w * (double) tokens < kExploreMs ? tokens <= limit : false;
-        return w * (double) tokens <= batched_ms(tokens);
+        if (batched_near(pos) < kTrust)
+            return pos <= kExploreUpTo && w * (double) tokens >= kExploreMs ? false : tokens <= limit;
+        return w * (double) tokens <= batched_ms(tokens, pos);
     }
-    /// the longest part the windows take now (for the log), or -1 before both paths are measured
-    int64_t limit_now() const {
-        const double w = window_ms();
-        if (w < 0 || (int) batched.size() < kTrust) return -1;
+    /// the longest part the windows take now near `pos` (for the log), or -1 before both paths are measured there
+    int64_t limit_now(int64_t pos) const {
+        const double w = window_ms(pos);
+        if (w < 0 || batched_near(pos) < kTrust) return -1;
         int64_t k = 0;
-        while (k < kMaxWindows && w * (double) (k + 1) <= batched_ms(k + 1)) ++k;
+        while (k < kMaxWindows && w * (double) (k + 1) <= batched_ms(k + 1, pos)) ++k;
         return k;
     }
 };
@@ -8567,7 +8586,7 @@ int main(int argc, char** argv) {
             int64_t req_short_read = o.short_read;   // STRATA_PIPELINE_SWITCH may set it per request (short_read=)
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
                 if (no_short || !sr_cost.windows(b - a, req_short_read,
-                                                 o.short_read_given || req_short_read != o.short_read))
+                                                 o.short_read_given || req_short_read != o.short_read, a))
                     return false;
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
@@ -9046,7 +9065,7 @@ int main(int argc, char** argv) {
                     const auto now = Clock::now();
                     if (win) {   // a refill before the windows is the batched part's
                         bat_ms += std::chrono::duration<double, std::milli>(tsp - tpart).count();
-                        if (sp_ok) sr_cost.add_windows(to - at, std::chrono::duration<double, std::milli>(now - tsp).count());
+                        if (sp_ok) sr_cost.add_windows(to - at, std::chrono::duration<double, std::milli>(now - tsp).count(), at);
                     } else {
                         bat_tokens += to - at;
                         bat_ms += std::chrono::duration<double, std::milli>(now - tpart).count();
@@ -9086,14 +9105,16 @@ int main(int argc, char** argv) {
             }
             if (bat_tokens > 0 && !cancelled) {
                 sr_cost.add_batched(bat_tokens,
-                                    bat_ms + std::chrono::duration<double, std::milli>(Clock::now() - tref).count());
+                                    bat_ms + std::chrono::duration<double, std::milli>(Clock::now() - tref).count(),
+                                    read_from);
             }
             if (!o.short_read_given) {
-                const int64_t lim = sr_cost.limit_now();
+                const int64_t lim = sr_cost.limit_now(read_from);
                 if (lim >= 0 && (sr_cost.said < 0 || std::llabs(lim - sr_cost.said) * 4 > std::max<int64_t>(sr_cost.said, 4))) {
                     std::fprintf(stderr, "strata serve: short reads go through the verify windows up to %lld tokens (a "
                                  "window token %.1f ms, a batched read %.0f ms + %.1f ms a token)\n", (long long) lim,
-                                 sr_cost.window_ms(), sr_cost.batched_ms(0), sr_cost.batched_ms(1) - sr_cost.batched_ms(0));
+                                 sr_cost.window_ms(read_from), sr_cost.batched_ms(0, read_from),
+                                 sr_cost.batched_ms(1, read_from) - sr_cost.batched_ms(0, read_from));
                     sr_cost.said = lim;
                 }
             }
