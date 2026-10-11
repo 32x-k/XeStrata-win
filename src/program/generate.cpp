@@ -7833,7 +7833,11 @@ int main(int argc, char** argv) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                         sl.active = false;
-                        sl.cached = false;   // the group's pad rows write an idle slot's state: not reused as a cache
+                        // a pipelined slot is a cache again, so a request left alone in its slot goes back to the
+                        // solo path with its drafts (upstream fc844436, #857): its state is final once its last window
+                        // has left the last stage, and a later group window whose pad row writes it clears the flag
+                        // where the group starts
+                        sl.cached = o.prompt_cache > 0 && !sl.img;
                     } else {
                         sl.x = y;
                         sl.p += 1;
