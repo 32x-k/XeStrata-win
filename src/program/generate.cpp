@@ -3989,6 +3989,29 @@ int main(int argc, char** argv) {
     strata::core::ArenaExpertSource arena_src;
     strata::core::ExpertSource* srcp = nullptr;
     std::vector<uint8_t> fill_tmp;   // blob_to_copy's buffer for a transient source
+    // Issue #10: less RAM available than the whole expert arena.  The arena then swaps while it loads, and on Level
+    // Zero the PCIe share later moves it into host USM (make_kernel_readable): GPU driver memory that the OOM killer
+    // cannot reclaim, so the GPU VM's rebind swapped it back in and the OOM killer emptied the host (#10, Case 1:
+    // 33 GiB of IQ2_XS in 28 GiB free).  Such a start runs as --resident-experts would: the experts the GPU's cache
+    // does not hold are copied into RAM as far as it has room, the rest read from the model files.
+    // STRATA_ARENA_LOW_RAM=keep: the whole arena anyway (the warning below only).
+    if (!o.mmap_experts && o.shared_expert_arena.empty() &&
+        !(native_pack && !std::ifstream(o.pack + "/experts.bin", std::ios::binary) && o.native_preset.empty())) {
+        const char* keep = std::getenv("STRATA_ARENA_LOW_RAM");
+        strata::core::detail::HostMemory hm;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        const uint64_t need = lay.total + lay.max_blob;
+        if (!(keep != nullptr && std::strcmp(keep, "keep") == 0) && strata::core::detail::host_available_memory(hm) &&
+            hm.available < need && hm.cgroup_limit >= need) {
+            std::fprintf(stderr, "strata generate: the expert arena needs %.2f GiB of RAM but %.2f GiB is available: "
+                                 "starting as with --resident-experts (the experts the GPU does not hold in RAM as far "
+                                 "as it has room, the rest from the model files; STRATA_ARENA_LOW_RAM=keep loads the "
+                                 "whole arena anyway)\n",
+                         (double) need / 1073741824.0, (double) hm.available / 1073741824.0);
+            o.mmap_experts = o.resident_pin = true;
+            o.resident_gib = -1;
+        }
+    }
     if (o.mmap_experts) {
         // FileExpertSource maps the pack's experts.bin: a canonical pack has it; a native (IQ) pack has it when
         // built with `tools/iq_pack.py --experts-bin` (per-layer blob sizes, upstream de159b5).  The low-RAM mode:

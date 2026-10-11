@@ -271,7 +271,7 @@ void PinnedArena::publish_shared() {
     flock(shared_fd_, LOCK_UN); shared_locked_ = false;
 }
 
-bool PinnedArena::to_host_usm(uint64_t pad, std::string& err) {
+bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::function<uint64_t()>& ram_available) {
     if (!layer_base.empty()) return true;
     if (base == nullptr || map_ == nullptr || shared_fd_ >= 0 || bounds_.size() < 2) {
         err = "only a private mapping with layer bounds moves into host USM";
@@ -297,7 +297,16 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err) {
     const size_t layers = bounds_.size() - 1;
     for (size_t l = 0; l < layers; ++l) {
         const uint64_t n = bounds_[l + 1] - bounds_[l];
-        void* q = sycl::malloc_host((size_t) (n + pad), runtime.context());
+        // Issue #10: host USM is GPU driver memory, which the OS cannot take back when RAM runs short (the GPU VM's
+        // rebind swapped it in and the OOM killer emptied the host).  Each layer moves only while the RAM has room
+        // for it and a reserve (STRATA_HOST_USM_RESERVE_MIB, default 1024); otherwise the arena stays as it was.
+        static const uint64_t reserve = [] {
+            const char* v = std::getenv("STRATA_HOST_USM_RESERVE_MIB");
+            return (uint64_t) (v != nullptr ? std::strtoull(v, nullptr, 10) : 1024) << 20;
+        }();
+        const uint64_t avail = ram_available ? ram_available() : UINT64_MAX;   // the caller's reading of the RAM
+        const bool room = avail >= n + pad + reserve;
+        void* q = room ? sycl::malloc_host((size_t) (n + pad), runtime.context()) : nullptr;
         if (q == nullptr) {   // back as it was: the moved layers into the mapping, then its registrations
             for (size_t k = 0; k < blocks.size(); ++k) {
                 std::memcpy((uint8_t*) base + bounds_[k], blocks[k], (size_t) (bounds_[k + 1] - bounds_[k]));
@@ -313,7 +322,9 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err) {
                       "again failed (" + e.what() + "): its copies are slower";
                 return false;
             }
-            err = "host USM refused at layer " + std::to_string(l) + " (" + std::to_string(n + pad) + " B)";
+            err = room ? "host USM refused at layer " + std::to_string(l) + " (" + std::to_string(n + pad) + " B)"
+                   : "the RAM has no room for layer " + std::to_string(l) + " in host USM (" +
+                         std::to_string(avail >> 20) + " MiB available)";
             return false;
         }
         std::memcpy(q, (uint8_t*) base + bounds_[l], (size_t) n);

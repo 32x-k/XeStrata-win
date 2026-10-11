@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -67,7 +68,9 @@ struct PinnedArena {
     /// bytes plus `pad`, as the `host_usm` constructor makes them: GPU kernels can then read it (a registration for
     /// copies does not give that on every runtime).  A layer at a time, each layer's pages given back once copied, so
     /// the arena is never held twice.  False (and `err`) with the mapping and its registrations as they were.
-    bool to_host_usm(uint64_t pad, std::string& err);
+    /// `ram_available` (issue #10): the RAM available now, read before each layer; a layer moves only while it leaves
+    /// STRATA_HOST_USM_RESERVE_MIB (default 1024) of it.
+    bool to_host_usm(uint64_t pad, std::string& err, const std::function<uint64_t()>& ram_available = {});
     bool valid() const { return base != nullptr; }
     uint8_t* data() const { return (uint8_t*) base; }   // one mapping only: null for host USM blocks
     /// The byte at arena offset `off` (one mapping, or the host USM block of the layer that holds it).

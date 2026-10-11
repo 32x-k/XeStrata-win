@@ -2721,7 +2721,12 @@ bool ArenaExpertSource::make_kernel_readable(std::string& err) {
     if (!dev_slice_.empty()) return true;
     if (arena_ == nullptr) { err = "the arena is a file mapping"; return false; }
     auto* a = static_cast<PinnedArena*>(arena_);
-    if (!a->to_host_usm(strata::kernels::cpu::expert_layout().max_blob, err)) return false;
+    // issue #10: the RAM available before each layer moves (UINT64_MAX when it cannot be read)
+    const auto ram = [] {
+        detail::HostMemory hm;
+        return detail::host_available_memory(hm) ? hm.available : UINT64_MAX;
+    };
+    if (!a->to_host_usm(strata::kernels::cpu::expert_layout().max_blob, err, ram)) return false;
     base_ = a->data();
     pinned_bytes_ = a->registered_bytes;
     slice_bytes_ = a->slice_bytes;
