@@ -1284,9 +1284,12 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
 - **[intel/llvm](https://github.com/intel/llvm)** の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib-llvm のコンパイラと SYCL のランタイム。
   リポジトリには含めず、`tools/intel_llvm_build.py` がリリースを取ってきてビルドします。
   そのとき当てる XeStrata の修正は `third_party/main/intel-llvm/patches/` にあり、intel/llvm と同じライセンスです。`third_party/main/intel-llvm/LICENSE.TXT` を参照。
-- **参考にした考え方**: [Splash](https://github.com/incoai/splash)、[ninfer](https://github.com/Neroued/ninfer)、[HyperQwen](https://github.com/syv-ai/HyperQwen)、
-  [Project Maya](https://github.com/mw00/project-maya)（VRAM にないエキスパートを CPU と PCIe に分ける数の決め方、[XE](XE.ja.md#外れたエキスパートの-cpu-と-pcie-への分け方)）。
-  文献は論文にあります。
+- **参考にした考え方**（文献は論文にあります）:
+   - Inco AI と Splash の貢献者による [Splash](https://github.com/incoai/splash)。
+   - Neroued による [ninfer](https://github.com/Neroued/ninfer)。
+   - syv.ai と HyperQwen の貢献者による [HyperQwen](https://github.com/syv-ai/HyperQwen)。
+   - mw00 と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)
+     （VRAM にないエキスパートを CPU と PCIe に分ける数の決め方、[XE](XE.ja.md#外れたエキスパートの-cpu-と-pcie-への分け方)）。
 - **ウェブの画面のフォント**: [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1、`third_party/main/outfit/OFL.txt`。なければシステムのフォントを使う）。
   Monitor のタブは @code-martin のダッシュボードの案（PR #22）から始まりました。
 - **`third_party/nonfree/`**: Qwen Community License 1.0 で、自由ソフトウェアではありません。XeStrata はこれなしでも動きます。
