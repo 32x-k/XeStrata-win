@@ -61,6 +61,15 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
                                   const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
+/// A checkpoint's save in two steps: `stage` copies the running state into `staging` (pinned host memory of
+/// conversation_checkpoint_staged_bytes; the caller has synchronized the device) as one batch of copies on `stream`
+/// and waits for it, `unstage` later fills `checkpoint` (its ids set) from it on the host, as
+/// conversation_checkpoint_save would have.  The reply waits only for the copies over the link.
+size_t conversation_checkpoint_staged_bytes(const SessionState& session, const ModelGeometry& g);
+bool conversation_checkpoint_stage(void* staging, void* stream, const SessionState& session, const ModelGeometry& g,
+                                   size_t tokens, std::string& error);
+bool conversation_checkpoint_unstage(ConversationCheckpoint& checkpoint, const void* staging,
+                                     const SessionState& session, const ModelGeometry& g, std::string& error);
 
 struct ConversationView {
     const std::vector<int32_t>& ids;

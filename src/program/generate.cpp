@@ -3529,6 +3529,22 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: zeroing the session state failed\n");
         return 1;
     }
+    // --serve: the checkpoint at a chat's turn boundary, which the next request of the chat resumes from, goes into
+    // this pinned buffer as one batch of copies, and into its RAM vectors after the reply: the copies one by one into
+    // pageable memory (~118 MB of running state) took 48-58 ms of every follow-up's wait on the RTX 4070's PCIe 4.0 x4.
+    // Pinned host memory, not VRAM: 118 MB of the expert cache is 68 of the RTX 4070's 3,419 slots, which costs its
+    // decode more.  STRATA_CKPT_STAGE=0: the copies to RAM as before.
+    void* ckpt_staging = nullptr;
+    strata::gpu::Stream ckpt_stream = nullptr;
+    if (o.serve && o.prompt_cache > 0 && split_devs.empty()) {
+        const char* v = std::getenv("STRATA_CKPT_STAGE");
+        const size_t bytes = strata::core::conversation_checkpoint_staged_bytes(ss, g);
+        if ((v == nullptr || std::strtol(v, nullptr, 10) != 0) && bytes > 0) {
+            ckpt_stream = strata::gpu::stream_create();
+            if (ckpt_stream == nullptr || !strata::gpu::alloc_host(&ckpt_staging, bytes))
+                ckpt_staging = nullptr;   // the copies to RAM as without it
+        }
+    }
     if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1)
         std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
                              "%.2f GiB of pinned RAM\n", (long long) ss.qsa_states[ss.qsa_primary()].n_slots * 4,
@@ -6508,7 +6524,48 @@ int main(int argc, char** argv) {
         std::vector<int64_t> part_next(stages.size() + 1, INT64_MAX);
         // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed.  `parts`: the stages'
         // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L)
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
+        // A staged checkpoint (see ckpt_staging): its tokens, and whether it is the tail kind; -1 when none is staged.
+        ConvCheckpoint ckpt_staged;
+        int64_t ckpt_staged_len = -1;
+        bool ckpt_staged_tail = false;
+        // `c` into the checkpoints: the tail kind replaces the previous one, and the least recently used leaves past
+        // --prompt-cache
+        auto keep_checkpoint = [&](ConvCheckpoint&& c, int64_t L, bool as_tail) {
+            c.used = ++check_clock;
+            if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
+                const int64_t old_tail = tail_ckpt_len;
+                checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& k) {
+                                 return old_tail >= 0 && (int64_t) k.ids.size() == old_tail;
+                             }), checks.end());
+                tail_ckpt_len = L;
+            } else if (L == tail_ckpt_len) {
+                tail_ckpt_len = -1;   // the flagged tail was dropped and a normal checkpoint takes its length
+            }
+            checks.push_back(std::move(c));
+            while ((int) checks.size() > o.prompt_cache) {
+                // the tail checkpoint serves only a branch of the last request: it leaves before a periodic one
+                const size_t n = checks.size();
+                std::vector<uint64_t> stamps(n);
+                std::unique_ptr<bool[]> tail_flags = std::make_unique<bool[]>(n);
+                for (size_t i = 0; i < n; ++i) {
+                    stamps[i] = checks[i].used;
+                    tail_flags[i] = tail_ckpt_len >= 0 && (int64_t) checks[i].ids.size() == tail_ckpt_len;
+                }
+                // the pin=N prefix is never the victim (flags only when one is pinned: nothing changes without)
+                std::unique_ptr<bool[]> pin_flags;
+                for (const ConvCheckpoint& k : checks)
+                    if (k.pinned) {
+                        pin_flags = std::make_unique<bool[]>(n);
+                        for (size_t i = 0; i < n; ++i) pin_flags[i] = checks[i].pinned;
+                        break;
+                    }
+                const size_t victim = strata::program::conv_cache::eviction_victim(
+                    stamps.data(), n, o.prompt_cache, tail_flags.get(), pin_flags.get());
+                checks.erase(checks.begin() + (std::ptrdiff_t) victim);
+            }
+        };
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
+                                 bool stage = false) -> bool {
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) {
@@ -6527,6 +6584,17 @@ int main(int argc, char** argv) {
                 c.dead = std::move((*parts)[0].dead);
                 c.block_pos = std::move((*parts)[0].block_pos);
                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
+            } else if (stage && ckpt_staging != nullptr && stages.empty() && ckpt_staged_len < 0) {
+                std::string e;
+                if (!strata::gpu::device_sync() || !strata::core::conversation_checkpoint_stage(ckpt_staging, ckpt_stream, ss, g,
+                                                                                             (size_t) L, e)) {
+                    std::fprintf(stderr, "strata serve: checkpoint stage: %s\n", e.c_str());
+                    return false;
+                }
+                ckpt_staged = std::move(c);
+                ckpt_staged_len = L;
+                ckpt_staged_tail = as_tail;
+                return true;
             } else {
                 if (!strata::gpu::device_sync() || !checkpoint_save(c, ss, g)) return false;
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
@@ -6537,41 +6605,19 @@ int main(int argc, char** argv) {
                     c.stage_parts.push_back(std::move(part));
                 }
             }
-            c.used = ++check_clock;
-            if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
-                const int64_t old_tail = tail_ckpt_len;
-                checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& k) {
-                                 return old_tail >= 0 && (int64_t) k.ids.size() == old_tail;
-                             }), checks.end());
-                tail_ckpt_len = L;
-            } else if (L == tail_ckpt_len) {
-                tail_ckpt_len = -1;   // the flagged tail was dropped and a normal checkpoint takes its length
-            }
-            checks.push_back(std::move(c));
-            while ((int) checks.size() > o.prompt_cache) {
-                std::vector<uint64_t> stamps;
-                std::vector<char> is_tail;
-                stamps.reserve(checks.size());
-                for (const ConvCheckpoint& k : checks) {
-                    stamps.push_back(k.used);
-                    is_tail.push_back((char) (tail_ckpt_len >= 0 && (int64_t) k.ids.size() == tail_ckpt_len));
-                }
-                // the tail checkpoint serves only a branch of the last request: it leaves before a periodic one
-                std::unique_ptr<bool[]> tail_flags(new bool[is_tail.size()]);
-                for (size_t i = 0; i < is_tail.size(); ++i) tail_flags[i] = is_tail[i] != 0;
-                // the pin=N prefix is never the victim (flags only when one is pinned: nothing changes without)
-                std::unique_ptr<bool[]> pin_flags;
-                for (const ConvCheckpoint& k : checks)
-                    if (k.pinned) {
-                        pin_flags.reset(new bool[checks.size()]);
-                        for (size_t i = 0; i < checks.size(); ++i) pin_flags[i] = checks[i].pinned;
-                        break;
-                    }
-                const size_t victim = strata::program::conv_cache::eviction_victim(
-                    stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get(), pin_flags.get());
-                checks.erase(checks.begin() + (std::ptrdiff_t) victim);
-            }
+            keep_checkpoint(std::move(c), L, as_tail);
             return true;
+        };
+        // the staged checkpoint into RAM and the checkpoints (after the reply that it did not delay)
+        auto finish_staged = [&]() -> bool {
+            if (ckpt_staged_len < 0) return true;
+            std::string e;
+            const bool ok = strata::core::conversation_checkpoint_unstage(ckpt_staged, ckpt_staging, ss, g, e);
+            if (ok) keep_checkpoint(std::move(ckpt_staged), ckpt_staged_len, ckpt_staged_tail);
+            else std::fprintf(stderr, "strata serve: checkpoint unstage: %s\n", e.c_str());
+            ckpt_staged = ConvCheckpoint{};
+            ckpt_staged_len = -1;
+            return ok;
         };
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
@@ -8454,6 +8500,10 @@ int main(int argc, char** argv) {
                              n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,
                              n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
             }
+            if (!finish_staged()) {   // (after every reply already; here for a request that ended another way)
+                std::printf("ERR saving a conversation checkpoint failed\n");
+                return 1;
+            }
             int64_t resume = 0;
             bool from_live = false;
             // the live session and the checkpoints were read with the control vector one way: a switch reads the
@@ -9250,8 +9300,11 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
+                // the turn boundary's checkpoint (the next request of the chat resumes there) is only staged now and
+                // goes to RAM after the reply (finish_staged)
                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
-                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
+                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at,
+                                   to == turn_at && to != root_at && to != message_at && to != pin_at)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed\n");
                     return 1;
                 }
@@ -10244,6 +10297,10 @@ int main(int argc, char** argv) {
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
                         (long long) req_offload, chain_txt);
             std::fflush(stdout);
+            if (!finish_staged()) {
+                std::printf("ERR saving a conversation checkpoint failed\n");
+                return 1;
+            }
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
