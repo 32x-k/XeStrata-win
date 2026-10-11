@@ -3196,11 +3196,15 @@ int main(int argc, char** argv) {
         double best_ms = 1e30, best_mass = 0;
         int64_t best_held = 0, best_room = 0;
         bool gate = true;   // only placements whose every stage can start its prompt path (upstream 09e5ab4f)
+        // 2 and 3 GPUs: every placement priced, kept (a few hundred) so the near-tie warning below can name the best
+        // placement that is really a different one, not the neighbour one layer over (upstream 8bb250d8)
+        std::vector<std::pair<double, std::vector<int64_t>>> priced;
         auto consider = [&]() {
             double hm = 0;
             int64_t held = 0;
             const double ms = predict(at, hm, held);
             if (gate && !startable) return;
+            if (ns <= 3) priced.emplace_back(ms, at);
             // the room the fullest stage keeps after its cache: on a tie the balanced placement wins (upstream 08cdd8bf)
             int64_t room = INT64_MAX;
             for (size_t i = 0; i < at.size() + 1; ++i) room = std::min(room, cap[i] - used[i]);
@@ -3209,6 +3213,7 @@ int main(int argc, char** argv) {
             }
         };
         auto search = [&] {
+        priced.clear();
         if (ns == 2) {
             for (int64_t k = 2; k < L; ++k) { at[0] = k; consider(); }
         } else if (ns == 3) {
@@ -3248,6 +3253,37 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: layer split auto: K=%s - predicted %.1f ms per decode window; the caches "
                              "hold %lld of %zu profiled pairs (~%.1f%% of the routed mass)\n", ks.c_str(), best_ms,
                      (long long) best_held, prof.size(), 100.0 * best_mass);
+        // a near tie on a mixed pair (upstream 8bb250d8, #1428): the model prices a decode window only, not the prompt,
+        // and on cards of different speed or link the winner can flip within a few percent of its error: name the
+        // other split that is almost as good, so the user can try it.  Only printed, the choice stays.
+        {
+            const auto [bw_lo, bw_hi] = std::minmax_element(bw.begin(), bw.end());
+            const auto [ls_lo, ls_hi] = std::minmax_element(link_scale.begin(), link_scale.end());
+            const bool mixed = *bw_hi > *bw_lo * 1.10 || *ls_hi > *ls_lo * 1.10;
+            const char* near_env = std::getenv("STRATA_SPLIT_NEAR_TIE_PCT");
+            const double near_pct = near_env != nullptr ? std::strtod(near_env, nullptr) : 4.0;   // 0: off
+            const std::vector<int64_t>* alt = nullptr;
+            double alt_ms = 1e30;
+            if (mixed && near_pct > 0 && ns <= 3 && best_ms > 0)
+                for (const auto& pc : priced) {
+                    if (pc.first > best_ms * (1.0 + near_pct / 100.0) || pc.first >= alt_ms) continue;
+                    int64_t dist = 0;   // how far the other split's points lie from the chosen one's
+                    for (size_t i = 0; i < pc.second.size() && i < best.size(); ++i)
+                        dist = std::max<int64_t>(dist, std::llabs(pc.second[i] - best[i]));
+                    if (dist < 3) continue;   // the neighbour one layer over is not a different split
+                    alt = &pc.second;
+                    alt_ms = pc.first;
+                }
+            if (alt != nullptr) {
+                std::string as;
+                for (const int64_t k : *alt) as += (as.empty() ? "" : ",") + std::to_string(k);
+                std::fprintf(stderr, "strata generate: layer split auto: NEAR TIE - K=%s is predicted %.1f ms per "
+                                     "decode window, within %.1f%% of K=%s (%.1f ms); the cards differ, so the "
+                                     "prediction may not rank them (it prices decode, not the prompt).  To try the "
+                                     "other: --layer-split %s\n",
+                             as.c_str(), alt_ms, 100.0 * (alt_ms / best_ms - 1.0), ks.c_str(), best_ms, as.c_str());
+            }
+        }
     }
     // Layer split across GPUs (upstream e50f2663, 12c099b3, 13f70a34): every GPU holds only the dense weights of ITS
     // layers (the PLE tensors stay everywhere).  A full copy on each card (~1.5 GB for IQ2_XS) is VRAM the expert cache
