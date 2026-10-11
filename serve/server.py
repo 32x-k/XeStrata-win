@@ -741,6 +741,7 @@ class StrataEngine:
         self.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
         self.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
         self.slot_groups = groups
+        self.slot_gs = gs if groups > 1 else 0   # pipelined groups: their size (pick_slot fills a group's holes)
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
@@ -1550,6 +1551,15 @@ class StrataEngine:
         # without --batch-groups a held prefix of any length is taken, as before
         if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
             return best
+        # pipelined groups: a group's window spans its slots up to its last busy one, so a free slot below a busy one
+        # of its group costs no extra row: such a hole is filled first (upstream 2c7c02ab, #793: picks that left
+        # leading holes, [_ B], cost a whole row each).  After a held prefix, as a pipelined slot is a cache again
+        # (upstream fc844436)
+        gs = getattr(self, "slot_gs", 0)
+        if gs:
+            holes = [b for b in free if any(self.slot_busy[x] for x in range(b + 1, b - b % gs + gs))]
+            if holes:
+                return min(holes, key=self.slot_order.index)
         # with --batch-groups: the group with the fewest busy slots first, so the requests spread over the
         # pipeline's stages (two requests in one group leave the other stage idle); then empty, then least recent
         busy_in: dict[int, int] = {}
