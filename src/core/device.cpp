@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU core_device
+#include "strata/kernels/device_arch_tag.hpp"
 
 
 #include <algorithm>
@@ -10,9 +12,11 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -48,10 +52,7 @@ std::string unusable(const sycl::device& d) {
     return {};
 }
 
-// Whether the GPU is the processor's own graphics (its memory is the system RAM), as the SYCL runtime reports it.
-// Not asked of Level Zero directly: the engine links no maker's driver library, so a contrib build starts on a PC
-// with only Intel's or only NVIDIA's (the runtime opens each backend's library when it is there).
-bool integrated(const sycl::device& d) { return d.has(sycl::aspect::ext_oneapi_is_integrated_gpu); }
+bool integrated(const sycl::device& d) { return integrated_gpu(d); }
 
 std::string pci_of(const sycl::device& d) {
     if (!d.has(sycl::aspect::ext_intel_pci_address)) return "?";
@@ -185,7 +186,41 @@ sycl::async_handler Runtime::handler() {
 
 Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), device_(device), context_(device_),
     compute_(context_, device_, handler(), sycl::property::queue::in_order{}),
-    transfer_(context_, device_, handler(), sycl::property::queue::in_order{}), watchdog_([this] { watch(); }) {}
+    transfer_(context_, device_, handler(), sycl::property::queue::in_order{}), watchdog_([this] { watch(); }) {
+    marks_by_barrier_ = measure_marks();
+}
+
+// A timestamp (submit_profiling_tag, the timing event's record) whose event is still held costs the next wait about
+// 65 us on the B70 with Level Zero (the prompt path holds 384, its streamed ring's: 25 ms on each layer's sync, the
+// prompt at 1,248 against 1,594 tok/s with barriers) and about 2 us on the RTX 4070 with CUDA, where the prompt reads
+// 1% faster with timestamps than with barriers (the 2026-10-09-xe-event-record record).  So the wait after 64 held
+// timestamps is timed on a queue of its own, and events without timing are barriers where it is above 20 us each.
+// STRATA_EVENT_MARK=tag or barrier chooses instead.
+bool Runtime::measure_marks() {
+    if (const char* v = std::getenv("STRATA_EVENT_MARK")) return std::strcmp(v, "barrier") == 0;
+    constexpr int kMarks = 64;
+    constexpr double kCostUs = 20.0;
+    try {
+        sycl::queue q(context_, device_, sycl::property::queue::in_order{});
+        std::vector<sycl::event> held(kMarks);
+        auto wait_us = [&q, &held](bool tag) {
+            q.wait();
+            for (auto& e : held)
+                e = tag ? sycl::ext::oneapi::experimental::submit_profiling_tag(q) : q.ext_oneapi_submit_barrier();
+            const auto t0 = std::chrono::steady_clock::now();
+            q.ext_oneapi_submit_barrier().wait();
+            return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        };
+        double tag = 1e30, barrier = 1e30;
+        for (int round = 0; round < 2; ++round) {
+            tag = std::min(tag, wait_us(true));
+            barrier = std::min(barrier, wait_us(false));
+        }
+        return tag - barrier > kMarks * kCostUs;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
 
 sycl::queue* Runtime::create_stream() {
     std::lock_guard<std::mutex> lock(streams_mutex_);
@@ -333,6 +368,41 @@ uint64_t vram_limit_bytes() {
 uint64_t max_alloc_limit_bytes() {
     static const uint64_t v = env_mib("STRATA_MAX_ALLOC_MIB");
     return v;
+}
+
+// Whether the GPU is the processor's own graphics (its memory is the system RAM), as the SYCL runtime reports it.
+// Not asked of Level Zero directly: the engine links no maker's driver library, so a contrib build starts on a PC
+// with only Intel's or only NVIDIA's (the runtime opens each backend's library when it is there).  The HIP runtime
+// does not answer the integrated-GPU aspect; it says the same as unified host memory (hipDeviceAttributeIntegrated).
+bool integrated_gpu(const sycl::device& d) {
+    if (d.has(sycl::aspect::ext_oneapi_is_integrated_gpu)) return true;
+    if (d.get_backend() != sycl::backend::ext_oneapi_hip) return false;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return d.get_info<sycl::info::device::host_unified_memory>();
+#pragma clang diagnostic pop
+}
+
+// upstream 004b15cd (#409): an integrated GPU's memory is the system RAM, and what its runtime reports free need not
+// subtract the CPU's allocations (an AMD APU's figure counts its whole shared pool).  The engine takes the smaller of
+// that figure and what Linux can give back, less STRATA_UMA_HEADROOM_GIB (default 6) for the system.
+void apply_uma_limit(uint64_t& free) {
+    static const uint64_t headroom = [] {
+        const char* v = std::getenv("STRATA_UMA_HEADROOM_GIB");
+        const long long g = v != nullptr ? std::strtoll(v, nullptr, 10) : 6;
+        return (uint64_t) std::max(0LL, g) << 30;
+    }();
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    uint64_t kb = 0;
+    while (meminfo >> key >> kb) {
+        if (key == "MemAvailable:") {
+            const uint64_t avail = kb << 10;
+            free = std::min(free, avail > headroom ? avail - headroom : 0);
+            return;
+        }
+        meminfo.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    }
 }
 
 void apply_vram_limit(uint64_t& free, uint64_t& total) {

@@ -17,6 +17,8 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_shared_expert
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <climits>
 #include <cstdlib>
@@ -96,49 +98,84 @@ void scalar_gate(sycl::queue& q, const uint16_t* x_bf16, const uint16_t* w_bf16,
     else scalar_gate_t<float>(q, x_bf16, w_bf16, out, n_embd);
 }
 
-void native_scalar_sigmoid(sycl::queue& q, float* gate, int n) {
-    q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> t) {
-        gate[t] = 1.0f / (1.0f + sycl::exp(-gate[t]));
-    });
-}
-
 void scale_rows(sycl::queue& q, float* out, const float* g, int n, int n_tok) {
     q.parallel_for(sycl::range<2>((size_t) n_tok, (size_t) n), [=](sycl::id<2> id) {
         out[id[0] * n + id[1]] *= g[id[0]];
     });
 }
 
+// the native gate's sigmoid and the row scale in one launch: each work-item takes its row's sigmoid of the raw gate
+// and scales four columns where the rows are 16-byte aligned (upstream 822251be)
+void sigmoid_scale_rows(sycl::queue& q, float* out, const float* g, int n, int n_tok) {
+    if (n % 4 == 0 && (reinterpret_cast<uintptr_t>(out) & 15u) == 0) {
+        const int n4 = n / 4;
+        auto* out4 = reinterpret_cast<sycl::float4*>(out);
+        q.parallel_for(sycl::range<2>((size_t) n_tok, (size_t) n4), [=](sycl::id<2> id) {
+            const float gt = 1.0f / (1.0f + sycl::exp(-g[id[0]]));
+            out4[id[0] * n4 + id[1]] *= gt;
+        });
+        return;
+    }
+    q.parallel_for(sycl::range<2>((size_t) n_tok, (size_t) n), [=](sycl::id<2> id) {
+        const float gt = 1.0f / (1.0f + sycl::exp(-g[id[0]]));
+        out[id[0] * n + id[1]] *= gt;
+    });
+}
+
 }  // namespace
 
 void shared_expert_set_native_bf16(bool enabled) { native_bf16 = enabled; }
+bool shared_expert_native_bf16() { return native_bf16; }
 
-void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
+bool shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
-                         int64_t n_ff, void* stream) {
+                         int64_t n_ff, void* stream, bool gate_later, bool g_ready, const void* x_q8_1) {
     if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
     auto& q = queue_for(stream);
-    native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
-    native_mmvq(nw.gate_type, nw.gate_data, nw.q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
-    native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
-    native_swiglu(q, gate, up, gate, (int) (n_ff * n_tok));
-    native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
+    const void* xq = x_q8_1;
+    if (xq == nullptr) {
+        native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
+        xq = nw.q8_1;
+    }
+    // gate and up in one launch where the layout allows (upstream b08cf3e1; STRATA_LFUSE_PAIR=0: two)
+    static const bool pair_on = [] {
+        const char* v = std::getenv("STRATA_LFUSE_PAIR");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (!(pair_on && nw.gate_type == nw.up_type &&
+          native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, xq, gate, up, (int) n_embd, (int) n_ff, n_tok,
+                           stream))) {
+        native_mmvq(nw.gate_type, nw.gate_data, xq, gate, (int) n_embd, (int) n_ff, n_tok, stream);
+        native_mmvq(nw.up_type, nw.up_data, xq, up, (int) n_embd, (int) n_ff, n_tok, stream);
+    }
+    // the SwiGLU and its q8_1 image in one launch (upstream be7889ed); STRATA_VERIFY_QDEDUP=0: two
+    static const bool fused_q8 = [] {
+        const char* v = std::getenv("STRATA_VERIFY_QDEDUP");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (fused_q8) {
+        native_swiglu_q8_1(gate, up, nw.q8_1, (int) n_ff, n_tok, stream);
+    } else {
+        native_swiglu(q, gate, up, gate, (int) (n_ff * n_tok));
+        native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
+    }
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
     static const bool batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
-    if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), one sigmoid launch
+    if (native_bf16 && g_ready) {
+        // the router's launch computed the raw gates
+    } else if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), the sigmoid in the scale
         bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
-        native_scalar_sigmoid(q, g, n_tok);
     } else {
         for (int t = 0; t < n_tok; ++t) {
-            if (native_bf16) {
-                bf16_gemv_fp32_mmvf(x + (size_t) t * n_embd, gate_inp_bf16, g + t, n_embd, 1, stream);
-                native_scalar_sigmoid(q, g + t, 1);
-            } else {
-                scalar_gate(q, x_bf16 + (size_t) t * n_embd, gate_inp_bf16, g + t, (int) n_embd);
-            }
+            if (native_bf16) bf16_gemv_fp32_mmvf(x + (size_t) t * n_embd, gate_inp_bf16, g + t, n_embd, 1, stream);
+            else scalar_gate(q, x_bf16 + (size_t) t * n_embd, gate_inp_bf16, g + t, (int) n_embd);
         }
     }
-    scale_rows(q, out, g, (int) n_embd, n_tok);
+    if (native_bf16 && gate_later) return true;                             // the combine scales the rows
+    if (native_bf16) sigmoid_scale_rows(q, out, g, (int) n_embd, n_tok);   // g holds the raw gates
+    else scale_rows(q, out, g, (int) n_embd, n_tok);                       // scalar_gate wrote the sigmoids
+    return false;
 }
 
 uint64_t shared_expert_scratch_bytes(int64_t n_ff) {
@@ -226,11 +263,11 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     // the per-token scalar gate, from the ORIGINAL hidden state, then the multiply
     if (use_native) {
         bf16_gemv_fp32_mmvf(x_f32, gate_inp_bf16, g, n_embd, 1, s);
-        native_scalar_sigmoid(q, g, 1);
+        sigmoid_scale_rows(q, out, g, (int) n_embd, 1);
     } else {
         scalar_gate(q, x_bf16, gate_inp_bf16, g, (int) n_embd);
+        scale_rows(q, out, g, (int) n_embd, 1);
     }
-    scale_rows(q, out, g, (int) n_embd, 1);
     if (!stream) core::Runtime::get().finish(q);
 }
 

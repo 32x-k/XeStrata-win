@@ -24,15 +24,14 @@ The Japanese version ([DETAILS.ja.md](DETAILS.ja.md)) is the original; this is i
 Every number here was measured on an Arc Pro B70 (32 GB).
 The machine: an i7-14700 (AVX2, no AVX-512), DDR4-3200 in two channels (about 35.5 GB/s read), the B70 at PCIe Gen5 x16,
 and the model files on a CPU-attached Gen4 x4 NVMe.
-Other GPUs have not been measured.
 The RTX numbers in Strata's (CUDA) README do not apply to XeStrata.
 
 The tables below are commit `58dbbe5` with the settings setup writes (images off), one code-agent prompt per length and 256 generated tokens.
 MTP speculative decoding is on.
 "262K" is the model's full context window (a 259,942-token prompt).
-One run per cell ([record](../bench/results/2026-10-04-speed-matrix/README.md)).
+One run per cell.
 
-### Prompt processing (tokens/s)
+### Prefill (tokens/s)
 
 | Model | 1K | 4K | 32K | 64K | 128K | 262K |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -42,7 +41,9 @@ One run per cell ([record](../bench/results/2026-10-04-speed-matrix/README.md)).
 | **IQ3_S** | 450 | 740 | 1,718 | 1,458 | 1,333 | 1,081 |
 | **Coder** | 936 | 1,573 | 2,015 | 1,659 | 1,499 | 1,188 |
 
-### Output (tokens/s)
+While a short prompt (a chunk below 2,048 tokens) is read, the decode CPU pool, idle then, computes the experts outside VRAM that few of its tokens route to (opt-in upstream, the default here: `STRATA_PREFILL_CPU_SHARE=auto`). It measures the CPU's and the GPU's time per expert and hands over the share at which both end together. With `STRATA_PREFILL_CPU_GATE=1` it also times neighbouring layers with and without the share, and shares only while the layers that share take less time per expert outside VRAM (upstream f2a3b946, #1282: on one PC the busy CPU slowed the host that issues the streams, and every share lost). The layers tried without the share cost more than that saved here, 1.3% of a 1K prompt's speed on the B70 and 4.4% on the RTX 4070, so it is off by default. `STRATA_DBG_CPU_GATE=1` prints those readings. The default leaves it off when the GPU cache holds every expert (nothing streams) and when the host is short of memory (less free RAM than the share's buffers and 3 GiB, or file pages of the experts it would read that the free RAM cannot keep) (upstream eaaa237e, 04dbe561; `STRATA_PREFILL_CPU_SHARE=auto` turns it on anyway). A buffer of the share that cannot be had ends the share instead of failing the request. The CPU computes in its own activation format, so an answer can differ a little from the GPU-only one. `STRATA_PREFILL_CPU_SHARE=0` keeps every expert on the GPU, `0.4` and the like a fixed share. 262- / 914-token prompts went from 319.2 to 383.1 / 736.3 to 828.0 tokens/s on the B70 and from 109.9 to 266.1 / 275.9 to 457.8 tokens/s on the RTX 4070 (one run each).
+
+### Decode (tokens/s)
 
 | Model | 1K | 4K | 32K | 64K | 128K | 262K |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -52,19 +53,65 @@ One run per cell ([record](../bench/results/2026-10-04-speed-matrix/README.md)).
 | **IQ3_S** | 77.1 | 73.9 | 72.5 | 68.8 | 63.2 | 50.3 |
 | **Coder** | 72.8 | 73.8 | 71.0 | 69.3 | 69.7 | 59.1 |
 
-Output speed depends on the text as well.
+Decode speed depends on the text as well.
 Speculative decoding runs faster when more of the drafted tokens are accepted, so a difference of a few percent between neighbouring cells means nothing
 (IQ2_XS is faster at 128K than at 64K because it accepted 0.768 of its drafts there against 0.683).
+
+`--lookup-chain K` (default 0, off) checks, after the draft layer's guesses, up to K more tokens that followed the same
+text earlier in the conversation (upstream 2312c83b).
+It speeds up handing back a given text nearly as it was, and slows ordinary chat a little
+(B70, IQ2_XS, K=3: rewriting a document 109.6 → 129.2, ordinary chat 71.1 → 68.3 tokens/s).
+`--lookup-chain-min M` is the match it needs before adding any (default 3 tokens).
+
+In the server's decode, a missed expert (not in VRAM) that every token of a verify window routes only at rank 7 or
+lower (the 8th to 10th of the top 10, the smallest weights) is neither read nor computed (`STRATA_ROUTE_TAIL_SKIP`,
+default 7, upstream b4e3407b). Its contribution is zero and the other experts keep their weights (no renormalisation),
+so the answers differ slightly.
+It does nothing when every expert is in VRAM (nothing is skipped), with `--batch` and with a helper cache
+(`--expert-cache-device1..3`); on a layer split each stage skips its own.
+`STRATA_ROUTE_TAIL_SKIP=0` turns it off and 1-9 sets the rank; the start prints one line.
+
+Measured (IQ3_XXS):
+
+| | B70 | RTX 4070 | RX 9060 XT |
+| --- | --- | --- | --- |
+| Mean KL of the decode path (floor: the same setting twice) | 0.0027 (0.0000) | 0.0053 (0.0009) | 0.0049 (0.0012) |
+| Top-1 agreement | 99.1% | 97.8% | 98.4% |
+| HumanEval (82) and arithmetic tasks (30) passed, off / on | 75, 25 / 76, 24 | 77, 25 / 79, 25 | 77, 24 / 77, 24 |
+| Serve decode, off to on (1K and 32K, greedy and temperature 0.7) | -1.0 to +12.7% | +7.5 to +24.5% | +6.3 to +55.4% |
+
+`STRATA_ROUTE_RESIDENT=<margin>` (upstream 5df35dcb, experimental, opt-in) swaps a verify window's missed experts at
+ranks 6-9 of the top 10 for resident ones whose logit is within the margin (`STRATA_ROUTE_RESIDENT_RANKS=lo-hi`).
+`STRATA_ROUTE_PRIOR=<lambda>` (upstream 2de9ae06, opt-in) picks the top 10 again with lambda added to the resident
+experts' logits (the weights stay the router's). Both change the answers.
 
 ### Small cards and GPUs without XMX
 
 With the B70 made to look like a small card (`STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1`: 8 GB of VRAM, no XMX),
-IQ2_XS writes 17.6 tokens/s with MTP and reads the 26K-token prompt at 574 tokens/s
-([record](../bench/results/2026-10-03-prompt-upstream/README.md)).
-On a GPU without XMX the prompt path's products run through DP4a, so reading a prompt takes about 1.6 times as long
-([record](../bench/results/2026-10-02-dp4a/README.md)).
+IQ2_XS writes 17.6 tokens/s with MTP and reads the 26K-token prompt at 574 tokens/s.
+On a GPU without XMX the prefill path's products run through DP4a, so prefill takes about 1.6 times as long.
 
-The text speed with images on has not been measured on the B70 yet.
+The prefill path's half-output buffer shares the embedding buffer, which is dead after the first hyper-connection
+broadcast (upstream 199fd1d5, #1454): T x 2560 floats less VRAM per chunk (320 MiB at 32,768 tokens).
+The planner still counts those bytes by default, so the chunk and the cache slots the prefill path borrows stay as
+they were, and so do the prefill's bits.
+`STRATA_EMB_REUSE_ACCOUNT=1` lets the planner use them: a chunk that VRAM limits grows (upstream 55dee8ed, RTX 3060,
+IQ3_XXS: 6,400 to 6,656 tokens, prefill about 3.9% faster).
+A different chunk changes the prefill's rounding.
+
+### AMD APUs
+
+On an AMD APU (Ryzen AI Max "Strix Halo" and the like) the CPU and the GPU share one memory (upstream c4a329fe).
+The GPU's part is the BIOS carve-out (which the OS does not see, so it is room beside the RAM) and the shared GTT pool.
+The GTT pool is the RAM itself, about half of it by the kernel's default.
+Setup counts the carve-out as room for experts (the low-RAM mode) and the carve-out plus the shared pool for the recommended context.
+It tells Strix Halo (gfx1151) apart by name, names the Radeon 8060S / 8050S / 8040S, and recommends UD-IQ4_XS from about 80 GB of memory.
+The kernel's boot options `ttm.pages_limit` and `ttm.page_pool_size` (in 4 KiB pages) give the GPU more of the shared memory.
+Setup changes no host setting.
+The engine counts an integrated GPU's free memory as the smaller of what its runtime reports and what Linux can give back (`MemAvailable`) less 6 GiB (upstream 004b15cd; `STRATA_UMA_HEADROOM_GIB` changes the 6).
+For the models that keep a RAM budget of their experts (UD-Q4_K_XL, UD-IQ4_XS), setup writes the expert cache as a number, not `auto` (upstream #1715).
+The cache and the budget draw on the same RAM, so `auto`, sized from the memory free at start, would count what the budget has not taken yet and leave the OS nothing.
+The number is the RAM less 24 GB and the budget (and a KV cache streamed to RAM), in slots; `--expert-cache N` in the config's `args` sets another.
 
 ### Where the KV cache lives, and its precision
 
@@ -73,12 +120,33 @@ Only the part the attention reads stays in VRAM (`--kv-resident 32768`), so more
 The attention reads exactly the same values; only where the KV lives changes.
 It costs about 13.7 KB of RAM per context token, about 1.7 GB at 128K.
 
+**The elastic K/V** (`--kv-grow` or `STRATA_KV_GROW=1`, upstream 9e3dbfe7): the whole KV cache in VRAM, taking VRAM only for the cells the requests reach.
+The expert cache holds the rest, giving slots to the K/V as the context grows and taking them back after a short request.
+Both live in virtual memory (`sycl_ext_oneapi_virtual_mem`) and neither address moves, so the captured graphs stay valid.
+It needs one GPU with virtual memory, an expert profile, no KV streaming and every expert in RAM; otherwise (and with `--batch` or `--vram-elastic`) the engine says so and stays off.
+`STRATA_KV_GROW_HOLD=1` keeps the longest parked conversation's cells in the K/V until it comes back.
+At a 128K context, int8, IQ2_XS and a 4,945-token prompt (one run each) the result differs by card:
+
+| | prefill (tokens/s) | decode after it | short chat decode | slots |
+| --- | ---: | ---: | ---: | ---: |
+| RTX 4070, KV streaming (default) | 791.6 | 73.60 | 58.50 | 4,102 |
+| RTX 4070, the whole K/V in VRAM | 770.2 | 66.70 | 56.70 | 3,149 |
+| RTX 4070, `--kv-grow` | 802.4 | 76.50 | 61.40 | 4,219 |
+| B70, KV streaming (default) | 1133.5 | 100.50 | 77.80 | 19,192 |
+| B70, the whole K/V in VRAM | 1245.9 | 101.00 | 78.60 | 18,347 |
+| B70, `--kv-grow` | 681.9 | 98.90 | 73.40 | 19,303 |
+
+On the B70 the slow side is the cache in virtual memory: with the K/V alone in it prefill ran at 1291.5 and the decode after it at 105.10, faster than the whole K/V in VRAM.
+Unless asked, the device's reported virtual-memory granularity decides: on at 2 MiB or more, off below (the B70 reports 64 KiB).
+`--kv-grow` and `--no-kv-grow` (`STRATA_KV_GROW=1` and `0`) take precedence over it.
+
 **KV precision**: above an 8K context setup asks for the KV cache's precision (`--kv`).
 
 - `int8` (the default): 8 bits
 - `q4_0`: a Hadamard rotation before 4-bit rounding, half the memory.
   Measurably less precise on long documents (upstream measured perplexity 8–12% worse; needle tests still pass)
-- `k8v4`: 8-bit keys and 4-bit values, about three quarters of the memory
+- `k8v4`: 8-bit keys and 4-bit values, about three quarters of the memory.
+  It streams its KV like the other formats (about 10.6 KB of RAM per context token)
 
 ## Which model
 
@@ -122,7 +190,7 @@ The experimental speed projection loaded and ran on it upstream (it was made for
 setup's first question also offers **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)**,
 UkisAI's fine-tune of Qwen3.8-Flash-Next, trained to reach the answer with much less thinking.
 Its authors report 63% fewer thinking tokens, answers 1.8× sooner, and under 1% accuracy loss.
-The same architecture; three sizes (Q2_0, IQ2_XS, IQ3_XXS; no IQ3_S); its own image encoder.
+The same architecture; four sizes (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S); its own image encoder.
 Its authors recommend **IQ2_XS** (their Q2_0 is marked experimental).
 Its license is the Swift Open License 1.0: read it on the model page.
 
@@ -136,14 +204,13 @@ Its license is the Swift Open License 1.0: read it on the model page.
 Its experts' gate and up are IQ3_S (IQ4_XS in one layer) and its downs IQ4_NL (Q8_0 in five layers), 59.5 GB of them.
 The dense side and the RAM budget are as UD-Q4_K_XL's below (`--resident-budget-gib N`; setup chooses the RAM less 24 GB).
 With about 80 GB of RAM every expert fits it.
-setup asks about images (off by default); the image encoder is the original model's (the image path has not been checked: `unverified`).
+setup asks about images (off by default); the image encoder is the original model's.
 
 ```sh
 ./setup.sh --setup --family unsloth --model UD-IQ4_XS
 ```
 
 On an Arc Pro B70 (32 GB) with an i7-14700 and 96 GB of RAM (a 55 GiB RAM budget), 96 tokens of a short chat decoded at 32.5 / 32.8 tokens/s, and the answer read correctly.
-The quality has not been measured on Arc against llama.cpp (`unverified`).
 
 ### Or: Unsloth's UD-Q4_K_XL (EXPERIMENTAL)
 
@@ -151,19 +218,21 @@ The quality has not been measured on Arc against llama.cpp (`unverified`).
 Its experts are Q4_K, Q5_K, Q5_1 and Q8_0 blocks, 77 GB of them: more than a 64 GB PC holds.
 setup downloads the shards from a pinned revision, checks their SHA-256 once, and packs the model with `--compat-bf16`.
 That turns its Q8_0 hyper-connection projections into BF16, the form the engine reads.
+`STRATA_HC_Q8=1` in the engine's environment makes the verify window's hyper-connection read (the final mixer's before the head too) read the GGUF's Q8_0 values themselves (upstream fe6c5260; 0.63 GiB more VRAM, and the answers change).
+On the B70 one read of 4 tokens went from 35.6 to 31.9 µs and the decode from 45.0 to 45.4 tokens/s; on an RTX 4070 the expert cache lost the VRAM and the decode went from 22.4 to 21.8 tokens/s.
 The engine reads the experts from the GGUF files in place.
 It keeps a RAM budget of them, the most-used first after the ones the GPU holds (`--resident-budget-gib N`).
 setup chooses the RAM less 24 GB for N, less the KV cache too when that lives in RAM:
 36 GiB on a 64 GB PC with a 128K context.
 The rest come from the SSD while it answers.
-No images yet.
+Images can be chosen, with a warning that this file has not been run with them (upstream #967; reported working upstream).
 
 ```sh
 ./setup.sh --setup --family unsloth
 ```
 
 Measured on an Arc Pro B70 (32 GB) and an i7-14700 with 96 GB of RAM, with setup's configuration, 64 generated tokens of a short chat,
-every run from a cold OS cache ([record](../bench/results/2026-10-03-ud-low-ram/README.md)):
+every run from a cold OS cache:
 
 | | Decode tokens/s |
 | --- | ---: |
@@ -172,7 +241,6 @@ every run from a cold OS cache ([record](../bench/results/2026-10-03-ud-low-ram/
 | No RAM budget (`--mmap-experts`): every expert the GPU does not hold read through the OS file cache | 10.0–11.1 |
 
 The answers were the same tokens in every run.
-The quality has not been measured on Arc against llama.cpp (`unverified`).
 
 ### Less RAM than the model: the low-RAM mode
 
@@ -183,7 +251,23 @@ The engine then reads the experts from the model files instead of copying them a
 a native pack's from the GGUF files in place, the AVX-512 Q2_0 pack's from its `experts.bin`.
 
 - If the experts the GPU does not hold fit the RAM, they are copied into RAM once at start (`--resident-experts`).
+  The server then moves the adaptive tier's swaps (exchanges between the RAM copy and the GPU cache) on a helper
+  thread between verify windows (`--adapt-async`, opt-in upstream in b437b8ea, the default here).
+  No window waits for a whole round of swaps.
+  On an RTX 4070, swapping about 95 experts a round, decoding ran 14-15% faster (the B70 within the run-to-run spread).
+  Which window first computes a swapped-in expert on the GPU depends on when its copy lands, so an answer can differ a little from run to run.
+  `--adapt-async 0` restores the tier in which a window waits.
+  Without page-locked exchange buffers, and with `--batch`, the waiting tier runs.
+  With `--pipeline-windows 2` ([MULTIGPU](MULTIGPU.md)) the decode loop queues each card's copies while that card has no window in flight, and the copies into the evicted slots and the moves into RAM wait until the windows that were in flight when they were decided have completed (upstream 13eee452; `STRATA_PIPELINE_ADAPT_ASYNC=0`: the waiting tier).
+  `STRATA_EXCHANGE_ROTATE=1` (opt-in, upstream 1e6cec80) hands the exchange buffer's ownership over at a swap instead of
+  copying the evicted expert into the RAM copy (the same tokens, fewer host copies).
+  It works only with a pack whose experts are all one size (the AVX-512 Q2_0 pack's `experts.bin`) and a fully
+  page-locked RAM copy; a native pack, whose blobs differ by layer, says so in the log and keeps the copying exchanges.
 - Otherwise they are read through the OS file cache (`--mmap-experts`), which re-reads them from the SSD as it runs: slower.
+  Reading from the GGUF files, the prefill copies the experts with the SSD profile (many threads, a deep ring). When
+  90% or more of the experts' pages are already in the page cache at the first prefill (Linux: a sample checked with
+  `mincore`), it takes the RAM profile (a few threads) instead and says so in its log (upstream 83a7dbc0, #1353).
+  `STRATA_STAGER_SSD=1` / `0` forces either.
 
 `--low-ram on|off|resident|mmap` overrides the choice, and `./setup.sh --check` shows what each size would use.
 
@@ -196,10 +280,15 @@ With a native pack whose experts the GPU mostly holds, `STRATA_ARENA_MMAP=1` in 
 The first start writes the arena to `experts.bin` (only when the drive has its size and 2 GiB more free); later starts map it.
 The pages of the experts in VRAM are handed back to the OS (`STRATA_ARENA_RELEASE=0` keeps them) and the rest are read ahead.
 The GPU does not read the mapping directly: run with `--pcie-frac 0`.
-With the Coder on the B70 (a 23.4 GiB arena, all in VRAM) it handed 23.38 GiB back, gave the same output, decoded as fast (28.3 tok/s) and read the prompt a little slower (54 to 48 tok/s).
+With the Coder on the B70 (a 23.4 GiB arena, all in VRAM) it handed 23.38 GiB back, gave the same output, decoded as fast (28.3 tok/s) and ran prefill a little slower (54 to 48 tok/s).
+
+The loads at start (the weights, the native dense matrices, the GPU cache's fill from the profile, the experts kept in RAM, the MTP draft files) ask the kernel to read ahead before they read (madvise / posix_fadvise WILLNEED in 128 KiB steps, upstream cb33c0ba).
+The drive then sees a deep queue instead of one page fault at a time.
+Upstream measured it on a Gen3 NVMe (RTX 5090, 32 GB, Q2_0 kept in RAM at 262K): ready in 70 s instead of ~920 s.
+`STRATA_READ_AHEAD=0` turns it off; `STRATA_FILL_AHEAD=N` sets how many pairs the cache fill asks for ahead (default 256).
 
 The processor's own graphics share the RAM, so they never take the low-RAM mode.
-setup's estimate of how much of a model the GPU holds is upstream's (its VRAM less ~5 GB) and has not been checked on an Arc card (`unverified`).
+setup's estimate of how much of a model the GPU holds is upstream's (its VRAM less ~5 GB).
 
 ## What you need
 
@@ -207,11 +296,12 @@ The GPU, CPU, RAM and disk are in the [README](../README.md#what-you-need).
 This adds only what the README leaves out.
 
 - **Packages**: with the deb and rpm packages ([README](../README.md#install)), apt or dnf installs what is needed.
-  From the source, an Intel GPU needs its runtime (Level Zero), an NVIDIA GPU its driver and the CUDA toolkit, and an
-  Intel GPU in the default contrib build oneMKL. setup can build the SYCL compiler (intel/llvm).
+  From the source, an Intel GPU needs its runtime (Level Zero), an AMD GPU ROCm (HIP, rocBLAS, hipBLASLt and others),
+  an NVIDIA GPU its driver and the CUDA toolkit, and an Intel GPU in the default contrib-llvm build oneMKL.
+  setup can build the SYCL compiler (intel/llvm).
   setup installs no system packages, so install them first.
-  What Ubuntu 26.04 and Fedora 44 need is in [BUILD.md](BUILD.md#packages).
-- **The GPU device**: for an Intel GPU, your user must be able to open `/dev/dri/renderD*` (the `render` group).
+  What Ubuntu 26.04 and Fedora 44 need is in [BUILD.md](BUILD.md#packages), and `./setup.sh --packages` prints the one-line command for this PC.
+- **The GPU device**: your user must be able to open `/dev/dri/renderD*` (and `/dev/kfd` for an AMD GPU; the `render` group).
 - **Disk**: about 60–110 GB for the model and about 6 GB for the MTP layer (1 GB more with images).
   **The original model's Q2_0 on an AVX-512 CPU** also writes a one-time copy of its experts (about 40 GB) for the fast CPU kernel.
   An NVMe SSD is strongly recommended.
@@ -266,8 +356,11 @@ The app has three tabs:
 - **Chat**: streaming answers; the model's thinking (folded away once it answers); code with a copy button;
   pictures when images are on; sampling and thinking-level settings.
   Chats stay in your browser.
-- **Monitor**: what the model is doing (reading the prompt, with progress, or writing, at how many tokens/s);
+- **Monitor**: what the model is doing (prefill, with progress, or decode, at how many tokens/s);
   GPU load, VRAM, temperature, power and PCIe traffic; CPU, RAM and disk; the context in use; the last requests.
+  Its conversation cache card shows how many prefill tokens the cache gave back (in the last request and since the
+  start) and, with `--conversation-cache-mib`, the parked conversations and their memory, and how many were parked,
+  restored and evicted (upstream #596; the same is under `"conversation_cache"` in `/metrics`).
 - **About**: the model and engine settings, and the addresses to connect other apps.
 
 `http://127.0.0.1:8095/?q=your question` opens it with a new chat already asking.
@@ -291,13 +384,17 @@ Engine options you added to `"args"` by hand are not carried over: setup names t
 ./setup.sh --gpus 1,2                       spread the layers over two or more GPUs (remembered; docs/MULTIGPU.md)
 ./setup.sh --vram-reserve-mib 2048          leave 2 GB of VRAM free for other programs (remembered)
 ./setup.sh --no-browser                     do not open the chat page when the model is ready (remembered; --browser undoes it)
-./setup.sh --calibrate                      tune the engine for this PC (about 5-10 minutes), then start
+./setup.sh --calibrate                      tune the engine for this PC (about 15-30 minutes), then start
 ./setup.sh --check                          only check this PC
 ```
 
 **Updating**: run `./update.sh`.
 For a git checkout it runs `git pull`, then updates the engine, the Python packages and the model settings (it does not start the model).
 It compiles the engine again when its source changed; if that compile fails, it says so and keeps the engine you had.
+
+**New releases**: the server asks GitHub for MistVVK/XeStrata's latest release at the start and every six hours after; when it is newer than this copy, it prints a line in its window and shows it on the chat page's About tab.
+About's "Check now" and `./setup.sh --check-update` (`xestrata --check-update` with a package) check at once, at any time.
+`XESTRATA_UPDATE_CHECK=0` in the environment turns the automatic checks off ("Check now" and `--check-update` still work).
 
 ### Leaving VRAM for other programs
 
@@ -316,29 +413,73 @@ Between requests, `POST /v1/vram` with `{"reserve_mib": 6000}` gives the cache's
 A running request finishes first.
 The experts of the pieces given back are computed on the CPU: the same answers, slower.
 `GET /v1/status` shows the current size under `"vram"`.
+A reserve that cannot be met (the cache at its smallest size, or no VRAM from the driver for the next segment) still answers `200`: compare the answer's `vram_free_mib` with your `reserve_mib` (upstream #1034).
+While a request runs or waits, it waits up to 300 s, then answers `409`.
 Where the GPU's runtime has no virtual memory it is off and the cache stays as it started (Intel's Level Zero and NVIDIA's CUDA have it; AMD's HIP in intel/llvm 7.1.1 does not).
 
 ### Model files downloaded by hand, or from a mirror
 
 setup's step 5 prints the folder it expects them in (`XeStrata-data/models/<SIZE>/`; upstream #495).
 Put them there with their original names, or point setup at them with `--gguf-dir`.
+To see what a file really holds before using or downloading it, `./setup.sh --inspect <file>` (upstream #911) reads only its headers (a few MB, also over the network).
+It shows every weight group's real bits per weight and storage types, and whether the file is one setup installs (under any name), stored like one of them, or not one XeStrata runs (another architecture, or experts in a format no kernel reads).
+It takes a file, a folder, a URL, `ms:owner/repo` (ModelScope) or `hf:owner/repo`, optionally followed by a variant name.
+A name says little: Unsloth's `UD-IQ3_XXS` stores its routed experts at 3.22 bits per weight, `UD-Q4_K_XL` at 5.10, the original `Q2_0` at 2.25 and `IQ3_S` at 3.33.
 To download from a Hugging Face mirror, set `HF_ENDPOINT` (e.g. `HF_ENDPOINT=https://hf-mirror.com ./setup.sh`):
 the pinned revisions and the checks are the same, and the MTP tensors come from the same host.
 
+**From ModelScope** (mainland China, upstream #908): every repository setup downloads from (the GSQ-RCO models, Swift 1.5, the Coder, Unsloth's files, and the original checkpoint the MTP draft layer is taken from) is on [ModelScope](https://www.modelscope.cn) under the same name, with the same files.
+Setup never switches to it by itself (a download that fails says how).
+Choose it with `--source modelscope` (`STRATA_SOURCE=modelscope`).
+ModelScope serves a repository's current files (no pinned revision), so each file is checked against the SHA-256 ModelScope publishes for it, and the MTP tensors against the pinned checkpoint's own hashes.
+The published SHA-256 is ModelScope's own statement: a changed upstream repository would carry its own hash.
+Setup says so when you choose it.
+
 ### Tuning for your PC (`--calibrate`)
 
-Three engine settings depend on the PC more than on the model:
+Four engine settings depend on the PC more than on the model:
 
-- the share of the experts missing from VRAM that are copied to the GPU instead of computed by the CPU (`--pcie-frac`):
-  a fast PCIe link and a slower CPU want more, a laptop's narrower link less;
+- the share of the experts missing from VRAM that are copied to the GPU instead of computed by the CPU (`--pcie-frac`).
+  Without it the engine splits them by an expert's time on each side, measured at start
+  ([XE](XE.md#splitting-the-missed-experts-between-the-cpu-and-pcie)); a fixed share is kept only when it is more than 3% faster;
 - how sure the draft layer must be to add another guess to a check (`--spec-min-p`);
-- how many CPU threads compute experts (`--pool-workers`): on CPUs with efficiency cores, fewer can be faster.
+- how many CPU threads compute experts (`--pool-workers`): on CPUs with efficiency cores, fewer can be faster;
+  it also tries one fewer than the P-cores, and one fewer than one socket's cores on a 2-socket PC;
+  on a CPU with more efficiency cores than performance cores, setup writes the performance cores (but the host's
+  one) and half the efficiency cores into the config before any tuning (upstream #642);
+- how busily the VRAM expert cache follows the conversation (`--adapt-every`, `--adapt-swaps`, `--adapt-decay`, upstream #907):
+  a PC whose CPU reads the missed experts slowly (DDR3, or DDR4 in few channels) gains from swapping more.
+  Upstream measured 160 swaps every window 7.9% faster than the default on a Xeon E5-2673 v3 with DDR3 and an RTX 4060 Ti on PCIe 3.0 x8.
+  This step measures 512-token answers.
 
 The defaults were measured by upstream on a Ryzen 5 7600 with an RTX 5070.
 Some have been measured again on the B70 ([XE.md](XE.md#upstream-settings-not-remeasured-on-xe)).
 setup offers to measure them on your PC after an install; `./setup.sh --calibrate` does it any time.
-It measures the output speed with each setting and keeps one only when it is more than 3% faster.
+It measures the decode speed with each setting and keeps one only when it is more than 3% faster.
 The result is remembered per PC and model in the settings file, so updates keep it.
+Measuring the worker count needs a fresh engine, so the model is loaded more than once, and the PC can stop responding for a minute or two each time (upstream #1197).
+When it finishes it starts the model (not with `--no-start`): do not start it a second time.
+
+`--pool-tasks N` sets how many row tasks each batched CPU expert phase (gate/up, then down) is cut into (upstream #949).
+It is neither the number of threads nor the tasks per expert.
+The default `0` keeps three per participating thread (the host included when it works too).
+Values `1` to `4096` are allowed, capped by the phase's row count.
+More tasks can even out the cores, but cost more scheduling:
+compare against `0` with the same worker count and workload.
+It changes neither the kernels, the phase barriers nor the PCIe placement; `--calibrate` does not tune it yet.
+For the server, add `"--pool-tasks", "192"` (for example) to the `args` of its configuration and restart it.
+
+`--aux-cpus` decides which CPUs run the threads that are neither CPU pool workers nor the host thread (Linux, `off` by
+default, upstream 91f1e85d): the expert cache's refills, the prefill copies, the file reads, the GPU runtime's threads
+and the like.
+`auto` takes the SMT siblings of the host's core, then the CPUs of physical cores with no worker. It never takes a CPU
+that shares a core with a worker, and does nothing when none is spare.
+A list such as `24,26` is taken as given, minus the host's and the workers' CPUs.
+It moves threads only and does not change the answers.
+`STRATA_AUX_CPUS` sets it too, and the API's `"strata_tune": {"aux_cpus": 1}` (`0` puts them back) switches it per
+request. `STRATA_AUX_STAGER=0` leaves the prefill copy threads where they were started.
+On an RX 9060 XT with a Ryzen 7 5700X (serve, IQ3_XXS, five interleaved rounds) `auto` sped up the 1K prefill and the
+wait before a 32K follow-up, but the 32K prefill read 3.2% slower, so the default stays `off`.
 
 ### Chat in the terminal
 
@@ -389,7 +530,12 @@ A relative path is in the XeStrata folder; one file per model.
 A profile per project works the same way: point the key at another file.
 The file is a fingerprint of what you used the model for: keep it on your PC.
 Without the key nothing is counted or written.
-setup rewrites the config when run again: add the key again then.
+A setup run again keeps the key, and `--expert-profile` (a file that still exists) and `--expert-profile-save` added to `"args"` by hand (upstream #775).
+
+An expert the adaptive tier swaps in is used on the GPU by the next window, which waits for its copy first.
+`STRATA_ADAPT_LAG=2` in the engine's environment uses it from the second window, so nothing waits (upstream #764; the
+answers change by that much, and are the same run to run with the same settings).
+Decode went from 59.1 to 64.2 tokens/s on an RTX 4070 and from 76.5 to 76.9 on the B70 (IQ2_XS).
 
 ### When the draft head does not fit
 
@@ -400,11 +546,17 @@ When the start stops with "the draft head does not fit", the engine says how muc
 and the server's start error repeats it.
 setup suggests `--draft-vocab en` on cards under 14 GB; it is only a suggestion, nothing changes unless you pass it.
 
+The server also runs without `--mtp` (upstream 3216d271).
+The drafts then come from the suffix and prompt lookup only (one token a round when neither fires), and every token is still verified against the model.
+The draft layer's VRAM (about 0.7-1 GiB with its head) goes to the expert cache: 1,000 to 1,678 slots in upstream's comparison on an 8 GB card.
+Parked and saved conversations carry the draft layer's K/V, so without `--mtp` the conversation cache's parking, `--conversation-save` and the session files are off.
+
 ---
 
 ## Using it
 
 The server listens on `http://127.0.0.1:8095` (change it with `--port` in setup, or in the run script).
+To switch between it and other model servers behind one address, see [LLAMA_SWAP.md](LLAMA_SWAP.md).
 
 | API | Endpoint |
 | --- | --- |
@@ -415,6 +567,7 @@ The server listens on `http://127.0.0.1:8095` (change it with `--port` in setup,
 | Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
 | What the model is doing right now | `GET /status`, `GET /slots` (a single slot, busy or idle) |
 | Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
+| The same for Prometheus, with vLLM's metric names (`Accept: text/plain` or `?format=prometheus`) | `GET /metrics` |
 | The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
 
 `/models` and `/v1/models` list only the loaded model, with its context limit and input modalities.
@@ -452,6 +605,8 @@ in the chat page (the "Thinking" menu), in `chat.py` (`/think low`), or over the
 | Anthropic | `"output_config": {"effort": "low" \| "medium" \| "high"}`, `"thinking": {"type": "disabled"}`, or `"thinking": {"type": "enabled", "budget_tokens": N}` (under 2K = low, under 8K = medium, more = high) |
 
 Without a setting the model uses its own default, **high**.
+`"reasoning_effort": "low"` (or `none`, `medium`, `high`) in the run config sets the level of every request that names none (upstream #1641).
+A `--reasoning-effort` in `args` is moved there by the server, with a note.
 `none` answers at once (fastest); `low` keeps the thinking short.
 The levels are instructions the model was trained with, not a hard token limit:
 on easy questions all three think briefly, on hard ones `high` thinks longest and is most accurate.
@@ -466,7 +621,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   `"effort_position": "end"` in `xestrata-<model>.json` renders every request's prompt start as the default effort's and puts a `low` / `medium` effort in a short system turn right before the answer (no thinking: the empty thinking block, as always).
   The engine keeps its conversation checkpoint in front of that turn (`--tail-role-token`; the server checks that the engine knows it), so the next request reuses the conversation whatever its effort.
   The default (`"start"`) prompt is unchanged.
-  The model sees a level that is not the default in another place than it was trained with; how well it follows it there is not measured yet.
+  The model sees a level that is not the default in another place than it was trained with.
 - **A reply stuck on one token is ended.** When a reply repeats the same token 256 times in a row, the server ends it there with `finish_reason` `"length"` and says so in its window:
   a model in a loop, or a broken state that answers one token forever (upstream's #606 saw 36,689 tokens of `!`).
   `"repeat_stop_tokens": N` in `xestrata-<model>.json` sets the run length; `0` turns it off (for a request that really wants one token many times).
@@ -540,7 +695,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   Every other key of the file stays as it is, the earlier file is kept as `xestrata-<model>.json.bak`, and the model uses the change from its next start.
   Only XeStrata's own page can save (JSON, with the API key when one is set, as for the Chat settings); the network, key, MCP and program keys are not editable there.
 - **From other devices on your network.** The server listens on your PC only (`127.0.0.1`) unless you say otherwise:
-  run `./setup.sh --setup --host 0.0.0.0 --api-key some-long-secret`, or add `"host": "0.0.0.0"` and `"api_key": "..."` to `xestrata-<model>.json`.
+  run `./setup.sh --host 0.0.0.0 --api-key some-long-secret` (kept in the model's config for the next starts), or add `"host": "0.0.0.0"` and `"api_key": "..."` to `xestrata-<model>.json`.
   The server window then prints this PC's addresses (`from other devices: http://192.168.x.x:8095/`).
   Open that on the other device, or use `.../v1` as an API base URL.
 - **From the internet.** Put a tunnel in front of it, for example
@@ -548,6 +703,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   `cloudflared tunnel --url http://127.0.0.1:8095`.
   **Set a key first**, or anyone with the link can use your PC:
   add `"api_key": "some-long-secret"` to `xestrata-<model>.json` (or set the `STRATA_API_KEY` environment variable); clients then send it as their API key.
+  Several keys, separated by commas, are all accepted (`"key1,key2"`, as llama.cpp does; `--api-key key1,key2` likewise).
   An API key that is given but empty refuses to start the server (it would switch authentication off).
   Streamed answers carry `X-Accel-Buffering: no`, so nginx-style proxies pass each token on at once.
   The web app's settings and MCP tools only answer XeStrata's own page.
@@ -595,6 +751,31 @@ A prompt read from the start is also checkpointed at the end of its system promp
 so the root exists for agent clients with long system prompts and tool lists.
 Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`, `--prompt-cache-root N` (0 = no system-prompt checkpoint), `--turn-token ID`.
 
+A one-shot request that no later request continues (a classification call, a probe) can send `"strata_checkpoint": false` in its body.
+It takes no checkpoint at the start of its last turn nor every 16K tokens, and its session is neither kept nor parked for a next request.
+It still starts from a checkpoint it matches, and still takes the system-prompt root when that reaches `--prompt-cache-root`.
+Without the field, or with `true`, nothing changes.
+
+For many questions about one long document a request can say where the document ends (`"strata_prefix"`, opt-in, upstream 13d14a49).
+It takes `{"messages": 1}` (the first message is the document), `{"message": 0, "chars": 210000}` (the first 210,000 characters of message 0, for a client that sends the document and the question in one message) or `{"tokens": 12345}`.
+The engine reads the prompt in two parts there and pins the checkpoint at the boundary.
+A pinned checkpoint is never evicted, a parked conversation holding it stays parked, and `SAVE` keeps it.
+When a later question resumes from it, the question it leaves is not parked.
+The next question starts at the end of the document, so any number of questions cost one read of it.
+On the B70 with IQ2_XS, three questions after a 1,791-token prompt: the second and third reused 1,766 tokens and read only 19-20.
+The field is checked against the prompt's own ids (the prefix is always the longest common start), a prefix that cannot be marked is said in the server's log and ignored, and a malformed field is a 400.
+One pinned prefix at a time per engine (a new one replaces it); it needs `--prompt-cache 3` or more.
+`tools/research_run.py` runs a document and a question list against a server with and without the field.
+The engine's own key is `pin=N` on the `GEN` line.
+
+Two options are off by default (both on one GPU).
+
+- `--prompt-cache-tail` (an engine argument): one more checkpoint at a chunk boundary within one chunk of the prompt's end.
+  A continuation that branches between the every-16K checkpoints reads less again. This checkpoint is evicted first and pushes out no other.
+- `STRATA_CACHE_MESSAGE_BOUNDARY=1` (the engine's environment): a checkpoint before the last user message (at the end of the turn before it).
+  An agent that keeps a long history and replaces only the last message does not read the history again.
+  It applies to a history of 8,192 tokens or more with a last message of at most 1,024; it splits the prompt's chunks and costs a fresh request the time of the snapshot.
+
 ### Several conversations (opt-in)
 
 Add `--conversation-cache-mib 8192 --conversation-cache-slots 4` to the engine arguments (the config's `args`) to park up to four conversations in at most 8 GiB of RAM.
@@ -606,11 +787,25 @@ A chat and an agent's subagent can then alternate without re-reading each other.
   Nothing tells conversations apart but their tokens, pictures and control-vector setting.
 - The default is 0 (off); `--prompt-cache 0` turns it off too.
   Parked conversations are not kept across restarts, unless [the next section](#keeping-parked-conversations-across-restarts-opt-in) is set up.
-- Before each copy the engine checks that `--conversation-cache-min-free-mib N` (default 2560) of RAM stays free (`MemAvailable`).
-  If it does not, or the copy does not fit the budget, it skips parking and reads the prompt as before.
-  The oldest parked conversation is dropped first.
+- Before each copy the engine checks that `--conversation-cache-min-free-mib N` (default 2560) of RAM stays free (the figure is read as below).
+  If it does not, it evicts the oldest parked conversations and checks again (upstream 940011da).
+  If that is still not enough, or the copy does not fit the budget, it skips parking and reads the prompt as before.
+  To fit the budget, too, the oldest parked conversation is dropped first.
+- `--conversation-cache-min-tokens N` (default 0 = every one) parks only conversations of at least N tokens (upstream 624070c5).
+  A parked conversation takes one of the slots whatever its length, so a client that puts short side requests between the turns of a long conversation filled the slots with them and evicted the long one.
 - A copy that fails to go back stops the engine instead of letting it answer from half a state.
 - After a restore, the K/V pages a conversation has not changed are reused for its next copy (`STRATA_SNAPSHOT_FULL_CAPTURE=1` turns that off).
+
+**How the available RAM is read** (upstream daa76552): the RAM checked before parking a conversation and before saving or restoring a conversation file is the smallest of:
+
+1. `MemAvailable`
+1. The room under the memory limits of the engine's cgroup and of every cgroup above it (v2 `memory.max` and `memory.high`, v1 `memory.limit_in_bytes`), less what is in use.
+   The clean inactive file cache (`inactive_file` in `memory.stat`) is not counted as in use.
+   A cgroup file that cannot be read makes the guard warn once and use `MemAvailable` alone without `--memory-limit-mib`; with it, the figure is unknown and nothing is parked.
+1. `--memory-limit-mib N` (or `STRATA_MEMORY_LIMIT_MIB=N`; the flag wins, 0 = no limit) less what the engine's container uses now.
+   For a container that cannot see its own limit: the total, in MiB, it may use.
+
+Started with `--serve`, the engine prints this breakdown in one `memory guard:` line.
 
 Measured on the B70 with IQ2_XS: a 970-token conversation (8K context, FP16 KV) is 251 MiB parked, copied out in 70–104 ms and back in 21–23 ms.
 Its answers and state match a run without parking byte for byte:
@@ -648,7 +843,41 @@ Measured on the B70 with IQ2_XS, a conversation of 9,183 tokens (INT8 KV, two ch
 After a restart it was read back from the CPU-attached NVMe in 0.28 s, and only the 7 new tokens were read (without the file, the 9,167 tokens are read again in 7.9 s).
 The answer matches a run without the restart, also on the small configuration (8 GB, no XMX).
 Writing a conversation of 300-360 MiB takes 0.10-0.16 s; when the RAM cache pushes one out, the next request waits that long.
-Compressed, the same conversation takes 421 MiB, 0.30 s to read back and 0.23 s to write ([the record](../bench/results/2026-10-04-conversation-save-compress/README.md)).
+Compressed, the same conversation takes 421 MiB, 0.30 s to read back and 0.23 s to write.
+
+### Saving a conversation to a file and restoring it (opt-in)
+
+The conversation the engine holds can be saved to a named file and restored later, also after a restart.
+A request that continues the restored conversation does not read its long prompt again.
+Started with `--slot-save-path DIR` (`"slot_save_path"` in the config), the server takes llama-server's slot API save and restore, for slot 0 only.
+The file format is XeStrata's (Strata's), not llama.cpp's. There is no erase action.
+
+```bash
+curl -X POST "http://127.0.0.1:8095/slots/0?action=save"    -H "Content-Type: application/json" -d '{"filename": "chat1.bin"}'
+# {"id_slot": 0, "filename": "chat1.bin", "n_saved": 4996, "n_written": 312432956, "timings": {"save_ms": 200.7}}
+curl -X POST "http://127.0.0.1:8095/slots/0?action=restore" -H "Content-Type: application/json" -d '{"filename": "chat1.bin"}'
+# {"id_slot": 0, "filename": "chat1.bin", "n_restored": 4996, "n_read": 312432956, "timings": {"restore_ms": 162.3}}
+```
+
+- DIR becomes an absolute path at start (`--slot-save-path` from the server's working folder, `"slot_save_path"` from the config's `"cwd"`), created with mode 0700 when missing.
+  The files hold the conversation's tokens and state and are created with mode 0600. Nothing deletes them.
+- `filename` is a file name inside DIR only: no path, drive, `:`, Windows device name, control character, leading `.`, or trailing `.` or space.
+- Before a save, the disk must have room for the new file plus `--session-min-free-mib` (an engine argument; default 4096, 0 = no check).
+- `--session-save-reclaim` (an engine argument, off by default; upstream 73ed39ae): a save that fails its RAM check first releases host caches that can be rebuilt, then checks again.
+  In this order: the retained K/V copies, the oldest unpinned parked conversations, the unpinned checkpoints other than the one written to the file.
+  Pinned prefixes and the checkpoint written stay. The server gives the released RAM up to 30 seconds to show in the figures before it tries again.
+- A file is restored only by the same engine version with the same model files and settings (KV precision, context length, MTP, control vector and so on).
+  A file that does not match, or a damaged one, is refused, and the engine's conversation stays as it was.
+- Only the checkpoint at the start of the last turn is saved: a continuation that edits an earlier turn reads again from there.
+- Not with parallel requests (`"parallel"`) or a layer split over several GPUs (`501`, and the engine refuses).
+- The request must be `Content-Type: application/json` (else `415`); from a browser page only XeStrata's own page and trusted origins.
+- Status codes: `501` without a save folder or with parallel requests; `400` for another slot, action or name, or a file the engine refused; `404` for a restore of a missing file;
+  `503` while the model is not loaded or the RAM is short; `507` when the disk has no room; `500` for any other I/O failure and when the engine ended.
+  An engine that ended is started again by the next request.
+
+Measured on the B70 with IQ2_XS, the file of a 4,996-token conversation (INT8 KV) took 312 MB, 0.20 s to save and 0.16 s to restore.
+Restored after a restart, the continuation was answered in 0.31 s without reading the 4,996 tokens again (8 s to read them all), and the answer matched a run without the save.
+The same held on the small configuration (8 GB, no XMX) and with the icpx build.
 
 ### Current limits and sampling
 
@@ -664,10 +893,19 @@ Compressed, the same conversation takes 421 MiB, 0.30 s to read back and 0.23 s 
   With no block at all, a request without sampling keys decodes greedy.
 - The penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`) ride the same path.
   `penalty_last_n` caps how many recent tokens they count over, 64 by default when any penalty is set.
+  llama.cpp's names `repeat_penalty` and `repeat_last_n` work too, in the config's `sampling` block and in a request (upstream #1819).
   They count the tokens the request has consumed, so a repetition penalty suppresses what the model itself just said, not the prompt alone.
   They apply to every token speculative decoding checks at once, exactly as if it decoded one token at a time.
   The draft layer guesses without penalties, so more of its guesses are rejected and requests with penalties run slower.
 - `top_k` keeps at most 64 candidates: `0` ("off") or anything above 64 uses all 64.
+- A sampling field sent as a numeric string (`"0.7"`) is read and used; a value that cannot be read as a number, or of another type (`true`), is a 400 that names the field (upstream #1663).
+- **logit_bias**: `"logit_bias"` in `/v1/chat/completions` (`{"<token id>": -100 to 100}`, or a list of `[id, bias]` pairs) is added before the penalties and filters (upstream dcc6f756).
+  -100 (`false` in a pair list) keeps the token out. Not with parallel requests (`"parallel"`).
+- `STRATA_SPEC_GUMBEL=1` (opt-in, upstream 6381df34) picks a sampled request's token by Gumbel-max.
+  The noise is drawn per token id instead of along the probability-sorted list, so the tokens follow the same distribution while `--coupled-draft` drafts agree more often with the target's pick.
+  With `--coupled-draft`, temperature 1.0 / top_p 0.95 / top_k 20 and eight 200-token story and code answers, three runs each, the median decode went from 51.05 to 52.05 tokens/s (+2.0%) on an RTX 4070 and from 80.25 to 72.75 tokens/s (-9%) on the B70.
+  The drafts kept on the 4070 rose from 64.1% to 70.8%.
+  The result differs by card: measure on yours before turning it on.
 - **logprobs:** `"logprobs": true` with `"top_logprobs": K` (0–20) on `/v1/chat/completions` returns each token's log-probability and the K most likely candidates in `choices[].logprobs` (streamed too; from upstream's Intel port, 4ba35fd).
   The values are the model's own, before sampling, temperature and penalties.
   Tokens written while it thinks are listed under `reasoning_content`; the stop token is not listed.
@@ -859,7 +1097,7 @@ Nothing else changes.
 With images on, setup passes `--vram-reserve-mib 700` to the engine.
 That is the same value as the text-only default, but the engine then no longer lowers the reserve on a small card
 ([XE.md](XE.md#the-vram-reserve-on-a-small-card)).
-The GPU encoder's own VRAM can leave the expert cache smaller and the text a little slower (not measured on the B70).
+The GPU encoder's own VRAM can leave the expert cache smaller and the text a little slower.
 
 The two GPU encoder builds (Vulkan, and SYCL in contrib-icpx), how their results differ, and the order in which the server falls back to the CPU are in [XE.md](XE.md#images).
 A picture becomes up to 1,024 tokens of the context (a 640x480 photo: 300).
@@ -869,6 +1107,25 @@ The same picture sent again, as chat apps do on every turn, is encoded only once
 It is `"max_tokens"` in the `"vision"` section of `xestrata-<model>.json`, which you can also edit by hand.
 More tokens keep more detail (small text, charts, screenshots) and take longer to encode, on the CPU most of all.
 A setup run again keeps the value for the same encoder place (GPU or CPU).
+
+**A minimum of image tokens** (upstream #767): `"min_tokens": N` written by hand in the `"vision"` section of `xestrata-<model>.json` is passed to the encoder as `--min-tokens N` (mtmd's `image_min_tokens`): a small picture is scaled up to at least N tokens.
+llama.cpp's mtmd prints that Qwen-VL models want at least 1,024 for pointing at or counting small items.
+The default is no minimum.
+A higher minimum changes the image answers and takes longer to encode (the CPU of an i7-14700, 14 threads: a 512x384 picture as 192 tokens in 0.9 s, with `--min-tokens 256` as 266 tokens in 1.5 s).
+A setup run again keeps the value.
+
+**A Q8_0 encoder** (upstream #625): `"mmproj"` in the `"vision"` section can point to another mmproj file of this model, for example a Q8_0 one (`llama-quantize mmproj-Qwen3.8-Flash-Next-BF16.gguf mmproj-Qwen3.8-Flash-Next-Q8_0.gguf Q8_0` makes one).
+The file is smaller (590 MiB against 865 MiB for the BF16 one), the encoder takes about 280 MiB less RAM on the CPU, and at the default 300 tokens it can encode faster than BF16.
+It is the one to use with `--vision cpu`.
+Setup downloads the BF16 file, and a setup run again keeps a file of your own that still exists.
+Against BF16, upstream reports a cosine of the embeddings per image token of 0.997-0.999 on average (at 300, 768 and 1,024 tokens), 0.94-0.96 for the worst token.
+Above 768 tokens the encode time is within about 3% of BF16's.
+
+**Flash attention in the CPU encoder** (upstream #660): ggml's fast CPU kernel for flash attention needs the encoder's head size (72) to be a multiple of the vector width.
+It is with AVX2's 8 floats, not with AVX-512's 16, where ggml falls back to a kernel several times slower that adds in FP16.
+`strata-vision` therefore turns flash attention off in a CPU build whose ggml has AVX-512, and leaves it at `auto` (on) otherwise.
+`--flash-attn on|off|auto` overrides that.
+Upstream measured a 1024x1024 picture on a Ryzen 7 7700X with 8 threads: AVX2 8-10 s with it and 14-15 s without, AVX-512 44 s with it and 13 s without.
 
 ### Sending a picture
 
@@ -924,6 +1181,7 @@ so measure it on your own prompts; the Monitor marks every request ESP or stock.
 
 **Turning it on (at setup).** `./setup.sh --setup` asks "Turn on the experimental speed projection?" (default: no),
 or pass `--experimental-speed-projection on` (`off`, or a path to another vector GGUF).
+The deb and rpm packages do not carry the vector: with it turned on, setup downloads the vector and its license from the installed version's tag on GitHub into `experimental-speed-projection/` in the data folder.
 Only for the original Qwen3.8-Flash-Next, not Swift 1.5.
 It writes these engine flags (llama.cpp's) into `xestrata-<model>.json`:
 
@@ -953,21 +1211,29 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 
 | Symptom | What to do |
 | --- | --- |
-| `no Intel GPU on the xe or i915 driver and no NVIDIA GPU on NVIDIA's driver found` | The Intel GPU is not on the xe or i915 driver, and the NVIDIA GPU not on NVIDIA's; check the driver with `lspci -k`. For a discrete card, enable Above 4G Decoding and Re-Size BAR and disable CSM in the BIOS. |
-| `an NVIDIA GPU needs the contrib build` | `--license free` or `--license contrib-icpx` is chosen. NVIDIA GPUs run in the contrib build only: run setup again with `--license contrib`. |
+| `no Intel GPU on the xe or i915 driver, no AMD GPU on amdgpu and no NVIDIA GPU on NVIDIA's driver found` | The Intel GPU is not on the xe or i915 driver, the AMD GPU not on amdgpu, and the NVIDIA GPU not on NVIDIA's; check the driver with `lspci -k`. For a discrete card, enable Above 4G Decoding and Re-Size BAR and disable CSM in the BIOS. |
+| `an NVIDIA GPU needs the contrib build` | `--license free` or `--license contrib-icpx` is chosen. NVIDIA GPUs run in the contrib-llvm build only: run setup again with `--license contrib`. |
 | `NVIDIA's CUDA toolkit is missing` | The CUDA toolkit that makes the NVIDIA GPU's code is not installed. Install it and run setup again (Ubuntu: `sudo apt install nvidia-cuda-toolkit`). |
-| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | The contrib or contrib-icpx build hands the Intel GPU's dense matrix products to oneMKL, which is missing. Install it ([BUILD.md](BUILD.md#packages)), or run setup again with `--license free`. |
+| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | The contrib-llvm or contrib-icpx build hands the Intel GPU's dense matrix products to oneMKL, which is missing. Install it ([BUILD.md](BUILD.md#packages)), or run setup again with `--license free`. |
 | `no access to the GPU` | Your user cannot open `/dev/dri/renderD*`: `sudo usermod -aG render $USER`, then log in again. |
+| `no access to the GPU's compute device (/dev/kfd)` | Your user cannot open `/dev/kfd`, which AMD GPUs compute through: `sudo usermod -aG render $USER`, then log in again. |
+| `... the engine needs an RDNA2 or later AMD GPU` | AMD GPUs older than RDNA2 do not run it. |
+| `... rocBLAS ... has no code for gfx...`, `... has no code for gfx...` | The distribution's rocBLAS (in a package, its engine) has no code for that GPU. On Ubuntu 26.04, it may run on Fedora 44 ([README](../README.md#amd-gpus)). |
+| `building for the AMD GPU needs ROCm's ...` | ROCm's packages that build the AMD GPU's code are missing. Install the ones named and run setup again (see also `./setup.sh --packages`). |
+| `... has no HIP target (AMD GPUs)` | intel/llvm was built before ROCm was installed. Let setup build it again when it asks, or run `python3 tools/intel_llvm_build.py --rebuild`. |
+| `an AMD GPU needs the free or contrib build` | `--license contrib-icpx` is chosen. icpx has no AMD target: run setup again with `--license free` or `--license contrib`. |
+| `no progress for 60 s ... reading the prompt` on Linux, and the stall report says `threads waiting on the disk (state D): 16 ...` | The engine waits for the drive, not a deadlock: the n-gram table is read at random (`--ple-io direct`), which a rotational disk cannot keep up with (upstream #605). The engine warns at start when the table is on one; `--ple-io ram` (it needs RAM for the table) or the model on an SSD fixes it. Setup adds `--ple-io ram` itself on a rotational disk when the RAM holds the table. |
 | `the SYCL runtime of ... lists no GPU` | The GPU's Level Zero driver (`libze-intel-gpu1`, Intel's compute-runtime) is missing or too old for it; install a newer one ([BUILD.md](BUILD.md#packages)). |
-| `... gives this GPU no XMX` | The compiler gives the GPU no XMX; choose from setup's options. It runs without XMX, with prompts taking about 1.6 times as long ([BUILD.md](BUILD.md#the-sycl-compiler)). |
+| `... gives this GPU no XMX` | The compiler gives the GPU no XMX; choose from setup's options. It runs without XMX, with prefill taking about 1.6 times as long ([BUILD.md](BUILD.md#the-sycl-compiler)). |
 | `no SYCL compiler for the engine` | There is no SYCL compiler: install the distribution's DPC++, or pass `--intel-llvm-build`. |
 | `alloc_device: ... refused` at start | Happens rarely on the B70 (3 in about 120 starts); starting again usually works ([XE.md](XE.md#the-output-heads-vram-refusal)). |
 | Python or the build tools could not be installed | Install what it names, then run it again. Everything already done is kept and skipped. |
 | `port 8095 is already in use` | XeStrata is already running (look for its window), or another program uses the port: `./setup.sh --port 8081`. |
 | The first start takes minutes | It is reading 23–50 GB into RAM; the second start is faster while the files are in the OS cache. |
 | The PC freezes for a few minutes at the start | Normal, most of all the first time (the server window says when it happens): the engine loads the experts into RAM, registers part of it for the GPU and sizes the expert cache. Wait; don't close the window. Still frozen after 10 minutes: restart the PC, close other programs, try again, or pick a smaller size. |
+| The start takes many minutes while the kernel is busy compacting memory (`kcompactd`) | With transparent huge pages on `madvise`, the engine asks for `MADV_HUGEPAGE` on its arena, and on fragmented RAM every fault can then compact memory (upstream #771). `STRATA_NO_ARENA_THP=1` stops the request (with THP on `always` the engine does not make it at all). |
 | `the engine stopped unexpectedly (exit code ...)` | The engine process ended mid-answer, usually out of RAM (Linux ends the biggest program: `journalctl -k \| grep -i -E 'killed process\|out of memory'`). The next request starts it again by itself. If it repeats, close other programs or pick a smaller size. The server also warns at start when the model's experts leave less than ~6 GB of RAM for everything else. |
-| Slow output, disk light busy | Not enough free RAM: close other programs, or choose Q2_0 / IQ2_XS. |
+| Slow decode, disk light busy | Not enough free RAM: close other programs, or choose Q2_0 / IQ2_XS. |
 | `prompt ... exceeds the context` | The request is longer than the context you chose: run setup again with a bigger `--context`. |
 | Slower than expected | A monitor plugged into the GPU and other GPU programs take VRAM from the expert cache; RAM below its rated speed (check XMP in the BIOS) slows the CPU half. Check setup's `SYCL compiler: ...` line for a build without XMX. |
 | `this server was started without the vision encoder` | The model was set up for text only: run setup again with `--vision gpu`. |
@@ -975,6 +1241,7 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 | Pictures are slow | The encoder runs on the CPU: run setup again with `--vision gpu`. |
 | A request never finishes (`no progress for ... s`) | When the engine stops making progress, the request ends with an error (after 1 minute) and the next request starts the engine again. The log says where it stopped and what every CPU pool thread and the GPU handshake were doing. If you see it, please open an issue with that report. (`STRATA_WATCHDOG_S` sets the time in seconds; 0 turns it off.) |
 | `the engine said nothing for ... s during the request` | The engine and the server lost step (the engine waits for its next command, the server for the request's end; GPU at 0%, nothing in the log; upstream #481). The server ends the engine after 300 s without a line from it during a request, the request ends with an error and the next request starts the engine again. `"engine_silence_s": 600` in `xestrata-<model>.json` sets the time (0 = wait forever, as before). |
+| `the engine said nothing for ... s and used no CPU or disk in that time (frozen ...)` | A quicker version of the check above (upstream #1317): an engine that prints nothing and uses no CPU or disk for 90 s is taken as stuck, ended, and started again by the next request. One whose GPU is busy (10% or more) or that is silent but working is not ended, only reported once. `STRATA_ENGINE_STALL_S` sets the time (0 = off). While a prompt layer reads the file tier again (low RAM), the engine's own watchdog also waits up to 10 times as long (`STRATA_WATCHDOG_IO_S`, upstream #1407). |
 | Anything else | The engine log is `xestrata-<model>.log` in the XeStrata folder; attach it to an issue. |
 
 ---
@@ -993,13 +1260,14 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
   `STRATA_NO_AVXVNNI=1` goes back to AVX2).
 - **SSD:** the 28.8 GB n-gram table, read a few rows per token through the OS cache.
 - **Speculation:** the model's own MTP layer drafts up to 3 tokens; one pass over all 48 layers checks them.
-  On the B70 a check advances 2.1–3.4 tokens on average ([record](../bench/results/2026-10-03-mtp-accept/README.md)).
+  On the B70 a check advances 2.1–3.4 tokens on average.
   When the reply repeats the context (code edits, quoted text), **prompt lookup** drafts up to 5 tokens from the earlier copy,
   but only where its measured acceptance and cost say it pays.
   The drafts are checked like the MTP's, so the output is the same.
-- **Prompts** are processed in chunks of up to 32,768 tokens, with the experts streamed to the GPU over PCIe.
-  The matrix products run on XMX on Intel GPUs and on tensor cores on NVIDIA GPUs, and the contrib and contrib-icpx
-  builds hand the dense ones to oneMKL or cuBLAS through oneMath.
+- **Prefill** runs in chunks of up to 32,768 tokens, with the experts streamed to the GPU over PCIe.
+  The matrix products run on XMX on Intel GPUs, on WMMA on AMD GPUs (RDNA3 or later) and on tensor cores on NVIDIA
+  GPUs, and the dense ones go through oneMath: to oneMKL or cuBLAS in the contrib-llvm and contrib-icpx builds, and to
+  rocBLAS and hipBLASLt on AMD GPUs.
 
 Strata's design, measurements and bottlenecks are in upstream's paper, **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)** (measured on CUDA).
 
@@ -1009,7 +1277,7 @@ Strata's design, measurements and bottlenecks are in upstream's paper, **[docs/p
 
 The whole of XeStrata is under the [LGPL-3.0-or-later](../COPYING.LESSER).
 The code from Strata and from ggml / llama.cpp (both MIT) is part of it under the LGPL too; their copyright and permission notices are in [NOTICE](../NOTICE).
-The exceptions stay under their own licenses: the patches to intel/llvm and oneMath, `ggml-common.h`, Outfit and `third_party/nonfree/` (below).
+The exceptions stay under their own licenses: the patches to intel/llvm, the changes to oneMath, `ggml-common.h`, Outfit and `third_party/nonfree/` (below).
 The model files are not part of it; their licenses apply to them (below).
 
 - **The original software**: [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors.
@@ -1023,13 +1291,14 @@ The model files are not part of it; their licenses apply to them (below).
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the i-quant formats, the GPU dot products and dequantizers transcribed in `src/kernels/xe/`,
   the CPU backend linked for the i-quant experts, the `mtmd` library and the GPU backends (Vulkan, SYCL) behind the image encoder (`tools/vision/`),
   and `gguf-py` used by the tools. See `third_party/main/ggml/LICENSE`.
-- **[oneMath](https://github.com/uxlfoundation/oneMath)** (Apache-2.0): the layer that hands the contrib and contrib-icpx modes' dense matrix products to oneMKL (Intel) and cuBLAS (NVIDIA).
-  It is not in the repository: CMake fetches v0.9,
-  with XeStrata's changes (cuBLAS's BF16 product) from `third_party/main/oneMath/patches/`, under oneMath's license. See `third_party/main/oneMath/LICENSE`.
-- **[intel/llvm](https://github.com/intel/llvm)**'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib modes' compiler and SYCL runtime.
+- **[oneMath](https://github.com/uxlfoundation/oneMath)** (Apache-2.0): the layer that hands the dense matrix products to oneMKL (Intel) and cuBLAS (NVIDIA) in the contrib-llvm and contrib-icpx modes, and to rocBLAS and hipBLASLt (AMD) in the free and contrib-llvm modes.
+  It is not in the repository: CMake fetches XeStrata's fork ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), oneMath with XeStrata's changes: cuBLAS's BF16 product, hipBLASLt in the rocBLAS backend), under oneMath's license. See `third_party/main/oneMath/LICENSE`.
+- **[intel/llvm](https://github.com/intel/llvm)**'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib-llvm modes' compiler and SYCL runtime.
   It is not in the repository: `tools/intel_llvm_build.py` fetches the release and builds it,
   with XeStrata's fixes from `third_party/main/intel-llvm/patches/`, under intel/llvm's license. See `third_party/main/intel-llvm/LICENSE.TXT`.
-- **Ideas** from [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and [HyperQwen](https://github.com/syv-ai/HyperQwen);
+- **Ideas** from [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer), [HyperQwen](https://github.com/syv-ai/HyperQwen) and
+  [Project Maya](https://github.com/mw00/project-maya) (how many of the experts missing from VRAM the CPU computes and how many are read over PCIe,
+  [XE](XE.md#splitting-the-missed-experts-between-the-cpu-and-pcie));
   references in the paper.
 - **The web app's font**: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see `third_party/main/outfit/OFL.txt`;
   without it the app uses the system font). Its Monitor tab started from @code-martin's dashboard idea (PR #22).

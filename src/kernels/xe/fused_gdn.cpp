@@ -8,6 +8,8 @@
 // become the precise exp and SYCL's rsqrt.
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_fused_gdn
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <sycl/sycl.hpp>
 

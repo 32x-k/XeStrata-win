@@ -57,6 +57,11 @@ inline bool device_pointer(void** d, const void* h) {
 /// Synchronous copy, ordered after the work already on the compute queue (the CUDA legacy stream).
 bool copy(void* dst, const void* src, size_t bytes);
 bool copy_async(void* dst, const void* src, size_t bytes, Stream s);
+/// stream_wait_event(s, after), copy_async and event_record(done, s) as one submission: the copy waits for `after`
+/// (null or not recorded: for nothing) and `done` marks the copy (an event without timing; null: not kept).  Three
+/// submissions a copy filled the RTX 4070's stream when the prompt path queued its ring's 384 copies, and each copy
+/// held its issuer for about 160 us (the 2026-10-09-xe-event-record record).
+bool copy_async_after(void* dst, const void* src, size_t bytes, Stream s, const Event* after, Event* done);
 /// `height` rows of `width` bytes between pitched buffers (cudaMemcpy2DAsync).
 bool copy2d_async(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, Stream s);
 bool memset(void* dst, int value, size_t bytes);
@@ -77,6 +82,12 @@ void vmem_free(void* va, size_t bytes);
 VmemSegment* vmem_map(void* va, size_t bytes);
 /// Unmaps `seg` from `va` and gives its memory back (the device must not be using it).
 void vmem_unmap(void* va, size_t bytes, VmemSegment* seg);
+/// The chunk form (the elastic K/V, vmm.hpp): a physical segment of `bytes` not mapped anywhere (null: no memory),
+/// mapped read-write at a reserved `va`, unmapped from it (it keeps its bytes and can be mapped elsewhere), freed.
+VmemSegment* vmem_new(size_t bytes);
+bool vmem_attach(VmemSegment* seg, void* va, size_t bytes);
+bool vmem_detach(void* va, size_t bytes);
+void vmem_delete(VmemSegment* seg);
 /// The device's compute units and maximum clock in kHz (cudaDevAttrMultiProcessorCount / ClockRate); device 0 only.
 bool device_speed(int device, int* units, int* khz);
 
@@ -88,7 +99,9 @@ void host_unregister(void* p);
 /// Runs `fn` on a host thread after the work already on `s`; later work on `s` waits for it (cudaLaunchHostFunc).
 bool launch_host(Stream s, std::function<void()> fn);
 
-bool event_create(Event** e);
+/// `timing`: the event can be measured with event_elapsed_ms (cudaEventCreate); without it only ordered and waited on,
+/// which is cheaper to record (cudaEventDisableTiming).
+bool event_create(Event** e, bool timing = false);
 void event_destroy(Event* e);
 /// Marks the current end of `s`.
 bool event_record(Event* e, Stream s);
@@ -104,8 +117,13 @@ bool event_elapsed_ms(float* ms, const Event* from, const Event* to);
 bool begin_capture(Stream s);
 /// Stops recording and finalizes the graph.  An empty recording fails.
 bool end_capture(Stream s, Graph** out);
-/// Stops a recording in progress and discards it.
+/// Stops a recording in progress and discards it (and the branches stream_fork opened on it).
 void abandon_capture(Stream s);
+/// A branch: what `to` is given next runs after everything `from` was given so far, beside what `from` is given
+/// next.  While `from` records a graph, `to` records into the same graph until stream_join.
+bool stream_fork(Stream from, Stream to);
+/// The branch's end: what `into` is given next runs after everything `from` was given; `from` stops recording.
+bool stream_join(Stream into, Stream from);
 bool is_capturing(Stream s);
 bool graph_launch(const Graph* g, Stream s);
 size_t graph_nodes(const Graph* g);

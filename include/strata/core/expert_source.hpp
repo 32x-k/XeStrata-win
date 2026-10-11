@@ -25,9 +25,11 @@
 #pragma once
 
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/exchange_storage.hpp"
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstddef>
@@ -37,6 +39,7 @@
 #include <unordered_map>
 #include <utility>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 namespace strata::kernels::cpu {
@@ -139,6 +142,9 @@ public:
     virtual void begin_layer(int64_t layer, const int32_t* ids, int64_t k) { (void) layer; (void) ids; (void) k; }
     /// Plan v0.3 P6: the DEVICE address of a pinned, mapped blob (the GPU can read it over PCIe), or null.
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
+    /// Make `device_alias` work where the source's memory is registered for copies only: false (and `err`) when it
+    /// cannot.  True at once when it already works.
+    virtual bool make_kernel_readable(std::string& err) { err = "this expert source has no such memory"; return false; }
     /// A file-backed source: start reading this expert's pages now (it will be needed by the CPU); no-op elsewhere.
     virtual void prefetch(int64_t layer, int64_t expert) { (void) layer; (void) expert; }
     /// A file-backed source: this expert lives in VRAM, so its pages need not stay in RAM - hand them back to the
@@ -154,15 +160,33 @@ public:
     /// stays valid for the layer it was asked in and the next one or two; a consumer that keeps a blob longer (the
     /// prompt path's stager queues a whole chunk) copies it with `copy_blob` instead.
     virtual bool transient(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
+    /// #1353 (upstream 83a7dbc0): of the bytes `transient` experts would be copied from, the share whose pages are in
+    /// RAM right now (a GGUF read in place whose page cache is warm), measured on a sample of up to `samples` experts;
+    /// -1 when this source cannot tell (not a file source, or no residency query on this OS).  The prompt path's stager
+    /// uses it to pick the SSD profile (many threads, a deep ring) only for blobs that really are page faults on a disk.
+    virtual double cached_share(int64_t samples) const { (void) samples; return -1.0; }
     /// A layer split: makes the blobs copy fast to engine device `device` as well (see PinnedArena::register_on).
     /// True when there is nothing to do; false (and `err`) when the device refuses, the copies then being slower.
     virtual bool register_on(int device, std::string& err) { (void) device; (void) err; return true; }
+    /// Disk sessions: the files this source read its experts from, as (role, path), resolved by the loader itself
+    /// - the pack's experts.bin, or every GGUF tensor native_experts.txt named, per layer and role
+    /// ("expert blk.L.ffn_up").  Filled by open(); empty before.
+    const std::vector<std::pair<std::string, std::string>>& model_inputs() const { return inputs_; }
     /// The blob's bytes into `dst` (blob_bytes(layer) of them).  Safe from several threads for a source whose
     /// `transient` can be true.
     virtual bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst);
+    /// Asks the OS for these pairs' bytes ahead of the `blob` calls that read them.  False (nothing asked) by default.
+    virtual bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
+        (void) pairs; (void) n; return false;
+    }
     /// The `n` experts of `layer` the CPU is about to ask `blob` for, all at once: a source that reads a file may
     /// fetch them in parallel.  The bytes `blob` then returns are the same.  Default: nothing.
     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
+protected:
+    /// What model_inputs() returns; set by a source's open().
+    void record_inputs(const std::string& pack_experts, const std::string& gguf,
+                       const strata::kernels::cpu::ExpertLayout& lay, bool from_gguf);
+    std::vector<std::pair<std::string, std::string>> inputs_;
 };
 
 /// Plan v0.3 P6: what the GPU computes in a verify window's layer, written by the pool (mapped host memory) right
@@ -191,6 +215,8 @@ struct GpuPlanSink {
     /// holds the arena's device alias.
     int pcie_mode = 0;
 };
+
+struct PcieSplitTimes;
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
 struct ExpertDispatch {
@@ -311,7 +337,16 @@ struct ExpertDispatch {
     /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.
     GpuPlanSink* plan = nullptr;
     int pcie_num = 0;
+    /// The measured split (after Project Maya's CPU lane): the times taken at start, from which `pcie_split_m` gives
+    /// the number of a group's missed experts read over PCIe; `pcie_overlap`: the GPU reads them beside its VRAM hits
+    /// (the verify window's fetch branch).  Null: the share `pcie_num`/256.
+    const PcieSplitTimes* pcie_split = nullptr;
+    bool pcie_overlap = false;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
+    /// STRATA_ROUTE_TAIL_SKIP=R: entries skipped (a missed expert every token of the window routes only at rank >= R)
+    /// and the distinct experts behind them (neither copied nor computed)
+    int64_t tail_skipped = 0;
+    int64_t tail_experts = 0;
     /// #588: routed (token, expert) entries the GPU computed from outside its cache in verify windows: read over PCIe
     /// (--pcie-frac, kind 1) or on another GPU (kind 2).  In neither cache_hits nor cache_refused.
     int64_t offload_entries = 0;
@@ -342,6 +377,30 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 /// Plan v0.3 P6: the pool for a verify window of `n_tok` tokens.  `x_f` is (n_tok, n_embd), `ids` (n_tok, k) and
 /// `out` (n_tok * k, n_embd).  Each distinct missed expert is computed once for all the tokens routed to it;
 /// resident experts' rows are zeroed (the GPU adds them).  Requires `host_res` (the token-graph residency).
+/// An expert's time on each side of the split of the missed experts, measured once at start (after Project Maya's CPU
+/// lane, https://github.com/mw00/project-maya), in ms: the CPU pool's `c0 + c x k` for `k` experts of a layer (one token
+/// each, the decode's common case), the GPU's PCIe fetch `p0 + p x m` for `m` of them, and the GPU computing `n`
+/// experts from its memory `q0 + q x n` (the VRAM hits, and the fetched ones after them); `cb0`, `cb`, `pb0`, `pb` the
+/// CPU and the fetch measured while the other runs (the CPU and the link read the same memory).
+struct PcieSplitTimes {
+    double c0 = 0.0, c = 0.0, p0 = 0.0, p = 0.0, q0 = 0.0, q = 0.0;
+    double cb0 = 0.0, cb = 0.0, pb0 = 0.0, pb = 0.0;
+    int64_t layer = -1;   ///< the layer every side was measured on (its experts' size and format)
+};
+/// The CPU side: `d`'s pool on 1 and 8 experts of one layer that are in RAM and not in VRAM (`d.host_res`), the layer's
+/// native format; `layer` < 0 picks the first such layer and gets it.  False, with `why`, when no layer has enough such
+/// experts or the pack is not native.
+bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, double& c, int64_t& layer, std::string& why);
+/// Of `f` missed experts of a group with `h` VRAM hits: the number read over PCIe.  The GPU computes its hits, then
+/// (`overlap`: beside them) fetches the `m` and computes them; the CPU computes the other `f - m`; both at their times
+/// beside each other when both work.  The `m` that makes the later side earliest, taken only when that is at least 10%
+/// earlier than the CPU taking all `f` (the times are measured alone and on few experts: a split by a thin margin
+/// lost on the B70 with the VRAM of a small card); else 0.
+int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h);
+
+/// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
+int tail_skip_rank();
+void set_tail_skip_rank(int r);
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out);
 
@@ -439,12 +498,27 @@ public:
     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
     bool reserve_exchanges(int64_t n, std::string& err);
     int64_t exchange_capacity() const { return xstage_cap_; }
+    /// The exchange buffers are page-locked (host USM): copies to and from them are asynchronous.
+    bool exchange_pinned() const { return xstage_pinned_; }
     uint8_t* exchange_buffer(int64_t q) const;
     /// Requires `has_resident(layer, in)`, `!has_resident(layer, out)` and `exchange_buffer(q)` holding out's blob.
     bool stage_exchange(int64_t layer, int64_t in, int64_t out, int64_t q);
     /// After the GPU copies of every staged swap have landed.  Returns how many exchanges were applied.
     int64_t commit_exchanges();
+    /// `commit_exchanges` in two halves, for the asynchronous adaptive tier (--adapt-async): `commit_copies` moves
+    /// every staged evicted blob into its `in`'s place in the copy (on another thread: safe once nothing computes `in`
+    /// from RAM - it is resident on the GPU - while `out` is still read from its exchange buffer), then `commit_flip`
+    /// (the caller's thread, between windows) points `out` there and drops the staging.  Returns how many were applied.
+    void commit_copies();
+    int64_t commit_flip();
+    /// The compact copy's blob of `(layer, expert)`, or null; not counted as a read (any thread).
+    const uint8_t* resident_blob(int64_t layer, int64_t expert) const;
     int64_t exchanges() const { return exchanges_; }
+    /// STRATA_EXCHANGE_ROTATE=1 (opt-in, upstream 1e6cec80): a swap hands the exchange buffer over instead of copying
+    /// the evicted blob into the RAM copy (equal-size blobs, a fully page-locked copy)
+    bool exchange_rotation() const { return exchange_storage_.active(); }
+    uint64_t rotated_exchanges() const { return exchange_storage_.exchanges(); }
+    uint64_t avoided_exchange_copy_bytes() const { return exchange_storage_.avoided_bytes(); }
     /// With the compact copy ready: blobs read from the mapped file since (what the plain mmap mode may read from
     /// the SSD).  0 in a steady resident mode; lend-region experts that did not fit the RAM count here.
     int64_t file_reads() const { return file_reads_.load(std::memory_order_relaxed); }
@@ -468,12 +542,16 @@ public:
     /// #286, unbuffered: assembles the blobs of these pairs ahead of the `blob` calls that will ask for them (the
     /// GPU cache's fill from the profile) - one batch of reads instead of one blob at a time.  At most 64 pairs.
     void prefetch_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n);
+    /// Mapped reads: asks the OS for these pairs' blobs ahead (platform::advise_willneed).  False when unbuffered,
+    /// when read-ahead is off, or before `open`.
+    bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const override;
 
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     bool pcie_layer(int64_t layer) const override;
     bool transient(int64_t layer, int64_t expert) const override;
+    double cached_share(int64_t samples) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     /// CS-T: advances the assembled blobs' age (see staged_blob).
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
@@ -485,6 +563,8 @@ public:
     int64_t reads() const override { return reads_; }
 
 private:
+    /// The RAM copy's blob of residency index `index` (through the rotation's ownership table when it is on), or null
+    const uint8_t* resident_blob(size_t index) const;
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
     bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
@@ -542,10 +622,27 @@ private:
     uint64_t mapped_bytes_ = 0;
     std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
     void* complement_arena_ = nullptr;
+    /// The complement in page-locked parts when one host allocation of it was refused: [start, end) of the offsets.
+    struct ComplementChunk { uint64_t start, end; uint8_t* host; const uint8_t* device; };
+    std::vector<ComplementChunk> complement_chunks_;
+    static const ComplementChunk* chunk_of(const std::vector<ComplementChunk>& chunks, uint64_t offset) {
+        auto it = std::upper_bound(chunks.begin(), chunks.end(), offset,
+                                   [](uint64_t o, const ComplementChunk& c) { return o < c.start; });
+        return &*(it - 1);
+    }
+    static uint8_t* chunk_at(const std::vector<ComplementChunk>& chunks, uint64_t offset) {
+        const ComplementChunk* c = chunk_of(chunks, offset);
+        return c->host + (size_t) (offset - c->start);
+    }
+    uint8_t* complement_at(uint64_t offset) const {
+        return complement_chunks_.empty() ? (uint8_t*) complement_host_ + (size_t) offset
+                                          : chunk_at(complement_chunks_, offset);
+    }
     const uint8_t* complement_host_ = nullptr;
     const uint8_t* complement_device_ = nullptr;
     uint64_t complement_bytes_ = 0;
     std::vector<uint64_t> complement_offsets_;
+    detail::ExchangeStorage exchange_storage_;   ///< STRATA_EXCHANGE_ROTATE: authoritative when active; the arenas still own the memory
     bool complement_pinned_ = false;
     bool complement_partial_ = false;         ///< CS-T: only the first complement_pin_limit_ bytes are registered
     uint64_t complement_pin_limit_ = 0;
@@ -604,6 +701,7 @@ public:
     int64_t reads() const override { return reads_; }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
+    bool make_kernel_readable(std::string& err) override;
     void prefetch(int64_t layer, int64_t expert) override;
     uint64_t release(int64_t layer, int64_t expert) override;
 

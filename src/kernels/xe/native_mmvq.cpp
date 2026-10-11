@@ -38,6 +38,8 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/runtime.hpp"
 #include "cuda_intrinsics.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_native_mmvq
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <cstdint>
 #include <cstddef>
@@ -541,18 +543,29 @@ sycl::event launch_kernel(sycl::queue& q, const void* weights, const void* x_q8_
 // within the sub-group: no local memory and no barrier.  The CUDA layout above gives a row a whole work-group of 128
 // lanes, most of them idle on the model's 2560- and 6144-wide rows, then waits on a barrier for the partial sums.
 // A column's arithmetic does not depend on NCOLS, so every column is bitwise its single-column call.
+// With `weights2` (a second matrix of the same type and shape, upstream b08cf3e1's pair), rows n_out .. 2 n_out - 1
+// are its rows, written to y2: two products of the same activations in one launch, each row's arithmetic unchanged.
 template<typename F, int NCOLS, int RPG>
-sycl::event launch_row(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out) {
+sycl::event launch_row(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out,
+                       const void* weights2 = nullptr, float* y2 = nullptr) {
     static_assert(WARP % F::T == 0, "a block's lanes must divide the sub-group");
-    const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const std::size_t groups = (std::size_t(n_out) + RPG - 1) / RPG;
+    const int rows_all = weights2 ? 2 * n_out : n_out;
+    const std::size_t groups = (std::size_t(rows_all) + RPG - 1) / RPG;
     return q.parallel_for(sycl::nd_range<1>(groups * RPG * WARP, std::size_t(RPG) * WARP),
                           [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int lane = (int) sg.get_local_linear_id();
-        const int row = (int) it.get_group(0) * RPG + (int) sg.get_group_linear_id();
-        if (row >= n_out) return;                           // whole sub-groups only, and no barrier follows
+        int row = (int) it.get_group(0) * RPG + (int) sg.get_group_linear_id();
+        if (row >= rows_all) return;                        // whole sub-groups only, and no barrier follows
+        const void* wsrc = weights;
+        float* ydst = y;
+        if (row >= n_out) {   // the second matrix
+            row -= n_out;
+            wsrc = weights2;
+            ydst = y2;
+        }
+        const auto* w = static_cast<const typename F::Block*>(wsrc);
         const int blocks_per_row = n_in / F::DIV;
         const int x_stride = n_in / Q8K;
         const int kqs = F::kqs(lane);
@@ -560,7 +573,7 @@ sycl::event launch_row(sycl::queue& q, const void* weights, const void* x_q8_1, 
         for (int kbx = lane / F::T; kbx < blocks_per_row; kbx += WARP / F::T) {
             typename F::W wv;
             if constexpr (requires { F::load_row; })
-                wv = F::load_row(static_cast<const uint8_t*>(weights), row, kbx, blocks_per_row, kqs);
+                wv = F::load_row(static_cast<const uint8_t*>(wsrc), row, kbx, blocks_per_row, kqs);
             else
                 wv = F::load(w + std::size_t(row) * blocks_per_row + kbx, kqs);
             for (int j = 0; j < NCOLS; ++j)
@@ -568,7 +581,7 @@ sycl::event launch_row(sycl::queue& q, const void* weights, const void* x_q8_1, 
         }
         for (int j = 0; j < NCOLS; ++j) {
             const float s = warp_sum(sg, tmp[j]);
-            if (lane == 0) y[std::size_t(j) * n_out + row] = s;
+            if (lane == 0) ydst[std::size_t(j) * n_out + row] = s;
         }
     });
 }
@@ -582,7 +595,7 @@ void launch_n(sycl::queue& q, const void* weights, const void* x_q8_1, float* y,
     }
     // A sub-group alone walks a row in ceil(blocks / (WARP / T)) dependent steps: up to 10 (the 2560-wide rows) it
     // beats the work-group layout, beyond (the 6144-wide rows, 12-24 steps) the work-group's four sub-groups win
-    // (bench/results/2026-10-02-xe-decode-gpu).
+    // (the 2026-10-02-xe-decode-gpu record).
     const int steps = (n_in / F::DIV + WARP / F::T - 1) / (WARP / F::T);
     if (steps <= 10) {
         launch_row<F, NCOLS, 8>(q, weights, x_q8_1, y, n_in, n_out);
@@ -630,6 +643,35 @@ void mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out
         case 7: launch_n<F, 7>(q, weights, x_q8_1, y, n_in, n_out); break;
         case 8: launch_n<F, 8>(q, weights, x_q8_1, y, n_in, n_out); break;
     }
+}
+
+// the pair in one launch where launch_n would take launch_row (a row of at most 10 steps; exact multi-column
+// layout); false, launching nothing, otherwise
+template<typename F>
+bool mmvq_pair(const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2, int n_in, int n_out, int ncols,
+               void* stream) {
+    validate_shape(n_in, ncols, F::DIV);
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    validate_pointer(w1);
+    validate_pointer(w2);
+    validate_pointer(x_q8_1);
+    validate_pointer(y1);
+    validate_pointer(y2);
+    auto& q = validate_stream(stream);
+    const int steps = (n_in / F::DIV + WARP / F::T - 1) / (WARP / F::T);
+    if ((ncols > 1 && !g_multi_exact) || steps > 10) return false;
+    switch (ncols) {
+        case 1: launch_row<F, 1, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;
+        case 2: launch_row<F, 2, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;
+        case 3: launch_row<F, 3, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;
+        case 4: launch_row<F, 4, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;
+        case 5: launch_row<F, 5, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;
+        case 6: launch_row<F, 6, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;
+        case 7: launch_row<F, 7, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;
+        case 8: launch_row<F, 8, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;
+        default: return false;
+    }
+    return true;
 }
 
 template<typename F>
@@ -699,6 +741,33 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
         const float amax = warp_max(sg, sycl::fabs(xi));
         const float sum = warp_sum(sg, xi);
         const float d = xe::q8_1_finite(amax / 127.0f);   // #606: finite blocks bit for bit
+        const int8_t qv = xe::q8_1_quant(xi, d, amax);
+        y[i / Q8K].qs[i % Q8K] = qv;
+        if (i % Q8K == 0) y[i / Q8K].ds = half2(half(d), half(xe::q8_1_finite(sum)));
+    });
+}
+
+void native_swiglu_q8_1(const float* gate, const float* up, void* x_q8_1, int n_in, int ncols, void* stream) {
+    validate_shape(n_in, ncols);
+    validate_pointer(gate);
+    validate_pointer(up);
+    validate_pointer(x_q8_1);
+    auto& q = validate_stream(stream);
+    const int n_total = n_in * ncols;
+    auto* y = static_cast<Q81Block*>(x_q8_1);
+    const std::size_t global = (std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS * QUANT_THREADS;
+    q.parallel_for(sycl::nd_range<1>(global, QUANT_THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        // contraction off: the SwiGLU product must not fuse into the sub-group sum's first add (the stored and
+        // reloaded value of the two launches is rounded on its own)
+#pragma clang fp contract(off)
+        const int i = (int) it.get_global_linear_id();
+        if (i >= n_total) return; // n_total is a multiple of 32: only whole sub-groups return.
+        const sycl::sub_group sg = it.get_sub_group();
+        const float g = gate[i];
+        const float xi = g / (1.0f + sycl::exp(-g)) * up[i];   // native_swiglu's expression
+        const float amax = warp_max(sg, sycl::fabs(xi));
+        const float sum = warp_sum(sg, xi);
+        const float d = xe::q8_1_finite(amax / 127.0f);
         const int8_t qv = xe::q8_1_quant(xi, d, amax);
         y[i / Q8K].qs[i % Q8K] = qv;
         if (i % Q8K == 0) y[i / Q8K].ds = half2(half(d), half(xe::q8_1_finite(sum)));
@@ -820,6 +889,23 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
         throw std::length_error("native MMVQ weight byte count overflows size_t");
     }
     return row_bytes * std::size_t(n_out);
+}
+
+bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
+                      int n_in, int n_out, int ncols, void* stream) {
+    switch (ggml_type) {
+    case 2: return mmvq_pair<Q40Traits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, stream);
+    case 6: return mmvq_pair<Q50Traits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, stream);
+    case 8: return mmvq_pair<Q80Traits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, stream);
+    case 20: return mmvq_pair<IQ4NLTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, stream);
+    case 14: return mmvq_pair<Q6KTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, stream);
+    case kNativeQ6KRows:
+        return native_q6_k_rows_ok(n_in) && mmvq_pair<Q6KRowTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, stream);
+    case kNativeQ8Rows:
+        return native_q8_0_rows_ok(n_in) && mmvq_pair<Q80RowTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, stream);
+    case 23: return mmvq_pair<IQ4XSTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, stream);
+    default: return false;   // the K-quants' and i-quants' own kernels: two launches
+    }
 }
 
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,

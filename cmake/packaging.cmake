@@ -7,12 +7,13 @@
 # - the program XeStrata's users run (setup.py as `xestrata`, the server, the web app, the tools setup runs, gguf-py,
 #   the data files), in <datadir>/xestrata, read-only; the user's files go to the XDG folders (setup.py, PACKAGED).
 # - the engine: strata, the image encoders and the SYCL runtime it was built with (intel/llvm's, which no distribution
-#   has as new: libsycl 9), with oneMath in the contrib mode, in <libdir>/xestrata/engine.
+#   has as new: libsycl 9), with oneMath (its rocBLAS backend for AMD GPUs; oneMKL's and cuBLAS's in the contrib mode),
+#   in <libdir>/xestrata/engine.
 #
 # The packages provide and conflict with xestrata-engine, so one is installed at a time, and installing another
 # replaces it.  Nothing non-free goes in: the contrib engine opens oneMKL, cuBLAS and NVIDIA's driver at run time (the
 # UR adapters, oneMath's backends).  No GPU maker's driver or library is required (tools/package/container.sh): the
-# free package recommends Intel's, the contrib ones only suggest every maker's.
+# free package recommends Intel's and AMD's, the contrib ones only suggest every maker's.
 
 include(GNUInstallDirs)
 
@@ -21,6 +22,8 @@ set(STRATA_PACKAGE_VISION_DIR "" CACHE PATH "the folder with strata-vision-cpu a
 set(STRATA_PACKAGE_DEPENDS "" CACHE STRING "the package's dependencies, the distribution's names")
 set(STRATA_PACKAGE_RECOMMENDS "" CACHE STRING "the package's weak dependencies, installed by default")
 set(STRATA_PACKAGE_SUGGESTS "" CACHE STRING "the package's suggestions, not installed by default")
+set(STRATA_PACKAGE_RUNTIME "{}" CACHE STRING
+    "the GPU makers' packages by maker, as a JSON object, for setup to tell what a PC lacks (BUILD.json's runtime)")
 if(NOT STRATA_PACKAGE_NAME OR NOT STRATA_PACKAGE_VISION_DIR)
   message(FATAL_ERROR "STRATA_PACKAGE needs STRATA_PACKAGE_NAME and STRATA_PACKAGE_VISION_DIR "
                       "(tools/package/build.sh sets them)")
@@ -28,6 +31,9 @@ endif()
 # A package runs on other PCs: nothing may come from this one's CPU or GPUs
 if(NOT STRATA_PORTABLE)
   message(FATAL_ERROR "STRATA_PACKAGE needs STRATA_PORTABLE=ON (ggml for any AVX2 CPU)")
+endif()
+if(STRATA_HIP_ARCHS STREQUAL "auto")
+  message(FATAL_ERROR "STRATA_PACKAGE: STRATA_HIP_ARCHS=auto takes this PC's; a package names it")
 endif()
 if(STRATA_LICENSE STREQUAL "contrib")
   foreach(option_name STRATA_CUDA_ARCHS STRATA_ONEMKL STRATA_CUDA_PATH STRATA_CUDA_PTX)
@@ -48,7 +54,7 @@ set_target_properties(strata PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
 install(TARGETS strata RUNTIME DESTINATION ${_pkg_engine})
 install(PROGRAMS ${STRATA_PACKAGE_VISION_DIR}/strata-vision-cpu ${STRATA_PACKAGE_VISION_DIR}/strata-vision-vulkan
         DESTINATION ${_pkg_engine})
-# the SYCL runtime the engine was built with: what libsycl loads for Level Zero (and CUDA in the contrib mode).
+# the SYCL runtime the engine was built with: what libsycl loads for Level Zero and HIP (and CUDA in the contrib mode).
 # libsycl-jit (157 MB) is left out: libsycl opens it only to compile kernels from source, which the engine does not.
 get_filename_component(_pkg_sycl_lib "${CMAKE_CXX_COMPILER}" DIRECTORY)
 get_filename_component(_pkg_sycl_lib "${_pkg_sycl_lib}/../lib" ABSOLUTE)
@@ -56,10 +62,9 @@ set(_pkg_runtime libsycl.so.9 libur_loader.so.0 libur_adapter_level_zero.so.0 li
                  libumf.so.1)
 if(STRATA_LICENSE STREQUAL "contrib")
   list(APPEND _pkg_runtime libur_adapter_cuda.so.0)
-  # AMD GPUs: the HIP adapter, which intel/llvm builds where ROCm's HIP is installed
-  if(EXISTS "${_pkg_sycl_lib}/libur_adapter_hip.so.0")
-    list(APPEND _pkg_runtime libur_adapter_hip.so.0)
-  endif()
+endif()
+if(_strata_hip_archs)
+  list(APPEND _pkg_runtime libur_adapter_hip.so.0)   # AMD GPUs
 endif()
 set(_pkg_runtime_files "")
 foreach(lib IN LISTS _pkg_runtime)
@@ -89,13 +94,12 @@ install(CODE "
       endif()
     endif()
   endforeach()")
-# the engine's record: setup.py reads its license, NVIDIA architectures and library folder (lib_dirs, which the server
-# puts on LD_LIBRARY_PATH for the libraries the UR adapters open)
+# the engine's record: setup.py reads its license, NVIDIA and AMD architectures, the GPU makers' packages (runtime)
+# and library folder (lib_dirs, which the server puts on LD_LIBRARY_PATH for the libraries the UR adapters open)
 set(_pkg_archs "")
-set(_pkg_hip_archs "")
+set(_pkg_hip_archs ${_strata_hip_archs})   # the AMD architectures (free and contrib)
 if(STRATA_LICENSE STREQUAL "contrib")
   set(_pkg_archs ${_strata_cuda_archs})
-  set(_pkg_hip_archs ${_strata_hip_archs})   # the AMD architectures, once the engine builds code for them
 endif()
 foreach(var_name _pkg_archs _pkg_hip_archs)
   list(TRANSFORM ${var_name} PREPEND "\"")
@@ -107,10 +111,11 @@ file(WRITE ${CMAKE_BINARY_DIR}/package/BUILD.json
  \"source\": \"package\",
  \"backend\": \"xe\",
  \"package\": \"${STRATA_PACKAGE_NAME}\",
- \"version\": \"${PROJECT_VERSION}\",
+ \"version\": \"${XESTRATA_VERSION}\",
  \"license\": \"${STRATA_LICENSE}\",
  \"cuda_archs\": [${_pkg_archs}],
  \"hip_archs\": [${_pkg_hip_archs}],
+ \"runtime\": ${STRATA_PACKAGE_RUNTIME},
  \"compiler\": {\"id\": \"${CMAKE_CXX_COMPILER_ID}\", \"version\": \"${CMAKE_CXX_COMPILER_VERSION}\"},
  \"lib_dirs\": [\"${_pkg_engine_abs}/lib\"]
 }
@@ -132,11 +137,12 @@ install(DIRECTORY serve tools DESTINATION ${_pkg_share}
 install(DIRECTORY serve/web DESTINATION ${_pkg_share}/serve)
 install(DIRECTORY data DESTINATION ${_pkg_share})
 install(DIRECTORY third_party/main/outfit DESTINATION ${_pkg_share}/third_party/main)
+install(DIRECTORY third_party/main/quantscope DESTINATION ${_pkg_share}/third_party/main PATTERN "__pycache__" EXCLUDE)
 install(DIRECTORY ${STRATA_GGML_DIR}/gguf-py DESTINATION ${_pkg_share}/third_party/main/llama.cpp
         PATTERN "__pycache__" EXCLUDE PATTERN "tests" EXCLUDE)
 install(FILES ${STRATA_GGML_DIR}/LICENSE DESTINATION ${_pkg_share}/third_party/main/llama.cpp)
 file(WRITE ${CMAKE_BINARY_DIR}/package/PACKAGED
-     "{\"engine\": \"${_pkg_engine_abs}\", \"version\": \"${PROJECT_VERSION}\"}\n")
+     "{\"engine\": \"${_pkg_engine_abs}\", \"version\": \"${XESTRATA_VERSION}\"}\n")
 install(FILES ${CMAKE_BINARY_DIR}/package/PACKAGED DESTINATION ${_pkg_share})
 configure_file(tools/package/xestrata.in ${CMAKE_BINARY_DIR}/package/xestrata @ONLY)
 install(PROGRAMS ${CMAKE_BINARY_DIR}/package/xestrata DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -156,6 +162,7 @@ install(CODE "
 
 # ---- CPack
 set(CPACK_PACKAGE_NAME xestrata)
+set(CPACK_PACKAGE_VERSION ${STRATA_UPSTREAM_VERSION})
 set(CPACK_PACKAGE_VENDOR "MistVVK and the XeStrata contributors")
 set(CPACK_PACKAGE_CONTACT "MistVVK <jffyc82pzv@privaterelay.appleid.com>")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Qwen3.8-Flash-Next on a PC: a GPU, system RAM and the CPU")
@@ -165,6 +172,7 @@ set(CPACK_STRIP_FILES ON)
 
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_PACKAGE_NAME ${STRATA_PACKAGE_NAME})
+set(CPACK_DEBIAN_PACKAGE_RELEASE ${XESTRATA_REVISION})
 set(CPACK_DEBIAN_PACKAGE_SECTION science)
 # the dependencies: tools/package/build.sh runs dpkg-shlibdeps on what links the distribution's libraries (not on
 # oneMath's backends and the CUDA adapter, which would make oneMKL, cuBLAS and NVIDIA's driver hard dependencies) and
@@ -179,6 +187,7 @@ set(CPACK_DEBIAN_PACKAGE_REPLACES xestrata-engine)
 
 set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
 set(CPACK_RPM_PACKAGE_NAME ${STRATA_PACKAGE_NAME})
+set(CPACK_RPM_PACKAGE_RELEASE ${XESTRATA_REVISION})
 set(CPACK_RPM_PACKAGE_LICENSE "LGPL-3.0-or-later AND MIT AND Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND OFL-1.1")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/Engineering")
 set(CPACK_RPM_PACKAGE_REQUIRES "${STRATA_PACKAGE_DEPENDS}")
@@ -191,7 +200,8 @@ set(CPACK_RPM_PACKAGE_AUTOREQPROV ON)
 set(_pkg_not_required libsycl libur_ libumf libonemath                      # bundled
                       libcuda libnvidia-ml libcublas                        # NVIDIA's
                       libmkl_                                               # Intel's oneMKL
-                      libamdhip64 libhsa-runtime64 libamd_comgr)            # AMD's ROCm
+                      libamdhip64 libhsa-runtime64 libamd_comgr             # AMD's ROCm
+                      librocblas libhipblaslt)
 list(JOIN _pkg_not_required "|" _pkg_not_required)
 set(CPACK_RPM_SPEC_MORE_DEFINE
 "%global __provides_exclude_from ^${_pkg_engine_abs}/.*$

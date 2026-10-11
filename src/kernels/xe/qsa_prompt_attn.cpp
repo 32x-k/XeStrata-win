@@ -26,6 +26,8 @@
 #include "strata/core/per_device.hpp"
 #include "device_target.hpp"
 #include "mma_gemm.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_qsa_prompt_attn
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -433,6 +435,21 @@ sycl::event launch(sycl::queue& q, const float* qv, QsaAttnPools p, const int32_
 namespace pm {
 constexpr int SG = 32, NSG = NG, WG = NSG * SG, T16 = 16, CH = 16;
 }
+using u32x2 = uint32_t __attribute__((ext_vector_type(2)));   // one 8- or 16-byte access (sycl::vec is split on NVPTX)
+using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
+// 8 int8 codes (two words) as 8 FP16 halves (four words of two), two at a time: code + 128 in the low mantissa bits
+// of 1024 (0x6400) is exactly 1152 + code, and 1152 comes off in one two-half subtraction.  [[maybe_unused]]: only
+// the device code calls it.
+[[maybe_unused]] inline u32x4 i8x8_to_h8(u32x2 w) {
+    u32x4 r = {0, 0, 0, 0};
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t x = w[k / 2] >> (16 * (k % 2));
+        const uint32_t b = (((x & 0xFFu) | ((x & 0xFF00u) << 8)) ^ 0x00800080u) | 0x64006400u;
+        const sycl::vec<half, 2> h = sycl::bit_cast<sycl::vec<half, 2>>(b) - sycl::vec<half, 2>(half(1152.0f));
+        r[k] = sycl::bit_cast<uint32_t>(h);
+    }
+    return r;
+}
 template<int KF, int VF>   // K's KvFmt (kF16, kI8), V's (kF16, kI8, kQ4)
 struct PromptAttnMma {
     static_assert(KF != kQ4, "Q4_0 K takes the FP32 kernel");
@@ -455,11 +472,13 @@ struct PromptAttnMma {
     sycl::local_accessor<float, 1> ks, vs;  // [CH][NG], [CH][VS]: INT8 K's scales, V's
     sycl::local_accessor<float, 1> part;    // [NG][R][CH]: q.k per 64-dim group; part[0] then holds p
     sycl::local_accessor<half, 1> pp;       // [2 VS][R][CH]: p' hi (2v) / lo (2v + 1) per V scale group
-    sycl::local_accessor<float, 1> st;      // [NG][R][64]: a sub-group's chunk of p.v on its way to the registers
+    sycl::local_accessor<float, 1> st;      // [NG][R][16]: a sub-group's tile of p.v on its way to the registers
     sycl::local_accessor<float, 1> mrow, lsum, alpha;
 
     void operator()(sycl::nd_item<2> it) const {
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+        // an empty body where joint_matrix has no FP16 tensor cores (AMD's RDNA, NVIDIA before sm_70): the device
+        // does not report the 16 x 16 x 16 shape there, so this kernel is never launched
+#if defined(__SYCL_DEVICE_ONLY__) && (defined(__AMDGCN__) || (defined(__NVPTX__) && STRATA_NV_ARCH < 700))
         (void) it;
 #else
         using pm::CH;
@@ -475,7 +494,7 @@ struct PromptAttnMma {
         const int32_t* sel = ids + qi * cap;
         const int n = steps[qi * kStepCount + kStepWidth];
         const size_t KH = 0, VH = (size_t) CH * KR, QH = 0, QL = (size_t) R * QS;
-        const size_t SG0 = (size_t) g * R * 64;   // this sub-group's output staging
+        const size_t SG0 = (size_t) g * R * T16;   // this sub-group's output staging, a tile at a time
 
         // q as in PromptAttn: 12 heads + 4 zero rows, times 2^(14 - e), FP16 hi + lo
         float qm = 0.0f;
@@ -499,7 +518,9 @@ struct PromptAttnMma {
             mx::joint_matrix_load(sg, qa[kk], at(kvq, QH + off), QS);
             mx::joint_matrix_load(sg, qb[kk], at(kvq, QL + off), QS);
         }
-        constexpr int OPL = R * 64 / pm::SG;   // output values a lane: element lane + SG * i of the sub-group's 16 x 64
+        // output values a lane: element lane + SG * i (i < TPL) of each of the sub-group's four 16 x 16 tiles, in
+        // o[nt * TPL + i]
+        constexpr int TPL = R * T16 / pm::SG, OPL = 4 * TPL;
         float o[OPL];
         for (int i = 0; i < OPL; ++i) o[i] = 0.0f;
 
@@ -515,25 +536,27 @@ struct PromptAttnMma {
                 rows[t] = r;
             }
             sycl::group_barrier(grp);   // rows ready; the previous chunk (and q's staging) is done with kvq, part, pp
-            // K and V as FP16: int8 codes are exact in FP16
+            // K and V as FP16: int8 codes are exact in FP16.  8 codes or halves a work-item in one access each way:
+            // through sycl::vec the NVPTX compile split the int8 loads into a byte each (LDG.E.S8; Nsight Compute,
+            // RTX 4070: 87% of the kernel's global sectors excessive)
             for (int i = t; i < CH * (HD / 8); i += pm::WG) {
                 const int c = i / (HD / 8), pc = i % (HD / 8);
                 const long long r = rows[c];
-                sycl::vec<half, 8> kx(half(0.0f)), vx(half(0.0f));
+                u32x4 kx = {0, 0, 0, 0}, vx = {0, 0, 0, 0};
                 if (r >= 0) {
                     const int64_t off = r * HD + (int64_t) pc * 8;
                     if constexpr (KF == kI8)
-                        kx = reinterpret_cast<const sycl::vec<int8_t, 8>*>(p.k_q + off)->template convert<half>();
+                        kx = i8x8_to_h8(*reinterpret_cast<const u32x2*>(p.k_q + off));
                     else
-                        kx = *reinterpret_cast<const sycl::vec<half, 8>*>(p.k_pool + off);
+                        kx = *reinterpret_cast<const u32x4*>(p.k_pool + off);
                     if constexpr (VF == kI8)
-                        vx = reinterpret_cast<const sycl::vec<int8_t, 8>*>(p.v_q + off)->template convert<half>();
+                        vx = i8x8_to_h8(*reinterpret_cast<const u32x2*>(p.v_q + off));
                     else if constexpr (VF == kF16)
-                        vx = *reinterpret_cast<const sycl::vec<half, 8>*>(p.v_pool + off);
+                        vx = *reinterpret_cast<const u32x4*>(p.v_pool + off);
                 }
-                *reinterpret_cast<sycl::vec<half, 8>*>(&kvq[KH + (size_t) c * KR + (size_t) pc * 8]) = kx;
+                *reinterpret_cast<u32x4*>(&kvq[KH + (size_t) c * KR + (size_t) pc * 8]) = kx;
                 if constexpr (VF != kQ4)
-                    *reinterpret_cast<sycl::vec<half, 8>*>(&kvq[VH + (size_t) c * KR + (size_t) pc * 8]) = vx;
+                    *reinterpret_cast<u32x4*>(&kvq[VH + (size_t) c * KR + (size_t) pc * 8]) = vx;
             }
             // Q4_0 V: one work-item a block, its codes and its scale
             if constexpr (VF == kQ4) {
@@ -643,17 +666,20 @@ struct PromptAttnMma {
                     mx::joint_matrix_load(sg, b, at(kvq, VH + (size_t) g * 64 + (size_t) nt * T16), KR);
                     mx::joint_matrix_mad(sg, acc, ph, b, acc);
                     mx::joint_matrix_mad(sg, acc, pl, b, acc);
-                    mx::joint_matrix_store(sg, acc, at(st, SG0 + (size_t) nt * T16), 64, mx::layout::row_major);
-                }
-                sycl::group_barrier(sg);
-                for (int i = 0; i < OPL; ++i) {
-                    const int e = lane + pm::SG * i;
-                    o[i] = sycl::fma(o[i], alpha[e / 64], st[SG0 + e] * unit);
+                    // through local memory a tile at a time (a quarter of the 16 x 64 staging: the work-group's local
+                    // memory, and so how many fit on a compute unit, set this kernel's speed on the RTX 4070)
+                    sycl::group_barrier(sg);   // the previous tile's values are read
+                    mx::joint_matrix_store(sg, acc, at(st, SG0), T16, mx::layout::row_major);
+                    sycl::group_barrier(sg);
+                    for (int i = 0; i < TPL; ++i) {
+                        const int e = lane + pm::SG * i;
+                        o[nt * TPL + i] = sycl::fma(o[nt * TPL + i], alpha[e / T16], st[SG0 + e] * unit);
+                    }
                 }
             }
         }
         for (int i = 0; i < OPL; ++i) {
-            const int e = lane + pm::SG * i, r = e / 64, col = e % 64;
+            const int e = lane + pm::SG * (i % TPL), r = e / T16, col = (i / TPL) * T16 + e % T16;
             if (r < G) {
                 const float l = lsum[r];
                 out[r * HD + g * 64 + col] = l > 0.0f ? o[i] / l : 0.0f;
@@ -668,7 +694,7 @@ struct PromptAttnMma {
 constexpr size_t mma_local_bytes() {
     constexpr size_t VS = PromptAttnMma<kI8, kQ4>::VS;
     return (size_t) PromptAttnMma<kF16, kF16>::KV_HALVES * 2 + (size_t) pm::CH * 8 + (size_t) pm::CH * (NG + VS) * 4 +
-           (size_t) NG * R * pm::CH * 4 + (size_t) 2 * VS * R * pm::CH * 2 + (size_t) NG * R * 64 * 4 +
+           (size_t) NG * R * pm::CH * 4 + (size_t) 2 * VS * R * pm::CH * 2 + (size_t) NG * R * pm::T16 * 4 +
            (size_t) 3 * R * 4;
 }
 
@@ -685,10 +711,322 @@ sycl::event launch_mma(sycl::queue& q, const float* qv, QsaAttnPools p, const in
             sycl::local_accessor<float, 1>(sycl::range<1>((size_t) pm::CH * K::VS), h),
             sycl::local_accessor<float, 1>(sycl::range<1>((size_t) NG * R * pm::CH), h),
             sycl::local_accessor<half, 1>(sycl::range<1>((size_t) 2 * K::VS * R * pm::CH), h),
-            sycl::local_accessor<float, 1>(sycl::range<1>((size_t) NG * R * 64), h),
+            sycl::local_accessor<float, 1>(sycl::range<1>((size_t) NG * R * pm::T16), h),
             sycl::local_accessor<float, 1>(sycl::range<1>(R), h),
             sycl::local_accessor<float, 1>(sycl::range<1>(R), h),
             sycl::local_accessor<float, 1>(sycl::range<1>(R), h)};
+        h.parallel_for(sycl::nd_range<2>({(size_t) n_q, (size_t) (n_kv * pm::WG)}, {1, pm::WG}), k);
+    });
+}
+
+// NVIDIA from sm_80 on, INT8 K and V: upstream's v2 (src/kernels/cuda/qsa_prompt_attn.cu, prompt_attn_i8_kernel) in
+// PTX, as mma_gemm.cpp writes its tiles.  Warp w owns dims [64w, 64w + 64), which is int8 scale group w, for both q.k
+// and p.v: it gathers its own 64-byte slice of each K and V row with cp.async into a double-buffered stage while it
+// computes the previous chunk, q stays in registers as mma.sync fragments, int8 codes become FP16 fragments in
+// registers, and the output stays in FP32 accumulators whose layout mma.sync defines.  Only the q.k partial sums cross
+// warps, added in a fixed order.  joint_matrix could not express the fragments or the copies: PromptAttnMma ran a
+// chunk of 32K at 14.0 ms, this at 7.4 (qsa_prompt_attn_parity, RTX 4070).  STRATA_PROMPT_ATTN_PTX=0: PromptAttnMma.
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__) && defined(__SYCL_CUDA_ARCH__) && __SYCL_CUDA_ARCH__ >= 800
+#define STRATA_PA_PTX 1
+#else
+#define STRATA_PA_PTX 0
+#endif
+namespace pv2 {
+constexpr int CH = 32;
+struct Smem {
+    int8_t kv[2][4][2][CH][64];   // stage, warp, K/V, cell, 64 dims in 16-byte pieces XOR-swizzled by the cell
+    float sc[2][4][2][CH];        // stage, warp, K/V scale of the cell for the warp's group
+    float part[4][16][CH + 1];    // q.k per dim group
+    float p[16][CH + 1];
+    float qmax[4];
+    float alpha[16];
+    float lsum[16];
+    float mrow[16];
+};
+// [[maybe_unused]]: these serve PromptAttnPtx's body, which only the sm_80+ device compile has
+[[maybe_unused]] inline int swz(int cell, int byte) {   // byte offset of (cell, byte) in a stage slice
+    return cell * 64 + ((((byte >> 4) ^ (cell >> 1)) & 3) << 4) + (byte & 15);
+}
+#if STRATA_PA_PTX
+inline uint32_t smem_addr(const void* p) {
+    uint32_t a;
+    asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }" : "=r"(a) : "l"(p));
+    return a;
+}
+inline void cp_async16(void* smem, const void* gmem, bool valid) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_addr(smem)), "l"(gmem),
+                 "r"(valid ? 16 : 0));
+}
+inline void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+inline void cp_async_wait1() { asm volatile("cp.async.wait_group 1;\n" ::); }
+inline void mma16816(float* c, const uint32_t* a, const uint32_t* b) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+#endif
+// two int8 codes (low byte first) as an exact half2: 1024 + (c + 128) built in the mantissa, minus 1152
+[[maybe_unused]] inline uint32_t i8x2_to_h2(uint32_t x) {
+    const uint32_t y = ((((x & 0xffu) | ((x & 0xff00u) << 8)) ^ 0x00800080u) | 0x64006400u);
+    return sycl::bit_cast<uint32_t>(sycl::bit_cast<sycl::vec<half, 2>>(y) - sycl::vec<half, 2>(half(1152.0f)));
+}
+[[maybe_unused]] inline uint32_t pack_h2(float lo_k, float hi_k) {   // element k in the low half
+    return sycl::bit_cast<uint32_t>(sycl::vec<half, 2>(half(lo_k), half(hi_k)));
+}
+}  // namespace pv2
+
+struct PromptAttnPtx {
+    [[maybe_unused]] static constexpr int CH = pv2::CH, THREADS = pm::WG;
+    const float* q;
+    QsaAttnPools p;
+    const int32_t* ids;
+    const int32_t* steps;
+    int64_t cap, n_kv, page_size;
+    float scale_log2;
+    float* attn;
+    sycl::local_accessor<uint8_t, 1> smem;   // pv2::Smem
+
+    void operator()(sycl::nd_item<2> it) const {
+#if !STRATA_PA_PTX
+        (void) it;
+#else
+        using pv2::swz;
+        // through a pointer that keeps the local address space: from a plain one the accesses are generic (LD.E / ST.E,
+        // not LDS / STS)
+        using LocalSmem = __attribute__((opencl_local)) pv2::Smem;
+        LocalSmem& S = *reinterpret_cast<LocalSmem*>(smem.template get_multi_ptr<sycl::access::decorated::yes>().get_decorated());
+        const auto grp = it.get_group();
+        const auto sg = it.get_sub_group();
+        const int qi = (int) it.get_group(0), kvh = (int) it.get_group(1);
+        const int n_head = (int) n_kv * G;
+        const float* qp = q + (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+        float* out = attn + (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+        const int32_t* sel = ids + (size_t) qi * cap;
+        const int n = steps[(size_t) qi * kStepCount + kStepWidth];
+        const int t = (int) it.get_local_id(1), lane = t & 31, warp = t >> 5;
+        const int gid = lane >> 2, tig = lane & 3;
+        const int dim0 = warp * 64;
+
+        // q: the power-of-two prescale over all 12 heads, then this warp's 64 dims as hi/lo A fragments
+        float qm = 0.0f;
+        for (int i = t; i < G * HD; i += THREADS) qm = sycl::fmax(qm, sycl::fabs(qp[i]));
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) qm = sycl::fmax(qm, sycl::permute_group_by_xor(sg, qm, o));
+        if (lane == 0) S.qmax[warp] = qm;
+        if (t < 16) { S.mrow[t] = NEG_INF; S.lsum[t] = 0.0f; }
+        sycl::group_barrier(grp);
+        qm = sycl::fmax(sycl::fmax(S.qmax[0], S.qmax[1]), sycl::fmax(S.qmax[2], S.qmax[3]));
+        const int qe = qm > 0.0f ? (int) ((sycl::bit_cast<uint32_t>(qm) >> 23) & 0xFF) - 126 : 0;
+        const float qup = sycl::ldexp(1.0f, 14 - qe), qdown = sycl::ldexp(scale_log2, qe - 14);
+        uint32_t qh[4][4], ql[4][4];
+        #pragma unroll
+        for (int kk = 0; kk < 4; ++kk)
+            #pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                const int row = gid + (r & 1) * 8, col = dim0 + kk * 16 + 2 * tig + (r >> 1) * 8;
+                float x0 = 0.0f, x1 = 0.0f;
+                if (row < G) { x0 = qp[(size_t) row * HD + col] * qup; x1 = qp[(size_t) row * HD + col + 1] * qup; }
+                const sycl::vec<half, 2> hi{half(x0), half(x1)};
+                qh[kk][r] = sycl::bit_cast<uint32_t>(hi);
+                ql[kk][r] = pv2::pack_h2(x0 - (float) hi[0], x1 - (float) hi[1]);
+            }
+
+        // the chunk pipeline: cells two chunks ahead, their pool rows one chunk ahead, the data (cp.async) one ahead
+        const int n_chunks = (n + CH - 1) / CH;
+        auto cell_of = [&](int c) -> int { return c < n ? sel[c] : -1; };
+        auto row_of = [&](int cell) -> long long {
+            if (cell < 0) return -1;
+            const long long page = (long long) p.page_table[cell / page_size];
+            return (page * n_kv + kvh) * page_size + (cell % page_size);
+        };
+        auto issue = [&](long long r, int st, float& ksr, float& vsr) {   // cp.async takes generic addresses
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int idx = lane + 32 * j, cell = idx >> 2, pc = idx & 3;
+                const long long rr = sycl::select_from_group(sg, r, cell);
+                const bool ok = rr >= 0;
+                const size_t off = ok ? (size_t) rr * HD + (size_t) dim0 + (size_t) pc * 16 : 0;
+                pv2::cp_async16((int8_t*) &S.kv[st][warp][0][0][0] + swz(cell, pc * 16), p.k_q + off, ok);
+                pv2::cp_async16((int8_t*) &S.kv[st][warp][1][0][0] + swz(cell, pc * 16), p.v_q + off, ok);
+            }
+            ksr = r >= 0 ? f32_from_f16(p.k_scale[r * (HD / KV_Q8_GROUP) + warp]) : 0.0f;
+            vsr = r >= 0 ? f32_from_f16(p.v_scale[r * (HD / KV_Q8_GROUP) + warp]) : 0.0f;
+        };
+        float ksn, vsn;
+        issue(row_of(cell_of(lane)), 0, ksn, vsn);
+        pv2::cp_async_commit();
+        S.sc[0][warp][0][lane] = ksn;
+        S.sc[0][warp][1][lane] = vsn;
+        long long r_next = row_of(cell_of(CH + lane));
+        int cell_next2 = cell_of(2 * CH + lane);
+
+        float acc[8][4];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
+
+        for (int ci = 0; ci < n_chunks; ++ci) {
+            const int st = ci & 1, c0 = ci * CH;
+            const bool more = ci + 1 < n_chunks;
+            if (more) issue(r_next, st ^ 1, ksn, vsn);
+            pv2::cp_async_commit();
+            r_next = row_of(cell_next2);
+            cell_next2 = cell_of((ci + 3) * CH + lane);
+            pv2::cp_async_wait1();
+            sycl::group_barrier(sg);
+            const __attribute__((opencl_local)) int8_t* K = &S.kv[st][warp][0][0][0];
+            const __attribute__((opencl_local)) int8_t* V = &S.kv[st][warp][1][0][0];
+            // q.k over this warp's 64 dims, times the cell's K scale for this group
+            #pragma unroll
+            for (int nt = 0; nt < CH / 8; ++nt) {
+                float tg[4] = {0.f, 0.f, 0.f, 0.f};
+                const int cell = nt * 8 + gid;
+                #pragma unroll
+                for (int kk = 0; kk < 4; ++kk) {
+                    uint32_t b[2];
+                    b[0] = pv2::i8x2_to_h2(*reinterpret_cast<const uint16_t*>(K + swz(cell, kk * 16 + 2 * tig)));
+                    b[1] = pv2::i8x2_to_h2(*reinterpret_cast<const uint16_t*>(K + swz(cell, kk * 16 + 2 * tig + 8)));
+                    pv2::mma16816(tg, qh[kk], b);
+                    pv2::mma16816(tg, ql[kk], b);
+                }
+                const int c = nt * 8 + 2 * tig;
+                const float s0 = S.sc[st][warp][0][c], s1 = S.sc[st][warp][0][c + 1];
+                S.part[warp][gid][c] = tg[0] * s0;
+                S.part[warp][gid][c + 1] = tg[1] * s1;
+                S.part[warp][gid + 8][c] = tg[2] * s0;
+                S.part[warp][gid + 8][c + 1] = tg[3] * s1;
+            }
+            sycl::group_barrier(grp);
+            // online softmax over the four groups' sum (fixed order): row t / 8, 4 cells per thread
+            {
+                const int r = t >> 3, sub = t & 7;
+                float x[4], mxv = NEG_INF;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int c = sub * 4 + j;
+                    x[j] = c0 + c < n ? (((S.part[0][r][c] + S.part[1][r][c]) + S.part[2][r][c]) + S.part[3][r][c]) * qdown
+                                      : NEG_INF;
+                    mxv = sycl::fmax(mxv, x[j]);
+                }
+                #pragma unroll
+                for (int o = 1; o < 8; o <<= 1) mxv = sycl::fmax(mxv, sycl::permute_group_by_xor(sg, mxv, o));
+                const float m_old = S.mrow[r];
+                const float m_new = sycl::fmax(m_old, mxv);
+                float sum = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float e = x[j] == NEG_INF ? 0.0f : sycl::exp2(x[j] - m_new);
+                    S.p[r][sub * 4 + j] = e;
+                    sum += e;
+                }
+                #pragma unroll
+                for (int o = 1; o < 8; o <<= 1) sum += sycl::permute_group_by_xor(sg, sum, o);
+                sycl::group_barrier(sg);
+                if (sub == 0) {
+                    const float a = m_old == NEG_INF ? 0.0f : sycl::exp2(m_old - m_new);
+                    S.alpha[r] = a;
+                    S.lsum[r] = sycl::fma(S.lsum[r], a, sum);
+                    S.mrow[r] = m_new;
+                }
+            }
+            sycl::group_barrier(grp);
+            // p.v over this warp's 64 dims
+            {
+                float vmax = S.sc[st][warp][1][lane];
+                #pragma unroll
+                for (int o = 16; o > 0; o >>= 1) vmax = sycl::fmax(vmax, sycl::permute_group_by_xor(sg, vmax, o));
+                const float vup = vmax > 0.0f ? 16384.0f / vmax : 0.0f, vdown = vmax * (1.0f / 16384.0f);
+                float tmp[8][4];
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) tmp[j][0] = tmp[j][1] = tmp[j][2] = tmp[j][3] = 0.0f;
+                #pragma unroll
+                for (int ks = 0; ks < CH / 16; ++ks) {
+                    const int cA = ks * 16 + 2 * tig, cB = cA + 8;
+                    const float w0 = S.sc[st][warp][1][cA] * vup, w1 = S.sc[st][warp][1][cA + 1] * vup,
+                                w2 = S.sc[st][warp][1][cB] * vup, w3 = S.sc[st][warp][1][cB + 1] * vup;
+                    const float p00 = S.p[gid][cA] * w0, p01 = S.p[gid][cA + 1] * w1;
+                    const float p10 = S.p[gid + 8][cA] * w0, p11 = S.p[gid + 8][cA + 1] * w1;
+                    const float p02 = S.p[gid][cB] * w2, p03 = S.p[gid][cB + 1] * w3;
+                    const float p12 = S.p[gid + 8][cB] * w2, p13 = S.p[gid + 8][cB + 1] * w3;
+                    uint32_t ah[4], al[4];
+                    ah[0] = pv2::pack_h2(p00, p01);
+                    ah[1] = pv2::pack_h2(p10, p11);
+                    ah[2] = pv2::pack_h2(p02, p03);
+                    ah[3] = pv2::pack_h2(p12, p13);
+                    {
+                        const auto f = [](uint32_t h, int k) { return (float) sycl::bit_cast<sycl::vec<half, 2>>(h)[k]; };
+                        al[0] = pv2::pack_h2(p00 - f(ah[0], 0), p01 - f(ah[0], 1));
+                        al[1] = pv2::pack_h2(p10 - f(ah[1], 0), p11 - f(ah[1], 1));
+                        al[2] = pv2::pack_h2(p02 - f(ah[2], 0), p03 - f(ah[2], 1));
+                        al[3] = pv2::pack_h2(p12 - f(ah[3], 0), p13 - f(ah[3], 1));
+                    }
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const int d = j * 8 + gid;
+                        const uint32_t x0 = (uint32_t) (uint8_t) V[swz(cA, d)] | ((uint32_t) (uint8_t) V[swz(cA + 1, d)] << 8);
+                        const uint32_t x1 = (uint32_t) (uint8_t) V[swz(cB, d)] | ((uint32_t) (uint8_t) V[swz(cB + 1, d)] << 8);
+                        uint32_t b[2];
+                        b[0] = pv2::i8x2_to_h2(x0);
+                        b[1] = pv2::i8x2_to_h2(x1);
+                        pv2::mma16816(tmp[j], ah, b);
+                        pv2::mma16816(tmp[j], al, b);
+                    }
+                }
+                const float a0 = S.alpha[gid], a1 = S.alpha[gid + 8];
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    acc[j][0] = sycl::fma(acc[j][0], a0, tmp[j][0] * vdown);
+                    acc[j][1] = sycl::fma(acc[j][1], a0, tmp[j][1] * vdown);
+                    acc[j][2] = sycl::fma(acc[j][2], a1, tmp[j][2] * vdown);
+                    acc[j][3] = sycl::fma(acc[j][3], a1, tmp[j][3] * vdown);
+                }
+            }
+            if (more) {
+                S.sc[st ^ 1][warp][0][lane] = ksn;
+                S.sc[st ^ 1][warp][1][lane] = vsn;
+            }
+            sycl::group_barrier(sg);
+        }
+        sycl::group_barrier(grp);
+        const float l0 = S.lsum[gid], l1 = S.lsum[gid + 8];
+        const float i0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, i1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int d = dim0 + j * 8 + 2 * tig;
+            out[(size_t) gid * HD + d] = acc[j][0] * i0;
+            out[(size_t) gid * HD + d + 1] = acc[j][1] * i0;
+            if (gid + 8 < G) {
+                out[(size_t) (gid + 8) * HD + d] = acc[j][2] * i1;
+                out[(size_t) (gid + 8) * HD + d + 1] = acc[j][3] * i1;
+            }
+        }
+#endif
+    }
+    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(pm::SG)>}; }
+};
+
+// Whether this device's compile carries PromptAttnPtx's body (NVIDIA from sm_80 on): asked of the device once.
+bool ptx_attn_built(sycl::queue& queue) {
+    static core::PerDevice<bool> per_device;
+    return per_device.get(queue.get_device(), [&queue] {
+        int* flag = sycl::malloc_device<int>(1, queue);
+        if (flag == nullptr) return false;
+        int got = 0;
+        try {
+            queue.single_task([=] { *flag = STRATA_PA_PTX; });
+            queue.memcpy(&got, flag, sizeof(int)).wait();
+        } catch (const sycl::exception&) { got = 0; }
+        sycl::free(flag, queue);
+        return got == 1;
+    });
+}
+
+sycl::event launch_ptx(sycl::queue& q, const float* qv, QsaAttnPools p, const int32_t* ids, const int32_t* steps,
+                       int64_t cap, int64_t n_kv, int64_t page_size, float* attn, int64_t n_q) {
+    const float scale_log2 = 1.4426950408889634f / std::sqrt((float) HD);
+    return q.submit([&](sycl::handler& h) {
+        PromptAttnPtx k{qv, p, ids, steps, cap, n_kv, page_size, scale_log2, attn,
+                        sycl::local_accessor<uint8_t, 1>(sycl::range<1>(sizeof(pv2::Smem)), h)};
         h.parallel_for(sycl::nd_range<2>({(size_t) n_q, (size_t) (n_kv * pm::WG)}, {1, pm::WG}), k);
     });
 }
@@ -715,12 +1053,18 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
             return xe::mma_shape_is(queue, 16, 16, 16, 32) && slm >= mma_local_bytes();
         });
         if (!mma || pools.k_q4 != nullptr) return false;
+        static const bool ptx_on = [] {
+            const char* v = std::getenv("STRATA_PROMPT_ATTN_PTX");
+            return v == nullptr || v[0] != '0';
+        }();
         const int64_t nkv = s.n_head_kv, ps = s.page_size;
         sycl::event e;
         if (pools.k_q != nullptr) {
             if (!pools.k_scale) return false;
             if (pools.v_q4 != nullptr)
                 e = launch_mma<kI8, kQ4>(queue, q, pools, ids, steps, cap, nkv, ps, attn, n_q);
+            else if (pools.v_q && pools.v_scale && ptx_on && slm >= sizeof(pv2::Smem) && ptx_attn_built(queue))
+                e = launch_ptx(queue, q, pools, ids, steps, cap, nkv, ps, attn, n_q);
             else if (pools.v_q && pools.v_scale)
                 e = launch_mma<kI8, kI8>(queue, q, pools, ids, steps, cap, nkv, ps, attn, n_q);
             else

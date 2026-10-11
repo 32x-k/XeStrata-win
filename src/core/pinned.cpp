@@ -76,6 +76,26 @@ void register_pieces(uint8_t* base, uint64_t bytes, const std::vector<uint64_t>&
         start = end;
     }
 }
+
+// Upstream #771: with transparent huge pages "always" the kernel backs a mapping with huge pages where it can; an
+// extra MADV_HUGEPAGE only adds direct reclaim and compaction on every fault (defrag=madvise), which on a fragmented
+// machine stretched a 25 s start to 432 s.  So it is not asked for there; STRATA_NO_ARENA_THP=1 skips it anywhere.
+// Returns why it was skipped, or an empty string when it should be asked for.
+std::string thp_request_skipped() {
+    if (std::getenv("STRATA_NO_ARENA_THP") != nullptr) return "transparent huge pages skipped (STRATA_NO_ARENA_THP)";
+    std::string mode;
+    if (std::FILE* f = std::fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r")) {
+        char line[128] = {0};
+        if (std::fgets(line, sizeof line, f) != nullptr) {
+            const char* open = std::strchr(line, '[');
+            const char* close = open ? std::strchr(open, ']') : nullptr;
+            if (open && close) mode.assign(open + 1, close);
+        }
+        std::fclose(f);
+    }
+    return mode == "always" ? "transparent huge pages are on for every mapping (THP always): MADV_HUGEPAGE not requested"
+                            : std::string();
+}
 }  // namespace
 
 PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, slice, std::vector<uint64_t>{}) {}
@@ -103,7 +123,8 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint6
         throw DeviceError("mmap of the expert arena failed for " + std::to_string(bytes) + " bytes");
     }
     base = (void*) (((uintptr_t) map_ + kHugePage - 1) & ~(uintptr_t) (kHugePage - 1));
-    const bool huge = madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
+    const std::string thp_skip = thp_request_skipped();
+    const bool huge = thp_skip.empty() && madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
 #endif
     // Registered before the loader touches a page: the B70 run showed later writes reach the device intact.
     try {
@@ -125,17 +146,20 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint6
 #if defined(_WIN32)
            "4 KB pages; no VirtualLock";
 #else
-           (huge ? "transparent huge pages requested (madvise)" : "madvise(MADV_HUGEPAGE) refused: 4 KB pages") +
+           (!thp_skip.empty() ? thp_skip
+            : huge             ? "transparent huge pages requested (madvise)"
+                               : "madvise(MADV_HUGEPAGE) refused: 4 KB pages") +
            "; no mlock";
 #endif
 }
 
-PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t pad, bool host_usm)
+PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t pad, bool host_usm,
+                         const std::vector<uint64_t>& cuts)
     : capacity(bytes), bounds_(bounds) {
     if (!host_usm) {
         // one mapping, registered in pieces that end at layer starts: the other constructor's work, then keep the
         // bounds for `at`
-        PinnedArena one(bytes, 0, std::vector<uint64_t>(bounds.begin() + 1, bounds.end()));
+        PinnedArena one(bytes, 0, cuts.empty() ? std::vector<uint64_t>(bounds.begin() + 1, bounds.end()) : cuts);
         std::swap(base, one.base); std::swap(map_, one.map_); std::swap(map_bytes_, one.map_bytes_);
         std::swap(reg_, one.reg_);
         std::swap(pieces_, one.pieces_);
@@ -238,7 +262,8 @@ void arena_lock(int fd) {
 }  // namespace
 
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes,
-                         const std::string& file, uint64_t pack_hash) : capacity(bytes), bounds_(bounds) {
+                         const std::string& file, uint64_t pack_hash, const std::vector<uint64_t>& cuts)
+    : capacity(bytes), bounds_(bounds) {
     (void) max_pinned_bytes;   // Xe registers every slice, bounded by the device's largest allocation.
     if (!bytes || bytes > (uint64_t) std::numeric_limits<int64_t>::max() - kArenaHeaderBytes - kHugePage)
         throw DeviceError("shared arena: invalid size");
@@ -296,9 +321,9 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
                  (off_t) kArenaHeaderBytes) == MAP_FAILED) {
             base = nullptr; throw DeviceError("shared arena: mapping failed");
         }
-        const bool huge = madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
+        const bool huge = thp_request_skipped().empty() && madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
 #endif
-        register_pieces((uint8_t*) base, bytes, bounds, reg_, pieces_);
+        register_pieces((uint8_t*) base, bytes, cuts.empty() ? bounds : cuts, reg_, pieces_);
         registered_bytes = bytes; registered_slices = 1; slice_starts = {0};
         backing = huge ? PageBacking::LargePages : PageBacking::NormalPages;
         note = "shared file mapping registered in device-sized slices; no mlock";
@@ -339,6 +364,78 @@ void PinnedArena::publish_shared() {
         !sync_file(shared_fd_))
         throw DeviceError("shared arena: cannot publish completed weights");
     unlock(shared_fd_); shared_locked_ = false;
+}
+
+bool PinnedArena::to_host_usm(uint64_t pad, std::string& err) {
+    if (!layer_base.empty()) return true;
+    if (base == nullptr || map_ == nullptr || shared_fd_ >= 0 || bounds_.size() < 2) {
+        err = "only a private mapping with layer bounds moves into host USM";
+        return false;
+    }
+    auto& runtime = Runtime::get();
+    namespace sx = sycl::ext::oneapi::experimental;
+    try {   // no copy may read the mapping while it moves, and its registrations go
+        runtime.finish();
+        for (auto& o : other_reg_) {
+            auto& r = Runtime::at(o.first);
+            r.finish();
+            for (void* q : o.second) sx::release_from_device_copy(q, r.context());
+        }
+        other_reg_.clear();
+        for (void* r : reg_) sx::release_from_device_copy(r, runtime.context());
+        reg_.clear();
+    } catch (const std::exception& e) {
+        err = std::string("releasing the arena's registrations: ") + e.what();
+        return false;
+    }
+    std::vector<uint8_t*> blocks;
+    const size_t layers = bounds_.size() - 1;
+    for (size_t l = 0; l < layers; ++l) {
+        const uint64_t n = bounds_[l + 1] - bounds_[l];
+        void* q = sycl::malloc_host((size_t) (n + pad), runtime.context());
+        if (q == nullptr) {   // back as it was: the moved layers into the mapping, then its registrations
+            for (size_t k = 0; k < blocks.size(); ++k) {
+                std::memcpy((uint8_t*) base + bounds_[k], blocks[k], (size_t) (bounds_[k + 1] - bounds_[k]));
+                runtime.free(blocks[k]);
+            }
+            try {
+                for (const auto& pc : pieces_) {
+                    sx::prepare_for_device_copy(pc.first, pc.second, runtime.context());
+                    reg_.push_back(pc.first);
+                }
+            } catch (const std::exception& e) {
+                err = std::string("host USM refused at layer ") + std::to_string(l) + ", and the mapping's registration " +
+                      "again failed (" + e.what() + "): its copies are slower";
+                return false;
+            }
+            err = "host USM refused at layer " + std::to_string(l) + " (" + std::to_string(n + pad) + " B)";
+            return false;
+        }
+        std::memcpy(q, (uint8_t*) base + bounds_[l], (size_t) n);
+        if (pad > 0) std::memset((uint8_t*) q + n, 0, (size_t) pad);
+        blocks.push_back((uint8_t*) q);
+        // the moved layer's whole pages back to the system (MADV_DONTNEED on a private mapping drops them)
+        const uintptr_t a = ((uintptr_t) base + bounds_[l] + 4095) & ~(uintptr_t) 4095;
+        const uintptr_t b = ((uintptr_t) base + bounds_[l + 1]) & ~(uintptr_t) 4095;
+        if (b > a) madvise((void*) a, (size_t) (b - a), MADV_DONTNEED);
+    }
+    munmap(map_, map_bytes_);
+    map_ = nullptr;
+    map_bytes_ = 0;
+    layer_base = std::move(blocks);
+    pieces_.clear();
+    slice_starts.clear();
+    for (size_t l = 0; l < layers; ++l) {
+        pieces_.emplace_back(layer_base[l], (size_t) (bounds_[l + 1] - bounds_[l] + pad));
+        slice_starts.push_back(bounds_[l]);
+    }
+    base = layer_base[0];
+    backing = PageBacking::NormalPages;
+    slice_bytes = 1;
+    registered_slices = (int) layers;
+    note = "host USM, one block per layer (" + std::to_string(layers) +
+           "), moved from the registered mapping: readable by GPU kernels for the PCIe share";
+    return true;
 }
 
 uint8_t* PinnedArena::at(uint64_t off) const {

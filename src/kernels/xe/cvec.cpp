@@ -10,6 +10,8 @@
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_cvec
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <array>
 #include <stdexcept>
@@ -78,6 +80,13 @@ inline float sigmoidf_(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
 }  // namespace
 
 const Cvec& cvec() { return g_cvec; }
+
+CvecTables cvec_tables() {
+    if (!g_cvec.loaded()) return {};
+    const DevTables& t = here();
+    if (t.dir == nullptr) throw std::runtime_error("cvec_tables: the control vector is not on this device (cvec_replicate)");
+    return CvecTables{t.dir, t.s, t.on};
+}
 
 bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int mode, int first, int last,
                  int64_t n_embd, int64_t hc, std::string& err) {

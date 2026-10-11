@@ -1,0 +1,395 @@
+# V100x1-up-1k-1.txt
+strata generate: PCIe probe: 13.1 GB/s host->device (best of 13.1 13.1 13.1 13.1) -> pcie_frac 0.36 (default 0.55)
+strata generate: native pack: <HOME>/Strata-data/packs/iq3_s experts (largest blob 2.66 MB), token embedding IQ4_XS in mapped host memory (322 MiB, 0.1 s)
+strata generate: 1466 MiB of weights loaded from <HOME>/Strata-data/packs/iq3_s in 0.2 s (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 2018.88 MiB of weights, in 0.2 s
+strata generate: PLE direct read probe: 177225 rows/s (fine)
+strata generate: the SSD is kept awake while rows are read: one page of the table after 100 ms without a read, until 60 s after the last request (STRATA_SSD_KEEPALIVE=0 turns it off)
+strata generate: profile <HOME>/xestrata-single-20261011/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: PLE on, table 320001536 rows of <HOME>/Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf
+strata mtp: draft layer loaded, 809 MiB of VRAM (experts 675, dense 111), files read in 0.17 s (4491 MiB/s)
+strata generate: experimental native Q5_K head, 521472000 bytes, in 0.1 s
+strata generate: GPU 0: Tesla V100-PCIE-32GB, compute capability 7.0
+strata generate: expert arena read through the file cache (buffered (not Windows))
+strata generate: expert arena: cudaHostRegister PORTABLE ok; MAP_HUGETLB unavailable (needed 23983 2 MiB pages, vm.nr_hugepages=0); transparent huge pages requested (MADV_HUGEPAGE)
+strata generate: loaded 46.84 GiB at 10.03 GiB/s
+strata generate: CPU pool tasks/phase: 48 (automatic), participating threads: 16
+strata generate: 15 pool workers on logical processors 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15, the host thread on 0 (draining too) (--host-core first)
+strata aux cpus: threads that are neither pool workers nor the host go to CPUs 16 (off at start; a request's aux_cpus=1 turns it on)
+strata generate: expert cache auto: 26.05 GiB free, 700 MiB reserved (+218 MiB for the draft head) -> 10143 slots
+strata generate: expert cache 13246 slots, 25.15 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: pre-filled 13246 of 13246 slots from the profile in 2.3 s (11816 MB/s); slot 0 verified
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 15 expert-pool workers + the host thread
+strata generate: session is up (engine 0.1.42)
+strata generate: sampling greedy
+strata generate: token graph hit path: 13246 resident experts, decided on the device
+prefill: the CPU share is ON by default for prompt chunks below 1024 tokens (the idle CPU takes some of the experts the GPU would stream; answers can differ slightly from 0.1.40.3, mean KL ~0.004). STRATA_PREFILL_CPU_SHARE=0 turns it off.
+strata generate: prompt chunk auto: 1024 tokens
+strata generate: prompt path borrows 779 cache slots (1.49 GiB)
+strata mtp: draft head over 106299 tokens (212.9 MiB)
+strata generate: 779 lent slots refilled in 124.2 ms
+strata generate: prefill 1016 tokens in 1 chunks, 1344.4 ms (755.7 tok/s); experts streamed 3244 (3244 by DMA, host 24.8 ms), resident 12049, on the CPU 4444 (share 0.87); PLE 31.8 ms
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 6 tokens, 74.4 MiB of device buffers
+strata verify: capturing the 1-token window (400 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (382 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (364 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (348 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (330 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata generate: position 1201, 185 tokens, 64 rounds
+speculation              84 rounds of 6, drafts accepted 175 of 218 (0.803), 3.08 tokens per round
+window sizes             T1:9 T2:8 T3:1 T4:61 T5:0 T6:5  (min draft probability 0.50)
+suffix drafts            16 windows, drafts accepted 51 of 58
+accepted per round       0:17 1:13 2:8 3:42 4:0 5:4
+verify window            wait for rings 27.763  pool 3.537  host 0.007  commit 0.030 ms/round; CPU experts 1.79 distinct / 2.13 routed per layer
+pool multi               gate/up 3.527  quantize 0.052  down 2.277 ms/round; 49.2 GB/s over the rows phases; CPU pool call 3.525 ms/round
+dispatch                 plan 0.087  activation quantize 0.105  jobs 0.007  run 3.323 ms/round
+adaptive tier            1566 experts swapped into the VRAM tier (every 4 rounds, 0.054 ms/round)
+pcie experts             0.47 distinct experts per layer read over PCIe (share 92/256 of the misses)
+mtp                      2.663 ms/round drafting (83 rounds), MTP prompt 4.6 ms, 1023 MiB of VRAM
+prompt  : 248045 8678 198 2523 513 264 10505 8057 3133 303 279 1156 579 12182 13 1394 1301 3425 440 279 1301 2378 5224 11 4351 1070 440 3668 38331 11 321 1542 10966 440 279 12168 5224 13 13262 4203 2526 11 10033 1092 488 2222 321 3069 11 321 635 524 5615 3425 279 3274 1503 524 1144 13 248046 198 248045 846 198 760 12182 369 264 351 992 14 17867 3040 42903 4560 13 4081 513 279 3425 488 599 1301 748 2944 25 271 27 1152 1752 420 965 14 485 450 53683 20123 21849 29456 6251 731 198 320 34313 12 1643 13155 1138 25 220 17 15 17 21 20913 78 16 17 17 16 321 279 4361 450 19726 198 320 34313 12 1643 13155 1138 25 220 17 15 17 21 32969 53 51005 321 279 175941 2495 450 19726 198 320 34313 35274 35555 25 45945 12 18 13 15 25663 2759 932 198 6287 2957 198 320 2212 53683 20123 21849 29456 6982 471 387 16 782 18 25 16764 5604 401 29456 11881 11 1308 16917 494 50285 980 13 198 320 198 320 387 16 782 18 16561 364 1396 10845 2945 303 279 1167 17 62 15 999 13 1061 8211 440 279 5981 383 279 8751 198 320 1752 318 1719 69764 11312 513 660 1167 17 62 15 8 5346 279 34468 2315 4346 11 321 369 31838 748 279 198 320 2645 5758 303 13 8483 314 7793 791 10845 369 22513 303 1754 709 13 198 320 198 320 1167 17 62 15 369 279 799 421 12482 11 321 1141 4954 369 21681 494 2450 303 25499 32773 17 62 15 14429 2076 20668 25 198 320 256 2424 283 313 11665 16 21 293 26 2535 23 31351 58 16 21 60 333 220 283 220 21 19 5255 11 220 16 23 5639 198 320 256 1970 313 15 11 16 11 17 11 18 92 1411 7489 28700 16 11 15 61310 16 61310 17 10738 220 343 283 318 1787 471 220 16 8 348 293 198 320 256 220 19 13513 791 4763 11 90096 35718 25 4763 492 14 19 11 9192 318 73 4 19 4653 17 198 320 256 1167 42 17 62 15 283 220 21 19 369 5140 39668 494 279 35426 579 1765 4206 37641 11 524 18533 318 1719 90448 6982 8313 421 198 320 256 11192 279 913 1429 220 16 17 23 26 411 35426 369 220 21 19 553 198 320 198 320 18381 25 1510 312 1960 361 1152 75021 1644 42181 401 29456 4603 1865 9714 321 54878 279 57565 48979 55687 421 198 320 1396 2468 869 369 799 314 28700 67 11 220 15 11 478 67 11 478 17 67 92 364 421 2424 579 1765 5281 13 2844 36584 2612 23065 11 198 320 1777 321 18648 21851 11 864 513 279 7652 19174 264 401 29456 3035 3404 682 13 1049 369 33931 198 320 524 264 55404 94497 2294 70 980 1228 471 421 3749 50285 980 10278 11 864 369 387 16 782 18 579 1727 2923 13 271 1032 361 93631 29 198 1032 361 35981 29 198 1032 361 37618 29 198 1032 361 32608 29 198 1032 361 889 29 198 1032 361 3112 29 271 1389 11804 4337 2559 38 19913 31212 53832 220 16 198 1032 328 485 450 53683 20123 4691 70 1644 21614 6251 1 271 2159 592 450 313 271 320 10977 11665 16 21 3359 69 16 21 1411 11665 18 17 13 11396 3579 1146 19401 1091 321 178642 1313 26 47993 27700 635 524 13 198 4895 2153 11665 16 21 2270 33030 18 17 8228 16 21 516 304 8 313 198 262 713 2535 18 17 516 1777 283 318 2416 18 17 516 2299 71 3459 220 16 20 8 594 220 16 84 26 198 262 2535 18 17 516 1295 283 318 71 3459 220 16 15 8 594 220 15 87 16 74120 11 855 283 304 594 220 15 87 18 1686 84 11 281 26 198 262 413 318 4431 606 220 15 8 313 198 285 413 318 1461 606 220 15 8 198 309 281 283 1777 1079 220 18 16 26 198 285 745 313 198 309 1295 283 220 16 17 22 471 220 16 20 478 220 16 26 198 309 1345 13440 1461 594 220 15 87 19 15 15 84 578 313 198 388 855 49456 220 16 26 198 388 1137 4431 26 198 309 333 198 309 855 14161 220 15 87 18 1686 84 26 198 309 281 283 318 7506 1079 220 18 16 8 735 318 4431 1079 220 17 18 8 735 318 1461 1079 220 16 18 1174 198 285 333 198 262 333 745 413 318 4431 606 220 18 16 8 198 285 281 283 318 7506 1079 220 18 16 8 735 220 15 87 22 37 23 15 15 15 15 15 84 735 318 1461 1079 220 16 18 1174 198 262 745 198 285 281 283 318 7506 1079 220 18 16 8 735 1718 4431 471 220 16 20 478 220 16 17 22 8 1079 220 17 18 8 735 318 1461 1079 220 16 18 1174 198 262 2153 680 26 198 262 1407 476 78290 2031 403 11 594 69 11 220 19 1174 198 262 460 680 26 198 92 271 4895 2153 37799 16 21 2270 33030 18 17 8228 16 21 516 304 8 313 198 262 713 2535 18 17 516 281 283 198 6065 25 1423 1332 279 9640 318 29554 473 8 1752 39129 264 1248 9640 1083 25903 11 10033 1204 279 11540 1331 369 11543 11 321 28647 264 10582 421 17872 279 11543 1331 2957 791 9640 13 4980 440 264 2716 3019 13 248046 198 248045 74455 198 248068 271 248069 271
+output  : 40 3172 1151 539 23218 279 12182 5759 310 1423 279 829 7320 4181 14322 11540 286 11870 13 271 248058 198 27 1628 86779 2378 29 198 27 15704 79114 29 198 13 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 198 27 13766 15480 3960 29 1743 44530 999 25 22052 369 524 264 999 13 1368 488 599 524 1301 1510 1825 42427 20668 63 3482 11 1301 424 1118 471 424 1189 6435 2313 43015 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 86779 2378 29 198 27 15704 79114 29 198 1825 42427 20668 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 198 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28 5454 29 198 4577 471 4120 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28 5454 29 198 24751 26 18997 471 4120 26 1627 73299 4961 1423 641 471 2721 17038 220 17 471 1267 293 735 1901 471 20 15 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 248046 198 248045 846 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28
+decode                   256 tokens in 3241.9 ms  ->  78.97 tok/s
+prefill                  1016 tokens in 1468.6 ms  ->  691.80 tok/s  (time to first token 1836.4 ms)
+
+# V100x1-up-1k-2.txt
+strata generate: PCIe probe: 13.1 GB/s host->device (best of 13.1 13.1 13.1 13.1) -> pcie_frac 0.36 (default 0.55)
+strata generate: native pack: <HOME>/Strata-data/packs/iq3_s experts (largest blob 2.66 MB), token embedding IQ4_XS in mapped host memory (322 MiB, 0.1 s)
+strata generate: 1466 MiB of weights loaded from <HOME>/Strata-data/packs/iq3_s in 0.2 s (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 2018.88 MiB of weights, in 0.2 s
+strata generate: PLE direct read probe: 179006 rows/s (fine)
+strata generate: the SSD is kept awake while rows are read: one page of the table after 100 ms without a read, until 60 s after the last request (STRATA_SSD_KEEPALIVE=0 turns it off)
+strata generate: profile <HOME>/xestrata-single-20261011/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: PLE on, table 320001536 rows of <HOME>/Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf
+strata mtp: draft layer loaded, 809 MiB of VRAM (experts 675, dense 111), files read in 0.18 s (4460 MiB/s)
+strata generate: experimental native Q5_K head, 521472000 bytes, in 0.1 s
+strata generate: GPU 0: Tesla V100-PCIE-32GB, compute capability 7.0
+strata generate: expert arena read through the file cache (buffered (not Windows))
+strata generate: expert arena: cudaHostRegister PORTABLE ok; MAP_HUGETLB unavailable (needed 23983 2 MiB pages, vm.nr_hugepages=0); transparent huge pages requested (MADV_HUGEPAGE)
+strata generate: loaded 46.84 GiB at 10.01 GiB/s
+strata generate: CPU pool tasks/phase: 48 (automatic), participating threads: 16
+strata generate: 15 pool workers on logical processors 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15, the host thread on 0 (draining too) (--host-core first)
+strata aux cpus: threads that are neither pool workers nor the host go to CPUs 16 (off at start; a request's aux_cpus=1 turns it on)
+strata generate: expert cache auto: 26.05 GiB free, 700 MiB reserved (+218 MiB for the draft head) -> 10143 slots
+strata generate: expert cache 13246 slots, 25.15 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: pre-filled 13246 of 13246 slots from the profile in 2.3 s (11816 MB/s); slot 0 verified
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 15 expert-pool workers + the host thread
+strata generate: session is up (engine 0.1.42)
+strata generate: sampling greedy
+strata generate: token graph hit path: 13246 resident experts, decided on the device
+prefill: the CPU share is ON by default for prompt chunks below 1024 tokens (the idle CPU takes some of the experts the GPU would stream; answers can differ slightly from 0.1.40.3, mean KL ~0.004). STRATA_PREFILL_CPU_SHARE=0 turns it off.
+strata generate: prompt chunk auto: 1024 tokens
+strata generate: prompt path borrows 779 cache slots (1.49 GiB)
+strata mtp: draft head over 106299 tokens (212.9 MiB)
+strata generate: 779 lent slots refilled in 124.2 ms
+strata generate: prefill 1016 tokens in 1 chunks, 1338.7 ms (759.0 tok/s); experts streamed 3244 (3244 by DMA, host 18.4 ms), resident 12049, on the CPU 4444 (share 0.87); PLE 31.5 ms
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 6 tokens, 74.4 MiB of device buffers
+strata verify: capturing the 1-token window (400 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (382 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (364 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (348 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (330 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata generate: position 1201, 185 tokens, 64 rounds
+speculation              84 rounds of 6, drafts accepted 175 of 218 (0.803), 3.08 tokens per round
+follow                   0 of 256 emitted tokens differ from the argmax
+window sizes             T1:9 T2:8 T3:1 T4:61 T5:0 T6:5  (min draft probability 0.50)
+suffix drafts            16 windows, drafts accepted 51 of 58
+accepted per round       0:17 1:13 2:8 3:42 4:0 5:4
+verify window            wait for rings 27.744  pool 3.551  host 0.007  commit 0.027 ms/round; CPU experts 1.79 distinct / 2.13 routed per layer
+pool multi               gate/up 3.516  quantize 0.051  down 2.269 ms/round; 49.4 GB/s over the rows phases; CPU pool call 3.539 ms/round
+dispatch                 plan 0.084  activation quantize 0.112  jobs 0.007  run 3.333 ms/round
+adaptive tier            1566 experts swapped into the VRAM tier (every 4 rounds, 0.078 ms/round)
+pcie experts             0.47 distinct experts per layer read over PCIe (share 92/256 of the misses)
+mtp                      2.664 ms/round drafting (83 rounds), MTP prompt 4.6 ms, 1023 MiB of VRAM
+prompt  : 248045 8678 198 2523 513 264 10505 8057 3133 303 279 1156 579 12182 13 1394 1301 3425 440 279 1301 2378 5224 11 4351 1070 440 3668 38331 11 321 1542 10966 440 279 12168 5224 13 13262 4203 2526 11 10033 1092 488 2222 321 3069 11 321 635 524 5615 3425 279 3274 1503 524 1144 13 248046 198 248045 846 198 760 12182 369 264 351 992 14 17867 3040 42903 4560 13 4081 513 279 3425 488 599 1301 748 2944 25 271 27 1152 1752 420 965 14 485 450 53683 20123 21849 29456 6251 731 198 320 34313 12 1643 13155 1138 25 220 17 15 17 21 20913 78 16 17 17 16 321 279 4361 450 19726 198 320 34313 12 1643 13155 1138 25 220 17 15 17 21 32969 53 51005 321 279 175941 2495 450 19726 198 320 34313 35274 35555 25 45945 12 18 13 15 25663 2759 932 198 6287 2957 198 320 2212 53683 20123 21849 29456 6982 471 387 16 782 18 25 16764 5604 401 29456 11881 11 1308 16917 494 50285 980 13 198 320 198 320 387 16 782 18 16561 364 1396 10845 2945 303 279 1167 17 62 15 999 13 1061 8211 440 279 5981 383 279 8751 198 320 1752 318 1719 69764 11312 513 660 1167 17 62 15 8 5346 279 34468 2315 4346 11 321 369 31838 748 279 198 320 2645 5758 303 13 8483 314 7793 791 10845 369 22513 303 1754 709 13 198 320 198 320 1167 17 62 15 369 279 799 421 12482 11 321 1141 4954 369 21681 494 2450 303 25499 32773 17 62 15 14429 2076 20668 25 198 320 256 2424 283 313 11665 16 21 293 26 2535 23 31351 58 16 21 60 333 220 283 220 21 19 5255 11 220 16 23 5639 198 320 256 1970 313 15 11 16 11 17 11 18 92 1411 7489 28700 16 11 15 61310 16 61310 17 10738 220 343 283 318 1787 471 220 16 8 348 293 198 320 256 220 19 13513 791 4763 11 90096 35718 25 4763 492 14 19 11 9192 318 73 4 19 4653 17 198 320 256 1167 42 17 62 15 283 220 21 19 369 5140 39668 494 279 35426 579 1765 4206 37641 11 524 18533 318 1719 90448 6982 8313 421 198 320 256 11192 279 913 1429 220 16 17 23 26 411 35426 369 220 21 19 553 198 320 198 320 18381 25 1510 312 1960 361 1152 75021 1644 42181 401 29456 4603 1865 9714 321 54878 279 57565 48979 55687 421 198 320 1396 2468 869 369 799 314 28700 67 11 220 15 11 478 67 11 478 17 67 92 364 421 2424 579 1765 5281 13 2844 36584 2612 23065 11 198 320 1777 321 18648 21851 11 864 513 279 7652 19174 264 401 29456 3035 3404 682 13 1049 369 33931 198 320 524 264 55404 94497 2294 70 980 1228 471 421 3749 50285 980 10278 11 864 369 387 16 782 18 579 1727 2923 13 271 1032 361 93631 29 198 1032 361 35981 29 198 1032 361 37618 29 198 1032 361 32608 29 198 1032 361 889 29 198 1032 361 3112 29 271 1389 11804 4337 2559 38 19913 31212 53832 220 16 198 1032 328 485 450 53683 20123 4691 70 1644 21614 6251 1 271 2159 592 450 313 271 320 10977 11665 16 21 3359 69 16 21 1411 11665 18 17 13 11396 3579 1146 19401 1091 321 178642 1313 26 47993 27700 635 524 13 198 4895 2153 11665 16 21 2270 33030 18 17 8228 16 21 516 304 8 313 198 262 713 2535 18 17 516 1777 283 318 2416 18 17 516 2299 71 3459 220 16 20 8 594 220 16 84 26 198 262 2535 18 17 516 1295 283 318 71 3459 220 16 15 8 594 220 15 87 16 74120 11 855 283 304 594 220 15 87 18 1686 84 11 281 26 198 262 413 318 4431 606 220 15 8 313 198 285 413 318 1461 606 220 15 8 198 309 281 283 1777 1079 220 18 16 26 198 285 745 313 198 309 1295 283 220 16 17 22 471 220 16 20 478 220 16 26 198 309 1345 13440 1461 594 220 15 87 19 15 15 84 578 313 198 388 855 49456 220 16 26 198 388 1137 4431 26 198 309 333 198 309 855 14161 220 15 87 18 1686 84 26 198 309 281 283 318 7506 1079 220 18 16 8 735 318 4431 1079 220 17 18 8 735 318 1461 1079 220 16 18 1174 198 285 333 198 262 333 745 413 318 4431 606 220 18 16 8 198 285 281 283 318 7506 1079 220 18 16 8 735 220 15 87 22 37 23 15 15 15 15 15 84 735 318 1461 1079 220 16 18 1174 198 262 745 198 285 281 283 318 7506 1079 220 18 16 8 735 1718 4431 471 220 16 20 478 220 16 17 22 8 1079 220 17 18 8 735 318 1461 1079 220 16 18 1174 198 262 2153 680 26 198 262 1407 476 78290 2031 403 11 594 69 11 220 19 1174 198 262 460 680 26 198 92 271 4895 2153 37799 16 21 2270 33030 18 17 8228 16 21 516 304 8 313 198 262 713 2535 18 17 516 281 283 198 6065 25 1423 1332 279 9640 318 29554 473 8 1752 39129 264 1248 9640 1083 25903 11 10033 1204 279 11540 1331 369 11543 11 321 28647 264 10582 421 17872 279 11543 1331 2957 791 9640 13 4980 440 264 2716 3019 13 248046 198 248045 74455 198 248068 271 248069 271
+output  : 40 3172 1151 539 23218 279 12182 5759 310 1423 279 829 7320 4181 14322 11540 286 11870 13 271 248058 198 27 1628 86779 2378 29 198 27 15704 79114 29 198 13 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 198 27 13766 15480 3960 29 1743 44530 999 25 22052 369 524 264 999 13 1368 488 599 524 1301 1510 1825 42427 20668 63 3482 11 1301 424 1118 471 424 1189 6435 2313 43015 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 86779 2378 29 198 27 15704 79114 29 198 1825 42427 20668 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 198 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28 5454 29 198 4577 471 4120 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28 5454 29 198 24751 26 18997 471 4120 26 1627 73299 4961 1423 641 471 2721 17038 220 17 471 1267 293 735 1901 471 20 15 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 248046 198 248045 846 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28
+decode                   256 tokens in 3244.3 ms  ->  78.91 tok/s
+prefill                  1016 tokens in 1462.9 ms  ->  694.53 tok/s  (time to first token 1823.2 ms)
+
+# V100x1-up-warmup.txt
+strata generate: PCIe probe: 13.1 GB/s host->device (best of 13.1 13.1 13.1 13.1) -> pcie_frac 0.36 (default 0.55)
+strata generate: native pack: <HOME>/Strata-data/packs/iq3_s experts (largest blob 2.66 MB), token embedding IQ4_XS in mapped host memory (322 MiB, 0.1 s)
+strata generate: 1466 MiB of weights loaded from <HOME>/Strata-data/packs/iq3_s in 0.2 s (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 2018.88 MiB of weights, in 0.2 s
+strata generate: PLE direct read probe: 179960 rows/s (fine)
+strata generate: the SSD is kept awake while rows are read: one page of the table after 100 ms without a read, until 60 s after the last request (STRATA_SSD_KEEPALIVE=0 turns it off)
+strata generate: profile <HOME>/xestrata-single-20261011/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: PLE on, table 320001536 rows of <HOME>/Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf
+strata mtp: draft layer loaded, 809 MiB of VRAM (experts 675, dense 111), files read in 0.17 s (4502 MiB/s)
+strata generate: experimental native Q5_K head, 521472000 bytes, in 0.1 s
+strata generate: GPU 0: Tesla V100-PCIE-32GB, compute capability 7.0
+strata generate: expert arena read through the file cache (buffered (not Windows))
+strata generate: expert arena: cudaHostRegister PORTABLE ok; MAP_HUGETLB unavailable (needed 23983 2 MiB pages, vm.nr_hugepages=0); transparent huge pages requested (MADV_HUGEPAGE)
+strata generate: loaded 46.84 GiB at 10.40 GiB/s
+strata generate: CPU pool tasks/phase: 48 (automatic), participating threads: 16
+strata generate: 15 pool workers on logical processors 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15, the host thread on 0 (draining too) (--host-core first)
+strata aux cpus: threads that are neither pool workers nor the host go to CPUs 16 (off at start; a request's aux_cpus=1 turns it on)
+strata generate: expert cache auto: 26.05 GiB free, 700 MiB reserved (+218 MiB for the draft head) -> 10143 slots
+strata generate: expert cache 13246 slots, 25.15 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: pre-filled 13246 of 13246 slots from the profile in 2.3 s (11815 MB/s); slot 0 verified
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 15 expert-pool workers + the host thread
+strata generate: session is up (engine 0.1.42)
+strata generate: sampling greedy
+strata generate: token graph hit path: 13246 resident experts, decided on the device
+prefill: the CPU share is ON by default for prompt chunks below 1024 tokens (the idle CPU takes some of the experts the GPU would stream; answers can differ slightly from 0.1.40.3, mean KL ~0.004). STRATA_PREFILL_CPU_SHARE=0 turns it off.
+strata generate: prompt chunk auto: 1024 tokens
+strata generate: prompt path borrows 779 cache slots (1.49 GiB)
+strata mtp: draft head over 106299 tokens (212.9 MiB)
+strata generate: 779 lent slots refilled in 124.0 ms
+strata generate: prefill 1016 tokens in 1 chunks, 1350.3 ms (752.4 tok/s); experts streamed 3244 (3244 by DMA, host 25.7 ms), resident 12049, on the CPU 4444 (share 0.86); PLE 33.6 ms
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 6 tokens, 74.4 MiB of device buffers
+strata verify: capturing the 1-token window (400 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 4-token window (382 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (364 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 3-token window (348 MiB of VRAM free)
+strata verify: captured the 3-token window (upload no error, sync no error)
+strata verify: capturing the 6-token window (330 MiB of VRAM free)
+strata verify: captured the 6-token window (upload no error, sync no error)
+strata generate: position 1201, 185 tokens, 64 rounds
+speculation              84 rounds of 6, drafts accepted 175 of 218 (0.803), 3.08 tokens per round
+window sizes             T1:9 T2:8 T3:1 T4:61 T5:0 T6:5  (min draft probability 0.50)
+suffix drafts            16 windows, drafts accepted 51 of 58
+accepted per round       0:17 1:13 2:8 3:42 4:0 5:4
+verify window            wait for rings 27.875  pool 3.522  host 0.007  commit 0.027 ms/round; CPU experts 1.79 distinct / 2.13 routed per layer
+pool multi               gate/up 3.690  quantize 0.055  down 2.348 ms/round; 47.3 GB/s over the rows phases; CPU pool call 3.511 ms/round
+dispatch                 plan 0.084  activation quantize 0.105  jobs 0.007  run 3.312 ms/round
+adaptive tier            1566 experts swapped into the VRAM tier (every 4 rounds, 0.054 ms/round)
+pcie experts             0.47 distinct experts per layer read over PCIe (share 92/256 of the misses)
+mtp                      2.670 ms/round drafting (83 rounds), MTP prompt 4.6 ms, 1023 MiB of VRAM
+prompt  : 248045 8678 198 2523 513 264 10505 8057 3133 303 279 1156 579 12182 13 1394 1301 3425 440 279 1301 2378 5224 11 4351 1070 440 3668 38331 11 321 1542 10966 440 279 12168 5224 13 13262 4203 2526 11 10033 1092 488 2222 321 3069 11 321 635 524 5615 3425 279 3274 1503 524 1144 13 248046 198 248045 846 198 760 12182 369 264 351 992 14 17867 3040 42903 4560 13 4081 513 279 3425 488 599 1301 748 2944 25 271 27 1152 1752 420 965 14 485 450 53683 20123 21849 29456 6251 731 198 320 34313 12 1643 13155 1138 25 220 17 15 17 21 20913 78 16 17 17 16 321 279 4361 450 19726 198 320 34313 12 1643 13155 1138 25 220 17 15 17 21 32969 53 51005 321 279 175941 2495 450 19726 198 320 34313 35274 35555 25 45945 12 18 13 15 25663 2759 932 198 6287 2957 198 320 2212 53683 20123 21849 29456 6982 471 387 16 782 18 25 16764 5604 401 29456 11881 11 1308 16917 494 50285 980 13 198 320 198 320 387 16 782 18 16561 364 1396 10845 2945 303 279 1167 17 62 15 999 13 1061 8211 440 279 5981 383 279 8751 198 320 1752 318 1719 69764 11312 513 660 1167 17 62 15 8 5346 279 34468 2315 4346 11 321 369 31838 748 279 198 320 2645 5758 303 13 8483 314 7793 791 10845 369 22513 303 1754 709 13 198 320 198 320 1167 17 62 15 369 279 799 421 12482 11 321 1141 4954 369 21681 494 2450 303 25499 32773 17 62 15 14429 2076 20668 25 198 320 256 2424 283 313 11665 16 21 293 26 2535 23 31351 58 16 21 60 333 220 283 220 21 19 5255 11 220 16 23 5639 198 320 256 1970 313 15 11 16 11 17 11 18 92 1411 7489 28700 16 11 15 61310 16 61310 17 10738 220 343 283 318 1787 471 220 16 8 348 293 198 320 256 220 19 13513 791 4763 11 90096 35718 25 4763 492 14 19 11 9192 318 73 4 19 4653 17 198 320 256 1167 42 17 62 15 283 220 21 19 369 5140 39668 494 279 35426 579 1765 4206 37641 11 524 18533 318 1719 90448 6982 8313 421 198 320 256 11192 279 913 1429 220 16 17 23 26 411 35426 369 220 21 19 553 198 320 198 320 18381 25 1510 312 1960 361 1152 75021 1644 42181 401 29456 4603 1865 9714 321 54878 279 57565 48979 55687 421 198 320 1396 2468 869 369 799 314 28700 67 11 220 15 11 478 67 11 478 17 67 92 364 421 2424 579 1765 5281 13 2844 36584 2612 23065 11 198 320 1777 321 18648 21851 11 864 513 279 7652 19174 264 401 29456 3035 3404 682 13 1049 369 33931 198 320 524 264 55404 94497 2294 70 980 1228 471 421 3749 50285 980 10278 11 864 369 387 16 782 18 579 1727 2923 13 271 1032 361 93631 29 198 1032 361 35981 29 198 1032 361 37618 29 198 1032 361 32608 29 198 1032 361 889 29 198 1032 361 3112 29 271 1389 11804 4337 2559 38 19913 31212 53832 220 16 198 1032 328 485 450 53683 20123 4691 70 1644 21614 6251 1 271 2159 592 450 313 271 320 10977 11665 16 21 3359 69 16 21 1411 11665 18 17 13 11396 3579 1146 19401 1091 321 178642 1313 26 47993 27700 635 524 13 198 4895 2153 11665 16 21 2270 33030 18 17 8228 16 21 516 304 8 313 198 262 713 2535 18 17 516 1777 283 318 2416 18 17 516 2299 71 3459 220 16 20 8 594 220 16 84 26 198 262 2535 18 17 516 1295 283 318 71 3459 220 16 15 8 594 220 15 87 16 74120 11 855 283 304 594 220 15 87 18 1686 84 11 281 26 198 262 413 318 4431 606 220 15 8 313 198 285 413 318 1461 606 220 15 8 198 309 281 283 1777 1079 220 18 16 26 198 285 745 313 198 309 1295 283 220 16 17 22 471 220 16 20 478 220 16 26 198 309 1345 13440 1461 594 220 15 87 19 15 15 84 578 313 198 388 855 49456 220 16 26 198 388 1137 4431 26 198 309 333 198 309 855 14161 220 15 87 18 1686 84 26 198 309 281 283 318 7506 1079 220 18 16 8 735 318 4431 1079 220 17 18 8 735 318 1461 1079 220 16 18 1174 198 285 333 198 262 333 745 413 318 4431 606 220 18 16 8 198 285 281 283 318 7506 1079 220 18 16 8 735 220 15 87 22 37 23 15 15 15 15 15 84 735 318 1461 1079 220 16 18 1174 198 262 745 198 285 281 283 318 7506 1079 220 18 16 8 735 1718 4431 471 220 16 20 478 220 16 17 22 8 1079 220 17 18 8 735 318 1461 1079 220 16 18 1174 198 262 2153 680 26 198 262 1407 476 78290 2031 403 11 594 69 11 220 19 1174 198 262 460 680 26 198 92 271 4895 2153 37799 16 21 2270 33030 18 17 8228 16 21 516 304 8 313 198 262 713 2535 18 17 516 281 283 198 6065 25 1423 1332 279 9640 318 29554 473 8 1752 39129 264 1248 9640 1083 25903 11 10033 1204 279 11540 1331 369 11543 11 321 28647 264 10582 421 17872 279 11543 1331 2957 791 9640 13 4980 440 264 2716 3019 13 248046 198 248045 74455 198 248068 271 248069 271
+output  : 40 3172 1151 539 23218 279 12182 5759 310 1423 279 829 7320 4181 14322 11540 286 11870 13 271 248058 198 27 1628 86779 2378 29 198 27 15704 79114 29 198 13 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 198 27 13766 15480 3960 29 1743 44530 999 25 22052 369 524 264 999 13 1368 488 599 524 1301 1510 1825 42427 20668 63 3482 11 1301 424 1118 471 424 1189 6435 2313 43015 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 86779 2378 29 198 27 15704 79114 29 198 1825 42427 20668 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 198 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28 5454 29 198 4577 471 4120 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28 5454 29 198 24751 26 18997 471 4120 26 1627 73299 4961 1423 641 471 2721 17038 220 17 471 1267 293 735 1901 471 20 15 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 248046 198 248045 846 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28
+decode                   256 tokens in 3254.4 ms  ->  78.66 tok/s
+prefill                  1016 tokens in 1474.4 ms  ->  689.09 tok/s  (time to first token 1845.2 ms)
+
+# V100x1-xe-1k-1.txt
+strata generate: GPU Tesla V100-PCIE-32GB, 80 compute units, 31.7 GiB, prompt matrix products on oneMath (cuBLAS), XeStrata's own kernels (joint_matrix) for the rest
+strata generate: PCIe probe: 13.1 GB/s host->device (best of 13.1 13.1 13.1 13.1) -> pcie_frac 0.36 (default 0.55)
+strata generate: native pack: <HOME>/Strata-data/packs/iq3_s experts (largest blob 2.66 MB), token embedding IQ4_XS in mapped host memory (322 MiB, 0.1 s)
+strata generate: 1466 MiB of weights loaded from <HOME>/Strata-data/packs/iq3_s in 0.2 s (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 2018.88 MiB of weights, in 0.3 s
+strata generate: PLE table format IQ4_NL
+strata generate: the SSD is kept awake while rows are read: one page of the table after 100 ms without a read, until 60 s after the last request (STRATA_SSD_KEEPALIVE=0 turns it off)
+strata generate: PLE on, table 320001536 rows of <HOME>/Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf
+strata mtp: draft layer loaded, 793 MiB of VRAM (experts 675, dense 111), files read in 0.20 s (3909 MiB/s)
+strata generate: experimental native Q5_K head, 521472000 bytes, in 0.1 s
+strata generate: expert arena: one mapping registered for device copies in 2 pieces (the GPU's largest allocation); transparent huge pages requested (madvise); no mlock
+strata generate: loaded 46.84 GiB at 10.43 GiB/s
+strata generate: CPU pool tasks/phase: 48 (automatic), participating threads: 16
+strata generate: profile <HOME>/xestrata-single-20261011/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: expert cache auto: 26.12 GiB free, 700 MiB reserved (+218 MiB for the draft head; 156 MiB of it the matrix library's) -> 10170 slots
+strata generate: expert cache 13277 slots, 25.22 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: pre-filled 13277 of 13277 slots from the profile in 2.3 s (11781 MB/s); slot 0 verified
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 15 expert-pool workers + the host thread
+strata: GDN step forms for windows of 1..8 tokens: 21111111 (0 one group a head, 1 split, 2 prefetch)
+strata: the PCIe share's fetch runs 6 work-groups (12.9 GB/s; 160: 12.9 GB/s)
+strata generate: session is up (engine xe0.1.40.2.2)
+strata generate: sampling greedy
+strata generate: token graph hit path: 13277 resident experts, decided on the device
+strata generate: prompt chunk auto: 1024 tokens
+strata generate: elastic K/V: 8192 of 8192 cells in VRAM (0.20 of 0.20 GiB); the expert cache (13277 slots) gives the K/V room below slot 12960 as the context grows
+strata generate: prompt path borrows 317 cache slots (0.61 GiB)
+strata mtp: draft head over 106299 tokens (212.9 MiB)
+strata: the DeltaNet recurrence, 1016 tokens: D-2 2974 us, the key-head form 992 us: the key-head form
+strata: STRATA_PREFILL_CPU_SHARE: the CPU pool computes 46 of a layer's 91 streamed experts (share 0.50)
+strata generate: 317 lent slots refilled in 51.0 ms
+strata generate: prefill 1016 tokens in 1 chunks, 1441.6 ms (704.8 tok/s); experts streamed 2686 (2686 by DMA, host 35.9 ms), resident 12498, on the CPU 4546 (share 0.90); PLE 33.8 ms
+strata: graph side branches: 380.7 us in a row, 419.8 us branched: not used
+strata verify: window up to 6 tokens, 74.3 MiB of device buffers
+strata generate: PCIe split, measured: an expert 0.033 ms on the CPU (0.044 beside the link), 0.165 ms over PCIe (0.225 beside the CPU), 0.006 ms on the GPU, layer 0 -> of 1..16 missed experts (as many hits) PCIe takes 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+strata verify: capturing the 1-token window (384 MiB of VRAM free)
+strata verify: captured the 1-token window (sync ok)
+strata verify: capturing the 4-token window (370 MiB of VRAM free)
+strata verify: captured the 4-token window (sync ok)
+strata verify: capturing the 3-token window (356 MiB of VRAM free)
+strata verify: captured the 3-token window (sync ok)
+strata verify: capturing the 2-token window (342 MiB of VRAM free)
+strata verify: captured the 2-token window (sync ok)
+strata verify: capturing the 6-token window (324 MiB of VRAM free)
+strata verify: captured the 6-token window (sync ok)
+strata generate: position 1191, 175 tokens, 64 rounds
+speculation              90 rounds of 6, drafts accepted 169 of 224 (0.754), 2.88 tokens per round
+follow                   7 of 256 emitted tokens differ from the argmax
+window sizes             T1:10 T2:8 T3:4 T4:66 T5:0 T6:2  (min draft probability 0.50)
+suffix drafts            12 windows, drafts accepted 37 of 40
+accepted per round       0:23 1:13 2:10 3:42 4:0 5:2
+verify window            wait for rings 23.538  pool 4.532  host 0.006  commit 0.040 ms/round; CPU experts 2.18 distinct / 2.52 routed per layer
+host memory              0 major page faults while decoding; 0 MiB of this process in swap
+pool multi               gate/up 5.053  quantize 0.063  down 3.251 ms/round; 48.4 GB/s over the rows phases; CPU pool call 4.527 ms/round
+dispatch                 plan 0.109  activation quantize 0.107  jobs 0.007  run 4.301 ms/round
+adaptive tier            1521 experts swapped into the VRAM tier (every 4 rounds, 0.128 ms/round)
+pcie experts             0.00 distinct experts per layer read over PCIe (share 92/256 of the misses)
+mtp                      3.002 ms/round drafting (89 rounds), MTP prompt 3.4 ms, 1007 MiB of VRAM
+prompt  : 248045 8678 198 2523 513 264 10505 8057 3133 303 279 1156 579 12182 13 1394 1301 3425 440 279 1301 2378 5224 11 4351 1070 440 3668 38331 11 321 1542 10966 440 279 12168 5224 13 13262 4203 2526 11 10033 1092 488 2222 321 3069 11 321 635 524 5615 3425 279 3274 1503 524 1144 13 248046 198 248045 846 198 760 12182 369 264 351 992 14 17867 3040 42903 4560 13 4081 513 279 3425 488 599 1301 748 2944 25 271 27 1152 1752 420 965 14 485 450 53683 20123 21849 29456 6251 731 198 320 34313 12 1643 13155 1138 25 220 17 15 17 21 20913 78 16 17 17 16 321 279 4361 450 19726 198 320 34313 12 1643 13155 1138 25 220 17 15 17 21 32969 53 51005 321 279 175941 2495 450 19726 198 320 34313 35274 35555 25 45945 12 18 13 15 25663 2759 932 198 6287 2957 198 320 2212 53683 20123 21849 29456 6982 471 387 16 782 18 25 16764 5604 401 29456 11881 11 1308 16917 494 50285 980 13 198 320 198 320 387 16 782 18 16561 364 1396 10845 2945 303 279 1167 17 62 15 999 13 1061 8211 440 279 5981 383 279 8751 198 320 1752 318 1719 69764 11312 513 660 1167 17 62 15 8 5346 279 34468 2315 4346 11 321 369 31838 748 279 198 320 2645 5758 303 13 8483 314 7793 791 10845 369 22513 303 1754 709 13 198 320 198 320 1167 17 62 15 369 279 799 421 12482 11 321 1141 4954 369 21681 494 2450 303 25499 32773 17 62 15 14429 2076 20668 25 198 320 256 2424 283 313 11665 16 21 293 26 2535 23 31351 58 16 21 60 333 220 283 220 21 19 5255 11 220 16 23 5639 198 320 256 1970 313 15 11 16 11 17 11 18 92 1411 7489 28700 16 11 15 61310 16 61310 17 10738 220 343 283 318 1787 471 220 16 8 348 293 198 320 256 220 19 13513 791 4763 11 90096 35718 25 4763 492 14 19 11 9192 318 73 4 19 4653 17 198 320 256 1167 42 17 62 15 283 220 21 19 369 5140 39668 494 279 35426 579 1765 4206 37641 11 524 18533 318 1719 90448 6982 8313 421 198 320 256 11192 279 913 1429 220 16 17 23 26 411 35426 369 220 21 19 553 198 320 198 320 18381 25 1510 312 1960 361 1152 75021 1644 42181 401 29456 4603 1865 9714 321 54878 279 57565 48979 55687 421 198 320 1396 2468 869 369 799 314 28700 67 11 220 15 11 478 67 11 478 17 67 92 364 421 2424 579 1765 5281 13 2844 36584 2612 23065 11 198 320 1777 321 18648 21851 11 864 513 279 7652 19174 264 401 29456 3035 3404 682 13 1049 369 33931 198 320 524 264 55404 94497 2294 70 980 1228 471 421 3749 50285 980 10278 11 864 369 387 16 782 18 579 1727 2923 13 271 1032 361 93631 29 198 1032 361 35981 29 198 1032 361 37618 29 198 1032 361 32608 29 198 1032 361 889 29 198 1032 361 3112 29 271 1389 11804 4337 2559 38 19913 31212 53832 220 16 198 1032 328 485 450 53683 20123 4691 70 1644 21614 6251 1 271 2159 592 450 313 271 320 10977 11665 16 21 3359 69 16 21 1411 11665 18 17 13 11396 3579 1146 19401 1091 321 178642 1313 26 47993 27700 635 524 13 198 4895 2153 11665 16 21 2270 33030 18 17 8228 16 21 516 304 8 313 198 262 713 2535 18 17 516 1777 283 318 2416 18 17 516 2299 71 3459 220 16 20 8 594 220 16 84 26 198 262 2535 18 17 516 1295 283 318 71 3459 220 16 15 8 594 220 15 87 16 74120 11 855 283 304 594 220 15 87 18 1686 84 11 281 26 198 262 413 318 4431 606 220 15 8 313 198 285 413 318 1461 606 220 15 8 198 309 281 283 1777 1079 220 18 16 26 198 285 745 313 198 309 1295 283 220 16 17 22 471 220 16 20 478 220 16 26 198 309 1345 13440 1461 594 220 15 87 19 15 15 84 578 313 198 388 855 49456 220 16 26 198 388 1137 4431 26 198 309 333 198 309 855 14161 220 15 87 18 1686 84 26 198 309 281 283 318 7506 1079 220 18 16 8 735 318 4431 1079 220 17 18 8 735 318 1461 1079 220 16 18 1174 198 285 333 198 262 333 745 413 318 4431 606 220 18 16 8 198 285 281 283 318 7506 1079 220 18 16 8 735 220 15 87 22 37 23 15 15 15 15 15 84 735 318 1461 1079 220 16 18 1174 198 262 745 198 285 281 283 318 7506 1079 220 18 16 8 735 1718 4431 471 220 16 20 478 220 16 17 22 8 1079 220 17 18 8 735 318 1461 1079 220 16 18 1174 198 262 2153 680 26 198 262 1407 476 78290 2031 403 11 594 69 11 220 19 1174 198 262 460 680 26 198 92 271 4895 2153 37799 16 21 2270 33030 18 17 8228 16 21 516 304 8 313 198 262 713 2535 18 17 516 281 283 198 6065 25 1423 1332 279 9640 318 29554 473 8 1752 39129 264 1248 9640 1083 25903 11 10033 1204 279 11540 1331 369 11543 11 321 28647 264 10582 421 17872 279 11543 1331 2957 791 9640 13 4980 440 264 2716 3019 13 248046 198 248045 74455 198 248068 271 248069 271
+output  : 40 3172 1151 539 23218 279 12182 5759 310 1423 279 829 7320 4181 14322 11540 286 11870 13 271 248058 198 27 1628 86779 2378 29 198 27 15704 79114 29 198 13 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 198 27 13766 15480 3960 29 1743 44530 999 25 22052 369 524 264 999 13 1368 488 599 524 1301 1510 1825 42427 20668 63 3482 11 1301 424 1118 471 424 1189 6435 2313 43015 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 86779 2378 29 198 27 15704 79114 29 198 1825 42427 20668 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 198 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28 5454 29 198 4577 471 4120 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28 5454 29 198 24751 26 18997 471 4120 26 1627 73299 4961 1423 641 471 2721 17038 220 17 471 1267 293 735 1901 471 20 15 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 248046 198 248045 846 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28
+decode                   256 tokens in 3208.4 ms  ->  79.79 tok/s
+prefill                  1016 tokens in 1492.6 ms  ->  680.68 tok/s  (time to first token 1930.4 ms)
+
+# V100x1-xe-1k-2.txt
+strata generate: GPU Tesla V100-PCIE-32GB, 80 compute units, 31.7 GiB, prompt matrix products on oneMath (cuBLAS), XeStrata's own kernels (joint_matrix) for the rest
+strata generate: PCIe probe: 13.1 GB/s host->device (best of 13.1 13.1 13.1 13.1) -> pcie_frac 0.36 (default 0.55)
+strata generate: native pack: <HOME>/Strata-data/packs/iq3_s experts (largest blob 2.66 MB), token embedding IQ4_XS in mapped host memory (322 MiB, 0.1 s)
+strata generate: 1466 MiB of weights loaded from <HOME>/Strata-data/packs/iq3_s in 0.2 s (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 2018.88 MiB of weights, in 0.3 s
+strata generate: PLE table format IQ4_NL
+strata generate: the SSD is kept awake while rows are read: one page of the table after 100 ms without a read, until 60 s after the last request (STRATA_SSD_KEEPALIVE=0 turns it off)
+strata generate: PLE on, table 320001536 rows of <HOME>/Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf
+strata mtp: draft layer loaded, 793 MiB of VRAM (experts 675, dense 111), files read in 0.17 s (4635 MiB/s)
+strata generate: experimental native Q5_K head, 521472000 bytes, in 0.1 s
+strata generate: expert arena: one mapping registered for device copies in 2 pieces (the GPU's largest allocation); transparent huge pages requested (madvise); no mlock
+strata generate: loaded 46.84 GiB at 10.46 GiB/s
+strata generate: CPU pool tasks/phase: 48 (automatic), participating threads: 16
+strata generate: profile <HOME>/xestrata-single-20261011/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: expert cache auto: 26.12 GiB free, 700 MiB reserved (+218 MiB for the draft head; 156 MiB of it the matrix library's) -> 10170 slots
+strata generate: expert cache 13277 slots, 25.22 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: pre-filled 13277 of 13277 slots from the profile in 2.3 s (11782 MB/s); slot 0 verified
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 15 expert-pool workers + the host thread
+strata: GDN step forms for windows of 1..8 tokens: 21111111 (0 one group a head, 1 split, 2 prefetch)
+strata: the PCIe share's fetch runs 6 work-groups (12.9 GB/s; 160: 12.9 GB/s)
+strata generate: session is up (engine xe0.1.40.2.2)
+strata generate: sampling greedy
+strata generate: token graph hit path: 13277 resident experts, decided on the device
+strata generate: prompt chunk auto: 1024 tokens
+strata generate: elastic K/V: 8192 of 8192 cells in VRAM (0.20 of 0.20 GiB); the expert cache (13277 slots) gives the K/V room below slot 12960 as the context grows
+strata generate: prompt path borrows 317 cache slots (0.61 GiB)
+strata mtp: draft head over 106299 tokens (212.9 MiB)
+strata: the DeltaNet recurrence, 1016 tokens: D-2 2951 us, the key-head form 989 us: the key-head form
+strata: STRATA_PREFILL_CPU_SHARE: the CPU pool computes 46 of a layer's 91 streamed experts (share 0.50)
+strata generate: 317 lent slots refilled in 51.0 ms
+strata generate: prefill 1016 tokens in 1 chunks, 1450.3 ms (700.6 tok/s); experts streamed 2686 (2686 by DMA, host 36.4 ms), resident 12498, on the CPU 4546 (share 0.90); PLE 35.8 ms
+strata: graph side branches: 382.1 us in a row, 418.5 us branched: not used
+strata verify: window up to 6 tokens, 74.3 MiB of device buffers
+strata generate: PCIe split, measured: an expert 0.032 ms on the CPU (0.040 beside the link), 0.164 ms over PCIe (0.210 beside the CPU), 0.006 ms on the GPU, layer 0 -> of 1..16 missed experts (as many hits) PCIe takes 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+strata verify: capturing the 1-token window (384 MiB of VRAM free)
+strata verify: captured the 1-token window (sync ok)
+strata verify: capturing the 4-token window (370 MiB of VRAM free)
+strata verify: captured the 4-token window (sync ok)
+strata verify: capturing the 3-token window (356 MiB of VRAM free)
+strata verify: captured the 3-token window (sync ok)
+strata verify: capturing the 2-token window (342 MiB of VRAM free)
+strata verify: captured the 2-token window (sync ok)
+strata verify: capturing the 6-token window (324 MiB of VRAM free)
+strata verify: captured the 6-token window (sync ok)
+strata generate: position 1191, 175 tokens, 64 rounds
+speculation              90 rounds of 6, drafts accepted 169 of 224 (0.754), 2.88 tokens per round
+follow                   7 of 256 emitted tokens differ from the argmax
+window sizes             T1:10 T2:8 T3:4 T4:66 T5:0 T6:2  (min draft probability 0.50)
+suffix drafts            12 windows, drafts accepted 37 of 40
+accepted per round       0:23 1:13 2:10 3:42 4:0 5:2
+verify window            wait for rings 23.722  pool 4.227  host 0.006  commit 0.035 ms/round; CPU experts 2.18 distinct / 2.52 routed per layer
+host memory              0 major page faults while decoding; 0 MiB of this process in swap
+pool multi               gate/up 4.866  quantize 0.074  down 3.058 ms/round; 51.3 GB/s over the rows phases; CPU pool call 4.223 ms/round
+dispatch                 plan 0.094  activation quantize 0.107  jobs 0.007  run 4.012 ms/round
+adaptive tier            1521 experts swapped into the VRAM tier (every 4 rounds, 0.093 ms/round)
+pcie experts             0.00 distinct experts per layer read over PCIe (share 92/256 of the misses)
+mtp                      3.007 ms/round drafting (89 rounds), MTP prompt 3.4 ms, 1007 MiB of VRAM
+prompt  : 248045 8678 198 2523 513 264 10505 8057 3133 303 279 1156 579 12182 13 1394 1301 3425 440 279 1301 2378 5224 11 4351 1070 440 3668 38331 11 321 1542 10966 440 279 12168 5224 13 13262 4203 2526 11 10033 1092 488 2222 321 3069 11 321 635 524 5615 3425 279 3274 1503 524 1144 13 248046 198 248045 846 198 760 12182 369 264 351 992 14 17867 3040 42903 4560 13 4081 513 279 3425 488 599 1301 748 2944 25 271 27 1152 1752 420 965 14 485 450 53683 20123 21849 29456 6251 731 198 320 34313 12 1643 13155 1138 25 220 17 15 17 21 20913 78 16 17 17 16 321 279 4361 450 19726 198 320 34313 12 1643 13155 1138 25 220 17 15 17 21 32969 53 51005 321 279 175941 2495 450 19726 198 320 34313 35274 35555 25 45945 12 18 13 15 25663 2759 932 198 6287 2957 198 320 2212 53683 20123 21849 29456 6982 471 387 16 782 18 25 16764 5604 401 29456 11881 11 1308 16917 494 50285 980 13 198 320 198 320 387 16 782 18 16561 364 1396 10845 2945 303 279 1167 17 62 15 999 13 1061 8211 440 279 5981 383 279 8751 198 320 1752 318 1719 69764 11312 513 660 1167 17 62 15 8 5346 279 34468 2315 4346 11 321 369 31838 748 279 198 320 2645 5758 303 13 8483 314 7793 791 10845 369 22513 303 1754 709 13 198 320 198 320 1167 17 62 15 369 279 799 421 12482 11 321 1141 4954 369 21681 494 2450 303 25499 32773 17 62 15 14429 2076 20668 25 198 320 256 2424 283 313 11665 16 21 293 26 2535 23 31351 58 16 21 60 333 220 283 220 21 19 5255 11 220 16 23 5639 198 320 256 1970 313 15 11 16 11 17 11 18 92 1411 7489 28700 16 11 15 61310 16 61310 17 10738 220 343 283 318 1787 471 220 16 8 348 293 198 320 256 220 19 13513 791 4763 11 90096 35718 25 4763 492 14 19 11 9192 318 73 4 19 4653 17 198 320 256 1167 42 17 62 15 283 220 21 19 369 5140 39668 494 279 35426 579 1765 4206 37641 11 524 18533 318 1719 90448 6982 8313 421 198 320 256 11192 279 913 1429 220 16 17 23 26 411 35426 369 220 21 19 553 198 320 198 320 18381 25 1510 312 1960 361 1152 75021 1644 42181 401 29456 4603 1865 9714 321 54878 279 57565 48979 55687 421 198 320 1396 2468 869 369 799 314 28700 67 11 220 15 11 478 67 11 478 17 67 92 364 421 2424 579 1765 5281 13 2844 36584 2612 23065 11 198 320 1777 321 18648 21851 11 864 513 279 7652 19174 264 401 29456 3035 3404 682 13 1049 369 33931 198 320 524 264 55404 94497 2294 70 980 1228 471 421 3749 50285 980 10278 11 864 369 387 16 782 18 579 1727 2923 13 271 1032 361 93631 29 198 1032 361 35981 29 198 1032 361 37618 29 198 1032 361 32608 29 198 1032 361 889 29 198 1032 361 3112 29 271 1389 11804 4337 2559 38 19913 31212 53832 220 16 198 1032 328 485 450 53683 20123 4691 70 1644 21614 6251 1 271 2159 592 450 313 271 320 10977 11665 16 21 3359 69 16 21 1411 11665 18 17 13 11396 3579 1146 19401 1091 321 178642 1313 26 47993 27700 635 524 13 198 4895 2153 11665 16 21 2270 33030 18 17 8228 16 21 516 304 8 313 198 262 713 2535 18 17 516 1777 283 318 2416 18 17 516 2299 71 3459 220 16 20 8 594 220 16 84 26 198 262 2535 18 17 516 1295 283 318 71 3459 220 16 15 8 594 220 15 87 16 74120 11 855 283 304 594 220 15 87 18 1686 84 11 281 26 198 262 413 318 4431 606 220 15 8 313 198 285 413 318 1461 606 220 15 8 198 309 281 283 1777 1079 220 18 16 26 198 285 745 313 198 309 1295 283 220 16 17 22 471 220 16 20 478 220 16 26 198 309 1345 13440 1461 594 220 15 87 19 15 15 84 578 313 198 388 855 49456 220 16 26 198 388 1137 4431 26 198 309 333 198 309 855 14161 220 15 87 18 1686 84 26 198 309 281 283 318 7506 1079 220 18 16 8 735 318 4431 1079 220 17 18 8 735 318 1461 1079 220 16 18 1174 198 285 333 198 262 333 745 413 318 4431 606 220 18 16 8 198 285 281 283 318 7506 1079 220 18 16 8 735 220 15 87 22 37 23 15 15 15 15 15 84 735 318 1461 1079 220 16 18 1174 198 262 745 198 285 281 283 318 7506 1079 220 18 16 8 735 1718 4431 471 220 16 20 478 220 16 17 22 8 1079 220 17 18 8 735 318 1461 1079 220 16 18 1174 198 262 2153 680 26 198 262 1407 476 78290 2031 403 11 594 69 11 220 19 1174 198 262 460 680 26 198 92 271 4895 2153 37799 16 21 2270 33030 18 17 8228 16 21 516 304 8 313 198 262 713 2535 18 17 516 281 283 198 6065 25 1423 1332 279 9640 318 29554 473 8 1752 39129 264 1248 9640 1083 25903 11 10033 1204 279 11540 1331 369 11543 11 321 28647 264 10582 421 17872 279 11543 1331 2957 791 9640 13 4980 440 264 2716 3019 13 248046 198 248045 74455 198 248068 271 248069 271
+output  : 40 3172 1151 539 23218 279 12182 5759 310 1423 279 829 7320 4181 14322 11540 286 11870 13 271 248058 198 27 1628 86779 2378 29 198 27 15704 79114 29 198 13 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 198 27 13766 15480 3960 29 1743 44530 999 25 22052 369 524 264 999 13 1368 488 599 524 1301 1510 1825 42427 20668 63 3482 11 1301 424 1118 471 424 1189 6435 2313 43015 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 86779 2378 29 198 27 15704 79114 29 198 1825 42427 20668 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 198 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28 5454 29 198 4577 471 4120 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28 5454 29 198 24751 26 18997 471 4120 26 1627 73299 4961 1423 641 471 2721 17038 220 17 471 1267 293 735 1901 471 20 15 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 248046 198 248045 846 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28
+decode                   256 tokens in 3188.1 ms  ->  80.30 tok/s
+prefill                  1016 tokens in 1501.3 ms  ->  676.73 tok/s  (time to first token 1934.0 ms)
+
+# V100x1-xe-warmup.txt
+strata generate: GPU Tesla V100-PCIE-32GB, 80 compute units, 31.7 GiB, prompt matrix products on oneMath (cuBLAS), XeStrata's own kernels (joint_matrix) for the rest
+strata generate: PCIe probe: 13.1 GB/s host->device (best of 13.1 13.1 13.1 13.1) -> pcie_frac 0.36 (default 0.55)
+strata generate: native pack: <HOME>/Strata-data/packs/iq3_s experts (largest blob 2.66 MB), token embedding IQ4_XS in mapped host memory (322 MiB, 0.1 s)
+strata generate: 1466 MiB of weights loaded from <HOME>/Strata-data/packs/iq3_s in 0.2 s (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 2018.88 MiB of weights, in 0.3 s
+strata generate: PLE table format IQ4_NL
+strata generate: the SSD is kept awake while rows are read: one page of the table after 100 ms without a read, until 60 s after the last request (STRATA_SSD_KEEPALIVE=0 turns it off)
+strata generate: PLE on, table 320001536 rows of <HOME>/Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf
+strata mtp: draft layer loaded, 793 MiB of VRAM (experts 675, dense 111), files read in 0.18 s (4319 MiB/s)
+strata generate: experimental native Q5_K head, 521472000 bytes, in 0.1 s
+strata generate: expert arena: one mapping registered for device copies in 2 pieces (the GPU's largest allocation); transparent huge pages requested (madvise); no mlock
+strata generate: loaded 46.84 GiB at 10.44 GiB/s
+strata generate: CPU pool tasks/phase: 48 (automatic), participating threads: 16
+strata generate: profile <HOME>/xestrata-single-20261011/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: expert cache auto: 26.12 GiB free, 700 MiB reserved (+218 MiB for the draft head; 156 MiB of it the matrix library's) -> 10170 slots
+strata generate: expert cache 13277 slots, 25.22 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: pre-filled 13277 of 13277 slots from the profile in 2.3 s (11785 MB/s); slot 0 verified
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 15 expert-pool workers + the host thread
+strata: GDN step forms for windows of 1..8 tokens: 21111111 (0 one group a head, 1 split, 2 prefetch)
+strata: the PCIe share's fetch runs 6 work-groups (12.9 GB/s; 160: 12.9 GB/s)
+strata generate: session is up (engine xe0.1.40.2.2)
+strata generate: sampling greedy
+strata generate: token graph hit path: 13277 resident experts, decided on the device
+strata generate: prompt chunk auto: 1024 tokens
+strata generate: elastic K/V: 8192 of 8192 cells in VRAM (0.20 of 0.20 GiB); the expert cache (13277 slots) gives the K/V room below slot 12960 as the context grows
+strata generate: prompt path borrows 317 cache slots (0.61 GiB)
+strata mtp: draft head over 106299 tokens (212.9 MiB)
+strata: the DeltaNet recurrence, 1016 tokens: D-2 2979 us, the key-head form 988 us: the key-head form
+strata: STRATA_PREFILL_CPU_SHARE: the CPU pool computes 46 of a layer's 91 streamed experts (share 0.50)
+strata generate: 317 lent slots refilled in 51.0 ms
+strata generate: prefill 1016 tokens in 1 chunks, 1455.4 ms (698.1 tok/s); experts streamed 2686 (2686 by DMA, host 30.0 ms), resident 12498, on the CPU 4546 (share 0.89); PLE 34.4 ms
+strata: graph side branches: 371.6 us in a row, 407.8 us branched: not used
+strata verify: window up to 6 tokens, 74.3 MiB of device buffers
+strata generate: PCIe split, measured: an expert 0.033 ms on the CPU (0.044 beside the link), 0.164 ms over PCIe (0.218 beside the CPU), 0.006 ms on the GPU, layer 0 -> of 1..16 missed experts (as many hits) PCIe takes 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+strata verify: capturing the 1-token window (384 MiB of VRAM free)
+strata verify: captured the 1-token window (sync ok)
+strata verify: capturing the 4-token window (370 MiB of VRAM free)
+strata verify: captured the 4-token window (sync ok)
+strata verify: capturing the 3-token window (356 MiB of VRAM free)
+strata verify: captured the 3-token window (sync ok)
+strata verify: capturing the 2-token window (342 MiB of VRAM free)
+strata verify: captured the 2-token window (sync ok)
+strata verify: capturing the 6-token window (324 MiB of VRAM free)
+strata verify: captured the 6-token window (sync ok)
+strata generate: position 1217, 201 tokens, 64 rounds
+speculation              82 rounds of 6, drafts accepted 174 of 252 (0.690), 3.12 tokens per round
+window sizes             T1:7 T2:3 T3:9 T4:42 T5:0 T6:21  (min draft probability 0.50)
+suffix drafts            22 windows, drafts accepted 83 of 108
+accepted per round       0:22 1:12 2:11 3:22 4:1 5:14
+verify window            wait for rings 25.565  pool 4.871  host 0.008  commit 0.051 ms/round; CPU experts 2.32 distinct / 2.64 routed per layer
+host memory              1 major page faults while decoding; 0 MiB of this process in swap
+pool multi               gate/up 5.511  quantize 0.066  down 3.551 ms/round; 47.5 GB/s over the rows phases; CPU pool call 4.866 ms/round
+dispatch                 plan 0.132  activation quantize 0.126  jobs 0.008  run 4.598 ms/round
+adaptive tier            1469 experts swapped into the VRAM tier (every 4 rounds, 0.134 ms/round)
+pcie experts             0.00 distinct experts per layer read over PCIe (share 92/256 of the misses)
+mtp                      3.104 ms/round drafting (81 rounds), MTP prompt 3.4 ms, 1007 MiB of VRAM
+prompt  : 248045 8678 198 2523 513 264 10505 8057 3133 303 279 1156 579 12182 13 1394 1301 3425 440 279 1301 2378 5224 11 4351 1070 440 3668 38331 11 321 1542 10966 440 279 12168 5224 13 13262 4203 2526 11 10033 1092 488 2222 321 3069 11 321 635 524 5615 3425 279 3274 1503 524 1144 13 248046 198 248045 846 198 760 12182 369 264 351 992 14 17867 3040 42903 4560 13 4081 513 279 3425 488 599 1301 748 2944 25 271 27 1152 1752 420 965 14 485 450 53683 20123 21849 29456 6251 731 198 320 34313 12 1643 13155 1138 25 220 17 15 17 21 20913 78 16 17 17 16 321 279 4361 450 19726 198 320 34313 12 1643 13155 1138 25 220 17 15 17 21 32969 53 51005 321 279 175941 2495 450 19726 198 320 34313 35274 35555 25 45945 12 18 13 15 25663 2759 932 198 6287 2957 198 320 2212 53683 20123 21849 29456 6982 471 387 16 782 18 25 16764 5604 401 29456 11881 11 1308 16917 494 50285 980 13 198 320 198 320 387 16 782 18 16561 364 1396 10845 2945 303 279 1167 17 62 15 999 13 1061 8211 440 279 5981 383 279 8751 198 320 1752 318 1719 69764 11312 513 660 1167 17 62 15 8 5346 279 34468 2315 4346 11 321 369 31838 748 279 198 320 2645 5758 303 13 8483 314 7793 791 10845 369 22513 303 1754 709 13 198 320 198 320 1167 17 62 15 369 279 799 421 12482 11 321 1141 4954 369 21681 494 2450 303 25499 32773 17 62 15 14429 2076 20668 25 198 320 256 2424 283 313 11665 16 21 293 26 2535 23 31351 58 16 21 60 333 220 283 220 21 19 5255 11 220 16 23 5639 198 320 256 1970 313 15 11 16 11 17 11 18 92 1411 7489 28700 16 11 15 61310 16 61310 17 10738 220 343 283 318 1787 471 220 16 8 348 293 198 320 256 220 19 13513 791 4763 11 90096 35718 25 4763 492 14 19 11 9192 318 73 4 19 4653 17 198 320 256 1167 42 17 62 15 283 220 21 19 369 5140 39668 494 279 35426 579 1765 4206 37641 11 524 18533 318 1719 90448 6982 8313 421 198 320 256 11192 279 913 1429 220 16 17 23 26 411 35426 369 220 21 19 553 198 320 198 320 18381 25 1510 312 1960 361 1152 75021 1644 42181 401 29456 4603 1865 9714 321 54878 279 57565 48979 55687 421 198 320 1396 2468 869 369 799 314 28700 67 11 220 15 11 478 67 11 478 17 67 92 364 421 2424 579 1765 5281 13 2844 36584 2612 23065 11 198 320 1777 321 18648 21851 11 864 513 279 7652 19174 264 401 29456 3035 3404 682 13 1049 369 33931 198 320 524 264 55404 94497 2294 70 980 1228 471 421 3749 50285 980 10278 11 864 369 387 16 782 18 579 1727 2923 13 271 1032 361 93631 29 198 1032 361 35981 29 198 1032 361 37618 29 198 1032 361 32608 29 198 1032 361 889 29 198 1032 361 3112 29 271 1389 11804 4337 2559 38 19913 31212 53832 220 16 198 1032 328 485 450 53683 20123 4691 70 1644 21614 6251 1 271 2159 592 450 313 271 320 10977 11665 16 21 3359 69 16 21 1411 11665 18 17 13 11396 3579 1146 19401 1091 321 178642 1313 26 47993 27700 635 524 13 198 4895 2153 11665 16 21 2270 33030 18 17 8228 16 21 516 304 8 313 198 262 713 2535 18 17 516 1777 283 318 2416 18 17 516 2299 71 3459 220 16 20 8 594 220 16 84 26 198 262 2535 18 17 516 1295 283 318 71 3459 220 16 15 8 594 220 15 87 16 74120 11 855 283 304 594 220 15 87 18 1686 84 11 281 26 198 262 413 318 4431 606 220 15 8 313 198 285 413 318 1461 606 220 15 8 198 309 281 283 1777 1079 220 18 16 26 198 285 745 313 198 309 1295 283 220 16 17 22 471 220 16 20 478 220 16 26 198 309 1345 13440 1461 594 220 15 87 19 15 15 84 578 313 198 388 855 49456 220 16 26 198 388 1137 4431 26 198 309 333 198 309 855 14161 220 15 87 18 1686 84 26 198 309 281 283 318 7506 1079 220 18 16 8 735 318 4431 1079 220 17 18 8 735 318 1461 1079 220 16 18 1174 198 285 333 198 262 333 745 413 318 4431 606 220 18 16 8 198 285 281 283 318 7506 1079 220 18 16 8 735 220 15 87 22 37 23 15 15 15 15 15 84 735 318 1461 1079 220 16 18 1174 198 262 745 198 285 281 283 318 7506 1079 220 18 16 8 735 1718 4431 471 220 16 20 478 220 16 17 22 8 1079 220 17 18 8 735 318 1461 1079 220 16 18 1174 198 262 2153 680 26 198 262 1407 476 78290 2031 403 11 594 69 11 220 19 1174 198 262 460 680 26 198 92 271 4895 2153 37799 16 21 2270 33030 18 17 8228 16 21 516 304 8 313 198 262 713 2535 18 17 516 281 283 198 6065 25 1423 1332 279 9640 318 29554 473 8 1752 39129 264 1248 9640 1083 25903 11 10033 1204 279 11540 1331 369 11543 11 321 28647 264 10582 421 17872 279 11543 1331 2957 791 9640 13 4980 440 264 2716 3019 13 248046 198 248045 74455 198 248068 271 248069 271
+output  : 40 3172 1151 539 23218 279 12182 5759 310 1423 279 829 7320 4181 14322 11540 286 11870 13 271 248058 198 27 1628 86779 2378 29 198 27 15704 79114 29 198 13 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 198 27 13766 5119 29 198 4754 2738 763 328 5453 487 328 1334 763 328 13766 13042 5119 763 5046 1267 763 328 1628 487 198 510 13766 5119 29 198 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 86779 2378 29 198 27 15704 79114 29 198 13 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248045 74455 248068 271 248069 271 248058 198 27 1628 86779 2378 29 198 27 15704 79114 29 198 13 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248045 846 248046 198 248045 74455 248068 271 248069 271 248058 198 27 1628 86779 2378 29 198 27 15704 79114 29 198 13 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 198 4754 2738 763 328 846 3960 487 328 846 3960 763 5046 1927 763 198 248046 198 248045 74455 198 248068 271 248069 271 248058 198 27 1628 86779 2378 29 198 27 15704 79114 29 198 13 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248066 198 4754 2738 763 198 248046
+decode                   256 tokens in 3145.8 ms  ->  81.38 tok/s
+prefill                  1016 tokens in 1506.4 ms  ->  674.45 tok/s  (time to first token 1941.6 ms)

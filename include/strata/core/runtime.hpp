@@ -14,6 +14,9 @@
 
 namespace strata::core {
 
+/// Whether a GPU is the processor's own graphics (src/core/device.cpp).
+bool integrated_gpu(const sycl::device& d);
+
 // One runtime per engine device: its context owns its queues and every USM allocation made on it. Cross-queue
 // consumers must depend on the producer event; in-order applies within a queue.  Device 0 is the GPU find_devices
 // puts first; 1.. the other usable GPUs (device.cpp).  A runtime is created when its device is first used, so a run on
@@ -58,6 +61,11 @@ public:
     // verify window took 22 module loads, 30 ms of its first token, on the RTX 4070.  A kernel the device cannot run
     // (another GPU's matrix shape) is skipped.  Once.
     void preload_kernels();
+    // Waits for preload_kernels' thread to end (timings taken beside it read its CPU work as theirs).
+    void wait_preload() { if (preload_.joinable()) preload_.join(); }
+    // Whether an event only ordered or waited on (gpu::event_record without timing) is recorded as an in-order
+    // barrier rather than a timestamp (submit_profiling_tag): measured when the runtime is made (measure_marks).
+    bool marks_by_barrier() const { return marks_by_barrier_; }
 
 private:
     struct Waiter {
@@ -69,6 +77,7 @@ private:
     sycl::async_handler handler();
     bool owns(const sycl::queue* queue);
     void watch();
+    bool measure_marks();
     int ordinal_;
     std::mutex error_mutex_;
     std::exception_ptr error_;
@@ -84,6 +93,7 @@ private:
     std::thread watchdog_;
     std::atomic<bool> preload_stop_{false};
     std::thread preload_;
+    bool marks_by_barrier_ = false;
 };
 
 }  // namespace strata::core

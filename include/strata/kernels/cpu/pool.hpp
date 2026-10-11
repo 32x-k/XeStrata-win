@@ -116,7 +116,10 @@ public:
     /// asserted - the counter it moves is `pool phases ... drain`, which is host-side and needs no profiler.
     /// `first_core`: the workers take the physical cores from that one on (a second pool beside a first, which took
     /// the cores below it: a layer split's stages each with workers of their own).
-    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true, int first_core = 0);
+    /// `tasks`: the row tasks of each batched expert phase (--pool-tasks), 0 = three per participating thread; a
+    /// count is capped by the phase's rows.
+    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true, int first_core = 0, int tasks = 0);
+    static constexpr int kMaxTasks = 4096;
     /// The watchdog's view of the pool (issue #31): the batch, the counters, every thread's state.
     void diag(std::FILE* f) const;
     ~ExpertPool();
@@ -127,6 +130,8 @@ public:
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
+    /// The logical CPUs the workers are pinned to (--aux-cpus keeps every other thread off them).
+    const std::vector<int>& worker_cpus() const { return worker_cpus_; }
 
     /// Publish `n` jobs, then block until every one has been claimed AND every worker has parked.
     /// `jobs` must outlive the call (it does, and the workers never touch it afterwards).
@@ -143,6 +148,13 @@ public:
     void run_split_multi(ExpertJobMulti* jobs, int n);
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+
+    /// Why a native multi-token batch cannot run, or `nullptr` when it can: `run_split_multi_native` reads a Q2_0
+    /// layer's gate/up rows from `act` (Strata's ActQ) and every other layer's from `nact` (the layer's native
+    /// activation), so a job whose rows are missing the one its layer reads is a fault in a worker thread, not a
+    /// result.  `job` names the offending job.  Checked at the top of the call: a few pointer reads against a
+    /// batch that moves megabytes.
+    static const char* check_multi_jobs(const NativeFmt& f, const ExpertJobMulti* jobs, int n, int& job);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
@@ -179,6 +191,8 @@ public:
     static constexpr std::chrono::seconds kStall{60};
 
 private:
+    int phase_tasks(int64_t rows) const;
+    int tasks_ = 0;
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
     void run_phase(int mode, int n_tasks);
@@ -234,6 +248,7 @@ private:
     std::condition_variable sleep_cv_;
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
     std::vector<std::thread> threads_;
+    std::vector<int> worker_cpus_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
     int mode_ = 0;

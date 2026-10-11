@@ -8,21 +8,26 @@
 // rows at the image's pad tokens and gives them their 2-D M-RoPE positions (see --serve GENI in generate.cpp).
 //
 //   strata-vision --mmproj <mmproj.gguf> --model <text model .gguf, first split> [--gpu [--gpu-pci ADDR]]
-//                 [--threads N] [--max-tokens N]
+//                 [--threads N] [--max-tokens N] [--min-tokens N] [--flash-attn on|off|auto]
 //
 // --gpu-pci takes the GPU whose PCI address (domain:bus:device.function) is ADDR; without it, mtmd takes the backend's
 // first GPU, which with Vulkan can be the CPU's integrated graphics or another vendor's card.
+// Flash attention defaults to auto, and to off on the CPU when ggml is built with AVX-512 (see main).
 //
 // Resident: prints "READY <n_embd>", then per stdin line
 //   ENC <image path> <output path>   ->  "OK <n_tokens> <nx> <ny> <ms>"  or  "ERR <message>"
 //   QUIT
 // The output file is  int32 {0x31455653 'SVE1', n_tokens, nx, ny, n_embd}  then float32 [n_tokens][n_embd],
 // row i at grid position (x = i % nx, y = i / nx).  The text model is opened vocab-only (no weights).
+#include "ggml-cpu.h"
 #include "gguf.h"
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include <algorithm>
+#include <fcntl.h>
+#include <unistd.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +35,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -56,7 +62,9 @@ int main(int argc, char** argv) {
     std::string mmproj, model;
     bool gpu = false;
     std::string gpu_pci;
-    int threads = 0, max_tokens = 0;
+    int threads = 0, max_tokens = 0, min_tokens = 0;
+    llama_flash_attn_type fa = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    bool fa_given = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -69,17 +77,36 @@ int main(int argc, char** argv) {
         else if (a == "--gpu-pci") gpu_pci = next();
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--max-tokens") max_tokens = std::atoi(next().c_str());
+        else if (a == "--min-tokens") min_tokens = (int) std::strtol(next().c_str(), nullptr, 10);   // mtmd image_min_tokens (upstream #767)
+        else if (a == "--flash-attn") {   // FA keeps K and V in FP16; off = the attention in FP32
+            const std::string v = next();
+            fa = v == "on" ? LLAMA_FLASH_ATTN_TYPE_ENABLED : v == "off" ? LLAMA_FLASH_ATTN_TYPE_DISABLED
+                                                                        : LLAMA_FLASH_ATTN_TYPE_AUTO;
+            fa_given = true;
+        }
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (mmproj.empty() || model.empty()) {
         std::fprintf(stderr, "usage: strata-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu [--gpu-pci ADDR]] "
-                             "[--threads N] [--max-tokens N]\n");
+                             "[--threads N] [--max-tokens N] [--min-tokens N] [--flash-attn on|off|auto]\n");
         return 2;
     }
     llama_log_set(quiet_log, nullptr);
     mtmd_helper_log_set(quiet_log, nullptr);
     llama_backend_init();
 
+    const auto load_t0 = std::chrono::steady_clock::now();
+    // ask the OS for the projector file up front (128 KiB steps) so the loader's sequential reads find it cached;
+    // STRATA_READ_AHEAD=0 turns it off, as in the engine
+    if (const char* ra = std::getenv("STRATA_READ_AHEAD"); ra == nullptr || std::strtol(ra, nullptr, 10) != 0) {
+        const int fd = open(mmproj.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            const off_t n = lseek(fd, 0, SEEK_END);
+            for (off_t at = 0; at < n; at += (off_t) (128 << 10))
+                (void) posix_fadvise(fd, at, std::min<off_t>((off_t) (128 << 10), n - at), POSIX_FADV_WILLNEED);
+            close(fd);
+        }
+    }
     llama_model_params mp = llama_model_default_params();
     mp.vocab_only = true;
     llama_model* text = llama_model_load_from_file(model.c_str(), mp);
@@ -102,14 +129,25 @@ int main(int argc, char** argv) {
     }
     cp.print_timings = false;
     cp.warmup = false;
+    // On the CPU "auto" turns flash attention on.  ggml's fast (tiled) CPU kernel for it needs the head size, 72 in this
+    // encoder, to be a multiple of the vector width: 8 floats with AVX2, 16 with AVX-512, where ggml falls back to a
+    // kernel that is several times slower and accumulates in FP16 (upstream e7ec6b1a, a Ryzen 7 7700X: AVX2 8-10 s with
+    // it, 14-15 s without; AVX-512 44 s with it, 13 s without, for a 1024x1024 picture)
+    if (!gpu && !fa_given && ggml_cpu_has_avx512()) fa = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cp.flash_attn_type = fa;
+    // on the CPU without --threads: one per core (mtmd's own default is 4 threads)
+    if (threads <= 0 && !gpu) threads = (int) std::max(1u, std::thread::hardware_concurrency() / 2);
     if (threads > 0) cp.n_threads = threads;
     if (max_tokens > 0) cp.image_max_tokens = max_tokens;
+    if (min_tokens > 0) cp.image_min_tokens = min_tokens;
     mtmd_context* ctx = mtmd_init_from_file(mmproj.c_str(), text, cp);
     if (!ctx || !mtmd_support_vision(ctx)) {
         std::printf("ERR cannot load the vision encoder %s\n", mmproj.c_str());
         std::fflush(stdout);
         return 1;
     }
+    std::fprintf(stderr, "strata-vision: model files loaded in %.1f s\n",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count());
     // a vocab-only model reports no hparams, so the width comes from the projector: its output is the model's input
     int n_embd = 0;
     {
@@ -123,7 +161,11 @@ int main(int argc, char** argv) {
     // Warm up at the LARGEST picture before READY: the encoder's GPU work buffers are allocated now, not at the first
     // real picture.  The server starts this process before the engine, so the engine sizes its expert cache from
     // what is really left. (A square image well above any cap; mtmd scales it to the token limit.)
-    {
+    // On the CPU there is no VRAM to reserve, and the warm-up would only delay the engine's start by one encode
+    // (~6 s at 1,024 tokens).
+    if (!gpu) std::fprintf(stderr, "strata-vision: on the CPU, %d threads, no warm-up\n", threads);
+    else {
+        const auto warm_t0 = std::chrono::steady_clock::now();
         const uint32_t side = 2048;
         std::vector<unsigned char> rgb((size_t) side * side * 3, 128);
         mtmd_bitmap* bm = mtmd_bitmap_init(side, side, rgb.data());
@@ -139,7 +181,8 @@ int main(int argc, char** argv) {
                     warm_tokens = (int) mtmd_input_chunk_get_n_tokens(ch);
             }
         }
-        std::fprintf(stderr, "strata-vision: warmed up at %d image tokens\n", warm_tokens);
+        std::fprintf(stderr, "strata-vision: warmed up at %d image tokens in %.1f s\n", warm_tokens,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0).count());
         mtmd_input_chunks_free(chunks);
         if (bm) mtmd_bitmap_free(bm);
         // READY tells the server the encoder's buffers are allocated, and it starts the engine on what is left: an

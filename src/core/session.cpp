@@ -10,6 +10,7 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/mrope.hpp"
 
@@ -327,7 +328,7 @@ bool session_replay_stages_per_layer(const ModelGeometry& g, int64_t pos, int32_
     const int64_t n = g.n_layers;
     std::vector<strata::gpu::Event*> ev((size_t) (n * 4));
     for (auto& e : ev) {
-        if (!strata::gpu::event_create(&e)) { err = "session_replay_stages: event create"; return false; }
+        if (!strata::gpu::event_create(&e, true)) { err = "session_replay_stages: event create"; return false; }
     }
     struct Free {
         std::vector<strata::gpu::Event*>* v;
@@ -379,7 +380,7 @@ bool session_replay_stage_sweep(const ModelGeometry& g, int64_t pos, int32_t pos
     stage_token(g, pos, pos_base, s);
 
     strata::gpu::Event *a, *b;
-    if (!strata::gpu::event_create(&a) || !strata::gpu::event_create(&b)) {
+    if (!strata::gpu::event_create(&a, true) || !strata::gpu::event_create(&b, true)) {
         err = "session_replay_stage_sweep: event create";
         return false;
     }
@@ -427,7 +428,7 @@ bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t 
     }
     std::vector<strata::gpu::Event*> ev((size_t) (n * 6));
     bool ev_ok = true;
-    for (auto& e : ev) if (!strata::gpu::event_create(&e)) { ev_ok = false; break; }
+    for (auto& e : ev) if (!strata::gpu::event_create(&e, true)) { ev_ok = false; break; }
     if (!ev_ok) {
         for (auto& e : ev) strata::gpu::event_destroy(e);
         strata::gpu::free(saved);
@@ -545,6 +546,7 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
         pinned_core = strata::kernels::cpu::pin_current_thread(cores[0]);
         pinned = true;
     }
+    strata::aux_cpus::note_owned_thread();   // the host: --aux-cpus leaves it where it is
     return true;
 }
 

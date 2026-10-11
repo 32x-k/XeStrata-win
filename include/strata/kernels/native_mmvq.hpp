@@ -40,6 +40,9 @@ bool native_mmvq_multi_exact();
 // not reconstruct that sum from the quantized integers.
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
                           void* stream);
+/// native_quantize_q8_1 of gate / (1 + exp(-gate)) * up (the shared expert's SwiGLU) in one launch, the same bytes as
+/// the SwiGLU's stored result quantized (upstream be7889ed).
+void native_swiglu_q8_1(const float* gate, const float* up, void* x_q8_1, int n_in, int ncols, void* stream);
 
 void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream);
@@ -111,6 +114,10 @@ bool native_mmvq_supported(int ggml_type) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
+/// native_mmvq of two matrices of one type and shape over the same activations in one launch (upstream b08cf3e1's
+/// pair), every output the two calls' bits.  Returns false, launching nothing, where that layout does not apply.
+bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
+                      int n_in, int n_out, int ncols, void* stream);
 
 // Q6_K with each row's blocks split into four arrays: the row's ql (128 bytes a block), then its qh (64), its
 // scales (16) and its d (2), each in block order.  A Q6_K block is 210 bytes, so in GGUF order every other block

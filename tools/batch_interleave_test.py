@@ -18,7 +18,7 @@ chunks interleaved with their windows), and a conversation's next turn continued
      F solo (which continues from the same checkpoint of the live chain)
 
 Exact comparisons need the same settings as batch_test.py (this script sets STRATA_IQ_MT_MIN=1):
-  python tools/batch_interleave_test.py --exe build/xe/strata --config xestrata-<model>.json \\
+  python tools/batch_interleave_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json \\
       --extra "--pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow"
 Without --no-prefill-borrow the slots decoding during C's read see the expert cache without the slots C's prompt
 borrowed (those experts run on the CPU, which rounds differently): A's and B's text may then drift from solo.

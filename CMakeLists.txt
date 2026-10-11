@@ -2,14 +2,25 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 cmake_minimum_required(VERSION 3.24)
-project(XeStrata VERSION 0.1.39 LANGUAGES CXX)
+project(XeStrata LANGUAGES CXX)
 if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
   message(FATAL_ERROR "XeStrata builds for Linux and Windows")
 endif()
-set(STRATA_UPSTREAM_VERSION "0.1.39")
-set(STRATA_UPSTREAM_COMMIT "6f32ec0")
-# XeStrata's version follows the upstream version it has integrated, marked "xe" so it is not taken for upstream's
-set(STRATA_VERSION_NAME "xe${PROJECT_VERSION}")
+set(STRATA_UPSTREAM_VERSION "0.1.42")
+set(STRATA_UPSTREAM_COMMIT "61b3fb5")
+# XeStrata's version follows the upstream version it has integrated, marked "xe" so it is not taken for upstream's.
+# XESTRATA_REVISION counts XeStrata's releases on that upstream version from 1, as a Debian revision does: the packages
+# are <upstream>-<revision> (rpm: Version and Release), the version name xe<upstream> for the first release and
+# xe<upstream>.<revision - 1> for a later one (xe0.1.40.2.1 is the package 0.1.40.2-2), more numbers than project()
+# can hold.
+set(XESTRATA_REVISION 1)
+if(XESTRATA_REVISION GREATER 1)
+  math(EXPR _xe_later "${XESTRATA_REVISION} - 1")
+  set(XESTRATA_VERSION "${STRATA_UPSTREAM_VERSION}.${_xe_later}")
+else()
+  set(XESTRATA_VERSION "${STRATA_UPSTREAM_VERSION}")
+endif()
+set(STRATA_VERSION_NAME "xe${XESTRATA_VERSION}")
 add_compile_definitions(STRATA_VERSION="${STRATA_VERSION_NAME}"
   STRATA_BACKEND="xe" STRATA_UPSTREAM_VERSION="${STRATA_UPSTREAM_VERSION}"
   STRATA_UPSTREAM_COMMIT="${STRATA_UPSTREAM_COMMIT}")
@@ -35,8 +46,13 @@ endif()
 # capability (from nvidia-smi) its architecture and the cuBLAS backend.
 # - STRATA_CUDA_ARCHS: NVIDIA architectures (contrib only), e.g. sm_89 for the RTX 40 series; empty: none
 # - STRATA_ONEMKL: the oneMKL backend for Intel GPUs' dense products (contrib; contrib-icpx always has it)
+# - STRATA_HIP_ARCHS: AMD architectures, RDNA2 and later, e.g. gfx1200 for the RX 9060 XT (free and contrib: ROCm is
+#   free software; cmake/StrataHip.cmake); auto: this PC's, from the kernel's KFD topology; rocblas: those the
+#   distribution's rocBLAS has code for (a package's); empty: none
 set(STRATA_CUDA_ARCHS auto CACHE STRING "NVIDIA architectures to build for, e.g. sm_89 (contrib); auto: this PC's")
 set(STRATA_ONEMKL auto CACHE STRING "the oneMKL backend for Intel GPUs (contrib): ON, OFF or auto (this PC has one)")
+set(STRATA_HIP_ARCHS auto CACHE STRING
+    "AMD architectures to build for, e.g. gfx1200 (free, contrib); auto: this PC's; rocblas: those rocBLAS has")
 set(STRATA_CUDA_PATH auto CACHE STRING
     "the CUDA toolkit for the NVIDIA code and cuBLAS (contrib), e.g. /usr/local/cuda-13.1; auto: the best one here")
 set(STRATA_CUDA_PTX auto CACHE STRING
@@ -56,6 +72,29 @@ if(STRATA_CUDA_ARCHS STREQUAL "auto")
       endforeach()
       list(REMOVE_DUPLICATES _strata_cuda_archs)
     endif()
+  endif()
+endif()
+include(cmake/StrataHip.cmake)
+set(_strata_hip_archs "${STRATA_HIP_ARCHS}")
+if(STRATA_HIP_ARCHS STREQUAL "auto")
+  set(_strata_hip_archs "")
+  if(NOT STRATA_LICENSE STREQUAL "contrib-icpx")
+    strata_hip_detect(_strata_hip_found)
+    # this PC's AMD GPUs the engine runs on; the others (an older integrated one, say) are left out
+    foreach(arch IN LISTS _strata_hip_found)
+      strata_hip_supported(${arch} ok)
+      if(ok)
+        list(APPEND _strata_hip_archs ${arch})
+      else()
+        message(STATUS "AMD GPU ${arch}: not RDNA2 or later, no code for it")
+      endif()
+    endforeach()
+  endif()
+elseif(STRATA_HIP_ARCHS STREQUAL "rocblas")
+  strata_hip_rocblas(_strata_hip_archs)
+  if(NOT _strata_hip_archs)
+    message(FATAL_ERROR "STRATA_HIP_ARCHS=rocblas: no rocBLAS with code for an RDNA2 or later AMD GPU is installed "
+                        "(Fedora: rocblas-devel; Ubuntu: librocblas-dev)")
   endif()
 endif()
 set(_strata_onemkl "${STRATA_ONEMKL}")
@@ -78,6 +117,7 @@ endif()
 if(STRATA_LICENSE STREQUAL "contrib")
   message(STATUS "contrib: NVIDIA architectures '${_strata_cuda_archs}', oneMKL backend ${_strata_onemkl}")
 endif()
+message(STATUS "AMD architectures '${_strata_hip_archs}'")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -179,6 +219,14 @@ if(STRATA_BUILD_TESTS)
   add_executable(direct_file_async_test tests/platform/direct_file_async.cpp)
   target_link_libraries(direct_file_async_test PRIVATE strata_platform)
   add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
+  # --aux-cpus: the CPU-set derivation (pure) and the placement of live threads; header-only, no GPU
+  add_executable(aux_cpus_test tests/platform/aux_cpus_test.cpp)
+  target_link_libraries(aux_cpus_test PRIVATE strata_platform)
+  add_test(NAME aux_cpus_test COMMAND aux_cpus_test)
+  # when the default CPU prefill share is armed (#1595, the host's memory): header-only rules, no GPU
+  add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
+  target_include_directories(share_rules_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME share_rules_test COMMAND share_rules_test)
 endif()
 
 add_executable(platform_memory_test src/platform/memory_test.cpp)
@@ -203,6 +251,10 @@ if(STRATA_ENABLE_XE)
       message(FATAL_ERROR "STRATA_CUDA_ARCHS: icpx has no NVIDIA target; configure with intel/llvm built with CUDA "
                           "(tools/intel_llvm_build.py --contrib) and -DSTRATA_LICENSE=contrib")
     endif()
+    if(_strata_hip_archs)
+      message(FATAL_ERROR "STRATA_HIP_ARCHS: icpx has no AMD target; configure with intel/llvm built with ROCm's HIP "
+                          "(tools/intel_llvm_build.py) and -DSTRATA_LICENSE=free or contrib")
+    endif()
   else()
     if(STRATA_LICENSE STREQUAL "contrib-icpx")
       message(FATAL_ERROR "STRATA_LICENSE=contrib-icpx builds with icpx (-DCMAKE_CXX_COMPILER=icpx)")
@@ -220,9 +272,12 @@ if(STRATA_ENABLE_XE)
                           "-DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++")
     endif()
   endif()
-  # The device targets: SPIR-V for Intel GPUs (compiled when the program starts), and with STRATA_CUDA_ARCHS each
-  # NVIDIA architecture's code.  Without them no -fsycl-targets: the compiler's default, SPIR-V alone.
+  # The device targets: SPIR-V for Intel GPUs (compiled when the program starts), and with STRATA_CUDA_ARCHS and
+  # STRATA_HIP_ARCHS each NVIDIA and AMD architecture's code.  Without them no -fsycl-targets: the compiler's default,
+  # SPIR-V alone.
   set(_strata_sycl_targets "")
+  set(_strata_sycl_list spir64)
+  set(_strata_sycl_opts "")
   if(_strata_cuda_archs)
     if(NOT STRATA_LICENSE STREQUAL "contrib")
       message(FATAL_ERROR "STRATA_CUDA_ARCHS needs NVIDIA's CUDA toolkit, which is not free software: "
@@ -284,7 +339,17 @@ if(STRATA_ENABLE_XE)
                           "targets (intel/llvm built with CUDA: tools/intel_llvm_build.py --contrib; NVIDIA's CUDA "
                           "toolkit)")
     endif()
-    set(_strata_sycl_targets "-fsycl-targets=${_strata_sycl_targets}" ${_strata_cuda_opts})
+    set(_strata_sycl_list ${_strata_sycl_targets})
+    set(_strata_sycl_opts ${_strata_cuda_opts})
+  endif()
+  if(_strata_hip_archs)
+    strata_hip_choose("${_strata_hip_archs}" _strata_hip_targets _strata_hip_opts)
+    list(APPEND _strata_sycl_list ${_strata_hip_targets})
+    list(APPEND _strata_sycl_opts ${_strata_hip_opts})
+  endif()
+  if(_strata_cuda_archs OR _strata_hip_archs)
+    list(JOIN _strata_sycl_list "," _strata_sycl_list)
+    set(_strata_sycl_targets "-fsycl-targets=${_strata_sycl_list}" ${_strata_sycl_opts})
   endif()
   add_library(strata_sycl INTERFACE)
   # CUDA divides and takes square roots with IEEE rounding by default; SYCL device code does not unless asked, and
@@ -298,8 +363,12 @@ if(STRATA_ENABLE_XE)
   if(_strata_sycl_targets)
     set(_strata_spirv_translator -Xspirv-translator=spir64)
   endif()
+  # The device code of every target (SPIR-V, each NVIDIA and AMD architecture) is made when the executable links, one
+  # target after another on one thread unless the compiler is let run them side by side (a contrib package's strata
+  # took 10-15 minutes so).
+  cmake_host_system_information(RESULT _strata_link_jobs QUERY NUMBER_OF_LOGICAL_CORES)
   target_link_options(strata_sycl INTERFACE -fsycl ${_strata_sycl_targets} -foffload-fp32-prec-div
-                      -foffload-fp32-prec-sqrt
+                      -foffload-fp32-prec-sqrt -fsycl-max-parallel-link-jobs=${_strata_link_jobs}
                       "SHELL:${_strata_spirv_translator} --spirv-ext=+SPV_KHR_integer_dot_product")
 
   add_library(strata_core STATIC src/core/device.cpp src/core/pinned.cpp src/core/gpu.cpp src/core/graph.cpp
@@ -344,7 +413,8 @@ if(STRATA_ENABLE_XE)
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
                                    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
-                                   src/core/conversation_memory.cpp src/core/conversation_disk.cpp)
+                                   src/core/conversation_memory.cpp src/core/conversation_disk.cpp
+                                   src/core/conversation_file.cpp src/core/vmm.cpp)
   target_include_directories(strata_engine PUBLIC include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu)
   # c-blosc2 (libblosc2-dev; free, BSD-3), optional: --conversation-save-compress stores the saved conversations'
@@ -366,6 +436,14 @@ if(STRATA_ENABLE_XE)
     add_test(NAME expert_profile_save_test COMMAND expert_profile_save_test)
     set_tests_properties(expert_profile_save_test PROPERTIES TIMEOUT 60)
   endif()
+  # the profile header's version is enforced: a version other than 1 is refused by its number (CPU only)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_profile_version_test.cpp")
+    enable_testing()
+    add_executable(expert_profile_version_test tests/core/expert_profile_version_test.cpp)
+    target_link_libraries(expert_profile_version_test PRIVATE strata_engine)
+    add_test(NAME expert_profile_version_test COMMAND expert_profile_version_test)
+    set_tests_properties(expert_profile_version_test PROPERTIES TIMEOUT 60)
+  endif()
   if(STRATA_BUILD_TESTS)
     add_executable(coupled_draft_test src/core/coupled_draft_test.cpp)
     target_link_libraries(coupled_draft_test PRIVATE strata_engine)
@@ -373,7 +451,7 @@ if(STRATA_ENABLE_XE)
     add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
     target_link_libraries(pinned_shared_test PRIVATE strata_engine)
     add_test(NAME pinned_shared_test COMMAND pinned_shared_test)
-    foreach(core_gpu_test expert_cache_per_layer_test native_dense_ple_key_test)
+    foreach(core_gpu_test expert_cache_per_layer_test native_dense_ple_key_test vmm_test)
       add_executable(${core_gpu_test} tests/core/${core_gpu_test}.cpp)
       target_link_libraries(${core_gpu_test} PRIVATE strata_engine)
       add_test(NAME ${core_gpu_test} COMMAND ${core_gpu_test})
@@ -382,6 +460,12 @@ if(STRATA_ENABLE_XE)
     add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
     target_link_libraries(file_expert_source_test PRIVATE strata_engine)
     add_test(NAME file_expert_source_test COMMAND file_expert_source_test)
+    # STRATA_EXCHANGE_ROTATE's ownership table (CPU) and its integration with the source (a GPU)
+    add_executable(exchange_storage_test tests/core/exchange_storage_test.cpp)
+    target_include_directories(exchange_storage_test PRIVATE include)
+    target_link_libraries(exchange_storage_test PRIVATE Threads::Threads)
+    add_test(NAME exchange_storage_test COMMAND exchange_storage_test)
+    add_test(NAME file_expert_source_rotation_test COMMAND file_expert_source_test --rotation-gpu)
     if(STRATA_NATIVE_EXPERTS)
       add_executable(expert_layout_test tests/core/expert_layout_test.cpp)
       target_link_libraries(expert_layout_test PRIVATE strata_engine)
@@ -398,14 +482,18 @@ if(STRATA_ENABLE_XE)
     add_test(NAME conversation_validation_test COMMAND conversation_validation_test)
   endif()
 
-  # The contrib modes' dense products (src/prefill/gemm.cpp): oneMath (Apache-2.0, third_party/main/oneMath) with its
-  # oneMKL backend for Intel GPUs (STRATA_ONEMKL) and its cuBLAS backend for NVIDIA GPUs (STRATA_CUDA_ARCHS); a GPU
-  # without a backend takes XeStrata's own kernels.  oneMath opens the backends at run time, so the engine starts
-  # without the library of a GPU it does not use.
+  # The dense products (src/prefill/gemm.cpp): oneMath (Apache-2.0, third_party/main/oneMath; XeStrata's fork) with its
+  # oneMKL backend for Intel GPUs (STRATA_ONEMKL) and its cuBLAS backend for NVIDIA GPUs (STRATA_CUDA_ARCHS) in the
+  # contrib modes, and its rocBLAS backend for AMD GPUs (STRATA_HIP_ARCHS; rocBLAS and hipBLASLt are free software) in
+  # the free and contrib modes; a GPU without a backend takes XeStrata's own kernels.  oneMath opens the backends at run
+  # time, so the engine starts without the library of a GPU it does not use.
   set(STRATA_ONEMATH_SOURCE "" CACHE STRING
-      "oneMath v0.9's source archive (a local file or URL) to build from (empty: fetch the pinned one)")
-  if(STRATA_LICENSE MATCHES "^(contrib|contrib-icpx)$" AND (_strata_onemkl OR _strata_cuda_archs))
-    if(NOT MKL_ROOT)
+      "oneMath's source archive (a local file or URL) to build from (empty: fetch the pinned one of XeStrata's fork)")
+  if(NOT STRATA_LICENSE MATCHES "^(contrib|contrib-icpx)$")
+    set(_strata_onemkl OFF)   # oneMKL is not free software
+  endif()
+  if(_strata_onemkl OR _strata_cuda_archs OR _strata_hip_archs)
+    if(_strata_onemkl AND NOT MKL_ROOT)
       if(DEFINED ENV{MKLROOT})
         set(MKL_ROOT $ENV{MKLROOT})
       elseif(EXISTS /opt/intel/oneapi/mkl/latest)
@@ -418,6 +506,26 @@ if(STRATA_ENABLE_XE)
     set(TARGET_DOMAINS blas)
     set(ENABLE_MKLCPU_BACKEND OFF)
     set(ENABLE_MKLGPU_BACKEND ${_strata_onemkl})
+    if(_strata_hip_archs)
+      # the backend's own GPU code takes one architecture (the products themselves run inside rocBLAS and hipBLASLt)
+      set(ENABLE_ROCBLAS_BACKEND ON)
+      list(GET _strata_hip_archs 0 HIP_TARGETS)
+      strata_hip_cxx(HIP_CXX_COMPILER)
+      # hipBLASLt, which the fork's rocBLAS backend hands the 16-bit GEMMs to where it has kernels for the GPU: without
+      # it they run in rocBLAS, whose kernels for some GPUs are generic ones (gfx12 in ROCm 7.1: a fifteenth of the
+      # speed).  A package must have it.
+      find_package(hipblaslt QUIET)
+      if(NOT hipblaslt_FOUND)
+        set(_strata_level WARNING)
+        if(STRATA_PACKAGE)
+          set(_strata_level FATAL_ERROR)
+        endif()
+        message(${_strata_level} "hipBLASLt is not installed, or its CMake package lacks hipblas-common (Fedora: "
+                                 "hipblaslt-devel hipblas-common-devel; Ubuntu: libhipblaslt-dev "
+                                 "libhipblas-common-dev): the AMD GPUs' dense products run in rocBLAS alone, much "
+                                 "slower on some GPUs")
+      endif()
+    endif()
     if(_strata_cuda_archs AND _strata_cuda_cublas)
       set(ENABLE_CUBLAS_BACKEND ON)
       # the backend's own GPU code for the oldest architecture, which every NVIDIA GPU here runs (its default, sm_75's
@@ -441,60 +549,54 @@ if(STRATA_ENABLE_XE)
     endif()
     set(BUILD_FUNCTIONAL_TESTS OFF)
     set(BUILD_EXAMPLES OFF)
-    # the cuBLAS backend's own GPU code in the same PTX version: this directory's options while oneMath is added
-    get_directory_property(_strata_copts COMPILE_OPTIONS)
-    get_directory_property(_strata_lopts LINK_OPTIONS)
+    # oneMath declares CUDA_TARGETS and HIP_TARGETS as cache entries, which under its CMake 3.13 policies drop the
+    # values set above on a first configure (the rocBLAS backend then got an empty --offload-arch= and the compiler
+    # failed; the cuBLAS backend got its default architecture): CMP0126 keeps them
+    set(CMAKE_POLICY_DEFAULT_CMP0126 NEW)
     if(_strata_cuda_base_opts)
-      add_compile_options(${_strata_cuda_base_opts})
-      add_link_options(${_strata_cuda_base_opts})
       set(CUDA_TOOLKIT_ROOT_DIR "${_strata_cuda_root}" CACHE PATH "the CUDA toolkit (cmake/StrataCuda.cmake)" FORCE)
     endif()
-    # oneMath is not in the repository: the pinned release, with XeStrata's changes to it
-    # (third_party/main/oneMath/patches/NN-<id>.patch) applied in order.  `patch`, not `git apply`: the source
-    # folder is inside this repository's work tree, where git apply takes the paths as this repository's.
-    find_program(STRATA_PATCH patch REQUIRED)
-    file(GLOB _strata_onemath_patches CONFIGURE_DEPENDS
-         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/oneMath/patches/[0-9][0-9]-*.patch)
-    list(SORT _strata_onemath_patches)
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_strata_onemath_patches})
+    # oneMath is not in the repository: XeStrata's fork (https://github.com/MistVVK/oneMath, branch xestrata: oneMath's
+    # 6ff3a43 with XeStrata's changes as commits, and oneMath's develop merged up to 1308c5e) at the tag pinned here
     if(STRATA_ONEMATH_SOURCE)
       set(_strata_onemath_url URL ${STRATA_ONEMATH_SOURCE})
     else()
       set(_strata_onemath_url
-        URL https://github.com/uxlfoundation/oneMath/archive/6ff3a43e555dbb20357017d48f0f6c6263259895.tar.gz
-        URL_HASH SHA256=4d431378064867e3b6b3bb3271cdfc6decfe7580a676f1c70bd5c338f8731a94)
+        URL https://github.com/MistVVK/oneMath/archive/refs/tags/xestrata-3.tar.gz
+        URL_HASH SHA256=9a5203102002e5e85f1ad4a8b91b9f6134365f016bba1a430b038df95517e61d)
     endif()
-    set(_strata_onemath_patch)
-    set(_strata_onemath_key "${_strata_onemath_url}")
-    foreach(onemath_patch_file ${_strata_onemath_patches})
-      list(APPEND _strata_onemath_patch
-           COMMAND ${STRATA_PATCH} -p1 -N -s --no-backup-if-mismatch -i ${onemath_patch_file})
-      file(SHA256 ${onemath_patch_file} _h)
-      string(APPEND _strata_onemath_key ";${_h}")
-    endforeach()
-    list(POP_FRONT _strata_onemath_patch)
-    # a changed patch does not change what FetchContent fetches, so it would keep the tree patched before: start
-    # from the archive again
-    if(NOT _strata_onemath_key STREQUAL _STRATA_ONEMATH_KEY)
+    # another archive is another tree: start from it again
+    if(NOT "${_strata_onemath_url}" STREQUAL "${_STRATA_ONEMATH_KEY}")
       file(REMOVE_RECURSE ${CMAKE_BINARY_DIR}/_deps/strata_onemath-src
                           ${CMAKE_BINARY_DIR}/_deps/strata_onemath-subbuild)
     endif()
     include(FetchContent)
     FetchContent_Populate(strata_onemath QUIET ${_strata_onemath_url} DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-      PATCH_COMMAND ${_strata_onemath_patch}
       SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_onemath-src
       SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_onemath-subbuild)
-    set(_STRATA_ONEMATH_KEY "${_strata_onemath_key}" CACHE INTERNAL "the archive and patches the oneMath tree has")
+    set(_STRATA_ONEMATH_KEY "${_strata_onemath_url}" CACHE INTERNAL "the archive the oneMath tree came from")
     add_subdirectory(${strata_onemath_SOURCE_DIR} ${CMAKE_BINARY_DIR}/onemath EXCLUDE_FROM_ALL)
-    set_directory_properties(PROPERTIES COMPILE_OPTIONS "${_strata_copts}" LINK_OPTIONS "${_strata_lopts}")
+    unset(CMAKE_POLICY_DEFAULT_CMP0126)
+    # ROCm's device libraries for the rocBLAS backend's own GPU code, and the CUDA toolkit and PTX version for the
+    # cuBLAS backend's: on those backends only, as the others (oneMKL's, the loader) build no AMD or NVIDIA code and
+    # the compiler warns of the unused arguments
+    if(_strata_hip_opts AND TARGET onemath_blas_rocblas)
+      target_compile_options(onemath_blas_rocblas_obj PRIVATE ${_strata_hip_opts})
+      target_link_options(onemath_blas_rocblas PRIVATE ${_strata_hip_opts})
+    endif()
+    if(_strata_cuda_base_opts AND TARGET onemath_blas_cublas)
+      target_compile_options(onemath_blas_cublas_obj PRIVATE ${_strata_cuda_base_opts})
+      target_link_options(onemath_blas_cublas PRIVATE ${_strata_cuda_base_opts})
+    endif()
     unset(BUILD_SHARED_LIBS)
     if(_strata_libcuda_stubs)
       list(REMOVE_ITEM CMAKE_LIBRARY_PATH "${_strata_libcuda_stubs}")
     endif()
   endif()
 
-  # plan v0.3 P5: batched prompt processing.  The GEMMs are oneMath's in the contrib modes (above) and XeStrata's own
-  # kernels in the free mode (src/kernels/xe/xmx_gemm.cpp; cuBLAS in the CUDA build, oneMKL in the first Xe port).
+  # plan v0.3 P5: batched prompt processing.  The GEMMs are oneMath's in the contrib modes and on AMD GPUs (above) and
+  # XeStrata's own kernels elsewhere in the free mode (src/kernels/xe/xmx_gemm.cpp; cuBLAS in the CUDA build, oneMKL in
+  # the first Xe port).
   # The experts' quantized products (moe_mmq.cpp) run on the int8 matrix engines where the GPU reports the shape
   # src/kernels/xe/iq_mmq.cpp is written for, and the FP16 GEMM path elsewhere.  Upstream 0.1.38's quantized and fused
   # expert products on the decode kernels' DP4a dots ran at 0.34x and 0.25x of it on the B70 and were dropped.
@@ -551,6 +653,22 @@ if(STRATA_ENABLE_XE)
     add_executable(kv_q4_parity src/kernels/kv_q4_parity.cpp)
     target_link_libraries(kv_q4_parity PRIVATE strata_kernels)
     add_test(NAME kv_q4_parity COMMAND kv_q4_parity)
+    # #783 PR-d: the batched K/V append (INT8, Q4_0, the hybrid fold) against the per-cell appends, memcmp
+    add_executable(kv_steps_parity src/kernels/kv_steps_parity.cpp)
+    target_link_libraries(kv_steps_parity PRIVATE strata_kernels)
+    add_test(NAME kv_steps_parity COMMAND kv_steps_parity)
+    # #783 PR-c: the multi-token router against the single one, the combine against its contract's host replay
+    add_executable(native_multi_parity src/kernels/native_multi_parity.cpp)
+    target_link_libraries(native_multi_parity PRIVATE strata_kernels)
+    add_test(NAME native_multi_parity COMMAND native_multi_parity)
+    # #783 PR-g: the multi-token hyper-connection write against the per-token one, memcmp
+    add_executable(gr_multi_parity src/kernels/gr_multi_parity.cpp)
+    target_link_libraries(gr_multi_parity PRIVATE strata_kernels)
+    add_test(NAME gr_multi_parity COMMAND gr_multi_parity)
+    # #783 PR-e: the verify window's device-built expert plan against a host replay of its contract
+    add_executable(resident_plan_parity src/kernels/resident_plan_parity.cpp)
+    target_link_libraries(resident_plan_parity PRIVATE strata_kernels)
+    add_test(NAME resident_plan_parity COMMAND resident_plan_parity)
     # KV streaming: streamed vs resident attention, bitwise (synthetic, no model).
     add_executable(kv_stream_parity src/kernels/kv_stream_parity.cpp)
     target_link_libraries(kv_stream_parity PRIVATE strata_kernels)
@@ -603,7 +721,8 @@ endif()
 #     worse opt-out.  `cpu_require_expert_support()` therefore refuses at startup on a CPU without the
 #     features, and the fallback exists for tests, exactly as P2.S3 specifies.
 # Plan v0.3 P6: speculation components that need no GPU.
-add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp)
+add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp
+            src/spec/draft_source.cpp)
 target_include_directories(strata_spec PUBLIC include)
 if(STRATA_BUILD_TESTS)
   add_executable(suffix_drafter_test src/spec/suffix_drafter_test.cpp)
@@ -615,6 +734,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(draft_policy_test src/spec/draft_policy_test.cpp)
   target_link_libraries(draft_policy_test PRIVATE strata_spec)
   add_test(NAME draft_policy_test COMMAND draft_policy_test)
+  add_executable(message_boundary_test src/program/message_boundary_test.cpp)
+  target_include_directories(message_boundary_test PRIVATE include)
+  add_test(NAME message_boundary_test COMMAND message_boundary_test)
   # the serve loop's conversation-cache retention policy (header-only, no library to link)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
@@ -627,6 +749,25 @@ if(STRATA_BUILD_TESTS)
   add_executable(conversation_memory_test src/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
   target_include_directories(conversation_memory_test PRIVATE include)
   add_test(NAME conversation_memory_test COMMAND conversation_memory_test)
+  # the session files of SAVE / RESTORE (upstream aa17fe86): format, identity and the refusals (host only)
+  add_executable(conversation_file_test src/core/conversation_file_test.cpp src/core/conversation_file.cpp)
+  target_include_directories(conversation_file_test PRIVATE include)
+  add_test(NAME conversation_file_test COMMAND conversation_file_test)
+  # SAVE's opt-in reclaim (--session-save-reclaim, upstream 73ed39ae): which host caches go, in which order, and that
+  # the RAM check runs again after each step
+  add_executable(session_save_reclaim_test src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp)
+  target_include_directories(session_save_reclaim_test PRIVATE include)
+  add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
+  # available_host_bytes(): MemAvailable, the cgroup limits and the operator's --memory-limit-mib cap on fixture
+  # directories (upstream daa76552) - no GPU
+  add_executable(memory_guard_test tests/core/memory_guard_test.cpp src/core/conversation_memory.cpp)
+  target_include_directories(memory_guard_test PRIVATE include)
+  add_test(NAME memory_guard_test COMMAND memory_guard_test)
+  # a request's logit_bias line (upstream dcc6f756): the parser, no GPU
+  add_executable(logit_bias_test src/core/logit_bias_test.cpp)
+  target_include_directories(logit_bias_test PRIVATE include)
+  add_test(NAME logit_bias_test COMMAND logit_bias_test)
+  set_tests_properties(memory_guard_test PROPERTIES TIMEOUT 60)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
@@ -638,16 +779,29 @@ target_include_directories(strata_kernels_cpu PUBLIC include)
 set_source_files_properties(src/kernels/cpu/expert.cpp
                             PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
 set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-# AVX-VNNI (Intel Core 12th gen and later, AMD Zen 5): the Q2_0 and IQ4_NL rows' integer dot as vpdpbusd, chosen at run
-# time (cpu_avxvnni_ok); without the compiler flag the AVX2 kernels serve every CPU.
-include(CheckCXXCompilerFlag)
-check_cxx_compiler_flag(-mavxvnni STRATA_CXX_AVXVNNI)
-if(STRATA_CXX_AVXVNNI)
-  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/q2_avxvnni.cpp)
-  set_source_files_properties(src/kernels/cpu/q2_avxvnni.cpp PROPERTIES COMPILE_OPTIONS
-                              "-mavx2;-mavxvnni;-mfma;-mf16c")
+# AVX-VNNI (Alder Lake, Sapphire Rapids and later; upstream b211ba17): the AVX-2 expert kernels' vpdpwssd / vpdpbusd
+# copies (q2_avx2.cpp, iq_avx2.cpp; *_rows.inl), taken at run time where cpu_avxvnni_ok().  Only those functions are
+# compiled with target("avxvnni") - never -mavxvnni on a file, which would let the compiler use it anywhere.  A compiler
+# without the intrinsics builds the files without the copies.
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_FLAGS "-mavx2 -mfma -mf16c")
+check_cxx_source_compiles([=[
+#include <immintrin.h>
+__attribute__((target("avxvnni")))
+static __m256i dots(__m256i a, __m256i b) { return _mm256_dpbusd_avx_epi32(_mm256_dpwssd_avx_epi32(a, a, b), a, b); }
+int main() {
+    volatile int x = 1;
+    return _mm256_extract_epi32(dots(_mm256_set1_epi32(x), _mm256_set1_epi32(x)), 0) == 0;
+}
+]=] STRATA_HAVE_AVXVNNI_INTRINSICS)
+unset(CMAKE_REQUIRED_FLAGS)
+if(STRATA_HAVE_AVXVNNI_INTRINSICS)
+  set(_strata_avxvnni STRATA_AVXVNNI=1)
   target_compile_definitions(strata_kernels_cpu PRIVATE STRATA_HAVE_AVXVNNI=1)
+else()
+  set(_strata_avxvnni STRATA_AVXVNNI=0)
 endif()
+set_property(SOURCE src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 
@@ -696,13 +850,33 @@ if(STRATA_NATIVE_EXPERTS)
   set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                               "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
   set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-  if(STRATA_CXX_AVXVNNI)
-    target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/iq_avxvnni.cpp)
-    set_source_files_properties(src/kernels/cpu/iq_avxvnni.cpp PROPERTIES COMPILE_OPTIONS
-                                "-mavx2;-mavxvnni;-mfma;-mf16c")
-  endif()
+  set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
+  if(STRATA_BUILD_TESTS)
+    # the Q5_1 block dequantizer (a Q5_1 PLE table, upstream #651) against ggml's, synthetic blocks: no model, no GPU
+    add_executable(dequant_q5_1_test tests/core/dequant_q5_1_test.cpp)
+    target_link_libraries(dequant_q5_1_test PRIVATE strata_artifact ggml-base)
+    add_test(NAME dequant_q5_1_test COMMAND dequant_q5_1_test)
+    # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp: gathered, AVX-VNNI) bit for bit against each other
+    # at 1..8 tokens and against ggml-cpu's dot, on random blocks (upstream a7336175, b211ba17); --bench: ms per expert
+    add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
+    target_link_libraries(iq_avx2_parity PRIVATE strata_kernels_cpu)
+    add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
+    # the AVX-2 Q8_K activation quantizer against ggml's, byte for byte (upstream 5208b320; --bench: its time)
+    add_executable(q8k_quant_parity src/kernels/cpu/q8k_quant_parity.cpp)
+    target_link_libraries(q8k_quant_parity PRIVATE strata_kernels_cpu)
+    add_test(NAME q8k_quant_parity COMMAND q8k_quant_parity)
+    # the AVX-2 Q2_0 bit-plane kernel (the default; upstream 2467bb68: opt-in) against the plain one
+    add_executable(q2_bitplane_parity src/kernels/cpu/q2_bitplane_parity.cpp)
+    target_link_libraries(q2_bitplane_parity PRIVATE strata_kernels_cpu)
+    add_test(NAME q2_bitplane_parity COMMAND q2_bitplane_parity)
+    # --pool-tasks: the batched expert phases cut into any task count, bitwise the default cut (upstream 6b1e303f)
+    add_executable(pool_tasks_test src/kernels/cpu/pool_tasks_test.cpp)
+    target_link_libraries(pool_tasks_test PRIVATE strata_kernels_cpu)
+    add_test(NAME pool_tasks_test COMMAND pool_tasks_test)
+    set_tests_properties(pool_tasks_test PROPERTIES TIMEOUT 180)
+  endif()
   if(STRATA_ENABLE_XE AND STRATA_BUILD_TESTS)
     # one native expert three ways on real GGUF rows (float reference, CPU, GPU): needs shard 1, not in CTest
     add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
@@ -713,14 +887,18 @@ if(STRATA_NATIVE_EXPERTS)
     # UD-Q4_K_XL's expert pairs (and Q8_0 alone) and OrcaRouter Q4_K_S's q4_K/q5_0 on synthetic ggml-quantized
     # weights at 2560/640 (upstream efeffd8, d652cd6): GPU and CPU experts against the float reference, GPU
     # dequantizers against to_float
-    foreach(pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 iq3_xxs/iq4_nl)
+    # q5_0/q8_0 (Q5_0 gate/up, a llama-quantize "_M" file), q4_0/q4_0 and q4_0/q4_1 (a plain llama-quantize Q4_0 file:
+    # gate/up Q4_0, down Q4_0 on 42 layers and Q4_1 on 6; upstream 16bdc707)
+    # q6_K/q8_0: Unsloth's UD-Q6_K_XL experts (upstream 87659162)
+    foreach(pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 iq3_xxs/iq4_nl q5_0/q8_0 q4_0/q4_0 q4_0/q4_1
+                 q6_K/q8_0)
       string(REPLACE "/" "_" pair_name "${pair}")
       add_test(NAME native_expert_parity_${pair_name} COMMAND native_expert_parity --synthetic ${pair})
       set_tests_properties(native_expert_parity_${pair_name} PROPERTIES TIMEOUT 120)
     endforeach()
-    # a pair without GPU kernels (Q6_K gate/up) is refused by native_expert_supported, not run
-    add_test(NAME native_expert_parity_refuses_q6_K COMMAND native_expert_parity --synthetic q6_K/q8_0)
-    set_tests_properties(native_expert_parity_refuses_q6_K PROPERTIES WILL_FAIL TRUE)
+    # a pair without GPU kernels (Q3_K gate/up) is refused by native_expert_supported, not run
+    add_test(NAME native_expert_parity_refuses_q3_K COMMAND native_expert_parity --synthetic q3_K/q8_0)
+    set_tests_properties(native_expert_parity_refuses_q3_K PROPERTIES WILL_FAIL TRUE)
     # the device dequantizers on one real tensor of each type: needs the model's shards, so not in CTest
     add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
     target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact)
@@ -749,6 +927,34 @@ if(STRATA_BUILD_TESTS)
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
+
+  # #795 (upstream 90dd021a): nothing an AVX2-only CPU can reach may hold AVX-512 / AVX-VNNI-class instructions.  (1) the
+  # kernel library is disassembled and any function with such instructions must be a kernel of a wide-ISA file, not a
+  # weak / COMDAT copy and not a probe or helper that every CPU runs; (2) with -DSTRATA_SDE=<sde> (Intel SDE) the CPU
+  # tests run on an emulated AVX2-only Haswell and on an Alder Lake (AVX-VNNI, no AVX-512): SDE stops at the first
+  # instruction the chip does not have.
+  if(TARGET iq_avx2_parity)
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+      add_test(NAME isa_guard_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_isa_guard.py
+               $<TARGET_FILE:strata_kernels_cpu>)
+      set_tests_properties(isa_guard_check PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+    endif()
+  endif()
+  set(STRATA_SDE "" CACHE FILEPATH "Intel SDE (sde / sde64): also run the CPU tests on an emulated AVX2-only and an AVX-VNNI-only CPU")
+  if(STRATA_SDE AND TARGET iq_avx2_parity)
+    foreach(_chip hsw adl)
+      foreach(_t iq_avx2_parity q8k_quant_parity router_dot_parity pool_tasks_test q2_bitplane_parity)
+        if(TARGET ${_t})
+          add_test(NAME sde_${_chip}_${_t} COMMAND ${STRATA_SDE} -${_chip} -- $<TARGET_FILE:${_t}>)
+          set_tests_properties(sde_${_chip}_${_t} PROPERTIES TIMEOUT 900)
+        endif()
+      endforeach()
+      if(TARGET q2_bitplane_parity)
+        set_tests_properties(sde_${_chip}_q2_bitplane_parity PROPERTIES ENVIRONMENT "STRATA_Q2_BITPLANE=1")
+      endif()
+    endforeach()
+  endif()
 endif()
 
 if(STRATA_BUILD_TESTS)

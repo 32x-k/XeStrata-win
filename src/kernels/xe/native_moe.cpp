@@ -8,6 +8,8 @@
 // added in order, then the shared output.
 #include "strata/kernels/native_moe.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_native_moe
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -30,7 +32,7 @@ bool overlap(const void* a, size_t an, const void* b, size_t bn) {
 }
 
 void launch(void* stream, const float* parts, const float* weights, const float* shared, float* output,
-            int64_t n_embd, int k, int n_tok) {
+            int64_t n_embd, int k, int n_tok, const float* shared_gate = nullptr) {
     if (!stream) throw core::DeviceError("native MoE combine requires an explicit stream");
     auto& queue = core::Runtime::get().stream(stream);
     queue.parallel_for(sycl::range<2>(size_t(n_tok), size_t(n_embd)), [=](sycl::id<2> id) {
@@ -39,7 +41,14 @@ void launch(void* stream, const float* parts, const float* weights, const float*
         const float* w = weights + tk * k;
         float sum = p[col] * w[0];
         for (int expert = 1; expert < k; ++expert) sum += p[int64_t(expert) * n_embd + col] * w[expert];
-        if (shared) sum += shared[tk * n_embd + col];
+        if (shared) {
+            float sv = shared[tk * n_embd + col];
+            if (shared_gate) {   // shared_expert's sigmoid_scale_rows, its product rounded before the add
+                const float gt = 1.0f / (1.0f + sycl::exp(-shared_gate[tk]));
+                sv = sv * gt;
+            }
+            sum += sv;
+        }
         output[tk * n_embd + col] = sum;
     });
 }
@@ -65,10 +74,10 @@ void native_moe_combine(const float* parts, const float* weights, const float* s
 }
 
 void native_moe_combine_multi(const float* parts, const float* weights, const float* shared, float* output,
-                              int64_t n_embd, int64_t k, int n_tok, void* stream) {
-    if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1)
+                              int64_t n_embd, int64_t k, int n_tok, void* stream, const float* shared_gate) {
+    if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1 || (shared_gate && !shared))
         throw std::invalid_argument("native MoE combine (multi) requires a stream, width, 1..15 experts, tokens");
-    launch(stream, parts, weights, shared, output, n_embd, int(k), n_tok);
+    launch(stream, parts, weights, shared, output, n_embd, int(k), n_tok, shared_gate);
 }
 
 }  // namespace strata::kernels

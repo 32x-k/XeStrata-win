@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/cpu/pool.cpp - P2.S3: the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/platform/aux_cpus.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
@@ -13,6 +14,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -222,7 +224,9 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, " for %lld ms\n", (long long) (now_ms() - hstate_ms_.load()));
 }
 
-ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int first_core) : host_works_(host_works) {
+ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int first_core, int tasks)
+    : tasks_(tasks), host_works_(host_works) {
+    if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
     if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
     const std::vector<int> cores = physical_cores(true);
@@ -240,7 +244,9 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int first_core)
     for (int i = 0; i < n_; ++i) {
         const int c = first_core + i;
         const int core = pin ? (c < (int) cores.size() ? cores[(size_t) c] : -1) : -1;
+        if (core >= 0) worker_cpus_.push_back(core);
         threads_.emplace_back([this, i, core] {
+            strata::aux_cpus::note_owned_thread();   // --aux-cpus never moves a worker
             pin_this_thread(core);
             worker(i);
         });
@@ -496,6 +502,10 @@ void ExpertPool::run_split(ExpertJob* jobs, int n) {
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+int ExpertPool::phase_tasks(int64_t rows) const {
+    return tasks_ == 0 ? 3 * (n_ + (host_works_ ? 1 : 0)) : (int) (std::min)(rows, (int64_t) tasks_);
+}
+
 void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
     if (n > kMaxSplitMulti || expert_oracle_q8_0_enabled()) {
@@ -515,9 +525,8 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     mjobs_ = jobs;
-    const int threads = n_ + (host_works_ ? 1 : 0);
-    mtasks_ = 3 * threads;
     mrows_ = (int64_t) n * FF;
+    mtasks_ = phase_tasks(mrows_);
     run_phase(3, mtasks_);
     const auto t1 = std::chrono::steady_clock::now();
     for (int e = 0; e < n; ++e)
@@ -525,6 +534,7 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
             act_quant_q8_1(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
     const auto t2 = std::chrono::steady_clock::now();
     mrows_ = (int64_t) n * H;
+    mtasks_ = phase_tasks(mrows_);
     run_phase(4, mtasks_);
     const auto t3 = std::chrono::steady_clock::now();
     ms_multi_gu += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -535,17 +545,42 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+const char* ExpertPool::check_multi_jobs(const NativeFmt& f, const ExpertJobMulti* jobs, int n, int& job) {
+    const bool q2_rows = f.gu_type == 42;   // drain's mode 5: the gate/up rows read the ActQ, not the native image
+    for (int e = 0; e < n; ++e) {
+        const ExpertJobMulti& j = jobs[e];
+        if (j.blob == nullptr) { job = e; return "has no blob"; }
+        if (j.nt < 1 || j.nt > MAXT) { job = e; return "has a token count outside 1..MAXT"; }
+        for (int t = 0; t < j.nt; ++t) {
+            if (j.out[t] == nullptr) { job = e; return "has a token with no output row"; }
+            if (q2_rows ? j.act[t] == nullptr : j.nact[t] == nullptr) {
+                job = e;
+                return q2_rows ? "has a token with no ActQ activation (a Q2_0 layer's gate/up rows read act, not nact)"
+                               : "has a token with no native activation";
+            }
+        }
+    }
+    return nullptr;
+}
+
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
+    int bad = -1;
+    if (const char* why = check_multi_jobs(f, jobs, n, bad)) {
+        std::fprintf(stderr, "strata: the CPU expert pool refused a native batch: job %d of %d %s (the layer's gate/up "
+                             "type %d) - stopping the engine so the server can start it again\n",
+                     bad, n, why, f.gu_type);
+        std::fflush(stderr);
+        std::abort();
+    }
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         mjobs_ = jobs + b0;
         nfmt_ = &f;
-        const int threads = n_ + (host_works_ ? 1 : 0);
-        mtasks_ = 3 * threads;
         mrows_ = (int64_t) nb * FF;
+        mtasks_ = phase_tasks(mrows_);
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
@@ -555,6 +590,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
         const auto c = std::chrono::steady_clock::now();
         mrows_ = (int64_t) nb * H;
+        mtasks_ = phase_tasks(mrows_);
         run_phase(6, mtasks_);
         const auto d = std::chrono::steady_clock::now();
         ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();

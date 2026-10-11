@@ -23,10 +23,14 @@ Setup recommends it only where it does not cost speed (below); any number you as
 | Option | What it does |
 | --- | --- |
 | `"parallel": N` / `--batch N` / `--slots N` (2..8) | up to N conversations decoded together; more requests wait for a free slot. Each slot gets its own session (GDN recurrence, QSA K/V and indexer, PLE history). |
+| `--batch-mtp` / `--no-batch-mtp` | on by default with `--mtp` (upstream 8cfb3fd7, c8c79b17; opt-in upstream): each slot also verifies one MTP proposal per window and moves two tokens when it holds. The draft layer's weights are shared; each slot's own state is about 50 MiB. Slots that do not fit a window take turns, so `"parallel"` above 8 works too. One GPU only, off with a layer split. `STRATA_BATCH_MTP=0` turns it off as well. |
 
 The engine never refuses a count it cannot run: it says so in its log and runs what it can.
 That is at most 8 slots (a window holds 8 rows), as many as fit in VRAM, or none (one request at a time) when not two fit.
 The server reads the count the engine reports (`INFO batch_slots=N`), and `GET /v1/status` says it (`concurrency.serving`).
+
+With `--batch-mtp`, four greedy requests of 200 tokens in 4 slots gave every slot the same tokens as decoding it alone (`tools/batch_test.py`, `--pcie-frac 0 --adapt-every 1000000`).
+The aggregate went from 87.4 / 86.8 to 90.6 / 90.6 tokens/s on the B70 and from 45.2 / 44.0 to 44.6 / 43.8 tokens/s on the RTX 4070 (the run-to-run spread).
 
 ### What a slot costs, and what setup recommends
 
@@ -49,10 +53,10 @@ At a 32K context that is 4 slots from a 24 GB card; a smaller card stays at one 
 - **A request left alone in a slot** (the others finished, nobody waits) goes back to the solo path.
   The slot is stopped, the engine copies its sessions back and decodes with MTP drafts again (at most twice per request; with `--prompt-cache 0` it stays in the slot; `STRATA_PARALLEL_SOLO=0` turns it off).
 - **More requests than slots** wait for a free one (`/metrics` -> `live.slots` shows each slot: idle, reading or decoding, its tokens and tok/s).
-- **Each admission** reads the request's prompt through the usual prompt path (prompt cache and conversation checkpoints included) and produces its first token there; the state is then copied into the slot.
-  Admissions are taken one at a time, and **the slots decode between the prompt's chunks**.
+- **Each admission** reads the request's prompt through the usual prefill path (prompt cache and conversation checkpoints included) and produces its first token there; the state is then copied into the slot.
+  Admissions are taken one at a time, and **the slots decode between prefill's chunks**.
   After each chunk they decode for half as long as the chunk took (`STRATA_BATCH_DECODE_SHARE`, default 0.5), so a long prompt slows the others down instead of stopping them.
-  The chunks are the ones one uninterrupted read takes, so the prompt's arithmetic is unchanged.
+  The chunks are the ones one uninterrupted read takes, so prefill's arithmetic is unchanged.
 - **A long prompt gives way to a short one**: when a request with a prompt under half as long is waiting, the server sends `BYIELD`.
   At its next chunk boundary the long read stops, the part read so far is copied into a slot, the short request is admitted, and the long one then goes on from its slot with the same chunks (at most twice per request).
 - **Each slot is a conversation cache.** A finished slot keeps what it holds (the prompt, the answer, and the checkpoint at the prompt's last turn boundary).
@@ -107,16 +111,16 @@ Four scripts drive a built engine or a running server; each exits non-zero on a 
 For exact comparisons pass `--pcie-frac 0 --adapt-every 1000000` (and the scripts set `STRATA_IQ_MT_MIN=1`):
 
 ```sh
-python3 tools/batch_test.py --exe build/xe/strata --config xestrata-<model>.json --batch 3 --n 3 \
+python3 tools/batch_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json --batch 3 --n 3 \
     --extra "--pcie-frac 0 --adapt-every 1000000"
-python3 tools/batch_interleave_test.py --exe build/xe/strata --config xestrata-<model>.json \
+python3 tools/batch_interleave_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json \
     --extra "--pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow"
-python3 tools/parking_test.py --exe build/xe/strata --config xestrata-<model>.json \
+python3 tools/parking_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json \
     --extra "--conversation-cache-mib 8192 --conversation-cache-slots 4 --pcie-frac 0 --adapt-every 1000000"
 STRATA_KEY=<key> python3 tools/early_close_test.py http://127.0.0.1:8095
 ```
 
-All four passed on the B70 (IQ2_XS, contrib build) on 2026-10-06.
+All four passed on the B70 (IQ2_XS, contrib-llvm build) on 2026-10-06.
 
 ## Engine protocol (`--serve`)
 

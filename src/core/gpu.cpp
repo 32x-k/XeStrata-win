@@ -5,6 +5,8 @@
 #include "strata/core/device.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU core_gpu
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <sycl/ext/oneapi/experimental/profiling_tag.hpp>
@@ -22,6 +24,7 @@ namespace sx = sycl::ext::oneapi::experimental;
 
 struct Event {
     std::optional<sycl::event> ev;
+    bool timing = false;
 };
 
 struct Graph {
@@ -38,7 +41,7 @@ namespace {
 thread_local std::string g_error;
 
 // The live alloc_device blocks, so a refusal can say how much this process holds (the refusals seen so far came
-// with ~26 GiB free in the runs that passed, cause unknown: bench/results/2026-09-30-xe-iq3xxs)
+// with ~26 GiB free in the runs that passed, cause unknown: the 2026-09-30-xe-iq3xxs record)
 std::mutex g_live_mu;
 std::map<const void*, size_t> g_live;
 size_t g_live_bytes = 0;
@@ -68,7 +71,7 @@ bool fail(const char* what, const std::exception& e) {
 core::Runtime& rt() { return core::Runtime::get(); }
 
 // A single memset of more than 4 GiB never completes on the B70; the same bytes in 1 GiB pieces do, and a 5 GiB memcpy
-// and kernels addressing past 4 GiB work normally (bench/results/2026-09-30-xe-large-alloc).
+// and kernels addressing past 4 GiB work normally (the 2026-09-30-xe-large-alloc record).
 constexpr size_t kPiece = size_t(1) << 30;
 sycl::event memset_pieces(sycl::queue& queue, void* dst, int value, size_t bytes) {
     sycl::event e;
@@ -196,6 +199,27 @@ void vmem_unmap(void* va, size_t bytes, VmemSegment* seg) {
     delete seg;
 }
 
+VmemSegment* vmem_new(size_t bytes) {
+    try { return new VmemSegment{sx::physical_mem(rt().device(), rt().context(), bytes)}; }
+    catch (const std::exception& e) { fail("vmem_new", e); return nullptr; }
+}
+
+bool vmem_attach(VmemSegment* seg, void* va, size_t bytes) {
+    try {
+        seg->mem.map(reinterpret_cast<uintptr_t>(va), bytes, sx::address_access_mode::read_write);
+        return true;
+    } catch (const std::exception& e) { return fail("vmem_attach", e); }
+}
+
+bool vmem_detach(void* va, size_t bytes) {
+    try {
+        sx::unmap(va, bytes, rt().context());
+        return true;
+    } catch (const std::exception& e) { return fail("vmem_detach", e); }
+}
+
+void vmem_delete(VmemSegment* seg) { delete seg; }
+
 bool is_host_usm(const void* p) {
     if (!p) return false;
     try {
@@ -215,6 +239,18 @@ bool copy_async(void* dst, const void* src, size_t bytes, Stream s) {
     if (bytes == 0) return true;
     try { q(s).memcpy(dst, src, bytes); return true; }
     catch (const std::exception& e) { return fail("copy_async", e); }
+}
+
+bool copy_async_after(void* dst, const void* src, size_t bytes, Stream s, const Event* after, Event* done) {
+    try {
+        auto& queue = q(s);
+        const sycl::event e = queue.submit([&](sycl::handler& h) {
+            if (after != nullptr && after->ev) h.depends_on(*after->ev);
+            if (bytes > 0) h.memcpy(dst, src, bytes);
+        });
+        if (done != nullptr) done->ev = e;
+        return true;
+    } catch (const std::exception& e) { return fail("copy_async_after", e); }
 }
 
 bool copy2d_async(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, Stream s) {
@@ -260,6 +296,7 @@ bool mem_info(size_t* free_bytes, size_t* total_bytes) {
         }
         uint64_t free = d.get_info<sycl::ext::intel::info::device::free_memory>();
         uint64_t total = d.get_info<sycl::info::device::global_mem_size>();
+        if (core::integrated_gpu(d)) core::apply_uma_limit(free);   // its memory is the system RAM
         core::apply_vram_limit(free, total);
         if (free_bytes) *free_bytes = (size_t) free;
         if (total_bytes) *total_bytes = (size_t) total;
@@ -293,15 +330,22 @@ bool launch_host(Stream s, std::function<void()> fn) {
     } catch (const std::exception& e) { return fail("launch_host", e); }
 }
 
-bool event_create(Event** e) {
+bool event_create(Event** e, bool timing) {
     *e = new Event();
+    (*e)->timing = timing;
     return true;
 }
 
 void event_destroy(Event* e) { delete e; }
 
 bool event_record(Event* e, Stream s) {
-    try { e->ev = sx::submit_profiling_tag(q(s)); return true; }
+    // an event without timing is a barrier where the runtime measured timestamps to slow the waits (measure_marks)
+    try {
+        auto& queue = q(s);
+        e->ev = e->timing || !rt_of(s).marks_by_barrier() ? sx::submit_profiling_tag(queue)
+                                                          : queue.ext_oneapi_submit_barrier();
+        return true;
+    }
     catch (const std::exception& ex) { return fail("event_record", ex); }
 }
 
@@ -327,6 +371,7 @@ bool stream_wait_event(Stream s, const Event* e) {
 
 bool event_elapsed_ms(float* ms, const Event* from, const Event* to) {
     if (!from->ev || !to->ev) { g_error = "event_elapsed_ms: an event was not recorded"; return false; }
+    if (!from->timing || !to->timing) { g_error = "event_elapsed_ms: an event was not created for timing"; return false; }
     try {
         const auto a = from->ev->get_profiling_info<sycl::info::event_profiling::command_end>();
         const auto b = to->ev->get_profiling_info<sycl::info::event_profiling::command_end>();
@@ -370,9 +415,52 @@ void abandon_capture(Stream s) {
         std::lock_guard<std::mutex> lock(g_capture_mutex);
         auto it = g_captures.find(&queue);
         if (it == g_captures.end()) return;
-        it->second.end_recording(queue);
-        g_captures.erase(it);
+        const auto graph = it->second;
+        for (auto b = g_captures.begin(); b != g_captures.end();) {   // the queue and its open branches
+            if (b->second == graph) {
+                b->second.end_recording(*const_cast<sycl::queue*>(b->first));
+                b = g_captures.erase(b);
+            } else {
+                ++b;
+            }
+        }
     } catch (const std::exception& e) { fail("abandon_capture", e); }
+}
+
+bool stream_fork(Stream from, Stream to) {
+    try {
+        auto& a = q(from);
+        auto& b = q(to);
+        {
+            std::lock_guard<std::mutex> lock(g_capture_mutex);
+            auto it = g_captures.find(&a);
+            if (it != g_captures.end()) {
+                if (g_captures.count(&b)) { g_error = "stream_fork: the branch is already recording"; return false; }
+                auto graph = it->second;   // a handle: the branch records into the same graph
+                graph.begin_recording(b);
+                g_captures.emplace(&b, graph);
+            }
+        }
+        const sycl::event e = a.ext_oneapi_submit_barrier();
+        b.ext_oneapi_submit_barrier({e});
+        return true;
+    } catch (const std::exception& e) { return fail("stream_fork", e); }
+}
+
+bool stream_join(Stream into, Stream from) {
+    try {
+        auto& a = q(into);
+        auto& b = q(from);
+        const sycl::event e = b.ext_oneapi_submit_barrier();
+        a.ext_oneapi_submit_barrier({e});
+        std::lock_guard<std::mutex> lock(g_capture_mutex);
+        auto it = g_captures.find(&b);
+        if (it != g_captures.end()) {
+            it->second.end_recording(b);
+            g_captures.erase(it);
+        }
+        return true;
+    } catch (const std::exception& e) { return fail("stream_join", e); }
 }
 
 bool is_capturing(Stream s) {

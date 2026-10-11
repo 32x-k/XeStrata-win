@@ -6,7 +6,10 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_elementwise
+#include "strata/kernels/device_arch_tag.hpp"
 
+#include <algorithm>
 #include <limits>
 
 namespace strata::kernels {
@@ -15,6 +18,9 @@ sycl::queue& queue_for(void* stream) {
     auto& queue = core::Runtime::get().stream(stream);
     return queue;
 }
+// 16 bytes in one read across PCIe from mapped host memory: through sycl::float4 NVPTX splits the read in two
+using f32x4 = float __attribute__((ext_vector_type(4)));
+using i32x4 = int32_t __attribute__((ext_vector_type(4)));
 void sync_if_needed(void* stream, const sycl::event& event) {
     if (!stream) core::Runtime::get().wait(event, "synchronous elementwise kernel");
 }
@@ -112,16 +118,27 @@ void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
     sync_if_needed(stream, event);
 }
 
-// ---- the doorbell (see the header).  bench/results/2026-09-30-xe-doorbell measured what a spinning kernel sees:
+// ---- the doorbell (see the header).  the 2026-09-30-xe-doorbell record measured what a spinning kernel sees:
 // a volatile read followed by a system-scope acquire fence observes the host's write; a system-scope atomic load
-// alone sometimes never does.  The GPU-to-host direction is a system-scope release fence, then the store.
+// alone sometimes never does.  The GPU-to-host direction is a system-scope fence, then a plain volatile store,
+// not an atomic one: no GPU here reports usm_atomic_host_allocations, and the xe driver serves a discrete
+// GPU's atomic page fault on system memory only by moving the page to VRAM (a userptr cannot move), where a read or
+// a write is simply bound again (xe_vma_need_vram_for_atomic).  The ring has one writer, so it needs no atomicity;
+// the B70 saw the store while the kernel ran in 2,000 of 2,000 runs, sooner than the atomic one (median 4.9 us
+// against 11.0; the 2026-10-11-xe-doorbell-store record).
 namespace {
-using sys_ref = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
-                                 sycl::access::address_space::global_space>;
 inline uint32_t read_host(const uint32_t* p) {
     const uint32_t v = *reinterpret_cast<const volatile uint32_t*>(p);
     sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
     return v;
+}
+// *p += 1, with one fence between the load and the store: a release fence right after read_host's acquire fence
+// crashed intel/llvm 7.1's sycl-optimize-barriers pass (an assertion in CallBase::setArgOperand).
+inline void bump_host(uint32_t* p) {
+    volatile uint32_t* v = p;
+    const uint32_t n = *v + 1u;
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+    *v = n;
 }
 }  // namespace
 
@@ -129,8 +146,7 @@ inline uint32_t read_host(const uint32_t* p) {
 void doorbell_ring(uint32_t* d_seq, void* stream) {
     if (d_seq == nullptr) return;
     const auto event = queue_for(stream).single_task([=] {
-        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-        sys_ref(*d_seq).store(read_host(d_seq) + 1u);
+        bump_host(d_seq);
     });
     sync_if_needed(stream, event);
 }
@@ -151,8 +167,12 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;
     if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0)
         throw core::DeviceError("copy_from_mapped: n must be a multiple of 4 and both pointers 16-byte aligned");
-    queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
-        dst[i] = reinterpret_cast<const volatile float*>(src)[i];
+    const int64_t n4 = n / 4;
+    const size_t groups = (size_t) std::min<int64_t>((n4 + 255) / 256, 64);
+    queue_for(stream).parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) {
+        const int64_t step = (int64_t) it.get_global_range(0);
+        for (int64_t i = (int64_t) it.get_global_id(0); i < n4; i += step)
+            reinterpret_cast<f32x4*>(dst)[i] = reinterpret_cast<const volatile f32x4*>(src)[i];
     });
 }
 
@@ -162,14 +182,17 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
     if (rows <= 0) return;
     if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0)
         throw core::DeviceError("copy_rows_from_mapped: width must be a multiple of 4 and both pointers 16-byte aligned");
+    // 16-byte reads and the hit test shared by the group: the RTX 4070 took 33.8 us for 10 rows against 20.5
+    const int64_t w4 = width / 4;
     queue_for(stream).parallel_for(sycl::nd_range<1>((size_t) rows * 128, 128), [=](sycl::nd_item<1> it) {
         const int64_t row = (int64_t) it.get_group(0);
         const int c = *count;
-        bool hit = false;
-        for (int i = 0; i < c; ++i) hit |= hit_rows[i] == row;
-        float* d = dst + row * width;
-        const volatile float* sr = reinterpret_cast<const volatile float*>(src) + row * width;
-        for (int64_t i = it.get_local_id(0); i < width; i += 128) d[i] = hit ? 0.0f : sr[i];
+        bool h = false;
+        for (int i = (int) it.get_local_id(0); i < c; i += 128) h |= hit_rows[i] == row;
+        const bool hit = sycl::any_of_group(it.get_group(), h);
+        f32x4* d = reinterpret_cast<f32x4*>(dst + row * width);
+        const volatile f32x4* sr = reinterpret_cast<const volatile f32x4*>(src + row * width);
+        for (int64_t i = (int64_t) it.get_local_id(0); i < w4; i += 128) d[i] = hit ? f32x4(0.0f) : sr[i];
     });
 }
 
@@ -188,15 +211,59 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
         sycl::group_barrier(it.get_group());
         if (t == 0) {
             sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
-            sys_ref(*d_seq).store(read_host(d_seq) + 1u);
+            bump_host(d_seq);
         }
     });
 }
 
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
-    queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
-        dst[i] = reinterpret_cast<const volatile int32_t*>(src)[i];
+    if (((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
+            dst[i] = reinterpret_cast<const volatile int32_t*>(src)[i];
+        });
+        return;
+    }
+    // 16 bytes a read, as copy_from_mapped, and the last n % 4 values one by one: the prompt path's routing tables
+    // cross PCIe beside the streamed experts
+    const int64_t n4 = n / 4;
+    const size_t groups = (size_t) std::clamp<int64_t>((n4 + 255) / 256, 1, 64);
+    queue_for(stream).parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) {
+        const int64_t step = (int64_t) it.get_global_range(0), g = (int64_t) it.get_global_id(0);
+        for (int64_t i = g; i < n4; i += step)
+            reinterpret_cast<i32x4*>(dst)[i] = reinterpret_cast<const volatile i32x4*>(src)[i];
+        if (g < n - n4 * 4) dst[n4 * 4 + g] = reinterpret_cast<const volatile int32_t*>(src)[n4 * 4 + g];
+    });
+}
+
+namespace {
+struct MappedCopies { MappedCopy c[8]; };
+}  // namespace
+
+// upstream 4a5713fb: the draft graphs' inputs from mapped memory in one launch instead of one each
+void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
+    if (n <= 0) return;
+    if (n > 8) throw core::DeviceError("copy_from_mapped_multi: at most 8 copies");
+    MappedCopies a{};
+    int64_t most = 0;
+    for (int i = 0; i < n; ++i) {
+        a.c[i] = copies[i];
+        most = copies[i].words > most ? copies[i].words : most;
+    }
+    const int64_t units = (most + 3) / 4;
+    const size_t bx = (size_t) std::clamp<int64_t>((units + 255) / 256, 1, 32);
+    queue_for(stream).parallel_for(sycl::nd_range<2>({(size_t) n, bx * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
+        const MappedCopy c = a.c[it.get_group(0)];
+        const int64_t i0 = (int64_t) it.get_global_id(1), st = (int64_t) it.get_global_range(1);
+        if ((c.words & 3) == 0 && ((uintptr_t) c.dst & 15) == 0 && ((uintptr_t) c.src & 15) == 0) {
+            const volatile sycl::uint4* s = static_cast<const volatile sycl::uint4*>(c.src);
+            sycl::uint4* d = static_cast<sycl::uint4*>(c.dst);
+            for (int64_t i = i0; i < c.words / 4; i += st) d[i] = const_cast<const sycl::uint4*>(s)[i];
+        } else {
+            const volatile int32_t* s = static_cast<const volatile int32_t*>(c.src);
+            int32_t* d = static_cast<int32_t*>(c.dst);
+            for (int64_t i = i0; i < c.words; i += st) d[i] = s[i];
+        }
     });
 }
 }  // namespace strata::kernels

@@ -10,6 +10,8 @@
 // CUDA compiled this with --use_fast_math to match ggml-cuda; the Xe version uses the precise exp and sqrt.
 #include "strata/kernels/native_gdn.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_native_gdn
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <atomic>
 #include <cmath>

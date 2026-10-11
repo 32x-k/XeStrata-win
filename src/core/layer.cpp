@@ -40,6 +40,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <memory>
 #include <vector>
 namespace strata::core {
 namespace { bool g_shared_early = true; bool g_fused_gr = false; bool g_fast_attn = true; bool g_publish_kernel = true; bool g_fused_gdn = true; bool g_fast_select = true; }
@@ -490,6 +492,120 @@ namespace {
 int64_t g_kv_resident = 0;
 uint64_t g_kv_host_bytes = 0;
 
+// ---- the elastic K/V (--kv-grow): one VMM range per state, each pool array at a chunk boundary in it
+bool g_kv_elastic = false;
+int64_t g_kv_elastic_init = 16384;
+struct ElasticPool {
+    strata::core::VmmRange range;
+    std::vector<uint64_t> off, per_slot;   // each array's offset in the range (whole chunks) and bytes per page slot
+    int64_t n_slots = 0, page_size = 0;
+};
+// Never destroyed: a destructor at exit would unmap the ranges after the device's Runtime (made later, so gone
+// first) and with it the context (an assertion in libsycl on the RTX 4070); the process's end frees them.
+std::vector<std::unique_ptr<ElasticPool>>& pools() {
+    static auto* p = new std::vector<std::unique_ptr<ElasticPool>>;
+    return *p;
+}
+
+int64_t pool_chunks(const ElasticPool& p, size_t a, int64_t slots) {
+    const uint64_t G = strata::core::vmm_granularity();
+    return (int64_t) (((uint64_t) slots * p.per_slot[a] + G - 1) / G);
+}
+int64_t pool_slots(const ElasticPool& p, int64_t cells) {
+    return std::min<int64_t>(p.n_slots, std::max<int64_t>((cells + p.page_size - 1) / p.page_size, 1));
+}
+/// Whole page slots every array of the pool has mapped.
+int64_t pool_slots_mapped(const ElasticPool& p) {
+    const uint64_t G = strata::core::vmm_granularity();
+    int64_t slots = p.n_slots;
+    for (size_t a = 0; a < p.off.size(); ++a) {
+        const int64_t c0 = (int64_t) (p.off[a] / G);
+        const int64_t end = a + 1 < p.off.size() ? (int64_t) (p.off[a + 1] / G) : p.range.chunks();
+        int64_t c = 0;
+        while (c0 + c < end && p.range.mapped(c0 + c)) ++c;
+        slots = std::min<int64_t>(slots, (int64_t) ((uint64_t) c * G / p.per_slot[a]));
+    }
+    return slots;
+}
+bool pool_grow(ElasticPool& p, int64_t cells, const std::function<strata::core::VmmChunk()>& take) {
+    const uint64_t G = strata::core::vmm_granularity();
+    const int64_t slots = pool_slots(p, cells);
+    for (size_t a = 0; a < p.off.size(); ++a) {
+        const int64_t c0 = (int64_t) (p.off[a] / G), c1 = c0 + pool_chunks(p, a, slots);
+        std::vector<int64_t> fresh;
+        for (int64_t c = c0; c < c1; ++c)
+            if (!p.range.mapped(c)) fresh.push_back(c);
+        if (fresh.empty()) continue;
+        if (!p.range.map_range(c0, c1, take)) {
+            std::fprintf(stderr, "strata: the elastic K/V could not map %zu chunks (the driver has no VRAM left)\n",
+                         fresh.size());
+            return false;
+        }
+        // what the chunk held before (another pool's cells, an expert) is not K/V: zeroed, as a new session is
+        for (const int64_t c : fresh)
+            if (!strata::gpu::memset(p.range.base() + (uint64_t) c * G, 0, (size_t) G)) {
+                std::fprintf(stderr, "strata: the elastic K/V could not clear a chunk: %s\n",
+                             strata::gpu::last_error());
+                return false;
+            }
+    }
+    return true;
+}
+}  // namespace
+
+void qsa_set_kv_elastic(bool enabled, int64_t init_cells) {
+    g_kv_elastic = enabled && strata::core::vmm_available();
+    if (init_cells > 0) g_kv_elastic_init = init_cells;
+}
+bool qsa_kv_elastic() { return g_kv_elastic; }
+int64_t qsa_kv_elastic_cells() {
+    int64_t cells = std::numeric_limits<int64_t>::max();
+    for (const auto& p : pools()) cells = std::min<int64_t>(cells, pool_slots_mapped(*p) * p->page_size);
+    return cells;
+}
+int64_t qsa_kv_elastic_need(int64_t cells) {
+    const uint64_t G = strata::core::vmm_granularity();
+    int64_t n = 0;
+    for (const auto& p : pools()) {
+        const int64_t slots = pool_slots(*p, cells);
+        for (size_t a = 0; a < p->off.size(); ++a) {
+            const int64_t c0 = (int64_t) (p->off[a] / G), c1 = c0 + pool_chunks(*p, a, slots);
+            for (int64_t c = c0; c < c1; ++c) n += !p->range.mapped(c);
+        }
+    }
+    return n;
+}
+bool qsa_kv_elastic_grow(int64_t cells, const std::function<strata::core::VmmChunk()>& take) {
+    for (auto& p : pools())
+        if (!pool_grow(*p, cells, take)) return false;
+    return strata::gpu::device_sync();
+}
+int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(strata::core::VmmChunk)>& give) {
+    const uint64_t G = strata::core::vmm_granularity();
+    int64_t n = 0;
+    for (auto& p : pools()) {
+        const int64_t slots = pool_slots(*p, cells);
+        for (size_t a = 0; a < p->off.size(); ++a) {
+            const int64_t c0 = (int64_t) (p->off[a] / G), c1 = c0 + pool_chunks(*p, a, slots);
+            const int64_t end = a + 1 < p->off.size() ? (int64_t) (p->off[a + 1] / G) : p->range.chunks();
+            for (int64_t c = c1; c < end; ++c)
+                if (const strata::core::VmmChunk h = p->range.unmap(c)) { give(h); ++n; }
+        }
+    }
+    return n;
+}
+uint64_t qsa_kv_elastic_mapped_bytes() {
+    uint64_t n = 0;
+    for (const auto& p : pools()) n += (uint64_t) p->range.mapped_count() * strata::core::vmm_granularity();
+    return n;
+}
+uint64_t qsa_kv_elastic_full_bytes() {
+    uint64_t n = 0;
+    for (const auto& p : pools()) n += (uint64_t) p->range.chunks() * strata::core::vmm_granularity();
+    return n;
+}
+namespace {
+
 /// How one state holds its K/V: `mode` as in QsaState::kv_mode, `slots` VRAM pages of `pages` logical ones.
 struct KvPlan {
     int mode = 0;
@@ -535,8 +651,9 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     uint64_t n = 0;
-    // K/V pools (the VRAM slots)
-    n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0, g_kv_int8 || g_kv_hybrid) + (uint64_t) 4 * 16;
+    if (!(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
+        n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
+                           g_kv_int8 || g_kv_hybrid) + (uint64_t) 4 * 16;   // K/V pools (the VRAM slots)
     n += (uint64_t) p.pages * 4;                                               // page_table
     if (p.mode == 1) n += strata::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
@@ -557,12 +674,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     Cursor c{(uint8_t*) base};
     st.kv_int8 = g_kv_int8 && !g_kv_q4;
     st.kv_q4 = g_kv_q4;
-    // K8V4 on the main layers only (the drafter's state is made with the setting switched to INT8, mtp.cpp)
+    // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
+    // mtp.cpp). A streamed one keeps its host copy in the same three runs (kv_stream.cu, kKvHybrid).
     if (g_kv_hybrid && ring_cells <= 0) {
-        if (p.mode == 1) {
-            std::fprintf(stderr, "strata: hybrid K8V4 KV does not support --kv-resident streaming\n");
-            return 0;
-        }
         st.kv_hybrid = true;
         st.kv_int8 = false;
         st.kv_q4 = false;
@@ -572,7 +686,51 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.n_slots = p.slots;
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
     const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
-    if (st.kv_hybrid) {
+    st.kv_elastic = -1;
+    if (g_kv_elastic && p.mode == 0) {
+        // the elastic K/V: each array at a chunk boundary of the state's own range, the first cells mapped
+        const uint64_t slot_rows = (uint64_t) s.n_head_kv * s.page_size;
+        const uint64_t scale_row = (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+        std::vector<uint64_t> per;   // bytes per page slot of each array, in the order they are assigned below
+        if (st.kv_hybrid) per = {slot_rows * s.head_dim, slot_rows * scale_row, slot_rows * q4_row};
+        else if (st.kv_q4) per = {slot_rows * q4_row, slot_rows * q4_row};
+        else if (st.kv_int8) per = {slot_rows * s.head_dim, slot_rows * s.head_dim, slot_rows * scale_row, slot_rows * scale_row};
+        else per = {slot_rows * s.head_dim * 2, slot_rows * s.head_dim * 2};
+        auto pool = std::make_unique<ElasticPool>();
+        const uint64_t G = strata::core::vmm_granularity();
+        uint64_t at = 0;
+        for (const uint64_t b : per) {
+            pool->off.push_back(at);
+            at += ((uint64_t) p.slots * b + G - 1) / G * G;
+        }
+        pool->per_slot = per;
+        pool->n_slots = p.slots;
+        pool->page_size = s.page_size;
+        if (!pool->range.reserve(at) || !pool_grow(*pool, g_kv_elastic_init, [] { return (strata::core::VmmChunk) 0; })) {
+            std::fprintf(stderr, "strata: the elastic K/V could not reserve or map its pools\n");
+            return 0;
+        }
+        uint8_t* b = pool->range.base();
+        const uint64_t* o = pool->off.data();
+        if (st.kv_hybrid) {
+            st.k_q = reinterpret_cast<int8_t*>(b + o[0]);
+            st.k_scale = reinterpret_cast<uint16_t*>(b + o[1]);
+            st.v_q4 = b + o[2];
+        } else if (st.kv_q4) {
+            st.k_q4 = b + o[0];
+            st.v_q4 = b + o[1];
+        } else if (st.kv_int8) {
+            st.k_q = reinterpret_cast<int8_t*>(b + o[0]);
+            st.v_q = reinterpret_cast<int8_t*>(b + o[1]);
+            st.k_scale = reinterpret_cast<uint16_t*>(b + o[2]);
+            st.v_scale = reinterpret_cast<uint16_t*>(b + o[3]);
+        } else {
+            st.k_pool = reinterpret_cast<uint16_t*>(b + o[0]);
+            st.v_pool = reinterpret_cast<uint16_t*>(b + o[1]);
+        }
+        st.kv_elastic = (int32_t) pools().size();
+        pools().push_back(std::move(pool));
+    } else if (st.kv_hybrid) {
         st.k_q = c.take<int8_t>(rows * s.head_dim);
         st.k_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
         st.v_q4 = c.take<uint8_t>(rows * q4_row);
@@ -641,7 +799,11 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         }
         g_kv_host_bytes += bytes;
         Cursor hc{d};
-        if (st.kv_q4) {
+        if (st.kv_hybrid) {
+            st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
+            st.host.k_scale = hc.take<uint16_t>(hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+            st.host.v_q4 = hc.take<uint8_t>(hrows * q4_row);
+        } else if (st.kv_q4) {
             st.host.k_q4 = hc.take<uint8_t>(hrows * q4_row);
             st.host.v_q4 = hc.take<uint8_t>(hrows * q4_row);
         } else if (st.kv_int8) {
@@ -685,7 +847,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const QsaShapes s = qsa_shapes(g);
     strata::gpu::Stream cs = stream;
-    const size_t rows = (size_t) st.n_slots * s.n_head_kv * s.page_size;
+    // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
+    const int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*pools()[(size_t) st.kv_elastic]) : st.n_slots;
+    const size_t rows = (size_t) live_slots * s.n_head_kv * s.page_size;
     if (st.kv_hybrid) {
         strata::gpu::memset_async(st.k_q, 0, rows * s.head_dim, cs);
         strata::gpu::memset_async(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
@@ -774,8 +938,8 @@ bool stage_timing_enable() {
     if (g_st.on) return true;
     for (int l = 0; l < 64; ++l) {
         for (int s = 0; s < STAGE_SLOTS; ++s) {
-            if (!strata::gpu::event_create(&g_st.a[l][s])) return false;
-            if (!strata::gpu::event_create(&g_st.b[l][s])) return false;
+            if (!strata::gpu::event_create(&g_st.a[l][s], true)) return false;
+            if (!strata::gpu::event_create(&g_st.b[l][s], true)) return false;
         }
     }
     g_st.on = true;
@@ -900,9 +1064,15 @@ if (st.kv_hybrid) {
     // K8V4: only V is rotated (kv_q4.hpp's H); the scores pair unrotated q with unrotated INT8 K, and the output (a
     // mix of rotated values) is rotated back after attention.  Each append passes the used pool for both halves (a
     // duplicate write of the same bits), so no kernel variants are needed; mode 0 has no host mirror.
+    // Streamed (--kv-resident), each half also writes its part of the host copy (kv_hybrid_*_half).
     strata::kernels::fwht256_inplace_cuda(b.vcur, g.n_head_kv, stream);
-    kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, st.step, b.kcur, b.kcur, s, stream, nullptr);
-    strata::kernels::kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, st.step, b.vcur, b.vcur, s, stream, nullptr);
+    const strata::kernels::KvHostPools hk = strata::kernels::kv_hybrid_k_half(st.host),
+                                       hv = strata::kernels::kv_hybrid_v_half(st.host);
+    const bool mirror = st.host.present();
+    kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, st.step, b.kcur, b.kcur, s, stream,
+                      mirror ? &hk : nullptr);
+    strata::kernels::kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, st.step, b.vcur, b.vcur, s, stream,
+                                       mirror ? &hv : nullptr);
 } else if (st.kv_q4) {
     strata::kernels::fwht256_inplace_cuda(b.kcur, g.n_head_kv, stream);   // Q4_0: rotated K and V (kv_q4.hpp)
     strata::kernels::fwht256_inplace_cuda(b.vcur, g.n_head_kv, stream);

@@ -4,10 +4,10 @@
 """serve/telemetry.py - hardware readings for the web app's Monitor tab (idea from PR #22 by code-martin).
 
 A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
-- GPU: the Intel GPU on the xe driver, from Linux (temperature and power from hwmon, the PCIe link, the load of this
-  user's processes from their DRM fdinfo) and its VRAM from Level Zero's sysman through ctypes, so no pip package is
-  needed.  An NVIDIA GPU (the contrib build): NVIDIA's NVML library (libnvidia-ml.so.1, installed with the driver)
-  through ctypes: load, VRAM, temperature, power, PCIe link and throughput.
+- GPU: the Intel GPU on the xe or i915 driver, from Linux (temperature and power from hwmon, the PCIe link, the load
+  of this user's processes from their DRM fdinfo) and its VRAM from Level Zero's sysman through ctypes, so no pip
+  package is needed.  An NVIDIA GPU (the contrib build): NVIDIA's NVML library (libnvidia-ml.so.1, installed with
+  the driver) through ctypes: load, VRAM, temperature, power, PCIe link and throughput.
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
   Linux /proc and the disk rate is absent.
 Anything that cannot be read is None; nothing here can stop the server.
@@ -49,7 +49,7 @@ class _ZesMemState(ctypes.Structure):    # zes_mem_state_t
 
 class _Zes:
     """The device's VRAM through Level Zero's management API (sysman, libze_loader.so.1, which the GPU runtime
-    installs) through ctypes: the reading Linux's sysfs does not give for the xe driver."""
+    installs) through ctypes: the reading Linux's sysfs does not give for the xe and i915 drivers."""
 
     STYPE_PCI_PROPERTIES, STYPE_MEM_STATE = 0x2, 0x1E
 
@@ -109,19 +109,20 @@ def _read(path, conv=int):
 
 
 class _XeGpu:
-    """An Intel GPU on the xe driver: temperature and power from Linux's sysfs (hwmon), the PCIe link from the PCI
-    path, the load from the DRM clients' fdinfo, the VRAM through sysman.  `pci` is the card's address as the config
-    gives it (setup's gpu_pci); without one, the first card on the xe driver."""
+    """An Intel GPU on the xe or i915 driver: temperature and power from Linux's sysfs (hwmon), the PCIe link from the
+    PCI path, the load from the DRM clients' fdinfo, the VRAM through sysman.  `pci` is the card's address as the
+    config gives it (setup's gpu_pci); without one, the first card on one of `drivers`."""
     LINK_GEN = {"2.5": 1, "5.0": 2, "8.0": 3, "16.0": 4, "32.0": 5, "64.0": 6}
 
-    def __init__(self, pci=None):
+    def __init__(self, pci=None, drivers=("xe", "i915")):
         self.dev = None
         for card in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
             dev = os.path.realpath(os.path.join(card, "device"))
-            if os.path.basename(os.path.realpath(os.path.join(dev, "driver"))) != "xe":
+            driver = os.path.basename(os.path.realpath(os.path.join(dev, "driver")))
+            if driver not in drivers:
                 continue
             if pci is None or os.path.basename(dev) == pci:
-                self.dev = dev
+                self.dev, self.driver = dev, driver
                 break
         if self.dev is None:
             return
@@ -130,7 +131,7 @@ class _XeGpu:
         self.hwmon = hw[0] if hw else None
         self.zes = _Zes(self.pci)
         self._prev = None   # (time, energy uJ)
-        self._cycles = {}   # DRM client id -> (engine cycles, total cycles)
+        self._cycles = {}   # DRM client id -> (engine cycles, total cycles); i915: (engine ns, sample time ns)
 
     def ok(self):
         return self.dev is not None
@@ -157,15 +158,17 @@ class _XeGpu:
 
     def _busy(self):
         """The render and compute engines' load from this user's processes on the card: the xe driver counts each
-        DRM client's engine cycles in /proc/<pid>/fdinfo (the card-wide load needs root on this driver)."""
+        DRM client's engine cycles in /proc/<pid>/fdinfo, i915 its engine time in ns (the card-wide load needs root
+        on these drivers)."""
         now = {}
+        t_ns = time.monotonic_ns()
         for f in glob.glob("/proc/[0-9]*/fdinfo/*"):
             try:
                 with open(f, encoding="ascii", errors="replace") as fh:
                     text = fh.read()
             except OSError:
                 continue
-            if "drm-driver:\txe" not in text or f"drm-pdev:\t{self.pci}" not in text:
+            if f"drm-driver:\t{self.driver}\n" not in text or f"drm-pdev:\t{self.pci}" not in text:
                 continue
             kv = {}
             for line in text.splitlines():
@@ -173,9 +176,13 @@ class _XeGpu:
                 kv.setdefault(k, v.strip())
             cid = kv.get("drm-client-id")
             try:
-                busy = sum(int(kv.get(f"drm-cycles-{e}", "0")) for e in ("rcs", "ccs"))
-                total = int(kv.get("drm-total-cycles-ccs") or kv.get("drm-total-cycles-rcs") or 0)
-            except ValueError:
+                if self.driver == "i915":
+                    busy = sum(int(kv.get(f"drm-engine-{e}", "0 ns").split()[0]) for e in ("render", "compute"))
+                    total = t_ns
+                else:
+                    busy = sum(int(kv.get(f"drm-cycles-{e}", "0")) for e in ("rcs", "ccs"))
+                    total = int(kv.get("drm-total-cycles-ccs") or kv.get("drm-total-cycles-rcs") or 0)
+            except (ValueError, IndexError):
                 continue
             if cid and total:
                 now[cid] = (busy, total)
@@ -198,10 +205,103 @@ class _XeGpu:
             temps = [_read(f) for f in glob.glob(os.path.join(self.hwmon, "temp*_input"))]
             temps = [v / 1000.0 for v in temps if v]
             out["temp"] = max(temps) if temps else None
-            cap = _read(os.path.join(self.hwmon, "power1_cap"))
+            cap = _read(os.path.join(self.hwmon, "power1_cap")) or _read(os.path.join(self.hwmon, "power1_max"))
             out["power_limit"] = cap / 1e6 if cap else None
         out["mem_used"], out["mem_total"] = self.zes.read()
         out["pcie_gen"], out["pcie_width"], out["pcie_gen_max"] = self._link()
+        out["pcie_rx_mb"] = out["pcie_tx_mb"] = None   # no counters for the link's traffic
+        return out
+
+
+# ------------------------------------------------------------------------------------------------ an AMD GPU
+SYSFS = "/sys"
+
+
+class _AmdGpu:
+    """An AMD GPU on the amdgpu driver, from its sysfs files (no ROCm library needed; upstream #301): load
+    (gpu_busy_percent), VRAM (mem_info_vram_used / _total), and from its hwmon folder the temperature (temp1_input, the
+    edge sensor, m°C), power (power1_average or power1_input, µW) and its cap (power1_cap).  `pci` is the card's
+    address as the config gives it; without one, the first card on the amdgpu driver."""
+
+    def __init__(self, pci=None, sysfs=None):
+        self.dev = None
+        for card in sorted(glob.glob(os.path.join(sysfs or SYSFS, "class", "drm", "card[0-9]*"))):
+            dev = os.path.realpath(os.path.join(card, "device"))
+            if os.path.basename(os.path.realpath(os.path.join(dev, "driver"))) != "amdgpu":
+                continue
+            if pci is None or os.path.basename(dev) == pci:
+                self.dev = dev
+                break
+        self.hwmon = None
+        if self.dev:
+            hw = sorted(glob.glob(os.path.join(self.dev, "hwmon", "hwmon*")))
+            self.hwmon = hw[0] if hw else None
+
+    def ok(self):
+        return self.dev is not None
+
+    def name(self):
+        return (_read(os.path.join(self.dev, "product_name"), str) or "AMD Radeon") if self.ok() else None
+
+    @staticmethod
+    def _gen(text):
+        """The PCIe generation of a link-speed file's contents ("16.0 GT/s PCIe" -> 4), or None."""
+        try:
+            return {2.5: 1, 5.0: 2, 8.0: 3, 16.0: 4, 32.0: 5, 64.0: 6}[float(str(text).split()[0])]
+        except (ValueError, TypeError, IndexError, KeyError):
+            return None
+
+    @staticmethod
+    def _bdf(s):
+        """True for a sysfs pci device name ("0000:03:00.0")."""
+        return (len(s) == 12 and s[4] == ":" and s[7] == ":" and s[10] == "." and s[11] in "01234567"
+                and all(c in "0123456789abcdef" for c in s[0:4] + s[5:7] + s[8:10]))
+
+    def _hops(self):
+        """The PCIe devices between the root port and this card, the card last."""
+        out, prefix = [], []
+        for part in os.path.realpath(self.dev or "").split("/"):
+            prefix.append(part)
+            if self._bdf(part):
+                out.append("/".join(prefix))
+        return out
+
+    def link(self):
+        """The PCIe link the card actually gets (upstream 7f3c0da2): the narrowest and slowest hop between the root
+        port and the card, from each hop's max_link_speed / max_link_width (a card that is Gen4 on its own hop behind
+        a Gen3 root port runs at Gen3).  pcie_own_gen keeps the card's own hop aside.  The bottleneck is claimed only
+        when every hop could be read (pcie_path: how many were, "4/4"); else the card's own negotiated link."""
+        hops = self._hops()
+        gens, widths, seen = [], [], 0
+        for d in hops:
+            g = self._gen(_read(os.path.join(d, "max_link_speed"), str))
+            w = _read(os.path.join(d, "max_link_width"))
+            seen += 1 if (g is not None or w is not None) else 0
+            if g:
+                gens.append(g)
+            if w:
+                widths.append(w)
+        own_gen = self._gen(_read(os.path.join(self.dev or "", "current_link_speed"), str))
+        whole = bool(hops) and seen == len(hops)
+        gen = min(gens) if (whole and gens) else own_gen
+        width = min(widths) if (whole and widths) else _read(os.path.join(self.dev or "", "current_link_width"))
+        return {"pcie_gen": gen, "pcie_gen_max": gen, "pcie_own_gen": own_gen, "pcie_width": width,
+                "pcie_path": "%d/%d" % (seen, len(hops))}
+
+    def read(self):
+        out = {"util": _read(os.path.join(self.dev, "gpu_busy_percent")),
+               "mem_used": _read(os.path.join(self.dev, "mem_info_vram_used")),
+               "mem_total": _read(os.path.join(self.dev, "mem_info_vram_total"))}
+        if self.hwmon:
+            t = _read(os.path.join(self.hwmon, "temp1_input"))
+            out["temp"] = t / 1000.0 if t is not None else None
+            p = _read(os.path.join(self.hwmon, "power1_average"))
+            if p is None:
+                p = _read(os.path.join(self.hwmon, "power1_input"))
+            out["power"] = p / 1e6 if p is not None else None
+            cap = _read(os.path.join(self.hwmon, "power1_cap"))
+            out["power_limit"] = cap / 1e6 if cap is not None else None
+        out.update(self.link())
         out["pcie_rx_mb"] = out["pcie_tx_mb"] = None   # no counters for the link's traffic
         return out
 
@@ -293,16 +393,24 @@ class _NvGpu:
 
 
 def _gpu(pci=None):
-    """The card the engine runs on: the Intel GPU at `pci` (or the first on the xe driver), else the NVIDIA one."""
-    g = _XeGpu(pci)
+    """The card the engine runs on: the Intel GPU at `pci` (or the first on the xe driver), else the AMD one (amdgpu),
+    else the NVIDIA one, else (without `pci`) the first on the i915 driver.  Without `pci` an i915 card comes last: it is
+    most often the processor's graphics beside the card the engine runs on."""
+    g = _XeGpu(pci, ("xe", "i915") if pci else ("xe",))
     if g.ok():
         return g
+    a = _AmdGpu(pci)
+    if a.ok():
+        return a
     n = _NvGpu(pci)
-    return n if n.ok() else g
+    if n.ok():
+        return n
+    i = _XeGpu(None, ("i915",)) if pci is None else g
+    return i if i.ok() else g
 
 
 def free_vram_mib(gpu_pci=None):
-    """Free VRAM of the card (by PCI address, None: the first on the xe driver, else NVML's first) in MiB, or None
+    """Free VRAM of the card (by PCI address, None: as _gpu chooses) in MiB, or None
     when it cannot be read."""
     g = _gpu(gpu_pci)
     if not g.ok():
@@ -357,8 +465,7 @@ class _CpuRamFallback:
 class Telemetry:
     def __init__(self, extra=None, gpu_pci=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_pci`: the PCI address
-        of the card the engine runs on (setup's gpu_pci), or None for the first card on the xe driver (else NVML's
-        first)."""
+        of the card the engine runs on (setup's gpu_pci), or None for the card _gpu chooses."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
@@ -381,6 +488,7 @@ class Telemetry:
             "psutil": self.ps is not None,
         }
         self._disk_prev = None
+        self._stop = threading.Event()
         threading.Thread(target=self._loop, daemon=True).start()
 
     def _disk(self):
@@ -389,6 +497,8 @@ class Telemetry:
         try:
             c = self.ps.disk_io_counters()
         except (OSError, RuntimeError):
+            return None, None
+        if c is None:   # psutil found no disk (a gVisor container, Windows with its disk counters off)
             return None, None
         t = time.time()
         prev, self._disk_prev = self._disk_prev, (t, c.read_bytes, c.write_bytes)
@@ -434,8 +544,13 @@ class Telemetry:
                 pass
         return s
 
+    def close(self):
+        """Ends the sampler thread (a server that stops, a test's service): it used to run for the life of the
+        process."""
+        self._stop.set()
+
     def _loop(self):
-        while True:
+        while not self._stop.is_set():
             s = self.sample()
             with self.lock:
                 self.now = s
@@ -443,7 +558,7 @@ class Telemetry:
                           "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
-            time.sleep(1.0)
+            self._stop.wait(1.0)
 
     def snapshot(self):
         with self.lock:

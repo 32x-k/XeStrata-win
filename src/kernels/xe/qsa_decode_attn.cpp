@@ -10,6 +10,8 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_qsa_decode_attn
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <cfloat>
 #include <cmath>

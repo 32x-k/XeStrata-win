@@ -13,12 +13,18 @@ SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
 # XeStrata's own files without a comment of their own
 [[annotations]]
-path = ["bench/**", "data/**", "docs/paper/**", "serve/web/sprite.svg", "tests/data/**"]
+path = ["bench/**", "data/**", "docs/paper/**", "serve/fixtures/**", "serve/web/favicon.svg", "serve/web/sprite.svg", "tests/data/**"]
 SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors"]
 SPDX-License-Identifier = "LGPL-3.0-or-later"
 
+# setup's --bench prompts: XeStrata's sources at commit 58dbbe5, two of them with code from ggml (its MIT notice kept)
 [[annotations]]
-path = ["cmake/BUILD.json.in", ".claude/skills/**/SKILL.md"]
+path = ["data/bench-corpus.json.xz"]
+SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors", "2023-2026 The ggml authors"]
+SPDX-License-Identifier = "LGPL-3.0-or-later"
+
+[[annotations]]
+path = ["cmake/BUILD.json.in", ".claude/skills/**/SKILL.md", ".claude/skills/**/references/*.md"]
 SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"
 SPDX-License-Identifier = "LGPL-3.0-or-later"
 
@@ -37,6 +43,11 @@ SPDX-License-Identifier = "Apache-2.0"
 path = ["third_party/main/intel-llvm/LICENSE.TXT"]
 SPDX-FileCopyrightText = "The LLVM project contributors"
 SPDX-License-Identifier = "Apache-2.0 WITH LLVM-exception"
+
+[[annotations]]
+path = ["third_party/main/quantscope/**"]
+SPDX-FileCopyrightText = "2026 1872183316 (https://github.com/1872183316/quantscope)"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
 
 [[annotations]]
 path = ["third_party/main/outfit/**"]

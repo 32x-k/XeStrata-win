@@ -19,4 +19,14 @@ bool native_router_enabled();
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream);
 /// n_tok rows at once (logits [n,512], ids/weights [n,10]); each row exactly as the single call.
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
+/// STRATA_ROUTE_RESIDENT (upstream 5df35dcb): swap non-resident tail-rank experts for resident ones within `margin`
+/// logits (see router.cpp).  `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident
+/// before, non-resident after.
+/// STRATA_ROUTE_PRIOR=lambda (upstream 2de9ae06, opt-in, changes the output): top-10 per token over `logits` (n_tok x 512)
+/// where a resident expert (`res_layer[e] >= 0`) gets `lambda` added to its logit for the SELECTION; the weights are the
+/// router's own probabilities (softmax over the 512 unbiased logits) renormalised over the 10 picked.
+void route_prior_top10(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
+                       int n_tok, void* stream);
+void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
+                           float margin, int rank_lo, int rank_hi, unsigned long long* stats, void* stream);
 }
