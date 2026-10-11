@@ -23,7 +23,7 @@ Setup recommends it only where it does not cost speed (below); any number you as
 | Option | What it does |
 | --- | --- |
 | `"parallel": N` / `--batch N` / `--slots N` (2..8) | up to N conversations decoded together; more requests wait for a free slot. Each slot gets its own session (GDN recurrence, QSA K/V and indexer, PLE history). |
-| `--batch-mtp` / `--no-batch-mtp` | on by default with `--mtp` (upstream 8cfb3fd7, c8c79b17; opt-in upstream): each slot also verifies one MTP proposal per window and moves two tokens when it holds. The draft layer's weights are shared; each slot's own state is about 50 MiB. Slots that do not fit a window take turns, so `"parallel"` above 8 works too. One GPU only, off with a layer split. `STRATA_BATCH_MTP=0` turns it off as well. |
+| `--batch-mtp` / `--no-batch-mtp` | on by default with `--mtp` (upstream 8cfb3fd7, c8c79b17; opt-in upstream): each slot also verifies one MTP proposal per window and moves two tokens when it holds. The draft layer's weights are shared; each slot's own state is about 50 MiB. Slots that do not fit a window take turns, so `"parallel"` above 8 works too. On a layer split the slots' drafters sit on the last GPU ([MULTIGPU](MULTIGPU.md#decoding-several-conversations)). `STRATA_BATCH_MTP=0` turns it off as well. |
 
 The engine never refuses a count it cannot run: it says so in its log and runs what it can.
 That is at most 8 slots (a window holds 8 rows), as many as fit in VRAM, or none (one request at a time) when not two fit.

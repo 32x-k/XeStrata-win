@@ -34,12 +34,15 @@ The engine's own options:
 | `--layer-split auto` | The split points are chosen from what this PC measures ([below](#choosing-the-split-points)). With one GPU visible there is no split. |
 | `--layer-split K[,K2..]` | The next GPU takes over at layer K (K from 2, rising). One GPU per split point. K is the **first layer** of each later GPU, not a count of layers per card (`24,36,42` for 4 GPUs). The config's `"layer_split"` may be a string or a JSON list (`[24, 36, 42]`); the server checks it before the start and says the format when it is wrong (upstream #644). |
 | `--split-device D[,D2..]` | The GPU for each split point, by engine number (from 1, see [GPU numbers](#gpu-numbers)) or PCI address. Without it, the GPUs that are not the processor's own graphics, in their order. |
-| `--batch-groups G` | With `--batch N`: the slots in G groups, each GPU on another group at once ([below](#decoding-several-conversations)). |
+| `--batch-groups G` / `auto` | With `--batch N`: the slots in G groups, each GPU on another group at once ([below](#decoding-several-conversations)). |
 | `--batch-cpu-split N0,N1` | Experimental, off by default ([below](#the-cpu-experts-per-stage-experimental)). |
 
 It needs:
 
 - `--serve` (the server passes it) and `--expert-profile`.
+
+With the experts' copy in RAM (`--resident-experts`), the experts of the slots the prefill path borrows from every GPU's cache are kept in that copy too, as many as fit in the RAM (upstream aea9dc3e, 51d55a9a).
+Those that do not fit are read from the files on every prefill.
 
 Conversation parking (`--conversation-cache-mib`, `--conversation-save`) copies every GPU's session out and back.
 A saved file is read only by an engine with the same split points; `--layer-split auto` can choose others from what it measures, and then the earlier files are not read.
@@ -61,9 +64,17 @@ The start-up log names the GPUs by these numbers, as `CUDA0`, `CUDA1` (upstream'
 - how fast the CPU reads the RAM (which sets the speed of the experts the CPU computes);
 - what each GPU holds: weights and sessions (both of its own layers only), the output head (the last GPU), and the room the prefill path keeps.
 
+- each GPU's link (how fast the host copies to it).
+
 From these it works out how many experts each GPU holds and, filling the caches in the order of `--expert-profile`,
 predicts the time of one window for every placement; the shortest wins.
+An expert no cache holds costs more on a GPU whose link is slower than 20 GB/s (upstream 0391e478).
 The log shows the choice (`layer split auto: K=...`); from there on it runs as if those split points were given.
+
+- When the choice gives a GPU only one or two layers, it chooses again among the placements that give every GPU three or more (upstream 1c6c82ef).
+  A GPU with few layers has a small cache, and the prefill chunk shrinks to it.
+- On GPUs of different speed or link, when another placement whose split points lie three or more layers away is predicted within 4%, the log names it (`NEAR TIE`, upstream 8bb250d8).
+  The prediction prices decode, not prefill, so it is worth a try; the choice stays.
 
 Environment variables change the model's assumptions:
 
@@ -72,6 +83,7 @@ Environment variables change the model's assumptions:
 | `STRATA_SPLIT_ROWS` | 3 | tokens computed per window (the average, with the MTP drafts) |
 | `STRATA_SPLIT_MASS_EXP` | 0.8 | a, where the expert of rank r by use takes a share (r+1)^-a of the routing |
 | `STRATA_SPLIT_CPU_GBPS` | measured | how fast the CPU reads the RAM (GB/s) |
+| `STRATA_SPLIT_NEAR_TIE_PCT` | 4 | the difference (%) within which another placement is named; 0 names none |
 
 `--vram-reserve-later-mib N` is the VRAM left free on the second and later GPUs (default: `--vram-reserve-mib`'s value; upstream 5c4105c0).
 The GPU that drives the monitors needs more headroom than one that drives none.
@@ -80,10 +92,21 @@ With the monitors on the last GPU, `--vram-reserve-mib 300 --vram-reserve-later-
 ## Decoding several conversations
 
 With `--batch N` ([BATCHING](BATCHING.md)) and a layer split, every GPU keeps the slots' sessions of its own layers.
-Without `--batch-groups G` a window passes the GPUs in turn, so each GPU waits while another computes.
+With one group a window passes the GPUs in turn, so each GPU waits while another computes.
 `--batch-groups G` puts the N slots in G groups: GPU 1 computes group 1 while GPU 0 computes group 2.
 G divides N.
 The fewer slots a group has, the fewer tokens share one read of the weights, so too many groups are slower (G=2 was the fastest in the measurements below).
+
+`--batch-groups auto` takes the most groups, at most one per GPU, that divide N (upstream 1bf6344c).
+On a layer split without `--batch-groups` the default is `auto` (upstream ca001df5; `--batch-groups 1` for one group).
+When `--batch-mtp` runs (on by default with `--mtp`) the default is one group instead (upstream cb6c549c), as grouped windows do not verify the MTP proposals.
+The engine logs the groups it chose and reports them as `INFO batch_groups`, and the server assigns the slots by them.
+A free slot before a busy one in its group is used first (upstream 2c7c02ab).
+
+`--batch-mtp` works on a layer split too (upstream 48f2c47d).
+The slots' drafters sit on the last GPU, and each slot's two rows pass every GPU.
+It is off when `--batch-groups` is given as 2 or more or `auto`, with two stages on one GPU, and with helper caches (`--expert-cache-device1..3`).
+`STRATA_SPLIT_MTP_BATCH=1` (opt-in, upstream a22a0e8c) builds the draft layer's prefill K/V in batches through the last GPU's prefill path, as one GPU does.
 
 ### The CPU experts per stage (experimental)
 

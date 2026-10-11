@@ -34,12 +34,15 @@ setup は最初の GPU を `"gpu_pci"` に、後の GPU を `"split_pci"` に PC
 | `--layer-split auto` | 分割点をこの PC で測った値から決めます（[下](#分割点の自動決定)）。GPU が 1 枚しか見えなければ分割しません。 |
 | `--layer-split K[,K2..]` | 層 K から次の GPU に渡します（K は 2 以上で、増えていく順）。分割点ごとに GPU が 1 枚要ります。K は 2 枚目以降の GPU の**最初の層**で、1 枚あたりの層の数ではありません（4 枚なら `24,36,42`）。設定ファイルの `"layer_split"` は文字列でも JSON のリスト（`[24, 36, 42]`）でもよく、サーバーが起動の前に確かめて、違っていれば書き方を示します（upstream #644）。 |
 | `--split-device D[,D2..]` | 分割点ごとに使う GPU。エンジンの番号（1 から、[GPU の番号](#gpu-の番号)）か PCI アドレスで書きます。省くと、CPU 内蔵でない GPU を番号の順に使います。 |
-| `--batch-groups G` | `--batch N` と一緒に使います。スロットを G 個の組に分け、GPU ごとに別の組を同時に計算します（[下](#まとめて-decode-するとき)）。 |
+| `--batch-groups G` / `auto` | `--batch N` と一緒に使います。スロットを G 個の組に分け、GPU ごとに別の組を同時に計算します（[下](#まとめて-decode-するとき)）。 |
 | `--batch-cpu-split N0,N1` | 実験的、既定は無効です（[下](#cpu-のエキスパートを段ごとに分ける実験的)）。 |
 
 必要なもの:
 
 - `--serve`（サーバーから起動するときは付いています）と `--expert-profile`。
+
+`--resident-experts` で RAM にエキスパートの写しを置くとき、prefill が各 GPU のキャッシュから借りるスロットのエキスパートも、RAM に入る分だけ写しに残します（upstream aea9dc3e、51d55a9a）。
+入りきらない分は、prefill のたびにファイルから読みます。
 
 会話の退避（`--conversation-cache-mib`、`--conversation-save`）は、各 GPU のセッションを写して戻します。
 保存したファイルは同じ分割点のエンジンだけが読みます。`--layer-split auto` は測った値で分割点が変わることがあり、そのときは前のファイルを読みません。
@@ -61,9 +64,17 @@ CPU 内蔵の GPU は、`--split-device`（setup では `--gpus`）で指定し�
 - CPU が RAM を読む速さ（CPU が計算するエキスパートの速さを決めます）。
 - 各 GPU が持つ重みとセッション（どちらも自分の層だけ）、出力ヘッド（最後の GPU）、prefill に残す分。
 
+- 各 GPU のリンク（ホストから GPU への転送の速さ）。
+
 ここから各 GPU に入るエキスパートの数を出し、`--expert-profile` のよく使われる順にキャッシュを埋めたときの、
 1 ウィンドウの時間を分割点ごとに見積もって、最も短いものを選びます。
+キャッシュに入らないエキスパートの費用は、その GPU のリンクが 20 GB/s より遅いほど大きく見積もります（upstream 0391e478）。
 選んだ分割点はログに出ます（`layer split auto: K=...`）。そのあとは、その分割点を指定したときと同じです。
+
+- 選んだ分割に 1〜2 層だけの GPU があれば、どの GPU も 3 層以上になる分割の中から選び直します（upstream 1c6c82ef）。
+  層の少ない GPU のキャッシュは小さく、prefill のチャンクがその大きさに縮むためです。
+- 速さかリンクの違う GPU の組で、分割点が 3 層以上離れた別の分割の見積もりが 4% 以内なら、その分割をログに出します（`NEAR TIE`、upstream 8bb250d8）。
+  見積もりは decode だけを見ていて prefill を見ていないので、試す価値があります。選ぶ分割は変えません。
 
 見積もりの前提は、環境変数で変えられます。
 
@@ -72,6 +83,7 @@ CPU 内蔵の GPU は、`--split-device`（setup では `--gpus`）で指定し�
 | `STRATA_SPLIT_ROWS` | 3 | 1 ウィンドウで計算するトークンの数（MTP の下書きを含む平均） |
 | `STRATA_SPLIT_MASS_EXP` | 0.8 | よく使われる順で r 番目のエキスパートが使われる割合を (r+1)^-a としたときの a |
 | `STRATA_SPLIT_CPU_GBPS` | 測った値 | CPU が RAM を読む速さ（GB/s） |
+| `STRATA_SPLIT_NEAR_TIE_PCT` | 4 | 別の分割をログに出す差（%）。0 で出しません |
 
 `--vram-reserve-later-mib N` は、2 枚目以降の GPU に残す VRAM です（既定は `--vram-reserve-mib` と同じ、upstream 5c4105c0）。
 モニターをつないだ GPU は、つないでいない GPU より多くの余裕が要ります。
@@ -80,10 +92,22 @@ CPU 内蔵の GPU は、`--split-device`（setup では `--gpus`）で指定し�
 ## まとめて decode するとき
 
 `--batch N`（[BATCHING](BATCHING.ja.md)）と層の分割を一緒に使うと、各 GPU は自分の層のスロットのセッションを持ちます。
-`--batch-groups G` なしでは、1 つのウィンドウが GPU を順に通るので、ある GPU が計算している間ほかの GPU は待ちます。
+組が 1 つなら、1 つのウィンドウが GPU を順に通るので、ある GPU が計算している間ほかの GPU は待ちます。
 `--batch-groups G` は N 個のスロットを G 個の組に分け、GPU 0 が組 2 を計算する間に GPU 1 が組 1 を計算します。
 G は N を割り切る数です。
 1 組のスロットが少ないほど、重みを 1 回読んで計算できるトークンが減るので、組を細かくしすぎると遅くなります（下の測定では G=2 が最も速い）。
+
+`--batch-groups auto` は、GPU ごとに多くて 1 組、N を割り切る最も多い組の数を選びます（upstream 1bf6344c）。
+層の分割で `--batch-groups` を渡さなければ、既定は `auto` です（upstream ca001df5。組を 1 つにするには `--batch-groups 1`）。
+ただし `--batch-mtp`（`--mtp` があれば既定で有効）が動くときは、既定は 1 組になります（upstream cb6c549c）。
+組に分けたウィンドウは MTP の下書きを確かめないためです。
+エンジンが選んだ組の数はログと `INFO batch_groups` に出て、サーバーはそれに合わせてスロットを割り当てます。
+組の中の使用中のスロットより前が空いていれば、そのスロットを先に使います（upstream 2c7c02ab）。
+
+`--batch-mtp` は層の分割でも動きます（upstream 48f2c47d）。
+スロットごとの下書き器は最後の GPU に置き、各スロットの 2 行が全部の GPU を通ります。
+コマンドラインで `--batch-groups` に 2 以上か `auto` を渡したとき、1 枚の GPU に 2 段を置くとき、補助のキャッシュ（`--expert-cache-device1..3`）があるときは無効です。
+`STRATA_SPLIT_MTP_BATCH=1`（opt-in、upstream a22a0e8c）は、下書き層の prefill の K/V を、1 枚のときと同じく最後の GPU の prefill の経路でまとめて作ります。
 
 ### CPU のエキスパートを段ごとに分ける（実験的）
 
