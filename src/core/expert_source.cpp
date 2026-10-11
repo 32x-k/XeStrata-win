@@ -532,7 +532,7 @@ bool FileExpertSource::open_gguf(std::string& err) {
     role_file_.assign((size_t) (3 * n_layers_), 0);
     for (int64_t l = 0; l < n_layers_; ++l) {
         const auto& fm = lay.fmt[(size_t) l];
-        const uint64_t per[3] = {fm.up_off, fm.up_off, lay.bytes[(size_t) l] - fm.down_off};
+        const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, lay.bytes[(size_t) l] - fm.down_off};
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * l + r);
             const std::string path = lay.gguf_file.size() > i && !lay.gguf_file[i].empty() ? dir + lay.gguf_file[i]
@@ -2312,14 +2312,16 @@ bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>
                     return false;
                 }
             }
-            if (t[0]->type != t[1]->type) {
-                err = "experts from the GGUF: block " + std::to_string(moe_blocks[(size_t) l]) +
-                      " has gate and up of different types";
+            // gate and up may differ in type (native_mixed_gu), as long as they read the same activation
+            NativeFmt& f = L.fmt[(size_t) l];
+            if (!native_fmt((int) t[0]->type, (int) t[2]->type, n_embd, n_ff, f, err, (int) t[1]->type)) {
+                std::string where = "experts from the GGUF: block ";
+                where += std::to_string(moe_blocks[(size_t) l]);
+                where += ": ";
+                err.insert(0, where);
                 return false;
             }
-            NativeFmt& f = L.fmt[(size_t) l];
-            if (!native_fmt((int) t[0]->type, (int) t[2]->type, n_embd, n_ff, f, err)) return false;
-            const uint64_t per[3] = {f.up_off, f.up_off, f.bytes - f.down_off};
+            const uint64_t per[3] = {f.up_off, f.up_row * (uint64_t) n_ff, f.bytes - f.down_off};
             for (int r = 0; r < 3; ++r) {
                 if (strata::tensor_payload_bytes(*t[r]) != per[r] * (uint64_t) n_expert) {
                     err = "experts from the GGUF: block " + std::to_string(moe_blocks[(size_t) l]) + "'s " + roles[r] +
@@ -2357,7 +2359,7 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
         for (int64_t l = 0; l < lay.n_layers; ++l) {
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
-            const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+            const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
             for (int r = 0; r < 3; ++r) {
                 const std::string path = expert_gguf_file(gguf, lay, l, r);
                 auto& f = files[path];
@@ -2426,7 +2428,7 @@ LoadStats load_experts_gguf(const std::string& gguf, const std::vector<uint8_t*>
             if (l >= lay.n_layers || bad) break;
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
-            const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+            const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
             const uint64_t at[3] = {0, fm.up_off, fm.down_off};
             for (int r = 0; r < 3; ++r) {
                 const std::string name = file_of(l, r);

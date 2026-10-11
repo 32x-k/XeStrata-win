@@ -56,8 +56,10 @@ bool native_row_to_float(int type, const void* src, float* dst, int64_t n) {
     return true;
 }
 
-bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
+bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err, int up_type) {
     init_once();
+    if (up_type < 0) up_type = gu_type;
+    const ggml_type_traits_cpu* tu = traits(up_type);
     const ggml_type_traits_cpu* tg = traits(gu_type);
     const ggml_type_traits_cpu* td = traits(d_type);
     if (tg == nullptr || tg->vec_dot == nullptr || td == nullptr || td->vec_dot == nullptr) {
@@ -70,7 +72,12 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
         err = "native experts: ggml-cpu cannot quantize an activation for this layer";
         return false;
     }
-    if (n_embd % ggml_blck_size((ggml_type) gu_type) || n_ff % ggml_blck_size((ggml_type) d_type) ||
+    if (tu == nullptr || tu->vec_dot == nullptr || tu->vec_dot_type != tg->vec_dot_type) {
+        err = "native experts: gate and up of types that read different activations";
+        return false;
+    }
+    if (n_embd % ggml_blck_size((ggml_type) gu_type) || n_embd % ggml_blck_size((ggml_type) up_type) ||
+        n_ff % ggml_blck_size((ggml_type) d_type) ||
         n_embd % ggml_blck_size(tg->vec_dot_type) || n_ff % ggml_blck_size(td->vec_dot_type)) {
         err = "native experts: expert geometry is not whole blocks";
         return false;
@@ -81,10 +88,12 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.d_act = (int) td->vec_dot_type;
     f.n_embd = n_embd;
     f.n_ff = n_ff;
+    f.up_type = up_type;
     f.gu_row = ggml_row_size((ggml_type) gu_type, n_embd);
+    f.up_row = ggml_row_size((ggml_type) up_type, n_embd);
     f.d_row = ggml_row_size((ggml_type) d_type, n_ff);
     f.up_off = f.gu_row * (size_t) n_ff;
-    f.down_off = 2 * f.up_off;
+    f.down_off = f.up_off + f.up_row * (size_t) n_ff;
     f.bytes = f.down_off + f.d_row * (size_t) n_embd;
     f.act_bytes = ggml_row_size(tg->vec_dot_type, n_embd);
     f.h_bytes = ggml_row_size(td->vec_dot_type, n_ff);
@@ -149,8 +158,35 @@ bool kq_on(int type) {
 }
 }  // namespace
 
+namespace {
+// out[t][r] = w_r . act[t] for rows [r0, r1) of one part of type `type` (the multi-token kernels where the type has one
+// and the group is large enough, else ggml-cpu's dot)
+void part_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
+               int r0, int r1, int mt_min) {
+    if (nt >= mt_min && kq_on(type)) {
+        if (type == (int) GGML_TYPE_Q8_0) q80_256_rows(w, row_bytes, n, act, nt, out, r0, r1);
+        else kq256_rows(type, w, row_bytes, n, act, nt, out, r0, r1);
+        return;
+    }
+    const ggml_vec_dot_t dot = traits(type)->vec_dot;
+    for (int r = r0; r < r1; ++r)
+        for (int t = 0; t < nt; ++t) dot(n, &out[t][r], 0, w + (size_t) r * row_bytes, 0, act[t], 0, 1);
+}
+}  // namespace
+
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (native_mixed_gu(f)) {   // gate and up of different types: each part on its own, then the SwiGLU
+        thread_local float ub[MAXT][kNativeMaxFF];
+        float* up[MAXT] = {};
+        for (int t = 0; t < nt; ++t) up[t] = ub[t];
+        const int mt = native_gu_mt_min(f.gu_type);
+        part_rows(f.gu_type, blob, f.gu_row, (int) f.n_embd, act, nt, ff, r0, r1, mt);
+        part_rows(f.up_type, blob + f.up_off, f.up_row, (int) f.n_embd, act, nt, up, r0, r1, mt);
+        for (int t = 0; t < nt; ++t)
+            for (int r = r0; r < r1; ++r) ff[t][r] = (ff[t][r] / (1.f + std::exp(-ff[t][r]))) * up[t][r];
+        return;
+    }
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the

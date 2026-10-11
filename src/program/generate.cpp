@@ -2576,6 +2576,10 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             const auto& f = lay.fmt[(size_t) l];
+            if (strata::kernels::cpu::native_mixed_gu(f)) {   // this engine's experts take one gate/up type
+                std::fprintf(stderr, "strata generate: layer %lld has gate and up of different types\n", (long long) l);
+                return 1;
+            }
             if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
                 std::fprintf(stderr, "strata generate: layer %lld's experts are %s/%s (ggml types %d/%d), which this "
                                      "engine has no GPU kernels for\n", (long long) l,
