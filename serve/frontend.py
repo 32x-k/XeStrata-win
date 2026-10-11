@@ -62,6 +62,9 @@ class ChatTemplate:
         self.template = env.from_string(self.source)
         # the Harmony format's templates (llm-jp-4.1, GPT-OSS): its replies are channels, read by HarmonyParser
         self.harmony = "<|channel|>" in self.source
+        # the tools as OpenAI sends them ({"type": "function", "function": {...}}) where the template unwraps them
+        # itself; otherwise their inner objects, as Qwen's templates read them
+        self.wrapped_tools = re.search(r"tool\.function\b|tool\[['\"]function['\"]\]", self.source) is not None
         self.caps = self._detect_caps()
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
@@ -84,6 +87,8 @@ class ChatTemplate:
                         m.pop("content", None)
                 adjusted.append(m)
             messages = adjusted
+        if tools and self.wrapped_tools:   # the template reads OpenAI's form, `tool.function` (llm-jp-4.1's)
+            tools = [t if "function" in t else {"type": "function", "function": t} for t in tools]
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
 
