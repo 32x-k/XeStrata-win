@@ -10,7 +10,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 エンジンが GPU に求めること、移植した計算と検証の一覧をまとめます。
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md)、ビルドの方法、setup の振る舞い、要るパッケージは [BUILD](BUILD.ja.md) にあります。
 
-XeStrata xe0.1.40.2.2 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版の数字は、取り込んだ upstream の版に合わせています。同じ upstream の版での 2 回目からのリリースは、末尾に番号を足します（xe0.1.40.2.1）。
+XeStrata xe0.1.42 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版の数字は、取り込んだ upstream の版に合わせています。同じ upstream の版での 2 回目からのリリースは、末尾に番号を足します（xe0.1.40.2.1）。
 移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.39（`6f32ec07`）までの変更の一部を取り込んでいます
 （[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
 同じ SYCL のコードを、intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib-llvm のビルド、[ビルド](BUILD.ja.md#ビルド)）。
@@ -27,6 +27,35 @@ CUDA のソースは upstream の Strata（`3ce2523`）に残っていて、Xe �
 `STRATA_VRAM_LIMIT_MIB` はエンジンから見える VRAM を、`STRATA_MAX_ALLOC_MIB` は想定する最大の確保量を制限し、
 `STRATA_NO_XMX=1` は XMX を使わない経路を選ばせます。
 CPU 内蔵のグラフィックス（開発機では UHD 770）は、確認用の 2 つ目の実機として使います。
+
+## Strata 0.1.42 の取り込み
+
+upstream の Strata 0.1.40.2 から 0.1.42（`61b3fb5d`）までの変更（0.1.41 を含む）を、Windows の実装を除いて Xe に移しています。
+取り込みは 1 件ずつ手で移しました。
+
+移したものの主なものは次のとおりです。
+
+- serve の decode で、検証の窓のどのトークンも順位 7 以下でしか選ばない外れのエキスパートを読まず計算もしない `STRATA_ROUTE_TAIL_SKIP=7`（既定）。upstream は HIP では切っていますが、XeStrata は 3 社の GPU で KL・タスクの確認・速さを測り直し、全機種で既定にしました。
+- 検証の窓で VRAM にあるエキスパートに寄せる `STRATA_ROUTE_RESIDENT` と `STRATA_ROUTE_PRIOR`（どちらも opt-in、答えが変わる）。
+- prefill の CPU 分担の拡張（ページ固定でない RAM のエキスパートも渡す）と、全エキスパートが VRAM にあるときやメモリが足りないときに既定で使わない規則。
+- `--aux-cpus`（opt-in）、PLE の `--ple-io direct` が遅いときの mmap への切り替え、stager の RAM 向けの読み方、埋め込みのバッファの使い回し。
+- メモリの見張り（cgroup の上限と `--memory-limit-mib`）、会話キャッシュの `--conversation-cache-min-tokens`、`--session-save-reclaim`、`logit_bias`、`strata --version`。
+- serve の変更（Prometheus の形のメトリクス、Monitor の会話キャッシュのカード、AMD の GPU の読み取り、サンプリングの欄の扱い、道具の一覧の順など）と、setup の変更（設定の書き方、`--gguf-dir`、回転ディスク、画面を出すカードの VRAM の予約、ハイブリッド CPU のワーカー数など）。
+- upstream の記録（`bench/results`）。
+
+upstream v0.1.42 と 3 社の GPU で比べました（generate は 5 つのモデルファイル、serve、通常使用）。
+B70 と RTX 4070 はすべての項目で upstream と同等以上です。RX 9060 XT は、generate の 32K の decode（36.9 対 44.6 tok/s）と serve の 1K の続きの待ち（526 対 478 ms）を除いて同等以上で、prefill はどの長さでも 2.2〜2.4 倍です。
+RX 9060 XT の decode は、同じ条件でも回ごとに 3 割ほど変わり（upstream も同じ）、原因はまだ分かっていません。
+
+最終の比較の途中で見つけて、XeStrata の側で直したもの:
+
+- RAM に置いたエキスパートの写しのページ固定が 1 回の確保で断られたら（B70 の Level Zero は 30 GiB まで）、エキスパートの境目で分けて確保する（`STRATA_PIN_PARTS=0` で前の形）。B70 の UD-Q4_K_XL の 32K で prefill +17%、decode +14%。
+- 外れたエキスパートの CPU と PCIe への分け方の測定をそろえる（[外れたエキスパートの CPU と PCIe への分け方](#外れたエキスパートの-cpu-と-pcie-への分け方)）。
+- serve の短い読み込みで、窓とまとめ読みの実測を読み始めの位置と一緒に覚え、近い位置の実測だけで選ぶ。試しのまとめ読みは 16K までの位置でだけ行う。RTX 4070 の 64K で、4 ターン目の続きが 505 ms から 304 ms に。
+
+速くするための経路は、B70・RTX 4070・RX 9060 XT のどれかで速くなり、ほかで遅くならないものを移しました。
+CPU 分担の auto の判定（upstream f2a3b946）は B70 と RTX 4070 の 1K で遅くなったので opt-in（`STRATA_PREFILL_CPU_GATE=1`）に、Q8_0 の逆量子化の 4 分け（upstream e910e410）はどちらでも速くならなかったので外しました。
+移していないのは、Windows の実装、upstream の `sycl/`（同じ B70 で速さを比べる相手）、HIP と CUDA の専用のカーネルの調整表、試せる機器のない GPU のための経路の一部（RDNA2 特有のもの）、複数 GPU の変更（別の作業でまとめて移します）です。
 
 ## Strata 0.1.40 の取り込み
 
@@ -307,6 +336,8 @@ llama.cpp と分かれるのは、どれも参照の上位 2 候補が僅差の�
   CPU がエキスパートを読むメモリの帯域。
 - **取り合い**: CPU と PCIe は同じメモリを読みます。2 つの速さの合計がメモリの帯域を超えるとき、両方がその比で遅くなるとみなします。
   B70 では、PCIe の 1 個が単独の 0.066 ms から 0.13 ms になる見積もりで、decode から逆算した値と合いました。
+  メモリの帯域は 100 ms おきに 5 回読んで最も速い値を使い、測る前にカーネルを先に用意するスレッドが終わるのを待ちます。generate では prompt を読む前に測ります。
+  1 回の読みは、ほかの仕事と重なると 3 倍まで低く出て、RX 9060 XT では起動ごとに外れを全部 CPU に回す判定になり、64K の decode が 21 tok/s に落ちていました（そろえた後は 38〜41 tok/s）。
 - **分け方**: 窓のグループごとに、GPU が VRAM 上のエキスパートを計算した後（読み込みを並べられる GPU では並べて）PCIe の分を読んで計算し、
   CPU が残りを計算するとして、遅い方が最も早く終わる数を選びます。
   CPU だけの場合より 10% 以上早く終わる見積もりのときだけ PCIe に回します。

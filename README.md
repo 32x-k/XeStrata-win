@@ -293,9 +293,9 @@ what has been checked in [docs/XE.md](docs/XE.md).
   are a reference, written again as XeStrata's code ([AGENTS.md](AGENTS.md#what-goes-in)).
   A pull request says which modes it was built in (free, contrib-llvm, contrib-icpx) and on which GPUs and CPUs it ran,
   and marks what was not checked `unverified`.
-- **Upstream integration:** the changes of Strata up to 0.1.40.2 are carried into Xe, except the Windows
+- **Upstream integration:** the changes of Strata up to 0.1.42 are carried into Xe, except the Windows
   implementation. Of the paths meant to be faster, those measured faster on the B70, the RTX 4070 or the RX 9060 XT
-  are carried ([docs/XE.md](docs/XE.md#integration-through-strata-0140)).
+  are carried ([docs/XE.md](docs/XE.md#integration-through-strata-0142)).
 - **The README and docs:** the Japanese ones (README.ja.md, docs/*.ja.md) are written first, and the English ones (README.md, docs/*.md) are their translations.
 
 ## Credits

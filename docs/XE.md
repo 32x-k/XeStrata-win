@@ -10,7 +10,7 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md); how to build it, what setup does and the packages it needs, in [BUILD](BUILD.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata xe0.1.40.2.2 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version follows the upstream version it has integrated, and another release on the same upstream version adds a number (xe0.1.40.2.1).
+XeStrata xe0.1.42 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version follows the upstream version it has integrated, and another release on the same upstream version adds a number (xe0.1.40.2.1).
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
@@ -26,6 +26,37 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_VRAM_LIMIT_MIB` caps the VRAM the engine sees, `STRATA_MAX_ALLOC_MIB` the largest allocation it assumes, and
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
+
+## Integration through Strata 0.1.42
+
+The changes of upstream Strata 0.1.40.2 to 0.1.42 (`61b3fb5d`, 0.1.41 included) are carried into Xe, except the Windows implementation.
+They were carried one by one by hand.
+
+The main ones:
+
+- On serve's decode, `STRATA_ROUTE_TAIL_SKIP=7` (default): a missed expert that every token of a verify window routes at rank 7 or lower is neither read nor computed. Upstream keeps it off on HIP; XeStrata measured the KL, a task check and the speed again on the three makers' GPUs and turned it on for all of them.
+- `STRATA_ROUTE_RESIDENT` and `STRATA_ROUTE_PRIOR`, which lean a verify window's routing towards the experts in VRAM (both opt-in; they change the answers).
+- The prefill CPU share's extension (experts in RAM that is not page-locked as well) and the rule that leaves it off by default when every expert is in VRAM or memory is short.
+- `--aux-cpus` (opt-in), `--ple-io direct` falling back to mmap when it measures slow, the stager's RAM profile, the embedding buffer's reuse.
+- The memory guard (the cgroup limit and `--memory-limit-mib`), `--conversation-cache-min-tokens`, `--session-save-reclaim`, `logit_bias`, `strata --version`.
+- serve's changes (metrics in Prometheus' format, the Monitor's conversation-cache card, AMD GPU readings, the sampling fields, the tool list's order and more) and setup's (how the config is written, `--gguf-dir`, rotational disks, a VRAM reserve on a card that also drives a display, the worker count on hybrid CPUs and more).
+- Upstream's records (`bench/results`).
+
+Measured against upstream v0.1.42 on the three makers' GPUs (generate with five model files, serve, everyday use):
+the B70 and the RTX 4070 match or beat upstream in every cell; the RX 9060 XT does in every cell but generate's decode at
+32K (36.9 against 44.6 tok/s) and serve's wait for a follow-up at 1K (526 against 478 ms), and reads prompts 2.2 to 2.4
+times as fast at every length. Its decode moves by about a third from run to run in the same setting (upstream's too),
+for reasons not yet known.
+
+Found during the final comparison and fixed on XeStrata's side:
+
+- When page-locking the RAM copy of the experts is refused as one allocation (the B70's Level Zero takes 30 GiB at most), it is taken in parts cut between experts (`STRATA_PIN_PARTS=0`: as before). UD-Q4_K_XL at 32K on the B70: prefill +17%, decode +14%.
+- The measurement behind the CPU/PCIe split of the missed experts holds still from start to start ([Splitting the missed experts between the CPU and PCIe](#splitting-the-missed-experts-between-the-cpu-and-pcie)).
+- serve's short reads keep each path's readings with where the read started and choose from the readings near it; a batched read is tried only up to 16K. On the RTX 4070 at 64K the fourth turn's follow-up went from 505 to 304 ms.
+
+Of the paths meant to be faster, those faster on the B70, the RTX 4070 or the RX 9060 XT and slower on none are carried.
+The CPU share's auto gate (upstream f2a3b946) slowed 1K prompts on the B70 and the RTX 4070, so it is opt-in (`STRATA_PREFILL_CPU_GATE=1`); the Q8_0 dequantization four threads a block (upstream e910e410) was faster on neither, so it is left out.
+Not carried: the Windows implementation, upstream's `sycl/` (measured against on the same B70), the HIP and CUDA kernels' tuning tables, some paths for GPUs there is no machine for (those for RDNA2 only), and the multi-GPU changes (carried together in work of their own).
 
 ## Integration through Strata 0.1.40
 
@@ -299,6 +330,8 @@ Before, it was a share from the link's speed alone (0.55 from 20 GB/s, below tha
   the window's expert kernel computing one from VRAM, and the memory's rate as the CPU reads experts.
 - **Sharing the memory**: the CPU and PCIe read the same memory; when their rates together pass the memory's, both are taken as slowed by that factor.
   On the B70 that gives 0.13 ms an expert over PCIe (0.066 alone), as the decode's waits work out.
+  The memory's rate is the fastest of five readings 100 ms apart, taken once the kernels' preload thread is done, and in generate before the prompt is read.
+  A single reading beside other work came out up to 3x low, and on the RX 9060 XT some starts then gave the CPU every miss, the 64K decode at 21 tok/s (38-41 once steady).
 - **The split**: for each group of a window, the GPU computes its VRAM hits, then (beside them where the window's fetch branch runs) reads and computes the PCIe experts,
   and the CPU computes the rest; the number read over PCIe makes the later side earliest.
   Experts go over PCIe only when that is at least 10% earlier than the CPU taking them all.
