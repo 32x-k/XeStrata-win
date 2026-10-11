@@ -10,6 +10,7 @@
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
+#include "q8_1_finite.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_qsa
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -30,11 +31,21 @@ inline float warp_sum(const sycl::sub_group& sg, float value) {
     for (int offset = 16; offset; offset >>= 1) value += sycl::permute_group_by_xor(sg, value, offset);
     return value;
 }
+inline float warp_max(const sycl::sub_group& sg, float value) {
+    for (int offset = 16; offset; offset >>= 1) value = sycl::fmax(value, sycl::permute_group_by_xor(sg, value, offset));
+    return value;
+}
+
+// native_mmvq.cpp's activation block: the scale and the sum as fp16, then the 32 values
+struct Q81 { sycl::half2 ds; int8_t qs[32]; };
+static_assert(sizeof(Q81) == 36, "a q8_1 block is 36 bytes");
 
 // gamma: `groups` rows of n_cols, row r takes gamma row r % groups (1: one gamma for every row)
+// q8 (n_cols a multiple of 32): the output also as q8_1 blocks, each the 32 columns one sub-group writes in a pass,
+// with native_quantize_q8_1's reductions over the stored values, so the blocks are that kernel's bit for bit
 template <int BlockSize>
 void norm(sycl::queue& q, const float* input, const float* gamma_all, float* output, int n_cols, int n_rows,
-          float epsilon, int groups = 1) {
+          float epsilon, int groups = 1, void* q8 = nullptr) {
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sums(sycl::range<1>(32), h);
         h.parallel_for(sycl::nd_range<1>(std::size_t(n_rows) * BlockSize, BlockSize),
@@ -59,7 +70,18 @@ void norm(sycl::queue& q, const float* input, const float* gamma_all, float* out
             partial = warp_sum(sg, partial);
             const float mean = partial / n_cols;
             const float scale = sycl::rsqrt(mean + epsilon);
-            for (std::size_t col = tid; col < std::size_t(n_cols); col += BlockSize) out[col] = scale * in[col] * gamma[col];
+            Q81* blocks = static_cast<Q81*>(q8);
+            for (std::size_t col = tid; col < std::size_t(n_cols); col += BlockSize) {
+                const float v = scale * in[col] * gamma[col];
+                out[col] = v;
+                if (blocks == nullptr) continue;
+                const float amax = warp_max(sg, sycl::fabs(v));
+                const float sum = warp_sum(sg, v);
+                const float d = xe::q8_1_finite(amax / 127.0f);
+                const std::size_t i = row_offset + col;
+                blocks[i / 32].qs[i % 32] = xe::q8_1_quant(v, d, amax);
+                if (lane == 0) blocks[i / 32].ds = sycl::half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+            }
         });
     });
 }
@@ -107,6 +129,20 @@ void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float*
     if (wg == 1024) norm<1024>(q, input, gamma, output, n_cols, n_rows, epsilon);
     else if (wg == 512) norm<512>(q, input, gamma, output, n_cols, n_rows, epsilon);
     else norm<256>(q, input, gamma, output, n_cols, n_rows, epsilon);
+}
+
+void native_qsa_rms_norm_weighted_q8_1(const float* input, const float* gamma, float* output, void* x_q8_1,
+                                       int n_cols, int n_rows, float epsilon, void* stream) {
+    const auto count = elements(n_cols, n_rows);
+    if (!std::isfinite(epsilon) || epsilon < 0.0f)
+        throw std::invalid_argument("native QSA requires finite nonnegative epsilon");
+    if (n_cols % 32 != 0 || x_q8_1 == nullptr) throw std::invalid_argument("the q8_1 output needs 32 | n_cols");
+    buffers(input, count * 4, gamma, std::size_t(n_cols) * 4, output, stream);
+    auto& q = queue_for(stream);
+    const int wg = n_cols < 1024 ? 256 : xe::work_group_upto_1024(q);
+    if (wg == 1024) norm<1024>(q, input, gamma, output, n_cols, n_rows, epsilon, 1, x_q8_1);
+    else if (wg == 512) norm<512>(q, input, gamma, output, n_cols, n_rows, epsilon, 1, x_q8_1);
+    else norm<256>(q, input, gamma, output, n_cols, n_rows, epsilon, 1, x_q8_1);
 }
 
 void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float* output,

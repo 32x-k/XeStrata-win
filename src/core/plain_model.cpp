@@ -667,11 +667,11 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) 
     uint32_t ring = 0;
     for (int64_t l = 0; l < s.n_layer; ++l) {
         const Block& b = blocks_[(size_t) l];
-        k::native_qsa_rms_norm_weighted(x_, b.attn_norm, hn_, (int) N, T, eps, cs);
+        // the norm writes the q8_1 rows the projections read as well (one launch; after nextsycl's Qwen3.5 norm)
+        k::native_qsa_rms_norm_weighted_q8_1(x_, b.attn_norm, hn_, xq_, (int) N, T, eps, cs);
         if (b.recurrent) {
             float* state = gdn_state_[(size_t) b.gdn];
             float* hist = gdn_conv_[(size_t) b.gdn];
-            k::native_quantize_q8_1(hn_, xq_, (int) N, T, cs);
             proj(b.qkv, hn_, qkv_, T, false);
             proj(b.z, hn_, z_, T, false);
             proj(b.alpha, hn_, alpha_, T, false);
@@ -691,7 +691,6 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) 
             proj(b.ssm_out, y_, mix_, T, true);
         } else {
             const int64_t a = b.attn;
-            k::native_quantize_q8_1(hn_, xq_, (int) N, T, cs);
             proj(b.q, hn_, qfull_, T, false);
             proj(b.k, hn_, kraw_, T, false);
             proj(b.v, hn_, vcur_, T, false);
@@ -718,19 +717,20 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) 
         k::add_inplace(x_, mix_, (int64_t) T * N, cs);
 
         // the MoE: route, publish, the shared expert while the host serves, then the experts and the combine
-        k::native_qsa_rms_norm_weighted(x_, b.post_norm, hn_, (int) N, T, eps, cs);
+        const bool sh_q8 = has_shared_ && b.sh_gate.type != kBF16 && b.sh_down.type != kBF16;
+        if (sh_q8) k::native_qsa_rms_norm_weighted_q8_1(x_, b.post_norm, hn_, xq_, (int) N, T, eps, cs);
+        else k::native_qsa_rms_norm_weighted(x_, b.post_norm, hn_, (int) N, T, eps, cs);
         k::f32_gemv_fp32_mmvf_multi(hn_, N, b.router, rlog_, E, N, E, T, cs);
         k::router_top10(rlog_, T, (int) E, (int) K, ids_, w_, cs);
         ++ring;
         win_.publish(ring, 0, 0, T, hn_, ids_, w_, cs);
-        if (has_shared_ && (b.sh_gate.type == kBF16 || b.sh_down.type == kBF16)) {   // in FP32 between the products
+        if (has_shared_ && !sh_q8) {   // in FP32 between the products
             proj(b.sh_gate, hn_, sh_gate_, T, true);
             proj(b.sh_up, hn_, sh_up_, T, false);
             k::native_swiglu_f32(sh_gate_, sh_up_, sh_gate_, (int) FS, T, cs);
             proj(b.sh_down, sh_gate_, shared_, T, true);
             k::f32_gemv_fp32_mmvf_multi(hn_, N, b.sh_gate_inp, sh_g_, 1, N, 1, T, cs);
         } else if (has_shared_) {
-            k::native_quantize_q8_1(hn_, xq_, (int) N, T, cs);
             if (!k::native_mmvq_pair(b.sh_gate.type, b.sh_gate.data, b.sh_up.data, xq_, sh_gate_, sh_up_, (int) N,
                                      (int) FS, T, cs)) {
                 k::native_mmvq(b.sh_gate.type, b.sh_gate.data, xq_, sh_gate_, (int) N, (int) FS, T, cs);
