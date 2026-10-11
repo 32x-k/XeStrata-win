@@ -83,6 +83,7 @@
 #include "strata/core/gpu.hpp"
 
 #include <array>
+#include <exception>
 #include <chrono>
 #include <algorithm>
 #include <memory>
@@ -2073,11 +2074,42 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     return el > 0 ? (double) done / el : -1.0;
 }
 
+// Issue #10: an exception that leaves the engine (a kernel launch the GPU runtime refused, a GPU that fell off the
+// bus) ended it through std::terminate with only the exception's text.  This handler reports it instead: one stderr
+// line and one ERR line on stdout, which the server keeps as the engine's last words (death_note) and shows in the web
+// app, with what the engine was doing, the SYCL and Unified Runtime codes, the VRAM free and whether the GPU still
+// answers.  A handler rather than a catch in main: an uncaught exception reaches it without unwinding the stack, whose
+// destructors would wait on a GPU that may be gone, and it covers the engine's own threads too.  The engine then ends;
+// the server starts it again for the next request.
+[[noreturn]] void report_and_end() {
+    std::string report = "an unknown exception";
+    if (const std::exception_ptr ep = std::current_exception()) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            report = strata::gpu::failure_report(e);
+        } catch (...) {
+        }
+    } else {
+        report = "std::terminate without an exception";
+    }
+    const strata::core::Progress& p = strata::core::progress();
+    std::fprintf(stderr, "strata generate: FATAL while %s (detail %lld, prompt chunk at %lld): %s\n", p.where.load(),
+                 (long long) p.detail.load(), (long long) p.chunk.load(), report.c_str());
+    std::printf("ERR the engine stopped while %s (detail %lld, prompt chunk at %lld): %s\n", p.where.load(),
+                (long long) p.detail.load(), (long long) p.chunk.load(), report.c_str());
+    std::fflush(stdout);
+    std::fflush(stderr);
+    strata::core::release_gpu_waits(stderr);
+    std::_Exit(3);
+}
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::set_terminate(report_and_end);   // issue #10: an exception that leaves the engine is reported, not lost
     // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is
     // touched (upstream b7dd070d)
     for (int i = 1; i < argc && i < 3; ++i) {
@@ -3277,6 +3309,7 @@ int main(int argc, char** argv) {
                      (unsigned long long) (total_b >> 20));
         return 1;
     }
+    mem_mark("the GPU context and the weight arena");
     auto load_t0 = std::chrono::steady_clock::now();
     auto load_s = [&] {
         const auto t = std::chrono::steady_clock::now();
@@ -3292,6 +3325,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "strata generate: %llu MiB of weights loaded from %s in %.1f s (%zu canonical tensors "
                          "skipped: served natively)\n",
                  (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), load_s(), skip.size());
+    mem_mark("the pack weights");
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
@@ -3495,6 +3529,22 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: zeroing the session state failed\n");
         return 1;
     }
+    // --serve: the checkpoint at a chat's turn boundary, which the next request of the chat resumes from, goes into
+    // this pinned buffer as one batch of copies, and into its RAM vectors after the reply: the copies one by one into
+    // pageable memory (~118 MB of running state) took 48-58 ms of every follow-up's wait on the RTX 4070's PCIe 4.0 x4.
+    // Pinned host memory, not VRAM: 118 MB of the expert cache is 68 of the RTX 4070's 3,419 slots, which costs its
+    // decode more.  STRATA_CKPT_STAGE=0: the copies to RAM as before.
+    void* ckpt_staging = nullptr;
+    strata::gpu::Stream ckpt_stream = nullptr;
+    if (o.serve && o.prompt_cache > 0 && split_devs.empty()) {
+        const char* v = std::getenv("STRATA_CKPT_STAGE");
+        const size_t bytes = strata::core::conversation_checkpoint_staged_bytes(ss, g);
+        if ((v == nullptr || std::strtol(v, nullptr, 10) != 0) && bytes > 0) {
+            ckpt_stream = strata::gpu::stream_create();
+            if (ckpt_stream == nullptr || !strata::gpu::alloc_host(&ckpt_staging, bytes))
+                ckpt_staging = nullptr;   // the copies to RAM as without it
+        }
+    }
     if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1)
         std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
                              "%.2f GiB of pinned RAM\n", (long long) ss.qsa_states[ss.qsa_primary()].n_slots * 4,
@@ -3692,6 +3742,7 @@ int main(int argc, char** argv) {
                      "strata generate: PLE OFF by explicit --no-ple diagnostic request.\n"
                      "  The tokens below are NOT this model's; this is only useful for A/B measurement.\n");
     }
+    mem_mark("the session (KV, GDN state, PLE history)");
 
     float* d_parts = nullptr;
     if (!strata::gpu::alloc_device(&d_parts, (size_t) K * g.n_embd * 4) ||
@@ -3944,6 +3995,7 @@ int main(int argc, char** argv) {
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
     std::vector<float> logits((size_t) n_vocab);
+    mem_mark("the native head");
     float* d_logits = nullptr;
     if (!strata::gpu::alloc_device(&d_logits, (size_t) n_vocab * 4)) {
         std::fprintf(stderr, "strata generate: the logits buffer failed%s\n", vram_free_note().c_str());
@@ -3985,6 +4037,29 @@ int main(int argc, char** argv) {
     strata::core::ArenaExpertSource arena_src;
     strata::core::ExpertSource* srcp = nullptr;
     std::vector<uint8_t> fill_tmp;   // blob_to_copy's buffer for a transient source
+    // Issue #10: less RAM available than the whole expert arena.  The arena then swaps while it loads, and on Level
+    // Zero the PCIe share later moves it into host USM (make_kernel_readable): GPU driver memory that the OOM killer
+    // cannot reclaim, so the GPU VM's rebind swapped it back in and the OOM killer emptied the host (#10, Case 1:
+    // 33 GiB of IQ2_XS in 28 GiB free).  Such a start runs as --resident-experts would: the experts the GPU's cache
+    // does not hold are copied into RAM as far as it has room, the rest read from the model files.
+    // STRATA_ARENA_LOW_RAM=keep: the whole arena anyway (the warning below only).
+    if (!o.mmap_experts && o.shared_expert_arena.empty() &&
+        !(native_pack && !std::ifstream(o.pack + "/experts.bin", std::ios::binary) && o.native_preset.empty())) {
+        const char* keep = std::getenv("STRATA_ARENA_LOW_RAM");
+        strata::core::detail::HostMemory hm;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        const uint64_t need = lay.total + lay.max_blob;
+        if (!(keep != nullptr && std::strcmp(keep, "keep") == 0) && strata::core::detail::host_available_memory(hm) &&
+            hm.available < need && hm.cgroup_limit >= need) {
+            std::fprintf(stderr, "strata generate: the expert arena needs %.2f GiB of RAM but %.2f GiB is available: "
+                                 "starting as with --resident-experts (the experts the GPU does not hold in RAM as far "
+                                 "as it has room, the rest from the model files; STRATA_ARENA_LOW_RAM=keep loads the "
+                                 "whole arena anyway)\n",
+                         (double) need / 1073741824.0, (double) hm.available / 1073741824.0);
+            o.mmap_experts = o.resident_pin = true;
+            o.resident_gib = -1;
+        }
+    }
     if (o.mmap_experts) {
         // FileExpertSource maps the pack's experts.bin: a canonical pack has it; a native (IQ) pack has it when
         // built with `tools/iq_pack.py --experts-bin` (per-layer blob sizes, upstream de159b5).  The low-RAM mode:
@@ -5531,8 +5606,13 @@ int main(int argc, char** argv) {
     //
     // and each generated token is written to stdout as `T <id>` as soon as its verify window is done, followed by
     //
-    //     DONE <generated> <prompt_tokens> <prompt_ms> <decode_ms> <stop|length|cancel> <drafts accepted>
+    //     DONE <generated> <prompt_tokens> <prompt_ms> <decode_ms> <stop|length|cancel|nonfinite> <drafts accepted>
     //          <drafts offered> <prompt tokens reused> ... <prompt tokens read>   (see the DONE line below; #471)
+    //
+    // `nonfinite` (#879, upstream f332a855): a window's head logits held a NaN or an infinity
+    // (Verifier::nonfinite_row).  None of that window's tokens was written; every state that may carry the poison (the
+    // live session, the checkpoints, the parked conversations, the idle batch slots) is dropped at the next request's
+    // start, which reads its prompt from token 0.  A batch slot ends the same way: `BDONE <slot> <n> nonfinite`.
     //
     // Before that, `RESUME <n>` (n prompt tokens are not read again), `PP <position> <prompt_tokens> <ms> <tok/s>`
     // after every prompt chunk, and `REUSED <n>` once the prompt is read.  (`ERR <message>` instead when a request
@@ -6130,6 +6210,8 @@ int main(int argc, char** argv) {
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
+        // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
+        bool nan_flush = false;
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
@@ -6414,6 +6496,20 @@ int main(int argc, char** argv) {
         // mid-read reports as read, instead of the whole prompt
         int64_t pp_reached = 0;
         Clock::time_point pp_t0 = Clock::now();
+        // #879: this request met a window whose head logits were not all finite (nonfinite_hit): it ends with
+        // DONE ... nonfinite, emitting none of that window's tokens
+        bool nf_hit = false;
+        auto nonfinite_hit = [&](const strata::core::Verifier& v, const char* what) -> bool {
+            const int row = v.nonfinite_row();
+            if (row < 0) return false;
+            std::fprintf(stderr, "strata serve: non-finite logits (#879) in a %s window at position %lld (row %d): its "
+                                 "tokens are not emitted, the request ends (DONE nonfinite) and the next request reads "
+                                 "its prompt from token 0\n", what, (long long) v.nonfinite_pos(), row);
+            std::fflush(stderr);
+            nf_hit = true;
+            nan_flush = true;
+            return true;
+        };
         auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
             std::vector<ImgKey> v;
             for (const ImgKey& k : all) if (k.start < L) v.push_back(k);
@@ -6428,7 +6524,48 @@ int main(int argc, char** argv) {
         std::vector<int64_t> part_next(stages.size() + 1, INT64_MAX);
         // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed.  `parts`: the stages'
         // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L)
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
+        // A staged checkpoint (see ckpt_staging): its tokens, and whether it is the tail kind; -1 when none is staged.
+        ConvCheckpoint ckpt_staged;
+        int64_t ckpt_staged_len = -1;
+        bool ckpt_staged_tail = false;
+        // `c` into the checkpoints: the tail kind replaces the previous one, and the least recently used leaves past
+        // --prompt-cache
+        auto keep_checkpoint = [&](ConvCheckpoint&& c, int64_t L, bool as_tail) {
+            c.used = ++check_clock;
+            if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
+                const int64_t old_tail = tail_ckpt_len;
+                checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& k) {
+                                 return old_tail >= 0 && (int64_t) k.ids.size() == old_tail;
+                             }), checks.end());
+                tail_ckpt_len = L;
+            } else if (L == tail_ckpt_len) {
+                tail_ckpt_len = -1;   // the flagged tail was dropped and a normal checkpoint takes its length
+            }
+            checks.push_back(std::move(c));
+            while ((int) checks.size() > o.prompt_cache) {
+                // the tail checkpoint serves only a branch of the last request: it leaves before a periodic one
+                const size_t n = checks.size();
+                std::vector<uint64_t> stamps(n);
+                std::unique_ptr<bool[]> tail_flags = std::make_unique<bool[]>(n);
+                for (size_t i = 0; i < n; ++i) {
+                    stamps[i] = checks[i].used;
+                    tail_flags[i] = tail_ckpt_len >= 0 && (int64_t) checks[i].ids.size() == tail_ckpt_len;
+                }
+                // the pin=N prefix is never the victim (flags only when one is pinned: nothing changes without)
+                std::unique_ptr<bool[]> pin_flags;
+                for (const ConvCheckpoint& k : checks)
+                    if (k.pinned) {
+                        pin_flags = std::make_unique<bool[]>(n);
+                        for (size_t i = 0; i < n; ++i) pin_flags[i] = checks[i].pinned;
+                        break;
+                    }
+                const size_t victim = strata::program::conv_cache::eviction_victim(
+                    stamps.data(), n, o.prompt_cache, tail_flags.get(), pin_flags.get());
+                checks.erase(checks.begin() + (std::ptrdiff_t) victim);
+            }
+        };
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
+                                 bool stage = false) -> bool {
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) {
@@ -6447,6 +6584,17 @@ int main(int argc, char** argv) {
                 c.dead = std::move((*parts)[0].dead);
                 c.block_pos = std::move((*parts)[0].block_pos);
                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
+            } else if (stage && ckpt_staging != nullptr && stages.empty() && ckpt_staged_len < 0) {
+                std::string e;
+                if (!strata::gpu::device_sync() || !strata::core::conversation_checkpoint_stage(ckpt_staging, ckpt_stream, ss, g,
+                                                                                             (size_t) L, e)) {
+                    std::fprintf(stderr, "strata serve: checkpoint stage: %s\n", e.c_str());
+                    return false;
+                }
+                ckpt_staged = std::move(c);
+                ckpt_staged_len = L;
+                ckpt_staged_tail = as_tail;
+                return true;
             } else {
                 if (!strata::gpu::device_sync() || !checkpoint_save(c, ss, g)) return false;
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
@@ -6457,41 +6605,19 @@ int main(int argc, char** argv) {
                     c.stage_parts.push_back(std::move(part));
                 }
             }
-            c.used = ++check_clock;
-            if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
-                const int64_t old_tail = tail_ckpt_len;
-                checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& k) {
-                                 return old_tail >= 0 && (int64_t) k.ids.size() == old_tail;
-                             }), checks.end());
-                tail_ckpt_len = L;
-            } else if (L == tail_ckpt_len) {
-                tail_ckpt_len = -1;   // the flagged tail was dropped and a normal checkpoint takes its length
-            }
-            checks.push_back(std::move(c));
-            while ((int) checks.size() > o.prompt_cache) {
-                std::vector<uint64_t> stamps;
-                std::vector<char> is_tail;
-                stamps.reserve(checks.size());
-                for (const ConvCheckpoint& k : checks) {
-                    stamps.push_back(k.used);
-                    is_tail.push_back((char) (tail_ckpt_len >= 0 && (int64_t) k.ids.size() == tail_ckpt_len));
-                }
-                // the tail checkpoint serves only a branch of the last request: it leaves before a periodic one
-                std::unique_ptr<bool[]> tail_flags(new bool[is_tail.size()]);
-                for (size_t i = 0; i < is_tail.size(); ++i) tail_flags[i] = is_tail[i] != 0;
-                // the pin=N prefix is never the victim (flags only when one is pinned: nothing changes without)
-                std::unique_ptr<bool[]> pin_flags;
-                for (const ConvCheckpoint& k : checks)
-                    if (k.pinned) {
-                        pin_flags.reset(new bool[checks.size()]);
-                        for (size_t i = 0; i < checks.size(); ++i) pin_flags[i] = checks[i].pinned;
-                        break;
-                    }
-                const size_t victim = strata::program::conv_cache::eviction_victim(
-                    stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get(), pin_flags.get());
-                checks.erase(checks.begin() + (std::ptrdiff_t) victim);
-            }
+            keep_checkpoint(std::move(c), L, as_tail);
             return true;
+        };
+        // the staged checkpoint into RAM and the checkpoints (after the reply that it did not delay)
+        auto finish_staged = [&]() -> bool {
+            if (ckpt_staged_len < 0) return true;
+            std::string e;
+            const bool ok = strata::core::conversation_checkpoint_unstage(ckpt_staged, ckpt_staging, ss, g, e);
+            if (ok) keep_checkpoint(std::move(ckpt_staged), ckpt_staged_len, ckpt_staged_tail);
+            else std::fprintf(stderr, "strata serve: checkpoint unstage: %s\n", e.c_str());
+            ckpt_staged = ConvCheckpoint{};
+            ckpt_staged_len = -1;
+            return ok;
         };
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
@@ -6562,7 +6688,7 @@ int main(int argc, char** argv) {
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
         strata::core::PcieSplitTimes pcie_split;   // the measured split, kept for the requests that set no share
         setup_pcie_split(drive.d, g.n_layers, o, pcie_given, !split_devs.empty(), ver.fetch_branch(), pcie_split);
-        const strata::core::PcieSplitTimes* const pcie_split_ptr = drive.d.pcie_split;
+        strata::core::PcieSplitTimes* const pcie_split_ptr = drive.d.pcie_split;
         {   // STRATA_ROUTE_TAIL_SKIP: ON BY DEFAULT (rank 7, upstream b4e3407b; measured on XeStrata's GPUs, docs/DETAILS.md): a
             // missed expert that every token of a verify window routes at rank 7 or lower is neither copied nor computed
             // (answers differ slightly; =0 restores the bytes of a build without it).  No default and no line when every
@@ -6574,7 +6700,22 @@ int main(int argc, char** argv) {
                 std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
             const bool helper = std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
                                             [](int n) { return n > 0; });
-            if (tse == nullptr && !all_experts_resident && o.batch <= 0 && !helper) strata::core::set_tail_skip_rank(7);
+            // #1884 (upstream 6ab541f6): with nearly every expert in the GPU cache the few misses are cheap and the skip
+            // costs more draft acceptance than it saves (upstream: V100 32 GB, Coder IQ1_M, 94.8% cached, -1..2% decode).
+            // STRATA_TAIL_SKIP_MAX_CACHED=<percent> (default 90) moves the line; 101 = never.
+            size_t cached_experts = 0;
+            for (int32_t r : host_res) cached_experts += r >= 0 ? 1 : 0;
+            const char* mcs = std::getenv("STRATA_TAIL_SKIP_MAX_CACHED");
+            const double max_cached = mcs != nullptr && mcs[0] != 0 ? std::strtod(mcs, nullptr) / 100.0 : 0.90;
+            const bool nearly_all_cached = !host_res.empty() && !all_experts_resident &&
+                                           (double) cached_experts >= max_cached * (double) host_res.size();
+            if (tse == nullptr && nearly_all_cached && o.batch <= 0 && !helper)
+                std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP is off by default: %.1f%% of the experts are in "
+                                     "the GPU cache, so few are missed and skipping them costs more draft acceptance than "
+                                     "it saves; STRATA_ROUTE_TAIL_SKIP=7 turns it on\n",
+                             100.0 * (double) cached_experts / (double) host_res.size());
+            if (tse == nullptr && !all_experts_resident && !nearly_all_cached && o.batch <= 0 && !helper)
+                strata::core::set_tail_skip_rank(7);
             if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
                 std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert that every token of a "
                                      "verify window routes at rank %d or lower is skipped (answers differ slightly); "
@@ -7364,6 +7505,9 @@ int main(int argc, char** argv) {
             // a prompt read that gave way to a waiting request (BYIELD): `ids` is the part read so far, and the same
             // request continues from it (the read goes on with the same chunks; `from0`: it had started at token 0)
             bool partial = false, partial_from0 = false;
+            // #879: it was running when non-finite logits dropped the cached state; its state may have started from
+            // that state (a checkpoint, a parked conversation), so it is not kept as a cache when it ends
+            bool tainted = false;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
         // timing of the batch windows since the slots were last all idle (one stderr line then)
@@ -7522,6 +7666,20 @@ int main(int argc, char** argv) {
             for (int a = 0; a < A; ++a) {
                 const int b = active[a];
                 BSlot& sl = bs[(size_t) b];
+                bool nf = false;   // #879: a row of this slot held non-finite logits: the slot ends, nothing emitted
+                for (int r = first[a]; r < first[a] + (batch_mtp ? 2 : 1); ++r) nf = nf || ver.nonfinite_in(r);
+                if (nf) {
+                    std::fprintf(stderr, "strata batch: non-finite logits (#879) in slot %d at position %lld: it ends "
+                                         "(BDONE nonfinite) and the next request reads its prompt from token 0\n", b,
+                                 (long long) pos[first[a]]);
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                    std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
+                    sl.active = false;
+                    sl.cached = false;
+                    sl.checks.clear();
+                    nan_flush = true;
+                    continue;
+                }
                 for (int j = 0; j < keep[(size_t) b]; ++j) {
                     const int32_t y = outb[first[a] + j];
                     sl.ids.push_back(tok[first[a] + j]);   // the window fed it: the slot's session holds it now
@@ -7534,7 +7692,7 @@ int main(int argc, char** argv) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                         sl.active = false;
-                        sl.cached = o.prompt_cache > 0 && !sl.img;   // its session holds sl.ids for the next turn
+                        sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;   // its session holds sl.ids
                         break;
                     }
                     sl.x = y;
@@ -8068,6 +8226,20 @@ int main(int argc, char** argv) {
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
                     cvec_cached = image.cvec;
                     live_ok = true;
+                    if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones and idle slots go
+                        nan_flush = false;
+                        const size_t n_parked = conversations.clear();
+                        for (BSlot& sl : bs)
+                            if (sl.active) sl.tainted = true;
+                            else if (sl.cached) {
+                                sl.cached = false;
+                                sl.partial = false;
+                                sl.checks.clear();
+                            }
+                        std::fprintf(stderr, "strata serve: after non-finite logits (#879): the restored session "
+                                             "replaces the live one; dropped %zu parked conversation%s\n", n_parked,
+                                     n_parked == 1 ? "" : "s");
+                    }
                     std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints, %zu bytes from %s "
                                  "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
                                  ms(), read_ms);
@@ -8299,6 +8471,38 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     return 1;
                 }
+            }
+            nf_hit = false;
+            // #879: an earlier window met non-finite logits.  The poison sits in a conversation's K/V and recurrent
+            // state, so nothing that may hold it is continued: the live session, every checkpoint, every parked
+            // conversation and every idle batch slot go, and this prompt is read from token 0 (resume == 0 below)
+            if (nan_flush) {
+                nan_flush = false;
+                const size_t n_checks = checks.size();
+                live_ok = false;
+                checks.clear();
+                tail_ckpt_len = -1;
+                const size_t n_parked = conversations.clear();
+                size_t n_slots = 0, n_running = 0;
+                for (BSlot& sl : bs)
+                    if (sl.active) {   // a running slot finishes its reply, but is not kept as a cache after it
+                        sl.tainted = true;
+                        ++n_running;
+                    } else if (sl.cached) {
+                        sl.cached = false;
+                        sl.partial = false;
+                        sl.checks.clear();
+                        ++n_slots;
+                    }
+                std::fprintf(stderr, "strata serve: after non-finite logits (#879): dropped the live session, %zu "
+                                     "checkpoint%s, %zu parked conversation%s and %zu idle slot%s (%zu running slot%s "
+                                     "not kept after their reply); reading this prompt from token 0\n", n_checks,
+                             n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,
+                             n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
+            }
+            if (!finish_staged()) {   // (after every reply already; here for a request that ended another way)
+                std::printf("ERR saving a conversation checkpoint failed\n");
+                return 1;
             }
             int64_t resume = 0;
             bool from_live = false;
@@ -8684,6 +8888,7 @@ int main(int argc, char** argv) {
                         if (v.service(win_pool_fn, PSD[f1 & 1], e) < 0) return fail(e);
                         if (v.done(e)) {
                             if (!v.pl_finish(nullptr, e) || !v.pl_commit_async(wins[f1].T, e)) return fail(e);
+                            if (nonfinite_hit(v, "prompt")) return fail("non-finite logits (#879)");
                             const Win& w = wins[f1];
                             for (int t = 0; t < w.T; ++t) nx[(size_t) t] = (int32_t) cur[(size_t) (w.q + t + 1)];
                             if (!mtp.prefill(v.final_R(0), nx.data(), w.T, w.q, e, false)) return fail(e);
@@ -8728,6 +8933,10 @@ int main(int argc, char** argv) {
                     drive.d.failed = false;
                     if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
+                        return false;
+                    }
+                    if (nonfinite_hit(ver, "prompt")) {   // (its commit is not needed: the next request reads from 0)
+                        e = "non-finite logits (#879)";
                         return false;
                     }
                     // STRATA_LOGPOS=<path>: the teacher-forced log-probability of every token read here (every token
@@ -9077,6 +9286,10 @@ int main(int argc, char** argv) {
                                  std::chrono::duration<double, std::milli>(Clock::now() - tsp).count());
                     std::fflush(stderr);
                 }
+                if (!sp_ok && nf_hit) {   // #879: DONE nonfinite (the lent slots are refilled below)
+                    cancelled = true;
+                    break;
+                }
                 if (!sp_ok) {
                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
@@ -9087,8 +9300,11 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
+                // the turn boundary's checkpoint (the next request of the chat resumes there) is only staged now and
+                // goes to RAM after the reply (finish_staged)
                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
-                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
+                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at,
+                                   to == turn_at && to != root_at && to != message_at && to != pin_at)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed\n");
                     return 1;
                 }
@@ -9178,7 +9394,7 @@ int main(int argc, char** argv) {
             const uint64_t file_bytes0 = src.file_read_bytes();
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             const int64_t offload0 = drive.d.offload_entries;   // #588
-            if (cancelled) finish = "cancel";
+            if (cancelled) finish = nf_hit ? "nonfinite" : "cancel";
             // ======== --pipeline-windows 2: the decode windows with the two cards overlapped ========
             // Stage 0 (the first card) runs window K+1 while stage 1 verifies window K, on the guess that K is accepted
             // whole and that its bonus token is the drafter's.  The drafter, teacher-forced through K+1's drafts,
@@ -9598,8 +9814,9 @@ int main(int argc, char** argv) {
                     ++rounds;
                     ++dec_windows;
                     dec_T += A.T;
+                    const bool nf = nonfinite_hit(V1(A), "decode");   // #879: none of its tokens goes out
                     bool eos = false;
-                    for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
+                    for (int i = 0; !nf && i <= a && produced_n < max_new && !eos; ++i) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
                         strata::core::progress_beat();
                         ++produced_n;
@@ -9607,10 +9824,11 @@ int main(int argc, char** argv) {
                         eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[(size_t) i]) != o.eos_ids.end();
                     }
                     std::fflush(stdout);
-                    if (eos) finish = "stop";
+                    if (nf) finish = "nonfinite";
+                    else if (eos) finish = "stop";
                     else if (stop_req.load()) finish = "cancel";
-                    const bool last = eos || produced_n >= max_new || stop_req.load();
-                    const bool on = B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
+                    const bool last = nf || eos || produced_n >= max_new || stop_req.load();
+                    const bool on = !nf && B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                     if (B.made) {   // the gate's calibration: would B have been on the path, by its estimate p_on
                         const bool would = a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                         const int bin = std::min(9, std::max(0, (int) (B.p_on * 10.0f)));
@@ -9836,6 +10054,15 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
+                    if (adapt_thr.joinable()) adapt_thr.join();
+                    if (!adapt_ok) {
+                        std::printf("ERR an adaptive refill failed\n");
+                        return 1;
+                    }
+                    finish = "nonfinite";
+                    break;
+                }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
                 draft_offered += T - 1;
@@ -9946,6 +10173,7 @@ int main(int argc, char** argv) {
                 live.swap(consumed);
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
                 live_ok = o.prompt_cache > 0 && req_ckpt;   // ckpt=0: nothing to continue or park (#830)
+                if (nf_hit) live_ok = false;   // #879 (the next request's start drops the rest)
             }
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
             if (state_hash && !cancelled && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
@@ -10069,6 +10297,10 @@ int main(int argc, char** argv) {
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
                         (long long) req_offload, chain_txt);
             std::fflush(stdout);
+            if (!finish_staged()) {
+                std::printf("ERR saving a conversation checkpoint failed\n");
+                return 1;
+            }
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;

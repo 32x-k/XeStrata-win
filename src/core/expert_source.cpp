@@ -292,6 +292,31 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     return true;
 }
 
+std::string page_cache_hint(const std::string& meminfo_text) {
+    const auto kib = [&](const char* key) -> uint64_t {
+        std::istringstream in(meminfo_text);
+        std::string line;
+        const std::string want = std::string(key) + ":";
+        while (std::getline(in, line)) {
+            std::istringstream f(line);
+            std::string k;
+            uint64_t v = 0;
+            if (f >> k >> v && k == want) return v;
+        }
+        return 0;
+    };
+    const uint64_t cache = (kib("Cached") + kib("Buffers")) * 1024;
+    if (cache < (1ull << 30)) return "";
+    char msg[420];
+    std::snprintf(msg, sizeof msg,
+                  "; %.1f GiB of the RAM is file cache (earlier runs' model files, which Linux gives back on demand - "
+                  "'free' showing little is normal). If the start still fails, free it with: "
+                  "sync; echo 1 | sudo tee /proc/sys/vm/drop_caches   (or start the server with "
+                  "STRATA_DROP_CACHE_ON_EXIT=1 so it releases its model files when it stops)",
+                  (double) cache / 1073741824.0);
+    return msg;
+}
+
 }  // namespace detail
 
 namespace {
@@ -997,6 +1022,13 @@ bool FileExpertSource::pin_cache_complement(
                           (double) bytes / 1073741824.0, (double) physical / 1073741824.0,
                           (double) headroom_bytes / 1073741824.0);
             err = message;
+#if defined(__linux__)
+            if (std::ifstream mi("/proc/meminfo"); mi) {
+                std::stringstream mt;
+                mt << mi.rdbuf();
+                err += detail::page_cache_hint(mt.str());
+            }
+#endif
             return false;
         }
     }
@@ -1725,6 +1757,39 @@ int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h) {
 }
 
 namespace {
+// The split's CPU times come from start-up calls of one token an expert, alone on the pool.  A decode's calls ran
+// slower than those times gave: 1.7x on the RX 9060 XT (0.049 against ~0.085 ms an expert; decode 41 tok/s against
+// upstream's 45 at a fixed share), and 3.5x beside a busy host, where the split gave the CPU nearly every missed expert
+// (26 against 40 tok/s).  The decode's own pool calls are set against the times the split read for them, and the CPU's
+// times are scaled by the ratio when it is off by more than 15%: after 512 calls with experts on the CPU, then 1,024 and
+// 2,048 more, three updates at most (as upstream's PcieAuto refines its share).  STRATA_PCIE_SPLIT_REFINE=0: the
+// start-up times stay.
+void refine_split(ExpertDispatch& d, bool both, int experts, double ms) {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PCIE_SPLIT_REFINE");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    ExpertDispatch::SplitRefine& r = d.split_refine;
+    if (!on || r.updates >= 3) return;
+    PcieSplitTimes& t = *d.pcie_split;
+    r.ms += ms;
+    r.ms_model += both ? t.cb0 + t.cb * experts : t.c0 + t.c * experts;
+    ++r.calls;
+    r.experts += experts;
+    if (r.calls < (int64_t) 512 << r.updates || r.experts < 300) return;
+    const double ratio = r.ms_model > 0.0 ? r.ms / r.ms_model : 1.0;
+    ++r.updates;
+    r = ExpertDispatch::SplitRefine{0.0, 0.0, 0, 0, r.updates};
+    if (!(ratio > 0.0) || (ratio >= 1.0 / 1.15 && ratio <= 1.15)) return;
+    const double f = std::min(4.0, std::max(0.25, ratio));
+    t.c0 *= f;
+    t.c *= f;
+    t.cb0 *= f;
+    t.cb *= f;
+    std::fprintf(stderr, "strata: PCIe split: the decode's CPU pool calls took %.2fx the start-up times; an expert on "
+                         "the CPU is now %.3f ms (%.3f beside the link), update %d of 3\n", ratio, t.c, t.cb, r.updates);
+}
+
 // STRATA_ROUTE_TAIL_SKIP: the rank from which a missed expert that every token of the window routes that low is
 // skipped (upstream b4e3407b).  An explicit environment value is read once; the serve start-up (generate.cpp) sets the
 // default where it applies.
@@ -1780,6 +1845,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const int64_t n = n_tok * k;
     int32_t kind[kMaxWindowEntries];       // per entry: -1 CPU, 0 VRAM, 1 PCIe, 2 a helper GPU, -2 skipped
     std::fill_n(kind, kMaxWindowEntries, -1);
+    int split_m = -1;                      // the measured split's PCIe count for this layer (-1: no split)
     if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
         int64_t distinct[kMaxWindowEntries], first_of[kMaxWindowEntries];
         int nd = 0, nmiss = 0;
@@ -1832,6 +1898,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int m = !pcie_ok ? 0
                       : d.pcie_split != nullptr ? pcie_split_m(*d.pcie_split, d.pcie_overlap, nmiss, std::max(0, nd - nmiss))
                                                 : (nmiss * d.pcie_num) >> 8;
+        if (pcie_ok && d.pcie_split != nullptr) split_m = m;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
@@ -2022,6 +2089,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
+    if (split_m >= 0 && njobs > 0 && d.remote_count == 0) refine_split(d, split_m > 0, njobs, ms(c3, c4));
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
@@ -2689,7 +2757,12 @@ bool ArenaExpertSource::make_kernel_readable(std::string& err) {
     if (!dev_slice_.empty()) return true;
     if (arena_ == nullptr) { err = "the arena is a file mapping"; return false; }
     auto* a = static_cast<PinnedArena*>(arena_);
-    if (!a->to_host_usm(strata::kernels::cpu::expert_layout().max_blob, err)) return false;
+    // issue #10: the RAM available before each layer moves (UINT64_MAX when it cannot be read)
+    const auto ram = [] {
+        detail::HostMemory hm;
+        return detail::host_available_memory(hm) ? hm.available : UINT64_MAX;
+    };
+    if (!a->to_host_usm(strata::kernels::cpu::expert_layout().max_blob, err, ram)) return false;
     base_ = a->data();
     pinned_bytes_ = a->registered_bytes;
     slice_bytes_ = a->slice_bytes;

@@ -5,7 +5,7 @@ The tables of step 7 of SKILL.md: how they are run. The check that reads them is
 The engines, each built in a worktree of its own under `.claude/worktrees/` (or in the AMD container):
 
 - XeStrata: `dev`'s HEAD, the contrib-llvm build; one GPU at a time with `ONEAPI_DEVICE_SELECTOR` (`level_zero:*`, `cuda:*`; `hip:*` in the container).
-- upstream on the B70: the tag's `sycl/` port, built and run in its Docker image as its docs/INTEL.md says.
+- upstream on the B70: not measured (the user's decision of 2026-10-12, to save time): the B70 runs XeStrata alone, with `UP=none`, and is judged against the previous XeStrata's record (`judge.py --prev`, step 8).
 - upstream on the RTX 4070: the tag's CUDA build; on the RX 9060 XT: its HIP build; both as its documents say.
 
 Each engine's own shipped expert profile. No other work on a machine while it measures.
@@ -41,7 +41,7 @@ XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> \
 python .claude/skills/upstream-sync/scripts/sync_collect.py $o/<file> xe-<commit> <tag>
 ```
 
-`bench_generate.py` alternates the engines, two rounds per tier, after a warm-up each.
+`bench_generate.py` alternates the engines after a warm-up each; the merge runs one round per tier (`ROUNDS=1`, the user's decision of 2026-10-12; the scripts' own default is more).
 A model other than IQ3_XXS comes from a model config setup wrote (`CONFIG`: its files, its draft layer and the settings setup and the calibration chose, such as the RAM budget) or from its files (`PACK`, `NATIVE`, `PLE`); the same variables work for the serve and everyday scripts.
 The three scripts are entry points to `tools/bench_core.py`, which setup's `--bench` runs too: the prompts, the conversations and how the runs are made and read are defined there once.
 Both engines write one text a tier (the user's decision of 2026-10-10): upstream runs first in the tier and writes its own answer, and every later run of both engines follows it with `--spec-follow` (upstream's own tool, ac131a3a).
@@ -60,10 +60,10 @@ python .claude/skills/upstream-sync/scripts/sync_collect.py $o/IQ3_XXS xe-<commi
 ```
 
 Each run is one chat of four turns: the tier's prompt, then the three follow-ups of `sync_prompts.py`, each sent with the answer before it, as a chat client sends them; 256 tokens a turn.
-It measures the prompt (the first turn), the follow-ups (the median time a follow-up's prompt takes: the wait before its answer, which the conversation checkpoints decide) and the output (all four turns), greedy and at temperature 0.7, three rounds each, the engines alternating.
+It measures the prompt (the first turn), the follow-ups (the median time a follow-up's prompt takes: the wait before its answer, which the conversation checkpoints decide) and the output (all four turns), greedy and at temperature 0.7, one round each (`ROUNDS=1`), the engines alternating.
 Each engine writes its own text, so the drafts it accepts count in its output speed, as they do for a user.
 Another temperature: `MODES` (`t10` is temperature 1.0; everyday use's is `TEMPERATURE`); the merge's check keeps 0.7, the temperature the limits were set at.
-The wrapper commands in `XE` and `UP` must pass stdin through (`docker run -i` for upstream's `sycl/` image).
+The wrapper commands in `XE` and `UP` must pass stdin through.
 
 ## Everyday use
 
@@ -75,7 +75,7 @@ Each run starts the server anew and holds three conversations, at most 1,024 tok
 | `chat-ja`, `chat-en` | a short system prompt and five short questions in a row, Japanese and English |
 | `agent` | a coding agent's task with two tools; each step's tool result is a fixed source file (about 4K tokens), so the context grows step by step; seven steps |
 
-It measures per conversation the time to the first streamed token, the prompt and the output speed (the server's `timings`), three rounds per engine, alternating:
+It measures per conversation the time to the first streamed token, the prompt and the output speed (the server's `timings`), one round per engine (`ROUNDS=1`), alternating:
 
 ```sh
 XE="..." UP="..." XE_ROOT=<xe tree> UP_ROOT=<up tree> XE_PROFILE=... UP_PROFILE=... DATA=<data> PY=<python> \

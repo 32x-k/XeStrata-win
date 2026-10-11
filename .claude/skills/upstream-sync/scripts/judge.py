@@ -9,15 +9,15 @@ token (lower is better), the prompt and the output.  There each engine writes it
 speed move with it from round to round: those cells pass when XeStrata is at most SERVE_LIMIT worse, the prompt
 still at 1%.
 
-    python .claude/skills/upstream-sync/scripts/judge.py [--prompt-only GPU]... [--prev NAME=DIR]... OUT/IQ3_XXS ...
+    python .claude/skills/upstream-sync/scripts/judge.py [--prev NAME=DIR]... OUT/IQ3_XXS ...
 
 A cell where upstream did not finish, ran at SLOW tok/s or less, or was stopped by bench_generate.py as that slow, is
-left out (not measurable); one where only XeStrata did not finish fails.  --prompt-only GPU: that GPU's output cells are
-left out too (a GPU no matrix.json names is an error: bench_generate.py's GPU argument, spelled the same).
+left out (not measurable); one where only XeStrata did not finish fails.  A GPU measured with UP=none (XeStrata
+alone: the B70 in an upstream merge) is judged against --prev only.
 --prev NAME=DIR: the previous XeStrata's record of the folder named NAME (the last merge's OUT/NAME, or a release
 record, whose serve and everyday tables are in DIR/serve): each cell both records have is judged against it too,
 XeStrata's median against its median there (the prompt at 1%, the rest at SERVE_LIMIT: the text is upstream's or
-each engine's own, and changes with the version), --prompt-only aside.
+each engine's own, and changes with the version).
 Prints a line per cell and, last, "ALL PASS" (exit 0) or "FAIL <n>" (exit 1; also when no cell was compared).
 """
 import json
@@ -44,16 +44,12 @@ def median(rows, key):
 
 
 args = sys.argv[1:]
-prompt_only = set()
 prev_dirs = {}
-while len(args) >= 2 and args[0] in ("--prompt-only", "--prev"):
-    if args[0] == "--prompt-only":
-        prompt_only.add(args[1])
-    else:
-        name, _, d = args[1].partition("=")
-        if not d:
-            sys.exit(f"--prev {args[1]}: NAME=DIR")
-        prev_dirs[name] = pathlib.Path(d)
+while len(args) >= 2 and args[0] == "--prev":
+    name, _, d = args[1].partition("=")
+    if not d:
+        sys.exit(f"--prev {args[1]}: NAME=DIR")
+    prev_dirs[name] = pathlib.Path(d)
     args = args[2:]
 
 
@@ -75,10 +71,6 @@ records = [(pathlib.Path(a), load(pathlib.Path(a))) for a in args]
 unread = set(prev_dirs) - {folder.name for folder, _ in records}
 if unread:
     sys.exit(f"--prev: no folder named {', '.join(sorted(unread))}")
-gpus = {r["gpu"] for _, rec in records for rows in rec for r in rows}
-unknown = prompt_only - gpus
-if unknown:
-    sys.exit(f"--prompt-only: no measurements of {', '.join(sorted(unknown))} (GPUs: {', '.join(sorted(gpus))})")
 fails = judged = 0
 
 
@@ -121,8 +113,8 @@ for folder, rec in records:
             up = median([r for r in cell if r["arm"] == "up"], key)
             where = f"{head} {name:6s}"
             stopped = {r["stopped"] for r in cell if r["arm"] == "up" and r.get("stopped")}
-            if name == "output" and gpu in prompt_only:
-                print(f"{where} SKIP  output not compared on this GPU (--prompt-only)")
+            if not any(r["arm"] == "up" for r in cell):
+                print(f"{where} SKIP  upstream not run (UP=none)")
             elif up is None and stopped:
                 print(f"{where} SKIP  upstream stopped at {SLOW:g} tok/s or less ({', '.join(sorted(stopped))})")
             elif up is None:
@@ -141,6 +133,7 @@ for folder, rec in records:
                     fails += 1
                     print(f"{where} prev FAIL  XeStrata did not finish (before {before:.1f})")
                 else:
+                    judged += 1
                     fails += not against(where, key, xe, before,
                                          LIMIT if key == "prefill_tok_s" else SERVE_LIMIT, "prev ")
 fails += judged == 0                          # nothing measured is no win

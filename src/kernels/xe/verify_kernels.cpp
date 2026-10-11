@@ -1188,6 +1188,27 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
     done(stream, e, "row_top_prob");
 }
 
+void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* flags, void* stream) {
+    if (n_rows <= 0 || n <= 0) return;
+    constexpr int WG = 256;
+    const int per_block = (n + kNonfiniteBlocks - 1) / kNonfiniteBlocks;
+    // work-group (b, row) scans [b * per_block, +per_block) of its row and writes its own word.  The test is on the
+    // bits (exponent all ones), so a fast-math build cannot fold it away.
+    const auto e = Q(stream).parallel_for(
+        sycl::nd_range<2>(sycl::range<2>((size_t) n_rows, (size_t) kNonfiniteBlocks * WG), sycl::range<2>(1, WG)),
+        [=](sycl::nd_item<2> it) {
+            const int row = (int) it.get_group(0), b = (int) it.get_group(1);
+            const float* l = logits + (size_t) row * (size_t) n;
+            const int lo = b * per_block, hi = sycl::min(n, lo + per_block);
+            bool bad = false;
+            for (int v = lo + (int) it.get_local_id(1); v < hi; v += WG)
+                bad |= (sycl::bit_cast<uint32_t>(l[v]) & 0x7f800000u) == 0x7f800000u;
+            bad = sycl::any_of_group(it.get_group(), bad);
+            if (it.get_local_id(1) == 0) flags[row * kNonfiniteBlocks + b] = bad ? 1u : 0u;
+        });
+    done(stream, e, "logits_nonfinite_rows");
+}
+
 void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, void* stream) {
     const long long stride = (long long) ids_stride;
     const auto e = Q(stream).parallel_for(sycl::nd_range<2>({(size_t) n, 8 * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
