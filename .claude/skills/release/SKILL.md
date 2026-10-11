@@ -126,6 +126,7 @@ gh release view xe<VERSION> --repo MistVVK/XeStrata --json url,isDraft
 
 Retry a push only for a network failure (up to four times, waiting 2, 4, 8, 16 s).
 `--verify-tag` makes gh refuse rather than create a tag of its own.
+Then mark the previous release as old: `.claude/skills/release/scripts/mark-old.sh <previous tag>` puts a note at the top of its notes that sends the reader to the latest release (`releases/latest`, so the older ones marked before stay right).
 Report the release's URL, then prepare the development machine's engines for step 9.
 A wrong asset or note is fixed with `gh release upload --clobber`, `gh release delete-asset` or `gh release edit --notes-file`.
 
