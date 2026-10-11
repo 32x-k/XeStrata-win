@@ -200,6 +200,9 @@ public:
     }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
+    /// The previous stage in this process wrote rows [row0, row0 + n) of its hand-off `from`: they become this stage's
+    /// (copied into its own hand-off when it has one: a stage on another GPU).  InProcessStage::rows.
+    void accept_rows(const float* from, int row0, int n);
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
@@ -416,7 +419,6 @@ private:
     float* hand_out_ = nullptr;
     StageLink* next_ = nullptr;          ///< set_next: the next stage, through this link only
     InProcessStage local_next_;
-    friend class InProcessStage;         ///< it reads the next stage's hand-off and geometry
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     bool capture_commit(std::string& err);
     bool record_window(int T, strata::gpu::Stream cs, std::string& err);

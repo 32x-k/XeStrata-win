@@ -169,12 +169,14 @@ public:
         local_next_.bind(next);
         next_ = next != nullptr ? &local_next_ : nullptr;
     }
+    /// The previous stage in this process hands the rows of the chunk this stage reads next (pinned host memory,
+    /// T x hc*n_embd floats, untouched until that chunk is read).  InProcessPrefill::chunk.
+    void accept_rows(const float* rows) { hand_in_ = rows; }
 
 private:
     int64_t stage_lb_ = 0, stage_le_ = -1;
     PrefillLink* next_ = nullptr;       ///< set_stage: the next stage, through this link only
     InProcessPrefill local_next_;
-    friend class InProcessPrefill;      ///< it points the next stage at the rows (hand_in_)
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)

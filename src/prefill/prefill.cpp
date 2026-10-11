@@ -2622,7 +2622,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
 
 bool InProcessPrefill::chunk(const float* rows, const int64_t* tokens, int64_t T, int64_t p0, std::string& err) {
     (void) err;
-    next_->hand_in_ = rows;
+    next_->accept_rows(rows);
     run_ = std::async(std::launch::async, [this, tokens, T, p0] { return next_->run(tokens, T, p0, err_); });
     return true;
 }

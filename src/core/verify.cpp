@@ -2743,12 +2743,14 @@ void Verifier::absorb_stats(Verifier& o) {
 
 // ================================ THE NEXT STAGE IN THIS PROCESS (StageLink) ================================
 
-void InProcessStage::rows(const float* hand_out, int row0, int n) {
-    float* in = const_cast<float*>(next_->hand_in_);
-    if (in == hand_out) return;   // stages on one GPU share the hand-off
-    const size_t HB = (size_t) Verifier::handoff_floats(*next_->g_);
-    std::memcpy(in + (size_t) row0 * HB, hand_out + (size_t) row0 * HB, (size_t) n * HB * sizeof(float));
+void Verifier::accept_rows(const float* from, int row0, int n) {
+    float* in = const_cast<float*>(hand_in_);
+    if (in == from) return;   // stages on one GPU share the hand-off
+    const size_t HB = (size_t) handoff_floats(*g_);
+    std::memcpy(in + (size_t) row0 * HB, from + (size_t) row0 * HB, (size_t) n * HB * sizeof(float));
 }
+
+void InProcessStage::rows(const float* hand_out, int row0, int n) { next_->accept_rows(hand_out, row0, n); }
 bool InProcessStage::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, int32_t* out,
                          std::string& err) {
     return next_->run(T, tokens, pos0, pool, user_, out, err);
