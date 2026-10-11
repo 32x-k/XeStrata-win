@@ -33,7 +33,7 @@ The attention over the earlier tokens grows with the context (B70, IQ3_XXS: the 
 The other files run at 32K: the products' shapes follow the chunk (from 32K a prompt is read in chunks of thousands of tokens, so each expert gets many rows), and the long contexts are what the engine is used at most.
 
 ```sh
-o=bench/results/<date>-upstream-<version>
+o=<data>/records/bench-results/<date>-upstream-<version>   # outside git (the user's decision of 2026-10-11)
 python .claude/skills/upstream-sync/scripts/sync_prompts.py <pack> <ids>               # the prompts, once
 XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> \
   [CONFIG=xestrata-<model>.json | PACK=... NATIVE=... PLE=...] [EXTRA="..."] [TIERS="..."] \

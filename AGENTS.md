@@ -95,6 +95,13 @@ The English files keep the headings that code, records and links point to (`docs
 Where the README or a document states something that was not checked, do not add that it is unverified (`unverified`, 未検証); that mark is for reports and commit messages.
 The two stages of generation are prefill and decode, the LLM terms, in Japanese as in English (the README, the documents, the release notes): not プロンプト・出力・デコード or prompt and output speed. 推測デコード (speculative decoding) and a prompt as the text that is read stay as they are.
 
+## Measurement records
+
+XeStrata's own measurements (benchmarks, A/B runs, probes, the upstream-sync and release records) are not shared: they go
+into the data folder's `records/` (`<data>: LOCAL.md`) and never into git. `bench/results` keeps only upstream's records
+(`tools/lint/records.txt`) and records others sent (pull requests). Commit messages and documents give the numbers
+themselves, not a link to a record.
+
 ## Lints
 
 Before committing, run `tools/lint/run.sh` from the repository root: without arguments it lints the files that differ from HEAD (changed or new), or the files given.

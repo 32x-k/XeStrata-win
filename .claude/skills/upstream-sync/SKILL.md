@@ -174,12 +174,12 @@ They come after step 4 has taken upstream's ideas, as the check that nothing los
 
 The previous XeStrata is the newest `xe*` release before this run (step 1). Its records:
 
-- its release record, `bench/results/<date>-release-<xe tag>/` (/release: IQ3_XXS on the generate path, the serve path at 32K and everyday use), for `IQ3_XXS`;
-- the last merge's record, `bench/results/<date>-upstream-<version>/<file>`, for the other files (and for `IQ3_XXS` when no release record is newer).
+- its release record, `<data>/records/bench-results/<date>-release-<xe tag>/` (/release: IQ3_XXS on the generate path, the serve path at 32K and everyday use), for `IQ3_XXS`;
+- the last merge's record, `<data>/records/bench-results/<date>-upstream-<version>/<file>`, for the other files (and for `IQ3_XXS` when no release record is newer).
 
 ```sh
 python .claude/skills/upstream-sync/scripts/judge.py \
-  --prev IQ3_XXS=bench/results/<date>-release-<xe tag> --prev Q2_0=<last merge>/Q2_0 ... \
+  --prev IQ3_XXS=<data>/records/bench-results/<date>-release-<xe tag> --prev Q2_0=<last merge>/Q2_0 ... \
   $o/IQ3_XXS $o/Q2_0 $o/IQ2_XS $o/IQ3_S $o/UD-Q4_K_XL
 ```
 
@@ -197,15 +197,16 @@ The run is done only when a full run of step 7 on the final HEAD, every file and
 
 ## 9. The record and the report
 
-On `dev`:
+XeStrata's own measurements are not shared (the user's decision of 2026-10-11): the record stays in the data folder, `$o` = `<data>/records/bench-results/<date>-upstream-<version>` (`LOCAL.md`), and never goes into git; only upstream's records (`tools/lint/records.txt`) and community records live in `bench/results`.
+
 
 - `$o/README.md`: the machines, both engines' commits and builds, the method, the tables (`sync_collect.py`), the check's output (against the tag and the previous XeStrata), what the numbers say, and the GPUs skipped; `matrix.json` and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>`. The ideas with step 4's and 5's numbers (kept, opt-in and removed) go into the same record.
-- docs/XE.ja.md, then docs/XE.md: the upstream version and range brought in, what was not taken and why, the approximations on by default and their switches, linking the record.
+- docs/XE.ja.md, then docs/XE.md: the upstream version and range brought in, what was not taken and why, the approximations on by default and their switches, without a link to the record (it is not in the repository).
 
-Lint, and commit the record as the run's last commit, with the tag as its second parent and the tree unchanged (as c3aa33ae records v0.1.40.2), so `dev`'s history shows where the run ended:
+Lint, and commit the documents as the run's last commit, with the tag as its second parent and the tree unchanged (as c3aa33ae records v0.1.40.2), so `dev`'s history shows where the run ended:
 
 ```sh
-git add <the record and the documents> && tree=$(git write-tree) && \
+git add <the documents> && tree=$(git write-tree) && \
   c=$(git commit-tree -p HEAD -p <tag> -m "upstream の Strata <version> の取り込みを記録する" <tree>) && \
   git merge --ff-only "$c"
 ```
