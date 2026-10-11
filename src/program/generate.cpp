@@ -2943,7 +2943,8 @@ int main(int argc, char** argv) {
     // carved to its layers, and its dense weights too.
     //   The window time of a placement: per layer, the dense weights read at the GPU's own bandwidth, then the
     //   layer's routed experts - the cached share read by the GPU at its bandwidth while the CPU reads the rest at the
-    //   RAM's (the two overlap: the larger counts) - and a hand-off per stage boundary.
+    //   RAM's (the two overlap: the larger counts), the rest scaled by the stage's link - and a hand-off per stage
+    //   boundary.
     //   Which experts a cache holds: its layers' profiled pairs, hottest first, until the VRAM its GPU has left is
     //   used: free now, less the reserve, the weights, the sessions (--batch slots too), the prompt path and, on the
     //   last GPU, the head; a later GPU keeps 1 GiB more (its windows and the drafter; and what KV streaming's staging
@@ -3116,6 +3117,19 @@ int main(int argc, char** argv) {
                          dev_of_stage(i), bw[(size_t) i] / 1e6, (double) free0[(size_t) i] / 1073741824.0);
         }
         std::fprintf(stderr, "strata generate: layer split auto: the CPU experts read RAM at %.0f GB/s\n", cpu_bw / 1e6);
+        // each stage's link (upstream 0391e478): the prompt path streams a stage's missed experts over its own link,
+        // so a stage on a narrow one pays more per missed expert.  Its miss term is scaled by 20 GB/s (the x16
+        // reference of pcie_frac_for_gbps) over the probed link, never below 1, so a machine whose links all read
+        // 20 GB/s or more keeps the formula as it was (upstream: 2x 4090 D, CUDA1 on a x1 link at 1.6 GB/s, K=22 ->
+        // 38, prompts ~350 -> ~1410 tok/s).
+        std::vector<double> link_scale((size_t) ns, 1.0);
+        for (int i = 0; i < ns; ++i) {
+            const strata::core::OnDevice on(dev_of_stage(i));
+            const double lbw = native_pack ? probe_pcie_h2d_gbps() : -1.0;
+            if (lbw > 0.0) link_scale[(size_t) i] = std::clamp(20.0 / lbw, 1.0, 64.0);
+            std::fprintf(stderr, "strata generate: layer split auto: CUDA%d link %.1f GB/s -> miss cost x%.2f\n",
+                         dev_of_stage(i), lbw, link_scale[(size_t) i]);
+        }
         const double rows = std::getenv("STRATA_SPLIT_ROWS") ? std::strtod(std::getenv("STRATA_SPLIT_ROWS"), nullptr) : 3.0;
         const double dense_layer = (double) (canon_all + nat_all) / (double) L;
         // the routed mass of rank r: (r+1)^-a.  a = 0.8 fits this model's measured hit rates on the B70 (IQ3_S: 58% of
@@ -3163,7 +3177,8 @@ int main(int argc, char** argv) {
                 const double hit = layer_mass[(size_t) l] > 0 ? layer_held[(size_t) l] / layer_mass[(size_t) l] : 1.0;
                 const double experts = (double) Ka * rows * (double) lay.blob_bytes(l);
                 ms += dense_layer / bw[(size_t) st] +
-                      std::max(experts * hit / bw[(size_t) st], experts * (1.0 - hit) / cpu_bw);
+                      std::max(experts * hit / bw[(size_t) st],
+                               experts * (1.0 - hit) / cpu_bw * link_scale[(size_t) st]);
                 all += layer_mass[(size_t) l];
                 kept += layer_held[(size_t) l];
             }
