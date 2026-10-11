@@ -151,6 +151,17 @@ const std::vector<sycl::device>& engine_devices() {
     return devices;
 }
 
+sycl::property_list ordered_properties() {
+#if defined(_WIN32) && defined(STRATA_ADAPTIVECPP)
+    // The native dedicated in-order path on Windows HIP failed kernel -> memcpy ordering in our
+    // bounded probe. A null executor keeps submission DAG-ordered, with explicit predecessor events.
+    return sycl::property_list{sycl::property::queue::in_order{},
+                               sycl::property::queue::AdaptiveCpp_inorder_executor{nullptr}};
+#else
+    return sycl::property_list{sycl::property::queue::in_order{}};
+#endif
+}
+
 sycl::event queue_marker(sycl::queue& q, const std::vector<sycl::event>& dependencies = {}) {
     return q.submit([&](sycl::handler& h) {
         if (!dependencies.empty()) h.depends_on(dependencies);
@@ -235,8 +246,8 @@ sycl::async_handler Runtime::handler() {
 }
 
 Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), device_(device), context_(device_),
-    compute_(context_, device_, handler(), sycl::property::queue::in_order{}),
-    transfer_(context_, device_, handler(), sycl::property::queue::in_order{}), watchdog_([this] { watch(); }) {
+    compute_(context_, device_, handler(), ordered_properties()),
+    transfer_(context_, device_, handler(), ordered_properties()), watchdog_([this] { watch(); }) {
     marks_by_barrier_ = measure_marks();
 }
 
@@ -278,7 +289,7 @@ bool Runtime::measure_marks() {
 
 sycl::queue* Runtime::create_stream() {
     std::lock_guard<std::mutex> lock(streams_mutex_);
-    return &streams_.emplace_back(context_, device_, handler(), sycl::property::queue::in_order{});
+    return &streams_.emplace_back(context_, device_, handler(), ordered_properties());
 }
 
 void Runtime::destroy_stream(sycl::queue* stream) {

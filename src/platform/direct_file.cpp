@@ -77,6 +77,7 @@ namespace {
 struct Req {
     OVERLAPPED ov;
     uint64_t tag;
+    bool active = false;               // issued, not yet collected from the port
 };
 }  // namespace
 
@@ -87,7 +88,7 @@ struct DirectFile::Impl {
     std::mutex mu;                      // everything below
     std::deque<Req*> free_reqs;
     std::vector<Req*> all_reqs;
-    std::deque<Completion> immediate;   // requests that completed without a port packet (EOF) or failed
+    std::deque<Completion> immediate;   // immediate results and dequeued packets not yet returned
     std::deque<Pending> queue;          // submitted, not yet issued
     std::condition_variable cv;
     bool stop = false;
@@ -109,6 +110,7 @@ struct DirectFile::Impl {
         {
             std::lock_guard<std::mutex> lk(mu);
             r = take();
+            r->active = true;
         }
         std::memset(&r->ov, 0, sizeof r->ov);
         r->ov.Offset = (DWORD) (p.offset & 0xFFFFFFFFull);
@@ -118,6 +120,7 @@ struct DirectFile::Impl {
             const DWORD e = GetLastError();
             if (e != ERROR_IO_PENDING) {
                 std::lock_guard<std::mutex> lk(mu);
+                r->active = false;
                 free_reqs.push_back(r);
                 // at or past end of file: a zero-byte completion; anything else: a failed one
                 immediate.push_back(Completion{p.tag, 0, e == ERROR_HANDLE_EOF});
@@ -185,7 +188,7 @@ bool DirectFile::open(const std::string& path, std::string& err) {
         return false;
     }
     // Completions of reads that finish synchronously are still queued to the port, so every issued read
-    // produces exactly one packet; `wait` is the only completion path.
+    // produces exactly one packet; `wait` collects it, or `close` drains it during shutdown.
     const int n = io_threads(4);
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
     return true;
@@ -193,6 +196,43 @@ bool DirectFile::open(const std::string& path, std::string& err) {
 
 void DirectFile::close() {
     impl_->stop_pool();
+    // Lifecycle calls are not concurrent with submit/wait (only wake is documented thread-safe).
+    // Joining issuers is not enough: cancellation merely requests cancellation and may lose a race.
+    // Keep the file, OVERLAPPEDs and caller buffers alive until every issued read is terminal.
+    // With no skip-on-success mode or low-bit hEvent, each accepted read has exactly one port packet.
+    size_t outstanding = 0;
+    for (Req* r : impl_->all_reqs) {
+        if (!r->active) continue;
+        ++outstanding;
+        CancelIoEx(impl_->file, &r->ov);   // success, failure or ERROR_NOT_FOUND: still wait for its packet
+    }
+    while (outstanding != 0) {
+        OVERLAPPED_ENTRY entries[64];
+        ULONG got = 0;
+        if (!GetQueuedCompletionStatusEx(impl_->port, entries, 64, &got, INFINITE, FALSE)) {
+            // A valid port and infinite timeout should not fail. Still, failure is not proof of
+            // terminal I/O: fall back to a single-packet wait, retaining every request and buffer.
+            DWORD bytes = 0;
+            ULONG_PTR key = 0;
+            OVERLAPPED* ov = nullptr;
+            const BOOL ok = GetQueuedCompletionStatus(impl_->port, &bytes, &key, &ov, INFINITE);
+            if (!ok && ov == nullptr) {
+                // Fail closed on persistent infrastructure errors, without spinning or freeing
+                // live requests. close deliberately cannot return until terminal packets arrive.
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            // FALSE with a non-null OVERLAPPED is a terminal failed read, not a dequeue failure.
+            entries[0].lpOverlapped = ov;
+            got = 1;
+        }
+        for (ULONG i = 0; i < got; ++i) {
+            if (entries[i].lpOverlapped == nullptr) continue;
+            Req* r = (Req*) entries[i].lpOverlapped;
+            r->active = false;
+            --outstanding;
+        }
+    }
     if (impl_->port != nullptr) CloseHandle(impl_->port);
     if (impl_->file != INVALID_HANDLE_VALUE) CloseHandle(impl_->file);
     impl_->port = nullptr;
@@ -200,6 +240,9 @@ void DirectFile::close() {
     impl_->size = 0;
     impl_->immediate.clear();
     impl_->queue.clear();
+    // The old port (including any uncollected packets) is gone before requests can be reused.
+    impl_->free_reqs.clear();
+    for (Req* r : impl_->all_reqs) impl_->free_reqs.push_back(r);
 }
 
 bool DirectFile::is_open() const { return impl_->file != INVALID_HANDLE_VALUE; }
@@ -220,6 +263,7 @@ bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t
 }
 
 int DirectFile::wait(Completion* out, int max, int timeout_ms) {
+    if (max <= 0) return 0;
     int n = 0;
     {
         std::lock_guard<std::mutex> lk(impl_->mu);
@@ -237,11 +281,7 @@ int DirectFile::wait(Completion* out, int max, int timeout_ms) {
     std::lock_guard<std::mutex> lk(impl_->mu);
     for (ULONG i = 0; i < got; ++i) {
         if (entries[i].lpOverlapped == nullptr) {          // a wake() packet (or an immediate completion's nudge)
-            while (n < max && !impl_->immediate.empty()) {
-                out[n++] = impl_->immediate.front();
-                impl_->immediate.pop_front();
-            }
-            if (n < max) out[n++] = Completion{WAKE_TAG, 0, true};
+            impl_->immediate.push_back(Completion{WAKE_TAG, 0, true});
             continue;
         }
         Req* r = (Req*) entries[i].lpOverlapped;
@@ -251,8 +291,15 @@ int DirectFile::wait(Completion* out, int max, int timeout_ms) {
         c.bytes = entries[i].dwNumberOfBytesTransferred;
         // STATUS_END_OF_FILE (0xC0000011) is a legal short read at the table's last page.
         c.ok = status == 0 || status == 0xC0000011u;
-        out[n++] = c;
+        // New immediate results may have arrived since the initial drain. Retain the entire batch
+        // before draining again: a null packet must not consume slots needed by later real packets.
+        impl_->immediate.push_back(c);
+        r->active = false;
         impl_->free_reqs.push_back(r);
+    }
+    while (n < max && !impl_->immediate.empty()) {
+        out[n++] = impl_->immediate.front();
+        impl_->immediate.pop_front();
     }
     return n;
 }

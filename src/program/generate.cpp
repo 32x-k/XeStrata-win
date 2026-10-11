@@ -4486,11 +4486,10 @@ int main(int argc, char** argv) try {
 
     // The direct path with a pool uses session_token_pool: each layer's routing is downloaded, computed
     // and combined before the next layer. session_token remains the explicit --no-pool ablation.
-    // Neither direct path fills the per-layer dump staging, so refuse that diagnostic here.
-    if (o.no_capture && !o.dump_layers.empty()) {
+    // Both complete pool paths fill the layer ladder; the caller-filled-parts ablation does not.
+    if (o.no_capture && pool_fn == nullptr && !o.dump_layers.empty()) {
         std::fprintf(stderr,
-                     "strata generate: --dump-layers is written by `session_loop`; `--no-capture` runs "
-                     "`session_token` instead, which never fills the staging buffer. Drop one of the two.\n");
+                     "strata generate: --dump-layers with --no-capture requires the CPU expert pool.\n");
         return 2;
     }
     if (o.no_capture && !o.dump_halves.empty()) {
@@ -9896,7 +9895,34 @@ int main(int argc, char** argv) try {
         kvg_start(xcache.slots());
         if (!kvg_ensure(n_prompt + o.max_new + 64, [] { strata::gpu::device_sync(); })) return 1;
     }
+    // Process-local opt-in only; never enables graphs, profiling events or new fences.
+    const char* pool_timing_env = std::getenv("STRATA_POOL_TIMING");
+    const bool pool_timing_enabled = pool_timing_env != nullptr && std::strcmp(pool_timing_env, "1") == 0 &&
+                                     o.no_capture && pool_fn != nullptr;
+    auto pool_measured = [](strata::core::PoolTiming::Span* span, auto&& call) -> bool {
+        struct Timer {
+            strata::core::PoolTiming::Span* span;
+            Clock::time_point start;
+            explicit Timer(strata::core::PoolTiming::Span* p) : span(p) {
+                if (span != nullptr) start = Clock::now();
+            }
+            ~Timer() {
+                if (span != nullptr) {
+                    span->ms += std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+                    ++span->count;
+                }
+            }
+        } timer(span);
+        return call();
+    };
+    if (pool_timing_enabled && o.stats)
+        std::fprintf(stderr, "pool timing: HOST ms/count/successful explicit copy bytes per position; "
+                             "waits include runtime scheduling + GPU + transfers, NOT pure GPU timing. "
+                             "parts_wait is existing optional post sync; routing_wait also protects parts reuse. "
+                             "embed/head are host calls (including internal waits); head_wait is existing device sync.\n");
     for (int64_t pos = pos_start;; ++pos) {
+        strata::core::PoolTiming pool_timing{};
+        strata::core::PoolTiming* timing = pool_timing_enabled ? &pool_timing : nullptr;
         // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)
         if (native_pack) { spec_pos = pos; break; }
         if (pos >= o.max_context) {
@@ -9927,7 +9953,8 @@ int main(int argc, char** argv) try {
             ms_ple += std::chrono::duration<double, std::milli>(n - tp).count();
             tp = n;
         }
-        if (!put_input(tok, pos)) return 1;
+        if (!pool_measured(timing == nullptr ? nullptr : &timing->embedding_submit,
+                           [&] { return put_input(tok, pos); })) return 1;
         {
             const Clock::time_point n = Clock::now();
             ms_embed += std::chrono::duration<double, std::milli>(n - tp).count();
@@ -9958,7 +9985,8 @@ int main(int argc, char** argv) try {
         if (o.no_capture) {
             const bool ok = pool_fn != nullptr
                 ? strata::core::session_token_pool(wt, g, pos, /*pos_base=*/0, ss, d_parts, pool_fn, hit_fn,
-                                                    pool_user, loop_scratch, main_cs, o.sync_every_layer, err)
+                                                    pool_user, loop_scratch, main_cs, o.sync_every_layer, err,
+                                                    layer_stage, timing)
                 : strata::core::session_token(wt, g, pos, /*pos_base=*/0, ss, d_parts, main_cs,
                                                o.sync_every_layer, err);
             if (!ok) {
@@ -9998,11 +10026,15 @@ int main(int argc, char** argv) try {
             tp = n;
         }
         // ---- the ladder for THIS position, in the order `session_loop` filled it: layer 0 first.
-        if (layer_dump != nullptr) std::fwrite(layer_stage, sizeof(float), layer_floats, layer_dump);
+        if (layer_dump != nullptr && std::fwrite(layer_stage, sizeof(float), layer_floats, layer_dump) != layer_floats) {
+            std::fprintf(stderr, "strata generate: cannot write layer dump at position %lld\n", (long long) pos);
+            return 1;
+        }
         if (half_dump != nullptr) {
             std::fwrite(half_stage, sizeof(float), (size_t) g.n_layers * (size_t) half_stride, half_dump);
         }
-        if (!run_head(token_stream)) {
+        if (!pool_measured(timing == nullptr ? nullptr : &timing->head_submit,
+                           [&] { return run_head(token_stream); })) {
             std::fprintf(stderr, "strata generate: lm_head: %s\n", err.c_str());
             return 1;
         }
@@ -10011,7 +10043,8 @@ int main(int argc, char** argv) try {
         // memory access" at a plane offset that has nothing to do with the fault, and the layer that actually
         // faulted had completed its own error checks successfully - because its kernels had not run yet.  A
         // sticky error surfaces at the next SYNCHRONISING call, which is whatever happens to come next.
-        if (!o.stream_token && !strata::gpu::device_sync()) {
+        if (!o.stream_token && !pool_measured(timing == nullptr ? nullptr : &timing->head_wait,
+                                             [&] { return strata::gpu::device_sync(); })) {
             std::fprintf(stderr, "strata generate: the device faulted in lm_head at position %lld: %s\n",
                          (long long) pos, strata::gpu::last_error());
             return 1;
@@ -10098,6 +10131,21 @@ int main(int argc, char** argv) try {
         // separate handling - and the version that "obviously" only samples after the prompt loses exactly one
         // token's worth of conditioning.
         if (pos >= n_prompt - 1) produced.push_back(next);
+        if (timing != nullptr && o.stats) {
+            std::fprintf(stderr, "pool timing position %lld:", (long long) pos);
+            const std::pair<const char*, strata::core::PoolTiming::Span> spans[] = {
+                {"embed", timing->embedding_submit}, {"pre_submit", timing->pre_submit},
+                {"routing_D2H_submit+record", timing->routing_d2h_submit}, {"routing_wait", timing->routing_wait},
+                {"cpu_pool", timing->cpu_pool}, {"parts_H2D_submit", timing->parts_h2d_submit},
+                {"parts_wait(post)", timing->parts_wait}, {"post_submit", timing->post_submit},
+                {"dump_D2H_submit", timing->dump_d2h_submit}, {"session_final_drain", timing->final_drain},
+                {"head_submit", timing->head_submit}, {"head_wait", timing->head_wait}
+            };
+            for (const auto& entry : spans)
+                std::fprintf(stderr, " %s=%.3f/%llu/%llu", entry.first, entry.second.ms,
+                             (unsigned long long) entry.second.count, (unsigned long long) entry.second.bytes);
+            std::fputc('\n', stderr);
+        }
         if ((int64_t) produced.size() >= o.max_new) break;
         if (o.stop_eos && pos >= n_prompt - 1 &&
             std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) next) != o.eos_ids.end()) break;
@@ -10581,8 +10629,12 @@ int main(int argc, char** argv) try {
         return 1;
     }
     if (layer_dump != nullptr) {
-        std::fclose(layer_dump);
+        const int closed = std::fclose(layer_dump);
         strata::gpu::free(layer_stage);
+        if (closed != 0) {
+            std::fprintf(stderr, "strata generate: cannot finish layer dump\n");
+            return 1;
+        }
         std::printf("%-24s %s (%lld layers + the input x %d streams x %lld per position)\n", "layers dumped",
                     o.dump_layers.c_str(), (long long) g.n_layers, (int) g.hc, (long long) g.n_embd);
     }

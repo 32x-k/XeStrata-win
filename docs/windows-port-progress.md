@@ -19,6 +19,135 @@ This document records the work to run XeStrata's SYCL engine on Windows 11 and a
 - [x] Generate meaningful text
 - [x] Confirm GPU use in the execution log
 
+## Current policy: establish correctness while protecting remote access
+
+While the user cannot directly operate the PC, remote access and recoverability take priority over performance. Do not reboot or shut down Windows, update/restart/reset GPU drivers, or change system-wide environment variables or registry settings. Do not launch upstream Strata executables, benchmarks or GPU load tests. Static source reference is allowed, but performance comparisons and output matching must wait for renewed confirmation that the user can directly operate the PC.
+
+Proceed through Phase 0 baseline protection, Phase 1 standalone correctness and stability, Phase 2 timing breakdowns, Phase 3 small measurement-driven optimizations, and Phase 4 generalization and maintainability. In Phase 3, change one major factor at a time and compare prefill, decode, numerical results and generation quality under matching conditions. Keep the working queue/event path; removing synchronization requires checking dependencies and buffer lifetimes. DPC++/HIP remains a separate follow-up investigation, limited for now to static inspection of public sources.
+
+Run GPU work one process at a time using short inputs and existing models. Initial generation caps are 64 and 128 tokens; do not continue past EOS merely to reach a cap. Neither 256 tokens nor long stress tests are mandatory. Use timeouts and monitor Windows RAM, commit and GPU memory. Stop additional load if anomalies, driver unresponsiveness or sudden memory growth are suspected; obtain confirmation before recovery-risk operations.
+
+## 2026-10-11: Phase 0 baseline protection
+
+The current branch is `feature/windows-r9700-sycl`, with HEAD `e7d67ead89cdc308e737b05d8a6ab09675c7679c`. At the start of this check, the only uncommitted changes were the Japanese and English progress documents containing the future plan. Those changes were preserved as a patch too.
+
+The local `build/windows-baseline-20261011T074825Z/` contains the working executable, AdaptiveCpp runtime/backend DLLs, HIP-related DLLs, run/build scripts, CMake configuration, input IDs, successful logs and external-toolchain compatibility patches. Executable and DLL copies were checked with SHA-256, and `source.bundle` passed `git bundle verify`. The copied executable also completed `--help` successfully. This directory is excluded from Git. No model data was copied or downloaded.
+
+Its recovery `run-baseline.bat` selects the saved executable and runtime, using the existing Windows environment and model data. The bundle and `worktree.patch` preserve the source state. This is not a complete image of the OS, driver or original toolchain/ROCm resource tree. Keep this saved execution path without overwriting the existing environment.
+
+The current compiler is clang 24.0.0git from ROCm LLVM revision `4f43f4746ede4cc49ab4129f473dbd54e0d9db4f`; AdaptiveCpp is `0ea863abe1af4422593583f91e5608ef75044a16`. HIP headers report 7.17.26391, and the DLL's `hipRuntimeGetVersion()` returns `71726391`. These current header/runtime values are preserved separately from the earlier “ROCm 7.1 series” description. Configuration uses `STRATA_ADAPTIVECPP=ON` and `hip:gfx1201`, with oneMath/native experts/tests/packaging disabled; generation uses CPU experts, PLE and mmap.
+
+Keep these two saved logs distinct. The 32-token output matches the first 32 tokens of the completed 41-token log.
+
+| Log | Generated tokens | Prefill | Decode | TTFT | CPU pool elapsed time |
+| --- | --- | --- | --- | --- | --- |
+| `model-hello-1.txt` | 32 | 2.00 tok/s | 3.11 tok/s | 6,308.0 ms | 224.633 ms/token |
+| `model-hello-final.txt` | 41, through EOS | 4.39 tok/s | 4.54 tok/s | 2,903.8 ms | 97.727 ms/token |
+
+The latter records a final answer. However, these are not a matched before/after experiment with identical generation caps and established cache conditions, so their difference is not attributed to optimization. The CPU pool figure is elapsed time that may include waits and synchronization, not pure arithmetic time. Numerical agreement with upstream Strata has not been checked.
+
+Before load, Windows reported about 14,660 MiB of available RAM, 18,121 MiB of available commit, a 38,984-MiB commit limit, and 1,502 MiB of aggregate adapter dedicated usage. A separate process queried HIP device 0 without executing kernels: about 32,473 MiB free and 32,624 MiB total. HIP and Windows counters need not describe the same budget; monitor Windows values during execution too.
+
+Commands and records:
+
+- `python .tools/protect-windows-baseline.py`: snapshot creation and hash/bundle validation
+- `cmd /d /c "call build\windows-baseline-20261011T074825Z\run-baseline.bat --help"`: saved executable check
+- `build/windows-acpp/baseline-protection.txt`: protection results
+- `build/windows-acpp/phase0-hip-memory.txt`: HIP memory query
+- `build/windows-acpp/phase1-preflight.txt`: Windows RAM, commit and GPU counters
+
+Phase 0 protection and checks are complete. Phase 1 first fixed asynchronous-I/O completion bounds and shutdown lifetime using host-only tests, then proceeded to small real-file and GPU checks.
+
+## 2026-10-11: Phase 1 transfer ordering and numerical repeatability
+
+### Host-only tests and Windows I/O
+
+`tools/test_session_token_pool_host.py` extracts the actual `session_token_pool()` and related state-update functions into a fake FIFO queue. It checks 48-layer QSA/GDN indexing, state across tokens, callback/transfer ordering, staging lifetimes, invalid inputs and exception cleanup. The added layer dumps are checked by the same fixture. Its mock arithmetic does not establish real-kernel numerical correctness.
+
+`tools/test_dequant_host_contract.py` checks all 65,536 half bit patterns, 384 Q2_0 blocks, and the IQ4_NL codebook and layout. The combined six host-only tests pass.
+
+Windows `DirectFile` now respects the caller's completion capacity even when wake packets and real completions are mixed. Dequeued excess completions remain available for the next call. Shutdown stops issuer threads, cancels outstanding reads and collects terminal completions before ending request/buffer lifetimes. Persistent IOCP infrastructure errors retain live requests and continue waiting instead of freeing them.
+
+Besides fake-Win32 bounds, cancellation and dequeue-failure tests, the real Windows SDK build passes `/W4 /WX` and a real-file test passes. It uses only an owned 32,785-byte file, 64-KiB buffer bank and at most eight reads in flight. Checks cover issuer counts 1/3, completion capacities 1/2, data and outside-buffer canaries, short reads/EOF, rejected misalignment, close/destruction and reopen. Windows may modify the unreturned tail of a short read, so data validation covers only reported bytes. The test does not establish that every cancellation found pending I/O, or recovery from persistent infrastructure errors.
+
+### Native in-order failure and workaround
+
+Two identical hello runs had bitwise-equal residual ladders and 41 generated tokens, but 455,360 logit values differed, with a maximum difference of 23.862265. They exceeded `atol=rtol=1e-5`, and some host-logit argmaxes disagreed with GPU-selected tokens. Matching generated text alone did not detect this problem.
+
+Separate trials of host-USM staging, draining with `queue.wait_and_throw()`, and waiting on the D2H event itself still had argmax disagreements. Changes without demonstrated improvement were reverted.
+
+A small model-free SYCL reproducer isolated the problem. Peak explicit GPU allocation is 993,344 bytes; the process runs with a 20-second Job Object timeout and memory monitoring.
+
+| Check | Native dedicated in-order | In-order through DAG dependencies |
+| --- | --- | --- |
+| Actual subgroup size and XOR reduction | Size 32; all 1,024 items match | All items match |
+| 248,320-element copy after kernel, followed by marker wait | Every item returns stale zero | Every item bitwise matches its reference |
+| Wait kernel event, then wait copy event | All items match | All items match |
+| Actual Q8 head kernel versus independent scalar dot, 64 rows | All rows match | All rows match |
+
+Kernel-to-copy ordering in the native dedicated in-order path cannot be relied upon in the current Windows HIP environment. Only Windows with AdaptiveCpp now supplies `AdaptiveCpp_inorder_executor{nullptr}` when creating compute, transfer and additional streams. AdaptiveCpp uses its DAG path, where each operation depends on its predecessor event. This is an internal submission DAG, not enabling oneAPI command graphs or capture. Linux/DPC++ queue settings, arithmetic kernels and sampling settings are unchanged. The backend's internal cause has not been identified.
+
+### Real-model recheck
+
+The corrected engine was checked with the existing Q2_0 pack and PLE GGUF, context cap 256, at most 64 generated tokens, mmap experts and no capture.
+
+- Two independent three-worker runs bitwise match all 26,593,280 residual floats and 13,160,960 logit floats across 53 positions. Maximum difference is zero; all values are finite.
+- The 41 generated tokens match the previous hello result, and each sampled position's host-logit argmax matches the GPU selection. Decoding through the end confirms a final `Hello!` greeting and EOS.
+- One worker also bitwise matches three workers in residuals, every logit and generated tokens.
+- One run also used 51 input tokens and a 128-generated-token cap. It reached a hello answer and EOS after 55 tokens; all logits across 105 positions were finite, and all 55 sampled-position argmaxes matched GPU selection. This does not test actually generating 128 tokens or reaching a context boundary.
+- Residuals before and after the workaround are bitwise equal. The previously incorrect logit readback changed.
+- The two diagnostic runs measured prefill 2.00/2.24 tok/s and decode 2.01/2.37 tok/s. Layer/logit dumps and cache conditions differ, so these are not speed comparisons against the older logs.
+
+Each run has its own monitored Job Object; GPU tests are not concurrent. Stop conditions include a 150-second deadline, 3 GiB available RAM, 6 GiB available commit, and 8 GiB caps for process private memory and aggregate GPU dedicated usage. None of these runs hit a stop condition, and post-exit GPU usage returned to approximately its starting level. No new models were fetched, upstream Strata was not launched, and drivers/system settings were not changed.
+
+Main records are `build/windows-acpp/phase1-dag-numerical-dumps.json`, `phase1-dag-worker1-numerical.json`, `phase1-dag-longer128-argmax.json`, `phase1-sycl-minimal.txt`, `phase1-sycl-dag.txt`, `phase1-directfile-real-v2.txt`, and each run's monitor/JSON. The existing logit-dump header describes planned rows: 76 versus 53 actual for hello, and 178 versus 105 for the longer input. Validation derives the actual row count from token logs.
+
+The corrected executable, runtime DLLs, changed sources/new tests, validation records, Git bundle and uncommitted patch are separately saved in `build/windows-correctness-baseline-20261011T094332Z/`. SHA-256 and the bundle are checked; the saved executable also passes `--help`. The Phase 0 baseline is unchanged. Model weights are not copied, and recovery still requires the existing driver, toolchain and model resources.
+
+Transfer ordering and numerical repeatability are established for the short sequential path. Still longer inputs, context boundaries, other quantization formats, independent references for all internal states and cleanup under real GPU faults need further checking. No performance optimization has been adopted. The following section records the Phase 2 timing breakdown.
+
+## 2026-10-11: Phase 2 timing breakdown and stopping point
+
+`STRATA_POOL_TIMING=1` measures existing API boundaries in the sequential CPU-pool path using a host monotonic clock. It is disabled by default. No measurement events, copies, synchronization or GPU profiling were added; arithmetic and buffer lifetimes are unchanged. `PoolTiming` counts attempted calls and records successful explicit-copy payload bytes.
+
+The runs use `.tools/bounded-windows-run.py` with `--pool-timing --diagnostics`, setting `STRATA_POOL_TIMING=1` only in the child. Other settings are `HIP_VISIBLE_DEVICES=0`, `STRATA_VRAM_LIMIT_MIB=8192`, `STRATA_NO_XMX=1` and `STRATA_SSD_KEEPALIVE=0`. This does not enforce a 4-GiB maximum allocation. The reproduction command below uses existing local toolchain/pack resources; it is not an instruction to perform extra runs after stopping.
+
+```text
+python .tools/bounded-windows-run.py --exe build/windows-acpp/strata.exe --label phase2-new-measurement --max-new 64 --pool-timing --diagnostics
+```
+
+The saved JSON's older environment list omits `STRATA_POOL_TIMING`; invocation options and the timing header/53 breakdown rows prove activation. This record-format limitation is deferred; no extra execution was performed to repair it.
+
+Conditions match the Phase 1 hello: 13 input tokens, at most 64 generated tokens, context cap 256, three workers, mmap experts and no capture. Two independent runs included layer/logit dumps and used the same monitoring/stop conditions. Every logit and residual across 53 positions bitwise matches both the saved pre-instrumentation result and the other instrumented run. The 41 generated tokens and sampled-position argmaxes match, and all values are finite. All seven host-only tests, including the new timing contract, also pass.
+
+These are mean host elapsed milliseconds across 53 positions. GPU submit means API time for embedding, pre, post and head, not GPU execution time. Waits include runtime scheduling, GPU work and transfers. CPU expert time includes computation, I/O and dispatch waits inside the callback; these are not individually separated.
+
+| Boundary | Run A ms/position | Run B ms/position |
+| --- | ---: | ---: |
+| Routing/input event wait | 349.611 | 324.439 |
+| CPU expert callback | 174.642 | 116.992 |
+| Combined GPU submit | 23.269 | 26.295 |
+| Routing/input D2H submit and event record | 1.430 | 1.760 |
+| Expert parts H2D submit | 2.590 | 2.296 |
+| Final session drain | 1.421 | 1.438 |
+| Diagnostic residual D2H submit | 0.625 | 0.660 |
+
+Routing/input D2H payload is 495,360 bytes/position; parts H2D is 4,915,200 bytes/position. These explicit payloads exclude kernel/driver staging, PLE and head-logit transfers and are not physical bus traffic. Normal settings have no independent wait immediately after post, so that timing field is zero. Completion waits are included in subsequent routing waits and the final drain. Diagnostic residual copies also affect later waits.
+
+Prefill and decode are summarized separately. Decode averages are wait 352.349/318.846 ms, CPU callback 160.867/116.177 ms and GPU submit 22.938/25.144 ms. Cache temperature was not reset or controlled, so A cannot be declared cold and B warm. Instrumentation/dump overhead prevents speed comparisons with earlier ordinary runs.
+
+The three largest observed boundaries and possible future investigations follow. No candidate implementation or optimization trial was performed.
+
+1. **Routing/input waits.** The longest host interval. Separate GPU arithmetic, transfers and DAG scheduling before considering ordered submission batching or kernel fusion. Simply restoring the broken native in-order path or removing synchronization is not a candidate.
+2. **CPU expert callbacks.** Also show substantial variation between runs. Separate paged I/O from computation before examining worker/task granularity and memory-budgeted fixed caches. Callback elapsed time is not pure CPU computation time.
+3. **GPU submission host overhead.** Many small pre/post calls accumulate. Inspect launch counts and runtime work before considering batching that preserves dependencies and staging lifetimes.
+
+Main records are `build/windows-acpp/phase2-timing-summary.json`, `phase2-timing-summary.txt`, `phase2-timing64-a-numerical.json`, `phase2-repeat-numerical.json`, and both execution/monitor logs. Peak process private memory was approximately 5,019 MiB, minimum available RAM 6,046 MiB and available commit 12,665 MiB; no stop threshold was reached.
+
+The Phase 0 executable and the numerically checked Phase 1 recovery copies are preserved. Repository lint is incomplete because required tools are missing. The `possible secret` message when gitleaks is absent is not evidence of a detected secret. New-file REUSE findings are resolved; only the pre-existing Windows checkout state of `.agents/skills` remains. Linux free/contrib-llvm, NVIDIA, integrated graphics, ASan/UBSan, context boundaries, other quantization formats, real GPU fault cleanup, physical transfer timing and hard-fault attribution still need checking.
+
+At the user's request, work stops after Phase 2 records and validation. Phase 3 optimization, migration to DPC++, other-GPU support and major refactoring have not started.
+
 ## 2026-10-11: toolchain check
 
 The repository revision is `e32b8b0594095352365db0e140a68d5bf56d8b0f`. The worktree was unchanged at the start of this work.
@@ -114,9 +243,53 @@ The host syntax check for `session.cpp` passed with `-Wall -Wextra -Werror`, as 
 
 REUSE was also run separately before committing. With `REUSE_ENCODING_MODULE=chardet`, none of the changed files, including the Japanese documents, were missing license information. However, the repository-wide check still reports the existing `.agents/skills`: it is a symlink in Git but is treated as a regular file in this Windows checkout. The full REUSE check exited with status one and has not passed.
 
+## Future plan: stabilize AdaptiveCpp and investigate DPC++ with HIP
+
+### Current baseline and public implementations
+
+The port remains experimental Windows/AMD support. Its execution path is XeStrata → SYCL → a custom AdaptiveCpp build → LLVM 24/AMDGPU → HIP/ROCm → the R9700. Existing Q2_0 pack data and the PLE GGUF have already supported model loading, serial prefill, decode and text generation. This supersedes the early investigation's “model loading and generation not confirmed” status. However, the successful build covers the selected configuration, not native/batched paths or kernels in every configuration.
+
+DPC++ also has an AMD HIP implementation. Unified Runtime is now developed under `unified-runtime/` in intel/llvm; oneapi-src/unified-runtime is a mirror. The HIP adapter's CMake contains Windows import-library settings. Nevertheless, the DPC++ Getting Started Guide states that Windows HIP is not supported. Windows-specific source branches and correct execution on the R9700 require separate verification.
+
+Codeplay's oneAPI for AMD GPUs 2025.2.0 instructions target Linux. Intel/llvm issue #22606 also reports a gfx1200 case on Ubuntu where `single_task` works but `nd_range` fails to launch. Follow-up comments report successful launches and device linking from a static archive after fixes. These are not Windows/gfx1201 success evidence; they inform reproducer tests and compiler revision selection.
+
+### Stage one: stabilize the AdaptiveCpp port
+
+Keep the working Q2_0 serial path as the correctness baseline for further changes. First test asynchronous-I/O shutdown and cancellation, queue/event dependencies, and memory lifetime on failure. Investigate subgroup-size attribute warnings and check both the actual subgroup sizes and operations such as reduction and routing that depend on them. Compilation or a short generation run alone cannot establish correctness of every kernel.
+
+Next document toolchain revisions, compatibility patches, DLL placement and build settings, then reproduce the same generation from an empty build directory. Add longer inputs, longer decode runs, context-boundary cases and different CPU worker counts. Enforce the largest-allocation limit, split arenas exceeding 4 GiB, and then test smaller configurations. Also verify affected tests in Linux free and contrib-llvm builds.
+
+Completion requires reproducible generation without omitting model components, safe cleanup on failure, and build instructions and verification scope that can be checked in other environments. Add native experts and batched prefill after preparing comparison tests against the serial path. Restoring command graphs is not a prerequisite.
+
+### Stage two: investigate Windows DPC++ with HIP separately
+
+Use a separate branch or worktree and toolchain directory for DPC++ investigations; do not overwrite the working AdaptiveCpp environment. Build intel/llvm's DPC++ and the Unified Runtime HIP adapter from source, first checking LLVM compatibility with the chosen ROCm device bitcode. Keep compiler and runtime revisions aligned.
+
+Proceed through adapter loading and GPU enumeration, USM allocation and transfers in both directions, `single_task`, `nd_range`, and event dependencies between multiple queues. Validate half and subgroup operations too, checking runtime sizes and computational results. Because XeStrata combines static libraries, also check device linking across multiple translation units and static archives. Only after output-validation tests pass should model loading and serial generation in XeStrata be attempted.
+
+A compilable oneAPI extension API does not establish HIP-backend support. Check command graphs, virtual memory and matrix features individually, retaining queue/event or other fallbacks where unavailable. Select GPU paths from reported capabilities and actual kernel results, not product names.
+
+Success requires executing and validating both the minimal tests and real-model generation on the Windows R9700. If a clear build or runtime blocker appears, record its minimal reproducer, revisions and errors, stop that investigation, and continue AdaptiveCpp development. Starting the investigation does not commit the project to switching to DPC++.
+
+### Stage three: compare correctness and speed under matching conditions
+
+Defer executing upstream Strata for comparison until the user confirms direct PC access. After that confirmation, compare the AdaptiveCpp port with Strata HIP using the same R9700, model revision and quantization, input token IDs, context length, KV settings, CPU worker count, memory budget and generation settings. Add DPC++ if it reaches real-model generation. Use existing models and packs, asking the user to provide any missing data rather than downloading models automatically.
+
+For correctness, define numerical tolerances and compare logits and layer states as well as generated text. Measure prefill, decode and TTFT separately over repeated runs, distinguishing serial from batched execution and cold from warm runs. Record CPU expert work, GPU work, transfers, I/O, waits and memory use. CPU-only runs or runs omitting PLE or experts cannot establish success.
+
+Use measurements to prioritize a fixed GPU expert cache, transfer overlap, batching and AMD matrix acceleration. Also compare whether DPC++ reduces oneAPI compatibility code and makes the toolchain easier to maintain. Choose paths by model correctness, reproducibility, speed and maintenance cost, not API counts or compiler names. Restrict non-free dependencies to the appropriate build modes, preserving XeStrata's license and Linux paths.
+
+### Research references
+
+- [DPC++ Getting Started Guide: HIP limitations](https://intel.github.io/llvm/GetStartedGuide.html#hip-back-end-limitations)
+- [Unified Runtime's current development location](https://github.com/intel/llvm/tree/sycl/unified-runtime)
+- [HIP adapter CMake](https://github.com/intel/llvm/blob/sycl/unified-runtime/source/adapters/hip/CMakeLists.txt)
+- [Codeplay oneAPI for AMD GPUs 2025.2.0](https://developer.codeplay.com/products/oneapi/amd/2025.2.0/guides/get-started-guide-amd.html)
+- [intel/llvm issue #22606](https://github.com/intel/llvm/issues/22606)
+
 ## Features not started or explicitly deferred
 
-Until the first correct generation, paths may explicitly disable:
+The initial generation path does not use the following. Until stabilization and comparative validation are complete, keep alternatives or explicit disabling rather than expanding support:
 
 - oneAPI experimental command graphs and graph replay
 - the oneAPI virtual-memory elastic cache

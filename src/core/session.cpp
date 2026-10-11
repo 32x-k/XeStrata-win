@@ -774,7 +774,8 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
 
 bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,
                         SessionState& s, float* parts, PoolFn pool, HitFn hits, void* user,
-                        SessionLoopScratch& scratch, void* stream, bool sync_every_layer, std::string& err) {
+                        SessionLoopScratch& scratch, void* stream, bool sync_every_layer, std::string& err,
+                        float* dump_layers, PoolTiming* timing) {
     err.clear();
     if (g.n_layers <= 0 || g.qsa_interval <= 0 || g.n_embd <= 0 || s.k < 1 || s.k > 64 ||
         s.k > g.n_expert || (uint64_t) g.n_embd > std::numeric_limits<size_t>::max() / (s.k * sizeof(float))) {
@@ -790,6 +791,12 @@ bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64
     }
     const size_t x_bytes = (size_t) g.n_embd * sizeof(float);
     const size_t parts_bytes = (size_t) s.k * x_bytes;
+    if (dump_layers != nullptr && (g.hc <= 0 || (uint64_t) g.hc >
+        std::numeric_limits<size_t>::max() / x_bytes / ((uint64_t) g.n_layers + 1))) {
+        err = "session_token_pool: layer dump dimensions overflow";
+        return false;
+    }
+    const size_t residual_bytes = dump_layers == nullptr ? 0 : (size_t) g.hc * x_bytes;
     if (parts == nullptr || scratch.y_miss == nullptr || scratch.probe == nullptr ||
         scratch.parts_bytes != parts_bytes) {
         err = "session_token_pool: requires parts and matching initialized scratch";
@@ -824,6 +831,27 @@ bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64
         return false;
     }
 
+    // Host clocks only when requested. RAII records attempted calls even on callback exceptions;
+    // successful copy bytes are charged from the same argument passed to copy_async.
+    auto measured = [&](PoolTiming::Span PoolTiming::* field, auto&& call, size_t bytes = 0) -> bool {
+        struct Timer {
+            PoolTiming::Span* span;
+            std::chrono::steady_clock::time_point start;
+            explicit Timer(PoolTiming::Span* p) : span(p) {
+                if (span != nullptr) start = std::chrono::steady_clock::now();
+            }
+            ~Timer() {
+                if (span != nullptr) {
+                    span->ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - start).count();
+                    ++span->count;
+                }
+            }
+        } timer(timing == nullptr ? nullptr : &(timing->*field));
+        const bool ok = call();
+        if (ok && timing != nullptr) (timing->*field).bytes += bytes;
+        return ok;
+    };
     int64_t layer = 0;
     auto gpu_error = [&](const char* what) {
         err = "session_token_pool: layer " + std::to_string(layer) + ": " + what + ": " +
@@ -833,6 +861,9 @@ bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64
     // Keep a harmless reference for all-GDN geometries; no QSA state is consumed by those blocks.
     QsaState unused_qsa;
     auto run = [&]() -> bool {
+        if (dump_layers != nullptr && !measured(&PoolTiming::dump_d2h_submit, [&] {
+                return strata::gpu::copy_async(dump_layers, s.block.R, residual_bytes, cs);
+            }, residual_bytes)) return gpu_error("dump input");
         int64_t qsa_index = 0;
         for (layer = 0; layer < g.n_layers; ++layer) {
             gdn_point_at(g, layer, s);
@@ -840,34 +871,62 @@ bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64
             QsaState& qst = nq == 0 ? unused_qsa : s.qsa_states[qsa ? qsa_index : s.qsa_primary()];
             // Null db deliberately disables both mapped device publication and ringing. qsa_layer stages
             // this token's pos/pos_base itself; gdn_point_at selects this layer's persistent recurrence.
-            if (!block_layer_pre(tables, g, layer, pos, pos_base, s.gdn, qst, s.qsa_bufs, s.moe, s.k,
-                                 s.block, cs, err, nullptr, s.ple.ready() ? &s.ple : nullptr)) {
+            if (!measured(&PoolTiming::pre_submit, [&] {
+                    return block_layer_pre(tables, g, layer, pos, pos_base, s.gdn, qst, s.qsa_bufs, s.moe, s.k,
+                                           s.block, cs, err, nullptr, s.ple.ready() ? &s.ple : nullptr);
+                })) {
                 err = "session_token_pool: pre layer " + std::to_string(layer) + ": " + err;
                 return false;
             }
             if (qsa) ++qsa_index;
             // FIFO copies, not device writes to mapped memory. The event also completes the previous
             // layer's H2D read of y_miss before the host reuses any staging for this layer.
-            if (!strata::gpu::copy_async(s.db->h_x_f, s.block.mixed, x_bytes, cs)) return gpu_error("D2H mixed");
-            if (!strata::gpu::copy_async(s.db->h_ids, s.moe.ids, (size_t) s.k * sizeof(int32_t), cs))
-                return gpu_error("D2H IDs");
-            if (!strata::gpu::copy_async(s.db->h_weights, s.moe.weights, (size_t) s.k * sizeof(float), cs))
-                return gpu_error("D2H weights");
-            if (!strata::gpu::event_record(scratch.probe, cs)) return gpu_error("record staging event");
-            if (!strata::gpu::event_sync(scratch.probe)) return gpu_error("wait staging event");
+            if (!measured(&PoolTiming::routing_d2h_submit, [&] {
+                    return strata::gpu::copy_async(s.db->h_x_f, s.block.mixed, x_bytes, cs);
+                }, x_bytes)) return gpu_error("D2H mixed");
+            const size_t ids_bytes = (size_t) s.k * sizeof(int32_t);
+            if (!measured(&PoolTiming::routing_d2h_submit, [&] {
+                    return strata::gpu::copy_async(s.db->h_ids, s.moe.ids, ids_bytes, cs);
+                }, ids_bytes)) return gpu_error("D2H IDs");
+            const size_t weights_bytes = (size_t) s.k * sizeof(float);
+            if (!measured(&PoolTiming::routing_d2h_submit, [&] {
+                    return strata::gpu::copy_async(s.db->h_weights, s.moe.weights, weights_bytes, cs);
+                }, weights_bytes)) return gpu_error("D2H weights");
+            if (!measured(&PoolTiming::routing_d2h_submit, [&] {
+                    return strata::gpu::event_record(scratch.probe, cs);
+                })) return gpu_error("record staging event");
+            if (!measured(&PoolTiming::routing_wait, [&] {
+                    return strata::gpu::event_sync(scratch.probe);
+                })) return gpu_error("wait staging event");
 
             if (hits != nullptr) hits(user, cs, HitPhase::Launch, s.db->h_ids, s.k);
             if (pool != nullptr)
-                pool(user, s.db->h_x_f, s.db->h_ids, s.db->h_weights, g.n_embd, s.k, scratch.y_miss);
+                measured(&PoolTiming::cpu_pool, [&] {
+                    pool(user, s.db->h_x_f, s.db->h_ids, s.db->h_weights, g.n_embd, s.k, scratch.y_miss);
+                    return true;
+                });
             else
                 std::memset(scratch.y_miss, 0, parts_bytes);
-            if (!strata::gpu::copy_async(parts, scratch.y_miss, parts_bytes, cs)) return gpu_error("H2D parts");
+            if (!measured(&PoolTiming::parts_h2d_submit, [&] {
+                    return strata::gpu::copy_async(parts, scratch.y_miss, parts_bytes, cs);
+                }, parts_bytes)) return gpu_error("H2D parts");
             if (hits != nullptr) hits(user, cs, HitPhase::Combine, nullptr, 0);
-            if (!block_layer_post(tables, g, layer, s.k, s.moe, s.block, parts, cs, err)) {
+            if (!measured(&PoolTiming::post_submit, [&] {
+                    return block_layer_post(tables, g, layer, s.k, s.moe, s.block, parts, cs, err);
+                })) {
                 err = "session_token_pool: post layer " + std::to_string(layer) + ": " + err;
                 return false;
             }
-            if (sync_every_layer && !strata::gpu::stream_sync(cs)) return gpu_error("post sync");
+            // Copy before the next pre can replace R. The final drain keeps the entire host ladder alive.
+            if (dump_layers != nullptr && !measured(&PoolTiming::dump_d2h_submit, [&] {
+                    return strata::gpu::copy_async(
+                        dump_layers + (size_t) (layer + 1) * (residual_bytes / sizeof(float)),
+                        s.block.R, residual_bytes, cs);
+                }, residual_bytes)) return gpu_error("dump layer");
+            // There is no independent parts fence: this optional existing wait includes the post.
+            if (sync_every_layer && !measured(&PoolTiming::parts_wait, [&] {
+                    return strata::gpu::stream_sync(cs);
+                })) return gpu_error("post sync");
         }
         return true;
     };
@@ -881,7 +940,7 @@ bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64
     }
     // Even a failed pre/copy/callback can leave staging transfers queued. Drain on every submitted path,
     // preserving the original diagnostic if the cleanup wait also fails; callers may now reuse/free staging.
-    if (!strata::gpu::stream_sync(cs)) {
+    if (!measured(&PoolTiming::final_drain, [&] { return strata::gpu::stream_sync(cs); })) {
         if (!err.empty()) err += "; ";
         err += "session_token_pool: final sync: " + std::string(strata::gpu::last_error());
         return false;

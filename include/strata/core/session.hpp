@@ -380,6 +380,32 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
                   PoolFn pool, HitFn hits, void* user, bool overlap, void* stream, std::string& err,
                   float* dump_layers = nullptr, SessionLoopScratch* scratch = nullptr);
 
+/// Optional HOST wall-clock counters; value-initialize with {} before first use. Calls accumulate.
+/// Counts are attempted calls (including failures/throws); bytes count successful explicit copy submissions
+/// at the measured boundary, using their actual call arguments, NOT traffic inside kernels/callbacks.
+/// Submission times are host API time, not kernel time; they can include runtime/internal blocking work.
+/// ALL waits include runtime scheduling + queued GPU work + transfers, NOT pure GPU timing.
+/// No added events, fences, copies or device profiling. Hit callbacks are not charged to cpu_pool.
+struct PoolTiming {
+    struct Span {
+        double ms;
+        uint64_t count;
+        uint64_t bytes;
+    };
+    Span pre_submit;
+    Span routing_d2h_submit;   ///< three copies per layer, plus event record (zero bytes)
+    Span routing_wait;         ///< existing event_sync, also protects previous parts staging reuse
+    Span cpu_pool;             ///< actual expert callback only; null-pool memset is not a callback
+    Span parts_h2d_submit;
+    Span parts_wait;           ///< optional existing post stream_sync; includes hits/post, NOT just H2D
+    Span post_submit;
+    Span dump_d2h_submit;      ///< optional input/residual ladder copies, separate from routing traffic
+    Span final_drain;          ///< session_token_pool's existing final stream_sync, also on failure
+    Span embedding_submit;    ///< caller's put_input, including any waits already inside it
+    Span head_submit;         ///< caller's run_head, including any waits already inside it
+    Span head_wait;            ///< caller's existing non-stream-token device_sync after head
+};
+
 /// Direct full-model token with the CPU pool and optional VRAM hits, available in every build mode.
 /// No graphs or doorbell polling: `pre[l]` runs without a doorbell, then explicit D2H copies of
 /// `block.mixed`, router IDs and weights into `s.db`'s HOST staging are event-waited before any callback.
@@ -391,9 +417,12 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
 /// The caller stages PLE rows/token history as for `session_token`; QSA position staging is done by `pre`.
 /// Always drains the stream before returning after submissions, including failures, for staging lifetime.
 /// `sync_every_layer` additionally checks each post; `session_token`'s caller-filled parts contract is unchanged.
+/// Optional HOST `dump_layers` holds (n_layers+1)*hc*n_embd floats: input, then each post residual.
+/// It must stay alive through return; the final stream drain completes its ordered copies.
 bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,
                         SessionState& s, float* parts, PoolFn pool, HitFn hits, void* user,
-                        SessionLoopScratch& scratch, void* stream, bool sync_every_layer, std::string& err);
+                        SessionLoopScratch& scratch, void* stream, bool sync_every_layer, std::string& err,
+                        float* dump_layers = nullptr, PoolTiming* timing = nullptr);
 
 // ================================ plan v0.3 P3: THE WHOLE TOKEN AS ONE GRAPH ================================
 //
