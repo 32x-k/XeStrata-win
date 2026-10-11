@@ -83,6 +83,7 @@
 #include "strata/core/gpu.hpp"
 
 #include <array>
+#include <exception>
 #include <chrono>
 #include <algorithm>
 #include <memory>
@@ -2073,11 +2074,42 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     return el > 0 ? (double) done / el : -1.0;
 }
 
+// Issue #10: an exception that leaves the engine (a kernel launch the GPU runtime refused, a GPU that fell off the
+// bus) ended it through std::terminate with only the exception's text.  This handler reports it instead: one stderr
+// line and one ERR line on stdout, which the server keeps as the engine's last words (death_note) and shows in the web
+// app, with what the engine was doing, the SYCL and Unified Runtime codes, the VRAM free and whether the GPU still
+// answers.  A handler rather than a catch in main: an uncaught exception reaches it without unwinding the stack, whose
+// destructors would wait on a GPU that may be gone, and it covers the engine's own threads too.  The engine then ends;
+// the server starts it again for the next request.
+[[noreturn]] void report_and_end() {
+    std::string report = "an unknown exception";
+    if (const std::exception_ptr ep = std::current_exception()) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            report = strata::gpu::failure_report(e);
+        } catch (...) {
+        }
+    } else {
+        report = "std::terminate without an exception";
+    }
+    const strata::core::Progress& p = strata::core::progress();
+    std::fprintf(stderr, "strata generate: FATAL while %s (detail %lld, prompt chunk at %lld): %s\n", p.where.load(),
+                 (long long) p.detail.load(), (long long) p.chunk.load(), report.c_str());
+    std::printf("ERR the engine stopped while %s (detail %lld, prompt chunk at %lld): %s\n", p.where.load(),
+                (long long) p.detail.load(), (long long) p.chunk.load(), report.c_str());
+    std::fflush(stdout);
+    std::fflush(stderr);
+    strata::core::release_gpu_waits(stderr);
+    std::_Exit(3);
+}
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::set_terminate(report_and_end);   // issue #10: an exception that leaves the engine is reported, not lost
     // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is
     // touched (upstream b7dd070d)
     for (int i = 1; i < argc && i < 3; ++i) {

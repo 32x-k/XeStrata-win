@@ -10,6 +10,7 @@
 #include <exception>
 #include <list>
 #include <mutex>
+#include <string>
 #include <thread>
 
 namespace strata::core {
@@ -46,6 +47,9 @@ public:
     // An engine stream for copies and events alone, on the GPU's copy engine where the device reports a copy-only
     // queue group (Level Zero); elsewhere an ordinary engine stream.  No kernel may go on it.
     sycl::queue* create_copy_stream();
+    // Whether the GPU still answers (issue #10): Level Zero's zeDeviceGetStatus, "answers" or "lost" (or its result
+    // code); "unknown" for a backend or a build without that call.  Safe after a failure: it submits no work.
+    std::string device_status();
     void destroy_stream(sycl::queue* stream);
     sycl::queue& stream(void* stream);
 

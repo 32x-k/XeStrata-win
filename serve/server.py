@@ -2753,6 +2753,7 @@ class Service:
         self.latencies = Latencies()                     # GET /metrics in Prometheus text: the latency histograms
         self.last_request_at: float | None = None        # when a request last started or finished
         self.started_at = time.time()
+        self.engine_failure: dict | None = None   # issue #10: the last engine that died in a request, for the web app
         self.updates = release_check.Checker()           # GET/POST /update: whether a newer release is out
         self.status_lock = threading.Lock()
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
@@ -2978,9 +2979,11 @@ class Service:
             self.fifo.release()
 
     def _say_died(self, e: Exception) -> None:
-        """The server window's line for an engine that died (or was ended, #481) in the middle of a request."""
+        """The server window's line for an engine that died (or was ended, #481) in the middle of a request; the web
+        app shows it too (issue #10: engine_failure in /metrics and /v1/status)."""
         note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
         log = getattr(self.engine, "log_path", None)
+        self.engine_failure = {"at": int(time.time()), "message": f"{e}. {note}".strip(), "log": log}
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
@@ -3220,7 +3223,8 @@ class Service:
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
-                tel["static"], "history": tel["history"], "time": now}
+                tel["static"], "history": tel["history"], "time": now,
+                "engine_failure": self.engine_failure}
 
     def prometheus(self) -> str:
         """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
@@ -3286,6 +3290,7 @@ class Service:
             "activity": {"requests": totals["requests"] + int(busy), "in_flight": int(busy) + int(s.get("queued") or 0),
                          "last_request_at": int(last_at) if last_at else None},
             "last_timings": last_t,
+            "engine_failure": self.engine_failure,
             "vram": dict((getattr(self.engine, "info", {}) or {}).get("vram") or {},
                          elastic=bool((getattr(self.engine, "info", {}) or {}).get("vram_elastic"))),
             "machine": {

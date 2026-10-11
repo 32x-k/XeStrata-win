@@ -300,6 +300,28 @@ sycl::queue* Runtime::create_copy_stream() {
     return create_stream();
 }
 
+std::string Runtime::device_status() {
+#ifdef STRATA_HAVE_ZE_API
+    if (device_.get_backend() == sycl::backend::ext_oneapi_level_zero) {
+        try {
+            void* lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);
+            using StatusFn = decltype(&zeDeviceGetStatus);
+            auto status = lib ? reinterpret_cast<StatusFn>(dlsym(lib, "zeDeviceGetStatus")) : nullptr;
+            if (status == nullptr) return "unknown";
+            const ze_result_t r = status(sycl::get_native<sycl::backend::ext_oneapi_level_zero>(device_));
+            if (r == ZE_RESULT_SUCCESS) return "answers";
+            if (r == ZE_RESULT_ERROR_DEVICE_LOST) return "lost";
+            char buf[48];
+            std::snprintf(buf, sizeof buf, "Level Zero result 0x%x", (unsigned) r);
+            return buf;
+        } catch (const std::exception&) {
+            return "unknown";
+        }
+    }
+#endif
+    return "unknown";
+}
+
 void Runtime::destroy_stream(sycl::queue* stream) {
     if (!stream) return;
     if (!owns(stream) || stream == &compute_ || stream == &transfer_)

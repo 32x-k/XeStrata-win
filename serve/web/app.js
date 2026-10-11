@@ -203,6 +203,7 @@ function setMetric(key, value, unit, sub) {
 }
 
 let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
+let failureSeen = null;   // issue #10: the engine failure already shown as a toast (its time)
 let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
 async function poll() {
   try {
@@ -243,7 +244,13 @@ function render(m) {
     setPill("idle", "Idle");
   }
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
-  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
+  // issue #10: an engine that stopped in a request says why once (the server starts it again for the next one)
+  const fail = m.engine_failure;
+  if (fail && fail.at !== failureSeen) {
+    if (failureSeen !== null || Date.now() / 1000 - fail.at < 600) toast("error", "The engine stopped", fail.message, 15000);
+    failureSeen = fail.at;
+  }
+  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, fail);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
   if (tab === "about") renderAbout(eng, hw, st);
 }
@@ -290,7 +297,7 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
-function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail) {
   // model state
   const on = live.queued > 0 ? "queued" : live.state;
   for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
@@ -313,6 +320,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   } else if (last) {
     delete prog.dataset.tone;
     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
+  }
+  if (fail && live.state === "idle") {   // issue #10: the last engine that stopped, until a request runs again
+    label = `Engine stopped at ${new Date(fail.at * 1000).toLocaleTimeString()}`;
+    detail = fail.message;
+    for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === "error");
   }
   $("state-label").textContent = label;
   $("state-detail").textContent = detail;
