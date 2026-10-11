@@ -282,7 +282,15 @@ std::optional<HostMemoryReading> sample_host_memory(const MemoryProbePaths& path
 }
 
 std::optional<HostMemoryReading> sample_host_memory() {
+#if defined(_WIN32)
+    // no meminfo and no cgroups: the available and total physical memory, and the operator's cap
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof status;
+    if (!GlobalMemoryStatusEx(&status)) return {};
+    return combine((uint64_t) status.ullAvailPhys, (uint64_t) status.ullTotalPhys, CgroupScan{}, memory_limit_bytes());
+#else
     return sample_host_memory(MemoryProbePaths{}, memory_limit_bytes());
+#endif
 }
 
 std::optional<uint64_t> available_host_bytes() {

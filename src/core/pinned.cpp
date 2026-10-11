@@ -80,7 +80,8 @@ void register_pieces(uint8_t* base, uint64_t bytes, const std::vector<uint64_t>&
 // Upstream #771: with transparent huge pages "always" the kernel backs a mapping with huge pages where it can; an
 // extra MADV_HUGEPAGE only adds direct reclaim and compaction on every fault (defrag=madvise), which on a fragmented
 // machine stretched a 25 s start to 432 s.  So it is not asked for there; STRATA_NO_ARENA_THP=1 skips it anywhere.
-// Returns why it was skipped, or an empty string when it should be asked for.
+// Returns why it was skipped, or an empty string when it should be asked for.  Linux only: Windows has no THP.
+#if !defined(_WIN32)
 std::string thp_request_skipped() {
     if (std::getenv("STRATA_NO_ARENA_THP") != nullptr) return "transparent huge pages skipped (STRATA_NO_ARENA_THP)";
     std::string mode;
@@ -96,6 +97,7 @@ std::string thp_request_skipped() {
     return mode == "always" ? "transparent huge pages are on for every mapping (THP always): MADV_HUGEPAGE not requested"
                             : std::string();
 }
+#endif
 }  // namespace
 
 PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, slice, std::vector<uint64_t>{}) {}
@@ -417,10 +419,13 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err) {
         // the moved layer's whole pages back to the system (MADV_DONTNEED on a private mapping drops them)
         const uintptr_t a = ((uintptr_t) base + bounds_[l] + 4095) & ~(uintptr_t) 4095;
         const uintptr_t b = ((uintptr_t) base + bounds_[l + 1]) & ~(uintptr_t) 4095;
+#if defined(_WIN32)
+        if (b > a && shared_fd_ < 0) VirtualFree((void*) a, (size_t) (b - a), MEM_DECOMMIT);
+#else
         if (b > a) madvise((void*) a, (size_t) (b - a), MADV_DONTNEED);
+#endif
     }
-    munmap(map_, map_bytes_);
-    map_ = nullptr;
+    unmap(shared_fd_ >= 0);
     map_bytes_ = 0;
     layer_base = std::move(blocks);
     pieces_.clear();

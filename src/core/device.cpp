@@ -19,6 +19,13 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace strata::core {
 namespace {
@@ -385,13 +392,21 @@ bool integrated_gpu(const sycl::device& d) {
 
 // upstream 004b15cd (#409): an integrated GPU's memory is the system RAM, and what its runtime reports free need not
 // subtract the CPU's allocations (an AMD APU's figure counts its whole shared pool).  The engine takes the smaller of
-// that figure and what Linux can give back, less STRATA_UMA_HEADROOM_GIB (default 6) for the system.
+// that figure and what the OS can give back, less STRATA_UMA_HEADROOM_GIB (default 6) for the system.
 void apply_uma_limit(uint64_t& free) {
     static const uint64_t headroom = [] {
         const char* v = std::getenv("STRATA_UMA_HEADROOM_GIB");
         const long long g = v != nullptr ? std::strtoll(v, nullptr, 10) : 6;
         return (uint64_t) std::max(0LL, g) << 30;
     }();
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) {
+        const uint64_t avail = (uint64_t) ms.ullAvailPhys;
+        free = std::min(free, avail > headroom ? avail - headroom : 0);
+    }
+#else
     std::ifstream meminfo("/proc/meminfo");
     std::string key;
     uint64_t kb = 0;
@@ -403,6 +418,7 @@ void apply_uma_limit(uint64_t& free) {
         }
         meminfo.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
     }
+#endif
 }
 
 void apply_vram_limit(uint64_t& free, uint64_t& total) {

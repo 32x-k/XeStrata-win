@@ -114,6 +114,10 @@ uint64_t total_physical_memory() {
     ms.dwLength = sizeof ms;
     return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullTotalPhys : 0;
 }
+
+bool read_ahead_enabled() { return false; }
+void advise_willneed(const void*, uint64_t) {}
+void advise_willneed(int, uint64_t, uint64_t) {}
 #else
 LockResult lock_resident(void* p, uint64_t bytes) {
     LockResult r;
@@ -139,7 +143,6 @@ uint64_t total_physical_memory() {
     const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
     return pages > 0 && page > 0 ? (uint64_t) pages * (uint64_t) page : 0;
 }
-#endif
 
 namespace {
 constexpr uint64_t kAdviseStep = 128ull << 10;
@@ -166,5 +169,6 @@ void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {
     for (uint64_t at = 0; at < bytes; at += kAdviseStep)
         (void) posix_fadvise(fd, (off_t) (offset + at), (off_t) std::min(kAdviseStep, bytes - at), POSIX_FADV_WILLNEED);
 }
+#endif
 
 }  // namespace strata::platform
