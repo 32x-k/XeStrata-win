@@ -674,8 +674,15 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) 
             float* hist = gdn_conv_[(size_t) b.gdn];
             proj(b.qkv, hn_, qkv_, T, false);
             proj(b.z, hn_, z_, T, false);
-            proj(b.alpha, hn_, alpha_, T, false);
-            proj(b.beta, hn_, beta_, T, false);
+            // alpha and beta, one shape and type: one launch where the pair kernel takes the type (nextsycl's
+            // Qwen3.5 decode fuses the two products)
+            if (b.alpha.type == kBF16 || b.alpha.type != b.beta.type || b.alpha.n_in != b.beta.n_in ||
+                b.alpha.n_out != b.beta.n_out ||
+                !k::native_mmvq_pair(b.alpha.type, b.alpha.data, b.beta.data, xq_, alpha_, beta_, b.alpha.n_in,
+                                     b.alpha.n_out, T, cs)) {
+                proj(b.alpha, hn_, alpha_, T, false);
+                proj(b.beta, hn_, beta_, T, false);
+            }
             for (int t = 0; t < T; ++t) {   // the recurrence, token by token
                 float* h = hc_ + (size_t) t * C;
                 k::native_gdn_conv_silu(hist, qkv_ + (size_t) t * C, b.conv, craw_, h, C, s.ssm_d_conv, cs);
