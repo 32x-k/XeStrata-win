@@ -1241,11 +1241,18 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
         }
-        moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
-        if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
+        const bool multi_combine = dec_batch && n > 1 && native_moe_combine_enabled();
+        const bool fold_hits = multi_combine && native_moe_fuse_hits();   // the hit rows added inside the combine
+        if (!fold_hits) moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
+        if (multi_combine) {   // one launch for the window's rows
             try {
-                native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs,
-                                         gate_later_[grp] ? sh_g_ + tb : nullptr);
+                if (fold_hits)
+                    native_moe_combine_multi_hits(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
+                                                  shared_ + tb * N, bo_ + tb * N, N, K, n, cs,
+                                                  gate_later_[grp] ? sh_g_ + tb : nullptr);
+                else
+                    native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N,
+                                             K, n, cs, gate_later_[grp] ? sh_g_ + tb : nullptr);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         for (int t = tb; t < te; ++t) {
