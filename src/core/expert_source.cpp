@@ -1072,7 +1072,7 @@ bool FileExpertSource::pin_cache_complement(
                         blobs.emplace_back(offsets[i], layer_blob_bytes_[i / (size_t) n_expert_]);
                 std::sort(blobs.begin(), blobs.end());
                 const char* parts_env = std::getenv("STRATA_PIN_PARTS");   // 0: one allocation or none (A/B)
-                const int max_parts = parts_env != nullptr ? std::atoi(parts_env) : 32;
+                const int max_parts = parts_env != nullptr ? (int) std::strtol(parts_env, nullptr, 10) : 32;
                 for (int parts = 2; parts <= max_parts && chunks.empty(); ++parts) {
                     std::vector<ComplementChunk> got;
                     uint64_t start = 0;
