@@ -623,7 +623,13 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                             if (!copied) { err = "plain prompt: an expert could not be read"; return false; }
                             blob = dst;
                         }
-                        k::dequant_f16(f.gu_type, blob, 0, 2 * FF, N, P.dq_gu + (size_t) q * P.gu_elems, cs);
+                        uint16_t* dq = P.dq_gu + (size_t) q * P.gu_elems;
+                        if (k::cpu::native_mixed_gu(f)) {   // gate and up of different types: each by its own
+                            k::dequant_f16(f.gu_type, blob, 0, FF, N, dq, cs);
+                            k::dequant_f16(f.up_type, blob + f.up_off, 0, FF, N, dq + FF * N, cs);
+                        } else {
+                            k::dequant_f16(f.gu_type, blob, 0, 2 * FF, N, dq, cs);
+                        }
                         k::dequant_f16(f.d_type, blob + f.down_off, 0, N, FF, P.dq_d + (size_t) q * P.d_elems, cs);
                     }
                     const int32_t* hbnd = P.h_bounds + g0;

@@ -378,7 +378,8 @@ bool PlainModel::prompt_int8() const {
     const int64_t N = spec_.n_embd, FF = spec_.n_ff_exp;
     if (N % 128 != 0 || (2 * FF) % 128 != 0 || FF % 32 != 0) return false;
     for (const auto& f : k::cpu::expert_layout().fmt)
-        if (!k::iq_mmq_type_ok(f.gu_type) || !k::iq_mmq_type_ok(f.d_type) ||
+        if (k::cpu::native_mixed_gu(f) ||   // a layer whose gate and up differ in type: the FP16 path's split dequant
+            !k::iq_mmq_type_ok(f.gu_type) || !k::iq_mmq_type_ok(f.d_type) ||
             f.up_off != (size_t) FF * k::iq_mmq_row_bytes(f.gu_type, N))
             return false;
     return true;
