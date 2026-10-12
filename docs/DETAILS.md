@@ -1320,7 +1320,12 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 | The engine stopped in the middle of a request (a toast in the web app, "Engine stopped" in the Monitor's state) | An exception such as a kernel launch the GPU runtime refused (device memory or resources short) or a GPU that stopped answering. The engine writes one line with what it was doing (the stage and the prompt chunk), the SYCL and Unified Runtime error codes, the VRAM free and whether the GPU still answers (Level Zero's `zeDeviceGetStatus`), ends, and the next request starts it again (issue #10). On Level Zero `level_zero backend failed with error: 40` stands for device memory and for resources alike. If the GPU is "lost", please open an issue with the xe lines and the PCIe AER lines of `sudo dmesg`. |
 | `the engine said nothing for ... s during the request` | The engine and the server lost step (the engine waits for its next command, the server for the request's end; GPU at 0%, nothing in the log; upstream #481). The server ends the engine after 300 s without a line from it during a request, the request ends with an error and the next request starts the engine again. `"engine_silence_s": 600` in `xestrata-<model>.json` sets the time (0 = wait forever, as before). |
 | `the engine said nothing for ... s and used no CPU or disk in that time (frozen ...)` | A quicker version of the check above (upstream #1317): an engine that prints nothing and uses no CPU or disk for 90 s is taken as stuck, ended, and started again by the next request. One whose GPU is busy (10% or more) or that is silent but working is not ended, only reported once. `STRATA_ENGINE_STALL_S` sets the time (0 = off). While a prompt layer reads the file tier again (low RAM), the engine's own watchdog also waits up to 10 times as long (`STRATA_WATCHDOG_IO_S`, upstream #1407). |
-| Anything else | The engine log is `xestrata-<model>.log` in the XeStrata folder; attach it to an issue. |
+| Anything else | Follow the `log` field in the model configuration actually in use. Usually the engine log is in the XeStrata folder for a source installation, or `~/.local/state/xestrata` for deb/rpm. |
+
+The [recovery and diagnosis instructions](DIAGNOSE.md) are for LLM agents that can use your terminal.
+They distinguish source and deb/rpm installations and ask for the cause and evidence whether the agent fixes the problem or gets stuck.
+The report format brings together reproduction steps, logs, code investigation and changes for developers.
+When opening an issue, include the report and necessary log excerpts after removing secrets and personal information.
 
 ---
 

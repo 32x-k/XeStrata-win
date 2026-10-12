@@ -285,8 +285,11 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 会話が、選んだ文脈の長さより長くなっています。新しい会話を始めるか、`xestrata --setup` で長い文脈を選び直してください。
 
 **解決しないとき**
-[詳しい対処の表](docs/DETAILS.ja.md#困ったとき)を見てください。それでも解決しなければ
-[issue](https://github.com/MistVVK/XeStrata/issues) を立て、`~/.local/state/xestrata/xestrata-<モデル>.log` を添付してください。
+[詳しい対処の表](docs/DETAILS.ja.md#困ったとき)を見てください。
+端末を操作できる LLM エージェントには、[復旧と原因調査の指示書](docs/DIAGNOSE.ja.md)と症状を渡せます。
+ソース版と deb/rpm 版の両方に対応し、復旧できた場合も、詰まった場合も、原因と根拠を報告します。
+開発者の対応が必要なら、秘密や個人情報を除いた報告を添えて [issue](https://github.com/MistVVK/XeStrata/issues) を立ててください。
+エンジンのログの場所は、実際に使っているモデルの設定の `log` で確認できます。
 
 ## しくみ
 

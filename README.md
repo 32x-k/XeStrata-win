@@ -302,8 +302,11 @@ The conversation is longer than the context you chose. Start a new conversation,
 choose a longer context.
 
 **Still stuck?**
-See the [full troubleshooting table](docs/DETAILS.md#troubleshooting). If that does not help, open an
-[issue](https://github.com/MistVVK/XeStrata/issues) and attach `~/.local/state/xestrata/xestrata-<model>.log`.
+See the [full troubleshooting table](docs/DETAILS.md#troubleshooting).
+Give an LLM agent that can use your terminal the [recovery and diagnosis instructions](docs/DIAGNOSE.md) and your symptoms.
+They cover both source and deb/rpm installations and ask for the cause and evidence whether recovery succeeds or the agent gets stuck.
+If developer help is needed, open an [issue](https://github.com/MistVVK/XeStrata/issues) with the report, after removing secrets and personal information.
+Find the engine log's location in the `log` field of the model configuration actually in use.
 
 ## How it works
 
