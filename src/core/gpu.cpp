@@ -42,6 +42,9 @@ namespace sx = sycl::ext::oneapi::experimental;
 struct Event {
     std::optional<sycl::event> ev;
     bool timing = false;
+#if defined(STRATA_ADAPTIVECPP)
+    void* hip_ev = nullptr;   // a timing event's hipEvent_t, recorded on the HIP stream the marker ran on
+#endif
 };
 
 struct Graph {
@@ -141,11 +144,17 @@ struct HipApi {
     int (*graph_destroy)(void* graph) = nullptr;
     int (*exec_destroy)(void* exec) = nullptr;
     const char* (*error_string)(int) = nullptr;
+    int (*event_create)(void** event) = nullptr;
+    int (*event_record)(void* event, void* stream) = nullptr;
+    int (*event_sync)(void* event) = nullptr;
+    int (*event_elapsed)(float* ms, void* from, void* to) = nullptr;
+    int (*event_destroy)(void* event) = nullptr;
     bool memory() const { return get_device && set_device && mem_get_info; }
     bool graphs() const {
         return begin_capture && end_capture && graph_nodes && instantiate && graph_launch && graph_destroy &&
                exec_destroy && error_string;
     }
+    bool events() const { return event_create && event_record && event_sync && event_elapsed && event_destroy; }
 };
 constexpr int kHipCaptureModeRelaxed = 2;   // hipStreamCaptureModeRelaxed
 
@@ -176,6 +185,11 @@ const HipApi& hip() {
         get(a.graph_destroy, "hipGraphDestroy");
         get(a.exec_destroy, "hipGraphExecDestroy");
         get(a.error_string, "hipGetErrorString");
+        get(a.event_create, "hipEventCreate");
+        get(a.event_record, "hipEventRecord");
+        get(a.event_sync, "hipEventSynchronize");
+        get(a.event_elapsed, "hipEventElapsedTime");
+        get(a.event_destroy, "hipEventDestroy");
         return a;
     }();
     return api;
@@ -565,14 +579,27 @@ bool event_create(Event** e, bool timing) {
     return true;
 }
 
-void event_destroy(Event* e) { delete e; }
+void event_destroy(Event* e) {
+#if defined(STRATA_ADAPTIVECPP)
+    if (e != nullptr && e->hip_ev != nullptr) hip().event_destroy(e->hip_ev);
+#endif
+    delete e;
+}
 
 bool event_record(Event* e, Stream s) {
     // an event without timing is a barrier where the runtime measured timestamps to slow the waits (measure_marks)
     try {
         auto& queue = q(s);
 #if defined(STRATA_ADAPTIVECPP)
-        e->ev = marker(queue);
+        if (e->timing && hip().events()) {
+            // SYCL events carry no timestamps here: a HIP event recorded where the marker runs, ordered like it
+            e->ev = queue.AdaptiveCpp_enqueue_custom_operation([e](sycl::interop_handle& h) {
+                if (e->hip_ev == nullptr && hip().event_create(&e->hip_ev) != 0) e->hip_ev = nullptr;
+                if (e->hip_ev != nullptr) hip().event_record(e->hip_ev, h.get_native_queue<sycl::backend::hip>());
+            });
+        } else {
+            e->ev = marker(queue);
+        }
 #else
         e->ev = e->timing || !rt_of(s).marks_by_barrier() ? sx::submit_profiling_tag(queue)
                                                           : queue.ext_oneapi_submit_barrier();
@@ -611,6 +638,20 @@ bool stream_wait_event(Stream s, const Event* e) {
 bool event_elapsed_ms(float* ms, const Event* from, const Event* to) {
     if (!from->ev || !to->ev) { g_error = "event_elapsed_ms: an event was not recorded"; return false; }
     if (!from->timing || !to->timing) { g_error = "event_elapsed_ms: an event was not created for timing"; return false; }
+#if defined(STRATA_ADAPTIVECPP)
+    try {
+        rt().wait(*from->ev, "event elapsed");
+        rt().wait(*to->ev, "event elapsed");
+        if (from->hip_ev == nullptr || to->hip_ev == nullptr) {
+            g_error = "event_elapsed_ms: no HIP timing event";
+            return false;
+        }
+        int rc = hip().event_sync(to->hip_ev);
+        if (rc == 0) rc = hip().event_elapsed(ms, from->hip_ev, to->hip_ev);
+        if (rc != 0) { g_error = hip_error("event_elapsed_ms", rc); return false; }
+        return true;
+    } catch (const std::exception& ex) { return fail("event_elapsed_ms", ex); }
+#endif
     try {
         const auto a = from->ev->get_profiling_info<sycl::info::event_profiling::command_end>();
         const auto b = to->ev->get_profiling_info<sycl::info::event_profiling::command_end>();

@@ -4494,9 +4494,11 @@ int main(int argc, char** argv) try {
 #else
     const bool pool_graphs_wanted = pool_graphs_env != nullptr && std::strcmp(pool_graphs_env, "1") == 0;
 #endif
-    const bool pool_graphs = o.no_capture && pool_fn != nullptr && !native_pack && pool_graphs_wanted;
+    // --stage-timing records its events between the kernels, which a graph would not carry
+    const bool pool_graphs =
+        o.no_capture && pool_fn != nullptr && !native_pack && pool_graphs_wanted && !o.stage_timing;
     if (pool_graphs) {
-        if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/false, /*doorbell=*/false)) {
+        if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages, /*doorbell=*/false)) {
             std::fprintf(stderr, "strata generate: session_capture (pool graphs): %s\n", err.c_str());
             return 1;
         }

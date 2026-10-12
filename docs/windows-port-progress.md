@@ -543,3 +543,21 @@ All logits matched the run without graphs bitwise (53 positions of hello, 66 of 
 On this PC the expert cache made it slower. The free commit limits it to about 4,900 slots (about 20% of the experts); filled from the profile at start it hit 48%, and Decode was 4.3 tok/s. The hits are computed outside the graphs, in series with the GPU's layers, and pay the launch cost per kernel. The CPU pool takes about 30 ms per position with graphs, so the cache adds more than it moves.
 
 `--stage-timing` returns zeros in the AdaptiveCpp build, so the GPU time per kernel is not measured yet. Unverified: Linux free and contrib-llvm (`session_capture`'s change keeps the old behaviour by default), NVIDIA, integrated graphics, long contexts, other quantizations.
+
+<a id="gpu-time-per-token"></a>
+## 2026-10-13: where the GPU time goes
+
+In the AdaptiveCpp build a timing event was a marker kernel without timestamps, so `--stage-timing` reported zero for every stage. Timing events now record a HIP event from a custom operation and read the interval with `hipEventElapsedTime`. With `--stage-timing` the pool path does not use graphs (a graph cannot hold the timing events). This timing adds a submission per mark, so its values are mostly the launch cost, proportional to the kernel count, and Decode falls to 2.64 tok/s. It is for proportions only.
+
+`--gpu-stages` now works with the pool path's graphs as well (`session_capture`'s `split`). The GPU time per token measured inside the graphs:
+
+| Part | ms/token | ms/layer |
+| --- | ---: | ---: |
+| mixer (gr_read, attention, gr_write) | 21.9 | 0.46 |
+| FFN front and router | 12.6 | 0.26 |
+| post (moe_finish, gr_write) | 1.0 | 0.02 |
+| total | 35.5 | 0.74 |
+
+GDN layers take 0.44 ms each, QSA layers 0.50 ms. The five-stage table from prefix differences disagrees widely with the sweep (-91% for the router, for example), so its per-stage values are not usable.
+
+In a normal run with graphs, the Routing wait is about 95 ms per position and the CPU pool about 30 ms. The GPU computes for about 35 ms, so about 60 ms of the Routing wait is the hand-off between layers: the graph launch, three D2H copies, the event wait, the parts H2D and the `post` launch, each submitted through AdaptiveCpp's DAG queue. That hand-off is the next target.

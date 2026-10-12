@@ -543,3 +543,21 @@ HIPのstream captureで、AdaptiveCppのnative in-order queueに投入したSYCL
 このPCの条件では、expert cacheを併用すると遅くなりました。コミットの空きで約4,900 slots（expertの約20%）に限られ、profileで事前に埋めてもhit率は48%、Decodeは4.3 tok/sでした。hitの計算はgraphの外でGPUの層と直列に並び、kernelごとの起動費用もかかります。CPU poolはgraphありで約30 ms/位置なので、cacheで移せる分より増える分が大きくなります。
 
 `--stage-timing`はAdaptiveCppビルドではすべて0を返し、kernel別のGPU時間はまだ測れていません。unverified：Linuxのfreeとcontrib-llvm（`session_capture`の変更は既定値で従来どおり）、NVIDIA、内蔵GPU、長いcontext、他の量子化。
+
+<a id="gpu-time-per-token"></a>
+## 2026-10-13: GPU時間の内訳
+
+AdaptiveCppビルドでは計時用のeventがmarker kernelで、timestampを持たないため、`--stage-timing`は全区間0を返していました。計時用のeventだけ、custom operationの中でHIP eventを記録し、`hipEventElapsedTime`で区間を読むようにしました。`--stage-timing`のときはpool経路のgraphを使いません（graphの中に計時eventを置けないため）。この計時は区間ごとにsubmissionを増やすので、値は主にkernel数に比例する起動費用で、Decodeも2.64 tok/sまで落ちます。比率を見る診断用です。
+
+pool経路のgraphで`--gpu-stages`も使えるようにしました（`session_capture`の`split`）。graphの中で測った1 tokenあたりのGPU時間は次のとおりです。
+
+| 区間 | ms/token | ms/層 |
+| --- | ---: | ---: |
+| mixer（gr_read、attention、gr_write） | 21.9 | 0.46 |
+| FFN前段とrouter | 12.6 | 0.26 |
+| post（moe_finish、gr_write） | 1.0 | 0.02 |
+| 合計 | 35.5 | 0.74 |
+
+GDN層は0.44 ms/層、QSA層は0.50 ms/層です。prefixの差分による5区間の表は、差分法とsweep法でずれが大きく（router区間で-91%など）、区間ごとの細かい値には使えません。
+
+graphありの通常実行では、Routing待機が約95 ms/位置、CPU poolが約30 ms/位置です。GPUの計算は約35 msなので、Routing待機の約60 msは層ごとの受け渡し（graph起動、3回のD2H、event待機、parts H2D、`post`の起動を、AdaptiveCppのDAG queueでそれぞれ投入する費用）と考えられます。次はこの受け渡しを減らします。
