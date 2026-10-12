@@ -48,7 +48,7 @@ struct PlainOptions {
     int64_t max_cells = 4096;       ///< the context the K/V cache holds
     int max_t = 8;                  ///< the largest window
     int pool_workers = 0;           ///< CPU pool workers (0: every physical core but the first)
-    int64_t reserve_mib = 768;      ///< VRAM left free after the expert slots
+    int64_t reserve_mib = -1;       ///< VRAM left free after the expert slots (-1: from the device's memory)
     int adapt_every = 4;            ///< windows between adaptive rounds (0: off)
     int adapt_swaps = 96;           ///< the most experts one round moves into the VRAM tier
     /// ... and at most this many MiB of experts for each token the windows read since the last round: the copies share

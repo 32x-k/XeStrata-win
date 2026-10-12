@@ -620,7 +620,12 @@ bool PlainModel::open_experts(std::string& err) {
     }
     const uint64_t window_b = (uint64_t) opt_.max_t * (uint64_t) s.n_expert_used * (uint64_t) s.n_embd * 4 * 3 +
                               16 * lay.max_blob + (64ull << 20);
-    const uint64_t reserve = (uint64_t) opt_.reserve_mib << 20;
+    // what is allocated after the tier (the products' libraries, the graphs) and the driver's margin: a 32nd of the
+    // memory, 192 to 768 MiB.  Under STRATA_VRAM_LIMIT_MIB=4096 on the RX 9060 XT the peak stayed below 4 GiB with
+    // 128 MiB (llm-jp Q4_K_M, Ornith Q4_K_M and GSQ-RCO 3bit, 2026-10-12), where the 768 MiB of before left 700 MiB
+    // of the card unused; 768 stays above 24 GiB.
+    const uint64_t reserve = opt_.reserve_mib >= 0 ? (uint64_t) opt_.reserve_mib << 20
+                                                   : std::clamp<uint64_t>(total_b / 32, 192ull << 20, 768ull << 20);
     const uint64_t room = free_b > window_b + reserve ? free_b - window_b - reserve : 0;
     uint64_t per_layer_b = 0;
     for (int64_t l = 0; l < L; ++l) per_layer_b += lay.bytes[(size_t) l];
