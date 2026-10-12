@@ -750,9 +750,17 @@ def function_end(text: str) -> int:
             return -1
 
 
+_JSON_FENCE = re.compile(r"```[ \t]*(?:json)?[ \t]*\r?\n\s*", re.I)
+
+
 def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
     """`{"name": N, "arguments": {...}}` (or "parameters", or the arguments as a JSON string) of a declared tool -> its
-    call; anything else -> None."""
+    call; anything else -> None.  #2037: the object may sit in a Markdown fence (```json ... ```)."""
+    body = body.strip()
+    m = _JSON_FENCE.match(body)
+    if m:
+        body = body[m.end():].rstrip()
+        body = body[:-3] if body.endswith("```") else body
     try:
         obj = json.loads(body)
     except ValueError:
@@ -969,6 +977,15 @@ class OutputParser:
             return "param" if after[len(PARAM_START):gt] in self.schemas else "text"
         if after.startswith("{"):
             return "json" if self.schemas else "text"
+        if after.startswith("```") or (after and "```".startswith(after)):
+            # #2037: the JSON call inside a Markdown fence (```json ... ```) in the explicit wrapper
+            m = _JSON_FENCE.match(after)
+            if m:
+                rest = after[m.end():]
+                if rest.startswith("{"):
+                    return "json" if self.schemas else "text"
+                return "wait" if not rest else "text"
+            return "wait" if "\n" not in after else "text"
         if not after or FUNC_START.startswith(after) or PARAM_START.startswith(after):
             return "wait"
         return "text"
