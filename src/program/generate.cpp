@@ -9811,9 +9811,11 @@ int main(int argc, char** argv) {
             // whole and that its bonus token is the drafter's.  The drafter, teacher-forced through K+1's drafts,
             // guesses K+1's bonus and drafts K+2 while stage 1 runs K+1.  A wrong guess costs the speculative window:
             // stage 0's GDN state comes back from a snapshot and K's commit is replayed with its real count (the
-            // window's own commit inputs are intact in its parity's verifier).  Stage 1 never runs a speculative window
-            // and a window row computes what it would in any other window, so every emitted token is the serial loop's
-            // (with STRATA_IQ_MT_MIN=1 bit for bit; sampled requests with the same Philox draw per position).
+            // window's own commit inputs are intact in its parity's verifier).  Stage 1 never runs a speculative
+            // window, and the tokens are picked by the serial loop's rules (sampled requests with the same Philox draw
+            // per position).  The windows are cut differently, and a window row's rounding can depend on the window's
+            // rows (B70 + 4070 and the B70 alone, STRATA_IQ_MT_MIN=1: a near-tie flipped as it does between serial
+            // runs with another --spec-min-p), so greedy output is not bit for bit the serial loop's.
             bool pl_ran = false;
             const bool pl_want = pipe && pl_pw >= 2 && pl_snap_ok;
             const char* pl_serial = !pl_want ? nullptr

@@ -156,8 +156,9 @@ It works with a split of two or more stages, each on its own GPU, and `--serve`.
 With three or more stages `--pipeline-windows 2` turns `--adapt-async` off, and the adaptive tier runs at a verdict.
 
 - **Cost**: a second verify window on each GPU, 160 MiB more kept out of each GPU's expert cache, and with `2` two copies of the recurrent state on every GPU before the last stage (about 3 MiB per GDN layer of that GPU).
-- **Same text**: the last GPU only runs windows that are verified, and every window row computes what it would in any other window, so the tokens are the serial loop's.
-  With `STRATA_IQ_MT_MIN=1 --pcie-frac 0 --adapt-every 0` and the same expert caches the greedy output is identical bit for bit (measurements below).
+- **The text**: the last GPU only runs windows that are verified, and picks the tokens by the serial loop's rules.
+  The windows are cut differently from the serial loop's, though, and a verify window's rounding can depend on how many rows it holds, so even greedy output can flip a near-tie.
+  The serial loop's output changes the same way with another `--spec` or `--spec-min-p` (B70 + RTX 4070, IQ2_XS, `STRATA_IQ_MT_MIN=1 --pcie-frac 0 --adapt-every 0`, the expert caches matched: 2 of 3 answers; the same on the B70 alone).
   The pipeline keeps its VRAM out of the caches, so against a run without the flag a few experts move from a GPU to the CPU, which rounds them differently, and a near-tie can flip.
 - **Off, with one line in the log saying why**, with `--batch` slots, the helper caches (`--expert-cache-device1..3`), a split onto one GPU (`--split-device 0`), `--pipeline-windows 1` on three or more stages, or no draft layer.
   A request with repetition penalties (`penalty_last_n`), coupled draft sampling or log-probabilities (`logprobs`), and `--lookup-chain`, decode serially.
@@ -207,7 +208,6 @@ Eight conversations decoded together (IQ3_S, `--batch 8`, `--layer-split auto`, 
 
 With auto's split (K=47) the 4070 holds one layer: there is nothing to overlap, and it is slower.
 At K=24 with `--resident-experts` (`--adapt-async` on by default): 111.4 -> 117.7 tok/s after the long prompt, 83.2 -> 70.7 tok/s in short chats (one run each).
-At K=24 with `STRATA_IQ_MT_MIN=1 --pcie-frac 0 --adapt-every 0`, the first GPU's cache fixed with `--expert-cache 10000` and the serial run's last-GPU reserve matched with `--vram-reserve-later-mib 860`, all 8 answers (thinking on and off) were identical.
 
 ## Limits
 
