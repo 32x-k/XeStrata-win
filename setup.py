@@ -2281,12 +2281,17 @@ def default_data_dir() -> Path:
     return xdg_dir("XDG_DATA_HOME", ".local/share") if PACKAGED else ROOT.parent / "XeStrata-data"
 
 
+def data_folder_path(requested: str | None, settings: dict) -> Path:
+    """The data folder --data-dir names, else the one the settings name, else the default; nothing is made."""
+    return Path(requested).expanduser().resolve() if requested else \
+        Path(settings["data_dir"]) if settings.get("data_dir") else default_data_dir()
+
+
 def data_folder(requested: str | None) -> tuple:
     """(the data folder, folders on other drives that still hold model files).  Moves the model files of this folder
     and of earlier Strata folders on the same drive into the data folder, and points their configs there."""
     settings = load_settings()
-    dest = Path(requested).expanduser().resolve() if requested else \
-        Path(settings["data_dir"]) if settings.get("data_dir") else default_data_dir()
+    dest = data_folder_path(requested, settings)
     try:
         dest.mkdir(parents=True, exist_ok=True)
     except OSError as e:                                # e.g. no write access next to the Strata folder
@@ -3643,7 +3648,12 @@ def main() -> int:
     if a.check_update:
         return check_update()
     say("Strata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
-    data, elsewhere = data_folder(a.data_dir)          # the model files: in the data folder, found from any copy
+    # --check only reports (a user ran it to look, on a work machine): nothing made, moved or saved.  Given with what
+    # acts before it (a measurement, an update), the data folder is prepared as for those
+    if a.check and not (a.bench or a.bench_verbose or a.bench_original_compat is not None or a.update):
+        data, elsewhere = data_folder_path(a.data_dir, load_settings()), []
+    else:
+        data, elsewhere = data_folder(a.data_dir)      # the model files: in the data folder, found from any copy
     roots = [data, *elsewhere]
     if a.models_dir is None:
         a.models_dir = str(data / "models")
