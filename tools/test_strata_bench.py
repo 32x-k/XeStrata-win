@@ -5,6 +5,8 @@
 report writing and the comparison.  Light: no GPU, no Strata server, a few seconds."""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -309,6 +311,34 @@ class ReportTests(unittest.TestCase):
                     {"hardware_static": {"gpu_name": "Intel Arc Pro B70"}} if path == "/metrics" else {})):
             m = B.collect_machine(srv.base, "", {"backend": "sycl"})
         self.assertEqual((m["gpu"], m["cuda"]), (["Intel Arc Pro B70"], None))
+
+    def test_a_bench_server_never_saves_over_the_users_profile(self):
+        """#2088: --expert-profile-save writes the profile at quit; the bench's own server runs without it."""
+        cfg = {"args": ["--expert-profile", "p.bin", "--expert-profile-save", "p.bin", "--spec", "4"]}
+        safe, removed = B.without_profile_save(cfg)
+        self.assertTrue(removed)
+        self.assertEqual(safe["args"], ["--expert-profile", "p.bin", "--spec", "4"])
+        self.assertEqual(cfg["args"][3], "p.bin")                       # the input is not changed
+        safe, removed = B.without_profile_save({"args": ["--expert-profile-save=p.bin", "--spec", "4"]})
+        self.assertEqual((safe["args"], removed), (["--spec", "4"], True))
+        same = {"args": ["--spec", "4"]}
+        self.assertEqual(B.without_profile_save(same), (same, False))
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            c = Path(d) / "strata-x.json"
+            c.write_text(json.dumps(cfg))
+            with mock.patch.object(B.subprocess, "Popen") as popen, contextlib.redirect_stderr(io.StringIO()):
+                B.start_server(c, 8080, None, Path(d) / "run.log")
+            used = Path(popen.call_args[0][0][popen.call_args[0][0].index("--config") + 1])
+            self.assertNotIn("--expert-profile-save", json.loads(used.read_text())["args"])
+            self.assertIn("--expert-profile-save", json.loads(c.read_text())["args"])   # the user's file is as it was
+
+    def test_an_attached_server_is_not_stopped(self):
+        """#2088: with --url the bench only reads; the server it did not start keeps running."""
+        srv = FakeStrata()
+        self.addCleanup(srv.stop)
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(B, "stop_server") as stop:
+            self.assertEqual(self.run_main(srv, d), 0)
+        stop.assert_not_called()
 
     def test_names(self):
         m = {"gpu": ["NVIDIA GeForce RTX 3060"], "model": "Qwen3.8 Flash-Next", "quant": "IQ3_XXS"}

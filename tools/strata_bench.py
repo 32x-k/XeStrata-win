@@ -684,7 +684,35 @@ def is_strata(base: str, key: str) -> bool:
     return bool(h and h.get("service") == "strata")
 
 
+def without_profile_save(cfg: dict) -> tuple[dict, bool]:
+    """#2088: the config without `--expert-profile-save FILE` (and its value) - the engine writes that profile when the
+    server quits, and a benchmark's short prompts must not replace the user's calibrated one.  -> (config, removed)."""
+    args = list(cfg.get("args") or [])
+    out, i, removed = [], 0, False
+    while i < len(args):
+        if args[i] == "--expert-profile-save":
+            i, removed = i + 2, True
+        elif isinstance(args[i], str) and args[i].startswith("--expert-profile-save="):
+            i, removed = i + 1, True
+        else:
+            out.append(args[i])
+            i += 1
+    return ({**cfg, "args": out} if removed else cfg), removed
+
+
 def start_server(cfg_path: Path, port: int, gpu: str | None, log_path: Path):
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        cfg = None
+    if isinstance(cfg, dict):
+        safe, removed = without_profile_save(cfg)
+        if removed:                       # a copy beside the log: the user's config file is not touched
+            print("Note: the bench starts this model without --expert-profile-save, so its short prompts do not "
+                  "overwrite your saved expert profile.", file=sys.stderr)
+            tmp = log_path.with_suffix(".config.json")
+            tmp.write_text(json.dumps(safe), encoding="utf-8")
+            cfg_path = tmp
     cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
            "--port", str(port)]
     if gpu:
