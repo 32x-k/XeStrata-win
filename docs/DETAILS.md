@@ -280,7 +280,8 @@ The others are made of the same tensor types, checked on those files and in the 
 ```
 
 The API works, with the thinking kept apart from the answer, streaming and tool calls.
-Not yet: images, speculative decoding (MTP), Intel processors' own graphics, more than one GPU (setup uses the
+Ornith's official versions (Q4_K_M to BF16) draft up to two tokens ahead with the model's MTP layer and check them in a window (speculative decoding, greedy requests only; the GSQ-RCO versions and llm-jp have no MTP layer).
+Not yet: images, Intel processors' own graphics, more than one GPU (setup uses the
 first), and the options made for Qwen3.8-Flash-Next such as the KV cache's precision and the low-RAM modes.
 When RAM is short for the experts, the engine does not load them and reads them from the model file through the OS
 file cache instead (slower; setup warns of it).
@@ -298,6 +299,7 @@ The engine's options (added to the settings' `args`):
 | `--pool-workers N` | the CPU threads that compute experts (default one fewer than the physical cores) |
 | `--prompt-chunk N` | the most tokens prefill computes at once (default 4096; 0: none at once) |
 | `--max-t N` | the decode window's most tokens (default 8) |
+| `--spec N` | the most tokens of a window checking the MTP layer's drafts (default 3: two drafts; 0: off) |
 | `--rope-scaling none\|linear\|yarn`, `--rope-scale F`, `--yarn-orig-ctx N` | context extension |
 
 ### Less RAM than the model: the low-RAM mode

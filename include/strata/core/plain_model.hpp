@@ -68,8 +68,10 @@ struct PlainOptions {
     /// length); 0: the prompt runs in windows.
     int64_t prompt_chunk = 4096;
     /// Speculative decoding with the model's MTP layer: windows of up to this many tokens, the last accepted one and
-    /// spec - 1 drafts (0 or 1: off; a model without the layer: off).  Greedy requests only.
-    int spec = 0;
+    /// spec - 1 drafts (0 or 1: off; a model without the layer: off).  Greedy requests only.  3 by default: two
+    /// drafts were the fastest of one to three on the RX 9060 XT (16 and 8 GB), the B70 and the RTX 4070 (Ornith Q6_K
+    /// and Q4_K_M, 2026-10-12).
+    int spec = 3;
 };
 
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding): one object, its members grouped by what they serve

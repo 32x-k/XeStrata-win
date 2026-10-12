@@ -311,7 +311,7 @@ static void plain_usage(const std::string& arch) {
                  "                       4096; 0: the prompt in windows)\n"
                  "  --max-t N            the decode window's most tokens (default 8)\n"
                  "  --spec N             speculative decoding with the model's MTP layer: windows of up to N tokens,\n"
-                 "                       the last one and N - 1 drafts (0: off; greedy only)\n"
+                 "                       the last one and N - 1 drafts (default 3; 0: off; greedy only)\n"
                  "  --rope-scaling none|linear|yarn, --rope-scale F, --yarn-orig-ctx N   context extension\n"
                  "  --dump-logits PATH   each generated token's logits, FP32 rows\n"
                  "  --serve              stay resident and take requests on stdin (server.py's protocol, text requests)\n"
