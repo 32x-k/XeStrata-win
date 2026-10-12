@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -259,6 +260,14 @@ void MoeWindow::reset() {
 bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, const int* tbs, const int* ns,
                       MoePoolFn pool, void* user, strata::gpu::Stream cs, std::string& err) {
     volatile uint32_t* const seq = h_seq_;
+    // STRATA_WINDOW_TIMES=1 (measuring): the host's time per ring, waiting for it (the GPU's work up to the layer's
+    // experts) and answering it (the plan, the CPU's experts and the flags), summed over the run and printed every
+    // 64 windows
+    static const bool times = std::getenv("STRATA_WINDOW_TIMES") != nullptr;
+    static double t_wait = 0.0, t_answer = 0.0, t_tail = 0.0;
+    static int64_t n_rings = 0, n_windows = 0;
+    const Clock::time_point w0 = Clock::now();
+    Clock::time_point last_answer = w0;
     for (int64_t r = 0; r < rings; ++r) {
         const uint32_t want = (uint32_t) (r + 1);
         const Clock::time_point a = Clock::now();
@@ -284,6 +293,7 @@ bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, con
                 return false;
             }
         }
+        const Clock::time_point rung = Clock::now();
         cur_ring_ = want;
         set_plan_slot(grps[r]);
         const int tb = tbs[r], n = ns[r];
@@ -303,6 +313,12 @@ bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, con
             raise_flag(h_flagB_, want);
         }
         *(volatile uint32_t*) h_flag_ = want;
+        if (times) {
+            last_answer = Clock::now();
+            t_wait += std::chrono::duration<double, std::milli>(rung - a).count();
+            t_answer += std::chrono::duration<double, std::milli>(last_answer - rung).count();
+            ++n_rings;
+        }
         if (segmented_) {   // the PCIe share's copies too, then the next segment
             if (!strata::gpu::stream_sync(copy_) || *(volatile uint32_t*) h_flagB_ < want) {
                 err = "moe window: the PCIe share of ring " + std::to_string(want) + " did not land";
@@ -318,6 +334,14 @@ bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, con
     if (!strata::gpu::stream_sync(copy_)) {   // no host function of this window may raise flag B in the next one
         err = std::string("moe window: the expert copies: ") + strata::gpu::last_error();
         return false;
+    }
+    if (times) {
+        t_tail += std::chrono::duration<double, std::milli>(Clock::now() - last_answer).count();
+        if (++n_windows % 64 == 0)
+            std::fprintf(stderr, "moe window times: %lld windows, %lld rings: a ring waited %.3f ms and was answered in "
+                                 "%.3f ms; after the last ring %.3f ms a window\n", (long long) n_windows,
+                         (long long) n_rings, t_wait / (double) n_rings, t_answer / (double) n_rings,
+                         t_tail / (double) n_windows);
     }
     return true;
 }
