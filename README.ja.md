@@ -83,6 +83,20 @@ AMD の GPU では、prefill の密な行列積をディストリビューショ
 
 ## モデルの選び方
 
+| モデル | パラメーター | RAM の目安 | VRAM | 向いていること |
+| --- | --- | ---: | ---: | --- |
+| **[Qwen3.8-Flash-Next](#qwen38-flash-next)** | 1,250 億 | 32〜62 GB | 12 GB 以上を勧めます | いちばん賢い。RAM の多い PC 向け |
+| **[Ornith-1.5](#ornith-15beta)**（BETA） | 350 億（1 トークンで 30 億） | 22〜80 GB | 4 GB から | RAM の少ない PC 向け |
+| **[llm-jp-4.1](#llm-jp-41beta)**（BETA） | 320 億（1 トークンで 30 億） | 30〜73 GB | 4 GB から | 日本語と英語の思考するモデル |
+
+BETA の 2 つは、画像、2 枚以上の GPU、Intel の CPU 内蔵の GPU にまだ対応していません（[詳細](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41)）。
+
+迷ったら、RAM が 48 GB 以上の PC では Qwen3.8-Flash-Next の **IQ2_XS** を選んでください。
+RAM がそれより少ない PC では、Qwen3.8-Flash-Next の Coder（32 GB）か Ornith-1.5 が選べます。
+あとから別のモデルを足すときは `xestrata --setup` を実行します。
+
+### Qwen3.8-Flash-Next
+
 **大きさ**（同じモデルを、どれだけ圧縮するかの違い）:
 
 | 大きさ | ダウンロード | RAM の目安 | 速さ | 品質 |
@@ -110,12 +124,37 @@ AMD の GPU では、prefill の密な行列積をディストリビューショ
   ダウンロードは 111 GB です。エキスパートが 77 GB あり、RAM に入りきらない分は答えている間に SSD から読むので、
   2〜3 ビットの大きさより遅くなります（[詳細](docs/DETAILS.ja.md#unsloth-の-ud-q4_k_xl実験的)）。
 
-迷ったら **IQ2_XS** を選んでください。RAM が 32 GB しかない PC では、Coder が選べます。
-Qwen3.8-Flash-Next のほかに、Ornith-1.5 と llm-jp-4.1 も選べます（[詳細](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41)）。
-あとから別のモデルを足すときは `xestrata --setup` を実行します。
-
 OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューにはありません。
 変換の手順は [docs/ORCA.ja.md](docs/ORCA.ja.md) にあります。
+
+### Ornith-1.5（BETA）
+
+[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（Ornith AI、MIT）: Qwen3.5 系の MoE で、文脈は 256K までです。
+公式の版（Q4_K_M〜BF16）は、モデルの MTP の層で下書きを作り、decode を速くします。
+
+| 大きさ | ダウンロード | RAM の目安 | VRAM |
+| --- | ---: | ---: | ---: |
+| Q4_K_M | 21.7 GB | 30 GB | 4 GB から |
+| Q5_K_M | 25.3 GB | 34 GB | 6 GB から |
+| Q6_K | 29.2 GB | 38 GB | 6 GB から |
+| Q8_0 | 37.8 GB | 46 GB | 6 GB から |
+| BF16 | 71.1 GB | 80 GB | 8 GB から |
+| GSQ-RCO-3BIT | 13.0 GB | 22 GB | 4 GB から |
+| GSQ-RCO-3.5BIT | 15.2 GB | 24 GB | 6 GB から |
+
+GSQ-RCO の 2 つは、pfeifferj による[コミュニティの再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)で、MTP の層がありません。
+
+### llm-jp-4.1（BETA）
+
+[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)（LLM-jp、Apache-2.0）: 日本語と英語の思考するモデルで、文脈は 256K までです。
+
+| 大きさ | ダウンロード | RAM の目安 | VRAM |
+| --- | ---: | ---: | ---: |
+| Q4_K_M | 21.5 GB | 30 GB | 4 GB から |
+| BF16 | 64.3 GB | 73 GB | 8 GB から |
+
+BETA の 2 つの RAM の目安は、ダウンロードの大きさに約 8 GB を足したものです。
+RAM がそれより少ないと、エキスパートを RAM に読み込まずにモデルのファイルから読むので、遅くなります。
 
 ## インストール
 

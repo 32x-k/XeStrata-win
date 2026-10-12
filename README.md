@@ -85,6 +85,21 @@ So XeStrata runs only on the GPUs the distribution's rocBLAS has code for.
 
 ## Choosing a model
 
+| Model | Parameters | RAM (about) | VRAM | Good for |
+| --- | --- | ---: | ---: | --- |
+| **[Qwen3.8-Flash-Next](#qwen38-flash-next)** | 125B | 32-62 GB | 12 GB or more recommended | the smartest; for a PC with a lot of RAM |
+| **[Ornith-1.5](#ornith-15-beta)** (BETA) | 35B (3B a token) | 22-80 GB | from 4 GB | a PC with less RAM |
+| **[llm-jp-4.1](#llm-jp-41-beta)** (BETA) | 32B (3B a token) | 30-73 GB | from 4 GB | a thinking model for Japanese and English |
+
+The two BETA models do not yet take images, two or more GPUs, or Intel's integrated GPUs
+([details](docs/DETAILS.md#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41)).
+
+Not sure? On a PC with 48 GB of RAM or more, take Qwen3.8-Flash-Next's **IQ2_XS**.
+With less RAM than that, Qwen3.8-Flash-Next's Coder (32 GB) or Ornith-1.5 is the one to choose.
+To add another model later, run `xestrata --setup`.
+
+### Qwen3.8-Flash-Next
+
 **The size** (the same model, compressed more or less):
 
 | Size | Download | RAM (about) | Speed | Quality |
@@ -114,13 +129,40 @@ lot of VRAM, it runs in the **low-RAM mode**: the experts are read from the mode
   of the original, a 111 GB download. Its experts take 77 GB; those that do not fit the RAM are read from the SSD
   while it answers, so it is slower than the 2-3-bit sizes ([details](docs/DETAILS.md#or-unsloths-ud-q4_k_xl-experimental)).
 
-Not sure? Take **IQ2_XS**. On a PC with only 32 GB of RAM, the Coder is the one to choose.
-Besides Qwen3.8-Flash-Next, setup offers Ornith-1.5 and llm-jp-4.1
-([details](docs/DETAILS.md#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41)).
-To add another model later, run `xestrata --setup`.
-
 OrcaRouter's Flash-Next Uncensored IQ3_XXS is not in setup's menu.
 How to convert it is in [docs/ORCA.md](docs/ORCA.md).
+
+### Ornith-1.5 (BETA)
+
+[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) (Ornith AI, MIT): a Qwen3.5 MoE, with a
+context of up to 256K. Its official files (Q4_K_M to BF16) draft tokens with the model's MTP layer, which makes the
+decode faster.
+
+| Size | Download | RAM (about) | VRAM |
+| --- | ---: | ---: | ---: |
+| Q4_K_M | 21.7 GB | 30 GB | from 4 GB |
+| Q5_K_M | 25.3 GB | 34 GB | from 6 GB |
+| Q6_K | 29.2 GB | 38 GB | from 6 GB |
+| Q8_0 | 37.8 GB | 46 GB | from 6 GB |
+| BF16 | 71.1 GB | 80 GB | from 8 GB |
+| GSQ-RCO-3BIT | 13.0 GB | 22 GB | from 4 GB |
+| GSQ-RCO-3.5BIT | 15.2 GB | 24 GB | from 6 GB |
+
+The two GSQ-RCO files are pfeifferj's [community reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)
+and have no MTP layer.
+
+### llm-jp-4.1 (BETA)
+
+[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) (LLM-jp, Apache-2.0):
+a thinking model for Japanese and English, with a context of up to 256K.
+
+| Size | Download | RAM (about) | VRAM |
+| --- | ---: | ---: | ---: |
+| Q4_K_M | 21.5 GB | 30 GB | from 4 GB |
+| BF16 | 64.3 GB | 73 GB | from 8 GB |
+
+For the two BETA models, the RAM is about the download plus 8 GB. With less, the experts are read from the model
+file instead of loaded into RAM, which is slower.
 
 ## Install
 
