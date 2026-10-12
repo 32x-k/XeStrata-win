@@ -310,6 +310,11 @@ class EngineStarting(RuntimeError):
     not a 400 about the prompt."""
 
 
+class ClientGone(Exception):
+    """#1999: the client hung up while its request was being prepared (an image URL downloading, a picture encoding or
+    waiting for its turn): nothing is left to answer."""
+
+
 class ModelBusy(RuntimeError):
     """Explicit model controls must not interrupt active or queued requests."""
 
@@ -2301,12 +2306,14 @@ class Vision:
         im.save(out, format="PNG")
         return out.getvalue()
 
-    def encode_all(self, sources: list) -> list[tuple[Path, int]]:
+    def encode_all(self, sources: list, cancel=None) -> list[tuple[Path, int]]:
         """encode() for every image of one request: the files of this request's earlier images are never evicted to
         make room for a later one (#1072: with more than 64 unique images the first was deleted before the request
-        had read it)."""
+        had read it).  `cancel` (#1999): a request whose client left does not encode its next pictures."""
         out: list[tuple[Path, int]] = []
         for src in sources:
+            if cancel is not None and cancel.is_set():
+                raise ClientGone()
             out.append(self.encode(src, keep=[p for p, _ in out]))
         return out
 
@@ -3433,7 +3440,22 @@ class Service:
         prompt, plain = unmark_think_literals(prompt, self.literals)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
-    def _note_unreadable_tool_images(self, messages):
+    @contextlib.contextmanager
+    def _turn(self, cancel=None):
+        """The engine's single turn (self.fifo) for an image encode.  #1999: a client that leaves while this request
+        waits for it gives its place up (ClientGone), as a queued generation does (#1619)."""
+        if cancel is None:
+            self.fifo.acquire()
+        else:
+            while not self.fifo.acquire(timeout=0.25):
+                if cancel.is_set():
+                    raise ClientGone()
+        try:
+            yield
+        finally:
+            self.fifo.release()
+
+    def _note_unreadable_tool_images(self, messages, cancel=None):
         """A picture a tool returned (Claude Code's Read of an image file) that this server cannot read - it has no
         image encoder, or the encoder refuses that picture - becomes a short note in its place instead of a 400.
         Clients resend the whole history every turn, so one unreadable tool picture would fail every later request of
@@ -3451,9 +3473,11 @@ class Service:
                 if why is None:
                     src = item["source"]
                     try:
+                        if cancel is not None and cancel.is_set():
+                            raise ClientGone()
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
-                        with self.fifo:          # the encoder takes its turn with the requests (see below)
+                        with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
                             self.vision.encode(src)
                     except (ValueError, OSError) as e:
                         why = str(e)
@@ -3462,11 +3486,13 @@ class Service:
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
 
-    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
-        fetched = self._note_unreadable_tool_images(messages)
+        # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
+        # between pictures and raise ClientGone
+        fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
@@ -3480,16 +3506,21 @@ class Service:
                                  "'vision'), so it cannot read images")
             pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
             start = self.tok.encode(VISION_START, parse_special=True)[0]
+
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
             # for as long as urlopen waited.
-            images = [fetched[src] if src in fetched else
-                      Vision.download(src) if src.startswith(("http://", "https://")) else src for src in images]
+            def fetch(src):
+                if cancel is not None and cancel.is_set():
+                    raise ClientGone()
+                return fetched[src] if src in fetched else Vision.download(src) \
+                    if src.startswith(("http://", "https://")) else src
+            images = [fetch(src) for src in images]
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
-            with self.fifo:
-                encoded = (self.vision.encode_all(images) if hasattr(self.vision, "encode_all")
+            with self._turn(cancel):
+                encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
                            else [self.vision.encode(src) for src in images])
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
@@ -4296,7 +4327,11 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                          **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
         messages += [{"role": "tool", "content": r} for r in results]
-        ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req)
+        try:
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, cancel=cancel)
+        except ClientGone:                                      # #1999: the client left while a picture was prepared
+            done = {**done, "finish": "cancel"}
+            break
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -5218,6 +5253,8 @@ def make_handler(svc: Service):
             except EngineStuck as e:                         # an unload or restart that could not end the engine
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
 
+            except ClientGone:                               # #1999: the client left while the request was prepared
+                self._note(outcome="disconnected")
             except OSError:
                 self._note(outcome="disconnected")
                 raise                                        # as before #332: the server's own handling
@@ -5463,10 +5500,10 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
-            _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431
+            self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
@@ -5525,16 +5562,19 @@ def make_handler(svc: Service):
                 return self._json(e.status, e.body())
             if title is not None:
                 return self._responses_ready(req, title)
+            cancel = threading.Event()
+            self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             try:
-                ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req)
+                ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req, cancel)
+            except ClientGone:
+                self._note(outcome="disconnected")
+                return
             except ResponsesError as e:
                 return self._json(e.status, e.body())
             except ModelBusy as e:
                 return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
-            cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431
 
             def check(text, finish):
                 return validated_json(text, validator, finish)
@@ -5607,7 +5647,7 @@ def make_handler(svc: Service):
             except OSError:
                 pass
 
-        def _responses_prepare(self, req):
+        def _responses_prepare(self, req, cancel=None):
             responses_api.check_request(req)
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
@@ -5646,13 +5686,13 @@ def make_handler(svc: Service):
             try:
                 try:
                     ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0,
-                                                         req=req)
+                                                         req=req, cancel=cancel)
                 except ValueError:
                     if shown is tools:
                         raise
                     shown = tools                            # too long with the kept tools: the request as sent
                     ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0,
-                                                         req=req)
+                                                         req=req, cancel=cancel)
             except ResponsesError:
                 raise
             except ValueError as e:                          # too long for the context, an image without vision
@@ -5688,10 +5728,10 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
-            _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431
+            self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):

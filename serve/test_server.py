@@ -5177,3 +5177,71 @@ class UntimedReads(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrepareCancelled(unittest.TestCase):
+    """#1999: a client that leaves while its pictures are prepared gives the turn up and encodes nothing more."""
+
+    def make(self, d, vision):
+        tok = ByteTokenizer()
+        return Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"),
+                       vision=vision(d))
+
+    @staticmethod
+    def msgs(n=2):
+        return [{"role": "user", "content": [{"type": "text", "text": "look"}] +
+                 [{"type": "image", "source": f"{i}.png"} for i in range(n)]}]
+
+    def test_cancel_before_the_encode_runs_none(self):
+        import tempfile
+        calls = []
+
+        class V(ImageMarkers.FakeVision):
+            def encode(self, source):
+                calls.append(source)
+                return self.rows, 3
+        with tempfile.TemporaryDirectory() as d:
+            svc = self.make(d, V)
+            cancel = threading.Event()
+            cancel.set()
+            from serve.server import ClientGone
+            with self.assertRaises(ClientGone):
+                svc.prepare(self.msgs(), None, {}, cancel=cancel)
+            self.assertEqual(calls, [])
+            self.assertTrue(svc.fifo.acquire(blocking=False))        # the turn was not left held
+            svc.fifo.release()
+
+    def test_cancel_while_waiting_for_the_turn(self):
+        import tempfile
+        from serve.server import ClientGone
+        with tempfile.TemporaryDirectory() as d:
+            svc = self.make(d, ImageMarkers.FakeVision)
+            cancel = threading.Event()
+            threading.Timer(0.3, cancel.set).start()
+            with svc.fifo:                                          # another request holds the engine
+                t0 = time.perf_counter()
+                with self.assertRaises(ClientGone):
+                    svc.prepare(self.msgs(1), None, {}, cancel=cancel)
+                self.assertLess(time.perf_counter() - t0, 3)
+
+    def test_cancel_between_pictures_stops_the_next_encode(self):
+        from serve.server import ClientGone, Vision
+        cancel, seen = threading.Event(), []
+        v = Vision.__new__(Vision)
+
+        def encode(src, keep=()):
+            seen.append(src)
+            cancel.set()                                            # the client leaves during the first encode
+            return Path("x"), 3
+        v.encode = encode
+        with self.assertRaises(ClientGone):
+            v.encode_all([b"a", b"b", b"c"], cancel)
+        self.assertEqual(seen, [b"a"])
+
+    def test_without_cancel_nothing_changes(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            svc = self.make(d, ImageMarkers.FakeVision)
+            ids, _, _ = svc.prepare(self.msgs(), None, {}, cancel=threading.Event())
+            self.assertEqual(ids.count(ByteTokenizer().encode("<|image_pad|>", parse_special=True)[0]), 6)
+            svc.embeddings.path.unlink(missing_ok=True)
