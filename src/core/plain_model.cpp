@@ -150,6 +150,13 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         err = "plain model: the window or the context is out of range";
         return false;
     }
+    // not on the processor's own graphics through Level Zero yet: on the UHD 770 the driver aborted (its command stream
+    // full) in the batched prompt and after some hundreds of segmented windows
+    if (const sycl::device& dev = Runtime::get().device();
+        integrated_gpu(dev) && dev.get_backend() == sycl::backend::ext_oneapi_level_zero) {
+        err = "plain model: this model does not run on the processor's own graphics yet; choose another GPU (--gpu)";
+        return false;
+    }
     try {
         model_ = std::make_unique<GgufModel>(GgufModel::open(opt_.gguf));
     } catch (const std::exception& e) {

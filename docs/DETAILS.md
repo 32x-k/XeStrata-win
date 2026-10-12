@@ -277,8 +277,8 @@ The others are made of the same tensor types, checked on those files and in the 
 ```
 
 The API works, with the thinking kept apart from the answer, streaming and tool calls.
-Not yet: images, speculative decoding (MTP), more than one GPU (setup uses the first), and the options made for
-Qwen3.8-Flash-Next such as the KV cache's precision and the low-RAM modes.
+Not yet: images, speculative decoding (MTP), Intel processors' own graphics, more than one GPU (setup uses the
+first), and the options made for Qwen3.8-Flash-Next such as the KV cache's precision and the low-RAM modes.
 When RAM is short for the experts, the engine does not load them and reads them from the model file through the OS
 file cache instead (slower; setup warns of it).
 

@@ -3289,6 +3289,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     the pinned revision), its tokenizer and chat template written out, and the config: `strata --native` with no pack,
     PLE table or MTP layer.  Images, the layer split and the Qwen3.8-Flash-Next options (KV precision, low-RAM modes,
     the speed projection) do not apply."""
+    if gpu.get("integrated") and gpu.get("vendor") == "intel":   # the engine refuses it (PlainModel::load)
+        fail(f"{fam['title']} does not run on the processor's own graphics yet", "choose another GPU with --gpu")
     models = fam["models"]
     names = list(models)
     if a.model and a.model not in names:
