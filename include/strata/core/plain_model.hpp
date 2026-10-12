@@ -16,6 +16,12 @@
 // the adaptive rule, the GGUF read in place (FileExpertSource: the page cache, the drive), the CPU pool for what the
 // VRAM does not hold, all in one window protocol (MoeWindow).  A window is 1..max_t tokens at consecutive positions,
 // recorded once per size as a graph.
+//
+// A qwen35moe file with its multi-token-prediction layer (`blk.<n_layer>.nextn.*`, Ornith's official K-quants) drafts
+// with it (`spec`): that layer is a full-attention block of the trunk's form with its own K/V, after a projection of
+// [rms_norm(embedding of token p) | rms_norm(the trunk's final normed row at p - 1)] (llama.cpp's graph_mtp), and its
+// routed experts are one more MoE layer of the tiers.  A window checks the last token and the drafts; the recurrent
+// states are copied after each row but the last, and put back to the last accepted row's copy when a draft is wrong.
 #pragma once
 
 #include "strata/artifact/model_spec.hpp"
@@ -61,6 +67,9 @@ struct PlainOptions {
     /// The most tokens a prompt chunk takes through the batched products (`prompt`; a shorter prompt, one chunk of its
     /// length); 0: the prompt runs in windows.
     int64_t prompt_chunk = 4096;
+    /// Speculative decoding with the model's MTP layer: windows of up to this many tokens, the last accepted one and
+    /// spec - 1 drafts (0 or 1: off; a model without the layer: off).  Greedy requests only.
+    int spec = 0;
 };
 
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding): one object, its members grouped by what they serve
@@ -97,6 +106,24 @@ public:
     /// first prompt (plain_prompt.cpp); nothing when the prompt runs in windows.
     bool prompt_warm(std::string& err);
 
+    /// Drafts a window can check (0: no speculative decoding): spec - 1 when the model has its MTP layer.
+    int drafts() const { return has_mtp_ ? n_snap_ : 0; }
+    /// After prompt() (or the windows of a prompt): `first`, the token picked after it, at position `pos`, the next
+    /// window's first token; the MTP layer reads it and drafts the tokens after it.
+    bool spec_start(int32_t first, int64_t pos, std::string& err);
+    /// One window over the pending token and its drafts: `emitted` gets the accepted drafts and the token after them
+    /// (`n_emit` of them, at most `limit`), cut after the first token in `stop`; with `logits`, their rows.  The state
+    /// then holds every emitted token but the last, which is pending, and the next drafts are made.
+    bool spec_step(const std::vector<int32_t>& stop, int64_t limit, int32_t* emitted, int& n_emit, float* logits,
+                   std::string& err);
+    /// The windows and the drafts they checked and accepted since the load, for the report.
+    int64_t spec_windows() const { return spec_windows_; }
+    int64_t spec_drafted() const { return spec_drafted_; }
+    int64_t spec_accepted() const { return spec_accepted_; }
+    /// The time spent in the windows that checked drafts, and in making the drafts (ms, since the load).
+    double spec_ms_check() const { return spec_ms_check_; }
+    double spec_ms_draft() const { return spec_ms_draft_; }
+
     /// The VRAM tier, for the report: slots, slots holding an expert, and the routed entries it served so far.
     int64_t slots() const { return n_slots_; }
     int64_t resident() const;
@@ -127,10 +154,31 @@ private:
     };
 
     bool upload(const GgufModel& m, const std::string& name, W& w, std::string& err);
+    /// Block `l`'s weights (blk.<l>.*): its mixer, norms, router and shared expert.
+    bool load_block(const GgufModel& m, int64_t l, Block& b, std::string& err);
     bool upload_f32(const GgufModel& m, const std::string& name, uint64_t elements, const float*& out, std::string& err);
     bool open_experts(std::string& err);
-    bool record(int T, std::string& err);
+    bool record(int T, bool mtp, std::string& err);
+    /// The window's inputs (embeddings, steps, positions) for `tokens` at pos .. pos + T - 1 into the mapped staging.
+    bool stage(const int32_t* tokens, int T, int64_t pos, std::string& err);
     bool record_window(int T, strata::gpu::Stream cs, std::string& err);
+    /// The head over T normed rows `x` into logits_.
+    void head_logits(const float* x, int T, strata::gpu::Stream cs);
+    /// One block over the window's T rows of x_ (MoE layer `ml` of the tiers, ring `ring` + 1): a segmented window's
+    /// graphs go into `segs`.
+    bool record_block(const Block& b, int64_t ml, int T, uint32_t& ring, std::vector<strata::gpu::Graph*>& segs,
+                      strata::gpu::Stream cs, std::string& err);
+    /// The MTP layer over T rows: the embeddings staged in m_emb_, the trunk's rows in mtp_h_; the last row's normed
+    /// output into mtp_h_'s first row (the next draft step's input) and its logits.
+    bool record_mtp(int T, strata::gpu::Stream cs, std::string& err);
+    /// Launches a window's graph (or its segments) and answers its `rings` rings, MoE layers layers[0 ..].
+    bool launch_serve(strata::gpu::Graph* g, std::vector<strata::gpu::Graph*>& segs, int64_t rings,
+                      const int64_t* layers, int T, std::string& err);
+    /// The MTP layer over T rows at positions pos .. pos + T - 1 (tokens[t] the token at pos + t, mtp_h_'s row t the
+    /// trunk's row before it): the greedy draft after the last.
+    bool mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* draft, std::string& err);
+    /// The chain after mtp_run's first draft: drafts_ up to `want` from position `pos` (the first draft's).
+    bool mtp_chain(int want, int64_t pos, std::string& err);
     bool adapt(std::string& err);
     /// The adaptive tier's copies in flight: their experts become resident once the copies are done (`wait`: wait
     /// for them; else only if they are).
@@ -219,6 +267,13 @@ private:
     W head_;
     const float* out_norm_ = nullptr;
     std::vector<Block> blocks_;
+    // the MTP layer (has_mtp_): its block, the projection of [norm(embedding) | norm(trunk row)], the two norms, the
+    // norm before the head (the trunk's when the file has none)
+    bool has_mtp_ = false;
+    Block mtp_;
+    W mtp_eh_;
+    const float *mtp_enorm_ = nullptr, *mtp_hnorm_ = nullptr, *mtp_head_norm_ = nullptr;
+    int64_t n_moe_ = 0;   ///< MoE layers of the tiers: the trunk's, then the MTP layer's
     std::vector<void*> allocs_;      ///< every device allocation, freed in the destructor
 
     // the expert tiers
@@ -238,6 +293,20 @@ private:
 
     // per-sequence device state
     std::vector<float*> gdn_state_, gdn_conv_;   ///< per GDN block
+    /// The recurrent states after a window's rows 0 .. n_snap_ - 1, per GDN block (gdn_snap_[block][row]), for
+    /// spec_step to go back to the last accepted row.
+    int n_snap_ = 0;
+    std::vector<std::vector<float*>> gdn_snap_, conv_snap_;
+    // the drafting: the pending token, its position, the drafts after it; the MTP layer's input rows (device, max_t of
+    // n_embd); the counts for the report
+    int32_t cur_ = -1;
+    int64_t cur_pos_ = 0;
+    std::vector<int32_t> drafts_;
+    float* mtp_h_ = nullptr;
+    bool mtp_h_set_ = false;   ///< prompt() left the trunk's last row in mtp_h_ (else forward's last row in hn_)
+    int last_T_ = 0;           ///< the last forward window's size
+    int64_t spec_windows_ = 0, spec_drafted_ = 0, spec_accepted_ = 0;
+    double spec_ms_check_ = 0, spec_ms_draft_ = 0;
     std::vector<uint16_t*> k_pool_, v_pool_;      ///< per attention block
     int32_t* page_table_ = nullptr;
     int64_t n_pages_ = 0;
@@ -251,6 +320,8 @@ private:
     std::vector<PendingSwap> pending_;
     std::vector<strata::gpu::Graph*> exec_;                      ///< per T: the whole window
     std::vector<std::vector<strata::gpu::Graph*>> segs_;         ///< per T: the segments (MoeWindow::segmented)
+    std::vector<strata::gpu::Graph*> mexec_;                     ///< per T: the MTP layer
+    std::vector<std::vector<strata::gpu::Graph*>> msegs_;
     float *h_emb_ = nullptr, *m_emb_ = nullptr;                  ///< mapped: T rows of n_embd
     int32_t *h_step_ = nullptr, *m_step_ = nullptr;              ///< mapped: T x kStepCount
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr;                ///< mapped: T x n_head, then T x n_head_kv

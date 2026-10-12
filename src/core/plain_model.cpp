@@ -41,6 +41,7 @@
 #include "strata/kernels/sampler.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -83,6 +84,9 @@ PlainModel::~PlainModel() {
     strata::gpu::free(prompt_host_);
     for (auto* g : exec_) strata::gpu::graph_destroy(g);
     for (auto& v : segs_)
+        for (auto* g : v) strata::gpu::graph_destroy(g);
+    for (auto* g : mexec_) strata::gpu::graph_destroy(g);
+    for (auto& v : msegs_)
         for (auto* g : v) strata::gpu::graph_destroy(g);
     for (void* p : allocs_) strata::gpu::free(p);
     for (void* p : {(void*) h_emb_, (void*) h_step_, (void*) h_pos_, (void*) h_out_, (void*) fill_tmp_})
@@ -144,6 +148,57 @@ bool PlainModel::upload_f32(const GgufModel& m, const std::string& name, uint64_
         return false;
     }
     out = (const float*) d;
+    return true;
+}
+
+bool PlainModel::load_block(const GgufModel& m, int64_t l, Block& b, std::string& err) {
+    const ModelSpec& s = spec_;
+    const bool q35 = s.arch == ModelArch::Qwen35Moe;
+    const uint64_t N = (uint64_t) s.n_embd, E = (uint64_t) s.n_expert;
+    const std::string p = "blk." + std::to_string(l) + ".";
+    if (!upload_f32(m, p + "attn_norm.weight", N, b.attn_norm, err) ||
+        !upload_f32(m, p + (q35 ? "post_attention_norm.weight" : "ffn_norm.weight"), N, b.post_norm, err))
+        return false;
+    if (b.recurrent) {
+        const uint64_t C = (uint64_t) (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner);
+        if (!upload(m, p + "attn_qkv.weight", b.qkv, err) || !upload(m, p + "attn_gate.weight", b.z, err) ||
+            !upload(m, p + "ssm_alpha.weight", b.alpha, err) || !upload(m, p + "ssm_beta.weight", b.beta, err) ||
+            !upload(m, p + "ssm_out.weight", b.ssm_out, err) ||
+            !upload_f32(m, p + "ssm_conv1d.weight", C * (uint64_t) s.ssm_d_conv, b.conv, err) ||
+            !upload_f32(m, p + "ssm_dt.bias", (uint64_t) s.ssm_dt_rank, b.dt, err) ||
+            !upload_f32(m, p + "ssm_a", (uint64_t) s.ssm_dt_rank, b.a, err) ||
+            !upload_f32(m, p + "ssm_norm.weight", (uint64_t) s.ssm_d_state, b.ssm_norm, err))
+            return false;
+        if ((uint64_t) b.qkv.n_out != C || b.z.n_out != s.ssm_d_inner || b.alpha.n_out != s.ssm_dt_rank ||
+            b.beta.n_out != s.ssm_dt_rank || b.ssm_out.n_in != s.ssm_d_inner) {
+            err = "plain model: block " + std::to_string(l) + "'s GDN projections have other shapes";
+            return false;
+        }
+    } else {
+        const int64_t nkv = s.n_head_kv[(size_t) l], hd = s.key_length;
+        if (!upload(m, p + "attn_q.weight", b.q, err) || !upload(m, p + "attn_k.weight", b.k, err) ||
+            !upload(m, p + "attn_v.weight", b.v, err) || !upload(m, p + "attn_output.weight", b.o, err) ||
+            !upload_f32(m, p + "attn_q_norm.weight", (uint64_t) hd, b.q_norm, err) ||
+            !upload_f32(m, p + "attn_k_norm.weight", (uint64_t) hd, b.k_norm, err))
+            return false;
+        if (b.q.n_out != (has_gate_ ? 2 : 1) * s.n_head * hd || b.k.n_out != nkv * hd || b.v.n_out != nkv * hd ||
+            b.o.n_in != s.n_head * hd || nkv <= 0 || s.n_head % nkv != 0 || (nkv_ != 0 && nkv != nkv_)) {
+            err = "plain model: block " + std::to_string(l) + "'s attention projections have other shapes";
+            return false;
+        }
+        nkv_ = nkv;
+    }
+    if (!upload_f32(m, p + "ffn_gate_inp.weight", N * E, b.router, err)) return false;
+    if (!has_shared_) return true;
+    if (!upload_f32(m, p + "ffn_gate_inp_shexp.weight", N, b.sh_gate_inp, err) ||
+        !upload(m, p + "ffn_gate_shexp.weight", b.sh_gate, err) ||
+        !upload(m, p + "ffn_up_shexp.weight", b.sh_up, err) ||
+        !upload(m, p + "ffn_down_shexp.weight", b.sh_down, err))
+        return false;
+    if (b.sh_gate.type != b.sh_up.type || b.sh_gate.n_out != s.n_ff_shexp || b.sh_down.n_in != s.n_ff_shexp) {
+        err = "plain model: block " + std::to_string(l) + "'s shared expert has other shapes";
+        return false;
+    }
     return true;
 }
 
@@ -234,63 +289,47 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     int64_t n_gdn = 0, n_attn = 0;
     for (int64_t l = 0; l < s.n_layer; ++l) {
         Block& b = blocks_[(size_t) l];
-        const std::string p = "blk." + std::to_string(l) + ".";
         b.recurrent = s.recurrent[(size_t) l];
-        if (!upload_f32(m, p + "attn_norm.weight", N, b.attn_norm, err) ||
-            !upload_f32(m, p + (q35 ? "post_attention_norm.weight" : "ffn_norm.weight"), N, b.post_norm, err))
+        if (b.recurrent) b.gdn = n_gdn++;
+        else b.attn = n_attn++;
+        if (!load_block(m, l, b, err)) return false;
+    }
+    // the MTP layer, when the window checks drafts and the file has it (its K/V the last attention block's)
+    {
+        const std::string p = "blk." + std::to_string(s.n_layer) + ".nextn.";
+        has_mtp_ = opt_.spec >= 2 && q35 && s.n_nextn == 1 && m.find(p + "eh_proj.weight") != nullptr;
+    }
+    if (has_mtp_) {
+        const std::string p = "blk." + std::to_string(s.n_layer) + ".nextn.";
+        mtp_.attn = n_attn++;
+        if (!load_block(m, s.n_layer, mtp_, err) || !upload(m, p + "eh_proj.weight", mtp_eh_, err) ||
+            !upload_f32(m, p + "enorm.weight", N, mtp_enorm_, err) ||
+            !upload_f32(m, p + "hnorm.weight", N, mtp_hnorm_, err))
             return false;
-        if (b.recurrent) {
-            b.gdn = n_gdn++;
-            const uint64_t C = (uint64_t) (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner);
-            if (!upload(m, p + "attn_qkv.weight", b.qkv, err) || !upload(m, p + "attn_gate.weight", b.z, err) ||
-                !upload(m, p + "ssm_alpha.weight", b.alpha, err) || !upload(m, p + "ssm_beta.weight", b.beta, err) ||
-                !upload(m, p + "ssm_out.weight", b.ssm_out, err) ||
-                !upload_f32(m, p + "ssm_conv1d.weight", C * (uint64_t) s.ssm_d_conv, b.conv, err) ||
-                !upload_f32(m, p + "ssm_dt.bias", (uint64_t) s.ssm_dt_rank, b.dt, err) ||
-                !upload_f32(m, p + "ssm_a", (uint64_t) s.ssm_dt_rank, b.a, err) ||
-                !upload_f32(m, p + "ssm_norm.weight", (uint64_t) s.ssm_d_state, b.ssm_norm, err))
-                return false;
-            if ((uint64_t) b.qkv.n_out != C || b.z.n_out != s.ssm_d_inner || b.alpha.n_out != s.ssm_dt_rank ||
-                b.beta.n_out != s.ssm_dt_rank || b.ssm_out.n_in != s.ssm_d_inner) {
-                err = "plain model: block " + std::to_string(l) + "'s GDN projections have other shapes";
-                return false;
-            }
-        } else {
-            b.attn = n_attn++;
-            const int64_t nkv = s.n_head_kv[(size_t) l], hd = s.key_length;
-            if (!upload(m, p + "attn_q.weight", b.q, err) || !upload(m, p + "attn_k.weight", b.k, err) ||
-                !upload(m, p + "attn_v.weight", b.v, err) || !upload(m, p + "attn_output.weight", b.o, err) ||
-                !upload_f32(m, p + "attn_q_norm.weight", (uint64_t) hd, b.q_norm, err) ||
-                !upload_f32(m, p + "attn_k_norm.weight", (uint64_t) hd, b.k_norm, err))
-                return false;
-            if (b.q.n_out != (has_gate_ ? 2 : 1) * s.n_head * hd || b.k.n_out != nkv * hd || b.v.n_out != nkv * hd ||
-                b.o.n_in != s.n_head * hd || nkv <= 0 || s.n_head % nkv != 0 || (nkv_ != 0 && nkv != nkv_)) {
-                err = "plain model: block " + std::to_string(l) + "'s attention projections have other shapes";
-                return false;
-            }
-            nkv_ = nkv;
-        }
-        if (!upload_f32(m, p + "ffn_gate_inp.weight", N * E, b.router, err)) return false;
-        if (!has_shared_) continue;
-        if (!upload_f32(m, p + "ffn_gate_inp_shexp.weight", N, b.sh_gate_inp, err) ||
-            !upload(m, p + "ffn_gate_shexp.weight", b.sh_gate, err) ||
-            !upload(m, p + "ffn_up_shexp.weight", b.sh_up, err) ||
-            !upload(m, p + "ffn_down_shexp.weight", b.sh_down, err))
-            return false;
-        if (b.sh_gate.type != b.sh_up.type || b.sh_gate.n_out != s.n_ff_shexp || b.sh_down.n_in != s.n_ff_shexp) {
-            err = "plain model: block " + std::to_string(l) + "'s shared expert has other shapes";
+        if (mtp_eh_.n_in != 2 * s.n_embd || mtp_eh_.n_out != s.n_embd) {
+            err = "plain model: the MTP layer's eh_proj has another shape";
             return false;
         }
+        mtp_head_norm_ = out_norm_;
+        if (m.find(p + "shared_head_norm.weight") != nullptr &&
+            !upload_f32(m, p + "shared_head_norm.weight", N, mtp_head_norm_, err))
+            return false;
     }
 
     if (nkv_ == 0) { err = "plain model: the model has no attention block"; return false; }
     // the BF16 projections' two GEMV forms timed for each shape a window takes, before any graph is recorded; the
     // head is left to the default form (its timing would allocate a second copy of it)
     try {
-        for (const Block& b : blocks_)
+        auto tune = [&](const Block& b) {
             for (const W* w : {&b.qkv, &b.z, &b.alpha, &b.beta, &b.ssm_out, &b.q, &b.k, &b.v, &b.o, &b.sh_gate, &b.sh_up,
                                &b.sh_down})
                 if (w->type == kBF16) k::bf16_gemv_fp32_mmvf_multi_tune(w->n_in, w->n_out, cs_);
+        };
+        for (const Block& b : blocks_) tune(b);
+        if (has_mtp_) {
+            tune(mtp_);
+            if (mtp_eh_.type == kBF16) k::bf16_gemv_fp32_mmvf_multi_tune(mtp_eh_.n_in, mtp_eh_.n_out, cs_);
+        }
     } catch (const std::exception& e) {
         err = std::string("plain model: timing the BF16 products: ") + e.what();
         return false;
@@ -312,12 +351,32 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
             gdn_conv_.push_back(cv);
         }
     }
+    // the states after a window's rows but its last, for going back to the last accepted draft: a window checks up to
+    // spec - 1 drafts
+    if (has_mtp_) {
+        opt_.spec = std::min(opt_.spec, opt_.max_t);
+        n_snap_ = opt_.spec - 1;
+        gdn_snap_.assign(gdn_state_.size(), {});
+        conv_snap_.assign(gdn_state_.size(), {});
+        for (size_t g = 0; g < gdn_state_.size(); ++g)
+            for (int t = 0; t < n_snap_; ++t) {
+                float *st = nullptr, *cv = nullptr;
+                if (!strata::gpu::alloc_device(&st, (size_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state) * 4) ||
+                    !strata::gpu::alloc_device(&cv, (size_t) (C * (s.ssm_d_conv - 1)) * 4)) {
+                    err = "plain model: no VRAM for the recurrent states' copies (--spec)";
+                    return false;
+                }
+                allocs_.push_back(st);
+                allocs_.push_back(cv);
+                gdn_snap_[g].push_back(st);
+                conv_snap_[g].push_back(cv);
+            }
+    }
     n_pages_ = (opt_.max_cells + qs.page_size - 1) / qs.page_size;
     opt_.max_cells = n_pages_ * qs.page_size;
     {
         const size_t pool = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size * qs.head_dim) * 2;
-        for (const Block& b : blocks_) {
-            if (b.recurrent) continue;
+        for (int64_t i = 0; i < n_attn; ++i) {   // the trunk's attention blocks, then the MTP layer
             uint16_t *kp = nullptr, *vp = nullptr;
             if (!strata::gpu::alloc_device(&kp, pool) || !strata::gpu::alloc_device(&vp, pool)) {
                 err = "plain model: no VRAM for the K/V cache (" + std::to_string(opt_.max_cells) + " cells)";
@@ -350,7 +409,7 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         return false;
     }
     attn_scratch_floats_ = (int64_t) k::qsa_decode_attn_scratch_floats(opt_.max_cells, qs);
-    const uint64_t max_in = std::max<uint64_t>({N, ZV, NH * HD, FS});
+    const uint64_t max_in = std::max<uint64_t>({N, ZV, NH * HD, FS, has_mtp_ ? 2 * N : 0});
     auto dev = [&](auto** p, uint64_t bytes) {
         void* d = nullptr;
         if (!strata::gpu::alloc_device(&d, (size_t) std::max<uint64_t>(bytes, 256))) return false;
@@ -362,13 +421,13 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         !dev(&hn_, T * N * 4) || !dev(&mix_, T * N * 4) || !dev(&xq_, k::native_q8_1_bytes((int) max_in, (int) T)) ||
         !dev(&qkv_, T * (uint64_t) C * 4) || !dev(&craw_, (uint64_t) C * 4) || !dev(&hc_, T * (uint64_t) C * 4) ||
         !dev(&z_, T * ZV * 4) || !dev(&alpha_, T * HV * 4) || !dev(&beta_, T * HV * 4) || !dev(&gate_, T * HV * 4) ||
-        !dev(&o_, T * ZV * 4) || !dev(&y_, T * ZV * 4) || !dev(&qfull_, T * NH * 2 * HD * 4) ||
+        !dev(&o_, T * ZV * 4) || !dev(&y_, T * ZV * 4) || !dev(&qfull_, T * std::max(NH * 2 * HD, 2 * N) * 4) ||
         !dev(&qcur_, T * NH * HD * 4) || !dev(&kraw_, T * NKV * HD * 4) || !dev(&kcur_, T * NKV * HD * 4) ||
         !dev(&vcur_, T * NKV * HD * 4) || !dev(&attn_, T * NH * HD * 4) || !dev(&attn32_, T * NH * HD * 4) ||
         !dev(&attn_scratch_, T * (uint64_t) attn_scratch_floats_ * 4) || !dev(&rlog_, T * E * 4) ||
         !dev(&ids_, T * K * 4) || !dev(&w_, T * K * 4) || !dev(&shared_, T * N * 4) || !dev(&sh_g_, (T + 4) * 4) ||
         !dev(&sh_gate_, T * FS * 4) || !dev(&sh_up_, T * FS * 4) || !dev(&moe_out_, T * N * 4) ||
-        !dev(&logits_, T * (uint64_t) n_vocab_ * 4)) {
+        !dev(&logits_, T * (uint64_t) n_vocab_ * 4) || (has_mtp_ && !dev(&mtp_h_, T * N * 4))) {
         err = "plain model: no VRAM for the window's buffers";
         return false;
     }
@@ -376,6 +435,8 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     if (!open_experts(err)) return false;
     exec_.assign((size_t) opt_.max_t + 1, nullptr);
     segs_.assign((size_t) opt_.max_t + 1, {});
+    mexec_.assign((size_t) opt_.max_t + 1, nullptr);
+    msegs_.assign((size_t) opt_.max_t + 1, {});
     return reset(err);
 }
 
@@ -404,17 +465,21 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     const uint64_t HV = (uint64_t) s.ssm_dt_rank, ZV = (uint64_t) s.ssm_d_inner;
     const uint64_t C = (uint64_t) (2 * s.ssm_n_group * s.ssm_d_state) + ZV, E = (uint64_t) s.n_expert;
     const uint64_t K = (uint64_t) s.n_expert_used, FS = (uint64_t) s.n_ff_shexp, FF = (uint64_t) s.n_ff_exp;
-    const uint64_t U = (uint64_t) T, TK = U * K, QW = (has_gate_ ? 2u : 1u) * NH * HD;
-    const uint64_t max_in = std::max<uint64_t>({N, ZV, NH * HD, FS, FF});
+    // the MTP layer's input rows ([embedding | trunk row], 2 N wide) go through qfull and x16
+    const uint64_t U = (uint64_t) T, TK = U * K, QW = std::max<uint64_t>((has_gate_ ? 2u : 1u) * NH * HD, has_mtp_ ? 2 * N : 0);
+    const uint64_t max_in = std::max<uint64_t>({N, ZV, NH * HD, FS, FF, has_mtp_ ? 2 * N : 0});
     b.T = T;
     b.gu_elems = (int64_t) (2 * FF * N);
     b.d_elems = (int64_t) (N * FF);
     b.int8 = prompt_int8();
     // the largest dense weight, dequantized at once (Gemm::native slices past 2^25 values)
-    b.gemm_elems = 1;
-    for (const Block& bl : blocks_)
-        for (const W* w : {&bl.qkv, &bl.z, &bl.alpha, &bl.beta, &bl.ssm_out, &bl.q, &bl.k, &bl.v, &bl.o, &bl.sh_gate,
-                           &bl.sh_up, &bl.sh_down})
+    b.gemm_elems = (int64_t) mtp_eh_.n_in * mtp_eh_.n_out;   // 0 without the MTP layer
+    std::vector<const Block*> all;
+    for (const Block& bl : blocks_) all.push_back(&bl);
+    if (has_mtp_) all.push_back(&mtp_);
+    for (const Block* bl : all)
+        for (const W* w : {&bl->qkv, &bl->z, &bl->alpha, &bl->beta, &bl->ssm_out, &bl->q, &bl->k, &bl->v, &bl->o,
+                           &bl->sh_gate, &bl->sh_up, &bl->sh_down})
             b.gemm_elems = std::max<int64_t>(b.gemm_elems, (int64_t) w->n_in * w->n_out);
     b.gemm_elems = std::min<int64_t>(b.gemm_elems, (int64_t) 1 << 25);
     uint64_t at = 0;
@@ -449,9 +514,10 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
         dup = dup || k::iq_mmq_type_dup(f.gu_type) || k::iq_mmq_type_dup(up) || k::iq_mmq_type_dup(f.d_type);
         dup_mixed = dup_mixed || k::iq_mmq_type_dup(f.gu_type) != k::iq_mmq_type_dup(up);
     }
-    for (const Block& bl : blocks_)
-        for (const W* w : {&bl.qkv, &bl.z, &bl.ssm_out, &bl.q, &bl.k, &bl.v, &bl.o})
+    for (const Block* bl : all)
+        for (const W* w : {&bl->qkv, &bl->z, &bl->ssm_out, &bl->q, &bl->k, &bl->v, &bl->o})
             dup = dup || k::iq_mmq_type_dup(w->type);
+    dup = dup || (has_mtp_ && k::iq_mmq_type_dup(mtp_eh_.type));
     const uint64_t rep = dup ? 2 : 1;
     const uint64_t xq_cols = rep * std::max<uint64_t>(TK * N, U * max_in);   // the routed rows', or a dense input's
     take(b.xq, xq_cols + 2 * (xq_cols / 32) * 4); take(b.hq, rep * (TK * FF + 2 * TK * (FF / 32) * 4));
@@ -480,10 +546,12 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
 
 bool PlainModel::open_experts(std::string& err) {
     const ModelSpec& s = spec_;
-    const int64_t L = s.n_moe_layers(), E = s.n_expert;
+    n_moe_ = s.n_moe_layers() + (has_mtp_ ? 1 : 0);
+    const int64_t L = n_moe_, E = s.n_expert;
     std::vector<int64_t> blocks;
     for (int64_t l = 0; l < s.n_layer; ++l)
         if (s.layer_routes(l)) blocks.push_back(l);
+    if (has_mtp_) blocks.push_back(s.n_layer);   // the MTP layer's experts: the tiers' last MoE layer
     if (!expert_layout_from_gguf(opt_.gguf, blocks, E, s.n_embd, s.n_ff_exp, err)) return false;
     const auto& lay = k::cpu::expert_layout();
     for (int64_t l = 0; l < L; ++l)
@@ -623,8 +691,17 @@ bool PlainModel::open_experts(std::string& err) {
     // the tier from a profile, after the split's timing (which needs experts in RAM outside the VRAM): its ranking,
     // each layer up to its slots
     if (!opt_.profile.empty()) {
+        // a profile of the trunk's layers serves a load with the MTP layer as well (its experts left to the
+        // adaptive rule), and one with the MTP layer a load without it (its pairs dropped)
         int64_t ranked_slots = 0;
-        if (!read_expert_profile(opt_.profile, L, E, prior_, ranked_slots, err)) return false;
+        std::string err2;
+        if (!read_expert_profile(opt_.profile, L, E, prior_, ranked_slots, err)) {
+            const int64_t other = has_mtp_ ? L - 1 : L + 1;
+            if (!read_expert_profile(opt_.profile, other, E, prior_, ranked_slots, err2)) return false;
+            prior_.erase(std::remove_if(prior_.begin(), prior_.end(), [&](const auto& p) { return p.first >= L; }),
+                         prior_.end());
+            err.clear();
+        }
         int64_t filled = 0;
         for (const auto& [l, e] : prior_)
             if (!free_[(size_t) l].empty()) {
@@ -659,6 +736,8 @@ bool PlainModel::reset(std::string& err) {
     const size_t pool = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size * qs.head_dim) * 2;
     for (size_t i = 0; i < k_pool_.size(); ++i)
         ok = ok && strata::gpu::memset(k_pool_[i], 0, pool) && strata::gpu::memset(v_pool_[i], 0, pool);
+    cur_ = -1;
+    drafts_.clear();
     if (!ok) err = "plain model: resetting the state failed";
     return ok;
 }
@@ -673,7 +752,8 @@ void PlainModel::pool_fn(void* user, const float* x_f, const int32_t* ids, int64
     expert_pool_dispatch_multi(m->disp_, x_f, ids, n_tok, k, out);
 }
 
-bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) {
+bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring, std::vector<strata::gpu::Graph*>& segs,
+                              strata::gpu::Stream cs, std::string& err) {
     const ModelSpec& s = spec_;
     const int64_t N = s.n_embd, NH = s.n_head, HD = s.key_length, HV = s.ssm_dt_rank, HK = s.ssm_n_group;
     const int64_t ZV = s.ssm_d_inner, S = s.ssm_d_state, C = 2 * HK * S + ZV, E = s.n_expert, K = s.n_expert_used;
@@ -694,127 +774,180 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) 
         if (quantize) k::native_quantize_q8_1(x, xq_, w.n_in, ncols, cs);
         k::native_mmvq(w.type, w.data, xq_, y, w.n_in, w.n_out, ncols, cs);
     };
+    // the norm writes the q8_1 rows the projections read as well (one launch; after nextsycl's Qwen3.5 norm)
+    k::native_qsa_rms_norm_weighted_q8_1(x_, b.attn_norm, hn_, xq_, (int) N, T, eps, cs);
+    if (b.recurrent) {
+        float* state = gdn_state_[(size_t) b.gdn];
+        float* hist = gdn_conv_[(size_t) b.gdn];
+        proj(b.qkv, hn_, qkv_, T, false);
+        proj(b.z, hn_, z_, T, false);
+        // alpha and beta, one shape and type: one launch where the pair kernel takes the type (nextsycl's
+        // Qwen3.5 decode fuses the two products)
+        if (b.alpha.type == kBF16 || b.alpha.type != b.beta.type || b.alpha.n_in != b.beta.n_in ||
+            b.alpha.n_out != b.beta.n_out ||
+            !k::native_mmvq_pair(b.alpha.type, b.alpha.data, b.beta.data, xq_, alpha_, beta_, b.alpha.n_in,
+                                 b.alpha.n_out, T, cs)) {
+            proj(b.alpha, hn_, alpha_, T, false);
+            proj(b.beta, hn_, beta_, T, false);
+        }
+        for (int t = 0; t < T; ++t) {   // the recurrence, token by token
+            float* h = hc_ + (size_t) t * C;
+            k::native_gdn_conv_silu(hist, qkv_ + (size_t) t * C, b.conv, craw_, h, C, s.ssm_d_conv, cs);
+            k::native_gdn_l2_norm(h, HK, S, eps, cs);
+            k::native_gdn_l2_norm(h + HK * S, HK, S, eps, cs);
+            k::native_gdn_beta_gate(beta_ + (size_t) t * HV, HV, cs);
+            k::native_gdn_gate(alpha_ + (size_t) t * HV, b.dt, b.a, gate_ + (size_t) t * HV, HV, cs);
+            k::native_gdn_step(state, h, h + HK * S, h + 2 * HK * S, gate_ + (size_t) t * HV, beta_ + (size_t) t * HV,
+                               o_ + (size_t) t * ZV, gs, cs);
+            k::native_gdn_out_norm(o_ + (size_t) t * ZV, z_ + (size_t) t * ZV, b.ssm_norm, y_ + (size_t) t * ZV, HV, S,
+                                   eps, cs);
+            if (t < T - 1 && t < n_snap_) {   // the state after row t, for spec_step to go back to
+                k::MappedCopy c[2];
+                c[0] = {gdn_snap_[(size_t) b.gdn][(size_t) t], state, S * HV * S};
+                c[1] = {conv_snap_[(size_t) b.gdn][(size_t) t], hist, C * (s.ssm_d_conv - 1)};
+                k::copy_from_mapped_multi(c, 2, cs);
+            }
+        }
+        proj(b.ssm_out, y_, mix_, T, true);
+    } else {
+        const int64_t a = b.attn;
+        proj(b.q, hn_, qfull_, T, false);
+        proj(b.k, hn_, kraw_, T, false);
+        proj(b.v, hn_, vcur_, T, false);
+        k::native_qsa_rms_norm_rope(qfull_, (int) ((has_gate_ ? 2 : 1) * HD), b.q_norm, qcur_, (int) (T * NH), (int) HD,
+                                    (int) s.rope_dims, eps, rs, pos_q, cs);
+        k::native_qsa_rms_norm_rope(kraw_, (int) HD, b.k_norm, kcur_, (int) (T * NKV), (int) HD,
+                                    (int) s.rope_dims, eps, rs, pos_k, cs);
+        for (int t = 0; t < T; ++t)
+            k::kv_append_step(k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_,
+                              step_ + (size_t) t * k::kStepCount, kcur_ + (size_t) t * NKV * HD,
+                              vcur_ + (size_t) t * NKV * HD, qs, cs);
+        k::QsaAttnPools pools;
+        pools.k_pool = k_pool_[(size_t) a];
+        pools.v_pool = v_pool_[(size_t) a];
+        pools.page_table = page_table_;
+        k::qsa_dense_attn_batch(qcur_, pools, step_, opt_.max_cells, qs, attn_scratch_, attn_, T, cs);
+        if (has_gate_) {
+            k::native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
+            proj(b.o, attn32_, mix_, T, true);
+        } else {
+            proj(b.o, attn_, mix_, T, true);
+        }
+    }
+    k::add_inplace(x_, mix_, (int64_t) T * N, cs);
+
+    // the MoE: route, publish, the shared expert while the host serves, then the experts and the combine
+    const bool sh_q8 = has_shared_ && b.sh_gate.type != kBF16 && b.sh_down.type != kBF16;
+    if (sh_q8) k::native_qsa_rms_norm_weighted_q8_1(x_, b.post_norm, hn_, xq_, (int) N, T, eps, cs);
+    else k::native_qsa_rms_norm_weighted(x_, b.post_norm, hn_, (int) N, T, eps, cs);
+    k::f32_gemv_fp32_mmvf_multi(hn_, N, b.router, rlog_, E, N, E, T, cs);
+    k::router_top10(rlog_, T, (int) E, (int) K, ids_, w_, cs);
+    ++ring;
+    win_.publish(ring, 0, 0, T, hn_, ids_, w_, cs);
+    if (has_shared_ && !sh_q8) {   // in FP32 between the products
+        proj(b.sh_gate, hn_, sh_gate_, T, true);
+        proj(b.sh_up, hn_, sh_up_, T, false);
+        k::native_swiglu_f32(sh_gate_, sh_up_, sh_gate_, (int) FS, T, cs);
+        proj(b.sh_down, sh_gate_, shared_, T, true);
+        k::f32_gemv_fp32_mmvf_multi(hn_, N, b.sh_gate_inp, sh_g_, 1, N, 1, T, cs);
+    } else if (has_shared_) {
+        if (!k::native_mmvq_pair(b.sh_gate.type, b.sh_gate.data, b.sh_up.data, xq_, sh_gate_, sh_up_, (int) N,
+                                 (int) FS, T, cs)) {
+            k::native_mmvq(b.sh_gate.type, b.sh_gate.data, xq_, sh_gate_, (int) N, (int) FS, T, cs);
+            k::native_mmvq(b.sh_up.type, b.sh_up.data, xq_, sh_up_, (int) N, (int) FS, T, cs);
+        }
+        k::native_swiglu_q8_1(sh_gate_, sh_up_, xq_, (int) FS, T, cs);
+        k::native_mmvq(b.sh_down.type, b.sh_down.data, xq_, shared_, (int) FS, (int) N, T, cs);
+        k::f32_gemv_fp32_mmvf_multi(hn_, N, b.sh_gate_inp, sh_g_, 1, N, 1, T, cs);
+    }
+    if (win_.segmented()) {   // a graph ends where the host must answer the ring
+        strata::gpu::Graph* g = nullptr;
+        if (!strata::gpu::end_capture(cs, &g)) {
+            err = std::string("plain model: segment capture: ") + strata::gpu::last_error();
+            return false;
+        }
+        segs.push_back(g);
+        if (!strata::gpu::begin_capture(cs)) { err = "plain model: begin capture failed"; return false; }
+    }
+    if (!win_.experts(ml, ring, 0, 0, T, cs, err)) return false;
+    k::native_moe_combine_multi(win_.parts(), w_, has_shared_ ? shared_ : nullptr, moe_out_, N, K, T, cs,
+                                has_shared_ ? sh_g_ : nullptr);
+    k::add_inplace(x_, moe_out_, (int64_t) T * N, cs);
+    return true;
+}
+
+bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) {
+    const ModelSpec& s = spec_;
+    const int64_t N = s.n_embd, NH = s.n_head;
+    const float eps = (float) s.rms_eps;
+    const int64_t NKV = attn_shapes(s, nkv_).n_head_kv;
     k::copy_from_mapped(x_, m_emb_, (int64_t) T * N, cs);
     k::copy_i32_from_mapped(step_, m_step_, (int64_t) T * k::kStepCount, cs);
     k::copy_i32_from_mapped(pos_, m_pos_, (int64_t) opt_.max_t * (NH + NKV), cs);
     uint32_t ring = 0;
-    for (int64_t l = 0; l < s.n_layer; ++l) {
-        const Block& b = blocks_[(size_t) l];
-        // the norm writes the q8_1 rows the projections read as well (one launch; after nextsycl's Qwen3.5 norm)
-        k::native_qsa_rms_norm_weighted_q8_1(x_, b.attn_norm, hn_, xq_, (int) N, T, eps, cs);
-        if (b.recurrent) {
-            float* state = gdn_state_[(size_t) b.gdn];
-            float* hist = gdn_conv_[(size_t) b.gdn];
-            proj(b.qkv, hn_, qkv_, T, false);
-            proj(b.z, hn_, z_, T, false);
-            // alpha and beta, one shape and type: one launch where the pair kernel takes the type (nextsycl's
-            // Qwen3.5 decode fuses the two products)
-            if (b.alpha.type == kBF16 || b.alpha.type != b.beta.type || b.alpha.n_in != b.beta.n_in ||
-                b.alpha.n_out != b.beta.n_out ||
-                !k::native_mmvq_pair(b.alpha.type, b.alpha.data, b.beta.data, xq_, alpha_, beta_, b.alpha.n_in,
-                                     b.alpha.n_out, T, cs)) {
-                proj(b.alpha, hn_, alpha_, T, false);
-                proj(b.beta, hn_, beta_, T, false);
-            }
-            for (int t = 0; t < T; ++t) {   // the recurrence, token by token
-                float* h = hc_ + (size_t) t * C;
-                k::native_gdn_conv_silu(hist, qkv_ + (size_t) t * C, b.conv, craw_, h, C, s.ssm_d_conv, cs);
-                k::native_gdn_l2_norm(h, HK, S, eps, cs);
-                k::native_gdn_l2_norm(h + HK * S, HK, S, eps, cs);
-                k::native_gdn_beta_gate(beta_ + (size_t) t * HV, HV, cs);
-                k::native_gdn_gate(alpha_ + (size_t) t * HV, b.dt, b.a, gate_ + (size_t) t * HV, HV, cs);
-                k::native_gdn_step(state, h, h + HK * S, h + 2 * HK * S, gate_ + (size_t) t * HV, beta_ + (size_t) t * HV,
-                                   o_ + (size_t) t * ZV, gs, cs);
-                k::native_gdn_out_norm(o_ + (size_t) t * ZV, z_ + (size_t) t * ZV, b.ssm_norm, y_ + (size_t) t * ZV, HV, S,
-                                       eps, cs);
-            }
-            proj(b.ssm_out, y_, mix_, T, true);
-        } else {
-            const int64_t a = b.attn;
-            proj(b.q, hn_, qfull_, T, false);
-            proj(b.k, hn_, kraw_, T, false);
-            proj(b.v, hn_, vcur_, T, false);
-            k::native_qsa_rms_norm_rope(qfull_, (int) ((has_gate_ ? 2 : 1) * HD), b.q_norm, qcur_, (int) (T * NH), (int) HD,
-                                        (int) s.rope_dims, eps, rs, pos_q, cs);
-            k::native_qsa_rms_norm_rope(kraw_, (int) HD, b.k_norm, kcur_, (int) (T * NKV), (int) HD,
-                                        (int) s.rope_dims, eps, rs, pos_k, cs);
-            for (int t = 0; t < T; ++t)
-                k::kv_append_step(k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_,
-                                  step_ + (size_t) t * k::kStepCount, kcur_ + (size_t) t * NKV * HD,
-                                  vcur_ + (size_t) t * NKV * HD, qs, cs);
-            k::QsaAttnPools pools;
-            pools.k_pool = k_pool_[(size_t) a];
-            pools.v_pool = v_pool_[(size_t) a];
-            pools.page_table = page_table_;
-            k::qsa_dense_attn_batch(qcur_, pools, step_, opt_.max_cells, qs, attn_scratch_, attn_, T, cs);
-            if (has_gate_) {
-                k::native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
-                proj(b.o, attn32_, mix_, T, true);
-            } else {
-                proj(b.o, attn_, mix_, T, true);
-            }
-        }
-        k::add_inplace(x_, mix_, (int64_t) T * N, cs);
-
-        // the MoE: route, publish, the shared expert while the host serves, then the experts and the combine
-        const bool sh_q8 = has_shared_ && b.sh_gate.type != kBF16 && b.sh_down.type != kBF16;
-        if (sh_q8) k::native_qsa_rms_norm_weighted_q8_1(x_, b.post_norm, hn_, xq_, (int) N, T, eps, cs);
-        else k::native_qsa_rms_norm_weighted(x_, b.post_norm, hn_, (int) N, T, eps, cs);
-        k::f32_gemv_fp32_mmvf_multi(hn_, N, b.router, rlog_, E, N, E, T, cs);
-        k::router_top10(rlog_, T, (int) E, (int) K, ids_, w_, cs);
-        ++ring;
-        win_.publish(ring, 0, 0, T, hn_, ids_, w_, cs);
-        if (has_shared_ && !sh_q8) {   // in FP32 between the products
-            proj(b.sh_gate, hn_, sh_gate_, T, true);
-            proj(b.sh_up, hn_, sh_up_, T, false);
-            k::native_swiglu_f32(sh_gate_, sh_up_, sh_gate_, (int) FS, T, cs);
-            proj(b.sh_down, sh_gate_, shared_, T, true);
-            k::f32_gemv_fp32_mmvf_multi(hn_, N, b.sh_gate_inp, sh_g_, 1, N, 1, T, cs);
-        } else if (has_shared_) {
-            if (!k::native_mmvq_pair(b.sh_gate.type, b.sh_gate.data, b.sh_up.data, xq_, sh_gate_, sh_up_, (int) N,
-                                     (int) FS, T, cs)) {
-                k::native_mmvq(b.sh_gate.type, b.sh_gate.data, xq_, sh_gate_, (int) N, (int) FS, T, cs);
-                k::native_mmvq(b.sh_up.type, b.sh_up.data, xq_, sh_up_, (int) N, (int) FS, T, cs);
-            }
-            k::native_swiglu_q8_1(sh_gate_, sh_up_, xq_, (int) FS, T, cs);
-            k::native_mmvq(b.sh_down.type, b.sh_down.data, xq_, shared_, (int) FS, (int) N, T, cs);
-            k::f32_gemv_fp32_mmvf_multi(hn_, N, b.sh_gate_inp, sh_g_, 1, N, 1, T, cs);
-        }
-        if (win_.segmented()) {   // a graph ends where the host must answer the ring
-            strata::gpu::Graph* g = nullptr;
-            if (!strata::gpu::end_capture(cs, &g)) {
-                err = std::string("plain model: segment capture: ") + strata::gpu::last_error();
-                return false;
-            }
-            segs_[(size_t) T].push_back(g);
-            if (!strata::gpu::begin_capture(cs)) { err = "plain model: begin capture failed"; return false; }
-        }
-        if (!win_.experts(s.moe_index(l), ring, 0, 0, T, cs, err)) return false;
-        k::native_moe_combine_multi(win_.parts(), w_, has_shared_ ? shared_ : nullptr, moe_out_, N, K, T, cs,
-                                    has_shared_ ? sh_g_ : nullptr);
-        k::add_inplace(x_, moe_out_, (int64_t) T * N, cs);
-    }
+    for (int64_t l = 0; l < s.n_layer; ++l)
+        if (!record_block(blocks_[(size_t) l], s.moe_index(l), T, ring, segs_[(size_t) T], cs, err)) return false;
     k::native_qsa_rms_norm_weighted(x_, out_norm_, hn_, (int) N, T, eps, cs);
-    proj(head_, hn_, logits_, T, true);   // the tokens are picked after the graph (forward), with the run's sampler
+    head_logits(hn_, T, cs);   // the tokens are picked after the graph (forward), with the run's sampler
     return true;
 }
 
-bool PlainModel::record(int T, std::string& err) {
-    if (exec_[(size_t) T] != nullptr || !segs_[(size_t) T].empty()) return true;
+void PlainModel::head_logits(const float* x, int T, strata::gpu::Stream cs) {
+    if (head_.type == kBF16) {
+        k::bf16_gemv_fp32_mmvf_multi(x, head_.n_in, static_cast<const uint16_t*>(head_.data), logits_, head_.n_out,
+                                     head_.n_in, head_.n_out, T, cs);
+        return;
+    }
+    k::native_quantize_q8_1(x, xq_, head_.n_in, T, cs);
+    k::native_mmvq(head_.type, head_.data, xq_, logits_, head_.n_in, head_.n_out, T, cs);
+}
+
+bool PlainModel::record_mtp(int T, strata::gpu::Stream cs, std::string& err) {
+    const ModelSpec& s = spec_;
+    const int64_t N = s.n_embd, NH = s.n_head;
+    const float eps = (float) s.rms_eps;
+    const int64_t NKV = attn_shapes(s, nkv_).n_head_kv;
+    k::copy_from_mapped(x_, m_emb_, (int64_t) T * N, cs);
+    k::copy_i32_from_mapped(step_, m_step_, (int64_t) T * k::kStepCount, cs);
+    k::copy_i32_from_mapped(pos_, m_pos_, (int64_t) opt_.max_t * (NH + NKV), cs);
+    // llama.cpp's graph_mtp: the block's input is eh_proj([rms_norm(e) enorm | rms_norm(h) hnorm])
+    k::native_qsa_rms_norm_weighted(x_, mtp_enorm_, hn_, (int) N, T, eps, cs);
+    k::native_qsa_rms_norm_weighted(mtp_h_, mtp_hnorm_, mix_, (int) N, T, eps, cs);
+    k::concat_rows(qfull_, hn_, mix_, N, T, cs);
+    if (mtp_eh_.type == kBF16) {
+        k::bf16_gemv_fp32_mmvf_multi(qfull_, 2 * N, static_cast<const uint16_t*>(mtp_eh_.data), x_, N, 2 * N, N, T, cs);
+    } else {
+        k::native_quantize_q8_1(qfull_, xq_, (int) (2 * N), T, cs);
+        k::native_mmvq(mtp_eh_.type, mtp_eh_.data, xq_, x_, (int) (2 * N), (int) N, T, cs);
+    }
+    uint32_t ring = 0;
+    if (!record_block(mtp_, n_moe_ - 1, T, ring, msegs_[(size_t) T], cs, err)) return false;
+    // the last row only: its norm is the next step's trunk row, and its logits pick the draft
+    k::native_qsa_rms_norm_weighted(x_ + (size_t) (T - 1) * N, mtp_head_norm_, hn_, (int) N, 1, eps, cs);
+    k::copy_from_mapped(mtp_h_, hn_, N, cs);
+    head_logits(hn_, 1, cs);
+    return true;
+}
+
+// The graph of a window of T rows, the trunk's or (`mtp`) the MTP layer's, recorded once.
+bool PlainModel::record(int T, bool mtp, std::string& err) {
+    strata::gpu::Graph*& exec = (mtp ? mexec_ : exec_)[(size_t) T];
+    std::vector<strata::gpu::Graph*>& segs = (mtp ? msegs_ : segs_)[(size_t) T];
+    if (exec != nullptr || !segs.empty()) return true;
     if (!strata::gpu::begin_capture(cs_)) {
         err = std::string("plain model: begin capture: ") + strata::gpu::last_error();
         return false;
     }
     bool ok = false;
     try {
-        ok = record_window(T, cs_, err);
+        ok = mtp ? record_mtp(T, cs_, err) : record_window(T, cs_, err);
     } catch (const std::exception& e) {
         err = std::string("plain model: recording the window: ") + e.what();
     }
     if (!ok) {
         strata::gpu::abandon_capture(cs_);
-        for (auto* g : segs_[(size_t) T]) strata::gpu::graph_destroy(g);
-        segs_[(size_t) T].clear();
+        for (auto* g : segs) strata::gpu::graph_destroy(g);
+        segs.clear();
         return false;
     }
     strata::gpu::Graph* g = nullptr;
@@ -822,18 +955,14 @@ bool PlainModel::record(int T, std::string& err) {
         err = std::string("plain model: end capture: ") + strata::gpu::last_error();
         return false;
     }
-    if (win_.segmented()) segs_[(size_t) T].push_back(g);
-    else exec_[(size_t) T] = g;
+    if (win_.segmented()) segs.push_back(g);
+    else exec = g;
     return true;
 }
 
-bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out, float* logits, std::string& err) {
+// The window's inputs in the mapped staging: the tokens' embedding rows, their step records and rotary positions.
+bool PlainModel::stage(const int32_t* tokens, int T, int64_t pos, std::string& err) {
     const ModelSpec& s = spec_;
-    if (T < 1 || T > opt_.max_t || pos < 0 || pos + T > opt_.max_cells) {
-        err = "plain model: the window is out of range";
-        return false;
-    }
-    if (!record(T, err) || !settle_swaps(false, err)) return false;
     const int64_t N = s.n_embd, NH = s.n_head;
     const k::QsaShapes qs = attn_shapes(s, nkv_);
     for (int t = 0; t < T; ++t) {
@@ -847,20 +976,34 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
         int32_t* pk = h_pos_ + (size_t) opt_.max_t * NH;
         for (int64_t h = 0; h < qs.n_head_kv; ++h) pk[(size_t) (t * qs.n_head_kv + h)] = (int32_t) (pos + t);
     }
+    return true;
+}
+
+bool PlainModel::launch_serve(strata::gpu::Graph* g, std::vector<strata::gpu::Graph*>& segs, int64_t rings,
+                              const int64_t* layers, int T, std::string& err) {
     win_.reset();
     const bool seg = win_.segmented();
-    if (!strata::gpu::graph_launch(seg ? segs_[(size_t) T][0] : exec_[(size_t) T], cs_)) {
+    if (!strata::gpu::graph_launch(seg ? segs[0] : g, cs_)) {
         err = std::string("plain model: launch: ") + strata::gpu::last_error();
         return false;
     }
     (void) strata::gpu::stream_idle(cs_);
+    std::vector<int> grps((size_t) rings, 0), tbs((size_t) rings, 0), ns((size_t) rings, T);
+    if (seg) win_.set_segments(&segs);
+    return win_.serve(rings, layers, grps.data(), tbs.data(), ns.data(), &PlainModel::pool_fn, this, cs_, err);
+}
+
+bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out, float* logits, std::string& err) {
+    const ModelSpec& s = spec_;
+    if (T < 1 || T > opt_.max_t || pos < 0 || pos + T > opt_.max_cells) {
+        err = "plain model: the window is out of range";
+        return false;
+    }
+    if (!record(T, false, err) || !settle_swaps(false, err) || !stage(tokens, T, pos, err)) return false;
     const int64_t L = s.n_moe_layers();
     std::vector<int64_t> layers((size_t) L);
-    std::vector<int> grps((size_t) L, 0), tbs((size_t) L, 0), ns((size_t) L, T);
     for (int64_t l = 0; l < L; ++l) layers[(size_t) l] = l;
-    if (seg) win_.set_segments(&segs_[(size_t) T]);
-    if (!win_.serve(L, layers.data(), grps.data(), tbs.data(), ns.data(), &PlainModel::pool_fn, this, cs_, err))
-        return false;
+    if (!launch_serve(exec_[(size_t) T], segs_[(size_t) T], L, layers.data(), T, err)) return false;
     k::SamplerParams sp = sampler_;
     sp.counter = (uint64_t) pos;   // row t's draw: position pos + t
     k::sample_tokens(logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs_);
@@ -877,9 +1020,118 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
         err = "plain model: reading the logits failed";
         return false;
     }
+    last_T_ = T;
+    mtp_h_set_ = false;
     ++windows_;
     if (!disp_.usage.empty() && windows_ % opt_.adapt_every == 0 && !adapt(err)) return false;
     return true;
+}
+
+bool PlainModel::mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* draft, std::string& err) {
+    if (!record(T, true, err) || !settle_swaps(false, err) || !stage(tokens, T, pos, err)) return false;
+    const int64_t ml = n_moe_ - 1;
+    if (!launch_serve(mexec_[(size_t) T], msegs_[(size_t) T], 1, &ml, T, err)) return false;
+    k::SamplerParams sp;   // the drafts are greedy
+    sp.greedy = true;
+    sp.temperature = 0.0f;
+    k::sample_tokens(logits_, 1, (int) n_vocab_, nullptr, 0, sp, m_out_, cs_);
+    if (!strata::gpu::stream_sync(cs_)) {
+        err = std::string("plain model: the MTP layer: ") + strata::gpu::last_error();
+        return false;
+    }
+    if (disp_.failed) {
+        err = std::string("plain model: the CPU experts: ") + (disp_.fail ? disp_.fail : "failed");
+        return false;
+    }
+    *draft = ((volatile int32_t*) h_out_)[0];
+    return true;
+}
+
+bool PlainModel::mtp_chain(int want, int64_t pos, std::string& err) {
+    // each step reads the draft before it at the next position, and the previous step's normed row (mtp_h_)
+    while ((int) drafts_.size() < want) {
+        int32_t d = -1;
+        const int64_t p = pos + (int64_t) drafts_.size() - 1;
+        if (p >= opt_.max_cells) return true;
+        if (!mtp_run(1, &drafts_.back(), p, &d, err)) return false;
+        drafts_.push_back(d);
+    }
+    return true;
+}
+
+bool PlainModel::spec_start(int32_t first, int64_t pos, std::string& err) {
+    drafts_.clear();
+    cur_ = first;
+    cur_pos_ = pos;
+    if (!has_mtp_ || n_snap_ < 1) return true;
+    // the trunk's row before `first`: prompt() leaves it in mtp_h_, a window in hn_
+    if (!mtp_h_set_ &&
+        !strata::gpu::copy(mtp_h_, hn_ + (size_t) (last_T_ - 1) * (size_t) spec_.n_embd, (size_t) spec_.n_embd * 4)) {
+        err = "plain model: the MTP layer's input";
+        return false;
+    }
+    if (pos >= opt_.max_cells) return true;
+    int32_t d = -1;
+    if (!mtp_run(1, &first, pos, &d, err)) return false;
+    drafts_.push_back(d);
+    return mtp_chain(n_snap_, pos + 1, err);
+}
+
+bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int32_t* emitted, int& n_emit, float* logits,
+                           std::string& err) {
+    n_emit = 0;
+    if (cur_ < 0) { err = "plain model: spec_step before spec_start"; return false; }
+    // the window: the pending token and the drafts that fit the context and the limit
+    int nd = (int) std::min<int64_t>({(int64_t) drafts_.size(), limit - 1, opt_.max_cells - cur_pos_ - 1});
+    nd = std::max(nd, 0);
+    int32_t win[k::cpu::MAXT];
+    int32_t out[k::cpu::MAXT];
+    win[0] = cur_;
+    for (int i = 0; i < nd; ++i) win[i + 1] = drafts_[(size_t) i];
+    const int T = nd + 1;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!forward(win, T, cur_pos_, out, logits, err)) return false;
+    const auto t1 = std::chrono::steady_clock::now();
+    spec_ms_check_ += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    // accepted: the drafts the window's own picks agree with, up to the first stop token among the emitted
+    int n = 0;
+    while (n < nd && out[n] == win[n + 1]) ++n;
+    for (int j = 0; j < n; ++j)
+        if (std::find(stop.begin(), stop.end(), out[j]) != stop.end()) { n = j; break; }
+    ++spec_windows_;
+    spec_drafted_ += nd;
+    spec_accepted_ += n;
+    for (int j = 0; j <= n; ++j) emitted[j] = out[j];
+    n_emit = n + 1;
+    // the recurrent states back to the last accepted row's (the attention's later cells are rewritten in turn)
+    if (n < T - 1) {
+        const ModelSpec& s = spec_;
+        const size_t st = (size_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state) * 4;
+        const size_t cv = (size_t) ((2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner) * (s.ssm_d_conv - 1)) * 4;
+        for (size_t g = 0; g < gdn_state_.size(); ++g)
+            if (!strata::gpu::copy_async(gdn_state_[g], gdn_snap_[g][(size_t) n], st, cs_) ||
+                !strata::gpu::copy_async(gdn_conv_[g], conv_snap_[g][(size_t) n], cv, cs_)) {
+                err = std::string("plain model: restoring the recurrent states: ") + strata::gpu::last_error();
+                return false;
+            }
+    }
+    // the MTP layer catches up over the accepted rows (row t: the window's trunk row t and the token after it), whose
+    // last row drafts the token after the new pending one; then the chain
+    const int64_t pos = cur_pos_;
+    cur_ = out[n];
+    cur_pos_ = pos + n + 1;
+    drafts_.clear();
+    if (cur_pos_ >= opt_.max_cells) return true;
+    if (!strata::gpu::copy_async(mtp_h_, hn_, (size_t) (n + 1) * (size_t) spec_.n_embd * 4, cs_)) {
+        err = std::string("plain model: the MTP layer's input: ") + strata::gpu::last_error();
+        return false;
+    }
+    int32_t d = -1;
+    if (!mtp_run(n + 1, out, pos + 1, &d, err)) return false;
+    drafts_.push_back(d);
+    const bool ok = mtp_chain(n_snap_, cur_pos_ + 1, err);
+    spec_ms_draft_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+    return ok;
 }
 
 // One of `layer`'s free slots takes `expert`, read from the expert source (blocking: between windows, or at load).
@@ -898,7 +1150,7 @@ bool PlainModel::fill_slot(int64_t layer, int32_t expert, std::string& err) {
 }
 
 bool PlainModel::save_profile(const std::string& path, std::string& err) const {
-    const int64_t L = spec_.n_moe_layers(), E = spec_.n_expert;
+    const int64_t L = n_moe_, E = spec_.n_expert;
     std::vector<uint8_t> resident((size_t) (L * E), 0);
     for (size_t i = 0; i < res_.size(); ++i) resident[i] = res_[i] >= 0;
     return write_expert_profile(path, L, E, rank_learned_profile(L, E, resident, heat_, prior_), err);
@@ -908,7 +1160,7 @@ bool PlainModel::save_profile(const std::string& path, std::string& err) const {
 // counts) replaces the least-routed resident one when it leads by 1.5, or takes a free slot; at most adapt_swaps a
 // round, the largest gains first; then the counts decay.  Runs between windows, so no window reads a slot it changes.
 bool PlainModel::adapt(std::string& err) {
-    const int64_t L = spec_.n_moe_layers(), E = spec_.n_expert;
+    const int64_t L = n_moe_, E = spec_.n_expert;
     if (!settle_swaps(false, err)) return false;
     if (!pending_.empty()) return true;   // the last round's copies are still landing: no new round yet
     struct Swap { float gain; int32_t layer, in, out; };   // out < 0: a free slot

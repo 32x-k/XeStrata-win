@@ -92,7 +92,7 @@ PlainModel::PromptGemm& PlainModel::prompt_gemm() {
 
 bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     if (!settle_swaps(true, err)) return false;   // the tier's copies may still be writing the slots lent below
-    const int64_t L = spec_.n_moe_layers(), E = spec_.n_expert, n = n_slots_;
+    const int64_t L = n_moe_, E = spec_.n_expert, n = n_slots_;
     const uint64_t* off = cache_.slot_offsets();
     if (borrow_first_ >= 0 || off == nullptr || L <= 0 || n < 2) { err = "plain prompt: no tier to borrow from"; return false; }
     // the chunk's device bytes from the tier's last slots: halved until they take at most half the tier, within its
@@ -126,7 +126,7 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
 }
 
 bool PlainModel::prompt_return(std::string& err) {
-    const int64_t L = spec_.n_moe_layers(), n = n_slots_;
+    const int64_t L = n_moe_, n = n_slots_;
     if (borrow_first_ < 0 || L <= 0) return true;   // a borrow needs slots, and slots need MoE layers
     const auto& lay = k::cpu::expert_layout();
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain prompt: ") + strata::gpu::last_error(); return false; }
@@ -223,7 +223,14 @@ bool PlainModel::prompt_warm_products(std::string& err) {
             err = std::string("plain prompt: warming: ") + strata::gpu::last_error();
             return false;
         }
-        for (const Block& b : blocks_) {
+        std::vector<const Block*> all;
+        for (const Block& b : blocks_) all.push_back(&b);
+        if (has_mtp_) {
+            all.push_back(&mtp_);
+            warm(mtp_eh_, P.x);
+        }
+        for (const Block* bp : all) {
+            const Block& b = *bp;
             if (b.recurrent) {
                 warm(b.qkv, P.qkv);
                 warm(b.z, P.z);
@@ -338,7 +345,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     auto t_mark = std::chrono::steady_clock::now();
     try {
         // the chunk's routes, every MoE layer's, for the adaptive tier's counts (below, after the chunk)
-        const int64_t L = s.n_moe_layers();
+        const int64_t L = n_moe_;
         std::vector<int32_t> routes(disp_.usage.empty() ? 0 : (size_t) (L * P.T * K));
         for (int64_t c0 = 0; c0 < n; c0 += P.T) {
             const int64_t T = std::min<int64_t>(P.T, n - c0), p0 = pos + c0;
@@ -375,8 +382,61 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
             auto proj_hn = [&](const W& w, float* y, int64_t ldy = 0) {
                 if (!dense(w, P.hn, N, y, T, ldy)) proj(w, y, T, ldy);
             };
-            for (int64_t l = 0; l < s.n_layer; ++l) {
-                const Block& b = blocks_[(size_t) l];
+            // the last token's logits, by the decode's head
+            auto last_logits = [&] {
+                if (c0 + T < n) return;
+                k::native_qsa_rms_norm_weighted(P.x + (T - 1) * N, out_norm_, P.hn, (int) N, 1, eps, cs);
+                if (head_.type == 30) {   // a BF16 head, as the decode reads it
+                    k::bf16_gemv_fp32_mmvf_multi(P.hn, head_.n_in, static_cast<const uint16_t*>(head_.data), logits_,
+                                                 head_.n_out, head_.n_in, head_.n_out, 1, cs);
+                } else {
+                    k::native_quantize_q8_1(P.hn, xq_, head_.n_in, 1, cs);
+                    k::native_mmvq(head_.type, head_.data, xq_, logits_, head_.n_in, head_.n_out, 1, cs);
+                }
+                k::SamplerParams sp = sampler_;
+                sp.counter = (uint64_t) (p0 + T - 1);   // the last token's position, as forward counts
+                k::sample_tokens(logits_, 1, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+            };
+            // the MTP layer after the trunk, its K/V a cell ahead: row t pairs the trunk's normed row t with the token
+            // after it (the prompt's last row with a stand-in, rewritten by spec_start once the token is picked)
+            const bool mtp_chunk = has_mtp_ && p0 + T < opt_.max_cells;
+            for (int64_t l = 0; l < s.n_layer + (mtp_chunk ? 1 : 0); ++l) {
+                const bool is_mtp = l == s.n_layer;
+                if (is_mtp) {
+                    last_logits();
+                    k::native_qsa_rms_norm_weighted(P.x, out_norm_, P.hn, (int) N, (int) T, eps, cs);
+                    if (c0 + T >= n &&
+                        !strata::gpu::copy_async(mtp_h_, P.hn + (T - 1) * N, (size_t) N * 4, cs)) {
+                        err = std::string("plain prompt: the MTP layer's input: ") + strata::gpu::last_error();
+                        return false;
+                    }
+                    k::native_qsa_rms_norm_weighted(P.hn, mtp_hnorm_, P.mix, (int) N, (int) T, eps, cs);
+                    for (int64_t t = 0; t < T; ++t) {   // the stream has synchronized since the chunk's uploads
+                        const int32_t tok = c0 + t + 1 < n ? tokens[c0 + t + 1] : tokens[n - 1];
+                        if (!k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tok * emb_row_, P.emb + t * N, N)) {
+                            err = "plain prompt: a token is out of the vocabulary";
+                            return false;
+                        }
+                        k::qsa_step_fill(P.h_steps + t * k::kStepCount, p0 + 1 + t, qs);
+                        for (int64_t hd = 0; hd < NH; ++hd) P.h_pos[t * NH + hd] = (int32_t) (p0 + 1 + t);
+                        for (int64_t hd = 0; hd < NKV; ++hd) P.h_pos[T * NH + t * NKV + hd] = (int32_t) (p0 + 1 + t);
+                    }
+                    if (!strata::gpu::copy_async(P.x, P.emb, (size_t) (T * N) * 4, cs) ||
+                        !strata::gpu::copy_async(P.steps, P.h_steps, (size_t) (T * k::kStepCount) * 4, cs) ||
+                        !strata::gpu::copy_async(P.pos_q, P.h_pos, (size_t) (T * NH) * 4, cs) ||
+                        !strata::gpu::copy_async(P.pos_k, P.h_pos + T * NH, (size_t) (T * NKV) * 4, cs)) {
+                        err = std::string("plain prompt: staging: ") + strata::gpu::last_error();
+                        return false;
+                    }
+                    k::native_qsa_rms_norm_weighted(P.x, mtp_enorm_, P.hn, (int) N, (int) T, eps, cs);
+                    k::concat_rows(P.qfull, P.hn, P.mix, N, T, cs);
+                    if (!dense(mtp_eh_, P.qfull, 2 * N, P.x, T)) {
+                        f16(P.qfull, T, 2 * N);
+                        proj(mtp_eh_, P.x, T);
+                    }
+                }
+                const Block& b = is_mtp ? mtp_ : blocks_[(size_t) l];
+                const int64_t pa = is_mtp ? p0 + 1 : p0;   // the rows' first position
                 k::native_qsa_rms_norm_weighted(P.x, b.attn_norm, P.hn, (int) N, (int) T, eps, cs);
                 f16(P.hn, T, N);
                 if (b.recurrent) {
@@ -427,11 +487,11 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     // the prompt attention (prompt_attn: K and V read once a block of queries), else the decode's
                     // kernel: every query reads the cells up to its own; the grid as wide as the chunk's last context (not
                     // the cache's capacity: no graph holds it), as many queries a launch as the scratch takes
-                    const int64_t cap = std::min<int64_t>(opt_.max_cells, p0 + T);
+                    const int64_t cap = std::min<int64_t>(opt_.max_cells, pa + T);
                     const int64_t per_q = (int64_t) k::qsa_decode_attn_scratch_floats(cap, qs);
                     const int64_t nq_max = std::max<int64_t>(1, std::min<int64_t>((int64_t) opt_.max_t * attn_scratch_floats_ / per_q, 4096));
                     const bool batched = prompt_attn_on &&
-                                         k::prompt_attn(P.qcur, k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_, p0,
+                                         k::prompt_attn(P.qcur, k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_, pa,
                                                         T, qs, P.attn, cs);
                     for (int64_t t = 0; !batched && t < T; t += nq_max) {
                         const int nq = (int) std::min<int64_t>(nq_max, T - t);
@@ -468,7 +528,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     err = std::string("plain prompt: the routes: ") + strata::gpu::last_error();
                     return false;
                 }
-                const int64_t ml = s.moe_index(l);
+                const int64_t ml = is_mtp ? n_moe_ - 1 : s.moe_index(l);
                 std::vector<int32_t> count((size_t) E, 0);
                 for (int64_t i = 0; i < T * K; ++i) {
                     const int32_t e = P.h_ids[i];
@@ -683,19 +743,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 k::add_inplace(P.x, P.moe_out, T * N, cs);
                 mark(3, t_mark);
             }
-            if (c0 + T >= n) {   // the last token's logits, by the decode's head
-                k::native_qsa_rms_norm_weighted(P.x + (T - 1) * N, out_norm_, P.hn, (int) N, 1, eps, cs);
-                if (head_.type == 30) {   // a BF16 head, as the decode reads it
-                    k::bf16_gemv_fp32_mmvf_multi(P.hn, head_.n_in, static_cast<const uint16_t*>(head_.data), logits_,
-                                                 head_.n_out, head_.n_in, head_.n_out, 1, cs);
-                } else {
-                    k::native_quantize_q8_1(P.hn, xq_, head_.n_in, 1, cs);
-                    k::native_mmvq(head_.type, head_.data, xq_, logits_, head_.n_in, head_.n_out, 1, cs);
-                }
-                k::SamplerParams sp = sampler_;
-                sp.counter = (uint64_t) (p0 + T - 1);   // the last token's position, as forward counts
-                k::sample_tokens(logits_, 1, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
-            }
+            if (!mtp_chunk) last_logits();
             if (!routes.empty()) {
                 // each window's counts as the windows would leave them at the prompt's end: times the decay of every
                 // round that would come after it; the rounds themselves are left to the decode (their swaps would
@@ -721,6 +769,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
         return false;
     }
     windows_ += (n + opt_.max_t - 1) / opt_.max_t;
+    mtp_h_set_ = has_mtp_ && pos + n < opt_.max_cells;   // the trunk's last row is in mtp_h_ for spec_start
     if (profile)
         std::fprintf(stderr, "strata plain: prompt of %lld tokens: GDN %.1f ms, attention %.1f, router and grouping %.1f, "
                              "experts %.1f, shared and combine %.1f\n", (long long) n, stage_ms[0], stage_ms[4], stage_ms[1],
