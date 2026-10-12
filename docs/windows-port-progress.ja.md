@@ -479,3 +479,12 @@ oneAPI拡張のAPIがコンパイルできても、HIP backendで使えるとは
 - 複数 GPU の二段 pipeline
 
 command graph を無効にするときも、標準 SYCL の queue と event による依存関係、メモリ寿命、同期順序は維持します。HIP エンジンへの全面置換は行いません。
+
+<a id="lane-affinity-measurement"></a>
+## 2026-10-12: AdaptiveCppのlane照合を隔離して測定
+
+AdaptiveCpp `0ea863abe1af4422593583f91e5608ef75044a16`の`multi_queue_executor::find_assigned_lane_index`は、DAG nodeに登録された親executorを子executorと比較していたため、先行nodeのlaneを見つけられませんでした。候補修正は所属・backend・device範囲を確認してから、nodeのexecution laneと子のqueueを照合します。kernel/copy laneの分離と必要なstream間依存、XeStrataのDAG方式、final-copy event待機は維持します。全laneを統合する別案はkernel後のD2Hで248,320要素すべてが古い0になったため不採用で、モデル性能測定には使用していません。
+
+Windows R9700の隔離runtime（B）と正常版（A）で同じ13入力ID、41出力token、53位置を比較しました。診断A/Bでは全13,160,960 logitsと26,593,280 residual floatsがbit単位で一致し、非有限値は0です。dumpなしのfresh processをA1→B1→A2→B2→A3→B3の順に各3回実行し、Decode中央値はA 2.576→B 3.846 tok/s（+49.3%、1.493倍）、Routing/Inputのhost待機中央値は261.091→122.509 ms/位置、CPU callbackは100.624→101.673 ms/位置でした。待機はGPU処理・転送・runtimeを含み、GPU実行時間の内訳ではありません。固定したこのworkloadでの結果であり、10倍には達していません。
+
+修正は`third_party/main/adaptivecpp/patches/0002-dag-lane-affinity.patch`として固定commitのAdaptiveCpp sourceだけへ適用する対象です。別source/build/prefixで再現・検査し、正常版installを上書きしません。正常版exe、SDK、driver、復元用コピーは維持しました。記録はGit対象外の`build/windows-acpp/lane-affinity-20261012T084944Z/report.ja.md`、`result.json`と`.tools/lane-affinity-runtime/source.diff`にあります。他のprompt、長いcontext、別GPU・量子化、実GPU障害時のcleanup、4 GiB最大allocation条件は今回の検査範囲外です。

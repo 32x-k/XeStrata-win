@@ -2,9 +2,9 @@
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 SPDX-License-Identifier: LGPL-3.0-or-later
 -->
-# Temporary AdaptiveCpp event patch
+# Local AdaptiveCpp Windows patches
 
-Only AdaptiveCpp commit `0ea863abe1af4422593583f91e5608ef75044a16` is supported. AdaptiveCpp itself is not bundled; use an existing local checkout. Nothing is downloaded.
+Only AdaptiveCpp commit `0ea863abe1af4422593583f91e5608ef75044a16` is supported. AdaptiveCpp itself is not bundled; use an existing local checkout. Nothing is downloaded. Patch 0001 fixes event handlers; 0002 fixes lane lookup.
 
 `patches/0001-event-async-handler.patch` changes one line to retain the supplied `async_handler` in the node-bearing `sycl::event` constructor. The patch carries AdaptiveCpp's BSD-2-Clause license and leaves the original copyright/license header untouched. The original license is kept in `LICENSE`. XeStrata's Python build tooling and this document are LGPL-3.0-or-later.
 
@@ -36,4 +36,13 @@ The committed LF original's SHA-256 is `0576c693880346dcd6d85ec3934be332c8e1678a
 
 `tests/platform/adaptivecpp_event_async.cpp` is an isolated test using real installed headers/runtime. Run with a separate CPU-only prefix; do not install or discover GPU backends. It uses no device queue, device allocation, kernel or DMA. Controlled synthetic runtime errors test handler counts, original diagnostics, SYCL errc, batching, event copies, no redelivery and throwing handlers. `--expect-broken`, using the same CPU runtime with the original event header, is the negative control.
 
-The patch changes no queue ordering, DAG behavior, normal arithmetic or XeStrata engine source. Default-constructed-event handler behavior, the process-global error list, and cancellation/uncertain-DMA cleanup remain separate issues. This test does not establish GPU-fault cleanup or real-model correctness.
+Patch 0001 changes no queue ordering, DAG behavior, normal arithmetic or XeStrata engine source. Default-constructed-event handler behavior, the process-global error list, and cancellation/uncertain-DMA cleanup remain separate issues. This test does not establish GPU-fault cleanup or real-model correctness.
+
+<a id="lane-affinity-patch-0002"></a>
+## 0002: lane-lookup scope and isolated build
+
+`patches/0002-dag-lane-affinity.patch` targets `src/runtime/multi_queue_executor.cpp` at the same pinned commit; its runtime behavior change is confined to `find_assigned_lane_index` (it also adds license attribution). For DAG nodes assigned to the parent multi_queue_executor, it identifies a predecessor lane by matching the node's execution lane to a child executor's queue, rather than asking whether the child owns the node. Ownership, backend and device bounds are checked first so foreign nodes' uninitialized lanes are not read. It does not merge kernel/copy lanes, remove necessary cross-stream dependencies or remove XeStrata's final-copy wait. The original-source difference is saved at `.tools/lane-affinity-runtime/source.diff`.
+
+For reproduction, apply 0001 in a separate checkout, then run `python tools/adaptivecpp_lane_affinity.py --source PATH_TO_ISOLATED_ADAPTIVECPP --apply-only`. After building and installing, run `--verify-only` against the same source. The tool checks the pinned commit and SHA-256 of the complete original and patched source; it stops on a mismatch. It does not build or install. Use separate source/build/prefix locations; never overwrite the working installation, 0001 validation environment or recovery copies. The 0001 instructions alone do not establish application or verification of 0002. A newly built binary differs from the measured isolated DLL and needs a numerical gate before use.
+
+On the Windows R9700, working A and isolated runtime B matched bitwise across 53 positions, 41 generated tokens, all 13,160,960 logits and 26,593,280 residual floats. Three alternating runs per side gave median decode 2.576→3.846 tok/s (+49.3%), host Routing/Input wait 261.091→122.509 ms/position and CPU callback 100.624→101.673 ms/position. A separate all-lanes merge was rejected after all 248,320 elements returned stale zero. This is neither a 10× gain nor evidence for other workloads. See Git-excluded `build/windows-acpp/lane-affinity-20261012T084944Z/report.ja.md` and `result.json`, and `docs/windows-port-progress.md`.

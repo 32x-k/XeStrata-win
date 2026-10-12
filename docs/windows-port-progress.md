@@ -479,3 +479,12 @@ The initial generation path does not use the following. Until stabilization and 
 - the two-stage multi-GPU pipeline
 
 When command graphs are disabled, standard SYCL queues and events must preserve dependencies, memory lifetime and synchronization order. The engine will not be replaced wholesale with the HIP engine.
+
+<a id="lane-affinity-measurement"></a>
+## 2026-10-12: isolated AdaptiveCpp lane-affinity measurement
+
+In AdaptiveCpp `0ea863abe1af4422593583f91e5608ef75044a16`, `multi_queue_executor::find_assigned_lane_index` compared the parent executor assigned to a DAG node against child executors, failing to find predecessor lanes. The candidate checks ownership, backend and device bounds, then matches the node's execution lane to the child queue. Kernel/copy lane separation and required cross-stream dependencies remain, as do XeStrata's DAG ordering and final-copy event wait. A separate all-lanes merge returned stale zero for all 248,320 D2H elements after a kernel; it was rejected without model performance runs.
+
+On the Windows R9700, the isolated runtime (B) was compared with the working version (A) on the same 13 input IDs, 41 generated tokens and 53 positions. Diagnostic A/B runs bitwise matched all 13,160,960 logits and 26,593,280 residual floats, with zero nonfinite values. Three fresh no-dump processes per side ran A1→B1→A2→B2→A3→B3: median decode A 2.576→B 3.846 tok/s (+49.3%, 1.493×); median host Routing/Input wait 261.091→122.509 ms/position; CPU callback 100.624→101.673 ms/position. The wait includes GPU work, transfers and runtime; it is not a breakdown of GPU execution time. This is evidence for this fixed workload, not a 10× gain.
+
+The change is scoped to `third_party/main/adaptivecpp/patches/0002-dag-lane-affinity.patch`, applied only to pinned AdaptiveCpp source. Reproduce and check it in separate source/build/prefix locations; do not overwrite the working installation. The working executable, SDK, driver and recovery copies remain intact. Local, Git-excluded evidence is in `build/windows-acpp/lane-affinity-20261012T084944Z/report.ja.md`, `result.json` and `.tools/lane-affinity-runtime/source.diff`. Other prompts, longer contexts, other GPUs/quantizations, real GPU-fault cleanup and a 4-GiB maximum-allocation limit are outside this check.

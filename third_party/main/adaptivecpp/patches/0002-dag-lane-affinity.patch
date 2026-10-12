@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: The AdaptiveCpp Contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Modified 2026 by MistVVK and the XeStrata contributors:
+# identify the actual DAG execution lane instead of comparing parent and child executors.
+# Original file's BSD-2-Clause notice is preserved. Full license: ../LICENSE
+# Applies only to AdaptiveCpp 0ea863abe1af4422593583f91e5608ef75044a16.
+# Retains separate kernel/memcpy lanes, DAG requirements and HIP stream waits.
+
+diff --git a/src/runtime/multi_queue_executor.cpp b/src/runtime/multi_queue_executor.cpp
+--- a/src/runtime/multi_queue_executor.cpp
++++ b/src/runtime/multi_queue_executor.cpp
+@@ -10,0 +11,3 @@
++// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
++// Modified 2026 by MistVVK and the XeStrata contributors: identify the actual DAG execution lane.
++
+@@ -249,4 +252,12 @@
+-  if(!node->is_submitted())
+-    return false;
+-
+-  std::size_t dev_id = node->get_assigned_device().get_id();
++  // Imported or foreign nodes may not have an initialized execution lane.
++  // Only our submitted DAG nodes have the child queue identity recorded below.
++  if(!node->is_submitted() || node->get_assigned_executor() != this)
++    return false;
++
++  const device_id dev = node->get_assigned_device();
++  if(dev.get_backend() != _backend || dev.get_id() < 0)
++    return false;
++
++  const std::size_t dev_id = static_cast<std::size_t>(dev.get_id());
++  if(dev_id >= _device_data.size())
++    return false;
+@@ -256 +267,4 @@
+-    if(executor->is_submitted_by_me(node)) {
++    // DAG scheduling assigns the outer multi_queue_executor to the node;
++    // the child inorder_executor records its queue as the execution lane.
++    // Identify the lane by that queue, not by comparing parent/child executors.
++    if(node->get_assigned_execution_lane() == executor->get_queue()) {

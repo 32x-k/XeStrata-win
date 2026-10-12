@@ -2,9 +2,9 @@
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 SPDX-License-Identifier: LGPL-3.0-or-later
 -->
-# AdaptiveCppの暫定eventパッチ
+# AdaptiveCppのWindows向け局所パッチ
 
-対象はAdaptiveCppのcommit `0ea863abe1af4422593583f91e5608ef75044a16`だけです。AdaptiveCpp本体は同梱せず、既存のローカルcheckoutを使います。ダウンロードは行いません。
+対象はAdaptiveCppのcommit `0ea863abe1af4422593583f91e5608ef75044a16`だけです。AdaptiveCpp本体は同梱せず、既存のローカルcheckoutを使います。ダウンロードは行いません。0001はevent handler、0002はlane照合の修正です。
 
 `patches/0001-event-async-handler.patch`は、`sycl::event`のnode付きconstructorが受け取った`async_handler`をメンバーへ保存する1行の修正です。パッチはAdaptiveCppと同じBSD-2-Clauseで、元のcopyright・license headerを変えません。原文のライセンスは`LICENSE`に保存しています。XeStrataのビルド用Pythonコードとこの文書はLGPL-3.0-or-laterです。
 
@@ -36,4 +36,13 @@ commit中のLF原文のSHA-256は`0576c693880346dcd6d85ec3934be332c8e1678af7f126
 
 `tests/platform/adaptivecpp_event_async.cpp`は、実際のinstalled headerとruntimeを使う隔離テストです。CPU backendだけの別prefixで実行し、GPU backendをinstall・探索させません。device queue、device allocation、kernel、DMAは使いません。制御されたsynthetic runtime errorを登録し、handlerの呼出し回数、元のdiagnostic、SYCL errc、複数error、event copy、再通知なし、throwするhandlerを確認します。同じCPU runtimeと未修正event headerでの`--expect-broken`はnegative controlです。
 
-このパッチはqueue順序、DAG、正常時の演算、XeStrata本体を変えません。default生成eventのhandler挙動、process-global error一覧、cancelやDMA完了不明時のcleanupは別課題です。このテストをGPU障害時のcleanupや実モデル生成の検証とは扱いません。
+0001はqueue順序、DAG、正常時の演算、XeStrata本体を変えません。default生成eventのhandler挙動、process-global error一覧、cancelやDMA完了不明時のcleanupは別課題です。このテストをGPU障害時のcleanupや実モデル生成の検証とは扱いません。
+
+<a id="lane-affinity-patch-0002"></a>
+## 0002: lane照合の範囲と隔離ビルド
+
+`patches/0002-dag-lane-affinity.patch`は同じ固定commitの`src/runtime/multi_queue_executor.cpp`を対象にし、runtime動作の変更は`find_assigned_lane_index`に限定します（ライセンス帰属表示も追加します）。親multi_queue_executorが登録されたDAG nodeについて、先行laneを子executorの所有判定ではなくnodeのexecution laneと子のqueueで照合します。所属・backend・device範囲の確認を先に行い、foreign nodeの未初期化laneは読まない設計です。kernel/copy laneを統合せず、必要なstream間依存やXeStrataのfinal-copy待機を外しません。原ソースとの差分は`.tools/lane-affinity-runtime/source.diff`に保存しています。
+
+再現時は別checkoutで0001を適用した後、`python tools/adaptivecpp_lane_affinity.py --source PATH_TO_ISOLATED_ADAPTIVECPP --apply-only`を実行します。build/install後は同じsourceへ`--verify-only`を実行します。toolは固定commitと対象sourceの原文・適用後全文のSHA-256を確認し、不一致なら停止します。buildやinstallは行いません。別source/build/prefixだけで作業し、正常版のsource/build/install、既存の0001検証環境や復元用コピーは上書きしません。上の0001用手順だけで0002の適用・検証が済んだとは扱いません。新規構築物は今回の隔離DLLと別のbinaryになるため、使用前に数値gateが必要です。
+
+Windows R9700で正常版Aと隔離runtime Bの53位置・41出力tokenを比較し、全13,160,960 logitsと26,593,280 residual floatsがbit単位で一致しました。A/B交互の各3回ではDecode中央値2.576→3.846 tok/s（+49.3%）、host Routing/Input待機261.091→122.509 ms/位置、CPU callback100.624→101.673 ms/位置でした。全lane統合の別案は248,320要素すべてが古い0となり不採用です。10倍の改善や他のworkloadでの再現を示す結果ではありません。詳細はGit対象外の`build/windows-acpp/lane-affinity-20261012T084944Z/report.ja.md`と`result.json`、進捗記録は`docs/windows-port-progress.ja.md`を参照してください。
