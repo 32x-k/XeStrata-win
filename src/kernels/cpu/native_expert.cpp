@@ -43,7 +43,7 @@ bool iq256_supported(int type) noexcept {
     return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
 }
 
-bool kq256_supported(int type) noexcept { return type == 12 || type == 13 || type == 14; }
+bool kq256_supported(int type) noexcept { return type == 10 || type == 11 || type == 12 || type == 13 || type == 14; }
 
 size_t native_row_bytes(int type, int64_t n) {
     if (type < 0 || type >= GGML_TYPE_COUNT || n <= 0 || n % ggml_blck_size((ggml_type) type)) return 0;
@@ -162,6 +162,13 @@ bool kq_on(int type) {
     static const bool q80 = on && cpu_avxvnni_ok();
     return type == (int) GGML_TYPE_Q8_0 ? q80 : on && kq256_supported(type);
 }
+// Q2_K and Q3_K (GSQ-RCO's experts) from four tokens on: ggml-cpu's own AVX2 dots for them are faster below that
+// (one thread, Ornith's shape, ms an expert, the kernel against ggml-cpu - i7-14700: Q2_K 0.103 / 0.069 at one token,
+// 0.135 / 0.121 at two, 0.210 / 0.230 at four; Ryzen 7 5700X: Q2_K 0.154 / 0.147 at two, 0.266 / 0.295 at four, Q3_K
+// 0.229 / 0.195 at two, 0.345 / 0.390 at four).
+int kq_mt_min(int type, int mt_min) {
+    return type == (int) GGML_TYPE_Q2_K || type == (int) GGML_TYPE_Q3_K ? (mt_min > 4 ? mt_min : 4) : mt_min;
+}
 }  // namespace
 
 namespace {
@@ -169,7 +176,7 @@ namespace {
 // and the group is large enough, else ggml-cpu's dot)
 void part_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                int r0, int r1, int mt_min) {
-    if (nt >= mt_min && kq_on(type)) {
+    if (nt >= kq_mt_min(type, mt_min) && kq_on(type)) {
         if (type == (int) GGML_TYPE_Q8_0) q80_256_rows(w, row_bytes, n, act, nt, out, r0, r1);
         else kq256_rows(type, w, row_bytes, n, act, nt, out, r0, r1);
         return;
@@ -219,7 +226,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             return;
         }
     }
-    if (nt >= mt_min && kq_on(f.gu_type)) {
+    if (nt >= kq_mt_min(f.gu_type, mt_min) && kq_on(f.gu_type)) {
         if (f.gu_type == (int) GGML_TYPE_Q8_0) q80_256_gu_rows(blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         else kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
@@ -248,7 +255,7 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
-    if (nt >= mt_min && kq_on(f.d_type)) {   // the K-quant and Q8_0 down rows: the same rule
+    if (nt >= kq_mt_min(f.d_type, mt_min) && kq_on(f.d_type)) {   // the K-quant and Q8_0 down rows: the same rule
         if (f.d_type == (int) GGML_TYPE_Q8_0) q80_256_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         else kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;

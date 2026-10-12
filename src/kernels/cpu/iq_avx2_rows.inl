@@ -256,12 +256,109 @@ inline void row_dot_q6k(const uint8_t* row, int nblocks, const block_q8_K* const
     for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
 }
 
+// ---- Q2_K (10): scales[16] (a 4-bit scale and a 4-bit min a 16 values), qs[64], d, dmin.  ggml's
+// ggml_vec_dot_q2_K_q8_K: x = d * sc * q - dmin * m with q in 0..3, so a block is d * y.d * sum(sc * q.y) minus
+// dmin * y.d * sum(m * bsums) (a bsum a 16 values, as the scales).  Value 128k + 32j + l is bits 2j of qs[32k + l].
+template <int NT> STRATA_ROWS_FN
+inline void row_dot_q2k(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+    const __m256i m3 = _mm256_set1_epi8(0x03);
+    const int pf = prefetch_distance();
+    __m256 accf[NT], accm[NT];
+    for (int t = 0; t < NT; ++t) accf[t] = accm[t] = _mm256_setzero_ps();
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* blk = row + (size_t) i * 84;
+        rows_ahead(blk, pf);
+        const __m128i sc8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk));
+        const __m256i mins = _mm256_cvtepu8_epi16(_mm_and_si128(_mm_srli_epi16(sc8, 4), _mm_set1_epi8(0x0f)));
+        __m256i acci[NT];
+        for (int t = 0; t < NT; ++t) acci[t] = _mm256_setzero_si256();
+        for (int k = 0; k < 2; ++k) {
+            const __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk + 16 + 32 * (ptrdiff_t) k));
+            for (int j = 0; j < 4; ++j) {
+                const __m256i g = _mm256_and_si256(_mm256_srli_epi16(q, 2 * j), m3);
+                const int s = 8 * k + 2 * j;   // the scales of the two 16-value halves
+                const __m256i sc = sc16(blk[s] & 0xf, blk[s + 1] & 0xf);
+                for (int t = 0; t < NT; ++t) {
+                    const __m256i yv = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i*>(y[t][i].qs + 128 * (ptrdiff_t) k + 32 * (ptrdiff_t) j));
+                    acci[t] = madd_add(acci[t], _mm256_maddubs_epi16(g, yv), sc);
+                }
+            }
+        }
+        const float d = h2f(u16(blk + 80)), dmin = h2f(u16(blk + 82));
+        for (int t = 0; t < NT; ++t) {
+            const __m256i bs = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y[t][i].bsums));
+            accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * y[t][i].d), _mm256_cvtepi32_ps(acci[t]), accf[t]);
+            accm[t] = _mm256_fmadd_ps(_mm256_set1_ps(dmin * y[t][i].d), _mm256_cvtepi32_ps(_mm256_madd_epi16(bs, mins)),
+                                      accm[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]) - hsum8(accm[t]);
+}
+
+// ---- Q3_K (11): hmask[32], qs[64], 12 bytes of 6-bit scales (less 32), d.  ggml's ggml_vec_dot_q3_K_q8_K:
+// x = d * sc * (q - 4 * (1 - h)) with q in 0..3 and h the hmask bit, so with q' = q + 4h in 0..7 a block is
+// d * y.d * (sum(sc * q'.y) - 4 * sum(sc * bsums)).  Value 128k + 32j + l: bits 2j of qs[32k + l], bit 4k + j of
+// hmask[l].
+template <int NT> STRATA_ROWS_FN
+inline void row_dot_q3k(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+    constexpr uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
+    const __m256i m3 = _mm256_set1_epi8(0x03), four = _mm256_set1_epi8(0x04);
+    const int pf = prefetch_distance();
+    __m256 accf[NT];
+    for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* blk = row + (size_t) i * 110;
+        rows_ahead(blk, pf);
+        // ggml's unpacking of the 12 scale bytes into 16 6-bit scales
+        uint32_t a[4];
+        std::memcpy(a, blk + 96, 12);
+        const uint32_t tmp = a[2];
+        a[2] = ((a[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        a[3] = ((a[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        a[0] = (a[0] & kmask2) | ((tmp & kmask1) << 4);
+        a[1] = (a[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        int8_t scs[16];
+        std::memcpy(scs, a, 16);
+        for (int s = 0; s < 16; ++s) scs[s] = (int8_t) (scs[s] - 32);
+        const __m256i sc_all = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(scs)));
+        const __m256i hm = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk));
+        __m256i acci[NT];
+        for (int t = 0; t < NT; ++t) acci[t] = _mm256_setzero_si256();
+        for (int k = 0; k < 2; ++k) {
+            const __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk + 32 + 32 * (ptrdiff_t) k));
+            for (int j = 0; j < 4; ++j) {
+                const __m256i bit = _mm256_set1_epi8((char) (1 << (4 * k + j)));
+                const __m256i h = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(hm, bit), bit), four);
+                const __m256i g = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q, 2 * j), m3), h);
+                const int s = 8 * k + 2 * j;
+                const __m256i sc = sc16(scs[s], scs[s + 1]);
+                for (int t = 0; t < NT; ++t) {
+                    const __m256i yv = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i*>(y[t][i].qs + 128 * (ptrdiff_t) k + 32 * (ptrdiff_t) j));
+                    acci[t] = madd_add(acci[t], _mm256_maddubs_epi16(g, yv), sc);
+                }
+            }
+        }
+        const float d = h2f(u16(blk + 108));
+        for (int t = 0; t < NT; ++t) {
+            const __m256i bs = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y[t][i].bsums));
+            const __m256i off = _mm256_slli_epi32(_mm256_madd_epi16(sc_all, bs), 2);   // 4 * sum(sc * bsums)
+            accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * y[t][i].d), _mm256_cvtepi32_ps(_mm256_sub_epi32(acci[t], off)),
+                                      accf[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+}
+
 template <int TY, int NT> STRATA_ROWS_FN
 inline void row_dot_any(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     if constexpr (TY == 17)      row_dot_iq2xs<NT>(row, nblocks, y, res);
     else if constexpr (TY == 12) row_dot_q45k<false, NT>(row, nblocks, y, res);
     else if constexpr (TY == 13) row_dot_q45k<true, NT>(row, nblocks, y, res);
     else if constexpr (TY == 14) row_dot_q6k<NT>(row, nblocks, y, res);
+    else if constexpr (TY == 10) row_dot_q2k<NT>(row, nblocks, y, res);
+    else if constexpr (TY == 11) row_dot_q3k<NT>(row, nblocks, y, res);
     else                         row_dot<TY, NT>(row, nblocks, y, res);
 }
 
@@ -321,7 +418,7 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
 }
 
 // The decode of each format for a variant: the gathered one (kIq256Gather) for IQ3_XXS, IQ3_S and IQ2_S.  The K-quants
-// (12-14, kq256_*) have one decode.
+// (10-14, kq256_*) have one decode.
 template <bool G> STRATA_ROWS_FN
 void gu_type(int type, int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
              float* const* ff, int r0, int r1) {
@@ -335,6 +432,8 @@ void gu_type(int type, int nt, const uint8_t* blob, size_t gu_row, size_t up_off
         case 12: gu_rows_nt<12>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 13: gu_rows_nt<13>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 14: gu_rows_nt<14>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 10: gu_rows_nt<10>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 11: gu_rows_nt<11>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         default: break;
     }
 }
@@ -352,6 +451,8 @@ void dot_type(int type, int nt, const uint8_t* w, size_t row_bytes, int n, const
         case 12: dot_rows_nt<12>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 13: dot_rows_nt<13>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 14: dot_rows_nt<14>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 10: dot_rows_nt<10>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 11: dot_rows_nt<11>(nt, w, row_bytes, n, act, out, r0, r1); break;
         default: break;
     }
 }

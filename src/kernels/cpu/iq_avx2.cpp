@@ -13,7 +13,7 @@
 // order of the float additions differs.
 //
 // Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), IQ4_XS (23).  IQ1_M stays on ggml-cpu.
-// The K-quants Q4_K (12), Q5_K (13), Q6_K (14) and Q8_0 (8) take the same scheme (kq256_*, q80_256_*): their values are
+// The K-quants Q2_K (10), Q3_K (11), Q4_K (12), Q5_K (13), Q6_K (14) and Q8_0 (8) take the same scheme (kq256_*, q80_256_*): their values are
 // unpacked once per block, every token applies them; the mins and Q6_K's offset of 32 come from the activation's
 // bsums, as in ggml's own dots.
 //
