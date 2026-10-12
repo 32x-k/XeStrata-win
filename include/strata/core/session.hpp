@@ -228,8 +228,11 @@ struct SessionGraphs {
 /// `pos`/`pos_base` are baked in ONLY through the fixed-address pinned staging in each `QsaState`, which the
 /// replay re-reads every token - so the position is data, not an argument.  That is the whole reason rounds
 /// 211-214 moved the per-token counts into device buffers.
+///
+/// `doorbell` false captures `pre` without the doorbell's ring and mapped publication, for `session_token_pool`,
+/// which downloads the routing with explicit copies instead.
 bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionState& s, const float* parts,
-                     SessionGraphs& gr, std::string& err, bool split = false);
+                     SessionGraphs& gr, std::string& err, bool split = false, bool doorbell = true);
 
 /// One token by REPLAYING the captured graphs.  Identical arithmetic to `session_token`; the only difference is
 /// that ~2,000 kernel launches become 48 graph launches.
@@ -419,10 +422,13 @@ struct PoolTiming {
 /// `sync_every_layer` additionally checks each post; `session_token`'s caller-filled parts contract is unchanged.
 /// Optional HOST `dump_layers` holds (n_layers+1)*hc*n_embd floats: input, then each post residual.
 /// It must stay alive through return; the final stream drain completes its ordered copies.
+/// Optional `graphs`, captured by `session_capture` with `doorbell` false on this `parts`: `pre[l]` and `post[l]`
+/// are replayed instead of submitted kernel by kernel, and the position is staged for them (`stage_token`).
 bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,
                         SessionState& s, float* parts, PoolFn pool, HitFn hits, void* user,
                         SessionLoopScratch& scratch, void* stream, bool sync_every_layer, std::string& err,
-                        float* dump_layers = nullptr, PoolTiming* timing = nullptr);
+                        float* dump_layers = nullptr, PoolTiming* timing = nullptr,
+                        const SessionGraphs* graphs = nullptr);
 
 // ================================ plan v0.3 P3: THE WHOLE TOKEN AS ONE GRAPH ================================
 //

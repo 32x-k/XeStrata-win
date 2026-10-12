@@ -292,6 +292,17 @@ sycl::queue* Runtime::create_stream() {
     return &streams_.emplace_back(context_, device_, handler(), ordered_properties());
 }
 
+sycl::queue* Runtime::create_capture_stream() {
+#if defined(STRATA_ADAPTIVECPP)
+    // Recording only: the DAG-ordered queues defer and spread their work over several HIP streams, which a
+    // stream capture cannot follow.  Nothing recorded here runs until the graph is replayed on an engine stream.
+    std::lock_guard<std::mutex> lock(streams_mutex_);
+    return &streams_.emplace_back(context_, device_, handler(), sycl::property_list{sycl::property::queue::in_order{}});
+#else
+    return create_stream();
+#endif
+}
+
 void Runtime::destroy_stream(sycl::queue* stream) {
     if (!stream) return;
     if (!owns(stream) || stream == &compute_ || stream == &transfer_)

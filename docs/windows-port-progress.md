@@ -513,3 +513,33 @@ XeStrata's Linux build was tried in WSL 2 (Ubuntu 24.04, ROCm 7.2.3, librocdxg).
 librocdxg's debug log shows that after ROCm's first internal kernel dispatch is converted to PM4 and submitted, the queue's read pointer on the R9700 never moves from 0. librocdxg's `src/wddm/cmd_util.cpp` (the same in its current home, ROCm/rocm-systems) has no gfx12 branch: the cache flush uses one bit layout for gfx10 and later, and `PRIV` is set for gfx11 only. librocdxg 1.2.2, the newest, behaves the same, and setting `PRIV` for gfx12 as well made Windows stop with bugcheck 0xD1 (`dxgmms2.sys`). The Windows driver is 32.0.32015.2008 (2026-09-28), newer than the pairing AMD supports for WSL (Adrenalin 26.2.2 with ROCm 7.2.1).
 
 The R9700 cannot be used through WSL on this machine, so work continues on the native Windows path. The setup change that finds AMD GPUs from `rocminfo` under WSL 2 is not committed, because of this bugcheck risk. `xmx_probe` running on the CPU for about 1 h 45 min under WSL after the intel/llvm build also needs a separate fix.
+
+<a id="pool-graphs"></a>
+## 2026-10-13: the pool path replays its layers as HIP graphs
+
+### What the time per layer was
+
+A small SYCL test measured the launch cost on AdaptiveCpp's HIP backend. Even an empty kernel, submitted back to back, cost about 38 µs (DAG ordering) or 26 to 35 µs (native in-order). Plain HIP, without AdaptiveCpp, launched the same kernel in 1.7 µs, and in 34 µs with an event recorded after each kernel. AdaptiveCpp records a completion event for every operation, so on Windows HIP each kernel appears to take a submission of its own. Kernels with no event after them sometimes left no result even though the synchronization succeeded (a Windows HIP behaviour; possibly the same root as the stale readback of native in-order).
+
+HIP's stream capture recorded SYCL kernels submitted to an AdaptiveCpp native in-order queue into a graph. Replaying a graph of 40 kernels cost 3 to 8 µs per kernel, with the right values.
+
+### The change
+
+- In the AdaptiveCpp build, the `strata::gpu` capture API is implemented with HIP's stream capture (`begin_capture`, `end_capture`, `abandon_capture`, `is_capturing`, `graph_launch`, `graph_destroy`). HIP is loaded at run time; the build does not link it. Recording is on the one HIP stream of a native in-order queue (`stream_create_capture`); a replay calls `hipGraphLaunch` from a custom operation on the engine's DAG queue, so AdaptiveCpp keeps it in order with what comes before and after.
+- `session_capture` takes a `doorbell` argument and can record `pre` and `post` without the doorbell. Given graphs, `session_token_pool` replays `pre[l]` and `post[l]` for each layer and passes the position through `stage_token`. The routing D2H, the CPU pool, the hit path and the dumps stay outside the graphs.
+- It is the default in the AdaptiveCpp build (`STRATA_POOL_GRAPHS=0` turns it off). Other builds use it only with `STRATA_POOL_GRAPHS=1`.
+
+### Results
+
+`pre` has 2,197 nodes over 48 layers (about 46 a layer), `post` 96. On the hello input with cache 0, runs with and without graphs alternated twice:
+
+| | without graphs | with graphs |
+| --- | --- | --- |
+| Decode | 4.65, 4.61 tok/s | 7.15, 7.05 tok/s |
+| Prefill | 4.08, 4.10 tok/s | 5.98, 6.00 tok/s |
+
+All logits matched the run without graphs bitwise (53 positions of hello, 66 of the arithmetic input). The Routing wait fell from about 115 to about 95 ms per position and the CPU's submissions from about 14 to about 3 ms. The remaining ~2 ms per layer is most likely the kernels' own time (launching 46 nodes is about 0.4 ms).
+
+On this PC the expert cache made it slower. The free commit limits it to about 4,900 slots (about 20% of the experts); filled from the profile at start it hit 48%, and Decode was 4.3 tok/s. The hits are computed outside the graphs, in series with the GPU's layers, and pay the launch cost per kernel. The CPU pool takes about 30 ms per position with graphs, so the cache adds more than it moves.
+
+`--stage-timing` returns zeros in the AdaptiveCpp build, so the GPU time per kernel is not measured yet. Unverified: Linux free and contrib-llvm (`session_capture`'s change keeps the old behaviour by default), NVIDIA, integrated graphics, long contexts, other quantizations.

@@ -192,7 +192,7 @@ void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionS
 }
 
 bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionState& s, const float* parts,
-                     SessionGraphs& gr, std::string& err, bool split) {
+                     SessionGraphs& gr, std::string& err, bool split, bool doorbell) {
     if (gr.captured) return true;
     gr.execs = new strata::gpu::Graph*[(size_t) g.n_layers];
     gr.posts = new strata::gpu::Graph*[(size_t) g.n_layers];
@@ -222,7 +222,7 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
         auto capture = [&](bool post, strata::gpu::Graph** out, const char* what, int half = 0,
                            int stage_prefix = 0) -> bool {
             strata::gpu::Stream cs = nullptr;
-            if (!(cs = strata::gpu::stream_create())) {
+            if (!(cs = strata::gpu::stream_create_capture())) {
                 err = std::string("session_capture: stream create failed");
                 return false;
             }
@@ -236,8 +236,8 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
             const bool ok = post
                                 ? block_layer_post(tables, g, l, s.k, s.moe, s.block, parts, (void*) cs, err)
                                 : block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k,
-                                                  s.block, (void*) cs, err, s.db, s.ple.ready() ? &s.ple : nullptr,
-                                                  half, stage_prefix);
+                                                  s.block, (void*) cs, err, doorbell ? s.db : nullptr,
+                                                  s.ple.ready() ? &s.ple : nullptr, half, stage_prefix);
             if (!ok) {
                 strata::gpu::abandon_capture(cs);
                 strata::gpu::stream_destroy(cs);
@@ -775,8 +775,13 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
 bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,
                         SessionState& s, float* parts, PoolFn pool, HitFn hits, void* user,
                         SessionLoopScratch& scratch, void* stream, bool sync_every_layer, std::string& err,
-                        float* dump_layers, PoolTiming* timing) {
+                        float* dump_layers, PoolTiming* timing, const SessionGraphs* graphs) {
     err.clear();
+    if (graphs != nullptr && (!graphs->captured || graphs->n != g.n_layers || graphs->posts == nullptr ||
+                              graphs->parts_dev != parts)) {
+        err = "session_token_pool: the graphs were not captured for this session and parts buffer";
+        return false;
+    }
     if (g.n_layers <= 0 || g.qsa_interval <= 0 || g.n_embd <= 0 || s.k < 1 || s.k > 64 ||
         s.k > g.n_expert || (uint64_t) g.n_embd > std::numeric_limits<size_t>::max() / (s.k * sizeof(float))) {
         err = "session_token_pool: invalid geometry or k";
@@ -860,6 +865,8 @@ bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64
     };
     // Keep a harmless reference for all-GDN geometries; no QSA state is consumed by those blocks.
     QsaState unused_qsa;
+    // the captured QSA layers read their position from the pinned staging, which `pre` fills only when it runs
+    if (graphs != nullptr) stage_token(g, pos, pos_base, s);
     auto run = [&]() -> bool {
         if (dump_layers != nullptr && !measured(&PoolTiming::dump_d2h_submit, [&] {
                 return strata::gpu::copy_async(dump_layers, s.block.R, residual_bytes, cs);
@@ -872,6 +879,11 @@ bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64
             // Null db deliberately disables both mapped device publication and ringing. qsa_layer stages
             // this token's pos/pos_base itself; gdn_point_at selects this layer's persistent recurrence.
             if (!measured(&PoolTiming::pre_submit, [&] {
+                    if (graphs != nullptr) {
+                        if (strata::gpu::graph_launch(graphs->execs[layer], cs)) return true;
+                        err = strata::gpu::last_error();
+                        return false;
+                    }
                     return block_layer_pre(tables, g, layer, pos, pos_base, s.gdn, qst, s.qsa_bufs, s.moe, s.k,
                                            s.block, cs, err, nullptr, s.ple.ready() ? &s.ple : nullptr);
                 })) {
@@ -910,6 +922,11 @@ bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64
                 }, parts_bytes)) return gpu_error("H2D parts");
             if (hits != nullptr) hits(user, cs, HitPhase::Combine, nullptr, 0);
             if (!measured(&PoolTiming::post_submit, [&] {
+                    if (graphs != nullptr) {
+                        if (strata::gpu::graph_launch(graphs->posts[layer], cs)) return true;
+                        err = strata::gpu::last_error();
+                        return false;
+                    }
                     return block_layer_post(tables, g, layer, s.k, s.moe, s.block, parts, cs, err);
                 })) {
                 err = "session_token_pool: post layer " + std::to_string(layer) + ": " + err;

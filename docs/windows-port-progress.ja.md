@@ -513,3 +513,33 @@ WSL 2（Ubuntu 24.04、ROCm 7.2.3、librocdxg）でXeStrataのLinux版を試し�
 librocdxgのdebug logでは、ROCm内部の最初のkernel dispatchをPM4へ変換して投入した後、R9700ではqueueのread pointerが0から進みません。librocdxgの`src/wddm/cmd_util.cpp`（ROCm/rocm-systemsへ移った現在の版も同じ）はgfx12の分岐を持たず、cache flushは「gfx10以降は共通」のbit配置、`PRIV`はgfx11だけに立てています。最新のlibrocdxg 1.2.2でも変わらず、gfx12にも`PRIV`を立てる試みではWindowsがbugcheck 0xD1（`dxgmms2.sys`）で停止しました。Windows driverは32.0.32015.2008（2026-09-28）で、AMDがWSLで保証する組み合わせ（Adrenalin 26.2.2とROCm 7.2.1）より新しい版です。
 
 WSL経由のR9700はこの環境では使えないため、Windowsネイティブの経路を続けます。WSL 2でAMD GPUを`rocminfo`から検出するsetupの変更は、このbugcheckの危険があるためcommitしていません。intel/llvmのbuild後に`xmx_probe`がWSL上で約1時間45分CPUを使い続けた問題も、別に直す必要があります。
+
+<a id="pool-graphs"></a>
+## 2026-10-13: pool経路の層をHIP graphで再生
+
+### 層ごとの時間の原因
+
+AdaptiveCppのHIP backendで、起動の費用を小さなSYCLテストで測りました。中身が空のkernelでも、続けて投入すると1個あたり約38 µs（DAG方式）、26〜35 µs（native in-order）かかります。AdaptiveCppを通さない素のHIPで同じkernelを続けて起動すると1.7 µs、kernelごとにeventを記録すると34 µsでした。AdaptiveCppは操作ごとに完了eventを記録するので、Windows HIPではkernel 1個ごとに別のsubmissionが発生していると考えられます。後ろにeventがないkernelは、同期が成功を返しても結果に反映されないことがありました（Windows HIPの挙動。native in-orderでreadbackが古い値になる現象と同じ根の可能性があります）。
+
+HIPのstream captureで、AdaptiveCppのnative in-order queueに投入したSYCL kernelをgraphへ記録できました。40 kernelのgraphを再生すると1個あたり3〜8 µsで、値も一致しました。
+
+### 実装
+
+- `strata::gpu`のcapture APIを、AdaptiveCppビルドではHIPのstream captureで実装しました（`begin_capture`、`end_capture`、`abandon_capture`、`is_capturing`、`graph_launch`、`graph_destroy`）。HIPは実行時に読み込み、buildはHIPをlinkしません。記録はnative in-order queueの1本のHIP streamで行い（`stream_create_capture`）、再生はengineのDAG queueのcustom operationとして`hipGraphLaunch`を呼ぶので、前後の操作との順序はAdaptiveCppが保ちます。
+- `session_capture`に`doorbell`引数を加え、doorbellなしで`pre`と`post`を記録できるようにしました。`session_token_pool`は、渡されたgraphがあれば層ごとに`pre[l]`と`post[l]`を再生し、位置は`stage_token`で渡します。routingのD2H、CPU pool、hit path、dumpはgraphの外に残ります。
+- AdaptiveCppビルドでは既定で有効です（`STRATA_POOL_GRAPHS=0`で無効）。ほかのビルドでは`STRATA_POOL_GRAPHS=1`のときだけ使います。
+
+### 結果
+
+`pre`は48層で2,197ノード（1層あたり約46）、`post`は96ノードです。hello入力、cache 0で、graphあり・なしを交互に2回ずつ測りました。
+
+| | graphなし | graphあり |
+| --- | --- | --- |
+| Decode | 4.65、4.61 tok/s | 7.15、7.05 tok/s |
+| Prefill | 4.08、4.10 tok/s | 5.98、6.00 tok/s |
+
+全logitsはgraphなしとbit単位で一致しました（helloの53位置、計算問題の入力の66位置）。Routing待機は約115から約95 ms/位置に減り、CPUのsubmitは約14から約3 ms/位置になりました。残る1層あたり約2 msはkernel自体の時間が中心と考えられます（1層46ノードの起動は0.4 ms程度）。
+
+このPCの条件では、expert cacheを併用すると遅くなりました。コミットの空きで約4,900 slots（expertの約20%）に限られ、profileで事前に埋めてもhit率は48%、Decodeは4.3 tok/sでした。hitの計算はgraphの外でGPUの層と直列に並び、kernelごとの起動費用もかかります。CPU poolはgraphありで約30 ms/位置なので、cacheで移せる分より増える分が大きくなります。
+
+`--stage-timing`はAdaptiveCppビルドではすべて0を返し、kernel別のGPU時間はまだ測れていません。unverified：Linuxのfreeとcontrib-llvm（`session_capture`の変更は既定値で従来どおり）、NVIDIA、内蔵GPU、長いcontext、他の量子化。

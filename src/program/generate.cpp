@@ -4483,6 +4483,31 @@ int main(int argc, char** argv) try {
             return 1;
         }
     }
+    // The direct pool path can replay each layer's `pre` and `post` as graphs captured without the doorbell: the
+    // runtime then takes one launch per graph instead of one per kernel.  With AdaptiveCpp on Windows HIP each
+    // submitted kernel cost about 35 us (its completion event forces a submission of its own) and a captured one
+    // about 3-8 us, so there it is the default (STRATA_POOL_GRAPHS=0 turns it off); elsewhere STRATA_POOL_GRAPHS=1
+    // turns it on.
+    const char* pool_graphs_env = std::getenv("STRATA_POOL_GRAPHS");
+#if defined(STRATA_ADAPTIVECPP)
+    const bool pool_graphs_wanted = pool_graphs_env == nullptr || std::strcmp(pool_graphs_env, "0") != 0;
+#else
+    const bool pool_graphs_wanted = pool_graphs_env != nullptr && std::strcmp(pool_graphs_env, "1") == 0;
+#endif
+    const bool pool_graphs = o.no_capture && pool_fn != nullptr && !native_pack && pool_graphs_wanted;
+    if (pool_graphs) {
+        if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/false, /*doorbell=*/false)) {
+            std::fprintf(stderr, "strata generate: session_capture (pool graphs): %s\n", err.c_str());
+            return 1;
+        }
+        size_t pre_nodes = 0, post_nodes = 0;
+        for (int64_t l = 0; l < gr.n; ++l) {
+            pre_nodes += strata::gpu::graph_nodes(gr.execs[l]);
+            post_nodes += strata::gpu::graph_nodes(gr.posts[l]);
+        }
+        std::fprintf(stderr, "strata generate: the pool path replays %lld layer graph pairs (%zu + %zu nodes)\n",
+                     (long long) gr.n, pre_nodes, post_nodes);
+    }
 
     // The direct path with a pool uses session_token_pool: each layer's routing is downloaded, computed
     // and combined before the next layer. session_token remains the explicit --no-pool ablation.
@@ -9986,7 +10011,7 @@ int main(int argc, char** argv) try {
             const bool ok = pool_fn != nullptr
                 ? strata::core::session_token_pool(wt, g, pos, /*pos_base=*/0, ss, d_parts, pool_fn, hit_fn,
                                                     pool_user, loop_scratch, main_cs, o.sync_every_layer, err,
-                                                    layer_stage, timing)
+                                                    layer_stage, timing, pool_graphs ? &gr : nullptr)
                 : strata::core::session_token(wt, g, pos, /*pos_base=*/0, ss, d_parts, main_cs,
                                                o.sync_every_layer, err);
             if (!ok) {

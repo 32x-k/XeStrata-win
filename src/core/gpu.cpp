@@ -17,7 +17,9 @@
 #include <map>
 #include <mutex>
 #include <optional>
-#include <tuple>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
 #include <vector>
 
 #if defined(STRATA_ADAPTIVECPP)
@@ -47,6 +49,9 @@ struct Graph {
     sx::command_graph<sx::graph_state::executable> exec;
 #endif
     size_t nodes = 0;
+#if defined(STRATA_ADAPTIVECPP)
+    void* hip_exec = nullptr;   // hipGraphExec_t
+#endif
 };
 
 struct VmemSegment {
@@ -122,39 +127,92 @@ core::Runtime& rt_of(Stream s) {
 }
 
 #if defined(STRATA_ADAPTIVECPP)
-// HIP's own free-memory answer for a HIP device, loaded at run time so the build does not link HIP.
-bool hip_free_memory(const sycl::device& d, uint64_t& free, uint64_t& total) {
-    if (d.get_backend() != sycl::backend::hip) return false;
-    using GetDevice = int (*)(int*);
-    using SetDevice = int (*)(int);
-    using MemGetInfo = int (*)(size_t*, size_t*);
-    static const auto fns = []() -> std::tuple<GetDevice, SetDevice, MemGetInfo> {
+// The few HIP calls SYCL has no word for (free memory, stream capture and graphs), from the HIP runtime the
+// AdaptiveCpp backend has already loaded, so the build does not link HIP.  Handles are opaque pointers.
+struct HipApi {
+    int (*get_device)(int*) = nullptr;
+    int (*set_device)(int) = nullptr;
+    int (*mem_get_info)(size_t*, size_t*) = nullptr;
+    int (*begin_capture)(void* stream, int mode) = nullptr;
+    int (*end_capture)(void* stream, void** graph) = nullptr;
+    int (*graph_nodes)(void* graph, void** nodes, size_t* count) = nullptr;
+    int (*instantiate)(void** exec, void* graph, void** error_node, char* log, size_t log_size) = nullptr;
+    int (*graph_launch)(void* exec, void* stream) = nullptr;
+    int (*graph_destroy)(void* graph) = nullptr;
+    int (*exec_destroy)(void* exec) = nullptr;
+    const char* (*error_string)(int) = nullptr;
+    bool memory() const { return get_device && set_device && mem_get_info; }
+    bool graphs() const {
+        return begin_capture && end_capture && graph_nodes && instantiate && graph_launch && graph_destroy &&
+               exec_destroy && error_string;
+    }
+};
+constexpr int kHipCaptureModeRelaxed = 2;   // hipStreamCaptureModeRelaxed
+
+const HipApi& hip() {
+    static const HipApi api = [] {
+        HipApi a;
 #if defined(_WIN32)
         HMODULE lib = ::GetModuleHandleA("amdhip64_7.dll");
         if (lib == nullptr) lib = ::GetModuleHandleA("amdhip64_6.dll");
-        if (lib == nullptr) return {};
+        if (lib == nullptr) return a;
         auto sym = [&](const char* name) { return reinterpret_cast<void*>(::GetProcAddress(lib, name)); };
 #else
-        void* lib = ::dlopen("libamdhip64.so", RTLD_NOW | RTLD_NOLOAD);
-        if (lib == nullptr) return {};
+        void* lib = nullptr;
+        for (const char* name : {"libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"})
+            if ((lib = ::dlopen(name, RTLD_NOW | RTLD_NOLOAD)) != nullptr) break;
+        if (lib == nullptr) return a;
         auto sym = [&](const char* name) { return ::dlsym(lib, name); };
 #endif
-        return {reinterpret_cast<GetDevice>(sym("hipGetDevice")), reinterpret_cast<SetDevice>(sym("hipSetDevice")),
-                reinterpret_cast<MemGetInfo>(sym("hipMemGetInfo"))};
+        auto get = [&](auto& fn, const char* name) { fn = reinterpret_cast<std::decay_t<decltype(fn)>>(sym(name)); };
+        get(a.get_device, "hipGetDevice");
+        get(a.set_device, "hipSetDevice");
+        get(a.mem_get_info, "hipMemGetInfo");
+        get(a.begin_capture, "hipStreamBeginCapture");
+        get(a.end_capture, "hipStreamEndCapture");
+        get(a.graph_nodes, "hipGraphGetNodes");
+        get(a.instantiate, "hipGraphInstantiate");
+        get(a.graph_launch, "hipGraphLaunch");
+        get(a.graph_destroy, "hipGraphDestroy");
+        get(a.exec_destroy, "hipGraphExecDestroy");
+        get(a.error_string, "hipGetErrorString");
+        return a;
     }();
-    const auto [get_device, set_device, mem_get_info] = fns;
-    if (get_device == nullptr || set_device == nullptr || mem_get_info == nullptr) return false;
+    return api;
+}
+
+std::string hip_error(const char* what, int code) {
+    return std::string(what) + ": HIP error " + std::to_string(code) +
+           (hip().error_string ? std::string(" (") + hip().error_string(code) + ")" : std::string());
+}
+
+// The HIP stream of a queue: for a native in-order queue (a capture stream) its one stream.
+void* hip_stream(sycl::queue& queue) {
+    void* stream = nullptr;
+    queue.AdaptiveCpp_enqueue_custom_operation([&stream](sycl::interop_handle& h) {
+        stream = h.get_native_queue<sycl::backend::hip>();
+    }).wait();
+    return stream;
+}
+
+// HIP's own free-memory answer for a HIP device.
+bool hip_free_memory(const sycl::device& d, uint64_t& free, uint64_t& total) {
+    if (d.get_backend() != sycl::backend::hip || !hip().memory()) return false;
     const int id = sycl::get_native<sycl::backend::hip>(d);
     int previous = -1;
-    if (get_device(&previous) != 0 || (previous != id && set_device(id) != 0)) return false;
+    if (hip().get_device(&previous) != 0 || (previous != id && hip().set_device(id) != 0)) return false;
     size_t f = 0, t = 0;
-    const bool ok = mem_get_info(&f, &t) == 0;
-    if (previous != id) set_device(previous);
+    const bool ok = hip().mem_get_info(&f, &t) == 0;
+    if (previous != id) hip().set_device(previous);
     if (!ok || t == 0) return false;
     free = f;
     total = t;
     return true;
 }
+
+// the recordings in progress: queue -> its HIP stream being captured
+std::mutex g_capture_mutex;
+std::map<const sycl::queue*, void*> g_captures;
 #endif
 
 // the recordings in progress, by queue
@@ -170,6 +228,11 @@ const char* last_error() { return g_error.c_str(); }
 Stream stream_create() {
     try { return rt().create_stream(); }
     catch (const std::exception& e) { fail("stream_create", e); return nullptr; }
+}
+
+Stream stream_create_capture() {
+    try { return rt().create_capture_stream(); }
+    catch (const std::exception& e) { fail("stream_create_capture", e); return nullptr; }
 }
 
 void stream_destroy(Stream s) {
@@ -558,9 +621,22 @@ bool event_elapsed_ms(float* ms, const Event* from, const Event* to) {
 
 bool begin_capture(Stream s) {
 #if defined(STRATA_ADAPTIVECPP)
-    (void) s;
-    g_error = "begin_capture: command graphs are unavailable with AdaptiveCpp";
-    return false;
+    // HIP's stream capture on the queue's one HIP stream: `s` must come from stream_create_capture.  Relaxed, as
+    // AdaptiveCpp itself records and queries events around what it submits.
+    try {
+        if (!hip().graphs()) { g_error = "begin_capture: this runtime has no HIP graphs"; return false; }
+        auto& queue = q(s);
+        std::lock_guard<std::mutex> lock(g_capture_mutex);
+        if (g_captures.count(&queue)) { g_error = "begin_capture: the stream is already recording"; return false; }
+        void* stream = hip_stream(queue);
+        if (stream == nullptr) { g_error = "begin_capture: the stream has no HIP stream"; return false; }
+        if (const int rc = hip().begin_capture(stream, kHipCaptureModeRelaxed)) {
+            g_error = hip_error("begin_capture", rc);
+            return false;
+        }
+        g_captures.emplace(&queue, stream);
+        return true;
+    } catch (const std::exception& e) { return fail("begin_capture", e); }
 #else
     try {
         auto& queue = q(s);
@@ -577,9 +653,31 @@ bool begin_capture(Stream s) {
 bool end_capture(Stream s, Graph** out) {
     *out = nullptr;
 #if defined(STRATA_ADAPTIVECPP)
-    (void) s;
-    g_error = "end_capture: command graphs are unavailable with AdaptiveCpp";
-    return false;
+    try {
+        auto& queue = q(s);
+        void* stream = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_capture_mutex);
+            auto it = g_captures.find(&queue);
+            if (it == g_captures.end()) { g_error = "end_capture: the stream is not recording"; return false; }
+            stream = it->second;
+            g_captures.erase(it);
+        }
+        void* graph = nullptr;
+        if (const int rc = hip().end_capture(stream, &graph)) { g_error = hip_error("end_capture", rc); return false; }
+        size_t nodes = 0;
+        int rc = hip().graph_nodes(graph, nullptr, &nodes);
+        void* exec = nullptr;
+        if (rc == 0 && nodes > 0) rc = hip().instantiate(&exec, graph, nullptr, nullptr, 0);
+        hip().graph_destroy(graph);
+        if (rc != 0) { g_error = hip_error("end_capture: instantiate", rc); return false; }
+        if (nodes == 0) { g_error = "end_capture: the recording holds ZERO nodes - the body submitted nothing"; return false; }
+        auto* g = new Graph;
+        g->nodes = nodes;
+        g->hip_exec = exec;
+        *out = g;
+        return true;
+    } catch (const std::exception& e) { return fail("end_capture", e); }
 #else
     try {
         auto& queue = q(s);
@@ -599,7 +697,15 @@ bool end_capture(Stream s, Graph** out) {
 
 void abandon_capture(Stream s) {
 #if defined(STRATA_ADAPTIVECPP)
-    (void) s;
+    try {
+        auto& queue = q(s);
+        std::lock_guard<std::mutex> lock(g_capture_mutex);
+        auto it = g_captures.find(&queue);
+        if (it == g_captures.end()) return;
+        void* graph = nullptr;
+        if (hip().end_capture(it->second, &graph) == 0 && graph != nullptr) hip().graph_destroy(graph);
+        g_captures.erase(it);
+    } catch (const std::exception& e) { fail("abandon_capture", e); }
 #else
     try {
         auto& queue = q(s);
@@ -667,8 +773,11 @@ bool stream_join(Stream into, Stream from) {
 
 bool is_capturing(Stream s) {
 #if defined(STRATA_ADAPTIVECPP)
-    (void) s;
-    return false;
+    try {
+        auto& queue = q(s);
+        std::lock_guard<std::mutex> lock(g_capture_mutex);
+        return g_captures.count(&queue) != 0;
+    } catch (const std::exception& e) { return fail("is_capturing", e); }
 #else
     try {
         auto& queue = q(s);
@@ -681,9 +790,16 @@ bool is_capturing(Stream s) {
 bool graph_launch(const Graph* g, Stream s) {
     if (!g) { g_error = "graph_launch: null graph"; return false; }
 #if defined(STRATA_ADAPTIVECPP)
-    (void) s;
-    g_error = "graph_launch: command graphs are unavailable with AdaptiveCpp";
-    return false;
+    // Launched from a custom operation, so AdaptiveCpp orders it on `s` like a kernel: after what `s` was given
+    // before, and before what it is given next (it records its completion event after the launch).
+    try {
+        void* exec = g->hip_exec;
+        q(s).AdaptiveCpp_enqueue_custom_operation([exec](sycl::interop_handle& h) {
+            if (const int rc = hip().graph_launch(exec, h.get_native_queue<sycl::backend::hip>()))
+                throw std::runtime_error(hip_error("graph_launch", rc));
+        });
+        return true;
+    } catch (const std::exception& e) { return fail("graph_launch", e); }
 #else
     try { q(s).ext_oneapi_graph(g->exec); return true; }
     catch (const std::exception& e) { return fail("graph_launch", e); }
@@ -695,6 +811,9 @@ size_t graph_nodes(const Graph* g) { return g ? g->nodes : 0; }
 void graph_destroy(Graph* g) {
     if (!g) return;
     try { rt().finish(); } catch (const std::exception& e) { fail("graph_destroy", e); }
+#if defined(STRATA_ADAPTIVECPP)
+    if (g->hip_exec != nullptr) hip().exec_destroy(g->hip_exec);
+#endif
     delete g;
 }
 

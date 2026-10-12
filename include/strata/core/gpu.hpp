@@ -35,6 +35,8 @@ struct Graph;
 const char* last_error();
 
 Stream stream_create();
+/// A stream to record a graph on with begin_capture (on most builds the same as stream_create).
+Stream stream_create_capture();
 void stream_destroy(Stream s);
 bool stream_sync(Stream s);
 /// True when every command submitted to `s` has completed (cudaStreamQuery == cudaSuccess).

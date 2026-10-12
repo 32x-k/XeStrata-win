@@ -43,6 +43,9 @@ public:
     // stream handed to a kernel is one of these, compute() or null (compute()), or a queue of another device's
     // runtime (the kernel then runs there); anything else is refused.
     sycl::queue* create_stream();
+    /// A stream a graph can be recorded on.  With AdaptiveCpp it is a native in-order queue (one HIP stream that
+    /// HIP's stream capture records), used only to record; elsewhere it is create_stream().
+    sycl::queue* create_capture_stream();
     void destroy_stream(sycl::queue* stream);
     sycl::queue& stream(void* stream);
 
