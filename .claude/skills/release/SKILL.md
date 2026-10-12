@@ -143,7 +143,7 @@ gh release list --repo MistVVK/XeStrata --limit 1000 --json tagName,isLatest -q 
 ## 9. The speed table
 
 The release against upstream's newest release tag, IQ3_XXS, on each maker's GPU: the Intel Arc Pro B70 and the RTX 4070 in the development machine, the RX 9060 XT in the AMD container (step 6).
-The six tiers and the settings of the 2026-10-04-speed-matrix record (1K to 262K, what setup writes for each context, 256 greedy tokens); its `prompts.py`, now `.claude/skills/release/scripts/prompts.py`, writes the prompts (`python .claude/skills/release/scripts/prompts.py <pack> <ids folder>`).
+The six tiers and the settings of the 2026-10-04-speed-matrix record (1K to 262K, what setup writes for each context, 256 greedy tokens), with one change (the user's decision of 2026-10-12): KV streaming (`--kv-resident`) only where setup writes it on the machine, from 64K when the RAM holds the KV cache beside the model, so a machine short of that RAM (the AMD container: `LOCAL.md`) does not compare at those lengths with the releases up to xe0.1.42; its `prompts.py`, now `.claude/skills/release/scripts/prompts.py`, writes the prompts (`python .claude/skills/release/scripts/prompts.py <pack> <ids folder>`).
 The table's method stays fixed from release to release so the releases compare: the upstream merge's measurements (/upstream-sync) have scripts of their own, and a change to them does not change this table.
 
 The engines, built from the tags (no package installed), each in a worktree of its own under `.claude/worktrees/`:
