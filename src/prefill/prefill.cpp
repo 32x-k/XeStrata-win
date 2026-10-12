@@ -526,7 +526,8 @@ struct Prefill::Impl {
     double cpu_ratio[CPU_RATIOS] = {};
     int cpu_nratio = 0;
     bool cpu_gate = false;   // the median ratio is below 1: the layers that share are the cheaper ones
-    // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
+    // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn).
+    // LAYER SPLIT, same process only: allocated in this stage's context, the next stage reads them where they are
     int device = -1;
     float* hand[2] = {};
     // C-4: the chunk's token ids on the device, for one batched embedding gather

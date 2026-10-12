@@ -63,7 +63,9 @@ class Verifier;
 /// goes through here: the split point's rows, the requests' control (windows, commits, sampling settings) and the
 /// results coming back from the last stage (its logits), so a next stage that shares nothing else with this one
 /// (another process, another machine) can stand behind it.  The calls marked "same process" hand a pointer over
-/// instead of its contents; only a stage in this process can serve them.
+/// instead of its contents; only a stage in this process can serve them.  The engine's other paths that reach across
+/// stages (a CPU pool, a RAM expert region and a residency table shared by every stage, the host driving each stage's
+/// verifiers and sessions) are marked "LAYER SPLIT, same process only" where they are made.
 class StageLink {
 public:
     virtual ~StageLink() = default;

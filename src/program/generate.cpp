@@ -884,6 +884,8 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
 
 /// Layer split: every verify stage shares one Drive (its counters, usage and failure flags); the GPU plan, the expert
 /// cache and the PCIe share the pool uses for a layer are those of the stage that runs it.
+/// LAYER SPLIT, same process only: one CPU pool, one residency table (Drive::host_res) and one adaptive tier for every
+/// stage; a stage in another process would serve its layers with its own.
 struct SplitDrive {
     static constexpr int kMax = 8;
     Drive* base = nullptr;
@@ -4846,7 +4848,8 @@ int main(int argc, char** argv) {
         const int64_t room = stage_room(st.dev, true, st.ss);
         const strata::core::OnDevice on(st.dev);
         // the expert arena is registered for device copies with CUDA0's context only: this GPU's fills and adaptive
-        // swaps copied from it as pageable memory (B70 + 4070, iq3_s: the swaps took 4.5 ms a window against 0.1)
+        // swaps copied from it as pageable memory (B70 + 4070, iq3_s: the swaps took 4.5 ms a window against 0.1).
+        // LAYER SPLIT, same process only: one RAM expert region serves every stage
         if (st.dev != 0 && !srcp->register_on(st.dev, err))
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: %s; its copies from the arena are slower\n",
                          st.dev, err.c_str());
@@ -6208,7 +6211,8 @@ int main(int argc, char** argv) {
         // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
         // last runs the head.  The hand-offs are host USM: one buffer between two stages on one GPU, and one on each
         // side between stages on two (a context's host USM is not visible to another GPU; Verifier::run copies).
-        // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
+        // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.
+        // LAYER SPLIT, same process only.)
         strata::core::Verifier ver_same;
         SplitDrive split_drive;
         auto stage_ver = [&](int st) -> strata::core::Verifier& {
@@ -7051,6 +7055,7 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        // LAYER SPLIT, same process only: the conversation cache saves and restores every stage's session itself
         if (multi_gpu) {   // the batched prompt is reported by its last stage (the drafter's rows are there)
             stages.back()->sp.on_chunk = std::move(sp.on_chunk);
             sp.on_chunk = nullptr;
@@ -7281,6 +7286,7 @@ int main(int argc, char** argv) {
         double a_ms = 0;                  // wall time from a round's start to its flip, summed (the "ms per round" stat)
         Clock::time_point a_t0;
         std::atomic<bool> a_err{false};
+        // LAYER SPLIT, same process only: one tier swaps every stage's cache from the shared residency table
         std::vector<AHome> ahomes;   // [0] = CUDA0's cache, [k] = layer split stage k's
         std::unique_ptr<JobThread> ajob;
         const int64_t a_cap = std::min<int64_t>(o.adapt_swaps, 96);   // as the blocking tier's exchange buffers
@@ -7912,7 +7918,7 @@ int main(int argc, char** argv) {
             return true;
         };
         // the session a request just left behind (its prompt and first token) -> slot b's session
-        // (a layer split: each GPU's session -> its own slot session, on that GPU)
+        // (a layer split: each GPU's session -> its own slot session, on that GPU; LAYER SPLIT, same process only)
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
             auto one = [&](int dev, strata::core::SessionState& from, strata::core::SessionState& to) -> bool {
@@ -8128,11 +8134,14 @@ int main(int argc, char** argv) {
         // ---- --batch-groups: the slot groups pipelined through the stages (upstream PR #559).  A group's window runs
         // on one stage at a time, its commit right behind it; when it is done there it moves to the next stage, and the
         // stage it left takes the next group.  Each stage on its own GPU, so the GPUs work on different groups at once.
+        // LAYER SPLIT, same process only: this loop launches and polls every stage's verifier itself (the rows between
+        // stages go through StageLink::rows).
         const int n_pipe = n_stages;   // (--batch-groups was checked against the split when it was resolved)
         const bool piped = o.batch > 0 && o.batch_groups > 1;
         const int GS = piped ? o.batch / o.batch_groups : o.batch;
         // --batch-cpu-split (experimental): stage 1's CPU experts through a Drive and a pool of their own, and each
-        // stage's windows served by a host thread of its own, so the two stages' CPU work runs at once
+        // stage's windows served by a host thread of its own, so the two stages' CPU work runs at once.
+        // LAYER SPLIT, same process only.
         const bool pipe_threads = piped && pool1 != nullptr && n_pipe == 2;
         Drive drive1 = drive;
         drive1.d.pool = pool1.get();
@@ -9797,6 +9806,7 @@ int main(int argc, char** argv) {
             const int64_t offload0 = drive.d.offload_entries;   // #588
             if (cancelled) finish = nf_hit ? "nonfinite" : "cancel";
             // ======== --pipeline-windows 2: the decode windows with the two cards overlapped ========
+            // LAYER SPLIT, same process only: this loop drives every stage's verifiers and GDN snapshots itself.
             // Stage 0 (the first card) runs window K+1 while stage 1 verifies window K, on the guess that K is accepted
             // whole and that its bonus token is the drafter's.  The drafter, teacher-forced through K+1's drafts,
             // guesses K+1's bonus and drafts K+2 while stage 1 runs K+1.  A wrong guess costs the speculative window:
