@@ -488,3 +488,28 @@ In AdaptiveCpp `0ea863abe1af4422593583f91e5608ef75044a16`, `multi_queue_executor
 On the Windows R9700, the isolated runtime (B) was compared with the working version (A) on the same 13 input IDs, 41 generated tokens and 53 positions. Diagnostic A/B runs bitwise matched all 13,160,960 logits and 26,593,280 residual floats, with zero nonfinite values. Three fresh no-dump processes per side ran A1→B1→A2→B2→A3→B3: median decode A 2.576→B 3.846 tok/s (+49.3%, 1.493×); median host Routing/Input wait 261.091→122.509 ms/position; CPU callback 100.624→101.673 ms/position. The wait includes GPU work, transfers and runtime; it is not a breakdown of GPU execution time. This is evidence for this fixed workload, not a 10× gain.
 
 The change is scoped to `third_party/main/adaptivecpp/patches/0002-dag-lane-affinity.patch`, applied only to pinned AdaptiveCpp source. Reproduce and check it in separate source/build/prefix locations; do not overwrite the working installation. The working executable, SDK, driver and recovery copies remain intact. Local, Git-excluded evidence is in `build/windows-acpp/lane-affinity-20261012T084944Z/report.ja.md`, `result.json` and `.tools/lane-affinity-runtime/source.diff`. Other prompts, longer contexts, other GPUs/quantizations, real GPU-fault cleanup and a 4-GiB maximum-allocation limit are outside this check.
+
+<a id="expert-cache-and-wsl"></a>
+## 2026-10-13: VRAM expert cache enabled; the WSL 2 path does not work
+
+### Why the expert cache was always 0
+
+In the AdaptiveCpp build `strata::gpu::mem_info` always failed. `--expert-cache auto` read the free VRAM as 0 GiB and sized the cache at 0 slots. This is also why Phase 3C could try only 4 slots: the automatic sizing never worked. On a HIP-backend device the free VRAM now comes from HIP's `hipMemGetInfo`, loaded at run time (the build does not link HIP). On a backend HIP cannot answer for, the device total less what this process holds is used.
+
+On Windows HIP, a device allocation takes the same amount of system commit. A 4 GiB `hipMalloc` lowered the free commit by 4.1 GiB, and `hipFree` gave it back; no physical RAM is used. So on Windows the free figure is the smaller of the free VRAM and the free commit less 4 GiB. Allocating 27 GiB of slots at once brought the free commit down to 98 MiB; with this bound, allocations stay within the free commit. A larger page file allows a larger cache.
+
+On the same hello input (13 input IDs, `--max-new 64`, context 256, 3 workers, mmap, no VRAM limit or no-XMX setting), cache auto took 7,759 slots (9.99 GiB) and hit 19,091 of 25,440 requests (75.0%). The 41 generated tokens are the same as with the cache off. Decode was 3.22 to 4.87 tok/s, about the same as the cache-off 3.11 to 4.88 tok/s. This short run starts with an empty cache and reads 6,349 experts from the mmap into VRAM while it generates.
+
+### The remaining floor: the GPU's time per layer
+
+In cache-on Decode with `STRATA_POOL_TIMING=1`, the CPU pool fell to 0.09 ms per position, and the Routing/Input host wait stayed at about 115 ms per position (about 2.4 ms per layer). Decode with `--no-pool` (no CPU experts) is 10.60 tok/s (about 94 ms per token). The same engine decodes at about 49 tok/s on Linux on an RX 9060 XT (about half an R9700), so the Windows path loses mainly in the GPU's time per layer. The Linux path's command graphs, doorbell, native experts and batched prefill are absent from this path.
+
+The native in-order queue (bypassing AdaptiveCpp's DAG scheduler) was also tried. Decode went from 4.88 to 6.02 tok/s, but the head's logits readback returned stale values and the argmax differed at 19 of 53 positions. The Routing wait was about 128 ms per position, the same as with the DAG path. It was rejected, and the DAG path stays.
+
+### The WSL 2 path
+
+XeStrata's Linux build was tried in WSL 2 (Ubuntu 24.04, ROCm 7.2.3, librocdxg). intel/llvm v7.1.1 with the HIP target and the engine built. On the R9700 (gfx1201), however, `hipMalloc` succeeds but the first queue creation, kernel launch or event record never completes. The same minimal HIP test passes on the 890M integrated GPU (gfx1150).
+
+librocdxg's debug log shows that after ROCm's first internal kernel dispatch is converted to PM4 and submitted, the queue's read pointer on the R9700 never moves from 0. librocdxg's `src/wddm/cmd_util.cpp` (the same in its current home, ROCm/rocm-systems) has no gfx12 branch: the cache flush uses one bit layout for gfx10 and later, and `PRIV` is set for gfx11 only. librocdxg 1.2.2, the newest, behaves the same, and setting `PRIV` for gfx12 as well made Windows stop with bugcheck 0xD1 (`dxgmms2.sys`). The Windows driver is 32.0.32015.2008 (2026-09-28), newer than the pairing AMD supports for WSL (Adrenalin 26.2.2 with ROCm 7.2.1).
+
+The R9700 cannot be used through WSL on this machine, so work continues on the native Windows path. The setup change that finds AMD GPUs from `rocminfo` under WSL 2 is not committed, because of this bugcheck risk. `xmx_probe` running on the CPU for about 1 h 45 min under WSL after the intel/llvm build also needs a separate fix.

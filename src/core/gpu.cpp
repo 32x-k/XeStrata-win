@@ -17,7 +17,19 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <tuple>
 #include <vector>
+
+#if defined(STRATA_ADAPTIVECPP)
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+#endif
 
 namespace strata::gpu {
 
@@ -108,6 +120,42 @@ core::Runtime& rt_of(Stream s) {
     core::Runtime* owner = core::Runtime::owner_of_stream(s);
     return owner ? *owner : rt();
 }
+
+#if defined(STRATA_ADAPTIVECPP)
+// HIP's own free-memory answer for a HIP device, loaded at run time so the build does not link HIP.
+bool hip_free_memory(const sycl::device& d, uint64_t& free, uint64_t& total) {
+    if (d.get_backend() != sycl::backend::hip) return false;
+    using GetDevice = int (*)(int*);
+    using SetDevice = int (*)(int);
+    using MemGetInfo = int (*)(size_t*, size_t*);
+    static const auto fns = []() -> std::tuple<GetDevice, SetDevice, MemGetInfo> {
+#if defined(_WIN32)
+        HMODULE lib = ::GetModuleHandleA("amdhip64_7.dll");
+        if (lib == nullptr) lib = ::GetModuleHandleA("amdhip64_6.dll");
+        if (lib == nullptr) return {};
+        auto sym = [&](const char* name) { return reinterpret_cast<void*>(::GetProcAddress(lib, name)); };
+#else
+        void* lib = ::dlopen("libamdhip64.so", RTLD_NOW | RTLD_NOLOAD);
+        if (lib == nullptr) return {};
+        auto sym = [&](const char* name) { return ::dlsym(lib, name); };
+#endif
+        return {reinterpret_cast<GetDevice>(sym("hipGetDevice")), reinterpret_cast<SetDevice>(sym("hipSetDevice")),
+                reinterpret_cast<MemGetInfo>(sym("hipMemGetInfo"))};
+    }();
+    const auto [get_device, set_device, mem_get_info] = fns;
+    if (get_device == nullptr || set_device == nullptr || mem_get_info == nullptr) return false;
+    const int id = sycl::get_native<sycl::backend::hip>(d);
+    int previous = -1;
+    if (get_device(&previous) != 0 || (previous != id && set_device(id) != 0)) return false;
+    size_t f = 0, t = 0;
+    const bool ok = mem_get_info(&f, &t) == 0;
+    if (previous != id) set_device(previous);
+    if (!ok || t == 0) return false;
+    free = f;
+    total = t;
+    return true;
+}
+#endif
 
 // the recordings in progress, by queue
 #if !defined(STRATA_ADAPTIVECPP)
@@ -369,10 +417,28 @@ bool mem_info(size_t* free_bytes, size_t* total_bytes) {
     try {
         const auto& d = rt().device();
 #if defined(STRATA_ADAPTIVECPP)
-        (void) free_bytes;
-        (void) total_bytes;
-        g_error = "mem_info: AdaptiveCpp does not report currently free device memory";
-        return false;
+        // SYCL has no portable free-memory query. On the HIP backend ask HIP itself; elsewhere, or when HIP
+        // cannot answer, count the device's total less what this process holds (other processes unseen).
+        uint64_t total = d.get_info<sycl::info::device::global_mem_size>();
+        uint64_t free = 0;
+        if (!hip_free_memory(d, free, total)) {
+            std::lock_guard<std::mutex> lock(g_live_mu);
+            free = total > g_live_bytes ? total - g_live_bytes : 0;
+        }
+#if defined(_WIN32)
+        // WDDM charges every device allocation against the system commit limit as well (a 4 GiB hipMalloc took
+        // 4.1 GiB of commit on the R9700), so what can be allocated is also bounded by the commit still free.
+        // 4 GiB is left for the host allocations that follow and for the other programs.
+        MEMORYSTATUSEX m{};
+        m.dwLength = sizeof m;
+        constexpr uint64_t kCommitReserve = uint64_t(4) << 30;
+        if (::GlobalMemoryStatusEx(&m))
+            free = std::min<uint64_t>(free, m.ullAvailPageFile > kCommitReserve ? m.ullAvailPageFile - kCommitReserve : 0);
+#endif
+        core::apply_vram_limit(free, total);
+        if (free_bytes) *free_bytes = (size_t) free;
+        if (total_bytes) *total_bytes = (size_t) total;
+        return true;
 #else
         if (!d.has(sycl::aspect::ext_intel_free_memory)) {
             g_error = "mem_info: the device does not report free memory (set ZES_ENABLE_SYSMAN=1)";

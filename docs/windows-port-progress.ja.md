@@ -488,3 +488,28 @@ AdaptiveCpp `0ea863abe1af4422593583f91e5608ef75044a16`の`multi_queue_executor::
 Windows R9700の隔離runtime（B）と正常版（A）で同じ13入力ID、41出力token、53位置を比較しました。診断A/Bでは全13,160,960 logitsと26,593,280 residual floatsがbit単位で一致し、非有限値は0です。dumpなしのfresh processをA1→B1→A2→B2→A3→B3の順に各3回実行し、Decode中央値はA 2.576→B 3.846 tok/s（+49.3%、1.493倍）、Routing/Inputのhost待機中央値は261.091→122.509 ms/位置、CPU callbackは100.624→101.673 ms/位置でした。待機はGPU処理・転送・runtimeを含み、GPU実行時間の内訳ではありません。固定したこのworkloadでの結果であり、10倍には達していません。
 
 修正は`third_party/main/adaptivecpp/patches/0002-dag-lane-affinity.patch`として固定commitのAdaptiveCpp sourceだけへ適用する対象です。別source/build/prefixで再現・検査し、正常版installを上書きしません。正常版exe、SDK、driver、復元用コピーは維持しました。記録はGit対象外の`build/windows-acpp/lane-affinity-20261012T084944Z/report.ja.md`、`result.json`と`.tools/lane-affinity-runtime/source.diff`にあります。他のprompt、長いcontext、別GPU・量子化、実GPU障害時のcleanup、4 GiB最大allocation条件は今回の検査範囲外です。
+
+<a id="expert-cache-and-wsl"></a>
+## 2026-10-13: VRAMのexpert cacheを有効化、WSL 2の経路は不可
+
+### expert cacheが常に0だった原因
+
+AdaptiveCppのビルドでは`strata::gpu::mem_info`が常に失敗を返していました。`--expert-cache auto`は空きVRAMを0 GiBと読み、cacheは0 slotsになっていました。Phase 3Cで4 slotsしか試せなかったのも、この自動sizingが働かなかったためです。HIP backendのdeviceでは、HIPの`hipMemGetInfo`を実行時に読み込んで空きVRAMを取ります（buildはHIPをlinkしません）。HIPが答えないbackendでは、deviceの総量からこのprocessの確保量を引いた値を使います。
+
+WindowsのHIPでは、device allocationがsystem commitも同じ量だけ消費します。4 GiBの`hipMalloc`でcommitの空きが4.1 GiB減り、`hipFree`で戻りました。物理RAMは消費しません。そのためWindowsでは、空きVRAMと「空きcommit − 4 GiB」の小さい方を空き容量とします。27 GiB分のslotsを一度に確保したときはcommitの空きが98 MiBまで落ちましたが、この上限を入れてからは確保が空きcommitの範囲に収まります。page fileを大きくすれば、cacheも大きくなります。
+
+同じhello入力（13 input IDs、`--max-new 64`、context 256、workers 3、mmap、VRAM制限とno-XMXの指定なし）で、cache autoは7,759 slots（9.99 GiB）、hitは25,440要求中19,091（75.0%）でした。生成した41 tokenはcache-offと同じです。Decodeは3.22〜4.87 tok/sで、cache-offの3.11〜4.88 tok/sとほぼ変わりません。この短い実行ではcacheが空の状態から始まり、6,349個のexpertを生成中にmmapから読んでVRAMへ入れているためです。
+
+### 残る下限: GPU側の層ごとの時間
+
+cache-on、`STRATA_POOL_TIMING=1`のDecodeでは、CPU poolは0.09 ms/位置まで減り、Routing/Inputのhost待機は約115 ms/位置（1層あたり約2.4 ms）のまま残りました。`--no-pool`（CPU expertsなし）のDecodeも10.60 tok/s（約94 ms/token）です。同じengineはLinuxのRX 9060 XT（R9700の約半分のGPU）でdecode約49 tok/sなので、Windows経路の主な損失はGPU側の層ごとの時間です。Linux経路のcommand graph、doorbell、native experts、batched prefillはこの経路にありません。
+
+native in-order queue（AdaptiveCppのDAG schedulerを通さない）も試しました。Decodeは4.88から6.02 tok/sになりましたが、headのlogits readbackが古い値を返し、53位置中19位置でargmaxが食い違いました。Routing待機も約128 ms/位置で、DAG方式と変わりません。不採用とし、DAG方式を維持します。
+
+### WSL 2の経路
+
+WSL 2（Ubuntu 24.04、ROCm 7.2.3、librocdxg）でXeStrataのLinux版を試しました。intel/llvm v7.1.1（HIP target付き）とengineのbuildは通りました。一方でR9700（gfx1201）では、`hipMalloc`は成功するものの、最初のqueue作成、kernel起動、event記録が完了しません。同じ最小HIPテストは内蔵の890M（gfx1150）では通ります。
+
+librocdxgのdebug logでは、ROCm内部の最初のkernel dispatchをPM4へ変換して投入した後、R9700ではqueueのread pointerが0から進みません。librocdxgの`src/wddm/cmd_util.cpp`（ROCm/rocm-systemsへ移った現在の版も同じ）はgfx12の分岐を持たず、cache flushは「gfx10以降は共通」のbit配置、`PRIV`はgfx11だけに立てています。最新のlibrocdxg 1.2.2でも変わらず、gfx12にも`PRIV`を立てる試みではWindowsがbugcheck 0xD1（`dxgmms2.sys`）で停止しました。Windows driverは32.0.32015.2008（2026-09-28）で、AMDがWSLで保証する組み合わせ（Adrenalin 26.2.2とROCm 7.2.1）より新しい版です。
+
+WSL経由のR9700はこの環境では使えないため、Windowsネイティブの経路を続けます。WSL 2でAMD GPUを`rocminfo`から検出するsetupの変更は、このbugcheckの危険があるためcommitしていません。intel/llvmのbuild後に`xmx_probe`がWSL上で約1時間45分CPUを使い続けた問題も、別に直す必要があります。
