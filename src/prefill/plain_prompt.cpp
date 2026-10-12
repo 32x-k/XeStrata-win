@@ -329,13 +329,13 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     // FP16 products have none either) where every layer's types are theirs (prompt_int8, decided with the buffers),
     // else dequantized to FP16
     const bool use_mmq = P.int8;
-    // the CPU's share of the missed experts needs the split's times (measured at load from pinned RAM) and the int8
-    // path's grouping; STRATA_PLAIN_CPU_SHARE=0: every expert on the GPU
+    // the CPU's share of the missed experts needs the split's times (measured at load from pinned RAM, on the decode
+    // window's kernels: the int8 and the FP16 path take them alike); STRATA_PLAIN_CPU_SHARE=0: every expert on the GPU
     static const bool cpu_env = [] {
         const char* v = std::getenv("STRATA_PLAIN_CPU_SHARE");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    const bool cpu_share = cpu_env && use_mmq && split_.c > 0.0 && split_.p > 0.0 && P.cpu_cap > 0;
+    const bool cpu_share = cpu_env && split_.c > 0.0 && split_.p > 0.0 && P.cpu_cap > 0;
     static const bool prompt_attn_on = [] {   // STRATA_PLAIN_PROMPT_ATTN=0: the decode's attention kernel
         const char* v = std::getenv("STRATA_PLAIN_PROMPT_ATTN");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
@@ -701,7 +701,11 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     }
                     g0 = g1;
                 }
-                if (!cpu_experts.empty() && !prompt_cpu_experts(ml, cpu_experts, count, start, err)) return false;
+                // the CPU's rows go into parts after the GPU's products are queued (it computes beside them): here on
+                // the int8 path, which writes parts itself; after the FP16 path's gather, which writes every routing
+                // entry's row of parts (the CPU's from rows of dm no product wrote)
+                if (use_mmq && !cpu_experts.empty() && !prompt_cpu_experts(ml, cpu_experts, count, start, err))
+                    return false;
                 cpu_n += (int64_t) cpu_experts.size();
                 for (int32_t e : cpu_experts) cpu_rows += count[(size_t) e];
                 for (int64_t e = 0; e < E; ++e) miss_n += count[(size_t) e] > 0 && res_[(size_t) (ml * E + e)] < 0;
@@ -750,6 +754,8 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 if (!use_mmq)
                     k::gather_rows(reinterpret_cast<const uint8_t*>(P.dm), N * 4, P.slot, T * K,
                                    reinterpret_cast<uint8_t*>(P.parts), cs);
+                if (!use_mmq && !cpu_experts.empty() && !prompt_cpu_experts(ml, cpu_experts, count, start, err))
+                    return false;
                 if (has_shared_) {   // shared = down(silu(gate) * up): the SwiGLU into FP16 (x16 is free again)
                     prefill::swiglu_pair(P.sh_gate, P.sh_up, P.x16, T, cs, FS);
                     proj(b.sh_down, P.shared, T);
