@@ -21,7 +21,11 @@ CUDA のソースは upstream の Strata（`3ce2523`）に残っていて、Xe �
 記録にある速さは、断りがなければこの GPU のものです。NVIDIA は RTX 4070 と RTX 3070 で確かめています。
 エンジンは経路を GPU が報告する能力で選びます（AGENTS.md の最初の規則）。
 プリフィルの行列積は、Xe2 の XMX には専用のカーネル（xmx_gemm）を、Arc A シリーズの XMX と NVIDIA の Tensor Core には
-報告されたタイルの形で動く joint_matrix の積（mma_gemm）を使い、行列エンジンのない GPU は DP4a の経路を使います。
+報告されたタイルの形で動く joint_matrix の積（mma_gemm）を、RDNA3・RDNA4 には同じ積を WMMA の命令で動かしたものを使い、
+行列エンジンのない GPU は DP4a の経路を使います。
+量子化したまま int8 で積むエキスパートの積（iq_mmq）は、Intel の XMX（Xe2・Xe-HPG）、NVIDIA の Tensor Core（Turing 以降）、RDNA3・RDNA4 の WMMA で動き、DP4a で積むのは行列エンジンのない GPU だけです。
+int8 の行列エンジンのない Volta は、FP16 の経路を使います。
+Qwen3.8 の prompt は、xmx_gemm が動く GPU では FP16 の経路のままにします（B70 ではそちらが速い）。
 
 小さい GPU は、B70 を小さく見せて確かめます。
 `STRATA_VRAM_LIMIT_MIB` はエンジンから見える VRAM を、`STRATA_MAX_ALLOC_MIB` は想定する最大の確保量を制限し、

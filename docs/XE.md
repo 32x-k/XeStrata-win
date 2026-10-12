@@ -20,7 +20,10 @@ Upstream Strata (`3ce2523`) keeps them, and each Xe source names the CUDA file i
 It is developed and measured on an Intel Arc Pro B70 (Xe2, 32 GB); the speeds in the records are that card's unless they say otherwise.
 On NVIDIA it is checked on an RTX 4070 and an RTX 3070.
 The engine chooses its paths from what the GPU reports (AGENTS.md, the first rule).
-The prefill path's matrix products use a kernel of their own on Xe2's XMX (xmx_gemm), a joint_matrix product that takes the reported tile shape on the Arc A series' XMX and NVIDIA's tensor cores (mma_gemm), and the DP4a paths on a GPU without matrix engines.
+The prefill path's matrix products use a kernel of their own on Xe2's XMX (xmx_gemm), a joint_matrix product that takes the reported tile shape on the Arc A series' XMX and NVIDIA's tensor cores (mma_gemm), the same product through the WMMA instructions on RDNA3 and RDNA4, and the DP4a paths on a GPU without matrix engines.
+The experts' products in int8 (their quantized blocks as they are, iq_mmq) run on Intel's XMX (Xe2, Xe-HPG), NVIDIA's tensor cores (Turing on) and the WMMA of RDNA3 and RDNA4, and take DP4a only on a GPU without matrix engines.
+Volta, whose matrix engines have no int8, takes the FP16 path.
+Qwen3.8's prompt keeps the FP16 path on a GPU that runs xmx_gemm (faster there on the B70).
 
 A smaller card is checked by making the B70 look like one.
 `STRATA_VRAM_LIMIT_MIB` caps the VRAM the engine sees, `STRATA_MAX_ALLOC_MIB` the largest allocation it assumes, and
