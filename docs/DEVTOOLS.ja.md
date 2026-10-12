@@ -83,10 +83,13 @@ sudo apt install hipcc libamdhip64-dev libhsa-runtime-dev rocminfo   # Ubuntu
 sudo dnf install hipcc rocm-hip-devel rocm-runtime-devel rocm-device-libs rocminfo   # Fedora 44
 ```
 
-- ROCm は AMD の `/opt/rocm` か、ディストリビューションのもの（ヘッダーは `/usr/include`、ライブラリは multiarch のフォルダーか `/usr/lib64`）を探します。
+- ROCm は AMD の `/opt/rocm`（ROCm 7.14 の AMD のパッケージでは `/opt/rocm/core-7.14`）か、ディストリビューションのもの（ヘッダーは `/usr/include`、ライブラリは multiarch のフォルダーか `/usr/lib64`）を探します。
+  ROCm 7.14 の AMD のパッケージは ld.so.conf を入れないので、setup はその `lib` をエンジンのライブラリの探索先（設定の `lib_dirs`）に加えます。
   見つからなければ HIP なしでビルドします。
 - AMD の GPU 向けのコードには、libclc の libspirv（AMD 向け）と ROCm のデバイスライブラリが要ります。
-  Fedora のデバイスライブラリは `/usr/lib64/rocm/llvm/lib/clang/20/lib/amdgcn/bitcode` にあり、コンパイラには `--rocm-device-lib-path` で渡します。
+  コンパイラが読めるビットコードは自分の LLVM かそれより古いものだけなので（ROCm 7.14 のデバイスライブラリは LLVM 23 製で、intel/llvm 7.1.1 の LLVM 22 では読めません）、
+  スクリプトはデバイスライブラリを、intel/llvm と同じ LLVM の ROCm のリリース（ROCm の llvm-project の `rocm-7.2.4` の `amd/device-libs`、University of Illinois/NCSA ライセンス）から取ってきて、同じツリーでビルドし、`install/amdgcn/bitcode` に入れます。
+  CMake は、入っている ROCm のデバイスライブラリをコンパイラが読めればそちらを使い、読めないときにこれを使います。これが通らなくても intel/llvm はできます。
 - Fedora 44（ROCm 7.1.1）のコンテナで、RX 9060 XT（gfx1200）に `-fsycl-targets=amd_gpu_gfx1200` でコンパイルした SYCL のカーネルが正しく動きました。
   HIP のアダプタは一度に確保できる大きさを 1 GiB と報告しますが、実際には 12 GiB まで確保できました。
 

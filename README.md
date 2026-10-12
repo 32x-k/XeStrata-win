@@ -368,6 +368,10 @@ what has been checked in [docs/XE.md](docs/XE.md).
    - [intel/llvm](https://github.com/intel/llvm)'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib-llvm
      modes' compiler, built with XeStrata's fixes (`third_party/main/intel-llvm/patches/`, under the same license);
      the packages carry its SYCL runtime;
+   - [ROCm's device libraries](https://github.com/ROCm/llvm-project/tree/rocm-7.2.4/amd/device-libs), by AMD
+     (University of Illinois/NCSA): built with intel/llvm, and linked into the code for AMD GPUs; the target features
+     their build is given are transcribed from the `debian/rules` of Debian's
+     [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) package (Expat);
    - the web app's font, [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1).
 - **Ideas from:**
    - [Splash](https://github.com/incoai/splash), by Inco AI and the Splash contributors;
@@ -391,6 +395,7 @@ XeStrata (copyright MistVVK and the XeStrata contributors) is free software; the
 - **Code from Strata and ggml:** the code that comes from Strata and from ggml / llama.cpp, both MIT (the kernels
   transcribed into `src/` included), is part of XeStrata under the LGPL; as MIT asks, their copyright and permission
   notices are kept in [NOTICE](NOTICE).
+  So is what `tools/intel_llvm_build.py` transcribes from Debian's rocm-llvm package (Expat).
 - **Exceptions:** these, in `third_party/`, stay under their own licenses, one folder per project with its license text.
    - XeStrata's patches to intel/llvm (`third_party/main/intel-llvm/`): Apache-2.0 WITH LLVM-exception.
    - XeStrata's changes to oneMath (its fork, `third_party/main/oneMath/`): Apache-2.0.
@@ -401,5 +406,6 @@ XeStrata (copyright MistVVK and the XeStrata contributors) is free software; the
 - **Without `third_party/nonfree/`,** XeStrata still builds and runs. The packages leave it out.
 - **What else the packages carry:** intel/llvm's SYCL runtime (Apache-2.0 WITH LLVM-exception), llama.cpp's gguf-py
   (MIT) and oneMath (Apache-2.0), each with its license text.
+  The code for AMD GPUs carries parts of ROCm's device libraries (NCSA), so their license text is there too.
   Nothing that is not free software (oneMKL, cuBLAS, NVIDIA's driver) is in them.
 - **The models** are not part of this repository; each model's own license applies to its files.

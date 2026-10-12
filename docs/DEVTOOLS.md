@@ -83,10 +83,13 @@ sudo apt install hipcc libamdhip64-dev libhsa-runtime-dev rocminfo   # Ubuntu
 sudo dnf install hipcc rocm-hip-devel rocm-runtime-devel rocm-device-libs rocminfo   # Fedora 44
 ```
 
-- ROCm is looked for in AMD's `/opt/rocm` or the distribution's (headers in `/usr/include`, libraries in the multiarch folder or `/usr/lib64`).
+- ROCm is looked for in AMD's `/opt/rocm` (`/opt/rocm/core-7.14` with ROCm 7.14's packages from AMD) or the distribution's (headers in `/usr/include`, libraries in the multiarch folder or `/usr/lib64`).
+  ROCm 7.14's packages from AMD install no ld.so.conf, so setup adds their `lib` to the engine's library path (the config's `lib_dirs`).
   Without it the build has no HIP.
 - Code for AMD GPUs needs libclc's libspirv for AMD and ROCm's device libraries.
-  Fedora's device libraries are in `/usr/lib64/rocm/llvm/lib/clang/20/lib/amdgcn/bitcode`; give them to the compiler with `--rocm-device-lib-path`.
+  A compiler reads bitcode of its own LLVM or an older one only (ROCm 7.14's device libraries are LLVM 23's, which intel/llvm 7.1.1's LLVM 22 cannot read),
+  so the script fetches the device libraries of the ROCm release on intel/llvm's LLVM (`amd/device-libs` of ROCm's llvm-project at `rocm-7.2.4`, under the University of Illinois/NCSA license), builds them in the same tree and installs them into `install/amdgcn/bitcode`.
+  CMake takes the installed ROCm's device libraries where the compiler reads them, and these where it does not; when they fail to build, intel/llvm is still built.
 - In a Fedora 44 container (ROCm 7.1.1), a SYCL kernel compiled with `-fsycl-targets=amd_gpu_gfx1200` ran correctly on an RX 9060 XT (gfx1200).
   The HIP adapter reports 1 GiB as the largest allocation, but 12 GiB could be allocated.
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-FileCopyrightText: 2022-2026 The authors of Debian's rocm-llvm packaging (debian/*; named in NOTICE)
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Build intel/llvm's DPC++ (free software: Apache-2.0 with LLVM exceptions) from source into .tools/intel-llvm/, for a
 free build of the engine where the distribution has no DPC++, or one whose SYCL runtime does not give the GPU its
@@ -8,7 +9,8 @@ matrix engines (Ubuntu 26.04's 6.2 lists none for the Arc Pro B70; intel/llvm ad
     tools/intel_llvm_build.py [--contrib] [--rebuild] [--keep-build] [--tag TAG] [--yes]
 
 .tools/intel-llvm/src is the clone, build/ the build tree, install/ the toolchain (bin/clang++, lib/libsycl.so).
-Where ROCm's HIP is installed (free software), it builds the HIP target (AMD GPUs) as well.  --contrib builds the same
+Where ROCm's HIP is installed (free software), it builds the HIP target (AMD GPUs) as well, with ROCm's device
+libraries built by the same compiler (DEVICE_LIBS_TAG, below).  --contrib builds the same
 clone with the CUDA target too (NVIDIA GPUs; it needs NVIDIA's CUDA toolkit, which is not free software: the contrib
 build mode), into .tools/intel-llvm-contrib/ (build/, install/).  A finished install/ carries XESTRATA.json (the tag,
 its commit, the date, the GPUs' matrix engines as tools/xmx_probe.cpp saw them).  Run again, it uses a finished install
@@ -37,6 +39,16 @@ REPO = "https://github.com/intel/llvm.git"
 # The release this script builds: one with the Arc Pro B70 in the runtime's matrix table (v7.0.0 or later).  Raised by
 # a change to this line, not by following the newest release, so a run does not start a build by itself.
 TAG = "v7.1.1"
+
+# ROCm's device libraries (ocml, ockl and the others; the University of Illinois/NCSA license), which the AMD code
+# links: built with the toolchain, into install/amdgcn/bitcode, since a clang reads bitcode of its own LLVM or older
+# only - ROCm 7.14's (LLVM 23) stopped v7.1.1's (LLVM 22) build for an RX 7900 XTX (a field report).  CMake takes them
+# where the installed ROCm's do not build (cmake/StrataHip.cmake).  amd/device-libs of
+# ROCm's llvm-project at a release on TAG's LLVM (rocm-7.2.x is LLVM 22): raised with TAG.  third_party/main/
+# rocm-device-libs/.
+DEVICE_LIBS_REPO = "https://github.com/ROCm/llvm-project.git"
+DEVICE_LIBS_TAG = "rocm-7.2.4"
+DEVICE_LIBS_SRC = BASE / "rocm-device-libs"
 
 # Fixes the release lacks (its sycl branch too, on 2026-10-05): third_party/main/intel-llvm/patches/NN-<id>.patch,
 # applied in order to the clone before the configuration (under intel/llvm's license, Apache-2.0 with LLVM
@@ -166,11 +178,53 @@ def target_options(contrib: bool) -> list:
     if rocm is None:
         say("note: no ROCm HIP (hipcc's headers, libamdhip64): building without the HIP target (AMD GPUs)")
     else:
+        # ROCm's device libraries as an external project: configure.py puts its external projects into
+        # LLVM_ENABLE_PROJECTS too, whose folders LLVM takes from the clone's top (src/device-libs), so a link there.
+        # They use AMDGPU builtins without an -mcpu, which upstream LLVM (and intel/llvm with it) allows only with
+        # their target features: the four transcribed from Debian's rocm-llvm package (debian/rules of
+        # 7.2.4+dfsg-1~exp1; Expat License, Copyright 2022-2026 its debian/ authors, see NOTICE)
+        link = SRC / "device-libs"
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(fetch_device_libs())
+        features = ";".join(f"-Xclang;-target-feature;-Xclang;+{f}"
+                            for f in ("lerp-inst", "cube-insts", "qsad-insts", "sad-insts"))
         opts += ["--hip", "--hip-platform", "AMD", f"--cmake-opt=-DUR_HIP_ROCM_DIR={rocm[0]}",
-                 f"--cmake-opt=-DUR_HIP_LIB_DIR={rocm[1]}"]
+                 f"--cmake-opt=-DUR_HIP_LIB_DIR={rocm[1]}", "--llvm-external-projects", "device-libs",
+                 f"--cmake-opt=-DCLANG_OPTIONS_APPEND={features}"]
         # the name libclc builds the AMD libspirv for (its list of known targets lacks it: the fix hip-libclc-target)
         libclc.append("amdgcn--amdhsa")
     return opts + ([f"--cmake-opt=-DLIBCLC_TARGETS_TO_BUILD={';'.join(libclc)}"] if libclc else [])
+
+
+def fetch_device_libs() -> Path:
+    """ROCm's llvm-project at DEVICE_LIBS_TAG, amd/device-libs alone (a shallow, sparse clone: a few MB)."""
+    if (DEVICE_LIBS_SRC / ".git").exists():
+        have = subprocess.run(["git", "-C", str(DEVICE_LIBS_SRC), "describe", "--tags", "--exact-match"],
+                              capture_output=True, text=True).stdout.strip()
+        if have != DEVICE_LIBS_TAG:
+            run(["git", "-C", DEVICE_LIBS_SRC, "fetch", "--depth", "1", "--filter=blob:none", "origin", "tag",
+                 DEVICE_LIBS_TAG])
+            run(["git", "-C", DEVICE_LIBS_SRC, "checkout", "--detach", DEVICE_LIBS_TAG])
+    else:
+        run(["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", "--branch", DEVICE_LIBS_TAG,
+             DEVICE_LIBS_REPO, DEVICE_LIBS_SRC])
+        run(["git", "-C", DEVICE_LIBS_SRC, "sparse-checkout", "set", "amd/device-libs"])
+    return DEVICE_LIBS_SRC / "amd" / "device-libs"
+
+
+def build_device_libs(jobs: int) -> bool:
+    """ROCm's device libraries, built in the toolchain's tree (an LLVM external project, as their README builds them)
+    and installed into install/amdgcn/bitcode.  Apart from compile.py's target, so a failure keeps the toolchain:
+    CMake then takes a ROCm's device libraries the compiler reads, or says why none (cmake/StrataHip.cmake)."""
+    for cmd in (["cmake", "--build", BUILD, "--target", "rocm-device-libs", "-j", str(jobs)],
+                ["cmake", "--install", BUILD, "--component", "device-libs"]):
+        say("  > " + " ".join(str(c) for c in cmd))
+        if subprocess.run([str(c) for c in cmd]).returncode != 0:
+            say(f"note: ROCm's device libraries ({DEVICE_LIBS_TAG}) did not build with this toolchain; the engine's "
+                "AMD code takes the system's where this compiler reads them")
+            return False
+    return True
 
 
 def fix_sources() -> None:
@@ -224,12 +278,14 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
     jobs = jobs or os.cpu_count() or 4
     started = time.time()
     run([sys.executable, SRC / "buildbot" / "compile.py", "-o", BUILD, "-j", str(jobs)])
+    device_libs = {"tag": DEVICE_LIBS_TAG, "built": build_device_libs(jobs)} if rocm_dirs() is not None else None
     commit = subprocess.run(["git", "-C", str(SRC), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     gpus = probe(INSTALL)
     backends = sorted(p.name.split("_adapter_")[1].split(".")[0] for p in (INSTALL / "lib").glob("libur_adapter_*.so"))
     RECORD.write_text(json.dumps({"tag": tag, "commit": commit, "fixes": [patch_id(p) for p in PATCHES], "zstd": True,
                                   "built": time.strftime("%Y-%m-%d %H:%M"),
                                   "minutes": round((time.time() - started) / 60), "backends": backends,
+                                  "device_libs": device_libs,
                                   "gpus": gpus}, indent=1))
     if not keep_build:
         shutil.rmtree(BUILD, ignore_errors=True)
@@ -265,6 +321,8 @@ def main() -> None:
                        and (hip or not patch_id(p).startswith("hip-"))]
             if not have.get("zstd"):
                 missing.append("zstd")
+            if hip and (have.get("device_libs") or {}).get("tag") != DEVICE_LIBS_TAG:
+                missing.append(f"ROCm's device libraries {DEVICE_LIBS_TAG}")
             if not missing:
                 say(f"intel/llvm {a.tag} is already built in {INSTALL}")
             elif ask(f"intel/llvm {a.tag} is built without the fixes {', '.join(missing)}; build it again with them? "

@@ -45,13 +45,24 @@ Every copyright holder whose work is in this repository, its license and where t
   third_party/main/intel-llvm/patches/, which tools/intel_llvm_build.py applies to the release it builds. intel/llvm
   itself is not in this repository - third_party/main/intel-llvm/LICENSE.TXT, LICENSES/Apache-2.0.txt,
   LICENSES/LLVM-exception.txt
+- Copyright 2022-2026 Maxime Chambonnet, Étienne Mollier, Cordell Bloor, Xuanteng Huang, Christian Kastner, Igor Luppi, Talha Can Havadar
+  Expat (MIT) - the target features tools/intel_llvm_build.py gives ROCm's device libraries' build, transcribed
+  from the debian/rules of Debian's rocm-llvm package (https://salsa.debian.org/rocm-team/rocm-llvm); part of
+  XeStrata under the LGPL - text below
+- Copyright (c) 2014-2016, Advanced Micro Devices, Inc.
+  University of Illinois/NCSA Open Source License - ROCm's device libraries (ocml, ockl and the others, from
+  https://github.com/ROCm/llvm-project, amd/device-libs), which tools/intel_llvm_build.py builds with intel/llvm and
+  the engine's code for AMD GPUs links: that code carries parts of them. They are not in this repository -
+  third_party/main/rocm-device-libs/LICENSE.TXT
 - Copyright (c) 2026 Qwen
   Qwen Community License 1.0 - third_party/nonfree/: material made from or copied from the Qwen3.8-Flash-Next model.
   Not free software and not covered by the LGPL; XeStrata builds and runs without it - third_party/nonfree/*/LICENSE
 
 The deb and rpm packages (cmake/packaging.cmake) also carry, each with its license text: the SYCL runtime of
 intel/llvm (Apache-2.0 WITH LLVM-exception) built with XeStrata's fixes, llama.cpp's gguf-py (MIT, Copyright (c)
-2023-2026 The ggml authors), and in the contrib-llvm ones oneMath (Apache-2.0) with XeStrata's changes.
+2023-2026 The ggml authors), the license of ROCm's device libraries, parts of which the engine's code for AMD GPUs
+carries (NCSA, Copyright (c) 2014-2016 Advanced Micro Devices, Inc.), and in the contrib-llvm ones oneMath
+(Apache-2.0) with XeStrata's changes.
 The engine in the contrib-llvm packages is compiled with NVIDIA's CUDA Toolkit, and its code for NVIDIA GPUs can contain
 parts of NVIDIA's libdevice; those parts are NVIDIA's, distributed under the NVIDIA CUDA Toolkit End User License
 Agreement.
@@ -89,6 +100,36 @@ ggml / llama.cpp (MIT License)
 ------------------------------
 
 Copyright (c) 2023-2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+Debian's rocm-llvm packaging (Expat License)
+--------------------------------------------
+
+Copyright 2022, Maxime Chambonnet
+Copyright 2022-2023, Étienne Mollier
+Copyright 2022-2025, Cordell Bloor
+Copyright 2024, Xuanteng Huang
+Copyright 2024, Christian Kastner
+Copyright 2025, Igor Luppi
+Copyright 2025-2026, Talha Can Havadar
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
