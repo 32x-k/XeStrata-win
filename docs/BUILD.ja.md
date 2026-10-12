@@ -52,7 +52,10 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   ROCm の HIP 付きでビルドした intel/llvm なら、`STRATA_HIP_ARCHS`（例 `gfx1200`）で AMD の GPU（RDNA2 以降: gfx103x、gfx11xx、gfx12xx）向けのコードも作ります。
   ROCm は自由ソフトウェアなので、free でも contrib-llvm でも同じです（[DEVTOOLS.ja.md](DEVTOOLS.ja.md#hipamd-の-gpu)）。
   `auto`（既定）はカーネルの KFD が報告するこの PC の AMD の GPU を選び、`rocblas` はディストリビューションの rocBLAS がコードを持つ RDNA2 以降の GPU のうち、SYCL のコンパイラにターゲットのあるものをすべて選びます（パッケージはこれでビルドします。intel/llvm 7.1.1 には gfx1152 と gfx1153 のターゲットがありません）。
-  ROCm のデバイスライブラリ（`ockl.bc`）の場所は `STRATA_ROCM_DEVICE_LIBS` で変えられます。
+  ROCm のデバイスライブラリ（`ockl.bc`）は、AMD の `/opt/rocm*`、ディストリビューションのもの、SYCL のコンパイラ自身のもの（`tools/intel_llvm_build.py` が一緒にビルドします）の順に、AMD のカーネルを試しにビルドして、通った最初のものを使います。
+  入っている ROCm のものが使えればそれを使い、コンパイラ自身のものは、ROCm のものがコンパイラより新しい LLVM で作られていて読めないとき（ROCm 7.14 など）に使います。
+  どれも通らなければ、それぞれの理由（コンパイラより新しい LLVM のビットコード、コンパイラが求めるファイルがない）を出して止まります。
+  `STRATA_ROCM_DEVICE_LIBS` で場所を指定でき、そのときも試しのビルドが通らなければ理由を出して止まります。
   AMD の GPU の密な積は oneMath の rocBLAS の後端で計算し、フォークの変更で、16 ビットの入力の積は hipBLASLt に回します。
   hipBLASLt が見つからないと CMake は警告し（`STRATA_PACKAGE=ON` では止まります）、その積は rocBLAS だけで計算します（gfx12 では 15 分の 1 ほどの速さでした）。
   RX 9060 XT（gfx1200、Fedora 44、ROCm 7.1.1）で CTest が通ることを確かめています。

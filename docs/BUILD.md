@@ -51,7 +51,10 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
   With intel/llvm built with ROCm's HIP, `STRATA_HIP_ARCHS` (`gfx1200`, for example) makes the code for AMD GPUs (RDNA2 and later: gfx103x, gfx11xx, gfx12xx) as well.
   ROCm is free software, so this is the same in the free and contrib-llvm modes ([DEVTOOLS.md](DEVTOOLS.md#hip-amd-gpus)).
   `auto` (the default) takes this PC's AMD GPUs as the kernel's KFD reports them, and `rocblas` every RDNA2 or later GPU the distribution's rocBLAS has code for and the SYCL compiler has a target for (the packages are built so; intel/llvm 7.1.1 has none for gfx1152 and gfx1153).
-  `STRATA_ROCM_DEVICE_LIBS` gives the place of ROCm's device libraries (`ockl.bc`).
+  For ROCm's device libraries (`ockl.bc`), CMake builds a test kernel for the AMD GPU with AMD's in `/opt/rocm*`, the distribution's and the SYCL compiler's own (`tools/intel_llvm_build.py` builds them with it), in that order, and takes the first that builds.
+  The installed ROCm's are taken where they build; the compiler's own where those are of a newer LLVM than the compiler's, which it cannot read (ROCm 7.14's, for example).
+  When none does, it stops with each one's reason (bitcode of a newer LLVM than the compiler's, files the compiler asks for that are missing).
+  `STRATA_ROCM_DEVICE_LIBS` gives their place; it stops with the reason when the test kernel does not build with them either.
   An AMD GPU's dense products run in oneMath's rocBLAS backend, which the fork's change makes hand those with 16-bit inputs to hipBLASLt.
   Without hipBLASLt, CMake warns (and stops with `STRATA_PACKAGE=ON`), and those products run in rocBLAS alone (at about a fifteenth of the speed on gfx12).
   Validated: CTest passes on an RX 9060 XT (gfx1200, Fedora 44, ROCm 7.1.1).
