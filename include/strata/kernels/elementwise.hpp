@@ -130,5 +130,8 @@ struct MappedCopy {
     int64_t words = 0;
 };
 void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream);
+/// `rows` rows of 2n floats: row r of `a` (n floats), then row r of `b` (the MTP layer's input, [embedding | hidden]).
+/// n a multiple of 4, every pointer 16-byte aligned.  Graph-capturable.
+void concat_rows(float* dst, const float* a, const float* b, int64_t n, int64_t rows, void* stream);
 
 }  // namespace strata::kernels
