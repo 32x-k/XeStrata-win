@@ -80,6 +80,7 @@
 #include "strata/artifact/model_spec.hpp"
 #include <fcntl.h>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -110,6 +111,7 @@
 #include <new>
 #include <charconv>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1901,12 +1903,60 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     std::_Exit(3);
 }
 
+// A fatal signal (a crash in the engine, a driver or a library it loaded) used to end the engine with nothing in its
+// log: issue #12, a B70 + RTX 3080 Ti that ended right after "layer split across 2 GPUs" on every start.  This handler
+// writes which signal and what the engine was doing (progress().where, set through the start as well) to the log and
+// as an ERR line the server shows, then ends the engine with the same signal, so its exit status stays the signal's.
+// write(2) only: nothing in a signal handler may take a lock or allocate.
+const char* fatal_signal_name(int sig) {
+    switch (sig) {
+        case SIGSEGV: return "SIGSEGV (a bad memory access)";
+        case SIGBUS: return "SIGBUS (a bad memory access)";
+        case SIGILL: return "SIGILL (an instruction this CPU does not have)";
+        case SIGFPE: return "SIGFPE (an arithmetic fault)";
+        case SIGABRT: return "SIGABRT (an abort)";
+        default: return "a fatal signal";
+    }
+}
+void fatal_signal(int sig) {
+    const char* where = strata::core::progress().where.load(std::memory_order_relaxed);
+    const char* name = fatal_signal_name(sig);
+    auto put = [](int fd, const char* a) { if (a != nullptr) (void) !write(fd, a, std::strlen(a)); };
+    put(2, "strata generate: FATAL signal ");
+    put(2, name);
+    put(2, " while ");
+    put(2, where);
+    put(2, "\n");
+    put(1, "ERR the engine crashed on ");
+    put(1, name);
+    put(1, " while ");
+    put(1, where);
+    put(1, "\n");
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+}
+void install_fatal_signals() {
+    // an alternate stack, so a stack overflow on the main thread is reported too
+    static char alt[64 * 1024];
+    stack_t st{};
+    st.ss_sp = alt;
+    st.ss_size = sizeof alt;
+    (void) sigaltstack(&st, nullptr);
+    struct sigaction sa{};
+    sa.sa_handler = fatal_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_ONSTACK | SA_RESETHAND;
+    for (const int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) (void) sigaction(sig, &sa, nullptr);
+}
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::set_terminate(report_and_end);   // issue #10: an exception that leaves the engine is reported, not lost
+    install_fatal_signals();               // issue #12: and a crash says what it was and where
+    strata::core::progress_at("starting: reading the options and opening the GPUs");
     // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is
     // touched (upstream b7dd070d)
     for (int i = 1; i < argc && i < 3; ++i) {
@@ -2687,6 +2737,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: CUDA%d context ready, %.2f GiB free before expert arena registration\n",
                      remote_dev[0], free_gib);
     }
+    strata::core::progress_at("starting: building the GPU kernels (on a thread beside the load)");
     strata::core::Runtime::get().preload_kernels();   // beside the model's loading
     // and on every other GPU of a layer split, with its matrix products' library (each GPU builds its own kernels)
     if (multi_gpu)
@@ -2698,6 +2749,7 @@ int main(int argc, char** argv) {
     // (1.85 s of module loads) a quarter of a 4K prompt's speed.  Waited for here so that the VRAM it took is known.
     int64_t blas_bytes = 0;
     {
+        strata::core::progress_at("starting: loading the matrix products' library and running its first products");
         size_t f0 = 0, f1 = 0, tot = 0;
         strata::gpu::mem_info(&f0, &tot);
         strata::prefill::Gemm::prepare();
@@ -2710,6 +2762,7 @@ int main(int argc, char** argv) {
             const strata::core::OnDevice on(d);
             strata::prefill::Gemm::prepare();
         }
+    strata::core::progress_at("starting: loading the weights, the session and the expert caches");
     {
         // the GPU this run drives and the paths it takes (chosen from what it reports, never from its name)
         const strata::core::DeviceInfo gi = strata::core::device_info(0);
@@ -7566,6 +7619,7 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        strata::core::progress_at("idle");
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
