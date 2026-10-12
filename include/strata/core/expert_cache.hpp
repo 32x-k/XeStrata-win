@@ -96,8 +96,17 @@ public:
     /// Plan v0.3 P6: slots of the given sizes, back to back (a native pack's blobs differ per layer, and a
     /// profile-filled tier never moves an expert to another layer's slot, so each slot keeps its first size).
     bool open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert, std::string& err);
-    /// Byte offset of each slot in the arena (null for uniform slots).
+    /// Byte offset of each slot in the arena (null for uniform slots).  Allocated in pieces (set_max_piece), the
+    /// offsets are each slot's address relative to slot 0's, so they wrap between pieces: only the slots of one piece
+    /// lie back to back.
     const uint64_t* slot_offsets() const { return off_.empty() ? nullptr : off_.data(); }
+    /// Before `open_sized`: the largest single allocation the device takes (its max_mem_alloc_size; 0, the default:
+    /// one allocation whatever its size).  A larger arena is allocated in pieces of at most this, in slot order, the
+    /// last piece the largest (the UHD 770 took an allocation past its 4 GiB without an error and read and wrote the
+    /// bytes past 4 GiB wrongly).  Not with segments or VMM.
+    void set_max_piece(uint64_t bytes) { piece_max_ = bytes; }
+    /// The first slot of the last piece (0: one allocation): the slots from it to the end lie back to back.
+    int64_t last_piece_first() const { return last_piece_first_; }
     void close();
 
     bool valid() const { return base_ != nullptr; }
@@ -204,8 +213,16 @@ public:
     uint64_t slot_offset(int64_t s) const { return off_.empty() ? (uint64_t) s * (uint64_t) blob_ : off_[(size_t) s]; }
 
 private:
-    int64_t slot_end(int64_t n) const { return off_.empty() ? n * blob_ : (int64_t) off_[(size_t) n]; }
+    int64_t slot_end(int64_t n) const {
+        return !size_off_.empty() ? (int64_t) size_off_[(size_t) n] : off_.empty() ? n * blob_ : (int64_t) off_[(size_t) n];
+    }
     bool open_segmented(uint64_t want, std::string& err);
+    bool open_pieces(const std::vector<uint64_t>& size_off, std::string& err);
+    void start_tables(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes);
+    uint64_t piece_max_ = 0;              ///< set_max_piece
+    std::vector<void*> pieces_;           ///< the pieces after the first (base_), when allocated in pieces
+    std::vector<uint64_t> size_off_;      ///< in pieces: each slot's offset by size (off_ holds the addresses)
+    int64_t last_piece_first_ = 0;
     void release_segmented();
     uint8_t* base_ = nullptr;
     int64_t live_slots_ = 0;              ///< #533: slots() - all of them unless shrunk

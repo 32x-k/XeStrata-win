@@ -93,14 +93,16 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     const int64_t L = spec_.n_moe_layers(), E = spec_.n_expert, n = n_slots_;
     const uint64_t* off = cache_.slot_offsets();
     if (borrow_first_ >= 0 || off == nullptr || L <= 0 || n < 2) { err = "plain prompt: no tier to borrow from"; return false; }
-    // the chunk's device bytes from the tier's last slots: halved until they take at most half the tier
+    // the chunk's device bytes from the tier's last slots: halved until they take at most half the tier, within its
+    // last piece (the slots lie back to back only inside one)
     uint64_t db = 0, hb = 0;
     int64_t first = n;
+    const int64_t lowest = std::max<int64_t>(n / 2, cache_.last_piece_first());
     for (;; T /= 2) {
         if (T < 16) { err = "plain prompt: the VRAM tier is too small for the prompt's buffers"; return false; }
         prompt_carve(T, pb_, nullptr, nullptr, db, hb);
         first = n;
-        while (first > n / 2 && off[n] - off[first] < db) --first;
+        while (first > lowest && off[n] - off[first] < db) --first;
         if (off[n] - off[first] >= db) break;
     }
     borrowed_res_.clear();

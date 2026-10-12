@@ -536,6 +536,7 @@ bool PlainModel::open_experts(std::string& err) {
             slot_bytes.push_back((int64_t) lay.bytes[(size_t) l]);
         }
     for (auto& f : free_) std::reverse(f.begin(), f.end());   // taken from the back: the lowest slot first
+    cache_.set_max_piece(max_alloc_bytes());   // in pieces where the tier passes the device's largest allocation
     if (!cache_.open_sized(slot_bytes, L, E, err)) return false;
     n_slots_ = (int64_t) slot_bytes.size();
     res_.assign((size_t) (L * E), -1);

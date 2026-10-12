@@ -343,6 +343,11 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         return false;
     }
 
+    start_tables(n_slots, n_layers, n_expert, blob_bytes);
+    return true;
+}
+
+void ExpertCache::start_tables(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes) {
     residency_.assign((size_t) (n_layers * n_expert), kNotResident);
     slots_ = n_slots;
     live_slots_ = n_slots;
@@ -360,6 +365,53 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         layer_slot_range(l, lo, hi);
         layer_next_[(size_t) l] = (int32_t) lo;
     }
+}
+
+// set_max_piece: the slots in runs of at most piece_max_ bytes, taken from the end so the last run (the prompt path's
+// loan) is the largest; each run one allocation.  off_ gets each slot's address relative to slot 0's (modulo 2^64:
+// the kernels add it to slot 0's address), size_off_ the offsets by size for bytes().
+bool ExpertCache::open_pieces(const std::vector<uint64_t>& size_off, std::string& err) {
+    const size_t n = size_off.size() - 1;
+    const uint64_t want = size_off.back();
+    size_t free_b = 0, total_b = 0;
+    if (strata::gpu::mem_info(&free_b, &total_b) && (uint64_t) free_b < want) {
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "ExpertCache: %.2f GiB of slots, but only %.2f GiB of VRAM is free",
+                      (double) want / 1073741824.0, (double) free_b / 1073741824.0);
+        err = buf;
+        return false;
+    }
+    std::vector<size_t> first;   // each run's first slot, from the last run back
+    for (size_t end = n; end > 0;) {
+        size_t b = end;
+        while (b > 0 && size_off[end] - size_off[b - 1] <= piece_max_) --b;
+        if (b == end) { err = "ExpertCache: a slot is larger than the device's largest allocation"; return false; }
+        first.push_back(b);
+        end = b;
+    }
+    std::reverse(first.begin(), first.end());
+    std::vector<uint64_t> addr(n + 1, 0);
+    for (size_t r = 0; r < first.size(); ++r) {
+        const size_t lo = first[r], hi = r + 1 < first.size() ? first[r + 1] : n;
+        const uint64_t bytes = size_off[hi] - size_off[lo];
+        void* p = nullptr;
+        if (!strata::gpu::alloc_device(&p, (size_t) bytes) || !strata::gpu::memset(p, 0, (size_t) bytes)) {
+            if (p != nullptr) strata::gpu::free(p);
+            char buf[256];
+            std::snprintf(buf, sizeof buf, "ExpertCache: device allocation of %.2f GiB (a piece of %.2f GiB) failed: %s",
+                          (double) bytes / 1073741824.0, (double) want / 1073741824.0, strata::gpu::last_error());
+            err = buf;
+            close();
+            return false;
+        }
+        if (r == 0) base_ = static_cast<uint8_t*>(p);
+        else pieces_.push_back(p);
+        const uint64_t at = (uint64_t) (uintptr_t) p - (uint64_t) (uintptr_t) base_;
+        for (size_t i = lo; i <= hi; ++i) addr[i] = at + (size_off[i] - size_off[lo]);
+    }
+    last_piece_first_ = (int64_t) first.back();
+    off_ = std::move(addr);
+    size_off_ = size_off;
     return true;
 }
 
@@ -372,6 +424,13 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
         // 256-byte aligned slots, so every blob starts where the kernels' vector loads expect it
         off[i + 1] = off[i] + ((uint64_t) slot_bytes[i] + 255) / 256 * 256;
         mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
+    }
+    if (piece_max_ > 0 && off.back() > piece_max_ && seg_req_ == 0 && !(g_cache_vmm && vmm_available())) {
+        close();
+        if (!open_pieces(off, err)) return false;
+        start_tables((int64_t) slot_bytes.size(), n_layers, n_expert, mx);
+        // start_tables seeded the cursors on these slots: nothing below to redo
+        return true;
     }
     // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
     if (!open((int64_t) off.back(), n_layers, n_expert, 1, err)) return false;
@@ -392,6 +451,10 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
 
 void ExpertCache::close() {
     off_.clear();
+    size_off_.clear();
+    last_piece_first_ = 0;
+    for (void* p : pieces_) strata::gpu::free(p);
+    pieces_.clear();
     if (!segs_.empty()) {
         release_segmented();
     } else if (vmm_) {
