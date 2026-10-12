@@ -593,3 +593,13 @@ MTP drafting first took 148 ms per round. Its wait loop called `stream_idle` eve
 On the hello input with `--native`, expert cache auto (8,868 to 8,923 slots within the free commit), `--expert-profile`, `--spec 4 --spec-min-p 0.5`, MTP and the default pool workers (11 + the host), Decode was 21.91 and 20.71 tok/s. The 41 generated tokens are the same as without speculation. 12 rounds gave 3.33 tokens each, with 90-93% of the drafts accepted. Of a round, the CPU experts take 109-117 ms and the wait for the GPU 27-29 ms, so the CPU experts are the main remaining time. Going from 3 to 11 workers only took them from 148 to 115 ms per round; reading the mmapped experts (27.6 GB of RAM, most of them on the SSD) appears to be the limit. Prefill is about 5 tok/s with the cache, whose hits go through the CPU path.
 
 The pool workers had been measured at `--pool-workers 3`. Without speculation, `--native` with the default worker count gives 13.39 and 13.85 tok/s.
+
+<a id="cpu-side"></a>
+## 2026-10-13: the CPU side and the prompt
+
+- The default pool workers (11 from the physical cores, plus the host) are faster: going from 3 to 11 took speculative decoding's CPU experts from 148 to 115 ms per round. That they do not scale is most likely the reading of the mmapped experts.
+- `--resident-budget-gib 6` was cut to 0 GiB (the free RAM less 8 GiB of headroom) and did nothing.
+- The expert cache's size counts directly: under the same conditions, Decode was 21-22 tok/s with 11.42 GiB of cache and 23.00 tok/s with 13.35 GiB. On Windows a device allocation takes commit, so the cache is bounded by the free commit (the page file's size).
+- `--prefill auto` (the batched prompt path) runs on Windows as it is. With a 191-token prompt (the arithmetic input repeated), Prefill was 18.73 tok/s and Decode 18.76 tok/s. Reading the prompt token by token, each token reads its experts from the mmap again; on the same input the free RAM fell to 227 MiB and the run was stopped. With a 12-token prompt Prefill went from 5.31 to 6.19 tok/s. The experts are moved from the host without DMA (AdaptiveCpp cannot register arbitrary host memory): 1,337 of them took 1,469 ms for 12 tokens.
+
+The configuration recommended on this PC is `--native`, `--expert-cache auto --expert-profile`, `--prefill auto`, `--spec 4 --spec-min-p 0.5 --mtp` and the default pool workers. `.tools/run-xestrata-fast.bat`, outside Git, starts it (context 4096; Decode 18.19 tok/s on the hello input).

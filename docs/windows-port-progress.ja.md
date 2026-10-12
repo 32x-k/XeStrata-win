@@ -593,3 +593,13 @@ verify window（`--spec`）は、残る前提（device residency table、`--expe
 hello入力、`--native`、expert cache auto（commitの空きで8,868〜8,923 slots）、`--expert-profile`、`--spec 4 --spec-min-p 0.5`、MTP、pool workersは既定（11 + host）で、Decodeは21.91、20.71 tok/sでした。生成した41 tokenは推測なしと同じです。12 roundで1 roundあたり3.33 token、下書きの採択率は90〜93%です。1 roundのうちCPU expertsが109〜117 ms、GPUの待ちが27〜29 msで、残る主な時間はCPU expertsです。CPU expertsはworker 3から11で148から115 ms/roundにしか減らず、mmapされたexpertの読み込み（RAM 27.6 GB、多くはSSD）に律速されていると考えられます。PrefillはcacheのあるときCPU経路のhitを通るため5 tok/s前後です。
 
 pool workersはこれまで`--pool-workers 3`で測っていました。推測なしの`--native`でも既定のworker数で13.39、13.85 tok/sです。
+
+<a id="cpu-side"></a>
+## 2026-10-13: CPU側の時間とprefill
+
+- pool workersは既定（物理core数から決まる11 + host）が速く、3から11で推測デコードのCPU expertsは148から115 ms/roundに減りました。比例しないのは、mmapされたexpertの読み込みに律速されているためと考えられます。
+- `--resident-budget-gib 6`は、空きRAMから8 GiBの余裕を引くと0 GiBに切り詰められ、効きませんでした。
+- expert cacheの大きさがそのまま効きます。同じ条件でcache 11.42 GiBのときDecode 21〜22 tok/s、13.35 GiBで23.00 tok/sでした。Windowsではdevice allocationがcommitを消費するため、cacheの上限はcommitの空き（page fileの大きさ）で決まります。
+- `--prefill auto`（batched prompt path）はWindowsでもそのまま動きました。191 token（計算問題の入力を繰り返したもの）のpromptで、Prefillは18.73 tok/s、Decodeは18.76 tok/sでした。1 tokenずつのpromptでは各tokenがexpertをmmapから読み直し、同じ入力で空きRAMが227 MiBまで下がったため途中で止めました。12 tokenのpromptでは5.31から6.19 tok/sです。expertのhostからの転送はDMAを使わず（AdaptiveCppでは任意のhost memoryを登録できない）、12 tokenでは1,337個の転送に1,469 msかかりました。
+
+このPCでの推奨構成は`--native`、`--expert-cache auto --expert-profile`、`--prefill auto`、`--spec 4 --spec-min-p 0.5 --mtp`、既定のpool workersです。Git対象外の`.tools/run-xestrata-fast.bat`がこの構成で起動します（context 4096、hello入力でDecode 18.19 tok/s）。
