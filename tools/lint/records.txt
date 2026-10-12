@@ -108,6 +108,7 @@ bench/results/2026-10-09-rope-yarn-long-context
 bench/results/2026-10-10-community-2x-p40-iq3_s
 bench/results/2026-10-10-community-rx-9060-xt
 bench/results/2026-10-10-community-rx-9070
+bench/results/2026-10-11-rtx-5090-callback-affinity
 bench/results/COMMUNITY.md
 bench/results/exchange-rotation-ab.json
 bench/results/exchange-rotation-token-ids.json
