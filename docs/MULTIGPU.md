@@ -112,7 +112,13 @@ A free slot before a busy one in its group is used first (upstream 2c7c02ab).
 `--batch-mtp` works on a layer split too (upstream 48f2c47d).
 The slots' drafters sit on the last GPU, and each slot's two rows pass every GPU.
 It is off when `--batch-groups` is given as 2 or more or `auto`, with two stages on one GPU, and with helper caches (`--expert-cache-device1..3`).
-`STRATA_SPLIT_MTP_BATCH=1` (opt-in, upstream a22a0e8c) builds the draft layer's prefill K/V in batches through the last GPU's prefill path, as one GPU does.
+On a layer split too, the draft layer's prefill K/V are built in batches through the last GPU's prefill path, as one GPU does (upstream a22a0e8c, opt-in there as `STRATA_SPLIT_MTP_BATCH=1`; the default here).
+On a B70 + RTX 4070 (IQ2_XS, K=45, a 32K prompt) prefill went from 2,350 to 2,424 tok/s.
+
+> **Note: with every expert in VRAM, consider turning it off with `STRATA_SPLIT_MTP_BATCH=0`.**
+> Upstream measured it 21.9% slower on two R9700s that held every expert.
+> It pays only when the experts do not fit the VRAM.
+> The drafter's K/V are built another way, so the drafts can differ a little (the tokens out do not: the verify window decides them).
 
 ### The CPU experts per stage (experimental)
 

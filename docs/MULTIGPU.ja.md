@@ -113,7 +113,13 @@ G は N を割り切る数です。
 `--batch-mtp` は層の分割でも動きます（upstream 48f2c47d）。
 スロットごとの下書き器は最後の GPU に置き、各スロットの 2 行が全部の GPU を通ります。
 コマンドラインで `--batch-groups` に 2 以上か `auto` を渡したとき、1 枚の GPU に 2 段を置くとき、補助のキャッシュ（`--expert-cache-device1..3`）があるときは無効です。
-`STRATA_SPLIT_MTP_BATCH=1`（opt-in、upstream a22a0e8c）は、下書き層の prefill の K/V を、1 枚のときと同じく最後の GPU の prefill の経路でまとめて作ります。
+層の分割でも、下書き層の prefill の K/V を、1 枚のときと同じく最後の GPU の prefill の経路でまとめて作ります（upstream a22a0e8c。upstream では `STRATA_SPLIT_MTP_BATCH=1` で入れる opt-in、ここでは既定）。
+B70 + RTX 4070（IQ2_XS、K=45、32K のプロンプト）では prefill が 2,350 → 2,424 tok/s になりました。
+
+> **注意: エキスパートが全部 VRAM に入る構成では、`STRATA_SPLIT_MTP_BATCH=0` で外すことを検討してください。**
+> upstream は、全部のエキスパートが VRAM にある 2 枚の R9700 で 21.9% 遅くなったと測っています。
+> 速くなるのは、エキスパートが VRAM に入りきらないときだけです。
+> 下書きの K/V の作り方が変わるので、下書きは少し変わることがあります（出るトークンは検証の窓で決まるので変わりません）。
 
 ### CPU のエキスパートを段ごとに分ける（実験的）
 

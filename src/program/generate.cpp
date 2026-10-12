@@ -6994,8 +6994,9 @@ int main(int argc, char** argv) {
             ckpt_staged_len = -1;
             return ok;
         };
-        // STRATA_SPLIT_MTP_BATCH=1 (opt-in, upstream a22a0e8c): a layer split's drafter is on the last stage, so E-9
-        // (Prefill::draft_kv) runs there, on the prompt path that ran the chunk, instead of the drafter's own pass.
+        // STRATA_SPLIT_MTP_BATCH (on by default here, opt-in upstream a22a0e8c; 0 turns it off, draft_kv_plan.hpp): a
+        // layer split's drafter is on the last stage, so E-9 (Prefill::draft_kv) runs there, on the prompt path that
+        // ran the chunk, instead of the drafter's own pass.
         // Its K/V come from the prompt path's products, not the drafter's own: the drafts may differ, the target's
         // tokens never.
         static const bool split_mtp_batch =
@@ -7003,7 +7004,7 @@ int main(int argc, char** argv) {
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
-            // E-9: batched through the prompt path when it can (a layer split: only with STRATA_SPLIT_MTP_BATCH=1)
+            // E-9: batched through the prompt path when it can (a layer split: not with STRATA_SPLIT_MTP_BATCH=0)
             bool batched = false;
             const strata::program::draft_kv::Plan dkv = strata::program::draft_kv::plan(
                 use_mtp, multi_gpu, split_mtp_batch, strata::core::native_embed() != nullptr);
@@ -7019,8 +7020,8 @@ int main(int argc, char** argv) {
                             std::fprintf(stderr, "strata serve: draft layer prompt K/V batched on CUDA%d (E-9 on the "
                                                  "layer split)\n", stages.back()->dev);
                         else
-                            std::fprintf(stderr, "strata serve: STRATA_SPLIT_MTP_BATCH=1 declined, the drafter's own "
-                                                 "pass runs: %s\n", why);
+                            std::fprintf(stderr, "strata serve: the batched draft layer prompt K/V declined, the "
+                                                 "drafter's own pass runs: %s\n", why);
                     }
                 }
             }

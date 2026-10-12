@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/program/draft_kv_plan_test.cpp - which path computes the draft layer's prompt K/V (header-only, CPU).
 //
-//   1. STRATA_SPLIT_MTP_BATCH: unset, empty, 0 and text that is not a number are off; any other whole number is on;
+//   1. STRATA_SPLIT_MTP_BATCH: 0 is off; unset, empty, any other whole number and text that is not a number are on;
 //   2. one GPU: the batched pass is tried whatever the variable says (the default before this change);
-//   3. a layer split: the default stays the drafter's own pass, silently; with the variable on the batched pass is
+//   3. a layer split: with the variable off, the drafter's own pass, silently; on (the default), the batched pass is
 //      tried, unless the pack has no GGUF-form token table, which is reported instead;
 //   4. no draft layer: nothing is tried and nothing is said.
 #include "strata/program/draft_kv_plan.hpp"
@@ -25,10 +25,10 @@ void check(bool ok, const char* what) {
 
 int main() {
     std::printf("draft_kv_plan_test\n");
-    check(!dkv::split_env_on(nullptr), "unset is off");
-    check(!dkv::split_env_on(""), "empty is off");
+    check(dkv::split_env_on(nullptr), "unset is on (the default)");
+    check(dkv::split_env_on(""), "empty is on");
     check(!dkv::split_env_on("0"), "0 is off");
-    check(!dkv::split_env_on("off"), "text that is not a number is off");
+    check(dkv::split_env_on("off"), "text that is not a number is on");
     check(dkv::split_env_on("1"), "1 is on");
     check(dkv::split_env_on("2"), "any other whole number is on");
 
