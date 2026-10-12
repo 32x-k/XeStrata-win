@@ -268,6 +268,28 @@ class ReportTests(unittest.TestCase):
             self.assertIn("+100.0%", table)
             self.assertIn("engine: 1.0 -> 9.9.9", table)
 
+    def test_only_the_gpus_the_engine_uses_are_listed(self):
+        """#1985: a PC with two cards, the engine on one: the report names that one, with its VRAM."""
+        srv = FakeStrata()
+        self.addCleanup(srv.stop)
+        two = {"gpus": [{"name": "NVIDIA GeForce RTX 3060", "vram_mib": 12288, "driver": "560.1"},
+                        {"name": "NVIDIA GeForce RTX 9999", "vram_mib": 16384, "driver": "560.1"}]}
+        with mock.patch.object(B, "gpu_info_local", return_value=two):
+            m = B.collect_machine(srv.base, "", {"gpu": 1})
+            self.assertEqual((m["gpu"], m["gpu_vram_mib"]), (["NVIDIA GeForce RTX 9999"], 16384))
+            m = B.collect_machine(srv.base, "", {"gpu": [0, 1]})
+            self.assertEqual((m["gpu"], m["gpu_vram_mib"]),
+                             (["NVIDIA GeForce RTX 3060", "NVIDIA GeForce RTX 9999"], 28672))
+            m = B.collect_machine(srv.base, "", {"gpu": "0"}, "1")            # the bench's own --gpu wins
+            self.assertEqual(m["gpu"], ["NVIDIA GeForce RTX 9999"])
+            m = B.collect_machine(srv.base, "", {"args": ["--gpu", "0"]})
+            self.assertEqual(m["gpu"], ["NVIDIA GeForce RTX 3060"])
+            # nothing selected: one card, the one the server reports (not every card of the PC)
+            m = B.collect_machine(srv.base, "", {})
+            self.assertEqual((m["gpu"], m["gpu_vram_mib"]), (["NVIDIA GeForce RTX 9999"], 16384))
+        self.assertEqual(B.gpu_selection({"gpu": "0,2"}), [0, 2])
+        self.assertEqual(B.gpu_selection({}, None), [])
+
     def test_names(self):
         m = {"gpu": ["NVIDIA GeForce RTX 3060"], "model": "Qwen3.8 Flash-Next", "quant": "IQ3_XXS"}
         self.assertEqual(B.results_dir_name(m, "2026-10-10"),

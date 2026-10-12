@@ -586,7 +586,29 @@ def git_commit() -> str | None:
     return out or None
 
 
-def collect_machine(base: str, key: str, cfg: dict | None) -> dict:
+def gpu_selection(cfg: dict | None, gpu_arg: str | None = None) -> list[int]:
+    """#1985: the GPU numbers (as nvidia-smi numbers them) the engine is told to use: the bench's --gpu when it starts
+    the server, else the config's "gpu" (one card, a list or "0,2"), else a "--gpu" in the config's args.  [] when
+    nothing says."""
+    def parse(v):
+        if v is None or v == "":
+            return []
+        items = v if isinstance(v, (list, tuple)) else str(v).split(",")
+        out = []
+        for x in items:
+            x = str(x).strip()
+            if x.isdigit():
+                out.append(int(x))
+        return out
+    sel = parse(gpu_arg) or parse((cfg or {}).get("gpu"))
+    if not sel:
+        args = [str(x) for x in ((cfg or {}).get("args") or [])]
+        if "--gpu" in args and args.index("--gpu") + 1 < len(args):
+            sel = parse(args[args.index("--gpu") + 1])
+    return sel
+
+
+def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None = None) -> dict:
     status = try_json(base, "/v1/status", key) or {}
     metrics = try_json(base, "/metrics", key, 30) or {}
     props = try_json(base, "/props", key) or {}
@@ -595,18 +617,27 @@ def collect_machine(base: str, key: str, cfg: dict | None) -> dict:
     eng = metrics.get("engine") or {}
     local = gpu_info_local()
     view = config_view(cfg) if cfg else {}
-    gpu_names = [g["name"] for g in local["gpus"]] or ([static["gpu_name"]] if static.get("gpu_name") else [])
+    # #1985: only the GPUs the engine uses - the config's / --gpu selection; with none given the engine runs on one card
+    # (the one the server reports), not on every card the PC has
+    used = local["gpus"]
+    sel = gpu_selection(cfg, gpu_arg)
+    if sel:
+        used = [local["gpus"][i] for i in sel if 0 <= i < len(local["gpus"])] or used
+    elif len(used) > 1 and static.get("gpu_name"):
+        named = [g for g in used if g["name"] == static["gpu_name"]]
+        used = named[:1] or used[:1]
+    gpu_names = [g["name"] for g in used] or ([static["gpu_name"]] if static.get("gpu_name") else [])
     m = status.get("machine") or {}
     vram_mib = (m.get("gpu") or {}).get("total_mib") or None
-    if local["gpus"] and local["gpus"][0].get("vram_mib"):
-        vram_mib = sum(g.get("vram_mib") or 0 for g in local["gpus"])
+    if used and used[0].get("vram_mib"):
+        vram_mib = sum(g.get("vram_mib") or 0 for g in used)
     n_ctx = None
     for d in models.get("data") or []:
         n_ctx = (d.get("meta") or {}).get("n_ctx") or n_ctx
     n_ctx = n_ctx or (props.get("default_generation_settings") or {}).get("n_ctx")
     return {
         "gpu": gpu_names, "gpu_vram_mib": vram_mib,
-        "gpu_driver": (local["gpus"][0].get("driver") if local["gpus"] else local.get("rocm_driver")),
+        "gpu_driver": (used[0].get("driver") if used else local.get("rocm_driver")),
         "cuda": local.get("cuda"), "cpu": static.get("cpu_name") or cpu_name(), "cpu_cores": static.get("cores"),
         "cpu_threads": static.get("threads") or os.cpu_count(), "ram_gib": total_ram_gib(),
         "os": f"{platform.system()} {platform.release()} ({platform.version()})" if os.name == "nt"
@@ -958,7 +989,7 @@ def main(argv=None) -> int:
                 print("The server did not become ready. Last log lines:\n" + red("\n".join(tail)), file=sys.stderr)
                 return 1
         t0 = time.time()
-        pre = collect_machine(base, key, cfg)
+        pre = collect_machine(base, key, cfg, a.gpu)
         suite = Suite(base, key, pre.get("context"), max(1, a.runs), a.think, log=say, want_clients=a.clients,
                       want_long=a.long)
         slots = pre.get("parallel_slots") or 1
@@ -967,7 +998,7 @@ def main(argv=None) -> int:
                 "wait their turn.")
         say("Running the suite (about 3-10 minutes) ...")
         out = suite.run()
-        machine = collect_machine(base, key, cfg)             # again: VRAM and the cache after the work
+        machine = collect_machine(base, key, cfg, a.gpu)      # again: VRAM and the cache after the work
         if not machine.get("gpu"):
             machine["gpu"] = pre.get("gpu")
         res = {"schema": SCHEMA, "tool": "tools/strata_bench.py", "date": datetime.date.today().isoformat(),
