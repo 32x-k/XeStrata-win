@@ -357,7 +357,28 @@ class EngineStuck(RuntimeError):
 
 class GpuBusy(RuntimeError):
     """The model is unloaded and the GPU has less free VRAM than min_free_vram_mib: something else (a game, another
-    model server) is using it, so the engine is not started into the little that is left."""
+    model server) is using it, so the engine is not started into the little that is left.  `retry_after`: seconds
+    for the Retry-After header of the 503."""
+
+    def __init__(self, message="", retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def unload_wait(value, default: float) -> float:
+    """#1997: the `wait` of POST /unload?wait=...: absent / 0 / false: 0 (answer "busy" at once, as before); 1 / true /
+    yes: `default` seconds; a number of seconds above 1: that long (at most an hour)."""
+    if value is None:
+        return 0.0
+    v = str(value).strip().lower()
+    if v in ("", "0", "false", "no", "off"):
+        return 0.0
+    if v in ("1", "true", "yes", "on"):
+        return default
+    try:
+        return min(3600.0, max(0.0, float(v)))
+    except ValueError:
+        return default
 
 
 ENGINE_REQUEST = re.compile(
@@ -1549,7 +1570,8 @@ class StrataEngine:
                         print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying another slot "
                               f"({refused}/{self.BGEN_REFUSALS_MAX}) (issue #1994)", flush=True)
                         if refused > self.BGEN_REFUSALS_MAX:
-                            raise GpuBusy("the engine's batch slots are not free right now; try again in a moment") from e
+                            raise GpuBusy("the engine's batch slots are not free right now; try again in a moment",
+                                          retry_after=5) from e
                         self.slot_live[slot] = None
                         self.slot_held[slot] = []
                         phase = "none"
@@ -2868,6 +2890,10 @@ class Service:
         self.idle_unload_s: float = 0
         self.min_free_vram_mib = 0
         self.before_load = None
+        self.before_load_timeout_s = 120.0               # #1997: how long the before_load command may run
+        self.before_load_ignore_failure = False          # #1997: load even when it fails, without a VRAM check
+        self.vram_free_wait_s = 15.0                     # how long a full card is waited on (memory given back)
+        self.before_load_strict = False                  # #1997: refuse (503) whenever it fails
         self.reasoning_loop_recovery = False
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply
@@ -3008,22 +3034,55 @@ class Service:
         the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
             return
+        hook_failed = None
         if self.before_load:
             cmd = self.before_load
             print(f"[strata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
+            why = None
             try:
-                subprocess.run(cmd, shell=isinstance(cmd, str), timeout=120, stdin=subprocess.DEVNULL)
+                r = subprocess.run(cmd, shell=isinstance(cmd, str), timeout=self.before_load_timeout_s,
+                                   stdin=subprocess.DEVNULL)
+                if r.returncode != 0:
+                    why = f"it exited with code {r.returncode}"
+            except subprocess.TimeoutExpired:
+                why = f"it did not finish in {self.before_load_timeout_s:g} s (before_load_timeout_s)"
             except (OSError, subprocess.SubprocessError) as e:
-                print(f"[strata] the before_load command failed ({e}); loading anyway", flush=True)
-        if self.min_free_vram_mib:
+                why = f"it could not run ({e})"
+            if why is not None:
+                # #1997: a failing hook (e.g. the other server's /unload that is still busy) may mean the GPU was not
+                # given back.  A peer that is simply not running also makes `curl` fail (exit 7), so the exit code alone
+                # does not refuse: the card's free VRAM decides (min_free_vram_mib, checked just below); "strict" always
+                # refuses, "ignore" always loads.
+                if self.before_load_strict and not self.before_load_ignore_failure:
+                    print(f"[strata] the before_load command failed ({why}); the model stays unloaded and this "
+                          "request is answered 503 - try again (before_load_strict)", flush=True)
+                    raise GpuBusy(f"the before_load command failed ({why}): the GPU was not given back, so the "
+                                  "model was not loaded; try again in a moment", retry_after=15)
+                hook_failed = why
+                if self.before_load_ignore_failure or not self.min_free_vram_mib:
+                    print(f"[strata] the before_load command failed ({why}); loading anyway"
+                          + ("" if self.before_load_ignore_failure else
+                             " (set min_free_vram_mib to have the free VRAM checked, or before_load_strict to refuse)"),
+                          flush=True)
+                else:
+                    print(f"[strata] the before_load command failed ({why}); checking the free VRAM", flush=True)
+        if self.min_free_vram_mib and not (hook_failed and self.before_load_ignore_failure):
             free = self.free_vram_mib()
-            deadline = time.time() + 15                 # memory another process just gave back can take a moment
+            deadline = time.time() + self.vram_free_wait_s   # memory another process just gave back can take a moment
             while free is not None and free < self.min_free_vram_mib and time.time() < deadline:
                 time.sleep(0.5)
                 free = self.free_vram_mib()
             if free is not None and free < self.min_free_vram_mib:
+                if hook_failed and not self.before_load_ignore_failure:
+                    print(f"[strata] the before_load command failed ({hook_failed}) and only {free} MiB of VRAM is "
+                          f"free (the model needs {self.min_free_vram_mib}): not loading; 503", flush=True)
                 raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
-                              f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free")
+                              f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free"
+                              + (f"; the before_load command failed ({hook_failed})" if hook_failed else ""),
+                              retry_after=15)
+            if hook_failed and not self.before_load_ignore_failure:
+                print(f"[strata] the before_load command failed ({hook_failed}), but {free} MiB of VRAM is free: "
+                      "loading", flush=True)
         vision_started = False
         if self._vision_down():                         # first, as at a start: a GPU encoder takes its VRAM before
             print("[strata] starting the vision encoder ...", flush=True)   # the engine sizes its cache
@@ -3126,6 +3185,18 @@ class Service:
             if counted:
                 with self.status_lock:
                     self.status["queued"] -= 1
+
+    UNLOAD_WAIT_S = 300.0       # #1997: POST /unload?wait=1 waits this long for the running turn (wait=<s> to choose)
+
+    def unload_waiting(self, wait_s: float) -> str:
+        """#1997: unload(), but a running or queued request is waited for (up to wait_s) instead of answering "busy":
+        a peer server that needs this GPU can then free the card on the server's terms.  "busy" after wait_s."""
+        deadline = time.monotonic() + max(0.0, wait_s)
+        while True:
+            r = self.unload()
+            if r != "busy" or time.monotonic() >= deadline:
+                return r
+            time.sleep(0.25)
 
     def unload(self, idle_for: float | None = None) -> str:
         """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
@@ -4915,7 +4986,7 @@ def make_handler(svc: Service):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-        def _json(self, code, obj):
+        def _json(self, code, obj, headers=None):
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
@@ -4927,6 +4998,8 @@ def make_handler(svc: Service):
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            for k, v in (headers or {}).items():
+                self.send_header(k, str(v))
             self._cors()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -5143,7 +5216,9 @@ def make_handler(svc: Service):
                 return
             if path == "/unload":                            # give the GPU back now (between requests)
                 try:
-                    r = svc.unload()
+                    wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
+                                         svc.UNLOAD_WAIT_S)
+                    r = svc.unload_waiting(wait_s) if wait_s else svc.unload()
                 except EngineStuck as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
@@ -5154,7 +5229,9 @@ def make_handler(svc: Service):
                     svc.load()
                     self._json(200, {"status": "loaded"})
                 except GpuBusy as e:
-                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                    ra = getattr(e, "retry_after", None)
+                    self._json(503, {"error": {"type": "server_error", "message": str(e)}},
+                               headers={"Retry-After": int(ra)} if ra else None)
                 return
             try:
                 req = json.loads(self._body() or b"{}")
@@ -5182,7 +5259,9 @@ def make_handler(svc: Service):
                         self._json(404, {"error": {"message": "model not found"}})
                         return
                     if path == "/v1/unload":
-                        result = svc.unload()
+                        wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
+                                             svc.UNLOAD_WAIT_S)
+                        result = svc.unload_waiting(wait_s) if wait_s else svc.unload()
                         if result == "busy":
                             raise ModelBusy("a request is running or queued")
                     else:
@@ -5236,7 +5315,9 @@ def make_handler(svc: Service):
                 self._json(502, {"error": {"type": "structured_output_failed", "code": "structured_output_failed",
                                            "message": str(e)}})
             except (GpuBusy, EngineStarting) as e:
-                self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                ra = getattr(e, "retry_after", None)       # #1997 / #1994: a refusal that is worth retrying
+                self._json(503, {"error": {"type": "server_error", "message": str(e)}},
+                           headers={"Retry-After": int(ra)} if ra else None)
             except (TypeError, KeyError, AttributeError, IndexError, UnicodeError) as e:
                 # a body that is JSON but the wrong shape ("messages": 5, a content part that is a number): a 400 that
                 # says so, with the traceback in the log, instead of a dropped connection - unless the answer began
@@ -6511,6 +6592,13 @@ def main() -> int:
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
+    try:
+        svc.before_load_timeout_s = float(cfg.get("before_load_timeout_s") or svc.before_load_timeout_s)
+    except (TypeError, ValueError):
+        print("[strata] \"before_load_timeout_s\" in the config is not a number; using "
+              f"{svc.before_load_timeout_s:g} s", flush=True)
+    svc.before_load_ignore_failure = cfg.get("before_load_ignore_failure") is True
+    svc.before_load_strict = cfg.get("before_load_strict") is True
     # --slot-save-path is relative to the working directory the server was started in; the config's slot_save_path
     # to the config's "cwd" (the engine's folder) when it has one.  Either way the engine gets an absolute path.
     if a.slot_save_path or cfg.get("slot_save_path"):

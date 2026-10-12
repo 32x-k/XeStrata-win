@@ -3271,6 +3271,97 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual(self.chat()[0], 200)
         self.assertTrue(mark.exists())
 
+    def _raw_chat(self):
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        r = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                   headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                return resp.status, dict(resp.headers), json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, dict(e.headers), json.loads(e.read())
+
+    def test_failing_before_load_with_free_vram_still_loads(self):
+        """#1997: a peer that is not running makes `curl` exit 7; the card has room, so the model loads."""
+        self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(7)"]
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 20000
+        self.svc.unload()
+        self.assertEqual(self._raw_chat()[0], 200)
+        self.assertEqual(self.engine.starts, 1)
+
+    def test_failing_before_load_with_full_vram_refuses_with_503_and_retry_after(self):
+        self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(3)"]
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 2000
+        self.svc.unload()
+        self.svc.vram_free_wait_s = 0.2                              # (not the 15 s wait for memory)
+        status, headers, body = self._raw_chat()
+        self.assertEqual(status, 503)
+        self.assertIn("exited with code 3", body["error"]["message"])
+        self.assertTrue(int(headers["Retry-After"]) > 0)
+        self.assertFalse(self.engine.alive())
+        self.assertEqual(self.engine.starts, 0)
+        self.svc.free_vram_mib = lambda: 20000                      # the peer let go: the next try loads
+        self.assertEqual(self._raw_chat()[0], 200)
+
+    def test_before_load_strict_refuses_even_with_free_vram(self):
+        self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(7)"]
+        self.svc.before_load_strict = True
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 20000
+        self.svc.unload()
+        status, headers, body = self._raw_chat()
+        self.assertEqual(status, 503)
+        self.assertTrue(int(headers["Retry-After"]) > 0)
+        self.assertEqual(self.engine.starts, 0)
+
+    def test_failing_before_load_without_a_vram_limit_loads(self):
+        self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(7)"]
+        self.svc.unload()
+        self.assertEqual(self._raw_chat()[0], 200)
+
+    def test_before_load_timeout_is_configurable_and_a_timeout_refuses(self):
+        self.svc.before_load = [sys.executable, "-c", "import time; time.sleep(30)"]
+        self.svc.before_load_timeout_s = 0.5
+        self.svc.before_load_strict = True
+        self.svc.unload()
+        t0 = time.time()
+        status, headers, body = self._raw_chat()
+        self.assertEqual(status, 503)
+        self.assertLess(time.time() - t0, 10)
+        self.assertIn("before_load_timeout_s", body["error"]["message"])
+        self.assertFalse(self.engine.alive())
+
+    def test_before_load_failure_can_be_ignored_by_config(self):
+        self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(1)"]
+        self.svc.before_load_ignore_failure = True
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 2000                       # full, but ignore means load
+        self.svc.unload()
+        self.assertEqual(self._raw_chat()[0], 200)
+
+    def test_unload_wait_waits_for_the_running_turn(self):
+        """#1997: POST /unload answers busy at once (409); with ?wait=1 it waits for the turn and then unloads."""
+        self.svc.fifo.acquire()
+        threading.Timer(1.0, self.svc.fifo.release).start()
+        t0 = time.time()
+        self.assertEqual(self.req("/unload", {}), (409, {"status": "busy"}))
+        self.assertLess(time.time() - t0, 0.9)
+        status, body = self.req("/unload?wait=1", {})
+        self.assertEqual((status, body), (200, {"status": "unloaded"}))
+        self.assertGreaterEqual(time.time() - t0, 0.9)
+        self.assertFalse(self.engine.alive())
+
+    def test_unload_wait_gives_up_after_the_given_seconds(self):
+        with self.svc.fifo:
+            t0 = time.time()
+            self.assertEqual(self.req("/unload?wait=0.6", {}),
+                             (409, {"status": "busy"}))
+            self.assertLess(time.time() - t0, 5)
+        self.assertTrue(self.engine.alive())
+
     def test_vision_encoder_unloads_and_starts_first(self):
         order = []
 
