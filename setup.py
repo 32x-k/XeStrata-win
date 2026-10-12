@@ -299,6 +299,7 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
     "ornith": {"title": "Ornith-1.5-35B-A3B", "by": "Ornith AI (MIT)",
                "about": "35B, 3B active; a Qwen3.5 MoE: Q4_K_M to BF16, and community GSQ-RCO 3 and 3.5 bits",
                "tag": "ornith-", "name": "ornith-1.5-35b-a3b", "max_context": 262144, "plain": True,
+               "profile": "expert-profile-ornith.bin",
                "models": {
                    "Q4_K_M": {"repo": _ORNITH, "file": "Ornith-1.5-35B-Q4_K_M.gguf", "size": 21713463040,
                               "sha256": "42739874cc2ccfdb8523b23fbe52e29b2a7555c8176737ca9ca0b5d59859d41f",
@@ -328,6 +329,7 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
     "llmjp": {"title": "llm-jp-4.1-32b-a3b-thinking", "by": "LLM-jp (Apache-2.0)",
               "about": "32B, 3B active; Japanese and English, a thinking model", "tag": "llmjp-",
               "name": "llm-jp-4.1-32b-a3b-thinking", "max_context": 262144, "plain": True,
+              "profile": "expert-profile-llmjp.bin",
               "models": {
                   "Q4_K_M": {"repo": _LLMJP, "file": "llm-jp-4.1-32b-a3b-thinking-Q4_K_M.gguf", "size": 21522488192,
                              "sha256": "52fea46f306928802ef189f1483b022a4431a97af7fb9f48dbc56e957713f561",
@@ -3369,6 +3371,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     # ---- 7. the settings
     step(7, "writing the model's settings" if PACKAGED else "writing the start script")
     args = ["--native", str(gguf), "--max-context", str(ctx)]
+    if fam.get("profile"):                             # the experts filled into VRAM at start, most routed first
+        args += ["--expert-profile", str(ROOT / "data" / fam["profile"])]
     if a.vram_reserve_mib is not None:
         warn("--vram-reserve-mib is not available for this model yet: not used")
     cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(STATE),
