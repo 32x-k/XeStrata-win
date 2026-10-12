@@ -641,6 +641,20 @@ bool PlainModel::open_experts(std::string& err) {
     cache_.set_max_piece(max_alloc_bytes());   // in pieces where the tier passes the device's largest allocation
     if (!cache_.open_sized(slot_bytes, L, E, err)) return false;
     n_slots_ = (int64_t) slot_bytes.size();
+    // every expert has its slot and VRAM is left beside the tier: the prompt's buffers there, for the longest chunk
+    // they fit (prompt_borrow then lends no slot, so the prompt reads no expert from RAM)
+    if (q == E && opt_.prompt_chunk > 0 && prompt_host_ != nullptr) {
+        const uint64_t left = room - per_layer_b * (uint64_t) q;
+        for (int64_t T = opt_.prompt_chunk; T >= 16; T /= 2) {
+            uint64_t db = 0, hb = 0;
+            prompt_carve(T, pb_, nullptr, nullptr, db, hb);
+            if (db <= left && db <= max_alloc_bytes() && strata::gpu::alloc_device(&prompt_dev_, (size_t) db)) {
+                allocs_.push_back(prompt_dev_);
+                prompt_dev_T_ = T;
+                break;
+            }
+        }
+    }
     res_.assign((size_t) (L * E), -1);
     heat_.assign((size_t) (L * E), 0.0);
     if (!strata::gpu::alloc_host(&fill_tmp_, (size_t) lay.max_blob)) {
@@ -724,6 +738,9 @@ bool PlainModel::open_experts(std::string& err) {
                          "%d CPU workers, %lld MiB free before the tier\n",
                  (long long) L, (long long) E, (long long) n_slots_, (long long) q, (double) cache_.bytes() / 1073741824.0,
                  pool_->workers(), (long long) (free_b >> 20));
+    if (prompt_dev_ != nullptr)
+        std::fprintf(stderr, "strata plain: the prompt's buffers beside the tier, chunks of up to %lld tokens\n",
+                     (long long) prompt_dev_T_);
     return true;
 }
 

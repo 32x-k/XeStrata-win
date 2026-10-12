@@ -244,6 +244,10 @@ private:
                       uint64_t& host_bytes) const;
     PromptBufs pb_;
     void* prompt_host_ = nullptr;
+    /// The prompt's device buffers of their own, for chunks of up to prompt_dev_T_ tokens, when every expert has a
+    /// slot and the VRAM beside the tier holds them (else null: prompt_borrow lends the tier's last slots).
+    void* prompt_dev_ = nullptr;
+    int64_t prompt_dev_T_ = 0;
     /// The prompt's device buffers, carved from the tier's last slots for one prompt (prompt_borrow) and given back
     /// after it (prompt_return), with the experts that were in them put back: the tier keeps that memory between
     /// prompts.  The slots go to the layers in turn (slot s is layer s % L's), so the last ones are every layer's.

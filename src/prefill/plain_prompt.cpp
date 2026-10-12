@@ -98,15 +98,30 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     // the chunk's device bytes from the tier's last slots: halved until they take at most half the tier, within its
     // last piece (the slots lie back to back only inside one)
     uint64_t db = 0, hb = 0;
+    const int64_t want = T;
     int64_t first = n;
     const int64_t lowest = std::max<int64_t>(n / 2, cache_.last_piece_first());
     for (;; T /= 2) {
-        if (T < 16) { err = "plain prompt: the VRAM tier is too small for the prompt's buffers"; return false; }
+        if (T < 16) break;
         prompt_carve(T, pb_, nullptr, nullptr, db, hb);
         first = n;
         while (first > lowest && off[n] - off[first] < db) --first;
         if (off[n] - off[first] >= db) break;
     }
+    // the buffers of their own when their chunk is no shorter than the borrowed one: no slot lent, prompt_return
+    // gives back none
+    if (prompt_dev_ != nullptr && (T < 16 || std::min(want, prompt_dev_T_) >= T)) {
+        const int64_t pieces = (want + prompt_dev_T_ - 1) / prompt_dev_T_;   // even chunks: no short last one
+        T = (want + pieces - 1) / pieces;
+        borrowed_res_.clear();
+        borrow_first_ = n;
+        prompt_carve(T, pb_, (uint8_t*) prompt_dev_, (uint8_t*) prompt_host_, db, hb);
+        PromptGemm& g = prompt_gemm();
+        g.gemm.rebind(pb_.gemm_scratch, pb_.gemm_elems);
+        g.identity = false;
+        return true;
+    }
+    if (T < 16) { err = "plain prompt: the VRAM tier is too small for the prompt's buffers"; return false; }
     borrowed_res_.clear();
     for (int64_t l = 0; l < L; ++l)
         for (int64_t e = 0; e < E; ++e) {
