@@ -192,8 +192,15 @@ void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionS
 }
 
 bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionState& s, const float* parts,
-                     SessionGraphs& gr, std::string& err, bool split, bool doorbell) {
+                     SessionGraphs& gr, std::string& err, bool split, bool doorbell, const float* y_miss) {
     if (gr.captured) return true;
+    if (y_miss != nullptr && (doorbell || s.db == nullptr || s.db->h_x_f == nullptr || s.db->h_ids == nullptr ||
+                              s.db->h_weights == nullptr)) {
+        err = "session_capture: staged copies need doorbell false and the doorbell's host staging";
+        return false;
+    }
+    const size_t x_bytes = (size_t) g.n_embd * sizeof(float);
+    const size_t parts_bytes = (size_t) s.k * x_bytes;
     gr.execs = new strata::gpu::Graph*[(size_t) g.n_layers];
     gr.posts = new strata::gpu::Graph*[(size_t) g.n_layers];
     for (int64_t i = 0; i < g.n_layers; ++i) gr.posts[i] = nullptr;
@@ -233,11 +240,21 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
             err.clear();
             // R0.9: `half` is 0 for every mode except the split capture, where it selects a prefix of the
             // stages so the mixer and the FFN-front-plus-router can be timed separately.
+            // the staged copies, as session_token_pool makes them: only into the full pre and post graphs
+            const bool staged = y_miss != nullptr && half == 0 && stage_prefix == 0;
             const bool ok = post
-                                ? block_layer_post(tables, g, l, s.k, s.moe, s.block, parts, (void*) cs, err)
+                                ? (!staged || strata::gpu::copy_async(const_cast<float*>(parts), y_miss,
+                                                                      parts_bytes, cs)) &&
+                                  block_layer_post(tables, g, l, s.k, s.moe, s.block, parts, (void*) cs, err)
                                 : block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k,
                                                   s.block, (void*) cs, err, doorbell ? s.db : nullptr,
-                                                  s.ple.ready() ? &s.ple : nullptr, half, stage_prefix);
+                                                  s.ple.ready() ? &s.ple : nullptr, half, stage_prefix) &&
+                                  (!staged ||
+                                   (strata::gpu::copy_async(s.db->h_x_f, s.block.mixed, x_bytes, cs) &&
+                                    strata::gpu::copy_async(s.db->h_ids, s.moe.ids, (size_t) s.k * sizeof(int32_t),
+                                                            cs) &&
+                                    strata::gpu::copy_async(s.db->h_weights, s.moe.weights,
+                                                            (size_t) s.k * sizeof(float), cs)));
             if (!ok) {
                 strata::gpu::abandon_capture(cs);
                 strata::gpu::stream_destroy(cs);
@@ -270,6 +287,7 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
     }
     gr.captured = true;
     gr.parts_dev = const_cast<float*>(parts);   // the address the graphs baked in; the loop copies here
+    gr.staged_y_miss = y_miss;
     return true;
 }
 
@@ -867,6 +885,55 @@ bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64
     QsaState unused_qsa;
     // the captured QSA layers read their position from the pinned staging, which `pre` fills only when it runs
     if (graphs != nullptr) stage_token(g, pos, pos_base, s);
+
+    // ---- THE DIRECT LOOP: the graphs carry the copies, and the layers run on a HIP stream of their own, so a
+    // layer is one launch, one wait and one launch.  Through the runtime each of the five steps it replaces
+    // (launch, three downloads and a wait, upload, launch) was a submission of its own.
+    void* hs = (graphs != nullptr && graphs->staged_y_miss == scratch.y_miss && hits == nullptr &&
+                dump_layers == nullptr && !sync_every_layer)
+                   ? strata::gpu::direct_stream() : nullptr;
+    if (hs == nullptr && graphs != nullptr && graphs->staged_y_miss != nullptr) {
+        // the graphs would repeat the copies this path makes (and overwrite the hits' combine)
+        err = "session_token_pool: graphs with staged copies need the direct loop (no hits, dumps or layer syncs)";
+        return false;
+    }
+    if (hs != nullptr) {
+        // what the engine stream was given for this token (embedding, PLE) before the layers read it
+        if (!measured(&PoolTiming::final_drain, [&] { return strata::gpu::stream_sync(cs); }))
+            return gpu_error("drain before the layers");
+        bool ok = true;
+        try {
+            for (layer = 0; layer < g.n_layers && ok; ++layer) {
+                ok = measured(&PoolTiming::pre_submit, [&] {
+                         return strata::gpu::direct_graph_launch(graphs->execs[layer], hs);
+                     }) &&
+                     measured(&PoolTiming::routing_wait, [&] { return strata::gpu::direct_sync(hs); });
+                if (!ok) break;
+                if (pool != nullptr)
+                    measured(&PoolTiming::cpu_pool, [&] {
+                        pool(user, s.db->h_x_f, s.db->h_ids, s.db->h_weights, g.n_embd, s.k, scratch.y_miss);
+                        return true;
+                    });
+                else
+                    std::memset(scratch.y_miss, 0, parts_bytes);
+                ok = measured(&PoolTiming::post_submit, [&] {
+                    return strata::gpu::direct_graph_launch(graphs->posts[layer], hs);
+                });
+            }
+        } catch (const std::exception& e) {
+            err = "session_token_pool: layer " + std::to_string(layer) + ": " + e.what();
+            ok = false;
+        }
+        if (!ok && err.empty())
+            err = "session_token_pool: layer " + std::to_string(layer) + ": " + strata::gpu::last_error();
+        // the layers' results before the engine stream reads them, and the staging before it is reused
+        if (!measured(&PoolTiming::final_drain, [&] { return strata::gpu::direct_sync(hs); })) {
+            if (!err.empty()) err += "; ";
+            err += "session_token_pool: final sync: " + std::string(strata::gpu::last_error());
+            return false;
+        }
+        return ok;
+    }
     auto run = [&]() -> bool {
         if (dump_layers != nullptr && !measured(&PoolTiming::dump_d2h_submit, [&] {
                 return strata::gpu::copy_async(dump_layers, s.block.R, residual_bytes, cs);

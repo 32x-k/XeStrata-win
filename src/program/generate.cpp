@@ -4497,19 +4497,25 @@ int main(int argc, char** argv) try {
     // --stage-timing records its events between the kernels, which a graph would not carry
     const bool pool_graphs =
         o.no_capture && pool_fn != nullptr && !native_pack && pool_graphs_wanted && !o.stage_timing;
-    if (pool_graphs) {
-        if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages, /*doorbell=*/false)) {
+    // With the copies in the graphs (`y_miss`), the layers run on the direct stream; captured after the loop's
+    // scratch below, except for --gpu-stages, which measures the graphs before any token and stops.
+    auto capture_pool_graphs = [&](const float* y_miss) -> bool {
+        if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages, /*doorbell=*/false,
+                                           y_miss)) {
             std::fprintf(stderr, "strata generate: session_capture (pool graphs): %s\n", err.c_str());
-            return 1;
+            return false;
         }
         size_t pre_nodes = 0, post_nodes = 0;
         for (int64_t l = 0; l < gr.n; ++l) {
             pre_nodes += strata::gpu::graph_nodes(gr.execs[l]);
             post_nodes += strata::gpu::graph_nodes(gr.posts[l]);
         }
-        std::fprintf(stderr, "strata generate: the pool path replays %lld layer graph pairs (%zu + %zu nodes)\n",
-                     (long long) gr.n, pre_nodes, post_nodes);
-    }
+        std::fprintf(stderr, "strata generate: the pool path replays %lld layer graph pairs (%zu + %zu nodes)%s\n",
+                     (long long) gr.n, pre_nodes, post_nodes,
+                     y_miss != nullptr ? " on a direct stream, the copies in the graphs" : "");
+        return true;
+    };
+    if (pool_graphs && o.gpu_stages && !capture_pool_graphs(nullptr)) return 1;
 
     // The direct path with a pool uses session_token_pool: each layer's routing is downloaded, computed
     // and combined before the next layer. session_token remains the explicit --no-pool ablation.
@@ -4921,6 +4927,12 @@ int main(int argc, char** argv) try {
     if (!loop_scratch.init((size_t) K * g.n_embd * 4, err)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
+    }
+    if (pool_graphs && !gr.captured) {
+        // the copies go into the graphs only where session_token_pool will take the direct loop
+        const bool direct = hit_fn == nullptr && layer_stage == nullptr && !o.sync_every_layer &&
+                            strata::gpu::direct_stream() != nullptr;
+        if (!capture_pool_graphs(direct ? loop_scratch.y_miss : nullptr)) return 1;
     }
     // Plan v0.3 P3: the whole token as ONE graph whenever nothing needs a host step between the ring and post[l]
     // (the VRAM expert tier and the per-layer dumps do).  `--no-token-graph` keeps two graphs per layer.

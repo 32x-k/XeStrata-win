@@ -150,6 +150,10 @@ struct SessionGraphs {
     /// THE DEVICE ADDRESS THE GRAPHS WERE CAPTURED WITH.  The host loop copies each layer's expert outputs
     /// here before launching the next layer, and a graph bakes the POINTER, so it has to be this one.
     float* parts_dev = nullptr;
+    /// The pinned host staging the graphs copy to and from, when captured with it (`session_capture`'s `y_miss`):
+    /// `pre[l]` ends by downloading the routing into `s.db`'s host staging and `post[l]` starts by uploading
+    /// `y_miss` into `parts_dev`.  Null: the caller copies.
+    const float* staged_y_miss = nullptr;
 
     /// **DIAGNOSTIC, AND IT IS THE ONE THAT SAYS WHETHER THE DOORBELL IS DECORATIVE.**
     ///
@@ -230,9 +234,12 @@ struct SessionGraphs {
 /// 211-214 moved the per-token counts into device buffers.
 ///
 /// `doorbell` false captures `pre` without the doorbell's ring and mapped publication, for `session_token_pool`,
-/// which downloads the routing with explicit copies instead.
+/// which downloads the routing with explicit copies instead.  With `doorbell` false, a pinned host `y_miss`
+/// (`parts`' size) puts those copies into the graphs: the routing download at the end of `pre[l]` (into `s.db`'s
+/// host staging) and the upload of `y_miss` into `parts` at the start of `post[l]`.
 bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionState& s, const float* parts,
-                     SessionGraphs& gr, std::string& err, bool split = false, bool doorbell = true);
+                     SessionGraphs& gr, std::string& err, bool split = false, bool doorbell = true,
+                     const float* y_miss = nullptr);
 
 /// One token by REPLAYING the captured graphs.  Identical arithmetic to `session_token`; the only difference is
 /// that ~2,000 kernel launches become 48 graph launches.
@@ -424,6 +431,9 @@ struct PoolTiming {
 /// It must stay alive through return; the final stream drain completes its ordered copies.
 /// Optional `graphs`, captured by `session_capture` with `doorbell` false on this `parts`: `pre[l]` and `post[l]`
 /// are replayed instead of submitted kernel by kernel, and the position is staged for them (`stage_token`).
+/// Graphs captured with `scratch.y_miss` staged, no hits, no dumps and no per-layer sync run the layers on
+/// `strata::gpu::direct_stream()` where there is one: one launch, one wait and one launch per layer, with
+/// `stream` drained before the layers and the direct stream after them.
 bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,
                         SessionState& s, float* parts, PoolFn pool, HitFn hits, void* user,
                         SessionLoopScratch& scratch, void* stream, bool sync_every_layer, std::string& err,

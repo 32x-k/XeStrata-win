@@ -149,6 +149,7 @@ struct HipApi {
     int (*event_sync)(void* event) = nullptr;
     int (*event_elapsed)(float* ms, void* from, void* to) = nullptr;
     int (*event_destroy)(void* event) = nullptr;
+    int (*stream_sync)(void* stream) = nullptr;
     bool memory() const { return get_device && set_device && mem_get_info; }
     bool graphs() const {
         return begin_capture && end_capture && graph_nodes && instantiate && graph_launch && graph_destroy &&
@@ -190,6 +191,7 @@ const HipApi& hip() {
         get(a.event_sync, "hipEventSynchronize");
         get(a.event_elapsed, "hipEventElapsedTime");
         get(a.event_destroy, "hipEventDestroy");
+        get(a.stream_sync, "hipStreamSynchronize");
         return a;
     }();
     return api;
@@ -844,6 +846,46 @@ bool graph_launch(const Graph* g, Stream s) {
 #else
     try { q(s).ext_oneapi_graph(g->exec); return true; }
     catch (const std::exception& e) { return fail("graph_launch", e); }
+#endif
+}
+
+void* direct_stream() {
+#if defined(STRATA_ADAPTIVECPP)
+    // the HIP stream of a native in-order queue of the current device that nothing else submits to
+    static void* stream = [] {
+        try {
+            if (!hip().graphs() || !hip().stream_sync) return (void*) nullptr;
+            return hip_stream(*rt().create_capture_stream());
+        } catch (const std::exception& e) { fail("direct_stream", e); return (void*) nullptr; }
+    }();
+    return stream;
+#else
+    return nullptr;
+#endif
+}
+
+bool direct_graph_launch(const Graph* g, void* hs) {
+    if (!g || !hs) { g_error = "direct_graph_launch: null graph or stream"; return false; }
+#if defined(STRATA_ADAPTIVECPP)
+    if (const int rc = hip().graph_launch(g->hip_exec, hs)) {
+        g_error = hip_error("direct_graph_launch", rc);
+        return false;
+    }
+    return true;
+#else
+    g_error = "direct_graph_launch: no direct stream in this build";
+    return false;
+#endif
+}
+
+bool direct_sync(void* hs) {
+    if (!hs) { g_error = "direct_sync: null stream"; return false; }
+#if defined(STRATA_ADAPTIVECPP)
+    if (const int rc = hip().stream_sync(hs)) { g_error = hip_error("direct_sync", rc); return false; }
+    return true;
+#else
+    g_error = "direct_sync: no direct stream in this build";
+    return false;
 #endif
 }
 

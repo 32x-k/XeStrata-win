@@ -561,3 +561,14 @@ pool経路のgraphで`--gpu-stages`も使えるようにしました（`session_
 GDN層は0.44 ms/層、QSA層は0.50 ms/層です。prefixの差分による5区間の表は、差分法とsweep法でずれが大きく（router区間で-91%など）、区間ごとの細かい値には使えません。
 
 graphありの通常実行では、Routing待機が約95 ms/位置、CPU poolが約30 ms/位置です。GPUの計算は約35 msなので、Routing待機の約60 msは層ごとの受け渡し（graph起動、3回のD2H、event待機、parts H2D、`post`の起動を、AdaptiveCppのDAG queueでそれぞれ投入する費用）と考えられます。次はこの受け渡しを減らします。
+
+<a id="direct-loop"></a>
+## 2026-10-13: 層の受け渡しを専用のHIP streamで直接行う
+
+graphを使っても、層ごとに`pre`の起動、3回のD2H、event待機、parts H2D、`post`の起動を、それぞれAdaptiveCppのDAG queueへ投入していました。routingのD2Hを`pre[l]`の最後に、partsのH2Dを`post[l]`の最初に入れて記録し（`session_capture`の`y_miss`）、層のループの間はengineのqueueを通さず専用のHIP stream（`strata::gpu::direct_stream`）にgraphを直接起動します。1層は`pre`の起動、`hipStreamSynchronize`、CPU pool、`post`の起動だけになります。層の前にengine streamを1回drainし、層の後にdirect streamを1回同期して、embedding、PLE、headとの順序を保ちます。
+
+hit path（expert cache）、層のdump、層ごとの同期を使うときは、copyを含まないgraphで従来の受け渡しを使います。copyを含むgraphが従来の受け渡しへ渡されると、copyが重複してhitのcombineを上書きするため、`session_token_pool`はエラーで止めます。
+
+hello入力、cache 0で、Decodeは8.87、9.00 tok/s、Prefillは7.27、7.48 tok/sでした（直前のgraphだけの版は7.15、7.05 tok/sと5.98、6.00 tok/s）。全logitsは従来の受け渡しとbit単位で一致しました（helloの53位置、計算問題の66位置）。cache autoでは従来の受け渡しに戻り、生成した41 tokenも同じです。
+
+Routing待機は約80 ms/位置、CPU poolは約35 ms/位置です。CPU poolを省いた診断（出力は正しくない）ではRouting待機が約54 msで、GPUの計算約35 msとの差の約19 msは、48回のgraph起動と完了待ちの費用（1層約0.4 ms）です。完了待ちを`hipStreamQuery`のspinにしても変わらず、wake-upの遅れではありません。CPU poolがあるときに増える約22 msは、GPUが待つ間のclock低下などが考えられますが、確かめていません。これらの診断用の切り替えはcommitしていません。

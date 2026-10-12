@@ -128,6 +128,13 @@ bool stream_fork(Stream from, Stream to);
 bool stream_join(Stream into, Stream from);
 bool is_capturing(Stream s);
 bool graph_launch(const Graph* g, Stream s);
+/// A HIP stream of the device outside the SYCL runtime (AdaptiveCpp on HIP; null elsewhere), on which graphs are
+/// launched directly: a loop of graph launches and waits then takes no runtime submission per step.  Work given
+/// to engine streams is not ordered with it: the caller synchronizes at the boundaries.
+void* direct_stream();
+bool direct_graph_launch(const Graph* g, void* hs);
+/// Waits for everything launched on `hs` (hipStreamSynchronize).
+bool direct_sync(void* hs);
 size_t graph_nodes(const Graph* g);
 /// Destroys a graph after draining the runtime's queues (null is a no-op).
 void graph_destroy(Graph* g);

@@ -561,3 +561,14 @@ In the AdaptiveCpp build a timing event was a marker kernel without timestamps, 
 GDN layers take 0.44 ms each, QSA layers 0.50 ms. The five-stage table from prefix differences disagrees widely with the sweep (-91% for the router, for example), so its per-stage values are not usable.
 
 In a normal run with graphs, the Routing wait is about 95 ms per position and the CPU pool about 30 ms. The GPU computes for about 35 ms, so about 60 ms of the Routing wait is the hand-off between layers: the graph launch, three D2H copies, the event wait, the parts H2D and the `post` launch, each submitted through AdaptiveCpp's DAG queue. That hand-off is the next target.
+
+<a id="direct-loop"></a>
+## 2026-10-13: the layer hand-off on a HIP stream of its own
+
+Even with graphs, each layer submitted the `pre` launch, three D2H copies, an event wait, the parts H2D and the `post` launch to AdaptiveCpp's DAG queue one by one. The routing D2H is now recorded at the end of `pre[l]` and the parts H2D at the start of `post[l]` (`session_capture`'s `y_miss`), and during the layer loop the graphs are launched directly on a HIP stream of their own (`strata::gpu::direct_stream`), bypassing the engine's queue. A layer is the `pre` launch, `hipStreamSynchronize`, the CPU pool and the `post` launch. The engine stream is drained once before the layers and the direct stream synchronized once after them, which keeps the order with the embedding, PLE and head.
+
+With the hit path (expert cache), layer dumps or per-layer syncs, graphs without the copies and the earlier hand-off are used. Graphs with the copies given to the earlier hand-off would repeat the copies and overwrite the hits' combine, so `session_token_pool` stops with an error instead.
+
+On the hello input with cache 0, Decode was 8.87 and 9.00 tok/s and Prefill 7.27 and 7.48 tok/s (the graph-only version before it: 7.15 and 7.05, 5.98 and 6.00). All logits matched the earlier hand-off bitwise (53 positions of hello, 66 of the arithmetic input). With cache auto it falls back to the earlier hand-off and generates the same 41 tokens.
+
+The Routing wait is about 80 ms per position and the CPU pool about 35 ms. In a diagnostic without the CPU pool (whose output is not correct) the Routing wait was about 54 ms; the ~19 ms above the ~35 ms of GPU compute is the cost of 48 graph launches and waits (about 0.4 ms a layer). Spinning on `hipStreamQuery` instead of waiting changed nothing, so it is not a wake-up delay. The ~22 ms added with the CPU pool may be the GPU's clock dropping while it waits, which is not checked. These diagnostic switches are not committed.
