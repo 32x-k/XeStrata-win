@@ -26,6 +26,8 @@ held, on the IQ3_S 4-way rig).
 
 A routing trace comes from a one-shot engine run with `--dump-routing FILE` (a prompt typical of your use; the
 routed experts of every layer and position are written).  Point the model config's `--expert-profile` at the result.
+A trace that starts with `XRT1` is dump_routing's (llama.cpp's routing of one conversation, the models other than
+Qwen3.8-Flash-Next): its rows are the routing layers in order, so give `--n-layer` and `--n-expert` with `--no-base`.
 """
 import argparse
 import struct
@@ -48,9 +50,22 @@ def read_profile(path, n_expert=N_EXPERT):
 
 
 def read_trace(path, n_expert=N_EXPERT):
-    """(layer, k, k expert ids, k weights) records, as `--dump-routing` writes them."""
+    """(layer, k, k expert ids, k weights) records, as `--dump-routing` writes them; or dump_routing's XRT1 file
+    (uint32 n_layer and k, then per token a phase byte, the token and n_layer * k uint16 expert ids)."""
     blob = Path(path).read_bytes()
     off, freq = 0, defaultdict(int)
+    if blob[:4] == b"XRT1":
+        nl, k = struct.unpack_from("<2I", blob, 4)
+        if nl != N_LAYER:
+            raise SystemExit(f"{path}: {nl} routing layers, not {N_LAYER} (--n-layer)")
+        off, row = 12, 5 + 2 * nl * k
+        while off + row <= len(blob):
+            ids = struct.unpack_from("<%dH" % (nl * k), blob, off + 5)
+            for i, e in enumerate(ids):
+                if e < n_expert:
+                    freq[(i // k, e)] += 1
+            off += row
+        return freq
     while off + 8 <= len(blob):
         layer, k = struct.unpack_from("<ii", blob, off)
         off += 8
@@ -101,6 +116,7 @@ def rank_profile(base_pairs, trace_freq, n_expert=N_EXPERT, no_base=False, reord
 
 
 def main():
+    global N_LAYER
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("traces", nargs="*", help="routing traces from --dump-routing")
     ap.add_argument("--base", default=str(ROOT / "data" / "expert-profile.bin"), help="ranking to keep first")
@@ -110,7 +126,9 @@ def main():
                          "base that already ranks every pair, where --base alone cannot change the order")
     ap.add_argument("--out", default=str(ROOT / "data" / "expert-profile.bin"))
     ap.add_argument("--n-expert", type=int, default=N_EXPERT, help="experts per layer (default 512)")
+    ap.add_argument("--n-layer", type=int, default=N_LAYER, help="MoE layers (default 48)")
     a = ap.parse_args()
+    N_LAYER = a.n_layer
 
     ne = a.n_expert
     freq = defaultdict(int)
