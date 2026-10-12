@@ -4,6 +4,7 @@
 #include "strata/kernels/prompt_attn.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_target.hpp"
+#include "amd_wmma.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -291,14 +292,6 @@ struct WmmaKernel {
     }
 };
 
-// GFX11 and GFX12, as SYCL reports the architecture (iq_mmq.cpp's amd_wmma: the values carry the version)
-bool amd_wmma(const sycl::device& d) {
-    namespace syclex = sycl::ext::oneapi::experimental;
-    if (d.get_backend() != sycl::backend::ext_oneapi_hip) return false;
-    const auto a = static_cast<uint64_t>(d.get_info<syclex::info::device::architecture>());
-    return a >= static_cast<uint64_t>(syclex::architecture::amd_gpu_gfx1100) && a < 0x0200000000130000ull;
-}
-
 template <int HD, int G, int BQ>
 void launch_wmma(sycl::queue& q, const float* qv, const uint16_t* kp, const uint16_t* vp, const int32_t* table,
                  int64_t pos0, int64_t T, const QsaShapes& s, float* attn) {
@@ -341,7 +334,7 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
         return v != nullptr && std::strtol(v, nullptr, 10) == 0;
     }();
     bool mma = false;
-    if (!no_mma && amd_wmma(queue.get_device())) {
+    if (!no_mma && xe::amd_wmma(queue.get_device())) {
         // a wave per 16 rows: 5 for llm-jp's 8 queries of 10 heads, 4 for 8 queries of 8 (local memory 25 to 43 KiB)
         mma = true;
         if (s.head_dim == 128 && g == 10) launch_wmma<128, 10, 8>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);

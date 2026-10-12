@@ -24,6 +24,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "device_target.hpp"
+#include "amd_wmma.hpp"
 #include "strata/core/per_device.hpp"
 #include "iq_bits.hpp"
 #include "cuda_intrinsics.hpp"
@@ -858,14 +859,6 @@ bool env_on(const char* name) {
     return v != nullptr && std::strtol(v, nullptr, 10) != 0;
 }
 
-// RDNA3 and RDNA4, whose int8 WMMA the kernels' STRATA_IQ_MMQ_WMMA body takes: the device's architecture as SYCL
-// reports it, AMD's GFX11 and GFX12 (the architecture values carry the version: 0x0200000000110000 is gfx1100).
-bool amd_wmma(const sycl::device& d) {
-    if (d.get_backend() != sycl::backend::ext_oneapi_hip) return false;
-    const auto a = static_cast<uint64_t>(d.get_info<syclex::info::device::architecture>());
-    return a >= static_cast<uint64_t>(syclex::architecture::amd_gpu_gfx1100) && a < 0x0200000000130000ull;
-}
-
 bool shape_reported(const sycl::device& d) {
     const auto sgs = d.get_info<sycl::info::device::sub_group_sizes>();
     if (std::find(sgs.begin(), sgs.end(), (size_t) SG) == sgs.end()) return false;
@@ -917,7 +910,7 @@ bool iq_mmq_usable(sycl::queue& q) {
     return per_device.get(q.get_device(), [&q] {
         if (env_on("STRATA_NO_XMX")) return false;
         const sycl::device d = q.get_device();
-        const bool wmma = amd_wmma(d);
+        const bool wmma = xe::amd_wmma(d);   // its int8 WMMA: the STRATA_IQ_MMQ_WMMA body
         if (!wmma && !shape_reported(d)) return false;
         using Big = Kernel<16, 2, 2>;
         if (d.get_info<sycl::info::device::local_mem_size>() < (size_t) Big::LOCAL ||

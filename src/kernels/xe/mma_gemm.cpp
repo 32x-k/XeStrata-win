@@ -16,6 +16,7 @@
 // file; in the default 128 registers they spilled), 14.2 (a fragment's rows contiguous) and 13.6 (16-byte stores).
 // DP4a takes 20.  Loading the next step into registers while multiplying, to store it after, spilled (91-103 ms).
 #include "mma_gemm.hpp"
+#include "amd_wmma.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "device_target.hpp"
 #include "strata/core/per_device.hpp"
@@ -43,7 +44,8 @@ using bf16_t = sycl::ext::oneapi::bfloat16;
 
 // A joint_matrix tile shape and the sub-group size it is built for: Intel Xe2's 8 x 16 x 16 on 16 lanes (to check this
 // code there; xmx_gemm.cpp's kernels are the fast ones on Xe2), Intel Xe-HPG's 8 x 8 x 16 on 8 (the Arc A series, whose
-// runtime refuses xmx_gemm's prefetches and checked loads) and NVIDIA's 16 x 16 x 16 on 32 (a warp); the work-group's
+// runtime refuses xmx_gemm's prefetches and checked loads) and NVIDIA's 16 x 16 x 16 on 32 (a warp; RDNA3's and RDNA4's
+// WMMA take it too, through amd_wmma.hpp); the work-group's
 // layout for a product (dense) and for the experts' groups (grouped); packed: B in Intel's VNNI layout.  Xe-HPG's
 // layouts from the A380's timings (the 2026-10-04-dg2-dp4a record): a product 4 x 8 sub-groups of 4 x 4 tiles in the
 // large register file (13.6 ms for the product above; 8 x 4: 14.4, 4 x 4: 15.4; 2 x 2 tiles in 128 registers, 8 x 8
@@ -99,11 +101,12 @@ constexpr int PAD = 8;            // column-major B's row stride is KC + PAD (16
 constexpr int VEC = 8;            // values a work-item copies at once (16 bytes)
 
 // Whether this device compile carries shape S's kernels: Intel's shapes only Intel's, NVIDIA's only the others (an
-// AMD GPU has joint_matrix on CDNA's matrix cores only, which these shapes are not).
+// AMD GPU has joint_matrix on CDNA's matrix cores only, which these shapes are not: RDNA3 and RDNA4 take NVIDIA's shape
+// through their WMMA instructions).
 template<int S>
 constexpr bool built() {
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
-    return false;
+    return S == 2 && STRATA_AMD_WMMA;
 #else
     return kShapes[S].sg < 32 ? !STRATA_DEVICE_NOT_INTEL : true;
 #endif
@@ -226,6 +229,65 @@ struct Kernel {
         constexpr bool arch_ok = STRATA_NV_ARCH == 0 || STRATA_NV_ARCH >= (std::is_same_v<E, bf16_t> ? 800 : 700);
         if constexpr (!built<S>() || !arch_ok) {
             (void) it;
+        } else if constexpr (STRATA_AMD_WMMA) {
+#if STRATA_AMD_WMMA
+            // RDNA3 and RDNA4: the same steps as below, the tiles through the WMMA instructions (amd_wmma.hpp), the
+            // accumulators straight to Y (a lane's elements are column lane % 16 of 8 rows)
+            const int64_t g = (int64_t) it.get_group(0), ex = g / (tiles_m * tiles_n), r = g % (tiles_m * tiles_n);
+            const int64_t wm0 = r % tiles_m * WM, wn0 = r / tiles_m * WN;
+            const int64_t row0 = bounds ? bounds[ex] : 0, rows = bounds ? bounds[ex + 1] - row0 : T;
+            if (wm0 >= rows) return;
+            const int64_t kb = bounds ? 0 : ex * kslice, ke = bounds ? K : sycl::min(K, kb + kslice);
+            const E* x = X + row0 * K;
+            const E* w = W + (bounds ? ex * w_stride : 0);
+            float* y = Y + (bounds ? row0 * ldy : ex * T * ldy);
+            const auto sg = it.get_sub_group();
+            const int sgid = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+            const int lid = (int) it.get_local_id(0);
+            const int ms = sgid / NSGN * SGM * TM, ns = sgid % NSGN * SGN * TN;
+            const auto ap = as.template get_multi_ptr<sycl::access::decorated::no>();
+            const auto bp = bs.template get_multi_ptr<sycl::access::decorated::no>();
+            wmma::C c[SGM][SGN];
+            for (int i = 0; i < SGM; ++i)
+                for (int j = 0; j < SGN; ++j) wmma::fill(sg, c[i][j], 0.0f);
+            stage<E, WM, LDA, false>(x, wm0, rows, K, kb, as, 0, lid, NSG * SG);
+            stage<E, WN, LDB, false>(w, wn0, N, K, kb, bs, 0, lid, NSG * SG);
+            sycl::group_barrier(it.get_group());
+            V8 va[NVA], vb[NVB];
+            for (int64_t k0 = kb; k0 < ke; k0 += KC) {
+                const bool more = k0 + KC < ke;
+                if (more) {
+                    fetch<WM, NVA>(x, wm0, rows, K, k0 + KC, lid, va);
+                    fetch<WN, NVB>(w, wn0, N, K, k0 + KC, lid, vb);
+                }
+                for (int kk = 0; kk < KC; kk += TK) {
+                    wmma::A<E> a[SGM];
+                    wmma::Bc<E> b[SGN];
+                    for (int i = 0; i < SGM; ++i) wmma::load(sg, a[i], ap + (ms + i * TM) * LDA + kk, LDA);
+                    for (int j = 0; j < SGN; ++j) wmma::load(sg, b[j], bp + (ns + j * TN) * LDB + kk, LDB);
+                    for (int i = 0; i < SGM; ++i)
+                        for (int j = 0; j < SGN; ++j) wmma::mad(sg, c[i][j], a[i], b[j], c[i][j]);
+                }
+                if (more) {
+                    sycl::group_barrier(it.get_group());
+                    put<WM, LDA, NVA>(as, 0, lid, va);
+                    put<WN, LDB, NVB>(bs, 0, lid, vb);
+                }
+                sycl::group_barrier(it.get_group());
+            }
+            const int lo = lane & 15, hi = lane >> 4;
+            for (int i = 0; i < SGM; ++i)
+                for (int j = 0; j < SGN; ++j) {
+                    const int64_t n = wn0 + ns + (int64_t) j * TN + lo;
+                    if (n >= N) continue;
+                    for (int e = 0; e < 8; ++e) {
+                        const int64_t row = wm0 + ms + (int64_t) i * TM + wmma::row_of(hi, e);
+                        if (row >= rows) continue;
+                        float* o = y + row * ldy + n;
+                        *o = ACC ? *o + c[i][j].v[e] : c[i][j].v[e];
+                    }
+                }
+#endif
         } else {
             const int64_t g = (int64_t) it.get_group(0), ex = g / (tiles_m * tiles_n), r = g % (tiles_m * tiles_n);
             // M first: the work-groups that read a tile of W run side by side and find it in L2 (N first, a 52 MB W
@@ -419,6 +481,9 @@ int shape(const sycl::queue& q, bool bf16) {
     static core::PerDevice<Shapes> per_device;
     const Shapes& s = per_device.get(q.get_device(), [&q] {
         const auto pick = [&q](mx::matrix_type in) {
+            // RDNA3 and RDNA4 report no combination (see built): their WMMA takes NVIDIA's shape, FP16 and BF16
+            if (amd_wmma(q.get_device()) && !(in == mx::matrix_type::bf16 && no_bf16_mma()))
+                return groups_layout_fits(2, q) ? 2 : -1;
             for (int i = 0; i < (int) std::size(kShapes); ++i)
                 if (reported(q.get_device(), in, kShapes[i])) return groups_layout_fits(i, q) ? i : -1;
             return -1;
