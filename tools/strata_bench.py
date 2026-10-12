@@ -629,7 +629,14 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
     gpu_names = [g["name"] for g in used] or ([static["gpu_name"]] if static.get("gpu_name") else [])
     m = status.get("machine") or {}
     vram_mib = (m.get("gpu") or {}).get("total_mib") or None
-    if used and used[0].get("vram_mib"):
+    # #2001: the server names the cards it reads (" + " between them).  A name nvidia-smi does not list means the
+    # engine runs on another vendor's card (an Intel Arc beside a GeForce): the server's names are the right ones, and
+    # so is its VRAM total - the PC's NVIDIA cards were not used.
+    served = [n for n in (static.get("gpu_name") or "").split(" + ") if n and n != "?"]
+    if served and not all(n in {g["name"] for g in local["gpus"]} for n in served):
+        gpu_names, used = served, []
+        local = {**local, "cuda": None}            # the PC's CUDA belongs to cards the engine did not use
+    elif used and used[0].get("vram_mib"):
         vram_mib = sum(g.get("vram_mib") or 0 for g in used)
     n_ctx = None
     for d in models.get("data") or []:
@@ -732,9 +739,19 @@ def gpu_slug(machine: dict) -> str:
     names = machine.get("gpu") or []
     if not names:
         return "cpu"
-    n = re.sub(r"(?i)\b(nvidia|geforce|amd|radeon|intel|graphics|corporation)\b", " ", names[0])
-    s = slug(n, 30)
-    return s if len(names) == 1 else f"{len(names)}x-{s}"
+    # #2062: the cards one by one when they differ (rtx-5070-ti-plus-rtx-a4000), "2x-" only for identical ones
+    groups: list[list] = []                              # [name, count], in the order the cards are listed
+    for name in names:
+        same = next((g for g in groups if g[0] == name), None)
+        if same:
+            same[1] += 1
+        else:
+            groups.append([name, 1])
+    parts = []
+    for name, count in groups:
+        n = re.sub(r"(?i)\b(nvidia|geforce|amd|radeon|intel|graphics|corporation)\b", " ", name)
+        parts.append(slug(n, 30) if count == 1 else f"{count}x-{slug(n, 30)}")
+    return "-plus-".join(parts)[:80].strip("-")
 
 
 def model_label(machine: dict) -> str:

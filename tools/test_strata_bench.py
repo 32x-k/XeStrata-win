@@ -290,6 +290,26 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(B.gpu_selection({"gpu": "0,2"}), [0, 2])
         self.assertEqual(B.gpu_selection({}, None), [])
 
+    def test_the_slug_names_mixed_cards_one_by_one(self):
+        """#2062: two different cards are not N copies of the first."""
+        a, b = "NVIDIA GeForce RTX 5070 Ti", "NVIDIA RTX A4000"
+        self.assertEqual(B.gpu_slug({"gpu": [a]}), "rtx-5070-ti")
+        self.assertEqual(B.gpu_slug({"gpu": [a, b]}), "rtx-5070-ti-plus-rtx-a4000")
+        self.assertEqual(B.gpu_slug({"gpu": [b, a]}), "rtx-a4000-plus-rtx-5070-ti")
+        self.assertEqual(B.gpu_slug({"gpu": [b, b]}), "2x-rtx-a4000")
+        self.assertEqual(B.gpu_slug({"gpu": [b, a, b]}), "2x-rtx-a4000-plus-rtx-5070-ti")
+
+    def test_a_card_the_pc_s_nvidia_smi_does_not_list_is_the_servers_own(self):
+        """#2001: the engine on an Intel Arc beside a GeForce: the report names the Arc (the name the server reads)."""
+        srv = FakeStrata()
+        self.addCleanup(srv.stop)
+        nv = {"gpus": [{"name": "NVIDIA GeForce RTX 3080 Ti", "vram_mib": 12288, "driver": "560.1"}], "cuda": "12.6"}
+        with mock.patch.object(B, "gpu_info_local", return_value=nv), mock.patch.object(
+                B, "try_json", side_effect=lambda base, path, *a, **k: (
+                    {"hardware_static": {"gpu_name": "Intel Arc Pro B70"}} if path == "/metrics" else {})):
+            m = B.collect_machine(srv.base, "", {"backend": "sycl"})
+        self.assertEqual((m["gpu"], m["cuda"]), (["Intel Arc Pro B70"], None))
+
     def test_names(self):
         m = {"gpu": ["NVIDIA GeForce RTX 3060"], "model": "Qwen3.8 Flash-Next", "quant": "IQ3_XXS"}
         self.assertEqual(B.results_dir_name(m, "2026-10-10"),
