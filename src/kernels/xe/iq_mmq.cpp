@@ -429,6 +429,18 @@ template<> struct Dec<kNativeQ6KRows> {   // Q6_K split by row (native_mmvq.hpp)
     }
 };
 
+template<> struct Dec<kNativeQ8Rows> {   // Q8_0 split by row (native_mmvq.hpp): a row's qs, then its d
+    static constexpr int QK = 32, BSZ = (int) sizeof(block_q8_0);
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+        const size_t bpr = row_bytes / BSZ;
+        const uint8_t* qs = row + (size_t) sb * 32;
+        Sub r;
+        for (int j = 0; j < 8; ++j) r.v[j] = (uint32_t) get_int_b4(qs, j);
+        r.s0 = r.s1 = (float) *reinterpret_cast<const sycl::half*>(row + bpr * 32 + (size_t) sb * 2);
+        return r;
+    }
+};
+
 template<int TY>
 constexpr bool half_scales() { return TY == 17 || TY == 22 || TY == 29 || TY == 14 || TY == kNativeQ6KRows || TY == 10 || TY == 11; }
 template<int TY>
@@ -943,7 +955,7 @@ bool iq_mmq_type_sums(int t) { return t == 12 || t == 13; }   // has_min
 
 bool iq_mmq_type_ok(int t) {
     switch (t) {
-        case 6: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows:
+        case 6: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows: case kNativeQ8Rows:
         case 16: case 17: case 18: case 20: case 21: case 22: case 23: case 29: case 42: return true;
         default: return false;
     }
@@ -959,6 +971,7 @@ size_t iq_mmq_row_bytes(int t, int64_t cols) {
         case 8: return (size_t) (cols / Dec<8>::QK) * Dec<8>::BSZ;
         case 14: return (size_t) (cols / Dec<14>::QK) * Dec<14>::BSZ;
         case kNativeQ6KRows: return (size_t) (cols / Dec<kNativeQ6KRows>::QK) * Dec<kNativeQ6KRows>::BSZ;
+        case kNativeQ8Rows: return (size_t) (cols / Dec<kNativeQ8Rows>::QK) * Dec<kNativeQ8Rows>::BSZ;
         case 16: return (size_t) (cols / Dec<16>::QK) * Dec<16>::BSZ;
         case 17: return (size_t) (cols / Dec<17>::QK) * Dec<17>::BSZ;
         case 18: return (size_t) (cols / Dec<18>::QK) * Dec<18>::BSZ;
@@ -1028,6 +1041,7 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         STRATA_MMQ_CASE(13);
         STRATA_MMQ_CASE(14);
         STRATA_MMQ_CASE(kNativeQ6KRows);
+        STRATA_MMQ_CASE(kNativeQ8Rows);
         STRATA_MMQ_CASE(16);
         STRATA_MMQ_CASE(17);
         STRATA_MMQ_CASE(18);

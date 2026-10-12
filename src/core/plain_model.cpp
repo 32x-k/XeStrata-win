@@ -55,6 +55,7 @@ namespace {
 namespace k = strata::kernels;
 
 constexpr int kQ6K = 14;
+constexpr int kQ80 = 8;
 constexpr int kBF16 = 30;   // a BF16 file's projections: bf16_gemv_fp32_mmvf_multi on the FP32 rows
 constexpr int kF32 = 0;
 
@@ -124,6 +125,9 @@ bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::
     if (w.type == kQ6K && k::native_q6_k_rows_ok(w.n_in)) {   // the same results, each row's loads aligned
         k::native_q6_k_to_rows(d, w.n_in, w.n_out, cs_);
         w.type = k::kNativeQ6KRows;
+    } else if (w.type == kQ80 && k::native_q8_0_rows_ok(w.n_in)) {   // as Qwen3.8's dense weights (native_dense)
+        k::native_q8_0_to_rows(d, w.n_in, w.n_out, cs_);
+        w.type = k::kNativeQ8Rows;
     }
     w.data = d;
     return true;
