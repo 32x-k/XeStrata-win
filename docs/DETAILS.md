@@ -257,6 +257,8 @@ An engine started by hand with neither `--resident-experts` nor `--mmap-experts`
 With every expert in RAM, the move into the GPU driver's memory (host USM) for the PCIe share takes a layer only while the RAM has room for it and `STRATA_HOST_USM_RESERVE_MIB` (default 1024) more; otherwise nothing moves and the CPU computes the missed experts.
 
 - If the experts the GPU does not hold fit the RAM, they are copied into RAM once at start (`--resident-experts`).
+  The copy is page-locked only when the RAM left free after it is more than 8 GiB and what is still read from the model files (the experts neither on the GPU nor in the copy) together (issue #11: a B70 with 31 GB of RAM and 17.5 GiB page-locked stalled the GPU's copies while the files were read again).
+  The engine says at start which it chose, with the numbers. `STRATA_RESIDENT_PIN=0` never page-locks it, `1` always does.
   The server then moves the adaptive tier's swaps (exchanges between the RAM copy and the GPU cache) on a helper
   thread between verify windows (`--adapt-async`, opt-in upstream in b437b8ea, the default here).
   No window waits for a whole round of swaps.

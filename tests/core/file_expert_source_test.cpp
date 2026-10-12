@@ -336,7 +336,7 @@ void test_rotating_source(bool rotate, bool pin) {
     }
     const std::vector<std::pair<int32_t, int32_t>> rank{{0,0},{0,1},{0,2},{0,3},{0,4}};
     // Keep expert 4 on the file tier to check that the fallback survives rotation.
-    require(src.pin_cache_complement(cache, err, pin, {}, -1, 0, 2 * bytes, &rank), err);
+    require(src.pin_cache_complement(cache, err, pin ? FileExpertSource::Pin::on : FileExpertSource::Pin::off, {}, -1, 0, 2 * bytes, &rank), err);
     require(src.reserve_exchanges(2, err), err);
     require(src.exchange_rotation() == (rotate && pin), "rotation activation/fallback wrong");
     require(src.reserve_exchanges(1, err), "smaller capacity rejected");

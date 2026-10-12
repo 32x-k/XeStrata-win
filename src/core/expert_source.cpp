@@ -292,6 +292,24 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     return true;
 }
 
+bool resident_pin_fits(uint64_t copy, uint64_t in_place, uint64_t headroom, uint64_t available, std::string& why) {
+    const double gib = 1073741824.0;
+    const uint64_t left = available > copy ? available - copy : 0;
+    const bool fits = available > 0 && left >= headroom && left - headroom >= in_place;
+    char b[512];
+    std::snprintf(b, sizeof b,
+                  fits ? "the %.2f GiB RAM copy is page-locked: of %.2f GiB available, %.2f GiB stays beside it for the "
+                         "%.2f GiB still read from the model's files and the %.0f GiB headroom"
+                       : "the %.2f GiB RAM copy stays pageable (#11): of %.2f GiB available, %.2f GiB stays beside it, "
+                         "less than the %.2f GiB still read from the model's files and the %.0f GiB headroom (memory "
+                         "page-locked there faulted the GPU's copies when the files paged; STRATA_RESIDENT_PIN=1 locks it "
+                         "anyway)",
+                  (double) copy / gib, (double) available / gib, (double) left / gib, (double) in_place / gib,
+                  (double) headroom / gib);
+    why = b;
+    return fits;
+}
+
 std::string page_cache_hint(const std::string& meminfo_text) {
     const auto kib = [&](const char* key) -> uint64_t {
         std::istringstream in(meminfo_text);
@@ -908,7 +926,7 @@ const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) cons
 }
 
 bool FileExpertSource::pin_cache_complement(
-    const ExpertCache& cache, std::string& err, bool pin,
+    const ExpertCache& cache, std::string& err, Pin pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
     uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
     err.clear();
@@ -948,6 +966,7 @@ bool FileExpertSource::pin_cache_complement(
     if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, primary_gpu_pairs,
                                             additional_gpu_pairs, offsets, bytes, err)) return false;
     const bool what_fits = budget_bytes == kResidentWhatFits;   // #467: the soft mode's second try
+    const int64_t lend_asked = lend_from_slot;   // #11: the lent slots whose experts stay on the files are read again
     uint64_t budget_physical = 0;   // #403: the RAM reading a budget was sized from (0: no budget)
     if (budget_bytes > 0) {
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while
@@ -1005,10 +1024,10 @@ bool FileExpertSource::pin_cache_complement(
 
     const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
     uint64_t budget = std::numeric_limits<uint64_t>::max();
+    uint64_t physical = budget_physical;
     if (bytes > 0 || lend) {
         // #403: with a budget, the reading it was sized from - a second reading a few MB lower (the engine's own
         // allocations, the file cache) failed a budget the first one had clamped.  (A budget turns `lend` off.)
-        uint64_t physical = budget_physical;
         if (physical == 0 && !available_memory_bytes(physical)) {
             err = "FileExpertSource: cannot determine available RAM for the resident-memory safety check";
             return false;
@@ -1049,6 +1068,30 @@ bool FileExpertSource::pin_cache_complement(
         }
     }
 
+    // #11: page-locked only when the RAM beside the copy holds what is still read from the files - the experts neither
+    // on a GPU nor in the copy, and the prompt's lent slots' experts the copy does not keep
+    bool lock = pin == Pin::on;
+    if (pin == Pin::automatic && bytes > 0) {
+        std::vector<char> on_gpu((size_t) (n_layers_ * n_expert_), 0);
+        using Pairs = std::vector<std::pair<int32_t, int32_t>>;
+        for (const Pairs* pairs : {static_cast<const Pairs*>(&primary_gpu_pairs), &additional_gpu_pairs})
+            for (const auto& [l, e] : *pairs)
+                if (l >= 0 && e >= 0 && l < n_layers_ && e < n_expert_) on_gpu[(size_t) l * (size_t) n_expert_ + (size_t) e] = 1;
+        uint64_t in_place = 0;
+        for (size_t i = 0; i < on_gpu.size(); ++i)
+            if (!on_gpu[i] && offsets[i] == kNoComplement) in_place += layer_blob_bytes_[i / (size_t) n_expert_];
+        if (lend_asked >= 0)
+            for (size_t i = 0; i < primary_gpu_pairs.size(); ++i) {
+                const auto [l, e] = primary_gpu_pairs[i];
+                if (pair_slot[i] >= lend_asked && offsets[(size_t) l * (size_t) n_expert_ + (size_t) e] == kNoComplement)
+                    in_place += layer_blob_bytes_[(size_t) l];
+            }
+        if (physical == 0 && !available_memory_bytes(physical)) physical = 0;
+        std::string why;
+        lock = detail::resident_pin_fits(bytes, in_place, headroom_bytes, physical, why);
+        std::fprintf(stderr, "FileExpertSource: %s\n", why.c_str());
+    }
+
     void* arena = nullptr;
     const uint8_t* host = nullptr;
     const uint8_t* device = nullptr;
@@ -1073,9 +1116,9 @@ bool FileExpertSource::pin_cache_complement(
     };
     if (bytes > 0) {
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
-                     (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
+                     (double) bytes / 1073741824.0, lock ? "page-locked" : "pageable resident");
         std::fflush(stderr);
-        if (pin) {
+        if (lock) {
             const bool allocated = strata::gpu::alloc_host(&arena, (size_t) bytes);
             if (allocated == true) {
                 void* alias = nullptr;

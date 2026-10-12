@@ -317,7 +317,8 @@ struct Options {
     bool resident_cpu_experts = false;
     /// the RAM tier page-locked and mapped, so the prompt path copies its experts by DMA (--resident-experts and
     /// --resident-budget-gib, as upstream: pageable, the RTX 4070 read UD-Q4_K_XL's 32K prompt with every expert
-    /// staged by the CPU); STRATA_RESIDENT_PIN=0 keeps it pageable
+    /// staged by the CPU), when the RAM beside it holds what is still read from the files (#11);
+    /// STRATA_RESIDENT_PIN=0 keeps it pageable, 1 locks it whatever the RAM
     bool resident_pin = false;
     std::string shared_expert_arena;
     bool coupled_draft = strata::core::coupled_draft_env();
@@ -5755,8 +5756,12 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> other_gpus;
         for (const auto& st : stages)
             other_gpus.insert(other_gpus.end(), st->profile.begin(), st->profile.begin() + st->held);
+        // STRATA_RESIDENT_PIN=0: never page-locked, 1: always; else as the RAM allows (#11)
+        using Pin = strata::core::FileExpertSource::Pin;
         const char* pin_env = std::getenv("STRATA_RESIDENT_PIN");
-        const bool pin = o.resident_pin && !(pin_env != nullptr && std::strcmp(pin_env, "0") == 0);
+        const Pin pin = !o.resident_pin || (pin_env != nullptr && std::strcmp(pin_env, "0") == 0) ? Pin::off
+                        : pin_env != nullptr && std::strcmp(pin_env, "1") == 0 ? Pin::on
+                                                                               : Pin::automatic;
         if (!src.pin_cache_complement(xcache, err, pin, other_gpus, lend_from, 8ull << 30, budget,
                                       stages.empty() ? &profile : &profile_all) ||
             (o.adapt_every > 0 && o.adapt_swaps > 0 && !src.reserve_exchanges(o.adapt_swaps, err))) {
