@@ -232,6 +232,7 @@ endif()
 add_executable(platform_memory_test src/platform/memory_test.cpp)
 target_link_libraries(platform_memory_test PRIVATE strata_platform)
 add_test(NAME platform_memory_test COMMAND platform_memory_test)
+set_tests_properties(platform_memory_test PROPERTIES SKIP_RETURN_CODE 77)   # ulimit -l below the region
 
 # Plan v0.3 P2: the n-gram table read straight from the SSD. The selftest needs only the CPU and a temp file.
 add_executable(ple_reader_test src/ngram/ple_reader_test.cpp)
