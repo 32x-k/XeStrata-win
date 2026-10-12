@@ -3687,15 +3687,21 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        // Recommend, never force: when the default direct reads measure slow, switch to the mapped reads (40-100x
-        // faster on the reporters' drives); an explicit --ple-io direct is kept and only warned about.
+        // Recommend, never force: when the default direct reads measure slow, say so.  The switch to the mapped reads
+        // (40-100x faster on some DRAM-less NVMe drives) is made only with STRATA_PLE_AUTO_MMAP=1 (upstream #2040: the
+        // 15K rows/s bar is NVMe-calibrated, a SATA SSD tops out at 10-14K with direct's 16 reads in flight, and mapped
+        // reads were 7x slower there); an explicit --ple-io direct is kept and only warned about.
         if (pio.mode == strata::kernels::PleIo::Direct && std::getenv("STRATA_PLE_PROBE") == nullptr) {
             constexpr double kSlowRowsPerS = 15000.0;   // ~60 MB/s of 4 KiB pages; a healthy NVMe is >100k
             const double rps = ple_direct_rows_per_s(ple_table);
             if (rps >= kSlowRowsPerS)
                 std::fprintf(stderr, "strata generate: PLE direct read probe: %.0f rows/s (fine)\n", rps);
+            static const bool auto_mmap = [] {
+                const char* v = std::getenv("STRATA_PLE_AUTO_MMAP");
+                return v != nullptr && std::strtol(v, nullptr, 10) == 1;
+            }();
             if (rps > 0 && rps < kSlowRowsPerS) {
-                if (!o.ple_io_explicit) {
+                if (!o.ple_io_explicit && auto_mmap) {
                     std::fprintf(stderr, "strata generate: --ple-io direct measures slow here (%.0f rows/s, about %.0f MB/s of "
                                          "random 4 KiB reads): using --ple-io mmap instead (the OS file cache holds the pages; "
                                          "--ple-io direct forces the old mode, --ple-io ram keeps the table in RAM)\n",
@@ -3710,8 +3716,10 @@ int main(int argc, char** argv) {
                 } else {
                     std::fprintf(stderr, "strata generate: WARNING: --ple-io direct measures slow here (%.0f rows/s, about %.0f "
                                          "MB/s of random 4 KiB reads): a prompt can spend minutes reading layer 1 and trip the "
-                                         "stall watchdog (#1425, #1629). --ple-io mmap was 40-100x faster on such drives; "
-                                         "--ple-io ram needs the RAM for the table\n", rps, rps * 4096.0 / 1e6);
+                                         "stall watchdog (#1425, #1629). --ple-io mmap was 40-100x faster on some DRAM-less "
+                                         "NVMe drives but 7x slower on a SATA SSD (#2040), so it is not chosen for you; "
+                                         "--ple-io ram needs the RAM for the table%s\n", rps, rps * 4096.0 / 1e6,
+                                 o.ple_io_explicit ? "" : " (kept direct: pass --ple-io mmap or --ple-io ram to change it)");
                 }
             }
         }
