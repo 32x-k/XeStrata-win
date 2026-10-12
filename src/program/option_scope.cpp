@@ -43,7 +43,6 @@ const char* const kNotYet[] = {
     "--no-pool", "--no-host-worker", "--no-hit-poke", "--no-publish-kernel", "--no-split-rows", "--pipeline-windows",
     "--sync-every-layer", "--short-read", "--rope-freq-base", "--rope-freq-scale", "--yarn-attn-factor",
     "--yarn-beta-fast", "--yarn-beta-slow", "--yarn-ext-factor", "--turn-token", "--tail-role-token",
-    "--expert-profile-save-every",
 };
 
 bool listed(const char* const* first, const char* const* last, const std::string& name) {

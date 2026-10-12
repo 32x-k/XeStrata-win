@@ -92,7 +92,7 @@ std::vector<int32_t> eos_tokens(const std::string& path) {
 // GENI, BGEN) answer ERR.  The conversation's tokens stay read between requests: a request that starts with them
 // reads only what follows (a model with a recurrent state only when it extends them all; else it starts over).
 static int plain_serve(strata::core::PlainModel& model, const strata::core::PlainOptions& opt, const std::string& arch,
-                       const std::vector<int32_t>& eos, const std::string& profile_save) {
+                       const std::vector<int32_t>& eos, const std::string& profile_save, double save_min) {
     std::atomic<bool> stop_req{false};
     std::mutex in_mu;
     std::condition_variable in_cv;
@@ -127,8 +127,17 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     std::printf("READY %lld stop\n", (long long) ctx);
     std::fflush(stdout);
     std::string line;
+    // what the tier learned, every save_min minutes before the next request (at QUIT: after the loop), as
+    // Qwen3.8-Flash-Next's serve does (#477)
+    auto saved_at = std::chrono::steady_clock::now();
     while (next_line(line)) {
         if (line == "QUIT") break;
+        if (!profile_save.empty() && save_min > 0 &&
+            std::chrono::steady_clock::now() - saved_at >= std::chrono::duration<double>(save_min * 60.0)) {
+            if (!model.save_profile(profile_save, err))
+                std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+            saved_at = std::chrono::steady_clock::now();
+        }
         if (line.empty()) continue;
         stop_req.store(false);   // a STOP between requests ends nothing
         if (line.rfind("GEN ", 0) != 0) {
@@ -270,6 +279,8 @@ static void plain_usage(const std::string& arch) {
                  "  --pool-workers N     the CPU's expert threads (default every physical core but one)\n"
                  "  --expert-profile PATH        fill the VRAM tier from this profile at load\n"
                  "  --expert-profile-save PATH   write what this run learned as a profile\n"
+                 "  --expert-profile-save-every MIN   with --serve: also every MIN minutes between requests (default\n"
+                 "                       10; 0: at QUIT only)\n"
                  "  --adapt-every N      windows between the tier's adaptive rounds (default 4; 0 off)\n"
                  "  --mmap-experts       read the experts from the GGUF through mmap instead of pinned RAM\n"
                  "  --no-pcie-split      the CPU computes every expert the VRAM tier misses\n"
@@ -300,6 +311,7 @@ int plain_main(int argc, char** argv) {
     bool stop_eos = false, serve = false;
     std::vector<int32_t> eos;
     std::string dump_path, profile_save;
+    double save_min = 10.0;   // --expert-profile-save-every (serve)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -342,6 +354,7 @@ int plain_main(int argc, char** argv) {
         else if (a == "--rope-scale") opt.rope_scale = std::strtod(next("--rope-scale"), nullptr);
         else if (a == "--yarn-orig-ctx") opt.yarn_orig_ctx = std::strtod(next("--yarn-orig-ctx"), nullptr);
         else if (a == "--expert-profile-save") profile_save = next("--expert-profile-save");
+        else if (a == "--expert-profile-save-every") save_min = std::strtod(next("--expert-profile-save-every"), nullptr);
         else {
             switch (option_scope(a)) {
                 case OptionScope::qwen38_only:
@@ -380,7 +393,7 @@ int plain_main(int argc, char** argv) {
     }
     if (opt.prompt_chunk > 0) std::fprintf(stderr, "strata (%s): prompt matrix products on %s\n", arch.c_str(),
                                            strata::prefill::Gemm::path());
-    if (serve) return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save);
+    if (serve) return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save, save_min);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> dump_file(nullptr, &std::fclose);
     if (!dump_path.empty()) {
