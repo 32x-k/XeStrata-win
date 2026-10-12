@@ -561,14 +561,18 @@ bool PlainModel::open_experts(std::string& err) {
             return false;
         }
     // the RAM tier: every expert loaded into pinned RAM when the host has the room (the GPU reads them over PCIe and
-    // the pool from RAM), else the GGUF read in place through the page cache
+    // the pool from RAM), else the GGUF read in place through the page cache.  The room is the resident copy's (#11,
+    // resident_pin_fits): the pinned experts and 8 GiB beside them
     bool in_ram = !opt_.mmap_experts;
     if (in_ram) {
         detail::HostMemory hm;
-        const uint64_t need = lay.total + lay.max_blob + (4ull << 30);   // and room for everything else
-        if (detail::host_available_memory(hm) && std::min(hm.available, hm.cgroup_limit) < need) {
-            std::fprintf(stderr, "strata plain: %.1f GiB of RAM available, the experts need %.1f GiB: read in place\n",
-                         (double) std::min(hm.available, hm.cgroup_limit) / 1073741824.0, (double) need / 1073741824.0);
+        const uint64_t need = lay.total + lay.max_blob;
+        std::string why;
+        if (detail::host_available_memory(hm) &&
+            !detail::resident_pin_fits(need, 0, 8ull << 30, std::min(hm.available, hm.cgroup_limit), why)) {
+            std::fprintf(stderr, "strata plain: the experts need %.1f GiB of RAM and 8 GiB beside them, %.1f GiB is "
+                                 "available: read in place\n",
+                         (double) need / 1073741824.0, (double) std::min(hm.available, hm.cgroup_limit) / 1073741824.0);
             in_ram = false;
         }
     }
