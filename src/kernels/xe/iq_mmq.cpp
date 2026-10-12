@@ -826,16 +826,20 @@ sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, si
 template<int TY>
 sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                     int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
-                    int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst) {
+                    int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst, int64_t rows) {
 #define STRATA_MMQ_LAUNCH(SGM, NSGM, DP4A, TAIL)                                                                     \
     launch<TY, SGM, NSGM, DP4A, TAIL>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds,     \
                                       max_rows, ids, dst, ld_dst)
 #define STRATA_MMQ_ROWS(DP4A, TAIL)                                                        \
     do {                                                                                    \
         if (max_rows <= 16) return STRATA_MMQ_LAUNCH(1, 1, DP4A, TAIL);                     \
-        if (max_rows <= 32) return STRATA_MMQ_LAUNCH(2, 1, DP4A, TAIL);                     \
+        if (max_rows <= 32 || mean_rows <= 32) return STRATA_MMQ_LAUNCH(2, 1, DP4A, TAIL);  \
         return STRATA_MMQ_LAUNCH(2, 2, DP4A, TAIL);                                         \
     } while (0)
+    // the tile's rows by the group's largest, but 32 where the experts average no more: a 64-row tile's work-groups
+    // then multiply mostly empty rows, and the extra tiles of the few larger experts cost less (Ornith GSQ-RCO 3bit's
+    // 515-token prompt, 16 rows an expert: RX 9060 XT +8%; its 4K prompt, 111 rows, keeps the 64-row tile)
+    const int64_t mean_rows = rows / std::max(n, 1);
     // dp4a where the matrix form does not run (iq_mmq_grouped is called where one of the two does); the K-tail form
     // only for a K that is no multiple of the step, so that the others keep their loads unguarded
     const bool tail = w_cols % KC != 0;
@@ -1027,11 +1031,12 @@ sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, 
 
 sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_bytes, int64_t w_rows, int64_t w_cols,
                            int n, const void* xq, int64_t total_rows, const int32_t* bounds, int64_t max_rows,
-                           const int32_t* ids, float* dst, int64_t ld_dst, const uint8_t* const* wtab, size_t woff) {
+                           const int32_t* ids, float* dst, int64_t ld_dst, const uint8_t* const* wtab, size_t woff,
+                           int64_t rows) {
 #define STRATA_MMQ_CASE(TY)                                                                                           \
     case TY:                                                                                                          \
         return by_rows<TY>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, max_rows, ids, \
-                           dst, ld_dst)
+                           dst, ld_dst, rows > 0 ? rows : total_rows)
     switch (t) {
         STRATA_MMQ_CASE(6);
         STRATA_MMQ_CASE(8);

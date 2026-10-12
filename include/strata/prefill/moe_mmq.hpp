@@ -45,6 +45,7 @@ struct Product {
     const int32_t* bounds = nullptr;
     const int32_t* ids = nullptr;
     int64_t total_rows = 0, max_rows = 0;
+    int64_t rows = 0;   ///< the n experts' rows together (0: total_rows), for the tile's shape
     float* dst = nullptr;
     int64_t ld_dst = 0;
     const uint8_t* const* wtab = nullptr;   ///< on the device: expert e's weights at wtab[e] + woff instead of w's
