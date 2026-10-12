@@ -20,7 +20,8 @@ bool built();
 bool built_dp4a();
 /// Whether the prompt's products take their int8 form: on the matrix engines where built(); else by dp4a only where the
 /// FP16 products have no matrix engines either (built_dp4a, and not kernels::f16_matrix_engines: Volta, whose tensor
-/// cores take FP16 and not int8, keeps the FP16 form).  The one rule every prompt path (prefill.cpp, PlainModel) takes.
+/// cores take FP16 and not int8, keeps the FP16 form).  PlainModel's prompt takes it as it is; Qwen3.8's (prefill.cpp)
+/// keeps the FP16 form where Intel's XMX take it, faster there than the int8 products.
 bool chosen();
 /// They cover this ggml type (the i-quants but IQ1_S, Q2_0, Q8_0, Q5_0, Q2_K to Q6_K).
 bool supported(int ggml_type);

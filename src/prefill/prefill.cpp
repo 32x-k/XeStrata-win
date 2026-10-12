@@ -655,9 +655,12 @@ const MmqPlan& mmq_plan() {
         MmqPlan p;
         const auto& lay = strata::kernels::cpu::expert_layout();
         const char* env = std::getenv("STRATA_PREFILL_MMQ");
-        // mmq::chosen: dp4a only where the FP16 products have no matrix engines either (the FP16 path with them was
-        // 4.8x faster than dp4a for gate/up at 32K on the B70, before its XMX took the int8 products)
-        const bool on = mmq::chosen() && lay.native && (env == nullptr || std::strtol(env, nullptr, 10) != 0);
+        // mmq::chosen, except where Intel's XMX take the FP16 path (xmx_available: its products of the dequantized
+        // experts, and the resident ones straight from their blocks, iq_gemm_grouped_f16): on the B70 that path beat
+        // the int8 XMX products at every length, 2,320 against 871 tok/s at 32K, 1,486 against 1,379 at 4K and 869
+        // against 829 at 1K (IQ2_XS experts), where PlainModel's FP16 path, without the fused products, lost to them
+        const bool on = mmq::chosen() && !strata::kernels::xmx_available(strata::kernels::XmxType::f16) && lay.native &&
+                        (env == nullptr || std::strtol(env, nullptr, 10) != 0);
         const int64_t layers = lay.native ? (int64_t) lay.fmt.size() : lay.n_layers;
         p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
         p.fallback = !on || layers <= 0;
