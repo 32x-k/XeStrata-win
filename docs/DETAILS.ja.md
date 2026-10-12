@@ -243,7 +243,7 @@ Unsloth の 2 つ以外のモデルは、すべてのエキスパートを RAM �
 （`--low-ram auto`、既定）。
 このときエンジンは、エキスパートを RAM にすべてコピーせずに、モデルのファイルから読みます。
 ネイティブの pack なら GGUF のファイルから、AVX-512 用の Q2_0 の pack ならその `experts.bin` からです。
-エンジンを直接起動して `--resident-experts` も `--mmap-experts` も付けなかった場合でも、空いている RAM がエキスパートの全体に足りなければ、エンジンは `--resident-experts` と同じ形で起動し、そう 1 行出します（issue #10: 全体を読み込むと swap に入り、Intel の GPU では GPU のドライバーが持つメモリへ移した後で OS が RAM を取り返せずに止まりました）。
+エンジンを直接起動して `--resident-experts` も `--mmap-experts` も付けなかった場合でも、空いている RAM がエキスパートの全体と 8 GiB に足りなければ、エンジンは `--resident-experts` と同じ形で起動し、そう 1 行出します（issue #10: 全体を読み込むと swap に入り、Intel の GPU では GPU のドライバーが持つメモリへ移した後で OS が RAM を取り返せずに止まりました）。
 `STRATA_ARENA_LOW_RAM=keep` で、足りなくても全体を読み込みます。
 全体を RAM に置いたときも、PCIe の分担のために GPU のドライバーのメモリ（host USM）へ移すのは、層ごとに RAM の空き（その層と `STRATA_HOST_USM_RESERVE_MIB`、既定 1024）があるときだけです。足りなければ移さず、外れたエキスパートは CPU が計算します。
 

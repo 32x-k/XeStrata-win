@@ -252,7 +252,7 @@ When the experts do not fit the RAM (with about 10 GB left for the rest) but the
 setup chooses the low-RAM mode (`--low-ram auto`, the default).
 The engine then reads the experts from the model files instead of copying them all into RAM:
 a native pack's from the GGUF files in place, the AVX-512 Q2_0 pack's from its `experts.bin`.
-An engine started by hand with neither `--resident-experts` nor `--mmap-experts` starts as with `--resident-experts`, and says so in one line, when the free RAM cannot hold all the experts (issue #10: the whole set swapped while it loaded, and on an Intel GPU, once moved into the GPU driver's memory, the OS could not take the RAM back and the host stopped).
+An engine started by hand with neither `--resident-experts` nor `--mmap-experts` starts as with `--resident-experts`, and says so in one line, when the free RAM cannot hold all the experts and 8 GiB more (issue #10: the whole set swapped while it loaded, and on an Intel GPU, once moved into the GPU driver's memory, the OS could not take the RAM back and the host stopped).
 `STRATA_ARENA_LOW_RAM=keep` loads the whole set anyway.
 With every expert in RAM, the move into the GPU driver's memory (host USM) for the PCIe share takes a layer only while the RAM has room for it and `STRATA_HOST_USM_RESERVE_MIB` (default 1024) more; otherwise nothing moves and the CPU computes the missed experts.
 
