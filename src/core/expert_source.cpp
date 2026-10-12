@@ -65,6 +65,10 @@ static int madvise(void* base, size_t bytes, int advice) {
     if (advice == MADV_WILLNEED) {
         WIN32_MEMORY_RANGE_ENTRY range{base, bytes};
         (void) PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
+    } else if (advice == MADV_DONTNEED) {
+        // unlocking pages that are not locked takes them out of the working set: a read-only file view's pages
+        // go back to the standby list, readable again from the file cache (it reports ERROR_NOT_LOCKED)
+        (void) VirtualUnlock(base, bytes);
     }
     return 0;
 }
@@ -894,6 +898,26 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
                        std::memory_order_relaxed);
     file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
     return true;
+}
+
+uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
+#if defined(_WIN32)
+    // the pages wholly inside the blob: one shared with a neighbour the CPU may still read stays
+    const uint8_t* b = mapped_blob(layer, expert);
+    if (b == nullptr) return 0;
+    SYSTEM_INFO system_info{};
+    GetSystemInfo(&system_info);
+    const uintptr_t page = system_info.dwPageSize > 0 ? system_info.dwPageSize : 4096;
+    const uintptr_t lo = ((uintptr_t) b + page - 1) / page * page;
+    const uintptr_t hi = ((uintptr_t) b + layer_blob_bytes_[(size_t) layer]) / page * page;
+    if (hi <= lo) return 0;
+    (void) madvise((void*) lo, (size_t) (hi - lo), MADV_DONTNEED);
+    return (uint64_t) (hi - lo);
+#else
+    (void) layer;
+    (void) expert;
+    return 0;
+#endif
 }
 
 const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) const {

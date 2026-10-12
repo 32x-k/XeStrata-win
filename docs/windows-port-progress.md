@@ -603,3 +603,12 @@ The pool workers had been measured at `--pool-workers 3`. Without speculation, `
 - `--prefill auto` (the batched prompt path) runs on Windows as it is. With a 191-token prompt (the arithmetic input repeated), Prefill was 18.73 tok/s and Decode 18.76 tok/s. Reading the prompt token by token, each token reads its experts from the mmap again; on the same input the free RAM fell to 227 MiB and the run was stopped. With a 12-token prompt Prefill went from 5.31 to 6.19 tok/s. The experts are moved from the host without DMA (AdaptiveCpp cannot register arbitrary host memory): 1,337 of them took 1,469 ms for 12 tokens.
 
 The configuration recommended on this PC is `--native`, `--expert-cache auto --expert-profile`, `--prefill auto`, `--spec 4 --spec-min-p 0.5 --mtp` and the default pool workers. `.tools/run-xestrata-fast.bat`, outside Git, starts it (context 4096; Decode 18.19 tok/s on the hello input).
+
+<a id="page-file"></a>
+## 2026-10-13: a larger page file and the whole expert cache
+
+With a fixed 40-48 GiB page file on C: (initial 40,960 MiB, maximum 49,152 MiB), the commit limit went from about 37,000 to 69,241 MiB and expert cache auto took 20,434 slots (26.31 GiB, close to the B70's 21,062 on Linux).
+
+While the profile filled the cache, the free RAM fell to about 200 MiB. The Windows stand-in for `madvise` did nothing for `MADV_DONTNEED`, so the mapped pages of the experts copied to VRAM stayed in the working set. `MADV_DONTNEED` is now `VirtualUnlock` (which takes pages that are not locked out of the working set and back to the file cache's standby list), `FileExpertSource::release` is implemented on Windows, and the profile fill releases each expert once it is copied. Linux's behaviour is unchanged. The free RAM stayed at 18.4 GiB or more.
+
+On the hello input with `--native`, cache auto (26.31 GiB), `--expert-profile`, `--prefill auto`, `--spec 4 --spec-min-p 0.5` and MTP, Decode was 35.86 and 36.16 tok/s and Prefill 13.74 and 13.67 tok/s, with 96.6% hits (1.00 CPU expert per layer). The 41 generated tokens are the same. With the 191-token prompt, Prefill was 81.73 tok/s and Decode 40.73 tok/s.

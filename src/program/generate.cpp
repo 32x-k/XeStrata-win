@@ -4162,6 +4162,8 @@ int main(int argc, char** argv) try {
             }
             fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
             ++prefilled;
+            // in VRAM now: the mapped file's pages need not stay in the working set (a no-op off Windows)
+            if (srcp == &src) (void) src.release(profile[(size_t) i].first, profile[(size_t) i].second);
         }
         const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong

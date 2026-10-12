@@ -603,3 +603,12 @@ pool workersはこれまで`--pool-workers 3`で測っていました。推測�
 - `--prefill auto`（batched prompt path）はWindowsでもそのまま動きました。191 token（計算問題の入力を繰り返したもの）のpromptで、Prefillは18.73 tok/s、Decodeは18.76 tok/sでした。1 tokenずつのpromptでは各tokenがexpertをmmapから読み直し、同じ入力で空きRAMが227 MiBまで下がったため途中で止めました。12 tokenのpromptでは5.31から6.19 tok/sです。expertのhostからの転送はDMAを使わず（AdaptiveCppでは任意のhost memoryを登録できない）、12 tokenでは1,337個の転送に1,469 msかかりました。
 
 このPCでの推奨構成は`--native`、`--expert-cache auto --expert-profile`、`--prefill auto`、`--spec 4 --spec-min-p 0.5 --mtp`、既定のpool workersです。Git対象外の`.tools/run-xestrata-fast.bat`がこの構成で起動します（context 4096、hello入力でDecode 18.19 tok/s）。
+
+<a id="page-file"></a>
+## 2026-10-13: page fileを広げてexpert cacheを全量に
+
+page fileをC:の固定40〜48 GiB（初期40,960 MiB、最大49,152 MiB）にすると、commitの上限は約37,000から69,241 MiBになり、expert cache autoは20,434 slots（26.31 GiB、LinuxのB70の21,062に近い）を取りました。
+
+profileでcacheを埋める間に、空きRAMが200 MiB前後まで下がりました。Windows用の`madvise`互換関数が`MADV_DONTNEED`を何もしない実装で、VRAMへ写したexpertのmapped pageがworking setに残り続けたためです。`MADV_DONTNEED`を`VirtualUnlock`（lockしていないpageをworking setから外し、file cacheのstandbyへ戻す）で実装し、`FileExpertSource::release`をWindowsで実装し、profileのfillで1個写すごとに手放すようにしました。Linuxの動作は変えていません。最小の空きRAMは18.4 GiBを保ちました。
+
+hello入力、`--native`、cache auto（26.31 GiB）、`--expert-profile`、`--prefill auto`、`--spec 4 --spec-min-p 0.5`、MTPで、Decodeは35.86、36.16 tok/s、Prefillは13.74、13.67 tok/s、hitは96.6%（CPU expertsは1層あたり1.00個）でした。生成した41 tokenは同じです。191 tokenのpromptでは、Prefill 81.73 tok/s、Decode 40.73 tok/sでした。
