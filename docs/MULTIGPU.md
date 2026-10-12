@@ -218,3 +218,4 @@ At K=24 with `--resident-experts` (`--adapt-async` on by default): 111.4 -> 117.
 ## Limits
 
 - One PC only: no GPUs over the network.
+- A split across two Radeons and a split across three or more GPUs (with `--pipeline-windows 2` on three or more stages) have not been run (unverified). The pair checked is a B70 + RTX 4070.
