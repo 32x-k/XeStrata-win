@@ -3952,8 +3952,91 @@ int main(int argc, char** argv) {
             batch_mtp = false;
         }
     }
+    // Allocate the MTP weights before registering the large host arena with both CUDA contexts.
+    strata::core::MtpDrafter mtp;
+    std::vector<std::unique_ptr<strata::core::MtpDrafter>> slot_mtp;   // --batch-mtp: one a slot
+    // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned, so it always sees
+    // the canonical geometry; `static` because MtpDrafter keeps a reference (the batch slots' draft K/V copies too)
+    static const strata::core::ModelGeometry draft_geometry{};
+    if (!o.mtp.empty()) {
+        if (o.spec < 2) {
+            std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
+            o.mtp.clear();
+        }
+        if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
+        mtp.set_hnorm_per_stream(o.mtp_hnorm_stream);   // --mtp-hnorm stream (opt-in), before any capture
+        // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
+        const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
+        // --pipeline-windows 2: 8 rows (the chain runs on past the window in flight: its drafts, its bonus token and
+        // the next window's drafts), and the round/step graphs carry the forcing kernel
+        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
+        if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
+        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
+    }
+    // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
+    // everything allocated after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after
+    // it and ate most of the 700 MiB: 128K IQ3_S ended with 30 MiB free, the driver paged, and a request stalled for
+    // good at its first verify window.  Loaded first, the cache is sized around it.  #620: and before the expert
+    // arena registers tens of GiB of host pages, like the drafter above (on Windows the driver then refused the
+    // head's allocation with GiBs free).
+    const strata::core::WeightRef* wo = wt.find("output.weight");
+    if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
+    const int64_t n_vocab = wo->ne1;
+    strata::core::NativeHead native_head;
+    if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
+        const auto head_t0 = std::chrono::steady_clock::now();
+        if (!native_head.load(o.native_head_gguf, g.n_embd, n_vocab, err)) {
+            std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: experimental native Q5_K head, %llu bytes, in %.1f s\n",
+                     (unsigned long long) native_head.weight_bytes(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
+    }
+    std::vector<float> logits((size_t) n_vocab);
+    mem_mark("the native head");
+    float* d_logits = nullptr;
+    if (!strata::gpu::alloc_device(&d_logits, (size_t) n_vocab * 4)) {
+        std::fprintf(stderr, "strata generate: the logits buffer failed%s\n", vram_free_note().c_str());
+        return 1;
+    }
     std::vector<std::unique_ptr<strata::core::SessionState>> bslot_ss;
     std::vector<void*> bslot_buf;
+    // --batch: the slots given back from the last, down to `keep` (none below two): their drafters, their sessions and
+    // the later stages' ones.  The sessions take what VRAM they can before the slots' drafters and the expert cache,
+    // and what those then lack is given back here, so that the start goes on with the slots this GPU holds beside them
+    // (a user's --batch 32 took all of a 24 GB card, and the start stopped at slot 27's drafter).  `beside`: what they
+    // left no room for, said when `say`.
+    const int batch_asked = o.batch;
+    auto drop_slots = [&](int keep, const char* beside, bool say) {
+        if (keep < 2) keep = 0;
+        strata::gpu::stream_sync(main_cs);
+        while ((int) slot_mtp.size() > keep) slot_mtp.pop_back();
+        while ((int) bslot_ss.size() > keep) {
+            strata::gpu::free(bslot_buf.back());
+            bslot_buf.pop_back();
+            bslot_ss.pop_back();
+        }
+        for (auto& stp : stages) {
+            const strata::core::OnDevice on(stp->dev);
+            strata::gpu::stream_sync(stp->stream);
+            while ((int) stp->bslots.size() > keep) {
+                strata::gpu::free(stp->bslot_buf.back());
+                stp->bslot_buf.pop_back();
+                stp->bslots.pop_back();
+            }
+        }
+        o.batch = keep;
+        if (keep == 0) batch_mtp = false;
+        if (o.batch_groups > 1 && (keep == 0 || keep % o.batch_groups != 0)) o.batch_groups = 1;
+        if (!say) return;
+        if (keep > 0)
+            std::fprintf(stderr, "strata generate: --batch %d: %d slots run - more leave %s no VRAM on this GPU "
+                                 "(fewer requests at once: the config's \"parallel\", --batch)\n", batch_asked, keep,
+                         beside);
+        else
+            std::fprintf(stderr, "strata generate: --batch is off: two slots leave %s no VRAM on this GPU\n", beside);
+    };
     if (o.batch != 0) {
         const char* why = !o.serve ? "it needs --serve"
                         : o.batch < 2 ? "it needs at least 2 slots"
@@ -4065,67 +4148,24 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Allocate the MTP weights before registering the large host arena with both CUDA contexts.
-    strata::core::MtpDrafter mtp;
-    std::vector<std::unique_ptr<strata::core::MtpDrafter>> slot_mtp;   // --batch-mtp: one a slot
-    // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned, so it always sees
-    // the canonical geometry; `static` because MtpDrafter keeps a reference (the batch slots' draft K/V copies too)
-    static const strata::core::ModelGeometry draft_geometry{};
-    if (!o.mtp.empty()) {
-        if (o.spec < 2) {
-            std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
-            o.mtp.clear();
-        }
-        if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
-        mtp.set_hnorm_per_stream(o.mtp_hnorm_stream);   // --mtp-hnorm stream (opt-in), before any capture
-        // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
+    if (batch_mtp && !o.mtp.empty()) {
         const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
-        // --pipeline-windows 2: 8 rows (the chain runs on past the window in flight: its drafts, its bonus token and
-        // the next window's drafts), and the round/step graphs carry the forcing kernel
-        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
-        if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
-        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
-        if (batch_mtp && !o.mtp.empty())
-            for (int b = 0; b < o.batch; ++b) {   // --batch-mtp: a drafter per slot, on the main one's weights
-                auto d = std::make_unique<strata::core::MtpDrafter>();
-                d->set_hnorm_per_stream(o.mtp_hnorm_stream);
-                // where the solo drafter is (the guard above), carved from the slot's session on that GPU: the last
-                // stage's with a layer split
-                strata::core::SessionState& slot_ss = last_st ? *last_st->bslots[(size_t) b] : *bslot_ss[(size_t) b];
-                if (!d->load(o.mtp, draft_geometry, slot_ss, o.spec, err, o.mtp_window, &mtp)) {
-                    std::fprintf(stderr, "strata generate: batch MTP slot %d: %s%s\n", b, err.c_str(), vram_free_note().c_str());
-                    return 1;
-                }
-                d->set_max_drafts(1);   // a slot verifies one proposal a window
-                slot_mtp.push_back(std::move(d));
+        for (int b = 0; b < o.batch; ++b) {   // --batch-mtp: a drafter per slot, on the main one's weights
+            auto d = std::make_unique<strata::core::MtpDrafter>();
+            d->set_hnorm_per_stream(o.mtp_hnorm_stream);
+            // where the solo drafter is (the guard above), carved from the slot's session on that GPU: the last
+            // stage's with a layer split
+            strata::core::SessionState& slot_ss = last_st ? *last_st->bslots[(size_t) b] : *bslot_ss[(size_t) b];
+            if (!d->load(o.mtp, draft_geometry, slot_ss, o.spec, err, o.mtp_window, &mtp)) {
+                // the slot sessions took what VRAM they could: this slot and the ones after it are given back
+                std::fprintf(stderr, "strata generate: --batch: slot %d's drafter does not fit (%s)%s\n", b,
+                             err.c_str(), vram_free_note().c_str());
+                drop_slots(b, "their drafters", true);
+                break;
             }
-    }
-    // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
-    // everything allocated after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after
-    // it and ate most of the 700 MiB: 128K IQ3_S ended with 30 MiB free, the driver paged, and a request stalled for
-    // good at its first verify window.  Loaded first, the cache is sized around it.  #620: and before the expert
-    // arena registers tens of GiB of host pages, like the drafter above (on Windows the driver then refused the
-    // head's allocation with GiBs free).
-    const strata::core::WeightRef* wo = wt.find("output.weight");
-    if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
-    const int64_t n_vocab = wo->ne1;
-    strata::core::NativeHead native_head;
-    if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
-        const auto head_t0 = std::chrono::steady_clock::now();
-        if (!native_head.load(o.native_head_gguf, g.n_embd, n_vocab, err)) {
-            std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str());
-            return 1;
+            d->set_max_drafts(1);   // a slot verifies one proposal a window
+            slot_mtp.push_back(std::move(d));
         }
-        std::fprintf(stderr, "strata generate: experimental native Q5_K head, %llu bytes, in %.1f s\n",
-                     (unsigned long long) native_head.weight_bytes(),
-                     std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
-    }
-    std::vector<float> logits((size_t) n_vocab);
-    mem_mark("the native head");
-    float* d_logits = nullptr;
-    if (!strata::gpu::alloc_device(&d_logits, (size_t) n_vocab * 4)) {
-        std::fprintf(stderr, "strata generate: the logits buffer failed%s\n", vram_free_note().c_str());
-        return 1;
     }
     // Create the additional contexts after MTP has secured CUDA0 memory, but
     // before the host arena maps its expert pages into their address spaces.
@@ -4376,8 +4416,6 @@ int main(int argc, char** argv) {
                      o.pipeline_windows >= 2 ? ", the GDN snapshots" : "");
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
-        strata::gpu::mem_info(&free_b, &total_b);
-        free_b += (size_t) blas_bytes;   // the matrix library's VRAM is the reserve's (above)
         // The batched prompt path's chunk buffers are allocated later, so reserve room for them here.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead)
         const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
@@ -4387,19 +4425,42 @@ int main(int argc, char** argv) {
                 ? (multi_gpu ? (int64_t) (strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk) >> 20) + 1
                              : 160 + (o.prefill_chunk * 680) / 1024)
                 : 0;
-        // the draft layer's head and logits are allocated when it binds, after this: the CJK draft subset makes them
-        // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (upstream b981f63)
-        int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
-                               ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
-        if (stages.empty())   // (with a layer split the slot drafters bind on the last stage, sized from its VRAM)
-            for (const auto& d : slot_mtp) mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
-        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-        // Not rounded: free VRAM moves the cache by a slot or two between starts, and with it the last bits of the
-        // output (the 2026-10-02-new-machine record), but rounding to 64 slots cost the RTX 4070 3-4% of its decode.
-        // Runs that must give the same tokens fix the size with --expert-cache N.
-        int64_t slots = ((int64_t) free_b - reserve) / blob;
-        if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
+        int64_t mtp_bind = 0, reserve = 0, slots = 0;
+        auto size_cache = [&] {
+            strata::gpu::mem_info(&free_b, &total_b);
+            free_b += (size_t) blas_bytes;   // the matrix library's VRAM is the reserve's (above)
+            // the draft layer's head and logits are allocated when it binds, after this: the CJK draft subset makes
+            // them ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (upstream
+            // b981f63)
+            mtp_bind = (!o.mtp.empty() && native_head.loaded())
+                           ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
+            if (stages.empty())   // (with a layer split the slot drafters bind on the last stage, sized from its VRAM)
+                for (const auto& d : slot_mtp) mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
+            reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
+            // Not rounded: free VRAM moves the cache by a slot or two between starts, and with it the last bits of
+            // the output (the 2026-10-02-new-machine record), but rounding to 64 slots cost the RTX 4070 3-4% of its
+            // decode.  Runs that must give the same tokens fix the size with --expert-cache N.
+            slots = ((int64_t) free_b - reserve) / blob;
+            if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
+        };
+        size_cache();
+        // #496 (below): the slots a working cache needs
+        const int64_t min_slots = (o.prefill_chunk > 0 && borrow)
+            ? ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, 256) + blob - 1) / blob + 128 : 1;
+        if (slots < min_slots && o.batch > 0) {   // --batch: slots given back until it has them (drop_slots)
+            while (slots < min_slots && o.batch > 0) {
+                drop_slots(o.batch - 1, "a working expert cache", false);
+                size_cache();
+            }
+            if (o.batch > 0)
+                std::fprintf(stderr, "strata generate: --batch %d: %d slots run - more leave the expert cache fewer "
+                                     "than the %lld slots it needs (fewer requests at once: the config's "
+                                     "\"parallel\", --batch)\n", batch_asked, o.batch, (long long) min_slots);
+            else
+                std::fprintf(stderr, "strata generate: --batch is off: two slots leave the expert cache fewer than the "
+                                     "%lld slots it needs\n", (long long) min_slots);
+        }
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
                              "draft head; %lld MiB of it the matrix library's) -> %d slots\n",
@@ -4415,8 +4476,6 @@ int main(int argc, char** argv) {
         // stops, saying what is short and what makes room.  A card the default reserve leaves that much is sized as
         // before.
         constexpr int kSmallReserveMib = 300;
-        const int64_t min_slots = (o.prefill_chunk > 0 && borrow)
-            ? ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, 256) + blob - 1) / blob + 128 : 1;
         if (o.expert_cache < min_slots && !o.vram_reserve_given && o.vram_reserve_mib > kSmallReserveMib) {
             // the largest reserve (in MiB) that still leaves min_slots
             const int64_t fit_mib = ((int64_t) free_b - mtp_bind - pipe_first - min_slots * blob) / (1 << 20) - prefill_mib;

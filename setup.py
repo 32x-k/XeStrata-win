@@ -3115,9 +3115,11 @@ def parallel_recommend(vram_gb: float, arena_gb: float, ctx: int, kv: str, strea
     return best
 
 
-def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, kv: str, streaming: bool) -> list[str]:
+def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, kv: str, streaming: bool,
+                  batch_mtp: bool = False) -> list[str]:
     """#465: what setup says about "parallel": the recommendation (or, where it would cost speed, why it is left at
-    one), or how the asked count compares with it (kept as asked: recommend, never force)."""
+    one), or how the asked count compares with it (kept as asked: recommend, never force).  `batch_mtp`: the engine
+    runs with --batch-mtp (the server's default with --mtp), which takes every slot asked, past PARALLEL_MAX."""
     rec = parallel_recommend(vram_gb, arena_gb, ctx, kv, streaming)
     slot = parallel_slot_gb(ctx, kv, streaming)
     if asked is None or asked <= 1:
@@ -3127,8 +3129,15 @@ def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, 
                 f"after the other (each takes ~{slot:.1f} GB of VRAM from the expert cache; docs/BATCHING.md)."]
     lines = [f"parallel requests: {asked} at once (each takes ~{slot:.1f} GB of VRAM from the expert cache, "
              f"{asked * slot:.1f} GB in all)"]
-    if asked > PARALLEL_MAX:
+    used = asked if batch_mtp else min(asked, PARALLEL_MAX)
+    if used < asked:
         lines.append(f"the engine runs at most {PARALLEL_MAX} at once; it will use {PARALLEL_MAX}")
+    if not rec or used > rec:
+        # every slot's session (and with --batch-mtp its drafter) is allocated before the expert cache: a user's 32 on
+        # a 24 GB card left it nothing; the engine then runs the slots that leave it a working cache
+        left = max(0.0, vram_gb - 5 - used * slot)
+        lines.append(f"{used} slots leave the expert cache ~{left:.1f} GB of VRAM; where that is too little the engine "
+                     "runs fewer, as many as fit")
     if not rec:
         lines.append(f"recommended for this card: one at a time - {PARALLEL_COST_NOTE}; kept as you chose")
     elif asked > rec:
@@ -4334,8 +4343,9 @@ def main() -> int:
     if a.parallel is not None:
         if a.parallel >= 2:
             cfg["parallel"] = a.parallel
+            batch_mtp = "--mtp" in args and "--no-batch-mtp" not in args   # as serve/server.py's parallel_args
             for i, line in enumerate(parallel_note(a.parallel, gpu_expert_vram(gpu), MODELS[model]["arena_gb"], ctx, kv,
-                                                   streaming)):
+                                                   streaming, batch_mtp)):
                 (ok if i == 0 else warn)(line)
         else:
             cfg["parallel"] = 1
