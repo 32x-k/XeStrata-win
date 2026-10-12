@@ -551,31 +551,9 @@ inline float vec_dot_q6_K_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx
     }
     return (float) bq6_K->d * sumf;
 }
-// Q2_K and Q3_K experts (Ornith-1.5's GSQ-RCO files, GLM-5.3-Flash's): llama.cpp's vecdotq.cuh vec_dot_q2_K_q8_1 /
-// vec_dot_q3_K_q8_1 with their _impl_mmvq, VDR 1 - QI 16 calls a block, each one 32-bit word of the quants against
-// four q8_1 blocks
-constexpr int VDR_Q2_K = 1, VDR_Q3_K = 1;
-inline float vec_dot_q2_K_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs) {
-    const block_q2_K* bq2_K = (const block_q2_K*) vbq + kbx;
-    const int bq8_offset = QR2_K * (iqs / QI8_1);
-    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
-    const uint8_t* scales = bq2_K->scales + scale_offset;
-    const int v = get_int_b4(bq2_K->qs, iqs);
-    float sumf_d = 0.0f, sumf_m = 0.0f;
-    for (int i = 0; i < QR2_K; ++i) {
-        const block_q8_1* b8 = bq8_1 + bq8_offset + i;
-        const int u = get_int_b4(b8->qs, iqs % QI8_1);
-        const float d8 = low_half(b8->ds);
-        const int sc = scales[(ptrdiff_t) 2 * i];
-        const int vi = (v >> (2 * i)) & 0x03030303;
-        sumf_d += d8 * (float) (dp4a(vi, u, 0) * (sc & 0xF));
-        int m = sc >> 4;   // the min in every byte, against the q8_1 values' sum
-        m |= m << 8;
-        m |= m << 16;
-        sumf_m += d8 * (float) dp4a(m, u, 0);
-    }
-    return (float) bq2_K->dm[0] * sumf_d - (float) bq2_K->dm[1] * sumf_m;
-}
+// Q3_K experts (Ornith-1.5's GSQ-RCO files, GLM-5.3-Flash's): llama.cpp's vecdotq.cuh vec_dot_q3_K_q8_1 with its
+// _impl_mmvq, VDR 1 - QI 16 calls a block, each one 32-bit word of the quants against four q8_1 blocks (Q2_K's: below)
+constexpr int VDR_Q3_K = 1;
 inline float vec_dot_q3_K_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs) {
     const block_q3_K* bq3_K = (const block_q3_K*) vbq + kbx;
     const int bq8_offset = QR3_K * (iqs / (QI3_K / 2));
@@ -617,7 +595,40 @@ template<> struct Split<6> : WholeDot<vec_dot_q5_0_q8_1> {};    // Q5_0
 template<> struct Split<2> : WholeDot<vec_dot_q4_0_q8_1> {};    // Q4_0
 template<> struct Split<3> : WholeDot<vec_dot_q4_1_q8_1> {};    // Q4_1
 template<> struct Split<14> : WholeDot<vec_dot_q6_K_q8_1> {};   // Q6_K
-template<> struct Split<10> : WholeDot<vec_dot_q2_K_q8_1> {};   // Q2_K
+// Q2_K two words a call: the two share their q8_1 blocks and their scales (and the block's d and dmin), so the scales
+// are unpacked, the integer sums made and the floats multiplied once for both - a decode token's experts (one entry
+// each) were bound by that per-word work (B70: 131 GB/s against Q4_K's 343).  The sums add in another order than
+// llama.cpp's vec_dot_q2_K_q8_1 (one word a call).
+template<> struct Split<10> {
+    struct W { int v0, v1, bq8_offset; uint32_t sc; float d, dmin; };
+    static W load(const void* vbq, int kbx, int iqs) {
+        const block_q2_K* b = (const block_q2_K*) vbq + kbx;
+        W r{};
+        r.bq8_offset = QR2_K * (iqs / QI8_1);
+        const int so = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
+        r.v0 = get_int_b4(b->qs, iqs);
+        r.v1 = get_int_b4(b->qs, iqs + 1);
+        r.sc = 0;
+        for (int i = 0; i < QR2_K; ++i) r.sc |= (uint32_t) b->scales[so + 2 * i] << (8 * i);
+        r.d = (float) b->dm[0];
+        r.dmin = (float) b->dm[1];
+        return r;
+    }
+    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+        float sumf_d = 0.0f, sumf_m = 0.0f;
+        for (int i = 0; i < QR2_K; ++i) {
+            const block_q8_1* b8 = bq8_1 + r.bq8_offset + i;
+            const int u0 = get_int_b4(b8->qs, iqs % QI8_1), u1 = get_int_b4(b8->qs, iqs % QI8_1 + 1);
+            const float d8 = low_half(b8->ds);
+            const int sc = (int) ((r.sc >> (8 * i)) & 0xFF);
+            const int sumi = dp4a((r.v1 >> (2 * i)) & 0x03030303, u1, dp4a((r.v0 >> (2 * i)) & 0x03030303, u0, 0));
+            const int m = (sc >> 4) * 0x01010101;   // the min in every byte, against the q8_1 values' sum
+            sumf_d += d8 * (float) (sumi * (sc & 0xF));
+            sumf_m += d8 * (float) dp4a(m, u1, dp4a(m, u0, 0));
+        }
+        return r.d * sumf_d - r.dmin * sumf_m;
+    }
+};
 template<> struct Split<11> : WholeDot<vec_dot_q3_K_q8_1> {};   // Q3_K
 
 // ---------------------------------------------------------------- the formats
@@ -647,7 +658,7 @@ template<> struct Fmt<6> : FmtOf<6, (int) sizeof(block_q5_0), 32, QI5_0 / VDR_Q5
 template<> struct Fmt<2> : FmtOf<2, (int) sizeof(block_q4_0), 32, QI4_0 / VDR_Q4_0, VDR_Q4_0> {};
 template<> struct Fmt<3> : FmtOf<3, (int) sizeof(block_q4_1), 32, QI4_1 / VDR_Q4_1, VDR_Q4_1> {};
 template<> struct Fmt<14> : FmtOf<14, (int) sizeof(block_q6_K), 256, QI6_K / VDR_Q6_K, VDR_Q6_K> {};
-template<> struct Fmt<10> : FmtOf<10, (int) sizeof(block_q2_K), 256, QI2_K / VDR_Q2_K, VDR_Q2_K> {};
+template<> struct Fmt<10> : FmtOf<10, (int) sizeof(block_q2_K), 256, QI2_K / 2, 2> {};   // two words a call
 template<> struct Fmt<11> : FmtOf<11, (int) sizeof(block_q3_K), 256, QI3_K / VDR_Q3_K, VDR_Q3_K> {};
 
 // A grid format's codebook, for a work-group's copy in local memory (the Volta experts below): its word, its length
