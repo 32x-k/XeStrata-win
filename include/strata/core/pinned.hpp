@@ -24,6 +24,10 @@
 
 namespace strata::core {
 
+/// LAYER SPLIT: the later GPUs that register the arena for copies too (PinnedArena::register_on), named before it is
+/// made: its pieces are cut to the smallest largest allocation of these and the current device.
+void arena_copy_devices(const std::vector<int>& devices);
+
 enum class PageBacking { LargePages, NormalPages };
 
 struct PinnedArena {
