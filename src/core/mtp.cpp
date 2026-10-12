@@ -5,6 +5,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/progress.hpp"
 
 #include "strata/core/native_head.hpp"
 #include "strata/platform/memory.hpp"
@@ -1093,6 +1094,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     }
     (void) strata::gpu::stream_idle(cs_);
     prefetch_ple(tokens[a]);
+    progress_at("mtp draft: waiting for the GPU");   // upstream #2065: a stall here read as the verify window before it
     wait_step(0);
     drafts[0] = ((volatile int32_t*) h_out_)[0];
     if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(0); }
