@@ -1704,6 +1704,29 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
     sync_if_needed(stream, e, "iq_dequant_gu_f16");
 }
 
+void iq_dequant_expert_f16(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* gu_dst,
+                           int dt, const void* down, uint16_t* d_dst, void* stream) {
+    require(n_embd % 256 == 0 && is_iq(t) && is_iq(dt), "iq_dequant_expert_f16");
+    const int64_t per_row = n_embd / 256;
+    auto* y = (sycl::half*) gu_dst;
+    auto* yd = (sycl::half*) d_dst;
+    const int64_t nsb = n_ff * per_row;   // superblocks per matrix (the down matrix has as many), eight a work-group
+    const auto e = queue_for(stream).parallel_for(
+        sycl::nd_range<2>({3, (size_t) (nsb + 7) / 8 * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
+            const int64_t i = (int64_t) (it.get_global_id(1) / 32);
+            if (i >= nsb) return;
+            const int part = (int) it.get_group(0);   // 0 gate, 1 up, 2 down
+            const int lane = (int) (it.get_local_id(1) % 32);
+            if (part == 2) {
+                dq_dispatch(dt, down, i, ToGlobal<sycl::half>{yd + i * QK_K}, lane);
+                return;
+            }
+            const int64_t r = i / per_row, c = i % per_row;
+            dq_dispatch(t, part ? up : gate, i, ToGlobal<sycl::half>{y + ((2 * r + part) * per_row + c) * QK_K}, lane);
+        });
+    sync_if_needed(stream, e, "iq_dequant_expert_f16");
+}
+
 bool iq_gemm_grouped_ok(int t, int64_t N, int64_t K) noexcept {
     return in_iq_gemm(t) && N > 0 && N % 128 == 0 && K > 0 && K % 128 == 0;
 }

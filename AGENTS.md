@@ -102,6 +102,11 @@ into the data folder's `records/` (`<data>: LOCAL.md`) and never into git. `benc
 (`tools/lint/records.txt`) and records others sent (pull requests). Commit messages and documents give the numbers
 themselves, not a link to a record.
 
+Do not run a measurement whose result is already known. A run that gives the same result each time (greedy, the same
+binary, settings and text, on the same machine in the same state) and has been measured is read from its record, not
+run again. Measure again only what can differ: a changed binary or setting, a run at temperature, or a cell suspected
+of noise (once).
+
 ## Lints
 
 Before committing, run `tools/lint/run.sh` from the repository root: without arguments it lints the files that differ from HEAD (changed or new), or the files given.

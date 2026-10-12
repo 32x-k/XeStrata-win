@@ -202,13 +202,13 @@ class Engine:
 
     def __init__(self, name: str, arm: str, cmd: list[str], profile: str, env: dict | None = None,
                  cwd: str | None = None, root: Path | None = None, py: str | None = None, server: str | None = None,
-                 map: tuple[str, str] | None = None, cfg_extra: dict | None = None, prompt_only: bool = False,
+                 map: tuple[str, str] | None = None, cfg_extra: dict | None = None,
                  how: str | None = None):
         self.name, self.arm, self.cmd, self.profile = name, arm, list(cmd), profile
         self.env = dict(os.environ) if env is None else env
         self.cwd, self.root, self.py = cwd, root, py or sys.executable
         self.server = server or "serve/server.py"
-        self.map, self.cfg_extra, self.prompt_only, self.how = map, cfg_extra or {}, prompt_only, how
+        self.map, self.cfg_extra, self.how = map, cfg_extra or {}, how
 
     @classmethod
     def from_spec(cls, name: str, arm: str, spec: str, profile: str, root: Path | None = None,
@@ -284,6 +284,8 @@ class Merge:
         self.engines = []
         for arm in ("xe", "up"):
             a = arm.upper()
+            if arm == "up" and os.environ.get("UP") == "none":   # XeStrata alone, judged against its previous record
+                continue
             root = Path(need(f"{a}_ROOT")) if usage else None
             e = Engine.from_spec(arm, arm, need(a), need(f"{a}_PROFILE"), root, os.environ.get("PY"))
             if usage and len(e.cmd) != 1:

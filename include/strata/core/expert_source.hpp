@@ -85,6 +85,14 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/me
                            const std::string& self_cgroup = "/proc/self/cgroup",
                            const std::string& cgroup_root = "/sys/fs/cgroup");
 
+/// #11: whether a RAM copy of `copy` bytes is page-locked.  Page-locked host memory belongs to the GPU driver (Linux
+/// xe: a buffer object it maps), and when the RAM beside it cannot hold what the run keeps reading from the model's
+/// files, reclaim reaches that memory under the GPU's copies: on a B70 with 31 GiB of RAM and 17.5 GiB locked, the
+/// prompt's copies faulted and timed out while the experts' files paged in and out; the same copy pageable ran.
+/// True when the RAM `available` before the copy, less the copy, still holds `headroom` and `in_place` (the bytes read
+/// from the files through the page cache); `why` gets the numbers either way, for the log.
+bool resident_pin_fits(uint64_t copy, uint64_t in_place, uint64_t headroom, uint64_t available, std::string& why);
+
 /// Build compact offsets for experts absent from both the primary GPU cache and an optional second GPU tier.
 /// Kept CPU-only so selection and byte accounting can be tested without initializing a GPU.
 bool make_cache_complement_plan(
@@ -109,6 +117,11 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
 /// The adaptive tier swapped `in` into a GPU slot and `out` out of it: `out` takes `in`'s place in the compact copy
 /// (the caller copies out's bytes there).  False, and nothing changed, unless `in` is in the copy and `out` is not.
 bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out);
+
+/// The sentence appended to a "not enough RAM" start failure: how much of the RAM is file cache (Cached + Buffers of
+/// `meminfo_text`, a /proc/meminfo text, mapped pages included) and what to do about it; "" when under 1 GiB of cache
+/// (nothing to say).  upstream 8c80a3ba.
+std::string page_cache_hint(const std::string& meminfo_text);
 
 }  // namespace detail
 
@@ -339,9 +352,17 @@ struct ExpertDispatch {
     int pcie_num = 0;
     /// The measured split (after Project Maya's CPU lane): the times taken at start, from which `pcie_split_m` gives
     /// the number of a group's missed experts read over PCIe; `pcie_overlap`: the GPU reads them beside its VRAM hits
-    /// (the verify window's fetch branch).  Null: the share `pcie_num`/256.
-    const PcieSplitTimes* pcie_split = nullptr;
+    /// (the verify window's fetch branch).  Null: the share `pcie_num`/256.  Its CPU times are refined from the decode's
+    /// own pool calls (`expert_pool_dispatch_multi`, STRATA_PCIE_SPLIT_REFINE=0 keeps the start-up times).
+    PcieSplitTimes* pcie_split = nullptr;
     bool pcie_overlap = false;
+    /// The pool calls the split's CPU times are checked against: their wall time, the time the split's times gave
+    /// them, the calls and their experts since the last update, and the updates made (three at most).
+    struct SplitRefine {
+        double ms = 0.0, ms_model = 0.0;
+        int64_t calls = 0, experts = 0;
+        int updates = 0;
+    } split_refine;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     /// STRATA_ROUTE_TAIL_SKIP=R: entries skipped (a missed expert every token of the window routes only at rank >= R)
     /// and the distinct experts behind them (neither copied nor computed)
@@ -462,8 +483,9 @@ public:
     /// The resident RAM mode (`--resident-experts`, `--resident-cpu-experts`):
     ///   - `pin`: page-locked and mapped (`cudaHostAlloc`), so the prompt path copies it by DMA and the verify
     ///     window may read a share of the misses over PCIe; when the driver refuses, ordinary memory locked in the
-    ///     working set instead.  `pin = false` is ordinary pageable memory (the ROCm arm: large pinned allocations
-    ///     can fail there, and it is what the HIP measurements used).
+    ///     working set instead.  `Pin::automatic` locks it only when the RAM left beside it holds what is still read
+    ///     from the files (detail::resident_pin_fits, #11); `Pin::off` is ordinary pageable memory (the ROCm arm:
+    ///     large pinned allocations can fail there, and it is what the HIP measurements used).
     ///   - `lend_from_slot` >= 0: the GPU-cache slots from there to the end are the prompt path's lend region; their
     ///     experts are kept in RAM too, from the last slot down, as far as `available RAM - headroom_bytes` allows
     ///     (a lent slot's expert is streamed during the prompt and copied back after it).
@@ -476,8 +498,9 @@ public:
     /// and the #403 margin) - the soft --resident-experts mode's second try when the whole complement does not fit;
     /// false when not even one expert fits.  On Windows the mapped experts leave the working set before any reading.
     static constexpr uint64_t kResidentWhatFits = ~0ull;
+    enum class Pin { off, automatic, on };
     bool pin_cache_complement(
-        const ExpertCache& cache, std::string& err, bool pin = true,
+        const ExpertCache& cache, std::string& err, Pin pin = Pin::automatic,
         const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
         const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);

@@ -192,7 +192,7 @@ def intel(tag: str, src: Path, data: Path, gpu: dict, say: Callable) -> dict:
     env = {**os.environ, "STRATA_SYCL_ROOT": str(data), "STRATA_SYCL_BIN": "build-sycl/strata",
            "STRATA_SYCL_NAME": "xestrata-bench-upstream", "ONEAPI_DEVICE_SELECTOR": f"level_zero:{index}"}
     return {"exe": str(src / "sycl" / "serve" / "strata-sycl.sh"), "env": env, "map": (str(data), "/work"),
-            "server": "sycl/serve/server_intel.py", "prompt_only": True,
+            "server": "sycl/serve/server_intel.py",
             "how": "its sycl/ port, compiled in its Docker image (JIT)"}
 
 
@@ -214,4 +214,4 @@ def prepare(tag: str, data: Path, gpus: list[dict], license: str, profile: str, 
     e = how(tag, src, data, gpu, say)
     return Engine(f"upstream {tag}", "up", [e["exe"]], str(src / "data" / Path(profile).name), env=e["env"],
                   cwd=str(src), root=src, py=sys.executable, server=e.get("server"), map=e.get("map"),
-                  cfg_extra=e.get("cfg_extra"), prompt_only=e.get("prompt_only", False), how=e["how"])
+                  cfg_extra=e.get("cfg_extra"), how=e["how"])

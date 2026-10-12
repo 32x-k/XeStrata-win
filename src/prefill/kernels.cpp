@@ -152,8 +152,17 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
     const strata::kernels::KvHostPools host = host_p ? *host_p : strata::kernels::KvHostPools{};
     const strata::kernels::KvHostPools stage = stage_p ? *stage_p : strata::kernels::KvHostPools{};
     const int32_t* table = page_table;
+    // upstream 5a0df898 (its sycl/ port): the host copy and the staging pool are written 4 bytes a lane, 64 contiguous
+    // bytes a group, instead of one 1- or 2-byte store a lane, which ran at ~30 MB/s into pinned host memory on a B70
+    // (2 s of a 4K prompt there with --kv-resident).  STRATA_KV_WIDE_HOST=0: the narrow stores.
+    static const bool wide_env = [] {
+        const char* v = std::getenv("STRATA_KV_WIDE_HOST");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    const bool wide = wide_env;   // (a kernel captures a copy, not the static)
     Q(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> wm(sycl::range<1>(2), h);
+        sycl::local_accessor<uint32_t, 1> lane(sycl::range<1>(64), h);   // the group's 64 values, for the wide stores
         h.parallel_for(sycl::nd_range<3>({(size_t) T, 2, 8 * 64}, {1, 1, 64}), [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int64_t t = (int64_t) it.get_group(0);
@@ -169,6 +178,19 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
             if (k_pool != nullptr) {   // uniform
                 const uint16_t hv = hf(x);
                 if (page >= 0) (is_v ? v_pool : k_pool)[row * 256 + d] = hv;
+                if (wide && (host.k_pool != nullptr || stage.k_pool != nullptr)) {   // uniform
+                    lane[tid] = hv;
+                    sycl::group_barrier(it.get_group());
+                    if (tid < 32) {
+                        const size_t l2 = 2 * (size_t) tid;
+                        const uint32_t w = lane[l2] | (lane[l2 + 1] << 16);
+                        if (host.k_pool != nullptr)
+                            reinterpret_cast<uint32_t*>((is_v ? host.v_pool : host.k_pool) + row_id * 256 + (int64_t) g * 64)[tid] = w;
+                        if (stage.k_pool != nullptr)
+                            reinterpret_cast<uint32_t*>((is_v ? stage.v_pool : stage.k_pool) + row_id * 256 + (int64_t) g * 64)[tid] = w;
+                    }
+                    return;
+                }
                 if (host.k_pool != nullptr) (is_v ? host.v_pool : host.k_pool)[row_id * 256 + d] = hv;
                 if (stage.k_pool != nullptr) (is_v ? stage.v_pool : stage.k_pool)[row_id * 256 + d] = hv;
                 return;
@@ -185,6 +207,23 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
             if (page >= 0) {
                 (is_v ? v_q : k_q)[row * 256 + d] = (int8_t) qv;
                 if (tid == 0) (is_v ? v_scale : k_scale)[row * 4 + g] = sb;
+            }
+            if (wide && (host.k_q != nullptr || stage.k_q != nullptr)) {   // uniform
+                lane[tid] = (uint32_t) (uint8_t) (int8_t) qv;
+                sycl::group_barrier(it.get_group());
+                if (tid < 16) {
+                    const size_t l4 = 4 * (size_t) tid;
+                    const uint32_t w = lane[l4] | (lane[l4 + 1] << 8) | (lane[l4 + 2] << 16) | (lane[l4 + 3] << 24);
+                    if (host.k_q != nullptr)
+                        reinterpret_cast<uint32_t*>((is_v ? host.v_q : host.k_q) + row_id * 256 + (int64_t) g * 64)[tid] = w;
+                    if (stage.k_q != nullptr)
+                        reinterpret_cast<uint32_t*>((is_v ? stage.v_q : stage.k_q) + row_id * 256 + (int64_t) g * 64)[tid] = w;
+                }
+                if (tid == 0) {
+                    if (host.k_q != nullptr) (is_v ? host.v_scale : host.k_scale)[row_id * 4 + g] = sb;
+                    if (stage.k_q != nullptr) (is_v ? stage.v_scale : stage.k_scale)[row_id * 4 + g] = sb;
+                }
+                return;
             }
             if (host.k_q != nullptr) {
                 (is_v ? host.v_q : host.k_q)[row_id * 256 + d] = (int8_t) qv;

@@ -183,26 +183,6 @@ inline float q2_q8_dot_impl(int v, const int* u, const uint8_t* scales, const ha
     return low(dm2) * sumf_d - high(dm2) * sumf_m;
 }
 
-inline float q3_q8_dot_impl(int vl, int vh, const int* u, const uint8_t* scales, int scale_offset, float d3,
-                            const float* d8) {
-    float sumf = 0.0f;
-    for (int i = 0; i < 4; ++i) {
-        const int isc = scale_offset + 2 * i;
-        const int isc_low = isc % 8;
-        const int sc_shift_low = 4 * (isc / 8);
-        const int sc_low = (scales[isc_low] >> sc_shift_low) & 0xf;
-        const int isc_high = isc % 4;
-        const int sc_shift_high = 2 * (isc / 4);
-        const int sc_high = ((scales[8 + isc_high] >> sc_shift_high) & 3) << 4;
-        const int sc = (sc_low | sc_high) - 32;
-        const int vil = (vl >> (2 * i)) & 0x03030303;
-        const int vih = ((vh >> i) << 2) & 0x04040404;
-        const int vi = vsubss4(vil, vih);
-        sumf += d8[i] * (dp4a(vi, u[i], 0) * sc);
-    }
-    return d3 * sumf;
-}
-
 // Exact pinned vec_dot_q6_K_q8_1: keep signed per-16-element scales,
 // signed-byte subtraction, DP4A order, and the float accumulation sequence.
 inline float q6_q8_dot_impl(int vl, int vh, const int* u, const int8_t* scales, float d, const float* d8) {
@@ -377,29 +357,37 @@ struct Q20Traits {
         return r.d2 * low(chunk->ds) * sumi;
     }
 };
+// The signed values and the scales of a lane's Q3_K chunk are worked out once in load() and reused for every column
+// (upstream 195d3791: the multi-column Q3_K kernels were 14% of an RTX A4000's GPU time on the Q2_0 pack); apply() is
+// the arithmetic of pinned vec_dot_q3_K_q8_1 in its order, so the output is the same bits.
 struct Q3KTraits {
     using Block = Q3KBlock;
     static constexpr int DIV = 256, T = 16, KBY = 8, BPI = WARPS * WARP / 16;
     static int kqs(int tid) { return tid % 16; }
-    struct W { int vl, vh; float d; const uint8_t* scales; int scale_offset, bq8_offset; };
+    struct W { int vi[4], sc[4]; float d; int bq8_offset; };
     static W load(const Block* w, int iqs) {
         W r;
         r.bq8_offset = 4 * (iqs / 8);
-        r.scale_offset = iqs - iqs % 8 + (iqs % 8) / 4;
+        const int scale_offset = iqs - iqs % 8 + (iqs % 8) / 4;
         r.d = (float) w->d;
-        r.vl = load_int_b2(w->qs, iqs);
-        r.vh = ~load_int_b2(w->hmask, iqs % 8) >> r.bq8_offset;
-        r.scales = w->scales;
+        const int vl = load_int_b2(w->qs, iqs);
+        const int vh = ~load_int_b2(w->hmask, iqs % 8) >> r.bq8_offset;
+        for (int i = 0; i < 4; ++i) {
+            const int isc = scale_offset + 2 * i;
+            const int sc_low = (w->scales[isc % 8] >> (4 * (isc / 8))) & 0xf;
+            const int sc_high = ((w->scales[8 + isc % 4] >> (2 * (isc / 4))) & 3) << 4;
+            r.sc[i] = (sc_low | sc_high) - 32;
+            r.vi[i] = vsubss4((vl >> (2 * i)) & 0x03030303, ((vh >> i) << 2) & 0x04040404);
+        }
         return r;
     }
     static float apply(const W& r, const Q81Block* x, int iqs) {
-        int u[4];
-        float d8[4];
+        float sumf = 0.0f;
         for (int i = 0; i < 4; ++i) {
-            u[i] = load_int(x[r.bq8_offset + i].qs, iqs % 8);
-            d8[i] = low(x[r.bq8_offset + i].ds);
+            const int u = load_int(x[r.bq8_offset + i].qs, iqs % 8);
+            sumf += low(x[r.bq8_offset + i].ds) * (float) (dp4a(r.vi[i], u, 0) * r.sc[i]);
         }
-        return q3_q8_dot_impl(r.vl, r.vh, u, r.scales, r.scale_offset, r.d, d8);
+        return r.d * sumf;
     }
 };
 // vec_dot_q2_K_q8_1: QI2_K = 16 lanes a block, each one 32-bit word of qs against four Q8_1 blocks

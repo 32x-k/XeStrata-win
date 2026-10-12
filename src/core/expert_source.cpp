@@ -292,6 +292,49 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     return true;
 }
 
+bool resident_pin_fits(uint64_t copy, uint64_t in_place, uint64_t headroom, uint64_t available, std::string& why) {
+    const double gib = 1073741824.0;
+    const uint64_t left = available > copy ? available - copy : 0;
+    const bool fits = available > 0 && left >= headroom && left - headroom >= in_place;
+    char b[512];
+    std::snprintf(b, sizeof b,
+                  fits ? "the %.2f GiB RAM copy is page-locked: of %.2f GiB available, %.2f GiB stays beside it for the "
+                         "%.2f GiB still read from the model's files and the %.0f GiB headroom"
+                       : "the %.2f GiB RAM copy stays pageable (#11): of %.2f GiB available, %.2f GiB stays beside it, "
+                         "less than the %.2f GiB still read from the model's files and the %.0f GiB headroom (memory "
+                         "page-locked there faulted the GPU's copies when the files paged; STRATA_RESIDENT_PIN=1 locks it "
+                         "anyway)",
+                  (double) copy / gib, (double) available / gib, (double) left / gib, (double) in_place / gib,
+                  (double) headroom / gib);
+    why = b;
+    return fits;
+}
+
+std::string page_cache_hint(const std::string& meminfo_text) {
+    const auto kib = [&](const char* key) -> uint64_t {
+        std::istringstream in(meminfo_text);
+        std::string line;
+        const std::string want = std::string(key) + ":";
+        while (std::getline(in, line)) {
+            std::istringstream f(line);
+            std::string k;
+            uint64_t v = 0;
+            if (f >> k >> v && k == want) return v;
+        }
+        return 0;
+    };
+    const uint64_t cache = (kib("Cached") + kib("Buffers")) * 1024;
+    if (cache < (1ull << 30)) return "";
+    char msg[420];
+    std::snprintf(msg, sizeof msg,
+                  "; %.1f GiB of the RAM is file cache (earlier runs' model files, which Linux gives back on demand - "
+                  "'free' showing little is normal). If the start still fails, free it with: "
+                  "sync; echo 1 | sudo tee /proc/sys/vm/drop_caches   (or start the server with "
+                  "STRATA_DROP_CACHE_ON_EXIT=1 so it releases its model files when it stops)",
+                  (double) cache / 1073741824.0);
+    return msg;
+}
+
 }  // namespace detail
 
 namespace {
@@ -883,7 +926,7 @@ const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) cons
 }
 
 bool FileExpertSource::pin_cache_complement(
-    const ExpertCache& cache, std::string& err, bool pin,
+    const ExpertCache& cache, std::string& err, Pin pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
     uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
     err.clear();
@@ -923,6 +966,7 @@ bool FileExpertSource::pin_cache_complement(
     if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, primary_gpu_pairs,
                                             additional_gpu_pairs, offsets, bytes, err)) return false;
     const bool what_fits = budget_bytes == kResidentWhatFits;   // #467: the soft mode's second try
+    const int64_t lend_asked = lend_from_slot;   // #11: the lent slots whose experts stay on the files are read again
     uint64_t budget_physical = 0;   // #403: the RAM reading a budget was sized from (0: no budget)
     if (budget_bytes > 0) {
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while
@@ -980,10 +1024,10 @@ bool FileExpertSource::pin_cache_complement(
 
     const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
     uint64_t budget = std::numeric_limits<uint64_t>::max();
+    uint64_t physical = budget_physical;
     if (bytes > 0 || lend) {
         // #403: with a budget, the reading it was sized from - a second reading a few MB lower (the engine's own
         // allocations, the file cache) failed a budget the first one had clamped.  (A budget turns `lend` off.)
-        uint64_t physical = budget_physical;
         if (physical == 0 && !available_memory_bytes(physical)) {
             err = "FileExpertSource: cannot determine available RAM for the resident-memory safety check";
             return false;
@@ -997,6 +1041,13 @@ bool FileExpertSource::pin_cache_complement(
                           (double) bytes / 1073741824.0, (double) physical / 1073741824.0,
                           (double) headroom_bytes / 1073741824.0);
             err = message;
+#if defined(__linux__)
+            if (std::ifstream mi("/proc/meminfo"); mi) {
+                std::stringstream mt;
+                mt << mi.rdbuf();
+                err += detail::page_cache_hint(mt.str());
+            }
+#endif
             return false;
         }
     }
@@ -1015,6 +1066,30 @@ bool FileExpertSource::pin_cache_complement(
             if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, core,
                                                     additional_gpu_pairs, offsets, bytes, err)) return false;
         }
+    }
+
+    // #11: page-locked only when the RAM beside the copy holds what is still read from the files - the experts neither
+    // on a GPU nor in the copy, and the prompt's lent slots' experts the copy does not keep
+    bool lock = pin == Pin::on;
+    if (pin == Pin::automatic && bytes > 0) {
+        std::vector<char> on_gpu((size_t) (n_layers_ * n_expert_), 0);
+        using Pairs = std::vector<std::pair<int32_t, int32_t>>;
+        for (const Pairs* pairs : {static_cast<const Pairs*>(&primary_gpu_pairs), &additional_gpu_pairs})
+            for (const auto& [l, e] : *pairs)
+                if (l >= 0 && e >= 0 && l < n_layers_ && e < n_expert_) on_gpu[(size_t) l * (size_t) n_expert_ + (size_t) e] = 1;
+        uint64_t in_place = 0;
+        for (size_t i = 0; i < on_gpu.size(); ++i)
+            if (!on_gpu[i] && offsets[i] == kNoComplement) in_place += layer_blob_bytes_[i / (size_t) n_expert_];
+        if (lend_asked >= 0)
+            for (size_t i = 0; i < primary_gpu_pairs.size(); ++i) {
+                const auto [l, e] = primary_gpu_pairs[i];
+                if (pair_slot[i] >= lend_asked && offsets[(size_t) l * (size_t) n_expert_ + (size_t) e] == kNoComplement)
+                    in_place += layer_blob_bytes_[(size_t) l];
+            }
+        if (physical == 0 && !available_memory_bytes(physical)) physical = 0;
+        std::string why;
+        lock = detail::resident_pin_fits(bytes, in_place, headroom_bytes, physical, why);
+        std::fprintf(stderr, "FileExpertSource: %s\n", why.c_str());
     }
 
     void* arena = nullptr;
@@ -1041,9 +1116,9 @@ bool FileExpertSource::pin_cache_complement(
     };
     if (bytes > 0) {
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
-                     (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
+                     (double) bytes / 1073741824.0, lock ? "page-locked" : "pageable resident");
         std::fflush(stderr);
-        if (pin) {
+        if (lock) {
             const bool allocated = strata::gpu::alloc_host(&arena, (size_t) bytes);
             if (allocated == true) {
                 void* alias = nullptr;
@@ -1725,6 +1800,39 @@ int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h) {
 }
 
 namespace {
+// The split's CPU times come from start-up calls of one token an expert, alone on the pool.  A decode's calls ran
+// slower than those times gave: 1.7x on the RX 9060 XT (0.049 against ~0.085 ms an expert; decode 41 tok/s against
+// upstream's 45 at a fixed share), and 3.5x beside a busy host, where the split gave the CPU nearly every missed expert
+// (26 against 40 tok/s).  The decode's own pool calls are set against the times the split read for them, and the CPU's
+// times are scaled by the ratio when it is off by more than 15%: after 512 calls with experts on the CPU, then 1,024 and
+// 2,048 more, three updates at most (as upstream's PcieAuto refines its share).  STRATA_PCIE_SPLIT_REFINE=0: the
+// start-up times stay.
+void refine_split(ExpertDispatch& d, bool both, int experts, double ms) {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PCIE_SPLIT_REFINE");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    ExpertDispatch::SplitRefine& r = d.split_refine;
+    if (!on || r.updates >= 3) return;
+    PcieSplitTimes& t = *d.pcie_split;
+    r.ms += ms;
+    r.ms_model += both ? t.cb0 + t.cb * experts : t.c0 + t.c * experts;
+    ++r.calls;
+    r.experts += experts;
+    if (r.calls < (int64_t) 512 << r.updates || r.experts < 300) return;
+    const double ratio = r.ms_model > 0.0 ? r.ms / r.ms_model : 1.0;
+    ++r.updates;
+    r = ExpertDispatch::SplitRefine{0.0, 0.0, 0, 0, r.updates};
+    if (!(ratio > 0.0) || (ratio >= 1.0 / 1.15 && ratio <= 1.15)) return;
+    const double f = std::min(4.0, std::max(0.25, ratio));
+    t.c0 *= f;
+    t.c *= f;
+    t.cb0 *= f;
+    t.cb *= f;
+    std::fprintf(stderr, "strata: PCIe split: the decode's CPU pool calls took %.2fx the start-up times; an expert on "
+                         "the CPU is now %.3f ms (%.3f beside the link), update %d of 3\n", ratio, t.c, t.cb, r.updates);
+}
+
 // STRATA_ROUTE_TAIL_SKIP: the rank from which a missed expert that every token of the window routes that low is
 // skipped (upstream b4e3407b).  An explicit environment value is read once; the serve start-up (generate.cpp) sets the
 // default where it applies.
@@ -1782,6 +1890,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const int64_t n = n_tok * k;
     int32_t kind[kMaxWindowEntries];       // per entry: -1 CPU, 0 VRAM, 1 PCIe, 2 a helper GPU, -2 skipped
     std::fill_n(kind, kMaxWindowEntries, -1);
+    int split_m = -1;                      // the measured split's PCIe count for this layer (-1: no split)
     if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
         int64_t distinct[kMaxWindowEntries], first_of[kMaxWindowEntries];
         int nd = 0, nmiss = 0;
@@ -1847,6 +1956,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int m = !pcie_ok ? 0
                       : d.pcie_split != nullptr ? pcie_split_m(*d.pcie_split, d.pcie_overlap, nmiss, std::max(0, nd - nmiss))
                                                 : (nmiss * d.pcie_num) >> 8;
+        if (pcie_ok && d.pcie_split != nullptr) split_m = m;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
@@ -2038,6 +2148,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
+    if (split_m >= 0 && njobs > 0 && d.remote_count == 0) refine_split(d, split_m > 0, njobs, ms(c3, c4));
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
@@ -2784,7 +2895,12 @@ bool ArenaExpertSource::make_kernel_readable(std::string& err) {
     if (!dev_slice_.empty()) return true;
     if (arena_ == nullptr) { err = "the arena is a file mapping"; return false; }
     auto* a = static_cast<PinnedArena*>(arena_);
-    if (!a->to_host_usm(strata::kernels::cpu::expert_layout().max_blob, err)) return false;
+    // issue #10: the RAM available before each layer moves (UINT64_MAX when it cannot be read)
+    const auto ram = [] {
+        detail::HostMemory hm;
+        return detail::host_available_memory(hm) ? hm.available : UINT64_MAX;
+    };
+    if (!a->to_host_usm(strata::kernels::cpu::expert_layout().max_blob, err, ram)) return false;
     base_ = a->data();
     pinned_bytes_ = a->registered_bytes;
     slice_bytes_ = a->slice_bytes;

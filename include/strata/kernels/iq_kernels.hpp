@@ -39,6 +39,10 @@ void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int
 /// uses: row 2r = gate row r, row 2r+1 = up row r.
 void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
                        void* stream);
+/// iq_dequant_gu_f16 and iq_dequant_f16 of the down matrix (n_embd x n_ff values of `d_type`) in one launch (upstream
+/// 75109596, in its sycl/ port: the same values, one launch an expert fewer).
+void iq_dequant_expert_f16(int gu_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* gu_dst,
+                           int d_type, const void* down, uint16_t* d_dst, void* stream);
 
 /// Whether iq_gemm_grouped_f16 takes weights of `ggml_type` in [N, K] matrices: N and K multiples of 128.  Q3_K is
 /// not taken.
