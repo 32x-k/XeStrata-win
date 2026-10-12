@@ -36,6 +36,8 @@
 #define GGML_COMMON_IMPL_SYCL
 #include "ggml-common.h"
 
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -921,7 +923,12 @@ struct Kernel {
         }
     }
     auto get(syclex::properties_tag) const {
+        // Intel's XMX bodies in the large register file: in the default one their sums and tiles spilled, 3.1x slower
+        // (B70, llm-jp-4.1's experts, 256 rows an expert: 6,464 against 2,070 us)
         if constexpr (DP4A) return syclex::properties{};   // no sub-group operations: the device's own size
+        else if constexpr (IS != 0)
+            return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(ISG)>,
+                                      sycl::ext::intel::experimental::grf_size<256>};
         else return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(ISG)>};
     }
 };
@@ -976,10 +983,21 @@ struct IntelLayoutCheck {
 // intel_body, and its accumulators laid out as intel_body reads them: 1 Xe2's (8 x 16 x 32 on 16 lanes), 2 Xe-HPG's (8
 // x 8 x 32 on 8), else 0.  STRATA_NO_XMX=1: 0.
 template<int IS>
-bool intel_fits(const sycl::device& d) {
-    const size_t local = std::max<size_t>(Kernel<17, 2, 2, false, false, IS>::LOCAL, Kernel<12, 2, 2, false, false, IS>::LOCAL);
-    return d.get_info<sycl::info::device::local_mem_size>() >= local &&
-           d.get_info<sycl::info::device::max_work_group_size>() >= (size_t) Kernel<17, 2, 2, false, false, IS>::NSG * SG;
+bool intel_fits(sycl::queue& q) {
+    const sycl::device d = q.get_device();
+    using Big = Kernel<17, 2, 2, false, false, IS>;
+    const size_t local = std::max<size_t>(Big::LOCAL, Kernel<12, 2, 2, false, false, IS>::LOCAL);
+    if (d.get_info<sycl::info::device::local_mem_size>() < local ||
+        d.get_info<sycl::info::device::max_work_group_size>() < (size_t) Big::NSG * SG)
+        return false;
+    try {   // the large register file (intel_body's properties), as xmx_gemm.cpp's large_grf_ok checks it
+        (void) sycl::get_kernel_bundle<sycl::bundle_state::executable>(q.get_context(), {d},
+                                                                       {sycl::get_kernel_id<Big>()});
+        return true;
+    } catch (const sycl::exception& e) {
+        std::fprintf(stderr, "strata: the int8 XMX products do not build for this GPU (%s)\n", e.what());
+        return false;
+    }
 }
 template<int IS>
 bool intel_layout_ok(sycl::queue& q) {
@@ -1018,7 +1036,7 @@ int intel_shape_of(sycl::queue& q) {
                 rep = rep || (c.atype == mx::matrix_type::sint8 && c.btype == mx::matrix_type::sint8 &&
                               c.ctype == mx::matrix_type::sint32 && c.dtype == mx::matrix_type::sint32 && m && nn && k);
             }
-            if (!rep || !(is == 1 ? intel_fits<1>(d) : intel_fits<2>(d))) continue;
+            if (!rep || !(is == 1 ? intel_fits<1>(q) : intel_fits<2>(q))) continue;
             if (is == 1 ? intel_layout_ok<1>(q) : intel_layout_ok<2>(q)) return is;
             std::fprintf(stderr, "strata: the GPU's int8 XMX accumulators are laid out otherwise: the experts' prompt "
                                  "products do not take them\n");
@@ -1051,13 +1069,21 @@ sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, s
         if (tail) STRATA_MMQ_ROWS(true, true, 0);
         STRATA_MMQ_ROWS(true, false, 0);
     }
-    if (const int is = intel_shape_of(q); is == 1) {   // Intel's XMX
-        if (tail) STRATA_MMQ_ROWS(false, true, 1);
-        STRATA_MMQ_ROWS(false, false, 1);
+    // Intel's XMX: the 32-row tile's work-group (128 lanes) decodes the step's weights at half the 64-row one's rate,
+    // and took longer for 32 rows than the 64-row tile for 64 on the B70; so 16 rows, else 64
+#define STRATA_MMQ_ROWS_INTEL(TAIL, IS)                                                     \
+    do {                                                                                    \
+        if (max_rows <= 16) return STRATA_MMQ_LAUNCH(1, 1, false, TAIL, IS);                \
+        return STRATA_MMQ_LAUNCH(2, 2, false, TAIL, IS);                                    \
+    } while (0)
+    if (const int is = intel_shape_of(q); is == 1) {
+        if (tail) STRATA_MMQ_ROWS_INTEL(true, 1);
+        STRATA_MMQ_ROWS_INTEL(false, 1);
     } else if (is == 2) {
-        if (tail) STRATA_MMQ_ROWS(false, true, 2);
-        STRATA_MMQ_ROWS(false, false, 2);
+        if (tail) STRATA_MMQ_ROWS_INTEL(true, 2);
+        STRATA_MMQ_ROWS_INTEL(false, 2);
     }
+#undef STRATA_MMQ_ROWS_INTEL
     if (tail) STRATA_MMQ_ROWS(false, true, 0);
     STRATA_MMQ_ROWS(false, false, 0);
 #undef STRATA_MMQ_ROWS
