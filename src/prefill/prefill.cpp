@@ -647,7 +647,10 @@ struct MmqPlan {
     size_t gu_max = 0, d_max = 0;
 };
 const MmqPlan& mmq_plan() {
-    static const MmqPlan plan = [] {
+    // per GPU (the current device's): a layer split's stages can differ, and a stage that took the first GPU's plan
+    // ran int8 products its own GPU lacks (B70 + RTX 4070: the 4070's prompt chunk stopped at its first layer)
+    static core::PerDevice<MmqPlan> plans;
+    return plans.get(core::Runtime::get().device(), [] {
         MmqPlan p;
         const auto& lay = strata::kernels::cpu::expert_layout();
         const char* env = std::getenv("STRATA_PREFILL_MMQ");
@@ -668,8 +671,7 @@ const MmqPlan& mmq_plan() {
             p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
         }
         return p;
-    }();
-    return plan;
+    });
 }
 uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
     const MmqPlan& mp = mmq_plan();
