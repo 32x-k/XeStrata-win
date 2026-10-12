@@ -2070,6 +2070,18 @@ def low_ram_needed(model, ram) -> bool:
     return ram < MODELS[model]["arena_gb"] + LOW_RAM_HEADROOM_GB
 
 
+def kv_streaming_ram_gb(ctx, kv) -> float:
+    """The RAM a streamed KV cache takes: ~13.7 KB per context token with 8-bit KV, 10.6 KB with K8V4, 7.5 KB with
+    4-bit (12 QSA layers + the draft layer)."""
+    return ctx * (13 * KV_CELL_BYTES.get(kv, 1056)) / 1e9
+
+
+def kv_streaming_wanted(model, ctx, kv, ram) -> bool:
+    """Does setup stream this model's KV cache on this PC (--kv-resident): from 64K up, when the RAM holds the cache
+    beside the model's experts (+1 GB).  The merges' and the release's measurements ask it too (tools/bench_core.py)."""
+    return ctx >= 65536 and ram >= MODELS[model]["ram_gb"] + kv_streaming_ram_gb(ctx, kv) + 1
+
+
 def low_ram_gpu_gb(model, vram_gb, ctx=32768, kv="int8") -> float:
     """About how many GB of the model's experts the GPU's cache holds: its VRAM less ~5 GB for the dense weights,
     buffers and a 32K context's KV cache (upstream's figure, not measured on an Arc card: unverified), less the KV
@@ -4200,8 +4212,8 @@ def main() -> int:
     # per layer) stays in VRAM; the VRAM it frees holds more experts (+6% at 128K, +23% at 262K with Q2_0). It
     # costs ~13.7 KB of RAM per context token with 8-bit KV (1.7 GB at 128K), 10.6 KB with K8V4, 7.5 KB with 4-bit, so
     # only when it fits.
-    kv_ram_gb = ctx * (13 * KV_CELL_BYTES.get(kv, 1056)) / 1e9   # 12 QSA layers + the draft layer
-    if ctx >= 65536 and ram >= MODELS[model]["ram_gb"] + kv_ram_gb + 1:
+    kv_ram_gb = kv_streaming_ram_gb(ctx, kv)
+    if kv_streaming_wanted(model, ctx, kv, ram):
         args += ["--kv-resident", "32768"]
         ok(f"KV streaming on: the context's KV cache lives in RAM ({kv_ram_gb:.1f} GB), more experts fit in VRAM")
         if budget is not None and a.resident_budget_gib is None:   # its RAM comes out of the experts' budget
