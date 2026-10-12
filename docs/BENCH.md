@@ -56,7 +56,7 @@ Its engine is made as upstream's setup makes it:
 | --- | --- |
 | NVIDIA | the release's prebuilt engine (its SHA-256 checked) |
 | AMD | the tag's sources compiled with HIP |
-| Intel | upstream's `sycl/` built in Docker (docker must work without sudo) |
+| Intel | upstream's `sycl/` built in Docker (docker must work without sudo), run with the settings its `sycl/setup_intel.py` writes for the card |
 
 - NVIDIA's prebuilt engine and the Intel Docker image are not free software: a free build does not compare on NVIDIA and Intel GPUs.
 - A cell where upstream turns out to run at 10 tok/s or less is stopped in that tier and not compared (it is listed under the runs that stopped).

@@ -56,7 +56,7 @@ xestrata --bench --original-strata v0.1.41        # 同じモデルで upstream 
 | --- | --- |
 | NVIDIA | リリースの配布物（SHA-256 を確かめる） |
 | AMD | タグのソースを HIP でビルド |
-| Intel | upstream の `sycl/` を Docker でビルド（sudo なしで docker が使えること） |
+| Intel | upstream の `sycl/` を Docker でビルド（sudo なしで docker が使えること）。その `sycl/setup_intel.py` がカードに書く設定で動かす |
 
 - NVIDIA の配布物と Intel の Docker イメージは自由ソフトウェアでないので、free のビルドでは NVIDIA と Intel の比較はしません。
 - upstream が 10 tok/s 以下と分かった欄は、その段の途中で止めて比べません（「止まった回」に出ます）。

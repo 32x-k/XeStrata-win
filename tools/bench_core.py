@@ -198,17 +198,18 @@ class Engine:
     or a wrapper and its arguments); `env`: its environment; `cwd`; `root`: its tree, whose serve/server.py (or
     `server`) the usage runs start; `py`: the Python that runs that server; `profile`: its expert profile.  `map`:
     (host prefix, its prefix) when it sees the data folder elsewhere (a container).  `cfg_extra`: what its server's
-    config needs besides (its CUDA libraries' folders)."""
+    config needs besides (its CUDA libraries' folders).  `adapt`: what its setup changes in the arguments it is given
+    (upstream's sycl/setup_intel.py)."""
 
     def __init__(self, name: str, arm: str, cmd: list[str], profile: str, env: dict | None = None,
                  cwd: str | None = None, root: Path | None = None, py: str | None = None, server: str | None = None,
                  map: tuple[str, str] | None = None, cfg_extra: dict | None = None,
-                 how: str | None = None):
+                 how: str | None = None, adapt: Callable[[list[str]], list[str]] | None = None):
         self.name, self.arm, self.cmd, self.profile = name, arm, list(cmd), profile
         self.env = dict(os.environ) if env is None else env
         self.cwd, self.root, self.py = cwd, root, py or sys.executable
         self.server = server or "serve/server.py"
-        self.map, self.cfg_extra, self.how = map, cfg_extra or {}, how
+        self.map, self.cfg_extra, self.how, self.adapt = map, cfg_extra or {}, how, adapt
 
     @classmethod
     def from_spec(cls, name: str, arm: str, spec: str, profile: str, root: Path | None = None,
@@ -230,6 +231,10 @@ class Engine:
             return list(words)
         host, inside = self.map
         return [inside + w[len(host):] if w.startswith(host + "/") else w for w in words]
+
+    def run_args(self, words: list[str]) -> list[str]:
+        """An engine's whole argument list: what its setup changes in it (`adapt`), with the paths as it sees them."""
+        return self.inside(self.adapt(words) if self.adapt else words)
 
 
 def model_args(pack: str, native: str | None, ple: str | None, extra: list[str]) -> list[str]:
@@ -378,7 +383,7 @@ def watch_generate(p: subprocess.Popen, log: Path, slow: float, owner: str) -> s
 def run_generate(e: Engine, args: list[str], ids: Path, log: Path, follow: Path | None = None, slow: float = 0.0,
                  extra_env: dict | None = None, dry: bool = False) -> int | None:
     """One generate run into `log` (the engine's output, then the stop line if it was stopped); the exit code."""
-    cmd = [*e.cmd, *e.inside([*args, "--tokens-file", str(ids), "--max-new", str(MAX_NEW)])]
+    cmd = [*e.cmd, *e.run_args([*args, "--tokens-file", str(ids), "--max-new", str(MAX_NEW)])]
     if follow is not None:
         cmd += e.inside(["--spec-follow", str(follow)])
     if dry:
@@ -427,7 +432,7 @@ def run_serve(e: Engine, args: list[str], ids: dict, tier: str, mode: str, rnd: 
               slow: float = 0.0, dry: bool = False) -> dict:
     """One process, one chat of 1 + len(FOLLOWUPS) turns: the turns' DONE fields and why it ended early, if it did.
     The first turn at `slow` tok/s or less (its prompt or its output) ends it: "stopped: prompt|output"."""
-    cmd = [*e.cmd, "--serve", *e.inside(args)]
+    cmd = [*e.cmd, "--serve", *e.run_args(args)]
     if dry:
         print("DRY serve " + shlex.join(cmd) + f" | {tier} {mode} {rnd}", flush=True)
         return {"turns": [], "why": None}
@@ -595,7 +600,7 @@ def run_usage(e: Engine, cfg: dict, seed: int, agent_files: list[str], stem: Pat
     or less ends it ("stopped: output")."""
     port = port or free_port()
     cfg = {**{k: v for k, v in cfg.items() if k not in ("api_key", "host", "port", "args")}, "port": port,
-           "args": e.inside(cfg["args"])}
+           "args": e.run_args(cfg["args"])}
     cpath = stem.with_name(stem.name + ".config.json")
     cmd = [e.py, str(Path(e.root or ROOT) / e.server), "--engine", "strata", "--config", str(cpath),
            "--port", str(port), "--host", "127.0.0.1"]
