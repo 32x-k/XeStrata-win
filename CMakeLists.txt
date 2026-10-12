@@ -628,6 +628,13 @@ if(STRATA_ENABLE_XE)
     # it is built but not registered, as in the CUDA build.
     add_executable(iq_parity src/kernels/iq_parity.cpp)
     target_link_libraries(iq_parity PRIVATE strata_kernels)
+    # the prompt's int8 expert products, in the form the GPU takes (Intel's XMX, NVIDIA's and AMD's matrix engines,
+    # dp4a), against ggml's dequantizers on synthetic weights
+    add_executable(iq_mmq_parity src/kernels/iq_mmq_parity.cpp)
+    target_include_directories(iq_mmq_parity PRIVATE third_party/main/ggml)
+    target_link_libraries(iq_mmq_parity PRIVATE strata_kernels strata_kernels_cpu)
+    add_test(NAME iq_mmq_parity COMMAND iq_mmq_parity --selftest)
+    set_tests_properties(iq_mmq_parity PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(rope_parity src/kernels/rope_parity.cpp)
     target_link_libraries(rope_parity PRIVATE strata_kernels)
     add_test(NAME rope_parity COMMAND rope_parity --selftest)
