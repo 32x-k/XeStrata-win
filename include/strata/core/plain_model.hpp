@@ -132,6 +132,9 @@ private:
     bool record(int T, std::string& err);
     bool record_window(int T, strata::gpu::Stream cs, std::string& err);
     bool adapt(std::string& err);
+    /// The adaptive tier's copies in flight: their experts become resident once the copies are done (`wait`: wait
+    /// for them; else only if they are).
+    bool settle_swaps(bool wait, std::string& err);
     bool fill_slot(int64_t layer, int32_t expert, std::string& err);
     /// The prompt path's buffers for chunks of `T` tokens, carved by prompt_carve: the pinned host block allocated at
     /// load for the longest chunk, the device block borrowed from the tier for each prompt (plain_prompt.cpp uses them).
@@ -239,6 +242,11 @@ private:
 
     // the window's buffers (device unless noted)
     strata::gpu::Stream cs_ = nullptr;
+    // the adaptive tier's copies (from the pinned RAM copy, beside the windows) and the experts they bring in
+    strata::gpu::Stream swap_cs_ = nullptr;
+    strata::gpu::Event* swap_ev_ = nullptr;
+    struct PendingSwap { int32_t layer, expert, slot; };
+    std::vector<PendingSwap> pending_;
     std::vector<strata::gpu::Graph*> exec_;                      ///< per T: the whole window
     std::vector<std::vector<strata::gpu::Graph*>> segs_;         ///< per T: the segments (MoeWindow::segmented)
     float *h_emb_ = nullptr, *m_emb_ = nullptr;                  ///< mapped: T rows of n_embd

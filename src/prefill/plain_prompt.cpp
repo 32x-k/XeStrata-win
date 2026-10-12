@@ -90,6 +90,7 @@ PlainModel::PromptGemm& PlainModel::prompt_gemm() {
 }
 
 bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
+    if (!settle_swaps(true, err)) return false;   // the tier's copies may still be writing the slots lent below
     const int64_t L = spec_.n_moe_layers(), E = spec_.n_expert, n = n_slots_;
     const uint64_t* off = cache_.slot_offsets();
     if (borrow_first_ >= 0 || off == nullptr || L <= 0 || n < 2) { err = "plain prompt: no tier to borrow from"; return false; }

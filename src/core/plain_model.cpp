@@ -77,6 +77,7 @@ k::QsaShapes attn_shapes(const ModelSpec& s, int64_t n_head_kv) {
 PlainModel::PlainModel() = default;
 
 PlainModel::~PlainModel() {
+    if (swap_cs_ != nullptr) strata::gpu::stream_sync(swap_cs_);
     if (cs_ != nullptr) strata::gpu::stream_sync(cs_);
     prompt_gemm_.reset();   // the products' state before the stream
     strata::gpu::free(prompt_host_);
@@ -86,6 +87,8 @@ PlainModel::~PlainModel() {
     for (void* p : allocs_) strata::gpu::free(p);
     for (void* p : {(void*) h_emb_, (void*) h_step_, (void*) h_pos_, (void*) h_out_, (void*) fill_tmp_})
         strata::gpu::free(p);
+    if (swap_ev_ != nullptr) strata::gpu::event_destroy(swap_ev_);
+    if (swap_cs_ != nullptr) strata::gpu::stream_destroy(swap_cs_);
     if (cs_ != nullptr) strata::gpu::stream_destroy(cs_);
 }
 
@@ -595,6 +598,12 @@ bool PlainModel::open_experts(std::string& err) {
             std::fprintf(stderr, "strata plain: no PCIe split (%s): the CPU takes every missed expert\n", why.c_str());
         }
     }
+    // the adaptive tier's copy stream: its rounds bring experts in beside the windows (adapt)
+    swap_cs_ = strata::gpu::stream_create();
+    if (swap_cs_ == nullptr || !strata::gpu::event_create(&swap_ev_)) {
+        err = "plain model: the adaptive tier's copy stream";
+        return false;
+    }
     // the tier from a profile, after the split's timing (which needs experts in RAM outside the VRAM): its ranking,
     // each layer up to its slots
     if (!opt_.profile.empty()) {
@@ -808,7 +817,7 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
         err = "plain model: the window is out of range";
         return false;
     }
-    if (!record(T, err)) return false;
+    if (!record(T, err) || !settle_swaps(false, err)) return false;
     const int64_t N = s.n_embd, NH = s.n_head;
     const k::QsaShapes qs = attn_shapes(s, nkv_);
     for (int t = 0; t < T; ++t) {
@@ -884,6 +893,8 @@ bool PlainModel::save_profile(const std::string& path, std::string& err) const {
 // round, the largest gains first; then the counts decay.  Runs between windows, so no window reads a slot it changes.
 bool PlainModel::adapt(std::string& err) {
     const int64_t L = spec_.n_moe_layers(), E = spec_.n_expert;
+    if (!settle_swaps(false, err)) return false;
+    if (!pending_.empty()) return true;   // the last round's copies are still landing: no new round yet
     struct Swap { float gain; int32_t layer, in, out; };   // out < 0: a free slot
     std::vector<Swap> swaps;
     std::vector<std::pair<float, int32_t>> cand, vict;
@@ -917,10 +928,41 @@ bool PlainModel::adapt(std::string& err) {
             res_[(size_t) (w.layer * E + w.out)] = -1;
             free_[(size_t) w.layer].push_back(slot);
         }
-        if (!fill_slot(w.layer, w.in, err)) return false;
+        // from the pinned RAM copy on the copy stream, beside the next windows: the evicted expert is out of the plan
+        // already, and the new one goes in once the copy is done (settle_swaps); else read into a slot and wait
+        const uint8_t* hb = src_->transient(w.layer, w.in) ? nullptr : src_->blob(w.layer, w.in);
+        if (hb != nullptr && strata::gpu::is_host_usm(hb)) {
+            auto& f = free_[(size_t) w.layer];
+            const int32_t slot = f.back();
+            if (!strata::gpu::copy_async(cache_.device_slot(slot), hb, k::cpu::expert_layout().blob_bytes(w.layer),
+                                         swap_cs_)) {
+                err = std::string("plain model: the adaptive tier's copy: ") + strata::gpu::last_error();
+                return false;
+            }
+            f.pop_back();
+            pending_.push_back({w.layer, w.in, slot});
+        } else if (!fill_slot(w.layer, w.in, err)) {
+            return false;
+        }
         ++swaps_total_;
     }
+    if (!pending_.empty() && !strata::gpu::event_record(swap_ev_, swap_cs_)) {
+        err = std::string("plain model: the adaptive tier's copies: ") + strata::gpu::last_error();
+        return false;
+    }
     for (float& v : disp_.usage) v *= opt_.adapt_decay;
+    return true;
+}
+
+bool PlainModel::settle_swaps(bool wait, std::string& err) {
+    if (pending_.empty()) return true;
+    if (wait ? !strata::gpu::event_sync(swap_ev_) : !strata::gpu::event_query(swap_ev_)) {
+        if (!wait) return true;
+        err = std::string("plain model: the adaptive tier's copies: ") + strata::gpu::last_error();
+        return false;
+    }
+    for (const PendingSwap& p : pending_) res_[(size_t) (p.layer * spec_.n_expert + p.expert)] = p.slot;
+    pending_.clear();
     return true;
 }
 
