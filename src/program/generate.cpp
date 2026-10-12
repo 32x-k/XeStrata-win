@@ -5953,8 +5953,11 @@ int main(int argc, char** argv) {
     };
     auto lend_slots = [&](int64_t c) -> int64_t { return lend_slots_of(xcache, ss, -1, c); };
     auto lend_bytes = [&](int32_t first) -> uint64_t { return lend_bytes_of(xcache, first); };
-    // every later stage's cache can lend a chunk of c tokens (`fits` its slot count)
+    // every later stage's cache can lend a chunk of c tokens (`fits` its slot count); with lend_stages false, CUDA0's
+    // alone decides (#448: what one GPU would read, for the warning where the chunk is chosen)
+    bool lend_stages = true;
     auto stages_lend = [&](int64_t c, const auto& fits) -> bool {
+        if (!lend_stages) return true;
         for (const auto& st : stages)
             if (!fits(st->cache, lend_slots_of(st->cache, st->ss, st->dev, c))) return false;
         return true;
@@ -5967,12 +5970,13 @@ int main(int argc, char** argv) {
     // and the bigger ring does not buy that back - on the B70 at STRATA_VRAM_LIMIT_MIB=8192, IQ3_S, interleaved:
     // 8K prompt 6144/default ring 532-817 tok/s, 8192/96 717-1161 (6 pairs); 32K 4096/default 565-617, 8192/96
     // 1046-1293 (3 pairs); 4K 405-653, 283-712 (3 pairs).  STRATA_PREFILL_RING still wins.
+    auto lend_pct = [] {
+        const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
+        return v ? (int64_t) std::strtol(v, nullptr, 10)
+                 : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
+    };
     auto auto_slots = [&](int64_t c) -> int64_t {
-        const int64_t pct = [] {
-            const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
-            return v ? (int64_t) std::strtol(v, nullptr, 10)
-                     : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
-        }();
+        const int64_t pct = lend_pct();
         auto fits = [&](const strata::core::ExpertCache& x, int64_t k) {
             return k + 128 <= x.slots() && k * 100 <= pct * x.slots();
         };
@@ -6134,6 +6138,17 @@ int main(int argc, char** argv) {
         // cache already filled to its reserve, that is the over-subscription the auto sizing avoids - so the
         // prompt chunk is halved until its buffers fit in the lendable slots (a smaller chunk only reads slower)
         if (!o.no_prefill_borrow && d_res != nullptr) {
+            // upstream #448: a small card in a layer split caps every stage's chunk (an RTX 3080's 512-slot cache held
+            // a 32 GB card's split to 512 tokens: prompts 6.2x slower, decode the same).  Named when it bites: each
+            // later stage that cannot lend the chunk CUDA0 alone would read in.  Planned first, so the plan that
+            // counts (its ring) is the last one made.
+            int64_t alone = 0;
+            if (!stages.empty()) {
+                int64_t c = o.prefill_chunk;
+                lend_stages = false;
+                if (plan_lend(c) > 0) alone = c;
+                lend_stages = true;
+            }
             int64_t chunk = o.prefill_chunk;
             if (const int64_t k = plan_lend(chunk); k > 0) {
                 if (o.prefill_auto)
@@ -6148,6 +6163,21 @@ int main(int argc, char** argv) {
                 borrow_bytes = xcache.slot_offsets()
                                    ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[lend_first])
                                    : (uint64_t) k * (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+                for (const auto& st : stages) {
+                    if (alone <= chunk) break;
+                    const int64_t kb = lend_slots_of(st->cache, st->ss, st->dev, alone);
+                    const int64_t ns = st->cache.slots();
+                    if (kb + 128 <= ns && (!o.prefill_auto || kb * 100 <= lend_pct() * ns)) continue;
+                    const std::string pct =
+                        o.prefill_auto ? ", and lend at most " + std::to_string(lend_pct()) + "%" : "";
+                    std::fprintf(stderr, "strata serve: WARNING: prompt chunk %lld tokens, not %lld: CUDA%d (%s) has "
+                                         "%lld expert-cache slots, and a %lld-token chunk borrows %lld of them (it "
+                                         "must keep 128%s) - prompts read slower than on CUDA0 alone (upstream "
+                                         "#448)\n",
+                                 (long long) chunk, (long long) alone, st->dev,
+                                 strata::core::device_info(st->dev).name.c_str(), (long long) st->cache.slots(),
+                                 (long long) alone, (long long) kb, pct.c_str());
+                }
             } else if (o.prefill_auto) {
                 o.prefill_chunk = 1024;   // nothing lendable: small buffers of its own
             }

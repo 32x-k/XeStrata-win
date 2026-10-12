@@ -12,6 +12,7 @@ GPUs of different makers can be combined (Intel, AMD and NVIDIA; with NVIDIA, in
 
 The GPUs hand off once per verify window, through the CPU's memory (12,804 floats a token).
 The prefill path borrows its buffers from each GPU's expert cache, as on one GPU (with one chunk size on every GPU).
+When a later GPU's cache is too small to lend the chunk the first GPU alone would read, the log names it (`WARNING: prompt chunk`, upstream #448).
 
 It is opt-in and changes nothing when the options are absent (a port of upstream's layer split).
 
