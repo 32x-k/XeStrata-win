@@ -5,23 +5,29 @@
 // the weights dequantized by ggml (to_float), multiplied in double.
 //
 //     build/iq_mmq_parity --selftest
+//     build/iq_mmq_parity --bench      the int8 and the FP16 form of a layer's experts, timed (not in CTest)
 //
 // A type for each way the products read scales: a scale per 32 (Q8_0, at a K with a tail past the step; IQ3_XXS), a
 // scale per 16 (IQ2_XS) and a min term (Q4_K); each over three experts of 5, 40 and 17 rows and one of 70 (the tile
 // shapes of 16, 32 and 64 rows).  The weights are random block bytes with a sane d: every bit pattern of the grid
 // indices and signs is a valid block.  Exit 77 (skipped) where the GPU runs neither form.
+#include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_mmq.hpp"
+#include "strata/kernels/xmx_gemm.hpp"
 #include "parity_device.hpp"
 
 #include "ggml.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace {
@@ -130,9 +136,114 @@ int check(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>& counts)
     return ok ? 0 : 1;
 }
 
+// --bench: a layer's experts as PlainModel's prompt takes them, 16 experts of r rows each, in the two forms the
+// prompt chooses between: int8 (gate and up products, down product: iq_mmq_grouped) and FP16 (the weights
+// dequantized, then grouped products: dequant_f16, xmx_gemm_grouped).  The steps both forms share (the routed rows'
+// input, the SwiGLU, the down product's input) are left out.  Synthetic weights (any bits time alike), the shapes and
+// types of Ornith-1.5 (Q4_K_M, GSQ-RCO 3bit), llm-jp-4.1 Q4_K_M and Qwen3.8's IQ3_XXS pack.
+struct Combo {
+    const char* name;
+    ggml_type gate, up, down;
+    int64_t N, FF;
+};
+
+double time_us(sycl::queue& q, const std::function<void()>& f) {
+    f();
+    q.wait();
+    f();
+    q.wait();
+    constexpr int reps = 10, trials = 5;   // the best of 5 means of 10: the GPU's clock and the host's moves
+    double best = 1e30;
+    for (int t = 0; t < trials; ++t) {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i) f();
+        q.wait();
+        best = std::min(best, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps);
+    }
+    return best;
+}
+
+int bench() {
+    namespace k = strata::kernels;
+    sycl::queue& q = strata::core::Runtime::get().compute();
+    void* s = P::stream();
+    const bool matrix = k::iq_mmq_usable(q);
+    std::printf("iq_mmq_parity --bench: int8 %s, FP16 products %s\n", matrix ? "on the matrix engines" : "by dp4a",
+                k::gemm_path(k::XmxType::f16));
+    const Combo combos[] = {{"ornith-q4_k_m", GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, 2048, 512},
+                            {"ornith-3bit", GGML_TYPE_Q3_K, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, 2048, 512},
+                            {"llmjp-q4_k_m", GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, 2560, 960},
+                            {"qwen-iq2_xs", GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, 2560, 640}};
+    constexpr int G = 16;
+    for (const Combo& c : combos) {
+        const int64_t N = c.N, FF = c.FF;
+        const bool one = c.gate == c.up;   // gate and up as one matrix of 2 FF rows (one product)
+        const size_t gb = ggml_row_size(c.gate, N) * (size_t) FF, ub = ggml_row_size(c.up, N) * (size_t) FF;
+        const size_t db = ggml_row_size(c.down, FF) * (size_t) N;
+        P::Device dev;
+        uint8_t* wg = dev.alloc<uint8_t>((gb + ub) * G);   // per expert: gate's rows, then up's
+        uint8_t* wd = dev.alloc<uint8_t>(db * G);
+        q.memset(wg, 0x11, (gb + ub) * G).wait();
+        q.memset(wd, 0x11, db * G).wait();
+        uint16_t* dq_gu = dev.alloc<uint16_t>((size_t) G * 2 * (size_t) (FF * N));
+        uint16_t* dq_d = dev.alloc<uint16_t>((size_t) (G * N * FF));
+        for (int64_t r : {8, 16, 32, 64, 128, 256}) {
+            const int64_t R = G * r;
+            std::vector<int32_t> bounds(G + 1), ids((size_t) R);
+            for (int e = 0; e <= G; ++e) bounds[(size_t) e] = (int32_t) (e * r);
+            for (int64_t i = 0; i < R; ++i) ids[(size_t) i] = (int32_t) i;
+            P::Device io;
+            int32_t* db_ = io.upload(bounds);
+            int32_t* di = io.upload(ids);
+            auto xq_of = [&](ggml_type t, int64_t cols) {   // quantized rows of zeros for type t's products
+                const bool dup = k::iq_mmq_type_dup((int) t);
+                uint8_t* p = io.alloc<uint8_t>(k::iq_mmq_act_bytes(R, dup ? 2 * cols : cols));
+                float* z = io.alloc<float>((size_t) (R * cols));
+                q.memset(z, 0, (size_t) (R * cols) * 4).wait();
+                k::iq_mmq_quantize(q, z, nullptr, p, cols, cols, R, k::iq_mmq_type_sums((int) t), dup).wait();
+                return p;
+            };
+            const uint8_t *xg = xq_of(c.gate, N), *xu = one ? xg : xq_of(c.up, N), *xh = xq_of(c.down, FF);
+            float* gu = io.alloc<float>((size_t) (R * 2 * FF));
+            float* dn = io.alloc<float>((size_t) (R * N));
+            uint16_t* x16 = io.alloc<uint16_t>((size_t) (R * N));
+            uint16_t* h16 = io.alloc<uint16_t>((size_t) (R * FF));
+            q.memset(x16, 0, (size_t) (R * N) * 2).wait();
+            q.memset(h16, 0, (size_t) (R * FF) * 2).wait();
+            auto cols = [&](ggml_type t, int64_t n) { return k::iq_mmq_type_dup((int) t) ? 2 * n : n; };
+            const double us8 = time_us(q, [&] {
+                if (one) {
+                    k::iq_mmq_grouped(q, (int) c.gate, wg, gb + ub, 2 * FF, cols(c.gate, N), G, xg, R, db_, r, di, gu,
+                                      2 * FF);
+                } else {
+                    k::iq_mmq_grouped(q, (int) c.gate, wg, gb + ub, FF, cols(c.gate, N), G, xg, R, db_, r, di, gu, 2 * FF);
+                    k::iq_mmq_grouped(q, (int) c.up, wg + gb, gb + ub, FF, cols(c.up, N), G, xu, R, db_, r, di, gu + FF,
+                                      2 * FF);
+                }
+                k::iq_mmq_grouped(q, (int) c.down, wd, db, N, cols(c.down, FF), G, xh, R, db_, r, di, dn, N);
+            });
+            const double us16 = time_us(q, [&] {
+                for (int e = 0; e < G; ++e) {
+                    const uint8_t* b = wg + (size_t) e * (gb + ub);
+                    uint16_t* o = dq_gu + (size_t) e * (size_t) (2 * FF * N);
+                    k::dequant_f16((int) c.gate, b, 0, FF, N, o, s);
+                    k::dequant_f16((int) c.up, b + gb, 0, FF, N, o + FF * N, s);
+                    k::dequant_f16((int) c.down, wd + (size_t) e * db, 0, N, FF, dq_d + (size_t) e * (size_t) (N * FF), s);
+                }
+                k::xmx_gemm_grouped(x16, dq_gu, 2 * FF * N, gu, db_, G, r, 2 * FF, N, s);
+                k::xmx_gemm_grouped(h16, dq_d, N * FF, dn, db_, G, r, N, FF, s);
+            });
+            std::printf("  %-14s %3lld rows an expert: int8 %8.1f us  FP16 %8.1f us  %s\n", c.name, (long long) r, us8,
+                        us16, us8 < us16 ? "int8" : "FP16");
+        }
+    }
+    return 0;
+}
+
 }  // namespace
 
-int main() try {
+int main(int argc, char** argv) try {
+    if (argc > 1 && std::string(argv[1]) == "--bench") return bench();
     sycl::queue& q = strata::core::Runtime::get().compute();
     const bool matrix = strata::kernels::iq_mmq_usable(q), dp4a = strata::kernels::iq_mmq_dp4a_usable(q);
     std::printf("iq_mmq_parity: the int8 expert products %s\n",
