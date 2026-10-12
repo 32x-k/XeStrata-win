@@ -325,7 +325,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     // goes): 0 the GDN layers, 4 the attention layers, 1 the router and the host's grouping, 2 the experts, 3 the shared
     // expert and the combine
     static const bool profile = std::getenv("STRATA_PROMPT_PROFILE") != nullptr;
-    double stage_ms[5] = {};
+    double stage_ms[10] = {};   // 5-9: the GDN layers' parts (stage 0 is their sum)
     int64_t cpu_n = 0, cpu_rows = 0, miss_n = 0;   // for the profile: the CPU's experts and rows, the missed experts
     auto mark = [&](int stage, std::chrono::steady_clock::time_point& t) {
         if (!profile) return;
@@ -379,16 +379,28 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 k::native_qsa_rms_norm_weighted(P.x, b.attn_norm, P.hn, (int) N, (int) T, eps, cs);
                 f16(P.hn, T, N);
                 if (b.recurrent) {
+                    auto part = [&](int stage) {   // the profile's GDN parts, summed into stage 0 as well
+                        if (!profile) return;
+                        const auto t0 = t_mark;
+                        mark(stage, t_mark);
+                        if (stage != 0) stage_ms[0] += std::chrono::duration<double, std::milli>(t_mark - t0).count();
+                    };
+                    part(0);   // the norm and its FP16 copy
                     proj_hn(b.qkv, P.qkv);
                     proj_hn(b.z, P.z);
+                    part(5);
                     proj(b.alpha, P.ab, T, 2 * HV);
                     proj(b.beta, P.ab + HV, T, 2 * HV);
+                    part(6);
                     prefill::gdn_gates(P.ab, b.dt, b.a, P.gate, P.beta, T, cs, HK, HV);
                     prefill::gdn_conv(gdn_conv_[(size_t) b.gdn], P.qkv, b.conv, P.h, T, eps, cs, HK, HV);
+                    part(7);
                     prefill::gdn_recurrence(gdn_state_[(size_t) b.gdn], P.h, P.gate, P.beta, P.z, b.ssm_norm, eps, P.y,
                                             P.y16, T, cs, HK, HV, /*silu=*/true);
+                    part(8);
                     // (y16, the normed and gated output, exists only in FP16: no float rows to round to int8)
                     gm.native(P.y16, b.ssm_out.type, b.ssm_out.data, P.mix, T, b.ssm_out.n_out, b.ssm_out.n_in);
+                    part(9);
                 } else {
                     const int64_t a = b.attn;
                     proj_hn(b.q, P.qfull);
@@ -702,6 +714,10 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
         std::fprintf(stderr, "strata plain: prompt of %lld tokens: GDN %.1f ms, attention %.1f, router and grouping %.1f, "
                              "experts %.1f, shared and combine %.1f\n", (long long) n, stage_ms[0], stage_ms[4], stage_ms[1],
                      stage_ms[2], stage_ms[3]);
+    if (profile && stage_ms[0] > 0.0)
+        std::fprintf(stderr, "strata plain: the GDN layers: in-projections %.1f ms, alpha and beta %.1f, gates and conv %.1f, "
+                             "recurrence %.1f, out-projection %.1f\n", stage_ms[5], stage_ms[6], stage_ms[7], stage_ms[8],
+                     stage_ms[9]);
     if (profile)
         std::fprintf(stderr, "strata plain: prompt experts not in VRAM %lld, of them on the CPU %lld (%lld rows)\n",
                      (long long) miss_n, (long long) cpu_n, (long long) cpu_rows);
