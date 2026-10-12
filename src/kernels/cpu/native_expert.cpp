@@ -153,10 +153,14 @@ int native_gu_mt_min(int gu_type) {
 namespace {
 // The K-quants (Q4_K, Q5_K, Q6_K) and Q8_0 of the other models' experts on the AVX-2 multi-token kernels (iq_avx2.cpp,
 // the AVX-VNNI copy where the CPU has it): every CPU with AVX2, AVX-512 ones too (ggml-cpu's dots for these are
-// single-token there as well).  STRATA_NO_KQ256=1: ggml-cpu's dot for every token count.
+// single-token there as well).  STRATA_NO_KQ256=1: ggml-cpu's dot for every token count.  Q8_0 only with AVX-VNNI: on
+// a Ryzen 7 5700X (AVX2 alone, one thread, 2 to 4 tokens) its gate/up took 0.185 / 0.289 / 0.340 ms an expert of
+// Ornith's shape against ggml-cpu's 0.170 / 0.235 / 0.309, and llm-jp's down 0.275 / 0.334 / 0.383 against 0.171 /
+// 0.240 / 0.317; the K-quants were 1.3 to 1.6 times ggml-cpu's there.
 bool kq_on(int type) {
     static const bool on = cpu_avx2_ok() && std::getenv("STRATA_NO_KQ256") == nullptr;
-    return on && (kq256_supported(type) || type == (int) GGML_TYPE_Q8_0);
+    static const bool q80 = on && cpu_avxvnni_ok();
+    return type == (int) GGML_TYPE_Q8_0 ? q80 : on && kq256_supported(type);
 }
 }  // namespace
 
