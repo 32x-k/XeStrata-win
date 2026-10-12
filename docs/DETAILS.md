@@ -263,7 +263,8 @@ With every expert in RAM, the move into the GPU driver's memory (host USM) for t
   On an RTX 4070, swapping about 95 experts a round, decoding ran 14-15% faster (the B70 within the run-to-run spread).
   Which window first computes a swapped-in expert on the GPU depends on when its copy lands, so an answer can differ a little from run to run.
   `--adapt-async 0` restores the tier in which a window waits.
-  Without page-locked exchange buffers, and with `--batch`, the waiting tier runs.
+  Without page-locked exchange buffers, and with the pipelined groups of `--batch-groups`, the waiting tier runs (beside the `--batch` slots it moves on between their windows, upstream 495dc436).
+  `--adapt-min-gain F` (default 1.5) is the bar a swap must clear (the decayed routing count of the expert coming in against the one going out); higher means fewer swaps a round. Both tiers use it.
   With `--pipeline-windows 2` ([MULTIGPU](MULTIGPU.md)) the decode loop queues each card's copies while that card has no window in flight, and the copies into the evicted slots and the moves into RAM wait until the windows that were in flight when they were decided have completed (upstream 13eee452; `STRATA_PIPELINE_ADAPT_ASYNC=0`: the waiting tier).
   `STRATA_EXCHANGE_ROTATE=1` (opt-in, upstream 1e6cec80) hands the exchange buffer's ownership over at a swap instead of
   copying the evicted expert into the RAM copy (the same tokens, fewer host copies).

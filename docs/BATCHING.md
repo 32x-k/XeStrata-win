@@ -65,6 +65,18 @@ At a 32K context that is 4 slots from a 24 GB card; a smaller card stays at one 
   A new conversation takes an empty slot, else the one used longest ago.
 - A client that disconnects stops its slot (`BSTOP`); the others go on.
 
+## The VRAM expert tier keeps adapting in batch windows
+
+Batch windows count which experts they route to as well (upstream e989c671).
+Every `--adapt-every` windows (default 4) the engine swaps the most-routed experts that are not in VRAM into the cache in place of the least-routed resident ones, by the solo path's rule.
+`--adapt-swaps` and `--adapt-decay` apply too, and on a layer split every GPU's cache adapts.
+The swaps run beside the window's commit, emits and drafts, and have landed before the next window starts.
+The tier stands still while a long prompt is read beside decoding slots (the prompt may hold a loan of cache slots).
+With `--adapt-async` (the default in the resident RAM mode) no window waits for a round: each batch window moves the round on a step (upstream 495dc436), and a request that arrives finishes the round in flight before it starts.
+The pipelined groups of `--batch-groups` do not adapt.
+The `strata batch:` log line shows the rounds, the experts swapped in and the wait per window (`adapt wait`).
+Swaps move experts between the GPU and the CPU, which round differently, so greedy output can differ from run to run; `--adapt-every 1000000` keeps the tier fixed (Exactness, below).
+
 ## Exactness
 
 A batch row's arithmetic is the single-token window's, so with greedy decoding **every conversation of a batch produces exactly the tokens it produces alone**.

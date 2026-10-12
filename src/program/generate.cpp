@@ -437,6 +437,9 @@ struct Options {
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
     int adapt_every = 4;
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
+    /// an expert is swapped into the VRAM tier only when its decayed routing count beats the one it replaces by more
+    /// than this (--adapt-min-gain, upstream 495dc436; both tiers)
+    float adapt_min_gain = 1.5f;
     /// --adapt-async (--serve with the resident RAM mode): the adaptive tier's rounds advance between verify windows on
     /// a helper thread instead of one window waiting for a whole round (see the tier in the --serve block).  Not
     /// bit-exact run to run.  -1 (default): on where it applies; 1: asked (said when it cannot run); 0: the blocking tier.
@@ -766,6 +769,8 @@ void usage() {
                  "  --resident-cpu-experts  cache the static GPU cache's misses in ordinary RAM (with --mmap-experts)\n"
                  "  --shared-expert-arena FILE  share completed expert weights between Linux processes\n"
                  "  --coupled-draft / --no-coupled-draft  sample MTP drafts with the target's chain (default: off)\n"
+                 "  --adapt-min-gain F   the adaptive tier swaps an expert in only when its decayed routing count\n"
+                 "                       beats the one it replaces by more than F (default 1.5; higher = fewer swaps)\n"
                  "  --adapt-async 0|1    --serve with the resident RAM mode: the adaptive tier's swaps advance\n"
                  "                       between verify windows instead of a window waiting for a whole round (on\n"
                  "                       by default where it applies; not bit-exact run to run). 0 = the blocking tier.\n");
@@ -2351,6 +2356,7 @@ int main(int argc, char** argv) {
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
         else if (a == "--adapt-decay") o.adapt_decay = std::strtof(next("--adapt-decay"), nullptr);
+        else if (a == "--adapt-min-gain") o.adapt_min_gain = std::strtof(next("--adapt-min-gain"), nullptr);
         else if (a == "--adapt-async") o.adapt_async = std::strtol(next("--adapt-async"), nullptr, 10) != 0 ? 1 : 0;
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
         else if (a == "--stop-eos") o.stop_eos = true;
@@ -4190,8 +4196,9 @@ int main(int argc, char** argv) {
         // most one per GPU of the layer split, that divide the slots, so every card is busy (upstream, 4 x R9700, 8
         // clients: 90 tok/s in one group, 136 in 2, 166 in 4); auto is the default for a layer split with 2 or more
         // slots, and that default gives way to --batch-mtp (one group), whose drafts the pipelined groups do not run.
-        // Resolved here, with the slots that fit, so INFO batch_groups says what the serve loop runs.  (upstream also
-        // gives way to --adapt-async 1; the engine turns it off beside --batch slots anyway.)
+        // Resolved here, with the slots that fit, so INFO batch_groups says what the serve loop runs.  It also gives
+        // way to --adapt-async 1 when asked for (upstream b5d52031): the default (-1, on where it applies) does not,
+        // and the asynchronous tier is then off beside the pipelined groups.
         if (o.batch > 0) {
             strata::program::batch_groups::Input bin;
             bin.set = o.batch_groups_set;
@@ -4200,6 +4207,7 @@ int main(int argc, char** argv) {
             bin.batch = o.batch;
             bin.later_stages = (int) stages.size();
             bin.batch_mtp = batch_mtp;
+            bin.adapt_async = o.adapt_async == 1;
             const auto r = strata::program::batch_groups::resolve(bin);
             if (r.from_auto) {
                 o.batch_groups = r.groups;
@@ -6008,8 +6016,9 @@ int main(int argc, char** argv) {
     // --adapt-async (upstream b437b8ea, opt-in there; on by default here: with the resident RAM mode the RTX 4070 decoded
     // 14-15% faster - its small cache swaps ~95 experts a round - and the B70 within the run-to-run spread): where the
     // asynchronous adaptive tier does not apply, the blocking tier runs, said once when it was asked for.  It exchanges
-    // experts between the GPU cache and the resident RAM copy only.  Not beside the --batch slots (their windows run
-    // between a request's prompt chunks).  The pipelined decode loop (--pipeline-windows 2) has windows in flight at
+    // experts between the GPU cache and the resident RAM copy only.  Beside the --batch slots it advances between
+    // their windows, never between a prompt's chunks; not with --batch-groups (the pipelined slot groups; upstream
+    // 495dc436).  The pipelined decode loop (--pipeline-windows 2) has windows in flight at
     // every tick: there the steps that overwrite something a window may still read wait for those windows (see
     // adapt_tick); STRATA_PIPELINE_ADAPT_ASYNC=0 keeps the blocking tier beside it instead (upstream 13eee452).
     auto adapt_async_off = [&](const char* why) {
@@ -6025,7 +6034,7 @@ int main(int argc, char** argv) {
         const char* why = !o.serve ? "it needs --serve"
                         : o.adapt_every <= 0 || o.adapt_swaps <= 0 ? "the adaptive tier is off"
                         : !(o.resident_cpu_experts || o.resident_gib != 0) ? "it needs the resident RAM mode, --resident-experts"
-                        : o.batch > 0 ? "not with --batch slots"
+                        : o.batch > 0 && o.batch_groups > 1 ? "not with --batch-groups (the pipelined slot groups)"
                         : o.pipeline_windows >= 2 && !pl_async ? "not with --pipeline-windows 2 (STRATA_PIPELINE_ADAPT_ASYNC=0)"
                         : o.pipeline_windows >= 2 && split_devs.size() > 1
                             ? "not with --pipeline-windows 2 on three or more stages"
@@ -7186,7 +7195,7 @@ int main(int argc, char** argv) {
                 std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                                   [](auto& a, auto& b) { return a.first < b.first; });
                 for (size_t i = 0; i < nc; ++i) {
-                    if (cand[i].first < vict[i].first + 1.5f) break;
+                    if (cand[i].first < vict[i].first + o.adapt_min_gain) break;
                     swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
                 }
             }
@@ -7330,7 +7339,7 @@ int main(int argc, char** argv) {
                 std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                                   [](auto& a, auto& b) { return a.first < b.first; });
                 for (size_t i = 0; i < nc; ++i) {
-                    if (cand[i].first < vict[i].first + 1.5f) break;
+                    if (cand[i].first < vict[i].first + o.adapt_min_gain) break;
                     all.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
                 }
             }
@@ -7502,6 +7511,11 @@ int main(int argc, char** argv) {
                         aswaps[k++] = w;
                     }
                     aswaps.resize(k);
+                    if (aswaps.empty()) {   // nothing to move (converged, or the table moved): the round ends here
+                        a_ms += std::chrono::duration<double, std::milli>(Clock::now() - a_t0).count();
+                        astate = AState::Idle;
+                        continue;
+                    }
                     for (AHome& h : ahomes) h.used = false;
                     if (pl) {   // the copies in at each card's next gap: after this step, so fenced (see above)
                         a_res_dirty = true;
@@ -7906,6 +7920,12 @@ int main(int argc, char** argv) {
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0, bt_wait0 = 0, bt_pool0 = 0;
         int64_t bt_windows = 0, bt_rows = 0, bt_accepted = 0;   // bt_accepted: --batch-mtp proposals taken
+        // the adaptive VRAM tier in batch windows (upstream e989c671): the windows seen (--adapt-every counts them),
+        // and since the last timing line its rounds, the experts it swapped in and the ms a window waited for it
+        int64_t ba_window = 0, bt_adapt_rounds = 0, bt_adapt_swaps = 0;
+        double bt_adapt_wait = 0;
+        bool in_prompt_read = false;   // batch_step runs between a prompt's chunks: the adaptive tier stands still then
+        int64_t bt_a_rounds0 = 0, bt_a_swapped0 = 0;   // the asynchronous tier's counters when the timed windows began
         Clock::time_point bt_start = Clock::now();
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
         long long admit_max_new = 0;
@@ -8029,9 +8049,23 @@ int main(int argc, char** argv) {
             strata::core::progress().busy.store(true);
             drive.d.failed = false;
             apply_pending(false);
+            // --adapt-async: the round in flight moves on a step when its job and copies are done, or a due round
+            // starts (upstream 495dc436).  Never between a prompt's chunks (its loan of cache slots reads the tables);
+            // a request drains the round before its prompt lends any slot.  The table changes and uploads are this
+            // thread's; the copies are on the helper thread and the cards' refill streams.
+            if (ajob && !in_prompt_read) {
+                const Clock::time_point ta = Clock::now();
+                if (!adapt_tick(false)) {
+                    std::printf("ERR an adaptive refill failed\n");
+                    return false;
+                }
+                bt_adapt_wait += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
+            }
             if (bt_windows == 0) {
                 bt_start = Clock::now();
                 bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
+                bt_a_rounds0 = a_rounds;
+                bt_a_swapped0 = a_swapped;
             }
             const Clock::time_point w0 = Clock::now();
             if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
@@ -8039,6 +8073,20 @@ int main(int argc, char** argv) {
                 return false;
             }
             const Clock::time_point w1 = Clock::now();
+            // The adaptive VRAM tier, as the solo loop runs it (upstream e989c671): every --adapt-every windows, on a
+            // thread beside the commit, the emits and the drafts.  Every stage's window has finished here, and nothing
+            // in flight reads the slots a swap overwrites; the swaps land (apply_pending) before this window ends, so
+            // a prompt chunk read between windows, its loan of cache slots and a K/V growth never meet swaps in flight.
+            // Not between a prompt's chunks: its loan marks the lent experts missing until it is given back, and a
+            // swap would move one of them into a second slot (upstream 495dc436).
+            struct AdaptRun {
+                std::thread th;
+                bool ok = true;
+                ~AdaptRun() { if (th.joinable()) th.join(); }   // an error return below still joins it
+            } adapt_run;
+            if (!drive.d.usage.empty() && !ajob && !in_prompt_read && (++ba_window % o.adapt_every) == 0 &&
+                pending.empty())
+                adapt_run.th = std::thread([&] { adapt_run.ok = adapt(); });
             // --batch-mtp: a proposal is kept when the target picked it and there is room to emit both tokens
             std::vector<int> keep(bs.size(), 0);
             for (int a = 0; a < A; ++a) {
@@ -8112,22 +8160,43 @@ int main(int argc, char** argv) {
             }
             std::fflush(stdout);
             bt_emit += msd(w2, Clock::now());
+            if (adapt_run.th.joinable()) {
+                const Clock::time_point wa = Clock::now();
+                adapt_run.th.join();
+                if (!adapt_run.ok) {
+                    std::printf("ERR an adaptive refill failed\n");
+                    return false;
+                }
+                ++bt_adapt_rounds;
+                bt_adapt_swaps += (int64_t) pending.size();
+                apply_pending(true);   // the copies land and the tables follow (the next window plans from them)
+                bt_adapt_wait += msd(wa, Clock::now());
+            }
             strata::core::progress().busy.store(was_busy);
             if (!batch_on() && bt_windows > 0) {
                 const double w = (double) bt_windows, wall = msd(bt_start, Clock::now());
+                char adapt_txt[112] = "";
+                if (!drive.d.usage.empty() && ajob)
+                    std::snprintf(adapt_txt, sizeof adapt_txt,
+                                  "; adaptive tier (async): %lld rounds started, %lld experts swapped in",
+                                  (long long) (a_rounds - bt_a_rounds0), (long long) (a_swapped - bt_a_swapped0));
+                else if (!drive.d.usage.empty())
+                    std::snprintf(adapt_txt, sizeof adapt_txt, "; adaptive tier: %lld rounds, %lld experts swapped in",
+                                  (long long) bt_adapt_rounds, (long long) bt_adapt_swaps);
                 std::fprintf(stderr, "strata batch: %lld windows, avg %.2f rows, %.2f ms/window = run %.2f (GPU-reach wait "
-                                     "%.2f + CPU experts %.2f) + commit %.2f + emit %.2f; %.1f rows/s over %.0f ms of wall "
-                                     "time (admissions included)\n",
-                             (long long) bt_windows, (double) bt_rows / w, (bt_run + bt_commit + bt_emit) / w, bt_run / w,
+                                     "%.2f + CPU experts %.2f) + commit %.2f + emit %.2f + adapt wait %.2f%s; "
+                                     "%.1f rows/s over %.0f ms of wall time (admissions included)\n",
+                             (long long) bt_windows, (double) bt_rows / w,
+                             (bt_run + bt_commit + bt_emit + bt_adapt_wait) / w, bt_run / w,
                              (ver.ms_wait - bt_wait0) / w, (ver.ms_pool - bt_pool0) / w, bt_commit / w, bt_emit / w,
-                             1000.0 * (double) bt_rows / std::max(wall, 1e-9), wall);
+                             bt_adapt_wait / w, adapt_txt, 1000.0 * (double) bt_rows / std::max(wall, 1e-9), wall);
                 // each slot-window offers one proposal and yields 1 + (accepted) tokens (upstream 70fc0ba4)
                 if (batch_mtp)
                     std::fprintf(stderr, "strata batch: MTP proposals accepted %lld of %lld (%.1f%%)\n",
                                  (long long) bt_accepted, (long long) (bt_rows - bt_accepted),
                                  100.0 * (double) bt_accepted / (double) std::max<int64_t>(bt_rows - bt_accepted, 1));
-                bt_run = bt_commit = bt_emit = 0;
-                bt_windows = bt_rows = bt_accepted = 0;
+                bt_run = bt_commit = bt_emit = bt_adapt_wait = 0;
+                bt_windows = bt_rows = bt_accepted = bt_adapt_rounds = bt_adapt_swaps = 0;
             }
             return true;
         };
@@ -8360,6 +8429,12 @@ int main(int argc, char** argv) {
                 continue;
             }
             if (line.rfind("BYIELD", 0) == 0) continue;   // for a prompt read that has ended meanwhile
+            // a command may touch the expert cache (a request lends slots, a K/V growth moves them, a session restore
+            // quiesces it): a round of the asynchronous tier that the batch windows left in flight lands first
+            if (!adapt_tick(true)) {
+                std::printf("ERR an adaptive refill failed\n");
+                return 1;
+            }
             admit_slot = -1;
             if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
                 const bool bimg = line.rfind("BGENI ", 0) == 0;
@@ -9534,9 +9609,16 @@ int main(int argc, char** argv) {
                     if (decode_share <= 0.0 || !batch_on()) continue;
                     const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
                     const auto td = Clock::now();
+                    in_prompt_read = true;
                     do {
-                        if (!batch_step()) { batch_fatal = true; e = "a batch window failed"; return false; }
+                        if (!batch_step()) {
+                            in_prompt_read = false;
+                            batch_fatal = true;
+                            e = "a batch window failed";
+                            return false;
+                        }
                     } while (batch_on() && std::chrono::duration<double, std::milli>(Clock::now() - td).count() < budget);
+                    in_prompt_read = false;
                     ++il_parts;
                     il_ms += std::chrono::duration<double, std::milli>(Clock::now() - td).count();
                     if (trace) {
@@ -11392,7 +11474,7 @@ int main(int argc, char** argv) {
                 std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                                   [](auto& a, auto& b) { return a.first < b.first; });
                 for (size_t i = 0; i < nc; ++i) {
-                    if (cand[i].first < vict[i].first + 1.5f) break;
+                    if (cand[i].first < vict[i].first + o.adapt_min_gain) break;
                     swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
                 }
             }
