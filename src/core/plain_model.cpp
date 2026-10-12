@@ -39,6 +39,7 @@
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/xmx_gemm.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -448,7 +449,9 @@ bool PlainModel::prompt_int8() const {
     const char* v = std::getenv("STRATA_PLAIN_MMQ");
     if (v != nullptr && std::strtol(v, nullptr, 10) == 0) return false;
     sycl::queue& q = Runtime::get().compute();
-    if (!k::iq_mmq_usable(q) && !k::iq_mmq_dp4a_usable(q)) return false;
+    // dp4a only where the FP16 products have no matrix engines either: the B70 and Arc A have them without iq_mmq's
+    // shape, and their FP16 path (xmx_gemm_grouped) is the faster one, as on Qwen3.8's prompt path (prefill.cpp)
+    if (!k::iq_mmq_usable(q) && !(k::iq_mmq_dp4a_usable(q) && !k::f16_matrix_engines())) return false;
     // the products' outputs in 128s (2 n_ff and n_embd), their K in blocks of 32; gate's rows right before up's
     const int64_t N = spec_.n_embd, FF = spec_.n_ff_exp;
     if (N % 128 != 0 || (2 * FF) % 128 != 0 || FF % 32 != 0) return false;

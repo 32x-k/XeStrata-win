@@ -310,7 +310,9 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
         const char* v = std::getenv("STRATA_PLAIN_DENSE_MMQ");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    const bool dense_on = dense_env && (prefill::mmq::built() || prefill::mmq::built_dp4a());
+    // (dp4a only where the FP16 products have no matrix engines either, as for the experts: PlainModel::prompt_int8)
+    const bool dense_on = dense_env && (prefill::mmq::built() ||
+                                        (prefill::mmq::built_dp4a() && !strata::kernels::f16_matrix_engines()));
     auto dense = [&](const W& w, const float* x, int64_t ldx, float* y, int64_t T, int64_t ldy = 0) {
         if (!dense_on || w.data == nullptr || !prefill::mmq::supported(w.type) || w.n_out % 128 != 0 || w.n_in % 32 != 0)
             return false;
@@ -325,8 +327,9 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     auto proj = [&](const W& w, float* y, int64_t T, int64_t ldy = 0) {
         gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
     };
-    // the routed experts in their quantized blocks (int8 products, iq_mmq: on the matrix engines, else by dp4a) where
-    // every layer's types are theirs (prompt_int8, decided with the buffers), else dequantized to FP16
+    // the routed experts in their quantized blocks (int8 products, iq_mmq: on the matrix engines, else by dp4a where the
+    // FP16 products have none either) where every layer's types are theirs (prompt_int8, decided with the buffers),
+    // else dequantized to FP16
     const bool use_mmq = P.int8;
     // the CPU's share of the missed experts needs the split's times (measured at load from pinned RAM) and the int8
     // path's grouping; STRATA_PLAIN_CPU_SHARE=0: every expert on the GPU
