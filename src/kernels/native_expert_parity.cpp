@@ -319,6 +319,44 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
         }
         par::sync();
         par::copy_bytes_out(got_g.data(), dout, got_g.size() * 4);
+        // STRATA_GROUPED_BENCH (measuring): a decode token's call, 8 groups of one entry, each a different expert out
+        // of 64 copies of this one (past the GPU's last-level cache), in rotation; the time a call and the weight
+        // bytes it reads a microsecond
+        if (std::getenv("STRATA_GROUPED_BENCH") != nullptr && f.gu_type != 30) {
+            constexpr int kCopies = 64, kG = 8, kSets = kCopies / kG, kIters = 200;
+            auto* many = static_cast<uint8_t*>(par::alloc_bytes(blob.size() * kCopies));
+            for (int c = 0; c < kCopies; ++c) par::copy_bytes_in(many + blob.size() * c, blob.data(), blob.size());
+            std::vector<unsigned long long> ptrs((size_t) kSets * kG);
+            for (int i = 0; i < kSets * kG; ++i) ptrs[(size_t) i] = (unsigned long long) (many + blob.size() * i);
+            auto* dptrs = static_cast<unsigned long long*>(par::alloc_bytes(ptrs.size() * 8));
+            par::copy_bytes_in(dptrs, ptrs.data(), ptrs.size() * 8);
+            int32_t st[kG + 1], zero[kG], ent[kG];
+            for (int g = 0; g <= kG; ++g) st[g] = g;
+            for (int g = 0; g < kG; ++g) { zero[g] = 0; ent[g] = g; }
+            const int32_t ng = kG;
+            auto* bst = static_cast<int32_t*>(par::alloc_bytes(sizeof st));
+            auto* bn = static_cast<int32_t*>(par::alloc_bytes(4));
+            auto* bdst = static_cast<int32_t*>(par::alloc_bytes(sizeof ent));
+            auto* btok = static_cast<int32_t*>(par::alloc_bytes(sizeof zero));
+            void* bscr = par::alloc_bytes(strata::kernels::native_expert_scratch_bytes(kG, FF));
+            auto* bout = static_cast<float*>(par::alloc_bytes((size_t) kG * H * 4));
+            par::copy_bytes_in(bst, st, sizeof st);
+            par::copy_bytes_in(bn, &ng, 4);
+            par::copy_bytes_in(bdst, ent, sizeof ent);
+            par::copy_bytes_in(btok, zero, sizeof zero);
+            auto call = [&](int i) {
+                strata::kernels::native_expert_grouped(L, dptrs + (size_t) (i % kSets) * kG, bst, bn, bdst, btok, kG, kG,
+                                                       dxq, bscr, bout, s);
+            };
+            for (int i = 0; i < kSets; ++i) call(i);
+            par::sync();
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < kIters; ++i) call(i);
+            par::sync();
+            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / kIters;
+            std::printf("          grouped bench: %d experts of %zu bytes a call, %.1f us, %.1f GB/s\n", kG, blob.size(), us,
+                        (double) blob.size() * kG / us / 1e3);
+        }
     }
     const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
     const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
