@@ -185,6 +185,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
+  # a model's shape from its GGUF metadata, for each architecture the engine is being taught (synthetic GGUFs)
+  add_executable(model_spec_test src/artifact/model_spec_test.cpp)
+  target_link_libraries(model_spec_test PRIVATE strata_artifact)
+  add_test(NAME model_spec_test COMMAND model_spec_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------
@@ -395,7 +399,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/dequant_bf16.cpp src/kernels/xe/ple.cpp
                                     src/kernels/xe/s2_expert_grouped.cpp src/kernels/xe/qsa_prompt_attn.cpp
                                     src/kernels/xe/xmx_gemm.cpp src/kernels/xe/dp4a_gemm.cpp
-                                    src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp
+                                    src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp src/kernels/xe/prompt_attn.cpp
                                     src/kernels/xe/matrix_report.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_ngram)
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/main/ggml)
@@ -407,7 +411,8 @@ if(STRATA_ENABLE_XE)
   # verify window and the MTP drafter.  Host code over strata_core's GPU operations (strata/core/gpu.hpp).
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
-                                   src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
+                                   src/core/native_dense.cpp src/core/verify.cpp src/core/moe_window.cpp
+                                   src/core/plain_model.cpp src/core/pcie_split.cpp src/core/mtp.cpp
                                    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/vmm.cpp)
@@ -597,7 +602,7 @@ if(STRATA_ENABLE_XE)
   # src/kernels/xe/iq_mmq.cpp is written for, and the FP16 GEMM path elsewhere.  Upstream 0.1.38's quantized and fused
   # expert products on the decode kernels' DP4a dots ran at 0.34x and 0.25x of it on the B70 and were dropped.
   add_library(strata_prefill STATIC src/prefill/gemm.cpp src/prefill/kernels.cpp src/prefill/prefill.cpp
-                                    src/prefill/moe_mmq.cpp)
+                                    src/prefill/moe_mmq.cpp src/prefill/plain_prompt.cpp)
   target_include_directories(strata_prefill PUBLIC include)
   target_link_libraries(strata_prefill PUBLIC strata_engine)
   if(TARGET onemath)
@@ -610,7 +615,7 @@ if(STRATA_ENABLE_XE)
   endif()
 
   # `strata generate` (P2.S6): the program that composes the components into tokens
-  add_executable(strata src/program/generate.cpp)
+  add_executable(strata src/program/generate.cpp src/program/plain_generate.cpp src/program/option_scope.cpp)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 
   if(STRATA_BUILD_TESTS)
@@ -642,6 +647,10 @@ if(STRATA_ENABLE_XE)
     # as in the CUDA build)
     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
     target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels)
+    # the decode attention over every cell (Ornith-1.5's and llm-jp-4.1's full attention) against FP64 (synthetic)
+    add_executable(qsa_dense_attn_parity src/kernels/qsa_dense_attn_parity.cpp)
+    target_link_libraries(qsa_dense_attn_parity PRIVATE strata_kernels)
+    add_test(NAME qsa_dense_attn_parity COMMAND qsa_dense_attn_parity)
     # Plan v0.3 P7 / PR #21: INT8 and Q4_0 KV storage against host references (synthetic, no model).
     add_executable(kv_q8_parity src/kernels/kv_q8_parity.cpp)
     target_link_libraries(kv_q8_parity PRIVATE strata_kernels)
@@ -886,15 +895,19 @@ if(STRATA_NATIVE_EXPERTS)
     # q5_0/q8_0 (Q5_0 gate/up, a llama-quantize "_M" file), q4_0/q4_0 and q4_0/q4_1 (a plain llama-quantize Q4_0 file:
     # gate/up Q4_0, down Q4_0 on 42 layers and Q4_1 on 6; upstream 16bdc707)
     # q6_K/q8_0: Unsloth's UD-Q6_K_XL experts (upstream 87659162)
+    # at Ornith-1.5's shape (2048/512): its official files' experts (Q6_K, Q4_K and Q5_K down, Q8_0, BF16) and its
+    # GSQ-RCO files' (Q2_K and Q3_K both ways); at llm-jp-4.1's (2560/960): Q4_K with its Q8_0 and Q5_0 down
     foreach(pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 iq3_xxs/iq4_nl q5_0/q8_0 q4_0/q4_0 q4_0/q4_1
-                 q6_K/q8_0)
+                 q6_K/q8_0 q6_K/q6_K@2048x512 q4_K/q4_K@2048x512 q5_K/q5_K@2048x512 q8_0/q8_0@2048x512
+                 bf16/bf16@2048x512 q2_K/q3_K@2048x512 q3_K/q2_K@2048x512 q4_K/q8_0@2560x960 q4_K/q5_0@2560x960)
       string(REPLACE "/" "_" pair_name "${pair}")
+      string(REPLACE "@" "_" pair_name "${pair_name}")
       add_test(NAME native_expert_parity_${pair_name} COMMAND native_expert_parity --synthetic ${pair})
       set_tests_properties(native_expert_parity_${pair_name} PROPERTIES TIMEOUT 120)
     endforeach()
-    # a pair without GPU kernels (Q3_K gate/up) is refused by native_expert_supported, not run
-    add_test(NAME native_expert_parity_refuses_q3_K COMMAND native_expert_parity --synthetic q3_K/q8_0)
-    set_tests_properties(native_expert_parity_refuses_q3_K PROPERTIES WILL_FAIL TRUE)
+    # a pair native_expert_supported refuses on purpose (IQ4_NL gate/up) is refused, not run
+    add_test(NAME native_expert_parity_refuses_iq4_nl_gate COMMAND native_expert_parity --synthetic iq4_nl/q8_0)
+    set_tests_properties(native_expert_parity_refuses_iq4_nl_gate PROPERTIES WILL_FAIL TRUE)
     # the device dequantizers on one real tensor of each type: needs the model's shards, so not in CTest
     add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
     target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact)

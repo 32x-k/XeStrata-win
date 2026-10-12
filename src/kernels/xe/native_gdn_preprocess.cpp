@@ -11,6 +11,7 @@
 // round-to-nearest operations (__fadd_rn, __fmul_rn, __fmaf_rn) stay as written: the library does not contract, and
 // the fma with a zero addend keeps its signed-zero behaviour.
 #include "strata/kernels/native_gdn_preprocess.hpp"
+#include "strata/kernels/gdn.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_gdn_preprocess
 #include "strata/kernels/device_arch_tag.hpp"
@@ -161,6 +162,7 @@ void native_gdn_out_norm(const float* output, const float* z, const float* gamma
     }
     queue_for(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sums(sycl::range<1>(WARP), h);
+        const bool silu = gdn_silu_gate();   // the closing norm's gate (gdn.hpp)
         h.parallel_for(sycl::nd_range<1>(size_t(heads) * NORM_THREADS, NORM_THREADS),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const int col = int(it.get_local_id(0));
@@ -173,7 +175,8 @@ void native_gdn_out_norm(const float* output, const float* z, const float* gamma
             if (col < S) {
                 // RMSNorm + gamma is one pinned fused operator, followed by sigmoid * mul
                 const float weighted = (scale * value) * gamma[col];
-                destination[offset + col] = weighted * sigmoid(z[offset + col]);
+                const float zv = z[offset + col], gz = sigmoid(zv);
+                destination[offset + col] = weighted * (silu ? zv * gz : gz);
             }
         });
     });

@@ -13,6 +13,9 @@
 // order of the float additions differs.
 //
 // Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), IQ4_XS (23).  IQ1_M stays on ggml-cpu.
+// The K-quants Q2_K (10), Q3_K (11), Q4_K (12), Q5_K (13), Q6_K (14) and Q8_0 (8) take the same scheme (kq256_*, q80_256_*): their values are
+// unpacked once per block, every token applies them; the mins and Q6_K's offset of 32 come from the activation's
+// bsums, as in ggml's own dots.
 //
 // IQ3_XXS, IQ3_S and IQ2_S also have a gathered decode (Fmt32<118>, <121>, <122>): the grid indices built in a
 // register and read with one vpgather, the same words into the same lanes, so the same bits.  Where it is faster
@@ -525,6 +528,78 @@ void iq4nl256_down_rows_v(int variant, const uint8_t* w, size_t row_bytes, int n
 void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt, float* const* out,
                         int r0, int r1) {
     iq4nl256_down_rows_v(vnni_on() ? kIq256Vnni : 0, w, row_bytes, n, hq, nt, out, r0, r1);
+}
+
+void kq256_gu_rows_v(int variant, int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
+                     const void* const* act, int nt, float* const* ff, int r0, int r1) {
+#if STRATA_AVXVNNI
+    if (variant & kIq256Vnni) {
+        vnni::gu_type<false>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+        return;
+    }
+#endif
+    (void) variant;
+    plain::gu_type<false>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+}
+
+void kq256_rows_v(int variant, int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                  float* const* out, int r0, int r1) {
+#if STRATA_AVXVNNI
+    if (variant & kIq256Vnni) {
+        vnni::dot_type<false>(type, nt, w, row_bytes, n, act, out, r0, r1);
+        return;
+    }
+#endif
+    (void) variant;
+    plain::dot_type<false>(type, nt, w, row_bytes, n, act, out, r0, r1);
+}
+
+void kq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
+                   float* const* ff, int r0, int r1) {
+    kq256_gu_rows_v(vnni_on() ? kIq256Vnni : 0, type, blob, gu_row, up_off, n, act, nt, ff, r0, r1);
+}
+
+void kq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
+                int r0, int r1) {
+    kq256_rows_v(vnni_on() ? kIq256Vnni : 0, type, w, row_bytes, n, act, nt, out, r0, r1);
+}
+
+void q80_256_gu_rows_v(int variant, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                       int nt, float* const* ff, int r0, int r1) {
+    const block_q8_0* y[8];
+    for (int t = 0; t < nt; ++t) y[t] = (const block_q8_0*) act[t];
+#if STRATA_AVXVNNI
+    if (variant & kIq256Vnni) {
+        vnni::q80_gu_nt(blob, gu_row, up_off, n, y, nt, ff, r0, r1);
+        return;
+    }
+#endif
+    (void) variant;
+    plain::q80_gu_nt(blob, gu_row, up_off, n, y, nt, ff, r0, r1);
+}
+
+void q80_256_rows_v(int variant, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                    float* const* out, int r0, int r1) {
+    const block_q8_0* y[8];
+    for (int t = 0; t < nt; ++t) y[t] = (const block_q8_0*) act[t];
+#if STRATA_AVXVNNI
+    if (variant & kIq256Vnni) {
+        vnni::q80_rows_nt(w, row_bytes, n, y, nt, out, r0, r1);
+        return;
+    }
+#endif
+    (void) variant;
+    plain::q80_rows_nt(w, row_bytes, n, y, nt, out, r0, r1);
+}
+
+void q80_256_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
+                     float* const* ff, int r0, int r1) {
+    q80_256_gu_rows_v(vnni_on() ? kIq256Vnni : 0, blob, gu_row, up_off, n, act, nt, ff, r0, r1);
+}
+
+void q80_256_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
+                  int r0, int r1) {
+    q80_256_rows_v(vnni_on() ? kIq256Vnni : 0, w, row_bytes, n, act, nt, out, r0, r1);
 }
 
 }  // namespace strata::kernels::cpu

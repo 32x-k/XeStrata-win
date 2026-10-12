@@ -368,5 +368,9 @@ struct KvHostPools;   // kv_stream.hpp
 void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, const int32_t* step,
                     const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
                     const KvHostPools* host = nullptr);
+/// kv_append_step for n_tok tokens in one launch: token t's step at step + t * step_stride, its K and V at
+/// kcur / vcur + t * cur_stride floats (the FP16 pools only, no host copy).
+void kv_append_steps(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, const int32_t* step, int step_stride,
+                     const float* kcur, const float* vcur, int cur_stride, int n_tok, const QsaShapes& s, void* stream);
 
 }  // namespace strata::kernels

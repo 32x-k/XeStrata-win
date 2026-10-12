@@ -575,7 +575,7 @@ bool FileExpertSource::open_gguf(std::string& err) {
     role_file_.assign((size_t) (3 * n_layers_), 0);
     for (int64_t l = 0; l < n_layers_; ++l) {
         const auto& fm = lay.fmt[(size_t) l];
-        const uint64_t per[3] = {fm.up_off, fm.up_off, lay.bytes[(size_t) l] - fm.down_off};
+        const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, lay.bytes[(size_t) l] - fm.down_off};
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * l + r);
             const std::string path = lay.gguf_file.size() > i && !lay.gguf_file[i].empty() ? dir + lay.gguf_file[i]
@@ -1869,6 +1869,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) MAXT);
     const ExpertLayout& lay = expert_layout();
     const bool native = lay.native;
+    // the activation width: a native layer's own (models other than Qwen3.8), else the S2 kernels' compiled H
+    const int64_t W = native ? lay.fmt[(size_t) d.layers].n_embd : (int64_t) H;
     if (native && d.nact_multi.size() < (size_t) MAXT * kNativeActBytes) d.nact_multi.resize((size_t) MAXT * kNativeActBytes);
     if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
     if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
@@ -1936,6 +1938,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 ++d.tail_experts;
             }
         }
+        // STRATA_FREE_MISSES=1 (measuring only, the output is wrong; after nextsycl's NS_FREE_MISSES): a missed expert
+        // is computed on the GPU from the slot of a resident expert of the layer instead of fetched or computed on the
+        // CPU, so a run times the decode as if every expert were in VRAM - the bound the CPU / PCIe split works toward
+        static const bool free_misses = [] {
+            const char* v = std::getenv("STRATA_FREE_MISSES");
+            return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+        }();
+        int32_t standin = -1;
+        if (free_misses && d.remote_count == 0) {
+            for (int32_t e = 0; e < d.n_expert && standin < 0; ++e)
+                standin = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
+            if (standin >= 0) nmiss = 0;
+        }
         const bool pcie_ok = d.pcie_num > 0 && d.src->device_alias(d.layers, 0) != nullptr;
         // from the times measured at start (pcie_split_m); else the share pcie_num/256
         const int m = !pcie_ok ? 0
@@ -1957,7 +1972,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             int kd = -1;
             unsigned long long ptr = 0;
             if (e >= 0 && e < d.n_expert) {
-                const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
+                int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
+                if (slot < 0) slot = standin;   // STRATA_FREE_MISSES
                 if (slot >= 0) {
                     kd = 0;
                     ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
@@ -2047,12 +2063,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const auto c1 = std::chrono::steady_clock::now();
     if (!any_cpu) {
     } else if (native && lay.fmt[(size_t) d.layers].gu_type == 42) {   // a native Q2_0 pack: the Q2_0 kernels' activations
-        for (int64_t t = 0; t < n_tok; ++t) act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+        for (int64_t t = 0; t < n_tok; ++t) act_quant_any(x_f + (size_t) t * W, (int) W, d.act_multi[(size_t) t]);
     } else if (native) {
         for (int64_t t = 0; t < n_tok; ++t)
-            native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
+            native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * W, d.nact_multi.data() + (size_t) t * kNativeActBytes);
     } else {
-        for (int64_t t = 0; t < n_tok; ++t) act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+        for (int64_t t = 0; t < n_tok; ++t) act_quant_q8_1(x_f + (size_t) t * W, (int) W, d.act_multi[(size_t) t]);
     }
     const auto c2 = std::chrono::steady_clock::now();
     if (any_cpu) {   // the experts the CPU computes, fetched together (the GGUF in place reads them on several threads)
@@ -2069,7 +2085,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
             const int64_t e = ids[i];
-            float* row = out + (size_t) i * H;
+            float* row = out + (size_t) i * W;
             if (e < 0 || e >= d.n_expert) {
                 d.failed = true;
                 d.fail = "a routed expert id is out of range";
@@ -2085,7 +2101,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote result staged into this row below
                 if (kind[i] == 0) ++d.cache_hits;
                 else ++d.offload_entries;                       // #588: PCIe or another GPU
-                if (!(gpu_zeroes_hits && kind[i] <= 1)) std::memset(row, 0, (size_t) H * sizeof(float));
+                if (!(gpu_zeroes_hits && kind[i] <= 1)) std::memset(row, 0, (size_t) W * sizeof(float));
                 continue;
             }
             ++d.cache_refused;
@@ -2375,7 +2391,86 @@ void ExpertSource::record_inputs(const std::string& pack_experts, const std::str
     // the same resolution open_gguf / load_experts_gguf use: every (layer, role) tensor and the file it is read from
     for (int64_t l = 0; l < lay.n_layers; ++l)
         for (int r = 0; r < 3; ++r)
-            inputs_.push_back({"expert blk." + std::to_string(l) + ".ffn_" + roles[r], expert_gguf_file(gguf, lay, l, r)});
+            inputs_.push_back({"expert blk." + std::to_string(lay.block_of(l)) + ".ffn_" + roles[r],
+                               expert_gguf_file(gguf, lay, l, r)});
+}
+
+bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>& moe_blocks, int64_t n_expert,
+                             int64_t n_embd, int64_t n_ff, std::string& err) {
+    using namespace strata::kernels::cpu;
+    static const char* roles[3] = {"gate", "up", "down"};
+    if (moe_blocks.empty() || n_expert <= 0 || n_embd <= 0 || n_ff <= 0) {
+        err = "experts from the GGUF: the geometry is empty";
+        return false;
+    }
+    try {
+        const strata::GgufModel model = strata::GgufModel::open(gguf);
+        const int64_t n_layers = (int64_t) moe_blocks.size();
+        ExpertLayout L;
+        L.native = true;
+        L.n_layers = n_layers;
+        L.n_expert = n_expert;
+        L.fmt.resize((size_t) n_layers);
+        L.offset.assign((size_t) n_layers, 0);
+        L.bytes.assign((size_t) n_layers, 0);
+        L.gguf_off.assign((size_t) (3 * n_layers), 0);
+        L.gguf_file.assign((size_t) (3 * n_layers), std::string());
+        L.block = moe_blocks;
+        L.max_blob = 0;
+        uint64_t at = 0;
+        for (int64_t l = 0; l < n_layers; ++l) {
+            const strata::TensorInfo* t[3] = {};
+            size_t shard[3] = {};
+            for (int r = 0; r < 3; ++r) {
+                const std::string name = "blk." + std::to_string(moe_blocks[(size_t) l]) + ".ffn_" + roles[r] +
+                                         "_exps.weight";
+                t[r] = model.find(name, &shard[r]);
+                const uint64_t cols = (uint64_t) (r < 2 ? n_embd : n_ff), rows = (uint64_t) (r < 2 ? n_ff : n_embd);
+                if (t[r] == nullptr || t[r]->shape.size() != 3 || t[r]->shape[0] != cols || t[r]->shape[1] != rows ||
+                    t[r]->shape[2] != (uint64_t) n_expert) {
+                    err = "experts from the GGUF: " + name + " is missing or not [" + std::to_string(cols) + ", " +
+                          std::to_string(rows) + ", " + std::to_string(n_expert) + "]";
+                    return false;
+                }
+                if (!model.in_bounds(*t[r], shard[r])) {
+                    err = "experts from the GGUF: " + name + " runs past the end of its file (a truncated shard?)";
+                    return false;
+                }
+            }
+            // gate and up may differ in type (native_mixed_gu), as long as they read the same activation
+            NativeFmt& f = L.fmt[(size_t) l];
+            if (!native_fmt((int) t[0]->type, (int) t[2]->type, n_embd, n_ff, f, err, (int) t[1]->type)) {
+                std::string where = "experts from the GGUF: block ";
+                where += std::to_string(moe_blocks[(size_t) l]);
+                where += ": ";
+                err.insert(0, where);
+                return false;
+            }
+            const uint64_t per[3] = {f.up_off, f.up_row * (uint64_t) n_ff, f.bytes - f.down_off};
+            for (int r = 0; r < 3; ++r) {
+                if (strata::tensor_payload_bytes(*t[r]) != per[r] * (uint64_t) n_expert) {
+                    err = "experts from the GGUF: block " + std::to_string(moe_blocks[(size_t) l]) + "'s " + roles[r] +
+                          " tensor is not " + std::to_string(per[r]) + " B per expert";
+                    return false;
+                }
+                const strata::GgufFile& file = model.shard(shard[r]);
+                L.gguf_off[(size_t) (3 * l + r)] = file.data_start() + t[r]->offset;
+                const std::string& path = file.path();
+                const size_t cut = path.find_last_of("/\\");
+                L.gguf_file[(size_t) (3 * l + r)] = cut == std::string::npos ? path : path.substr(cut + 1);
+            }
+            L.offset[(size_t) l] = at;
+            L.bytes[(size_t) l] = f.bytes;
+            L.max_blob = std::max<uint64_t>(L.max_blob, f.bytes);
+            at += (uint64_t) f.bytes * (uint64_t) n_expert;
+        }
+        L.total = at;
+        expert_layout_set(L);
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("experts from the GGUF: ") + e.what();
+        return false;
+    }
 }
 
 bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, std::string& err) {
@@ -2389,12 +2484,12 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
         for (int64_t l = 0; l < lay.n_layers; ++l) {
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
-            const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+            const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
             for (int r = 0; r < 3; ++r) {
                 const std::string path = expert_gguf_file(gguf, lay, l, r);
                 auto& f = files[path];
                 if (!f) f = std::make_unique<strata::GgufFile>(path);
-                const std::string name = "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight";
+                const std::string name = "blk." + std::to_string(lay.block_of(l)) + ".ffn_" + roles[r] + "_exps.weight";
                 const strata::TensorInfo* t = f->find(name);
                 const uint64_t want_type = (uint64_t) (r < 2 ? fm.gu_type : fm.d_type);
                 // GGUF order: dim 0 is the row (the input), dim 1 the rows, dim 2 the experts
@@ -2458,7 +2553,7 @@ LoadStats load_experts_gguf(const std::string& gguf, const std::vector<uint8_t*>
             if (l >= lay.n_layers || bad) break;
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
-            const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+            const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
             const uint64_t at[3] = {0, fm.up_off, fm.down_off};
             for (int r = 0; r < 3; ++r) {
                 const std::string name = file_of(l, r);

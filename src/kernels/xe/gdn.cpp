@@ -10,6 +10,7 @@
 #define STRATA_DEVICE_ARCH_TAG_TU xe_gdn
 #include "strata/kernels/device_arch_tag.hpp"
 
+#include <atomic>
 #include <cmath>
 #include <string>
 
@@ -29,6 +30,8 @@ void finish(void* stream, const sycl::event& e, const char* what) {
 }
 
 inline float sigmoid_f(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
+
+std::atomic<bool> silu_gate{false};
 
 template <typename D>
 inline D warp_sum(const sycl::sub_group& sg, D v) {
@@ -129,7 +132,7 @@ sycl::event gdn_l2_norm_t(sycl::queue& q, float* x, int64_t rows, int ncols, flo
 }
 template <typename D>
 sycl::event gdn_out_norm_t(sycl::queue& q, const float* o, const float* z, const float* ssm_norm, float* y,
-                           int64_t h_v, int Si, float eps) {
+                           int64_t h_v, int Si, float eps, bool silu) {
     return q.parallel_for(sycl::nd_range<1>((size_t) h_v * WARP, WARP),
                           [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
         const sycl::sub_group sg = it.get_sub_group();
@@ -142,7 +145,10 @@ sycl::event gdn_out_norm_t(sycl::queue& q, const float* o, const float* z, const
         for (int i = t; i < Si; i += WARP) acc += (D) po[i] * (D) po[i];
         const D ssum = sycl::group_broadcast(sg, warp_sum(sg, acc), 0);
         const float inv = (float) ((D) 1 / sycl::sqrt(ssum / (D) Si + (D) eps));
-        for (int i = t; i < Si; i += WARP) py[i] = po[i] * inv * ssm_norm[i] * sigmoid_f(pz[i]);
+        for (int i = t; i < Si; i += WARP) {
+            const float gz = sigmoid_f(pz[i]);
+            py[i] = po[i] * inv * ssm_norm[i] * (silu ? pz[i] * gz : gz);
+        }
     });
 }
 }  // namespace
@@ -170,9 +176,13 @@ void gdn_out_norm(const float* o, const float* z, const float* ssm_norm, float* 
     if (h_v <= 0 || S <= 0) return;
     const int Si = (int) S;
     auto& q = queue_for(stream);
-    const auto e = xe::has_fp64(q) ? gdn_out_norm_t<double>(q, o, z, ssm_norm, y, h_v, Si, eps)
-                                   : gdn_out_norm_t<float>(q, o, z, ssm_norm, y, h_v, Si, eps);
+    const bool silu = gdn_silu_gate();
+    const auto e = xe::has_fp64(q) ? gdn_out_norm_t<double>(q, o, z, ssm_norm, y, h_v, Si, eps, silu)
+                                   : gdn_out_norm_t<float>(q, o, z, ssm_norm, y, h_v, Si, eps, silu);
     finish(stream, e, "gdn_out_norm");
 }
+
+void gdn_set_silu_gate(bool silu) { silu_gate.store(silu); }
+bool gdn_silu_gate() { return silu_gate.load(); }
 
 }  // namespace strata::kernels

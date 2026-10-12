@@ -418,6 +418,13 @@ bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, doub
 /// earlier than the CPU taking all `f` (the times are measured alone and on few experts: a split by a thin margin
 /// lost on the B70 with the VRAM of a small card); else 0.
 int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h);
+/// All of `t`, measured once at start on the window's own kernels: the CPU's side (measure_cpu_expert_ms), the GPU
+/// computing experts from its memory, the PCIe fetch of experts in RAM, and the CPU's and the link's sides beside each
+/// other from the rate the memory serves.  False, with `why`, when a side cannot be timed (too few experts in RAM).
+bool measure_pcie_split(ExpertDispatch& d, int64_t n_layers, PcieSplitTimes& t, std::string& why);
+/// The memory's rate for measure_pcie_split, read now (before a long prompt, where the split is set up after it: after a
+/// 64K prompt the reading came out up to 3x low on the RX 9060 XT's machine).
+void read_memory_rate_before(const ExpertDispatch& d, int64_t n_layers);
 
 /// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
 int tail_skip_rank();
@@ -762,6 +769,12 @@ private:
 };
 
 bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, std::string& err);
+/// The routed experts of a GGUF model read in place (no pack, no experts.bin) as the process-wide expert layout: per
+/// MoE layer i (the model's block moe_blocks[i]), the gate / up / down types, the blob, and the tensors' files and
+/// offsets in the shards of `gguf`'s model (any of its shards).  Gate and up are [n_embd, n_ff, n_expert], down
+/// [n_ff, n_embd, n_expert].  A FileExpertSource reads it with set_gguf(`gguf`) and no experts.bin.
+bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>& moe_blocks, int64_t n_expert,
+                             int64_t n_embd, int64_t n_ff, std::string& err);
 LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst,
                           const strata::kernels::cpu::ExpertLayout& lay, int threads);
 

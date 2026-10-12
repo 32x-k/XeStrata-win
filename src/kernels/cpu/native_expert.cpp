@@ -43,8 +43,25 @@ bool iq256_supported(int type) noexcept {
     return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
 }
 
-bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
+bool kq256_supported(int type) noexcept { return type == 10 || type == 11 || type == 12 || type == 13 || type == 14; }
+
+size_t native_row_bytes(int type, int64_t n) {
+    if (type < 0 || type >= GGML_TYPE_COUNT || n <= 0 || n % ggml_blck_size((ggml_type) type)) return 0;
+    return ggml_row_size((ggml_type) type, n);
+}
+
+bool native_row_to_float(int type, const void* src, float* dst, int64_t n) {
+    if (native_row_bytes(type, n) == 0) return false;
+    const ggml_type_traits* t = ggml_get_type_traits((ggml_type) type);
+    if (t == nullptr || t->to_float == nullptr) return false;
+    t->to_float(src, dst, n);
+    return true;
+}
+
+bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err, int up_type) {
     init_once();
+    if (up_type < 0) up_type = gu_type;
+    const ggml_type_traits_cpu* tu = traits(up_type);
     const ggml_type_traits_cpu* tg = traits(gu_type);
     const ggml_type_traits_cpu* td = traits(d_type);
     if (tg == nullptr || tg->vec_dot == nullptr || td == nullptr || td->vec_dot == nullptr) {
@@ -57,7 +74,12 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
         err = "native experts: ggml-cpu cannot quantize an activation for this layer";
         return false;
     }
-    if (n_embd % ggml_blck_size((ggml_type) gu_type) || n_ff % ggml_blck_size((ggml_type) d_type) ||
+    if (tu == nullptr || tu->vec_dot == nullptr || tu->vec_dot_type != tg->vec_dot_type) {
+        err = "native experts: gate and up of types that read different activations";
+        return false;
+    }
+    if (n_embd % ggml_blck_size((ggml_type) gu_type) || n_embd % ggml_blck_size((ggml_type) up_type) ||
+        n_ff % ggml_blck_size((ggml_type) d_type) ||
         n_embd % ggml_blck_size(tg->vec_dot_type) || n_ff % ggml_blck_size(td->vec_dot_type)) {
         err = "native experts: expert geometry is not whole blocks";
         return false;
@@ -68,14 +90,16 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.d_act = (int) td->vec_dot_type;
     f.n_embd = n_embd;
     f.n_ff = n_ff;
+    f.up_type = up_type;
     f.gu_row = ggml_row_size((ggml_type) gu_type, n_embd);
+    f.up_row = ggml_row_size((ggml_type) up_type, n_embd);
     f.d_row = ggml_row_size((ggml_type) d_type, n_ff);
     f.up_off = f.gu_row * (size_t) n_ff;
-    f.down_off = 2 * f.up_off;
+    f.down_off = f.up_off + f.up_row * (size_t) n_ff;
     f.bytes = f.down_off + f.d_row * (size_t) n_embd;
     f.act_bytes = ggml_row_size(tg->vec_dot_type, n_embd);
     f.h_bytes = ggml_row_size(td->vec_dot_type, n_ff);
-    if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes) {
+    if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes || n_ff > kNativeMaxFF) {
         err = "native experts: activation larger than the pool's buffers";
         return false;
     }
@@ -121,11 +145,61 @@ int native_gu_mt_min(int gu_type) {
     // keeps its rule.
     static const bool avx2_one = env == nullptr && cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr &&
                                  !cpu_avx512_ok();
-    return avx2_one && gu_type != 16 ? 1 : mt_min;   // 16: IQ2_XXS
+    // The K-quants and Q8_0 (kq256_* / q80_256_*) share only the unpacking between tokens: one token keeps ggml-cpu's
+    // dot until a measurement says otherwise.
+    return avx2_one && iq256_supported(gu_type) && gu_type != 16 ? 1 : mt_min;   // 16: IQ2_XXS
 }
+
+namespace {
+// The K-quants (Q4_K, Q5_K, Q6_K) and Q8_0 of the other models' experts on the AVX-2 multi-token kernels (iq_avx2.cpp,
+// the AVX-VNNI copy where the CPU has it): every CPU with AVX2, AVX-512 ones too (ggml-cpu's dots for these are
+// single-token there as well).  STRATA_NO_KQ256=1: ggml-cpu's dot for every token count.  Q8_0 only with AVX-VNNI: on
+// a Ryzen 7 5700X (AVX2 alone, one thread, 2 to 4 tokens) its gate/up took 0.185 / 0.289 / 0.340 ms an expert of
+// Ornith's shape against ggml-cpu's 0.170 / 0.235 / 0.309, and llm-jp's down 0.275 / 0.334 / 0.383 against 0.171 /
+// 0.240 / 0.317; the K-quants were 1.3 to 1.6 times ggml-cpu's there.
+bool kq_on(int type) {
+    static const bool on = cpu_avx2_ok() && std::getenv("STRATA_NO_KQ256") == nullptr;
+    static const bool q80 = on && cpu_avxvnni_ok();
+    return type == (int) GGML_TYPE_Q8_0 ? q80 : on && kq256_supported(type);
+}
+// Q2_K and Q3_K (GSQ-RCO's experts) from four tokens on: ggml-cpu's own AVX2 dots for them are faster below that
+// (one thread, Ornith's shape, ms an expert, the kernel against ggml-cpu - i7-14700: Q2_K 0.103 / 0.069 at one token,
+// 0.135 / 0.121 at two, 0.210 / 0.230 at four; Ryzen 7 5700X: Q2_K 0.154 / 0.147 at two, 0.266 / 0.295 at four, Q3_K
+// 0.229 / 0.195 at two, 0.345 / 0.390 at four).
+int kq_mt_min(int type, int mt_min) {
+    return type == (int) GGML_TYPE_Q2_K || type == (int) GGML_TYPE_Q3_K ? (mt_min > 4 ? mt_min : 4) : mt_min;
+}
+}  // namespace
+
+namespace {
+// out[t][r] = w_r . act[t] for rows [r0, r1) of one part of type `type` (the multi-token kernels where the type has one
+// and the group is large enough, else ggml-cpu's dot)
+void part_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
+               int r0, int r1, int mt_min) {
+    if (nt >= kq_mt_min(type, mt_min) && kq_on(type)) {
+        if (type == (int) GGML_TYPE_Q8_0) q80_256_rows(w, row_bytes, n, act, nt, out, r0, r1);
+        else kq256_rows(type, w, row_bytes, n, act, nt, out, r0, r1);
+        return;
+    }
+    const ggml_vec_dot_t dot = traits(type)->vec_dot;
+    for (int r = r0; r < r1; ++r)
+        for (int t = 0; t < nt; ++t) dot(n, &out[t][r], 0, w + (size_t) r * row_bytes, 0, act[t], 0, 1);
+}
+}  // namespace
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (native_mixed_gu(f)) {   // gate and up of different types: each part on its own, then the SwiGLU
+        thread_local float ub[MAXT][kNativeMaxFF];
+        float* up[MAXT] = {};
+        for (int t = 0; t < nt; ++t) up[t] = ub[t];
+        const int mt = native_gu_mt_min(f.gu_type);
+        part_rows(f.gu_type, blob, f.gu_row, (int) f.n_embd, act, nt, ff, r0, r1, mt);
+        part_rows(f.up_type, blob + f.up_off, f.up_row, (int) f.n_embd, act, nt, up, r0, r1, mt);
+        for (int t = 0; t < nt; ++t)
+            for (int r = r0; r < r1; ++r) ff[t][r] = (ff[t][r] / (1.f + std::exp(-ff[t][r]))) * up[t][r];
+        return;
+    }
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the
@@ -152,6 +226,11 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             return;
         }
     }
+    if (nt >= kq_mt_min(f.gu_type, mt_min) && kq_on(f.gu_type)) {
+        if (f.gu_type == (int) GGML_TYPE_Q8_0) q80_256_gu_rows(blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        else kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        return;
+    }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const int n = (int) f.n_embd;
     for (int r = r0; r < r1; ++r) {
@@ -174,6 +253,11 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     static const int mt_min = [] { const char* e = std::getenv("STRATA_IQ_MT_MIN"); return e ? (int) std::strtol(e, nullptr, 10) : 2; }();
     if (nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
+    if (nt >= kq_mt_min(f.d_type, mt_min) && kq_on(f.d_type)) {   // the K-quant and Q8_0 down rows: the same rule
+        if (f.d_type == (int) GGML_TYPE_Q8_0) q80_256_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        else kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;

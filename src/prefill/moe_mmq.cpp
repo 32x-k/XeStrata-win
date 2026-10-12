@@ -19,20 +19,26 @@ sycl::queue& Q(void* stream) { return core::Runtime::get().stream(stream); }
 }  // namespace
 
 bool built() { return kernels::iq_mmq_usable(core::Runtime::get().compute()); }
+bool built_dp4a() { return kernels::iq_mmq_dp4a_usable(core::Runtime::get().compute()); }
 bool supported(int t) { return kernels::iq_mmq_type_ok(t); }
 size_t matrix_bytes(int t, int64_t rows, int64_t cols) { return (size_t) rows * kernels::iq_mmq_row_bytes(t, cols); }
 size_t q8_bytes(int64_t rows, int64_t cols) { return kernels::iq_mmq_act_bytes(rows, cols); }
 
-void quantize(const float* x, const int32_t* ids, void* xq, int, int64_t cols, int64_t ld, int64_t rows, void* stream) {
-    if (rows > 0) kernels::iq_mmq_quantize(Q(stream), x, ids, xq, cols, ld, rows);
+void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
+    if (rows > 0)
+        kernels::iq_mmq_quantize(Q(stream), x, ids, xq, cols, ld, rows, kernels::iq_mmq_type_sums(t),
+                                 kernels::iq_mmq_type_dup(t));
 }
 
 Context::Context() {}
 Context::~Context() {}
 void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
-    kernels::iq_mmq_grouped(Q(stream), p.type, p.w, p.expert_bytes, p.w_rows, p.w_cols, p.n, p.xq, p.total_rows,
-                            p.bounds, p.max_rows, p.ids, p.dst, p.ld_dst);
+    // a type that reads every activation block twice (Q2_K) reads rows of twice the columns
+    const int64_t cols = kernels::iq_mmq_type_dup(p.type) ? 2 * p.w_cols : p.w_cols;
+    kernels::iq_mmq_grouped(Q(stream), p.type, p.w, p.expert_bytes, p.w_rows, cols, p.n, p.xq, p.total_rows,
+                            p.bounds, p.max_rows, p.ids, p.dst, p.ld_dst, p.wtab, p.woff,
+                            p.rows > 0 ? p.rows : p.total_rows);
 }
 
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,

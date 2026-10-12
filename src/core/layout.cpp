@@ -4,6 +4,8 @@
 // src/core/layout.cpp - the shape checks.  See the header for why this exists.
 #include "strata/core/layout.hpp"
 
+#include "strata/artifact/model_spec.hpp"
+
 #include <cstdio>
 
 namespace strata::core {
@@ -170,6 +172,52 @@ bool check_all(const WeightTable& table, const ModelGeometry& g, std::string& er
         err = buf;
         return false;
     }
+    return true;
+}
+
+bool geometry_from_spec(const strata::ModelSpec& s, ModelGeometry& g, std::string& err) {
+    if (s.arch != strata::ModelArch::Qwen4Exp) {
+        err = "architecture '" + s.arch_name + "': these layers are qwen4exp's";
+        return false;
+    }
+    const ModelGeometry d;   // what the kernels are built for
+    // the full-attention layers' K/V heads: the first layer that is not recurrent
+    int64_t head_kv = 0;
+    for (int64_t l = 0; l < s.n_layer; ++l)
+        if (!s.recurrent[(size_t) l]) { head_kv = s.n_head_kv[(size_t) l]; break; }
+    struct Field {
+        const char* key;
+        int64_t file;
+        int64_t want;
+    };
+    const Field fields[] = {
+        {"embedding_length", s.n_embd, d.n_embd},
+        {"block_count (without the MTP layers)", s.n_layer, d.n_layers},
+        {"full_attention_interval", s.full_attention_interval, d.qsa_interval},
+        {"ssm.state_size", s.ssm_d_state, d.ssm_state_size},
+        {"ssm.group_count", s.ssm_n_group, d.ssm_k_heads},
+        {"ssm.time_step_rank", s.ssm_dt_rank, d.ssm_v_heads},
+        {"ssm.conv_kernel", s.ssm_d_conv, d.ssm_d_conv},
+        {"ssm.inner_size", s.ssm_d_inner, d.ssm_value_dim},
+        {"attention.head_count", s.n_head, d.n_head},
+        {"attention.head_count_kv", head_kv, d.n_head_kv},
+        {"attention.key_length", s.key_length, d.head_dim},
+        {"attention.indexer.head_count", s.idx_n_head, d.idx_q_heads},
+        {"attention.indexer.key_length", s.idx_key_length, d.idx_key_dim},
+        {"hyper_connection.count", s.hc, d.hc},
+        {"hyper_connection.low_rank", s.hc_low_rank, d.hc_lr},
+        {"expert_feed_forward_length", s.n_ff_exp, d.n_ff},
+    };
+    for (const Field& f : fields) {
+        if (f.file == 0) continue;   // not written: the default stands
+        if (f.file != f.want) {
+            err = "qwen4exp." + std::string(f.key) + " is " + std::to_string(f.file) + ", the kernels are built for " +
+                  std::to_string(f.want);
+            return false;
+        }
+    }
+    g = d;
+    g.n_expert = s.n_expert;
     return true;
 }
 

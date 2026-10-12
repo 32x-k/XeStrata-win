@@ -43,6 +43,9 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
 /// native_quantize_q8_1 of gate / (1 + exp(-gate)) * up (the shared expert's SwiGLU) in one launch, the same bytes as
 /// the SwiGLU's stored result quantized (upstream be7889ed).
 void native_swiglu_q8_1(const float* gate, const float* up, void* x_q8_1, int n_in, int ncols, void* stream);
+/// out = gate / (1 + exp(-gate)) * up in FP32, native_swiglu_q8_1's expression unquantized (a BF16 down projection
+/// reads floats); `out` may be `gate`.
+void native_swiglu_f32(const float* gate, const float* up, float* out, int n_in, int ncols, void* stream);
 
 void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream);
@@ -55,6 +58,12 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream);
 
 void native_q2_0_f32(const void* weights, const float* x, void* scratch_q8_1,
+                     float* y, int n_in, int n_out, int ncols, void* stream);
+
+void native_q2_k_mmvq(const void* weights, const void* x_q8_1, float* y,
+                      int n_in, int n_out, int ncols, void* stream);
+
+void native_q2_k_f32(const void* weights, const float* x, void* scratch_q8_1,
                      float* y, int n_in, int n_out, int ncols, void* stream);
 
 void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,

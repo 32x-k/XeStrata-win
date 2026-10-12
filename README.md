@@ -115,6 +115,8 @@ lot of VRAM, it runs in the **low-RAM mode**: the experts are read from the mode
   while it answers, so it is slower than the 2-3-bit sizes ([details](docs/DETAILS.md#or-unsloths-ud-q4_k_xl-experimental)).
 
 Not sure? Take **IQ2_XS**. On a PC with only 32 GB of RAM, the Coder is the one to choose.
+Besides Qwen3.8-Flash-Next, setup offers Ornith-1.5 and llm-jp-4.1
+([details](docs/DETAILS.md#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41)).
 To add another model later, run `xestrata --setup`.
 
 OrcaRouter's Flash-Next Uncensored IQ3_XXS is not in setup's menu.
@@ -323,7 +325,9 @@ what has been checked in [docs/XE.md](docs/XE.md).
    - [ninfer](https://github.com/Neroued/ninfer), by Neroued;
    - [HyperQwen](https://github.com/syv-ai/HyperQwen), by syv.ai and the HyperQwen contributors;
    - [Project Maya](https://github.com/mw00/project-maya), by mw00 and the Project Maya contributors (how many of the
-     experts missing from VRAM the CPU computes and how many are read over PCIe).
+     experts missing from VRAM the CPU computes and how many are read over PCIe);
+   - [nextsycl](https://github.com/maxfridbe/nextsycl), by maxfridbe (which kernels the decode of the Qwen3.5 family's
+     models merges).
 - More in [docs/DETAILS.md](docs/DETAILS.md#credits-and-licenses).
 
 ## License
