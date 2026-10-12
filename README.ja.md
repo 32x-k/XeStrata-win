@@ -97,32 +97,34 @@ RAM がそれより少ない PC では、Qwen3.8-Flash-Next の Coder（32 GB）
 
 ### Qwen3.8-Flash-Next
 
-**大きさ**（同じモデルを、どれだけ圧縮するかの違い）:
+**版と大きさ**（大きさは、同じモデルをどれだけ圧縮するかの違い）:
 
-| 大きさ | ダウンロード | RAM の目安 | 速さ | 品質 |
-| --- | ---: | ---: | --- | --- |
-| **Q2_0** | 66 GB | 48 GB | いちばん速い | 良い |
-| **IQ2_XS** | 68 GB | 48 GB | 速い | より良い（**おすすめ**） |
-| **IQ3_XXS** | 76 GB | 60 GB | 遅め | とても良い |
-| **IQ3_S** | 84 GB | 62 GB | いちばん遅い | いちばん良い（元のモデルだけ） |
+| 版 | 大きさ | ダウンロード | RAM の目安 | 速さ | 品質 |
+| --- | --- | ---: | ---: | --- | --- |
+| 元のモデル、Swift 1.5 | **Q2_0** | 66 GB | 48 GB | いちばん速い | 良い |
+| 元のモデル、Swift 1.5 | **IQ2_XS** | 68 GB | 48 GB | 速い | より良い（**おすすめ**） |
+| 元のモデル、Swift 1.5 | **IQ3_XXS** | 76 GB | 60 GB | 遅め | とても良い |
+| 元のモデル、Swift 1.5 | **IQ3_S** | 84 GB | 62 GB | 遅い | 元のモデルと同等 |
+| Coder | **IQ1_M** | 58 GB | 32 GB | 速い | コードでは良い、ほかは弱い |
+| Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | RAM が約 80 GB より少ないと遅い | IQ3_S と UD-Q4_K_XL の間 |
+| Unsloth（実験的） | **UD-Q4_K_XL** | 111 GB | 48 GB | いちばん遅い | いちばん良い |
 
 モデルのエキスパート（[しくみ](#しくみ)）は、すべて RAM に置きます。RAM が目安より少なくても、GPU の VRAM が大きければ
 **省 RAM モード**で動きます。このモードでは、エキスパートを RAM にコピーせずにモデルのファイルから読みます
 （[詳細](docs/DETAILS.ja.md#ram-がモデルより少ないとき省-ram-モード)）。
+Unsloth の 2 つは、RAM に入りきらないエキスパートを答えている間に SSD から読みます。
 
 **版:**
 
 - **Qwen3.8-Flash-Next**: 元のモデル。
-- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)**: ISTA-DASLab によるコード向けの版です。
-  各層 512 個のエキスパートのうち、コードで使う 256 個だけを残しています。大きさは IQ1_M の 1 種類で、
-  ダウンロード 58 GB、RAM 32 GB で動きます。エキスパートが半分なので、コード以外や、英語以外の言語では弱くなります。
 - **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)**: UkisAI による調整版です。
-  答える前の思考が短く、答えが早く出ます。品質はほぼ同じで、IQ3_S はありません。このモデル自身のライセンスに従います。
-- **[Unsloth の UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**: 元のモデルの約 4 ビットの i-quant で、品質は IQ3_S と UD-Q4_K_XL の間です。
-  ダウンロードは 94 GB です。エキスパートが 59.5 GB あり、RAM が約 80 GB より少ない PC では、入りきらない分を SSD から読みます（[詳細](docs/DETAILS.ja.md#unsloth-の-ud-iq4_xs)）。
+  答える前の思考が短く、答えが早く出ます。品質はほぼ同じです。このモデル自身のライセンスに従います。
+- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)**: ISTA-DASLab によるコード向けの版です。
+  各層 512 個のエキスパートのうち、コードで使う 256 個だけを残しています。エキスパートが半分なので、コード以外や、英語以外の言語では弱くなります。
+- **[Unsloth の UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**: 元のモデルの約 4 ビットの i-quant です。
+  エキスパートが 59.5 GB あり、RAM が約 80 GB 以上あればすべて RAM に置けます（[詳細](docs/DETAILS.ja.md#unsloth-の-ud-iq4_xs)）。
 - **[Unsloth の UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**（実験的）: 元のモデルの 4 ビット版です。
-  ダウンロードは 111 GB です。エキスパートが 77 GB あり、RAM に入りきらない分は答えている間に SSD から読むので、
-  2〜3 ビットの大きさより遅くなります（[詳細](docs/DETAILS.ja.md#unsloth-の-ud-q4_k_xl実験的)）。
+  エキスパートが 77 GB あり、2〜3 ビットの大きさより遅くなります（[詳細](docs/DETAILS.ja.md#unsloth-の-ud-q4_k_xl実験的)）。
 
 OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューにはありません。
 変換の手順は [docs/ORCA.ja.md](docs/ORCA.ja.md) にあります。

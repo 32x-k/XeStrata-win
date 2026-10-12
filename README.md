@@ -100,34 +100,38 @@ To add another model later, run `xestrata --setup`.
 
 ### Qwen3.8-Flash-Next
 
-**The size** (the same model, compressed more or less):
+**The version and the size** (the size: the same model, compressed more or less):
 
-| Size | Download | RAM (about) | Speed | Quality |
-| --- | ---: | ---: | --- | --- |
-| **Q2_0** | 66 GB | 48 GB | fastest | good |
-| **IQ2_XS** | 68 GB | 48 GB | fast | better (**recommended**) |
-| **IQ3_XXS** | 76 GB | 60 GB | slower | great |
-| **IQ3_S** | 84 GB | 62 GB | slowest | best (the original model only) |
+| Version | Size | Download | RAM (about) | Speed | Quality |
+| --- | --- | ---: | ---: | --- | --- |
+| the original, Swift 1.5 | **Q2_0** | 66 GB | 48 GB | fastest | good |
+| the original, Swift 1.5 | **IQ2_XS** | 68 GB | 48 GB | fast | better (**recommended**) |
+| the original, Swift 1.5 | **IQ3_XXS** | 76 GB | 60 GB | slower | great |
+| the original, Swift 1.5 | **IQ3_S** | 84 GB | 62 GB | slow | as the original model |
+| Coder | **IQ1_M** | 58 GB | 32 GB | fast | good at code, weaker elsewhere |
+| Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | slow with less than about 80 GB of RAM | between IQ3_S and UD-Q4_K_XL |
+| Unsloth (experimental) | **UD-Q4_K_XL** | 111 GB | 48 GB | slowest | best |
 
 All of the model's experts ([How it works](#how-it-works)) are kept in RAM. With less RAM than that but a GPU with a
 lot of VRAM, it runs in the **low-RAM mode**: the experts are read from the model files instead of copied into RAM
 ([details](docs/DETAILS.md#less-ram-than-the-model-the-low-ram-mode)).
+The two Unsloth files read the experts that do not fit the RAM from the SSD while they answer.
 
 **The version:**
 
 - **Qwen3.8-Flash-Next:** the original.
-- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF):** ISTA-DASLab's version for
-  code. Of each layer's 512 experts it keeps the 256 that code uses. One size, IQ1_M: a 58 GB download, and it runs
-  with 32 GB of RAM. With half the experts it is weaker outside code and in languages other than English.
 - **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF):** UkisAI's fine-tune. It
-  thinks for a shorter time before it answers, so the answer comes sooner, at about the same quality. There is no
-  IQ3_S. Its own license applies.
+  thinks for a shorter time before it answers, so the answer comes sooner, at about the same quality. Its own license
+  applies.
+- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF):** ISTA-DASLab's version for
+  code. Of each layer's 512 experts it keeps the 256 that code uses. With half the experts it is weaker outside code
+  and in languages other than English.
 - **[Unsloth's UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF):** a ~4-bit i-quant of the
-  original, between IQ3_S and UD-Q4_K_XL in quality, a 94 GB download. Its experts take 59.5 GB; on a PC with less
-  than about 80 GB of RAM, those that do not fit are read from the SSD ([details](docs/DETAILS.md#or-unsloths-ud-iq4_xs)).
+  original. Its experts take 59.5 GB; with about 80 GB of RAM or more, all of them stay in RAM
+  ([details](docs/DETAILS.md#or-unsloths-ud-iq4_xs)).
 - **[Unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** (experimental): a 4-bit file
-  of the original, a 111 GB download. Its experts take 77 GB; those that do not fit the RAM are read from the SSD
-  while it answers, so it is slower than the 2-3-bit sizes ([details](docs/DETAILS.md#or-unsloths-ud-q4_k_xl-experimental)).
+  of the original. Its experts take 77 GB, and it is slower than the 2-3-bit sizes
+  ([details](docs/DETAILS.md#or-unsloths-ud-q4_k_xl-experimental)).
 
 OrcaRouter's Flash-Next Uncensored IQ3_XXS is not in setup's menu.
 How to convert it is in [docs/ORCA.md](docs/ORCA.md).
