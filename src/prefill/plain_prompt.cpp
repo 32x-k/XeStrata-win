@@ -310,9 +310,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
         const char* v = std::getenv("STRATA_PLAIN_DENSE_MMQ");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    // (dp4a only where the FP16 products have no matrix engines either, as for the experts: PlainModel::prompt_int8)
-    const bool dense_on = dense_env && (prefill::mmq::built() ||
-                                        (prefill::mmq::built_dp4a() && !strata::kernels::f16_matrix_engines()));
+    const bool dense_on = dense_env && prefill::mmq::chosen();   // as for the experts: PlainModel::prompt_int8
     auto dense = [&](const W& w, const float* x, int64_t ldx, float* y, int64_t T, int64_t ldy = 0) {
         if (!dense_on || w.data == nullptr || !prefill::mmq::supported(w.type) || w.n_out % 128 != 0 || w.n_in % 32 != 0)
             return false;

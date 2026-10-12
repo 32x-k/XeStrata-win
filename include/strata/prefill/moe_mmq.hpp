@@ -18,6 +18,10 @@ namespace strata::prefill::mmq {
 bool built();
 /// The GPU runs them without matrix engines (iq_mmq_dp4a_usable), where built() says no.
 bool built_dp4a();
+/// Whether the prompt's products take their int8 form: on the matrix engines where built(); else by dp4a only where the
+/// FP16 products have no matrix engines either (built_dp4a, and not kernels::f16_matrix_engines: Volta, whose tensor
+/// cores take FP16 and not int8, keeps the FP16 form).  The one rule every prompt path (prefill.cpp, PlainModel) takes.
+bool chosen();
 /// They cover this ggml type (the i-quants but IQ1_S, Q2_0, Q8_0, Q5_0, Q2_K to Q6_K).
 bool supported(int ggml_type);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
