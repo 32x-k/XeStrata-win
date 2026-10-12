@@ -185,4 +185,8 @@ private:
     PrefillStats stats_;
 };
 
+/// What multiplies the prompt path's experts on the current GPU, for the start's report: "int8 (WMMA)" and the like
+/// (moe_mmq.hpp), with the layers of types the int8 products lack said, or "FP16".  Call once the expert layout is read.
+std::string experts_path();
+
 }  // namespace strata::prefill

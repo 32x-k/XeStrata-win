@@ -16,6 +16,7 @@
 #include "strata/core/plain_model.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -425,8 +426,12 @@ int plain_main(int argc, char** argv) {
         std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
         return 1;
     }
-    if (opt.prompt_chunk > 0) std::fprintf(stderr, "strata (%s): prompt matrix products on %s\n", arch.c_str(),
-                                           strata::prefill::Gemm::path());
+    if (opt.prompt_chunk > 0) {
+        const char* experts = model.prompt_int8() ? strata::prefill::mmq::path() : nullptr;
+        std::fprintf(stderr, "strata (%s): prompt matrix products on %s; the experts' in %s%s%s\n", arch.c_str(),
+                     strata::prefill::Gemm::path(), experts ? "int8 (" : "FP16", experts ? experts : "",
+                     experts ? ")" : "");
+    }
     if (serve) return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save, save_min);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> dump_file(nullptr, &std::fclose);

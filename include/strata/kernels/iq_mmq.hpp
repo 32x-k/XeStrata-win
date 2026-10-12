@@ -21,6 +21,9 @@ bool iq_mmq_usable(sycl::queue& q);
 /// Whether the same products run on `q`'s device without matrix engines (dp4a; local memory and work-group size
 /// permitting): iq_mmq_grouped takes that form where iq_mmq_usable says no.
 bool iq_mmq_dp4a_usable(sycl::queue& q);
+/// What runs these products on `q`'s device, for the start's report: "WMMA" (RDNA3, RDNA4), "joint_matrix" (a shape
+/// the device reports: NVIDIA's tensor cores), "XMX" (Intel's shapes), "DP4a" (no matrix engines), or null (neither).
+const char* iq_mmq_path(sycl::queue& q);
 /// The ggml types whose weights these products decode (the i-quants but IQ1_S, Q2_0, Q8_0, Q5_0, Q2_K to Q6_K).
 bool iq_mmq_type_ok(int ggml_type);
 /// Bytes of a weight row of `cols` values in ggml_type (iq_mmq_type_ok).

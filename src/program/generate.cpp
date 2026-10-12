@@ -2766,9 +2766,25 @@ int main(int argc, char** argv) {
     {
         // the GPU this run drives and the paths it takes (chosen from what it reports, never from its name)
         const strata::core::DeviceInfo gi = strata::core::device_info(0);
-        std::fprintf(stderr, "strata generate: GPU %s, %u compute units, %.1f GiB, prompt matrix products on %s\n",
+        // the experts' products beside the dense ones: a user read "DP4a" alone and took it that RDNA3's WMMA ran
+        // nowhere, while the experts' int8 products took it
+        std::fprintf(stderr, "strata generate: GPU %s, %u compute units, %.1f GiB, prompt matrix products on %s; the "
+                             "experts' in %s\n",
                      gi.name.c_str(), gi.compute_units, (double) gi.total_bytes / (1024.0 * 1024 * 1024),
-                     strata::prefill::Gemm::path());
+                     strata::prefill::Gemm::path(), strata::prefill::experts_path().c_str());
+        // a layer split: each later stage's GPU takes the paths its own report gives (B70 + RTX 4070: XMX and FP16 on
+        // one, joint_matrix and int8 on the other)
+        std::vector<int> said{0};
+        for (const int d : multi_gpu ? split_devs : std::vector<int>{}) {
+            if (std::find(said.begin(), said.end(), d) != said.end()) continue;
+            said.push_back(d);
+            const strata::core::OnDevice on(d);
+            const strata::core::DeviceInfo di = strata::core::device_info(d);
+            std::fprintf(stderr, "strata generate: GPU %d %s, %u compute units, %.1f GiB, prompt matrix products on %s; "
+                                 "the experts' in %s\n",
+                         d, di.name.c_str(), di.compute_units, (double) di.total_bytes / (1024.0 * 1024 * 1024),
+                         strata::prefill::Gemm::path(), strata::prefill::experts_path().c_str());
+        }
     }
     // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe).
     // PR #44: a x8 link carries half of what the native default assumes - the GPU's SMs read that share over the

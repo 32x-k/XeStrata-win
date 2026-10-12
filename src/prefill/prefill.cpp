@@ -647,6 +647,15 @@ struct MmqPlan {
     std::vector<char> layer;                   // per layer: MMQ
     size_t gu_max = 0, d_max = 0;
 };
+// mmq::chosen, except where Intel's XMX take the FP16 path (xmx_available: its products of the dequantized experts, and
+// the resident ones straight from their blocks, iq_gemm_grouped_f16): on the B70 that path beat the int8 XMX products at
+// every length, 2,320 against 871 tok/s at 32K, 1,486 against 1,379 at 4K and 869 against 829 at 1K (IQ2_XS experts),
+// where PlainModel's FP16 path, without the fused products, lost to them.  STRATA_PREFILL_MMQ=0: the FP16 path.
+bool mmq_wanted() {
+    const char* env = std::getenv("STRATA_PREFILL_MMQ");
+    return mmq::chosen() && !strata::kernels::xmx_available(strata::kernels::XmxType::f16) &&
+           (env == nullptr || std::strtol(env, nullptr, 10) != 0);
+}
 const MmqPlan& mmq_plan() {
     // per GPU (the current device's): a layer split's stages can differ, and a stage that took the first GPU's plan
     // ran int8 products its own GPU lacks (B70 + RTX 4070: the 4070's prompt chunk stopped at its first layer)
@@ -654,13 +663,7 @@ const MmqPlan& mmq_plan() {
     return plans.get(core::Runtime::get().device(), [] {
         MmqPlan p;
         const auto& lay = strata::kernels::cpu::expert_layout();
-        const char* env = std::getenv("STRATA_PREFILL_MMQ");
-        // mmq::chosen, except where Intel's XMX take the FP16 path (xmx_available: its products of the dequantized
-        // experts, and the resident ones straight from their blocks, iq_gemm_grouped_f16): on the B70 that path beat
-        // the int8 XMX products at every length, 2,320 against 871 tok/s at 32K, 1,486 against 1,379 at 4K and 869
-        // against 829 at 1K (IQ2_XS experts), where PlainModel's FP16 path, without the fused products, lost to them
-        const bool on = mmq::chosen() && !strata::kernels::xmx_available(strata::kernels::XmxType::f16) && lay.native &&
-                        (env == nullptr || std::strtol(env, nullptr, 10) != 0);
+        const bool on = mmq_wanted() && lay.native;
         const int64_t layers = lay.native ? (int64_t) lay.fmt.size() : lay.n_layers;
         p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
         p.fallback = !on || layers <= 0;
@@ -1178,6 +1181,12 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
 }
 
 }  // namespace
+
+std::string experts_path() {
+    const MmqPlan& p = mmq_plan();
+    if (!p.any) return "FP16";
+    return std::string("int8 (") + mmq::path() + ")" + (p.fallback ? ", FP16 in the layers of types it lacks" : "");
+}
 
 namespace {
 // STRATA_PREFILL_TIMING=1: the prompt path's GPU time by phase.  Events are recorded on the compute stream in order;
