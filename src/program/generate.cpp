@@ -3922,6 +3922,10 @@ int main(int argc, char** argv) {
                      st.dev, last ? " and head" : "", (double) fb / 1073741824.0);
     }
     GpuStage* const last_st = stages.empty() ? nullptr : stages.back().get();
+    auto batch_mtp_serial = [] {   // STRATA_BATCH_MTP_SERIAL=1: --batch-mtp keeps its serial windows (batch_groups.hpp)
+        const char* v = std::getenv("STRATA_BATCH_MTP_SERIAL");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    };
 
     // --batch (upstream PR #559, #465): o.batch more sessions carved like the main one, one per slot of the batch
     // windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.  A count the engine
@@ -3939,6 +3943,9 @@ int main(int argc, char** argv) {
         // the head and the final residual rows are, and the windows carry two rows a slot through every stage.  Not
         // with pipelined slot groups given on the command line (the default groups give way to it: below), and not
         // run with helper expert caches on a layer split (upstream f90bec6f)
+        // upstream a0116b27 (#2038): the default groups no longer give way to --batch-mtp (four streams on two GPUs ran
+        // 25-30% faster pipelined than in the serial MTP windows); STRATA_BATCH_MTP_SERIAL=1 or --batch-groups 1 keeps
+        // the serial windows with the slots' drafts
         auto groups_given = [&] {
             strata::program::batch_groups::Input bin;
             bin.set = o.batch_groups_set;
@@ -3947,13 +3954,19 @@ int main(int argc, char** argv) {
             bin.batch = o.batch;
             bin.later_stages = (int) stages.size();
             bin.batch_mtp = true;
-            return strata::program::batch_groups::resolve(bin).groups;
+            bin.mtp_serial = batch_mtp_serial();
+            return strata::program::batch_groups::resolve(bin);
         };
         const char* why = o.batch < 2 ? "it needs --batch 2 or more" : o.mtp.empty() ? "it needs --mtp"
                         : o.spec < 2 ? "it needs --spec T (T >= 2)"
                         : split_same ? "it needs each stage of a layer split on its own GPU"
-                        : !stages.empty() && groups_given() > 1
-                            ? "it does not combine with --batch-groups (pipelined slot groups) yet"
+                        : !stages.empty() && groups_given().groups > 1
+                            ? (groups_given().mtp_dropped
+                                   ? "a layer split with --batch pipelines the slots in groups by default and the "
+                                     "pipelined groups run no slot drafts (4 streams on 2 GPUs: 25-30% faster than the "
+                                     "serial MTP windows); --batch-groups 1 or STRATA_BATCH_MTP_SERIAL=1 keeps --batch-mtp "
+                                     "with serial windows"
+                                   : "it does not combine with --batch-groups (pipelined slot groups) yet")
                         : !stages.empty() && o.expert_cache_remote[0] > 0
                             ? "it is not run with helper expert caches on a layer split"
                         : !o.serve ? "it needs --serve" : nullptr;
@@ -4036,7 +4049,8 @@ int main(int argc, char** argv) {
         // --batch-groups (upstream 1bf6344c, ca001df5, cb6c549c, b5d52031): a number, or auto - the most groups, at
         // most one per GPU of the layer split, that divide the slots, so every card is busy (upstream, 4 x R9700, 8
         // clients: 90 tok/s in one group, 136 in 2, 166 in 4); auto is the default for a layer split with 2 or more
-        // slots, and that default gives way to --batch-mtp (one group), whose drafts the pipelined groups do not run.
+        // slots, and that default no longer gives way to --batch-mtp (upstream a0116b27: --batch-mtp is off there, as
+        // the pipelined groups run no drafts; STRATA_BATCH_MTP_SERIAL=1 keeps it in one serial group).
         // Resolved here, with the slots that fit, so INFO batch_groups says what the serve loop runs.  It also gives
         // way to --adapt-async 1 when asked for (upstream b5d52031): the default (-1, on where it applies) does not,
         // and the asynchronous tier is then off beside the pipelined groups.
@@ -4048,6 +4062,7 @@ int main(int argc, char** argv) {
             bin.batch = o.batch;
             bin.later_stages = (int) stages.size();
             bin.batch_mtp = batch_mtp;
+            bin.mtp_serial = batch_mtp_serial();
             bin.adapt_async = o.adapt_async == 1;
             const auto r = strata::program::batch_groups::resolve(bin);
             if (r.from_auto) {

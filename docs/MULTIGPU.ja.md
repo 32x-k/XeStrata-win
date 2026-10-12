@@ -106,14 +106,15 @@ G は N を割り切る数です。
 
 `--batch-groups auto` は、GPU ごとに多くて 1 組、N を割り切る最も多い組の数を選びます（upstream 1bf6344c）。
 層の分割で `--batch-groups` を渡さなければ、既定は `auto` です（upstream ca001df5。組を 1 つにするには `--batch-groups 1`）。
-ただし `--batch-mtp`（`--mtp` があれば既定で有効）が動くときは、既定は 1 組になります（upstream cb6c549c）。
-組に分けたウィンドウは MTP の下書きを確かめないためです。
+既定の組は `--batch-mtp`（`--mtp` があれば既定で有効）に譲らず、そのとき `--batch-mtp` を切って、そうログに出します（upstream a0116b27）。
+組に分けたウィンドウは MTP の下書きを確かめませんが、2x RTX A4000 の 4 本の同時の要求では、組に分けたほうが MTP の下書きを確かめる 1 組より 25〜30% 速かったためです。
+`--batch-groups 1` か `STRATA_BATCH_MTP_SERIAL=1` で、前と同じく 1 組で `--batch-mtp` を使います（同時の要求が少ないときや、prompt がまれにしか来ないときは、こちらが速いことがあります）。
 エンジンが選んだ組の数はログと `INFO batch_groups` に出て、サーバーはそれに合わせてスロットを割り当てます。
 組の中の使用中のスロットより前が空いていれば、そのスロットを先に使います（upstream 2c7c02ab）。
 
 `--batch-mtp` は層の分割でも動きます（upstream 48f2c47d）。
 スロットごとの下書き器は最後の GPU に置き、各スロットの 2 行が全部の GPU を通ります。
-コマンドラインで `--batch-groups` に 2 以上か `auto` を渡したとき、1 枚の GPU に 2 段を置くとき、補助のキャッシュ（`--expert-cache-device1..3`）があるときは無効です。
+組に分けるとき（既定の `auto` を含む）、1 枚の GPU に 2 段を置くとき、補助のキャッシュ（`--expert-cache-device1..3`）があるときは無効です。
 層の分割でも、下書き層の prefill の K/V を、1 枚のときと同じく最後の GPU の prefill の経路でまとめて作ります（upstream a22a0e8c。upstream では `STRATA_SPLIT_MTP_BATCH=1` で入れる opt-in、ここでは既定）。
 B70 + RTX 4070（IQ2_XS、K=45、32K のプロンプト）では prefill が 2,350 → 2,424 tok/s になりました。
 

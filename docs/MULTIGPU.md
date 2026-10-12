@@ -106,13 +106,15 @@ The fewer slots a group has, the fewer tokens share one read of the weights, so 
 
 `--batch-groups auto` takes the most groups, at most one per GPU, that divide N (upstream 1bf6344c).
 On a layer split without `--batch-groups` the default is `auto` (upstream ca001df5; `--batch-groups 1` for one group).
-When `--batch-mtp` runs (on by default with `--mtp`) the default is one group instead (upstream cb6c549c), as grouped windows do not verify the MTP proposals.
+The default groups do not give way to `--batch-mtp` (on by default with `--mtp`): it is turned off then, and the log says so (upstream a0116b27).
+Grouped windows do not verify the MTP proposals, but four concurrent requests on 2x RTX A4000 ran 25-30% faster in groups than in the one group that verifies them.
+`--batch-groups 1` or `STRATA_BATCH_MTP_SERIAL=1` keeps `--batch-mtp` in one group, as before (with few concurrent requests, or prompts that come rarely, it can be the faster choice).
 The engine logs the groups it chose and reports them as `INFO batch_groups`, and the server assigns the slots by them.
 A free slot before a busy one in its group is used first (upstream 2c7c02ab).
 
 `--batch-mtp` works on a layer split too (upstream 48f2c47d).
 The slots' drafters sit on the last GPU, and each slot's two rows pass every GPU.
-It is off when `--batch-groups` is given as 2 or more or `auto`, with two stages on one GPU, and with helper caches (`--expert-cache-device1..3`).
+It is off when the slots run in groups (the default `auto` included), with two stages on one GPU, and with helper caches (`--expert-cache-device1..3`).
 On a layer split too, the draft layer's prefill K/V are built in batches through the last GPU's prefill path, as one GPU does (upstream a22a0e8c, opt-in there as `STRATA_SPLIT_MTP_BATCH=1`; the default here).
 On a B70 + RTX 4070 (IQ2_XS, K=45, a 32K prompt) prefill went from 2,350 to 2,424 tok/s.
 
