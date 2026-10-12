@@ -51,6 +51,12 @@ struct PlainOptions {
     int64_t reserve_mib = 768;      ///< VRAM left free after the expert slots
     int adapt_every = 4;            ///< windows between adaptive rounds (0: off)
     int adapt_swaps = 96;           ///< the most experts one round moves into the VRAM tier
+    /// ... and at most this many MiB of experts for each token the windows read since the last round: the copies share
+    /// the RAM's bandwidth with the missed experts.  48: on the RX 9060 XT with a Ryzen 7 5700X (DDR4, 2026-10-12),
+    /// llm-jp-4.1 (4.6 MB experts, a token a window) went 31.3 -> 34.3 tok/s at 8 GB (96 a round had been 100 MB a token)
+    /// and 58.6 -> 60.0 at 16 GB (32: 35.3 and 58.1); Ornith Q6_K (2.5 MB, MTP windows) stays at its 96 a round, 21-24 MB
+    /// a token.  On the B70 with an i7-14700 (DDR5) the bound changed nothing (llm-jp 8 GB 41.5 / 41.6).  0: none.
+    int adapt_mib_per_token = 48;
     float adapt_decay = 0.7f;       ///< the routing counts are multiplied by this after each round
     /// The experts read from the GGUF in place (the page cache, the drive) instead of loaded into pinned RAM: the
     /// low-RAM mode, taken by itself when the RAM available is less than the experts.  It has no PCIe share.
@@ -291,6 +297,7 @@ private:
     std::vector<std::pair<int32_t, int32_t>> prior_;   ///< the profile the tier was filled from
     int64_t n_slots_ = 0;
     int64_t windows_ = 0, swaps_total_ = 0;
+    int64_t tokens_since_adapt_ = 0;   ///< tokens the windows read since the last adaptive round
     uint8_t* fill_tmp_ = nullptr;                 ///< pinned staging for a slot fill
 
     // per-sequence device state

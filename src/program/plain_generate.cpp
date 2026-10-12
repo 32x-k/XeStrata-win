@@ -305,6 +305,9 @@ static void plain_usage(const std::string& arch) {
                  "  --expert-profile-save-every MIN   with --serve: also every MIN minutes between requests (default\n"
                  "                       10; 0: at QUIT only)\n"
                  "  --adapt-every N      windows between the tier's adaptive rounds (default 4; 0 off)\n"
+                 "  --adapt-swaps N      the most experts one round moves into the VRAM tier (default 96)\n"
+                 "  --adapt-mib-per-token N   and at most N MiB of them for each token read since the last round\n"
+                 "                       (default 48; 0: no such bound)\n"
                  "  --mmap-experts       read the experts from the GGUF through mmap instead of pinned RAM\n"
                  "  --no-pcie-split      the CPU computes every expert the VRAM tier misses\n"
                  "  --prompt-chunk N     the prompt's most tokens a chunk through the batched products (default\n"
@@ -371,6 +374,9 @@ int plain_main(int argc, char** argv) {
         else if (a == "--pool-workers") opt.pool_workers = (int) std::strtol(next("--pool-workers"), nullptr, 10);
         else if (a == "--dump-logits") dump_path = next("--dump-logits");
         else if (a == "--adapt-every") opt.adapt_every = (int) std::strtol(next("--adapt-every"), nullptr, 10);
+        else if (a == "--adapt-swaps") opt.adapt_swaps = (int) std::strtol(next("--adapt-swaps"), nullptr, 10);
+        else if (a == "--adapt-mib-per-token")
+            opt.adapt_mib_per_token = (int) std::strtol(next("--adapt-mib-per-token"), nullptr, 10);
         else if (a == "--gpu") (void) next("--gpu");
         else if (a == "--mmap-experts") opt.mmap_experts = true;
         else if (a == "--no-pcie-split") opt.pcie_split = false;

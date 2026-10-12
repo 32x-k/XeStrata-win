@@ -32,7 +32,7 @@ const char* const kNotYet[] = {
     "--conversation-cache-slots", "--conversation-save", "--conversation-save-checkpoints",
     "--conversation-save-compress", "--conversation-save-hours", "--conversation-save-mib", "--session-min-free-mib",
     "--kv", "--kv-grow", "--no-kv-grow", "--kv-resident", "--vram-reserve-mib", "--vram-reserve-later-mib",
-    "--vram-elastic", "--vram-segment-mib", "--expert-cache", "--adapt-async", "--adapt-decay", "--adapt-swaps",
+    "--vram-elastic", "--vram-segment-mib", "--expert-cache", "--adapt-async", "--adapt-decay",
     "--pcie-frac", "--pcie-mode", "--pool-tasks", "--stats", "--stage-timing", "--spec-min-p",
     "--spec-split", "--no-spec-split", "--spec-follow", "--spec-oracle", "--spec-corrupt", "--suffix-draft",
     "--lookup-chain", "--lookup-chain-min", "--coupled-draft", "--no-coupled-draft", "--mtp", "--mtp-max-t",

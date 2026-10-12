@@ -1031,6 +1031,7 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
     last_T_ = T;
     mtp_h_set_ = false;
     ++windows_;
+    tokens_since_adapt_ += T;
     if (!disp_.usage.empty() && windows_ % opt_.adapt_every == 0 && !adapt(err)) return false;
     return true;
 }
@@ -1195,7 +1196,15 @@ bool PlainModel::adapt(std::string& err) {
         }
     }
     std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
-    if ((int) swaps.size() > opt_.adapt_swaps) swaps.resize((size_t) opt_.adapt_swaps);
+    // and at most adapt_mib_per_token of copies for each token the windows read since the last round: the copies share
+    // the RAM's bandwidth with the missed experts the CPU and PCIe read
+    const uint64_t blob = k::cpu::expert_layout().max_blob;
+    const int64_t budget = blob > 0 && opt_.adapt_mib_per_token > 0
+                               ? (int64_t) (((uint64_t) opt_.adapt_mib_per_token << 20) * (uint64_t) tokens_since_adapt_ / blob)
+                               : opt_.adapt_swaps;
+    tokens_since_adapt_ = 0;
+    const int64_t cap = std::min<int64_t>(opt_.adapt_swaps, std::max<int64_t>(budget, 1));
+    if ((int64_t) swaps.size() > cap) swaps.resize((size_t) cap);
     for (const Swap& w : swaps) {
         if (w.out < 0) {
             if (free_[(size_t) w.layer].empty()) continue;
