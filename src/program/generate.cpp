@@ -1095,12 +1095,22 @@ void disk_wait_threads(std::FILE* f) {
                                "direct (#605: --ple-io ram), or a drive too slow for the reads asked of it" : "");
 }
 
+// Upstream #2065: the VRAM free when the current request began (-1 before the first); the stall report prints it, as a
+// card too full is one cause of a window that never finishes (the driver moves GPU memory to system RAM).  No line is
+// drawn: the expert cache fills the card by design, leaving 400-450 MiB free on the RTX 4070 and the B70, below
+// upstream's 512 MiB warning.
+std::atomic<int64_t> g_req_vram_free_mib{-1};
+
 void stall_report(std::FILE* f, uint64_t layers_during) {
     strata::core::Progress& p = strata::core::progress();
     std::fprintf(f, "strata serve: stall report (engine %s): stage \"%s\" for %lld s; %llu layers served since the "
                     "last finished step (0 = stopped, more = slow)\n", STRATA_VERSION, stage_text().c_str(),
                  (long long) ((strata::core::progress_now_ms() - p.since_ms.load()) / 1000),
                  (unsigned long long) layers_during);
+    if (const int64_t vf = g_req_vram_free_mib.load(); vf >= 0)
+        std::fprintf(f, "  VRAM free when this request began: %lld MiB (a card the driver must move memory off of is "
+                        "a cause of a window that never finishes: a larger --vram-reserve-mib leaves room)\n",
+                     (long long) vf);
     for (int pass = 0; pass < 2; ++pass) {
         if (pass == 1) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -6686,6 +6696,13 @@ int main(int argc, char** argv) {
                                          "this snapshot (%zu MiB plus %lld MiB floor)\n",
                                  freed, freed == 1 ? "" : "s", additional >> 20,
                                  (long long) o.conversation_cache_min_free_mib);
+                // upstream #2049: parking copies the outgoing conversation's running checkpoints and K/V into host
+                // memory, a silent stretch of the "request" stage that takes minutes when the OS has paged that memory
+                // out.  Named, so a stall report says "parking"; its copies beat (conversation_state.cpp).
+                struct ParkStage {
+                    ParkStage() { strata::core::progress_at("request: parking the previous conversation"); }
+                    ~ParkStage() { strata::core::progress_at("request"); strata::core::progress_beat(); }
+                } park_stage;
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
                 if (conv_stages.empty() ? !strata::core::conversation_snapshot_save(image, view, ss, g, mtp.kv_state(),
@@ -8844,6 +8861,11 @@ int main(int argc, char** argv) {
             if (!finish_staged()) {   // (after every reply already; here for a request that ended another way)
                 std::printf("ERR saving a conversation checkpoint failed\n");
                 return 1;
+            }
+            {   // upstream #2065: the free VRAM now, for the stall report (the verify windows' captures and the batch
+                // layouts eat into what the start reported)
+                size_t vf_b = 0, vt_b = 0;
+                if (strata::gpu::mem_info(&vf_b, &vt_b)) g_req_vram_free_mib.store((int64_t) (vf_b >> 20));
             }
             int64_t resume = 0;
             bool from_live = false;

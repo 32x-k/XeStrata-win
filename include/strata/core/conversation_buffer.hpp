@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #pragma once
 
+#include "strata/core/progress.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -81,6 +83,7 @@ public:
                 segment.resize(count, value);
                 segments_.push_back(std::move(segment));
                 size_ += count;
+                progress_beat();   // upstream #2049: zero-filling fresh pages is slow when the host is paging
             }
         } else {
             while (!segments_.empty() && size_ - segments_.back().size() >= n) {
