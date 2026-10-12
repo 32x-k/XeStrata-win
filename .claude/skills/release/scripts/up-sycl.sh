@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # .claude/skills/release/scripts/up-sycl.sh - upstream's sycl/ port as an engine command (UP for bench.sh and the
 # serve and everyday scripts): its strata, built in its strata-sycl-dev image (its docs/INTEL.md), run in that image
-# with the arguments as they are.  stdin passes through (serve).
+# as its setup configures it: the arguments get what its sycl/setup_intel.py writes for the card, and the engine the
+# environment of that config and the run-time switches of its sycl/serve/strata-sycl.sh (tools/bench_upstream.py
+# --sycl-setup).  stdin passes through (serve).
 #
 #   UP_TREE=DIR DATA=DIR [IDS=DIR] [UP_SELECTOR=level_zero:N] up-sycl.sh ARGS...
 #
@@ -12,6 +14,18 @@
 # UP_SELECTOR (default level_zero:0): the Level Zero device to take.
 set -u
 : "${UP_TREE:?}" "${DATA:?}"
+selector=${UP_SELECTOR:-level_zero:0}
+repo=$(cd "$(dirname "$0")/../../../.." && pwd)
+words=$(mktemp) || exit 1
+python3 "$repo/tools/bench_upstream.py" --sycl-setup "$UP_TREE" "$selector" -- "$@" > "$words" || { rm -f "$words"; exit 1; }
+mapfile -d '' -t w < "$words"
+rm -f "$words"
+envs=()
+for i in "${!w[@]}"; do
+  [ "${w[$i]}" = -- ] && { set -- "${w[@]:$((i + 1))}"; break; }
+  envs+=(-e "${w[$i]}")
+done
+echo "up-sycl.sh: sycl/setup_intel.py's settings: ${envs[*]} $*" >&2
 mounts=(-v "$UP_TREE:$UP_TREE:ro" -v "$DATA:$DATA:ro")
 [ -n "${IDS:-}" ] && mounts+=(-v "$IDS:$IDS:ro")
 # the folder of a file argument outside those (--spec-follow's text, a --dump-logits output), at the same path
@@ -26,6 +40,6 @@ name="up-sycl-$$-$RANDOM"
 me=$$
 (while kill -0 "$me" 2>/dev/null; do sleep 2; done; docker kill "$name" >/dev/null 2>&1) </dev/null >/dev/null 2>&1 &
 docker run --rm -i --name "$name" -u "$(id -u):$(id -g)" --device /dev/dri \
-  --group-add "$(getent group render | cut -d: -f3)" \
-  -e ONEAPI_DEVICE_SELECTOR="${UP_SELECTOR:-level_zero:0}" "${mounts[@]}" strata-sycl-dev \
+  --group-add "$(getent group render | cut -d: -f3)" --ulimit memlock=-1 \
+  -e ONEAPI_DEVICE_SELECTOR="$selector" "${envs[@]}" "${mounts[@]}" strata-sycl-dev \
   "exec $UP_TREE/build-sycl-aot/strata $(printf '%q ' "$@")"
