@@ -125,12 +125,32 @@ function(strata_hip_choose archs targets_out opts_out)
   set(${opts_out} "${opts}" PARENT_SCOPE)
 endfunction()
 
+# AMD's ROCm tree with CMake packages (hip, rocblas, hipblaslt), for CMAKE_PREFIX_PATH: /opt/rocm or the versioned
+# /opt/rocm-<version>, or the parts ROCm 7.14 splits its tree into (/opt/rocm/core-7.14, where hip-config.cmake is;
+# /opt/rocm itself has no lib/cmake there, and find_package(hip) failed: a field report).  One tree, so that two
+# installed versions are not mixed, in setup.py's order (rocm_roots): /opt/rocm, its alternatives link core, the newest
+# core-<version>, the newest /opt/rocm-<version>; NATURAL sorts core-10.1 after core-7.14.
+function(strata_hip_prefixes out)
+  file(GLOB cores LIST_DIRECTORIES true /opt/rocm/core-*)
+  file(GLOB versioned LIST_DIRECTORIES true /opt/rocm-*)
+  list(SORT cores COMPARE NATURAL ORDER DESCENDING)
+  list(SORT versioned COMPARE NATURAL ORDER DESCENDING)
+  set(${out} "" PARENT_SCOPE)
+  foreach(root IN ITEMS /opt/rocm /opt/rocm/core ${cores} ${versioned})
+    if(IS_DIRECTORY "${root}/lib/cmake")
+      set(${out} "${root}" PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+endfunction()
+
 # ROCm's clang (AMD's tree's, or the distribution's ROCm one: Fedora's /usr/lib64/rocm/llvm, Ubuntu's
 # /usr/lib/llvm-<N>), for HIP's CMake package (HIP_CXX_COMPILER): it links clang's runtime builtins where that compiler
 # has them, and intel/llvm's install has none, so asked with intel/llvm's clang it named a file that is not there.  The
 # newest one whose builtins exist; empty when there is none.
 function(strata_hip_cxx out)
-  file(GLOB compilers /opt/rocm/llvm/bin/clang++ /opt/rocm/lib/llvm/bin/clang++ /usr/lib64/rocm/llvm/bin/clang++
+  file(GLOB compilers /opt/rocm/llvm/bin/clang++ /opt/rocm/lib/llvm/bin/clang++ /opt/rocm*/core-*/llvm/bin/clang++
+                      /opt/rocm*/core-*/lib/llvm/bin/clang++ /usr/lib64/rocm/llvm/bin/clang++
                       /usr/lib/llvm-*/bin/clang++)
   list(SORT compilers COMPARE NATURAL ORDER DESCENDING)
   foreach(cxx IN LISTS compilers)

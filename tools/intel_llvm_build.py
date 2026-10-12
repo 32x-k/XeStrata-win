@@ -20,6 +20,7 @@ Prints the toolchain's folder on its last line.  setup.py runs it for --intel-ll
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -135,10 +136,15 @@ def finished():
 
 
 def rocm_dirs() -> tuple | None:
-    """ROCm's HIP for the HIP target: AMD's own tree (/opt/rocm) or the distribution's (the headers in /usr/include,
-    the libraries in Debian's and Ubuntu's multiarch folder or Fedora's /usr/lib64)."""
-    if Path("/opt/rocm/include/hip/hip_runtime_api.h").exists():
-        return Path("/opt/rocm"), Path("/opt/rocm/lib")
+    """ROCm's HIP for the HIP target: AMD's own tree (/opt/rocm, or the part ROCm 7.14's packages put it in,
+    /opt/rocm/core-7.14, with nothing in /opt/rocm itself) or the distribution's (the headers in /usr/include, the
+    libraries in Debian's and Ubuntu's multiarch folder or Fedora's /usr/lib64)."""
+    # one tree, in setup.py's order (rocm_roots): /opt/rocm, its alternatives link core, the newest core-<version>
+    cores = sorted(Path("/opt/rocm").glob("core-*"), key=lambda p: [int(n) for n in re.findall(r"\d+", p.name)],
+                   reverse=True)
+    for root in (Path("/opt/rocm"), Path("/opt/rocm/core"), *cores):
+        if (root / "include/hip/hip_runtime_api.h").exists():
+            return root, root / "lib"
     if Path("/usr/include/hip/hip_runtime_api.h").exists():
         for lib in [*sorted(Path("/usr/lib").glob("*/libamdhip64.so")), Path("/usr/lib64/libamdhip64.so")]:
             if lib.exists():

@@ -205,7 +205,10 @@ def drivers(vendors: set) -> dict:
         m = re.search(r"Kernel Module\s+(?:for \S+\s+)?([\d.]+)", v or "")
         out["nvidia"] = m.group(1) if m else None
     if "amd" in vendors:
-        out["amd"] = {"rocm": read("/opt/rocm/.info/version"), **package_version("rocm-core", "hip-runtime-amd")}
+        # ROCm 7.14 keeps it in /opt/rocm/core-<version> only
+        rocm = read("/opt/rocm/.info/version") or next(
+            (v for p in sorted(Path("/opt/rocm").glob("core-*/.info/version")) if (v := read(p))), None)
+        out["amd"] = {"rocm": rocm, **package_version("rocm-core", "hip-runtime-amd")}
     return out
 
 

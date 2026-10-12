@@ -694,10 +694,38 @@ def strix_halo_notes(gpu, ram) -> list:
     return notes
 
 
+def rocm_roots() -> list:
+    """AMD's ROCm tree the build takes, as one ([] without one), so that two installed versions are not mixed: /opt/rocm
+    where it holds lib/ or include/ (ROCm 7.2's alternatives link to /opt/rocm-<version>, or ROCm 7.14's links into
+    /opt/rocm/core-7.14 that its amdrocm-core packages make), else /opt/rocm/core (their alternatives link), else the
+    newest /opt/rocm/core-<version> (ROCm 7.14's packages without amdrocm-core: nothing of /opt/rocm's own), else the
+    newest /opt/rocm-<version>.  The newest by the version's numbers: core-10.1 after core-7.14."""
+    def newest(paths):
+        return sorted(paths, key=lambda p: [int(n) for n in re.findall(r"\d+", p.name)], reverse=True)
+    opt = Path("/opt/rocm")
+    for root in [opt, opt / "core", *newest(opt.glob("core-*")), *newest(Path("/opt").glob("rocm-*"))]:
+        if (root / "lib").is_dir() or (root / "include").is_dir():
+            return [root.resolve() if root.is_symlink() else root]
+    return []
+
+
+def rocm_lib_dirs() -> list:
+    """The folders of AMD's ROCm libraries the engine needs on its library path: none where the loader finds
+    libamdhip64 (a distribution's, or a ROCm that installs an ld.so.conf); ROCm 7.14's packages install none, and the
+    SYCL runtime's HIP adapter then did not load (no GPU listed) until its lib/ was on LD_LIBRARY_PATH."""
+    try:
+        cached = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True).stdout
+    except OSError:
+        cached = ""
+    if "libamdhip64.so" in cached:
+        return []
+    return [str(r / "lib") for r in rocm_roots() if any((r / "lib").glob("libamdhip64.so*"))][:1]
+
+
 def rocblas_archs() -> set | None:
     """The AMD architectures the distribution's rocBLAS has code for (its kernels' file names), None without rocBLAS:
     the engine's dense matrix products run in it, so an AMD GPU it has no code for cannot run the engine."""
-    dirs = [d for d in (Path("/usr/lib64/rocblas/library"), Path("/opt/rocm/lib/rocblas/library"),
+    dirs = [d for d in (Path("/usr/lib64/rocblas/library"), *(r / "lib/rocblas/library" for r in rocm_roots()),
                         *Path("/usr/lib").glob("*/rocblas/*/library")) if d.is_dir()]
     if not dirs:
         return None
@@ -893,17 +921,21 @@ def rocm_missing() -> list:
     (oneMath's rocBLAS backend: the dense products), and hipblas-common, which hipBLASLt's CMake package needs and its
     distribution package does not depend on."""
     import glob
-    inc = [Path("/usr/include"), Path("/opt/rocm/include")]
+    roots = rocm_roots()
+    inc = [Path("/usr/include"), *(r / "include" for r in roots)]
     clang_ok = False
-    for cxx in glob.glob("/opt/rocm/llvm/bin/clang++") + glob.glob("/usr/lib64/rocm/llvm/bin/clang++") + \
-            glob.glob("/usr/lib/llvm-*/bin/clang++"):
+    for cxx in [str(c) for r in roots for c in (r / "llvm/bin/clang++", r / "lib/llvm/bin/clang++") if c.exists()] + \
+            glob.glob("/usr/lib64/rocm/llvm/bin/clang++") + glob.glob("/usr/lib/llvm-*/bin/clang++"):
         r = subprocess.run([cxx, "-print-libgcc-file-name", "--rtlib=compiler-rt"], capture_output=True, text=True)
         clang_ok = clang_ok or (r.returncode == 0 and Path(r.stdout.strip()).is_file())
     # in the order of PACKAGES' AMD part
     have = [any((d / "hip" / "hip_runtime_api.h").exists() for d in inc),
-            any(glob.glob(g) for g in ("/opt/rocm/amdgcn/bitcode/ockl.bc",
-                                       "/usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode/ockl.bc",
-                                       "/usr/lib/llvm-*/lib/clang/*/amdgcn/bitcode/ockl.bc")),
+            # (an intel/llvm built here has its own: tools/intel_llvm_build.py)
+            any((r / d / "ockl.bc").exists() for r in roots for d in ("amdgcn/bitcode", "lib/llvm/amdgcn/bitcode")) or
+            any(glob.glob(g) for g in ("/usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode/ockl.bc",
+                                       "/usr/lib/llvm-*/lib/clang/*/amdgcn/bitcode/ockl.bc",
+                                       str(INTEL_LLVM_DEFAULT / "amdgcn/bitcode/ockl.bc"),
+                                       str(INTEL_LLVM_CONTRIB / "amdgcn/bitcode/ockl.bc"))),
             clang_ok, clang_ok,
             any((d / "rocblas" / "rocblas.h").exists() for d in inc),
             any((d / "hipblaslt" / "hipblaslt.h").exists() for d in inc),
@@ -1708,6 +1740,7 @@ def choose_compiler(a, gpu: dict) -> dict:
             fail("building for the AMD GPU needs ROCm's " + ", ".join(missing),
                  ("install them: sudo dnf install " if distro_id() == "fedora" else "install them: sudo apt install ")
                  + " ".join(missing) + ", then run it again")
+        comp["lib_dirs"] = list(dict.fromkeys(comp["lib_dirs"] + rocm_lib_dirs()))
         if not any(Path(d).glob("libur_adapter_hip.so*") for d in comp["lib_dirs"]):
             # intel/llvm gets the HIP target only when ROCm's HIP is there as it is built
             llvm = Path(comp["cxx"]).parent.parent
