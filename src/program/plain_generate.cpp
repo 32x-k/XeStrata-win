@@ -5,7 +5,8 @@
 //     strata --native MODEL.gguf --tokens 1,2,3 [options: plain_usage, --help]
 //
 // The prompt runs in chunks of up to N tokens through the batched products (--prompt-chunk, default 4096; 0: in
-// windows of up to T tokens), then one token a window.  stdout gets one line,
+// windows of up to T tokens), then one token a window (--spec: the pending token and the MTP layer's drafts, the
+// accepted ones emitted together).  stdout gets one line,
 // `tokens: a,b,c`, the generated ids; --dump-logits writes the logits each generated token was chosen from, n_vocab
 // floats a row.  The report goes to stderr.
 #include "strata/program/plain_generate.hpp"
@@ -87,7 +88,7 @@ std::vector<int32_t> eos_tokens(const std::string& path) {
 
 // `--serve` for these models: generate.cpp's --serve protocol (server.py's StrataEngine) for text requests.  READY
 // <context> stop; then `GEN <max_new> [temperature=F top_p=F top_k=N min_p=F seed=N] <ids>` -> RESUME <reused>,
-// one `T <id>` a token, DONE (generate.cpp's fields; the drafts, tiers and offload ones zero); STOP ends a request,
+// one `T <id>` a token, DONE (generate.cpp's fields; the RAM, file and offload ones zero); STOP ends a request,
 // QUIT the engine.  The commands of Qwen3.8-Flash-Next's engine this one has no part for (VRAM, SAVE, RESTORE,
 // GENI, BGEN) answer ERR.  The conversation's tokens stay read between requests: a request that starts with them
 // reads only what follows (a model with a recurrent state only when it extends them all; else it starts over).
@@ -204,6 +205,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         model.set_sampler(sp);
         const Clock::time_point t0 = Clock::now();
         const int64_t hits0 = model.hits(), look0 = model.hits() + model.misses();
+        const int64_t acc0 = model.spec_accepted(), off0 = model.spec_drafted();
         bool ok = true;
         int32_t next = -1;
         if (opt.prompt_chunk > 0) {
@@ -227,13 +229,33 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         const Clock::time_point t1 = Clock::now();
         const char* finish = "length";
         long long produced = 0;
-        for (;;) {
+        // with drafts (greedy requests): a window emits the accepted drafts and the token after them, sent one by one;
+        // the state holds every one of them but the last, as `live` does
+        const bool spec = model.drafts() > 0 && sp.greedy;
+        if (spec && !model.spec_start(next, (int64_t) live.size(), err)) ok = false;
+        std::vector<int32_t> pend;
+        size_t at = 0;
+        while (ok) {
             std::printf("T %d\n", next);
             std::fflush(stdout);
             ++produced;
             if (std::find(eos.begin(), eos.end(), next) != eos.end()) { finish = "stop"; break; }
             if (produced >= max_new) break;
+            if (at < pend.size()) {   // the window read this one already
+                live.push_back(next);
+                next = pend[at++];
+                continue;
+            }
             if (stop_req.load()) { finish = "cancel"; break; }
+            if (spec) {
+                int n_emit = 0;
+                if (!model.spec_step(eos, max_new - produced, out.data(), n_emit, nullptr, err)) { ok = false; break; }
+                live.push_back(next);
+                pend.assign(out.begin(), out.begin() + n_emit);
+                at = 0;
+                next = pend[at++];
+                continue;
+            }
             if (!model.forward(&next, 1, (int64_t) live.size(), out.data(), nullptr, err)) { ok = false; break; }
             live.push_back(next);
             next = out[0];
@@ -247,8 +269,9 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         const Clock::time_point t2 = Clock::now();
         const double prompt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         const double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
-        std::printf("DONE %lld %lld %.1f %.1f %s 0 0 %lld %lld %lld 0 0 0.0 %lld 0\n", produced, (long long) n,
-                    prompt_ms, decode_ms, finish, (long long) resume, (long long) (model.hits() - hits0),
+        std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld 0 0 0.0 %lld 0\n", produced, (long long) n,
+                    prompt_ms, decode_ms, finish, (long long) (model.spec_accepted() - acc0),
+                    (long long) (model.spec_drafted() - off0), (long long) resume, (long long) (model.hits() - hits0),
                     (long long) (model.hits() + model.misses() - look0), (long long) (n - resume));
         std::fflush(stdout);
     }
@@ -287,6 +310,8 @@ static void plain_usage(const std::string& arch) {
                  "  --prompt-chunk N     the prompt's most tokens a chunk through the batched products (default\n"
                  "                       4096; 0: the prompt in windows)\n"
                  "  --max-t N            the decode window's most tokens (default 8)\n"
+                 "  --spec N             speculative decoding with the model's MTP layer: windows of up to N tokens,\n"
+                 "                       the last one and N - 1 drafts (0: off; greedy only)\n"
                  "  --rope-scaling none|linear|yarn, --rope-scale F, --yarn-orig-ctx N   context extension\n"
                  "  --dump-logits PATH   each generated token's logits, FP32 rows\n"
                  "  --serve              stay resident and take requests on stdin (server.py's protocol, text requests)\n"
@@ -342,6 +367,7 @@ int plain_main(int argc, char** argv) {
         }
         else if (a == "--max-context") opt.max_cells = std::strtoll(next("--max-context"), nullptr, 10);
         else if (a == "--max-t") opt.max_t = (int) std::strtol(next("--max-t"), nullptr, 10);
+        else if (a == "--spec") opt.spec = (int) std::strtol(next("--spec"), nullptr, 10);
         else if (a == "--pool-workers") opt.pool_workers = (int) std::strtol(next("--pool-workers"), nullptr, 10);
         else if (a == "--dump-logits") dump_path = next("--dump-logits");
         else if (a == "--adapt-every") opt.adapt_every = (int) std::strtol(next("--adapt-every"), nullptr, 10);
@@ -376,7 +402,9 @@ int plain_main(int argc, char** argv) {
         std::fprintf(stderr, "strata (%s): needs --tokens and --max-new >= 1\n", arch.c_str());
         return 2;
     }
-    if ((int64_t) prompt.size() + n_new > opt.max_cells) opt.max_cells = (int64_t) prompt.size() + n_new;
+    // the last window's drafts and the MTP layer's cells reach a window past the last token
+    if ((int64_t) prompt.size() + n_new + opt.max_t > opt.max_cells)
+        opt.max_cells = (int64_t) prompt.size() + n_new + opt.max_t;
 
     if (sp.greedy) sp.temperature = 0.0f;
     if (stop_eos && eos.empty()) eos = eos_tokens(gguf);
@@ -440,7 +468,26 @@ int plain_main(int argc, char** argv) {
         if (pos == (int64_t) prompt.size() && !emit(n - 1)) return 1;
     }
     const Clock::time_point t2 = Clock::now();
+    // with drafts: a window checks them and emits the accepted ones and the token after them
+    const bool spec = model.drafts() > 0 && sp.greedy;
+    if (spec && (int64_t) produced.size() < n_new && !at_eos(produced.back()) &&
+        !model.spec_start(produced.back(), pos, err)) {
+        std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+        return 1;
+    }
+    const std::vector<int32_t> stop = stop_eos ? eos : std::vector<int32_t>();
     while ((int64_t) produced.size() < n_new && !at_eos(produced.back())) {
+        if (spec) {
+            int n_emit = 0;
+            if (!model.spec_step(stop, n_new - (int64_t) produced.size(), out.data(), n_emit, lg, err)) {
+                std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+                return 1;
+            }
+            for (int j = 0; j < n_emit; ++j)
+                if (!emit(j)) return 1;
+            pos += n_emit;
+            continue;
+        }
         const int32_t x = produced.back();
         if (!model.forward(&x, 1, pos, out.data(), lg, err)) {
             std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
@@ -465,6 +512,15 @@ int plain_main(int argc, char** argv) {
                  (double) (produced.size() - 1) / (tg > 0 ? tg : 1), (long long) model.resident(),
                  (long long) model.slots(), routed > 0 ? 100.0 * (double) model.hits() / (double) routed : 0.0,
                  (long long) model.swaps());
+    if (model.spec_windows() > 0)
+        std::fprintf(stderr, "strata (%s): %lld windows checked %lld drafts, accepted %lld (%.1f%%), %.2f tokens a window; "
+                             "a window %.2f ms, its drafts %.2f ms\n",
+                     arch.c_str(), (long long) model.spec_windows(), (long long) model.spec_drafted(),
+                     (long long) model.spec_accepted(),
+                     model.spec_drafted() > 0 ? 100.0 * (double) model.spec_accepted() / (double) model.spec_drafted() : 0.0,
+                     (double) (model.spec_accepted() + model.spec_windows()) / (double) model.spec_windows(),
+                     model.spec_ms_check() / (double) model.spec_windows(),
+                     model.spec_ms_draft() / (double) model.spec_windows());
     return 0;
 }
 
