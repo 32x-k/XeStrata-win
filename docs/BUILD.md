@@ -296,6 +296,9 @@ What happens next depends on the result:
 When the engine is compiled again after an update, setup uses the compiler recorded in `BUILD.json` and asks nothing.
 An engine from before the free build (no record) was built with icpx and stays so, as `--license contrib-icpx`.
 
+`--cmake-arg KEY=VALUE` hands the engine's build a CMake option (`-DKEY=VALUE`), once for each.
+They are kept in the settings for the builds after an update; `--cmake-arg ""` clears them.
+
 `tools/intel_llvm_build.py` is run by `--intel-llvm-build` or by hand.
 It clones the intel/llvm release tag the script names into `.tools/intel-llvm/src`, builds it, and installs it into `.tools/intel-llvm/install`.
 Its configuration downloads the sources the release pins.

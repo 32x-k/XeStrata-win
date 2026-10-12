@@ -299,6 +299,9 @@ Intel の GPU では、選んだコンパイラで `tools/xmx_probe.cpp` をビ�
 更新のあとでエンジンをコンパイルし直すときは、`BUILD.json` に記録したコンパイラを使い、何も尋ねません。
 free のビルドができる前のエンジン（記録がないもの）は icpx で作ったものなので、`--license contrib-icpx` としてそのまま icpx を使います。
 
+`--cmake-arg KEY=VALUE` は、エンジンのビルドに CMake のオプション（`-DKEY=VALUE`）を渡します（1 つにつき 1 回）。
+設定に残し、更新のあとのビルドでも使います。`--cmake-arg ""` で消せます。
+
 `tools/intel_llvm_build.py` は、`--intel-llvm-build` から、または手で動かします。
 スクリプトに書いた intel/llvm のリリースのタグを `.tools/intel-llvm/src` に clone してビルドし、`.tools/intel-llvm/install` にインストールします。
 ビルドの構成は、リリースが指定するソースを取ってきます。

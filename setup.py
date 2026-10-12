@@ -1839,6 +1839,19 @@ def gpu_encoder(comp: dict) -> str:
     return "vulkan"
 
 
+def engine_cmake_args() -> list:
+    """--cmake-arg KEY=VALUE: CMake options of the user's for the engine's build (a ROCm or toolkit in a place CMake
+    does not look, for example; a user could not hand setup one and changed setup.py), kept in the settings so that
+    later builds (an update) take them again; --cmake-arg "" clears them."""
+    st = load_settings()
+    given = getattr(ARGS, "cmake_arg", None)
+    if given is None:
+        return list(st.get("cmake_args", []))
+    keep = [x for x in given if x]
+    save_settings({**st, "cmake_args": keep})
+    return keep
+
+
 def build_engine(visions, llama, comp: dict) -> Path:
     """Compile the engine with `comp` (choose_compiler) and the image encoders in `visions` ("cpu", "vulkan", "gpu" =
     SYCL); the results go to engine/.  A compiled engine or encoder whose source files or compiler changed since (a
@@ -1853,6 +1866,8 @@ def build_engine(visions, llama, comp: dict) -> Path:
     used = {"cxx": comp["cxx"], "version": comp["version"], "kind": comp["kind"], "xmx": comp["xmx"],
             "license": comp["license"], "cuda_archs": comp["cuda_archs"], "onemkl": comp["onemkl"],
             "hip_archs": comp.get("hip_archs", [])}
+    if extra := engine_cmake_args():                   # (only when given: a build without them stays as it was)
+        used["cmake_args"] = extra
     engine_ok = xe and (eng / EXE).exists() and meta.get("src") == src and meta.get("compiler") == used
     built = dict(meta.get("vision_srcs") or {}) if xe else {}
     missing = [v for v in dict.fromkeys(visions)
@@ -1866,8 +1881,9 @@ def build_engine(visions, llama, comp: dict) -> Path:
     if not engine_ok:
         bdir = ROOT / "build-xe"
         cache = bdir / "CMakeCache.txt"
-        if cache.exists() and f"CMAKE_CXX_COMPILER:FILEPATH={comp['cxx']}" not in cache.read_text(errors="replace"):
-            shutil.rmtree(bdir)                        # CMake keeps the compiler it configured with
+        if cache.exists() and (f"CMAKE_CXX_COMPILER:FILEPATH={comp['cxx']}" not in cache.read_text(errors="replace")
+                               or (meta.get("compiler") or {}).get("cmake_args") != used.get("cmake_args")):
+            shutil.rmtree(bdir)                        # CMake keeps the compiler and the -D values it configured with
         say("  The engine's source changed: compiling it again (only what changed) ..." if xe and (eng / EXE).exists()
             and bdir.exists() else "  Compiling the Strata engine for the GPU (20-40 minutes, once) ...")
         cmake_build(ROOT, bdir, "strata",
@@ -1878,7 +1894,7 @@ def build_engine(visions, llama, comp: dict) -> Path:
                      f"-DSTRATA_ONEMKL={'ON' if comp['onemkl'] else 'OFF'}",
                      *([f"-DMKL_ROOT={mkl_root()}"] if comp["onemkl"] else []), "-DSTRATA_ENABLE_XE=ON",
                      "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_PORTABLE=ON",
-                     f"-DSTRATA_GGML_DIR={llama}"], comp["env"])
+                     f"-DSTRATA_GGML_DIR={llama}", *(f"-D{x}" for x in used.get("cmake_args", []))], comp["env"])
         install_binary(bdir / EXE, eng / EXE)
     for v in missing:
         llama_def = f"-DLLAMA_DIR={llama}"
@@ -3536,6 +3552,9 @@ def main() -> int:
                          "icpx and oneMKL, for Intel GPUs, with the SYCL image encoder. Kept for later runs")
     ap.add_argument("--intel-llvm", metavar="DIR",
                     help="build the engine with the intel/llvm installed in DIR (bin/clang++); kept for later runs")
+    ap.add_argument("--cmake-arg", action="append", metavar="KEY=VALUE",
+                    help="a CMake option for the engine's build (-DKEY=VALUE; e.g. STRATA_ROCM_DEVICE_LIBS=DIR), once "
+                         "for each; kept for later builds, --cmake-arg \"\" clears them")
     ap.add_argument("--intel-llvm-build", action="store_true",
                     help="build intel/llvm from source into .tools/intel-llvm and use it (13 minutes on 28 threads, "
                          "3.5 GB); a finished build is used again, an interrupted one continued")
@@ -3623,6 +3642,8 @@ def main() -> int:
     ARGS = a
     if a.vision_tokens is not None and a.vision_tokens < 1:
         ap.error("--vision-tokens takes a number of image tokens, 1 or more, e.g. --vision-tokens 768")
+    if any(x and "=" not in x for x in a.cmake_arg or []):
+        ap.error("--cmake-arg takes KEY=VALUE, e.g. --cmake-arg STRATA_ROCM_DEVICE_LIBS=/opt/rocm-7.1.1/amdgcn/bitcode")
     if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
         ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
     if a.bench_original_compat is not None and (a.bench or a.bench_verbose or a.original_strata):
