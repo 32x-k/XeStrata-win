@@ -368,6 +368,19 @@ DRAFT_HEAD_HINT = ("a smaller draft vocabulary needs less VRAM: --draft-vocab cy
                    f"{SETUP_CMD} --draft-vocab en once and the model keeps it; or a smaller --context in setup.")
 
 
+def exit_text(rc: int | None) -> str:
+    """The engine's exit status in words (issue #12): "exit code N", or the signal that ended it ("killed by SIGSEGV")
+    - a crash and the OS ending it for its RAM (SIGKILL) read alike as a negative code."""
+    if rc is None:
+        return "no exit status yet"
+    if rc < 0:
+        try:
+            return f"killed by {signal.Signals(-rc).name}"
+        except ValueError:
+            return f"killed by signal {-rc}"
+    return f"exit code {rc}"
+
+
 def start_failure_hint(log: str | None, offset: int) -> str:
     """#474 (upstream f2aaba1): what to change when the engine stopped at the start because the MTP draft head did not
     fit the VRAM left: the engine's own `strata mtp:` lines after that failure (what it needs, what is free, the
@@ -743,7 +756,7 @@ class StrataEngine:
             except (OSError, subprocess.TimeoutExpired):
                 pass
             why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
-                   "the engine exited before it was ready")
+                   f"the engine exited before it was ready ({exit_text(self.proc.poll())})")
             # EngineDied, not bare RuntimeError: a request waiting on this load must end with a 503
             # through the request path's handler - a RuntimeError there left the turn with no answer (#1527)
             raise EngineDied(why + (f" (see {log})" if log else "") +
@@ -873,6 +886,10 @@ class StrataEngine:
             return (f"The engine exited (code {rc}) after it reported: {self.last_err} - please report it at "
                     "github.com/Niko1221/Strata/issues with the log.")
         last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("strata", "ERR"))), "")
+        if rc is not None and rc < 0 and -rc != signal.SIGKILL:   # issue #12: a crash, not the OS ending it for RAM
+            return (f"The engine crashed ({exit_text(rc)}). " + (f"It reported: {self.last_err}" if self.last_err
+                    else f"Its last log line: {last}" if last else "It wrote nothing about it") +
+                    " - please report it with the log.")
         if rc is not None and rc >= 0 and last:          # it ended by itself: its own last words say why (#215)
             return (f"The engine exited (code {rc}). Its last log line: {last} - if that does not explain it, please "
                     "report it at github.com/Niko1221/Strata/issues with the log.")
@@ -1081,7 +1098,7 @@ class StrataEngine:
                 proc.stdin.write(text + "\n")
                 proc.stdin.flush()
         except OSError:                                  # the pipe is gone: the engine died (not the client)
-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+            raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})") from None
 
     def _control(self, cancel, on_token, stop_when=None):
         """Reads the control lines of the request on them (GEN / BGEN), yielding None heartbeats.  Calls on_token(id)
@@ -1104,7 +1121,7 @@ class StrataEngine:
                 continue
             beat = time.monotonic()
             if line is None:
-                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})")
             if not line.startswith(("PP ", "INFO")):
                 btrace("ctl<", self._ctl_mode, line.strip()[:60])
             if line.startswith("T "):
@@ -1525,7 +1542,7 @@ class StrataEngine:
                         continue
                     if line is None:
                         phase = "none"
-                        raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                        raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})")
                     if line.startswith("BT "):
                         t = int(line.split()[2])
                         out.append(t)
@@ -1696,7 +1713,7 @@ class StrataEngine:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
         except OSError:                                  # the pipe is gone: the engine died (not the client)
-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+            raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})") from None
         done = False
         # #481: how long the engine may stay silent from here.  Until the first line: the request's first prompt
         # chunk at the slowest prompt reading on top of silence_s; a PP line resets it to its own chunk's time.
@@ -1734,7 +1751,7 @@ class StrataEngine:
                     continue
                 if line is None:
                     done = True
-                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                    raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})")
                 heard = time.monotonic()                  # any line is output: T, PP, RESUME, INFO ...
                 beat = heard
                 if stall_state:
@@ -1876,7 +1893,7 @@ class StrataEngine:
             proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
             proc.stdin.flush()
         except OSError:
-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+            raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
         want = "SAVED" if action == "save" else "RESTORED"
@@ -1910,7 +1927,7 @@ class StrataEngine:
                                    + (f" (in a blocking step allowed {allow:.0f} s)" if allow > silence else "")
                                    ) from None
             if line is None:
-                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})")
             f = line.split()
             head = f[0] if f else ""
             if head == "SESSION":                          # a large file moving: progress, and a heartbeat
@@ -2975,7 +2992,7 @@ class Service:
             print("[strata] loading the model again (it was unloaded) ...", flush=True)
         else:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
-            print(f"[strata] the engine had stopped (exit code {code}); starting it again "
+            print(f"[strata] the engine had stopped ({exit_text(code)}); starting it again "
                   "(a minute or two) ...", flush=True)
         try:
             self.engine.restart()
