@@ -13,9 +13,10 @@
 
 namespace strata::kernels {
 
-/// Whether `q`'s device runs these products: it reports a tile shape they are written for (int8 inputs, int32
-/// accumulators) at its sub-group size, and its accumulators of int32 and of FP32 hold their elements in the same
-/// places (checked on the device once).  STRATA_NO_XMX=1 says no.
+/// Whether `q`'s device runs these products on its matrix engines: it reports a tile shape they are written for (int8
+/// inputs, int32 accumulators: NVIDIA's 16 x 16 x 16 on 32 lanes, Intel's XMX 8 x 16 x 32 on 16 or 8 x 8 x 32 on 8) at
+/// its sub-group size, or it is an RDNA3 or RDNA4 GPU (their WMMA); and its accumulators hold their elements where the
+/// products read them (checked on the device once).  STRATA_NO_XMX=1 says no.
 bool iq_mmq_usable(sycl::queue& q);
 /// Whether the same products run on `q`'s device without matrix engines (dp4a; local memory and work-group size
 /// permitting): iq_mmq_grouped takes that form where iq_mmq_usable says no.

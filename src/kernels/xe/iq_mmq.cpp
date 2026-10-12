@@ -17,7 +17,8 @@
 // block's two scales into FP32 ones.  joint_matrix_apply gives a lane its elements but not where they sit in the tile,
 // so the scales come as tiles too: loaded with stride 0, a column of one row's scale and a row of one output's, and
 // multiplied element by element with the int32 tile (iq_mmq_usable checks that an int32 tile and an FP32 one hold
-// their elements in the same order).
+// their elements in the same order).  Intel's XMX take tiles of 8 x N x 32 on N lanes instead (intel_body), RDNA3 and
+// RDNA4 their WMMA instructions.
 //
 // In a source file of its own, so its kernels are in a device image apart from the Intel-only ones.
 #include "strata/kernels/iq_mmq.hpp"
@@ -47,7 +48,8 @@ namespace syclex = sycl::ext::oneapi::experimental;
 using namespace iq_bits;
 using u32x4 = uint32_t __attribute__((ext_vector_type(4)));   // one 16-byte access (sycl::uint4 is split on NVPTX)
 
-// The tile shape (NVIDIA's int8 one on a warp; the only one written for so far) and the K step.
+// The work-group's tile shape (NVIDIA's int8 one on a warp, which RDNA's WMMA takes too; intel_body splits it into
+// Intel's) and the K step.
 constexpr int TM = 16, TN = 16, TK = 16, SG = 32;
 [[maybe_unused]] constexpr int NE = TM * TN / SG;   // accumulator elements a lane (the layout check)
 constexpr int KC = 128;               // K a step: four blocks of 32
@@ -68,6 +70,13 @@ constexpr int LDB = KC + 16;
 #else
 #define STRATA_IQ_MMQ_MATRIX 1
 #define STRATA_IQ_MMQ_WMMA 0
+#endif
+// Intel's XMX (Xe2, Xe-HPG) take int8 tiles of 8 x N x 32 on N lanes, B in Intel's VNNI layout (the IS bodies): only
+// in Intel's device compile, whose run-time check (intel_shape) is the only one that launches them
+#if STRATA_IQ_MMQ_MATRIX && !STRATA_DEVICE_NOT_INTEL
+#define STRATA_IQ_MMQ_INTEL 1
+#else
+#define STRATA_IQ_MMQ_INTEL 0
 #endif
 
 template<int S>
@@ -466,15 +475,19 @@ constexpr int up128(int b) { return (b + 127) / 128 * 128; }
 // the weights' as [block][half][output] (so that a tile of either loads with stride 0: the same scale down a column or
 // along a row), and a tile a sub-group on its way out.  DP4A: the same tiles and steps without matrix engines (the
 // GPUs iq_mmq_usable says no for: RDNA2, Volta, Intel's without XMX), each work-item a column of outputs down
-// WM / (lanes / WN) of the rows, the products by dp4a.
-template<int TY, int SGM, int NSGM, bool DP4A = false, bool TAIL = false>
+// WM / (lanes / WN) of the rows, the products by dp4a.  IS: Intel's XMX shapes (1: Xe2's 8 x 16 x 32 on 16 lanes, 2:
+// Xe-HPG's 8 x 8 x 32 on 8), the same work-group and steps (intel_body); a type with a scale per 16 values keeps two
+// copies of the activations, each with the other half of every block zeroed.
+template<int TY, int SGM, int NSGM, bool DP4A = false, bool TAIL = false, int IS = 0>
 struct Kernel {
     static constexpr int SGN = 2, NSGN = 4, NSG = NSGM * NSGN;
     static constexpr int WM = NSGM * SGM * TM, WN = NSGN * SGN * TN;
     static constexpr bool HALF = half_scales<TY>();
     static constexpr bool MIN = has_min<TY>();
+    static constexpr int ISG = IS == 1 ? 16 : IS == 2 ? 8 : SG;   // the sub-group size, and Intel's tile width
+    static constexpr int A_N = IS != 0 && HALF ? 2 : 1;           // copies of the activations' tile
     // MIN: the activations' block sums as [block][row] and the weights' min terms as [block][output] after the rest
-    static constexpr int A_OFF = 0, B_OFF = up128(A_OFF + WM * LDA), XS_OFF = up128(B_OFF + WN * LDB),
+    static constexpr int A_OFF = 0, B_OFF = up128(A_OFF + A_N * WM * LDA), XS_OFF = up128(B_OFF + WN * LDB),
                          WS_OFF = up128(XS_OFF + NB * WM * 4), ST_OFF = up128(WS_OFF + 2 * NB * WN * 4),
                          XU_OFF = up128(ST_OFF + NSG * TM * TN * 4), WM_OFF = up128(XU_OFF + NB * WM * 4),
                          LOCAL = MIN ? up128(WM_OFF + NB * WN * 4) : XU_OFF;
@@ -559,9 +572,117 @@ struct Kernel {
         }
     }
 
+    // Intel's XMX: the sub-groups split the WM x WN tile into 8 x ISG tiles, a column of them each (TPS tiles down its
+    // row group's rows).  The weights' words go to local memory in Intel's VNNI order, [K / 4][output] (a word is 4 K
+    // values of one output, as Dec gives them); a block of 32 is one product.  An 8 x N accumulator gives each lane one
+    // column, its element i in row i (Xe's DPAS layout, as qsa_prompt_attn takes it; intel_layout_ok checks it at the
+    // start), so the scales are applied by element order: asking each element its coordinates cost more than the
+    // products there.
+    void intel_body(sycl::nd_item<1> it) const {
+#if STRATA_IQ_MMQ_INTEL
+        constexpr int IM = 8, IK = 32, IN = ISG;
+        constexpr int NT = WN / IN, NSUB = NSG * SG / ISG, RG = NSUB / NT, TPS = WM / IM / RG;
+        static_assert(NSUB % NT == 0 && (WM / IM) % RG == 0, "the tiles split evenly over the sub-groups");
+        constexpr int LDBV = WN * 4;   // a VNNI row: 4 K values of every output
+        const int64_t g = (int64_t) it.get_group(0), per = tiles_m * tiles_n, e = g / per, r = g % per;
+        const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
+        const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
+        if (m0 >= rows) return;   // the whole work-group: this expert has fewer rows than the launch
+        const auto sg = it.get_sub_group();
+        const int sgid = (int) sg.get_group_linear_id(), lid = (int) it.get_local_id(0);
+        const int lane = (int) sg.get_local_linear_id();
+        constexpr int lanes = NSG * SG;
+        const int rs = sgid / NT * TPS * IM, cs = sgid % NT * IN;   // the sub-group's first row and column in the tile
+        const uint8_t* wx = wtab != nullptr ? wtab[e] + woff : w + (size_t) e * expert_bytes;
+        const auto base = lm.template get_multi_ptr<sycl::access::decorated::no>();
+        const auto ap = local_as<int8_t>(base + A_OFF);
+        const auto bp = local_as<int8_t>(base + B_OFF);
+        int8_t* al = ap.get();
+        uint32_t* bw = local_as<uint32_t>(base + B_OFF).get();
+        float* xsl = local_as<float>(base + XS_OFF).get();
+        [[maybe_unused]] float* xul = local_as<float>(base + XU_OFF).get();
+        [[maybe_unused]] float* wml = local_as<float>(base + WM_OFF).get();
+        float* wsl = local_as<float>(base + WS_OFF).get();
+
+        float acc[TPS][IM];
+        for (int t = 0; t < TPS; ++t)
+            for (int i = 0; i < IM; ++i) acc[t][i] = 0.0f;
+        mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, IM, IN> ci;
+
+        const int64_t kb = K / 32;   // activation scales a row
+        for (int64_t k0 = 0; k0 < K; k0 += KC) {
+            sycl::group_barrier(it.get_group());   // the last step's tiles are read
+            const bool last = TAIL && k0 + KC > K;   // TAIL: a last step past K, zeros past it
+            for (int v = lid; v < WM * (KC / 16); v += lanes) {
+                const int rr = v / (KC / 16), c = v % (KC / 16) * 16;
+                const int64_t row = m0 + rr;
+                u32x4 val = {0u, 0u, 0u, 0u};
+                if (row < rows && (!last || k0 + c < K)) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
+                if constexpr (HALF) {   // copy h keeps the half h of each block, zeros in the other
+                    const u32x4 z = {0u, 0u, 0u, 0u};
+                    const bool hi = c % 32 >= 16;
+                    *reinterpret_cast<u32x4*>(al + static_cast<ptrdiff_t>(rr) * LDA + c) = hi ? z : val;
+                    *reinterpret_cast<u32x4*>(al + static_cast<ptrdiff_t>(WM + rr) * LDA + c) = hi ? val : z;
+                } else {
+                    *reinterpret_cast<u32x4*>(al + static_cast<ptrdiff_t>(rr) * LDA + c) = val;
+                }
+            }
+            for (int v = lid; v < WM * NB; v += lanes) {
+                const int b = v / WM, rr = v % WM;
+                const int64_t row = m0 + rr;
+                xsl[v] = row < rows && (!last || k0 / 32 + b < kb) ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                if constexpr (MIN) xul[v] = row < rows && (!last || k0 / 32 + b < kb) ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+            }
+            for (int v = lid; v < WN * NB; v += lanes) {
+                const int nn = v % WN, b = v / WN;   // neighbouring work-items: neighbouring outputs of a VNNI row
+                const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes)
+                                                : Sub{{}, 0.0f, 0.0f, 0.0f};   // past K: zeros
+                for (int j = 0; j < 8; ++j) bw[(b * 8 + j) * WN + nn] = d.v[j];
+                wsl[(2 * b) * WN + nn] = d.s0;
+                wsl[(2 * b + 1) * WN + nn] = d.s1;
+                if constexpr (MIN) wml[b * WN + nn] = d.m;
+            }
+            sycl::group_barrier(it.get_group());
+            for (int b = 0; b < NB; ++b) {
+                mx::joint_matrix<sycl::sub_group, int8_t, mx::use::b, IK, IN, mx::layout::ext_intel_packed> bm;
+                mx::joint_matrix_load(sg, bm, bp + static_cast<int>(b * 8 * LDBV + cs * 4), LDBV);
+                for (int h = 0; h < (HALF ? 2 : 1); ++h) {
+                    const float ws = wsl[(2 * b + h) * WN + cs + lane];   // this lane's column's
+                    for (int t = 0; t < TPS; ++t) {
+                        mx::joint_matrix<sycl::sub_group, int8_t, mx::use::a, IM, IK, mx::layout::row_major> a;
+                        mx::joint_matrix_load(sg, a, ap + static_cast<int>((h * WM + rs + t * IM) * LDA + b * 32), LDA);
+                        mx::joint_matrix_fill(sg, ci, 0);
+                        mx::joint_matrix_mad(sg, ci, a, bm, ci);
+                        const float* xr = xsl + static_cast<ptrdiff_t>(b * WM + rs + t * IM);
+                        int i = 0;
+                        mx::joint_matrix_apply(sg, ci, [&](int32_t& c) {
+                            acc[t][i] += ws * xr[i] * exact_float(c);
+                            ++i;
+                        });
+                    }
+                }
+                if constexpr (MIN) {   // less the weights' min of the lane's column times each row's sum
+                    const float wmn = wml[b * WN + cs + lane];
+                    for (int t = 0; t < TPS; ++t)
+                        for (int i = 0; i < IM; ++i) acc[t][i] -= wmn * xul[b * WM + rs + t * IM + i];
+                }
+            }
+        }
+        for (int t = 0; t < TPS; ++t)
+            for (int i = 0; i < IM; ++i) {
+                const int64_t row = m0 + rs + (int64_t) t * IM + i;
+                if (row < rows) dst[(int64_t) ids[row0 + row] * ld_dst + n0 + cs + lane] = acc[t][i];
+            }
+#else
+        (void) it;
+#endif
+    }
+
     void operator()(sycl::nd_item<1> it) const {
         if constexpr (DP4A) {
             dp4a_body(it);
+        } else if constexpr (IS != 0) {
+            intel_body(it);
         } else if constexpr (!built<TY>()) {
             (void) it;
         } else {
@@ -801,15 +922,15 @@ struct Kernel {
     }
     auto get(syclex::properties_tag) const {
         if constexpr (DP4A) return syclex::properties{};   // no sub-group operations: the device's own size
-        else return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>};
+        else return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(ISG)>};
     }
 };
 
-template<int TY, int SGM, int NSGM, bool DP4A, bool TAIL>
+template<int TY, int SGM, int NSGM, bool DP4A, bool TAIL, int IS>
 sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                    int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
                    int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst) {
-    using KT = Kernel<TY, SGM, NSGM, DP4A, TAIL>;
+    using KT = Kernel<TY, SGM, NSGM, DP4A, TAIL, IS>;
     const int64_t tiles_m = (max_rows + KT::WM - 1) / KT::WM, tiles_n = w_rows / KT::WN;
     const size_t row_bytes = (size_t) (w_cols / Dec<TY>::QK) * (size_t) Dec<TY>::BSZ;
     const auto* x8 = static_cast<const int8_t*>(xq);
@@ -824,18 +945,100 @@ sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, si
     });
 }
 
+// Whether an int32 accumulator of Intel's 8 x N shape holds, in lane l, column l with element i in row i (the order
+// intel_body applies the scales in): 1 when it does.
+template<int IS>
+struct IntelLayoutCheck {
+    static constexpr int N = IS == 1 ? 16 : 8;
+    sycl::local_accessor<int32_t, 1> pi;
+    int* out;
+    void operator()(sycl::nd_item<1> it) const {
+#if STRATA_IQ_MMQ_INTEL
+        const auto sg = it.get_sub_group();
+        const int lid = (int) it.get_local_id(0);
+        for (int i = lid; i < 8 * N; i += N) pi[i] = i;
+        sycl::group_barrier(it.get_group());
+        mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, 8, N> a;
+        mx::joint_matrix_load(sg, a, pi.template get_multi_ptr<sycl::access::decorated::no>(), N, mx::layout::row_major);
+        int bad = 0, i = 0;
+        mx::joint_matrix_apply(sg, a, [&](int32_t& v) { bad |= v != i * N + lid; ++i; });
+        bad |= i != 8;
+        bad = sycl::reduce_over_group(sg, bad, sycl::bit_or<int>());
+        if (lid == 0) *out = bad ? 0 : 1;
+#else
+        (void) it;
+#endif
+    }
+    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(N)>}; }
+};
+
+// Intel's int8 XMX shape the device reports at its sub-group size, its local memory and work-group size permitting
+// intel_body, and its accumulators laid out as intel_body reads them: 1 Xe2's (8 x 16 x 32 on 16 lanes), 2 Xe-HPG's (8
+// x 8 x 32 on 8), else 0.  STRATA_NO_XMX=1: 0.
+template<int IS>
+bool intel_fits(const sycl::device& d) {
+    const size_t local = std::max<size_t>(Kernel<17, 2, 2, false, false, IS>::LOCAL, Kernel<12, 2, 2, false, false, IS>::LOCAL);
+    return d.get_info<sycl::info::device::local_mem_size>() >= local &&
+           d.get_info<sycl::info::device::max_work_group_size>() >= (size_t) Kernel<17, 2, 2, false, false, IS>::NSG * SG;
+}
+template<int IS>
+bool intel_layout_ok(sycl::queue& q) {
+    int* out = sycl::malloc_device<int>(1, q);
+    if (out == nullptr) return false;
+    int res = 0;
+    try {
+        q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<int32_t, 1> pi(sycl::range<1>((size_t) 8 * IntelLayoutCheck<IS>::N), h);
+            h.parallel_for(sycl::nd_range<1>(IntelLayoutCheck<IS>::N, IntelLayoutCheck<IS>::N), IntelLayoutCheck<IS>{pi, out});
+        });
+        q.memcpy(&res, out, sizeof(int)).wait();
+    } catch (const sycl::exception& e) {
+        std::fprintf(stderr, "strata: the int8 XMX layout check did not run (%s)\n", e.what());
+        res = 0;
+    }
+    sycl::free(out, q);
+    return res == 1;
+}
+int intel_shape_of(sycl::queue& q) {
+    static core::PerDevice<int> per_device;
+    return per_device.get(q.get_device(), [&q] {
+        const char* no = std::getenv("STRATA_NO_XMX");
+        if (no != nullptr && std::strtol(no, nullptr, 10) != 0) return 0;
+        const sycl::device d = q.get_device();
+        const auto sgs = d.get_info<sycl::info::device::sub_group_sizes>();
+        const auto combos = matrix_combinations(d);
+        for (int is = 1; is <= 2; ++is) {
+            const size_t n = is == 1 ? 16 : 8;
+            if (std::find(sgs.begin(), sgs.end(), n) == sgs.end()) continue;
+            bool rep = false;
+            for (const auto& c : combos) {
+                const bool m = c.msize == 8 || (c.msize == 0 && c.max_msize >= 8);
+                const bool nn = c.nsize == n || (c.nsize == 0 && c.max_nsize >= n);
+                const bool k = c.ksize == 32 || (c.ksize == 0 && c.max_ksize >= 32);
+                rep = rep || (c.atype == mx::matrix_type::sint8 && c.btype == mx::matrix_type::sint8 &&
+                              c.ctype == mx::matrix_type::sint32 && c.dtype == mx::matrix_type::sint32 && m && nn && k);
+            }
+            if (!rep || !(is == 1 ? intel_fits<1>(d) : intel_fits<2>(d))) continue;
+            if (is == 1 ? intel_layout_ok<1>(q) : intel_layout_ok<2>(q)) return is;
+            std::fprintf(stderr, "strata: the GPU's int8 XMX accumulators are laid out otherwise: the experts' prompt "
+                                 "products do not take them\n");
+        }
+        return 0;
+    });
+}
+
 template<int TY>
 sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                     int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
                     int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst, int64_t rows) {
-#define STRATA_MMQ_LAUNCH(SGM, NSGM, DP4A, TAIL)                                                                     \
-    launch<TY, SGM, NSGM, DP4A, TAIL>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds,     \
-                                      max_rows, ids, dst, ld_dst)
-#define STRATA_MMQ_ROWS(DP4A, TAIL)                                                        \
-    do {                                                                                    \
-        if (max_rows <= 16) return STRATA_MMQ_LAUNCH(1, 1, DP4A, TAIL);                     \
-        if (max_rows <= 32 || mean_rows <= 32) return STRATA_MMQ_LAUNCH(2, 1, DP4A, TAIL);  \
-        return STRATA_MMQ_LAUNCH(2, 2, DP4A, TAIL);                                         \
+#define STRATA_MMQ_LAUNCH(SGM, NSGM, DP4A, TAIL, IS)                                                                 \
+    launch<TY, SGM, NSGM, DP4A, TAIL, IS>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, \
+                                          max_rows, ids, dst, ld_dst)
+#define STRATA_MMQ_ROWS(DP4A, TAIL, IS)                                                        \
+    do {                                                                                        \
+        if (max_rows <= 16) return STRATA_MMQ_LAUNCH(1, 1, DP4A, TAIL, IS);                     \
+        if (max_rows <= 32 || mean_rows <= 32) return STRATA_MMQ_LAUNCH(2, 1, DP4A, TAIL, IS);  \
+        return STRATA_MMQ_LAUNCH(2, 2, DP4A, TAIL, IS);                                         \
     } while (0)
     // the tile's rows by the group's largest, but 32 where the experts average no more: a 64-row tile's work-groups
     // then multiply mostly empty rows, and the extra tiles of the few larger experts cost less (Ornith GSQ-RCO 3bit's
@@ -845,11 +1048,18 @@ sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, s
     // only for a K that is no multiple of the step, so that the others keep their loads unguarded
     const bool tail = w_cols % KC != 0;
     if (!iq_mmq_usable(q)) {
-        if (tail) STRATA_MMQ_ROWS(true, true);
-        STRATA_MMQ_ROWS(true, false);
+        if (tail) STRATA_MMQ_ROWS(true, true, 0);
+        STRATA_MMQ_ROWS(true, false, 0);
     }
-    if (tail) STRATA_MMQ_ROWS(false, true);
-    STRATA_MMQ_ROWS(false, false);
+    if (const int is = intel_shape_of(q); is == 1) {   // Intel's XMX
+        if (tail) STRATA_MMQ_ROWS(false, true, 1);
+        STRATA_MMQ_ROWS(false, false, 1);
+    } else if (is == 2) {
+        if (tail) STRATA_MMQ_ROWS(false, true, 2);
+        STRATA_MMQ_ROWS(false, false, 2);
+    }
+    if (tail) STRATA_MMQ_ROWS(false, true, 0);
+    STRATA_MMQ_ROWS(false, false, 0);
 #undef STRATA_MMQ_ROWS
 #undef STRATA_MMQ_LAUNCH
 }
@@ -911,7 +1121,7 @@ bool iq_mmq_usable(sycl::queue& q) {
         if (env_on("STRATA_NO_XMX")) return false;
         const sycl::device d = q.get_device();
         const bool wmma = xe::amd_wmma(d);   // its int8 WMMA: the STRATA_IQ_MMQ_WMMA body
-        if (!wmma && !shape_reported(d)) return false;
+        if (!wmma && !shape_reported(d)) return intel_shape_of(q) != 0;   // Intel's XMX shapes (intel_body)
         using Big = Kernel<16, 2, 2>;
         if (d.get_info<sycl::info::device::local_mem_size>() < (size_t) Big::LOCAL ||
             d.get_info<sycl::info::device::max_work_group_size>() < (size_t) Big::NSG * SG)
