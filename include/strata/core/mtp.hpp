@@ -24,6 +24,7 @@
 
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/kernels/gr.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include "strata/core/gpu.hpp"
@@ -227,6 +228,9 @@ private:
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr;
     float* attn_scratch_ = nullptr;
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *y_ = nullptr, *sample_ = nullptr;
+    /// gr_read's scratch of the drafter's own, not the session's ss.block.gr: the last stage's verifier uses that one,
+    /// and with --pipeline-windows a chain and that stage's window can run on the card at once (upstream 553b0b78)
+    strata::kernels::GrWorkspace own_gr_;
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr, *out_ids_ = nullptr;
     uint8_t* hit_xq_ = nullptr;
     unsigned long long* grp_ptr_ = nullptr;

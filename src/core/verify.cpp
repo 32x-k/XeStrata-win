@@ -1690,11 +1690,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
         if (next_ == nullptr) return true;
-        // the next stage on another GPU reads a hand-off of its own context (set_stage): the rows go across here
-        if (next_->hand_in_ != hand_out_)
-            std::memcpy(const_cast<float*>(next_->hand_in_), hand_out_,
-                        (size_t) T * (size_t) handoff_floats(g) * sizeof(float));
-        return next_->run(T, tokens, pos0, pool, next_user_, out, err);
+        next_->rows(hand_out_, 0, T);
+        return next_->run(T, tokens, pos0, pool, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
@@ -1989,7 +1986,9 @@ bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolM
 bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
                            std::string& err) {
     using namespace strata::kernels;
-    if (S < 1 || S > max_t_ || hbase < 0 || (next_ != nullptr && hbase + S > (int) slots_.size())) {
+    // a slot may own a contiguous group of rows (--batch-mtp), also across the stages of a layer split, whose hand-off
+    // buffers hold kVerifyMaxT rows (a stage that hands rows on or takes them; upstream 48f2c47d)
+    if (S < 1 || S > max_t_ || hbase < 0 || ((next_ != nullptr || lb_ > 0) && hbase + S > kVerifyMaxT)) {
         err = "verify: batch rows out of range (init_slots)";
         return false;
     }
@@ -2006,10 +2005,6 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             }
         if (t > 0 && rows[t] == rows[t - 1] && pos[t] != pos[t - 1] + 1) {
             err = "verify: proposed rows must have consecutive positions";
-            return false;
-        }
-        if (t > 0 && rows[t] == rows[t - 1] && next_ != nullptr) {
-            err = "verify: grouped slot rows do not support a layer split yet";
             return false;
         }
         if (pos[t] < 0 || pos[t] + 1 > slots_[(size_t) rows[t]]->max_cells) {
@@ -2153,10 +2148,8 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     ++windows;
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the rows go on to the next stage, as in run()
         if (next_ == nullptr) return true;
-        if (next_->hand_in_ != hand_out_)
-            std::memcpy(const_cast<float*>(next_->hand_in_), hand_out_,
-                        (size_t) S * (size_t) handoff_floats(g) * sizeof(float));
-        return next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+        next_->rows(hand_out_, 0, S);
+        return next_->run_slot_rows(rows, S, tokens, pos, pool, out, err);
     }
     if (!sample_rows(S, err)) return false;
     for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
@@ -2294,10 +2287,8 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         if (!sample_rows(S, err)) { b_running_ = false; return -1; }
         for (int t = 0; t < S; ++t) b_out_[t] = ((volatile int32_t*) h_out_)[t];
         note_nonfinite(S, last_pos_b_);
-    } else if (next_ != nullptr && next_->hand_in_ != hand_out_) {   // the next stage on another GPU: its rows
-        const size_t HB = (size_t) handoff_floats(*g_);
-        std::memcpy(const_cast<float*>(next_->hand_in_) + (size_t) row_base_ * HB, hand_out_ + (size_t) row_base_ * HB,
-                    (size_t) S * HB * sizeof(float));
+    } else if (next_ != nullptr) {   // the next stage's rows of this group
+        next_->rows(hand_out_, row_base_, S);
     }
     ++windows;
     b_running_ = false;
@@ -2690,11 +2681,9 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
     ++windows;
     const int T = fl_T_;
     if (le_ < g.n_layers) {   // an earlier stage: the hand-off is written
-        // the next stage on another GPU reads a hand-off of its own context (run() copies it the same way); the caller
-        // launches that stage's window of this parity only after it has finished the one before, which read it
-        if (next_ != nullptr && next_->hand_in_ != hand_out_)
-            std::memcpy(const_cast<float*>(next_->hand_in_), hand_out_,
-                        (size_t) T * (size_t) handoff_floats(g) * sizeof(float));
+        // the caller launches the next stage's window of this parity only after it has finished the one before,
+        // which read its rows
+        if (next_ != nullptr) next_->rows(hand_out_, 0, T);
         return true;
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
@@ -2751,5 +2740,50 @@ void Verifier::absorb_stats(Verifier& o) {
     prof_windows_ += o.prof_windows_;
     o.prof_windows_ = 0;
 }
+
+// ================================ THE NEXT STAGE IN THIS PROCESS (StageLink) ================================
+
+void Verifier::accept_rows(const float* from, int row0, int n) {
+    float* in = const_cast<float*>(hand_in_);
+    if (in == from) return;   // stages on one GPU share the hand-off
+    const size_t HB = (size_t) handoff_floats(*g_);
+    std::memcpy(in + (size_t) row0 * HB, from + (size_t) row0 * HB, (size_t) n * HB * sizeof(float));
+}
+
+void InProcessStage::rows(const float* hand_out, int row0, int n) { next_->accept_rows(hand_out, row0, n); }
+bool InProcessStage::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, int32_t* out,
+                         std::string& err) {
+    return next_->run(T, tokens, pos0, pool, user_, out, err);
+}
+bool InProcessStage::run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos,
+                                   PoolMultiFn pool, int32_t* out, std::string& err) {
+    return next_->run_slot_rows(rows, S, tokens, pos, pool, user_, out, err);
+}
+bool InProcessStage::commit(int n_keep, std::string& err) { return next_->commit(n_keep, err); }
+bool InProcessStage::commit_slot_prefixes(const int* keep, std::string& err) {
+    return next_->commit_slot_prefixes(keep, err);
+}
+bool InProcessStage::wait_commit(std::string& err) { return next_->wait_commit(err); }
+void InProcessStage::set_sampling(const strata::kernels::SamplerParams& sp) { next_->set_sampling(sp); }
+void InProcessStage::set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) {
+    next_->set_slot_sampling(slot, sp);
+}
+void InProcessStage::set_head_sampling(bool on) { next_->set_head_sampling(on); }
+bool InProcessStage::set_logit_bias(const std::vector<float>& bias, std::string& err) {
+    return next_->set_logit_bias(bias, err);
+}
+void InProcessStage::set_history(const int32_t* history, int history_len) { next_->set_history(history, history_len); }
+bool InProcessStage::read_logits(int rows, float* host, std::string& err) const {
+    return next_->read_logits(rows, host, err);
+}
+bool InProcessStage::copy_logits(int t, float* host) const { return next_->copy_logits(t, host); }
+int InProcessStage::nonfinite_row() const { return next_->nonfinite_row(); }
+int64_t InProcessStage::nonfinite_pos() const { return next_->nonfinite_pos(); }
+bool InProcessStage::nonfinite_in(int t) const { return next_->nonfinite_in(t); }
+bool InProcessStage::window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
+                                     std::string& err) {
+    return next_->window_logprobs(targets, T, pos0, extra_id, out, err);
+}
+const float* InProcessStage::final_R_all() const { return next_->final_R_all(); }
 
 }  // namespace strata::core

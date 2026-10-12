@@ -38,12 +38,18 @@ constexpr uint64_t kHugePage = 2ull << 20;
 }
 
 // The mapping registered for device copies in pieces no larger than the device's largest allocation: past it the
-// UHD 770 (4 GiB) registered without an error and copied wrong bytes, the B70 (31 GB) did not.  `cuts` are the
-// offsets a piece may end at (a layer's start, so no expert crosses two registrations), or empty: every `limit`.
+// UHD 770 (4 GiB) registered without an error and copied wrong bytes, the B70 (31 GB) did not.  With a layer split
+// the later GPUs' too: the UHD 770 behind a B70 copied wrong bytes from the B70's pieces.  `cuts` are the offsets a
+// piece may end at (a layer's start, so no expert crosses two registrations), or empty: every `limit`.
 namespace {
+std::vector<int> g_copy_devices;
 void register_pieces(uint8_t* base, uint64_t bytes, const std::vector<uint64_t>& cuts, std::vector<void*>& reg,
                      std::vector<std::pair<void*, size_t>>& pieces) {
-    const uint64_t limit = max_alloc_bytes();
+    uint64_t limit = max_alloc_bytes();
+    for (int d : g_copy_devices) {
+        const uint64_t m = Runtime::at(d).device().get_info<sycl::info::device::max_mem_alloc_size>();
+        limit = std::min(limit, m);
+    }
     // pieces end at the last cut that keeps them within the limit (or at the limit when no cut does)
     std::vector<uint64_t> ends, c;
     for (uint64_t x : cuts)
@@ -88,6 +94,8 @@ std::string thp_request_skipped() {
                             : std::string();
 }
 }  // namespace
+
+void arena_copy_devices(const std::vector<int>& devices) { g_copy_devices = devices; }
 
 PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, slice, std::vector<uint64_t>{}) {}
 

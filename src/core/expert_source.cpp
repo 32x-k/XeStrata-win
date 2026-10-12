@@ -158,6 +158,44 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
     return keep;
 }
 
+int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
+                                  std::vector<uint64_t>& offsets, uint64_t& bytes, uint64_t cap_bytes,
+                                  const std::vector<std::vector<std::pair<int32_t, int32_t>>>& regions,
+                                  std::string& err) {
+    const size_t blobs = (size_t) (n_layers * n_expert);
+    if (n_layers <= 0 || n_expert <= 0 || layer_blob_bytes.size() != (size_t) n_layers || offsets.size() != blobs) {
+        err = "append_stage_lend_regions: the plan does not match the geometry";
+        return -1;
+    }
+    std::vector<std::pair<int32_t, int32_t>> sorted;
+    for (const auto& region : regions) {   // the whole request is checked before the plan is touched
+        for (const auto& pair : region)
+            if (pair.first < 0 || pair.first >= n_layers || pair.second < 0 || pair.second >= n_expert) {
+                err = "append_stage_lend_regions: a lend-region expert is outside the model";
+                return -1;
+            }
+        sorted = region;
+        std::sort(sorted.begin(), sorted.end());
+        if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+            err = "append_stage_lend_regions: a stage's lend region repeats an expert";
+            return -1;
+        }
+    }
+    int64_t kept = 0;
+    for (const auto& region : regions) {
+        for (const auto& pair : region) {
+            const size_t index = (size_t) pair.first * (size_t) n_expert + (size_t) pair.second;
+            if (offsets[index] != kNoCacheComplement) continue;   // already in the copy
+            const uint64_t b = layer_blob_bytes[(size_t) pair.first];
+            if (b > cap_bytes - bytes) break;                     // this stage's rest keeps the file fallback
+            offsets[index] = bytes;
+            bytes += b;
+            ++kept;
+        }
+    }
+    return kept;
+}
+
 bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out) {
     if (in == out || in >= offsets.size() || out >= offsets.size() || offsets[in] == kNoCacheComplement ||
         offsets[out] != kNoCacheComplement) return false;
@@ -1068,6 +1106,31 @@ bool FileExpertSource::pin_cache_complement(
         }
     }
 
+    // A layer split: every stage's lend region (`stage_lend_regions`, set before the call).  The prompt path borrows
+    // the tail slots of every part's cache, and with `additional_gpu_pairs` the single lend region above is off, so
+    // without this the borrowed experts sat in neither VRAM nor RAM during a prompt and came back through page faults
+    // from the mapped files (upstream aea9dc3e, an RTX 2000 Ada + 5060 Ti, 17/48 split, IQ3_S, one 73K-token prompt:
+    // 3.7 GiB read from the NVMe, against 1.1 GiB in the arena mode, and 1.5 s of a 3.9 s chunk on host staging).
+    // The regions walk each stage's highest slots first, as the borrowing does; the whole copy, complement and
+    // regions together, stays within one budget, and experts past it keep the file fallback they had.
+    int64_t stage_lent = 0;
+    uint64_t stage_lent_bytes = 0;
+    if (!stage_lend_regions_.empty()) {
+        if (budget == std::numeric_limits<uint64_t>::max()) {   // #403: the one reading, taken now
+            if (physical == 0 && !available_memory_bytes(physical)) {
+                err = "FileExpertSource: cannot determine available RAM for the stage lend regions";
+                return false;
+            }
+            budget = physical > headroom_bytes ? physical - headroom_bytes : 0;
+        }
+        uint64_t cap = budget;   // a RAM budget (--resident-budget-gib) caps the whole copy, regions included
+        if (budget_bytes > 0 && budget_bytes != kResidentWhatFits && budget_bytes < cap) cap = budget_bytes;
+        const uint64_t before = bytes;
+        stage_lent = detail::append_stage_lend_regions(n_layers_, n_expert_, layer_blob_bytes_, offsets, bytes, cap,
+                                                       stage_lend_regions_, err);
+        if (stage_lent < 0) return false;
+        stage_lent_bytes = bytes - before;
+    }
     // #11: page-locked only when the RAM beside the copy holds what is still read from the files - the experts neither
     // on a GPU nor in the copy, and the prompt's lent slots' experts the copy does not keep
     bool lock = pin == Pin::on;
@@ -1310,6 +1373,7 @@ bool FileExpertSource::pin_cache_complement(
     complement_locked_ = locked;
     complement_lock_off_ = lock_off;
     complement_lent_slots_ = lend ? n_slots - keep_from : 0;
+    complement_lent_slots_ += stage_lent;   // and the split stages' regions: the pairs the copy kept of them
     complement_ready_ = true;
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s\n",
                  complement_pinned_ ? "mapped pinned" : "pageable resident",
@@ -1321,6 +1385,26 @@ bool FileExpertSource::pin_cache_complement(
                              "too%s\n", (long long) complement_lent_slots_, (long long) (n_slots - lend_from_slot),
                      complement_lent_slots_ < n_slots - lend_from_slot
                          ? " (the others are read from the file when lent: not enough RAM for them)" : "");
+    if (lend && complement_lent_slots_ < n_slots - lend_from_slot) {
+        // below full coverage the uncovered experts are read from the files during a long prompt, which routes
+        // through nearly all of them, so the reads repeat (upstream 14d9d2e1, f780961c, #1389: 18% uncovered cost 26%
+        // of the prompt speed on a gfx1100; short prompts barely touch them).  A warning, not a refusal.
+        const long long lendable = (long long) (n_slots - lend_from_slot);
+        const long long missing = lendable - (long long) complement_lent_slots_;
+        std::fprintf(stderr, "FileExpertSource: WARNING: %lld of %lld lendable slots (%.0f%%) will read their experts "
+                             "from the files during a long prompt; expect a slower prompt read on 50K+ token prompts "
+                             "(one measurement: 18%% uncovered cost 26%%).  Free RAM and restart; the line above "
+                             "should read N of N\n",
+                     missing, lendable, 100.0 * (double) missing / (double) std::max<long long>(1, lendable));
+    }
+    if (!stage_lend_regions_.empty()) {
+        int64_t offered = 0;
+        for (const auto& region : stage_lend_regions_) offered += (int64_t) region.size();
+        std::fprintf(stderr, "FileExpertSource: the split stages lend %lld slots to the prompt path: %lld keep their "
+                             "experts in RAM too (%.2f GiB)%s\n",
+                     (long long) offered, (long long) stage_lent, (double) stage_lent_bytes / 1073741824.0,
+                     stage_lent < offered ? " (the rest are read from the file when lent: not enough RAM for them)" : "");
+    }
     if (!additional_gpu_pairs.empty()) {
         std::fprintf(stderr, "FileExpertSource: %zu verified additional-GPU experts remain on the mmap fallback\n",
                      additional_gpu_pairs.size());

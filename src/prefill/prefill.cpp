@@ -526,7 +526,8 @@ struct Prefill::Impl {
     double cpu_ratio[CPU_RATIOS] = {};
     int cpu_nratio = 0;
     bool cpu_gate = false;   // the median ratio is below 1: the layers that share are the cheaper ones
-    // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
+    // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn).
+    // LAYER SPLIT, same process only: allocated in this stage's context, the next stage reads them where they are
     int device = -1;
     float* hand[2] = {};
     // C-4: the chunk's token ids on the device, for one batched embedding gather
@@ -647,7 +648,10 @@ struct MmqPlan {
     size_t gu_max = 0, d_max = 0;
 };
 const MmqPlan& mmq_plan() {
-    static const MmqPlan plan = [] {
+    // per GPU (the current device's): a layer split's stages can differ, and a stage that took the first GPU's plan
+    // ran int8 products its own GPU lacks (B70 + RTX 4070: the 4070's prompt chunk stopped at its first layer)
+    static core::PerDevice<MmqPlan> plans;
+    return plans.get(core::Runtime::get().device(), [] {
         MmqPlan p;
         const auto& lay = strata::kernels::cpu::expert_layout();
         const char* env = std::getenv("STRATA_PREFILL_MMQ");
@@ -669,8 +673,7 @@ const MmqPlan& mmq_plan() {
             p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
         }
         return p;
-    }();
-    return plan;
+    });
 }
 uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
     const MmqPlan& mp = mmq_plan();
@@ -940,8 +943,12 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 int64_t Prefill::chunk() const { return impl_->T; }
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
-                       std::string& err) {
+                       std::string& err, const char** why) {
     Impl& m = *impl_;
+    auto decline = [why](const char* reason) {
+        if (why != nullptr) *why = reason;
+        return false;
+    };
     static const bool off = [] {
         const char* v = std::getenv("STRATA_MTP_BATCH");
         return v != nullptr && v[0] == '0';
@@ -955,14 +962,18 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         return v == nullptr || v[0] != '0';
     }();
     core::QsaState& st = mtp.kv_state_rw();
-    if (off || n <= 0 || m.g == nullptr || m.region == nullptr || (st.kv_mode != 0 && !(st.kv_mode == 2 && ring_ok)) ||
-        mtp.device() != m.device)
-        return false;
+    if (off) return decline("STRATA_MTP_BATCH=0");
+    if (n <= 0 || m.g == nullptr || m.region == nullptr) return decline("no prompt scratch region on this path");
+    if (st.kv_mode != 0 && !(st.kv_mode == 2 && ring_ok))
+        return decline(st.kv_mode == 2 ? "the drafter's K/V is a ring and STRATA_MTP_BATCH_RING=0"
+                                       : "the drafter's K/V mode is not paged or a ring");
+    if (mtp.device() != m.device) return decline("the drafter is on another device than this prompt path");
     const core::OnDevice on_device(m.device);
     const auto t0 = Clock::now();
     const core::ModelGeometry& g = *m.g;
     const int64_t Nn = g.n_embd, HCN = g.hc * g.n_embd, KV = g.n_head_kv * g.head_dim;
-    if (Nn != N || g.hc != HC || g.hc_lr != LR) return false;   // the hyper-connection kernels' fixed shapes
+    if (Nn != N || g.hc != HC || g.hc_lr != LR)   // the hyper-connection kernels' fixed shapes
+        return decline("the geometry is not the hyper-connection kernels' fixed shapes");
     constexpr int kQ8_0 = 8;   // GGML_TYPE_Q8_0
     const float* w_ne = mtp.tensor_f32("pre_fc_norm_embedding.weight");
     const void* w_fe = mtp.tensor_q8("fc_embedding.weight");
@@ -974,12 +985,13 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     const void* w_k = mtp.tensor_q8("self_attn.k_proj.weight");
     const void* w_v = mtp.tensor_q8("self_attn.v_proj.weight");
     const float* w_kn = mtp.tensor_f32("self_attn.k_norm.weight");
-    if (!w_ne || !w_fe || !w_nh || !w_fh || !w_hn || !w_dn || !w_up || !w_k || !w_v || !w_kn) return false;
+    if (!w_ne || !w_fe || !w_nh || !w_fh || !w_hn || !w_dn || !w_up || !w_k || !w_v || !w_kn)
+        return decline("a drafter tensor is missing (Q8_0 projections or norms)");
     const core::NativeEmbed* nemb = core::native_embed();
     const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
     if (!nemb && (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
                   (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
-        return false;
+        return decline("the token embedding is not gatherable on this path");
     // the cells the drafter's window can still reach
     const int64_t r0 = std::max<int64_t>(0, mtp.first_needed() - cell0);
     if (r0 >= n) return true;
@@ -987,11 +999,11 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     // (N) + mixed_h, K and V (KV each), the token id; up to 256 bytes of alignment for each of the 17 buffers
     const uint64_t per_row = 4 * (2 * Nn + 4 * HCN + LR + HC + Nn + 2 * KV + 1) + 2 * (Nn + 2 * HCN + LR + Nn);
     constexpr uint64_t kAlignBytes = (uint64_t) 17 * 256;
-    if (m.region_bytes < kAlignBytes) return false;
+    if (m.region_bytes < kAlignBytes) return decline("too little scratch for a 64-row batch");
     int64_t B = std::min<int64_t>(n - r0, (int64_t) ((m.region_bytes - kAlignBytes) / per_row) & ~(int64_t) 63);
     if (st.kv_mode == 2)   // a ring: one batch's cells must not share a slot (a batch can straddle one page more)
         B = std::min<int64_t>(B, ((st.n_slots - 1) * strata::kernels::qsa_real_shapes().page_size) & ~(int64_t) 63);
-    if (B < 64) return false;
+    if (B < 64) return decline("too little scratch for a 64-row batch");
     uint8_t* q = m.region;
     auto carve = [&](size_t bytes) { void* p = q; q += (bytes + 255) & ~(size_t) 255; return p; };
     auto* emb = (float*) carve((size_t) B * Nn * 4);
@@ -1011,7 +1023,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     auto* Kc = (float*) carve((size_t) B * KV * 4);
     auto* Vc = (float*) carve((size_t) B * KV * 4);
     auto* tok = (int32_t*) carve((size_t) B * 4);
-    if ((uint64_t) (q - m.region) > m.region_bytes) return false;
+    if ((uint64_t) (q - m.region) > m.region_bytes) return decline("the batch buffers do not fit the scratch region");
     static const bool timing = std::getenv("STRATA_DRAFT_TIMING") != nullptr;   // debug: where this pass's time goes
     if (timing) strata::gpu::stream_sync(m.cs);
     const auto ti0 = Clock::now();
@@ -1218,10 +1230,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
-    // the next stage reads chunk c on a thread while this one reads chunk c + 1 (declared first: an early return
-    // waits for it before anything it reads goes away)
-    std::string next_err;
-    std::future<bool> next_run;
+    // the next stage reads chunk c while this one reads chunk c + 1 (declared first: an early return waits for it
+    // before anything it reads goes away)
+    struct NextWait {
+        PrefillLink* l;
+        ~NextWait() {
+            std::string e;
+            if (l != nullptr) (void) l->wait(e);
+        }
+    } next_wait{next_};
     int hand_buf = 0;
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
@@ -2492,11 +2509,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
             // this stage's state is at the chunk's end now (synced) and moves on with the next chunk below
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
-            if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
-            next_->hand_in_ = h;
-            next_run = std::async(std::launch::async, [this, tokens, c0, T, p0, &next_err] {
-                return next_->run(tokens + c0, T, p0, next_err);
-            });
+            if (!next_->wait(err) || !next_->chunk(h, tokens + c0, T, p0, err)) return false;
             hand_buf ^= 1;
             continue;   // the last stage reports the chunk (on_chunk)
         }
@@ -2549,7 +2562,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             host_chunk_ms += ms_since(toc2);
         }
     }
-    if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
+    if (next_ != nullptr && !next_->wait(err)) return false;
     ss.ple_prev[0] = prev[0];
     ss.ple_prev[1] = prev[1];
     if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
@@ -2607,6 +2620,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         std::fprintf(stderr, "strata prefill: GDN_HASH %s\n", line.c_str());
     }
     return true;
+}
+
+// ---- the next stage in this process (PrefillLink)
+
+bool InProcessPrefill::chunk(const float* rows, const int64_t* tokens, int64_t T, int64_t p0, std::string& err) {
+    (void) err;
+    next_->accept_rows(rows);
+    run_ = std::async(std::launch::async, [this, tokens, T, p0] { return next_->run(tokens, T, p0, err_); });
+    return true;
+}
+
+bool InProcessPrefill::wait(std::string& err) {
+    if (!run_.valid() || run_.get()) return true;
+    err = err_;
+    return false;
 }
 
 }  // namespace strata::prefill

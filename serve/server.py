@@ -648,8 +648,8 @@ class StrataEngine:
             tl.last = value
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None, lazy: bool = False):
-        self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
+                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None):
+        self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
@@ -693,8 +693,12 @@ class StrataEngine:
             except OSError:
                 pass
         self.max_context = 0                             # before the new process is visible: never its predecessor's
+        pin = {}
+        if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (serve/replicas.py)
+            pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
-                          stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
+                          stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env,
+                          **pin)
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
         ready_q: queue.Queue = queue.Queue()
@@ -759,13 +763,17 @@ class StrataEngine:
         if asked and self.batch != asked:
             print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
                   "(its log says why)", flush=True)
-        groups = int(args[args.index("--batch-groups") + 1]) if "--batch-groups" in args else 1
+        # the engine resolves the groups (a number, auto, or auto by default on a layer split) and says what it runs:
+        # INFO batch_groups=G (upstream 1bf6344c, ca001df5); an engine without it runs what --batch-groups asked
+        bg = args[args.index("--batch-groups") + 1] if "--batch-groups" in args[:-1] else "1"
+        groups = int(self.info["batch_groups"]) if "batch_groups" in self.info else int(bg) if bg.isdigit() else 1
         groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
         gs = self.batch // groups if self.batch else 0
         # slots in the order that spreads requests over the pipeline's groups first: 0, gs, 2gs, .., 1, gs+1, ..
         self.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
         self.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
         self.slot_groups = groups
+        self.slot_gs = gs if groups > 1 else 0   # pipelined groups: their size (pick_slot fills a group's holes)
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
@@ -1636,6 +1644,15 @@ class StrataEngine:
         # without --batch-groups a held prefix of any length is taken, as before
         if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
             return best
+        # pipelined groups: a group's window spans its slots up to its last busy one, so a free slot below a busy one
+        # of its group costs no extra row: such a hole is filled first (upstream 2c7c02ab, #793: picks that left
+        # leading holes, [_ B], cost a whole row each).  After a held prefix, as a pipelined slot is a cache again
+        # (upstream fc844436)
+        gs = getattr(self, "slot_gs", 0)
+        if gs:
+            holes = [b for b in free if any(self.slot_busy[x] for x in range(b + 1, b - b % gs + gs))]
+            if holes:
+                return min(holes, key=self.slot_order.index)
         # with --batch-groups: the group with the fewest busy slots first, so the requests spread over the
         # pipeline's stages (two requests in one group leave the other stage idle); then empty, then least recent
         busy_in: dict[int, int] = {}
@@ -2404,6 +2421,9 @@ def engine_args(cfg: dict) -> list[str]:
     # for one start) runs on the first card alone
     if cfg.get("split_pci") and "--layer-split" not in args and os.environ.get("STRATA_LAYER_SPLIT") != "off":
         args += ["--layer-split", layer_split_value(cfg), "--split-device", ",".join(cfg["split_pci"])]
+        # "gpu_order": "as_given": the auto split keeps the cards in the config's order (upstream be8db787)
+        if cfg.get("gpu_order") == "as_given" and "--split-order" not in args:
+            args += ["--split-order", "as-given"]
     if "coupled_draft" in cfg and "--coupled-draft" not in args and "--no-coupled-draft" not in args:
         args += ["--coupled-draft" if cfg["coupled_draft"] else "--no-coupled-draft"]
     # #533 (opt-in): "vram_elastic": true - the expert cache in segments, so POST /v1/vram can give VRAM back to other
@@ -3239,6 +3259,8 @@ class Service:
                         admitting=int(getattr(self.engine, "admitting", 0) or 0))
             if running and state == "idle":
                 live["state"] = "generating"
+        if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
+            live["replicas"] = self.engine.replica_view()
         engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
@@ -6130,6 +6152,51 @@ def check_request_sampling(req) -> None:
             raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
 
 
+def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: list[str], lazy: bool):
+    """Opt-in data-parallel replicas (serve/replicas.py, upstream 8d276c19): one StrataEngine per card group, each with
+    its own cards, log and CPU cores, started together; the ReplicaEngine in front spreads the requests."""
+    from serve import replicas as rp
+    n = len(groups)
+    cpus = rp.cpu_sets(n, cfg.get("replica_cpus") is not False)
+    print(f"[strata] {n} replicas on the cards {' | '.join(','.join(g) for g in groups)}"
+          f"{' (own CPU cores each)' if cpus else ''}: requests go to the least busy one, a conversation back to its own",
+          flush=True)
+    engines: list = [None] * n
+    errors: list = []
+
+    def one(i: int):
+        rc = rp.replica_cfg(cfg, i, groups[i])
+        env = child_env(rc)
+        env["STRATA_GPU_PCI"] = rc["gpu_pci"]           # its own card, whatever the server's environment names
+        try:
+            engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
+                                      env=env, lazy=lazy, cpus=cpus[i] if cpus else None)
+        except BaseException as e:        # noqa: BLE001
+            errors.append((i, e))
+    rc0 = rp.replica_cfg(cfg, 0, groups[0])
+    warn_budget_over_ram(engine_args(rc0) if "args" in rc0 else [])
+    if os.environ.get("STRATA_REPLICA_START", "") == "serial":
+        for i in range(n):
+            one(i)
+    else:
+        ts = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+    if errors:
+        for e in engines:
+            if e is not None:
+                try:
+                    e.close()
+                except Exception:        # noqa: BLE001
+                    pass
+        i, e = errors[0]
+        raise SystemExit(f"[strata] replica {i} did not start: {e}")
+    load = int(cfg.get("replica_load_tokens") or rp.LOAD_TOKENS)
+    return rp.ReplicaEngine(engines, load_tokens=load)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -6176,8 +6243,14 @@ def main() -> int:
     ap.add_argument("--slot-save-path", default=None, metavar="DIR",
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
+    ap.add_argument("--replicas", type=int, default=None, metavar="N",
+                    help="data-parallel replicas (opt-in): cut the cards (\"gpu_pci\" and \"split_pci\") into N equal "
+                         "groups and run one engine on each, requests spread over them (also \"replicas\" in the "
+                         "config: a number, or [{\"gpus\": [\"0000:03:00.0\"]}, {\"gpus\": [\"0000:09:00.0\"]}])")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    if a.replicas is not None:
+        cfg["replicas"] = a.replicas
     lift_reasoning_effort_arg(cfg)
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
@@ -6251,12 +6324,20 @@ def main() -> int:
             effort_end = effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
-                              env=env, lazy=lazy)
+        from serve import replicas as rp
+        try:
+            groups = rp.gpu_groups(cfg)
+        except rp.ReplicaConfigError as e:
+            raise SystemExit(f"[strata] config {e}")
+        if groups:
+            engine = start_replicas(cfg, groups, exe, effort_end or [], lazy)
+        else:
+            engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+                                  env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
-        note = desktop_vram_note(amd_card(cfg.get("gpu_pci")), engine.info.get("vram_free_mib"), engine_args(cfg),
-                                 linux_desktop())
+        note = None if groups else desktop_vram_note(amd_card(cfg.get("gpu_pci")), engine.info.get("vram_free_mib"),
+                                                     engine_args(cfg), linux_desktop())
         if note:                                        # upstream #560 #516: before --open starts a browser there
             print(note, flush=True)
     else:
