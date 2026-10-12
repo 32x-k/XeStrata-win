@@ -44,7 +44,7 @@ ctx = int(os.environ.get("CONTEXT", "262144"))
 
 def cfg(e: B.Engine) -> dict:
     return {"exe": e.cmd[0], "cwd": str(e.root), "tokenizer": f"{m.pack}/tokenizer", "model_name": "bench",
-            "args": B.engine_args(m.model, e.profile, m.mtp, B.usage_context(ctx))}
+            "args": B.engine_args(m.model, e.profile, m.mtp, B.usage_context(m.model, ctx))}
 
 
 convs = tuple(os.environ.get("CONVS", " ".join(B.CONVERSATIONS)).split())

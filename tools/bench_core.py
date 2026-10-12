@@ -46,11 +46,12 @@ COMMIT = "58dbbe5"
 # README's 259,943), so each tier fills the same share of its context; 192K: 262K's share of 196,608 (setup's context
 # for it is 204,800)
 TIERS = {"1k": 1017, "4k": 3562, "32k": 31566, "64k": 64162, "128k": 128478, "192k": 194956, "262k": 259943}
-# what setup writes for each tier's context (its smallest is 8K): int8 KV above 8K, KV streaming from 64K
+# what setup writes for each tier's context (its smallest is 8K): int8 KV above 8K; KV streaming from 64K is
+# kv_resident()'s, by the model and this PC's RAM (tier_context)
 CONTEXT = {"1k": ["--max-context", "8192"], "4k": ["--max-context", "8192"],
            "32k": ["--max-context", "32768", "--kv", "int8"]}
 for _t, _c in (("64k", "65536"), ("128k", "131072"), ("192k", "204800"), ("262k", "262144")):
-    CONTEXT[_t] = ["--max-context", _c, "--kv", "int8", "--kv-resident", "32768"]
+    CONTEXT[_t] = ["--max-context", _c, "--kv", "int8"]
 # the engines' settings besides the model files and the context: what setup writes
 FIXED = ["--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5"]
 
@@ -262,6 +263,30 @@ def config_model(args: list[str]) -> tuple[str, list[str], str | None]:
     return pack, model_args(pack, arg("--native"), arg("--ple-gguf"), extra), arg("--mtp")
 
 
+def model_name(model: list[str]) -> str | None:
+    """The name in setup's MODELS of the model whose arguments these are, from its first GGUF shard's name
+    (...-IQ3_XXS-00001-of-00002.gguf); None for a model setup installs otherwise (Ornith, llm-jp)."""
+    import setup
+    native = Path(model[model.index("--native") + 1]).name if "--native" in model[:-1] else ""
+    found = [k for k in setup.MODELS if re.search(rf"(^|[-_.]){re.escape(k)}([-.]|$)", native)]
+    return max(found, key=len) if found else None
+
+
+def kv_resident(model: list[str], ctx: int, kv: str = "int8") -> list[str]:
+    """--kv-resident 32768 where setup writes it for this model on this PC (setup.kv_streaming_wanted: from 64K, when
+    the RAM holds the KV cache beside the model; never for the models outside MODELS).  upstream's setup decides the
+    same, with the same RAM per model (v0.1.43), so both engines get it; its sycl/ port decides again
+    (sycl/setup_intel.py, tools/bench_upstream.py)."""
+    import setup
+    name = model_name(model)
+    return ["--kv-resident", "32768"] if name and setup.kv_streaming_wanted(name, ctx, kv, setup.ram_gb()) else []
+
+
+def tier_context(model: list[str], tier: str) -> list[str]:
+    """What setup writes for the tier's context, for this model on this PC."""
+    return CONTEXT[tier] + kv_resident(model, int(CONTEXT[tier][1]))
+
+
 def engine_args(model: list[str], profile: str, mtp: str | None, context: list[str]) -> list[str]:
     """The merge scripts' arguments: the model, the engine's profile, setup's settings, the draft layer (none: a
     model installed without it), the context."""
@@ -300,7 +325,7 @@ class Merge:
         self.slow = float(os.environ.get("SLOW", str(SLOW)))
 
     def args(self, e: Engine, tier: str) -> list[str]:
-        return engine_args(self.model, e.profile, self.mtp, CONTEXT[tier])
+        return engine_args(self.model, e.profile, self.mtp, tier_context(self.model, tier))
 
 
 def need(name: str) -> str:
@@ -586,10 +611,9 @@ def usage_turns(port: int, seed: int, agent_files: list[str], temperature: float
                          "content": agent_files[step] if c is m["tool_calls"][0] else "(not available)"})
 
 
-def usage_context(ctx: int) -> list[str]:
-    """What setup writes for a context."""
-    return ["--max-context", str(ctx)] + (["--kv", "int8"] if ctx > 8192 else []) + \
-        (["--kv-resident", "32768"] if ctx >= 65536 else [])
+def usage_context(model: list[str], ctx: int) -> list[str]:
+    """What setup writes for a context, for this model on this PC."""
+    return ["--max-context", str(ctx)] + (["--kv", "int8"] if ctx > 8192 else []) + kv_resident(model, ctx)
 
 
 def run_usage(e: Engine, cfg: dict, seed: int, agent_files: list[str], stem: Path, warmup: bool = False,
@@ -910,7 +934,11 @@ def main(argv: list[str]) -> int:
         print(f"{CORPUS}: {len(corpus['files'])} files, {len(corpus['agent'])} tool results, "
               f"{CORPUS.stat().st_size} bytes")
         return 0
-    print("usage: python tools/bench_core.py corpus PACK_DIR   # (re)write data/bench-corpus.json.xz from git",
+    if argv[:1] == ["kv-resident"] and len(argv) == 3:
+        print(shlex.join(kv_resident(["--native", argv[1]], int(argv[2]))))
+        return 0
+    print("usage: python tools/bench_core.py corpus PACK_DIR   # (re)write data/bench-corpus.json.xz from git\n"
+          "       python tools/bench_core.py kv-resident GGUF CONTEXT   # what kv_resident() gives on this PC",
           file=sys.stderr)
     return 2
 

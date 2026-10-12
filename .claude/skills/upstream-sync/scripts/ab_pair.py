@@ -54,7 +54,7 @@ else:
 
     def cfg(e: B.Engine) -> dict:
         return {"exe": e.cmd[0], "cwd": str(e.root), "tokenizer": f"{m.pack}/tokenizer", "model_name": "bench",
-                "args": B.engine_args(m.model, e.profile, m.mtp, B.usage_context(ctx)) + extra[e.arm]}
+                "args": B.engine_args(m.model, e.profile, m.mtp, B.usage_context(m.model, ctx)) + extra[e.arm]}
 
     convs = tuple(os.environ.get("CONVS", " ".join(B.CONVERSATIONS)).split())
     if set(convs) - set(B.CONVERSATIONS):

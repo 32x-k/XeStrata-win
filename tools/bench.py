@@ -583,7 +583,7 @@ def run(cfg_path: Path, data: Path, gpus: list[dict], verbose: bool = False, ori
     model, mtp = model_of(cfg)
 
     def args(e: C.Engine, tier: str) -> list[str]:
-        return C.engine_args(model, e.profile, mtp, C.CONTEXT[tier])
+        return C.engine_args(model, e.profile, mtp, C.tier_context(model, tier))
 
     def usage_cfg(e: C.Engine) -> dict:
         # this PC's own config, as it is used; beside upstream, the merges' config for both engines at its context
@@ -591,7 +591,7 @@ def run(cfg_path: Path, data: Path, gpus: list[dict], verbose: bool = False, ori
             return dict(cfg)
         own = {k: cfg[k] for k in ("gpu", "gpu_pci", "lib_dirs") if k in cfg} if e is xe else {}
         return {"exe": e.cmd[0], "cwd": str(e.root), "tokenizer": cfg["tokenizer"], "model_name": "bench",
-                "args": C.engine_args(model, e.profile, mtp, C.usage_context(ctx)), **own, **e.cfg_extra}
+                "args": C.engine_args(model, e.profile, mtp, C.usage_context(model, ctx)), **own, **e.cfg_extra}
 
     ctx = context_of(cfg["args"])
     tiers = [t for t in TIERS if fits(t, ctx)]
