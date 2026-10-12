@@ -120,6 +120,25 @@ It is off when `--batch-groups` is given as 2 or more or `auto`, with two stages
 threads, so that both stages' CPU experts run at once.
 Where the RAM bandwidth is the limit it is slower (below); it is an experiment for PCs with faster RAM, off by default.
 
+## Independent engines side by side (replicas, opt-in)
+
+When the model fits fewer cards, independent engines on groups of cards, with the requests spread over them, give more total throughput than one split over every card (upstream 8d276c19).
+A split is one pipeline whose stages wait on each other; each replica runs a pipeline of its own.
+
+```sh
+./setup.sh --gpus 1,2,3,4 --replicas 2   # 4 cards as two 2-card engines
+```
+
+In the config, `"replicas": 2` (the cards of `"gpu_pci"` and `"split_pci"` cut into equal groups in their order), or the groups by PCI address, `"replicas": [{"gpus": ["0000:03:00.0"]}, {"gpus": ["0000:09:00.0"]}]`.
+A group's first card is its engine's GPU; a group of two or more cards splits its layers among them.
+An entry may add `"env"` and `"args"`.
+`serve/server.py --replicas N` does the same.
+
+- A request goes to the replica with the lowest cost: the prompt tokens it would read again and the requests running there. A conversation's next turn goes back to its replica unless another is much less busy.
+- On Linux every replica gets physical cores of its own (`"replica_cpus": false` turns that off).
+- A replica that stopped is started again in the background; the others keep serving.
+- Every replica keeps its own copy of the model's experts in RAM: check that the RAM holds them.
+
 ## One conversation with both cards busy (`--pipeline-windows`, opt-in)
 
 With a split the GPUs take turns on a verify window.

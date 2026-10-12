@@ -3286,6 +3286,11 @@ def main() -> int:
     ap.add_argument("--parallel", type=int, metavar="N",
                     help="up to N requests decode together (batch slots, opt-in; default: one at a time, the others "
                          "wait). Each slot takes VRAM from the expert cache; setup says what it recommends")
+    ap.add_argument("--replicas", type=int, metavar="N",
+                    help="several GPUs (--gpus): run N independent engines, each on its own equal group of the chosen "
+                         "cards (2 replicas on 4 cards = two 2-card engines), requests spread over them (opt-in; more "
+                         "total throughput for a model that fits fewer cards; each replica holds its own copy of the "
+                         "model in RAM and VRAM)")
     ap.add_argument("--yes", action="store_true", help="accept the recommended answers")
     ap.add_argument("--setup", action="store_true", help="install another model or change settings")
     ap.add_argument("--no-start", action="store_true", help="install only, do not start the model")
@@ -4033,6 +4038,21 @@ def main() -> int:
         cfg["split_pci"] = [gpu_info(i)["pci"] for i in sel[1:]]
         if a.layer_split:
             cfg["layer_split"] = str(a.layer_split)
+    if a.replicas is not None and a.replicas >= 2:      # data-parallel replicas (serve/replicas.py, upstream 8d276c19)
+        cards = [cfg.get("gpu_pci"), *(cfg.get("split_pci") or [])] if cfg.get("gpu_pci") else []
+        if not cards or len(cards) % a.replicas:
+            warn(f"--replicas {a.replicas}: needs the chosen GPUs ({len(cards) or 'one'}) to divide into {a.replicas} "
+                 "equal groups; not set (choose the cards with --gpus, or write the groups into the config: "
+                 '"replicas": [{"gpus": ["0000:03:00.0"]}, {"gpus": ["0000:09:00.0"]}])')
+        else:
+            cfg["replicas"] = a.replicas
+            per = len(cards) // a.replicas
+            ok(f"{a.replicas} replicas of {per} GPU(s) each: "
+               f"{' | '.join(','.join(cards[i * per:(i + 1) * per]) for i in range(a.replicas))}")
+            if per > 1 and a.layer_split not in (None, "auto"):
+                warn("--layer-split is one engine's value; with replicas every group would get it: leave it at auto")
+            warn("each replica loads its own copy of the model's experts into RAM and runs its own host threads: "
+                 "check that the RAM holds them")
     if draft_vocab:
         cfg["draft_vocab"] = draft_vocab
     if a.host:
