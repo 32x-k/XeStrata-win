@@ -2500,9 +2500,9 @@ def engine_version(exe: Path) -> tuple:
     v = str(meta.get("version") or "")
     if not v:                                          # the version compiled into the binary: 0.1.13 and newer
         try:                                           # carry it, so a binary without it is older
-            # XeStrata's binaries say engine=xe<version>; a hotfix version has a fourth number (upstream 511b6467),
-            # another XeStrata release on the same upstream version a fifth
-            m = re.search(rb"engine=(?:xe)?(\d+\.\d+\.\d+)(?:\.\d+)*\n", Path(exe).read_bytes())
+            # XeStrata's binaries say engine=xe<version>-<revision> (before 2026-10-13: xe<version>, another release
+            # on the same upstream version a fifth number); a hotfix version has a fourth number (upstream 511b6467)
+            m = re.search(rb"engine=(?:xe)?(\d+\.\d+\.\d+)(?:\.\d+)*(?:-\d+)?\n", Path(exe).read_bytes())
             v = m.group(1).decode() if m else "0.1.12"
         except OSError:
             v = "0"

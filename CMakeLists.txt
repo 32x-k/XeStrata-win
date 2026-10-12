@@ -6,20 +6,15 @@ project(XeStrata LANGUAGES CXX)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "Strata supports Linux only")
 endif()
-set(STRATA_UPSTREAM_VERSION "0.1.43")
-set(STRATA_UPSTREAM_COMMIT "7695859")
+set(STRATA_UPSTREAM_VERSION "0.1.43.1")
+set(STRATA_UPSTREAM_COMMIT "a0116b2")
 # XeStrata's version follows the upstream version it has integrated, marked "xe" so it is not taken for upstream's.
-# XESTRATA_REVISION counts XeStrata's releases on that upstream version from 1, as a Debian revision does: the packages
-# are <upstream>-<revision> (rpm: Version and Release), the version name xe<upstream> for the first release and
-# xe<upstream>.<revision - 1> for a later one (xe0.1.40.2.1 is the package 0.1.40.2-2), more numbers than project()
-# can hold.
-set(XESTRATA_REVISION 2)
-if(XESTRATA_REVISION GREATER 1)
-  math(EXPR _xe_later "${XESTRATA_REVISION} - 1")
-  set(XESTRATA_VERSION "${STRATA_UPSTREAM_VERSION}.${_xe_later}")
-else()
-  set(XESTRATA_VERSION "${STRATA_UPSTREAM_VERSION}")
-endif()
+# XESTRATA_REVISION counts XeStrata's releases on that upstream version from 1, as a Debian revision does, and the
+# version is <upstream>-<revision> everywhere: the version name (the tag, what the engine says) xe<upstream>-<revision>
+# (xe0.1.43.1-1), the packages <upstream>-<revision> (rpm: Version and Release).  Before 2026-10-13 a later release
+# took a fifth number instead (xe0.1.43.1 was 0.1.43's second), which upstream's own 0.1.43.1 then collided with.
+set(XESTRATA_REVISION 1)
+set(XESTRATA_VERSION "${STRATA_UPSTREAM_VERSION}-${XESTRATA_REVISION}")
 set(STRATA_VERSION_NAME "xe${XESTRATA_VERSION}")
 add_compile_definitions(STRATA_VERSION="${STRATA_VERSION_NAME}"
   STRATA_BACKEND="xe" STRATA_UPSTREAM_VERSION="${STRATA_UPSTREAM_VERSION}"

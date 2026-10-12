@@ -408,7 +408,7 @@ Every variant has AMD code for the GPUs the distribution's rocBLAS (ROCm 7.1) ha
 
 Each variant (`xestrata-free`, `xestrata-contrib-cuda<version>`) is one package with the following.
 Its version is, after Debian's, the upstream version integrated and the count of XeStrata's releases on it (from 1):
-xe0.1.40.2.1 is `0.1.40.2-2` (for rpm, Version 0.1.40.2 and Release 2).
+xe0.1.43.1-1 is `0.1.43.1-1` (for rpm, Version 0.1.43.1 and Release 1).
 
 | What | Where |
 | --- | --- |

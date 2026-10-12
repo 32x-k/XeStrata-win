@@ -44,8 +44,8 @@ The newest `xe*` tag is the previous release (none before the first one).
 The version is `$ARGUMENTS` when given, else the one `CMakeLists.txt` makes from `STRATA_UPSTREAM_VERSION` and `XESTRATA_REVISION` (AGENTS.md, "Versions"); the tag is `xe<VERSION>` (the name the program shows, `STRATA_VERSION_NAME`).
 It must not exist yet, locally or on origin.
 
-- A release after integrating a new upstream version takes that version: the integration changes `STRATA_UPSTREAM_VERSION` and sets `XESTRATA_REVISION` back to 1 (`xe0.1.41`, the packages `0.1.41-1`).
-- Another release on the same upstream version raises `XESTRATA_REVISION` by one, and the version name gets a number: `xe0.1.40.2` (revision 1) then `xe0.1.40.2.1` (packages `0.1.40.2-2`), `xe0.1.40.2.2`.
+- A release after integrating a new upstream version takes that version: the integration changes `STRATA_UPSTREAM_VERSION` and sets `XESTRATA_REVISION` back to 1 (`xe0.1.43.1-1`, the packages `0.1.43.1-1`).
+- Another release on the same upstream version raises `XESTRATA_REVISION` by one: `xe0.1.43.1-1`, then `xe0.1.43.1-2` (packages `0.1.43.1-2`). Tags before 2026-10-13 have the earlier form (`xe0.1.40.2.1` was 0.1.40.2's second release; AGENTS.md, "Versions").
 
 When the version changes, change `XESTRATA_REVISION` and every place that shows the version name (`git grep -n 'xe<OLD>'`: docs/XE), Japanese and English files in the same commit, and commit on `dev` (`版を xe<VERSION> にする`).
 A new version makes conversations saved by `--conversation-save` under the old one unreadable (the engine version is part of their identity): the notes say so.
@@ -197,7 +197,7 @@ The final release is reached a GPU at a time (the user's decision, 2026-10-11): 
 
 The tables:
 
-The notes' table is one per GPU, from `bench-collect.py`'s medians (the record's README keeps `bench-collect.py`'s own tables): a row per tier, named by the model's weight type and the length (`IQ3_XXS 1K`), and for prefill and then decode three columns (the LLM terms, in both languages; the user's decision, 2026-10-11): XeStrata's value, upstream's, and the difference (the value columns named with the engine and its version, `XeStrata xe0.1.40.2.1`, `upstream v0.1.41`), marked ✅ where XeStrata is faster and ❌ where it is slower: prefill as a ratio (`✅ 2.1 倍`, `✅ ×2.1`), decode as a percentage (`✅ +14%`; slower: `❌ −3%`).
+The notes' table is one per GPU, from `bench-collect.py`'s medians (the record's README keeps `bench-collect.py`'s own tables): a row per tier, named by the model's weight type and the length (`IQ3_XXS 1K`), and for prefill and then decode three columns (the LLM terms, in both languages; the user's decision, 2026-10-11): XeStrata's value, upstream's, and the difference (the value columns named with the engine and its version, `XeStrata xe0.1.43.1-1`, `upstream v0.1.41`), marked ✅ where XeStrata is faster and ❌ where it is slower: prefill as a ratio (`✅ 2.1 倍`, `✅ ×2.1`), decode as a percentage (`✅ +14%`; slower: `❌ −3%`).
 Within ±1% (either way) the two count as equal: `≒ 同等（−0.1%）` / `≈ equal (−0.1%)`, for prefill as well.
 A value upstream was stopped in is 計測不能（低速） / not measurable (too slow), its difference `✅`, with the line saying upstream was stopped at 10 tok/s or less; a value that does not fit stays `-`.
 Above each GPU's tables: the GPU (and its memory) and which build of upstream it ran (`sycl/`, CUDA, HIP).
@@ -208,7 +208,7 @@ Each table has a heading line with its temperature: **generate**（温度 0、�
 
 **generate**（温度 0、トークン/秒）
 
-| 形式・長さ | prefill XeStrata xe0.1.40.2.1 | prefill upstream v0.1.41 | 差 | decode XeStrata xe0.1.40.2.1 | decode upstream v0.1.41 | 差 |
+| 形式・長さ | prefill XeStrata xe0.1.43.1-1 | prefill upstream v0.1.41 | 差 | decode XeStrata xe0.1.43.1-1 | decode upstream v0.1.41 | 差 |
 | --- | ---: | ---: | --- | ---: | ---: | --- |
 | IQ3_XXS 1K | 509 | 295 | ✅ 1.7 倍 | 48.8 | 46.8 | ✅ +4% |
 ```
@@ -219,7 +219,7 @@ Equal there is the upstream merge's check (`judge.py`): prefill within ±1%, the
 ```markdown
 **serve と通常使用**（温度 0.7）
 
-| 計測 | XeStrata xe0.1.40.2.1 | upstream v0.1.41 | 差 |
+| 計測 | XeStrata xe0.1.43.1-1 | upstream v0.1.41 | 差 |
 | --- | ---: | ---: | --- |
 | serve 32K 最初の prefill (tok/s) | 839 | 380 | ✅ 2.2 倍 |
 | serve 32K 会話の続きの待ち (ms) | 372 | 354 | ≒ 同等（+5%） |
