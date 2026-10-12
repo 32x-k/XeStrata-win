@@ -387,13 +387,19 @@ struct Stager {
 // #1712 (upstream b97a36a4): a chunk's small int32 tables (the QSA step records, the token ids) go up from a pinned
 // buffer.  A copy from pageable memory is staged by the runtime; on gfx1100 the first text prompt after a picture one
 // was seen to read stale step records that way.  The event holds the next upload back until the last one has left the
-// buffer.  No pinned RAM: the copy is made from the caller's memory, as before.
+// buffer.  No pinned RAM (or a table larger than the buffer): the copy is made from the caller's memory and the stream
+// is waited for, so the source is free to change on return all the same (upstream #1996: a pageable source the caller
+// changed before the copy read it faulted a 4-hour load on 2x RX 7900 XTX).
 struct PinnedUpload {
     int32_t* p = nullptr;
     size_t n = 0;
     strata::gpu::Event* ev = nullptr;
-    void init(size_t count) {
-        if (p || force_pageable()) return;
+    void init(size_t count) {   // at least `count` ints; a larger count takes a larger buffer once the last copy is out
+        if (force_pageable() || (p && count <= n)) return;
+        if (p) {
+            if (ev && !strata::gpu::event_sync(ev)) return;   // keep the old buffer: begin() then falls back
+            release();
+        }
         if (!strata::gpu::alloc_host(&p, count * sizeof(int32_t))) {
             p = nullptr;
             return;
@@ -408,11 +414,15 @@ struct PinnedUpload {
     }
     bool upload(void* dst, const int32_t* src, size_t count, strata::gpu::Stream s) {
         const size_t bytes = count * sizeof(int32_t);
-        if (!p || count > n) return strata::gpu::copy_async(dst, src, bytes, s);
+        if (!p || count > n) return strata::gpu::copy_async(dst, src, bytes, s) && strata::gpu::stream_sync(s);
         if (!strata::gpu::event_sync(ev)) return false;   // the previous upload is out of the buffer
         std::memcpy(p, src, bytes);
         return strata::gpu::copy_async(dst, p, bytes, s) && strata::gpu::event_record(ev, s);
     }
+    /// For several copies out of one buffer: the pinned buffer once the last upload has left it (nullptr: none of
+    /// `count` ints, so copy from the source and wait for the stream), then end() once the copies are queued.
+    int32_t* begin(size_t count) { return p && count <= n && strata::gpu::event_sync(ev) ? p : nullptr; }
+    bool end(strata::gpu::Stream s) { return strata::gpu::event_record(ev, s); }
     void release() {
         if (ev) strata::gpu::event_destroy(ev);
         if (p) strata::gpu::free(p);
@@ -534,6 +544,10 @@ struct Prefill::Impl {
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
     PinnedUpload tok_up;
+    // the draft K/V pass's token ids, a batch at a time from one host vector (upstream #1996)
+    PinnedUpload draft_tok_up;
+    // a chunk's picture embedding rows, gathered from the caller's memory (upstream #1996); taken at the first picture
+    PinnedUpload emb_up;
 };
 
 namespace {
@@ -587,6 +601,8 @@ void Prefill::release() {
     if (impl_->copy) strata::gpu::stream_sync(impl_->copy);
     impl_->steps_up.release();
     impl_->tok_up.release();
+    impl_->draft_tok_up.release();
+    impl_->emb_up.release();
     for (float* p : {impl_->cpu_x, impl_->cpu_rows})
         if (p) strata::gpu::free(p);
     for (strata::gpu::Event* e : impl_->cpu_ev)
@@ -1038,10 +1054,11 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
     std::vector<int32_t> tk((size_t) B);
+    m.draft_tok_up.init((size_t) B);   // tk is refilled every batch: each batch goes up from the pinned buffer
     for (int64_t b0 = r0; b0 < n; b0 += B) {
         const int64_t nb = std::min(B, n - b0), c0 = cell0 + b0;
         for (int64_t i = 0; i < nb; ++i) tk[(size_t) i] = next_tokens[b0 + i];
-        if (!strata::gpu::copy_async(tok, tk.data(), (size_t) nb * 4, m.cs)) {
+        if (!m.draft_tok_up.upload(tok, tk.data(), (size_t) nb, m.cs)) {
             err = "prefill: the draft tokens' upload failed";
             return false;
         }
@@ -1335,16 +1352,39 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                                       (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
             }
         }
+        // the picture rows go up from one pinned buffer (upstream #1996: from the caller's pageable memory a later
+        // prompt on gfx1100 read stale rows); without one, from the caller's memory with the stream waited for
+        // (packed: only the chunk's picture rows, so the buffer is a picture's size, not a chunk's)
+        int64_t pic_rows = 0;
+        for (int64_t t = 0; hand_in_ == nullptr && !batched && embd_rows && t < T; ++t)
+            pic_rows += embd_rows[p0 + t] != nullptr;
+        float* rows_stage = nullptr;
+        if (pic_rows > 0) {
+            m.emb_up.init((size_t) (pic_rows * N));
+            rows_stage = reinterpret_cast<float*>(m.emb_up.begin((size_t) (pic_rows * N)));
+        }
+        const bool rows_pinned = rows_stage != nullptr, rows_pageable = pic_rows > 0 && !rows_pinned;
+        int64_t k_row = 0;
         for (int64_t t = 0; hand_in_ == nullptr && !batched && t < T; ++t) {
             const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
             if (row) {
-                if (!strata::gpu::copy_async(m.emb + t * N, row, (size_t) N * 4, m.cs)) {
+                const float* src = row;
+                if (rows_pinned) {
+                    std::memcpy(rows_stage + k_row * N, row, (size_t) N * 4);
+                    src = rows_stage + k_row * N;
+                    ++k_row;
+                }
+                if (!strata::gpu::copy_async(m.emb + t * N, src, (size_t) N * 4, m.cs)) {
                     err = "prefill: the image embedding upload failed";
                     return false;
                 }
             } else if (!core::embed_row(*m.wt, g, tokens[c0 + t], m.emb + t * N, m.cs, err)) {
                 return false;
             }
+        }
+        if ((rows_pinned && !m.emb_up.end(m.cs)) || (rows_pageable && !strata::gpu::stream_sync(m.cs))) {
+            err = "prefill: the image embedding upload failed";
+            return false;
         }
         if (hand_in_ == nullptr) gr_broadcast(m.emb, m.R, T, m.cs);
         // ---- the PLE rows of the whole chunk, one batched SSD request on a thread (see ple_gather).  A later chunk's
@@ -1368,6 +1408,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
             strata::gpu::copy_async(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, m.cs);
             strata::gpu::event_record(m.ple_copied[ple_buf], m.cs);
+            // the pageable fallback (no pinned RAM): waited for, as a pageable source can be read out of order
+            // (upstream #1996)
+            if (!m.ple_pageable[ple_buf].empty()) strata::gpu::stream_sync(m.cs);
             if (c0 + m.T < n) {
                 strata::gpu::event_sync(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
                 ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
