@@ -1205,8 +1205,16 @@ int adapt_lag() {
 
 /// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
 void mem_mark(const char* where) {
-    static const bool on = std::getenv("STRATA_TRACE") != nullptr;
-    if (!on) return;
+    static const char* const env = std::getenv("STRATA_TRACE");
+    if (env == nullptr) return;
+    // STRATA_TRACE=2 (upstream #2013): also wait for the device here and name the first step after which it reports
+    // an error, so a failure that surfaces in a later, unrelated call is pinned to the step that ran the faulting work.
+    // Only a diagnostic: it adds a synchronisation per mark.
+    if (env[0] == '2') {
+        const bool ok = strata::gpu::device_sync();
+        std::fprintf(stderr, "strata trace: device %s after %s%s%s\n", ok ? "ok" : "ERROR", where, ok ? "" : ": ",
+                     ok ? "" : strata::gpu::last_error());
+    }
     size_t free_b = 0, total_b = 0;
     strata::gpu::mem_info(&free_b, &total_b);
     std::fprintf(stderr, "strata trace: %lld MiB free after %s\n", (long long) (free_b >> 20), where);
@@ -6048,6 +6056,7 @@ int main(int argc, char** argv) {
         // the pool is idle while a prompt is read unless batch slots decode between its parts
         if (!multi_gpu && o.batch <= 0 && !o.no_pool && cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr))
             sp.set_cpu_pool(&pool);
+        mem_mark("before the prompt path init");
         if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             if (err.find("fit") != std::string::npos)   // #85: say what frees VRAM
