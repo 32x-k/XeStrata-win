@@ -18,11 +18,12 @@ namespace strata::prefill::mmq {
 bool built();
 /// The GPU runs them without matrix engines (iq_mmq_dp4a_usable), where built() says no.
 bool built_dp4a();
-/// They cover this ggml type (the i-quants but IQ1_S, Q2_0, Q8_0, Q5_0, Q4_K, Q5_K and Q6_K).
+/// They cover this ggml type (the i-quants but IQ1_S, Q2_0, Q8_0, Q5_0, Q2_K to Q6_K).
 bool supported(int ggml_type);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
-/// Bytes of `rows` activation rows of `cols` values quantized for MMQ.
+/// Bytes of `rows` activation rows of `cols` values quantized for MMQ (twice that for a type that repeats every block,
+/// Q2_K: kernels::iq_mmq_type_dup).
 size_t q8_bytes(int64_t rows, int64_t cols);
 
 /// int8 activations for MMQ against weights of `ggml_type`: row i of the output is row ids[i] of x (or row i when

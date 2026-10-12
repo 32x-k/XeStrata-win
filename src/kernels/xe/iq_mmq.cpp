@@ -355,6 +355,59 @@ template<> struct Dec<13> {   // Q5_K: Q4_K's nibbles with bit ib of qh as the f
     }
 };
 
+template<> struct Dec<11> {   // Q3_K: d (6-bit scale - 32) ((2-bit value | high bit << 2) - 4), a scale per 16
+    static constexpr int QK = 256, BSZ = (int) sizeof(block_q3_K);
+    // scale `is` of 16 (dequantize_row_q3_K's aux unpacking): its low nibble from bytes 0-7, its high bits from 8-11
+    static int scale(const uint8_t* s, int is) {
+        const int lo = is < 8 ? s[is] & 0x0F : s[is - 8] >> 4;
+        const int hi = (s[8 + (is & 3)] >> (2 * (is >> 2))) & 0x03;
+        return (lo | (hi << 4)) - 32;
+    }
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+        const block_q3_K* b = reinterpret_cast<const block_q3_K*>(row) + sb / 8;
+        const int ib = sb % 8, n = ib / 4, j = ib % 4;   // 128-value half n, its 2-bit field j
+        Sub r;
+        for (int k = 0; k < 8; ++k) {   // values 0-15 from qs[32n..] and hmask[0..], 16-31 from qs[32n + 16..]
+            const int l = k < 4 ? 4 * k : 16 + 4 * (k - 4);
+            const uint32_t q = ((uint32_t) get_int_b2(b->qs + 32 * n, l / 4) >> (2 * j)) & 0x03030303u;
+            const uint32_t h = ((uint32_t) get_int_b2(b->hmask, l / 4) >> (4 * n + j)) & 0x01010101u;
+            r.v[k] = (((q | (h << 2)) | 0x80808080u) - 0x04040404u) ^ 0x80808080u;
+        }
+        const float d = (float) b->d;
+        r.s0 = d * (float) scale(b->scales, 8 * n + 2 * j);
+        r.s1 = d * (float) scale(b->scales, 8 * n + 2 * j + 1);
+        return r;
+    }
+};
+// Q2_K: d sc value - dmin m, sc and m a pair per 16 values.  The products have one min a block of 32, so a Q2_K row
+// is read as twice its length: block 2 i is its sub-block i's values (scales d sc), block 2 i + 1 ones scaled by
+// -dmin m, against activations whose blocks come twice each (iq_mmq_quantize's dup).  QK: 256 values per 512 read.
+template<> struct Dec<10> {
+    static constexpr int QK = 512, BSZ = (int) sizeof(block_q2_K);
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+        const int rb = sb / 2;
+        const block_q2_K* b = reinterpret_cast<const block_q2_K*>(row) + rb / 8;
+        const int ib = rb % 8, n = ib / 4, j = ib % 4;
+        const int sc0 = b->scales[8 * n + 2 * j], sc1 = b->scales[8 * n + 2 * j + 1];
+        Sub r;
+        if (sb % 2 == 0) {
+            for (int k = 0; k < 8; ++k) {
+                const int l = k < 4 ? 4 * k : 16 + 4 * (k - 4);
+                r.v[k] = ((uint32_t) get_int_b4(b->qs + 32 * n, l / 4) >> (2 * j)) & 0x03030303u;
+            }
+            const float d = (float) b->dm[0];
+            r.s0 = d * (float) (sc0 & 0x0F);
+            r.s1 = d * (float) (sc1 & 0x0F);
+        } else {
+            for (int k = 0; k < 8; ++k) r.v[k] = 0x01010101u;
+            const float dmin = (float) b->dm[1];
+            r.s0 = -dmin * (float) (sc0 >> 4);
+            r.s1 = -dmin * (float) (sc1 >> 4);
+        }
+        return r;
+    }
+};
+
 template<> struct Dec<kNativeQ6KRows> {   // Q6_K split by row (native_mmvq.hpp): a row's ql, then qh, scales and d
     static constexpr int QK = 256, BSZ = (int) sizeof(block_q6_K);
     static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
@@ -377,7 +430,7 @@ template<> struct Dec<kNativeQ6KRows> {   // Q6_K split by row (native_mmvq.hpp)
 };
 
 template<int TY>
-constexpr bool half_scales() { return TY == 17 || TY == 22 || TY == 29 || TY == 14 || TY == kNativeQ6KRows; }
+constexpr bool half_scales() { return TY == 17 || TY == 22 || TY == 29 || TY == 14 || TY == kNativeQ6KRows || TY == 10 || TY == 11; }
 template<int TY>
 constexpr bool has_min() { return TY == 12 || TY == 13; }
 
@@ -890,7 +943,7 @@ bool iq_mmq_type_sums(int t) { return t == 12 || t == 13; }   // has_min
 
 bool iq_mmq_type_ok(int t) {
     switch (t) {
-        case 6: case 8: case 12: case 13: case 14: case kNativeQ6KRows:
+        case 6: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows:
         case 16: case 17: case 18: case 20: case 21: case 22: case 23: case 29: case 42: return true;
         default: return false;
     }
@@ -899,6 +952,8 @@ bool iq_mmq_type_ok(int t) {
 size_t iq_mmq_row_bytes(int t, int64_t cols) {
     switch (t) {
         case 6: return (size_t) (cols / Dec<6>::QK) * Dec<6>::BSZ;
+        case 10: return (size_t) (cols / 256) * Dec<10>::BSZ;   // the row's own values (read twice as long)
+        case 11: return (size_t) (cols / Dec<11>::QK) * Dec<11>::BSZ;
         case 12: return (size_t) (cols / Dec<12>::QK) * Dec<12>::BSZ;
         case 13: return (size_t) (cols / Dec<13>::QK) * Dec<13>::BSZ;
         case 8: return (size_t) (cols / Dec<8>::QK) * Dec<8>::BSZ;
@@ -919,12 +974,16 @@ size_t iq_mmq_row_bytes(int t, int64_t cols) {
 
 size_t iq_mmq_act_bytes(int64_t rows, int64_t cols) { return (size_t) (rows * cols + 2 * rows * (cols / 32) * 4); }
 
+bool iq_mmq_type_dup(int t) { return t == 10; }
+
 sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
-                            int64_t rows, bool sums) {
+                            int64_t rows, bool sums, bool dup) {
+    // dup (Q2_K, Dec<10>): each block written twice, as a row of 2 cols values
+    const int64_t oc = dup ? 2 * cols : cols, rep = dup ? 2 : 1;
     auto* x8 = static_cast<int8_t*>(xq);
-    auto* xs = reinterpret_cast<float*>(x8 + rows * cols);
-    const int64_t nb = cols / 32;
-    float* xu = xs + rows * nb;
+    auto* xs = reinterpret_cast<float*>(x8 + rows * oc);
+    const int64_t nb = cols / 32, onb = oc / 32;
+    float* xu = xs + rows * onb;
     return q.parallel_for(sycl::range<1>((size_t) (rows * nb)), [=](sycl::id<1> i) {
         const int64_t r = (int64_t) i[0] / nb, b = (int64_t) i[0] % nb;
         const float* xr = x + (int64_t) (ids ? ids[r] : r) * ld + b * 32;
@@ -942,11 +1001,14 @@ sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, 
             }
             p[j] = u;
         }
-        u32x4* o = reinterpret_cast<u32x4*>(x8 + r * cols + b * 32);
-        o[0] = u32x4{p[0], p[1], p[2], p[3]};
-        o[1] = u32x4{p[4], p[5], p[6], p[7]};
-        xs[r * nb + b] = d;
-        if (sums) xu[r * nb + b] = d * (float) sum;
+        for (int64_t c = 0; c < rep; ++c) {
+            const int64_t ob = b * rep + c;
+            u32x4* o = reinterpret_cast<u32x4*>(x8 + r * oc + ob * 32);
+            o[0] = u32x4{p[0], p[1], p[2], p[3]};
+            o[1] = u32x4{p[4], p[5], p[6], p[7]};
+            xs[r * onb + ob] = d;
+            if (sums) xu[r * onb + ob] = d * (float) sum;
+        }
     });
 }
 
@@ -960,6 +1022,8 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
     switch (t) {
         STRATA_MMQ_CASE(6);
         STRATA_MMQ_CASE(8);
+        STRATA_MMQ_CASE(10);
+        STRATA_MMQ_CASE(11);
         STRATA_MMQ_CASE(12);
         STRATA_MMQ_CASE(13);
         STRATA_MMQ_CASE(14);

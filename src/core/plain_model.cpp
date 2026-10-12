@@ -387,11 +387,12 @@ bool PlainModel::prompt_int8() const {
     // the products' outputs in 128s (2 n_ff and n_embd), their K in blocks of 32; gate's rows right before up's
     const int64_t N = spec_.n_embd, FF = spec_.n_ff_exp;
     if (N % 128 != 0 || (2 * FF) % 128 != 0 || FF % 32 != 0) return false;
-    for (const auto& f : k::cpu::expert_layout().fmt)
-        if (k::cpu::native_mixed_gu(f) ||   // a layer whose gate and up differ in type: the FP16 path's split dequant
-            !k::iq_mmq_type_ok(f.gu_type) || !k::iq_mmq_type_ok(f.d_type) ||
-            f.up_off != (size_t) FF * k::iq_mmq_row_bytes(f.gu_type, N))
+    for (const auto& f : k::cpu::expert_layout().fmt) {
+        if (!k::iq_mmq_type_ok(f.gu_type) || !k::iq_mmq_type_ok(f.d_type)) return false;
+        if (k::cpu::native_mixed_gu(f) ? !k::iq_mmq_type_ok(f.up_type)   // gate and up: a product each
+                                       : f.up_off != (size_t) FF * k::iq_mmq_row_bytes(f.gu_type, N))
             return false;
+    }
     return true;
 }
 
@@ -439,9 +440,24 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     take(b.dq_gu, f16 * (uint64_t) PromptBufs::kGroup * (uint64_t) b.gu_elems * 2);
     take(b.dq_d, f16 * (uint64_t) PromptBufs::kGroup * (uint64_t) b.d_elems * 2);
     take(b.stage, 2 * (uint64_t) PromptBufs::kGroup * lay.max_blob);   // two halves: one copied while one is read
-    // the int8 activations: values, then a scale and a sum per 32 (iq_mmq_act_bytes)
-    const uint64_t xq_cols = std::max<uint64_t>(TK * N, U * max_in);   // the routed rows', or a dense input's
-    take(b.xq, xq_cols + 2 * (xq_cols / 32) * 4); take(b.hq, TK * FF + 2 * TK * (FF / 32) * 4); take(b.identity, TK * 4);
+    // the int8 activations: values, then a scale and a sum per 32 (iq_mmq_act_bytes); twice as many where a product
+    // reads them with every block repeated (Q2_K, iq_mmq_type_dup), and a second copy of the routed rows for a layer
+    // whose gate and up differ in that
+    bool dup = false, dup_mixed = false;
+    for (const auto& f : lay.fmt) {
+        const int up = f.up_type >= 0 ? f.up_type : f.gu_type;
+        dup = dup || k::iq_mmq_type_dup(f.gu_type) || k::iq_mmq_type_dup(up) || k::iq_mmq_type_dup(f.d_type);
+        dup_mixed = dup_mixed || k::iq_mmq_type_dup(f.gu_type) != k::iq_mmq_type_dup(up);
+    }
+    for (const Block& bl : blocks_)
+        for (const W* w : {&bl.qkv, &bl.z, &bl.ssm_out, &bl.q, &bl.k, &bl.v, &bl.o})
+            dup = dup || k::iq_mmq_type_dup(w->type);
+    const uint64_t rep = dup ? 2 : 1;
+    const uint64_t xq_cols = rep * std::max<uint64_t>(TK * N, U * max_in);   // the routed rows', or a dense input's
+    take(b.xq, xq_cols + 2 * (xq_cols / 32) * 4); take(b.hq, rep * (TK * FF + 2 * TK * (FF / 32) * 4));
+    take(b.xq2, dup_mixed && b.int8 ? rep * (TK * N + 2 * TK * (N / 32) * 4) : 0);
+    if (!(dup_mixed && b.int8) && dev != nullptr) b.xq2 = nullptr;
+    take(b.identity, TK * 4);
     take(b.wtab, E * sizeof(void*)); take(b.rbounds, (2 * E + 2) * 4); take(b.dense_bounds, 2 * sizeof(int32_t));
     // the CPU's share of the missed experts (plain_prompt.cpp): at most a window's tokens an expert, so 8 E rows
     b.cpu_cap = std::min<int64_t>((int64_t) TK, (int64_t) k::cpu::MAXT * (int64_t) E);

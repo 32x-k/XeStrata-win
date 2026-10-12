@@ -19,6 +19,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_qsa.hpp"
@@ -536,7 +537,12 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     err = std::string("plain prompt: the groups: ") + strata::gpu::last_error();
                     return false;
                 }
+                // a layer whose gate and up differ in type: up's rows too, into xq2 where the two repeat the
+                // blocks differently (Q2_K against another type)
+                const int up_type = k::cpu::native_mixed_gu(f) ? f.up_type : f.gu_type;
+                const bool up_xq2 = k::iq_mmq_type_dup(up_type) != k::iq_mmq_type_dup(f.gu_type);
                 if (use_mmq) prefill::mmq::quantize(P.hn, P.src, P.xq, f.gu_type, N, N, T * K, cs);
+                if (use_mmq && up_xq2) prefill::mmq::quantize(P.hn, P.src, P.xq2, up_type, N, N, T * K, cs);
                 else prefill::gather_rows16(P.x16, P.src, P.xs16, T * K, N, cs);
                 mark(1, t_mark);
                 const bool transient = src_->transient(ml, experts.empty() ? 0 : experts[0]);
@@ -596,6 +602,11 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     gu.type = f.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.n = G; gu.xq = P.xq;
                     gu.bounds = P.bounds + g0; gu.ids = P.identity; gu.total_rows = T * K; gu.max_rows = mr;
                     gu.dst = P.gu; gu.ld_dst = 2 * FF; gu.wtab = P.wtab + g0; gu.woff = 0;
+                    if (k::cpu::native_mixed_gu(f)) {   // the gate rows, then the up rows in their own type
+                        gu.w_rows = FF;
+                        pg.mmq.run(gu, cs);
+                        gu.type = up_type; gu.xq = up_xq2 ? P.xq2 : P.xq; gu.dst = P.gu + FF; gu.woff = f.up_off;
+                    }
                     pg.mmq.run(gu, cs);
                     prefill::mmq::swiglu(P.gu + (int64_t) r0 * 2 * FF, P.hh + (int64_t) r0 * FF, nr, FF,
                                          /*interleaved=*/false, cs);

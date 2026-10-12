@@ -159,6 +159,8 @@ private:
         uint16_t *dq_gu = nullptr, *dq_d = nullptr;   ///< kGroup experts' FP16 weights
         uint8_t* stage = nullptr;          ///< 2 kGroup expert blobs copied from RAM (two halves)
         uint8_t *xq = nullptr, *hq = nullptr;   ///< the int8 products' activations: the routed rows, the SwiGLU's
+        uint8_t* xq2 = nullptr;            ///< the routed rows for the up product of a layer whose gate and up
+                                           ///< differ in the blocks' repetition (iq_mmq_type_dup); else null
         int32_t* identity = nullptr;       ///< row i is row i (the int8 products' output map)
         const uint8_t** wtab = nullptr;    ///< a layer's experts' blobs, for the int8 products
         int32_t* rbounds = nullptr;        ///< each group's bounds from its first row (the down product's)

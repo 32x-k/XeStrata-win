@@ -20,7 +20,7 @@ bool iq_mmq_usable(sycl::queue& q);
 /// Whether the same products run on `q`'s device without matrix engines (dp4a; local memory and work-group size
 /// permitting): iq_mmq_grouped takes that form where iq_mmq_usable says no.
 bool iq_mmq_dp4a_usable(sycl::queue& q);
-/// The ggml types whose weights these products decode (the i-quants but IQ1_S, Q2_0, Q8_0, Q5_0, Q4_K, Q5_K and Q6_K).
+/// The ggml types whose weights these products decode (the i-quants but IQ1_S, Q2_0, Q8_0, Q5_0, Q2_K to Q6_K).
 bool iq_mmq_type_ok(int ggml_type);
 /// Bytes of a weight row of `cols` values in ggml_type (iq_mmq_type_ok).
 size_t iq_mmq_row_bytes(int ggml_type, int64_t cols);
@@ -29,10 +29,13 @@ size_t iq_mmq_row_bytes(int ggml_type, int64_t cols);
 size_t iq_mmq_act_bytes(int64_t rows, int64_t cols);
 /// Whether products of ggml_type read the activations' sums (the K-quants with a min term).
 bool iq_mmq_type_sums(int ggml_type);
+/// Whether products of ggml_type read rows of twice the weights' columns, every activation block twice (Q2_K: its
+/// per-16 mins as a second block of ones): iq_mmq_quantize's `dup`, and iq_mmq_grouped's w_cols doubled.
+bool iq_mmq_type_dup(int ggml_type);
 /// The activations: row i of xq from row ids[i] of x (row i when ids is null), `ld` floats a row of x; `sums`: their
-/// block sums too (iq_mmq_type_sums), else that part is left unwritten.
+/// block sums too (iq_mmq_type_sums), else that part is left unwritten; `dup`: each block twice (rows of 2 cols).
 sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
-                            int64_t rows, bool sums);
+                            int64_t rows, bool sums, bool dup = false);
 
 /// n experts, one launch: expert e's weights ([w_rows, w_cols] in ggml_type's blocks) at w + e * expert_bytes, its
 /// activation rows bounds[e] .. bounds[e + 1] of xq (bounds on the device; xq holds total_rows rows), into dst rows
