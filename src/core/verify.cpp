@@ -401,7 +401,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     {
         const char* v = std::getenv("STRATA_VERIFY_SEGMENTED");
+#if defined(STRATA_ADAPTIVECPP)
+        // not probed: the probe and the unsegmented windows have the GPU wait on the host, which a Windows driver
+        // can take for a hang (TDR), and the doorbell's ring is not seen until a submission ends there
+        segmented_ = v == nullptr || std::strtol(v, nullptr, 10) != 0;
+#else
         segmented_ = v != nullptr ? std::strtol(v, nullptr, 10) != 0 : !strata::kernels::doorbell_visible(cs_);
+#endif
         if (segmented_)
             std::fprintf(stderr, "strata verify: the GPU's running kernels do not see the host's writes: each window "
                                  "runs as segments the host launches (slower)\n");

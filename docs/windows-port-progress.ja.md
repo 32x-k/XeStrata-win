@@ -572,3 +572,24 @@ hit path（expert cache）、層のdump、層ごとの同期を使うときは�
 hello入力、cache 0で、Decodeは8.87、9.00 tok/s、Prefillは7.27、7.48 tok/sでした（直前のgraphだけの版は7.15、7.05 tok/sと5.98、6.00 tok/s）。全logitsは従来の受け渡しとbit単位で一致しました（helloの53位置、計算問題の66位置）。cache autoでは従来の受け渡しに戻り、生成した41 tokenも同じです。
 
 Routing待機は約80 ms/位置、CPU poolは約35 ms/位置です。CPU poolを省いた診断（出力は正しくない）ではRouting待機が約54 msで、GPUの計算約35 msとの差の約19 msは、48回のgraph起動と完了待ちの費用（1層約0.4 ms）です。完了待ちを`hipStreamQuery`のspinにしても変わらず、wake-upの遅れではありません。CPU poolがあるときに増える約22 msは、GPUが待つ間のclock低下などが考えられますが、確かめていません。これらの診断用の切り替えはcommitしていません。
+
+<a id="native-and-spec"></a>
+## 2026-10-13: `--native`と推測デコード
+
+### `--native`
+
+これまでのWindowsの実行は、canonical packのdense重みと汎用kernelで動かしていました（`--native`なし）。Linuxのsetupが既定で使う`--native <shard 1>`は、projectionをGGUFから読みnative kernel（BF16 projection、融合GDN、split-K attention、block top-k、native QSA indexer、Q5_K head）を使います。同じhello入力で、Decodeは8.74、9.17から12.87、12.99 tok/s、Routing待機は73〜99から46 ms/位置になりました。生成した41 tokenと53位置のargmaxは同じで、logitsは最大1.31異なります（kernelの計算順序の違い）。layer graphは2,341から1,452ノードです。
+
+### captureの一般化
+
+engineのcaptureを使う処理（verify window、MTP drafter）は、普通のengine streamで記録します。AdaptiveCppビルドでは、記録中のstreamへの投入を`Runtime::stream`がそのstream用のnative in-order queueへ振り替え、HIPのstream captureで記録します。`stream_fork`の分岐先も同じqueueへ振り替えて直列に記録し、`stream_join`で戻します。tokenは引き続きpool経路（直接loop）で動き、`session_loop`とtoken graph（GPUがdoorbellを待つ）は使いません。captureは既定で有効です（`STRATA_ACPP_CAPTURE=0`で無効）。
+
+### 推測デコード
+
+verify window（`--spec`）は、残る前提（device residency table、`--expert-profile`、expert cache）を満たせば動きました。AdaptiveCppビルドでは、verify windowを常にsegmented（層ごとにhostがsegmentを起動）にします。doorbellの検査とsegmentなしのwindowはGPUにhostを待たせ、WindowsのdriverがTDRと扱う恐れがあるためです（`STRATA_VERIFY_SEGMENTED=0`で検査に戻せます）。
+
+最初のMTPの下書きは148 ms/roundでした。下書きの待ちloopが1024回ごとに`stream_idle`を呼び、AdaptiveCppビルドの`stream_idle`は呼ぶたびにmarker kernelを投入していたため、待つ間に数千のsubmissionがGPUへ積まれていました。`strata::gpu`が各streamに最後に投入した操作（graph起動、copy、memset、event）のeventを覚え、`stream_idle`はそれを問い合わせるだけにしました。下書きは3.3 ms/roundになりました。この表はprocess終了時に破棄しません（runtimeの後片付けの後でeventを破棄して0xC0000005で落ちたため）。
+
+hello入力、`--native`、expert cache auto（commitの空きで8,868〜8,923 slots）、`--expert-profile`、`--spec 4 --spec-min-p 0.5`、MTP、pool workersは既定（11 + host）で、Decodeは21.91、20.71 tok/sでした。生成した41 tokenは推測なしと同じです。12 roundで1 roundあたり3.33 token、下書きの採択率は90〜93%です。1 roundのうちCPU expertsが109〜117 ms、GPUの待ちが27〜29 msで、残る主な時間はCPU expertsです。CPU expertsはworker 3から11で148から115 ms/roundにしか減らず、mmapされたexpertの読み込み（RAM 27.6 GB、多くはSSD）に律速されていると考えられます。PrefillはcacheのあるときCPU経路のhitを通るため5 tok/s前後です。
+
+pool workersはこれまで`--pool-workers 3`で測っていました。推測なしの`--native`でも既定のworker数で13.39、13.85 tok/sです。

@@ -321,11 +321,40 @@ bool Runtime::owns(const sycl::queue* queue) {
 }
 
 sycl::queue& Runtime::stream(void* stream) {
-    if (!stream) return compute_;
-    auto* q = static_cast<sycl::queue*>(stream);
+    auto* q = stream ? static_cast<sycl::queue*>(stream) : &compute_;
     // a queue of another device's runtime is that device's: a kernel goes where its stream is, as with CUDA streams
-    if (!owns(q) && owner_of_stream(q) == nullptr) throw DeviceError("the stream is not a queue of the Xe runtime");
+    if (stream && !owns(q) && owner_of_stream(q) == nullptr)
+        throw DeviceError("the stream is not a queue of the Xe runtime");
+    if (n_redirects_.load(std::memory_order_acquire) > 0) {
+        std::lock_guard<std::mutex> lock(redirect_mutex_);
+        if (auto it = redirects_.find(q); it != redirects_.end()) return *it->second;
+    }
     return *q;
+}
+
+void Runtime::redirect(const sycl::queue* from, sycl::queue* to) {
+    std::lock_guard<std::mutex> lock(redirect_mutex_);
+    if (to != nullptr) {
+        if (redirects_.emplace(from, to).second) n_redirects_.fetch_add(1, std::memory_order_release);
+    } else if (redirects_.erase(from) != 0) {
+        n_redirects_.fetch_sub(1, std::memory_order_release);
+    }
+}
+
+sycl::queue* Runtime::redirected(const sycl::queue* from) {
+    std::lock_guard<std::mutex> lock(redirect_mutex_);
+    auto it = redirects_.find(from);
+    return it == redirects_.end() ? nullptr : it->second;
+}
+
+sycl::queue* Runtime::recording_queue(const sycl::queue* from) {
+    {
+        std::lock_guard<std::mutex> lock(redirect_mutex_);
+        if (auto it = recorders_.find(from); it != recorders_.end()) return it->second;
+    }
+    sycl::queue* rec = create_capture_stream();
+    std::lock_guard<std::mutex> lock(redirect_mutex_);
+    return recorders_.emplace(from, rec).first->second;
 }
 
 void Runtime::preload_kernels() {

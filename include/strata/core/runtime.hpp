@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <exception>
 #include <list>
+#include <map>
 #include <mutex>
 #include <thread>
 
@@ -48,6 +49,12 @@ public:
     sycl::queue* create_capture_stream();
     void destroy_stream(sycl::queue* stream);
     sycl::queue& stream(void* stream);
+    /// While a stream records a graph (AdaptiveCpp: HIP stream capture), the queue its work goes to instead:
+    /// stream() returns `to` for `from` until it is redirected to null.  recording_queue() is the native in-order
+    /// queue kept for recording `from`'s graphs.
+    void redirect(const sycl::queue* from, sycl::queue* to);
+    sycl::queue* redirected(const sycl::queue* from);
+    sycl::queue* recording_queue(const sycl::queue* from);
 
     sycl::event copy_async(void* dst, const void* src, uint64_t bytes,
                            const std::vector<sycl::event>& dependencies = {});
@@ -87,6 +94,9 @@ private:
     sycl::queue compute_, transfer_;
     std::mutex streams_mutex_;
     std::list<sycl::queue> streams_;
+    std::mutex redirect_mutex_;
+    std::map<const sycl::queue*, sycl::queue*> redirects_, recorders_;
+    std::atomic<int> n_redirects_{0};
     std::mutex watch_mutex_;
     std::condition_variable watch_cv_;
     std::list<Waiter> waiters_;

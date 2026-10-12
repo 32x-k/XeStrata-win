@@ -572,3 +572,24 @@ With the hit path (expert cache), layer dumps or per-layer syncs, graphs without
 On the hello input with cache 0, Decode was 8.87 and 9.00 tok/s and Prefill 7.27 and 7.48 tok/s (the graph-only version before it: 7.15 and 7.05, 5.98 and 6.00). All logits matched the earlier hand-off bitwise (53 positions of hello, 66 of the arithmetic input). With cache auto it falls back to the earlier hand-off and generates the same 41 tokens.
 
 The Routing wait is about 80 ms per position and the CPU pool about 35 ms. In a diagnostic without the CPU pool (whose output is not correct) the Routing wait was about 54 ms; the ~19 ms above the ~35 ms of GPU compute is the cost of 48 graph launches and waits (about 0.4 ms a layer). Spinning on `hipStreamQuery` instead of waiting changed nothing, so it is not a wake-up delay. The ~22 ms added with the CPU pool may be the GPU's clock dropping while it waits, which is not checked. These diagnostic switches are not committed.
+
+<a id="native-and-spec"></a>
+## 2026-10-13: `--native` and speculative decoding
+
+### `--native`
+
+The Windows runs so far used the canonical pack's dense weights and the generic kernels (no `--native`). `--native <shard 1>`, which Linux's setup uses by default, reads the projections from the GGUF and uses the native kernels (BF16 projections, fused GDN, split-K attention, block top-k, the native QSA indexer, the Q5_K head). On the same hello input Decode went from 8.74 and 9.17 to 12.87 and 12.99 tok/s, and the Routing wait from 73-99 to 46 ms per position. The 41 generated tokens and the argmax at all 53 positions are the same; the logits differ by up to 1.31 (the kernels' order of arithmetic). The layer graphs have 1,452 nodes instead of 2,341.
+
+### Capture, generalized
+
+The engine's other captured parts (the verify windows, the MTP drafter) record on ordinary engine streams. In the AdaptiveCpp build, `Runtime::stream` redirects the work given to a recording stream to a native in-order queue kept for it, which HIP's stream capture records. A branch `stream_fork` opens is redirected to the same queue and recorded in series until `stream_join`. The tokens still take the pool path (the direct loop); `session_loop` and the token graph, where the GPU waits on a doorbell, are not used. Capture is on by default (`STRATA_ACPP_CAPTURE=0` turns it off).
+
+### Speculative decoding
+
+The verify windows (`--spec`) ran once their other requirements were met (the device residency table, `--expert-profile`, the expert cache). In the AdaptiveCpp build the verify windows are always segmented (the host launches each layer's segment): the doorbell probe and unsegmented windows make the GPU wait on the host, which a Windows driver may take for a hang (TDR). `STRATA_VERIFY_SEGMENTED=0` brings the probe back.
+
+MTP drafting first took 148 ms per round. Its wait loop called `stream_idle` every 1,024 spins, and in the AdaptiveCpp build every `stream_idle` submitted a marker kernel, so thousands of submissions piled onto the GPU while it waited. `strata::gpu` now keeps the event of the last operation it gave each stream (graph launch, copy, memset, event), and `stream_idle` only asks it. Drafting takes 3.3 ms per round. The table is not destroyed at process exit (destroying its events after the runtime's teardown crashed with 0xC0000005).
+
+On the hello input with `--native`, expert cache auto (8,868 to 8,923 slots within the free commit), `--expert-profile`, `--spec 4 --spec-min-p 0.5`, MTP and the default pool workers (11 + the host), Decode was 21.91 and 20.71 tok/s. The 41 generated tokens are the same as without speculation. 12 rounds gave 3.33 tokens each, with 90-93% of the drafts accepted. Of a round, the CPU experts take 109-117 ms and the wait for the GPU 27-29 ms, so the CPU experts are the main remaining time. Going from 3 to 11 workers only took them from 148 to 115 ms per round; reading the mmapped experts (27.6 GB of RAM, most of them on the SSD) appears to be the limit. Prefill is about 5 tok/s with the cache, whose hits go through the CPU path.
+
+The pool workers had been measured at `--pool-workers 3`. Without speculation, `--native` with the default worker count gives 13.39 and 13.85 tok/s.

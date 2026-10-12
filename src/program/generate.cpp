@@ -2201,8 +2201,12 @@ int main(int argc, char** argv) try {
         }
     }
 #if defined(STRATA_ADAPTIVECPP)
-    // Command graphs are unavailable: keep input, PLE, layers and head on one in-order queue.
-    o.no_capture = true;
+    // Keep input, PLE, layers and head on one in-order queue.  The tokens take the pool path (session_token_pool,
+    // its layer graphs recorded with HIP's stream capture), never session_loop or the token graph, whose
+    // doorbells the GPU would wait on.  The captured graphs stay on for the verify windows of --spec
+    // (STRATA_ACPP_CAPTURE=0 turns them off).
+    if (const char* v = std::getenv("STRATA_ACPP_CAPTURE"); v != nullptr && std::strcmp(v, "0") == 0)
+        o.no_capture = true;
     o.no_token_graph = true;
     o.stream_token = true;
     o.check_logits = true;
@@ -4477,7 +4481,13 @@ int main(int argc, char** argv) try {
 
     // ---- the graphs
     strata::core::SessionGraphs gr;
-    if (!o.no_capture && !native_pack) {   // plan v0.3 P6: a native pack runs verify windows only
+    // the tokens' path: the direct pool path with --no-capture, and always with AdaptiveCpp (see above)
+#if defined(STRATA_ADAPTIVECPP)
+    const bool pool_path = true;
+#else
+    const bool pool_path = o.no_capture;
+#endif
+    if (!pool_path && !native_pack) {   // plan v0.3 P6: a native pack runs verify windows only
         if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages)) {
             std::fprintf(stderr, "strata generate: session_capture: %s\n", err.c_str());
             return 1;
@@ -4496,7 +4506,7 @@ int main(int argc, char** argv) try {
 #endif
     // --stage-timing records its events between the kernels, which a graph would not carry
     const bool pool_graphs =
-        o.no_capture && pool_fn != nullptr && !native_pack && pool_graphs_wanted && !o.stage_timing;
+        pool_path && pool_fn != nullptr && !native_pack && pool_graphs_wanted && !o.stage_timing;
     // With the copies in the graphs (`y_miss`), the layers run on the direct stream; captured after the loop's
     // scratch below, except for --gpu-stages, which measures the graphs before any token and stops.
     auto capture_pool_graphs = [&](const float* y_miss) -> bool {
@@ -5153,7 +5163,9 @@ int main(int argc, char** argv) try {
     };
     strata::core::TokenHits thits;
     const bool graph_hits = hit_fn != nullptr && !profile.empty() && !o.no_pool;
-    if (graph_hits && !o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr) {
+    // the residency table serves the token graph and the verify windows of --spec
+    if (graph_hits && !o.no_capture && (!o.no_token_graph || o.spec > 0) && layer_dump == nullptr &&
+        half_dump == nullptr) {
         host_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
         int64_t resident = 0;
         for (int64_t l = 0; l < g.n_layers; ++l)
@@ -9937,7 +9949,7 @@ int main(int argc, char** argv) try {
     // Process-local opt-in only; never enables graphs, profiling events or new fences.
     const char* pool_timing_env = std::getenv("STRATA_POOL_TIMING");
     const bool pool_timing_enabled = pool_timing_env != nullptr && std::strcmp(pool_timing_env, "1") == 0 &&
-                                     o.no_capture && pool_fn != nullptr;
+                                     pool_path && pool_fn != nullptr;
     auto pool_measured = [](strata::core::PoolTiming::Span* span, auto&& call) -> bool {
         struct Timer {
             strata::core::PoolTiming::Span* span;
@@ -10021,7 +10033,7 @@ int main(int argc, char** argv) try {
         drive.d.experts = 0;
         drive.d.failed = false;
         err.clear();
-        if (o.no_capture) {
+        if (pool_path) {
             const bool ok = pool_fn != nullptr
                 ? strata::core::session_token_pool(wt, g, pos, /*pos_base=*/0, ss, d_parts, pool_fn, hit_fn,
                                                     pool_user, loop_scratch, main_cs, o.sync_every_layer, err,

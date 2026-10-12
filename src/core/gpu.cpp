@@ -118,7 +118,7 @@ sycl::event memset_pieces(sycl::queue& queue, void* dst, int value, size_t bytes
 // A stream is a queue of the device it was created on, whichever device is current (null: the current device's
 // compute queue).
 sycl::queue& q(Stream s) {
-    if (!s) return rt().compute();
+    if (!s) return rt().stream(nullptr);
     core::Runtime* owner = core::Runtime::owner_of_stream(s);
     if (!owner) throw core::DeviceError("the stream is not a queue of the Xe runtime");
     return owner->stream(s);
@@ -226,9 +226,24 @@ bool hip_free_memory(const sycl::device& d, uint64_t& free, uint64_t& total) {
     return true;
 }
 
-// the recordings in progress: queue -> its HIP stream being captured
+// The recordings in progress, by the queue a stream names (null: the compute queue): its HIP stream being
+// captured.  While a stream records, Runtime::stream redirects its work to the native in-order queue kept for
+// it, and a branch stream_fork opens is redirected to the same queue (in series) until stream_join.
 std::mutex g_capture_mutex;
 std::map<const sycl::queue*, void*> g_captures;
+std::map<const sycl::queue*, const sycl::queue*> g_branches;   // branch -> the recording it joins
+sycl::queue* base_queue(Stream s) { return s ? static_cast<sycl::queue*>(s) : &rt().compute(); }
+
+// The last operation this API gave each stream (graph launches, copies, memsets, event marks): stream_idle asks
+// its event instead of submitting a marker, which a polling loop would otherwise submit by the thousand (each one
+// a submission of its own on Windows HIP, queued behind and slowing the work being waited for).
+// Never destroyed: its events must not outlive the runtime that ends them at exit.
+std::mutex g_last_mutex;
+std::map<const sycl::queue*, sycl::event>& g_last = *new std::map<const sycl::queue*, sycl::event>;
+void note_last(Stream s, const sycl::event& e) {
+    std::lock_guard<std::mutex> lock(g_last_mutex);
+    g_last[base_queue(s)] = e;
+}
 #endif
 
 // the recordings in progress, by queue
@@ -264,7 +279,16 @@ bool stream_sync(Stream s) {
 bool stream_idle(Stream s) {
     try {
 #if defined(STRATA_ADAPTIVECPP)
-        return marker(q(s)).get_info<sycl::info::event::command_execution_status>() ==
+        std::optional<sycl::event> last;
+        {
+            std::lock_guard<std::mutex> lock(g_last_mutex);
+            if (auto it = g_last.find(base_queue(s)); it != g_last.end()) last = it->second;
+        }
+        if (!last) {   // nothing given through this API yet: one marker, then that is the event asked
+            last = marker(q(s));
+            note_last(s, *last);
+        }
+        return last->get_info<sycl::info::event::command_execution_status>() ==
                sycl::info::event_command_status::complete;
 #else
         return q(s).ext_oneapi_empty();
@@ -442,8 +466,14 @@ bool copy(void* dst, const void* src, size_t bytes) {
 
 bool copy_async(void* dst, const void* src, size_t bytes, Stream s) {
     if (bytes == 0) return true;
-    try { q(s).memcpy(dst, src, bytes); return true; }
-    catch (const std::exception& e) { return fail("copy_async", e); }
+    try {
+        const sycl::event e = q(s).memcpy(dst, src, bytes);
+#if defined(STRATA_ADAPTIVECPP)
+        note_last(s, e);
+#endif
+        (void) e;
+        return true;
+    } catch (const std::exception& e) { return fail("copy_async", e); }
 }
 
 bool copy_async_after(void* dst, const void* src, size_t bytes, Stream s, const Event* after, Event* done) {
@@ -454,6 +484,9 @@ bool copy_async_after(void* dst, const void* src, size_t bytes, Stream s, const 
             if (bytes > 0) h.memcpy(dst, src, bytes);
         });
         if (done != nullptr) done->ev = e;
+#if defined(STRATA_ADAPTIVECPP)
+        note_last(s, e);
+#endif
         return true;
     } catch (const std::exception& e) { return fail("copy_async_after", e); }
 }
@@ -488,8 +521,14 @@ bool memset(void* dst, int value, size_t bytes) {
 
 bool memset_async(void* dst, int value, size_t bytes, Stream s) {
     if (bytes == 0) return true;
-    try { memset_pieces(q(s), dst, value, bytes); return true; }
-    catch (const std::exception& e) { return fail("memset_async", e); }
+    try {
+        const sycl::event e = memset_pieces(q(s), dst, value, bytes);
+#if defined(STRATA_ADAPTIVECPP)
+        note_last(s, e);
+#endif
+        (void) e;
+        return true;
+    } catch (const std::exception& e) { return fail("memset_async", e); }
 }
 
 bool mem_info(size_t* free_bytes, size_t* total_bytes) {
@@ -602,6 +641,7 @@ bool event_record(Event* e, Stream s) {
         } else {
             e->ev = marker(queue);
         }
+        note_last(s, *e->ev);
 #else
         e->ev = e->timing || !rt_of(s).marks_by_barrier() ? sx::submit_profiling_tag(queue)
                                                           : queue.ext_oneapi_submit_barrier();
@@ -664,20 +704,27 @@ bool event_elapsed_ms(float* ms, const Event* from, const Event* to) {
 
 bool begin_capture(Stream s) {
 #if defined(STRATA_ADAPTIVECPP)
-    // HIP's stream capture on the queue's one HIP stream: `s` must come from stream_create_capture.  Relaxed, as
-    // AdaptiveCpp itself records and queries events around what it submits.
+    // HIP's stream capture on the one HIP stream of the native in-order queue kept for `s`, which receives `s`'s
+    // work while it records (the engine queues defer and spread their work over several HIP streams).  Relaxed,
+    // as AdaptiveCpp itself records and queries events around what it submits.
     try {
         if (!hip().graphs()) { g_error = "begin_capture: this runtime has no HIP graphs"; return false; }
-        auto& queue = q(s);
+        sycl::queue* base = base_queue(s);
+        core::Runtime& r = rt_of(s);
         std::lock_guard<std::mutex> lock(g_capture_mutex);
-        if (g_captures.count(&queue)) { g_error = "begin_capture: the stream is already recording"; return false; }
-        void* stream = hip_stream(queue);
+        if (g_captures.count(base) || g_branches.count(base)) {
+            g_error = "begin_capture: the stream is already recording";
+            return false;
+        }
+        sycl::queue* rec = r.recording_queue(base);
+        void* stream = hip_stream(*rec);
         if (stream == nullptr) { g_error = "begin_capture: the stream has no HIP stream"; return false; }
         if (const int rc = hip().begin_capture(stream, kHipCaptureModeRelaxed)) {
             g_error = hip_error("begin_capture", rc);
             return false;
         }
-        g_captures.emplace(&queue, stream);
+        r.redirect(base, rec);
+        g_captures.emplace(base, stream);
         return true;
     } catch (const std::exception& e) { return fail("begin_capture", e); }
 #else
@@ -697,14 +744,24 @@ bool end_capture(Stream s, Graph** out) {
     *out = nullptr;
 #if defined(STRATA_ADAPTIVECPP)
     try {
-        auto& queue = q(s);
+        sycl::queue* base = base_queue(s);
+        core::Runtime& r = rt_of(s);
         void* stream = nullptr;
         {
             std::lock_guard<std::mutex> lock(g_capture_mutex);
-            auto it = g_captures.find(&queue);
+            auto it = g_captures.find(base);
             if (it == g_captures.end()) { g_error = "end_capture: the stream is not recording"; return false; }
             stream = it->second;
             g_captures.erase(it);
+            r.redirect(base, nullptr);
+            for (auto b = g_branches.begin(); b != g_branches.end();) {   // branches left open end with it
+                if (b->second == base) {
+                    r.redirect(b->first, nullptr);
+                    b = g_branches.erase(b);
+                } else {
+                    ++b;
+                }
+            }
         }
         void* graph = nullptr;
         if (const int rc = hip().end_capture(stream, &graph)) { g_error = hip_error("end_capture", rc); return false; }
@@ -741,13 +798,23 @@ bool end_capture(Stream s, Graph** out) {
 void abandon_capture(Stream s) {
 #if defined(STRATA_ADAPTIVECPP)
     try {
-        auto& queue = q(s);
+        sycl::queue* base = base_queue(s);
+        core::Runtime& r = rt_of(s);
         std::lock_guard<std::mutex> lock(g_capture_mutex);
-        auto it = g_captures.find(&queue);
+        auto it = g_captures.find(base);
         if (it == g_captures.end()) return;
         void* graph = nullptr;
         if (hip().end_capture(it->second, &graph) == 0 && graph != nullptr) hip().graph_destroy(graph);
         g_captures.erase(it);
+        r.redirect(base, nullptr);
+        for (auto b = g_branches.begin(); b != g_branches.end();) {
+            if (b->second == base) {
+                r.redirect(b->first, nullptr);
+                b = g_branches.erase(b);
+            } else {
+                ++b;
+            }
+        }
     } catch (const std::exception& e) { fail("abandon_capture", e); }
 #else
     try {
@@ -770,6 +837,25 @@ void abandon_capture(Stream s) {
 
 bool stream_fork(Stream from, Stream to) {
     try {
+#if defined(STRATA_ADAPTIVECPP)
+        {
+            // while `from` records, the branch records into the same HIP stream, after what `from` was given
+            sycl::queue* bf = base_queue(from);
+            sycl::queue* bt = base_queue(to);
+            std::lock_guard<std::mutex> lock(g_capture_mutex);
+            const sycl::queue* root = g_captures.count(bf) ? bf : g_branches.count(bf) ? g_branches[bf] : nullptr;
+            if (root != nullptr) {
+                if (g_captures.count(bt) || g_branches.count(bt)) {
+                    g_error = "stream_fork: the branch is already recording";
+                    return false;
+                }
+                core::Runtime& r = rt_of(from);
+                r.redirect(bt, r.redirected(bf));
+                g_branches.emplace(bt, root);
+                return true;
+            }
+        }
+#endif
         auto& a = q(from);
         auto& b = q(to);
 #if !defined(STRATA_ADAPTIVECPP)
@@ -795,6 +881,16 @@ bool stream_fork(Stream from, Stream to) {
 
 bool stream_join(Stream into, Stream from) {
     try {
+#if defined(STRATA_ADAPTIVECPP)
+        {
+            sycl::queue* bf = base_queue(from);
+            std::lock_guard<std::mutex> lock(g_capture_mutex);
+            if (g_branches.erase(bf) != 0) {   // the branch recorded in series: nothing to join
+                rt_of(from).redirect(bf, nullptr);
+                return true;
+            }
+        }
+#endif
         auto& a = q(into);
         auto& b = q(from);
 #if !defined(STRATA_ADAPTIVECPP)
@@ -817,9 +913,9 @@ bool stream_join(Stream into, Stream from) {
 bool is_capturing(Stream s) {
 #if defined(STRATA_ADAPTIVECPP)
     try {
-        auto& queue = q(s);
+        sycl::queue* base = base_queue(s);
         std::lock_guard<std::mutex> lock(g_capture_mutex);
-        return g_captures.count(&queue) != 0;
+        return g_captures.count(base) != 0 || g_branches.count(base) != 0;
     } catch (const std::exception& e) { return fail("is_capturing", e); }
 #else
     try {
@@ -837,10 +933,11 @@ bool graph_launch(const Graph* g, Stream s) {
     // before, and before what it is given next (it records its completion event after the launch).
     try {
         void* exec = g->hip_exec;
-        q(s).AdaptiveCpp_enqueue_custom_operation([exec](sycl::interop_handle& h) {
+        const sycl::event e = q(s).AdaptiveCpp_enqueue_custom_operation([exec](sycl::interop_handle& h) {
             if (const int rc = hip().graph_launch(exec, h.get_native_queue<sycl::backend::hip>()))
                 throw std::runtime_error(hip_error("graph_launch", rc));
         });
+        note_last(s, e);
         return true;
     } catch (const std::exception& e) { return fail("graph_launch", e); }
 #else
