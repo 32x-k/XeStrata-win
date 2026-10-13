@@ -25,7 +25,7 @@ intel/llvm（DPC++）を Windows の上で HIP のターゲットだけでビル
 ### 対応している GPU
 
 - Windows で動くのは AMD の GPU だけです（HIP）。確かめたのは Radeon AI PRO R9700（gfx1201、32 GB）だけです。
-- Windows の Intel Arc と NVIDIA の GPU は、ビルドしていません。
+- Windows では、Intel Arc と NVIDIA の GPU 向けにはビルドしていません。
 - Linux では本家の XeStrata と同じです（Intel Arc、AMD、NVIDIA）。
 
 ### Windows で使える機能
@@ -34,12 +34,12 @@ intel/llvm（DPC++）を Windows の上で HIP のターゲットだけでビル
 - `--serve` と `serve/server.py` による OpenAI 互換の API
 - ネイティブパック（`tools/iq_pack.py`）、MTP による推測デコード、`--resident-experts`、rocBLAS による prefill
 
-本家と違うところ:
+本家と違うところは次の 4 つです。
 
 - インストーラー（`xestrata --setup`）と deb・rpm のパッケージは Linux 用です。Windows では下のとおり手でビルドします。
 - Windows では、RAM 側のエキスパートのコピーを既定でページロックしません。`STRATA_RESIDENT_PIN=1` でページロックすると prefill のエキスパートのコピーが速くなりますが、`--serve` では約 6 GiB を超えると GPU が落ちることがあります。
-- 適応キャッシュ（エキスパートの入れ替え）は入れ替えが遅く、`--adapt-every 0` のほうが速く動きます。
-- `--gpu-stages` は、ネイティブパックでは動きません。
+- 適応キャッシュはエキスパートの入れ替えが遅く、`--adapt-every 0` のほうが速く動きます。
+- `--gpu-stages` はネイティブパックでは動きません。
 
 ### ビルド
 
@@ -96,8 +96,9 @@ intel/llvm（DPC++）を Windows の上で HIP のターゲットだけでビル
 
 ### 今の計測（参考値）
 
-Radeon AI PRO R9700、Ryzen AI 9 HX 370、RAM 28 GB、Windows 11 で、Qwen3.8-Flash-Next の Q2_0、上の引数（MTP の推測デコード、4 トークン）で測りました（2026-10-14）。
-比べたのは本家の上流の Strata v0.1.43.1 の HIP 版で、同じ PC・モデル・プロンプトで、引数はその既定です。
+2026-10-14 に、Radeon AI PRO R9700、Ryzen AI 9 HX 370、RAM 28 GB、Windows 11 の PC で測りました。
+モデルは Qwen3.8-Flash-Next の Q2_0、引数は上のとおりです（MTP の推測デコードは 4 トークン）。
+比べた相手は、XeStrata の上流にあたる Strata v0.1.43.1 の HIP 版です。同じ PC・モデル・プロンプトで、引数は Strata の既定です。
 値は tok/s で、2 回測ったものは平均です。
 
 | プロンプト | 出力 | decode（このブランチ） | decode（Strata） | prefill（このブランチ） | prefill（Strata） |
@@ -108,9 +109,9 @@ Radeon AI PRO R9700、Ryzen AI 9 HX 370、RAM 28 GB、Windows 11 で、Qwen3.8-F
 | 18,801 トークン | 200 | 103 | 107 | 970 | 948 |
 | 40 トークン | 2,000 | 86 | 96 | 72 | 37 |
 
-`--serve` に 20 個の質問を続けて送ったときは、全体で 91 tok/s（Strata は 95 tok/s）で、20 個とも答えました。
+`--serve` に 20 個の質問を続けて送ると、20 個すべてに答え、全体の速さは 91 tok/s でした（Strata は 95 tok/s）。
 
-decode が Strata より遅いのは、主に GPU のキャッシュにないエキスパートを CPU で計算する時間と、MTP の下書きの時間です（GPU の verify の時間は同じくらいです）。
+decode が Strata より遅い主な理由は、GPU のキャッシュにないエキスパートを CPU で計算する時間と、MTP の下書きの時間が長いことです。GPU の verify にかかる時間は同じくらいです。
 
 ---
 

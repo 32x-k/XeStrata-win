@@ -25,7 +25,7 @@ It keeps taking in upstream's releases; it now includes everything up to xe0.1.4
 ### Supported GPUs
 
 - On Windows, only AMD GPUs run (HIP). Only the Radeon AI PRO R9700 (gfx1201, 32 GB) has been tried.
-- Intel Arc and NVIDIA GPUs are not built for on Windows.
+- On Windows, it is not built for Intel Arc or NVIDIA GPUs.
 - On Linux, it is the same as upstream XeStrata (Intel Arc, AMD and NVIDIA).
 
 ### What works on Windows
@@ -34,11 +34,11 @@ It keeps taking in upstream's releases; it now includes everything up to xe0.1.4
 - The OpenAI-compatible API with `--serve` and `serve/server.py`
 - The native pack (`tools/iq_pack.py`), speculative decoding with MTP, `--resident-experts`, and prefill on rocBLAS
 
-Differences from upstream:
+These four things differ from upstream.
 
 - The installer (`xestrata --setup`) and the deb and rpm packages are for Linux. On Windows, build by hand as below.
 - On Windows, the RAM copy of the experts is not page-locked by default. `STRATA_RESIDENT_PIN=1` page-locks it and makes prefill's expert copies faster, but with `--serve` the GPU can fail once it is larger than about 6 GiB.
-- The adaptive cache swaps experts slowly; `--adapt-every 0` runs faster.
+- The adaptive cache is slow to swap experts, and `--adapt-every 0` runs faster.
 - `--gpu-stages` does not work with the native pack.
 
 ### Building
@@ -96,8 +96,9 @@ The full steps are in [docs/DEVTOOLS.md](docs/DEVTOOLS.md), under "Windows (AMD 
 
 ### Current measurements (for reference)
 
-Measured on a Radeon AI PRO R9700, a Ryzen AI 9 HX 370, 28 GB of RAM and Windows 11, with Qwen3.8-Flash-Next's Q2_0 and the arguments above (speculative decoding with MTP, 4 tokens), on 2026-10-14.
-The comparison is upstream Strata v0.1.43.1's HIP build, on the same PC with the same model and prompts and its default arguments.
+Measured on 2026-10-14 on a PC with a Radeon AI PRO R9700, a Ryzen AI 9 HX 370, 28 GB of RAM and Windows 11.
+The model is Qwen3.8-Flash-Next's Q2_0 and the arguments are those above (4 tokens of speculative decoding with MTP).
+The comparison is the HIP build of Strata v0.1.43.1, XeStrata's upstream, on the same PC with the same model and prompts and Strata's default arguments.
 Values are tok/s; those measured twice are averages.
 
 | Prompt | Output | decode (this branch) | decode (Strata) | prefill (this branch) | prefill (Strata) |
@@ -108,9 +109,9 @@ Values are tok/s; those measured twice are averages.
 | 18,801 tokens | 200 | 103 | 107 | 970 | 948 |
 | 40 tokens | 2,000 | 86 | 96 | 72 | 37 |
 
-With 20 questions sent to `--serve` in a row, it answered all 20 at 91 tok/s overall (Strata: 95 tok/s).
+Sent 20 questions in a row, `--serve` answered all 20, at 91 tok/s overall (Strata: 95 tok/s).
 
-decode is slower than Strata's mostly from computing on the CPU the experts the GPU cache does not hold, and from MTP's drafting (the GPU's verify takes about as long).
+decode is slower than Strata's mainly because computing on the CPU the experts the GPU cache does not hold, and MTP's drafting, take longer. The GPU's verify takes about as long as Strata's.
 
 ---
 
