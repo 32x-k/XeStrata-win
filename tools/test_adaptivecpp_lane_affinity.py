@@ -27,6 +27,7 @@ class LaneAffinityTests(unittest.TestCase):
         self.source.mkdir()
         self.file = self.source / lane.FILE
         self.file.parent.mkdir(parents=True)
+        # REUSE-IgnoreStart (the header of the AdaptiveCpp file the test writes, not this file's)
         head = (b"/*\n * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard\n"
                 b" * parallelism for CPUs and GPUs.\n *\n * Copyright The AdaptiveCpp Contributors\n *\n"
                 b" * See file LICENSE in the project root for full license details.\n */\n"
@@ -41,6 +42,7 @@ class LaneAffinityTests(unittest.TestCase):
                 b"  for(const auto& executor : _device_data[dev_id].executors) {\n"
                 b"    if(executor->is_submitted_by_me(node)) {\n"
                 b"      index_out = lane_id;\n      return true;\n    }\n    ++lane_id;\n  }\n  return false;\n}\n")
+        # REUSE-IgnoreEnd
         self.original = head + b"\n" * 232 + tail
         self.file.write_bytes(self.original)
         self.other = self.source / 'owned-by-user.txt'
