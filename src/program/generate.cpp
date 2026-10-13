@@ -802,6 +802,42 @@ const uint8_t* blob_to_copy(strata::core::ExpertSource* src, int64_t layer, int6
     return src->copy_blob(layer, expert, tmp.data()) ? tmp.data() : nullptr;
 }
 
+/// Page-locked buffers an adaptive round's copies to the device read their blobs from when the RAM copy of the
+/// experts is not page-locked: a copy from pageable memory holds the host for the whole transfer while the runtime
+/// stages it, a copy from these returns at once.  The round copies each blob in here first; the buffers are reused
+/// from the next round on, which starts only once the previous round's copies have landed.
+class PinnedBounce {
+public:
+    PinnedBounce() = default;
+    PinnedBounce(const PinnedBounce&) = delete;
+    PinnedBounce& operator=(const PinnedBounce&) = delete;
+    ~PinnedBounce() { if (base_ != nullptr) strata::gpu::free(base_); }
+    void begin() { used_ = 0; }
+    /// `src` copied into the next buffer, or null (no buffer left, or none could be page-locked: copy from `src`)
+    const uint8_t* take(const uint8_t* src, size_t bytes, size_t slots) {
+        const size_t blob = (size_t) strata::kernels::cpu::expert_layout().max_blob;
+        if (failed_ || bytes > blob || slots == 0) return nullptr;
+        if (base_ == nullptr) {
+            if (strata::gpu::alloc_host(&base_, blob * slots) != true || base_ == nullptr) {
+                base_ = nullptr;
+                failed_ = true;
+                return nullptr;
+            }
+            slots_ = slots;
+            blob_ = blob;
+        }
+        if (used_ >= slots_) return nullptr;
+        uint8_t* dst = base_ + used_++ * blob_;
+        std::memcpy(dst, src, bytes);
+        return dst;
+    }
+
+private:
+    uint8_t* base_ = nullptr;
+    size_t slots_ = 0, blob_ = 0, used_ = 0;
+    bool failed_ = false;
+};
+
 // --lookup-chain: the context's last tokens for the draft sources (at most 64), the MTP's pending drafts last
 int chain_tail(const strata::spec::SuffixDrafter& sfx, const int32_t* pending, int n_pending, std::vector<int32_t>& tail) {
     const std::vector<int32_t>& h = sfx.history();
@@ -4243,6 +4279,7 @@ int main(int argc, char** argv) {
     strata::core::ArenaExpertSource arena_src;
     strata::core::ExpertSource* srcp = nullptr;
     std::vector<uint8_t> fill_tmp;   // blob_to_copy's buffer for a transient source
+    PinnedBounce adapt_bounce;       // the adaptive rounds' page-locked copies of blobs in pageable RAM
     // Issue #10: less RAM available than the whole expert arena.  The arena then swaps while it loads, and on Level
     // Zero the PCIe share later moves it into host USM (make_kernel_readable): GPU driver memory that the OOM killer
     // cannot reclaim, so the GPU VM's rebind swapped it back in and the OOM killer emptied the host (#10, Case 1:
@@ -7199,6 +7236,7 @@ int main(int argc, char** argv) {
                 return SwapHome{gs ? &gs->cache : &xcache, gs ? gs->adapt_stream : adapt_stream, gs ? gs->dev : -1};
             };
             if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, swap_home)) return false;
+            adapt_bounce.begin();
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
@@ -7210,6 +7248,8 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on(gs ? gs->dev : -1);
                 uint8_t* sdst = gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot);
                 const size_t sn = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer);
+                if (!tb && b != nullptr && !src.complement_pinned())
+                    if (const uint8_t* pb = adapt_bounce.take(b, sn, (size_t) o.adapt_swaps)) b = pb;
                 ++adapt_swaps_n;
                 if (tb) ++adapt_sync_n;
                 if (slot < 0 || b == nullptr ||
@@ -11534,6 +11574,7 @@ int main(int argc, char** argv) {
             if (!resident_stage_swaps(src, host_res, g.n_expert, swaps,   // this loop refills the first card only
                                       [&](int32_t) { return SwapHome{&xcache, adapt_stream, -1}; }))
                 return false;
+            adapt_bounce.begin();
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
@@ -11542,6 +11583,8 @@ int main(int argc, char** argv) {
                 const bool tb = srcp->transient(s.layer, s.in);
                 const uint8_t* b = blob_to_copy(srcp, s.layer, s.in, fill_tmp);
                 const size_t sn = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer);
+                if (!tb && b != nullptr && !src.complement_pinned())
+                    if (const uint8_t* pb = adapt_bounce.take(b, sn, (size_t) o.adapt_swaps)) b = pb;
                 if (slot < 0 || b == nullptr ||
                     !(tb ? strata::gpu::copy(xcache.device_slot(slot), b, sn)
                          : strata::gpu::copy_async(xcache.device_slot(slot), b, sn, adapt_stream))) {

@@ -9,6 +9,7 @@
 #include "strata/kernels/device_arch_tag.hpp"
 
 #if !defined(STRATA_ADAPTIVECPP)
+#include <sycl/ext/oneapi/experimental/enqueue_functions.hpp>
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <sycl/ext/oneapi/experimental/profiling_tag.hpp>
 #include <sycl/ext/oneapi/virtual_mem/physical_mem.hpp>
@@ -502,11 +503,14 @@ bool copy(void* dst, const void* src, size_t bytes) {
 bool copy_async(void* dst, const void* src, size_t bytes, Stream s) {
     if (bytes == 0) return true;
     try {
-        const sycl::event e = q(s).memcpy(dst, src, bytes);
 #if defined(STRATA_ADAPTIVECPP)
-        note_last(s, e);
+        note_last(s, q(s).memcpy(dst, src, bytes));
+#else
+        // without an event: on HIP an event recorded after each copy cut the copies between pinned host memory and
+        // the device from 6.6 to 3.7 GB/s (expert blobs of 1.3 MB, R9700 on Windows); the in-order queue keeps the
+        // order, and stream_idle asks the queue itself
+        sx::memcpy(q(s), dst, src, bytes);
 #endif
-        (void) e;
         return true;
     } catch (const std::exception& e) { return fail("copy_async", e); }
 }
