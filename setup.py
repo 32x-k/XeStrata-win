@@ -63,6 +63,7 @@ from typing import Any, NoReturn
 from serve import places, release_check
 
 ROOT = Path(__file__).resolve().parent
+WIN = places.WIN
 
 
 # A deb or rpm package installs this folder read-only (/usr/share/xestrata) with a PACKAGED record (where the engine
@@ -74,7 +75,7 @@ if (ROOT / "PACKAGED").is_file():
     PACKAGED = json.loads((ROOT / "PACKAGED").read_text(encoding="utf-8"))
 CONF = places.user_dir("config") if PACKAGED else ROOT   # the model configs, xestrata-<model>.json
 STATE = places.user_dir("state") if PACKAGED else ROOT    # the logs, and the engine's working folder
-SETUP_CMD = "xestrata" if PACKAGED else "./setup.sh"
+SETUP_CMD = ("xestrata-cli" if WIN else "xestrata") if PACKAGED else "./setup.sh"
 # Every Hugging Face file comes from a fixed commit of its repository (the `sha` of
 # https://huggingface.co/api/models/<repo> when it was pinned, upstream #214), so a checkout installs the same files
 # on any day.  A revision the repository no longer has falls back to its current files, with a message (download()).
@@ -370,10 +371,11 @@ def esp_download(data: Path) -> Path | None:
 # sizes its expert slots around it and the default reserve (700 MiB) is enough; engines before 0.1.2 need more
 VISION = {"gpu": {"max_tokens": 1024, "reserve_mib": 700},
           "cpu": {"max_tokens": 300, "reserve_mib": 700}}
-EXE = "strata"
+EXE = "strata.exe" if WIN else "strata"
 # the image encoder, one binary per place it runs: the configs of different models may use different ones
 # the image encoders: on the CPU, on the GPU through Vulkan (free), on the GPU through SYCL (oneMKL: contrib-icpx)
-VEXE = {"cpu": "strata-vision-cpu", "vulkan": "strata-vision-vulkan", "gpu": "strata-vision-sycl"}
+VEXE = {k: v + (".exe" if WIN else "") for k, v in
+        {"cpu": "strata-vision-cpu", "vulkan": "strata-vision-vulkan", "gpu": "strata-vision-sycl"}.items()}
 
 
 # ------------------------------------------------------------------------------------------------ output
@@ -474,7 +476,25 @@ def wsl_version() -> int:
     return 2 if "wsl2" in release or "microsoft-standard" in release else 1
 
 
+def _memory_status():
+    """Windows' GlobalMemoryStatusEx: RAM, and the commit limit (ullTotalPageFile = RAM + page file)."""
+    import ctypes
+
+    class MS(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+    m = MS()
+    m.dwLength = ctypes.sizeof(MS)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))  # type: ignore[attr-defined]
+    return m
+
+
 def ram_gb():
+    if WIN:
+        return _memory_status().ullTotalPhys / 2**30
     for line in open("/proc/meminfo"):
         if line.startswith("MemTotal"):
             return int(line.split()[1]) * 1024 / 2**30
@@ -485,6 +505,12 @@ def cpu_info():
     """(name, avx2, avx512): avx512 means everything Strata's fast AVX-512 kernels use (F, BW, VL, VNNI, VBMI),
     the same test the engine makes (cpu_avx512_ok), not just AVX-512F."""
     name, avx2, avx512 = platform.processor() or "unknown CPU", False, False
+    if WIN:                                            # no /proc/cpuinfo: the engine's own tests (strata-device --cpu)
+        try:
+            c = json.loads(engine_tool("--cpu"))
+            return c.get("name") or name, bool(c.get("avx2")), bool(c.get("avx512"))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return name, False, False
     try:
         txt = open("/proc/cpuinfo").read()
         flags = set(re.search(r"^flags\s*:\s*(.*)$", txt, re.M).group(1).split())
@@ -898,7 +924,11 @@ def runtime_commands(need: list, fast: list, repos: list) -> list:
 
 def check_runtime(makers: set) -> None:
     """Stops when the GPUs of `makers` lack their makers' packages, and says how to install them; names oneMKL and
-    cuBLAS too when they are missing, without stopping (XeStrata's own kernels do their work)."""
+    cuBLAS too when they are missing, without stopping (XeStrata's own kernels do their work).  Windows: the GPU
+    makers' drivers bring what the engine runs on (Level Zero, the CUDA driver), the 7z the rest, and the launcher
+    checks the Visual C++ runtime; the engine there has no oneMath yet, so oneMKL and cuBLAS have no use."""
+    if WIN:
+        return
     need, fast, repos = runtime_missing(makers)
     if not need and not fast:
         return
@@ -946,7 +976,9 @@ def gpus():
     on NVIDIA's driver and every AMD GPU on amdgpu (after them, so that the Intel cards keep the numbers saved configs
     know them by), from sysfs, the Intel driver's memory query, nvidia-smi and the KFD topology: no tool of Strata's is
     needed before the engine is built.  Nothing is decided from the device ID: the engine checks at start what the
-    card reports (AGENTS.md)."""
+    card reports (AGENTS.md).  Windows has no sysfs: there the engine lists the GPUs (gpus_from_engine)."""
+    if WIN:
+        return gpus_from_engine()
     found, nvidia, amd = [], [], []
     kfd = None
     smi = None
@@ -1012,6 +1044,27 @@ def gpus():
     return found + [{"index": len(found) + i, **g} for i, g in enumerate(nvidia + amd)]
 
 
+def gpus_from_engine():
+    """The GPUs as the engine sees them (strata-device --list-devices), in its order (the card it would take first), in
+    gpus()'s form.  What sysfs alone gives on Linux is not known here: the PCIe link, a small BAR (taken as the whole
+    VRAM), an AMD card's gfx name; the render node is not needed (no device files to open)."""
+    vendors = {0x8086: "intel", 0x10DE: "nvidia", 0x1002: "amd"}
+    try:
+        lines = [json.loads(x) for x in engine_tool("--list-devices").splitlines() if x.strip()]
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        warn(f"the engine could not list the GPUs: {e}")
+        return []
+    found = []
+    for d in lines:
+        integrated = bool(d.get("integrated"))
+        vram = 0.0 if integrated else d.get("total_bytes", 0) / 2 ** 30
+        found.append({"index": len(found), "name": d.get("name") or "GPU", "vram_gb": vram,
+                      "device_id": d.get("device_id", 0), "driver": d.get("backend"), "integrated": integrated,
+                      "supported": True, "pci": d.get("pci"), "bar_gb": vram, "link": None, "render": None,
+                      "vendor": vendors.get(d.get("vendor_id"), "other")})
+    return found
+
+
 def gpu_problem(g, together=False):
     """Why Strata cannot use this card, in plain words (None: it can).  What the card can do (16-wide sub-groups,
     FP16, the matrix engines) is checked by the engine and the compiler's probe, not here."""
@@ -1031,6 +1084,8 @@ def gpu_problem(g, together=False):
         return None
     if g.get("vendor") == "nvidia" and license_mode(ARGS) != "contrib":
         return "an NVIDIA GPU needs the contrib build (--license contrib: NVIDIA's CUDA toolkit, not free software)"
+    if g.get("vendor") == "amd" and WIN:
+        return "AMD GPUs are not supported on Windows yet"
     if g.get("vendor") == "amd":
         if not PACKAGED and license_mode(ARGS) == "contrib-icpx":
             return "icpx has no AMD target: an AMD GPU needs the free or contrib build (--license free or contrib)"
@@ -1518,9 +1573,55 @@ def license_mode(a=None) -> str:
     return st.get("license") or ("contrib-icpx" if st.get("nonfree") else "contrib")
 
 
+def new_process_group() -> dict:
+    """Popen's arguments for a program started in a process group of its own (the server and the engine it starts),
+    so end_process_group ends them together."""
+    if WIN:
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}  # type: ignore[attr-defined]
+    return {"start_new_session": True}
+
+
+def end_process_group(proc) -> None:
+    """Ends a program started with new_process_group and what it started: SIGTERM to the group, SIGKILL after a minute;
+    on Windows the whole tree at once (taskkill /T /F)."""
+    if WIN:
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=60)
+        proc.wait()
+        return
+    try:
+        os.killpg(proc.pid, 15)
+    except ProcessLookupError:                         # the server and its engine have ended already
+        return
+    try:
+        proc.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, 9)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+
+
+def packaged_engine_dir() -> Path:
+    """The installed engine's folder: the PACKAGED record's (relative to this folder in the Windows 7z, which can be
+    unpacked anywhere), else engine/ next to this file."""
+    return ROOT / PACKAGED["engine"] if PACKAGED else ROOT / "engine"
+
+
+def engine_tool(*args: str) -> str:
+    """strata-device's output for `args` (--list-devices, --cpu): where setup has no sysfs or /proc to read (Windows),
+    the engine reports the GPUs and the CPU itself."""
+    exe = packaged_engine_dir() / ("strata-device.exe" if WIN else "strata-device")
+    r = subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise subprocess.SubprocessError((r.stderr or r.stdout).strip() or f"{exe.name} {' '.join(args)} failed")
+    return r.stdout
+
+
 def packaged_engine() -> dict:
     """The installed package's engine record (BUILD.json): its license, NVIDIA architectures and library folders."""
-    eng = Path(PACKAGED["engine"]) if PACKAGED else ROOT / "engine"
+    eng = packaged_engine_dir()
     try:
         meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -2212,7 +2313,10 @@ def budget_choice(model, ram, asked) -> float:
 
 def memlock_gib() -> float:
     """The RAM (GiB) this user may lock (ulimit -l): the engine locks its resident copy of the experts so the OS does
-    not swap it out; with a lower limit the copy stays unlocked (the engine says so)."""
+    not swap it out; with a lower limit the copy stays unlocked (the engine says so).  Windows has no such limit: the
+    engine raises its working set's minimum instead."""
+    if WIN:
+        return float("inf")
     import resource
     soft = resource.getrlimit(resource.RLIMIT_MEMLOCK)[0]
     return float("inf") if soft == resource.RLIM_INFINITY else soft / 2 ** 30
@@ -2803,6 +2907,25 @@ def saved_calibration(cfg: dict) -> dict | None:
     return (load_settings().get("calibration") or {}).get(hardware_key(cfg))
 
 
+def repoint_engine(cfg_path: Path, cfg: dict) -> dict:
+    """Windows: the 7z is unpacked anywhere, a new release in a folder of its own, so a config's engine and image
+    encoders are this program folder's: one another release wrote is pointed here on every start (the settings and the
+    model files, in the user's folders, stay as they are)."""
+    if not (WIN and PACKAGED):
+        return cfg
+    eng = packaged_engine_dir()
+    changed = False
+    for part in (cfg, cfg.get("vision"), (cfg.get("vision") or {}).get("fallback")):
+        if isinstance(part, dict) and part.get("exe"):
+            new = str(eng / Path(part["exe"]).name)
+            if part["exe"] != new:
+                part["exe"] = new
+                changed = True
+    if changed:
+        write_config(cfg_path, cfg)
+    return cfg
+
+
 def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     """Configs written before v0.1.13 read prompts in fixed 2048-token chunks; the engine now picks the chunk
     itself (`--prefill auto`: up to 32768, as the free VRAM allows - about 2x faster on long prompts)."""
@@ -2972,7 +3095,8 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
           layer_split=None, keep=None) -> int:
     """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab,
     --vram-reserve-mib)."""
-    cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
+    cfg = repoint_engine(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
+    cfg = upgrade_config(cfg_path, cfg)
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
     if missing:
         fail(f"{cfg_path.name} refers to missing files: {missing[0]}", "run it again with --setup to repair")
@@ -3086,7 +3210,7 @@ def warm_up(cfg_path: Path) -> None:
     with open(log, "w", encoding="utf-8") as out:
         proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config",
                                  str(cfg_path), "--port", str(port)], stdout=out, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
+                                stdin=subprocess.DEVNULL, **new_process_group())
         try:
             deadline = time.time() + 900
             while True:
@@ -3117,18 +3241,7 @@ def warm_up(cfg_path: Path) -> None:
         except (RuntimeError, OSError, ValueError) as e:
             warn(f"the warm-up did not finish ({e}): the first request will take longer")
         finally:
-            try:
-                os.killpg(proc.pid, 15)
-            except ProcessLookupError:                 # the server and its engine have ended already
-                pass
-            try:
-                proc.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(proc.pid, 9)
-                except ProcessLookupError:
-                    pass
-                proc.wait()
+            end_process_group(proc)
 
 
 # upstream #629: the run config's keys setup writes itself (and rewrites on every setup run); any other key is the
@@ -3350,7 +3463,7 @@ def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
     step(4, "the Strata engine")
     if PACKAGED:                                       # the package's: nothing is compiled
         llama = ROOT / "third_party" / "main" / "llama.cpp"   # gguf-py, for the tools below
-        eng = Path(PACKAGED["engine"])
+        eng = packaged_engine_dir()
         meta = packaged_engine()
         enc = "vulkan"
         # the engine's SYCL runtime, and oneMKL's folder when it is installed (oneMath opens its backend at run time;
@@ -3870,12 +3983,12 @@ def main() -> int:
         x = gpu_info(i)
         ok(f"then GPU {i}: {x['name']}, {x['vram_gb']:.0f} GB VRAM, PCI {x['pci']} (layer split, "
            f"{a.layer_split or 'auto'})")
-    if gpu.get("vendor") == "amd" and not os.access("/dev/kfd", os.R_OK | os.W_OK):
+    if not WIN and gpu.get("vendor") == "amd" and not os.access("/dev/kfd", os.R_OK | os.W_OK):
         fail("no access to the GPU's compute device (/dev/kfd)",
              "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
     if PACKAGED:                                       # the GPU makers' packages the package only suggests
         check_runtime({x["vendor"] for x in chosen} | {gpu_info(i)["vendor"] for i in sel[1:]})
-    if gpu["render"] is None or not os.access(gpu["render"], os.R_OK | os.W_OK):
+    if not WIN and (gpu["render"] is None or not os.access(gpu["render"], os.R_OK | os.W_OK)):
         fail(f"no access to the GPU ({gpu['render'] or 'no render node'})",
              "NVIDIA's driver is not loaded (nvidia-smi says why)" if gpu.get("vendor") == "nvidia" else
              "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
