@@ -6,9 +6,9 @@ project(XeStrata LANGUAGES CXX)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT WIN32)
   message(FATAL_ERROR "XeStrata supports Linux and the experimental Windows port")
 endif()
-# On Windows the engine builds with AdaptiveCpp (the default there) or with intel/llvm built with
-# third_party/main/intel-llvm/patches (-DSTRATA_ADAPTIVECPP=OFF, experimental: AMD GPUs through HIP)
-option(STRATA_ADAPTIVECPP "Build the SYCL engine with AdaptiveCpp (experimental Windows port)" ${WIN32})
+# The engine builds with intel/llvm (third_party/main/intel-llvm/patches; on Windows AMD GPUs through HIP).  The
+# AdaptiveCpp port of the Windows engine stays in the tree but out of the default build (-DSTRATA_ADAPTIVECPP=ON)
+option(STRATA_ADAPTIVECPP "Build the SYCL engine with AdaptiveCpp (experimental Windows port)" OFF)
 set(STRATA_UPSTREAM_VERSION "0.1.43")
 set(STRATA_UPSTREAM_COMMIT "7695859")
 # XeStrata's version follows the upstream version it has integrated, marked "xe" so it is not taken for upstream's.

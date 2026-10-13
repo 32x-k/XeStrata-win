@@ -101,7 +101,7 @@ Windows では、intel/llvm を HIP のターゲットだけでビルドし、Xe
   ROCm の場所は `UR_HIP_ROCM_DIR` と `UR_HIP_LIB_DIR` で渡します。
 - デバイスライブラリ: SDK のものは intel/llvm より新しい LLVM のビットコードで読めないので、ROCm 7.2 のもの（Linux の ROCm の `amdgcn/bitcode`）を使います。
   Windows のデバイスコードは wchar_t が 2 バイトなので、`tools/windows/device_libs_wchar.py` で `wchar_size` のフラグを 2 に書き換えてから、`STRATA_ROCM_DEVICE_LIBS` で渡します。
-- XeStrata は `-DSTRATA_ADAPTIVECPP=OFF -DSTRATA_LICENSE=free -DSTRATA_HIP_ARCHS=<GPU>` で構成します。`STRATA_ROCM_ROOT` に SDK を渡すと、oneMath の rocBLAS のバックエンドもビルドされます（`third_party/main/oneMath/patches/windows-gnu-driver.patch` を CMake が当てます）。
+- XeStrata は `-DSTRATA_LICENSE=free -DSTRATA_HIP_ARCHS=<GPU>` で構成します（AdaptiveCpp の版は既定ではビルドせず、`-DSTRATA_ADAPTIVECPP=ON` で選びます）。`STRATA_ROCM_ROOT` に SDK を渡すと、oneMath の rocBLAS のバックエンドもビルドされます（`third_party/main/oneMath/patches/windows-gnu-driver.patch` を CMake が当てます）。
 - 実行時は、intel/llvm の `install/bin`、oneMath の DLL（ビルドの `bin`）、SDK の `bin` を `PATH` に置き、`ONEAPI_DEVICE_SELECTOR=hip:0` で GPU を選びます。
 
 ### contrib-llvm 用のビルド（CUDA）

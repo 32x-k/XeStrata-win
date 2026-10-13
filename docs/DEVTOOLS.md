@@ -101,7 +101,7 @@ On Windows intel/llvm can be built with the HIP target alone, and XeStrata's fre
   ROCm's place goes in `UR_HIP_ROCM_DIR` and `UR_HIP_LIB_DIR`.
 - Device libraries: the SDK's are bitcode of a newer LLVM than intel/llvm reads, so ROCm 7.2's are used (a Linux ROCm's `amdgcn/bitcode`).
   Windows device code has a 2-byte wchar_t: `tools/windows/device_libs_wchar.py` rewrites their `wchar_size` flag to 2, and `STRATA_ROCM_DEVICE_LIBS` gives them to the build.
-- Configure XeStrata with `-DSTRATA_ADAPTIVECPP=OFF -DSTRATA_LICENSE=free -DSTRATA_HIP_ARCHS=<GPU>`; with the SDK in `STRATA_ROCM_ROOT` oneMath's rocBLAS backend is built too (CMake applies `third_party/main/oneMath/patches/windows-gnu-driver.patch`).
+- Configure XeStrata with `-DSTRATA_LICENSE=free -DSTRATA_HIP_ARCHS=<GPU>` (the AdaptiveCpp port is out of the default build; `-DSTRATA_ADAPTIVECPP=ON` chooses it); with the SDK in `STRATA_ROCM_ROOT` oneMath's rocBLAS backend is built too (CMake applies `third_party/main/oneMath/patches/windows-gnu-driver.patch`).
 - At run time put intel/llvm's `install/bin`, oneMath's DLLs (the build's `bin`) and the SDK's `bin` on `PATH`, and choose the GPU with `ONEAPI_DEVICE_SELECTOR=hip:0`.
 
 ### The contrib-llvm build (CUDA)
