@@ -25,6 +25,15 @@ The contrib-llvm build (below) runs on NVIDIA GPUs as well, through the same ker
 - A feature some devices lack (XMX, large GRF mode, a SYCL extension) is checked before use, with a working fallback.
 - Check a change on a smaller configuration as well: on the B70 with `STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1` (the memory, the largest allocation and the matrix engines of a small card) and fewer CPU threads; at milestones also on the processor's own graphics (the UHD 770, a check only: start and a short answer). Mark what was not checked `unverified`.
 
+## Operating systems: Linux (main) and Windows
+
+Linux is the main platform: development, tests, measurements and the packages are on Linux.
+Windows is a target as well, built natively for the MSVC ABI with intel/llvm's clang.
+
+- Host code that differs between the two keeps a `#if defined(_WIN32)` branch beside the Linux one, as upstream does, or goes through `src/platform/`.
+- A change to the C++ code is also compiled for Windows on Linux with the cross build ([docs/DEVTOOLS.md](docs/DEVTOOLS.md#windows-cross-build)): at least the files it touches, and the whole build, linked, when dev is integrated. It must compile and link with no new warnings.
+- Running on Windows is checked only at milestones; until then a report marks it `unverified`.
+
 ## Free and non-free builds (Debian main)
 
 XeStrata builds in three modes, chosen by the CMake option `STRATA_LICENSE`, after the Debian archive's areas:
