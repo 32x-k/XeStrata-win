@@ -815,6 +815,7 @@ bool finish_capture(strata::gpu::Stream cs, bool ok, strata::gpu::Graph*& exec, 
 }  // namespace
 
 bool MtpDrafter::capture_prefill(int T, std::string& err) {
+    if (T < 1 || T >= (int) std::size(prefill_exec_)) { err = "mtp: no prefill graph for " + std::to_string(T) + " rows"; return false; }
     if (prefill_exec_[T]) return true;
     using namespace strata::kernels;
     if (!strata::gpu::begin_capture(cs_)) { err = "mtp: begin capture"; return false; }
@@ -826,6 +827,7 @@ bool MtpDrafter::capture_prefill(int T, std::string& err) {
 }
 
 bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
+    if (T < 1 || T >= (int) std::size(prefill_dev_exec_)) { err = "mtp: no prefill graph for " + std::to_string(T) + " rows"; return false; }
     if (prefill_dev_exec_[T]) return true;
     if (!strata::gpu::begin_capture(cs_)) { err = "mtp: begin capture"; return false; }
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T); tok_/step_/pos_ filled before launch
