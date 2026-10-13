@@ -62,28 +62,49 @@ A change that does not meet them, a pull request among others, does not go in as
 
 ## Licenses
 
-XeStrata is under the LGPL, version 3 or later (`COPYING.LESSER`, `COPYING`); copyright and MIT notices are in `NOTICE`.
-Keep the MIT notice of the parts that come from Strata.
+XeStrata as a whole is under the LGPL, version 3 or later (`COPYING.LESSER`, `COPYING`); copyright and license notices are in `NOTICE`.
 `NOTICE` also grants an additional permission (GPL version 3, section 7): XeStrata linked with a GPU or CPU maker's math or compute library and its runtime libraries (oneMKL, cuBLAS, the CUDA runtime) may be conveyed.
+
+Each file carries the license of the code in it, by where that code comes from:
+
+- XeStrata's own: a file written for XeStrata is under the LGPL, with XeStrata's copyright only.
+- Mixed: a file from a project under a permissive license (Strata, ggml / llama.cpp: MIT) that XeStrata has changed, or a file of XeStrata's with code transcribed from such a project (the kernels in `src/` that follow ggml, for example).
+  The original code keeps its copyright and license; XeStrata's changes and the file as a whole are under the LGPL. The file names both copyright holders and both licenses, and keeps the original notice comment.
+- Unchanged: a file from such a project that XeStrata has not changed (Strata's files as upstream has them, upstream's records in `bench/results`, upstream's data files) keeps its own license and copyright only, without XeStrata's line.
+- A file is changed when its content, apart from the SPDX header XeStrata adds, differs from the upstream version XeStrata has integrated (`STRATA_UPSTREAM_VERSION`). An upstream sync that brings a file back to upstream's content makes it unchanged again; a change of XeStrata's to an unchanged file makes it mixed.
+- Exceptions: XeStrata's changes to oneMath (below) and its patches to intel/llvm (`third_party/main/intel-llvm/patches/`, Apache-2.0 WITH LLVM-exception) stay under those projects' licenses, even when MistVVK writes them.
+
 Material from other projects goes into `third_party/`, one folder per project with its license text, and is listed in that folder's README:
 
 - `third_party/main/<project>/`: free software (what Debian main would take), kept under its own license. XeStrata may build and run with it.
-- Code transcribed from such a project into XeStrata's own sources (the kernels in `src/` that follow ggml, for example) is part of XeStrata under the LGPL, with the original notice kept in a comment.
 - `third_party/nonfree/<project>/`: anything that is not free software.
 - XeStrata's changes to oneMath are commits in its fork ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), branch `xestrata`: oneMath's commit 6ff3a43 with XeStrata's changes on it, and oneMath's `develop` merged into it, up to 1308c5e), under oneMath's license (Apache-2.0), not the LGPL, even when MistVVK writes them; CMake fetches a tag of it. In each file a change touches, it keeps the Apache-2.0 header and adds a line saying who changed what (`Modified 2026 by MistVVK and the XeStrata contributors: ...`); a new file carries XeStrata's copyright and the Apache-2.0 header. The changes are listed in `third_party/main/README.md`.
 
 XeStrata must build, run and pass its tests without `third_party/nonfree/`: whatever is there stays optional and can be removed by deleting the folder.
 
-Every file under the LGPL starts with its copyright holders and license in SPDX form (the [REUSE](https://reuse.software) specification), in the file's comment syntax:
+Every file starts with its copyright holders and license in SPDX form (the [REUSE](https://reuse.software) specification), in the file's comment syntax.
+XeStrata's own file:
 
 ```cpp
-// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 ```
 
-- A file that came from Strata has both lines; a file new in XeStrata has only the XeStrata line.
-- A file with code transcribed from ggml / llama.cpp adds `SPDX-FileCopyrightText: 2023-2026 The ggml authors` and keeps its MIT notice comment.
+A mixed file (one from Strata that XeStrata has changed; a file with code transcribed from ggml / llama.cpp adds `SPDX-FileCopyrightText: 2023-2026 The ggml authors` instead of or besides Strata's line):
+
+```cpp
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+```
+
+An unchanged file from Strata:
+
+```cpp
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-License-Identifier: MIT
+```
+
 - Files that cannot carry a comment (data, images, JSON) are covered in `REUSE.toml`; the license texts are in `LICENSES/`.
 - `reuse lint` must pass.
 
