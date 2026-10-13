@@ -1,0 +1,41 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+hip-device-libs-sqrt: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+The driver took a ROCm device library directory as valid only with oclc_correctly_rounded_sqrt_on.bc and _off.bc,
+which newer ROCm releases no longer ship (the HIP SDK for Windows of ROCm 7.12, for example): every AMD GPU compile
+then failed with "cannot find ROCm device library".  Both files or neither are accepted, and the control library
+is linked only where it exists.
+---
+diff --git a/clang/include/clang/Driver/RocmInstallationDetector.h b/clang/include/clang/Driver/RocmInstallationDetector.h
+index 046143aa8..e98a5b4b2 100644
+--- a/clang/include/clang/Driver/RocmInstallationDetector.h
++++ b/clang/include/clang/Driver/RocmInstallationDetector.h
+@@ -160,7 +160,10 @@ private:
+   bool allGenericLibsValid() const {
+     return !OCML.empty() && !OCKL.empty() && !OpenCL.empty() &&
+            WavefrontSize64.isValid() && FiniteOnly.isValid() &&
+-           UnsafeMath.isValid() && CorrectlyRoundedSqrt.isValid();
++           UnsafeMath.isValid() &&
++           // ROCm 7.12's device libraries dropped oclc_correctly_rounded_sqrt_*: both or neither
++           (CorrectlyRoundedSqrt.isValid() ||
++            (CorrectlyRoundedSqrt.On.empty() && CorrectlyRoundedSqrt.Off.empty()));
+   }
+ 
+   void scanLibDevicePath(llvm::StringRef Path);
+diff --git a/clang/lib/Driver/ToolChains/AMDGPU.cpp b/clang/lib/Driver/ToolChains/AMDGPU.cpp
+index 50d160717..032a00b04 100644
+--- a/clang/lib/Driver/ToolChains/AMDGPU.cpp
++++ b/clang/lib/Driver/ToolChains/AMDGPU.cpp
+@@ -1055,7 +1055,8 @@ RocmInstallationDetector::getCommonBitcodeLibs(
+     AddBCLib(getOCKLPath(), false);
+   AddBCLib(getUnsafeMathPath(Pref.UnsafeMathOpt || Pref.FastRelaxedMath));
+   AddBCLib(getFiniteOnlyPath(Pref.FiniteOnly || Pref.FastRelaxedMath));
+-  AddBCLib(getCorrectlyRoundedSqrtPath(Pref.CorrectSqrt));
++  if (CorrectlyRoundedSqrt.isValid())
++    AddBCLib(getCorrectlyRoundedSqrtPath(Pref.CorrectSqrt));
+   AddBCLib(getWavefrontSize64Path(Pref.Wave64));
+   AddBCLib(LibDeviceFile);
+   auto ABIVerPath = getABIVersionPath(Pref.ABIVer);

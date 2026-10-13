@@ -1,0 +1,43 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+hip-windows-comgr: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+On Windows the HIP adapter's CMake imported AMD's code object manager by its Linux shared object
+(libamd_comgr.so as IMPORTED_LOCATION), and the generate step failed with "IMPORTED_IMPLIB not set for imported
+target amd_comgr".  The HIP runtime beside it already takes amdhip64.lib on Windows: comgr takes amd_comgr.lib the
+same way.
+---
+diff --git a/unified-runtime/source/adapters/hip/CMakeLists.txt b/unified-runtime/source/adapters/hip/CMakeLists.txt
+index 88ac87dbc..53834eb75 100644
+--- a/unified-runtime/source/adapters/hip/CMakeLists.txt
++++ b/unified-runtime/source/adapters/hip/CMakeLists.txt
+@@ -145,12 +145,21 @@ if("${UR_HIP_PLATFORM}" STREQUAL "AMD")
+         endif()
+ 
+         add_library(amd_comgr SHARED IMPORTED GLOBAL)
+-        set_target_properties(
+-        amd_comgr PROPERTIES
+-            IMPORTED_LOCATION                    "${UR_HIP_LIB_DIR}/libamd_comgr.so"
+-            INTERFACE_INCLUDE_DIRECTORIES        "${HIP_HEADERS}"
+-            INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${HIP_HEADERS}"
+-        )
++        if(WIN32)
++          set_target_properties(
++          amd_comgr PROPERTIES
++              IMPORTED_IMPLIB                      "${UR_HIP_LIB_DIR}/amd_comgr.lib"
++              INTERFACE_INCLUDE_DIRECTORIES        "${HIP_HEADERS}"
++              INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${HIP_HEADERS}"
++          )
++        else()
++          set_target_properties(
++          amd_comgr PROPERTIES
++              IMPORTED_LOCATION                    "${UR_HIP_LIB_DIR}/libamd_comgr.so"
++              INTERFACE_INCLUDE_DIRECTORIES        "${HIP_HEADERS}"
++              INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${HIP_HEADERS}"
++          )
++        endif()
+         target_link_libraries(${TARGET_NAME} PUBLIC amd_comgr)
+         target_compile_definitions(${TARGET_NAME} PRIVATE SYCL_ENABLE_KERNEL_FUSION)
+     endif(UR_ENABLE_COMGR)
