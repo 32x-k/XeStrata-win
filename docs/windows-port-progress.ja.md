@@ -612,3 +612,30 @@ page fileをC:の固定40〜48 GiB（初期40,960 MiB、最大49,152 MiB）に�
 profileでcacheを埋める間に、空きRAMが200 MiB前後まで下がりました。Windows用の`madvise`互換関数が`MADV_DONTNEED`を何もしない実装で、VRAMへ写したexpertのmapped pageがworking setに残り続けたためです。`MADV_DONTNEED`を`VirtualUnlock`（lockしていないpageをworking setから外し、file cacheのstandbyへ戻す）で実装し、`FileExpertSource::release`をWindowsで実装し、profileのfillで1個写すごとに手放すようにしました。Linuxの動作は変えていません。最小の空きRAMは18.4 GiBを保ちました。
 
 hello入力、`--native`、cache auto（26.31 GiB）、`--expert-profile`、`--prefill auto`、`--spec 4 --spec-min-p 0.5`、MTPで、Decodeは35.86、36.16 tok/s、Prefillは13.74、13.67 tok/s、hitは96.6%（CPU expertsは1層あたり1.00個）でした。生成した41 tokenは同じです。191 tokenのpromptでは、Prefill 81.73 tok/s、Decode 40.73 tok/sでした。
+
+<a id="intel-llvm-windows"></a>
+## 2026-10-13: intel/llvmでWindowsのengineをbuild
+
+### toolchain
+
+XeStrataのpatch 17本を当てたintel/llvm v7.1.1を、WindowsでHIP targetだけ（MSVC、ROCmのWindows HIP SDK）でbuildしました（22並列で約34分）。必要だったのは次のとおりです。
+
+- 新しいpatch 3本（`third_party/main/intel-llvm/patches/`、どれも17本の後に当たり、Linuxの動作は変えません）：`hip-windows-comgr`（HIP adapterのCMakeがcomgrをWindowsの`amd_comgr.lib`で読み込む）、`hip-device-libs-sqrt`（`oclc_correctly_rounded_sqrt_*.bc`のないdevice libraryを受け付ける）、`hip-windows-luid`（HIP adapterがWindowsでdeviceのLUIDを答える）。
+- buildの設定：`/utf-8`（MSVCがUTF-8のsourceを既定のCP932として読み、構文errorになった）、`LLVM_ENABLE_DIA_SDK=OFF`（Build ToolsにATLがない）、`SYCL_ENABLE_BACKENDS=hip`。
+- device library：WindowsのSDKのものはLLVM 24のbitcodeでintel/llvm（LLVM 22）には読めず、ROCm 7.2.3のもの（Linux、`wchar_size` 4）はWindowsのdevice code（`wchar_size` 2）とlinkで衝突します。ROCm 7.2.3のものの`wchar_size`の印だけを2に書き換えて使いました（libraryは`wchar_t`を使いません）。
+
+`sycl-ls`はR9700（gfx1201）と890M（gfx1150）をHIP adapterから列挙し、R9700は`ext_oneapi_graph`、`ext_intel_free_memory`、queue profiling tagを持ちます。最小のSYCL testでは、kernel → D2H → barrier待ちの順序が20回とも正しく（AdaptiveCppのnative in-orderでは古い値が返った）、続けて投入したkernelは1個27 µs（AdaptiveCppは38 µs）、40 kernelのcommand graphは1 kernel 9.4 µsで正しく再生されました。
+
+### engine
+
+CMakeの「WindowsはAdaptiveCpp必須」を外し、`-DSTRATA_ADAPTIVECPP=OFF`でintel/llvm（free、`STRATA_HIP_ARCHS=gfx1201`、oneMathなし）としてbuildできるようにしました。Windowsの既定は引き続きAdaptiveCppです。engineはLinuxと同じ経路（token graph、doorbellのあるverify window）でそのまま動き、生成した41 tokenはAdaptiveCpp版と同じでした（logitsは最大0.94異なる。compilerとkernelの経路の違い）。
+
+本番の構成でMTPの下書きが1回27 msかかりました。expert cacheを使い切った後に確保した下書き用のhead（178 MiB）が、WDDMによりsystem memoryへ置かれ、PCIe越しに読まれていたためです。HIPが報告する空き（32,460 MiB）より、DXGIのlocal memory予算（31,770 MiB）が小さいことが原因です。`strata::platform::gpu_local_memory_budget`でDXGIの予算と使用量をadapterのLUIDで読み、`mem_info`の空きを「予算 − 使用量」とcommitの上限で抑えるようにしました（intel/llvm経路。AdaptiveCppではLUIDが得られないためcommitの上限だけ）。cacheは19,782 slots（25.47 GiB）になり、下書きは1回1.8 msです。
+
+| 本番の構成（`--native`、cache、profile、`--prefill auto`、`--spec 4`、MTP） | Decode | Prefill |
+| --- | ---: | ---: |
+| intel/llvm、hello（41 token） | 49.57〜51.19 tok/s | 13.9〜15.1 tok/s |
+| intel/llvm、191 tokenのprompt | 60.46 tok/s | 75.83 tok/s |
+| AdaptiveCpp、hello | 38.79 tok/s | 14.36 tok/s |
+
+unverified：Linuxのtoolchain buildでの新しいpatch 3本（17本の後に当たることは確認）、Linuxのfreeとcontrib-llvmのengine、890Mでのintel/llvm版、長いcontext。toolchainのbuild手順とdevice libraryの書き換えはGit対象外の`.tools/intel-llvm-win/`のscriptで行いました。

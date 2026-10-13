@@ -612,3 +612,30 @@ With a fixed 40-48 GiB page file on C: (initial 40,960 MiB, maximum 49,152 MiB),
 While the profile filled the cache, the free RAM fell to about 200 MiB. The Windows stand-in for `madvise` did nothing for `MADV_DONTNEED`, so the mapped pages of the experts copied to VRAM stayed in the working set. `MADV_DONTNEED` is now `VirtualUnlock` (which takes pages that are not locked out of the working set and back to the file cache's standby list), `FileExpertSource::release` is implemented on Windows, and the profile fill releases each expert once it is copied. Linux's behaviour is unchanged. The free RAM stayed at 18.4 GiB or more.
 
 On the hello input with `--native`, cache auto (26.31 GiB), `--expert-profile`, `--prefill auto`, `--spec 4 --spec-min-p 0.5` and MTP, Decode was 35.86 and 36.16 tok/s and Prefill 13.74 and 13.67 tok/s, with 96.6% hits (1.00 CPU expert per layer). The 41 generated tokens are the same. With the 191-token prompt, Prefill was 81.73 tok/s and Decode 40.73 tok/s.
+
+<a id="intel-llvm-windows"></a>
+## 2026-10-13: the Windows engine built with intel/llvm
+
+### The toolchain
+
+intel/llvm v7.1.1 with XeStrata's 17 patches was built on Windows with the HIP target only (MSVC, ROCm's HIP SDK for Windows), in about 34 minutes on 22 jobs. It needed:
+
+- Three new patches (`third_party/main/intel-llvm/patches/`; each applies after the 17 and changes nothing on Linux): `hip-windows-comgr` (the HIP adapter's CMake imports comgr as Windows' `amd_comgr.lib`), `hip-device-libs-sqrt` (device library folders without `oclc_correctly_rounded_sqrt_*.bc` are accepted), `hip-windows-luid` (the HIP adapter answers the device LUID on Windows).
+- Build settings: `/utf-8` (MSVC read the UTF-8 sources as the default CP932 and failed with syntax errors), `LLVM_ENABLE_DIA_SDK=OFF` (the Build Tools have no ATL), `SYCL_ENABLE_BACKENDS=hip`.
+- Device libraries: the SDK's are LLVM 24 bitcode, which intel/llvm (LLVM 22) cannot read, and ROCm 7.2.3's (Linux, `wchar_size` 4) clash at link time with Windows device code (`wchar_size` 2). ROCm 7.2.3's were used with only their `wchar_size` flag rewritten to 2 (the libraries do not use `wchar_t`).
+
+`sycl-ls` lists the R9700 (gfx1201) and the 890M (gfx1150) through the HIP adapter, the R9700 with `ext_oneapi_graph`, `ext_intel_free_memory` and queue profiling tags. In a minimal SYCL test, kernel -> D2H -> barrier wait kept its order in all 20 rounds (AdaptiveCpp's native in-order returned stale values), back-to-back kernels cost 27 µs each (AdaptiveCpp: 38 µs), and a 40-kernel command graph replayed correctly at 9.4 µs per kernel.
+
+### The engine
+
+CMake no longer requires AdaptiveCpp on Windows: `-DSTRATA_ADAPTIVECPP=OFF` builds with intel/llvm (free, `STRATA_HIP_ARCHS=gfx1201`, no oneMath). AdaptiveCpp stays the Windows default. The engine runs Linux's own paths (the token graph, verify windows with doorbells) as they are, and generated the same 41 tokens as the AdaptiveCpp build (logits differ by up to 0.94: another compiler and kernel path).
+
+In the full configuration an MTP draft first took 27 ms. The draft head (178 MiB), allocated after the expert cache had taken the free VRAM, was placed in system memory by WDDM and read over PCIe: DXGI's local memory budget (31,770 MiB) is smaller than the free memory HIP reports (32,460 MiB). `strata::platform::gpu_local_memory_budget` now reads DXGI's budget and use by the adapter's LUID, and `mem_info` bounds the free figure by the budget less the use as well as by the commit (the intel/llvm path; AdaptiveCpp gives no LUID, so only the commit bound there). The cache takes 19,782 slots (25.47 GiB) and a draft takes 1.8 ms.
+
+| Full configuration (`--native`, cache, profile, `--prefill auto`, `--spec 4`, MTP) | Decode | Prefill |
+| --- | ---: | ---: |
+| intel/llvm, hello (41 tokens) | 49.57-51.19 tok/s | 13.9-15.1 tok/s |
+| intel/llvm, the 191-token prompt | 60.46 tok/s | 75.83 tok/s |
+| AdaptiveCpp, hello | 38.79 tok/s | 14.36 tok/s |
+
+Unverified: the three new patches in a Linux toolchain build (they apply after the 17), the Linux free and contrib-llvm engines, the intel/llvm build on the 890M, long contexts. The toolchain's build steps and the device library rewrite were done with scripts in `.tools/intel-llvm-win/`, outside Git.

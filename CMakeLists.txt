@@ -6,10 +6,9 @@ project(XeStrata LANGUAGES CXX)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT WIN32)
   message(FATAL_ERROR "XeStrata supports Linux and the experimental Windows port")
 endif()
+# On Windows the engine builds with AdaptiveCpp (the default there) or with intel/llvm built with
+# third_party/main/intel-llvm/patches (-DSTRATA_ADAPTIVECPP=OFF, experimental: AMD GPUs through HIP)
 option(STRATA_ADAPTIVECPP "Build the SYCL engine with AdaptiveCpp (experimental Windows port)" ${WIN32})
-if(WIN32 AND NOT STRATA_ADAPTIVECPP)
-  message(FATAL_ERROR "The experimental Windows port requires -DSTRATA_ADAPTIVECPP=ON")
-endif()
 set(STRATA_UPSTREAM_VERSION "0.1.40.2")
 set(STRATA_UPSTREAM_COMMIT "e8ca9af")
 # XeStrata's version follows the upstream version it has integrated, marked "xe" so it is not taken for upstream's.
@@ -210,6 +209,9 @@ add_library(strata_platform STATIC src/platform/memory.cpp src/platform/direct_f
 target_include_directories(strata_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 find_package(Threads REQUIRED)
 target_link_libraries(strata_platform PUBLIC strata_warnings Threads::Threads)
+if(WIN32)
+  target_link_libraries(strata_platform PUBLIC dxgi)   # the GPU's memory budget (gpu_local_memory_budget)
+endif()
 
 # `ngram.cpp` is the PLE hash and table geometry the GPU PLE block will share with the reader.
 add_library(strata_ngram STATIC src/kernels/ngram.cpp src/ngram/ple_reader.cpp)

@@ -70,6 +70,40 @@ bool gpu_shared_memory_budget(const void*, uint64_t& budget, uint64_t& usage, st
     return false;
 }
 
+bool gpu_local_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why) {
+    budget = usage = 0;
+    if (luid == nullptr) {
+        why = "no LUID";
+        return false;
+    }
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**) &factory)) || factory == nullptr) {
+        why = "CreateDXGIFactory1 failed";
+        return false;
+    }
+    bool found = false;
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT i = 0; !found && factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(adapter->GetDesc1(&desc)) && std::memcmp(&desc.AdapterLuid, luid, sizeof desc.AdapterLuid) == 0) {
+            IDXGIAdapter3* a3 = nullptr;
+            if (SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**) &a3)) && a3 != nullptr) {
+                DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+                if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+                    budget = info.Budget;
+                    usage = info.CurrentUsage;
+                    found = true;
+                }
+                a3->Release();
+            }
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    if (!found) why = "no DXGI adapter with this LUID answered";
+    return found;
+}
+
 uint64_t total_physical_memory() {
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof ms;
@@ -91,6 +125,12 @@ void unlock_resident(void* p, uint64_t bytes) {
 }
 
 bool gpu_shared_memory_budget(const void*, uint64_t& budget, uint64_t& usage, std::string& why) {
+    budget = usage = 0;
+    why = "DXGI is Windows-only";
+    return false;
+}
+
+bool gpu_local_memory_budget(const void*, uint64_t& budget, uint64_t& usage, std::string& why) {
     budget = usage = 0;
     why = "DXGI is Windows-only";
     return false;

@@ -29,6 +29,13 @@ void unlock_resident(void* p, uint64_t bytes);
 /// `why` says so) when the query is not possible - always elsewhere than Windows.
 bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why);
 
+/// Windows: the GPU's local memory (VRAM) budget the OS gives this process and this process's use of it, from DXGI
+/// (QueryVideoMemoryInfo, DXGI_MEMORY_SEGMENT_GROUP_LOCAL) for the adapter whose LUID is the 8 bytes at `luid`
+/// (sycl::ext::intel::info::device::luid).  Allocations past the budget are not refused: WDDM places them in system
+/// memory, which the GPU then reads over PCIe.  False (and `why` says so) when the query is not possible - always
+/// elsewhere than Windows.
+bool gpu_local_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why);
+
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
 

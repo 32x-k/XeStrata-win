@@ -107,7 +107,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Packages that came in automatically with `rocm-dev` become `apt autoremove` candidates once it is gone; mark them with `sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo`.
 - The script applies fixes the release lacks to the sources before building, as the patches in `third_party/main/intel-llvm/patches/` (`NN-<id>.patch`, in order; under intel/llvm's Apache-2.0 WITH LLVM-exception), and records their ids in `install/XESTRATA.json`.
   A build of the same release without them is offered a rebuild.
-  There are fourteen fixes now; the first twelve are not fixed in intel/llvm's `sycl` branch either (2026-10-08).
+  There are fifteen fixes now; the first twelve are not fixed in intel/llvm's `sycl` branch either (2026-10-08).
   First, the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).
   Second, the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture.
   With an executable carrying code for several architectures, a GPU older than that image did not run and a newer one ran older code.
@@ -142,6 +142,9 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Fourteenth, the driver took a ROCm device library folder without `oclc_correctly_rounded_sqrt_on.bc` and `_off.bc` for no device libraries at all.
   Newer ROCm releases (ROCm 7.12's HIP SDK for Windows, for example) no longer ship the two, so every compile for an AMD GPU failed.
   Fixed, both or neither are accepted, and the library is linked only where it exists (`hip-device-libs-sqrt`).
+  Fifteenth, the HIP adapter did not answer the device LUID (`sycl::ext::intel::info::device::luid`), which the CUDA and Level Zero adapters answer on Windows, and its device ID query returned the PCI device number (0), so a program could not find a HIP GPU's DXGI adapter.
+  On Windows a device allocation past the adapter's local memory budget is not refused but placed in system memory and read over PCIe; the engine sizes its expert cache by that budget, which it reads from DXGI by the LUID.
+  Fixed, the adapter answers `hipDeviceProp_t::luid` on Windows (an all-zero LUID, and every other system, stays unsupported; `hip-windows-luid`).
   The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).
 - On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.

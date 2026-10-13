@@ -22,15 +22,14 @@
 #include <type_traits>
 #include <vector>
 
-#if defined(STRATA_ADAPTIVECPP)
 #if defined(_WIN32)
+#include "strata/platform/memory.hpp"
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
-#else
+#elif defined(STRATA_ADAPTIVECPP)
 #include <dlfcn.h>
-#endif
 #endif
 
 namespace strata::gpu {
@@ -531,6 +530,34 @@ bool memset_async(void* dst, int value, size_t bytes, Stream s) {
     } catch (const std::exception& e) { return fail("memset_async", e); }
 }
 
+#if defined(_WIN32)
+namespace {
+// What a Windows process can still place in VRAM.  WDDM charges every device allocation against the system commit
+// limit as well (a 4 GiB hipMalloc took 4.1 GiB of commit on the R9700), so it is bounded by the commit still free,
+// 4 GiB of it left for the host allocations that follow and for the other programs.  And past the local memory
+// budget the OS gives the process an allocation is not refused but placed in system memory, which the GPU then reads
+// over PCIe (the MTP draft head, allocated after a full expert cache, took 27 ms a draft for about 1.8): bounded by
+// the budget less what the process uses, where the device reports its adapter's LUID.
+void windows_allocatable(const sycl::device& d, uint64_t& free) {
+    MEMORYSTATUSEX m{};
+    m.dwLength = sizeof m;
+    constexpr uint64_t kCommitReserve = uint64_t(4) << 30;
+    if (::GlobalMemoryStatusEx(&m))
+        free = std::min<uint64_t>(free, m.ullAvailPageFile > kCommitReserve ? m.ullAvailPageFile - kCommitReserve : 0);
+#if !defined(STRATA_ADAPTIVECPP)
+    if (!d.has(sycl::aspect::ext_intel_device_info_luid) || core::integrated_gpu(d)) return;
+    const auto luid = d.get_info<sycl::ext::intel::info::device::luid>();
+    uint64_t budget = 0, usage = 0;
+    std::string why;
+    if (platform::gpu_local_memory_budget(luid.data(), budget, usage, why))
+        free = std::min<uint64_t>(free, budget > usage ? budget - usage : 0);
+#else
+    (void) d;
+#endif
+}
+}  // namespace
+#endif
+
 bool mem_info(size_t* free_bytes, size_t* total_bytes) {
     try {
         const auto& d = rt().device();
@@ -544,14 +571,7 @@ bool mem_info(size_t* free_bytes, size_t* total_bytes) {
             free = total > g_live_bytes ? total - g_live_bytes : 0;
         }
 #if defined(_WIN32)
-        // WDDM charges every device allocation against the system commit limit as well (a 4 GiB hipMalloc took
-        // 4.1 GiB of commit on the R9700), so what can be allocated is also bounded by the commit still free.
-        // 4 GiB is left for the host allocations that follow and for the other programs.
-        MEMORYSTATUSEX m{};
-        m.dwLength = sizeof m;
-        constexpr uint64_t kCommitReserve = uint64_t(4) << 30;
-        if (::GlobalMemoryStatusEx(&m))
-            free = std::min<uint64_t>(free, m.ullAvailPageFile > kCommitReserve ? m.ullAvailPageFile - kCommitReserve : 0);
+        windows_allocatable(d, free);
 #endif
         core::apply_vram_limit(free, total);
         if (free_bytes) *free_bytes = (size_t) free;
@@ -565,6 +585,9 @@ bool mem_info(size_t* free_bytes, size_t* total_bytes) {
         uint64_t free = d.get_info<sycl::ext::intel::info::device::free_memory>();
         uint64_t total = d.get_info<sycl::info::device::global_mem_size>();
         if (core::integrated_gpu(d)) core::apply_uma_limit(free);   // its memory is the system RAM
+#if defined(_WIN32)
+        windows_allocatable(d, free);
+#endif
         core::apply_vram_limit(free, total);
         if (free_bytes) *free_bytes = (size_t) free;
         if (total_bytes) *total_bytes = (size_t) total;

@@ -1,0 +1,44 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+hip-windows-luid: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+The HIP adapter did not answer the device LUID (sycl::ext::intel::info::device::luid), which the CUDA and Level
+Zero adapters answer on Windows, and its device ID query returns the PCI device number (0) rather than the device
+ID, so a program could not find a HIP GPU's DXGI adapter.  On Windows a device allocation past the adapter's local
+memory budget is not refused but placed in system memory and read over PCIe: the engine sizes its expert cache by
+that budget, which it reads from DXGI by the LUID.  Fixed, the adapter answers hipDeviceProp_t::luid on Windows (an
+all-zero LUID, and every other system, stays unsupported).
+---
+diff --git a/unified-runtime/source/adapters/hip/device.cpp b/unified-runtime/source/adapters/hip/device.cpp
+index 9b47946..98e0110 100644
+--- a/unified-runtime/source/adapters/hip/device.cpp
++++ b/unified-runtime/source/adapters/hip/device.cpp
+@@ -917,6 +917,26 @@ UR_APIEXPORT ur_result_t UR_APICALL urDeviceGetInfo(ur_device_handle_t hDevice,
+     assert(Value >= 0);
+     return ReturnValue(Value);
+   }
++  case UR_DEVICE_INFO_LUID: {
++    // Windows only: the adapter's LUID (DXGI's AdapterLuid), as the CUDA adapter
++    // answers it, so a program can find the GPU's DXGI adapter (its memory budget)
++#if defined(_WIN32)
++    hipDeviceProp_t Props{};
++    UR_CHECK_ERROR(hipGetDeviceProperties(&Props, hDevice->get()));
++    std::array<unsigned char, 8> LUID{};
++    bool isAllZeros = true;
++    for (size_t i = 0; i < LUID.size(); ++i) {
++      LUID[i] = static_cast<unsigned char>(Props.luid[i]);
++      if (LUID[i] != 0)
++        isAllZeros = false;
++    }
++    if (isAllZeros)
++      return UR_RESULT_ERROR_UNSUPPORTED_FEATURE;
++    return ReturnValue(LUID.data(), 8);
++#else
++    return UR_RESULT_ERROR_UNSUPPORTED_FEATURE;
++#endif
++  }
+   case UR_DEVICE_INFO_UUID: {
+ #if ((HIP_VERSION_MAJOR == 5 && HIP_VERSION_MINOR >= 2) ||                     \
+      HIP_VERSION_MAJOR > 5)
