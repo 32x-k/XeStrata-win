@@ -3807,8 +3807,8 @@ def main() -> int:
     if have and a.calibrate and not (a.setup or a.check):
         targets = calibration_targets(have, a.model, a.family)
         if not targets:                                # upstream #2036: --model names a model that is not installed
-            names = ", ".join(sorted({choices_from_config(c)["model"] or c.stem for c in have}))
-            fail(f"--calibrate: {a.model or a.family} is not installed (installed: {names})",
+            installed = ", ".join(sorted({choices_from_config(c)["model"] or c.stem for c in have}))
+            fail(f"--calibrate: {a.model or a.family} is not installed (installed: {installed})",
                  "calibrate an installed model, or set this one up first without --calibrate")
         have = targets
         update_installed_engine()
