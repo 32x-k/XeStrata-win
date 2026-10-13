@@ -18,8 +18,17 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <filesystem>
 #include <type_traits>
 #include <unordered_map>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 #endif
 
 #include <algorithm>
@@ -110,6 +119,43 @@ bool blas(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, 
         return false;
     }
 }
+
+// rocBLAS ends the process (abort) at its first product on a GPU its installed kernel library has no files for (the
+// Radeon 890M, gfx1150, with ROCm's device package for that GPU not installed), which no exception or trial can
+// catch: on the HIP backend, the library
+// folder beside the rocBLAS that would be loaded (or ROCBLAS_TENSILE_LIBPATH) must name the GPU's architecture, as the
+// device reports it (info::device::version: gcnArchName, its features after ':' dropped).  Empty when it does, or when
+// it cannot be told; else why not.
+std::string rocblas_lacks(const sycl::device& dev) {
+    if (dev.get_backend() != sycl::backend::ext_oneapi_hip) return {};
+    std::string arch = dev.get_info<sycl::info::device::version>();
+    arch = arch.substr(0, arch.find(':'));
+    if (arch.rfind("gfx", 0) != 0) return {};
+    namespace fs = std::filesystem;
+    fs::path dir;
+    if (const char* env = std::getenv("ROCBLAS_TENSILE_LIBPATH"); env != nullptr && env[0] != 0) {
+        dir = env;
+    } else {
+#if defined(_WIN32)
+        char path[MAX_PATH] = {};
+        if (SearchPathA(nullptr, "rocblas.dll", nullptr, MAX_PATH, path, nullptr) == 0) return {};
+#else
+        void* h = dlopen("librocblas.so", RTLD_LAZY | RTLD_LOCAL);
+        for (const char* name : {"librocblas.so.5", "librocblas.so.4"})
+            if (h == nullptr) h = dlopen(name, RTLD_LAZY | RTLD_LOCAL);
+        Dl_info info{};
+        void* sym = h != nullptr ? dlsym(h, "rocblas_create_handle") : nullptr;
+        if (sym == nullptr || dladdr(sym, &info) == 0 || info.dli_fname == nullptr) return {};
+        const char* path = info.dli_fname;
+#endif
+        dir = fs::path(path).parent_path() / "rocblas" / "library";
+    }
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) return {};
+    for (const auto& entry : fs::directory_iterator(dir, ec))
+        if (entry.path().filename().string().find(arch) != std::string::npos) return {};
+    return "rocBLAS has no kernels for " + arch + " installed (" + dir.string() + ")";
+}
 #endif
 }  // namespace
 
@@ -122,6 +168,12 @@ void Gemm::prepare() {
     std::lock_guard<std::mutex> lock(g_mutex);
     Backend& b = g_backends[c.get_device()];
     if (!b.blas || b.ready.valid()) return;
+    if (const std::string why = rocblas_lacks(c.get_device()); !why.empty()) {
+        std::fprintf(stderr, "strata: oneMath: %s; the prompt's matrix products take XeStrata's own kernels\n",
+                     why.c_str());
+        b.blas = false;
+        return;
+    }
     b.ready = std::async(std::launch::async, [ctx = c.get_context(), dev = c.get_device()]() -> Trial {
         constexpr int64_t n = 16;
         constexpr size_t tile = (size_t) n * n;

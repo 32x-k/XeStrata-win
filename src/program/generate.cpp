@@ -2003,7 +2003,10 @@ void fatal_signal(int sig) {
 }
 void install_fatal_signals() {
 #if defined(_WIN32)
-    // Windows has no sigaction or alternate signal stack: the C runtime's handlers for the signals it has
+    // Windows has no sigaction or alternate signal stack: the C runtime's handlers for the signals it has.  An abort
+    // ends the process at once, without the C runtime's message box or Windows Error Reporting, which kept an engine
+    // that a library aborted waiting for minutes
+    (void) _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     for (const int sig : {SIGSEGV, SIGILL, SIGFPE, SIGABRT}) (void) std::signal(sig, fatal_signal);
 #else
     // an alternate stack, so a stack overflow on the main thread is reported too
