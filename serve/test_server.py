@@ -4020,6 +4020,8 @@ class ModelAliases(unittest.TestCase):
             httpd.server_close()
 
 
+@unittest.skipIf(os.name == "nt", "the fake amdgpu sysfs tree has ':' in its folder names, which Windows refuses; the "
+                                  "reader is Linux's")
 class AmdTelemetry(unittest.TestCase):
     """upstream #301 and #1733: an AMD card's readings from a fake amdgpu sysfs tree, chosen by its PCI address."""
 
