@@ -605,6 +605,24 @@ if(STRATA_ENABLE_XE)
       SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_onemath-src
       SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_onemath-subbuild)
     set(_STRATA_ONEMATH_KEY "${_strata_onemath_url}" CACHE INTERNAL "the archive the oneMath tree came from")
+    if(WIN32 AND NOT STRATA_ONEMATH_SOURCE)
+      # oneMath on Windows with intel/llvm's clang++ (a GNU-style driver) and its rocBLAS backend there, until the
+      # fork carries it (third_party/main/oneMath/patches); applied once to the extracted tree, which is outside any
+      # Git repository for the command (the ceiling)
+      find_package(Git REQUIRED)
+      set(_strata_om_patch "${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/oneMath/patches/windows-gnu-driver.patch")
+      set(_strata_om_git ${CMAKE_COMMAND} -E env "GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}/_deps" ${GIT_EXECUTABLE})
+      execute_process(COMMAND ${_strata_om_git} apply --reverse --check "${_strata_om_patch}"
+                      WORKING_DIRECTORY ${strata_onemath_SOURCE_DIR} RESULT_VARIABLE _strata_om_applied
+                      OUTPUT_QUIET ERROR_QUIET)
+      if(NOT _strata_om_applied EQUAL 0)
+        execute_process(COMMAND ${_strata_om_git} apply "${_strata_om_patch}"
+                        WORKING_DIRECTORY ${strata_onemath_SOURCE_DIR} RESULT_VARIABLE _strata_om_r)
+        if(NOT _strata_om_r EQUAL 0)
+          message(FATAL_ERROR "oneMath: ${_strata_om_patch} does not apply to ${strata_onemath_SOURCE_DIR}")
+        endif()
+      endif()
+    endif()
     add_subdirectory(${strata_onemath_SOURCE_DIR} ${CMAKE_BINARY_DIR}/onemath EXCLUDE_FROM_ALL)
     unset(CMAKE_POLICY_DEFAULT_CMP0126)
     # ROCm's device libraries for the rocBLAS backend's own GPU code, and the CUDA toolkit and PTX version for the
@@ -640,7 +658,7 @@ if(STRATA_ENABLE_XE)
     # -fsycl-targets=nvptx64-nvidia-cuda on them, which would replace the engine's own targets
     add_dependencies(strata_prefill onemath)
     target_include_directories(strata_prefill SYSTEM PRIVATE $<TARGET_PROPERTY:onemath,INTERFACE_INCLUDE_DIRECTORIES>)
-    target_link_libraries(strata_prefill PRIVATE $<TARGET_FILE:onemath>)
+    target_link_libraries(strata_prefill PRIVATE $<TARGET_LINKER_FILE:onemath>)
     target_compile_definitions(strata_prefill PRIVATE STRATA_ONEMATH=1)
   endif()
 

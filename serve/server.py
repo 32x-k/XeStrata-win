@@ -2135,7 +2135,7 @@ def child_env(cfg: dict) -> dict:
         env.setdefault("STRATA_GPU_PCI", str(cfg["gpu_pci"]))   # a --gpu for this start (setup sets it) wins
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
-        var = "LD_LIBRARY_PATH"
+        var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"   # Windows finds a program's DLLs on PATH
         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
     return env
 

@@ -126,12 +126,15 @@ function(strata_hip_choose archs targets_out opts_out)
 endfunction()
 
 # ROCm's clang (AMD's tree's, or the distribution's ROCm one: Fedora's /usr/lib64/rocm/llvm, Ubuntu's
-# /usr/lib/llvm-<N>), for HIP's CMake package (HIP_CXX_COMPILER): it links clang's runtime builtins where that compiler
-# has them, and intel/llvm's install has none, so asked with intel/llvm's clang it named a file that is not there.  The
-# newest one whose builtins exist; empty when there is none.
+# /usr/lib/llvm-<N>; on Windows the HIP SDK's under STRATA_ROCM_ROOT), for HIP's CMake package (HIP_CXX_COMPILER): it
+# links clang's runtime builtins where that compiler has them, and intel/llvm's install has none, so asked with
+# intel/llvm's clang it named a file that is not there.  The newest one whose builtins exist; empty when there is none.
 function(strata_hip_cxx out)
   file(GLOB compilers /opt/rocm/llvm/bin/clang++ /opt/rocm/lib/llvm/bin/clang++ /usr/lib64/rocm/llvm/bin/clang++
                       /usr/lib/llvm-*/bin/clang++)
+  if(WIN32 AND STRATA_ROCM_ROOT)
+    file(GLOB compilers "${STRATA_ROCM_ROOT}/lib/llvm/bin/clang++.exe" "${STRATA_ROCM_ROOT}/llvm/bin/clang++.exe")
+  endif()
   list(SORT compilers COMPARE NATURAL ORDER DESCENDING)
   foreach(cxx IN LISTS compilers)
     execute_process(COMMAND "${cxx}" -print-libgcc-file-name --rtlib=compiler-rt

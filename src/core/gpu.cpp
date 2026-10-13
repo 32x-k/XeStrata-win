@@ -558,6 +558,32 @@ void windows_allocatable(const sycl::device& d, uint64_t& free) {
 }  // namespace
 #endif
 
+bool host_pin_room(uint64_t* room, uint64_t* budget) {
+#if defined(_WIN32) && !defined(STRATA_ADAPTIVECPP)
+    try {
+        const auto& d = rt().device();
+        if (!d.has(sycl::aspect::ext_intel_device_info_luid) || core::integrated_gpu(d)) return false;
+        const auto luid = d.get_info<sycl::ext::intel::info::device::luid>();
+        uint64_t b = 0, used = 0;
+        std::string why;
+        if (!platform::gpu_shared_memory_budget(luid.data(), b, used, why)) return false;
+        // A quarter of the RAM: measured on the R9700 (28 GiB of RAM, the DXGI budget 13,372 MiB), where the engine
+        // ran with 6,750 MiB of page-locked memory mapped and its kernels faulted with 7,118 MiB, well inside the
+        // budget.  The limit is the driver's; other drivers may allow more.
+        const uint64_t quarter = platform::total_physical_memory() / 4;
+        uint64_t r = b > used ? b - used : 0;
+        if (quarter > 0) r = std::min<uint64_t>(r, quarter > used ? quarter - used : 0);
+        if (room) *room = r;
+        if (budget) *budget = b;
+        return true;
+    } catch (const std::exception& e) { return fail("host_pin_room", e); }
+#else
+    (void) room;
+    (void) budget;
+    return false;
+#endif
+}
+
 bool mem_info(size_t* free_bytes, size_t* total_bytes) {
     try {
         const auto& d = rt().device();

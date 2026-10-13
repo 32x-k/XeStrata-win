@@ -70,6 +70,11 @@ bool memset(void* dst, int value, size_t bytes);
 bool memset_async(void* dst, int value, size_t bytes, Stream s);
 
 bool mem_info(size_t* free_bytes, size_t* total_bytes);
+/// Windows: the page-locked host memory the GPU can still map: its shared (non-local) memory budget less what this
+/// process uses of it (DXGI, by the device's LUID), and no more than a quarter of the RAM in all.  Past that a
+/// page-locked allocation can succeed and the GPU then faults (hipErrorLaunchFailure).  False where it is not known
+/// (other systems, no LUID).
+bool host_pin_room(uint64_t* room, uint64_t* budget = nullptr);
 
 /// Virtual memory (sycl_ext_oneapi_virtual_mem; the Level Zero and CUDA adapters, not HIP in intel/llvm 7.1.1): one
 /// address range reserved once and backed by physical segments that can be given back to the driver and taken again,

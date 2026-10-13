@@ -1064,7 +1064,12 @@ void mem_mark(const char* where) {
     if (!on) return;
     size_t free_b = 0, total_b = 0;
     strata::gpu::mem_info(&free_b, &total_b);
-    std::fprintf(stderr, "strata trace: %lld MiB free after %s\n", (long long) (free_b >> 20), where);
+    uint64_t pin_room = 0;
+    if (strata::gpu::host_pin_room(&pin_room))
+        std::fprintf(stderr, "strata trace: %lld MiB free, %lld MiB more host memory mappable after %s\n",
+                     (long long) (free_b >> 20), (long long) (pin_room >> 20), where);
+    else
+        std::fprintf(stderr, "strata trace: %lld MiB free after %s\n", (long long) (free_b >> 20), where);
 }
 
 // ---- --serve's short reads: a short text part of a prompt (a chat's new message) goes through the verify windows when

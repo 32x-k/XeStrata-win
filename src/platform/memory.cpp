@@ -64,13 +64,10 @@ void unlock_resident(void* p, uint64_t bytes) {
         VirtualUnlock((uint8_t*) p + off, (SIZE_T) std::min(chunk, bytes - off));
 }
 
-bool gpu_shared_memory_budget(const void*, uint64_t& budget, uint64_t& usage, std::string& why) {
-    budget = usage = 0;
-    why = "DXGI adapter matching is unavailable for this SYCL backend";
-    return false;
-}
-
-bool gpu_local_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why) {
+namespace {
+// DXGI's budget and this process's use of one memory segment group of the adapter whose LUID is at `luid`
+bool dxgi_memory_budget(const void* luid, DXGI_MEMORY_SEGMENT_GROUP group, uint64_t& budget, uint64_t& usage,
+                        std::string& why) {
     budget = usage = 0;
     if (luid == nullptr) {
         why = "no LUID";
@@ -89,7 +86,7 @@ bool gpu_local_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage
             IDXGIAdapter3* a3 = nullptr;
             if (SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**) &a3)) && a3 != nullptr) {
                 DXGI_QUERY_VIDEO_MEMORY_INFO info{};
-                if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+                if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, group, &info))) {
                     budget = info.Budget;
                     usage = info.CurrentUsage;
                     found = true;
@@ -102,6 +99,15 @@ bool gpu_local_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage
     factory->Release();
     if (!found) why = "no DXGI adapter with this LUID answered";
     return found;
+}
+}  // namespace
+
+bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why) {
+    return dxgi_memory_budget(luid, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, budget, usage, why);
+}
+
+bool gpu_local_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why) {
+    return dxgi_memory_budget(luid, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, budget, usage, why);
 }
 
 uint64_t total_physical_memory() {

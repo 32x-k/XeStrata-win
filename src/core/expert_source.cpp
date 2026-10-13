@@ -902,17 +902,28 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
 
 uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
 #if defined(_WIN32)
-    // the pages wholly inside the blob: one shared with a neighbour the CPU may still read stays
-    const uint8_t* b = mapped_blob(layer, expert);
-    if (b == nullptr) return 0;
+    // the pages wholly inside the blob (the GGUF in place: inside each of its three parts): one shared with a
+    // neighbour the CPU may still read stays
+    if (layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return 0;
     SYSTEM_INFO system_info{};
     GetSystemInfo(&system_info);
     const uintptr_t page = system_info.dwPageSize > 0 ? system_info.dwPageSize : 4096;
-    const uintptr_t lo = ((uintptr_t) b + page - 1) / page * page;
-    const uintptr_t hi = ((uintptr_t) b + layer_blob_bytes_[(size_t) layer]) / page * page;
-    if (hi <= lo) return 0;
-    (void) madvise((void*) lo, (size_t) (hi - lo), MADV_DONTNEED);
-    return (uint64_t) (hi - lo);
+    const auto drop = [page](const uint8_t* b, uint64_t bytes) -> uint64_t {
+        const uintptr_t lo = ((uintptr_t) b + page - 1) / page * page;
+        const uintptr_t hi = ((uintptr_t) b + bytes) / page * page;
+        if (b == nullptr || hi <= lo) return 0;
+        (void) madvise((void*) lo, (size_t) (hi - lo), MADV_DONTNEED);
+        return (uint64_t) (hi - lo);
+    };
+    if (!role_ptr_.empty()) {
+        uint64_t dropped = 0;
+        for (size_t i = (size_t) (3 * layer); i < (size_t) (3 * layer + 3); ++i)
+            if (role_ptr_[i] != nullptr)
+                dropped += drop(role_ptr_[i] + (size_t) ((uint64_t) expert * role_bytes_[i]), role_bytes_[i]);
+        return dropped;
+    }
+    const uint8_t* b = mapped_blob(layer, expert);
+    return b == nullptr ? 0 : drop(b, layer_blob_bytes_[(size_t) layer]);
 #else
     (void) layer;
     (void) expert;
@@ -1089,6 +1100,18 @@ bool FileExpertSource::pin_cache_complement(
         arena = nullptr;
     };
     if (bytes > 0) {
+        // Windows: past what the GPU can map, page-locking can succeed and the GPU's kernels then fault (the R9700,
+        // with --serve's buffers on top of a 6.2 GiB complement); the ordinary copy instead, with room left for the
+        // page-locked buffers the engine allocates after it (about 0.4 GiB in --serve)
+        constexpr uint64_t kPinReserve = 512ull << 20;
+        uint64_t pin_room = 0;
+        if (pin && strata::gpu::host_pin_room(&pin_room) && bytes + kPinReserve > pin_room) {
+            char why[160];
+            std::snprintf(why, sizeof why, "not page-locked: the GPU can map %.2f GiB more host memory",
+                          (double) pin_room / 1073741824.0);
+            note = why;
+            pin = false;
+        }
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
         std::fflush(stderr);

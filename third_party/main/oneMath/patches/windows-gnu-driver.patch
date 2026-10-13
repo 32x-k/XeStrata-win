@@ -1,0 +1,110 @@
+SPDX-FileCopyrightText: The oneMath contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0
+
+windows-gnu-driver: oneMath (XeStrata's fork, tag xestrata-3) on Windows with a SYCL compiler whose driver is
+GNU-style (intel/llvm's clang++), and its rocBLAS backend there; applied by CMakeLists.txt on Windows only, until
+the fork carries it. oneMath took a Windows compiler for the MSVC-style driver (clang-cl, icx: /nologo, /Fo, no
+-fsycl at link), built the rocBLAS backend on Unix only, and did not export the backend's function table, which
+its loader finds by name in the DLL. Nothing changes off Windows.
+---
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c23f1e2..7816af1 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ #===============================================================================
+ # Copyright 2020-2022 Intel Corporation
+ # Copyright (C) 2022 Heidelberg University, Engineering Mathematics and Computing Lab (EMCL) and Computing Centre (URZ)
++# Modified 2026 by MistVVK and the XeStrata contributors: on Windows, the Linux setup for a SYCL compiler with a GNU-style driver (clang++).
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -213,7 +214,7 @@ endif()
+ project(oneMath VERSION 0.5.0 LANGUAGES CXX)
+ 
+ # Override default CXX compile/link lines for Windows after project
+-if(WIN32 AND ONEMATH_SYCL_IMPLEMENTATION STREQUAL "dpc++")
++if(WIN32 AND ONEMATH_SYCL_IMPLEMENTATION STREQUAL "dpc++" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-function -w")
+   foreach (flag_var
+            CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE
+@@ -289,8 +290,8 @@ add_subdirectory(cmake)
+ # Include general cmake config files
+ list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
+ 
+-# Add DPC++ options for Linux
+-if(WIN32)
++# Add DPC++ options for Linux (and for a GNU-style driver on Windows)
++if(WIN32 AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+   add_library(ONEMATH::SYCL::SYCL INTERFACE IMPORTED)
+ else()
+   # Find necessary packages
+diff --git a/cmake/FindCompiler.cmake b/cmake/FindCompiler.cmake
+index 817a005..2dd0f4a 100644
+--- a/cmake/FindCompiler.cmake
++++ b/cmake/FindCompiler.cmake
+@@ -1,6 +1,7 @@
+ #===============================================================================
+ # Copyright 2020-2021 Intel Corporation
+ # Modified 2026 by MistVVK and the XeStrata contributors: the rocBLAS backend's AMD target left to the backend.
++# Modified 2026 by MistVVK and the XeStrata contributors: -fsycl linked on Windows as well.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -74,6 +75,7 @@ if(is_dpcpp)
+   else()
+     set_target_properties(ONEMATH::SYCL::SYCL PROPERTIES
+       INTERFACE_COMPILE_OPTIONS "-fsycl"
++      INTERFACE_LINK_OPTIONS "-fsycl"
+       INTERFACE_LINK_LIBRARIES ${SYCL_LIBRARY})
+   endif()
+ 
+diff --git a/src/blas/backends/CMakeLists.txt b/src/blas/backends/CMakeLists.txt
+index d388aad..4111b74 100644
+--- a/src/blas/backends/CMakeLists.txt
++++ b/src/blas/backends/CMakeLists.txt
+@@ -1,5 +1,6 @@
+ #===============================================================================
+ # Copyright 2020-2021 Intel Corporation
++# Modified 2026 by MistVVK and the XeStrata contributors: the rocBLAS backend built on Windows as well.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -44,7 +45,7 @@ if(ENABLE_CUBLAS_BACKEND AND UNIX)
+   add_subdirectory(cublas)
+ endif()
+ 
+-if(ENABLE_ROCBLAS_BACKEND AND UNIX)
++if(ENABLE_ROCBLAS_BACKEND)
+   add_subdirectory(rocblas)
+ endif()
+ 
+diff --git a/src/blas/backends/rocblas/rocblas_wrappers.cpp b/src/blas/backends/rocblas/rocblas_wrappers.cpp
+index 1119442..ec828d5 100644
+--- a/src/blas/backends/rocblas/rocblas_wrappers.cpp
++++ b/src/blas/backends/rocblas/rocblas_wrappers.cpp
+@@ -1,6 +1,7 @@
+ /***************************************************************************
+ *  Copyright (C) Codeplay Software Limited
+ *  Copyright (C) 2022 Heidelberg University, Engineering Mathematics and Computing Lab (EMCL) and Computing Centre (URZ)
++*  Modified 2026 by MistVVK and the XeStrata contributors: the function table exported on Windows.
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+@@ -23,7 +24,14 @@
+ 
+ #define WRAPPER_VERSION 1
+ 
+-extern "C" blas_function_table_t onemath_blas_table = {
++// the loader finds the table by name in the DLL on Windows: exported there
++#ifdef _WIN32
++#define ONEMATH_ROCBLAS_TABLE_EXPORT __declspec(dllexport)
++#else
++#define ONEMATH_ROCBLAS_TABLE_EXPORT
++#endif
++
++extern "C" ONEMATH_ROCBLAS_TABLE_EXPORT blas_function_table_t onemath_blas_table = {
+     WRAPPER_VERSION,
+     oneapi::math::blas::rocblas::column_major::asum,
+     oneapi::math::blas::rocblas::column_major::asum,
