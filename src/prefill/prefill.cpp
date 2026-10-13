@@ -698,22 +698,47 @@ const MmqPlan& mmq_plan() {
         return p;
     });
 }
+// The MoE half's scratch, carve's order.  A layer reads its experts' rows either as FP16 (Xs, Hh) or as int8 (Xq, H,
+// Hq), on m.cs, the layer before it done with them: a model with both kinds of layer (the int8 products lack some of
+// its types: UD-Q4_K_XL) keeps the larger set's room, not both: 0.42 and 0.40 GB at an 8192-token chunk.  Their sum
+// (with the expert groups', expert_group_bytes) cost an RTX 4070 the 8192 chunk at a 32K UD-Q4_K_XL prompt: 6144-token
+// chunks streamed 36% more experts, 615 -> 460 tok/s.
 uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
     const MmqPlan& mp = mmq_plan();
     Alloc a; a.count_only = true; bool ok = true;
     a.take<float>(T * n_expert, ok); a.take<float>(T * K, ok); a.take<int32_t>(T * K, ok); a.take<int32_t>(T * K, ok);
     a.take<int32_t>(T * K, ok);
-    if (mp.fallback) a.take<uint16_t>(T * K * N, ok);
     a.take<float>(T * K * 1280, ok);
-    if (mp.fallback) a.take<uint16_t>(T * K * 640, ok);
     a.take<float>(T * K * N, ok); a.take<float>(T * 640, ok);
     a.take<float>(T * 640, ok); a.take<uint16_t>(T * 640, ok); a.take<float>(T * N, ok); a.take<float>(T, ok);
+    Alloc q8 = a;
+    if (mp.fallback) { a.take<uint16_t>(T * K * N, ok); a.take<uint16_t>(T * K * 640, ok); }
     if (mp.any) {
-        a.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
-        a.take<float>(T * K * 640, ok);
-        a.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), 640), ok);
+        q8.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
+        q8.take<float>(T * K * 640, ok);
+        q8.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), 640), ok);
     }
-    return a.used;
+    return std::max(a.used, q8.used);
+}
+// The experts' group a layer's products read: G experts dequantized to FP16 (dq_gu, dq_d; 157 MB at 16) where some
+// layer keeps the FP16 path, MMQ_GROUP experts' int8 blocks (grp_gu, grp_d) where some layer takes the int8 one and the
+// chunk streams every expert.  Both are filled and read on m.cs, one kind a layer, so a model with both kinds of layer
+// keeps one place of the larger: their sum still kept an RTX 4070 from its 8192-token chunk on UD-Q4_K_XL (1,251 slots
+// lent where its 85% limit is 1,231).  The small chunks' MMQ ring is not here: the copy stream fills it.
+uint64_t expert_group_bytes(size_t T) {
+    const MmqPlan& mp = mmq_plan();
+    Alloc dq, q8;
+    dq.count_only = q8.count_only = true;
+    bool ok = true;
+    if (mp.fallback) {
+        dq.take<uint16_t>((size_t) (g_expert_group * GU_ELEMS), ok);
+        dq.take<uint16_t>((size_t) (g_expert_group * D_ELEMS), ok);
+    }
+    if (mp.any && (int64_t) T >= STREAM_ALL_MIN) {
+        q8.take<uint8_t>(MMQ_GROUP * mp.gu_max, ok);
+        q8.take<uint8_t>(MMQ_GROUP * mp.d_max, ok);
+    }
+    return std::max(dq.used, q8.used);
 }
 }
 
@@ -881,34 +906,45 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.logits = c.take<float>(T * m.g->n_expert, ok); m.w = c.take<float>(T * K, ok); m.ids = c.take<int32_t>(T * K, ok);
         m.slot_dev = c.take<int32_t>(T * K, ok); m.src_dev = c.take<int32_t>(T * K, ok);
         const MmqPlan& mp = mmq_plan();
-        m.Xs = mp.fallback ? c.take<uint16_t>(T * K * N, ok) : nullptr;
         m.GU = c.take<float>(T * K * 1280, ok);
-        m.Hh = mp.fallback ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
         m.Dm = c.take<float>(T * K * N, ok);
         m.sgate = c.take<float>(T * 640, ok); m.sup = c.take<float>(T * 640, ok); m.sh_h = c.take<uint16_t>(T * 640, ok);
         m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
+        // the experts' rows: FP16 (Xs, Hh) or int8 (Xq, H, Hq), at the same place (see moe_set_bytes)
+        Alloc q8 = c;
+        m.Xs = mp.fallback ? c.take<uint16_t>(T * K * N, ok) : nullptr;
+        m.Hh = mp.fallback ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
         if (mp.any) {
-            m.Xq = c.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
-            m.H = c.take<float>(T * K * 640, ok);
-            m.Hq = c.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), 640), ok);
+            m.Xq = q8.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
+            m.H = q8.take<float>(T * K * 640, ok);
+            m.Hq = q8.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), 640), ok);
         }
+        c.used = std::max(c.used, q8.used);
         if (base == nullptr) ok = false;
     }
-    // the FP16 experts' group (157 MB at 16): only where some layer keeps the FP16 path
-    m.dq_gu = mmq_plan().fallback ? o.take<uint16_t>((size_t) (g_expert_group * GU_ELEMS), ok) : nullptr;
-    m.dq_d = mmq_plan().fallback ? o.take<uint16_t>((size_t) (g_expert_group * D_ELEMS), ok) : nullptr;
+    // the experts' group: FP16 (dq_gu, dq_d) and int8 (grp_gu, grp_d) at one place (see expert_group_bytes)
+    m.dq_gu = m.dq_d = nullptr;
+    m.grp_gu = m.grp_d = m.mring = nullptr;
+    if (const uint64_t group_bytes = expert_group_bytes(T)) {
+        uint8_t* group = o.take<uint8_t>((size_t) group_bytes, ok);
+        Alloc dq, q8;
+        dq.base = q8.base = group;
+        dq.cap = q8.cap = group_bytes;
+        if (group == nullptr) ok = false;
+        if (ok && mmq_plan().fallback) {
+            m.dq_gu = dq.take<uint16_t>((size_t) (g_expert_group * GU_ELEMS), ok);
+            m.dq_d = dq.take<uint16_t>((size_t) (g_expert_group * D_ELEMS), ok);
+        }
+        if (ok && mmq_plan().any && (int64_t) T >= STREAM_ALL_MIN) {
+            m.grp_gu = q8.take<uint8_t>(MMQ_GROUP * mmq_plan().gu_max, ok);
+            m.grp_d = q8.take<uint8_t>(MMQ_GROUP * mmq_plan().d_max, ok);
+        }
+    }
     m.xb_dev = o.take<int32_t>((size_t) m.g->n_expert + 1, ok);
     if (mmq_plan().any) {
-        const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
         m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
-        m.grp_gu = m.grp_d = m.mring = nullptr;
-        if ((int64_t) T >= STREAM_ALL_MIN) {
-            m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max, ok);
-            m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max, ok);
-        } else {
-            m.mring = o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
-        }
+        if ((int64_t) T < STREAM_ALL_MIN) m.mring = o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
         m.mgrp_live[0] = m.mgrp_live[1] = false;
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
@@ -1153,21 +1189,12 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
                                        moe_set_bytes(T, g.n_expert)}), ok);
-    if (mmq_plan().fallback) {
-        o.take<uint16_t>((size_t) (g_expert_group * GU_ELEMS), ok);
-        o.take<uint16_t>((size_t) (g_expert_group * D_ELEMS), ok);
-    }
+    if (const uint64_t group_bytes = expert_group_bytes(T)) o.take<uint8_t>((size_t) group_bytes, ok);
     o.take<int32_t>((size_t) g.n_expert + 1, ok);
     if (mmq_plan().any) {
-        const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
         o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
-        if ((int64_t) T >= STREAM_ALL_MIN) {
-            o.take<uint8_t>(MMQ_GROUP * mp.gu_max, ok);
-            o.take<uint8_t>(MMQ_GROUP * mp.d_max, ok);
-        } else {
-            o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
-        }
+        if ((int64_t) T < STREAM_ALL_MIN) o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
     }
     for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
     f(T * N);
@@ -2498,7 +2525,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         };
                         // (the CPU's rows of GU and H are never written by the GPU: not counted, upstream 4322e241)
                         const int64_t bgu = bad(m.GU, rows_gpu * 1280), bdm = bad(m.Dm, T * K * N), bbo = bad(m.bo, T * N);
-                        const int64_t bh = m.H ? bad(m.H, rows_gpu * 640) : -1;
+                        const int64_t bh = use_mmq && m.H ? bad(m.H, rows_gpu * 640) : -1;
                         static int64_t reported = -1;
                         if ((bgu || bdm || bbo || bh > 0) && reported != stats_.chunks) {
                             reported = stats_.chunks;
