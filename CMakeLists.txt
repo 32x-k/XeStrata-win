@@ -493,7 +493,8 @@ if(STRATA_ENABLE_XE)
   if(NOT STRATA_LICENSE MATCHES "^(contrib|contrib-icpx)$")
     set(_strata_onemkl OFF)   # oneMKL is not free software
   endif()
-  if(_strata_onemkl OR _strata_cuda_archs OR _strata_hip_archs)
+  # Windows: not yet (oneMath's FindcuBLAS finds Linux's libraries only), so every GPU takes XeStrata's own kernels
+  if((_strata_onemkl OR _strata_cuda_archs OR _strata_hip_archs) AND NOT WIN32)
     if(_strata_onemkl AND NOT MKL_ROOT)
       if(DEFINED ENV{MKLROOT})
         set(MKL_ROOT $ENV{MKLROOT})
