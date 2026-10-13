@@ -259,6 +259,15 @@ bool is_host_usm(const void* p) {
     catch (const std::exception& e) { return fail("is_host_usm", e); }
 }
 
+bool kernels_read_host(const void* p) {
+    if (!p) return false;
+    try {
+        if (core::Runtime::owner(p) == &rt()) return true;
+        return rt().device().get_backend() != sycl::backend::ext_oneapi_level_zero;
+    }
+    catch (const std::exception& e) { return fail("kernels_read_host", e); }
+}
+
 bool copy(void* dst, const void* src, size_t bytes) {
     if (bytes == 0) return true;
     try { rt().wait(rt().compute().memcpy(dst, src, bytes), "synchronous copy"); return true; }

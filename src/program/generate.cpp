@@ -933,6 +933,7 @@ struct GpuStage {
     int dev = 0;
     int64_t lb = 0, le = 0;
     double pcie_frac = 0.0;
+    bool pcie_reads = true;   // its kernels can read the missed experts in host memory (gpu::kernels_read_host)
     strata::core::WeightTable wt;
     strata::core::NativeDense dense;
     strata::core::NativeHead head;
@@ -6341,7 +6342,19 @@ int main(int argc, char** argv) {
                                        batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
-                    split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
+                    // the PCIe share's kernels read the missed experts where CUDA0's runtime allocated or registered
+                    // them: a Level Zero GPU cannot (an RTX 4070 then a B70: GPU page faults on those addresses, and
+                    // the first decode window waited 20 s for a layer that never rang), so the CPU takes them there
+                    const uint8_t* host_expert = nullptr;
+                    for (int64_t l = gs.lb; host_expert == nullptr && l < gs.le; ++l)
+                        for (int64_t e = 0; host_expert == nullptr && e < g.n_expert; ++e)
+                            host_expert = srcp->device_alias(l, e);
+                    gs.pcie_reads = host_expert == nullptr || strata::gpu::kernels_read_host(host_expert);
+                    if (!gs.pcie_reads && gs.pcie_frac > 0.0)
+                        std::fprintf(stderr, "strata serve: layer split, CUDA%d: its kernels cannot read the experts in "
+                                             "CUDA0's host memory: the CPU takes its missed experts (no PCIe share)\n",
+                                     gs.dev);
+                    split_drive.pcie_num[st] = gs.pcie_reads ? pcie_num_of(gs.pcie_frac) : 0;
                 }
                 if (!ok_s) {
                     std::fprintf(stderr, "strata serve: layer split, stage %d: %s\n", st + 1, err.c_str());
@@ -9719,7 +9732,8 @@ int main(int argc, char** argv) {
             drive.d.pcie_split = req_pcie_set ? nullptr : pcie_split_ptr;
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
-                split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
+                split_drive.pcie_num[st] = st > 0 && !split_same && !stages[(size_t) st - 1]->pcie_reads ? 0
+                                           : (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
                                                ? drive.d.pcie_num : pcie_num_of(stages[(size_t) st - 1]->pcie_frac);
             if (pipe) for (int st = 0; st < split_drive.n; ++st) split_drive_b.pcie_num[st] = split_drive.pcie_num[st];
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);

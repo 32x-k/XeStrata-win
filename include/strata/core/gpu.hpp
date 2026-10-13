@@ -60,6 +60,10 @@ inline bool device_pointer(void** d, const void* h) {
     *d = is_host_usm(h) ? const_cast<void*>(h) : nullptr;
     return *d != nullptr;
 }
+/// Whether the current GPU's kernels can read the host memory at `p` in place, as the PCIe share reads the missed
+/// experts: its own runtime's host USM, and on a CUDA or HIP GPU any pinned or registered host memory (mapped at the
+/// same address).  A Level Zero GPU reads neither another context's host USM nor a registration for copies.
+bool kernels_read_host(const void* p);
 
 /// Synchronous copy, ordered after the work already on the compute queue (the CUDA legacy stream).
 bool copy(void* dst, const void* src, size_t bytes);
