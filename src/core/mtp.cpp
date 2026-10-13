@@ -132,6 +132,11 @@ MtpDrafter::~MtpDrafter() {
     if (h_chist_) strata::gpu::free(h_chist_);
     if (ev_chain_) strata::gpu::event_destroy(ev_chain_);
     for (strata::gpu::Event* e : ev_step_) if (e) strata::gpu::event_destroy(e);
+    for (strata::gpu::Event* e : pf_rec_up_)
+        if (e) {
+            (void) strata::gpu::event_sync(e);   // the upload has read its copy before the copy goes
+            strata::gpu::event_destroy(e);
+        }
     if (h_force_) strata::gpu::free(h_force_);
     if (cs_) strata::gpu::stream_destroy(cs_);
     if (side_) strata::gpu::stream_destroy(side_);
@@ -958,6 +963,11 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     const int64_t NHp = g_->n_head, per_row = 1 + 4 + NHp;
     if (!per_group_sync && n > 0) {
         if (pf_cap_ < n * per_row) {
+            // an earlier prefill that returned without a sync may still read it
+            if (pf_dev_ && !strata::gpu::stream_sync(cs_)) {
+                err = std::string("mtp prefill: ") + strata::gpu::last_error();
+                return false;
+            }
             if (pf_dev_) strata::gpu::free(pf_dev_);
             pf_dev_ = nullptr;
             pf_cap_ = 0;
@@ -967,7 +977,16 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             }
             pf_cap_ = n * per_row;
         }
-        std::vector<int32_t> rec((size_t) (n * per_row));
+        // a copy the last upload from it has finished reading (with sync = false it may still run when this returns)
+        const int turn = pf_rec_turn_;
+        pf_rec_turn_ ^= 1;
+        if ((pf_rec_up_[turn] == nullptr && !strata::gpu::event_create(&pf_rec_up_[turn])) ||
+            !strata::gpu::event_sync(pf_rec_up_[turn])) {
+            err = std::string("mtp prefill: the input records' event: ") + strata::gpu::last_error();
+            return false;
+        }
+        std::vector<int32_t>& rec = pf_rec_[turn];
+        rec.assign((size_t) (n * per_row), 0);
         int32_t* tk = rec.data();
         int32_t* stp = tk + n;
         int32_t* ps = stp + 4 * n;
@@ -980,7 +999,8 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             stp[i * 4 + 3] = (int32_t) (cell + 1);
             for (int64_t h = 0; h < NHp; ++h) ps[i * NHp + h] = (int32_t) cell;
         }
-        if (!strata::gpu::copy_async(pf_dev_, rec.data(), rec.size() * sizeof(int32_t), cs_)) {
+        if (!strata::gpu::copy_async(pf_dev_, rec.data(), rec.size() * sizeof(int32_t), cs_) ||
+            !strata::gpu::event_record(pf_rec_up_[turn], cs_)) {
             err = "mtp prefill: the input records upload failed";
             return false;
         }

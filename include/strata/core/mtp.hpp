@@ -192,6 +192,11 @@ private:
     float chain_prob_[8] = {};
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
+    /// E-4: the records' host copies, used in turn: a prefill that returns without a sync (sync = false) leaves its
+    /// upload running, so its copy stays alive until that upload, recorded in pf_rec_up_, has read it
+    std::vector<int32_t> pf_rec_[2];
+    strata::gpu::Event* pf_rec_up_[2] = {};
+    int pf_rec_turn_ = 0;
     strata::gpu::Graph* round_exec_[9] = {};
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
