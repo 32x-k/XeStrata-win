@@ -186,6 +186,18 @@ inline int bf16x2_mode() {
 }
 inline bool bf16x2() { return bf16x2_mode() != 0; }
 inline bool bf16x2_hc() { return bf16x2_mode() == 1; }
+// A small card's prompt chunk is what its buffers leave room for, and every chunk streams the experts again (an
+// 8 GB RTX 4070 at a 64K prompt: 2048-token chunks, 291 tok/s against 1,066 with 12 GB).  Two places the buffers
+// overlap: the hyper-connection block's rows (xn16, lo, lo16, gated: written and read before a half's GDN, QSA or MoE
+// work starts, and xn16 again after it ends) live in the region that work uses (STRATA_PREFILL_HC_IN_REGION=0: their
+// own place); the FP16 experts' input rows (Xs) live in the upper half of their down outputs' rows (Dm), each group's
+// down written after its gate/up read them, the rows in ascending order (STRATA_PREFILL_XS_IN_DM=0: their own place).
+inline bool env_off(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && std::strtol(v, nullptr, 10) == 0;
+}
+inline bool hc_in_region() { static const bool v = !env_off("STRATA_PREFILL_HC_IN_REGION"); return v; }
+inline bool xs_in_dm() { static const bool v = !env_off("STRATA_PREFILL_XS_IN_DM"); return v; }
 // Experts dequantized (FP16) before one grouped product: G of them take G x 9.4 MiB (--prefill-experts)
 int g_expert_group = 16;
 constexpr int64_t GU_ELEMS = 1280ll * 2560, D_ELEMS = 2560ll * 640;
@@ -205,7 +217,7 @@ struct Alloc {
         if (count_only) { used += bytes; return nullptr; }
         if (base != nullptr) {
             if (used + bytes > cap) { ok = false; failed_bytes = bytes; return nullptr; }
-            T* p = (T*) (base + used);
+            T* p = reinterpret_cast<T*>(base + used);
             used += bytes;
             return p;
         }
@@ -387,13 +399,19 @@ struct Stager {
 // #1712 (upstream b97a36a4): a chunk's small int32 tables (the QSA step records, the token ids) go up from a pinned
 // buffer.  A copy from pageable memory is staged by the runtime; on gfx1100 the first text prompt after a picture one
 // was seen to read stale step records that way.  The event holds the next upload back until the last one has left the
-// buffer.  No pinned RAM: the copy is made from the caller's memory, as before.
+// buffer.  No pinned RAM (or a table larger than the buffer): the copy is made from the caller's memory and the stream
+// is waited for, so the source is free to change on return all the same (upstream #1996: a pageable source the caller
+// changed before the copy read it faulted a 4-hour load on 2x RX 7900 XTX).
 struct PinnedUpload {
     int32_t* p = nullptr;
     size_t n = 0;
     strata::gpu::Event* ev = nullptr;
-    void init(size_t count) {
-        if (p || force_pageable()) return;
+    void init(size_t count) {   // at least `count` ints; a larger count takes a larger buffer once the last copy is out
+        if (force_pageable() || (p && count <= n)) return;
+        if (p) {
+            if (ev && !strata::gpu::event_sync(ev)) return;   // keep the old buffer: begin() then falls back
+            release();
+        }
         if (!strata::gpu::alloc_host(&p, count * sizeof(int32_t))) {
             p = nullptr;
             return;
@@ -408,11 +426,15 @@ struct PinnedUpload {
     }
     bool upload(void* dst, const int32_t* src, size_t count, strata::gpu::Stream s) {
         const size_t bytes = count * sizeof(int32_t);
-        if (!p || count > n) return strata::gpu::copy_async(dst, src, bytes, s);
+        if (!p || count > n) return strata::gpu::copy_async(dst, src, bytes, s) && strata::gpu::stream_sync(s);
         if (!strata::gpu::event_sync(ev)) return false;   // the previous upload is out of the buffer
         std::memcpy(p, src, bytes);
         return strata::gpu::copy_async(dst, p, bytes, s) && strata::gpu::event_record(ev, s);
     }
+    /// For several copies out of one buffer: the pinned buffer once the last upload has left it (nullptr: none of
+    /// `count` ints, so copy from the source and wait for the stream), then end() once the copies are queued.
+    int32_t* begin(size_t count) { return p && count <= n && strata::gpu::event_sync(ev) ? p : nullptr; }
+    bool end(strata::gpu::Stream s) { return strata::gpu::event_record(ev, s); }
     void release() {
         if (ev) strata::gpu::event_destroy(ev);
         if (p) strata::gpu::free(p);
@@ -534,6 +556,10 @@ struct Prefill::Impl {
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
     PinnedUpload tok_up;
+    // the draft K/V pass's token ids, a batch at a time from one host vector (upstream #1996)
+    PinnedUpload draft_tok_up;
+    // a chunk's picture embedding rows, gathered from the caller's memory (upstream #1996); taken at the first picture
+    PinnedUpload emb_up;
 };
 
 namespace {
@@ -587,6 +613,8 @@ void Prefill::release() {
     if (impl_->copy) strata::gpu::stream_sync(impl_->copy);
     impl_->steps_up.release();
     impl_->tok_up.release();
+    impl_->draft_tok_up.release();
+    impl_->emb_up.release();
     for (float* p : {impl_->cpu_x, impl_->cpu_rows})
         if (p) strata::gpu::free(p);
     for (strata::gpu::Event* e : impl_->cpu_ev)
@@ -682,22 +710,57 @@ const MmqPlan& mmq_plan() {
         return p;
     });
 }
+// The MoE half's scratch, carve's order.  A layer reads its experts' rows either as FP16 (Xs, Hh) or as int8 (Xq, H,
+// Hq), on m.cs, the layer before it done with them: a model with both kinds of layer (the int8 products lack some of
+// its types: UD-Q4_K_XL) keeps the larger set's room, not both: 0.42 and 0.40 GB at an 8192-token chunk.  Their sum
+// (with the expert groups', expert_group_bytes) cost an RTX 4070 the 8192 chunk at a 32K UD-Q4_K_XL prompt: 6144-token
+// chunks streamed 36% more experts, 615 -> 460 tok/s.
 uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
     const MmqPlan& mp = mmq_plan();
     Alloc a; a.count_only = true; bool ok = true;
     a.take<float>(T * n_expert, ok); a.take<float>(T * K, ok); a.take<int32_t>(T * K, ok); a.take<int32_t>(T * K, ok);
     a.take<int32_t>(T * K, ok);
-    if (mp.fallback) a.take<uint16_t>(T * K * N, ok);
     a.take<float>(T * K * 1280, ok);
-    if (mp.fallback) a.take<uint16_t>(T * K * 640, ok);
     a.take<float>(T * K * N, ok); a.take<float>(T * 640, ok);
     a.take<float>(T * 640, ok); a.take<uint16_t>(T * 640, ok); a.take<float>(T * N, ok); a.take<float>(T, ok);
-    if (mp.any) {
-        a.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
-        a.take<float>(T * K * 640, ok);
-        a.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), 640), ok);
+    Alloc q8 = a;
+    if (mp.fallback) {
+        if (!xs_in_dm()) a.take<uint16_t>(T * K * N, ok);
+        a.take<uint16_t>(T * K * 640, ok);
     }
+    if (mp.any) {
+        q8.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
+        q8.take<float>(T * K * 640, ok);
+        q8.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), 640), ok);
+    }
+    return std::max(a.used, q8.used);
+}
+// The experts' group a layer's products read: G experts dequantized to FP16 (dq_gu, dq_d; 157 MB at 16) where some
+// layer keeps the FP16 path, MMQ_GROUP experts' int8 blocks (grp_gu, grp_d) where some layer takes the int8 one and the
+// chunk streams every expert.  Both are filled and read on m.cs, one kind a layer, so a model with both kinds of layer
+// keeps one place of the larger: their sum still kept an RTX 4070 from its 8192-token chunk on UD-Q4_K_XL (1,251 slots
+// lent where its 85% limit is 1,231).  The small chunks' MMQ ring is not here: the copy stream fills it.
+// The hyper-connection block's rows, carve's order (in the region with hc_in_region, else beside it).
+uint64_t hc_set_bytes(size_t T) {
+    Alloc a; a.count_only = true; bool ok = true;
+    a.take<uint16_t>(T * D, ok); a.take<float>(T * LR, ok); a.take<uint16_t>(T * LR, ok); a.take<float>(T * D, ok);
+    if (bf16x2_hc()) { a.take<uint16_t>(T * D, ok); a.take<uint16_t>(T * LR, ok); }
     return a.used;
+}
+uint64_t expert_group_bytes(size_t T) {
+    const MmqPlan& mp = mmq_plan();
+    Alloc dq, q8;
+    dq.count_only = q8.count_only = true;
+    bool ok = true;
+    if (mp.fallback) {
+        dq.take<uint16_t>((size_t) (g_expert_group * GU_ELEMS), ok);
+        dq.take<uint16_t>((size_t) (g_expert_group * D_ELEMS), ok);
+    }
+    if (mp.any && (int64_t) T >= STREAM_ALL_MIN) {
+        q8.take<uint8_t>(MMQ_GROUP * mp.gu_max, ok);
+        q8.take<uint8_t>(MMQ_GROUP * mp.d_max, ok);
+    }
+    return std::max(dq.used, q8.used);
 }
 }
 
@@ -730,7 +793,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.tok_host.resize((size_t) chunk);
         m.tok_up.init((size_t) chunk);
     }
-    if (!(m.copy = strata::gpu::stream_create_copy())) { err = "prefill: copy stream"; return false; }
+    m.copy = strata::gpu::stream_create_copy();
+    if (!m.copy) { err = "prefill: copy stream"; return false; }
     const size_t T = (size_t) chunk;
     m.T_max = chunk;
     m.borrowed = borrow != nullptr;
@@ -824,14 +888,18 @@ bool Prefill::carve(size_t T, void* alloc) {
     // xn: the row scales only (F-1, gr_norm_rs: the FP32 normalized rows are not kept; a T x D buffer was 335 MB of
     // the borrowed cache slots at an 8192-token chunk)
     m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok); m.xn = o.take<float>(T * HC, ok);
-    m.xn16 = o.take<uint16_t>(T * D, ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
-    m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
+    auto take_hc = [&](Alloc& h) {
+        m.xn16 = h.take<uint16_t>(T * D, ok); m.lo = h.take<float>(T * LR, ok); m.lo16 = h.take<uint16_t>(T * LR, ok);
+        m.gated = h.take<float>(T * D, ok);
+        if (bf16x2_hc()) { m.xn16_lo = h.take<uint16_t>(T * D, ok); m.lo16_lo = h.take<uint16_t>(T * LR, ok); }
+    };
+    if (!hc_in_region()) take_hc(o);
+    m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
     m.mixed_h = o.take<uint16_t>(T * N, ok);
     // the embedding rows are dead once gr_broadcast has read them on m.cs; the half outputs written into bo come after
     // it on the same in-order queue (the GEMMs' too)
     m.bo = m.emb;
-    if (bf16x2_hc()) { m.xn16_lo = o.take<uint16_t>(T * D, ok); m.lo16_lo = o.take<uint16_t>(T * LR, ok); }
     if (bf16x2()) m.mixed_bf_lo = o.take<uint16_t>(T * N, ok);
     m.steps_dev = o.take<int32_t>(T * strata::kernels::kStepCount, ok);
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
@@ -842,10 +910,16 @@ bool Prefill::carve(size_t T, void* alloc) {
     {
         // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
         const uint64_t region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
-                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert)});
+                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert),
+                                          hc_in_region() ? hc_set_bytes(T) : (uint64_t) 0});
         uint8_t* base = o.take<uint8_t>((size_t) region, ok);
         m.region = base;
         m.region_bytes = region;
+        if (hc_in_region()) {
+            Alloc h;
+            h.base = base; h.cap = region; h.owned = &m.owned;
+            take_hc(h);
+        }
         Alloc a;
         a.base = base; a.cap = region; a.owned = &m.owned;
         m.qkv = a.take<float>(T * C, ok); m.z = a.take<float>(T * ZV, ok); m.ab = a.take<float>(T * 2 * HV, ok);
@@ -864,34 +938,47 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.logits = c.take<float>(T * m.g->n_expert, ok); m.w = c.take<float>(T * K, ok); m.ids = c.take<int32_t>(T * K, ok);
         m.slot_dev = c.take<int32_t>(T * K, ok); m.src_dev = c.take<int32_t>(T * K, ok);
         const MmqPlan& mp = mmq_plan();
-        m.Xs = mp.fallback ? c.take<uint16_t>(T * K * N, ok) : nullptr;
         m.GU = c.take<float>(T * K * 1280, ok);
-        m.Hh = mp.fallback ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
         m.Dm = c.take<float>(T * K * N, ok);
         m.sgate = c.take<float>(T * 640, ok); m.sup = c.take<float>(T * 640, ok); m.sh_h = c.take<uint16_t>(T * 640, ok);
         m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
+        // the experts' rows: FP16 (Xs, Hh) or int8 (Xq, H, Hq), at the same place (see moe_set_bytes)
+        Alloc q8 = c;
+        // the upper half of Dm's T*K rows of N floats holds the T*K rows of N halves
+        m.Xs = !mp.fallback ? nullptr : xs_in_dm() && m.Dm ? reinterpret_cast<uint16_t*>(m.Dm) + T * K * N
+                                                            : c.take<uint16_t>(T * K * N, ok);
+        m.Hh = mp.fallback ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
         if (mp.any) {
-            m.Xq = c.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
-            m.H = c.take<float>(T * K * 640, ok);
-            m.Hq = c.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), 640), ok);
+            m.Xq = q8.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
+            m.H = q8.take<float>(T * K * 640, ok);
+            m.Hq = q8.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), 640), ok);
         }
+        c.used = std::max(c.used, q8.used);
         if (base == nullptr) ok = false;
     }
-    // the FP16 experts' group (157 MB at 16): only where some layer keeps the FP16 path
-    m.dq_gu = mmq_plan().fallback ? o.take<uint16_t>((size_t) (g_expert_group * GU_ELEMS), ok) : nullptr;
-    m.dq_d = mmq_plan().fallback ? o.take<uint16_t>((size_t) (g_expert_group * D_ELEMS), ok) : nullptr;
+    // the experts' group: FP16 (dq_gu, dq_d) and int8 (grp_gu, grp_d) at one place (see expert_group_bytes)
+    m.dq_gu = m.dq_d = nullptr;
+    m.grp_gu = m.grp_d = m.mring = nullptr;
+    if (const uint64_t group_bytes = expert_group_bytes(T)) {
+        uint8_t* group = o.take<uint8_t>((size_t) group_bytes, ok);
+        Alloc dq, q8;
+        dq.base = q8.base = group;
+        dq.cap = q8.cap = group_bytes;
+        if (group == nullptr) ok = false;
+        if (ok && mmq_plan().fallback) {
+            m.dq_gu = dq.take<uint16_t>((size_t) (g_expert_group * GU_ELEMS), ok);
+            m.dq_d = dq.take<uint16_t>((size_t) (g_expert_group * D_ELEMS), ok);
+        }
+        if (ok && mmq_plan().any && (int64_t) T >= STREAM_ALL_MIN) {
+            m.grp_gu = q8.take<uint8_t>(MMQ_GROUP * mmq_plan().gu_max, ok);
+            m.grp_d = q8.take<uint8_t>(MMQ_GROUP * mmq_plan().d_max, ok);
+        }
+    }
     m.xb_dev = o.take<int32_t>((size_t) m.g->n_expert + 1, ok);
     if (mmq_plan().any) {
-        const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
         m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
-        m.grp_gu = m.grp_d = m.mring = nullptr;
-        if ((int64_t) T >= STREAM_ALL_MIN) {
-            m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max, ok);
-            m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max, ok);
-        } else {
-            m.mring = o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
-        }
+        if ((int64_t) T < STREAM_ALL_MIN) m.mring = o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
         m.mgrp_live[0] = m.mgrp_live[1] = false;
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
@@ -1041,10 +1128,11 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
     std::vector<int32_t> tk((size_t) B);
+    m.draft_tok_up.init((size_t) B);   // tk is refilled every batch: each batch goes up from the pinned buffer
     for (int64_t b0 = r0; b0 < n; b0 += B) {
         const int64_t nb = std::min(B, n - b0), c0 = cell0 + b0;
         for (int64_t i = 0; i < nb; ++i) tk[(size_t) i] = next_tokens[b0 + i];
-        if (!strata::gpu::copy_async(tok, tk.data(), (size_t) nb * 4, m.cs)) {
+        if (!m.draft_tok_up.upload(tok, tk.data(), (size_t) nb, m.cs)) {
             err = "prefill: the draft tokens' upload failed";
             return false;
         }
@@ -1122,10 +1210,10 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     o.count_only = true;
     o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     auto f = [&](size_t n) { o.take<float>(n, ok); };
-    f(T * N); f(T * D); f(T * HC); o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
-    f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok);
+    f(T * N); f(T * D); f(T * HC);
+    if (!hc_in_region()) o.take<uint8_t>((size_t) hc_set_bytes(T), ok);
+    f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok);
     if (!emb_reuse_account()) f(T * N);   // bo: aliases emb in carve; still counted unless STRATA_EMB_REUSE_ACCOUNT=1
-    if (bf16x2_hc()) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
     if (bf16x2()) o.take<uint16_t>(T * N, ok);
     o.take<int32_t>(T * strata::kernels::kStepCount, ok);
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
@@ -1134,22 +1222,14 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
-                                       moe_set_bytes(T, g.n_expert)}), ok);
-    if (mmq_plan().fallback) {
-        o.take<uint16_t>((size_t) (g_expert_group * GU_ELEMS), ok);
-        o.take<uint16_t>((size_t) (g_expert_group * D_ELEMS), ok);
-    }
+                                       moe_set_bytes(T, g.n_expert), hc_in_region() ? hc_set_bytes(T) : (uint64_t) 0}),
+                    ok);
+    if (const uint64_t group_bytes = expert_group_bytes(T)) o.take<uint8_t>((size_t) group_bytes, ok);
     o.take<int32_t>((size_t) g.n_expert + 1, ok);
     if (mmq_plan().any) {
-        const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
         o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
-        if ((int64_t) T >= STREAM_ALL_MIN) {
-            o.take<uint8_t>(MMQ_GROUP * mp.gu_max, ok);
-            o.take<uint8_t>(MMQ_GROUP * mp.d_max, ok);
-        } else {
-            o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
-        }
+        if ((int64_t) T < STREAM_ALL_MIN) o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
     }
     for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
     f(T * N);
@@ -1277,7 +1357,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     }();
     const bool ple_batch = ple_on && ple_batch_env && strata::kernels::ple_native_postops_enabled() &&
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
-                           m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
+                           m.region_bytes / (((uint64_t) 3 * strata::kernels::NG_HC_DIM + (uint64_t) N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
     auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
         const int64_t T = std::min(m.T, n - c0);
@@ -1344,16 +1424,39 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                                       (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
             }
         }
+        // the picture rows go up from one pinned buffer (upstream #1996: from the caller's pageable memory a later
+        // prompt on gfx1100 read stale rows); without one, from the caller's memory with the stream waited for
+        // (packed: only the chunk's picture rows, so the buffer is a picture's size, not a chunk's)
+        int64_t pic_rows = 0;
+        for (int64_t t = 0; hand_in_ == nullptr && !batched && embd_rows && t < T; ++t)
+            pic_rows += embd_rows[p0 + t] != nullptr;
+        float* rows_stage = nullptr;
+        if (pic_rows > 0) {
+            m.emb_up.init((size_t) (pic_rows * N));
+            rows_stage = reinterpret_cast<float*>(m.emb_up.begin((size_t) (pic_rows * N)));
+        }
+        const bool rows_pinned = rows_stage != nullptr, rows_pageable = pic_rows > 0 && !rows_pinned;
+        int64_t k_row = 0;
         for (int64_t t = 0; hand_in_ == nullptr && !batched && t < T; ++t) {
             const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
             if (row) {
-                if (!strata::gpu::copy_async(m.emb + t * N, row, (size_t) N * 4, m.cs)) {
+                const float* src = row;
+                if (rows_pinned) {
+                    std::memcpy(rows_stage + k_row * N, row, (size_t) N * 4);
+                    src = rows_stage + k_row * N;
+                    ++k_row;
+                }
+                if (!strata::gpu::copy_async(m.emb + t * N, src, (size_t) N * 4, m.cs)) {
                     err = "prefill: the image embedding upload failed";
                     return false;
                 }
             } else if (!core::embed_row(*m.wt, g, tokens[c0 + t], m.emb + t * N, m.cs, err)) {
                 return false;
             }
+        }
+        if ((rows_pinned && !m.emb_up.end(m.cs)) || (rows_pageable && !strata::gpu::stream_sync(m.cs))) {
+            err = "prefill: the image embedding upload failed";
+            return false;
         }
         if (hand_in_ == nullptr) gr_broadcast(m.emb, m.R, T, m.cs);
         // ---- the PLE rows of the whole chunk, one batched SSD request on a thread (see ple_gather).  A later chunk's
@@ -1377,6 +1480,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
             strata::gpu::copy_async(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, m.cs);
             strata::gpu::event_record(m.ple_copied[ple_buf], m.cs);
+            // the pageable fallback (no pinned RAM): waited for, as a pageable source can be read out of order
+            // (upstream #1996)
+            if (!m.ple_pageable[ple_buf].empty()) strata::gpu::stream_sync(m.cs);
             if (c0 + m.T < n) {
                 strata::gpu::event_sync(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
                 ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
@@ -1535,7 +1641,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 for (int64_t s0 = 0; s0 < T; s0 += SB) {
                     const int64_t nb = std::min(SB, T - s0);
                     uint8_t* q = m.region;
-                    auto carve_f = [&](size_t n) { float* p = (float*) q; q += (n * 4 + 255) & ~(size_t) 255; return p; };
+                    auto carve_f = [&](size_t n) { float* p = reinterpret_cast<float*>(q); q += (n * 4 + 255) & ~(size_t) 255; return p; };
                     float* key = carve_f((size_t) nb * HD);
                     float* qn = carve_f((size_t) nb * HD);
                     float* gated = carve_f((size_t) nb * HD);
@@ -1789,7 +1895,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // for tools/qsa_locality.py (how local the sparse attention's reads are: the KV-streaming question)
                     if (static const char* dump = std::getenv("STRATA_QSA_DUMP"); dump != nullptr) {
                         static const long long last = std::getenv("STRATA_QSA_DUMP_LAST")
-                                                          ? std::atoll(std::getenv("STRATA_QSA_DUMP_LAST")) : 4096;
+                                                          ? std::strtoll(std::getenv("STRATA_QSA_DUMP_LAST"), nullptr, 10) : 4096;
                         if (p0 + T > pos0 + n - last) {
                             std::vector<int32_t> h((size_t) (T * m.cap));
                             strata::gpu::copy_async(h.data(), m.sel_ids, h.size() * 4, m.cs);
@@ -2410,7 +2516,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
                             }
                         }
-                        release_to(m.g->n_expert);
+                        release_to((int32_t) m.g->n_expert);
                     }
                     pt.mark(kPfCombine, cs);
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail
@@ -2454,7 +2560,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         };
                         // (the CPU's rows of GU and H are never written by the GPU: not counted, upstream 4322e241)
                         const int64_t bgu = bad(m.GU, rows_gpu * 1280), bdm = bad(m.Dm, T * K * N), bbo = bad(m.bo, T * N);
-                        const int64_t bh = m.H ? bad(m.H, rows_gpu * 640) : -1;
+                        const int64_t bh = use_mmq && m.H ? bad(m.H, rows_gpu * 640) : -1;
                         static int64_t reported = -1;
                         if ((bgu || bdm || bbo || bh > 0) && reported != stats_.chunks) {
                             reported = stats_.chunks;
@@ -2593,7 +2699,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         bad(m.R + last * D, D);
         if (ss.ple.ready()) { std::fprintf(stderr, "; PLE history"); bad(ss.ple.hist, (int64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM); }
         std::fprintf(stderr, "; GDN state 0");
-        bad(ss.gdn_state, 64 * 1024);
+        bad(ss.gdn_state, (int64_t) 64 * 1024);
         std::fprintf(stderr, "\n");
     }
     if (!strata::gpu::stream_sync(m.cs)) {

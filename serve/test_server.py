@@ -1341,7 +1341,8 @@ class ClientShapes(unittest.TestCase):
             "system": [{"type": "text", "text": "You are terse."}],
             "messages": [
                 {"role": "user", "content": [{"type": "text", "text": "1+1? digits only"}]},
-                {"role": "system", "content": [{"type": "text", "text": "<system-reminder>answer in digits</system-reminder>"}]}]})
+                {"role": "system",
+                 "content": [{"type": "text", "text": "<system-reminder>answer in digits</system-reminder>"}]}]})
         self.assertEqual(status, 200, b)
         text = self.prompt_text()
         self.assertIn("You are terse.", text)
@@ -1470,7 +1471,8 @@ class ClientShapes(unittest.TestCase):
 
     def test_leading_system_unchanged(self):
         from serve.frontend import anthropic_to_messages, openai_to_messages
-        msgs, _, _ = openai_to_messages({"messages": [{"role": "developer", "content": "D"}, {"role": "user", "content": "u"}]})
+        msgs, _, _ = openai_to_messages({"messages": [{"role": "developer", "content": "D"},
+                                                      {"role": "user", "content": "u"}]})
         self.assertEqual([m["role"] for m in msgs], ["system", "user"])
         msgs, _, _ = anthropic_to_messages({"system": "S", "messages": [{"role": "user", "content": "u"}]})
         self.assertEqual([m["role"] for m in msgs], ["system", "user"])
@@ -1789,14 +1791,13 @@ class EngineDeath(unittest.TestCase):
                 raise ValueError("verify: layer 31 never rang (an illegal memory access was encountered)")
 
         tok = ByteTokenizer()
-        svc = Service(ErrEngine(tok, ANSWER, max_context=CTX), tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        svc = Service(ErrEngine(tok, ANSWER, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         try:
-            for path, body in [("/v1/chat/completions", {"model": "m", "stream": True, "max_tokens": 20,
-                                                          "messages": [{"role": "user", "content": "hi"}]}),
-                               ("/v1/messages", {"model": "m", "stream": True, "max_tokens": 20,
-                                                 "messages": [{"role": "user", "content": "hi"}]})]:
+            body = {"model": "m", "stream": True, "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}]}
+            for path in ("/v1/chat/completions", "/v1/messages"):
                 req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
                                              headers={"Content-Type": "application/json"})
                 with urllib.request.urlopen(req, timeout=30) as r:
@@ -2624,7 +2625,8 @@ class SharedSettings(unittest.TestCase):
 
     def req(self, path, body, headers=None, raw=None):
         h = {"Content-Type": "application/json", **(headers or {})}
-        r = urllib.request.Request(self.base + path, data=raw if raw is not None else json.dumps(body).encode(), headers=h)
+        data = raw if raw is not None else json.dumps(body).encode()
+        r = urllib.request.Request(self.base + path, data=data, headers=h)
         try:
             with urllib.request.urlopen(r, timeout=30) as resp:
                 return resp.status, json.loads(resp.read())
@@ -2633,7 +2635,8 @@ class SharedSettings(unittest.TestCase):
                 return e.code, json.loads(e.read())
 
     def chat(self, **extra):
-        return self.req("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], **extra})
+        return self.req("/v1/chat/completions",
+                        {"model": "m", "messages": [{"role": "user", "content": "hi"}], **extra})
 
     def tearDown(self):
         self.svc.set_shared(None)
@@ -2818,7 +2821,8 @@ class WebApp(unittest.TestCase):
                 self.assertEqual(props["default_generation_settings"]["n_ctx"], 262144)
                 self.assertEqual(props["default_generation_settings"]["params"],
                                  {"temperature": 0.7, "repeat_penalty": 1.1, "n_predict": 4096})
-                self.assertEqual(props["chat_template"], (ROOT / "serve/test_chat_template.jinja").read_text(encoding="utf-8"))
+                self.assertEqual(props["chat_template"],
+                                 (ROOT / "serve/test_chat_template.jinja").read_text(encoding="utf-8"))
                 self.assertEqual(sorted(props["chat_template_caps"]),
                                  ["supports_parallel_tool_calls", "supports_preserve_reasoning", "supports_system_role",
                                   "supports_tool_calls", "supports_tools"])
@@ -3270,6 +3274,97 @@ class SharingTheGpu(unittest.TestCase):
         self.assertFalse(mark.exists())
         self.assertEqual(self.chat()[0], 200)
         self.assertTrue(mark.exists())
+
+    def _raw_chat(self):
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        r = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                   headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                return resp.status, dict(resp.headers), json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, dict(e.headers), json.loads(e.read())
+
+    def test_failing_before_load_with_free_vram_still_loads(self):
+        """#1997: a peer that is not running makes `curl` exit 7; the card has room, so the model loads."""
+        self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(7)"]
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 20000
+        self.svc.unload()
+        self.assertEqual(self._raw_chat()[0], 200)
+        self.assertEqual(self.engine.starts, 1)
+
+    def test_failing_before_load_with_full_vram_refuses_with_503_and_retry_after(self):
+        self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(3)"]
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 2000
+        self.svc.unload()
+        self.svc.vram_free_wait_s = 0.2                              # (not the 15 s wait for memory)
+        status, headers, body = self._raw_chat()
+        self.assertEqual(status, 503)
+        self.assertIn("exited with code 3", body["error"]["message"])
+        self.assertTrue(int(headers["Retry-After"]) > 0)
+        self.assertFalse(self.engine.alive())
+        self.assertEqual(self.engine.starts, 0)
+        self.svc.free_vram_mib = lambda: 20000                      # the peer let go: the next try loads
+        self.assertEqual(self._raw_chat()[0], 200)
+
+    def test_before_load_strict_refuses_even_with_free_vram(self):
+        self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(7)"]
+        self.svc.before_load_strict = True
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 20000
+        self.svc.unload()
+        status, headers, body = self._raw_chat()
+        self.assertEqual(status, 503)
+        self.assertTrue(int(headers["Retry-After"]) > 0)
+        self.assertEqual(self.engine.starts, 0)
+
+    def test_failing_before_load_without_a_vram_limit_loads(self):
+        self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(7)"]
+        self.svc.unload()
+        self.assertEqual(self._raw_chat()[0], 200)
+
+    def test_before_load_timeout_is_configurable_and_a_timeout_refuses(self):
+        self.svc.before_load = [sys.executable, "-c", "import time; time.sleep(30)"]
+        self.svc.before_load_timeout_s = 0.5
+        self.svc.before_load_strict = True
+        self.svc.unload()
+        t0 = time.time()
+        status, headers, body = self._raw_chat()
+        self.assertEqual(status, 503)
+        self.assertLess(time.time() - t0, 10)
+        self.assertIn("before_load_timeout_s", body["error"]["message"])
+        self.assertFalse(self.engine.alive())
+
+    def test_before_load_failure_can_be_ignored_by_config(self):
+        self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(1)"]
+        self.svc.before_load_ignore_failure = True
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 2000                       # full, but ignore means load
+        self.svc.unload()
+        self.assertEqual(self._raw_chat()[0], 200)
+
+    def test_unload_wait_waits_for_the_running_turn(self):
+        """#1997: POST /unload answers busy at once (409); with ?wait=1 it waits for the turn and then unloads."""
+        self.svc.fifo.acquire()
+        threading.Timer(1.0, self.svc.fifo.release).start()
+        t0 = time.time()
+        self.assertEqual(self.req("/unload", {}), (409, {"status": "busy"}))
+        self.assertLess(time.time() - t0, 0.9)
+        status, body = self.req("/unload?wait=1", {})
+        self.assertEqual((status, body), (200, {"status": "unloaded"}))
+        self.assertGreaterEqual(time.time() - t0, 0.9)
+        self.assertFalse(self.engine.alive())
+
+    def test_unload_wait_gives_up_after_the_given_seconds(self):
+        with self.svc.fifo:
+            t0 = time.time()
+            self.assertEqual(self.req("/unload?wait=0.6", {}),
+                             (409, {"status": "busy"}))
+            self.assertLess(time.time() - t0, 5)
+        self.assertTrue(self.engine.alive())
 
     def test_vision_encoder_unloads_and_starts_first(self):
         order = []
@@ -5177,3 +5272,71 @@ class UntimedReads(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrepareCancelled(unittest.TestCase):
+    """#1999: a client that leaves while its pictures are prepared gives the turn up and encodes nothing more."""
+
+    def make(self, d, vision):
+        tok = ByteTokenizer()
+        return Service(MockEngine(tok, "ok", max_context=CTX), tok,
+                       ChatTemplate(ROOT / "serve/test_chat_template.jinja"), vision=vision(d))
+
+    @staticmethod
+    def msgs(n=2):
+        return [{"role": "user", "content": [{"type": "text", "text": "look"}] +
+                 [{"type": "image", "source": f"{i}.png"} for i in range(n)]}]
+
+    def test_cancel_before_the_encode_runs_none(self):
+        import tempfile
+        calls = []
+
+        class V(ImageMarkers.FakeVision):
+            def encode(self, source):
+                calls.append(source)
+                return self.rows, 3
+        with tempfile.TemporaryDirectory() as d:
+            svc = self.make(d, V)
+            cancel = threading.Event()
+            cancel.set()
+            from serve.server import ClientGone
+            with self.assertRaises(ClientGone):
+                svc.prepare(self.msgs(), None, {}, cancel=cancel)
+            self.assertEqual(calls, [])
+            self.assertTrue(svc.fifo.acquire(blocking=False))        # the turn was not left held
+            svc.fifo.release()
+
+    def test_cancel_while_waiting_for_the_turn(self):
+        import tempfile
+        from serve.server import ClientGone
+        with tempfile.TemporaryDirectory() as d:
+            svc = self.make(d, ImageMarkers.FakeVision)
+            cancel = threading.Event()
+            threading.Timer(0.3, cancel.set).start()
+            with svc.fifo:                                          # another request holds the engine
+                t0 = time.perf_counter()
+                with self.assertRaises(ClientGone):
+                    svc.prepare(self.msgs(1), None, {}, cancel=cancel)
+                self.assertLess(time.perf_counter() - t0, 3)
+
+    def test_cancel_between_pictures_stops_the_next_encode(self):
+        from serve.server import ClientGone, Vision
+        cancel, seen = threading.Event(), []
+        v = Vision.__new__(Vision)
+
+        def encode(src, keep=()):
+            seen.append(src)
+            cancel.set()                                            # the client leaves during the first encode
+            return Path("x"), 3
+        v.encode = encode
+        with self.assertRaises(ClientGone):
+            v.encode_all([b"a", b"b", b"c"], cancel)
+        self.assertEqual(seen, [b"a"])
+
+    def test_without_cancel_nothing_changes(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            svc = self.make(d, ImageMarkers.FakeVision)
+            ids, _, _ = svc.prepare(self.msgs(), None, {}, cancel=threading.Event())
+            self.assertEqual(ids.count(ByteTokenizer().encode("<|image_pad|>", parse_special=True)[0]), 6)
+            svc.embeddings.path.unlink(missing_ok=True)

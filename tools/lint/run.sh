@@ -85,7 +85,7 @@ if [ ${#cpp[@]} -gt 0 ]; then
   else
     echo "== clang-tidy: skipped (needs oneAPI's clang-tidy and $BUILD/compile_commands.json)"
   fi
-  run cppcheck cppcheck --quiet --error-exitcode=1 --std=c++20 --enable=warning,performance \
+  run cppcheck cppcheck --quiet --error-exitcode=1 --std=c++20 --enable=warning,performance --library="$C/cppcheck.cfg" \
     --suppress=missingIncludeSystem --suppress=noCopyConstructor --suppress=noOperatorEq "${cpp[@]}"
 fi
 [ ${#cmake[@]} -gt 0 ] && run cmake-lint cmake-lint -c "$C/cmake-format.py" -- "${cmake[@]}"

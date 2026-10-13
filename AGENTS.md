@@ -191,7 +191,9 @@ The README, the documents and the release notes send the user to `xestrata --set
 XeStrata's version is the upstream version it has integrated (`STRATA_UPSTREAM_VERSION` in `CMakeLists.txt`) and `XESTRATA_REVISION`, the count of XeStrata's releases on that upstream version from 1, as a Debian revision counts:
 
 - the packages are `<upstream>-<revision>` (rpm: Version and Release);
-- the version name (the tag and `STRATA_VERSION_NAME`) is `xe<upstream>` for the first release and `xe<upstream>.<revision - 1>` for a later one: xe0.1.40.2.1 is the package `0.1.40.2-2`.
+- the version name (the tag, `STRATA_VERSION_NAME` and what the engine says) is the same with `xe` before it, `xe<upstream>-<revision>`: xe0.1.43.1-1 is the package `0.1.43.1-1`.
+
+Releases before 2026-10-13 were named `xe<upstream>` for the first and `xe<upstream>.<revision - 1>` for a later one (xe0.1.43.1 was 0.1.43's second release), which an upstream version with a fourth number collided with; their tags stay as they are.
 
 Integrating a new upstream version sets `XESTRATA_REVISION` back to 1; another release on the same upstream version raises it by one.
 

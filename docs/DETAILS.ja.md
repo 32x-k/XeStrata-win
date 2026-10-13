@@ -550,8 +550,9 @@ RX 9060 XT と Ryzen 7 5700X の serve（IQ3_XXS、5 回交互）では、`auto`
 | `--idle-unload 600` | `"idle_unload_s": 600` | 要求が 600 秒なければモデルを下ろし、次の要求でまた読み込む |
 | `--min-free-vram-mib 11000` | `"min_free_vram_mib": 11000` | 下ろしたモデルを、その GPU にそれだけ VRAM が空いているときだけ読み込む（Intel の GPU は Level Zero の sysman、NVIDIA の GPU は NVML で読み、返されつつあるメモリを最大 15 秒待つ）。空いていなければ **503**「the GPU is in use by another program」を返す |
 | `--before-load "cmd"` | `"before_load": "cmd"` または `["cmd", "arg"]` | モデルを読み込み直す前に実行するコマンド。たとえば、別のサーバーのモデルを下ろすもの |
+| | `"before_load_timeout_s": 120` | そのコマンドが動いてよい時間（既定 120 秒）。0 以外で終わるか時間切れのとき（相手のサーバーが動いていないと `curl` は 7 で終わります）は、空いている VRAM で決めます。`min_free_vram_mib` があって空きが足りなければ、モデルを読み込まず、要求には `Retry-After` 付きの **503** を返します。空きがある（または上限を決めていない）ときは、ログに警告を出して読み込みます。`"before_load_strict": true` は失敗したら必ず断り、`"before_load_ignore_failure": true` は必ず読み込みます |
 
-- **下ろす、読み込む**: `POST /unload` はすぐに下ろし（要求の処理中は `409`）、`POST /load` は要求の前に読み込みます。
+- **下ろす、読み込む**: `POST /unload` はすぐに下ろし（要求の処理中は `409`。`POST /unload?wait=1` は動いている要求が終わるのを最大 300 秒待ってから下ろし、`?wait=<秒>` で待つ時間を決めます。2 つ目のサーバーが本当にカードを空けられるように）、`POST /load` は要求の前に読み込みます。
   どちらも `Content-Type: application/json` を付けます（例: `curl -X POST -H "Content-Type: application/json" localhost:8095/unload`）。
 - **状態**: `/health` は `"loaded"` を返し、`/v1/models` は下ろしたモデルを `unloaded` と示します（llama.cpp の router と同じ）。
   `/props` は `is_sleeping` を設定し、Monitor も状態を表示します。
