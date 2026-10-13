@@ -1341,7 +1341,8 @@ class ClientShapes(unittest.TestCase):
             "system": [{"type": "text", "text": "You are terse."}],
             "messages": [
                 {"role": "user", "content": [{"type": "text", "text": "1+1? digits only"}]},
-                {"role": "system", "content": [{"type": "text", "text": "<system-reminder>answer in digits</system-reminder>"}]}]})
+                {"role": "system",
+                 "content": [{"type": "text", "text": "<system-reminder>answer in digits</system-reminder>"}]}]})
         self.assertEqual(status, 200, b)
         text = self.prompt_text()
         self.assertIn("You are terse.", text)
@@ -1470,7 +1471,8 @@ class ClientShapes(unittest.TestCase):
 
     def test_leading_system_unchanged(self):
         from serve.frontend import anthropic_to_messages, openai_to_messages
-        msgs, _, _ = openai_to_messages({"messages": [{"role": "developer", "content": "D"}, {"role": "user", "content": "u"}]})
+        msgs, _, _ = openai_to_messages({"messages": [{"role": "developer", "content": "D"},
+                                                      {"role": "user", "content": "u"}]})
         self.assertEqual([m["role"] for m in msgs], ["system", "user"])
         msgs, _, _ = anthropic_to_messages({"system": "S", "messages": [{"role": "user", "content": "u"}]})
         self.assertEqual([m["role"] for m in msgs], ["system", "user"])
@@ -1789,14 +1791,13 @@ class EngineDeath(unittest.TestCase):
                 raise ValueError("verify: layer 31 never rang (an illegal memory access was encountered)")
 
         tok = ByteTokenizer()
-        svc = Service(ErrEngine(tok, ANSWER, max_context=CTX), tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        svc = Service(ErrEngine(tok, ANSWER, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         try:
-            for path, body in [("/v1/chat/completions", {"model": "m", "stream": True, "max_tokens": 20,
-                                                          "messages": [{"role": "user", "content": "hi"}]}),
-                               ("/v1/messages", {"model": "m", "stream": True, "max_tokens": 20,
-                                                 "messages": [{"role": "user", "content": "hi"}]})]:
+            body = {"model": "m", "stream": True, "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}]}
+            for path in ("/v1/chat/completions", "/v1/messages"):
                 req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
                                              headers={"Content-Type": "application/json"})
                 with urllib.request.urlopen(req, timeout=30) as r:
@@ -2624,7 +2625,8 @@ class SharedSettings(unittest.TestCase):
 
     def req(self, path, body, headers=None, raw=None):
         h = {"Content-Type": "application/json", **(headers or {})}
-        r = urllib.request.Request(self.base + path, data=raw if raw is not None else json.dumps(body).encode(), headers=h)
+        data = raw if raw is not None else json.dumps(body).encode()
+        r = urllib.request.Request(self.base + path, data=data, headers=h)
         try:
             with urllib.request.urlopen(r, timeout=30) as resp:
                 return resp.status, json.loads(resp.read())
@@ -2633,7 +2635,8 @@ class SharedSettings(unittest.TestCase):
                 return e.code, json.loads(e.read())
 
     def chat(self, **extra):
-        return self.req("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], **extra})
+        return self.req("/v1/chat/completions",
+                        {"model": "m", "messages": [{"role": "user", "content": "hi"}], **extra})
 
     def tearDown(self):
         self.svc.set_shared(None)
@@ -2818,7 +2821,8 @@ class WebApp(unittest.TestCase):
                 self.assertEqual(props["default_generation_settings"]["n_ctx"], 262144)
                 self.assertEqual(props["default_generation_settings"]["params"],
                                  {"temperature": 0.7, "repeat_penalty": 1.1, "n_predict": 4096})
-                self.assertEqual(props["chat_template"], (ROOT / "serve/test_chat_template.jinja").read_text(encoding="utf-8"))
+                self.assertEqual(props["chat_template"],
+                                 (ROOT / "serve/test_chat_template.jinja").read_text(encoding="utf-8"))
                 self.assertEqual(sorted(props["chat_template_caps"]),
                                  ["supports_parallel_tool_calls", "supports_preserve_reasoning", "supports_system_role",
                                   "supports_tool_calls", "supports_tools"])
@@ -5275,8 +5279,8 @@ class PrepareCancelled(unittest.TestCase):
 
     def make(self, d, vision):
         tok = ByteTokenizer()
-        return Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"),
-                       vision=vision(d))
+        return Service(MockEngine(tok, "ok", max_context=CTX), tok,
+                       ChatTemplate(ROOT / "serve/test_chat_template.jinja"), vision=vision(d))
 
     @staticmethod
     def msgs(n=2):

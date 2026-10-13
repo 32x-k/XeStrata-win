@@ -83,12 +83,13 @@ class StdioTransport:
 
     def __init__(self, name: str, cfg: dict):
         self.name, self.cfg = name, cfg
-        self.proc = None
+        self.proc: subprocess.Popen | None = None
         self.lock = threading.Lock()                    # the pending requests
         self.write_lock = threading.Lock()              # stdin; separate, so a full pipe can't block the reader
         self.pending: dict[int, _Slot] = {}
         self.next_id = 0
-        self.stderr = collections.deque(maxlen=40)       # its last log lines, for the error message when it fails
+        # its last log lines, for the error message when it fails
+        self.stderr: collections.deque[str] = collections.deque(maxlen=40)
         self.protocol = PROTOCOL
 
     def start(self):
@@ -98,8 +99,8 @@ class StdioTransport:
         exe = shutil.which(command, path=env.get("PATH")) or command
         try:
             self.proc = subprocess.Popen([exe, *[str(a) for a in self.cfg.get("args") or []]], stdin=subprocess.PIPE,
-                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.cfg.get("cwd") or None,
-                                         env=env, start_new_session=True)
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                         cwd=self.cfg.get("cwd") or None, env=env, start_new_session=True)
         except OSError as e:
             raise McpError(f"could not start {command!r}: {e}") from None
         self._err_reader = threading.Thread(target=self._read_stderr, daemon=True)
@@ -166,7 +167,8 @@ class StdioTransport:
                     pass
             return                                       # notifications (log messages, list changes): not used
         with self.lock:
-            slot = self.pending.pop(m.get("id"), None)
+            mid = m.get("id")
+            slot = self.pending.pop(mid, None) if isinstance(mid, int) else None   # (the ids it is sent are ints)
         if slot is not None:                             # an answer to a call that timed out is simply dropped
             slot.msg = m
             slot.done.set()
@@ -175,6 +177,8 @@ class StdioTransport:
         data = json.dumps(msg, ensure_ascii=False).encode("utf-8") + b"\n"
         try:
             with self.write_lock:
+                if self.proc is None or self.proc.stdin is None:
+                    raise OSError("not started")
                 self.proc.stdin.write(data)
                 self.proc.stdin.flush()
         except (OSError, ValueError):
@@ -342,8 +346,8 @@ class HttpTransport:
         try:
             return _wait(slot, timeout, cancel, method)
         except (McpTimeout, McpCancelled) as e:
-            threading.Thread(target=self._quiet_notify, args=("notifications/cancelled",
-                                                              {"requestId": rid, "reason": str(e)}), daemon=True).start()
+            note = {"requestId": rid, "reason": str(e)}
+            threading.Thread(target=self._quiet_notify, args=("notifications/cancelled", note), daemon=True).start()
             raise
 
     def _quiet_notify(self, method, params):
@@ -374,10 +378,10 @@ class McpServer:
         self.name, self.cfg, self.settings = name, cfg, settings
         self.kind = "http" if cfg.get("url") else "stdio"
         self.status = "idle"             # idle -> starting -> ready | failed; ready -> stopped when it ends
-        self.error = None
+        self.error: str | None = None
         self.tools: list[dict] = []
         self.info: dict = {}
-        self.transport = None
+        self.transport: HttpTransport | StdioTransport | None = None
         self.lock = threading.Lock()
         self.last_start = 0.0
 
@@ -401,7 +405,8 @@ class McpServer:
             self.info = {k: v for k, v in (res.get("serverInfo") or {}).items() if k in ("name", "title", "version")}
             self.info["protocol"] = t.protocol
             t.notify("notifications/initialized")
-            tools, cursor = [], None
+            tools: list[dict] = []
+            cursor = None
             for _ in range(100):                         # pages; a server that never stops paging is cut off
                 try:
                     page = t.request("tools/list", {"cursor": cursor} if cursor else {}, timeout)
@@ -436,6 +441,7 @@ class McpServer:
                 if not self._start():
                     raise McpError(f"the server could not be started again: {self.error}")
             t = self.transport
+        assert t is not None                             # (started above)
         try:
             return t.request("tools/call", {"name": tool, "arguments": arguments}, timeout, cancel)
         except McpError as e:
@@ -463,8 +469,8 @@ def result_text(result: dict) -> str:
             parts.append(str(block.get("text", "")))
         elif kind == "resource":
             res = block.get("resource") or {}
-            parts.append(str(res["text"]) if "text" in res else f"[resource {res.get('uri', '')} "
-                                                                  f"({res.get('mimeType', 'binary')}), not shown]")
+            parts.append(str(res["text"]) if "text" in res else
+                         f"[resource {res.get('uri', '')} ({res.get('mimeType', 'binary')}), not shown]")
         elif kind == "resource_link":
             parts.append(f"[resource link: {block.get('name') or ''} {block.get('uri', '')}]".replace("  ", " "))
         elif kind in ("image", "audio"):
@@ -542,8 +548,9 @@ class McpHub:
         """Run one tool -> {"ok", "text" (what the model reads, capped), "chars" (its full length), "truncated",
         "ms", "server", "tool"}.  Errors become text starting with "error:"; only McpCancelled is raised."""
         t0 = time.monotonic()
-        server, tool = self._routes.get(name) or self.routes().get(name, (None, name))
-        out = {"server": server.name if server else None, "tool": tool}
+        route = self._routes.get(name) or self.routes().get(name)
+        server, tool = route if route is not None else (None, name)
+        out: dict = {"server": server.name if server else None, "tool": tool}
         if server is None:
             text, ok = f"error: there is no tool named {name!r}", False
         else:

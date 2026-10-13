@@ -54,7 +54,8 @@ class ChatTemplate:
         def strftime_now(fmt):   # transformers' global for templates that write today's date (llm-jp-4.1's)
             return datetime.datetime.now().strftime(fmt)
 
-        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
+                                            extensions=["jinja2.ext.loopcontrols"])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         env.globals["strftime_now"] = strftime_now
@@ -491,7 +492,8 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
              for t in _tool_list(req.get("tools"), "function")] or None
     kwargs = {}
     # OpenAI Chat Completions: "reasoning_effort"; Responses style: "reasoning": {"effort": ...}
-    reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
+    reasoning = req.get("reasoning")
+    reasoning = reasoning if isinstance(reasoning, dict) else {}
     kwargs.update(effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort")))
     # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}}
     for k, v in (req.get("chat_template_kwargs") or {}).items():
@@ -930,6 +932,8 @@ RCALL_MAX = 32768        # the most of a `<tool_call>` inside the reasoning held
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
+    _line_parts: list[str]              # the current line in pieces (the `line` property)
+    _line_blocks: list[str] | None
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  recover: bool = False):
@@ -1193,7 +1197,7 @@ class OutputParser:
 
     def _close_scan(self) -> list[Event]:
         """A streamed call that ended without a clean </function>: close its JSON so clients can still parse it."""
-        out = []
+        out: list[Event] = []
         if self.scall is None or self.ss == "done":
             return out
         tail = ""

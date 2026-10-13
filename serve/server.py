@@ -7,7 +7,8 @@
     python -m serve.server --engine strata --config strata.json --port 8095   (the real engine, resident)
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
-non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
+non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time
+behind a FIFO (plan: one resident sequence).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
@@ -57,10 +58,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a module
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
-from serve.frontend import (THINK_END, ChatTemplate, Event, HarmonyParser, OutputParser,  # noqa: E402
+from serve.frontend import (THINK_END, ChatTemplate, Event, HarmonyParser, OutputParser, ToolCall,  # noqa: E402
                             anthropic_to_messages, forced_call, images_of, literal_tags, mark_think_literals,
                             openai_to_messages, tool_choice_of, unmark_think_literals)
-from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import release_check  # noqa: E402
@@ -130,6 +131,8 @@ def write_temporary(path: Path, parts: list) -> None:
     with os.fdopen(os.open(path, flags, 0o600), "wb") as f:
         for part in parts:
             f.write(Path(part).read_bytes())
+
+
 # #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
 # template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
@@ -272,7 +275,8 @@ ENGINE_READY_S = _timeout_env("STRATA_ENGINE_READY_S", 900.0)
 # ------------------------------------------------------------------------------------------------ engines
 class Engine(Protocol):
     max_context: int
-    def generate(self, ids: list[int], max_new: int, sampling: dict, cancel: threading.Event) -> Iterator[int]: ...
+    def generate(self, ids: list[int], max_new: int, sampling: dict, cancel: threading.Event,
+                 embeddings: list | None = None) -> Iterator[int]: ...
 
 
 class MockEngine:
@@ -282,8 +286,8 @@ class MockEngine:
     def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0):
         self.tok, self.max_context, self.delay = tokenizer, max_context, delay_s
         end = tokenizer.encode(IM_END, parse_special=True)
-        self.scripts = [tokenizer.encode(x, parse_special=True) + end for x in ([script] if isinstance(script, str)
-                                                                                 else script)]
+        scripts = [script] if isinstance(script, str) else script
+        self.scripts = [tokenizer.encode(x, parse_special=True) + end for x in scripts]
         self.script, self.turns = self.scripts[0], 0
         self.last_prompt: list[int] = []
 
@@ -531,8 +535,8 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
                 if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # #505: mapped
                     say("arena", f"[strata] {loading}\n"
-                                 "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
-                                 "         Please wait and don't close this window; the browser opens when it is ready.")
+                        "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
+                        "         Please wait and don't close this window; the browser opens when it is ready.")
                 elif " loaded " in line and "GiB at" in line:
                     say("loaded", "[strata] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
                         f" ({time.time() - t0:.0f} s so far)")
@@ -733,7 +737,7 @@ class StrataEngine:
                 pass
         self.max_context = 0                             # before the new process is visible: never its predecessor's
         pin = {}
-        if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (serve/replicas.py)
+        if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (replicas.py)
             pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env,
@@ -813,7 +817,7 @@ class StrataEngine:
         self.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
         self.slot_groups = groups
         self.slot_gs = gs if groups > 1 else 0   # pipelined groups: their size (pick_slot fills a group's holes)
-        self.slot_q = [queue.Queue() for _ in range(self.batch)]
+        self.slot_q: list[queue.Queue] = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
         # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
@@ -894,6 +898,8 @@ class StrataEngine:
             return self.silent_note
         tail = wide = ""
         try:
+            if self.log_path is None:
+                raise OSError("no log")
             with open(self.log_path, "rb") as f:
                 f.seek(0, 2)
                 f.seek(max(0, f.tell() - 262144))
@@ -1005,11 +1011,12 @@ class StrataEngine:
                 # (0)".  __init__ clears `ended` itself once READY (before its pump thread can set it again).
                 self.ended = True
                 try:
-                    self.__init__(*self.spawn)
+                    self.__init__(*self.spawn)   # type: ignore[misc]  # (a test's subclass starts again as itself)
                     break
                 except RuntimeError:
                     try:
-                        self.proc.wait(timeout=60)
+                        if self.proc is not None:
+                            self.proc.wait(timeout=60)
                     except (subprocess.TimeoutExpired, OSError):
                         pass
                     if i == tries - 1:
@@ -1056,18 +1063,16 @@ class StrataEngine:
         mp = sampling.get("min_p")
         if isinstance(mp, (int, float)) and 0.0 < float(mp) <= 1.0:
             keys += f" min_p={float(mp)!r}"
-        rp = sampling.get("repetition_penalty")
-        rp_on = isinstance(rp, (int, float)) and float(rp) != 1.0
-        pf = sampling.get("frequency_penalty")
-        pf_on = isinstance(pf, (int, float)) and float(pf) != 0.0
-        pp = sampling.get("presence_penalty")
-        pp_on = isinstance(pp, (int, float)) and float(pp) != 0.0
+        rp, pf, pp = (float(v) if isinstance(v, (int, float)) else None for v in
+                      (sampling.get("repetition_penalty"), sampling.get("frequency_penalty"),
+                       sampling.get("presence_penalty")))
+        rp_on, pf_on, pp_on = rp is not None and rp != 1.0, pf is not None and pf != 0.0, pp is not None and pp != 0.0
         if rp_on:
-            keys += f" penalty_repeat={float(rp)!r}"
+            keys += f" penalty_repeat={rp!r}"
         if pf_on:
-            keys += f" penalty_freq={float(pf)!r}"
+            keys += f" penalty_freq={pf!r}"
         if pp_on:
-            keys += f" penalty_present={float(pp)!r}"
+            keys += f" penalty_present={pp!r}"
         if rp_on or pf_on or pp_on:
             # a penalty without a window counts over nothing: the engine's default is the last 64 tokens
             pln = sampling.get("penalty_last_n")
@@ -1889,6 +1894,8 @@ class StrataEngine:
         """#1317: (CPU seconds, I/O bytes) the engine process has used so far, or None when they cannot be read."""
         try:
             import psutil
+            if self.proc is None:
+                return None
             pr = psutil.Process(self.proc.pid)
             t = pr.cpu_times()
             io = pr.io_counters()
@@ -2233,16 +2240,20 @@ class Vision:
 
     def _stop(self, why: str) -> None:
         self.dead = why
+        proc = self.proc
         try:
-            self.proc.kill()
-            self.proc.wait(timeout=10)
+            if proc is not None:
+                proc.kill()
+                proc.wait(timeout=10)
         except Exception:
             pass
         self._close_stdin()
 
     def _close_stdin(self) -> None:
+        proc = self.proc
         try:                                        # a line it never read stays buffered; closing drops it here
-            self.proc.stdin.close()
+            if proc is not None and proc.stdin is not None:
+                proc.stdin.close()
         except OSError:
             pass
 
@@ -2367,7 +2378,7 @@ class Vision:
             if line is None or line == "":
                 self._stop("the vision encoder stopped" if line is None else
                            "the vision encoder did not answer within %d s" % (VISION_ENCODE_S or 0))
-                raise ValueError("the image could not be read: " + self.dead)
+                raise ValueError(f"the image could not be read: {self.dead}")
             line = line.strip()
             if not line.startswith("OK"):
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else line))
@@ -2621,8 +2632,10 @@ def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
     env = dict(os.environ)
-    if gpu_list(cfg):                                # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
-        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
+    # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's own default order (fastest first) can number
+    # the cards otherwise
+    if gpu_list(cfg):
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries
         env[str(k)] = str(v)
@@ -2833,8 +2846,8 @@ class Service:
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction rendered with its own tools
         self.codex_thread_titles = False              # #923 (opt-in): Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
-        self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
-        self.shared_path = None                       # where they are kept between starts (next to the config)
+        self.shared: dict = {}                        # the web app's Chat settings for every client (POST /settings)
+        self.shared_path: str | None = None           # where they are kept between starts (next to the config)
         # #1641: the config's "reasoning_effort": the level for requests with none
         self.config_effort = None
         self.fifo = threading.Lock()
@@ -2861,7 +2874,8 @@ class Service:
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
         self.status: dict = {"busy": False, "queued": 0}   # GET /status: what the model is doing right now
-        self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
+        # (time, generated) samples for the live tok/s window
+        self.rate: collections.deque = collections.deque(maxlen=32)
         # "parallel" (the engine's batch slots, #465): every running request's own status and rate window; self.status
         # then says busy while any runs and shows the newest one
         self.live_reqs: dict[int, tuple[dict, collections.deque]] = {}
@@ -2871,21 +2885,23 @@ class Service:
         # bounded I/O in memory; no headers or API keys
         self.api_requests: collections.deque[dict] = collections.deque(maxlen=100)
         self.request_trace = threading.local()
-        self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
+        # the last finished requests, newest last (GET /metrics)
+        self.history: collections.deque[dict] = collections.deque(maxlen=500)
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0,
                        "drafts_offered": 0, "drafts_accepted": 0}   # #457: the MTP drafts, summed where reported
-        self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
+        self.last_timings: dict | None = None           # the last finished request's, llama.cpp's names (/v1/status)
         from serve.prometheus import Latencies
         self.latencies = Latencies()                     # GET /metrics in Prometheus text: the latency histograms
         self.last_request_at: float | None = None        # when a request last started or finished
         self.started_at = time.time()
         self.engine_failure: dict | None = None   # issue #10: the last engine that died in a request, for the web app
+        self.gpu_pci: str | None = None      # the engine's card (the Monitor reads it)
         self.split_pci: list | None = None   # a layer split's other cards (the Monitor reads them too)
         self.updates = release_check.Checker()           # GET/POST /update: whether a newer release is out
         self.status_lock = threading.Lock()
-        self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
+        self.mcp: McpHub | None = None                   # serve/mcp.py's McpHub when MCP servers are configured
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
         # server's model); the next request after an unload starts the engine again
@@ -3262,7 +3278,8 @@ class Service:
             req["max_tokens"] = s["max_tokens"]
         if effort:
             if api == "openai":
-                ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
+                ctk = req.get("chat_template_kwargs")
+                ctk = ctk if isinstance(ctk, dict) else {}
                 if not req.get("reasoning_effort") and not req.get("reasoning") and \
                         "enable_thinking" not in ctk and "reasoning_effort" not in ctk:
                     req["reasoning_effort"] = effort
@@ -3399,7 +3416,8 @@ class Service:
             live["replicas"] = self.engine.replica_view()
         engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
-        tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
+        tel = (self.telemetry.snapshot() if getattr(self, "telemetry", None)
+               else {"now": {}, "history": {}, "static": {}})
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
@@ -3477,9 +3495,10 @@ class Service:
                          elastic=bool((getattr(self.engine, "info", {}) or {}).get("vram_elastic"))),
             "machine": {
                 "at": int(time.time()),
-                "gpu": {"name": static.get("gpu_name"), "used_mib": scaled(hw.get("gpu_mem_used"), 2 ** 20),
-                        "total_mib": scaled(hw.get("gpu_mem_total"), 2 ** 20), "util_pct": hw.get("gpu_util"),
-                        "temp_c": hw.get("gpu_temp"), "power_w": hw.get("gpu_power")} if static.get("gpu_name") else None,
+                "gpu": ({"name": static.get("gpu_name"), "used_mib": scaled(hw.get("gpu_mem_used"), 2 ** 20),
+                         "total_mib": scaled(hw.get("gpu_mem_total"), 2 ** 20), "util_pct": hw.get("gpu_util"),
+                         "temp_c": hw.get("gpu_temp"), "power_w": hw.get("gpu_power")}
+                        if static.get("gpu_name") else None),
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
@@ -4186,11 +4205,11 @@ class Service:
                             now = time.time()
                             el = now - st.get("started", now)
                             ft = st.get("first_token")
-                            rate = n / max(1e-6, now - ft) if ft else 0.0
+                            tok_s = n / max(1e-6, now - ft) if ft else 0.0
                             hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                             if hit_msg and pcie_share:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
-                            print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
+                            print(f"[strata] done: {n} tokens in {el:.0f} s ({tok_s:.1f} tok/s) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
                                 print("[strata] the reply reached max tokens while still thinking, so it has no "
@@ -4271,7 +4290,8 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
         # #1870: the engine says how many prompt tokens it read: the slot's own session may have held the rest
         # (not the conversation cache), so the rate is not made of tokens it never read
         cache_n = max(cache_n, max(0, prompt_tokens - int(last["prompt_read"])))
-    prompt_n, prompt_ms, decode_ms = max(0, prompt_tokens - cache_n), float(last["prompt_ms"]), float(last.get("decode_ms") or 0)
+    prompt_n, prompt_ms = max(0, prompt_tokens - cache_n), float(last["prompt_ms"])
+    decode_ms = float(last.get("decode_ms") or 0)
     decoded = int(last.get("generated") or generated)          # the engine's count gives its rate, as /metrics does
     return {"cache_n": cache_n, "prompt_n": prompt_n, "prompt_ms": round(prompt_ms, 1),
             "prompt_per_token_ms": round(prompt_ms / prompt_n, 3) if prompt_n else None,
@@ -4279,7 +4299,8 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             "predicted_n": generated, "predicted_ms": round(decode_ms, 1),
             "predicted_per_token_ms": round(decode_ms / decoded, 3) if decoded else None,
             "predicted_per_second": round(decoded / (decode_ms / 1000), 1) if decoded and decode_ms > 0 else None,
-            # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported them
+            # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported
+            # them
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
                if last.get("drafts_offered") is not None else {})}
 
@@ -4522,38 +4543,40 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
             c["strata_mcp"] = x
             yield c
         elif kind == "event":
-            ev: Event = x
+            ev = cast(Event, x)
+            call = cast(ToolCall, ev.call)          # (every tool_* event carries its call)
             if ev.kind == "reasoning" and ev.text:
                 yield chunk({"reasoning_content": ev.text})
             elif ev.kind == "content" and ev.text:
                 yield chunk({"content": ev.text})
             elif ev.kind == "tool_start":
-                streamed[ev.call.id] = calls
+                streamed[call.id] = calls
                 calls += 1
-                yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "id": ev.call.id, "type": "function",
-                                             "function": {"name": ev.call.name, "arguments": ""}}]})
+                yield chunk({"tool_calls": [{"index": streamed[call.id], "id": call.id, "type": "function",
+                                             "function": {"name": call.name, "arguments": ""}}]})
             elif ev.kind == "tool_args":
-                yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "function": {"arguments": ev.text}}]})
-            elif ev.kind == "tool_call" and ev.call.id in streamed:
+                yield chunk({"tool_calls": [{"index": streamed[call.id], "function": {"arguments": ev.text}}]})
+            elif ev.kind == "tool_call" and call.id in streamed:
                 finished.add(getattr(ev.call, "id", None))
             elif ev.kind == "tool_call":
-                yield chunk({"tool_calls": [{"index": calls, "id": ev.call.id, "type": "function",
-                                             "function": {"name": ev.call.name,
-                                                          "arguments": json.dumps(ev.call.arguments, ensure_ascii=False)}}]})
+                args = json.dumps(call.arguments, ensure_ascii=False)
+                yield chunk({"tool_calls": [{"index": calls, "id": call.id, "type": "function",
+                                             "function": {"name": call.name, "arguments": args}}]})
                 calls += 1
         else:
             # a streamed call without its final tool_call is one the output ended inside: not "tool_calls" (#211)
             whole = calls and streamed.keys() <= finished
-            ended = x["finish"]
+            fin = cast(dict, x)                     # the run's last item: the DONE figures
+            ended = fin["finish"]
             finish = "tool_calls" if whole and ended == "stop" else {"cancel": "stop"}.get(ended, ended)
             last = chunk({}, finish)
-            pt = x.get("prompt_tokens", len(ids))     # after MCP rounds: the last round's prompt
-            last["usage"] = {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
-                             "total_tokens": pt + x["completion_tokens"],
+            pt = fin.get("prompt_tokens", len(ids))     # after MCP rounds: the last round's prompt
+            last["usage"] = {"prompt_tokens": pt, "completion_tokens": fin["completion_tokens"],
+                             "total_tokens": pt + fin["completion_tokens"],
                              # the part of the prompt the conversation cache already held (OpenAI's field)
-                             "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
-            if x.get("timings"):
-                last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
+                             "prompt_tokens_details": {"cached_tokens": fin.get("reused") or 0}}
+            if fin.get("timings"):
+                last["timings"] = fin["timings"]          # llama.cpp's field: the speed its clients show
             yield last
 
 
@@ -4566,7 +4589,8 @@ def _is_json(text: str) -> bool:
 
 
 def openai_collect(chunks) -> dict:
-    content, reasoning, by_index, last, mcp = [], [], {}, None, []
+    content, reasoning, last, mcp = [], [], None, []
+    by_index: dict = {}
     lps: dict[str, list] = {"content": [], "reasoning_content": []}
     for c in chunks:
         if c is None:                              # a heartbeat
@@ -4579,8 +4603,8 @@ def openai_collect(chunks) -> dict:
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
         for tc in d.get("tool_calls") or []:       # streamed calls arrive in pieces: merge them by index
-            cur = by_index.setdefault(tc.get("index", len(by_index)), {"id": None, "type": "function",
-                                                                        "function": {"name": "", "arguments": ""}})
+            cur = by_index.setdefault(tc.get("index", len(by_index)),
+                                      {"id": None, "type": "function", "function": {"name": "", "arguments": ""}})
             cur["id"] = tc.get("id") or cur["id"]
             fn = tc.get("function") or {}
             cur["function"]["name"] += fn.get("name") or ""
@@ -4590,7 +4614,7 @@ def openai_collect(chunks) -> dict:
     assert last is not None                         # openai_chunks always ends with the finishing chunk
     if last["choices"][0]["finish_reason"] != "tool_calls":
         calls = [c for c in calls if _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
-    msg = {"role": "assistant", "content": "".join(content) or None}
+    msg: dict = {"role": "assistant", "content": "".join(content) or None}
     if "".join(reasoning):
         msg["reasoning_content"] = "".join(reasoning)
     if calls:
@@ -4651,19 +4675,21 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             yield None
             continue
         if kind == "event":
-            ev: Event = x
+            ev = cast(Event, x)
+            call = cast(ToolCall, ev.call)          # (None but for the tool_* events)
             if ev.kind == "tool_args":
                 yield "content_block_delta", {"type": "content_block_delta", "index": index,
                                               "delta": {"type": "input_json_delta", "partial_json": ev.text}}
                 continue
-            if ev.kind == "tool_call" and ev.call.id in streamed:
+            if ev.kind == "tool_call" and call.id in streamed:
                 finished.add(getattr(ev.call, "id", None))
                 continue
-            want = {"reasoning": "thinking", "content": "text", "tool_call": "tool_use", "tool_start": "tool_use"}[ev.kind]
+            want = {"reasoning": "thinking", "content": "text", "tool_call": "tool_use",
+                    "tool_start": "tool_use"}[ev.kind]
             if ev.kind not in ("tool_call", "tool_start") and not ev.text:
                 continue
             if ev.kind == "tool_start":
-                streamed.add(ev.call.id)
+                streamed.add(call.id)
                 used_tool = True
             if open_kind != want or want == "tool_use":
                 if open_kind is not None:
@@ -4686,7 +4712,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             else:
                 used_tool = True
                 yield "content_block_delta", {"type": "content_block_delta", "index": index, "delta": {
-                    "type": "input_json_delta", "partial_json": json.dumps(ev.call.arguments, ensure_ascii=False)}}
+                    "type": "input_json_delta", "partial_json": json.dumps(call.arguments, ensure_ascii=False)}}
         else:
             if open_kind is not None:
                 yield close()
@@ -4731,10 +4757,11 @@ def anthropic_collect(events) -> dict:
             except ValueError:                     # a call the output ended inside (#211): it has no input to give
                 blocks.pop()
         elif name == "message_delta":
-            msg["stop_reason"] = e["delta"]["stop_reason"]
             assert msg is not None
+            msg["stop_reason"] = e["delta"]["stop_reason"]
             msg["stop_sequence"] = e["delta"].get("stop_sequence")
             msg["usage"].update(e["usage"])
+    assert msg is not None                          # anthropic_events always starts with message_start
     msg["content"] = blocks
     return msg
 
@@ -5140,7 +5167,8 @@ def make_handler(svc: Service):
                     loaded = svc.loaded()
                     model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
                              "meta": {"n_ctx": svc.reported_ctx()},
-                             "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
+                             "architecture": {"input_modalities": (["text", "image"] if svc.vision is not None
+                                                                   else ["text"]),
                                               "output_modalities": ["text"]}}
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
                         model["status"] = {"value": "unloaded"}   # like llama-server's router: listed, loads on use
@@ -5461,7 +5489,8 @@ def make_handler(svc: Service):
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
             except OSError as e:
-                self._json(500, {"error": {"type": "server_error", "message": f"the run config cannot be written: {e}"}})
+                self._json(500, {"error": {"type": "server_error",
+                                           "message": f"the run config cannot be written: {e}"}})
                 return
             if changed:
                 print(f"[strata] the Settings view changed {', '.join(changed)} in {Path(svc.config_path).name} "
@@ -5699,8 +5728,8 @@ def make_handler(svc: Service):
                                  json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
 
             try:
-                for e in items:
-                    if e is None:
+                for item in items:
+                    if item is None:
                         # Codex's idle timeout (5 minutes by default) counts events, not SSE comments: while a long
                         # prompt is read, a response.in_progress every 15 s tells it the server is still working
                         if time.monotonic() - last >= 15:
@@ -5709,7 +5738,7 @@ def make_handler(svc: Service):
                         else:
                             self.wfile.write(b": keep-alive\n\n")
                     else:
-                        send(e)
+                        send(item)
                         last = time.monotonic()
                     self.wfile.flush()
             except OSError:
@@ -5848,6 +5877,7 @@ def make_handler(svc: Service):
 
 
 class Server(ThreadingHTTPServer):
+    svc: Service                       # set by serve()
     # On Windows SO_REUSEADDR lets a second server bind a port that is already serving, and requests then land on
     # either one (a forgotten second start of run-<model>.bat).  Without it the second start fails loudly instead.
     allow_reuse_address = os.name != "nt"
@@ -5956,7 +5986,8 @@ def warn_budget_over_ram(args) -> str | None:
 def lan_addresses() -> list[str]:
     """This PC's IPv4 addresses on its networks (what another device types in), without loopback/link-local."""
     import socket
-    first, ips = None, set()
+    first: str | None = None
+    ips: set[str] = set()
     try:                                                # the address of the default route; sends nothing (UDP)
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("10.255.255.255", 1))
@@ -5965,11 +5996,13 @@ def lan_addresses() -> list[str]:
         pass
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ips.add(info[4][0])
+            ips.add(str(info[4][0]))
     except OSError:
         pass
-    ok = lambda ip: ip and not ip.startswith(("127.", "169.254.", "0."))
-    return ([first] if ok(first) else []) + sorted(ip for ip in ips if ok(ip) and ip != first)
+
+    def ok(ip: str) -> bool:
+        return bool(ip) and not ip.startswith(("127.", "169.254.", "0."))
+    return ([first] if first is not None and ok(first) else []) + sorted(ip for ip in ips if ok(ip) and ip != first)
 
 
 def host_name(value) -> str:
@@ -6277,7 +6310,8 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
             out[key] = float(value)
         elif key == "repetition_penalty":
             if not number or value <= 0:
-                raise SystemExit(f"[strata] config sampling.repetition_penalty={value!r}: expected a number > 0 (1 = off)")
+                raise SystemExit(f"[strata] config sampling.repetition_penalty={value!r}: "
+                                 "expected a number > 0 (1 = off)")
             out[key] = float(value)
         elif key == "penalty_last_n":
             if not number or value != int(value) or value < 0:
@@ -6318,8 +6352,8 @@ def check_request_sampling(req) -> None:
             continue
         if isinstance(value, str) and value.strip():      # some clients send numbers as strings: read and used
             try:
-                num = float(value)
-                num = int(num) if integer and num == int(num) else (num if not integer else None)
+                f = float(value)
+                num: float | None = int(f) if integer and f == int(f) else (f if not integer else None)
                 if integer and num is None:
                     raise ValueError
                 if not integer and re.fullmatch(r"\s*[+-]?\d+\s*", value):
@@ -6340,7 +6374,8 @@ def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: lis
     n = len(groups)
     cpus = rp.cpu_sets(n, cfg.get("replica_cpus") is not False)
     print(f"[strata] {n} replicas on the cards {' | '.join(','.join(g) for g in groups)}"
-          f"{' (own CPU cores each)' if cpus else ''}: requests go to the least busy one, a conversation back to its own",
+          f"{' (own CPU cores each)' if cpus else ''}: requests go to the least busy one, "
+          "a conversation back to its own",
           flush=True)
     engines: list = [None] * n
     errors: list = []
@@ -6384,8 +6419,8 @@ def main() -> int:
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
-                    help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
-                         "on your network (set an API key); also \"host\" in the config")
+                    help="the address to listen on: 127.0.0.1 = this PC only (the default), "
+                         "0.0.0.0 = also other devices on your network (set an API key); also \"host\" in the config")
     ap.add_argument("--script", action="append",
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
@@ -6468,7 +6503,7 @@ def main() -> int:
             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
-            failed = []
+            failed: list = []
             for vc in vision_attempts(vcfg, a.vision_onednn):
                 if failed:
                     print(f"[strata] images: trying {vision_label(vc)} instead", flush=True)
