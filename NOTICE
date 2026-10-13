@@ -26,12 +26,15 @@ Copyright notices
 Every copyright holder whose work is in this repository, its license and where the license text is:
 
 - Copyright (C) 2026 MistVVK and the XeStrata contributors
-  LGPL-3.0-or-later - XeStrata - COPYING.LESSER, COPYING
+  LGPL-3.0-or-later - XeStrata, as a whole and in its own files - COPYING.LESSER, COPYING
 - Copyright (c) 2026 Niko1221 and the Strata contributors
-  MIT - Strata, which XeStrata is a port of; its code is part of XeStrata under the LGPL - text below
+  MIT - Strata, which XeStrata is a port of. Strata's files XeStrata has not changed stay under MIT alone
+  (their headers say MIT); in those XeStrata has changed, Strata's code stays under MIT and XeStrata's changes
+  and the file as a whole are under the LGPL (LGPL-3.0-or-later AND MIT) - text below
 - Copyright (c) 2023-2026 The ggml authors
   MIT - third_party/main/ggml/ggml-common.h (an unmodified copy, kept under MIT), and the code in src/ transcribed
-  from ggml / llama.cpp (each such file says so in its header; part of XeStrata under the LGPL) - text below and in
+  from ggml / llama.cpp (each such file says so in its header; the code stays under MIT, the file as a whole is
+  under the LGPL: LGPL-3.0-or-later AND MIT) - text below and in
   third_party/main/ggml/LICENSE. setup also fetches llama.cpp (MIT, the same authors) into third_party/main/llama.cpp,
   with its own LICENSE
 - Copyright 2021 The Outfit Project Authors (https://github.com/Outfitio/Outfit-Fonts)
@@ -47,8 +50,8 @@ Every copyright holder whose work is in this repository, its license and where t
   LICENSES/LLVM-exception.txt
 - Copyright 2022-2026 Maxime Chambonnet, Étienne Mollier, Cordell Bloor, Xuanteng Huang, Christian Kastner, Igor Luppi, Talha Can Havadar
   Expat (MIT) - the target features tools/intel_llvm_build.py gives ROCm's device libraries' build, transcribed
-  from the debian/rules of Debian's rocm-llvm package (https://salsa.debian.org/rocm-team/rocm-llvm); part of
-  XeStrata under the LGPL - text below
+  from the debian/rules of Debian's rocm-llvm package (https://salsa.debian.org/rocm-team/rocm-llvm); they stay
+  under Expat, the file as a whole is under the LGPL (LGPL-3.0-or-later AND MIT) - text below
 - Copyright (c) 2014-2016, Advanced Micro Devices, Inc.
   University of Illinois/NCSA Open Source License - ROCm's device libraries (ocml, ockl and the others, from
   https://github.com/ROCm/llvm-project, amd/device-libs), which tools/intel_llvm_build.py builds with intel/llvm and

@@ -393,8 +393,9 @@ XeStrata (copyright MistVVK and the XeStrata contributors) is free software; the
   oneAPI compilers, cuBLAS and the CUDA runtime and driver, for example), may be distributed as well: an additional
   permission under section 7 of the GPL, version 3, worded in [NOTICE](NOTICE).
 - **Code from Strata and ggml:** the code that comes from Strata and from ggml / llama.cpp, both MIT (the kernels
-  transcribed into `src/` included), is part of XeStrata under the LGPL; as MIT asks, their copyright and permission
-  notices are kept in [NOTICE](NOTICE).
+  transcribed into `src/` included), stays under MIT. Strata's files XeStrata has not changed are under MIT alone; in
+  a file XeStrata has changed or that carries transcribed code, XeStrata's changes and the file as a whole are under
+  the LGPL (its header says `LGPL-3.0-or-later AND MIT`). The copyright and permission notices are in [NOTICE](NOTICE).
   So is what `tools/intel_llvm_build.py` transcribes from Debian's rocm-llvm package (Expat).
 - **Exceptions:** these, in `third_party/`, stay under their own licenses, one folder per project with its license text.
    - XeStrata's patches to intel/llvm (`third_party/main/intel-llvm/`): Apache-2.0 WITH LLVM-exception.
