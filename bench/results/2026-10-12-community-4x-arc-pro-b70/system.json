@@ -1,0 +1,37 @@
+{
+ "gpus": [
+  {
+   "index": 0,
+   "pci": "0000:0a:00.0",
+   "name": "Intel Arc Pro B70",
+   "vram_gib": 31.9,
+   "power_cap_w": 275
+  },
+  {
+   "index": 1,
+   "pci": "0000:0e:00.0",
+   "name": "Intel Arc Pro B70",
+   "vram_gib": 31.9,
+   "power_cap_w": 275
+  },
+  {
+   "index": 2,
+   "pci": "0000:14:00.0",
+   "name": "Intel Arc Pro B70",
+   "vram_gib": 31.9,
+   "power_cap_w": 275
+  },
+  {
+   "index": 3,
+   "pci": "0000:18:00.0",
+   "name": "Intel Arc Pro B70",
+   "vram_gib": 31.9,
+   "power_cap_w": 275
+  }
+ ],
+ "cpu": "13th Gen Intel Core i7-13700K (24 threads, AVX2, no AVX-512)",
+ "ram_gib_visible": 61,
+ "motherboard": "Raptor Lake-S host bridge",
+ "storage": "single NVMe partition holding models, pack and MTP",
+ "pcie_topology": "four cards behind PCIe switch branches of one root complex; lspci's LnkSta on the card reports an internal port (x1 2.5GT/s), not the data path (the engine's own copy test measures 26.7 GB/s; see README)"
+}
