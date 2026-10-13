@@ -1168,17 +1168,17 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
     std::string note;
     std::vector<ComplementChunk> chunks;   ///< the arena in parts when one allocation was refused
+    bool heap = false;                     ///< the arena is std::malloc's (the pageable copy)
     auto release = [&]() {
         if (arena == nullptr) return;
-        if (!chunks.empty()) {
-            for (const ComplementChunk& c : chunks) (void) strata::gpu::free(c.host);
-            chunks.clear();
-        } else if (pinned_ok) (void) strata::gpu::free(arena);
-        else {
+        if (heap) {
             if (partial_pin > 0) (void) strata::gpu::host_unregister(arena);
             if (locked > 0) strata::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
             std::free(arena);
-        }
+        } else if (!chunks.empty()) {
+            for (const ComplementChunk& c : chunks) (void) strata::gpu::free(c.host);
+            chunks.clear();
+        } else (void) strata::gpu::free(arena);
         arena = nullptr;
     };
     if (bytes > 0) {
@@ -1254,6 +1254,7 @@ bool FileExpertSource::pin_cache_complement(
                 err = "FileExpertSource: pageable resident complement allocation failed";
                 return false;
             }
+            heap = true;
         }
         host = (const uint8_t*) arena;
     }
