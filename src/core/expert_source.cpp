@@ -2958,7 +2958,14 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // plan v0.3 P6: device aliases of the mapped registration, for the PCIe share of the misses
     dev_slice_.clear();
     slice_bytes_ = a->slice_bytes;
+    // Windows: CUDA gives registered memory a device address of its own, not the host's (the RTX 3050 Laptop read the
+    // host address and faulted), so a registration there is for copies only, as Level Zero's: make_kernel_readable
+    // moves the arena into host USM when the PCIe share needs it.  Host USM is the same address on both sides.
+#if defined(_WIN32)
+    if (a->registered_bytes > 0 && !a->layer_base.empty()) {
+#else
     if (a->registered_bytes > 0) {
+#endif
         std::vector<uint64_t> starts = a->slice_bytes > 0 ? a->slice_starts : std::vector<uint64_t>{0};
         for (uint64_t off : starts) {
             void* d = nullptr;
