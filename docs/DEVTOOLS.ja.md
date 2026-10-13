@@ -213,13 +213,25 @@ curl -L https://github.com/Jake-Shadle/xwin/releases/download/0.10.0/xwin-0.10.0
     splat --output .tools/xwin/sdk
 curl -L https://github.com/intel/llvm/releases/download/nightly-2026-09-16/sycl_windows.tar.gz |
     tar -xz -C .tools/intel-llvm-win
-cmake -S . -B build/win -G Ninja -DCMAKE_BUILD_TYPE=Release \
+export CCACHE_DIR=$PWD/build/win-ccache CCACHE_COMPILERCHECK=content
+cmake -S . -B build/win -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=ON \
     -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-windows-msvc.cmake \
     -DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++ -DSTRATA_LICENSE=free \
-    -DSTRATA_XWIN=$PWD/.tools/xwin/sdk -DSTRATA_SYCL_WINDOWS=$PWD/.tools/intel-llvm-win
+    -DSTRATA_XWIN=$PWD/.tools/xwin/sdk -DSTRATA_SYCL_WINDOWS=$PWD/.tools/intel-llvm-win \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
 ninja -C build/win
 ```
 
+普段の変更では、触ったソースのオブジェクトだけをコンパイルします（[AGENTS.md](../AGENTS.md#operating-systems-linux-main-and-windows)）。
+ninja はソースのパスに `^` を付けると、そのソースのオブジェクトを作ります（パスはフルパスで書きます）。
+
+```sh
+export CCACHE_DIR=$PWD/build/win-ccache CCACHE_COMPILERCHECK=content
+ninja -C build/win $(git diff --name-only HEAD -- '*.cpp' | sed "s|^|$PWD/|; s|$|^|")
+```
+
+- ccache は「ビルドを速くする」の節と同じものです。Windows 向けのオブジェクトは Linux 向けのものと設定が違って当たらないので、`CCACHE_DIR` を分けて Linux 向けのキャッシュを追い出さないようにします。`CCACHE_COMPILERCHECK=content` は、intel/llvm を作り直したときにコンパイラーを中身で見分けるためです。
+- ヘッダーだけを変えたときは、`ninja -C build/win` で全体を作ります（ccache が変わっていないファイルを返します）。
 - xwin の `cache` は展開のあとは要らず、消してかまいません（`sdk` は 0.8 GB）。
 - lld-link は、`sycl9.lib` について `skipping imported DllMain symbol` と警告します。MSVC で作られたインポートライブラリを lld で読むときに出るもので、リンクの結果には関係しません。
 

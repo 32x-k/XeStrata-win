@@ -213,13 +213,25 @@ curl -L https://github.com/Jake-Shadle/xwin/releases/download/0.10.0/xwin-0.10.0
     splat --output .tools/xwin/sdk
 curl -L https://github.com/intel/llvm/releases/download/nightly-2026-09-16/sycl_windows.tar.gz |
     tar -xz -C .tools/intel-llvm-win
-cmake -S . -B build/win -G Ninja -DCMAKE_BUILD_TYPE=Release \
+export CCACHE_DIR=$PWD/build/win-ccache CCACHE_COMPILERCHECK=content
+cmake -S . -B build/win -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=ON \
     -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-windows-msvc.cmake \
     -DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++ -DSTRATA_LICENSE=free \
-    -DSTRATA_XWIN=$PWD/.tools/xwin/sdk -DSTRATA_SYCL_WINDOWS=$PWD/.tools/intel-llvm-win
+    -DSTRATA_XWIN=$PWD/.tools/xwin/sdk -DSTRATA_SYCL_WINDOWS=$PWD/.tools/intel-llvm-win \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
 ninja -C build/win
 ```
 
+For an everyday change, only the objects of the sources it touches are compiled ([AGENTS.md](../AGENTS.md#operating-systems-linux-main-and-windows)).
+ninja builds a source's object when given the source's path with `^` after it (a full path).
+
+```sh
+export CCACHE_DIR=$PWD/build/win-ccache CCACHE_COMPILERCHECK=content
+ninja -C build/win $(git diff --name-only HEAD -- '*.cpp' | sed "s|^|$PWD/|; s|$|^|")
+```
+
+- ccache is the one of "Faster builds" above. The Windows objects never hit the Linux ones (their settings differ), so a `CCACHE_DIR` of their own keeps them from pushing the Linux cache out. `CCACHE_COMPILERCHECK=content` tells the compiler by its content when intel/llvm is built again.
+- When only a header changed, `ninja -C build/win` builds everything (ccache returns the files that did not change).
 - xwin's `cache` is not needed after the splat and may be deleted (`sdk` is 0.8 GB).
 - lld-link warns `skipping imported DllMain symbol` about `sycl9.lib`: it comes from lld reading an import library MSVC made, and does not change the link.
 
