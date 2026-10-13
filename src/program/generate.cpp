@@ -6027,11 +6027,21 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> other_gpus;
         for (const auto& st : stages)
             other_gpus.insert(other_gpus.end(), st->profile.begin(), st->profile.begin() + st->held);
-        // STRATA_RESIDENT_PIN=0: never page-locked, 1: always; else as the RAM allows (#11)
+        // STRATA_RESIDENT_PIN=0: never page-locked, 1: always; else as the RAM allows (#11).  Windows: pageable unless
+        // asked for (1, or auto for the RAM rule): on the R9700 through intel/llvm's HIP adapter, --serve's GPU faulted
+        // (hipErrorLaunchFailure) right after a page-locked copy of more than about 6 GiB was built, for a cause not
+        // found (upstream's HIP engine locks 10.6 GiB there); pageable, the decode measured the same
         using Pin = strata::core::FileExpertSource::Pin;
         const char* pin_env = std::getenv("STRATA_RESIDENT_PIN");
+        const bool pin_auto = pin_env != nullptr && std::strcmp(pin_env, "auto") == 0;
+#if defined(_WIN32)
+        const bool pin_default_off = !pin_auto;
+#else
+        const bool pin_default_off = false;
+#endif
         const Pin pin = !o.resident_pin || (pin_env != nullptr && std::strcmp(pin_env, "0") == 0) ? Pin::off
                         : pin_env != nullptr && std::strcmp(pin_env, "1") == 0 ? Pin::on
+                        : pin_default_off                                      ? Pin::off
                                                                                : Pin::automatic;
         if (!src.pin_cache_complement(xcache, err, pin, other_gpus, lend_from, 8ull << 30, budget,
                                       stages.empty() ? &profile : &profile_all) ||

@@ -1276,22 +1276,6 @@ bool FileExpertSource::pin_cache_complement(
         arena = nullptr;
     };
     if (bytes > 0) {
-        // Windows: past what the GPU can map, page-locking can succeed and the GPU's kernels then fault (the R9700,
-        // with --serve's buffers on top of a 6.2 GiB complement); the ordinary copy instead, with room left for the
-        // page-locked buffers the engine allocates after it (about 0.4 GiB in --serve)
-        constexpr uint64_t kPinReserve = 512ull << 20;
-        uint64_t pin_room = 0;
-        static const bool cap_off = [] {   // STRATA_PIN_CAP=0: no such check (A/B)
-            const char* v = std::getenv("STRATA_PIN_CAP");
-            return v != nullptr && v[0] == '0';
-        }();
-        if (lock && !cap_off && strata::gpu::host_pin_room(&pin_room) && bytes + kPinReserve > pin_room) {
-            char why[160];
-            std::snprintf(why, sizeof why, "not page-locked: the GPU can map %.2f GiB more host memory",
-                          (double) pin_room / 1073741824.0);
-            note = why;
-            lock = false;
-        }
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
                      (double) bytes / 1073741824.0, lock ? "page-locked" : "pageable resident");
         std::fflush(stderr);

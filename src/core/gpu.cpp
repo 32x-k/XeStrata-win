@@ -603,13 +603,7 @@ bool host_pin_room(uint64_t* room, uint64_t* budget) {
         uint64_t b = 0, used = 0;
         std::string why;
         if (!platform::gpu_shared_memory_budget(luid.data(), b, used, why)) return false;
-        // A quarter of the RAM: measured on the R9700 (28 GiB of RAM, the DXGI budget 13,372 MiB), where the engine
-        // ran with 6,750 MiB of page-locked memory mapped and its kernels faulted with 7,118 MiB, well inside the
-        // budget.  The limit is the driver's; other drivers may allow more.
-        const uint64_t quarter = platform::total_physical_memory() / 4;
-        uint64_t r = b > used ? b - used : 0;
-        if (quarter > 0) r = std::min<uint64_t>(r, quarter > used ? quarter - used : 0);
-        if (room) *room = r;
+        if (room) *room = b > used ? b - used : 0;
         if (budget) *budget = b;
         return true;
     } catch (const std::exception& e) { return fail("host_pin_room", e); }
