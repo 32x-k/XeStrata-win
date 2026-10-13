@@ -377,7 +377,7 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata_core PUBLIC strata_sycl strata_warnings strata_plan strata_platform)
 
   add_executable(strata-device src/core/device_main.cpp)
-  target_link_libraries(strata-device PRIVATE strata_core)
+  target_link_libraries(strata-device PRIVATE strata_core strata_kernels_cpu)   # --cpu: the engine's CPU tests
   add_executable(strata-load src/core/load_main.cpp)
   target_link_libraries(strata-load PRIVATE strata_core)
 
