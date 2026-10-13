@@ -15,6 +15,12 @@
 #include <system_error>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace strata::core {
 
@@ -275,7 +281,17 @@ std::optional<HostMemoryReading> sample_host_memory(const MemoryProbePaths& path
 }
 
 std::optional<HostMemoryReading> sample_host_memory() {
+#if defined(_WIN32)
+    // Windows has no /proc/meminfo (upstream 0.1.43): the free physical RAM, bounded by the commit still free, which
+    // refuses an allocation while physical RAM is still free (#1607)
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof status;
+    if (!GlobalMemoryStatusEx(&status)) return {};
+    return combine(std::min<uint64_t>(status.ullAvailPhys, status.ullAvailPageFile), status.ullTotalPhys, CgroupScan{},
+                   memory_limit_bytes());
+#else
     return sample_host_memory(MemoryProbePaths{}, memory_limit_bytes());
+#endif
 }
 
 std::optional<uint64_t> available_host_bytes() {
