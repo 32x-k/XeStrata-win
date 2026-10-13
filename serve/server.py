@@ -748,9 +748,23 @@ class StrataEngine:
         threading.Thread(target=self._ready_pump, args=(self.proc, ready_q), daemon=True).start()
         ready_deadline = None if ENGINE_READY_S is None else time.monotonic() + ENGINE_READY_S
         timed_out = False
+        # past ENGINE_READY_S an engine still at work (CPU or disk in the last window, as _stall_check reads it) is
+        # waited for, a window at a time; a frozen one, or one that cannot be read, is ended as before.  A big RAM copy
+        # from a cold disk took longer than the limit and was killed with SIGKILL while it loaded, with nothing in its
+        # log (R9700 x2, IQ3_S, 30.8 GiB page-locked, the GPU caches filled at 88 MB/s).
+        work_base = None
+        work_window = min(x for x in (ENGINE_STALL_S, ENGINE_READY_S) if x is not None) if ENGINE_STALL_S else None
         while True:
             left = None if ready_deadline is None else ready_deadline - time.monotonic()
             if left is not None and left <= 0:
+                now = self._activity() if work_window else None
+                if work_window and now is not None and (work_base is None or not engine_frozen(work_base, now)):
+                    if work_base is None:
+                        print(f"[strata] the engine has not reported READY within {ENGINE_READY_S:.0f} s but is still "
+                              "loading (CPU or disk at work): waiting while it works (STRATA_ENGINE_READY_S, "
+                              "STRATA_ENGINE_STALL_S)", flush=True)
+                    work_base, ready_deadline = now, time.monotonic() + work_window
+                    continue
                 timed_out = True
                 break
             try:
