@@ -7,6 +7,113 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 [English](README.md) | 日本語
 
+## このブランチについて（Windows と AMD の GPU）
+
+> この節は `feature/windows-r9700-sycl` ブランチで足したものです。区切り線から下は本家 XeStrata の README のままです。
+
+このブランチは、XeStrata を Windows 11 で AMD の GPU を使って動かすための移植です。
+intel/llvm（DPC++）を Windows の上で HIP のターゲットだけでビルドし、XeStrata を free モードでコンパイルします。
+本家の更新は取り込みながら進めていて、今は xe0.1.43.1 までを含みます。
+
+### していること
+
+- intel/llvm v7.1.1 を Windows でビルドするための修正（`third_party/main/intel-llvm/patches` の 90〜92。本家のパッチと番号が重ならないよう 90 から付けています）
+- oneMath の rocBLAS のバックエンドを Windows でビルドし（`third_party/main/oneMath/patches/windows-gnu-driver.patch`）、prefill の密な行列積に使う
+- Windows に合わせたエンジンの修正: GPU のメモリの予算（DXGI から LUID で読む）、空き RAM の読み取り、シグナルと異常終了の扱い、ファイルの読み方、rocBLAS に GPU 用のファイルがないときの自前カーネルへの切り替えなど
+- 速さの調整: GGUF のエキスパートをそのまま読むネイティブパック、GPU のキャッシュにないエキスパートの RAM 側のコピー（`--resident-experts`）
+
+### 対応している GPU
+
+- Windows で動くのは AMD の GPU だけです（HIP）。確かめたのは Radeon AI PRO R9700（gfx1201、32 GB）だけです。
+- Windows の Intel Arc と NVIDIA の GPU は、ビルドしていません。
+- Linux では本家の XeStrata と同じです（Intel Arc、AMD、NVIDIA）。
+
+### Windows で使える機能
+
+- `strata.exe` によるテキストの生成（`--tokens-file`）
+- `--serve` と `serve/server.py` による OpenAI 互換の API
+- ネイティブパック（`tools/iq_pack.py`）、MTP による推測デコード、`--resident-experts`、rocBLAS による prefill
+
+本家と違うところ:
+
+- インストーラー（`xestrata --setup`）と deb・rpm のパッケージは Linux 用です。Windows では下のとおり手でビルドします。
+- Windows では、RAM 側のエキスパートのコピーを既定でページロックしません。`STRATA_RESIDENT_PIN=1` でページロックすると prefill のエキスパートのコピーが速くなりますが、`--serve` では約 6 GiB を超えると GPU が落ちることがあります。
+- 適応キャッシュ（エキスパートの入れ替え）は入れ替えが遅く、`--adapt-every 0` のほうが速く動きます。
+- `--gpu-stages` は、ネイティブパックでは動きません。
+
+### ビルド
+
+詳しい手順は [docs/DEVTOOLS.ja.md](docs/DEVTOOLS.ja.md) の「Windows（AMD の GPU、HIP）」にあります。
+
+1. 用意するもの: Visual Studio 2022 Build Tools（C++ のワークロード）、CMake、Ninja、Python、ROCm の Windows 用 SDK（AMD の TheRock の Python の wheel。clang、HIP のランタイム、rocBLAS を含む）、ROCm 7.2 の Linux 用のデバイスライブラリ（`amdgcn/bitcode`）。
+2. intel/llvm v7.1.1 を取得し、`third_party/main/intel-llvm/patches` のパッチを番号順に当てます。
+3. Visual Studio の `x64 Native Tools Command Prompt` で intel/llvm を構成してビルドします。
+
+   ```bat
+   python buildbot\configure.py -o build -t Release --hip --hip-platform AMD ^
+     "--cmake-opt=-DCMAKE_INSTALL_PREFIX=<intel-llvm>/install" ^
+     "--cmake-opt=-DUR_HIP_ROCM_DIR=<ROCm SDK>" "--cmake-opt=-DUR_HIP_LIB_DIR=<ROCm SDK>/lib" ^
+     "--cmake-opt=-DLIBCLC_TARGETS_TO_BUILD=amdgcn--amdhsa" "--cmake-opt=-DSYCL_ENABLE_BACKENDS=hip" ^
+     "--cmake-opt=-DLLVM_ENABLE_DIA_SDK=OFF" ^
+     "--cmake-opt=-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS /utf-8" ^
+     "--cmake-opt=-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /GR /EHsc /utf-8"
+   cmake --build build --target deploy-sycl-toolchain
+   ```
+
+4. デバイスライブラリの `wchar_size` を Windows に合わせて書き換えます。
+
+   ```bat
+   python tools\windows\device_libs_wchar.py <intel-llvm>\build\bin <ROCm 7.2>\amdgcn\bitcode <device-libs>
+   ```
+
+5. XeStrata を構成してビルドします（`STRATA_HIP_ARCHS` は GPU のアーキテクチャ。R9700 は gfx1201）。
+
+   ```bat
+   cmake -S . -B build\free-win -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+     -DCMAKE_C_COMPILER=<intel-llvm>/install/bin/clang.exe ^
+     -DCMAKE_CXX_COMPILER=<intel-llvm>/install/bin/clang++.exe ^
+     -DSTRATA_LICENSE=free -DSTRATA_HIP_ARCHS=gfx1201 -DSTRATA_CUDA_ARCHS= -DSTRATA_ONEMKL=OFF ^
+     -DSTRATA_ROCM_DEVICE_LIBS=<device-libs> -DSTRATA_ROCM_ROOT=<ROCm SDK> ^
+     -DSTRATA_ENABLE_ONEMATH=ON -DCMAKE_PREFIX_PATH=<ROCm SDK> -DHIP_PATH=<ROCm SDK> ^
+     -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PACKAGE=OFF
+   cmake --build build\free-win --target strata onemath_blas_rocblas
+   ```
+
+6. ネイティブパックを作ります。
+
+   ```bat
+   python tools\iq_pack.py --gguf <model>-00001-of-00002.gguf --out <pack>
+   ```
+
+7. 動かすときは、intel/llvm の `install\bin`、ビルドの `bin`（oneMath の DLL）、ROCm の SDK の `bin` を `PATH` に置き、`ONEAPI_DEVICE_SELECTOR=hip:0` で GPU を選びます。
+
+   ```bat
+   build\free-win\strata.exe --pack <pack> --native <model>-00001-of-00002.gguf ^
+     --ple-gguf <model>-00002-of-00002.gguf --expert-profile data\expert-profile.bin --expert-cache auto ^
+     --resident-experts --prefill auto --spec 4 --spec-min-p 0.5 --mtp <MTP の下書き層> ^
+     --adapt-every 0 --pcie-frac 0 --tokens-file <prompt.ids> --max-new 256 --stats
+   ```
+
+### 今の計測（参考値）
+
+Radeon AI PRO R9700、Ryzen AI 9 HX 370、RAM 28 GB、Windows 11 で、Qwen3.8-Flash-Next の Q2_0、上の引数（MTP の推測デコード、4 トークン）で測りました（2026-10-14）。
+比べたのは本家の上流の Strata v0.1.43.1 の HIP 版で、同じ PC・モデル・プロンプトで、引数はその既定です。
+値は tok/s で、2 回測ったものは平均です。
+
+| プロンプト | 出力 | decode（このブランチ） | decode（Strata） | prefill（このブランチ） | prefill（Strata） |
+| --- | --- | --- | --- | --- | --- |
+| 50 トークン | 300 | 96 | 107 | 84 | 46 |
+| 190 トークン | 128 | 87 | 92 | 189 | 101 |
+| 2,301 トークン | 200 | 101 | 107 | 473 | 499 |
+| 18,801 トークン | 200 | 103 | 107 | 970 | 948 |
+| 40 トークン | 2,000 | 86 | 96 | 72 | 37 |
+
+`--serve` に 20 個の質問を続けて送ったときは、全体で 91 tok/s（Strata は 95 tok/s）で、20 個とも答えました。
+
+decode が Strata より遅いのは、主に GPU のキャッシュにないエキスパートを CPU で計算する時間と、MTP の下書きの時間です（GPU の verify の時間は同じくらいです）。
+
+---
+
 1,250 億パラメーターの AI モデルを、Intel Arc、AMD Radeon、NVIDIA のどれかの GPU 1 枚と普通の PC で動かします。
 
 XeStrata は、ふつうはサーバーで動かす大きな AI モデル

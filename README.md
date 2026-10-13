@@ -7,6 +7,113 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 English | [日本語](README.ja.md)
 
+## About this branch (Windows and AMD GPUs)
+
+> This section was added on the `feature/windows-r9700-sycl` branch. Everything below the rule is the upstream XeStrata README, unchanged.
+
+This branch ports XeStrata to Windows 11 with AMD GPUs.
+It builds intel/llvm (DPC++) on Windows with the HIP target only, and compiles XeStrata in the free mode with it.
+It keeps taking in upstream's releases; it now includes everything up to xe0.1.43.1.
+
+### What it does
+
+- Fixes for building intel/llvm v7.1.1 on Windows (90-92 in `third_party/main/intel-llvm/patches`, numbered from 90 so they do not collide with upstream's patches)
+- oneMath's rocBLAS backend built on Windows (`third_party/main/oneMath/patches/windows-gnu-driver.patch`), for the dense matrix products of prefill
+- Engine changes for Windows: the GPU memory budget (read from DXGI by LUID), the available RAM, signals and abnormal exits, file reading, and falling back to XeStrata's own kernels when rocBLAS has no files for the GPU, among others
+- Speed: the native pack, which reads the GGUF's experts in place, and a RAM copy of the experts the GPU cache does not hold (`--resident-experts`)
+
+### Supported GPUs
+
+- On Windows, only AMD GPUs run (HIP). Only the Radeon AI PRO R9700 (gfx1201, 32 GB) has been tried.
+- Intel Arc and NVIDIA GPUs are not built for on Windows.
+- On Linux, it is the same as upstream XeStrata (Intel Arc, AMD and NVIDIA).
+
+### What works on Windows
+
+- Text generation with `strata.exe` (`--tokens-file`)
+- The OpenAI-compatible API with `--serve` and `serve/server.py`
+- The native pack (`tools/iq_pack.py`), speculative decoding with MTP, `--resident-experts`, and prefill on rocBLAS
+
+Differences from upstream:
+
+- The installer (`xestrata --setup`) and the deb and rpm packages are for Linux. On Windows, build by hand as below.
+- On Windows, the RAM copy of the experts is not page-locked by default. `STRATA_RESIDENT_PIN=1` page-locks it and makes prefill's expert copies faster, but with `--serve` the GPU can fail once it is larger than about 6 GiB.
+- The adaptive cache swaps experts slowly; `--adapt-every 0` runs faster.
+- `--gpu-stages` does not work with the native pack.
+
+### Building
+
+The full steps are in [docs/DEVTOOLS.md](docs/DEVTOOLS.md), under "Windows (AMD GPUs, HIP)".
+
+1. You need: Visual Studio 2022 Build Tools (the C++ workload), CMake, Ninja, Python, the ROCm SDK for Windows (AMD's TheRock Python wheel, with clang, the HIP runtime and rocBLAS), and the Linux device libraries of ROCm 7.2 (`amdgcn/bitcode`).
+2. Get intel/llvm v7.1.1 and apply the patches in `third_party/main/intel-llvm/patches` in the order of their numbers.
+3. In Visual Studio's `x64 Native Tools Command Prompt`, configure and build intel/llvm:
+
+   ```bat
+   python buildbot\configure.py -o build -t Release --hip --hip-platform AMD ^
+     "--cmake-opt=-DCMAKE_INSTALL_PREFIX=<intel-llvm>/install" ^
+     "--cmake-opt=-DUR_HIP_ROCM_DIR=<ROCm SDK>" "--cmake-opt=-DUR_HIP_LIB_DIR=<ROCm SDK>/lib" ^
+     "--cmake-opt=-DLIBCLC_TARGETS_TO_BUILD=amdgcn--amdhsa" "--cmake-opt=-DSYCL_ENABLE_BACKENDS=hip" ^
+     "--cmake-opt=-DLLVM_ENABLE_DIA_SDK=OFF" ^
+     "--cmake-opt=-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS /utf-8" ^
+     "--cmake-opt=-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /GR /EHsc /utf-8"
+   cmake --build build --target deploy-sycl-toolchain
+   ```
+
+4. Rewrite the device libraries' `wchar_size` for Windows:
+
+   ```bat
+   python tools\windows\device_libs_wchar.py <intel-llvm>\build\bin <ROCm 7.2>\amdgcn\bitcode <device-libs>
+   ```
+
+5. Configure and build XeStrata (`STRATA_HIP_ARCHS` is the GPU's architecture; gfx1201 for the R9700):
+
+   ```bat
+   cmake -S . -B build\free-win -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+     -DCMAKE_C_COMPILER=<intel-llvm>/install/bin/clang.exe ^
+     -DCMAKE_CXX_COMPILER=<intel-llvm>/install/bin/clang++.exe ^
+     -DSTRATA_LICENSE=free -DSTRATA_HIP_ARCHS=gfx1201 -DSTRATA_CUDA_ARCHS= -DSTRATA_ONEMKL=OFF ^
+     -DSTRATA_ROCM_DEVICE_LIBS=<device-libs> -DSTRATA_ROCM_ROOT=<ROCm SDK> ^
+     -DSTRATA_ENABLE_ONEMATH=ON -DCMAKE_PREFIX_PATH=<ROCm SDK> -DHIP_PATH=<ROCm SDK> ^
+     -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PACKAGE=OFF
+   cmake --build build\free-win --target strata onemath_blas_rocblas
+   ```
+
+6. Make the native pack:
+
+   ```bat
+   python tools\iq_pack.py --gguf <model>-00001-of-00002.gguf --out <pack>
+   ```
+
+7. To run it, put intel/llvm's `install\bin`, the build's `bin` (oneMath's DLLs) and the ROCm SDK's `bin` on `PATH`, and choose the GPU with `ONEAPI_DEVICE_SELECTOR=hip:0`:
+
+   ```bat
+   build\free-win\strata.exe --pack <pack> --native <model>-00001-of-00002.gguf ^
+     --ple-gguf <model>-00002-of-00002.gguf --expert-profile data\expert-profile.bin --expert-cache auto ^
+     --resident-experts --prefill auto --spec 4 --spec-min-p 0.5 --mtp <the MTP draft layer> ^
+     --adapt-every 0 --pcie-frac 0 --tokens-file <prompt.ids> --max-new 256 --stats
+   ```
+
+### Current measurements (for reference)
+
+Measured on a Radeon AI PRO R9700, a Ryzen AI 9 HX 370, 28 GB of RAM and Windows 11, with Qwen3.8-Flash-Next's Q2_0 and the arguments above (speculative decoding with MTP, 4 tokens), on 2026-10-14.
+The comparison is upstream Strata v0.1.43.1's HIP build, on the same PC with the same model and prompts and its default arguments.
+Values are tok/s; those measured twice are averages.
+
+| Prompt | Output | decode (this branch) | decode (Strata) | prefill (this branch) | prefill (Strata) |
+| --- | --- | --- | --- | --- | --- |
+| 50 tokens | 300 | 96 | 107 | 84 | 46 |
+| 190 tokens | 128 | 87 | 92 | 189 | 101 |
+| 2,301 tokens | 200 | 101 | 107 | 473 | 499 |
+| 18,801 tokens | 200 | 103 | 107 | 970 | 948 |
+| 40 tokens | 2,000 | 86 | 96 | 72 | 37 |
+
+With 20 questions sent to `--serve` in a row, it answered all 20 at 91 tok/s overall (Strata: 95 tok/s).
+
+decode is slower than Strata's mostly from computing on the CPU the experts the GPU cache does not hold, and from MTP's drafting (the GPU's verify takes about as long).
+
+---
+
 Run a 125-billion-parameter AI model on one Intel Arc, AMD Radeon or NVIDIA GPU and an ordinary PC.
 
 XeStrata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**, a large AI model that
