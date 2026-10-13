@@ -6053,30 +6053,37 @@ int main(int argc, char** argv) {
                         : pin_env != nullptr && std::strcmp(pin_env, "1") == 0 ? Pin::on
                                                                                : Pin::automatic;
         if (!src.pin_cache_complement(xcache, err, pin, other_gpus, lend_from, 8ull << 30, budget,
-                                      stages.empty() ? &profile : &profile_all) ||
-            (o.adapt_every > 0 && o.adapt_swaps > 0 && !src.reserve_exchanges(o.adapt_swaps, err))) {
-            std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str()); return 1;
+                                      stages.empty() ? &profile : &profile_all)) {
+            // upstream #403 / #467: a RAM copy that cannot be made is not a reason to stop - the experts it would have
+            // held are read from the files like the ones outside it (pin_cache_complement leaves nothing half-built)
+            std::fprintf(stderr, "strata generate: WARNING: the resident RAM mode does not fit (%s); the experts the "
+                                 "GPU does not hold are read from the model files through the OS file cache "
+                                 "(--mmap-experts), which is slower when the RAM cannot keep them\n", err.c_str());
+        } else {
+            if (o.adapt_every > 0 && o.adapt_swaps > 0 && !src.reserve_exchanges(o.adapt_swaps, err)) {
+                std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str()); return 1;
+            }
+            // --adapt-async: twice the exchange buffers - the second half bounces the copies in whose source is not
+            // page-locked (an asynchronous copy instead of the driver's staged, synchronous one)
+            if (o.adapt_async && !src.reserve_exchanges((int64_t) 2 * o.adapt_swaps, err)) adapt_async_off(err.c_str());
+            // pageable buffers would make every copy of a round synchronous (the driver stages them): that is the blocking
+            // tier's cost, so the asynchronous tier is not worth running - said, and the blocking tier stays (upstream 5288cd29)
+            if (o.adapt_async && !src.exchange_pinned()) adapt_async_off("the exchange buffers could not be page-locked");
+            // #669 / #765: a big chunk lends many cache slots to the prompt path, and each lent slot's expert is read back
+            // from the SSD whenever the RAM could not keep its copy (31 GB: auto:32768 read prompts ~3x slower than auto).
+            // Said, never capped: --prefill is the user's, and with the RAM for them it is the faster one (+21-35%).
+            if (lend_from >= 0 && o.prefill_chunk > 8192 && xcache.slots() > lend_from &&
+                src.resident_lent_slots() < xcache.slots() - lend_from)
+                std::fprintf(stderr, "strata generate: WARNING: a prompt chunk of %lld tokens lends %lld cache slots to the "
+                                     "prompt path, but only %lld of their experts fit in RAM: the others are read from the "
+                                     "SSD on every chunk, and prompts can read ~3x slower than with --prefill auto (#669). "
+                                     "A smaller --prefill, or auto, keeps them all in RAM\n",
+                             (long long) o.prefill_chunk, (long long) (xcache.slots() - lend_from),
+                             (long long) src.resident_lent_slots());
+            std::fprintf(stderr, "strata generate: resident CPU experts: %.2f GiB, %lld experts\n",
+                         (double) src.resident_bytes() / 1073741824.0, (long long) src.resident_count());
+            mem_mark("the resident experts");
         }
-        // --adapt-async: twice the exchange buffers - the second half bounces the copies in whose source is not
-        // page-locked (an asynchronous copy instead of the driver's staged, synchronous one)
-        if (o.adapt_async && !src.reserve_exchanges((int64_t) 2 * o.adapt_swaps, err)) adapt_async_off(err.c_str());
-        // pageable buffers would make every copy of a round synchronous (the driver stages them): that is the blocking
-        // tier's cost, so the asynchronous tier is not worth running - said, and the blocking tier stays (upstream 5288cd29)
-        if (o.adapt_async && !src.exchange_pinned()) adapt_async_off("the exchange buffers could not be page-locked");
-        // #669 / #765: a big chunk lends many cache slots to the prompt path, and each lent slot's expert is read back
-        // from the SSD whenever the RAM could not keep its copy (31 GB: auto:32768 read prompts ~3x slower than auto).
-        // Said, never capped: --prefill is the user's, and with the RAM for them it is the faster one (+21-35%).
-        if (lend_from >= 0 && o.prefill_chunk > 8192 && xcache.slots() > lend_from &&
-            src.resident_lent_slots() < xcache.slots() - lend_from)
-            std::fprintf(stderr, "strata generate: WARNING: a prompt chunk of %lld tokens lends %lld cache slots to the "
-                                 "prompt path, but only %lld of their experts fit in RAM: the others are read from the "
-                                 "SSD on every chunk, and prompts can read ~3x slower than with --prefill auto (#669). "
-                                 "A smaller --prefill, or auto, keeps them all in RAM\n",
-                         (long long) o.prefill_chunk, (long long) (xcache.slots() - lend_from),
-                         (long long) src.resident_lent_slots());
-        std::fprintf(stderr, "strata generate: resident CPU experts: %.2f GiB, %lld experts\n",
-                     (double) src.resident_bytes() / 1073741824.0, (long long) src.resident_count());
-        mem_mark("the resident experts");
     }
     if (o.adapt_async && !src.complement_ready()) adapt_async_off("the resident RAM mode is not running");
     if (o.serve) {
