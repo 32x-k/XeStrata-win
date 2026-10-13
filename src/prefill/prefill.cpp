@@ -186,6 +186,15 @@ inline int bf16x2_mode() {
 }
 inline bool bf16x2() { return bf16x2_mode() != 0; }
 inline bool bf16x2_hc() { return bf16x2_mode() == 1; }
+// A small card's prompt chunk is what its buffers leave room for, and every chunk streams the experts again (an
+// 8 GB RTX 4070 at a 64K prompt: 2048-token chunks, 291 tok/s against 1,066 with 12 GB).  The hyper-connection
+// block's rows (xn16, lo, lo16, gated: written and read before a half's GDN, QSA or MoE work starts, and xn16 again
+// after it ends) live in the region that work uses (STRATA_PREFILL_HC_IN_REGION=0: their own place).
+inline bool env_off(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && std::strtol(v, nullptr, 10) == 0;
+}
+inline bool hc_in_region() { static const bool v = !env_off("STRATA_PREFILL_HC_IN_REGION"); return v; }
 // Experts dequantized (FP16) before one grouped product: G of them take G x 9.4 MiB (--prefill-experts)
 int g_expert_group = 16;
 constexpr int64_t GU_ELEMS = 1280ll * 2560, D_ELEMS = 2560ll * 640;
@@ -725,6 +734,13 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
 // chunk streams every expert.  Both are filled and read on m.cs, one kind a layer, so a model with both kinds of layer
 // keeps one place of the larger: their sum still kept an RTX 4070 from its 8192-token chunk on UD-Q4_K_XL (1,251 slots
 // lent where its 85% limit is 1,231).  The small chunks' MMQ ring is not here: the copy stream fills it.
+// The hyper-connection block's rows, carve's order (in the region with hc_in_region, else beside it).
+uint64_t hc_set_bytes(size_t T) {
+    Alloc a; a.count_only = true; bool ok = true;
+    a.take<uint16_t>(T * D, ok); a.take<float>(T * LR, ok); a.take<uint16_t>(T * LR, ok); a.take<float>(T * D, ok);
+    if (bf16x2_hc()) { a.take<uint16_t>(T * D, ok); a.take<uint16_t>(T * LR, ok); }
+    return a.used;
+}
 uint64_t expert_group_bytes(size_t T) {
     const MmqPlan& mp = mmq_plan();
     Alloc dq, q8;
@@ -866,14 +882,18 @@ bool Prefill::carve(size_t T, void* alloc) {
     // xn: the row scales only (F-1, gr_norm_rs: the FP32 normalized rows are not kept; a T x D buffer was 335 MB of
     // the borrowed cache slots at an 8192-token chunk)
     m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok); m.xn = o.take<float>(T * HC, ok);
-    m.xn16 = o.take<uint16_t>(T * D, ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
-    m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
+    auto take_hc = [&](Alloc& h) {
+        m.xn16 = h.take<uint16_t>(T * D, ok); m.lo = h.take<float>(T * LR, ok); m.lo16 = h.take<uint16_t>(T * LR, ok);
+        m.gated = h.take<float>(T * D, ok);
+        if (bf16x2_hc()) { m.xn16_lo = h.take<uint16_t>(T * D, ok); m.lo16_lo = h.take<uint16_t>(T * LR, ok); }
+    };
+    if (!hc_in_region()) take_hc(o);
+    m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
     m.mixed_h = o.take<uint16_t>(T * N, ok);
     // the embedding rows are dead once gr_broadcast has read them on m.cs; the half outputs written into bo come after
     // it on the same in-order queue (the GEMMs' too)
     m.bo = m.emb;
-    if (bf16x2_hc()) { m.xn16_lo = o.take<uint16_t>(T * D, ok); m.lo16_lo = o.take<uint16_t>(T * LR, ok); }
     if (bf16x2()) m.mixed_bf_lo = o.take<uint16_t>(T * N, ok);
     m.steps_dev = o.take<int32_t>(T * strata::kernels::kStepCount, ok);
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
@@ -884,10 +904,16 @@ bool Prefill::carve(size_t T, void* alloc) {
     {
         // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
         const uint64_t region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
-                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert)});
+                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert),
+                                          hc_in_region() ? hc_set_bytes(T) : (uint64_t) 0});
         uint8_t* base = o.take<uint8_t>((size_t) region, ok);
         m.region = base;
         m.region_bytes = region;
+        if (hc_in_region()) {
+            Alloc h;
+            h.base = base; h.cap = region; h.owned = &m.owned;
+            take_hc(h);
+        }
         Alloc a;
         a.base = base; a.cap = region; a.owned = &m.owned;
         m.qkv = a.take<float>(T * C, ok); m.z = a.take<float>(T * ZV, ok); m.ab = a.take<float>(T * 2 * HV, ok);
@@ -1176,10 +1202,10 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     o.count_only = true;
     o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     auto f = [&](size_t n) { o.take<float>(n, ok); };
-    f(T * N); f(T * D); f(T * HC); o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
-    f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok);
+    f(T * N); f(T * D); f(T * HC);
+    if (!hc_in_region()) o.take<uint8_t>((size_t) hc_set_bytes(T), ok);
+    f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok);
     if (!emb_reuse_account()) f(T * N);   // bo: aliases emb in carve; still counted unless STRATA_EMB_REUSE_ACCOUNT=1
-    if (bf16x2_hc()) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
     if (bf16x2()) o.take<uint16_t>(T * N, ok);
     o.take<int32_t>(T * strata::kernels::kStepCount, ok);
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
@@ -1188,7 +1214,8 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
-                                       moe_set_bytes(T, g.n_expert)}), ok);
+                                       moe_set_bytes(T, g.n_expert), hc_in_region() ? hc_set_bytes(T) : (uint64_t) 0}),
+                    ok);
     if (const uint64_t group_bytes = expert_group_bytes(T)) o.take<uint8_t>((size_t) group_bytes, ok);
     o.take<int32_t>((size_t) g.n_expert + 1, ok);
     if (mmq_plan().any) {
