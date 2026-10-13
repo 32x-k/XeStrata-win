@@ -4,6 +4,9 @@
 # Frozen prompts are hashed byte for byte (manifest sha256): never convert their line endings.
 bench/prompts/** -text
 
+# patches are applied with git apply: their bytes as stored, also on a Windows checkout (core.autocrlf)
+third_party/**/*.patch -text
+
 # launchers keep their platform line endings wherever the repository is cloned
 *.sh text eol=lf
 
