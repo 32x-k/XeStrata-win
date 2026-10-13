@@ -16,6 +16,10 @@
 #endif
 #endif
 
+#ifndef _WIN32
+#include <link.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -71,6 +75,29 @@ std::string pci_of(const sycl::device& d) {
     return s;
 }
 
+// No GPU on Level Zero, CUDA or HIP at all: the GPU's driver is missing, or the SYCL runtime did not load its adapter
+// for the backend.  A user who started the engine without the libraries setup gave it (the config's lib_dirs) read
+// only "no usable GPU" and looked for the fault in the card; say what the runtime lists and which libsycl it is.
+std::string no_gpu_listed() {
+    std::string seen;
+    for (const auto& p : sycl::platform::get_platforms())
+        seen += (seen.empty() ? "" : ", ") + p.get_info<sycl::info::platform::name>();
+    std::string lib = "?";
+#ifndef _WIN32
+    // the loaded object by its name: dladdr on one of its functions names the engine itself, which is not PIE (the
+    // address is the engine's PLT entry)
+    dl_iterate_phdr([](dl_phdr_info* info, size_t, void* out) {
+        if (info->dlpi_name == nullptr || std::strstr(info->dlpi_name, "/libsycl.so") == nullptr) return 0;
+        *static_cast<std::string*>(out) = info->dlpi_name;
+        return 1;
+    }, &lib);
+#endif
+    return "the SYCL runtime lists no GPU on Level Zero, CUDA or HIP (platforms: " + (seen.empty() ? "none" : seen) +
+           "; libsycl: " + lib + "): the GPU driver is missing, or the runtime did not load its adapter for the GPU. "
+           "Started by hand, the engine needs the lib_dirs of its config in LD_LIBRARY_PATH (the server sets it); "
+           "SYCL_UR_TRACE=1 shows which adapters load";
+}
+
 // The GPUs the engine can drive, device 0 first: the GPU chosen below, then the others in the same order of
 // preference.  Read once.
 std::vector<sycl::device> find_devices() {
@@ -84,7 +111,7 @@ std::vector<sycl::device> find_devices() {
         }
         candidates.push_back(d);
     }
-    if (candidates.empty()) throw DeviceError("no usable GPU" + refused);
+    if (candidates.empty()) throw DeviceError(refused.empty() ? no_gpu_listed() : "no usable GPU" + refused);
     // setup names the card by PCI address: Level Zero's own numbering can include GPUs that setup does not list
     if (const char* want = std::getenv("STRATA_GPU_PCI"); want != nullptr && *want != '\0') {
         std::string w = want;

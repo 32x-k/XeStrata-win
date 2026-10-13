@@ -123,6 +123,9 @@ file(WRITE ${CMAKE_BINARY_DIR}/package/BUILD.json
 install(FILES ${CMAKE_BINARY_DIR}/package/BUILD.json DESTINATION ${_pkg_engine})
 install(FILES third_party/main/intel-llvm/LICENSE.TXT
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.intel-llvm)
+# ROCm's device libraries: the engine's code for AMD GPUs carries parts of them (NCSA asks for the notice with binaries)
+install(FILES third_party/main/rocm-device-libs/LICENSE.TXT
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.rocm-device-libs)
 if(TARGET onemath)
   install(FILES third_party/main/oneMath/LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}
           RENAME LICENSE.oneMath)

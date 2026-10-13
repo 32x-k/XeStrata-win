@@ -508,6 +508,8 @@ if(STRATA_ENABLE_XE)
       set(ENABLE_ROCBLAS_BACKEND ON)
       list(GET _strata_hip_archs 0 HIP_TARGETS)
       strata_hip_cxx(HIP_CXX_COMPILER)
+      strata_hip_prefixes(_strata_rocm_prefixes)        # after what is given: AMD's trees, for find_package(hip)
+      list(APPEND CMAKE_PREFIX_PATH ${_strata_rocm_prefixes})
       # hipBLASLt, which the fork's rocBLAS backend hands the 16-bit GEMMs to where it has kernels for the GPU: without
       # it they run in rocBLAS, whose kernels for some GPUs are generic ones (gfx12 in ROCm 7.1: a fifteenth of the
       # speed).  A package must have it.

@@ -694,10 +694,38 @@ def strix_halo_notes(gpu, ram) -> list:
     return notes
 
 
+def rocm_roots() -> list:
+    """AMD's ROCm tree the build takes, as one ([] without one), so that two installed versions are not mixed: /opt/rocm
+    where it holds lib/ or include/ (ROCm 7.2's alternatives link to /opt/rocm-<version>, or ROCm 7.14's links into
+    /opt/rocm/core-7.14 that its amdrocm-core packages make), else /opt/rocm/core (their alternatives link), else the
+    newest /opt/rocm/core-<version> (ROCm 7.14's packages without amdrocm-core: nothing of /opt/rocm's own), else the
+    newest /opt/rocm-<version>.  The newest by the version's numbers: core-10.1 after core-7.14."""
+    def newest(paths):
+        return sorted(paths, key=lambda p: [int(n) for n in re.findall(r"\d+", p.name)], reverse=True)
+    opt = Path("/opt/rocm")
+    for root in [opt, opt / "core", *newest(opt.glob("core-*")), *newest(Path("/opt").glob("rocm-*"))]:
+        if (root / "lib").is_dir() or (root / "include").is_dir():
+            return [root.resolve() if root.is_symlink() else root]
+    return []
+
+
+def rocm_lib_dirs() -> list:
+    """The folders of AMD's ROCm libraries the engine needs on its library path: none where the loader finds
+    libamdhip64 (a distribution's, or a ROCm that installs an ld.so.conf); ROCm 7.14's packages install none, and the
+    SYCL runtime's HIP adapter then did not load (no GPU listed) until its lib/ was on LD_LIBRARY_PATH."""
+    try:
+        cached = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True).stdout
+    except OSError:
+        cached = ""
+    if "libamdhip64.so" in cached:
+        return []
+    return [str(r / "lib") for r in rocm_roots() if any((r / "lib").glob("libamdhip64.so*"))][:1]
+
+
 def rocblas_archs() -> set | None:
     """The AMD architectures the distribution's rocBLAS has code for (its kernels' file names), None without rocBLAS:
     the engine's dense matrix products run in it, so an AMD GPU it has no code for cannot run the engine."""
-    dirs = [d for d in (Path("/usr/lib64/rocblas/library"), Path("/opt/rocm/lib/rocblas/library"),
+    dirs = [d for d in (Path("/usr/lib64/rocblas/library"), *(r / "lib/rocblas/library" for r in rocm_roots()),
                         *Path("/usr/lib").glob("*/rocblas/*/library")) if d.is_dir()]
     if not dirs:
         return None
@@ -893,17 +921,21 @@ def rocm_missing() -> list:
     (oneMath's rocBLAS backend: the dense products), and hipblas-common, which hipBLASLt's CMake package needs and its
     distribution package does not depend on."""
     import glob
-    inc = [Path("/usr/include"), Path("/opt/rocm/include")]
+    roots = rocm_roots()
+    inc = [Path("/usr/include"), *(r / "include" for r in roots)]
     clang_ok = False
-    for cxx in glob.glob("/opt/rocm/llvm/bin/clang++") + glob.glob("/usr/lib64/rocm/llvm/bin/clang++") + \
-            glob.glob("/usr/lib/llvm-*/bin/clang++"):
+    for cxx in [str(c) for r in roots for c in (r / "llvm/bin/clang++", r / "lib/llvm/bin/clang++") if c.exists()] + \
+            glob.glob("/usr/lib64/rocm/llvm/bin/clang++") + glob.glob("/usr/lib/llvm-*/bin/clang++"):
         r = subprocess.run([cxx, "-print-libgcc-file-name", "--rtlib=compiler-rt"], capture_output=True, text=True)
         clang_ok = clang_ok or (r.returncode == 0 and Path(r.stdout.strip()).is_file())
     # in the order of PACKAGES' AMD part
     have = [any((d / "hip" / "hip_runtime_api.h").exists() for d in inc),
-            any(glob.glob(g) for g in ("/opt/rocm/amdgcn/bitcode/ockl.bc",
-                                       "/usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode/ockl.bc",
-                                       "/usr/lib/llvm-*/lib/clang/*/amdgcn/bitcode/ockl.bc")),
+            # (an intel/llvm built here has its own: tools/intel_llvm_build.py)
+            any((r / d / "ockl.bc").exists() for r in roots for d in ("amdgcn/bitcode", "lib/llvm/amdgcn/bitcode")) or
+            any(glob.glob(g) for g in ("/usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode/ockl.bc",
+                                       "/usr/lib/llvm-*/lib/clang/*/amdgcn/bitcode/ockl.bc",
+                                       str(INTEL_LLVM_DEFAULT / "amdgcn/bitcode/ockl.bc"),
+                                       str(INTEL_LLVM_CONTRIB / "amdgcn/bitcode/ockl.bc"))),
             clang_ok, clang_ok,
             any((d / "rocblas" / "rocblas.h").exists() for d in inc),
             any((d / "hipblaslt" / "hipblaslt.h").exists() for d in inc),
@@ -1708,6 +1740,7 @@ def choose_compiler(a, gpu: dict) -> dict:
             fail("building for the AMD GPU needs ROCm's " + ", ".join(missing),
                  ("install them: sudo dnf install " if distro_id() == "fedora" else "install them: sudo apt install ")
                  + " ".join(missing) + ", then run it again")
+        comp["lib_dirs"] = list(dict.fromkeys(comp["lib_dirs"] + rocm_lib_dirs()))
         if not any(Path(d).glob("libur_adapter_hip.so*") for d in comp["lib_dirs"]):
             # intel/llvm gets the HIP target only when ROCm's HIP is there as it is built
             llvm = Path(comp["cxx"]).parent.parent
@@ -1839,6 +1872,19 @@ def gpu_encoder(comp: dict) -> str:
     return "vulkan"
 
 
+def engine_cmake_args() -> list:
+    """--cmake-arg KEY=VALUE: CMake options of the user's for the engine's build (a ROCm or toolkit in a place CMake
+    does not look, for example; a user could not hand setup one and changed setup.py), kept in the settings so that
+    later builds (an update) take them again; --cmake-arg "" clears them."""
+    st = load_settings()
+    given = getattr(ARGS, "cmake_arg", None)
+    if given is None:
+        return list(st.get("cmake_args", []))
+    keep = [x for x in given if x]
+    save_settings({**st, "cmake_args": keep})
+    return keep
+
+
 def build_engine(visions, llama, comp: dict) -> Path:
     """Compile the engine with `comp` (choose_compiler) and the image encoders in `visions` ("cpu", "vulkan", "gpu" =
     SYCL); the results go to engine/.  A compiled engine or encoder whose source files or compiler changed since (a
@@ -1853,6 +1899,8 @@ def build_engine(visions, llama, comp: dict) -> Path:
     used = {"cxx": comp["cxx"], "version": comp["version"], "kind": comp["kind"], "xmx": comp["xmx"],
             "license": comp["license"], "cuda_archs": comp["cuda_archs"], "onemkl": comp["onemkl"],
             "hip_archs": comp.get("hip_archs", [])}
+    if extra := engine_cmake_args():                   # (only when given: a build without them stays as it was)
+        used["cmake_args"] = extra
     engine_ok = xe and (eng / EXE).exists() and meta.get("src") == src and meta.get("compiler") == used
     built = dict(meta.get("vision_srcs") or {}) if xe else {}
     missing = [v for v in dict.fromkeys(visions)
@@ -1866,8 +1914,9 @@ def build_engine(visions, llama, comp: dict) -> Path:
     if not engine_ok:
         bdir = ROOT / "build-xe"
         cache = bdir / "CMakeCache.txt"
-        if cache.exists() and f"CMAKE_CXX_COMPILER:FILEPATH={comp['cxx']}" not in cache.read_text(errors="replace"):
-            shutil.rmtree(bdir)                        # CMake keeps the compiler it configured with
+        if cache.exists() and (f"CMAKE_CXX_COMPILER:FILEPATH={comp['cxx']}" not in cache.read_text(errors="replace")
+                               or (meta.get("compiler") or {}).get("cmake_args") != used.get("cmake_args")):
+            shutil.rmtree(bdir)                        # CMake keeps the compiler and the -D values it configured with
         say("  The engine's source changed: compiling it again (only what changed) ..." if xe and (eng / EXE).exists()
             and bdir.exists() else "  Compiling the Strata engine for the GPU (20-40 minutes, once) ...")
         cmake_build(ROOT, bdir, "strata",
@@ -1878,7 +1927,7 @@ def build_engine(visions, llama, comp: dict) -> Path:
                      f"-DSTRATA_ONEMKL={'ON' if comp['onemkl'] else 'OFF'}",
                      *([f"-DMKL_ROOT={mkl_root()}"] if comp["onemkl"] else []), "-DSTRATA_ENABLE_XE=ON",
                      "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_PORTABLE=ON",
-                     f"-DSTRATA_GGML_DIR={llama}"], comp["env"])
+                     f"-DSTRATA_GGML_DIR={llama}", *(f"-D{x}" for x in used.get("cmake_args", []))], comp["env"])
         install_binary(bdir / EXE, eng / EXE)
     for v in missing:
         llama_def = f"-DLLAMA_DIR={llama}"
@@ -2281,12 +2330,17 @@ def default_data_dir() -> Path:
     return xdg_dir("XDG_DATA_HOME", ".local/share") if PACKAGED else ROOT.parent / "XeStrata-data"
 
 
+def data_folder_path(requested: str | None, settings: dict) -> Path:
+    """The data folder --data-dir names, else the one the settings name, else the default; nothing is made."""
+    return Path(requested).expanduser().resolve() if requested else \
+        Path(settings["data_dir"]) if settings.get("data_dir") else default_data_dir()
+
+
 def data_folder(requested: str | None) -> tuple:
     """(the data folder, folders on other drives that still hold model files).  Moves the model files of this folder
     and of earlier Strata folders on the same drive into the data folder, and points their configs there."""
     settings = load_settings()
-    dest = Path(requested).expanduser().resolve() if requested else \
-        Path(settings["data_dir"]) if settings.get("data_dir") else default_data_dir()
+    dest = data_folder_path(requested, settings)
     try:
         dest.mkdir(parents=True, exist_ok=True)
     except OSError as e:                                # e.g. no write access next to the Strata folder
@@ -3107,9 +3161,11 @@ def parallel_recommend(vram_gb: float, arena_gb: float, ctx: int, kv: str, strea
     return best
 
 
-def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, kv: str, streaming: bool) -> list[str]:
+def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, kv: str, streaming: bool,
+                  batch_mtp: bool = False) -> list[str]:
     """#465: what setup says about "parallel": the recommendation (or, where it would cost speed, why it is left at
-    one), or how the asked count compares with it (kept as asked: recommend, never force)."""
+    one), or how the asked count compares with it (kept as asked: recommend, never force).  `batch_mtp`: the engine
+    runs with --batch-mtp (the server's default with --mtp), which takes every slot asked, past PARALLEL_MAX."""
     rec = parallel_recommend(vram_gb, arena_gb, ctx, kv, streaming)
     slot = parallel_slot_gb(ctx, kv, streaming)
     if asked is None or asked <= 1:
@@ -3119,8 +3175,15 @@ def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, 
                 f"after the other (each takes ~{slot:.1f} GB of VRAM from the expert cache; docs/BATCHING.md)."]
     lines = [f"parallel requests: {asked} at once (each takes ~{slot:.1f} GB of VRAM from the expert cache, "
              f"{asked * slot:.1f} GB in all)"]
-    if asked > PARALLEL_MAX:
+    used = asked if batch_mtp else min(asked, PARALLEL_MAX)
+    if used < asked:
         lines.append(f"the engine runs at most {PARALLEL_MAX} at once; it will use {PARALLEL_MAX}")
+    if not rec or used > rec:
+        # every slot's session (and with --batch-mtp its drafter) is allocated before the expert cache: a user's 32 on
+        # a 24 GB card left it nothing; the engine then runs the slots that leave it a working cache
+        left = max(0.0, vram_gb - 5 - used * slot)
+        lines.append(f"{used} slots leave the expert cache ~{left:.1f} GB of VRAM; where that is too little the engine "
+                     "runs fewer, as many as fit")
     if not rec:
         lines.append(f"recommended for this card: one at a time - {PARALLEL_COST_NOTE}; kept as you chose")
     elif asked > rec:
@@ -3544,6 +3607,9 @@ def main() -> int:
                          "icpx and oneMKL, for Intel GPUs, with the SYCL image encoder. Kept for later runs")
     ap.add_argument("--intel-llvm", metavar="DIR",
                     help="build the engine with the intel/llvm installed in DIR (bin/clang++); kept for later runs")
+    ap.add_argument("--cmake-arg", action="append", metavar="KEY=VALUE",
+                    help="a CMake option for the engine's build (-DKEY=VALUE; e.g. STRATA_ROCM_DEVICE_LIBS=DIR), once "
+                         "for each; kept for later builds, --cmake-arg \"\" clears them")
     ap.add_argument("--intel-llvm-build", action="store_true",
                     help="build intel/llvm from source into .tools/intel-llvm and use it (13 minutes on 28 threads, "
                          "3.5 GB); a finished build is used again, an interrupted one continued")
@@ -3631,6 +3697,8 @@ def main() -> int:
     ARGS = a
     if a.vision_tokens is not None and a.vision_tokens < 1:
         ap.error("--vision-tokens takes a number of image tokens, 1 or more, e.g. --vision-tokens 768")
+    if any(x and "=" not in x for x in a.cmake_arg or []):
+        ap.error("--cmake-arg takes KEY=VALUE, e.g. --cmake-arg STRATA_ROCM_DEVICE_LIBS=/opt/rocm-7.1.1/amdgcn/bitcode")
     if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
         ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
     if a.bench_original_compat is not None and (a.bench or a.bench_verbose or a.original_strata):
@@ -3656,7 +3724,12 @@ def main() -> int:
     if a.check_update:
         return check_update()
     say("Strata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
-    data, elsewhere = data_folder(a.data_dir)          # the model files: in the data folder, found from any copy
+    # --check only reports (a user ran it to look, on a work machine): nothing made, moved or saved.  Given with what
+    # acts before it (a measurement, an update), the data folder is prepared as for those
+    if a.check and not (a.bench or a.bench_verbose or a.bench_original_compat is not None or a.update):
+        data, elsewhere = data_folder_path(a.data_dir, load_settings()), []
+    else:
+        data, elsewhere = data_folder(a.data_dir)      # the model files: in the data folder, found from any copy
     roots = [data, *elsewhere]
     if a.models_dir is None:
         a.models_dir = str(data / "models")
@@ -4326,8 +4399,9 @@ def main() -> int:
     if a.parallel is not None:
         if a.parallel >= 2:
             cfg["parallel"] = a.parallel
+            batch_mtp = "--mtp" in args and "--no-batch-mtp" not in args   # as serve/server.py's parallel_args
             for i, line in enumerate(parallel_note(a.parallel, gpu_expert_vram(gpu), MODELS[model]["arena_gb"], ctx, kv,
-                                                   streaming)):
+                                                   streaming, batch_mtp)):
                 (ok if i == 0 else warn)(line)
         else:
             cfg["parallel"] = 1

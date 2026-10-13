@@ -1380,6 +1380,9 @@ The model files are not part of it; their licenses apply to them (below).
 - **[intel/llvm](https://github.com/intel/llvm)**'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib-llvm modes' compiler and SYCL runtime.
   It is not in the repository: `tools/intel_llvm_build.py` fetches the release and builds it,
   with XeStrata's fixes from `third_party/main/intel-llvm/patches/`, under intel/llvm's license. See `third_party/main/intel-llvm/LICENSE.TXT`.
+- **[ROCm's device libraries](https://github.com/ROCm/llvm-project/tree/rocm-7.2.4/amd/device-libs)** (University of Illinois/NCSA, by AMD): ocml, ockl and the others, which the code for AMD GPUs links.
+  They are not in the repository: `tools/intel_llvm_build.py` fetches them from a release of ROCm's llvm-project and builds them with intel/llvm. See `third_party/main/rocm-device-libs/LICENSE.TXT`.
+  The target features their build is given are transcribed from the `debian/rules` of Debian's [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) package (Expat; its authors in NOTICE).
 - **Ideas** (references in the paper) from:
    - [Splash](https://github.com/incoai/splash), by Inco AI and the Splash contributors;
    - [ninfer](https://github.com/Neroued/ninfer), by Neroued;

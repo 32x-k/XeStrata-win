@@ -1359,6 +1359,9 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
 - **[intel/llvm](https://github.com/intel/llvm)** の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib-llvm のコンパイラと SYCL のランタイム。
   リポジトリには含めず、`tools/intel_llvm_build.py` がリリースを取ってきてビルドします。
   そのとき当てる XeStrata の修正は `third_party/main/intel-llvm/patches/` にあり、intel/llvm と同じライセンスです。`third_party/main/intel-llvm/LICENSE.TXT` を参照。
+- **[ROCm のデバイスライブラリ](https://github.com/ROCm/llvm-project/tree/rocm-7.2.4/amd/device-libs)**（University of Illinois/NCSA、AMD）: ocml・ockl などの、AMD の GPU 向けのコードがリンクするライブラリ。
+  リポジトリには含めず、`tools/intel_llvm_build.py` が ROCm の llvm-project のリリースから取ってきて、intel/llvm と一緒にビルドします。`third_party/main/rocm-device-libs/LICENSE.TXT` を参照。
+  そのビルドに渡す機能の指定は、Debian の [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) のパッケージ（Expat、著作者は NOTICE）の `debian/rules` から写しました。
 - **参考にした考え方**（文献は論文にあります）:
    - Inco AI と Splash の貢献者による [Splash](https://github.com/incoai/splash)。
    - Neroued による [ninfer](https://github.com/Neroued/ninfer)。

@@ -1184,6 +1184,14 @@ bool iq_mmq_dp4a_usable(sycl::queue& q) {
     });
 }
 
+const char* iq_mmq_path(sycl::queue& q) {
+    if (iq_mmq_usable(q)) {
+        const sycl::device d = q.get_device();
+        return xe::amd_wmma(d) ? "WMMA" : shape_reported(d) ? "joint_matrix" : "XMX";
+    }
+    return iq_mmq_dp4a_usable(q) ? "DP4a" : nullptr;
+}
+
 bool iq_mmq_type_sums(int t) { return t == 12 || t == 13; }   // has_min
 
 bool iq_mmq_type_ok(int t) {

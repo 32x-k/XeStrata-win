@@ -113,6 +113,8 @@ public:
     /// Runs each dense product the prompt takes once, so the products' library has loaded its kernels before the
     /// first prompt (plain_prompt.cpp); nothing when the prompt runs in windows.
     bool prompt_warm(std::string& err);
+    /// Whether every MoE layer's experts take the int8 products on this GPU (iq_mmq; STRATA_PLAIN_MMQ=0: no).
+    bool prompt_int8() const;
 
     /// Drafts a window can check (0: no speculative decoding): spec - 1 when the model has its MTP layer.
     int drafts() const { return has_mtp_ ? n_snap_ : 0; }
@@ -238,8 +240,6 @@ private:
     };
     /// Lays the buffers for chunks of `T` tokens out from `dev` / `host` (null: only counts), returning the device and
     /// host bytes.
-    /// Whether every MoE layer's experts take the int8 products on this GPU (iq_mmq; STRATA_PLAIN_MMQ=0: no).
-    bool prompt_int8() const;
     void prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* host, uint64_t& dev_bytes,
                       uint64_t& host_bytes) const;
     PromptBufs pb_;

@@ -345,6 +345,9 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
      CMake が XeStrata の変更の入ったフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、同じライセンス）から取得します。
    - [intel/llvm](https://github.com/intel/llvm) の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib-llvm のコンパイラ。
      XeStrata の修正（`third_party/main/intel-llvm/patches/`、同じライセンス）を当ててビルドし、パッケージにはその SYCL の実行時を入れます。
+   - AMD による [ROCm のデバイスライブラリ](https://github.com/ROCm/llvm-project/tree/rocm-7.2.4/amd/device-libs)（University of Illinois/NCSA）:
+     intel/llvm と一緒にビルドし、AMD の GPU 向けのコードがリンクします。
+     そのビルドに渡す機能の指定は、Debian の [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) のパッケージ（Expat）の `debian/rules` から写しました。
    - 画面のフォント [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1）。
 - **参考にした考え方**:
    - Inco AI と Splash の貢献者による [Splash](https://github.com/incoai/splash)。
@@ -364,6 +367,7 @@ XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフト�
   GPL 第 3 版の第 7 条による追加の許可で、文面は [NOTICE](NOTICE) にあります。
 - **Strata と ggml から来たコード**: MIT ライセンスの Strata と ggml / llama.cpp から来たコード（`src/` に書き写したカーネルを含む）も、
   XeStrata の一部として LGPL です。MIT の条件どおり、著作権表示と許諾表示を [NOTICE](NOTICE) に残しています。
+  Debian の rocm-llvm のパッケージ（Expat）から `tools/intel_llvm_build.py` に写した部分も同じです。
 - **例外**: `third_party/` の次のものは、元のライセンスのままです。プロジェクトごとのフォルダーに、ライセンスの文書と一緒に置いています。
    - intel/llvm への XeStrata の修正のパッチ（`third_party/main/intel-llvm/`）: Apache-2.0 WITH LLVM-exception。
    - oneMath への XeStrata の変更（フォーク、`third_party/main/oneMath/`）: Apache-2.0。
@@ -374,5 +378,6 @@ XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフト�
 - **`third_party/nonfree/` がなくても**、XeStrata はビルドでき、動きます。パッケージには入れていません。
 - **パッケージに入れているほかのもの**: intel/llvm の SYCL の実行時（Apache-2.0 WITH LLVM-exception）、llama.cpp の gguf-py（MIT）、
   oneMath（Apache-2.0）を、それぞれのライセンスの文書と一緒に入れています。
+  AMD の GPU 向けのコードは ROCm のデバイスライブラリ（NCSA）の一部を含むので、そのライセンスの文書も入れています。
   自由ソフトウェアでないもの（oneMKL、cuBLAS、NVIDIA のドライバー）は入れていません。
 - **モデル**: このリポジトリには含みません。モデルのファイルには、それぞれのライセンスが適用されます。

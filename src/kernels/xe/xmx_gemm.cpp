@@ -14,6 +14,7 @@
 #include "strata/core/per_device.hpp"
 #include "dp4a_gemm.hpp"
 #include "mma_gemm.hpp"
+#include "amd_wmma.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "device_target.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_xmx_gemm
@@ -278,8 +279,9 @@ bool f16_only_matrix_engines() {
 }
 
 const char* gemm_path(XmxType t) {
-    if (xe::mma_usable(core::Runtime::get().compute(), t == XmxType::bf16) && (xe::mma_forced() || !use_xmx(t)))
-        return "joint_matrix";
+    sycl::queue& q = core::Runtime::get().compute();
+    if (xe::mma_usable(q, t == XmxType::bf16) && (xe::mma_forced() || !use_xmx(t)))
+        return xe::amd_wmma(q.get_device()) ? "WMMA" : "joint_matrix";   // RDNA3 and RDNA4: the instructions, written out
     return use_xmx(t) ? "XMX" : "DP4a";
 }
 
