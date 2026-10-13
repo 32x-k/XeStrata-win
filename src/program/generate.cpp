@@ -6351,10 +6351,12 @@ int main(int argc, char** argv) {
                     for (int64_t l = gs.lb; host_expert == nullptr && l < gs.le; ++l)
                         for (int64_t e = 0; host_expert == nullptr && e < g.n_expert; ++e)
                             host_expert = srcp->device_alias(l, e);
+                    // registered on every stage, for its copies as well (fills, swaps, the prompt path's lent experts):
+                    // unregistered, a Level Zero GPU copied them as pageable memory
                     std::string reg_err;
+                    const bool registered = srcp->register_on(gs.dev, reg_err) && srcp->registered_on(gs.dev);
                     gs.pcie_reads = host_expert == nullptr || strata::gpu::kernels_read_host(host_expert) ||
-                                    (strata::gpu::kernels_read_registered() && srcp->register_on(gs.dev, reg_err) &&
-                                     srcp->registered_on(gs.dev));
+                                    (strata::gpu::kernels_read_registered() && registered);
                     if (!reg_err.empty()) std::fprintf(stderr, "strata serve: layer split, CUDA%d: %s\n", gs.dev, reg_err.c_str());
                     if (!gs.pcie_reads && gs.pcie_frac > 0.0)
                         std::fprintf(stderr, "strata serve: layer split, CUDA%d: its kernels cannot read the experts in "
