@@ -3201,19 +3201,26 @@ def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, 
 # are "host" and "api_key" when this run does not give them
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "gpu_pci",
                         "draft_vocab", "vision"})
+SPLIT_KEYS = frozenset({"split_pci", "layer_split"})
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "gpu_pci", "max_tokens", "threads", "onednn", "fallback"})
 
 
-def carry_over(old: dict, cfg: dict) -> list[str]:
+def carry_over(old: dict, cfg: dict, gpus_chosen: bool = False) -> list[str]:
     """Setup run again for an installed model keeps what the user added to its run config: every key setup does not
     write (`SETUP_KEYS`), and in "vision" the keys setup does not write plus an mmproj of their own that still exists.
     `cfg` (the new config) is updated in place; the names of what was kept are returned.  Engine options added by
-    hand to "args" are not merged (setup chooses those): `args_dropped` names them."""
+    hand to "args" are not merged (setup chooses those): `args_dropped` names them.  The earlier layer split
+    (`SPLIT_KEYS`) is kept only when this run chose no GPU (`gpus_chosen`: --gpu or --gpus), and then with its own
+    first card: issue #12, --gpu 0 kept a split onto that same card, --gpu 1 a split it did not ask for."""
     kept = []
     for k, v in old.items():
+        if k in SPLIT_KEYS and gpus_chosen:
+            continue
         if k not in SETUP_KEYS and k not in cfg:
             cfg[k] = v
             kept.append(k)
+    if "split_pci" in kept and old.get("gpu_pci"):
+        cfg["gpu_pci"] = old["gpu_pci"]
     ov, nv = old.get("vision"), cfg.get("vision")
     if isinstance(ov, dict) and isinstance(nv, dict):
         for k, v in ov.items():
@@ -3266,11 +3273,12 @@ def args_dropped(old: dict, cfg: dict) -> list[str]:
     return list(dict.fromkeys(f for f in flags(old) if f not in new))
 
 
-def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None) -> None:
+def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None, gpus_chosen: bool = False) -> None:
     """Setup's run config, written over an earlier one for the same model without losing what the user added to it:
-    the keys setup does not write are carried over (carry_over), and the earlier file is kept as
-    xestrata-<model>.json.bak when it changes.  `source`: an earlier install's config to carry the keys over from when
-    this folder has none yet (a copy set up like the last one).  A line says what was kept, one what was not."""
+    the keys setup does not write are carried over (carry_over; `gpus_chosen`: this run chose its GPUs), and the
+    earlier file is kept as xestrata-<model>.json.bak when it changes.  `source`: an earlier install's config to carry
+    the keys over from when this folder has none yet (a copy set up like the last one).  A line says what was kept,
+    one what was not."""
     old_path = cfg_path if cfg_path.is_file() else source
     old = None
     if old_path is not None and old_path.is_file():
@@ -3280,7 +3288,7 @@ def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None) ->
             pass
         if not isinstance(old, dict):
             old = None
-    kept = carry_over(old, cfg) if old is not None else []
+    kept = carry_over(old, cfg, gpus_chosen) if old is not None else []
     bak = None
     if cfg_path.is_file() and old != cfg:
         bak = cfg_path.with_name(cfg_path.name + ".bak")
@@ -3504,7 +3512,8 @@ def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images
             say("  " + line)
     for line in notes:
         say("  " + line)
-    write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
+    write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None,
+                       getattr(a, "gpus_chosen", False))
     script = None if PACKAGED else write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     if not a.no_warmup:
         warm_up(cfg_path)
@@ -3857,6 +3866,7 @@ def main() -> int:
     if len(found) > 1 or gpu_problem(found[0]) is not None:
         gpu_table(found)
     gpu_chosen = a.gpu is not None                     # --gpu given: the config names the card
+    a.gpus_chosen = gpu_chosen or bool(a.gpus)         # and with --gpus, the earlier split is not kept (carry_over)
     sel = choose_gpus(a, found)
     a.gpu = sel[0]
     GPU_PICK = a.gpu
