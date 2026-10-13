@@ -105,7 +105,7 @@ core::Runtime& rt() { return core::Runtime::get(); }
 // A single memset of more than 4 GiB never completes on the B70; the same bytes in 1 GiB pieces do, and a 5 GiB memcpy
 // and kernels addressing past 4 GiB work normally (the 2026-09-30-xe-large-alloc record).
 constexpr size_t kPiece = size_t(1) << 30;
-sycl::event marker(sycl::queue& queue, const std::vector<sycl::event>& dependencies = {}) {
+[[maybe_unused]] sycl::event marker(sycl::queue& queue, const std::vector<sycl::event>& dependencies = {}) {
     return queue.submit([&](sycl::handler& h) {
         if (!dependencies.empty()) h.depends_on(dependencies);
         h.single_task([] {});

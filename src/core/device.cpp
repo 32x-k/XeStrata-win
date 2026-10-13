@@ -174,7 +174,7 @@ sycl::property_list ordered_properties() {
 #endif
 }
 
-sycl::event queue_marker(sycl::queue& q, const std::vector<sycl::event>& dependencies = {}) {
+[[maybe_unused]] sycl::event queue_marker(sycl::queue& q, const std::vector<sycl::event>& dependencies = {}) {
     return q.submit([&](sycl::handler& h) {
         if (!dependencies.empty()) h.depends_on(dependencies);
         h.single_task([] {});
