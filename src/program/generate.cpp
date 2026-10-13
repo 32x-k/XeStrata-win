@@ -2001,7 +2001,9 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
 const char* fatal_signal_name(int sig) {
     switch (sig) {
         case SIGSEGV: return "SIGSEGV (a bad memory access)";
+#ifdef SIGBUS
         case SIGBUS: return "SIGBUS (a bad memory access)";
+#endif
         case SIGILL: return "SIGILL (an instruction this CPU does not have)";
         case SIGFPE: return "SIGFPE (an arithmetic fault)";
         case SIGABRT: return "SIGABRT (an abort)";
@@ -2011,7 +2013,11 @@ const char* fatal_signal_name(int sig) {
 void fatal_signal(int sig) {
     const char* where = strata::core::progress().where.load(std::memory_order_relaxed);
     const char* name = fatal_signal_name(sig);
+#if defined(_WIN32)
+    auto put = [](int fd, const char* a) { if (a != nullptr) (void) !_write(fd, a, (unsigned) std::strlen(a)); };
+#else
     auto put = [](int fd, const char* a) { if (a != nullptr) (void) !write(fd, a, std::strlen(a)); };
+#endif
     put(2, "strata generate: FATAL signal ");
     put(2, name);
     put(2, " while ");
@@ -2026,6 +2032,10 @@ void fatal_signal(int sig) {
     std::raise(sig);
 }
 void install_fatal_signals() {
+#if defined(_WIN32)
+    // the C runtime's signals: no SIGBUS, and no alternate stack for a stack overflow
+    for (const int sig : {SIGSEGV, SIGILL, SIGFPE, SIGABRT}) (void) std::signal(sig, fatal_signal);
+#else
     // an alternate stack, so a stack overflow on the main thread is reported too
     static char alt[64 * 1024];
     stack_t st{};
@@ -2037,6 +2047,7 @@ void install_fatal_signals() {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_ONSTACK | SA_RESETHAND;
     for (const int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) (void) sigaction(sig, &sa, nullptr);
+#endif
 }
 
 int main(int argc, char** argv) {

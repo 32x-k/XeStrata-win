@@ -21,8 +21,16 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <pthread.h>
 #include <sched.h>
+#endif
 
 namespace strata::core {
 namespace {
@@ -192,10 +200,18 @@ double memory_read_rate(const std::vector<const uint8_t*>& blobs, size_t bytes, 
     for (int w = 0; w < threads; ++w)
         pool.emplace_back([&, w] {
             if (!cores.empty()) {
+#if defined(_WIN32)
+                const int core = cores[(size_t) w % cores.size()];
+                GROUP_AFFINITY one{};
+                one.Group = (WORD) (core / 64);
+                one.Mask = KAFFINITY(1) << (core & 63);
+                SetThreadGroupAffinity(GetCurrentThread(), &one, nullptr);
+#else
                 cpu_set_t one;
                 CPU_ZERO(&one);
                 CPU_SET(cores[(size_t) w % cores.size()], &one);
                 pthread_setaffinity_np(pthread_self(), sizeof one, &one);
+#endif
             }
             uint64_t x = 0, counted = 0;
             for (size_t i = (size_t) w; phase.load(std::memory_order_relaxed) < 2; i += (size_t) threads) {
