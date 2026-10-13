@@ -1037,18 +1037,22 @@ bool FileExpertSource::pin_cache_complement(
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
         uint64_t at = 0;
         int64_t held = 0;
+        int64_t wanted = 0;   // the ranked experts no GPU holds
         if (rank != nullptr)
             for (const auto& pr : *rank) {
                 if (pr.first < 0 || pr.second < 0 || pr.first >= n_layers_ || pr.second >= n_expert_) continue;
                 const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
                 if (offsets[i] == kNoComplement || ranked[i] != kNoComplement) continue;   // on a GPU, or twice
+                ++wanted;
                 const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
                 if (b > budget_bytes - at) continue;
                 ranked[i] = at;
                 at += b;
                 ++held;
             }
-        if (what_fits && held == 0) {   // #467: nothing to keep - the caller's plain mmap fallback, not an empty copy
+        // #467: none of them fits - the caller's plain mmap fallback, not an empty copy.  None to keep (the GPUs of a
+        // layer split hold every ranked expert) is not that: the copy goes on empty, and keeps the stages' lend regions.
+        if (what_fits && wanted > 0 && held == 0) {
             err = "FileExpertSource: the RAM has no room for any expert of the complement";
             return false;
         }
