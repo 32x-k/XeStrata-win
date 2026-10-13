@@ -1982,6 +1982,22 @@ void install_fatal_signals() {
     sa.sa_flags = SA_ONSTACK | SA_RESETHAND;
     for (const int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) (void) sigaction(sig, &sa, nullptr);
 }
+// SIGTERM and SIGINT end the engine at once, as their default action does, but on a thread of their own.  While the GPU
+// compiler (IGC) translates a kernel it takes them over and longjmps to the translating thread, so one delivered to any
+// other thread aborted the engine ("longjmp causes uninitialized stack frame"; the server's SIGTERM after a QUIT, or a
+// stop while the kernels are built).  Blocked before any thread exists, so every thread inherits the mask.
+void route_stop_signals() {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGINT);
+    if (pthread_sigmask(SIG_BLOCK, &set, nullptr) != 0) return;
+    std::thread([set] {
+        int sig = 0;
+        while (sigwait(&set, &sig) != 0) {}
+        _exit(128 + sig);
+    }).detach();
+}
 
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
@@ -1990,6 +2006,7 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::set_terminate(report_and_end);   // issue #10: an exception that leaves the engine is reported, not lost
     install_fatal_signals();               // issue #12: and a crash says what it was and where
+    route_stop_signals();
     strata::core::progress_at("starting: reading the options and opening the GPUs");
     // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is
     // touched (upstream b7dd070d)
