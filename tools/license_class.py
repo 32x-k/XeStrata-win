@@ -5,8 +5,9 @@ comes from (AGENTS.md, Licenses).  Run from the repository root; without files, 
 
 A file is upstream's when upstream Strata's integrated tag (v + STRATA_UPSTREAM_VERSION in CMakeLists.txt, or --tag)
 has it at the same path, has a file of the same content elsewhere (a rename), or the file names Strata's copyright and
-upstream had it at that path before the tag (the content it last had there).  Apart from the SPDX header lines
-XeStrata adds, the same content as upstream's is unchanged, any other is mixed:
+upstream had it at that path before the tag (the content it last had there); not when it has none of upstream's
+lines (apart from blank and short ones): XeStrata wrote it anew.  Apart from the SPDX header lines XeStrata adds, the
+same content as upstream's is unchanged, any other is mixed:
 
   unchanged  upstream's copyright holders only, upstream's license (MIT, or the SPDX identifier upstream's file has)
   mixed      those holders and XeStrata's, LGPL-3.0-or-later AND MIT
@@ -124,10 +125,20 @@ class Upstream:
         return b""  # Strata's copyright, no upstream file to compare: mixed
 
 
+def shares_lines(data: bytes, base: bytes) -> bool:
+    """Whether the file has a line of upstream's, apart from blank and short ones (a brace, an else)."""
+    if not base or b"\0" in data[:8192]:
+        return True
+    old = {ln.strip() for ln in strip(base).splitlines() if len(ln.strip()) > 3}
+    return any(ln.strip() in old for ln in strip(data).splitlines() if len(ln.strip()) > 3)
+
+
 def expected(path: str, data: bytes, hs: list[str], up: Upstream) -> tuple[str, list[str], str]:
     """(class, holders, identifier) the file should carry, given the holders it names (its header or REUSE.toml).
     An own file keeps the holders it names, XeStrata's among them: what it transcribed is not checked here."""
     base = up.base(path, data)
+    if base is not None and not shares_lines(data, base):
+        base = None  # written anew at upstream's path (AGENTS.md)
     if base is None:
         perm = [h for h in hs if h != XE and any(k in h for k in PERMISSIVE)]
         return ("own", hs if XE in hs else hs + [XE], MIXED if perm else OWN)
