@@ -679,6 +679,8 @@ A `--reasoning-effort` in `args` is moved there by the server, with a note.
 The levels are instructions the model was trained with, not a hard token limit:
 on easy questions all three think briefly, on hard ones `high` thinks longest and is most accurate.
 
+- **Keep Windows awake while it works (opt-in, upstream #1727).** `"prevent_sleep": true` in `xestrata-<model>.json` keeps the PC from going to sleep while at least one request is running or waiting (Windows' `SetThreadExecutionState` with `ES_SYSTEM_REQUIRED`; the screen may still turn off).
+  The normal sleep rules come back when the server is idle and when it exits. Default off; on Linux it does nothing (one line at startup says so).
 - **A hard thinking budget (opt-in).** `"reasoning_budget_tokens": N` in a request (OpenAI or Anthropic) caps the thinking at N tokens.
   When it gets there the server ends it with a short wrap-up line and `</think>`, and the model answers from there.
   The engine continues from what it already holds, so nothing is read again.

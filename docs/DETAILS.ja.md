@@ -661,6 +661,8 @@ print(r.choices[0].message.content)
 深さは、モデルが学習した指示で、トークン数の厳密な上限ではありません。
 易しい質問では 3 つとも短く考え、難しい質問では `high` がいちばん長く考えて、いちばん正確です。
 
+- **処理中は Windows をスリープさせない（任意、upstream #1727）**: `xestrata-<model>.json` に `"prevent_sleep": true` を書くと、要求を 1 つでも処理中か待ち行列に持っている間は PC がスリープしません（Windows の `SetThreadExecutionState` の `ES_SYSTEM_REQUIRED`。画面は消えることがあります）。
+  server が何もしていないときと終わるときは、通常のスリープの設定に戻します。既定は無効で、Linux では何もしません（起動時に 1 行で知らせます）。
 - **思考の厳密な上限（任意）**: 要求に `"reasoning_budget_tokens": N`（OpenAI でも Anthropic でも）を付けると、思考を N トークンで打ち切ります。
   そこに達すると、server は短い締めの行と `</think>` で思考を終え、モデルはそこから答えます。
   エンジンは持っている状態から続けるので、何も読み直しません。
