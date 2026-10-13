@@ -122,6 +122,13 @@
 #include <vector>
 
 namespace {
+
+// A dump file closed on whichever return leaves the function that opened it.
+struct CloseFile {
+    void operator()(std::FILE* f) const { std::fclose(f); }
+};
+using DumpFile = std::unique_ptr<std::FILE, CloseFile>;
+
 // #620 #486: " (N MiB of M MiB VRAM free on this GPU)" for an allocation's failure message
 std::string vram_free_note() {
     size_t free_b = 0, total_b = 0;
@@ -1530,9 +1537,11 @@ double pcie_frac_for_gbps(double gbps, double base) {
 // The RAM's read bandwidth with `cores.size()` threads, each pinned to one of `cores` and reading its share of
 // `bytes`: the best of three passes, in GB/s.
 double bench_ram_read_gbps(const std::vector<int>& cores, size_t bytes) {
-    const size_t n = cores.size(), words = bytes / 8 / n * n;
+    const size_t n = cores.size();
+    if (n == 0) return -1.0;
+    const size_t words = bytes / 8 / n * n;
     auto* buf = static_cast<uint64_t*>(std::aligned_alloc(4096, (words * 8 + 4095) / 4096 * 4096));
-    if (buf == nullptr || n == 0) return -1.0;
+    if (buf == nullptr) return -1.0;
     std::memset(buf, 1, words * 8);   // fault the pages in before timing
     std::atomic<uint64_t> sink{0};
     double best = -1.0;
@@ -1912,6 +1921,7 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     }
     const strata::core::Progress& p = strata::core::progress();
     std::fprintf(stderr, "strata generate: FATAL while %s (detail %lld, prompt chunk at %lld): %s\n", p.where.load(),
+            report = "an unknown exception";   // (not a std::exception: nothing more to say)
                  (long long) p.detail.load(), (long long) p.chunk.load(), report.c_str());
     std::printf("ERR the engine stopped while %s (detail %lld, prompt chunk at %lld): %s\n", p.where.load(),
                 (long long) p.detail.load(), (long long) p.chunk.load(), report.c_str());
@@ -3650,9 +3660,11 @@ int main(int argc, char** argv) {
     std::FILE* half_dump = nullptr;
     float* half_stage = nullptr;
     if (!o.dump_halves.empty()) {
-        half_dump = std::fopen(o.dump_halves.c_str(), "wb");
+        half_dump_file.reset(std::fopen(o.dump_halves.c_str(), "wb"));
+        half_dump = half_dump_file.get();
         if (half_dump == nullptr) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_halves.c_str());
+    DumpFile half_dump_file;
             return 1;
         }
         const size_t n = (size_t) g.n_layers * (size_t) half_stride;
@@ -5244,9 +5256,11 @@ int main(int argc, char** argv) {
     float* layer_stage = nullptr;
     const size_t layer_floats = (size_t) (g.n_layers + 1) * (size_t) g.hc * (size_t) g.n_embd;
     if (!o.dump_layers.empty()) {
-        layer_dump = std::fopen(o.dump_layers.c_str(), "wb");
+        layer_dump_file.reset(std::fopen(o.dump_layers.c_str(), "wb"));
+        layer_dump = layer_dump_file.get();
         if (layer_dump == nullptr) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_layers.c_str());
+    DumpFile layer_dump_file;
             return 1;
         }
         if (!strata::gpu::alloc_host((void**) &layer_stage, layer_floats * sizeof(float))) {
@@ -11798,13 +11812,15 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (layer_dump != nullptr) {
-        std::fclose(layer_dump);
+        layer_dump_file.reset();
+        layer_dump = nullptr;
         strata::gpu::free(layer_stage);
         std::printf("%-24s %s (%lld layers + the input x %d streams x %lld per position)\n", "layers dumped",
                     o.dump_layers.c_str(), (long long) g.n_layers, (int) g.hc, (long long) g.n_embd);
     }
     if (half_dump != nullptr) {
-        std::fclose(half_dump);
+        half_dump_file.reset();
+        half_dump = nullptr;
         strata::gpu::free(half_stage);
         std::printf("%-24s %s (%lld layers x %llu per position)\n", "halves dumped", o.dump_halves.c_str(),
                     (long long) g.n_layers, (unsigned long long) half_stride);
