@@ -70,7 +70,7 @@ Each file carries the license of the code in it, by where that code comes from:
 - XeStrata's own: a file written for XeStrata is under the LGPL, with XeStrata's copyright only.
 - Mixed: a file from a project under a permissive license (Strata, ggml / llama.cpp: MIT) that XeStrata has changed, or a file of XeStrata's with code transcribed from such a project (the kernels in `src/` that follow ggml, for example).
   The original code keeps its copyright and license; XeStrata's changes and the file as a whole are under the LGPL. The file names both copyright holders and both licenses, and keeps the original notice comment.
-- Unchanged: a file from such a project that XeStrata has not changed (Strata's files as upstream has them, upstream's records in `bench/results`, upstream's data files) keeps its own license and copyright only, without XeStrata's line.
+- Unchanged: a file from such a project that XeStrata has not changed (Strata's files as upstream has them, upstream's data files) keeps its own license and copyright only, without XeStrata's line.
 - A file is changed when its content, apart from the SPDX header XeStrata adds, differs from the upstream version XeStrata has integrated (`STRATA_UPSTREAM_VERSION`). An upstream sync that brings a file back to upstream's content makes it unchanged again; a change of XeStrata's to an unchanged file makes it mixed.
 - Exceptions: XeStrata's changes to oneMath (below) and its patches to intel/llvm (`third_party/main/intel-llvm/patches/`, Apache-2.0 WITH LLVM-exception) stay under those projects' licenses, even when MistVVK writes them.
 
@@ -119,9 +119,9 @@ The two stages of generation are prefill and decode, the LLM terms, in Japanese 
 ## Measurement records
 
 XeStrata's own measurements (benchmarks, A/B runs, probes, the upstream-sync and release records) are not shared: they go
-into the data folder's `records/` (`<data>: LOCAL.md`) and never into git. `bench/results` keeps only upstream's records
-(`tools/lint/records.txt`) and records others sent (pull requests). Commit messages and documents give the numbers
-themselves, not a link to a record.
+into the data folder's `records/` (`<data>: LOCAL.md`) and never into git. `bench/XeStrataBenchResults` keeps only the
+measurements of XeStrata that others sent (pull requests). upstream's records (its `bench/results`, its community's
+included) are not brought in. Commit messages and documents give the numbers themselves, not a link to a record.
 
 Do not run a measurement whose result is already known. A run that gives the same result each time (greedy, the same
 binary, settings and text, on the same machine in the same state) and has been measured is read from its record, not
@@ -146,7 +146,7 @@ It picks the lints by file kind, with the configurations in `tools/lint/`:
 | the whole repository | `reuse lint` (see Licenses above) |
 
 The files a change touches must get no new findings; findings that were there before may stay.
-The records that came from upstream's `bench/results` (other people's measurements, listed in `tools/lint/records.txt`) and other projects' files in `third_party/<area>/<project>/` (kept as they are; XeStrata's `patches/` there excepted) get only gitleaks and `reuse lint`.
+Other projects' files in `third_party/<area>/<project>/` (kept as they are; XeStrata's `patches/` there excepted) get only gitleaks and `reuse lint`.
 clang-tidy reads `compile_commands.json` from the build folder (`build/free`, or `STRATA_LINT_BUILD`): configure it with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
 
 Then run the existing tests the change can affect (CTest in the build folder, `python -m unittest` for `serve/` and `tools/`).

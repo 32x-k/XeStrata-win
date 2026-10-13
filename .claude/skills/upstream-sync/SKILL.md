@@ -47,7 +47,7 @@ Write `.upstream-<version>.md` (add it to `.git/info/exclude`, as `.upstream-014
 | Group | What | Taken |
 | --- | --- | --- |
 | A | AMD, HIP | as ideas (below) |
-| B | bench records | the records as they are; read them for findings (below) |
+| B | bench records | not taken (AGENTS.md, Measurement records); read them for findings (below) |
 | D | documents | what is true of XeStrata, into its documents (Japanese first); read upstream's investigation records for findings |
 | E | engine features and fixes | all |
 | M | several GPUs | all |
@@ -199,7 +199,7 @@ The run is done only when a full run of step 7 on the final HEAD, every file and
 
 ## 9. The record and the report
 
-XeStrata's own measurements are not shared (the user's decision of 2026-10-11): the record stays in the data folder, `$o` = `<data>/records/bench-results/<date>-upstream-<version>` (`LOCAL.md`), and never goes into git; only upstream's records (`tools/lint/records.txt`) and community records live in `bench/results`.
+XeStrata's own measurements are not shared (the user's decision of 2026-10-11): the record stays in the data folder, `$o` = `<data>/records/bench-results/<date>-upstream-<version>` (`LOCAL.md`), and never goes into git; upstream's records are not brought in, and `bench/XeStrataBenchResults` holds only the measurements of XeStrata others sent.
 
 - `$o/README.md`: the machines, both engines' commits and builds, the method, the tables (`sync_collect.py`), the check's output (against the tag and the previous XeStrata), what the numbers say, and the GPUs skipped; `matrix.json` and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>`. The ideas with step 4's and 5's numbers (kept, opt-in and removed) go into the same record.
 - docs/XE.ja.md, then docs/XE.md: the upstream version and range brought in, what was not taken and why, the approximations on by default and their switches, without a link to the record (it is not in the repository).
