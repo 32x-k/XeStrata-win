@@ -97,10 +97,15 @@ class StdioTransport:
         env.update({str(k): str(v) for k, v in (self.cfg.get("env") or {}).items()})
         command = str(self.cfg["command"])
         exe = shutil.which(command, path=env.get("PATH")) or command
+        extra = {}
+        if os.name == "nt":
+            extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        else:
+            extra["start_new_session"] = True           # its own process group, so close() ends its children too
         try:
             self.proc = subprocess.Popen([exe, *[str(a) for a in self.cfg.get("args") or []]], stdin=subprocess.PIPE,
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                         cwd=self.cfg.get("cwd") or None, env=env, start_new_session=True)
+                                         cwd=self.cfg.get("cwd") or None, env=env, **extra)
         except OSError as e:
             raise McpError(f"could not start {command!r}: {e}") from None
         self._err_reader = threading.Thread(target=self._read_stderr, daemon=True)
@@ -229,11 +234,15 @@ class StdioTransport:
     @staticmethod
     def _kill_tree(p):
         try:
-            os.killpg(p.pid, signal.SIGTERM)
-            try:
-                p.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                os.killpg(p.pid, signal.SIGKILL)
+            if os.name == "nt":                          # npx.cmd -> node: end the whole tree
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=10)
+            else:
+                os.killpg(p.pid, signal.SIGTERM)
+                try:
+                    p.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    os.killpg(p.pid, signal.SIGKILL)
         except (OSError, subprocess.SubprocessError):
             pass
         try:
