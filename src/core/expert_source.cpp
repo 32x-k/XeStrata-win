@@ -1281,7 +1281,11 @@ bool FileExpertSource::pin_cache_complement(
         // page-locked buffers the engine allocates after it (about 0.4 GiB in --serve)
         constexpr uint64_t kPinReserve = 512ull << 20;
         uint64_t pin_room = 0;
-        if (lock && strata::gpu::host_pin_room(&pin_room) && bytes + kPinReserve > pin_room) {
+        static const bool cap_off = [] {   // STRATA_PIN_CAP=0: no such check (A/B)
+            const char* v = std::getenv("STRATA_PIN_CAP");
+            return v != nullptr && v[0] == '0';
+        }();
+        if (lock && !cap_off && strata::gpu::host_pin_room(&pin_room) && bytes + kPinReserve > pin_room) {
             char why[160];
             std::snprintf(why, sizeof why, "not page-locked: the GPU can map %.2f GiB more host memory",
                           (double) pin_room / 1073741824.0);
