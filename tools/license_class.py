@@ -153,12 +153,15 @@ def reuse_rules() -> list[tuple[re.Pattern[str], list[str], str]]:
 def fix(path: Path, data: bytes, hs: list[str], ident: str) -> None:
     lines = data.splitlines(keepends=True)
     idx = header(lines)
+    have = holders_and_id(data)[0]
+    hs = [h for h in have if h in hs] + [h for h in hs if h not in have]  # keep the order the file has
     m0 = SPDX.match(lines[idx[0]].rstrip(b"\r\n"))
     assert m0
     pre, post = m0["pre"], m0["post"]
     eol = lines[idx[0]][len(lines[idx[0]].rstrip(b"\r\n")):]
-    new = [pre + b"SPDX-FileCopyrightText: " + h.encode() + post + eol for h in hs]
-    new.append(pre + b"SPDX-License-Identifier: " + ident.encode() + post + eol)
+    # the keys are split so that reuse does not read these lines as this file's own header
+    new = [pre + b"SPDX-" + b"FileCopyrightText: " + h.encode() + post + eol for h in hs]
+    new.append(pre + b"SPDX-" + b"License-Identifier: " + ident.encode() + post + eol)
     path.write_bytes(b"".join(lines[:idx[0]] + new + lines[idx[-1] + 1:]))
 
 
