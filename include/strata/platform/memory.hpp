@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/platform/memory.hpp - plan v0.3 P0.1/P1: keep a large host region resident.
 //
 // If CUDA cannot register the expert arena, mlock can keep it resident while the CPU pool reads it.

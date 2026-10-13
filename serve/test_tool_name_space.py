@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """serve/test_tool_name_space.py - a tool call written `<function= NAME>` (a space after the `=`) is the call NAME.
 
 Seen live (Qwen3.8-Flash-Next IQ2_XS, Zed's agent panel): the model wrote `<function= capture>` inside its thinking;

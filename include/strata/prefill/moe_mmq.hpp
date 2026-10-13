@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/prefill/moe_mmq.hpp - prompt-speed plan step 2b: the prompt path's experts multiplied in their
 // quantized blocks (iq_mmq.hpp: llama.cpp's MMQ, written anew on joint_matrix): the activations are rounded to int8,
 // the products run on the int8 matrix engines.  The dequantize-to-FP16 path wrote ~10 MB of FP16 per expert and

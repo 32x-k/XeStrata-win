@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // include/strata/program/batch_groups.hpp - how many pipelined slot groups `--batch` runs with.
 //
 // `--batch-groups N` pipelines N groups of slots through the stages of a layer split; `--batch-groups auto` picks the

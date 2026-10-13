@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """tools/strata_mcp.py - an MCP server that lets an AI assistant install, start, check and stop Strata.
 
     claude mcp add xestrata -- python3 /path/to/XeStrata/tools/strata_mcp.py

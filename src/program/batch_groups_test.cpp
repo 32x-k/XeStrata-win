@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // src/program/batch_groups_test.cpp - how many pipelined slot groups --batch runs with (header-only, CPU).
 //
 //   1. `auto` picks the most groups, at most one per stage, that divide the slots;

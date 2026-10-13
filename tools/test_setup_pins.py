@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Tests for setup.py's reproducible installs (upstream #214): Hugging Face files at pinned revisions (the current
 files when a revision is gone), the pinned requirements file, and an existing install left as it is.  Mocked
 network - nothing is downloaded.  (XeStrata compiles its engine, so upstream's release-engine tests are left out.)

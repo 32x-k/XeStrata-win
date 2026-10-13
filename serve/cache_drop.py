@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Opt-in: give the model files' page cache back when the server stops (STRATA_DROP_CACHE_ON_EXIT=1).
 
 Linux keeps a stopped model's GGUF/pack files in the page cache (MemAvailable counts it, `free` shows it as used),

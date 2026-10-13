@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """One command that measures this Strata install the way it is used, and writes a report you can share.
 
 XeStrata: upstream Strata's benchmark mode (v0.1.43), kept as it is so a report compares with upstream's community

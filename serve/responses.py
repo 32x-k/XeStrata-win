@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/responses.py - #451: OpenAI's Responses API (POST /v1/responses), stateless, on the chat path.
 
 A Responses request becomes the same template messages, tools and kwargs a Chat Completions request does, runs through

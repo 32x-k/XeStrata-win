@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // include/strata/program/split_rules.hpp - rules for the automatic layer split that do not need a GPU to check.
 //
 // A stage that owns one or two layers holds a handful of expert slots (a 12 GB 3060 with one layer held 512), and

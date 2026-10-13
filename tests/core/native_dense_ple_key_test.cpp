@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // tests/core/native_dense_ple_key_test.cpp - #326: a native pack whose PLE key row is BF16 (iq_pack --compat-bf16 of
 // OrcaRouter's IQ3_XXS key) loads with that row in the arena, and NativeDense does not upload the GGUF key over it.
 //

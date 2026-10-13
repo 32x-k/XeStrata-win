@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/kernels/bf16_bits.hpp - the bf16 conversions, written out, as bits.
 //
 // bf16 is the TOP HALF of an f32, so `f32_from_bf16` is a shift and needs no rounding at all.  The forward

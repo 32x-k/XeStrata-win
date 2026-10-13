@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Tests for tools/strata_bench.py with a fake engine behind a real HTTP server: the suite runner, the redaction, the
 report writing and the comparison.  Light: no GPU, no Strata server, a few seconds."""
 from __future__ import annotations

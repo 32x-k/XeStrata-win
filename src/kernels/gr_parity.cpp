@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/gr_parity.cpp - P2.S2's test for the gated residual / hyper-connection.
 //
 // `ref/gr.py` opens by listing the details "a prose reading gets wrong", and every one of them is a reading

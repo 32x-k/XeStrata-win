@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """tools/test_strata_mcp.py - tests for tools/strata_mcp.py (Strata's MCP server), standard library only.
 
     python -m unittest tools/test_strata_mcp.py -v

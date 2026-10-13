@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/dequant_bf16.cpp - the Xe port of Strata's src/kernels/cuda/dequant_bf16.cu: whole-row dequantization of
 // the legacy, K-quant and IQ4 block formats (and Q2_0) to BF16, FP16 or FP32, one work-item per 32-element group,
 // with the CUDA kernel's expressions.  The i-quant formats go to iq_kernels as in CUDA.  BF16 (qwen35moe's BF16 files)

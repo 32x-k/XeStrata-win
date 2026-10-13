@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-FileCopyrightText: 2022-2026 The authors of Debian's rocm-llvm packaging (debian/*; named in NOTICE)
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Build intel/llvm's DPC++ (free software: Apache-2.0 with LLVM exceptions) from source into .tools/intel-llvm/, for a
 free build of the engine where the distribution has no DPC++, or one whose SYCL runtime does not give the GPU its
 matrix engines (Ubuntu 26.04's 6.2 lists none for the Arc Pro B70; intel/llvm added it in v7.0.0).

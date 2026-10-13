@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/qsa_select.cpp - the Xe port of Strata's src/kernels/cuda/qsa_select.cu (see qsa_select.hpp): the QSA block
 // scores for many queries and the per-query top-k over cells (a radix threshold, ties to the lowest index, the cells
 // written ascending).

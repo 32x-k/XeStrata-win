@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/pinned.hpp - P2.S1: the host arena the expert weights live in.
 //
 // The expert weights do not fit in VRAM, so they stay in host memory: the CPU pool computes the missed experts

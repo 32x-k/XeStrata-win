@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/native_ple_postops.cpp - the Xe port of Strata's src/kernels/cuda/native_ple_postops.cu: the PLE block after
 // its projections (key/query RMS norms, the per-group gate, the gated value, its norm, the dilated convolution and the
 // residual), for one token and for a batch, with the arithmetic of the pinned ggml-cuda operators it replaces.

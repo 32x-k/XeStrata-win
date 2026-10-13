@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/expert_source.hpp - P2.S3/P2.S5: the expert pool's adapter to the host loop.
 //
 // `session_loop` publishes, per layer, the NORMED activation `x_f`, the ten routed expert ids and their router

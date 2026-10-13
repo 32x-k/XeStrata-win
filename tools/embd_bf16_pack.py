@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """tools/embd_bf16_pack.py - the token embedding exactly as the checkpoint ships it (BF16), as a GGUF the engine reads.
 
     python tools/embd_bf16_pack.py --model <checkpoint dir> --out <token-embd-bf16.gguf>

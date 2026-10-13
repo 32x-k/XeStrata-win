@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Check that no code reachable on an AVX2-only CPU can contain wider-ISA instructions (#795).
 
 Strata compiles a few translation units for AVX-512 (expert.cpp, iq_avx512.cpp) and some for AVX2 + AVX-VNNI

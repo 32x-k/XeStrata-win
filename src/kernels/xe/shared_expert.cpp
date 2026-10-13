@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/shared_expert.cpp - the Xe port of Strata's src/kernels/cuda/shared_expert.cu: the shared expert
 // (h = silu(x W_gate) * (x W_up), then W_down, scaled by the per-token scalar gate sigmoid(x . w)) and the MoE
 // block's final combination.  See the CUDA source for the reference and the readings it pins.

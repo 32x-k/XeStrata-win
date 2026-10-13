@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // tests/core/expert_layout_test.cpp - native_experts.txt (v2/v3/v4) and the expert arena filled from GGUF shards,
 // without a model or a GPU.
 //

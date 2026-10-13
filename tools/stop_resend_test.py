@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Stop, edit and resend, over and over (#879, #606): every answer must be real text, never a repeated token.
 
 The reports are an all-logits NaN (one token repeated, "!!!!") after a request was stopped and the next one, an edit

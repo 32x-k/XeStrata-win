@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/vmm.cpp - see include/strata/core/vmm.hpp.  A chunk is a physical segment of the current device
 // (strata::gpu::vmem_new); a range's addresses come from vmem_reserve.  Mapping a segment makes it readable and
 // writable at once, so there is no separate access step.

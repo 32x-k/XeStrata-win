@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/ngram.cpp - P2.S4: the PLE n-gram hash and the IQ4_NL table read.
 //
 // See include/strata/kernels/ngram.hpp for the semantics and the rival readings.

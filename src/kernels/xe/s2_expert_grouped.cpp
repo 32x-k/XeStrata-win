@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/s2_expert_grouped.cpp - the Xe port of Strata's src/kernels/cuda/s2_expert_grouped.cu: the S2 (Strata Q2
 // blob) experts computed on the GPU - one hit at a time, per-hit on device counts, grouped by expert for a window,
 // and in the CPU pool's summation order - plus the hit selection, grouping and combination.

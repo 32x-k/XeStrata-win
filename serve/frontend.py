@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/frontend.py - plan v0.3 P8: the request/response layer between API clients and the engine.
 
 Everything here is text: no model, no GPU. The engine consumes token ids and produces text deltas; this module

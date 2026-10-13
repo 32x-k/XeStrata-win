@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/qsa_prompt_attn_parity.cpp - perf-review D-1: the prompt attention on the matrix engines (XMX on Xe,
 // tensor cores in Strata's CUDA build; qsa_prompt_attn.hpp) against the FP32 kernel it replaces
 // (`qsa_decode_attn_batch`) and an FP64 host reference (GPU, synthetic, no model).

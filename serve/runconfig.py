@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/runconfig.py - #564: the web page's Settings view of the run config (xestrata-<model>.json).
 
 A short list of documented keys can be read and changed from XeStrata's own page (GET / POST /config).  Everything

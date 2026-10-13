@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_reasoning_tools.py - #804 (strict form of PR #787): a tool call the model writes inside its reasoning.
 
 A call inside the reasoning counts only when tools are declared and the name is one of them; anything else stays

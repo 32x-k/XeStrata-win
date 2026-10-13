@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-FileCopyrightText: 2023-2026 The ggml authors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/native_qsa_indexer.cpp - the Xe port of Strata's src/kernels/cuda/native_qsa_indexer.cu: the QSA indexer's
 // pooled-key append (keys rounded through F16, the block mean, RMS norm, gamma and the rotation), for one cell and
 // for a batch, with the arithmetic of the pinned ggml-cuda operators it replaces (llama.cpp 3cf03257, MIT License,

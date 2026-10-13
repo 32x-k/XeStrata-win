@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/kv_q4.cpp - the Xe port of Strata's src/kernels/cuda/kv_q4.cu: Q4_0 KV storage after a 256-point Walsh-Hadamard
 // rotation.  One sub-group of 32 per Q4_0 block or Hadamard row, as in the CUDA kernels.
 #include "strata/kernels/kv_q4.hpp"

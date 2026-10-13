@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/cpu/q8k_quant_parity.cpp - the AVX-2 Q8_K activation quantizer (q8k_quant_avx2, iq_avx2.cpp) against
 // ggml's, byte for byte: the reference (ggml-base's from_float_ref) and what ggml-cpu runs (its from_float), over
 // rows of random, scaled, sparse and degenerate values; then the same through native_quant_act / native_quant_h with

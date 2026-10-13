@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/cpu/iq_avx2_parity.cpp - the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp) bit for bit
 // against each other and against ggml-cpu, and their time per expert.  No GPU, no model: random blocks, so every grid
 // index and sign pattern occurs, and random activations quantized the way the engine quantizes them.

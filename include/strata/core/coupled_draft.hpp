@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/coupled_draft.hpp - COUPLED DRAFT SAMPLING (STRATA_SPEC_COUPLED=1, off by default).
 //
 // Under sampling the verify window samples row t of a window at position pos0 as Philox(seed, pos0 + t) over the

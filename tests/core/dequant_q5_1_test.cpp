@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // dequantize_q5_1 (strata/artifact/dequant.hpp: the PLE table of a Q5_1 GGUF) against ggml's dequantize_row_q5_1,
 // on synthetic blocks: random codes, high bits and scales, plus the edge codes 0 and 31 and a negative minimum.
 // No model, no GPU.
