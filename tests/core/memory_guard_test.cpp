@@ -5,7 +5,11 @@
 // directories standing in for /proc/meminfo, /proc/self/cgroup and /sys/fs/cgroup.  CPU only, no GPU.
 #include "strata/core/conversation_memory.hpp"
 
+#if defined(_WIN32)
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -18,6 +22,14 @@ using namespace strata::core;
 namespace fs = std::filesystem;
 
 namespace {
+
+long process_id() {
+#if defined(_WIN32)
+    return (long) ::_getpid();
+#else
+    return (long) ::getpid();
+#endif
+}
 
 int checks = 0;
 void check(bool ok, const char* label) {
@@ -32,7 +44,7 @@ struct Fixture {
     fs::path dir;
     Fixture() {
         static int n = 0;
-        dir = fs::temp_directory_path() / ("strata_memory_guard_" + std::to_string((long) ::getpid()) + "_" + std::to_string(n++));
+        dir = fs::temp_directory_path() / ("strata_memory_guard_" + std::to_string((long) process_id()) + "_" + std::to_string(n++));
         fs::remove_all(dir);
         fs::create_directories(dir / "cgroup");
     }
