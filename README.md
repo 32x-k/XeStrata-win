@@ -388,10 +388,12 @@ what has been checked in [docs/XE.md](docs/XE.md).
 XeStrata (copyright MistVVK and the XeStrata contributors) is free software; the whole of it is under the
 [GNU Lesser General Public License, version 3 or later](COPYING.LESSER) (`COPYING.LESSER`, with `COPYING`).
 
-- **Linking with the vendors' math libraries:** what is linked with a math or compute library a GPU or CPU maker
-  publishes for its processors, and with the runtime libraries it needs (oneMKL and the runtime libraries of Intel's
-  oneAPI compilers, cuBLAS and the CUDA runtime and driver, for example), may be distributed as well: an additional
-  permission under section 7 of the GPL, version 3, worded in [NOTICE](NOTICE).
+- **Linking with the vendors' math libraries and the system's runtime:** what is linked with a math or compute library
+  a GPU or CPU maker publishes for its processors, and with the runtime libraries it needs (oneMKL and the runtime
+  libraries of Intel's oneAPI compilers, cuBLAS and the CUDA runtime and driver, for example), or with the C and C++
+  runtime libraries of the operating system or of its standard compiler (Microsoft's Universal C Runtime and Visual C++
+  runtime libraries, for example), may be distributed as well: an additional permission under section 7 of the GPL,
+  version 3, worded in [NOTICE](NOTICE).
 - **Code from Strata and ggml:** the code that comes from Strata and from ggml / llama.cpp, both MIT (the kernels
   transcribed into `src/` included), stays under MIT. Strata's files XeStrata has not changed are under MIT alone; in
   a file XeStrata has changed or that carries transcribed code, XeStrata's changes and the file as a whole are under
