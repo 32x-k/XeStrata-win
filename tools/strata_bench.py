@@ -29,7 +29,7 @@ first token and latency are measured by this client.  Thinking is off for the su
 answers are short and the runs comparable.  The default run takes about 3-10 minutes after the model has loaded (the
 slower the card, the longer).
 
-The result goes to bench/results/<date>-community-<gpu>-<model>/ : README.md in the format of
+The result goes to bench/XeStrataBenchResults/<date>-community-<gpu>-<model>/ : README.md in the format of
 docs/COMMUNITY_BENCHMARKS.md, results.json (every request) and an engine log excerpt.  Home folders, user and host
 names, IP addresses and API keys are replaced by placeholders before anything is written; read it once before you share
 it. `--compare <older results folder>` prints the two side by side.  Standard library only.
@@ -894,8 +894,8 @@ def main(argv=None) -> int:
     ap.add_argument("--clients", type=int, default=0, metavar="N", help="also send N requests at once")
     ap.add_argument("--long", action="store_true", help="also a prompt of about 32,768 tokens")
     ap.add_argument("--think", action="store_true", help="leave thinking on (the default suite turns it off)")
-    ap.add_argument("--out", help="where to write the results folder (default: bench/results; xestrata passes the data "
-                                  "folder's records/)")
+    ap.add_argument("--out", help="where to write the results folder (default: bench/XeStrataBenchResults; xestrata "
+                                  "passes the data folder's records/)")
     ap.add_argument("--compare", metavar="DIR", help="a results folder (or its results.json) to put beside this run")
     ap.add_argument("--compare-only", metavar="NEW", help="print --compare of two existing results folders and stop")
     ap.add_argument("--ready-timeout", type=float, default=1800, help="seconds to wait for the model to load")
@@ -978,7 +978,7 @@ def main(argv=None) -> int:
                                                 "--long" if a.long else "", "--think" if a.think else "",
                                                 f"--runs {a.runs}" if a.runs != 3 else "") if x)},
                "elapsed_s": time.time() - t0, "machine": machine, "results": out}
-        parent = Path(a.out) if a.out else ROOT / "bench" / "results"
+        parent = Path(a.out) if a.out else ROOT / "bench" / "XeStrataBenchResults"
         d = write_results(res, parent, red, log_excerpt(log_path) if log_path else [])
         say("\nResults (median, range over the runs):")
         say(red(short_table(res)))
