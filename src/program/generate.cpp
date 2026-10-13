@@ -6036,9 +6036,8 @@ int main(int argc, char** argv) {
         // found (upstream's HIP engine locks 10.6 GiB there); pageable, the decode measured the same
         using Pin = strata::core::FileExpertSource::Pin;
         const char* pin_env = std::getenv("STRATA_RESIDENT_PIN");
-        const bool pin_auto = pin_env != nullptr && std::strcmp(pin_env, "auto") == 0;
 #if defined(_WIN32)
-        const bool pin_default_off = !pin_auto;
+        const bool pin_default_off = !(pin_env != nullptr && std::strcmp(pin_env, "auto") == 0);
 #else
         const bool pin_default_off = false;
 #endif
