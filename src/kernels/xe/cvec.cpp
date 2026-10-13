@@ -10,6 +10,8 @@
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_cvec
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <array>
 #include <stdexcept>

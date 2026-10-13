@@ -1,6 +1,14 @@
 # Notes for coding agents
 
-Read `LOCAL.md` in the repository root when it is there: this machine's hosts, containers and paths, kept out of git.
+## LOCAL.md: this machine's facts (read it first, keep it current)
+
+`LOCAL.md` in the repository root holds what is true of this machine and the machines it works with, and nothing else holds it; git ignores it.
+
+- **Read it before any work that runs something** (a build, a test, a measurement, a container, another machine).
+- **Facts of a machine go there and only there:** host names, users, IP addresses, containers and how to run in them, paths (the data folder, the model files, the toolchains, the venvs), the GPUs' PCI addresses, what a machine lacks or needs set up, and its quirks (naming a GPU or CPU model, as everywhere, is fine).
+  Never write them into AGENTS.md, a skill, a script, a document or a commit message; these name the fact and send the reader to `LOCAL.md` (`<data>: LOCAL.md`), and scripts take such values from the environment or their arguments.
+- **Keep it current in the same turn:** a fact learned or found changed (a new container, a moved folder, something a machine lacks) goes into `LOCAL.md` before the work moves on. A fact that is missing there is looked up, and asked of the user only when it cannot be found, then written down.
+- It is written in Japanese, by machine, facts only, as it is now.
 
 ## Hardware independence (the first rule)
 
@@ -9,7 +17,7 @@ A GPU with matrix engines (XMX) takes the XMX paths; one without (an older Arc, 
 The contrib-llvm build (below) runs on NVIDIA GPUs as well, through the same kernels: their tensor cores take the matrix path that reads its tile shape from the device (`mma_gemm`), not Intel's.
 
 - Choose code paths from what the hardware reports: the CPUID feature bits (as `cpu_avx512_ok` does); the device's matrix combinations, sub-group sizes, GRF modes, local memory, memory size and largest allocation. Never from a vendor string, a model number, a device ID or a product name.
-- Sizes and thresholds measured on one machine (tile shapes, chunk sizes, ring slots, cache sizes, thread counts, memory reserves) are derived from those reports at run time, or have a fallback that works on a smaller device. A constant tuned on the B70 says so in a comment, with what it depends on.
+- Sizes and thresholds (tile shapes, chunk sizes, ring slots, cache sizes, thread counts, memory reserves, spin bounds) are not hard-coded, as far as they can be: they are derived from those reports at run time. A value that has to be measured is measured on the three makers' GPUs the maintainer has, the Arc Pro B70, the RTX 4070 and the RX 9060 XT, not on the B70 alone; it has a fallback that works on a smaller device, and a comment says where it was measured and what it depends on.
 - A feature some devices lack (XMX, large GRF mode, a SYCL extension) is checked before use, with a working fallback.
 - Check a change on a smaller configuration as well: on the B70 with `STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1` (the memory, the largest allocation and the matrix engines of a small card) and fewer CPU threads; at milestones also on the processor's own graphics (the UHD 770, a check only: start and a short answer). Mark what was not checked `unverified`.
 
@@ -42,6 +50,15 @@ Rules:
 - `third_party/nonfree/` (below) stays optional in every mode.
 - The model itself (Qwen3.8-Flash-Next) is excluded from these rules.
 - Non-free tools a developer runs by hand, such as Intel SDE below, are allowed as long as they are not bundled and neither the build nor the tests require them.
+
+## What goes in
+
+Every change goes in only on these two conditions, whoever writes it: the maintainer, a coding agent, a pull request, a port from upstream or another project.
+
+- It was built and tested with intel/llvm, in the free and contrib-llvm modes (above). intel/llvm is the compiler that reaches every GPU maker's devices: a change built only with icpx (the contrib-icpx mode), or not built, does not go in.
+- It depends on the hardware it was written on as little as it can (the first rule, above): not only no CUDA or other maker's API outside the paths only the contrib modes reach, but no value measured on one card (the B70's spin bounds or tile shapes, for example) hard-coded where it can be derived from what the device reports.
+
+A change that does not meet them, a pull request among others, does not go in as it is: it is a reference, and what it does is written again in XeStrata's code.
 
 ## Licenses
 
@@ -77,6 +94,18 @@ A change goes into the Japanese file first and then into the English one in the 
 The English files keep the headings that code, records and links point to (`docs/BUILD.md#packages`, for example); a Japanese file's anchors come from its own headings.
 Where the README or a document states something that was not checked, do not add that it is unverified (`unverified`, 未検証); that mark is for reports and commit messages.
 The two stages of generation are prefill and decode, the LLM terms, in Japanese as in English (the README, the documents, the release notes): not プロンプト・出力・デコード or prompt and output speed. 推測デコード (speculative decoding) and a prompt as the text that is read stay as they are.
+
+## Measurement records
+
+XeStrata's own measurements (benchmarks, A/B runs, probes, the upstream-sync and release records) are not shared: they go
+into the data folder's `records/` (`<data>: LOCAL.md`) and never into git. `bench/results` keeps only upstream's records
+(`tools/lint/records.txt`) and records others sent (pull requests). Commit messages and documents give the numbers
+themselves, not a link to a record.
+
+Do not run a measurement whose result is already known. A run that gives the same result each time (greedy, the same
+binary, settings and text, on the same machine in the same state) and has been measured is read from its record, not
+run again. Measure again only what can differ: a changed binary or setting, a run at temperature, or a cell suspected
+of noise (once).
 
 ## Lints
 
@@ -120,6 +149,13 @@ Work with the repository through `git`, not the GitHub CLI (`gh`), with these ex
 - closing and reopening issues: `gh issue close` and `gh issue reopen`.
 
 Do not create, comment on or edit issues and pull requests with `gh`.
+
+A pull request says which modes it was built in (free, contrib-llvm, contrib-icpx) and on which GPUs and CPUs it ran, and marks what was not checked `unverified`; one that does not is asked for it ([What goes in](#what-goes-in)).
+
+## No agent self-attribution
+
+Nothing a coding agent writes for this repository or its GitHub says that an agent wrote it: no "Generated by ..." or "Written with ..." line, no `Co-Authored-By` trailer naming an agent, and no name of the agent or of the AI model behind it in a commit message, a code comment, a document, a release note, an issue or pull request comment, or a record.
+This holds whatever a tool or a harness adds by default: such a line is removed before the text goes out.
 
 ## Packages
 

@@ -2,15 +2,16 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # .claude/skills/release/scripts/bench.sh - a release's speed table on one GPU: the release and upstream's latest
-# release, IQ3_XXS, the six tiers of bench/results/2026-10-04-speed-matrix (1K to 262K) with what setup writes for
-# each context (images off), 256 greedy tokens, each run a new process.
+# release, IQ3_XXS, the six tiers of the 2026-10-04-speed-matrix record (1K to 262K) with what setup writes for
+# each context on this machine (images off; KV streaming only where the RAM holds it, from 2026-10-12), 256 greedy
+# tokens, each run a new process.
 #
 #   XE="CMD..." UP="CMD..." DATA=DIR IDS=DIR .claude/skills/release/scripts/bench.sh OUT GPU
 #
 # XE and UP: the command that starts each engine (its strata binary, or a wrapper that runs it in its container);
 # the generate options are appended.  XE_PROFILE and UP_PROFILE: each engine's shipped expert profile (its
 # data/expert-profile.bin).  DATA: the data folder (packs/qwen-iq3_xxs, models/...IQ3_XXS-0000N-of-00002.gguf,
-# mtp/rt).  IDS: the prompts of the speed-matrix record's prompts.py.  ROUNDS (default 2): runs per arm and tier.
+# mtp/rt).  IDS: the prompts of prompts.py beside this script.  ROUNDS (default 2): runs per arm and tier.
 # OUT/runs/GPU-ARM-TIER-ROUND.txt gets each log; one discarded warm-up per arm first (JIT); the arms alternate,
 # the first arm changing from round to round.  bench-collect.py OUT reads them.
 # upstream plainly at SLOW tok/s or less (default 10) is stopped mid-run and not run again in that tier: its prompt
@@ -25,6 +26,13 @@ slow=${SLOW:-10}
 P=$DATA/packs/qwen-iq3_xxs
 G=$DATA/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS
 mkdir -p "$out/runs"
+# KV streaming where setup writes it for the model on this machine's RAM (setup.kv_streaming_wanted, through
+# tools/bench_core.py; upstream's setup decides the same, its sycl/ port again in up-sycl.sh)
+repo=$(cd "$(dirname "$0")/../../../.." && pwd)
+declare -A kvr
+for c in 65536 131072 262144; do
+  kvr[$c]=$(python3 "$repo/tools/bench_core.py" kv-resident "$G-00001-of-00002.gguf" "$c") || exit 1
+done
 
 # PID LOG: writes LOG.stop and stops PID once the run is plainly at $slow tok/s or less
 watch_slow() {
@@ -54,14 +62,15 @@ run() {
     xe) read -r -a cmd <<< "$XE"; prof=$XE_PROFILE ;;
     up) read -r -a cmd <<< "$UP"; prof=$UP_PROFILE ;;
   esac
-  # setup's context for the tier (its smallest is 8K), int8 KV above 8K, KV streaming from 64K
+  # setup's context for the tier (its smallest is 8K), int8 KV above 8K, KV streaming from 64K where it fits the RAM
   case $2 in
     1k|4k) C=(--max-context 8192) ;;
     32k)   C=(--max-context 32768 --kv int8) ;;
-    64k)   C=(--max-context 65536 --kv int8 --kv-resident 32768) ;;
-    128k)  C=(--max-context 131072 --kv int8 --kv-resident 32768) ;;
-    262k)  C=(--max-context 262144 --kv int8 --kv-resident 32768) ;;
+    64k)   C=(--max-context 65536 --kv int8) ;;
+    128k)  C=(--max-context 131072 --kv int8) ;;
+    262k)  C=(--max-context 262144 --kv int8) ;;
   esac
+  case $2 in 64k|128k|262k) read -r -a k <<< "${kvr[${C[1]}]}"; C+=("${k[@]}") ;; esac
   timeout 2400 "${cmd[@]}" --pack "$P" --native "$G-00001-of-00002.gguf" --ple-gguf "$G-00002-of-00002.gguf" \
     --expert-profile "$prof" --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp "$DATA/mtp/rt" \
     "${C[@]}" --tokens-file "$IDS/$2.ids" --max-new 256 > "$3" 2>&1 &
@@ -85,3 +94,5 @@ for t in 1k 4k 32k 64k 128k 262k; do
     done
   done
 done
+
+exit 0

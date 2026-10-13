@@ -43,17 +43,20 @@ void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t 
 /// R[t, c, :] = e[t, :] for all four streams (the embedding broadcast).
 void gr_broadcast(const float* e, float* R, int64_t T, void* stream);
 
-// ---- GDN (state 128, 16 k heads, 48 v heads, 10240 conv channels, 4 taps)
-/// gate[t,h] = softplus(ab[t,h] + dt[h]) * ssm_a[h];  beta[t,h] = sigmoid(ab[t, 48 + h])  (ab: [T, 96])
-void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream);
+// ---- GDN (state 128, 4 taps; h_k key heads and h_v value heads, C = 2 h_k 128 + h_v 128 conv channels: Qwen3.8's
+// 16 and 48, the defaults, and qwen35moe's 16 and 32 - any other shape throws)
+/// gate[t,h] = softplus(ab[t,h] + dt[h]) * ssm_a[h];  beta[t,h] = sigmoid(ab[t, h_v + h])  (ab: [T, 2 h_v])
+void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream,
+               int64_t h_k = 16, int64_t h_v = 48);
 /// The 4-tap causal conv + SiLU over the chunk (history [C][3] in, updated to the chunk's last three inputs), then
 /// the L2 norm of the q and k heads of every token.  h: [T, C].
-void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream);
+void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream,
+              int64_t h_k = 16, int64_t h_v = 48);
 /// The recurrence over the chunk, state in registers; y16[t] = rmsnorm(o) * gamma * sigmoid(z) in FP16 (what the
-/// out projection reads); y is FP32 scratch.
+/// out projection reads; `silu`: * silu(z), qwen35moe's gate); y is FP32 scratch.
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
-                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream);
-
+                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, int64_t h_k = 16,
+                    int64_t h_v = 48, bool silu = false);
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream);
@@ -61,10 +64,13 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream);
 /// h16[n, r] = fp16(silu(gu[n, 2r]) * gu[n, 2r + 1])   (the interleaved expert gate/up)
 void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream);
-/// h16[n, r] = fp16(silu(g[n, r]) * u[n, r])   (the shared expert, gate and up separate, width 640)
-void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream);
+/// h16[n, r] = fp16(silu(g[n, r]) * u[n, r])   (the shared expert, gate and up separate, n rows of `width`: Qwen3.8's
+/// 640, qwen35moe's 512)
+void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream, int64_t width = 640);
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
+/// Scatter rows: dst[dst_row[i], :] = src[i, :] (n rows of `width` floats).
+void scatter_rows(const float* src, const int32_t* dst_row, float* dst, int64_t n, int64_t width, void* stream);
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);

@@ -107,7 +107,8 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Packages that came in automatically with `rocm-dev` become `apt autoremove` candidates once it is gone; mark them with `sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo`.
 - The script applies fixes the release lacks to the sources before building, as the patches in `third_party/main/intel-llvm/patches/` (`NN-<id>.patch`, in order; under intel/llvm's Apache-2.0 WITH LLVM-exception), and records their ids in `install/XESTRATA.json`.
   A build of the same release without them is offered a rebuild.
-  There are fifteen fixes now; the first twelve are not fixed in intel/llvm's `sycl` branch either (2026-10-08).
+  There are seventeen fixes now; none of the first twelve is fixed in intel/llvm's `sycl` branch either (2026-10-08).
+  The Windows port's fixes are numbered from 90, so that the numbers XeStrata's own fixes take next do not collide with them.
   First, the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).
   Second, the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture.
   With an executable carrying code for several architectures, a GPU older than that image did not run and a newer one ran older code.
@@ -137,15 +138,24 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   AMD images carry no `compile_target`; the runtime asked the HIP adapter about each image alone without handing it the image, and the adapter falls back on the first AMD image when none matches.
   An engine for many AMD GPUs, as the packages build it, stopped with no usable GPU (kernels submitted to a queue were not affected: that path hands the adapter all the images and their bytes).
   Fixed, the runtime hands the HIP adapter the image too, as it does the CUDA one, and the adapter does not fall back on a clang offload bundle without the GPU's architecture (`hip-bundle-arch`).
-  Thirteenth, on Windows the HIP adapter's CMake imported AMD's comgr as the Linux shared object (`libamd_comgr.so`), and the configuration failed (`IMPORTED_IMPLIB not set for imported target "amd_comgr"`).
+  Thirteenth, a program with code for several NVIDIA or AMD architectures had another architecture's device code under each one's name.
+  SYCL's bundle IDs carry the GPU without an environment field before it (`sycl-amdgcn-amd-amdhsa-gfx1030`), and clang-offload-bundler read the GPU as the triple's environment.
+  The target ID was empty and every architecture of a triple matched every other, so unbundling an object or an archive gave each architecture's link the triple's first unclaimed entry in hash order.
+  The packages' engine had gfx1200's code under gfx1030, gfx1030's under gfx1101 and gfx1100's under gfx1201, which an RX 9070 XT refused as an illegal instruction.
+  Fixed, a fifth component that names a GPU is read as the target ID (`offload-bundle-arch`).
+  Fourteenth, the HIP adapter answered a GPU's free memory (SYCL's `ext_intel_free_memory`) with `hipMemGetInfo` without making that GPU current, so every AMD GPU reported the free memory of the thread's current one.
+  A layer split over two AMD GPUs saw the first stage's free memory, nearly all of it held by its expert cache, on the second stage, which found no room for its own cache and stopped.
+  Fixed, the GPU is made current before the query, as the adapter's other calls do (`hip-mem-free-device`; the CUDA adapter makes the GPU's context current for every query).
+  Fifteenth (90), on Windows the HIP adapter's CMake imported AMD's comgr as the Linux shared object (`libamd_comgr.so`), and the configuration failed (`IMPORTED_IMPLIB not set for imported target "amd_comgr"`).
   Fixed, it imports `amd_comgr.lib` on Windows, as the HIP runtime beside it imports `amdhip64.lib` (`hip-windows-comgr`).
-  Fourteenth, the driver took a ROCm device library folder without `oclc_correctly_rounded_sqrt_on.bc` and `_off.bc` for no device libraries at all.
+  Sixteenth (91), the driver took a ROCm device library folder without `oclc_correctly_rounded_sqrt_on.bc` and `_off.bc` for no device libraries at all.
   Newer ROCm releases (ROCm 7.12's HIP SDK for Windows, for example) no longer ship the two, so every compile for an AMD GPU failed.
   Fixed, both or neither are accepted, and the library is linked only where it exists (`hip-device-libs-sqrt`).
-  Fifteenth, the HIP adapter did not answer the device LUID (`sycl::ext::intel::info::device::luid`), which the CUDA and Level Zero adapters answer on Windows, and its device ID query returned the PCI device number (0), so a program could not find a HIP GPU's DXGI adapter.
+  Seventeenth (92), the HIP adapter did not answer the device LUID (`sycl::ext::intel::info::device::luid`), which the CUDA and Level Zero adapters answer on Windows, and its device ID query returned the PCI device number (0), so a program could not find a HIP GPU's DXGI adapter.
   On Windows a device allocation past the adapter's local memory budget is not refused but placed in system memory and read over PCIe; the engine sizes its expert cache by that budget, which it reads from DXGI by the LUID.
   Fixed, the adapter answers `hipDeviceProp_t::luid` on Windows (an all-zero LUID, and every other system, stays unsupported; `hip-windows-luid`).
   The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
+  `offload-bundle-arch` asks every toolchain.
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).
 - On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.
 - Running on an NVIDIA GPU needs NVIDIA's driver (on Ubuntu 26.04, `nvidia-driver-610-open` or another).
@@ -209,7 +219,7 @@ sde64 -version
 - The engine's own timings: `STRATA_PREFILL_TIMING=1` for the prefill path.
   The decode's `verify window` line (the host's wait for the GPU, the CPU pool) is always printed.
 - `STRATA_VERIFY_NODES=1` prints how many kernels a decode window's graph holds.
-- Scratch probes that time single kernels with SYCL event profiling (the records in `bench/results/2026-10-02-xe-decode-gpu`).
+- Scratch probes that time single kernels with SYCL event profiling.
 - `STRATA_VERIFY_PROFILE=1` needs a device-scope clock, which the B70 does not have.
 
 ### The xe driver's kernel log
@@ -221,8 +231,7 @@ The xe driver reports its errors in the kernel log.
 journalctl -k --since "-1h" --no-pager | grep "xe 0000"
 ```
 
-`VM worker error: -16` there came about 8 s before each start that had the output head's VRAM refused
-(`bench/results/2026-10-02-xe-decode-gpu`).
+`VM worker error: -16` there came about 8 s before each start that had the output head's VRAM refused.
 
 ### VTune and the GPU's hardware counters
 

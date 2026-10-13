@@ -16,26 +16,46 @@
 
 namespace strata::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
-inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292; a BF16 layer's
+/// activation is BF16, llm-jp-4.1's 2560 values 5120 bytes).
+inline constexpr size_t kNativeActBytes = 8192;
+/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292; llm-jp-4.1's 960
+/// as Q8_0: 30 x 34, as BF16 1920).
+inline constexpr size_t kNativeHBytes = 2048;
+/// The widest expert intermediate a native layer may have (llm-jp-4.1: 960); the pool's row buffers are this wide.
+inline constexpr int64_t kNativeMaxFF = 1024;
 
 /// One layer's native expert geometry.
 struct NativeFmt {
     int gu_type = -1, d_type = -1;      ///< ggml types of gate/up and of down
     int gu_act = -1, d_act = -1;        ///< their vec_dot_type (the activation formats)
+    /// The up rows' type: gu_type, or another one with the same activation format (Ornith-1.5's GSQ-RCO files mix
+    /// Q2_K, Q3_K and Q4_K between gate and up in some layers).  gu_row and up_off are the gate rows'.
+    int up_type = -1;
     int64_t n_embd = 0, n_ff = 0;
     size_t gu_row = 0, d_row = 0;       ///< bytes per weight row
+    size_t up_row = 0;                  ///< bytes per up row (gu_row when up_type is gu_type)
     size_t up_off = 0, down_off = 0;    ///< inside the blob
     size_t bytes = 0;                   ///< the whole blob
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
 };
 
+/// Whether the layer's gate and up rows are of different types (a NativeFmt filled by native_fmt; one built another
+/// way leaves up_type at -1: the gate's).
+inline bool native_mixed_gu(const NativeFmt& f) { return f.up_type >= 0 && f.up_type != f.gu_type; }
+
 /// Whether this build has the ggml-cpu path.
 bool native_experts_available() noexcept;
-/// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
-bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
+/// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.  `up_type` (-1: the gate's)
+/// is the up rows' when they differ, which must quantize the activation the same way.
+bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
+                int up_type = -1);
+
+/// One row of `n` values of a GGUF tensor of ggml type `type` to floats, by ggml's own dequantizer (a model's
+/// embedding row read on the host).  False when ggml has none for the type or `n` is not whole blocks.
+bool native_row_to_float(int type, const void* src, float* dst, int64_t n);
+/// Bytes of one row of `n` values of ggml type `type` (0 when `n` is not whole blocks).
+size_t native_row_bytes(int type, int64_t n);
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes).
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);

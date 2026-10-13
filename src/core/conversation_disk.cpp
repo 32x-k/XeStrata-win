@@ -268,7 +268,7 @@ std::array<const std::vector<uint8_t>*, 5> state_parts(const ConversationCheckpo
 // ---- the body: every running state (the live one first), then every K/V layer.  Each part is its size, its codec
 // and its bytes.  With --conversation-save-compress the floating-point parts that compress (the DeltaNet states,
 // the indexer rows, FP16 K/V) go through c-blosc2's ZSTD at level 1 after a byte shuffle; 1-byte K/V codes gain
-// 4-7% and the small parts nothing, so they stay as they are (bench/results/2026-10-04-conversation-save-compress).
+// 4-7% and the small parts nothing, so they stay as they are (the 2026-10-04-conversation-save-compress record).
 struct Writer {
     std::FILE* f = nullptr;
     Hash hash;

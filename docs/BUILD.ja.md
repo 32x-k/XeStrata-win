@@ -48,8 +48,7 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   自由ソフトウェアだけで済み、oneAPI の環境は使いません。
   `tools/intel_llvm_build.py` でソースからビルドしたもの（v7.1.1）で確かめています（[setup](#setup) を参照）。
   ディストリビューションのパッケージも 7 以降なら使えます。それより古いもの（Ubuntu 26.04 の `dpclang++` 6.2）は、CMake と setup が断ります。
-  6.2 の SYCL ランタイムは Arc Pro B70 に XMX がないと報告し、prefill の経路が約 1.6 倍遅くなっていました
-  （[記録](../bench/results/2026-10-02-dp4a/README.md)）。
+  6.2 の SYCL ランタイムは Arc Pro B70 に XMX がないと報告し、prefill の経路が約 1.6 倍遅くなっていました。
   ROCm の HIP 付きでビルドした intel/llvm なら、`STRATA_HIP_ARCHS`（例 `gfx1200`）で AMD の GPU（RDNA2 以降: gfx103x、gfx11xx、gfx12xx）向けのコードも作ります。
   ROCm は自由ソフトウェアなので、free でも contrib-llvm でも同じです（[DEVTOOLS.ja.md](DEVTOOLS.ja.md#hipamd-の-gpu)）。
   `auto`（既定）はカーネルの KFD が報告するこの PC の AMD の GPU を選び、`rocblas` はディストリビューションの rocBLAS がコードを持つ RDNA2 以降の GPU のうち、SYCL のコンパイラにターゲットのあるものをすべて選びます（パッケージはこれでビルドします。intel/llvm 7.1.1 には gfx1152 と gfx1153 のターゲットがありません）。
@@ -102,7 +101,7 @@ coder-iq1_m の 997 トークンのプリフィルは、B70 で 1421 ms から 1
 なければ、GPU が報告する別の形の行列エンジン（Arc A シリーズ（Xe-HPG）の 8 x 8 x 16、NVIDIA の Tensor Core の 16 x 16 x 16）を `joint_matrix` の標準の API で使う経路（`src/kernels/xe/mma_gemm.cpp`）を選びます。
 それもなければ DP4a の経路を選び、どちらになったかを一度だけ表示します。
 Arc A シリーズが `mma_gemm` を使うのは、その SYCL ランタイムが XMX のカーネルの使う Intel の拡張（joint_matrix の prefetch と境界つきの読み込み・書き込み）を受け付けないためです。
-A380 では DP4a より 17〜38% 速く、FP64 との相対誤差も小さくなります（0.53% に対して 0.0001%、[記録](../bench/results/2026-10-04-dg2-dp4a/README.md)）。
+A380 では DP4a より 17〜38% 速く、FP64 との相対誤差も小さくなります（0.53% に対して 0.0001%）。
 `STRATA_NO_XMX=1` を付けると、行列エンジンがあっても DP4a の経路を選びます。
 `STRATA_MMA=1` を付けると、`mma_gemm` が扱う形（Xe2 の 8 x 16 x 16 など）を GPU が報告していれば、XMX があってもそれを選びます（その経路を確かめるためのものです）。
 `STRATA_NO_BF16_MMA=1` は BF16 の、`STRATA_NO_INT8_MMA=1` は int8 の行列の組み合わせを、GPU の報告から除きます（`src/kernels/xe/matrix_report.cpp`）。
@@ -230,8 +229,7 @@ AMD の GPU は `STRATA_HIP_ARCHS` に並べます（RX 6800 は `gfx1030`、RX 
   ドライバーが各カーネルを初めて使うときにコンパイルし、`~/.cache/neo_compiler_cache` に保存します。
   AOT のコードは作りません（deb と rpm のパッケージも同じです）。
   そのため、まだコンパイルしていないカーネルを使うモデルの初回は、最初のトークンまで時間がかかります。
-  setup は最後にモデルを一度起動し、長い質問と画像を送って、このコンパイルを済ませます
-  （[記録](../bench/results/2026-09-30-xe-setup/README.md#compiling-the-gpu-code-at-setup-added-later-on-2026-09-30)）。
+  setup は最後にモデルを一度起動し、長い質問と画像を送って、このコンパイルを済ませます。
   `--no-warmup` で省けます。
 
 ## setup
@@ -436,6 +434,7 @@ xe0.1.40.2.1 は `0.1.40.2-2`（rpm は Version が 0.1.40.2、Release が 2）�
   アダプターを作り、アダプターを同梱します。エンジンが持つ AMD のコードは `BUILD.json` の `hip_archs` に記録し、setup はそれで GPU が使えるかを判断します。
 - 推奨と提案に入れたメーカーのものは、メーカーごとに `BUILD.json` の `runtime` にも記録します。setup は、使う GPU のメーカーのもので入っていないものを apt か dnf に尋ねて調べ、入れ方（要るならリポジトリの登録から）を表示します。GPU のランタイムがなければ止まり、oneMKL と cuBLAS がなければ表示だけして続けます。
 - `third_party/nonfree/` は入れません。チャットテンプレートは、setup がモデルの pack に書いたものを使います。
+  実験的な速度向上用の射影のベクトルは、有効にしたときに setup が版のタグから GitHub でダウンロードします。
 - Python はビルドのときにバイトコンパイルし、`xestrata` は `PYTHONDONTWRITEBYTECODE=1` で動かします。`/usr` に後から何も書かず、
   `/etc` にも何も置かないので、パッケージを消せば何も残りません。
 

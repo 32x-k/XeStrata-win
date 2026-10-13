@@ -422,12 +422,8 @@ def fmt(v, kind):
     return f"{v:,.0f}" if kind in ("ratio", "ms") else f"{v:.2f}" if kind == "lower" else f"{v:.1f}"
 
 
-def table(title: str, rows: list[tuple], names: list[str], prompt_only: list[bool] | None = None) -> list[str]:
-    """rows: (label, kind, [value per engine]).  An engine `prompt_only` (upstream's Intel port, as the upstream merges
-    measure it) has no output and no time to the first token compared: those cells stay empty."""
-    if prompt_only:
-        rows = [(label, kind, [None if kind not in ("ratio", "ms") and po else x for x, po in zip(v, prompt_only)])
-                for label, kind, v in rows]
+def table(title: str, rows: list[tuple], names: list[str]) -> list[str]:
+    """rows: (label, kind, [value per engine])."""
     if len(names) == 1:
         out = [f"### {title}", "", "| | " + names[0] + " |", "| --- | ---: |"]
         out += [f"| {label} | {fmt(v[0], kind)} |" for label, kind, v in rows]
@@ -440,7 +436,6 @@ def table(title: str, rows: list[tuple], names: list[str], prompt_only: list[boo
 
 def summary_md(rec: dict) -> str:
     names = [e["name"] for e in rec["engines"]]
-    po = [e.get("prompt_only", False) for e in rec["engines"]]
     m = rec["machine"]
     # the link as setup reads it, before the runs: a card that narrows or slows its link when idle shows that here
     gpu = " + ".join(f"{g.get('name')} ({g.get('vram_gb', 0):.0f} GB, PCIe link before the runs {g.get('link') or '?'})"
@@ -475,8 +470,7 @@ def summary_md(rec: dict) -> str:
         rows = [(f"{t.upper()} {label} (tok/s)", kind, [med(gen, key, engine=n, tier=t) for n in names])
                 for key, label, kind in (("prefill_tok_s", "プロンプト", "ratio"), ("decode_tok_s", "出力", "pct"))
                 for t in rec["tiers"]]
-        out += table(f"generate（追従・リリースと同じ条件、256 トークン greedy、{rec.get('rounds', 2)} 回の中央値）", rows, names,
-                     po)
+        out += table(f"generate（追従・リリースと同じ条件、256 トークン greedy、{rec.get('rounds', 2)} 回の中央値）", rows, names)
     if rec.get("skipped"):
         out += [f"- {rec['skipped']}", ""]
     srv = mx.get("serve") or []
@@ -486,7 +480,7 @@ def summary_md(rec: dict) -> str:
                                          ("cont_ms", "会話の続きの待ち (ms)", "ms"), ("decode_tok_s", "出力 (tok/s)", "pct"))
                 for t in rec["tiers"]]
         how = "greedy" if mode == "greedy" else f"温度 {C.mode_temperature(mode):g}"
-        out += table(f"serve {how}（4 ターンのチャット、256 トークン）", rows, names, po)
+        out += table(f"serve {how}（4 ターンのチャット、256 トークン）", rows, names)
     use = mx.get("usage") or []
     if use:
         rows = [(f"{c} {label}", kind, [med(use, key, engine=n, conv=c) for n in names])
@@ -495,8 +489,7 @@ def summary_md(rec: dict) -> str:
                                          ("prefill_tok_s", "プロンプト (tok/s)", "ratio"),
                                          ("decode_tok_s", "出力 (tok/s)", "pct"))]
         t = rec.get("temperature", C.TEMPERATURE)
-        out += table(f"usage（server.py 経由、{'greedy' if not t else f'温度 {t:g}、top_p 0.8、top_k 20'}）", rows,
-                     names, po)
+        out += table(f"usage（server.py 経由、{'greedy' if not t else f'温度 {t:g}、top_p 0.8、top_k 20'}）", rows, names)
     stopped = [f"generate {r['engine']} {r['tier']} {r['round']}: {r['stopped']}" for r in gen if r.get("stopped")]
     stopped += [f"serve {r['engine']} {r['tier']} {r['mode']} {r['round']}: {r['stopped']}" for r in srv
                 if r.get("stopped")]
@@ -590,7 +583,7 @@ def run(cfg_path: Path, data: Path, gpus: list[dict], verbose: bool = False, ori
     model, mtp = model_of(cfg)
 
     def args(e: C.Engine, tier: str) -> list[str]:
-        return C.engine_args(model, e.profile, mtp, C.CONTEXT[tier])
+        return C.engine_args(model, e.profile, mtp, C.tier_context(model, tier))
 
     def usage_cfg(e: C.Engine) -> dict:
         # this PC's own config, as it is used; beside upstream, the merges' config for both engines at its context
@@ -598,7 +591,7 @@ def run(cfg_path: Path, data: Path, gpus: list[dict], verbose: bool = False, ori
             return dict(cfg)
         own = {k: cfg[k] for k in ("gpu", "gpu_pci", "lib_dirs") if k in cfg} if e is xe else {}
         return {"exe": e.cmd[0], "cwd": str(e.root), "tokenizer": cfg["tokenizer"], "model_name": "bench",
-                "args": C.engine_args(model, e.profile, mtp, C.usage_context(ctx)), **own, **e.cfg_extra}
+                "args": C.engine_args(model, e.profile, mtp, C.usage_context(model, ctx)), **own, **e.cfg_extra}
 
     ctx = context_of(cfg["args"])
     tiers = [t for t in TIERS if fits(t, ctx)]
@@ -606,7 +599,7 @@ def run(cfg_path: Path, data: Path, gpus: list[dict], verbose: bool = False, ori
     modes = tuple(dict.fromkeys(("greedy", C.temperature_mode(temperature))))
     rec: dict = {"date": time.strftime("%Y-%m-%d %H:%M"), "tiers": [] if split else tiers, "rounds": rounds,
                  "temperature": temperature,
-                 "engines": [{"name": e.name, "arm": e.arm, "prompt_only": e.prompt_only} for e in engines],
+                 "engines": [{"name": e.name, "arm": e.arm} for e in engines],
                  "machine": environment(cfg, gpus, data), "upstream": upstream, "judgment": [],
                  "verbose": {} if verbose else None}
     sampler = Sampler(cfg.get("gpu_pci")) if verbose else None

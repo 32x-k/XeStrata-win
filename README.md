@@ -20,6 +20,9 @@ It is free software, and on an Intel or AMD GPU it also builds and runs with fre
 
 ## About XeStrata
 
+Software written in CUDA runs only on NVIDIA's GPUs, which ties its users to one maker's hardware.
+XeStrata aims to run on Intel, AMD and NVIDIA GPUs alike, from one code base written in SYCL, an open standard.
+
 A port of [Strata](https://github.com/Niko1221/Strata) (for NVIDIA GPUs) to Intel GPUs.
 Its GPU code is rewritten from CUDA to SYCL and Level Zero, so that it runs on Intel's GPUs.
 The same code is compiled for AMD GPUs (the free and contrib-llvm builds) and NVIDIA GPUs (the contrib-llvm build) as well.
@@ -82,40 +85,88 @@ So XeStrata runs only on the GPUs the distribution's rocBLAS has code for.
 
 ## Choosing a model
 
-**The size** (the same model, compressed more or less):
+| Model | Parameters | RAM (about) | VRAM | Good for |
+| --- | --- | ---: | ---: | --- |
+| **[Qwen3.8-Flash-Next](#qwen38-flash-next)** | 125B | 32-62 GB | 12 GB or more recommended | the smartest; for a PC with a lot of RAM |
+| **[Ornith-1.5](#ornith-15-beta)** (BETA) | 35B (3B a token) | 22-80 GB | from 4 GB | a PC with less RAM |
+| **[llm-jp-4.1](#llm-jp-41-beta)** (BETA) | 32B (3B a token) | 30-73 GB | from 4 GB | a thinking model for Japanese and English |
 
-| Size | Download | RAM (about) | Speed | Quality |
-| --- | ---: | ---: | --- | --- |
-| **Q2_0** | 66 GB | 48 GB | fastest | good |
-| **IQ2_XS** | 68 GB | 48 GB | fast | better (**recommended**) |
-| **IQ3_XXS** | 76 GB | 60 GB | slower | great |
-| **IQ3_S** | 84 GB | 62 GB | slowest | best (the original model only) |
+The two BETA models do not yet take images, two or more GPUs, or Intel's integrated GPUs
+([details](docs/DETAILS.md#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41)).
+
+Not sure? On a PC with 48 GB of RAM or more, take Qwen3.8-Flash-Next's **IQ2_XS**.
+With less RAM than that, Qwen3.8-Flash-Next's Coder (32 GB) or Ornith-1.5 is the one to choose.
+To add another model later, run `xestrata --setup`.
+
+### Qwen3.8-Flash-Next
+
+**The version and the size** (the size: the same model, compressed more or less):
+
+| Version | Size | Download | RAM (about) | Speed | Quality |
+| --- | --- | ---: | ---: | --- | --- |
+| the original, Swift 1.5 | **Q2_0** | 66 GB | 48 GB | fastest | good |
+| the original, Swift 1.5 | **IQ2_XS** | 68 GB | 48 GB | fast | better (**recommended**) |
+| the original, Swift 1.5 | **IQ3_XXS** | 76 GB | 60 GB | slower | great |
+| the original, Swift 1.5 | **IQ3_S** | 84 GB | 62 GB | slow | as the original model |
+| Coder | **IQ1_M** | 58 GB | 32 GB | fast | good at code, weaker elsewhere |
+| Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | slow with less than about 80 GB of RAM | between IQ3_S and UD-Q4_K_XL |
+| Unsloth (experimental) | **UD-Q4_K_XL** | 111 GB | 48 GB | slowest | best |
 
 All of the model's experts ([How it works](#how-it-works)) are kept in RAM. With less RAM than that but a GPU with a
 lot of VRAM, it runs in the **low-RAM mode**: the experts are read from the model files instead of copied into RAM
 ([details](docs/DETAILS.md#less-ram-than-the-model-the-low-ram-mode)).
+The two Unsloth files read the experts that do not fit the RAM from the SSD while they answer.
 
 **The version:**
 
 - **Qwen3.8-Flash-Next:** the original.
-- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF):** ISTA-DASLab's version for
-  code. Of each layer's 512 experts it keeps the 256 that code uses. One size, IQ1_M: a 58 GB download, and it runs
-  with 32 GB of RAM. With half the experts it is weaker outside code and in languages other than English.
 - **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF):** UkisAI's fine-tune. It
-  thinks for a shorter time before it answers, so the answer comes sooner, at about the same quality. There is no
-  IQ3_S. Its own license applies.
+  thinks for a shorter time before it answers, so the answer comes sooner, at about the same quality. Its own license
+  applies.
+- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF):** ISTA-DASLab's version for
+  code. Of each layer's 512 experts it keeps the 256 that code uses. With half the experts it is weaker outside code
+  and in languages other than English.
 - **[Unsloth's UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF):** a ~4-bit i-quant of the
-  original, between IQ3_S and UD-Q4_K_XL in quality, a 94 GB download. Its experts take 59.5 GB; on a PC with less
-  than about 80 GB of RAM, those that do not fit are read from the SSD ([details](docs/DETAILS.md#or-unsloths-ud-iq4_xs)).
+  original. Its experts take 59.5 GB; with about 80 GB of RAM or more, all of them stay in RAM
+  ([details](docs/DETAILS.md#or-unsloths-ud-iq4_xs)).
 - **[Unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** (experimental): a 4-bit file
-  of the original, a 111 GB download. Its experts take 77 GB; those that do not fit the RAM are read from the SSD
-  while it answers, so it is slower than the 2-3-bit sizes ([details](docs/DETAILS.md#or-unsloths-ud-q4_k_xl-experimental)).
-
-Not sure? Take **IQ2_XS**. On a PC with only 32 GB of RAM, the Coder is the one to choose.
-To add another model later, run `xestrata --setup`.
+  of the original. Its experts take 77 GB, and it is slower than the 2-3-bit sizes
+  ([details](docs/DETAILS.md#or-unsloths-ud-q4_k_xl-experimental)).
 
 OrcaRouter's Flash-Next Uncensored IQ3_XXS is not in setup's menu.
 How to convert it is in [docs/ORCA.md](docs/ORCA.md).
+
+### Ornith-1.5 (BETA)
+
+[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) (Ornith AI, MIT): a Qwen3.5 MoE, with a
+context of up to 256K. Its official files (Q4_K_M to BF16) draft tokens with the model's MTP layer, which makes the
+decode faster.
+
+| Size | Download | RAM (about) | VRAM |
+| --- | ---: | ---: | ---: |
+| Q4_K_M | 21.7 GB | 30 GB | from 4 GB |
+| Q5_K_M | 25.3 GB | 34 GB | from 6 GB |
+| Q6_K | 29.2 GB | 38 GB | from 6 GB |
+| Q8_0 | 37.8 GB | 46 GB | from 6 GB |
+| BF16 | 71.1 GB | 80 GB | from 8 GB |
+| GSQ-RCO-3BIT | 13.0 GB | 22 GB | from 4 GB |
+| GSQ-RCO-3.5BIT | 15.2 GB | 24 GB | from 6 GB |
+
+The two GSQ-RCO files are pfeifferj's [community reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)
+and have no MTP layer.
+
+### llm-jp-4.1 (BETA)
+
+[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) (LLM-jp, Apache-2.0):
+a thinking model for Japanese and English, with a context of up to 256K.
+
+| Size | Download | RAM (about) | VRAM |
+| --- | ---: | ---: | ---: |
+| Q4_K_M | 21.5 GB | 30 GB | from 4 GB |
+| BF16 | 64.3 GB | 73 GB | from 8 GB |
+
+For the two BETA models, the RAM is about the download plus 8 GB. With less, the experts are read from the model
+file instead of loaded into RAM, which is slower.
 
 ## Install
 
@@ -159,7 +210,10 @@ In `xestrata --setup`'s questions, pressing Enter takes the recommended choice.
 **Running it while you are logged in:** `systemctl --user enable --now xestrata` keeps the model set up last running
 (no browser opens). Set it up with `xestrata` once first.
 
-**Updating:** `sudo apt upgrade` or `sudo dnf upgrade`. The model's settings are updated at the next start.
+**Updating:** when a new release is out, XeStrata says so in its window and on the chat page's About tab (it checks
+at the start and every six hours while it runs; `xestrata --check-update` checks now). Download the new package from
+[Releases](https://github.com/MistVVK/XeStrata/releases) and install it as before, with `sudo apt install ./<file>.deb`
+or `sudo dnf install ./<file>.rpm`. The model's settings are updated at the next start.
 
 **Fitting it to your PC:** `xestrata --calibrate` measures some of the engine's settings on this PC and keeps the
 fastest (about 5-10 minutes).
@@ -199,7 +253,7 @@ Installing from the source with `./setup.sh` is in [docs/BUILD.md](docs/BUILD.md
 - **Thinking:** the model thinks before it answers. Choose **Off, Low, Medium or High** in the chat page's menu, with
   `/think low` in `chat.py`, or with your app's "reasoning effort" setting. Off is fastest; High suits hard questions.
 - **Pictures:** in the chat page, click **Picture**; in `chat.py`, type `/image <path>`; in apps, attach them.
-- **From a phone or another PC:** run `xestrata --setup --host 0.0.0.0 --api-key <secret>` and open the address
+- **From a phone or another PC:** run `xestrata --host 0.0.0.0 --api-key <secret>` and open the address
   the server window prints ([details](docs/DETAILS.md#streaming-and-connecting)).
 
 **Good to know:** it answers one request at a time (several at once is opt-in: `"parallel": 2`, [BATCHING](docs/BATCHING.md)). The first message of a conversation is read in full; after that
@@ -281,9 +335,15 @@ what has been checked in [docs/XE.md](docs/XE.md).
 - **Measuring the speed:** `xestrata --bench`, the upstream merges' measurements and the release table are in [docs/BENCH.md](docs/BENCH.md).
 - **Rules:** [AGENTS.md](AGENTS.md) covers them: independence from the hardware (code paths chosen from what the GPU
   and CPU report), the lints (`tools/lint/run.sh`), the tests, and the license notices.
-- **Upstream integration:** the changes of Strata up to 0.1.40.2 are carried into Xe, except the Windows
+- **What goes in:** whoever wrote it (the maintainer's commits, pull requests, ports from upstream), a change goes in only when
+  built and tested with intel/llvm in both the free and contrib-llvm modes, and depending on the hardware as little as it can
+  (no CUDA or other maker's API relied on, no value measured on one card hard-coded). Others do not go in as they are: they
+  are a reference, written again as XeStrata's code ([AGENTS.md](AGENTS.md#what-goes-in)).
+  A pull request says which modes it was built in (free, contrib-llvm, contrib-icpx) and on which GPUs and CPUs it ran,
+  and marks what was not checked `unverified`.
+- **Upstream integration:** the changes of Strata up to 0.1.42 are carried into Xe, except the Windows
   implementation. Of the paths meant to be faster, those measured faster on the B70, the RTX 4070 or the RX 9060 XT
-  are carried ([docs/XE.md](docs/XE.md#integration-through-strata-0140)).
+  are carried ([docs/XE.md](docs/XE.md#integration-through-strata-0142)).
 - **The README and docs:** the Japanese ones (README.ja.md, docs/*.ja.md) are written first, and the English ones (README.md, docs/*.md) are their translations.
 
 ## Credits
@@ -306,9 +366,14 @@ what has been checked in [docs/XE.md](docs/XE.md).
      modes' compiler, built with XeStrata's fixes (`third_party/main/intel-llvm/patches/`, under the same license);
      the packages carry its SYCL runtime;
    - the web app's font, [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1).
-- **Ideas from:** [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer),
-  [HyperQwen](https://github.com/syv-ai/HyperQwen) and [Project Maya](https://github.com/mw00/project-maya) (how many of the experts missing from VRAM
-  the CPU computes and how many are read over PCIe).
+- **Ideas from:**
+   - [Splash](https://github.com/incoai/splash), by Inco AI and the Splash contributors;
+   - [ninfer](https://github.com/Neroued/ninfer), by Neroued;
+   - [HyperQwen](https://github.com/syv-ai/HyperQwen), by syv.ai and the HyperQwen contributors;
+   - [Project Maya](https://github.com/mw00/project-maya), by mw00 and the Project Maya contributors (how many of the
+     experts missing from VRAM the CPU computes and how many are read over PCIe);
+   - [nextsycl](https://github.com/maxfridbe/nextsycl), by maxfridbe (which kernels the decode of the Qwen3.5 family's
+     models merges).
 - More in [docs/DETAILS.md](docs/DETAILS.md#credits-and-licenses).
 
 ## License

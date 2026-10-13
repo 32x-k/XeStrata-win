@@ -9,6 +9,8 @@
 #include "strata/kernels/s2_gemv_q8.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_s2_gemv
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <string>
 

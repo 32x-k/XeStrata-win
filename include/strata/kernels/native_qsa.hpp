@@ -24,6 +24,11 @@ bool native_qsa_enabled();
 void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float* output,
                                   int n_cols, int n_rows, float epsilon, void* stream);
 
+// The same, writing the output also as q8_1 blocks (n_cols a multiple of 32) into x_q8_1, bit for bit
+// native_quantize_q8_1 of the output: one launch for the norm and the quantization of the next products.
+void native_qsa_rms_norm_weighted_q8_1(const float* input, const float* gamma, float* output, void* x_q8_1,
+                                       int n_cols, int n_rows, float epsilon, void* stream);
+
 // The same per row with gamma[n_cols * groups]: row r is normalized on its own and scaled by gamma's slice
 // r % groups (the MTP's hidden input, one row per hyper-connection stream: --mtp-hnorm stream).
 void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float* output,

@@ -38,6 +38,8 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/runtime.hpp"
 #include "cuda_intrinsics.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_native_mmvq
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <cstdint>
 #include <cstddef>
@@ -64,6 +66,7 @@ struct Q5KBlock { half2 dm; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128];
 struct Q81Block { half2 ds; int8_t qs[32]; };
 struct Q20Block { half d; uint8_t qs[16]; };
 struct Q3KBlock { uint8_t hmask[32]; uint8_t qs[64]; uint8_t scales[12]; half d; };
+struct Q2KBlock { uint8_t scales[16]; uint8_t qs[64]; half2 dm; };
 struct IQ4XSBlock { half d; uint16_t scales_h; uint8_t scales_l[4]; uint8_t qs[128]; };
 struct Q4KBlock { half2 dm; uint8_t scales[12]; uint8_t qs[128]; };
 struct Q6KBlock { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; half d; };
@@ -76,6 +79,8 @@ static_assert(sizeof(Q81Block) == 36 && alignof(Q81Block) == 4);
 static_assert(sizeof(Q20Block) == 18 && alignof(Q20Block) == 2 && offsetof(Q20Block, qs) == 2);
 static_assert(sizeof(Q3KBlock) == 110 && alignof(Q3KBlock) == 2 && offsetof(Q3KBlock, qs) == 32 &&
               offsetof(Q3KBlock, scales) == 96 && offsetof(Q3KBlock, d) == 108);
+static_assert(sizeof(Q2KBlock) == 84 && alignof(Q2KBlock) == 4 && offsetof(Q2KBlock, qs) == 16 &&
+              offsetof(Q2KBlock, dm) == 80);
 static_assert(sizeof(IQ4XSBlock) == 136 && alignof(IQ4XSBlock) == 2 &&
               offsetof(IQ4XSBlock, scales_h) == 2 && offsetof(IQ4XSBlock, scales_l) == 4 &&
               offsetof(IQ4XSBlock, qs) == 8);
@@ -161,24 +166,21 @@ inline float q4_q8_dot_impl(const int* v, const int* u, const uint8_t* sc, const
     return low(dm4) * sumf_d - high(dm4) * sumf_m;
 }
 
-inline float q3_q8_dot_impl(int vl, int vh, const int* u, const uint8_t* scales, int scale_offset, float d3,
-                            const float* d8) {
-    float sumf = 0.0f;
+// vec_dot_q2_K_q8_1_impl_mmvq: a 4-bit scale and a 4-bit min a 16 values, the min against the Q8_1 values' sum by
+// DP4A with the min in every byte
+inline float q2_q8_dot_impl(int v, const int* u, const uint8_t* scales, const half2& dm2, const float* d8) {
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
     for (int i = 0; i < 4; ++i) {
-        const int isc = scale_offset + 2 * i;
-        const int isc_low = isc % 8;
-        const int sc_shift_low = 4 * (isc / 8);
-        const int sc_low = (scales[isc_low] >> sc_shift_low) & 0xf;
-        const int isc_high = isc % 4;
-        const int sc_shift_high = 2 * (isc / 4);
-        const int sc_high = ((scales[8 + isc_high] >> sc_shift_high) & 3) << 4;
-        const int sc = (sc_low | sc_high) - 32;
-        const int vil = (vl >> (2 * i)) & 0x03030303;
-        const int vih = ((vh >> i) << 2) & 0x04040404;
-        const int vi = vsubss4(vil, vih);
-        sumf += d8[i] * (dp4a(vi, u[i], 0) * sc);
+        const int sc = scales[2 * (ptrdiff_t) i];
+        const int vi = (v >> (2 * i)) & 0x03030303;
+        sumf_d += d8[i] * (float) (dp4a(vi, u[i], 0) * (sc & 0xF));
+        int m = sc >> 4;
+        m |= m << 8;
+        m |= m << 16;
+        sumf_m += d8[i] * (float) dp4a(m, u[i], 0);
     }
-    return d3 * sumf;
+    return low(dm2) * sumf_d - high(dm2) * sumf_m;
 }
 
 // Exact pinned vec_dot_q6_K_q8_1: keep signed per-16-element scales,
@@ -355,19 +357,51 @@ struct Q20Traits {
         return r.d2 * low(chunk->ds) * sumi;
     }
 };
+// The signed values and the scales of a lane's Q3_K chunk are worked out once in load() and reused for every column
+// (upstream 195d3791: the multi-column Q3_K kernels were 14% of an RTX A4000's GPU time on the Q2_0 pack); apply() is
+// the arithmetic of pinned vec_dot_q3_K_q8_1 in its order, so the output is the same bits.
 struct Q3KTraits {
     using Block = Q3KBlock;
     static constexpr int DIV = 256, T = 16, KBY = 8, BPI = WARPS * WARP / 16;
     static int kqs(int tid) { return tid % 16; }
-    struct W { int vl, vh; float d; const uint8_t* scales; int scale_offset, bq8_offset; };
+    struct W { int vi[4], sc[4]; float d; int bq8_offset; };
     static W load(const Block* w, int iqs) {
         W r;
         r.bq8_offset = 4 * (iqs / 8);
-        r.scale_offset = iqs - iqs % 8 + (iqs % 8) / 4;
+        const int scale_offset = iqs - iqs % 8 + (iqs % 8) / 4;
         r.d = (float) w->d;
-        r.vl = load_int_b2(w->qs, iqs);
-        r.vh = ~load_int_b2(w->hmask, iqs % 8) >> r.bq8_offset;
-        r.scales = w->scales;
+        const int vl = load_int_b2(w->qs, iqs);
+        const int vh = ~load_int_b2(w->hmask, iqs % 8) >> r.bq8_offset;
+        for (int i = 0; i < 4; ++i) {
+            const int isc = scale_offset + 2 * i;
+            const int sc_low = (w->scales[isc % 8] >> (4 * (isc / 8))) & 0xf;
+            const int sc_high = ((w->scales[8 + isc % 4] >> (2 * (isc / 4))) & 3) << 4;
+            r.sc[i] = (sc_low | sc_high) - 32;
+            r.vi[i] = vsubss4((vl >> (2 * i)) & 0x03030303, ((vh >> i) << 2) & 0x04040404);
+        }
+        return r;
+    }
+    static float apply(const W& r, const Q81Block* x, int iqs) {
+        float sumf = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            const int u = load_int(x[r.bq8_offset + i].qs, iqs % 8);
+            sumf += low(x[r.bq8_offset + i].ds) * (float) (dp4a(r.vi[i], u, 0) * r.sc[i]);
+        }
+        return r.d * sumf;
+    }
+};
+// vec_dot_q2_K_q8_1: QI2_K = 16 lanes a block, each one 32-bit word of qs against four Q8_1 blocks
+struct Q2KTraits {
+    using Block = Q2KBlock;
+    static constexpr int DIV = 256, T = 16, KBY = 8, BPI = WARPS * WARP / 16;
+    static int kqs(int tid) { return tid % 16; }
+    struct W { int v; half2 dm; const uint8_t* scales; int bq8_offset; };
+    static W load(const Block* w, int iqs) {
+        W r;
+        r.bq8_offset = 4 * (iqs / 8);
+        r.scales = w->scales + (iqs - iqs % 8 + (iqs % 8) / 4);
+        r.v = load_int(w->qs, iqs);
+        r.dm = w->dm;
         return r;
     }
     static float apply(const W& r, const Q81Block* x, int iqs) {
@@ -377,7 +411,7 @@ struct Q3KTraits {
             u[i] = load_int(x[r.bq8_offset + i].qs, iqs % 8);
             d8[i] = low(x[r.bq8_offset + i].ds);
         }
-        return q3_q8_dot_impl(r.vl, r.vh, u, r.scales, r.scale_offset, r.d, d8);
+        return q2_q8_dot_impl(r.v, u, r.scales, r.dm, d8);
     }
 };
 struct Q6KTraits {
@@ -593,7 +627,7 @@ void launch_n(sycl::queue& q, const void* weights, const void* x_q8_1, float* y,
     }
     // A sub-group alone walks a row in ceil(blocks / (WARP / T)) dependent steps: up to 10 (the 2560-wide rows) it
     // beats the work-group layout, beyond (the 6144-wide rows, 12-24 steps) the work-group's four sub-groups win
-    // (bench/results/2026-10-02-xe-decode-gpu).
+    // (the 2026-10-02-xe-decode-gpu record).
     const int steps = (n_in / F::DIV + WARP / F::T - 1) / (WARP / F::T);
     if (steps <= 10) {
         launch_row<F, NCOLS, 8>(q, weights, x_q8_1, y, n_in, n_out);
@@ -772,10 +806,26 @@ void native_swiglu_q8_1(const float* gate, const float* up, void* x_q8_1, int n_
     });
 }
 
+void native_swiglu_f32(const float* gate, const float* up, float* out, int n_in, int ncols, void* stream) {
+    validate_shape(n_in, ncols);
+    validate_pointer(gate);
+    validate_pointer(up);
+    validate_pointer(out);
+    auto& q = validate_stream(stream);
+    q.parallel_for(sycl::range<1>((std::size_t) n_in * (std::size_t) ncols), [=](sycl::id<1> id) {
+#pragma clang fp contract(off)
+        const std::size_t i = id[0];
+        const float g = gate[i];
+        out[i] = g / (1.0f + sycl::exp(-g)) * up[i];
+    });
+}
+
 void native_q5_k_mmvq(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* s) { mmvq<Q5KTraits>(w, x, y, n_in, n_out, ncols, s); }
 void native_q5_k_f32(const void* w, const float* x, void* xq, float* y, int n_in, int n_out, int ncols, void* s) { mmvq_f32<Q5KTraits>(w, x, xq, y, n_in, n_out, ncols, s); }
 void native_q2_0_mmvq(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* s) { mmvq<Q20Traits>(w, x, y, n_in, n_out, ncols, s); }
 void native_q2_0_f32(const void* w, const float* x, void* xq, float* y, int n_in, int n_out, int ncols, void* s) { mmvq_f32<Q20Traits>(w, x, xq, y, n_in, n_out, ncols, s); }
+void native_q2_k_mmvq(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* s) { mmvq<Q2KTraits>(w, x, y, n_in, n_out, ncols, s); }
+void native_q2_k_f32(const void* w, const float* x, void* xq, float* y, int n_in, int n_out, int ncols, void* s) { mmvq_f32<Q2KTraits>(w, x, xq, y, n_in, n_out, ncols, s); }
 void native_q3_k_mmvq(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* s) { mmvq<Q3KTraits>(w, x, y, n_in, n_out, ncols, s); }
 void native_q3_k_f32(const void* w, const float* x, void* xq, float* y, int n_in, int n_out, int ncols, void* s) { mmvq_f32<Q3KTraits>(w, x, xq, y, n_in, n_out, ncols, s); }
 void native_iq4_xs_mmvq(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* s) { mmvq<IQ4XSTraits>(w, x, y, n_in, n_out, ncols, s); }
@@ -854,7 +904,7 @@ void native_q6_k_to_rows(void* weights, int n_in, int n_out, void* stream) {
 
 bool native_mmvq_supported(int ggml_type) noexcept {
     return ggml_type == kNativeQ6KRows || ggml_type == kNativeQ8Rows || ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 ||
-           ggml_type == 11 ||
+           ggml_type == 10 || ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
            ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
@@ -868,6 +918,7 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     case 7: block_elems = 32; block_bytes = 24; break;   // Q5_1 (OrcaRouter Q4_K_S, upstream d652cd6)
     case 8: block_elems = 32; block_bytes = 34; break;
     case 20: block_elems = 32; block_bytes = 18; break;
+    case 10: block_elems = 256; block_bytes = 84; break;
     case 11: block_elems = 256; block_bytes = 110; break;
     case 12: block_elems = 256; block_bytes = 144; break;
     case 13: block_elems = 256; block_bytes = 176; break;
@@ -913,6 +964,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 6: native_q5_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 8: native_q8_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 20: native_iq4_nl_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 10: native_q2_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 11: native_q3_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 12: native_q4_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 13: native_q5_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;

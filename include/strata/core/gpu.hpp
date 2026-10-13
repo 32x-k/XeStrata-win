@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <string>
 
@@ -33,10 +34,16 @@ struct Graph;
 
 /// The message of the last failing call on this thread.
 const char* last_error();
+/// Issue #10: one line on an exception that left the engine: its text, the SYCL error code and Unified Runtime result
+/// when it is a SYCL exception (error 40 is also what a kernel launch refused for device memory reports), the VRAM
+/// free if it can still be read, and whether the GPU still answers (Runtime::device_status).
+std::string failure_report(const std::exception& e);
 
 Stream stream_create();
 /// A stream to record a graph on with begin_capture (on most builds the same as stream_create).
 Stream stream_create_capture();
+/// A stream for copies and events alone (Runtime::create_copy_stream): the copy engine where the device has one.
+Stream stream_create_copy();
 void stream_destroy(Stream s);
 bool stream_sync(Stream s);
 /// True when every command submitted to `s` has completed (cudaStreamQuery == cudaSuccess).
@@ -62,7 +69,7 @@ bool copy_async(void* dst, const void* src, size_t bytes, Stream s);
 /// stream_wait_event(s, after), copy_async and event_record(done, s) as one submission: the copy waits for `after`
 /// (null or not recorded: for nothing) and `done` marks the copy (an event without timing; null: not kept).  Three
 /// submissions a copy filled the RTX 4070's stream when the prompt path queued its ring's 384 copies, and each copy
-/// held its issuer for about 160 us (bench/results/2026-10-09-xe-event-record).
+/// held its issuer for about 160 us (the 2026-10-09-xe-event-record record).
 bool copy_async_after(void* dst, const void* src, size_t bytes, Stream s, const Event* after, Event* done);
 /// `height` rows of `width` bytes between pitched buffers (cudaMemcpy2DAsync).
 bool copy2d_async(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, Stream s);

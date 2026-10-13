@@ -1,6 +1,6 @@
 ---
 name: release
-description: Make a GitHub release of XeStrata in stages - the version, main fast-forwarded to dev, the tag (xe and the version, e.g. xe0.1.39); first the three contrib-llvm packages published with the notes (Japanese then English), then a speed table against upstream on Intel, NVIDIA and AMD GPUs. Only when the user asks for a release (/release).
+description: Make a GitHub release of XeStrata in stages - the version, main fast-forwarded to dev, the tag (xe and the version, e.g. xe0.1.39); first the three contrib-llvm packages published with the notes (English then Japanese) and the older releases marked as old, then a speed table against upstream on Intel, NVIDIA and AMD GPUs. Only when the user asks for a release (/release).
 disable-model-invocation: true
 argument-hint: "[VERSION, e.g. 0.1.39 or 0.1.39.1]"
 ---
@@ -27,7 +27,7 @@ Rules for the whole run:
 ## 1. Check the starting point
 
 ```sh
-git status --short                        # must be empty, on dev
+git status --short --untracked-files=no   # must be empty, on dev
 gh auth status 2>&1 | grep -v -i token    # logged in to github.com as MistVVK
 docker info --format '{{.ServerVersion}}' # the package builds run in Docker
 git fetch origin main --tags
@@ -35,7 +35,8 @@ git merge-base --is-ancestor main dev     # main must fast-forward to dev
 git tag -l 'xe*' --sort=-v:refname | head -n 1; git ls-remote --tags origin 'xe*'
 ```
 
-Stop and report if the tree is not clean, gh is not logged in, Docker does not answer, or `main` has commits `dev` lacks.
+Stop and report if a tracked file has changes, gh is not logged in, Docker does not answer, or `main` has commits `dev` lacks.
+Untracked files (a record not yet committed, for example) may stay: the packages are built from the tag, and the push takes only commits.
 The newest `xe*` tag is the previous release (none before the first one).
 
 ## 2. The version
@@ -72,7 +73,7 @@ Steps 5 and 6 are done while it builds.
 
 ## 5. The release notes
 
-Write `build/release/xe<VERSION>/NOTES.md`: the Japanese section first, then the same content in English.
+Write `build/release/xe<VERSION>/NOTES.md`: the English section first, then the same content in Japanese (the user's decision, 2026-10-12), under a first line linking the two: `[English](#english) | [日本語](#日本語)`.
 
 - What changed for users since the previous release tag (`git log --no-merges <previous>..xe<VERSION>`; for the first release, since `origin/main`), grouped by what a user notices, not a list of commits.
 - How to install: README's install section, as it is there (the user's decision, 2026-10-11): the four numbered steps (download from the table with `SHA256SUMS`, `sha256sum -c SHA256SUMS --ignore-missing`, `sudo apt install ./…deb` or `sudo dnf install ./…rpm` with the release's file names, `xestrata --setup`, which shows the GPU makers' packages that are missing and the command that installs them: AGENTS.md, "Packages", the notes do not list them), then the `> [!NOTE]` that without an NVIDIA GPU either CUDA version works the same, then the package table (Intel, AMD (RDNA2 or later), NVIDIA (Turing or later): `xestrata-contrib-cuda13.1`, `cuda13.4` on Fedora; Intel, AMD (RDNA2 or later), NVIDIA Pascal and Volta: `xestrata-contrib-cuda12.4`). A change to one goes into the other.
@@ -128,23 +129,34 @@ Retry a push only for a network failure (up to four times, waiting 2, 4, 8, 16 s
 Report the release's URL, then prepare the development machine's engines for step 9.
 A wrong asset or note is fixed with `gh release upload --clobber`, `gh release delete-asset` or `gh release edit --notes-file`.
 
+### The older releases
+
+Once the new release is published (it is then the latest), mark every older one:
+
+```sh
+gh release list --repo MistVVK/XeStrata --limit 1000 --json tagName,isLatest -q '.[] | select(.isLatest | not) | .tagName' |
+  while read -r t; do .claude/skills/release/scripts/mark-old.sh "$t"; done
+```
+
+`mark-old.sh` puts a warning at the top of a release's notes, in English and Japanese, that sends the reader to the latest release (`releases/latest`, so a note put in before stays right); a release that has it already is left as it is, so in practice only the previous release changes.
+
 ## 9. The speed table
 
 The release against upstream's newest release tag, IQ3_XXS, on each maker's GPU: the Intel Arc Pro B70 and the RTX 4070 in the development machine, the RX 9060 XT in the AMD container (step 6).
-The six tiers and the settings of `bench/results/2026-10-04-speed-matrix` (1K to 262K, what setup writes for each context, 256 greedy tokens); its `prompts.py` writes the prompts (`python bench/results/2026-10-04-speed-matrix/prompts.py <pack> <ids folder>`).
+The six tiers and the settings of the 2026-10-04-speed-matrix record (1K to 262K, what setup writes for each context, 256 greedy tokens), with one change (the user's decision of 2026-10-12): KV streaming (`--kv-resident`) only where setup writes it on the machine, from 64K when the RAM holds the KV cache beside the model, so a machine short of that RAM (the AMD container: `LOCAL.md`) does not compare at those lengths with the releases up to xe0.1.42; its `prompts.py`, now `.claude/skills/release/scripts/prompts.py`, writes the prompts (`python .claude/skills/release/scripts/prompts.py <pack> <ids folder>`).
 The table's method stays fixed from release to release so the releases compare: the upstream merge's measurements (/upstream-sync) have scripts of their own, and a change to them does not change this table.
 
 The engines, built from the tags (no package installed), each in a worktree of its own under `.claude/worktrees/`:
 
 - XeStrata: the contrib-llvm build of `xe<VERSION>` (docs/BUILD.md, with `LD_LIBRARY_PATH` to intel/llvm's `lib`); one GPU at a time with `ONEAPI_DEVICE_SELECTOR` (`level_zero:*` for the B70, `cuda:*` for the RTX 4070).
-- upstream on the B70: its `sycl/` port, built and run in its Docker image as its docs/INTEL.md says.
+- upstream on the B70: its `sycl/` port, built in its Docker image as its docs/INTEL.md says (`docker build -t strata-sycl-dev sycl/tools`, then its `build.sh` with `AOT=bmg-g31`), and run through `scripts/up-sycl.sh` (`UP=".claude/skills/release/scripts/up-sycl.sh"` with `UP_TREE`, `DATA` and `IDS` exported), which runs it as its setup configures an Intel card: the arguments get what its `sycl/setup_intel.py` writes (the xe cards' expert profile, the streamed experts, KV streaming from 64K, the VRAM reserve, the prompt chunks), and the engine the run-time switches of its `sycl/serve/strata-sycl.sh`.
 - upstream on the RTX 4070: its CUDA build, as its documents say.
 
-Each engine's own shipped expert profile (`data/expert-profile.bin` of its tree).
+Each engine's own shipped expert profile (`data/expert-profile.bin` of its tree; upstream's `sycl/` port takes the one its `sycl/setup_intel.py` writes in its place, `data/expert-profile-sycl.bin` from v0.1.43).
 No other work on a machine while it measures (no build, no other engine).
 
 ```sh
-o=bench/results/<date>-release-xe<VERSION>
+o=<data>/records/bench-results/<date>-release-xe<VERSION>   # outside git (the user's decision of 2026-10-11)
 XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> .claude/skills/release/scripts/bench.sh $o B70   # <data>: LOCAL.md
 python .claude/skills/release/scripts/bench-collect.py $o xe<VERSION> <upstream tag>
 ```
@@ -171,17 +183,24 @@ python $u/sync_collect.py $o/serve xe<VERSION> <upstream tag>                 # 
 `XE` and `UP` are as above; serve and everyday use pass stdin to them, so upstream's `sycl/` wrapper runs `docker run -i`.
 `XE_ROOT` and `UP_ROOT` are the engines' worktrees (their `serve/server.py`), `PY` a Python with the server's packages (the data folder's `venv`); everyday use runs at a 262144 context with what setup writes for it.
 
-The record goes into `$o/` on `dev`: a README (the machines, the two engines' commits and builds, the method, the tables and what the numbers say), `matrix.json`, `serve/` (its `matrix-serve.json`, `matrix-usage.json` and runs), and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>` (as the speed-matrix record does).
-Lint and commit it on `dev` (it is not in the tag).
+The record goes into `$o/`, in the data folder and never into git (XeStrata's own measurements are not shared, the user's decision of 2026-10-11): a README (the machines, the two engines' commits and builds, the method, the tables and what the numbers say), `matrix.json`, `serve/` (its `matrix-serve.json`, `matrix-usage.json` and runs), and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>` (as the speed-matrix record does).
+It is not committed; the release notes carry the tables.
 
 ## 10. The final release (確定報)
 
-Take the stage lines out of the notes, add the tables (Japanese and English sections) with the engines' versions, the GPUs and the model, and:
+The final release is reached a GPU at a time (the user's decision, 2026-10-11): as soon as one GPU's tables are complete (its generate table and its serve and everyday table both), add them to the notes (English and Japanese sections) and update the release (`gh release edit`, below), without waiting for the other GPUs.
+
+- The comparison section comes after the notes' other sections: its opening lines (the engines' versions, the model, the method), then the note on temperatures and what counts as equal (below) right after them, once, then the GPUs in a fixed order, the B70, the RTX 4070, the RX 9060 XT, each as its tables are done.
+- While some are missing, one line under the done ones names them: B70・RTX 4070: 計測中（後で足す） / B70, RTX 4070: being measured (added later).
+- The first update replaces the preliminary stage line with that section; when the last GPU is in, the line of the missing GPUs goes too.
+- Report the release's URL and the GPU's tables at each update.
+
+The tables:
 
 The notes' table is one per GPU, from `bench-collect.py`'s medians (the record's README keeps `bench-collect.py`'s own tables): a row per tier, named by the model's weight type and the length (`IQ3_XXS 1K`), and for prefill and then decode three columns (the LLM terms, in both languages; the user's decision, 2026-10-11): XeStrata's value, upstream's, and the difference (the value columns named with the engine and its version, `XeStrata xe0.1.40.2.1`, `upstream v0.1.41`), marked ✅ where XeStrata is faster and ❌ where it is slower: prefill as a ratio (`✅ 2.1 倍`, `✅ ×2.1`), decode as a percentage (`✅ +14%`; slower: `❌ −3%`).
 Within ±1% (either way) the two count as equal: `≒ 同等（−0.1%）` / `≈ equal (−0.1%)`, for prefill as well.
 A value upstream was stopped in is 計測不能（低速） / not measurable (too slow), its difference `✅`, with the line saying upstream was stopped at 10 tok/s or less; a value that does not fit stays `-`.
-Above each GPU's tables: the GPU (and its memory) and which build of upstream it ran (`sycl/`, CUDA, HIP); above the first GPU, the engines' versions, the model and the method (256 tokens, the median of two alternating runs).
+Above each GPU's tables: the GPU (and its memory) and which build of upstream it ran (`sycl/`, CUDA, HIP).
 Each table has a heading line with its temperature: **generate**（温度 0、トークン/秒） / **generate** (temperature 0, tokens/s), and **serve と通常使用**（温度 0.7） / **serve and everyday use** (temperature 0.7).
 
 ```markdown
@@ -212,7 +231,7 @@ Equal there is the upstream merge's check (`judge.py`): prefill within ±1%, the
 | agent decode (tok/s) | 46.2 | 45.0 | ≒ 同等（+3%） |
 ```
 
-Below the first GPU's tables only (not repeated for the others), one note in each language section, with the temperatures and what counts as equal:
+Right after the section's opening lines, once (not repeated for each GPU), one note in each language section, with the temperatures and what counts as equal:
 
 ```markdown
 > [!NOTE]
@@ -231,5 +250,3 @@ Below the first GPU's tables only (not repeated for the others), one note in eac
 ```sh
 gh release edit xe<VERSION> --repo MistVVK/XeStrata --notes-file build/release/xe<VERSION>/NOTES.md
 ```
-
-Report the release's URL and the tables.

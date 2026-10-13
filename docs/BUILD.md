@@ -47,8 +47,7 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
   Free software only; no oneAPI environment is used.
   Validated with intel/llvm v7.1.1 built from source by `tools/intel_llvm_build.py` (see [Setup](#setup)).
   A distribution's package of version 7 or later serves as well; an older one (Ubuntu 26.04's `dpclang++` 6.2) is refused by CMake and setup.
-  6.2's SYCL runtime reported no XMX for the Arc Pro B70, and the prefill path took about 1.6 times as long
-  ([record](../bench/results/2026-10-02-dp4a/README.md)).
+  6.2's SYCL runtime reported no XMX for the Arc Pro B70, and the prefill path took about 1.6 times as long.
   With intel/llvm built with ROCm's HIP, `STRATA_HIP_ARCHS` (`gfx1200`, for example) makes the code for AMD GPUs (RDNA2 and later: gfx103x, gfx11xx, gfx12xx) as well.
   ROCm is free software, so this is the same in the free and contrib-llvm modes ([DEVTOOLS.md](DEVTOOLS.md#hip-amd-gpus)).
   `auto` (the default) takes this PC's AMD GPUs as the kernel's KFD reports them, and `rocblas` every RDNA2 or later GPU the distribution's rocBLAS has code for and the SYCL compiler has a target for (the packages are built so; intel/llvm 7.1.1 has none for gfx1152 and gfx1153).
@@ -100,7 +99,7 @@ At start the engine asks the GPU whether it has the matrix combinations its XMX 
 Without them it takes the path that uses another shape the GPU reports (the Arc A series' (Xe-HPG) 8 x 8 x 16, NVIDIA's tensor cores' 16 x 16 x 16) through joint_matrix's portable API (`src/kernels/xe/mma_gemm.cpp`),
 and without that the DP4a path, and says once which.
 The Arc A series takes `mma_gemm` because its SYCL runtime refuses the Intel extensions the XMX kernels use (joint_matrix's prefetches and checked loads and stores).
-On the A380 it ran 17–38% faster than DP4a, and closer to FP64 (relative error 0.0001% against 0.53%; [record](../bench/results/2026-10-04-dg2-dp4a/README.md)).
+On the A380 it ran 17–38% faster than DP4a, and closer to FP64 (relative error 0.0001% against 0.53%).
 `STRATA_NO_XMX=1` takes the DP4a path even when the GPU has matrix engines.
 `STRATA_MMA=1` takes `mma_gemm` even where XMX is there, if the GPU reports a shape it carries (Xe2's 8 x 16 x 16 and others; to check that path).
 `STRATA_NO_BF16_MMA=1` drops the BF16 matrix combinations from what the GPU reports, `STRATA_NO_INT8_MMA=1` the int8 ones (`src/kernels/xe/matrix_report.cpp`),
@@ -227,8 +226,7 @@ The same executable runs on Intel GPUs too.
 - **GPU code**: device code is SPIR-V, compiled by the driver (JIT) when each kernel is first used and kept in `~/.cache/neo_compiler_cache`.
   No AOT code is built (the deb and rpm packages neither).
   So the first run of a model whose kernels were not compiled before takes longer to its first token.
-  setup therefore ends by starting the model once and asking it a long question and a picture
-  ([record](../bench/results/2026-09-30-xe-setup/README.md#compiling-the-gpu-code-at-setup-added-later-on-2026-09-30));
+  setup therefore ends by starting the model once and asking it a long question and a picture;
   `--no-warmup` skips it.
 
 ## Setup
@@ -436,6 +434,7 @@ xe0.1.40.2.1 is `0.1.40.2-2` (for rpm, Version 0.1.40.2 and Release 2).
   (`hip_archs`), from which setup decides whether a GPU can be used.
 - The makers' packages the package recommends or suggests are recorded in `BUILD.json` too, by maker (`runtime`). setup asks apt or dnf which of those of the GPUs it uses are missing, and shows how to install them (adding a repository first where needed). Without the GPU's runtime it stops; without oneMKL or cuBLAS it only shows them and goes on.
 - `third_party/nonfree/` is not packaged: the chat template is the one setup writes into the model's pack.
+  The experimental speed projection's vector is downloaded by setup from the version's tag on GitHub when it is turned on.
 - The Python files are compiled when the package is built, and `xestrata` runs with `PYTHONDONTWRITEBYTECODE=1`: nothing is written
   under `/usr` later and nothing goes in `/etc`, so removing the packages leaves nothing behind.
 

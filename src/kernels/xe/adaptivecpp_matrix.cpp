@@ -3,6 +3,7 @@
 // Matrix-extension fallbacks for AdaptiveCpp, which does not expose oneAPI joint_matrix.
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/matrix_report.hpp"
+#include "strata/kernels/prompt_attn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 
@@ -41,6 +42,7 @@ sycl::event scalar_gemm(sycl::queue& q, XmxType type, const uint16_t* x, const u
 }  // namespace
 
 bool xmx_available(XmxType) { return false; }
+bool f16_matrix_engines() { return false; }
 bool f16_only_matrix_engines() { return false; }
 const char* gemm_path(XmxType) { return "DP4a"; }
 
@@ -76,15 +78,24 @@ void xmx_gemm_grouped(const uint16_t* x, const uint16_t* w, int64_t w_stride, fl
 bool no_bf16_mma() { return false; }
 
 bool iq_mmq_usable(sycl::queue&) { return false; }
+bool iq_mmq_dp4a_usable(sycl::queue&) { return false; }
 bool iq_mmq_type_ok(int) { return false; }
 size_t iq_mmq_row_bytes(int, int64_t) { return 0; }
 size_t iq_mmq_act_bytes(int64_t, int64_t) { return 0; }
-sycl::event iq_mmq_quantize(sycl::queue& q, const float*, const int32_t*, void*, int64_t, int64_t, int64_t) {
+bool iq_mmq_type_sums(int) { return false; }
+bool iq_mmq_type_dup(int) { return false; }
+sycl::event iq_mmq_quantize(sycl::queue& q, const float*, const int32_t*, void*, int64_t, int64_t, int64_t, bool, bool) {
     return q.single_task([] {});
 }
 sycl::event iq_mmq_grouped(sycl::queue& q, int, const void*, size_t, int64_t, int64_t, int, const void*, int64_t,
-                           const int32_t*, int64_t, const int32_t*, float*, int64_t) {
+                           const int32_t*, int64_t, const int32_t*, float*, int64_t, const uint8_t* const*, size_t,
+                           int64_t) {
     return q.single_task([] {});
+}
+
+bool prompt_attn(const float*, const uint16_t*, const uint16_t*, const int32_t*, int64_t, int64_t, const QsaShapes&,
+                 float*, void*) {
+    return false;
 }
 
 bool qsa_prompt_attn_batch(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t,

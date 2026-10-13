@@ -26,6 +26,9 @@
 #include "strata/core/per_device.hpp"
 #include "device_target.hpp"
 #include "mma_gemm.hpp"
+#include "amd_wmma.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_qsa_prompt_attn
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -448,6 +451,15 @@ using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
     }
     return r;
 }
+// joint_matrix's calls in the form PromptAttnMma makes them, beside amd_wmma.hpp's for RDNA3 and RDNA4
+namespace jmx {
+template<typename M, typename P> inline void load(sycl::sub_group sg, M& m, P p, size_t ld) { mx::joint_matrix_load(sg, m, p, ld); }
+template<typename M> inline void fill(sycl::sub_group sg, M& m, float v) { mx::joint_matrix_fill(sg, m, v); }
+template<typename D, typename A, typename B>
+inline void mad(sycl::sub_group sg, D& d, A& a, B& b, D& c) { mx::joint_matrix_mad(sg, d, a, b, c); }
+template<typename M, typename P>
+inline void store(sycl::sub_group sg, M& m, P p, size_t ld) { mx::joint_matrix_store(sg, m, p, ld, mx::layout::row_major); }
+}  // namespace jmx
 template<int KF, int VF>   // K's KvFmt (kF16, kI8), V's (kF16, kI8, kQ4)
 struct PromptAttnMma {
     static_assert(KF != kQ4, "Q4_0 K takes the FP32 kernel");
@@ -474,11 +486,25 @@ struct PromptAttnMma {
     sycl::local_accessor<float, 1> mrow, lsum, alpha;
 
     void operator()(sycl::nd_item<2> it) const {
-        // an empty body where joint_matrix has no FP16 tensor cores (AMD's RDNA, NVIDIA before sm_70): the device
-        // does not report the 16 x 16 x 16 shape there, so this kernel is never launched
-#if defined(__SYCL_DEVICE_ONLY__) && (defined(__AMDGCN__) || (defined(__NVPTX__) && STRATA_NV_ARCH < 700))
+        // an empty body where there are no FP16 matrix engines of this shape (AMD before RDNA3, NVIDIA before sm_70):
+        // mma_gemm does not take the 16 x 16 x 16 shape there, so this kernel is never launched.  RDNA3 and RDNA4 take
+        // the tiles through their WMMA instructions (amd_wmma.hpp), the others through joint_matrix.
+#if defined(__SYCL_DEVICE_ONLY__) && ((defined(__AMDGCN__) && !STRATA_AMD_WMMA) || (defined(__NVPTX__) && STRATA_NV_ARCH < 700))
         (void) it;
 #else
+#if STRATA_AMD_WMMA
+        namespace J = xe::wmma;
+        using MA = J::A<half>;
+        using MBc = J::Bc<half>;
+        using MBr = J::Br<half>;
+        using MC = J::C;
+#else
+        namespace J = jmx;
+        using MA = mx::joint_matrix<sycl::sub_group, half, mx::use::a, pm::T16, pm::T16, mx::layout::row_major>;
+        using MBc = mx::joint_matrix<sycl::sub_group, half, mx::use::b, pm::T16, pm::T16, mx::layout::col_major>;
+        using MBr = mx::joint_matrix<sycl::sub_group, half, mx::use::b, pm::T16, pm::T16, mx::layout::row_major>;
+        using MC = mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, pm::T16, pm::T16>;
+#endif
         using pm::CH;
         using pm::T16;
         const auto grp = it.get_group();
@@ -510,11 +536,11 @@ struct PromptAttnMma {
         if (t < R) { mrow[t] = NEG_INF; lsum[t] = 0.0f; }
         sycl::group_barrier(grp);
         // this sub-group's q: the 16 rows x 4 steps of 16 of its 64 dims, hi and lo
-        mx::joint_matrix<sycl::sub_group, half, mx::use::a, T16, T16, mx::layout::row_major> qa[4], qb[4];
+        MA qa[4], qb[4];
         for (int kk = 0; kk < 4; ++kk) {
             const size_t off = (size_t) g * 64 + (size_t) kk * T16;
-            mx::joint_matrix_load(sg, qa[kk], at(kvq, QH + off), QS);
-            mx::joint_matrix_load(sg, qb[kk], at(kvq, QL + off), QS);
+            J::load(sg, qa[kk], at(kvq, QH + off), QS);
+            J::load(sg, qb[kk], at(kvq, QL + off), QS);
         }
         // output values a lane: element lane + SG * i (i < TPL) of each of the sub-group's four 16 x 16 tiles, in
         // o[nt * TPL + i]
@@ -578,15 +604,15 @@ struct PromptAttnMma {
 
             // q.k of the 16 rows and this sub-group's 64 dims, hi and lo
             {
-                mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, T16, T16> c;
-                mx::joint_matrix_fill(sg, c, 0.0f);
+                MC c;
+                J::fill(sg, c, 0.0f);
                 for (int kk = 0; kk < 4; ++kk) {
-                    mx::joint_matrix<sycl::sub_group, half, mx::use::b, T16, T16, mx::layout::col_major> b;
-                    mx::joint_matrix_load(sg, b, at(kvq, KH + (size_t) g * 64 + (size_t) kk * T16), KR);
-                    mx::joint_matrix_mad(sg, c, qa[kk], b, c);
-                    mx::joint_matrix_mad(sg, c, qb[kk], b, c);
+                    MBc b;
+                    J::load(sg, b, at(kvq, KH + (size_t) g * 64 + (size_t) kk * T16), KR);
+                    J::mad(sg, c, qa[kk], b, c);
+                    J::mad(sg, c, qb[kk], b, c);
                 }
-                mx::joint_matrix_store(sg, c, at(part, (size_t) g * R * CH), CH, mx::layout::row_major);
+                J::store(sg, c, at(part, (size_t) g * R * CH), CH);
             }
             sycl::group_barrier(grp);
 
@@ -651,23 +677,23 @@ struct PromptAttnMma {
                     }
                 }
                 sycl::group_barrier(sg);
-                mx::joint_matrix<sycl::sub_group, half, mx::use::a, T16, T16, mx::layout::row_major> ph, pl;
+                MA ph, pl;
                 for (int nt = 0; nt < 4; ++nt) {
                     if (nt % (4 / VPG) == 0) {   // the V scale group of these 16 dims
                         const int vg = g * VPG + nt / (4 / VPG);
-                        mx::joint_matrix_load(sg, ph, at(pp, (size_t) (2 * vg) * R * CH), CH);
-                        mx::joint_matrix_load(sg, pl, at(pp, (size_t) (2 * vg + 1) * R * CH), CH);
+                        J::load(sg, ph, at(pp, (size_t) (2 * vg) * R * CH), CH);
+                        J::load(sg, pl, at(pp, (size_t) (2 * vg + 1) * R * CH), CH);
                     }
-                    mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, T16, T16> acc;
-                    mx::joint_matrix_fill(sg, acc, 0.0f);
-                    mx::joint_matrix<sycl::sub_group, half, mx::use::b, T16, T16, mx::layout::row_major> b;
-                    mx::joint_matrix_load(sg, b, at(kvq, VH + (size_t) g * 64 + (size_t) nt * T16), KR);
-                    mx::joint_matrix_mad(sg, acc, ph, b, acc);
-                    mx::joint_matrix_mad(sg, acc, pl, b, acc);
+                    MC acc;
+                    J::fill(sg, acc, 0.0f);
+                    MBr b;
+                    J::load(sg, b, at(kvq, VH + (size_t) g * 64 + (size_t) nt * T16), KR);
+                    J::mad(sg, acc, ph, b, acc);
+                    J::mad(sg, acc, pl, b, acc);
                     // through local memory a tile at a time (a quarter of the 16 x 64 staging: the work-group's local
                     // memory, and so how many fit on a compute unit, set this kernel's speed on the RTX 4070)
                     sycl::group_barrier(sg);   // the previous tile's values are read
-                    mx::joint_matrix_store(sg, acc, at(st, SG0), T16, mx::layout::row_major);
+                    J::store(sg, acc, at(st, SG0), T16);
                     sycl::group_barrier(sg);
                     for (int i = 0; i < TPL; ++i) {
                         const int e = lane + pm::SG * i;

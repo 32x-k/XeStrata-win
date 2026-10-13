@@ -11,6 +11,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <string>
 #include <thread>
 
 namespace strata::core {
@@ -47,6 +48,12 @@ public:
     /// A stream a graph can be recorded on.  With AdaptiveCpp it is a native in-order queue (one HIP stream that
     /// HIP's stream capture records), used only to record; elsewhere it is create_stream().
     sycl::queue* create_capture_stream();
+    // An engine stream for copies and events alone, on the GPU's copy engine where the device reports a copy-only
+    // queue group (Level Zero); elsewhere an ordinary engine stream.  No kernel may go on it.
+    sycl::queue* create_copy_stream();
+    // Whether the GPU still answers (issue #10): Level Zero's zeDeviceGetStatus, "answers" or "lost" (or its result
+    // code); "unknown" for a backend or a build without that call.  Safe after a failure: it submits no work.
+    std::string device_status();
     void destroy_stream(sycl::queue* stream);
     sycl::queue& stream(void* stream);
     /// While a stream records a graph (AdaptiveCpp: HIP stream capture), the queue its work goes to instead:
@@ -71,6 +78,8 @@ public:
     // verify window took 22 module loads, 30 ms of its first token, on the RTX 4070.  A kernel the device cannot run
     // (another GPU's matrix shape) is skipped.  Once.
     void preload_kernels();
+    // Waits for preload_kernels' thread to end (timings taken beside it read its CPU work as theirs).
+    void wait_preload() { if (preload_.joinable()) preload_.join(); }
     // Whether an event only ordered or waited on (gpu::event_record without timing) is recorded as an in-order
     // barrier rather than a timestamp (submit_profiling_tag): measured when the runtime is made (measure_marks).
     bool marks_by_barrier() const { return marks_by_barrier_; }

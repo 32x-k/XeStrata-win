@@ -7,13 +7,16 @@
 //
 // The per-token arithmetic of each kernel is its single-token original's (fused_gdn, elementwise) with the same
 // operation order, so a verify window reproduces plain decode.  The flag waits use the reading measured in
-// bench/results/2026-09-30-xe-doorbell: a volatile read followed by a system-scope acquire fence.  gpu_stamp writes
+// the 2026-09-30-xe-doorbell record: a volatile read followed by a system-scope acquire fence.  gpu_stamp writes
 // device-clock ticks, not the nanoseconds of CUDA's %globaltimer.
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/gdn.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
 #include "q8_1_finite.hpp"
 #include "strata/core/per_device.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_verify_kernels
+#include "strata/kernels/device_arch_tag.hpp"
 
 // sycl_ext_oneapi_clock is newer than some DPC++ releases (intel/llvm 6.2 lacks it): without it there is no stamp
 #if __has_include(<sycl/ext/oneapi/experimental/clock.hpp>)
@@ -270,6 +273,7 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
     }
     // y = oc * rsqrt(mean(oc^2) + eps) * gamma * sigmoid(z) a head and token, with the one-group kernel's sums
     return q.submit([&](sycl::handler& hd) {
+        const bool silu = gdn_silu_gate();   // the closing norm's gate (gdn.hpp)
         sycl::local_accessor<float, 1> wsum(sycl::range<1>(S / WARP), hd);
         hd.parallel_for(sycl::nd_range<1>((size_t) h_v * rows * S, S), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
@@ -286,7 +290,8 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
             const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
             const float scale = sycl::rsqrt(ss / (float) S + eps);
             const float zz = z[at];
-            const float out = oc * scale * gamma[col] * (1.0f / (1.0f + sycl::exp(-zz)));
+            const float gz = 1.0f / (1.0f + sycl::exp(-zz));
+            const float out = oc * scale * gamma[col] * (silu ? zz * gz : gz);
             y[at] = out;
             if constexpr (Q8)
                 q8_1_store(sg, out, y_q8_1 + ((size_t) (t - t_out_begin) * value_dim + (size_t) (head * S + col)) / 32 * 36,
@@ -347,6 +352,7 @@ sycl::event gdn_step_plain(sycl::queue& q, float* state, const float* hbuf, int 
                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
                            const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1) {
     return q.submit([&](sycl::handler& hd) {
+        const bool silu = gdn_silu_gate();   // the closing norm's gate (gdn.hpp)
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
             red(sycl::range<1>(RG * S), hd), wsum(sycl::range<1>(S * RG / WARP), hd);
         // one work-group per head; work-item tid = rg * 128 + col, as CUDA's (col, rg) block linearises
@@ -398,7 +404,8 @@ sycl::event gdn_step_plain(sycl::queue& q, float* state, const float* hbuf, int 
                     const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
                     const float scale = sycl::rsqrt(ss / (float) S + eps);
                     const float zz = z[(size_t) t * value_dim + head * S + col];
-                    const float out = oc * scale * gamma[col] * (1.0f / (1.0f + sycl::exp(-zz)));
+                    const float gz = 1.0f / (1.0f + sycl::exp(-zz));
+                    const float out = oc * scale * gamma[col] * (silu ? zz * gz : gz);
                     y[(size_t) t * value_dim + (size_t) (head * S + col)] = out;
                     if constexpr (Q8)
                         q8_1_store(sg, out, y_q8_1 + ((size_t) (t - t_out_begin) * value_dim + (size_t) (head * S + col)) / 32 * 36,
@@ -422,6 +429,7 @@ sycl::event gdn_step_prefetch(sycl::queue& q, float* state, const float* hbuf, i
                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
                            const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1) {
     return q.submit([&](sycl::handler& hd) {
+        const bool silu = gdn_silu_gate();   // the closing norm's gate (gdn.hpp)
         // sk/sq: two buffers, the next token's staged while the current one runs; red_kv and red_o apart, so a token
         // needs four barriers instead of six
         constexpr size_t two_s = 2 * (size_t) S, rg_s = (size_t) RG * S;
@@ -482,7 +490,8 @@ sycl::event gdn_step_prefetch(sycl::queue& q, float* state, const float* hbuf, i
                     const size_t at = (size_t) t * value_dim + (size_t) (head * S + col);
                     const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
                     const float scale = sycl::rsqrt(ss / (float) S + eps);
-                    const float out = oc * scale * gamma[col] * (1.0f / (1.0f + sycl::exp(-z[at])));
+                    const float gz = 1.0f / (1.0f + sycl::exp(-z[at]));
+                    const float out = oc * scale * gamma[col] * (silu ? z[at] * gz : gz);
                     y[at] = out;
                     if constexpr (Q8)
                         q8_1_store(sg, out, y_q8_1 + ((size_t) (t - t_out_begin) * value_dim + (size_t) (head * S + col)) / 32 * 36,
@@ -1202,6 +1211,27 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
                    : wg == 512 ? row_top_prob_launch<512>(q, logits, n_rows, n_vocab, ids, probs)
                                : row_top_prob_launch<256>(q, logits, n_rows, n_vocab, ids, probs);
     done(stream, e, "row_top_prob");
+}
+
+void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* flags, void* stream) {
+    if (n_rows <= 0 || n <= 0) return;
+    constexpr int WG = 256;
+    const int per_block = (n + kNonfiniteBlocks - 1) / kNonfiniteBlocks;
+    // work-group (b, row) scans [b * per_block, +per_block) of its row and writes its own word.  The test is on the
+    // bits (exponent all ones), so a fast-math build cannot fold it away.
+    const auto e = Q(stream).parallel_for(
+        sycl::nd_range<2>(sycl::range<2>((size_t) n_rows, (size_t) kNonfiniteBlocks * WG), sycl::range<2>(1, WG)),
+        [=](sycl::nd_item<2> it) {
+            const int row = (int) it.get_group(0), b = (int) it.get_group(1);
+            const float* l = logits + (size_t) row * (size_t) n;
+            const int lo = b * per_block, hi = sycl::min(n, lo + per_block);
+            bool bad = false;
+            for (int v = lo + (int) it.get_local_id(1); v < hi; v += WG)
+                bad |= (sycl::bit_cast<uint32_t>(l[v]) & 0x7f800000u) == 0x7f800000u;
+            bad = sycl::any_of_group(it.get_group(), bad);
+            if (it.get_local_id(1) == 0) flags[row * kNonfiniteBlocks + b] = bad ? 1u : 0u;
+        });
+    done(stream, e, "logits_nonfinite_rows");
 }
 
 void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, void* stream) {

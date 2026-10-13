@@ -82,7 +82,7 @@ function showTab(name) {
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
-  if (tab === "about") loadConfig();
+  if (tab === "about") { loadConfig(); loadUpdate(); }
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
@@ -191,7 +191,7 @@ function spark(id, values, max) {
   const svg = $(id);
   const v = (values || []).map((x) => (x == null ? 0 : x));
   if (v.length < 2) { svg.querySelector(".line").setAttribute("d", ""); svg.querySelector(".area").setAttribute("d", ""); return; }
-  const top = Math.max(max || 0, ...v, 1e-9);
+  const top = Math.max(max || 0, ...v, 1);
   const pts = v.map((x, i) => [(i / (v.length - 1)) * 100, 30 - (x / top) * 26]);
   const line = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("");
   svg.querySelector(".line").setAttribute("d", line);
@@ -203,6 +203,7 @@ function setMetric(key, value, unit, sub) {
 }
 
 let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
+let failureSeen = null;   // issue #10: the engine failure already shown as a toast (its time)
 let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
 async function poll() {
   try {
@@ -243,8 +244,48 @@ function render(m) {
     setPill("idle", "Idle");
   }
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
-  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
+  // issue #10: an engine that stopped in a request says why once (the server starts it again for the next one)
+  const fail = m.engine_failure;
+  if (fail && fail.at !== failureSeen) {
+    if (failureSeen !== null || Date.now() / 1000 - fail.at < 600) toast("error", "The engine stopped", fail.message, 15000);
+    failureSeen = fail.at;
+  }
+  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, fail);
+  if (tab === "monitor") renderConvCache(m.conversation_cache);
   if (tab === "about") renderAbout(eng, hw, st);
+}
+
+// #596: the conversation cache - the prompt's state the engine keeps between requests (always), and the whole
+// conversations it parks in RAM when "--conversation-cache-mib N" is in the run config's args (opt-in)
+function since(t) {
+  if (!t) return "";
+  const s = Math.max(0, Date.now() / 1000 - t);
+  return s < 60 ? "just now" : s < 3600 ? `${fmt(s / 60)} min ago` : `${fmt(s / 3600, 1)} h ago`;
+}
+function renderConvCache(c) {
+  $("cc-card").hidden = !c;
+  if (!c) return;                                  // an older server
+  const pct = (a, b) => (b ? `${Math.min(100, (100 * a) / b)}%` : "0%");
+  $("cc-bars").hidden = !c.enabled;
+  if (c.enabled) {
+    $("cc-slots-text").textContent = `${fmt(c.parked)} / ${fmt(c.slots)}`;
+    $("cc-slots-bar").style.width = pct(c.parked, c.slots);
+    const budget = c.budget_mib * 1048576;
+    $("cc-mem-text").textContent = `${gb(c.bytes)} / ${gb(budget)} GB`;
+    $("cc-mem-bar").style.width = pct(c.bytes, budget);
+  }
+  $("cc-sum").textContent = c.requests ? `${fmt(c.requests_reused)} of ${fmt(c.requests)} requests reused part of their prompt` : "";
+  const share = c.prompt_tokens ? ` (${fmt((100 * c.reused_tokens) / c.prompt_tokens)}% of all prompt tokens)` : "";
+  const event = c.last_event ? `${c.last_event === "parked" ? "Parked" : "Restored"} ${fmt(c.last_tokens)} tokens, ${since(c.last_at)}` : null;
+  facts($("cc-facts"), [
+    ["Last request", c.last_prompt != null ? `${fmt(c.last_reused || 0)} of ${fmt(c.last_prompt)} prompt tokens reused` : null],
+    ["Reused since start", c.requests ? `${fmt(c.reused_tokens)} tokens${share}` : null],
+    ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? ` · ${fmt(c.evictions)} evicted` : ""}` : null],
+    ["Last switch", c.enabled ? event : null],
+  ]);
+  $("cc-note").textContent = c.enabled
+    ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
+    : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
 }
 
 function renderTotals(t) {
@@ -256,7 +297,7 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
-function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail) {
   // model state
   const on = live.queued > 0 ? "queued" : live.state;
   for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
@@ -279,6 +320,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   } else if (last) {
     delete prog.dataset.tone;
     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
+  }
+  if (fail && live.state === "idle") {   // issue #10: the last engine that stopped, until a request runs again
+    label = `Engine stopped at ${new Date(fail.at * 1000).toLocaleTimeString()}`;
+    detail = fail.message;
+    for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === "error");
   }
   $("state-label").textContent = label;
   $("state-detail").textContent = detail;
@@ -304,15 +350,20 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
             multi ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`))
                   : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : "");
   spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
+  // an idle GPU on the xe driver may report its last temperature, not its present one (Battlemage's hwmon): dimmed
+  const stale = Boolean(hw.gpu_temp_may_be_stale) && hw.gpu_temp != null;
   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
-            multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : "");
+            stale ? "GPU idle (the reading may be old)"
+            : multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`))
+            : hw.gpu_mem_temp == null ? "" : `VRAM ${fmt(hw.gpu_mem_temp)} °C`);
+  $("mv-temp").classList.toggle("is-stale", stale);
   spark("sp-temp", h.gpu_temp, 90);
   setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
   const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
   setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
             hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
-            (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
+            (hw.gpu_pcie_own_gen && gen && hw.gpu_pcie_own_gen < gen ? ` · now Gen${hw.gpu_pcie_own_gen}` : ""));
   spark("sp-pcie", h.gpu_pcie_rx_mb);
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
   spark("sp-cpu", h.cpu, 100);
@@ -348,7 +399,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // recent requests
   const body = $("req-body");
   if (!requests.length) {
-    body.innerHTML = `<tr><td colspan="8" class="muted">No requests yet</td></tr>`;
+    body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
   } else {
     const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
                    disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
@@ -359,8 +410,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
       // #588: the VRAM share; the PCIe share (--pcie-frac) beside it when there is one
       const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%` +
         (r.pcie_share ? ` <span class="muted" title="routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "");
+      // Reused tokens are not prefetched again. Match the Monitor's existing Prefill metric.
+      const fresh = r.prompt_tokens == null ? null : Math.max(0, r.prompt_tokens - (r.reused || 0));
+      const prefillRate = fresh > 0 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;
       return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
-        <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
+        <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(prefillRate)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
         <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
     }).join("");
   }
@@ -414,6 +468,45 @@ document.addEventListener("click", (e) => {
   if (b) copyText(b.dataset.copy, b);
 });
 $("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (lastMetrics) render(lastMetrics); });
+
+// ------------------------------------------------------------------ a newer release (GET/POST /update)
+// The server asks GitHub (at most every six hours, or now from the button); this page never leaves this server.
+async function loadUpdate(force = false) {
+  let u;
+  try {
+    const r = await fetch("update", force ? {method: "POST", headers: headers(true), body: "{}"} : {headers: headers()});
+    if (!r.ok) return false;
+    u = await r.json();
+  } catch (e) { return false; /* an older server: no check */ }
+  renderUpdate(u);
+  if (u.newer && store.get("update-told", "") !== u.tag) {   // once for each release
+    store.set("update-told", u.tag);
+    toast("info", `XeStrata ${u.tag} is out`, "About > Updates says how to update.", 8000,
+          {label: "Show", run: () => showTab("about")});
+  }
+  return true;
+}
+function renderUpdate(u) {
+  const when = u.checked_at ? new Date(u.checked_at * 1000).toLocaleString([], {dateStyle: "medium", timeStyle: "short"}) : null;
+  facts($("facts-update"), [
+    ["This version", `xe${u.current}`],
+    ["Latest release", u.tag ? `${u.tag}${u.newer ? " (newer)" : " (up to date)"}` : null],
+    ["Checked", when ? `${when}${u.automatic ? "" : " (automatic checks off)"}` : (u.automatic ? "not yet" : "automatic checks off")],
+  ]);
+  $("update-dot").hidden = !u.newer;
+  $("update-how").hidden = !u.newer;
+  if (u.newer) {
+    $("update-how").innerHTML = `<a href="${esc(u.url)}" target="_blank" rel="noopener noreferrer">Release notes of ${esc(u.tag)}</a>. ` +
+                                `To update: ${esc(u.how)}.`;
+  }
+  $("update-msg").textContent = u.error || "";
+}
+$("update-check").onclick = async () => {
+  $("update-check").disabled = true;
+  $("update-msg").textContent = "Checking…";
+  if (!await loadUpdate(true)) $("update-msg").textContent = "The server did not answer.";
+  $("update-check").disabled = false;
+};
 
 // ------------------------------------------------------------------ MCP servers (GET /mcp)
 // Tools from the MCP servers in the run config: the chat offers them to the model (opt-in per request,
@@ -745,7 +838,7 @@ function apiMessages() {
       const text = userText(m);
       out.push({role: "user", content: imgs.length ? [{type: "text", text},
         ...imgs.map((i) => ({type: "image_url", image_url: {url: i.url}}))] : text});
-    } else if (!m.error) {
+    } else if (!(busy && busy.msg === m)) {            // the answer being asked for now is not history yet
       out.push(...assistantMessages(m));
     }
   }
@@ -755,7 +848,14 @@ function apiMessages() {
 // their results (as the model read them), then the rest - so the next question can build on what the tools found.
 function assistantMessages(m) {
   const ran = (m.tools || []).filter((t) => t.round != null && t.result != null && t.state !== "skipped");
-  if (!ran.length) return m.text ? [{role: "assistant", content: m.text}] : [];
+  // #1392: a turn with no answer text (only reasoning, a stop before the first content token, or an error) still goes
+  // back as an assistant turn, so the history keeps alternating and a reasoning model sees that it already answered.
+  // The server leaves such a turn out of the prompt itself (serve/frontend.py, #843); reasoning_content rides along.
+  if (!ran.length) {
+    const msg = {role: "assistant", content: m.text || ""};
+    if (!m.text && m.reasoning) msg.reasoning_content = m.reasoning;
+    return [msg];
+  }
   const out = [];
   let pos = 0;
   for (const r of [...new Set(ran.map((t) => t.round))]) {
@@ -1087,7 +1187,7 @@ setBusy(false);
 renderChat();
 const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
 if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
-loadHealth().then(loadSwitcher).then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
+loadHealth().then(loadSwitcher).then(loadMcp).then(() => loadUpdate()).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
 showTab(location.hash.slice(1) || "chat");
 poll();
 setInterval(() => { if (!switching) loadSwitcher(); }, 15000);   // a switch started elsewhere shows here too

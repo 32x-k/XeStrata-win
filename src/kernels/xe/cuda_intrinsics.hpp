@@ -43,7 +43,7 @@ inline int dp4a(int a, int b, int c) {
 // __byte_perm(x, y, s): result byte i is byte ((s >> 4i) & 7) of the eight bytes y:x.  In 32-bit operations: the
 // selector's bit 2 picks x or y, its low bits the byte.  A variable shift of the 64-bit y:x, as first written, costs
 // several instructions on Xe, and the i-quant decoders call this per weight word (the B70's expert kernels were
-// bound by these integer instructions, not by memory: bench/results/2026-10-02-xe-decode-gpu).
+// bound by these integer instructions, not by memory: the 2026-10-02-xe-decode-gpu record).
 inline uint32_t byte_perm(uint32_t x, uint32_t y, uint32_t s) {
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
     return __nvvm_prmt(x, y, s & 0x7777u);   // prmt's default mode; bit 3 of each selector (sign replication) unused

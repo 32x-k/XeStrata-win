@@ -10,12 +10,15 @@
 #include "strata/kernels/native_router.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_router
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -222,6 +225,163 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
         || overlap(ids, 10 * 4, weights, 10 * 4))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
     launch_native_router(queue_for(stream, true), logits, ids, weights, 1);
+}
+
+// STRATA_ROUTE_PRIOR=lambda (upstream 2de9ae06, opt-in, changes the output): cache-conditioned routing, after "Mixture
+// of Cache-Conditional Experts" (arXiv 2412.00099) without training.  When a token's 10 experts are picked, an expert
+// already in VRAM gets a `lambda` bonus on its logit: the SELECTION uses the biased logits, the WEIGHTS stay the
+// router's (softmax over the 512 unbiased logits) renormalised over the 10 picked.  One sub-group per token, 16 values
+// a lane, as the native router.
+void route_prior_top10(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
+                       int n_tok, void* stream) {
+    if (n_tok <= 0) return;
+    if (!stream || res_layer == nullptr) throw std::invalid_argument("route-prior requires a stream and the residency row");
+    queue_for(stream, true).parallel_for(sycl::nd_range<1>((size_t) n_tok * WARP, WARP), [=](sycl::nd_item<1> it)
+                                         [[sycl::reqd_sub_group_size(WARP)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const size_t tok = it.get_group(0);
+        const float* lg = logits + tok * 512;
+        int32_t* id = ids + tok * 10;
+        float* w = weights + tok * 10;
+        const int lane = (int) sg.get_local_linear_id();
+        float p[16], s[16];
+        float mx = -INFINITY;
+        for (int i = 0; i < 16; ++i) { p[i] = lg[lane + 32 * i]; mx = sycl::fmax(mx, p[i]); }
+        for (int m = 16; m; m >>= 1) mx = sycl::fmax(mx, sycl::permute_group_by_xor(sg, mx, m));
+        for (int i = 0; i < 16; ++i) {
+            const int e = lane + 32 * i;
+            s[i] = p[i] + (res_layer[e] >= 0 ? lambda : 0.0f);   // the selection score
+            p[i] = sycl::exp(p[i] - mx);                         // the router's probability (unnormalised)
+        }
+        float sel_p = 0.0f, sel_sum = 0.0f;
+        for (int rank = 0; rank < 10; ++rank) {
+            float best = -FLT_MAX, bp = 0.0f;
+            int be = 1 << 30;
+            for (int i = 0; i < 16; ++i)
+                if (s[i] > best) { best = s[i]; be = lane + 32 * i; bp = p[i]; }
+            for (int m = 16; m; m >>= 1) {
+                const float ob = sycl::permute_group_by_xor(sg, best, m);
+                const int oe = sycl::permute_group_by_xor(sg, be, m);
+                const float op = sycl::permute_group_by_xor(sg, bp, m);
+                if (ob > best || (ob == best && oe < be)) { best = ob; be = oe; bp = op; }
+            }
+            if ((be & 31) == lane) s[be >> 5] = -FLT_MAX;
+            if (lane == rank) { id[rank] = be; sel_p = bp; }
+            sel_sum += bp;                                       // the same on every lane
+        }
+        if (lane < 10) w[lane] = sel_p / sycl::fmax(sel_sum, 1e-30f);
+    });
+}
+
+// STRATA_ROUTE_RESIDENT (upstream 5df35dcb, EXPERIMENTAL, opt-in, changes the output): residency-biased routing for
+// 512 x 10.  After the top-10: for the ranks lo..hi a non-resident expert is replaced by the best resident expert not
+// already picked when its logit is within `margin` of the replaced one; the weights are then the softmax of the selected
+// logits (the router's renormalisation).  Tokens without a swap keep the router's exact bits.
+// stats (device, 4 x uint64): [0] tail entries seen, [1] swaps, [2] non-resident entries before, [3] after.
+void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
+                           float margin, int rank_lo, int rank_hi, unsigned long long* stats, void* stream) {
+    if (!stream || n_tok < 1 || res_layer == nullptr)
+        throw std::invalid_argument("route-resident requires a stream, tokens and the residency row");
+    const int lo = rank_lo, hi = rank_hi;
+    // upstream 33fd01b4: a sub-group a token, lane j scanning experts j, j + 32, ...; the serial scan per token was the
+    // window's own cost (upstream: 2.75 ms of a 22 ms window).  The same choice bit for bit: a strictly greater logit
+    // wins, the smaller expert index breaks a tie, the ranks in order (a swap changes the set already picked).
+    // STRATA_ROUTE_RESIDENT_SERIAL=1: the serial form, to compare.
+    static const bool serial_env = [] {
+        const char* v = std::getenv("STRATA_ROUTE_RESIDENT_SERIAL");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (!serial_env) {
+        queue_for(stream, true).parallel_for(
+            sycl::nd_range<1>((size_t) n_tok * WARP, WARP), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                const sycl::sub_group sg = it.get_sub_group();
+                const int lane = (int) sg.get_local_linear_id();
+                const size_t t = it.get_group_linear_id();
+                const float* l = logits + t * 512;
+                int32_t* idp = ids + t * 10;
+                int32_t id[10];
+                for (int r = 0; r < 10; ++r) id[r] = idp[r];
+                int swaps = 0, tail = 0, before = 0;
+                for (int r = 0; r < 10; ++r) before += res_layer[id[r]] < 0;
+                for (int r = lo; r <= hi && r < 10; ++r) {
+                    const int e = id[r];
+                    if (res_layer[e] >= 0) continue;
+                    ++tail;
+                    int best = -1;
+                    float bl = -INFINITY;
+                    for (int f = lane; f < 512; f += WARP) {   // ascending: the lane keeps its first maximum
+                        if (res_layer[f] < 0 || l[f] <= bl) continue;
+                        bool used = false;
+                        for (int q = 0; q < 10; ++q) used |= id[q] == f;
+                        if (!used) { best = f; bl = l[f]; }
+                    }
+                    for (int o = WARP / 2; o > 0; o >>= 1) {   // the greatest logit, the smallest index on a tie
+                        const float ob = sycl::permute_group_by_xor(sg, bl, o);
+                        const int oi = sycl::permute_group_by_xor(sg, best, o);
+                        if (oi >= 0 && (best < 0 || ob > bl || (ob == bl && oi < best))) { bl = ob; best = oi; }
+                    }
+                    if (best >= 0 && l[e] - bl <= margin) { id[r] = best; ++swaps; }
+                }
+                if (lane != 0) return;
+                int after = 0;
+                for (int r = 0; r < 10; ++r) after += res_layer[id[r]] < 0;
+                if (swaps) {
+                    for (int r = 0; r < 10; ++r) idp[r] = id[r];
+                    float m = -INFINITY;
+                    for (int r = 0; r < 10; ++r) m = sycl::fmax(m, l[id[r]]);
+                    float ex[10], sum = 0.0f;
+                    for (int r = 0; r < 10; ++r) { ex[r] = sycl::exp(l[id[r]] - m); sum += ex[r]; }
+                    for (int r = 0; r < 10; ++r) weights[t * 10 + r] = ex[r] / sum;
+                }
+                if (stats) {
+                    using A = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed,
+                                               sycl::memory_scope::device, sycl::access::address_space::global_space>;
+                    A(stats[0]).fetch_add((unsigned long long) tail);
+                    A(stats[1]).fetch_add((unsigned long long) swaps);
+                    A(stats[2]).fetch_add((unsigned long long) before);
+                    A(stats[3]).fetch_add((unsigned long long) after);
+                }
+            });
+        return;
+    }
+    queue_for(stream, true).parallel_for(sycl::range<1>((size_t) n_tok), [=](sycl::id<1> i) {
+        const size_t t = i[0];
+        const float* l = logits + t * 512;
+        int32_t* id = ids + t * 10;
+        int swaps = 0, tail = 0, before = 0;
+        for (int r = 0; r < 10; ++r) before += res_layer[id[r]] < 0;
+        for (int r = lo; r <= hi && r < 10; ++r) {
+            const int e = id[r];
+            if (res_layer[e] >= 0) continue;
+            ++tail;
+            int best = -1;
+            float bl = -INFINITY;
+            for (int f = 0; f < 512; ++f) {
+                if (res_layer[f] < 0 || l[f] <= bl) continue;
+                bool used = false;
+                for (int q = 0; q < 10; ++q) used |= id[q] == f;
+                if (!used) { best = f; bl = l[f]; }
+            }
+            if (best >= 0 && l[e] - bl <= margin) { id[r] = best; ++swaps; }
+        }
+        int after = 0;
+        for (int r = 0; r < 10; ++r) after += res_layer[id[r]] < 0;
+        if (swaps) {
+            float m = -INFINITY;
+            for (int r = 0; r < 10; ++r) m = sycl::fmax(m, l[id[r]]);
+            float ex[10], sum = 0.0f;
+            for (int r = 0; r < 10; ++r) { ex[r] = sycl::exp(l[id[r]] - m); sum += ex[r]; }
+            for (int r = 0; r < 10; ++r) weights[t * 10 + r] = ex[r] / sum;
+        }
+        if (stats) {
+            using A = sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                       sycl::access::address_space::global_space>;
+            A(stats[0]).fetch_add((unsigned long long) tail);
+            A(stats[1]).fetch_add((unsigned long long) swaps);
+            A(stats[2]).fetch_add((unsigned long long) before);
+            A(stats[3]).fetch_add((unsigned long long) after);
+        }
+    });
 }
 
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream) {

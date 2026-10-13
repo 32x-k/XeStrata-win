@@ -16,11 +16,19 @@ namespace strata::prefill::mmq {
 
 /// The GPU runs these products (iq_mmq_usable).
 bool built();
-/// They cover this ggml type (the i-quants but IQ1_S, and Q2_0).
+/// The GPU runs them without matrix engines (iq_mmq_dp4a_usable), where built() says no.
+bool built_dp4a();
+/// Whether the prompt's products take their int8 form: on the matrix engines where built(); else by dp4a only where the
+/// FP16 products have no matrix engines either (built_dp4a, and not kernels::f16_matrix_engines: Volta, whose tensor
+/// cores take FP16 and not int8, keeps the FP16 form).  PlainModel's prompt takes it as it is; Qwen3.8's (prefill.cpp)
+/// keeps the FP16 form where Intel's XMX take it, faster there than the int8 products.
+bool chosen();
+/// They cover this ggml type (the i-quants but IQ1_S, Q2_0, Q8_0, Q5_0, Q2_K to Q6_K).
 bool supported(int ggml_type);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
-/// Bytes of `rows` activation rows of `cols` values quantized for MMQ.
+/// Bytes of `rows` activation rows of `cols` values quantized for MMQ (twice that for a type that repeats every block,
+/// Q2_K: kernels::iq_mmq_type_dup).
 size_t q8_bytes(int64_t rows, int64_t cols);
 
 /// int8 activations for MMQ against weights of `ggml_type`: row i of the output is row ids[i] of x (or row i when
@@ -42,8 +50,11 @@ struct Product {
     const int32_t* bounds = nullptr;
     const int32_t* ids = nullptr;
     int64_t total_rows = 0, max_rows = 0;
+    int64_t rows = 0;   ///< the n experts' rows together (0: total_rows), for the tile's shape
     float* dst = nullptr;
     int64_t ld_dst = 0;
+    const uint8_t* const* wtab = nullptr;   ///< on the device: expert e's weights at wtab[e] + woff instead of w's
+    size_t woff = 0;
 };
 
 /// The launch context.  One per prompt path.

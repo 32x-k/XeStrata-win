@@ -12,6 +12,8 @@
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_s_gemv
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <array>
 #include <string>

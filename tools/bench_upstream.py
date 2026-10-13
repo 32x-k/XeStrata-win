@@ -11,7 +11,13 @@ the engine the way that tag's own setup.py gets it, with that setup.py's own fun
 - AMD: compiled with HIP by its build_engine_hip, with the system's ROCm (its setup.py would otherwise install ROCm into
   the Python that runs it).
 - Intel: its sycl/ port compiled and run in its Docker image (docs/INTEL.md), JIT code (an AOT target would have to be
-  chosen by the device's ID); the data folder is mounted at /work.
+  chosen by the device's ID); the data folder is mounted at /work.  The arguments get what its sycl/setup_intel.py
+  writes for the card (sycl_setup), as its setup does.
+
+Run as a script, `bench_upstream.py --sycl-setup TREE SELECTOR -- ARGS...` prints what sycl_setup makes of ARGS for
+upstream's sycl/ port in TREE on the Level Zero device SELECTOR, for a wrapper that runs that engine without the
+port's own sycl/serve/strata-sycl.sh (the release's up-sycl.sh): the environment (K=V, the wrapper's defaults
+included), then `--`, then the arguments, each ended by a NUL byte.
 
 Upstream's prebuilt CUDA engine and its oneAPI image are not free software: a free build of XeStrata does not fetch
 them (AGENTS.md); the AMD comparison is free.  Nothing here is bundled: it is fetched when the user asks for it.
@@ -22,6 +28,7 @@ import ast
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -96,6 +103,74 @@ def constant(src: Path, name: str):
             v = node.value.orelse if isinstance(node.value, ast.IfExp) else node.value
             return ast.literal_eval(v)
     raise UpstreamError(f"the tag's setup.py has no {name}")
+
+
+class SyclSetup:
+    """What the tag's sycl/setup_intel.py writes for an Intel card, as a change to the arguments the bench gives:
+    its to_sycl() (the experts streamed with the pinned mirror, the VRAM reserve, KV streaming from 64K when the RAM
+    holds the KV, 4,096-token prompt chunks, the xe cards' expert profile in place of the shipped one), with the
+    options its install() adds for a small card, and the environment its config carries.  The card is the one
+    `selector` (level_zero:N) takes; its install() counts the Level Zero devices in the sysfs order of its
+    intel_gpus().  The paths stay as they are given (the caller's are already the ones the engine sees)."""
+
+    def __init__(self, src: Path, selector: str | None):
+        path = src / "sycl" / "setup_intel.py"
+        if not path.is_file():
+            raise UpstreamError(f"{path} is missing: this tag has no setup for its sycl/ port")
+        saved_path, saved_setup = list(sys.path), sys.modules.get("setup")
+        sys.modules["setup"] = load_setup(src)          # setup_intel.py imports its tree's setup.py as `setup`
+        try:
+            spec = importlib.util.spec_from_file_location("strata_upstream_setup_intel", path)
+            if spec is None or spec.loader is None:
+                raise UpstreamError(f"{path} cannot be read")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except (Exception, SystemExit) as e:
+            raise UpstreamError(f"the tag's sycl/setup_intel.py does not load here ({e})") from e
+        finally:
+            sys.path[:] = saved_path
+            if saved_setup is None:
+                sys.modules.pop("setup", None)
+            else:
+                sys.modules["setup"] = saved_setup
+        for name in ("intel_gpus", "to_sycl", "small_card"):
+            if not callable(getattr(mod, name, None)):
+                raise UpstreamError(f"the tag's sycl/setup_intel.py has no {name}(): this tag is not supported")
+        cards = mod.intel_gpus()
+        if not cards:
+            raise UpstreamError("the tag's sycl/setup_intel.py finds no Intel Arc (an xe or i915 card in "
+                                "/sys/class/drm)")
+        m = re.fullmatch(r"level_zero:(\d+)", selector or "")
+        self.card = cards[int(m.group(1))] if m and int(m.group(1)) < len(cards) else cards[0]
+        setattr(mod, "sycl_path", str)                  # the paths stay the caller's
+        self.mod, self.ram = mod, mod.S.ram_gb()
+        self.wrapper = src / "sycl" / "serve" / "strata-sycl.sh"
+        self.env = {k: v for k, v in (self.config([])[1]).items() if not k.startswith("STRATA_SYCL_")}
+
+    def config(self, args: list[str]) -> tuple[list[str], dict]:
+        args = list(args)
+        card = self.card
+        if self.mod.small_card(card["vram_gb"], card["driver"]) and "--draft-vocab" not in args:
+            args += ["--draft-vocab", "en"]             # its install()'s option for a small card
+        try:                                            # the AOT binary's name: its config then names no other
+            cfg = self.mod.to_sycl({"args": args}, self.mod.ROOT / "build-sycl-aot" / "strata", self.ram, {},
+                                   card["vram_gb"], card["driver"], card.get("devid", ""))
+        except SystemExit as e:
+            raise UpstreamError(f"the tag's sycl/setup_intel.py stopped in to_sycl() ({e})") from e
+        return cfg["args"], cfg.get("env") or {}
+
+    def args(self, args: list[str]) -> list[str]:
+        return self.config(args)[0]
+
+    def wrapper_env(self) -> dict:
+        """The run-time switches its sycl/serve/strata-sycl.sh sets (`declare -A setting=([K]=V ...)`) under the
+        config's environment, without the ones at 0 or empty, which that wrapper does not pass on."""
+        m = re.search(r"declare -A setting=\(([^)]*)\)", self.wrapper.read_text(encoding="utf-8")
+                      if self.wrapper.is_file() else "")
+        if m is None:
+            raise UpstreamError(f"{self.wrapper} sets no run-time switches this reads: this tag is not supported")
+        env = {**dict(re.findall(r"\[(\w+)\]=(\S*)", m.group(1))), **self.env}
+        return {k: v for k, v in env.items() if v not in ("0", "")}
 
 
 def nvidia_index(pci: str) -> tuple[int, int]:
@@ -189,11 +264,12 @@ def intel(tag: str, src: Path, data: Path, gpu: dict, say: Callable) -> dict:
         stamp.write_text(tag + "\n")
     intel_cards = [x for x in gpu.get("_all", []) if x.get("vendor") == "intel"]
     index = next((i for i, x in enumerate(intel_cards) if x.get("pci") == gpu.get("pci")), 0)
-    env = {**os.environ, "STRATA_SYCL_ROOT": str(data), "STRATA_SYCL_BIN": "build-sycl/strata",
+    setup = SyclSetup(src, f"level_zero:{index}")
+    env = {**os.environ, **setup.env, "STRATA_SYCL_ROOT": str(data), "STRATA_SYCL_BIN": "build-sycl/strata",
            "STRATA_SYCL_NAME": "xestrata-bench-upstream", "ONEAPI_DEVICE_SELECTOR": f"level_zero:{index}"}
     return {"exe": str(src / "sycl" / "serve" / "strata-sycl.sh"), "env": env, "map": (str(data), "/work"),
-            "server": "sycl/serve/server_intel.py", "prompt_only": True,
-            "how": "its sycl/ port, compiled in its Docker image (JIT)"}
+            "server": "sycl/serve/server_intel.py", "adapt": setup.args,
+            "how": "its sycl/ port, compiled in its Docker image (JIT), with what its sycl/setup_intel.py writes"}
 
 
 def prepare(tag: str, data: Path, gpus: list[dict], license: str, profile: str, say: Callable) -> Engine:
@@ -214,4 +290,22 @@ def prepare(tag: str, data: Path, gpus: list[dict], license: str, profile: str, 
     e = how(tag, src, data, gpu, say)
     return Engine(f"upstream {tag}", "up", [e["exe"]], str(src / "data" / Path(profile).name), env=e["env"],
                   cwd=str(src), root=src, py=sys.executable, server=e.get("server"), map=e.get("map"),
-                  cfg_extra=e.get("cfg_extra"), prompt_only=e.get("prompt_only", False), how=e["how"])
+                  cfg_extra=e.get("cfg_extra"), how=e["how"], adapt=e.get("adapt"))
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 3 or argv[0] != "--sycl-setup" or "--" not in argv or argv.index("--") != 3:
+        print("usage: bench_upstream.py --sycl-setup TREE SELECTOR -- ARGS...", file=sys.stderr)
+        return 2
+    try:
+        setup = SyclSetup(Path(argv[1]), argv[2])
+        words = [f"{k}={v}" for k, v in sorted(setup.wrapper_env().items())] + ["--"] + setup.args(argv[4:])
+    except UpstreamError as e:
+        print(f"bench_upstream.py: {e}", file=sys.stderr)
+        return 1
+    sys.stdout.write("".join(w + "\0" for w in words))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

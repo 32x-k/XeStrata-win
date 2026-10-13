@@ -56,10 +56,29 @@ xestrata --bench --original-strata v0.1.41        # 同じモデルで upstream 
 | --- | --- |
 | NVIDIA | リリースの配布物（SHA-256 を確かめる） |
 | AMD | タグのソースを HIP でビルド |
-| Intel | upstream の `sycl/` を Docker でビルド（sudo なしで docker が使えること） |
+| Intel | upstream の `sycl/` を Docker でビルド（sudo なしで docker が使えること）。その `sycl/setup_intel.py` がカードに書く設定で動かす |
 
 - NVIDIA の配布物と Intel の Docker イメージは自由ソフトウェアでないので、free のビルドでは NVIDIA と Intel の比較はしません。
-- Intel では decode の速さを比べません。upstream の `sycl/` は、VRAM に入らないエキスパートを PCIe 越しに読むためです。
+- upstream が 10 tok/s 以下と分かった欄は、その段の途中で止めて比べません（「止まった回」に出ます）。
+
+## xestrata --bench-original-compat
+
+upstream Strata のベンチマークのモード（`tools/strata_bench.py`、upstream v0.1.43）を、そのままの測り方で動かす互換モードです。
+upstream の利用者の報告（upstream の `docs/COMMUNITY_BENCHMARKS.md` の形）と並べて比べるときに使います。
+XeStrata 自身の測り方は `--bench` です。
+
+```sh
+xestrata --setup --bench-original-compat                        # 一番新しく入れたモデル（--model・--family で別のモデル）
+xestrata --setup --bench-original-compat --long --clients 4     # 後ろの引数は strata_bench.py にそのまま渡す
+xestrata --setup --bench-original-compat --compare <前の結果のフォルダ>
+```
+
+- 入れたモデルの設定でサーバーを起動し（動いていればそれを使い）、HTTP API に決まった要求を送ります。各 3 回の中央値です。考えは切ります（`--think` で入れます）。
+- 試験は upstream と同じです: 短い質問 3 つ（最大 100 トークン）、4K と 16K のプロンプト、ファイルを足していく 5 ターンのエージェント。`--long` で 32K のプロンプト、`--clients N` で N 件の同時の要求を足します。
+- 時間はモデルを読んだ後 3〜10 分ほどです。
+- 結果はデータフォルダの `records/<日付>-community-<GPU>-<モデル>/` に書きます（`README.md`、`results.json`、`engine-log-excerpt.txt`）。ホームフォルダ、ユーザー名、ホスト名、IP アドレス、API キーは書く前に置き換えます。どこにも送りません。
+- upstream と違うのは、設定ファイル（`xestrata-*.json`）、報告に書く版（XeStrata の版）、書き出す場所だけです。
+- `--bench`、`--bench-verbose`、`--original-strata` とは一緒に使えません。
 
 ## upstream 追従の計測
 
@@ -73,7 +92,8 @@ XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> python $S/
 XE="..." UP="..." XE_ROOT=... UP_ROOT=... XE_PROFILE=... UP_PROFILE=... DATA=<data> PY=<python> \
   python $S/bench_usage.py $o/IQ3_XXS <GPU>
 python $S/sync_collect.py $o/<file> xe-<commit> <tag>                         # matrix*.json と表
-python $S/judge.py --prompt-only B70 $o/IQ3_XXS ...                           # ALL PASS か FAIL <n>
+python $S/judge.py --prev IQ3_XXS=<前の記録> $o/IQ3_XXS ...  # ALL PASS か FAIL <n>
+A="..." B="..." PROFILE=... DATA=<data> IDS=<ids> python $S/ab_pair.py generate|serve|usage <out> <GPU>
 ```
 
 - モデルの既定は IQ3_XXS です。RAM の少ない PC では、setup が書いたモデルの設定を `CONFIG=xestrata-<モデル>.json` で渡すと、そのモデルのファイルと設定（RAM の予算、calibrate の結果）で両エンジンを測ります。
@@ -83,6 +103,8 @@ python $S/judge.py --prompt-only B70 $o/IQ3_XXS ...                           # 
 - generate は `--spec-follow` で両エンジンに upstream の答えをなぞらせ、テキストの違いを除きます。serve にはこの機能がありません。
 - 合格の幅: generate と、serve・通常使用の最初の prefill の速さは、XeStrata が upstream より 1% 以上遅くないこと。serve・通常使用のそれ以外（続きのターンの待ち時間、decode、最初のトークンまでの時間）は 5% 以上悪くないこと。
 - 温度は、serve が `MODES`（既定 `greedy t07`。`t10` は温度 1.0）、通常使用が `TEMPERATURE`（既定 0.7）で変えられます。
+- `--prev <ファイル>=<フォルダー>` を付けると、前の XeStrata の記録（前回の追従の記録か、リリースの記録）とも比べます。両方にあるマスごとに、prefill の速さは 1%、それ以外は 5% 以上悪くないこと。B70 の decode も比べます。
+- `ab_pair.py` は XeStrata どうしを交互に測ります。A が基準、B が候補です（スイッチの有無や、前の版と HEAD）。同じシードなので、書くテキストが変わる変更でない限り同じテキストを書きます。`judge.py <out>` で B を A と比べます。
 - `--dry-run` を付けると、エンジンを動かさずに起動するコマンドを出します。
 
 ## リリースの表

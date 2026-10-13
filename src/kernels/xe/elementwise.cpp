@@ -6,6 +6,8 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_elementwise
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -116,14 +118,14 @@ void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
     sync_if_needed(stream, event);
 }
 
-// ---- the doorbell (see the header).  bench/results/2026-09-30-xe-doorbell measured what a spinning kernel sees:
+// ---- the doorbell (see the header).  the 2026-09-30-xe-doorbell record measured what a spinning kernel sees:
 // a volatile read followed by a system-scope acquire fence observes the host's write; a system-scope atomic load
 // alone sometimes never does.  The GPU-to-host direction is a system-scope fence, then a plain volatile store,
 // not an atomic one: no GPU here reports usm_atomic_host_allocations, and the xe driver serves a discrete
 // GPU's atomic page fault on system memory only by moving the page to VRAM (a userptr cannot move), where a read or
 // a write is simply bound again (xe_vma_need_vram_for_atomic).  The ring has one writer, so it needs no atomicity;
 // the B70 saw the store while the kernel ran in 2,000 of 2,000 runs, sooner than the atomic one (median 4.9 us
-// against 11.0; bench/results/2026-10-11-xe-doorbell-store).
+// against 11.0; the 2026-10-11-xe-doorbell-store record).
 namespace {
 inline uint32_t read_host(const uint32_t* p) {
     const uint32_t v = *reinterpret_cast<const volatile uint32_t*>(p);
@@ -171,6 +173,23 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
         const int64_t step = (int64_t) it.get_global_range(0);
         for (int64_t i = (int64_t) it.get_global_id(0); i < n4; i += step)
             reinterpret_cast<f32x4*>(dst)[i] = reinterpret_cast<const volatile f32x4*>(src)[i];
+    });
+}
+
+void concat_rows(float* dst, const float* a, const float* b, int64_t n, int64_t rows, void* stream) {
+    if (n <= 0 || rows <= 0) return;
+    if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) a & 15) != 0 || ((uintptr_t) b & 15) != 0)
+        throw core::DeviceError("concat_rows: n must be a multiple of 4 and the pointers 16-byte aligned");
+    const int64_t n4 = n / 4;
+    queue_for(stream).parallel_for(sycl::nd_range<1>((size_t) rows * 256, 256), [=](sycl::nd_item<1> it) {
+        const int64_t row = (int64_t) it.get_group(0);
+        f32x4* d = reinterpret_cast<f32x4*>(dst + row * 2 * n);
+        const f32x4* sa = reinterpret_cast<const f32x4*>(a + row * n);
+        const f32x4* sb = reinterpret_cast<const f32x4*>(b + row * n);
+        for (int64_t i = (int64_t) it.get_local_id(0); i < n4; i += 256) {
+            d[i] = sa[i];
+            d[n4 + i] = sb[i];
+        }
     });
 }
 

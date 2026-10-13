@@ -29,7 +29,7 @@ Strata（CUDA）の README にある RTX での数字は、XeStrata には当て
 下の表は、コミット `58dbbe5` を setup が書く設定（画像はオフ）で動かし、コード・エージェント向けのプロンプトを長さごとに 1 つ読ませて 256 トークンを書かせた結果です。
 MTP の推測デコードはオンです。
 「262K」はモデルの文脈の上限いっぱい（259,942 トークンのプロンプト）です。
-1 マス 1 回の測定です（[記録](../bench/results/2026-10-04-speed-matrix/README.md)）。
+1 マス 1 回の測定です。
 
 ### prefill（トークン/秒）
 
@@ -41,7 +41,7 @@ MTP の推測デコードはオンです。
 | **IQ3_S** | 450 | 740 | 1,718 | 1,458 | 1,333 | 1,081 |
 | **Coder** | 936 | 1,573 | 2,015 | 1,659 | 1,499 | 1,188 |
 
-短いプロンプト（2,048 トークン未満のチャンク）では、VRAM にないエキスパートのうち少しのトークンにしか選ばれないものを、そのあいだ空いている decode 用の CPU のプールが計算します（upstream では opt-in、Xe は既定、`STRATA_PREFILL_CPU_SHARE=auto`）。CPU と GPU のエキスパートあたりの時間を測り、両方が同時に終わる割合を渡します。CPU の活性の形で計算するので、GPU だけのときと答えが少し変わります。`STRATA_PREFILL_CPU_SHARE=0` で GPU だけ、`0.4` などで決まった割合です。262 / 914 トークンのプロンプトは、B70 で 319.2 → 383.1 / 736.3 → 828.0 トークン/秒、RTX 4070 で 109.9 → 266.1 / 275.9 → 457.8 トークン/秒でした（各 1 回）。
+短いプロンプト（2,048 トークン未満のチャンク）では、VRAM にないエキスパートのうち少しのトークンにしか選ばれないものを、そのあいだ空いている decode 用の CPU のプールが計算します（upstream では opt-in、Xe は既定、`STRATA_PREFILL_CPU_SHARE=auto`）。CPU と GPU のエキスパートあたりの時間を測り、両方が同時に終わる割合を渡します。`STRATA_PREFILL_CPU_GATE=1` にすると、渡す層と渡さない層を隣どうしで交互に測り、VRAM にないエキスパートあたりの時間が渡す方で短いあいだだけ渡します（upstream f2a3b946、#1282。CPU が忙しいとストリームを出すホストが遅くなり、渡すと遅くなった PC があったため）。渡さない層を試す分だけ遅くなり、1K のプロンプトが B70 で 1.3%、RTX 4070 で 4.4% 遅くなったので、既定では使いません。`STRATA_DBG_CPU_GATE=1` でその測定を出します。GPU のキャッシュがすべてのエキスパートを持つとき（流すものがない）と、ホストのメモリが足りないとき（空き RAM が分担のバッファと 3 GiB より少ない、または読むエキスパートのファイルのページを空き RAM が持てない）は、既定では使いません（upstream eaaa237e・04dbe561、`STRATA_PREFILL_CPU_SHARE=auto` で使います）。分担のバッファを確保できなかったときは、その要求を失敗させずに分担を止めます。CPU の活性の形で計算するので、GPU だけのときと答えが少し変わります。`STRATA_PREFILL_CPU_SHARE=0` で GPU だけ、`0.4` などで決まった割合です。262 / 914 トークンのプロンプトは、B70 で 319.2 → 383.1 / 736.3 → 828.0 トークン/秒、RTX 4070 で 109.9 → 266.1 / 275.9 → 457.8 トークン/秒でした（各 1 回）。
 
 ### decode（トークン/秒）
 
@@ -62,13 +62,36 @@ decode の速さは文章によっても変わります。
 （B70、IQ2_XS、K=3: 文書の書き直し 109.6 → 129.2、ふつうの会話 71.1 → 68.3 トークン/秒）。
 `--lookup-chain-min M` は、続きを足すのに要る一致の長さです（既定 3 トークン）。
 
+サーバーの decode では、VRAM にないエキスパートのうち、検証の窓のどのトークンも順位 7 以下（上位 10 のうち重みの小さい 8〜10 番目）でしか選ばないものを、読まず計算もしません（`STRATA_ROUTE_TAIL_SKIP`、既定 7、upstream b4e3407b）。
+寄与は 0 になり、残りのエキスパートの重みは正規化し直しません。そのぶん答えが少し変わります。
+全エキスパートが VRAM にあるとき（読み飛ばすものがない）、`--batch` のとき、補助のキャッシュ（`--expert-cache-device1..3`）を使うときは働きません。層の分割では、各段が自分の分を読み飛ばします。
+エキスパートの 90% 以上が VRAM にあるときも既定では働きません（upstream #1884: 外れがわずかで、読み飛ばしの得より推測の当たりの減りが大きい。V100 32 GB・Coder IQ1_M・94.8% で decode −1〜2%）。`STRATA_TAIL_SKIP_MAX_CACHED=<割合>` でこの線を動かします（101 で常に働く）。
+`STRATA_ROUTE_TAIL_SKIP=0` で切れ、1〜9 で順位を変えられます。起動時に 1 行出します。
+
+測った結果（IQ3_XXS）:
+
+| | B70 | RTX 4070 | RX 9060 XT |
+| --- | --- | --- | --- |
+| KL の平均（窓のずれ。同じ設定を 2 回の下限） | 0.0027（0.0000） | 0.0053（0.0009） | 0.0049（0.0012） |
+| top-1 の一致 | 99.1% | 97.8% | 98.4% |
+| HumanEval 82 問と計算の課題 30 問の正答（なし / あり） | 75・25 / 76・24 | 77・25 / 79・25 | 77・24 / 77・24 |
+| serve の decode（なし → あり、1K と 32K、greedy と温度 0.7） | −1.0〜+12.7% | +7.5〜+24.5% | +6.3〜+55.4% |
+
+`STRATA_ROUTE_RESIDENT=<margin>`（upstream 5df35dcb、実験的、opt-in）は、検証の窓で上位 10 のうち順位 6〜9 の VRAM にないエキスパートを、ロジットの差が margin 以内なら VRAM にあるエキスパートに入れ替えます（`STRATA_ROUTE_RESIDENT_RANKS=lo-hi`）。
+`STRATA_ROUTE_PRIOR=<lambda>`（upstream 2de9ae06、opt-in）は、VRAM にあるエキスパートのロジットに lambda を足して選び直します（重みはルーターのもの）。
+どちらも答えが変わります。
+
 ### 小さい GPU と XMX のない GPU
 
 B70 を小さい GPU に見せた設定（`STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1`、VRAM 8 GB、XMX なし）で、
-IQ2_XS は MTP で 17.6 トークン/秒を書き、26K トークンのプロンプトを 574 トークン/秒で読みました
-（[記録](../bench/results/2026-10-03-prompt-upstream/README.md)）。
-XMX のない GPU では、prefill の経路の行列積を DP4a で計算するので、prefill に約 1.6 倍の時間がかかります
-（[記録](../bench/results/2026-10-02-dp4a/README.md)）。
+IQ2_XS は MTP で 17.6 トークン/秒を書き、26K トークンのプロンプトを 574 トークン/秒で読みました。
+XMX のない GPU では、prefill の経路の行列積を DP4a で計算するので、prefill に約 1.6 倍の時間がかかります。
+
+prefill の経路は、半精度の出力のバッファを、最初の hyper-connection の配り（broadcast）のあとは使わない埋め込みのバッファと共有します（upstream 199fd1d5、#1454）。
+チャンクあたり T × 2560 個の float（32,768 トークンで 320 MiB）の VRAM が空きます。
+チャンクの大きさを決めるときは既定でその分も数えるので、チャンクと借りるキャッシュの枠は前と同じで、prefill の結果のビットも変わりません。
+`STRATA_EMB_REUSE_ACCOUNT=1` にすると、空いた分も使って、VRAM で決まるチャンクを大きくします（upstream 55dee8ed、RTX 3060・IQ3_XXS で 6,400 から 6,656 トークン、prefill が約 3.9% 速い）。
+チャンクが変わると prefill の丸めも変わります。
 
 ### AMD の APU
 
@@ -80,6 +103,9 @@ Strix Halo（gfx1151）は名前で見分け、Radeon 8060S / 8050S / 8040S を�
 GPU が使える共有のメモリを増やすのは、カーネルの起動の選択肢 `ttm.pages_limit` と `ttm.page_pool_size`（4 KiB のページの数）です。
 setup はホストの設定を変えません。
 エンジンは、内蔵 GPU の空きを、ランタイムが報告する値と、Linux が返せるメモリ（`MemAvailable`）から 6 GiB を引いた値の小さい方として数えます（upstream 004b15cd、`STRATA_UMA_HEADROOM_GIB` で 6 を変えられます）。
+エキスパートを RAM の予算で持つモデル（UD-Q4_K_XL、UD-IQ4_XS）では、setup はエキスパートのキャッシュを `auto` でなく数で書きます（upstream #1715）。
+キャッシュと予算は同じ RAM を使うので、起動時の空きから決める `auto` は予算がまだ取っていない分まで数え、OS の分が残らなくなります。
+数は、RAM から 24 GB と予算（と RAM に置く KV）を引いた分のスロットで、設定の `args` の `--expert-cache N` で変えられます。
 
 ### KV キャッシュの置き場所と精度
 
@@ -158,7 +184,7 @@ XeStrata はこのモデル用のエキスパートの順位（`data/expert-prof
 setup の最初の質問では **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)** も選べます。
 UkisAI による Qwen3.8-Flash-Next のファインチューンで、ずっと短い思考で答えにたどり着くよう訓練されています。
 作者によれば、思考のトークンは 63% 少なく、答えは 1.8 倍早く出て、正確さの低下は 1% 未満です。
-構成は同じで、大きさは Q2_0、IQ2_XS、IQ3_XXS の 3 つ（IQ3_S はない）、画像のエンコーダーは専用のものです。
+構成は同じで、大きさは Q2_0、IQ2_XS、IQ3_XXS、IQ3_S の 4 つ、画像のエンコーダーは専用のものです。
 作者は **IQ2_XS** を勧めています（Q2_0 は実験的とされています）。
 ライセンスは Swift Open License 1.0 です。モデルのページで読んでください。
 
@@ -200,7 +226,7 @@ setup が選ぶ N は、RAM から 24 GB を引いた値で、KV キャッシュ
 ```
 
 Arc Pro B70（32 GB）と i7-14700、RAM 96 GB で、setup の設定のまま、短い会話で 64 トークンを書かせました。
-毎回、OS のキャッシュが空の状態から測っています（[記録](../bench/results/2026-10-03-ud-low-ram/README.md)）。
+毎回、OS のキャッシュが空の状態から測っています。
 
 | | decode（トークン/秒） |
 | --- | ---: |
@@ -210,6 +236,58 @@ Arc Pro B70（32 GB）と i7-14700、RAM 96 GB で、setup の設定のまま、
 
 答えは、どの実行でも同じトークンでした。
 
+### Qwen3.8-Flash-Next 以外のモデル（Ornith-1.5、llm-jp-4.1）
+
+setup の最初の質問では、Qwen3.8-Flash-Next とは作りの違う 2 つの MoE モデルも選べます。
+どちらも GGUF のファイル 1 つで、エキスパートを RAM に置き、よく使うものを GPU の VRAM に置きます（VRAM にないものの扱いは Qwen3.8-Flash-Next と同じです）。
+
+- **[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)**（Ornith AI、MIT）: 35B、1 トークンで使うのは 3B の Qwen3.5 系の MoE です。文脈は 256K まで。
+  公式の Q4_K_M〜BF16 と、pfeifferj による GSQ-RCO の 3 ビットと 3.5 ビット（[コミュニティの再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)で、ISTA-DASLab のものではありません）があります。
+- **[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)**（LLM-jp、Apache-2.0）: 32B、1 トークンで使うのは 3B の、日本語と英語の思考するモデルです。文脈は 256K まで。
+
+| モデル | 大きさ | ダウンロード |
+| --- | --- | ---: |
+| Ornith-1.5 | **Q4_K_M** | 21.7 GB |
+| | Q5_K_M | 25.3 GB |
+| | **Q6_K** | 29.2 GB |
+| | Q8_0 | 37.8 GB |
+| | **BF16** | 71.1 GB |
+| | **GSQ-RCO-3BIT** | 13.0 GB |
+| | GSQ-RCO-3.5BIT | 15.2 GB |
+| llm-jp-4.1 | **Q4_K_M** | 21.5 GB |
+| | BF16 | 64.3 GB |
+
+太字は、このリリースで llama.cpp と答えを比べた版です。
+ほかの版も同じ型のテンソルでできていて、その型は太字の版とカーネルの試験で確かめています（setup は「untested」と表示します）。
+
+```sh
+./setup.sh --setup --family ornith --model Q4_K_M
+./setup.sh --setup --family llmjp
+```
+
+API は、思考と答えの分離、ストリーミング、ツールの呼び出しを含めて使えます。
+Ornith の公式の版（Q4_K_M〜BF16）は、モデルの MTP の層で 2 つ先までの下書きを作り、窓でまとめて確かめます（推測デコード、greedy の要求だけ。GSQ-RCO の版と llm-jp には MTP の層がありません）。
+まだ使えないのは、画像、Intel の CPU 内蔵の GPU、2 枚以上の GPU（setup は最初の GPU を使います）、KV キャッシュの精度や省 RAM モードなど Qwen3.8-Flash-Next のためのオプションです。
+RAM がエキスパートに足りないとき、エンジンはエキスパートを RAM に読み込まず、モデルのファイルから OS のファイルキャッシュ越しに読みます（遅くなります。setup はそのことを警告します）。
+
+エンジンのオプション（設定の `args` に足します）:
+
+| オプション | 意味 |
+| --- | --- |
+| `--max-context N` | KV キャッシュのトークン数（setup が GPU の VRAM から選びます） |
+| `--expert-profile PATH` | 起動時に、このプロファイルの順で VRAM のエキスパートを埋める |
+| `--expert-profile-save PATH` | この実行で学んだことをプロファイルとして書き出す |
+| `--adapt-every N` | VRAM のエキスパートを入れ替える間隔（窓の数、既定 4。0 で入れ替えない） |
+| `--adapt-swaps N` | 1 回に入れ替えるエキスパートの最大の数（既定 96） |
+| `--adapt-mib-per-token N` | 入れ替えで写す量の上限を、前の入れ替えから進んだトークンあたり N MiB にする（既定 48。0 で上限なし） |
+| `--mmap-experts` | エキスパートを RAM に読み込まず、モデルのファイルから読む |
+| `--no-pcie-split` | VRAM にないエキスパートを、すべて CPU で計算する |
+| `--pool-workers N` | エキスパートを計算する CPU のスレッドの数（既定は物理コアの数より 1 少ない） |
+| `--prompt-chunk N` | prefill で一度にまとめて計算する最大のトークン数（既定 4096、0 でまとめない） |
+| `--max-t N` | decode の窓の最大のトークン数（既定 8） |
+| `--spec N` | MTP の層の推測デコードの窓の最大のトークン数（既定 3: 下書き 2 個。0 で使わない） |
+| `--rope-scaling none\|linear\|yarn`、`--rope-scale F`、`--yarn-orig-ctx N` | 文脈の延長 |
+
 ### RAM がモデルより少ないとき（省 RAM モード）
 
 Unsloth の 2 つ以外のモデルは、すべてのエキスパートを RAM に置き、GPU はよく使うもののコピーを持ちます。
@@ -217,20 +295,29 @@ Unsloth の 2 つ以外のモデルは、すべてのエキスパートを RAM �
 （`--low-ram auto`、既定）。
 このときエンジンは、エキスパートを RAM にすべてコピーせずに、モデルのファイルから読みます。
 ネイティブの pack なら GGUF のファイルから、AVX-512 用の Q2_0 の pack ならその `experts.bin` からです。
+エンジンを直接起動して `--resident-experts` も `--mmap-experts` も付けなかった場合でも、空いている RAM がエキスパートの全体と 8 GiB に足りなければ、エンジンは `--resident-experts` と同じ形で起動し、そう 1 行出します（issue #10: 全体を読み込むと swap に入り、Intel の GPU では GPU のドライバーが持つメモリへ移した後で OS が RAM を取り返せずに止まりました）。
+`STRATA_ARENA_LOW_RAM=keep` で、足りなくても全体を読み込みます。
+全体を RAM に置いたときも、PCIe の分担のために GPU のドライバーのメモリ（host USM）へ移すのは、層ごとに RAM の空き（その層と `STRATA_HOST_USM_RESERVE_MIB`、既定 1024）があるときだけです。足りなければ移さず、外れたエキスパートは CPU が計算します。
 
 - GPU が持たないエキスパートが RAM に入るなら、起動時に一度 RAM にコピーします（`--resident-experts`）。
+  このコピーをページ固定するのは、コピーの後に空く RAM が、8 GiB と、なおモデルのファイルから読む分（GPU にもコピーにもないエキスパート）を合わせた量より多いときだけです（issue #11: RAM 31 GB の B70 で 17.5 GiB をページ固定したら、ファイルの読み直しの最中に GPU のコピーが止まりました）。
+  起動時に、どちらにしたかと、その数字を 1 行出します。`STRATA_RESIDENT_PIN=0` で常にページ固定せず、`1` で常にページ固定します。
   このときサーバーでは、適応する段の入れ替え（RAM のコピーと GPU のキャッシュの交換）を、検証の窓の間に裏のスレッドで少しずつ進めます（`--adapt-async`、upstream b437b8ea では opt-in、ここでは既定）。
   窓が入れ替えの 1 回ぶん全部を待つことはなくなります。
   RTX 4070 では 1 回に約 95 個を入れ替え、decode が 14〜15% 速くなりました（B70 は計測のばらつきの範囲）。
   どの窓が入れ替えたエキスパートを最初に GPU で計算するかがコピーの届く時刻で決まるので、実行ごとに答えが少し変わることがあります。
   `--adapt-async 0` で、窓が待つ従来の段に戻ります。
-  交換のバッファをページ固定できないときと、`--batch` のときは、従来の段で動きます。
+  交換のバッファをページ固定できないときと、`--batch-groups` で組をパイプラインにしたときは、従来の段で動きます（`--batch` のスロットでは、バッチの窓の間に進めます。upstream 495dc436）。
+  `--adapt-min-gain F`（既定 1.5）は、入れ替えに要る差（入れるエキスパートと出すエキスパートの、減衰させた使用回数の差）です。大きくすると、1 回に入れ替える数が減ります。どちらの段でも効きます。
   `--pipeline-windows 2`（[MULTIGPU](MULTIGPU.ja.md)）では、各カードのコピーをそのカードに窓がないときに decode のループが積み、追い出したスロットへのコピーと RAM への移動は、決めたときに実行中だった窓が終わるのを待ちます（upstream 13eee452、`STRATA_PIPELINE_ADAPT_ASYNC=0` で従来の段）。
   `STRATA_EXCHANGE_ROTATE=1`（opt-in、upstream 1e6cec80）は、入れ替えのときに追い出したエキスパートを RAM のコピーへ写さず、交換のバッファの持ち主を渡します（同じトークンで、ホストのコピーが減ります）。
   エキスパートの大きさが全部同じ pack（AVX-512 用の Q2_0 の `experts.bin`）で、RAM のコピーが全部ページ固定のときだけ働きます。
   層ごとに大きさの違うネイティブの pack では働かず、ログにそう出して従来のコピーで動きます。
 - 入らないなら、OS のファイルキャッシュ経由で読みます（`--mmap-experts`）。
   動きながら SSD から読み直すので、遅くなります。
+  GGUF のファイルから読むとき、prefill は SSD 向けの多いスレッドと深いリングでエキスパートをコピーします。
+  最初の prefill でエキスパートのページの 90% 以上がすでにページキャッシュにあれば（Linux の `mincore` で見本を調べます）、RAM 向けの少ないスレッドに切り替え、ログにそう出します（upstream 83a7dbc0、#1353）。
+  `STRATA_STAGER_SSD=1`・`0` でどちらかに決められます。
 
 `--low-ram on|off|resident|mmap` で選び直せます。
 `./setup.sh --check` は、それぞれの大きさでどうなるかを示します。
@@ -325,6 +412,7 @@ setup はそこでファイルを見つけ、設定を書き直します。
   会話はブラウザに保存されます。
 - **Monitor**: モデルが何をしているか（prefill 中ならその進み具合、decode 中ならその速さ）、
   GPU の負荷、VRAM、温度、電力、PCIe の通信量、CPU、RAM、ディスク、使っている文脈、最近の要求です。
+  会話のキャッシュのカードには、prefill のトークンのうちキャッシュから戻せた数（最後の要求と起動から）と、`--conversation-cache-mib` を入れていれば、置いた会話の数とメモリ、置いた・戻した・追い出した回数が出ます（upstream #596。`/metrics` の `"conversation_cache"` にも同じもの）。
 - **About**: モデルとエンジンの設定、ほかのアプリをつなぐアドレスです。
 
 `http://127.0.0.1:8095/?q=質問` を開くと、その質問をした新しい会話から始まります。
@@ -349,13 +437,17 @@ RAM に 23〜50 GB を読み込むのに時間がかかりますが、何もダ�
 ./setup.sh --gpus 1,2                       2 枚以上の GPU に層を分けて載せる（記録される。docs/MULTIGPU.ja.md）
 ./setup.sh --vram-reserve-mib 2048          ほかのプログラムのために VRAM を 2 GB 空けておく（記録される）
 ./setup.sh --no-browser                     準備ができてもチャットのページを開かない（記録される。--browser で戻す）
-./setup.sh --calibrate                      この PC に合わせてエンジンを調整してから起動する（5〜10 分）
+./setup.sh --calibrate                      この PC に合わせてエンジンを調整してから起動する（15〜30 分、遅いカードではもっと）
 ./setup.sh --check                          この PC を調べるだけ
 ```
 
 **更新**: `./update.sh` を実行します。
 git で取得したものなら `git pull` してから、エンジン、Python のパッケージ、モデルの設定を更新します（モデルは起動しません）。
 エンジンのソースが変わっていればコンパイルし直し、それに失敗したらそう言って、前のエンジンのままにします。
+
+**新しいリリースの確認**: サーバーは起動したときと、その後 6 時間ごとに GitHub に MistVVK/XeStrata の最新のリリースを問い合わせ、今のものより新しければ端末に 1 行出して、チャットのページの About に表示します。
+About の「Check now」と `./setup.sh --check-update`（パッケージでは `xestrata --check-update`）は、いつでもその場で調べます。
+環境変数 `XESTRATA_UPDATE_CHECK=0` で自動の確認を止めます（「Check now」と `--check-update` は使えます）。
 
 ### ほかのプログラムのために VRAM を空ける
 
@@ -406,6 +498,7 @@ setup は、選んだときにそう言います。
   決まった割合は、その分け方より 3% を超えて速いときだけ使います。
 - 推測の層がどれだけ確かなら、確かめる候補をもう 1 つ足すか（`--spec-min-p`）。
 - エキスパートを計算する CPU のスレッドの数（`--pool-workers`）。高効率コアのある CPU では、少ない方が速いことがあります。
+  高効率コアが性能コアより多い CPU では、調整の前から、setup が性能コア（host の 1 つを除く）と高効率コアの半分を設定に書きます（upstream #642）。
   P コアの数より 1 つ少ない数と、2 ソケットの PC では 1 ソケットのコアの数より 1 つ少ない数も試します。
 - VRAM のエキスパートのキャッシュが会話にどれだけ追いつくか（`--adapt-every`、`--adapt-swaps`、`--adapt-decay`、upstream #907）。
   見落としたエキスパートを CPU が遅く読む PC（DDR3 や、チャネルの少ない DDR4）では、多く入れ替える方が速くなります。
@@ -428,6 +521,15 @@ worker の数を測るにはエンジンを起動し直すので、モデルを�
 同じ worker の数と同じ負荷で、`0` と比べて決めてください。
 カーネルや段の区切り、PCIe への振り分けは変わりません。`--calibrate` はまだこの値を測りません。
 サーバーでは、設定ファイルの `args` に `"--pool-tasks", "192"` のように足して起動し直します。
+
+`--aux-cpus` は、CPU のプールの worker でも host でもないスレッドを、どの CPU で動かすかを決めます（Linux、既定は `off`、upstream 91f1e85d）。
+対象は、エキスパートのキャッシュの入れ替え、prefill のコピー、ファイルの読み込み、GPU のランタイムのスレッドなどです。
+`auto` は、host のコアの SMT の相方、次に worker のいない物理コアの CPU を使います。worker とコアを分け合う CPU は使わず、空きがなければ何もしません。
+`24,26` のように CPU を並べることもできます（host と worker の CPU は除きます）。
+スレッドを動かすだけで、答えは変わりません。
+`STRATA_AUX_CPUS` でも設定でき、API の `"strata_tune": {"aux_cpus": 1}`（`0` で元に戻す）で要求ごとに切り替えられます。
+`STRATA_AUX_STAGER=0` にすると、prefill のコピーのスレッドだけは動かしません。
+RX 9060 XT と Ryzen 7 5700X の serve（IQ3_XXS、5 回交互）では、`auto` で 1K の prefill と 32K の追質問の待ちは速くなりましたが、32K の prefill が 3.2% 遅くなったので、既定は `off` のままです。
 
 ### 端末で会話する
 
@@ -516,6 +618,7 @@ server は `http://127.0.0.1:8095` で待ち受けます（setup の `--port`、
 | モデルの属性 | `GET /props`（`?model=<読み込んだモデルの id>` も受け付ける） |
 | モデルがいま何をしているか | `GET /status`、`GET /slots`（スロットは 1 つで、busy か idle） |
 | Monitor のタブが示すすべて（エンジン、いまの状態、最近の要求、ハードウェア） | `GET /metrics` |
+| 同じものを Prometheus の形で（vLLM の名前、`Accept: text/plain` か `?format=prometheus`） | `GET /metrics` |
 | MCP サーバーとその状態とツール（[下](#mcp-サーバーのツールを使う)） | `GET /mcp` |
 
 `/models` と `/v1/models` は、読み込んだモデルだけを、文脈の上限と入力の種類とともに示します。
@@ -552,6 +655,8 @@ print(r.choices[0].message.content)
 | Anthropic | `"output_config": {"effort": "low" \| "medium" \| "high"}`、`"thinking": {"type": "disabled"}`、`"thinking": {"type": "enabled", "budget_tokens": N}`（2K 未満は low、8K 未満は medium、それ以上は high） |
 
 指定がなければ、モデル自身の既定の **high** になります。
+実行の設定に `"reasoning_effort": "low"`（`none`、`medium`、`high` も）を書くと、指定のない要求はその深さになります（upstream #1641）。
+`args` に書いた `--reasoning-effort` は、server がここへ移して知らせます。
 `none` はすぐに答え、いちばん速く、`low` は思考を短くします。
 深さは、モデルが学習した指示で、トークン数の厳密な上限ではありません。
 易しい質問では 3 つとも短く考え、難しい質問では `high` がいちばん長く考えて、いちばん正確です。
@@ -571,6 +676,14 @@ print(r.choices[0].message.content)
 - **1 つのトークンを繰り返す返答は打ち切ります**: 返答が同じトークンを 256 回続けたら、server はそこで `finish_reason` を `"length"` にして終え、ウィンドウにそう表示します。
   ループに入ったモデルや、1 つのトークンを出し続ける壊れた状態のためです（upstream の #606 では `!` が 36,689 個続きました）。
   `xestrata-<model>.json` の `"repeat_stop_tokens": N` で回数を決め、`0` で止めません（本当に同じトークンを何度も求める要求のため）。
+- **logits が NaN になったら要求を終え、使い回す状態を捨てます（既定）**: まれに窓の logits が NaN になり、返答がトークン 0（`!`）の繰り返しになります（upstream の #606、#879）。
+  毒は会話の K/V と再帰の状態に残るので、そのままでは使い回した後のターンもすべて壊れます。
+  `--serve` のどの窓（decode、層分割の `--pipeline-windows`、プロンプトの短い残り、バッチの枠）も、貪欲の選択の隣で head の logits を GPU で確かめます（小さなカーネルが page-lock したフラグに書き、窓がもともと待つ同期の後で読みます）。
+  引っかかった窓のトークンは出さず、エンジンは位置を 1 行書いて要求を `DONE ... nonfinite`（枠は `BDONE <slot> <n> nonfinite`）で終えます。
+  次の要求は、生きているセッション、すべてのチェックポイント、預けた会話、空いている枠を捨ててから、プロンプトをトークン 0 から読みます（動いている枠は返答を終えますが、後で使い回しません）。
+  server は、まだ何も送っていない要求を 1 回だけ黙って送り直し、送り始めていた返答は `"length"` で終えます。送り直しでもう一度起きたら要求はエラーです（答えの前なら 503、ストリームではエラーのイベント）。
+  カーネルはフラグを書くだけなので、NaN のない答えは `STRATA_NAN_GUARD=0`（カーネルを入れない）と同じです。
+  試しのスイッチ: `STRATA_NAN_INJECT=<n>[,<n>...]` で、エンジンが確かめる n 番目の窓を NaN として扱います。
 - **思考を求めない Anthropic の要求（任意）**: 既定では、`"thinking"`、深さ、上限のどれもない `/v1/messages` の要求は、モデルのテンプレートどおりに考えます。
   `xestrata-<model>.json` に `"anthropic_thinking": "on_request"` を書くと、そうした要求を思考なしで処理します。
   Anthropic 自身の規則で、Claude Code の短い補助の呼び出し（数十トークンで会話の題を付けるものなど）に要ります。
@@ -643,7 +756,7 @@ print(r.choices[0].message.content)
   ファイルのほかのキーはそのまま残し、前のファイルを `xestrata-<model>.json.bak` に残し、モデルは次の起動から変更を使います。
   保存できるのは XeStrata 自身のページだけです（JSON、API キーがあればそれも。Chat の設定と同じ）。ネットワーク、キー、MCP、プログラムのキーは、そこでは変えられません。
 - **同じネットワークのほかの機器から**: 指定しなければ、server はこの PC（`127.0.0.1`）でだけ待ち受けます。
-  `./setup.sh --setup --host 0.0.0.0 --api-key 長い秘密の文字列` で setup するか、`xestrata-<model>.json` に `"host": "0.0.0.0"` と `"api_key": "..."` を書きます。
+  `./setup.sh --host 0.0.0.0 --api-key 長い秘密の文字列` で起動するか（モデルの設定に保存され、次からも使われます）、`xestrata-<model>.json` に `"host": "0.0.0.0"` と `"api_key": "..."` を書きます。
   server のウィンドウに、この PC のアドレスが出ます（`from other devices: http://192.168.x.x:8095/`）。
   ほかの機器でそれを開くか、`.../v1` を API のベース URL に使います。
 - **インターネットから**: 前にトンネルを置きます。
@@ -651,6 +764,7 @@ print(r.choices[0].message.content)
   `cloudflared tunnel --url http://127.0.0.1:8095` です。
   **先にキーを設定します**。そうしないと、リンクを知っている誰でもこの PC を使えます。
   `xestrata-<model>.json` に `"api_key": "長い秘密の文字列"` を書く（または環境変数 `STRATA_API_KEY`）と、クライアントはそれを API キーとして送ります。
+  カンマで区切ると、複数のキーを受けます（`"key1,key2"`、llama.cpp と同じ。`--api-key key1,key2` も同じ）。
   空の API キーを指定すると、server は起動しません（認証を切ることになるためです）。
   ストリーミングの答えには `X-Accel-Buffering: no` を付けるので、nginx のようなプロキシも 1 トークンずつ渡します。
   ウェブの画面の設定と MCP のツールは、XeStrata 自身のページにだけ答えます。
@@ -690,6 +804,7 @@ print(r.choices[0].message.content)
 持っている部分とは、いまのセッションか、RAM に置いたチェックポイント（最大 6 個、それぞれ約 118 MB）のどれかです。
 チェックポイントは、アシスタントの新しい発言の始まりと、プロンプトの 16K トークンごとに取ります。
 プロンプトがそのトークンと画像で正確に始まるときだけ、チェックポイントを使います。
+アシスタントの発言の始まりのチェックポイントは、ページ固定した RAM の作業領域へまとめて写すだけにして、普通の RAM への書き込みは返答の後に回します（RTX 4070 では続きの要求の待ちが 1 回 30〜40 ms 短くなります。`STRATA_CKPT_STAGE=0` で返答の前に書き込みます）。
 
 いちばん古いチェックポイントは、ずっと残します。
 これは実際にはシステムプロンプトの終わりで、同じクライアントのどの会話も共有する部分です。
@@ -734,11 +849,25 @@ B70 の IQ2_XS で 1,791 トークンのプロンプトに 3 つの問いを続�
   会話は、トークン、画像、制御ベクトルの設定だけで見分けます。
 - 既定は 0（オフ）で、`--prompt-cache 0` でもオフになります。
   置いた会話は、[次の節](#置いた会話を再起動後も使う任意)の設定がなければ、再起動をまたいで残りません。
-- コピーの前に、`--conversation-cache-min-free-mib N`（既定 2560）の RAM が空いたままか（`MemAvailable`）を確かめます。
-  空かないとき、またはコピーが予算に入らないときは、置かずにこれまでどおりプロンプトを読みます。
-  いちばん古い会話から捨てます。
+- コピーの前に、`--conversation-cache-min-free-mib N`（既定 2560）の RAM が空いたままかを確かめます（使える RAM の読み方は下）。
+  足りなければ、古い会話から追い出しながら確かめ直します（upstream 940011da）。
+  それでも足りないとき、またはコピーが予算に入らないときは、置かずにこれまでどおりプロンプトを読みます。
+  予算に入れるためにも、いちばん古い会話から捨てます。
+- `--conversation-cache-min-tokens N`（既定 0 = すべて）で、N トークン以上の会話だけを置きます（upstream 624070c5）。
+  置いた会話は長さによらずスロットを 1 つ使うので、長い会話の合間に短い横の要求を挟むクライアントでは、短い要求がスロットを埋めて長い会話を追い出していました。
 - 戻すコピーに失敗したら、半分の状態から答えずに、エンジンを止めます。
 - 戻したあと、変わっていない K/V のページは次のコピーで使い回します（`STRATA_SNAPSHOT_FULL_CAPTURE=1` で使い回しを切ります）。
+
+**使える RAM の読み方**（upstream daa76552）: 会話を置くときと、会話のファイルの保存と復元のときに確かめる RAM は、次の 3 つの小さい方です。
+
+1. `MemAvailable`
+1. エンジンの cgroup とその上の cgroup のメモリの上限（v2 の `memory.max` と `memory.high`、v1 の `memory.limit_in_bytes`）から、使っている量を引いたもの。
+   使っている量からは、汚れていない使われていないファイルのキャッシュ（`memory.stat` の `inactive_file`）を差し引きます。
+   読めない cgroup のファイルがあれば、`--memory-limit-mib` がないときは警告を 1 度出して `MemAvailable` だけを使い、あるときはわからないとして置きません。
+1. `--memory-limit-mib N`（または `STRATA_MEMORY_LIMIT_MIB=N`。フラグが優先し、0 は上限なし）から、エンジンのコンテナがいま使っている量を引いたもの。
+   コンテナが自分の上限を見られないときに、そのコンテナが使ってよい合計を MiB で書きます。
+
+`--serve` で起動すると、エンジンはこの内訳を `memory guard:` の 1 行で出します。
 
 B70 の IQ2_XS で測ると、970 トークンの会話（文脈 8K、FP16 の KV）は 251 MiB で、置くのに 70〜104 ms、戻すのに 21〜23 ms かかりました。
 答えと状態は、置かない実行とバイト単位で同じでした。
@@ -776,7 +905,7 @@ B70 の IQ2_XS で測ると、9,183 トークンの会話（INT8 の KV、チェ
 再起動のあと、CPU 直結の NVMe から 0.28 秒で読んで戻し、新しい 7 トークンだけを読みました（ファイルがないと 9,167 トークンを 7.9 秒で読み直します）。
 答えは、再起動しなかった実行と同じです。小さい GPU の設定（8 GB、XMX なし）でも同じでした。
 書き込みは、300〜360 MiB の会話で 0.10〜0.16 秒です。追い出すときは、この分だけ次の要求が遅れます。
-圧縮すると、同じ会話は 421 MiB になり、読んで戻すのに 0.30 秒、書くのに 0.23 秒かかります（[記録](../bench/results/2026-10-04-conversation-save-compress/README.md)）。
+圧縮すると、同じ会話は 421 MiB になり、読んで戻すのに 0.30 秒、書くのに 0.23 秒かかります。
 
 ### 会話をファイルに保存して戻す（任意）
 
@@ -796,6 +925,9 @@ curl -X POST "http://127.0.0.1:8095/slots/0?action=restore" -H "Content-Type: ap
   ファイルは会話のトークンと状態を持ち、0600 で作ります。消すのは利用者です。
 - `filename` は DIR の中のファイル名だけです。パス、ドライブ、`:`、Windows のデバイス名、制御文字、先頭の `.`、末尾の `.` と空白は受け付けません。
 - 保存の前に、新しいファイルの大きさに `--session-min-free-mib`（エンジンの引数、既定 4096、0 で確かめない）を足した空きがディスクにあるかを確かめます。
+- `--session-save-reclaim`（エンジンの引数、既定はオフ、upstream 73ed39ae）: 保存の前の RAM の確認に通らないとき、作り直せるホストのキャッシュを放してから確かめ直します。
+  放すのは、持っている K/V の控え、固定していない古い置いた会話、ファイルに書くもの以外の固定していないチェックポイントの順です。
+  固定した先頭と書くチェックポイントは残します。server は、放した RAM が数字に表れるのを最大 30 秒待ってから試し直します。
 - 戻せるのは、同じ版のエンジンが、同じモデルのファイルと同じ設定（KV の精度、文脈の長さ、MTP、制御ベクトルなど）で書いたファイルだけです。
   合わないファイルや壊れたファイルは断り、エンジンの会話はそのままです。
 - 保存するのは、最後の発言の始まりのチェックポイントだけです。それより前を編集した続きは、そこから読み直します。
@@ -824,11 +956,15 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
   ブロックがなければ、サンプリングの項目のない要求は貪欲に生成します。
 - ペナルティ（`presence_penalty`、`frequency_penalty`、`repetition_penalty`）も同じ経路で効きます。
   `penalty_last_n` は数える直近のトークン数の上限で、どれかのペナルティがあれば既定は 64 です。
+  llama.cpp の名前の `repeat_penalty` と `repeat_last_n` も、設定の `sampling` と要求で使えます（upstream #1819）。
   要求が使ったトークンを数えるので、繰り返しのペナルティはプロンプトだけでなく、モデル自身がいま書いたものも抑えます。
   推測の検証では、まとめて確かめるどのトークンにも、1 つずつ生成したのと同じにペナルティをかけます。
   推測の層はペナルティなしで候補を出すので、ペナルティのある要求は候補が外れやすく、そのぶん遅くなります。
 - `top_k` の候補は最大 64 です。
   `0`（オフ）や 64 を超える値は、64 個すべてを使います。
+- サンプリングの欄の数字の文字列（`"0.7"`）は読んで使い、数として読めない値と型の違う値（`true` など）は、その欄の名前を言って 400 にします（upstream #1663）。
+- **logit_bias**: `/v1/chat/completions` の `"logit_bias"`（`{"<トークンの id>": -100〜100}`、または `[id, 重み]` の組の並び）を、ペナルティやフィルターより前に足します（upstream dcc6f756）。
+  -100（組の並びでは `false`）はそのトークンを使わせません。並列の要求（`"parallel"`）では使えません。
 - `STRATA_SPEC_GUMBEL=1`（opt-in、upstream 6381df34）は、温度ありの要求のトークンを Gumbel-max で選びます。
   確率の高い順の累積ではなく、トークンの id ごとの乱数で選ぶので、選ばれ方の分布は同じまま、`--coupled-draft` の下書きが対象モデルの選ぶトークンと揃いやすくなります。
   `--coupled-draft` と合わせて、温度 1.0・top_p 0.95・top_k 20、200 トークンの物語とコードの答え 8 つを 3 回ずつ測ると、decode の中央値は RTX 4070 で 51.05 から 52.05 トークン/秒（+2.0%）、B70 で 80.25 から 72.75 トークン/秒（−9%）でした。
@@ -1104,6 +1240,7 @@ Monitor は、要求ごとに ESP か stock かを示します。
 
 **有効にする（setup で）**: `./setup.sh --setup` が「Turn on the experimental speed projection?」と尋ねます（既定は no）。
 または `--experimental-speed-projection on`（`off`、または別のベクトルの GGUF のパス）を渡します。
+deb と rpm のパッケージにはベクトルが入っていないので、有効にすると、setup が入れた版のタグから GitHub にあるベクトルとそのライセンスをデータフォルダの `experimental-speed-projection/` にダウンロードします。
 元の Qwen3.8-Flash-Next だけで使え、Swift 1.5 では使えません。
 setup は、次のエンジンの設定（llama.cpp のもの）を `xestrata-<model>.json` に書きます。
 
@@ -1144,6 +1281,7 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | `building for the AMD GPU needs ROCm's ...` | AMD の GPU のコードを作る ROCm のパッケージが足りません。示されたものを入れて、setup をやり直します（`./setup.sh --packages` も参照）。 |
 | `... has no HIP target (AMD GPUs)` | intel/llvm が、ROCm を入れる前にビルドされています。setup が尋ねたら作り直すか、`python3 tools/intel_llvm_build.py --rebuild` を実行します。 |
 | `an AMD GPU needs the free or contrib build` | `--license contrib-icpx` を選んでいます。icpx には AMD の対象がないので、`--license free` か `--license contrib` で setup をやり直します。 |
+| Linux で `no progress for 60 s ... reading the prompt` と出て、止まったときの報告に `threads waiting on the disk (state D): 16 ...` がある | エンジンが止まったのではなく、ドライブを待っています。n-gram の表をランダムに読む（`--ple-io direct`）のに、回転ディスクが追いつきません（upstream #605）。表が回転ディスクにあると、エンジンは起動時に警告します。`--ple-io ram`（表の分の RAM が要ります）か、モデルを SSD に置くと直ります。setup は、回転ディスクで RAM に表が入るなら、自分で `--ple-io ram` を付けます。 |
 | `the SYCL runtime of ... lists no GPU` | GPU の Level Zero のドライバー（`libze-intel-gpu1`、Intel の compute-runtime）がないか、その GPU には古すぎます。新しいものを入れます（[BUILD.ja.md](BUILD.ja.md#パッケージ)）。 |
 | `... gives this GPU no XMX` | そのコンパイラでは GPU の XMX が使えません。setup の選択肢から選びます。XMX なしでも動き、prefill に約 1.6 倍の時間がかかります（[BUILD.ja.md](BUILD.ja.md#sycl-のコンパイラ)）。 |
 | `no SYCL compiler for the engine` | SYCL のコンパイラがありません。ディストリビューションの DPC++ を入れるか、`--intel-llvm-build` を付けます。 |
@@ -1161,7 +1299,9 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | 画像が断られる、`cannot read the image` | Pillow で開けない画像のファイルです（JPEG、PNG、WebP、GIF、BMP、TIFF、AVIF は使えます）。 |
 | 画像が遅い | エンコーダーが CPU で動いています。`--vision gpu` で setup をやり直します。 |
 | 要求が終わらない（`no progress for ... s`） | エンジンの処理が進まなくなると、要求は（1 分後に）エラーで終わり、次の要求でエンジンを起動し直します。ログには、どこで止まったかと、CPU のプールの各スレッドと GPU との受け渡しが何をしていたかが出ます。見かけたら、その報告を添えて issue を立ててください（`STRATA_WATCHDOG_S` で秒数を変え、0 で切ります）。 |
+| 要求の途中でエンジンが止まった（Web アプリにトーストと、Monitor の状態に「Engine stopped」） | GPU のランタイムがカーネルの起動を断った（VRAM や資源が足りない）か、GPU が応答しなくなった、などの例外です。エンジンは、何をしていたか（段階と prompt の区切り）、SYCL と Unified Runtime のエラーの番号、VRAM の空き、GPU がまだ応答するか（Level Zero の `zeDeviceGetStatus`）を 1 行に書いて終わり、次の要求で起動し直します（issue #10）。`level_zero backend failed with error: 40` は、Level Zero ではデバイスのメモリ不足でも資源不足でも同じ番号で出ます。GPU が「lost」なら、`sudo dmesg` の xe の行と PCIe の AER の行を添えて issue を立ててください。 |
 | `the engine said nothing for ... s during the request` | エンジンと server の歩調がずれました（エンジンは次の指示を、server は要求の終わりを待っていて、GPU は 0%、ログにも何も出ない。upstream #481）。server は、要求の間にエンジンから 300 秒何も来なければエンジンを終わらせ、要求はエラーで終わり、次の要求でエンジンを起動し直します。`xestrata-<model>.json` の `"engine_silence_s": 600` で時間を変えます（0 で、以前どおりいつまでも待つ）。 |
+| `the engine said nothing for ... s and used no CPU or disk in that time (frozen ...)` | 上の見張りの速い版です（upstream #1317）。エンジンが何も出さず、CPU もディスクも使わないまま 90 秒たつと、止まっているとみなして終わらせ、次の要求で起動し直します。GPU が動いているとき（使用率 10% 以上）と、何も出さなくても働いているときは終わらせず、1 度だけ知らせます。`STRATA_ENGINE_STALL_S` で秒数を変えます（0 で切る）。プロンプトの層がファイルの段を読み直している間（メモリが少ないとき）は、エンジン自身の見張りも最大 10 倍まで待ちます（`STRATA_WATCHDOG_IO_S`、upstream #1407）。 |
 | ほかのこと | エンジンのログは、XeStrata のフォルダーの `xestrata-<model>.log` です。issue を立てるときは、これを添えてください。 |
 
 ---
@@ -1178,7 +1318,7 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
   GPU にないエキスパートは、CPU がその場で計算し、GPU がキャッシュにあるものを計算するのと同時に進めます（AVX-512 と AVX2 のカーネル、i-quant には ggml のもの。AVX-VNNI のある CPU では Q2_0 と IQ4_NL の内積をそれで計算し、`STRATA_NO_AVXVNNI=1` で AVX2 に戻せます）。
 - **SSD**: 28.8 GB の n-gram の表を置き、1 トークンごとに数行だけを OS のキャッシュ経由で読みます。
 - **推測**: モデル自身の MTP の層が最大 3 トークンを推測し、48 層すべてを 1 回通して確かめます。
-  B70 では、1 回の確認で平均 2.1〜3.4 トークンを進めます（[記録](../bench/results/2026-10-03-mtp-accept/README.md)）。
+  B70 では、1 回の確認で平均 2.1〜3.4 トークンを進めます。
   答えが文脈を繰り返すとき（コードの編集、引用）は、**プロンプト照合**が、前に出てきた部分から最大 5 トークンを推測します。
   ただし、測った当たり方と費用から、得になるところでだけ使います。
   推測は MTP のものと同じに確かめるので、出力は変わりません。
@@ -1213,9 +1353,13 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
 - **[intel/llvm](https://github.com/intel/llvm)** の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib-llvm のコンパイラと SYCL のランタイム。
   リポジトリには含めず、`tools/intel_llvm_build.py` がリリースを取ってきてビルドします。
   そのとき当てる XeStrata の修正は `third_party/main/intel-llvm/patches/` にあり、intel/llvm と同じライセンスです。`third_party/main/intel-llvm/LICENSE.TXT` を参照。
-- **参考にした考え方**: [Splash](https://github.com/incoai/splash)、[ninfer](https://github.com/Neroued/ninfer)、[HyperQwen](https://github.com/syv-ai/HyperQwen)、
-  [Project Maya](https://github.com/mw00/project-maya)（VRAM にないエキスパートを CPU と PCIe に分ける数の決め方、[XE](XE.ja.md#外れたエキスパートの-cpu-と-pcie-への分け方)）。
-  文献は論文にあります。
+- **参考にした考え方**（文献は論文にあります）:
+   - Inco AI と Splash の貢献者による [Splash](https://github.com/incoai/splash)。
+   - Neroued による [ninfer](https://github.com/Neroued/ninfer)。
+   - syv.ai と HyperQwen の貢献者による [HyperQwen](https://github.com/syv-ai/HyperQwen)。
+   - mw00 と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)
+     （VRAM にないエキスパートを CPU と PCIe に分ける数の決め方、[XE](XE.ja.md#外れたエキスパートの-cpu-と-pcie-への分け方)）。
+   - maxfridbe による [nextsycl](https://github.com/maxfridbe/nextsycl)（Qwen3.5 系のモデルの decode でカーネルをまとめるやり方。コードは書き起こし）。
 - **ウェブの画面のフォント**: [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1、`third_party/main/outfit/OFL.txt`。なければシステムのフォントを使う）。
   Monitor のタブは @code-martin のダッシュボードの案（PR #22）から始まりました。
 - **`third_party/nonfree/`**: Qwen Community License 1.0 で、自由ソフトウェアではありません。XeStrata はこれなしでも動きます。

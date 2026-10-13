@@ -11,12 +11,15 @@
 //         also the same at every width, #152); the scalar rows against ggml-cpu's vec_dot (Q2_0: a double
 //         reference), rel <= 1e-5; and where the engine's dispatch (native_gu_rows) takes the multi-token kernel from
 //         one token on (native_gu_mt_min), each token's rows the same alone and in a group.
-//     iq_avx2_parity --bench [--cpu N] [--nt 1,2,3,4] [--mb 256] [--reps 5] [--pairs iq3_s/iq4_nl,...] [--dispatch]
+//     iq_avx2_parity --bench [--cpu N] [--nt 1,2,3,4] [--mb 256] [--reps 5] [--pairs iq3_s/iq4_nl,...]
+//                    [--shape 2560x640] [--dispatch]
 //         ms per expert on one thread: each variant, ggml-cpu's per-token dot, and the engine's dispatch
 //         (native_gu_rows, native_down_rows / q2_rows_any) over --mb MB of expert blobs - far more than an L3 holds, so
 //         the weights stream from DRAM as they do in decode.  --dispatch: only the kernels' own dispatch, ggml and the
 //         engine's (the env decides: STRATA_IQ256_GATHER, STRATA_NO_AVXVNNI, STRATA_IQ_MT_MIN), for A/B runs against
-//         another build.  --cpu pins the thread to that logical CPU.
+//         another build.  --cpu pins the thread to that logical CPU.  --pairs takes any gate/up and down types
+//         ggml-cpu multiplies (q6_k/q6_k, q4_k/q8_0, ...): a pair without kernels of its own measures ggml-cpu and the
+//         engine's dispatch only, at --shape (n_embd x expert width: 2048x512 Ornith-1.5, 2560x960 llm-jp-4.1).
 //
 // Built with -DSTRATA_IQ_PARITY_DISPATCH_ONLY=1 it calls only the kernels' public entry points, so the same program
 // builds on an engine from before the variants (--bench --dispatch against it).
@@ -60,7 +63,7 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-constexpr int64_t kH = 2560, kFF = 640;   // the experts' geometry: n_embd, expert width
+int64_t kH = 2560, kFF = 640;   // the experts' geometry: n_embd, expert width (--shape for the bench)
 constexpr int kMaxT = 8;
 
 // ---- the variants: the public dispatch only in a DISPATCH_ONLY build
@@ -82,6 +85,9 @@ void q2_rows_v(int, const uint8_t* w, size_t row_bytes, const cpu::ActQ* const* 
     cpu::q2_0_gguf_rows_multi_avx2(w, row_bytes, (int) (kFF / 64), a, nt, out, 0, (int) kH);
 }
 std::string variant_name(int) { return "dispatch"; }
+bool kq_type(int) { return false; }
+void kq_gu_v(int, int, const uint8_t*, size_t, size_t, const void* const*, int, float* const*) {}
+void kq_dn_v(int, int, const uint8_t*, size_t, const void* const*, int, float* const*) {}
 #else
 constexpr bool kVariants = true;
 int gu_variants() { return cpu::iq256_variants(); }
@@ -106,6 +112,17 @@ std::string variant_name(int v) {
     if (v & cpu::kIq256Vnni) s += s.empty() ? "vnni" : "+vnni";
     return s;
 }
+// the K-quants' and Q8_0's multi-token kernels (kq256_*, q80_256_*): AVX2 or AVX-VNNI, no other variant
+bool kq_type(int type) { return cpu::kq256_supported(type) || type == 8; }
+void kq_gu_v(int v, int type, const uint8_t* blob, size_t gu_row, size_t up_off, const void* const* act, int nt,
+             float* const* ff) {
+    if (type == 8) cpu::q80_256_gu_rows_v(v, blob, gu_row, up_off, (int) kH, act, nt, ff, 0, (int) kFF);
+    else cpu::kq256_gu_rows_v(v, type, blob, gu_row, up_off, (int) kH, act, nt, ff, 0, (int) kFF);
+}
+void kq_dn_v(int v, int type, const uint8_t* w, size_t row_bytes, const void* const* hq, int nt, float* const* out) {
+    if (type == 8) cpu::q80_256_rows_v(v, w, row_bytes, (int) kFF, hq, nt, out, 0, (int) kH);
+    else cpu::kq256_rows_v(v, type, w, row_bytes, (int) kFF, hq, nt, out, 0, (int) kH);
+}
 #endif
 
 // every subset of a variant mask, the empty one (scalar) first
@@ -125,18 +142,32 @@ uint64_t mix(uint64_t& s) {   // splitmix64
 
 const ggml_type_traits_cpu* traits_cpu(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
 
-// random bytes, then a sane fp16 scale at the front of every block (each format here starts its block with it)
+// Where a block keeps its fp16 scales: the front for the i-quants, Q8_0 and Q5_0; Q4_K and Q5_K d and dmin first;
+// Q6_K, Q3_K and Q2_K after their quants (ggml-common.h's block structs)
+std::vector<size_t> scale_offsets(int type) {
+    switch (type) {
+        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: return {0, 2};
+        case GGML_TYPE_Q6_K: return {208};
+        case GGML_TYPE_Q3_K: return {108};
+        case GGML_TYPE_Q2_K: return {80, 82};
+        default: return {0};
+    }
+}
+
+// random bytes, then sane fp16 scales where every block keeps them
 void fill_blocks(uint8_t* p, size_t bytes, int type, uint64_t& seed) {
     for (size_t i = 0; i < bytes; i += 8) {
         const uint64_t v = mix(seed);
         std::memcpy(p + i, &v, std::min<size_t>(8, bytes - i));
     }
     const size_t bs = ggml_type_size((ggml_type) type);
-    for (size_t o = 0; o + bs <= bytes; o += bs) {
-        const float d = (0.5f + (float) (mix(seed) >> 40) * (1.f / 16777216.f)) * 1e-3f;
-        const ggml_fp16_t h = ggml_fp32_to_fp16(d);
-        std::memcpy(p + o, &h, 2);
-    }
+    const std::vector<size_t> offs = scale_offsets(type);
+    for (size_t o = 0; o + bs <= bytes; o += bs)
+        for (size_t at : offs) {
+            const float d = (0.5f + (float) (mix(seed) >> 40) * (1.f / 16777216.f)) * 1e-3f;
+            const ggml_fp16_t h = ggml_fp32_to_fp16(d);
+            std::memcpy(p + o + at, &h, 2);
+        }
 }
 
 void fill_blob(uint8_t* blob, const cpu::NativeFmt& f, uint64_t& seed) {
@@ -398,11 +429,13 @@ int bench(const std::vector<std::string>& pairs, const std::vector<int>& nts, in
         const int dt = slash == std::string::npos ? -1 : type_of(pair.substr(slash + 1));
         cpu::NativeFmt f;
         std::string err;
-        if (gt < 0 || dt < 0 || !cpu::native_fmt(gt, dt, kH, kFF, f, err) || !cpu::iq256_supported(gt) ||
-            (dt != 20 && dt != 42)) {
-            std::printf("%s: not a gate/up i-quant with an IQ4_NL or Q2_0 down %s\n", pair.c_str(), err.c_str());
+        if (gt < 0 || dt < 0 || !cpu::native_fmt(gt, dt, kH, kFF, f, err)) {
+            std::printf("%s: not a pair of types ggml-cpu multiplies at %lld x %lld %s\n", pair.c_str(), (long long) kH,
+                        (long long) kFF, err.c_str());
             return 2;
         }
+        // the AVX-2 kernels' own variants for the pairs they implement; any other pair: ggml-cpu and the engine only
+        const bool own = cpu::iq256_supported(gt) && (dt == 20 || dt == 42);
         const size_t E = std::max<size_t>(16, ((size_t) mb << 20) / f.bytes);
         std::unique_ptr<uint8_t[]> mem(new uint8_t[E * f.bytes + 64]);
         uint8_t* blobs = (uint8_t*) (((uintptr_t) mem.get() + 63) & ~(uintptr_t) 63);
@@ -422,12 +455,12 @@ int bench(const std::vector<std::string>& pairs, const std::vector<int>& nts, in
                 else q2_rows_v(v, blob + f.down_off, f.d_row, a.q2p, nt, out);
             };
         };
-        if (!dispatch_only && kVariants) {
+        if (own && !dispatch_only && kVariants) {
             for (int v : subsets(gu_variants() | down_variants()))
                 ms.push_back({variant_name(v),
                               [&, v, gt](const uint8_t* blob, int nt) { gu_rows_v(v, gt, blob, f.gu_row, f.up_off, a.gup, nt, ff); },
                               down_v(v)});
-        } else {
+        } else if (own) {
             ms.push_back({"kernels",
                           [&, gt](const uint8_t* blob, int nt) {
                               cpu::iq256_gu_rows(gt, blob, f.gu_row, f.up_off, (int) kH, a.gup, nt, ff, 0, (int) kFF);
@@ -437,21 +470,32 @@ int bench(const std::vector<std::string>& pairs, const std::vector<int>& nts, in
                               else cpu::q2_0_gguf_rows_multi_avx2(blob + f.down_off, f.d_row, (int) (kFF / 64), a.q2p, nt, out, 0, (int) kH);
                           }});
         }
-        ms.push_back({"ggml",   // ggml-cpu's dot, token by token: the engine's one-token path (#152's rule)
-                      [&](const uint8_t* blob, int nt) {
-                          for (int64_t r = 0; r < kFF; ++r)
-                              for (int t = 0; t < nt; ++t) {
-                                  float g = 0.f, u = 0.f;
-                                  gdot((int) kH, &g, 0, blob + (size_t) r * f.gu_row, 0, a.gup[t], 0, 1);
-                                  gdot((int) kH, &u, 0, blob + f.up_off + (size_t) r * f.gu_row, 0, a.gup[t], 0, 1);
-                                  ff[t][r] = (g / (1.f + std::exp(-g))) * u;
-                              }
-                      },
-                      [&](const uint8_t* blob, int nt) {
-                          for (int64_t r = 0; r < kH; ++r)
-                              for (int t = 0; t < nt; ++t)
-                                  ddot((int) kFF, &out[t][r], 0, blob + f.down_off + (size_t) r * f.d_row, 0, a.dnp[t], 0, 1);
-                      }});
+        // ggml-cpu's dot, token by token: the engine's one-token path (#152's rule)
+        const std::function<void(const uint8_t*, int)> ggml_gu = [&](const uint8_t* blob, int nt) {
+            for (int64_t r = 0; r < kFF; ++r)
+                for (int t = 0; t < nt; ++t) {
+                    float g = 0.f, u = 0.f;
+                    gdot((int) kH, &g, 0, blob + (size_t) r * f.gu_row, 0, a.gup[t], 0, 1);
+                    gdot((int) kH, &u, 0, blob + f.up_off + (size_t) r * f.gu_row, 0, a.gup[t], 0, 1);
+                    ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+                }
+        };
+        const std::function<void(const uint8_t*, int)> ggml_dn = [&](const uint8_t* blob, int nt) {
+            for (int64_t r = 0; r < kH; ++r)
+                for (int t = 0; t < nt; ++t)
+                    ddot((int) kFF, &out[t][r], 0, blob + f.down_off + (size_t) r * f.d_row, 0, a.dnp[t], 0, 1);
+        };
+        // the K-quant and Q8_0 kernels in each variant (scalar: the AVX2 copy), ggml-cpu for a side they do not take
+        if (!own && !dispatch_only && kVariants && (kq_type(gt) || kq_type(dt)))
+            for (int v : subsets(down_variants()))
+                ms.push_back({variant_name(v),
+                              kq_type(gt) ? std::function<void(const uint8_t*, int)>([&, v, gt](const uint8_t* blob, int nt) {
+                                  kq_gu_v(v, gt, blob, f.gu_row, f.up_off, a.gup, nt, ff);
+                              }) : ggml_gu,
+                              kq_type(dt) ? std::function<void(const uint8_t*, int)>([&, v, dt](const uint8_t* blob, int nt) {
+                                  kq_dn_v(v, dt, blob + f.down_off, f.d_row, a.dnp, nt, out);
+                              }) : ggml_dn});
+        ms.push_back({"ggml", ggml_gu, ggml_dn});
         ms.push_back({"engine",   // what the pool calls: native_gu_rows, native_down_rows or (Q2_0) q2_rows_any
                       [&](const uint8_t* blob, int nt) { cpu::native_gu_rows(f, blob, a.gup, nt, ff, 0, (int) kFF); },
                       [&, dt](const uint8_t* blob, int nt) {
@@ -513,7 +557,17 @@ int main(int argc, char** argv) {
         else if (a == "--mb" && more) mb = (int) std::strtol(argv[++i], nullptr, 10);
         else if (a == "--reps" && more) reps = std::max(1, (int) std::strtol(argv[++i], nullptr, 10));
         else if (a == "--nt" && more) nts = ints(argv[++i]);
-        else if (a == "--pairs" && more) {
+        else if (a == "--shape" && more) {   // n_embd x expert width: 2048x512 (Ornith-1.5), 2560x960 (llm-jp-4.1)
+            const std::string sh = argv[++i];
+            const size_t x = sh.find('x');
+            kH = std::strtoll(sh.c_str(), nullptr, 10);
+            kFF = x == std::string::npos ? 0 : std::strtoll(sh.c_str() + x + 1, nullptr, 10);
+            if (kH <= 0 || kFF <= 0 || kFF > cpu::kNativeMaxFF) {
+                std::fprintf(stderr, "--shape: n_embd x expert width, the width at most %lld\n",
+                             (long long) cpu::kNativeMaxFF);
+                return 2;
+            }
+        } else if (a == "--pairs" && more) {
             pairs.clear();
             const std::string s = argv[++i];
             for (size_t from = 0;;) {
@@ -524,7 +578,7 @@ int main(int argc, char** argv) {
             }
         } else {
             std::fprintf(stderr, "usage: iq_avx2_parity [--cpu N] | --bench [--cpu N] [--nt 1,2,3,4] [--mb 256] "
-                                 "[--reps 5] [--pairs iq3_s/iq4_nl,...] [--dispatch]\n");
+                                 "[--reps 5] [--pairs iq3_s/iq4_nl,...] [--shape 2560x640] [--dispatch]\n");
             return 2;
         }
     }

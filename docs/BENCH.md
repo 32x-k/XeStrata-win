@@ -56,10 +56,29 @@ Its engine is made as upstream's setup makes it:
 | --- | --- |
 | NVIDIA | the release's prebuilt engine (its SHA-256 checked) |
 | AMD | the tag's sources compiled with HIP |
-| Intel | upstream's `sycl/` built in Docker (docker must work without sudo) |
+| Intel | upstream's `sycl/` built in Docker (docker must work without sudo), run with the settings its `sycl/setup_intel.py` writes for the card |
 
 - NVIDIA's prebuilt engine and the Intel Docker image are not free software: a free build does not compare on NVIDIA and Intel GPUs.
-- On Intel GPUs the decode speed is not compared: upstream's `sycl/` reads the experts that do not fit in VRAM over PCIe.
+- A cell where upstream turns out to run at 10 tok/s or less is stopped in that tier and not compared (it is listed under the runs that stopped).
+
+## xestrata --bench-original-compat
+
+A compatibility mode that runs upstream Strata's benchmark mode (`tools/strata_bench.py`, upstream v0.1.43) as upstream measures.
+Use it to compare with upstream users' reports (the format of upstream's `docs/COMMUNITY_BENCHMARKS.md`).
+XeStrata's own measurement is `--bench`.
+
+```sh
+xestrata --setup --bench-original-compat                        # the newest installed model (--model, --family: another)
+xestrata --setup --bench-original-compat --long --clients 4     # the arguments after it go to strata_bench.py as they are
+xestrata --setup --bench-original-compat --compare <an earlier results folder>
+```
+
+- It starts the server with the installed model's config (or uses the one running) and sends a fixed suite through the HTTP API, the median of three runs each, with thinking off (`--think` turns it on).
+- The tests are upstream's: three short questions (up to 100 tokens), a 4K and a 16K prompt, a 5-turn agent session that adds a file each turn. `--long` adds a 32K prompt, `--clients N` N requests at once.
+- It takes about 3 to 10 minutes after the model has loaded.
+- The results go to the data folder's `records/<date>-community-<GPU>-<model>/` (`README.md`, `results.json`, `engine-log-excerpt.txt`). Home folders, user and host names, IP addresses and API keys are replaced before anything is written. Nothing is sent anywhere.
+- What differs from upstream: the config files (`xestrata-*.json`), the version the report gives (XeStrata's) and where it writes.
+- It does not go with `--bench`, `--bench-verbose` or `--original-strata`.
 
 ## The upstream merges' measurements
 
@@ -73,7 +92,8 @@ XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> python $S/
 XE="..." UP="..." XE_ROOT=... UP_ROOT=... XE_PROFILE=... UP_PROFILE=... DATA=<data> PY=<python> \
   python $S/bench_usage.py $o/IQ3_XXS <GPU>
 python $S/sync_collect.py $o/<file> xe-<commit> <tag>                         # matrix*.json and the tables
-python $S/judge.py --prompt-only B70 $o/IQ3_XXS ...                           # ALL PASS or FAIL <n>
+python $S/judge.py --prev IQ3_XXS=<older record> $o/IQ3_XXS ... # ALL PASS or FAIL <n>
+A="..." B="..." PROFILE=... DATA=<data> IDS=<ids> python $S/ab_pair.py generate|serve|usage <out> <GPU>
 ```
 
 - The model is IQ3_XXS by default. On a PC with less RAM, `CONFIG=xestrata-<model>.json`, a model config setup wrote, measures both engines with that model's files and settings (its RAM budget, the calibration's results).
@@ -83,6 +103,8 @@ python $S/judge.py --prompt-only B70 $o/IQ3_XXS ...                           # 
 - generate makes both engines follow upstream's answer (`--spec-follow`), leaving the texts' difference out; serve has no such option.
 - To pass: in generate, and the first prefill's speed in serve and everyday use, XeStrata is at most 1% slower than upstream; the rest of serve and everyday use (the wait before a follow-up's answer, decode, the time to the first token) at most 5% worse.
 - The temperature: serve's `MODES` (default `greedy t07`; `t10` is temperature 1.0), everyday use's `TEMPERATURE` (default 0.7).
+- `--prev <file>=<folder>` compares with the previous XeStrata's record as well (the last merge's record, or a release's): per cell both have, the prefill speed at most 1% slower, the rest at most 5% worse. The B70's decode is compared too.
+- `ab_pair.py` runs XeStrata against itself in turns: A the base, B the candidate (a switch off and on, or the previous version and HEAD). With one seed they write one text unless the change alters the text. `judge.py <out>` judges B against A.
 - `--dry-run` prints the commands that would start the engines instead of running them.
 
 ## The release table

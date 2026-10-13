@@ -94,7 +94,15 @@ void gdn_beta_gate(float* beta, int64_t h_v, void* stream);
 ///
 /// Note SIGMOID, not SiLU - qwen3.5 used SiLU and this artifact does not, and `ref/gdn.py` says so outright.
 /// The norm is over the LAST axis: one RMS per head, so it is per-ROW here and not over the whole (h_v, S).
+/// With `gdn_set_silu_gate(true)` the gate is `silu(z) = z * sigmoid(z)` instead (qwen35moe, llama.cpp's
+/// `build_norm_gated`).
 void gdn_out_norm(const float* o, const float* z, const float* ssm_norm, float* y, int64_t h_v, int64_t S,
                   float eps, void* stream);
+
+/// The closing norm's gate for every GDN kernel that applies it (`gdn_out_norm`, `native_gdn_out_norm`,
+/// `fused_gdn_step_norm` and the verify-window kernels): false (the default) `sigmoid(z)`, qwen4exp's; true
+/// `silu(z)`, qwen35moe's.  Set before the session's graphs are captured; captured graphs keep the gate they saw.
+void gdn_set_silu_gate(bool silu);
+bool gdn_silu_gate();
 
 }  // namespace strata::kernels

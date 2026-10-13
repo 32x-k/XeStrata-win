@@ -13,6 +13,8 @@
 #include "strata/kernels/native_flash_attn.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_native_flash_attn
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <cfloat>
 #include <cstddef>

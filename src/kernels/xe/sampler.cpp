@@ -11,6 +11,8 @@
 #include "strata/core/runtime.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "device_caps.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_sampler
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <cstdlib>
 #include <cstring>
@@ -239,7 +241,7 @@ sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int
                 float wv;
                 int wi;
                 block_argmax<THREADS>(it, n_vocab, &sv[0], &si[0], [&](int v, float& s) {
-                    s = apply_penalties(l[v], hit_count(w, b, v), pp);
+                    s = apply_penalties(pp.logit_bias ? l[v] + pp.logit_bias[v] : l[v], hit_count(w, b, v), pp);
                     return true;
                 }, wv, wi);
                 // a tie between two -inf candidates leaves wi == n_vocab, and the serial version answered 0
@@ -256,7 +258,7 @@ sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int
                 int wi;
                 block_argmax<THREADS>(it, n_vocab, &sv[0], &si[0], [&](int v, float& s) {
                     for (int j = 0; j < i; ++j) if (sel_ids[j] == v) return false;
-                    s = apply_penalties(l[v], hit_count(w, b, v), pp);
+                    s = apply_penalties(pp.logit_bias ? l[v] + pp.logit_bias[v] : l[v], hit_count(w, b, v), pp);
                     return true;
                 }, wv, wi);
                 if (tid == 0) { sel_ids[i] = (wi < n_vocab) ? wi : 0; sel_logit[i] = wv; }
@@ -341,7 +343,7 @@ sycl::event split_stage1(sycl::queue& q, const float* logits, int n_tokens, int 
             }
             for (int c = tid; c < n; c += SPLIT_T) {
                 const int cnt = use_bits && (bits[c >> 5] & (1u << (c & 31))) ? history_count(hrow, hlen, base + c) : 0;
-                sc[c] = apply_penalties(l[base + c], cnt, pp);
+                sc[c] = apply_penalties(pp.logit_bias ? l[base + c] + pp.logit_bias[base + c] : l[base + c], cnt, pp);
                 taken[c] = 0;
             }
             sycl::group_barrier(it.get_group());

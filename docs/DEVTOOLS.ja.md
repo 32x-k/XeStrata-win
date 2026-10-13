@@ -107,7 +107,8 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   `rocm-dev` に引かれて自動で入ったものは、`rocm-dev` が消えると `apt autoremove` の対象になるので、`sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo` で手動の印を付けます。
 - スクリプトは、リリースにない修正を `third_party/main/intel-llvm/patches/` のパッチ（`NN-<id>.patch`、intel/llvm と同じ Apache-2.0 WITH LLVM-exception）として番号順にソースに当ててからビルドし、当てた修正の id を `install/XESTRATA.json` に残します。
   修正の足りない同じ版のビルドがあれば、作り直すかを尋ねます。
-  今の修正は 15 で、12 番目までは intel/llvm の `sycl` ブランチでも直っていません（2026-10-08）。
+  今の修正は 17 で、最初の 12 はどれも intel/llvm の `sycl` ブランチでも直っていません（2026-10-08）。
+  Windows 移植の修正は、XeStrata の次の修正と番号が重ならないよう、90 から番号を付けています。
   1 つ目: CUDA と HIP のアダプタが、コマンドバッファにノードを足すたびに同期点の表を丸ごとコピーしていて、SYCL のグラフの完成にノード数の 2 乗の時間がかかっていました（2600 カーネルのグラフで、RTX 4070 では 90 ms、修正後は 4 ms。Level Zero は 2 ms）。
   2 つ目: SYCL のランタイムが、どの NVIDIA の GPU にも最初に見つけた NVIDIA の像を、アーキテクチャを見ずに渡していました。
   いくつかのアーキテクチャのコードを持つ実行ファイルでは、その像より古い GPU は動かず、新しい GPU は古いコードを走らせていました。
@@ -137,15 +138,24 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   AMD の像には `compile_target` がなく、ランタイムは像を 1 つずつ、中身を渡さずに HIP のアダプタに尋ね、アダプタは合うものがないと最初の AMD の像を代わりに選ぶためです。
   パッケージのように AMD の GPU をいくつも対象にしたエンジンは、使える GPU がないと言って止まっていました（キューに投げるカーネルは、像をまとめて中身ごと渡すので選べていました）。
   修正後は、ランタイムが CUDA と同じく像そのものを HIP のアダプタにも渡し、アダプタはその GPU のアーキテクチャを含まない clang のオフロードバンドルを代わりに選びません（`hip-bundle-arch`）。
-  13 番目: Windows では、HIP のアダプタの CMake が AMD の comgr を Linux の共有ライブラリ（`libamd_comgr.so`）として読み込もうとして、設定が失敗していました（`IMPORTED_IMPLIB not set for imported target "amd_comgr"`）。
+  13 番目: いくつかの NVIDIA や AMD のアーキテクチャのコードを持つプログラムで、各アーキテクチャの名前の下に別のアーキテクチャのデバイスコードが入っていました。
+  SYCL のバンドル ID は GPU の前に environment の欄がなく（`sycl-amdgcn-amd-amdhsa-gfx1030`）、clang-offload-bundler はその GPU をトリプルの environment と読んでいました。
+  ターゲット ID が空になり、同じトリプルのアーキテクチャがどれもほかと合うので、オブジェクトやアーカイブを展開するたびに、各アーキテクチャのリンクがそのトリプルの未使用の項目をハッシュの順に受け取っていました。
+  パッケージのエンジンは gfx1030 の下に gfx1200 の、gfx1101 の下に gfx1030 の、gfx1201 の下に gfx1100 のコードを持ち、RX 9070 XT が不正な命令として断っていました。
+  修正後は、GPU を表す 5 番目の要素をターゲット ID として読みます（`offload-bundle-arch`）。
+  14 番目: HIP のアダプタが GPU の空きメモリ（SYCL の `ext_intel_free_memory`）を、その GPU を current にせずに `hipMemGetInfo` で答えていて、どの AMD の GPU もスレッドの current の GPU の空きを報告していました。
+  AMD の GPU 2 枚で層を分割すると、2 段目は 1 段目のエキスパートのキャッシュでほぼ埋まった空きを見て、自分のキャッシュの場所がないと言って止まっていました。
+  修正後は、アダプタのほかの呼び出しと同じく、その GPU を current にしてから問い合わせます（`hip-mem-free-device`。CUDA のアダプタは問い合わせのたびにその GPU のコンテキストを current にしています）。
+  15 番目（90）: Windows では、HIP のアダプタの CMake が AMD の comgr を Linux の共有ライブラリ（`libamd_comgr.so`）として読み込もうとして、設定が失敗していました（`IMPORTED_IMPLIB not set for imported target "amd_comgr"`）。
   修正後は、隣の HIP のランタイム（`amdhip64.lib`）と同じく、Windows では `amd_comgr.lib` を読み込みます（`hip-windows-comgr`）。
-  14 番目: ドライバーは、ROCm のデバイスライブラリのフォルダーに `oclc_correctly_rounded_sqrt_on.bc` と `_off.bc` がないと、デバイスライブラリがないと判断していました。
+  16 番目（91）: ドライバーは、ROCm のデバイスライブラリのフォルダーに `oclc_correctly_rounded_sqrt_on.bc` と `_off.bc` がないと、デバイスライブラリがないと判断していました。
   新しい ROCm（Windows の HIP SDK の ROCm 7.12 など）はこの 2 つを含まないので、AMD の GPU 向けのコンパイルがどれも失敗していました。
   修正後は、2 つともあるか、どちらもないかのどちらでも受け付け、あるときだけリンクします（`hip-device-libs-sqrt`）。
-  15 番目: HIP のアダプタは、CUDA と Level Zero のアダプタが Windows で答えるデバイスの LUID（`sycl::ext::intel::info::device::luid`）に答えず、デバイス ID の問い合わせには PCI のデバイス番号（0）を返していたので、プログラムは HIP の GPU の DXGI のアダプタを見つけられませんでした。
+  17 番目（92）: HIP のアダプタは、CUDA と Level Zero のアダプタが Windows で答えるデバイスの LUID（`sycl::ext::intel::info::device::luid`）に答えず、デバイス ID の問い合わせには PCI のデバイス番号（0）を返していたので、プログラムは HIP の GPU の DXGI のアダプタを見つけられませんでした。
   Windows では、アダプタのローカルメモリの予算を超えたデバイスの確保は断られず、システムメモリに置かれて PCIe 越しに読まれます。エンジンはエキスパートキャッシュの大きさをこの予算で決め、予算は LUID で DXGI から読みます。
   修正後は、Windows では `hipDeviceProp_t::luid` を答えます（すべて 0 の LUID と、ほかの OS は引き続き未対応です。`hip-windows-luid`）。
   CUDA の修正は contrib-llvm のツールチェーンにだけ、HIP の修正は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
+  `offload-bundle-arch` はどのツールチェーンにも作り直しを求めます。
 - スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。
 - 開発機（Ubuntu 26.04、CUDA 12.4、ROCm 7.1）では、ランタイムのバックエンドが cuda・hip・level_zero・opencl になりました。
 - NVIDIA の GPU の上で動かすには、NVIDIA のドライバー（Ubuntu 26.04 では `nvidia-driver-610-open` など）が要ります。
@@ -209,7 +219,7 @@ sde64 -version
 - エンジン自身の時間の計測: prefill の経路は `STRATA_PREFILL_TIMING=1` で出ます。
   decode の `verify window` の行（ホストが GPU を待つ時間、CPU のプール）は、いつも出ます。
 - `STRATA_VERIFY_NODES=1` は、decode の窓のグラフに入るカーネルの数を出します。
-- SYCL のイベントのプロファイリングで単独のカーネルを測る使い捨てのプローブ（`bench/results/2026-10-02-xe-decode-gpu` の記録）。
+- SYCL のイベントのプロファイリングで単独のカーネルを測る使い捨てのプローブ。
 - `STRATA_VERIFY_PROFILE=1` はデバイス全体で共通の時計を必要とし、B70 にはそれがありません。
 
 ### xe ドライバーのカーネルのログ
@@ -221,8 +231,7 @@ xe ドライバーはエラーをカーネルのログに出します。
 journalctl -k --since "-1h" --no-pager | grep "xe 0000"
 ```
 
-出力ヘッドの VRAM の確保が断られた起動では、どれもその約 8 秒前に `VM worker error: -16` が出ていました
-（`bench/results/2026-10-02-xe-decode-gpu`）。
+出力ヘッドの VRAM の確保が断られた起動では、どれもその約 8 秒前に `VM worker error: -16` が出ていました。
 
 ### VTune と GPU のハードウェアカウンター
 

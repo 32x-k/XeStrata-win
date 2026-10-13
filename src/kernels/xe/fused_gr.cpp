@@ -12,6 +12,8 @@
 #include "strata/core/runtime.hpp"
 #include "device_target.hpp"
 #include "sm70_table.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_fused_gr
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <cstdlib>
 #include <string>

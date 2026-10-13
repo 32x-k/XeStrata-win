@@ -374,6 +374,15 @@ int main(int argc, char** argv) {
         std::printf("  %-42s %-4s (%.2f%% apart)\n", "sigmoid vs SiLU on the gate is observable",
                     rel_silu > 0.05 ? "yes" : "*** NO ***", rel_silu * 100);
         if (!(rel_silu > 0.05)) ++bad;
+
+        // ...and it is qwen35moe's: gdn_set_silu_gate switches the kernel to it, and back
+        strata::kernels::gdn_set_silu_gate(true);
+        strata::kernels::gdn_out_norm(d_o, d_z, d_sn, d_y, hv2, S2, eps, nullptr);
+        strata::kernels::gdn_set_silu_gate(false);
+        strata::parity::copy_bytes_out(got.data(), d_y, got.size() * 4);
+        const double rel_gate = rel_l1(y_silu, got);
+        std::printf("  %-42s rel %.3e\n", "out norm with gdn_set_silu_gate (silu z)", rel_gate);
+        if (!(rel_gate <= 1e-6)) ++bad;
         }
 
     std::printf("\ngdn: %d failures\n", bad);

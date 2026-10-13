@@ -66,6 +66,27 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# `glm4` and `glm5` (GLM-5.3-Flash): llama.cpp's LLAMA_VOCAB_PRE_TYPE_CHATGLM4 (`src/llama-vocab.cpp` L406 at
+# de7fa0a3), the llama3 shape with `\p{L}` alone, and `ignore_merges` (L2407): a pre-token piece that is itself in
+# the vocabulary is that one token, without running the merges.
+CHATGLM4_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+# The GGUF's `tokenizer.ggml.pre` -> (pattern, ignore_merges, where the pattern was transcribed from).  A `pre` not
+# listed is refused: tokenizing it with another type's pattern gives plausible tokens the model was not trained on.
+PRE_TYPES = {
+    "qwen35": (QWEN35_PATTERN, False, ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
+    "glm4": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
+    "glm5": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
+}
+
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
@@ -89,7 +110,10 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        if pre not in PRE_TYPES:
+            raise ValueError("pre-tokenizer %r is not supported (%s)" % (pre, ", ".join(sorted(PRE_TYPES))))
+        pattern, self.ignore_merges, _ = PRE_TYPES[pre]
+        self._re = regex.compile(pattern)
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -114,6 +138,10 @@ class Tokenizer:
         # token containing regex metacharacters (several do: `<|`, `[`, `(`) is matched literally.
         self._always_re = self._alt(always)
         self._special_re = self._alt(list(self.special_tokens))
+        # Initialize once, rather than allocating a default dict and looking it up
+        # through __dict__.setdefault on each encoded segment or decoded token.
+        self._piece_ids: dict[str, list[int]] = {}
+        self._bytes_cache: dict[int, bytes] = {}
 
     @staticmethod
     def _alt(literals: list[str]):
@@ -140,6 +168,25 @@ class Tokenizer:
                    list(md.get("tokenizer.ggml.token_type") or []) or None,
                    md.get("tokenizer.ggml.pre", "qwen35"), special)
 
+    @classmethod
+    def from_dir(cls, path):
+        """The tokenizer `extract` wrote into a pack's `tokenizer/` folder, with the `pre` it declared (an export
+        older than the field is Qwen3.8's, `qwen35`); a Unigram one (`model` t5: llm-jp-4.1) is strata_unigram's."""
+        path = pathlib.Path(path)
+        cfg_file = path / "tokenizer.json"
+        cfg = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}
+        if cfg.get("model") == "t5":
+            sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+            from strata_unigram import UnigramTokenizer
+            return UnigramTokenizer.from_dir(path, cfg)
+        vocab = json.loads((path / "vocab.json").read_text(encoding="utf-8"))
+        tokens = [""] * len(vocab)
+        for t, i in vocab.items():
+            tokens[i] = t
+        merges = (path / "merges.txt").read_text(encoding="utf-8").split("\n")
+        types = json.loads((path / "token_type.json").read_text())
+        return cls(tokens, merges, types, cfg.get("pre", "qwen35"), cfg.get("special_ids"))
+
     # -------------------------------------------------------------- the algorithm
     def _bpe(self, word: str) -> list[str]:
         """Merge `word` (already byte-mapped) by LOWEST RANK first, repeatedly - not left to right.
@@ -153,11 +200,16 @@ class Tokenizer:
         """
         if len(word) > self.HEAP_MIN:
             return self._bpe_heap(word)
+        # `self` is read ONCE, here.  #1385: an interpreter (CPython 3.14.4) was seen handing this frame an int
+        # for `self` partway through the scan (`'int' object has no attribute 'ranks'`).  Nothing in this class
+        # can do that (no cache, decorator, slots or callback; a thread hammering test cannot make it happen),
+        # so the scan below works on a local and no longer re-reads `self` once per symbol pair.
+        ranks_get = self.ranks.get
         parts = list(word)
         while len(parts) > 1:
             best, best_rank = None, None
             for i in range(len(parts) - 1):
-                r = self.ranks.get((parts[i], parts[i + 1]))
+                r = ranks_get((parts[i], parts[i + 1]))
                 if r is not None and (best_rank is None or r < best_rank):
                     best, best_rank = i, r
             if best is None:
@@ -207,15 +259,30 @@ class Tokenizer:
                     heapq.heappush(heap, (r2, p, parts[p], parts[i]))
         return [s for s, g in zip(parts, gone) if not g]
 
+    PIECE_CACHE_MAX = 200_000    # pre-tokenizer pieces remembered (an agent resends its whole history every turn)
+
     def _encode_plain(self, text: str) -> list[int]:
         out: list[int] = []
+        # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
+        # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
+        cache = self._piece_ids
         for piece in self._re.findall(text):
-            mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
-            for tok in self._bpe(mapped):
-                i = self.ids.get(tok)
-                if i is None:
-                    raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
-                out.append(i)
+            got = cache.get(piece)
+            if got is None:
+                mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
+                whole = self.ids.get(mapped) if self.ignore_merges else None
+                if whole is not None:
+                    got = [whole]
+                else:
+                    got = []
+                    for tok in self._bpe(mapped):
+                        i = self.ids.get(tok)
+                        if i is None:
+                            raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
+                        got.append(i)
+                if len(cache) < self.PIECE_CACHE_MAX:
+                    cache[piece] = got
+            out.extend(got)
         return out
 
     def _encode_matching(self, text: str, pat, plain=()) -> list[int]:
@@ -230,11 +297,27 @@ class Tokenizer:
             return self._encode_plain(text)
         out: list[int] = []
         pos = 0
+        # Matches arrive in text order. For reusable span sequences, consume each
+        # span once instead of scanning the entire list for every literal match.
+        # Sorting a copy handles unsorted/overlapping input without mutating it.
+        # Other iterables keep the original consumption semantics below.
+        span_sequence = isinstance(plain, (list, tuple)) and bool(plain)
+        if span_sequence:
+            spans = iter(sorted(plain))
+            upcoming = next(spans, None)
+            plain_end = 0
         for m in pat.finditer(text):
-            if plain and any(a <= m.start() < b for a, b in plain):
+            start = m.start()
+            if span_sequence:
+                while upcoming is not None and upcoming[0] <= start:
+                    plain_end = max(plain_end, upcoming[1])
+                    upcoming = next(spans, None)
+                if start < plain_end:
+                    continue
+            elif plain and any(a <= start < b for a, b in plain):
                 continue
-            if m.start() > pos:
-                out.extend(self._encode_plain(text[pos:m.start()]))
+            if start > pos:
+                out.extend(self._encode_plain(text[pos:start]))
             out.append(self.special_tokens[m.group(0)])
             pos = m.end()
         if pos < len(text):
@@ -253,7 +336,7 @@ class Tokenizer:
 
     def token_bytes(self, i: int) -> bytes:
         """The raw bytes of one token (a multi-byte character can be split across tokens)."""
-        cache = self.__dict__.setdefault("_bytes_cache", {})
+        cache = self._bytes_cache
         b = cache.get(i)
         if b is None:
             if i < 0 or i >= len(self.tokens):
@@ -276,6 +359,17 @@ def extract(gguf_path, out_dir) -> dict:
     """Write the tokenizer into `<out_dir>/tokenizer/` so the engine never opens the weight shards for it."""
     out = pathlib.Path(out_dir) / "tokenizer"
     out.mkdir(parents=True, exist_ok=True)
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    from gguf_reader import GGUFFile
+    md = GGUFFile(pathlib.Path(gguf_path)).metadata
+    if md.get("tokenizer.ggml.model") == "t5":   # SentencePiece Unigram (llm-jp-4.1)
+        from strata_unigram import UnigramTokenizer
+        cfg = UnigramTokenizer.from_gguf(gguf_path).write_dir(out)
+        (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+        tpl = md.get("tokenizer.chat_template")
+        if tpl:
+            (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
+        return cfg
     tk = Tokenizer.from_gguf(gguf_path)
     cfg = {
         "model": "gpt2",
@@ -286,8 +380,9 @@ def extract(gguf_path, out_dir) -> dict:
         "add_bos_token": False,
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        "pre_pattern": PRE_TYPES[tk.pre][0],
+        "pre_pattern_source": PRE_TYPES[tk.pre][2],
+        "ignore_merges": tk.ignore_merges,
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
@@ -311,6 +406,11 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="round-trip a corpus and report")
     args = ap.parse_args()
     cfg = extract(args.gguf, args.out)
+    if cfg["model"] == "t5":
+        print("tokenizer/: Unigram, vocab %d, specials %s" % (cfg["vocab_size"], cfg["special_ids"]))
+        if args.check:   # the round trip is byte-level BPE's property: Unigram normalizes its input
+            print("--check: a Unigram tokenizer has no exact round trip (its input is normalized)")
+        return 0
     print("tokenizer/: vocab %d, merges %d, pre %s, specials %s"
           % (cfg["vocab_size"], cfg["n_merges"], cfg["pre"], cfg["special_ids"]))
     if args.check:

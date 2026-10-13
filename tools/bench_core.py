@@ -46,11 +46,12 @@ COMMIT = "58dbbe5"
 # README's 259,943), so each tier fills the same share of its context; 192K: 262K's share of 196,608 (setup's context
 # for it is 204,800)
 TIERS = {"1k": 1017, "4k": 3562, "32k": 31566, "64k": 64162, "128k": 128478, "192k": 194956, "262k": 259943}
-# what setup writes for each tier's context (its smallest is 8K): int8 KV above 8K, KV streaming from 64K
+# what setup writes for each tier's context (its smallest is 8K): int8 KV above 8K; KV streaming from 64K is
+# kv_resident()'s, by the model and this PC's RAM (tier_context)
 CONTEXT = {"1k": ["--max-context", "8192"], "4k": ["--max-context", "8192"],
            "32k": ["--max-context", "32768", "--kv", "int8"]}
 for _t, _c in (("64k", "65536"), ("128k", "131072"), ("192k", "204800"), ("262k", "262144")):
-    CONTEXT[_t] = ["--max-context", _c, "--kv", "int8", "--kv-resident", "32768"]
+    CONTEXT[_t] = ["--max-context", _c, "--kv", "int8"]
 # the engines' settings besides the model files and the context: what setup writes
 FIXED = ["--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5"]
 
@@ -198,17 +199,18 @@ class Engine:
     or a wrapper and its arguments); `env`: its environment; `cwd`; `root`: its tree, whose serve/server.py (or
     `server`) the usage runs start; `py`: the Python that runs that server; `profile`: its expert profile.  `map`:
     (host prefix, its prefix) when it sees the data folder elsewhere (a container).  `cfg_extra`: what its server's
-    config needs besides (its CUDA libraries' folders)."""
+    config needs besides (its CUDA libraries' folders).  `adapt`: what its setup changes in the arguments it is given
+    (upstream's sycl/setup_intel.py)."""
 
     def __init__(self, name: str, arm: str, cmd: list[str], profile: str, env: dict | None = None,
                  cwd: str | None = None, root: Path | None = None, py: str | None = None, server: str | None = None,
-                 map: tuple[str, str] | None = None, cfg_extra: dict | None = None, prompt_only: bool = False,
-                 how: str | None = None):
+                 map: tuple[str, str] | None = None, cfg_extra: dict | None = None,
+                 how: str | None = None, adapt: Callable[[list[str]], list[str]] | None = None):
         self.name, self.arm, self.cmd, self.profile = name, arm, list(cmd), profile
         self.env = dict(os.environ) if env is None else env
         self.cwd, self.root, self.py = cwd, root, py or sys.executable
         self.server = server or "serve/server.py"
-        self.map, self.cfg_extra, self.prompt_only, self.how = map, cfg_extra or {}, prompt_only, how
+        self.map, self.cfg_extra, self.how, self.adapt = map, cfg_extra or {}, how, adapt
 
     @classmethod
     def from_spec(cls, name: str, arm: str, spec: str, profile: str, root: Path | None = None,
@@ -230,6 +232,10 @@ class Engine:
             return list(words)
         host, inside = self.map
         return [inside + w[len(host):] if w.startswith(host + "/") else w for w in words]
+
+    def run_args(self, words: list[str]) -> list[str]:
+        """An engine's whole argument list: what its setup changes in it (`adapt`), with the paths as it sees them."""
+        return self.inside(self.adapt(words) if self.adapt else words)
 
 
 def model_args(pack: str, native: str | None, ple: str | None, extra: list[str]) -> list[str]:
@@ -255,6 +261,30 @@ def config_model(args: list[str]) -> tuple[str, list[str], str | None]:
     pack = arg("--pack") or ""
     extra = [x for f in CARRY if (v := arg(f)) is not None for x in (f, v)]
     return pack, model_args(pack, arg("--native"), arg("--ple-gguf"), extra), arg("--mtp")
+
+
+def model_name(model: list[str]) -> str | None:
+    """The name in setup's MODELS of the model whose arguments these are, from its first GGUF shard's name
+    (...-IQ3_XXS-00001-of-00002.gguf); None for a model setup installs otherwise (Ornith, llm-jp)."""
+    import setup
+    native = Path(model[model.index("--native") + 1]).name if "--native" in model[:-1] else ""
+    found = [k for k in setup.MODELS if re.search(rf"(^|[-_.]){re.escape(k)}([-.]|$)", native)]
+    return max(found, key=len) if found else None
+
+
+def kv_resident(model: list[str], ctx: int, kv: str = "int8") -> list[str]:
+    """--kv-resident 32768 where setup writes it for this model on this PC (setup.kv_streaming_wanted: from 64K, when
+    the RAM holds the KV cache beside the model; never for the models outside MODELS).  upstream's setup decides the
+    same, with the same RAM per model (v0.1.43), so both engines get it; its sycl/ port decides again
+    (sycl/setup_intel.py, tools/bench_upstream.py)."""
+    import setup
+    name = model_name(model)
+    return ["--kv-resident", "32768"] if name and setup.kv_streaming_wanted(name, ctx, kv, setup.ram_gb()) else []
+
+
+def tier_context(model: list[str], tier: str) -> list[str]:
+    """What setup writes for the tier's context, for this model on this PC."""
+    return CONTEXT[tier] + kv_resident(model, int(CONTEXT[tier][1]))
 
 
 def engine_args(model: list[str], profile: str, mtp: str | None, context: list[str]) -> list[str]:
@@ -284,6 +314,8 @@ class Merge:
         self.engines = []
         for arm in ("xe", "up"):
             a = arm.upper()
+            if arm == "up" and os.environ.get("UP") == "none":   # XeStrata alone, judged against its previous record
+                continue
             root = Path(need(f"{a}_ROOT")) if usage else None
             e = Engine.from_spec(arm, arm, need(a), need(f"{a}_PROFILE"), root, os.environ.get("PY"))
             if usage and len(e.cmd) != 1:
@@ -293,7 +325,7 @@ class Merge:
         self.slow = float(os.environ.get("SLOW", str(SLOW)))
 
     def args(self, e: Engine, tier: str) -> list[str]:
-        return engine_args(self.model, e.profile, self.mtp, CONTEXT[tier])
+        return engine_args(self.model, e.profile, self.mtp, tier_context(self.model, tier))
 
 
 def need(name: str) -> str:
@@ -376,7 +408,7 @@ def watch_generate(p: subprocess.Popen, log: Path, slow: float, owner: str) -> s
 def run_generate(e: Engine, args: list[str], ids: Path, log: Path, follow: Path | None = None, slow: float = 0.0,
                  extra_env: dict | None = None, dry: bool = False) -> int | None:
     """One generate run into `log` (the engine's output, then the stop line if it was stopped); the exit code."""
-    cmd = [*e.cmd, *e.inside([*args, "--tokens-file", str(ids), "--max-new", str(MAX_NEW)])]
+    cmd = [*e.cmd, *e.run_args([*args, "--tokens-file", str(ids), "--max-new", str(MAX_NEW)])]
     if follow is not None:
         cmd += e.inside(["--spec-follow", str(follow)])
     if dry:
@@ -425,7 +457,7 @@ def run_serve(e: Engine, args: list[str], ids: dict, tier: str, mode: str, rnd: 
               slow: float = 0.0, dry: bool = False) -> dict:
     """One process, one chat of 1 + len(FOLLOWUPS) turns: the turns' DONE fields and why it ended early, if it did.
     The first turn at `slow` tok/s or less (its prompt or its output) ends it: "stopped: prompt|output"."""
-    cmd = [*e.cmd, "--serve", *e.inside(args)]
+    cmd = [*e.cmd, "--serve", *e.run_args(args)]
     if dry:
         print("DRY serve " + shlex.join(cmd) + f" | {tier} {mode} {rnd}", flush=True)
         return {"turns": [], "why": None}
@@ -579,10 +611,9 @@ def usage_turns(port: int, seed: int, agent_files: list[str], temperature: float
                          "content": agent_files[step] if c is m["tool_calls"][0] else "(not available)"})
 
 
-def usage_context(ctx: int) -> list[str]:
-    """What setup writes for a context."""
-    return ["--max-context", str(ctx)] + (["--kv", "int8"] if ctx > 8192 else []) + \
-        (["--kv-resident", "32768"] if ctx >= 65536 else [])
+def usage_context(model: list[str], ctx: int) -> list[str]:
+    """What setup writes for a context, for this model on this PC."""
+    return ["--max-context", str(ctx)] + (["--kv", "int8"] if ctx > 8192 else []) + kv_resident(model, ctx)
 
 
 def run_usage(e: Engine, cfg: dict, seed: int, agent_files: list[str], stem: Path, warmup: bool = False,
@@ -593,7 +624,7 @@ def run_usage(e: Engine, cfg: dict, seed: int, agent_files: list[str], stem: Pat
     or less ends it ("stopped: output")."""
     port = port or free_port()
     cfg = {**{k: v for k, v in cfg.items() if k not in ("api_key", "host", "port", "args")}, "port": port,
-           "args": e.inside(cfg["args"])}
+           "args": e.run_args(cfg["args"])}
     cpath = stem.with_name(stem.name + ".config.json")
     cmd = [e.py, str(Path(e.root or ROOT) / e.server), "--engine", "strata", "--config", str(cpath),
            "--port", str(port), "--host", "127.0.0.1"]
@@ -807,8 +838,8 @@ def collect(out: Path, names: dict[str, str], say: Callable = print) -> None:
     if rows or (out / "runs").is_dir():
         (out / "matrix.json").write_text(json.dumps(rows, indent=1) + "\n")
     for gpu in sorted({r["gpu"] for r in rows}):
-        for key, title, fmt in (("prefill_tok_s", "Prompt (tokens/s)", "{:,.0f}"),
-                                ("decode_tok_s", "Output (tokens/s)", "{:.1f}")):
+        for key, title, fmt in (("prefill_tok_s", "Prefill (tokens/s)", "{:,.0f}"),
+                                ("decode_tok_s", "Decode (tokens/s)", "{:.1f}")):
             say(f"\n### {gpu}: {title}\n\n| Engine | " + " | ".join(t.upper() for t in COLLECT_TIERS) + " |")
             say("| --- |" + " ---: |" * len(COLLECT_TIERS))
             for name in names.values():
@@ -843,9 +874,9 @@ def collect(out: Path, names: dict[str, str], say: Callable = print) -> None:
         tiers = [t for t in COLLECT_TIERS if any(r["tier"] == t for r in serve)]
         for gpu in sorted({r["gpu"] for r in serve}):
             for mode in sorted({r["mode"] for r in serve}):
-                for key, title, fmt in (("prefill_tok_s", "Prompt (tokens/s)", "{:,.0f}"),
+                for key, title, fmt in (("prefill_tok_s", "Prefill (tokens/s)", "{:,.0f}"),
                                         ("cont_ms", "Follow-ups (ms)", "{:,.0f}"),
-                                        ("decode_tok_s", "Output (tokens/s)", "{:.1f}")):
+                                        ("decode_tok_s", "Decode (tokens/s)", "{:.1f}")):
                     say(f"\n### {gpu} serve {mode}: {title}\n\n| Engine | " + " | ".join(t.upper() for t in tiers)
                         + " |")
                     say("| --- |" + " ---: |" * len(tiers))
@@ -903,7 +934,11 @@ def main(argv: list[str]) -> int:
         print(f"{CORPUS}: {len(corpus['files'])} files, {len(corpus['agent'])} tool results, "
               f"{CORPUS.stat().st_size} bytes")
         return 0
-    print("usage: python tools/bench_core.py corpus PACK_DIR   # (re)write data/bench-corpus.json.xz from git",
+    if argv[:1] == ["kv-resident"] and len(argv) == 3:
+        print(shlex.join(kv_resident(["--native", argv[1]], int(argv[2]))))
+        return 0
+    print("usage: python tools/bench_core.py corpus PACK_DIR   # (re)write data/bench-corpus.json.xz from git\n"
+          "       python tools/bench_core.py kv-resident GGUF CONTEXT   # what kv_resident() gives on this PC",
           file=sys.stderr)
     return 2
 

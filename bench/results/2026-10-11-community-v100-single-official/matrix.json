@@ -1,0 +1,54 @@
+[
+ {
+  "gpu": "V100x1",
+  "arm": "up",
+  "engine": "Strata v0.1.42",
+  "tier": "1k",
+  "round": 1,
+  "prompt_tokens": 1016,
+  "prefill_tok_s": 691.8,
+  "decoded": 256,
+  "decode_tok_s": 78.97,
+  "spec_accept": 0.803,
+  "stopped": null
+ },
+ {
+  "gpu": "V100x1",
+  "arm": "up",
+  "engine": "Strata v0.1.42",
+  "tier": "1k",
+  "round": 2,
+  "prompt_tokens": 1016,
+  "prefill_tok_s": 694.53,
+  "decoded": 256,
+  "decode_tok_s": 78.91,
+  "spec_accept": 0.803,
+  "stopped": null
+ },
+ {
+  "gpu": "V100x1",
+  "arm": "xe",
+  "engine": "XeStrata xe0.1.40.2.2",
+  "tier": "1k",
+  "round": 1,
+  "prompt_tokens": 1016,
+  "prefill_tok_s": 680.68,
+  "decoded": 256,
+  "decode_tok_s": 79.79,
+  "spec_accept": 0.754,
+  "stopped": null
+ },
+ {
+  "gpu": "V100x1",
+  "arm": "xe",
+  "engine": "XeStrata xe0.1.40.2.2",
+  "tier": "1k",
+  "round": 2,
+  "prompt_tokens": 1016,
+  "prefill_tok_s": 676.73,
+  "decoded": 256,
+  "decode_tok_s": 80.3,
+  "spec_accept": 0.754,
+  "stopped": null
+ }
+]

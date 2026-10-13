@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -191,6 +192,63 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
         if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) ||
             !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
             !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
+    }
+    return true;
+}
+
+size_t conversation_checkpoint_staged_bytes(const SessionState& ss, const ModelGeometry& g) {
+    ConversationStateSizes z;
+    std::string error;
+    if (!conversation_session_sizes(g, ss, z, error)) return 0;
+    return z.gdn + (ss.ple_hist ? z.ple : 0) + owned_qsa(ss, g) * (z.tail + z.dead + z.block_pos);
+}
+
+// the order and sizes of conversation_checkpoint_save, packed one after another
+bool conversation_checkpoint_stage(void* staging, void* stream, const SessionState& ss, const ModelGeometry& g,
+                                   size_t tokens, std::string& error) {
+    ConversationStateSizes z;
+    if (!checkpoint_targets(ss, g, tokens, z, error)) return false;
+    auto* p = static_cast<uint8_t*>(staging);
+    bool ok = true;
+    auto put = [&](uint8_t* dst, const void* src, size_t bytes) {
+        if (bytes == 0 || !ok) return;
+        ok = src != nullptr && strata::gpu::copy_async(dst, src, bytes, stream);
+    };
+    const size_t ple = ss.ple_hist ? z.ple : 0;
+    put(p, ss.gdn_state, z.gdn);
+    put(p + z.gdn, ss.ple_hist, ple);
+    p += z.gdn + ple;
+    for (size_t j = 0; j < owned_qsa(ss, g); ++j) {
+        const auto& st = owned(ss, j);
+        put(p, st.idx_tail, z.tail);
+        put(p + z.tail, st.idx_dead, z.dead);
+        put(p + z.tail + z.dead, st.idx_block_pos, z.block_pos);
+        p += z.tail + z.dead + z.block_pos;
+    }
+    if (ok && strata::gpu::stream_sync(stream)) return true;
+    error = std::string("conversation checkpoint stage: ") + strata::gpu::last_error();
+    return false;
+}
+
+bool conversation_checkpoint_unstage(ConversationCheckpoint& c, const void* staging, const SessionState& ss,
+                                     const ModelGeometry& g, std::string& error) {
+    ConversationStateSizes z;
+    if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
+    const size_t layers = owned_qsa(ss, g);
+    c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
+    c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
+    const auto* p = static_cast<const uint8_t*>(staging);
+    if (p == nullptr) return fail(error, "missing checkpoint staging");
+    auto take = [&](void* dst, size_t bytes) {
+        if (bytes) std::memcpy(dst, p, bytes);
+        p += bytes;
+    };
+    take(c.gdn.data(), c.gdn.size());
+    take(c.ple.data(), c.ple.size());
+    for (size_t j = 0; j < layers; ++j) {
+        take(c.tails.data() + j * z.tail, z.tail);
+        take(c.dead.data() + j * z.dead, z.dead);
+        take(c.block_pos.data() + j * z.block_pos, z.block_pos);
     }
     return true;
 }

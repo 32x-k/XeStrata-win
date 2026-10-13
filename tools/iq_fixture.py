@@ -26,7 +26,7 @@ import _paths  # noqa: E402
 from gguf_reader import BLOCK_GEOMETRY, GGUFFile  # noqa: E402
 
 REPO = "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"
-REVISION = "ed59f92082b1e93c0e96d60a8b11aab089b52f09"   # bench/results/2026-09-30-b70/iq2-xs-baseline.json
+REVISION = "ed59f92082b1e93c0e96d60a8b11aab089b52f09"   # the 2026-09-30-b70 record
 # the model sizes searched, in order, for a tensor of each format
 SIZES = ("IQ2_XS", "IQ3_XXS", "Q2_0", "IQ3_S")
 FILE = "{q}/Qwen3.8-Flash-Next-GSQ-RCO-{q}-00001-of-00002.gguf"

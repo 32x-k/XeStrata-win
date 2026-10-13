@@ -7,11 +7,13 @@
 // work-items load the block's BM rows of X and BN rows of W, each row shared by a few neighbouring lanes that find its
 // largest magnitude together, and write the int8 values (4 a word) and the scale to local memory.  Quantizing while
 // loading needs no int8 copies in memory; with them made beforehand the products alone were 15% faster on the
-// largest shapes and no faster on the experts', before counting the quantization (bench/results/2026-10-02-dp4a).
+// largest shapes and no faster on the experts', before counting the quantization (the 2026-10-02-dp4a record).
 #include "dp4a_gemm.hpp"
 #include "cuda_intrinsics.hpp"
 #include "device_target.hpp"
 #include "strata/core/per_device.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_dp4a_gemm
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -135,7 +137,7 @@ sycl::event dp4a_gemm(sycl::queue& q, bool bf16, const uint16_t* X, const uint16
     // 128 x 64 tiles where there are rows enough to fill the GPU with them (20 TOPS against 17 for 64 x 64 on the
     // wide products, on the B70), 64 x 64 for short prompts.  The 128 x 64 tile's 64 accumulators a work-item fit the
     // registers only where the EU is 16 wide (Xe2): on the 8-wide EUs of Xe-HPG (the A380) they spilled, and it ran at
-    // 0.026 TOPS against 2.5 for 64 x 64 (bench/results/2026-10-04-dg2-dp4a).
+    // 0.026 TOPS against 2.5 for 64 x 64 (the 2026-10-04-dg2-dp4a record).
 #if defined(STRATA_ADAPTIVECPP)
     const bool wide_eu = false;
 #else

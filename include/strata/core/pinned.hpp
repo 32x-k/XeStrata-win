@@ -10,7 +10,7 @@
 //   * LARGE PAGES (2 MB) - transparent huge pages via `madvise(MADV_HUGEPAGE)`.  34 GB at 4 KB pages is 8.3 million
 //     TLB entries, which does not fit in any TLB.  THP needs no hugetlbfs pool to be reserved by the user.
 //   * NORMAL PAGES - correct, and it must be REPORTED rather than silently accepted: an unregistered 4 KB-page
-//     source copied at 4.3 GB/s against 14.4 GB/s on the B70's x8 link (bench/results/2026-09-30-b70).
+//     source copied at 4.3 GB/s against 14.4 GB/s on the B70's x8 link (the 2026-09-30-b70 record).
 //
 // The arena is ONE mapping registered for device copies, not host USM: the Level Zero driver refuses a single USM
 // allocation above the device's max_mem_alloc_size (the VRAM size, 32.5 GB on the B70), which every model but the
@@ -18,10 +18,15 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
 namespace strata::core {
+
+/// LAYER SPLIT: the later GPUs that register the arena for copies too (PinnedArena::register_on), named before it is
+/// made: its pieces are cut to the smallest largest allocation of these and the current device.
+void arena_copy_devices(const std::vector<int>& devices);
 
 enum class PageBacking { LargePages, NormalPages };
 
@@ -67,7 +72,9 @@ struct PinnedArena {
     /// bytes plus `pad`, as the `host_usm` constructor makes them: GPU kernels can then read it (a registration for
     /// copies does not give that on every runtime).  A layer at a time, each layer's pages given back once copied, so
     /// the arena is never held twice.  False (and `err`) with the mapping and its registrations as they were.
-    bool to_host_usm(uint64_t pad, std::string& err);
+    /// `ram_available` (issue #10): the RAM available now, read before each layer; a layer moves only while it leaves
+    /// STRATA_HOST_USM_RESERVE_MIB (default 1024) of it.
+    bool to_host_usm(uint64_t pad, std::string& err, const std::function<uint64_t()>& ram_available = {});
     bool valid() const { return base != nullptr; }
     uint8_t* data() const { return (uint8_t*) base; }   // one mapping only: null for host USM blocks
     /// The byte at arena offset `off` (one mapping, or the host USM block of the layer that holds it).

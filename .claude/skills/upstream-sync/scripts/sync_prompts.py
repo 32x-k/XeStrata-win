@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """The code-agent prompts of the speed table: a coding agent's system prompt, XeStrata's own sources at commit
 58dbbe5 as the files it has read, and a task about them; one prompt per length.  The prompts.py of
-bench/results/2026-10-04-speed-matrix with a 192K tier added (the same tokens up to each length), from the text
+the 2026-10-04-speed-matrix record with a 192K tier added (the same tokens up to each length), from the text
 tools/bench_core.py ships (data/bench-corpus.json.xz), which setup's --bench reads too.
 
     python .claude/skills/upstream-sync/scripts/sync_prompts.py PACK_DIR OUT_DIR

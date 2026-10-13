@@ -16,6 +16,8 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/core/runtime.hpp"
 #include "cuda_intrinsics.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_s2_expert_grouped
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include <cstring>
 #include <string>

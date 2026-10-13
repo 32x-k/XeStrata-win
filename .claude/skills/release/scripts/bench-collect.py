@@ -45,8 +45,8 @@ for f in sorted((out / "runs").glob("*.txt")):
 (out / "matrix.json").write_text(json.dumps(rows, indent=1) + "\n")
 
 for gpu in sorted({r["gpu"] for r in rows}):
-    for key, title, fmt in (("prefill_tok_s", "Prompt (tokens/s)", "{:,.0f}"),
-                            ("decode_tok_s", "Output (tokens/s)", "{:.1f}")):
+    for key, title, fmt in (("prefill_tok_s", "Prefill (tokens/s)", "{:,.0f}"),
+                            ("decode_tok_s", "Decode (tokens/s)", "{:.1f}")):
         print(f"\n### {gpu}: {title}\n\n| Engine | " + " | ".join(t.upper() for t in TIERS) + " |")
         print("| --- |" + " ---: |" * len(TIERS))
         for name in NAMES.values():

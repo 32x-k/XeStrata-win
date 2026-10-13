@@ -5,6 +5,8 @@
 #include "strata/core/device.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU core_gpu
+#include "strata/kernels/device_arch_tag.hpp"
 
 #if !defined(STRATA_ADAPTIVECPP)
 #include <sycl/ext/oneapi/experimental/graph.hpp>
@@ -14,6 +16,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdio>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -67,7 +70,7 @@ namespace {
 thread_local std::string g_error;
 
 // The live alloc_device blocks, so a refusal can say how much this process holds (the refusals seen so far came
-// with ~26 GiB free in the runs that passed, cause unknown: bench/results/2026-09-30-xe-iq3xxs)
+// with ~26 GiB free in the runs that passed, cause unknown: the 2026-09-30-xe-iq3xxs record)
 std::mutex g_live_mu;
 std::map<const void*, size_t> g_live;
 size_t g_live_bytes = 0;
@@ -100,7 +103,7 @@ bool fail(const char* what, const std::exception& e) {
 core::Runtime& rt() { return core::Runtime::get(); }
 
 // A single memset of more than 4 GiB never completes on the B70; the same bytes in 1 GiB pieces do, and a 5 GiB memcpy
-// and kernels addressing past 4 GiB work normally (bench/results/2026-09-30-xe-large-alloc).
+// and kernels addressing past 4 GiB work normally (the 2026-09-30-xe-large-alloc record).
 constexpr size_t kPiece = size_t(1) << 30;
 sycl::event marker(sycl::queue& queue, const std::vector<sycl::event>& dependencies = {}) {
     return queue.submit([&](sycl::handler& h) {
@@ -255,6 +258,34 @@ std::map<const sycl::queue*, sx::command_graph<sx::graph_state::modifiable>> g_c
 
 const char* last_error() { return g_error.c_str(); }
 
+std::string failure_report(const std::exception& e) {
+    std::string r = e.what();
+    if (const auto* se = dynamic_cast<const sycl::exception*>(&e)) {
+        char buf[96];
+#if defined(STRATA_ADAPTIVECPP)
+        std::snprintf(buf, sizeof buf, " [SYCL code %d]", se->code().value());
+#else
+        std::snprintf(buf, sizeof buf, " [SYCL code %d, UR result %d]", se->code().value(),
+                      (int) sycl::detail::get_ur_error(*se));
+#endif
+        r += buf;
+    }
+    try {
+        auto& runtime = rt();
+        const std::string status = runtime.device_status();
+        r += "; the GPU: " + status;
+        size_t free_b = 0, total_b = 0;
+        if (status != "lost" && mem_info(&free_b, &total_b)) {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, ", %zu MiB of VRAM free", free_b >> 20);
+            r += buf;
+        }
+    } catch (const std::exception&) {
+        r += "; the GPU: unknown";
+    }
+    return r;
+}
+
 Stream stream_create() {
     try { return rt().create_stream(); }
     catch (const std::exception& e) { fail("stream_create", e); return nullptr; }
@@ -263,6 +294,11 @@ Stream stream_create() {
 Stream stream_create_capture() {
     try { return rt().create_capture_stream(); }
     catch (const std::exception& e) { fail("stream_create_capture", e); return nullptr; }
+}
+
+Stream stream_create_copy() {
+    try { return rt().create_copy_stream(); }
+    catch (const std::exception& e) { fail("stream_create_copy", e); return nullptr; }
 }
 
 void stream_destroy(Stream s) {

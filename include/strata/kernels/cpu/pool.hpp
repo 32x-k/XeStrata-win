@@ -120,6 +120,8 @@ public:
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
+    /// The logical CPUs the workers are pinned to (--aux-cpus keeps every other thread off them).
+    const std::vector<int>& worker_cpus() const { return worker_cpus_; }
 
     /// Publish `n` jobs, then block until every one has been claimed AND every worker has parked.
     /// `jobs` must outlive the call (it does, and the workers never touch it afterwards).
@@ -236,6 +238,7 @@ private:
     std::condition_variable sleep_cv_;
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
     std::vector<std::thread> threads_;
+    std::vector<int> worker_cpus_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
     int mode_ = 0;
@@ -247,10 +250,11 @@ private:
     std::vector<SplitBuf> split_;
     // run_split_multi state: mode 3 = gate/up row parts, 4 = down row parts
     ExpertJobMulti* mjobs_ = nullptr;
-    int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H)
+    int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H;
+                            // a native layer's n_ff and n_embd)
     int mtasks_ = 1;        // equal row ranges the phase is cut into
     struct SplitBufMulti {
-        alignas(64) float ff[MAXT][FF];
+        alignas(64) float ff[MAXT][FF > kNativeMaxFF ? FF : kNativeMaxFF];
         ActQ a2[MAXT];
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
     };

@@ -8,6 +8,8 @@
 // separately rounded, which CUDA spelled with __dadd_rn/__dmul_rn.  A warp is a sub-group of 32.  The CUDA entry
 // points exited on a bad argument; these throw core::DeviceError.
 #include "strata/kernels/qsa.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_qsa
+#include "strata/kernels/device_arch_tag.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_stream.hpp"
@@ -135,6 +137,32 @@ void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_tabl
         }
     });
     finish(stream, e, "kv_append");
+}
+
+void kv_append_steps(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, const int32_t* step, int step_stride,
+                     const float* kcur, const float* vcur, int cur_stride, int n_tok, const QsaShapes& s, void* stream) {
+    validate(s, "kv_append_steps");
+    if (step == nullptr || n_tok < 0) fail("kv_append_steps: step is null or n_tok negative");
+    if (n_tok == 0) return;
+    const long long per = s.n_head_kv * s.head_dim, n = per * n_tok;
+    const int head_dim = (int) s.head_dim, kv_heads = (int) s.n_head_kv, page_size = (int) s.page_size;
+    const int32_t* table = page_table;
+    // kv_append_step's arithmetic for each of n_tok tokens: token t's position in step[t * step_stride + kStepPos],
+    // its K and V at kcur / vcur + t * cur_stride
+    const auto e = queue_for(stream).parallel_for(sycl::nd_range<1>(grid_for(n, THREADS), THREADS), [=](sycl::nd_item<1> it) {
+        const long long g = (long long) it.get_global_id(0);
+        if (g >= n) return;
+        const int t = (int) (g / per), i = (int) (g - (long long) t * per);
+        const long long pos = (long long) step[(long long) t * step_stride + kStepPos];
+        const int h = i / head_dim, d = i - h * head_dim;
+        const long long page = (long long) table[pos / page_size];
+        if (page >= 0) {
+            const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
+            k_pool[row * head_dim + d] = f16_from_f32(kcur[(long long) t * cur_stride + i]);
+            v_pool[row * head_dim + d] = f16_from_f32(vcur[(long long) t * cur_stride + i]);
+        }
+    });
+    finish(stream, e, "kv_append_steps");
 }
 
 void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, const QsaShapes& s,
