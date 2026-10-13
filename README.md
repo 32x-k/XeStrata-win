@@ -332,6 +332,9 @@ what has been checked in [docs/XE.md](docs/XE.md).
 
 ## For developers
 
+Before sending a report or a pull request, read [CONTRIBUTING.md](CONTRIBUTING.md) (no dependence on the model number, the licenses, the additional
+permission under GPL section 7, what goes in, and how to report).
+
 - **Building:** installing from the source, the three build modes (free, contrib-llvm, contrib-icpx), what setup does and the
   packages it needs, and how the deb and rpm packages are made are in [docs/BUILD.md](docs/BUILD.md).
   The development tools (lints, Intel SDE, GPU profilers): [docs/DEVTOOLS.md](docs/DEVTOOLS.md).
