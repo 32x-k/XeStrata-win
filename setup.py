@@ -2056,6 +2056,11 @@ def ram_ctx(model, ram, low_ram=False) -> int:
 # (--mmap-experts: a native pack's from the GGUF files in place, the AVX-512 Q2_0 pack's from its experts.bin), and
 # with --resident-experts copies the ones the GPU does not hold into RAM once.
 LOW_RAM_HEADROOM_GB = 10   # RAM beside the experts: the OS, the engine's other buffers, the server
+# low_ram_gpu_gb's room below which the engine finds no VRAM for its expert cache.  On an RX 9060 XT limited to 8 GB
+# (IQ3_XXS, the KV cache in VRAM) 128K with 8-bit KV (1.65 by that estimate) started with 178 slots and 262K with
+# 4-bit KV (1.28) was 267 MiB short: the estimate leaves out the engine's reserve, the draft head and the matrix
+# library.
+MIN_CACHE_GB = 1.5
 
 
 SMALL_CARD_GB = 7.5            # #496: a card under 8 GB gets a tip (an 8 GB card lists 7.99)
@@ -4318,6 +4323,14 @@ def main() -> int:
     elif ctx >= 65536:   # #620: say why, so a regenerated config without --kv-resident is no surprise
         ok(f"KV streaming off: it needs ~{kv_ram_gb:.1f} GB of RAM beside the ~{MODELS[model]['ram_gb']} GB {model} "
            f"uses, and this PC has {ram:.0f}; the KV cache stays in VRAM (fewer cached experts)")
+        # neither RAM nor VRAM holds that KV cache with the experts: the engine stops at start (no expert cache)
+        if low_ram_gpu_gb(model, small, ctx, kv) < MIN_CACHE_GB:
+            smaller = [c for c in CONTEXTS if c < ctx and low_ram_gpu_gb(model, small, c, kv) >= MIN_CACHE_GB]
+            q4 = kv != "q4_0" and low_ram_gpu_gb(model, small, ctx, "q4_0") >= MIN_CACHE_GB
+            warn(f"a {ctx // 1024}K context's KV cache leaves the GPU ({small:.0f} GB) no room for the expert cache, "
+                 "and the RAM has none for it either: the engine will not start. " +
+                 " or ".join(([f"--context {smaller[-1]}"] if smaller else []) + (["--kv q4_0"] if q4 else [])) +
+                 " makes room")
     if budget is not None:     # UD-Q4_K_XL: the experts read from the GGUF in place, the most-used N GiB kept in RAM
         args += ["--resident-budget-gib", f"{budget:g}"]
         if gpu.get("integrated") and "--expert-cache" in args:
