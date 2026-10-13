@@ -87,6 +87,15 @@ Read each one listed: what XeStrata does not have and needs goes into the ledger
 
 **The findings.** upstream's records and community reports of this range (`bench/`, its investigation documents) said something about a GPU or a setting XeStrata runs on (an Intel Arc investigation, a card's bottleneck, a setting users run): a line each, with what XeStrata could take from it. They are worked like ideas in step 4 when they point at something to try.
 
+**The licenses.** Every commit of the range that changes upstream's `LICENSE`, or adds code that names another copyright holder or license (an SPDX header, a notice such as ggml's MIT text, a vendored project), gets a line under its own heading with the holders and the license:
+
+```sh
+git diff --stat <base>..<tag> -- 'LICENSE*' 'NOTICE*'
+git log -p --no-merges <base>..<tag> | grep -nE '^\+.*(SPDX-|Copyright|Permission is hereby granted)'
+```
+
+What step 3 takes from it keeps those holders and that license (AGENTS.md, Licenses); a holder or license XeStrata did not carry before also goes into `NOTICE` (and `LICENSES/`, `REUSE.toml`).
+
 ## 3. Port the shared changes
 
 XeStrata's kernels are written from scratch (SYCL) and its prompt path and runtime have moved far from upstream's, so the tag cannot be merged (no `git merge`, no `git merge-tree`): every change taken is ported by hand onto `dev`, and the tag is recorded at the end, by a commit that keeps the tree as it is (step 9), as c3aa33ae (v0.1.40.2) and 0509e3e6 did.
@@ -96,6 +105,9 @@ XeStrata's kernels are written from scratch (SYCL) and its prompt path and runti
 - Each ledger line gets the commit that took it, or `N/A` and why (the code is not in XeStrata, or XeStrata does it another way).
 - The documents XeStrata has (Japanese first) get what is true of XeStrata; upstream's new documents are not copied as files.
 - Once the ledger is done, set `STRATA_UPSTREAM_VERSION` in `CMakeLists.txt` to the tag and `XESTRATA_REVISION` back to 1 (AGENTS.md, "Versions"), and replace any old upstream hash a document names with the rewritten one.
+- Then bring the license classes (AGENTS.md, Licenses) to the new tag, in one commit (`ライセンスの表示を upstream <version> に合わせる`): `python tools/license_class.py --fix` rewrites the headers, so a file brought back to upstream's content loses XeStrata's line and goes back to MIT, and one XeStrata has changed for the first time gets XeStrata's line and `LGPL-3.0-or-later AND MIT`.
+  What it reports and does not fix is fixed by hand: a `REUSE.toml` annotation (upstream's unchanged data files go under one with upstream's holders and MIT) and a file without a header. A new file of upstream's taken as it is gets a header with upstream's holders and MIT (the header is not a change); one taken and changed, both holders and `LGPL-3.0-or-later AND MIT`.
+  A later commit of the run that changes an unchanged file of upstream's also changes its header; step 6's lint finds the ones missed.
 
 ## 4. Port each idea and measure it
 
@@ -156,7 +168,10 @@ When the rule does not fit an idea (upstream's check does not apply to XeStrata'
 
 ```sh
 tools/lint/run.sh                          # the files that differ from HEAD
+python tools/license_class.py              # every file's license class against the tag
 ```
+
+The license check needs upstream's tag in the clone (step 1's fetch); without it, it is skipped.
 
 As AGENTS.md says, with intel/llvm only, in the free and contrib-llvm modes (the contrib-icpx mode is not built or tested):
 
