@@ -1274,8 +1274,9 @@ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream) {
 }
 
 // The stage stamps: %globaltimer (nanoseconds) where the kernel is compiled for NVPTX, whose devices report no
-// device-scope clock; elsewhere the device-scope clock, which counts device ticks (stamps are compared with one
-// another, and converting them to time needs the tick rate, which is not established here).
+// device-scope clock; the steady counter where it is compiled for AMD GPUs, whose HIP devices report none either;
+// elsewhere the device-scope clock.  The last two count device ticks (stamps are compared with one another, and
+// converting them to time needs the tick rate, which is not established here).
 void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     if (!gpu_stamp_available()) fail("gpu_stamp: the device has no clock a kernel reads");
     Q(stream).single_task([=] {
@@ -1283,6 +1284,8 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
         unsigned long long t;
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
         buf[i] = t;
+#elif defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+        buf[i] = (unsigned long long) __builtin_readsteadycounter();
 #elif defined(SYCL_EXT_ONEAPI_CLOCK)
         buf[i] = (unsigned long long) sycl::ext::oneapi::experimental::clock<
             sycl::ext::oneapi::experimental::clock_scope::device>();
@@ -1298,6 +1301,7 @@ bool gpu_stamp_available() {
 #else
     const sycl::device d = core::Runtime::get().compute().get_device();
     if (d.get_backend() == sycl::backend::ext_oneapi_cuda) return true;   // %globaltimer
+    if (d.get_backend() == sycl::backend::ext_oneapi_hip) return true;    // the steady counter
 #ifdef SYCL_EXT_ONEAPI_CLOCK
     return d.has(sycl::aspect::ext_oneapi_clock_device);
 #else

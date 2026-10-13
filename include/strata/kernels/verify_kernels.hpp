@@ -59,9 +59,10 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
 /// kernel runs (the verify window then runs in host-launched segments); the B70 sees both.  Synchronizes `stream`.
 bool doorbell_visible(void* stream);
 /// The device clock into buf[i] (a one-thread kernel: the verify window's stage profiler).  CUDA wrote %globaltimer
-/// in ns; SYCL's device-scope clock counts ticks of an unspecified rate, so stamps are only compared with each other.
+/// in ns; SYCL's device-scope clock and an AMD GPU's steady counter count ticks of an unspecified rate, so stamps are
+/// only compared with each other.
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
-/// Whether the device has the device-scope clock gpu_stamp reads (the B70 does not).
+/// Whether the device has a clock gpu_stamp reads (the B70 does not).
 bool gpu_stamp_available();
 
 // ---- perf-review E-6: a layer whose routed experts are all in VRAM needs nothing from the host

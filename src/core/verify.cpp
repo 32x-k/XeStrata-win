@@ -1385,11 +1385,11 @@ std::string Verifier::profile_report() {
         for (int i = 0; i < kProfPer; ++i) {
             if (prof_sum_[k][i] <= 0) continue;
             total += prof_sum_[k][i];
-            std::snprintf(b, sizeof b, " %s %.2f", names[i], prof_sum_[k][i] / 1e6 / (double) prof_windows_);
+            std::snprintf(b, sizeof b, " %s %.3f", names[i], prof_sum_[k][i] / 1e6 / (double) prof_windows_);
             out += b;
         }
     }
-    std::snprintf(b, sizeof b, " | total %.2f M ticks/window over %lld windows", total / 1e6 / (double) prof_windows_, (long long) prof_windows_);
+    std::snprintf(b, sizeof b, " | total %.3f M ticks/window over %lld windows", total / 1e6 / (double) prof_windows_, (long long) prof_windows_);
     out += b;
     for (auto& r : prof_sum_) for (double& d : r) d = 0;
     prof_windows_ = 0;
