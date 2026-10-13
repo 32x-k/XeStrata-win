@@ -39,7 +39,8 @@ TAG = "v7.1.1"
 
 # Fixes the release lacks (its sycl branch too, on 2026-10-05): third_party/main/intel-llvm/patches/NN-<id>.patch,
 # applied in order to the clone before the configuration (under intel/llvm's license, Apache-2.0 with LLVM
-# exceptions).  A finished install records the ids it was built with.
+# exceptions).  A finished install records the ids it was built with.  90-99 are the Windows port's (applied last), so
+# the numbers XeStrata's own fixes take next do not collide with them.
 PATCHES = sorted((ROOT / "third_party" / "main" / "intel-llvm" / "patches").glob("[0-9][0-9]-*.patch"))
 
 
