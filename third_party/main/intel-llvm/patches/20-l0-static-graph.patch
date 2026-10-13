@@ -1,0 +1,73 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+l0-static-graph: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+Where the system's Level Zero is older than 1.32 (Ubuntu 26.04's libze 1.28, where the packages are
+built), the Level Zero adapters link the loader statically, and the static loader forwards the stable
+record and replay graph functions to the system's loader at run time.  The system's 1.28 loader lacks
+them, and the static one then answers the first call UNSUPPORTED and calls a null pointer on the next
+(the static loader's ze_libapi.cpp, 1.32 to 1.34).  The adapter took the functions as there, the
+static loader's own entry points being not null, whenever the driver announced the stable graph
+extension: compute-runtime 26.35.39758.10 does.  handler::finalize asks every queue whether a graph
+capture is on, and oneMKL's GEMM submits through the handler, so the engine ended with SIGSEGV at its
+first product with oneMKL installed on an Arc Pro B70 (XeStrata issue #12).  Fixed, with the static
+loader the graph functions are used only when the system's loader has them, as the static one finds
+them (libze_loader.so.1, ze_loader.dll).
+---
+diff --git a/unified-runtime/source/adapters/level_zero/platform.cpp b/unified-runtime/source/adapters/level_zero/platform.cpp
+index 13fc407cf..5bb729805 100644
+--- a/unified-runtime/source/adapters/level_zero/platform.cpp
++++ b/unified-runtime/source/adapters/level_zero/platform.cpp
+@@ -5,6 +5,7 @@
+ // Part of the Unified-Runtime Project, under the Apache License v2.0 with LLVM
+ // Exceptions. See LICENSE.TXT
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// Modified 2026 by MistVVK and the XeStrata contributors: the static loader's graph functions only when the system's loader has them (l0-static-graph)
+ //
+ //===----------------------------------------------------------------------===//
+ 
+@@ -757,6 +758,42 @@ ur_result_t ur_platform_handle_t_::initialize() {
+           (ZeGraphExt.zeGraphDumpContentsExp != nullptr) &&
+           (ZeGraphExt.zeGraphDestroyExp != nullptr) &&
+           (ZeGraphExt.zeExecutableGraphDestroyExp != nullptr);
++#ifdef UR_STATIC_LEVEL_ZERO
++      // The statically linked loader forwards these entry points to the
++      // system's Level Zero loader, which may predate them (1.28): the static
++      // one then answers the first call UNSUPPORTED and calls a null pointer
++      // on the next (its ze_libapi.cpp, loader 1.32 to 1.34).  A driver that
++      // announces the stable graph extension (compute-runtime 26.35) with such
++      // a loader ended the program at its second graph-capture query.  So they
++      // are used only when the system's loader has them.
++      {
++#ifdef _WIN32
++        auto SystemLoader =
++            ur_loader::LibLoader::loadAdapterLibrary("ze_loader.dll");
++#else
++        auto SystemLoader =
++            ur_loader::LibLoader::loadAdapterLibrary("libze_loader.so.1");
++#endif
++        auto Has = [&](const char *Name) {
++          return SystemLoader &&
++                 ur_loader::LibLoader::getFunctionPtr(SystemLoader.get(),
++                                                      Name) != nullptr;
++        };
++        for (const char *Name :
++             {"zeCommandListBeginGraphCaptureExt",
++              "zeCommandListBeginCaptureIntoGraphExt",
++              "zeCommandListEndGraphCaptureExt", "zeCommandListAppendGraphExt",
++              "zeCommandListIsGraphCaptureEnabledExt", "zeGraphCreateExt",
++              "zeGraphInstantiateExt", "zeGraphIsEmptyExt",
++              "zeGraphDumpContentsExt", "zeGraphDestroyExt",
++              "zeExecutableGraphDestroyExt"})
++          ZeGraphExt.Supported = ZeGraphExt.Supported && Has(Name);
++        if (!Has("zeCommandListGetGraphExt"))
++          ZeGraphExt.zeCommandListGetGraphExp = nullptr;
++        if (!Has("zeGraphSetDestructionCallbackExt"))
++          ZeGraphExt.zeGraphSetDestructionCallbackExp = nullptr;
++      }
++#endif
+     }
+ 
+     // zeGraphGetIdExt must be special-cased: it isn't part of the graph DDI

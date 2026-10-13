@@ -110,7 +110,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   `rocm-dev` に引かれて自動で入ったものは、`rocm-dev` が消えると `apt autoremove` の対象になるので、`sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo` で手動の印を付けます。
 - スクリプトは、リリースにない修正を `third_party/main/intel-llvm/patches/` のパッチ（`NN-<id>.patch`、intel/llvm と同じ Apache-2.0 WITH LLVM-exception）として番号順にソースに当ててからビルドし、当てた修正の id を `install/XESTRATA.json` に残します。
   修正の足りない同じ版のビルドがあれば、作り直すかを尋ねます。
-  今の修正は 14 で、最初の 12 はどれも intel/llvm の `sycl` ブランチでも直っていません（2026-10-08）。
+  今の修正は 15 で、最初の 12 はどれも intel/llvm の `sycl` ブランチでも直っていません（2026-10-08）。15 番目も直っていません（2026-10-14）。
   1 つ目: CUDA と HIP のアダプタが、コマンドバッファにノードを足すたびに同期点の表を丸ごとコピーしていて、SYCL のグラフの完成にノード数の 2 乗の時間がかかっていました（2600 カーネルのグラフで、RTX 4070 では 90 ms、修正後は 4 ms。Level Zero は 2 ms）。
   2 つ目: SYCL のランタイムが、どの NVIDIA の GPU にも最初に見つけた NVIDIA の像を、アーキテクチャを見ずに渡していました。
   いくつかのアーキテクチャのコードを持つ実行ファイルでは、その像より古い GPU は動かず、新しい GPU は古いコードを走らせていました。
@@ -148,8 +148,13 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   14 番目: HIP のアダプタが GPU の空きメモリ（SYCL の `ext_intel_free_memory`）を、その GPU を current にせずに `hipMemGetInfo` で答えていて、どの AMD の GPU もスレッドの current の GPU の空きを報告していました。
   AMD の GPU 2 枚で層を分割すると、2 段目は 1 段目のエキスパートのキャッシュでほぼ埋まった空きを見て、自分のキャッシュの場所がないと言って止まっていました。
   修正後は、アダプタのほかの呼び出しと同じく、その GPU を current にしてから問い合わせます（`hip-mem-free-device`。CUDA のアダプタは問い合わせのたびにその GPU のコンテキストを current にしています）。
+  15 番目: システムの Level Zero が 1.32 より古いとき（パッケージを作る Ubuntu 26.04 の libze は 1.28）、Level Zero のアダプタはローダーを静的にリンクし、静的なローダーは安定版のグラフ（record and replay）の関数を実行時にシステムのローダーへ回します。
+  1.28 のローダーはその関数を持たず、静的なローダーは 1 回目の呼び出しには UNSUPPORTED を返し、2 回目に NULL のポインターを呼んでいました（静的なローダーの ze_libapi.cpp、1.32 から 1.34）。
+  アダプタは、静的なローダー自身の入り口が NULL でないので関数があると見なし、安定版のグラフの拡張を名乗るドライバー（compute-runtime 26.35.39758.10）では、キューに投入するたびの問い合わせ（`handler::finalize` の `urQueueIsGraphCaptureEnabledExp`）を通していました。
+  oneMKL の GEMM はこの道を通るので、Arc Pro B70 で oneMKL を入れるとエンジンが最初の積で SIGSEGV で止まっていました（XeStrata の issue #12）。
+  修正後は、静的なローダーを使うとき、システムのローダー（`libze_loader.so.1`、`ze_loader.dll`）がグラフの関数を持つ場合にだけ使います（`l0-static-graph`）。
   CUDA の修正は contrib-llvm のツールチェーンにだけ、HIP の修正は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
-  `offload-bundle-arch` はどのツールチェーンにも作り直しを求めます。
+  `offload-bundle-arch` と `l0-static-graph` はどのツールチェーンにも作り直しを求めます。
 - スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。
 - 開発機（Ubuntu 26.04、CUDA 12.4、ROCm 7.1）では、ランタイムのバックエンドが cuda・hip・level_zero・opencl になりました。
 - NVIDIA の GPU の上で動かすには、NVIDIA のドライバー（Ubuntu 26.04 では `nvidia-driver-610-open` など）が要ります。

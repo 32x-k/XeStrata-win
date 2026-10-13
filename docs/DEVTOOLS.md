@@ -110,7 +110,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Packages that came in automatically with `rocm-dev` become `apt autoremove` candidates once it is gone; mark them with `sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo`.
 - The script applies fixes the release lacks to the sources before building, as the patches in `third_party/main/intel-llvm/patches/` (`NN-<id>.patch`, in order; under intel/llvm's Apache-2.0 WITH LLVM-exception), and records their ids in `install/XESTRATA.json`.
   A build of the same release without them is offered a rebuild.
-  There are fourteen fixes now; none of the first twelve is fixed in intel/llvm's `sycl` branch either (2026-10-08).
+  There are fifteen fixes now; none of the first twelve is fixed in intel/llvm's `sycl` branch either (2026-10-08), nor the fifteenth (2026-10-14).
   First, the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).
   Second, the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture.
   With an executable carrying code for several architectures, a GPU older than that image did not run and a newer one ran older code.
@@ -148,8 +148,13 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Fourteenth, the HIP adapter answered a GPU's free memory (SYCL's `ext_intel_free_memory`) with `hipMemGetInfo` without making that GPU current, so every AMD GPU reported the free memory of the thread's current one.
   A layer split over two AMD GPUs saw the first stage's free memory, nearly all of it held by its expert cache, on the second stage, which found no room for its own cache and stopped.
   Fixed, the GPU is made current before the query, as the adapter's other calls do (`hip-mem-free-device`; the CUDA adapter makes the GPU's context current for every query).
+  Fifteenth, where the system's Level Zero is older than 1.32 (Ubuntu 26.04's libze 1.28, where the packages are built), the Level Zero adapters link the loader statically, and the static loader hands the stable record and replay graph functions on to the system's loader at run time.
+  The 1.28 loader lacks them, and the static one answered the first call UNSUPPORTED and called a null pointer on the next (the static loader's ze_libapi.cpp, 1.32 to 1.34).
+  The adapter took the functions as there, the static loader's own entry points being not null, and with a driver that announces the stable graph extension (compute-runtime 26.35.39758.10) the query made at every submission to a queue (`urQueueIsGraphCaptureEnabledExp` in `handler::finalize`) went through.
+  oneMKL's GEMM takes that path, so with oneMKL installed the engine stopped with SIGSEGV at its first product on an Arc Pro B70 (XeStrata issue #12).
+  Fixed, with the static loader the graph functions are used only when the system's loader (`libze_loader.so.1`, `ze_loader.dll`) has them (`l0-static-graph`).
   The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
-  `offload-bundle-arch` asks every toolchain.
+  `offload-bundle-arch` and `l0-static-graph` ask every toolchain.
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).
 - On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.
 - Running on an NVIDIA GPU needs NVIDIA's driver (on Ubuntu 26.04, `nvidia-driver-610-open` or another).
