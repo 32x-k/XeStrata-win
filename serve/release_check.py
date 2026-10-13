@@ -63,6 +63,9 @@ def vtuple(v) -> tuple | None:
 
 
 def how_to_update(root: Path = ROOT) -> str:
+    if packaged(root) and os.name == "nt":
+        return (f"download the new 7z from {RELEASES}, unpack it into a folder of its own and start xestrata.exe "
+                "there; the models and settings stay")
     if packaged(root):
         return (f"download the new package from {RELEASES} and install it as before (sudo apt install ./<file>.deb "
                 "or sudo dnf install ./<file>.rpm); the models and settings stay")

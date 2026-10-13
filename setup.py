@@ -384,8 +384,11 @@ VEXE = {k: v + (".exe" if WIN else "") for k, v in
 #   {"type": "fail", "text": ..., "hint": ...} (then setup exits with 1),
 #   {"type": "progress", "what": ..., "done": bytes, "total": bytes or 0},
 #   {"type": "log", "text": ...} (a line a program setup runs printed),
-#   {"type": "ask", "question": ..., "choices": [...], "default": ...}: the answer is one line on stdin.
-# A line that is not a JSON object is plain log text.  Read from the command line before anything is printed.
+#   {"type": "ask", "question": ..., "choices": [...], "default": ...}: the answer is one line on stdin;
+#   --describe: {"type": "describe", ...} (describe()); --check-update: {"type": "update", "current": ...,
+#   "latest": ..., "newer": ..., "url": ..., "how": ...}.
+# A line that is not a JSON object is plain log text (the server's own lines, once setup starts it).  Read from the
+# command line before anything is printed.
 JSON_OUT = "--json" in sys.argv[1:]
 
 
@@ -2730,7 +2733,12 @@ def check_update() -> int:
     except (OSError, ValueError) as e:
         say(f"This is XeStrata xe{current}. {release_check.error_text(e)}: see {release_check.RELEASES}")
         return 1
-    if not release_check.is_newer(latest, current):
+    newer = release_check.is_newer(latest, current)
+    if JSON_OUT:                                       # the launcher's banner
+        emit({"type": "update", "current": f"xe{current}", "latest": latest["tag"], "newer": bool(newer),
+              "url": latest["url"], "how": release_check.how_to_update(ROOT)})
+        return 0
+    if not newer:
         say(f"XeStrata xe{current} is up to date (the latest release is {latest['tag']}).")
         return 0
     say(f"XeStrata {latest['tag']} is out (this is xe{current}): {latest['url']}")
@@ -3573,9 +3581,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     if a.vision not in (None, "no", "none"):
         warn(f"images are not available with {fam['title']} yet: off")
     # the context: up to the model's, recommended by the smallest card's memory as for Qwen3.8-Flash-Next
-    small = min(x.get("uma_gb", x["vram_gb"]) for x in chosen)
     contexts = [c for c in CONTEXTS if c <= fam["max_context"]]
-    rec_ctx = 32768 if small < 14 else 65536 if small < 20 else 131072
+    rec_ctx = vram_ctx(chosen)
     if a.context:
         ctx = a.context
         if ctx > fam["max_context"]:
@@ -3700,6 +3707,71 @@ def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images
     return start(cfg_path, port)
 
 
+def vram_ctx(cards: list) -> int:
+    """The context the GPUs' memory recommends: each card keeps its layers' KV of the whole context, so the smallest
+    decides; an AMD APU, in the memory it can use in all."""
+    small = min(x.get("uma_gb", x["vram_gb"]) for x in cards)
+    return 32768 if small < 14 else 65536 if small < 20 else 131072
+
+
+def describe() -> dict:
+    """What a front end (the Windows launcher) shows before it asks anything, as one object: this PC (RAM, CPU, the
+    GPUs and why one cannot be used, the one setup takes by default), every model family and size with the RAM it
+    needs, whether it fits and which is recommended (the rules the questions of step 2 use, for that GPU), the data
+    folder and the installed models.  It reports only: nothing is made, moved or saved.  The front end passes its
+    choices back as --family, --model, --context, --gpu and --data-dir."""
+    ram = ram_gb()
+    found = gpus()
+    # the card choose_gpus takes without --gpu: the supported one with the most VRAM
+    usable = sorted([g for g in found if gpu_problem(g) is None], key=lambda x: (-round(x["vram_gb"]), x["index"]))
+    gpu = usable[0] if usable else None
+    vram = gpu_expert_vram(gpu) if gpu else 0.0
+    by_vram = vram_ctx([gpu]) if gpu else 32768
+    families = []
+    for f, fam in FAMILIES.items():
+        models = []
+        if fam.get("plain"):
+            names = list(fam["models"])
+            rec = next((m for m in names if fam["models"][m].get("tested")), names[0])
+            for m in names:
+                d = fam["models"][m]
+                gb = d["size"] / 1e9
+                models.append({"id": m, "about": d["about"], "download_gb": round(gb, 1), "ram_gb": round(gb + 8),
+                               "fits": "yes" if ram >= gb + 8 else "slow", "tested": bool(d.get("tested")),
+                               "experimental": False, "recommended": m == rec,
+                               "context": min(by_vram, fam["max_context"])})
+            max_ctx = fam["max_context"]
+        else:
+            names = sorted((m for m in MODELS if f in MODELS[m].get("families", ("qwen", "swift"))),
+                           key=lambda m: bool(MODELS[m].get("experimental")))
+            rec = names[names.index("IQ3_XXS")] if ram >= 60 and "IQ3_XXS" in names else names[0]
+            for m in names:
+                d = MODELS[m]
+                low = not d.get("budget") and low_ram_needed(m, ram) and low_ram_fits(m, ram, vram)
+                fits = ("budget" if d.get("budget") else "yes" if ram >= d["ram_gb"] else "low-ram" if low else
+                        "no")
+                models.append({"id": m, "about": d["about"], "download_gb": d["download_gb"], "ram_gb": d["ram_gb"],
+                               "fits": fits, "tested": True, "experimental": bool(d.get("experimental")),
+                               "recommended": m == rec, "context": min(by_vram, ram_ctx(m, ram, low))})
+            max_ctx = CONTEXTS[-1]
+        families.append({"id": f, "title": fam["title"], "by": fam["by"], "about": fam["about"],
+                         "license": fam.get("license"), "experimental": bool(fam.get("experimental")),
+                         "contexts": [c for c in CONTEXTS if c <= max_ctx], "models": models})
+    installed = []
+    for c in installed_configs():
+        ch = choices_from_config(c)
+        cfg = json.loads(c.read_text(encoding="utf-8-sig"))
+        installed.append({"config": str(c), "model_name": cfg.get("model_name", c.stem), "family": ch["family"],
+                          "model": ch["model"], "context": ch["context"], "port": ch["port"] or 8095})
+    return {"type": "describe", "version": source_version(), "packaged": bool(PACKAGED),
+            "ram_gb": round(ram, 1), "cpu": dict(zip(("name", "avx2", "avx512"), cpu_info())),
+            "gpu": gpu["index"] if gpu else None,
+            "gpus": [{"index": g["index"], "name": g["name"], "vendor": g.get("vendor"),
+                      "vram_gb": round(g["vram_gb"], 1), "integrated": bool(g.get("integrated")), "pci": g.get("pci"),
+                      "problem": gpu_problem(g)} for g in found],
+            "data_dir": str(data_folder_path(None, load_settings())), "families": families, "installed": installed}
+
+
 def main() -> int:
     # Windows: the 7z's prebuilt engine only (PACKAGED); this folder compiles one on Linux only
     if sys.platform != "linux" and not (WIN and PACKAGED):
@@ -3810,6 +3882,10 @@ def main() -> int:
     ap.add_argument("--json", action="store_true",
                     help="one JSON object a line for a front end (the Windows launcher): messages, steps, progress and "
                          "questions, whose answers are read as lines on stdin")
+    ap.add_argument("--describe", action="store_true",
+                    help="print this PC, the model families and sizes (with the RAM they need and the recommended "
+                         "ones), the data folder and the installed models as one JSON object, and exit (the Windows "
+                         "launcher's first screen)")
     ap.add_argument("--setup", action="store_true", help="install another model or change settings")
     ap.add_argument("--no-start", action="store_true", help="install only, do not start the model")
     ap.add_argument("--update", action="store_true",
@@ -3895,6 +3971,9 @@ def main() -> int:
         return remove_data()
     if a.check_update:
         return check_update()
+    if a.describe:
+        emit(describe())
+        return 0
     say("Strata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
     # --check only reports (a user ran it to look, on a work machine): nothing made, moved or saved.  Given with what
     # acts before it (a measurement, an update), the data folder is prepared as for those
@@ -4192,9 +4271,8 @@ def main() -> int:
         warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose" + (" (--model)" if a.model else ""))
     ok(f"size: {model}")
     tag = fam["tag"] + model                           # names of the pack, config and start script
-    # each card keeps its layers' KV of the whole context; an AMD APU, in the memory it can use in all
-    small = min(x.get("uma_gb", x["vram_gb"]) for x in chosen)
-    rec_ctx = 32768 if small < 14 else 65536 if small < 20 else 131072
+    small = min(x.get("uma_gb", x["vram_gb"]) for x in chosen)   # the smallest card's memory, for the KV notes below
+    rec_ctx = vram_ctx(chosen)
     # upstream #406: the RAM rule is part of the recommendation (the smaller of the two), not a cap over the choice
     rec_ctx = min(rec_ctx, ram_ctx(model, ram, low_ram))
     if a.context:
