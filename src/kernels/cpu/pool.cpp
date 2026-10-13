@@ -381,7 +381,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 SplitBufMulti& sb = split_multi_[(size_t) e];
                 if (mode_ == 5 && nfmt_->gu_type == 42) {
                     // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
-                    thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
+                    // rows r0..r1 of the layer's n_ff, which native_fmt allows up to kNativeMaxFF (as sb.ff)
+                    thread_local float gbuf[MAXT][kNativeMaxFF], ubuf[MAXT][kNativeMaxFF];
                     float* gp[MAXT];
                     float* up[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
