@@ -101,8 +101,9 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     const int64_t want = T;
     int64_t first = n;
     const int64_t lowest = std::max<int64_t>(n / 2, cache_.last_piece_first());
+    const int64_t least = std::clamp<int64_t>(want, 1, 16);   // a prompt under 16 tokens: one chunk of its length
     for (;; T /= 2) {
-        if (T < 16) break;
+        if (T < least) break;
         prompt_carve(T, pb_, nullptr, nullptr, db, hb);
         first = n;
         while (first > lowest && off[n] - off[first] < db) --first;
@@ -110,7 +111,7 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     }
     // the buffers of their own when their chunk is no shorter than the borrowed one: no slot lent, prompt_return
     // gives back none
-    if (prompt_dev_ != nullptr && (T < 16 || std::min(want, prompt_dev_T_) >= T)) {
+    if (prompt_dev_ != nullptr && (T < least || std::min(want, prompt_dev_T_) >= T)) {
         const int64_t pieces = (want + prompt_dev_T_ - 1) / prompt_dev_T_;   // even chunks: no short last one
         T = (want + pieces - 1) / pieces;
         borrowed_res_.clear();
@@ -121,7 +122,12 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
         g.identity = false;
         return true;
     }
-    if (T < 16) { err = "plain prompt: the VRAM tier is too small for the prompt's buffers"; return false; }
+    if (T < least) {
+        err = "plain prompt: the VRAM tier is too small for the prompt's buffers (" + std::to_string(least) +
+              " tokens need " + std::to_string(db >> 20) + " MiB, the tier lends at most " +
+              std::to_string((off[n] - off[lowest]) >> 20) + " MiB of its " + std::to_string(off[n] >> 20) + ")";
+        return false;
+    }
     borrowed_res_.clear();
     for (int64_t l = 0; l < L; ++l)
         for (int64_t e = 0; e < E; ++e) {
