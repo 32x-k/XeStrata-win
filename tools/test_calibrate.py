@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Tests for tools/calibrate.py and setup's use of it, without a GPU: a stand-in engine whose decode speed is a
 function of the settings it runs with.
 

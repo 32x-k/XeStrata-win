@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/layout.hpp - the pack's LAYOUT, resolved by name and checked against the kernels.
 //
 // `WeightTable` answers "where are the bytes".  This answers "is this the tensor I think it is", and it is
@@ -22,6 +22,10 @@
 
 #include <cstdint>
 #include <string>
+
+namespace strata {
+struct ModelSpec;
+}
 
 namespace strata::core {
 
@@ -60,6 +64,12 @@ struct ModelGeometry {
     int64_t n_qsa_layers() const { return n_layers / qsa_interval; }
     int64_t n_gdn_layers() const { return n_layers - n_qsa_layers(); }
 };
+
+/// Fills `g` from a qwen4exp model's GGUF shape (artifact/model_spec.hpp).  The engine's kernels are built for
+/// the defaults above, so every value the file writes must equal its default - except `n_expert`, which a pruned
+/// variant (the GSQ-RCO Coder) legitimately lowers.  False, naming the first value that differs, otherwise and for
+/// any other architecture.
+bool geometry_from_spec(const strata::ModelSpec& s, ModelGeometry& g, std::string& err);
 
 /// True for the full-attention layers.  `docs/semantics.md` gives this twice over - `full_attention_interval
 /// = 4` and an explicit `attention.compress_ratios` array - and this is the first of the two.

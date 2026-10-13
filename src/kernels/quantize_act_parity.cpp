@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/quantize_act_parity.cpp - P2.S2's parity test for the Q8_0 activation quantizer.
 //
 // THE CHECK IS ON THE BYTES, not on the round-tripped values.  `ref/quant.py::q8_0`'s central finding is that

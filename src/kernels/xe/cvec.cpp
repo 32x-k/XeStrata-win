@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/cvec.cpp - the Xe port of Strata's src/kernels/cuda/cvec.cu (see the header): the control vector, applied to the
 // residual streams after a layer's FFN write, optionally folding in that pending write first.
 //

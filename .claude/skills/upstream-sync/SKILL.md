@@ -47,13 +47,13 @@ Write `.upstream-<version>.md` (add it to `.git/info/exclude`, as `.upstream-014
 | Group | What | Taken |
 | --- | --- | --- |
 | A | AMD, HIP | as ideas (below) |
-| B | bench records | the records as they are; read them for findings (below) |
+| B | bench records | not taken (AGENTS.md, Measurement records); read them for findings (below) |
 | D | documents | what is true of XeStrata, into its documents (Japanese first); read upstream's investigation records for findings |
 | E | engine features and fixes | all |
 | M | several GPUs | all |
 | N | NVIDIA, every generation (Pascal, Volta, Turing included) | as ideas (below) |
 | P | speed paths | as ideas (below) |
-| S | upstream's `sycl/` | not taken: measured as a competitor (step 7) |
+| S | upstream's `sycl/` | not taken, and not measured in a merge (the release's table compares it) |
 | T | serve, setup, tools | ported (step 3) |
 | W | Windows | not taken |
 
@@ -87,6 +87,15 @@ Read each one listed: what XeStrata does not have and needs goes into the ledger
 
 **The findings.** upstream's records and community reports of this range (`bench/`, its investigation documents) said something about a GPU or a setting XeStrata runs on (an Intel Arc investigation, a card's bottleneck, a setting users run): a line each, with what XeStrata could take from it. They are worked like ideas in step 4 when they point at something to try.
 
+**The licenses.** Every commit of the range that changes upstream's `LICENSE`, or adds code that names another copyright holder or license (an SPDX header, a notice such as ggml's MIT text, a vendored project), gets a line under its own heading with the holders and the license:
+
+```sh
+git diff --stat <base>..<tag> -- 'LICENSE*' 'NOTICE*'
+git log -p --no-merges <base>..<tag> | grep -nE '^\+.*(SPDX-|Copyright|Permission is hereby granted)'
+```
+
+What step 3 takes from it keeps those holders and that license (AGENTS.md, Licenses); a holder or license XeStrata did not carry before also goes into `NOTICE` (and `LICENSES/`, `REUSE.toml`).
+
 ## 3. Port the shared changes
 
 XeStrata's kernels are written from scratch (SYCL) and its prompt path and runtime have moved far from upstream's, so the tag cannot be merged (no `git merge`, no `git merge-tree`): every change taken is ported by hand onto `dev`, and the tag is recorded at the end, by a commit that keeps the tree as it is (step 9), as c3aa33ae (v0.1.40.2) and 0509e3e6 did.
@@ -96,6 +105,9 @@ XeStrata's kernels are written from scratch (SYCL) and its prompt path and runti
 - Each ledger line gets the commit that took it, or `N/A` and why (the code is not in XeStrata, or XeStrata does it another way).
 - The documents XeStrata has (Japanese first) get what is true of XeStrata; upstream's new documents are not copied as files.
 - Once the ledger is done, set `STRATA_UPSTREAM_VERSION` in `CMakeLists.txt` to the tag and `XESTRATA_REVISION` back to 1 (AGENTS.md, "Versions"), and replace any old upstream hash a document names with the rewritten one.
+- Then bring the license classes (AGENTS.md, Licenses) to the new tag, in one commit (`ライセンスの表示を upstream <version> に合わせる`): `python tools/license_class.py --fix` rewrites the headers, so a file brought back to upstream's content loses XeStrata's line and goes back to MIT, and one XeStrata has changed for the first time gets XeStrata's line and `LGPL-3.0-or-later AND MIT`.
+  What it reports and does not fix is fixed by hand: a `REUSE.toml` annotation (upstream's unchanged data files go under one with upstream's holders and MIT) and a file without a header. A new file of upstream's taken as it is gets a header with upstream's holders and MIT (the header is not a change); one taken and changed, both holders and `LGPL-3.0-or-later AND MIT`.
+  A later commit of the run that changes an unchanged file of upstream's also changes its header; step 6's lint finds the ones missed.
 
 ## 4. Port each idea and measure it
 
@@ -107,7 +119,7 @@ Every idea is ported and measured, whether XeStrata wins or loses against upstre
 - Port it behind an environment switch (`STRATA_<NAME>=0|1`, or the option upstream gave it), so it can be measured on and off and turned off later. Related ideas go in as a group, each behind its own switch.
 - Its condition is XeStrata's: what the device reports (matrix units, memory, the PCIe link, the CPU pool's measured speed), not upstream's backend.
 - An exact change that can be checked bitwise is checked by a probe; an opt-in feature is run once to see it works.
-- A speed idea is measured with `scripts/ab_pair.py`: the same binary with its switch off (A) and on (B), alternating, in the setting the idea is for (its tier, the serve path, a conversation; `TIERS`, `MODES`, `CONVS`), on all three GPUs and on each with its matrix units off (`STRATA_NO_XMX`, `STRATA_NO_BF16_MMA`, `STRATA_NO_INT8_MMA`).
+- A speed idea is measured with `scripts/ab_pair.py`: the same binary with its switch off (A) and on (B), in the setting the idea is for (its tier, the serve path, a conversation; `TIERS`, `MODES`, `CONVS`), once (`ROUNDS=1`) on one GPU, the one the idea is most likely to help (the user's decision of 2026-10-12).
   Both runs are XeStrata with one seed: they write one text unless the switch changes the output, so the difference is the switch's alone and a difference of 1 to 2% shows.
 
 ```sh
@@ -117,7 +129,9 @@ A="env STRATA_X=0 build/contrib-llvm/strata" B="env STRATA_X=1 build/contrib-llv
 python .claude/skills/upstream-sync/scripts/judge.py <out>        # B against A per cell
 ```
 
-- Kept on where it is faster on a GPU and slower on none (chosen at run time from what the device reports where it helps only some); opt-in where it is faster nowhere but upstream keeps it as an option; removed otherwise. The numbers go into the idea's line, the commit and the record.
+- Faster on that GPU, or equal (within ±1%): kept, on by default.
+  Slower: measured once on each of the two other GPUs; kept on where it is faster or equal there (chosen at run time from what the device reports, when it helps only some); opt-in where it is slower everywhere but upstream keeps it as an option; removed otherwise.
+  The numbers go into the idea's line, the commit and the record.
 - Probes on the B70 and the RTX 4070 may run together; whole-engine A/B runs one card at a time.
 
 ### GPUs there is no machine for
@@ -154,7 +168,10 @@ When the rule does not fit an idea (upstream's check does not apply to XeStrata'
 
 ```sh
 tools/lint/run.sh                          # the files that differ from HEAD
+python tools/license_class.py              # every file's license class against the tag
 ```
+
+The license check needs upstream's tag in the clone (step 1's fetch); without it, it is skipped.
 
 As AGENTS.md says, with intel/llvm only, in the free and contrib-llvm modes (the contrib-icpx mode is not built or tested):
 
@@ -187,17 +204,17 @@ Against the tag, a cell (file, GPU, tier, prompt or output) passes when XeStrata
 The serve cells (GPU, tier, greedy or t07; prompt, follow-ups, output), read from `matrix-serve.json`, and the everyday cells (GPU, conversation; first token, prompt, output), read from `matrix-usage.json`, pass at most `SERVE_LIMIT` (`judge.py`, 5%) below upstream's, the prompt speed at 1%: each engine writes its own text there, so the other measures vary with the text from round to round (the rounds' seeds differ), up to 10% off a cell's median at temperature 0.7 on 2026-10-10.
 A cell upstream does not finish, finishes at 10 tok/s or less, or is stopped as that slow, is left out; one only XeStrata does not finish fails.
 A file whose experts do not fit in a machine's RAM budget, so that they are read from the SSD while it answers (SSD offload: UD-Q4_K_XL on the AMD container's 62 GB), is not run on that machine (the user's decision of 2026-10-09): as for GPUs there is no machine for (step 4), its paths are checked by the tests and the builds only, and the record lists its cells `unverified`.
-The B70's output cells are judged like the others (the user's decision of 2026-10-11, which replaces the `--prompt-only B70` of 2026-10-09): only the 10 tok/s rule above leaves a cell out.
+The B70 is not measured against upstream in a merge (the user's decision of 2026-10-12, to save time; it replaces the B70 rules of 2026-10-09 and 2026-10-11): it runs XeStrata alone (`UP=none`) and every cell of it is judged against the previous XeStrata (`prev` lines) only. The RTX 4070 and the RX 9060 XT are judged against both. The release's speed table (/release) still compares the B70 with upstream's `sycl/`.
 
 Against the previous XeStrata (`prev` lines), every cell both records have is judged: the prompt at 1%, the rest at `SERVE_LIMIT`, since the text changes with the version (on the generate path it is the tag's).
-The two records were measured on different days, so a `prev` failure is measured again before it is worked: `ab_pair.py` with the previous XeStrata's binary (A, built from its tag in a worktree) and HEAD's (B), in that cell's setting, one seed. That A/B decides.
+The previous XeStrata is not measured again: its record is the reference (the user's decision of 2026-10-12). A `prev` failure suspected of noise (another cell of the same run moved the other way, or upstream moved as much in the same run) is measured once more in the same setting; one still slower then, or not suspected of noise, is worked at once, the ideas' switches off one at a time with `ab_pair.py` (only the side that changed is measured: a greedy run of the same binary, settings and text is read from its record, AGENTS.md).
 
 For each failing cell: find where the time goes (the GPU profilers of docs/DEVTOOLS.md, the engine's timing lines), read how upstream does that part (for a `prev` failure: what changed since the previous XeStrata, `git log <xe tag>..HEAD`), make XeStrata faster (step 4's rules), and measure that cell again.
 The run is done only when a full run of step 7 on the final HEAD, every file and tier of the table (IQ3_XXS with 262K), the serve path, everyday use and every reachable GPU, gives `ALL PASS` with the `--prev` records: a cell fixed earlier can lose again to a later change.
 
 ## 9. The record and the report
 
-XeStrata's own measurements are not shared (the user's decision of 2026-10-11): the record stays in the data folder, `$o` = `<data>/records/bench-results/<date>-upstream-<version>` (`LOCAL.md`), and never goes into git; only upstream's records (`tools/lint/records.txt`) and community records live in `bench/results`.
+XeStrata's own measurements are not shared (the user's decision of 2026-10-11): the record stays in the data folder, `$o` = `<data>/records/bench-results/<date>-upstream-<version>` (`LOCAL.md`), and never goes into git; upstream's records are not brought in, and `bench/XeStrataBenchResults` holds only the measurements of XeStrata others sent.
 
 - `$o/README.md`: the machines, both engines' commits and builds, the method, the tables (`sync_collect.py`), the check's output (against the tag and the previous XeStrata), what the numbers say, and the GPUs skipped; `matrix.json` and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>`. The ideas with step 4's and 5's numbers (kept, opt-in and removed) go into the same record.
 - docs/XE.ja.md, then docs/XE.md: the upstream version and range brought in, what was not taken and why, the approximations on by default and their switches, without a link to the record (it is not in the repository).

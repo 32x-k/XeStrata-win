@@ -1,15 +1,17 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/conversation_snapshot.hpp"
 #include "conversation_checked.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/progress.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/qsa.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -18,6 +20,46 @@ namespace strata::core {
 namespace {
 using conversation_detail::add;
 using conversation_detail::product;
+
+// Upstream #2049 #2065: a host-to-host copy that tells the watchdog it is moving.  Parked state (the running
+// checkpoints) sits in ordinary pageable memory for the whole session; when the OS has written it out, copying it back
+// runs at the drive's page-in speed and one copy of it stayed silent past the watchdog's limit, which ended an engine
+// that was only slow.  One beat per 1 MiB slice keeps a copy that moves alive and still lets a real stall show.
+template <class T>
+std::vector<T> copy_beating(const std::vector<T>& src) {
+    std::vector<T> out;
+    out.reserve(src.size());
+    const size_t step = std::max<size_t>(1, ((size_t) 1 << 20) / sizeof(T));
+    for (size_t at = 0; at < src.size(); at += step) {
+        out.insert(out.end(), src.begin() + (std::ptrdiff_t) at,
+                   src.begin() + (std::ptrdiff_t) std::min(src.size(), at + step));
+        progress_beat();
+    }
+    return out;
+}
+
+ConversationCheckpoint copy_checkpoint_beating(const ConversationCheckpoint& c) {
+    ConversationCheckpoint o;
+    o.ids = copy_beating(c.ids);
+    o.imgs = c.imgs;
+    o.used = c.used;
+    o.pinned = c.pinned;
+    o.gdn = copy_beating(c.gdn);
+    o.ple = copy_beating(c.ple);
+    o.tails = copy_beating(c.tails);
+    o.dead = copy_beating(c.dead);
+    o.block_pos = copy_beating(c.block_pos);
+    o.stage_parts.reserve(c.stage_parts.size());
+    for (const auto& part : c.stage_parts) o.stage_parts.push_back(copy_checkpoint_beating(part));
+    return o;
+}
+
+std::vector<ConversationCheckpoint> copy_checkpoints_beating(const std::vector<ConversationCheckpoint>& cs) {
+    std::vector<ConversationCheckpoint> out;
+    out.reserve(cs.size());
+    for (const auto& c : cs) out.push_back(copy_checkpoint_beating(c));
+    return out;
+}
 
 std::array<int64_t, 18> geometry_key(const ModelGeometry& g) {
     return {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_k_heads,
@@ -195,6 +237,63 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     return true;
 }
 
+size_t conversation_checkpoint_staged_bytes(const SessionState& ss, const ModelGeometry& g) {
+    ConversationStateSizes z;
+    std::string error;
+    if (!conversation_session_sizes(g, ss, z, error)) return 0;
+    return z.gdn + (ss.ple_hist ? z.ple : 0) + owned_qsa(ss, g) * (z.tail + z.dead + z.block_pos);
+}
+
+// the order and sizes of conversation_checkpoint_save, packed one after another
+bool conversation_checkpoint_stage(void* staging, void* stream, const SessionState& ss, const ModelGeometry& g,
+                                   size_t tokens, std::string& error) {
+    ConversationStateSizes z;
+    if (!checkpoint_targets(ss, g, tokens, z, error)) return false;
+    auto* p = static_cast<uint8_t*>(staging);
+    bool ok = true;
+    auto put = [&](uint8_t* dst, const void* src, size_t bytes) {
+        if (bytes == 0 || !ok) return;
+        ok = src != nullptr && strata::gpu::copy_async(dst, src, bytes, stream);
+    };
+    const size_t ple = ss.ple_hist ? z.ple : 0;
+    put(p, ss.gdn_state, z.gdn);
+    put(p + z.gdn, ss.ple_hist, ple);
+    p += z.gdn + ple;
+    for (size_t j = 0; j < owned_qsa(ss, g); ++j) {
+        const auto& st = owned(ss, j);
+        put(p, st.idx_tail, z.tail);
+        put(p + z.tail, st.idx_dead, z.dead);
+        put(p + z.tail + z.dead, st.idx_block_pos, z.block_pos);
+        p += z.tail + z.dead + z.block_pos;
+    }
+    if (ok && strata::gpu::stream_sync(stream)) return true;
+    error = std::string("conversation checkpoint stage: ") + strata::gpu::last_error();
+    return false;
+}
+
+bool conversation_checkpoint_unstage(ConversationCheckpoint& c, const void* staging, const SessionState& ss,
+                                     const ModelGeometry& g, std::string& error) {
+    ConversationStateSizes z;
+    if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
+    const size_t layers = owned_qsa(ss, g);
+    c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
+    c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
+    const auto* p = static_cast<const uint8_t*>(staging);
+    if (p == nullptr) return fail(error, "missing checkpoint staging");
+    auto take = [&](void* dst, size_t bytes) {
+        if (bytes) std::memcpy(dst, p, bytes);
+        p += bytes;
+    };
+    take(c.gdn.data(), c.gdn.size());
+    take(c.ple.data(), c.ple.size());
+    for (size_t j = 0; j < layers; ++j) {
+        take(c.tails.data() + j * z.tail, z.tail);
+        take(c.dead.data() + j * z.dead, z.dead);
+        take(c.block_pos.data() + j * z.block_pos, z.block_pos);
+    }
+    return true;
+}
+
 bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
                                      const ModelGeometry& g, std::string& error) {
     if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
@@ -280,7 +379,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     SavedConversation captured;
     captured.geometry = geometry_key(g);
     captured.live.ids = view.ids; captured.live.imgs = view.images;
-    captured.cvec = view.cvec; captured.checkpoints = view.checkpoints;
+    captured.cvec = view.cvec; captured.checkpoints = copy_checkpoints_beating(view.checkpoints);
     const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
     captured.kv = std::move(reuse.kv);
     const size_t layers = owned_qsa(ss, g);
@@ -306,7 +405,7 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     captured.geometry = geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     captured.live.ids = view.ids; captured.live.imgs = view.images;
-    captured.cvec = view.cvec; captured.checkpoints = view.checkpoints;
+    captured.cvec = view.cvec; captured.checkpoints = copy_checkpoints_beating(view.checkpoints);
     if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
     const int64_t upto = (int64_t) view.ids.size();
     const size_t layers = owned_qsa(ss, g);
@@ -472,7 +571,7 @@ bool conversation_split_save(SavedConversation& image, const ConversationView& v
     captured.live.ids = view.ids;
     captured.live.imgs = view.images;
     captured.cvec = view.cvec;
-    captured.checkpoints = view.checkpoints;
+    captured.checkpoints = copy_checkpoints_beating(view.checkpoints);
     for (size_t i = 0; i < stages.size(); ++i) {
         const OnDevice on(stages[i].device);
         ConversationCheckpoint part;

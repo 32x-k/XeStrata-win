@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-FileCopyrightText: 2023-2026 The ggml authors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/iq_bits.hpp - the i-quant decoders' word handling, shared by the dot products (iq_kernels.cpp) and
 // the int8 matrix products (iq_mmq.cpp): unaligned words of a block, the grids' value pairs, the sign bytes, IQ4's
 // 16-entry tables, Q2_0's codes and IQ1_M's block scale.  Transcribed from llama.cpp

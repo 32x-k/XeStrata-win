@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Decode A/B on coding-agent turns over this repository: arms restarted per round, per-turn ratios.
 
     python tools/agent_turns_bench.py strata-iq2_xs.json base: hcq8:STRATA_HC_Q8=2 [--rounds 2]
@@ -121,7 +121,7 @@ def turns() -> list[tuple[str, list[dict]]]:
     """[(tag, messages)]: one entry per point right after a tool result."""
     out = []
     for name, task, steps in SESSIONS:
-        msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task}]
+        msgs: list[dict] = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task}]
         for i, (tool, arg, before) in enumerate(steps):
             cid = f"call_{name}_{i}"
             args = {"path": arg} if tool == "read_file" else {"pattern": arg}
@@ -212,9 +212,9 @@ def main() -> int:
         if name == first:
             print(f"  {name:10s} median decode {med:6.1f} tok/s")
             continue
-        r = [per_turn(name, t) / per_turn(first, t) for t, _ in work]
-        print(f"  {name:10s} median decode {med:6.1f} tok/s   x{statistics.median(r):.3f} (x{min(r):.2f} to "
-              f"x{max(r):.2f}), {sum(x > 1 for x in r)}/{len(r)} turns faster")
+        ratios = [per_turn(name, t) / per_turn(first, t) for t, _ in work]
+        print(f"  {name:10s} median decode {med:6.1f} tok/s   x{statistics.median(ratios):.3f} "
+              f"(x{min(ratios):.2f} to x{max(ratios):.2f}), {sum(x > 1 for x in ratios)}/{len(ratios)} turns faster")
     return 0
 
 

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """tools/ple_fp8_pack.py - the PLE n-gram table exactly as Qwen shipped it (FP8 E4M3), as a GGUF the engine reads.
 
     python tools/ple_fp8_pack.py --model <checkpoint dir> --out <ple-fp8.gguf>

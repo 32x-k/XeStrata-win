@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/fused_gdn.cpp - the Xe port of Strata's src/kernels/cuda/fused_gdn.cu (see the header): the conv + SiLU + L2
 // norm, the alpha/beta projections with their epilogues, and the GDN step with its output norm, each one kernel.
 //
 // Work-group shapes, explicit fmaf chains and summation orders are the CUDA kernels'.  CUDA's __expf and rsqrtf
 // become the precise exp and SYCL's rsqrt.
 #include "strata/kernels/fused_gdn.hpp"
+#include "strata/kernels/gdn.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_fused_gdn
 #include "strata/kernels/device_arch_tag.hpp"
@@ -118,6 +119,7 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
         sycl::local_accessor<float, 1> sq(sycl::range<1>(S), hd);
         sycl::local_accessor<float, 1> red(sycl::range<1>(RG * S), hd);
         sycl::local_accessor<float, 1> wsum(sycl::range<1>(S * RG / WARP), hd);
+        const bool silu = gdn_silu_gate();   // the closing norm's gate (gdn.hpp)
         // one work-group per head; work-item tid = rg * 128 + col, as CUDA's (col, rg) block linearises
         hd.parallel_for(sycl::nd_range<1>((size_t) h_v * S * RG, S * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
@@ -160,7 +162,8 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
                 const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
                 const float scale = sycl::rsqrt(ss / (float) S + eps);
                 const float zz = z[head * S + col];
-                y[head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + sycl::exp(-zz)));
+                const float gz = 1.0f / (1.0f + sycl::exp(-zz));
+                y[head * S + col] = oc * scale * gamma[col] * (silu ? zz * gz : gz);
             }
         });
     });

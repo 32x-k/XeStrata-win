@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/artifact/gguf_split.hpp - the shards of a split model (upstream 02cfe36), apart from gguf_reader.hpp
 // so that any translation unit can resolve a model's shards without the reader.
 //

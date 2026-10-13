@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/prefill/kernels.cpp - see include/strata/prefill/kernels.hpp.  The Xe port of Strata's src/prefill/kernels.cu: work
 // shapes, explicit fmaf and summation orders are the CUDA kernels'; a warp is a sub-group of 32 and a 2-D CUDA block
 // is linearised the way CUDA numbers its threads (x fastest).  __expf, rsqrtf, powf, cosf, sinf and log1pf are the
@@ -23,12 +23,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 namespace strata::prefill {
 namespace {
 
 constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
-constexpr int S = 128, HK = 16, HV = 48, C = 10240;
+constexpr int S = 128;   // a GDN head's width (the shapes: struct Gdn below)
 constexpr int WARP = 32;
 
 sycl::queue& Q(void* stream) { return core::Runtime::get().stream(stream); }
@@ -75,31 +76,6 @@ inline float block_sum(const sycl::nd_item<1>& it, float v, float* sh) {
 constexpr int CONV_TILE = 64;
 constexpr int RG = 4, RPG = S / RG;
 constexpr int CB = 32, NCB = S / CB;
-
-// the recurrence's shared per-token step for one (head, column); returns the column's output before the norm
-template <int COLS>
-inline float rec_step(const sycl::nd_item<1>& it, float* s, const float* ht, const float* gate, const float* beta,
-                      int64_t t, int head, int qh, int rg, int c, int col, int tid, float* sk, float* sq, float* red) {
-    sycl::group_barrier(it.get_group());
-    if (tid < S) { sq[tid] = ht[qh * S + tid]; sk[tid] = ht[HK * S + qh * S + tid]; }
-    sycl::group_barrier(it.get_group());
-    const float g = sycl::exp(gate[t * HV + head]);
-    float kv = 0.0f;
-    for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], sk[rg * RPG + r], kv);
-    red[rg * COLS + c] = kv;
-    sycl::group_barrier(it.get_group());
-    const float kv_col = red[c] + red[COLS + c] + red[2 * COLS + c] + red[3 * COLS + c];
-    const float delta = (ht[2 * HK * S + head * S + col] - g * kv_col) * beta[t * HV + head];
-    float o = 0.0f;
-    for (int r = 0; r < RPG; ++r) {
-        s[r] = sycl::fma(g, s[r], sk[rg * RPG + r] * delta);
-        o = sycl::fma(s[r], sq[rg * RPG + r], o);
-    }
-    sycl::group_barrier(it.get_group());
-    red[rg * COLS + c] = o;
-    sycl::group_barrier(it.get_group());
-    return (red[c] + red[COLS + c] + red[2 * COLS + c] + red[3 * COLS + c]) * sycl::rsqrt((float) S);
-}
 
 template <int REG>
 void route_launch(sycl::queue& q, const float* logits, int32_t* ids, float* wout, int64_t T) {
@@ -176,8 +152,17 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
     const strata::kernels::KvHostPools host = host_p ? *host_p : strata::kernels::KvHostPools{};
     const strata::kernels::KvHostPools stage = stage_p ? *stage_p : strata::kernels::KvHostPools{};
     const int32_t* table = page_table;
+    // upstream 5a0df898 (its sycl/ port): the host copy and the staging pool are written 4 bytes a lane, 64 contiguous
+    // bytes a group, instead of one 1- or 2-byte store a lane, which ran at ~30 MB/s into pinned host memory on a B70
+    // (2 s of a 4K prompt there with --kv-resident).  STRATA_KV_WIDE_HOST=0: the narrow stores.
+    static const bool wide_env = [] {
+        const char* v = std::getenv("STRATA_KV_WIDE_HOST");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    const bool wide = wide_env;   // (a kernel captures a copy, not the static)
     Q(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> wm(sycl::range<1>(2), h);
+        sycl::local_accessor<uint32_t, 1> lane(sycl::range<1>(64), h);   // the group's 64 values, for the wide stores
         h.parallel_for(sycl::nd_range<3>({(size_t) T, 2, 8 * 64}, {1, 1, 64}), [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int64_t t = (int64_t) it.get_group(0);
@@ -193,6 +178,19 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
             if (k_pool != nullptr) {   // uniform
                 const uint16_t hv = hf(x);
                 if (page >= 0) (is_v ? v_pool : k_pool)[row * 256 + d] = hv;
+                if (wide && (host.k_pool != nullptr || stage.k_pool != nullptr)) {   // uniform
+                    lane[tid] = hv;
+                    sycl::group_barrier(it.get_group());
+                    if (tid < 32) {
+                        const size_t l2 = 2 * (size_t) tid;
+                        const uint32_t w = lane[l2] | (lane[l2 + 1] << 16);
+                        if (host.k_pool != nullptr)
+                            reinterpret_cast<uint32_t*>((is_v ? host.v_pool : host.k_pool) + row_id * 256 + (int64_t) g * 64)[tid] = w;
+                        if (stage.k_pool != nullptr)
+                            reinterpret_cast<uint32_t*>((is_v ? stage.v_pool : stage.k_pool) + row_id * 256 + (int64_t) g * 64)[tid] = w;
+                    }
+                    return;
+                }
                 if (host.k_pool != nullptr) (is_v ? host.v_pool : host.k_pool)[row_id * 256 + d] = hv;
                 if (stage.k_pool != nullptr) (is_v ? stage.v_pool : stage.k_pool)[row_id * 256 + d] = hv;
                 return;
@@ -209,6 +207,23 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
             if (page >= 0) {
                 (is_v ? v_q : k_q)[row * 256 + d] = (int8_t) qv;
                 if (tid == 0) (is_v ? v_scale : k_scale)[row * 4 + g] = sb;
+            }
+            if (wide && (host.k_q != nullptr || stage.k_q != nullptr)) {   // uniform
+                lane[tid] = (uint32_t) (uint8_t) (int8_t) qv;
+                sycl::group_barrier(it.get_group());
+                if (tid < 16) {
+                    const size_t l4 = 4 * (size_t) tid;
+                    const uint32_t w = lane[l4] | (lane[l4 + 1] << 8) | (lane[l4 + 2] << 16) | (lane[l4 + 3] << 24);
+                    if (host.k_q != nullptr)
+                        reinterpret_cast<uint32_t*>((is_v ? host.v_q : host.k_q) + row_id * 256 + (int64_t) g * 64)[tid] = w;
+                    if (stage.k_q != nullptr)
+                        reinterpret_cast<uint32_t*>((is_v ? stage.v_q : stage.k_q) + row_id * 256 + (int64_t) g * 64)[tid] = w;
+                }
+                if (tid == 0) {
+                    if (host.k_q != nullptr) (is_v ? host.v_scale : host.k_scale)[row_id * 4 + g] = sb;
+                    if (stage.k_q != nullptr) (is_v ? stage.v_scale : stage.k_scale)[row_id * 4 + g] = sb;
+                }
+                return;
             }
             if (host.k_q != nullptr) {
                 (is_v ? host.v_q : host.k_q)[row_id * 256 + d] = (int8_t) qv;
@@ -414,74 +429,133 @@ void gr_broadcast(const float* e, float* R, int64_t T, void* stream) {
 }
 
 // ---------------------------------------------------------------- GDN
-void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream) {
-    Q(stream).parallel_for(sycl::range<1>((size_t) (T * HV)), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], t = i / HV, h = i % HV;
-        const float v = ab[t * 2 * HV + h] + dt[h];
-        gate[i] = (v > 20.0f ? v : sycl::log1p(sycl::exp(v))) * ssm_a[h];
-        beta[i] = sigm(ab[t * 2 * HV + HV + h]);
-    });
-}
+// The kernels of one GDN shape: HK key heads and HV value heads of S, conv channels C = 2 HK S + HV S.  Qwen3.8 is
+// <16, 48>, Ornith-1.5 (qwen35moe) <16, 32>; the public functions below dispatch on the shape.
+template <int HK, int HV>
+struct Gdn {
+    static constexpr int C = 2 * HK * S + HV * S;
+    static constexpr int GDN_TB = 8, VPK = HV / HK;
+    // the output gate: sigmoid(z) (Qwen3.8) or silu(z) (qwen35moe)
+    static float zgate(float z, bool silu) { return silu ? z * sigm(z) : sigm(z); }
+    // the recurrence's shared per-token step for one (head, column); returns the column's output before the norm
+    template <int COLS>
+    static float rec_step(const sycl::nd_item<1>& it, float* s, const float* ht, const float* gate, const float* beta,
+                          int64_t t, int head, int qh, int rg, int c, int col, int tid, float* sk, float* sq, float* red) {
+        sycl::group_barrier(it.get_group());
+        if (tid < S) { sq[tid] = ht[qh * S + tid]; sk[tid] = ht[HK * S + qh * S + tid]; }
+        sycl::group_barrier(it.get_group());
+        const float g = sycl::exp(gate[t * HV + head]);
+        float kv = 0.0f;
+        for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], sk[rg * RPG + r], kv);
+        red[rg * COLS + c] = kv;
+        sycl::group_barrier(it.get_group());
+        const float kv_col = red[c] + red[COLS + c] + red[2 * COLS + c] + red[3 * COLS + c];
+        const float delta = (ht[2 * HK * S + head * S + col] - g * kv_col) * beta[t * HV + head];
+        float o = 0.0f;
+        for (int r = 0; r < RPG; ++r) {
+            s[r] = sycl::fma(g, s[r], sk[rg * RPG + r] * delta);
+            o = sycl::fma(s[r], sq[rg * RPG + r], o);
+        }
+        sycl::group_barrier(it.get_group());
+        red[rg * COLS + c] = o;
+        sycl::group_barrier(it.get_group());
+        return (red[c] + red[COLS + c] + red[2 * COLS + c] + red[3 * COLS + c]) * sycl::rsqrt((float) S);
+    }
 
-void gdn_conv(float* hist, const float* qkv, const float* w, float* h, int64_t T, float eps, void* stream) {
-    static const bool serial = std::getenv("STRATA_GDN_CONV_SERIAL") != nullptr;   // the old walk (A/B)
-    auto& q = Q(stream);
-    if (serial || T <= CONV_TILE) {
-        // one work-item per channel walks the chunk
-        q.parallel_for(sycl::range<1>(C), [=](sycl::id<1> id) {
-            const int c = (int) id[0];
-            float v0 = hist[c * 3], v1 = hist[c * 3 + 1], v2 = hist[c * 3 + 2];
-            const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
-            for (int64_t t = 0; t < T; ++t) {
-                const float x = qkv[t * C + c];
-                const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
-                h[t * C + c] = s / (1.0f + sycl::exp(-s));
-                v0 = v1; v1 = v2; v2 = x;
-            }
-            hist[c * 3] = v0; hist[c * 3 + 1] = v1; hist[c * 3 + 2] = v2;
+    static void gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream) {
+        Q(stream).parallel_for(sycl::range<1>((size_t) (T * HV)), [=](sycl::id<1> id) {
+            const int64_t i = (int64_t) id[0], t = i / HV, h = i % HV;
+            const float v = ab[t * 2 * HV + h] + dt[h];
+            gate[i] = (v > 20.0f ? v : sycl::log1p(sycl::exp(v))) * ssm_a[h];
+            beta[i] = sigm(ab[t * 2 * HV + HV + h]);
         });
-    } else {
-        // C-3: tiled over tokens, each tile reading its 3 predecessors from the chunk (or the history before it);
-        // the same expression per element, then the history written afterwards
-        const size_t tiles = (size_t) ((T + CONV_TILE - 1) / CONV_TILE);
-        static const bool fused = [] {   // upstream 9668e324; STRATA_GDN_CONVL2=0: the conv, then the norm kernel
-            const char* v = std::getenv("STRATA_GDN_CONVL2");
-            return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-        }();
-        if (fused) {
-            // a work-group is one head's S channels of one tile: the conv loop below, then, for the q/k heads, each
-            // token's L2 norm as the norm kernel computes it (the same sub-group sum, the four partials in order, the
-            // same v * rsqrt(ss + eps) on the stored value)
-            q.submit([&](sycl::handler& hd) {
-                sycl::local_accessor<float, 1> part(sycl::range<1>((size_t) 4 * CONV_TILE), hd);
-                hd.parallel_for(sycl::nd_range<2>({tiles, (size_t) C}, {1, (size_t) S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
-                    const sycl::sub_group sg = it.get_sub_group();
-                    const int c = (int) it.get_global_id(1), tid = (int) it.get_local_id(1);
-                    const int64_t t0 = (int64_t) it.get_group(0) * CONV_TILE;
-                    const int64_t t1 = t0 + CONV_TILE < T ? t0 + CONV_TILE : T;
-                    auto input = [&](int64_t t) -> float { return t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)]; };
-                    float v0 = input(t0 - 3), v1 = input(t0 - 2), v2 = input(t0 - 1);
-                    const float* wc = w + (size_t) c * 4;
-                    const float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
-                    for (int64_t t = t0; t < t1; ++t) {
-                        const float x = qkv[t * C + c];
-                        const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
-                        h[t * C + c] = s / (1.0f + sycl::exp(-s));
-                        v0 = v1; v1 = v2; v2 = x;
-                    }
-                    if ((int) it.get_group(1) >= 2 * HK) return;   // the v channels: no norm (the whole group)
-                    for (int64_t t = t0; t < t1; ++t) {
-                        const float v = h[t * C + c];
-                        const float sq = warp_sum(sg, v * v);
-                        if ((tid & 31) == 0) part[(t - t0) * 4 + (tid >> 5)] = sq;
-                    }
-                    sycl::group_barrier(it.get_group());
-                    for (int64_t t = t0; t < t1; ++t) {
-                        const int64_t k = t - t0;
-                        const float ss = part[k * 4] + part[k * 4 + 1] + part[k * 4 + 2] + part[k * 4 + 3];
-                        h[t * C + c] = h[t * C + c] * sycl::rsqrt(ss + eps);
-                    }
+    }
+
+    static void conv(float* hist, const float* qkv, const float* w, float* h, int64_t T, float eps, void* stream) {
+        static const bool serial = std::getenv("STRATA_GDN_CONV_SERIAL") != nullptr;   // the old walk (A/B)
+        auto& q = Q(stream);
+        if (serial || T <= CONV_TILE) {
+            // one work-item per channel walks the chunk
+            q.parallel_for(sycl::range<1>(C), [=](sycl::id<1> id) {
+                const int c = (int) id[0];
+                float v0 = hist[(ptrdiff_t) c * 3], v1 = hist[(ptrdiff_t) c * 3 + 1], v2 = hist[(ptrdiff_t) c * 3 + 2];
+                const float w0 = w[(ptrdiff_t) c * 4], w1 = w[(ptrdiff_t) c * 4 + 1], w2 = w[(ptrdiff_t) c * 4 + 2], w3 = w[(ptrdiff_t) c * 4 + 3];
+                for (int64_t t = 0; t < T; ++t) {
+                    const float x = qkv[t * C + c];
+                    const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
+                    h[t * C + c] = s / (1.0f + sycl::exp(-s));
+                    v0 = v1; v1 = v2; v2 = x;
+                }
+                hist[(ptrdiff_t) c * 3] = v0; hist[(ptrdiff_t) c * 3 + 1] = v1; hist[(ptrdiff_t) c * 3 + 2] = v2;
+            });
+        } else {
+            // C-3: tiled over tokens, each tile reading its 3 predecessors from the chunk (or the history before it);
+            // the same expression per element, then the history written afterwards
+            const size_t tiles = (size_t) ((T + CONV_TILE - 1) / CONV_TILE);
+            static const bool fused = [] {   // upstream 9668e324; STRATA_GDN_CONVL2=0: the conv, then the norm kernel
+                const char* v = std::getenv("STRATA_GDN_CONVL2");
+                return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+            }();
+            if (fused) {
+                // a work-group is one head's S channels of one tile: the conv loop below, then, for the q/k heads, each
+                // token's L2 norm as the norm kernel computes it (the same sub-group sum, the four partials in order, the
+                // same v * rsqrt(ss + eps) on the stored value)
+                q.submit([&](sycl::handler& hd) {
+                    sycl::local_accessor<float, 1> part(sycl::range<1>((size_t) 4 * CONV_TILE), hd);
+                    hd.parallel_for(sycl::nd_range<2>({tiles, (size_t) C}, {1, (size_t) S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                        const sycl::sub_group sg = it.get_sub_group();
+                        const int c = (int) it.get_global_id(1), tid = (int) it.get_local_id(1);
+                        const int64_t t0 = (int64_t) it.get_group(0) * CONV_TILE;
+                        const int64_t t1 = t0 + CONV_TILE < T ? t0 + CONV_TILE : T;
+                        auto input = [&](int64_t t) -> float { return t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)]; };
+                        float v0 = input(t0 - 3), v1 = input(t0 - 2), v2 = input(t0 - 1);
+                        const float* wc = w + (size_t) c * 4;
+                        const float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
+                        for (int64_t t = t0; t < t1; ++t) {
+                            const float x = qkv[t * C + c];
+                            const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
+                            h[t * C + c] = s / (1.0f + sycl::exp(-s));
+                            v0 = v1; v1 = v2; v2 = x;
+                        }
+                        if ((int) it.get_group(1) >= 2 * HK) return;   // the v channels: no norm (the whole group)
+                        for (int64_t t = t0; t < t1; ++t) {
+                            const float v = h[t * C + c];
+                            const float sq = warp_sum(sg, v * v);
+                            if ((tid & 31) == 0) part[(t - t0) * 4 + (tid >> 5)] = sq;
+                        }
+                        sycl::group_barrier(it.get_group());
+                        for (int64_t t = t0; t < t1; ++t) {
+                            const int64_t k = t - t0;
+                            const float ss = part[k * 4] + part[k * 4 + 1] + part[k * 4 + 2] + part[k * 4 + 3];
+                            h[t * C + c] = h[t * C + c] * sycl::rsqrt(ss + eps);
+                        }
+                    });
                 });
+                q.parallel_for(sycl::range<1>(C), [=](sycl::id<1> id) {
+                    const int c = (int) id[0];
+                    float v[3];
+                    for (int k = 0; k < 3; ++k) {
+                        const int64_t t = T - 3 + k;
+                        v[k] = t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)];
+                    }
+                    float* hc = hist + (size_t) c * 3;
+                    hc[0] = v[0]; hc[1] = v[1]; hc[2] = v[2];
+                });
+                return;
+            }
+            q.parallel_for(sycl::range<2>(tiles, C), [=](sycl::id<2> id) {
+                const int c = (int) id[1];
+                const int64_t t0 = (int64_t) id[0] * CONV_TILE;
+                const int64_t t1 = t0 + CONV_TILE < T ? t0 + CONV_TILE : T;
+                auto input = [&](int64_t t) -> float { return t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)]; };
+                float v0 = input(t0 - 3), v1 = input(t0 - 2), v2 = input(t0 - 1);
+                const float w0 = w[(ptrdiff_t) c * 4], w1 = w[(ptrdiff_t) c * 4 + 1], w2 = w[(ptrdiff_t) c * 4 + 2], w3 = w[(ptrdiff_t) c * 4 + 3];
+                for (int64_t t = t0; t < t1; ++t) {
+                    const float x = qkv[t * C + c];
+                    const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
+                    h[t * C + c] = s / (1.0f + sycl::exp(-s));
+                    v0 = v1; v1 = v2; v2 = x;
+                }
             });
             q.parallel_for(sycl::range<1>(C), [=](sycl::id<1> id) {
                 const int c = (int) id[0];
@@ -490,470 +564,469 @@ void gdn_conv(float* hist, const float* qkv, const float* w, float* h, int64_t T
                     const int64_t t = T - 3 + k;
                     v[k] = t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)];
                 }
-                float* hc = hist + (size_t) c * 3;
-                hc[0] = v[0]; hc[1] = v[1]; hc[2] = v[2];
+                hist[(ptrdiff_t) c * 3] = v[0]; hist[(ptrdiff_t) c * 3 + 1] = v[1]; hist[(ptrdiff_t) c * 3 + 2] = v[2];
             });
-            return;
         }
-        q.parallel_for(sycl::range<2>(tiles, C), [=](sycl::id<2> id) {
-            const int c = (int) id[1];
-            const int64_t t0 = (int64_t) id[0] * CONV_TILE;
-            const int64_t t1 = t0 + CONV_TILE < T ? t0 + CONV_TILE : T;
-            auto input = [&](int64_t t) -> float { return t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)]; };
-            float v0 = input(t0 - 3), v1 = input(t0 - 2), v2 = input(t0 - 1);
-            const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
-            for (int64_t t = t0; t < t1; ++t) {
-                const float x = qkv[t * C + c];
-                const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
-                h[t * C + c] = s / (1.0f + sycl::exp(-s));
-                v0 = v1; v1 = v2; v2 = x;
-            }
-        });
-        q.parallel_for(sycl::range<1>(C), [=](sycl::id<1> id) {
-            const int c = (int) id[0];
-            float v[3];
-            for (int k = 0; k < 3; ++k) {
-                const int64_t t = T - 3 + k;
-                v[k] = t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)];
-            }
-            hist[c * 3] = v[0]; hist[c * 3 + 1] = v[1]; hist[c * 3 + 2] = v[2];
-        });
-    }
-    // the L2 norm of the 32 q/k heads per token, 128 work-items each
-    q.submit([&](sycl::handler& hd) {
-        sycl::local_accessor<float, 1> part(sycl::range<1>(4), hd);
-        hd.parallel_for(sycl::nd_range<2>({(size_t) T, (size_t) 2 * HK * S}, {1, S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const sycl::sub_group sg = it.get_sub_group();
-            const int64_t t = (int64_t) it.get_group(0);
-            const int head = (int) it.get_group(1), tid = (int) it.get_local_id(1);
-            float* x = h + t * C + head * S;
-            const float v = x[tid];
-            const float sq = warp_sum(sg, v * v);
-            if ((tid & 31) == 0) part[tid >> 5] = sq;
-            sycl::group_barrier(it.get_group());
-            const float ss = part[0] + part[1] + part[2] + part[3];
-            x[tid] = v * sycl::rsqrt(ss + eps);
-        });
-    });
-}
-
-// The recurrence with one value column a work-item and all S rows of its state in registers (the large register
-// file): no barrier, no local memory, q and k read once per sub-group and handed out by sub-group broadcasts.  Per
-// column the same arithmetic in the same order as the D-2 kernel below (four row groups of S / 4, summed left to
-// right), so the same bits.  B70, one DeltaNet layer over 26K tokens: 32 ms against D-2's 42.
-template <int SG>
-struct GdnRecLane {
-    float* state;
-    const float* h;
-    const float* gate;
-    const float* beta;
-    float* y;
-    int64_t T;
-    static constexpr int NJ = S / SG;   // the q and k values a work-item holds
-    static constexpr int QR = S / 4;    // the D-2 kernel's rows per row group
-    void operator()(sycl::nd_item<1> it) const {
-        const sycl::sub_group sg = it.get_sub_group();
-        const int lane = (int) sg.get_local_linear_id();
-        const int gcol = (int) it.get_global_id(0), head = gcol / S, col = gcol % S, qh = head % HK;
-        const size_t rs = (size_t) HV * S;
-        float* base = state + (size_t) head * S + col;
-        float s[S];
-#pragma unroll
-        for (int r = 0; r < S; ++r) s[r] = base[r * rs];
-        float nk[NJ], nq[NJ], nv = 0.0f, ng = 0.0f, nb = 0.0f;
-        auto fetch = [&](int64_t t) {
-            const float* ht = h + t * C;
-#pragma unroll
-            for (int j = 0; j < NJ; ++j) {
-                nq[j] = ht[qh * S + j * SG + lane];
-                nk[j] = ht[HK * S + qh * S + j * SG + lane];
-            }
-            nv = ht[2 * HK * S + head * S + col];
-            ng = gate[t * HV + head];
-            nb = beta[t * HV + head];
-        };
-        if (T > 0) fetch(0);
-        for (int64_t t = 0; t < T; ++t) {
-            float ck[NJ], cq[NJ];
-#pragma unroll
-            for (int j = 0; j < NJ; ++j) { ck[j] = nk[j]; cq[j] = nq[j]; }
-            const float cv = nv, cg = ng, cbt = nb;
-            if (t + 1 < T) fetch(t + 1);
-            const float g = sycl::exp(cg);
-            // the four row groups' sums interleaved, each still in row order: four independent chains instead of one
-            // (1.7x on the B70)
-            float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
-            for (int i = 0; i < QR; ++i)
-#pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    const int r = k * QR + i;
-                    a[k] = sycl::fma(s[r], sycl::select_from_group(sg, ck[r / SG], r % SG), a[k]);
-                }
-            const float delta = (cv - g * (a[0] + a[1] + a[2] + a[3])) * cbt;
-#pragma unroll
-            for (int r = 0; r < S; ++r)
-                s[r] = sycl::fma(g, s[r], sycl::select_from_group(sg, ck[r / SG], r % SG) * delta);
-            float o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
-            for (int i = 0; i < QR; ++i)
-#pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    const int r = k * QR + i;
-                    o[k] = sycl::fma(s[r], sycl::select_from_group(sg, cq[r / SG], r % SG), o[k]);
-                }
-            y[t * HV * S + (int64_t) head * S + col] = (o[0] + o[1] + o[2] + o[3]) * sycl::rsqrt((float) S);
-        }
-#pragma unroll
-        for (int r = 0; r < S; ++r) base[r * rs] = s[r];
-    }
-    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
-        return sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>,
-                                                           sycl::ext::oneapi::experimental::sub_group_size<SG>};
-    }
-};
-
-// The key-head form (upstream's gdn_rec_kh_kernel): a work-group takes one key head's VPK value heads and CB of their
-// columns, so every q and k value it reads feeds VPK heads, and 64 work-groups walk the chunk instead of 192.  The
-// inputs come in blocks of GDN_TB tokens, read into registers while the block before computes and stored to local
-// memory after it (upstream's cp.async), and a token takes two barriers instead of four.  Per value head and column
-// the same arithmetic in the same order as the D-2 kernel: the same bits.
-constexpr int GDN_TB = 8, VPK = HV / HK;
-struct GdnRecKh {
-    static constexpr int NT = CB * RG, QK4 = GDN_TB * 2 * (S / 4), V4 = GDN_TB * VPK * (CB / 4), GB = 2 * GDN_TB * VPK;
-    static constexpr int NQK = (QK4 + NT - 1) / NT, NV = (V4 + NT - 1) / NT;
-    float* state;
-    const float* h;
-    const float* gate;
-    const float* beta;
-    float* y;
-    int64_t T;
-    sycl::local_accessor<float, 1> sq, sk, sv, sgb, rkv, ro;   // [2][TB][S] x2, [2][TB][VPK][CB], [2][2][TB][VPK], ...
-
-    void operator()(sycl::nd_item<1> it) const {
-        const int qh = (int) it.get_group(0) / NCB, cb = (int) it.get_group(0) % NCB;
-        const int tid = (int) it.get_local_id(0), c = tid % CB, rg = tid / CB, col = cb * CB + c;
-        float s[VPK][RPG];
-        const size_t rs = (size_t) HV * S;
-#pragma unroll
-        for (int j = 0; j < VPK; ++j) {
-            const float* base = state + ((size_t) (rg * RPG) * HV + (size_t) (qh + j * HK)) * S + col;
-#pragma unroll
-            for (int r = 0; r < RPG; ++r) s[j][r] = base[r * rs];
-        }
-        const int64_t nblk = (T + GDN_TB - 1) / GDN_TB;
-        sycl::float4 rqk[NQK], rv[NV];
-        float rgb = 0.0f;
-        auto load = [&](int64_t k) {   // tokens [k * TB, k * TB + TB) into registers
-            const int64_t t0 = k * GDN_TB;
-#pragma unroll
-            for (int n = 0; n < NQK; ++n) {
-                const int p = tid + n * NT;
-                if (p >= QK4) break;
-                const int i = p / (2 * (S / 4)), w = p % (2 * (S / 4)), isk = w / (S / 4), jj = (w % (S / 4)) * 4;
-                rqk[n] = t0 + i < T ? *reinterpret_cast<const sycl::float4*>(h + (t0 + i) * C + (int64_t) ((isk ? HK * S : 0) + qh * S + jj))
-                                    : sycl::float4(0.0f);
-            }
-#pragma unroll
-            for (int n = 0; n < NV; ++n) {
-                const int p = tid + n * NT;
-                if (p >= V4) break;
-                const int i = p / (VPK * (CB / 4)), w = p % (VPK * (CB / 4)), j = w / (CB / 4), jj = (w % (CB / 4)) * 4;
-                rv[n] = t0 + i < T ? *reinterpret_cast<const sycl::float4*>(h + (t0 + i) * C +
-                                                                             (int64_t) (2 * HK * S + (qh + j * HK) * S + cb * CB + jj))
-                                   : sycl::float4(0.0f);
-            }
-            if (tid < GB) {
-                const int isb = tid / (GDN_TB * VPK), w = tid % (GDN_TB * VPK), i = w / VPK, j = w % VPK;
-                rgb = t0 + i < T ? (isb ? beta : gate)[(t0 + i) * HV + (int64_t) (qh + j * HK)] : 0.0f;
-            }
-        };
-        auto store = [&](int bb) {     // the registers into buffer bb
-#pragma unroll
-            for (int n = 0; n < NQK; ++n) {
-                const int p = tid + n * NT;
-                if (p >= QK4) break;
-                const int i = p / (2 * (S / 4)), w = p % (2 * (S / 4)), isk = w / (S / 4), jj = (w % (S / 4)) * 4;
-                const auto& dst = isk ? sk : sq;
-                for (int e = 0; e < 4; ++e) dst[((size_t) bb * GDN_TB + i) * S + jj + e] = rqk[n][e];
-            }
-#pragma unroll
-            for (int n = 0; n < NV; ++n) {
-                const int p = tid + n * NT;
-                if (p >= V4) break;
-                const int i = p / (VPK * (CB / 4)), w = p % (VPK * (CB / 4)), j = w / (CB / 4), jj = (w % (CB / 4)) * 4;
-                for (int e = 0; e < 4; ++e) sv[(((size_t) bb * GDN_TB + i) * VPK + j) * CB + jj + e] = rv[n][e];
-            }
-            if (tid < GB) sgb[(size_t) bb * GB + tid] = rgb;   // [bb][gate, beta][i][j]
-        };
-        if (nblk > 0) {
-            load(0);
-            store(0);
-        }
-        sycl::group_barrier(it.get_group());
-        for (int64_t k = 0; k < nblk; ++k) {
-            if (k + 1 < nblk) load(k + 1);
-            const int bb = (int) (k & 1);
-            const int n = (int) std::min<int64_t>(GDN_TB, T - k * GDN_TB);
-            for (int i = 0; i < n; ++i) {
-                const int64_t t = k * GDN_TB + i;
-                float kc[RPG];
-#pragma unroll
-                for (int r = 0; r < RPG; ++r) kc[r] = sk[((size_t) bb * GDN_TB + i) * S + (size_t) (rg * RPG + r)];
-                float g[VPK], kv[VPK], delta[VPK], o[VPK];
-#pragma unroll
-                for (int j = 0; j < VPK; ++j) {
-                    g[j] = sycl::exp(sgb[(size_t) bb * GB + (size_t) (i * VPK + j)]);
-                    kv[j] = 0.0f;
-                    o[j] = 0.0f;
-                }
-#pragma unroll
-                for (int r = 0; r < RPG; ++r)
-#pragma unroll
-                    for (int j = 0; j < VPK; ++j) kv[j] = sycl::fma(s[j][r], kc[r], kv[j]);
-#pragma unroll
-                for (int j = 0; j < VPK; ++j) rkv[(j * RG + rg) * CB + c] = kv[j];
-                sycl::group_barrier(it.get_group());
-#pragma unroll
-                for (int j = 0; j < VPK; ++j) {
-                    const float kv_col = rkv[(j * RG + 0) * CB + c] + rkv[(j * RG + 1) * CB + c] +
-                                         rkv[(j * RG + 2) * CB + c] + rkv[(j * RG + 3) * CB + c];
-                    delta[j] = (sv[(((size_t) bb * GDN_TB + i) * VPK + j) * CB + c] - g[j] * kv_col) *
-                               sgb[(size_t) bb * GB + (size_t) (GDN_TB * VPK + i * VPK + j)];
-                }
-#pragma unroll
-                for (int r = 0; r < RPG; ++r) {
-                    const float qr = sq[((size_t) bb * GDN_TB + i) * S + (size_t) (rg * RPG + r)];
-#pragma unroll
-                    for (int j = 0; j < VPK; ++j) {
-                        s[j][r] = sycl::fma(g[j], s[j][r], kc[r] * delta[j]);
-                        o[j] = sycl::fma(s[j][r], qr, o[j]);
-                    }
-                }
-#pragma unroll
-                for (int j = 0; j < VPK; ++j) ro[(j * RG + rg) * CB + c] = o[j];
-                sycl::group_barrier(it.get_group());
-                if (rg < VPK)   // row group j writes head j's output
-                    y[t * HV * S + (int64_t) (qh + rg * HK) * S + col] =
-                        (ro[(rg * RG + 0) * CB + c] + ro[(rg * RG + 1) * CB + c] + ro[(rg * RG + 2) * CB + c] +
-                         ro[(rg * RG + 3) * CB + c]) * sycl::rsqrt((float) S);
-            }
-            // buffer (k + 1) & 1 was read by block k - 1, whose last token's second barrier every work-item passed
-            if (k + 1 < nblk) store((int) ((k + 1) & 1));
-            sycl::group_barrier(it.get_group());
-        }
-#pragma unroll
-        for (int j = 0; j < VPK; ++j) {
-            float* base = state + ((size_t) (rg * RPG) * HV + (size_t) (qh + j * HK)) * S + col;
-#pragma unroll
-            for (int r = 0; r < RPG; ++r) base[r * rs] = s[j][r];
-        }
-    }
-};
-static_assert(HV % HK == 0 && VPK <= RG && GdnRecKh::GB <= GdnRecKh::NT, "the key-head form's layout");
-
-namespace {
-// Whether GdnRecLane<16> runs on this device: a GRF holds 16 floats only where the EU is 16 wide (Xe2; the 8-wide
-// EUs of Xe-LP and Xe-HPG would spill the 128 state rows), and the device must build the large register file.
-// STRATA_GDN_REC_LANE=0: the D-2 kernel (A/B).
-bool gdn_lane_ok(sycl::queue& q) {
-    static core::PerDevice<bool> per_device;
-    return per_device.get(q.get_device(), [&] {
-        const char* v = std::getenv("STRATA_GDN_REC_LANE");
-        if (v != nullptr && v[0] == '0') return false;
-        const sycl::device d = q.get_device();
-        if (!d.has(sycl::aspect::ext_intel_gpu_eu_simd_width) ||
-            d.get_info<sycl::ext::intel::info::device::gpu_eu_simd_width>() < 16)
-            return false;
-        try {
-            (void) sycl::get_kernel_bundle<sycl::bundle_state::executable>(
-                q.get_context(), {d}, {sycl::get_kernel_id<GdnRecLane<16>>()});
-            return true;
-        } catch (const sycl::exception& e) {
-            std::fprintf(stderr, "strata: the GPU does not build the DeltaNet recurrence with the large register file "
-                         "(%s): the prompt path keeps the work-group kernel\n", e.what());
-            return false;
-        }
-    });
-}
-}  // namespace
-
-void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
-                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream) {
-    static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-group-per-head kernel (A/B)
-    auto& q = Q(stream);
-    if (serial || T <= 0) {
+        // the L2 norm of the 32 q/k heads per token, 128 work-items each
         q.submit([&](sycl::handler& hd) {
-            sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
-                red(sycl::range<1>(RG * S), hd), wsum(sycl::range<1>(16), hd);
-            hd.parallel_for(sycl::nd_range<1>((size_t) HV * S * RG, S * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            sycl::local_accessor<float, 1> part(sycl::range<1>(4), hd);
+            hd.parallel_for(sycl::nd_range<2>({(size_t) T, (size_t) 2 * HK * S}, {1, S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
                 const sycl::sub_group sg = it.get_sub_group();
-                const int head = (int) it.get_group(0), tid = (int) it.get_local_id(0), col = tid % S, rg = tid / S;
-                const int qh = head % HK;
-                float s[RPG];
-                float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
-                const size_t rs = (size_t) HV * S;
-                for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
-                const float g_col = gamma[col];
-                for (int64_t t = 0; t < T; ++t) {
-                    const float oc_all = rec_step<S>(it, s, h + t * C, gate, beta, t, head, qh, rg, col, col, tid,
-                                                     &sk[0], &sq[0], &red[0]);
-                    float oc = 0.0f, sp = 0.0f;
-                    if (rg == 0) { oc = oc_all; sp = oc * oc; }
-                    sp = warp_sum(sg, sp);
-                    if ((tid & 31) == 0) wsum[tid >> 5] = sp;
-                    sycl::group_barrier(it.get_group());
-                    if (rg == 0) {
-                        const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-                        const float v = oc * sycl::rsqrt(ss / (float) S + eps) * g_col * sigm(z[t * HV * S + head * S + col]);
-                        y[t * HV * S + head * S + col] = v;
-                        y16[t * HV * S + head * S + col] = hf(v);
-                    }
-                }
-                for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+                const int64_t t = (int64_t) it.get_group(0);
+                const int head = (int) it.get_group(1), tid = (int) it.get_local_id(1);
+                float* x = h + t * C + (int64_t) head * S;
+                const float v = x[tid];
+                const float sq = warp_sum(sg, v * v);
+                if ((tid & 31) == 0) part[tid >> 5] = sq;
+                sycl::group_barrier(it.get_group());
+                const float ss = part[0] + part[1] + part[2] + part[3];
+                x[tid] = v * sycl::rsqrt(ss + eps);
             });
         });
-        return;
     }
-    // D-2: the value columns split over 4 work-groups per head, then the output norm in its own kernel; per column
-    // the same arithmetic in the same order as the kernel above.  The next token's inputs (its q and k rows, v, gate,
-    // beta) are loaded into registers while this one computes (upstream ac6aad4, 04f4a53): the same bits.
-    // STRATA_GDN_PIPELINE=0: each token's inputs loaded when it starts (rec_step), to compare.
-    static const bool pipe_on = [] {
-        const char* v = std::getenv("STRATA_GDN_PIPELINE");
-        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-    }();
-    const bool pipe = pipe_on;   // the kernel takes a copy
-    static_assert(CB * RG == S, "one q and one k value a work-item");
-    // STRATA_GDN_KEYHEAD=0: the D-2 kernel where GdnRecLane does not run (A/B)
-    static const bool kh_on = [] {
-        const char* v = std::getenv("STRATA_GDN_KEYHEAD");
-        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-    }();
-    auto launch_kh = [&](float* st, float* yy) {
-        q.submit([&](sycl::handler& hd) {
-        using L = sycl::local_accessor<float, 1>;
-        hd.parallel_for(sycl::nd_range<1>((size_t) HK * NCB * GdnRecKh::NT, GdnRecKh::NT),
-                        GdnRecKh{st, h, gate, beta, yy, T, L(sycl::range<1>((size_t) 2 * GDN_TB * S), hd),
-                                 L(sycl::range<1>((size_t) 2 * GDN_TB * S), hd),
-                                 L(sycl::range<1>((size_t) 2 * GDN_TB * VPK * CB), hd),
-                                 L(sycl::range<1>((size_t) 2 * GdnRecKh::GB), hd),
-                                 L(sycl::range<1>((size_t) VPK * RG * CB), hd),
-                                 L(sycl::range<1>((size_t) VPK * RG * CB), hd)});
-    });
-    };
-    auto launch_d2 = [&](float* st, float* yy) {
-        q.submit([&](sycl::handler& hd) {
-        sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
-            red(sycl::range<1>(RG * CB), hd);
-        hd.parallel_for(sycl::nd_range<1>((size_t) HV * NCB * CB * RG, CB * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const int head = (int) it.get_group(0) / NCB, cb = (int) it.get_group(0) % NCB;
-            const int tid = (int) it.get_local_id(0), c = tid % CB, rg = tid / CB, col = cb * CB + c;
-            const int qh = head % HK;
-            float s[RPG];
-            float* base = st + ((size_t) (rg * RPG) * HV + head) * S + col;
+
+    // The recurrence with one value column a work-item and all S rows of its state in registers (the large register
+    // file): no barrier, no local memory, q and k read once per sub-group and handed out by sub-group broadcasts.  Per
+    // column the same arithmetic in the same order as the D-2 kernel below (four row groups of S / 4, summed left to
+    // right), so the same bits.  B70, one DeltaNet layer over 26K tokens: 32 ms against D-2's 42.
+    template <int SG>
+    struct GdnRecLane {
+        float* state;
+        const float* h;
+        const float* gate;
+        const float* beta;
+        float* y;
+        int64_t T;
+        static constexpr int NJ = S / SG;   // the q and k values a work-item holds
+        static constexpr int QR = S / 4;    // the D-2 kernel's rows per row group
+        void operator()(sycl::nd_item<1> it) const {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int lane = (int) sg.get_local_linear_id();
+            const int gcol = (int) it.get_global_id(0), head = gcol / S, col = gcol % S, qh = head % HK;
             const size_t rs = (size_t) HV * S;
-            for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
-            if (!pipe) {
-                for (int64_t t = 0; t < T; ++t) {
-                    const float oc = rec_step<CB>(it, s, h + t * C, gate, beta, t, head, qh, rg, c, col, tid, &sk[0],
-                                                  &sq[0], &red[0]);
-                    if (rg == 0) yy[t * HV * S + (int64_t) head * S + col] = oc;
-                }
-                for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
-                return;
-            }
-            float nq = 0.0f, nk = 0.0f, nv = 0.0f, ng = 0.0f, nb = 0.0f;
+            float* base = state + (size_t) head * S + col;
+            float s[S];
+    #pragma unroll
+            for (int r = 0; r < S; ++r) s[r] = base[r * rs];
+            float nk[NJ], nq[NJ], nv = 0.0f, ng = 0.0f, nb = 0.0f;
             auto fetch = [&](int64_t t) {
                 const float* ht = h + t * C;
-                nq = ht[qh * S + tid];
-                nk = ht[HK * S + qh * S + tid];
+    #pragma unroll
+                for (int j = 0; j < NJ; ++j) {
+                    nq[j] = ht[qh * S + j * SG + lane];
+                    nk[j] = ht[HK * S + qh * S + j * SG + lane];
+                }
                 nv = ht[2 * HK * S + head * S + col];
                 ng = gate[t * HV + head];
                 nb = beta[t * HV + head];
             };
             if (T > 0) fetch(0);
             for (int64_t t = 0; t < T; ++t) {
-                const float cq = nq, ck = nk, cv = nv, cg = ng, cbt = nb;
-                sycl::group_barrier(it.get_group());
-                sq[tid] = cq;
-                sk[tid] = ck;
-                sycl::group_barrier(it.get_group());
+                float ck[NJ], cq[NJ];
+    #pragma unroll
+                for (int j = 0; j < NJ; ++j) { ck[j] = nk[j]; cq[j] = nq[j]; }
+                const float cv = nv, cg = ng, cbt = nb;
                 if (t + 1 < T) fetch(t + 1);
                 const float g = sycl::exp(cg);
-                float kv = 0.0f;
-                for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], sk[rg * RPG + r], kv);
-                red[rg * CB + c] = kv;
-                sycl::group_barrier(it.get_group());
-                const float kv_col = red[c] + red[CB + c] + red[2 * CB + c] + red[3 * CB + c];
-                const float delta = (cv - g * kv_col) * cbt;
-                float o = 0.0f;
-                for (int r = 0; r < RPG; ++r) {
-                    s[r] = sycl::fma(g, s[r], sk[rg * RPG + r] * delta);
-                    o = sycl::fma(s[r], sq[rg * RPG + r], o);
-                }
-                sycl::group_barrier(it.get_group());
-                red[rg * CB + c] = o;
-                sycl::group_barrier(it.get_group());
-                if (rg == 0)
-                    yy[t * HV * S + (int64_t) head * S + col] =
-                        (red[c] + red[CB + c] + red[2 * CB + c] + red[3 * CB + c]) * sycl::rsqrt((float) S);
-            }
-            for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
-        });
-    });
-    };
-    // D-2 or the key-head form, whichever ran a chunk faster on this device: timed once, on copies of the state, at
-    // the first call of at least 64 tokens.  RTX 4070: 2175 -> 459 us for 512 tokens (+2.4% prompt speed); the B70
-    // without GdnRecLane: 56 -> 92 ms a prompt (the key-head form keeps 3 x 32 state rows a work-item in registers).
-    static int pick = -1;   // 1: the key-head form
-    if (gdn_lane_ok(q))
-        q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{state, h, gate, beta, y, T});
-    else {
-        if (pick < 0 && kh_on && T >= 64) {
-            const size_t ns = (size_t) S * HV * S, ny = (size_t) T * HV * S;
-            float* st = sycl::malloc_device<float>(ns, q);
-            float* yy = sycl::malloc_device<float>(ny, q);
-            if (st != nullptr && yy != nullptr) {
-                auto time = [&](auto&& launch) {   // the second run: the first may compile the kernel
-                    double us = 0;
-                    for (int r = 0; r < 2; ++r) {
-                        q.copy(state, st, ns).wait();
-                        const auto t0 = std::chrono::steady_clock::now();
-                        launch(st, yy);
-                        q.wait();
-                        us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                // the four row groups' sums interleaved, each still in row order: four independent chains instead of one
+                // (1.7x on the B70)
+                float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    #pragma unroll
+                for (int i = 0; i < QR; ++i)
+    #pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        const int r = k * QR + i;
+                        a[k] = sycl::fma(s[r], sycl::select_from_group(sg, ck[r / SG], r % SG), a[k]);
                     }
-                    return us;
-                };
-                const double d2 = time(launch_d2), kh = time(launch_kh);
-                pick = kh < d2 ? 1 : 0;
-                std::fprintf(stderr, "strata: the DeltaNet recurrence, %lld tokens: D-2 %.0f us, the key-head form %.0f "
-                             "us: %s\n", (long long) T, d2, kh, pick ? "the key-head form" : "D-2");
-            } else {
-                pick = 0;
+                const float delta = (cv - g * (a[0] + a[1] + a[2] + a[3])) * cbt;
+    #pragma unroll
+                for (int r = 0; r < S; ++r)
+                    s[r] = sycl::fma(g, s[r], sycl::select_from_group(sg, ck[r / SG], r % SG) * delta);
+                float o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    #pragma unroll
+                for (int i = 0; i < QR; ++i)
+    #pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        const int r = k * QR + i;
+                        o[k] = sycl::fma(s[r], sycl::select_from_group(sg, cq[r / SG], r % SG), o[k]);
+                    }
+                y[t * HV * S + (int64_t) head * S + col] = (o[0] + o[1] + o[2] + o[3]) * sycl::rsqrt((float) S);
             }
-            if (st != nullptr) sycl::free(st, q);
-            if (yy != nullptr) sycl::free(yy, q);
+    #pragma unroll
+            for (int r = 0; r < S; ++r) base[r * rs] = s[r];
         }
-        if (kh_on && pick == 1) launch_kh(state, y);
-        else launch_d2(state, y);
-    }
-    q.submit([&](sycl::handler& hd) {
-        sycl::local_accessor<float, 1> wsum(sycl::range<1>(4), hd);
-        hd.parallel_for(sycl::nd_range<2>({(size_t) T, (size_t) HV * S}, {1, S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const sycl::sub_group sg = it.get_sub_group();
-            const int64_t t = (int64_t) it.get_group(0);
-            const int head = (int) it.get_group(1), col = (int) it.get_local_id(1);
-            const size_t at = (size_t) t * HV * S + (size_t) head * S + col;
-            const float oc = y[at];
-            const float sp = warp_sum(sg, oc * oc);
-            if ((col & 31) == 0) wsum[col >> 5] = sp;
+        auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+            return sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>,
+                                                               sycl::ext::oneapi::experimental::sub_group_size<SG>};
+        }
+    };
+
+    // The key-head form (upstream's gdn_rec_kh_kernel): a work-group takes one key head's VPK value heads and CB of their
+    // columns, so every q and k value it reads feeds VPK heads, and 64 work-groups walk the chunk instead of 192.  The
+    // inputs come in blocks of GDN_TB tokens, read into registers while the block before computes and stored to local
+    // memory after it (upstream's cp.async), and a token takes two barriers instead of four.  Per value head and column
+    // the same arithmetic in the same order as the D-2 kernel: the same bits.
+    struct GdnRecKh {
+        static constexpr int NT = CB * RG, QK4 = GDN_TB * 2 * (S / 4), V4 = GDN_TB * VPK * (CB / 4), GB = 2 * GDN_TB * VPK;
+        static constexpr int NQK = (QK4 + NT - 1) / NT, NV = (V4 + NT - 1) / NT;
+        float* state;
+        const float* h;
+        const float* gate;
+        const float* beta;
+        float* y;
+        int64_t T;
+        sycl::local_accessor<float, 1> sq, sk, sv, sgb, rkv, ro;   // [2][TB][S] x2, [2][TB][VPK][CB], [2][2][TB][VPK], ...
+
+        void operator()(sycl::nd_item<1> it) const {
+            const int qh = (int) it.get_group(0) / NCB, cb = (int) it.get_group(0) % NCB;
+            const int tid = (int) it.get_local_id(0), c = tid % CB, rg = tid / CB, col = cb * CB + c;
+            float s[VPK][RPG];
+            const size_t rs = (size_t) HV * S;
+    #pragma unroll
+            for (int j = 0; j < VPK; ++j) {
+                const float* base = state + ((size_t) (rg * RPG) * HV + (size_t) (qh + j * HK)) * S + col;
+    #pragma unroll
+                for (int r = 0; r < RPG; ++r) s[j][r] = base[r * rs];
+            }
+            const int64_t nblk = (T + GDN_TB - 1) / GDN_TB;
+            sycl::float4 rqk[NQK], rv[NV];
+            float rgb = 0.0f;
+            auto load = [&](int64_t k) {   // tokens [k * TB, k * TB + TB) into registers
+                const int64_t t0 = k * GDN_TB;
+    #pragma unroll
+                for (int n = 0; n < NQK; ++n) {
+                    const int p = tid + n * NT;
+                    if (p >= QK4) break;
+                    const int i = p / (2 * (S / 4)), w = p % (2 * (S / 4)), isk = w / (S / 4), jj = (w % (S / 4)) * 4;
+                    rqk[n] = t0 + i < T ? *reinterpret_cast<const sycl::float4*>(h + (t0 + i) * C + (int64_t) ((isk ? HK * S : 0) + qh * S + jj))
+                                        : sycl::float4(0.0f);
+                }
+    #pragma unroll
+                for (int n = 0; n < NV; ++n) {
+                    const int p = tid + n * NT;
+                    if (p >= V4) break;
+                    const int i = p / (VPK * (CB / 4)), w = p % (VPK * (CB / 4)), j = w / (CB / 4), jj = (w % (CB / 4)) * 4;
+                    rv[n] = t0 + i < T ? *reinterpret_cast<const sycl::float4*>(h + (t0 + i) * C +
+                                                                                 (int64_t) (2 * HK * S + (qh + j * HK) * S + cb * CB + jj))
+                                       : sycl::float4(0.0f);
+                }
+                if (tid < GB) {
+                    const int isb = tid / (GDN_TB * VPK), w = tid % (GDN_TB * VPK), i = w / VPK, j = w % VPK;
+                    rgb = t0 + i < T ? (isb ? beta : gate)[(t0 + i) * HV + (int64_t) (qh + j * HK)] : 0.0f;
+                }
+            };
+            auto store = [&](int bb) {     // the registers into buffer bb
+    #pragma unroll
+                for (int n = 0; n < NQK; ++n) {
+                    const int p = tid + n * NT;
+                    if (p >= QK4) break;
+                    const int i = p / (2 * (S / 4)), w = p % (2 * (S / 4)), isk = w / (S / 4), jj = (w % (S / 4)) * 4;
+                    const auto& dst = isk ? sk : sq;
+                    for (int e = 0; e < 4; ++e) dst[((size_t) bb * GDN_TB + i) * S + jj + e] = rqk[n][e];
+                }
+    #pragma unroll
+                for (int n = 0; n < NV; ++n) {
+                    const int p = tid + n * NT;
+                    if (p >= V4) break;
+                    const int i = p / (VPK * (CB / 4)), w = p % (VPK * (CB / 4)), j = w / (CB / 4), jj = (w % (CB / 4)) * 4;
+                    for (int e = 0; e < 4; ++e) sv[(((size_t) bb * GDN_TB + i) * VPK + j) * CB + jj + e] = rv[n][e];
+                }
+                if (tid < GB) sgb[(size_t) bb * GB + tid] = rgb;   // [bb][gate, beta][i][j]
+            };
+            if (nblk > 0) {
+                load(0);
+                store(0);
+            }
             sycl::group_barrier(it.get_group());
-            const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-            // FP16 only: the out projection reads y16, nothing reads the normalized value in FP32 (upstream a7ce31b)
-            y16[at] = hf(oc * sycl::rsqrt(ss / (float) S + eps) * gamma[col] * sigm(z[at]));
+            for (int64_t k = 0; k < nblk; ++k) {
+                if (k + 1 < nblk) load(k + 1);
+                const int bb = (int) (k & 1);
+                const int n = (int) std::min<int64_t>(GDN_TB, T - k * GDN_TB);
+                for (int i = 0; i < n; ++i) {
+                    const int64_t t = k * GDN_TB + i;
+                    float kc[RPG];
+    #pragma unroll
+                    for (int r = 0; r < RPG; ++r) kc[r] = sk[((size_t) bb * GDN_TB + i) * S + (size_t) (rg * RPG + r)];
+                    float g[VPK], kv[VPK], delta[VPK], o[VPK];
+    #pragma unroll
+                    for (int j = 0; j < VPK; ++j) {
+                        g[j] = sycl::exp(sgb[(size_t) bb * GB + (size_t) (i * VPK + j)]);
+                        kv[j] = 0.0f;
+                        o[j] = 0.0f;
+                    }
+    #pragma unroll
+                    for (int r = 0; r < RPG; ++r)
+    #pragma unroll
+                        for (int j = 0; j < VPK; ++j) kv[j] = sycl::fma(s[j][r], kc[r], kv[j]);
+    #pragma unroll
+                    for (int j = 0; j < VPK; ++j) rkv[(j * RG + rg) * CB + c] = kv[j];
+                    sycl::group_barrier(it.get_group());
+    #pragma unroll
+                    for (int j = 0; j < VPK; ++j) {
+                        const float kv_col = rkv[(j * RG + 0) * CB + c] + rkv[(j * RG + 1) * CB + c] +
+                                             rkv[(j * RG + 2) * CB + c] + rkv[(j * RG + 3) * CB + c];
+                        delta[j] = (sv[(((size_t) bb * GDN_TB + i) * VPK + j) * CB + c] - g[j] * kv_col) *
+                                   sgb[(size_t) bb * GB + (size_t) (GDN_TB * VPK + i * VPK + j)];
+                    }
+    #pragma unroll
+                    for (int r = 0; r < RPG; ++r) {
+                        const float qr = sq[((size_t) bb * GDN_TB + i) * S + (size_t) (rg * RPG + r)];
+    #pragma unroll
+                        for (int j = 0; j < VPK; ++j) {
+                            s[j][r] = sycl::fma(g[j], s[j][r], kc[r] * delta[j]);
+                            o[j] = sycl::fma(s[j][r], qr, o[j]);
+                        }
+                    }
+    #pragma unroll
+                    for (int j = 0; j < VPK; ++j) ro[(j * RG + rg) * CB + c] = o[j];
+                    sycl::group_barrier(it.get_group());
+                    if (rg < VPK)   // row group j writes head j's output
+                        y[t * HV * S + (int64_t) (qh + rg * HK) * S + col] =
+                            (ro[(rg * RG + 0) * CB + c] + ro[(rg * RG + 1) * CB + c] + ro[(rg * RG + 2) * CB + c] +
+                             ro[(rg * RG + 3) * CB + c]) * sycl::rsqrt((float) S);
+                }
+                // buffer (k + 1) & 1 was read by block k - 1, whose last token's second barrier every work-item passed
+                if (k + 1 < nblk) store((int) ((k + 1) & 1));
+                sycl::group_barrier(it.get_group());
+            }
+    #pragma unroll
+            for (int j = 0; j < VPK; ++j) {
+                float* base = state + ((size_t) (rg * RPG) * HV + (size_t) (qh + j * HK)) * S + col;
+    #pragma unroll
+                for (int r = 0; r < RPG; ++r) base[r * rs] = s[j][r];
+            }
+        }
+    };
+    static_assert(HV % HK == 0 && VPK <= RG && GdnRecKh::GB <= GdnRecKh::NT, "the key-head form's layout");
+
+    // Whether GdnRecLane<16> runs on this device: a GRF holds 16 floats only where the EU is 16 wide (Xe2; the 8-wide
+    // EUs of Xe-LP and Xe-HPG would spill the 128 state rows), and the device must build the large register file.
+    // STRATA_GDN_REC_LANE=0: the D-2 kernel (A/B).
+    static bool gdn_lane_ok(sycl::queue& q) {
+        static core::PerDevice<bool> per_device;
+        return per_device.get(q.get_device(), [&] {
+            const char* v = std::getenv("STRATA_GDN_REC_LANE");
+            if (v != nullptr && v[0] == '0') return false;
+            const sycl::device d = q.get_device();
+            if (!d.has(sycl::aspect::ext_intel_gpu_eu_simd_width) ||
+                d.get_info<sycl::ext::intel::info::device::gpu_eu_simd_width>() < 16)
+                return false;
+            try {
+                (void) sycl::get_kernel_bundle<sycl::bundle_state::executable>(
+                    q.get_context(), {d}, {sycl::get_kernel_id<GdnRecLane<16>>()});
+                return true;
+            } catch (const sycl::exception& e) {
+                std::fprintf(stderr, "strata: the GPU does not build the DeltaNet recurrence with the large register file "
+                             "(%s): the prompt path keeps the work-group kernel\n", e.what());
+                return false;
+            }
         });
+    }
+
+    static void recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
+                           const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, bool silu, void* stream) {
+        static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-group-per-head kernel (A/B)
+        auto& q = Q(stream);
+        if (serial || T <= 0) {
+            q.submit([&](sycl::handler& hd) {
+                sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
+                    red(sycl::range<1>((size_t) RG * S), hd), wsum(sycl::range<1>(16), hd);
+                hd.parallel_for(sycl::nd_range<1>((size_t) HV * S * RG, (size_t) S * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                    const sycl::sub_group sg = it.get_sub_group();
+                    const int head = (int) it.get_group(0), tid = (int) it.get_local_id(0), col = tid % S, rg = tid / S;
+                    const int qh = head % HK;
+                    float s[RPG];
+                    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
+                    const size_t rs = (size_t) HV * S;
+                    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
+                    const float g_col = gamma[col];
+                    for (int64_t t = 0; t < T; ++t) {
+                        const float oc_all = rec_step<S>(it, s, h + t * C, gate, beta, t, head, qh, rg, col, col, tid,
+                                                         &sk[0], &sq[0], &red[0]);
+                        float oc = 0.0f, sp = 0.0f;
+                        if (rg == 0) { oc = oc_all; sp = oc * oc; }
+                        sp = warp_sum(sg, sp);
+                        if ((tid & 31) == 0) wsum[tid >> 5] = sp;
+                        sycl::group_barrier(it.get_group());
+                        if (rg == 0) {
+                            const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+                            const float v = oc * sycl::rsqrt(ss / (float) S + eps) * g_col * zgate(z[t * HV * S + (int64_t) head * S + col], silu);
+                            y[t * HV * S + (int64_t) head * S + col] = v;
+                            y16[t * HV * S + (int64_t) head * S + col] = hf(v);
+                        }
+                    }
+                    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+                });
+            });
+            return;
+        }
+        // D-2: the value columns split over 4 work-groups per head, then the output norm in its own kernel; per column
+        // the same arithmetic in the same order as the kernel above.  The next token's inputs (its q and k rows, v, gate,
+        // beta) are loaded into registers while this one computes (upstream ac6aad4, 04f4a53): the same bits.
+        // STRATA_GDN_PIPELINE=0: each token's inputs loaded when it starts (rec_step), to compare.
+        static const bool pipe_on = [] {
+            const char* v = std::getenv("STRATA_GDN_PIPELINE");
+            return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+        }();
+        const bool pipe = pipe_on;   // the kernel takes a copy
+        static_assert(CB * RG == S, "one q and one k value a work-item");
+        // STRATA_GDN_KEYHEAD=0: the D-2 kernel where GdnRecLane does not run (A/B)
+        static const bool kh_on = [] {
+            const char* v = std::getenv("STRATA_GDN_KEYHEAD");
+            return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+        }();
+        auto launch_kh = [&](float* st, float* yy) {
+            q.submit([&](sycl::handler& hd) {
+            using L = sycl::local_accessor<float, 1>;
+            hd.parallel_for(sycl::nd_range<1>((size_t) HK * NCB * GdnRecKh::NT, GdnRecKh::NT),
+                            GdnRecKh{st, h, gate, beta, yy, T, L(sycl::range<1>((size_t) 2 * GDN_TB * S), hd),
+                                     L(sycl::range<1>((size_t) 2 * GDN_TB * S), hd),
+                                     L(sycl::range<1>((size_t) 2 * GDN_TB * VPK * CB), hd),
+                                     L(sycl::range<1>((size_t) 2 * GdnRecKh::GB), hd),
+                                     L(sycl::range<1>((size_t) VPK * RG * CB), hd),
+                                     L(sycl::range<1>((size_t) VPK * RG * CB), hd)});
+        });
+        };
+        auto launch_d2 = [&](float* st, float* yy) {
+            q.submit([&](sycl::handler& hd) {
+            sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
+                red(sycl::range<1>((size_t) RG * CB), hd);
+            hd.parallel_for(sycl::nd_range<1>((size_t) HV * NCB * CB * RG, (size_t) CB * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                const int head = (int) it.get_group(0) / NCB, cb = (int) it.get_group(0) % NCB;
+                const int tid = (int) it.get_local_id(0), c = tid % CB, rg = tid / CB, col = cb * CB + c;
+                const int qh = head % HK;
+                float s[RPG];
+                float* base = st + ((size_t) (rg * RPG) * HV + head) * S + col;
+                const size_t rs = (size_t) HV * S;
+                for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
+                if (!pipe) {
+                    for (int64_t t = 0; t < T; ++t) {
+                        const float oc = rec_step<CB>(it, s, h + t * C, gate, beta, t, head, qh, rg, c, col, tid, &sk[0],
+                                                      &sq[0], &red[0]);
+                        if (rg == 0) yy[t * HV * S + (int64_t) head * S + col] = oc;
+                    }
+                    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+                    return;
+                }
+                float nq = 0.0f, nk = 0.0f, nv = 0.0f, ng = 0.0f, nb = 0.0f;
+                auto fetch = [&](int64_t t) {
+                    const float* ht = h + t * C;
+                    nq = ht[qh * S + tid];
+                    nk = ht[HK * S + qh * S + tid];
+                    nv = ht[2 * HK * S + head * S + col];
+                    ng = gate[t * HV + head];
+                    nb = beta[t * HV + head];
+                };
+                if (T > 0) fetch(0);
+                for (int64_t t = 0; t < T; ++t) {
+                    const float cq = nq, ck = nk, cv = nv, cg = ng, cbt = nb;
+                    sycl::group_barrier(it.get_group());
+                    sq[tid] = cq;
+                    sk[tid] = ck;
+                    sycl::group_barrier(it.get_group());
+                    if (t + 1 < T) fetch(t + 1);
+                    const float g = sycl::exp(cg);
+                    float kv = 0.0f;
+                    for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], sk[rg * RPG + r], kv);
+                    red[rg * CB + c] = kv;
+                    sycl::group_barrier(it.get_group());
+                    const float kv_col = red[c] + red[CB + c] + red[2 * CB + c] + red[3 * CB + c];
+                    const float delta = (cv - g * kv_col) * cbt;
+                    float o = 0.0f;
+                    for (int r = 0; r < RPG; ++r) {
+                        s[r] = sycl::fma(g, s[r], sk[rg * RPG + r] * delta);
+                        o = sycl::fma(s[r], sq[rg * RPG + r], o);
+                    }
+                    sycl::group_barrier(it.get_group());
+                    red[rg * CB + c] = o;
+                    sycl::group_barrier(it.get_group());
+                    if (rg == 0)
+                        yy[t * HV * S + (int64_t) head * S + col] =
+                            (red[c] + red[CB + c] + red[2 * CB + c] + red[3 * CB + c]) * sycl::rsqrt((float) S);
+                }
+                for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+            });
+        });
+        };
+        // D-2 or the key-head form, whichever ran a chunk faster on this device: timed once, on copies of the state, at
+        // the first call of at least 64 tokens.  RTX 4070: 2175 -> 459 us for 512 tokens (+2.4% prompt speed); the B70
+        // without GdnRecLane: 56 -> 92 ms a prompt (the key-head form keeps 3 x 32 state rows a work-item in registers).
+        static int pick = -1;   // 1: the key-head form
+        if (gdn_lane_ok(q))
+            q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{state, h, gate, beta, y, T});
+        else {
+            if (pick < 0 && kh_on && T >= 64) {
+                const size_t ns = (size_t) S * HV * S, ny = (size_t) T * HV * S;
+                float* st = sycl::malloc_device<float>(ns, q);
+                float* yy = sycl::malloc_device<float>(ny, q);
+                if (st != nullptr && yy != nullptr) {
+                    auto time = [&](auto&& launch) {   // the second run: the first may compile the kernel
+                        double us = 0;
+                        for (int r = 0; r < 2; ++r) {
+                            q.copy(state, st, ns).wait();
+                            const auto t0 = std::chrono::steady_clock::now();
+                            launch(st, yy);
+                            q.wait();
+                            us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                        }
+                        return us;
+                    };
+                    const double d2 = time(launch_d2), kh = time(launch_kh);
+                    pick = kh < d2 ? 1 : 0;
+                    std::fprintf(stderr, "strata: the DeltaNet recurrence, %lld tokens: D-2 %.0f us, the key-head form %.0f "
+                                 "us: %s\n", (long long) T, d2, kh, pick ? "the key-head form" : "D-2");
+                } else {
+                    pick = 0;
+                }
+                if (st != nullptr) sycl::free(st, q);
+                if (yy != nullptr) sycl::free(yy, q);
+            }
+            if (kh_on && pick == 1) launch_kh(state, y);
+            else launch_d2(state, y);
+        }
+        q.submit([&](sycl::handler& hd) {
+            sycl::local_accessor<float, 1> wsum(sycl::range<1>(4), hd);
+            hd.parallel_for(sycl::nd_range<2>({(size_t) T, (size_t) HV * S}, {1, S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                const sycl::sub_group sg = it.get_sub_group();
+                const int64_t t = (int64_t) it.get_group(0);
+                const int head = (int) it.get_group(1), col = (int) it.get_local_id(1);
+                const size_t at = (size_t) t * HV * S + (size_t) head * S + col;
+                const float oc = y[at];
+                const float sp = warp_sum(sg, oc * oc);
+                if ((col & 31) == 0) wsum[col >> 5] = sp;
+                sycl::group_barrier(it.get_group());
+                const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+                // FP16 only: the out projection reads y16, nothing reads the normalized value in FP32 (upstream a7ce31b)
+                y16[at] = hf(oc * sycl::rsqrt(ss / (float) S + eps) * gamma[col] * zgate(z[at], silu));
+            });
+        });
+    }
+};
+
+namespace {
+template <class F> void gdn_dispatch(int64_t h_k, int64_t h_v, const char* what, F&& f) {
+    if (h_k == 16 && h_v == 48) f(Gdn<16, 48>{});
+    else if (h_k == 16 && h_v == 32) f(Gdn<16, 32>{});
+    else throw core::DeviceError(std::string(what) + ": no kernels for " + std::to_string(h_k) + " key and " +
+                                 std::to_string(h_v) + " value heads");
+}
+}  // namespace
+
+void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream,
+               int64_t h_k, int64_t h_v) {
+    gdn_dispatch(h_k, h_v, "gdn_gates", [&](auto g) { decltype(g)::gates(ab, dt, ssm_a, gate, beta, T, stream); });
+}
+
+void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream,
+              int64_t h_k, int64_t h_v) {
+    gdn_dispatch(h_k, h_v, "gdn_conv", [&](auto g) { decltype(g)::conv(history, qkv, conv_w, h, T, eps, stream); });
+}
+
+void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
+                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, int64_t h_k,
+                    int64_t h_v, bool silu) {
+    gdn_dispatch(h_k, h_v, "gdn_recurrence", [&](auto g) {
+        decltype(g)::recurrence(state, h, gate, beta, z, gamma, eps, y, y16, T, silu, stream);
     });
 }
 
@@ -977,9 +1050,9 @@ void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream)
         h16[i] = hf_sat(g / (1.0f + sycl::exp(-g)) * u);
     });
 }
-void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream) {
+void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream, int64_t width) {
     if (n <= 0) return;
-    Q(stream).parallel_for(sycl::range<1>((size_t) (n * 640)), [=](sycl::id<1> i) {
+    Q(stream).parallel_for(sycl::range<1>((size_t) (n * width)), [=](sycl::id<1> i) {
         const float a = g[i];
         h16[i] = hf_sat(a / (1.0f + sycl::exp(-a)) * u[i]);
     });
@@ -992,6 +1065,13 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
     Q(stream).parallel_for(sycl::range<1>((size_t) (n * per)), [=](sycl::id<1> id) {
         const int64_t i = (int64_t) id[0], r = i / per, j = i % per;
         dst[r * per + j] = x[(int64_t) src[r] * per + j];
+    });
+}
+void scatter_rows(const float* src, const int32_t* dst_row, float* dst, int64_t n, int64_t width, void* stream) {
+    if (n <= 0) return;
+    Q(stream).parallel_for(sycl::range<1>((size_t) (n * width)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], r = i / width, j = i % width;
+        dst[(int64_t) dst_row[r] * width + j] = src[i];
     });
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,

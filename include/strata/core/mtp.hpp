@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/mtp.hpp - plan v0.3 P6: the MTP draft layer on the GPU.
 //
 // The model ships one multi-token-prediction layer (vLLM 0.30.0 `qwen4_exp` MTP; transcribed and validated in
@@ -24,6 +24,7 @@
 
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/kernels/gr.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include "strata/core/gpu.hpp"
@@ -191,6 +192,11 @@ private:
     float chain_prob_[8] = {};
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
+    /// upstream #1996: those records' pinned host side and the event of the copy that last read it (a pageable source
+    /// went out of scope before an asynchronous copy read it)
+    int32_t* pf_host_ = nullptr;
+    int64_t pf_host_cap_ = 0;
+    strata::gpu::Event* pf_ev_ = nullptr;
     strata::gpu::Graph* round_exec_[9] = {};
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
@@ -227,6 +233,9 @@ private:
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr;
     float* attn_scratch_ = nullptr;
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *y_ = nullptr, *sample_ = nullptr;
+    /// gr_read's scratch of the drafter's own, not the session's ss.block.gr: the last stage's verifier uses that one,
+    /// and with --pipeline-windows a chain and that stage's window can run on the card at once (upstream 553b0b78)
+    strata::kernels::GrWorkspace own_gr_;
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr, *out_ids_ = nullptr;
     uint8_t* hit_xq_ = nullptr;
     unsigned long long* grp_ptr_ = nullptr;

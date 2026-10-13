@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/progress.hpp - issue #29: whether a request is still moving, and where it is.
 //
 // The engine's host loop and the GPU wait on each other through flags; a protocol bug there does not crash, it

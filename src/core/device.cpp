@@ -1,13 +1,27 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU core_device
 #include "strata/kernels/device_arch_tag.hpp"
 
 
+#if defined(__has_include)
+#if __has_include(<level_zero/ze_api.h>) && __has_include(<sycl/ext/oneapi/backend/level_zero.hpp>)
+#include <level_zero/ze_api.h>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+#include <dlfcn.h>
+#define STRATA_HAVE_ZE_API 1
+#endif
+#endif
+
+#ifndef _WIN32
+#include <link.h>
+#endif
+
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -68,6 +82,29 @@ std::string pci_of(const sycl::device& d) {
     return s;
 }
 
+// No GPU on Level Zero, CUDA or HIP at all: the GPU's driver is missing, or the SYCL runtime did not load its adapter
+// for the backend.  A user who started the engine without the libraries setup gave it (the config's lib_dirs) read
+// only "no usable GPU" and looked for the fault in the card; say what the runtime lists and which libsycl it is.
+std::string no_gpu_listed() {
+    std::string seen;
+    for (const auto& p : sycl::platform::get_platforms())
+        seen += (seen.empty() ? "" : ", ") + p.get_info<sycl::info::platform::name>();
+    std::string lib = "?";
+#ifndef _WIN32
+    // the loaded object by its name: dladdr on one of its functions names the engine itself, which is not PIE (the
+    // address is the engine's PLT entry)
+    dl_iterate_phdr([](dl_phdr_info* info, size_t, void* out) {
+        if (info->dlpi_name == nullptr || std::strstr(info->dlpi_name, "/libsycl.so") == nullptr) return 0;
+        *static_cast<std::string*>(out) = info->dlpi_name;
+        return 1;
+    }, &lib);
+#endif
+    return "the SYCL runtime lists no GPU on Level Zero, CUDA or HIP (platforms: " + (seen.empty() ? "none" : seen) +
+           "; libsycl: " + lib + "): the GPU driver is missing, or the runtime did not load its adapter for the GPU. "
+           "Started by hand, the engine needs the lib_dirs of its config in LD_LIBRARY_PATH (the server sets it); "
+           "SYCL_UR_TRACE=1 shows which adapters load";
+}
+
 // The GPUs the engine can drive, device 0 first: the GPU chosen below, then the others in the same order of
 // preference.  Read once.
 std::vector<sycl::device> find_devices() {
@@ -81,7 +118,7 @@ std::vector<sycl::device> find_devices() {
         }
         candidates.push_back(d);
     }
-    if (candidates.empty()) throw DeviceError("no usable GPU" + refused);
+    if (candidates.empty()) throw DeviceError(refused.empty() ? no_gpu_listed() : "no usable GPU" + refused);
     // setup names the card by PCI address: Level Zero's own numbering can include GPUs that setup does not list
     if (const char* want = std::getenv("STRATA_GPU_PCI"); want != nullptr && *want != '\0') {
         std::string w = want;
@@ -232,6 +269,91 @@ bool Runtime::measure_marks() {
 sycl::queue* Runtime::create_stream() {
     std::lock_guard<std::mutex> lock(streams_mutex_);
     return &streams_.emplace_back(context_, device_, handler(), sycl::property::queue::in_order{});
+}
+
+// The prompt path's expert copies on the GPU's copy engine (upstream 01fe68dd, in its sycl/ port): Level Zero's v2
+// adapter runs an in-order queue's memcpy on the compute engine.  A device that reports a copy-only queue group gets an
+// immediate command list on it, wrapped as a SYCL queue; any other device (CUDA, HIP, no such group, a build without
+// the Level Zero headers) an ordinary engine stream.  On the B70 the prompt read as fast either way (4K 1,504 tok/s,
+// 32K 2,312 and 2,305, 2026-10-12): the copies were already behind the kernels there.  STRATA_COPY_ENGINE=0: off.
+sycl::queue* Runtime::create_copy_stream() {
+#ifdef STRATA_HAVE_ZE_API
+    static const bool off = [] {
+        const char* v = std::getenv("STRATA_COPY_ENGINE");
+        return v != nullptr && std::strtol(v, nullptr, 10) == 0;
+    }();
+    if (!off && device_.get_backend() == sycl::backend::ext_oneapi_level_zero) {
+        try {
+            void* lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);   // the SYCL runtime has loaded it
+            if (lib == nullptr) lib = dlopen("libze_loader.so.1", RTLD_NOW);
+            using GroupsFn = decltype(&zeDeviceGetCommandQueueGroupProperties);
+            using ImmFn = decltype(&zeCommandListCreateImmediate);
+            auto groups = lib ? reinterpret_cast<GroupsFn>(dlsym(lib, "zeDeviceGetCommandQueueGroupProperties")) : nullptr;
+            auto imm = lib ? reinterpret_cast<ImmFn>(dlsym(lib, "zeCommandListCreateImmediate")) : nullptr;
+            const auto zdev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(device_);
+            const auto zctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(context_);
+            uint32_t n = 0;
+            std::vector<ze_command_queue_group_properties_t> g;
+            if (groups != nullptr && imm != nullptr && groups(zdev, &n, nullptr) == ZE_RESULT_SUCCESS && n > 0) {
+                ze_command_queue_group_properties_t blank;
+                std::memset(&blank, 0, sizeof blank);
+                blank.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_GROUP_PROPERTIES;
+                g.assign(n, blank);
+                if (groups(zdev, &n, g.data()) != ZE_RESULT_SUCCESS) g.clear();
+            }
+            for (uint32_t i = 0; i < (uint32_t) g.size(); ++i) {
+                if (!(g[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY) ||
+                    (g[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE) || g[i].numQueues == 0)
+                    continue;
+                ze_command_queue_desc_t d;
+                std::memset(&d, 0, sizeof d);
+                d.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
+                d.ordinal = i;
+                d.flags = ZE_COMMAND_QUEUE_FLAG_IN_ORDER;
+                d.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+                d.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+                ze_command_list_handle_t cl = nullptr;
+                if (imm(zctx, zdev, &d, &cl) != ZE_RESULT_SUCCESS || cl == nullptr) break;
+                sycl::backend_input_t<sycl::backend::ext_oneapi_level_zero, sycl::queue> in(
+                    cl, device_, sycl::ext::oneapi::level_zero::ownership::transfer,
+                    sycl::property_list{sycl::property::queue::in_order{}});
+                std::lock_guard<std::mutex> lock(streams_mutex_);
+                sycl::queue* q = &streams_.emplace_back(
+                    sycl::make_queue<sycl::backend::ext_oneapi_level_zero>(in, context_, handler()));
+                static std::atomic<bool> said{false};
+                if (!said.exchange(true))
+                    std::fprintf(stderr, "strata: the prompt's expert copies on the GPU's copy engine (queue group %u; "
+                                         "STRATA_COPY_ENGINE=0 turns it off)\n", i);
+                return q;
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata: no copy-engine queue (%s): an ordinary stream\n", e.what());
+        }
+    }
+#endif
+    return create_stream();
+}
+
+std::string Runtime::device_status() {
+#ifdef STRATA_HAVE_ZE_API
+    if (device_.get_backend() == sycl::backend::ext_oneapi_level_zero) {
+        try {
+            void* lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);
+            using StatusFn = decltype(&zeDeviceGetStatus);
+            auto status = lib ? reinterpret_cast<StatusFn>(dlsym(lib, "zeDeviceGetStatus")) : nullptr;
+            if (status == nullptr) return "unknown";
+            const ze_result_t r = status(sycl::get_native<sycl::backend::ext_oneapi_level_zero>(device_));
+            if (r == ZE_RESULT_SUCCESS) return "answers";
+            if (r == ZE_RESULT_ERROR_DEVICE_LOST) return "lost";
+            char buf[48];
+            std::snprintf(buf, sizeof buf, "Level Zero result 0x%x", (unsigned) r);
+            return buf;
+        } catch (const std::exception&) {
+            return "unknown";
+        }
+    }
+#endif
+    return "unknown";
 }
 
 void Runtime::destroy_stream(sycl::queue* stream) {

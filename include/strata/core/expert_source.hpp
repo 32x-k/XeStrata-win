@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/expert_source.hpp - P2.S3/P2.S5: the expert pool's adapter to the host loop.
 //
 // `session_loop` publishes, per layer, the NORMED activation `x_f`, the ten routed expert ids and their router
@@ -85,6 +85,14 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/me
                            const std::string& self_cgroup = "/proc/self/cgroup",
                            const std::string& cgroup_root = "/sys/fs/cgroup");
 
+/// #11: whether a RAM copy of `copy` bytes is page-locked.  Page-locked host memory belongs to the GPU driver (Linux
+/// xe: a buffer object it maps), and when the RAM beside it cannot hold what the run keeps reading from the model's
+/// files, reclaim reaches that memory under the GPU's copies: on a B70 with 31 GiB of RAM and 17.5 GiB locked, the
+/// prompt's copies faulted and timed out while the experts' files paged in and out; the same copy pageable ran.
+/// True when the RAM `available` before the copy, less the copy, still holds `headroom` and `in_place` (the bytes read
+/// from the files through the page cache); `why` gets the numbers either way, for the log.
+bool resident_pin_fits(uint64_t copy, uint64_t in_place, uint64_t headroom, uint64_t available, std::string& why);
+
 /// Build compact offsets for experts absent from both the primary GPU cache and an optional second GPU tier.
 /// Kept CPU-only so selection and byte accounting can be tested without initializing a GPU.
 bool make_cache_complement_plan(
@@ -109,6 +117,22 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
 /// The adaptive tier swapped `in` into a GPU slot and `out` out of it: `out` takes `in`'s place in the compact copy
 /// (the caller copies out's bytes there).  False, and nothing changed, unless `in` is in the copy and `out` is not.
 bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out);
+
+/// A layer split: add each stage's lend region to a plan built from the complement plus every stage's cache (the
+/// `additional_gpu_pairs` shape).  Each region lists one stage's (layer, expert) pairs, the pairs in its cache's
+/// highest slots first - the slots the prompt path borrows, from the tail in.  A pair already in the plan is passed
+/// over; a stage's walk stops at the first pair that does not fit `cap_bytes` and the NEXT stage's walk still runs
+/// (the pairs past the cap keep the mapped-file fallback they had).  Returns the pairs added, or -1 - leaving the
+/// plan untouched - when a pair is outside the geometry or a region repeats one (upstream aea9dc3e).
+int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
+                                  std::vector<uint64_t>& offsets, uint64_t& bytes, uint64_t cap_bytes,
+                                  const std::vector<std::vector<std::pair<int32_t, int32_t>>>& regions,
+                                  std::string& err);
+
+/// The sentence appended to a "not enough RAM" start failure: how much of the RAM is file cache (Cached + Buffers of
+/// `meminfo_text`, a /proc/meminfo text, mapped pages included) and what to do about it; "" when under 1 GiB of cache
+/// (nothing to say).  upstream 8c80a3ba.
+std::string page_cache_hint(const std::string& meminfo_text);
 
 }  // namespace detail
 
@@ -339,9 +363,17 @@ struct ExpertDispatch {
     int pcie_num = 0;
     /// The measured split (after Project Maya's CPU lane): the times taken at start, from which `pcie_split_m` gives
     /// the number of a group's missed experts read over PCIe; `pcie_overlap`: the GPU reads them beside its VRAM hits
-    /// (the verify window's fetch branch).  Null: the share `pcie_num`/256.
-    const PcieSplitTimes* pcie_split = nullptr;
+    /// (the verify window's fetch branch).  Null: the share `pcie_num`/256.  Its CPU times are refined from the decode's
+    /// own pool calls (`expert_pool_dispatch_multi`, STRATA_PCIE_SPLIT_REFINE=0 keeps the start-up times).
+    PcieSplitTimes* pcie_split = nullptr;
     bool pcie_overlap = false;
+    /// The pool calls the split's CPU times are checked against: their wall time, the time the split's times gave
+    /// them, the calls and their experts since the last update, and the updates made (three at most).
+    struct SplitRefine {
+        double ms = 0.0, ms_model = 0.0;
+        int64_t calls = 0, experts = 0;
+        int updates = 0;
+    } split_refine;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     /// STRATA_ROUTE_TAIL_SKIP=R: entries skipped (a missed expert every token of the window routes only at rank >= R)
     /// and the distinct experts behind them (neither copied nor computed)
@@ -397,6 +429,13 @@ bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, doub
 /// earlier than the CPU taking all `f` (the times are measured alone and on few experts: a split by a thin margin
 /// lost on the B70 with the VRAM of a small card); else 0.
 int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h);
+/// All of `t`, measured once at start on the window's own kernels: the CPU's side (measure_cpu_expert_ms), the GPU
+/// computing experts from its memory, the PCIe fetch of experts in RAM, and the CPU's and the link's sides beside each
+/// other from the rate the memory serves.  False, with `why`, when a side cannot be timed (too few experts in RAM).
+bool measure_pcie_split(ExpertDispatch& d, int64_t n_layers, PcieSplitTimes& t, std::string& why);
+/// The memory's rate for measure_pcie_split, read now (before a long prompt, where the split is set up after it: after a
+/// 64K prompt the reading came out up to 3x low on the RX 9060 XT's machine).
+void read_memory_rate_before(const ExpertDispatch& d, int64_t n_layers);
 
 /// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
 int tail_skip_rank();
@@ -455,8 +494,9 @@ public:
     /// The resident RAM mode (`--resident-experts`, `--resident-cpu-experts`):
     ///   - `pin`: page-locked and mapped (`cudaHostAlloc`), so the prompt path copies it by DMA and the verify
     ///     window may read a share of the misses over PCIe; when the driver refuses, ordinary memory locked in the
-    ///     working set instead.  `pin = false` is ordinary pageable memory (the ROCm arm: large pinned allocations
-    ///     can fail there, and it is what the HIP measurements used).
+    ///     working set instead.  `Pin::automatic` locks it only when the RAM left beside it holds what is still read
+    ///     from the files (detail::resident_pin_fits, #11); `Pin::off` is ordinary pageable memory (the ROCm arm:
+    ///     large pinned allocations can fail there, and it is what the HIP measurements used).
     ///   - `lend_from_slot` >= 0: the GPU-cache slots from there to the end are the prompt path's lend region; their
     ///     experts are kept in RAM too, from the last slot down, as far as `available RAM - headroom_bytes` allows
     ///     (a lent slot's expert is streamed during the prompt and copied back after it).
@@ -469,11 +509,20 @@ public:
     /// and the #403 margin) - the soft --resident-experts mode's second try when the whole complement does not fit;
     /// false when not even one expert fits.  On Windows the mapped experts leave the working set before any reading.
     static constexpr uint64_t kResidentWhatFits = ~0ull;
+    enum class Pin { off, automatic, on };
     bool pin_cache_complement(
-        const ExpertCache& cache, std::string& err, bool pin = true,
+        const ExpertCache& cache, std::string& err, Pin pin = Pin::automatic,
         const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
         const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
+    /// A layer split: the prompt path borrows the TAIL SLOTS of every stage's cache, CUDA0's included, and with
+    /// `additional_gpu_pairs` the single lend region above is off.  Set these BEFORE `pin_cache_complement` to keep
+    /// those slots' experts in the RAM copy too: each region lists its stage's (layer, expert) pairs, the highest
+    /// cache slot first, as the borrowing takes them.  Pairs past the budget keep the mapped-file fallback.  Empty
+    /// (the default): the copy holds only the complement under a split (upstream aea9dc3e).
+    void stage_lend_regions(std::vector<std::vector<std::pair<int32_t, int32_t>>> regions) {
+        stage_lend_regions_ = std::move(regions);
+    }
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -650,6 +699,7 @@ private:
     bool complement_ready_ = false;
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
+    std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
     std::vector<Exchange> staged_;
@@ -739,6 +789,12 @@ private:
 };
 
 bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, std::string& err);
+/// The routed experts of a GGUF model read in place (no pack, no experts.bin) as the process-wide expert layout: per
+/// MoE layer i (the model's block moe_blocks[i]), the gate / up / down types, the blob, and the tensors' files and
+/// offsets in the shards of `gguf`'s model (any of its shards).  Gate and up are [n_embd, n_ff, n_expert], down
+/// [n_ff, n_embd, n_expert].  A FileExpertSource reads it with set_gguf(`gguf`) and no experts.bin.
+bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>& moe_blocks, int64_t n_expert,
+                             int64_t n_embd, int64_t n_ff, std::string& err);
 LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst,
                           const strata::kernels::cpu::ExpertLayout& lay, int threads);
 

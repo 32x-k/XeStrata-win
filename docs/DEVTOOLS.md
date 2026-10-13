@@ -83,10 +83,13 @@ sudo apt install hipcc libamdhip64-dev libhsa-runtime-dev rocminfo   # Ubuntu
 sudo dnf install hipcc rocm-hip-devel rocm-runtime-devel rocm-device-libs rocminfo   # Fedora 44
 ```
 
-- ROCm is looked for in AMD's `/opt/rocm` or the distribution's (headers in `/usr/include`, libraries in the multiarch folder or `/usr/lib64`).
+- ROCm is looked for in AMD's `/opt/rocm` (`/opt/rocm/core-7.14` with ROCm 7.14's packages from AMD) or the distribution's (headers in `/usr/include`, libraries in the multiarch folder or `/usr/lib64`).
+  ROCm 7.14's packages from AMD install no ld.so.conf, so setup adds their `lib` to the engine's library path (the config's `lib_dirs`).
   Without it the build has no HIP.
 - Code for AMD GPUs needs libclc's libspirv for AMD and ROCm's device libraries.
-  Fedora's device libraries are in `/usr/lib64/rocm/llvm/lib/clang/20/lib/amdgcn/bitcode`; give them to the compiler with `--rocm-device-lib-path`.
+  A compiler reads bitcode of its own LLVM or an older one only (ROCm 7.14's device libraries are LLVM 23's, which intel/llvm 7.1.1's LLVM 22 cannot read),
+  so the script fetches the device libraries of the ROCm release on intel/llvm's LLVM (`amd/device-libs` of ROCm's llvm-project at `rocm-7.2.4`, under the University of Illinois/NCSA license), builds them in the same tree and installs them into `install/amdgcn/bitcode`.
+  CMake takes the installed ROCm's device libraries where the compiler reads them, and these where it does not; when they fail to build, intel/llvm is still built.
 - In a Fedora 44 container (ROCm 7.1.1), a SYCL kernel compiled with `-fsycl-targets=amd_gpu_gfx1200` ran correctly on an RX 9060 XT (gfx1200).
   The HIP adapter reports 1 GiB as the largest allocation, but 12 GiB could be allocated.
 
@@ -107,7 +110,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Packages that came in automatically with `rocm-dev` become `apt autoremove` candidates once it is gone; mark them with `sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo`.
 - The script applies fixes the release lacks to the sources before building, as the patches in `third_party/main/intel-llvm/patches/` (`NN-<id>.patch`, in order; under intel/llvm's Apache-2.0 WITH LLVM-exception), and records their ids in `install/XESTRATA.json`.
   A build of the same release without them is offered a rebuild.
-  There are thirteen fixes now; none of the first twelve is fixed in intel/llvm's `sycl` branch either (2026-10-08).
+  There are fourteen fixes now; none of the first twelve is fixed in intel/llvm's `sycl` branch either (2026-10-08).
   First, the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).
   Second, the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture.
   With an executable carrying code for several architectures, a GPU older than that image did not run and a newer one ran older code.
@@ -142,6 +145,9 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   The target ID was empty and every architecture of a triple matched every other, so unbundling an object or an archive gave each architecture's link the triple's first unclaimed entry in hash order.
   The packages' engine had gfx1200's code under gfx1030, gfx1030's under gfx1101 and gfx1100's under gfx1201, which an RX 9070 XT refused as an illegal instruction.
   Fixed, a fifth component that names a GPU is read as the target ID (`offload-bundle-arch`).
+  Fourteenth, the HIP adapter answered a GPU's free memory (SYCL's `ext_intel_free_memory`) with `hipMemGetInfo` without making that GPU current, so every AMD GPU reported the free memory of the thread's current one.
+  A layer split over two AMD GPUs saw the first stage's free memory, nearly all of it held by its expert cache, on the second stage, which found no room for its own cache and stopped.
+  Fixed, the GPU is made current before the query, as the adapter's other calls do (`hip-mem-free-device`; the CUDA adapter makes the GPU's context current for every query).
   The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
   `offload-bundle-arch` asks every toolchain.
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).

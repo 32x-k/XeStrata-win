@@ -16,6 +16,9 @@ enum class XmxType { f16, bf16 };
 /// through DP4a, and other kernels on the matrix engines (the prompt attention) take their own paths.
 bool xmx_available(XmxType t);
 
+/// Whether the compute device runs FP16 products on its matrix engines (the XMX kernels, or mma_gemm's joint_matrix).
+bool f16_matrix_engines();
+
 /// Whether the compute device's matrix engines take FP16 inputs and not BF16 ones (NVIDIA's before sm_80): its BF16
 /// products are faster through FP16 (prefill::Gemm::bf16).
 bool f16_only_matrix_engines();

@@ -1,7 +1,7 @@
 <!--
 SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-SPDX-License-Identifier: LGPL-3.0-or-later
+SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 -->
 # XeStrata
 
@@ -83,38 +83,80 @@ AMD の GPU では、prefill の密な行列積をディストリビューショ
 
 ## モデルの選び方
 
-**大きさ**（同じモデルを、どれだけ圧縮するかの違い）:
+| モデル | パラメーター | RAM の目安 | VRAM | 向いていること |
+| --- | --- | ---: | ---: | --- |
+| **[Qwen3.8-Flash-Next](#qwen38-flash-next)** | 1,250 億 | 32〜62 GB | 12 GB 以上を勧めます | いちばん賢い。RAM の多い PC 向け |
+| **[Ornith-1.5](#ornith-15beta)**（BETA） | 350 億（1 トークンで 30 億） | 22〜80 GB | 4 GB から | RAM の少ない PC 向け |
+| **[llm-jp-4.1](#llm-jp-41beta)**（BETA） | 320 億（1 トークンで 30 億） | 30〜73 GB | 4 GB から | 日本語と英語の思考するモデル |
 
-| 大きさ | ダウンロード | RAM の目安 | 速さ | 品質 |
-| --- | ---: | ---: | --- | --- |
-| **Q2_0** | 66 GB | 48 GB | いちばん速い | 良い |
-| **IQ2_XS** | 68 GB | 48 GB | 速い | より良い（**おすすめ**） |
-| **IQ3_XXS** | 76 GB | 60 GB | 遅め | とても良い |
-| **IQ3_S** | 84 GB | 62 GB | いちばん遅い | いちばん良い（元のモデルだけ） |
+BETA の 2 つは、画像、2 枚以上の GPU、Intel の CPU 内蔵の GPU にまだ対応していません（[詳細](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41)）。
+
+迷ったら、RAM が 48 GB 以上の PC では Qwen3.8-Flash-Next の **IQ2_XS** を選んでください。
+RAM がそれより少ない PC では、Qwen3.8-Flash-Next の Coder（32 GB）か Ornith-1.5 が選べます。
+あとから別のモデルを足すときは `xestrata --setup` を実行します。
+
+### Qwen3.8-Flash-Next
+
+**版と大きさ**（大きさは、同じモデルをどれだけ圧縮するかの違い）:
+
+| 版 | 大きさ | ダウンロード | RAM の目安 | 速さ | 品質 |
+| --- | --- | ---: | ---: | --- | --- |
+| 元のモデル、Swift 1.5 | **Q2_0** | 66 GB | 48 GB | いちばん速い | 良い |
+| 元のモデル、Swift 1.5 | **IQ2_XS** | 68 GB | 48 GB | 速い | より良い（**おすすめ**） |
+| 元のモデル、Swift 1.5 | **IQ3_XXS** | 76 GB | 60 GB | 遅め | とても良い |
+| 元のモデル、Swift 1.5 | **IQ3_S** | 84 GB | 62 GB | 遅い | 元のモデルと同等 |
+| Coder | **IQ1_M** | 58 GB | 32 GB | 速い | コードでは良い、ほかは弱い |
+| Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | RAM が約 80 GB より少ないと遅い | IQ3_S と UD-Q4_K_XL の間 |
+| Unsloth（実験的） | **UD-Q4_K_XL** | 111 GB | 48 GB | いちばん遅い | いちばん良い |
 
 モデルのエキスパート（[しくみ](#しくみ)）は、すべて RAM に置きます。RAM が目安より少なくても、GPU の VRAM が大きければ
 **省 RAM モード**で動きます。このモードでは、エキスパートを RAM にコピーせずにモデルのファイルから読みます
 （[詳細](docs/DETAILS.ja.md#ram-がモデルより少ないとき省-ram-モード)）。
+Unsloth の 2 つは、RAM に入りきらないエキスパートを答えている間に SSD から読みます。
 
 **版:**
 
 - **Qwen3.8-Flash-Next**: 元のモデル。
-- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)**: ISTA-DASLab によるコード向けの版です。
-  各層 512 個のエキスパートのうち、コードで使う 256 個だけを残しています。大きさは IQ1_M の 1 種類で、
-  ダウンロード 58 GB、RAM 32 GB で動きます。エキスパートが半分なので、コード以外や、英語以外の言語では弱くなります。
 - **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)**: UkisAI による調整版です。
-  答える前の思考が短く、答えが早く出ます。品質はほぼ同じで、IQ3_S はありません。このモデル自身のライセンスに従います。
-- **[Unsloth の UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**: 元のモデルの約 4 ビットの i-quant で、品質は IQ3_S と UD-Q4_K_XL の間です。
-  ダウンロードは 94 GB です。エキスパートが 59.5 GB あり、RAM が約 80 GB より少ない PC では、入りきらない分を SSD から読みます（[詳細](docs/DETAILS.ja.md#unsloth-の-ud-iq4_xs)）。
+  答える前の思考が短く、答えが早く出ます。品質はほぼ同じです。このモデル自身のライセンスに従います。
+- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)**: ISTA-DASLab によるコード向けの版です。
+  各層 512 個のエキスパートのうち、コードで使う 256 個だけを残しています。エキスパートが半分なので、コード以外や、英語以外の言語では弱くなります。
+- **[Unsloth の UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**: 元のモデルの約 4 ビットの i-quant です。
+  エキスパートが 59.5 GB あり、RAM が約 80 GB 以上あればすべて RAM に置けます（[詳細](docs/DETAILS.ja.md#unsloth-の-ud-iq4_xs)）。
 - **[Unsloth の UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**（実験的）: 元のモデルの 4 ビット版です。
-  ダウンロードは 111 GB です。エキスパートが 77 GB あり、RAM に入りきらない分は答えている間に SSD から読むので、
-  2〜3 ビットの大きさより遅くなります（[詳細](docs/DETAILS.ja.md#unsloth-の-ud-q4_k_xl実験的)）。
-
-迷ったら **IQ2_XS** を選んでください。RAM が 32 GB しかない PC では、Coder が選べます。
-あとから別のモデルを足すときは `xestrata --setup` を実行します。
+  エキスパートが 77 GB あり、2〜3 ビットの大きさより遅くなります（[詳細](docs/DETAILS.ja.md#unsloth-の-ud-q4_k_xl実験的)）。
 
 OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューにはありません。
 変換の手順は [docs/ORCA.ja.md](docs/ORCA.ja.md) にあります。
+
+### Ornith-1.5（BETA）
+
+[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（Ornith AI、MIT）: Qwen3.5 系の MoE で、文脈は 256K までです。
+公式の版（Q4_K_M〜BF16）は、モデルの MTP の層で下書きを作り、decode を速くします。
+
+| 大きさ | ダウンロード | RAM の目安 | VRAM |
+| --- | ---: | ---: | ---: |
+| Q4_K_M | 21.7 GB | 30 GB | 4 GB から |
+| Q5_K_M | 25.3 GB | 34 GB | 6 GB から |
+| Q6_K | 29.2 GB | 38 GB | 6 GB から |
+| Q8_0 | 37.8 GB | 46 GB | 6 GB から |
+| BF16 | 71.1 GB | 80 GB | 8 GB から |
+| GSQ-RCO-3BIT | 13.0 GB | 22 GB | 4 GB から |
+| GSQ-RCO-3.5BIT | 15.2 GB | 24 GB | 6 GB から |
+
+GSQ-RCO の 2 つは、pfeifferj による[コミュニティの再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)で、MTP の層がありません。
+
+### llm-jp-4.1（BETA）
+
+[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)（LLM-jp、Apache-2.0）: 日本語と英語の思考するモデルで、文脈は 256K までです。
+
+| 大きさ | ダウンロード | RAM の目安 | VRAM |
+| --- | ---: | ---: | ---: |
+| Q4_K_M | 21.5 GB | 30 GB | 4 GB から |
+| BF16 | 64.3 GB | 73 GB | 8 GB から |
+
+BETA の 2 つの RAM の目安は、ダウンロードの大きさに約 8 GB を足したものです。
+RAM がそれより少ないと、エキスパートを RAM に読み込まずにモデルのファイルから読むので、遅くなります。
 
 ## インストール
 
@@ -243,8 +285,11 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 会話が、選んだ文脈の長さより長くなっています。新しい会話を始めるか、`xestrata --setup` で長い文脈を選び直してください。
 
 **解決しないとき**
-[詳しい対処の表](docs/DETAILS.ja.md#困ったとき)を見てください。それでも解決しなければ
-[issue](https://github.com/MistVVK/XeStrata/issues) を立て、`~/.local/state/xestrata/xestrata-<モデル>.log` を添付してください。
+[詳しい対処の表](docs/DETAILS.ja.md#困ったとき)を見てください。
+端末を操作できる LLM エージェントには、[復旧と原因調査の指示書](docs/DIAGNOSE.ja.md)と症状を渡せます。
+ソース版と deb/rpm 版の両方に対応し、復旧できた場合も、詰まった場合も、原因と根拠を報告します。
+開発者の対応が必要なら、秘密や個人情報を除いた報告を添えて [issue](https://github.com/MistVVK/XeStrata/issues) を立ててください。
+エンジンのログの場所は、実際に使っているモデルの設定の `log` で確認できます。
 
 ## しくみ
 
@@ -300,9 +345,16 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
      CMake が XeStrata の変更の入ったフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、同じライセンス）から取得します。
    - [intel/llvm](https://github.com/intel/llvm) の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib-llvm のコンパイラ。
      XeStrata の修正（`third_party/main/intel-llvm/patches/`、同じライセンス）を当ててビルドし、パッケージにはその SYCL の実行時を入れます。
+   - AMD による [ROCm のデバイスライブラリ](https://github.com/ROCm/llvm-project/tree/rocm-7.2.4/amd/device-libs)（University of Illinois/NCSA）:
+     intel/llvm と一緒にビルドし、AMD の GPU 向けのコードがリンクします。
+     そのビルドに渡す機能の指定は、Debian の [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) のパッケージ（Expat）の `debian/rules` から写しました。
    - 画面のフォント [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1）。
-- **参考にした考え方**: [Splash](https://github.com/incoai/splash)、[ninfer](https://github.com/Neroued/ninfer)、
-  [HyperQwen](https://github.com/syv-ai/HyperQwen)、[Project Maya](https://github.com/mw00/project-maya)（VRAM にないエキスパートを CPU と PCIe に分ける数の決め方）。
+- **参考にした考え方**:
+   - Inco AI と Splash の貢献者による [Splash](https://github.com/incoai/splash)。
+   - Neroued による [ninfer](https://github.com/Neroued/ninfer)。
+   - syv.ai と HyperQwen の貢献者による [HyperQwen](https://github.com/syv-ai/HyperQwen)。
+   - mw00 と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)（VRAM にないエキスパートを CPU と PCIe に分ける数の決め方）。
+   - maxfridbe による [nextsycl](https://github.com/maxfridbe/nextsycl)（Qwen3.5 系のモデルの decode でカーネルをまとめるやり方）。
 - 詳しくは [docs/DETAILS.ja.md](docs/DETAILS.ja.md#クレジットとライセンス) にあります。
 
 ## ライセンス
@@ -313,8 +365,10 @@ XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフト�
 - **メーカーの計算ライブラリとのリンク**: GPU や CPU のメーカーが自社の製品向けに出している計算ライブラリとその実行時ライブラリ
   （oneMKL や Intel oneAPI のコンパイラの実行時ライブラリ、cuBLAS や CUDA のランタイムとドライバなど）とリンクしたものも配布できます。
   GPL 第 3 版の第 7 条による追加の許可で、文面は [NOTICE](NOTICE) にあります。
-- **Strata と ggml から来たコード**: MIT ライセンスの Strata と ggml / llama.cpp から来たコード（`src/` に書き写したカーネルを含む）も、
-  XeStrata の一部として LGPL です。MIT の条件どおり、著作権表示と許諾表示を [NOTICE](NOTICE) に残しています。
+- **Strata と ggml から来たコード**: MIT ライセンスの Strata と ggml / llama.cpp から来たコード（`src/` に書き写したカーネルを含む）は、
+  MIT のままです。XeStrata が変えていない Strata のファイルは MIT だけで、XeStrata が手を入れたファイルや書き写したコードを含むファイルは、
+  XeStrata の変更とファイル全体が LGPL です（ヘッダーは `LGPL-3.0-or-later AND MIT`）。著作権表示と許諾表示は [NOTICE](NOTICE) にあります。
+  Debian の rocm-llvm のパッケージ（Expat）から `tools/intel_llvm_build.py` に写した部分も同じです。
 - **例外**: `third_party/` の次のものは、元のライセンスのままです。プロジェクトごとのフォルダーに、ライセンスの文書と一緒に置いています。
    - intel/llvm への XeStrata の修正のパッチ（`third_party/main/intel-llvm/`）: Apache-2.0 WITH LLVM-exception。
    - oneMath への XeStrata の変更（フォーク、`third_party/main/oneMath/`）: Apache-2.0。
@@ -325,5 +379,6 @@ XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフト�
 - **`third_party/nonfree/` がなくても**、XeStrata はビルドでき、動きます。パッケージには入れていません。
 - **パッケージに入れているほかのもの**: intel/llvm の SYCL の実行時（Apache-2.0 WITH LLVM-exception）、llama.cpp の gguf-py（MIT）、
   oneMath（Apache-2.0）を、それぞれのライセンスの文書と一緒に入れています。
+  AMD の GPU 向けのコードは ROCm のデバイスライブラリ（NCSA）の一部を含むので、そのライセンスの文書も入れています。
   自由ソフトウェアでないもの（oneMKL、cuBLAS、NVIDIA のドライバー）は入れていません。
 - **モデル**: このリポジトリには含みません。モデルのファイルには、それぞれのライセンスが適用されます。

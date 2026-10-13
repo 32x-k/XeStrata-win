@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Strata vs llama.cpp head-to-head (stream 1402-h).  Measurement only.
 
 Both engines are driven through their OpenAI-compatible HTTP servers (/v1/chat/completions), with the same prompt

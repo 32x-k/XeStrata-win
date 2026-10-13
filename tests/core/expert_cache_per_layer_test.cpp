@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // #369: per-layer admission on a sized cache (open_sized, every native pack) - each layer admits into its own slot
 // range, as on the uniform cache, so no two layers write the same slot.  Needs a CUDA device (exits 77 without one).
 #include "strata/core/expert_cache.hpp"

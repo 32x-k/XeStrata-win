@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // include/strata/spec/draft_source.hpp - a source of draft tokens beside the MTP layer (--lookup-chain).
 //
 // A source proposes how the context continues; the verify window checks the proposal, so a source can only change

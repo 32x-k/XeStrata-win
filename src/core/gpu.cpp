@@ -14,6 +14,7 @@
 #include <sycl/ext/oneapi/virtual_mem/virtual_mem.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -100,9 +101,38 @@ std::map<const sycl::queue*, sx::command_graph<sx::graph_state::modifiable>> g_c
 
 const char* last_error() { return g_error.c_str(); }
 
+std::string failure_report(const std::exception& e) {
+    std::string r = e.what();
+    if (const auto* se = dynamic_cast<const sycl::exception*>(&e)) {
+        char buf[96];
+        std::snprintf(buf, sizeof buf, " [SYCL code %d, UR result %d]", se->code().value(),
+                      (int) sycl::detail::get_ur_error(*se));
+        r += buf;
+    }
+    try {
+        auto& runtime = rt();
+        const std::string status = runtime.device_status();
+        r += "; the GPU: " + status;
+        size_t free_b = 0, total_b = 0;
+        if (status != "lost" && mem_info(&free_b, &total_b)) {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, ", %zu MiB of VRAM free", free_b >> 20);
+            r += buf;
+        }
+    } catch (const std::exception&) {
+        r += "; the GPU: unknown";
+    }
+    return r;
+}
+
 Stream stream_create() {
     try { return rt().create_stream(); }
     catch (const std::exception& e) { fail("stream_create", e); return nullptr; }
+}
+
+Stream stream_create_copy() {
+    try { return rt().create_copy_stream(); }
+    catch (const std::exception& e) { fail("stream_create_copy", e); return nullptr; }
 }
 
 void stream_destroy(Stream s) {

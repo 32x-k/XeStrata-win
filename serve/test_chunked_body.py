@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """#893 / #894: a request body sent as Transfer-Encoding: chunked (a relay or proxy) is decoded, on every route that
 reads a body; a malformed or oversized one is a 400 / 413, not an empty body. Incomplete chunked framing must not
 apply an otherwise valid JSON body.

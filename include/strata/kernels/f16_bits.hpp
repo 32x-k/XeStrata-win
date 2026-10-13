@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/kernels/f16_bits.hpp - the fp16 conversions, written out, as bits.
 //
 // WHY THIS IS NOT `__float2half`.  Round 193 found `__float2half` producing 0x2600 for a value whose correct

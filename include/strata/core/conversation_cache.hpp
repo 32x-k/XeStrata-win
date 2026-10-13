@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // CPU-only ownership and matching policy for --serve's parked conversations.
 // Token equality, image identity, and steering mode are all required for reuse.
 #pragma once
@@ -216,6 +216,16 @@ public:
         entries_.erase(victim);
         ++evictions_;
         return true;
+    }
+
+    // #879 (upstream f332a855): every parked conversation (pinned ones too) and the retained K/V go - after
+    // non-finite logits any of them may carry the poison.  Returns how many were parked.
+    size_t clear() {
+        const size_t n = entries_.size();
+        entries_.clear();
+        bytes_ = 0;
+        reuse_ = {};
+        return n;
     }
 
     // The slot count, so a caller that evicts in a loop has a bound it did not invent.

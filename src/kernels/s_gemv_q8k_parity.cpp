@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/s_gemv_q8k_parity.cpp - the Q8_K activation path of `s_gemv`.
 //
 // THE POINT OF THIS KERNEL IS A CONTRACT, so the test is built around the contract rather than around the

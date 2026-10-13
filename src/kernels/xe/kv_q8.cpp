@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/kv_q8.cpp - the Xe port of Strata's src/kernels/cuda/kv_q8.cu: INT8 KV storage with an fp16 scale per 64 values.
 //
 // One work-group of 64 (two sub-groups of 32) per (head, group, K or V), as in the CUDA kernel.  Each value is

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-FileCopyrightText: 2023-2026 The ggml authors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/gr.cpp - the Xe ports of Strata's src/kernels/cuda/gr.cu (the gated residual / hyper-connection, `gr_read`
 // and `gr_write`), Strata's src/kernels/cuda/native_gr_norm.cu and Strata's src/kernels/cuda/native_gr_postops.cu.
 //

@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // CPU-only tests for the on-disk session format (include/strata/core/conversation_file.hpp).
 // Built with the tests (STRATA_BUILD_TESTS); no GPU, no model.
 #include "strata/core/conversation_file.hpp"

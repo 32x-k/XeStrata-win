@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 # Update XeStrata without starting the model (upstream #475): the newest code (git pull, when this folder is a git
 # clone), then what ./setup.sh does before a start - the engine compiled again when its source changed, the Python
 # packages, each installed model's settings and draft subset. The model files are not touched. Start the model later

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """#1619: a request waiting for the single request turn sends keep-alive comments (a client with a stream idle
 timeout must not abort a healthy queued request), and one cancelled while queued leaves without taking the turn.
 

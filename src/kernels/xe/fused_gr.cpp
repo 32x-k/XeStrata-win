@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/fused_gr.cpp - the Xe port of Strata's src/kernels/cuda/fused_gr.cu (see the header): the gated residual read
 // at the model's fixed geometry in two kernels, for one token or a verify window of up to kFusedGrMaxT.
 //

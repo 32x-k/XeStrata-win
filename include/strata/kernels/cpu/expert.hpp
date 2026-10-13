@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/kernels/cpu/expert.hpp - P2.S3: the CPU expert path.
 //
 // This is the Q2_0 expert kernel promoted out of `bench/micro/cpu_s2.cpp`, which is the instrument that

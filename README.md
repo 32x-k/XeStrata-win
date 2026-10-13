@@ -1,7 +1,7 @@
 <!--
 SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-SPDX-License-Identifier: LGPL-3.0-or-later
+SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 -->
 # XeStrata
 
@@ -85,40 +85,88 @@ So XeStrata runs only on the GPUs the distribution's rocBLAS has code for.
 
 ## Choosing a model
 
-**The size** (the same model, compressed more or less):
+| Model | Parameters | RAM (about) | VRAM | Good for |
+| --- | --- | ---: | ---: | --- |
+| **[Qwen3.8-Flash-Next](#qwen38-flash-next)** | 125B | 32-62 GB | 12 GB or more recommended | the smartest; for a PC with a lot of RAM |
+| **[Ornith-1.5](#ornith-15-beta)** (BETA) | 35B (3B a token) | 22-80 GB | from 4 GB | a PC with less RAM |
+| **[llm-jp-4.1](#llm-jp-41-beta)** (BETA) | 32B (3B a token) | 30-73 GB | from 4 GB | a thinking model for Japanese and English |
 
-| Size | Download | RAM (about) | Speed | Quality |
-| --- | ---: | ---: | --- | --- |
-| **Q2_0** | 66 GB | 48 GB | fastest | good |
-| **IQ2_XS** | 68 GB | 48 GB | fast | better (**recommended**) |
-| **IQ3_XXS** | 76 GB | 60 GB | slower | great |
-| **IQ3_S** | 84 GB | 62 GB | slowest | best (the original model only) |
+The two BETA models do not yet take images, two or more GPUs, or Intel's integrated GPUs
+([details](docs/DETAILS.md#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41)).
+
+Not sure? On a PC with 48 GB of RAM or more, take Qwen3.8-Flash-Next's **IQ2_XS**.
+With less RAM than that, Qwen3.8-Flash-Next's Coder (32 GB) or Ornith-1.5 is the one to choose.
+To add another model later, run `xestrata --setup`.
+
+### Qwen3.8-Flash-Next
+
+**The version and the size** (the size: the same model, compressed more or less):
+
+| Version | Size | Download | RAM (about) | Speed | Quality |
+| --- | --- | ---: | ---: | --- | --- |
+| the original, Swift 1.5 | **Q2_0** | 66 GB | 48 GB | fastest | good |
+| the original, Swift 1.5 | **IQ2_XS** | 68 GB | 48 GB | fast | better (**recommended**) |
+| the original, Swift 1.5 | **IQ3_XXS** | 76 GB | 60 GB | slower | great |
+| the original, Swift 1.5 | **IQ3_S** | 84 GB | 62 GB | slow | as the original model |
+| Coder | **IQ1_M** | 58 GB | 32 GB | fast | good at code, weaker elsewhere |
+| Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | slow with less than about 80 GB of RAM | between IQ3_S and UD-Q4_K_XL |
+| Unsloth (experimental) | **UD-Q4_K_XL** | 111 GB | 48 GB | slowest | best |
 
 All of the model's experts ([How it works](#how-it-works)) are kept in RAM. With less RAM than that but a GPU with a
 lot of VRAM, it runs in the **low-RAM mode**: the experts are read from the model files instead of copied into RAM
 ([details](docs/DETAILS.md#less-ram-than-the-model-the-low-ram-mode)).
+The two Unsloth files read the experts that do not fit the RAM from the SSD while they answer.
 
 **The version:**
 
 - **Qwen3.8-Flash-Next:** the original.
-- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF):** ISTA-DASLab's version for
-  code. Of each layer's 512 experts it keeps the 256 that code uses. One size, IQ1_M: a 58 GB download, and it runs
-  with 32 GB of RAM. With half the experts it is weaker outside code and in languages other than English.
 - **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF):** UkisAI's fine-tune. It
-  thinks for a shorter time before it answers, so the answer comes sooner, at about the same quality. There is no
-  IQ3_S. Its own license applies.
+  thinks for a shorter time before it answers, so the answer comes sooner, at about the same quality. Its own license
+  applies.
+- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF):** ISTA-DASLab's version for
+  code. Of each layer's 512 experts it keeps the 256 that code uses. With half the experts it is weaker outside code
+  and in languages other than English.
 - **[Unsloth's UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF):** a ~4-bit i-quant of the
-  original, between IQ3_S and UD-Q4_K_XL in quality, a 94 GB download. Its experts take 59.5 GB; on a PC with less
-  than about 80 GB of RAM, those that do not fit are read from the SSD ([details](docs/DETAILS.md#or-unsloths-ud-iq4_xs)).
+  original. Its experts take 59.5 GB; with about 80 GB of RAM or more, all of them stay in RAM
+  ([details](docs/DETAILS.md#or-unsloths-ud-iq4_xs)).
 - **[Unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** (experimental): a 4-bit file
-  of the original, a 111 GB download. Its experts take 77 GB; those that do not fit the RAM are read from the SSD
-  while it answers, so it is slower than the 2-3-bit sizes ([details](docs/DETAILS.md#or-unsloths-ud-q4_k_xl-experimental)).
-
-Not sure? Take **IQ2_XS**. On a PC with only 32 GB of RAM, the Coder is the one to choose.
-To add another model later, run `xestrata --setup`.
+  of the original. Its experts take 77 GB, and it is slower than the 2-3-bit sizes
+  ([details](docs/DETAILS.md#or-unsloths-ud-q4_k_xl-experimental)).
 
 OrcaRouter's Flash-Next Uncensored IQ3_XXS is not in setup's menu.
 How to convert it is in [docs/ORCA.md](docs/ORCA.md).
+
+### Ornith-1.5 (BETA)
+
+[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) (Ornith AI, MIT): a Qwen3.5 MoE, with a
+context of up to 256K. Its official files (Q4_K_M to BF16) draft tokens with the model's MTP layer, which makes the
+decode faster.
+
+| Size | Download | RAM (about) | VRAM |
+| --- | ---: | ---: | ---: |
+| Q4_K_M | 21.7 GB | 30 GB | from 4 GB |
+| Q5_K_M | 25.3 GB | 34 GB | from 6 GB |
+| Q6_K | 29.2 GB | 38 GB | from 6 GB |
+| Q8_0 | 37.8 GB | 46 GB | from 6 GB |
+| BF16 | 71.1 GB | 80 GB | from 8 GB |
+| GSQ-RCO-3BIT | 13.0 GB | 22 GB | from 4 GB |
+| GSQ-RCO-3.5BIT | 15.2 GB | 24 GB | from 6 GB |
+
+The two GSQ-RCO files are pfeifferj's [community reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)
+and have no MTP layer.
+
+### llm-jp-4.1 (BETA)
+
+[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) (LLM-jp, Apache-2.0):
+a thinking model for Japanese and English, with a context of up to 256K.
+
+| Size | Download | RAM (about) | VRAM |
+| --- | ---: | ---: | ---: |
+| Q4_K_M | 21.5 GB | 30 GB | from 4 GB |
+| BF16 | 64.3 GB | 73 GB | from 8 GB |
+
+For the two BETA models, the RAM is about the download plus 8 GB. With less, the experts are read from the model
+file instead of loaded into RAM, which is slower.
 
 ## Install
 
@@ -254,8 +302,11 @@ The conversation is longer than the context you chose. Start a new conversation,
 choose a longer context.
 
 **Still stuck?**
-See the [full troubleshooting table](docs/DETAILS.md#troubleshooting). If that does not help, open an
-[issue](https://github.com/MistVVK/XeStrata/issues) and attach `~/.local/state/xestrata/xestrata-<model>.log`.
+See the [full troubleshooting table](docs/DETAILS.md#troubleshooting).
+Give an LLM agent that can use your terminal the [recovery and diagnosis instructions](docs/DIAGNOSE.md) and your symptoms.
+They cover both source and deb/rpm installations and ask for the cause and evidence whether recovery succeeds or the agent gets stuck.
+If developer help is needed, open an [issue](https://github.com/MistVVK/XeStrata/issues) with the report, after removing secrets and personal information.
+Find the engine log's location in the `log` field of the model configuration actually in use.
 
 ## How it works
 
@@ -317,10 +368,19 @@ what has been checked in [docs/XE.md](docs/XE.md).
    - [intel/llvm](https://github.com/intel/llvm)'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib-llvm
      modes' compiler, built with XeStrata's fixes (`third_party/main/intel-llvm/patches/`, under the same license);
      the packages carry its SYCL runtime;
+   - [ROCm's device libraries](https://github.com/ROCm/llvm-project/tree/rocm-7.2.4/amd/device-libs), by AMD
+     (University of Illinois/NCSA): built with intel/llvm, and linked into the code for AMD GPUs; the target features
+     their build is given are transcribed from the `debian/rules` of Debian's
+     [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) package (Expat);
    - the web app's font, [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1).
-- **Ideas from:** [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer),
-  [HyperQwen](https://github.com/syv-ai/HyperQwen) and [Project Maya](https://github.com/mw00/project-maya) (how many of the experts missing from VRAM
-  the CPU computes and how many are read over PCIe).
+- **Ideas from:**
+   - [Splash](https://github.com/incoai/splash), by Inco AI and the Splash contributors;
+   - [ninfer](https://github.com/Neroued/ninfer), by Neroued;
+   - [HyperQwen](https://github.com/syv-ai/HyperQwen), by syv.ai and the HyperQwen contributors;
+   - [Project Maya](https://github.com/mw00/project-maya), by mw00 and the Project Maya contributors (how many of the
+     experts missing from VRAM the CPU computes and how many are read over PCIe);
+   - [nextsycl](https://github.com/maxfridbe/nextsycl), by maxfridbe (which kernels the decode of the Qwen3.5 family's
+     models merges).
 - More in [docs/DETAILS.md](docs/DETAILS.md#credits-and-licenses).
 
 ## License
@@ -333,8 +393,10 @@ XeStrata (copyright MistVVK and the XeStrata contributors) is free software; the
   oneAPI compilers, cuBLAS and the CUDA runtime and driver, for example), may be distributed as well: an additional
   permission under section 7 of the GPL, version 3, worded in [NOTICE](NOTICE).
 - **Code from Strata and ggml:** the code that comes from Strata and from ggml / llama.cpp, both MIT (the kernels
-  transcribed into `src/` included), is part of XeStrata under the LGPL; as MIT asks, their copyright and permission
-  notices are kept in [NOTICE](NOTICE).
+  transcribed into `src/` included), stays under MIT. Strata's files XeStrata has not changed are under MIT alone; in
+  a file XeStrata has changed or that carries transcribed code, XeStrata's changes and the file as a whole are under
+  the LGPL (its header says `LGPL-3.0-or-later AND MIT`). The copyright and permission notices are in [NOTICE](NOTICE).
+  So is what `tools/intel_llvm_build.py` transcribes from Debian's rocm-llvm package (Expat).
 - **Exceptions:** these, in `third_party/`, stay under their own licenses, one folder per project with its license text.
    - XeStrata's patches to intel/llvm (`third_party/main/intel-llvm/`): Apache-2.0 WITH LLVM-exception.
    - XeStrata's changes to oneMath (its fork, `third_party/main/oneMath/`): Apache-2.0.
@@ -345,5 +407,6 @@ XeStrata (copyright MistVVK and the XeStrata contributors) is free software; the
 - **Without `third_party/nonfree/`,** XeStrata still builds and runs. The packages leave it out.
 - **What else the packages carry:** intel/llvm's SYCL runtime (Apache-2.0 WITH LLVM-exception), llama.cpp's gguf-py
   (MIT) and oneMath (Apache-2.0), each with its license text.
+  The code for AMD GPUs carries parts of ROCm's device libraries (NCSA), so their license text is there too.
   Nothing that is not free software (oneMKL, cuBLAS, NVIDIA's driver) is in them.
 - **The models** are not part of this repository; each model's own license applies to its files.

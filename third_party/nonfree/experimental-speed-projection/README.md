@@ -14,7 +14,7 @@ is the configuration its authors selected and their scores.
 package's patches. The package's own documentation describes the vector as a **refusal-direction projection**: the
 model declines far fewer requests (it reports 1 of 50 vs 50 of 50 on its test set), and removing refusals removes a
 safety behaviour - you are responsible for what the model writes with it on. It also shifts the model's predictions
-slightly on ordinary text (measured here: `bench/results/2026-09-27-esp/`). It is not an optimization in the engine:
+slightly on ordinary text (measured upstream: Strata's `bench/results/2026-09-27-esp/`). It is not an optimization in the engine:
 on the same text it costs 0.2-0.4% per token; a chat's speed with it on depends on the text the model writes.
 
 **Turning it on.** `./setup.sh --setup` asks (default: off), or pass `--experimental-speed-projection on`. With it

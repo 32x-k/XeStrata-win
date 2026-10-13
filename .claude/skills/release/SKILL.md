@@ -44,8 +44,8 @@ The newest `xe*` tag is the previous release (none before the first one).
 The version is `$ARGUMENTS` when given, else the one `CMakeLists.txt` makes from `STRATA_UPSTREAM_VERSION` and `XESTRATA_REVISION` (AGENTS.md, "Versions"); the tag is `xe<VERSION>` (the name the program shows, `STRATA_VERSION_NAME`).
 It must not exist yet, locally or on origin.
 
-- A release after integrating a new upstream version takes that version: the integration changes `STRATA_UPSTREAM_VERSION` and sets `XESTRATA_REVISION` back to 1 (`xe0.1.41`, the packages `0.1.41-1`).
-- Another release on the same upstream version raises `XESTRATA_REVISION` by one, and the version name gets a number: `xe0.1.40.2` (revision 1) then `xe0.1.40.2.1` (packages `0.1.40.2-2`), `xe0.1.40.2.2`.
+- A release after integrating a new upstream version takes that version: the integration changes `STRATA_UPSTREAM_VERSION` and sets `XESTRATA_REVISION` back to 1 (`xe0.1.43.1-1`, the packages `0.1.43.1-1`).
+- Another release on the same upstream version raises `XESTRATA_REVISION` by one: `xe0.1.43.1-1`, then `xe0.1.43.1-2` (packages `0.1.43.1-2`). Tags before 2026-10-13 have the earlier form (`xe0.1.40.2.1` was 0.1.40.2's second release; AGENTS.md, "Versions").
 
 When the version changes, change `XESTRATA_REVISION` and every place that shows the version name (`git grep -n 'xe<OLD>'`: docs/XE), Japanese and English files in the same commit, and commit on `dev` (`版を xe<VERSION> にする`).
 A new version makes conversations saved by `--conversation-save` under the old one unreadable (the engine version is part of their identity): the notes say so.
@@ -96,7 +96,7 @@ The AMD GPU is in another machine, so its part of the speed table (step 9) is pr
 Prepare the two engines in the AMD development container (where it is and how to run in it: `LOCAL.md` in the repository root, kept out of git; when it is missing, ask the user and write the answer there):
 
 - XeStrata: bring the tag into the container's clone (it has no access to origin: a `git bundle` of `xe<VERSION>` copied in) and build the contrib-llvm mode with HIP for its GPU (`STRATA_HIP_ARCHS`, docs/BUILD.md) in a folder of the tag's own.
-- upstream: its newest release tag (`git ls-remote --tags --refs upstream 'v*' | sed 's#.*refs/tags/##' | sort -V | tail -n 1`; not `git tag -l 'v*'`, which also lists other remotes' tags (Project Maya's `upstream-maya` has v1.0.x)), built with HIP as its own documents say.
+- upstream: its newest release tag (`git ls-remote --tags --refs upstream 'v*' | sed 's#.*refs/tags/##' | sort -V | tail -n 1`; not `git tag -l 'v*'`, which also lists other remotes' tags (Project Maya's `upstream-maya` has v1.0.x)), built with HIP with the CMake options its own setup.py's `build_engine_hip` passes (`-DSTRATA_PREFILL_MMQ=ON` among them: docs/AMD_HIP.md's plain build command leaves it out, and upstream's prefill then takes a slower path).
 
 Run step 9's script there as soon as both are built; the development machine's GPUs wait until the packages are built (step 8).
 
@@ -143,16 +143,16 @@ gh release list --repo MistVVK/XeStrata --limit 1000 --json tagName,isLatest -q 
 ## 9. The speed table
 
 The release against upstream's newest release tag, IQ3_XXS, on each maker's GPU: the Intel Arc Pro B70 and the RTX 4070 in the development machine, the RX 9060 XT in the AMD container (step 6).
-The six tiers and the settings of the 2026-10-04-speed-matrix record (1K to 262K, what setup writes for each context, 256 greedy tokens); its `prompts.py`, now `.claude/skills/release/scripts/prompts.py`, writes the prompts (`python .claude/skills/release/scripts/prompts.py <pack> <ids folder>`).
+The six tiers and the settings of the 2026-10-04-speed-matrix record (1K to 262K, what setup writes for each context, 256 greedy tokens), with one change (the user's decision of 2026-10-12): KV streaming (`--kv-resident`) only where setup writes it on the machine, from 64K when the RAM holds the KV cache beside the model, so a machine short of that RAM (the AMD container: `LOCAL.md`) does not compare at those lengths with the releases up to xe0.1.42; its `prompts.py`, now `.claude/skills/release/scripts/prompts.py`, writes the prompts (`python .claude/skills/release/scripts/prompts.py <pack> <ids folder>`).
 The table's method stays fixed from release to release so the releases compare: the upstream merge's measurements (/upstream-sync) have scripts of their own, and a change to them does not change this table.
 
 The engines, built from the tags (no package installed), each in a worktree of its own under `.claude/worktrees/`:
 
 - XeStrata: the contrib-llvm build of `xe<VERSION>` (docs/BUILD.md, with `LD_LIBRARY_PATH` to intel/llvm's `lib`); one GPU at a time with `ONEAPI_DEVICE_SELECTOR` (`level_zero:*` for the B70, `cuda:*` for the RTX 4070).
-- upstream on the B70: its `sycl/` port, built in its Docker image as its docs/INTEL.md says (`docker build -t strata-sycl-dev sycl/tools`, then its `build.sh` with `AOT=bmg-g31`), and run through `scripts/up-sycl.sh` (`UP=".claude/skills/release/scripts/up-sycl.sh"` with `UP_TREE`, `DATA` and `IDS` exported).
-- upstream on the RTX 4070: its CUDA build, as its documents say.
+- upstream on the B70: its `sycl/` port, built in its Docker image as its docs/INTEL.md says (`docker build -t strata-sycl-dev sycl/tools`, then its `build.sh` with `AOT=bmg-g31`), and run through `scripts/up-sycl.sh` (`UP=".claude/skills/release/scripts/up-sycl.sh"` with `UP_TREE`, `DATA` and `IDS` exported), which runs it as its setup configures an Intel card: the arguments get what its `sycl/setup_intel.py` writes (the xe cards' expert profile, the streamed experts, KV streaming from 64K, the VRAM reserve, the prompt chunks), and the engine the run-time switches of its `sycl/serve/strata-sycl.sh`.
+- upstream on the RTX 4070: its CUDA build, with the CMake options its own setup.py builds it with.
 
-Each engine's own shipped expert profile (`data/expert-profile.bin` of its tree).
+Each engine's own shipped expert profile (`data/expert-profile.bin` of its tree; upstream's `sycl/` port takes the one its `sycl/setup_intel.py` writes in its place, `data/expert-profile-sycl.bin` from v0.1.43).
 No other work on a machine while it measures (no build, no other engine).
 
 ```sh
@@ -197,7 +197,7 @@ The final release is reached a GPU at a time (the user's decision, 2026-10-11): 
 
 The tables:
 
-The notes' table is one per GPU, from `bench-collect.py`'s medians (the record's README keeps `bench-collect.py`'s own tables): a row per tier, named by the model's weight type and the length (`IQ3_XXS 1K`), and for prefill and then decode three columns (the LLM terms, in both languages; the user's decision, 2026-10-11): XeStrata's value, upstream's, and the difference (the value columns named with the engine and its version, `XeStrata xe0.1.40.2.1`, `upstream v0.1.41`), marked ✅ where XeStrata is faster and ❌ where it is slower: prefill as a ratio (`✅ 2.1 倍`, `✅ ×2.1`), decode as a percentage (`✅ +14%`; slower: `❌ −3%`).
+The notes' table is one per GPU, from `bench-collect.py`'s medians (the record's README keeps `bench-collect.py`'s own tables): a row per tier, named by the model's weight type and the length (`IQ3_XXS 1K`), and for prefill and then decode three columns (the LLM terms, in both languages; the user's decision, 2026-10-11): XeStrata's value, upstream's, and the difference (the value columns named with the engine and its version, `XeStrata xe0.1.43.1-1`, `upstream v0.1.41`), marked ✅ where XeStrata is faster and ❌ where it is slower: prefill as a ratio (`✅ 2.1 倍`, `✅ ×2.1`), decode as a percentage (`✅ +14%`; slower: `❌ −3%`).
 Within ±1% (either way) the two count as equal: `≒ 同等（−0.1%）` / `≈ equal (−0.1%)`, for prefill as well.
 A value upstream was stopped in is 計測不能（低速） / not measurable (too slow), its difference `✅`, with the line saying upstream was stopped at 10 tok/s or less; a value that does not fit stays `-`.
 Above each GPU's tables: the GPU (and its memory) and which build of upstream it ran (`sycl/`, CUDA, HIP).
@@ -208,7 +208,7 @@ Each table has a heading line with its temperature: **generate**（温度 0、�
 
 **generate**（温度 0、トークン/秒）
 
-| 形式・長さ | prefill XeStrata xe0.1.40.2.1 | prefill upstream v0.1.41 | 差 | decode XeStrata xe0.1.40.2.1 | decode upstream v0.1.41 | 差 |
+| 形式・長さ | prefill XeStrata xe0.1.43.1-1 | prefill upstream v0.1.41 | 差 | decode XeStrata xe0.1.43.1-1 | decode upstream v0.1.41 | 差 |
 | --- | ---: | ---: | --- | ---: | ---: | --- |
 | IQ3_XXS 1K | 509 | 295 | ✅ 1.7 倍 | 48.8 | 46.8 | ✅ +4% |
 ```
@@ -219,7 +219,7 @@ Equal there is the upstream merge's check (`judge.py`): prefill within ±1%, the
 ```markdown
 **serve と通常使用**（温度 0.7）
 
-| 計測 | XeStrata xe0.1.40.2.1 | upstream v0.1.41 | 差 |
+| 計測 | XeStrata xe0.1.43.1-1 | upstream v0.1.41 | 差 |
 | --- | ---: | ---: | --- |
 | serve 32K 最初の prefill (tok/s) | 839 | 380 | ✅ 2.2 倍 |
 | serve 32K 会話の続きの待ち (ms) | 372 | 354 | ≒ 同等（+5%） |

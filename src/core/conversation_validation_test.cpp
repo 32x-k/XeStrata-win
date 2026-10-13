@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // Host-only validation fixtures: invalid restores must return before the first device call or destination write
 // (the "device" buffers here are host vectors).  Upstream's transfer-fault variant wraps cudaMemcpy at link time
 // and is not ported.

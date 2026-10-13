@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/pinned.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/device.hpp"
@@ -47,12 +47,18 @@ constexpr uint64_t kHugePage = 2ull << 20;
 }
 
 // The mapping registered for device copies in pieces no larger than the device's largest allocation: past it the
-// UHD 770 (4 GiB) registered without an error and copied wrong bytes, the B70 (31 GB) did not.  `cuts` are the
-// offsets a piece may end at (a layer's start, so no expert crosses two registrations), or empty: every `limit`.
+// UHD 770 (4 GiB) registered without an error and copied wrong bytes, the B70 (31 GB) did not.  With a layer split
+// the later GPUs' too: the UHD 770 behind a B70 copied wrong bytes from the B70's pieces.  `cuts` are the offsets a
+// piece may end at (a layer's start, so no expert crosses two registrations), or empty: every `limit`.
 namespace {
+std::vector<int> g_copy_devices;
 void register_pieces(uint8_t* base, uint64_t bytes, const std::vector<uint64_t>& cuts, std::vector<void*>& reg,
                      std::vector<std::pair<void*, size_t>>& pieces) {
-    const uint64_t limit = max_alloc_bytes();
+    uint64_t limit = max_alloc_bytes();
+    for (int d : g_copy_devices) {
+        const uint64_t m = Runtime::at(d).device().get_info<sycl::info::device::max_mem_alloc_size>();
+        limit = std::min(limit, m);
+    }
     // pieces end at the last cut that keeps them within the limit (or at the limit when no cut does)
     std::vector<uint64_t> ends, c;
     for (uint64_t x : cuts)
@@ -99,6 +105,8 @@ std::string thp_request_skipped() {
 }
 #endif
 }  // namespace
+
+void arena_copy_devices(const std::vector<int>& devices) { g_copy_devices = devices; }
 
 PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, slice, std::vector<uint64_t>{}) {}
 
@@ -368,7 +376,7 @@ void PinnedArena::publish_shared() {
     unlock(shared_fd_); shared_locked_ = false;
 }
 
-bool PinnedArena::to_host_usm(uint64_t pad, std::string& err) {
+bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::function<uint64_t()>& ram_available) {
     if (!layer_base.empty()) return true;
     if (base == nullptr || map_ == nullptr || shared_fd_ >= 0 || bounds_.size() < 2) {
         err = "only a private mapping with layer bounds moves into host USM";
@@ -394,7 +402,16 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err) {
     const size_t layers = bounds_.size() - 1;
     for (size_t l = 0; l < layers; ++l) {
         const uint64_t n = bounds_[l + 1] - bounds_[l];
-        void* q = sycl::malloc_host((size_t) (n + pad), runtime.context());
+        // Issue #10: host USM is GPU driver memory, which the OS cannot take back when RAM runs short (the GPU VM's
+        // rebind swapped it in and the OOM killer emptied the host).  Each layer moves only while the RAM has room
+        // for it and a reserve (STRATA_HOST_USM_RESERVE_MIB, default 1024); otherwise the arena stays as it was.
+        static const uint64_t reserve = [] {
+            const char* v = std::getenv("STRATA_HOST_USM_RESERVE_MIB");
+            return (uint64_t) (v != nullptr ? std::strtoull(v, nullptr, 10) : 1024) << 20;
+        }();
+        const uint64_t avail = ram_available ? ram_available() : UINT64_MAX;   // the caller's reading of the RAM
+        const bool room = avail >= n + pad + reserve;
+        void* q = room ? sycl::malloc_host((size_t) (n + pad), runtime.context()) : nullptr;
         if (q == nullptr) {   // back as it was: the moved layers into the mapping, then its registrations
             for (size_t k = 0; k < blocks.size(); ++k) {
                 std::memcpy((uint8_t*) base + bounds_[k], blocks[k], (size_t) (bounds_[k + 1] - bounds_[k]));
@@ -410,7 +427,9 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err) {
                       "again failed (" + e.what() + "): its copies are slower";
                 return false;
             }
-            err = "host USM refused at layer " + std::to_string(l) + " (" + std::to_string(n + pad) + " B)";
+            err = room ? "host USM refused at layer " + std::to_string(l) + " (" + std::to_string(n + pad) + " B)"
+                   : "the RAM has no room for layer " + std::to_string(l) + " in host USM (" +
+                         std::to_string(avail >> 20) + " MiB available)";
             return false;
         }
         std::memcpy(q, (uint8_t*) base + bounds_[l], (size_t) n);

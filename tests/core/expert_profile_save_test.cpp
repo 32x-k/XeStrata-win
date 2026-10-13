@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // #477: --expert-profile-save's profile - rank_learned_profile's order (resident first, then the counted routing, then
 // the profile the engine started from) and write_expert_profile's file, byte for byte tools/make_profile.py's format,
 // read back by read_expert_profile.  CPU only: no device is touched.

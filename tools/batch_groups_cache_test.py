@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """#1604: with --batch N --batch-groups N on a layer split, two long conversations that alternate must reuse their slot
 (or the conversation cache) on every later turn instead of reading their prompt from token 0.
 

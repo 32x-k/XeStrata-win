@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/verify.hpp - plan v0.3 P6: the speculative VERIFY window.
 //
 // T tokens at consecutive positions p0 .. p0+T-1 - the last accepted token and T-1 drafts - go through all 48
@@ -55,6 +55,79 @@ struct VerifyHits {
     int64_t blob = 0;
     const int32_t* h_res = nullptr;       ///< host [n_layers * n_expert] slot or -1: a window whose layers have every
                                           ///< expert resident runs without the host (null: never)
+};
+
+class Verifier;
+
+/// LAYER SPLIT: what a stage asks of the stage after it.  Everything that crosses a stage boundary of the windows
+/// goes through here: the split point's rows, the requests' control (windows, commits, sampling settings) and the
+/// results coming back from the last stage (its logits), so a next stage that shares nothing else with this one
+/// (another process, another machine) can stand behind it.  The calls marked "same process" hand a pointer over
+/// instead of its contents; only a stage in this process can serve them.  The engine's other paths that reach across
+/// stages (a CPU pool, a RAM expert region and a residency table shared by every stage, the host driving each stage's
+/// verifiers and sessions) are marked "LAYER SPLIT, same process only" where they are made.
+class StageLink {
+public:
+    virtual ~StageLink() = default;
+    /// Rows [row0, row0 + n) of this stage's hand-off (`Verifier::handoff_floats` each) are written: the next stage's.
+    virtual void rows(const float* hand_out, int row0, int n) = 0;
+    /// The window and the batch window, continued on the next stage.  `pool` is this process's CPU pool function
+    /// (a stage in another process serves its layers' experts with its own).
+    virtual bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, int32_t* out, std::string& err) = 0;
+    virtual bool run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool,
+                               int32_t* out, std::string& err) = 0;
+    virtual bool commit(int n_keep, std::string& err) = 0;
+    virtual bool commit_slot_prefixes(const int* keep, std::string& err) = 0;
+    virtual bool wait_commit(std::string& err) = 0;
+    virtual void set_sampling(const strata::kernels::SamplerParams& sp) = 0;
+    virtual void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) = 0;
+    virtual void set_head_sampling(bool on) = 0;
+    virtual bool set_logit_bias(const std::vector<float>& bias, std::string& err) = 0;
+    /// Same process: the penalty rows the last stage's head reads, a buffer the engine fills before every window.
+    virtual void set_history(const int32_t* history, int history_len) = 0;
+    virtual bool read_logits(int rows, float* host, std::string& err) const = 0;
+    virtual bool copy_logits(int t, float* host) const = 0;
+    /// The last stage's check of its head logits (#879): the first row that held a NaN or an infinity, its position,
+    /// and whether row t did.
+    virtual int nonfinite_row() const = 0;
+    virtual int64_t nonfinite_pos() const = 0;
+    virtual bool nonfinite_in(int t) const = 0;
+    /// Same process: the measurement hook writes its lines to `out` (STRATA_LOGPOS).
+    virtual bool window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
+                                 std::string& err) = 0;
+    /// Same process: the last stage's final rows on its device (the drafter's input).
+    virtual const float* final_R_all() const = 0;
+};
+
+/// The next stage in this process: the calls go to its Verifier, and the rows are copied into its hand-off when it
+/// has one of its own (a stage on another GPU, whose context cannot read this one's host memory).
+class InProcessStage final : public StageLink {
+public:
+    void bind(Verifier* next, void* pool_user) { next_ = next; user_ = pool_user; }
+    void rows(const float* hand_out, int row0, int n) override;
+    bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, int32_t* out, std::string& err) override;
+    bool run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool,
+                       int32_t* out, std::string& err) override;
+    bool commit(int n_keep, std::string& err) override;
+    bool commit_slot_prefixes(const int* keep, std::string& err) override;
+    bool wait_commit(std::string& err) override;
+    void set_sampling(const strata::kernels::SamplerParams& sp) override;
+    void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) override;
+    void set_head_sampling(bool on) override;
+    bool set_logit_bias(const std::vector<float>& bias, std::string& err) override;
+    void set_history(const int32_t* history, int history_len) override;
+    bool read_logits(int rows, float* host, std::string& err) const override;
+    bool copy_logits(int t, float* host) const override;
+    int nonfinite_row() const override;
+    int64_t nonfinite_pos() const override;
+    bool nonfinite_in(int t) const override;
+    bool window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
+                         std::string& err) override;
+    const float* final_R_all() const override;
+
+private:
+    Verifier* next_ = nullptr;
+    void* user_ = nullptr;   ///< what the next stage's pool calls get
 };
 
 class Verifier {
@@ -122,10 +195,16 @@ public:
         lb_ = layer_begin; le_ = layer_end; hand_in_ = handoff_in; hand_out_ = handoff_out;
     }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
-    /// and `final_R` are the last stage's.
-    void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
+    /// and `final_R` are the last stage's.  Everything goes through a StageLink (an InProcessStage here).
+    void set_next(Verifier* next, void* next_user) {
+        local_next_.bind(next, next_user);
+        next_ = next != nullptr ? &local_next_ : nullptr;
+    }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
+    /// The previous stage in this process wrote rows [row0, row0 + n) of its hand-off `from`: they become this stage's
+    /// (copied into its own hand-off when it has one: a stage on another GPU).  InProcessStage::rows.
+    void accept_rows(const float* from, int row0, int n);
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
@@ -227,6 +306,22 @@ public:
     /// temperature and penalties) into `host` (vocab() floats); false when there is none.  OpenAI's logprobs.
     bool copy_logits(int t, float* host) const;
     int64_t vocab() const { return n_vocab_; }
+    /// #879 GUARD (upstream f332a855): the first row of the last finished window (run, run_slot_rows, batch_poll,
+    /// pl_finish) whose head logits held a NaN or an infinity, else -1; nonfinite_pos() is that row's position.  Every
+    /// window graph checks its T rows on the device beside the greedy pick (logits_nonfinite_rows into mapped flags,
+    /// read after the sync the window already does: no extra sync).  On the stage with the head (a layer split asks
+    /// the last stage).  STRATA_NAN_GUARD=0: off (always -1).  STRATA_NAN_INJECT=<n>[,<n>...] (debug): the n-th
+    /// window the guard checks in this process (counted from 1 over every stage-with-head verifier: prompt-tail
+    /// windows, decode windows and batch windows alike) reports row 0 as non-finite, so the whole response can be
+    /// tested.
+    int nonfinite_row() const { return next_ != nullptr && !last_stage() ? next_->nonfinite_row() : nf_row_; }
+    int64_t nonfinite_pos() const { return next_ != nullptr && !last_stage() ? next_->nonfinite_pos() : nf_pos_; }
+    /// Row t of the last window (a batch window: each slot's own rows) held a non-finite logit.
+    bool nonfinite_in(int t) const {
+        if (next_ != nullptr && !last_stage()) return next_->nonfinite_in(t);
+        return t >= 0 && t < 32 && ((nf_mask_ >> t) & 1u) != 0;
+    }
+    static bool nan_guard_on();
     /// Measurement hook (STRATA_LOGPOS, upstream 06b82fe / 5e14c19): after run(), one line per row t of the last
     /// window's head - "pos target logprob top top_logprob hit extra_logprob target_logprob_without_extra", and with
     /// STRATA_LOGPOS_TOPK=K the K most likely tokens as `id:logprob` - where row t is the distribution at pos0 + t,
@@ -324,8 +419,8 @@ private:
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;
-    Verifier* next_ = nullptr;
-    void* next_user_ = nullptr;
+    StageLink* next_ = nullptr;          ///< set_next: the next stage, through this link only
+    InProcessStage local_next_;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     bool capture_commit(std::string& err);
     bool record_window(int T, strata::gpu::Stream cs, std::string& err);
@@ -380,6 +475,11 @@ private:
     int32_t* h_commit_ = nullptr; int32_t* m_commit_ = nullptr; // [n_keep, n_keep-1, pos_0 .. pos_{T-1}]
     float* h_ple_ = nullptr;     float* m_ple_ = nullptr;       // T * n_embd
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
+    uint32_t* h_nf_ = nullptr;   uint32_t* m_nf_ = nullptr;     // #879: kVerifyMaxT * kNonfiniteBlocks flags
+    int nf_row_ = -1;                     ///< nonfinite_row()
+    int64_t nf_pos_ = -1;                 ///< nonfinite_pos()
+    uint32_t nf_mask_ = 0;                ///< nonfinite_in(): bit t = row t
+    void note_nonfinite(int T, const int64_t* pos_b);   ///< the window's flags (+ STRATA_NAN_INJECT) -> nf_row_
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k

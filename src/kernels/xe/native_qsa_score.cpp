@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-FileCopyrightText: 2023-2026 The ggml authors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/native_qsa_score.cpp - the Xe port of Strata's src/kernels/cuda/native_qsa_score.cu: the QSA indexer's block
 // scores (four ReLU'd head dots, summed, plus the block bias and the partial-block mask), after ggml-cuda's mmf,
 // unary and binbcast at pinned llama.cpp 3cf03257 (MIT License, Copyright (c) 2023-2026 The ggml authors, see

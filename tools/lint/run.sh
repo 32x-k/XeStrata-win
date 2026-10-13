@@ -20,12 +20,9 @@ else
 fi
 [ ${#files[@]} -gt 0 ] || { echo "nothing to lint"; exit 0; }
 all=("${files[@]}")
-# upstream's records (tools/lint/records.txt): gitleaks and reuse only
-mapfile -t records < <(grep -v -e '^#' -e '^$' "$C/records.txt")
+# another project's files in third_party/<area>/<project>/, kept as that project wrote them: gitleaks and reuse only
+# (XeStrata's patches there are linted as usual)
 mapfile -t files < <(printf '%s\n' "${files[@]}" | while read -r f; do
-  for r in "${records[@]}"; do [ "$f" = "$r" ] || [ "${f#"$r"/}" != "$f" ] && continue 2; done
-  # another project's files in third_party/<area>/<project>/, kept as that project wrote them: the same two lints
-  # (XeStrata's patches there are linted as usual)
   case "$f" in third_party/*/*/patches/*) ;; third_party/*/*/*) continue ;; esac
   echo "$f"
 done)
@@ -88,7 +85,7 @@ if [ ${#cpp[@]} -gt 0 ]; then
   else
     echo "== clang-tidy: skipped (needs oneAPI's clang-tidy and $BUILD/compile_commands.json)"
   fi
-  run cppcheck cppcheck --quiet --error-exitcode=1 --std=c++20 --enable=warning,performance \
+  run cppcheck cppcheck --quiet --error-exitcode=1 --std=c++20 --enable=warning,performance --library="$C/cppcheck.cfg" \
     --suppress=missingIncludeSystem --suppress=noCopyConstructor --suppress=noOperatorEq "${cpp[@]}"
 fi
 [ ${#cmake[@]} -gt 0 ] && run cmake-lint cmake-lint -c "$C/cmake-format.py" -- "${cmake[@]}"
@@ -106,6 +103,9 @@ for f in "${all[@]}"; do
   gitleaks detect --no-git --redact --no-banner --exit-code 1 --source "$f" >/dev/null 2>&1 \
     || { echo "== gitleaks: a possible secret in $f (gitleaks detect --no-git --redact --source $f)"; status=1; }
 done
+# each file's SPDX header against where its code comes from (AGENTS.md, Licenses)
+echo "== license classes"
+python3 tools/license_class.py "${all[@]}" || status=1
 REUSE=$(command -v reuse || echo .lint/venv/bin/reuse)
 run reuse "$REUSE" lint --quiet
 exit $status

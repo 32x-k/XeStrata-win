@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/cpu/q2_bitplane_parity.cpp - the AVX-2 Q2_0 bit-plane kernel (the default, PR #706).
 //
 //   1. against the legacy AVX-2 kernel: the integer part is exact, only the float summation order differs, so the

@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/session.hpp - ONE TOKEN through all 48 layers, and the doorbell protocol between them.
 //
 // P2.S5's host loop, and the first place the engine runs a whole forward pass rather than one block.  What it

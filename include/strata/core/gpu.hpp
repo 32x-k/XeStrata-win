@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <string>
 
@@ -33,8 +34,14 @@ struct Graph;
 
 /// The message of the last failing call on this thread.
 const char* last_error();
+/// Issue #10: one line on an exception that left the engine: its text, the SYCL error code and Unified Runtime result
+/// when it is a SYCL exception (error 40 is also what a kernel launch refused for device memory reports), the VRAM
+/// free if it can still be read, and whether the GPU still answers (Runtime::device_status).
+std::string failure_report(const std::exception& e);
 
 Stream stream_create();
+/// A stream for copies and events alone (Runtime::create_copy_stream): the copy engine where the device has one.
+Stream stream_create_copy();
 void stream_destroy(Stream s);
 bool stream_sync(Stream s);
 /// True when every command submitted to `s` has completed (cudaStreamQuery == cudaSuccess).

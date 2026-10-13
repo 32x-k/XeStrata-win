@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_prometheus.py - GET /metrics in the Prometheus text format (vLLM's names), against the mock engine.
 
     python -m unittest serve.test_prometheus -v

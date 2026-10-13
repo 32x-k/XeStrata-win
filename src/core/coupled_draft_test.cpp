@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/coupled_draft_test.cpp - coupled draft sampling's host-side arithmetic (include/strata/core/coupled_draft.hpp).
 //
 // No GPU.  A simulated decode - windows of random size, random accepted counts, the serve loop's first window of one

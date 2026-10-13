@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_reasoning_rescue.py - #804 / #1058: when a `<tool_call>` written inside the reasoning is a real call.
 
 A call inside the reasoning counts only when ALL hold: tools are declared and the name is one of them; the opener is

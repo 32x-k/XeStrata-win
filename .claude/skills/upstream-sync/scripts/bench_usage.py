@@ -18,7 +18,8 @@ tools/bench_core.py's (ab_usage), which setup's --bench makes too.
     XE="CMD..." UP="CMD..." XE_ROOT=DIR UP_ROOT=DIR DATA=DIR XE_PROFILE=... UP_PROFILE=... \\
       python .claude/skills/upstream-sync/scripts/bench_usage.py OUT GPU [--dry-run]     # from the repository root
 
-XE and UP: each engine's binary or wrapper, optionally after `env K=V ...` (those go to its server's environment).
+XE and UP: each engine's binary or wrapper, optionally after `env K=V ...` (those go to its server's environment);
+UP=none: XeStrata alone, as for bench_generate.py.
 XE_ROOT and UP_ROOT: each engine's tree (its serve/server.py runs).  PY (default this Python): the Python that runs
 them.  CONTEXT (default 262144): the context, with what setup writes for it.  CONFIG, PACK, NATIVE, PLE and EXTRA as for
 bench_generate.py.  ROUNDS (default 3): runs per arm, alternating, after a discarded warm-up per arm.
@@ -43,7 +44,7 @@ ctx = int(os.environ.get("CONTEXT", "262144"))
 
 def cfg(e: B.Engine) -> dict:
     return {"exe": e.cmd[0], "cwd": str(e.root), "tokenizer": f"{m.pack}/tokenizer", "model_name": "bench",
-            "args": B.engine_args(m.model, e.profile, m.mtp, B.usage_context(ctx))}
+            "args": B.engine_args(m.model, e.profile, m.mtp, B.usage_context(m.model, ctx))}
 
 
 convs = tuple(os.environ.get("CONVS", " ".join(B.CONVERSATIONS)).split())

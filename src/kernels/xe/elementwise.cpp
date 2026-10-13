@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -173,6 +173,23 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
         const int64_t step = (int64_t) it.get_global_range(0);
         for (int64_t i = (int64_t) it.get_global_id(0); i < n4; i += step)
             reinterpret_cast<f32x4*>(dst)[i] = reinterpret_cast<const volatile f32x4*>(src)[i];
+    });
+}
+
+void concat_rows(float* dst, const float* a, const float* b, int64_t n, int64_t rows, void* stream) {
+    if (n <= 0 || rows <= 0) return;
+    if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) a & 15) != 0 || ((uintptr_t) b & 15) != 0)
+        throw core::DeviceError("concat_rows: n must be a multiple of 4 and the pointers 16-byte aligned");
+    const int64_t n4 = n / 4;
+    queue_for(stream).parallel_for(sycl::nd_range<1>((size_t) rows * 256, 256), [=](sycl::nd_item<1> it) {
+        const int64_t row = (int64_t) it.get_group(0);
+        f32x4* d = reinterpret_cast<f32x4*>(dst + row * 2 * n);
+        const f32x4* sa = reinterpret_cast<const f32x4*>(a + row * n);
+        const f32x4* sb = reinterpret_cast<const f32x4*>(b + row * n);
+        for (int64_t i = (int64_t) it.get_local_id(0); i < n4; i += 256) {
+            d[i] = sa[i];
+            d[n4 + i] = sb[i];
+        }
     });
 }
 
