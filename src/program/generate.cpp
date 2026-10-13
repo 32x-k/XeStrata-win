@@ -1427,7 +1427,7 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
             for (int64_t j = 0; j < N; ++j) dir[(size_t) (l * N + j)] = (float) (d[j] / nrm);
         } else {
             s[(size_t) l] = 1.0f;
-            std::copy(d, d + N, dir.begin() + (size_t) (l * N));
+            std::copy(d, d + N, dir.begin() + (std::ptrdiff_t) (l * N));
         }
         ++steered;
     }
@@ -1921,13 +1921,13 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
         } catch (const std::exception& e) {
             report = strata::gpu::failure_report(e);
         } catch (...) {
+            report = "an unknown exception";   // (not a std::exception: nothing more to say)
         }
     } else {
         report = "std::terminate without an exception";
     }
     const strata::core::Progress& p = strata::core::progress();
     std::fprintf(stderr, "strata generate: FATAL while %s (detail %lld, prompt chunk at %lld): %s\n", p.where.load(),
-            report = "an unknown exception";   // (not a std::exception: nothing more to say)
                  (long long) p.detail.load(), (long long) p.chunk.load(), report.c_str());
     std::printf("ERR the engine stopped while %s (detail %lld, prompt chunk at %lld): %s\n", p.where.load(),
                 (long long) p.detail.load(), (long long) p.chunk.load(), report.c_str());
@@ -2353,7 +2353,7 @@ int main(int argc, char** argv) {
             if (env != nullptr && env[0] != '\0') {
                 const size_t len = std::strlen(env);
                 const auto parsed = std::from_chars(env, env + len, mib);
-                if (parsed.ec != std::errc{} || parsed.ptr != env + len || mib < 0 || mib > INT64_MAX / (1024 * 1024)) {
+                if (parsed.ec != std::errc{} || parsed.ptr != env + len || mib < 0 || mib > INT64_MAX / (1024LL * 1024)) {
                     std::fprintf(stderr, "STRATA_MEMORY_LIMIT_MIB needs a nonnegative integer within range (got \"%s\")\n", env);
                     return 2;
                 }
@@ -3616,8 +3616,8 @@ int main(int argc, char** argv) {
     // on 10,240 floats being indistinguishable, which is a fixed per-launch cost and not execution.
     // `bench/micro/graph_node_cost.cu` measures the same kernels on a real stream at 3.63 us ungrapped and
     // 0.805 us inside a graph.  **That is an ~8x penalty on every launch in the engine.**
-    strata::gpu::Stream main_stream = nullptr;
-    if (!(main_stream = strata::gpu::stream_create())) {
+    strata::gpu::Stream main_stream = strata::gpu::stream_create();
+    if (!main_stream) {
         std::fprintf(stderr, "strata generate: cannot create the main stream\n");
         return 1;
     }
@@ -3663,6 +3663,7 @@ int main(int argc, char** argv) {
     const uint64_t half_stride = (uint64_t) 2 * g.n_embd + (uint64_t) 2 * g.hc +
                                  (uint64_t) g.n_head * g.head_dim +
                                  (uint64_t) 5 * g.n_head_kv * g.head_dim + 8;
+    DumpFile half_dump_file;
     std::FILE* half_dump = nullptr;
     float* half_stage = nullptr;
     if (!o.dump_halves.empty()) {
@@ -3670,7 +3671,6 @@ int main(int argc, char** argv) {
         half_dump = half_dump_file.get();
         if (half_dump == nullptr) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_halves.c_str());
-    DumpFile half_dump_file;
             return 1;
         }
         const size_t n = (size_t) g.n_layers * (size_t) half_stride;
@@ -3910,11 +3910,12 @@ int main(int argc, char** argv) {
         }
         void* sbuf_s = nullptr;
         const int64_t slo = carve ? stage_lo(i) : 0, shi = carve ? stage_hi(i) : -1;
-        if (!strata::gpu::alloc_device(&sbuf_s, strata::core::session_bytes(g, o.max_context, K, slo, shi)) ||
-            strata::core::session_init(g, o.max_context, K, sbuf_s, st.ss, slo, shi) == 0 ||
-            !(st.stream = strata::gpu::stream_create()) ||
-            !(st.adapt_stream = strata::gpu::stream_create()) ||
-            !strata::gpu::event_create(&st.adapt_ev)) {
+        const bool session_ok =
+            strata::gpu::alloc_device(&sbuf_s, strata::core::session_bytes(g, o.max_context, K, slo, shi)) &&
+            strata::core::session_init(g, o.max_context, K, sbuf_s, st.ss, slo, shi) != 0;
+        if (session_ok) st.stream = strata::gpu::stream_create();
+        if (session_ok && st.stream) st.adapt_stream = strata::gpu::stream_create();
+        if (!session_ok || !st.stream || !st.adapt_stream || !strata::gpu::event_create(&st.adapt_ev)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: the session state failed\n", st.dev);
             return 1;
         }
@@ -5258,6 +5259,7 @@ int main(int argc, char** argv) {
     // `llama-debug`'s `l_last-<il>` node instead of against a single end-to-end perplexity.  The buffer is
     // PINNED because `session_loop` enqueues a device-to-host copy into it after every layer and the transfer
     // would otherwise be staged through a pageable bounce buffer on the critical path.
+    DumpFile layer_dump_file;
     std::FILE* layer_dump = nullptr;
     float* layer_stage = nullptr;
     const size_t layer_floats = (size_t) (g.n_layers + 1) * (size_t) g.hc * (size_t) g.n_embd;
@@ -5266,7 +5268,6 @@ int main(int argc, char** argv) {
         layer_dump = layer_dump_file.get();
         if (layer_dump == nullptr) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_layers.c_str());
-    DumpFile layer_dump_file;
             return 1;
         }
         if (!strata::gpu::alloc_host((void**) &layer_stage, layer_floats * sizeof(float))) {
@@ -6216,7 +6217,7 @@ int main(int argc, char** argv) {
         auto stage_ver = [&](int st) -> strata::core::Verifier& {
             return st == 0 ? ver : split_same ? ver_same : stages[(size_t) st - 1]->ver;
         };
-        auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); };
+        auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) std::lround(f * 256.0))); };
         const int n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
         // --pipeline-windows (decided where the split was): two verifiers per stage, one for the even windows and one
         // for the odd ones, sharing one stream of their card, and a hand-off per parity - so stage 0 can run window
@@ -7083,7 +7084,7 @@ int main(int argc, char** argv) {
             }
         }
         drive.d.plan = ver.plan_sink();
-        drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+        drive.d.pcie_num = std::max(0, std::min(256, (int) std::lround(o.pcie_frac * 256.0)));
         strata::core::PcieSplitTimes pcie_split;   // the measured split, kept for the requests that set no share
         setup_pcie_split(drive.d, g.n_layers, o, pcie_given, !split_devs.empty(), ver.fetch_branch(), pcie_split);
         strata::core::PcieSplitTimes* const pcie_split_ptr = drive.d.pcie_split;
@@ -7132,8 +7133,8 @@ int main(int argc, char** argv) {
                 heat.assign(drive.d.usage.size(), 0.0);
         }
         Clock::time_point profile_saved_at = Clock::now();
-        strata::gpu::Stream adapt_stream = nullptr;
-        if (!(adapt_stream = strata::gpu::stream_create())) {
+        strata::gpu::Stream adapt_stream = strata::gpu::stream_create();
+        if (!adapt_stream) {
             std::fprintf(stderr, "strata serve: cannot create the refill stream\n");
             return 1;
         }
@@ -7776,9 +7777,8 @@ int main(int argc, char** argv) {
         const int S = o.spec;
         ShortReadCost sr_cost;   // which way a short part of a prompt is read (see ShortReadCost)
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
-        if (use_mtp && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         // --pipeline-windows 2 loads the drafter with 8 rows: the serial loop's chain keeps its own length
-        else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
+        if (use_mtp && (S_mtp < S || mtp.max_t() > S_mtp)) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
@@ -9220,6 +9220,13 @@ int main(int argc, char** argv) {
                 for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
                 if (c != nullptr) c->used = ++check_clock;   // mounting through it is the use LRU counts
                 static const bool reread = std::getenv("STRATA_CKPT_REREAD") != nullptr;
+                auto restore_stages = [&](const ConvCheckpoint& cp) {   // a layer split's later stages, each on its card
+                    for (size_t i = 0; i < stages.size(); ++i) {
+                        const strata::core::OnDevice on(stages[i]->dev);
+                        if (!checkpoint_restore(cp.stage_parts[i], stages[i]->ss, g)) return false;
+                    }
+                    return true;
+                };
                 if (reread && c != nullptr) {
                     // THE CHECK OF THE CHECKPOINT: instead of restoring it, read its tokens again from position 0 in
                     // one run (below, with the prompt path's slots lent like any read) - the same chunks the request
@@ -9237,13 +9244,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
                                          "restoring\n", (long long) resume);
                 } else if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
-                           [&] {
-                               for (size_t i = 0; i < stages.size(); ++i) {
-                                   const strata::core::OnDevice on(stages[i]->dev);
-                                   if (!checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) return true;
-                               }
-                               return false;
-                           }()) {
+                           !restore_stages(*c)) {
                     std::printf("ERR restoring a conversation checkpoint failed\n");
                     return 1;
                 }
@@ -9674,7 +9675,7 @@ int main(int argc, char** argv) {
                                  strata::aux_cpus::enabled() ? "ON" : "off",
                                  want && !strata::aux_cpus::enabled() ? " (asked for, but no CPU is spare: see the start-up line)" : "");
             }
-            drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
+            drive.d.pcie_num = std::max(0, std::min(256, (int) std::lround(req_pcie_frac * 256.0)));
             drive.d.pcie_split = req_pcie_set ? nullptr : pcie_split_ptr;
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
@@ -10691,10 +10692,10 @@ int main(int argc, char** argv) {
                                      "CPU %.2f] + stage %.2f) + commit/emit %.2f + draft %.2f; per layer-window: CPU experts "
                                      "%.2f (%.2f entries), VRAM hits %.2f, PCIe %.2f; before the window %.2f, adapt join %.2f "
                                      "(adapt %.2f, %lld swaps, %lld synchronous)\n",
-                             (long long) dec_windows, dec_T / w, produced_n / w, decode_ms / w, dt_run / w,
+                             (long long) dec_windows, (double) dec_T / w, (double) produced_n / w, decode_ms / w, dt_run / w,
                              (d1.wait - ds0.wait) / w, (d1.pool - ds0.pool) / w, (d1.plan - ds0.plan) / w,
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
-                             (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
+                             (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (double) (d1.misses - ds0.misses) / (w * L),
                              (double) (d1.entries - ds0.entries) / (w * L), (double) (d1.hits - ds0.hits) / (w * L),
                              (double) (d1.pcie - ds0.pcie) / (w * L), dt_pre / w, dt_join / w, dt_adapt / w, (long long) (adapt_swaps_n - adapt_swaps0),
                              (long long) (adapt_sync_n - adapt_sync0));
@@ -10898,7 +10899,7 @@ int main(int argc, char** argv) {
                                  "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %zu checkpoints%s\n",
                          (long long) n, (long long) resume, read_txt, prompt_ms,
                          prompt_ms > 0 ? 1000.0 * (double) read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
-                         decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
+                         decode_ms > 0 ? 1000.0 * (double) produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
             // to read (--pcie-frac) are in neither count - #588: so that share is said beside it (raising --pcie-frac
@@ -10909,7 +10910,7 @@ int main(int argc, char** argv) {
                     std::snprintf(off, sizeof off, "; %lld more read by the GPU over PCIe or from another GPU (%.1f%% of "
                                   "all %lld routed)", (long long) req_offload,
                                   100.0 * (double) req_offload / (double) (req_look + req_offload),
-                                  (long long) (req_look + req_offload));
+                                  (long long) req_look + (long long) req_offload);
                 std::fprintf(stderr, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s\n",
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
@@ -11407,7 +11408,7 @@ int main(int argc, char** argv) {
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         drive.d.plan = ver.plan_sink();
-        drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
+        drive.d.pcie_num = (int) std::lround(o.pcie_frac * 256.0);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
         strata::core::PcieSplitTimes pcie_split;   // the measured split
@@ -11416,8 +11417,8 @@ int main(int argc, char** argv) {
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         int64_t swaps_total = 0;
         double ms_adapt = 0;
-        strata::gpu::Stream adapt_stream = nullptr;
-        if (!drive.d.usage.empty() && !(adapt_stream = strata::gpu::stream_create())) {
+        strata::gpu::Stream adapt_stream = drive.d.usage.empty() ? nullptr : strata::gpu::stream_create();
+        if (!drive.d.usage.empty() && !adapt_stream) {
             std::fprintf(stderr, "strata generate: cannot create the refill stream\n");
             return 1;
         }
@@ -11650,7 +11651,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 uint64_t h = 1469598103934665603ull;
-                const auto* bytes = (const uint8_t*) hash_rows.data();
+                const auto* bytes = reinterpret_cast<const uint8_t*>(hash_rows.data());
                 for (size_t i = 0; i < n_floats * sizeof(float); ++i) h = (h ^ bytes[i]) * 1099511628211ull;
                 std::fprintf(hashes, "%lld %lld %d %016llx", (long long) rounds, (long long) p, T, (unsigned long long) h);
                 for (int i = 0; i < T; ++i) std::fprintf(hashes, " %d", (int) outv[(size_t) i]);
@@ -11708,7 +11709,7 @@ int main(int argc, char** argv) {
                     const float* row = window_logits.data() + (size_t) i * (size_t) n_vocab;
                     if (std::fwrite(row, sizeof(float), (size_t) n_vocab, dump) != (size_t) n_vocab) {
                         if (adapt_thr.joinable()) adapt_thr.join();
-                        std::fprintf(stderr, "strata generate: cannot write logits at position %lld\n", (long long) (p + i));
+                        std::fprintf(stderr, "strata generate: cannot write logits at position %lld\n", (long long) p + (long long) i);
                         return 1;
                     }
                 }
@@ -11768,8 +11769,8 @@ int main(int argc, char** argv) {
         if (rounds > 0)
             std::printf("%-24s wait for rings %.3f  pool %.3f  host %.3f  commit %.3f ms/round; CPU experts %.2f "
                         "distinct / %.2f routed per layer\n",
-                        "verify window", ver.ms_wait / rounds, ver.ms_pool / rounds, ver.ms_host / rounds,
-                        ver.ms_commit / rounds,
+                        "verify window", ver.ms_wait / (double) rounds, ver.ms_pool / (double) rounds, ver.ms_host / (double) rounds,
+                        ver.ms_commit / (double) rounds,
                         (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
                         (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
         if (rounds > 0 && src.resident_count() > 0)
@@ -11791,17 +11792,17 @@ int main(int argc, char** argv) {
         }
         if (rounds > 0)
             std::printf("%-24s gate/up %.3f  quantize %.3f  down %.3f ms/round; %.1f GB/s over the rows phases; "
-                        "CPU pool call %.3f ms/round\n", "pool multi", pool.ms_multi_gu / rounds,
-                        pool.ms_multi_q / rounds, pool.ms_multi_down / rounds,
+                        "CPU pool call %.3f ms/round\n", "pool multi", pool.ms_multi_gu / (double) rounds,
+                        pool.ms_multi_q / (double) rounds, pool.ms_multi_down / (double) rounds,
                         (double) pool.multi_bytes / 1e6 / std::max(1e-9, pool.ms_multi_gu + pool.ms_multi_down),
-                        (drive.cpu_ms - pool_ms0) / rounds);
+                        (drive.cpu_ms - pool_ms0) / (double) rounds);
         if (rounds > 0)
             std::printf("%-24s plan %.3f  activation quantize %.3f  jobs %.3f  run %.3f ms/round\n", "dispatch",
-                        drive.d.ms_plan / rounds, drive.d.ms_actq / rounds, drive.d.ms_jobs / rounds,
-                        drive.d.ms_run / rounds);
+                        drive.d.ms_plan / (double) rounds, drive.d.ms_actq / (double) rounds, drive.d.ms_jobs / (double) rounds,
+                        drive.d.ms_run / (double) rounds);
         if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
-                        (long long) swaps_total, o.adapt_every, ms_adapt / rounds);
+                        (long long) swaps_total, o.adapt_every, ms_adapt / (double) rounds);
         if (rounds > 0 && drive.d.pcie_num > 0)
             std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 of the misses)\n",
                         "pcie experts", (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers),
@@ -11970,7 +11971,7 @@ int main(int argc, char** argv) {
             // firing more often than it should.
             const int64_t positions = gr.calls_total;
             std::printf("%-24s %lld of %lld over %lld positions\n", "  rings seen MID-GRAPH",
-                        (long long) gr.rings_mid_graph, (long long) (g.n_layers * positions),
+                        (long long) gr.rings_mid_graph, (long long) g.n_layers * (long long) positions,
                         (long long) positions);
             std::printf("%-24s %.3f ms of a %.3f ms layer\n", "  ring latency",
                         gr.ms_to_ring / (double) (g.n_layers * positions), decode_ms / (double) g.n_layers);

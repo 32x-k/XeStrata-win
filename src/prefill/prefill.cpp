@@ -205,7 +205,7 @@ struct Alloc {
         if (count_only) { used += bytes; return nullptr; }
         if (base != nullptr) {
             if (used + bytes > cap) { ok = false; failed_bytes = bytes; return nullptr; }
-            T* p = (T*) (base + used);
+            T* p = reinterpret_cast<T*>(base + used);
             used += bytes;
             return p;
         }
@@ -746,7 +746,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.tok_host.resize((size_t) chunk);
         m.tok_up.init((size_t) chunk);
     }
-    if (!(m.copy = strata::gpu::stream_create_copy())) { err = "prefill: copy stream"; return false; }
+    m.copy = strata::gpu::stream_create_copy();
+    if (!m.copy) { err = "prefill: copy stream"; return false; }
     const size_t T = (size_t) chunk;
     m.T_max = chunk;
     m.borrowed = borrow != nullptr;
@@ -1294,7 +1295,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     }();
     const bool ple_batch = ple_on && ple_batch_env && strata::kernels::ple_native_postops_enabled() &&
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
-                           m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
+                           m.region_bytes / (((uint64_t) 3 * strata::kernels::NG_HC_DIM + (uint64_t) N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
     auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
         const int64_t T = std::min(m.T, n - c0);
@@ -1578,7 +1579,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 for (int64_t s0 = 0; s0 < T; s0 += SB) {
                     const int64_t nb = std::min(SB, T - s0);
                     uint8_t* q = m.region;
-                    auto carve_f = [&](size_t n) { float* p = (float*) q; q += (n * 4 + 255) & ~(size_t) 255; return p; };
+                    auto carve_f = [&](size_t n) { float* p = reinterpret_cast<float*>(q); q += (n * 4 + 255) & ~(size_t) 255; return p; };
                     float* key = carve_f((size_t) nb * HD);
                     float* qn = carve_f((size_t) nb * HD);
                     float* gated = carve_f((size_t) nb * HD);
@@ -2453,7 +2454,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
                             }
                         }
-                        release_to(m.g->n_expert);
+                        release_to((int32_t) m.g->n_expert);
                     }
                     pt.mark(kPfCombine, cs);
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail
@@ -2636,7 +2637,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         bad(m.R + last * D, D);
         if (ss.ple.ready()) { std::fprintf(stderr, "; PLE history"); bad(ss.ple.hist, (int64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM); }
         std::fprintf(stderr, "; GDN state 0");
-        bad(ss.gdn_state, 64 * 1024);
+        bad(ss.gdn_state, (int64_t) 64 * 1024);
         std::fprintf(stderr, "\n");
     }
     if (!strata::gpu::stream_sync(m.cs)) {

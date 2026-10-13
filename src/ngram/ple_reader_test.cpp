@@ -271,7 +271,7 @@ int selftest(const std::string& dir, uint32_t rb) {
     const uint32_t N = 500000;                          // 45 MB: large enough for thousands of distinct pages
     const std::string path = dir + "/ple_reader_selftest_" + std::to_string(rb) + ".bin";
     if (!make_table(path, N, rb)) { std::fprintf(stderr, "cannot write %s\n", path.c_str()); return 2; }
-    std::mt19937 rng(7);
+    std::mt19937 rng(7);  // NOLINT(bugprone-random-generator-seed): reproducible rows.
     for (bool thr : {false, true})
     for (uint64_t cache : {0ull, 4096ull}) {
         for (uint32_t inflight : {1u, 8u, 64u}) {
@@ -399,7 +399,7 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path, 
     if (!direct_only && !mm.open(gguf, err, mo)) { std::fprintf(stderr, "mmap open: %s\n", err.c_str()); return 2; }
     if (!direct.open(gguf, err, dopt)) { std::fprintf(stderr, "direct open: %s\n", err.c_str()); return 2; }
     std::vector<std::vector<uint32_t>> tickets;
-    std::mt19937_64 rng(11);
+    std::mt19937_64 rng(11);  // NOLINT(bugprone-random-generator-seed): reproducible rows.
     for (int t = 0; t < n_random / 16; ++t) {
         std::vector<uint32_t> r(16);
         for (auto& x : r) x = (uint32_t) (rng() % direct.rows());

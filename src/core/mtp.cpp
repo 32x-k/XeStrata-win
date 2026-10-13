@@ -65,7 +65,7 @@ struct Bump {
     uint8_t* base = nullptr;
     uint64_t used = 0;
     template <typename T> T* take(uint64_t n) {
-        T* p = base ? (T*) (base + used) : nullptr;
+        T* p = base ? reinterpret_cast<T*>(base + used) : nullptr;
         used += (n * sizeof(T) + 255) & ~255ull;
         return p;
     }
@@ -565,8 +565,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
     const int64_t N = g.n_embd, HC = g.hc, K = ss.k, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
     const QsaShapes s = shapes_of(g);
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
-    const int32_t* step = step_ + row0 * 4;
-    const int32_t* pos = pos_ + row0 * NH;
+    const int32_t* step = step_ + (int64_t) row0 * 4;
+    const int32_t* pos = pos_ + (int64_t) row0 * NH;
     const bool fused_nr = native_rope_enabled() && native_norm_rope_usable((int) HD, (int) s.n_rot);
     auto norm_rope = [&](float* data, const float* gamma, int rows, int cols, const int32_t* p) {
         if (fused_nr && cols == (int) HD) {
@@ -646,14 +646,14 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         else
         for (int t = 0; t < T; ++t) {
             if (st_.kv_q4) {
-                kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
-                                  vcur_ + t * NKV * HD, s, cs, &st_.host);
+                kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, step + (int64_t) t * 4, kcur_ + (int64_t) t * NKV * HD,
+                                  vcur_ + (int64_t) t * NKV * HD, s, cs, &st_.host);
             } else if (st_.kv_int8)
-                kv_append_q8_step(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step + t * 4,
-                                  kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st_.host);
+                kv_append_q8_step(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step + (int64_t) t * 4,
+                                  kcur_ + (int64_t) t * NKV * HD, vcur_ + (int64_t) t * NKV * HD, s, cs, &st_.host);
             else
-                kv_append_step(st_.k_pool, st_.v_pool, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
-                               vcur_ + t * NKV * HD, s, cs, &st_.host);
+                kv_append_step(st_.k_pool, st_.v_pool, st_.page_table, step + (int64_t) t * 4, kcur_ + (int64_t) t * NKV * HD,
+                               vcur_ + (int64_t) t * NKV * HD, s, cs, &st_.host);
         }
       }
         if (!full) return true;
