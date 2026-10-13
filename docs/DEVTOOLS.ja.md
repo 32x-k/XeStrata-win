@@ -90,6 +90,20 @@ sudo dnf install hipcc rocm-hip-devel rocm-runtime-devel rocm-device-libs rocmin
 - Fedora 44（ROCm 7.1.1）のコンテナで、RX 9060 XT（gfx1200）に `-fsycl-targets=amd_gpu_gfx1200` でコンパイルした SYCL のカーネルが正しく動きました。
   HIP のアダプタは一度に確保できる大きさを 1 GiB と報告しますが、実際には 12 GiB まで確保できました。
 
+### Windows（AMD の GPU、HIP）
+
+Windows では、intel/llvm を HIP のターゲットだけでビルドし、XeStrata の free モードを AMD の GPU で動かせます。
+`tools/intel_llvm_build.py` は Linux 用なので、手順は手で行います（パスは `LOCAL.md`）。
+
+- 要るもの: Visual Studio 2022 Build Tools（C++ のワークロード）、CMake と Ninja、Python、ROCm の Windows 用 SDK（AMD の TheRock の Python の wheel。clang、HIP のランタイム、rocBLAS、hipBLASLt を含む）。
+- intel/llvm v7.1.1 に `third_party/main/intel-llvm/patches` を番号順に当て、`buildbot/configure.py` を `--hip --hip-platform AMD` で動かします。
+  ソースの変更ではない設定が 3 つ要ります: MSVC が UTF-8 のソースを CP932 として読まないように `/utf-8`、Build Tools に ATL がないので `LLVM_ENABLE_DIA_SDK=OFF`、`SYCL_ENABLE_BACKENDS=hip` と `LIBCLC_TARGETS_TO_BUILD=amdgcn--amdhsa`。
+  ROCm の場所は `UR_HIP_ROCM_DIR` と `UR_HIP_LIB_DIR` で渡します。
+- デバイスライブラリ: SDK のものは intel/llvm より新しい LLVM のビットコードで読めないので、ROCm 7.2 のもの（Linux の ROCm の `amdgcn/bitcode`）を使います。
+  Windows のデバイスコードは wchar_t が 2 バイトなので、`tools/windows/device_libs_wchar.py` で `wchar_size` のフラグを 2 に書き換えてから、`STRATA_ROCM_DEVICE_LIBS` で渡します。
+- XeStrata は `-DSTRATA_ADAPTIVECPP=OFF -DSTRATA_LICENSE=free -DSTRATA_HIP_ARCHS=<GPU>` で構成します。`STRATA_ROCM_ROOT` に SDK を渡すと、oneMath の rocBLAS のバックエンドもビルドされます（`third_party/main/oneMath/patches/windows-gnu-driver.patch` を CMake が当てます）。
+- 実行時は、intel/llvm の `install/bin`、oneMath の DLL（ビルドの `bin`）、SDK の `bin` を `PATH` に置き、`ONEAPI_DEVICE_SELECTOR=hip:0` で GPU を選びます。
+
 ### contrib-llvm 用のビルド（CUDA）
 
 contrib-llvm のビルド（[BUILD.ja.md](BUILD.ja.md#ビルド)）は、CUDA のターゲット付きの intel/llvm で NVIDIA の GPU 向けのコードも作ります。
