@@ -149,6 +149,21 @@ class ChunkedBody(unittest.TestCase):
                 status, got = self.send(head, framed)
                 self.assertEqual((status, self.svc.shared), (200, {"temperature": 0.5}), got)
 
+    def switcher(self, extra: bytes, body: bytes):
+        return self.send(b"/switcher HTTP/1.1" + CRLF + b"Content-Type: application/json" + CRLF + extra, body)
+
+    def test_the_switcher_reads_its_body_through_the_common_reader(self):
+        status, got = self.switcher(b"Transfer-Encoding: chunked" + CRLF, chunked(b'{"mode": ""}'))
+        self.assertEqual(status, 200, got)
+        for length in (b"-1", b"abc"):   # before: read until the client closed, or a ValueError and no answer
+            with self.subTest(length=length):
+                status, got = self.switcher(b"Content-Length: " + length + CRLF, b"{}")
+                self.assertEqual(status, 400, got)
+
+    def test_the_switcher_body_limit(self):   # answered before the body is read
+        status, got = self.switcher(b"Content-Length: %d" % (server.body_limit() + 1) + CRLF, b"{}")
+        self.assertEqual(status, 413, got)
+
     def test_a_chunked_control_body_is_consumed(self):
         head = (b"/unload HTTP/1.1" + CRLF + b"Content-Type: application/json" + CRLF +
                 b"Transfer-Encoding: chunked" + CRLF)
