@@ -1441,6 +1441,13 @@ bool FileExpertSource::pin_cache_complement(
                 fail("FileExpertSource: an expert could not be read while building the cache complement");
                 return;
             }
+#if defined(_WIN32)
+            // the GGUF in place: Windows keeps the pages read through the views in the working set, beside the copy
+            if (!role_ptr_.empty())
+                for (int64_t expert = 0; expert < n_expert_; ++expert)
+                    if (offsets[(size_t) layer * (size_t) n_expert_ + (size_t) expert] != kNoComplement)
+                        (void) this->release(layer, expert);
+#endif
             if (role_ptr_.empty()) {   // experts.bin; the GGUF in place leaves its pages to the OS
             const uint64_t layer_offset = layer_offsets_[(size_t) layer];
             const uint64_t layer_bytes = blob_bytes * (uint64_t) n_expert_;
