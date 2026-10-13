@@ -15,6 +15,7 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 
 #include "strata/core/gpu.hpp"
+#include "strata/core/on_device.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -503,8 +504,42 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
     return true;
 }
 
+bool FileExpertSource::register_on(int device, std::string& err) {
+    if (registered_on(device) || (!complement_ready_ && xstage_ == nullptr)) return true;
+    std::vector<std::pair<void*, size_t>> blocks;
+    if (!complement_chunks_.empty())
+        for (const ComplementChunk& c : complement_chunks_) blocks.emplace_back(c.host, (size_t) (c.end - c.start));
+    else if (complement_arena_ != nullptr && complement_bytes_ > 0)
+        blocks.emplace_back(complement_arena_, (size_t) complement_bytes_);
+    if (xstage_ != nullptr && xstage_cap_ > 0) blocks.emplace_back(xstage_, (size_t) xstage_cap_ * (size_t) xstage_blob_);
+    std::vector<void*> regs;
+    for (const auto& [p, n] : blocks) {
+        if (!strata::gpu::host_register_on(device, p, n)) {
+            for (void* r : regs) strata::gpu::host_unregister_on(device, r);
+            err = std::string("registering the RAM copy on GPU ") + std::to_string(device) + ": " +
+                  strata::gpu::last_error();
+            return false;
+        }
+        regs.push_back(p);
+    }
+    stage_reg_.emplace_back(device, std::move(regs));
+    return true;
+}
+
+bool FileExpertSource::registered_on(int device) const {
+    for (const auto& o : stage_reg_)
+        if (o.first == device) return true;
+    return false;
+}
+
 void FileExpertSource::close() {
     if (complement_arena_ || xstage_) strata::gpu::device_sync();
+    for (auto& o : stage_reg_) {   // before the memory goes, and after that GPU's copies from it
+        const OnDevice on(o.first);
+        (void) strata::gpu::device_sync();
+        for (void* p : o.second) strata::gpu::host_unregister_on(o.first, p);
+    }
+    stage_reg_.clear();
     inputs_.clear();
     if (!complement_chunks_.empty()) {
         for (const ComplementChunk& c : complement_chunks_) (void) strata::gpu::free(c.host);
@@ -2698,6 +2733,10 @@ ArenaExpertSource::~ArenaExpertSource() { close(); }
 
 bool ArenaExpertSource::register_on(int device, std::string& err) {
     return arena_ == nullptr || static_cast<PinnedArena*>(arena_)->register_on(device, err);
+}
+
+bool ArenaExpertSource::registered_on(int device) const {
+    return arena_ != nullptr && static_cast<PinnedArena*>(arena_)->registered_on(device);
 }
 
 bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads,

@@ -67,6 +67,12 @@ struct PinnedArena {
     /// of the rate, blocking the host.  Released by the destructor.  False (and `err`) when the device refuses; the
     /// copies are then correct, only slower.
     bool register_on(int device, std::string& err);
+    /// Whether register_on registered it on engine device `device` (and it is still so).
+    bool registered_on(int device) const {
+        for (const auto& o : other_reg_)
+            if (o.first == device) return true;
+        return false;
+    }
 
     /// The one registered mapping (a private one with layer bounds) moved into host USM blocks, one per layer of its
     /// bytes plus `pad`, as the `host_usm` constructor makes them: GPU kernels can then read it (a registration for

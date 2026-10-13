@@ -192,6 +192,9 @@ public:
     /// A layer split: makes the blobs copy fast to engine device `device` as well (see PinnedArena::register_on).
     /// True when there is nothing to do; false (and `err`) when the device refuses, the copies then being slower.
     virtual bool register_on(int device, std::string& err) { (void) device; (void) err; return true; }
+    /// Whether every blob device_alias names is registered on engine device `device` (register_on), which a CUDA or
+    /// HIP GPU's kernels then read in place (gpu::kernels_read_host).
+    virtual bool registered_on(int device) const { (void) device; return false; }
     /// Disk sessions: the files this source read its experts from, as (role, path), resolved by the loader itself
     /// - the pack's experts.bin, or every GGUF tensor native_experts.txt named, per layer and role
     /// ("expert blk.L.ffn_up").  Filled by open(); empty before.
@@ -468,6 +471,11 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
 /// token - which is the only way they get debugged before speed matters.
 class FileExpertSource : public ExpertSource {
 public:
+    /// A layer split: the RAM copy (the complement) and the exchange buffers registered on engine device `device`, so
+    /// that a CUDA or HIP GPU's PCIe share reads them in place.  Done once they exist (after pin_cache_complement and
+    /// reserve_exchanges); released by close().
+    bool register_on(int device, std::string& err) override;
+    bool registered_on(int device) const override;
     FileExpertSource() = default;
     ~FileExpertSource() override;
     FileExpertSource(const FileExpertSource&) = delete;
@@ -704,6 +712,7 @@ private:
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
     std::vector<Exchange> staged_;
     uint8_t* xstage_ = nullptr;               ///< exchange buffers, `xstage_cap_ x xstage_blob_`
+    std::vector<std::pair<int, std::vector<void*>>> stage_reg_;   ///< register_on: a device, its registrations
     bool xstage_pinned_ = false;
     int64_t xstage_cap_ = 0;
     uint64_t xstage_blob_ = 0;
@@ -732,6 +741,7 @@ private:
 class ArenaExpertSource : public ExpertSource {
 public:
     bool register_on(int device, std::string& err) override;
+    bool registered_on(int device) const override;
     ArenaExpertSource() = default;
     ~ArenaExpertSource() override;
     ArenaExpertSource(const ArenaExpertSource&) = delete;

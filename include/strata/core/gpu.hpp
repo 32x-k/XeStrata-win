@@ -61,9 +61,11 @@ inline bool device_pointer(void** d, const void* h) {
     return *d != nullptr;
 }
 /// Whether the current GPU's kernels can read the host memory at `p` in place, as the PCIe share reads the missed
-/// experts: its own runtime's host USM, and on a CUDA or HIP GPU any pinned or registered host memory (mapped at the
-/// same address).  A Level Zero GPU reads neither another context's host USM nor a registration for copies.
+/// experts: host USM of its own runtime.  A CUDA or HIP GPU also reads host memory registered on it (host_register,
+/// mapped at the same address: kernels_read_registered); a Level Zero GPU reads neither another context's host USM
+/// nor a registration, which is for copies only.
 bool kernels_read_host(const void* p);
+bool kernels_read_registered();
 
 /// Synchronous copy, ordered after the work already on the compute queue (the CUDA legacy stream).
 bool copy(void* dst, const void* src, size_t bytes);
@@ -105,6 +107,9 @@ bool device_speed(int device, int* units, int* khz);
 /// Registers pageable memory for fast device copies (cudaHostRegister).  Registered memory is a copy source or
 /// destination only: kernels cannot address it (docs/XE.md, Runtime contract).
 bool host_register(void* p, size_t bytes);
+/// The same on engine device `device` instead of the current one.
+bool host_register_on(int device, void* p, size_t bytes);
+void host_unregister_on(int device, void* p);
 void host_unregister(void* p);
 
 /// Runs `fn` on a host thread after the work already on `s`; later work on `s` waits for it (cudaLaunchHostFunc).

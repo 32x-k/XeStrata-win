@@ -6343,13 +6343,19 @@ int main(int argc, char** argv) {
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                     // the PCIe share's kernels read the missed experts where CUDA0's runtime allocated or registered
-                    // them: a Level Zero GPU cannot (an RTX 4070 then a B70: GPU page faults on those addresses, and
-                    // the first decode window waited 20 s for a layer that never rang), so the CPU takes them there
+                    // them: a CUDA or HIP GPU where they are registered on it too (the RAM copy is made after the
+                    // stages, so it is registered here), a Level Zero GPU not at all (an RTX 4070 then a B70: GPU page
+                    // faults on those addresses, and the first decode window waited 20 s for a layer that never rang),
+                    // so the CPU takes them where it cannot
                     const uint8_t* host_expert = nullptr;
                     for (int64_t l = gs.lb; host_expert == nullptr && l < gs.le; ++l)
                         for (int64_t e = 0; host_expert == nullptr && e < g.n_expert; ++e)
                             host_expert = srcp->device_alias(l, e);
-                    gs.pcie_reads = host_expert == nullptr || strata::gpu::kernels_read_host(host_expert);
+                    std::string reg_err;
+                    gs.pcie_reads = host_expert == nullptr || strata::gpu::kernels_read_host(host_expert) ||
+                                    (strata::gpu::kernels_read_registered() && srcp->register_on(gs.dev, reg_err) &&
+                                     srcp->registered_on(gs.dev));
+                    if (!reg_err.empty()) std::fprintf(stderr, "strata serve: layer split, CUDA%d: %s\n", gs.dev, reg_err.c_str());
                     if (!gs.pcie_reads && gs.pcie_frac > 0.0)
                         std::fprintf(stderr, "strata serve: layer split, CUDA%d: its kernels cannot read the experts in "
                                              "CUDA0's host memory: the CPU takes its missed experts (no PCIe share)\n",
