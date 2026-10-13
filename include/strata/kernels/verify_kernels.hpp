@@ -48,7 +48,8 @@ void gdn_step_tune(int conv_channels, int h_k, int h_v, void* stream);
 /// Whether side branches of a graph pay on this device: 16 rounds of eight small kernels in a row and three more,
 /// recorded in a row on `stream`, against the three as one on `stream` beside one on each of `side0` / `side1`
 /// (forked from `stream` and joined back, as the window's GDN layer branches), each graph replayed in turns; true when
-/// the branched graph takes at most 95% of the other's time.  Call it before any graph is recorded on these queues.
+/// the branched graph takes at most 95% of the other's time.  Measured once a device, the first call's answer kept for
+/// the later ones.  Call it before any graph is recorded on these queues.
 bool graph_branch_pays(void* stream, void* side0, void* side1);
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).

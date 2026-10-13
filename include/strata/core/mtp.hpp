@@ -178,6 +178,7 @@ private:
     uint64_t vram_ = 0;
     strata::gpu::Stream cs_ = nullptr;
     strata::gpu::Stream side_ = nullptr;   ///< the shared expert's branch of the draft graphs
+    bool side_branch_ = false;             ///< whether the draft graphs branch to side_ (where branches pay)
     strata::gpu::Graph* prefill_exec_[9] = {};
     strata::gpu::Graph* prefill_dev_exec_[9] = {};
     // --pipeline-windows 2 (chain_launch)

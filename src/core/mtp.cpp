@@ -349,6 +349,20 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         err = "mtp: stream";
         return false;
     }
+    // The shared expert on a side branch of the draft graphs where the graphs' branches pay on this device - the
+    // verify window's measurement (on the R9700 under Windows a branch cost the step 0.3 ms, the expert 0.04 ms in a
+    // row).  STRATA_MTP_SHARED_BRANCH=0|1 fixes the choice.
+    if (const char* v = std::getenv("STRATA_MTP_SHARED_BRANCH"); v != nullptr) {
+        side_branch_ = std::strtol(v, nullptr, 10) != 0;
+    } else {
+        strata::gpu::Stream probe = strata::gpu::stream_create();
+        try {
+            side_branch_ = probe != nullptr && strata::kernels::graph_branch_pays(cs_, side_, probe);
+        } catch (const std::exception&) {
+            side_branch_ = false;   // a device that cannot record such a graph keeps one queue
+        }
+        if (probe) strata::gpu::stream_destroy(probe);
+    }
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
     if (shared != nullptr)
         std::fprintf(stderr, "strata mtp: shared draft weights, %.0f MiB of private state and buffers\n",
@@ -708,13 +722,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         const bool multi = T > 1 && native_router_enabled() && native_moe_combine_enabled() && g.n_expert == 512 &&
                            K == 10;
         // The shared expert reads mixed_ (and xq_, x_bf16_, its scratch) and writes shared_ only: a branch beside the
-        // router and the routed experts, joined before the combine (upstream 4a5713fb).  STRATA_MTP_SHARED_BRANCH=0:
-        // one queue.
-        static const bool branch_on = [] {
-            const char* v = std::getenv("STRATA_MTP_SHARED_BRANCH");
-            return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-        }();
-        const bool branch = branch_on && side_ != nullptr;
+        // router and the routed experts, joined before the combine (upstream 4a5713fb), where branches pay (load).
+        const bool branch = side_branch_ && side_ != nullptr;
         if (branch && !strata::gpu::stream_fork(cs, side_)) {
             err = std::string("mtp: the shared expert's branch: ") + strata::gpu::last_error();
             return false;

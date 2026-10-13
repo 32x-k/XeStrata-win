@@ -666,16 +666,10 @@ void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* ga
          "gdn_step_norm_multi");
 }
 
-bool graph_branch_pays(void* stream, void* side0, void* side1) {
-#if defined(STRATA_ADAPTIVECPP)
-    (void) stream;
-    (void) side0;
-    (void) side1;
-    return false;
-#else
+#if !defined(STRATA_ADAPTIVECPP)
+namespace {
+bool measure_graph_branches(sycl::queue& q, sycl::queue* side[2]) {
     namespace sx = sycl::ext::oneapi::experimental;
-    auto& q = Q(stream);
-    sycl::queue* side[2] = {&Q(side0), &Q(side1)};
     float* buf = sycl::malloc_device<float>((size_t) 3 * 16 * 256, q);
     if (buf == nullptr) return false;
     // a kernel of a small projection's size (16 work-groups, a few microseconds)
@@ -733,6 +727,22 @@ bool graph_branch_pays(void* stream, void* side0, void* side1) {
     std::fprintf(stderr, "strata: graph side branches: %.1f us in a row, %.1f us branched: %s\n", t_min[0], t_min[1],
                  t_min[1] <= 0.95 * t_min[0] ? "used" : "not used");
     return t_min[1] <= 0.95 * t_min[0];
+}
+}  // namespace
+#endif
+
+bool graph_branch_pays(void* stream, void* side0, void* side1) {
+#if defined(STRATA_ADAPTIVECPP)
+    (void) stream;
+    (void) side0;
+    (void) side1;
+    return false;
+#else
+    auto& q = Q(stream);
+    sycl::queue* side[2] = {&Q(side0), &Q(side1)};
+    // measured once a device: the verify window and the draft layer both ask
+    static core::PerDevice<bool> answers;
+    return answers.get(q.get_device(), [&] { return measure_graph_branches(q, side); });
 #endif
 }
 
