@@ -20,12 +20,9 @@ else
 fi
 [ ${#files[@]} -gt 0 ] || { echo "nothing to lint"; exit 0; }
 all=("${files[@]}")
-# upstream's records (tools/lint/records.txt): gitleaks and reuse only
-mapfile -t records < <(grep -v -e '^#' -e '^$' "$C/records.txt")
+# another project's files in third_party/<area>/<project>/, kept as that project wrote them: gitleaks and reuse only
+# (XeStrata's patches there are linted as usual)
 mapfile -t files < <(printf '%s\n' "${files[@]}" | while read -r f; do
-  for r in "${records[@]}"; do [ "$f" = "$r" ] || [ "${f#"$r"/}" != "$f" ] && continue 2; done
-  # another project's files in third_party/<area>/<project>/, kept as that project wrote them: the same two lints
-  # (XeStrata's patches there are linted as usual)
   case "$f" in third_party/*/*/patches/*) ;; third_party/*/*/*) continue ;; esac
   echo "$f"
 done)

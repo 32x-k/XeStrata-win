@@ -291,7 +291,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
 # The models the engine runs other than Qwen3.8-Flash-Next (src/core/plain_model.cpp: `strata --native` with another
 # architecture): one GGUF file each, its size and SHA-256 at the pinned revision (the Hub's LFS pointers), no pack, no
 # PLE table, no MTP draft layer and no images yet.  "tested": the files this release was checked with (the rest use
-# the same tensor types, checked on those files and in the kernels' tests: bench/results).
+# the same tensor types, checked on those files and in the kernels' tests).
 _ORNITH = "ornith-ai/Ornith-1.5-35B-A3B-GGUF"
 _ORNITH_GSQ = "pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF"
 _LLMJP = "llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf"

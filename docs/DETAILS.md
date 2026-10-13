@@ -1279,7 +1279,7 @@ Switched off, the output is token-for-token the stock model's.
 **Measured upstream** (CUDA; Q2_0, fixed experts, 2,557 teacher-forced tokens of code, a document and a chat):
 the top-1 token changes at 10% of positions, the mean KL from the stock model is 0.063 nats (max 4.1),
 and perplexity is +15% on code, +2.3% on the document and +0.4% on the chat.
-Details: `bench/results/2026-09-27-esp/`.
+Details: upstream's `bench/results/2026-09-27-esp/`.
 On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#validation-inventory)).
 
 ---

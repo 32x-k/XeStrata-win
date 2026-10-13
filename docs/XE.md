@@ -63,7 +63,7 @@ The RTX 4070's serve follow-ups wait 222 and 253 ms, against upstream's 240 and 
 
 Not taken: the Windows implementation, upstream's `sycl/`, the HIP and CUDA kernels' tuning tables and the paths for GPUs there is no machine for (Pascal's rows table, gfx12's fused int8 prompt experts, gfx12's decode HC norm and folded flag waits, HIP layer-split defaults),
 the mixed expert profile upstream made for `sycl/` (generate's 32K decode: B70 −2.0%, RTX 4070 +6.2%, RX 9060 XT −5.3%),
-and what has nothing to act on in XeStrata (`STRATA_ADAPT_OVERLAP`, PcieAuto's share, skipping the GEMM operand staging, refilling lent slots by DMA).
+what has nothing to act on in XeStrata (`STRATA_ADAPT_OVERLAP`, PcieAuto's share, skipping the GEMM operand staging, refilling lent slots by DMA), and upstream's records (`bench/results`).
 
 ## Integration through Strata 0.1.42
 
@@ -78,7 +78,6 @@ The main ones:
 - `--aux-cpus` (opt-in), `--ple-io direct` falling back to mmap when it measures slow, the stager's RAM profile, the embedding buffer's reuse.
 - The memory guard (the cgroup limit and `--memory-limit-mib`), `--conversation-cache-min-tokens`, `--session-save-reclaim`, `logit_bias`, `strata --version`.
 - serve's changes (metrics in Prometheus' format, the Monitor's conversation-cache card, AMD GPU readings, the sampling fields, the tool list's order and more) and setup's (how the config is written, `--gguf-dir`, rotational disks, a VRAM reserve on a card that also drives a display, the worker count on hybrid CPUs and more).
-- Upstream's records (`bench/results`).
 
 Measured against upstream v0.1.42 on the three makers' GPUs (generate with five model files, serve, everyday use):
 the B70 and the RTX 4070 match or beat upstream in every cell; the RX 9060 XT does in every cell but generate's decode at
