@@ -177,7 +177,7 @@ class SuiteTests(unittest.TestCase):
 
 class RedactionTests(unittest.TestCase):
     def test_paths_names_ips_and_keys(self):
-        red = B.redactor(extra=["Jane Roe Laptop"], key="sk-secret-123456")
+        red = B.redactor(extra=["Jane Roe Laptop"], key="sk-secret-123456")  # gitleaks:allow (a made-up key)
         user = os.environ.get("USERNAME") or os.environ.get("USER") or "tester"
         cases = [r"C:\Users\someone_else\models\a.gguf", "/home/bob/strata/x.json", "/Users/alice/Library",
                  "peer 192.168.1.20 and 10.0.0.7 and 100.101.102.103", "Authorization: Bearer abcdefghijkl12345",
