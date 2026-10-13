@@ -129,7 +129,7 @@ bool blas(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, 
 std::string rocblas_lacks(const sycl::device& dev) {
     if (dev.get_backend() != sycl::backend::ext_oneapi_hip) return {};
     std::string arch = dev.get_info<sycl::info::device::version>();
-    arch = arch.substr(0, arch.find(':'));
+    if (const size_t colon = arch.find(':'); colon != std::string::npos) arch.resize(colon);
     if (arch.rfind("gfx", 0) != 0) return {};
     namespace fs = std::filesystem;
     fs::path dir;

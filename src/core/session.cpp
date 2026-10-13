@@ -229,8 +229,8 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
         // `moe_combine` needs the pool's answer and the pool needs the router's.
         auto capture = [&](bool post, strata::gpu::Graph** out, const char* what, int half = 0,
                            int stage_prefix = 0) -> bool {
-            strata::gpu::Stream cs = nullptr;
-            if (!(cs = strata::gpu::stream_create_capture())) {
+            strata::gpu::Stream cs = strata::gpu::stream_create_capture();
+            if (cs == nullptr) {
                 err = std::string("session_capture: stream create failed");
                 return false;
             }
@@ -956,7 +956,7 @@ bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64
                     return block_layer_pre(tables, g, layer, pos, pos_base, s.gdn, qst, s.qsa_bufs, s.moe, s.k,
                                            s.block, cs, err, nullptr, s.ple.ready() ? &s.ple : nullptr);
                 })) {
-                err = "session_token_pool: pre layer " + std::to_string(layer) + ": " + err;
+                err.insert(0, "session_token_pool: pre layer " + std::to_string(layer) + ": ");
                 return false;
             }
             if (qsa) ++qsa_index;
@@ -998,7 +998,7 @@ bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64
                     }
                     return block_layer_post(tables, g, layer, s.k, s.moe, s.block, parts, cs, err);
                 })) {
-                err = "session_token_pool: post layer " + std::to_string(layer) + ": " + err;
+                err.insert(0, "session_token_pool: post layer " + std::to_string(layer) + ": ");
                 return false;
             }
             // Copy before the next pre can replace R. The final drain keeps the entire host ladder alive.

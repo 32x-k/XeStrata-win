@@ -8,9 +8,11 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -157,7 +159,11 @@ struct DirectFile::Impl {
 
 DirectFile::DirectFile() : impl_(new Impl) {}
 DirectFile::~DirectFile() {
-    close();
+    try {
+        close();
+    } catch (const std::exception& e) {   // a destructor does not throw: the handles go with the process
+        std::fprintf(stderr, "DirectFile: close failed (%s)\n", e.what());
+    }
     for (Req* r : impl_->all_reqs) delete r;
     delete impl_;
 }
