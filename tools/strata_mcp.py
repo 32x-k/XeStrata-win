@@ -391,6 +391,13 @@ class Strata:
 
     # ---- paths
     def settings_path(self) -> Path:
+        # the checkout's serve/places.py (the user's folders on Linux and on Windows)
+        places = self.root / "serve" / "places.py"
+        spec = importlib.util.spec_from_file_location("strata_places_for_mcp", places) if places.is_file() else None
+        if spec is not None and spec.loader is not None:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.settings_path()
         return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "xestrata" / "settings.json"
 
     def data_dir(self) -> Path:

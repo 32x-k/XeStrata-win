@@ -60,23 +60,20 @@ import zipfile
 from pathlib import Path
 from typing import Any, NoReturn
 
-from serve import release_check
+from serve import places, release_check
 
 ROOT = Path(__file__).resolve().parent
 
 
-def xdg_dir(var: str, default: str) -> Path:
-    return Path(os.environ.get(var) or Path.home() / default) / "xestrata"
-
-
 # A deb or rpm package installs this folder read-only (/usr/share/xestrata) with a PACKAGED record (where the engine
-# package puts the engine).  Then nothing is compiled, the Python packages are the distribution's, and what setup
-# writes for a model (its config, the logs) goes to the user's XDG folders instead of next to this file.
+# package puts the engine), and so does the Windows 7z.  Then nothing is compiled, the Python packages are the
+# distribution's (or the 7z's), and what setup writes for a model (its config, the logs) goes to the user's folders
+# (serve/places.py) instead of next to this file.
 PACKAGED: dict[str, Any] | None = None
 if (ROOT / "PACKAGED").is_file():
     PACKAGED = json.loads((ROOT / "PACKAGED").read_text(encoding="utf-8"))
-CONF = xdg_dir("XDG_CONFIG_HOME", ".config") if PACKAGED else ROOT        # the model configs, xestrata-<model>.json
-STATE = xdg_dir("XDG_STATE_HOME", ".local/state") if PACKAGED else ROOT   # the logs, and the engine's working folder
+CONF = places.user_dir("config") if PACKAGED else ROOT   # the model configs, xestrata-<model>.json
+STATE = places.user_dir("state") if PACKAGED else ROOT    # the logs, and the engine's working folder
 SETUP_CMD = "xestrata" if PACKAGED else "./setup.sh"
 # Every Hugging Face file comes from a fixed commit of its repository (the `sha` of
 # https://huggingface.co/api/models/<repo> when it was pinned, upstream #214), so a checkout installs the same files
@@ -2222,8 +2219,7 @@ def memlock_gib() -> float:
 
 
 def settings_path() -> Path:
-    # its own, not upstream Strata's (~/.config/strata): the two keep their data folders apart
-    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "xestrata" / "settings.json"
+    return places.settings_path()
 
 
 def load_settings() -> dict:
@@ -2331,8 +2327,8 @@ def repoint_config(cfg_file: Path, old: Path, new: Path) -> None:
 
 def default_data_dir() -> Path:
     """Where the model files go unless the settings name a folder: next to this Strata folder, or for a package (whose
-    folder is read-only) in the user's XDG data folder."""
-    return xdg_dir("XDG_DATA_HOME", ".local/share") if PACKAGED else ROOT.parent / "XeStrata-data"
+    folder is read-only) in the user's data folder (serve/places.py)."""
+    return places.user_dir("data") if PACKAGED else ROOT.parent / "XeStrata-data"
 
 
 def data_folder_path(requested: str | None, settings: dict) -> Path:
