@@ -379,29 +379,72 @@ VEXE = {k: v + (".exe" if WIN else "") for k, v in
 
 
 # ------------------------------------------------------------------------------------------------ output
+# --json: for a front end (the Windows launcher, xestrata.exe), every message is one JSON object a line on stdout:
+#   {"type": "say" | "ok" | "warn", "text": ...}, {"type": "step", "n": ..., "title": ...},
+#   {"type": "fail", "text": ..., "hint": ...} (then setup exits with 1),
+#   {"type": "progress", "what": ..., "done": bytes, "total": bytes or 0},
+#   {"type": "log", "text": ...} (a line a program setup runs printed),
+#   {"type": "ask", "question": ..., "choices": [...], "default": ...}: the answer is one line on stdin.
+# A line that is not a JSON object is plain log text.  Read from the command line before anything is printed.
+JSON_OUT = "--json" in sys.argv[1:]
+
+
+def emit(obj: dict) -> None:
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+
 def say(msg=""):
-    print(msg, flush=True)
+    if JSON_OUT:
+        emit({"type": "say", "text": msg})
+    else:
+        print(msg, flush=True)
 
 
 def step(n, title):
+    if JSON_OUT:
+        emit({"type": "step", "n": n, "title": title})
+        return
     say()
     say(f"=== Step {n}: {title} ===")
 
 
 def ok(msg):
-    say(f"  [ok] {msg}")
+    if JSON_OUT:
+        emit({"type": "ok", "text": msg})
+    else:
+        say(f"  [ok] {msg}")
 
 
 def warn(msg):
-    say(f"  [!]  {msg}")
+    if JSON_OUT:
+        emit({"type": "warn", "text": msg})
+    else:
+        say(f"  [!]  {msg}")
 
 
 def fail(msg, hint=None) -> NoReturn:
+    if JSON_OUT:
+        emit({"type": "fail", "text": msg, "hint": hint})
+        sys.exit(1)
     say(f"\n  [X]  {msg}")
     if hint:
         say(f"       {hint}")
     say("\nSetup stopped. Fix the item above and run it again - everything already done is kept and skipped.")
     sys.exit(1)
+
+
+def progress(what: str, have: int, total: int) -> None:
+    """A download's progress: a line rewritten in place, or a progress object."""
+    if JSON_OUT:
+        emit({"type": "progress", "what": what, "done": have, "total": total})
+        return
+    size = f"{have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)" if total else f"{have / 1e6:7.1f} MB"
+    print(f"\r  {what}: {size}   ", end="", flush=True)
+
+
+def progress_end() -> None:
+    if not JSON_OUT:
+        print()
 
 
 def flush_typed_ahead() -> None:
@@ -423,7 +466,11 @@ def ask(question, choices, default, yes):
     flush_typed_ahead()
     while True:
         try:
-            a = input(f"{question} [{default}]: ").strip()
+            if JSON_OUT:
+                emit({"type": "ask", "question": question, "choices": list(choices), "default": default})
+                a = input().strip()
+            else:
+                a = input(f"{question} [{default}]: ").strip()
         except EOFError:
             return default
         if not a:
@@ -435,6 +482,15 @@ def ask(question, choices, default, yes):
 
 def run(cmd, cwd=None, env=None, check=True, quiet=False):
     say("  > " + " ".join(str(c) for c in cmd))
+    if JSON_OUT and not quiet:                         # the program's lines as log objects, not loose on stdout
+        with subprocess.Popen([str(c) for c in cmd], cwd=cwd, env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, errors="replace") as p:
+            for line in p.stdout or []:
+                emit({"type": "log", "text": line.rstrip("\n")})
+        r = subprocess.CompletedProcess(p.args, p.returncode)
+        if check and r.returncode != 0:
+            fail(f"command failed (exit {r.returncode}): {Path(str(cmd[0])).name}")
+        return r
     r = subprocess.run([str(c) for c in cmd], cwd=cwd, env=env,
                        stdout=subprocess.PIPE if quiet else None, stderr=subprocess.STDOUT if quiet else None,
                        text=True)
@@ -1272,14 +1328,12 @@ def download(url, dst: Path, what=None):
                     have += len(b)
                     if time.time() - last > 2:
                         last = time.time()
-                        size = f"{have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)" if total \
-                            else f"{have / 1e6:7.1f} MB"
-                        print(f"\r  {what or dst.name}: {size}   ", end="", flush=True)
-            print()
+                        progress(what or dst.name, have, total)
+            progress_end()
             if not total or have >= total:
                 break
         except OSError as e:
-            print()
+            progress_end()
             warn(f"download interrupted ({e}); retrying in 10 s ...")
             time.sleep(10)
     if total and part.stat().st_size != total:
@@ -3752,6 +3806,9 @@ def main() -> int:
                          "total throughput for a model that fits fewer cards; each replica holds its own copy of the "
                          "model in RAM and VRAM)")
     ap.add_argument("--yes", action="store_true", help="accept the recommended answers")
+    ap.add_argument("--json", action="store_true",
+                    help="one JSON object a line for a front end (the Windows launcher): messages, steps, progress and "
+                         "questions, whose answers are read as lines on stdin")
     ap.add_argument("--setup", action="store_true", help="install another model or change settings")
     ap.add_argument("--no-start", action="store_true", help="install only, do not start the model")
     ap.add_argument("--update", action="store_true",
