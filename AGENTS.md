@@ -71,7 +71,8 @@ Each file carries the license of the code in it, by where that code comes from:
 - Mixed: a file from a project under a permissive license (Strata, ggml / llama.cpp: MIT) that XeStrata has changed, or a file of XeStrata's with code transcribed from such a project (the kernels in `src/` that follow ggml, for example).
   The original code keeps its copyright and license; XeStrata's changes and the file as a whole are under the LGPL. The file names both copyright holders and both licenses, and keeps the original notice comment.
 - Unchanged: a file from such a project that XeStrata has not changed (Strata's files as upstream has them, upstream's data files) keeps its own license and copyright only, without XeStrata's line.
-- A file is changed when its content, apart from the SPDX header XeStrata adds, differs from the upstream version XeStrata has integrated (`STRATA_UPSTREAM_VERSION`). An upstream sync that brings a file back to upstream's content makes it unchanged again; a change of XeStrata's to an unchanged file makes it mixed.
+- A file is changed when its content, apart from the SPDX header XeStrata adds, differs from the upstream version XeStrata has integrated (`STRATA_UPSTREAM_VERSION`): from upstream's file at the same path, or from a file of the same content elsewhere (a rename); a file of Strata's that upstream has removed, from the content it last had there. One that XeStrata renamed and changed is mixed. An upstream sync that brings a file back to upstream's content makes it unchanged again; a change of XeStrata's to an unchanged file makes it mixed.
+- `tools/license_class.py` checks each file's header (or its `REUSE.toml` annotation) against its class, and `--fix` rewrites the headers that differ; `tools/lint/run.sh` runs the check.
 - Exceptions: XeStrata's changes to oneMath (below) and its patches to intel/llvm (`third_party/main/intel-llvm/patches/`, Apache-2.0 WITH LLVM-exception) stay under those projects' licenses, even when MistVVK writes them.
 
 Material from other projects goes into `third_party/`, one folder per project with its license text, and is listed in that folder's README:
@@ -143,6 +144,7 @@ It picks the lints by file kind, with the configurations in `tools/lint/`:
 | CSS / JavaScript / HTML | stylelint, eslint, tidy |
 | all text files | codespell |
 | every file | gitleaks (built-in rules, no configuration of its own) |
+| every file | `tools/license_class.py` (the license classes, see Licenses above) |
 | the whole repository | `reuse lint` (see Licenses above) |
 
 The files a change touches must get no new findings; findings that were there before may stay.

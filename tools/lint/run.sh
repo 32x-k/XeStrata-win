@@ -103,6 +103,9 @@ for f in "${all[@]}"; do
   gitleaks detect --no-git --redact --no-banner --exit-code 1 --source "$f" >/dev/null 2>&1 \
     || { echo "== gitleaks: a possible secret in $f (gitleaks detect --no-git --redact --source $f)"; status=1; }
 done
+# each file's SPDX header against where its code comes from (AGENTS.md, Licenses)
+echo "== license classes"
+python3 tools/license_class.py "${all[@]}" || status=1
 REUSE=$(command -v reuse || echo .lint/venv/bin/reuse)
 run reuse "$REUSE" lint --quiet
 exit $status
