@@ -4589,6 +4589,13 @@ int main(int argc, char** argv) {
             o.expert_cache = (int) fit;
         }
     }
+    // the speculative loop and the serve path read the residency table, which an empty cache does not have: say so now,
+    // before a long prompt is read for nothing (an 8 GB card at a 262K context, its KV cache in VRAM: four minutes)
+    if (o.spec > 0 && o.expert_cache == 0) {
+        std::fprintf(stderr, "strata generate: --spec %d needs an expert cache, and this card has no VRAM left for one "
+                             "(see above): stopping before the prompt\n", o.spec);
+        return 2;
+    }
     // plan v0.3 P6: a native pack's blobs differ per layer, so the same VRAM holds more experts than slots of the
     // largest blob would (~30% more IQ3_XXS).  The shared cache sizes its slots in profile order.  That list does not
     // match --expert-cache-per-layer, whose range for a layer is layer * quota + n: a size cut for one layer could
