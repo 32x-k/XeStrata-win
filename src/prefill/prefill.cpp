@@ -187,14 +187,17 @@ inline int bf16x2_mode() {
 inline bool bf16x2() { return bf16x2_mode() != 0; }
 inline bool bf16x2_hc() { return bf16x2_mode() == 1; }
 // A small card's prompt chunk is what its buffers leave room for, and every chunk streams the experts again (an
-// 8 GB RTX 4070 at a 64K prompt: 2048-token chunks, 291 tok/s against 1,066 with 12 GB).  The hyper-connection
-// block's rows (xn16, lo, lo16, gated: written and read before a half's GDN, QSA or MoE work starts, and xn16 again
-// after it ends) live in the region that work uses (STRATA_PREFILL_HC_IN_REGION=0: their own place).
+// 8 GB RTX 4070 at a 64K prompt: 2048-token chunks, 291 tok/s against 1,066 with 12 GB).  Two places the buffers
+// overlap: the hyper-connection block's rows (xn16, lo, lo16, gated: written and read before a half's GDN, QSA or MoE
+// work starts, and xn16 again after it ends) live in the region that work uses (STRATA_PREFILL_HC_IN_REGION=0: their
+// own place); the FP16 experts' input rows (Xs) live in the upper half of their down outputs' rows (Dm), each group's
+// down written after its gate/up read them, the rows in ascending order (STRATA_PREFILL_XS_IN_DM=0: their own place).
 inline bool env_off(const char* name) {
     const char* v = std::getenv(name);
     return v != nullptr && std::strtol(v, nullptr, 10) == 0;
 }
 inline bool hc_in_region() { static const bool v = !env_off("STRATA_PREFILL_HC_IN_REGION"); return v; }
+inline bool xs_in_dm() { static const bool v = !env_off("STRATA_PREFILL_XS_IN_DM"); return v; }
 // Experts dequantized (FP16) before one grouped product: G of them take G x 9.4 MiB (--prefill-experts)
 int g_expert_group = 16;
 constexpr int64_t GU_ELEMS = 1280ll * 2560, D_ELEMS = 2560ll * 640;
@@ -721,7 +724,10 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
     a.take<float>(T * K * N, ok); a.take<float>(T * 640, ok);
     a.take<float>(T * 640, ok); a.take<uint16_t>(T * 640, ok); a.take<float>(T * N, ok); a.take<float>(T, ok);
     Alloc q8 = a;
-    if (mp.fallback) { a.take<uint16_t>(T * K * N, ok); a.take<uint16_t>(T * K * 640, ok); }
+    if (mp.fallback) {
+        if (!xs_in_dm()) a.take<uint16_t>(T * K * N, ok);
+        a.take<uint16_t>(T * K * 640, ok);
+    }
     if (mp.any) {
         q8.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
         q8.take<float>(T * K * 640, ok);
@@ -938,7 +944,9 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
         // the experts' rows: FP16 (Xs, Hh) or int8 (Xq, H, Hq), at the same place (see moe_set_bytes)
         Alloc q8 = c;
-        m.Xs = mp.fallback ? c.take<uint16_t>(T * K * N, ok) : nullptr;
+        // the upper half of Dm's T*K rows of N floats holds the T*K rows of N halves
+        m.Xs = !mp.fallback ? nullptr : xs_in_dm() && m.Dm ? reinterpret_cast<uint16_t*>(m.Dm) + T * K * N
+                                                            : c.take<uint16_t>(T * K * N, ok);
         m.Hh = mp.fallback ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
         if (mp.any) {
             m.Xq = q8.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
