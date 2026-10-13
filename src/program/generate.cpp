@@ -1006,15 +1006,21 @@ static uint64_t file_tier_activity() {
         const char* p = std::strrchr(buf, ')');
         if (p != nullptr && n > 0) {
             // after "(comm)": state ppid pgrp session tty tpgid flags minflt cminflt majflt
-            unsigned long long majflt = 0;
-            if (std::sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %llu", &majflt) == 1) total += majflt;
+            const char* q = p + 1;
+            for (int field = 0; field < 9 && q != nullptr; ++field) q = std::strchr(q + 1, ' ');
+            char* end = nullptr;
+            const unsigned long long majflt = q != nullptr ? std::strtoull(q, &end, 10) : 0;
+            if (q != nullptr && end != q) total += majflt;
         }
     }
     if (FILE* f = std::fopen("/proc/self/io", "r")) {
         char line[256];
         while (std::fgets(line, sizeof(line), f) != nullptr) {
-            unsigned long long v = 0;
-            if (std::sscanf(line, "read_bytes: %llu", &v) == 1) total += v >> 20;   // MiB
+            static const char key[] = "read_bytes:";
+            if (std::strncmp(line, key, sizeof key - 1) != 0) continue;
+            char* end = nullptr;
+            const unsigned long long v = std::strtoull(line + sizeof key - 1, &end, 10);
+            if (end != line + sizeof key - 1) total += v >> 20;   // MiB
         }
         std::fclose(f);
     }
@@ -2045,8 +2051,8 @@ int main(int argc, char** argv) {
             }
             have_tokens = true;
         }
-        else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
-        else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
+        else if (a == "--max-new") o.max_new = std::strtoll(next("--max-new"), nullptr, 10);
+        else if (a == "--max-context") o.max_context = std::strtoll(next("--max-context"), nullptr, 10);
         else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
         else if (a == "--rope-scale") o.rope_scale = std::strtod(next("--rope-scale"), nullptr);
         else if (a == "--rope-freq-base") o.rope_freq_base = std::strtod(next("--rope-freq-base"), nullptr);
@@ -2057,10 +2063,10 @@ int main(int argc, char** argv) {
         else if (a == "--yarn-beta-fast") o.yarn_beta_fast = std::strtod(next("--yarn-beta-fast"), nullptr);
         else if (a == "--yarn-beta-slow") o.yarn_beta_slow = std::strtod(next("--yarn-beta-slow"), nullptr);
         else if (a == "--greedy") o.greedy = true;
-        else if (a == "--seed") { o.seed = (uint64_t) std::atoll(next("--seed")); o.greedy = false; }
-        else if (a == "--top-k") o.top_k = std::atoi(next("--top-k"));
-        else if (a == "--top-p") o.top_p = (float) std::atof(next("--top-p"));
-        else if (a == "--temperature") o.temperature = (float) std::atof(next("--temperature"));
+        else if (a == "--seed") { o.seed = (uint64_t) std::strtoll(next("--seed"), nullptr, 10); o.greedy = false; }
+        else if (a == "--top-k") o.top_k = (int) std::strtol(next("--top-k"), nullptr, 10);
+        else if (a == "--top-p") o.top_p = (float) std::strtod(next("--top-p"), nullptr);
+        else if (a == "--temperature") o.temperature = (float) std::strtod(next("--temperature"), nullptr);
         else if (a == "--dump-logits") o.dump_logits = next("--dump-logits");
         else if (a == "--logits-stride") {
             if (have_logits_stride) { std::fprintf(stderr, "--logits-stride must be supplied only once\n"); return 2; }
@@ -2078,12 +2084,12 @@ int main(int argc, char** argv) {
         else if (a == "--no-ple") o.no_ple = true;
         else if (a == "--ple-io") { o.ple_io = next("--ple-io"); o.ple_io_explicit = true; }
         else if (a == "--embd-gguf") o.embd_gguf = next("--embd-gguf");
-        else if (a == "--ple-row-cache") o.ple_row_cache = std::atoll(next("--ple-row-cache"));
-        else if (a == "--ple-inflight") o.ple_inflight = std::atoi(next("--ple-inflight"));
-        else if (a == "--ple-delay-us") o.ple_delay_us = std::atof(next("--ple-delay-us"));
+        else if (a == "--ple-row-cache") o.ple_row_cache = std::strtoll(next("--ple-row-cache"), nullptr, 10);
+        else if (a == "--ple-inflight") o.ple_inflight = (int) std::strtol(next("--ple-inflight"), nullptr, 10);
+        else if (a == "--ple-delay-us") o.ple_delay_us = std::strtod(next("--ple-delay-us"), nullptr);
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
         else if (a == "--kv") o.kv = next("--kv");
-        else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
+        else if (a == "--kv-resident") o.kv_resident = std::strtoll(next("--kv-resident"), nullptr, 10);
         else if (a == "--kv-grow") o.kv_grow = 1;
         else if (a == "--no-kv-grow") o.kv_grow = 0;
         else if (a == "--stream-token") o.stream_token = true;
@@ -2111,7 +2117,7 @@ int main(int argc, char** argv) {
         else if (a == "--stage-timing") o.stage_timing = true;
         else if (a == "--graph-only") o.graph_only = true;
         else if (a == "--gpu-only-full") o.gpu_only_full = true;
-        else if (a == "--pool-workers") o.pool_workers = std::atoi(next("--pool-workers"));
+        else if (a == "--pool-workers") o.pool_workers = (int) std::strtol(next("--pool-workers"), nullptr, 10);
         else if (a == "--aux-cpus") {
             o.aux_cpus = next("--aux-cpus");
             std::string aerr;
@@ -2134,11 +2140,11 @@ int main(int argc, char** argv) {
         else if (a == "--no-host-worker") o.no_host_worker = true;
         else if (a == "--expert-cache") {
             const std::string v = next("--expert-cache");
-            o.expert_cache = (v == "auto") ? -1 : std::atoi(v.c_str());
+            o.expert_cache = (v == "auto") ? -1 : (int) std::strtol(v.c_str(), nullptr, 10);
         }
-        else if (a == "--expert-cache-device1") o.expert_cache_remote[0] = std::atoi(next("--expert-cache-device1"));
-        else if (a == "--expert-cache-device2") o.expert_cache_remote[1] = std::atoi(next("--expert-cache-device2"));
-        else if (a == "--expert-cache-device3") o.expert_cache_remote[2] = std::atoi(next("--expert-cache-device3"));
+        else if (a == "--expert-cache-device1") o.expert_cache_remote[0] = (int) std::strtol(next("--expert-cache-device1"), nullptr, 10);
+        else if (a == "--expert-cache-device2") o.expert_cache_remote[1] = (int) std::strtol(next("--expert-cache-device2"), nullptr, 10);
+        else if (a == "--expert-cache-device3") o.expert_cache_remote[2] = (int) std::strtol(next("--expert-cache-device3"), nullptr, 10);
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
         else if (a == "--vram-elastic") o.vram_elastic = true;
@@ -2152,14 +2158,14 @@ int main(int argc, char** argv) {
         else if (a == "--prefill") {
             const std::string v = next("--prefill");
             o.prefill_auto = v == "auto";
-            o.prefill_chunk = o.prefill_auto ? 8192 : std::atoll(v.c_str());
+            o.prefill_chunk = o.prefill_auto ? 8192 : std::strtoll(v.c_str(), nullptr, 10);
         }
         else if (a == "--no-split-rows") o.no_split_rows = true;
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
-        else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));
+        else if (a == "--prefill-until") o.prefill_until = std::strtoll(next("--prefill-until"), nullptr, 10);
         else if (a == "--prefill-experts") o.prefill_experts = (int) std::strtol(next("--prefill-experts"), nullptr, 10);
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
-        else if (a == "--spec") o.spec = std::atoi(next("--spec"));
+        else if (a == "--spec") o.spec = (int) std::strtol(next("--spec"), nullptr, 10);
         else if (a == "--batch" || a == "--slots") o.batch = (int) std::strtol(next(a.c_str()), nullptr, 10);
         else if (a == "--batch-groups") {
             const char* bgv = next(a.c_str());
@@ -2180,17 +2186,17 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
-        else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
+        else if (a == "--spec-corrupt") o.spec_corrupt = (int) std::strtol(next("--spec-corrupt"), nullptr, 10);
         else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
         else if (a == "--window-hashes") o.window_hashes = next("--window-hashes");
         else if (a == "--mtp") o.mtp = next("--mtp");
-        else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
-        else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
-        else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
+        else if (a == "--mtp-window") o.mtp_window = std::strtoll(next("--mtp-window"), nullptr, 10);
+        else if (a == "--pcie-frac") o.pcie_frac = std::strtod(next("--pcie-frac"), nullptr);
+        else if (a == "--adapt-every") o.adapt_every = (int) std::strtol(next("--adapt-every"), nullptr, 10);
         else if (a == "--adapt-decay") o.adapt_decay = std::strtof(next("--adapt-decay"), nullptr);
         else if (a == "--adapt-min-gain") o.adapt_min_gain = std::strtof(next("--adapt-min-gain"), nullptr);
         else if (a == "--adapt-async") o.adapt_async = std::strtol(next("--adapt-async"), nullptr, 10) != 0 ? 1 : 0;
-        else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
+        else if (a == "--spec-min-p") o.spec_min_p = std::strtod(next("--spec-min-p"), nullptr);
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
@@ -2201,7 +2207,7 @@ int main(int argc, char** argv) {
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
-        else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
+        else if (a == "--prompt-cache") o.prompt_cache = std::max(0, (int) std::strtol(next("--prompt-cache"), nullptr, 10));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
                  a == "--conversation-save-checkpoints" ||
@@ -2232,17 +2238,17 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-save") o.conversation_save = next("--conversation-save");
         else if (a == "--conversation-save-compress") o.conversation_save_compress = true;
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
-        else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
-        else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
-        else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
-        else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
+        else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::strtoll(next("--prompt-cache-every"), nullptr, 10));
+        else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::strtoll(next("--prompt-cache-root"), nullptr, 10));
+        else if (a == "--turn-token") o.turn_token = std::strtoll(next("--turn-token"), nullptr, 10);
+        else if (a == "--tail-role-token") o.tail_role_token = std::strtoll(next("--tail-role-token"), nullptr, 10);
         else if (a == "--short-read") {
-            o.short_read = std::max(0LL, std::atoll(next("--short-read")));
+            o.short_read = std::max(0LL, std::strtoll(next("--short-read"), nullptr, 10));
             o.short_read_given = true;
         }
         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::min(2, (int) std::strtol(next("--pipeline-windows"), nullptr, 10)));
-        else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
-        else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
+        else if (a == "--suffix-draft") o.suffix_draft = std::max(0, (int) std::strtol(next("--suffix-draft"), nullptr, 10));
+        else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, (int) std::strtol(next("--mtp-max-t"), nullptr, 10));
         else if (a == "--lookup-chain") o.lookup_chain = std::clamp((int) std::strtol(next("--lookup-chain"), nullptr, 10), 0, 7);
         else if (a == "--lookup-chain-min") o.lookup_chain_min = std::max(3, (int) std::strtol(next("--lookup-chain-min"), nullptr, 10));
         else if (a == "--mtp-hnorm") {
@@ -2270,8 +2276,8 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--control-vector-layer-range") {
-            o.cvec_first = std::atoi(next("--control-vector-layer-range"));
-            o.cvec_last = std::atoi(next("--control-vector-layer-range"));
+            o.cvec_first = (int) std::strtol(next("--control-vector-layer-range"), nullptr, 10);
+            o.cvec_last = (int) std::strtol(next("--control-vector-layer-range"), nullptr, 10);
         }
         else if (a == "--cvec-mode") {
             const std::string m = next("--cvec-mode");
@@ -2282,7 +2288,7 @@ int main(int argc, char** argv) {
         else if (a == "--cvec-dir") {
             const std::string d = next("--cvec-dir");
             if (d == "per-layer") o.cvec_single = -1;
-            else if (d.rfind("single:", 0) == 0) o.cvec_single = std::atoi(d.c_str() + 7);
+            else if (d.rfind("single:", 0) == 0) o.cvec_single = (int) std::strtol(d.c_str() + 7, nullptr, 10);
             else { std::fprintf(stderr, "--cvec-dir: per-layer or single:L, got '%s'\n", d.c_str()); return 2; }
         }
         else if (a == "--no-spec-split") o.spec_split = false;
@@ -2291,7 +2297,7 @@ int main(int argc, char** argv) {
             if (!parse_i64_list(next("--eos-ids"), o.eos_ids, e)) { std::fprintf(stderr, "--eos-ids: %s\n", e.c_str()); return 2; }
             o.stop_eos = true;
         }
-        else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
+        else if (a == "--adapt-swaps") o.adapt_swaps = (int) std::strtol(next("--adapt-swaps"), nullptr, 10);
         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
@@ -2402,7 +2408,7 @@ int main(int argc, char** argv) {
                 if (b == std::string::npos) b = str.size();
                 const std::string t = str.substr(a, b - a);
                 if (t.empty() || t.find_first_not_of("0123456789") != std::string::npos) return false;
-                out.push_back((V) std::atoll(t.c_str()));
+                out.push_back((V) std::strtoll(t.c_str(), nullptr, 10));
                 a = b + 1;
             }
             return !out.empty();
@@ -4676,7 +4682,7 @@ int main(int argc, char** argv) {
         // With `--expert-cache auto` the reserve must still be free once the slots are written. Zero the slots,
         // check free memory again, and reopen a smaller cache if the reserve is short.
         // STRATA_TEST_CACHE_FAIL=N: the first N opens fail as an out-of-commit cudaMalloc does (tests the retry)
-        int fake_fails = std::getenv("STRATA_TEST_CACHE_FAIL") ? std::atoi(std::getenv("STRATA_TEST_CACHE_FAIL")) : 0;
+        int fake_fails = std::getenv("STRATA_TEST_CACHE_FAIL") ? (int) std::strtol(std::getenv("STRATA_TEST_CACHE_FAIL"), nullptr, 10) : 0;
         int failed = 0;
         for (int attempt = 0;; ++attempt) {
             bool ok = false;
@@ -7712,11 +7718,11 @@ int main(int argc, char** argv) {
         // part was doing (stall_report), so one occurrence says where the wait is.
         {
             const char* ws = std::getenv("STRATA_WATCHDOG_S");
-            const int limit = ws ? std::atoi(ws) : 60;   // one step (a prompt layer, a verify window) takes seconds
+            const int limit = ws ? (int) std::strtol(ws, nullptr, 10) : 60;   // one step (a prompt layer, a verify window) takes seconds
             // #1407: while the OS is still reading the file tier (major faults / bytes read advance), a silent step is
             // slow, not stuck; it gets up to STRATA_WATCHDOG_IO_S (default 10 x the limit) of such time. 0 = no allowance.
             const char* wio = std::getenv("STRATA_WATCHDOG_IO_S");
-            const int io_limit = wio ? std::atoi(wio) : limit * 10;
+            const int io_limit = wio ? (int) std::strtol(wio, nullptr, 10) : limit * 10;
             if (limit > 0)
                 std::thread([limit, io_limit] {
                     strata::aux_cpus::pin_current_thread();
@@ -8777,14 +8783,14 @@ int main(int argc, char** argv) {
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
-                    else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "cvec") req_cvec = (int) std::strtol(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "ckpt") req_ckpt = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::strtoll(tok.c_str() + eq + 1, nullptr, 10));
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
-                    else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "top_k") req_top_k = (int) std::strtol(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "min_p") req_min_p = fv;
-                    else if (key == "penalty_last_n") req_penalty_last_n = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "penalty_last_n") req_penalty_last_n = (int) std::strtol(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "logprobs") req_logprobs = (int) std::clamp(std::strtol(tok.c_str() + eq + 1, nullptr, 10), -1L, 20L);
                     else if (key == "penalty_repeat") req_penalty_repeat = fv;
                     else if (key == "penalty_freq") req_penalty_freq = fv;
@@ -11779,7 +11785,7 @@ int main(int argc, char** argv) {
             long long swap_kb = -1;
             std::ifstream st("/proc/self/status");
             for (std::string l; std::getline(st, l);)
-                if (l.rfind("VmSwap:", 0) == 0) swap_kb = std::atoll(l.c_str() + 7);
+                if (l.rfind("VmSwap:", 0) == 0) swap_kb = std::strtoll(l.c_str() + 7, nullptr, 10);
             std::printf("%-24s %lld major page faults while decoding; %lld MiB of this process in swap\n",
                         "host memory", major_faults() - majflt0, swap_kb < 0 ? -1 : swap_kb / 1024);
         }

@@ -469,9 +469,9 @@ int main(int argc, char** argv) {
         else if (a == "--ram-time" && i + 1 < argc) ram_path = argv[++i];
         else if (a == "--dir" && i + 1 < argc) dir = argv[++i];
         else if (a == "--gguf" && i + 1 < argc) gguf = argv[++i];
-        else if (a == "--rows" && i + 1 < argc) rows = std::atoi(argv[++i]);
+        else if (a == "--rows" && i + 1 < argc) rows = (int) std::strtol(argv[++i], nullptr, 10);
         else if (a == "--tokens" && i + 1 < argc) tokens = argv[++i];
-        else if (a == "--inflight" && i + 1 < argc) inflight = (uint32_t) std::atoi(argv[++i]);
+        else if (a == "--inflight" && i + 1 < argc) inflight = (uint32_t) std::strtoul(argv[++i], nullptr, 10);
         else if (a == "--direct-first") direct_first = true;
         else if (a == "--direct-only") direct_only = true;
         else if (a == "--sync") sync_submit = true;

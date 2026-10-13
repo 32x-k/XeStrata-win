@@ -1832,7 +1832,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // for tools/qsa_locality.py (how local the sparse attention's reads are: the KV-streaming question)
                     if (static const char* dump = std::getenv("STRATA_QSA_DUMP"); dump != nullptr) {
                         static const long long last = std::getenv("STRATA_QSA_DUMP_LAST")
-                                                          ? std::atoll(std::getenv("STRATA_QSA_DUMP_LAST")) : 4096;
+                                                          ? std::strtoll(std::getenv("STRATA_QSA_DUMP_LAST"), nullptr, 10) : 4096;
                         if (p0 + T > pos0 + n - last) {
                             std::vector<int32_t> h((size_t) (T * m.cap));
                             strata::gpu::copy_async(h.data(), m.sel_ids, h.size() * 4, m.cs);
