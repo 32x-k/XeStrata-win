@@ -69,7 +69,7 @@ RX 9060 XT は prefill が 2.1〜3.1 倍、decode が 5〜12% 速くなりまし
 
 移していないのは、Windows の実装、upstream の `sycl/`、`STRATA_ADAPT_OVERLAP` とその callback のスレッドの調整（XeStrata にない機能）、
 適応の段のコピーの着地を host の関数でなく stream の順番どおりのコピーで知らせる変更（XeStrata で host の関数でフラグを立てるのは `--pcie-mode dma` のときだけで、既定の経路は使わない）、
-塊を小さくすると貸す枠が増える場合の扱い（#2090。XeStrata のリングは塊について単調）、upstream の試験の道具です。
+塊を小さくすると貸す枠が増える場合の扱い（#2090。XeStrata のリングは塊について単調）、upstream の試験の道具と記録（`bench/results`）です。
 
 ## Strata 0.1.43 の取り込み
 

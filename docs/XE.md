@@ -67,7 +67,7 @@ On an 8 GB card (both engines run with 8 GB of VRAM left), the prefill is 270 ag
 
 Not carried: the Windows implementation, upstream's `sycl/`, `STRATA_ADAPT_OVERLAP` and its callback thread's tuning (a feature XeStrata does not have),
 telling an adaptive stage's landing by a stream-ordered copy instead of a host function (XeStrata raises its flags in a host function only with `--pcie-mode dma`, not on its default path),
-a smaller chunk that would lend more slots (#2090; XeStrata's ring is monotonic in the chunk), and upstream's test tools.
+a smaller chunk that would lend more slots (#2090; XeStrata's ring is monotonic in the chunk), and upstream's test tools and records (`bench/results`).
 
 ## Integration through Strata 0.1.43
 
