@@ -1,3 +1,7 @@
+<!--
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
 # Notes for coding agents
 
 ## LOCAL.md: this machine's facts (read it first, keep it current)
@@ -86,6 +90,8 @@ XeStrata must build, run and pass its tests without `third_party/nonfree/`: what
 Every file starts with its copyright holders and license in SPDX form (the [REUSE](https://reuse.software) specification), in the file's comment syntax.
 XeStrata's own file:
 
+<!-- REUSE-IgnoreStart: examples, not this file's own header -->
+
 ```cpp
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
@@ -105,6 +111,8 @@ An unchanged file from Strata:
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-License-Identifier: MIT
 ```
+
+<!-- REUSE-IgnoreEnd -->
 
 - Files that cannot carry a comment (data, images, JSON) are covered in `REUSE.toml`; the license texts are in `LICENSES/`.
 - `reuse lint` must pass.
