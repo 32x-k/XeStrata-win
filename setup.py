@@ -3701,8 +3701,9 @@ def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images
 
 
 def main() -> int:
-    if sys.platform != "linux":
-        fail("Strata supports Linux only")
+    # Windows: the 7z's prebuilt engine only (PACKAGED); this folder compiles one on Linux only
+    if sys.platform != "linux" and not (WIN and PACKAGED):
+        fail("XeStrata runs on Linux, and on Windows from its 7z" if WIN else "XeStrata runs on Linux and Windows")
     if wsl_version() == 1:
         fail("Strata does not run on WSL 1 (it has no GPU access)", "use WSL 2, or a native Linux installation")
     if wsl_version() == 2:
