@@ -71,6 +71,9 @@ Whoever sends a change also agrees to the following:
 If you do not agree, or the code you send cannot carry these permissions (code copied from another project, for
 example), the change is, as a rule, not accepted.
 
+The measurement records added to `bench/XeStrataBenchResults/` link with nothing, so this section does not apply to
+them: they go in under LGPL-3.0-or-later without the additional permission, and need no such agreement.
+
 ## What goes in
 
 Whoever wrote it (the maintainer, a pull request, a port from upstream), a change goes in only on these two conditions.
@@ -109,4 +112,5 @@ Remove user names, personal paths, host names, IP addresses and keys before past
 
 - Run `xestrata --bench` and paste `records/bench-<date and time>/summary.md` from the data folder.
   Nothing is sent anywhere, so check what it says before pasting ([docs/BENCH.md](docs/BENCH.md#xestrata---bench)).
-- To keep the record itself, send a pull request that adds a folder to `bench/XeStrataBenchResults/`.
+- To keep the record itself, send a pull request that adds a folder to `bench/XeStrataBenchResults/` (it goes in under
+  LGPL-3.0-or-later without the additional permission).
