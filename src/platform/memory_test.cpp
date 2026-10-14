@@ -7,7 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if !defined(_WIN32)
 #include <sys/resource.h>
+#endif
 
 
 int main() {
@@ -20,6 +22,7 @@ int main() {
                 r.note.c_str());
     // a refusal under a memlock limit below the region (8 MiB by default on Ubuntu, without CAP_IPC_LOCK) is the
     // machine's setting, not a fault: skipped.  With the limit high enough, a refusal still fails.
+#if !defined(_WIN32)
     rlimit lim{};
     if (!r.ok && getrlimit(RLIMIT_MEMLOCK, &lim) == 0 && lim.rlim_cur != RLIM_INFINITY && lim.rlim_cur < bytes) {
         std::printf("platform_memory_test: skipped (ulimit -l is %llu KiB, below the %llu MiB region)\n",
@@ -27,6 +30,7 @@ int main() {
         std::free(p);
         return 77;
     }
+#endif
     int fail = !(r.ok && r.locked_bytes == bytes);
     strata::platform::unlock_resident(p, bytes);
     std::free(p);

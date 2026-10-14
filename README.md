@@ -94,6 +94,16 @@ The full steps are in [docs/DEVTOOLS.md](docs/DEVTOOLS.md), under "Windows (AMD 
      --adapt-every 0 --pcie-frac 0 --tokens-file <prompt.ids> --max-new 256 --stats
    ```
 
+8. For the tests, configure another folder with `-DSTRATA_BUILD_TESTS=ON` (the arguments of step 5, another folder), build all of it and run CTest.
+   `expert_parity` and `pool_test` read the AVX-512 pack (`experts.bin`) at `pack\full` in the repository root, so put a junction to that pack there.
+   Run them with the `PATH` and `ONEAPI_DEVICE_SELECTOR=hip:0` of step 7.
+
+   ```bat
+   cmake --build build\free-win-test
+   mklink /J pack\full <the AVX-512 pack>
+   cd build\free-win-test && ctest --output-on-failure
+   ```
+
 ### Current measurements (for reference)
 
 Measured on 2026-10-14 on a PC with a Radeon AI PRO R9700, a Ryzen AI 9 HX 370, 28 GB of RAM and Windows 11.

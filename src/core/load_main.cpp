@@ -14,11 +14,16 @@
 #include <string>
 #include <fstream>
 #include <memory>
+#if !defined(_WIN32)
 #include <sys/resource.h>
+#endif
 #include <limits>
 #include <stdexcept>
 
 static void memory_status(const char* phase) {
+#if defined(_WIN32)
+    (void) phase;   // no memlock limit or VmLck on Windows
+#else
     struct rlimit limit{};
     if (getrlimit(RLIMIT_MEMLOCK, &limit) == 0) {
         if (limit.rlim_cur == RLIM_INFINITY) std::printf("%s: memlock unlimited", phase);
@@ -32,6 +37,7 @@ static void memory_status(const char* phase) {
         if (!found) std::printf("; VmLck unavailable");
         std::printf("\n");
     }
+#endif
 }
 
 int run(int argc, char** argv) {

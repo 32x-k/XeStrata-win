@@ -94,6 +94,16 @@ intel/llvm（DPC++）を Windows の上で HIP のターゲットだけでビル
      --adapt-every 0 --pcie-frac 0 --tokens-file <prompt.ids> --max-new 256 --stats
    ```
 
+8. テストは、別のフォルダーで `-DSTRATA_BUILD_TESTS=ON` として構成し、全体をビルドして CTest で動かします（5 と同じ引数で、フォルダーだけ変えます）。
+   `expert_parity` と `pool_test` はリポジトリ直下の `pack\full` にある AVX-512 向けのパック（`experts.bin`）を読むので、そのパックへのジャンクションを置きます。
+   7 と同じ `PATH` と `ONEAPI_DEVICE_SELECTOR=hip:0` で動かします。
+
+   ```bat
+   cmake --build build\free-win-test
+   mklink /J pack\full <AVX-512 向けのパック>
+   cd build\free-win-test && ctest --output-on-failure
+   ```
+
 ### 今の計測（参考値）
 
 2026-10-14 に、Radeon AI PRO R9700、Ryzen AI 9 HX 370、RAM 28 GB、Windows 11 の PC で測りました。
