@@ -3179,18 +3179,24 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: layer split auto: the CPU experts read RAM at %.0f GB/s\n", cpu_bw / 1e6);
         // each stage's link (upstream 0391e478): the prompt path streams a stage's missed experts over its own link,
-        // so a stage on a narrow one pays more per missed expert.  Its miss term is scaled by 20 GB/s (the x16
-        // reference of pcie_frac_for_gbps) over the probed link, never below 1, so a machine whose links all read
-        // 20 GB/s or more keeps the formula as it was (upstream: 2x 4090 D, CUDA1 on a x1 link at 1.6 GB/s, K=22 ->
-        // 38, prompts ~350 -> ~1410 tok/s).
-        std::vector<double> link_scale((size_t) ns, 1.0), link_gbps((size_t) ns, -1.0);
+        // so a stage on a narrow one pays more per missed expert (upstream: 2x 4090 D, CUDA1 on a x1 link at 1.6 GB/s,
+        // K=22 -> 38, prompts ~350 -> ~1410 tok/s).
+        // #2007 (upstream 9d41e18b): the same scale moved 2x Tesla T10 from K=23 to K=14 (prompt -23%, decode -15%), so
+        // it is now relative to the stage with the fastest link and applies only from a 4x gap on
+        // (split_rules::link_miss_scale): a symmetric rig, or a moderate gap, keeps the fitted formula.
+        // STRATA_SPLIT_LINK_ABS=1: the 20 GB/s rule.
+        std::vector<double> link_gbps((size_t) ns, -1.0);
         std::vector<double> copy_ms((size_t) ns, -1.0);
         for (int i = 0; i < ns; ++i) {
             const strata::core::OnDevice on(dev_of_stage(i));
-            const double lbw = native_pack ? probe_pcie_h2d_gbps() : -1.0;
-            if (lbw > 0.0) link_scale[(size_t) i] = std::clamp(20.0 / lbw, 1.0, 64.0);
-            link_gbps[(size_t) i] = lbw;
+            link_gbps[(size_t) i] = native_pack ? probe_pcie_h2d_gbps() : -1.0;
             copy_ms[(size_t) i] = probe_copy_latency_ms();
+        }
+        static const bool link_abs = [] { const char* v = std::getenv("STRATA_SPLIT_LINK_ABS"); return v && v[0] == '1'; }();
+        std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps);
+        for (int i = 0; i < ns; ++i) {
+            const double lbw = link_gbps[(size_t) i];
+            if (link_abs) link_scale[(size_t) i] = lbw > 0.0 ? std::clamp(20.0 / lbw, 1.0, 64.0) : 1.0;
             std::fprintf(stderr, "strata generate: layer split auto: CUDA%d link %.1f GB/s (a 64 KiB copy %.3f ms) -> "
                                  "miss cost x%.2f\n",
                          dev_of_stage(i), lbw, copy_ms[(size_t) i], link_scale[(size_t) i]);
