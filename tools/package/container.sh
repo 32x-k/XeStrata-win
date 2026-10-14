@@ -70,7 +70,9 @@ python3-requests, python3-pillow, python3-psutil"
       v=$(echo "$cuda_ver" | tr . -)
       dnf install -y -q "cuda-toolkit-$v"
       cuda_path=/usr/local/cuda-$cuda_ver
-      cublas="libcublas.so.$(echo "$cuda_ver" | cut -d. -f1)()(64bit)"
+      # by its package's name, as on Ubuntu: dnf gives libcublas.so.13()(64bit) to DCGM's private copy
+      # (datacenter-gpu-manager-4-cuda13-cublas, in /usr/libexec), which the engine does not find
+      cublas=libcublas-$v
       cat > /etc/yum.repos.d/oneAPI.repo <<EOF
 [oneAPI]
 name=Intel oneAPI repository
