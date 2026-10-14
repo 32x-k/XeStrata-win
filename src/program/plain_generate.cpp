@@ -209,10 +209,13 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         const int64_t acc0 = model.spec_accepted(), off0 = model.spec_drafted();
         bool ok = true;
         int32_t next = -1;
-        if (opt.prompt_chunk > 0) {
+        bool windows = opt.prompt_chunk <= 0;
+        if (!windows) {
             ok = model.prompt(ids.data() + resume, n - resume, resume, out.data(), nullptr, err);
             next = out[0];
-        } else {
+            if (!ok && err.empty()) ok = windows = true;   // no room for the chunks: through the windows
+        }
+        if (windows) {
             for (int64_t p = resume; ok && p < n;) {
                 const int w = (int) std::min<int64_t>(opt.max_t, n - p);
                 ok = model.forward(ids.data() + p, w, p, out.data(), nullptr, err);
@@ -462,12 +465,13 @@ int plain_main(int argc, char** argv) {
     int64_t pos = 0;
     // the prompt through the batched products (all but nothing left for the windows), else in windows
     if (opt.prompt_chunk > 0) {
-        if (!model.prompt(prompt.data(), (int64_t) prompt.size(), 0, out.data(), lg, err)) {
+        if (model.prompt(prompt.data(), (int64_t) prompt.size(), 0, out.data(), lg, err)) {
+            pos = (int64_t) prompt.size();
+            if (!emit(0)) return 1;
+        } else if (!err.empty()) {   // (empty: no room for the chunks, the windows below read it)
             std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
             return 1;
         }
-        pos = (int64_t) prompt.size();
-        if (!emit(0)) return 1;
     }
     while (pos < (int64_t) prompt.size()) {
         const int n = (int) std::min<int64_t>(T, (int64_t) prompt.size() - pos);

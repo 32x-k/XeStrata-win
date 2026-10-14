@@ -609,15 +609,26 @@ bool PlainModel::open_experts(std::string& err) {
     }
     // the prompt path's host buffers, for its longest chunk; the device ones are borrowed from the tier a prompt at a
     // time (prompt_borrow), so the tier is sized from all the free memory
+    // pinned memory can be short (WSL 2 caps it): the chunk is halved until its buffers fit, and with none the prompt
+    // is read through the decode windows (--prompt-chunk 0), said
     if (opt_.prompt_chunk > 0) {
+        const int64_t asked = opt_.prompt_chunk;
         uint64_t db = 0, hb = 0;
-        prompt_carve(opt_.prompt_chunk, pb_, nullptr, nullptr, db, hb);
-        if (!strata::gpu::alloc_host(&prompt_host_, hb)) {
-            err = "plain model: no pinned memory for the prompt path's chunks of " + std::to_string(opt_.prompt_chunk) +
-                  " tokens (" + std::to_string(hb >> 20) + " MiB; --prompt-chunk sets a smaller one, 0 none)";
-            return false;
+        for (; opt_.prompt_chunk >= 16; opt_.prompt_chunk /= 2) {
+            prompt_carve(opt_.prompt_chunk, pb_, nullptr, nullptr, db, hb);
+            if (strata::gpu::alloc_host(&prompt_host_, hb)) break;
+            prompt_host_ = nullptr;
         }
-        prompt_carve(opt_.prompt_chunk, pb_, nullptr, (uint8_t*) prompt_host_, db, hb);
+        if (prompt_host_ == nullptr) {
+            std::fprintf(stderr, "strata plain: no pinned memory for the prompt path's chunks (%lld tokens asked): "
+                                 "prompts are read through the decode windows\n", (long long) asked);
+            opt_.prompt_chunk = 0;
+        } else {
+            if (opt_.prompt_chunk != asked)
+                std::fprintf(stderr, "strata plain: the prompt path's chunks are %lld tokens (the pinned memory for %lld "
+                                     "was not there)\n", (long long) opt_.prompt_chunk, (long long) asked);
+            prompt_carve(opt_.prompt_chunk, pb_, nullptr, (uint8_t*) prompt_host_, db, hb);
+        }
     }
     const uint64_t window_b = (uint64_t) opt_.max_t * (uint64_t) s.n_expert_used * (uint64_t) s.n_embd * 4 * 3 +
                               16 * lay.max_blob + (64ull << 20);

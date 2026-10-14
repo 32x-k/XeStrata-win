@@ -97,6 +97,7 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     if (borrow_first_ >= 0 || off == nullptr || L <= 0 || n < 2) { err = "plain prompt: no tier to borrow from"; return false; }
     // the chunk's device bytes from the tier's last slots: halved until they take at most half the tier, within its
     // last piece (the slots lie back to back only inside one)
+    borrow_short_ = false;
     uint64_t db = 0, hb = 0;
     const int64_t want = T;
     int64_t first = n;
@@ -126,6 +127,7 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
         err = "plain prompt: the VRAM tier is too small for the prompt's buffers (" + std::to_string(least) +
               " tokens need " + std::to_string(db >> 20) + " MiB, the tier lends at most " +
               std::to_string((off[n] - off[lowest]) >> 20) + " MiB of its " + std::to_string(off[n] >> 20) + ")";
+        borrow_short_ = true;
         return false;
     }
     borrowed_res_.clear();
@@ -285,7 +287,17 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     if (opt_.prompt_chunk <= 0 || n <= 0 || prompt_host_ == nullptr) { err.clear(); return false; }
     if (pos < 0 || pos + n > opt_.max_cells) { err = "plain prompt: past the context"; return false; }
     // one chunk the prompt's length, up to prompt_chunk (prompt_borrow may take fewer)
-    if (!prompt_borrow(std::min<int64_t>(n, opt_.prompt_chunk), err)) return false;
+    if (!prompt_borrow(std::min<int64_t>(n, opt_.prompt_chunk), err)) {
+        // a report on WSL 2 (an RTX 2050, 4 GB): the tier lent too little for even a short chunk and every request
+        // failed; the windows read the prompt instead (slower, but it answers), said once
+        if (borrow_short_) {
+            static bool said = false;
+            if (!said) std::fprintf(stderr, "strata plain: %s: prompts are read through the decode windows\n", err.c_str());
+            said = true;
+            err.clear();
+        }
+        return false;
+    }
     const bool ok = prompt_chunks(tokens, n, pos, out, logits, err);
     std::string err2;
     if (!prompt_return(err2) && ok) { err = err2; return false; }

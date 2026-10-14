@@ -105,7 +105,8 @@ public:
     /// The prompt: tokens [0, n) at positions pos .. pos + n - 1 in chunks of `prompt_chunk` tokens, every projection a
     /// matrix product and the routed experts grouped by expert, all on the GPU (src/prefill/plain_prompt.cpp, in the
     /// prompt path's library).  `out`: the greedy token after the last; `logits`: its row (or null).  The state is left
-    /// where the windows would have left it.
+    /// where the windows would have left it.  False with `err` empty when the VRAM tier cannot lend the prompt's
+    /// buffers even for a short chunk (a 4 GB card): nothing ran, and the caller reads the prompt through the windows.
     bool prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err);
     /// How forward and prompt pick their tokens (greedy by default): each row's draw counted from its position, so a
     /// seed repeats a run.
@@ -258,6 +259,7 @@ private:
                             const std::vector<int32_t>& start, std::string& err);
     bool prompt_return(std::string& err);
     int64_t borrow_first_ = -1;
+    bool borrow_short_ = false;     ///< prompt_borrow: the tier lends too little for the shortest chunk
     std::vector<std::pair<int32_t, int32_t>> borrowed_res_;   // (layer, expert) the borrowed slots held
     struct PromptGemm;   // plain_prompt.cpp: the products' state over pb_.gemm_scratch
     static void prompt_gemm_free(PromptGemm* g);
