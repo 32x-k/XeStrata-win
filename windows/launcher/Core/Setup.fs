@@ -1,0 +1,88 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
+/// setup.py run by the bundled Python: with --json for the GUI (its lines as messages, its questions answered on
+/// stdin), or on the console as it is for the CLI.
+module Xestrata.Launcher.Setup
+
+open System
+open System.Diagnostics
+open System.Text
+open System.Threading.Tasks
+
+let private startInfo (args: string seq) =
+    let si = ProcessStartInfo(Places.python, WorkingDirectory = Places.app, UseShellExecute = false)
+    // The bundled Python sees its own packages only: not a Python installed on the PC (PYTHONHOME, PYTHONPATH) nor the
+    // user's site-packages.  It has no ._pth file, which would also leave the script's folder off sys.path (setup.py
+    // imports serve/ from beside it, tools/ their neighbours).
+    si.Environment.Remove "PYTHONHOME" |> ignore
+    si.Environment.Remove "PYTHONPATH" |> ignore
+    si.Environment["PYTHONNOUSERSITE"] <- "1"
+    si.ArgumentList.Add Places.setupPy
+    for a in args do
+        si.ArgumentList.Add a
+    si
+
+/// setup.py on this console, interactive as on Linux; its exit code.
+let runOnConsole (args: string seq) =
+    use p = Process.Start(startInfo args)
+    p.WaitForExit()
+    p.ExitCode
+
+/// setup.py --json with `args`: each line to `onMessage` (on a thread of its own), the exit code to `onExit` once
+/// both streams have ended.
+type Run(args: string seq, onMessage: Protocol.Message -> unit, onExit: int -> unit) =
+    let si = startInfo (Seq.append [ "--json" ] args)
+    do
+        si.RedirectStandardInput <- true
+        si.RedirectStandardOutput <- true
+        si.RedirectStandardError <- true
+        si.CreateNoWindow <- true
+        si.StandardOutputEncoding <- UTF8Encoding false
+        si.StandardErrorEncoding <- UTF8Encoding false
+        si.StandardInputEncoding <- UTF8Encoding false
+        // Python's own streams in UTF-8 (the console's code page otherwise: 932 on a Japanese Windows)
+        si.Environment["PYTHONIOENCODING"] <- "utf-8"
+        si.Environment["PYTHONUTF8"] <- "1"
+
+    let proc = Process.Start si
+
+    let pump (reader: IO.StreamReader) (wrap: string -> Protocol.Message) =
+        Task.Run(fun () ->
+            let mutable line = reader.ReadLine()
+            while not (isNull line) do
+                onMessage (wrap line)
+                line <- reader.ReadLine())
+
+    let out = pump proc.StandardOutput Protocol.parse
+    let err = pump proc.StandardError Protocol.Log
+
+    do
+        Task
+            .WhenAll(out, err)
+            .ContinueWith(fun (_: Task) ->
+                proc.WaitForExit()
+                onExit proc.ExitCode)
+        |> ignore
+
+    /// The answer to an Ask, one line.
+    member _.Answer(answer: string) =
+        proc.StandardInput.WriteLine answer
+        proc.StandardInput.Flush()
+
+    /// Ends setup and what it started (the server and its engine).
+    member _.Stop() =
+        try
+            if not proc.HasExited then
+                proc.Kill true
+        with :? InvalidOperationException ->
+            ()
+
+    member _.HasExited = proc.HasExited
+
+/// The messages of a short run that asks nothing (--describe, --check-update), and its exit code.
+let collect (args: string seq) : Task<Protocol.Message list * int> =
+    let done' = TaskCompletionSource<Protocol.Message list * int>()
+    let messages = Collections.Concurrent.ConcurrentQueue<Protocol.Message>()
+    Run(args, messages.Enqueue, (fun code -> done'.SetResult(List.ofSeq messages, code))) |> ignore
+    done'.Task
