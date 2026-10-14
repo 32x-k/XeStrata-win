@@ -343,8 +343,7 @@ template<> struct Split<23> {   // IQ4_XS
 
 // ---------------------------------------------------------------- Unsloth's UD-Q4_K_XL experts (upstream efeffd8)
 // Q4_K / Q5_K gate/up and Q5_1 / Q8_0 down: llama.cpp's vec_dot_*_q8_1 (vecdotq.cuh, VDR 2 each), transcribed through
-// upstream's CUDA version; the Q5_1 min term is its one departure (below).  These have no decode-once split: `load`
-// keeps the block's address and `apply` is the whole dot, so a row read for several columns decodes it per column.
+// upstream's CUDA version; the Q5_1 min term is its one departure (below).  Their decode-once splits follow the dots.
 constexpr int VDR_Q4_K = 2, VDR_Q5_K = 2, VDR_Q5_1 = 2, VDR_Q8_0 = 2;
 
 inline float vec_dot_q4_K_q8_1_impl_vmmq(const int* v, const int* u, const uint8_t* sc, const uint8_t* m,
@@ -390,81 +389,6 @@ inline void k_scale_min(const uint8_t* scales8, int bq8_offset, uint16_t aux[2])
     const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
     aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
     aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
-}
-inline float vec_dot_q4_K_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs) {
-    const block_q4_K* bq4_K = (const block_q4_K*) vbq + kbx;
-    int v[2];
-    int u[2 * QR4_K] = {};
-    float d8[QR4_K] = {};
-    const int bq8_offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
-    const auto* q4 = reinterpret_cast<const int*>(bq4_K->qs + (size_t) (16 * bq8_offset + 4 * ((iqs / 2) % 4)));
-    v[0] = q4[0];
-    v[1] = q4[4];
-    uint16_t aux[2];
-    k_scale_min(bq4_K->scales, bq8_offset, aux);
-    const auto* sc = reinterpret_cast<const uint8_t*>(aux);
-    const uint8_t* m = sc + 2;
-    for (int i = 0; i < QR4_K; ++i) {
-        const block_q8_1* bq8i = bq8_1 + bq8_offset + i;
-        d8[i] = low_half(bq8i->ds);
-        const int* q8 = (const int*) bq8i->qs + ((iqs / 2) % 4);
-        u[2 * i + 0] = q8[0];
-        u[2 * i + 1] = q8[4];
-    }
-    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
-}
-inline float vec_dot_q5_K_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs) {
-    const block_q5_K* bq5_K = (const block_q5_K*) vbq + kbx;
-    int vl[2];
-    int vh[2];
-    int u[2 * QR5_K] = {};
-    float d8[QR5_K] = {};
-    const int bq8_offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
-    const auto* ql = reinterpret_cast<const int*>(bq5_K->qs + (size_t) (16 * bq8_offset + 4 * ((iqs / 2) % 4)));
-    const auto* qh = reinterpret_cast<const int*>(bq5_K->qh + (size_t) (4 * ((iqs / 2) % 4)));
-    vl[0] = ql[0];
-    vl[1] = ql[4];
-    vh[0] = qh[0] >> bq8_offset;
-    vh[1] = qh[4] >> bq8_offset;
-    uint16_t aux[2];
-    k_scale_min(bq5_K->scales, bq8_offset, aux);
-    const auto* sc = reinterpret_cast<const uint8_t*>(aux);
-    const uint8_t* m = sc + 2;
-    for (int i = 0; i < QR5_K; ++i) {
-        const block_q8_1* bq8i = bq8_1 + bq8_offset + i;
-        d8[i] = low_half(bq8i->ds);
-        const int* q8 = (const int*) bq8i->qs + ((iqs / 2) % 4);
-        u[2 * i + 0] = q8[0];
-        u[2 * i + 1] = q8[4];
-    }
-    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
-}
-// Q5_1: llama.cpp's integer chain, but the min term multiplies the sum of the QUANTIZED activations (dp4a with
-// 0x01010101, times d8) instead of the q8_1 block's `ds.y`, which the quantizer (like llama.cpp's) fills with the sum
-// of the ORIGINAL activations: ggml-cpu's convention, and the one the K-quant mins above use.
-inline float vec_dot_q5_1_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs) {
-    const block_q5_1* bq5_1 = (const block_q5_1*) vbq + kbx;
-    int sumi = 0, sumu = 0;
-    for (int i = 0; i < VDR_Q5_1; ++i) {
-        const int vl = get_int_b4(bq5_1->qs, iqs + i);
-        const int vh = get_int_b4(bq5_1->qh, 0) >> (4 * (iqs + i));
-        const int u0 = get_int_b4(bq8_1->qs, iqs + i), u1 = get_int_b4(bq8_1->qs, iqs + i + QI5_1);
-        int vi0 = (vl >> 0) & 0x0F0F0F0F;
-        vi0 |= (vh << 4) & 0x00000010;
-        vi0 |= (vh << 11) & 0x00001000;
-        vi0 |= (vh << 18) & 0x00100000;
-        vi0 |= (vh << 25) & 0x10000000;
-        sumi = dp4a(vi0, u0, sumi);
-        int vi1 = (vl >> 4) & 0x0F0F0F0F;
-        vi1 |= (vh >> 12) & 0x00000010;
-        vi1 |= (vh >> 5) & 0x00001000;
-        vi1 |= (vh << 2) & 0x00100000;
-        vi1 |= (vh << 9) & 0x10000000;
-        sumi = dp4a(vi1, u1, sumi);
-        sumu = dp4a(0x01010101, u1, dp4a(0x01010101, u0, sumu));
-    }
-    const float d8 = low_half(bq8_1->ds);
-    return (float) sumi * ((float) bq5_1->dm[0] * d8) + (float) sumu * ((float) bq5_1->dm[1] * d8);
 }
 // Q5_0 (OrcaRouter Q4_K_S's down projections, upstream d652cd6): llama.cpp's vec_dot_q5_0_q8_1 integer chain, with its
 // -16 offset taken from the sum of the QUANTIZED activations as for Q5_1 (ggml-cpu's exact sum of (q - 16) * u), not
@@ -513,8 +437,8 @@ inline float vec_dot_q4_0_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx
     }
     return (float) bq4->d * low_half(bq8_1->ds) * (float) sumi;
 }
-// Q4_1 (llama-quantize puts it on a few down projections of its Q4_0 files): the Q5_1 chain above without the fifth
-// bit, the same min-term choice (the activations' own int8 codes)
+// Q4_1 (llama-quantize puts it on a few down projections of its Q4_0 files): the Q5_1 chain (Split<7> below) without
+// the fifth bit, the same min-term choice (the activations' own int8 codes)
 inline float vec_dot_q4_1_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs) {
     const block_q4_1* bq4_1 = (const block_q4_1*) vbq + kbx;
     int sumi = 0, sumu = 0;
@@ -530,27 +454,8 @@ inline float vec_dot_q4_1_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx
 }
 // Q6_K gate/up (Unsloth's UD-Q6_K_XL experts; upstream 87659162): llama.cpp's integer chain verbatim
 // (vecdotq.cuh vec_dot_q6_K_q8_1_impl_mmvq / vec_dot_q6_K_q8_1) - signed per-16-element scales, the -32 offset folded
-// into the per-byte value, the q8_1 block's ds.low for the scales (Q6_K has no learned min)
+// into the per-byte value, the q8_1 block's ds.low for the scales (Q6_K has no learned min); its split is below
 constexpr int VDR_Q6_K = 1;
-inline float vec_dot_q6_K_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs) {
-    const block_q6_K* bq6_K = (const block_q6_K*) vbq + kbx;
-    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
-    const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
-    const int vh_shift = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
-    const int vl = get_int_b2(bq6_K->ql, iqs);
-    const int vh = get_int_b2(bq6_K->qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
-    const int8_t* scales = bq6_K->scales + scale_offset;
-    float sumf = 0.0f;
-    for (int i = 0; i < QR6_K; ++i) {
-        const block_q8_1* b8 = bq8_1 + bq8_offset + (ptrdiff_t) 2 * i;
-        const int sc = scales[(ptrdiff_t) 4 * i];   // NOLINT(bugprone-signed-char-misuse): Q6_K scales are signed
-        const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
-        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
-        const int vi = xe::vsubss4(vil | vih, 0x20202020);   // (vil | vih) - 32
-        sumf += low_half(b8->ds) * (float) (dp4a(vi, get_int_b4(b8->qs, iqs % QI8_1), 0) * sc);
-    }
-    return (float) bq6_K->d * sumf;
-}
 // Q3_K experts (Ornith-1.5's GSQ-RCO files, GLM-5.3-Flash's): llama.cpp's vecdotq.cuh vec_dot_q3_K_q8_1 with its
 // _impl_mmvq, VDR 1 - QI 16 calls a block, each one 32-bit word of the quants against four q8_1 blocks (Q2_K's: below)
 constexpr int VDR_Q3_K = 1;
@@ -574,12 +479,6 @@ inline float vec_dot_q3_K_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx
     }
     return (float) bq3_K->d * sumf;
 }
-inline float vec_dot_q8_0_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs) {
-    const block_q8_0* bq8_0 = (const block_q8_0*) vbq + kbx;
-    int sumi = 0;
-    for (int i = 0; i < VDR_Q8_0; ++i) sumi = dp4a(get_int_b2(bq8_0->qs, iqs + i), get_int_b4(bq8_1->qs, iqs + i), sumi);
-    return (float) bq8_0->d * low_half(bq8_1->ds) * (float) sumi;
-}
 
 template<float (*DOT)(const void*, const block_q8_1*, int, int)>
 struct WholeDot {
@@ -587,14 +486,153 @@ struct WholeDot {
     static W load(const void* vbq, int kbx, int iqs) { (void) iqs; return {vbq, kbx}; }
     static float apply(const W& r, const block_q8_1* bq8_1, int iqs) { return DOT(r.v, bq8_1, r.kbx, iqs); }
 };
-template<> struct Split<12> : WholeDot<vec_dot_q4_K_q8_1> {};   // Q4_K
-template<> struct Split<13> : WholeDot<vec_dot_q5_K_q8_1> {};   // Q5_K
-template<> struct Split<7> : WholeDot<vec_dot_q5_1_q8_1> {};    // Q5_1
-template<> struct Split<8> : WholeDot<vec_dot_q8_0_q8_1> {};    // Q8_0
+// Unsloth's expert formats decode each weight word once for a group's entries and a window's columns (upstream
+// e65858f8, its KqSplit): `load` takes the weight words, the unpacked scales and the block scale, `apply` the
+// activations and the same integer chain and float expression as the whole dot above, so every entry's sum is the
+// whole dot's bit for bit.  (B70 upstream, 2560 x 640 experts, 2- / 4-token windows: Q4_K/Q5_1 362 -> 402 / 369 -> 425
+// GB/s of expert bytes, Q6_K/Q8_0 259 -> 307 / 256 -> 318; one token within 1-2%.)
+template<> struct Split<12> {   // Q4_K
+    struct W { int v[2]; uint16_t aux[2]; ggml_half2 dm; int bq8_offset; };
+    static W load(const void* vbq, int kbx, int iqs) {
+        const block_q4_K* b = (const block_q4_K*) vbq + kbx;
+        W r;
+        r.bq8_offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+        const auto* q4 = reinterpret_cast<const int*>(b->qs + (size_t) (16 * r.bq8_offset + 4 * ((iqs / 2) % 4)));
+        r.v[0] = q4[0];
+        r.v[1] = q4[4];
+        k_scale_min(b->scales, r.bq8_offset, r.aux);
+        r.dm = b->dm;
+        return r;
+    }
+    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+        int u[2 * QR4_K] = {};
+        float d8[QR4_K] = {};
+        for (int i = 0; i < QR4_K; ++i) {
+            const block_q8_1* bq8i = bq8_1 + r.bq8_offset + i;
+            d8[i] = low_half(bq8i->ds);
+            const int* q8 = (const int*) bq8i->qs + ((iqs / 2) % 4);
+            u[2 * i + 0] = q8[0];
+            u[2 * i + 1] = q8[4];
+        }
+        const auto* sc = reinterpret_cast<const uint8_t*>(r.aux);
+        return vec_dot_q4_K_q8_1_impl_vmmq(r.v, u, sc, sc + 2, r.dm, d8);
+    }
+};
+template<> struct Split<13> {   // Q5_K
+    struct W { int vl[2], vh[2]; uint16_t aux[2]; ggml_half2 dm; int bq8_offset; };
+    static W load(const void* vbq, int kbx, int iqs) {
+        const block_q5_K* b = (const block_q5_K*) vbq + kbx;
+        W r;
+        r.bq8_offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
+        const auto* ql = reinterpret_cast<const int*>(b->qs + (size_t) (16 * r.bq8_offset + 4 * ((iqs / 2) % 4)));
+        const auto* qh = reinterpret_cast<const int*>(b->qh + (size_t) (4 * ((iqs / 2) % 4)));
+        r.vl[0] = ql[0];
+        r.vl[1] = ql[4];
+        r.vh[0] = qh[0] >> r.bq8_offset;
+        r.vh[1] = qh[4] >> r.bq8_offset;
+        k_scale_min(b->scales, r.bq8_offset, r.aux);
+        r.dm = b->dm;
+        return r;
+    }
+    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+        int u[2 * QR5_K] = {};
+        float d8[QR5_K] = {};
+        for (int i = 0; i < QR5_K; ++i) {
+            const block_q8_1* bq8i = bq8_1 + r.bq8_offset + i;
+            d8[i] = low_half(bq8i->ds);
+            const int* q8 = (const int*) bq8i->qs + ((iqs / 2) % 4);
+            u[2 * i + 0] = q8[0];
+            u[2 * i + 1] = q8[4];
+        }
+        const auto* sc = reinterpret_cast<const uint8_t*>(r.aux);
+        return vec_dot_q5_K_q8_1_impl_vmmq(r.vl, r.vh, u, sc, sc + 2, r.dm, d8);
+    }
+};
+// Q5_1: llama.cpp's integer chain, but the min term multiplies the sum of the QUANTIZED activations (dp4a with
+// 0x01010101, times d8) instead of the q8_1 block's `ds.y`, which the quantizer (like llama.cpp's) fills with the sum
+// of the ORIGINAL activations: ggml-cpu's convention, and the one the K-quant mins use.
+template<> struct Split<7> {   // Q5_1
+    struct W { int vi0[VDR_Q5_1], vi1[VDR_Q5_1]; float d, m; };
+    static W load(const void* vbq, int kbx, int iqs) {
+        const block_q5_1* b = (const block_q5_1*) vbq + kbx;
+        W r;
+        for (int i = 0; i < VDR_Q5_1; ++i) {
+            const int vl = get_int_b4(b->qs, iqs + i);
+            const int vh = get_int_b4(b->qh, 0) >> (4 * (iqs + i));
+            int vi0 = (vl >> 0) & 0x0F0F0F0F;
+            vi0 |= (vh << 4) & 0x00000010;
+            vi0 |= (vh << 11) & 0x00001000;
+            vi0 |= (vh << 18) & 0x00100000;
+            vi0 |= (vh << 25) & 0x10000000;
+            int vi1 = (vl >> 4) & 0x0F0F0F0F;
+            vi1 |= (vh >> 12) & 0x00000010;
+            vi1 |= (vh >> 5) & 0x00001000;
+            vi1 |= (vh << 2) & 0x00100000;
+            vi1 |= (vh << 9) & 0x10000000;
+            r.vi0[i] = vi0;
+            r.vi1[i] = vi1;
+        }
+        r.d = (float) b->dm[0];
+        r.m = (float) b->dm[1];
+        return r;
+    }
+    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+        int sumi = 0, sumu = 0;
+        for (int i = 0; i < VDR_Q5_1; ++i) {
+            const int u0 = get_int_b4(bq8_1->qs, iqs + i), u1 = get_int_b4(bq8_1->qs, iqs + i + QI5_1);
+            sumi = dp4a(r.vi0[i], u0, sumi);
+            sumi = dp4a(r.vi1[i], u1, sumi);
+            sumu = dp4a(0x01010101, u1, dp4a(0x01010101, u0, sumu));
+        }
+        const float d8 = low_half(bq8_1->ds);
+        return (float) sumi * (r.d * d8) + (float) sumu * (r.m * d8);
+    }
+};
+template<> struct Split<8> {   // Q8_0
+    struct W { int v[VDR_Q8_0]; float d; };
+    static W load(const void* vbq, int kbx, int iqs) {
+        const block_q8_0* b = (const block_q8_0*) vbq + kbx;
+        W r;
+        for (int i = 0; i < VDR_Q8_0; ++i) r.v[i] = get_int_b2(b->qs, iqs + i);
+        r.d = (float) b->d;
+        return r;
+    }
+    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+        int sumi = 0;
+        for (int i = 0; i < VDR_Q8_0; ++i) sumi = dp4a(r.v[i], get_int_b4(bq8_1->qs, iqs + i), sumi);
+        return r.d * low_half(bq8_1->ds) * (float) sumi;
+    }
+};
 template<> struct Split<6> : WholeDot<vec_dot_q5_0_q8_1> {};    // Q5_0
 template<> struct Split<2> : WholeDot<vec_dot_q4_0_q8_1> {};    // Q4_0
 template<> struct Split<3> : WholeDot<vec_dot_q4_1_q8_1> {};    // Q4_1
-template<> struct Split<14> : WholeDot<vec_dot_q6_K_q8_1> {};   // Q6_K
+template<> struct Split<14> {   // Q6_K: the whole dot's chain, the weight words and scales loaded once
+    struct W { int vl, vh; int8_t sc[QR6_K]; float d; int bq8_offset; };
+    static W load(const void* vbq, int kbx, int iqs) {
+        const block_q6_K* b = (const block_q6_K*) vbq + kbx;
+        W r;
+        r.bq8_offset = 2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
+        const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
+        const int vh_shift = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
+        r.vl = get_int_b2(b->ql, iqs);
+        r.vh = get_int_b2(b->qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
+        for (int i = 0; i < QR6_K; ++i) r.sc[i] = b->scales[scale_offset + 4 * i];
+        r.d = (float) b->d;
+        return r;
+    }
+    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+        float sumf = 0.0f;
+        for (int i = 0; i < QR6_K; ++i) {
+            const block_q8_1* b8 = bq8_1 + r.bq8_offset + (ptrdiff_t) 2 * i;
+            const int sc = r.sc[i];
+            const int vil = (r.vl >> (4 * i)) & 0x0F0F0F0F;
+            const int vih = ((r.vh >> (4 * i)) << 4) & 0x30303030;
+            const int vi = xe::vsubss4(vil | vih, 0x20202020);   // (vil | vih) - 32
+            sumf += low_half(b8->ds) * (float) (dp4a(vi, get_int_b4(b8->qs, iqs % QI8_1), 0) * sc);
+        }
+        return r.d * sumf;
+    }
+};
 // Q2_K two words a call: the two share their q8_1 blocks and their scales (and the block's d and dmin), so the scales
 // are unpacked, the integer sums made and the floats multiplied once for both - a decode token's experts (one entry
 // each) were bound by that per-word work (B70: 131 GB/s against Q4_K's 343).  The sums add in another order than
