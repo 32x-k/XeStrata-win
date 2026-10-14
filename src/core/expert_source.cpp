@@ -2130,9 +2130,17 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
         const bool pcie_ok = d.pcie_num > 0 && d.src->device_alias(d.layers, 0) != nullptr;
         // from the times measured at start (pcie_split_m); else the share pcie_num/256
-        const int m = !pcie_ok ? 0
-                      : d.pcie_split != nullptr ? pcie_split_m(*d.pcie_split, d.pcie_overlap, nmiss, std::max(0, nd - nmiss))
-                                                : (nmiss * d.pcie_num) >> 8;
+        int m = !pcie_ok ? 0
+                : d.pcie_split != nullptr ? pcie_split_m(*d.pcie_split, d.pcie_overlap, nmiss, std::max(0, nd - nmiss))
+                                          : (nmiss * d.pcie_num) >> 8;
+        // STRATA_PCIE_MIN1 (opt-in, upstream ab6bce05): the share pcie_num/256 rounds to 0 at 1-2 misses a layer, so the
+        // PCIe lane idles on the typical decode step; with two misses or more one goes over PCIe (the last in routing
+        // order; only where its blob is pinned, as the fetch below checks).  Not with the measured split.
+        static const bool pcie_min1 = [] {
+            const char* v = std::getenv("STRATA_PCIE_MIN1");
+            return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+        }();
+        if (pcie_min1 && pcie_ok && d.pcie_split == nullptr && m < 1 && nmiss >= 2) m = 1;
         if (pcie_ok && d.pcie_split != nullptr) split_m = m;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
