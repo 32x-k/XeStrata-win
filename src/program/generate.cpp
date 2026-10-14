@@ -6119,9 +6119,38 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_PREFILL_AUTO_MAX");
             return v ? (int64_t) std::strtoll(v, nullptr, 10) : (int64_t) 32768;
         }();
+        // #2090 (upstream 1a55fc37, 987548ce): a chunk above 8192 lends the prompt path about twice the slots of 8192
+        // (R9700, IQ3_XXS: 3,907 slots / 6.38 GiB at 16384 against 2,068 / 3.37 GiB), and each lent slot's expert is read
+        // from the RAM side during the read.  On a 30 GB PC with --resident-experts that was 3.4 GB available, 20 GB in
+        // swap and a killed engine; 8192 ran.  With the experts read from the files (not the arena, which holds them all
+        // already), the auto chunk stays at 8192 when the RAM available does not cover the extra loan, and with the
+        // resident RAM mode the copy to come (every expert the cache does not hold, and the loan), plus 6 GiB.
+        // STRATA_BIG_CHUNK=1 takes the bigger chunks anyway.
+        auto big_chunk_fits = [&](int64_t c) {
+            static const bool force = [] { const char* v = std::getenv("STRATA_BIG_CHUNK"); return v && v[0] == '1'; }();
+            if (force || srcp != &src) return true;
+            strata::core::detail::HostMemory hm;
+            if (!strata::core::detail::host_available_memory(hm) || hm.available == 0) return true;
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            const uint64_t extra = (uint64_t) std::max<int64_t>(0, lend_slots(c) - lend_slots(8192)) * lay.max_blob;
+            uint64_t pin = 0;
+            if (o.resident_cpu_experts || o.resident_gib != 0) {
+                const uint64_t cached = (uint64_t) std::max<int64_t>(0, (int64_t) xcache.bytes());
+                pin = (lay.total > cached ? lay.total - cached : 0) +
+                      (uint64_t) std::max<int64_t>(0, lend_slots(8192)) * lay.max_blob;
+            }
+            if (hm.available >= pin + extra + (6ull << 30)) return true;
+            std::fprintf(stderr, "strata generate: prompt chunks of %lld tokens not taken: they would hold %llu MiB more "
+                                 "in RAM during a prompt, and %llu MiB is available for %llu MiB of resident experts plus "
+                                 "that (#2090; STRATA_BIG_CHUNK=1 takes them anyway)\n", (long long) c,
+                         (unsigned long long) (extra >> 20), (unsigned long long) (hm.available >> 20),
+                         (unsigned long long) (pin >> 20));
+            return false;
+        };
         if (o.prefill_auto) {
             for (const int64_t c : kAutoChunks) {
                 if (c > auto_max || (c > 8192 && c > o.max_context)) continue;
+                if (c > 8192 && !big_chunk_fits(c)) continue;
                 if (const int64_t k = auto_slots(c); k > 0) { chunk = c; return k; }
             }
             return 0;
