@@ -352,8 +352,8 @@ It prints other choices too, as in `./setup.sh --packages fedora44/intel,amd --l
 - On Arch `opencl-headers` is installed as well: intel/llvm's build installs the SYCL tools too, and `sycl-ls` includes `CL/cl.h` through `sycl/detail/cl.h` while its target gets no include for the OpenCL headers the configuration fetches (those belong to the runtime's own objects).
   Ubuntu's and Fedora's builds have that header (their compilers bring it in); Arch's clang does not.
 - Intel oneAPI (icpx and oneMKL) is not in Arch's repositories: install Intel's offline installer for it if it is wanted.
-  Without it, the free and contrib modes build intel/llvm from the source, and an Intel GPU's dense products are XeStrata's own kernels' work.
-- Not checked (`unverified`): running an AMD GPU on Ubuntu, and contrib-icpx on Fedora.
+  The contrib-llvm mode hands an Intel GPU's dense products to oneMKL, so it needs oneMKL for an Intel GPU.
+  Without it, use the free mode: it builds intel/llvm from the source, and an Intel GPU's dense products are XeStrata's own kernels' work.
 
 #### Other distributions
 

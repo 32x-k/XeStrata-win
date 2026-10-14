@@ -355,8 +355,8 @@ setup.sh は、venv の使える Python 3 がないときだけ、それを `sud
 - Arch では `opencl-headers` も入れます。intel/llvm のビルドは SYCL の道具（`sycl-ls`）もインストールし、それは `sycl/detail/cl.h` から `CL/cl.h` を読みますが、そのターゲットには構成が取ってくる OpenCL のヘッダーの include が付きません（あれはランタイム自身のオブジェクトのものです）。
   Ubuntu と Fedora のビルドではそのヘッダーが入っています（コンパイラーが連れてきます）が、Arch の clang は連れてきません。
 - Intel oneAPI（icpx と oneMKL）は Arch のリポジトリにないので、要るなら Intel のオフラインインストーラーで入れます。
-  入れない場合、free と contrib のモードは intel/llvm をソースからビルドし、Intel の GPU の密な積は XeStrata 自身のカーネルが行います。
-- 確かめていない組み合わせ（`unverified`）: Ubuntu で AMD の GPU を動かすこと、Fedora の contrib-icpx。
+  contrib-llvm のモードは Intel の GPU の密な積を oneMKL に任せるので、Intel の GPU では oneMKL が要ります。
+  入れない場合は free のモードを使います。intel/llvm をソースからビルドし、Intel の GPU の密な積は XeStrata 自身のカーネルが行います。
 
 #### ほかのディストリビューション
 

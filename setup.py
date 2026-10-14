@@ -918,12 +918,12 @@ def packages_for(distro: str, makers: set, mode: str) -> tuple:
     notes = []
     if distro == "arch" and mode == "contrib-icpx":
         notes.append("Arch: Intel oneAPI is not in its repositories, so these names cover no icpx: Intel's offline "
-                     "installer, or --license free / contrib")
+                     "installer, or --license free")
     if "intel" in makers:
         names += p["intel"].split() + (p["intel-contrib"].split() if mode == "contrib" else [])
         if distro == "arch" and mode == "contrib":
-            notes.append("Arch: oneMKL (Intel's oneAPI repository) is not there either, so the Intel GPU's dense "
-                         "products stay in XeStrata's own kernels")
+            notes.append("Arch: oneMKL (Intel's oneAPI repository) is not there either, and the contrib mode hands "
+                         "the Intel GPU's dense products to it: Intel's offline installer, or --license free")
     if "amd" in makers:
         if mode == "contrib-icpx":
             notes.append("AMD GPUs: not with contrib-icpx (icpx has no AMD target); --license free or contrib")
@@ -1682,9 +1682,9 @@ MKL_HOW = ("oneMKL (not free software; Intel's apt repository, set up as for icp
            "sudo apt install intel-oneapi-mkl-sycl-devel")
 # Intel's repositories carry apt and dnf packages, not Arch's: on Arch the oneAPI packages come from Intel's offline
 # installer, if they are wanted at all (the free and contrib modes build intel/llvm from the source)
-ONEAPI_ARCH = ("Intel oneAPI is not in Arch's repositories (only apt's and dnf's): either install Intel's offline "
-               "installer, which has both) or use another mode: --license free or contrib build intel/llvm from the "
-               "source (./setup.sh --intel-llvm-build)")
+ONEAPI_ARCH = ("Intel oneAPI is not in Arch's repositories (only apt's and dnf's): either install it with Intel's "
+               "offline installer, or use --license free, which builds intel/llvm from the source and keeps the Intel "
+               "GPU's dense products in XeStrata's own kernels")
 
 
 def license_mode(a=None) -> str:
