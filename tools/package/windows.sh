@@ -48,7 +48,8 @@ mkdir -p /cache/xwin /build
 xwin_tar=xwin-$xwin_ver-x86_64-unknown-linux-musl.tar.gz
 curl -fsSL -o "/build/$xwin_tar" "https://github.com/Jake-Shadle/xwin/releases/download/$xwin_ver/$xwin_tar"
 curl -fsSL -o "/build/$xwin_tar.sha256" "https://github.com/Jake-Shadle/xwin/releases/download/$xwin_ver/$xwin_tar.sha256"
-(cd /build && sha256sum -c "$xwin_tar.sha256")
+# the release's .sha256 holds the hash alone
+echo "$(cat "/build/$xwin_tar.sha256")  /build/$xwin_tar" | sha256sum -c
 tar -xzf "/build/$xwin_tar" -C /build
 "/build/xwin-$xwin_ver-x86_64-unknown-linux-musl/xwin" --accept-license --cache-dir /cache/xwin --arch x86_64 \
   splat --output /build/xwin
