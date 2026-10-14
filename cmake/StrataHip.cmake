@@ -7,6 +7,14 @@
 
 include(${CMAKE_CURRENT_LIST_DIR}/StrataCuda.cmake)   # strata_sycl_compiles
 
+# ROCm's CMake packages (hip's, rocBLAS's and hipBLASLt's, which oneMath's rocBLAS backend asks for) are in the
+# distribution's prefix where it packages them (/usr/lib64/cmake, /usr/lib/<triplet>/cmake), and under AMD's own tree,
+# /opt/rocm/lib/cmake, where ROCm itself was installed (Arch's packages too) - a prefix CMake does not search by
+# itself.  This file is included before oneMath is added (CMakeLists.txt), so the backends see it.
+if(EXISTS /opt/rocm/lib/cmake)
+  list(APPEND CMAKE_PREFIX_PATH /opt/rocm)
+endif()
+
 # This PC's AMD GPUs, as the ISA names the compiler takes (gfx1200), from the kernel's KFD topology:
 # gfx_target_version is major * 10000 + minor * 100 + stepping, the last two in hex in the name.
 function(strata_hip_detect out)

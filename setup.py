@@ -823,6 +823,21 @@ def distro_id() -> str:
     return m.group(1) if m else ""
 
 
+def distro_family() -> str:
+    """Which list of PACKAGES this PC's packages come from ("ubuntu", "fedora", "arch"): the ID in /etc/os-release, or
+    ID_LIKE for a distribution whose own ID names nothing there (CachyOS: ID=cachyos, ID_LIKE=arch).  A distribution
+    neither names gets Ubuntu's list (apt), which its package names are usually close to."""
+    try:
+        text = Path("/etc/os-release").read_text()
+    except OSError:
+        return "ubuntu"
+    ids = " ".join(re.findall(r"^ID(?:_LIKE)?=\"?([^\"\n]*)", text, re.M)).split()
+    for family in PACKAGES:
+        if any(i == family or i.startswith(family) for i in ids):
+            return family
+    return "ubuntu"
+
+
 def amd_elsewhere() -> str:
     """Where an AMD GPU that this distribution's rocBLAS lacks runs: Fedora 44's rocBLAS has code for more of them
     (README.md, "AMD GPUs")."""
@@ -833,7 +848,9 @@ def amd_elsewhere() -> str:
 # The distribution packages that building and running XeStrata from the source needs (docs/BUILD.md, "Packages"), by
 # distribution and part: "base" for the free and contrib modes (intel/llvm's build tools, the image encoders' and the
 # optional conversation compression's), "icpx" for the contrib-icpx mode in its place, and each GPU maker's (Intel's
-# oneMKL in the contrib mode only, NVIDIA's in the contrib mode only, AMD's not in the contrib-icpx mode).
+# oneMKL in the contrib mode only, NVIDIA's in the contrib mode only, AMD's not in the contrib-icpx mode).  "tools" are
+# the names of the tools setup does not install itself, for its messages.  On Arch the Vulkan ICD is the GPU maker's
+# own package, not one mesa-vulkan-drivers carries for both.
 PACKAGES = {
     "ubuntu": {
         "base": "python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc "
@@ -845,6 +862,7 @@ PACKAGES = {
         "amd": "libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev "
                "libhipblas-common-dev",
         "nvidia": "nvidia-cuda-toolkit",
+        "tools": {"g++": "build-essential", "glslc": "glslc", "vulkan": "libvulkan-dev", "spirv": "spirv-headers"},
     },
     "fedora": {
         "base": "python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static "
@@ -855,18 +873,57 @@ PACKAGES = {
         "amd": "rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel "
                "hipblas-common-devel",
         "nvidia": "cuda-toolkit-13-4",
+        "tools": {"g++": "gcc-c++", "glslc": "glslc", "vulkan": "vulkan-loader-devel", "spirv": "spirv-headers-devel"},
+    },
+    "arch": {
+        # Arch and its derivatives (ID_LIKE=arch).  Intel's oneAPI repository has no Arch packages: there is no icpx
+        # and no oneMKL (Intel's offline installer is the way to either), so the engine builds with intel/llvm from the
+        # source and an Intel GPU's dense products stay in XeStrata's own kernels.  zstd's package has no libzstd.a, so
+        # intel/llvm's build links the shared one (tools/intel_llvm_build.py).
+        # opencl-headers: intel/llvm's SYCL tools (sycl-ls, part of what its build installs) include CL/cl.h, and they
+        # get no include for the OpenCL headers the configuration fetches (those are the runtime's own objects'); Arch's
+        # clang does not bring the header in, Ubuntu's and Fedora's builds have it
+        "base": "python base-devel git cmake ninja lld hwloc zstd vulkan-headers vulkan-icd-loader shaderc "
+                "spirv-headers opencl-headers blosc2",
+        "icpx": "",
+        "intel": "level-zero-loader intel-compute-runtime vulkan-intel",
+        "intel-contrib": "",
+        # ROCm's clang (rocm-llvm) carries clang's runtime builtins too, which HIP's CMake package asks for where
+        # PACKAGES' other lists name a package of their own for them (Debian's libclang-rt-21-dev)
+        "amd": "hip-runtime-amd rocm-device-libs rocm-llvm rocm-llvm rocblas hipblaslt hipblas-common vulkan-radeon",
+        "nvidia": "cuda",
+        "tools": {"g++": "base-devel", "glslc": "shaderc", "vulkan": "vulkan-headers", "spirv": "spirv-headers"},
     },
 }
 
+# The command that installs distribution packages on this PC, by distro_family()
+INSTALLERS = {"ubuntu": "sudo apt install ", "fedora": "sudo dnf install ", "arch": "sudo pacman -S --needed "}
+
+
+def install_cmd(packages) -> str:
+    """The command that installs these packages (PACKAGES' names) on this PC."""
+    return INSTALLERS[distro_family()] + " ".join(packages)
+
+
+def tool_pkg(kind: str) -> str:
+    """The name of one of the tools setup does not install itself (PACKAGES' "tools"), for this PC."""
+    return PACKAGES[distro_family()]["tools"][kind]
+
 
 def packages_for(distro: str, makers: set, mode: str) -> tuple:
-    """The packages (PACKAGES) for a distribution ("ubuntu", "fedora"), the GPU makers ("intel", "amd", "nvidia") and
-    the build mode, and the notes that go with them (the repositories, what a mode cannot build)."""
+    """The packages (PACKAGES) for a distribution ("ubuntu", "fedora", "arch"), the GPU makers ("intel", "amd",
+    "nvidia") and the build mode, and the notes that go with them (the repositories, what a mode cannot build)."""
     p = PACKAGES[distro]
     names = (p["icpx"] if mode == "contrib-icpx" else p["base"]).split()
     notes = []
+    if distro == "arch" and mode == "contrib-icpx":
+        notes.append("Arch: Intel oneAPI is not in its repositories, so these names cover no icpx: Intel's offline "
+                     "installer, or --license free / contrib")
     if "intel" in makers:
         names += p["intel"].split() + (p["intel-contrib"].split() if mode == "contrib" else [])
+        if distro == "arch" and mode == "contrib":
+            notes.append("Arch: oneMKL (Intel's oneAPI repository) is not there either, so the Intel GPU's dense "
+                         "products stay in XeStrata's own kernels")
     if "amd" in makers:
         if mode == "contrib-icpx":
             notes.append("AMD GPUs: not with contrib-icpx (icpx has no AMD target); --license free or contrib")
@@ -897,18 +954,18 @@ def print_packages(spec: str, mode: str) -> int:
     if spec:
         distro, _, makers_s = spec.partition("/")
         makers = {m.strip() for m in makers_s.split(",") if m.strip()}
+        distro = next((f for f in PACKAGES if distro.startswith(f)), distro)
     else:
-        distro, makers = distro_id(), {g["vendor"] for g in gpus()}
-    distro = "ubuntu" if distro.startswith("ubuntu") else "fedora" if distro.startswith("fedora") else distro
+        distro, makers = distro_family(), {g["vendor"] for g in gpus()}
     if distro not in PACKAGES:
         fail(f"--packages: no list for {distro or 'this distribution'}",
-             "the lists are for Ubuntu 26.04 and Fedora 44: e.g. --packages ubuntu26.04/intel,amd")
+             "the lists are for Ubuntu 26.04, Fedora 44 and Arch: e.g. --packages ubuntu26.04/intel,amd")
     if not makers or not makers <= {"intel", "amd", "nvidia"}:
         fail("--packages: the GPU makers are intel, amd and nvidia" + ("" if spec else " (no GPU of theirs found)"),
              "e.g. --packages fedora44/intel,amd")
     names, notes = packages_for(distro, makers, mode)
     say(f"Packages for {distro}, {', '.join(sorted(makers))} GPUs, the {mode} build:")
-    say(("  sudo apt install " if distro == "ubuntu" else "  sudo dnf install ") + " ".join(names))
+    say("  " + INSTALLERS[distro] + " ".join(names))
     for n in notes:
         say(f"  - {n}")
     return 0
@@ -934,14 +991,16 @@ NVIDIA_REPO_FEDORA = ("sudo dnf config-manager addrepo "
 
 
 def pkg_installed(name: str) -> bool:
-    """Whether the distribution package (or, on Fedora, what provides the capability) is installed."""
-    cmd = (["rpm", "-q", "--whatprovides", name] if distro_id() == "fedora" else
+    """Whether the distribution package (or, on Fedora and Arch, what provides the capability) is installed."""
+    family = distro_family()
+    cmd = (["rpm", "-q", "--whatprovides", name] if family == "fedora" else
+           ["pacman", "-T", name] if family == "arch" else
            ["dpkg-query", "-W", "-f", "${db:Status-Abbrev}", name])
     try:
         r = subprocess.run(cmd, capture_output=True, text=True)
     except OSError:
         return True                                    # no package manager to ask: nothing is said
-    return r.returncode == 0 and (distro_id() == "fedora" or r.stdout.startswith("ii"))
+    return r.returncode == 0 and (family in ("fedora", "arch") or r.stdout.startswith("ii"))
 
 
 def repo_added(url: str) -> bool:
@@ -965,9 +1024,10 @@ def runtime_missing(makers: set) -> tuple:
     need = [n for m in ("intel", "amd") if m in makers for n in rt.get(m, []) if not pkg_installed(n)]
     fast = [n for m, k in (("intel", "onemkl"), ("nvidia", "cublas")) if m in makers for n in rt.get(k, [])
             if not pkg_installed(n)]
-    d = "fedora" if distro_id() == "fedora" else "ubuntu"
+    d = distro_family()
     repos = []
-    if any(n in rt.get("onemkl", []) for n in fast) and not repo_added("repos.intel.com/oneapi"):
+    if any(n in rt.get("onemkl", []) for n in fast) and d in INTEL_REPO and \
+            not repo_added("repos.intel.com/oneapi"):
         repos.append(INTEL_REPO[d])
     if d == "fedora" and any(n in rt.get("cublas", []) for n in fast) and \
             not repo_added("developer.download.nvidia.com/compute/cuda"):
@@ -977,8 +1037,7 @@ def runtime_missing(makers: set) -> tuple:
 
 def runtime_commands(need: list, fast: list, repos: list) -> list:
     """The lines that install them: the repositories first, then the packages in one command."""
-    inst = "sudo dnf install " if distro_id() == "fedora" else "sudo apt install "
-    return [f"  {r}" for r in repos] + ([f"  {inst}{' '.join(need + fast)}"] if need or fast else [])
+    return [f"  {r}" for r in repos] + ([f"  {install_cmd(need + fast)}"] if need or fast else [])
 
 
 def check_runtime(makers: set) -> None:
@@ -1016,18 +1075,22 @@ def rocm_missing() -> list:
         clang_ok = clang_ok or (r.returncode == 0 and Path(r.stdout.strip()).is_file())
     # in the order of PACKAGES' AMD part
     have = [any((d / "hip" / "hip_runtime_api.h").exists() for d in inc),
-            # (an intel/llvm built here has its own: tools/intel_llvm_build.py)
+            # (an intel/llvm built here has its own: tools/intel_llvm_build.py; Arch's ROCm keeps it in its clang's tree)
             any((r / d / "ockl.bc").exists() for r in roots for d in ("amdgcn/bitcode", "lib/llvm/amdgcn/bitcode")) or
-            any(glob.glob(g) for g in ("/usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode/ockl.bc",
+            any(glob.glob(g) for g in (*(str(r / "lib/llvm/lib/clang/*/lib/amdgcn/bitcode/ockl.bc") for r in roots),
+                                       "/usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode/ockl.bc",
                                        "/usr/lib/llvm-*/lib/clang/*/amdgcn/bitcode/ockl.bc",
+                                       "/usr/lib/llvm-*/lib/clang/*/lib/amdgcn/bitcode/ockl.bc",
                                        str(INTEL_LLVM_DEFAULT / "amdgcn/bitcode/ockl.bc"),
                                        str(INTEL_LLVM_CONTRIB / "amdgcn/bitcode/ockl.bc"))),
             clang_ok, clang_ok,
             any((d / "rocblas" / "rocblas.h").exists() for d in inc),
             any((d / "hipblaslt" / "hipblaslt.h").exists() for d in inc),
             any((d / "hipblas-common" / "hipblas-common.h").exists() for d in inc)]
-    names = PACKAGES["fedora" if distro_id() == "fedora" else "ubuntu"]["amd"].split()
-    return [n for n, ok_ in zip(names, have) if not ok_]
+    # the names follow PACKAGES' AMD part position by position (its other lists name one package for both clang and
+    # clang's runtime builtins; ROCm's clang carries both on Arch, so its name is there twice)
+    names = PACKAGES[distro_family()]["amd"].split()
+    return list(dict.fromkeys(n for n, ok_ in zip(names, have) if not ok_))
 
 
 def gpus():
@@ -1617,6 +1680,11 @@ FREE_HOW = ("intel/llvm's DPC++ 7 or later (free software): build it here: ./set
             "on 28 threads, 3.5 GB), or a distribution's package of version 7 or later")
 MKL_HOW = ("oneMKL (not free software; Intel's apt repository, set up as for icpx in docs/BUILD.md#packages): "
            "sudo apt install intel-oneapi-mkl-sycl-devel")
+# Intel's repositories carry apt and dnf packages, not Arch's: on Arch the oneAPI packages come from Intel's offline
+# installer, if they are wanted at all (the free and contrib modes build intel/llvm from the source)
+ONEAPI_ARCH = ("Intel oneAPI is not in Arch's repositories (only apt's and dnf's): either install Intel's offline "
+               "installer, which has both) or use another mode: --license free or contrib build intel/llvm from the "
+               "source (./setup.sh --intel-llvm-build)")
 
 
 def license_mode(a=None) -> str:
@@ -1839,7 +1907,8 @@ def contrib_compiler(a, st: dict) -> tuple:
     comp["onemkl"] = intel_gpu_present()
     if comp["cuda_archs"] and not cuda_toolkits():
         fail("NVIDIA's CUDA toolkit is missing (the contrib build makes the NVIDIA GPUs' code with it, and their "
-             "dense products go to its cuBLAS)", "install it: sudo apt install nvidia-cuda-toolkit")
+             "dense products go to its cuBLAS)",
+             "install it: " + install_cmd([PACKAGES[distro_family()]["nvidia"]]))
     return comp, d
 
 
@@ -1855,7 +1924,8 @@ def choose_compiler(a, gpu: dict) -> dict:
     if mode == "contrib-icpx":
         comp = icpx_compiler()
         if comp is None:
-            fail("--license contrib-icpx builds with Intel's icpx, which is not installed", ICPX_HOW)
+            fail("--license contrib-icpx builds with Intel's icpx, which is not installed",
+                 ONEAPI_ARCH if distro_family() == "arch" else ICPX_HOW)
     elif mode == "contrib" and cuda_archs():
         comp, d = contrib_compiler(a, st)
         kept = {"intel_llvm_contrib": str(d)}
@@ -1888,13 +1958,13 @@ def choose_compiler(a, gpu: dict) -> dict:
         if mode == "contrib":
             comp["license"], comp["onemkl"] = "contrib", intel_gpu_present()
     if comp["onemkl"] and mkl_root() is None:
-        fail(f"--license {mode} hands the Intel GPU's dense matrix products to oneMKL, which is not installed", MKL_HOW)
+        fail(f"--license {mode} hands the Intel GPU's dense matrix products to oneMKL, which is not installed",
+             ONEAPI_ARCH if distro_family() == "arch" else MKL_HOW)
     comp["hip_archs"] = amd_archs()
     if comp["hip_archs"]:
         if missing := rocm_missing():
             fail("building for the AMD GPU needs ROCm's " + ", ".join(missing),
-                 ("install them: sudo dnf install " if distro_id() == "fedora" else "install them: sudo apt install ")
-                 + " ".join(missing) + ", then run it again")
+                 "install them: " + install_cmd(missing) + ", then run it again")
         comp["lib_dirs"] = list(dict.fromkeys(comp["lib_dirs"] + rocm_lib_dirs()))
         if not any(Path(d).glob("libur_adapter_hip.so*") for d in comp["lib_dirs"]):
             # intel/llvm gets the HIP target only when ROCm's HIP is there as it is built
@@ -1950,7 +2020,7 @@ def check_build_tools(comp: dict, sycl_vision: bool) -> None:
     sudo from setup): it says what is missing."""
     missing = []
     if shutil.which("g++") is None:
-        missing.append("build-essential")
+        missing.append(tool_pkg("g++"))
     if sycl_vision and not Path((oneapi_env() or {}).get("MKLROOT", "")).is_dir():
         missing.append("oneMKL for the SYCL image encoder (intel-oneapi-mkl-sycl-devel from Intel's apt repository)")
     if missing:
@@ -1961,11 +2031,11 @@ def vulkan_missing() -> list:
     """The packages the Vulkan image encoder (ggml-vulkan) needs that are not installed."""
     need = []
     if shutil.which("glslc") is None:
-        need.append("glslc")
+        need.append(tool_pkg("glslc"))
     if not Path("/usr/include/vulkan/vulkan.h").exists():
-        need.append("libvulkan-dev")
+        need.append(tool_pkg("vulkan"))
     if not Path("/usr/include/spirv/unified1/spirv.hpp").exists():
-        need.append("spirv-headers")
+        need.append(tool_pkg("spirv"))
     return need
 
 
@@ -2065,7 +2135,7 @@ def build_engine(visions, llama, comp: dict) -> Path:
         return eng
     check_build_tools(comp, "gpu" in missing)
     if "vulkan" in missing and (need := vulkan_missing()):
-        fail("the Vulkan image encoder needs: " + ", ".join(need), "install them: sudo apt install " + " ".join(need))
+        fail("the Vulkan image encoder needs: " + ", ".join(need), "install them: " + install_cmd(need))
     if not engine_ok:
         bdir = ROOT / "build-xe"
         cache = bdir / "CMakeCache.txt"

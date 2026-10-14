@@ -56,12 +56,15 @@ An example of the latter is Ubuntu 26.04's 6.2 with the Arc Pro B70 (intel/llvm 
 setup runs it for `--intel-llvm-build`;
 [BUILD.md](BUILD.md#the-sycl-compiler) describes how it reuses a finished build.
 intel/llvm is free software (Apache-2.0 with LLVM exceptions) and builds with free software only.
-It needs these packages (on Fedora 44: `git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static python3`):
+It needs these packages (on Fedora 44: `git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static python3`; on Arch: `git cmake ninja base-devel lld hwloc zstd opencl-headers python`):
 
 ```sh
 sudo apt install git cmake ninja-build g++ lld python3 libhwloc-dev libzstd-dev
 python3 tools/intel_llvm_build.py            # --keep-build keeps the build tree for a quicker update; --jobs N
 ```
+
+Arch's `zstd` has no `libzstd.a` (`zstd-static` is an AUR package).
+The script then passes `-DLLVM_USE_STATIC_ZSTD=OFF` and links the shared zstd (intel/llvm handles it from v7.1.1; [BUILD.md](BUILD.md#packages)).
 
 Its configuration downloads what the release pins (Level Zero's headers and loader, emhash; all free software), so it needs the network.
 The script makes it fetch Level Zero even when one is installed (`SYCL_UR_FORCE_FETCH_LEVEL_ZERO`):
