@@ -1,14 +1,15 @@
 #!/bin/sh
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-# .claude/skills/release/scripts/build-packages.sh - a release's packages: one set of the deb and rpm variants built
-# from TAG one after another (tools/package/build.sh, a clean container each), gathered into build/release/TAG/ with
-# SHA256SUMS over every package there (the other set's included).
+# .claude/skills/release/scripts/build-packages.sh - a release's packages: one set of the deb and rpm variants (and in
+# the contrib set the Windows 7z) built from TAG one after another (tools/package/build.sh, a clean container each),
+# gathered into build/release/TAG/ with SHA256SUMS over every package there (the other set's included).
 #
-#   .claude/skills/release/scripts/build-packages.sh TAG contrib   # ubuntu26.04 cuda13.1, cuda12.4; fedora44 cuda13.4
+#   .claude/skills/release/scripts/build-packages.sh TAG contrib   # ubuntu26.04 cuda13.1, cuda12.4; fedora44 cuda13.4;
+#                                                                  # windows cuda12.4
 #   .claude/skills/release/scripts/build-packages.sh TAG free      # ubuntu26.04 free; fedora44 free
 #
-# Run from the repository root.  The contrib set takes about an hour and a half, the free one about an hour.  It
+# Run from the repository root.  The contrib set takes about two hours, the free one about an hour.  It
 # writes its own PID to build/release/TAG/build-SET.pid (wait on that PID, not on a pattern: pgrep -f matches the
 # waiting shell itself) and a line per variant to build/release/TAG/summary-SET.txt, then ALLDONE, or FAILED at the
 # first variant that fails (its log is in build/release/TAG/logs/).
@@ -19,7 +20,7 @@ usage() { echo "usage: $0 TAG contrib|free" >&2; exit 2; }
 tag=$1
 set_=$2
 case $set_ in
-  contrib) variants="ubuntu26.04 cuda13.1|ubuntu26.04 cuda12.4|fedora44 cuda13.4" ;;
+  contrib) variants="ubuntu26.04 cuda13.1|ubuntu26.04 cuda12.4|fedora44 cuda13.4|windows cuda12.4" ;;
   free) variants="ubuntu26.04 free|fedora44 free" ;;
   *) usage ;;
 esac
@@ -45,10 +46,11 @@ for t; do
     echo FAILED >> "$summary"
     exit 1
   fi
-  find "build/pkg/$n" -maxdepth 1 \( -name '*.deb' -o -name '*.rpm' \) -exec cp {} "$out/" \;
+  find "build/pkg/$n" -maxdepth 1 \( -name '*.deb' -o -name '*.rpm' -o -name '*.7z' \) -exec cp {} "$out/" \;
   cp "build/pkg/$n/BUILDINFO" "$out/logs/$n.BUILDINFO"
   echo "$n ok in $(( ($(date +%s) - start) / 60 )) min" >> "$summary"
 done
 
-(cd "$out" && find . -maxdepth 1 \( -name '*.deb' -o -name '*.rpm' \) -printf '%f\n' | sort | xargs sha256sum -- > SHA256SUMS) || { echo FAILED >> "$summary"; exit 1; }
+(cd "$out" && find . -maxdepth 1 \( -name '*.deb' -o -name '*.rpm' -o -name '*.7z' \) -printf '%f\n' | sort |
+  xargs sha256sum -- > SHA256SUMS) || { echo FAILED >> "$summary"; exit 1; }
 echo ALLDONE >> "$summary"
