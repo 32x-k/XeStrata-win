@@ -3176,6 +3176,24 @@ def refresh_draft_vocab(rt: Path, choice: str = "cjk") -> None:
     shutil.copyfile(new, dst)
 
 
+def refresh_shared_draft_vocab(cfg: dict, done: set) -> None:
+    """update_install's draft subset of one config, for configs taken most recently used first (installed_configs'
+    order): an MTP folder already in `done` is left alone.  Several configs can name one MTP folder (a second config of
+    the same model: another GPU mode, another context), each with its own "draft_vocab".  Refreshed once per config,
+    the folder ended with the subset of the config used LONGEST ago (upstream c0462733: a config without the key put
+    the default subset over the cyrillic one of the config in use).  The folder takes the subset of the most recently
+    used config that names it; a start still installs its own config's."""
+    args = cfg.get("args") or []
+    if "--mtp" not in args[:-1]:
+        return
+    rt = Path(args[args.index("--mtp") + 1])
+    key = os.path.normcase(os.path.abspath(rt))
+    if key in done:
+        return
+    done.add(key)
+    refresh_draft_vocab(rt, cfg.get("draft_vocab", "cjk"))
+
+
 def update_install(have: list) -> int:
     """#475 (upstream 64987c8): `setup.py --update` (update.sh, after its git pull): what a plain ./setup.sh does to an
     install before it starts the model, without starting it - the Python packages, the engine compiled again when its
@@ -3191,10 +3209,10 @@ def update_install(have: list) -> int:
         pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
                     "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
     update_installed_engine()
+    mtp_done: set = set()
     for cfg_path in have:
         cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
-        if "--mtp" in cfg["args"][:-1]:
-            refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
+        refresh_shared_draft_vocab(cfg, mtp_done)
         ok(f"{cfg.get('model_name', cfg_path.stem)}: up to date")
     say()
     ok(f"XeStrata is updated. Start the model with {SETUP_CMD} when you want it.")
