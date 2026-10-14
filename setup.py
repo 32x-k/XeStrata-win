@@ -219,6 +219,21 @@ MODELS: dict[str, dict[str, Any]] = {
                    # upstream #967: images are allowed (the same base model and image encoder as UD-IQ4_XS), with a
                    # warning: reported working by hand upstream (#967, #971), not run with this file
                    "vision": True, "vision_untested": True},
+    # upstream 0.1.44 (23250b5d): Unsloth's 5-, 6- and 8-bit files, six shards each; their experts are Q5_K, Q6_K and
+    # Q8_0 gate/up with Q8_0 downs, which the expert kernels read.  Not run here (the user's decision of 2026-10-14:
+    # offered as they are); on a PC with less RAM than "ram_gb" a RAM budget of the experts, the rest read from the SSD.
+    "UD-Q5_K_XL": {"about": "5-bit (Unsloth Dynamic): Q5_K experts with Q8_0 downs, close to Q8_0 in quality; not "
+                            "tested in XeStrata", "download_gb": 158.3, "ram_gb": 108, "arena_gb": 98.4,
+                   "families": ("unsloth",), "budget": True, "experimental": True, "shards": 6,
+                   "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00006.gguf", "vision": True, "vision_untested": True},
+    "UD-Q6_K_XL": {"about": "6-bit (Unsloth Dynamic): Q6_K experts with Q8_0 downs; not tested in XeStrata",
+                   "download_gb": 169.2, "ram_gb": 118, "arena_gb": 109.2, "families": ("unsloth",), "budget": True,
+                   "experimental": True, "shards": 6, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00006.gguf",
+                   "vision": True, "vision_untested": True},
+    "Q8_0": {"about": "8-bit, the reference quality (every expert Q8_0), for a 192 GB PC; not tested in XeStrata",
+             "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth",), "budget": True,
+             "experimental": True, "shards": 6, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00006.gguf",
+             "vision": True, "vision_untested": True},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (check_shards reads the other model files' directories; these are also hashed once).
@@ -240,6 +255,45 @@ UNSLOTH_IQ4_XS_SHARDS = {
         (49835229856, "577a38a2392b40ca2193cea502e1d92f60b8cd370675d308e0ec21885d9daaa7"),
     "Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf":
         (43836407744, "d4634e6d84f0ebb0940be15c90d3790bf6464e3dea3a1cddc567dc0e83ad8833"),
+}
+# Unsloth's bigger files (upstream 0.1.44), offered without a run here (the user's decision of 2026-10-14)
+UNSLOTH_BIG_SHARDS = {
+    "Qwen3.8-Flash-Next-UD-Q5_K_XL-00001-of-00006.gguf":
+        (10946618, "610922cdb1afe1094e95d7a3e86b12ee33317ebbf7320ac9344e21b6ae4bb69f"),
+    "Qwen3.8-Flash-Next-UD-Q5_K_XL-00002-of-00006.gguf":
+        (682434912, "494ca4ed3dbf97bc28da88af3890b8877b9032f909812d00c0526a9ca5e91d2e"),
+    "Qwen3.8-Flash-Next-UD-Q5_K_XL-00003-of-00006.gguf":
+        (54400261312, "34efd79a80a1ce540a517a5d56171924b66ce1c38b04c904f17ad6d8ef17cf20"),
+    "Qwen3.8-Flash-Next-UD-Q5_K_XL-00004-of-00006.gguf":
+        (49990245824, "9ee6bbe462e6830864382d629101490625b1c95afa15492b7ad550c7bed2dd13"),
+    "Qwen3.8-Flash-Next-UD-Q5_K_XL-00005-of-00006.gguf":
+        (49882416192, "0b2437f661f584030cb5aeb8fb1bb70f6422518a6746bfcc0304167c7b6b8beb"),
+    "Qwen3.8-Flash-Next-UD-Q5_K_XL-00006-of-00006.gguf":
+        (3320101792, "55dd96c5ad0863b06b6393151b9ad0ac727b8d58a62e02a296ca5d5ddbfee4a3"),
+    "Qwen3.8-Flash-Next-UD-Q6_K_XL-00001-of-00006.gguf":
+        (10946624, "8bdc6bad55b6699f46f60708829932ff4018d7ac9bd309c388534fa31753bdb7"),
+    "Qwen3.8-Flash-Next-UD-Q6_K_XL-00002-of-00006.gguf":
+        (682434912, "494ca4ed3dbf97bc28da88af3890b8877b9032f909812d00c0526a9ca5e91d2e"),
+    "Qwen3.8-Flash-Next-UD-Q6_K_XL-00003-of-00006.gguf":
+        (54400261312, "34efd79a80a1ce540a517a5d56171924b66ce1c38b04c904f17ad6d8ef17cf20"),
+    "Qwen3.8-Flash-Next-UD-Q6_K_XL-00004-of-00006.gguf":
+        (49814108512, "0ea4b599880a5a52fcd9c188ba1443f646c69c96571904ddbd6a79246a01a997"),
+    "Qwen3.8-Flash-Next-UD-Q6_K_XL-00005-of-00006.gguf":
+        (49419317344, "9948e81ae8368144b135a7403d8c0f2cf9a6c2f9f692313865855b2832e696c9"),
+    "Qwen3.8-Flash-Next-UD-Q6_K_XL-00006-of-00006.gguf":
+        (14838313984, "e4ae255234f42b18012f6d6eec5bf615b57479b7e0a0233c47436a321ffeec3f"),
+    "Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf":
+        (10946624, "2dabcbb53ca537a7947bc7d20414fd464eeaf4d66d43021b5b2556cc87544ad2"),
+    "Qwen3.8-Flash-Next-Q8_0-00002-of-00006.gguf":
+        (682434912, "494ca4ed3dbf97bc28da88af3890b8877b9032f909812d00c0526a9ca5e91d2e"),
+    "Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf":
+        (54400261312, "34efd79a80a1ce540a517a5d56171924b66ce1c38b04c904f17ad6d8ef17cf20"),
+    "Qwen3.8-Flash-Next-Q8_0-00004-of-00006.gguf":
+        (49446841216, "bfa634025fabbd2658bf7694bc80b90e571699c768723f844c934c7ef06c691a"),
+    "Qwen3.8-Flash-Next-Q8_0-00005-of-00006.gguf":
+        (49668930400, "232a8f14cc0fa4262e7efe8593774b136fe40909e39c7a020342ddaa27259a97"),
+    "Qwen3.8-Flash-Next-Q8_0-00006-of-00006.gguf":
+        (34015618784, "538a93bca918064983409a41187ad4c68640f9aced6f29564da8f551bf86d7a5"),
 }
 UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and the file cache the rest is read through
 # Contexts past 262144 (the model's trained length) extend it by rope scaling (upstream #84): for the context it will
@@ -284,7 +338,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
                 "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
                 "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-unsloth",
                 "vision": False, "pack_args": ["--compat-bf16"],
-                "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS}},
+                "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS}},
 }
 # The models the engine runs other than Qwen3.8-Flash-Next (src/core/plain_model.cpp: `strata --native` with another
 # architecture): one GGUF file each, its size and SHA-256 at the pinned revision (the Hub's LFS pointers), no pack, no
