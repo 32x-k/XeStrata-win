@@ -7752,12 +7752,23 @@ int main(int argc, char** argv) {
         };
         // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
         // away, or pressed Esc): the flag is checked between prompt chunks and between verify windows.
-        std::atomic<bool> stop_req{false};
-        std::mutex in_mu;
-        std::condition_variable in_cv;
-        std::deque<std::string> in_lines;
-        bool in_eof = false;
-        std::thread([&] {
+        // The reader is detached and may sit in read(2) past QUIT (the server writes more, or closes stdin, while main
+        // returns and the process exits), so what it touches is shared with it, never main's locals: a line or EOF
+        // after QUIT locked a destroyed mutex (upstream 6339e861).
+        struct StdinShared {
+            std::atomic<bool> stop_req{false};
+            std::mutex mu;
+            std::condition_variable cv;
+            std::deque<std::string> lines;
+            bool eof = false;
+        };
+        const auto in_shared = std::make_shared<StdinShared>();
+        std::atomic<bool>& stop_req = in_shared->stop_req;
+        std::mutex& in_mu = in_shared->mu;
+        std::condition_variable& in_cv = in_shared->cv;
+        std::deque<std::string>& in_lines = in_shared->lines;
+        bool& in_eof = in_shared->eof;
+        std::thread([st = in_shared] {
             strata::aux_cpus::pin_current_thread();
             // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
             // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
@@ -7789,14 +7800,14 @@ int main(int argc, char** argv) {
             };
             while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
-                if (l == "STOP") { stop_req.store(true); continue; }
-                std::lock_guard<std::mutex> lk(in_mu);
-                in_lines.push_back(l);
-                in_cv.notify_one();
+                if (l == "STOP") { st->stop_req.store(true); continue; }
+                std::lock_guard<std::mutex> lk(st->mu);
+                st->lines.push_back(l);
+                st->cv.notify_one();
             }
-            std::lock_guard<std::mutex> lk(in_mu);
-            in_eof = true;
-            in_cv.notify_one();
+            std::lock_guard<std::mutex> lk(st->mu);
+            st->eof = true;
+            st->cv.notify_one();
         }).detach();
         auto next_line = [&](std::string& out) -> bool {
             std::unique_lock<std::mutex> lk(in_mu);
