@@ -734,6 +734,10 @@ print(r.choices[0].message.content)
   プロンプトと `max_tokens` の和が文脈を超える要求は断られます（下の「文脈」）。
   または `xestrata-<model>.json` に `"fit_max_tokens": true` を書きます。
   思考に厳密な上限を付けるなら、`xestrata-<model>.json` に `"reasoning_budget_tokens": N` を書きます（上を参照）。
+  OpenCode はシステムの発言の先頭近くに `<env>` の塊（作業フォルダーと今日の日付）を書き、その後に毎回同じ約 4 万文字の指示とツールの定義が続きます。
+  プレフィックスのキャッシュはプロンプトの先頭しか使い回さないので、フォルダーや日が変わるたびに約 1 万 4 千トークンを読み直します。
+  `xestrata-<model>.json` に `"env_to_user": true` を書くと、その塊を最初のユーザーの発言の先頭へ移し、システムの発言がどのセッションでも同じになります（opt-in、upstream d8a49433）。
+  upstream の計測（RTX 5070 Ti Laptop、別のフォルダーでの新しいセッション）では、最初の要求が 11.9 秒から 1.1 秒になり、モデルはフォルダーと日付を正しく答えました。
 - **Claude Code**: `ANTHROPIC_BASE_URL=http://127.0.0.1:8095` を設定し、`ANTHROPIC_MODEL` には Claude Code が知っている Claude のモデル名を入れます。
   知らない名前は Claude Code が断ります。XeStrata は名前を無視します。
   `ANTHROPIC_AUTH_TOKEN` は何でも構いません（`api_key` を設定していればそれ）。

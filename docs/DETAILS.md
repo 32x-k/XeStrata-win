@@ -749,6 +749,10 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   Keep `limit.output` well under it: a request whose prompt plus `max_tokens` runs past the context is refused (see **Context** below),
   or add `"fit_max_tokens": true` to `xestrata-<model>.json`.
   For a hard cap on the thinking, add `"reasoning_budget_tokens": N` to `xestrata-<model>.json` (see above).
+  OpenCode writes an `<env>` block (working directory, today's date) near the start of its system message, ahead of ~40K characters of instructions and tool definitions that are the same in every session.
+  The prefix cache only reuses a prompt's start, so every new folder and every new day reads ~14K tokens again.
+  `"env_to_user": true` in `xestrata-<model>.json` moves that block to the front of the first user message, so the system turn is the same for every session (opt-in, upstream d8a49433).
+  Measured by upstream (RTX 5070 Ti Laptop, a new session in a second folder): the first request took 1.1 s instead of 11.9 s, and the model still answered the folder and date correctly.
 - **Claude Code**: set `ANTHROPIC_BASE_URL=http://127.0.0.1:8095` and `ANTHROPIC_MODEL` to a Claude model name it knows.
   Claude Code refuses names it doesn't know; XeStrata ignores the name.
   Add any `ANTHROPIC_AUTH_TOKEN` (or your `api_key`, if you set one).
