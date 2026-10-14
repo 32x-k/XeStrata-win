@@ -53,4 +53,22 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
                                      const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
                                      int64_t max_cells, const RopeScaling& scaling, void* stream);
 
+/// The commit's append of the same window rows into several QSA layers in one launch (upstream 6f3e3810).  Layer i
+/// reads raw0 + i * raw_stride and its own gamma and buffers; with tail_src[i] set its tail is first restored from
+/// there (the commit's snapshot, host memory), as copy_from_mapped did before the per-layer append.  The same stores
+/// as the per-layer calls.
+struct QsaIndexerLayers {
+    static constexpr int kMax = 16;
+    const float* gamma[kMax] = {};
+    const float* tail_src[kMax] = {};
+    float* tail[kMax] = {};
+    float* dead[kMax] = {};
+    float* pooled[kMax] = {};
+    int32_t* block_pos[kMax] = {};
+};
+void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_stride, const int32_t* relative_pos_device,
+                                            int pos_stride, int n_steps, int32_t pos_base, float epsilon,
+                                            const QsaIndexerLayers& layers, int n_layers, const QsaShapes& shapes,
+                                            int64_t max_cells, const RopeScaling& scaling, void* stream);
+
 } // namespace strata::kernels
