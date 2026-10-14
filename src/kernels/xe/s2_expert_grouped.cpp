@@ -19,6 +19,9 @@
 #define STRATA_DEVICE_ARCH_TAG_TU xe_s2_expert_grouped
 #include "strata/kernels/device_arch_tag.hpp"
 
+#include <atomic>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -256,7 +259,374 @@ inline float chunk_dot(const uint8_t* cbytes, const int* xw, float dw, float dx)
     return dw * dx * (float) (s - hx);
 }
 
+// ---- THE SAME INTEGERS FROM FEWER INSTRUCTIONS (upstream e155b07b).  `STRATA_OLD_GROUPED=1` keeps the kernels above.
+//
+// **INSIDE A CHUNK, WHICH CODE MEETS WHICH ACTIVATION IN A `dp4a` WORD IS FREE.**  `s = sum_e code_e * x_e` and
+// `hx = sum_e x_e` are exact integer sums (|s| <= 32 * 3 * 128), so any grouping of the 32 products into words
+// gives the same two integers.  `(w >> 2f) & 0x03030303` holds field `f` of each of a code word's four bytes -
+// elements `4b + f`, plus 16 for the second word - so it is the ACTIVATIONS that are regrouped, once per chunk, into
+//
+//     X[4h + f] = { x[16h + f], x[16h + 4 + f], x[16h + 8 + f], x[16h + 12 + f] }
+//
+// a 4x4 byte transpose of each half of the chunk.  The kernels above spend seven integer operations per code BYTE and
+// a second `dp4a` chain for `hx` on every row; here a code word costs seven for 16 elements and `hx` is summed once
+// per chunk.  `s`, `hx` and the float expression `dw * dx * (float) (s - hx)` are unchanged, so every output is
+// bitwise the previous kernels'.
+
+// fp16 at an even address, one 16-bit load (`f16_at` reads it as two bytes); same value.
+inline float f16_ld(const uint8_t* p) { return f32_from_f16(*(const uint16_t*) p); }
+
+// A chunk's two code words as the eight `dp4a` operands that pair with `X[0..7]`: `m[4h + f]` byte `b` is the code
+// of element `16h + 4b + f`.
+inline void expand_codes(uint32_t lo, uint32_t hi, int m[8]) {
+    const uint32_t M = 0x03030303u;
+    m[0] = (int) (lo & M);
+    m[1] = (int) ((lo >> 2) & M);
+    m[2] = (int) ((lo >> 4) & M);
+    m[3] = (int) ((lo >> 6) & M);
+    m[4] = (int) (hi & M);
+    m[5] = (int) ((hi >> 2) & M);
+    m[6] = (int) ((hi >> 4) & M);
+    m[7] = (int) ((hi >> 6) & M);
+}
+// the 8-byte aligned code words of chunk `c` (two 32-bit loads; CUDA's uint2)
+inline void load_codes(const uint8_t* codes, int c, int m[8]) {
+    const uint32_t* w = (const uint32_t*) (codes + (size_t) c * 8);
+    expand_codes(w[0], w[1], m);
+}
+
+// The 32 int8 of the `block_q8_0` at `xb` regrouped into `X[0..7]` (see above), and their sum `hx`.
+//
+// **NINE ALIGNED WORD LOADS INSTEAD OF 32 BYTE LOADS.**  The caller guarantees a 4-byte aligned activation row, so
+// chunk `c`'s int8 start at `34c + 2`, i.e. 0 bytes (odd `c`) or 2 bytes (even `c`) into an aligned word; the words
+// are read aligned and shifted into place.  The ninth word is read only in the 2-byte case, and then it lies inside
+// block `c + 1` of the same row: both row lengths (80 and 20 chunks) are even, so an even chunk is never a row's last.
+inline int load_x_chunk(const uint8_t* xb, int X[8]) {
+    const uint8_t* q = xb + 2;
+    const int off = (int) ((uintptr_t) q & 3);
+    const uint32_t* p = (const uint32_t*) (q - off);
+    const uint32_t sh = (uint32_t) off * 8;
+    uint32_t v[9];
+    for (int j = 0; j < 8; ++j) v[j] = p[j];
+    v[8] = off != 0 ? p[8] : 0u;
+    uint32_t n[8];
+    int hx = 0;
+    for (int j = 0; j < 8; ++j) {
+        n[j] = (uint32_t) ((((uint64_t) v[j + 1] << 32) | v[j]) >> sh);   // natural word j: x[4j .. 4j+3]
+        hx = dp4a(0x01010101, (int) n[j], hx);
+    }
+    // CUDA's __byte_perm transposes: t0 = a0 b0 a1 b1, t1 = a2 b2 a3 b3 (and t2, t3 of c, d), then
+    // X = a0 b0 c0 d0 / a1 b1 c1 d1 / a2 b2 c2 d2 / a3 b3 c3 d3
+    auto lo_pairs = [](uint32_t a, uint32_t b) {
+        return (a & 0xFFu) | ((b & 0xFFu) << 8) | (((a >> 8) & 0xFFu) << 16) | (((b >> 8) & 0xFFu) << 24);
+    };
+    auto hi_pairs = [](uint32_t a, uint32_t b) {
+        return ((a >> 16) & 0xFFu) | (((b >> 16) & 0xFFu) << 8) | (((a >> 24) & 0xFFu) << 16) | ((b >> 24) << 24);
+    };
+    for (int b = 0; b < 8; b += 4) {   // the two halves: words b .. b + 3
+        const uint32_t t0 = lo_pairs(n[b], n[b + 1]);
+        const uint32_t t1 = hi_pairs(n[b], n[b + 1]);
+        const uint32_t t2 = lo_pairs(n[b + 2], n[b + 3]);
+        const uint32_t t3 = hi_pairs(n[b + 2], n[b + 3]);
+        X[b + 0] = (int) ((t0 & 0xFFFFu) | (t2 << 16));
+        X[b + 1] = (int) ((t0 >> 16) | (t2 & 0xFFFF0000u));
+        X[b + 2] = (int) ((t1 & 0xFFFFu) | (t3 << 16));
+        X[b + 3] = (int) ((t1 >> 16) | (t3 & 0xFFFF0000u));
+    }
+    return hx;
+}
+
+// `s` for one chunk: the eight expanded code words against the eight regrouped activation words.
+inline int chunk_s(const int m[8], const int X[8]) {
+    int s = 0;
+    for (int j = 0; j < 8; ++j) s = dp4a(m[j], X[j], s);
+    return s;
+}
+
+// `gu_launch`, new: ONE SUB-GROUP PER (gate, up) PAIR - row-slots `2r` and `2r + 1`, adjacent in the blob - so each
+// activation chunk is loaded and regrouped once for both rows.  Per row, the lane's chunks, their order, the float
+// expression and the butterfly are `row_dot_s2_q8`'s; the outputs land where `gu_launch` puts them.
+sycl::event gu_pair_launch(sycl::queue& q, const uint8_t* blob_base, const int32_t* slot_index, long long blob_bytes,
+                           const uint8_t* x_q8_0, const float* x_scales, float* gate_up, int n_hits,
+                           const int32_t* d_count, const int32_t* dst_index, int tok_div) {
+    const long long total = (long long) n_hits * FF;
+    const int warps = THREADS / WARP;
+    const size_t groups = (size_t) ((total + warps - 1) / warps);
+    return q.parallel_for(sycl::nd_range<1>(groups * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const long long pair = (long long) it.get_group(0) * warps + (long long) sg.get_group_linear_id();
+        if (pair >= total) return;   // uniform over the sub-group
+        const int h = (int) (pair / FF);
+        if (d_count != nullptr && h >= *d_count) return;
+        const int r = (int) (pair % FF);
+        const int lane = (int) sg.get_local_linear_id();
+        const uint8_t* blob = blob_base + (size_t) slot_index[h] * (size_t) blob_bytes;
+        const uint8_t* xq = x_q8_0;
+        const float* xs = x_scales;
+        if (tok_div > 0) {
+            const int tok = dst_index[h] / tok_div;
+            xq += (size_t) tok * (size_t) (H / 32) * 34;
+            if (xs != nullptr) xs += (size_t) tok * (size_t) (H / 32);
+        }
+        const uint8_t* codes = blob + (size_t) (2 * r) * ROW_GU;   // gate row; the up row follows it
+        const uint8_t* scales = blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2;
+        float acc_g = 0.0f, acc_u = 0.0f;
+        for (int c = lane; c < H / 32; c += 32) {
+            const uint8_t* xb = xq + (size_t) c * 34;
+            const float dx = xs ? xs[c] : f16_ld(xb);
+            int X[8], m[8];
+            const int hx = load_x_chunk(xb, X);
+            load_codes(codes, c, m);
+            const float dw_g = f16_ld(scales + (size_t) (c >> 1) * 2);
+            acc_g += dw_g * dx * (float) (chunk_s(m, X) - hx);
+            load_codes(codes + ROW_GU, c, m);
+            const float dw_u = f16_ld(scales + (size_t) SC_GU * 2 + (size_t) (c >> 1) * 2);
+            acc_u += dw_u * dx * (float) (chunk_s(m, X) - hx);
+        }
+        const float sgate = warp_sum(sg, acc_g);
+        const float sup = warp_sum(sg, acc_u);
+        if (lane != 0) return;
+        gate_up[(size_t) h * FF + (size_t) r] = sgate;   // gate-major, as in `gu_launch`
+        gate_up[(size_t) n_hits * FF + (size_t) h * FF + (size_t) r] = sup;
+    });
+}
+
+// `down_launch`, new: ONE SUB-GROUP PER PAIR OF ROWS `r, r + 1` of one hit, the intermediate's chunk loaded once for both.
+sycl::event down_pair_launch(sycl::queue& q, const uint8_t* blob_base, const int32_t* slot_index,
+                             const int32_t* dst_index, long long blob_bytes, const uint8_t* h_q8_0,
+                             const float* h_scales, float* out, int n_hits, const int32_t* d_count) {
+    const long long total = (long long) n_hits * (H / 2);
+    const int warps = THREADS / WARP;
+    const size_t groups = (size_t) ((total + warps - 1) / warps);
+    return q.parallel_for(sycl::nd_range<1>(groups * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const long long pair = (long long) it.get_group(0) * warps + (long long) sg.get_group_linear_id();
+        if (pair >= total) return;
+        const int h = (int) (pair / (H / 2));
+        if (d_count != nullptr && h >= *d_count) return;
+        const int r = 2 * (int) (pair % (H / 2));
+        const int lane = (int) sg.get_local_linear_id();
+        const uint8_t* blob = blob_base + (size_t) slot_index[h] * (size_t) blob_bytes;
+        const uint8_t* xrow = h_q8_0 + (size_t) h * (size_t) (FF / 32) * 34;
+        const float* xs = h_scales ? h_scales + (size_t) h * (size_t) (FF / 32) : nullptr;
+        const uint8_t* codes = blob + O_D_CODES + (size_t) r * ROW_D;
+        const uint8_t* scales = blob + O_D_SCALES + (size_t) r * SC_D * 2;
+        float acc0 = 0.0f, acc1 = 0.0f;
+        for (int c = lane; c < FF / 32; c += 32) {
+            const uint8_t* xb = xrow + (size_t) c * 34;
+            const float dx = xs ? xs[c] : f16_ld(xb);
+            int X[8], m[8];
+            const int hx = load_x_chunk(xb, X);
+            load_codes(codes, c, m);
+            const float dw0 = f16_ld(scales + (size_t) (c >> 1) * 2);
+            acc0 += dw0 * dx * (float) (chunk_s(m, X) - hx);
+            load_codes(codes + ROW_D, c, m);
+            const float dw1 = f16_ld(scales + (size_t) SC_D * 2 + (size_t) (c >> 1) * 2);
+            acc1 += dw1 * dx * (float) (chunk_s(m, X) - hx);
+        }
+        const float s0 = warp_sum(sg, acc0);
+        const float s1 = warp_sum(sg, acc1);
+        if (lane != 0) return;
+        const size_t o = (size_t) dst_index[h] * H + (size_t) r;
+        out[o] = s0;
+        out[o + 1] = s1;
+    });
+}
+
+// The previous kernels stay selectable for A/B - `STRATA_OLD_GROUPED=1` in the environment, or
+// `moe_grouped_select_old`.  The environment is read once, on first use; the choice is made at each launch, so a
+// recorded graph keeps the kernels it was recorded with.
+std::atomic<int> g_select_old{-1};
+// Which kernels the last launch of an entry point used: 1 = new, 0 = previous, -1 = none since the last query.
+std::atomic<int> g_last_path{-1};
+
+bool old_kernels() {
+    const int s = g_select_old.load(std::memory_order_relaxed);
+    if (s >= 0) return s != 0;
+    static const bool env = [] {
+        const char* e = std::getenv("STRATA_OLD_GROUPED");
+        return e != nullptr && e[0] == '1';
+    }();
+    return env;
+}
+
+// `STRATA_GROUPED_PAIR_MIN_HITS=N`: the per-hit path keeps the previous one-row-a-sub-group kernels below N hits of
+// capacity (the new ones launch half the sub-groups, two rows each).  Bitwise the same either way; default 0 (always
+// the new kernels).  Ignored while `moe_grouped_select_old` forces a choice.
+long long pair_min_hits() {
+    if (g_select_old.load(std::memory_order_relaxed) >= 0) return 0;
+    static const long long n = [] {
+        const char* e = std::getenv("STRATA_GROUPED_PAIR_MIN_HITS");
+        return e != nullptr ? std::strtoll(e, nullptr, 10) : 0LL;
+    }();
+    return n;
+}
+
+// The new kernels read the activations as aligned words (`load_x_chunk`), so they need 4-byte aligned activation
+// rows - the input's and the intermediate's in `scratch`; the per-hit ones also read a blob's codes as two aligned
+// words, which needs an 8-byte aligned arena and slot size (the grouped kernels' groups are VRAM slots, already so).
+// Anything else keeps the previous kernels rather than issuing a misaligned load.
+bool new_grouped(const void* x_q8_0, const void* scratch) {
+    const bool fast = !old_kernels() && ((uintptr_t) x_q8_0 & 3) == 0 && ((uintptr_t) scratch & 3) == 0;
+    g_last_path.store(fast ? 1 : 0, std::memory_order_relaxed);
+    return fast;
+}
+
+bool new_hit(const void* blob_base, long long blob_bytes, const void* x_q8_0, const void* scratch, long long cap) {
+    const bool fast = new_grouped(x_q8_0, scratch) && ((uintptr_t) blob_base & 7) == 0 && (blob_bytes & 7) == 0 &&
+                      cap >= pair_min_hits();
+    g_last_path.store(fast ? 1 : 0, std::memory_order_relaxed);
+    return fast;
+}
+
+// ---- The grouped kernels with the staged activations laid out for the reads (upstream e155b07b).
+//
+// **THE LAYOUT ABOVE IS AN 8-WAY BANK CONFLICT.**  `xs_q[k * (H / 4) + c * 8 + j]` puts lane `L`'s word `j` at
+// `8L + j`, so lanes `L, L + 4, L + 8, ...` share a bank on every one of the chunk's eight reads; and `chunk_dot`
+// recomputes `hx`, which depends on the entry alone, for every row.  Here the staging writes, once per (entry, chunk):
+//
+//     xs_w[j][k * NC + c]   word j of the regrouped chunk (`load_x_chunk`), so lanes read consecutive words
+//     xs_dh[k * NC + c]     (dx, hx) - one 64-bit read per chunk instead of a float and eight `dp4a`
+//
+// Word-major, the staging writes are consecutive as well (the flat index `i` IS `k * NC + c`).  Each sub-group takes
+// its rows TWO at a time (gate `r` and up `r`, or down rows `r, r + 1`), so every local read serves both.  Per
+// (row, entry) the lane's chunks, their order, the float expression and the butterfly are the kernels' above.
+sycl::event gu_grouped_t_launch(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
+                                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok,
+                                const uint8_t* x_q8_0, const float* x_scales, float* gate_up, int cap_e) {
+    constexpr int NC = H / 32;
+    return q.submit([&](sycl::handler& hd) {
+        sycl::local_accessor<int, 1> xs_w(sycl::range<1>((size_t) 8 * GMAX * NC), hd);    // word j of entry k's chunk c at [j][k * NC + c]
+        sycl::local_accessor<sycl::int2, 1> xs_dh(sycl::range<1>((size_t) GMAX * NC), hd);  // (dx as bits, hx)
+        hd.parallel_for(sycl::nd_range<2>({cap_groups, (size_t) (2 * FF / GU_ROWS) * 256}, {1, 256}),
+                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int g = (int) it.get_group(0);
+            if (g >= *n_groups) return;   // uniform
+            const int e0 = grp_start[g], ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+            const int t = (int) it.get_local_id(1), lane = t & 31, warp = t >> 5;
+            for (int i = t; i < ne * NC; i += 256) {
+                const int k = i / NC, c = i - k * NC;
+                const int tok = ent_tok[e0 + k];
+                const uint8_t* xb = x_q8_0 + (size_t) tok * (size_t) NC * 34 + (size_t) c * 34;
+                const float dx = x_scales ? x_scales[(size_t) tok * NC + c] : f16_ld(xb);
+                int X[8];
+                const int hx = load_x_chunk(xb, X);
+                for (int j = 0; j < 8; ++j) xs_w[j * (GMAX * NC) + i] = X[j];
+                xs_dh[i] = sycl::int2(sycl::bit_cast<int>(dx), hx);
+            }
+            sycl::group_barrier(it.get_group());
+            const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+            const int row0 = (int) it.get_group(1) * GU_ROWS;   // even: a pair is always (gate r, up r)
+            for (int pp = warp; pp < GU_ROWS / 2; pp += 8) {
+                const int i = row0 + 2 * pp;
+                const uint8_t* codes = blob + (size_t) i * ROW_GU;
+                const uint8_t* scales = blob + O_GU_SCALES + (size_t) i * SC_GU * 2;
+                int m0[GU_CHUNKS][8], m1[GU_CHUNKS][8];
+                float dw0[GU_CHUNKS] = {}, dw1[GU_CHUNKS] = {};
+                for (int qc = 0; qc < GU_CHUNKS; ++qc) {
+                    const int c = lane + 32 * qc;
+                    if (c < NC) {
+                        load_codes(codes, c, m0[qc]);
+                        load_codes(codes + ROW_GU, c, m1[qc]);
+                        dw0[qc] = f16_ld(scales + (size_t) (c >> 1) * 2);
+                        dw1[qc] = f16_ld(scales + (size_t) SC_GU * 2 + (size_t) (c >> 1) * 2);
+                    }
+                }
+                for (int k = 0; k < ne; ++k) {
+                    float acc0 = 0.0f, acc1 = 0.0f;
+                    for (int qc = 0; qc < GU_CHUNKS; ++qc) {
+                        const int c = lane + 32 * qc;
+                        if (c >= NC) break;
+                        const int at = k * NC + c;
+                        int X[8];
+                        for (int j = 0; j < 8; ++j) X[j] = xs_w[j * (GMAX * NC) + at];
+                        const sycl::int2 dh = xs_dh[at];
+                        const float dx = sycl::bit_cast<float>(dh.x());
+                        acc0 += dw0[qc] * dx * (float) (chunk_s(m0[qc], X) - dh.y());
+                        acc1 += dw1[qc] * dx * (float) (chunk_s(m1[qc], X) - dh.y());
+                    }
+                    const float s0 = warp_sum(sg, acc0);
+                    const float s1 = warp_sum(sg, acc1);
+                    if (lane == 0) {
+                        const int e = e0 + k, r = i >> 1;
+                        gate_up[(size_t) e * FF + (size_t) r] = s0;
+                        gate_up[(size_t) cap_e * FF + (size_t) e * FF + (size_t) r] = s1;
+                    }
+                }
+            }
+        });
+    });
+}
+
+sycl::event down_grouped_t_launch(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
+                                  const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                                  const uint8_t* h_q8_0, const float* hs, float* out) {
+    constexpr int NC = FF / 32;
+    return q.submit([&](sycl::handler& hd) {
+        sycl::local_accessor<int, 1> hs_w(sycl::range<1>((size_t) 8 * GMAX * NC), hd);
+        sycl::local_accessor<sycl::int2, 1> hs_dh(sycl::range<1>((size_t) GMAX * NC), hd);
+        hd.parallel_for(sycl::nd_range<2>({cap_groups, (size_t) (H / D_ROWS) * 256}, {1, 256}),
+                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int g = (int) it.get_group(0);
+            if (g >= *n_groups) return;
+            const int e0 = grp_start[g], ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+            const int t = (int) it.get_local_id(1), lane = t & 31, warp = t >> 5;
+            for (int i = t; i < ne * NC; i += 256) {
+                const int k = i / NC, c = i - k * NC;
+                const uint8_t* xb = h_q8_0 + (size_t) (e0 + k) * (size_t) NC * 34 + (size_t) c * 34;
+                const float dx = hs ? hs[(size_t) (e0 + k) * NC + c] : f16_ld(xb);
+                int X[8];
+                const int hx = load_x_chunk(xb, X);
+                for (int j = 0; j < 8; ++j) hs_w[j * (GMAX * NC) + i] = X[j];
+                hs_dh[i] = sycl::int2(sycl::bit_cast<int>(dx), hx);
+            }
+            sycl::group_barrier(it.get_group());
+            const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+            const int row0 = (int) it.get_group(1) * D_ROWS;
+            for (int pp = warp; pp < D_ROWS / 2; pp += 8) {
+                const int r = row0 + 2 * pp;
+                const uint8_t* codes = blob + O_D_CODES + (size_t) r * ROW_D;
+                const uint8_t* scales = blob + O_D_SCALES + (size_t) r * SC_D * 2;
+                const int c = lane;   // lanes 0..19 hold one chunk each, as above
+                int m0[8] = {}, m1[8] = {};
+                float dw0 = 0.0f, dw1 = 0.0f;
+                if (c < NC) {
+                    load_codes(codes, c, m0);
+                    load_codes(codes + ROW_D, c, m1);
+                    dw0 = f16_ld(scales + (size_t) (c >> 1) * 2);
+                    dw1 = f16_ld(scales + (size_t) SC_D * 2 + (size_t) (c >> 1) * 2);
+                }
+                for (int k = 0; k < ne; ++k) {
+                    float acc0 = 0.0f, acc1 = 0.0f;
+                    if (c < NC) {
+                        const int at = k * NC + c;
+                        int X[8];
+                        for (int j = 0; j < 8; ++j) X[j] = hs_w[j * (GMAX * NC) + at];
+                        const sycl::int2 dh = hs_dh[at];
+                        const float dx = sycl::bit_cast<float>(dh.x());
+                        acc0 += dw0 * dx * (float) (chunk_s(m0, X) - dh.y());
+                        acc1 += dw1 * dx * (float) (chunk_s(m1, X) - dh.y());
+                    }
+                    const float s0 = warp_sum(sg, acc0);
+                    const float s1 = warp_sum(sg, acc1);
+                    if (lane == 0) {
+                        const size_t o = (size_t) ent_dst[e0 + k] * H + (size_t) r;
+                        out[o] = s0;
+                        out[o + 1] = s1;
+                    }
+                }
+            }
+        });
+    });
+}
+
 }  // namespace
+
+void moe_grouped_select_old(int old) { g_select_old.store(old < 0 ? -1 : (old != 0 ? 1 : 0)); }
+
+int moe_grouped_last_path() { return g_last_path.exchange(-1, std::memory_order_relaxed); }
 
 uint64_t moe_hit_grouped_scratch_bytes(int64_t n_hits, int64_t n_embd, int64_t n_ff) {
     if (n_hits <= 0) return 0;
@@ -277,7 +647,12 @@ void hit_pipeline(const uint8_t* blob_base, const int32_t* slot_index, const int
     float* gate_up = (float*) scratch;
     uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
     float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
-    gu_launch(q, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int) n, d_count, dst_index, tok_div);
+    const bool fast = new_hit(blob_base, (long long) blob_bytes, x_q8_0, scratch, (long long) n);
+    if (fast)
+        gu_pair_launch(q, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int) n, d_count, dst_index,
+                       tok_div);
+    else
+        gu_launch(q, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int) n, d_count, dst_index, tok_div);
     void* s = &q;
     if (x_scales != nullptr) {
         swiglu_q8_launch(q, gate_up, n * (long long) FF, h_q8_0, h_scales);
@@ -285,8 +660,10 @@ void hit_pipeline(const uint8_t* blob_base, const int32_t* slot_index, const int
         swiglu_launch(q, gate_up, n * (long long) FF);
         quantize_q8_0(gate_up, h_q8_0, n * (int64_t) FF, s);
     }
-    const auto e = down_launch(q, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
-                               x_scales != nullptr ? h_scales : nullptr, out, (int) n, d_count);
+    const auto e = fast ? down_pair_launch(q, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
+                                           x_scales != nullptr ? h_scales : nullptr, out, (int) n, d_count)
+                        : down_launch(q, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
+                                      x_scales != nullptr ? h_scales : nullptr, out, (int) n, d_count);
     if (!stream) core::Runtime::get().wait(e, "moe_hit_grouped_s2");
 }
 }  // namespace
@@ -411,6 +788,11 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
     uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
     float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
     const int cap_e = (int) cap_entries;
+    const bool fast = new_grouped(x_q8_0, scratch);
+    if (fast)
+        gu_grouped_t_launch(q, (size_t) cap_groups, grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
+                            cap_e);
+    else
     q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<int, 1> xs_q(sycl::range<1>(GMAX * (H / 4)), hd);   // the entries' int8 activations as words
         sycl::local_accessor<float, 1> xs_d(sycl::range<1>(GMAX * (H / 32)), hd);
@@ -475,7 +857,9 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
         quantize_q8_0(gate_up, h_q8_0, cap_entries * (int64_t) FF, s);
     }
     const float* hs = x_scales != nullptr ? h_scales : nullptr;
-    const auto e = q.submit([&](sycl::handler& hd) {
+    const auto e = fast ? down_grouped_t_launch(q, (size_t) cap_groups, grp_ptr, grp_start, n_groups, ent_dst, h_q8_0,
+                                                hs, out)
+                        : q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<int, 1> hs_q(sycl::range<1>(GMAX * (FF / 4)), hd);
         sycl::local_accessor<float, 1> hs_d(sycl::range<1>(GMAX * (FF / 32)), hd);
         hd.parallel_for(sycl::nd_range<2>({(size_t) cap_groups, (size_t) (H / D_ROWS) * 256}, {1, 256}),
