@@ -171,6 +171,29 @@ file instead of loaded into RAM, which is slower.
 
 ## Install
 
+### Podman
+
+Only Podman and podman-compose go on the host. XeStrata goes into a Fedora 44 container, from the release's rpm (rootless).
+
+```bash
+git clone https://github.com/MistVVK/XeStrata && cd XeStrata/container
+mkdir -p ~/.config/xestrata ~/.local/state/xestrata ~/.local/share/xestrata
+podman compose build                         # the image, with the latest release and the GPU libraries
+podman compose run --rm xestrata --setup     # answer the questions; it downloads the model
+podman compose up -d                         # http://127.0.0.1:8095 (podman compose down stops it)
+```
+
+- **GPU**: Intel's as it is. For AMD add `-f compose.yaml -f compose.amd.yaml` after `podman compose`, for NVIDIA
+  `-f compose.yaml -f compose.nvidia.yaml` (or `export COMPOSE_FILE=compose.yaml:compose.nvidia.yaml`).
+  NVIDIA needs the NVIDIA Container Toolkit's CDI specification on the host ([docs/BUILD.md](docs/BUILD.md#podman)).
+  The container has cuda13.4, so Pascal and Volta (P100, P40, the GTX 10 series, V100) are not used.
+- **What the host needs**: the GPU's driver, and your user in the render group (`sudo usermod -aG render $USER`).
+- **Where things go**: the settings, logs and model files are the host's own (the same places as the packages below), so the packages and the container can take each other's place and keep them.
+- **Other commands**: what follows `xestrata`, as in `podman compose run --rm xestrata --bench`, `--calibrate` or `chat`.
+- **Updating**: `podman compose build --pull --no-cache` installs the latest release again, and `podman compose up -d` restarts it.
+
+### The deb and rpm packages
+
 1. Pick the package for your GPU from the table below and download it from [GitHub's Releases](https://github.com/MistVVK/XeStrata/releases) (with `SHA256SUMS`).
 1. Check it: `sha256sum -c SHA256SUMS --ignore-missing`.
 1. Install it: `sudo apt install ./xestrata-contrib-cuda13.1_*.deb` (Ubuntu) or `sudo dnf install ./xestrata-contrib-cuda13.4-*.rpm` (Fedora).

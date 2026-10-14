@@ -160,6 +160,29 @@ RAM がそれより少ないと、エキスパートを RAM に読み込まず�
 
 ## インストール
 
+### Podman
+
+ホストに入れるのは Podman と podman-compose だけです。XeStrata は Fedora 44 のコンテナの中に、Releases の rpm から入ります（rootless）。
+
+```bash
+git clone https://github.com/MistVVK/XeStrata && cd XeStrata/container
+mkdir -p ~/.config/xestrata ~/.local/state/xestrata ~/.local/share/xestrata
+podman compose build                         # 最新のリリースと GPU のライブラリを入れたイメージを作ります
+podman compose run --rm xestrata --setup     # 質問に答えてモデルを取ってきます
+podman compose up -d                         # http://127.0.0.1:8095（止めるときは podman compose down）
+```
+
+- **GPU**: Intel はこのままです。AMD は `-f compose.yaml -f compose.amd.yaml`、NVIDIA は `-f compose.yaml -f compose.nvidia.yaml` を
+  `podman compose` の後に付けます（`export COMPOSE_FILE=compose.yaml:compose.nvidia.yaml` でも同じです）。
+  NVIDIA はホストに NVIDIA Container Toolkit の CDI の設定が要ります（[docs/BUILD.ja.md](docs/BUILD.ja.md#podman)）。
+  コンテナの中は cuda13.4 なので、Pascal と Volta（P100、P40、GTX 10 シリーズ、V100 など）は使えません。
+- **ホストに要るもの**: GPU のドライバーと、自分が render グループに入っていること（`sudo usermod -aG render $USER`）です。
+- **置き場所**: 設定・ログ・モデルのファイルはホストの同じ場所（下のパッケージと同じ）を使うので、パッケージ版とコンテナを入れ替えても、そのまま使えます。
+- **ほかのコマンド**: `podman compose run --rm xestrata --bench`、`--calibrate`、`chat` のように、`xestrata` の後に付けるものを並べます。
+- **更新**: `podman compose build --pull --no-cache` で最新のリリースを入れ直し、`podman compose up -d` で起動し直します。
+
+### deb と rpm のパッケージ
+
 1. GPU に合うパッケージを下の表から選んで、[GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) から取ってきます（`SHA256SUMS` も一緒に）。
 1. `sha256sum -c SHA256SUMS --ignore-missing` で確かめます。
 1. 入れます: `sudo apt install ./xestrata-contrib-cuda13.1_*.deb`（Ubuntu）か `sudo dnf install ./xestrata-contrib-cuda13.4-*.rpm`（Fedora）。

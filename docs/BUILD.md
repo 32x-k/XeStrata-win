@@ -6,7 +6,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 English | [日本語](BUILD.ja.md)
 
-How to install XeStrata from the source, the engine's build modes, what setup does and the packages it needs, and how the deb and rpm packages are made.
+How to install XeStrata from the source, the engine's build modes, what setup does and the packages it needs, how the deb and rpm packages are made, and the Podman container.
 How to install the packages and use XeStrata is in the [README](../README.md).
 The Japanese version ([BUILD.ja.md](BUILD.ja.md)) is the original; this is its translation.
 
@@ -477,3 +477,50 @@ xe0.1.43.1-1 is `0.1.43.1-1` (for rpm, Version 0.1.43.1 and Release 1).
   (2026-10-06; forky and sid have 26.27).
 - **openSUSE Leap 16.0**: its compute-runtime is 25.18, which does not list the Arc Pro B70, and openSUSE's OBS has no newer one
   for Leap 16 (2026-10-06).
+
+## Podman
+
+The Containerfile and the compose files in `container/` run XeStrata in a rootless Podman container (how to use it: [README](../README.md#podman)).
+The image is built on the user's PC and not distributed: the contrib packages' image holds cuBLAS and oneMKL, which are not free software.
+
+- **What it holds**: the Fedora 44 image `tools/package/build.sh` uses (pinned by digest), with the release's rpm, checked against `SHA256SUMS`.
+  Then every maker's package its `BUILD.json` records in `runtime` (Level Zero, ROCm's HIP runtime, rocBLAS and hipBLASLt, cuBLAS, oneMKL)
+  and Mesa's Vulkan drivers (`container/install.sh`).
+  NVIDIA's driver libraries and `nvidia-smi` are not in it: CDI brings the host's.
+- **Build arguments**: environment variables for `podman compose build`.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `XESTRATA_VERSION` | `latest` | the release's tag (`xe0.1.43.1`, for example) |
+| `XESTRATA_VARIANT` | `contrib-cuda13.4` | the rpm's variant |
+| `XESTRATA_NONFREE` | `1` | `0` leaves out oneMKL and cuBLAS (Intel's and NVIDIA's dense products then run on XeStrata's own kernels) |
+
+- **A local rpm**: one rpm in `container/rpm/` is installed instead of the release's.
+  `xestrata-free`, which the Releases do not have, is made with `tools/package/build.sh fedora44 free` and put there.
+- **GPU**: `/dev/dri` is passed, and `userns_mode: keep-id` with `group_add: keep-groups` opens it as the host's user, with its uid and render group
+  (`keep-groups` needs the crun runtime). For AMD, `compose.amd.yaml` adds `/dev/kfd`.
+  For NVIDIA, `compose.nvidia.yaml` passes CDI's `nvidia.com/gpu=all`: install the NVIDIA Container Toolkit (`nvidia-container-toolkit`, in NVIDIA's repository) on the host and make its CDI specification once.
+
+```bash
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+```
+
+- **Network**: the host's. The server listens on 127.0.0.1:8095, as the packages' does;
+  for other devices, `--host 0.0.0.0 --api-key <a secret>` as with the packages.
+- **Where things go**: `~/.config/xestrata`, `~/.local/state/xestrata` and `~/.local/share/xestrata` are passed at the same paths as on the host, and `HOME` is the host's.
+  The absolute paths in the settings are then the same in the host and in the container, so the host's package (Ubuntu's deb as well) shares the settings and the models.
+  The engine's place in a model's settings is pointed on every start at the package that runs.
+  The kernels the GPU drivers compile are kept in the named volume `cache` (`~/.cache`).
+- **A data folder elsewhere** (`--data-dir`) is passed at its own path in `container/compose.override.yaml`.
+  Run with `-f`, list `-f compose.override.yaml` as well.
+
+```yaml
+services:
+  xestrata:
+    volumes:
+      - /mnt/models/XeStrata-data:/mnt/models/XeStrata-data
+```
+
+- **SELinux** (Fedora and others): the container runs with `label=disable`, so the host's folders are not relabeled; only the build labels `container/` to read it (`relabel=shared`).
+- **memlock**: a rootless container cannot go above the host user's limit. When setup says the limit is too low, raise it on the host.
+- **Stopping**: `podman compose down`. `init`'s PID 1 passes the signal to setup and the server, and the engine gets up to 60 seconds to stop.
