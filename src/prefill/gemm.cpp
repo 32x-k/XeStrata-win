@@ -110,6 +110,51 @@ bool blas(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, 
         return false;
     }
 }
+// STRATA_DENSE_F32=1 (opt-in, upstream 40ba0cf9): the FP16 products as FP32 ones on FP32 copies of both operands.
+// For FP16 operands with FP32 sums cuBLAS 12.4 has two Maxwell kernels on a Tesla P40 and picks the slow one for most
+// chunk sizes (qkv 10240 x 2560 at 7.6 TFLOPS up to T 7040, 4.3 from T 7041); its SGEMM runs at 8.4-9.8 from T 512,
+// and for the engine's shapes upstream measured the same bits as the FP16 call.  That is the cuBLAS build's property,
+// so opt-in.  The copies are kept per queue and grown to the largest product (a few hundred MiB for the big ones).
+bool dense_f32(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+               void* stream) {
+    static const bool on = env_on("STRATA_DENSE_F32");
+    if (!on) return false;
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    const Backend b = backend(q.get_device());
+    if (!b.blas) return false;
+    struct Copies { float* p = nullptr; size_t n = 0; };
+    static std::mutex mu;
+    static std::unordered_map<const sycl::queue*, Copies> copies;
+    const size_t need = (size_t) (T + N) * (size_t) K;
+    float* buf = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        Copies& c = copies[&q];
+        if (c.n < need) {
+            q.wait();
+            if (c.p != nullptr) sycl::free(c.p, q);
+            c.p = sycl::malloc_device<float>(need, q);
+            c.n = c.p != nullptr ? need : 0;
+        }
+        buf = c.p;
+    }
+    if (buf == nullptr) return false;
+    float* xf = buf;
+    float* wf = buf + (size_t) T * (size_t) K;
+    const auto* xh = reinterpret_cast<const sycl::half*>(X);
+    const auto* wh = reinterpret_cast<const sycl::half*>(W);
+    q.parallel_for(sycl::range<1>((size_t) T * (size_t) K), [=](sycl::id<1> i) { xf[i] = (float) xh[i]; });
+    q.parallel_for(sycl::range<1>((size_t) N * (size_t) K), [=](sycl::id<1> i) { wf[i] = (float) wh[i]; });
+    try {
+        namespace om = oneapi::math;
+        om::blas::column_major::gemm(q, om::transpose::trans, om::transpose::nontrans, N, T, K, 1.0f, wf, K, xf, K, 0.0f,
+                                     Y, ldy);
+        return true;
+    } catch (const oneapi::math::exception& e) {
+        std::fprintf(stderr, "strata: oneMath (STRATA_DENSE_F32): %s; the FP16 products instead\n", e.what());
+        return false;
+    }
+}
 #endif
 }  // namespace
 
@@ -261,6 +306,7 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
 #if STRATA_ONEMATH
+    if (dense_f32(X, W, Y, T, N, K, ldy, stream_)) return;
     if (blas<sycl::half>(X, W, Y, T, N, K, ldy, false, stream_)) return;
 #endif
     if (strata::kernels::xmx_gemm_ok(X, W, Y, N, K, ldy))
