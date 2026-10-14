@@ -1181,6 +1181,12 @@ That is the same value as the text-only default, but the engine then no longer l
 ([XE.md](XE.md#the-vram-reserve-on-a-small-card)).
 The GPU encoder's own VRAM can leave the expert cache smaller and the text a little slower.
 
+**The encoder only while there are pictures** (opt-in, upstream ca41a6b9): with the config's `"vram_elastic": true`, `"elastic": true` in the `"vision"` section keeps the GPU encoder from starting with the server, so the expert cache keeps all of the VRAM.
+The first picture's request makes the cache keep `"elastic_mib"` (default 2048) free on top of the reserve and starts the encoder there (a few seconds).
+After `"elastic_idle_s"` (default 120) without a picture it stops between requests and the cache takes the VRAM back.
+A `POST /v1/vram` while the encoder runs stacks the reserve on top of the encoder's share; an unload stops the encoder too.
+Without `"vram_elastic"` the server says so and starts the encoder with the model, as before.
+
 The two GPU encoder builds (Vulkan, and SYCL in contrib-icpx), how their results differ, and the order in which the server falls back to the CPU are in [XE.md](XE.md#images).
 A picture becomes up to 1,024 tokens of the context (a 640x480 photo: 300).
 The same picture sent again, as chat apps do on every turn, is encoded only once.
