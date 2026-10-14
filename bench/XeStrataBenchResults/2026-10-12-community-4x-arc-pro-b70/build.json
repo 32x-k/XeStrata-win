@@ -1,0 +1,29 @@
+{
+ "source": "local",
+ "backend": "xe",
+ "version": "0.1.43.1",
+ "compiler": {
+  "cxx": "<repo>/.tools/intel-llvm/install/bin/clang++",
+  "version": "DPC++ compiler 7.1.0 (pre-release) build based on: clang version 22.1.0 (https://github.com/intel/llvm.git 504366f4b82ff00bbac7b0c956635eed8bc599d8)",
+  "kind": "intel-llvm",
+  "xmx": true,
+  "license": "contrib",
+  "cuda_archs": [],
+  "onemkl": true,
+  "hip_archs": []
+ },
+ "lib_dirs": [
+  "<repo>/.tools/intel-llvm/install/lib"
+ ],
+ "src": "e70297365a51145c",
+ "vision_srcs": {},
+ "modes_built_and_tested": {
+  "free": "built, CTest 92/92 pass",
+  "contrib-llvm": "built, CTest 92/92 pass (the binary measured here)",
+  "contrib-icpx": "not built"
+ },
+ "ctest": {
+  "free": 92,
+  "contrib_llvm": 92
+ }
+}

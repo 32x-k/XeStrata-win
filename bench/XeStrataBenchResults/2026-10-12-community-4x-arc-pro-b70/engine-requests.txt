@@ -1,0 +1,13 @@
+# Engine per-request lines, this run (the source of results.csv and matrix.jsonl)
+strata serve: prompt 4154 tokens = 0 reused + 4154 read in 4497 ms (923.8 tok/s), 8 generated in 280 ms (28.5 tok/s), drafts accepted 5 of 5, 1 checkpoints
+strata serve: prompt 4154 tokens = 0 reused + 4154 read in 3745 ms (1109.1 tok/s), 256 generated in 3355 ms (76.3 tok/s), drafts accepted 138 of 183, 1 checkpoints
+strata serve: prompt 4154 tokens = 0 reused + 4154 read in 3737 ms (1111.4 tok/s), 256 generated in 3262 ms (78.5 tok/s), drafts accepted 132 of 181, 1 checkpoints
+strata serve: prompt 4154 tokens = 0 reused + 4154 read in 3736 ms (1111.9 tok/s), 256 generated in 3241 ms (79.0 tok/s), drafts accepted 136 of 177, 1 checkpoints
+strata serve: prompt 32702 tokens = 0 reused + 32702 read in 17609 ms (1857.2 tok/s), 8 generated in 104 ms (77.2 tok/s), drafts accepted 5 of 5, 2 checkpoints
+strata serve: prompt 32702 tokens = 0 reused + 32702 read in 17501 ms (1868.6 tok/s), 256 generated in 3014 ms (84.9 tok/s), drafts accepted 143 of 176, 2 checkpoints
+strata serve: prompt 32702 tokens = 0 reused + 32702 read in 17500 ms (1868.7 tok/s), 256 generated in 3560 ms (71.9 tok/s), drafts accepted 128 of 177, 2 checkpoints
+strata serve: prompt 32702 tokens = 0 reused + 32702 read in 17503 ms (1868.3 tok/s), 256 generated in 3557 ms (72.0 tok/s), drafts accepted 131 of 176, 2 checkpoints
+strata serve: prompt 127531 tokens = 0 reused + 127531 read in 57053 ms (2235.3 tok/s), 8 generated in 108 ms (74.4 tok/s), drafts accepted 5 of 5, 6 checkpoints
+strata serve: prompt 127531 tokens = 0 reused + 127531 read in 57101 ms (2233.4 tok/s), 256 generated in 3532 ms (72.5 tok/s), drafts accepted 137 of 191, 6 checkpoints
+strata serve: prompt 127531 tokens = 0 reused + 127531 read in 57129 ms (2232.3 tok/s), 256 generated in 3504 ms (73.1 tok/s), drafts accepted 137 of 171, 6 checkpoints
+strata serve: prompt 127531 tokens = 0 reused + 127531 read in 57112 ms (2233.0 tok/s), 256 generated in 3569 ms (71.7 tok/s), drafts accepted 129 of 169, 6 checkpoints
