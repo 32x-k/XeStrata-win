@@ -7895,6 +7895,25 @@ int main(int argc, char** argv) {
                                          "slots are written - leaves room; decode can be several times slower with the "
                                          "card this full\n", (long long) xcache.slots());
             }
+            // #2192 (upstream b5217c8b): the same check on a layer split's later cards; the line above reads the first
+            // GPU alone.  On 2x RTX 2080 Ti one card had 740 MiB free while the other started its window captures at
+            // 153 MiB and fell to 52, and the first window on it never finished.  Said, never changed.
+            for (const auto& stp : stages) {
+                const strata::core::OnDevice on(stp->dev);
+                size_t sf = 0, stot = 0;
+                if (!strata::gpu::mem_info(&sf, &stot)) continue;
+                const int64_t sf_mib = (int64_t) (sf >> 20);
+                const int later_reserve = o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
+                if (sf_mib >= 512)
+                    std::fprintf(stderr, "strata serve: GPU %d: %lld MiB of VRAM free with everything loaded\n", stp->dev,
+                                 (long long) sf_mib);
+                else
+                    std::fprintf(stderr, "strata serve: GPU %d: %lld MiB of VRAM free with everything loaded - LOW: its "
+                                         "window graphs are captured on first use and need room too, and a full card can "
+                                         "stall a request; add --vram-reserve-later-mib %lld to the config's args (or "
+                                         "lower --max-context)\n",
+                                 stp->dev, (long long) sf_mib, (long long) (later_reserve + 768 - sf_mib));
+            }
         }
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
         {
