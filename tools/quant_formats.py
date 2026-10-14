@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Per-layer tensor formats of a (sharded) GGUF, read from the headers only (docs/QUANTS.md).
 
     python tools/quant_formats.py PATH-OR-GLOB [...]           local shards (any shard; all are read)
@@ -20,6 +21,7 @@ import pathlib
 import re
 import sys
 import urllib.request
+from collections.abc import Sequence
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import gguf_reader as G  # noqa: E402
@@ -91,7 +93,7 @@ def ranges(layers: list[int]) -> str:
     return ", ".join(out)
 
 
-def summarize(heads: list[Header]) -> dict:
+def summarize(heads: Sequence[G.GGUFFile]) -> dict:
     roles: dict[str, dict[str, dict]] = {}
     per_layer: dict[int, dict[str, str]] = {}
     for h in heads:
@@ -123,8 +125,8 @@ def render(name: str, s: dict) -> str:
     for layer, d in s["per_layer"].items():
         combos.setdefault((d.get("gate"), d.get("up"), d.get("down")), []).append(layer)
     lines += ["| Routed gate / up / down | Layers |", "|---|---|"]
-    for (g, u, dn), lay in sorted(combos.items(), key=lambda kv: -len(kv[1])):
-        lines.append(f"| {g} / {u} / {dn} | {ranges(lay)} |")
+    for (g, u, dn), in_layers in sorted(combos.items(), key=lambda kv: -len(kv[1])):
+        lines.append(f"| {g} / {u} / {dn} | {ranges(in_layers)} |")
     return "\n".join(lines) + "\n"
 
 
@@ -135,6 +137,7 @@ def main() -> int:
     ap.add_argument("--name")
     ap.add_argument("--json")
     a = ap.parse_args()
+    heads: Sequence[G.GGUFFile]
     if a.hf:
         heads = hf_headers(*a.hf)
         name = a.name or a.hf[2]

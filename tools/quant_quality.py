@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """The quant quality yardstick (MODEL-UPDATE.md, Phase 0): teacher-forced top-1 agreement and KL of a quant against
 Q8_0, on one fixed text set (data/quant_quality/v1: code, docs, English, other languages, an agent transcript).
 
     python tools/quant_quality.py ids --tokenizer DIR [--set data/quant_quality/v1] [--out set.ids.json]
         tokenizes the set (each segment cut to --seg-tokens, default 1000) - the ids file is committed with the set
         (data/quant_quality/v1/set.ids.json), so a box without the tokenizer scores the same positions
-    python tools/quant_quality.py run --config CFG.json --out RUN.tsv [--ids set.ids.json] [--env K=V ...] [--gpu-experts]
+    python tools/quant_quality.py run --config CFG.json --out RUN.tsv [--ids set.ids.json] [--env K=V ...]
+        [--gpu-experts]
         one `strata --serve` engine (the config's exe and args), every segment one request whose tokens are all read
         through the decode windows (--short-read), where STRATA_LOGPOS / STRATA_LOGPOS_TOPK=64 write, per position,
         the log-probability of the text's next token and the 64 most likely tokens.  Fixed: the experts on the CPU
         (one VRAM slot, --expert-cache 1: the verify windows need a profile-filled tier, so the config must have
         --expert-profile; --gpu-experts: 1500 slots), no expert adaptation, no PCIe share, no suffix drafts, no prompt
-        cache, FP16 K/V, STRATA_ROUTE_TAIL_SKIP=0, STRATA_PREFILL_CPU_SHARE=0.  RUN.tsv + RUN.tsv.seg.json (line ranges).
+        cache, FP16 K/V, STRATA_ROUTE_TAIL_SKIP=0, STRATA_PREFILL_CPU_SHARE=0.  RUN.tsv + RUN.tsv.seg.json (line
+        ranges).
     python tools/quant_quality.py compare REF.tsv RUN.tsv [...]   (REF = the Q8_0 run)
         per segment and overall: top-1 agreement (same argmax), mean / p99 KL(REF || RUN) over REF's 64 most likely
         tokens (both renormalized to that set; a token RUN does not list gets RUN's 64th log-probability), and the
@@ -53,7 +56,7 @@ def cmd_ids(a) -> int:
     import strata_tokenizer as ST  # noqa: E402
     tp = pathlib.Path(a.tokenizer)
     vocab = json.loads((tp / "vocab.json").read_text(encoding="utf-8"))
-    toks = [None] * len(vocab)
+    toks: list = [None] * len(vocab)
     for t, i in vocab.items():
         toks[i] = t
     tok = ST.Tokenizer(toks, (tp / "merges.txt").read_text(encoding="utf-8").split("\n"),
@@ -128,6 +131,7 @@ def cmd_run(a) -> int:
     print("engine:", " ".join(args), flush=True)
     p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errf, text=True,
                          cwd=cfg.get("cwd"), env=env, bufsize=1)
+    assert p.stdin is not None and p.stdout is not None
     for line in p.stdout:
         if line.startswith("READY"):
             break
@@ -165,10 +169,10 @@ def cmd_run(a) -> int:
         p.kill()
     errf.close()
     err = pathlib.Path(str(out) + ".stderr.txt").read_text(errors="replace")
-    cache = [l for l in err.splitlines() if "expert cache" in l][:3]
+    cache = [ln for ln in err.splitlines() if "expert cache" in ln][:3]
     pathlib.Path(str(out) + ".seg.json").write_text(json.dumps({"segments": segs, "config": a.config,
-                                                                 "args": args, "env": a.env or [],
-                                                                 "expert_cache_lines": cache}, indent=1))
+                                                                "args": args, "env": a.env or [],
+                                                                "expert_cache_lines": cache}, indent=1))
     return 0
 
 
@@ -207,6 +211,7 @@ def cmd_prompt(a) -> int:
     print("engine:", " ".join(args), flush=True)
     p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errf, text=True,
                          cwd=cfg.get("cwd"), env=env, bufsize=1)
+    assert p.stdin is not None and p.stdout is not None
     for line in p.stdout:
         if line.startswith("READY"):
             break
@@ -261,7 +266,8 @@ def cmd_pcompare(a) -> int:
             agree += int(lr.argmax() == la.argmax())
         kls.sort()
         n = len(kls)
-        print(f"{r.name:40s} prompts {n:3d}  top-1 {100 * agree / max(n, 1):6.2f}%  KL mean {sum(kls) / max(n, 1):.5f}  "
+        print(f"{r.name:40s} prompts {n:3d}  top-1 {100 * agree / max(n, 1):6.2f}%  "
+              f"KL mean {sum(kls) / max(n, 1):.5f}  "
               f"median {kls[n // 2] if n else float('nan'):.5f}  max {kls[-1] if n else float('nan'):.5f}")
     return 0
 
@@ -284,7 +290,7 @@ def read_run(path: str) -> dict:
 
 
 def compare(ref: dict, run: dict) -> dict:
-    res, allk, tot = {}, [], {"n": 0, "agree": 0, "nll_r": 0.0, "nll_a": 0.0, "kl": 0.0}
+    res, all_kl, tot = {}, [], {"n": 0, "agree": 0, "nll_r": 0.0, "nll_a": 0.0, "kl": 0.0}
     for name, rr in ref.items():
         ra = run.get(name, {})
         pos = sorted(set(rr) & set(ra))
@@ -305,7 +311,7 @@ def compare(ref: dict, run: dict) -> dict:
             pa = [math.exp(da.get(i, floor)) for i, _ in kr]
             sr, sa = sum(pr), sum(pa)
             kls.append(sum((x / sr) * math.log((x / sr) / (y / sa)) for x, y in zip(pr, pa) if x > 0))
-        allk += kls
+        all_kl += kls
         if n:
             res[name] = {"positions": n, "top1": agree / n, "kl": sum(kls) / n,
                          "ppl_ref": math.exp(nll_r / n), "ppl": math.exp(nll_a / n)}
@@ -314,11 +320,11 @@ def compare(ref: dict, run: dict) -> dict:
         tot["nll_r"] += nll_r
         tot["nll_a"] += nll_a
         tot["kl"] += sum(kls)
-    n = max(tot["n"], 1)
-    allk.sort()
-    res["all"] = {"positions": tot["n"], "top1": tot["agree"] / n, "kl": tot["kl"] / n,
-                  "kl_p99": allk[int(0.99 * (len(allk) - 1))] if allk else float("nan"),
-                  "ppl_ref": math.exp(tot["nll_r"] / n), "ppl": math.exp(tot["nll_a"] / n)}
+    nt = max(int(tot["n"]), 1)
+    all_kl.sort()
+    res["all"] = {"positions": tot["n"], "top1": tot["agree"] / nt, "kl": tot["kl"] / nt,
+                  "kl_p99": all_kl[int(0.99 * (len(all_kl) - 1))] if all_kl else float("nan"),
+                  "ppl_ref": math.exp(tot["nll_r"] / nt), "ppl": math.exp(tot["nll_a"] / nt)}
     return res
 
 
@@ -354,9 +360,11 @@ def main() -> int:
     p.add_argument("--ids", default=str(SET_DIR / "set.ids.json"))
     p.add_argument("--env", action="append")
     p.add_argument("--gpu-experts", nargs="?", const=True, default=False,
-                   help="--expert-cache 1500 (or the N given, e.g. auto) instead of one slot (the experts on the GPU kernels)")
+                   help="--expert-cache 1500 (or the N given, e.g. auto) instead of one slot "
+                        "(the experts on the GPU kernels)")
     p.add_argument("--min-free-gb", type=float, default=16)
-    p.add_argument("--wrap", help="a command prefix for the engine, e.g. 'systemd-run --user --scope -p MemoryMax=200G'")
+    p.add_argument("--wrap",
+                   help="a command prefix for the engine, e.g. 'systemd-run --user --scope -p MemoryMax=200G'")
     p = sub.add_parser("prompt", help="the batched prompt path's next-token logits after 20 prompts (a directory)")
     p.add_argument("--config", required=True)
     p.add_argument("--out", required=True)
