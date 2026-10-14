@@ -412,6 +412,21 @@ AMD のコードは、どの版にも、そのディストリビューション�
 - intel/llvm 7.1.1 の SYCL には sm_90 より上の名前がないので、RTX 50 などの新しい GPU は sm_90 の PTX をドライバーがコンパイルして動かします。
 - PTX はツールキットの版なので、ドライバーはその CUDA の版に対応している必要があります。
 
+### Windows の 7z
+
+Windows 版の 7z も、同じ `tools/package/build.sh` で、Ubuntu 26.04 の使い捨てのコンテナの中で作ります（`tools/package/windows.sh`）。
+
+```bash
+tools/package/build.sh windows cuda12.4      # XeStrata-<版>-windows-x64.7z
+```
+
+- すべて Linux の上で Windows 向けにクロスビルドします。intel/llvm（Linux 版の contrib と、Windows 版の SYCL のランタイム）、エンジン（contrib-llvm のモード、NVIDIA のコードは cuda12.4 の deb と同じ）、.NET の入口（`dotnet-sdk-10.0`）、Python の embeddable 版と wheel を作り、`tools/package/windows_bundle.py` がフォルダーと 7z にします。
+- MSVC の CRT と Windows SDK は xwin で Microsoft から取り、ライセンスに同意します（自由ソフトウェアではなく、7z には入れません）。CUDA の Windows 版のヘッダーとインポートライブラリも 7z には入れません。
+- Ubuntu 26.04 のパッケージと同じ ccache（`build/pkg-ccache/ubuntu26.04/`）を使い、xwin と NuGet の取得物は `build/pkg-cache/windows/` に残します。
+- 7z の中の exe・DLL・Python のパッケージは、どれも `windows_bundle.py` の部品の一覧にあるものでなければならず、Visual C++ のランタイムや NVIDIA のライブラリが入っていると止まります。
+  `THIRD-PARTY-NOTICES.md` に部品・版・ライセンス・入手元を書き、`licenses/` にライセンスの全文を置きます。
+- 出てくるものは `build/pkg/windows-cuda12.4/` の 7z と `BUILDINFO` です。
+
 ### パッケージの中身
 
 どの版（`xestrata-free`、`xestrata-contrib-cuda<版>`）も、1 つのパッケージに次のものを入れます。

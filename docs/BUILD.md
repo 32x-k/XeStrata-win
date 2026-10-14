@@ -410,6 +410,21 @@ Every variant has AMD code for the GPUs the distribution's rocBLAS (ROCm 7.1) ha
 - intel/llvm 7.1.1's SYCL has no name above sm_90: newer GPUs (an RTX 50) run sm_90's PTX, which their driver compiles.
 - The PTX is the toolkit's version, so the driver must support that CUDA version.
 
+### The Windows 7z
+
+The Windows 7z is built with the same `tools/package/build.sh`, in a disposable Ubuntu 26.04 container (`tools/package/windows.sh`).
+
+```bash
+tools/package/build.sh windows cuda12.4      # XeStrata-<version>-windows-x64.7z
+```
+
+- All of it is cross-built on Linux for Windows: intel/llvm (the Linux contrib toolchain and the SYCL runtime for Windows), the engine (the contrib-llvm mode, the NVIDIA code as the cuda12.4 deb's), the .NET launchers (`dotnet-sdk-10.0`), and Python's embeddable distribution with the wheels; `tools/package/windows_bundle.py` makes the folder and the 7z.
+- The MSVC CRT and the Windows SDK come from Microsoft through xwin, its license accepted (they are not free software and do not go into the 7z). Neither do the Windows CUDA headers and import libraries.
+- It uses the Ubuntu 26.04 packages' ccache (`build/pkg-ccache/ubuntu26.04/`) and keeps xwin's and NuGet's downloads in `build/pkg-cache/windows/`.
+- Every exe, DLL and Python package in the 7z must be one of `windows_bundle.py`'s components; a Visual C++ runtime or an NVIDIA library in it stops the build.
+  `THIRD-PARTY-NOTICES.md` names each component, its version, license and source, and `licenses/` holds the license texts.
+- What comes out: the 7z and `BUILDINFO` in `build/pkg/windows-cuda12.4/`.
+
 ### What the packages hold
 
 Each variant (`xestrata-free`, `xestrata-contrib-cuda<version>`) is one package with the following.
