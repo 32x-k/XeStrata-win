@@ -55,7 +55,7 @@ Write `.upstream-<version>.md` (add it to `.git/info/exclude`, as `.upstream-014
 | P | speed paths | as ideas (below) |
 | S | upstream's `sycl/` | not taken, and not measured in a merge (the release's table compares it) |
 | T | serve, setup, tools | ported (step 3) |
-| W | Windows | not taken |
+| W | Windows | ported as the group it would otherwise be (E, P, T) is, onto XeStrata's Windows code (AGENTS.md, Operating systems); only a part for what XeStrata's Windows build does not have (a backend, upstream's own packaging) gets `N/A` |
 
 Each line ends with what became of it: the idea it belongs to, a commit, or `N/A` and why.
 
@@ -83,7 +83,7 @@ python .claude/skills/upstream-sync/scripts/carryover.py <tag> --ref dev --ledge
 ```
 
 It compares the lines each commit added that upstream still has at the tag with the same file in `dev` (comments and short lines left out); a fix of one or two lines is not found this way.
-Read each one listed: what XeStrata does not have and needs goes into the ledger (a line under its own heading) and is ported as in step 3; the rest gets `N/A` and why (CUDA, HIP or Windows only; XeStrata does it another way), so the next run's `--ledger` leaves it out.
+Read each one listed: what XeStrata does not have and needs goes into the ledger (a line under its own heading) and is ported as in step 3; the rest gets `N/A` and why (CUDA or HIP only; for what XeStrata's Windows build does not have; XeStrata does it another way), so the next run's `--ledger` leaves it out.
 
 **The findings.** upstream's records and community reports of this range (`bench/`, its investigation documents) said something about a GPU or a setting XeStrata runs on (an Intel Arc investigation, a card's bottleneck, a setting users run): a line each, with what XeStrata could take from it. They are worked like ideas in step 4 when they point at something to try.
 
@@ -101,7 +101,8 @@ What step 3 takes from it keeps those holders and that license (AGENTS.md, Licen
 XeStrata's kernels are written from scratch (SYCL) and its prompt path and runtime have moved far from upstream's, so the tag cannot be merged (no `git merge`, no `git merge-tree`): every change taken is ported by hand onto `dev`, and the tag is recorded at the end, by a commit that keeps the tree as it is (step 9), as c3aa33ae (v0.1.40.2) and 0509e3e6 did.
 
 - One commit per upstream change, or per idea (step 2), with upstream's hashes in the message: `... （upstream 1e6cec80、e57c9072）`.
-- Groups E, M and T, and the parts of A, N and P that are shared code, are ported here or in step 4; `sycl/`, the CUDA and HIP sources, the HIP tables and the Windows parts are not taken.
+- Groups E, M and T, and the parts of A, N and P that are shared code, are ported here or in step 4; `sycl/`, the CUDA and HIP sources and the HIP tables are not taken.
+- Group W is ported as the group it would otherwise be, in `#if defined(_WIN32)` branches or `src/platform/` as AGENTS.md says; running it on Windows waits for a milestone (`unverified` until then).
 - Each ledger line gets the commit that took it, or `N/A` and why (the code is not in XeStrata, or XeStrata does it another way).
 - The documents XeStrata has (Japanese first) get what is true of XeStrata; upstream's new documents are not copied as files.
 - Once the ledger is done, set `STRATA_UPSTREAM_VERSION` in `CMakeLists.txt` to the tag and `XESTRATA_REVISION` back to 1 (AGENTS.md, "Versions"), and replace any old upstream hash a document names with the rewritten one.
@@ -177,6 +178,7 @@ As AGENTS.md says, with intel/llvm only, in the free and contrib-llvm modes (the
 
 - on the development machine, build and run CTest in `build/free` (without oneAPI's environment) and `build/contrib-llvm`;
 - in the AMD container, its contrib-llvm build with HIP (`STRATA_HIP_ARCHS`), and CTest;
+- the Windows cross build (docs/DEVTOOLS.md, Windows cross build), whole and linked: no new warnings;
 - a change NVIDIA's device compile sees is run on the RTX 4070.
 
 A warning or a mismatch only one mode shows is traced back to the commit that caused it and fixed there.
