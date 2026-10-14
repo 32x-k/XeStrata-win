@@ -145,7 +145,7 @@ def image_env(cfg: dict, base: dict | None = None) -> dict:
                    "vulkan": "GGML_VK_VISIBLE_DEVICES"}.get(str(cfg.get("backend")))
         if dev_var:
             env[dev_var] = str(gpu)
-            if var == "CUDA_VISIBLE_DEVICES":
+            if dev_var == "CUDA_VISIBLE_DEVICES":
                 env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     for k, v in (cfg.get("env") or {}).items():
         env[str(k)] = str(v)
