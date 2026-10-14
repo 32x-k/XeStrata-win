@@ -33,7 +33,7 @@ Strata との主な違い:
 - **Intel Arc 向け**で、AMD と NVIDIA の GPU でも動きます。
 - **GPU は 1 枚が基本**です。同じ PC の 2 枚以上の GPU に層を分けて載せることもできます（[MULTIGPU](docs/MULTIGPU.ja.md)）。
   Intel・AMD・NVIDIA のメーカーの違う GPU も組み合わせられます（例: Intel Arc の Battlemage と NVIDIA の Ada。NVIDIA を含むときは contrib-llvm のビルド）。
-- **Linux だけ**です。Windows には対応しません。WSL 2 は動くかもしれません（プルリクエスト歓迎）。
+- **Linux と Windows** で動きます。Windows は Intel と NVIDIA の GPU で、AMD の GPU は Linux だけです（[Windows](#windows)）。WSL 2 は動くかもしれません（プルリクエスト歓迎）。
 - **自由ソフトウェアだけでも動きます**（free のビルド、Debian main に入れられる程度に自由な構成。[ソースから作ります](docs/BUILD.ja.md#deb-と-rpm-のパッケージ)）。
   配っている contrib-llvm の版は、自由ソフトウェアでない Intel の oneMKL と NVIDIA の cuBLAS を、入っていれば使います（[インストール](#インストール)）。
 
@@ -45,13 +45,13 @@ Strata との主な違い:
 | CPU | x86-64 で AVX2 があるもの。AVX-512（F、BW、VL、VNNI、VBMI）があれば、CPU の計算に AVX-512 を使います。 |
 | RAM | モデルの大きさによって 32〜62 GB（[モデルの選び方](#モデルの選び方)）。 |
 | ディスク | モデルに 60〜110 GB ほど、ほかに MTP 層に約 6 GB。SSD（NVMe）を強く勧めます。 |
-| OS | Linux（WSL 2 は動くかもしれません。プルリクエスト歓迎）。パッケージは Ubuntu 26.04 と Fedora 44 向けです。ほかのディストリビューションでは[ソースから入れます](docs/BUILD.ja.md#ソースから入れる)。 |
+| OS | Linux（WSL 2 は動くかもしれません。プルリクエスト歓迎）。パッケージは Ubuntu 26.04 と Fedora 44 向けです。ほかのディストリビューションでは[ソースから入れます](docs/BUILD.ja.md#ソースから入れる)。Windows 10 と 11（x64）は 7z で配ります（[Windows](#windows)）。 |
 | BIOS | 単体の GPU では Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
 
 - **行列エンジン**: Intel の XMX、AMD の WMMA（RDNA3 以降）、NVIDIA の Tensor Core を使い、ない GPU では DP4a などの整数の内積の命令で計算します。
   どれを使うかは、GPU が報告する能力で決めます。行列エンジンがないと prefill が遅くなりますが、動きます。
 - **確かめた GPU**: 開発と確認は Arc Pro B70（Xe2、32 GB）で行っています。NVIDIA は RTX 4070 と RTX 3070、AMD は RX 9060 XT（RDNA4）で確かめています。
-  Arc A380 では計算の正しさだけを確かめ、モデルは動かしていません。
+  Arc A380 では計算の正しさだけを確かめ、モデルは動かしていません。Windows は RTX 3050 Laptop（4 GB）で確かめています。
   小さな GPU は、B70 で使えるメモリと XMX を制限して確かめています。
 - **CPU 内蔵のグラフィックス**: 起動と prefill までを確かめています。メモリが RAM と共有で、
   XMX のないものが多いので、遅くなります。
@@ -227,6 +227,17 @@ sudo dnf remove xestrata-contrib-cuda13.4    # Fedora（同じ）
 `xestrata --remove-data` をせずにパッケージを消すと、ホームのモデルのファイルと設定は残ります。
 
 ソースから `./setup.sh` で入れる方法は [docs/BUILD.ja.md](docs/BUILD.ja.md#ソースから入れる) にあります。
+
+### Windows
+
+1. [GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) から `XeStrata-<版>-windows-x64.7z` を取ってきて（`SHA256SUMS` も一緒に）、好きなフォルダーに展開します。
+1. `xestrata.exe` を起動します。導入（GPU とモデルの選択、ダウンロード）と起動を画面で進めます。端末で使うときは `xestrata-cli.exe`（Linux の `xestrata` と同じ使い方）です。
+
+- **要るもの**: [.NET 10 のランタイム](https://dotnet.microsoft.com/download/dotnet/10.0)と [Visual C++ の再頒布可能パッケージ](https://aka.ms/vs/17/release/vc_redist.x64.exe)、GPU のドライバー。
+  Visual C++ の再頒布可能パッケージがなければ、`xestrata.exe` が知らせて止まります。
+- **GPU**: Intel と NVIDIA です（NVIDIA は Pascal 以降、cuda12.4 のパッケージと同じコード）。AMD の GPU は Windows ではまだ使えません。
+- **置き場所**: 7z のフォルダーには書き込みません。設定は `%APPDATA%\xestrata`、ログなどは `%LOCALAPPDATA%\xestrata`、モデルはデータのフォルダー（既定は `%LOCALAPPDATA%\xestrata\data`）に置きます。
+- **更新**: 新しい 7z を別のフォルダーに展開して、そちらの `xestrata.exe` を起動します。設定とモデルはそのまま使います。
 
 ## 使い方
 
