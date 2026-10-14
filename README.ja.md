@@ -88,8 +88,9 @@ AMD の GPU では、prefill の密な行列積をディストリビューショ
 | **[Qwen3.8-Flash-Next](#qwen38-flash-next)** | 1,250 億 | 32〜62 GB | 12 GB 以上を勧めます | いちばん賢い。RAM の多い PC 向け |
 | **[Ornith-1.5](#ornith-15beta)**（BETA） | 350 億（1 トークンで 30 億） | 22〜80 GB | 4 GB から | RAM の少ない PC 向け |
 | **[llm-jp-4.1](#llm-jp-41beta)**（BETA） | 320 億（1 トークンで 30 億） | 30〜73 GB | 4 GB から | 日本語と英語の思考するモデル |
+| **[Qwen3.6-35B-A3B](#qwen36-35b-a3bbeta)**（BETA） | 350 億（1 トークンで 30 億） | 31〜46 GB | 4 GB から | 思考するモデル。RAM の少ない PC 向け |
 
-BETA の 2 つは、画像、2 枚以上の GPU、Intel の CPU 内蔵の GPU にまだ対応していません（[詳細](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41)）。
+BETA の 3 つは、画像、2 枚以上の GPU、Intel の CPU 内蔵の GPU にまだ対応していません（[詳細](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41qwen36-35b-a3b)）。
 
 迷ったら、RAM が 48 GB 以上の PC では Qwen3.8-Flash-Next の **IQ2_XS** を選んでください。
 RAM がそれより少ない PC では、Qwen3.8-Flash-Next の Coder（32 GB）か Ornith-1.5 が選べます。
@@ -155,7 +156,18 @@ GSQ-RCO の 2 つは、pfeifferj による[コミュニティの再現](https://
 | Q4_K_M | 21.5 GB | 30 GB | 4 GB から |
 | BF16 | 64.3 GB | 73 GB | 8 GB から |
 
-BETA の 2 つの RAM の目安は、ダウンロードの大きさに約 8 GB を足したものです。
+### Qwen3.6-35B-A3B（BETA）
+
+[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)（Qwen、Apache-2.0。GGUF は Unsloth が MTP の層付きで作ったもの）: Qwen3.5 系の思考する MoE で、文脈は 256K までです。
+モデルの MTP の層で下書きを作り、decode を速くします。
+
+| 大きさ | ダウンロード | RAM の目安 | VRAM |
+| --- | ---: | ---: | ---: |
+| UD-Q4_K_XL | 22.9 GB | 31 GB | 4 GB から |
+| UD-Q6_K_XL | 32.6 GB | 41 GB | 6 GB から |
+| Q8_0 | 37.8 GB | 46 GB | 6 GB から |
+
+BETA の 3 つの RAM の目安は、ダウンロードの大きさに約 8 GB を足したものです。
 RAM がそれより少ないと、エキスパートを RAM に読み込まずにモデルのファイルから読むので、遅くなります。
 
 ## インストール

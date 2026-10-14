@@ -91,9 +91,10 @@ So XeStrata runs only on the GPUs the distribution's rocBLAS has code for.
 | **[Qwen3.8-Flash-Next](#qwen38-flash-next)** | 125B | 32-62 GB | 12 GB or more recommended | the smartest; for a PC with a lot of RAM |
 | **[Ornith-1.5](#ornith-15-beta)** (BETA) | 35B (3B a token) | 22-80 GB | from 4 GB | a PC with less RAM |
 | **[llm-jp-4.1](#llm-jp-41-beta)** (BETA) | 32B (3B a token) | 30-73 GB | from 4 GB | a thinking model for Japanese and English |
+| **[Qwen3.6-35B-A3B](#qwen36-35b-a3b-beta)** (BETA) | 35B (3B a token) | 31-46 GB | from 4 GB | a thinking model; a PC with less RAM |
 
-The two BETA models do not yet take images, two or more GPUs, or Intel's integrated GPUs
-([details](docs/DETAILS.md#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41)).
+The three BETA models do not yet take images, two or more GPUs, or Intel's integrated GPUs
+([details](docs/DETAILS.md#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41-qwen36-35b-a3b)).
 
 Not sure? On a PC with 48 GB of RAM or more, take Qwen3.8-Flash-Next's **IQ2_XS**.
 With less RAM than that, Qwen3.8-Flash-Next's Coder (32 GB) or Ornith-1.5 is the one to choose.
@@ -166,7 +167,19 @@ a thinking model for Japanese and English, with a context of up to 256K.
 | Q4_K_M | 21.5 GB | 30 GB | from 4 GB |
 | BF16 | 64.3 GB | 73 GB | from 8 GB |
 
-For the two BETA models, the RAM is about the download plus 8 GB. With less, the experts are read from the model
+### Qwen3.6-35B-A3B (BETA)
+
+[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) (Qwen, Apache-2.0; the GGUFs with the MTP
+layer by Unsloth): a thinking Qwen3.5-family MoE, with a context of up to 256K.
+It drafts tokens with the model's MTP layer, which makes decode faster.
+
+| Size | Download | RAM (about) | VRAM |
+| --- | ---: | ---: | ---: |
+| UD-Q4_K_XL | 22.9 GB | 31 GB | from 4 GB |
+| UD-Q6_K_XL | 32.6 GB | 41 GB | from 6 GB |
+| Q8_0 | 37.8 GB | 46 GB | from 6 GB |
+
+For the three BETA models, the RAM is about the download plus 8 GB. With less, the experts are read from the model
 file instead of loaded into RAM, which is slower.
 
 ## Install

@@ -245,9 +245,9 @@ every run from a cold OS cache:
 
 The answers were the same tokens in every run.
 
-### Or: models other than Qwen3.8-Flash-Next (Ornith-1.5, llm-jp-4.1)
+### Or: models other than Qwen3.8-Flash-Next (Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B)
 
-setup's first question also offers two MoE models built differently from Qwen3.8-Flash-Next.
+setup's first question also offers three MoE models built differently from Qwen3.8-Flash-Next.
 Each is one GGUF file; the experts are kept in RAM and the most used ones in the GPU's VRAM (the ones VRAM does not hold
 are handled as for Qwen3.8-Flash-Next).
 
@@ -257,6 +257,9 @@ are handled as for Qwen3.8-Flash-Next).
   ISTA-DASLab's).
 - **[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)** (LLM-jp,
   Apache-2.0): a thinking model of 32B with 3B active per token, in Japanese and English, context up to 256K.
+- **[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)** (Qwen, Apache-2.0): a thinking
+  Qwen3.5-family MoE of 35B with 3B active per token, context up to 256K. The GGUFs are Unsloth's UD-Q4_K_XL,
+  UD-Q6_K_XL and Q8_0 with the MTP layer.
 
 | Model | Size | Download |
 | --- | --- | ---: |
@@ -269,6 +272,9 @@ are handled as for Qwen3.8-Flash-Next).
 | | GSQ-RCO-3.5BIT | 15.2 GB |
 | llm-jp-4.1 | **Q4_K_M** | 21.5 GB |
 | | BF16 | 64.3 GB |
+| Qwen3.6-35B-A3B | **UD-Q4_K_XL** | 22.9 GB |
+| | **UD-Q6_K_XL** | 32.6 GB |
+| | Q8_0 | 37.8 GB |
 
 The sizes in bold are the files whose answers this release compared with llama.cpp's.
 The others are made of the same tensor types, checked on those files and in the kernels' tests (setup marks them
@@ -277,10 +283,11 @@ The others are made of the same tensor types, checked on those files and in the 
 ```sh
 ./setup.sh --setup --family ornith --model Q4_K_M
 ./setup.sh --setup --family llmjp
+./setup.sh --setup --family qwen36 --model UD-Q4_K_XL
 ```
 
 The API works, with the thinking kept apart from the answer, streaming and tool calls.
-Ornith's official versions (Q4_K_M to BF16) draft up to two tokens ahead with the model's MTP layer and check them in a window (speculative decoding, greedy requests only; the GSQ-RCO versions and llm-jp have no MTP layer).
+Ornith's official versions (Q4_K_M to BF16) and Qwen3.6 draft up to two tokens ahead with the model's MTP layer and check them in a window (speculative decoding, greedy requests only; the GSQ-RCO versions and llm-jp have no MTP layer).
 Not yet: images, Intel processors' own graphics, more than one GPU (setup uses the
 first), and the options made for Qwen3.8-Flash-Next such as the KV cache's precision and the low-RAM modes.
 When RAM is short for the experts, the engine does not load them and reads them from the model file through the OS
@@ -294,7 +301,7 @@ The engine's options (added to the settings' `args`):
 | `--expert-profile PATH` | fill the experts in VRAM in this profile's order at start |
 | `--expert-profile-save PATH` | write what this run learned as a profile |
 | `--adapt-every N` | windows between swaps of the experts in VRAM (default 4; 0: no swaps) |
-| `--adapt-swaps N` | the most experts one swap moves (default 96) |
+| `--adapt-swaps N` | the most experts one swap moves (default 96; the one right after a prompt moves up to 2,048, those the prompt used most) |
 | `--adapt-mib-per-token N` | the swaps copy at most N MiB for each token read since the last one (default 48; 0: no bound) |
 | `--mmap-experts` | read the experts from the model file instead of loading them into RAM |
 | `--no-pcie-split` | the CPU computes every expert VRAM does not hold |

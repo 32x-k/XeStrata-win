@@ -403,10 +403,10 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
                "models": {
                    "UD-Q4_K_XL": {"repo": _QWEN36, "file": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", "size": 22853663008,
                                   "sha256": "55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1",
-                                  "about": "4-bit (Unsloth Dynamic)"},
+                                  "about": "4-bit (Unsloth Dynamic)", "tested": True},
                    "UD-Q6_K_XL": {"repo": _QWEN36, "file": "Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf", "size": 32611711264,
                                   "sha256": "35fce994cd36104a7dc1bd8a4bdf13778145664c00fdef6773aebc9246e5019c",
-                                  "about": "6-bit (Unsloth Dynamic), closer to the full model"},
+                                  "about": "6-bit (Unsloth Dynamic), closer to the full model", "tested": True},
                    "Q8_0": {"repo": _QWEN36, "file": "Qwen3.6-35B-A3B-Q8_0.gguf", "size": 37801097504,
                             "sha256": "c1283d8b80c3e38b2735ddbc9766d3b3126f44d6c484be419d4e101d09a76131",
                             "about": "8-bit, the closest to the full model"},
