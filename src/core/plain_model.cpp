@@ -40,6 +40,7 @@
 #include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/platform/memory.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -691,7 +692,17 @@ bool PlainModel::open_experts(std::string& err) {
     if (opt_.adapt_every > 0 && opt_.adapt_swaps > 0) disp_.usage.assign((size_t) (L * E), 0.0f);
     // the split of the missed experts between the CPU and PCIe (after Project Maya's CPU lane): the times measured now,
     // while no expert is in VRAM; only from pinned RAM
-    if (opt_.pcie_split && in_ram) {
+    // WSL 2: an RTX 2050 there failed at this point with CUDA error 700 (an illegal address) while the experts' RAM
+    // was read by the GPU's kernels; --no-pcie-split started and answered.  The cause is not known, so under WSL 2 the
+    // split is off unless STRATA_WSL_PCIE_SPLIT=1 asks for it.
+    static const bool wsl_split = [] {
+        const char* v = std::getenv("STRATA_WSL_PCIE_SPLIT");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (opt_.pcie_split && in_ram && strata::platform::under_wsl() && !wsl_split)
+        std::fprintf(stderr, "strata plain: no PCIe split under WSL 2 (the GPU reading the experts' RAM failed there; "
+                             "STRATA_WSL_PCIE_SPLIT=1 tries it): the CPU takes every missed expert\n");
+    else if (opt_.pcie_split && in_ram) {
         std::string why;
         if (measure_pcie_split(disp_, L, split_, why)) {
             disp_.pcie_split = &split_;

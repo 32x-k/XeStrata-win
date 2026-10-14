@@ -32,6 +32,10 @@ bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usag
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
 
+/// Linux under WSL 2 (Microsoft's kernel, "...-microsoft-standard-WSL2" in /proc/sys/kernel/osrelease): the GPU is
+/// Windows' own, behind /dev/dxg.  Always false elsewhere.
+bool under_wsl();
+
 /// Whether `advise_willneed` asks the OS for anything: not on Windows, nor with STRATA_READ_AHEAD=0.
 bool read_ahead_enabled();
 /// Asks the OS to start reading [p, p + bytes) of a file mapping, without waiting.  Linux reads at most one

@@ -3914,11 +3914,8 @@ int main(int argc, char** argv) {
             // upstream #605: --ple-io direct's random reads (up to --ple-inflight at once) are for SSDs; a rotational
             // disk can take longer than the stall watchdog's 60 s for one prompt chunk's rows.  Recommended, not
             // forced.  (WSL's virtual disk says rotational: not there.)
-            std::string dev, rel;
-            std::ifstream osr("/proc/sys/kernel/osrelease");
-            std::getline(osr, rel);
-            const bool wsl = rel.find("microsoft") != std::string::npos || rel.find("Microsoft") != std::string::npos;
-            if (!wsl && on_rotational_disk(o.ple_gguf, dev) == 1)
+            std::string dev;
+            if (!strata::platform::under_wsl() && on_rotational_disk(o.ple_gguf, dev) == 1)
                 std::fprintf(stderr, "strata generate: WARNING: the n-gram table (%s) is on a rotational disk (%s): "
                                      "--ple-io direct reads it at random and can stall a prompt for minutes (#605). "
                                      "--ple-io ram (it then needs RAM for the table) or the model on an SSD is "

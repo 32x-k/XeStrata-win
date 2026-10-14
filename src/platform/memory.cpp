@@ -12,6 +12,7 @@
 #include <cstring>
 #else
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -170,5 +171,22 @@ void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {
         (void) posix_fadvise(fd, (off_t) (offset + at), (off_t) std::min(kAdviseStep, bytes - at), POSIX_FADV_WILLNEED);
 }
 #endif
+
+bool under_wsl() {
+#if defined(__linux__)
+    static const bool wsl = [] {
+        std::string rel;
+        if (std::FILE* f = std::fopen("/proc/sys/kernel/osrelease", "r")) {
+            char line[256] = {0};
+            if (std::fgets(line, sizeof line, f) != nullptr) rel = line;
+            std::fclose(f);
+        }
+        return rel.find("microsoft") != std::string::npos || rel.find("Microsoft") != std::string::npos;
+    }();
+    return wsl;
+#else
+    return false;
+#endif
+}
 
 }  // namespace strata::platform
