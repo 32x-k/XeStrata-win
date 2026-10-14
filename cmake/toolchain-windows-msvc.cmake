@@ -28,7 +28,9 @@ endif()
 
 find_program(STRATA_LLD_LINK NAMES lld-link PATHS /usr/lib/llvm-22/bin /usr/lib/llvm-21/bin /usr/lib/llvm-20/bin
              REQUIRED)
-get_filename_component(_strata_llvm_bin "${STRATA_LLD_LINK}" DIRECTORY)
+# its LLVM's own folder (/usr/bin/lld-link is a link into /usr/lib/llvm-<version>/bin), where llvm-ar and the others are
+get_filename_component(_strata_llvm_bin "${STRATA_LLD_LINK}" REALPATH)
+get_filename_component(_strata_llvm_bin "${_strata_llvm_bin}" DIRECTORY)
 find_program(CMAKE_AR NAMES llvm-ar HINTS "${_strata_llvm_bin}" REQUIRED)
 find_program(CMAKE_RC_COMPILER NAMES llvm-rc HINTS "${_strata_llvm_bin}")
 find_program(CMAKE_MT NAMES llvm-mt HINTS "${_strata_llvm_bin}")
