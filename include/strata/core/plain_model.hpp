@@ -193,7 +193,8 @@ private:
     bool mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* draft, std::string& err);
     /// The chain after mtp_run's first draft: drafts_ up to `want` from position `pos` (the first draft's).
     bool mtp_chain(int want, int64_t pos, std::string& err);
-    bool adapt(std::string& err);
+    /// `max_swaps` > 0: this round moves up to that many, past adapt_swaps and the copy budget (after a prompt).
+    bool adapt(std::string& err, int64_t max_swaps = 0);
     /// The adaptive tier's copies in flight: their experts become resident once the copies are done (`wait`: wait
     /// for them; else only if they are).
     bool settle_swaps(bool wait, std::string& err);

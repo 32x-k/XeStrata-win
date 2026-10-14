@@ -301,6 +301,10 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     const bool ok = prompt_chunks(tokens, n, pos, out, logits, err);
     std::string err2;
     if (!prompt_return(err2) && ok) { err = err2; return false; }
+    // the tier to the experts the prompt routed most, at once (upstream's q36 engine: up to 2048 slot replacements
+    // after a prompt): the rounds between windows move at most adapt_swaps each, so an empty tier (no profile) took
+    // a hundred windows to fill.  The copies run on the copy stream beside the first windows.
+    if (ok && !disp_.usage.empty() && !adapt(err, 2048)) return false;
     return ok;
 }
 

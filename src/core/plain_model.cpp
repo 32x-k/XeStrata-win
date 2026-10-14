@@ -1229,9 +1229,9 @@ bool PlainModel::save_profile(const std::string& path, std::string& err) const {
 // XeStrata's adaptive tier (generate.cpp's `adapt`): per MoE layer, a missing expert routed at least twice (decayed
 // counts) replaces the least-routed resident one when it leads by 1.5, or takes a free slot; at most adapt_swaps a
 // round, the largest gains first; then the counts decay.  Runs between windows, so no window reads a slot it changes.
-bool PlainModel::adapt(std::string& err) {
+bool PlainModel::adapt(std::string& err, int64_t max_swaps) {
     const int64_t L = n_moe_, E = spec_.n_expert;
-    if (!settle_swaps(false, err)) return false;
+    if (!settle_swaps(max_swaps > 0, err)) return false;
     if (!pending_.empty()) return true;   // the last round's copies are still landing: no new round yet
     struct Swap { float gain; int32_t layer, in, out; };   // out < 0: a free slot
     std::vector<Swap> swaps;
@@ -1264,7 +1264,7 @@ bool PlainModel::adapt(std::string& err) {
                                ? (int64_t) (((uint64_t) opt_.adapt_mib_per_token << 20) * (uint64_t) tokens_since_adapt_ / blob)
                                : opt_.adapt_swaps;
     tokens_since_adapt_ = 0;
-    const int64_t cap = std::min<int64_t>(opt_.adapt_swaps, std::max<int64_t>(budget, 1));
+    const int64_t cap = max_swaps > 0 ? max_swaps : std::min<int64_t>(opt_.adapt_swaps, std::max<int64_t>(budget, 1));
     if ((int64_t) swaps.size() > cap) swaps.resize((size_t) cap);
     for (const Swap& w : swaps) {
         if (w.out < 0) {
