@@ -523,8 +523,7 @@ struct Prefill::Impl {
     float *cpu_x = nullptr, *cpu_rows = nullptr;
     size_t cpu_x_n = 0, cpu_rows_n = 0;
     bool cpu_dead = false;   // a pinned buffer of the share could not be had (host memory is short): the GPU does it all
-    std::vector<uint8_t> cpu_nact;
-    std::vector<strata::kernels::cpu::ActQ> cpu_actq;   // a Q2_0 layer's activations (the pool's Q2_0 kernels read ActQ)
+    std::vector<strata::kernels::cpu::NativeAct> cpu_nact;
     std::vector<strata::kernels::cpu::ExpertJobMulti> cpu_jobs;
     // the measured share: running means of the CPU's ms per expert and the GPU's per streamed expert
     double cpu_c_ms = 0, cpu_g_ms = 0, cpu_share_now = 0.5;
@@ -2155,8 +2154,6 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (rows_cpu > 0) {
                         // (the rows buffer was had at its largest after the routing sync)
                         const strata::kernels::cpu::NativeFmt& cf = lay.fmt[(size_t) l];
-                        const bool q2 = cf.gu_type == 42;   // a native Q2_0 layer: the pool's Q2_0 kernels read ActQ
-                        constexpr size_t AB = strata::kernels::cpu::kNativeActBytes;
                         m.cpu_jobs.clear();
                         for (int32_t e = 0; e < m.g->n_expert; ++e) {
                             if (!on_cpu[(size_t) e]) continue;
@@ -2175,23 +2172,20 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             }
                             strata::gpu::event_record(m.cpu_ev[0], m.cs);
                         }
-                        cpu_fut = std::async(std::launch::async, [&m, &cf, &cpu_ms, q2, T, rows_gpu, pool = cpu_pool_]() -> bool {
+                        cpu_fut = std::async(std::launch::async, [&m, &cf, &cpu_ms, T, rows_gpu, pool = cpu_pool_]() -> bool {
                             const auto t0 = std::chrono::steady_clock::now();
-                            if (q2 && m.cpu_actq.size() < (size_t) T) m.cpu_actq.resize((size_t) T);
-                            if (!q2 && m.cpu_nact.size() < (size_t) T * AB) m.cpu_nact.resize((size_t) T * AB);
+                            if (m.cpu_nact.size() < (size_t) T) m.cpu_nact.resize((size_t) T);
                             std::vector<char> need((size_t) T, 0);   // the tokens the CPU's experts read
                             for (int64_t p = rows_gpu; p < T * K; ++p) need[(size_t) m.src_host[(size_t) p]] = 1;
                             for (int64_t t = 0; t < T; ++t) {
                                 if (!need[(size_t) t]) continue;
-                                if (q2) strata::kernels::cpu::act_quant_any(m.cpu_x + (size_t) t * N, (int) N, m.cpu_actq[(size_t) t]);
-                                else strata::kernels::cpu::native_quant_act(cf, m.cpu_x + (size_t) t * N, m.cpu_nact.data() + (size_t) t * AB);
+                                strata::kernels::cpu::native_quant_act(cf, m.cpu_x + (size_t) t * N, m.cpu_nact[(size_t) t].bytes);
                             }
                             for (auto& j : m.cpu_jobs)
                                 for (int r = 0; r < j.nt; ++r) {
                                     const int64_t p = rows_gpu + (int64_t) (j.out[r] - m.cpu_rows) / N;
                                     const int64_t tok = m.src_host[(size_t) p];
-                                    if (q2) j.act[r] = &m.cpu_actq[(size_t) tok];
-                                    else j.nact[r] = m.cpu_nact.data() + (size_t) tok * AB;
+                                    j.nact[r] = m.cpu_nact[(size_t) tok].bytes;
                                 }
                             pool->run_split_multi_native(cf, m.cpu_jobs.data(), (int) m.cpu_jobs.size());
                             cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();

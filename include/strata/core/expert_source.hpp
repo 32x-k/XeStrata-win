@@ -356,8 +356,8 @@ struct ExpertDispatch {
     /// Plan v0.3 P6 verify window: one quantized activation per token, the multi-token jobs, and the expert ->
     /// job map (reset after every layer).
     std::vector<strata::kernels::cpu::ActQ> act_multi;
-    /// Plan v0.3 P6: a native pack's per-token activations (MAXT x kNativeActBytes).
-    std::vector<uint8_t> nact_multi;
+    /// Plan v0.3 P6: a native pack's per-token activations (MAXT).
+    std::vector<strata::kernels::cpu::NativeAct> nact_multi;
     std::vector<strata::kernels::cpu::ExpertJobMulti> jobs_multi;
     std::vector<int16_t> job_of;
     /// Plan v0.3 P6: the verify window's GPU plan (VRAM hits + the PCIe share of the misses); `pcie_num`/256 of
