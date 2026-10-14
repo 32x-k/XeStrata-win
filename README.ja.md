@@ -325,6 +325,8 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 
 ## 開発する人へ
 
+報告やプルリクエストを送る前に、[CONTRIBUTING.ja.md](CONTRIBUTING.ja.md)（型番に依存しないこと、ライセンス、GPL 第 7 条の追加の許可、取り込む変更の条件、報告の仕方）を読んでください。
+
 - **ビルド**: ソースから入れる方法、ビルドの 3 つの方式（free、contrib-llvm、contrib-icpx）、setup の振る舞いと要るパッケージ、
   deb と rpm のパッケージの作り方は [docs/BUILD.ja.md](docs/BUILD.ja.md) にあります。
   開発に使う道具（リント、Intel SDE、GPU のプロファイラー）は [docs/DEVTOOLS.ja.md](docs/DEVTOOLS.ja.md) にあります。

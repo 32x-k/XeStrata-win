@@ -421,19 +421,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
                 SplitBufMulti& sb = split_multi_[(size_t) e];
-                if (mode_ == 5 && nfmt_->gu_type == 42) {
-                    // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
-                    thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
-                    float* gp[MAXT];
-                    float* up[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
-                    const int nbk = (int) (nfmt_->n_embd / 64);
-                    q2_rows_any(mjobs_[e].blob, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
-                    q2_rows_any(mjobs_[e].blob + nfmt_->up_off, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
-                    for (int t = 0; t < mjobs_[e].nt; ++t)
-                        for (int r = r0; r < r1; ++r)
-                            sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
-                } else if (mode_ == 5) {
+                if (mode_ == 5) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
                     native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
@@ -545,34 +533,8 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-const char* ExpertPool::check_multi_jobs(const NativeFmt& f, const ExpertJobMulti* jobs, int n, int& job) {
-    const bool q2_rows = f.gu_type == 42;   // drain's mode 5: the gate/up rows read the ActQ, not the native image
-    for (int e = 0; e < n; ++e) {
-        const ExpertJobMulti& j = jobs[e];
-        if (j.blob == nullptr) { job = e; return "has no blob"; }
-        if (j.nt < 1 || j.nt > MAXT) { job = e; return "has a token count outside 1..MAXT"; }
-        for (int t = 0; t < j.nt; ++t) {
-            if (j.out[t] == nullptr) { job = e; return "has a token with no output row"; }
-            if (q2_rows ? j.act[t] == nullptr : j.nact[t] == nullptr) {
-                job = e;
-                return q2_rows ? "has a token with no ActQ activation (a Q2_0 layer's gate/up rows read act, not nact)"
-                               : "has a token with no native activation";
-            }
-        }
-    }
-    return nullptr;
-}
-
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
-    int bad = -1;
-    if (const char* why = check_multi_jobs(f, jobs, n, bad)) {
-        std::fprintf(stderr, "strata: the CPU expert pool refused a native batch: job %d of %d %s (the layer's gate/up "
-                             "type %d) - stopping the engine so the server can start it again\n",
-                     bad, n, why, f.gu_type);
-        std::fflush(stderr);
-        std::abort();
-    }
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {

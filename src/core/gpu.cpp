@@ -259,6 +259,14 @@ bool is_host_usm(const void* p) {
     catch (const std::exception& e) { return fail("is_host_usm", e); }
 }
 
+bool kernels_read_host(const void* p) {
+    if (!p) return false;
+    try { return core::Runtime::owner(p) == &rt() && sycl::get_pointer_type(p, rt().context()) == sycl::usm::alloc::host; }
+    catch (const std::exception& e) { return fail("kernels_read_host", e); }
+}
+
+bool kernels_read_registered() { return rt().device().get_backend() != sycl::backend::ext_oneapi_level_zero; }
+
 bool copy(void* dst, const void* src, size_t bytes) {
     if (bytes == 0) return true;
     try { rt().wait(rt().compute().memcpy(dst, src, bytes), "synchronous copy"); return true; }
@@ -346,6 +354,16 @@ bool device_speed(int device, int* units, int* khz) {
 bool host_register(void* p, size_t bytes) {
     try { sx::prepare_for_device_copy(p, bytes, rt().context()); return true; }
     catch (const std::exception& e) { return fail("host_register", e); }
+}
+
+bool host_register_on(int device, void* p, size_t bytes) {
+    try { sx::prepare_for_device_copy(p, bytes, core::Runtime::at(device).context()); return true; }
+    catch (const std::exception& e) { return fail("host_register_on", e); }
+}
+
+void host_unregister_on(int device, void* p) {
+    try { sx::release_from_device_copy(p, core::Runtime::at(device).context()); }
+    catch (const std::exception& e) { fail("host_unregister_on", e); }
 }
 
 void host_unregister(void* p) {

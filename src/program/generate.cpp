@@ -949,6 +949,7 @@ struct GpuStage {
     int dev = 0;
     int64_t lb = 0, le = 0;
     double pcie_frac = 0.0;
+    bool pcie_reads = true;   // its kernels can read the missed experts in host memory (gpu::kernels_read_host)
     strata::core::WeightTable wt;
     strata::core::NativeDense dense;
     strata::core::NativeHead head;
@@ -2049,6 +2050,22 @@ void install_fatal_signals() {
     for (const int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) (void) sigaction(sig, &sa, nullptr);
 #endif
 }
+// SIGTERM and SIGINT end the engine at once, as their default action does, but on a thread of their own.  While the GPU
+// compiler (IGC) translates a kernel it takes them over and longjmps to the translating thread, so one delivered to any
+// other thread aborted the engine ("longjmp causes uninitialized stack frame"; the server's SIGTERM after a QUIT, or a
+// stop while the kernels are built).  Blocked before any thread exists, so every thread inherits the mask.
+void route_stop_signals() {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGINT);
+    if (pthread_sigmask(SIG_BLOCK, &set, nullptr) != 0) return;
+    std::thread([set] {
+        int sig = 0;
+        while (sigwait(&set, &sig) != 0) {}
+        _exit(128 + sig);
+    }).detach();
+}
 
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
@@ -2057,6 +2074,7 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::set_terminate(report_and_end);   // issue #10: an exception that leaves the engine is reported, not lost
     install_fatal_signals();               // issue #12: and a crash says what it was and where
+    route_stop_signals();
     strata::core::progress_at("starting: reading the options and opening the GPUs");
     // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is
     // touched (upstream b7dd070d)
@@ -2854,6 +2872,15 @@ int main(int argc, char** argv) {
     // and on every other GPU of a layer split, with its matrix products' library (each GPU builds its own kernels)
     if (multi_gpu)
         for (const int d : split_devs) strata::core::Runtime::at(d).preload_kernels();
+    // stopped when main returns, whichever way (stop_preload)
+    struct PreloadStop {
+        const std::vector<int>* split;
+        ~PreloadStop() {
+            strata::core::Runtime::get().stop_preload();
+            if (split != nullptr)
+                for (const int d : *split) strata::core::Runtime::at(d).stop_preload();
+        }
+    } preload_stop{multi_gpu ? &split_devs : nullptr};
     // The matrix products' library (oneMath's backend) loaded and its first products run before the first prompt, and
     // what it holds on this GPU counted into the reserve when the cache is sized (blas_bytes), as for a library loaded
     // at its first use: hipBLASLt holds 0.2-0.3 GiB (172 MiB for its handle, ~78 for each kernel type's code), which
@@ -6133,30 +6160,37 @@ int main(int argc, char** argv) {
                         : pin_env != nullptr && std::strcmp(pin_env, "1") == 0 ? Pin::on
                                                                                : Pin::automatic;
         if (!src.pin_cache_complement(xcache, err, pin, other_gpus, lend_from, 8ull << 30, budget,
-                                      stages.empty() ? &profile : &profile_all) ||
-            (o.adapt_every > 0 && o.adapt_swaps > 0 && !src.reserve_exchanges(o.adapt_swaps, err))) {
-            std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str()); return 1;
+                                      stages.empty() ? &profile : &profile_all)) {
+            // upstream #403 / #467: a RAM copy that cannot be made is not a reason to stop - the experts it would have
+            // held are read from the files like the ones outside it (pin_cache_complement leaves nothing half-built)
+            std::fprintf(stderr, "strata generate: WARNING: the resident RAM mode does not fit (%s); the experts the "
+                                 "GPU does not hold are read from the model files through the OS file cache "
+                                 "(--mmap-experts), which is slower when the RAM cannot keep them\n", err.c_str());
+        } else {
+            if (o.adapt_every > 0 && o.adapt_swaps > 0 && !src.reserve_exchanges(o.adapt_swaps, err)) {
+                std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str()); return 1;
+            }
+            // --adapt-async: twice the exchange buffers - the second half bounces the copies in whose source is not
+            // page-locked (an asynchronous copy instead of the driver's staged, synchronous one)
+            if (o.adapt_async && !src.reserve_exchanges((int64_t) 2 * o.adapt_swaps, err)) adapt_async_off(err.c_str());
+            // pageable buffers would make every copy of a round synchronous (the driver stages them): that is the blocking
+            // tier's cost, so the asynchronous tier is not worth running - said, and the blocking tier stays (upstream 5288cd29)
+            if (o.adapt_async && !src.exchange_pinned()) adapt_async_off("the exchange buffers could not be page-locked");
+            // #669 / #765: a big chunk lends many cache slots to the prompt path, and each lent slot's expert is read back
+            // from the SSD whenever the RAM could not keep its copy (31 GB: auto:32768 read prompts ~3x slower than auto).
+            // Said, never capped: --prefill is the user's, and with the RAM for them it is the faster one (+21-35%).
+            if (lend_from >= 0 && o.prefill_chunk > 8192 && xcache.slots() > lend_from &&
+                src.resident_lent_slots() < xcache.slots() - lend_from)
+                std::fprintf(stderr, "strata generate: WARNING: a prompt chunk of %lld tokens lends %lld cache slots to the "
+                                     "prompt path, but only %lld of their experts fit in RAM: the others are read from the "
+                                     "SSD on every chunk, and prompts can read ~3x slower than with --prefill auto (#669). "
+                                     "A smaller --prefill, or auto, keeps them all in RAM\n",
+                             (long long) o.prefill_chunk, (long long) (xcache.slots() - lend_from),
+                             (long long) src.resident_lent_slots());
+            std::fprintf(stderr, "strata generate: resident CPU experts: %.2f GiB, %lld experts\n",
+                         (double) src.resident_bytes() / 1073741824.0, (long long) src.resident_count());
+            mem_mark("the resident experts");
         }
-        // --adapt-async: twice the exchange buffers - the second half bounces the copies in whose source is not
-        // page-locked (an asynchronous copy instead of the driver's staged, synchronous one)
-        if (o.adapt_async && !src.reserve_exchanges((int64_t) 2 * o.adapt_swaps, err)) adapt_async_off(err.c_str());
-        // pageable buffers would make every copy of a round synchronous (the driver stages them): that is the blocking
-        // tier's cost, so the asynchronous tier is not worth running - said, and the blocking tier stays (upstream 5288cd29)
-        if (o.adapt_async && !src.exchange_pinned()) adapt_async_off("the exchange buffers could not be page-locked");
-        // #669 / #765: a big chunk lends many cache slots to the prompt path, and each lent slot's expert is read back
-        // from the SSD whenever the RAM could not keep its copy (31 GB: auto:32768 read prompts ~3x slower than auto).
-        // Said, never capped: --prefill is the user's, and with the RAM for them it is the faster one (+21-35%).
-        if (lend_from >= 0 && o.prefill_chunk > 8192 && xcache.slots() > lend_from &&
-            src.resident_lent_slots() < xcache.slots() - lend_from)
-            std::fprintf(stderr, "strata generate: WARNING: a prompt chunk of %lld tokens lends %lld cache slots to the "
-                                 "prompt path, but only %lld of their experts fit in RAM: the others are read from the "
-                                 "SSD on every chunk, and prompts can read ~3x slower than with --prefill auto (#669). "
-                                 "A smaller --prefill, or auto, keeps them all in RAM\n",
-                         (long long) o.prefill_chunk, (long long) (xcache.slots() - lend_from),
-                         (long long) src.resident_lent_slots());
-        std::fprintf(stderr, "strata generate: resident CPU experts: %.2f GiB, %lld experts\n",
-                     (double) src.resident_bytes() / 1073741824.0, (long long) src.resident_count());
-        mem_mark("the resident experts");
     }
     if (o.adapt_async && !src.complement_ready()) adapt_async_off("the resident RAM mode is not running");
     if (o.serve) {
@@ -6388,7 +6422,27 @@ int main(int argc, char** argv) {
                                        batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
-                    split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
+                    // the PCIe share's kernels read the missed experts where CUDA0's runtime allocated or registered
+                    // them: a CUDA or HIP GPU where they are registered on it too (the RAM copy is made after the
+                    // stages, so it is registered here), a Level Zero GPU not at all (an RTX 4070 then a B70: GPU page
+                    // faults on those addresses, and the first decode window waited 20 s for a layer that never rang),
+                    // so the CPU takes them where it cannot
+                    const uint8_t* host_expert = nullptr;
+                    for (int64_t l = gs.lb; host_expert == nullptr && l < gs.le; ++l)
+                        for (int64_t e = 0; host_expert == nullptr && e < g.n_expert; ++e)
+                            host_expert = srcp->device_alias(l, e);
+                    // registered on every stage, for its copies as well (fills, swaps, the prompt path's lent experts):
+                    // unregistered, a Level Zero GPU copied them as pageable memory
+                    std::string reg_err;
+                    const bool registered = srcp->register_on(gs.dev, reg_err) && srcp->registered_on(gs.dev);
+                    gs.pcie_reads = host_expert == nullptr || strata::gpu::kernels_read_host(host_expert) ||
+                                    (strata::gpu::kernels_read_registered() && registered);
+                    if (!reg_err.empty()) std::fprintf(stderr, "strata serve: layer split, CUDA%d: %s\n", gs.dev, reg_err.c_str());
+                    if (!gs.pcie_reads && gs.pcie_frac > 0.0)
+                        std::fprintf(stderr, "strata serve: layer split, CUDA%d: its kernels cannot read the experts in "
+                                             "CUDA0's host memory: the CPU takes its missed experts (no PCIe share)\n",
+                                     gs.dev);
+                    split_drive.pcie_num[st] = gs.pcie_reads ? pcie_num_of(gs.pcie_frac) : 0;
                 }
                 if (!ok_s) {
                     std::fprintf(stderr, "strata serve: layer split, stage %d: %s\n", st + 1, err.c_str());
@@ -9770,7 +9824,8 @@ int main(int argc, char** argv) {
             drive.d.pcie_split = req_pcie_set ? nullptr : pcie_split_ptr;
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
-                split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
+                split_drive.pcie_num[st] = st > 0 && !split_same && !stages[(size_t) st - 1]->pcie_reads ? 0
+                                           : (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
                                                ? drive.d.pcie_num : pcie_num_of(stages[(size_t) st - 1]->pcie_frac);
             if (pipe) for (int st = 0; st < split_drive.n; ++st) split_drive_b.pcie_num[st] = split_drive.pcie_num[st];
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);

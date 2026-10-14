@@ -22,6 +22,9 @@ compiler (for example Microsoft's Universal C Runtime and Visual C++ runtime lib
 such a library, containing parts covered by the terms of that library's license, the licensors of XeStrata grant you
 additional permission to convey the resulting work.
 
+This permission does not apply to the measurement records in bench/XeStrataBenchResults/, which nothing links with:
+they are under the GNU Lesser General Public License alone.
+
 Copyright notices
 =================
 
