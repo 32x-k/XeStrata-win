@@ -3132,4 +3132,12 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     return arena_ != nullptr ? ((const PinnedArena*) arena_)->at(off) : base_ + off;   // else STRATA_ARENA_MMAP's map
 }
 
+const uint8_t* ArenaExpertSource::blob_at(int64_t layer, int64_t expert) const {
+    if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
+    const int64_t idx = layer * n_expert_ + expert;
+    if (idx < 0 || idx >= blobs_) return nullptr;
+    const uint64_t off = strata::kernels::cpu::expert_layout().blob_offset(layer, expert);
+    return arena_ != nullptr ? ((const PinnedArena*) arena_)->at(off) : base_ + off;
+}
+
 }  // namespace strata::core
