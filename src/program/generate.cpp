@@ -3278,6 +3278,9 @@ int main(int argc, char** argv) {
         // placement that is really a different one, not the neighbour one layer over (upstream 8bb250d8)
         std::vector<std::pair<double, std::vector<int64_t>>> priced;
         int64_t min_stage_layers = 1;   // 3 in the second search below, when the first pick has a 1- or 2-layer stage
+        // #1440 (upstream 9c5a45f8): every placement the last search took, for the headroom pick below
+        struct Scored { strata::program::split_rules::Placement p; double mass; int64_t held; };
+        std::vector<Scored> scored;
         auto consider = [&]() {
             if (min_stage_layers > 1 && strata::program::split_rules::smallest_stage(at, L) < min_stage_layers) return;
             double hm = 0;
@@ -3288,12 +3291,14 @@ int main(int argc, char** argv) {
             // the room the fullest stage keeps after its cache: on a tie the balanced placement wins (upstream 08cdd8bf)
             int64_t room = INT64_MAX;
             for (size_t i = 0; i < at.size() + 1; ++i) room = std::min(room, cap[i] - used[i]);
+            scored.push_back({{at, ms, room}, hm, held});
             if (ms < best_ms - 1e-9 || (ms <= best_ms + 1e-9 && room > best_room)) {
                 best = at; best_ms = ms; best_mass = hm; best_held = held; best_room = room;
             }
         };
         auto search = [&] {
         priced.clear();
+        scored.clear();
         if (ns == 2) {
             for (int64_t k = 2; k < L; ++k) { at[0] = k; consider(); }
         } else if (ns == 3) {
@@ -3432,6 +3437,37 @@ int main(int argc, char** argv) {
                                  "more\n",
                          (long long) (std::max<int64_t>(prompt_min, 0) >> 20),
                          own_prompt ? ", its own buffers counted in" : " lent from its cache");
+        }
+        // #1440 (upstream 9c5a45f8): on two equal cards every K whose caches hold all the profiled pairs predicts about
+        // the same window, and the first tried wins: the smallest K, which gives the last stage (the head and the
+        // draft layer) the most layers and lets its cache fill the card.  2x Arc Pro B70, IQ3_S: auto K=24 with the
+        // last card at 31.8 of 31.9 GiB decoded ~11 tok/s, --layer-split 30 ~54: a full xe card moves buffers to system
+        // memory instead of failing.  So among the placements within STRATA_SPLIT_HEADROOM_TOL (default 0.2%) of the
+        // fastest, the one whose fullest stage keeps the most room after its cache wins.  STRATA_SPLIT_HEADROOM=0: the
+        // plain pick.
+        static const bool headroom = [] { const char* v = std::getenv("STRATA_SPLIT_HEADROOM"); return !v || v[0] != '0'; }();
+        static const double headroom_tol = [] {
+            const char* v = std::getenv("STRATA_SPLIT_HEADROOM_TOL");
+            return v ? std::strtod(v, nullptr) / 100.0 : 0.002;
+        }();
+        if (headroom && !best.empty() && scored.size() > 1) {
+            std::vector<strata::program::split_rules::Placement> cand;
+            for (const Scored& s : scored) cand.push_back(s.p);
+            const size_t i = strata::program::split_rules::pick_with_headroom(cand, headroom_tol);
+            if (cand[i].cuts != best) {
+                auto fmt = [](const std::vector<int64_t>& v) {
+                    std::string str;
+                    for (const int64_t k : v) str += (str.empty() ? "" : ",") + std::to_string(k);
+                    return str;
+                };
+                std::fprintf(stderr, "strata generate: layer split auto: K=%s instead of K=%s (%.1f against %.1f ms per "
+                                     "decode window, its fullest card keeps %lld MiB, not %lld; #1440, "
+                                     "STRATA_SPLIT_HEADROOM=0 keeps K=%s)\n",
+                             fmt(cand[i].cuts).c_str(), fmt(best).c_str(), cand[i].ms, best_ms,
+                             (long long) (cand[i].min_spare >> 20), (long long) (best_room >> 20), fmt(best).c_str());
+                best = cand[i].cuts; best_ms = cand[i].ms; best_mass = scored[i].mass; best_held = scored[i].held;
+                best_room = cand[i].min_spare;
+            }
         }
         split_at = best;
         if (ord != given) {   // the later GPUs in the order chosen above
