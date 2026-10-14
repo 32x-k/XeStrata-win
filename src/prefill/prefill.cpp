@@ -746,10 +746,18 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         // The GGUF read in place (the low-RAM mode): most of a chunk's blobs are page faults on the SSD, so the copies
         // need many reads in flight (upstream 361537b: 32 threads and a 128-deep ring, measured on an RTX 5070 / NVMe
         // PC).  Here as many threads as the CPU has, up to 32, and a ring 4 x as deep; every other source keeps
-        // the defaults.
-        bool files = false;
-        for (int64_t l = 0; src != nullptr && !files && l < g.n_layers; ++l)
-            for (int64_t e = 0; !files && e < g.n_expert; ++e) files = src->transient(l, e);
+        // the defaults.  Only the blobs the walk streams count (the GPU cache's are not copied), and the GGUF's must be
+        // most of them: with the RAM copy of the rest (--resident-experts) a few dozen of the blobs past the RAM budget
+        // put the RAM's copies on the SSD profile (R9700 under Windows, 34 of 4611, a 2301-token chunk: 24 threads and
+        // 96 buffers 4.6-4.9 s, 4 threads 3.8 s).
+        int64_t streamed = 0, from_files = 0;
+        for (int64_t l = 0; src != nullptr && l < g.n_layers; ++l)
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                if (host_res != nullptr && host_res[l * g.n_expert + e] >= 0) continue;
+                ++streamed;
+                from_files += src->transient(l, e) ? 1 : 0;
+            }
+        bool files = from_files > 0 && 2 * from_files >= streamed;
         // #1353 (upstream 83a7dbc0): ... but a source answers transient() for every blob it copies out of the GGUF,
         // including the ones whose pages are already in the page cache (a Q8 pack on a big-RAM box with a warm cache).
         // Those copies are memcpy from RAM, where 32 threads and a 128-deep ring ran 4-7x slower than the defaults.  So
@@ -767,6 +775,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         const int threads = stv ? std::clamp((int) std::strtol(stv, nullptr, 10), 1, 32)
                           : files ? std::clamp(hw, 4, 32) : std::max(2, std::min(4, hw / 4));
         if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
+        // The streamed walk keeps ring_slots(T) copies in flight, and a host buffer of an unpinned blob is free again
+        // only once its copy is done: with fewer buffers than slots the copies and the launching thread wait on the
+        // ring (the case above, 4 threads: 16 buffers 4.1 s, 96 3.8 s).  Where most streamed blobs come from pinned
+        // RAM the device ring is deeper and the host copies few: the ring stays as it is.
+        if (std::getenv("STRATA_STAGER_RING") == nullptr && (int64_t) T >= STREAM_ALL_MIN && g_pinned_share < 0.9)
+            m.stager->kRing = std::max(m.stager->kRing, std::min(ring_slots(T), 256));
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
