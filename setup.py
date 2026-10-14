@@ -2383,9 +2383,9 @@ def build_image_engine(backend: str) -> Path:
     if exe.exists() and {k: meta.get(k) for k in want} == want:
         ok(f"image generator already built ({backend})")
         return exe
-    if backend == "vulkan" and (shutil.which("glslc") is None or not Path("/usr/include/vulkan/vulkan.h").exists()):
-        fail("compiling the image generator (Vulkan) needs the Vulkan headers and glslc",
-             f"install them: {install_cmd([tool_pkg('vulkan'), tool_pkg('glslc')])} (or --image-backend cpu)")
+    if backend == "vulkan" and (need := vulkan_missing()):   # ggml-vulkan: glslc, the Vulkan and SPIR-V headers
+        fail("compiling the image generator (Vulkan) needs the Vulkan headers, the SPIR-V headers and glslc",
+             f"install them: {install_cmd(need)} (or --image-backend cpu)")
     src = get_sd_cpp()
     say(f"  Compiling the image generator (stable-diffusion.cpp {QI.SD_CPP_COMMIT[:7]}, {backend}; 5-20 minutes, "
         "once) ...")
