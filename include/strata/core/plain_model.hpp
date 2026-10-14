@@ -164,9 +164,12 @@ private:
         W sh_gate, sh_up, sh_down;
     };
 
-    bool upload(const GgufModel& m, const std::string& name, W& w, std::string& err);
+    /// `f32`: an F32 matrix is taken as it is (Qwen3.6's GDN alpha and beta: llama.cpp's float product)
+    bool upload(const GgufModel& m, const std::string& name, W& w, std::string& err, bool f32 = false);
     /// Block `l`'s weights (blk.<l>.*): its mixer, norms, router and shared expert.
     bool load_block(const GgufModel& m, int64_t l, Block& b, std::string& err);
+    /// An F32 vector or matrix, or a BF16 one widened to F32 at load (exact: Qwen3.6's MTP layer keeps its two routers
+    /// in BF16).
     bool upload_f32(const GgufModel& m, const std::string& name, uint64_t elements, const float*& out, std::string& err);
     bool open_experts(std::string& err);
     bool record(int T, bool mtp, std::string& err);

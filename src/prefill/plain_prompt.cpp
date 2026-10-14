@@ -238,7 +238,7 @@ bool PlainModel::prompt_warm_products(std::string& err) {
     const int64_t T = P.T, HV = spec_.ssm_dt_rank;
     std::set<std::tuple<int, int, int, int64_t>> seen;
     auto warm = [&](const W& w, float* y, int64_t ldy = 0) {
-        if (w.data != nullptr && seen.insert({w.type, w.n_out, w.n_in, ldy}).second)
+        if (w.data != nullptr && w.type != 0 && seen.insert({w.type, w.n_out, w.n_in, ldy}).second)
             gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
     };
     try {
@@ -484,8 +484,13 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     proj_hn(b.qkv, P.qkv);
                     proj_hn(b.z, P.z);
                     part(5);
-                    proj(b.alpha, P.ab, T, 2 * HV);
-                    proj(b.beta, P.ab + HV, T, 2 * HV);
+                    for (const auto& [w, y] : {std::pair<const W*, float*>{&b.alpha, P.ab}, {&b.beta, P.ab + HV}}) {
+                        if (w->type == 0)   // F32 (Qwen3.6), from the FP32 rows as the router
+                            k::f32_gemm_rows(P.hn, N, static_cast<const float*>(w->data), y, 2 * HV, w->n_in,
+                                             w->n_out, T, cs);
+                        else
+                            proj(*w, y, T, 2 * HV);
+                    }
                     part(6);
                     prefill::gdn_gates(P.ab, b.dt, b.a, P.gate, P.beta, T, cs, HK, HV);
                     prefill::gdn_conv(gdn_conv_[(size_t) b.gdn], P.qkv, b.conv, P.h, T, eps, cs, HK, HV);

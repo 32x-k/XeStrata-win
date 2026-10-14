@@ -99,7 +99,7 @@ PlainModel::~PlainModel() {
     if (cs_ != nullptr) strata::gpu::stream_destroy(cs_);
 }
 
-bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::string& err) {
+bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::string& err, bool f32) {
     size_t at = 0;
     const TensorInfo* t = m.find(name, &at);
     if (t == nullptr || t->shape.size() != 2 || !m.in_bounds(*t, at)) {
@@ -109,7 +109,7 @@ bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::
     w.type = (int) t->type;
     w.n_in = (int) t->shape[0];
     w.n_out = (int) t->shape[1];
-    if (!k::native_mmvq_supported(w.type) && !(w.type == kBF16 && w.n_in % 2 == 0)) {
+    if (!k::native_mmvq_supported(w.type) && !((w.type == kBF16 || (f32 && w.type == kF32)) && w.n_in % 2 == 0)) {
         err = "plain model: " + name + " is " + t->type_name() + ", which the native matrix-vector kernels do not take";
         return false;
     }
@@ -139,9 +139,20 @@ bool PlainModel::upload_f32(const GgufModel& m, const std::string& name, uint64_
                             std::string& err) {
     size_t at = 0;
     const TensorInfo* t = m.find(name, &at);
-    if (t == nullptr || t->type != kF32 || t->elements() != elements || !m.in_bounds(*t, at)) {
-        err = "plain model: " + name + " is missing, not F32 or not " + std::to_string(elements) + " values";
+    if (t == nullptr || (t->type != kF32 && t->type != kBF16) || t->elements() != elements || !m.in_bounds(*t, at)) {
+        err = "plain model: " + name + " is missing, not F32 or BF16 or not " + std::to_string(elements) + " values";
         return false;
+    }
+    const void* src = m.shard(at).tensor_data(*t);
+    std::vector<float> wide;
+    if (t->type == kBF16) {
+        wide.resize(elements);
+        const auto* h = static_cast<const uint16_t*>(src);
+        for (uint64_t i = 0; i < elements; ++i) {
+            const uint32_t u = (uint32_t) h[i] << 16;
+            std::memcpy(&wide[i], &u, 4);
+        }
+        src = wide.data();
     }
     void* d = nullptr;
     if (!strata::gpu::alloc_device(&d, elements * 4)) {
@@ -149,7 +160,7 @@ bool PlainModel::upload_f32(const GgufModel& m, const std::string& name, uint64_
         return false;
     }
     allocs_.push_back(d);
-    if (!strata::gpu::copy(d, m.shard(at).tensor_data(*t), elements * 4)) {
+    if (!strata::gpu::copy(d, src, elements * 4)) {
         err = "plain model: uploading " + name + " failed";
         return false;
     }
@@ -168,7 +179,8 @@ bool PlainModel::load_block(const GgufModel& m, int64_t l, Block& b, std::string
     if (b.recurrent) {
         const uint64_t C = (uint64_t) (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner);
         if (!upload(m, p + "attn_qkv.weight", b.qkv, err) || !upload(m, p + "attn_gate.weight", b.z, err) ||
-            !upload(m, p + "ssm_alpha.weight", b.alpha, err) || !upload(m, p + "ssm_beta.weight", b.beta, err) ||
+            !upload(m, p + "ssm_alpha.weight", b.alpha, err, true) ||
+            !upload(m, p + "ssm_beta.weight", b.beta, err, true) ||
             !upload(m, p + "ssm_out.weight", b.ssm_out, err) ||
             !upload_f32(m, p + "ssm_conv1d.weight", C * (uint64_t) s.ssm_d_conv, b.conv, err) ||
             !upload_f32(m, p + "ssm_dt.bias", (uint64_t) s.ssm_dt_rank, b.dt, err) ||
@@ -823,6 +835,11 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
                                          ncols, cs);
             return;
         }
+        if (w.type == kF32) {
+            k::f32_gemv_fp32_mmvf_multi(x, w.n_in, static_cast<const float*>(w.data), y, w.n_out, w.n_in, w.n_out,
+                                        ncols, cs);
+            return;
+        }
         if (quantize) k::native_quantize_q8_1(x, xq_, w.n_in, ncols, cs);
         k::native_mmvq(w.type, w.data, xq_, y, w.n_in, w.n_out, ncols, cs);
     };
@@ -835,8 +852,8 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         proj(b.z, hn_, z_, T, false);
         // alpha and beta, one shape and type: one launch where the pair kernel takes the type (nextsycl's
         // Qwen3.5 decode fuses the two products)
-        if (b.alpha.type == kBF16 || b.alpha.type != b.beta.type || b.alpha.n_in != b.beta.n_in ||
-            b.alpha.n_out != b.beta.n_out ||
+        if (b.alpha.type == kBF16 || b.alpha.type == kF32 || b.alpha.type != b.beta.type ||
+            b.alpha.n_in != b.beta.n_in || b.alpha.n_out != b.beta.n_out ||
             !k::native_mmvq_pair(b.alpha.type, b.alpha.data, b.beta.data, xq_, alpha_, beta_, b.alpha.n_in,
                                  b.alpha.n_out, T, cs)) {
             proj(b.alpha, hn_, alpha_, T, false);
