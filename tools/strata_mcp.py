@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """tools/strata_mcp.py - an MCP server that lets an AI assistant install, start, check and stop Strata.
 
     claude mcp add xestrata -- python3 /path/to/XeStrata/tools/strata_mcp.py
@@ -69,6 +69,15 @@ FALLBACK_MODELS = {
                             "experts come from the SSD while it answers, so it is slower than the 2-3-bit models",
                    "download_gb": 111.3, "ram_gb": 48, "arena_gb": 77.0, "families": ("unsloth",), "budget": True,
                    "experimental": True, "vision": True},   # upstream #967: images allowed (setup warns: untested)
+    "UD-Q5_K_XL": {"about": "5-bit (Unsloth Dynamic): Q5_K experts with Q8_0 downs, close to Q8_0 in quality; not "
+                            "tested in XeStrata", "download_gb": 158.3, "ram_gb": 108, "arena_gb": 98.4,
+                   "families": ("unsloth",), "budget": True, "experimental": True, "vision": True},
+    "UD-Q6_K_XL": {"about": "6-bit (Unsloth Dynamic): Q6_K experts with Q8_0 downs; not tested in XeStrata",
+                   "download_gb": 169.2, "ram_gb": 118, "arena_gb": 109.2, "families": ("unsloth",), "budget": True,
+                   "experimental": True, "vision": True},
+    "Q8_0": {"about": "8-bit, the reference quality (every expert Q8_0), for a 192 GB PC; not tested in XeStrata",
+             "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth",), "budget": True,
+             "experimental": True, "vision": True},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -84,6 +93,8 @@ FALLBACK_FAMILIES = {
                                                        "GSQ-RCO 3 and 3.5 bits", "tag": "ornith-"},
     "llmjp": {"title": "llm-jp-4.1-32b-a3b-thinking", "about": "32B, 3B active; Japanese and English, a thinking model",
               "tag": "llmjp-"},
+    "qwen36": {"title": "Qwen3.6-35B-A3B", "about": "35B, 3B active; a Qwen3.5 MoE with the Qwen tokenizer: Unsloth's "
+                                                    "4-, 6- and 8-bit files", "tag": "qwen36-"},
 }
 FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
 BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper who finds a message in a bottle. "
@@ -391,6 +402,13 @@ class Strata:
 
     # ---- paths
     def settings_path(self) -> Path:
+        # the checkout's serve/places.py (the user's folders on Linux and on Windows)
+        places = self.root / "serve" / "places.py"
+        spec = importlib.util.spec_from_file_location("strata_places_for_mcp", places) if places.is_file() else None
+        if spec is not None and spec.loader is not None:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.settings_path()
         return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "xestrata" / "settings.json"
 
     def data_dir(self) -> Path:

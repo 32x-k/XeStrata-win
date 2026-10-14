@@ -1,0 +1,37 @@
+{
+ "engine": "xe0.1.43.1",
+ "commit": "8607e667",
+ "measured": "2026-10-12",
+ "generated_tokens_cap": 256,
+ "temperature": 0,
+ "runs_per_size": 3,
+ "sizes": [
+  {
+   "prompt_tokens": 4154,
+   "pp_tok_s_median": 1111.4,
+   "pp_tok_s_min": 1109.1,
+   "pp_tok_s_max": 1111.9,
+   "tg_tok_s_median": 78.5,
+   "tg_tok_s_min": 76.3,
+   "tg_tok_s_max": 79.0
+  },
+  {
+   "prompt_tokens": 32702,
+   "pp_tok_s_median": 1868.6,
+   "pp_tok_s_min": 1868.3,
+   "pp_tok_s_max": 1868.7,
+   "tg_tok_s_median": 72.0,
+   "tg_tok_s_min": 71.9,
+   "tg_tok_s_max": 84.9
+  },
+  {
+   "prompt_tokens": 127531,
+   "pp_tok_s_median": 2233.0,
+   "pp_tok_s_min": 2232.3,
+   "pp_tok_s_max": 2233.4,
+   "tg_tok_s_median": 72.5,
+   "tg_tok_s_min": 71.7,
+   "tg_tok_s_max": 73.1
+  }
+ ]
+}

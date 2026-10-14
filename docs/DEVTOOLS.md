@@ -16,7 +16,7 @@ The commands are for Ubuntu and Debian; the versions are those last used on the 
 | Folder (git ignores it) | What goes there |
 | --- | --- |
 | `.lint/` | lint tools that the distribution does not package |
-| `.tools/` | other tools built from source (intel/llvm, Metrics Discovery) |
+| `.tools/` | other tools built from source (intel/llvm, Metrics Discovery), and what the Windows cross build uses |
 
 ## Lints
 
@@ -56,12 +56,15 @@ An example of the latter is Ubuntu 26.04's 6.2 with the Arc Pro B70 (intel/llvm 
 setup runs it for `--intel-llvm-build`;
 [BUILD.md](BUILD.md#the-sycl-compiler) describes how it reuses a finished build.
 intel/llvm is free software (Apache-2.0 with LLVM exceptions) and builds with free software only.
-It needs these packages (on Fedora 44: `git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static python3`):
+It needs these packages (on Fedora 44: `git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static python3`; on Arch: `git cmake ninja base-devel lld hwloc zstd opencl-headers python`):
 
 ```sh
 sudo apt install git cmake ninja-build g++ lld python3 libhwloc-dev libzstd-dev
 python3 tools/intel_llvm_build.py            # --keep-build keeps the build tree for a quicker update; --jobs N
 ```
+
+Arch's `zstd` has no `libzstd.a` (`zstd-static` is an AUR package).
+The script then passes `-DLLVM_USE_STATIC_ZSTD=OFF` and links the shared zstd (intel/llvm handles it from v7.1.1; [BUILD.md](BUILD.md#packages)).
 
 Its configuration downloads what the release pins (Level Zero's headers and loader, emhash; all free software), so it needs the network.
 The script makes it fetch Level Zero even when one is installed (`SYCL_UR_FORCE_FETCH_LEVEL_ZERO`):
@@ -83,10 +86,13 @@ sudo apt install hipcc libamdhip64-dev libhsa-runtime-dev rocminfo   # Ubuntu
 sudo dnf install hipcc rocm-hip-devel rocm-runtime-devel rocm-device-libs rocminfo   # Fedora 44
 ```
 
-- ROCm is looked for in AMD's `/opt/rocm` or the distribution's (headers in `/usr/include`, libraries in the multiarch folder or `/usr/lib64`).
+- ROCm is looked for in AMD's `/opt/rocm` (`/opt/rocm/core-7.14` with ROCm 7.14's packages from AMD) or the distribution's (headers in `/usr/include`, libraries in the multiarch folder or `/usr/lib64`).
+  ROCm 7.14's packages from AMD install no ld.so.conf, so setup adds their `lib` to the engine's library path (the config's `lib_dirs`).
   Without it the build has no HIP.
 - Code for AMD GPUs needs libclc's libspirv for AMD and ROCm's device libraries.
-  Fedora's device libraries are in `/usr/lib64/rocm/llvm/lib/clang/20/lib/amdgcn/bitcode`; give them to the compiler with `--rocm-device-lib-path`.
+  A compiler reads bitcode of its own LLVM or an older one only (ROCm 7.14's device libraries are LLVM 23's, which intel/llvm 7.1.1's LLVM 22 cannot read),
+  so the script fetches the device libraries of the ROCm release on intel/llvm's LLVM (`amd/device-libs` of ROCm's llvm-project at `rocm-7.2.4`, under the University of Illinois/NCSA license), builds them in the same tree and installs them into `install/amdgcn/bitcode`.
+  CMake takes the installed ROCm's device libraries where the compiler reads them, and these where it does not; when they fail to build, intel/llvm is still built.
 - In a Fedora 44 container (ROCm 7.1.1), a SYCL kernel compiled with `-fsycl-targets=amd_gpu_gfx1200` ran correctly on an RX 9060 XT (gfx1200).
   The HIP adapter reports 1 GiB as the largest allocation, but 12 GiB could be allocated.
 
@@ -121,7 +127,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Packages that came in automatically with `rocm-dev` become `apt autoremove` candidates once it is gone; mark them with `sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo`.
 - The script applies fixes the release lacks to the sources before building, as the patches in `third_party/main/intel-llvm/patches/` (`NN-<id>.patch`, in order; under intel/llvm's Apache-2.0 WITH LLVM-exception), and records their ids in `install/XESTRATA.json`.
   A build of the same release without them is offered a rebuild.
-  There are seventeen fixes now; none of the first twelve is fixed in intel/llvm's `sycl` branch either (2026-10-08).
+  There are nineteen fixes now; none of the first twelve is fixed in intel/llvm's `sycl` branch either (2026-10-08), nor the fifteenth (2026-10-14).
   The Windows port's fixes are numbered from 90, so that the numbers XeStrata's own fixes take next do not collide with them.
   First, the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).
   Second, the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture.
@@ -160,16 +166,24 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Fourteenth, the HIP adapter answered a GPU's free memory (SYCL's `ext_intel_free_memory`) with `hipMemGetInfo` without making that GPU current, so every AMD GPU reported the free memory of the thread's current one.
   A layer split over two AMD GPUs saw the first stage's free memory, nearly all of it held by its expert cache, on the second stage, which found no room for its own cache and stopped.
   Fixed, the GPU is made current before the query, as the adapter's other calls do (`hip-mem-free-device`; the CUDA adapter makes the GPU's context current for every query).
-  Fifteenth (90), on Windows the HIP adapter's CMake imported AMD's comgr as the Linux shared object (`libamd_comgr.so`), and the configuration failed (`IMPORTED_IMPLIB not set for imported target "amd_comgr"`).
+  Fifteenth, where the system's Level Zero is older than 1.32 (Ubuntu 26.04's libze 1.28, where the packages are built), the Level Zero adapters link the loader statically, and the static loader hands the stable record and replay graph functions on to the system's loader at run time.
+  The 1.28 loader lacks them, and the static one answered the first call UNSUPPORTED and called a null pointer on the next (the static loader's ze_libapi.cpp, 1.32 to 1.34).
+  The adapter took the functions as there, the static loader's own entry points being not null, and with a driver that announces the stable graph extension (compute-runtime 26.35.39758.10) the query made at every submission to a queue (`urQueueIsGraphCaptureEnabledExp` in `handler::finalize`) went through.
+  oneMKL's GEMM takes that path, so with oneMKL installed the engine stopped with SIGSEGV at its first product on an Arc Pro B70 (XeStrata issue #12).
+  Fixed, with the static loader the graph functions are used only when the system's loader (`libze_loader.so.1`, `ze_loader.dll`) has them (`l0-static-graph`).
+  Sixteenth, the device libraries (libdevice) depended on the compiler being built and all its tools (`sycl-compiler`) even when `LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR` gives the tools that compile them.
+  The cross build for Windows (`--windows`) built a Windows `clang.exe` and tools nobody runs, most of its time.
+  Fixed, with the tools given they depend on the SYCL headers alone (`build-libdevice-custom-tools`; a build without them is unchanged). A fix to the build only, it asks no finished toolchain to be built again.
+  Seventeenth (90), on Windows the HIP adapter's CMake imported AMD's comgr as the Linux shared object (`libamd_comgr.so`), and the configuration failed (`IMPORTED_IMPLIB not set for imported target "amd_comgr"`).
   Fixed, it imports `amd_comgr.lib` on Windows, as the HIP runtime beside it imports `amdhip64.lib` (`hip-windows-comgr`).
-  Sixteenth (91), the driver took a ROCm device library folder without `oclc_correctly_rounded_sqrt_on.bc` and `_off.bc` for no device libraries at all.
+  Eighteenth (91), the driver took a ROCm device library folder without `oclc_correctly_rounded_sqrt_on.bc` and `_off.bc` for no device libraries at all.
   Newer ROCm releases (ROCm 7.12's HIP SDK for Windows, for example) no longer ship the two, so every compile for an AMD GPU failed.
   Fixed, both or neither are accepted, and the library is linked only where it exists (`hip-device-libs-sqrt`).
-  Seventeenth (92), the HIP adapter did not answer the device LUID (`sycl::ext::intel::info::device::luid`), which the CUDA and Level Zero adapters answer on Windows, and its device ID query returned the PCI device number (0), so a program could not find a HIP GPU's DXGI adapter.
+  Nineteenth (92), the HIP adapter did not answer the device LUID (`sycl::ext::intel::info::device::luid`), which the CUDA and Level Zero adapters answer on Windows, and its device ID query returned the PCI device number (0), so a program could not find a HIP GPU's DXGI adapter.
   On Windows a device allocation past the adapter's local memory budget is not refused but placed in system memory and read over PCIe; the engine sizes its expert cache by that budget, which it reads from DXGI by the LUID.
   Fixed, the adapter answers `hipDeviceProp_t::luid` on Windows (an all-zero LUID, and every other system, stays unsupported; `hip-windows-luid`).
   The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
-  `offload-bundle-arch` asks every toolchain.
+  `offload-bundle-arch` and `l0-static-graph` ask every toolchain.
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).
 - On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.
 - Running on an NVIDIA GPU needs NVIDIA's driver (on Ubuntu 26.04, `nvidia-driver-610-open` or another).
@@ -209,6 +223,67 @@ sudo usermod -aG docker "$USER"       # after logging in again it runs without s
 The docker group has the same power as root.
 The containers get no GPU, so nothing extra for GPUs (such as nvidia-container-toolkit) is needed.
 A build makes intel/llvm too; for Fedora 44's free packages the container grew to 6.8 GB at most (measured every minute; the cuda variants add the CUDA toolkit). The container is removed at the end.
+
+## Windows cross build
+
+The Windows engine and tests are built on Linux, up to the link (`cmake/toolchain-windows-msvc.cmake`).
+intel/llvm's SYCL runtime takes only the MSVC ABI on Windows, so the target is `x86_64-pc-windows-msvc`.
+intel/llvm's clang++ compiles and lld-link links.
+What it builds does not run here: running it needs a Windows PC.
+
+It needs three things:
+
+- lld-link (LLVM's `lld`): `sudo apt install lld-21` (21.1)
+- the MSVC CRT and the Windows SDK: downloaded from Microsoft with [xwin](https://github.com/Jake-Shadle/xwin) (0.10.0).
+  They are not free software; Microsoft's license is accepted with `--accept-license`. They do not go into the repository.
+- intel/llvm's Windows SYCL tree (headers, import libraries, the runtime's DLLs): `tools/intel_llvm_build.py --windows` cross-builds the release XeStrata uses (v7.1.1), with XeStrata's patches, for Windows here ("intel/llvm for Windows" below).
+
+```sh
+mkdir -p .tools/xwin
+curl -L https://github.com/Jake-Shadle/xwin/releases/download/0.10.0/xwin-0.10.0-x86_64-unknown-linux-musl.tar.gz |
+    tar -xz -C .tools/xwin
+.tools/xwin/xwin-0.10.0-x86_64-unknown-linux-musl/xwin --accept-license --cache-dir .tools/xwin/cache --arch x86_64 \
+    splat --output .tools/xwin/sdk
+python3 tools/intel_llvm_build.py --contrib && python3 tools/intel_llvm_build.py --windows
+export CCACHE_DIR=$PWD/build/win-ccache CCACHE_COMPILERCHECK=content
+cmake -S . -B build/win -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=ON \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-windows-msvc.cmake \
+    -DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++ -DSTRATA_LICENSE=free \
+    -DSTRATA_XWIN=$PWD/.tools/xwin/sdk -DSTRATA_SYCL_WINDOWS=$PWD/.tools/intel-llvm-win/install \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
+ninja -C build/win
+```
+
+For an everyday change, only the objects of the sources it touches are compiled ([AGENTS.md](../AGENTS.md#operating-systems-linux-main-and-windows)).
+ninja builds a source's object when given the source's path with `^` after it (a full path).
+
+```sh
+export CCACHE_DIR=$PWD/build/win-ccache CCACHE_COMPILERCHECK=content
+ninja -C build/win $(git diff --name-only HEAD -- '*.cpp' | sed "s|^|$PWD/|; s|$|^|")
+```
+
+- ccache is the one of "Faster builds" above. The Windows objects never hit the Linux ones (their settings differ), so a `CCACHE_DIR` of their own keeps them from pushing the Linux cache out. `CCACHE_COMPILERCHECK=content` tells the compiler by its content when intel/llvm is built again.
+- When only a header changed, `ninja -C build/win` builds everything (ccache returns the files that did not change).
+- xwin's `cache` is not needed after the splat and may be deleted (`sdk` is 0.8 GB).
+- lld-link warns `skipping imported DllMain symbol` about `sycl9.lib`: it comes from lld reading an import library MSVC made, and does not change the link.
+
+### intel/llvm for Windows
+
+`tools/intel_llvm_build.py --windows` builds the SYCL runtime for Windows from the same clone as the Linux one, into `.tools/intel-llvm-win/install`.
+It builds the parts the engine uses only (`sycl9.dll`, UR's loader and its CUDA and Level Zero adapters, `xptifw.dll`, the device libraries, the NVIDIA libspirv, the headers and the import libraries): no Debug DLLs, no `clang.exe` and no sycl-jit.
+
+- The clang-cl of the toolchain `--contrib` built, of the same release, compiles and lld-link links. The tools that make the device libraries and libspirv are that toolchain's too (`--contrib`'s build also copies `opt`, `llvm-as` and `libclc-remangler`, which it does not install, into its install folder). No compiler is built, for Windows or for this machine. Build `--contrib` first.
+- The MSVC CRT and the Windows SDK are xwin's splat (`--xwin`, by default `.tools/xwin/sdk`). `llvm-lib`, `llvm-rc`, `llvm-mt` and `llvm-ml` are the distribution's LLVM's (`sudo apt install llvm`).
+- The Windows CUDA headers and import libraries the CUDA adapter links come from NVIDIA's redistributable archives (CUDA 12.4.1's `cuda_cudart`, `cuda_nvml_dev` and `cuda_cccl`). They are not free software and do not go into the 7z.
+- It takes about three minutes on the development machine (28 threads).
+
+For NVIDIA GPUs, configure the cross build with `-DSTRATA_LICENSE=contrib -DSTRATA_CUDA_ARCHS=<the GPU's architecture> -DSTRATA_CUDA_PATH=<a CUDA toolkit>`, a CUDA toolkit no newer than the version the target PC's driver supports.
+`tools/package/build.sh windows cuda12.4` builds all of this, and the Windows 7z, in a disposable Ubuntu 26.04 container ([BUILD.md](BUILD.md)).
+
+### Running on a Windows PC
+
+Put `build/win`'s `strata*.exe` in one folder with `.tools/intel-llvm-win/install/bin`'s `sycl9.dll`, `ur_win_proxy_loader.dll`, `ur_loader.dll`, the adapter of the GPU (`ur_adapter_cuda.dll` for NVIDIA, `ur_adapter_level_zero.dll` for Intel) and `xptifw.dll`.
+When `strata-device.exe --list-devices` lists the GPU, the engine runs.
 
 ## Intel SDE (the AVX-512 paths)
 

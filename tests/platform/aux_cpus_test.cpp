@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // aux_cpus_test: the CPU-set derivation of --aux-cpus (pure functions, no GPU) and, on Linux, the placement of live
 // threads (a thread of the process moved to the aux set by the sweep, one that pins itself at creation, the owned ones
 // left alone, and the original placement put back).

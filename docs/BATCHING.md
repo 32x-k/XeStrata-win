@@ -1,7 +1,7 @@
 <!--
 SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-SPDX-License-Identifier: LGPL-3.0-or-later
+SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 -->
 # Several requests at once (batch slots)
 
@@ -27,6 +27,7 @@ Setup recommends it only where it does not cost speed (below); any number you as
 
 The engine never refuses a count it cannot run: it says so in its log and runs what it can.
 That is at most 8 slots (a window holds 8 rows), as many as fit in VRAM, or none (one request at a time) when not two fit.
+To fit, the slots' sessions, with `--batch-mtp` each slot's drafter, and an expert cache that works must all go in; when they do not, the engine gives slots back from the last and its start log says how many run.
 The server reads the count the engine reports (`INFO batch_slots=N`), and `GET /v1/status` says it (`concurrency.serving`).
 
 With `--batch-mtp`, four greedy requests of 200 tokens in 4 slots gave every slot the same tokens as decoding it alone (`tools/batch_test.py`, `--pcie-frac 0 --adapt-every 1000000`).

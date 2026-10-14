@@ -10,7 +10,7 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md); how to build it, what setup does and the packages it needs, in [BUILD](BUILD.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata xe0.1.43.1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version follows the upstream version it has integrated, and another release on the same upstream version adds a number (xe0.1.40.2.1).
+XeStrata xe0.1.44.1-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.1.44.1-1; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
@@ -29,6 +29,45 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_VRAM_LIMIT_MIB` caps the VRAM the engine sees, `STRATA_MAX_ALLOC_MIB` the largest allocation it assumes, and
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
+
+## Integration through Strata 0.1.43.1
+
+The changes of upstream Strata 0.1.43 to 0.1.43.1 (`a0116b27`) are carried into Xe, except the Windows implementation.
+They were ported one at a time.
+
+The main ones:
+
+- Asynchronous host-to-device copies from pageable RAM go through a pinned slot, or wait until they are sent (upstream #1996).
+  They were the draft K/V's tokens, MTP's prompt records and the image embeddings' rows.
+- PLE: a slow direct read only warns and no longer switches to mmap (`STRATA_PLE_AUTO_MMAP=1` for 0.1.42's switch).
+  `--ple-io mmap`'s prompt reads ask for the next 4096 rows ahead (upstream #2040, #1984, #1971).
+- The watchdog: a file tier busy within the last 10 s keeps its I/O allowance. Parking a conversation copies 1 MiB at a time so the watchdog does not stop it,
+  and the stall report names an MTP draft wait (upstream #2049, #2065). `STRATA_TRACE=2` waits for the device at each startup mark.
+- serve: a refused BGEN slot tries another slot (#1994), a failing before_load hook answers 503 with Retry-After and `/unload?wait=1` is taken (#1997),
+  a quoted `</tool_call>` in a message is text (#2026), a call in a Markdown fence inside `<tool_call>` is read (#2037),
+  and a client that leaves while its pictures are prepared stops the preparation (#1999).
+- Layer split with `--batch`: the default groups no longer give way to `--batch-mtp` (#2038; `STRATA_BATCH_MTP_SERIAL=1` for the old form).
+- setup's `--calibrate` tunes the model of `--model` and `--family` (#2036). The benchmark reports only the GPUs the engine uses (#1985, #2062),
+  and the server it starts runs without `--expert-profile-save` (#2088).
+
+Fixed on XeStrata's side meanwhile:
+
+- Prompt path: the FP16 and int8 experts' rows and groups share one place, so a model with both paths keeps its chunk.
+  RTX 4070, UD-Q4_K_XL at 32K: 460 → 617 tok/s (upstream: 620).
+- Small VRAM's prefill: the hyper-connection block's rows live in the attention and MoE work's region (`STRATA_PREFILL_HC_IN_REGION=0` for their own place),
+  and the FP16 experts' input rows in the upper half of their down outputs' rows (`STRATA_PREFILL_XS_IN_DM=0`).
+  IQ3_XXS at 64K on an RTX 4070 limited to 8 GB: 291 → 428 tok/s.
+- With `--spec` and an expert cache of no slots, the engine stops before reading the prompt.
+  setup warns of a context whose KV cache and expert cache fit in neither VRAM nor RAM, and names a `--context` or `--kv q4_0` that fits.
+
+Measured against upstream v0.1.43.1 on the three makers' GPUs (generate with five model files, the serve path, everyday use).
+On the RTX 4070, IQ3_XXS's decode is 11 to 20% faster from 1K to 262K and the prefill equal or faster.
+On the RX 9060 XT, the prefill is 2.1 to 3.1 times and the decode 5 to 12% faster.
+On an 8 GB card (both engines run with 8 GB of VRAM left), the prefill is 270 against 194 tok/s on the RTX 4070 at 64K and 713 against 306 tok/s on the RX 9060 XT at 32K.
+
+Not carried: the Windows implementation, upstream's `sycl/`, `STRATA_ADAPT_OVERLAP` and its callback thread's tuning (a feature XeStrata does not have),
+telling an adaptive stage's landing by a stream-ordered copy instead of a host function (XeStrata raises its flags in a host function only with `--pcie-mode dma`, not on its default path),
+a smaller chunk that would lend more slots (#2090; XeStrata's ring is monotonic in the chunk), and upstream's test tools and records (`bench/results`).
 
 ## Integration through Strata 0.1.43
 
@@ -63,7 +102,7 @@ The RTX 4070's serve follow-ups wait 222 and 253 ms, against upstream's 240 and 
 
 Not taken: the Windows implementation, upstream's `sycl/`, the HIP and CUDA kernels' tuning tables and the paths for GPUs there is no machine for (Pascal's rows table, gfx12's fused int8 prompt experts, gfx12's decode HC norm and folded flag waits, HIP layer-split defaults),
 the mixed expert profile upstream made for `sycl/` (generate's 32K decode: B70 −2.0%, RTX 4070 +6.2%, RX 9060 XT −5.3%),
-and what has nothing to act on in XeStrata (`STRATA_ADAPT_OVERLAP`, PcieAuto's share, skipping the GEMM operand staging, refilling lent slots by DMA).
+what has nothing to act on in XeStrata (`STRATA_ADAPT_OVERLAP`, PcieAuto's share, skipping the GEMM operand staging, refilling lent slots by DMA), and upstream's records (`bench/results`).
 
 ## Integration through Strata 0.1.42
 
@@ -78,7 +117,6 @@ The main ones:
 - `--aux-cpus` (opt-in), `--ple-io direct` falling back to mmap when it measures slow, the stager's RAM profile, the embedding buffer's reuse.
 - The memory guard (the cgroup limit and `--memory-limit-mib`), `--conversation-cache-min-tokens`, `--session-save-reclaim`, `logit_bias`, `strata --version`.
 - serve's changes (metrics in Prometheus' format, the Monitor's conversation-cache card, AMD GPU readings, the sampling fields, the tool list's order and more) and setup's (how the config is written, `--gguf-dir`, rotational disks, a VRAM reserve on a card that also drives a display, the worker count on hybrid CPUs and more).
-- Upstream's records (`bench/results`).
 
 Measured against upstream v0.1.42 on the three makers' GPUs (generate with five model files, serve, everyday use):
 the B70 and the RTX 4070 match or beat upstream in every cell; the RX 9060 XT does in every cell but generate's decode at

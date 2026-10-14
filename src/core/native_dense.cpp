@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/native_dense.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/platform/memory.hpp"
 
@@ -273,6 +274,33 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 hc_q8.emplace_back(&ref, std::move(data));
             }
         }
+        // upstream 0a379a1f: a pack whose GGUF has no Q8_0 copy of the layers' hyper-connection down / up projections
+        // (the GSQ-RCO files store them in BF16): quantized to Q8_0 from the arena's BF16 at load, then into
+        // kNativeQ8Rows' layout as the GGUF's copies are.  The inject rows and the final mixer stay BF16 (the inject
+        // rows are 82 KB, the mixer runs once a window).
+        if (hc_q8_requested())
+            for (auto& [name, ref] : table.table_) {
+                if (name.rfind("blk.", 0) != 0 || !in_range(name) || !hc_q8_name(name) || ref.data == nullptr ||
+                    std::any_of(hc_q8.begin(), hc_q8.end(), [&ref](const auto& h) { return h.first == &ref; }))
+                    continue;
+                if (ref.ne0 > INT_MAX || ref.ne1 > INT_MAX || ref.elements != ref.ne0 * ref.ne1 ||
+                    ref.bytes != (uint64_t) ref.elements * 2 || !strata::kernels::native_q8_0_rows_ok((int) ref.ne0)) {
+                    err = "native dense (STRATA_HC_Q8): the arena copy of " + name + " is not a BF16 matrix";
+                    return false;
+                }
+                const uint64_t nb = (uint64_t) ref.elements / 32, bytes = nb * 34;
+                void* allocation = nullptr;
+                if (!strata::gpu::alloc_device(&allocation, bytes)) {
+                    err = "native dense (STRATA_HC_Q8) alloc " + name + ": " + strata::gpu::last_error();
+                    return false;
+                }
+                DevicePtr data(allocation);
+                strata::kernels::fused_gr_quantize_q8_0(static_cast<const uint16_t*>(ref.data),
+                                                        static_cast<uint8_t*>(data.get()), (int64_t) nb, &compute);
+                strata::kernels::native_q8_0_to_rows(data.get(), (int) ref.ne0, (int) ref.ne1, &compute);
+                hc_q8_bytes += bytes;
+                hc_q8.emplace_back(&ref, std::move(data));
+            }
         compute.wait();   // the Q6_K rewrites, before any other queue reads the weights
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
         void* allocation = nullptr;

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/s2_expert_grouped_parity.cpp - the S2 expert kernels' rewrite (upstream e155b07b) against the previous
 // kernels, byte for byte (strata/kernels/s2_expert_grouped.hpp, moe_grouped_select_old).  On synthetic S2 blobs (random
 // codes, finite FP16 scales) and Q8_0 activations, for windows of 1, 2, 4 and 8 tokens:

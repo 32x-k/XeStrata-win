@@ -39,14 +39,21 @@ const char* last_error();
 /// free if it can still be read, and whether the GPU still answers (Runtime::device_status).
 std::string failure_report(const std::exception& e);
 
-Stream stream_create();
+/// `high_priority`: a stream the device may run ahead of the others (Runtime::create_stream).
+Stream stream_create(bool high_priority = false);
 /// A stream to record a graph on with begin_capture (on most builds the same as stream_create).
 Stream stream_create_capture();
 /// A stream for copies and events alone (Runtime::create_copy_stream): the copy engine where the device has one.
 Stream stream_create_copy();
 void stream_destroy(Stream s);
 bool stream_sync(Stream s);
-/// True when every command submitted to `s` has completed (cudaStreamQuery == cudaSuccess).
+/// What a poll found (stream_status, event_status).  Failed: the query itself failed, its message in last_error(); a
+/// device error stays in its context, so every later query fails too and a wait that read it as Pending would spin to
+/// its timeout or forever (issue #12: an illegal address on a later stage's CUDA GPU).
+enum class Status { Done, Pending, Failed };
+/// Done when every command submitted to `s` has completed (cudaStreamQuery == cudaSuccess).
+Status stream_status(Stream s);
+/// stream_status(s) == Done: a failed query reads as "not yet", for a caller that waits elsewhere.
 bool stream_idle(Stream s);
 bool device_sync();
 
@@ -62,6 +69,12 @@ inline bool device_pointer(void** d, const void* h) {
     *d = is_host_usm(h) ? const_cast<void*>(h) : nullptr;
     return *d != nullptr;
 }
+/// Whether the current GPU's kernels can read the host memory at `p` in place, as the PCIe share reads the missed
+/// experts: host USM of its own runtime.  A CUDA or HIP GPU also reads host memory registered on it (host_register,
+/// mapped at the same address: kernels_read_registered); a Level Zero GPU reads neither another context's host USM
+/// nor a registration, which is for copies only.
+bool kernels_read_host(const void* p);
+bool kernels_read_registered();
 
 /// Synchronous copy, ordered after the work already on the compute queue (the CUDA legacy stream).
 bool copy(void* dst, const void* src, size_t bytes);
@@ -106,6 +119,9 @@ bool device_speed(int device, int* units, int* khz);
 /// Registers pageable memory for fast device copies (cudaHostRegister).  Registered memory is a copy source or
 /// destination only: kernels cannot address it (docs/XE.md, Runtime contract).
 bool host_register(void* p, size_t bytes);
+/// The same on engine device `device` instead of the current one.
+bool host_register_on(int device, void* p, size_t bytes);
+void host_unregister_on(int device, void* p);
 void host_unregister(void* p);
 
 /// Runs `fn` on a host thread after the work already on `s`; later work on `s` waits for it (cudaLaunchHostFunc).
@@ -117,7 +133,9 @@ bool event_create(Event** e, bool timing = false);
 void event_destroy(Event* e);
 /// Marks the current end of `s`.
 bool event_record(Event* e, Stream s);
-/// True when the marked position has been reached (and when nothing was recorded).
+/// Done when the marked position has been reached (and when nothing was recorded).
+Status event_status(const Event* e);
+/// event_status(e) == Done: a failed query reads as "not yet", for a caller that waits elsewhere.
 bool event_query(const Event* e);
 bool event_sync(const Event* e);
 /// Makes later work on `s` wait for the marked position (cudaStreamWaitEvent).

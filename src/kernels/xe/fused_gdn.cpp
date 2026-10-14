@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/fused_gdn.cpp - the Xe port of Strata's src/kernels/cuda/fused_gdn.cu (see the header): the conv + SiLU + L2
 // norm, the alpha/beta projections with their epilogues, and the GDN step with its output norm, each one kernel.
 //

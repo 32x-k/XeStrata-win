@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def current_version(root: Path = ROOT) -> str:
     """This copy's version without the "xe": a package's (its PACKAGED record), else the one the source tree builds
-    (CMakeLists.txt's XESTRATA_VERSION: the upstream version, and the release on it after the first)."""
+    (CMakeLists.txt's XESTRATA_VERSION: <upstream version>-<XESTRATA_REVISION>, as 0.1.43.1-1)."""
     try:
         return str(json.loads((root / "PACKAGED").read_text(encoding="utf-8")).get("version", "0"))
     except FileNotFoundError:
@@ -43,7 +43,7 @@ def current_version(root: Path = ROOT) -> str:
     r = re.search(r"set\(XESTRATA_REVISION (\d+)\)", text)
     if not m:
         return "0"
-    return m.group(1) + (f".{int(r.group(1)) - 1}" if r and int(r.group(1)) > 1 else "")
+    return f"{m.group(1)}-{int(r.group(1)) if r else 1}"
 
 
 def packaged(root: Path = ROOT) -> bool:
@@ -51,12 +51,21 @@ def packaged(root: Path = ROOT) -> bool:
 
 
 def vtuple(v) -> tuple | None:
-    """xe0.1.40.2.2 (a tag) or 0.1.40.2.2 -> (0, 1, 40, 2, 2); None for anything else."""
-    m = re.fullmatch(r"(?:xe|v)?(\d+(?:\.\d+)*)", str(v or "").strip())
-    return tuple(int(x) for x in m.group(1).split(".")) if m else None
+    """A version's order: xe0.1.43.1-1 (a tag) or 0.1.43.1-1, <upstream>-<revision> since 2026-10-13, ->
+    (1, (0, 1, 43, 1), 1); a version of the earlier form, xe0.1.40.2.2 or 0.1.40.2.2 (a later release on an upstream
+    version took a number more), -> (0, (0, 1, 40, 2, 2), 0), older than any of the new form.  None for anything
+    else."""
+    m = re.fullmatch(r"(?:xe|v)?(\d+(?:\.\d+)*)(?:-(\d+))?", str(v or "").strip())
+    if not m:
+        return None
+    nums = tuple(int(x) for x in m.group(1).split("."))
+    return (1, nums, int(m.group(2))) if m.group(2) is not None else (0, nums, 0)
 
 
 def how_to_update(root: Path = ROOT) -> str:
+    if packaged(root) and os.name == "nt":
+        return (f"download the new 7z from {RELEASES}, unpack it into a folder of its own and start xestrata.exe "
+                "there; the models and settings stay")
     if packaged(root):
         return (f"download the new package from {RELEASES} and install it as before (sudo apt install ./<file>.deb "
                 "or sudo dnf install ./<file>.rpm); the models and settings stay")

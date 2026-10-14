@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/kernels/cpu/native_expert.hpp - plan v0.3 P6: one routed expert in its GGUF form on the CPU.
 //
 // The IQ2_XS / IQ3_XXS model files keep their experts in i-quant formats (IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
@@ -19,6 +19,10 @@ namespace strata::kernels::cpu {
 /// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292; a BF16 layer's
 /// activation is BF16, llm-jp-4.1's 2560 values 5120 bytes).
 inline constexpr size_t kNativeActBytes = 8192;
+/// One token's gate/up activation, as native_quant_act writes it for the layer.  Aligned for the Q2_0 rows' ActQ.
+struct alignas(64) NativeAct {
+    uint8_t bytes[kNativeActBytes];
+};
 /// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292; llm-jp-4.1's 960
 /// as Q8_0: 30 x 34, as BF16 1920).
 inline constexpr size_t kNativeHBytes = 2048;
@@ -37,7 +41,7 @@ struct NativeFmt {
     size_t up_row = 0;                  ///< bytes per up row (gu_row when up_type is gu_type)
     size_t up_off = 0, down_off = 0;    ///< inside the blob
     size_t bytes = 0;                   ///< the whole blob
-    size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
+    size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, or the ActQ; n_ff of d_act)
 };
 
 /// Whether the layer's gate and up rows are of different types (a NativeFmt filled by native_fmt; one built another
@@ -57,7 +61,9 @@ bool native_row_to_float(int type, const void* src, float* dst, int64_t n);
 /// Bytes of one row of `n` values of ggml type `type` (0 when `n` is not whole blocks).
 size_t native_row_bytes(int type, int64_t n);
 
-/// x (n_embd floats) -> the gate/up activation (act_bytes).
+/// x (n_embd floats) -> the gate/up activation the layer's rows read (act_bytes): a Q2_0 layer's is Strata's ActQ,
+/// any other layer's its vec_dot_type.  Every caller gets the right one from here, so none chooses by type.  `dst` is
+/// a NativeAct's bytes, or kNativeActBytes as aligned.
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
 /// h (n_ff floats) -> the down activation (h_bytes).
 void native_quant_h(const NativeFmt& f, const float* h, void* dst);

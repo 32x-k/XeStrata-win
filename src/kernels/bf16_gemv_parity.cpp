@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/bf16_gemv_parity.cpp - P2.S5's test for the BF16 GEMV.
 //
 // THREE THINGS ARE CHECKED, and the third is the one the engine's correctness rests on:

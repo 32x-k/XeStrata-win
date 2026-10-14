@@ -97,12 +97,14 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     if (borrow_first_ >= 0 || off == nullptr || L <= 0 || n < 2) { err = "plain prompt: no tier to borrow from"; return false; }
     // the chunk's device bytes from the tier's last slots: halved until they take at most half the tier, within its
     // last piece (the slots lie back to back only inside one)
+    borrow_short_ = false;
     uint64_t db = 0, hb = 0;
     const int64_t want = T;
     int64_t first = n;
     const int64_t lowest = std::max<int64_t>(n / 2, cache_.last_piece_first());
+    const int64_t least = std::clamp<int64_t>(want, 1, 16);   // a prompt under 16 tokens: one chunk of its length
     for (;; T /= 2) {
-        if (T < 16) break;
+        if (T < least) break;
         prompt_carve(T, pb_, nullptr, nullptr, db, hb);
         first = n;
         while (first > lowest && off[n] - off[first] < db) --first;
@@ -110,7 +112,7 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     }
     // the buffers of their own when their chunk is no shorter than the borrowed one: no slot lent, prompt_return
     // gives back none
-    if (prompt_dev_ != nullptr && (T < 16 || std::min(want, prompt_dev_T_) >= T)) {
+    if (prompt_dev_ != nullptr && (T < least || std::min(want, prompt_dev_T_) >= T)) {
         const int64_t pieces = (want + prompt_dev_T_ - 1) / prompt_dev_T_;   // even chunks: no short last one
         T = (want + pieces - 1) / pieces;
         borrowed_res_.clear();
@@ -121,7 +123,13 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
         g.identity = false;
         return true;
     }
-    if (T < 16) { err = "plain prompt: the VRAM tier is too small for the prompt's buffers"; return false; }
+    if (T < least) {
+        err = "plain prompt: the VRAM tier is too small for the prompt's buffers (" + std::to_string(least) +
+              " tokens need " + std::to_string(db >> 20) + " MiB, the tier lends at most " +
+              std::to_string((off[n] - off[lowest]) >> 20) + " MiB of its " + std::to_string(off[n] >> 20) + ")";
+        borrow_short_ = true;
+        return false;
+    }
     borrowed_res_.clear();
     for (int64_t l = 0; l < L; ++l)
         for (int64_t e = 0; e < E; ++e) {
@@ -230,7 +238,7 @@ bool PlainModel::prompt_warm_products(std::string& err) {
     const int64_t T = P.T, HV = spec_.ssm_dt_rank;
     std::set<std::tuple<int, int, int, int64_t>> seen;
     auto warm = [&](const W& w, float* y, int64_t ldy = 0) {
-        if (w.data != nullptr && seen.insert({w.type, w.n_out, w.n_in, ldy}).second)
+        if (w.data != nullptr && w.type != 0 && seen.insert({w.type, w.n_out, w.n_in, ldy}).second)
             gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
     };
     try {
@@ -279,10 +287,24 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     if (opt_.prompt_chunk <= 0 || n <= 0 || prompt_host_ == nullptr) { err.clear(); return false; }
     if (pos < 0 || pos + n > opt_.max_cells) { err = "plain prompt: past the context"; return false; }
     // one chunk the prompt's length, up to prompt_chunk (prompt_borrow may take fewer)
-    if (!prompt_borrow(std::min<int64_t>(n, opt_.prompt_chunk), err)) return false;
+    if (!prompt_borrow(std::min<int64_t>(n, opt_.prompt_chunk), err)) {
+        // a report on WSL 2 (an RTX 2050, 4 GB): the tier lent too little for even a short chunk and every request
+        // failed; the windows read the prompt instead (slower, but it answers), said once
+        if (borrow_short_) {
+            static bool said = false;
+            if (!said) std::fprintf(stderr, "strata plain: %s: prompts are read through the decode windows\n", err.c_str());
+            said = true;
+            err.clear();
+        }
+        return false;
+    }
     const bool ok = prompt_chunks(tokens, n, pos, out, logits, err);
     std::string err2;
     if (!prompt_return(err2) && ok) { err = err2; return false; }
+    // the tier to the experts the prompt routed most, at once (upstream's q36 engine: up to 2048 slot replacements
+    // after a prompt): the rounds between windows move at most adapt_swaps each, so an empty tier (no profile) took
+    // a hundred windows to fill.  The copies run on the copy stream beside the first windows.
+    if (ok && !disp_.usage.empty() && !adapt(err, 2048)) return false;
     return ok;
 }
 
@@ -466,8 +488,13 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     proj_hn(b.qkv, P.qkv);
                     proj_hn(b.z, P.z);
                     part(5);
-                    proj(b.alpha, P.ab, T, 2 * HV);
-                    proj(b.beta, P.ab + HV, T, 2 * HV);
+                    for (const auto& [w, y] : {std::pair<const W*, float*>{&b.alpha, P.ab}, {&b.beta, P.ab + HV}}) {
+                        if (w->type == 0)   // F32 (Qwen3.6), from the FP32 rows as the router
+                            k::f32_gemm_rows(P.hn, N, static_cast<const float*>(w->data), y, 2 * HV, w->n_in,
+                                             w->n_out, T, cs);
+                        else
+                            proj(*w, y, T, 2 * HV);
+                    }
                     part(6);
                     prefill::gdn_gates(P.ab, b.dt, b.a, P.gate, P.beta, T, cs, HK, HV);
                     prefill::gdn_conv(gdn_conv_[(size_t) b.gdn], P.qkv, b.conv, P.h, T, eps, cs, HK, HV);

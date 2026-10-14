@@ -40,6 +40,7 @@
 #include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/platform/memory.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -98,7 +99,7 @@ PlainModel::~PlainModel() {
     if (cs_ != nullptr) strata::gpu::stream_destroy(cs_);
 }
 
-bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::string& err) {
+bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::string& err, bool f32) {
     size_t at = 0;
     const TensorInfo* t = m.find(name, &at);
     if (t == nullptr || t->shape.size() != 2 || !m.in_bounds(*t, at)) {
@@ -108,7 +109,7 @@ bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::
     w.type = (int) t->type;
     w.n_in = (int) t->shape[0];
     w.n_out = (int) t->shape[1];
-    if (!k::native_mmvq_supported(w.type) && !(w.type == kBF16 && w.n_in % 2 == 0)) {
+    if (!k::native_mmvq_supported(w.type) && !((w.type == kBF16 || (f32 && w.type == kF32)) && w.n_in % 2 == 0)) {
         err = "plain model: " + name + " is " + t->type_name() + ", which the native matrix-vector kernels do not take";
         return false;
     }
@@ -138,9 +139,20 @@ bool PlainModel::upload_f32(const GgufModel& m, const std::string& name, uint64_
                             std::string& err) {
     size_t at = 0;
     const TensorInfo* t = m.find(name, &at);
-    if (t == nullptr || t->type != kF32 || t->elements() != elements || !m.in_bounds(*t, at)) {
-        err = "plain model: " + name + " is missing, not F32 or not " + std::to_string(elements) + " values";
+    if (t == nullptr || (t->type != kF32 && t->type != kBF16) || t->elements() != elements || !m.in_bounds(*t, at)) {
+        err = "plain model: " + name + " is missing, not F32 or BF16 or not " + std::to_string(elements) + " values";
         return false;
+    }
+    const void* src = m.shard(at).tensor_data(*t);
+    std::vector<float> wide;
+    if (t->type == kBF16) {
+        wide.resize(elements);
+        const auto* h = static_cast<const uint16_t*>(src);
+        for (uint64_t i = 0; i < elements; ++i) {
+            const uint32_t u = (uint32_t) h[i] << 16;
+            std::memcpy(&wide[i], &u, 4);
+        }
+        src = wide.data();
     }
     void* d = nullptr;
     if (!strata::gpu::alloc_device(&d, elements * 4)) {
@@ -148,7 +160,7 @@ bool PlainModel::upload_f32(const GgufModel& m, const std::string& name, uint64_
         return false;
     }
     allocs_.push_back(d);
-    if (!strata::gpu::copy(d, m.shard(at).tensor_data(*t), elements * 4)) {
+    if (!strata::gpu::copy(d, src, elements * 4)) {
         err = "plain model: uploading " + name + " failed";
         return false;
     }
@@ -167,7 +179,8 @@ bool PlainModel::load_block(const GgufModel& m, int64_t l, Block& b, std::string
     if (b.recurrent) {
         const uint64_t C = (uint64_t) (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner);
         if (!upload(m, p + "attn_qkv.weight", b.qkv, err) || !upload(m, p + "attn_gate.weight", b.z, err) ||
-            !upload(m, p + "ssm_alpha.weight", b.alpha, err) || !upload(m, p + "ssm_beta.weight", b.beta, err) ||
+            !upload(m, p + "ssm_alpha.weight", b.alpha, err, true) ||
+            !upload(m, p + "ssm_beta.weight", b.beta, err, true) ||
             !upload(m, p + "ssm_out.weight", b.ssm_out, err) ||
             !upload_f32(m, p + "ssm_conv1d.weight", C * (uint64_t) s.ssm_d_conv, b.conv, err) ||
             !upload_f32(m, p + "ssm_dt.bias", (uint64_t) s.ssm_dt_rank, b.dt, err) ||
@@ -612,15 +625,26 @@ bool PlainModel::open_experts(std::string& err) {
     }
     // the prompt path's host buffers, for its longest chunk; the device ones are borrowed from the tier a prompt at a
     // time (prompt_borrow), so the tier is sized from all the free memory
+    // pinned memory can be short (WSL 2 caps it): the chunk is halved until its buffers fit, and with none the prompt
+    // is read through the decode windows (--prompt-chunk 0), said
     if (opt_.prompt_chunk > 0) {
+        const int64_t asked = opt_.prompt_chunk;
         uint64_t db = 0, hb = 0;
-        prompt_carve(opt_.prompt_chunk, pb_, nullptr, nullptr, db, hb);
-        if (!strata::gpu::alloc_host(&prompt_host_, hb)) {
-            err = "plain model: no pinned memory for the prompt path's chunks of " + std::to_string(opt_.prompt_chunk) +
-                  " tokens (" + std::to_string(hb >> 20) + " MiB; --prompt-chunk sets a smaller one, 0 none)";
-            return false;
+        for (; opt_.prompt_chunk >= 16; opt_.prompt_chunk /= 2) {
+            prompt_carve(opt_.prompt_chunk, pb_, nullptr, nullptr, db, hb);
+            if (strata::gpu::alloc_host(&prompt_host_, hb)) break;
+            prompt_host_ = nullptr;
         }
-        prompt_carve(opt_.prompt_chunk, pb_, nullptr, (uint8_t*) prompt_host_, db, hb);
+        if (prompt_host_ == nullptr) {
+            std::fprintf(stderr, "strata plain: no pinned memory for the prompt path's chunks (%lld tokens asked): "
+                                 "prompts are read through the decode windows\n", (long long) asked);
+            opt_.prompt_chunk = 0;
+        } else {
+            if (opt_.prompt_chunk != asked)
+                std::fprintf(stderr, "strata plain: the prompt path's chunks are %lld tokens (the pinned memory for %lld "
+                                     "was not there)\n", (long long) opt_.prompt_chunk, (long long) asked);
+            prompt_carve(opt_.prompt_chunk, pb_, nullptr, (uint8_t*) prompt_host_, db, hb);
+        }
     }
     const uint64_t window_b = (uint64_t) opt_.max_t * (uint64_t) s.n_expert_used * (uint64_t) s.n_embd * 4 * 3 +
                               16 * lay.max_blob + (64ull << 20);
@@ -695,7 +719,17 @@ bool PlainModel::open_experts(std::string& err) {
     if (opt_.adapt_every > 0 && opt_.adapt_swaps > 0) disp_.usage.assign((size_t) (L * E), 0.0f);
     // the split of the missed experts between the CPU and PCIe (after Project Maya's CPU lane): the times measured now,
     // while no expert is in VRAM; only from pinned RAM
-    if (opt_.pcie_split && in_ram) {
+    // WSL 2: an RTX 2050 there failed at this point with CUDA error 700 (an illegal address) while the experts' RAM
+    // was read by the GPU's kernels; --no-pcie-split started and answered.  The cause is not known, so under WSL 2 the
+    // split is off unless STRATA_WSL_PCIE_SPLIT=1 asks for it.
+    static const bool wsl_split = [] {
+        const char* v = std::getenv("STRATA_WSL_PCIE_SPLIT");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (opt_.pcie_split && in_ram && strata::platform::under_wsl() && !wsl_split)
+        std::fprintf(stderr, "strata plain: no PCIe split under WSL 2 (the GPU reading the experts' RAM failed there; "
+                             "STRATA_WSL_PCIE_SPLIT=1 tries it): the CPU takes every missed expert\n");
+    else if (opt_.pcie_split && in_ram) {
         std::string why;
         if (measure_pcie_split(disp_, L, split_, why)) {
             disp_.pcie_split = &split_;
@@ -805,6 +839,11 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
                                          ncols, cs);
             return;
         }
+        if (w.type == kF32) {
+            k::f32_gemv_fp32_mmvf_multi(x, w.n_in, static_cast<const float*>(w.data), y, w.n_out, w.n_in, w.n_out,
+                                        ncols, cs);
+            return;
+        }
         if (quantize) k::native_quantize_q8_1(x, xq_, w.n_in, ncols, cs);
         k::native_mmvq(w.type, w.data, xq_, y, w.n_in, w.n_out, ncols, cs);
     };
@@ -817,8 +856,8 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         proj(b.z, hn_, z_, T, false);
         // alpha and beta, one shape and type: one launch where the pair kernel takes the type (nextsycl's
         // Qwen3.5 decode fuses the two products)
-        if (b.alpha.type == kBF16 || b.alpha.type != b.beta.type || b.alpha.n_in != b.beta.n_in ||
-            b.alpha.n_out != b.beta.n_out ||
+        if (b.alpha.type == kBF16 || b.alpha.type == kF32 || b.alpha.type != b.beta.type ||
+            b.alpha.n_in != b.beta.n_in || b.alpha.n_out != b.beta.n_out ||
             !k::native_mmvq_pair(b.alpha.type, b.alpha.data, b.beta.data, xq_, alpha_, beta_, b.alpha.n_in,
                                  b.alpha.n_out, T, cs)) {
             proj(b.alpha, hn_, alpha_, T, false);
@@ -1194,9 +1233,9 @@ bool PlainModel::save_profile(const std::string& path, std::string& err) const {
 // XeStrata's adaptive tier (generate.cpp's `adapt`): per MoE layer, a missing expert routed at least twice (decayed
 // counts) replaces the least-routed resident one when it leads by 1.5, or takes a free slot; at most adapt_swaps a
 // round, the largest gains first; then the counts decay.  Runs between windows, so no window reads a slot it changes.
-bool PlainModel::adapt(std::string& err) {
+bool PlainModel::adapt(std::string& err, int64_t max_swaps) {
     const int64_t L = n_moe_, E = spec_.n_expert;
-    if (!settle_swaps(false, err)) return false;
+    if (!settle_swaps(max_swaps > 0, err)) return false;
     if (!pending_.empty()) return true;   // the last round's copies are still landing: no new round yet
     struct Swap { float gain; int32_t layer, in, out; };   // out < 0: a free slot
     std::vector<Swap> swaps;
@@ -1229,7 +1268,7 @@ bool PlainModel::adapt(std::string& err) {
                                ? (int64_t) (((uint64_t) opt_.adapt_mib_per_token << 20) * (uint64_t) tokens_since_adapt_ / blob)
                                : opt_.adapt_swaps;
     tokens_since_adapt_ = 0;
-    const int64_t cap = std::min<int64_t>(opt_.adapt_swaps, std::max<int64_t>(budget, 1));
+    const int64_t cap = max_swaps > 0 ? max_swaps : std::min<int64_t>(opt_.adapt_swaps, std::max<int64_t>(budget, 1));
     if ((int64_t) swaps.size() > cap) swaps.resize((size_t) cap);
     for (const Swap& w : swaps) {
         if (w.out < 0) {

@@ -43,8 +43,10 @@ public:
 
     // Engine streams: further in-order queues on this context, for the work CUDA put on its own streams.  A void*
     // stream handed to a kernel is one of these, compute() or null (compute()), or a queue of another device's
-    // runtime (the kernel then runs there); anything else is refused.
-    sycl::queue* create_stream();
+    // runtime (the kernel then runs there); anything else is refused.  `high_priority`: sycl_ext_oneapi_queue_priority's
+    // priority_high, a hint the backend maps to its own (CUDA and HIP stream priorities, Level Zero's queue priority);
+    // a runtime without the extension gives an ordinary stream.
+    sycl::queue* create_stream(bool high_priority = false);
     /// A stream a graph can be recorded on.  With AdaptiveCpp it is a native in-order queue (one HIP stream that
     /// HIP's stream capture records), used only to record; elsewhere it is create_stream().
     sycl::queue* create_capture_stream();
@@ -80,6 +82,12 @@ public:
     void preload_kernels();
     // Waits for preload_kernels' thread to end (timings taken beside it read its CPU work as theirs).
     void wait_preload() { if (preload_.joinable()) preload_.join(); }
+    // Stops it after the kernel it is building, and waits.  Before main returns: exit() tears the GPU compiler (IGC)
+    // down before the runtimes, and a build still running in it then hung or crashed the engine at QUIT.
+    void stop_preload() {
+        preload_stop_.store(true, std::memory_order_relaxed);
+        wait_preload();
+    }
     // Whether an event only ordered or waited on (gpu::event_record without timing) is recorded as an in-order
     // barrier rather than a timestamp (submit_profiling_tag): measured when the runtime is made (measure_marks).
     bool marks_by_barrier() const { return marks_by_barrier_; }

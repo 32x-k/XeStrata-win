@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/s2_gemv.cpp - the Xe ports of Strata's src/kernels/cuda/dequant_s2.cu, s2_gemv.cu and s2_gemv_q8.cu: the
 // S2 (Q2_0 canonical form) decode, its naive fp16-activation GEMV, and the GEMV over Q8_0 activations.  Work shapes
 // and summation orders are the CUDA kernels'.

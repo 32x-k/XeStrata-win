@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/pinned.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/device.hpp"
@@ -17,18 +17,21 @@
 #include <mutex>
 #include <thread>
 
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <cerrno>
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#define STRATA_FSEEK64(f, o) _fseeki64((f), (__int64) (o), SEEK_SET)
+#include <io.h>
+
+#define STRATA_FSEEK64(f, o) _fseeki64((f), (long long) (o), SEEK_SET)
 #else
 #include <sys/mman.h>
 #include <sys/file.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 #include <unistd.h>
-#include <cerrno>
+
 #define STRATA_FSEEK64(f, o) fseeko((f), (off_t) (o), SEEK_SET)
 #endif
 
@@ -72,11 +75,9 @@ void register_pieces(uint8_t* base, uint64_t bytes, const std::vector<uint64_t>&
     }
     uint64_t start = 0;
     for (uint64_t end : ends) {
-#if !defined(STRATA_ADAPTIVECPP)
         sycl::ext::oneapi::experimental::prepare_for_device_copy(base + start, (size_t) (end - start),
                                                                  Runtime::get().context());
         reg.push_back(base + start);
-#endif
         pieces.emplace_back(base + start, (size_t) (end - start));
         start = end;
     }
@@ -85,11 +86,36 @@ void register_pieces(uint8_t* base, uint64_t bytes, const std::vector<uint64_t>&
 // Upstream #771: with transparent huge pages "always" the kernel backs a mapping with huge pages where it can; an
 // extra MADV_HUGEPAGE only adds direct reclaim and compaction on every fault (defrag=madvise), which on a fragmented
 // machine stretched a 25 s start to 432 s.  So it is not asked for there; STRATA_NO_ARENA_THP=1 skips it anywhere.
-// Returns why it was skipped, or an empty string when it should be asked for.
-std::string thp_request_skipped() {
-#if defined(_WIN32)
-    return "transparent huge pages are unavailable on Windows";
-#else
+// Returns why it was skipped, or an empty string when it should be asked for.  Linux only: Windows has no THP.
+#if !defined(_WIN32)
+// bytes in free blocks of 2 MiB or more (/proc/buddyinfo, order >= 9): what MADV_HUGEPAGE can get without compaction
+uint64_t free_huge_bytes() {
+    uint64_t total = 0;
+    if (std::FILE* f = std::fopen("/proc/buddyinfo", "r")) {
+        char line[512];
+        while (std::fgets(line, sizeof line, f) != nullptr) {
+            const char* z = std::strstr(line, "zone");
+            if (z == nullptr) continue;
+            const char* q = z + 4;
+            while (*q == ' ') ++q;
+            while (*q != '\0' && *q != ' ') ++q;   // the zone's name
+            unsigned long long c[11] = {0};
+            int n = 0;
+            for (; n < 11; ++n) {
+                char* e = nullptr;
+                const unsigned long long v = std::strtoull(q, &e, 10);
+                if (e == q) break;
+                c[n] = v;
+                q = e;
+            }
+            for (int o = 9; o < n; ++o) total += c[o] * (4096ull << o);
+        }
+        std::fclose(f);
+    }
+    return total;
+}
+
+std::string thp_request_skipped(uint64_t bytes) {
     if (std::getenv("STRATA_NO_ARENA_THP") != nullptr) return "transparent huge pages skipped (STRATA_NO_ARENA_THP)";
     std::string mode;
     if (std::FILE* f = std::fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r")) {
@@ -101,10 +127,25 @@ std::string thp_request_skipped() {
         }
         std::fclose(f);
     }
-    return mode == "always" ? "transparent huge pages are on for every mapping (THP always): MADV_HUGEPAGE not requested"
-                            : std::string();
-#endif
+    if (mode == "always")
+        return "transparent huge pages are on for every mapping (THP always): MADV_HUGEPAGE not requested";
+    // upstream 6b395578 (#2126): with THP and defrag "madvise", every fault of a MADV_HUGEPAGE mapping reclaims and
+    // compacts until it finds a 2 MiB block.  When the free 2 MiB blocks cover less than half of the arena (a 62 GB
+    // machine holding 47 GB of anonymous memory: the load never ended, at 100% system time), that is minutes of kernel
+    // work per GiB for a TLB gain.  STRATA_ARENA_THP=1 asks for them anyway.
+    if (std::getenv("STRATA_ARENA_THP") == nullptr) {
+        const uint64_t free_huge = free_huge_bytes();
+        if (free_huge < bytes / 2) {
+            std::string why = "transparent huge pages NOT requested: only " + std::to_string(free_huge >> 30) +
+                              " GiB of free 2 MiB blocks for a " + std::to_string(bytes >> 30) +
+                              " GiB arena, compaction would stall the load (STRATA_ARENA_THP=1 requests them anyway)";
+            std::fprintf(stderr, "strata: expert arena: %s\n", why.c_str());   // now: the load that follows can be long
+            return why;
+        }
+    }
+    return std::string();
 }
+#endif
 }  // namespace
 
 void arena_copy_devices(const std::vector<int>& devices) { g_copy_devices = devices; }
@@ -115,16 +156,18 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint6
     (void) slice;   // the registrations cover any slice geometry
     if (!bytes || bytes > std::numeric_limits<size_t>::max() - kHugePage)
         throw DeviceError("the expert arena requires a nonzero size");
-    // Over-map on Linux so the arena starts on a 2 MB boundary and THP can back it from the first byte.
 #if defined(_WIN32)
+    // Windows has no transparent huge pages (its large pages need a privilege an ordinary account lacks): 4 KB pages,
+    // committed against the page file up front, as Windows has nothing like MAP_NORESERVE.
     map_bytes_ = (size_t) bytes;
     map_ = VirtualAlloc(nullptr, map_bytes_, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (map_ == nullptr)
-        throw DeviceError("VirtualAlloc of the expert arena failed for " + std::to_string(bytes) + " bytes");
+        throw DeviceError("VirtualAlloc of the expert arena failed for " + std::to_string(bytes) + " bytes (error " +
+                          std::to_string(GetLastError()) + ")");
     base = map_;
-    const std::string thp_skip = thp_request_skipped();
     const bool huge = false;
 #else
+    // Over-map by one huge page so the arena starts on a 2 MB boundary and THP can back it from the first byte.
     map_bytes_ = (size_t) bytes + kHugePage;
     map_ = mmap(nullptr, map_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (map_ == MAP_FAILED) {
@@ -132,42 +175,34 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint6
         throw DeviceError("mmap of the expert arena failed for " + std::to_string(bytes) + " bytes");
     }
     base = (void*) (((uintptr_t) map_ + kHugePage - 1) & ~(uintptr_t) (kHugePage - 1));
-    const std::string thp_skip = thp_request_skipped();
+    const std::string thp_skip = thp_request_skipped(bytes);
     const bool huge = thp_skip.empty() && madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
 #endif
     // Registered before the loader touches a page: the B70 run showed later writes reach the device intact.
     try {
         register_pieces((uint8_t*) base, bytes, cuts, reg_, pieces_);
     } catch (const std::exception& e) {
-#if !defined(STRATA_ADAPTIVECPP)
         for (void* r : reg_) sycl::ext::oneapi::experimental::release_from_device_copy(r, Runtime::get().context());
-#endif
         reg_.clear();
         pieces_.clear();
-#if defined(_WIN32)
-        VirtualFree(map_, 0, MEM_RELEASE);
-#else
-        munmap(map_, map_bytes_);
-#endif
-        map_ = base = nullptr;
+        unmap(false);
         throw DeviceError(std::string("registering the expert arena for device copies failed: ") + e.what());
     }
     backing = huge ? PageBacking::LargePages : PageBacking::NormalPages;
-#if defined(STRATA_ADAPTIVECPP)
-    registered_bytes = 0;
-    registered_slices = 0;
-#else
     registered_bytes = bytes;
     registered_slices = 1;
-#endif
     slice_starts = {0};
     note = std::string("one mapping registered for device copies") +
            (reg_.size() > 1 ? " in " + std::to_string(reg_.size()) + " pieces (the GPU's largest allocation)" : "") +
            "; " +
+#if defined(_WIN32)
+           "4 KB pages; no VirtualLock";
+#else
            (!thp_skip.empty() ? thp_skip
             : huge             ? "transparent huge pages requested (madvise)"
                                : "madvise(MADV_HUGEPAGE) refused: 4 KB pages") +
            "; no mlock";
+#endif
 }
 
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t pad, bool host_usm,
@@ -216,18 +251,65 @@ struct SharedArenaHeader {
     uint64_t arena_bytes = 0, pack_hash = 0;
     uint64_t reserved[4] = {};   // reserved[0]: durable population completion
 };
-void arena_lock(int fd) {
 #if defined(_WIN32)
-    (void) fd;
-    throw DeviceError("shared expert arenas are unavailable on Windows");
+// The backing file is a CRT descriptor, as on Linux; its handle does the locking, the mapping and the positioned I/O.
+HANDLE os_handle(int fd) { return (HANDLE) _get_osfhandle(fd); }
+bool try_lock(int fd) {
+    OVERLAPPED ov{};
+    return LockFileEx(os_handle(fd), LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, MAXDWORD, MAXDWORD, &ov);
+}
+bool lock_busy() { return GetLastError() == ERROR_LOCK_VIOLATION; }
+void unlock(int fd) {
+    OVERLAPPED ov{};
+    UnlockFileEx(os_handle(fd), 0, MAXDWORD, MAXDWORD, &ov);
+}
+bool pread_all(int fd, void* p, uint64_t n, uint64_t off) {
+    OVERLAPPED ov{};
+    ov.Offset = (DWORD) off;
+    ov.OffsetHigh = (DWORD) (off >> 32);
+    DWORD got = 0;
+    return ReadFile(os_handle(fd), p, (DWORD) n, &got, &ov) && got == n;
+}
+bool pwrite_all(int fd, const void* p, uint64_t n, uint64_t off) {
+    OVERLAPPED ov{};
+    ov.Offset = (DWORD) off;
+    ov.OffsetHigh = (DWORD) (off >> 32);
+    DWORD put = 0;
+    return WriteFile(os_handle(fd), p, (DWORD) n, &put, &ov) && put == n;
+}
+bool sync_file(int fd) { return FlushFileBuffers(os_handle(fd)) != 0; }
+bool file_bytes(int fd, uint64_t& size) {
+    struct _stat64 st{};
+    if (_fstat64(fd, &st) != 0) return false;
+    size = (uint64_t) st.st_size;
+    return true;
+}
+bool resize_file(int fd, uint64_t size) { return _chsize_s(fd, (long long) size) == 0; }
+void close_file(int fd) { _close(fd); }
 #else
+bool try_lock(int fd) { return flock(fd, LOCK_EX | LOCK_NB) == 0; }
+bool lock_busy() { return errno == EWOULDBLOCK || errno == EINTR; }
+void unlock(int fd) { flock(fd, LOCK_UN); }
+bool pread_all(int fd, void* p, uint64_t n, uint64_t off) { return pread(fd, p, n, (off_t) off) == (ssize_t) n; }
+bool pwrite_all(int fd, const void* p, uint64_t n, uint64_t off) { return pwrite(fd, p, n, (off_t) off) == (ssize_t) n; }
+bool sync_file(int fd) { return fdatasync(fd) == 0; }
+bool file_bytes(int fd, uint64_t& size) {
+    struct stat st{};
+    if (fstat(fd, &st) != 0) return false;
+    size = (uint64_t) st.st_size;
+    return true;
+}
+bool resize_file(int fd, uint64_t size) { return ftruncate(fd, (off_t) size) == 0; }
+void close_file(int fd) { ::close(fd); }
+#endif
+
+void arena_lock(int fd) {
     const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(120);
-    while (flock(fd, LOCK_EX | LOCK_NB) != 0) {
-        if (errno != EWOULDBLOCK && errno != EINTR) throw DeviceError("shared arena: file lock failed");
+    while (!try_lock(fd)) {
+        if (!lock_busy()) throw DeviceError("shared arena: file lock failed");
         if (std::chrono::steady_clock::now() >= end) throw DeviceError("shared arena: population lock timed out");
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-#endif
 }
 }  // namespace
 
@@ -235,31 +317,29 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
                          const std::string& file, uint64_t pack_hash, const std::vector<uint64_t>& cuts)
     : capacity(bytes), bounds_(bounds) {
     (void) max_pinned_bytes;   // Xe registers every slice, bounded by the device's largest allocation.
-#if defined(_WIN32)
-    (void) file;
-    (void) pack_hash;
-    (void) cuts;
-    throw DeviceError("shared expert arenas are unavailable on Windows");
-#else
-    if (!bytes || bytes > (uint64_t) std::numeric_limits<off_t>::max() - kArenaHeaderBytes - kHugePage)
+    if (!bytes || bytes > (uint64_t) std::numeric_limits<int64_t>::max() - kArenaHeaderBytes - kHugePage)
         throw DeviceError("shared arena: invalid size");
+#if defined(_WIN32)
+    shared_fd_ = _open(file.c_str(), _O_RDWR | _O_CREAT | _O_BINARY | _O_NOINHERIT, _S_IREAD | _S_IWRITE);
+#else
     shared_fd_ = open(file.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+#endif
     if (shared_fd_ < 0) throw DeviceError("shared arena: cannot open backing file");
     try {
         arena_lock(shared_fd_);
         shared_locked_ = true;
-        struct stat st{};
-        if (fstat(shared_fd_, &st) != 0) throw DeviceError("shared arena: cannot size backing file");
+        uint64_t file_size = 0;
+        if (!file_bytes(shared_fd_, file_size)) throw DeviceError("shared arena: cannot size backing file");
         SharedArenaHeader hdr;
-        if (st.st_size == 0) {
+        if (file_size == 0) {
             hdr.arena_bytes = bytes; hdr.pack_hash = pack_hash;
-            if (ftruncate(shared_fd_, (off_t) (bytes + kArenaHeaderBytes)) != 0 ||
-                pwrite(shared_fd_, &hdr, sizeof hdr, 0) != (ssize_t) sizeof hdr || fdatasync(shared_fd_) != 0)
+            if (!resize_file(shared_fd_, bytes + kArenaHeaderBytes) || !pwrite_all(shared_fd_, &hdr, sizeof hdr, 0) ||
+                !sync_file(shared_fd_))
                 throw DeviceError("shared arena: cannot initialize header");
         } else {
-            if ((uint64_t) st.st_size != bytes + kArenaHeaderBytes) {
+            if (file_size != bytes + kArenaHeaderBytes) {
                 note = "shared arena: file size differs from expected arena size";
-            } else if (pread(shared_fd_, &hdr, sizeof hdr, 0) != (ssize_t) sizeof hdr ||
+            } else if (!pread_all(shared_fd_, &hdr, sizeof hdr, 0) ||
                        std::memcmp(hdr.magic, "STRATA-ARENA-V1", 16) != 0 || hdr.version != 1 ||
                        hdr.header_bytes != kArenaHeaderBytes || hdr.arena_bytes != bytes) {
                 note = "shared arena: incompatible header";
@@ -267,11 +347,23 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
                 note = "shared arena: pack hash mismatch";
             }
             if (!note.empty()) {
-                flock(shared_fd_, LOCK_UN); shared_locked_ = false;
-                ::close(shared_fd_); shared_fd_ = -1;
+                unlock(shared_fd_); shared_locked_ = false;
+                close_file(shared_fd_); shared_fd_ = -1;
                 return;
             }
         }
+#if defined(_WIN32)
+        // A view starts at a multiple of the allocation granularity (64 KiB), so the header is mapped with the arena
+        // and the arena starts 4 KiB in.  The mapping object closes at once: the view keeps it.
+        HANDLE mapping = CreateFileMappingW(os_handle(shared_fd_), nullptr, PAGE_READWRITE, 0, 0, nullptr);
+        if (mapping == nullptr) throw DeviceError("shared arena: mapping failed");
+        map_bytes_ = (size_t) (bytes + kArenaHeaderBytes);
+        map_ = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, map_bytes_);
+        CloseHandle(mapping);
+        if (map_ == nullptr) throw DeviceError("shared arena: mapping failed");
+        base = (uint8_t*) map_ + kArenaHeaderBytes;
+        const bool huge = false;
+#else
         // Reserve the address range first: file offset 4096 can still start at a 2 MiB-aligned virtual address.
         map_bytes_ = (size_t) bytes + kHugePage;
         map_ = mmap(nullptr, map_bytes_, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -281,55 +373,49 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
                  (off_t) kArenaHeaderBytes) == MAP_FAILED) {
             base = nullptr; throw DeviceError("shared arena: mapping failed");
         }
-        const bool huge = thp_request_skipped().empty() && madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
+        const bool huge = thp_request_skipped(bytes).empty() && madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
+#endif
         register_pieces((uint8_t*) base, bytes, cuts.empty() ? bounds : cuts, reg_, pieces_);
         registered_bytes = bytes; registered_slices = 1; slice_starts = {0};
         backing = huge ? PageBacking::LargePages : PageBacking::NormalPages;
         note = "shared file mapping registered in device-sized slices; no mlock";
-        flock(shared_fd_, LOCK_UN); shared_locked_ = false;
+        unlock(shared_fd_); shared_locked_ = false;
     } catch (...) {
         for (void* r : reg_) sycl::ext::oneapi::experimental::release_from_device_copy(r, Runtime::get().context());
         reg_.clear();
-        if (map_) munmap(map_, map_bytes_);
-        map_ = base = nullptr;
-        ::close(shared_fd_); shared_fd_ = -1;
+        unmap(true);
+        close_file(shared_fd_); shared_fd_ = -1;
         throw;
     }
-#endif
 }
 
 bool PinnedArena::begin_shared_population() {
-#if defined(_WIN32)
-    return true;
-#else
     if (shared_fd_ < 0) return true;
     arena_lock(shared_fd_); shared_locked_ = true;
     SharedArenaHeader hdr;
-    if (pread(shared_fd_, &hdr, sizeof hdr, 0) != (ssize_t) sizeof hdr)
-        throw DeviceError("shared arena: cannot read population state");
+    if (!pread_all(shared_fd_, &hdr, sizeof hdr, 0)) throw DeviceError("shared arena: cannot read population state");
     if (hdr.reserved[0] == 1) {
-        flock(shared_fd_, LOCK_UN); shared_locked_ = false;
+        unlock(shared_fd_); shared_locked_ = false;
         return false;
     }
     return true;
-#endif
 }
 
 void PinnedArena::publish_shared() {
-#if defined(_WIN32)
-    throw DeviceError("shared expert arenas are unavailable on Windows");
-#else
     if (shared_fd_ < 0) return;
     if (!shared_locked_) throw DeviceError("shared arena: population lock is not held");
     // The complete body must reach storage before another process can observe its completion record.
-    if (msync(base, (size_t) capacity, MS_SYNC) != 0 || fdatasync(shared_fd_) != 0)
-        throw DeviceError("shared arena: cannot persist populated weights");
-    const uint64_t complete = 1;
-    if (pwrite(shared_fd_, &complete, sizeof complete, offsetof(SharedArenaHeader, reserved)) !=
-            (ssize_t) sizeof complete || fdatasync(shared_fd_) != 0)
-        throw DeviceError("shared arena: cannot publish completed weights");
-    flock(shared_fd_, LOCK_UN); shared_locked_ = false;
+#if defined(_WIN32)
+    const bool flushed = FlushViewOfFile(base, (size_t) capacity) != 0;
+#else
+    const bool flushed = msync(base, (size_t) capacity, MS_SYNC) == 0;
 #endif
+    if (!flushed || !sync_file(shared_fd_)) throw DeviceError("shared arena: cannot persist populated weights");
+    const uint64_t complete = 1;
+    if (!pwrite_all(shared_fd_, &complete, sizeof complete, offsetof(SharedArenaHeader, reserved)) ||
+        !sync_file(shared_fd_))
+        throw DeviceError("shared arena: cannot publish completed weights");
+    unlock(shared_fd_); shared_locked_ = false;
 }
 
 bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::function<uint64_t()>& ram_available) {
@@ -339,10 +425,9 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
         return false;
     }
     auto& runtime = Runtime::get();
+    namespace sx = sycl::ext::oneapi::experimental;
     try {   // no copy may read the mapping while it moves, and its registrations go
         runtime.finish();
-#if !defined(STRATA_ADAPTIVECPP)
-        namespace sx = sycl::ext::oneapi::experimental;
         for (auto& o : other_reg_) {
             auto& r = Runtime::at(o.first);
             r.finish();
@@ -351,7 +436,6 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
         other_reg_.clear();
         for (void* r : reg_) sx::release_from_device_copy(r, runtime.context());
         reg_.clear();
-#endif
     } catch (const std::exception& e) {
         err = std::string("releasing the arena's registrations: ") + e.what();
         return false;
@@ -375,9 +459,7 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
                 std::memcpy((uint8_t*) base + bounds_[k], blocks[k], (size_t) (bounds_[k + 1] - bounds_[k]));
                 runtime.free(blocks[k]);
             }
-#if !defined(STRATA_ADAPTIVECPP)
             try {
-                namespace sx = sycl::ext::oneapi::experimental;
                 for (const auto& pc : pieces_) {
                     sx::prepare_for_device_copy(pc.first, pc.second, runtime.context());
                     reg_.push_back(pc.first);
@@ -387,7 +469,6 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
                       "again failed (" + e.what() + "): its copies are slower";
                 return false;
             }
-#endif
             err = room ? "host USM refused at layer " + std::to_string(l) + " (" + std::to_string(n + pad) + " B)"
                    : "the RAM has no room for layer " + std::to_string(l) + " in host USM (" +
                          std::to_string(avail >> 20) + " MiB available)";
@@ -396,19 +477,16 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
         std::memcpy(q, (uint8_t*) base + bounds_[l], (size_t) n);
         if (pad > 0) std::memset((uint8_t*) q + n, 0, (size_t) pad);
         blocks.push_back((uint8_t*) q);
-#if !defined(_WIN32)
         // the moved layer's whole pages back to the system (MADV_DONTNEED on a private mapping drops them)
         const uintptr_t a = ((uintptr_t) base + bounds_[l] + 4095) & ~(uintptr_t) 4095;
         const uintptr_t b = ((uintptr_t) base + bounds_[l + 1]) & ~(uintptr_t) 4095;
+#if defined(_WIN32)
+        if (b > a && shared_fd_ < 0) VirtualFree((void*) a, (size_t) (b - a), MEM_DECOMMIT);
+#else
         if (b > a) madvise((void*) a, (size_t) (b - a), MADV_DONTNEED);
 #endif
     }
-#if defined(_WIN32)
-    VirtualFree(map_, 0, MEM_RELEASE);
-#else
-    munmap(map_, map_bytes_);
-#endif
-    map_ = nullptr;
+    unmap(shared_fd_ >= 0);
     map_bytes_ = 0;
     layer_base = std::move(blocks);
     pieces_.clear();
@@ -434,11 +512,6 @@ uint8_t* PinnedArena::at(uint64_t off) const {
 }
 
 bool PinnedArena::register_on(int device, std::string& err) {
-#if defined(STRATA_ADAPTIVECPP)
-    (void) device;
-    err.clear();
-    return true;   // pageable copies remain correct; AdaptiveCpp cannot register arbitrary mappings
-#else
     for (const auto& o : other_reg_)
         if (o.first == device) return true;
     std::vector<void*> regs;
@@ -456,14 +529,24 @@ bool PinnedArena::register_on(int device, std::string& err) {
     }
     other_reg_.emplace_back(device, std::move(regs));
     return true;
+}
+
+void PinnedArena::unmap(bool file_view) {
+    if (map_ != nullptr) {
+#if defined(_WIN32)
+        if (file_view) UnmapViewOfFile(map_);
+        else VirtualFree(map_, 0, MEM_RELEASE);
+#else
+        (void) file_view;
+        munmap(map_, map_bytes_);
 #endif
+    }
+    map_ = base = nullptr;
 }
 
 PinnedArena::~PinnedArena() {
-#if !defined(_WIN32)
-    if (shared_fd_ >= 0) ::close(shared_fd_);
-#endif
-#if !defined(STRATA_ADAPTIVECPP)
+    const bool file_view = shared_fd_ >= 0;
+    if (shared_fd_ >= 0) close_file(shared_fd_);
     for (auto& o : other_reg_) {
         try {
             auto& r = Runtime::at(o.first);
@@ -476,7 +559,6 @@ PinnedArena::~PinnedArena() {
             std::_Exit(1);
         }
     }
-#endif
     if (!layer_base.empty()) {
         for (uint8_t* p : layer_base) Runtime::get().free(p);
         return;
@@ -485,19 +567,13 @@ PinnedArena::~PinnedArena() {
     auto& runtime = Runtime::get();
     try {
         runtime.finish();   // no copy may still read the mapping
-#if !defined(STRATA_ADAPTIVECPP)
         for (void* r : reg_) sycl::ext::oneapi::experimental::release_from_device_copy(r, runtime.context());
-#endif
     } catch (const std::exception& e) {
         std::fprintf(stderr, "Xe runtime: releasing the expert arena failed: %s; terminating\n", e.what());
         std::fflush(stderr);
         std::_Exit(1);
     }
-#if defined(_WIN32)
-    VirtualFree(map_, 0, MEM_RELEASE);
-#else
-    munmap(map_, map_bytes_);
-#endif
+    unmap(file_view);
 }
 
 LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_bytes, uint64_t blobs_per_layer,

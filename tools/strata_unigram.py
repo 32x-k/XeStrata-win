@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-FileCopyrightText: 2023-2026 The ggml authors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """tools/strata_unigram.py - SentencePiece's Unigram tokenizer (a GGUF's `tokenizer.ggml.model` = `t5`), llm-jp-4.1's.
 
 Transcribed from llama.cpp's llm_tokenizer_ugm and llm_tokenizer_ugm_session (src/llama-vocab.cpp at the llama.cpp

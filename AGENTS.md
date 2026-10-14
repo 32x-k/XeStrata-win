@@ -1,3 +1,7 @@
+<!--
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
 # Notes for coding agents
 
 ## LOCAL.md: this machine's facts (read it first, keep it current)
@@ -20,6 +24,15 @@ The contrib-llvm build (below) runs on NVIDIA GPUs as well, through the same ker
 - Sizes and thresholds (tile shapes, chunk sizes, ring slots, cache sizes, thread counts, memory reserves, spin bounds) are not hard-coded, as far as they can be: they are derived from those reports at run time. A value that has to be measured is measured on the three makers' GPUs the maintainer has, the Arc Pro B70, the RTX 4070 and the RX 9060 XT, not on the B70 alone; it has a fallback that works on a smaller device, and a comment says where it was measured and what it depends on.
 - A feature some devices lack (XMX, large GRF mode, a SYCL extension) is checked before use, with a working fallback.
 - Check a change on a smaller configuration as well: on the B70 with `STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1` (the memory, the largest allocation and the matrix engines of a small card) and fewer CPU threads; at milestones also on the processor's own graphics (the UHD 770, a check only: start and a short answer). Mark what was not checked `unverified`.
+
+## Operating systems: Linux (main) and Windows
+
+Linux is the main platform: development, tests, measurements and the packages are on Linux.
+Windows is a target as well, built natively for the MSVC ABI with intel/llvm's clang.
+
+- Host code that differs between the two keeps a `#if defined(_WIN32)` branch beside the Linux one, as upstream does, or goes through `src/platform/`.
+- A change to the C++ code is also compiled for Windows on Linux with the cross build ([docs/DEVTOOLS.md](docs/DEVTOOLS.md#windows-cross-build)): at least the files it touches, and the whole build, linked, when dev is integrated. It must compile and link with no new warnings.
+- Running on Windows is checked only at milestones; until then a report marks it `unverified`.
 
 ## Free and non-free builds (Debian main)
 
@@ -62,28 +75,54 @@ A change that does not meet them, a pull request among others, does not go in as
 
 ## Licenses
 
-XeStrata is under the LGPL, version 3 or later (`COPYING.LESSER`, `COPYING`); copyright and MIT notices are in `NOTICE`.
-Keep the MIT notice of the parts that come from Strata.
-`NOTICE` also grants an additional permission (GPL version 3, section 7): XeStrata linked with a GPU or CPU maker's math or compute library and its runtime libraries (oneMKL, cuBLAS, the CUDA runtime) may be conveyed.
+XeStrata as a whole is under the LGPL, version 3 or later (`COPYING.LESSER`, `COPYING`); copyright and license notices are in `NOTICE`.
+`NOTICE` also grants an additional permission (GPL version 3, section 7): XeStrata linked with a GPU or CPU maker's math or compute library and its runtime libraries (oneMKL, cuBLAS, the CUDA runtime), or with the C and C++ runtime libraries of the operating system or its standard compiler (Microsoft's Universal C Runtime and Visual C++ runtime), may be conveyed.
+
+Each file carries the license of the code in it, by where that code comes from:
+
+- XeStrata's own: a file written for XeStrata is under the LGPL, with XeStrata's copyright only.
+- Mixed: a file from a project under a permissive license (Strata, ggml / llama.cpp: MIT) that XeStrata has changed, or a file of XeStrata's with code transcribed from such a project (the kernels in `src/` that follow ggml, for example).
+  The original code keeps its copyright and license; XeStrata's changes and the file as a whole are under the LGPL. The file names both copyright holders and both licenses, and keeps the original notice comment.
+- Unchanged: a file from such a project that XeStrata has not changed (Strata's files as upstream has them, upstream's data files) keeps its own license and copyright only, without XeStrata's line.
+- A file is changed when its content, apart from the SPDX header XeStrata adds, differs from the upstream version XeStrata has integrated (`STRATA_UPSTREAM_VERSION`): from upstream's file at the same path, or from a file of the same content elsewhere (a rename); a file of Strata's that upstream has removed, from the content it last had there. One that XeStrata renamed and changed is mixed; one that has none of upstream's lines (apart from blank and short ones) is XeStrata's own, written anew. An upstream sync that brings a file back to upstream's content makes it unchanged again; a change of XeStrata's to an unchanged file makes it mixed.
+- `tools/license_class.py` checks each file's header (or its `REUSE.toml` annotation) against its class, and `--fix` rewrites the headers that differ; `tools/lint/run.sh` runs the check.
+- Exceptions: XeStrata's changes to oneMath (below) and its patches to intel/llvm (`third_party/main/intel-llvm/patches/`, Apache-2.0 WITH LLVM-exception) stay under those projects' licenses, even when MistVVK writes them.
+
 Material from other projects goes into `third_party/`, one folder per project with its license text, and is listed in that folder's README:
 
 - `third_party/main/<project>/`: free software (what Debian main would take), kept under its own license. XeStrata may build and run with it.
-- Code transcribed from such a project into XeStrata's own sources (the kernels in `src/` that follow ggml, for example) is part of XeStrata under the LGPL, with the original notice kept in a comment.
 - `third_party/nonfree/<project>/`: anything that is not free software.
 - XeStrata's changes to oneMath are commits in its fork ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), branch `xestrata`: oneMath's commit 6ff3a43 with XeStrata's changes on it, and oneMath's `develop` merged into it, up to 1308c5e), under oneMath's license (Apache-2.0), not the LGPL, even when MistVVK writes them; CMake fetches a tag of it. In each file a change touches, it keeps the Apache-2.0 header and adds a line saying who changed what (`Modified 2026 by MistVVK and the XeStrata contributors: ...`); a new file carries XeStrata's copyright and the Apache-2.0 header. The changes are listed in `third_party/main/README.md`.
 
 XeStrata must build, run and pass its tests without `third_party/nonfree/`: whatever is there stays optional and can be removed by deleting the folder.
 
-Every file under the LGPL starts with its copyright holders and license in SPDX form (the [REUSE](https://reuse.software) specification), in the file's comment syntax:
+Every file starts with its copyright holders and license in SPDX form (the [REUSE](https://reuse.software) specification), in the file's comment syntax.
+XeStrata's own file:
+
+<!-- REUSE-IgnoreStart: examples, not this file's own header -->
 
 ```cpp
-// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 ```
 
-- A file that came from Strata has both lines; a file new in XeStrata has only the XeStrata line.
-- A file with code transcribed from ggml / llama.cpp adds `SPDX-FileCopyrightText: 2023-2026 The ggml authors` and keeps its MIT notice comment.
+A mixed file (one from Strata that XeStrata has changed; a file with code transcribed from ggml / llama.cpp adds `SPDX-FileCopyrightText: 2023-2026 The ggml authors` instead of or besides Strata's line):
+
+```cpp
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+```
+
+An unchanged file from Strata:
+
+```cpp
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-License-Identifier: MIT
+```
+
+<!-- REUSE-IgnoreEnd -->
+
 - Files that cannot carry a comment (data, images, JSON) are covered in `REUSE.toml`; the license texts are in `LICENSES/`.
 - `reuse lint` must pass.
 
@@ -98,9 +137,9 @@ The two stages of generation are prefill and decode, the LLM terms, in Japanese 
 ## Measurement records
 
 XeStrata's own measurements (benchmarks, A/B runs, probes, the upstream-sync and release records) are not shared: they go
-into the data folder's `records/` (`<data>: LOCAL.md`) and never into git. `bench/results` keeps only upstream's records
-(`tools/lint/records.txt`) and records others sent (pull requests). Commit messages and documents give the numbers
-themselves, not a link to a record.
+into the data folder's `records/` (`<data>: LOCAL.md`) and never into git. `bench/XeStrataBenchResults` keeps only the
+measurements of XeStrata that others sent (pull requests). upstream's records (its `bench/results`, its community's
+included) are not brought in. Commit messages and documents give the numbers themselves, not a link to a record.
 
 Do not run a measurement whose result is already known. A run that gives the same result each time (greedy, the same
 binary, settings and text, on the same machine in the same state) and has been measured is read from its record, not
@@ -122,10 +161,11 @@ It picks the lints by file kind, with the configurations in `tools/lint/`:
 | CSS / JavaScript / HTML | stylelint, eslint, tidy |
 | all text files | codespell |
 | every file | gitleaks (built-in rules, no configuration of its own) |
+| every file | `tools/license_class.py` (the license classes, see Licenses above) |
 | the whole repository | `reuse lint` (see Licenses above) |
 
 The files a change touches must get no new findings; findings that were there before may stay.
-The records that came from upstream's `bench/results` (other people's measurements, listed in `tools/lint/records.txt`) and other projects' files in `third_party/<area>/<project>/` (kept as they are; XeStrata's `patches/` there excepted) get only gitleaks and `reuse lint`.
+Other projects' files in `third_party/<area>/<project>/` (kept as they are; XeStrata's `patches/` there excepted) get only gitleaks and `reuse lint`.
 clang-tidy reads `compile_commands.json` from the build folder (`build/free`, or `STRATA_LINT_BUILD`): configure it with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
 
 Then run the existing tests the change can affect (CTest in the build folder, `python -m unittest` for `serve/` and `tools/`).
@@ -170,7 +210,9 @@ The README, the documents and the release notes send the user to `xestrata --set
 XeStrata's version is the upstream version it has integrated (`STRATA_UPSTREAM_VERSION` in `CMakeLists.txt`) and `XESTRATA_REVISION`, the count of XeStrata's releases on that upstream version from 1, as a Debian revision counts:
 
 - the packages are `<upstream>-<revision>` (rpm: Version and Release);
-- the version name (the tag and `STRATA_VERSION_NAME`) is `xe<upstream>` for the first release and `xe<upstream>.<revision - 1>` for a later one: xe0.1.40.2.1 is the package `0.1.40.2-2`.
+- the version name (the tag, `STRATA_VERSION_NAME` and what the engine says) is the same with `xe` before it, `xe<upstream>-<revision>`: xe0.1.43.1-1 is the package `0.1.43.1-1`.
+
+Releases before 2026-10-13 were named `xe<upstream>` for the first and `xe<upstream>.<revision - 1>` for a later one (xe0.1.43.1 was 0.1.43's second release), which an upstream version with a fourth number collided with; their tags stay as they are.
 
 Integrating a new upstream version sets `XESTRATA_REVISION` back to 1; another release on the same upstream version raises it by one.
 

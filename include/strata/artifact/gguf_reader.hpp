@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/artifact/gguf_reader.hpp - generated from src/artifact/gguf_reader.cpp by
 // scripts/split_artifact.py.  Header-only on purpose: the reader is one translation unit's worth of
 // code with no state to hide, and a header-only split cannot introduce a duplicate-symbol or
@@ -39,7 +39,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
-#define NOMINMAX
+#define NOMINMAX   // windows.h's min/max macros would break std::min/std::max in every file that includes this one
 #endif
 #include <windows.h>
 #else

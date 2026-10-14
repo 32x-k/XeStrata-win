@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // serve/web/app.js - the Strata web app: Chat, Monitor, About. No framework, no network beyond this server.
 // The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
 "use strict";
@@ -76,9 +76,10 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 
 let tab = "chat";
 function showTab(name) {
-  tab = ["chat", "monitor", "about"].includes(name) ? name : "chat";
+  tab = ["chat", "images", "monitor", "about"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "images", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
+  if (tab === "images") $("img-prompt").focus();
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
@@ -106,6 +107,8 @@ async function loadHealth() {
     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
     $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
+    $("tab-btn-images").hidden = !health.image_generation;
+    if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }
@@ -1191,3 +1194,36 @@ loadHealth().then(loadSwitcher).then(loadMcp).then(() => loadUpdate()).then(() =
 showTab(location.hash.slice(1) || "chat");
 poll();
 setInterval(() => { if (!switching) loadSwitcher(); }, 15000);   // a switch started elsewhere shows here too
+
+// ------------------------------------------------------------------ images (POST /v1/images/generations)
+$("img-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const prompt = $("img-prompt").value.trim();
+  if (!prompt) return;
+  const body = {prompt, size: $("img-size").value, response_format: "b64_json"};
+  if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
+  $("img-go").disabled = true;
+  const t0 = performance.now();
+  $("img-hint").textContent = "Generating\u2026 (a minute or more on a small GPU)";
+  try {
+    const r = await fetch("v1/images/generations", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+    for (const d of j.data) {
+      const fig = document.createElement("figure");
+      const img = document.createElement("img");
+      img.src = "data:image/png;base64," + d.b64_json;
+      img.alt = prompt;
+      const cap = document.createElement("figcaption");
+      cap.textContent = `${j.size}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
+      fig.append(img, cap);
+      $("img-results").prepend(fig);
+    }
+    $("img-hint").textContent = "Done. Right-click an image to save it.";
+  } catch (e) {
+    $("img-hint").textContent = "";
+    toast("error", "No image", String(e.message || e), 8000);
+  } finally {
+    $("img-go").disabled = false;
+  }
+};

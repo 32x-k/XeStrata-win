@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-FileCopyrightText: 2023-2026 The ggml authors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/iq_mmq.cpp - see include/strata/kernels/iq_mmq.hpp.
 //
 // The weights' values and scales follow llama.cpp's dequantizers (ggml/src/ggml-quants.c, dequantize_row_*; MIT
@@ -1182,6 +1182,14 @@ bool iq_mmq_dp4a_usable(sycl::queue& q) {
         return d.get_info<sycl::info::device::local_mem_size>() >= (size_t) Big::LOCAL &&
                d.get_info<sycl::info::device::max_work_group_size>() >= (size_t) Big::NSG * SG;
     });
+}
+
+const char* iq_mmq_path(sycl::queue& q) {
+    if (iq_mmq_usable(q)) {
+        const sycl::device d = q.get_device();
+        return xe::amd_wmma(d) ? "WMMA" : shape_reported(d) ? "joint_matrix" : "XMX";
+    }
+    return iq_mmq_dp4a_usable(q) ? "DP4a" : nullptr;
 }
 
 bool iq_mmq_type_sums(int t) { return t == 12 || t == 13; }   // has_min

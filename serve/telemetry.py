@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/telemetry.py - hardware readings for the web app's Monitor tab (idea from PR #22 by code-martin).
 
 A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:

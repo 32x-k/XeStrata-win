@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/fused_gr.cpp - the Xe port of Strata's src/kernels/cuda/fused_gr.cu (see the header): the gated residual read
 // at the model's fixed geometry in two kernels, for one token or a verify window of up to kFusedGrMaxT.
 //
@@ -729,6 +729,30 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         });
     });
     if (!stream) core::Runtime::get().wait(e, "fused_gr_read_multi");
+}
+
+void fused_gr_quantize_q8_0(const uint16_t* src, uint8_t* dst, int64_t nb, void* stream) {
+    if (nb <= 0) return;
+    // one sub-group a block: lane i takes value i, the block's max |x| by a butterfly
+    queue_for(stream).parallel_for(sycl::nd_range<1>((size_t) nb * WARP, WARP),
+                                   [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int64_t b = (int64_t) it.get_group(0);
+        const int i = (int) sg.get_local_linear_id();
+        const float x = sycl::bit_cast<float>((uint32_t) src[b * 32 + i] << 16);
+        float amax = sycl::fabs(x);
+        for (int o = 16; o > 0; o >>= 1) amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
+        const float d = amax / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        uint8_t* blk = dst + b * 34;
+        blk[2 + i] = (uint8_t) (int8_t) sycl::round(x * id);
+        if (i == 0) {
+            const sycl::half h = (sycl::half) d;
+            const uint16_t hb = sycl::bit_cast<uint16_t>(h);
+            blk[0] = (uint8_t) (hb & 0xff);
+            blk[1] = (uint8_t) (hb >> 8);
+        }
+    });
 }
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) {

@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/cpu/expert_parity.cpp - P2.S3's test for the CPU expert path.
 //
 // WHAT IS BEING CHECKED, and the two tolerances are different questions:
@@ -48,8 +48,8 @@ bool read_blob(const char* path, long long index, std::vector<uint8_t>& out) {
     out.assign(cpu::BLOB, 0);
     std::FILE* f = std::fopen(path, "rb");
     if (!f) return false;
-#if defined(_WIN32)
-    if (_fseeki64(f, (__int64) index * (__int64) cpu::BLOB, SEEK_SET) != 0) { std::fclose(f); return false; }
+#if defined(_MSC_VER)
+    if (_fseeki64(f, index * (long long) cpu::BLOB, SEEK_SET) != 0) { std::fclose(f); return false; }
 #else
     if (fseeko(f, (off_t) index * (off_t) cpu::BLOB, SEEK_SET) != 0) { std::fclose(f); return false; }
 #endif

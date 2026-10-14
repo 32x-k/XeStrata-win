@@ -1,0 +1,39 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+build-libdevice-custom-tools: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+The device libraries (libdevice) depend on sycl-compiler, the compiler being built and all its tools, even
+when LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR gives the tools that compile them.  A cross build for Windows
+(tools/intel_llvm_build.py --windows) then built a Windows clang.exe and its tools nobody runs, most of the
+build's time.  With the tools given, the device libraries depend on the SYCL headers alone; a build without
+them is unchanged.
+---
+diff --git a/libdevice/cmake/modules/SYCLLibdevice.cmake b/libdevice/cmake/modules/SYCLLibdevice.cmake
+index 4f7d06e66..c811d12a4 100644
+--- a/libdevice/cmake/modules/SYCLLibdevice.cmake
++++ b/libdevice/cmake/modules/SYCLLibdevice.cmake
+@@ -330,11 +330,17 @@ endfunction()
+ 
+ # For native builds, sycl-compiler will already include everything we need.
+ # For cross builds, we also need native versions of the tools.
+-set(sycl-compiler_deps
+-  sycl-compiler ${clang_target} ${append-file_target}
+-  ${clang-offload-bundler_target} ${llvm-offload-binary_target}
+-  ${file-table-tform_target} ${llvm-foreach_target} ${llvm-spirv_target}
+-  ${sycl-post-link_target})
++# With LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR the tools are given: the SYCL headers
++# are all the compiles need, and the compiler being built is not.
++if(EXISTS ${LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR})
++  set(sycl-compiler_deps sycl-headers)
++else()
++  set(sycl-compiler_deps
++    sycl-compiler ${clang_target} ${append-file_target}
++    ${clang-offload-bundler_target} ${llvm-offload-binary_target}
++    ${file-table-tform_target} ${llvm-foreach_target} ${llvm-spirv_target}
++    ${sycl-post-link_target})
++endif()
+ set(crt_obj_deps wrapper.h device.h spirv_vars.h ${sycl-compiler_deps})
+ set(complex_obj_deps device_complex.h device.h ${sycl-compiler_deps})
+ set(cmath_obj_deps device_math.h device.h ${sycl-compiler_deps})

@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #pragma once
 // src/artifact/dequant.cpp - P1.S3: scalar reference dequantizers, transcribed from ggml.
 //
@@ -255,7 +255,7 @@ inline void dequantize_q3_K(const uint8_t* block, float* out) {
     aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
     aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
     aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-    const int8_t* scales = (const int8_t*)aux;
+    const int8_t* scales = reinterpret_cast<const int8_t*>(aux);
 
     float* y = out;
     int is = 0;
@@ -302,10 +302,10 @@ inline void dequantize_f32(const uint8_t* p, float* out, int n) {
     std::memcpy(out, p, (size_t)n * 4);
 }
 inline void dequantize_f16(const uint8_t* p, float* out, int n) {
-    for (int i = 0; i < n; ++i) out[i] = fp16_to_fp32(read_u16(p + 2 * i));
+    for (int i = 0; i < n; ++i) out[i] = fp16_to_fp32(read_u16(p + 2 * (size_t) i));
 }
 inline void dequantize_bf16(const uint8_t* p, float* out, int n) {
-    for (int i = 0; i < n; ++i) out[i] = bf16_to_fp32(read_u16(p + 2 * i));
+    for (int i = 0; i < n; ++i) out[i] = bf16_to_fp32(read_u16(p + 2 * (size_t) i));
 }
 
 } // namespace strata

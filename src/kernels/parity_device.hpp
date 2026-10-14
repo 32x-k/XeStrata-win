@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/parity_device.hpp - device plumbing shared by the parity programs ported from CUDA.
 //
 // Each program keeps its fixtures, references and tolerances; this only replaces cudaMalloc, cudaMemcpy and

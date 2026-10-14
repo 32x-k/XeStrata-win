@@ -1,28 +1,23 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 cmake_minimum_required(VERSION 3.24)
 project(XeStrata LANGUAGES CXX)
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT WIN32)
-  message(FATAL_ERROR "XeStrata supports Linux and the experimental Windows port")
+if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
+  message(FATAL_ERROR "XeStrata builds for Linux and Windows")
 endif()
-# The engine builds with intel/llvm (third_party/main/intel-llvm/patches; on Windows AMD GPUs through HIP).  The
+# On Windows the AMD GPUs build through intel/llvm's HIP target (third_party/main/intel-llvm/patches 90-92).  The
 # AdaptiveCpp port of the Windows engine stays in the tree but out of the default build (-DSTRATA_ADAPTIVECPP=ON)
 option(STRATA_ADAPTIVECPP "Build the SYCL engine with AdaptiveCpp (experimental Windows port)" OFF)
-set(STRATA_UPSTREAM_VERSION "0.1.43")
-set(STRATA_UPSTREAM_COMMIT "7695859")
+set(STRATA_UPSTREAM_VERSION "0.1.44.1")
+set(STRATA_UPSTREAM_COMMIT "a0116b2")
 # XeStrata's version follows the upstream version it has integrated, marked "xe" so it is not taken for upstream's.
-# XESTRATA_REVISION counts XeStrata's releases on that upstream version from 1, as a Debian revision does: the packages
-# are <upstream>-<revision> (rpm: Version and Release), the version name xe<upstream> for the first release and
-# xe<upstream>.<revision - 1> for a later one (xe0.1.40.2.1 is the package 0.1.40.2-2), more numbers than project()
-# can hold.
-set(XESTRATA_REVISION 2)
-if(XESTRATA_REVISION GREATER 1)
-  math(EXPR _xe_later "${XESTRATA_REVISION} - 1")
-  set(XESTRATA_VERSION "${STRATA_UPSTREAM_VERSION}.${_xe_later}")
-else()
-  set(XESTRATA_VERSION "${STRATA_UPSTREAM_VERSION}")
-endif()
+# XESTRATA_REVISION counts XeStrata's releases on that upstream version from 1, as a Debian revision does, and the
+# version is <upstream>-<revision> everywhere: the version name (the tag, what the engine says) xe<upstream>-<revision>
+# (xe0.1.43.1-1), the packages <upstream>-<revision> (rpm: Version and Release).  Before 2026-10-13 a later release
+# took a fifth number instead (xe0.1.43.1 was 0.1.43's second), which upstream's own 0.1.43.1 then collided with.
+set(XESTRATA_REVISION 1)
+set(XESTRATA_VERSION "${STRATA_UPSTREAM_VERSION}-${XESTRATA_REVISION}")
 set(STRATA_VERSION_NAME "xe${XESTRATA_VERSION}")
 add_compile_definitions(STRATA_VERSION="${STRATA_VERSION_NAME}"
   STRATA_BACKEND="xe" STRATA_UPSTREAM_VERSION="${STRATA_UPSTREAM_VERSION}"
@@ -134,6 +129,10 @@ endif()
 # arithmetic as upstream; a kernel may opt into faster math only with a measured reason.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-ffp-model=precise>)
+endif()
+# Windows' C runtime marks standard C functions (getenv, fopen, sscanf) deprecated in favour of its own _s versions
+if(WIN32)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
 
 option(STRATA_ENABLE_XE "Build the Intel Xe runtime and migrated kernels" ON)
@@ -407,7 +406,7 @@ if(STRATA_ENABLE_XE)
   strata_enable_sycl(strata_core)
 
   add_executable(strata-device src/core/device_main.cpp)
-  target_link_libraries(strata-device PRIVATE strata_core)
+  target_link_libraries(strata-device PRIVATE strata_core strata_kernels_cpu)   # --cpu: the engine's CPU tests
   strata_enable_sycl(strata-device)
   add_executable(strata-load src/core/load_main.cpp)
   target_link_libraries(strata-load PRIVATE strata_core)
@@ -537,7 +536,14 @@ if(STRATA_ENABLE_XE)
   if(NOT STRATA_LICENSE MATCHES "^(contrib|contrib-icpx)$")
     set(_strata_onemkl OFF)   # oneMKL is not free software
   endif()
-  option(STRATA_ENABLE_ONEMATH "Build oneMath dense-product backends" ON)
+  # Windows: oneMath's FindcuBLAS finds Linux's libraries only, so there the Intel and NVIDIA GPUs take XeStrata's own
+  # kernels; the AMD GPUs' rocBLAS backend builds against the ROCm SDK (STRATA_ROCM_ROOT)
+  if(WIN32 AND (_strata_onemkl OR _strata_cuda_archs))
+    set(_strata_onemath_default OFF)
+  else()
+    set(_strata_onemath_default ON)
+  endif()
+  option(STRATA_ENABLE_ONEMATH "Build oneMath dense-product backends" ${_strata_onemath_default})
   if(STRATA_ENABLE_ONEMATH AND (_strata_onemkl OR _strata_cuda_archs OR _strata_hip_archs))
     if(_strata_onemkl AND NOT MKL_ROOT)
       if(DEFINED ENV{MKLROOT})
@@ -557,6 +563,8 @@ if(STRATA_ENABLE_XE)
       set(ENABLE_ROCBLAS_BACKEND ON)
       list(GET _strata_hip_archs 0 HIP_TARGETS)
       strata_hip_cxx(HIP_CXX_COMPILER)
+      strata_hip_prefixes(_strata_rocm_prefixes)        # after what is given: AMD's trees, for find_package(hip)
+      list(APPEND CMAKE_PREFIX_PATH ${_strata_rocm_prefixes})
       # hipBLASLt, which the fork's rocBLAS backend hands the 16-bit GEMMs to where it has kernels for the GPU: without
       # it they run in rocBLAS, whose kernels for some GPUs are generic ones (gfx12 in ROCm 7.1: a fifteenth of the
       # speed).  A package must have it.
@@ -864,8 +872,8 @@ target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
 # `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
-set_source_files_properties(src/kernels/cpu/expert.cpp
-                            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+set(STRATA_AVX512_FLAGS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "${STRATA_AVX512_FLAGS}")
 set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 # AVX-VNNI (Alder Lake, Sapphire Rapids and later; upstream b211ba17): the AVX-2 expert kernels' vpdpwssd / vpdpbusd
 # copies (q2_avx2.cpp, iq_avx2.cpp; *_rows.inl), taken at run time where cpu_avxvnni_ok().  Only those functions are
@@ -910,8 +918,8 @@ if(STRATA_NATIVE_EXPERTS)
   set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   if(STRATA_PORTABLE)
     set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
-    foreach(_f GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)
-      set(${_f} ON CACHE BOOL "" FORCE)
+    foreach(ggml_isa GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)
+      set(${ggml_isa} ON CACHE BOOL "" FORCE)
     endforeach()
   else()
     set(GGML_NATIVE ON CACHE BOOL "" FORCE)
@@ -935,8 +943,7 @@ if(STRATA_NATIVE_EXPERTS)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
                                            src/kernels/cpu/iq_avx2.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/main/ggml)
-  set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
-                              "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+  set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${STRATA_AVX512_FLAGS}")
   set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
@@ -1020,11 +1027,11 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
 
-  # #795 (upstream 90dd021a): nothing an AVX2-only CPU can reach may hold AVX-512 / AVX-VNNI-class instructions.  (1) the
-  # kernel library is disassembled and any function with such instructions must be a kernel of a wide-ISA file, not a
-  # weak / COMDAT copy and not a probe or helper that every CPU runs; (2) with -DSTRATA_SDE=<sde> (Intel SDE) the CPU
-  # tests run on an emulated AVX2-only Haswell and on an Alder Lake (AVX-VNNI, no AVX-512): SDE stops at the first
-  # instruction the chip does not have.
+  # #795 (upstream 90dd021a): nothing an AVX2-only CPU can reach may hold AVX-512 / AVX-VNNI-class instructions.
+  # (1) the kernel library is disassembled and any function with such instructions must be a kernel of a wide-ISA
+  # file, not a weak / COMDAT copy and not a probe or helper that every CPU runs; (2) with -DSTRATA_SDE=<sde> (Intel
+  # SDE) the CPU tests run on an emulated AVX2-only Haswell and on an Alder Lake (AVX-VNNI, no AVX-512): SDE stops at
+  # the first instruction the chip does not have.
   if(TARGET iq_avx2_parity)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
@@ -1033,17 +1040,18 @@ if(STRATA_BUILD_TESTS)
       set_tests_properties(isa_guard_check PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     endif()
   endif()
-  set(STRATA_SDE "" CACHE FILEPATH "Intel SDE (sde / sde64): also run the CPU tests on an emulated AVX2-only and an AVX-VNNI-only CPU")
+  set(STRATA_SDE "" CACHE FILEPATH
+      "Intel SDE (sde / sde64): also run the CPU tests on an emulated AVX2-only and an AVX-VNNI-only CPU")
   if(STRATA_SDE AND TARGET iq_avx2_parity)
-    foreach(_chip hsw adl)
-      foreach(_t iq_avx2_parity q8k_quant_parity router_dot_parity pool_tasks_test q2_bitplane_parity)
-        if(TARGET ${_t})
-          add_test(NAME sde_${_chip}_${_t} COMMAND ${STRATA_SDE} -${_chip} -- $<TARGET_FILE:${_t}>)
-          set_tests_properties(sde_${_chip}_${_t} PROPERTIES TIMEOUT 900)
+    foreach(sde_chip hsw adl)
+      foreach(sde_test iq_avx2_parity q8k_quant_parity router_dot_parity pool_tasks_test q2_bitplane_parity)
+        if(TARGET ${sde_test})
+          add_test(NAME sde_${sde_chip}_${sde_test} COMMAND ${STRATA_SDE} -${sde_chip} -- $<TARGET_FILE:${sde_test}>)
+          set_tests_properties(sde_${sde_chip}_${sde_test} PROPERTIES TIMEOUT 900)
         endif()
       endforeach()
       if(TARGET q2_bitplane_parity)
-        set_tests_properties(sde_${_chip}_q2_bitplane_parity PROPERTIES ENVIRONMENT "STRATA_Q2_BITPLANE=1")
+        set_tests_properties(sde_${sde_chip}_q2_bitplane_parity PROPERTIES ENVIRONMENT "STRATA_Q2_BITPLANE=1")
       endif()
     endforeach()
   endif()

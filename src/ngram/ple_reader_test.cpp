@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/ngram/ple_reader_test.cpp - plan v0.3 P2: the direct SSD row reader against ground truth.
 //
 //   ple_reader_test --selftest [--dir D]        synthetic table file; CPU and disk only, no model, no GPU
@@ -193,6 +193,27 @@ void format_round_trip(const std::string& dir, const k::PleFormatInfo& f, uint32
             // NOLINTNEXTLINE(bugprone-suspicious-memory-comparison): bit-exact
             CHECK(std::memcmp(tok + (size_t) h * k::PLE_HEAD_DIM, ref, sizeof ref) == 0, "%s: %s: gather head %d differs", f.name, name, h);
         }
+        // a prompt chunk: gather_batch over more rows than one prefetch window (4096), one of them past the table's end
+        {
+            const size_t nt = 700, nr = nt * 16;     // 11200 rows, three windows
+            std::vector<uint32_t> br(nr);
+            for (size_t i = 0; i < nr; ++i) br[i] = want[i % want.size()];
+            if (mode == k::PleIo::Mmap) br[5000] = rows + 7;   // out of range (mapped): zeros, as read_row gives
+            std::vector<float> bo(nr * k::PLE_HEAD_DIM);
+            std::string e2;
+            CHECK(t.gather_batch(br.data(), nt, bo.data(), e2), "%s: %s: gather_batch: %s", f.name, name, e2.c_str());
+            size_t bad = 0;
+            for (size_t i = 0; i < nr && !g_fail; ++i) {
+                if (br[i] >= rows) {
+                    for (int d = 0; d < k::PLE_HEAD_DIM; ++d) bad += bo[i * k::PLE_HEAD_DIM + d] != 0.0f;
+                    continue;
+                }
+                expected_row(br[i], f.row_bytes, raw.data());
+                f.dequant(raw.data(), f.needs_scale ? 0.75f : 1.0f, ref);
+                bad += std::memcmp(bo.data() + i * k::PLE_HEAD_DIM, ref, sizeof ref) != 0;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
+            }
+            CHECK(bad == 0, "%s: %s: gather_batch differs in %zu rows", f.name, name, bad);
+        }
     }
     std::filesystem::remove(path);
 }
@@ -250,7 +271,7 @@ int selftest(const std::string& dir, uint32_t rb) {
     const uint32_t N = 500000;                          // 45 MB: large enough for thousands of distinct pages
     const std::string path = dir + "/ple_reader_selftest_" + std::to_string(rb) + ".bin";
     if (!make_table(path, N, rb)) { std::fprintf(stderr, "cannot write %s\n", path.c_str()); return 2; }
-    std::mt19937 rng(7);
+    std::mt19937 rng(7);  // NOLINT(bugprone-random-generator-seed): reproducible rows.
     for (bool thr : {false, true})
     for (uint64_t cache : {0ull, 4096ull}) {
         for (uint32_t inflight : {1u, 8u, 64u}) {
@@ -378,7 +399,7 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path, 
     if (!direct_only && !mm.open(gguf, err, mo)) { std::fprintf(stderr, "mmap open: %s\n", err.c_str()); return 2; }
     if (!direct.open(gguf, err, dopt)) { std::fprintf(stderr, "direct open: %s\n", err.c_str()); return 2; }
     std::vector<std::vector<uint32_t>> tickets;
-    std::mt19937_64 rng(11);
+    std::mt19937_64 rng(11);  // NOLINT(bugprone-random-generator-seed): reproducible rows.
     for (int t = 0; t < n_random / 16; ++t) {
         std::vector<uint32_t> r(16);
         for (auto& x : r) x = (uint32_t) (rng() % direct.rows());
@@ -448,9 +469,9 @@ int main(int argc, char** argv) {
         else if (a == "--ram-time" && i + 1 < argc) ram_path = argv[++i];
         else if (a == "--dir" && i + 1 < argc) dir = argv[++i];
         else if (a == "--gguf" && i + 1 < argc) gguf = argv[++i];
-        else if (a == "--rows" && i + 1 < argc) rows = std::atoi(argv[++i]);
+        else if (a == "--rows" && i + 1 < argc) rows = (int) std::strtol(argv[++i], nullptr, 10);
         else if (a == "--tokens" && i + 1 < argc) tokens = argv[++i];
-        else if (a == "--inflight" && i + 1 < argc) inflight = (uint32_t) std::atoi(argv[++i]);
+        else if (a == "--inflight" && i + 1 < argc) inflight = (uint32_t) std::strtoul(argv[++i], nullptr, 10);
         else if (a == "--direct-first") direct_first = true;
         else if (a == "--direct-only") direct_only = true;
         else if (a == "--sync") sync_submit = true;

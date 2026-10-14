@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // src/kernels/cpu/pool_test.cpp - P2.S3's test for the expert pool.
 //
 // The pool's correctness claims are small and specific, so they are checked directly rather than through a
@@ -37,8 +36,8 @@ bool read_blob(const char* path, long long index, std::vector<uint8_t>& out) {
     out.assign(cpu::BLOB, 0);
     std::FILE* f = std::fopen(path, "rb");
     if (!f) return false;
-#if defined(_WIN32)
-    if (_fseeki64(f, (__int64) index * (__int64) cpu::BLOB, SEEK_SET) != 0) { std::fclose(f); return false; }
+#if defined(_MSC_VER)
+    if (_fseeki64(f, index * (long long) cpu::BLOB, SEEK_SET) != 0) { std::fclose(f); return false; }
 #else
     if (fseeko(f, (off_t) index * (off_t) cpu::BLOB, SEEK_SET) != 0) { std::fclose(f); return false; }
 #endif

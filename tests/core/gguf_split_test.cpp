@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // tests/core/gguf_split_test.cpp - a split model's shards (strata::gguf_split_paths) and their joint view
 // (strata::GgufModel), on synthetic GGUFs: no model, no GPU.
 //

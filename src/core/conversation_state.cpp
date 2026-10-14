@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/conversation_snapshot.hpp"
 #include "conversation_checked.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/progress.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/qsa.hpp"
 
@@ -19,6 +20,46 @@ namespace strata::core {
 namespace {
 using conversation_detail::add;
 using conversation_detail::product;
+
+// Upstream #2049 #2065: a host-to-host copy that tells the watchdog it is moving.  Parked state (the running
+// checkpoints) sits in ordinary pageable memory for the whole session; when the OS has written it out, copying it back
+// runs at the drive's page-in speed and one copy of it stayed silent past the watchdog's limit, which ended an engine
+// that was only slow.  One beat per 1 MiB slice keeps a copy that moves alive and still lets a real stall show.
+template <class T>
+std::vector<T> copy_beating(const std::vector<T>& src) {
+    std::vector<T> out;
+    out.reserve(src.size());
+    const size_t step = std::max<size_t>(1, ((size_t) 1 << 20) / sizeof(T));
+    for (size_t at = 0; at < src.size(); at += step) {
+        out.insert(out.end(), src.begin() + (std::ptrdiff_t) at,
+                   src.begin() + (std::ptrdiff_t) std::min(src.size(), at + step));
+        progress_beat();
+    }
+    return out;
+}
+
+ConversationCheckpoint copy_checkpoint_beating(const ConversationCheckpoint& c) {
+    ConversationCheckpoint o;
+    o.ids = copy_beating(c.ids);
+    o.imgs = c.imgs;
+    o.used = c.used;
+    o.pinned = c.pinned;
+    o.gdn = copy_beating(c.gdn);
+    o.ple = copy_beating(c.ple);
+    o.tails = copy_beating(c.tails);
+    o.dead = copy_beating(c.dead);
+    o.block_pos = copy_beating(c.block_pos);
+    o.stage_parts.reserve(c.stage_parts.size());
+    for (const auto& part : c.stage_parts) o.stage_parts.push_back(copy_checkpoint_beating(part));
+    return o;
+}
+
+std::vector<ConversationCheckpoint> copy_checkpoints_beating(const std::vector<ConversationCheckpoint>& cs) {
+    std::vector<ConversationCheckpoint> out;
+    out.reserve(cs.size());
+    for (const auto& c : cs) out.push_back(copy_checkpoint_beating(c));
+    return out;
+}
 
 std::array<int64_t, 18> geometry_key(const ModelGeometry& g) {
     return {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_k_heads,
@@ -338,7 +379,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     SavedConversation captured;
     captured.geometry = geometry_key(g);
     captured.live.ids = view.ids; captured.live.imgs = view.images;
-    captured.cvec = view.cvec; captured.checkpoints = view.checkpoints;
+    captured.cvec = view.cvec; captured.checkpoints = copy_checkpoints_beating(view.checkpoints);
     const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
     captured.kv = std::move(reuse.kv);
     const size_t layers = owned_qsa(ss, g);
@@ -364,7 +405,7 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     captured.geometry = geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     captured.live.ids = view.ids; captured.live.imgs = view.images;
-    captured.cvec = view.cvec; captured.checkpoints = view.checkpoints;
+    captured.cvec = view.cvec; captured.checkpoints = copy_checkpoints_beating(view.checkpoints);
     if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
     const int64_t upto = (int64_t) view.ids.size();
     const size_t layers = owned_qsa(ss, g);
@@ -530,7 +571,7 @@ bool conversation_split_save(SavedConversation& image, const ConversationView& v
     captured.live.ids = view.ids;
     captured.live.imgs = view.images;
     captured.cvec = view.cvec;
-    captured.checkpoints = view.checkpoints;
+    captured.checkpoints = copy_checkpoints_beating(view.checkpoints);
     for (size_t i = 0; i < stages.size(); ++i) {
         const OnDevice on(stages[i].device);
         ConversationCheckpoint part;

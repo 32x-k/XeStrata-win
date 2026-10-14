@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // read_expert_profile refuses a profile whose header version is not 1, naming the version it found, the one it
 // reads, and the file - before the geometry check, since the fields after the version are only known to be a
 // version 1 layout.  A version 1 file still loads.  CPU only: no device is touched.

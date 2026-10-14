@@ -5,6 +5,7 @@
 #
 #   tools/package/build.sh ubuntu26.04 free|cuda13.1|cuda12.4 [COMMIT]
 #   tools/package/build.sh fedora44    free|cuda13.4          [COMMIT]
+#   tools/package/build.sh windows     cuda12.4               [COMMIT]
 #
 # XESTRATA_JOBS=N compiles N files at once in every build in the container (default: as many as the threads;
 # intel/llvm's links as many as the free RAM allows).
@@ -15,6 +16,11 @@
 # it gets no GPU and nothing of this PC's, and is removed afterwards.  Only build/pkg/<distro>-<variant>/ comes out:
 # the packages and BUILDINFO (the commit, the image, the packages the build had).
 #
+# windows builds the Windows 7z in the same way, in Ubuntu 26.04's image (tools/package/windows.sh): all of it
+# cross-built on Linux, intel/llvm's SYCL runtime for Windows included.  Its downloads that do not change between builds
+# (the MSVC CRT and Windows SDK xwin fetches, NuGet's packages) are kept in build/pkg-cache/windows/; it shares the
+# Ubuntu packages' compiler cache.
+#
 # The one thing kept between builds is the compiler cache, build/pkg-ccache/<distro>/ (ccache, one per distribution
 # as their compilers differ; at most XESTRATA_CCACHE_MAX, default 30G): a package built after another of the same
 # distribution takes most of intel/llvm's and the engine's objects from it.  Deleting the folder makes the next
@@ -24,6 +30,7 @@ set -eu
 usage() {
   echo "usage: $0 ubuntu26.04 free|cuda13.1|cuda12.4 [COMMIT]" >&2
   echo "       $0 fedora44 free|cuda13.4 [COMMIT]" >&2
+  echo "       $0 windows cuda12.4 [COMMIT]" >&2
   exit 2
 }
 
@@ -34,11 +41,12 @@ commit=${3:-HEAD}
 case "$distro/$variant" in
   ubuntu26.04/free | ubuntu26.04/cuda13.1 | ubuntu26.04/cuda12.4) ;;
   fedora44/free | fedora44/cuda13.4) ;;
+  windows/cuda12.4) ;;
   *) usage ;;
 esac
 # the images as pulled on 2026-10-06: a newer one is taken by changing these lines
 case "$distro" in
-  ubuntu26.04) image=ubuntu@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7 ;;
+  ubuntu26.04 | windows) image=ubuntu@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7 ;;
   fedora44) image=fedora@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80 ;;
 esac
 
@@ -54,15 +62,22 @@ rm -rf "$out"
 mkdir -p "$out"
 
 cache=build/pkg-ccache/$distro
-mkdir -p "$cache"
+script=container.sh
+downloads=build/pkg-cache/$distro
+if [ "$distro" = windows ]; then
+  # built in Ubuntu 26.04 with the same compilers as its packages: their cache
+  cache=build/pkg-ccache/ubuntu26.04
+  script=windows.sh
+fi
+mkdir -p "$cache" "$downloads"
 
 echo "building $distro $variant from $rev in $image ..."
 git archive --format=tar "$rev" | docker run --rm -i --pull missing \
-  -v "$PWD/$out:/out" -v "$PWD/$cache:/ccache" -e CCACHE_DIR=/ccache \
+  -v "$PWD/$out:/out" -v "$PWD/$cache:/ccache" -v "$PWD/$downloads:/cache" -e CCACHE_DIR=/ccache \
   -e CCACHE_MAXSIZE="${XESTRATA_CCACHE_MAX:-30G}" \
   -e XESTRATA_DISTRO="$distro" -e XESTRATA_VARIANT="$variant" -e XESTRATA_COMMIT="$rev" \
   -e XESTRATA_IMAGE="$image" -e XESTRATA_UID="$(id -u)" -e XESTRATA_GID="$(id -g)" \
   -e XESTRATA_JOBS="${XESTRATA_JOBS:-}" \
-  "$image" sh -c 'mkdir -p /src && tar -x -C /src && exec sh /src/tools/package/container.sh'
-echo "packages in $out:"
+  "$image" sh -c "mkdir -p /src && tar -x -C /src && exec sh /src/tools/package/$script"
+echo "built in $out:"
 ls -l "$out"

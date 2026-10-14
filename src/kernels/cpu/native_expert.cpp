@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/cpu/native_expert.cpp - plan v0.3 P6: native (GGUF-form) experts on the CPU through ggml-cpu.
 // See the header.  Nothing here is Strata arithmetic: the activation quantizers and the row dot products are
 // ggml-cpu's, so an IQ expert computes what llama.cpp's CPU backend computes for it.
@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <mutex>
+#include <new>
 
 namespace strata::kernels::cpu {
 namespace {
@@ -97,7 +98,11 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.up_off = f.gu_row * (size_t) n_ff;
     f.down_off = f.up_off + f.up_row * (size_t) n_ff;
     f.bytes = f.down_off + f.d_row * (size_t) n_embd;
-    f.act_bytes = ggml_row_size(tg->vec_dot_type, n_embd);
+    f.act_bytes = gu_type == 42 ? sizeof(ActQ) : ggml_row_size(tg->vec_dot_type, n_embd);
+    if (gu_type == 42 && n_embd > H) {
+        err = "native experts: a Q2_0 layer wider than the ActQ";
+        return false;
+    }
     f.h_bytes = ggml_row_size(td->vec_dot_type, n_ff);
     if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes || n_ff > kNativeMaxFF) {
         err = "native experts: activation larger than the pool's buffers";
@@ -117,7 +122,12 @@ bool q8k_avx2(int type) {
 }
 }  // namespace
 
+static_assert(sizeof(ActQ) <= sizeof(NativeAct) && alignof(ActQ) <= alignof(NativeAct),
+              "a Q2_0 layer's ActQ is kept in a NativeAct");
+
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    // native_gu_rows reads a Q2_0 layer's ActQ, not ggml's vec_dot_type
+    if (f.gu_type == 42) { act_quant_any(x, (int) f.n_embd, *new (dst) ActQ); return; }
     if (q8k_avx2(f.gu_act)) { q8k_quant_avx2(x, dst, f.n_embd); return; }
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
 }
@@ -189,6 +199,21 @@ void part_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* 
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (f.gu_type == 42) {   // Q2_0: Strata's GGUF-layout kernels on the ActQ native_quant_act wrote
+        thread_local float ub[MAXT][kNativeMaxFF];
+        float* up[MAXT] = {};
+        const ActQ* qa[MAXT] = {};
+        for (int t = 0; t < nt; ++t) {
+            up[t] = ub[t];
+            qa[t] = std::launder(static_cast<const ActQ*>(act[t]));
+        }
+        const int nbk = (int) (f.n_embd / 64);
+        q2_rows_any(blob, f.gu_row, nbk, qa, nt, ff, r0, r1);
+        q2_rows_any(blob + f.up_off, f.gu_row, nbk, qa, nt, up, r0, r1);
+        for (int t = 0; t < nt; ++t)
+            for (int r = r0; r < r1; ++r) ff[t][r] = (ff[t][r] / (1.f + std::exp(-ff[t][r]))) * up[t][r];
+        return;
+    }
     if (native_mixed_gu(f)) {   // gate and up of different types: each part on its own, then the SwiGLU
         thread_local float ub[MAXT][kNativeMaxFF];
         float* up[MAXT] = {};

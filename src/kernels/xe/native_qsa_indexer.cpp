@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-FileCopyrightText: 2023-2026 The ggml authors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/native_qsa_indexer.cpp - the Xe port of Strata's src/kernels/cuda/native_qsa_indexer.cu: the QSA indexer's
 // pooled-key append (keys rounded through F16, the block mean, RMS norm, gamma and the rotation), for one cell and
 // for a batch, with the arithmetic of the pinned ggml-cuda operators it replaces (llama.cpp 3cf03257, MIT License,
@@ -81,6 +81,49 @@ sycl::queue& queue_for(void* stream) {
     return queue;
 }
 
+// One work-group's appends of n_steps cells into one layer's buffers (native_qsa_indexer_append_steps and the commit's
+// layers launch).  `values` (D) and `partials` (32) are the work-group's local memory.
+inline void append_cells(const sycl::nd_item<1>& it, float* values, float* partials, const float* raw,
+                         const int32_t* relative_pos_device, int pos_stride, int n_steps, int32_t pos_base,
+                         const float* gamma, float epsilon, float* tail, float* dead, float* pooled, int32_t* block_pos,
+                         int mc, float theta_scale, const int32_t* mtab, bool scaled, const RopeKernelArgs& ka,
+                         const RopeTab& tab) {
+    const int d = int(it.get_local_id(0));
+    // the cells in order; a work-item reads back only the tail and dead lanes it wrote itself, so the barrier
+    // between cells guards the work-group's local values and partials only
+    for (int step = 0; step < n_steps; ++step) {
+        if (step > 0) sycl::group_barrier(it.get_group());
+        const int pos = relative_pos_device[std::size_t(step) * pos_stride];
+        if (pos < 0 || pos >= mc) continue;   // uniform
+        const int slot = pos % R;
+        float incoming = 0.0f;
+        if (d < D) {
+            incoming = through_f16(raw[std::size_t(step) * D + d]);
+            if (slot < R - 1) tail[slot * D + d] = incoming;
+        }
+        if (pos != 0 && slot != R - 1) continue;   // uniform
+        float mean = 0.0f;
+        if (d < D) {
+            // the spare's four gather indices all name cell zero; completed blocks use chronological slices
+            float sum = pos == 0 ? incoming : tail[d];
+            for (int j = 1; j < R; ++j) sum = sum + (pos == 0 || j == R - 1 ? incoming : tail[j * D + d]);
+            mean = sycl::fma(0.25f, sum, 0.0f);   // SCALE includes a zero bias
+        }
+        const float square_sum = norm_square_sum(it, mean, partials);
+        const float scale = sycl::rsqrt(square_sum / D + epsilon);
+        if (d < D) values[d] = scale * mean * gamma[d];
+        sycl::group_barrier(it.get_group());
+        if (d >= D) continue;
+        const int bl = pos / R;
+        const int rope_pos = pos == 0 ? 0 : pos_base + R * bl;
+        const float y = pooled_value(values, d, rope_pos, theta_scale, mtab, pos == 0, scaled, ka, tab);
+        pooled[std::size_t(bl) * D + d] = y;
+        if (pos == 0) dead[d] = y;
+        else pooled[std::size_t(bl + 1) * D + d] = dead[d];
+        if (d == 0 && pos != 0) *block_pos = rope_pos;
+    }
+}
+
 }  // namespace
 
 void native_qsa_indexer_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
@@ -115,40 +158,53 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
         sycl::local_accessor<float, 1> values(sycl::range<1>(D), h);
         sycl::local_accessor<float, 1> partials(sycl::range<1>(32), h);
         h.parallel_for(sycl::nd_range<1>(THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const int d = int(it.get_local_id(0));
-            // the cells in order; a work-item reads back only the tail and dead lanes it wrote itself, so the barrier
-            // between cells guards the work-group's local values and partials only
-            for (int step = 0; step < n_steps; ++step) {
-                if (step > 0) sycl::group_barrier(it.get_group());
-                const int pos = relative_pos_device[std::size_t(step) * pos_stride];
-                if (pos < 0 || pos >= mc) continue;   // uniform
-                const int slot = pos % R;
-                float incoming = 0.0f;
-                if (d < D) {
-                    incoming = through_f16(raw[std::size_t(step) * D + d]);
-                    if (slot < R - 1) tail[slot * D + d] = incoming;
-                }
-                if (pos != 0 && slot != R - 1) continue;   // uniform
-                float mean = 0.0f;
-                if (d < D) {
-                    // the spare's four gather indices all name cell zero; completed blocks use chronological slices
-                    float sum = pos == 0 ? incoming : tail[d];
-                    for (int j = 1; j < R; ++j) sum = sum + (pos == 0 || j == R - 1 ? incoming : tail[j * D + d]);
-                    mean = sycl::fma(0.25f, sum, 0.0f);   // SCALE includes a zero bias
-                }
-                const float square_sum = norm_square_sum(it, mean, &partials[0]);
-                const float scale = sycl::rsqrt(square_sum / D + epsilon);
-                if (d < D) values[d] = scale * mean * gamma[d];
+            append_cells(it, &values[0], &partials[0], raw, relative_pos_device, pos_stride, n_steps, pos_base, gamma,
+                         epsilon, tail, dead, pooled, block_pos, mc, theta_scale, mtab, scaled, ka, tab);
+        });
+    });
+}
+
+void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_stride, const int32_t* relative_pos_device,
+                                            int pos_stride, int n_steps, int32_t pos_base, float epsilon,
+                                            const QsaIndexerLayers& L, int n_layers, const QsaShapes& s,
+                                            int64_t max_cells, const RopeScaling& scaling, void* stream) {
+    if (n_steps <= 0 || n_layers <= 0) return;
+    if (!stream || n_layers > QsaIndexerLayers::kMax || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
+        max_cells < 1 || max_cells > INT32_MAX || pos_base < 0 || pos_base % R ||
+        int64_t(pos_base) + max_cells > INT32_MAX || !std::isfinite(epsilon) || epsilon <= 0.0f ||
+        rope_scaling_invalid(scaling) != nullptr)
+        throw std::invalid_argument("native QSA indexer (layers): bad geometry, layer count or parameters");
+    for (int i = 0; i < n_layers; ++i) {   // the per-layer append's span checks, layer by layer
+        const std::size_t pos_span = n_steps == 1 || pos_stride <= 0 ? 4 : (std::size_t(n_steps - 1) * pos_stride + 1) * 4;
+        const Span spans[] = {{raw0 + (std::size_t) i * (std::size_t) raw_stride, std::size_t(n_steps)*D*4},
+            {relative_pos_device,pos_span},{L.gamma[i],std::size_t(D)*4},{L.tail[i],std::size_t(R-1)*D*4},{L.dead[i],std::size_t(D)*4},
+            {L.pooled[i],std::size_t(max_cells/R+1)*D*4},{L.block_pos[i],4}};
+        for (const auto& span : spans) validate(span);
+        for (int a = 0; a < 7; ++a) for (int b = a + 1; b < 7; ++b)
+            if (overlaps(spans[a], spans[b])) throw std::invalid_argument("native QSA indexer buffers overlap");
+    }
+    const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / ROT);
+    const bool scaled = scaling.type != RopeScalingType::None;
+    const RopeKernelArgs ka = scaling.kernel_args(ROT);
+    const RopeTab tab = rope_table_for(scaling);
+    const int32_t* mtab = mrope_table();
+    const int mc = int(max_cells);
+    queue_for(stream).submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> values(sycl::range<1>(D), h);
+        sycl::local_accessor<float, 1> partials(sycl::range<1>(32), h);
+        // one work-group a layer; each first restores its tail from the window's snapshot (the per-layer commit's
+        // copy_from_mapped), then makes that layer's appends
+        h.parallel_for(sycl::nd_range<1>((size_t) n_layers * THREADS, THREADS),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const int i = (int) it.get_group(0);
+            float* tail = L.tail[i];
+            if (L.tail_src[i] != nullptr) {
+                for (int j = (int) it.get_local_id(0); j < (R - 1) * D; j += THREADS) tail[j] = reinterpret_cast<const volatile float*>(L.tail_src[i])[j];   // as copy_from_mapped reads it
                 sycl::group_barrier(it.get_group());
-                if (d >= D) continue;
-                const int bl = pos / R;
-                const int rope_pos = pos == 0 ? 0 : pos_base + R * bl;
-                const float y = pooled_value(&values[0], d, rope_pos, theta_scale, mtab, pos == 0, scaled, ka, tab);
-                pooled[std::size_t(bl) * D + d] = y;
-                if (pos == 0) dead[d] = y;
-                else pooled[std::size_t(bl + 1) * D + d] = dead[d];
-                if (d == 0 && pos != 0) *block_pos = rope_pos;
             }
+            append_cells(it, &values[0], &partials[0], raw0 + (std::size_t) i * (std::size_t) raw_stride,
+                         relative_pos_device, pos_stride, n_steps, pos_base, L.gamma[i], epsilon, tail, L.dead[i],
+                         L.pooled[i], L.block_pos[i], mc, theta_scale, mtab, scaled, ka, tab);
         });
     });
 }

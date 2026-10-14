@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/sampler.cpp - the Xe port of Strata's src/kernels/cuda/sampler.cu: the sampler chain in llama.cpp's order
 // (penalties -> top_k -> top_p -> min_p -> temperature -> pick), one work-group of 1024 per token over the
 // vocabulary.  See the CUDA source for the order, the tie rule and the cost notes.

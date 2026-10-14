@@ -16,7 +16,7 @@ XeStrata の開発で、リント、確認、測定のために入れる道具�
 | フォルダー（git が無視する） | 置くもの |
 | --- | --- |
 | `.lint/` | ディストリビューションがパッケージにしていないリントの道具 |
-| `.tools/` | ソースからビルドするそのほかの道具（intel/llvm、Metrics Discovery） |
+| `.tools/` | ソースからビルドするそのほかの道具（intel/llvm、Metrics Discovery）と、Windows 向けのクロスビルドに使うもの |
 
 ## リント
 
@@ -56,12 +56,15 @@ free のビルドは、intel/llvm の DPC++ でエンジンをコンパイルし
 setup は `--intel-llvm-build` でこれを動かします。
 済んだビルドをどう使い回すかは [BUILD.ja.md](BUILD.ja.md#sycl-のコンパイラ) にあります。
 intel/llvm は自由ソフトウェア（Apache-2.0 with LLVM exceptions）で、自由ソフトウェアだけでビルドできます。
-要るパッケージは次のとおりです（Fedora 44 では `git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static python3`）。
+要るパッケージは次のとおりです（Fedora 44 では `git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static python3`、Arch では `git cmake ninja base-devel lld hwloc zstd opencl-headers python`）。
 
 ```sh
 sudo apt install git cmake ninja-build g++ lld python3 libhwloc-dev libzstd-dev
 python3 tools/intel_llvm_build.py            # --keep-build keeps the build tree for a quicker update; --jobs N
 ```
+
+Arch の `zstd` には `libzstd.a` がありません（`zstd-static` は AUR のパッケージです）。
+そのときスクリプトは `-DLLVM_USE_STATIC_ZSTD=OFF` を渡し、共有の zstd をリンクします（intel/llvm は v7.1.1 からそれを扱います。[BUILD.ja.md](BUILD.ja.md#パッケージ)）。
 
 ビルドの構成は、リリースが指定するもの（Level Zero のヘッダーとローダー、emhash。どれも自由ソフトウェア）を取ってくるので、ネットワークが要ります。
 スクリプトは、Level Zero がすでに入っていても取ってこさせます（`SYCL_UR_FORCE_FETCH_LEVEL_ZERO`）。
@@ -83,10 +86,13 @@ sudo apt install hipcc libamdhip64-dev libhsa-runtime-dev rocminfo   # Ubuntu
 sudo dnf install hipcc rocm-hip-devel rocm-runtime-devel rocm-device-libs rocminfo   # Fedora 44
 ```
 
-- ROCm は AMD の `/opt/rocm` か、ディストリビューションのもの（ヘッダーは `/usr/include`、ライブラリは multiarch のフォルダーか `/usr/lib64`）を探します。
+- ROCm は AMD の `/opt/rocm`（ROCm 7.14 の AMD のパッケージでは `/opt/rocm/core-7.14`）か、ディストリビューションのもの（ヘッダーは `/usr/include`、ライブラリは multiarch のフォルダーか `/usr/lib64`）を探します。
+  ROCm 7.14 の AMD のパッケージは ld.so.conf を入れないので、setup はその `lib` をエンジンのライブラリの探索先（設定の `lib_dirs`）に加えます。
   見つからなければ HIP なしでビルドします。
 - AMD の GPU 向けのコードには、libclc の libspirv（AMD 向け）と ROCm のデバイスライブラリが要ります。
-  Fedora のデバイスライブラリは `/usr/lib64/rocm/llvm/lib/clang/20/lib/amdgcn/bitcode` にあり、コンパイラには `--rocm-device-lib-path` で渡します。
+  コンパイラが読めるビットコードは自分の LLVM かそれより古いものだけなので（ROCm 7.14 のデバイスライブラリは LLVM 23 製で、intel/llvm 7.1.1 の LLVM 22 では読めません）、
+  スクリプトはデバイスライブラリを、intel/llvm と同じ LLVM の ROCm のリリース（ROCm の llvm-project の `rocm-7.2.4` の `amd/device-libs`、University of Illinois/NCSA ライセンス）から取ってきて、同じツリーでビルドし、`install/amdgcn/bitcode` に入れます。
+  CMake は、入っている ROCm のデバイスライブラリをコンパイラが読めればそちらを使い、読めないときにこれを使います。これが通らなくても intel/llvm はできます。
 - Fedora 44（ROCm 7.1.1）のコンテナで、RX 9060 XT（gfx1200）に `-fsycl-targets=amd_gpu_gfx1200` でコンパイルした SYCL のカーネルが正しく動きました。
   HIP のアダプタは一度に確保できる大きさを 1 GiB と報告しますが、実際には 12 GiB まで確保できました。
 
@@ -121,7 +127,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   `rocm-dev` に引かれて自動で入ったものは、`rocm-dev` が消えると `apt autoremove` の対象になるので、`sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo` で手動の印を付けます。
 - スクリプトは、リリースにない修正を `third_party/main/intel-llvm/patches/` のパッチ（`NN-<id>.patch`、intel/llvm と同じ Apache-2.0 WITH LLVM-exception）として番号順にソースに当ててからビルドし、当てた修正の id を `install/XESTRATA.json` に残します。
   修正の足りない同じ版のビルドがあれば、作り直すかを尋ねます。
-  今の修正は 17 で、最初の 12 はどれも intel/llvm の `sycl` ブランチでも直っていません（2026-10-08）。
+  今の修正は 19 で、最初の 12 はどれも intel/llvm の `sycl` ブランチでも直っていません（2026-10-08）。15 番目も直っていません（2026-10-14）。
   Windows 移植の修正は、XeStrata の次の修正と番号が重ならないよう、90 から番号を付けています。
   1 つ目: CUDA と HIP のアダプタが、コマンドバッファにノードを足すたびに同期点の表を丸ごとコピーしていて、SYCL のグラフの完成にノード数の 2 乗の時間がかかっていました（2600 カーネルのグラフで、RTX 4070 では 90 ms、修正後は 4 ms。Level Zero は 2 ms）。
   2 つ目: SYCL のランタイムが、どの NVIDIA の GPU にも最初に見つけた NVIDIA の像を、アーキテクチャを見ずに渡していました。
@@ -160,16 +166,24 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   14 番目: HIP のアダプタが GPU の空きメモリ（SYCL の `ext_intel_free_memory`）を、その GPU を current にせずに `hipMemGetInfo` で答えていて、どの AMD の GPU もスレッドの current の GPU の空きを報告していました。
   AMD の GPU 2 枚で層を分割すると、2 段目は 1 段目のエキスパートのキャッシュでほぼ埋まった空きを見て、自分のキャッシュの場所がないと言って止まっていました。
   修正後は、アダプタのほかの呼び出しと同じく、その GPU を current にしてから問い合わせます（`hip-mem-free-device`。CUDA のアダプタは問い合わせのたびにその GPU のコンテキストを current にしています）。
-  15 番目（90）: Windows では、HIP のアダプタの CMake が AMD の comgr を Linux の共有ライブラリ（`libamd_comgr.so`）として読み込もうとして、設定が失敗していました（`IMPORTED_IMPLIB not set for imported target "amd_comgr"`）。
+  15 番目: システムの Level Zero が 1.32 より古いとき（パッケージを作る Ubuntu 26.04 の libze は 1.28）、Level Zero のアダプタはローダーを静的にリンクし、静的なローダーは安定版のグラフ（record and replay）の関数を実行時にシステムのローダーへ回します。
+  1.28 のローダーはその関数を持たず、静的なローダーは 1 回目の呼び出しには UNSUPPORTED を返し、2 回目に NULL のポインターを呼んでいました（静的なローダーの ze_libapi.cpp、1.32 から 1.34）。
+  アダプタは、静的なローダー自身の入り口が NULL でないので関数があると見なし、安定版のグラフの拡張を名乗るドライバー（compute-runtime 26.35.39758.10）では、キューに投入するたびの問い合わせ（`handler::finalize` の `urQueueIsGraphCaptureEnabledExp`）を通していました。
+  oneMKL の GEMM はこの道を通るので、Arc Pro B70 で oneMKL を入れるとエンジンが最初の積で SIGSEGV で止まっていました（XeStrata の issue #12）。
+  修正後は、静的なローダーを使うとき、システムのローダー（`libze_loader.so.1`、`ze_loader.dll`）がグラフの関数を持つ場合にだけ使います（`l0-static-graph`）。
+  16 番目: デバイスライブラリ（libdevice）は、それをコンパイルするツールを `LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR` で渡しても、作っている最中のコンパイラとその道具一式（`sycl-compiler`）に依存していました。
+  Windows 向けのクロスビルド（`--windows`）では、誰も動かさない Windows の `clang.exe` と道具を作っていて、それがビルドの時間の大半でした。
+  修正後は、ツールを渡したときは SYCL のヘッダーにだけ依存します（`build-libdevice-custom-tools`。渡さないビルドは変わりません）。ビルドだけの修正なので、できあがったツールチェーンの作り直しは求めません。
+  17 番目（90）: Windows では、HIP のアダプタの CMake が AMD の comgr を Linux の共有ライブラリ（`libamd_comgr.so`）として読み込もうとして、設定が失敗していました（`IMPORTED_IMPLIB not set for imported target "amd_comgr"`）。
   修正後は、隣の HIP のランタイム（`amdhip64.lib`）と同じく、Windows では `amd_comgr.lib` を読み込みます（`hip-windows-comgr`）。
-  16 番目（91）: ドライバーは、ROCm のデバイスライブラリのフォルダーに `oclc_correctly_rounded_sqrt_on.bc` と `_off.bc` がないと、デバイスライブラリがないと判断していました。
+  18 番目（91）: ドライバーは、ROCm のデバイスライブラリのフォルダーに `oclc_correctly_rounded_sqrt_on.bc` と `_off.bc` がないと、デバイスライブラリがないと判断していました。
   新しい ROCm（Windows の HIP SDK の ROCm 7.12 など）はこの 2 つを含まないので、AMD の GPU 向けのコンパイルがどれも失敗していました。
   修正後は、2 つともあるか、どちらもないかのどちらでも受け付け、あるときだけリンクします（`hip-device-libs-sqrt`）。
-  17 番目（92）: HIP のアダプタは、CUDA と Level Zero のアダプタが Windows で答えるデバイスの LUID（`sycl::ext::intel::info::device::luid`）に答えず、デバイス ID の問い合わせには PCI のデバイス番号（0）を返していたので、プログラムは HIP の GPU の DXGI のアダプタを見つけられませんでした。
+  19 番目（92）: HIP のアダプタは、CUDA と Level Zero のアダプタが Windows で答えるデバイスの LUID（`sycl::ext::intel::info::device::luid`）に答えず、デバイス ID の問い合わせには PCI のデバイス番号（0）を返していたので、プログラムは HIP の GPU の DXGI のアダプタを見つけられませんでした。
   Windows では、アダプタのローカルメモリの予算を超えたデバイスの確保は断られず、システムメモリに置かれて PCIe 越しに読まれます。エンジンはエキスパートキャッシュの大きさをこの予算で決め、予算は LUID で DXGI から読みます。
   修正後は、Windows では `hipDeviceProp_t::luid` を答えます（すべて 0 の LUID と、ほかの OS は引き続き未対応です。`hip-windows-luid`）。
   CUDA の修正は contrib-llvm のツールチェーンにだけ、HIP の修正は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
-  `offload-bundle-arch` はどのツールチェーンにも作り直しを求めます。
+  `offload-bundle-arch` と `l0-static-graph` はどのツールチェーンにも作り直しを求めます。
 - スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。
 - 開発機（Ubuntu 26.04、CUDA 12.4、ROCm 7.1）では、ランタイムのバックエンドが cuda・hip・level_zero・opencl になりました。
 - NVIDIA の GPU の上で動かすには、NVIDIA のドライバー（Ubuntu 26.04 では `nvidia-driver-610-open` など）が要ります。
@@ -209,6 +223,67 @@ sudo usermod -aG docker "$USER"       # ログインし直すと sudo なしで�
 docker グループは root と同じ権限を持ちます。
 コンテナには GPU を渡さないので、GPU のための追加の道具（nvidia-container-toolkit など）は要りません。
 1 回のビルドで intel/llvm も作り、Fedora 44 の free でコンテナは最大 6.8 GB になりました（1 分ごとに測った値。cuda の版は CUDA ツールキットの分だけ増えます）。コンテナは終わると消えます。
+
+## Windows 向けのクロスビルド
+
+Windows 版のエンジンとテストを、Linux の上でリンクまでビルドします（`cmake/toolchain-windows-msvc.cmake`）。
+intel/llvm の SYCL のランタイムは Windows では MSVC の ABI だけに対応するので、ターゲットは `x86_64-pc-windows-msvc` です。
+コンパイルは intel/llvm の clang++、リンクは lld-link が行います。
+できたものはここでは動かせません。動かすには Windows の PC が要ります。
+
+要るものは次の3つです。
+
+- lld-link（LLVM の `lld`）: `sudo apt install lld-21`（21.1）
+- MSVC の CRT と Windows SDK: [xwin](https://github.com/Jake-Shadle/xwin)（0.10.0）で Microsoft から落とします。
+  自由ソフトウェアではなく、Microsoft のライセンスは `--accept-license` で受け入れます。リポジトリには入れません。
+- intel/llvm の Windows 版の SYCL の木（ヘッダ、インポートライブラリ、ランタイムの DLL）: `tools/intel_llvm_build.py --windows` が、XeStrata の使う版（v7.1.1）を XeStrata のパッチを当てて、ここで Windows 向けにクロスビルドします（下の「Windows 版の intel/llvm」）。
+
+```sh
+mkdir -p .tools/xwin
+curl -L https://github.com/Jake-Shadle/xwin/releases/download/0.10.0/xwin-0.10.0-x86_64-unknown-linux-musl.tar.gz |
+    tar -xz -C .tools/xwin
+.tools/xwin/xwin-0.10.0-x86_64-unknown-linux-musl/xwin --accept-license --cache-dir .tools/xwin/cache --arch x86_64 \
+    splat --output .tools/xwin/sdk
+python3 tools/intel_llvm_build.py --contrib && python3 tools/intel_llvm_build.py --windows
+export CCACHE_DIR=$PWD/build/win-ccache CCACHE_COMPILERCHECK=content
+cmake -S . -B build/win -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=ON \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-windows-msvc.cmake \
+    -DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++ -DSTRATA_LICENSE=free \
+    -DSTRATA_XWIN=$PWD/.tools/xwin/sdk -DSTRATA_SYCL_WINDOWS=$PWD/.tools/intel-llvm-win/install \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
+ninja -C build/win
+```
+
+普段の変更では、触ったソースのオブジェクトだけをコンパイルします（[AGENTS.md](../AGENTS.md#operating-systems-linux-main-and-windows)）。
+ninja はソースのパスに `^` を付けると、そのソースのオブジェクトを作ります（パスはフルパスで書きます）。
+
+```sh
+export CCACHE_DIR=$PWD/build/win-ccache CCACHE_COMPILERCHECK=content
+ninja -C build/win $(git diff --name-only HEAD -- '*.cpp' | sed "s|^|$PWD/|; s|$|^|")
+```
+
+- ccache は「ビルドを速くする」の節と同じものです。Windows 向けのオブジェクトは Linux 向けのものと設定が違って当たらないので、`CCACHE_DIR` を分けて Linux 向けのキャッシュを追い出さないようにします。`CCACHE_COMPILERCHECK=content` は、intel/llvm を作り直したときにコンパイラーを中身で見分けるためです。
+- ヘッダーだけを変えたときは、`ninja -C build/win` で全体を作ります（ccache が変わっていないファイルを返します）。
+- xwin の `cache` は展開のあとは要らず、消してかまいません（`sdk` は 0.8 GB）。
+- lld-link は、`sycl9.lib` について `skipping imported DllMain symbol` と警告します。MSVC で作られたインポートライブラリを lld で読むときに出るもので、リンクの結果には関係しません。
+
+### Windows 版の intel/llvm
+
+`tools/intel_llvm_build.py --windows` は、Linux 版と同じクローンから、Windows 版の SYCL のランタイムを `.tools/intel-llvm-win/install` に作ります。
+エンジンが使う部分（`sycl9.dll`、UR のローダーと CUDA・Level Zero のアダプター、`xptifw.dll`、デバイスライブラリ、NVIDIA 向けの libspirv、ヘッダー、インポートライブラリ）だけで、Debug 版の DLL、`clang.exe`、sycl-jit は作りません。
+
+- コンパイルは `--contrib` で作った同じ版のツールチェーンの clang-cl、リンクは lld-link が行います。デバイスライブラリと libspirv を作るツールも、そのツールチェーンのものです（`--contrib` のビルドは、入れ先にない `opt`・`llvm-as`・`libclc-remangler` も入れ先に写します）。Windows 向けにもこの機械向けにも、コンパイラは作りません。先に `--contrib` を作っておきます。
+- MSVC の CRT と Windows SDK は xwin の展開（`--xwin`、既定は `.tools/xwin/sdk`）を使います。`llvm-lib`・`llvm-rc`・`llvm-mt`・`llvm-ml` はディストリビューションの LLVM のものです（`sudo apt install llvm`）。
+- CUDA のアダプターがリンクする CUDA の Windows 版のヘッダーとインポートライブラリは、NVIDIA の再配布用のアーカイブ（CUDA 12.4.1 の `cuda_cudart`・`cuda_nvml_dev`・`cuda_cccl`）から取ります。自由ソフトウェアではなく、7z には入れません。
+- 開発機（28 スレッド）で 3 分ほどです。
+
+NVIDIA の GPU 向けには、クロスビルドを `-DSTRATA_LICENSE=contrib -DSTRATA_CUDA_ARCHS=<GPU の版> -DSTRATA_CUDA_PATH=<CUDA ツールキット>` で構成します。CUDA ツールキットは、動かす PC のドライバの対応する版以下にします。
+Windows 版の 7z は、`tools/package/build.sh windows cuda12.4` が Ubuntu 26.04 の使い捨てのコンテナでここまでをすべて作ります（[BUILD.md](BUILD.ja.md)）。
+
+### Windows の PC で動かす
+
+`build/win` の `strata*.exe` と、`.tools/intel-llvm-win/install/bin` の `sycl9.dll`・`ur_win_proxy_loader.dll`・`ur_loader.dll`・使う GPU のアダプター（NVIDIA は `ur_adapter_cuda.dll`、Intel は `ur_adapter_level_zero.dll`）・`xptifw.dll` を、1 つのフォルダーに置きます。
+`strata-device.exe --list-devices` で GPU が見えれば、エンジンは動きます。
 
 ## AVX-512 の経路を確かめる Intel SDE
 

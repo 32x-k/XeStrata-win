@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/pinned.hpp - P2.S1: the host arena the expert weights live in.
 //
 // The expert weights do not fit in VRAM, so they stay in host memory: the CPU pool computes the missed experts
@@ -67,6 +67,12 @@ struct PinnedArena {
     /// of the rate, blocking the host.  Released by the destructor.  False (and `err`) when the device refuses; the
     /// copies are then correct, only slower.
     bool register_on(int device, std::string& err);
+    /// Whether register_on registered it on engine device `device` (and it is still so).
+    bool registered_on(int device) const {
+        for (const auto& o : other_reg_)
+            if (o.first == device) return true;
+        return false;
+    }
 
     /// The one registered mapping (a private one with layer bounds) moved into host USM blocks, one per layer of its
     /// bytes plus `pad`, as the `host_usm` constructor makes them: GPU kernels can then read it (a registration for
@@ -82,6 +88,7 @@ struct PinnedArena {
     std::vector<uint8_t*> layer_base;   // host USM blocks, one per layer (empty: one mapping)
 
 private:
+    void unmap(bool file_view);   // the mapping, if any; `file_view`: it maps the shared backing file
     int shared_fd_ = -1;
     bool shared_locked_ = false;
     std::vector<uint64_t> bounds_;

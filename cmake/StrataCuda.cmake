@@ -32,11 +32,19 @@ function(strata_sycl_compiles flags name out)
   set(${out} "${${name}}" PARENT_SCOPE)
 endfunction()
 
-# The CUDA version the installed driver supports (12040 for 12.4), or "" without a driver.
+# The CUDA version the installed driver supports (12040 for 12.4), or "" without a driver.  A cross build runs nothing
+# here: the target's driver is not this PC's (STRATA_CUDA_PTX names the PTX version it takes).
 function(strata_cuda_driver_version out)
+  if(CMAKE_CROSSCOMPILING)
+    set(${out} "" PARENT_SCOPE)
+    return()
+  endif()
   file(WRITE "${CMAKE_BINARY_DIR}/strata_cuda_driver.cpp"
-       "#include <dlfcn.h>\n#include <stdio.h>\nint main(void) { void* h = dlopen(\"libcuda.so.1\", RTLD_NOW);\n"
-       "  int (*f)(int*) = h ? (int (*)(int*)) dlsym(h, \"cuDriverGetVersion\") : 0;\n  int v = 0;\n"
+       "#include <stdio.h>\n#ifdef _WIN32\n#include <windows.h>\n#define strata_open() LoadLibraryA(\"nvcuda.dll\")\n"
+       "#define strata_sym GetProcAddress\n#else\n#include <dlfcn.h>\n"
+       "#define strata_open() dlopen(\"libcuda.so.1\", RTLD_NOW)\n#define strata_sym dlsym\n#endif\n"
+       "int main(void) { auto h = strata_open();\n"
+       "  int (*f)(int*) = h ? (int (*)(int*)) strata_sym(h, \"cuDriverGetVersion\") : 0;\n  int v = 0;\n"
        "  if (!f || f(&v)) return 1;\n  printf(\"%d\", v);\n  return 0;\n}\n")
   try_run(rc built "${CMAKE_BINARY_DIR}/strata_cuda_driver" SOURCES "${CMAKE_BINARY_DIR}/strata_cuda_driver.cpp"
           LINK_LIBRARIES ${CMAKE_DL_LIBS} RUN_OUTPUT_VARIABLE version)
@@ -233,12 +241,24 @@ function(strata_cuda_score covered sum cublas version out)
   set(${out} "${f1}${f2}${cublas_bit}${f4}" PARENT_SCOPE)
 endfunction()
 
+# A Windows cross build: the NVIDIA libspirv of the Windows SYCL build (STRATA_SYCL_WINDOWS) appended to `opts_var`, as
+# the compiler's own, built for Linux, has another wchar_t and does not link into Windows code.
+function(strata_cuda_win_spirv opts_var)
+  file(GLOB spirv
+       "${STRATA_SYCL_WINDOWS}/lib/clang/*/lib/libclc/remangled-l32-signed_char.libspirv-nvptx64-nvidia-cuda.bc")
+  if(CMAKE_CROSSCOMPILING AND WIN32 AND spirv)
+    list(GET spirv 0 spirv)
+    set(${opts_var} ${${opts_var}} "-fsycl-libspirv-path=${spirv}" PARENT_SCOPE)
+  endif()
+endfunction()
+
 # Tries toolkit `dir` for `archs` (each GPU's, or with `explicit` the architectures asked for, every one or none).
 # Sets in the caller: _t_opts (the compile options), _t_str (them joined), _t_archs (the code it builds), _t_score (a
 # string that compares greater for a better toolkit), _t_note (a line for the report).
 function(strata_cuda_try dir archs explicit driver)
   set(_t_score "" PARENT_SCOPE)
   set(opts "--cuda-path=${dir}")
+  strata_cuda_win_spirv(opts)
   strata_cuda_ptx("${dir}" "${driver}" ptx toolkit_ptx)
   if(NOT toolkit_ptx)
     set(_t_note "clang does not take it" PARENT_SCOPE)

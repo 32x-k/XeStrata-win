@@ -17,7 +17,7 @@ sys.path.insert(0, "tools")
 import strata_tokenizer as ST  # noqa: E402
 
 COMMIT = "58dbbe5"
-# the token counts of upstream's code-agent prompts (bench/results/2026-09-29-speed-0126/matrix.json; 262K: the
+# the token counts of upstream's code-agent prompts (its bench/results/2026-09-29-speed-0126/matrix.json; 262K: the
 # README's 259,943), so each tier fills the same share of its context
 TIERS = {"1k": 1017, "4k": 3562, "32k": 31566, "64k": 64162, "128k": 128478, "262k": 259943}
 

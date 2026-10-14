@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU core_device
@@ -16,6 +16,10 @@
 #endif
 #endif
 
+#ifndef _WIN32
+#include <link.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -29,6 +33,13 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -122,6 +133,29 @@ std::string pci_of(const sycl::device& d) {
 #endif
 }
 
+// No GPU on Level Zero, CUDA or HIP at all: the GPU's driver is missing, or the SYCL runtime did not load its adapter
+// for the backend.  A user who started the engine without the libraries setup gave it (the config's lib_dirs) read
+// only "no usable GPU" and looked for the fault in the card; say what the runtime lists and which libsycl it is.
+std::string no_gpu_listed() {
+    std::string seen;
+    for (const auto& p : sycl::platform::get_platforms())
+        seen += (seen.empty() ? "" : ", ") + p.get_info<sycl::info::platform::name>();
+    std::string lib = "?";
+#ifndef _WIN32
+    // the loaded object by its name: dladdr on one of its functions names the engine itself, which is not PIE (the
+    // address is the engine's PLT entry)
+    dl_iterate_phdr([](dl_phdr_info* info, size_t, void* out) {
+        if (info->dlpi_name == nullptr || std::strstr(info->dlpi_name, "/libsycl.so") == nullptr) return 0;
+        *static_cast<std::string*>(out) = info->dlpi_name;
+        return 1;
+    }, &lib);
+#endif
+    return "the SYCL runtime lists no GPU on Level Zero, CUDA or HIP (platforms: " + (seen.empty() ? "none" : seen) +
+           "; libsycl: " + lib + "): the GPU driver is missing, or the runtime did not load its adapter for the GPU. "
+           "Started by hand, the engine needs the lib_dirs of its config in LD_LIBRARY_PATH (the server sets it); "
+           "SYCL_UR_TRACE=1 shows which adapters load";
+}
+
 // The GPUs the engine can drive, device 0 first: the GPU chosen below, then the others in the same order of
 // preference.  Read once.
 std::vector<sycl::device> find_devices() {
@@ -135,7 +169,7 @@ std::vector<sycl::device> find_devices() {
         }
         candidates.push_back(d);
     }
-    if (candidates.empty()) throw DeviceError("no usable GPU" + refused);
+    if (candidates.empty()) throw DeviceError(refused.empty() ? no_gpu_listed() : "no usable GPU" + refused);
     // setup names the card by PCI address: Level Zero's own numbering can include GPUs that setup does not list
     if (const char* want = std::getenv("STRATA_GPU_PCI"); want != nullptr && *want != '\0') {
         std::string w = want;
@@ -305,8 +339,16 @@ bool Runtime::measure_marks() {
 #endif
 }
 
-sycl::queue* Runtime::create_stream() {
+sycl::queue* Runtime::create_stream(bool high_priority) {
     std::lock_guard<std::mutex> lock(streams_mutex_);
+#if defined(SYCL_EXT_ONEAPI_QUEUE_PRIORITY) && !defined(STRATA_ADAPTIVECPP)
+    if (high_priority)
+        return &streams_.emplace_back(context_, device_, handler(),
+                                      sycl::property_list{sycl::property::queue::in_order{},
+                                                          sycl::ext::oneapi::property::queue::priority_high{}});
+#else
+    (void) high_priority;
+#endif
     return &streams_.emplace_back(context_, device_, handler(), ordered_properties());
 }
 
@@ -613,13 +655,21 @@ bool integrated_gpu(const sycl::device& d) {
 
 // upstream 004b15cd (#409): an integrated GPU's memory is the system RAM, and what its runtime reports free need not
 // subtract the CPU's allocations (an AMD APU's figure counts its whole shared pool).  The engine takes the smaller of
-// that figure and what Linux can give back, less STRATA_UMA_HEADROOM_GIB (default 6) for the system.
+// that figure and what the OS can give back, less STRATA_UMA_HEADROOM_GIB (default 6) for the system.
 void apply_uma_limit(uint64_t& free) {
     static const uint64_t headroom = [] {
         const char* v = std::getenv("STRATA_UMA_HEADROOM_GIB");
         const long long g = v != nullptr ? std::strtoll(v, nullptr, 10) : 6;
         return (uint64_t) std::max(0LL, g) << 30;
     }();
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) {
+        const uint64_t avail = (uint64_t) ms.ullAvailPhys;
+        free = std::min(free, avail > headroom ? avail - headroom : 0);
+    }
+#else
     std::ifstream meminfo("/proc/meminfo");
     std::string key;
     uint64_t kb = 0;
@@ -631,6 +681,7 @@ void apply_uma_limit(uint64_t& free) {
         }
         meminfo.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
     }
+#endif
 }
 
 void apply_vram_limit(uint64_t& free, uint64_t& total) {

@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """GET /metrics in the Prometheus text format, with vLLM's metric names, so the dashboards and alerts written for a
 vLLM server read a Strata server unchanged.  Everything comes from the server's own record (Service.metrics(), the
 same dict the JSON /metrics returns) plus three latency histograms observed when a request finishes.

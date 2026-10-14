@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """#1620: a request cancelled right after it restored a parked conversation must not lose that conversation.
 
   A (long answer) -> B (an unrelated chat parks A) -> A2 = A + a short next turn, STOPped as soon as the engine

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-FileCopyrightText: 2023-2026 The ggml authors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/native_gdn.cpp - the Xe port of Strata's src/kernels/cuda/native_gdn.cu: one gated delta-net step with the
 // arithmetic of ggml-cuda's gated_delta_net.cu at pinned llama.cpp 3cf03257 (MIT License, Copyright (c) 2023-2026
 // The ggml authors, see third_party/main/ggml/LICENSE).  Each sub-group of 32 owns one (head, column) and keeps its four

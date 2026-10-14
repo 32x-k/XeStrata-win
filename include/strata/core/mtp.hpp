@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/mtp.hpp - plan v0.3 P6: the MTP draft layer on the GPU.
 //
 // The model ships one multi-token-prediction layer (vLLM 0.30.0 `qwen4_exp` MTP; transcribed and validated in
@@ -193,11 +193,11 @@ private:
     float chain_prob_[8] = {};
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
-    /// E-4: the records' host copies, used in turn: a prefill that returns without a sync (sync = false) leaves its
-    /// upload running, so its copy stays alive until that upload, recorded in pf_rec_up_, has read it
-    std::vector<int32_t> pf_rec_[2];
-    strata::gpu::Event* pf_rec_up_[2] = {};
-    int pf_rec_turn_ = 0;
+    /// upstream #1996: those records' pinned host side and the event of the copy that last read it (a pageable source
+    /// went out of scope before an asynchronous copy read it)
+    int32_t* pf_host_ = nullptr;
+    int64_t pf_host_cap_ = 0;
+    strata::gpu::Event* pf_ev_ = nullptr;
     strata::gpu::Graph* round_exec_[9] = {};
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };

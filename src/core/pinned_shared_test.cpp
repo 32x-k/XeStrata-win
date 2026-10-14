@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
-// Linux selftest for the optional MAP_SHARED backing of PinnedArena.
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+// Selftest for the optional shared file backing of PinnedArena (MAP_SHARED; a file view on Windows).
 #include "strata/core/pinned.hpp"
 
 #include <cstdio>
@@ -9,9 +9,21 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 int main() {
+#if defined(_WIN32)
+    char dir[MAX_PATH], path[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, dir) == 0 || GetTempFileNameA(dir, "sa", 0, path) == 0) {
+        std::fprintf(stderr, "GetTempFileName failed: %lu\n", (unsigned long) GetLastError());
+        return 2;
+    }
+#else
     char path[] = "/tmp/strata-shared-arena-XXXXXX";
     const int fd = mkstemp(path);
     if (fd < 0) {
@@ -19,6 +31,7 @@ int main() {
         return 2;
     }
     close(fd);
+#endif
 
     int fail = 0;
     const uint64_t bytes = 64u << 10;
@@ -55,8 +68,8 @@ int main() {
         }
     }
 
-    if (unlink(path) != 0) {
-        std::perror("unlink");
+    if (std::remove(path) != 0) {
+        std::perror("remove");
         fail = 1;
     }
     std::printf("pinned_shared_test: %s\n", fail ? "FAILED" : "OK");

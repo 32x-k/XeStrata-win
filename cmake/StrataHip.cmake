@@ -7,6 +7,14 @@
 
 include(${CMAKE_CURRENT_LIST_DIR}/StrataCuda.cmake)   # strata_sycl_compiles
 
+# ROCm's CMake packages (hip's, rocBLAS's and hipBLASLt's, which oneMath's rocBLAS backend asks for) are in the
+# distribution's prefix where it packages them (/usr/lib64/cmake, /usr/lib/<triplet>/cmake), and under AMD's own tree,
+# /opt/rocm/lib/cmake, where ROCm itself was installed (Arch's packages too) - a prefix CMake does not search by
+# itself.  This file is included before oneMath is added (CMakeLists.txt), so the backends see it.
+if(EXISTS /opt/rocm/lib/cmake)
+  list(APPEND CMAKE_PREFIX_PATH /opt/rocm)
+endif()
+
 # This PC's AMD GPUs, as the ISA names the compiler takes (gfx1200), from the kernel's KFD topology:
 # gfx_target_version is major * 10000 + minor * 100 + stepping, the last two in hex in the name.
 function(strata_hip_detect out)
@@ -82,6 +90,116 @@ function(strata_hip_compiler_knows arch out)
   endif()
 endfunction()
 
+# Whether the SYCL compiler builds a kernel for `arch` with the device libraries in `dir` (a kernel with ocml's math,
+# which links them), and if not, why: bitcode of a newer LLVM than the compiler's (it reads its own and older), files
+# the compiler asks for that are missing (ROCm 7.14 dropped the oclc_correctly_rounded_sqrt and oclc_daz_opt ones,
+# which LLVM 22 still links), or the compiler's own first error.  Cached per folder and architecture.
+function(strata_hip_device_libs_check dir arch ok_out why_out)
+  string(MD5 key "${dir} ${arch} ${CMAKE_CXX_COMPILER}")
+  set(var STRATA_HIP_DEVICE_LIBS_${key})
+  if(NOT DEFINED ${var})
+    set(src "${CMAKE_BINARY_DIR}/strata_hip_device_libs_probe.cpp")
+    file(WRITE "${src}" "#include <sycl/sycl.hpp>\nint main() {\n  sycl::queue q;\n"
+                        "  float* p = sycl::malloc_shared<float>(1, q);\n"
+                        "  q.single_task([=] { p[0] = sycl::sqrt(p[0]) * sycl::exp(p[0]); }).wait();\n"
+                        "  sycl::free(p, q);\n}\n")
+    set(flags -fsycl -fsycl-targets=amd_gpu_${arch} --rocm-device-lib-path=${dir})
+    message(CHECK_START "Building an AMD kernel (${arch}) with the device libraries in ${dir}")
+    try_compile(result "${CMAKE_BINARY_DIR}/strata_hip_device_libs_probe" SOURCES "${src}"
+                COMPILE_DEFINITIONS ${flags} LINK_OPTIONS ${flags} OUTPUT_VARIABLE out)
+    set(why "")
+    if(result)
+      message(CHECK_PASS "yes")
+    else()
+      string(REGEX MATCH "Producer: '[^']*' *Reader: '[^']*'" versions "${out}")
+      string(REGEX REPLACE "^gfx" "oclc_isa_version_" isa "${arch}")
+      set(missing "")
+      foreach(name ocml ockl oclc_correctly_rounded_sqrt_on oclc_daz_opt_on oclc_finite_only_off
+                   oclc_unsafe_math_off oclc_wavefrontsize64_off ${isa})
+        if(NOT EXISTS "${dir}/${name}.bc")
+          list(APPEND missing ${name}.bc)
+        endif()
+      endforeach()
+      if(versions OR out MATCHES "Unknown attribute kind")
+        set(why "its bitcode is of a newer LLVM than the SYCL compiler's, which cannot read it (${versions})")
+      elseif(missing)
+        list(JOIN missing ", " missing)
+        set(why "the SYCL compiler needs files it lacks: ${missing}")
+      else()
+        string(REGEX MATCH "[^\n]*error:[^\n]*" first "${out}")
+        set(why "the SYCL compiler did not build with it: ${first}")
+      endif()
+      message(CHECK_FAIL "no: ${why}")              # said also when a later folder is taken
+    endif()
+    set(${var} "${result}" CACHE INTERNAL "")
+    set(${var}_WHY "${why}" CACHE INTERNAL "")
+  endif()
+  set(${ok_out} "${${var}}" PARENT_SCOPE)
+  set(${why_out} "${${var}_WHY}" PARENT_SCOPE)
+endfunction()
+
+# ROCm's device libraries for `arch`'s kernels, given (STRATA_ROCM_DEVICE_LIBS) or the first folder found that a test
+# kernel builds with (strata_hip_device_libs_check).  The search before this one kept the folder it found in the cache
+# under the same name, which then read as given: such an entry (its help text) is searched for again.
+function(strata_hip_device_libs arch out)
+  get_property(help CACHE STRATA_ROCM_DEVICE_LIBS PROPERTY HELPSTRING)
+  if(help STREQUAL "ROCm's device libraries (ockl.bc), for the AMD code")
+    unset(STRATA_ROCM_DEVICE_LIBS CACHE)
+  endif()
+  if(STRATA_ROCM_DEVICE_LIBS)                         # given: used as it is, or the reason it cannot be
+    strata_hip_device_libs_check("${STRATA_ROCM_DEVICE_LIBS}" ${arch} ok why)
+    if(NOT ok)
+      message(FATAL_ERROR "STRATA_ROCM_DEVICE_LIBS=${STRATA_ROCM_DEVICE_LIBS}: ${why}")
+    endif()
+    set(libs "${STRATA_ROCM_DEVICE_LIBS}")
+  else()
+    # ROCm's device libraries (ockl.bc and the others): AMD's trees and the distribution's, which keeps them with
+    # its ROCm clang (Fedora: /usr/lib64/rocm/llvm/lib/clang/<N>/lib/amdgcn/bitcode; Ubuntu:
+    # /usr/lib/llvm-<N>/lib/clang/<N>/amdgcn/bitcode), and last the SYCL compiler's own (tools/intel_llvm_build.py
+    # builds them with it).  The first one the compiler builds a kernel with: a clang reads bitcode of its own LLVM
+    # or older, and ROCm 7.14's (LLVM 23, without files LLVM 22 asks for) stopped intel/llvm 7.1.1's build on an
+    # RX 7900 XTX (a field report).  The ROCm's own first, so that a ROCm whose libraries the compiler reads (Fedora
+    # 44's and Ubuntu 26.04's 7.1.1) gets the code it was linked with before, matched with its runtime; the
+    # compiler's own only where none of them builds
+    get_filename_component(own "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(own "${own}/../amdgcn/bitcode" ABSOLUTE)
+    file(GLOB dirs /opt/rocm/amdgcn/bitcode /opt/rocm*/amdgcn/bitcode /opt/rocm*/core-*/amdgcn/bitcode
+                   /opt/rocm*/lib/llvm/amdgcn/bitcode /opt/rocm*/core-*/lib/llvm/amdgcn/bitcode
+                   /opt/rocm*/lib/llvm/lib/clang/*/lib/amdgcn/bitcode
+                   /usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode
+                   /usr/lib/llvm-*/lib/clang/*/amdgcn/bitcode /usr/lib/llvm-*/lib/clang/*/lib/amdgcn/bitcode)
+    list(SORT dirs COMPARE NATURAL ORDER DESCENDING)
+    set(libs "")
+    set(tried "")
+    foreach(dir IN ITEMS ${dirs} "${own}")
+      get_filename_component(real "${dir}" REALPATH)
+      if(libs OR NOT EXISTS "${real}/ockl.bc" OR real IN_LIST tried)
+        continue()
+      endif()
+      list(APPEND tried "${real}")
+      strata_hip_device_libs_check("${real}" ${arch} ok why)
+      if(ok)
+        set(libs "${real}")
+      else()
+        string(APPEND reasons "\n  ${real}: ${why}")
+      endif()
+    endforeach()
+    if(NOT libs AND NOT tried)
+      message(FATAL_ERROR "STRATA_HIP_ARCHS (${arch}): ROCm's device libraries (ockl.bc) were not found: build "
+                          "intel/llvm with ROCm's HIP installed (tools/intel_llvm_build.py builds them with it), "
+                          "install them (Fedora: rocm-device-libs; Ubuntu: rocm-device-libs-21), or give "
+                          "-DSTRATA_ROCM_DEVICE_LIBS=")
+    elseif(NOT libs)
+      message(FATAL_ERROR "STRATA_HIP_ARCHS (${arch}): the SYCL compiler builds with none of ROCm's device libraries "
+                          "found:${reasons}\nBuild intel/llvm again with tools/intel_llvm_build.py --rebuild (it "
+                          "builds device libraries of its own LLVM), or give -DSTRATA_ROCM_DEVICE_LIBS= a folder of "
+                          "an older ROCm's")
+    endif()
+    message(STATUS "ROCm's device libraries: ${libs}")
+  endif()
+  set(${out} "${libs}" PARENT_SCOPE)
+endfunction()
+
 # The SYCL targets (amd_gpu_gfx1200) and options (ROCm's device libraries) for `archs`, after checking that each is
 # supported and that the SYCL compiler builds for them.
 function(strata_hip_choose archs targets_out opts_out)
@@ -94,25 +212,9 @@ function(strata_hip_choose archs targets_out opts_out)
     endif()
     list(APPEND targets amd_gpu_${arch})
   endforeach()
-  # ROCm's device libraries (ockl.bc and the others): AMD's tree, or the distribution's, which keeps them with its ROCm
-  # clang (Fedora: /usr/lib64/rocm/llvm/lib/clang/<N>/lib/amdgcn/bitcode; Ubuntu: /usr/lib/llvm-<N>/lib/clang/<N>/
-  # amdgcn/bitcode)
-  if(NOT STRATA_ROCM_DEVICE_LIBS)
-    file(GLOB dirs /opt/rocm/amdgcn/bitcode /opt/rocm/lib/llvm/lib/clang/*/lib/amdgcn/bitcode
-                   /usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode /usr/lib/llvm-*/lib/clang/*/amdgcn/bitcode
-                   /usr/lib/llvm-*/lib/clang/*/lib/amdgcn/bitcode)
-    list(SORT dirs COMPARE NATURAL ORDER DESCENDING)
-    foreach(dir IN LISTS dirs)
-      if(EXISTS "${dir}/ockl.bc" AND NOT STRATA_ROCM_DEVICE_LIBS)
-        set(STRATA_ROCM_DEVICE_LIBS "${dir}" CACHE PATH "ROCm's device libraries (ockl.bc), for the AMD code")
-      endif()
-    endforeach()
-  endif()
-  if(NOT STRATA_ROCM_DEVICE_LIBS)
-    message(FATAL_ERROR "STRATA_HIP_ARCHS=${archs}: ROCm's device libraries (ockl.bc) were not found: install them "
-                        "(Fedora: rocm-device-libs; Ubuntu: rocm-device-libs-21) or give -DSTRATA_ROCM_DEVICE_LIBS=")
-  endif()
-  set(opts "--rocm-device-lib-path=${STRATA_ROCM_DEVICE_LIBS}")
+  list(GET archs 0 first)
+  strata_hip_device_libs(${first} libs)
+  set(opts "--rocm-device-lib-path=${libs}")
   list(JOIN targets "," str)
   string(MD5 key "${str} ${opts}")
   strata_sycl_compiles("-fsycl-targets=spir64,${str};${opts}" STRATA_SYCL_HIP_${key} ok)
@@ -125,12 +227,32 @@ function(strata_hip_choose archs targets_out opts_out)
   set(${opts_out} "${opts}" PARENT_SCOPE)
 endfunction()
 
+# AMD's ROCm tree with CMake packages (hip, rocblas, hipblaslt), for CMAKE_PREFIX_PATH: /opt/rocm or the versioned
+# /opt/rocm-<version>, or the parts ROCm 7.14 splits its tree into (/opt/rocm/core-7.14, where hip-config.cmake is;
+# /opt/rocm itself has no lib/cmake there, and find_package(hip) failed: a field report).  One tree, so that two
+# installed versions are not mixed, in setup.py's order (rocm_roots): /opt/rocm, its alternatives link core, the newest
+# core-<version>, the newest /opt/rocm-<version>; NATURAL sorts core-10.1 after core-7.14.
+function(strata_hip_prefixes out)
+  file(GLOB cores LIST_DIRECTORIES true /opt/rocm/core-*)
+  file(GLOB versioned LIST_DIRECTORIES true /opt/rocm-*)
+  list(SORT cores COMPARE NATURAL ORDER DESCENDING)
+  list(SORT versioned COMPARE NATURAL ORDER DESCENDING)
+  set(${out} "" PARENT_SCOPE)
+  foreach(root IN ITEMS /opt/rocm /opt/rocm/core ${cores} ${versioned})
+    if(IS_DIRECTORY "${root}/lib/cmake")
+      set(${out} "${root}" PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+endfunction()
+
 # ROCm's clang (AMD's tree's, or the distribution's ROCm one: Fedora's /usr/lib64/rocm/llvm, Ubuntu's
 # /usr/lib/llvm-<N>; on Windows the HIP SDK's under STRATA_ROCM_ROOT), for HIP's CMake package (HIP_CXX_COMPILER): it
 # links clang's runtime builtins where that compiler has them, and intel/llvm's install has none, so asked with
 # intel/llvm's clang it named a file that is not there.  The newest one whose builtins exist; empty when there is none.
 function(strata_hip_cxx out)
-  file(GLOB compilers /opt/rocm/llvm/bin/clang++ /opt/rocm/lib/llvm/bin/clang++ /usr/lib64/rocm/llvm/bin/clang++
+  file(GLOB compilers /opt/rocm/llvm/bin/clang++ /opt/rocm/lib/llvm/bin/clang++ /opt/rocm*/core-*/llvm/bin/clang++
+                      /opt/rocm*/core-*/lib/llvm/bin/clang++ /usr/lib64/rocm/llvm/bin/clang++
                       /usr/lib/llvm-*/bin/clang++)
   if(WIN32 AND STRATA_ROCM_ROOT)
     file(GLOB compilers "${STRATA_ROCM_ROOT}/lib/llvm/bin/clang++.exe" "${STRATA_ROCM_ROOT}/llvm/bin/clang++.exe")

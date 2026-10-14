@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/platform/memory_test.cpp - plan v0.3 P0.1: lock_resident on a 256 MiB region (CPU only, no GPU, no model).
 #include "strata/platform/memory.hpp"
 
@@ -20,9 +20,10 @@ int main() {
     const strata::platform::LockResult r = strata::platform::lock_resident(p, bytes);
     std::printf("lock_resident: ok=%d locked=%llu MiB (%s)\n", (int) r.ok, (unsigned long long) (r.locked_bytes >> 20),
                 r.note.c_str());
-    // a refusal under a memlock limit below the region (8 MiB by default on Ubuntu, without CAP_IPC_LOCK) is the
-    // machine's setting, not a fault: skipped.  With the limit high enough, a refusal still fails.
 #if !defined(_WIN32)
+    // a refusal under a memlock limit below the region (8 MiB by default on Ubuntu, without CAP_IPC_LOCK) is the
+    // machine's setting, not a fault: skipped.  With the limit high enough, a refusal still fails.  (Windows raises
+    // the working-set minimum instead: a refusal there fails.)
     rlimit lim{};
     if (!r.ok && getrlimit(RLIMIT_MEMLOCK, &lim) == 0 && lim.rlim_cur != RLIM_INFINITY && lim.rlim_cur < bytes) {
         std::printf("platform_memory_test: skipped (ulimit -l is %llu KiB, below the %llu MiB region)\n",

@@ -6,7 +6,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 [English](BUILD.md) | 日本語
 
-XeStrata をソースから入れる方法、エンジンのビルドの方式、setup の振る舞いと要るパッケージ、deb と rpm のパッケージの作り方をまとめます。
+XeStrata をソースから入れる方法、エンジンのビルドの方式、setup の振る舞いと要るパッケージ、deb と rpm のパッケージの作り方、Podman のコンテナをまとめます。
 パッケージから入れて使う方法は [README](../README.ja.md) にあります。
 
 ## ソースから入れる
@@ -52,10 +52,14 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   ROCm の HIP 付きでビルドした intel/llvm なら、`STRATA_HIP_ARCHS`（例 `gfx1200`）で AMD の GPU（RDNA2 以降: gfx103x、gfx11xx、gfx12xx）向けのコードも作ります。
   ROCm は自由ソフトウェアなので、free でも contrib-llvm でも同じです（[DEVTOOLS.ja.md](DEVTOOLS.ja.md#hipamd-の-gpu)）。
   `auto`（既定）はカーネルの KFD が報告するこの PC の AMD の GPU を選び、`rocblas` はディストリビューションの rocBLAS がコードを持つ RDNA2 以降の GPU のうち、SYCL のコンパイラにターゲットのあるものをすべて選びます（パッケージはこれでビルドします。intel/llvm 7.1.1 には gfx1152 と gfx1153 のターゲットがありません）。
-  ROCm のデバイスライブラリ（`ockl.bc`）の場所は `STRATA_ROCM_DEVICE_LIBS` で変えられます。
+  ROCm のデバイスライブラリ（`ockl.bc`）は、AMD の `/opt/rocm*`、ディストリビューションのもの、SYCL のコンパイラ自身のもの（`tools/intel_llvm_build.py` が一緒にビルドします）の順に、AMD のカーネルを試しにビルドして、通った最初のものを使います。
+  入っている ROCm のものが使えればそれを使い、コンパイラ自身のものは、ROCm のものがコンパイラより新しい LLVM で作られていて読めないとき（ROCm 7.14 など）に使います。
+  どれも通らなければ、それぞれの理由（コンパイラより新しい LLVM のビットコード、コンパイラが求めるファイルがない）を出して止まります。
+  `STRATA_ROCM_DEVICE_LIBS` で場所を指定でき、そのときも試しのビルドが通らなければ理由を出して止まります。
   AMD の GPU の密な積は oneMath の rocBLAS の後端で計算し、フォークの変更で、16 ビットの入力の積は hipBLASLt に回します。
   hipBLASLt が見つからないと CMake は警告し（`STRATA_PACKAGE=ON` では止まります）、その積は rocBLAS だけで計算します（gfx12 では 15 分の 1 ほどの速さでした）。
   RX 9060 XT（gfx1200、Fedora 44、ROCm 7.1.1）で CTest が通ることを確かめています。
+  gfx1030 のカード（RX 6800 XT、CachyOS（Arch）、ROCm 7.2.4）でビルドと実行が通ることを確かめています。setup の単体テストが通り、IQ3_XXS は 64-68 tok/s でデコードします（2000 トークンの実行、262144 コンテキスト。215K トークンを読んだときは約 65 tok/s）。
 - **contrib-llvm**（既定、`-DSTRATA_LICENSE=contrib`）: intel/llvm を CUDA のターゲット付きでビルドしたもの（`tools/intel_llvm_build.py --contrib`）を使い、
   `STRATA_CUDA_ARCHS`（例 `sm_89`）で NVIDIA の GPU 向けのコードも作ります。
   XeStrata のソースは free のときと同じで、自由ソフトウェアのままです。
@@ -299,6 +303,9 @@ Intel の GPU では、選んだコンパイラで `tools/xmx_probe.cpp` をビ�
 更新のあとでエンジンをコンパイルし直すときは、`BUILD.json` に記録したコンパイラを使い、何も尋ねません。
 free のビルドができる前のエンジン（記録がないもの）は icpx で作ったものなので、`--license contrib-icpx` としてそのまま icpx を使います。
 
+`--cmake-arg KEY=VALUE` は、エンジンのビルドに CMake のオプション（`-DKEY=VALUE`）を渡します（1 つにつき 1 回）。
+設定に残し、更新のあとのビルドでも使います。`--cmake-arg ""` で消せます。
+
 `tools/intel_llvm_build.py` は、`--intel-llvm-build` から、または手で動かします。
 スクリプトに書いた intel/llvm のリリースのタグを `.tools/intel-llvm/src` に clone してビルドし、`.tools/intel-llvm/install` にインストールします。
 ビルドの構成は、リリースが指定するソースを取ってきます。
@@ -315,22 +322,22 @@ v7.1.1 のビルドは開発機（28 スレッド）で 13 分かかり、3.5 GB
 
 ### パッケージ
 
-setup.py は OS のパッケージを入れず、apt も sudo も実行しません。
-setup.sh は、venv の使える Python 3 がないときだけ、それを `sudo apt-get`（Fedora では `sudo dnf`）で入れます。
+setup.py は OS のパッケージを入れず、パッケージマネージャーも sudo も実行しません。
+setup.sh は、venv の使える Python 3 がないときだけ、それを `sudo apt-get`（Fedora では `sudo dnf`、Arch では `sudo pacman -S`）で入れます。
 ほかのパッケージは、先に自分で入れておきます。
 
-次の表から、使うモードの共通の行と、PC にある GPU のメーカーの行（いくつでも）を選び、`sudo apt install`（Fedora は `sudo dnf install`）の後ろに並べます。
+次の表から、使うモードの共通の行と、PC にある GPU のメーカーの行（いくつでも）を選び、`sudo apt install`（Fedora は `sudo dnf install`、Arch は `sudo pacman -S`）の後ろに並べます。
 `./setup.sh --packages` は、この PC のディストリビューションと GPU、`--license` のモード（既定は contrib-llvm）に合わせて、その 1 行を出します。
 `./setup.sh --packages fedora44/intel,amd --license free` のように、ほかの組み合わせも出せます。
 
-| 選択 | Ubuntu 26.04 | Fedora 44 |
-| --- | --- | --- |
-| 共通（free、contrib-llvm） | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel` |
-| 共通（contrib-icpx） | `python3-venv build-essential libblosc2-dev intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` | `python3 gcc-c++ blosc2-devel intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` |
-| Intel の GPU | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` |
-| Intel の GPU（contrib-llvm） | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` |
-| AMD の GPU（free、contrib-llvm） | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` |
-| NVIDIA の GPU（contrib-llvm） | `nvidia-cuda-toolkit` と NVIDIA のドライバー | `cuda-toolkit-13-4`（NVIDIA の CUDA のリポジトリ）と NVIDIA のドライバー |
+| 選択 | Ubuntu 26.04 | Fedora 44 | Arch |
+| --- | --- | --- | --- |
+| 共通（free、contrib-llvm） | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel` | `python base-devel git cmake ninja lld hwloc zstd vulkan-headers vulkan-icd-loader shaderc spirv-headers opencl-headers blosc2` |
+| 共通（contrib-icpx） | `python3-venv build-essential libblosc2-dev intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` | `python3 gcc-c++ blosc2-devel intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` | なし（Intel oneAPI は Arch のリポジトリにありません） |
+| Intel の GPU | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` | `level-zero-loader intel-compute-runtime vulkan-intel` |
+| Intel の GPU（contrib-llvm） | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` | なし（oneMKL も Arch のリポジトリにありません） |
+| AMD の GPU（free、contrib-llvm） | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` | `hip-runtime-amd rocm-device-libs rocm-llvm rocblas hipblaslt hipblas-common vulkan-radeon` |
+| NVIDIA の GPU（contrib-llvm） | `nvidia-cuda-toolkit` と NVIDIA のドライバー | `cuda-toolkit-13-4`（NVIDIA の CUDA のリポジトリ）と NVIDIA のドライバー | `cuda` と NVIDIA のドライバー |
 
 - `intel-oneapi-` で始まるものは、Intel の oneAPI のリポジトリにあります（追加のしかたは Intel の手順: [APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html)、[DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)）。
 - 共通の行の Vulkan のもの（`libvulkan-dev` ほか）は GPU の画像エンコーダーのため、`libblosc2-dev`（`blosc2-devel`）は保存した会話の圧縮（任意。[`conversation_save_compress`](DETAILS.ja.md#置いた会話を再起動後も使う任意)）のためです。
@@ -339,6 +346,17 @@ setup.sh は、venv の使える Python 3 がないときだけ、それを `sud
   oneMath の rocBLAS の後端が読む HIP の CMake のパッケージが、clang の実行時の builtins（`libclang_rt.builtins`）をリンクに足すためにコンパイラに尋ねます。
   intel/llvm にはその builtins がないので、ROCm の clang を `HIP_CXX_COMPILER` にしてそれに答えさせています（`cmake/StrataHip.cmake` の `strata_hip_cxx`）。
   要るのはビルドのときだけで、実行には要りません。
+- Arch では、Vulkan の ICD は GPU のメーカーのパッケージです（Intel は `vulkan-intel`、AMD は `vulkan-radeon`。1 つの `mesa-vulkan-drivers` が両方を持つ Ubuntu と Fedora とは違います）。
+- Arch の `zstd` には `libzstd.a` がありません（`zstd-static` は AUR のパッケージです）。
+  intel/llvm の `configure.py` は静的な zstd（`LLVM_USE_STATIC_ZSTD=ON`）を要求するので、`tools/intel_llvm_build.py` はそれがないとき OFF にし、共有の zstd をリンクします（intel/llvm は v7.1.1 からそれを扱います: [intel/llvm#22294](https://github.com/intel/llvm/pull/22294)）。
+- Arch の ROCm の clang は `/opt/rocm/lib/llvm` にあり、その実行時の builtins（`libclang_rt.builtins`）も同じ `rocm-llvm` に入っています（AMD の行の `clang-21` と `libclang-rt-21-dev` にあたるものが 1 つのパッケージです）。
+- Arch の ROCm は AMD 自身の入れ方と同じ `/opt/rocm` にあります（CMake のパッケージは `/opt/rocm/lib/cmake`、ライブラリは `/opt/rocm/lib`）。
+  CMake の既定の探索にも ld.so の既定にも入らないので、`cmake/StrataHip.cmake` が `/opt/rocm` を `CMAKE_PREFIX_PATH` に足し、setup は `/opt/rocm/lib` をエンジンのライブラリのフォルダーに記録します。
+- Arch では `opencl-headers` も入れます。intel/llvm のビルドは SYCL の道具（`sycl-ls`）もインストールし、それは `sycl/detail/cl.h` から `CL/cl.h` を読みますが、そのターゲットには構成が取ってくる OpenCL のヘッダーの include が付きません（あれはランタイム自身のオブジェクトのものです）。
+  Ubuntu と Fedora のビルドではそのヘッダーが入っています（コンパイラーが連れてきます）が、Arch の clang は連れてきません。
+- Intel oneAPI（icpx と oneMKL）は Arch のリポジトリにないので、要るなら Intel のオフラインインストーラーで入れます。
+  contrib-llvm のモードは Intel の GPU の密な積を oneMKL に任せるので、Intel の GPU では oneMKL が要ります。
+  入れない場合は free のモードを使います。intel/llvm をソースからビルドし、Intel の GPU の密な積は XeStrata 自身のカーネルが行います。
 
 #### ほかのディストリビューション
 
@@ -406,11 +424,26 @@ AMD のコードは、どの版にも、そのディストリビューション�
 - intel/llvm 7.1.1 の SYCL には sm_90 より上の名前がないので、RTX 50 などの新しい GPU は sm_90 の PTX をドライバーがコンパイルして動かします。
 - PTX はツールキットの版なので、ドライバーはその CUDA の版に対応している必要があります。
 
+### Windows の 7z
+
+Windows 版の 7z も、同じ `tools/package/build.sh` で、Ubuntu 26.04 の使い捨てのコンテナの中で作ります（`tools/package/windows.sh`）。
+
+```bash
+tools/package/build.sh windows cuda12.4      # XeStrata-<版>-windows-x64.7z
+```
+
+- すべて Linux の上で Windows 向けにクロスビルドします。intel/llvm（Linux 版の contrib と、Windows 版の SYCL のランタイム）、エンジン（contrib-llvm のモード、NVIDIA のコードは cuda12.4 の deb と同じ）、.NET の入口（`dotnet-sdk-10.0`）、Python の embeddable 版と wheel を作り、`tools/package/windows_bundle.py` がフォルダーと 7z にします。
+- MSVC の CRT と Windows SDK は xwin で Microsoft から取り、ライセンスに同意します（自由ソフトウェアではなく、7z には入れません）。CUDA の Windows 版のヘッダーとインポートライブラリも 7z には入れません。
+- Ubuntu 26.04 のパッケージと同じ ccache（`build/pkg-ccache/ubuntu26.04/`）を使い、xwin と NuGet の取得物は `build/pkg-cache/windows/` に残します。
+- 7z の中の exe・DLL・Python のパッケージは、どれも `windows_bundle.py` の部品の一覧にあるものでなければならず、Visual C++ のランタイムや NVIDIA のライブラリが入っていると止まります。
+  `THIRD-PARTY-NOTICES.md` に部品・版・ライセンス・入手元を書き、`licenses/` にライセンスの全文を置きます。
+- 出てくるものは `build/pkg/windows-cuda12.4/` の 7z と `BUILDINFO` です。
+
 ### パッケージの中身
 
 どの版（`xestrata-free`、`xestrata-contrib-cuda<版>`）も、1 つのパッケージに次のものを入れます。
 パッケージの版は Debian の付け方にならい、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）です。
-xe0.1.40.2.1 は `0.1.40.2-2`（rpm は Version が 0.1.40.2、Release が 2）です。
+xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）です。
 
 | 中身 | 置き場所 |
 | --- | --- |
@@ -444,3 +477,50 @@ xe0.1.40.2.1 は `0.1.40.2-2`（rpm は Version が 0.1.40.2、Release が 2）�
   （2026-10-06。forky と sid には 26.27 があります）。
 - **openSUSE Leap 16.0**: compute-runtime が 25.18 で、Arc Pro B70 を列挙しません。openSUSE の OBS にも Leap 16 向けの新しい版はありません
   （2026-10-06）。
+
+## Podman
+
+`container/` の Containerfile と compose のファイルで、XeStrata を rootless の Podman のコンテナで動かします（使い方は [README](../README.ja.md#podman)）。
+イメージは使う人の PC で作り、配布しません。contrib の版のイメージには、自由ソフトウェアでない cuBLAS と oneMKL が入るためです。
+
+- **中身**: `tools/package/build.sh` と同じ Fedora 44 のイメージ（ダイジェストで固定）に、Releases の rpm を `SHA256SUMS` で確かめて入れます。
+  続けて、その `BUILD.json` の `runtime` にあるメーカーのもの（Level Zero、ROCm の HIP の実行時と rocBLAS と hipBLASLt、cuBLAS、oneMKL）と
+  Mesa の Vulkan のドライバーをすべて入れます（`container/install.sh`）。
+  NVIDIA のドライバーのライブラリと `nvidia-smi` は入れず、CDI でホストのものを使います。
+- **ビルドの引数**: 環境変数で `podman compose build` に渡します。
+
+| 変数 | 既定 | 意味 |
+| --- | --- | --- |
+| `XESTRATA_VERSION` | `latest` | リリースのタグ（`xe0.1.43.1` など） |
+| `XESTRATA_VARIANT` | `contrib-cuda13.4` | 入れる rpm の版 |
+| `XESTRATA_NONFREE` | `1` | `0` で oneMKL と cuBLAS を入れません（Intel と NVIDIA の密な積は XeStrata の自前のカーネルになります） |
+
+- **手元の rpm**: `container/rpm/` に rpm を 1 つ置くと、Releases から取らずにそれを入れます。
+  Releases にない `xestrata-free` は、`tools/package/build.sh fedora44 free` で作ってここに置きます。
+- **GPU**: `/dev/dri` を渡し、`userns_mode: keep-id` と `group_add: keep-groups` で、ホストのユーザーの uid と render グループの権限のまま開きます
+  （`keep-groups` には crun のランタイムが要ります）。AMD は `compose.amd.yaml` が `/dev/kfd` を足します。
+  NVIDIA は `compose.nvidia.yaml` が CDI の `nvidia.com/gpu=all` を渡すので、ホストに NVIDIA Container Toolkit（`nvidia-container-toolkit`、NVIDIA のリポジトリにあります）を入れて、一度 CDI の設定を作ります。
+
+```bash
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+```
+
+- **ネットワーク**: ホストのネットワークを使い、サーバーはパッケージと同じく 127.0.0.1:8095 で待ちます。
+  ほかの機器から使うときも、パッケージと同じく `--host 0.0.0.0 --api-key <秘密の文字列>` です。
+- **置き場所**: `~/.config/xestrata`・`~/.local/state/xestrata`・`~/.local/share/xestrata` をホストと同じパスに渡し、`HOME` もホストと同じにします。
+  設定に書く絶対パスがホストとコンテナで一致するので、ホストのパッケージ（Ubuntu の deb でも）と設定とモデルを共有できます。
+  設定の中のエンジンの場所は、起動のたびに動いているパッケージのものに付け替えます。
+  GPU のドライバーがコンパイルしたカーネルは、名前付きボリューム `cache`（`~/.cache`）に残します。
+- **データフォルダがほかの場所にあるとき**（`--data-dir`）は、`container/compose.override.yaml` で同じパスに渡します。
+  `-f` を付けて動かすときは、`-f compose.override.yaml` も並べます。
+
+```yaml
+services:
+  xestrata:
+    volumes:
+      - /mnt/models/XeStrata-data:/mnt/models/XeStrata-data
+```
+
+- **SELinux**（Fedora など）: ホストのフォルダーのラベルを書き換えないよう、コンテナは `label=disable` で動かします。ビルドのときだけ、`container/` を読めるようにラベルを付けます（`relabel=shared`）。
+- **memlock**: rootless のコンテナは、ホストのユーザーの上限を超えられません。setup が上限が足りないと言ったら、ホストで上げます。
+- **止め方**: `podman compose down` です。`init` の PID 1 が止める合図を setup とサーバーに渡し、エンジンが止まるのを最大 60 秒待ちます。

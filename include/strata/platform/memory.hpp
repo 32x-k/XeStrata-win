@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/platform/memory.hpp - plan v0.3 P0.1/P1: keep a large host region resident.
 //
 // If CUDA cannot register the expert arena, mlock can keep it resident while the CPU pool reads it.
@@ -25,9 +25,9 @@ void unlock_resident(void* p, uint64_t bytes);
 
 /// #243, Windows: the GPU's shared (non-local) memory budget and this process's use of it, from DXGI
 /// (IDXGIAdapter3::QueryVideoMemoryInfo, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL) for the adapter whose LUID is the
-/// 8 bytes at `luid` (cudaDeviceProp::luid, sycl::ext::intel::info::device::luid).  Page-locked host memory the GPU
-/// maps is charged there.  False (and
-/// `why` says so) when the query is not possible - always elsewhere than Windows.
+/// 8 bytes at `luid` (the device LUID the runtime reports: sycl::ext::intel::info::device::luid, which Level Zero and
+/// XeStrata's HIP adapter on Windows give).  Page-locked host memory the GPU maps is charged there.  False (and `why`
+/// says so) when the query is not possible - always elsewhere than Windows.
 bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why);
 
 /// Windows: the GPU's local memory (VRAM) budget the OS gives this process and this process's use of it, from DXGI
@@ -39,6 +39,10 @@ bool gpu_local_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage
 
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
+
+/// Linux under WSL 2 (Microsoft's kernel, "...-microsoft-standard-WSL2" in /proc/sys/kernel/osrelease): the GPU is
+/// Windows' own, behind /dev/dxg.  Always false elsewhere.
+bool under_wsl();
 
 /// Whether `advise_willneed` asks the OS for anything: not on Windows, nor with STRATA_READ_AHEAD=0.
 bool read_ahead_enabled();

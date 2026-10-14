@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """tools/test_strata_mcp.py - tests for tools/strata_mcp.py (Strata's MCP server), standard library only.
 
     python -m unittest tools/test_strata_mcp.py -v
@@ -555,12 +555,15 @@ class Helpers(unittest.TestCase):
         self.assertEqual(list(S.CONTEXTS), M.FALLBACK_CONTEXTS)
 
     def test_unsloth_sizes(self):
-        """UD-IQ4_XS is a regular size, listed first (the family's default); UD-Q4_K_XL stays experimental."""
+        """UD-IQ4_XS is a regular size, listed first (the family's default); UD-Q4_K_XL stays experimental, and
+        UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 (upstream 0.1.44, not run in XeStrata) follow by size, experimental too."""
         s = M.Strata(HERE.parent)
         for models in (s.tables()[0], M.FALLBACK_MODELS):
-            self.assertEqual(s.sizes_of(models, "unsloth"), ["UD-IQ4_XS", "UD-Q4_K_XL"])
+            self.assertEqual(s.sizes_of(models, "unsloth"),
+                             ["UD-IQ4_XS", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"])
             self.assertFalse(models["UD-IQ4_XS"].get("experimental"))
-            self.assertTrue(models["UD-Q4_K_XL"].get("experimental"))
+            for m in ("UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"):
+                self.assertTrue(models[m].get("experimental"))
         fam = next(f for f in s.model_table({"ram_gb": 63.7, "gpus": []}) if f["family"] == "unsloth")
         self.assertFalse(fam["experimental"])
         self.assertTrue(fam["images"])

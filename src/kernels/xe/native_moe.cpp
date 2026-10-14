@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-FileCopyrightText: 2023-2026 The ggml authors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/native_moe.cpp - the Xe port of Strata's src/kernels/cuda/native_moe.cu: the MoE weighted combination with
 // the arithmetic of ggml-cuda's moe-weighted-reduction.cu at pinned llama.cpp 3cf03257 (MIT License, Copyright (c)
 // 2023-2026 The ggml authors, see third_party/main/ggml/LICENSE): parts[0] * w[0], then each further expert's product

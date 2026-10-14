@@ -1,7 +1,7 @@
 <!--
 SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-SPDX-License-Identifier: LGPL-3.0-or-later
+SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 -->
 # XeStrata
 
@@ -13,7 +13,7 @@ English | [日本語](README.ja.md)
 
 This branch ports XeStrata to Windows 11 with AMD GPUs.
 It builds intel/llvm (DPC++) on Windows with the HIP target only, and compiles XeStrata in the free mode with it.
-It keeps taking in upstream's releases; it now includes everything up to xe0.1.43.1.
+It keeps taking in upstream's releases; it now includes upstream XeStrata's main (with upstream Strata 0.1.44.1, 2026-10-14).
 
 ### What it does
 
@@ -151,7 +151,7 @@ How it differs from Strata:
 - **For Intel Arc,** and it runs on AMD and NVIDIA GPUs too.
 - **One GPU, as a rule.** The layers can also be spread over two or more GPUs in the same PC ([MULTIGPU](docs/MULTIGPU.md)).
   The GPUs may be of different makers, Intel, AMD and NVIDIA (for example an Intel Arc Battlemage and an NVIDIA Ada; with NVIDIA, in the contrib-llvm build).
-- **Linux only.** Windows is not supported. WSL 2 may work (pull requests welcome).
+- **Linux and Windows.** On Windows, Intel and NVIDIA GPUs; AMD GPUs on Linux only ([Windows](#windows)). WSL 2 may work (pull requests welcome).
 - **Runs with free software only, too** (the free build, free enough for Debian main; [made from the source](docs/BUILD.md#the-deb-and-rpm-packages)). The contrib-llvm packages use
   Intel's oneMKL and NVIDIA's cuBLAS, which are not free software, when they are installed ([Install](#install)).
 
@@ -163,7 +163,7 @@ How it differs from Strata:
 | CPU | x86-64 with AVX2. With AVX-512 (F, BW, VL, VNNI, VBMI) the CPU's part runs on AVX-512. |
 | RAM | 32-62 GB, depending on the model's size ([Choosing a model](#choosing-a-model)). |
 | Disk | About 60-110 GB for the model, and about 6 GB for the MTP layer. An SSD (NVMe) is strongly recommended. |
-| OS | Linux (WSL 2 may work; pull requests welcome). The packages are for Ubuntu 26.04 and Fedora 44; on other distributions, [install from the source](docs/BUILD.md#installing-from-the-source). |
+| OS | Linux (WSL 2 may work; pull requests welcome). The packages are for Ubuntu 26.04 and Fedora 44; on other distributions, [install from the source](docs/BUILD.md#installing-from-the-source). Windows 10 and 11 (x64) get a 7z ([Windows](#windows)). |
 | BIOS | For a discrete GPU: Above 4G Decoding and Re-Size BAR on, CSM off. |
 
 - **Matrix engines:** Intel's XMX, AMD's WMMA (RDNA3 or later) and NVIDIA's tensor cores are used; a GPU without
@@ -171,6 +171,7 @@ How it differs from Strata:
   but it runs.
 - **GPUs checked:** development and checks are done on an Arc Pro B70 (Xe2, 32 GB). On NVIDIA, an RTX 4070 and an
   RTX 3070 are checked; on AMD, an RX 9060 XT (RDNA4). On an Arc A380 only the arithmetic is checked, without running a model.
+  Windows is checked on an RTX 3050 Laptop (4 GB).
   Smaller cards are checked by limiting the memory and the XMX the B70 may use.
 - **The processor's own graphics:** checked up to starting and prefill. Its memory is shared with the RAM,
   and most have no XMX, so it is slow.
@@ -208,9 +209,10 @@ So XeStrata runs only on the GPUs the distribution's rocBLAS has code for.
 | **[Qwen3.8-Flash-Next](#qwen38-flash-next)** | 125B | 32-62 GB | 12 GB or more recommended | the smartest; for a PC with a lot of RAM |
 | **[Ornith-1.5](#ornith-15-beta)** (BETA) | 35B (3B a token) | 22-80 GB | from 4 GB | a PC with less RAM |
 | **[llm-jp-4.1](#llm-jp-41-beta)** (BETA) | 32B (3B a token) | 30-73 GB | from 4 GB | a thinking model for Japanese and English |
+| **[Qwen3.6-35B-A3B](#qwen36-35b-a3b-beta)** (BETA) | 35B (3B a token) | 31-46 GB | from 4 GB | a thinking model; a PC with less RAM |
 
-The two BETA models do not yet take images, two or more GPUs, or Intel's integrated GPUs
-([details](docs/DETAILS.md#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41)).
+The three BETA models do not yet take images, two or more GPUs, or Intel's integrated GPUs
+([details](docs/DETAILS.md#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41-qwen36-35b-a3b)).
 
 Not sure? On a PC with 48 GB of RAM or more, take Qwen3.8-Flash-Next's **IQ2_XS**.
 With less RAM than that, Qwen3.8-Flash-Next's Coder (32 GB) or Ornith-1.5 is the one to choose.
@@ -283,10 +285,45 @@ a thinking model for Japanese and English, with a context of up to 256K.
 | Q4_K_M | 21.5 GB | 30 GB | from 4 GB |
 | BF16 | 64.3 GB | 73 GB | from 8 GB |
 
-For the two BETA models, the RAM is about the download plus 8 GB. With less, the experts are read from the model
+### Qwen3.6-35B-A3B (BETA)
+
+[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) (Qwen, Apache-2.0; the GGUFs with the MTP
+layer by Unsloth): a thinking Qwen3.5-family MoE, with a context of up to 256K.
+It drafts tokens with the model's MTP layer, which makes decode faster.
+
+| Size | Download | RAM (about) | VRAM |
+| --- | ---: | ---: | ---: |
+| UD-Q4_K_XL | 22.9 GB | 31 GB | from 4 GB |
+| UD-Q6_K_XL | 32.6 GB | 41 GB | from 6 GB |
+| Q8_0 | 37.8 GB | 46 GB | from 6 GB |
+
+For the three BETA models, the RAM is about the download plus 8 GB. With less, the experts are read from the model
 file instead of loaded into RAM, which is slower.
 
 ## Install
+
+### Podman
+
+Only Podman and podman-compose go on the host. XeStrata goes into a Fedora 44 container, from the release's rpm (rootless).
+
+```bash
+git clone https://github.com/MistVVK/XeStrata && cd XeStrata/container
+mkdir -p ~/.config/xestrata ~/.local/state/xestrata ~/.local/share/xestrata
+podman compose build                         # the image, with the latest release and the GPU libraries
+podman compose run --rm xestrata --setup     # answer the questions; it downloads the model
+podman compose up -d                         # http://127.0.0.1:8095 (podman compose down stops it)
+```
+
+- **GPU**: Intel's as it is. For AMD add `-f compose.yaml -f compose.amd.yaml` after `podman compose`, for NVIDIA
+  `-f compose.yaml -f compose.nvidia.yaml` (or `export COMPOSE_FILE=compose.yaml:compose.nvidia.yaml`).
+  NVIDIA needs the NVIDIA Container Toolkit's CDI specification on the host ([docs/BUILD.md](docs/BUILD.md#podman)).
+  The container has cuda13.4, so Pascal and Volta (P100, P40, the GTX 10 series, V100) are not used.
+- **What the host needs**: the GPU's driver, and your user in the render group (`sudo usermod -aG render $USER`).
+- **Where things go**: the settings, logs and model files are the host's own (the same places as the packages below), so the packages and the container can take each other's place and keep them.
+- **Other commands**: what follows `xestrata`, as in `podman compose run --rm xestrata --bench`, `--calibrate` or `chat`.
+- **Updating**: `podman compose build --pull --no-cache` installs the latest release again, and `podman compose up -d` restarts it.
+
+### The deb and rpm packages
 
 1. Pick the package for your GPU from the table below and download it from [GitHub's Releases](https://github.com/MistVVK/XeStrata/releases) (with `SHA256SUMS`).
 1. Check it: `sha256sum -c SHA256SUMS --ignore-missing`.
@@ -360,6 +397,17 @@ Removed without `xestrata --remove-data`, the packages leave the model files and
 
 Installing from the source with `./setup.sh` is in [docs/BUILD.md](docs/BUILD.md#installing-from-the-source).
 
+### Windows
+
+1. Download `XeStrata-<version>-windows-x64.7z` from [GitHub's Releases](https://github.com/MistVVK/XeStrata/releases) (with `SHA256SUMS`) and unpack it into a folder of your choice.
+1. Start `xestrata.exe`. It takes you through the install (the GPU and the model, the download) and the start on screen. On the console, `xestrata-cli.exe` (used as `xestrata` on Linux).
+
+- **What it needs:** the [.NET 10 runtime](https://dotnet.microsoft.com/download/dotnet/10.0), the [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) and the GPU's driver.
+  Without the Visual C++ Redistributable, `xestrata.exe` says so and stops.
+- **GPUs:** Intel and NVIDIA (NVIDIA from Pascal on, the code of the cuda12.4 package). AMD GPUs do not run on Windows yet.
+- **Where things go:** nothing is written into the 7z's folder. The settings go to `%APPDATA%\xestrata`, the logs and the rest to `%LOCALAPPDATA%\xestrata`, the models to the data folder (by default `%LOCALAPPDATA%\xestrata\data`).
+- **Updates:** unpack the new 7z into a folder of its own and start its `xestrata.exe`. The settings and the models carry over.
+
 ## Using it
 
 - **In the browser:** `http://127.0.0.1:8095` (it opens by itself when the model starts): **Chat**, the **Monitor**
@@ -420,8 +468,11 @@ The conversation is longer than the context you chose. Start a new conversation,
 choose a longer context.
 
 **Still stuck?**
-See the [full troubleshooting table](docs/DETAILS.md#troubleshooting). If that does not help, open an
-[issue](https://github.com/MistVVK/XeStrata/issues) and attach `~/.local/state/xestrata/xestrata-<model>.log`.
+See the [full troubleshooting table](docs/DETAILS.md#troubleshooting).
+Give an LLM agent that can use your terminal the [recovery and diagnosis instructions](docs/DIAGNOSE.md) and your symptoms.
+They cover both source and deb/rpm installations and ask for the cause and evidence whether recovery succeeds or the agent gets stuck.
+If developer help is needed, open an [issue](https://github.com/MistVVK/XeStrata/issues) with the report, after removing secrets and personal information.
+Find the engine log's location in the `log` field of the model configuration actually in use.
 
 ## How it works
 
@@ -446,6 +497,9 @@ Every part is explained in [docs/DETAILS.md](docs/DETAILS.md#how-it-works), and 
 what has been checked in [docs/XE.md](docs/XE.md).
 
 ## For developers
+
+Before sending a report or a pull request, read [CONTRIBUTING.md](CONTRIBUTING.md) (no dependence on the model number, the licenses, the additional
+permission under GPL section 7, what goes in, and how to report).
 
 - **Building:** installing from the source, the three build modes (free, contrib-llvm, contrib-icpx), what setup does and the
   packages it needs, and how the deb and rpm packages are made are in [docs/BUILD.md](docs/BUILD.md).
@@ -483,6 +537,10 @@ what has been checked in [docs/XE.md](docs/XE.md).
    - [intel/llvm](https://github.com/intel/llvm)'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib-llvm
      modes' compiler, built with XeStrata's fixes (`third_party/main/intel-llvm/patches/`, under the same license);
      the packages carry its SYCL runtime;
+   - [ROCm's device libraries](https://github.com/ROCm/llvm-project/tree/rocm-7.2.4/amd/device-libs), by AMD
+     (University of Illinois/NCSA): built with intel/llvm, and linked into the code for AMD GPUs; the target features
+     their build is given are transcribed from the `debian/rules` of Debian's
+     [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) package (Expat);
    - the web app's font, [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1).
 - **Ideas from:**
    - [Splash](https://github.com/incoai/splash), by Inco AI and the Splash contributors;
@@ -499,13 +557,17 @@ what has been checked in [docs/XE.md](docs/XE.md).
 XeStrata (copyright MistVVK and the XeStrata contributors) is free software; the whole of it is under the
 [GNU Lesser General Public License, version 3 or later](COPYING.LESSER) (`COPYING.LESSER`, with `COPYING`).
 
-- **Linking with the vendors' math libraries:** what is linked with a math or compute library a GPU or CPU maker
-  publishes for its processors, and with the runtime libraries it needs (oneMKL and the runtime libraries of Intel's
-  oneAPI compilers, cuBLAS and the CUDA runtime and driver, for example), may be distributed as well: an additional
-  permission under section 7 of the GPL, version 3, worded in [NOTICE](NOTICE).
+- **Linking with the vendors' math libraries and the system's runtime:** what is linked with a math or compute library
+  a GPU or CPU maker publishes for its processors, and with the runtime libraries it needs (oneMKL and the runtime
+  libraries of Intel's oneAPI compilers, cuBLAS and the CUDA runtime and driver, for example), or with the C and C++
+  runtime libraries of the operating system or of its standard compiler (Microsoft's Universal C Runtime and Visual C++
+  runtime libraries, for example), may be distributed as well: an additional permission under section 7 of the GPL,
+  version 3, worded in [NOTICE](NOTICE).
 - **Code from Strata and ggml:** the code that comes from Strata and from ggml / llama.cpp, both MIT (the kernels
-  transcribed into `src/` included), is part of XeStrata under the LGPL; as MIT asks, their copyright and permission
-  notices are kept in [NOTICE](NOTICE).
+  transcribed into `src/` included), stays under MIT. Strata's files XeStrata has not changed are under MIT alone; in
+  a file XeStrata has changed or that carries transcribed code, XeStrata's changes and the file as a whole are under
+  the LGPL (its header says `LGPL-3.0-or-later AND MIT`). The copyright and permission notices are in [NOTICE](NOTICE).
+  So is what `tools/intel_llvm_build.py` transcribes from Debian's rocm-llvm package (Expat).
 - **Exceptions:** these, in `third_party/`, stay under their own licenses, one folder per project with its license text.
    - XeStrata's patches to intel/llvm (`third_party/main/intel-llvm/`): Apache-2.0 WITH LLVM-exception.
    - XeStrata's changes to oneMath (its fork, `third_party/main/oneMath/`): Apache-2.0.
@@ -516,5 +578,6 @@ XeStrata (copyright MistVVK and the XeStrata contributors) is free software; the
 - **Without `third_party/nonfree/`,** XeStrata still builds and runs. The packages leave it out.
 - **What else the packages carry:** intel/llvm's SYCL runtime (Apache-2.0 WITH LLVM-exception), llama.cpp's gguf-py
   (MIT) and oneMath (Apache-2.0), each with its license text.
+  The code for AMD GPUs carries parts of ROCm's device libraries (NCSA), so their license text is there too.
   Nothing that is not free software (oneMKL, cuBLAS, NVIDIA's driver) is in them.
 - **The models** are not part of this repository; each model's own license applies to its files.

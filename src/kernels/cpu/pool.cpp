@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/cpu/pool.cpp - P2.S3: the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/platform/aux_cpus.hpp"
@@ -11,15 +11,19 @@
 #include <cmath>
 #include <chrono>
 #include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>   // __cpuidex (STRATA_POOL_UMWAIT)
+#else
+#include <cpuid.h>    // __cpuid_count (STRATA_POOL_UMWAIT)
+#endif
 
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 
 #if defined(_WIN32)
-#ifndef NOMINMAX
+#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#endif
 #include <windows.h>
 #else
 #include <pthread.h>
@@ -29,6 +33,62 @@
 namespace strata::kernels::cpu {
 
 namespace {
+// STRATA_POOL_UMWAIT=<TSC cycles> (opt-in, upstream caf1856b, 54b61dbb): a parked worker waits with UMONITOR/UMWAIT on
+// the epoch's cache line instead of spinning on _mm_pause.  It wakes when the host publishes (a write to that line) or
+// after the cycles, in the light C0.1 state; on a laptop whose CPU and GPU share a power budget the spin's power goes
+// to the GPU.  0, unset, or a CPU without WAITPKG (CPUID.7.0:ECX bit 5): the spin, unchanged.
+// STRATA_POOL_UMWAIT_C02=1: the deeper C0.2 state; STRATA_POOL_UMWAIT_ESC=<cycles>: C0.1 first, C0.2 after.
+// The instructions are compiled for this one function (clang and GCC, on Linux and Windows), not for the file.
+bool cpu_waitpkg() {
+    unsigned r[4] = {0, 0, 0, 0};
+#if defined(_MSC_VER)
+    int x[4];
+    __cpuidex(x, 0, 0);
+    if (x[0] < 7) return false;
+    __cpuidex(x, 7, 0);
+    r[2] = (unsigned) x[2];
+#else
+    __cpuid_count(0, 0, r[0], r[1], r[2], r[3]);
+    if (r[0] < 7) return false;
+    __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
+#endif
+    return ((r[2] >> 5) & 1u) != 0;
+}
+uint64_t umwait_cycles() {
+    static const uint64_t c = [] {
+        const char* e = std::getenv("STRATA_POOL_UMWAIT");
+        if (e == nullptr || std::strtoll(e, nullptr, 10) <= 0) return (uint64_t) 0;
+        if (!cpu_waitpkg()) {
+            std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin\n");
+            return (uint64_t) 0;
+        }
+        std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: parked workers wait with UMWAIT (%lld cycles)\n", std::strtoll(e, nullptr, 10));
+        return (uint64_t) std::strtoll(e, nullptr, 10);
+    }();
+    return c;
+}
+unsigned umwait_state() {   // 1 = C0.1 (light), 0 = C0.2
+    static const unsigned s = [] { const char* e = std::getenv("STRATA_POOL_UMWAIT_C02"); return e && *e == '1' ? 0u : 1u; }();
+    return s;
+}
+uint64_t umwait_escalate() {   // a park that has lasted this long is a GPU phase, where a slower wake costs little
+    static const uint64_t c = [] {
+        const char* e = std::getenv("STRATA_POOL_UMWAIT_ESC");
+        return e ? (uint64_t) (std::max)(0LL, std::strtoll(e, nullptr, 10)) : (uint64_t) 0;
+    }();
+    return c;
+}
+// false when `epoch` moved before the wait (the monitor is armed first, so a publish after the check wakes it)
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((target("waitpkg")))
+#endif
+bool umwait_unless_moved(const std::atomic<uint32_t>& epoch, uint32_t seen, unsigned state, uint64_t until) {
+    _umonitor((void*) &epoch);
+    if (epoch.load(std::memory_order_acquire) != seen) return false;
+    _umwait(state, until);
+    return true;
+}
+
 constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
     return ((uint64_t) epoch << 32) | ((uint64_t) n << 16) | (uint64_t) i;
 }
@@ -37,33 +97,31 @@ constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
 std::vector<int> physical_cores(bool skip_first) {
     std::vector<int> cores;
 #if defined(_WIN32)
-    DWORD bytes = 0;
-    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
-    std::vector<uint8_t> storage(bytes);
-    if (bytes != 0 && GetLogicalProcessorInformationEx(RelationProcessorCore,
-            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(storage.data()), &bytes)) {
-        DWORD_PTR process = 0, system = 0;
-        GetProcessAffinityMask(GetCurrentProcess(), &process, &system);
-        for (size_t off = 0; off < bytes;) {
-            const auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(storage.data() + off);
-            if (info->Relationship == RelationProcessorCore) {
-                for (WORD g = 0; g < info->Processor.GroupCount; ++g) {
-                    if (info->Processor.GroupMask[g].Group != 0) continue;
-                    KAFFINITY mask = info->Processor.GroupMask[g].Mask & process;
-                    if (mask != 0) {
-                        int cpu = 0;
-                        while ((mask & (KAFFINITY(1) << cpu)) == 0) ++cpu;
-                        cores.push_back(cpu);
+    // One logical processor per core from the OS, numbered group * 64 + the processor's bit in its group.  Without
+    // the core list (an old Windows) every active processor counts, group by group.
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    std::vector<char> buf(len);
+    auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data());
+    if (len != 0 && GetLogicalProcessorInformationEx(RelationProcessorCore, info, &len)) {
+        for (const char* p = buf.data(); p < buf.data() + len;) {
+            const auto* e = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(p);
+            if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount > 0) {
+                const GROUP_AFFINITY& g = e->Processor.GroupMask[0];
+                for (int bit = 0; bit < 64; ++bit)
+                    if (g.Mask & (KAFFINITY(1) << bit)) {
+                        cores.push_back((int) g.Group * 64 + bit);
                         break;
                     }
-                }
             }
-            if (info->Size == 0) break;
-            off += info->Size;
+            p += e->Size;
+        }
+    } else {
+        for (WORD group = 0; group < GetActiveProcessorGroupCount(); ++group) {
+            const DWORD count = GetActiveProcessorCount(group);
+            for (DWORD i = 0; i < count && i < 64; ++i) cores.push_back((int) group * 64 + (int) i);
         }
     }
-    if (cores.empty())
-        for (unsigned i = 0; i < std::thread::hardware_concurrency() && i < 64; ++i) cores.push_back((int) i);
 #else
     // The logical CPUs this process may run on, ONE PER PHYSICAL CORE (issue #40): SMT siblings share a core's
     // load/store bandwidth, so a worker on each would put two workers on one core. sysfs names each CPU's
@@ -105,10 +163,43 @@ std::vector<int> physical_cores(bool skip_first) {
 
 namespace {
 
+#if defined(_WIN32)
+// The CPU Set of a processor numbered group * 64 + index: CPU Set IDs are opaque, so the entry is found by its group and
+// group-relative index.
+bool cpu_set_for_core(int core, ULONG& id) {
+    ULONG bytes = 0;
+    if (!GetSystemCpuSetInformation(nullptr, 0, &bytes, GetCurrentProcess(), 0) &&
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER) return false;
+    std::vector<unsigned char> buffer(bytes);
+    if (bytes && !GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()), bytes,
+                                            &bytes, GetCurrentProcess(), 0)) return false;
+    constexpr size_t header_size = offsetof(SYSTEM_CPU_SET_INFORMATION, CpuSet);
+    for (size_t offset = 0; offset + header_size <= bytes;) {
+        const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+        if (info->Size < header_size || info->Size > bytes - offset) break;
+        if (info->Type == CpuSetInformation && info->Size >= sizeof(SYSTEM_CPU_SET_INFORMATION) &&
+            info->CpuSet.Group == core / 64 && info->CpuSet.LogicalProcessorIndex == (core & 63) &&
+            (!info->CpuSet.Allocated || info->CpuSet.AllocatedToTargetProcess)) {
+            id = info->CpuSet.Id;
+            return true;
+        }
+        offset += info->Size;
+    }
+    SetLastError(ERROR_NOT_FOUND);
+    return false;
+}
+#endif
+
+// Hard affinity: a pool worker keeps it until it ends; on Linux pin_current_thread saves the mask before it.
 void pin_this_thread(int core) {
     if (core < 0) return;
 #if defined(_WIN32)
-    if (core < 64) SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << core);
+    GROUP_AFFINITY target{};
+    target.Group = (WORD) (core / 64);
+    target.Mask = KAFFINITY(1) << (core & 63);
+    if (!SetThreadGroupAffinity(GetCurrentThread(), &target, nullptr))
+        std::fprintf(stderr, "strata cpu pool: affinity for processor %d failed: %lu; previous affinity kept\n", core,
+                     (unsigned long) GetLastError());
 #else
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -119,33 +210,45 @@ void pin_this_thread(int core) {
 
 }  // namespace
 
-long long pin_current_thread(int core) {
-    if (core < 0) return -1;
+ThreadAffinity pin_current_thread(int core) {
+    if (core < 0) return {};
+    ThreadAffinity previous;
 #if defined(_WIN32)
-    if (core >= 64) return -1;
-    const DWORD_PTR previous = SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << core);
-    return previous != 0 ? (long long) previous : -1;
+    ULONG count = 0, target = 0;
+    if (!GetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0, &count) && GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+        return {};
+    previous.cpu_sets.resize(count);
+    if ((count != 0 && !GetThreadSelectedCpuSets(GetCurrentThread(), previous.cpu_sets.data(), count, &count)) ||
+        !cpu_set_for_core(core, target) || !SetThreadSelectedCpuSets(GetCurrentThread(), &target, 1)) {
+        std::fprintf(stderr, "strata cpu pool: host CPU Set selection for processor %d failed: %lu; previous placement "
+                             "kept\n", core, (unsigned long) GetLastError());
+        return {};
+    }
+    previous.cpu_sets.resize(count);
 #else
     cpu_set_t prev;
     CPU_ZERO(&prev);
-    if (pthread_getaffinity_np(pthread_self(), sizeof prev, &prev) != 0) return -1;
-    unsigned long mask = 0;
+    if (pthread_getaffinity_np(pthread_self(), sizeof prev, &prev) != 0) return {};
     for (int i = 0; i < CPU_SETSIZE && i < 64; ++i)
-        if (CPU_ISSET(i, &prev)) mask |= 1ul << i;
+        if (CPU_ISSET(i, &prev)) previous.mask |= 1ul << i;
     pin_this_thread(core);
-    return (long long) mask;
 #endif
+    previous.valid = true;
+    return previous;
 }
 
-void restore_thread_affinity(long long previous) {
-    if (previous <= 0) return;
+void restore_thread_affinity(const ThreadAffinity& previous) {
+    if (!previous.valid) return;
 #if defined(_WIN32)
-    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) previous);
+    // an empty selection puts the thread back on the process defaults
+    if (!SetThreadSelectedCpuSets(GetCurrentThread(), previous.cpu_sets.empty() ? nullptr : previous.cpu_sets.data(),
+                                  (ULONG) previous.cpu_sets.size()))
+        std::fprintf(stderr, "strata cpu pool: host CPU Set restoration failed: %lu\n", (unsigned long) GetLastError());
 #else
     cpu_set_t set;
     CPU_ZERO(&set);
     for (int i = 0; i < 64; ++i)
-        if ((previous >> i) & 1) CPU_SET(i, &set);
+        if ((previous.mask >> i) & 1) CPU_SET(i, &set);
     pthread_setaffinity_np(pthread_self(), sizeof set, &set);
 #endif
 }
@@ -254,10 +357,19 @@ void ExpertPool::worker(int id) {
         // every 1024 pauses, so the spin itself is unchanged.
         const auto parked_at = std::chrono::steady_clock::now();
         uint32_t spins = 0;
+        const uint64_t um = umwait_cycles(), um_esc = umwait_escalate();
+        const uint64_t um_t0 = um != 0 && um_esc != 0 ? __rdtsc() : 0;
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
-            _mm_pause();
-            if ((++spins & 1023u) != 0) continue;
+            if (um != 0) {   // STRATA_POOL_UMWAIT: wake on the publish's write to epoch_, or after `um` cycles
+                const uint64_t now = __rdtsc();
+                const unsigned st = um_esc != 0 ? (now - um_t0 < um_esc ? 1u : 0u) : umwait_state();
+                if (!umwait_unless_moved(epoch_, seen, st, now + um)) break;
+                if ((++spins & 15u) != 0) continue;   // each wait is ~um cycles: look at the clock more often
+            } else {
+                _mm_pause();
+                if ((++spins & 1023u) != 0) continue;
+            }
             if (std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
             std::unique_lock<std::mutex> lk(sleep_mu_);
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
@@ -379,20 +491,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
                 SplitBufMulti& sb = split_multi_[(size_t) e];
-                if (mode_ == 5 && nfmt_->gu_type == 42) {
-                    // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
-                    // rows r0..r1 of the layer's n_ff, which native_fmt allows up to kNativeMaxFF (as sb.ff)
-                    thread_local float gbuf[MAXT][kNativeMaxFF], ubuf[MAXT][kNativeMaxFF];
-                    float* gp[MAXT];
-                    float* up[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
-                    const int nbk = (int) (nfmt_->n_embd / 64);
-                    q2_rows_any(mjobs_[e].blob, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
-                    q2_rows_any(mjobs_[e].blob + nfmt_->up_off, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
-                    for (int t = 0; t < mjobs_[e].nt; ++t)
-                        for (int r = r0; r < r1; ++r)
-                            sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
-                } else if (mode_ == 5) {
+                if (mode_ == 5) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
                     native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
@@ -504,34 +603,8 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-const char* ExpertPool::check_multi_jobs(const NativeFmt& f, const ExpertJobMulti* jobs, int n, int& job) {
-    const bool q2_rows = f.gu_type == 42;   // drain's mode 5: the gate/up rows read the ActQ, not the native image
-    for (int e = 0; e < n; ++e) {
-        const ExpertJobMulti& j = jobs[e];
-        if (j.blob == nullptr) { job = e; return "has no blob"; }
-        if (j.nt < 1 || j.nt > MAXT) { job = e; return "has a token count outside 1..MAXT"; }
-        for (int t = 0; t < j.nt; ++t) {
-            if (j.out[t] == nullptr) { job = e; return "has a token with no output row"; }
-            if (q2_rows ? j.act[t] == nullptr : j.nact[t] == nullptr) {
-                job = e;
-                return q2_rows ? "has a token with no ActQ activation (a Q2_0 layer's gate/up rows read act, not nact)"
-                               : "has a token with no native activation";
-            }
-        }
-    }
-    return nullptr;
-}
-
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
-    int bad = -1;
-    if (const char* why = check_multi_jobs(f, jobs, n, bad)) {
-        std::fprintf(stderr, "strata: the CPU expert pool refused a native batch: job %d of %d %s (the layer's gate/up "
-                             "type %d) - stopping the engine so the server can start it again\n",
-                     bad, n, why, f.gu_type);
-        std::fflush(stderr);
-        std::abort();
-    }
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {

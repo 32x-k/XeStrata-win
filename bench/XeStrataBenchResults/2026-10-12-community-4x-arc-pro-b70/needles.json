@@ -1,0 +1,106 @@
+{
+ "method": "needle-in-a-haystack: a unique 5-digit code buried at 10/50/90% of a filler prompt, asked back with temperature 0 and a 24-token cap; one fresh-context request per cell (a full cold prefill)",
+ "cells": [
+  {
+   "size_tokens_target": 4096,
+   "depth": 0.1,
+   "code": "39567",
+   "recalled": true,
+   "prompt_tokens": 3630,
+   "prompt_ms": 3469,
+   "pp_tok_s": 1046.3,
+   "reply": "39567",
+   "wall_s": 3.5
+  },
+  {
+   "size_tokens_target": 4096,
+   "depth": 0.5,
+   "code": "33722",
+   "recalled": true,
+   "prompt_tokens": 3630,
+   "prompt_ms": 3460,
+   "pp_tok_s": 1049.0,
+   "reply": "33722",
+   "wall_s": 3.5
+  },
+  {
+   "size_tokens_target": 4096,
+   "depth": 0.9,
+   "code": "92369",
+   "recalled": true,
+   "prompt_tokens": 3630,
+   "prompt_ms": 3472,
+   "pp_tok_s": 1045.6,
+   "reply": "92369",
+   "wall_s": 3.5
+  },
+  {
+   "size_tokens_target": 32768,
+   "depth": 0.1,
+   "code": "10173",
+   "recalled": true,
+   "prompt_tokens": 28786,
+   "prompt_ms": 15979,
+   "pp_tok_s": 1801.5,
+   "reply": "10173",
+   "wall_s": 16.1
+  },
+  {
+   "size_tokens_target": 32768,
+   "depth": 0.5,
+   "code": "88827",
+   "recalled": true,
+   "prompt_tokens": 28786,
+   "prompt_ms": 15981,
+   "pp_tok_s": 1801.2,
+   "reply": "88827",
+   "wall_s": 16.1
+  },
+  {
+   "size_tokens_target": 32768,
+   "depth": 0.9,
+   "code": "42024",
+   "recalled": true,
+   "prompt_tokens": 28786,
+   "prompt_ms": 16068,
+   "pp_tok_s": 1791.5,
+   "reply": "42024",
+   "wall_s": 16.2
+  },
+  {
+   "size_tokens_target": 131072,
+   "depth": 0.1,
+   "code": "49246",
+   "recalled": true,
+   "prompt_tokens": 115016,
+   "prompt_ms": 52362,
+   "pp_tok_s": 2196.6,
+   "reply": "49246",
+   "wall_s": 52.5
+  },
+  {
+   "size_tokens_target": 131072,
+   "depth": 0.5,
+   "code": "29097",
+   "recalled": true,
+   "prompt_tokens": 115016,
+   "prompt_ms": 52409,
+   "pp_tok_s": 2194.6,
+   "reply": "29097",
+   "wall_s": 52.6
+  },
+  {
+   "size_tokens_target": 131072,
+   "depth": 0.9,
+   "code": "30706",
+   "recalled": true,
+   "prompt_tokens": 115016,
+   "prompt_ms": 52447,
+   "pp_tok_s": 2193.0,
+   "reply": "30706",
+   "wall_s": 52.6
+  }
+ ],
+ "recalled": 9,
+ "total": 9
+}

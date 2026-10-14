@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/graph.hpp - P2.S5: the GraphRegistry.
 //
 // `GraphRegistry`: capture/replay wrappers keyed by `(layer_type, n_tokens)`, with static input/output
@@ -74,9 +74,9 @@ public:
     bool launch(void* stream, std::string& err) const;
 
     /// The host loop's wait: poll `done_` until it completes or `timeout_ms` elapses.  Returns false on
-    /// timeout, which the caller must treat as a hang and not as "probably fine".  See NOTE 1 above for why
-    /// this exists instead of a memory spin.
-    bool wait_ms(int timeout_ms) const;
+    /// timeout or a failed query, `err` saying which, which the caller must treat as a hang and not as "probably
+    /// fine".  See NOTE 1 above for why this exists instead of a memory spin.
+    bool wait_ms(int timeout_ms, std::string& err) const;
 
     size_t nodes() const { return nodes_; }
     bool valid() const { return exec_ != nullptr; }

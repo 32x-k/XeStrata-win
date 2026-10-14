@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
 #include "strata/kernels/cpu/expert_layout.hpp"
 
@@ -9,7 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#if defined(_WIN32)
+#if defined(_MSC_VER)
 #include <intrin.h>
 #else
 #include <cpuid.h>
@@ -96,20 +96,20 @@ bool cpu_avxvnni_ok() {
         if (const char* e = std::getenv("STRATA_NO_AVXVNNI"); e != nullptr && e[0] == '1') return false;
         if (!cpu_avx2_ok()) return false;
         unsigned a = 0, b = 0, c = 0, d = 0;
+        auto cpuid = [&](unsigned leaf, unsigned sub) {
 #if defined(_MSC_VER)
-        int x[4];
-        __cpuidex(x, 0, 0); a = (unsigned) x[0]; b = (unsigned) x[1]; c = (unsigned) x[2]; d = (unsigned) x[3];
-        if (a < 7) return false;
-        __cpuidex(x, 7, 0); a = (unsigned) x[0]; b = (unsigned) x[1]; c = (unsigned) x[2]; d = (unsigned) x[3];
-        if (a < 1) return false;
-        __cpuidex(x, 7, 1); a = (unsigned) x[0]; b = (unsigned) x[1]; c = (unsigned) x[2]; d = (unsigned) x[3];
+            int x[4];
+            __cpuidex(x, (int) leaf, (int) sub);
+            a = (unsigned) x[0], b = (unsigned) x[1], c = (unsigned) x[2], d = (unsigned) x[3];
 #else
-        __cpuid_count(0, 0, a, b, c, d);
-        if (a < 7) return false;
-        __cpuid_count(7, 0, a, b, c, d);
-        if (a < 1) return false;                           // no sub-leaf 1
-        __cpuid_count(7, 1, a, b, c, d);
+            __cpuid_count(leaf, sub, a, b, c, d);
 #endif
+        };
+        cpuid(0, 0);
+        if (a < 7) return false;
+        cpuid(7, 0);
+        if (a < 1) return false;                           // no sub-leaf 1
+        cpuid(7, 1);
         return ((a >> 4) & 1u) != 0;                       // AVX-VNNI
     }();
     return ok;

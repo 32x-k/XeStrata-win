@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """One command that measures this Strata install the way it is used, and writes a report you can share.
 
 XeStrata: upstream Strata's benchmark mode (v0.1.43), kept as it is so a report compares with upstream's community
@@ -29,7 +29,7 @@ first token and latency are measured by this client.  Thinking is off for the su
 answers are short and the runs comparable.  The default run takes about 3-10 minutes after the model has loaded (the
 slower the card, the longer).
 
-The result goes to bench/results/<date>-community-<gpu>-<model>/ : README.md in the format of
+The result goes to bench/XeStrataBenchResults/<date>-community-<gpu>-<model>/ : README.md in the format of
 docs/COMMUNITY_BENCHMARKS.md, results.json (every request) and an engine log excerpt.  Home folders, user and host
 names, IP addresses and API keys are replaced by placeholders before anything is written; read it once before you share
 it. `--compare <older results folder>` prints the two side by side.  Standard library only.
@@ -586,7 +586,29 @@ def git_commit() -> str | None:
     return out or None
 
 
-def collect_machine(base: str, key: str, cfg: dict | None) -> dict:
+def gpu_selection(cfg: dict | None, gpu_arg: str | None = None) -> list[int]:
+    """#1985: the GPU numbers (as nvidia-smi numbers them) the engine is told to use: the bench's --gpu when it starts
+    the server, else the config's "gpu" (one card, a list or "0,2"), else a "--gpu" in the config's args.  [] when
+    nothing says."""
+    def parse(v):
+        if v is None or v == "":
+            return []
+        items = v if isinstance(v, (list, tuple)) else str(v).split(",")
+        out = []
+        for x in items:
+            x = str(x).strip()
+            if x.isdigit():
+                out.append(int(x))
+        return out
+    sel = parse(gpu_arg) or parse((cfg or {}).get("gpu"))
+    if not sel:
+        args = [str(x) for x in ((cfg or {}).get("args") or [])]
+        if "--gpu" in args and args.index("--gpu") + 1 < len(args):
+            sel = parse(args[args.index("--gpu") + 1])
+    return sel
+
+
+def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None = None) -> dict:
     status = try_json(base, "/v1/status", key) or {}
     metrics = try_json(base, "/metrics", key, 30) or {}
     props = try_json(base, "/props", key) or {}
@@ -595,18 +617,34 @@ def collect_machine(base: str, key: str, cfg: dict | None) -> dict:
     eng = metrics.get("engine") or {}
     local = gpu_info_local()
     view = config_view(cfg) if cfg else {}
-    gpu_names = [g["name"] for g in local["gpus"]] or ([static["gpu_name"]] if static.get("gpu_name") else [])
+    # #1985: only the GPUs the engine uses - the config's / --gpu selection; with none given the engine runs on one card
+    # (the one the server reports), not on every card the PC has
+    used = local["gpus"]
+    sel = gpu_selection(cfg, gpu_arg)
+    if sel:
+        used = [local["gpus"][i] for i in sel if 0 <= i < len(local["gpus"])] or used
+    elif len(used) > 1 and static.get("gpu_name"):
+        named = [g for g in used if g["name"] == static["gpu_name"]]
+        used = named[:1] or used[:1]
+    gpu_names = [g["name"] for g in used] or ([static["gpu_name"]] if static.get("gpu_name") else [])
     m = status.get("machine") or {}
     vram_mib = (m.get("gpu") or {}).get("total_mib") or None
-    if local["gpus"] and local["gpus"][0].get("vram_mib"):
-        vram_mib = sum(g.get("vram_mib") or 0 for g in local["gpus"])
+    # #2001: the server names the cards it reads (" + " between them).  A name nvidia-smi does not list means the
+    # engine runs on another vendor's card (an Intel Arc beside a GeForce): the server's names are the right ones, and
+    # so is its VRAM total - the PC's NVIDIA cards were not used.
+    served = [n for n in (static.get("gpu_name") or "").split(" + ") if n and n != "?"]
+    if served and not all(n in {g["name"] for g in local["gpus"]} for n in served):
+        gpu_names, used = served, []
+        local = {**local, "cuda": None}            # the PC's CUDA belongs to cards the engine did not use
+    elif used and used[0].get("vram_mib"):
+        vram_mib = sum(g.get("vram_mib") or 0 for g in used)
     n_ctx = None
     for d in models.get("data") or []:
         n_ctx = (d.get("meta") or {}).get("n_ctx") or n_ctx
     n_ctx = n_ctx or (props.get("default_generation_settings") or {}).get("n_ctx")
     return {
         "gpu": gpu_names, "gpu_vram_mib": vram_mib,
-        "gpu_driver": (local["gpus"][0].get("driver") if local["gpus"] else local.get("rocm_driver")),
+        "gpu_driver": (used[0].get("driver") if used else local.get("rocm_driver")),
         "cuda": local.get("cuda"), "cpu": static.get("cpu_name") or cpu_name(), "cpu_cores": static.get("cores"),
         "cpu_threads": static.get("threads") or os.cpu_count(), "ram_gib": total_ram_gib(),
         "os": f"{platform.system()} {platform.release()} ({platform.version()})" if os.name == "nt"
@@ -646,7 +684,35 @@ def is_strata(base: str, key: str) -> bool:
     return bool(h and h.get("service") == "strata")
 
 
+def without_profile_save(cfg: dict) -> tuple[dict, bool]:
+    """#2088: the config without `--expert-profile-save FILE` (and its value) - the engine writes that profile when the
+    server quits, and a benchmark's short prompts must not replace the user's calibrated one.  -> (config, removed)."""
+    args = list(cfg.get("args") or [])
+    out, i, removed = [], 0, False
+    while i < len(args):
+        if args[i] == "--expert-profile-save":
+            i, removed = i + 2, True
+        elif isinstance(args[i], str) and args[i].startswith("--expert-profile-save="):
+            i, removed = i + 1, True
+        else:
+            out.append(args[i])
+            i += 1
+    return ({**cfg, "args": out} if removed else cfg), removed
+
+
 def start_server(cfg_path: Path, port: int, gpu: str | None, log_path: Path):
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        cfg = None
+    if isinstance(cfg, dict):
+        safe, removed = without_profile_save(cfg)
+        if removed:                       # a copy beside the log: the user's config file is not touched
+            print("Note: the bench starts this model without --expert-profile-save, so its short prompts do not "
+                  "overwrite your saved expert profile.", file=sys.stderr)
+            tmp = log_path.with_suffix(".config.json")
+            tmp.write_text(json.dumps(safe), encoding="utf-8")
+            cfg_path = tmp
     cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
            "--port", str(port)]
     if gpu:
@@ -701,9 +767,19 @@ def gpu_slug(machine: dict) -> str:
     names = machine.get("gpu") or []
     if not names:
         return "cpu"
-    n = re.sub(r"(?i)\b(nvidia|geforce|amd|radeon|intel|graphics|corporation)\b", " ", names[0])
-    s = slug(n, 30)
-    return s if len(names) == 1 else f"{len(names)}x-{s}"
+    # #2062: the cards one by one when they differ (rtx-5070-ti-plus-rtx-a4000), "2x-" only for identical ones
+    groups: list[list] = []                              # [name, count], in the order the cards are listed
+    for name in names:
+        same = next((g for g in groups if g[0] == name), None)
+        if same:
+            same[1] += 1
+        else:
+            groups.append([name, 1])
+    parts = []
+    for name, count in groups:
+        n = re.sub(r"(?i)\b(nvidia|geforce|amd|radeon|intel|graphics|corporation)\b", " ", name)
+        parts.append(slug(n, 30) if count == 1 else f"{count}x-{slug(n, 30)}")
+    return "-plus-".join(parts)[:80].strip("-")
 
 
 def model_label(machine: dict) -> str:
@@ -894,8 +970,8 @@ def main(argv=None) -> int:
     ap.add_argument("--clients", type=int, default=0, metavar="N", help="also send N requests at once")
     ap.add_argument("--long", action="store_true", help="also a prompt of about 32,768 tokens")
     ap.add_argument("--think", action="store_true", help="leave thinking on (the default suite turns it off)")
-    ap.add_argument("--out", help="where to write the results folder (default: bench/results; xestrata passes the data "
-                                  "folder's records/)")
+    ap.add_argument("--out", help="where to write the results folder (default: bench/XeStrataBenchResults; xestrata "
+                                  "passes the data folder's records/)")
     ap.add_argument("--compare", metavar="DIR", help="a results folder (or its results.json) to put beside this run")
     ap.add_argument("--compare-only", metavar="NEW", help="print --compare of two existing results folders and stop")
     ap.add_argument("--ready-timeout", type=float, default=1800, help="seconds to wait for the model to load")
@@ -958,7 +1034,7 @@ def main(argv=None) -> int:
                 print("The server did not become ready. Last log lines:\n" + red("\n".join(tail)), file=sys.stderr)
                 return 1
         t0 = time.time()
-        pre = collect_machine(base, key, cfg)
+        pre = collect_machine(base, key, cfg, a.gpu)
         suite = Suite(base, key, pre.get("context"), max(1, a.runs), a.think, log=say, want_clients=a.clients,
                       want_long=a.long)
         slots = pre.get("parallel_slots") or 1
@@ -967,7 +1043,7 @@ def main(argv=None) -> int:
                 "wait their turn.")
         say("Running the suite (about 3-10 minutes) ...")
         out = suite.run()
-        machine = collect_machine(base, key, cfg)             # again: VRAM and the cache after the work
+        machine = collect_machine(base, key, cfg, a.gpu)      # again: VRAM and the cache after the work
         if not machine.get("gpu"):
             machine["gpu"] = pre.get("gpu")
         res = {"schema": SCHEMA, "tool": "tools/strata_bench.py", "date": datetime.date.today().isoformat(),
@@ -978,7 +1054,7 @@ def main(argv=None) -> int:
                                                 "--long" if a.long else "", "--think" if a.think else "",
                                                 f"--runs {a.runs}" if a.runs != 3 else "") if x)},
                "elapsed_s": time.time() - t0, "machine": machine, "results": out}
-        parent = Path(a.out) if a.out else ROOT / "bench" / "results"
+        parent = Path(a.out) if a.out else ROOT / "bench" / "XeStrataBenchResults"
         d = write_results(res, parent, red, log_excerpt(log_path) if log_path else [])
         say("\nResults (median, range over the runs):")
         say(red(short_table(res)))

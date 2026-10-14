@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/qsa_prompt_attn.cpp - the prompt attention entry point (qsa_prompt_attn.hpp) on Xe's matrix engines.
 //
 // The scheme of Strata's CUDA kernel (src/kernels/cuda/qsa_prompt_attn.cu, its "v2"), on SYCL joint_matrix:

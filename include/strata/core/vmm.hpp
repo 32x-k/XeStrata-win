@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/vmm.hpp - virtual memory for the elastic K/V (--kv-grow, upstream 9e3dbfe7): an address range
 // reserved once, whose physical memory is mapped and unmapped in chunks of the device's granularity.  The K/V pools
 // grow with the context by taking chunks the expert cache gives up, and neither moves: every captured graph and stored

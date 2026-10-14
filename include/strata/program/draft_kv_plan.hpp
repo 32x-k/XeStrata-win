@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/program/draft_kv_plan.hpp - which code computes the draft layer's prompt K/V for a chunk.
 //
 // One GPU: the prompt path's batched pass (E-9, `Prefill::draft_kv`) tries first and the drafter's own

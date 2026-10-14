@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-FileCopyrightText: 2023-2026 The ggml authors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/rope.cpp - the Xe ports of Strata's src/kernels/cuda/rope.cu (NEOX partial RoPE over a host-built table)
 // and Strata's src/kernels/cuda/native_rope.cu (the pinned ggml text IMRoPE), with the M-RoPE table they share.
 //

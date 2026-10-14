@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/expert_source.hpp - P2.S3/P2.S5: the expert pool's adapter to the host loop.
 //
 // `session_loop` publishes, per layer, the NORMED activation `x_f`, the ten routed expert ids and their router
@@ -192,6 +192,9 @@ public:
     /// A layer split: makes the blobs copy fast to engine device `device` as well (see PinnedArena::register_on).
     /// True when there is nothing to do; false (and `err`) when the device refuses, the copies then being slower.
     virtual bool register_on(int device, std::string& err) { (void) device; (void) err; return true; }
+    /// Whether every blob device_alias names is registered on engine device `device` (register_on), which a CUDA or
+    /// HIP GPU's kernels then read in place (gpu::kernels_read_host).
+    virtual bool registered_on(int device) const { (void) device; return false; }
     /// Disk sessions: the files this source read its experts from, as (role, path), resolved by the loader itself
     /// - the pack's experts.bin, or every GGUF tensor native_experts.txt named, per layer and role
     /// ("expert blk.L.ffn_up").  Filled by open(); empty before.
@@ -353,8 +356,8 @@ struct ExpertDispatch {
     /// Plan v0.3 P6 verify window: one quantized activation per token, the multi-token jobs, and the expert ->
     /// job map (reset after every layer).
     std::vector<strata::kernels::cpu::ActQ> act_multi;
-    /// Plan v0.3 P6: a native pack's per-token activations (MAXT x kNativeActBytes).
-    std::vector<uint8_t> nact_multi;
+    /// Plan v0.3 P6: a native pack's per-token activations (MAXT).
+    std::vector<strata::kernels::cpu::NativeAct> nact_multi;
     std::vector<strata::kernels::cpu::ExpertJobMulti> jobs_multi;
     std::vector<int16_t> job_of;
     /// Plan v0.3 P6: the verify window's GPU plan (VRAM hits + the PCIe share of the misses); `pcie_num`/256 of
@@ -468,6 +471,11 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
 /// token - which is the only way they get debugged before speed matters.
 class FileExpertSource : public ExpertSource {
 public:
+    /// A layer split: the RAM copy (the complement) and the exchange buffers registered on engine device `device`, so
+    /// that a CUDA or HIP GPU's PCIe share reads them in place.  Done once they exist (after pin_cache_complement and
+    /// reserve_exchanges); released by close().
+    bool register_on(int device, std::string& err) override;
+    bool registered_on(int device) const override;
     FileExpertSource() = default;
     ~FileExpertSource() override;
     FileExpertSource(const FileExpertSource&) = delete;
@@ -706,6 +714,7 @@ private:
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
     std::vector<Exchange> staged_;
     uint8_t* xstage_ = nullptr;               ///< exchange buffers, `xstage_cap_ x xstage_blob_`
+    std::vector<std::pair<int, std::vector<void*>>> stage_reg_;   ///< register_on: a device, its registrations
     bool xstage_pinned_ = false;
     int64_t xstage_cap_ = 0;
     uint64_t xstage_blob_ = 0;
@@ -734,6 +743,7 @@ private:
 class ArenaExpertSource : public ExpertSource {
 public:
     bool register_on(int device, std::string& err) override;
+    bool registered_on(int device) const override;
     ArenaExpertSource() = default;
     ~ArenaExpertSource() override;
     ArenaExpertSource(const ArenaExpertSource&) = delete;
@@ -750,6 +760,9 @@ public:
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     const uint8_t* blob(int64_t layer, int64_t expert) override;
+    /// `blob` without the read counter: a pointer into the arena, safe from another thread (the asynchronous adaptive
+    /// tier's job thread, which must not touch the non-atomic `reads_`)
+    const uint8_t* blob_at(int64_t layer, int64_t expert) const;
     int64_t reads() const override { return reads_; }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;

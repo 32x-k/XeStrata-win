@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/verify_kernels.cpp - the Xe port of Strata's src/kernels/cuda/verify_kernels.cu (see verify_kernels.hpp):
 // the verify window's multi-token GDN kernels, the resident-expert plan, the flag waits on host-mapped memory, and
 // the small gathers, copies and selections around them.
@@ -132,6 +132,30 @@ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32
     });
     done(stream, e, "gdn_conv_commit");
 }
+
+namespace {
+// gdn_conv_commit for `n_layers` layers in one launch (gdn_commit_layers)
+void gdn_conv_commit_layers(float* hist0, int64_t hist_stride, const float* qkv0, int64_t qkv_stride, int channels,
+                            int n_layers, const int32_t* n_keep, void* stream) {
+    const int C = channels;
+    const auto e = Q(stream).parallel_for(sycl::range<2>((size_t) n_layers, (size_t) C), [=](sycl::id<2> id) {
+        const int c = (int) id[1];
+        const int n = *n_keep;
+        if (n <= 0) return;
+        float* history = hist0 + (size_t) id[0] * (size_t) hist_stride;
+        const float* qkv = qkv0 + (size_t) id[0] * (size_t) qkv_stride;
+        float seq[3];
+        for (int j = 0; j < 3; ++j) {
+            const int src = n + j;   // the last three of [hist(3) | x_0..x_{n-1}], as gdn_conv_commit
+            seq[j] = src < 3 ? history[(size_t) c * 3 + src] : qkv[(size_t) (src - 3) * C + c];
+        }
+        history[(size_t) c * 3] = seq[0];
+        history[(size_t) c * 3 + 1] = seq[1];
+        history[(size_t) c * 3 + 2] = seq[2];
+    });
+    done(stream, e, "gdn_conv_commit_layers");
+}
+}  // namespace
 
 namespace {
 // gdn_ab_multi for at most MAX_T tokens; EXACT: exactly MAX_T (the token loop fixed at compile time, upstream ae3b249f).
@@ -305,15 +329,24 @@ namespace {
 // upstream's gdn_step_commit_kernel: the commit's state only, without the outputs the window's forms also compute (the
 // queries, the second reduction and its two barriers a token).  The split's work-items and the same state arithmetic in
 // the same order, so the state is every form's bit for bit.
-sycl::event gdn_state_commit(sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
-                             int h_k, int h_v, const int32_t* n_keep) {
+// `n_layers` layers in one launch (the commit's layers, upstream 6f3e3810): layer z's state at state + z * state_stride,
+// its rows at hbuf + z * h_stride and gate|beta + z * gb_stride; each layer's work-groups as its own launch's.
+sycl::event gdn_state_commit(sycl::queue& q, float* state0, const float* hbuf0, int C, const float* gate0,
+                             const float* beta0, int h_k, int h_v, const int32_t* n_keep, int n_layers = 1, int64_t state_stride = 0,
+                             int64_t h_stride = 0, int64_t gb_stride = 0) {
     return q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), red(sycl::range<1>((size_t) RG * GS_COLS), hd);
-        hd.parallel_for(sycl::nd_range<1>((size_t) h_v * (S / GS_COLS) * GS_COLS * RG, (size_t) GS_COLS * RG),
+        const int per_layer = h_v * (S / GS_COLS);
+        hd.parallel_for(sycl::nd_range<1>((size_t) n_layers * per_layer * GS_COLS * RG, (size_t) GS_COLS * RG),
                         [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const int n = *n_keep;
             if (n <= 0) return;   // the whole launch
-            const int grp = (int) it.get_group(0), head = grp / (S / GS_COLS), c0 = (grp % (S / GS_COLS)) * GS_COLS;
+            const int z = (int) it.get_group(0) / per_layer;
+            float* state = state0 + (size_t) z * (size_t) state_stride;
+            const float* hbuf = hbuf0 + (size_t) z * (size_t) h_stride;
+            const float* gate = gate0 + (size_t) z * (size_t) gb_stride;
+            const float* beta = beta0 + (size_t) z * (size_t) gb_stride;
+            const int grp = (int) it.get_group(0) % per_layer, head = grp / (S / GS_COLS), c0 = (grp % (S / GS_COLS)) * GS_COLS;
             const int tid = (int) it.get_local_id(0), lc = tid % GS_COLS, rg = tid / GS_COLS, col = c0 + lc;
             const int qh = head % h_k;
             const int qk = S * h_k;
@@ -664,6 +697,25 @@ void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* ga
     done(stream, gdn_step_form(form, q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin,
                                static_cast<uint8_t*>(y_q8_1)),
          "gdn_step_norm_multi");
+}
+
+bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
+                       const float* h, int64_t h_stride, const float* gate, const float* beta, int64_t gb_stride,
+                       int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream) {
+    // only the per-layer commit's state-only kernel is batched (gdn_step_norm_multi above): its other choices keep the loop
+    static const bool per_layer = [] {
+        const char* cs = std::getenv("STRATA_GDN_COMMIT_SPLIT");
+        const char* dbg = std::getenv("STRATA_DBG_GDN");
+        return (cs != nullptr && std::strtol(cs, nullptr, 10) == 0) || (dbg != nullptr && dbg[0] == '1');
+    }();
+    if (per_layer || n_layers <= 0 || n_max < 1 || n_max > kVerifyMaxT || n_keep == nullptr || h_v <= 0 || h_k <= 0 ||
+        h_v % h_k != 0)
+        return false;
+    gdn_conv_commit_layers(state + conv_off, state_stride, qkv, qkv_stride, conv_channels, n_layers, n_keep, stream);
+    done(stream, gdn_state_commit(Q(stream), state, h, conv_channels, gate, beta, h_k, h_v, n_keep, n_layers, state_stride,
+                                  h_stride, gb_stride),
+         "gdn_commit_layers");
+    return true;
 }
 
 #if !defined(STRATA_ADAPTIVECPP)

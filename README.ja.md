@@ -1,7 +1,7 @@
 <!--
 SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-SPDX-License-Identifier: LGPL-3.0-or-later
+SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 -->
 # XeStrata
 
@@ -13,7 +13,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 このブランチは、XeStrata を Windows 11 で AMD の GPU を使って動かすための移植です。
 intel/llvm（DPC++）を Windows の上で HIP のターゲットだけでビルドし、XeStrata を free モードでコンパイルします。
-本家の更新は取り込みながら進めていて、今は xe0.1.43.1 までを含みます。
+本家の更新は取り込みながら進めていて、今は本家の main（上流 Strata 0.1.44.1 を取り込んだもの、2026-10-14）までを含みます。
 
 ### していること
 
@@ -151,7 +151,7 @@ Strata との主な違い:
 - **Intel Arc 向け**で、AMD と NVIDIA の GPU でも動きます。
 - **GPU は 1 枚が基本**です。同じ PC の 2 枚以上の GPU に層を分けて載せることもできます（[MULTIGPU](docs/MULTIGPU.ja.md)）。
   Intel・AMD・NVIDIA のメーカーの違う GPU も組み合わせられます（例: Intel Arc の Battlemage と NVIDIA の Ada。NVIDIA を含むときは contrib-llvm のビルド）。
-- **Linux だけ**です。Windows には対応しません。WSL 2 は動くかもしれません（プルリクエスト歓迎）。
+- **Linux と Windows** で動きます。Windows は Intel と NVIDIA の GPU で、AMD の GPU は Linux だけです（[Windows](#windows)）。WSL 2 は動くかもしれません（プルリクエスト歓迎）。
 - **自由ソフトウェアだけでも動きます**（free のビルド、Debian main に入れられる程度に自由な構成。[ソースから作ります](docs/BUILD.ja.md#deb-と-rpm-のパッケージ)）。
   配っている contrib-llvm の版は、自由ソフトウェアでない Intel の oneMKL と NVIDIA の cuBLAS を、入っていれば使います（[インストール](#インストール)）。
 
@@ -163,13 +163,13 @@ Strata との主な違い:
 | CPU | x86-64 で AVX2 があるもの。AVX-512（F、BW、VL、VNNI、VBMI）があれば、CPU の計算に AVX-512 を使います。 |
 | RAM | モデルの大きさによって 32〜62 GB（[モデルの選び方](#モデルの選び方)）。 |
 | ディスク | モデルに 60〜110 GB ほど、ほかに MTP 層に約 6 GB。SSD（NVMe）を強く勧めます。 |
-| OS | Linux（WSL 2 は動くかもしれません。プルリクエスト歓迎）。パッケージは Ubuntu 26.04 と Fedora 44 向けです。ほかのディストリビューションでは[ソースから入れます](docs/BUILD.ja.md#ソースから入れる)。 |
+| OS | Linux（WSL 2 は動くかもしれません。プルリクエスト歓迎）。パッケージは Ubuntu 26.04 と Fedora 44 向けです。ほかのディストリビューションでは[ソースから入れます](docs/BUILD.ja.md#ソースから入れる)。Windows 10 と 11（x64）は 7z で配ります（[Windows](#windows)）。 |
 | BIOS | 単体の GPU では Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
 
 - **行列エンジン**: Intel の XMX、AMD の WMMA（RDNA3 以降）、NVIDIA の Tensor Core を使い、ない GPU では DP4a などの整数の内積の命令で計算します。
   どれを使うかは、GPU が報告する能力で決めます。行列エンジンがないと prefill が遅くなりますが、動きます。
 - **確かめた GPU**: 開発と確認は Arc Pro B70（Xe2、32 GB）で行っています。NVIDIA は RTX 4070 と RTX 3070、AMD は RX 9060 XT（RDNA4）で確かめています。
-  Arc A380 では計算の正しさだけを確かめ、モデルは動かしていません。
+  Arc A380 では計算の正しさだけを確かめ、モデルは動かしていません。Windows は RTX 3050 Laptop（4 GB）で確かめています。
   小さな GPU は、B70 で使えるメモリと XMX を制限して確かめています。
 - **CPU 内蔵のグラフィックス**: 起動と prefill までを確かめています。メモリが RAM と共有で、
   XMX のないものが多いので、遅くなります。
@@ -206,8 +206,9 @@ AMD の GPU では、prefill の密な行列積をディストリビューショ
 | **[Qwen3.8-Flash-Next](#qwen38-flash-next)** | 1,250 億 | 32〜62 GB | 12 GB 以上を勧めます | いちばん賢い。RAM の多い PC 向け |
 | **[Ornith-1.5](#ornith-15beta)**（BETA） | 350 億（1 トークンで 30 億） | 22〜80 GB | 4 GB から | RAM の少ない PC 向け |
 | **[llm-jp-4.1](#llm-jp-41beta)**（BETA） | 320 億（1 トークンで 30 億） | 30〜73 GB | 4 GB から | 日本語と英語の思考するモデル |
+| **[Qwen3.6-35B-A3B](#qwen36-35b-a3bbeta)**（BETA） | 350 億（1 トークンで 30 億） | 31〜46 GB | 4 GB から | 思考するモデル。RAM の少ない PC 向け |
 
-BETA の 2 つは、画像、2 枚以上の GPU、Intel の CPU 内蔵の GPU にまだ対応していません（[詳細](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41)）。
+BETA の 3 つは、画像、2 枚以上の GPU、Intel の CPU 内蔵の GPU にまだ対応していません（[詳細](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41qwen36-35b-a3b)）。
 
 迷ったら、RAM が 48 GB 以上の PC では Qwen3.8-Flash-Next の **IQ2_XS** を選んでください。
 RAM がそれより少ない PC では、Qwen3.8-Flash-Next の Coder（32 GB）か Ornith-1.5 が選べます。
@@ -273,10 +274,44 @@ GSQ-RCO の 2 つは、pfeifferj による[コミュニティの再現](https://
 | Q4_K_M | 21.5 GB | 30 GB | 4 GB から |
 | BF16 | 64.3 GB | 73 GB | 8 GB から |
 
-BETA の 2 つの RAM の目安は、ダウンロードの大きさに約 8 GB を足したものです。
+### Qwen3.6-35B-A3B（BETA）
+
+[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)（Qwen、Apache-2.0。GGUF は Unsloth が MTP の層付きで作ったもの）: Qwen3.5 系の思考する MoE で、文脈は 256K までです。
+モデルの MTP の層で下書きを作り、decode を速くします。
+
+| 大きさ | ダウンロード | RAM の目安 | VRAM |
+| --- | ---: | ---: | ---: |
+| UD-Q4_K_XL | 22.9 GB | 31 GB | 4 GB から |
+| UD-Q6_K_XL | 32.6 GB | 41 GB | 6 GB から |
+| Q8_0 | 37.8 GB | 46 GB | 6 GB から |
+
+BETA の 3 つの RAM の目安は、ダウンロードの大きさに約 8 GB を足したものです。
 RAM がそれより少ないと、エキスパートを RAM に読み込まずにモデルのファイルから読むので、遅くなります。
 
 ## インストール
+
+### Podman
+
+ホストに入れるのは Podman と podman-compose だけです。XeStrata は Fedora 44 のコンテナの中に、Releases の rpm から入ります（rootless）。
+
+```bash
+git clone https://github.com/MistVVK/XeStrata && cd XeStrata/container
+mkdir -p ~/.config/xestrata ~/.local/state/xestrata ~/.local/share/xestrata
+podman compose build                         # 最新のリリースと GPU のライブラリを入れたイメージを作ります
+podman compose run --rm xestrata --setup     # 質問に答えてモデルを取ってきます
+podman compose up -d                         # http://127.0.0.1:8095（止めるときは podman compose down）
+```
+
+- **GPU**: Intel はこのままです。AMD は `-f compose.yaml -f compose.amd.yaml`、NVIDIA は `-f compose.yaml -f compose.nvidia.yaml` を
+  `podman compose` の後に付けます（`export COMPOSE_FILE=compose.yaml:compose.nvidia.yaml` でも同じです）。
+  NVIDIA はホストに NVIDIA Container Toolkit の CDI の設定が要ります（[docs/BUILD.ja.md](docs/BUILD.ja.md#podman)）。
+  コンテナの中は cuda13.4 なので、Pascal と Volta（P100、P40、GTX 10 シリーズ、V100 など）は使えません。
+- **ホストに要るもの**: GPU のドライバーと、自分が render グループに入っていること（`sudo usermod -aG render $USER`）です。
+- **置き場所**: 設定・ログ・モデルのファイルはホストの同じ場所（下のパッケージと同じ）を使うので、パッケージ版とコンテナを入れ替えても、そのまま使えます。
+- **ほかのコマンド**: `podman compose run --rm xestrata --bench`、`--calibrate`、`chat` のように、`xestrata` の後に付けるものを並べます。
+- **更新**: `podman compose build --pull --no-cache` で最新のリリースを入れ直し、`podman compose up -d` で起動し直します。
+
+### deb と rpm のパッケージ
 
 1. GPU に合うパッケージを下の表から選んで、[GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) から取ってきます（`SHA256SUMS` も一緒に）。
 1. `sha256sum -c SHA256SUMS --ignore-missing` で確かめます。
@@ -346,6 +381,17 @@ sudo dnf remove xestrata-contrib-cuda13.4    # Fedora（同じ）
 
 ソースから `./setup.sh` で入れる方法は [docs/BUILD.ja.md](docs/BUILD.ja.md#ソースから入れる) にあります。
 
+### Windows
+
+1. [GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) から `XeStrata-<版>-windows-x64.7z` を取ってきて（`SHA256SUMS` も一緒に）、好きなフォルダーに展開します。
+1. `xestrata.exe` を起動します。導入（GPU とモデルの選択、ダウンロード）と起動を画面で進めます。端末で使うときは `xestrata-cli.exe`（Linux の `xestrata` と同じ使い方）です。
+
+- **要るもの**: [.NET 10 のランタイム](https://dotnet.microsoft.com/download/dotnet/10.0)と [Visual C++ の再頒布可能パッケージ](https://aka.ms/vs/17/release/vc_redist.x64.exe)、GPU のドライバー。
+  Visual C++ の再頒布可能パッケージがなければ、`xestrata.exe` が知らせて止まります。
+- **GPU**: Intel と NVIDIA です（NVIDIA は Pascal 以降、cuda12.4 のパッケージと同じコード）。AMD の GPU は Windows ではまだ使えません。
+- **置き場所**: 7z のフォルダーには書き込みません。設定は `%APPDATA%\xestrata`、ログなどは `%LOCALAPPDATA%\xestrata`、モデルはデータのフォルダー（既定は `%LOCALAPPDATA%\xestrata\data`）に置きます。
+- **更新**: 新しい 7z を別のフォルダーに展開して、そちらの `xestrata.exe` を起動します。設定とモデルはそのまま使います。
+
 ## 使い方
 
 - **ブラウザ**: `http://127.0.0.1:8095`（モデルが起動すると自動で開きます）。**Chat**、モデルと GPU・CPU・RAM の様子を
@@ -403,8 +449,11 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 会話が、選んだ文脈の長さより長くなっています。新しい会話を始めるか、`xestrata --setup` で長い文脈を選び直してください。
 
 **解決しないとき**
-[詳しい対処の表](docs/DETAILS.ja.md#困ったとき)を見てください。それでも解決しなければ
-[issue](https://github.com/MistVVK/XeStrata/issues) を立て、`~/.local/state/xestrata/xestrata-<モデル>.log` を添付してください。
+[詳しい対処の表](docs/DETAILS.ja.md#困ったとき)を見てください。
+端末を操作できる LLM エージェントには、[復旧と原因調査の指示書](docs/DIAGNOSE.ja.md)と症状を渡せます。
+ソース版と deb/rpm 版の両方に対応し、復旧できた場合も、詰まった場合も、原因と根拠を報告します。
+開発者の対応が必要なら、秘密や個人情報を除いた報告を添えて [issue](https://github.com/MistVVK/XeStrata/issues) を立ててください。
+エンジンのログの場所は、実際に使っているモデルの設定の `log` で確認できます。
 
 ## しくみ
 
@@ -428,6 +477,8 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 [docs/XE.ja.md](docs/XE.ja.md) にあります。
 
 ## 開発する人へ
+
+報告やプルリクエストを送る前に、[CONTRIBUTING.ja.md](CONTRIBUTING.ja.md)（型番に依存しないこと、ライセンス、GPL 第 7 条の追加の許可、取り込む変更の条件、報告の仕方）を読んでください。
 
 - **ビルド**: ソースから入れる方法、ビルドの 3 つの方式（free、contrib-llvm、contrib-icpx）、setup の振る舞いと要るパッケージ、
   deb と rpm のパッケージの作り方は [docs/BUILD.ja.md](docs/BUILD.ja.md) にあります。
@@ -460,6 +511,9 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
      CMake が XeStrata の変更の入ったフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、同じライセンス）から取得します。
    - [intel/llvm](https://github.com/intel/llvm) の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib-llvm のコンパイラ。
      XeStrata の修正（`third_party/main/intel-llvm/patches/`、同じライセンス）を当ててビルドし、パッケージにはその SYCL の実行時を入れます。
+   - AMD による [ROCm のデバイスライブラリ](https://github.com/ROCm/llvm-project/tree/rocm-7.2.4/amd/device-libs)（University of Illinois/NCSA）:
+     intel/llvm と一緒にビルドし、AMD の GPU 向けのコードがリンクします。
+     そのビルドに渡す機能の指定は、Debian の [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) のパッケージ（Expat）の `debian/rules` から写しました。
    - 画面のフォント [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1）。
 - **参考にした考え方**:
    - Inco AI と Splash の貢献者による [Splash](https://github.com/incoai/splash)。
@@ -474,11 +528,14 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフトウェアで、全体を
 [GNU Lesser General Public License の第 3 版以降](COPYING.LESSER)（`COPYING.LESSER` と `COPYING`）で配布します。
 
-- **メーカーの計算ライブラリとのリンク**: GPU や CPU のメーカーが自社の製品向けに出している計算ライブラリとその実行時ライブラリ
-  （oneMKL や Intel oneAPI のコンパイラの実行時ライブラリ、cuBLAS や CUDA のランタイムとドライバなど）とリンクしたものも配布できます。
+- **メーカーの計算ライブラリと OS のランタイムとのリンク**: GPU や CPU のメーカーが自社の製品向けに出している計算ライブラリとその実行時ライブラリ
+  （oneMKL や Intel oneAPI のコンパイラの実行時ライブラリ、cuBLAS や CUDA のランタイムとドライバなど）、
+  OS とその標準のコンパイラの C・C++ の実行時ライブラリ（Microsoft の Universal C Runtime や Visual C++ の実行時ライブラリなど）とリンクしたものも配布できます。
   GPL 第 3 版の第 7 条による追加の許可で、文面は [NOTICE](NOTICE) にあります。
-- **Strata と ggml から来たコード**: MIT ライセンスの Strata と ggml / llama.cpp から来たコード（`src/` に書き写したカーネルを含む）も、
-  XeStrata の一部として LGPL です。MIT の条件どおり、著作権表示と許諾表示を [NOTICE](NOTICE) に残しています。
+- **Strata と ggml から来たコード**: MIT ライセンスの Strata と ggml / llama.cpp から来たコード（`src/` に書き写したカーネルを含む）は、
+  MIT のままです。XeStrata が変えていない Strata のファイルは MIT だけで、XeStrata が手を入れたファイルや書き写したコードを含むファイルは、
+  XeStrata の変更とファイル全体が LGPL です（ヘッダーは `LGPL-3.0-or-later AND MIT`）。著作権表示と許諾表示は [NOTICE](NOTICE) にあります。
+  Debian の rocm-llvm のパッケージ（Expat）から `tools/intel_llvm_build.py` に写した部分も同じです。
 - **例外**: `third_party/` の次のものは、元のライセンスのままです。プロジェクトごとのフォルダーに、ライセンスの文書と一緒に置いています。
    - intel/llvm への XeStrata の修正のパッチ（`third_party/main/intel-llvm/`）: Apache-2.0 WITH LLVM-exception。
    - oneMath への XeStrata の変更（フォーク、`third_party/main/oneMath/`）: Apache-2.0。
@@ -489,5 +546,6 @@ XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフト�
 - **`third_party/nonfree/` がなくても**、XeStrata はビルドでき、動きます。パッケージには入れていません。
 - **パッケージに入れているほかのもの**: intel/llvm の SYCL の実行時（Apache-2.0 WITH LLVM-exception）、llama.cpp の gguf-py（MIT）、
   oneMath（Apache-2.0）を、それぞれのライセンスの文書と一緒に入れています。
+  AMD の GPU 向けのコードは ROCm のデバイスライブラリ（NCSA）の一部を含むので、そのライセンスの文書も入れています。
   自由ソフトウェアでないもの（oneMKL、cuBLAS、NVIDIA のドライバー）は入れていません。
 - **モデル**: このリポジトリには含みません。モデルのファイルには、それぞれのライセンスが適用されます。

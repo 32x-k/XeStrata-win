@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/gdn.cpp - the Xe port of Strata's src/kernels/cuda/gdn.cu: the gated delta-net recurrence, its causal
 // convolution, and the norms around it.  Work-group shapes are the CUDA kernels'; a warp is a sub-group of 32, and
 // lane 0 of its xor butterfly adds in the order of CUDA's shuffle-down tree.

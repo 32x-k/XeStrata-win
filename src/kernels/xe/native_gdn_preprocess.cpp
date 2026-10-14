@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-FileCopyrightText: 2023-2026 The ggml authors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/native_gdn_preprocess.cpp - the Xe port of Strata's src/kernels/cuda/native_gdn_preprocess.cu: the GDN
 // convolution + SiLU, the L2 norm (RMS norm then ggml_scale), the beta and gate epilogues and the output norm, with
 // the arithmetic of ggml-cuda's norm.cu, unary.cu, ssm-conv.cu and scale.cu at pinned llama.cpp 3cf03257 (MIT

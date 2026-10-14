@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/prefill/kernels.cpp - see include/strata/prefill/kernels.hpp.  The Xe port of Strata's src/prefill/kernels.cu: work
 // shapes, explicit fmaf and summation orders are the CUDA kernels'; a warp is a sub-group of 32 and a 2-D CUDA block
 // is linearised the way CUDA numbers its threads (x fastest).  __expf, rsqrtf, powf, cosf, sinf and log1pf are the

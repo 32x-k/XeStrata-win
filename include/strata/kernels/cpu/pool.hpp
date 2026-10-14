@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/kernels/cpu/pool.hpp - P2.S3: the CPU expert pool.
 //
 // A layer runs TEN experts against ONE activation, and the expert kernel is DRAM-bound (Memory/LEDGER.md L9:
@@ -62,7 +62,7 @@ struct ExpertJobMulti {
     int nt = 0;
     const ActQ* act[MAXT] = {};
     float* out[MAXT] = {};
-    /// Plan v0.3 P6: a native pack's activations (the layer's `vec_dot_type`), one per token.
+    /// Plan v0.3 P6: a native pack's activations (native_quant_act's, in a NativeAct), one per token.
     const void* nact[MAXT] = {};
 };
 
@@ -84,9 +84,19 @@ std::vector<int> physical_cores(bool skip_first);
 /// - exactly 5/6 of L9's 44.14 on 6 - and at **26.9 GB/s inside the host loop**, where the unpinned spinning
 /// host is free to land on a worker's core or its SMT sibling.  That 1.35x is not the kernel.
 ///
-/// Returns the PREVIOUS affinity mask, or -1 if the platform refused; pass it to `restore_thread_affinity`.
-long long pin_current_thread(int core);
-void restore_thread_affinity(long long previous);
+/// Returns the PREVIOUS affinity (`valid` false if the platform refused); pass it to `restore_thread_affinity` on the
+/// same thread.  Windows selects a CPU Set, which can be undone, rather than a hard group affinity: a caller's implicit
+/// all-group eligibility (Windows 11) cannot be put back from a group affinity.
+struct ThreadAffinity {
+#if defined(_WIN32)
+    std::vector<unsigned long> cpu_sets;   ///< the thread's selected CPU Sets; empty: the process defaults
+#else
+    unsigned long mask = 0;                ///< CPUs 0..63
+#endif
+    bool valid = false;
+};
+ThreadAffinity pin_current_thread(int core);
+void restore_thread_affinity(const ThreadAffinity& previous);
 
 class ExpertPool {
 public:
@@ -138,13 +148,6 @@ public:
     void run_split_multi(ExpertJobMulti* jobs, int n);
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
-
-    /// Why a native multi-token batch cannot run, or `nullptr` when it can: `run_split_multi_native` reads a Q2_0
-    /// layer's gate/up rows from `act` (Strata's ActQ) and every other layer's from `nact` (the layer's native
-    /// activation), so a job whose rows are missing the one its layer reads is a fault in a worker thread, not a
-    /// result.  `job` names the offending job.  Checked at the top of the call: a few pointer reads against a
-    /// batch that moves megabytes.
-    static const char* check_multi_jobs(const NativeFmt& f, const ExpertJobMulti* jobs, int n, int& job);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;

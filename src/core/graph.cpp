@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/graph.cpp - P2.S5: the GraphRegistry implementation, on SYCL command graphs (strata/core/gpu.hpp).
 #include "strata/core/graph.hpp"
 
@@ -77,14 +77,19 @@ bool CapturedGraph::launch(void* stream, std::string& err) const {
     return true;
 }
 
-bool CapturedGraph::wait_ms(int timeout_ms) const {
-    if (!done_) return false;
+bool CapturedGraph::wait_ms(int timeout_ms, std::string& err) const {
+    if (!done_) { err = "launch: not recorded"; return false; }
     // A BOUNDED wait on a real clock: an unbounded spin turns a protocol bug into a hung run.  The event query is a
     // driver call that does not block.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     for (;;) {
-        if (gpu::event_query(done_)) return true;
-        if (std::chrono::steady_clock::now() >= deadline) return false;
+        const gpu::Status st = gpu::event_status(done_);
+        if (st == gpu::Status::Done) return true;
+        if (st == gpu::Status::Failed) return fail(err, "launch: the graph");
+        if (std::chrono::steady_clock::now() >= deadline) {
+            err = "launch: timed out waiting for the graph to complete";
+            return false;
+        }
         for (int i = 0; i < 64; ++i) _mm_pause();
     }
 }
@@ -123,8 +128,7 @@ bool GraphRegistry::launch(LayerType type, int n_tokens, int timeout_ms, std::st
         return false;
     }
     if (!g->launch(stream_, err)) return false;
-    if (!g->wait_ms(timeout_ms)) { err = "launch: timed out waiting for the graph to complete"; return false; }
-    return true;
+    return g->wait_ms(timeout_ms, err);
 }
 
 }  // namespace strata::core

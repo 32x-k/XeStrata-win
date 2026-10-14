@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/resident_plan_parity.cpp - the verify window's device-built expert plan (#783 PR-e: the groups numbered
 // by a scan) against a host replay of its contract: distinct experts in routing order, each with its entries
 // ascending, `ptr[g]` = the expert's slot, counts / start / dst / tok / start2 in the host pool's layout.

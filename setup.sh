@@ -1,15 +1,30 @@
 #!/bin/sh
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 # Strata for Linux: the first run installs everything and starts the model; later runs just start it.
-# Needs the Intel GPU driver (xe) and Intel oneAPI (DPC++, oneMKL). Python (with venv) is installed through apt/dnf if
-# it is missing (asks for sudo).
+# Needs the Intel GPU driver (xe) and Intel oneAPI (DPC++, oneMKL). Python (with venv) is installed through
+# apt/dnf/pacman if it is missing (asks for sudo).
 # NixOS (or STRATA_UV=1) with uv installed: uv makes the project venv; every other Linux uses the standard venv.
 cd "$(dirname "$0")" || exit 1
 # Python 3.10+ that can make a venv WITH pip: Debian/Ubuntu ship `venv` without `ensurepip` (that is the separate
 # python3-venv package), and a venv made without it has no pip
 ok_py() { "$1" -c 'import sys, venv, ensurepip; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; }
+# --help and --check only report, with any Python 3.10+ (they need nothing beyond the standard library): they make no
+# .venv and install nothing (a user ran --help to look, on a work machine, and apt installed Python's packages)
+for arg in "$@"; do
+  case $arg in
+    -h|--help|--check)
+      for c in .venv/bin/python python3 python; do
+        if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null
+        then
+          exec "$c" setup.py "$@"
+        fi
+      done
+      echo "./setup.sh $arg needs Python 3.10 or newer; ./setup.sh without it installs Python (asks for sudo)."
+      exit 1 ;;
+  esac
+done
 # a .venv from an earlier run that failed half-way has a python but no pip: start it again
 if [ -x .venv/bin/python ] && ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
   rm -rf .venv

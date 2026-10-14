@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """tools/needle_bench.py - needle-in-a-haystack recall through a running Strata server.
 
 A long text is built from files in this repository (its docs and source code, and the llama.cpp docs setup downloads

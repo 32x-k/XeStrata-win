@@ -11,17 +11,29 @@ path = ["NOTICE"]
 SPDX-FileCopyrightText = ["2026 MistVVK and the XeStrata contributors", "2026 Niko1221 and the Strata contributors", "2023-2026 The ggml authors"]
 SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
-# XeStrata's own files without a comment of their own
+# upstream Strata's files without a comment of their own, unchanged (AGENTS.md, Licenses)
 [[annotations]]
-path = ["bench/**", "data/**", "docs/paper/**", "serve/fixtures/**", "serve/web/favicon.svg", "serve/web/sprite.svg", "tests/data/**"]
-SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors"]
+path = ["data/draft_vocab*.bin", "data/expert-profile.bin", "data/expert-profile-coder.bin", "data/gguf_fingerprints.json", "data/quant_quality/**", "docs/paper/**", "serve/fixtures/rcall_specimens.json", "serve/web/favicon.svg", "serve/web/sprite.svg", "tests/data/native_experts/**"]
+SPDX-FileCopyrightText = "2026 Niko1221 and the Strata contributors"
+SPDX-License-Identifier = "MIT"
+
+# XeStrata's own files without a comment of their own: the expert profiles of the other models
+[[annotations]]
+path = ["data/expert-profile-llmjp.bin", "data/expert-profile-ornith.bin"]
+SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"
 SPDX-License-Identifier = "LGPL-3.0-or-later"
 
-# setup's --bench prompts: XeStrata's sources at commit 58dbbe5, two of them with code from ggml (its MIT notice kept)
+# measurements of XeStrata that others sent (pull requests); the LGPL alone, without NOTICE's additional permission
+[[annotations]]
+path = ["bench/XeStrataBenchResults/**"]
+SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"
+SPDX-License-Identifier = "LGPL-3.0-or-later"
+
+# setup's --bench prompts: XeStrata's sources at commit 58dbbe5, with code from Strata and ggml (their MIT notices kept)
 [[annotations]]
 path = ["data/bench-corpus.json.xz"]
 SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors", "2023-2026 The ggml authors"]
-SPDX-License-Identifier = "LGPL-3.0-or-later"
+SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
 [[annotations]]
 path = ["cmake/BUILD.json.in", ".claude/skills/**/SKILL.md", ".claude/skills/**/references/*.md"]

@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/load_main.cpp - `strata-load`: the expert arena load, measurable at any scale.
 //
 // The size is a FLAG rather than hard-coded because the honest way to measure a 34 GB load is to measure a smaller
@@ -14,7 +14,11 @@
 #include <string>
 #include <fstream>
 #include <memory>
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <sys/resource.h>
 #endif
 #include <limits>
@@ -22,7 +26,11 @@
 
 static void memory_status(const char* phase) {
 #if defined(_WIN32)
-    (void) phase;   // no memlock limit or VmLck on Windows
+    // Windows locks pages against the working-set minimum, not a memlock limit
+    SIZE_T lo = 0, hi = 0;
+    if (GetProcessWorkingSetSize(GetCurrentProcess(), &lo, &hi))
+        std::printf("%s: working set minimum %llu B, maximum %llu B\n", phase, (unsigned long long) lo,
+                    (unsigned long long) hi);
 #else
     struct rlimit limit{};
     if (getrlimit(RLIMIT_MEMLOCK, &limit) == 0) {

@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/qsa.cpp - the Xe port of Strata's src/kernels/cuda/qsa.cu: the QSA cache, indexer and attention (see
 // include/strata/kernels/qsa.hpp and the CUDA file for the four kernel decisions this keeps).
 //

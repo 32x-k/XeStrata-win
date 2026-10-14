@@ -1,6 +1,6 @@
 ---
 name: release
-description: Make a GitHub release of XeStrata in stages - the version, main fast-forwarded to dev, the tag (xe and the version, e.g. xe0.1.39); first the three contrib-llvm packages published with the notes (English then Japanese) and the older releases marked as old, then a speed table against upstream on Intel, NVIDIA and AMD GPUs. Only when the user asks for a release (/release).
+description: Make a GitHub release of XeStrata in stages - the version, main fast-forwarded to dev, the tag (xe and the version, e.g. xe0.1.39); first the three contrib-llvm packages and the Windows 7z published with the notes (English then Japanese) and the older releases marked as old, then a speed table against upstream on Intel, NVIDIA and AMD GPUs. Only when the user asks for a release (/release).
 disable-model-invocation: true
 argument-hint: "[VERSION, e.g. 0.1.39 or 0.1.39.1]"
 ---
@@ -9,7 +9,7 @@ argument-hint: "[VERSION, e.g. 0.1.39 or 0.1.39.1]"
 
 A release is the annotated tag `xe<VERSION>` on `main`, pushed to origin, and a published GitHub release on it, made in two stages:
 
-- the preliminary release (先行報): the three contrib-llvm packages, `SHA256SUMS` and the notes;
+- the preliminary release (先行報): the three contrib-llvm packages, the Windows 7z, `SHA256SUMS` and the notes;
 - the final release (確定報): the speed table against upstream on an Intel, an NVIDIA and an AMD GPU added to the notes.
 
 Rules for the whole run:
@@ -19,8 +19,8 @@ Rules for the whole run:
 - `gh` only as `gh release ...` (the one exception to "git commands only" in the user's global instructions); everything else with git.
   Every `gh release` names `--repo MistVVK/XeStrata`: without it gh takes the `upstream` remote (Niko1221/Strata).
   Never print or read gh's token (`gh auth status` shows the account; leave its token lines out).
-- A release ships the contrib-llvm packages only (the user's decision, 2026-10-09). The free packages are treated like contrib-icpx: built only when the user asks (`build-packages.sh xe<VERSION> free`), and not attached otherwise.
-- The check of the packages is their build alone (the user's decision, 2026-10-07): no CTest, no incus run, unless the user asks for them.
+- A release ships the contrib-llvm packages (the user's decision, 2026-10-09) and the Windows 7z, a contrib-llvm build for Windows (the user's decision, 2026-10-14). The free packages are treated like contrib-icpx: built only when the user asks (`build-packages.sh xe<VERSION> free`), and not attached otherwise.
+- The check of the packages and the 7z is their build alone (the user's decision, 2026-10-07): no CTest, no incus run, no Windows run, unless the user asks for them.
 - Work and commits are on `dev` (Japanese commit messages, one logical change per commit, `git add` and `git commit` joined with `&&`). `dev` itself is never pushed; `main` is.
 - A tag that has been pushed is never moved or deleted. A mistake after the push is fixed by a new version (the fourth number).
 
@@ -44,8 +44,8 @@ The newest `xe*` tag is the previous release (none before the first one).
 The version is `$ARGUMENTS` when given, else the one `CMakeLists.txt` makes from `STRATA_UPSTREAM_VERSION` and `XESTRATA_REVISION` (AGENTS.md, "Versions"); the tag is `xe<VERSION>` (the name the program shows, `STRATA_VERSION_NAME`).
 It must not exist yet, locally or on origin.
 
-- A release after integrating a new upstream version takes that version: the integration changes `STRATA_UPSTREAM_VERSION` and sets `XESTRATA_REVISION` back to 1 (`xe0.1.41`, the packages `0.1.41-1`).
-- Another release on the same upstream version raises `XESTRATA_REVISION` by one, and the version name gets a number: `xe0.1.40.2` (revision 1) then `xe0.1.40.2.1` (packages `0.1.40.2-2`), `xe0.1.40.2.2`.
+- A release after integrating a new upstream version takes that version: the integration changes `STRATA_UPSTREAM_VERSION` and sets `XESTRATA_REVISION` back to 1 (`xe0.1.43.1-1`, the packages `0.1.43.1-1`).
+- Another release on the same upstream version raises `XESTRATA_REVISION` by one: `xe0.1.43.1-1`, then `xe0.1.43.1-2` (packages `0.1.43.1-2`). Tags before 2026-10-13 have the earlier form (`xe0.1.40.2.1` was 0.1.40.2's second release; AGENTS.md, "Versions").
 
 When the version changes, change `XESTRATA_REVISION` and every place that shows the version name (`git grep -n 'xe<OLD>'`: docs/XE), Japanese and English files in the same commit, and commit on `dev` (`版を xe<VERSION> にする`).
 A new version makes conversations saved by `--conversation-save` under the old one unreadable (the engine version is part of their identity): the notes say so.
@@ -65,7 +65,7 @@ Both stay local until step 8.
 setsid nohup .claude/skills/release/scripts/build-packages.sh xe<VERSION> contrib >/dev/null 2>&1 </dev/null &
 ```
 
-It builds the three contrib-llvm variants from the tag one after another (ubuntu26.04 cuda13.1 and cuda12.4, fedora44 cuda13.4), each in a clean container (about an hour and a half), and gathers them with `SHA256SUMS` in `build/release/xe<VERSION>/`.
+It builds the three contrib-llvm variants and the Windows 7z from the tag one after another (ubuntu26.04 cuda13.1 and cuda12.4, fedora44 cuda13.4, windows cuda12.4: the 7z all cross-built in Ubuntu 26.04, docs/BUILD.md), each in a clean container (about two hours), and gathers them with `SHA256SUMS` in `build/release/xe<VERSION>/`.
 Wait on the PID in `build/release/xe<VERSION>/build-contrib.pid` (`kill -0`) and follow `summary-contrib.txt` (a Monitor that prints its new lines, re-armed every 30 minutes); never wait on `pgrep -f`, which matches the waiting shell.
 On `FAILED`, report the end of the variant's log in `logs/`; the fix is an ordinary change on `dev`, after which delete the local tag (`git tag -d xe<VERSION>`) and go back to step 3 (only while the tag has not been pushed).
 
@@ -76,7 +76,7 @@ Steps 5 and 6 are done while it builds.
 Write `build/release/xe<VERSION>/NOTES.md`: the English section first, then the same content in Japanese (the user's decision, 2026-10-12), under a first line linking the two: `[English](#english) | [日本語](#日本語)`.
 
 - What changed for users since the previous release tag (`git log --no-merges <previous>..xe<VERSION>`; for the first release, since `origin/main`), grouped by what a user notices, not a list of commits.
-- How to install: README's install section, as it is there (the user's decision, 2026-10-11): the four numbered steps (download from the table with `SHA256SUMS`, `sha256sum -c SHA256SUMS --ignore-missing`, `sudo apt install ./…deb` or `sudo dnf install ./…rpm` with the release's file names, `xestrata --setup`, which shows the GPU makers' packages that are missing and the command that installs them: AGENTS.md, "Packages", the notes do not list them), then the `> [!NOTE]` that without an NVIDIA GPU either CUDA version works the same, then the package table (Intel, AMD (RDNA2 or later), NVIDIA (Turing or later): `xestrata-contrib-cuda13.1`, `cuda13.4` on Fedora; Intel, AMD (RDNA2 or later), NVIDIA Pascal and Volta: `xestrata-contrib-cuda12.4`). A change to one goes into the other.
+- How to install: README's install section, as it is there (the user's decision, 2026-10-11): the four numbered steps (download from the table with `SHA256SUMS`, `sha256sum -c SHA256SUMS --ignore-missing`, `sudo apt install ./…deb` or `sudo dnf install ./…rpm` with the release's file names, `xestrata --setup`, which shows the GPU makers' packages that are missing and the command that installs them: AGENTS.md, "Packages", the notes do not list them), then the `> [!NOTE]` that without an NVIDIA GPU either CUDA version works the same, then the package table (Intel, AMD (RDNA2 or later), NVIDIA (Turing or later): `xestrata-contrib-cuda13.1`, `cuda13.4` on Fedora; Intel, AMD (RDNA2 or later), NVIDIA Pascal and Volta: `xestrata-contrib-cuda12.4`), then its Windows part (download `XeStrata-<VERSION>-windows-x64.7z`, start `xestrata.exe`; what it needs, the GPUs, where things go). A change to one goes into the other.
 - When the version changed: saved conversations from another version are not read.
 - That the release has no free packages: a free build is made from the source (docs/BUILD.md).
 
@@ -96,7 +96,7 @@ The AMD GPU is in another machine, so its part of the speed table (step 9) is pr
 Prepare the two engines in the AMD development container (where it is and how to run in it: `LOCAL.md` in the repository root, kept out of git; when it is missing, ask the user and write the answer there):
 
 - XeStrata: bring the tag into the container's clone (it has no access to origin: a `git bundle` of `xe<VERSION>` copied in) and build the contrib-llvm mode with HIP for its GPU (`STRATA_HIP_ARCHS`, docs/BUILD.md) in a folder of the tag's own.
-- upstream: its newest release tag (`git ls-remote --tags --refs upstream 'v*' | sed 's#.*refs/tags/##' | sort -V | tail -n 1`; not `git tag -l 'v*'`, which also lists other remotes' tags (Project Maya's `upstream-maya` has v1.0.x)), built with HIP as its own documents say.
+- upstream: its newest release tag (`git ls-remote --tags --refs upstream 'v*' | sed 's#.*refs/tags/##' | sort -V | tail -n 1`; not `git tag -l 'v*'`, which also lists other remotes' tags (Project Maya's `upstream-maya` has v1.0.x)), built with HIP with the CMake options its own setup.py's `build_engine_hip` passes (`-DSTRATA_PREFILL_MMQ=ON` among them: docs/AMD_HIP.md's plain build command leaves it out, and upstream's prefill then takes a slower path).
 
 Run step 9's script there as soon as both are built; the development machine's GPUs wait until the packages are built (step 8).
 
@@ -113,14 +113,14 @@ For anything not clearly public, stop and report it with the commit and file; do
 
 ## 8. The preliminary release (先行報)
 
-When `summary-contrib.txt` ends with `ALLDONE`: `build/release/xe<VERSION>/` holds the three contrib-llvm packages (two `.deb`, one `.rpm`) and `SHA256SUMS`, and `(cd build/release/xe<VERSION> && sha256sum -c SHA256SUMS)` passes.
+When `summary-contrib.txt` ends with `ALLDONE`: `build/release/xe<VERSION>/` holds the three contrib-llvm packages (two `.deb`, one `.rpm`), the Windows `.7z` and `SHA256SUMS`, and `(cd build/release/xe<VERSION> && sha256sum -c SHA256SUMS)` passes.
 
 ```sh
 git push origin main
 git push origin xe<VERSION>
 d=build/release/xe<VERSION>
 gh release create xe<VERSION> --repo MistVVK/XeStrata --verify-tag --title "XeStrata xe<VERSION>" --notes-file "$d/NOTES.md" \
-  "$d"/*.deb "$d"/*.rpm "$d/SHA256SUMS"
+  "$d"/*.deb "$d"/*.rpm "$d"/*.7z "$d/SHA256SUMS"
 gh release view xe<VERSION> --repo MistVVK/XeStrata --json url,isDraft
 ```
 
@@ -142,7 +142,7 @@ gh release list --repo MistVVK/XeStrata --limit 1000 --json tagName,isLatest -q 
 
 ## 9. The speed table
 
-The release against upstream's newest release tag, IQ3_XXS, on each maker's GPU: the Intel Arc Pro B70 and the RTX 4070 in the development machine, the RX 9060 XT in the AMD container (step 6).
+The release against upstream's newest release tag, IQ3_XXS, on each maker's GPU, on Linux (the Windows 7z is not measured): the Intel Arc Pro B70 and the RTX 4070 in the development machine, the RX 9060 XT in the AMD container (step 6).
 The six tiers and the settings of the 2026-10-04-speed-matrix record (1K to 262K, what setup writes for each context, 256 greedy tokens), with one change (the user's decision of 2026-10-12): KV streaming (`--kv-resident`) only where setup writes it on the machine, from 64K when the RAM holds the KV cache beside the model, so a machine short of that RAM (the AMD container: `LOCAL.md`) does not compare at those lengths with the releases up to xe0.1.42; its `prompts.py`, now `.claude/skills/release/scripts/prompts.py`, writes the prompts (`python .claude/skills/release/scripts/prompts.py <pack> <ids folder>`).
 The table's method stays fixed from release to release so the releases compare: the upstream merge's measurements (/upstream-sync) have scripts of their own, and a change to them does not change this table.
 
@@ -150,7 +150,7 @@ The engines, built from the tags (no package installed), each in a worktree of i
 
 - XeStrata: the contrib-llvm build of `xe<VERSION>` (docs/BUILD.md, with `LD_LIBRARY_PATH` to intel/llvm's `lib`); one GPU at a time with `ONEAPI_DEVICE_SELECTOR` (`level_zero:*` for the B70, `cuda:*` for the RTX 4070).
 - upstream on the B70: its `sycl/` port, built in its Docker image as its docs/INTEL.md says (`docker build -t strata-sycl-dev sycl/tools`, then its `build.sh` with `AOT=bmg-g31`), and run through `scripts/up-sycl.sh` (`UP=".claude/skills/release/scripts/up-sycl.sh"` with `UP_TREE`, `DATA` and `IDS` exported), which runs it as its setup configures an Intel card: the arguments get what its `sycl/setup_intel.py` writes (the xe cards' expert profile, the streamed experts, KV streaming from 64K, the VRAM reserve, the prompt chunks), and the engine the run-time switches of its `sycl/serve/strata-sycl.sh`.
-- upstream on the RTX 4070: its CUDA build, as its documents say.
+- upstream on the RTX 4070: its CUDA build, with the CMake options its own setup.py builds it with.
 
 Each engine's own shipped expert profile (`data/expert-profile.bin` of its tree; upstream's `sycl/` port takes the one its `sycl/setup_intel.py` writes in its place, `data/expert-profile-sycl.bin` from v0.1.43).
 No other work on a machine while it measures (no build, no other engine).
@@ -197,7 +197,7 @@ The final release is reached a GPU at a time (the user's decision, 2026-10-11): 
 
 The tables:
 
-The notes' table is one per GPU, from `bench-collect.py`'s medians (the record's README keeps `bench-collect.py`'s own tables): a row per tier, named by the model's weight type and the length (`IQ3_XXS 1K`), and for prefill and then decode three columns (the LLM terms, in both languages; the user's decision, 2026-10-11): XeStrata's value, upstream's, and the difference (the value columns named with the engine and its version, `XeStrata xe0.1.40.2.1`, `upstream v0.1.41`), marked ✅ where XeStrata is faster and ❌ where it is slower: prefill as a ratio (`✅ 2.1 倍`, `✅ ×2.1`), decode as a percentage (`✅ +14%`; slower: `❌ −3%`).
+The notes' table is one per GPU, from `bench-collect.py`'s medians (the record's README keeps `bench-collect.py`'s own tables): a row per tier, named by the model's weight type and the length (`IQ3_XXS 1K`), and for prefill and then decode three columns (the LLM terms, in both languages; the user's decision, 2026-10-11): XeStrata's value, upstream's, and the difference (the value columns named with the engine and its version, `XeStrata xe0.1.43.1-1`, `upstream v0.1.41`), marked ✅ where XeStrata is faster and ❌ where it is slower: prefill as a ratio (`✅ 2.1 倍`, `✅ ×2.1`), decode as a percentage (`✅ +14%`; slower: `❌ −3%`).
 Within ±1% (either way) the two count as equal: `≒ 同等（−0.1%）` / `≈ equal (−0.1%)`, for prefill as well.
 A value upstream was stopped in is 計測不能（低速） / not measurable (too slow), its difference `✅`, with the line saying upstream was stopped at 10 tok/s or less; a value that does not fit stays `-`.
 Above each GPU's tables: the GPU (and its memory) and which build of upstream it ran (`sycl/`, CUDA, HIP).
@@ -208,7 +208,7 @@ Each table has a heading line with its temperature: **generate**（温度 0、�
 
 **generate**（温度 0、トークン/秒）
 
-| 形式・長さ | prefill XeStrata xe0.1.40.2.1 | prefill upstream v0.1.41 | 差 | decode XeStrata xe0.1.40.2.1 | decode upstream v0.1.41 | 差 |
+| 形式・長さ | prefill XeStrata xe0.1.43.1-1 | prefill upstream v0.1.41 | 差 | decode XeStrata xe0.1.43.1-1 | decode upstream v0.1.41 | 差 |
 | --- | ---: | ---: | --- | ---: | ---: | --- |
 | IQ3_XXS 1K | 509 | 295 | ✅ 1.7 倍 | 48.8 | 46.8 | ✅ +4% |
 ```
@@ -219,7 +219,7 @@ Equal there is the upstream merge's check (`judge.py`): prefill within ±1%, the
 ```markdown
 **serve と通常使用**（温度 0.7）
 
-| 計測 | XeStrata xe0.1.40.2.1 | upstream v0.1.41 | 差 |
+| 計測 | XeStrata xe0.1.43.1-1 | upstream v0.1.41 | 差 |
 | --- | ---: | ---: | --- |
 | serve 32K 最初の prefill (tok/s) | 839 | 380 | ✅ 2.2 倍 |
 | serve 32K 会話の続きの待ち (ms) | 372 | 354 | ≒ 同等（+5%） |

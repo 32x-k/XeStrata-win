@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/prefill/prefill.hpp - plan v0.3 P5: batched prompt processing.
 //
 // The prompt's positions [pos0, pos0 + n) are processed in chunks of `chunk` tokens through all 48 layers, leaving
@@ -184,5 +184,9 @@ private:
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;
 };
+
+/// What multiplies the prompt path's experts on the current GPU, for the start's report: "int8 (WMMA)" and the like
+/// (moe_mmq.hpp), with the layers of types the int8 products lack said, or "FP16".  Call once the expert layout is read.
+std::string experts_path();
 
 }  // namespace strata::prefill

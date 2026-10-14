@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/remote_experts.cpp - the helper-GPU expert tier (--expert-cache-device1..3), on the Xe runtime.
 //
 // The CUDA engine could place a static expert tier on CUDA1..3 next to the main GPU.  The tier is not carried: its

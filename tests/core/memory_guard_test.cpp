@@ -1,13 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // available_host_bytes(): MemAvailable, the cgroup limits above this process, and the operator's cap, on fixture
 // directories standing in for /proc/meminfo, /proc/self/cgroup and /sys/fs/cgroup.  CPU only, no GPU.
 #include "strata/core/conversation_memory.hpp"
 
 #if defined(_WIN32)
 #include <process.h>
-#define getpid _getpid
 #else
 #include <unistd.h>
 #endif
@@ -24,6 +23,14 @@ namespace fs = std::filesystem;
 
 namespace {
 
+long process_id() {
+#if defined(_WIN32)
+    return (long) ::_getpid();
+#else
+    return (long) ::getpid();
+#endif
+}
+
 int checks = 0;
 void check(bool ok, const char* label) {
     ++checks;
@@ -37,7 +44,7 @@ struct Fixture {
     fs::path dir;
     Fixture() {
         static int n = 0;
-        dir = fs::temp_directory_path() / ("strata_memory_guard_" + std::to_string((long) ::getpid()) + "_" + std::to_string(n++));
+        dir = fs::temp_directory_path() / ("strata_memory_guard_" + std::to_string((long) process_id()) + "_" + std::to_string(n++));
         fs::remove_all(dir);
         fs::create_directories(dir / "cgroup");
     }

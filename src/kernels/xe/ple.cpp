@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/ple.cpp - the Xe port of Strata's src/kernels/cuda/ple.cu: the PLE block's GPU half (see ple.hpp).
 //
 // The legacy arithmetic follows the captured CPU ggml graph, as in CUDA: `rms_norm` accumulates (double)(x*x) with

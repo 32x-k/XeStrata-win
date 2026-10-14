@@ -1,7 +1,7 @@
 <!--
 SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-SPDX-License-Identifier: LGPL-3.0-or-later
+SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 -->
 # 複数の要求を同時に処理する（バッチスロット）
 
@@ -27,6 +27,7 @@ setup は速さを落とさない所でだけ勧めます（下）。指定し�
 
 エンジンは動かせない数を拒否しません。ログにそう書いて、動かせる数で動きます。
 上限は 8 スロット（ウィンドウは 8 行）で、VRAM に収まる数まで、2 つも収まらなければスロットなし（1 つずつ）です。
+「収まる」は、スロットのセッション、`--batch-mtp` のスロットごとの下書き器、使える大きさのエキスパートキャッシュがそろって入ることです。入らなければ、エンジンは後ろのスロットから返し、起動時のログに動かせた数を書きます。
 サーバーはエンジンが報告する数（`INFO batch_slots=N`）を読み、`GET /v1/status` の `concurrency.serving` に出します。
 
 `--batch-mtp` は、温度 0、4 スロットで 200 トークンずつの 4 つの要求で、どのスロットも 1 つずつ生成したときと同じトークンを出しました（`tools/batch_test.py`、`--pcie-frac 0 --adapt-every 1000000`）。

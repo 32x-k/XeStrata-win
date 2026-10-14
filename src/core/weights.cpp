@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/weights.cpp - the dense-weight loader.  See the header for the engine-vs-pack distinction.
 #include "strata/core/weights.hpp"
 
@@ -18,7 +18,7 @@
 #include <sstream>
 
 #if defined(_WIN32)
-#define fseeko _fseeki64
+#include <io.h>
 #else
 #include <unistd.h>
 #endif
@@ -78,7 +78,11 @@ const char* file_name(int id) {
 }
 
 bool read_at(std::FILE* f, uint64_t off, void* dst, size_t n, std::string& err, const char* what) {
-    if (fseeko(f, (int64_t) off, SEEK_SET) != 0) { err = std::string(what) + ": seek failed"; return false; }
+#if defined(_WIN32)
+    if (_fseeki64(f, (long long) off, SEEK_SET) != 0) { err = std::string(what) + ": seek failed"; return false; }
+#else
+    if (fseeko(f, (off_t) off, SEEK_SET) != 0) { err = std::string(what) + ": seek failed"; return false; }
+#endif
     if (std::fread(dst, 1, n, f) != n) { err = std::string(what) + ": short read"; return false; }
     return true;
 }

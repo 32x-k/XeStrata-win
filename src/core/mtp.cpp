@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/progress.hpp"
 
 #include "strata/core/native_head.hpp"
 #include "strata/platform/memory.hpp"
@@ -64,7 +65,7 @@ struct Bump {
     uint8_t* base = nullptr;
     uint64_t used = 0;
     template <typename T> T* take(uint64_t n) {
-        T* p = base ? (T*) (base + used) : nullptr;
+        T* p = base ? reinterpret_cast<T*>(base + used) : nullptr;
         used += (n * sizeof(T) + 255) & ~255ull;
         return p;
     }
@@ -86,8 +87,9 @@ strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
     return s;
 }
 
+// 64-bit seek/tell on a `FILE*`: `fseek`/`ftell` take a 32-bit `long` on Windows and would wrap past 2 GiB.
 #if defined(_WIN32)
-#define STRATA_FILE_SEEK64(f, o, w) _fseeki64((f), (__int64) (o), (w))
+#define STRATA_FILE_SEEK64(f, o, w) _fseeki64((f), (long long) (o), (w))
 #define STRATA_FILE_TELL64(f) _ftelli64(f)
 #else
 #define STRATA_FILE_SEEK64(f, o, w) fseeko((f), (off_t) (o), (w))
@@ -120,6 +122,8 @@ MtpDrafter::~MtpDrafter() {
     for (auto& e : prefill_exec_) if (e) strata::gpu::graph_destroy(e);
     for (auto& e : prefill_dev_exec_) if (e) strata::gpu::graph_destroy(e);
     if (pf_dev_) strata::gpu::free(pf_dev_);
+    if (pf_ev_) strata::gpu::event_destroy(pf_ev_);
+    if (pf_host_) strata::gpu::free(pf_host_);
     for (auto& e : round_exec_) if (e) strata::gpu::graph_destroy(e);
     for (auto& e : step_exec_) if (e) strata::gpu::graph_destroy(e);
     for (auto& e : round_exec_c_) if (e) strata::gpu::graph_destroy(e);
@@ -132,11 +136,6 @@ MtpDrafter::~MtpDrafter() {
     if (h_chist_) strata::gpu::free(h_chist_);
     if (ev_chain_) strata::gpu::event_destroy(ev_chain_);
     for (strata::gpu::Event* e : ev_step_) if (e) strata::gpu::event_destroy(e);
-    for (strata::gpu::Event* e : pf_rec_up_)
-        if (e) {
-            (void) strata::gpu::event_sync(e);   // the upload has read its copy before the copy goes
-            strata::gpu::event_destroy(e);
-        }
     if (h_force_) strata::gpu::free(h_force_);
     if (cs_) strata::gpu::stream_destroy(cs_);
     if (side_) strata::gpu::stream_destroy(side_);
@@ -343,7 +342,13 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             for (int64_t i = 0; i < cap_; ++i) id[(size_t) (t * (uint64_t) cap_ + (uint64_t) i)] = (int32_t) i;
         strata::gpu::copy(ident_, id.data(), id.size() * 4);
     }
-    cs_ = strata::gpu::stream_create();
+    // STRATA_MTP_PRIO=1: the drafter's stream at high priority, so its round is not queued behind the verifier's copies
+    // and the next window (upstream 1d21b9cd6, 655145426: on HIP, R9700)
+    static const bool prio = [] {
+        const char* v = std::getenv("STRATA_MTP_PRIO");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    }();
+    cs_ = strata::gpu::stream_create(prio);
     side_ = cs_ ? strata::gpu::stream_create() : nullptr;
     if (!cs_ || !side_) {
         err = "mtp: stream";
@@ -586,8 +591,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
     const int64_t N = g.n_embd, HC = g.hc, K = ss.k, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
     const QsaShapes s = shapes_of(g);
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
-    const int32_t* step = step_ + row0 * 4;
-    const int32_t* pos = pos_ + row0 * NH;
+    const int32_t* step = step_ + (int64_t) row0 * 4;
+    const int32_t* pos = pos_ + (int64_t) row0 * NH;
     const bool fused_nr = native_rope_enabled() && native_norm_rope_usable((int) HD, (int) s.n_rot);
     auto norm_rope = [&](float* data, const float* gamma, int rows, int cols, const int32_t* p) {
         if (fused_nr && cols == (int) HD) {
@@ -667,14 +672,14 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         else
         for (int t = 0; t < T; ++t) {
             if (st_.kv_q4) {
-                kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
-                                  vcur_ + t * NKV * HD, s, cs, &st_.host);
+                kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, step + (int64_t) t * 4, kcur_ + (int64_t) t * NKV * HD,
+                                  vcur_ + (int64_t) t * NKV * HD, s, cs, &st_.host);
             } else if (st_.kv_int8)
-                kv_append_q8_step(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step + t * 4,
-                                  kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st_.host);
+                kv_append_q8_step(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step + (int64_t) t * 4,
+                                  kcur_ + (int64_t) t * NKV * HD, vcur_ + (int64_t) t * NKV * HD, s, cs, &st_.host);
             else
-                kv_append_step(st_.k_pool, st_.v_pool, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
-                               vcur_ + t * NKV * HD, s, cs, &st_.host);
+                kv_append_step(st_.k_pool, st_.v_pool, st_.page_table, step + (int64_t) t * 4, kcur_ + (int64_t) t * NKV * HD,
+                               vcur_ + (int64_t) t * NKV * HD, s, cs, &st_.host);
         }
       }
         if (!full) return true;
@@ -831,6 +836,7 @@ bool finish_capture(strata::gpu::Stream cs, bool ok, strata::gpu::Graph*& exec, 
 }  // namespace
 
 bool MtpDrafter::capture_prefill(int T, std::string& err) {
+    if (T < 1 || T >= (int) std::size(prefill_exec_)) { err = "mtp: no prefill graph for " + std::to_string(T) + " rows"; return false; }
     if (prefill_exec_[T]) return true;
     using namespace strata::kernels;
     if (!strata::gpu::begin_capture(cs_)) { err = "mtp: begin capture"; return false; }
@@ -842,6 +848,7 @@ bool MtpDrafter::capture_prefill(int T, std::string& err) {
 }
 
 bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
+    if (T < 1 || T >= (int) std::size(prefill_dev_exec_)) { err = "mtp: no prefill graph for " + std::to_string(T) + " rows"; return false; }
     if (prefill_dev_exec_[T]) return true;
     if (!strata::gpu::begin_capture(cs_)) { err = "mtp: begin capture"; return false; }
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T); tok_/step_/pos_ filled before launch
@@ -986,17 +993,24 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             }
             pf_cap_ = n * per_row;
         }
-        // a copy the last upload from it has finished reading (with sync = false it may still run when this returns)
-        const int turn = pf_rec_turn_;
-        pf_rec_turn_ ^= 1;
-        if ((pf_rec_up_[turn] == nullptr && !strata::gpu::event_create(&pf_rec_up_[turn])) ||
-            !strata::gpu::event_sync(pf_rec_up_[turn])) {
-            err = std::string("mtp prefill: the input records' event: ") + strata::gpu::last_error();
+        // the records go up from pinned memory (upstream #1996): with !sync this returns before the copy has read
+        // them, and a pageable vector would be gone by then.  Without pinned memory, the copy is waited for.
+        const int64_t need = n * per_row;
+        if (pf_host_ != nullptr && pf_ev_ != nullptr && !strata::gpu::event_sync(pf_ev_)) {   // the last copy read it
+            err = std::string("mtp prefill: ") + strata::gpu::last_error();
             return false;
         }
-        std::vector<int32_t>& rec = pf_rec_[turn];
-        rec.assign((size_t) (n * per_row), 0);
-        int32_t* tk = rec.data();
+        if (pf_host_cap_ < need) {
+            if (pf_host_) strata::gpu::free(pf_host_);
+            pf_host_ = nullptr;
+            pf_host_cap_ = 0;
+            if (strata::gpu::alloc_host(&pf_host_, (size_t) need * sizeof(int32_t))) pf_host_cap_ = need;
+            else pf_host_ = nullptr;
+        }
+        if (pf_host_ != nullptr && pf_ev_ == nullptr && !strata::gpu::event_create(&pf_ev_)) pf_ev_ = nullptr;
+        const bool pinned = pf_host_ != nullptr && pf_ev_ != nullptr;
+        std::vector<int32_t> rec(pinned ? 0 : (size_t) need);
+        int32_t* tk = pinned ? pf_host_ : rec.data();
         int32_t* stp = tk + n;
         int32_t* ps = stp + 4 * n;
         for (int64_t i = 0; i < n; ++i) {
@@ -1008,8 +1022,8 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             stp[i * 4 + 3] = (int32_t) (cell + 1);
             for (int64_t h = 0; h < NHp; ++h) ps[i * NHp + h] = (int32_t) cell;
         }
-        if (!strata::gpu::copy_async(pf_dev_, rec.data(), rec.size() * sizeof(int32_t), cs_) ||
-            !strata::gpu::event_record(pf_rec_up_[turn], cs_)) {
+        if (!strata::gpu::copy_async(pf_dev_, tk, (size_t) need * sizeof(int32_t), cs_) ||
+            !(pinned ? strata::gpu::event_record(pf_ev_, cs_) : strata::gpu::stream_sync(cs_))) {
             err = "mtp prefill: the input records upload failed";
             return false;
         }
@@ -1118,8 +1132,15 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         uint32_t spins = 0;
         while (((volatile int32_t*) h_out_)[j] < 0) {
             _mm_pause();
-            if ((++spins & 1023u) == 0 && strata::gpu::stream_idle(cs_)) break;
+            if ((++spins & 1023u) != 0) continue;
+            const strata::gpu::Status st = strata::gpu::stream_status(cs_);
+            if (st == strata::gpu::Status::Failed) {
+                err = std::string("mtp draft: ") + strata::gpu::last_error();
+                return false;
+            }
+            if (st == strata::gpu::Status::Done) break;
         }
+        return true;
     };
     if (!strata::gpu::graph_launch(cp ? round_exec_c_[T] : round_exec_[T], cs_)) {
         err = std::string("mtp draft: ") + strata::gpu::last_error();
@@ -1127,7 +1148,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     }
     (void) strata::gpu::stream_idle(cs_);
     prefetch_ple(tokens[a]);
-    wait_step(0);
+    progress_at("mtp draft: waiting for the GPU");   // upstream #2065: a stall here read as the verify window before it
+    if (!wait_step(0)) return false;
     drafts[0] = ((volatile int32_t*) h_out_)[0];
     if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(0); }
     float pj = ((volatile float*) h_prob_)[0];
@@ -1141,7 +1163,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         }
         (void) strata::gpu::stream_idle(cs_);
         prefetch_ple(drafts[j - 1]);
-        wait_step(j);
+        if (!wait_step(j)) return false;
         drafts[j] = ((volatile int32_t*) h_out_)[j];
         if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(j); }
         pj = ((volatile float*) h_prob_)[j];
@@ -1243,10 +1265,15 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
 }
 
 int MtpDrafter::chain_outputs_ready(std::string& err) {
-    (void) err;
     if (!chain_live_) return chain_n_;
     const OnDevice on_device(device_);
-    while (steps_seen_ < chain_early_ && strata::gpu::event_query(ev_step_[steps_seen_])) {
+    while (steps_seen_ < chain_early_) {
+        const strata::gpu::Status st = strata::gpu::event_status(ev_step_[steps_seen_]);
+        if (st == strata::gpu::Status::Failed) {
+            err = std::string("mtp chain: ") + strata::gpu::last_error();
+            return -1;
+        }
+        if (st == strata::gpu::Status::Pending) break;
         chain_tok_[steps_seen_] = ((volatile int32_t*) h_out_)[steps_seen_];
         chain_prob_[steps_seen_] = ((volatile float*) h_prob_)[steps_seen_];
         ++steps_seen_;
@@ -1255,10 +1282,14 @@ int MtpDrafter::chain_outputs_ready(std::string& err) {
 }
 
 int MtpDrafter::chain_poll(std::string& err) {
-    (void) err;
     if (!chain_live_) return 1;
     const OnDevice on_device(device_);
-    if (!strata::gpu::event_query(ev_chain_)) return 0;
+    const strata::gpu::Status st = strata::gpu::event_status(ev_chain_);
+    if (st == strata::gpu::Status::Failed) {
+        err = std::string("mtp chain: ") + strata::gpu::last_error();
+        return -1;
+    }
+    if (st == strata::gpu::Status::Pending) return 0;
     chain_live_ = false;
     for (int j = 0; j < chain_n_; ++j) {
         chain_tok_[j] = ((volatile int32_t*) h_out_)[j];

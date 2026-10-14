@@ -1,0 +1,126 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
+/// setup.py --json's lines (setup.py's "output" section): one JSON object a line, or plain text (the server's own
+/// lines once setup starts it).
+module Xestrata.Launcher.Protocol
+
+open System
+open System.Text.Json
+
+type Cpu = { Name: string; Avx2: bool; Avx512: bool }
+
+type Gpu =
+    { Index: int
+      Name: string
+      Vendor: string
+      VramGb: float
+      Integrated: bool
+      Pci: string
+      /// why setup cannot use it, or null
+      Problem: string }
+
+type Model =
+    { Id: string
+      About: string
+      DownloadGb: float
+      RamGb: float
+      /// "yes", "low-ram" (part of the experts on the GPU, the rest from the SSD), "budget" (a RAM budget of the
+      /// experts), "slow" or "no"
+      Fits: string
+      Tested: bool
+      Experimental: bool
+      Recommended: bool
+      /// the recommended context for this PC
+      Context: int }
+
+type Family =
+    { Id: string
+      Title: string
+      By: string
+      About: string
+      License: string
+      Experimental: bool
+      Contexts: int[]
+      Models: Model[] }
+
+type Installed =
+    { Config: string
+      ModelName: string
+      Family: string
+      Model: string
+      Context: Nullable<int>
+      Port: int }
+
+type Describe =
+    { Version: string
+      Packaged: bool
+      RamGb: float
+      Cpu: Cpu
+      /// the GPU setup takes by default, or null when none can be used
+      Gpu: Nullable<int>
+      Gpus: Gpu[]
+      DataDir: string
+      Families: Family[]
+      Installed: Installed[] }
+
+type Update =
+    { Current: string
+      Latest: string
+      Newer: bool
+      Url: string
+      How: string }
+
+type Message =
+    | Say of string
+    | Ok of string
+    | Warn of string
+    | Step of int * string
+    | Fail of text: string * hint: string
+    | Progress of what: string * done': int64 * total: int64
+    | Log of string
+    | Ask of question: string * choices: string list * defaultChoice: string
+    | Described of Describe
+    | Updated of Update
+    /// a line that is not one of setup's objects
+    | Text of string
+
+let private options = JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower)
+
+let private str (e: JsonElement) (name: string) =
+    match e.TryGetProperty name with
+    | true, v when v.ValueKind = JsonValueKind.String -> v.GetString()
+    | true, v when v.ValueKind <> JsonValueKind.Null -> v.ToString()
+    | _ -> ""
+
+let private int64Of (e: JsonElement) (name: string) =
+    match e.TryGetProperty name with
+    | true, v when v.ValueKind = JsonValueKind.Number -> v.GetInt64()
+    | _ -> 0L
+
+let parse (line: string) : Message =
+    if not (line.StartsWith "{") then
+        Text line
+    else
+        try
+            use doc = JsonDocument.Parse line
+            let e = doc.RootElement
+            match str e "type" with
+            | "say" -> Say(str e "text")
+            | "ok" -> Ok(str e "text")
+            | "warn" -> Warn(str e "text")
+            | "step" -> Step(int (int64Of e "n"), str e "title")
+            | "fail" -> Fail(str e "text", str e "hint")
+            | "progress" -> Progress(str e "what", int64Of e "done", int64Of e "total")
+            | "log" -> Log(str e "text")
+            | "ask" ->
+                let choices =
+                    match e.TryGetProperty "choices" with
+                    | true, v when v.ValueKind = JsonValueKind.Array -> [ for c in v.EnumerateArray() -> c.ToString() ]
+                    | _ -> []
+                Ask(str e "question", choices, str e "default")
+            | "describe" -> Described(e.Deserialize<Describe> options)
+            | "update" -> Updated(e.Deserialize<Update> options)
+            | _ -> Text line
+        with :? JsonException ->
+            Text line

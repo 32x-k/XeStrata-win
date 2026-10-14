@@ -105,7 +105,8 @@ public:
     /// The prompt: tokens [0, n) at positions pos .. pos + n - 1 in chunks of `prompt_chunk` tokens, every projection a
     /// matrix product and the routed experts grouped by expert, all on the GPU (src/prefill/plain_prompt.cpp, in the
     /// prompt path's library).  `out`: the greedy token after the last; `logits`: its row (or null).  The state is left
-    /// where the windows would have left it.
+    /// where the windows would have left it.  False with `err` empty when the VRAM tier cannot lend the prompt's
+    /// buffers even for a short chunk (a 4 GB card): nothing ran, and the caller reads the prompt through the windows.
     bool prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err);
     /// How forward and prompt pick their tokens (greedy by default): each row's draw counted from its position, so a
     /// seed repeats a run.
@@ -113,6 +114,8 @@ public:
     /// Runs each dense product the prompt takes once, so the products' library has loaded its kernels before the
     /// first prompt (plain_prompt.cpp); nothing when the prompt runs in windows.
     bool prompt_warm(std::string& err);
+    /// Whether every MoE layer's experts take the int8 products on this GPU (iq_mmq; STRATA_PLAIN_MMQ=0: no).
+    bool prompt_int8() const;
 
     /// Drafts a window can check (0: no speculative decoding): spec - 1 when the model has its MTP layer.
     int drafts() const { return has_mtp_ ? n_snap_ : 0; }
@@ -161,9 +164,12 @@ private:
         W sh_gate, sh_up, sh_down;
     };
 
-    bool upload(const GgufModel& m, const std::string& name, W& w, std::string& err);
+    /// `f32`: an F32 matrix is taken as it is (Qwen3.6's GDN alpha and beta: llama.cpp's float product)
+    bool upload(const GgufModel& m, const std::string& name, W& w, std::string& err, bool f32 = false);
     /// Block `l`'s weights (blk.<l>.*): its mixer, norms, router and shared expert.
     bool load_block(const GgufModel& m, int64_t l, Block& b, std::string& err);
+    /// An F32 vector or matrix, or a BF16 one widened to F32 at load (exact: Qwen3.6's MTP layer keeps its two routers
+    /// in BF16).
     bool upload_f32(const GgufModel& m, const std::string& name, uint64_t elements, const float*& out, std::string& err);
     bool open_experts(std::string& err);
     bool record(int T, bool mtp, std::string& err);
@@ -187,7 +193,8 @@ private:
     bool mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* draft, std::string& err);
     /// The chain after mtp_run's first draft: drafts_ up to `want` from position `pos` (the first draft's).
     bool mtp_chain(int want, int64_t pos, std::string& err);
-    bool adapt(std::string& err);
+    /// `max_swaps` > 0: this round moves up to that many, past adapt_swaps and the copy budget (after a prompt).
+    bool adapt(std::string& err, int64_t max_swaps = 0);
     /// The adaptive tier's copies in flight: their experts become resident once the copies are done (`wait`: wait
     /// for them; else only if they are).
     bool settle_swaps(bool wait, std::string& err);
@@ -238,8 +245,6 @@ private:
     };
     /// Lays the buffers for chunks of `T` tokens out from `dev` / `host` (null: only counts), returning the device and
     /// host bytes.
-    /// Whether every MoE layer's experts take the int8 products on this GPU (iq_mmq; STRATA_PLAIN_MMQ=0: no).
-    bool prompt_int8() const;
     void prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* host, uint64_t& dev_bytes,
                       uint64_t& host_bytes) const;
     PromptBufs pb_;
@@ -258,6 +263,7 @@ private:
                             const std::vector<int32_t>& start, std::string& err);
     bool prompt_return(std::string& err);
     int64_t borrow_first_ = -1;
+    bool borrow_short_ = false;     ///< prompt_borrow: the tier lends too little for the shortest chunk
     std::vector<std::pair<int32_t, int32_t>> borrowed_res_;   // (layer, expert) the borrowed slots held
     struct PromptGemm;   // plain_prompt.cpp: the products' state over pb_.gemm_scratch
     static void prompt_gemm_free(PromptGemm* g);

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Tune the engine's hardware-dependent settings on this PC (setup's --calibrate).
 
 Three settings depend on the machine more than on the model, and the defaults are right for the PC they were
@@ -129,7 +129,7 @@ def pick(measured: dict, default_key, min_gain: float = MIN_GAIN):
     med = {k: statistics.median(v) for k, v in measured.items() if v}
     if not med or default_key not in med:
         return default_key
-    best = max(med, key=med.get)
+    best = max(med, key=lambda k: med[k])
     return best if med[best] > med[default_key] * (1.0 + min_gain) else default_key
 
 
@@ -143,7 +143,7 @@ class Session:
     def rate(self, tune: dict | None = None, max_new: int | None = None) -> float:
         rates = []
         for ids in self.ids_list:
-            sampling = {"temperature": 0}
+            sampling: dict = {"temperature": 0}
             if tune:
                 sampling["strata_tune"] = tune
             n = sum(1 for t in self.engine.generate(ids, max_new or MAX_NEW, sampling, threading.Event())
@@ -169,7 +169,7 @@ def run(cfg: dict, say=print, start_engine=None) -> dict:
     import strata_tokenizer as ST
     tpath = Path(cfg["tokenizer"])
     vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
-    toks = [None] * len(vocab)
+    toks: list = [None] * len(vocab)
     for t, i in vocab.items():
         toks[i] = t
     tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
@@ -222,7 +222,7 @@ def sweep(s, values: list, tune, name, label: str, say) -> dict:
     values inside one engine start puts that drift on every value the same number of times, and the median over the
     rounds keeps a single bad sample from deciding.  The caller takes the winner from the medians.
     """
-    out = {v: [] for v in values}
+    out: dict = {v: [] for v in values}
     for r in range(SWEEP_ROUNDS):
         for v in (values if r % 2 == 0 else values[::-1]):
             out[v].append(s.rate(tune(v)))

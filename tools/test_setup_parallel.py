@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """#465: setup's recommendation for "parallel" (several requests decoded together in the engine's batch slots).
 No GPU or download needed: python tools/test_setup_parallel.py"""
 import sys

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Conversation parking test: a follow-up to conversation A must decode the same tokens whether A's state was still
 live (reference engine: A, then the follow-up) or came back from the parking cache (second engine: A, then B, which
 parks A, then the follow-up).  Greedy; run with --extra "--pcie-frac 0 --adapt-every 1000000" for exactness.

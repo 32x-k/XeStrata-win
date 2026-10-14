@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/verify.hpp"
 
@@ -449,7 +449,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
     (void) TS;
-    if (!(copy_ = strata::gpu::stream_create())) {
+    // STRATA_COPY_PRIO=1: the copy stream at high priority (upstream 728097fb6, opt-in)
+    static const bool copy_prio = [] {
+        const char* v = std::getenv("STRATA_COPY_PRIO");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    }();
+    copy_ = strata::gpu::stream_create(copy_prio);
+    if (copy_ == nullptr) {
         err = "verify: copy stream create failed";
         return false;
     }
@@ -1512,9 +1518,62 @@ bool Verifier::capture_commit(std::string& err) {
         copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+        // STRATA_COMMIT_BATCH (default on; =0 keeps the per-layer loop, upstream 6f3e3810): every GDN layer's conv
+        // history and state in two launches, and every QSA layer's tail restore and indexer append in one, instead of
+        // two or three per layer.  The same arithmetic per layer, bitwise.  The commit runs between a window and the
+        // draft round.
+        static const bool commit_batch = [] {
+            const char* e = std::getenv("STRATA_COMMIT_BATCH");
+            return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+        }();
+        bool gdn_batched = false, qsa_batched = false;
+        if (commit_batch) {
+            int64_t n_gdn = 0;
+            for (int64_t l = lb_; l < le_ && ok; ++l)   // the per-layer loop's check of each layer's ssm_norm.weight
+                if (!is_qsa_layer(g, l)) {
+                    ++n_gdn;
+                    ok = need(LayerView(*wt_, l), "ssm_norm.weight", err) != nullptr;
+                }
+            if (ok && n_gdn > 0)
+                gdn_batched = gdn_commit_layers(
+                    ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats, (int64_t) gdn_floats,
+                    (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size, qkv_L_ + (size_t) gdn_index * MT * C,
+                    MT * C, h_L_ + (size_t) gdn_index * MT * C, MT * C, gate_L_ + (size_t) gdn_index * MT * HV,
+                    beta_L_ + (size_t) gdn_index * MT * HV, MT * HV, (int) C, (int) g.ssm_k_heads, (int) HV, (int) MT,
+                    (int) n_gdn, commit_, cs_);
+        }
+        if (commit_batch && ok && !no_batch_kv()) {
+            QsaIndexerLayers il;
+            int nq = 0;
+            int64_t mc = -1;
+            bool fits = true;
+            for (int64_t l = lb_, qi = qsa_index; l < le_ && fits; ++l) {
+                if (!is_qsa_layer(g, l)) continue;
+                const WeightRef* wikn = need(LayerView(*wt_, l), "indexer.k_norm.weight", err);
+                if (!wikn) { ok = false; break; }
+                const QsaState& st = ss.qsa_states[qi];
+                if (nq >= QsaIndexerLayers::kMax || (mc >= 0 && st.max_cells != mc)) { fits = false; break; }
+                mc = st.max_cells;
+                il.gamma[nq] = (const float*) wikn->data;
+                il.tail_src[nq] = tail_snap_ + (size_t) qi * TS;
+                il.tail[nq] = st.idx_tail;
+                il.dead[nq] = st.idx_dead;
+                il.pooled[nq] = st.idx_pooled;
+                il.block_pos[nq] = st.idx_block_pos;
+                ++nq;
+                ++qi;
+            }
+            if (ok && fits && nq > 0) {
+                native_qsa_indexer_append_steps_layers(idx_raw_L_ + (size_t) qsa_index * MT * ID, MT * ID, commit_ + 2, 1,
+                                                       (int) MT, 0, EPS, il, nq, s, mc, rope_scaling(), cs_);
+                qsa_batched = true;
+            }
+        }
         for (int64_t l = lb_; l < le_ && ok; ++l) {
             const LayerView v(*wt_, l);
-            if (!is_qsa_layer(g, l)) {
+            if (is_qsa_layer(g, l) ? qsa_batched : gdn_batched) {
+                ++(is_qsa_layer(g, l) ? qsa_index : gdn_index);
+            } else if (!is_qsa_layer(g, l)) {
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);
                 if (!wnm) { ok = false; break; }
                 float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
@@ -1652,7 +1711,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
                 last_flush = now;
-                if (strata::gpu::stream_idle(cs_) && *seq < want) {
+                const strata::gpu::Status st = strata::gpu::stream_status(cs_);
+                if (st == strata::gpu::Status::Failed) {
+                    err = "verify: layer " + std::to_string(l) + ": " + strata::gpu::last_error();
+                    return false;
+                }
+                if (st == strata::gpu::Status::Done && *seq < want) {
                     err = "verify: layer " + std::to_string(l) + " never rang (graph finished)";
                     return false;
                 }
@@ -2136,7 +2200,12 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
                 last_flush = now;
-                if (strata::gpu::stream_idle(cs_) && *seq < want) {
+                const strata::gpu::Status st = strata::gpu::stream_status(cs_);
+                if (st == strata::gpu::Status::Failed) {
+                    err = "verify batch: layer " + std::to_string(l) + ": " + strata::gpu::last_error();
+                    return false;
+                }
+                if (st == strata::gpu::Status::Done && *seq < want) {
                     err = "verify batch: layer " + std::to_string(l) + " never rang (graph finished)";
                     return false;
                 }
@@ -2262,7 +2331,13 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         if (*seq < want) {
             const auto now = Clock::now();
             if (now - b_last_ > std::chrono::milliseconds(2)) {
-                if (strata::gpu::stream_idle(cs_) && *seq < want) {
+                const strata::gpu::Status st = strata::gpu::stream_status(cs_);
+                if (st == strata::gpu::Status::Failed) {
+                    err = "verify batch: layer " + std::to_string(lb_ + b_k_) + ": " + strata::gpu::last_error();
+                    b_running_ = false;
+                    return -1;
+                }
+                if (st == strata::gpu::Status::Done && *seq < want) {
                     err = "verify batch: layer " + std::to_string(lb_ + b_k_) + " never rang (graph finished)";
                     b_running_ = false;
                     return -1;
@@ -2297,8 +2372,15 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         b_last_ = Clock::now();
         ++b_k_;
     }
-    if (!strata::gpu::stream_idle(cs_) || !strata::gpu::stream_idle(copy_)) {   // (copy_: no host function of this
-        if (Clock::now() - b_last_ > std::chrono::seconds(20)) {                // window may raise flag B in the next)
+    strata::gpu::Status st = strata::gpu::stream_status(cs_);
+    if (st == strata::gpu::Status::Done) st = strata::gpu::stream_status(copy_);   // (copy_: no host function of this
+    if (st == strata::gpu::Status::Failed) {                                         // window may raise flag B in the next)
+        err = std::string("verify batch: the window's commit: ") + strata::gpu::last_error();
+        b_running_ = false;
+        return -1;
+    }
+    if (st == strata::gpu::Status::Pending) {
+        if (Clock::now() - b_last_ > std::chrono::seconds(20)) {
             err = "verify batch: the window's commit did not finish";
             b_running_ = false;
             return -1;
@@ -2591,7 +2673,12 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     // window is launched, never in pl_commit_async behind it (on the B70 that wait did not return while the window
     // waited for this thread)
     if (commit_live_) {
-        while (!strata::gpu::event_query(ev_commit_)) _mm_pause();
+        strata::gpu::Status st;
+        while ((st = strata::gpu::event_status(ev_commit_)) == strata::gpu::Status::Pending) _mm_pause();
+        if (st == strata::gpu::Status::Failed) {
+            err = std::string("verify: the previous commit: ") + strata::gpu::last_error();
+            return false;
+        }
         commit_live_ = false;
     }
     *(volatile uint32_t*) h_seq_ = 0;
@@ -2641,7 +2728,12 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
             const double now = now_ms();
             if (now - fl_flush_ms_ > 2.0) {   // notice a dead graph, as run() does
                 fl_flush_ms_ = now;
-                if (strata::gpu::event_query(ev_done_) && *(volatile uint32_t*) h_seq_ < want) {
+                const strata::gpu::Status st = strata::gpu::event_status(ev_done_);
+                if (st == strata::gpu::Status::Failed) {
+                    err = "verify: layer " + std::to_string(l) + ": " + strata::gpu::last_error();
+                    return -1;
+                }
+                if (st == strata::gpu::Status::Done && *(volatile uint32_t*) h_seq_ < want) {
                     err = "verify: layer " + std::to_string(l) + " never rang (graph finished)";
                     return -1;
                 }
@@ -2686,12 +2778,15 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
 bool Verifier::done(std::string& err) {
     if (!fl_active_ || fl_k_ < fl_total_) return false;
     const OnDevice on_device(device_);
-    if (!strata::gpu::event_query(ev_done_)) {
+    strata::gpu::Status st = strata::gpu::event_status(ev_done_);
+    if (st == strata::gpu::Status::Pending) {
         if (now_ms() - fl_since_ms_ > 20000.0) err = "verify: the window never finished";
         return false;
     }
     // no host function of this window may raise flag B in the next one
-    return strata::gpu::stream_idle(copy_);
+    if (st == strata::gpu::Status::Done) st = strata::gpu::stream_status(copy_);
+    if (st == strata::gpu::Status::Failed) err = std::string("verify: the window: ") + strata::gpu::last_error();
+    return st == strata::gpu::Status::Done;
 }
 
 bool Verifier::pl_finish(int32_t* out, std::string& err) {
@@ -2731,7 +2826,12 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
     if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
     const Clock::time_point t0 = Clock::now();
     if (commit_live_) {   // a replay (pl_launch waited for the one before): its graph reads the words below
-        while (!strata::gpu::event_query(ev_commit_)) _mm_pause();
+        strata::gpu::Status st;
+        while ((st = strata::gpu::event_status(ev_commit_)) == strata::gpu::Status::Pending) _mm_pause();
+        if (st == strata::gpu::Status::Failed) {
+            err = std::string("verify: the commit before: ") + strata::gpu::last_error();
+            return false;
+        }
     }
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;

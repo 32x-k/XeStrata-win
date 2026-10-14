@@ -9,20 +9,12 @@
 #endif
 
 #include <fcntl.h>
-#if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <io.h>
 #include <sys/stat.h>
+#if defined(_WIN32)
+#include <io.h>
 #else
 #include <pthread.h>
 #include <sched.h>
-#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -102,15 +94,13 @@ private:
 
 #ifdef STRATA_HAVE_BLOSC2
 #if defined(_WIN32)
-// The Windows initial port does not change the caller's affinity while c-blosc2 runs.
-class WideAffinity {
-public:
-    WideAffinity() = default;
+// A thread Windows starts takes the process's CPU Sets, not its creator's selection (SessionLoopScratch's pin), so
+// c-blosc2's threads already have every CPU.
+struct WideAffinity {
+    WideAffinity() {}
 };
 
-int16_t blosc2_threads() {
-    return (int16_t) std::clamp((int) std::thread::hardware_concurrency(), 1, 256);
-}
+int16_t blosc2_threads() { return (int16_t) std::clamp((int) std::thread::hardware_concurrency(), 1, 256); }
 #else
 // The CPUs the process may use, taken before main: the serve loop pins its own thread to one core
 // (SessionLoopScratch), and c-blosc2's threads, started from that thread, would all inherit that one core.
@@ -442,6 +432,15 @@ std::string hex(uint64_t v) {
     return s;
 }
 
+// fs::path's native string is UTF-16 on Windows, where fopen would take the ANSI code page
+std::FILE* open_read(const fs::path& path) {
+#if defined(_WIN32)
+    return ::_wfopen(path.c_str(), L"rb");
+#else
+    return std::fopen(path.c_str(), "rb");
+#endif
+}
+
 struct Found {
     fs::path path;
     fs::file_time_type time;
@@ -558,11 +557,7 @@ bool ConversationDisk::open(ConversationDiskOptions options, std::string& error)
     enabled_ = true;
     expire();
     for (const Found& found : scan(options_.dir)) {
-#if defined(_WIN32)
-        std::FILE* f = ::_wfopen(found.path.c_str(), L"rb");
-#else
-        std::FILE* f = std::fopen(found.path.c_str(), "rb");
-#endif
+        std::FILE* f = open_read(found.path);
         if (f == nullptr) continue;
         Header h;
         const bool ok = read_header(f, h);
@@ -627,11 +622,7 @@ bool ConversationDisk::load(size_t index, SavedConversation& image, std::string&
         remove_file(path);
         return false;
     };
-#if defined(_WIN32)
-    std::FILE* f = ::_wfopen(path.c_str(), L"rb");
-#else
-    std::FILE* f = std::fopen(path.c_str(), "rb");
-#endif
+    std::FILE* f = open_read(path);
     if (f == nullptr) return reject("cannot open");
     struct Close { std::FILE* f; ~Close() { std::fclose(f); } } close{f};
     Header h;
@@ -743,20 +734,17 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
     const uint8_t cvec = h.cvec;
     name.update(&cvec, 1);
     const fs::path path = options_.dir / (hex(name.digest()) + kExtension);
+    const fs::path tmp = path.string() + ".tmp";
 #if defined(_WIN32)
-    const fs::path tmp = path.native() + L".tmp";
     const int fd = ::_wopen(tmp.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY | _O_NOINHERIT,
                             _S_IREAD | _S_IWRITE);
     std::FILE* f = fd < 0 ? nullptr : ::_fdopen(fd, "wb");
-#else
-    const fs::path tmp = path.string() + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    std::FILE* f = fd < 0 ? nullptr : ::fdopen(fd, "wb");
-#endif
     if (f == nullptr) {
-#if defined(_WIN32)
         if (fd >= 0) ::_close(fd);
 #else
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    std::FILE* f = fd < 0 ? nullptr : ::fdopen(fd, "wb");
+    if (f == nullptr) {
         if (fd >= 0) ::close(fd);
 #endif
         error = "cannot create " + tmp.string();
@@ -801,19 +789,15 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
         w.part(kv.pooled, sizeof(float));
     }
 #if defined(_WIN32)
-    const __int64 end = ::_ftelli64(f);   // the file's length: the body ends it
+    const long long end = ::_ftelli64(f);   // the file's length: the body ends it (ftell's long is 32 bits here)
 #else
-    const off_t end = ::ftello(f);
+    const long end = std::ftell(f);   // the file's length: the body ends it
 #endif
     bool ok = w.ok && end > 0;
     if (ok) {
         h.body_hash = w.hash.digest();
         header = encode(h);
-#if defined(_WIN32)
-        ok = header.size() == length && ::_fseeki64(f, 0, SEEK_SET) == 0 && prefix();
-#else
-        ok = header.size() == length && ::fseeko(f, 0, SEEK_SET) == 0 && prefix();
-#endif
+        ok = header.size() == length && std::fseek(f, 0, SEEK_SET) == 0 && prefix();
     }
     ok = std::fflush(f) == 0 && ok;
 #if defined(_WIN32)
@@ -823,12 +807,7 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
 #endif
     ok = std::fclose(f) == 0 && ok;
     std::error_code ec;
-#if defined(_WIN32)
-    // Replace the deterministic destination after flushing the file; Windows has no directory flush.
-    if (ok) ok = ::MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-#else
     if (ok) fs::rename(tmp, path, ec);
-#endif
     if (!ok || ec) {
         fs::remove(tmp, ec);
         error = "cannot write " + path.string();

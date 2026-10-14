@@ -1,0 +1,18 @@
+{
+ "os": "Ubuntu 26.04.1 LTS",
+ "kernel": "7.2.10-072110-generic",
+ "level_zero": "libze-intel-gpu1 26.18.38308.1-0",
+ "xe_driver": "/lib/modules/7.2.10-072110-generic/kernel/drivers/gpu/drm/xe/xe.ko",
+ "oneapi_compiler_installed": "intel-oneapi-compiler-dpcpp-cpp 2026.1.1-325",
+ "oneMKL": "2026.1",
+ "gcc": "g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+ "intel_llvm": {
+  "tag": "v7.1.1",
+  "commit": "504366f4b82ff00bbac7b0c956635eed8bc599d8",
+  "built_by": "tools/intel_llvm_build.py",
+  "version_string": "DPC++ 7.1.0 pre-release, clang 22.1.0"
+ },
+ "cmake": [
+  "cmake version 4.4.3"
+ ]
+}
