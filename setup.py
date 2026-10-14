@@ -848,9 +848,8 @@ def amd_elsewhere() -> str:
 # The distribution packages that building and running XeStrata from the source needs (docs/BUILD.md, "Packages"), by
 # distribution and part: "base" for the free and contrib modes (intel/llvm's build tools, the image encoders' and the
 # optional conversation compression's), "icpx" for the contrib-icpx mode in its place, and each GPU maker's (Intel's
-# oneMKL in the contrib mode only, NVIDIA's in the contrib mode only, AMD's not in the contrib-icpx mode).  "tools" are
-# the names of the tools setup does not install itself, for its messages.  On Arch the Vulkan ICD is the GPU maker's
-# own package, not one mesa-vulkan-drivers carries for both.
+# oneMKL in the contrib mode only, NVIDIA's in the contrib mode only, AMD's not in the contrib-icpx mode).  On Arch the
+# Vulkan ICD is the GPU maker's own package, not one mesa-vulkan-drivers carries for both.
 PACKAGES = {
     "ubuntu": {
         "base": "python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc "
@@ -862,7 +861,6 @@ PACKAGES = {
         "amd": "libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev "
                "libhipblas-common-dev",
         "nvidia": "nvidia-cuda-toolkit",
-        "tools": {"g++": "build-essential", "glslc": "glslc", "vulkan": "libvulkan-dev", "spirv": "spirv-headers"},
     },
     "fedora": {
         "base": "python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static "
@@ -873,7 +871,6 @@ PACKAGES = {
         "amd": "rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel "
                "hipblas-common-devel",
         "nvidia": "cuda-toolkit-13-4",
-        "tools": {"g++": "gcc-c++", "glslc": "glslc", "vulkan": "vulkan-loader-devel", "spirv": "spirv-headers-devel"},
     },
     "arch": {
         # Arch and its derivatives (ID_LIKE=arch).  Intel's oneAPI repository has no Arch packages: there is no icpx
@@ -892,8 +889,14 @@ PACKAGES = {
         # PACKAGES' other lists name a package of their own for them (Debian's libclang-rt-21-dev)
         "amd": "hip-runtime-amd rocm-device-libs rocm-llvm rocm-llvm rocblas hipblaslt hipblas-common vulkan-radeon",
         "nvidia": "cuda",
-        "tools": {"g++": "base-devel", "glslc": "shaderc", "vulkan": "vulkan-headers", "spirv": "spirv-headers"},
     },
+}
+
+# The packages of the tools setup does not install itself, for its messages, by distro_family()
+TOOL_PACKAGES = {
+    "ubuntu": {"g++": "build-essential", "glslc": "glslc", "vulkan": "libvulkan-dev", "spirv": "spirv-headers"},
+    "fedora": {"g++": "gcc-c++", "glslc": "glslc", "vulkan": "vulkan-loader-devel", "spirv": "spirv-headers-devel"},
+    "arch": {"g++": "base-devel", "glslc": "shaderc", "vulkan": "vulkan-headers", "spirv": "spirv-headers"},
 }
 
 # The command that installs distribution packages on this PC, by distro_family()
@@ -906,8 +909,8 @@ def install_cmd(packages) -> str:
 
 
 def tool_pkg(kind: str) -> str:
-    """The name of one of the tools setup does not install itself (PACKAGES' "tools"), for this PC."""
-    return PACKAGES[distro_family()]["tools"][kind]
+    """The package of one of the tools setup does not install itself (TOOL_PACKAGES), for this PC."""
+    return TOOL_PACKAGES[distro_family()][kind]
 
 
 def packages_for(distro: str, makers: set, mode: str) -> tuple:
@@ -1075,9 +1078,11 @@ def rocm_missing() -> list:
         clang_ok = clang_ok or (r.returncode == 0 and Path(r.stdout.strip()).is_file())
     # in the order of PACKAGES' AMD part
     have = [any((d / "hip" / "hip_runtime_api.h").exists() for d in inc),
-            # (an intel/llvm built here has its own: tools/intel_llvm_build.py; Arch's ROCm keeps it in its clang's tree)
+            # (an intel/llvm built here has its own: tools/intel_llvm_build.py; Arch's ROCm keeps it in its clang's
+            # tree)
             any((r / d / "ockl.bc").exists() for r in roots for d in ("amdgcn/bitcode", "lib/llvm/amdgcn/bitcode")) or
-            any(glob.glob(g) for g in (*(str(r / "lib/llvm/lib/clang/*/lib/amdgcn/bitcode/ockl.bc") for r in roots),
+            any(glob.glob(g) for g in (*(str(r / "lib/llvm/lib/clang/*/lib/amdgcn/bitcode/ockl.bc")
+                                         for r in roots),
                                        "/usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode/ockl.bc",
                                        "/usr/lib/llvm-*/lib/clang/*/amdgcn/bitcode/ockl.bc",
                                        "/usr/lib/llvm-*/lib/clang/*/lib/amdgcn/bitcode/ockl.bc",
