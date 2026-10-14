@@ -54,6 +54,10 @@ set(CMAKE_EXE_LINKER_FLAGS_INIT "${_strata_win_link}")
 set(CMAKE_SHARED_LINKER_FLAGS_INIT "${_strata_win_link}")
 set(CMAKE_MODULE_LINKER_FLAGS_INIT "${_strata_win_link}")
 
+# the checks' test programs as Release builds: a Debug one links the SYCL runtime's debug library (sycl9d.lib), which
+# a SYCL tree built for Release alone does not have
+set(CMAKE_TRY_COMPILE_CONFIGURATION Release)
+
 set(CMAKE_FIND_ROOT_PATH "${STRATA_XWIN}" "${STRATA_SYCL_WINDOWS}")
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
