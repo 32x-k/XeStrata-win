@@ -37,7 +37,7 @@ It keeps taking in upstream's releases; it now includes everything up to xe0.1.4
 These four things differ from upstream.
 
 - The installer (`xestrata --setup`) and the deb and rpm packages are for Linux. On Windows, build by hand as below.
-- On Windows, the RAM copy of the experts is not page-locked by default. `STRATA_RESIDENT_PIN=1` page-locks it and makes prefill's expert copies faster, but with `--serve` the GPU can fail once it is larger than about 6 GiB.
+- On Windows, the RAM copy of the experts is page-locked by default only when HIP sees one GPU (and the RAM has room for it). With two or more GPUs seen by HIP (the processor's graphics included), the GPU can fail at an allocation after a large page-locked one. Choosing the GPU with `ONEAPI_DEVICE_SELECTOR=hip:N` makes XeStrata narrow `HIP_VISIBLE_DEVICES` to the same GPU.
 - The adaptive cache is slow to swap experts, and `--adapt-every 0` runs faster.
 - `--gpu-stages` does not work with the native pack.
 

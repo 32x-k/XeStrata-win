@@ -47,6 +47,13 @@ void apply_vram_limit(uint64_t& free, uint64_t& total);
 void apply_uma_limit(uint64_t& free);
 /// The device's largest allocation, under STRATA_MAX_ALLOC_MIB.
 uint64_t max_alloc_bytes();
+/// HIP maps page-locked host memory into every GPU its runtime sees, not only the ones ONEAPI_DEVICE_SELECTOR shows
+/// SYCL.  Before the runtime starts (main): a selector naming HIP GPUs by number ("hip:N", "hip:N,M") with
+/// HIP_VISIBLE_DEVICES unset becomes HIP_VISIBLE_DEVICES=N[,M] and "hip:*".  Windows only.
+void restrict_hip_to_selector();
+/// The GPUs this process's HIP runtime sees: HIP_VISIBLE_DEVICES's entries when it is set, else SYCL's HIP GPUs when
+/// no ONEAPI_DEVICE_SELECTOR narrows them; -1 when that is not known.
+int hip_gpus_seen();
 
 class Runtime;
 

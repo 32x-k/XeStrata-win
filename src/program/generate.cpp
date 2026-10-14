@@ -2066,6 +2066,7 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::set_terminate(report_and_end);   // issue #10: an exception that leaves the engine is reported, not lost
     install_fatal_signals();               // issue #12: and a crash says what it was and where
+    strata::core::restrict_hip_to_selector();   // before the HIP runtime reads HIP_VISIBLE_DEVICES
     strata::core::progress_at("starting: reading the options and opening the GPUs");
     // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is
     // touched (upstream b7dd070d)
@@ -6067,14 +6068,16 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> other_gpus;
         for (const auto& st : stages)
             other_gpus.insert(other_gpus.end(), st->profile.begin(), st->profile.begin() + st->held);
-        // STRATA_RESIDENT_PIN=0: never page-locked, 1: always; else as the RAM allows (#11).  Windows: pageable unless
-        // asked for (1, or auto for the RAM rule): on the R9700 through intel/llvm's HIP adapter, --serve's GPU faulted
-        // (hipErrorLaunchFailure) right after a page-locked copy of more than about 6 GiB was built, for a cause not
-        // found (upstream's HIP engine locks 10.6 GiB there); pageable, the decode measured the same
+        // STRATA_RESIDENT_PIN=0: never page-locked, 1: always; else as the RAM allows (#11).  Windows: pageable while
+        // HIP sees more than one GPU, unless asked for (1, or auto for the RAM rule): with the R9700 and the
+        // processor's Radeon 890M both seen, HIP's next page-locked allocation after one of about 6 GiB or more failed
+        // (hipErrorLaunchFailure), with either alone seen it did not (restrict_hip_to_selector)
         using Pin = strata::core::FileExpertSource::Pin;
         const char* pin_env = std::getenv("STRATA_RESIDENT_PIN");
 #if defined(_WIN32)
-        const bool pin_default_off = !(pin_env != nullptr && std::strcmp(pin_env, "auto") == 0);
+        const int hip_seen = strata::core::hip_gpus_seen();
+        const bool pin_default_off =
+            !(pin_env != nullptr && std::strcmp(pin_env, "auto") == 0) && hip_seen != 0 && hip_seen != 1;
 #else
         const bool pin_default_off = false;
 #endif

@@ -37,7 +37,7 @@ intel/llvm（DPC++）を Windows の上で HIP のターゲットだけでビル
 本家と違うところは次の 4 つです。
 
 - インストーラー（`xestrata --setup`）と deb・rpm のパッケージは Linux 用です。Windows では下のとおり手でビルドします。
-- Windows では、RAM 側のエキスパートのコピーを既定でページロックしません。`STRATA_RESIDENT_PIN=1` でページロックすると prefill のエキスパートのコピーが速くなりますが、`--serve` では約 6 GiB を超えると GPU が落ちることがあります。
+- Windows では、RAM 側のエキスパートのコピーを、HIP から見える GPU が 1 台のときだけ既定でページロックします（RAM に余裕があるとき）。HIP から 2 台以上（内蔵 GPU を含む）見えていると、大きくページロックした後の確保で GPU が落ちることがあるためです。`ONEAPI_DEVICE_SELECTOR=hip:N` で GPU を選ぶと、XeStrata は `HIP_VISIBLE_DEVICES` も同じ GPU に絞ります。
 - 適応キャッシュはエキスパートの入れ替えが遅く、`--adapt-every 0` のほうが速く動きます。
 - `--gpu-stages` はネイティブパックでは動きません。
 

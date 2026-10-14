@@ -30,6 +30,12 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 namespace strata::core {
 namespace {
 // The backends the engine runs on: Level Zero for Intel GPUs, CUDA and HIP where the build has their targets.  The
@@ -633,6 +639,53 @@ void apply_vram_limit(uint64_t& free, uint64_t& total) {
     const uint64_t used = total > free ? total - free : 0;
     total = lim;
     free = lim > used ? lim - used : 0;
+}
+
+void restrict_hip_to_selector() {
+#if defined(_WIN32) && !defined(STRATA_ADAPTIVECPP)
+    // With the processor's graphics also seen by HIP (R9700 and Radeon 890M), hipHostMalloc of 7 GiB followed by one
+    // of 1 MiB failed (hipErrorLaunchFailure), with no SYCL and no kernel; with either GPU alone seen, it passed
+    if (std::getenv("HIP_VISIBLE_DEVICES") != nullptr) return;
+    const char* sel = std::getenv("ONEAPI_DEVICE_SELECTOR");
+    if (sel == nullptr) return;
+    const std::string given = sel;   // _putenv_s below invalidates `sel`
+    std::string s;
+    for (const char* c = given.c_str(); *c != '\0'; ++c)
+        if (!std::isspace((unsigned char) *c)) s += (char) std::tolower((unsigned char) *c);
+    if (s.rfind("hip:", 0) != 0) return;
+    const std::string list = s.substr(4);
+    if (list.empty() || list.front() == ',' || list.back() == ',' || list.find(",,") != std::string::npos) return;
+    for (char c : list)
+        if (c != ',' && !std::isdigit((unsigned char) c)) return;
+    // the C runtime's copy and the process's own, which a DLL with a C runtime of its own reads
+    ::_putenv_s("HIP_VISIBLE_DEVICES", list.c_str());
+    ::_putenv_s("ONEAPI_DEVICE_SELECTOR", "hip:*");
+    ::SetEnvironmentVariableA("HIP_VISIBLE_DEVICES", list.c_str());
+    ::SetEnvironmentVariableA("ONEAPI_DEVICE_SELECTOR", "hip:*");
+    std::fprintf(stderr, "strata: ONEAPI_DEVICE_SELECTOR=%s: HIP_VISIBLE_DEVICES=%s, so HIP maps page-locked memory "
+                         "into those GPUs alone\n", given.c_str(), list.c_str());
+#endif
+}
+
+int hip_gpus_seen() {
+    if (const char* v = std::getenv("HIP_VISIBLE_DEVICES"); v != nullptr) {
+        int n = 0;
+        bool in = false;
+        for (const char* c = v; *c != '\0'; ++c) {
+            if (*c == ',') in = false;
+            else if (!std::isspace((unsigned char) *c) && !in) { in = true; ++n; }
+        }
+        return n;
+    }
+    if (std::getenv("ONEAPI_DEVICE_SELECTOR") != nullptr) return -1;
+    int n = 0;
+    for (const auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
+#if defined(STRATA_ADAPTIVECPP)
+        n += d.get_backend() == sycl::backend::hip;
+#else
+        n += d.get_backend() == sycl::backend::ext_oneapi_hip;
+#endif
+    return n;
 }
 
 uint64_t max_alloc_bytes() {
