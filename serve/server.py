@@ -1117,6 +1117,11 @@ class StrataEngine:
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
             keys += " ckpt=0"
+        # #2228: the pictures' keys (hex, in prompt order): the engine matches a picture by them, not by its embeddings
+        ik = sampling.get("strata_img_keys")
+        if isinstance(ik, list) and ik and all(isinstance(k, str) and k and all(c in "0123456789abcdef" for c in k)
+                                               for k in ik):
+            keys += " img_keys=" + ",".join(ik)
         # "strata_prefix" (resolved by Service.resolve_prefix to {"tokens": N}): the first N prompt tokens are a shared
         # prefix - the engine pins the checkpoint there.  Absent or unresolved = as before.
         prefix = sampling.get("strata_prefix")
@@ -3603,6 +3608,7 @@ class Service:
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
+        self.embeddings.keys = None
         images = images_of(messages)
         if images:
             if self.vision is None:
@@ -3678,6 +3684,10 @@ class Service:
             # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
             combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
             self.embeddings.path = combined             # first, so a half-written one is found as well
+            # #2228: each picture's key is its normalized bytes' hash (the encoder's file name), so the engine's
+            # conversation cache matches a picture by what it is, not by its embedding floats: a picture encoded again
+            # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
+            self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
             write_temporary(combined, [p for p, _ in encoded])
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
@@ -3861,6 +3871,9 @@ class Service:
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
+        img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
+        if emb and img_keys:
+            sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
         # the PREVIOUS request's decode figures recorded as its own: each pass keeps its own DONE (a segment) if
         # one arrived.  A reasoning-budget continuation is another native generation, not another API request,

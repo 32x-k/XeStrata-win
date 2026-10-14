@@ -8932,6 +8932,10 @@ int main(int argc, char** argv) {
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
             int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
+            // #2228: img_keys=<hex>,<hex>,... (GENI): each picture's key from the server (its normalized bytes' hash),
+            // in prompt order.  With them the conversation cache matches a picture by its key and grid, not by its
+            // embedding floats, so a picture encoded again with other bits still matches.  Absent: the embeddings' hash.
+            std::vector<uint64_t> req_img_keys;
             bool req_pcie_set = false;   // the request set pcie_frac: its share, not the measured split
             // logprobs=K (0..20; upstream's Intel port 4ba35fd): after each "T id" an "LP logprob id:logprob ..." line
             // with the token's log-probability and the K most likely tokens', from the verify window's head logits
@@ -8966,6 +8970,18 @@ int main(int argc, char** argv) {
                     else if (key == "pcie_frac") { req_pcie_frac = std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "aux_cpus") req_aux_cpus = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0 ? 1 : 0;
+                    else if (key == "img_keys") {
+                        req_img_keys.clear();
+                        const char* q = tok.c_str() + eq + 1;
+                        while (*q != '\0') {
+                            char* qe = nullptr;
+                            const unsigned long long v = std::strtoull(q, &qe, 16);
+                            if (qe == q) { req_img_keys.clear(); break; }
+                            req_img_keys.push_back((uint64_t) v);
+                            q = *qe == ',' ? qe + 1 : qe;
+                            if (*qe != ',' && *qe != '\0') { req_img_keys.clear(); break; }
+                        }
+                    }
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -9031,10 +9047,13 @@ int main(int argc, char** argv) {
                         if (ids[(size_t) i] != kImagePad) { put(i, p, p, p); ++p; ++i; continue; }
                         if (k >= imgs.size()) { ve = "the prompt has more images than the embeddings file"; break; }
                         const Img& im = imgs[k++];
-                        {   // what the conversation cache compares: a picture is its grid and its embeddings
+                        {   // what the conversation cache compares: a picture is its grid and its key (else embeddings)
                             const int64_t grid[3] = {im.n, im.nx, im.ny};
                             uint64_t h = fnv1a(grid, sizeof grid);
-                            h = fnv1a(img_rows.data() + im.off, (size_t) im.n * (size_t) g.n_embd * sizeof(float), h);
+                            if (req_img_keys.size() == imgs.size())   // #2228: the server's key for picture k
+                                h = fnv1a(&req_img_keys[k - 1], sizeof(uint64_t), h);
+                            else
+                                h = fnv1a(img_rows.data() + im.off, (size_t) im.n * (size_t) g.n_embd * sizeof(float), h);
                             req_imgs.push_back({i, h});
                         }
                         for (int64_t j = 0; j < im.n && ve.empty(); ++j)
@@ -9196,6 +9215,39 @@ int main(int argc, char** argv) {
                             slot_ck = &c;
                         }
                 }
+            // #2228: a checkpoint or the live state whose TOKENS this prompt starts with, deeper than what is reused, but
+            // whose pictures differ (a picture encoded again with other bits by an older server, which sends no keys, no
+            // longer matches).  The reuse then falls back to a checkpoint before that picture; said once per request, so
+            // the log tells this apart from a client that rewrote its history.
+            if (o.prompt_cache > 0 && !req_imgs.empty()) {
+                int64_t deep = 0;
+                const std::vector<ImgKey>* deep_imgs = nullptr;
+                auto tokens_match = [&](const std::vector<int32_t>& pre) {
+                    const int64_t L = (int64_t) pre.size();
+                    if (L < 1 || L > n - 1) return false;
+                    for (int64_t i = 0; i < L; ++i)
+                        if ((int32_t) ids[(size_t) i] != pre[(size_t) i]) return false;
+                    return true;
+                };
+                auto consider = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) {
+                    if ((int64_t) pre.size() > std::max(deep, resume) && tokens_match(pre) &&
+                        imgs_below(req_imgs, (int64_t) pre.size()) != pre_imgs) {
+                        deep = (int64_t) pre.size();
+                        deep_imgs = &pre_imgs;
+                    }
+                };
+                if (live_ok) consider(live, live_imgs);
+                for (const ConvCheckpoint& c : checks) consider(c.ids, c.imgs);
+                if (deep_imgs != nullptr) {
+                    const std::vector<ImgKey> now = imgs_below(req_imgs, deep);
+                    size_t k = 0;
+                    while (k < now.size() && k < deep_imgs->size() && now[k] == (*deep_imgs)[k]) ++k;
+                    std::fprintf(stderr, "strata serve: conversation cache: the state at %lld tokens has this prompt's "
+                                         "tokens but picture %zu (at token %lld) is not the same as when it was saved: it "
+                                         "cannot be reused (#2228)\n", (long long) deep,
+                                 k + 1, (long long) (k < now.size() ? now[k].start : -1));
+                }
+            }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
             int64_t in_tokens = 0;
