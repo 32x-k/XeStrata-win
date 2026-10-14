@@ -273,7 +273,11 @@ VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", 
 # #2026: `</tool_call>` the same way.  A user asking for the string verbatim handed the model the real end-of-call token
 # (type 4, matched everywhere); it copied that token into its answer and the reply came back empty.  An assistant
 # message keeps its own: a client replaying the model's raw call text sends the tokens the model wrote.
-TOOL_LITERAL_TAGS = {"</tool_call>": "\U000F0E07"}
+# 0.1.44: `<tool_call>`, `<tool_response>` and `</tool_response>` are type 4 too (ids 248058, 248066, 248070), so a quoted
+# one handed the model the real call / tool-result marker in the same way (found by 47Hunter47 in #2026).  The template
+# writes the tool-result markers around a tool message itself; only the text inside a message is marked.
+TOOL_LITERAL_TAGS = {"</tool_call>": "\U000F0E07", "<tool_call>": "\U000F0E08", "<tool_response>": "\U000F0E09",
+                     "</tool_response>": "\U000F0E0A"}
 LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS, **TOOL_LITERAL_TAGS}
 THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
 CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
@@ -315,6 +319,44 @@ def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
     return False
 
 
+_TOOL_RESULT_OPEN, _TOOL_RESULT_CLOSE = "<tool_response>", "</tool_response>"
+
+
+def _keep_tool_result_wrap(content, tags: dict[str, str]):
+    """A user message whose whole text is <tool_response>...</tool_response> (a client that formats a tool result the way
+    the template does for a tool message) keeps that outer pair as the markers - the template tells such a turn from a
+    real question by exactly that pair - and only the text inside is marked.  None: not such a message."""
+    o, c = _TOOL_RESULT_OPEN, _TOOL_RESULT_CLOSE
+
+    def wrap(text: str, first: bool, last: bool) -> str:
+        i = text.index(o) + len(o) if first else 0
+        j = text.rindex(c) if last else len(text)
+        head = _mark(text[:i - len(o)], tags) + o if first else ""
+        tail = c + _mark(text[j + len(c):], tags) if last else ""
+        return head + _mark(text[i:j], tags) + tail
+
+    if isinstance(content, str):
+        body = content.strip()
+        if len(body) >= len(o) + len(c) and body.startswith(o) and body.endswith(c):
+            return wrap(content, True, True)
+        return None
+    if not (isinstance(content, list) and content and all(isinstance(x, dict) and "text" in x for x in content)):
+        return None
+    texts = [x["text"] for x in content]
+    if not all(isinstance(t, str) for t in texts):
+        return None
+    body = "".join(texts).strip()
+    if not (len(body) >= len(o) + len(c) and body.startswith(o) and body.endswith(c)):
+        return None
+    if not (texts[0].lstrip().startswith(o) and texts[-1].rstrip().endswith(c)):
+        return None          # the pair is split across parts: mark it all, as before
+    if len(content) == 1:
+        return [{**content[0], "text": wrap(texts[0], True, True)}]
+    return ([{**content[0], "text": wrap(texts[0], True, False)}] +
+            [_mark_deep(x, tags) for x in content[1:-1]] +
+            [{**content[-1], "text": wrap(texts[-1], False, True)}])
+
+
 def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str, str] = LITERAL_TAGS):
     """#537: (messages, tools) with every literal <think> / </think> (#554: and vision marker) in their text swapped for
     LITERAL_TAGS' marks (or `tags`': literal_tags() adds the control tokens' texts), and
@@ -332,6 +374,10 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: di
         for k, v in m.items():
             if k != "role":
                 m[k] = _mark_deep(v, mine)
+        if m.get("role") == "user":
+            kept = _keep_tool_result_wrap(content, tags)
+            if kept is not None:
+                m["content"] = kept
         if m.get("role") == "assistant" and isinstance(content, str) and content.lstrip().startswith("<think>") \
                 and "</think>" in content:
             i, j = content.index("<think>") + len("<think>"), content.index("</think>")
