@@ -1150,10 +1150,11 @@ class StrataEngine:
         except OSError:                                  # the pipe is gone: the engine died (not the client)
             raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})") from None
 
-    def _control(self, cancel, on_token, stop_when=None):
+    def _control(self, cancel, on_token, stop_when=None, on_quiet=None):
         """Reads the control lines of the request on them (GEN / BGEN), yielding None heartbeats.  Calls on_token(id)
         for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
-        true sends STOP once (the request is then read to its DONE)."""
+        true sends STOP once (the request is then read to its DONE).  `on_quiet()` runs whenever the engine has been
+        quiet for half a second: between two PP lines of a read whose chunks take longer than that."""
         stopped = False
         beat = time.monotonic()
         while True:
@@ -1165,6 +1166,8 @@ class StrataEngine:
                 if cancel.is_set() and not stopped:
                     self._send("STOP")
                     stopped = True
+                if on_quiet is not None:
+                    on_quiet()
                 if time.monotonic() - beat >= 10.0:
                     beat = time.monotonic()
                     yield None
@@ -1459,21 +1462,25 @@ class StrataEngine:
                     def others():
                         with self.slot_cv:
                             return self.waiting > 0
-                    for x in self._control(cancel, pending.append, stop_when=others):
+
+                    def give_way():   # at a PP line, and between two far apart (the engine takes it at its next boundary)
+                        nonlocal reserved
+                        if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
+                                self._shorter_waiting(len(prompt))):
+                            with self.slot_cv:          # the slot the part read will wait in
+                                reserved = self.pick_slot(prompt)
+                                if reserved is not None:
+                                    self.slot_busy[reserved] = True
+                                    self.slot_claims.add(reserved)
+                            if reserved is not None:
+                                self._send(f"BYIELD {reserved}")
+                    for x in self._control(cancel, pending.append, stop_when=others, on_quiet=give_way):
                         while pending:
                             t = pending.pop(0)
                             out.append(t)
                             yield t
                         if x is None:                       # a heartbeat (False: a token, flushed above)
-                            if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
-                                    self._shorter_waiting(len(prompt))):
-                                with self.slot_cv:          # the slot the part read will wait in
-                                    reserved = self.pick_slot(prompt)
-                                    if reserved is not None:
-                                        self.slot_busy[reserved] = True
-                                        self.slot_claims.add(reserved)
-                                if reserved is not None:
-                                    self._send(f"BYIELD {reserved}")
+                            give_way()
                             yield None
                     phase = "none"                          # its DONE is read
                     while pending:
@@ -1572,17 +1579,21 @@ class StrataEngine:
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
                     self._ctl_erred = False
                     asked = False
+
+                    def ask():        # as give_way above, for the slot this admission reads into
+                        nonlocal asked
+                        if (not asked and not embeddings and yields < self.YIELDS_MAX and
+                                self._shorter_waiting(len(prompt))):
+                            self._send(f"BYIELD {slot}")
+                            asked = True
                     try:
-                        for x in self._control(cancel, pending.append):
+                        for x in self._control(cancel, pending.append, on_quiet=ask):
                             while pending:
                                 t = pending.pop(0)
                                 out.append(t)
                                 yield t
                             if x is None:
-                                if (not asked and not embeddings and yields < self.YIELDS_MAX and
-                                        self._shorter_waiting(len(prompt))):
-                                    self._send(f"BYIELD {slot}")
-                                    asked = True
+                                ask()
                                 yield None
                     except ValueError as e:
                         # #1994: the engine says this slot is not free (its view and ours differ for a moment, or a
