@@ -1222,7 +1222,26 @@ def gpus():
         found.append({"index": len(found), "name": pci_name(0x8086, did), "vram_gb": vram, "device_id": did,
                       "driver": driver, "integrated": integrated, "supported": True, "pci": pci,
                       "bar_gb": visible, "link": host_link(dev), "render": node, "vendor": "intel"})
+    if not (found or nvidia or amd) and wsl_version() == 2:
+        return gpus_wsl()
     return found + [{"index": len(found) + i, **g} for i, g in enumerate(nvidia + amd)]
+
+
+def gpus_wsl():
+    """WSL 2 has no DRM card in sysfs: its GPU is Windows' own, behind /dev/dxg (a report: an RTX 2050 that the
+    Linux listing did not find).  An installed engine lists them as on Windows (gpus_from_engine); before an engine is
+    built, nvidia-smi names the NVIDIA ones (an Intel GPU under WSL is listed by the engine only)."""
+    dxg = "/dev/dxg" if Path("/dev/dxg").exists() else None   # the device the GPU is opened through
+    if PACKAGED:
+        return [{**g, "render": dxg} for g in gpus_from_engine()]
+    found = []
+    for pci, info in sorted(nvidia_smi().items()):
+        vram = info.get("mib", 0.0) / 1024
+        found.append({"index": len(found), "name": info.get("name") or "NVIDIA GPU", "vram_gb": vram,
+                      "device_id": 0, "driver": "nvidia (WSL 2)", "integrated": False, "supported": True,
+                      "pci": pci, "bar_gb": vram, "link": None, "render": dxg, "vendor": "nvidia",
+                      "cc": info.get("cc")})
+    return found
 
 
 def gpus_from_engine():
