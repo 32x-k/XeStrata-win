@@ -15,6 +15,7 @@
 #define STRATA_DEVICE_ARCH_TAG_TU xe_fused_gr
 #include "strata/kernels/device_arch_tag.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -753,6 +754,42 @@ void fused_gr_quantize_q8_0(const uint16_t* src, uint8_t* dst, int64_t nb, void*
             blk[1] = (uint8_t) (hb >> 8);
         }
     });
+}
+
+void fused_gr_time_q8(const FusedGrArgs& w, int n_tok, int reps, void* stream, double& bf16_us, double& q8_us) {
+    if (n_tok < 1 || n_tok > kFusedGrMaxT || reps < 1 || w.q8_down == nullptr || w.q8_up == nullptr)
+        throw core::DeviceError("fused_gr_time_q8: invalid arguments");
+    auto& q = queue_for(stream);
+    // per token: R, its block output, injection, lo, rs, inject_out, mixed; then the xn scratch
+    const size_t per = (size_t) D + N + HC + LR + HC + HC + N, total = per * (size_t) n_tok + (size_t) n_tok * D;
+    float* buf = sycl::malloc_device<float>(total, q);
+    if (buf == nullptr) throw core::DeviceError("fused_gr_time_q8: no device memory for the inputs");
+    q.memset(buf, 0, total * sizeof(float)).wait();
+    FusedGrArgs a[kFusedGrMaxT];
+    for (int t = 0; t < n_tok; ++t) {
+        float* b = buf + per * (size_t) t;
+        a[t] = w;
+        a[t].R = b; a[t].R_out = b; a[t].apply = true;
+        a[t].bo_prev = b + D; a[t].inj_prev = b + D + N; a[t].lo = b + D + N + HC; a[t].rs = b + D + N + HC + LR;
+        a[t].inject_out = b + D + N + HC + LR + HC; a[t].mixed = b + D + N + HC + LR + 2 * HC;
+    }
+    float* xn = buf + per * (size_t) n_tok;
+    auto run = [&](bool q8) {
+        for (int t = 0; t < n_tok; ++t) {
+            a[t].q8_down = q8 ? w.q8_down : nullptr;
+            a[t].q8_up = q8 ? w.q8_up : nullptr;
+        }
+        for (int i = 0; i < 3; ++i) fused_gr_read_multi(a, n_tok, xn, stream);
+        q.wait();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i) fused_gr_read_multi(a, n_tok, xn, stream);
+        q.wait();
+        return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+    };
+    bf16_us = run(false);
+    q8_us = run(true);
+    bf16_us = (bf16_us + run(false)) / 2;   // both forms timed on either side of the other
+    sycl::free(buf, q);
 }
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) {

@@ -27,17 +27,22 @@ bool in_range(const std::string& name) {
     const long l = std::strtol(name.c_str() + 4, nullptr, 10);
     return l >= g_layer_lb && l < g_layer_le;
 }
-// STRATA_HC_Q8=1 (upstream fe6c5260, 58729711): the hyper-connection down and up projections (the final mixer's
-// too) as the GGUF's Q8_0 values for the verify window's read, beside the pack's BF16 rounding of them.  The GGUF's
-// inject rows are F32 holding BF16 values, so the read keeps the pack's BF16 for them.  Another summation order and
-// other weights: output-changing, so opt-in.
-bool hc_q8_requested() {
-    static const bool on = [] {
+// STRATA_HC_Q8 (upstream fe6c5260, 58729711): the hyper-connection down and up projections (the final mixer's too)
+// as the GGUF's Q8_0 values for the verify window's read, beside the pack's BF16 rounding of them.  The GGUF's inject
+// rows are F32 holding BF16 values, so the read keeps the pack's BF16 for them.  Another summation order and other
+// weights: the output changes (KL 0.025-0.031 against the BF16 read, IQ3_XXS, 2026-10-14).  =1 always, =0 never;
+// unset, the read is timed in both forms at load and the Q8_0 one kept only where it is faster (the user's decision
+// of 2026-10-15: 32K decode B70 +3.7%, RX 9060 XT -2.9% with it).
+enum class HcQ8 { Off, On, Auto };
+HcQ8 hc_q8_mode() {
+    static const HcQ8 mode = [] {
         const char* v = std::getenv("STRATA_HC_Q8");
-        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+        if (v == nullptr || *v == 0) return HcQ8::Auto;
+        return std::strtol(v, nullptr, 10) != 0 ? HcQ8::On : HcQ8::Off;
     }();
-    return on;
+    return mode;
 }
+bool hc_q8_requested() { return hc_q8_mode() != HcQ8::Off; }
 bool hc_q8_name(const std::string& name) {
     if (name == "output_hc_down.weight" || name == "output_hc_up.weight") return true;
     if (name.rfind("blk.", 0) != 0) return false;
@@ -67,6 +72,46 @@ struct Pending {
     uint64_t bytes;
     DevicePtr data;
 };
+// STRATA_HC_Q8 unset: the first layer's attention-half read timed with its Q8_0 copies and without, on one token and
+// on a window of four; true when the Q8_0 read is faster over both.  Said either way.
+bool hc_q8_faster(const WeightTable& table, const std::vector<std::pair<WeightRef*, DevicePtr>>& q8, void* stream) {
+    auto copy_of = [&q8](const WeightRef* ref) -> const uint8_t* {
+        for (const auto& [r, data] : q8)
+            if (r == ref) return static_cast<const uint8_t*>(data.get());
+        return nullptr;
+    };
+    for (int l = 0; l < 1024; ++l) {
+        const std::string layer = "blk." + std::to_string(l) + ".";
+        const WeightRef* down = table.find(layer + "hc_attn_down.weight");
+        const WeightRef* up = table.find(layer + "hc_attn_up.weight");
+        const WeightRef* norm = table.find(layer + "hc_attn_norm.weight");
+        const WeightRef* inject = table.find(layer + "hc_attn_inject.weight");
+        if (down == nullptr || up == nullptr || norm == nullptr || inject == nullptr || copy_of(down) == nullptr ||
+            copy_of(up) == nullptr)
+            continue;
+        strata::kernels::FusedGrArgs w;
+        w.w_norm = static_cast<const float*>(norm->data);
+        w.w_down = static_cast<const uint16_t*>(down->data);
+        w.w_up = static_cast<const uint16_t*>(up->data);
+        w.w_inject = static_cast<const uint16_t*>(inject->data);
+        w.q8_down = copy_of(down);
+        w.q8_up = copy_of(up);
+        double b1 = 0, q1 = 0, b4 = 0, q4 = 0;
+        try {
+            strata::kernels::fused_gr_time_q8(w, 1, 20, stream, b1, q1);
+            strata::kernels::fused_gr_time_q8(w, 4, 20, stream, b4, q4);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata: STRATA_HC_Q8: timing the read failed (%s): the BF16 read\n", e.what());
+            return false;
+        }
+        const bool faster = q1 + q4 < 0.99 * (b1 + b4);
+        std::fprintf(stderr, "strata: STRATA_HC_Q8: the hyper-connection read, 1 and 4 tokens: BF16 %.1f + %.1f us, "
+                             "Q8_0 %.1f + %.1f us: the %s read (STRATA_HC_Q8=0/1 picks one)\n",
+                     b1, b4, q1, q4, faster ? "Q8_0" : "BF16");
+        return faster;
+    }
+    return false;
+}
 }
 
 bool NativeDense::served_names(const std::vector<std::string>& shards, bool include_ple_key,
@@ -139,6 +184,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         std::set<std::string> seen;
         int max_in = 0;
         uint64_t total = 0, hc_q8_bytes = 0;
+        bool hc_q8_short = false;   // STRATA_HC_Q8 unset: no VRAM for the Q8_0 copies, the BF16 read
         std::vector<std::pair<WeightRef*, DevicePtr>> hc_q8;
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
@@ -249,7 +295,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 pending.push_back(Pending{&ref, type, bytes, std::move(data)});
             }
             for (const auto& tensor : gguf.tensors()) {
-                if (!hc_q8_requested() || tensor.type != 8 || !hc_q8_name(tensor.name) || !in_range(tensor.name))
+                if (!hc_q8_requested() || hc_q8_short || tensor.type != 8 || !hc_q8_name(tensor.name) ||
+                    !in_range(tensor.name))
                     continue;
                 auto found = table.table_.find(tensor.name);
                 if (found == table.table_.end()) continue;
@@ -266,6 +313,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 DevicePtr data(allocation);
                 if (status) status = strata::gpu::copy(data.get(), gguf.tensor_data(tensor), bytes);
                 if (!status) {
+                    if (hc_q8_mode() == HcQ8::Auto) { hc_q8_short = true; break; }
                     err = "native dense (STRATA_HC_Q8) upload " + tensor.name + ": " + strata::gpu::last_error();
                     return false;
                 }
@@ -278,7 +326,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         // (the GSQ-RCO files store them in BF16): quantized to Q8_0 from the arena's BF16 at load, then into
         // kNativeQ8Rows' layout as the GGUF's copies are.  The inject rows and the final mixer stay BF16 (the inject
         // rows are 82 KB, the mixer runs once a window).
-        if (hc_q8_requested())
+        if (hc_q8_requested() && !hc_q8_short)
             for (auto& [name, ref] : table.table_) {
                 if (name.rfind("blk.", 0) != 0 || !in_range(name) || !hc_q8_name(name) || ref.data == nullptr ||
                     std::any_of(hc_q8.begin(), hc_q8.end(), [&ref](const auto& h) { return h.first == &ref; }))
@@ -291,6 +339,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 const uint64_t nb = (uint64_t) ref.elements / 32, bytes = nb * 34;
                 void* allocation = nullptr;
                 if (!strata::gpu::alloc_device(&allocation, bytes)) {
+                    if (hc_q8_mode() == HcQ8::Auto) { hc_q8_short = true; break; }
                     err = "native dense (STRATA_HC_Q8) alloc " + name + ": " + strata::gpu::last_error();
                     return false;
                 }
@@ -302,6 +351,27 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 hc_q8.emplace_back(&ref, std::move(data));
             }
         compute.wait();   // the Q6_K rewrites, before any other queue reads the weights
+        if (hc_q8_mode() == HcQ8::Auto && !hc_q8_short && !hc_q8.empty()) {
+            // the copies' VRAM is the expert cache's: on the RTX 4070 (12 GB, IQ3_XXS) they were 9.7% of the VRAM
+            // free here and took 14% of its slots, and the decode lost 3% though the read itself was 18% faster; on
+            // the B70 (32 GB) 2.4% and +3.3% (2026-10-15).  So the read is timed only where they are under 5%.
+            uint64_t q8_bytes = 0;
+            for (const auto& h : hc_q8) q8_bytes += (uint64_t) h.first->ne0 / 32 * 34 * (uint64_t) h.first->ne1;
+            size_t free_b = 0, total_b = 0;
+            const double share = strata::gpu::mem_info(&free_b, &total_b) && free_b + q8_bytes > 0
+                                     ? (double) q8_bytes / (double) (free_b + q8_bytes) : 1.0;
+            if (share > 0.05) {
+                std::fprintf(stderr, "strata: STRATA_HC_Q8: the Q8_0 hyper-connection projections would take %.1f%% "
+                                     "of the free VRAM from the expert cache: the BF16 read (STRATA_HC_Q8=1 keeps "
+                                     "them)\n", 100.0 * share);
+                hc_q8.clear();
+            } else if (!hc_q8_faster(table, hc_q8, &compute)) {
+                hc_q8.clear();
+            }
+        }
+        if (hc_q8_short) hc_q8.clear();
+        hc_q8_bytes = 0;
+        for (const auto& h : hc_q8) hc_q8_bytes += (uint64_t) h.first->ne0 / 32 * 34 * (uint64_t) h.first->ne1;
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
         void* allocation = nullptr;
         const bool status = strata::gpu::alloc_device(&allocation, strata::kernels::native_q8_1_bytes(max_in));
@@ -321,9 +391,12 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             hc_q8_.push_back(data.release());
         }
         bytes_ = total + hc_q8_bytes;
-        if (hc_q8_requested())
-            std::fprintf(stderr, "strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections (%zu)\n",
+        if (!hc_q8_.empty())
+            std::fprintf(stderr, "strata: STRATA_HC_Q8: %.2f GiB of Q8_0 hyper-connection projections (%zu)\n",
                          (double) hc_q8_bytes / 1073741824.0, hc_q8_.size());
+        else if (hc_q8_short)
+            std::fprintf(stderr, "strata: STRATA_HC_Q8: no VRAM for the Q8_0 hyper-connection projections, the BF16 "
+                                 "read\n");
         return true;
     } catch (const std::exception& error) {
         err = std::string("native dense: ") + error.what();

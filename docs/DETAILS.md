@@ -221,8 +221,9 @@ On an Arc Pro B70 (32 GB) with an i7-14700 and 96 GB of RAM (a 55 GiB RAM budget
 Its experts are Q4_K, Q5_K, Q5_1 and Q8_0 blocks, 77 GB of them: more than a 64 GB PC holds.
 setup downloads the shards from a pinned revision, checks their SHA-256 once, and packs the model with `--compat-bf16`.
 That turns its Q8_0 hyper-connection projections into BF16, the form the engine reads.
-`STRATA_HC_Q8=1` in the engine's environment makes the verify window's hyper-connection read (the final mixer's before the head too) read the GGUF's Q8_0 values themselves (upstream fe6c5260; 0.63 GiB more VRAM, and the answers change).
-On the B70 one read of 4 tokens went from 35.6 to 31.9 µs and the decode from 45.0 to 45.4 tokens/s; on an RTX 4070 the expert cache lost the VRAM and the decode went from 22.4 to 21.8 tokens/s.
+The verify window's hyper-connection read (the final mixer's before the head too) can read the GGUF's Q8_0 values themselves (upstream fe6c5260; a BF16 pack's are quantized to Q8_0 at load; 0.62 GiB more VRAM, and the answers change).
+At load, where those copies are at most 5% of the free VRAM, the engine times the read in both forms and keeps the Q8_0 one only when it is faster (`STRATA_HC_Q8=1`: always, `=0`: never).
+IQ3_XXS's 32K decode: the B70 (32 GB) takes Q8_0, +3%; on the RTX 4070 (12 GB) and the RX 9060 XT (16 GB) the copies would take the expert cache's room, so they stay BF16 (Q8_0 on the RTX 4070: -3%).
 The engine reads the experts from the GGUF files in place.
 It keeps a RAM budget of them, the most-used first after the ones the GPU holds (`--resident-budget-gib N`).
 setup chooses the RAM less 24 GB for N, less the KV cache too when that lives in RAM:

@@ -51,6 +51,10 @@ bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);
 /// each value rounded to the nearest).  Ordered on `stream`.
 void fused_gr_quantize_q8_0(const uint16_t* src, uint8_t* dst, int64_t nb, void* stream);
 void fused_gr_read(const FusedGrArgs& a, void* stream);
+/// STRATA_HC_Q8 unset: one layer's read (`w`'s weights; its BF16 and its Q8_0 pointers) timed on a window of `n_tok`
+/// tokens in each form, `reps` times after a warm-up, on zero inputs (the time does not depend on the values) ->
+/// the mean microseconds of each.
+void fused_gr_time_q8(const FusedGrArgs& w, int n_tok, int reps, void* stream, double& bf16_us, double& q8_us);
 
 /// Plan v0.3 P6: the same read for up to 8 tokens that share the weights (a verify window): the weights are read
 /// once for all of them.  `a[t]` is token t's arguments (its own R, pending write, lo, rs, inject, mixed; the four
