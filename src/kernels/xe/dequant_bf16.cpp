@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2023-2026 The ggml authors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/xe/dequant_bf16.cpp - the Xe port of Strata's src/kernels/cuda/dequant_bf16.cu: whole-row dequantization of
 // the legacy, K-quant and IQ4 block formats (and Q2_0) to BF16, FP16 or FP32, one work-item per 32-element group,
 // with the CUDA kernel's expressions.  The i-quant formats go to iq_kernels as in CUDA.  BF16 (qwen35moe's BF16 files)
 // is widened exactly: into BF16 a copy, into FP16 a conversion that rounds where FP16 has fewer exponent bits.
+//
+// The arithmetic is transcribed, as in CUDA, from ggml/src/ggml-quants.c at llama.cpp 3cf03257 (dequantize_row_*);
+// MIT License, Copyright (c) 2023-2026 The ggml authors, see third_party/main/ggml/LICENSE.
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"

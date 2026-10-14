@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2023-2026 The ggml authors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/xe/native_ple_postops.cpp - the Xe port of Strata's src/kernels/cuda/native_ple_postops.cu: the PLE block after
 // its projections (key/query RMS norms, the per-group gate, the gated value, its norm, the dilated convolution and the
-// residual), for one token and for a batch, with the arithmetic of the pinned ggml-cuda operators it replaces.
+// residual), for one token and for a batch, with the arithmetic of the pinned ggml-cuda operators it replaces: adapted,
+// as in CUDA, from llama.cpp 3cf03257 (src/models/qwen4exp.cpp, ggml-cuda's reduce_rows.cuh, sumrows.cu and unary.cu);
+// MIT License, Copyright (c) 2023-2026 The ggml authors, see third_party/main/ggml/LICENSE.
 //
 // CUDA's explicit round-to-nearest operations are plain operations here, since the library does not contract; the
 // fma with a zero addend (ggml SCALE's zero bias) stays an fma.  expf and sqrtf are the precise ones.
