@@ -11,6 +11,11 @@
 #include <cmath>
 #include <chrono>
 #include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>   // __cpuidex (STRATA_POOL_UMWAIT)
+#else
+#include <cpuid.h>    // __cpuid_count (STRATA_POOL_UMWAIT)
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +33,62 @@
 namespace strata::kernels::cpu {
 
 namespace {
+// STRATA_POOL_UMWAIT=<TSC cycles> (opt-in, upstream caf1856b, 54b61dbb): a parked worker waits with UMONITOR/UMWAIT on
+// the epoch's cache line instead of spinning on _mm_pause.  It wakes when the host publishes (a write to that line) or
+// after the cycles, in the light C0.1 state; on a laptop whose CPU and GPU share a power budget the spin's power goes
+// to the GPU.  0, unset, or a CPU without WAITPKG (CPUID.7.0:ECX bit 5): the spin, unchanged.
+// STRATA_POOL_UMWAIT_C02=1: the deeper C0.2 state; STRATA_POOL_UMWAIT_ESC=<cycles>: C0.1 first, C0.2 after.
+// The instructions are compiled for this one function (clang and GCC, on Linux and Windows), not for the file.
+bool cpu_waitpkg() {
+    unsigned r[4] = {0, 0, 0, 0};
+#if defined(_MSC_VER)
+    int x[4];
+    __cpuidex(x, 0, 0);
+    if (x[0] < 7) return false;
+    __cpuidex(x, 7, 0);
+    r[2] = (unsigned) x[2];
+#else
+    __cpuid_count(0, 0, r[0], r[1], r[2], r[3]);
+    if (r[0] < 7) return false;
+    __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
+#endif
+    return ((r[2] >> 5) & 1u) != 0;
+}
+uint64_t umwait_cycles() {
+    static const uint64_t c = [] {
+        const char* e = std::getenv("STRATA_POOL_UMWAIT");
+        if (e == nullptr || std::atoll(e) <= 0) return (uint64_t) 0;
+        if (!cpu_waitpkg()) {
+            std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin\n");
+            return (uint64_t) 0;
+        }
+        std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: parked workers wait with UMWAIT (%lld cycles)\n", std::atoll(e));
+        return (uint64_t) std::atoll(e);
+    }();
+    return c;
+}
+unsigned umwait_state() {   // 1 = C0.1 (light), 0 = C0.2
+    static const unsigned s = [] { const char* e = std::getenv("STRATA_POOL_UMWAIT_C02"); return e && *e == '1' ? 0u : 1u; }();
+    return s;
+}
+uint64_t umwait_escalate() {   // a park that has lasted this long is a GPU phase, where a slower wake costs little
+    static const uint64_t c = [] {
+        const char* e = std::getenv("STRATA_POOL_UMWAIT_ESC");
+        return e ? (uint64_t) (std::max)(0LL, std::atoll(e)) : (uint64_t) 0;
+    }();
+    return c;
+}
+// false when `epoch` moved before the wait (the monitor is armed first, so a publish after the check wakes it)
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((target("waitpkg")))
+#endif
+bool umwait_unless_moved(const std::atomic<uint32_t>& epoch, uint32_t seen, unsigned state, uint64_t until) {
+    _umonitor((void*) &epoch);
+    if (epoch.load(std::memory_order_acquire) != seen) return false;
+    _umwait(state, until);
+    return true;
+}
+
 constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
     return ((uint64_t) epoch << 32) | ((uint64_t) n << 16) | (uint64_t) i;
 }
@@ -296,10 +357,19 @@ void ExpertPool::worker(int id) {
         // every 1024 pauses, so the spin itself is unchanged.
         const auto parked_at = std::chrono::steady_clock::now();
         uint32_t spins = 0;
+        const uint64_t um = umwait_cycles(), um_esc = umwait_escalate();
+        const uint64_t um_t0 = um != 0 && um_esc != 0 ? __rdtsc() : 0;
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
-            _mm_pause();
-            if ((++spins & 1023u) != 0) continue;
+            if (um != 0) {   // STRATA_POOL_UMWAIT: wake on the publish's write to epoch_, or after `um` cycles
+                const uint64_t now = __rdtsc();
+                const unsigned st = um_esc != 0 ? (now - um_t0 < um_esc ? 1u : 0u) : umwait_state();
+                if (!umwait_unless_moved(epoch_, seen, st, now + um)) break;
+                if ((++spins & 15u) != 0) continue;   // each wait is ~um cycles: look at the clock more often
+            } else {
+                _mm_pause();
+                if ((++spins & 1023u) != 0) continue;
+            }
             if (std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
             std::unique_lock<std::mutex> lk(sleep_mu_);
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
