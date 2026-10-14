@@ -1630,7 +1630,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
                 last_flush = now;
-                if (strata::gpu::stream_idle(cs_) && *seq < want) {
+                const strata::gpu::Status st = strata::gpu::stream_status(cs_);
+                if (st == strata::gpu::Status::Failed) {
+                    err = "verify: layer " + std::to_string(l) + ": " + strata::gpu::last_error();
+                    return false;
+                }
+                if (st == strata::gpu::Status::Done && *seq < want) {
                     err = "verify: layer " + std::to_string(l) + " never rang (graph finished)";
                     return false;
                 }
@@ -2114,7 +2119,12 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
                 last_flush = now;
-                if (strata::gpu::stream_idle(cs_) && *seq < want) {
+                const strata::gpu::Status st = strata::gpu::stream_status(cs_);
+                if (st == strata::gpu::Status::Failed) {
+                    err = "verify batch: layer " + std::to_string(l) + ": " + strata::gpu::last_error();
+                    return false;
+                }
+                if (st == strata::gpu::Status::Done && *seq < want) {
                     err = "verify batch: layer " + std::to_string(l) + " never rang (graph finished)";
                     return false;
                 }
@@ -2240,7 +2250,13 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         if (*seq < want) {
             const auto now = Clock::now();
             if (now - b_last_ > std::chrono::milliseconds(2)) {
-                if (strata::gpu::stream_idle(cs_) && *seq < want) {
+                const strata::gpu::Status st = strata::gpu::stream_status(cs_);
+                if (st == strata::gpu::Status::Failed) {
+                    err = "verify batch: layer " + std::to_string(lb_ + b_k_) + ": " + strata::gpu::last_error();
+                    b_running_ = false;
+                    return -1;
+                }
+                if (st == strata::gpu::Status::Done && *seq < want) {
                     err = "verify batch: layer " + std::to_string(lb_ + b_k_) + " never rang (graph finished)";
                     b_running_ = false;
                     return -1;
@@ -2275,8 +2291,15 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         b_last_ = Clock::now();
         ++b_k_;
     }
-    if (!strata::gpu::stream_idle(cs_) || !strata::gpu::stream_idle(copy_)) {   // (copy_: no host function of this
-        if (Clock::now() - b_last_ > std::chrono::seconds(20)) {                // window may raise flag B in the next)
+    strata::gpu::Status st = strata::gpu::stream_status(cs_);
+    if (st == strata::gpu::Status::Done) st = strata::gpu::stream_status(copy_);   // (copy_: no host function of this
+    if (st == strata::gpu::Status::Failed) {                                         // window may raise flag B in the next)
+        err = std::string("verify batch: the window's commit: ") + strata::gpu::last_error();
+        b_running_ = false;
+        return -1;
+    }
+    if (st == strata::gpu::Status::Pending) {
+        if (Clock::now() - b_last_ > std::chrono::seconds(20)) {
             err = "verify batch: the window's commit did not finish";
             b_running_ = false;
             return -1;
@@ -2569,7 +2592,12 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     // window is launched, never in pl_commit_async behind it (on the B70 that wait did not return while the window
     // waited for this thread)
     if (commit_live_) {
-        while (!strata::gpu::event_query(ev_commit_)) _mm_pause();
+        strata::gpu::Status st;
+        while ((st = strata::gpu::event_status(ev_commit_)) == strata::gpu::Status::Pending) _mm_pause();
+        if (st == strata::gpu::Status::Failed) {
+            err = std::string("verify: the previous commit: ") + strata::gpu::last_error();
+            return false;
+        }
         commit_live_ = false;
     }
     *(volatile uint32_t*) h_seq_ = 0;
@@ -2619,7 +2647,12 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
             const double now = now_ms();
             if (now - fl_flush_ms_ > 2.0) {   // notice a dead graph, as run() does
                 fl_flush_ms_ = now;
-                if (strata::gpu::event_query(ev_done_) && *(volatile uint32_t*) h_seq_ < want) {
+                const strata::gpu::Status st = strata::gpu::event_status(ev_done_);
+                if (st == strata::gpu::Status::Failed) {
+                    err = "verify: layer " + std::to_string(l) + ": " + strata::gpu::last_error();
+                    return -1;
+                }
+                if (st == strata::gpu::Status::Done && *(volatile uint32_t*) h_seq_ < want) {
                     err = "verify: layer " + std::to_string(l) + " never rang (graph finished)";
                     return -1;
                 }
@@ -2664,12 +2697,15 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
 bool Verifier::done(std::string& err) {
     if (!fl_active_ || fl_k_ < fl_total_) return false;
     const OnDevice on_device(device_);
-    if (!strata::gpu::event_query(ev_done_)) {
+    strata::gpu::Status st = strata::gpu::event_status(ev_done_);
+    if (st == strata::gpu::Status::Pending) {
         if (now_ms() - fl_since_ms_ > 20000.0) err = "verify: the window never finished";
         return false;
     }
     // no host function of this window may raise flag B in the next one
-    return strata::gpu::stream_idle(copy_);
+    if (st == strata::gpu::Status::Done) st = strata::gpu::stream_status(copy_);
+    if (st == strata::gpu::Status::Failed) err = std::string("verify: the window: ") + strata::gpu::last_error();
+    return st == strata::gpu::Status::Done;
 }
 
 bool Verifier::pl_finish(int32_t* out, std::string& err) {
@@ -2709,7 +2745,12 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
     if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
     const Clock::time_point t0 = Clock::now();
     if (commit_live_) {   // a replay (pl_launch waited for the one before): its graph reads the words below
-        while (!strata::gpu::event_query(ev_commit_)) _mm_pause();
+        strata::gpu::Status st;
+        while ((st = strata::gpu::event_status(ev_commit_)) == strata::gpu::Status::Pending) _mm_pause();
+        if (st == strata::gpu::Status::Failed) {
+            err = std::string("verify: the commit before: ") + strata::gpu::last_error();
+            return false;
+        }
     }
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;

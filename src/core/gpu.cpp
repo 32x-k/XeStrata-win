@@ -69,6 +69,14 @@ bool fail(const char* what, const std::exception& e) {
     return false;
 }
 
+// a failed poll, with the Unified Runtime result: the device's error, which the adapter prints on its own lines
+Status fail_query(const char* what, const std::exception& e) {
+    g_error = std::string(what) + ": " + e.what();
+    if (const auto* se = dynamic_cast<const sycl::exception*>(&e))
+        g_error += " [UR result " + std::to_string((int) sycl::detail::get_ur_error(*se)) + "]";
+    return Status::Failed;
+}
+
 core::Runtime& rt() { return core::Runtime::get(); }
 
 // A single memset of more than 4 GiB never completes on the B70; the same bytes in 1 GiB pieces do, and a 5 GiB memcpy
@@ -145,10 +153,12 @@ bool stream_sync(Stream s) {
     catch (const std::exception& e) { return fail("stream_sync", e); }
 }
 
-bool stream_idle(Stream s) {
-    try { return q(s).ext_oneapi_empty(); }
-    catch (const std::exception& e) { return fail("stream_idle", e); }
+Status stream_status(Stream s) {
+    try { return q(s).ext_oneapi_empty() ? Status::Done : Status::Pending; }
+    catch (const std::exception& e) { return fail_query("stream query", e); }
 }
+
+bool stream_idle(Stream s) { return stream_status(s) == Status::Done; }
 
 bool device_sync() {
     try { rt().finish(); return true; }
@@ -397,13 +407,15 @@ bool event_record(Event* e, Stream s) {
     catch (const std::exception& ex) { return fail("event_record", ex); }
 }
 
-bool event_query(const Event* e) {
-    if (!e->ev) return true;
+Status event_status(const Event* e) {
+    if (!e->ev) return Status::Done;
     try {
         return e->ev->get_info<sycl::info::event::command_execution_status>() ==
-               sycl::info::event_command_status::complete;
-    } catch (const std::exception& ex) { return fail("event_query", ex); }
+               sycl::info::event_command_status::complete ? Status::Done : Status::Pending;
+    } catch (const std::exception& ex) { return fail_query("event query", ex); }
 }
+
+bool event_query(const Event* e) { return event_status(e) == Status::Done; }
 
 bool event_sync(const Event* e) {
     if (!e->ev) return true;

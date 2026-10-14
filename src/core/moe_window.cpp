@@ -283,7 +283,12 @@ bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, con
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
                 last_flush = now;
-                if (strata::gpu::stream_idle(cs) && *seq < want) {
+                const strata::gpu::Status st = strata::gpu::stream_status(cs);
+                if (st == strata::gpu::Status::Failed) {
+                    err = "moe window: ring " + std::to_string(want) + ": " + strata::gpu::last_error();
+                    return false;
+                }
+                if (st == strata::gpu::Status::Done && *seq < want) {
                     err = "moe window: ring " + std::to_string(want) + " never rang (the graph finished)";
                     return false;
                 }

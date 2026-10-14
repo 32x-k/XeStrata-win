@@ -44,7 +44,13 @@ Stream stream_create();
 Stream stream_create_copy();
 void stream_destroy(Stream s);
 bool stream_sync(Stream s);
-/// True when every command submitted to `s` has completed (cudaStreamQuery == cudaSuccess).
+/// What a poll found (stream_status, event_status).  Failed: the query itself failed, its message in last_error(); a
+/// device error stays in its context, so every later query fails too and a wait that read it as Pending would spin to
+/// its timeout or forever (issue #12: an illegal address on a later stage's CUDA GPU).
+enum class Status { Done, Pending, Failed };
+/// Done when every command submitted to `s` has completed (cudaStreamQuery == cudaSuccess).
+Status stream_status(Stream s);
+/// stream_status(s) == Done: a failed query reads as "not yet", for a caller that waits elsewhere.
 bool stream_idle(Stream s);
 bool device_sync();
 
@@ -121,7 +127,9 @@ bool event_create(Event** e, bool timing = false);
 void event_destroy(Event* e);
 /// Marks the current end of `s`.
 bool event_record(Event* e, Stream s);
-/// True when the marked position has been reached (and when nothing was recorded).
+/// Done when the marked position has been reached (and when nothing was recorded).
+Status event_status(const Event* e);
+/// event_status(e) == Done: a failed query reads as "not yet", for a caller that waits elsewhere.
 bool event_query(const Event* e);
 bool event_sync(const Event* e);
 /// Makes later work on `s` wait for the marked position (cudaStreamWaitEvent).

@@ -1112,8 +1112,15 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         uint32_t spins = 0;
         while (((volatile int32_t*) h_out_)[j] < 0) {
             _mm_pause();
-            if ((++spins & 1023u) == 0 && strata::gpu::stream_idle(cs_)) break;
+            if ((++spins & 1023u) != 0) continue;
+            const strata::gpu::Status st = strata::gpu::stream_status(cs_);
+            if (st == strata::gpu::Status::Failed) {
+                err = std::string("mtp draft: ") + strata::gpu::last_error();
+                return false;
+            }
+            if (st == strata::gpu::Status::Done) break;
         }
+        return true;
     };
     if (!strata::gpu::graph_launch(cp ? round_exec_c_[T] : round_exec_[T], cs_)) {
         err = std::string("mtp draft: ") + strata::gpu::last_error();
@@ -1122,7 +1129,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     (void) strata::gpu::stream_idle(cs_);
     prefetch_ple(tokens[a]);
     progress_at("mtp draft: waiting for the GPU");   // upstream #2065: a stall here read as the verify window before it
-    wait_step(0);
+    if (!wait_step(0)) return false;
     drafts[0] = ((volatile int32_t*) h_out_)[0];
     if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(0); }
     float pj = ((volatile float*) h_prob_)[0];
@@ -1136,7 +1143,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         }
         (void) strata::gpu::stream_idle(cs_);
         prefetch_ple(drafts[j - 1]);
-        wait_step(j);
+        if (!wait_step(j)) return false;
         drafts[j] = ((volatile int32_t*) h_out_)[j];
         if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(j); }
         pj = ((volatile float*) h_prob_)[j];
@@ -1238,10 +1245,15 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
 }
 
 int MtpDrafter::chain_outputs_ready(std::string& err) {
-    (void) err;
     if (!chain_live_) return chain_n_;
     const OnDevice on_device(device_);
-    while (steps_seen_ < chain_early_ && strata::gpu::event_query(ev_step_[steps_seen_])) {
+    while (steps_seen_ < chain_early_) {
+        const strata::gpu::Status st = strata::gpu::event_status(ev_step_[steps_seen_]);
+        if (st == strata::gpu::Status::Failed) {
+            err = std::string("mtp chain: ") + strata::gpu::last_error();
+            return -1;
+        }
+        if (st == strata::gpu::Status::Pending) break;
         chain_tok_[steps_seen_] = ((volatile int32_t*) h_out_)[steps_seen_];
         chain_prob_[steps_seen_] = ((volatile float*) h_prob_)[steps_seen_];
         ++steps_seen_;
@@ -1250,10 +1262,14 @@ int MtpDrafter::chain_outputs_ready(std::string& err) {
 }
 
 int MtpDrafter::chain_poll(std::string& err) {
-    (void) err;
     if (!chain_live_) return 1;
     const OnDevice on_device(device_);
-    if (!strata::gpu::event_query(ev_chain_)) return 0;
+    const strata::gpu::Status st = strata::gpu::event_status(ev_chain_);
+    if (st == strata::gpu::Status::Failed) {
+        err = std::string("mtp chain: ") + strata::gpu::last_error();
+        return -1;
+    }
+    if (st == strata::gpu::Status::Pending) return 0;
     chain_live_ = false;
     for (int j = 0; j < chain_n_; ++j) {
         chain_tok_[j] = ((volatile int32_t*) h_out_)[j];

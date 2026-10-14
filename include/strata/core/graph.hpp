@@ -74,9 +74,9 @@ public:
     bool launch(void* stream, std::string& err) const;
 
     /// The host loop's wait: poll `done_` until it completes or `timeout_ms` elapses.  Returns false on
-    /// timeout, which the caller must treat as a hang and not as "probably fine".  See NOTE 1 above for why
-    /// this exists instead of a memory spin.
-    bool wait_ms(int timeout_ms) const;
+    /// timeout or a failed query, `err` saying which, which the caller must treat as a hang and not as "probably
+    /// fine".  See NOTE 1 above for why this exists instead of a memory spin.
+    bool wait_ms(int timeout_ms, std::string& err) const;
 
     size_t nodes() const { return nodes_; }
     bool valid() const { return exec_ != nullptr; }

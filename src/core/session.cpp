@@ -677,8 +677,14 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
             // is entered.  The fence and the volatile read are kept because they are correct and cost nothing -
             // without them the ring's ordering against `x_f`/`ids`/`weights` is unstated - but they do not
             // remove the need for the call, and nothing here should be read as claiming they do.
-            // On Xe the event query also enters the driver; a failed query surfaces at the next runtime wait.
-            const bool done = strata::gpu::event_query(probe);
+            // On Xe the event query also enters the driver.  A failed one ends the wait: the error stays in the
+            // device's context, so the ring would never be seen (issue #12).
+            const strata::gpu::Status st = strata::gpu::event_status(probe);
+            if (st == strata::gpu::Status::Failed) {
+                err = "session_loop: layer " + std::to_string(l) + ": " + strata::gpu::last_error();
+                return false;
+            }
+            const bool done = st == strata::gpu::Status::Done;
             if (!rang && *seq >= want) {
                 rang = true;
                 mid_graph = !done;
@@ -923,7 +929,12 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
                 // A slow ring: flush the submission queue once more, and notice a fault or a finished graph.
                 last_flush = now;
                 ++tg.flushes;
-                if (strata::gpu::stream_idle(cs) && *seq < want) {
+                const strata::gpu::Status st = strata::gpu::stream_status(cs);
+                if (st == strata::gpu::Status::Failed) {
+                    err = "session_run_token: layer " + std::to_string(l) + ": " + strata::gpu::last_error();
+                    return false;
+                }
+                if (st == strata::gpu::Status::Done && *seq < want) {
                     err = "session_run_token: layer " + std::to_string(l) + " never rang (graph finished)";
                     return false;
                 }
