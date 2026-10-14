@@ -3520,10 +3520,15 @@ class Service:
                 print(f"[strata] could not save the shared settings: {e}", flush=True)
         return self.shared
 
+    def effort_default(self) -> str | None:
+        """The thinking level of a request that names none: the Chat settings shared with apps first, then the config's
+        "reasoning_effort" (#1641).  Every API reads it here (the Responses API did not: 0.1.44.1)."""
+        return self.shared.get("reasoning_effort") or self.config_effort
+
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
         s = self.shared
-        effort = s.get("reasoning_effort") or self.config_effort   # the Chat settings first, then the config's
+        effort = self.effort_default()
         if not s and not effort:
             return req
         req = dict(req)
@@ -6030,7 +6035,7 @@ def make_handler(svc: Service):
             responses_api.check_request(req)
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
-            kw = responses_api.template_kwargs(req, svc.shared)
+            kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
             try:
                 self._no_local_images(messages)              # as on the chat route: no file read for a foreign page
             except ValueError as e:
