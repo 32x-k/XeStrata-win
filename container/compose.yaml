@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# XeStrata with rootless Podman: podman compose build, then podman compose run --rm xestrata --setup, then
+# podman compose up -d (http://127.0.0.1:8095).  Intel GPUs as it is; AMD's add compose.amd.yaml, NVIDIA's
+# compose.nvidia.yaml (podman compose -f compose.yaml -f compose.nvidia.yaml ...).  docs/BUILD.md#podman
+name: xestrata
+services:
+  xestrata:
+    build:
+      context: .
+      args:
+        XESTRATA_VERSION: ${XESTRATA_VERSION:-latest}
+        XESTRATA_VARIANT: ${XESTRATA_VARIANT:-contrib-cuda13.4}
+        XESTRATA_NONFREE: ${XESTRATA_NONFREE:-1}
+    image: localhost/xestrata
+    # the server as the package's: on 127.0.0.1, which with the host's network is the host's own
+    network_mode: host
+    # the host user's uid and groups (render, video), so the GPU's device files open as on the host
+    userns_mode: keep-id
+    group_add:
+      - keep-groups
+    devices:
+      - /dev/dri
+    # SELinux (Fedora): the folders below are the host's own, not relabeled for the container
+    security_opt:
+      - label=disable
+    # the settings, logs and model files are the host's own, at the same paths: the deb or rpm installed on the host
+    # and this container use the same models and settings.  A data folder elsewhere (--data-dir) is mounted at its
+    # own path in compose.override.yaml
+    environment:
+      HOME: ${HOME}
+    volumes:
+      - ${HOME}/.config/xestrata:${HOME}/.config/xestrata
+      - ${HOME}/.local/state/xestrata:${HOME}/.local/state/xestrata
+      - ${HOME}/.local/share/xestrata:${HOME}/.local/share/xestrata
+      # the GPU drivers' compiled kernels, kept from one start to the next
+      - cache:${HOME}/.cache
+    # images on their way to the engine go through /dev/shm (serve/server.py), which is 64 MB by default
+    shm_size: 1g
+    # PID 1 passes the stop signal on to setup and the server, which stop the engine
+    init: true
+    stop_grace_period: 60s
+    restart: unless-stopped
+volumes:
+  cache:

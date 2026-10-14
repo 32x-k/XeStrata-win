@@ -25,6 +25,10 @@ r[0-9][0-9][0-9]*/
 /xestrata-*.json
 /xestrata-*.log
 
+# the user's own for the Podman container: a local rpm to install, and the compose settings of this PC
+/container/rpm/
+/container/compose.override.yaml
+
 # the Windows launchers' build outputs (dotnet)
 windows/launcher/*/bin/
 windows/launcher/*/obj/

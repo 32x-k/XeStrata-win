@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# NVIDIA GPUs through CDI: the host's driver libraries and nvidia-smi, from the NVIDIA Container Toolkit's
+# specification (sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml)
+# (podman compose -f compose.yaml -f compose.nvidia.yaml ...)
+services:
+  xestrata:
+    devices:
+      - nvidia.com/gpu=all
