@@ -5953,10 +5953,12 @@ def desktop_vram_note(amd: bool, vram_free_mib, args: list, desktop: bool) -> st
             f"{(DESKTOP_RESERVE_MIB - reserve) / 1024:.1f} GB less, a few % of speed)")
 
 
-def warn_tight_ram(arena_mib) -> None:
+def warn_tight_ram(arena_mib, experts_ram=None) -> None:
     """The model's experts live in RAM (INFO arena_mib, engine 0.1.10+).  With less than ~6 GB left beside them for the
     system, the engine and this server, Linux may end the engine mid-answer when memory runs out (issue #27);
-    say so at start instead of after a lost answer."""
+    say so at start instead of after a lost answer.  #11: an engine that says `experts_ram` gives in arena_mib what it
+    placed in RAM - the whole arena, or the resident copy of the experts the GPU does not hold (`resident`) - and an
+    older one the whole arena."""
     if not isinstance(arena_mib, int) or arena_mib <= 0:
         return
     try:
@@ -5966,7 +5968,9 @@ def warn_tight_ram(arena_mib) -> None:
         return
     left = total / 2**30 - arena_mib / 1024
     if left < 6:
-        print(f"[strata] WARNING: RAM is tight - the model's experts take {arena_mib / 1024:.1f} GB of this PC's "
+        what = ("the RAM copy of the experts the GPU does not hold takes" if experts_ram == "resident"
+                else "the model's experts take")
+        print(f"[strata] WARNING: RAM is tight - {what} {arena_mib / 1024:.1f} GB of this PC's "
               f"{total / 2**30:.0f} GB, leaving {left:.1f} GB for everything else. "
               + "Linux may stop the engine in the middle of an answer. "
               + f"Close other programs, or run {SETUP_CMD} --setup and pick a smaller size (Q2_0 / IQ2_XS).",
@@ -6565,7 +6569,7 @@ def main() -> int:
             engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
-        warn_tight_ram(engine.info.get("arena_mib"))
+        warn_tight_ram(engine.info.get("arena_mib"), engine.info.get("experts_ram"))
         note = None if groups else desktop_vram_note(amd_card(cfg.get("gpu_pci")), engine.info.get("vram_free_mib"),
                                                      engine_args(cfg), linux_desktop())
         if note:                                        # upstream #560 #516: before --open starts a browser there
