@@ -411,6 +411,8 @@ foreach(kind EXE SHARED MODULE)
   set(CMAKE_${{kind}}_LINKER_FLAGS_INIT "{" ".join(f"/libpath:{d}" for d in libs)}")
 endforeach()
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+# the checks' test programs as Release builds: xwin's splat has no Debug CRT unless asked for it
+set(CMAKE_TRY_COMPILE_CONFIGURATION Release)
 """)
     return tc
 
