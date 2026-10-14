@@ -9,8 +9,10 @@
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_target.hpp"
+#include "q8_1_finite.hpp"
 #include "sm70_table.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_fused_gr
 #include "strata/kernels/device_arch_tag.hpp"
@@ -172,10 +174,131 @@ private:
         d.R = s.R; d.R_out = s.R_out; d.apply = s.apply; d.bo_prev = s.bo_prev; d.inj_prev = s.inj_prev;
         d.w_norm = s.w_norm; d.w_down = s.w_down; d.w_up = s.w_up; d.w_inject = s.w_inject; d.eps = s.eps;
         d.lo = s.lo; d.rs = s.rs; d.inject_out = s.inject_out; d.mixed = s.mixed;
-        d.q8_down = s.q8_down; d.q8_up = s.q8_up;
+        d.q8_down = s.q8_down; d.q8_up = s.q8_up; d.q8_mixed = s.q8_mixed;
     }
     sycl::local_accessor<FusedGrArgs, 1> tab_;
 };
+
+template <int T, int COLS>
+sycl::event gr_up_q8(sycl::queue& q, const GrMulti& m, const float* part, const float* ssg) {
+    static_assert(COLS == 16 || COLS == 32, "a work-group's columns");
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float4, 1> lo(sycl::range<1>((size_t) kFusedGrMaxT * LR / 4), h);
+        sycl::local_accessor<float, 1> rs_s(sycl::range<1>((size_t) kFusedGrMaxT * HC), h);
+        sycl::local_accessor<float, 1> g(sycl::range<1>((size_t) kFusedGrMaxT * HC * COLS), h);
+        sycl::local_accessor<float, 1> mx(sycl::range<1>((size_t) kFusedGrMaxT * COLS), h);
+        const TokArgs tok(h);
+        h.parallel_for(sycl::nd_range<1>((size_t) (N / COLS) * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            tok.stage(m, it);
+            const sycl::sub_group sg = it.get_sub_group();
+            const int t = (int) it.get_local_id(0), lane = (int) sg.get_local_linear_id(), warp = (int) sg.get_group_linear_id();
+            const int grp = (int) it.get_group(0);
+            const int d0 = grp * COLS;
+            if (t < T * HC) {
+                const int k = t / HC, c = t - k * HC;
+                float ss = 0.0f;
+                for (int j = 0; j < Q8_CPS; ++j) ss += ssg[k * Q8_NKC + c * Q8_CPS + j];
+                const auto& a = tok(m, k);
+                const float r = sycl::rsqrt(ss / (float) N + a.eps);
+                rs_s[k * HC + c] = r;
+                if (grp == 0) a.rs[c] = r;
+            }
+            sycl::group_barrier(it.get_group());
+            const bool injects = m.a[0].w_inject != nullptr;
+            for (int i = t; i < T * PR; i += THREADS) {
+                const int k = i / PR, r = i - k * PR;
+                if (r >= LR && (grp != 0 || !injects)) continue;
+                float sum = 0.0f;
+                for (int c = 0; c < HC; ++c) {
+                    float pp = 0.0f;
+                    for (int j = 0; j < Q8_CPS; ++j) pp += part[(size_t) (k * Q8_NKC + c * Q8_CPS + j) * PR + r];
+                    sum = sycl::fma(rs_s[k * HC + c], pp, sum);
+                }
+                if (r < LR) {
+                    const float x = sum / (float) HC;
+                    reinterpret_cast<float*>(&lo[0])[k * LR + r] = x / (1.0f + sycl::exp(-x));
+                } else {
+                    tok(m, k).inject_out[r - LR] = sum;
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            const auto& my = tok(m, lane < T ? lane : 0);   // this lane's token, for its epilogue
+            for (int r = warp; r < HC * COLS; r += WARPS) {
+                const int c = r / COLS, dd = r - c * COLS, i = c * N + d0 + dd;
+                const uint8_t* qrow = m.a[0].q8_up + (size_t) i * Q8_ROW_U;
+                const uint16_t* drow = reinterpret_cast<const uint16_t*>(qrow + LR);
+                float4 w[3];
+#pragma unroll
+                for (int st = 0; st < 3; ++st) {   // lane: values 4 lane + 128 st (the third step: lanes 0-15)
+                    const int v = 4 * lane + 128 * st;
+                    w[st] = v < LR ? q8_four(*reinterpret_cast<const uint32_t*>(qrow + v), drow[v / 32]) : float4(0.0f);
+                }
+                float rv = 0.0f, wn = 0.0f, bo = 0.0f, ip = 0.0f;
+                bool apply = false;
+                if (lane < T) {
+                    rv = my.R[i];
+                    wn = my.w_norm[i];
+                    apply = my.apply;
+                    if (apply) { bo = my.bo_prev[d0 + dd]; ip = my.inj_prev[c]; }
+                }
+                float mine = 0.0f;
+#pragma unroll
+                for (int k = 0; k < T; ++k) {
+                    float acc = 0.0f;
+#pragma unroll
+                    for (int st = 0; st < 3; ++st) {
+                        const int v = 4 * lane + 128 * st;
+                        if (v < LR) {
+                            const float4 x = lo[k * LR / 4 + v / 4];
+                            acc = sycl::fma(w[st].x(), x.x(), acc); acc = sycl::fma(w[st].y(), x.y(), acc);
+                            acc = sycl::fma(w[st].z(), x.z(), acc); acc = sycl::fma(w[st].w(), x.w(), acc);
+                        }
+                    }
+                    acc = warp_sum(sg, acc);
+                    if (lane == k) mine = acc;
+                }
+                if (lane < T) {
+                    if (apply) {
+                        rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
+                        my.R_out[i] = rv;
+                    }
+                    const float x = rv * wn * rs_s[lane * HC + c];
+                    g[(lane * HC + c) * COLS + dd] = x * sigmoidf_(mine);
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            for (int i = t; i < T * COLS; i += THREADS) {
+                const int k = i / COLS, col = i - k * COLS;
+                float sum = 0.0f;
+                for (int c = 0; c < HC; ++c) sum += g[(k * HC + c) * COLS + col];
+                tok(m, k).mixed[d0 + col] = sum / (float) HC;
+                if constexpr (COLS == 32) mx[k * COLS + col] = sum / (float) HC;
+            }
+            if constexpr (COLS == 32) {
+                // upstream 0a379a1f's 32-column up: the work-group owns its columns' q8_1 group, so mixed's q8_1
+                // block is written here, a sub-group a token: native_quantize_q8_1's arithmetic on the same values
+                if (m.a[0].q8_mixed != nullptr) {
+                    sycl::group_barrier(it.get_group());
+                    if (warp < T) {
+                        const float xi = mx[warp * COLS + lane];
+                        float amax = sycl::fabs(xi), sum = xi;
+                        for (int o = WARP / 2; o > 0; o >>= 1) {
+                            amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
+                            sum += sycl::permute_group_by_xor(sg, sum, o);
+                        }
+                        const float d = xe::q8_1_finite(amax / 127.0f);
+                        uint8_t* blk = static_cast<uint8_t*>(tok(m, warp).q8_mixed) + (size_t) (d0 / 32) * 36;
+                        blk[4 + lane] = (uint8_t) xe::q8_1_quant(xi, d, amax);
+                        if (lane == 0) {
+                            const sycl::half2 ds(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+                            *reinterpret_cast<sycl::half2*>(blk) = ds;
+                        }
+                    }
+                }
+            }
+        });
+    });
+}
 
 // STRATA_HC_Q8: the read from the Q8_0 projections (see Q8_RPW above); `part` holds T * Q8_NKC * PR partial dots
 // and then T * Q8_NKC sums of squares.  Another summation order and other weights than the BF16 read.
@@ -280,98 +403,7 @@ sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned l
         gpu_stamp(stamp_buf, stamp_i0, &q);
         gpu_stamp(stamp_buf, stamp_i0 + 1, &q);
     }
-    return q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float4, 1> lo(sycl::range<1>((size_t) kFusedGrMaxT * LR / 4), h);
-        sycl::local_accessor<float, 1> rs_s(sycl::range<1>((size_t) kFusedGrMaxT * HC), h);
-        sycl::local_accessor<float, 1> g(sycl::range<1>((size_t) kFusedGrMaxT * HC * UPM_COLS), h);
-        const TokArgs tok(h);
-        h.parallel_for(sycl::nd_range<1>((size_t) UPM_BLOCKS * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            tok.stage(m, it);
-            const sycl::sub_group sg = it.get_sub_group();
-            const int t = (int) it.get_local_id(0), lane = (int) sg.get_local_linear_id(), warp = (int) sg.get_group_linear_id();
-            const int grp = (int) it.get_group(0);
-            const int d0 = grp * UPM_COLS;
-            if (t < T * HC) {
-                const int k = t / HC, c = t - k * HC;
-                float ss = 0.0f;
-                for (int j = 0; j < Q8_CPS; ++j) ss += ssg[k * Q8_NKC + c * Q8_CPS + j];
-                const auto& a = tok(m, k);
-                const float r = sycl::rsqrt(ss / (float) N + a.eps);
-                rs_s[k * HC + c] = r;
-                if (grp == 0) a.rs[c] = r;
-            }
-            sycl::group_barrier(it.get_group());
-            const bool injects = m.a[0].w_inject != nullptr;
-            for (int i = t; i < T * PR; i += THREADS) {
-                const int k = i / PR, r = i - k * PR;
-                if (r >= LR && (grp != 0 || !injects)) continue;
-                float sum = 0.0f;
-                for (int c = 0; c < HC; ++c) {
-                    float pp = 0.0f;
-                    for (int j = 0; j < Q8_CPS; ++j) pp += part[(size_t) (k * Q8_NKC + c * Q8_CPS + j) * PR + r];
-                    sum = sycl::fma(rs_s[k * HC + c], pp, sum);
-                }
-                if (r < LR) {
-                    const float x = sum / (float) HC;
-                    reinterpret_cast<float*>(&lo[0])[k * LR + r] = x / (1.0f + sycl::exp(-x));
-                } else {
-                    tok(m, k).inject_out[r - LR] = sum;
-                }
-            }
-            sycl::group_barrier(it.get_group());
-            const auto& my = tok(m, lane < T ? lane : 0);   // this lane's token, for its epilogue
-            for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
-                const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
-                const uint8_t* qrow = m.a[0].q8_up + (size_t) i * Q8_ROW_U;
-                const uint16_t* drow = reinterpret_cast<const uint16_t*>(qrow + LR);
-                float4 w[3];
-#pragma unroll
-                for (int st = 0; st < 3; ++st) {   // lane: values 4 lane + 128 st (the third step: lanes 0-15)
-                    const int v = 4 * lane + 128 * st;
-                    w[st] = v < LR ? q8_four(*reinterpret_cast<const uint32_t*>(qrow + v), drow[v / 32]) : float4(0.0f);
-                }
-                float rv = 0.0f, wn = 0.0f, bo = 0.0f, ip = 0.0f;
-                bool apply = false;
-                if (lane < T) {
-                    rv = my.R[i];
-                    wn = my.w_norm[i];
-                    apply = my.apply;
-                    if (apply) { bo = my.bo_prev[d0 + dd]; ip = my.inj_prev[c]; }
-                }
-                float mine = 0.0f;
-#pragma unroll
-                for (int k = 0; k < T; ++k) {
-                    float acc = 0.0f;
-#pragma unroll
-                    for (int st = 0; st < 3; ++st) {
-                        const int v = 4 * lane + 128 * st;
-                        if (v < LR) {
-                            const float4 x = lo[k * LR / 4 + v / 4];
-                            acc = sycl::fma(w[st].x(), x.x(), acc); acc = sycl::fma(w[st].y(), x.y(), acc);
-                            acc = sycl::fma(w[st].z(), x.z(), acc); acc = sycl::fma(w[st].w(), x.w(), acc);
-                        }
-                    }
-                    acc = warp_sum(sg, acc);
-                    if (lane == k) mine = acc;
-                }
-                if (lane < T) {
-                    if (apply) {
-                        rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
-                        my.R_out[i] = rv;
-                    }
-                    const float x = rv * wn * rs_s[lane * HC + c];
-                    g[(lane * HC + c) * UPM_COLS + dd] = x * sigmoidf_(mine);
-                }
-            }
-            sycl::group_barrier(it.get_group());
-            for (int i = t; i < T * UPM_COLS; i += THREADS) {
-                const int k = i / UPM_COLS, col = i - k * UPM_COLS;
-                float sum = 0.0f;
-                for (int c = 0; c < HC; ++c) sum += g[(k * HC + c) * UPM_COLS + col];
-                tok(m, k).mixed[d0 + col] = sum / (float) HC;
-            }
-        });
-    });
+    return m.a[0].q8_mixed != nullptr ? gr_up_q8<T, 32>(q, m, part, ssg) : gr_up_q8<T, 16>(q, m, part, ssg);
 }
 
 // Upstream's latency-hidden up projection (gr_fast): 8 lanes a row instead of a sub-group.  Lane j holds the default
@@ -469,10 +501,13 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     for (int t = 0; t < n_tok; ++t) {
         m.a[t] = a[t];
         const FusedGrArgs& x = a[t];
-        if (!x.R || !x.w_norm || !x.w_down || !x.w_up || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
+        // the BF16 projections, or (STRATA_HC_Q8 with the BF16 copies dropped) the Q8_0 ones alone
+        if (!x.R || !x.w_norm || (!(x.w_down && x.w_up) && !x.q8_down) || !x.lo || !x.rs || !x.mixed ||
+            (x.w_inject && !x.inject_out) ||
             (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) || x.w_down != a[0].w_down || x.w_up != a[0].w_up ||
             x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm || x.q8_down != a[0].q8_down ||
-            x.q8_up != a[0].q8_up || (x.q8_down == nullptr) != (x.q8_up == nullptr))
+            x.q8_up != a[0].q8_up || (x.q8_down == nullptr) != (x.q8_up == nullptr) ||
+            (x.q8_mixed != nullptr && x.q8_down == nullptr) || (x.q8_mixed == nullptr) != (a[0].q8_mixed == nullptr))
             throw core::DeviceError("fused_gr_read_multi: invalid arguments for token " + std::to_string(t));
     }
     m.xn = xn_scratch;
@@ -756,40 +791,68 @@ void fused_gr_quantize_q8_0(const uint16_t* src, uint8_t* dst, int64_t nb, void*
     });
 }
 
-void fused_gr_time_q8(const FusedGrArgs& w, int n_tok, int reps, void* stream, double& bf16_us, double& q8_us) {
+namespace {
+bool g_q8_fuse = false;
+}
+void fused_gr_set_q8_fuse(bool on) { g_q8_fuse = on; }
+bool fused_gr_q8_fuse() { return g_q8_fuse; }
+
+void fused_gr_time_q8(const FusedGrArgs& w, int n_tok, int reps, void* stream, double& bf16_us, double& q8_us,
+                      double& q8f_us) {
     if (n_tok < 1 || n_tok > kFusedGrMaxT || reps < 1 || w.q8_down == nullptr || w.q8_up == nullptr)
         throw core::DeviceError("fused_gr_time_q8: invalid arguments");
     auto& q = queue_for(stream);
-    // per token: R, its block output, injection, lo, rs, inject_out, mixed; then the xn scratch
-    const size_t per = (size_t) D + N + HC + LR + HC + HC + N, total = per * (size_t) n_tok + (size_t) n_tok * D;
+    // per token: R, its block output, injection, lo, rs, inject_out, mixed; then the xn scratch, then mixed's q8_1
+    const size_t per = (size_t) D + N + HC + LR + HC + HC + N, q81 = (size_t) N / 32 * 36 / sizeof(float);
+    const size_t total = per * (size_t) n_tok + (size_t) n_tok * D + (size_t) n_tok * q81 + N;
     float* buf = sycl::malloc_device<float>(total, q);
     if (buf == nullptr) throw core::DeviceError("fused_gr_time_q8: no device memory for the inputs");
     q.memset(buf, 0, total * sizeof(float)).wait();
+    float* xn = buf + per * (size_t) n_tok;
+    float* xq = xn + (size_t) n_tok * D;
+    float* mixed = buf + (size_t) n_tok * per;   // the quantize launch's n_tok contiguous rows (the xn scratch)
     FusedGrArgs a[kFusedGrMaxT];
     for (int t = 0; t < n_tok; ++t) {
         float* b = buf + per * (size_t) t;
         a[t] = w;
         a[t].R = b; a[t].R_out = b; a[t].apply = true;
         a[t].bo_prev = b + D; a[t].inj_prev = b + D + N; a[t].lo = b + D + N + HC; a[t].rs = b + D + N + HC + LR;
-        a[t].inject_out = b + D + N + HC + LR + HC; a[t].mixed = b + D + N + HC + LR + 2 * HC;
+        a[t].inject_out = b + D + N + HC + LR + HC; a[t].mixed = b + D + N + HC + LR + (size_t) 2 * HC;
     }
-    float* xn = buf + per * (size_t) n_tok;
-    auto run = [&](bool q8) {
+    auto run = [&](int form) {   // 0 BF16 + quantize, 1 Q8_0 + quantize, 2 Q8_0 writing the q8_1
         for (int t = 0; t < n_tok; ++t) {
-            a[t].q8_down = q8 ? w.q8_down : nullptr;
-            a[t].q8_up = q8 ? w.q8_up : nullptr;
+            a[t].q8_down = form > 0 ? w.q8_down : nullptr;
+            a[t].q8_up = form > 0 ? w.q8_up : nullptr;
+            a[t].q8_mixed = form == 2 ? (void*) (xq + q81 * (size_t) t) : nullptr;
         }
-        for (int i = 0; i < 3; ++i) fused_gr_read_multi(a, n_tok, xn, stream);
+        auto once = [&] {
+            fused_gr_read_multi(a, n_tok, xn, stream);
+            if (form < 2) native_quantize_q8_1(mixed, xq, N, n_tok, stream);
+        };
+        for (int i = 0; i < 3; ++i) once();
         q.wait();
         const auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < reps; ++i) fused_gr_read_multi(a, n_tok, xn, stream);
+        for (int i = 0; i < reps; ++i) once();
         q.wait();
         return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
     };
-    bf16_us = run(false);
-    q8_us = run(true);
-    bf16_us = (bf16_us + run(false)) / 2;   // both forms timed on either side of the other
+    bf16_us = run(0);
+    q8_us = run(1);
+    q8f_us = run(2);
+    bf16_us = (bf16_us + run(0)) / 2;   // the BF16 read timed on either side of the others
     sycl::free(buf, q);
+}
+
+void fused_gr_q8_rows_to_bf16(const uint8_t* q8, uint16_t* dst, int64_t ne0, int64_t ne1, void* stream) {
+    if (ne0 <= 0 || ne1 <= 0) return;
+    if (ne0 % 32 != 0) throw core::DeviceError("fused_gr_q8_rows_to_bf16: a row is not whole Q8_0 blocks");
+    const size_t row = (size_t) ne0 + (size_t) ne0 / 32 * 2;   // kNativeQ8Rows: ne0 int8 values, then the fp16 scales
+    queue_for(stream).parallel_for(sycl::range<1>((size_t) ne0 * (size_t) ne1), [=](sycl::id<1> id) {
+        const size_t r = id[0] / (size_t) ne0, i = id[0] % (size_t) ne0;
+        const uint8_t* q = q8 + r * row;
+        const uint16_t d = (uint16_t) (q[ne0 + i / 32 * 2] | (q[ne0 + i / 32 * 2 + 1] << 8));
+        dst[id[0]] = bf16_from_f32((float) sycl::bit_cast<sycl::half>(d) * (float) (int8_t) q[i]);
+    });
 }
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) {

@@ -6,6 +6,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
+#include "strata/core/native_dense.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/core/per_device.hpp"
@@ -1694,9 +1695,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 // recomputes them from R)
                 if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo);
                 normed = false;
-                if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
+                // STRATA_HC_Q8 with the BF16 copies dropped: each from its Q8_0 copy, dequantized on m.cs
+                core::WeightRef wdv = *wd, wuv = *wu;
+                if (wd->data == nullptr) wdv.data = core::hc_bf16_view(wd, 0, m.cs);
+                if (wu->data == nullptr) wuv.data = core::hc_bf16_view(wu, 1, m.cs);
+                if (!bf16_proj(m.gemm, &wdv, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
-                if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
+                if (!bf16_proj(m.gemm, &wuv, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
                 if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
                 gr_mix_r(m.R, m.xn, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
                          m.mixed_bf_lo);

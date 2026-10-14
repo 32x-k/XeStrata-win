@@ -729,8 +729,10 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 a.bo_prev = bo_ + t * N; a.inj_prev = inj_prev + t * HC;
                 a.w_norm = (const float*) wn[half]->data; a.w_down = (const uint16_t*) wd[half]->data;
                 a.w_up = (const uint16_t*) wu[half]->data; a.w_inject = (const uint16_t*) wi[half]->data;
-                if (wd[half]->hc_q8 != nullptr && wu[half]->hc_q8 != nullptr) {   // STRATA_HC_Q8=1
+                if (wd[half]->hc_q8 != nullptr && wu[half]->hc_q8 != nullptr) {   // STRATA_HC_Q8
                     a.q8_down = (const uint8_t*) wd[half]->hc_q8; a.q8_up = (const uint8_t*) wu[half]->hc_q8;
+                    // the first half's mixed as q8_1 too, for the GDN / QSA projections (no quantize launch)
+                    if (half == 0 && fused_gr_q8_fuse()) a.q8_mixed = xq_ + (size_t) (t - tb) * (N / 32) * 36;
                 }
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
@@ -739,6 +741,8 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
         gr_read_group(0, pending, inj2_, inj_);
+        // the read wrote mixed's q8_1 into xq_ itself (STRATA_HC_Q8's 32-column up)
+        const bool mixed_q8 = wd[0]->hc_q8 != nullptr && wu[0]->hc_q8 != nullptr && fused_gr_q8_fuse();
         stamp(l, 1, grp);
         float* xm = mixed_ + tb * N;
         try {
@@ -760,7 +764,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 float* hb = h_L_ + (size_t) gi * MT * C;
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
-                native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                if (!mixed_q8) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 if (br) {   // a/b and z beside q/k/v and the conv: they read only this layer's input (xm, xq_)
                     if (!fork(0)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
                     gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
@@ -860,7 +864,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     return e == nullptr || std::strtol(e, nullptr, 10) != 0;
                 }();
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
-                native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                if (!mixed_q8) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 // the query side on branches (upstream 2e4ddf6e): q with its split, norm, RoPE and rotation on side 0, the
                 // indexer query on side 1, beside the K/V side; side 1 joins before the block scores, side 0 before
                 // attention (xq_ and mixed_ are not rewritten before then)

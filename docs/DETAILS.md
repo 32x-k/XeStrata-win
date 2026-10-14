@@ -222,8 +222,11 @@ Its experts are Q4_K, Q5_K, Q5_1 and Q8_0 blocks, 77 GB of them: more than a 64 
 setup downloads the shards from a pinned revision, checks their SHA-256 once, and packs the model with `--compat-bf16`.
 That turns its Q8_0 hyper-connection projections into BF16, the form the engine reads.
 The verify window's hyper-connection read (the final mixer's before the head too) can read the GGUF's Q8_0 values themselves (upstream fe6c5260; a BF16 pack's are quantized to Q8_0 at load; 0.62 GiB more VRAM, and the answers change).
-At load, where those copies are at most 5% of the free VRAM, the engine times the read in both forms and keeps the Q8_0 one only when it is faster (`STRATA_HC_Q8=1`: always, `=0`: never).
-IQ3_XXS's 32K decode: the B70 (32 GB) takes Q8_0, +3%; on the RTX 4070 (12 GB) and the RX 9060 XT (16 GB) the copies would take the expert cache's room, so they stay BF16 (Q8_0 on the RTX 4070: -3%).
+At load the engine times the read in its BF16 and Q8_0 forms and keeps the Q8_0 one only when it is faster (`STRATA_HC_Q8=1`: always, `=0`: never).
+On one GPU, once the Q8_0 read is chosen the layers' BF16 copies leave the VRAM (upstream b60aab1b; 1.17 GiB with IQ3_XXS) and the expert cache gets their room; the prompt path turns the Q8_0 values back into BF16 in a scratch as it reads them.
+A layer split cannot drop the BF16, so there a GPU whose Q8_0 copies would take more than 5% of the free VRAM stays BF16.
+The Q8_0 read that also writes the next projections' q8_1, 32 columns a work-group (upstream 0a379a1f), is timed too and taken where it is faster (`STRATA_HC_Q8_FUSE=0/1` decides; the same answers).
+IQ3_XXS's 32K decode: B70 +3.5%, RTX 4070 the same (prefill +1%), RX 9060 XT +0.6% (there with the q8_1 written in the read).
 The engine reads the experts from the GGUF files in place.
 It keeps a RAM budget of them, the most-used first after the ones the GPU holds (`--resident-budget-gib N`).
 setup chooses the RAM less 24 GB for N, less the KV cache too when that lives in RAM:

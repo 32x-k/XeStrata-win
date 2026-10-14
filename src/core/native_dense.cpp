@@ -96,18 +96,28 @@ bool hc_q8_faster(const WeightTable& table, const std::vector<std::pair<WeightRe
         w.w_inject = static_cast<const uint16_t*>(inject->data);
         w.q8_down = copy_of(down);
         w.q8_up = copy_of(up);
-        double b1 = 0, q1 = 0, b4 = 0, q4 = 0;
+        double b1 = 0, q1 = 0, f1 = 0, b4 = 0, q4 = 0, f4 = 0;
         try {
-            strata::kernels::fused_gr_time_q8(w, 1, 20, stream, b1, q1);
-            strata::kernels::fused_gr_time_q8(w, 4, 20, stream, b4, q4);
+            strata::kernels::fused_gr_time_q8(w, 1, 20, stream, b1, q1, f1);
+            strata::kernels::fused_gr_time_q8(w, 4, 20, stream, b4, q4, f4);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "strata: STRATA_HC_Q8: timing the read failed (%s): the BF16 read\n", e.what());
             return false;
         }
-        const bool faster = q1 + q4 < 0.99 * (b1 + b4);
-        std::fprintf(stderr, "strata: STRATA_HC_Q8: the hyper-connection read, 1 and 4 tokens: BF16 %.1f + %.1f us, "
-                             "Q8_0 %.1f + %.1f us: the %s read (STRATA_HC_Q8=0/1 picks one)\n",
-                     b1, b4, q1, q4, faster ? "Q8_0" : "BF16");
+        // the read with the launch that quantizes mixed after it, or (the 32-column Q8_0 up) writing the q8_1 itself
+        // STRATA_HC_Q8_FUSE=0/1 overrides the choice between the two Q8_0 forms (the same bits either way)
+        static const int fuse_env = [] {
+            const char* v = std::getenv("STRATA_HC_Q8_FUSE");
+            return v == nullptr || *v == 0 ? -1 : (int) (std::strtol(v, nullptr, 10) != 0);
+        }();
+        const bool fuse = fuse_env >= 0 ? fuse_env == 1 : f1 + f4 < q1 + q4;
+        const double best = fuse ? f1 + f4 : q1 + q4;
+        const bool faster = best < 0.99 * (b1 + b4);
+        strata::kernels::fused_gr_set_q8_fuse(faster && fuse);
+        std::fprintf(stderr, "strata: STRATA_HC_Q8: the hyper-connection read and mixed's q8_1, 1 and 4 tokens: BF16 "
+                             "%.1f + %.1f us, Q8_0 %.1f + %.1f us, Q8_0 writing the q8_1 %.1f + %.1f us: the %s read "
+                             "(STRATA_HC_Q8=0/1 picks one)\n",
+                     b1, b4, q1, q4, f1, f4, faster ? (fuse ? "Q8_0 (q8_1 in the read)" : "Q8_0") : "BF16");
         return faster;
     }
     return false;
@@ -168,10 +178,71 @@ bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set
     return true;
 }
 
+namespace {
+// hc_bf16_view's scratch (drop_hc_bf16 allocates it): four matrices of the largest down / up size
+void* g_hc_scratch[4] = {nullptr, nullptr, nullptr, nullptr};
+}
+
 NativeDense::~NativeDense() {
     if (scratch_) strata::gpu::free(scratch_);
     for (void* p : weights_) strata::gpu::free(p);
     for (void* p : hc_q8_) strata::gpu::free(p);
+    if (hc_side_)
+        for (void*& p : g_hc_scratch) { strata::gpu::free(p); p = nullptr; }
+}
+
+bool NativeDense::hc_q8_wanted() { return hc_q8_requested(); }
+
+bool NativeDense::hc_side_names(const std::string& pack_dir, std::set<std::string>& hc, std::set<std::string>& others,
+                                std::string& err) {
+    std::FILE* f = std::fopen((pack_dir + "/index.txt").c_str(), "rb");
+    if (f == nullptr) { err = "cannot open " + pack_dir + "/index.txt"; return false; }
+    char line[1024], name[256];
+    while (std::fgets(line, sizeof line, f)) {
+        if (line[0] == '#' || std::sscanf(line, "%255s", name) != 1) continue;
+        const std::string n = name;
+        const bool side = n.rfind("blk.", 0) == 0 && (n.ends_with(".hc_attn_down.weight") ||
+                          n.ends_with(".hc_attn_up.weight") || n.ends_with(".hc_ffn_down.weight") ||
+                          n.ends_with(".hc_ffn_up.weight"));
+        (side ? hc : others).insert(n);
+    }
+    std::fclose(f);
+    return true;
+}
+
+void NativeDense::adopt(WeightTable& main, const WeightTable& side) {
+    for (const auto& [name, ref] : side.table_) {
+        if (!ref.resident || ref.data == nullptr) continue;
+        auto it = main.table_.find(name);
+        if (it == main.table_.end()) continue;
+        it->second.data = ref.data;
+        it->second.resident = true;
+    }
+}
+
+bool NativeDense::drop_hc_bf16(WeightTable& table, std::string& err) {
+    uint64_t largest = 0;
+    for (auto& [name, ref] : table.table_) {
+        if (name.rfind("blk.", 0) != 0 || ref.hc_q8 == nullptr) continue;
+        largest = (std::max)(largest, (uint64_t) ref.ne0 * (uint64_t) ref.ne1 * 2);
+        ref.data = nullptr;
+        ref.resident = false;
+    }
+    for (void*& p : g_hc_scratch) {
+        if (p == nullptr && !strata::gpu::alloc_device(&p, largest)) {
+            err = std::string("native dense (STRATA_HC_Q8): the BF16 scratch: ") + strata::gpu::last_error();
+            return false;
+        }
+    }
+    return true;
+}
+
+const uint16_t* hc_bf16_view(const WeightRef* w, int slot, void* stream) {
+    if (w->data != nullptr || w->hc_q8 == nullptr || slot < 0 || slot > 3 || g_hc_scratch[slot] == nullptr)
+        return static_cast<const uint16_t*>(w->data);
+    auto* dst = static_cast<uint16_t*>(g_hc_scratch[slot]);
+    strata::kernels::fused_gr_q8_rows_to_bf16(static_cast<const uint8_t*>(w->hc_q8), dst, w->ne0, w->ne1, stream);
+    return dst;
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
@@ -264,7 +335,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 auto& ref = found->second;
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
-                if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
+                if (!strata::kernels::native_mmvq_supported((int) tensor.type)) continue;
                 // #326: the pack keeps an unquantized (--compat-bf16) key, which the PLE reads from the arena
                 if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
                 if (!ref.quantized() || tensor.shape.size() != 2 ||
@@ -273,7 +344,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     err = "native dense: incompatible matrix " + tensor.name; return false;
                 }
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
-                    tensor.type, (int) ref.ne0, (int) ref.ne1);
+                    (int) tensor.type, (int) ref.ne0, (int) ref.ne1);
                 void* allocation = nullptr;
                 bool status = strata::gpu::alloc_device(&allocation, bytes);
                 DevicePtr data(allocation);
@@ -354,13 +425,15 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         if (hc_q8_mode() == HcQ8::Auto && !hc_q8_short && !hc_q8.empty()) {
             // the copies' VRAM is the expert cache's: on the RTX 4070 (12 GB, IQ3_XXS) they were 9.7% of the VRAM
             // free here and took 14% of its slots, and the decode lost 3% though the read itself was 18% faster; on
-            // the B70 (32 GB) 2.4% and +3.3% (2026-10-15).  So the read is timed only where they are under 5%.
+            // the B70 (32 GB) 2.4% and +3.3% (2026-10-15).  So the read is timed only where they are under 5% - unless
+            // the BF16 copies are in a side allocation the caller frees on the Q8_0 read (set_hc_side): the Q8_0
+            // copies then take less VRAM than they give back.
             uint64_t q8_bytes = 0;
             for (const auto& h : hc_q8) q8_bytes += (uint64_t) h.first->ne0 / 32 * 34 * (uint64_t) h.first->ne1;
             size_t free_b = 0, total_b = 0;
             const double share = strata::gpu::mem_info(&free_b, &total_b) && free_b + q8_bytes > 0
                                      ? (double) q8_bytes / (double) (free_b + q8_bytes) : 1.0;
-            if (share > 0.05) {
+            if (!hc_side_ && share > 0.05) {
                 std::fprintf(stderr, "strata: STRATA_HC_Q8: the Q8_0 hyper-connection projections would take %.1f%% "
                                      "of the free VRAM from the expert cache: the BF16 read (STRATA_HC_Q8=1 keeps "
                                      "them)\n", 100.0 * share);

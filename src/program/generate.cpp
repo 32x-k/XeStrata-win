@@ -3545,6 +3545,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: layer split: CUDA0 loads the dense weights of layers 0-%lld only\n",
                      (long long) split_at[0] - 1);
     }
+    // STRATA_HC_Q8 (upstream b60aab1b, one GPU): the layers' hyper-connection down / up projections are left out of
+    // the arena and loaded beside it, so that when NativeDense chooses their Q8_0 read their BF16 (1.17 GiB with
+    // IQ3_XXS, against 0.62 GiB of Q8_0) goes back to the expert cache.
+    std::set<std::string> hc_side, hc_others;
+    const bool hc_side_on = split_devs.empty() && !o.keep_canonical && !o.native_dense_gguf.empty() &&
+                            strata::core::NativeDense::hc_q8_wanted() &&
+                            strata::core::NativeDense::hc_side_names(o.pack, hc_side, hc_others, err) &&
+                            !hc_side.empty();
+    if (hc_side_on) skip.insert(hc_side.begin(), hc_side.end());
     uint64_t pool_bytes = 0;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -3580,12 +3589,36 @@ int main(int argc, char** argv) {
                          "skipped: served natively)\n",
                  (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), load_s(), skip.size());
     mem_mark("the pack weights");
+    strata::core::WeightTable hc_wt;
+    void* hc_arena = nullptr;
+    if (hc_side_on) {
+        uint64_t hc_bytes = 0;
+        if (!strata::core::WeightTable::pool_bytes(o.pack, hc_bytes, err, &hc_others) ||
+            !strata::gpu::alloc_device(&hc_arena, hc_bytes) ||
+            !hc_wt.load(o.pack, hc_arena, hc_bytes, err, &hc_others)) {
+            std::fprintf(stderr, "strata generate: the hyper-connection projections: %s\n",
+                         err.empty() ? strata::gpu::last_error() : err.c_str());
+            return 1;
+        }
+        strata::core::NativeDense::adopt(wt, hc_wt);
+    }
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
+        native_dense.set_hc_side(hc_side_on);
         if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
+        }
+        if (hc_side_on && native_dense.hc_q8_chosen()) {
+            if (!native_dense.drop_hc_bf16(wt, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            strata::gpu::free(hc_arena);
+            hc_arena = nullptr;
+            std::fprintf(stderr, "strata generate: STRATA_HC_Q8: the BF16 hyper-connection projections freed (%.2f "
+                                 "GiB back to the expert cache)\n", (double) hc_wt.report().arena_bytes / 1073741824.0);
         }
         std::fprintf(stderr, "strata generate: %zu native projection matrices, %.2f MiB of weights, in %.1f s\n",
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0), load_s());
