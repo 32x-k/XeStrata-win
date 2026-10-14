@@ -39,7 +39,8 @@ const char* last_error();
 /// free if it can still be read, and whether the GPU still answers (Runtime::device_status).
 std::string failure_report(const std::exception& e);
 
-Stream stream_create();
+/// `high_priority`: a stream the device may run ahead of the others (Runtime::create_stream).
+Stream stream_create(bool high_priority = false);
 /// A stream for copies and events alone (Runtime::create_copy_stream): the copy engine where the device has one.
 Stream stream_create_copy();
 void stream_destroy(Stream s);

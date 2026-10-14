@@ -266,8 +266,16 @@ bool Runtime::measure_marks() {
     }
 }
 
-sycl::queue* Runtime::create_stream() {
+sycl::queue* Runtime::create_stream(bool high_priority) {
     std::lock_guard<std::mutex> lock(streams_mutex_);
+#if defined(SYCL_EXT_ONEAPI_QUEUE_PRIORITY)
+    if (high_priority)
+        return &streams_.emplace_back(context_, device_, handler(),
+                                      sycl::property_list{sycl::property::queue::in_order{},
+                                                          sycl::ext::oneapi::property::queue::priority_high{}});
+#else
+    (void) high_priority;
+#endif
     return &streams_.emplace_back(context_, device_, handler(), sycl::property::queue::in_order{});
 }
 

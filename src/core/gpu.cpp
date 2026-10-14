@@ -133,8 +133,8 @@ std::string failure_report(const std::exception& e) {
     return r;
 }
 
-Stream stream_create() {
-    try { return rt().create_stream(); }
+Stream stream_create(bool high_priority) {
+    try { return rt().create_stream(high_priority); }
     catch (const std::exception& e) { fail("stream_create", e); return nullptr; }
 }
 

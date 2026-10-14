@@ -42,8 +42,10 @@ public:
 
     // Engine streams: further in-order queues on this context, for the work CUDA put on its own streams.  A void*
     // stream handed to a kernel is one of these, compute() or null (compute()), or a queue of another device's
-    // runtime (the kernel then runs there); anything else is refused.
-    sycl::queue* create_stream();
+    // runtime (the kernel then runs there); anything else is refused.  `high_priority`: sycl_ext_oneapi_queue_priority's
+    // priority_high, a hint the backend maps to its own (CUDA and HIP stream priorities, Level Zero's queue priority);
+    // a runtime without the extension gives an ordinary stream.
+    sycl::queue* create_stream(bool high_priority = false);
     // An engine stream for copies and events alone, on the GPU's copy engine where the device reports a copy-only
     // queue group (Level Zero); elsewhere an ordinary engine stream.  No kernel may go on it.
     sycl::queue* create_copy_stream();

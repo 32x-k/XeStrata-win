@@ -449,7 +449,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
     (void) TS;
-    if (!(copy_ = strata::gpu::stream_create())) {
+    // STRATA_COPY_PRIO=1: the copy stream at high priority (upstream 728097fb6, opt-in)
+    static const bool copy_prio = [] {
+        const char* v = std::getenv("STRATA_COPY_PRIO");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (!(copy_ = strata::gpu::stream_create(copy_prio))) {
         err = "verify: copy stream create failed";
         return false;
     }

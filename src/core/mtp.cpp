@@ -342,7 +342,13 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             for (int64_t i = 0; i < cap_; ++i) id[(size_t) (t * (uint64_t) cap_ + (uint64_t) i)] = (int32_t) i;
         strata::gpu::copy(ident_, id.data(), id.size() * 4);
     }
-    cs_ = strata::gpu::stream_create();
+    // STRATA_MTP_PRIO=1: the drafter's stream at high priority, so its round is not queued behind the verifier's copies
+    // and the next window (upstream 1d21b9cd6, 655145426: on HIP, R9700)
+    static const bool prio = [] {
+        const char* v = std::getenv("STRATA_MTP_PRIO");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    }();
+    cs_ = strata::gpu::stream_create(prio);
     side_ = cs_ ? strata::gpu::stream_create() : nullptr;
     if (!cs_ || !side_) {
         err = "mtp: stream";
