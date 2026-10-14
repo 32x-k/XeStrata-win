@@ -52,7 +52,7 @@ curl -fsSL -o "/build/$xwin_tar.sha256" "https://github.com/Jake-Shadle/xwin/rel
 echo "$(cat "/build/$xwin_tar.sha256")  /build/$xwin_tar" | sha256sum -c
 tar -xzf "/build/$xwin_tar" -C /build
 "/build/xwin-$xwin_ver-x86_64-unknown-linux-musl/xwin" --accept-license --cache-dir /cache/xwin --arch x86_64 \
-  splat --output /build/xwin
+  splat --copy --output /build/xwin   # copied: /cache is another file system
 python3 "$src/tools/intel_llvm_build.py" --windows --xwin /build/xwin ${XESTRATA_JOBS:+--jobs "$XESTRATA_JOBS"}
 sycl=$src/.tools/intel-llvm-win/install
 
