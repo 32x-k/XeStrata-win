@@ -6,7 +6,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 [English](BUILD.md) | 日本語
 
-XeStrata をソースから入れる方法、エンジンのビルドの方式、setup の振る舞いと要るパッケージ、deb と rpm のパッケージの作り方をまとめます。
+XeStrata をソースから入れる方法、エンジンのビルドの方式、setup の振る舞いと要るパッケージ、deb と rpm のパッケージの作り方、Podman のコンテナをまとめます。
 パッケージから入れて使う方法は [README](../README.ja.md) にあります。
 
 ## ソースから入れる
@@ -477,3 +477,50 @@ xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）�
   （2026-10-06。forky と sid には 26.27 があります）。
 - **openSUSE Leap 16.0**: compute-runtime が 25.18 で、Arc Pro B70 を列挙しません。openSUSE の OBS にも Leap 16 向けの新しい版はありません
   （2026-10-06）。
+
+## Podman
+
+`container/` の Containerfile と compose のファイルで、XeStrata を rootless の Podman のコンテナで動かします（使い方は [README](../README.ja.md#podman)）。
+イメージは使う人の PC で作り、配布しません。contrib の版のイメージには、自由ソフトウェアでない cuBLAS と oneMKL が入るためです。
+
+- **中身**: `tools/package/build.sh` と同じ Fedora 44 のイメージ（ダイジェストで固定）に、Releases の rpm を `SHA256SUMS` で確かめて入れます。
+  続けて、その `BUILD.json` の `runtime` にあるメーカーのもの（Level Zero、ROCm の HIP の実行時と rocBLAS と hipBLASLt、cuBLAS、oneMKL）と
+  Mesa の Vulkan のドライバーをすべて入れます（`container/install.sh`）。
+  NVIDIA のドライバーのライブラリと `nvidia-smi` は入れず、CDI でホストのものを使います。
+- **ビルドの引数**: 環境変数で `podman compose build` に渡します。
+
+| 変数 | 既定 | 意味 |
+| --- | --- | --- |
+| `XESTRATA_VERSION` | `latest` | リリースのタグ（`xe0.1.43.1` など） |
+| `XESTRATA_VARIANT` | `contrib-cuda13.4` | 入れる rpm の版 |
+| `XESTRATA_NONFREE` | `1` | `0` で oneMKL と cuBLAS を入れません（Intel と NVIDIA の密な積は XeStrata の自前のカーネルになります） |
+
+- **手元の rpm**: `container/rpm/` に rpm を 1 つ置くと、Releases から取らずにそれを入れます。
+  Releases にない `xestrata-free` は、`tools/package/build.sh fedora44 free` で作ってここに置きます。
+- **GPU**: `/dev/dri` を渡し、`userns_mode: keep-id` と `group_add: keep-groups` で、ホストのユーザーの uid と render グループの権限のまま開きます
+  （`keep-groups` には crun のランタイムが要ります）。AMD は `compose.amd.yaml` が `/dev/kfd` を足します。
+  NVIDIA は `compose.nvidia.yaml` が CDI の `nvidia.com/gpu=all` を渡すので、ホストに NVIDIA Container Toolkit（`nvidia-container-toolkit`、NVIDIA のリポジトリにあります）を入れて、一度 CDI の設定を作ります。
+
+```bash
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+```
+
+- **ネットワーク**: ホストのネットワークを使い、サーバーはパッケージと同じく 127.0.0.1:8095 で待ちます。
+  ほかの機器から使うときも、パッケージと同じく `--host 0.0.0.0 --api-key <秘密の文字列>` です。
+- **置き場所**: `~/.config/xestrata`・`~/.local/state/xestrata`・`~/.local/share/xestrata` をホストと同じパスに渡し、`HOME` もホストと同じにします。
+  設定に書く絶対パスがホストとコンテナで一致するので、ホストのパッケージ（Ubuntu の deb でも）と設定とモデルを共有できます。
+  設定の中のエンジンの場所は、起動のたびに動いているパッケージのものに付け替えます。
+  GPU のドライバーがコンパイルしたカーネルは、名前付きボリューム `cache`（`~/.cache`）に残します。
+- **データフォルダがほかの場所にあるとき**（`--data-dir`）は、`container/compose.override.yaml` で同じパスに渡します。
+  `-f` を付けて動かすときは、`-f compose.override.yaml` も並べます。
+
+```yaml
+services:
+  xestrata:
+    volumes:
+      - /mnt/models/XeStrata-data:/mnt/models/XeStrata-data
+```
+
+- **SELinux**（Fedora など）: ホストのフォルダーのラベルを書き換えないよう、コンテナは `label=disable` で動かします。ビルドのときだけ、`container/` を読めるようにラベルを付けます（`relabel=shared`）。
+- **memlock**: rootless のコンテナは、ホストのユーザーの上限を超えられません。setup が上限が足りないと言ったら、ホストで上げます。
+- **止め方**: `podman compose down` です。`init` の PID 1 が止める合図を setup とサーバーに渡し、エンジンが止まるのを最大 60 秒待ちます。
