@@ -19,10 +19,11 @@ python_ver=3.14.8
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-# llvm-21: llvm-lib, llvm-rc, llvm-mt and llvm-ml, which intel/llvm does not install; nvidia-cuda-toolkit: CUDA 12.4,
-# for intel/llvm's CUDA target and the engine's NVIDIA code (not free software); dotnet-sdk-10.0 for the launchers
+# llvm-21 and lld-21: llvm-lib, llvm-rc, llvm-mt, llvm-ml and lld-link, which intel/llvm does not install;
+# nvidia-cuda-toolkit: CUDA 12.4, for intel/llvm's CUDA target and the engine's NVIDIA code (not free software);
+# dotnet-sdk-10.0 for the launchers
 apt-get install -y -q --no-install-recommends git cmake ninja-build g++ libhwloc-dev libzstd-dev python3 python3-pip \
-  curl ca-certificates unzip ccache lld llvm-21 dotnet-sdk-10.0 7zip nvidia-cuda-toolkit
+  curl ca-certificates unzip ccache lld lld-21 llvm-21 dotnet-sdk-10.0 7zip nvidia-cuda-toolkit
 cuda_path=/usr/lib/cuda
 
 # build.sh's compiler cache, shared with the Ubuntu packages (container.sh)

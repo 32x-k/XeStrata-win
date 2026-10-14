@@ -350,7 +350,7 @@ WIN_CASE_LIBS = {"Shlwapi.lib": "um/x86_64/shlwapi.lib"}
 
 def llvm_bin_with(tool: str) -> Path:
     """The newest of the distribution's LLVM folders with `tool` (llvm-lib, llvm-rc, llvm-mt, llvm-ml: Ubuntu's
-    llvm-<version>), which intel/llvm does not install."""
+    llvm-<version>; lld-link: lld-<version>), which intel/llvm does not install."""
     for d in sorted(Path("/usr/lib").glob("llvm-*/bin"), key=lambda p: version_key(p.parent.name), reverse=True):
         if (d / tool).exists():
             return d / tool
@@ -393,13 +393,15 @@ def win_toolchain(xwin: Path, host_bin: Path) -> Path:
     libs = [xwin / "crt" / "lib" / "x86_64", *(xwin / "sdk" / "lib" / s / "x86_64" for s in ("um", "ucrt")), case_lib]
     flags = " ".join(["--target=x86_64-pc-windows-msvc", "-Wno-unused-command-line-argument",
                       *(f"/imsvc{d}" for d in inc)])
+    # intel/llvm installs lld only where it builds the AMD target (ROCm installed): else the distribution's
+    linker = host_bin / "lld-link" if (host_bin / "lld-link").exists() else llvm_bin_with("lld-link")
     tc = OUT / "toolchain.cmake"
     tc.write_text(f"""set(CMAKE_SYSTEM_NAME Windows)
 set(CMAKE_SYSTEM_VERSION 10.0)
 set(CMAKE_SYSTEM_PROCESSOR AMD64)
 set(CMAKE_C_COMPILER {host_bin}/clang-cl)
 set(CMAKE_CXX_COMPILER {host_bin}/clang-cl)
-set(CMAKE_LINKER {host_bin}/lld-link)
+set(CMAKE_LINKER {linker})
 set(CMAKE_AR {llvm_bin_with("llvm-lib")})
 set(CMAKE_RC_COMPILER {llvm_bin_with("llvm-rc")})
 set(CMAKE_MT {llvm_bin_with("llvm-mt")})
