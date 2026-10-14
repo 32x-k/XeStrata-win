@@ -110,7 +110,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   `rocm-dev` に引かれて自動で入ったものは、`rocm-dev` が消えると `apt autoremove` の対象になるので、`sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo` で手動の印を付けます。
 - スクリプトは、リリースにない修正を `third_party/main/intel-llvm/patches/` のパッチ（`NN-<id>.patch`、intel/llvm と同じ Apache-2.0 WITH LLVM-exception）として番号順にソースに当ててからビルドし、当てた修正の id を `install/XESTRATA.json` に残します。
   修正の足りない同じ版のビルドがあれば、作り直すかを尋ねます。
-  今の修正は 14 で、最初の 12 はどれも intel/llvm の `sycl` ブランチでも直っていません（2026-10-08）。
+  今の修正は 15 で、最初の 12 はどれも intel/llvm の `sycl` ブランチでも直っていません（2026-10-08）。
   1 つ目: CUDA と HIP のアダプタが、コマンドバッファにノードを足すたびに同期点の表を丸ごとコピーしていて、SYCL のグラフの完成にノード数の 2 乗の時間がかかっていました（2600 カーネルのグラフで、RTX 4070 では 90 ms、修正後は 4 ms。Level Zero は 2 ms）。
   2 つ目: SYCL のランタイムが、どの NVIDIA の GPU にも最初に見つけた NVIDIA の像を、アーキテクチャを見ずに渡していました。
   いくつかのアーキテクチャのコードを持つ実行ファイルでは、その像より古い GPU は動かず、新しい GPU は古いコードを走らせていました。
@@ -148,6 +148,9 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   14 番目: HIP のアダプタが GPU の空きメモリ（SYCL の `ext_intel_free_memory`）を、その GPU を current にせずに `hipMemGetInfo` で答えていて、どの AMD の GPU もスレッドの current の GPU の空きを報告していました。
   AMD の GPU 2 枚で層を分割すると、2 段目は 1 段目のエキスパートのキャッシュでほぼ埋まった空きを見て、自分のキャッシュの場所がないと言って止まっていました。
   修正後は、アダプタのほかの呼び出しと同じく、その GPU を current にしてから問い合わせます（`hip-mem-free-device`。CUDA のアダプタは問い合わせのたびにその GPU のコンテキストを current にしています）。
+  15 番目: sycl-jit は SYCL のヘッダーを埋め込んだオブジェクトを、作ったばかりの clang-cl でコンパイルします。対象が Windows なら、いつも `bin/clang-cl.exe` を使っていました。
+  Linux で Windows 向けにクロスビルドすると、これは Linux の上で動かない Windows のプログラムで、ビルドが止まっていました。
+  修正後は、クロスビルドのときだけ、ホストのツールとして渡す clang（`CLANG`）の横の clang-cl を使います（`build-windows-cross-jit`。Windows の上のビルドは変わりません）。ビルドだけの修正なので、できあがったツールチェーンの作り直しは求めません。
   CUDA の修正は contrib-llvm のツールチェーンにだけ、HIP の修正は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
   `offload-bundle-arch` はどのツールチェーンにも作り直しを求めます。
 - スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。
@@ -202,20 +205,20 @@ intel/llvm の SYCL のランタイムは Windows では MSVC の ABI だけに�
 - lld-link（LLVM の `lld`）: `sudo apt install lld-21`（21.1）
 - MSVC の CRT と Windows SDK: [xwin](https://github.com/Jake-Shadle/xwin)（0.10.0）で Microsoft から落とします。
   自由ソフトウェアではなく、Microsoft のライセンスは `--accept-license` で受け入れます。リポジトリには入れません。
-- intel/llvm の Windows 版の SYCL の木（ヘッダ、インポートライブラリ、ランタイムの DLL）: XeStrata の使う版（v7.1.1）を XeStrata のパッチを当てて Windows の PC でビルドし、その入れ先の `include`・`lib`・`bin\*.dll` を `.tools/intel-llvm-win` に置きます（下の「Windows 版の intel/llvm」）。
-  リリースには Windows 版が付いていません。nightly の `sycl_windows.tar.gz` は UR の API が v7.1.1 と違い、UR のローダーとアダプターも入っていないので、それで作ったエンジンは動きません。
+- intel/llvm の Windows 版の SYCL の木（ヘッダ、インポートライブラリ、ランタイムの DLL）: `tools/intel_llvm_build.py --windows` が、XeStrata の使う版（v7.1.1）を XeStrata のパッチを当てて、ここで Windows 向けにクロスビルドします（下の「Windows 版の intel/llvm」）。
 
 ```sh
-mkdir -p .tools/xwin .tools/intel-llvm-win
+mkdir -p .tools/xwin
 curl -L https://github.com/Jake-Shadle/xwin/releases/download/0.10.0/xwin-0.10.0-x86_64-unknown-linux-musl.tar.gz |
     tar -xz -C .tools/xwin
 .tools/xwin/xwin-0.10.0-x86_64-unknown-linux-musl/xwin --accept-license --cache-dir .tools/xwin/cache --arch x86_64 \
     splat --output .tools/xwin/sdk
+python3 tools/intel_llvm_build.py --contrib && python3 tools/intel_llvm_build.py --windows
 export CCACHE_DIR=$PWD/build/win-ccache CCACHE_COMPILERCHECK=content
 cmake -S . -B build/win -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=ON \
     -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-windows-msvc.cmake \
     -DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++ -DSTRATA_LICENSE=free \
-    -DSTRATA_XWIN=$PWD/.tools/xwin/sdk -DSTRATA_SYCL_WINDOWS=$PWD/.tools/intel-llvm-win \
+    -DSTRATA_XWIN=$PWD/.tools/xwin/sdk -DSTRATA_SYCL_WINDOWS=$PWD/.tools/intel-llvm-win/install \
     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
 ninja -C build/win
 ```
@@ -235,30 +238,20 @@ ninja -C build/win $(git diff --name-only HEAD -- '*.cpp' | sed "s|^|$PWD/|; s|$
 
 ### Windows 版の intel/llvm
 
-Windows の PC で、Visual Studio 2022 の Build Tools（C++ のワークロード）、Python、Git、CMake、Ninja と、NVIDIA の GPU を使うなら CUDA ツールキット（ドライバの対応する版まで）を入れ、x64 の開発者コマンドプロンプト（`vcvars64.bat`）で次を実行します。
+`tools/intel_llvm_build.py --windows` は、Linux 版と同じクローンから、Windows 版の SYCL のランタイムを `.tools/intel-llvm-win/install` に作ります。
+エンジンが使う部分（`sycl9.dll`、UR のローダーと CUDA・Level Zero のアダプター、`xptifw.dll`、デバイスライブラリ、NVIDIA 向けの libspirv、ヘッダー、インポートライブラリ）だけで、Debug 版の DLL と `clang.exe` は作りません。
 
-```bat
-git config --global core.longpaths true
-git clone --depth 1 --branch v7.1.1 https://github.com/intel/llvm D:\il
-cd /d D:\il
-for %p in (<XeStrata>\third_party\main\intel-llvm\patches\*.patch) do git apply %p
-set CL=/utf-8
-python buildbot\configure.py -o D:\il\b -t Release --cuda --cmake-opt=-DCMAKE_INSTALL_PREFIX=D:/il/inst ^
-    --cmake-opt=-DLLVM_ENABLE_ASSERTIONS=OFF --cmake-opt=-DLLVM_ENABLE_DIA_SDK=OFF ^
-    --cmake-opt=-DLIBCLC_TARGETS_TO_BUILD=nvptx64--nvidiacl --cmake-opt=-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON
-python buildbot\compile.py -o D:\il\b
-```
+- コンパイルは `--contrib` で作った同じ版のツールチェーンの clang-cl、リンクは lld-link が行います。ビルドの途中で動かすツール（tablegen、デバイスライブラリを作る clang など）も、そのツールチェーンのものです。足りないもの（`opt` など）は LLVM が `build/NATIVE` でこの機械向けに作ります。先に `--contrib` を作っておきます。
+- MSVC の CRT と Windows SDK は xwin の展開（`--xwin`、既定は `.tools/xwin/sdk`）を使います。`llvm-lib`・`llvm-rc`・`llvm-mt`・`llvm-ml` はディストリビューションの LLVM のものです（`sudo apt install llvm`）。
+- CUDA のアダプターがリンクする CUDA の Windows 版のヘッダーとインポートライブラリは、NVIDIA の再配布用のアーカイブ（CUDA 12.4.1 の `cuda_cudart`・`cuda_nvml_dev`・`cuda_cccl`）から取ります。自由ソフトウェアではなく、7z には入れません。
+- 開発機（28 スレッド）でおよそ 1 時間かかります。
 
-- `CL=/utf-8`: 表示言語が日本語などの Windows では、MSVC が BOM のない UTF-8 のソースを別のコードページで読んで止まります。CMake のフラグは UR のデバッグ版の下位のビルドに渡らないので、環境変数で全部の呼び出しに渡します。
-- `LLVM_ENABLE_DIA_SDK=OFF`: DIA SDK には ATL が要り、Build Tools の既定には入っていません。使いません。
-- 6 コア 12 スレッドのノート PC で数時間かかります。
-
-できたら `D:\il\inst` の `include`・`lib`・`bin\*.dll` を開発機の `.tools/intel-llvm-win` に写します。
 NVIDIA の GPU 向けには、クロスビルドを `-DSTRATA_LICENSE=contrib -DSTRATA_CUDA_ARCHS=<GPU の版> -DSTRATA_CUDA_PATH=<CUDA ツールキット>` で構成します。CUDA ツールキットは、動かす PC のドライバの対応する版以下にします。
+Windows 版の 7z は、`tools/package/build.sh windows cuda12.4` が Ubuntu 26.04 の使い捨てのコンテナでここまでをすべて作ります（[BUILD.md](BUILD.ja.md)）。
 
 ### Windows の PC で動かす
 
-`build/win` の `strata*.exe` と、`.tools/intel-llvm-win/bin` の `sycl9.dll`・`ur_win_proxy_loader.dll`・`ur_loader.dll`・使う GPU のアダプター（NVIDIA は `ur_adapter_cuda.dll`、Intel は `ur_adapter_level_zero.dll`）・`xptifw.dll` を、1 つのフォルダーに置きます。
+`build/win` の `strata*.exe` と、`.tools/intel-llvm-win/install/bin` の `sycl9.dll`・`ur_win_proxy_loader.dll`・`ur_loader.dll`・使う GPU のアダプター（NVIDIA は `ur_adapter_cuda.dll`、Intel は `ur_adapter_level_zero.dll`）・`xptifw.dll` を、1 つのフォルダーに置きます。
 `strata-device.exe --list-devices` で GPU が見えれば、エンジンは動きます。
 
 ## AVX-512 の経路を確かめる Intel SDE

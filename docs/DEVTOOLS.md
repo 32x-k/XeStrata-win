@@ -110,7 +110,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Packages that came in automatically with `rocm-dev` become `apt autoremove` candidates once it is gone; mark them with `sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo`.
 - The script applies fixes the release lacks to the sources before building, as the patches in `third_party/main/intel-llvm/patches/` (`NN-<id>.patch`, in order; under intel/llvm's Apache-2.0 WITH LLVM-exception), and records their ids in `install/XESTRATA.json`.
   A build of the same release without them is offered a rebuild.
-  There are fourteen fixes now; none of the first twelve is fixed in intel/llvm's `sycl` branch either (2026-10-08).
+  There are fifteen fixes now; none of the first twelve is fixed in intel/llvm's `sycl` branch either (2026-10-08).
   First, the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).
   Second, the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture.
   With an executable carrying code for several architectures, a GPU older than that image did not run and a newer one ran older code.
@@ -148,6 +148,9 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Fourteenth, the HIP adapter answered a GPU's free memory (SYCL's `ext_intel_free_memory`) with `hipMemGetInfo` without making that GPU current, so every AMD GPU reported the free memory of the thread's current one.
   A layer split over two AMD GPUs saw the first stage's free memory, nearly all of it held by its expert cache, on the second stage, which found no room for its own cache and stopped.
   Fixed, the GPU is made current before the query, as the adapter's other calls do (`hip-mem-free-device`; the CUDA adapter makes the GPU's context current for every query).
+  Fifteenth, sycl-jit compiles an object that embeds the SYCL headers with the clang-cl just built, taken as `bin/clang-cl.exe` whenever the target is Windows.
+  Cross-built on Linux for Windows, that is a Windows program the build cannot run, and the build stopped.
+  Fixed, a cross build takes the clang-cl beside the clang given as a host tool (`CLANG`) instead (`build-windows-cross-jit`; a build on Windows is unchanged). A fix to the build only, it asks no finished toolchain to be built again.
   The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
   `offload-bundle-arch` asks every toolchain.
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).
@@ -202,20 +205,20 @@ It needs three things:
 - lld-link (LLVM's `lld`): `sudo apt install lld-21` (21.1)
 - the MSVC CRT and the Windows SDK: downloaded from Microsoft with [xwin](https://github.com/Jake-Shadle/xwin) (0.10.0).
   They are not free software; Microsoft's license is accepted with `--accept-license`. They do not go into the repository.
-- intel/llvm's Windows SYCL tree (headers, import libraries, the runtime's DLLs): the release XeStrata uses (v7.1.1) with XeStrata's patches, built on a Windows PC; its install's `include`, `lib` and `bin\*.dll` go into `.tools/intel-llvm-win` ("intel/llvm for Windows" below).
-  The release has no Windows build. A nightly's `sycl_windows.tar.gz` has another UR API than v7.1.1 and lacks the UR loader and adapters, so an engine built with it does not run.
+- intel/llvm's Windows SYCL tree (headers, import libraries, the runtime's DLLs): `tools/intel_llvm_build.py --windows` cross-builds the release XeStrata uses (v7.1.1), with XeStrata's patches, for Windows here ("intel/llvm for Windows" below).
 
 ```sh
-mkdir -p .tools/xwin .tools/intel-llvm-win
+mkdir -p .tools/xwin
 curl -L https://github.com/Jake-Shadle/xwin/releases/download/0.10.0/xwin-0.10.0-x86_64-unknown-linux-musl.tar.gz |
     tar -xz -C .tools/xwin
 .tools/xwin/xwin-0.10.0-x86_64-unknown-linux-musl/xwin --accept-license --cache-dir .tools/xwin/cache --arch x86_64 \
     splat --output .tools/xwin/sdk
+python3 tools/intel_llvm_build.py --contrib && python3 tools/intel_llvm_build.py --windows
 export CCACHE_DIR=$PWD/build/win-ccache CCACHE_COMPILERCHECK=content
 cmake -S . -B build/win -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=ON \
     -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-windows-msvc.cmake \
     -DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++ -DSTRATA_LICENSE=free \
-    -DSTRATA_XWIN=$PWD/.tools/xwin/sdk -DSTRATA_SYCL_WINDOWS=$PWD/.tools/intel-llvm-win \
+    -DSTRATA_XWIN=$PWD/.tools/xwin/sdk -DSTRATA_SYCL_WINDOWS=$PWD/.tools/intel-llvm-win/install \
     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
 ninja -C build/win
 ```
@@ -235,30 +238,20 @@ ninja -C build/win $(git diff --name-only HEAD -- '*.cpp' | sed "s|^|$PWD/|; s|$
 
 ### intel/llvm for Windows
 
-On a Windows PC, install Visual Studio 2022's Build Tools (the C++ workload), Python, Git, CMake, Ninja and, for NVIDIA GPUs, the CUDA toolkit (up to the version the driver supports), and run this in the x64 developer command prompt (`vcvars64.bat`):
+`tools/intel_llvm_build.py --windows` builds the SYCL runtime for Windows from the same clone as the Linux one, into `.tools/intel-llvm-win/install`.
+It builds the parts the engine uses only (`sycl9.dll`, UR's loader and its CUDA and Level Zero adapters, `xptifw.dll`, the device libraries, the NVIDIA libspirv, the headers and the import libraries): no Debug DLLs and no `clang.exe`.
 
-```bat
-git config --global core.longpaths true
-git clone --depth 1 --branch v7.1.1 https://github.com/intel/llvm D:\il
-cd /d D:\il
-for %p in (<XeStrata>\third_party\main\intel-llvm\patches\*.patch) do git apply %p
-set CL=/utf-8
-python buildbot\configure.py -o D:\il\b -t Release --cuda --cmake-opt=-DCMAKE_INSTALL_PREFIX=D:/il/inst ^
-    --cmake-opt=-DLLVM_ENABLE_ASSERTIONS=OFF --cmake-opt=-DLLVM_ENABLE_DIA_SDK=OFF ^
-    --cmake-opt=-DLIBCLC_TARGETS_TO_BUILD=nvptx64--nvidiacl --cmake-opt=-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON
-python buildbot\compile.py -o D:\il\b
-```
+- The clang-cl of the toolchain `--contrib` built, of the same release, compiles and lld-link links. The tools the build runs on the way (the tablegens, the clang that makes the device libraries) are that toolchain's too; LLVM builds the ones it lacks (`opt` and others) for this machine in `build/NATIVE`. Build `--contrib` first.
+- The MSVC CRT and the Windows SDK are xwin's splat (`--xwin`, by default `.tools/xwin/sdk`). `llvm-lib`, `llvm-rc`, `llvm-mt` and `llvm-ml` are the distribution's LLVM's (`sudo apt install llvm`).
+- The Windows CUDA headers and import libraries the CUDA adapter links come from NVIDIA's redistributable archives (CUDA 12.4.1's `cuda_cudart`, `cuda_nvml_dev` and `cuda_cccl`). They are not free software and do not go into the 7z.
+- It takes about an hour on the development machine (28 threads).
 
-- `CL=/utf-8`: on a Windows in Japanese (or another language with its own code page), MSVC reads UTF-8 sources without a BOM in that code page and stops. CMake's flags do not reach the sub-build of UR's debug libraries, so the environment passes it to every call.
-- `LLVM_ENABLE_DIA_SDK=OFF`: the DIA SDK needs ATL, which the Build Tools leave out by default. It is not used.
-- It takes a few hours on a laptop of 6 cores and 12 threads.
-
-Then copy `D:\il\inst`'s `include`, `lib` and `bin\*.dll` to `.tools/intel-llvm-win` on the development machine.
 For NVIDIA GPUs, configure the cross build with `-DSTRATA_LICENSE=contrib -DSTRATA_CUDA_ARCHS=<the GPU's architecture> -DSTRATA_CUDA_PATH=<a CUDA toolkit>`, a CUDA toolkit no newer than the version the target PC's driver supports.
+`tools/package/build.sh windows cuda12.4` builds all of this, and the Windows 7z, in a disposable Ubuntu 26.04 container ([BUILD.md](BUILD.md)).
 
 ### Running on a Windows PC
 
-Put `build/win`'s `strata*.exe` in one folder with `.tools/intel-llvm-win/bin`'s `sycl9.dll`, `ur_win_proxy_loader.dll`, `ur_loader.dll`, the adapter of the GPU (`ur_adapter_cuda.dll` for NVIDIA, `ur_adapter_level_zero.dll` for Intel) and `xptifw.dll`.
+Put `build/win`'s `strata*.exe` in one folder with `.tools/intel-llvm-win/install/bin`'s `sycl9.dll`, `ur_win_proxy_loader.dll`, `ur_loader.dll`, the adapter of the GPU (`ur_adapter_cuda.dll` for NVIDIA, `ur_adapter_level_zero.dll` for Intel) and `xptifw.dll`.
 When `strata-device.exe --list-devices` lists the GPU, the engine runs.
 
 ## Intel SDE (the AVX-512 paths)

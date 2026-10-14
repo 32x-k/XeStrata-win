@@ -1,0 +1,30 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+build-windows-cross-jit: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+sycl-jit embeds the SYCL headers in an object it compiles with the clang-cl just built, taken as
+bin/clang-cl.exe whenever the target is Windows.  Built on Linux for Windows (a cross build), that is a
+Windows program the build cannot run.  In a cross build the build host's clang-cl is taken instead, beside
+the clang the host tools are given (CLANG); a build on Windows is unchanged.
+---
+diff --git a/sycl-jit/jit-compiler/CMakeLists.txt b/sycl-jit/jit-compiler/CMakeLists.txt
+index 30ef7f720..907ce213f 100644
+--- a/sycl-jit/jit-compiler/CMakeLists.txt
++++ b/sycl-jit/jit-compiler/CMakeLists.txt
+@@ -66,7 +66,13 @@ add_custom_command(
+ # CMAKE_CXX_COMPILER might not have support for it. As such, use freshly built
+ # `clang++` instead.
+ if (WIN32)
+-  set(clang_exe ${CMAKE_BINARY_DIR}/bin/clang-cl.exe)
++  if (CMAKE_CROSSCOMPILING)
++    # built on another system: the build host's clang-cl, beside the clang the host tools take (CLANG)
++    get_filename_component(clang_host_bin "${CLANG}" DIRECTORY)
++    set(clang_exe ${clang_host_bin}/clang-cl)
++  else()
++    set(clang_exe ${CMAKE_BINARY_DIR}/bin/clang-cl.exe)
++  endif()
+   set(SYCL_JIT_RESOURCE_CXX_FLAGS /O2 /std:c++17 /W0)
+ 
+   # Determine if we should use static (/MT) or dynamic (/MD) runtime

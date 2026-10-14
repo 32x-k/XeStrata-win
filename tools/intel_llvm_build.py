@@ -7,12 +7,15 @@ free build of the engine where the distribution has no DPC++, or one whose SYCL 
 matrix engines (Ubuntu 26.04's 6.2 lists none for the Arc Pro B70; intel/llvm added it in v7.0.0).
 
     tools/intel_llvm_build.py [--contrib] [--rebuild] [--keep-build] [--tag TAG] [--yes]
+    tools/intel_llvm_build.py --windows [--xwin DIR] [--rebuild] [--keep-build] [--tag TAG]
 
 .tools/intel-llvm/src is the clone, build/ the build tree, install/ the toolchain (bin/clang++, lib/libsycl.so).
 Where ROCm's HIP is installed (free software), it builds the HIP target (AMD GPUs) as well, with ROCm's device
 libraries built by the same compiler (DEVICE_LIBS_TAG, below).  --contrib builds the same
 clone with the CUDA target too (NVIDIA GPUs; it needs NVIDIA's CUDA toolkit, which is not free software: the contrib
-build mode), into .tools/intel-llvm-contrib/ (build/, install/).  A finished install/ carries XESTRATA.json (the tag,
+build mode), into .tools/intel-llvm-contrib/ (build/, install/).  --windows cross-builds the SYCL runtime for Windows
+from the same clone, with the --contrib toolchain's tools, into .tools/intel-llvm-win/ (a Windows engine's headers,
+import libraries and DLLs).  A finished install/ carries XESTRATA.json (the tag,
 its commit, the date, the GPUs' matrix engines as tools/xmx_probe.cpp saw them).  Run again, it uses a finished install
 of the same tag as it is, asks before building another tag over an older one, and continues an interrupted build where
 it stopped.  build/ is deleted once install/ is done, unless --keep-build: keeping it makes the next tag's build
@@ -27,7 +30,9 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
+from typing import NoReturn
 
 ROOT = Path(__file__).resolve().parent.parent
 BASE = ROOT / ".tools" / "intel-llvm"
@@ -80,7 +85,7 @@ def say(msg=""):
     print(msg, flush=True)
 
 
-def fail(msg, hint=None):
+def fail(msg, hint=None) -> NoReturn:
     say(f"\n  [X]  {msg}")
     if hint:
         say(f"       {hint}")
@@ -238,10 +243,8 @@ def fix_sources() -> None:
         say(f"applied {patch.name}")
 
 
-def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) -> None:
-    need = missing_prerequisites()
-    if need:
-        fail("intel/llvm's build needs: " + ", ".join(need), "install them: sudo apt install " + " ".join(need))
+def prepare_source(tag: str) -> None:
+    """The clone at `tag`, with the patches."""
     BASE.mkdir(parents=True, exist_ok=True)
     OUT.mkdir(parents=True, exist_ok=True)
     if (SRC / ".git").exists():
@@ -255,6 +258,13 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
     else:
         run(["git", "clone", "--depth", "1", "--branch", tag, REPO, SRC])
     fix_sources()
+
+
+def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) -> None:
+    need = missing_prerequisites()
+    if need:
+        fail("intel/llvm's build needs: " + ", ".join(need), "install them: sudo apt install " + " ".join(need))
+    prepare_source(tag)
     # The configuration downloads what its release pins (Level Zero's headers and loader: the runtime adapter needs
     # newer ones than Ubuntu 26.04's 1.28; emhash), all free software; giving it the distribution's failed.  Forced:
     # without pkg-config the adapter takes an installed loader without checking its version (Debian 13's 1.20 failed).
@@ -291,6 +301,184 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
         shutil.rmtree(BUILD, ignore_errors=True)
 
 
+# ---- the SYCL runtime for Windows (--windows): cross-built here with clang-cl and lld-link, against the MSVC CRT and
+# the Windows SDK from xwin (docs/DEVTOOLS.md#windows-cross-build).  Its build runs tools on this machine (the
+# tablegens, and the compiler that makes the device libraries): the contrib toolchain's, of the same tag and patches,
+# and LLVM builds the ones it lacks for this machine (opt, llvm-as) in build/NATIVE.  Only the parts a Windows engine
+# links and runs with are installed (no Debug libraries, no clang.exe).
+WIN_OUT = ROOT / ".tools" / "intel-llvm-win"
+# NVIDIA's Windows CUDA headers and import libraries (cuda.lib, nvml.lib) the CUDA adapter links: the toolkit's
+# redistributable archives (not free software; downloaded, never bundled), of the version the contrib packages build
+# for, which every newer driver runs
+WIN_CUDA = "12.4.1"
+WIN_CUDA_PARTS = ("cuda_cudart", "cuda_nvml_dev", "cuda_cccl")
+WIN_CUDA_URL = "https://developer.download.nvidia.com/compute/cuda/redist/"
+NVCC_STAND_IN = r"""#!/bin/sh
+# FindCUDAToolkit's questions about the Windows CUDA tree {root} (headers and import libraries only)
+case "$*" in *--version*) echo "Cuda compilation tools, release {version}"; exit 0 ;; esac
+echo "#$ _HERE_={root}/bin"
+echo "#$ _THERE_={root}/bin"
+echo "#$ TOP={root}"
+echo "#$ INCLUDES=\"-I{root}/include\""
+echo "#$ LIBRARIES=\"-L{root}/lib/x64\""
+"""
+# what a Windows engine's SYCL runtime is: the headers and the device libraries, installed by their components, and
+# the DLLs and import libraries, copied (their components install the Debug ones too, which are not built)
+WIN_COMPONENTS = ("sycl-headers", "sycl-headers-extras", "OpenCL-Headers", "ur_headers", "libsycldevice",
+                  "libspirv-builtins")
+WIN_FILES = ("bin/sycl9.dll", "bin/sycl-jit.dll", "bin/ur_loader.dll", "bin/ur_win_proxy_loader.dll",
+             "bin/ur_adapter_cuda.dll", "bin/ur_adapter_level_zero.dll", "bin/ur_adapter_level_zero_v2.dll",
+             "bin/ur_adapter_opencl.dll", "bin/xptifw.dll", "lib/sycl9.lib", "lib/sycl.lib", "lib/sycl-jit.lib",
+             "lib/sycl-devicelib-host.lib", "lib/ur_loader.lib", "lib/xpti.lib", "lib/xptifw.lib")
+WIN_TARGETS = ("sycl9.dll", "sycl-jit", "ur_loader", "ur_win_proxy_loader", "ur_adapter_cuda", "ur_adapter_level_zero",
+               "ur_adapter_level_zero_v2", "ur_adapter_opencl", "xptifw", "libsycldevice", "libspirv-builtins")
+# Windows names the build asks for in another case than the SDK's files (Linux's file names are case-sensitive)
+WIN_CASE_HEADERS = {"Libloaderapi.h": "um/libloaderapi.h"}
+WIN_CASE_LIBS = {"Shlwapi.lib": "um/x86_64/shlwapi.lib"}
+
+
+def llvm_bin_with(tool: str) -> Path:
+    """The newest of the distribution's LLVM folders with `tool` (llvm-lib, llvm-rc, llvm-mt, llvm-ml: Ubuntu's
+    llvm-<version>), which intel/llvm does not install."""
+    for d in sorted(Path("/usr/lib").glob("llvm-*/bin"), key=lambda p: version_key(p.parent.name), reverse=True):
+        if (d / tool).exists():
+            return d / tool
+    fail(f"no {tool} (LLVM's)", "install it: sudo apt install llvm")
+
+
+def fetch_win_cuda(dest: Path) -> Path:
+    """NVIDIA's Windows CUDA headers and import libraries in `dest`, and an nvcc that answers CMake's FindCUDAToolkit
+    (its version and folders: the Windows nvcc.exe does not run here)."""
+    if not (dest / "lib" / "x64" / "cuda.lib").exists():
+        with urllib.request.urlopen(f"{WIN_CUDA_URL}redistrib_{WIN_CUDA}.json", timeout=60) as r:
+            meta = json.loads(r.read())
+        for part in WIN_CUDA_PARTS:
+            rel = meta[part]["windows-x86_64"]["relative_path"]
+            z = OUT / Path(rel).name
+            run(["curl", "-fsSL", "-o", z, WIN_CUDA_URL + rel])
+            tmp = OUT / "cuda-unpack"
+            shutil.rmtree(tmp, ignore_errors=True)
+            run(["unzip", "-q", "-o", z, "-d", tmp])
+            shutil.copytree(next(tmp.iterdir()), dest, dirs_exist_ok=True)
+            shutil.rmtree(tmp)
+            z.unlink()
+    nvcc = dest / "bin" / "nvcc"
+    nvcc.parent.mkdir(parents=True, exist_ok=True)
+    nvcc.write_text(NVCC_STAND_IN.format(version=".".join(WIN_CUDA.split(".")[:2]), root=dest))
+    nvcc.chmod(0o755)
+    return dest
+
+
+def win_toolchain(xwin: Path, host_bin: Path) -> Path:
+    """The CMake toolchain of the cross build: the host toolchain's clang-cl and lld-link, xwin's CRT and SDK."""
+    case_inc, case_lib = OUT / "case" / "include", OUT / "case" / "lib"
+    for d, links, root in ((case_inc, WIN_CASE_HEADERS, xwin / "sdk" / "include"),
+                           (case_lib, WIN_CASE_LIBS, xwin / "sdk" / "lib")):
+        d.mkdir(parents=True, exist_ok=True)
+        for name, target in links.items():
+            (d / name).unlink(missing_ok=True)
+            (d / name).symlink_to(root / target)
+    inc = [xwin / "crt" / "include", *(xwin / "sdk" / "include" / s for s in ("ucrt", "um", "shared")), case_inc]
+    libs = [xwin / "crt" / "lib" / "x86_64", *(xwin / "sdk" / "lib" / s / "x86_64" for s in ("um", "ucrt")), case_lib]
+    flags = " ".join(["--target=x86_64-pc-windows-msvc", "-Wno-unused-command-line-argument",
+                      *(f"/imsvc{d}" for d in inc)])
+    tc = OUT / "toolchain.cmake"
+    tc.write_text(f"""set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_VERSION 10.0)
+set(CMAKE_SYSTEM_PROCESSOR AMD64)
+set(CMAKE_C_COMPILER {host_bin}/clang-cl)
+set(CMAKE_CXX_COMPILER {host_bin}/clang-cl)
+set(CMAKE_LINKER {host_bin}/lld-link)
+set(CMAKE_AR {llvm_bin_with("llvm-lib")})
+set(CMAKE_RC_COMPILER {llvm_bin_with("llvm-rc")})
+set(CMAKE_MT {llvm_bin_with("llvm-mt")})
+set(CMAKE_ASM_MASM_COMPILER {llvm_bin_with("llvm-ml")})
+set(CMAKE_C_FLAGS_INIT "{flags}")
+set(CMAKE_CXX_FLAGS_INIT "{flags}")
+set(CMAKE_RC_FLAGS_INIT "{" ".join(f"-I{d}" for d in inc)}")
+foreach(kind EXE SHARED MODULE)
+  set(CMAKE_${{kind}}_LINKER_FLAGS_INIT "{" ".join(f"/libpath:{d}" for d in libs)}")
+endforeach()
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+""")
+    return tc
+
+
+def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> None:
+    host = ROOT / ".tools" / "intel-llvm-contrib" / "install"
+    rec = json.loads((host / "XESTRATA.json").read_text()) if (host / "XESTRATA.json").exists() else {}
+    if rec.get("tag") != tag or "cuda" not in rec.get("backends", []):
+        fail(f"--windows runs the tools of the contrib toolchain of {tag} on this machine, which is not built",
+             f"build it first: tools/intel_llvm_build.py --contrib --tag {tag}")
+    if not (xwin / "crt" / "include").is_dir():
+        fail(f"no MSVC CRT and Windows SDK in {xwin}", "xwin's splat: docs/DEVTOOLS.md#windows-cross-build, or --xwin")
+    prepare_source(tag)
+    cuda = fetch_win_cuda(OUT / "cuda")
+    hb = host / "bin"
+    # the device libraries: the host compiler for Windows, with the CRT's and the SDK's headers after its own
+    devflags = " ".join(["-nostdlibinc", *(f"-idirafter {d}" for d in (
+        xwin / "crt" / "include", *(xwin / "sdk" / "include" / s for s in ("ucrt", "um", "shared"))))])
+    s = SRC
+    projects = "sycl;llvm-spirv;opencl;xpti;xptifw;libdevice;sycl-jit"
+    options = [
+        f"-DCMAKE_TOOLCHAIN_FILE={win_toolchain(xwin, hb)}", "-DCMAKE_BUILD_TYPE=Release",
+        f"-DCMAKE_INSTALL_PREFIX={INSTALL}", "-DLLVM_ENABLE_ASSERTIONS=OFF",
+        "-DLLVM_TARGETS_TO_BUILD=X86;SPIRV;NVPTX", "-DLLVM_HOST_TRIPLE=x86_64-pc-windows-msvc",
+        # BLAKE3's MASM files: LLVM's ml (llvm-ml) does not assemble them; the C versions are taken
+        "-DLLVM_DISABLE_ASSEMBLY_FILES=ON",
+        f"-DLLVM_EXTERNAL_PROJECTS={projects}", f"-DLLVM_ENABLE_PROJECTS=clang;{projects};libclc",
+        f"-DLLVM_EXTERNAL_SYCL_SOURCE_DIR={s / 'sycl'}", f"-DLLVM_EXTERNAL_LLVM_SPIRV_SOURCE_DIR={s / 'llvm-spirv'}",
+        f"-DLLVM_EXTERNAL_XPTI_SOURCE_DIR={s / 'xpti'}", f"-DXPTI_SOURCE_DIR={s / 'xpti'}",
+        f"-DLLVM_EXTERNAL_XPTIFW_SOURCE_DIR={s / 'xptifw'}", f"-DLLVM_EXTERNAL_LIBDEVICE_SOURCE_DIR={s / 'libdevice'}",
+        f"-DLLVM_EXTERNAL_SYCL_JIT_SOURCE_DIR={s / 'sycl-jit'}",
+        # configure.py --cuda's options for Windows
+        "-DLLVM_BUILD_TOOLS=ON", "-DSYCL_ENABLE_WERROR=OFF", "-DSYCL_INCLUDE_TESTS=OFF", "-DLLVM_ENABLE_DOXYGEN=OFF",
+        "-DLLVM_ENABLE_SPHINX=OFF", "-DBUILD_SHARED_LIBS=OFF", "-DSYCL_ENABLE_XPTI_TRACING=ON",
+        "-DLLVM_ENABLE_LLD=OFF", "-DLLVM_SPIRV_ENABLE_LIBSPIRV_DIS=OFF", "-DXPTI_ENABLE_WERROR=OFF",
+        "-DSYCL_ENABLE_BACKENDS=level_zero;level_zero_v2;cuda;opencl", "-DSYCL_ENABLE_EXTENSION_JIT=ON",
+        "-DSYCL_ENABLE_MAJOR_RELEASE_PREVIEW_LIB=OFF", "-DLIBCLC_TARGETS_TO_BUILD=nvptx64--nvidiacl",
+        "-DLIBCLC_GENERATE_REMANGLED_VARIANTS=ON", "-DLIBCLC_NATIVECPU_HOST_TARGET=OFF",
+        "-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON", f"-DCUDAToolkit_ROOT={cuda}", "-DLLVM_ENABLE_DIA_SDK=OFF",
+        "-DLLVM_ENABLE_ZSTD=OFF",
+        # this machine's tools, of the same tag; LLVM's cross build hands PYTHON_EXECUTABLE to build/NATIVE (empty
+        # unless given) over its own
+        *(f"-D{var}={hb / tool}" for var, tool in (
+            ("CLANG", "clang"), ("LLVM_AR", "llvm-ar"), ("APPEND_FILE", "append-file"),
+            ("CLANG_OFFLOAD_BUNDLER", "clang-offload-bundler"), ("LLVM_OFFLOAD_BINARY", "llvm-offload-binary"),
+            ("FILE_TABLE_TFORM", "file-table-tform"), ("LLVM_FOREACH", "llvm-foreach"), ("LLVM_SPIRV", "llvm-spirv"),
+            ("SYCL_POST_LINK", "sycl-post-link"), ("LLVM_LINK", "llvm-link"))),
+        f"-DPYTHON_EXECUTABLE={sys.executable}", f"-DSYCL_LIBDEVICE_CXX_FLAGS={devflags}",
+    ]
+    if not (BUILD / "build.ninja").exists():
+        run(["cmake", "-G", "Ninja", "-S", s / "llvm", "-B", BUILD, *options])
+    started = time.time()
+    run(["cmake", "--build", BUILD, "--target", *WIN_TARGETS, "--", "-j", str(jobs or os.cpu_count() or 4)])
+    shutil.rmtree(INSTALL, ignore_errors=True)
+    for component in WIN_COMPONENTS:
+        run(["cmake", "--install", BUILD, "--component", component])
+    for rel in WIN_FILES:
+        (INSTALL / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(BUILD / rel, INSTALL / rel)
+    shutil.copytree(s / "xpti" / "include" / "xpti", INSTALL / "include" / "xpti", dirs_exist_ok=True)
+    # the license texts of what the DLLs carry: intel/llvm's, and those of the projects its build fetched (UMF and the
+    # hwloc it links statically, Level Zero's loader and headers, emhash, parallel-hashmap, OpenCL's headers and ICD
+    # loader, vc-intrinsics), for the Windows package's notices
+    lic = INSTALL / "licenses"
+    lic.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(s / "llvm" / "LICENSE.TXT", lic / "intel-llvm.txt")
+    for dep in sorted((BUILD / "_deps").glob("*-src")):
+        for f in sorted(dep.iterdir()):
+            if f.is_file() and f.name.upper().startswith(("LICENSE", "COPYING", "NOTICE")):
+                shutil.copy2(f, lic / f"{dep.name[:-4]}-{f.name}")
+    commit = subprocess.run(["git", "-C", str(SRC), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    RECORD.write_text(json.dumps({"tag": tag, "commit": commit, "fixes": [patch_id(p) for p in PATCHES],
+                                  "target": "x86_64-pc-windows-msvc", "cuda": WIN_CUDA,
+                                  "built": time.strftime("%Y-%m-%d %H:%M"),
+                                  "minutes": round((time.time() - started) / 60)}, indent=1))
+    if not keep_build:
+        shutil.rmtree(BUILD, ignore_errors=True)
+
+
 def version_key(tag: str) -> tuple:
     return tuple(int(x) for x in tag.lstrip("v").split(".") if x.isdigit())
 
@@ -300,6 +488,11 @@ def main() -> None:
     ap.add_argument("--contrib", action="store_true",
                     help="with the CUDA target too (NVIDIA GPUs, needs NVIDIA's CUDA toolkit), into "
                          ".tools/intel-llvm-contrib")
+    ap.add_argument("--windows", action="store_true",
+                    help="the SYCL runtime for Windows (headers, import libraries and DLLs, for a Windows engine built "
+                         "here), cross-built with the --contrib toolchain's tools, into .tools/intel-llvm-win")
+    ap.add_argument("--xwin", type=Path, default=ROOT / ".tools" / "xwin" / "sdk",
+                    help="with --windows: xwin's splat of the MSVC CRT and the Windows SDK (default .tools/xwin/sdk)")
     ap.add_argument("--tag", default=TAG, help=f"the intel/llvm release to build (default {TAG})")
     ap.add_argument("--rebuild", action="store_true", help="build again even when a finished build is there")
     ap.add_argument("--keep-build", action="store_true", help="keep the build tree for the next update")
@@ -307,6 +500,16 @@ def main() -> None:
     ap.add_argument("--jobs", type=int, metavar="N",
                     help="compile N files at once (default: the threads; the links as many as the free RAM allows)")
     a = ap.parse_args()
+    if a.windows:
+        set_out(WIN_OUT)
+        have = json.loads(RECORD.read_text()) if RECORD.exists() else {}
+        if a.rebuild or have.get("tag") != a.tag or have.get("fixes") != [patch_id(p) for p in PATCHES]:
+            say(f"building intel/llvm {a.tag}'s SYCL runtime for Windows in {OUT} ...")
+            build_windows(a.tag, a.xwin.resolve(), a.keep_build, a.jobs)
+        else:
+            say(f"intel/llvm {a.tag}'s SYCL runtime for Windows is already built in {INSTALL}")
+        say(str(INSTALL))
+        return
     if a.contrib:
         set_out(ROOT / ".tools" / "intel-llvm-contrib")
     have = finished()
