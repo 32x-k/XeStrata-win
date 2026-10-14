@@ -32,6 +32,42 @@ Qwen3.8 の prompt は、xmx_gemm が動く GPU では FP16 の経路のまま�
 `STRATA_NO_XMX=1` は XMX を使わない経路を選ばせます。
 CPU 内蔵のグラフィックス（開発機では UHD 770）は、確認用の 2 つ目の実機として使います。
 
+## Strata 0.1.44.1 の取り込み
+
+upstream の Strata 0.1.43.1 から 0.1.44.1（`296b59d2`）までの変更を Xe に移しています。
+今回から、Windows の変更も取り込む対象にしました（XeStrata の Windows 版にない HIP の部分を除く）。
+
+移したものの主なものは次のとおりです。
+
+- Qwen3.6-35B-A3B（Unsloth の MTP の層付きの UD-Q4_K_XL・UD-Q6_K_XL・Q8_0）を、Ornith-1.5 と同じ plain の経路で読む。
+  upstream は Qwen3.6 に CUDA 専用のエンジンを作りましたが、XeStrata では F32 の GDN の alpha・beta と MTP の層の BF16 の router を読めるようにしました。
+  llama.cpp と答えを比べ、3 社の GPU で動かしています。prompt の直後に、その prompt が多く使ったエキスパートで VRAM の層を一度に埋める（upstream の q36 の考え方）ので、decode が 20〜40% 速くなりました（Ornith と llm-jp にも効きます）。
+- 画像の生成（Qwen-Image-2.1-Turbo、`POST /v1/images/generations`）。stable-diffusion.cpp の `sd-cli` を、どのメーカーの GPU でも Vulkan 版で作ります。
+- Unsloth のファイル: K-quant のエキスパートの重みを、グループの呼び出しで 1 回だけ展開する（KqSplit、同じビットの答え。B70 の UD-Q4_K_XL の decode +7%）。setup は UD-Q5_K_XL・UD-Q6_K_XL・Q8_0 も選べます（experimental）。
+- 確定のグラフで GDN と QSA の層をまとめて 1 回の起動にする（`STRATA_COMMIT_BATCH`、既定でオン）。
+- 層の分割の自動の配置（近い同点では窮屈なカードに余裕を残す、遅いリンクの重みは 4 倍の差から）、起動時の VRAM の空きの確認を後ろのカードにも。
+- prompt の塊を 16384 にするのは、RAM が貸し出しを賄えるときだけ。arena の MADV_HUGEPAGE は、空いている 2 MiB のブロックが半分に満たないときは頼まない（#2126）。
+- serve: 長い読みが短い要求に次の塊で譲る（#656）、opencode の `<env>` を最初のユーザーの発言へ移す（`"env_to_user"`、opt-in）、画像があるときだけ画像のエンコーダーを動かす（`"elastic"`、opt-in）、
+  GPU のランタイムの立ち上げで止まったエンジンの起動し直し、落ちたエンジンの終わり方の表示、Responses API の `reasoning_effort`、会話のキャッシュの画像の照合（#2228）、stdin の読み手の終了の競合。
+- 量子化の品質の物差し（`tools/quant_quality.py`、`tools/quant_formats.py`）。
+- opt-in のまま移したもの: `STRATA_HC_Q8`（BF16 の pack でも読み込み時に Q8_0 にする）、`STRATA_MTP_PRIO`・`STRATA_COPY_PRIO`、`STRATA_POOL_UMWAIT`、`STRATA_PCIE_MIN1`、arena の `--adapt-async 1`、`STRATA_DENSE_F32`。
+
+この取り込みの間に XeStrata の側で直したもの:
+
+- GPU の問い合わせの失敗を未完了と区別し、待ちをエラーで抜ける（issue #12）。RAM is tight の警告を、エキスパートを実際に RAM に置く量で出す（issue #11）。
+- WSL2: setup が GPU を見つけない、plain の経路の PCIe の分担での失敗、prompt のバッファの不足（報告の 3 件）。
+- Podman（podman compose）で入れて動かすコンテナ。
+
+upstream v0.1.44.1 と 3 社の GPU で比べました（generate は 5 つのモデルファイル、serve、通常使用）。
+RTX 4070 は、generate の decode が 5 つのファイルのすべてで 8〜21% 速く、prefill は同等以上（IQ3_XXS の 1K は 16%、IQ2_XS は 15% 速い）です。
+RX 9060 XT は prefill が 2.1〜3.2 倍ですが、IQ3_XXS の decode は 2.5〜4.7% 遅くなりました。
+upstream が gfx12 で hyper-connection の down/up を Q8_0 で読むのを既定にした分（upstream の側で切って比べると +4.4%）で、XeStrata ではこの出力の変わる近似を opt-in（`STRATA_HC_Q8=1`）のままにしています。
+B70 は upstream と比べず、取り込みの前の XeStrata と同じ文で比べて同じ速さです。
+
+移していないのは、Mac（Metal）、upstream の `sycl/`、NVFP4 のエキスパート（FP4 の行列ユニットのない GPU では IQ 系より prompt が遅く、品質も UD-Q4_K_XL より下）、
+upstream の Qwen3.6 の CUDA 専用のエンジン、gfx11 の WMMA への gfx1103 の追加（RDNA2・3 の保留と一緒に）、`--prefill-head-alias` と arena の pin by need（XeStrata の USM と arena の作りに合わない）、
+upstream の試験の道具と記録です。
+
 ## Strata 0.1.43.1 の取り込み
 
 upstream の Strata 0.1.43 から 0.1.43.1（`a0116b27`）までの変更を、Windows の実装を除いて Xe に移しています。
