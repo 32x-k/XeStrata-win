@@ -20,7 +20,10 @@ setup.py (--images qwen-image) and tools/image/install.py use these pieces; serv
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -190,6 +193,52 @@ def build_stamp(backend: str, arch) -> dict:
     return stamp
 
 
+def vulkan_env(uma: bool) -> dict:
+    """ggml-vulkan's environment for sd-cli: weights go through a staging buffer instead of being written into
+    host-visible VRAM, which moved them at about 200 MB/s on an RTX 4070 (PCIe 4.0 x4): 72 s an image, 19.5 s without,
+    the B70 and the RX 9060 XT unchanged (2026-10-15).  Not on an integrated GPU's shared memory: not measured there."""
+    return {} if uma else {"GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM": "1"}
+
+
+def tune(cfg: dict, say=print) -> dict:
+    """Flash attention in the DiT on or off, whichever is faster on this PC (on the B70 the sampling took half the time
+    without it, on the RTX 4070 and the RX 9060 XT it was faster with it, 2026-10-15): each form makes one 1024x1024
+    image of 2 steps, and an 8-step image is estimated as that run plus 3x its sampling.  Sets cfg["args"] to the
+    faster form and returns {form: estimated seconds} (a form that failed is left out)."""
+    import subprocess
+    import tempfile
+    serve = Path(__file__).resolve().parents[2] / "serve"
+    if str(serve) not in sys.path:
+        sys.path.insert(0, str(serve))
+    import images as IM   # serve/images.py: the command the server runs
+    base = [a for a in cfg.get("args") or [] if a != "--diffusion-fa"]
+    forms = {"flash-attention": ["--diffusion-fa"] + base, "no-flash-attention": base}
+    est: dict[str, float] = {}
+    with tempfile.TemporaryDirectory(prefix="strata-image-tune-") as tmp:
+        for name, args in forms.items():
+            c = dict(cfg, args=args)
+            job = IM.parse_request({"prompt": "A red fox sitting in a snowy forest at dawn, photograph",
+                                    "size": "1024x1024", "seed": 42, "steps": 2}, c)
+            t0 = time.monotonic()
+            try:
+                p = subprocess.run(IM.sd_cli_args(c, job, str(Path(tmp) / f"{name}.png")), env=IM.image_env(c),
+                                   capture_output=True, text=True, errors="replace", timeout=900)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                say(f"  image tuning: {name} did not run ({e})")
+                continue
+            wall = time.monotonic() - t0
+            m = re.findall(r"sampling completed, taking ([0-9.]+) ?s", p.stdout + p.stderr)
+            if p.returncode != 0 or not m:
+                say(f"  image tuning: {name} failed (exit {p.returncode})")
+                continue
+            est[name] = round(wall + 3 * float(m[-1]), 1)
+    if est:
+        best = min(est, key=lambda k: est[k])
+        cfg["args"] = forms[best]
+        cfg["tuned"] = {"estimated_s": est, "chosen": best}
+    return est
+
+
 def image_config(backend: str, quant: str, exe: Path, models_dir: Path, *, uma: bool = False, gpu=None,
                  lib_dirs=(), policy: str = "auto", native: bool = False) -> dict:
     """The run config's "images" section (serve/images.py reads it)."""
@@ -198,7 +247,9 @@ def image_config(backend: str, quant: str, exe: Path, models_dir: Path, *, uma: 
            "llm": str(local_path(models_dir, "llm")), "args": default_args(backend), "gpu_policy": policy,
            "uma": bool(uma), "sd_cpp": SD_CPP_COMMIT[:7]}
     if backend in NATIVE_BACKENDS:
-        cfg["native"] = bool(native)       # Strata's DiT runner (--model-args qwen_image_2_1_native=1)
+        cfg["native"] = bool(native)
+    if backend == "vulkan" and (env := vulkan_env(uma)):
+        cfg["env"] = env       # Strata's DiT runner (--model-args qwen_image_2_1_native=1)
     if gpu is not None:
         cfg["gpu"] = gpu
     if lib_dirs:

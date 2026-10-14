@@ -2431,6 +2431,12 @@ def setup_images(a, gpu: dict, models_dir: Path) -> dict | None:
         verify_sha256(dst, size, sha)
     cfg = QI.image_config(backend, quant, exe, models_dir, uma=bool(gpu.get("integrated")),
                           policy=a.image_gpu_policy or "auto")
+    if backend == "vulkan":
+        say("  Timing the image generator's two forms on this GPU (flash attention on and off; about a minute) ...")
+        est = QI.tune(cfg, say)
+        if est:
+            ok("image generator: " + ", ".join(f"{k} ~{v:.0f} s an image" for k, v in est.items()) +
+               f": {cfg['tuned']['chosen']}")
     ok(f"image generation: {quant} on {backend}, GPU policy {cfg['gpu_policy']}")
     return cfg
 
