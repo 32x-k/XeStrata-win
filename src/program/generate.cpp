@@ -2055,6 +2055,10 @@ void install_fatal_signals() {
 // other thread aborted the engine ("longjmp causes uninitialized stack frame"; the server's SIGTERM after a QUIT, or a
 // stop while the kernels are built).  Blocked before any thread exists, so every thread inherits the mask.
 void route_stop_signals() {
+#if defined(_WIN32)
+    // Windows has no signal masks; Ctrl+C reaches a thread of its own already, and the server ends the engine with
+    // taskkill, not a signal
+#else
     sigset_t set;
     sigemptyset(&set);
     sigaddset(&set, SIGTERM);
@@ -2065,6 +2069,7 @@ void route_stop_signals() {
         while (sigwait(&set, &sig) != 0) {}
         _exit(128 + sig);
     }).detach();
+#endif
 }
 
 int main(int argc, char** argv) {
