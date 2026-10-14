@@ -148,9 +148,9 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Fourteenth, the HIP adapter answered a GPU's free memory (SYCL's `ext_intel_free_memory`) with `hipMemGetInfo` without making that GPU current, so every AMD GPU reported the free memory of the thread's current one.
   A layer split over two AMD GPUs saw the first stage's free memory, nearly all of it held by its expert cache, on the second stage, which found no room for its own cache and stopped.
   Fixed, the GPU is made current before the query, as the adapter's other calls do (`hip-mem-free-device`; the CUDA adapter makes the GPU's context current for every query).
-  Fifteenth, sycl-jit compiles an object that embeds the SYCL headers with the clang-cl just built, taken as `bin/clang-cl.exe` whenever the target is Windows.
-  Cross-built on Linux for Windows, that is a Windows program the build cannot run, and the build stopped.
-  Fixed, a cross build takes the clang-cl beside the clang given as a host tool (`CLANG`) instead (`build-windows-cross-jit`; a build on Windows is unchanged). A fix to the build only, it asks no finished toolchain to be built again.
+  Fifteenth, the device libraries (libdevice) depended on the compiler being built and all its tools (`sycl-compiler`) even when `LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR` gives the tools that compile them.
+  The cross build for Windows (`--windows`) built a Windows `clang.exe` and tools nobody runs, most of its time.
+  Fixed, with the tools given they depend on the SYCL headers alone (`build-libdevice-custom-tools`; a build without them is unchanged). A fix to the build only, it asks no finished toolchain to be built again.
   The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
   `offload-bundle-arch` asks every toolchain.
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).
@@ -239,12 +239,12 @@ ninja -C build/win $(git diff --name-only HEAD -- '*.cpp' | sed "s|^|$PWD/|; s|$
 ### intel/llvm for Windows
 
 `tools/intel_llvm_build.py --windows` builds the SYCL runtime for Windows from the same clone as the Linux one, into `.tools/intel-llvm-win/install`.
-It builds the parts the engine uses only (`sycl9.dll`, UR's loader and its CUDA and Level Zero adapters, `xptifw.dll`, the device libraries, the NVIDIA libspirv, the headers and the import libraries): no Debug DLLs and no `clang.exe`.
+It builds the parts the engine uses only (`sycl9.dll`, UR's loader and its CUDA and Level Zero adapters, `xptifw.dll`, the device libraries, the NVIDIA libspirv, the headers and the import libraries): no Debug DLLs, no `clang.exe` and no sycl-jit.
 
-- The clang-cl of the toolchain `--contrib` built, of the same release, compiles and lld-link links. The tools the build runs on the way (the tablegens, the clang that makes the device libraries) are that toolchain's too; LLVM builds the ones it lacks (`opt` and others) for this machine in `build/NATIVE`. Build `--contrib` first.
+- The clang-cl of the toolchain `--contrib` built, of the same release, compiles and lld-link links. The tools that make the device libraries and libspirv are that toolchain's too (`--contrib`'s build also copies `opt`, `llvm-as` and `libclc-remangler`, which it does not install, into its install folder). No compiler is built, for Windows or for this machine. Build `--contrib` first.
 - The MSVC CRT and the Windows SDK are xwin's splat (`--xwin`, by default `.tools/xwin/sdk`). `llvm-lib`, `llvm-rc`, `llvm-mt` and `llvm-ml` are the distribution's LLVM's (`sudo apt install llvm`).
 - The Windows CUDA headers and import libraries the CUDA adapter links come from NVIDIA's redistributable archives (CUDA 12.4.1's `cuda_cudart`, `cuda_nvml_dev` and `cuda_cccl`). They are not free software and do not go into the 7z.
-- It takes about an hour on the development machine (28 threads).
+- It takes about three minutes on the development machine (28 threads).
 
 For NVIDIA GPUs, configure the cross build with `-DSTRATA_LICENSE=contrib -DSTRATA_CUDA_ARCHS=<the GPU's architecture> -DSTRATA_CUDA_PATH=<a CUDA toolkit>`, a CUDA toolkit no newer than the version the target PC's driver supports.
 `tools/package/build.sh windows cuda12.4` builds all of this, and the Windows 7z, in a disposable Ubuntu 26.04 container ([BUILD.md](BUILD.md)).

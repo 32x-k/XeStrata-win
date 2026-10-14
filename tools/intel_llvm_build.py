@@ -272,10 +272,12 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
     # MB; 10000 is the value llvm/docs/CMake.rst suggests), and every other job runs on all the threads
     # Without assertions, as a distribution's clang is: they check the compiler's own state and do not change the code
     # it makes, and they slow every compile.  lld links LLVM's many large binaries faster, and with less memory, than
-    # GNU ld.
+    # GNU ld.  Without sycl-jit (libsycl-jit, 157 MB): libsycl opens it only to compile kernels from source, which the
+    # engine does not, and the packages never carried it.
     options = [f"--cmake-opt=-DCMAKE_INSTALL_PREFIX={INSTALL}", "--cmake-opt=-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON",
                "--cmake-opt=-DLLVM_ENABLE_ZSTD=FORCE_ON", "--cmake-opt=-DLLVM_RAM_PER_LINK_JOB=10000",
-               "--cmake-opt=-DLLVM_ENABLE_ASSERTIONS=OFF", "--cmake-opt=-DLLVM_USE_LINKER=lld"] + \
+               "--cmake-opt=-DLLVM_ENABLE_ASSERTIONS=OFF", "--cmake-opt=-DLLVM_USE_LINKER=lld",
+               "--disable-jit", "--cmake-opt=-DSYCL_ENABLE_EXTENSION_JIT=OFF"] + \
         target_options(contrib)
     # configured again when the tree was configured with other values of these options
     cache = BUILD / "CMakeCache.txt"
@@ -288,6 +290,10 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
     jobs = jobs or os.cpu_count() or 4
     started = time.time()
     run([sys.executable, SRC / "buildbot" / "compile.py", "-o", BUILD, "-j", str(jobs)])
+    # the tools a --windows build runs that the toolchain does not install (libclc's)
+    for tool in HOST_TOOLS_EXTRA:
+        if (BUILD / "bin" / tool).exists():
+            shutil.copy2(BUILD / "bin" / tool, INSTALL / "bin" / tool)
     device_libs = {"tag": DEVICE_LIBS_TAG, "built": build_device_libs(jobs)} if rocm_dirs() is not None else None
     commit = subprocess.run(["git", "-C", str(SRC), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     gpus = probe(INSTALL)
@@ -302,11 +308,16 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
 
 
 # ---- the SYCL runtime for Windows (--windows): cross-built here with clang-cl and lld-link, against the MSVC CRT and
-# the Windows SDK from xwin (docs/DEVTOOLS.md#windows-cross-build).  Its build runs tools on this machine (the
-# tablegens, and the compiler that makes the device libraries): the contrib toolchain's, of the same tag and patches,
-# and LLVM builds the ones it lacks for this machine (opt, llvm-as) in build/NATIVE.  Only the parts a Windows engine
-# links and runs with are installed (no Debug libraries, no clang.exe).
+# the Windows SDK from xwin (docs/DEVTOOLS.md#windows-cross-build).  The device libraries are made with the contrib
+# toolchain's tools, of the same tag and patches (LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR; its build copies in the three
+# it does not install), so no compiler is built for Windows or for this machine: only the parts a Windows engine links
+# and runs with (no Debug libraries, no clang.exe).
 WIN_OUT = ROOT / ".tools" / "intel-llvm-win"
+# the tools libdevice and libclc take from LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR; the toolchain installs all but
+# HOST_TOOLS_EXTRA, which build() copies from its build tree
+HOST_TOOLS = ("clang", "llvm-ar", "append-file", "clang-offload-bundler", "llvm-offload-binary", "file-table-tform",
+              "llvm-foreach", "llvm-spirv", "sycl-post-link", "llvm-link")
+HOST_TOOLS_EXTRA = ("llvm-as", "opt", "libclc-remangler")
 # NVIDIA's Windows CUDA headers and import libraries (cuda.lib, nvml.lib) the CUDA adapter links: the toolkit's
 # redistributable archives (not free software; downloaded, never bundled), of the version the contrib packages build
 # for, which every newer driver runs
@@ -326,11 +337,11 @@ echo "#$ LIBRARIES=\"-L{root}/lib/x64\""
 # the DLLs and import libraries, copied (their components install the Debug ones too, which are not built)
 WIN_COMPONENTS = ("sycl-headers", "sycl-headers-extras", "OpenCL-Headers", "ur_headers", "libsycldevice",
                   "libspirv-builtins")
-WIN_FILES = ("bin/sycl9.dll", "bin/sycl-jit.dll", "bin/ur_loader.dll", "bin/ur_win_proxy_loader.dll",
+WIN_FILES = ("bin/sycl9.dll", "bin/ur_loader.dll", "bin/ur_win_proxy_loader.dll",
              "bin/ur_adapter_cuda.dll", "bin/ur_adapter_level_zero.dll", "bin/ur_adapter_level_zero_v2.dll",
-             "bin/ur_adapter_opencl.dll", "bin/xptifw.dll", "lib/sycl9.lib", "lib/sycl.lib", "lib/sycl-jit.lib",
+             "bin/ur_adapter_opencl.dll", "bin/xptifw.dll", "lib/sycl9.lib", "lib/sycl.lib",
              "lib/sycl-devicelib-host.lib", "lib/ur_loader.lib", "lib/xpti.lib", "lib/xptifw.lib")
-WIN_TARGETS = ("sycl9.dll", "sycl-jit", "ur_loader", "ur_win_proxy_loader", "ur_adapter_cuda", "ur_adapter_level_zero",
+WIN_TARGETS = ("sycl9.dll", "ur_loader", "ur_win_proxy_loader", "ur_adapter_cuda", "ur_adapter_level_zero",
                "ur_adapter_level_zero_v2", "ur_adapter_opencl", "xptifw", "libsycldevice", "libspirv-builtins")
 # Windows names the build asks for in another case than the SDK's files (Linux's file names are case-sensitive)
 WIN_CASE_HEADERS = {"Libloaderapi.h": "um/libloaderapi.h"}
@@ -410,6 +421,10 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
     if rec.get("tag") != tag or "cuda" not in rec.get("backends", []):
         fail(f"--windows runs the tools of the contrib toolchain of {tag} on this machine, which is not built",
              f"build it first: tools/intel_llvm_build.py --contrib --tag {tag}")
+    lacking = [t for t in (*HOST_TOOLS, *HOST_TOOLS_EXTRA) if not (host / "bin" / t).exists()]
+    if lacking:
+        fail(f"the contrib toolchain lacks {', '.join(lacking)} (built before --windows needed them)",
+             f"build it again: tools/intel_llvm_build.py --contrib --rebuild --tag {tag}")
     if not (xwin / "crt" / "include").is_dir():
         fail(f"no MSVC CRT and Windows SDK in {xwin}", "xwin's splat: docs/DEVTOOLS.md#windows-cross-build, or --xwin")
     prepare_source(tag)
@@ -419,7 +434,7 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
     devflags = " ".join(["-nostdlibinc", *(f"-idirafter {d}" for d in (
         xwin / "crt" / "include", *(xwin / "sdk" / "include" / s for s in ("ucrt", "um", "shared"))))])
     s = SRC
-    projects = "sycl;llvm-spirv;opencl;xpti;xptifw;libdevice;sycl-jit"
+    projects = "sycl;llvm-spirv;opencl;xpti;xptifw;libdevice"
     options = [
         f"-DCMAKE_TOOLCHAIN_FILE={win_toolchain(xwin, hb)}", "-DCMAKE_BUILD_TYPE=Release",
         f"-DCMAKE_INSTALL_PREFIX={INSTALL}", "-DLLVM_ENABLE_ASSERTIONS=OFF",
@@ -430,29 +445,32 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
         f"-DLLVM_EXTERNAL_SYCL_SOURCE_DIR={s / 'sycl'}", f"-DLLVM_EXTERNAL_LLVM_SPIRV_SOURCE_DIR={s / 'llvm-spirv'}",
         f"-DLLVM_EXTERNAL_XPTI_SOURCE_DIR={s / 'xpti'}", f"-DXPTI_SOURCE_DIR={s / 'xpti'}",
         f"-DLLVM_EXTERNAL_XPTIFW_SOURCE_DIR={s / 'xptifw'}", f"-DLLVM_EXTERNAL_LIBDEVICE_SOURCE_DIR={s / 'libdevice'}",
-        f"-DLLVM_EXTERNAL_SYCL_JIT_SOURCE_DIR={s / 'sycl-jit'}",
         # configure.py --cuda's options for Windows
         "-DLLVM_BUILD_TOOLS=ON", "-DSYCL_ENABLE_WERROR=OFF", "-DSYCL_INCLUDE_TESTS=OFF", "-DLLVM_ENABLE_DOXYGEN=OFF",
         "-DLLVM_ENABLE_SPHINX=OFF", "-DBUILD_SHARED_LIBS=OFF", "-DSYCL_ENABLE_XPTI_TRACING=ON",
         "-DLLVM_ENABLE_LLD=OFF", "-DLLVM_SPIRV_ENABLE_LIBSPIRV_DIS=OFF", "-DXPTI_ENABLE_WERROR=OFF",
-        "-DSYCL_ENABLE_BACKENDS=level_zero;level_zero_v2;cuda;opencl", "-DSYCL_ENABLE_EXTENSION_JIT=ON",
+        "-DSYCL_ENABLE_BACKENDS=level_zero;level_zero_v2;cuda;opencl",
+        # no sycl-jit (the runtime compiler, kernel_compiler's), which the engine does not use: it would build most of
+        # LLVM's code generation and clang for Windows
+        "-DSYCL_ENABLE_EXTENSION_JIT=OFF",
         "-DSYCL_ENABLE_MAJOR_RELEASE_PREVIEW_LIB=OFF", "-DLIBCLC_TARGETS_TO_BUILD=nvptx64--nvidiacl",
         "-DLIBCLC_GENERATE_REMANGLED_VARIANTS=ON", "-DLIBCLC_NATIVECPU_HOST_TARGET=OFF",
         "-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON", f"-DCUDAToolkit_ROOT={cuda}", "-DLLVM_ENABLE_DIA_SDK=OFF",
         "-DLLVM_ENABLE_ZSTD=OFF",
-        # this machine's tools, of the same tag; LLVM's cross build hands PYTHON_EXECUTABLE to build/NATIVE (empty
-        # unless given) over its own
-        *(f"-D{var}={hb / tool}" for var, tool in (
-            ("CLANG", "clang"), ("LLVM_AR", "llvm-ar"), ("APPEND_FILE", "append-file"),
-            ("CLANG_OFFLOAD_BUNDLER", "clang-offload-bundler"), ("LLVM_OFFLOAD_BINARY", "llvm-offload-binary"),
-            ("FILE_TABLE_TFORM", "file-table-tform"), ("LLVM_FOREACH", "llvm-foreach"), ("LLVM_SPIRV", "llvm-spirv"),
-            ("SYCL_POST_LINK", "sycl-post-link"), ("LLVM_LINK", "llvm-link"))),
-        f"-DPYTHON_EXECUTABLE={sys.executable}", f"-DSYCL_LIBDEVICE_CXX_FLAGS={devflags}",
+        # the device libraries' tools, this machine's (patch build-libdevice-custom-tools); each also by its own
+        # variable, else LLVM's get_host_tool_path sets its *_target in the cache to a build of it for this machine
+        f"-DLIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR={hb}", f"-DSYCL_LIBDEVICE_CXX_FLAGS={devflags}",
+        *(f"-D{tool.upper().replace('-', '_')}={hb / tool}" for tool in (*HOST_TOOLS, *HOST_TOOLS_EXTRA)),
+        # build/NATIVE, LLVM's tree for this machine's tablegens: configured with these too; LLVM's cross build hands
+        # it PYTHON_EXECUTABLE (empty unless given) over its own
+        f"-DPYTHON_EXECUTABLE={sys.executable}", "-DCROSS_TOOLCHAIN_FLAGS_NATIVE=-DSYCL_ENABLE_EXTENSION_JIT=OFF",
     ]
-    if not (BUILD / "build.ninja").exists():
-        run(["cmake", "-G", "Ninja", "-S", s / "llvm", "-B", BUILD, *options])
+    # llvm-rc preprocesses the resource scripts with the clang it finds on PATH: the host toolchain's
+    env = dict(os.environ, PATH=f"{hb}{os.pathsep}{os.environ.get('PATH', '')}")
     started = time.time()
-    run(["cmake", "--build", BUILD, "--target", *WIN_TARGETS, "--", "-j", str(jobs or os.cpu_count() or 4)])
+    if not (BUILD / "build.ninja").exists():
+        run(["cmake", "-G", "Ninja", "-S", s / "llvm", "-B", BUILD, *options], env=env)
+    run(["cmake", "--build", BUILD, "--target", *WIN_TARGETS, "--", "-j", str(jobs or os.cpu_count() or 4)], env=env)
     shutil.rmtree(INSTALL, ignore_errors=True)
     for component in WIN_COMPONENTS:
         run(["cmake", "--install", BUILD, "--component", component])

@@ -148,9 +148,9 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   14 番目: HIP のアダプタが GPU の空きメモリ（SYCL の `ext_intel_free_memory`）を、その GPU を current にせずに `hipMemGetInfo` で答えていて、どの AMD の GPU もスレッドの current の GPU の空きを報告していました。
   AMD の GPU 2 枚で層を分割すると、2 段目は 1 段目のエキスパートのキャッシュでほぼ埋まった空きを見て、自分のキャッシュの場所がないと言って止まっていました。
   修正後は、アダプタのほかの呼び出しと同じく、その GPU を current にしてから問い合わせます（`hip-mem-free-device`。CUDA のアダプタは問い合わせのたびにその GPU のコンテキストを current にしています）。
-  15 番目: sycl-jit は SYCL のヘッダーを埋め込んだオブジェクトを、作ったばかりの clang-cl でコンパイルします。対象が Windows なら、いつも `bin/clang-cl.exe` を使っていました。
-  Linux で Windows 向けにクロスビルドすると、これは Linux の上で動かない Windows のプログラムで、ビルドが止まっていました。
-  修正後は、クロスビルドのときだけ、ホストのツールとして渡す clang（`CLANG`）の横の clang-cl を使います（`build-windows-cross-jit`。Windows の上のビルドは変わりません）。ビルドだけの修正なので、できあがったツールチェーンの作り直しは求めません。
+  15 番目: デバイスライブラリ（libdevice）は、それをコンパイルするツールを `LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR` で渡しても、作っている最中のコンパイラとその道具一式（`sycl-compiler`）に依存していました。
+  Windows 向けのクロスビルド（`--windows`）では、誰も動かさない Windows の `clang.exe` と道具を作っていて、それがビルドの時間の大半でした。
+  修正後は、ツールを渡したときは SYCL のヘッダーにだけ依存します（`build-libdevice-custom-tools`。渡さないビルドは変わりません）。ビルドだけの修正なので、できあがったツールチェーンの作り直しは求めません。
   CUDA の修正は contrib-llvm のツールチェーンにだけ、HIP の修正は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
   `offload-bundle-arch` はどのツールチェーンにも作り直しを求めます。
 - スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。
@@ -239,12 +239,12 @@ ninja -C build/win $(git diff --name-only HEAD -- '*.cpp' | sed "s|^|$PWD/|; s|$
 ### Windows 版の intel/llvm
 
 `tools/intel_llvm_build.py --windows` は、Linux 版と同じクローンから、Windows 版の SYCL のランタイムを `.tools/intel-llvm-win/install` に作ります。
-エンジンが使う部分（`sycl9.dll`、UR のローダーと CUDA・Level Zero のアダプター、`xptifw.dll`、デバイスライブラリ、NVIDIA 向けの libspirv、ヘッダー、インポートライブラリ）だけで、Debug 版の DLL と `clang.exe` は作りません。
+エンジンが使う部分（`sycl9.dll`、UR のローダーと CUDA・Level Zero のアダプター、`xptifw.dll`、デバイスライブラリ、NVIDIA 向けの libspirv、ヘッダー、インポートライブラリ）だけで、Debug 版の DLL、`clang.exe`、sycl-jit は作りません。
 
-- コンパイルは `--contrib` で作った同じ版のツールチェーンの clang-cl、リンクは lld-link が行います。ビルドの途中で動かすツール（tablegen、デバイスライブラリを作る clang など）も、そのツールチェーンのものです。足りないもの（`opt` など）は LLVM が `build/NATIVE` でこの機械向けに作ります。先に `--contrib` を作っておきます。
+- コンパイルは `--contrib` で作った同じ版のツールチェーンの clang-cl、リンクは lld-link が行います。デバイスライブラリと libspirv を作るツールも、そのツールチェーンのものです（`--contrib` のビルドは、入れ先にない `opt`・`llvm-as`・`libclc-remangler` も入れ先に写します）。Windows 向けにもこの機械向けにも、コンパイラは作りません。先に `--contrib` を作っておきます。
 - MSVC の CRT と Windows SDK は xwin の展開（`--xwin`、既定は `.tools/xwin/sdk`）を使います。`llvm-lib`・`llvm-rc`・`llvm-mt`・`llvm-ml` はディストリビューションの LLVM のものです（`sudo apt install llvm`）。
 - CUDA のアダプターがリンクする CUDA の Windows 版のヘッダーとインポートライブラリは、NVIDIA の再配布用のアーカイブ（CUDA 12.4.1 の `cuda_cudart`・`cuda_nvml_dev`・`cuda_cccl`）から取ります。自由ソフトウェアではなく、7z には入れません。
-- 開発機（28 スレッド）でおよそ 1 時間かかります。
+- 開発機（28 スレッド）で 3 分ほどです。
 
 NVIDIA の GPU 向けには、クロスビルドを `-DSTRATA_LICENSE=contrib -DSTRATA_CUDA_ARCHS=<GPU の版> -DSTRATA_CUDA_PATH=<CUDA ツールキット>` で構成します。CUDA ツールキットは、動かす PC のドライバの対応する版以下にします。
 Windows 版の 7z は、`tools/package/build.sh windows cuda12.4` が Ubuntu 26.04 の使い捨てのコンテナでここまでをすべて作ります（[BUILD.md](BUILD.ja.md)）。
