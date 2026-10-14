@@ -103,15 +103,15 @@ Values are tok/s; those measured twice are averages.
 
 | Prompt | Output | decode (this branch) | decode (Strata) | prefill (this branch) | prefill (Strata) |
 | --- | --- | --- | --- | --- | --- |
-| 50 tokens | 300 | 96 | 107 | 84 | 46 |
-| 190 tokens | 128 | 87 | 92 | 189 | 101 |
-| 2,301 tokens | 200 | 101 | 107 | 473 | 499 |
-| 18,801 tokens | 200 | 103 | 107 | 970 | 948 |
-| 40 tokens | 2,000 | 86 | 96 | 72 | 37 |
+| 50 tokens | 300 | 96 | 107 | 125 | 46 |
+| 190 tokens | 128 | 90 | 92 | 228 | 101 |
+| 2,301 tokens | 200 | 103 | 107 | 522 | 499 |
+| 18,801 tokens | 200 | 101 | 107 | 976 | 948 |
+| 40 tokens | 2,000 | 84 | 96 | 99 | 37 |
 
-Sent 20 questions in a row, `--serve` answered all 20, at 91 tok/s overall (Strata: 95 tok/s).
+Sent 20 questions in a row, `--serve` answered all 20, at 93 tok/s overall (Strata: 95 tok/s).
 
-decode is slower than Strata's mainly because computing on the CPU the experts the GPU cache does not hold, and MTP's drafting, take longer. The GPU's verify takes about as long as Strata's.
+decode is slower than Strata's mainly because computing on the CPU the experts the GPU cache does not hold takes longer: more of them go to the CPU than in Strata, while the GPU's verify and MTP's drafting take about as long as Strata's.
 
 ---
 
