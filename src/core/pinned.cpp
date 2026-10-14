@@ -88,7 +88,34 @@ void register_pieces(uint8_t* base, uint64_t bytes, const std::vector<uint64_t>&
 // machine stretched a 25 s start to 432 s.  So it is not asked for there; STRATA_NO_ARENA_THP=1 skips it anywhere.
 // Returns why it was skipped, or an empty string when it should be asked for.  Linux only: Windows has no THP.
 #if !defined(_WIN32)
-std::string thp_request_skipped() {
+// bytes in free blocks of 2 MiB or more (/proc/buddyinfo, order >= 9): what MADV_HUGEPAGE can get without compaction
+uint64_t free_huge_bytes() {
+    uint64_t total = 0;
+    if (std::FILE* f = std::fopen("/proc/buddyinfo", "r")) {
+        char line[512];
+        while (std::fgets(line, sizeof line, f) != nullptr) {
+            const char* z = std::strstr(line, "zone");
+            if (z == nullptr) continue;
+            const char* q = z + 4;
+            while (*q == ' ') ++q;
+            while (*q != '\0' && *q != ' ') ++q;   // the zone's name
+            unsigned long long c[11] = {0};
+            int n = 0;
+            for (; n < 11; ++n) {
+                char* e = nullptr;
+                const unsigned long long v = std::strtoull(q, &e, 10);
+                if (e == q) break;
+                c[n] = v;
+                q = e;
+            }
+            for (int o = 9; o < n; ++o) total += c[o] * (4096ull << o);
+        }
+        std::fclose(f);
+    }
+    return total;
+}
+
+std::string thp_request_skipped(uint64_t bytes) {
     if (std::getenv("STRATA_NO_ARENA_THP") != nullptr) return "transparent huge pages skipped (STRATA_NO_ARENA_THP)";
     std::string mode;
     if (std::FILE* f = std::fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r")) {
@@ -100,8 +127,23 @@ std::string thp_request_skipped() {
         }
         std::fclose(f);
     }
-    return mode == "always" ? "transparent huge pages are on for every mapping (THP always): MADV_HUGEPAGE not requested"
-                            : std::string();
+    if (mode == "always")
+        return "transparent huge pages are on for every mapping (THP always): MADV_HUGEPAGE not requested";
+    // upstream 6b395578 (#2126): with THP and defrag "madvise", every fault of a MADV_HUGEPAGE mapping reclaims and
+    // compacts until it finds a 2 MiB block.  When the free 2 MiB blocks cover less than half of the arena (a 62 GB
+    // machine holding 47 GB of anonymous memory: the load never ended, at 100% system time), that is minutes of kernel
+    // work per GiB for a TLB gain.  STRATA_ARENA_THP=1 asks for them anyway.
+    if (std::getenv("STRATA_ARENA_THP") == nullptr) {
+        const uint64_t free_huge = free_huge_bytes();
+        if (free_huge < bytes / 2) {
+            std::string why = "transparent huge pages NOT requested: only " + std::to_string(free_huge >> 30) +
+                              " GiB of free 2 MiB blocks for a " + std::to_string(bytes >> 30) +
+                              " GiB arena, compaction would stall the load (STRATA_ARENA_THP=1 requests them anyway)";
+            std::fprintf(stderr, "strata: expert arena: %s\n", why.c_str());   // now: the load that follows can be long
+            return why;
+        }
+    }
+    return std::string();
 }
 #endif
 }  // namespace
@@ -133,7 +175,7 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint6
         throw DeviceError("mmap of the expert arena failed for " + std::to_string(bytes) + " bytes");
     }
     base = (void*) (((uintptr_t) map_ + kHugePage - 1) & ~(uintptr_t) (kHugePage - 1));
-    const std::string thp_skip = thp_request_skipped();
+    const std::string thp_skip = thp_request_skipped(bytes);
     const bool huge = thp_skip.empty() && madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
 #endif
     // Registered before the loader touches a page: the B70 run showed later writes reach the device intact.
@@ -331,7 +373,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
                  (off_t) kArenaHeaderBytes) == MAP_FAILED) {
             base = nullptr; throw DeviceError("shared arena: mapping failed");
         }
-        const bool huge = thp_request_skipped().empty() && madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
+        const bool huge = thp_request_skipped(bytes).empty() && madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
 #endif
         register_pieces((uint8_t*) base, bytes, cuts.empty() ? bounds : cuts, reg_, pieces_);
         registered_bytes = bytes; registered_slices = 1; slice_starts = {0};
