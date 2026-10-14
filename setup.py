@@ -87,6 +87,7 @@ HF_REVISIONS = {
     "ornith-ai/Ornith-1.5-35B-A3B-GGUF": "12393612fd4f730ff5aadc23e9b8f9648aa49ceb",                 # 2026-10-11
     "pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF": "0bfdfe7f6c424de60481c26379c9d821469f75f1",         # 2026-10-11
     "llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf": "044a4447c2da94b489484927355665b819eb3d4b",           # 2026-10-11
+    "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",                  # 2026-10-12
 }
 
 
@@ -347,6 +348,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
 _ORNITH = "ornith-ai/Ornith-1.5-35B-A3B-GGUF"
 _ORNITH_GSQ = "pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF"
 _LLMJP = "llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf"
+_QWEN36 = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
 PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
     "ornith": {"title": "Ornith-1.5-35B-A3B", "by": "Ornith AI (MIT)",
                "about": "35B, 3B active; a Qwen3.5 MoE: Q4_K_M to BF16, and community GSQ-RCO 3 and 3.5 bits",
@@ -390,6 +392,23 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
                            "sha256": "52ffbf4ffb021b68d0341e7d7cd0f7a15f4beb6b4bff748042ba249c3b5e6a39",
                            "about": "the unquantized weights"},
               }},
+    # Qwen3.6-35B-A3B (qwen35moe, as Ornith-1.5): Unsloth's GGUFs with the MTP block, the three upstream offers (its own
+    # CUDA engine path there, 0.1.44; here the same plain path as Ornith's).  Their tensors: Q4_K, Q5_K, Q6_K and Q8_0
+    # experts, Q8_0 dense, F32, and the MTP block's two routers in BF16
+    "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen (Apache-2.0), GGUFs with the MTP layer by Unsloth",
+               "about": "35B, 3B active; a Qwen3.5 MoE with the Qwen tokenizer: Unsloth's 4-, 6- and 8-bit files",
+               "tag": "qwen36-", "name": "qwen3.6-35b-a3b", "max_context": 262144, "plain": True,
+               "models": {
+                   "UD-Q4_K_XL": {"repo": _QWEN36, "file": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", "size": 22853663008,
+                                  "sha256": "55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1",
+                                  "about": "4-bit (Unsloth Dynamic)"},
+                   "UD-Q6_K_XL": {"repo": _QWEN36, "file": "Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf", "size": 32611711264,
+                                  "sha256": "35fce994cd36104a7dc1bd8a4bdf13778145664c00fdef6773aebc9246e5019c",
+                                  "about": "6-bit (Unsloth Dynamic), closer to the full model"},
+                   "Q8_0": {"repo": _QWEN36, "file": "Qwen3.6-35B-A3B-Q8_0.gguf", "size": 37801097504,
+                            "sha256": "c1283d8b80c3e38b2735ddbc9766d3b3126f44d6c484be419d4e101d09a76131",
+                            "about": "8-bit, the closest to the full model"},
+               }},
 }
 FAMILIES.update(PLAIN_FAMILIES)
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
