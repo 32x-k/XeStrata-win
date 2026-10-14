@@ -3045,10 +3045,12 @@ def saved_calibration(cfg: dict) -> dict | None:
 
 
 def repoint_engine(cfg_path: Path, cfg: dict) -> dict:
-    """Windows: the 7z is unpacked anywhere, a new release in a folder of its own, so a config's engine and image
-    encoders are this program folder's: one another release wrote is pointed here on every start (the settings and the
-    model files, in the user's folders, stay as they are)."""
-    if not (WIN and PACKAGED):
+    """A packaged engine runs the config: its engine and image encoders are this package's, pointed here on every start
+    (the settings and the model files, in the user's folders, stay as they are).  Windows: the 7z is unpacked
+    anywhere, a new release in a folder of its own.  Linux: the deb on the host and the rpm in the Podman container
+    (container/) share the settings, and keep the engine in different folders (lib vs lib64); the engine finds its
+    libraries by its RPATH, so a config's other package's lib_dirs, missing here, are skipped."""
+    if not PACKAGED:
         return cfg
     eng = packaged_engine_dir()
     changed = False
