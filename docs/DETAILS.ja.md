@@ -1227,6 +1227,18 @@ JPEG、PNG、BMP、GIF、WebP、TIFF、AVIF が使えます（後ろのいくつ
 XeStrata はそれを、プロンプトの `<|image_pad|>` のトークンの位置に置き、それぞれに 2 次元の位置（画像の中の行と列）を与えます。
 モデルは交互に並べた M-RoPE を使います。
 
+## 画像の生成（任意）
+
+`./setup.sh --images qwen-image` で、文章のモデルとは別に Qwen-Image-2.1-Turbo で画像を作れるようにします（upstream 0.1.44）。
+setup は [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)（MIT）の `sd-cli` を Vulkan 版でビルドし、画像のモデル、VAE、文の読み手（Qwen3-VL-8B）をダウンロードして、設定に `"images"` を足します。
+Vulkan 版はどのメーカーの GPU でも動きます。`--image-backend cpu` で CPU でも作れます（遅い）。
+画像のモデルの大きさは GPU のメモリで選びます（8 GB まで Q4_K_M、12 GB まで Q6_K、それより上は Q8_0。`--image-quant` で変えられます）。
+Qwen-Image-2.1-Turbo の重みは Qwen Research License で、自由なソフトウェアのライセンスではありません。商用に使う前にそのライセンスを読んでください。
+
+サーバーは `POST /v1/images/generations`（OpenAI の images API の形。`seed` と `steps` も受けます）で画像を作り、Web のページには「Images」のタブが出ます。
+画像の仕事は GPU で 1 つずつ動きます。その間の文章のモデルの扱いは `--image-gpu-policy` で決めます: `keep`（そのまま）、`shrink`（`--vram-elastic` で VRAM を空ける）、`unload`（会話を保存して外し、次の起動で戻す）、`auto`（既定。両方が入れば `keep`、入らなければ空けるか外す）。
+`tools/image/install.py --config <設定>` で、入っているモデルにあとから足せます。今は Linux だけです。
+
 ---
 
 ## 実験的な速度向上用の射影（実験的、既定はオフ）

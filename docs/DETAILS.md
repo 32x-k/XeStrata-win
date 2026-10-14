@@ -1247,6 +1247,18 @@ Chat apps with image upload work the same way.
 XeStrata puts them where the prompt has `<|image_pad|>` tokens and gives each one its 2-D position (row and column in the picture);
 the model uses interleaved M-RoPE.
 
+## Image generation (optional)
+
+`./setup.sh --images qwen-image` sets up image generation with Qwen-Image-2.1-Turbo beside the text model (upstream 0.1.44).
+Setup builds [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)'s (MIT) `sd-cli` with its Vulkan backend, downloads the image model, its VAE and its text encoder (Qwen3-VL-8B), and adds an `"images"` section to the config.
+The Vulkan build runs on every maker's GPU; `--image-backend cpu` makes images on the CPU (slowly).
+The image model's size follows the GPU memory (Q4_K_M up to 8 GB, Q6_K up to 12 GB, Q8_0 above; `--image-quant` changes it).
+Qwen-Image-2.1-Turbo's weights are under the Qwen Research License, not a free software license: read it before any commercial use.
+
+The server makes images on `POST /v1/images/generations` (OpenAI's images API, plus `seed` and `steps`), and the web page gets an Images tab.
+Image jobs run one at a time on the GPU. What the text model does meanwhile is `--image-gpu-policy`: `keep` (stays as it is), `shrink` (gives VRAM back through `--vram-elastic`), `unload` (its conversation saved, unloaded, restored at the next start), or `auto` (the default: `keep` when both fit, else shrink or unload).
+`tools/image/install.py --config <config>` adds it to an existing install. Linux only for now.
+
 ---
 
 ## Experimental speed projection (EXPERIMENTAL, off by default)
