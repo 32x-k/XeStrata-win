@@ -41,11 +41,21 @@
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_mmvq
 #include "strata/kernels/device_arch_tag.hpp"
 
+#if !defined(STRATA_ADAPTIVECPP)
+#include <sycl/ext/oneapi/experimental/graph.hpp>
+#endif
+
+#include <chrono>
 #include <cstdint>
 #include <cstddef>
+#include <cstdio>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <typeinfo>
+#include <unordered_map>
+#include <vector>
 
 namespace strata::kernels {
 namespace {
@@ -618,6 +628,40 @@ sycl::event launch_row(sycl::queue& q, const void* weights, const void* x_q8_1, 
     });
 }
 
+// The layout of a row longer than the sub-group layout's 10 steps (launch_n): the work-group layout unless
+// native_mmvq_tune timed the sub-group layout faster on the device for that type and width (the R9700's 6144-wide
+// Q3_K rows: 16.4 / 27.8 us for 1 / 4 columns against 18.6 / 32.3; the B70 measured the other way, launch_n).
+// g_force_long (the tuning's runs): 0 the work-group layout, 1 the sub-group one; g_last_long the last call's type,
+// width and steps.
+struct LongRowKey {
+    std::size_t type;
+    int n_in;
+    bool operator==(const LongRowKey& o) const { return type == o.type && n_in == o.n_in; }
+};
+struct LongRowHash {
+    std::size_t operator()(const LongRowKey& k) const { return k.type ^ (std::size_t(k.n_in) << 1); }
+};
+std::mutex g_long_mutex;
+std::unordered_map<sycl::device, std::unordered_map<LongRowKey, bool, LongRowHash>>& long_rows() {
+    static std::unordered_map<sycl::device, std::unordered_map<LongRowKey, bool, LongRowHash>> rows;
+    return rows;
+}
+thread_local int g_force_long = -1;
+thread_local LongRowKey g_last_long{0, 0};
+thread_local int g_last_steps = 0;
+
+template<typename F>
+bool long_row_by_sub_group(sycl::queue& q, int n_in, int steps) {
+    g_last_long = {typeid(F).hash_code(), n_in};
+    g_last_steps = steps;
+    if (g_force_long >= 0) return g_force_long == 1;
+    std::lock_guard<std::mutex> lock(g_long_mutex);
+    const auto d = long_rows().find(q.get_device());
+    if (d == long_rows().end()) return false;
+    const auto r = d->second.find(g_last_long);
+    return r != d->second.end() && r->second;
+}
+
 template<typename F, int NCOLS>
 void launch_n(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out) {
     if (NCOLS > 1 && !g_multi_exact) {
@@ -629,7 +673,7 @@ void launch_n(sycl::queue& q, const void* weights, const void* x_q8_1, float* y,
     // beats the work-group layout, beyond (the 6144-wide rows, 12-24 steps) the work-group's four sub-groups win
     // (the 2026-10-02-xe-decode-gpu record).
     const int steps = (n_in / F::DIV + WARP / F::T - 1) / (WARP / F::T);
-    if (steps <= 10) {
+    if (steps <= 10 || long_row_by_sub_group<F>(q, n_in, steps)) {
         launch_row<F, NCOLS, 8>(q, weights, x_q8_1, y, n_in, n_out);
         return;
     }
@@ -748,6 +792,71 @@ using IQ4NLTraits = SmallTraits<IQ4NLBlock, 4>;
 } // namespace
 
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
+
+void native_mmvq_tune(int ggml_type, int n_in, int n_out, void* stream) {
+#if defined(STRATA_ADAPTIVECPP)
+    (void) ggml_type; (void) n_in; (void) n_out; (void) stream;   // no command graphs to time with: the default stays
+#else
+    if (!native_mmvq_supported(ggml_type) || n_in <= 0 || n_out <= 0) return;
+    auto& q = validate_stream(stream);
+    const std::size_t wb = native_mmvq_weight_bytes(ggml_type, n_in, n_out);
+    void* w = sycl::malloc_device(wb, q);
+    void* x = sycl::malloc_device(native_q8_1_bytes(n_in, 4), q);
+    float* y = sycl::malloc_device<float>((std::size_t) 4 * n_out, q);
+    if (!w || !x || !y) {
+        sycl::free(w, q); sycl::free(x, q); sycl::free(y, q);
+        return;   // the default layout stays
+    }
+    q.memset(w, 0, wb);
+    q.memset(x, 0, native_q8_1_bytes(n_in, 4)).wait();
+    // which layout this type and width take: nothing to choose where the sub-group layout covers the row anyway
+    g_force_long = 0;
+    g_last_steps = 0;
+    native_mmvq(ggml_type, w, x, y, n_in, n_out, 1, stream);
+    q.wait();
+    const LongRowKey key = g_last_long;
+    const bool is_long = g_last_steps > 10;
+    if (is_long) {
+        bool known = false;
+        {
+            std::lock_guard<std::mutex> lock(g_long_mutex);
+            const auto d = long_rows().find(q.get_device());
+            known = d != long_rows().end() && d->second.count(key) != 0;
+        }
+        if (!known) {
+            // timed as the engine runs them: 32 launches of 1 and of 4 columns in a graph for each layout, the two
+            // graphs replayed in turns (the first round a warm-up), each layout's fastest round kept
+            namespace sx = sycl::ext::oneapi::experimental;
+            std::vector<sx::command_graph<sx::graph_state::executable>> exec;
+            for (int layout = 0; layout < 2; ++layout) {
+                g_force_long = layout;
+                sx::command_graph<sx::graph_state::modifiable> graph(q.get_context(), q.get_device());
+                graph.begin_recording(q);
+                for (int i = 0; i < 32; ++i)
+                    for (int cols : {1, 4}) native_mmvq(ggml_type, w, x, y, n_in, n_out, cols, stream);
+                graph.end_recording(q);
+                exec.push_back(graph.finalize());
+            }
+            double t_min[2] = {};
+            for (int round = 0; round < 6; ++round)
+                for (int layout = 0; layout < 2; ++layout) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    q.ext_oneapi_graph(exec[(std::size_t) layout]);
+                    q.wait();
+                    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                    if (round > 0 && (t_min[layout] == 0.0 || us < t_min[layout])) t_min[layout] = us;
+                }
+            std::fprintf(stderr, "strata: native MMVQ type %d, %d-wide rows: %.1f us a work-group a row, %.1f us a sub-group "
+                                 "a row: %s%s", ggml_type, n_in, t_min[0], t_min[1],
+                         t_min[1] < t_min[0] ? "a sub-group" : "a work-group", "\n");
+            std::lock_guard<std::mutex> lock(g_long_mutex);
+            long_rows()[q.get_device()][key] = t_min[1] < t_min[0];
+        }
+    }
+    g_force_long = -1;
+    sycl::free(w, q); sycl::free(x, q); sycl::free(y, q);
+#endif
+}
 bool native_mmvq_multi_exact() { return g_multi_exact; }
 
 std::size_t native_q8_1_bytes(int n_in, int ncols) {

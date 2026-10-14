@@ -33,6 +33,10 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 // single-column call. Set before
 // graph capture; captured graphs keep the kernels they captured.
 void native_mmvq_set_multi_exact(bool exact);
+/// The layout of rows longer than one sub-group covers in 10 steps, for `ggml_type` at width `n_in`: both layouts
+/// timed on the stream's device as the engine runs them (in a graph, 1 and 4 columns) and the faster kept for later
+/// calls on the device; a width one sub-group covers anyway returns at once.  Call it before graphs are recorded.
+void native_mmvq_tune(int ggml_type, int n_in, int n_out, void* stream);
 bool native_mmvq_multi_exact();
 
 // One quantization may serve multiple weight matrices sharing the same input.

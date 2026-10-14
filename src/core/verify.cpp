@@ -461,6 +461,22 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     try {   // before any graph is recorded
         tune_device(g, cs_);
+        // the layout of the window's quantized projections whose rows are long (the GDN output's, for one): timed
+        // once a device for each type and width the layers use
+        const int64_t N = g.n_embd, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
+        const int64_t NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
+        struct Proj { const char* name; int64_t n_in, n_out; };
+        const Proj gdn[] = {{"attn_qkv.weight", N, C}, {"attn_gate.weight", N, ZV}, {"ssm_out.weight", ZV, N}};
+        const Proj qsa[] = {{"attn_q.weight", N, NH * 2 * HD}, {"attn_k.weight", N, NKV * HD},
+                            {"attn_v.weight", N, NKV * HD}, {"attn_output.weight", NH * HD, N}};
+        for (int64_t l = lb_; l < le_; ++l) {
+            const LayerView v(*wt_, l);
+            const bool qsa_layer = is_qsa_layer(g, l);
+            for (const Proj& pr : qsa_layer ? std::vector<Proj>(std::begin(qsa), std::end(qsa))
+                                            : std::vector<Proj>(std::begin(gdn), std::end(gdn)))
+                if (const WeightRef* r = v.get(pr.name); r != nullptr && r->native_data != nullptr)
+                    strata::kernels::native_mmvq_tune(r->native_type, (int) pr.n_in, (int) pr.n_out, cs_);
+        }
     } catch (const std::exception& e) {
         err = std::string("verify: ") + e.what();
         return false;
