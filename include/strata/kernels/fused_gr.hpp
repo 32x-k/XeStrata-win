@@ -46,6 +46,10 @@ struct FusedGrArgs {
 };
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);
+/// STRATA_HC_Q8 on a pack whose hyper-connection projections are BF16 (upstream 0a379a1f): `nb` Q8_0 blocks (34 bytes:
+/// an fp16 scale, then 32 int8 values) of the BF16 values `src`, as ggml's quantize_row_q8_0 (scale = max |x| / 127,
+/// each value rounded to the nearest).  Ordered on `stream`.
+void fused_gr_quantize_q8_0(const uint16_t* src, uint8_t* dst, int64_t nb, void* stream);
 void fused_gr_read(const FusedGrArgs& a, void* stream);
 
 /// Plan v0.3 P6: the same read for up to 8 tokens that share the weights (a verify window): the weights are read
