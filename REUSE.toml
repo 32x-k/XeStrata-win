@@ -13,7 +13,7 @@ SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
 # upstream Strata's files without a comment of their own, unchanged (AGENTS.md, Licenses)
 [[annotations]]
-path = ["data/draft_vocab*.bin", "data/expert-profile.bin", "data/expert-profile-coder.bin", "data/gguf_fingerprints.json", "docs/paper/**", "serve/fixtures/rcall_specimens.json", "serve/web/favicon.svg", "serve/web/sprite.svg", "tests/data/native_experts/**"]
+path = ["data/draft_vocab*.bin", "data/expert-profile.bin", "data/expert-profile-coder.bin", "data/gguf_fingerprints.json", "data/quant_quality/**", "docs/paper/**", "serve/fixtures/rcall_specimens.json", "serve/web/favicon.svg", "serve/web/sprite.svg", "tests/data/native_experts/**"]
 SPDX-FileCopyrightText = "2026 Niko1221 and the Strata contributors"
 SPDX-License-Identifier = "MIT"
 
