@@ -54,7 +54,7 @@ import uuid
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Iterator, Protocol, cast
+from typing import Any, Iterator, Protocol, cast
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -461,12 +461,13 @@ _WIN_CRASH = {0xC000001D: "illegal instruction (the CPU lacks an instruction the
               0xC0000005: "access violation", 0xC0000409: "stack buffer overrun / fast-fail",
               0xC0000135: "a DLL the program needs was not found", 0xC0000139: "entry point not found in a DLL",
               0xC0000142: "a DLL failed to initialize", 0xC000007B: "bad image (32-bit / 64-bit mix-up)",
-              0xC00000FD: "stack overflow", 0xC0000094: "integer division by zero", 0xC0000096: "privileged instruction"}
+              0xC00000FD: "stack overflow", 0xC0000094: "integer division by zero",
+              0xC0000096: "privileged instruction"}
 
 
 def engine_exit_words(rc: int | None) -> str:
-    """What a process's exit status says, in words: "killed by signal 4 (SIGILL, Illegal instruction)" (a negative status
-    on Linux / macOS), a Windows NTSTATUS crash code, or "exit code N".  "" when there is no status."""
+    """What a process's exit status says, in words: "killed by signal 4 (SIGILL, Illegal instruction)" (a negative
+    status on Linux / macOS), a Windows NTSTATUS crash code, or "exit code N".  "" when there is no status."""
     if rc is None:
         return ""
     if rc < 0 and os.name != "nt":
@@ -528,8 +529,8 @@ def start_exit_note(rc: int | None) -> str:
 
 
 def start_log_marks(log: str | None, offset: int) -> list:
-    """The GPU runtime failure texts (TRANSIENT_START_MARKS) this start wrote to the log: what lets a retry notice say the
-    GPU runtime failed.  [] when none, or no log."""
+    """The GPU runtime failure texts (TRANSIENT_START_MARKS) this start wrote to the log: what lets a retry notice say
+    the GPU runtime failed.  [] when none, or no log."""
     if not log:
         return []
     try:
@@ -1605,7 +1606,8 @@ class StrataEngine:
                         with self.slot_cv:
                             return self.waiting > 0
 
-                    def give_way():   # at a PP line, and between two far apart (the engine takes it at its next boundary)
+                    # at a PP line, and between two far apart (the engine takes it at its next boundary)
+                    def give_way():
                         nonlocal reserved
                         if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
@@ -3098,7 +3100,7 @@ class Service:
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
-        self.images = None                                # serve/images.py's ImageGen when the config has "images"
+        self.images: Any = None                           # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = stop_token_ids(tokenizer)
         if hasattr(engine, "eos_ids"):
@@ -3226,15 +3228,15 @@ class Service:
 
     def _engine_reserve(self) -> int | None:
         """The VRAM the engine keeps free for other programs outside an elastic encoder's turn: the last POST /v1/vram
-        reserve, or 0 when none was asked (the cache grows back to its full size; None would leave the reserve the engine
-        started with, a segment or more below the size it had)."""
+        reserve, or 0 when none was asked (the cache grows back to its full size; None would leave the reserve the
+        engine started with, a segment or more below the size it had)."""
         return self.vram_reserve if self.vram_reserve_asked else 0
 
     def _vision_up(self):
         """The image turn's start for an elastic encoder that is not running (the caller holds self.fifo): the expert
-        cache first keeps the encoder's elastic_mib of VRAM free on top of the reserve, then the encoder starts (load and
-        warm-up, a few seconds).  If the cache cannot shrink (an engine without --vram-elastic, the resident low-RAM mode)
-        the encoder starts anyway, as a non-elastic one would."""
+        cache first keeps the encoder's elastic_mib of VRAM free on top of the reserve, then the encoder starts (load
+        and warm-up, a few seconds).  If the cache cannot shrink (an engine without --vram-elastic, the resident low-RAM
+        mode) the encoder starts anyway, as a non-elastic one would."""
         v = self.vision
         if not getattr(v, "elastic", False) or v.alive():
             return
@@ -3260,7 +3262,7 @@ class Service:
         "down", "busy" (a request holds the turn, or a picture came more recently) or "nothing" (not elastic or not
         holding anything)."""
         v = self.vision
-        if not getattr(v, "elastic", False) or not (self.vision_held or v.alive()):
+        if v is None or not getattr(v, "elastic", False) or not (self.vision_held or v.alive()):
             return "nothing"
         if not force and time.time() - self.last_image_at < v.elastic_idle_s:
             return "busy"
@@ -3282,8 +3284,9 @@ class Service:
         v = self.vision
         if not getattr(v, "elastic", False):
             return
-        print(f"[strata] images: the image encoder starts with the first picture and stops after {v.elastic_idle_s:g} s "
-              f"without one; while it runs the expert cache keeps {v.elastic_mib} MiB free for it", flush=True)
+        print(f"[strata] images: the image encoder starts with the first picture and stops after "
+              f"{v.elastic_idle_s:g} s without one; while it runs the expert cache keeps {v.elastic_mib} MiB free "
+              "for it", flush=True)
 
         def loop():
             while True:
@@ -3411,7 +3414,8 @@ class Service:
                 return {"status": "not loaded", "reserve_mib": reserve_mib,
                         "note": "applied when the model loads"}
             # an elastic encoder that runs keeps its VRAM on top of the asked reserve
-            out = self.engine.vram((reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib)
+            held = self.vision.elastic_mib if self.vision_held and self.vision is not None else None
+            out = self.engine.vram((reserve_mib or 0) + held if held is not None else reserve_mib)
             self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
             print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
                   f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
@@ -6917,7 +6921,8 @@ def main() -> int:
                     and not os.path.isabs(v) else v)
                 for k, v in cfg["images"].items()}
         try:
-            svc.images = images_api.ImageGen(icfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None)
+            ilog = open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None
+            svc.images = images_api.ImageGen(icfg, log=ilog)
         except ValueError as e:
             raise SystemExit(f"[strata] config: {e}")
         gone = svc.images.missing()

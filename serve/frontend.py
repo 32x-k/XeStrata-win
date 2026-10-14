@@ -273,9 +273,9 @@ VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", 
 # #2026: `</tool_call>` the same way.  A user asking for the string verbatim handed the model the real end-of-call token
 # (type 4, matched everywhere); it copied that token into its answer and the reply came back empty.  An assistant
 # message keeps its own: a client replaying the model's raw call text sends the tokens the model wrote.
-# 0.1.44: `<tool_call>`, `<tool_response>` and `</tool_response>` are type 4 too (ids 248058, 248066, 248070), so a quoted
-# one handed the model the real call / tool-result marker in the same way (found by 47Hunter47 in #2026).  The template
-# writes the tool-result markers around a tool message itself; only the text inside a message is marked.
+# 0.1.44: `<tool_call>`, `<tool_response>` and `</tool_response>` are type 4 too (ids 248058, 248066, 248070), so a
+# quoted one handed the model the real call / tool-result marker in the same way (found by 47Hunter47 in #2026).  The
+# template writes the tool-result markers around a tool message itself; only the text inside a message is marked.
 TOOL_LITERAL_TAGS = {"</tool_call>": "\U000F0E07", "<tool_call>": "\U000F0E08", "<tool_response>": "\U000F0E09",
                      "</tool_response>": "\U000F0E0A"}
 LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS, **TOOL_LITERAL_TAGS}
@@ -323,9 +323,9 @@ _TOOL_RESULT_OPEN, _TOOL_RESULT_CLOSE = "<tool_response>", "</tool_response>"
 
 
 def _keep_tool_result_wrap(content, tags: dict[str, str]):
-    """A user message whose whole text is <tool_response>...</tool_response> (a client that formats a tool result the way
-    the template does for a tool message) keeps that outer pair as the markers - the template tells such a turn from a
-    real question by exactly that pair - and only the text inside is marked.  None: not such a message."""
+    """A user message whose whole text is <tool_response>...</tool_response> (a client that formats a tool result the
+    way the template does for a tool message) keeps that outer pair as the markers - the template tells such a turn from
+    a real question by exactly that pair - and only the text inside is marked.  None: not such a message."""
     o, c = _TOOL_RESULT_OPEN, _TOOL_RESULT_CLOSE
 
     def wrap(text: str, first: bool, last: bool) -> str:
@@ -410,9 +410,10 @@ def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> t
 
 # Config "env_to_user" (opt-in): opencode writes its <env> block (working directory, today's date) near the START of
 # the system message, before ~40K characters of instructions and tool definitions that are the same in every session.
-# The prefix cache only reuses a prompt's start, so a new folder or a new day read all of it again (~14K tokens, 8-11 s).
-# Moved to the front of the first user message, the system turn (and the tools the template writes into it) is the same
-# for every session and the disk prefix cache restores it.  The model still sees the same lines, one turn later.
+# The prefix cache only reuses a prompt's start, so a new folder or a new day read all of it again (~14K tokens,
+# 8-11 s).  Moved to the front of the first user message, the system turn (and the tools the template writes into it)
+# is the same for every session and the disk prefix cache restores it.  The model still sees the same lines, one turn
+# later.
 ENV_TO_USER = False
 _ENV_BLOCK = re.compile(r"(?:[^\n]*environment you are running in:\n)?<env>\n.*?\n</env>\n?", re.S)
 
@@ -431,6 +432,7 @@ def _env_to_user(messages: list[dict]) -> list[dict]:
             continue
         block = m.group(0).rstrip("\n")
         c = messages[i].get("content")
+        nc: str | list
         if isinstance(c, str):
             nc = block + "\n\n" + c
         elif isinstance(c, list):
@@ -574,7 +576,7 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
              for t in _tool_list(req.get("tools"), "function")] or None
     kwargs = {}
     # OpenAI Chat Completions: "reasoning_effort"; Responses style: "reasoning": {"effort": ...}
-    reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
+    reasoning = req["reasoning"] if isinstance(req.get("reasoning"), dict) else {}
     given = req.get("reasoning_effort")
     # `false` is a level (thinking off, effort_kwargs): an `or` between the two fields dropped it
     kwargs.update(effort_kwargs(given if given is not None and given != "" else reasoning.get("effort")))
