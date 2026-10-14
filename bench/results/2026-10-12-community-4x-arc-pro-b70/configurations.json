@@ -1,0 +1,49 @@
+{
+ "engine_args": [
+  "--pack",
+  "<data>/packs/unsloth-ud-q4_k_xl",
+  "--native",
+  "<data>/models/unsloth-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+  "--ple-gguf",
+  "<data>/models/unsloth-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf",
+  "--expert-profile",
+  "<repo>/data/expert-profile.bin",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "auto",
+  "--spec",
+  "3",
+  "--spec-min-p",
+  "0.5",
+  "--mtp",
+  "<data>/mtp/rt",
+  "--max-context",
+  "131072",
+  "--kv",
+  "int8",
+  "--resident-budget-gib",
+  "8",
+  "--expert-cache-per-layer",
+  "--pcie-frac",
+  "0",
+  "--adapt-every",
+  "0",
+  "--pipeline-windows",
+  "2",
+  "--layer-split",
+  "5,24,43"
+ ],
+ "engine_env": [
+  "export STRATA_SPLIT_MTP_BATCH=0",
+  "export STRATA_SPLIT_CPU_GBPS=5"
+ ],
+ "gpu_pci": "0000:0a:00.0",
+ "split_pci": [
+  "0000:0e:00.0",
+  "0000:14:00.0",
+  "0000:18:00.0"
+ ],
+ "resolved_split": "layers 0-4 (card 0), 5-23 (card 1), 24-42 (card 2), 43-47 (card 3)",
+ "note": "the split is pinned with --layer-split 5,24,43; see README 'What the numbers show'"
+}

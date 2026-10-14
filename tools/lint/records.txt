@@ -111,3 +111,4 @@ bench/results/2026-10-10-community-rx-9070
 bench/results/COMMUNITY.md
 bench/results/exchange-rotation-ab.json
 bench/results/exchange-rotation-token-ids.json
+bench/results/2026-10-12-community-4x-arc-pro-b70

@@ -1,0 +1,5 @@
+{"card": 0, "layers": "0-4", "power_w_mean": 94.2, "power_w_peak": 102.1, "compute_pct_mean": 39.2, "mem_pct_mean": 33.8, "work_share_pct": 19}
+{"card": 1, "layers": "5-23", "power_w_mean": 144.1, "power_w_peak": 169.5, "compute_pct_mean": 60.8, "mem_pct_mean": 96.2, "work_share_pct": 29}
+{"card": 2, "layers": "24-42", "power_w_mean": 132.1, "power_w_peak": 155.1, "compute_pct_mean": 60.2, "mem_pct_mean": 96.2, "work_share_pct": 26}
+{"card": 3, "layers": "43-47", "power_w_mean": 129.1, "power_w_peak": 152.6, "compute_pct_mean": 47.6, "mem_pct_mean": 62.3, "work_share_pct": 26}
+{"card": null, "note": "total 499 W during one 400-token generation; 5 samples a card"}

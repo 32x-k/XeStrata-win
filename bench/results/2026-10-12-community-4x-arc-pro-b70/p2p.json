@@ -1,0 +1,13 @@
+{
+ "method": "p2p-bw.cpp: 256 MiB copy, one warm-up then one timed run, per ordered pair; SYCL ext_oneapi_enable_peer_access + memcpy; run while the engine served",
+ "zeDeviceCanAccessPeer": "YES for all 12 ordered pairs (reported by l0-peer.py; zeDeviceGetP2PProperties reports 0 for bandwidth and latency, so these are measured, not quoted)",
+ "device_to_device_gb_s": {
+  "min": 25.56,
+  "max": 28.7
+ },
+ "device_to_host_to_device_gb_s": {
+  "min": 12.63,
+  "max": 12.68
+ },
+ "note": "the engine has no peer code path; the layer hand-off goes through host memory (docs/MULTIGPU.md)"
+}
