@@ -452,6 +452,32 @@ def start_log_tail(log: str | None, offset: int, n: int = 20) -> str:
 
 
 _echoing: set[str] = set()      # the logs echo_requests already follows (restart() runs StrataEngine.__init__ again)
+# A start that ends at once with the GPU runtime's own failure and none of the engine's lines: on ROCm, a start right
+# after the previous engine exited can fail inside the runtime's device/queue set-up while the old process's queues are
+# still being torn down ("terminate called after throwing an instance of 'rocr::AMD::hsa_exception'", or an exit with
+# nothing in the log).  Such a start is tried again after a short wait (STRATA_START_RETRIES, default 3; 0: never).
+TRANSIENT_START_MARKS = ("hsa_exception", "HSA_STATUS_ERROR", "hsaKmt")
+START_RETRIES = max(0, int(os.environ.get("STRATA_START_RETRIES", "3") or 0))
+
+
+def transient_start_failure(log: str | None, offset: int, elapsed_s: float, rc: int | None = None) -> bool:
+    """True when the start that wrote the log from `offset` failed the transient way above: within 30 s, and its lines
+    are only the launcher's own "engine started" line plus (optionally) a GPU runtime failure.  An exit with no line
+    at all counts only when it was not the engine's own error exit (1: it said why on stdout)."""
+    if not log or elapsed_s > 30.0:
+        return False
+    try:
+        with open(log, "rb") as f:
+            f.seek(offset)
+            text = f.read(64 * 1024).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return False
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    engine_lines = [x for x in lines if not x.startswith("[strata]")]
+    if any(m in text for m in TRANSIENT_START_MARKS):
+        return all(x.startswith("terminate called") or x.startswith("what()") or
+                   any(m in x for m in TRANSIENT_START_MARKS) for x in engine_lines)
+    return not engine_lines and rc != 1   # it exited without writing a single line of its own
 
 
 def echo_requests(log_path: str, offset: int) -> None:
@@ -691,7 +717,7 @@ class StrataEngine:
             tl.last = value
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None):
+                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
@@ -739,6 +765,7 @@ class StrataEngine:
         pin = {}
         if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (replicas.py)
             pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
+        spawned_at = time.monotonic()
         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env,
                           **pin)
@@ -799,6 +826,15 @@ class StrataEngine:
                     self.log.close()
             except (OSError, subprocess.TimeoutExpired):
                 pass
+            if not timed_out and _attempt < START_RETRIES and \
+                    transient_start_failure(log, log_start, time.monotonic() - spawned_at, self.proc.returncode):
+                wait_s = 2.0 * (2 ** _attempt)              # 2, 4, 8 s: the previous process's GPU queues go away
+                print(f"[strata] the engine stopped while the GPU runtime was starting (most often right after another "
+                      f"engine exited, whose GPU queues were still being released): starting it again in {wait_s:.0f} s "
+                      f"(try {_attempt + 2} of {START_RETRIES + 1})", flush=True)
+                time.sleep(wait_s)
+                StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1)
+                return
             why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
                    f"the engine exited before it was ready ({exit_text(self.proc.poll())})")
             # EngineDied, not bare RuntimeError: a request waiting on this load must end with a 503
