@@ -2703,6 +2703,19 @@ def previous_config(elsewhere_first: list, settings: dict):
     return next((c for c in sorted(cands, key=lambda p: p.stat().st_mtime, reverse=True) if readable_config(c)), None)
 
 
+def installed_size(family: str, names: list, have: list) -> str | None:
+    """The size of this family already installed (the most recently used config first), or None.  setup run again
+    pre-selects it (upstream de9115fa): Enter must not move an installed model to another size and download it."""
+    for c in have:
+        try:
+            ch = choices_from_config(c)
+        except (OSError, ValueError, KeyError, TypeError, IndexError):
+            continue
+        if ch.get("family") == family and ch.get("model") in names:
+            return ch["model"]
+    return None
+
+
 def choices_from_config(cfg_path: Path) -> dict:
     """The setup answers a config was written with (family, size, context, KV, images, projection, network)."""
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
@@ -4319,9 +4332,12 @@ def main() -> int:
     # the VRAM that holds experts instead of RAM: every card of a layer split holds its own layers' (upstream #642),
     # each less the ~5 GB of dense weights and buffers low_ram_gpu_gb counts once
     vram = gpu_expert_vram(gpu) + sum(max(0.0, gpu_expert_vram(gpu_info(i)) - 5) for i in sel[1:])
+    have_size = installed_size(family, names, have)
     for i, m in enumerate(names, 1):
         d = MODELS[m]
         fit = "" if ram >= d["ram_gb"] else f"   <- needs {d['ram_gb']} GB RAM, you have {ram:.0f}"
+        if m == have_size:
+            fit += "   (installed)"
         if d.get("budget"):
             say(f"  {i}) {m} {d['about']}; download {d['download_gb']:.0f} GB, keeps ~"
                 f"{resident_budget_gib(m, ram)} GB of its {d['arena_gb']:.0f} GB of experts in RAM{fit}")
@@ -4333,6 +4349,8 @@ def main() -> int:
     rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
     if family == halo_fam and STRIX_HALO_MODEL in names:
         rec = str(names.index(STRIX_HALO_MODEL) + 1)
+    if have_size is not None:   # setup run again: the installed size, whatever is recommended for a first install
+        rec = str(names.index(have_size) + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     budget = None
     if MODELS[model].get("budget"):
