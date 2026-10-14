@@ -3458,6 +3458,7 @@ int main(int argc, char** argv) {
         }();
         if (headroom && !best.empty() && scored.size() > 1) {
             std::vector<strata::program::split_rules::Placement> cand;
+            cand.reserve(scored.size());
             for (const Scored& s : scored) cand.push_back(s.p);
             const size_t i = strata::program::split_rules::pick_with_headroom(cand, headroom_tol);
             if (cand[i].cuts != best) {
@@ -7532,7 +7533,7 @@ int main(int argc, char** argv) {
         const int64_t a_cap = a_arena ? o.adapt_swaps : std::min<int64_t>(o.adapt_swaps, 96);
         const auto a_env = [](const char* name, int def) {
             const char* v = std::getenv(name);
-            return v != nullptr && *v != 0 ? std::atoi(v) : def;
+            return v != nullptr && *v != 0 ? (int) std::strtol(v, nullptr, 10) : def;
         };
         const bool a_inline = a_arena && a_env("STRATA_ADAPT_PICK_INLINE", 1) != 0;
         const bool a_wait = a_arena && a_env("STRATA_ADAPT_ASYNC_WAIT", 1) != 0;

@@ -57,13 +57,13 @@ bool cpu_waitpkg() {
 uint64_t umwait_cycles() {
     static const uint64_t c = [] {
         const char* e = std::getenv("STRATA_POOL_UMWAIT");
-        if (e == nullptr || std::atoll(e) <= 0) return (uint64_t) 0;
+        if (e == nullptr || std::strtoll(e, nullptr, 10) <= 0) return (uint64_t) 0;
         if (!cpu_waitpkg()) {
             std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin\n");
             return (uint64_t) 0;
         }
-        std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: parked workers wait with UMWAIT (%lld cycles)\n", std::atoll(e));
-        return (uint64_t) std::atoll(e);
+        std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: parked workers wait with UMWAIT (%lld cycles)\n", std::strtoll(e, nullptr, 10));
+        return (uint64_t) std::strtoll(e, nullptr, 10);
     }();
     return c;
 }
@@ -74,7 +74,7 @@ unsigned umwait_state() {   // 1 = C0.1 (light), 0 = C0.2
 uint64_t umwait_escalate() {   // a park that has lasted this long is a GPU phase, where a slower wake costs little
     static const uint64_t c = [] {
         const char* e = std::getenv("STRATA_POOL_UMWAIT_ESC");
-        return e ? (uint64_t) (std::max)(0LL, std::atoll(e)) : (uint64_t) 0;
+        return e ? (uint64_t) (std::max)(0LL, std::strtoll(e, nullptr, 10)) : (uint64_t) 0;
     }();
     return c;
 }

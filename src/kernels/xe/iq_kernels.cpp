@@ -495,7 +495,7 @@ template<> struct Split<12> {   // Q4_K
     struct W { int v[2]; uint16_t aux[2]; ggml_half2 dm; int bq8_offset; };
     static W load(const void* vbq, int kbx, int iqs) {
         const block_q4_K* b = (const block_q4_K*) vbq + kbx;
-        W r;
+        W r{};
         r.bq8_offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
         const auto* q4 = reinterpret_cast<const int*>(b->qs + (size_t) (16 * r.bq8_offset + 4 * ((iqs / 2) % 4)));
         r.v[0] = q4[0];
@@ -522,7 +522,7 @@ template<> struct Split<13> {   // Q5_K
     struct W { int vl[2], vh[2]; uint16_t aux[2]; ggml_half2 dm; int bq8_offset; };
     static W load(const void* vbq, int kbx, int iqs) {
         const block_q5_K* b = (const block_q5_K*) vbq + kbx;
-        W r;
+        W r{};
         r.bq8_offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
         const auto* ql = reinterpret_cast<const int*>(b->qs + (size_t) (16 * r.bq8_offset + 4 * ((iqs / 2) % 4)));
         const auto* qh = reinterpret_cast<const int*>(b->qh + (size_t) (4 * ((iqs / 2) % 4)));
@@ -555,7 +555,7 @@ template<> struct Split<7> {   // Q5_1
     struct W { int vi0[VDR_Q5_1], vi1[VDR_Q5_1]; float d, m; };
     static W load(const void* vbq, int kbx, int iqs) {
         const block_q5_1* b = (const block_q5_1*) vbq + kbx;
-        W r;
+        W r{};
         for (int i = 0; i < VDR_Q5_1; ++i) {
             const int vl = get_int_b4(b->qs, iqs + i);
             const int vh = get_int_b4(b->qh, 0) >> (4 * (iqs + i));
@@ -592,7 +592,7 @@ template<> struct Split<8> {   // Q8_0
     struct W { int v[VDR_Q8_0]; float d; };
     static W load(const void* vbq, int kbx, int iqs) {
         const block_q8_0* b = (const block_q8_0*) vbq + kbx;
-        W r;
+        W r{};
         for (int i = 0; i < VDR_Q8_0; ++i) r.v[i] = get_int_b2(b->qs, iqs + i);
         r.d = (float) b->d;
         return r;
@@ -610,7 +610,7 @@ template<> struct Split<14> {   // Q6_K: the whole dot's chain, the weight words
     struct W { int vl, vh; int8_t sc[QR6_K]; float d; int bq8_offset; };
     static W load(const void* vbq, int kbx, int iqs) {
         const block_q6_K* b = (const block_q6_K*) vbq + kbx;
-        W r;
+        W r{};
         r.bq8_offset = 2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
         const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
         const int vh_shift = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
@@ -624,7 +624,7 @@ template<> struct Split<14> {   // Q6_K: the whole dot's chain, the weight words
         float sumf = 0.0f;
         for (int i = 0; i < QR6_K; ++i) {
             const block_q8_1* b8 = bq8_1 + r.bq8_offset + (ptrdiff_t) 2 * i;
-            const int sc = r.sc[i];
+            const int sc = r.sc[i];  // NOLINT(bugprone-signed-char-misuse): Q6_K scales are signed
             const int vil = (r.vl >> (4 * i)) & 0x0F0F0F0F;
             const int vih = ((r.vh >> (4 * i)) << 4) & 0x30303030;
             const int vi = xe::vsubss4(vil | vih, 0x20202020);   // (vil | vih) - 32

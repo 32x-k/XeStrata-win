@@ -147,11 +147,11 @@ void gdn_conv_commit_layers(float* hist0, int64_t hist_stride, const float* qkv0
         float seq[3];
         for (int j = 0; j < 3; ++j) {
             const int src = n + j;   // the last three of [hist(3) | x_0..x_{n-1}], as gdn_conv_commit
-            seq[j] = src < 3 ? history[c * 3 + src] : qkv[(size_t) (src - 3) * C + c];
+            seq[j] = src < 3 ? history[(size_t) c * 3 + src] : qkv[(size_t) (src - 3) * C + c];
         }
-        history[c * 3] = seq[0];
-        history[c * 3 + 1] = seq[1];
-        history[c * 3 + 2] = seq[2];
+        history[(size_t) c * 3] = seq[0];
+        history[(size_t) c * 3 + 1] = seq[1];
+        history[(size_t) c * 3 + 2] = seq[2];
     });
     done(stream, e, "gdn_conv_commit_layers");
 }

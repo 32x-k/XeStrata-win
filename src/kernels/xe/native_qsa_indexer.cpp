@@ -177,7 +177,7 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
     for (int i = 0; i < n_layers; ++i) {   // the per-layer append's span checks, layer by layer
         const std::size_t pos_span = n_steps == 1 || pos_stride <= 0 ? 4 : (std::size_t(n_steps - 1) * pos_stride + 1) * 4;
         const Span spans[] = {{raw0 + (std::size_t) i * (std::size_t) raw_stride, std::size_t(n_steps)*D*4},
-            {relative_pos_device,pos_span},{L.gamma[i],std::size_t(D)*4},{L.tail[i],std::size_t(R-1)*D*4},{L.dead[i],D*4},
+            {relative_pos_device,pos_span},{L.gamma[i],std::size_t(D)*4},{L.tail[i],std::size_t(R-1)*D*4},{L.dead[i],std::size_t(D)*4},
             {L.pooled[i],std::size_t(max_cells/R+1)*D*4},{L.block_pos[i],4}};
         for (const auto& span : spans) validate(span);
         for (int a = 0; a < 7; ++a) for (int b = a + 1; b < 7; ++b)

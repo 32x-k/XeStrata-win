@@ -454,7 +454,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const char* v = std::getenv("STRATA_COPY_PRIO");
         return v != nullptr && std::strtol(v, nullptr, 10) != 0;
     }();
-    if (!(copy_ = strata::gpu::stream_create(copy_prio))) {
+    copy_ = strata::gpu::stream_create(copy_prio);
+    if (copy_ == nullptr) {
         err = "verify: copy stream create failed";
         return false;
     }
