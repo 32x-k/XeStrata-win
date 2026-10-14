@@ -57,9 +57,9 @@ The main ones:
   `reasoning_effort`, pictures matched by their bytes in the conversation cache (#2228), and the stdin reader's QUIT
   race.
 - The quantization yardstick (`tools/quant_quality.py`, `tools/quant_formats.py`).
-- `STRATA_HC_Q8` (the hyper-connection down/up read in Q8_0; a BF16 pack's quantized at load): where the copies are
-  at most 5% of the free VRAM both forms are timed at load and the faster kept (B70 decode +3%; an approximation that
-  changes the output).
+- `STRATA_HC_Q8` (the hyper-connection down/up read in Q8_0; a BF16 pack's quantized at load): both forms are timed
+  at load and the faster kept; with Q8_0 on one GPU the BF16 copies leave the VRAM, and on AMD the read also writes
+  the next projections' q8_1 (B70 decode +3.5%; an approximation that changes the output).
 - Ported and kept opt-in: `STRATA_MTP_PRIO` and `STRATA_COPY_PRIO`, `STRATA_POOL_UMWAIT`, `STRATA_PCIE_MIN1`, `--adapt-async 1` in the arena
   mode, `STRATA_DENSE_F32`.
 
@@ -75,8 +75,7 @@ Compared with upstream v0.1.44.1 on the three makers' GPUs (generate on five mod
 on the RTX 4070 generate's decode is 8-21% faster on all five files and the prefill as fast or faster (IQ3_XXS at 1K
 16%, IQ2_XS 15%). On the RX 9060 XT the prefill is 2.1-3.2x, but IQ3_XXS's decode is 2.5-4.7% slower: upstream reads
 the hyper-connection down/up projections in Q8_0 by default on gfx12 (+4.4% when turned off and on in upstream).
-XeStrata's Q8_0 read is not clearly faster on the RX 9060 XT and on 16 GB takes the expert cache's room, so it reads
-BF16 there. The B70 is not compared
+XeStrata times it at load and takes Q8_0 too, but gains only 0.6% on the RX 9060 XT. The B70 is not compared
 with upstream; on the same text it is as fast as XeStrata before this integration.
 
 Not ported: the Mac (Metal), upstream's `sycl/`, the NVFP4 experts (on GPUs without FP4 matrix units their prompts

@@ -50,7 +50,7 @@ upstream の Strata 0.1.43.1 から 0.1.44.1（`296b59d2`）までの変更を X
 - serve: 長い読みが短い要求に次の塊で譲る（#656）、opencode の `<env>` を最初のユーザーの発言へ移す（`"env_to_user"`、opt-in）、画像があるときだけ画像のエンコーダーを動かす（`"elastic"`、opt-in）、
   GPU のランタイムの立ち上げで止まったエンジンの起動し直し、落ちたエンジンの終わり方の表示、Responses API の `reasoning_effort`、会話のキャッシュの画像の照合（#2228）、stdin の読み手の終了の競合。
 - 量子化の品質の物差し（`tools/quant_quality.py`、`tools/quant_formats.py`）。
-- `STRATA_HC_Q8`（ハイパーコネクションの down/up を Q8_0 で読む、BF16 の pack では読み込み時に Q8_0 にする）: 写しが空いている VRAM の 5% 以下なら読み込み時に両方の形を測り、速い方を使います（B70 で decode +3%。答えが変わる近似）。
+- `STRATA_HC_Q8`（ハイパーコネクションの down/up を Q8_0 で読む、BF16 の pack では読み込み時に Q8_0 にする）: 読み込み時に両方の形を測って速い方を使い、Q8_0 なら GPU 1 枚のときは BF16 の写しを VRAM から外します。AMD では次の射影のための q8_1 も読みの中で書きます（B70 で decode +3.5%。答えが変わる近似）。
 - opt-in のまま移したもの: `STRATA_MTP_PRIO`・`STRATA_COPY_PRIO`、`STRATA_POOL_UMWAIT`、`STRATA_PCIE_MIN1`、arena の `--adapt-async 1`、`STRATA_DENSE_F32`。
 
 この取り込みの間に XeStrata の側で直したもの:
@@ -62,7 +62,7 @@ upstream の Strata 0.1.43.1 から 0.1.44.1（`296b59d2`）までの変更を X
 upstream v0.1.44.1 と 3 社の GPU で比べました（generate は 5 つのモデルファイル、serve、通常使用）。
 RTX 4070 は、generate の decode が 5 つのファイルのすべてで 8〜21% 速く、prefill は同等以上（IQ3_XXS の 1K は 16%、IQ2_XS は 15% 速い）です。
 RX 9060 XT は prefill が 2.1〜3.2 倍ですが、IQ3_XXS の decode は 2.5〜4.7% 遅くなりました。
-upstream が gfx12 で hyper-connection の down/up を Q8_0 で読むのを既定にした分（upstream の側で切って比べると +4.4%）です。XeStrata の Q8_0 の読みは RX 9060 XT では速いとは言えず、16 GB ではエキスパートのキャッシュを削るので、BF16 で読みます。
+upstream が gfx12 で hyper-connection の down/up を Q8_0 で読むのを既定にした分（upstream の側で切って比べると +4.4%）です。XeStrata も読み込み時に測って Q8_0 を選びますが、RX 9060 XT での伸びは +0.6% にとどまります。
 B70 は upstream と比べず、取り込みの前の XeStrata と同じ文で比べて同じ速さです。
 
 移していないのは、Mac（Metal）、upstream の `sycl/`、NVFP4 のエキスパート（FP4 の行列ユニットのない GPU では IQ 系より prompt が遅く、品質も UD-Q4_K_XL より下）、
