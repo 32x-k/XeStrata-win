@@ -92,9 +92,11 @@ void rms16(const float* x, const float* g, int64_t HW, int64_t C, bool silu, uin
 // col16[r][(dy * 3 + dx) * C + c] = in16[y + dy - 1][x + dx - 1][c] (0 outside), pixel p0 + r = y * W + x
 void im2col3(const uint16_t* in16, int64_t H, int64_t W, int64_t C, int64_t p0, int64_t rows, uint16_t* col16,
              void* s) {
-    q_of(s).parallel_for(sycl::range<2>((size_t) (rows * 9), (size_t) (C / 8)), [=](sycl::id<2> id) {
-        const auto rk = static_cast<int64_t>(id[0]);
-        const int64_t r = rk / 9, kk = rk - r * 9, c8 = static_cast<int64_t>(id[1]) * 8;
+    // one dimension (a CUDA grid's second is capped at 65535 blocks: the rows of a band pass it), the channels fastest
+    const int64_t C8 = C / 8;
+    q_of(s).parallel_for(sycl::range<1>((size_t) (rows * 9 * C8)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t rk = i / C8, r = rk / 9, kk = rk - r * 9, c8 = (i - rk * C8) * 8;
         const int64_t p = p0 + r, y = p / W + kk / 3 - 1, x = p % W + kk % 3 - 1;
         sycl::vec<uint16_t, 8> v(0);
         if (y >= 0 && y < H && x >= 0 && x < W) v = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(in16 + (y * W + x) * C + c8);
@@ -221,9 +223,10 @@ void rgba_tokens16(const float* rgba, int64_t HW, int64_t Cp, uint16_t* out16, v
 void im2col3s2(const uint16_t* in16, int64_t H, int64_t W, int64_t C, int64_t p0, int64_t rows, uint16_t* col16,
                void* s) {
     const int64_t Wo = W / 2;
-    q_of(s).parallel_for(sycl::range<2>((size_t) (rows * 9), (size_t) (C / 8)), [=](sycl::id<2> id) {
-        const auto rk = static_cast<int64_t>(id[0]);
-        const int64_t r = rk / 9, kk = rk - r * 9, c8 = static_cast<int64_t>(id[1]) * 8;
+    const int64_t C8 = C / 8;   // one dimension, as im2col3
+    q_of(s).parallel_for(sycl::range<1>((size_t) (rows * 9 * C8)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t rk = i / C8, r = rk / 9, kk = rk - r * 9, c8 = (i - rk * C8) * 8;
         const int64_t p = p0 + r, y = 2 * (p / Wo) + kk / 3, x = 2 * (p % Wo) + kk % 3;
         sycl::vec<uint16_t, 8> v(0);
         if (y < H && x < W) v = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(in16 + (y * W + x) * C + c8);
