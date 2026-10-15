@@ -44,7 +44,7 @@ public:
     int64_t hidden() const { return C_; }
     /// The layers' bytes (in the file) and the two slots a streamed walk takes at least.
     uint64_t layer_bytes() const { return layers_stream_.total(); }
-    uint64_t layer_min() const { return 2 * (layers_stream_.count() ? layers_stream_.bytes(0) : 0); }
+    uint64_t layer_min() const { return layers_stream_.min_budget(); }
     /// The VRAM the layers may take (LayerStream: those that fit stay, the rest are streamed).
     void set_layer_budget(uint64_t bytes) { layers_stream_.configure(bytes, s_); }
     int resident_layers() const { return layers_stream_.resident(); }

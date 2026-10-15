@@ -44,6 +44,8 @@ public:
     uint64_t bytes(int i) const { return layers_[(size_t) i].bytes; }
     uint64_t total() const;
     int count() const { return (int) layers_.size(); }
+    /// The least budget configure takes when not every layer fits: two slots of the largest layer.
+    uint64_t min_budget() const { return 2 * max_bytes_; }
 
     /// Sets the VRAM the layers may take (their resident prefix and, when not all fit, the two slots): a layer resident
     /// before and past the new prefix is freed.  `compute` is the stream the layers are used on.

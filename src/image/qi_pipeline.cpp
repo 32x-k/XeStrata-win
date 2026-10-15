@@ -353,7 +353,10 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
             p.vae_tiled = vae_->scratch_bytes(h, w) > vae_room;
         }
         vae_->decode(x, h, w, rgba, vae_room);
-        if (p.vae_tiled) vae_->drop_scratch();   // a tile's buffers: not worth keeping beside the layers
+        // a tile's buffers are not worth keeping beside the layers, and buffers past the plan's share for the VAE (the
+        // room the encoder's layers or the DiT's blocks gave it) are that room: the next request takes it back for
+        // them (RTX 4070, 1920x1088: the second image's blocks were refused beside the first one's VAE buffers)
+        if (p.vae_tiled || vae_->scratch_bytes(h, w) > p.vae) vae_->drop_scratch();
         gpu::copy(out.data(), rgba, out.size() * 4);
         const auto t3 = clock::now();
         if (times != nullptr) {

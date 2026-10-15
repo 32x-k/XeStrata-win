@@ -78,7 +78,7 @@ public:
     uint64_t weight_bytes() const { return weight_bytes_; }
     uint64_t block_bytes() const { return blocks_stream_.total(); }
     /// The two slots a streamed block walk takes at least.
-    uint64_t block_min() const { return 2 * (blocks_stream_.count() ? blocks_stream_.bytes(0) : 0); }
+    uint64_t block_min() const { return blocks_stream_.min_budget(); }
     /// The VRAM the blocks may take: those that fit stay, the rest are streamed (LayerStream).
     void set_block_budget(uint64_t bytes) { blocks_stream_.configure(bytes, s_); }
     int resident_blocks() const { return blocks_stream_.resident(); }
