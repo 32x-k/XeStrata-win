@@ -421,6 +421,11 @@ class ImageEngine:
             with contextlib.suppress(OSError, ValueError):
                 f.write(("SHUTDOWN" if shutdown else "QUIT") + "\n")
                 f.flush()
+        if sock is not None:   # the reader blocked in the file first: closing the file under it would wait for it
+            import socket
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+        if f is not None:
             with contextlib.suppress(OSError, ValueError):
                 f.close()
         if sock is not None:
