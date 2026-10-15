@@ -23,7 +23,7 @@ apt-get update -q
 # nvidia-cuda-toolkit: CUDA 12.4, for intel/llvm's CUDA target and the engine's NVIDIA code (not free software);
 # dotnet-sdk-10.0 for the launchers
 apt-get install -y -q --no-install-recommends git cmake ninja-build g++ libhwloc-dev libzstd-dev python3 python3-pip \
-  curl ca-certificates unzip ccache lld lld-21 llvm-21 dotnet-sdk-10.0 7zip nvidia-cuda-toolkit
+  curl ca-certificates unzip ccache lld lld-21 llvm-21 dotnet-sdk-10.0 7zip nvidia-cuda-toolkit opencl-headers
 cuda_path=/usr/lib/cuda
 
 # build.sh's compiler cache, shared with the Ubuntu packages (container.sh)
