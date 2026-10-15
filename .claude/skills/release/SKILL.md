@@ -19,7 +19,7 @@ Rules for the whole run:
 - `gh` only as `gh release ...` (the one exception to "git commands only" in the user's global instructions); everything else with git.
   Every `gh release` names `--repo MistVVK/XeStrata`: without it gh takes the `upstream` remote (Niko1221/Strata).
   Never print or read gh's token (`gh auth status` shows the account; leave its token lines out).
-- A release ships the contrib-llvm packages (the user's decision, 2026-10-09) and the Windows 7z, a contrib-llvm build for Windows (the user's decision, 2026-10-14). The free packages are treated like contrib-icpx: built only when the user asks (`build-packages.sh xe<VERSION> free`), and not attached otherwise.
+- A release ships the contrib-llvm packages (the user's decision, 2026-10-09) and the Windows 7z, a contrib-llvm build for Windows (the user's decision, 2026-10-14). The free packages are built only when the user asks (`build-packages.sh xe<VERSION> free`), and not attached otherwise.
 - The check of the packages and the 7z is their build alone (the user's decision, 2026-10-07): no CTest, no incus run, no Windows run, unless the user asks for them.
 - Work and commits are on `dev` (Japanese commit messages, one logical change per commit, `git add` and `git commit` joined with `&&`). `dev` itself is never pushed; `main` is.
 - A tag that has been pushed is never moved or deleted. A mistake after the push is fixed by a new version (the fourth number).

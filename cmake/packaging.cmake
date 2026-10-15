@@ -42,7 +42,7 @@ if(STRATA_LICENSE STREQUAL "contrib")
     endif()
   endforeach()
 elseif(NOT STRATA_LICENSE STREQUAL "free")
-  message(FATAL_ERROR "STRATA_PACKAGE builds the free and contrib modes (contrib-icpx links icpx's runtime)")
+  message(FATAL_ERROR "STRATA_PACKAGE builds the free and contrib modes")
 endif()
 
 set(_pkg_share ${CMAKE_INSTALL_DATADIR}/xestrata)

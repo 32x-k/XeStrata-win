@@ -76,8 +76,8 @@ parts of NVIDIA's libdevice; those parts are NVIDIA's, distributed under the NVI
 Agreement.
 
 The models are not part of this repository; each model's own license applies to its files.
-Neither are the vendors' libraries the contrib-llvm and contrib-icpx modes link (Intel oneMKL and the runtime libraries of
-Intel's oneAPI compilers, NVIDIA cuBLAS and the CUDA runtime and driver); each one's own license applies to it.
+Neither are the vendors' libraries the contrib-llvm mode links (Intel oneMKL, NVIDIA cuBLAS and the CUDA runtime and
+driver); each one's own license applies to it.
 
 
 Strata (MIT License)

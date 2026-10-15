@@ -29,18 +29,22 @@ option(STRATA_PORTABLE "ggml-cpu for any AVX2 CPU; OFF: -march=native" ON)
 # - contrib (the default): free software that needs non-free parts to build or run: intel/llvm with its CUDA target,
 #   for NVIDIA GPUs as well (STRATA_CUDA_ARCHS), which needs NVIDIA's CUDA toolkit to build and its driver to run, and
 #   oneMKL and cuBLAS for the dense products (through oneMath).
-# - contrib-icpx: the same with Intel oneAPI's icpx (and the runtime libraries it links, libimf, libsvml and others)
-#   and oneMKL, Intel GPUs only.
-set(STRATA_LICENSE contrib CACHE STRING "build mode: free, contrib or contrib-icpx")
-set_property(CACHE STRATA_LICENSE PROPERTY STRINGS free contrib contrib-icpx)
-if(NOT STRATA_LICENSE MATCHES "^(free|contrib|contrib-icpx)$")
-  message(FATAL_ERROR "STRATA_LICENSE=${STRATA_LICENSE}: one of free, contrib, contrib-icpx")
+# Intel oneAPI's icpx is not taken (the contrib-icpx mode was removed on 2026-10-15): intel/llvm reaches every maker's
+# GPUs.
+set(STRATA_LICENSE contrib CACHE STRING "build mode: free or contrib")
+set_property(CACHE STRATA_LICENSE PROPERTY STRINGS free contrib)
+if(STRATA_LICENSE STREQUAL "contrib-icpx")
+  message(FATAL_ERROR "STRATA_LICENSE=contrib-icpx: the contrib-icpx mode (Intel oneAPI's icpx) was removed; use "
+                      "-DSTRATA_LICENSE=contrib (contrib-llvm: intel/llvm, -DCMAKE_CXX_COMPILER=.tools/intel-llvm-contrib/"
+                      "install/bin/clang++ or .tools/intel-llvm/install/bin/clang++), or -DSTRATA_LICENSE=free")
+elseif(NOT STRATA_LICENSE MATCHES "^(free|contrib)$")
+  message(FATAL_ERROR "STRATA_LICENSE=${STRATA_LICENSE}: free or contrib")
 endif()
 # The GPUs a contrib build makes code and links libraries for; "auto" (the default) takes this PC's cards, of every
 # maker it has: an Intel card (on the PCI bus, from sysfs) wants the oneMKL backend, each NVIDIA card's compute
 # capability (from nvidia-smi) its architecture and the cuBLAS backend.
 # - STRATA_CUDA_ARCHS: NVIDIA architectures (contrib only), e.g. sm_89 for the RTX 40 series; empty: none
-# - STRATA_ONEMKL: the oneMKL backend for Intel GPUs' dense products (contrib; contrib-icpx always has it)
+# - STRATA_ONEMKL: the oneMKL backend for Intel GPUs' dense products (contrib)
 # - STRATA_HIP_ARCHS: AMD architectures, RDNA2 and later, e.g. gfx1200 for the RX 9060 XT (free and contrib: ROCm is
 #   free software; cmake/StrataHip.cmake); auto: this PC's, from the kernel's KFD topology; rocblas: those the
 #   distribution's rocBLAS has code for (a package's); empty: none
@@ -73,18 +77,16 @@ include(cmake/StrataHip.cmake)
 set(_strata_hip_archs "${STRATA_HIP_ARCHS}")
 if(STRATA_HIP_ARCHS STREQUAL "auto")
   set(_strata_hip_archs "")
-  if(NOT STRATA_LICENSE STREQUAL "contrib-icpx")
-    strata_hip_detect(_strata_hip_found)
-    # this PC's AMD GPUs the engine runs on; the others (an older integrated one, say) are left out
-    foreach(arch IN LISTS _strata_hip_found)
-      strata_hip_supported(${arch} ok)
-      if(ok)
-        list(APPEND _strata_hip_archs ${arch})
-      else()
-        message(STATUS "AMD GPU ${arch}: not RDNA2 or later, no code for it")
-      endif()
-    endforeach()
-  endif()
+  strata_hip_detect(_strata_hip_found)
+  # this PC's AMD GPUs the engine runs on; the others (an older integrated one, say) are left out
+  foreach(arch IN LISTS _strata_hip_found)
+    strata_hip_supported(${arch} ok)
+    if(ok)
+      list(APPEND _strata_hip_archs ${arch})
+    else()
+      message(STATUS "AMD GPU ${arch}: not RDNA2 or later, no code for it")
+    endif()
+  endforeach()
 elseif(STRATA_HIP_ARCHS STREQUAL "rocblas")
   strata_hip_rocblas(_strata_hip_archs)
   if(NOT _strata_hip_archs)
@@ -103,12 +105,6 @@ if(STRATA_ONEMKL STREQUAL "auto")
     endif()
   endforeach()
 endif()
-if(STRATA_LICENSE STREQUAL "contrib-icpx")
-  if(NOT _strata_onemkl)
-    message(STATUS "STRATA_LICENSE=contrib-icpx always builds the oneMKL backend (its GPUs are Intel's)")
-  endif()
-  set(_strata_onemkl ON)
-endif()
 if(STRATA_LICENSE STREQUAL "contrib")
   message(STATUS "contrib: NVIDIA architectures '${_strata_cuda_archs}', oneMKL backend ${_strata_onemkl}")
 endif()
@@ -119,12 +115,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
-endif()
-# icpx defaults to -fp-model=fast; the CUDA build compiled its host code with g++, whose default keeps IEEE semantics.
-# Precise is the baseline here too, so host references, the CPU experts and the device kernels start from the same
-# arithmetic as upstream; a kernel may opt into faster math only with a measured reason.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
-  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-ffp-model=precise>)
 endif()
 # Windows' C runtime marks standard C functions (getenv, fopen, sscanf) deprecated in favour of its own _s versions
 if(WIN32)
@@ -242,23 +232,10 @@ add_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
 if(STRATA_ENABLE_XE)
   include(CheckCXXSourceCompiles)
   if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
-    if(NOT STRATA_LICENSE STREQUAL "contrib-icpx")
-      message(FATAL_ERROR "icpx is not free software: configure with intel/llvm's DPC++ 7 or later "
-                          "(tools/intel_llvm_build.py; -DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++), "
-                          "or allow it with -DSTRATA_LICENSE=contrib-icpx")
-    endif()
-    if(_strata_cuda_archs)
-      message(FATAL_ERROR "STRATA_CUDA_ARCHS: icpx has no NVIDIA target; configure with intel/llvm built with CUDA "
-                          "(tools/intel_llvm_build.py --contrib) and -DSTRATA_LICENSE=contrib")
-    endif()
-    if(_strata_hip_archs)
-      message(FATAL_ERROR "STRATA_HIP_ARCHS: icpx has no AMD target; configure with intel/llvm built with ROCm's HIP "
-                          "(tools/intel_llvm_build.py) and -DSTRATA_LICENSE=free or contrib")
-    endif()
+    message(FATAL_ERROR "Intel oneAPI's icpx is not taken (the contrib-icpx mode was removed): configure with "
+                        "intel/llvm's DPC++ 7 or later (tools/intel_llvm_build.py; "
+                        "-DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++, --contrib for NVIDIA GPUs)")
   else()
-    if(STRATA_LICENSE STREQUAL "contrib-icpx")
-      message(FATAL_ERROR "STRATA_LICENSE=contrib-icpx builds with icpx (-DCMAKE_CXX_COMPILER=icpx)")
-    endif()
     # intel/llvm 7 or later, whose SYCL runtime is libsycl 9 (Ubuntu 26.04's dpclang++ 6.2 has libsycl 8 and gives the
     # Arc Pro B70 no XMX): one compiler line for every build with intel/llvm
     set(CMAKE_REQUIRED_FLAGS -fsycl)
@@ -490,7 +467,7 @@ if(STRATA_ENABLE_XE)
   # time, so the engine starts without the library of a GPU it does not use.
   set(STRATA_ONEMATH_SOURCE "" CACHE STRING
       "oneMath's source archive (a local file or URL) to build from (empty: fetch the pinned one of XeStrata's fork)")
-  if(NOT STRATA_LICENSE MATCHES "^(contrib|contrib-icpx)$")
+  if(NOT STRATA_LICENSE STREQUAL "contrib")
     set(_strata_onemkl OFF)   # oneMKL is not free software
   endif()
   # Windows: not yet (oneMath's FindcuBLAS finds Linux's libraries only), so every GPU takes XeStrata's own kernels

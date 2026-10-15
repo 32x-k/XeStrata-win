@@ -332,7 +332,6 @@ The Xe library exports `embedding_gather`, `gdn_gate`, `scale_inplace`, `f32_to_
 The other declarations in `elementwise.hpp` are not ported and not provided by the library.
 These kernels and the parity oracle are compiled without fast math and without multiply/add contraction.
 
-Everything icpx compiles uses `-ffp-model=precise`: icpx defaults to fast, and upstream's host code was built with g++.
 All device code is built with `-foffload-fp32-prec-div -foffload-fp32-prec-sqrt`.
 CUDA divides and takes square roots with IEEE rounding by default; SYCL device code does not.
 `quantize_act_parity` sees the one-ulp difference in Q8_K's `1/iscale`.
@@ -483,29 +482,16 @@ The CPU encoder reads the pictures checked as llama.cpp does, on grids of both s
 Every model that runs was checked with images:
 two grid shapes, two images in one request, and a conversation that sends the image again and reuses its cache.
 
-The GPU encoder comes in two builds.
-Both take the B70 by its PCI address (`strata-vision --gpu-pci`, from the config's `vision.gpu_pci`):
+The GPU encoder is the Vulkan build (ggml-vulkan, `-DSTRATA_VISION_VULKAN=ON`).
+It takes the GPU by its PCI address (`strata-vision --gpu-pci`, from the config's `vision.gpu_pci`):
 with Vulkan the first GPU can be the processor's graphics or another card.
-
-- **Vulkan** (ggml-vulkan, `-DSTRATA_VISION_VULKAN=ON`): the free build's.
-  Its driver is Mesa, free software.
-  It encodes 7–9× faster than the CPU encoder (8 threads) and about half as fast as the SYCL one.
-  Its embeddings differ from the CPU encoder's by 2.4–3.1% (relative L2), less than the SYCL encoder's, and repeat bit for bit.
-- **SYCL** (ggml-sycl, `-DSTRATA_VISION_SYCL=ON`): in the contrib-icpx mode (`--license contrib-icpx`), when oneMKL is installed.
-  ggml-sycl links oneMKL, which is not free software.
-  Every node runs on the GPU; it encodes 13–20× faster than the CPU encoder, with the same answers or a rewording at a near-tie.
-  Its embeddings differ from the CPU encoder's by 3–6% (relative L2); it was adopted without a tolerance for that.
-
-ggml-sycl takes oneDNN (`intel-oneapi-dnnl-devel`) when it is installed at build time.
-With it the SYCL encoder is 1.2–1.5× faster per image, but the same image gives slightly different embeddings from run to run.
-So it is off unless chosen.
-`./setup.sh --vision-onednn on` writes `"onednn": true` in the config, and the server's `--vision-onednn on|off` overrides it for one start.
-The server sets `GGML_SYCL_ENABLE_DNN` and `GGML_SYCL_FA_ONEDNN` for the encoder; off gives the same bits as a build without oneDNN.
+On Intel GPUs its driver is Mesa, free software.
+It encodes 7–9× faster than the CPU encoder (8 threads); its embeddings differ from the CPU encoder's by 2.4–3.1% (relative L2) and repeat bit for bit.
+(The SYCL build of the contrib-icpx mode, ggml-sycl with oneMKL, was removed with that mode on 2026-10-15.)
 
 The server starts the encoders in this order until one is ready:
 
-1. the GPU encoder (with oneDNN if chosen)
-1. the GPU encoder without oneDNN
+1. the GPU encoder
 1. the CPU encoder (the config's `vision.fallback`)
 
 The console and `/v1/status` (`vision.encoder`, `vision.fallback`) say which one serves and why the ones before it did not start.

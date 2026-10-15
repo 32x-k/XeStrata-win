@@ -174,7 +174,7 @@ python tools/license_class.py              # every file's license class against 
 
 The license check needs upstream's tag in the clone (step 1's fetch); without it, it is skipped.
 
-As AGENTS.md says, with intel/llvm only, in the free and contrib-llvm modes (the contrib-icpx mode is not built or tested):
+As AGENTS.md says, with intel/llvm only, in the free and contrib-llvm modes:
 
 - on the development machine, build and run CTest in `build/free` (without oneAPI's environment) and `build/contrib-llvm`;
 - in the AMD container, its contrib-llvm build with HIP (`STRATA_HIP_ARCHS`), and CTest;

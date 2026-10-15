@@ -318,8 +318,6 @@ Xe のライブラリは、`embedding_gather`、`gdn_gate`、`scale_inplace`、`
 `elementwise.hpp` のほかの宣言は移植しておらず、ライブラリにはありません。
 これらのカーネルと parity の参照は、高速な数学関数と積和の融合（contraction）を切ってコンパイルします。
 
-icpx がコンパイルするものはすべて `-ffp-model=precise` を使います。
-icpx の既定は fast で、upstream のホストのコードは g++ でビルドしていたためです。
 デバイスのコードはすべて `-foffload-fp32-prec-div -foffload-fp32-prec-sqrt` でビルドします。
 CUDA は既定で除算と平方根を IEEE の丸めで行いますが、SYCL のデバイスのコードは行いません。
 `quantize_act_parity` は、Q8_K の `1/iscale` に出る 1 ulp の差でこれを見つけます。
@@ -474,29 +472,16 @@ CPU のエンコーダーは、確かめた画像を、2 つの形の格子で l
 動くモデルはすべて画像でも確かめました。
 2 つの形の格子、1 つの要求に 2 枚の画像、同じ画像をもう一度送ってそのキャッシュを使う会話です。
 
-GPU のエンコーダーには 2 つのビルドがあります。
-どちらも B70 を PCI アドレスで選びます（`strata-vision --gpu-pci`、設定の `vision.gpu_pci`）。
+GPU のエンコーダーは Vulkan のビルド（ggml-vulkan、`-DSTRATA_VISION_VULKAN=ON`）です。
+GPU を PCI アドレスで選びます（`strata-vision --gpu-pci`、設定の `vision.gpu_pci`）。
 Vulkan では、最初の GPU が CPU 内蔵のグラフィックスやほかの GPU のこともあるためです。
+Intel の GPU のドライバーは自由ソフトウェアの Mesa です。
+CPU のエンコーダー（8 スレッド）より 7〜9 倍速く、埋め込みは CPU のエンコーダーと 2.4〜3.1%（相対 L2）違い、毎回ビット単位で同じになります。
+（contrib-icpx のモードにあった SYCL のビルド（ggml-sycl、oneMKL）は、そのモードと一緒に 2026-10-15 に廃止しました。）
 
-- **Vulkan**（ggml-vulkan、`-DSTRATA_VISION_VULKAN=ON`）: free のビルドのものです。
-  ドライバーは自由ソフトウェアの Mesa です。
-  CPU のエンコーダー（8 スレッド）より 7〜9 倍速く、SYCL のものの約半分の速さです。
-  埋め込みは CPU のエンコーダーと 2.4〜3.1%（相対 L2）違い、SYCL のものより差が小さく、毎回ビット単位で同じになります。
-- **SYCL**（ggml-sycl、`-DSTRATA_VISION_SYCL=ON`）: contrib-icpx（`--license contrib-icpx`）で、oneMKL が入っているときに使います。
-  ggml-sycl は、自由ソフトウェアでない oneMKL をリンクします。
-  すべてのノードが GPU で動き、CPU のエンコーダーより 13〜20 倍速く、答えは同じか、僅差のところで言い回しが変わる程度です。
-  埋め込みは CPU のエンコーダーと 3〜6%（相対 L2）違い、その差に許容範囲を決めずに採用しました。
+server は、どちらかが準備できるまで、エンコーダーを次の順に起動します。
 
-ggml-sycl は、ビルドのときに oneDNN（`intel-oneapi-dnnl-devel`）が入っていればそれを使います。
-oneDNN を使うと SYCL のエンコーダーは画像 1 枚あたり 1.2〜1.5 倍速くなりますが、同じ画像でも実行ごとに埋め込みがわずかに変わります。
-そのため、選んだときだけ使います。
-`./setup.sh --vision-onednn on` は設定に `"onednn": true` を書き、server の `--vision-onednn on|off` はその起動に限って上書きします。
-server はエンコーダーのために `GGML_SYCL_ENABLE_DNN` と `GGML_SYCL_FA_ONEDNN` を設定し、off なら oneDNN なしのビルドと同じビットになります。
-
-server は、どれかが準備できるまで、エンコーダーを次の順に起動します。
-
-1. GPU のエンコーダー（選んでいれば oneDNN つき）
-1. oneDNN なしの GPU のエンコーダー
+1. GPU のエンコーダー
 1. CPU のエンコーダー（設定の `vision.fallback`）
 
 どれが使われ、それより前のものがなぜ起動しなかったかは、コンソールと `/v1/status`（`vision.encoder`、`vision.fallback`）に出ます。

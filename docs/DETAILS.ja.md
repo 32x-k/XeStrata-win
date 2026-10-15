@@ -1165,7 +1165,7 @@ setup はエンコーダーをダウンロードし、小さな補助のプロ�
 
 | エンコーダーの場所 | 速さ | 画像 1 枚のトークン |
 | --- | --- | --- |
-| **GPU**（勧める） | CPU のエンコーダーより、Vulkan で 7〜9 倍、SYCL（contrib-icpx）で 13〜20 倍速い | 最大 1,024 |
+| **GPU**（勧める） | CPU のエンコーダーより 7〜9 倍速い（Vulkan） | 最大 1,024 |
 | CPU | 遅い | 約 300 に縮める |
 
 画像を有効にすると、setup はエンジンに `--vram-reserve-mib 700` を渡します。
@@ -1178,7 +1178,7 @@ GPU のエンコーダーが VRAM を使うぶん、エキスパートのキャ�
 エンコーダーが動いている間の `POST /v1/vram` は、エンコーダーの分の上に予約を積みます。モデルを外すとエンコーダーも止まります。
 `"vram_elastic"` がなければ、サーバーはそう言って、これまでどおりモデルと一緒にエンコーダーを起動します。
 
-GPU のエンコーダーの 2 つのビルド（Vulkan と contrib-icpx の SYCL）、精度の違い、GPU で動かないときに CPU へ切り替わる順は [XE.ja.md](XE.ja.md#画像) にあります。
+GPU のエンコーダーのビルド（Vulkan）、精度、GPU で動かないときに CPU へ切り替わる順は [XE.ja.md](XE.ja.md#画像) にあります。
 画像 1 枚は、文脈の最大 1,024 トークンになります（640x480 の写真なら 300）。
 チャットのアプリが毎回送り直す同じ画像は、一度だけエンコードします。
 
@@ -1308,16 +1308,15 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | 症状 | すること |
 | --- | --- |
 | `no Intel GPU on the xe or i915 driver, no AMD GPU on amdgpu and no NVIDIA GPU on NVIDIA's driver found` | Intel の GPU が xe か i915 のドライバーに、AMD の GPU が amdgpu に、NVIDIA の GPU が NVIDIA のドライバーにつながっていません。`lspci -k` でドライバーを確かめます。単体の GPU なら、BIOS で Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
-| `an NVIDIA GPU needs the contrib build` | `--license free` か `--license contrib-icpx` を選んでいます。NVIDIA の GPU は contrib-llvm のビルドでだけ使えるので、`--license contrib` で setup をやり直します。 |
+| `an NVIDIA GPU needs the contrib build` | `--license free` を選んでいます。NVIDIA の GPU は contrib-llvm のビルドでだけ使えるので、`--license contrib` で setup をやり直します。 |
 | `NVIDIA's CUDA toolkit is missing` | NVIDIA の GPU のコードを作る CUDA ツールキットがありません。入れてから setup をやり直します（Ubuntu: `sudo apt install nvidia-cuda-toolkit`）。 |
-| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | contrib-llvm か contrib-icpx のビルドで、Intel の GPU の密な行列積に使う oneMKL がありません。入れる（[BUILD.ja.md](BUILD.ja.md#パッケージ)）か、`--license free` で setup をやり直します。 |
+| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | contrib-llvm のビルドで、Intel の GPU の密な行列積に使う oneMKL がありません。入れる（[BUILD.ja.md](BUILD.ja.md#パッケージ)）か、`--license free` で setup をやり直します。 |
 | `no access to the GPU` | 自分のユーザーで `/dev/dri/renderD*` を開けません。`sudo usermod -aG render $USER` のあと、ログインし直します。 |
 | `no access to the GPU's compute device (/dev/kfd)` | AMD の GPU の計算に使う `/dev/kfd` を開けません。`sudo usermod -aG render $USER` のあと、ログインし直します。 |
 | `... the engine needs an RDNA2 or later AMD GPU` | RDNA2 より前の AMD の GPU では動きません。 |
 | `... rocBLAS ... has no code for gfx...`、`... has no code for gfx...` | ディストリビューションの rocBLAS（パッケージではそのエンジン）が、その GPU のコードを持っていません。Ubuntu 26.04 なら、Fedora 44 で動くことがあります（[README](../README.ja.md#amd-の-gpu)）。 |
 | `building for the AMD GPU needs ROCm's ...` | AMD の GPU のコードを作る ROCm のパッケージが足りません。示されたものを入れて、setup をやり直します（`./setup.sh --packages` も参照）。 |
 | `... has no HIP target (AMD GPUs)` | intel/llvm が、ROCm を入れる前にビルドされています。setup が尋ねたら作り直すか、`python3 tools/intel_llvm_build.py --rebuild` を実行します。 |
-| `an AMD GPU needs the free or contrib build` | `--license contrib-icpx` を選んでいます。icpx には AMD の対象がないので、`--license free` か `--license contrib` で setup をやり直します。 |
 | Linux で `no progress for 60 s ... reading the prompt` と出て、止まったときの報告に `threads waiting on the disk (state D): 16 ...` がある | エンジンが止まったのではなく、ドライブを待っています。n-gram の表をランダムに読む（`--ple-io direct`）のに、回転ディスクが追いつきません（upstream #605）。表が回転ディスクにあると、エンジンは起動時に警告します。`--ple-io ram`（表の分の RAM が要ります）か、モデルを SSD に置くと直ります。setup は、回転ディスクで RAM に表が入るなら、自分で `--ple-io ram` を付けます。 |
 | `the SYCL runtime of ... lists no GPU` | GPU の Level Zero のドライバー（`libze-intel-gpu1`、Intel の compute-runtime）がないか、その GPU には古すぎます。新しいものを入れます（[BUILD.ja.md](BUILD.ja.md#パッケージ)）。 |
 | `... gives this GPU no XMX` | そのコンパイラでは GPU の XMX が使えません。setup の選択肢から選びます。XMX なしでも動き、prefill に約 1.6 倍の時間がかかります（[BUILD.ja.md](BUILD.ja.md#sycl-のコンパイラ)）。 |
@@ -1366,7 +1365,7 @@ issue を立てるときは、秘密や個人情報を除いた報告と必要�
   推測は MTP のものと同じに確かめるので、出力は変わりません。
 - **prefill** は、最大 32,768 トークンの塊で処理し、エキスパートは PCIe で GPU に流します。
   行列積は、Intel の GPU では XMX、AMD の GPU では WMMA（RDNA3 以降）、NVIDIA の GPU では Tensor Core で計算し、
-  密な行列積は oneMath 経由で、contrib-llvm と contrib-icpx のビルドでは oneMKL か cuBLAS に、AMD の GPU では rocBLAS と hipBLASLt に任せます。
+  密な行列積は oneMath 経由で、contrib-llvm のビルドでは oneMKL か cuBLAS に、AMD の GPU では rocBLAS と hipBLASLt に任せます。
 
 Strata の設計、測定、ボトルネックは、upstream の論文 **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)**（英語、CUDA での測定）にあります。
 
@@ -1390,7 +1389,7 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)**（MIT）: i-quant の形式、`src/kernels/xe/` に書き写した GPU の内積と展開、
   i-quant のエキスパートのためにリンクする CPU のバックエンド、画像のエンコーダー（`tools/vision/`）の `mtmd` のライブラリと GPU のバックエンド（Vulkan、SYCL）、
   道具が使う `gguf-py`。`third_party/main/ggml/LICENSE` を参照。
-- **[oneMath](https://github.com/uxlfoundation/oneMath)**（Apache-2.0）: 密な行列積を、contrib-llvm と contrib-icpx では oneMKL（Intel）と cuBLAS（NVIDIA）に、free と contrib-llvm では rocBLAS と hipBLASLt（AMD）に渡す層。
+- **[oneMath](https://github.com/uxlfoundation/oneMath)**（Apache-2.0）: 密な行列積を、contrib-llvm では oneMKL（Intel）と cuBLAS（NVIDIA）に、free と contrib-llvm では rocBLAS と hipBLASLt（AMD）に渡す層。
   リポジトリには含めず、CMake が XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)。XeStrata の変更として cuBLAS の BF16 の積と rocBLAS の後端の hipBLASLt が入った oneMath）を取ってきます。oneMath と同じライセンスです。`third_party/main/oneMath/LICENSE` を参照。
 - **[intel/llvm](https://github.com/intel/llvm)** の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib-llvm のコンパイラと SYCL のランタイム。
   リポジトリには含めず、`tools/intel_llvm_build.py` がリリースを取ってきてビルドします。

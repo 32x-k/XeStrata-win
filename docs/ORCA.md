@@ -87,7 +87,7 @@ The expert arena alone needs about 49.8 GiB of free RAM, plus the draft and runt
 }
 ```
 
-An engine built with the intel/llvm built here or with icpx needs its runtime's folders.
+An engine built with the intel/llvm built here needs its runtime's folders.
 Copy `lib_dirs` from an `xestrata-<model>.json` setup wrote into this config.
 
 Run from the repository root:

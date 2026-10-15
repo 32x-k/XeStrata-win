@@ -1185,7 +1185,7 @@ Nothing else changes.
 
 | Encoder on | Speed | Image tokens per picture |
 | --- | --- | --- |
-| **GPU** (recommended) | faster than the CPU encoder: 7–9× with Vulkan, 13–20× with SYCL (contrib-icpx) | up to 1,024 |
+| **GPU** (recommended) | 7–9× faster than the CPU encoder (Vulkan) | up to 1,024 |
 | CPU | slow | scaled down to about 300 |
 
 With images on, setup passes `--vram-reserve-mib 700` to the engine.
@@ -1199,7 +1199,7 @@ After `"elastic_idle_s"` (default 120) without a picture it stops between reques
 A `POST /v1/vram` while the encoder runs stacks the reserve on top of the encoder's share; an unload stops the encoder too.
 Without `"vram_elastic"` the server says so and starts the encoder with the model, as before.
 
-The two GPU encoder builds (Vulkan, and SYCL in contrib-icpx), how their results differ, and the order in which the server falls back to the CPU are in [XE.md](XE.md#images).
+The GPU encoder's build (Vulkan), its precision, and the order in which the server falls back to the CPU are in [XE.md](XE.md#images).
 A picture becomes up to 1,024 tokens of the context (a 640x480 photo: 300).
 The same picture sent again, as chat apps do on every turn, is encoded only once.
 
@@ -1327,16 +1327,15 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 | Symptom | What to do |
 | --- | --- |
 | `no Intel GPU on the xe or i915 driver, no AMD GPU on amdgpu and no NVIDIA GPU on NVIDIA's driver found` | The Intel GPU is not on the xe or i915 driver, the AMD GPU not on amdgpu, and the NVIDIA GPU not on NVIDIA's; check the driver with `lspci -k`. For a discrete card, enable Above 4G Decoding and Re-Size BAR and disable CSM in the BIOS. |
-| `an NVIDIA GPU needs the contrib build` | `--license free` or `--license contrib-icpx` is chosen. NVIDIA GPUs run in the contrib-llvm build only: run setup again with `--license contrib`. |
+| `an NVIDIA GPU needs the contrib build` | `--license free` is chosen. NVIDIA GPUs run in the contrib-llvm build only: run setup again with `--license contrib`. |
 | `NVIDIA's CUDA toolkit is missing` | The CUDA toolkit that makes the NVIDIA GPU's code is not installed. Install it and run setup again (Ubuntu: `sudo apt install nvidia-cuda-toolkit`). |
-| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | The contrib-llvm or contrib-icpx build hands the Intel GPU's dense matrix products to oneMKL, which is missing. Install it ([BUILD.md](BUILD.md#packages)), or run setup again with `--license free`. |
+| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | The contrib-llvm build hands the Intel GPU's dense matrix products to oneMKL, which is missing. Install it ([BUILD.md](BUILD.md#packages)), or run setup again with `--license free`. |
 | `no access to the GPU` | Your user cannot open `/dev/dri/renderD*`: `sudo usermod -aG render $USER`, then log in again. |
 | `no access to the GPU's compute device (/dev/kfd)` | Your user cannot open `/dev/kfd`, which AMD GPUs compute through: `sudo usermod -aG render $USER`, then log in again. |
 | `... the engine needs an RDNA2 or later AMD GPU` | AMD GPUs older than RDNA2 do not run it. |
 | `... rocBLAS ... has no code for gfx...`, `... has no code for gfx...` | The distribution's rocBLAS (in a package, its engine) has no code for that GPU. On Ubuntu 26.04, it may run on Fedora 44 ([README](../README.md#amd-gpus)). |
 | `building for the AMD GPU needs ROCm's ...` | ROCm's packages that build the AMD GPU's code are missing. Install the ones named and run setup again (see also `./setup.sh --packages`). |
 | `... has no HIP target (AMD GPUs)` | intel/llvm was built before ROCm was installed. Let setup build it again when it asks, or run `python3 tools/intel_llvm_build.py --rebuild`. |
-| `an AMD GPU needs the free or contrib build` | `--license contrib-icpx` is chosen. icpx has no AMD target: run setup again with `--license free` or `--license contrib`. |
 | `no progress for 60 s ... reading the prompt` on Linux, and the stall report says `threads waiting on the disk (state D): 16 ...` | The engine waits for the drive, not a deadlock: the n-gram table is read at random (`--ple-io direct`), which a rotational disk cannot keep up with (upstream #605). The engine warns at start when the table is on one; `--ple-io ram` (it needs RAM for the table) or the model on an SSD fixes it. Setup adds `--ple-io ram` itself on a rotational disk when the RAM holds the table. |
 | `the SYCL runtime of ... lists no GPU` | The GPU's Level Zero driver (`libze-intel-gpu1`, Intel's compute-runtime) is missing or too old for it; install a newer one ([BUILD.md](BUILD.md#packages)). |
 | `... gives this GPU no XMX` | The compiler gives the GPU no XMX; choose from setup's options. It runs without XMX, with prefill taking about 1.6 times as long ([BUILD.md](BUILD.md#the-sycl-compiler)). |
@@ -1387,7 +1386,7 @@ When opening an issue, include the report and necessary log excerpts after remov
   The drafts are checked like the MTP's, so the output is the same.
 - **Prefill** runs in chunks of up to 32,768 tokens, with the experts streamed to the GPU over PCIe.
   The matrix products run on XMX on Intel GPUs, on WMMA on AMD GPUs (RDNA3 or later) and on tensor cores on NVIDIA
-  GPUs, and the dense ones go through oneMath: to oneMKL or cuBLAS in the contrib-llvm and contrib-icpx builds, and to
+  GPUs, and the dense ones go through oneMath: to oneMKL or cuBLAS in the contrib-llvm build, and to
   rocBLAS and hipBLASLt on AMD GPUs.
 
 Strata's design, measurements and bottlenecks are in upstream's paper, **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)** (measured on CUDA).
@@ -1412,7 +1411,7 @@ The model files are not part of it; their licenses apply to them (below).
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the i-quant formats, the GPU dot products and dequantizers transcribed in `src/kernels/xe/`,
   the CPU backend linked for the i-quant experts, the `mtmd` library and the GPU backends (Vulkan, SYCL) behind the image encoder (`tools/vision/`),
   and `gguf-py` used by the tools. See `third_party/main/ggml/LICENSE`.
-- **[oneMath](https://github.com/uxlfoundation/oneMath)** (Apache-2.0): the layer that hands the dense matrix products to oneMKL (Intel) and cuBLAS (NVIDIA) in the contrib-llvm and contrib-icpx modes, and to rocBLAS and hipBLASLt (AMD) in the free and contrib-llvm modes.
+- **[oneMath](https://github.com/uxlfoundation/oneMath)** (Apache-2.0): the layer that hands the dense matrix products to oneMKL (Intel) and cuBLAS (NVIDIA) in the contrib-llvm mode, and to rocBLAS and hipBLASLt (AMD) in the free and contrib-llvm modes.
   It is not in the repository: CMake fetches XeStrata's fork ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), oneMath with XeStrata's changes: cuBLAS's BF16 product, hipBLASLt in the rocBLAS backend), under oneMath's license. See `third_party/main/oneMath/LICENSE`.
 - **[intel/llvm](https://github.com/intel/llvm)**'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib-llvm modes' compiler and SYCL runtime.
   It is not in the repository: `tools/intel_llvm_build.py` fetches the release and builds it,

@@ -2276,20 +2276,15 @@ def network_path(path: str) -> bool:
 
 
 def vision_label(cfg: dict) -> str:
-    return ("the GPU encoder" + (" with oneDNN" if cfg.get("onednn") else "")) if cfg.get("gpu") else "the CPU encoder"
+    return "the GPU encoder" if cfg.get("gpu") else "the CPU encoder"
 
 
-def vision_attempts(cfg: dict, onednn: str | None = None) -> list[dict]:
-    """The encoders to start, in order: the configured one, then (the GPU encoder with oneDNN) the same without
-    oneDNN, then the config's `fallback` (setup writes the CPU encoder there).  `onednn` ("on"/"off") overrides
-    the config's choice for this start."""
+def vision_attempts(cfg: dict) -> list[dict]:
+    """The encoders to start, in order: the configured one, then the config's `fallback` (setup writes the CPU
+    encoder there)."""
     first = dict(cfg)
     first.pop("fallback", None)
-    if onednn is not None and first.get("gpu"):
-        first["onednn"] = onednn == "on"
     out = [first]
-    if first.get("gpu") and first.get("onednn"):
-        out.append(dict(first, onednn=False))
     if isinstance(cfg.get("fallback"), dict):
         out.append(dict({k: cfg[k] for k in ("mmproj", "model") if k in cfg}, **cfg["fallback"]))
     return out
@@ -2337,11 +2332,6 @@ class Vision:
             args += ["--max-tokens", str(cfg["max_tokens"])]
         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
             args += ["--min-tokens", str(cfg["min_tokens"])]
-        if cfg.get("gpu"):
-            # ggml-sycl uses oneDNN whenever it was built with it; off unless asked for: without it the same image
-            # gives the same embeddings every time (the 2026-09-30-xe-vision-sycl record)
-            flag = "1" if cfg.get("onednn") else "0"
-            env = dict(os.environ if env is None else env, GGML_SYCL_ENABLE_DNN=flag, GGML_SYCL_FA_ONEDNN=flag)
         self.label = vision_label(cfg)
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload (#208)
@@ -6767,9 +6757,6 @@ def main() -> int:
     ap.add_argument("--fit-max-tokens", action="store_true",
                     help="clamp max_tokens to the remaining context instead of rejecting the request "
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
-    ap.add_argument("--vision-onednn", choices=["on", "off"],
-                    help="the SYCL image encoder with oneDNN (a little faster; an image's embeddings vary slightly "
-                         "from run to run) or without; default: the config's \"onednn\" (setup: off)")
     ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY. "
                          "Several keys: separate them with commas (key1,key2), as llama.cpp does")
@@ -6844,7 +6831,7 @@ def main() -> int:
                       "encoder its VRAM): the encoder starts with the model instead", flush=True)
                 vcfg["elastic"] = False
             failed: list = []
-            for vc in vision_attempts(vcfg, a.vision_onednn):
+            for vc in vision_attempts(vcfg):
                 if failed:
                     print(f"[strata] images: trying {vision_label(vc)} instead", flush=True)
                 try:
