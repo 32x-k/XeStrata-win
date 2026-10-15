@@ -124,6 +124,7 @@ struct AttnKernel {
     const uint16_t *q16, *k16, *v16;
     uint16_t* out16;
     int64_t T, heads, n_text;
+    const int32_t* key_lim;   // the prefix rows' key limits (null: a text row its own prefix)
     float scale;
     sycl::local_accessor<sycl::half, 1> ps;      // per sub-group P [TM][PLD]
     sycl::local_accessor<float, 1> st;           // per sub-group S [TM][SLD], or the output [TM][D]
@@ -173,9 +174,9 @@ struct AttnKernel {
         for (int nt = 0; nt < NT; ++nt) Ops::zero(sg, o[nt]);
         const int r = lane / L, part = lane % L;               // the softmax's row and its lanes' share
         const int64_t t = my0 + r;
-        const int64_t lim = t >= T ? 0 : (t < n_text ? t + 1 : T);
+        const int64_t lim = t >= T ? 0 : (t < n_text ? (key_lim ? key_lim[t] : t + 1) : T);
         const int64_t last = std::min(T, my0 + TM) - 1;
-        const int64_t keys = last < n_text ? last + 1 : T;
+        const int64_t keys = last < n_text ? (key_lim ? key_lim[last] : last + 1) : T;   // the limits never fall
         sycl::group_barrier(sg);
         for (int64_t j0 = 0; j0 < keys; j0 += CH) {
             const uint16_t* kc0 = k16 + j0 * row + h * D;
@@ -290,7 +291,7 @@ int pick(const sycl::device& d) {
 
 template<int P>
 sycl::event launch(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T,
-                   int64_t heads, int64_t n_text, uint16_t* out16) {
+                   int64_t heads, int64_t n_text, const int32_t* key_lim, uint16_t* out16) {
     using K = AttnKernel<P>;
     // as many sub-groups a work-group as the device's local memory and work-group size take, up to 8: they share the
     // keys' tiles in the caches
@@ -302,7 +303,7 @@ sycl::event launch(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, con
     const int64_t bq = (int64_t) nsg * K::TM;
     const size_t groups = (size_t) ((T + bq - 1) / bq);
     return q.submit([&](sycl::handler& h) {
-        K k{q16, k16, v16, out16, T, heads, n_text, 1.0f / std::sqrt((float) D),
+        K k{q16, k16, v16, out16, T, heads, n_text, key_lim, 1.0f / std::sqrt((float) D),
             sycl::local_accessor<sycl::half, 1>(sycl::range<1>((size_t) nsg * K::TM * K::PLD), h),
             sycl::local_accessor<float, 1>(sycl::range<1>((size_t) nsg * K::SREG), h),
             sycl::local_accessor<float, 1>(sycl::range<1>((size_t) nsg * 2 * K::TM), h)};
@@ -320,7 +321,8 @@ const char* qi_attention_path() {
 }
 
 void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
-                  int64_t head_dim, int64_t n_text, uint16_t* out16, float* scratch, void* stream) {
+                  int64_t head_dim, int64_t n_text, uint16_t* out16, float* scratch, void* stream,
+                  const int32_t* key_lim) {
     if (T <= 0) return;
     if (head_dim != D) throw std::invalid_argument("qi_attention: head_dim 128");
     sycl::queue& q = core::Runtime::get().stream(stream);
@@ -328,12 +330,12 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
     const int p = per_device.get(q.get_device(), [&q] { return pick(q.get_device()); });
     sycl::event e;
     switch (p) {
-    case 0: e = launch<0>(q, q16, k16, v16, T, heads, n_text, out16); break;
-    case 1: e = launch<1>(q, q16, k16, v16, T, heads, n_text, out16); break;
-    case 2: e = launch<2>(q, q16, k16, v16, T, heads, n_text, out16); break;
-    case 3: e = launch<3>(q, q16, k16, v16, T, heads, n_text, out16); break;
+    case 0: e = launch<0>(q, q16, k16, v16, T, heads, n_text, key_lim, out16); break;
+    case 1: e = launch<1>(q, q16, k16, v16, T, heads, n_text, key_lim, out16); break;
+    case 2: e = launch<2>(q, q16, k16, v16, T, heads, n_text, key_lim, out16); break;
+    case 3: e = launch<3>(q, q16, k16, v16, T, heads, n_text, key_lim, out16); break;
     default:
-        qi_attention_plain(q16, k16, v16, T, heads, head_dim, n_text, scratch, stream);
+        qi_attention_plain(q16, k16, v16, T, heads, head_dim, n_text, scratch, stream, key_lim);
         qi_to_f16(scratch, T * heads * head_dim, out16, stream);
         return;
     }

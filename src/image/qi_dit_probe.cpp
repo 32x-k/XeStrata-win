@@ -8,7 +8,8 @@
 //
 // Prints how far the noise from philox_randn (seed 42) is from the run's, each step's velocity (from the run's input
 // of that step) from the run's, and the latent after the 8 steps (from the run's noise) from the run's, with the
-// sampling's time.  OUT_LATENT: the latent written as raw FP32.
+// sampling's time.  OUT_LATENT: the latent written as raw FP32.  An edit's run (ref_latent_0, and its image's pads
+// marked in cond_token_types): the reference's latent takes their place, as in the run.
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
@@ -75,7 +76,27 @@ int main(int argc, char** argv) {
         const auto side = (int64_t) std::lround(std::sqrt((double) noise.size() / (double) C));
         const int64_t H = side, W = side, n = C * H * W;
         compare("noise", strata::image::philox_randn(42, (uint64_t) n), noise);
-        dit.set_context(cond.data(), n_text);
+        // an edit: the reference's latent in place of its pads (the run of marked context rows)
+        std::vector<strata::image::QiDit::Ref> refs;
+        float* ref_latent = nullptr;
+        if (std::ifstream(dir + "/ref_latent_0.bin")) {
+            const auto rl = load(dir, "ref_latent_0");
+            std::ifstream tf(dir + "/cond_token_types.bin", std::ios::binary);
+            std::vector<int32_t> types((size_t) n_text);
+            tf.read(reinterpret_cast<char*>(types.data()), (std::streamsize) (types.size() * 4));
+            const auto first = std::find_if(types.begin(), types.end(), [](int32_t v) { return v != 0; });
+            strata::image::QiDit::Ref r;
+            r.slot = first - types.begin();
+            r.slots = std::count_if(types.begin(), types.end(), [](int32_t v) { return v != 0; });
+            r.h = r.w = (int64_t) std::lround(std::sqrt((double) rl.size() / (double) C));
+            if (!gpu::alloc_device(&ref_latent, rl.size() * 4)) throw std::runtime_error("alloc");
+            gpu::copy(ref_latent, rl.data(), rl.size() * 4);
+            r.latent = ref_latent;
+            refs.push_back(r);
+            std::printf("reference: %lld pads from %lld, a %lld x %lld latent\n", (long long) r.slots,
+                        (long long) r.slot, (long long) r.h, (long long) r.w);
+        }
+        dit.set_context(cond.data(), n_text, refs);
         float *x = nullptr, *v = nullptr;
         if (!gpu::alloc_device(&x, n * 4) || !gpu::alloc_device(&v, n * 4)) throw std::runtime_error("alloc");
         std::vector<float> got((size_t) n);
@@ -88,10 +109,10 @@ int main(int argc, char** argv) {
             compare("step " + std::to_string(k), got, load(dir, "dit_out_" + std::to_string(k)));
         }
         gpu::copy(x, noise.data(), n * 4);
-        dit.set_context(cond.data(), n_text);
+        dit.set_context(cond.data(), n_text, refs);
         dit.sample(x, H, W, strata::image::turbo_sigmas());   // a warm-up
         gpu::copy(x, noise.data(), n * 4);
-        dit.set_context(cond.data(), n_text);
+        dit.set_context(cond.data(), n_text, refs);
         const auto t1 = std::chrono::steady_clock::now();
         dit.sample(x, H, W, strata::image::turbo_sigmas());
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();

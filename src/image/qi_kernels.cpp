@@ -102,7 +102,7 @@ namespace {
 // neighbours in a sub-group (any size a multiple of 8), so its row's max and sum go through sub-group shuffles.
 template<int64_t BQ>
 void attention_tiles(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
-                     int64_t n_text, float* out, void* stream) {
+                     int64_t n_text, const int32_t* key_lim, float* out, void* stream) {
     constexpr int64_t D = 128, BK = 32, LANES = 8, WG = BQ * LANES;
     constexpr int64_t S = D + 8;                        // the rows' stride in local memory: neighbouring rows in other banks
     constexpr int SC = (int) (BK / LANES), OC = (int) (D / LANES);
@@ -127,10 +127,10 @@ void attention_tiles(const uint16_t* q16, const uint16_t* k16, const uint16_t* v
                 const uint16_t bits = q0 + r < T ? q16[(q0 + r) * row + hh * D + d] : (uint16_t) 0;
                 qs[r * S + d] = sycl::bit_cast<sycl::half>(bits);
             }
-            // the keys a query sees: the text rows their own prefix (causal), the image rows every row
-            const int64_t keys = t < n_text ? t + 1 : T;
-            int64_t last = q0 + BQ - 1 < n_text ? q0 + BQ : T;   // the tile's furthest key
-            if (last > T) last = T;
+            // the keys a query sees: a prefix row its limit (a text row its own prefix), the image rows every row
+            const int64_t keys = t < n_text ? (key_lim ? key_lim[t] : t + 1) : T;
+            const int64_t lr = sycl::min(q0 + BQ, T) - 1;   // the tile's furthest key: its last row's (they never fall)
+            const int64_t last = lr < n_text ? (key_lim ? key_lim[lr] : lr + 1) : T;
             float m = -INFINITY, l = 0.f, acc[OC];
             for (int c = 0; c < OC; ++c) acc[c] = 0.f;
             for (int64_t j0 = 0; j0 < last; j0 += BK) {
@@ -191,15 +191,15 @@ void attention_tiles(const uint16_t* q16, const uint16_t* k16, const uint16_t* v
 // 64 queries a work-group where the device takes 512 work-items and their local memory (B70 without its matrix
 // engines: 56 ms a 1024 x 1024 block's attention, 68 ms with 32), else 32
 void qi_attention_plain(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
-                        int64_t head_dim, int64_t n_text, float* out, void* stream) {
+                        int64_t head_dim, int64_t n_text, float* out, void* stream, const int32_t* key_lim) {
     if (T <= 0) return;
     if (head_dim != 128) throw std::invalid_argument("qi_attention_plain: head_dim 128");
     const sycl::device dev = queue_for(stream).get_device();
     const size_t wg = dev.get_info<sycl::info::device::max_work_group_size>();
     const size_t slm = dev.get_info<sycl::info::device::local_mem_size>();
     constexpr size_t kBig = (64 + 2 * 32) * (128 + 8) * 2 + 64 * 32 * 4;   // attention_tiles<64>'s local memory
-    if (wg >= 512 && slm >= kBig) attention_tiles<64>(q16, k16, v16, T, heads, n_text, out, stream);
-    else attention_tiles<32>(q16, k16, v16, T, heads, n_text, out, stream);
+    if (wg >= 512 && slm >= kBig) attention_tiles<64>(q16, k16, v16, T, heads, n_text, key_lim, out, stream);
+    else attention_tiles<32>(q16, k16, v16, T, heads, n_text, key_lim, out, stream);
 }
 
 void qi_text_qk_rope16(const float* q, const float* k, const float* v, const float* wq, const float* wk, int64_t T,

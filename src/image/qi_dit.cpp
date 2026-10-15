@@ -259,29 +259,78 @@ void QiDit::ensure(int64_t T, int64_t HW) {
     (void) HW;
 }
 
-void QiDit::set_context(const float* ctx, int64_t n_text) {
-    ensure(std::max(n_text, cap_T_), 0);
-    n_text_ = n_text;
-    float* raw = q_;   // the encoder's states, then the projection's first product
-    put_async(raw, ctx, (size_t) (n_text * C_) * 4, s_);
-    qi_rms_norm16(raw, tnorm_, n_text, C_, h16_, s_);
-    product(h16_, tin_, k_, n_text);
-    qi_gelu16(k_, n_text * C_, h16_, s_);
+void QiDit::set_context(const float* ctx, int64_t n_ctx, const std::vector<Ref>& refs) {
+    int64_t n_pre = n_ctx;
+    for (const Ref& r : refs) {
+        if (r.slot < 0 || r.slot + r.slots > n_ctx || r.slots * 4 != r.h * r.w || r.latent == nullptr)
+            throw std::invalid_argument("image engine: a reference image's pads do not match its latent");
+        n_pre += r.h * r.w - r.slots;
+    }
+    ensure(std::max({n_ctx, n_pre, cap_T_}), 0);
+    n_text_ = n_pre;
+    float* raw = q_;   // the encoder's states, then the projection's first product, then the projected rows
+    put_async(raw, ctx, (size_t) (n_ctx * C_) * 4, s_);
+    qi_rms_norm16(raw, tnorm_, n_ctx, C_, h16_, s_);
+    product(h16_, tin_, k_, n_ctx);
+    qi_gelu16(k_, n_ctx * C_, h16_, s_);
+    product(h16_, tout_, v_, n_ctx);
     if (text_ != nullptr) {
         allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), (void*) text_), allocs_.end());
         gpu::free(text_);
     }
-    text_ = alloc<float>(allocs_, n_text * C_);
-    product(h16_, tout_, text_, n_text);
+    text_ = alloc<float>(allocs_, n_pre * C_);
+    // the prefix: the context's rows, each reference's pads its latent's tokens
+    pre_pos_.assign((size_t) (n_pre * 3), 0.0f);
+    std::vector<int32_t> lim((size_t) n_pre);
+    int64_t src = 0, dst = 0;
+    float pos = 0;
+    auto text_rows = [&](int64_t upto) {
+        const int64_t n = upto - src;
+        if (n > 0) gpu::copy_async(text_ + dst * C_, v_ + src * C_, (size_t) (n * C_) * 4, s_);
+        for (int64_t k = 0; k < n; ++k, ++dst, pos += 1) {
+            pre_pos_[(size_t) dst * 3] = pre_pos_[(size_t) dst * 3 + 1] = pre_pos_[(size_t) dst * 3 + 2] = pos;
+            lim[(size_t) dst] = (int32_t) (dst + 1);
+        }
+        src = upto;
+    };
+    for (const Ref& r : refs) {
+        text_rows(r.slot);
+        const int64_t hw = r.h * r.w, ch = r.h - r.h / 2, cw = r.w - r.w / 2;   // the grid's centre, as the target's
+        qi_latent_tokens16(r.latent, in_ch_, hw, h16_, s_);
+        product(h16_, iin_, text_ + dst * C_, hw);
+        for (int64_t y = 0; y < r.h; ++y)
+            for (int64_t x = 0; x < r.w; ++x) {
+                float* p = &pre_pos_[(size_t) (dst + y * r.w + x) * 3];
+                p[0] = pos;
+                p[1] = (float) (y - ch);
+                p[2] = (float) (x - cw);
+                lim[(size_t) (dst + y * r.w + x)] = (int32_t) (dst + hw);   // the whole image, and the prefix before it
+            }
+        pos += (float) std::max(r.h, r.w);
+        dst += hw;
+        src += r.slots;
+    }
+    text_rows(n_ctx);
+    target_pos_ = (int64_t) pos;
+    if (key_lim_ != nullptr) {
+        allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), (void*) key_lim_), allocs_.end());
+        gpu::free(key_lim_);
+        key_lim_ = nullptr;
+    }
+    if (!refs.empty()) {   // without references a prefix row sees itself and before: the attention's own rule
+        key_lim_ = alloc<int32_t>(allocs_, n_pre);
+        put(key_lim_, lim.data(), lim.size() * 4);
+    }
     for (Block& b : blocks_) {
         for (uint16_t** p : {&b.pk, &b.pv}) {
             if (*p != nullptr) {
                 allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), (void*) *p), allocs_.end());
                 gpu::free(*p);
             }
-            *p = alloc<uint16_t>(allocs_, n_text * C_);
+            *p = alloc<uint16_t>(allocs_, n_pre * C_);
         }
     }
+    rope_H_ = -1;   // the positions changed
     gpu::stream_sync(s_);
 }
 
@@ -306,11 +355,11 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
     ensure(T, HW);
     if (rope_H_ != H || rope_W_ != W || rope_text_ != n_text_) {   // the 3-axis rotary tables [T][64]
         std::vector<float> pos((size_t) T * 3);
-        for (int64_t i = 0; i < n_text_; ++i) pos[i * 3] = pos[i * 3 + 1] = pos[i * 3 + 2] = (float) i;
+        std::copy(pre_pos_.begin(), pre_pos_.end(), pos.begin());
         for (int64_t y = 0; y < H; ++y)
             for (int64_t xx = 0; xx < W; ++xx) {
                 float* p = &pos[(size_t) (n_text_ + y * W + xx) * 3];
-                p[0] = (float) n_text_;
+                p[0] = (float) target_pos_;
                 const int64_t hh = H - H / 2, wh = W - W / 2;   // the grid's centre, as the model was trained
                 p[1] = (float) (y - hh);
                 p[2] = (float) (xx - wh);
@@ -366,7 +415,7 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
                 gpu::copy_async(b.pv, v16_, text_bytes, s_);
             }
         }
-        qi_attention(q16_, k16_, v16_, T, heads_, kHead, n_text_, o16_, attn_scratch_, s_);
+        qi_attention(q16_, k16_, v16_, T, heads_, kHead, n_text_, o16_, attn_scratch_, s_, key_lim_);
         product(o16_ + r0 * C, wo, h_, Tr);
         qi_gate_add(xr, h_, mod(1), ntr, Tr, C, s_);
         for (int64_t m0 = 0; m0 < Tr; m0 += mlp_rows_) {   // the MLP a band of rows at a time (its 2 x inter wide product)

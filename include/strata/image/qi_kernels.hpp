@@ -25,10 +25,11 @@ void qi_qk_norm_rope16(const float* q, const float* k, const float* v, const flo
                        const float* cos, const float* sin, int64_t T, int64_t heads, int64_t head_dim,
                        uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream);
 
-/// out[t, h, :] = softmax(q . k^T / sqrt(head_dim)) . v over the rows token t sees: a text token (t < n_text) the
-/// text tokens up to itself, an image token every token.  FP32 accumulation; the plain form, every GPU (the check).
+/// out[t, h, :] = softmax(q . k^T / sqrt(head_dim)) . v over the rows token t sees: a prefix token (t < n_text) the
+/// tokens up to itself, or with key_lim the first key_lim[t] (never falling from row to row: an edit's reference
+/// image sees all of itself), an image token every token.  FP32 accumulation; the plain form, every GPU.
 void qi_attention_plain(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
-                        int64_t head_dim, int64_t n_text, float* out, void* stream);
+                        int64_t head_dim, int64_t n_text, float* out, void* stream, const int32_t* key_lim = nullptr);
 
 /// The rows q16, k16 and v16 must hold for qi_attention: T rounded up to a multiple of 128, the rows past T zero.
 constexpr int64_t qi_attn_rows(int64_t T) { return (T + 127) / 128 * 128; }
@@ -36,7 +37,8 @@ constexpr int64_t qi_attn_rows(int64_t T) { return (T + 127) / 128 * 128; }
 /// The same attention on the GPU's matrix engines where it has them (src/image/qi_attn.cpp), FP16 out16
 /// [T][heads * head_dim]; else qi_attention_plain through `scratch` (FP32 [T][heads * head_dim]).
 void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
-                  int64_t head_dim, int64_t n_text, uint16_t* out16, float* scratch, void* stream);
+                  int64_t head_dim, int64_t n_text, uint16_t* out16, float* scratch, void* stream,
+                  const int32_t* key_lim = nullptr);
 
 /// The path qi_attention takes on the current GPU, for the report.
 const char* qi_attention_path();

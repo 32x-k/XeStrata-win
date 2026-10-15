@@ -3,10 +3,11 @@
 // include/strata/image/qi_dit.hpp - Qwen-Image-2.1's DiT on the GPU: the velocity of a latent at a time, and the
 // flow sampler over Turbo's schedule.
 //
-// The sequence is the n_text text tokens (the text encoder's states, projected once by set_context) and the image's
-// H x W tokens (the latent's 64 channels each).  A text token sees the text before it and its time is 0, so its
-// hidden states, and its K and V in every block, are the same at every step: the first step keeps the blocks' text K
-// and V (the prefix cache), and the later ones compute the image's rows alone.
+// The sequence is the prefix (the text encoder's states, projected once by set_context, and in an edit its reference
+// images' latent tokens in place of their image pads) and the image's H x W tokens (the latent's 64 channels each).
+// A text token sees the prefix up to itself, a reference image's token the prefix up to the image's end, and their
+// time is 0, so their hidden states, and their K and V in every block, are the same at every step: the first step
+// keeps the blocks' prefix K and V (the prefix cache), and the later ones compute the image's rows alone.
 #pragma once
 
 #include "strata/image/qi_stream.hpp"
@@ -49,9 +50,17 @@ public:
     /// planned with), nothing put on the GPU; such a part cannot run.
     bool open(const std::string& path, void* stream, std::string& err, bool dry = false);
 
-    /// The text encoder's states [n_text][4096] (host FP32): projected into the sequence's text rows; the prefix
-    /// cache starts again.
-    void set_context(const float* ctx, int64_t n_text);
+    /// An edit's reference image: its `slots` image pads from context row `slot` are its latent's h x w tokens instead
+    /// (latent: device FP32 [64][h][w], the VAE encoder's; 4 tokens a pad), at positions [p, row, column] (the grid's
+    /// centre 0, as the target's), p moving on by the image's longer side after it.
+    struct Ref {
+        int64_t slot = 0, slots = 0, h = 0, w = 0;
+        const float* latent = nullptr;
+    };
+
+    /// The text encoder's states [n_ctx][4096] (host FP32, after the system turn): projected into the sequence's
+    /// prefix, with `refs` (in order) in place of their pads; the prefix cache starts again.
+    void set_context(const float* ctx, int64_t n_ctx, const std::vector<Ref>& refs = {});
 
     /// out = the velocity [64][H][W] (device FP32) of the latent x (device FP32, the same shape) at time t (sigma x
     /// 1000).  `prefix`: the text rows' K and V from the cache (a step after the first of one context).
@@ -121,7 +130,10 @@ private:
     uint16_t *h16_ = nullptr, *q16_ = nullptr, *k16_ = nullptr, *v16_ = nullptr, *o16_ = nullptr;
     float *cos_ = nullptr, *sin_ = nullptr, *attn_scratch_ = nullptr;
     int64_t rope_H_ = -1, rope_W_ = -1, rope_text_ = -1;
-    float *text_ = nullptr;           // the projected text rows [n_text][C]
+    float *text_ = nullptr;           // the prefix's rows [n_text][C] (the projected text, the references' tokens)
+    std::vector<float> pre_pos_;      // the prefix rows' positions [n_text][3]
+    int64_t target_pos_ = 0;          // the image's first position
+    int32_t* key_lim_ = nullptr;      // the prefix rows' key limits, with references (null: each its own prefix)
     float *mods_ = nullptr;           // [4][2][C]: the step's modulation, row 0 the image's, row 1 the text's
     float *scale_ = nullptr;          // [2][C]: the final norm's scale (row 0)
     float *temb_ = nullptr;           // [2][C] the time embeddings (t, 0), after their SiLU
