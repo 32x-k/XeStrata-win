@@ -44,7 +44,7 @@ intel/llvm（DPC++）を Windows の上で HIP のターゲットだけでビル
 
 ### インストール（Windows、AMD の GPU）
 
-1. [このフォークの Releases](https://github.com/32x-k/XeStrata-win/releases) から `XeStrata-<版>-windows-x64-amd.zip` を取ってきて、浅いフォルダー（`C:\XeStrata` など）に展開します。中のパスが長いので、深いフォルダーでは展開に失敗することがあります。
+1. [このフォークの Releases](https://github.com/32x-k/XeStrata-win/releases) から `XeStrata-<版>-windows-x64-amd.zip` をダウンロードして、浅いフォルダー（`C:\XeStrata` など）に展開します。中のパスが長いので、深いフォルダーでは展開に失敗することがあります。
 1. `xestrata-cli.bat` を実行します（ダブルクリックでも動きます）。GPU とモデルの選択、ダウンロード、モデルの準備を端末で進め、終わると起動します。次からは実行するとすぐ起動します。オプションは Linux の `xestrata` と同じです（`--help`）。
 
 - **要るもの**: AMD の GPU のドライバー（AMD Software。HIP のランタイム `amdhip64_7.dll` が一緒に入ります）と [Visual C++ の再頒布可能パッケージ](https://aka.ms/vs/17/release/vc_redist.x64.exe)。.NET は要りません。
