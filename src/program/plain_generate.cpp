@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -28,13 +29,18 @@
 #include <deque>
 #include <exception>
 #include <fstream>
-#include <iostream>
 #include <iterator>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace strata::program {
 namespace {
@@ -95,23 +101,58 @@ std::vector<int32_t> eos_tokens(const std::string& path) {
 // reads only what follows (a model with a recurrent state only when it extends them all; else it starts over).
 static int plain_serve(strata::core::PlainModel& model, const strata::core::PlainOptions& opt, const std::string& arch,
                        const std::vector<int32_t>& eos, const std::string& profile_save, double save_min) {
-    std::atomic<bool> stop_req{false};
-    std::mutex in_mu;
-    std::condition_variable in_cv;
-    std::deque<std::string> in_lines;
-    bool in_eof = false;
-    std::thread([&] {   // stdin: STOP takes effect mid-request, every other line queues
-        std::string l;
-        while (std::getline(std::cin, l)) {
+    // stdin: STOP takes effect mid-request, every other line queues.  The reader is detached and may sit in read(2)
+    // past QUIT, so what it touches is shared with it, never this function's locals; and it reads the descriptor,
+    // not std::cin, whose lock glibc's exit() waits for (as generate.cpp's --serve)
+    struct StdinShared {
+        std::atomic<bool> stop_req{false};
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<std::string> lines;
+        bool eof = false;
+    };
+    const auto in_shared = std::make_shared<StdinShared>();
+    std::atomic<bool>& stop_req = in_shared->stop_req;
+    std::mutex& in_mu = in_shared->mu;
+    std::condition_variable& in_cv = in_shared->cv;
+    std::deque<std::string>& in_lines = in_shared->lines;
+    bool& in_eof = in_shared->eof;
+    std::thread([st = in_shared] {
+        std::string l, buf;
+        char chunk[4096];
+        auto getline_fd = [&](std::string& out) -> bool {
+            for (;;) {
+                const size_t nlpos = buf.find('\n');
+                if (nlpos != std::string::npos) {
+                    out.assign(buf, 0, nlpos);
+                    buf.erase(0, nlpos + 1);
+                    return true;
+                }
+#if defined(_WIN32)
+                const int n = _read(0, chunk, (unsigned) sizeof chunk);
+#else
+                const ssize_t n = ::read(0, chunk, sizeof chunk);
+#endif
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) {
+                    if (buf.empty()) return false;
+                    out.swap(buf);
+                    buf.clear();
+                    return true;
+                }
+                buf.append(chunk, (size_t) n);
+            }
+        };
+        while (getline_fd(l)) {
             if (!l.empty() && l.back() == '\r') l.pop_back();
-            if (l == "STOP") { stop_req.store(true); continue; }
-            std::lock_guard<std::mutex> lk(in_mu);
-            in_lines.push_back(l);
-            in_cv.notify_one();
+            if (l == "STOP") { st->stop_req.store(true); continue; }
+            std::lock_guard<std::mutex> lk(st->mu);
+            st->lines.push_back(l);
+            st->cv.notify_one();
         }
-        std::lock_guard<std::mutex> lk(in_mu);
-        in_eof = true;
-        in_cv.notify_one();
+        std::lock_guard<std::mutex> lk(st->mu);
+        st->eof = true;
+        st->cv.notify_one();
     }).detach();
     auto next_line = [&](std::string& out) {
         std::unique_lock<std::mutex> lk(in_mu);

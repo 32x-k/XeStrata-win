@@ -143,9 +143,22 @@ def fetch(url: str) -> bytes:
         return r.read()
 
 
+def python_version(python_zip: Path) -> str:
+    """The version in the name of python.org's embeddable zip (python-3.14.8-embed-amd64.zip)."""
+    m = re.search(r"\d+\.\d+(?:\.\d+)?", python_zip.stem)
+    return m.group(0) if m else python_zip.stem
+
+
+def version_key(v: str) -> tuple:
+    """A NuGet version's order: its numbers, then a pre-release (1.0.0-beta1) before the release (1.0.0)."""
+    main, _, pre = v.partition("-")
+    nums = tuple(int(x) if x.isdigit() else 0 for x in main.split("."))
+    return nums, (0, pre) if pre else (1, "")
+
+
 def nuget_version(nuget: Path, package: str) -> str:
     versions = sorted((p.name for p in (nuget / package).iterdir() if p.is_dir()),
-                      key=lambda v: [int(x) if x.isdigit() else x for x in v.replace("-", ".").split(".")])
+                      key=version_key)
     if not versions:
         fail(f"no NuGet package {package} in {nuget}")
     return versions[-1]
@@ -292,7 +305,7 @@ def main() -> None:
     lic.mkdir()
     versions = {"version": a.version, "dotnet": "10", "llama.cpp": "the commit setup.py pins",
                 "outfit": "third_party/main/outfit", "quantscope": "bfdf205",
-                "python": a.python_zip.stem.split("-")[1]}
+                "python": python_version(a.python_zip)}
     sycl_rec = json.loads((a.sycl / "XESTRATA.json").read_text())
     versions["intel-llvm"] = f"{sycl_rec['tag']} ({sycl_rec['commit'][:12]}, with XeStrata's patches)"
     if a.launcher is not None:

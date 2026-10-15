@@ -8727,6 +8727,18 @@ int main(int argc, char** argv) {
                     const int b = gi * GS + t;
                     BSlot& sl = bs[(size_t) b];
                     if (!sl.active) continue;
+                    if (stage_ver(k).nonfinite_in(t)) {   // #879, as the solo path: the slot ends, nothing emitted
+                        std::fprintf(stderr, "strata batch: non-finite logits (#879) in slot %d at position %lld: it "
+                                             "ends (BDONE nonfinite) and the next request reads its prompt from token "
+                                             "0\n", b, (long long) sl.p);
+                        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                        std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
+                        sl.active = false;
+                        sl.cached = false;
+                        sl.checks.clear();
+                        nan_flush = true;
+                        continue;
+                    }
                     const int32_t y = outb[t];
                     sl.ids.push_back(sl.x);    // the window fed it: the slot's session holds it now
                     std::printf("BT %d %d\n", b, (int) y);
@@ -8743,7 +8755,7 @@ int main(int argc, char** argv) {
                         // solo path with its drafts (upstream fc844436, #857): its state is final once its last window
                         // has left the last stage, and a later group window whose pad row writes it clears the flag
                         // where the group starts
-                        sl.cached = o.prompt_cache > 0 && !sl.img;
+                        sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
                     } else {
                         sl.x = y;
                         sl.p += 1;
