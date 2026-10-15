@@ -2684,7 +2684,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts needs --mmap-experts and a static --expert-profile\n");
         return 2;
     }
-    const bool multi_gpu = !split_devs.empty() && !split_same;
+    // a layer split across GPUs; --layer-split auto may give its GPU the helper cache's role instead (below)
+    bool multi_gpu = !split_devs.empty() && !split_same;
     // the helper-GPU expert caches (--expert-cache-remote, upstream's docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order
     int remote_dev[3] = {1, 2, 3};
@@ -3626,6 +3627,66 @@ int main(int argc, char** argv) {
                                      "prediction may not rank them (it prices decode, not the prompt).  To try the "
                                      "other: --layer-split %s\n",
                              as.c_str(), alt_ms, 100.0 * (alt_ms / best_ms - 1.0), ks.c_str(), best_ms, as.c_str());
+            }
+        }
+        // The other role for a second GPU: no stage of the split, but a helper expert cache (RemoteExperts, as
+        // --expert-cache-device1) beside CUDA0 alone.  CUDA0's cache takes the profile's hottest pairs as alone, the
+        // helper the next ones that fit its free memory (less RemoteExperts' 512 MiB and its staging); in a layer the
+        // GPU's, the CPU's and the helper's shares overlap (the largest counts), and the helper's pays a round trip
+        // over its link (the activations there, the rows back).  The faster prediction takes the GPU, said with
+        // both times.  STRATA_SPLIT_ROLE=split / helper: that role whatever the prediction.  Two GPUs only, with the
+        // expert pool (the helper's rows are the pool's) and without --pipeline-windows (a split's own).
+        const char* role_env = std::getenv("STRATA_SPLIT_ROLE");
+        const std::string role = role_env != nullptr ? role_env : "";
+        if (ns == 2 && !o.no_pool && o.pipeline_windows <= 0 && role != "split") {
+            const int h = 1;   // the second GPU's index in the measurements above
+            std::vector<double> held0_l((size_t) L, 0.0), heldh_l((size_t) L, 0.0);
+            const int64_t cap0 = std::max<int64_t>(cap_raw(0, 0, -1, true), 0);
+            const int64_t caph = free0[(size_t) h] - ((int64_t) (512 + 256) << 20);
+            int64_t u0 = 0, uh = 0, nh = 0;
+            bool full0 = false;
+            for (size_t r = 0; r < prof.size(); ++r) {
+                const int64_t l = prof[r].first, c = cost(l);
+                if (!full0) {
+                    if (u0 + c <= cap0) {
+                        u0 += c;
+                        held0_l[(size_t) l] += mass[r];
+                        continue;
+                    }
+                    full0 = true;
+                }
+                if (uh + c > caph) break;
+                uh += c;
+                heldh_l[(size_t) l] += mass[r];
+                ++nh;
+            }
+            const double rt = 2.0 * side_ms(h);
+            double ms = 0, kept = 0, all = 0;
+            for (int64_t l = 0; l < L; ++l) {
+                const double lm = layer_mass[(size_t) l];
+                const double hit0 = lm > 0 ? held0_l[(size_t) l] / lm : 1.0, hith = lm > 0 ? heldh_l[(size_t) l] / lm : 0.0;
+                const double experts = (double) Ka * rows * (double) lay.blob_bytes(l);
+                const double gpu = experts * hit0 / bw[0];
+                const double cpu = experts * std::max(0.0, 1.0 - hit0 - hith) / cpu_bw * link_scale[0];
+                const double help = hith > 0 ? experts * hith / bw[(size_t) h] + rt : 0.0;
+                ms += dense_layer / bw[0] + std::max({gpu, cpu, help});
+                kept += held0_l[(size_t) l] + heldh_l[(size_t) l];
+                all += lm;
+            }
+            ms += ((double) head_bytes + (drafts ? (rows - 1.0) * dense_layer : 0.0)) / bw[0];
+            const bool helper = nh > 0 && (role == "helper" || ms < best_ms);
+            std::fprintf(stderr, "strata generate: layer split auto: CUDA%d as a helper expert cache instead: %.1f ms per "
+                                 "decode window (%lld more experts there, ~%.1f%% of the routed mass on the GPUs) "
+                                 "against %.1f split at K=%s -> %s%s\n",
+                         dev_of_stage(h), ms, (long long) nh, all > 0 ? 100.0 * kept / all : 0.0, best_ms, ks.c_str(),
+                         helper ? "the helper" : "the split", role.empty() ? "" : " (STRATA_SPLIT_ROLE)");
+            if (helper) {
+                o.expert_cache_remote[0] = (int) nh;
+                remote_dev[0] = dev_of_stage(h);
+                split_devs.clear();
+                split_at.clear();
+                o.layer_split.clear();
+                multi_gpu = false;
             }
         }
     }
