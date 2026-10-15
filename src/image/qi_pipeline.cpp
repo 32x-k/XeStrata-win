@@ -343,6 +343,15 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
             vae_room += p.layers;
             p.vae_tiled = vae_->scratch_bytes(h, w) > vae_room;
         }
+        if (vae_->scratch_bytes(h, w) > vae_room && dit_set_ > dit_->block_min()) {
+            // and as many of the DiT's resident blocks as the VAE still lacks: this image's sampling is done with
+            // them, and the next one streams them back in (a budget a little short after a shrink tiled the VAE)
+            const uint64_t give = std::min<uint64_t>(vae_->scratch_bytes(h, w) - vae_room, dit_set_ - dit_->block_min());
+            dit_set_ -= give;
+            dit_->set_block_budget(dit_set_);
+            vae_room += give;
+            p.vae_tiled = vae_->scratch_bytes(h, w) > vae_room;
+        }
         vae_->decode(x, h, w, rgba, vae_room);
         if (p.vae_tiled) vae_->drop_scratch();   // a tile's buffers: not worth keeping beside the layers
         gpu::copy(out.data(), rgba, out.size() * 4);
