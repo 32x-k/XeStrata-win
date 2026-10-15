@@ -7,8 +7,9 @@ POST /v1/images/generations takes OpenAI's request shape (prompt, size, n, respo
 own field seed; POST /v1/images/edits the same with reference images (OpenAI's multipart form, image or image[]; or JSON
 with images: [{"image_url": ...}]), which the image model edits or takes as its subject (Qwen-Image-2.1's edits: the
 vision encoder reads them into the prompt, the VAE's encoder into the DiT's).  The engine (src/image/strata_image.cpp,
-`strata-image --serve`) starts with the first image and stays: its kernels built once, the prompt's text states and
-the layers that fit in VRAM kept between images, and it takes one image a line on its standard input.  It runs Turbo's
+`strata-image --serve`) starts with the first image and stays, outside the server (serve/image_daemon.py, the next
+server of the same image model and GPU finds it: a model switch does not lose it): its kernels built once, the
+prompt's text states and the layers that fit in VRAM kept between images, one image a request.  It runs Turbo's
 8 steps (CFG 1, the Euler flow sampler, the model's own sigmas), the image the one stable-diffusion.cpp makes with the
 model card's command for the same seed (within LPIPS 0.03).  A size whose sides are not multiples of 16 (1920x1080)
 is made at the sides rounded up (1920x1088) and its middle cut out.
@@ -25,7 +26,8 @@ and the config's "gpu_policy" says what happens to the text engine during the jo
   auto    - (default) keep when the image fits beside it at full speed, else shrink when the engine can, else keep
             when the image fits at all (its layers streamed), else unload
 After a job the image engine keeps what it holds (the next image starts warm) only under keep with VRAM to spare;
-otherwise it lets go of everything but its process (about 200 MiB).
+otherwise it lets go of everything but its process (about 200 MiB).  The daemon ends after daemon_idle_s (default
+1800) without a server.
 
 The config's "images" section (written by setup --images, tools/image/qimage.py):
   {"exe": "engine/strata-image", "diffusion_model": "...Q8_0.gguf", "vae": "...",
@@ -56,6 +58,7 @@ import threading
 import time
 import zlib
 from pathlib import Path
+from typing import Any
 
 TURBO_STEPS = 8
 MODEL_NAME = "qwen-image-2.1-turbo"
@@ -243,84 +246,156 @@ def _kv(line: str) -> dict:
     return out
 
 
+# the environment that makes one image engine another: the GPU it takes and the libraries it loads
+ENGINE_ENV = ("STRATA_GPU_PCI", "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "ONEAPI_DEVICE_SELECTOR",
+              "HIP_VISIBLE_DEVICES", "ZE_AFFINITY_MASK", "STRATA_VRAM_LIMIT_MIB", "STRATA_MAX_ALLOC_MIB",
+              "STRATA_NO_XMX", "LD_LIBRARY_PATH")
+
+
+def daemon_address(cmd: list[str], env: dict) -> str:
+    """Where the image daemon (serve/image_daemon.py) of this engine command and GPU listens: a Unix socket's path, on
+    Windows the file with its loopback port and token; one per user."""
+    import hashlib
+    import json
+    key = hashlib.sha256(json.dumps([cmd, [env.get(k) for k in ENGINE_ENV]]).encode()).hexdigest()[:16]
+    user = str(os.getuid()) if hasattr(os, "getuid") else re.sub(r"\W", "", os.environ.get("USERNAME", "user"))
+    return str(Path(tempfile.gettempdir()) / f"xestrata-image-{user}-{key}.{'port' if os.name == 'nt' else 'sock'}")
+
+
 class ImageEngine:
-    """The resident `strata-image --serve`: one process, one request line at a time (the caller serializes)."""
+    """The image engine, `strata-image --serve`, through the image daemon (serve/image_daemon.py): started outside the
+    server the first time and found again by the next server of the same image model and GPU, so a model switch does
+    not lose it; one request line at a time (the caller serializes, the daemon between servers)."""
 
     def __init__(self, cfg: dict, env: dict, log_path: Path, say):
         self.cfg, self.env, self.log_path, self.say = cfg, env, log_path, say
-        self.proc: subprocess.Popen | None = None
+        self.sock: Any = None
+        self.f: Any = None
         self.lines: queue.Queue = queue.Queue()
 
-    def alive(self) -> bool:
-        return self.proc is not None and self.proc.poll() is None
+    def command(self) -> list[str]:
+        cmd = [str(self.cfg["exe"]), "--dit", str(self.cfg["diffusion_model"]), "--vae", str(self.cfg["vae"]),
+               "--text", str(self.cfg["llm"])]
+        if self.cfg.get("vision"):
+            cmd += ["--vision", str(self.cfg["vision"])]
+        return cmd + ["--serve"]
 
-    def _pump(self, proc, logf) -> None:
-        for line in proc.stdout:
-            self.lines.put(line.rstrip("\r\n"))
-        self.lines.put(None)                          # the process ended
-        with contextlib.suppress(OSError, ValueError):
-            logf.close()
+    def alive(self) -> bool:
+        return self.f is not None
+
+    def _connect(self, addr: str) -> bool:
+        import socket
+        try:
+            if os.name != "nt":
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.connect(addr)
+                token = None
+            else:
+                port, token = Path(addr).read_text(encoding="utf-8").split()
+                s = socket.create_connection(("127.0.0.1", int(port)), timeout=10)
+                s.settimeout(None)
+        except (OSError, ValueError):
+            return False
+        self.sock = s
+        self.f = s.makefile("rw", encoding="utf-8", errors="replace", newline="\n")
+        if token is not None:
+            self.f.write(token + "\n")
+            self.f.flush()
+        self.lines = queue.Queue()
+
+        def pump(f, q):
+            try:
+                for line in f:
+                    q.put(line.rstrip("\r\n"))
+            except (OSError, ValueError):
+                pass
+            q.put(None)                               # the daemon closed the connection
+        threading.Thread(target=pump, args=(self.f, self.lines), daemon=True).start()
+        return True
+
+    def _spawn(self, addr: str):
+        """Start the daemon (its environment the server's engine's), detached from this server."""
+        cmd = [sys.executable, str(Path(__file__).resolve().parent / "image_daemon.py"), "--socket", addr,
+               "--idle", str(float(self.cfg.get("daemon_idle_s") or 1800)), "--log", str(self.log_path), "--",
+               *self.command()]
+        kw: dict = {"start_new_session": True} if os.name != "nt" else \
+            {"creationflags": 0x00000200 | 0x00000008 | 0x01000000}   # its own group, no console, out of the job
+        try:
+            return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, env=self.env, **kw)
+        except OSError:
+            if os.name != "nt":
+                raise
+            kw["creationflags"] = 0x00000200 | 0x00000008                # a job that allows no breakaway
+            return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, env=self.env, **kw)
 
     def start(self) -> dict:
-        """Start the engine and wait for READY -> its fields.  ImageJobFailed when it does not start."""
-        cmd = [str(self.cfg["exe"]), "--dit", str(self.cfg["diffusion_model"]), "--vae", str(self.cfg["vae"]),
-               "--text", str(self.cfg["llm"]), "--serve"]
-        if self.cfg.get("vision"):
-            cmd[-1:-1] = ["--vision", str(self.cfg["vision"])]
-        self.lines = queue.Queue()
-        logf = open(self.log_path, "a", encoding="utf-8", errors="replace")
-        try:
-            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=logf,
-                                         env=self.env, text=True, errors="replace", bufsize=1)
-        except OSError as e:
-            logf.close()
-            raise ImageJobFailed(f"the image engine did not start ({cmd[0]}): {e}") from e
-        try:
-            from serve.winjob import contain
-            contain(self.proc)                        # ends with the server (Windows)
-        except Exception:
-            pass
-        threading.Thread(target=self._pump, args=(self.proc, logf), daemon=True).start()
+        """Connect to the image daemon, starting it when there is none, and wait for READY -> its fields.
+        ImageJobFailed when it does not start."""
+        addr = daemon_address(self.command(), self.env)
         t0 = time.monotonic()
-        while True:
-            line = self._next(time.monotonic() - t0, START_TIMEOUT_S)
-            if line.startswith("READY"):
-                self.say(f"image engine ready in {time.monotonic() - t0:.1f} s")
-                return _kv(line)
+        proc = None
+        lock = addr + ".lock"
+        while not self._connect(addr):
+            if proc is None:
+                try:   # one server starts it; another waits for its socket
+                    fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    os.close(fd)
+                    proc = self._spawn(addr)
+                except FileExistsError:
+                    with contextlib.suppress(OSError):
+                        if time.time() - os.path.getmtime(lock) > START_TIMEOUT_S:
+                            os.unlink(lock)               # a start that never finished
+                except OSError as e:
+                    raise ImageJobFailed(f"the image engine did not start: {e}") from e
+            elif proc.poll() is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(lock)
+                raise ImageJobFailed(f"the image engine did not start; its log: {self.log_path}")
+            if time.monotonic() - t0 > START_TIMEOUT_S:
+                raise ImageJobFailed(f"the image engine did not start in {START_TIMEOUT_S} s; its log: {self.log_path}")
+            time.sleep(0.25)
+        if proc is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(lock)
+        line = self._next(0, START_TIMEOUT_S)
+        if not line.startswith("READY"):
+            self.close()
+            raise ImageJobFailed(line[6:] if line.startswith("ERROR") else f"the image engine said: {line}")
+        self.say(f"image engine {'started' if proc else 'found'} in {time.monotonic() - t0:.1f} s ({addr})")
+        return _kv(line)
 
     def _next(self, waited: float, limit: float, cancel: threading.Event | None = None) -> str:
-        """The engine's next line; ImageJobFailed when it ended or `limit` passed."""
+        """The engine's next line; ImageJobFailed when the connection ended or `limit` passed."""
         while True:
             try:
                 line = self.lines.get(timeout=0.25)
             except queue.Empty:
-                if self.proc is not None and self.proc.poll() is not None and self.lines.empty():
-                    line = None
-                elif cancel is not None and cancel.is_set():
+                if cancel is not None and cancel.is_set():
                     self.send("STOP")
                     cancel = None                     # the engine answers ERROR stopped after its step
                     continue
-                elif waited > limit:
+                if waited > limit:
                     self.close()
-                    raise ImageJobFailed(f"the image engine did not answer in {limit:g} s (it was stopped); "
-                                         f"its log: {self.log_path}")
-                else:
-                    waited += 0.25
-                    continue
+                    raise ImageJobFailed(f"the image engine did not answer in {limit:g} s; its log: "
+                                         f"{self.log_path}")
+                waited += 0.25
+                continue
             if line is None:
-                code = self.proc.poll() if self.proc is not None else None
-                self.proc = None
-                raise ImageJobFailed(f"the image engine ended (exit code {code}); its log: {self.log_path}")
+                self.close()
+                raise ImageJobFailed(f"the image engine ended; its log: {self.log_path}")
             return line
 
     def send(self, line: str) -> None:
-        proc = self.proc
+        f = self.f
         try:
-            if proc is None or proc.stdin is None:
-                raise OSError("not running")
-            proc.stdin.write(line + "\n")
-            proc.stdin.flush()
+            if f is None:
+                raise OSError("not connected")
+            f.write(line + "\n")
+            f.flush()
         except (OSError, ValueError) as e:
+            self.close()
             raise ImageJobFailed(f"the image engine is gone ({e}); its log: {self.log_path}") from e
 
     def ask(self, line: str, want: str, timeout: float, cancel: threading.Event | None = None, step=None) -> dict:
@@ -339,20 +414,18 @@ class ImageEngine:
             elif got.startswith("ERROR"):
                 raise ImageJobFailed(got[6:] or "the image engine failed")
 
-    def close(self) -> None:
-        proc, self.proc = self.proc, None
-        if proc is None:
-            return
-        with contextlib.suppress(OSError, ValueError):
-            if proc.stdin is not None:
-                proc.stdin.write("QUIT\n")
-                proc.stdin.flush()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=10)
+    def close(self, shutdown: bool = False) -> None:
+        """Leave the daemon (it stays for the next server); `shutdown`: end it and its engine."""
+        f, sock, self.f, self.sock = self.f, self.sock, None, None
+        if f is not None:
+            with contextlib.suppress(OSError, ValueError):
+                f.write(("SHUTDOWN" if shutdown else "QUIT") + "\n")
+                f.flush()
+            with contextlib.suppress(OSError, ValueError):
+                f.close()
+        if sock is not None:
+            with contextlib.suppress(OSError):
+                sock.close()
 
 
 class ImageGen:
@@ -494,9 +567,10 @@ class ImageGen:
                 except ImageJobFailed as e:
                     self._say(f"image engine: release failed ({e})")
 
-    def close(self) -> None:
+    def close(self, shutdown: bool = False) -> None:
+        """Leave the image daemon (it stays, warm, for the next server: a model switch); `shutdown`: end it."""
         with self.lock:
-            self.engine.close()
+            self.engine.close(shutdown)
 
     def run(self, job: dict, cancel: threading.Event | None = None) -> tuple[list[bytes], dict]:
         """Make `job`'s images (parse_request's dict) -> (the PNG files' bytes in order, figures).  The caller holds
