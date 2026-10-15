@@ -24,22 +24,34 @@ intel/llvm（DPC++）を Windows の上で HIP のターゲットだけでビル
 
 ### 対応している GPU
 
-- Windows で動くのは AMD の GPU だけです（HIP）。確かめたのは Radeon AI PRO R9700（gfx1201、32 GB）だけです。
+- Windows で動くのは AMD の GPU だけです（HIP）。配布用の zip には RDNA2 以降（gfx1030〜gfx1036、gfx1100〜gfx1103、gfx1150、gfx1151、gfx1200、gfx1201）のコードが入っています。確かめたのは Radeon AI PRO R9700（gfx1201、32 GB）だけです。
 - Windows では、Intel Arc と NVIDIA の GPU 向けにはビルドしていません。
 - Linux では本家の XeStrata と同じです（Intel Arc、AMD、NVIDIA）。
 
 ### Windows で使える機能
 
+- 導入と起動（配布用の zip の `xestrata-cli.bat`。GPU とモデルの選択、モデルの準備、設定）
 - `strata.exe` によるテキストの生成（`--tokens-file`）
 - `--serve` と `serve/server.py` による OpenAI 互換の API
 - ネイティブパック（`tools/iq_pack.py`）、MTP による推測デコード、`--resident-experts`、rocBLAS による prefill
 
 本家と違うところは次の 4 つです。
 
-- インストーラー（`xestrata --setup`）と deb・rpm のパッケージは Linux 用です。Windows では下のとおり手でビルドします。
+- Windows の配布は 7z ではなく zip で、本家の `xestrata.exe`（.NET の画面）の代わりに `xestrata-cli.bat` で、端末で導入と起動をします。deb と rpm のパッケージは Linux 用です。
 - Windows では、RAM 側のエキスパートのコピーを、HIP から見える GPU が 1 台のときだけ既定でページロックします（RAM に余裕があるとき）。HIP から 2 台以上（内蔵 GPU を含む）見えていると、大きくページロックした後の確保で GPU が落ちることがあるためです。`ONEAPI_DEVICE_SELECTOR=hip:N` で GPU を選ぶと、XeStrata は `HIP_VISIBLE_DEVICES` も同じ GPU に絞ります。
 - 適応キャッシュはエキスパートの入れ替えが遅く、`--adapt-every 0` のほうが速く動きます。
 - `--gpu-stages` はネイティブパックでは動きません。
+
+### インストール（Windows、AMD の GPU）
+
+1. [このフォークの Releases](https://github.com/32x-k/XeStrata-win/releases) から `XeStrata-<版>-windows-x64-amd.zip` を取ってきて、浅いフォルダー（`C:\XeStrata` など）に展開します。中のパスが長いので、深いフォルダーでは展開に失敗することがあります。
+1. `xestrata-cli.bat` を実行します（ダブルクリックでも動きます）。GPU とモデルの選択、ダウンロード、モデルの準備を端末で進め、終わると起動します。次からは実行するとすぐ起動します。オプションは Linux の `xestrata` と同じです（`--help`）。
+
+- **要るもの**: AMD の GPU のドライバー（AMD Software。HIP のランタイム `amdhip64_7.dll` が一緒に入ります）と [Visual C++ の再頒布可能パッケージ](https://aka.ms/vs/17/release/vc_redist.x64.exe)。.NET は要りません。
+  Visual C++ の再頒布可能パッケージがなければ、`xestrata-cli.bat` が知らせて止まります。rocBLAS と hipBLASLt は zip に入っています。
+- **GPU が 2 台以上のとき**（内蔵 GPU を含む）: setup は選んだ GPU を設定の `ONEAPI_DEVICE_SELECTOR=hip:N` に書き、エンジンが HIP に見せる GPU をそれだけに絞ります。
+- **置き場所**: zip のフォルダーには書き込みません。設定は `%APPDATA%\xestrata`、ログなどは `%LOCALAPPDATA%\xestrata`、モデルはデータのフォルダー（既定は `%LOCALAPPDATA%\xestrata\data`）に置きます。
+- **更新**: 新しい zip を別のフォルダーに展開して、そちらの `xestrata-cli.bat` を実行します。設定とモデルはそのまま使います。
 
 ### ビルド
 

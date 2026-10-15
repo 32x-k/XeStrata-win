@@ -24,22 +24,34 @@ It keeps taking in upstream's releases; it now includes upstream XeStrata's main
 
 ### Supported GPUs
 
-- On Windows, only AMD GPUs run (HIP). Only the Radeon AI PRO R9700 (gfx1201, 32 GB) has been tried.
+- On Windows, only AMD GPUs run (HIP). The zip carries code for RDNA2 and later (gfx1030-gfx1036, gfx1100-gfx1103, gfx1150, gfx1151, gfx1200 and gfx1201). Only the Radeon AI PRO R9700 (gfx1201, 32 GB) has been tried.
 - On Windows, it is not built for Intel Arc or NVIDIA GPUs.
 - On Linux, it is the same as upstream XeStrata (Intel Arc, AMD and NVIDIA).
 
 ### What works on Windows
 
+- Installing and starting (the zip's `xestrata-cli.bat`: choosing the GPU and the model, preparing the model, the settings)
 - Text generation with `strata.exe` (`--tokens-file`)
 - The OpenAI-compatible API with `--serve` and `serve/server.py`
 - The native pack (`tools/iq_pack.py`), speculative decoding with MTP, `--resident-experts`, and prefill on rocBLAS
 
 These four things differ from upstream.
 
-- The installer (`xestrata --setup`) and the deb and rpm packages are for Linux. On Windows, build by hand as below.
+- On Windows it comes as a zip, not a 7z, and `xestrata-cli.bat` installs and starts it on the console in place of upstream's `xestrata.exe` (the .NET window). The deb and rpm packages are for Linux.
 - On Windows, the RAM copy of the experts is page-locked by default only when HIP sees one GPU (and the RAM has room for it). With two or more GPUs seen by HIP (the processor's graphics included), the GPU can fail at an allocation after a large page-locked one. Choosing the GPU with `ONEAPI_DEVICE_SELECTOR=hip:N` makes XeStrata narrow `HIP_VISIBLE_DEVICES` to the same GPU.
 - The adaptive cache is slow to swap experts, and `--adapt-every 0` runs faster.
 - `--gpu-stages` does not work with the native pack.
+
+### Installing (Windows, AMD GPUs)
+
+1. Download `XeStrata-<version>-windows-x64-amd.zip` from [this fork's Releases](https://github.com/32x-k/XeStrata-win/releases) and unpack it into a short folder (`C:\XeStrata`, for example). Its paths are long, and unpacking into a deep folder can fail.
+1. Run `xestrata-cli.bat` (a double-click works too). It goes through choosing the GPU and the model, the download and preparing the model on the console, then starts it. Later runs start it right away. Its options are those of `xestrata` on Linux (`--help`).
+
+- **You need**: the AMD GPU driver (AMD Software, which installs the HIP runtime `amdhip64_7.dll`) and the [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe). .NET is not needed.
+  Without the Visual C++ Redistributable, `xestrata-cli.bat` says so and stops. rocBLAS and hipBLASLt come in the zip.
+- **With two or more GPUs** (the processor's graphics included): setup writes the chosen GPU into the config as `ONEAPI_DEVICE_SELECTOR=hip:N`, and the engine narrows the GPUs HIP sees to it.
+- **Where things go**: nothing is written into the zip's folder. The settings go into `%APPDATA%\xestrata`, the logs and the like into `%LOCALAPPDATA%\xestrata`, and the models into the data folder (by default `%LOCALAPPDATA%\xestrata\data`).
+- **Updating**: unpack the new zip into another folder and run its `xestrata-cli.bat`. The settings and the models are kept.
 
 ### Building
 
