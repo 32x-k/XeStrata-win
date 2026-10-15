@@ -6111,14 +6111,29 @@ def make_handler(svc: Service):
             def check(text, finish):
                 return validated_json(text, validator, finish)
 
+            image_tools = self.image_tools
+
+            def image_b64(url: str) -> str | None:
+                f = svc.images.file(url.rsplit("/", 1)[-1]) if svc.images is not None else None
+                return base64.b64encode(f.read_bytes()).decode("ascii") if f is not None else None
+
             def events():
                 yield from asm.start()
                 done = None
-                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+                if image_tools is not None:   # the image tools run here, each an image_generation_call item
+                    messages, kw = self.prepared
+                    source = run_with_mcp(svc, image_tools, messages, tools, kw, ids, thinking, max_new,
+                                          int(req.get("max_output_tokens") or 0), req, cancel,
+                                          set(image_tools.routes()))
+                else:
+                    source = svc.run(ids, thinking, tools, max_new, req, cancel)
+                for kind, x in source:
                     if kind == "ping":
                         yield None
                     elif kind == "event":
                         yield from asm.feed(x)
+                    elif kind == "mcp":
+                        yield from asm.image_call(cast(dict, x), image_b64)
                     elif kind == "done":
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
@@ -6183,6 +6198,12 @@ def make_handler(svc: Service):
             responses_api.check_request(req)
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
+            # OpenAI's hosted image_generation tool: this server's image tools, run here (serve/images.py)
+            self.image_tools = None
+            if "image_generation" in skipped and svc.images is not None and req.get("tool_choice") != "none":
+                self.image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load, Vision.normalize)
+                tools = (tools or []) + self.image_tools.template_tools(exclude={t["name"] for t in tools or []})
+                skipped = [k for k in skipped if k != "image_generation"]
             kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
             try:
                 self._no_local_images(messages)              # as on the chat route: no file read for a foreign page
@@ -6236,6 +6257,7 @@ def make_handler(svc: Service):
             include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
+            self.prepared = (messages, kw)
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
             return ids, thinking, tools, max_new, asm, validator, req
 

@@ -653,6 +653,33 @@ class Assembler:
             item["namespace"] = namespace
         return item
 
+    def image_call(self, x: dict, image_b64) -> list[dict]:
+        """An image tool's activity (run_with_mcp's "mcp" events: call, result) as an image_generation_call item, as
+        OpenAI's hosted image_generation tool shows one: its result the PNG in base64 (`image_b64(url)`)."""
+        out: list[dict] = []
+        if x.get("event") == "call":
+            out += self.close()
+            raw = x.get("arguments")
+            args: dict = raw if isinstance(raw, dict) else {}
+            item = {"id": new_id("ig"), "type": "image_generation_call", "status": "in_progress", "result": None,
+                    "revised_prompt": args.get("prompt")}
+            out += self._open(item)
+            out.append(self.event("response.image_generation_call.in_progress", item_id=item["id"],
+                                  output_index=self.index))
+            out.append(self.event("response.image_generation_call.generating", item_id=item["id"],
+                                  output_index=self.index))
+        elif x.get("event") == "result" and self.item is not None and self.item["type"] == "image_generation_call":
+            urls = x.get("images") or []
+            self.item["result"] = image_b64(urls[0]) if urls else None
+            if x.get("ok") and self.item["result"]:
+                out.append(self.event("response.image_generation_call.completed", item_id=self.item["id"],
+                                      output_index=self.index))
+                out += self.close("completed")
+            else:
+                self.item["error"] = x.get("text")
+                out += self.close("failed")
+        return out
+
     def finish(self, done: dict, validate=None) -> list[dict]:
         """The end: close what is open, then response.completed (or .incomplete when max_output_tokens ran out).
         `validate(text, finish)` checks a structured answer and returns its text (or raises)."""
