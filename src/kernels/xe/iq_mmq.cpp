@@ -636,7 +636,13 @@ struct Kernel {
                 if constexpr (MIN) xul[v] = row < rows && (!last || k0 / 32 + b < kb) ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
             }
             for (int v = lid; v < WN * NB; v += lanes) {
-                const int nn = v % WN, b = v / WN;   // neighbouring work-items: neighbouring outputs of a VNNI row
+                // neighbouring work-items: neighbouring outputs of a VNNI row (their stores in local memory side by
+                // side), or, where a work-item decodes four blocks or more a step (the 16-row tile), neighbouring
+                // blocks of one output (their reads of the weights side by side) on Xe2's 16-lane tiles: B70, 16 rows
+                // an expert, Ornith Q4_K_M 228 -> 190 us; the 64-row tile was 3% slower that way, and the A380's
+                // 8-lane 16-row tile 6-23% slower
+                constexpr bool by_block = IS == 1 && WN * NB >= 4 * lanes;
+                const int nn = by_block ? v / NB : v % WN, b = by_block ? v % NB : v / WN;
                 const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes)
                                                 : Sub{{}, 0.0f, 0.0f, 0.0f};   // past K: zeros
                 for (int j = 0; j < 8; ++j) bw[(b * 8 + j) * WN + nn] = d.v[j];
@@ -657,8 +663,10 @@ struct Kernel {
                         mx::joint_matrix_mad(sg, ci, a, bm, ci);
                         const float* xr = xsl + static_cast<ptrdiff_t>(b * WM + rs + t * IM);
                         int i = 0;
+                        // the int32 sum converted by one instruction (exact_float's two are for NVIDIA's slow
+                        // conversion) and added in one fma: B70, Ornith Q4_K_M at 256 rows an expert 988 -> 898 us
                         mx::joint_matrix_apply(sg, ci, [&](int32_t& c) {
-                            acc[t][i] += ws * xr[i] * exact_float(c);
+                            acc[t][i] = sycl::fma(ws * xr[i], static_cast<float>(c), acc[t][i]);
                             ++i;
                         });
                     }
@@ -1045,6 +1053,25 @@ int intel_shape_of(sycl::queue& q) {
     });
 }
 
+// Whether the GPU runs kernel KT with its full work-group (NSG sub-groups of SG work-items) and its local memory,
+// asked once a GPU.  The A380's 64 KiB of local memory did not hold the 128-row tile of a type with a scale per 16
+// (two copies of the activations), and the launch lost the device instead of failing.
+template<class KT>
+bool takes_work_group(sycl::queue& q) {
+    static core::PerDevice<bool> per_device;
+    return per_device.get(q.get_device(), [&q] {
+        if ((uint64_t) KT::LOCAL > q.get_device().get_info<sycl::info::device::local_mem_size>()) return false;
+        try {
+            const sycl::kernel_id id = sycl::get_kernel_id<KT>();
+            const auto kb = sycl::get_kernel_bundle<sycl::bundle_state::executable>(q.get_context(), {q.get_device()}, {id});
+            const size_t most = kb.get_kernel(id).template get_info<sycl::info::kernel_device_specific::work_group_size>(q.get_device());
+            return most >= (size_t) KT::NSG * SG;
+        } catch (const std::exception&) {
+            return false;
+        }
+    });
+}
+
 template<int TY>
 sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                     int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
@@ -1070,10 +1097,18 @@ sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, s
         STRATA_MMQ_ROWS(true, false, 0);
     }
     // Intel's XMX: the 32-row tile's work-group (128 lanes) decodes the step's weights at half the 64-row one's rate,
-    // and took longer for 32 rows than the 64-row tile for 64 on the B70; so 16 rows, else 64
+    // and took longer for 32 rows than the 64-row tile for 64 on the B70; so 16 rows, else 64.  Where the experts
+    // average more than 64 rows, a 128-row tile on a work-group of twice the sub-groups (each with the 64-row tile's
+    // share, so nothing more in its registers: more rows a sub-group spilled them, 3x slower) decodes the weights
+    // once for 128 rows: B70, Ornith Q4_K_M at 128 and 256 rows an expert 613 -> 495 and 1209 -> 988 us.  It needs
+    // the kernel to take 512 work-items (the large register file halves the work-group's limit), asked of the GPU,
+    // and 16-lane tiles (Xe2): on Xe-HPG's 8-lane ones its work-group is 64 sub-groups, and the A380 lost the device
+    // on it, with the kernel's limits and local memory reported as enough.
 #define STRATA_MMQ_ROWS_INTEL(TAIL, IS)                                                     \
     do {                                                                                    \
         if (max_rows <= 16) return STRATA_MMQ_LAUNCH(1, 1, false, TAIL, IS);                \
+        if ((IS) == 1 && mean_rows > 64 && takes_work_group<Kernel<TY, 2, 4, false, (TAIL), (IS)>>(q)) \
+            return STRATA_MMQ_LAUNCH(2, 4, false, TAIL, IS);                                \
         return STRATA_MMQ_LAUNCH(2, 2, false, TAIL, IS);                                    \
     } while (0)
     if (const int is = intel_shape_of(q); is == 1) {
