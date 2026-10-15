@@ -35,8 +35,10 @@ windows/launcher/*/obj/
 
 # setup.py outputs (engine, downloads)
 /engine/
+# the earlier image generator (sd-cli) and its source: setup removes them (remove_old_image_engine)
 /engine-image/
 /third_party/stable-diffusion.cpp/
+/build-image-*/
 *.done
 /third_party/main/*.zip
 /third_party/main/_unpack/

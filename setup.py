@@ -2271,6 +2271,7 @@ def update_installed_engine() -> None:
     run here.  A package's engine is updated by apt or dnf."""
     if PACKAGED:
         return
+    remove_old_image_engine()
     eng = ROOT / "engine"
     info = eng / "BUILD.json"
     if not info.exists() or not (eng / EXE).exists():
@@ -2293,6 +2294,21 @@ def update_installed_engine() -> None:
 
 # ---- image generation: Qwen-Image-2.1-Turbo on XeStrata's own image engine (strata-image, built with the text
 # engine; serve/images.py).  upstream 0.1.44 (a5b3b6c2) runs stable-diffusion.cpp's sd-cli instead.
+# what XeStrata's earlier image generator (stable-diffusion.cpp's sd-cli, before strata-image) left in the install
+OLD_IMAGE_ENGINE = ("engine-image", "build-image-vulkan", "build-image-cpu", "third_party/stable-diffusion.cpp")
+
+
+def remove_old_image_engine() -> None:
+    """The earlier sd-cli build, its build folders and its source, which nothing uses now: removed (a few GB)."""
+    if PACKAGED:
+        return
+    for rel in OLD_IMAGE_ENGINE:
+        p = ROOT / rel
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+            ok(f"removed {rel}/: the earlier image generator (sd-cli), which XeStrata's own image engine replaced")
+
+
 def _qimage():
     if str(ROOT / "tools" / "image") not in sys.path:
         sys.path.insert(0, str(ROOT / "tools" / "image"))
@@ -2323,6 +2339,7 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
     of 2026-10-15), or the one asked for with --image-ssd-offload on (what does not fit read from the SSD)."""
     if not a.images or a.images == "no":
         return None
+    remove_old_image_engine()
     QI = _qimage()
     exe = eng / IMAGE_EXE
     if not exe.exists():
