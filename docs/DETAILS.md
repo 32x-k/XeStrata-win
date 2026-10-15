@@ -1263,7 +1263,7 @@ the model uses interleaved M-RoPE.
 
 `./setup.sh --images qwen-image` sets up image generation with Qwen-Image-2.1-Turbo beside the text model (upstream 0.1.44).
 Images are made by XeStrata's own image engine, `strata-image`, which setup builds with the text engine: the same SYCL kernels, on every maker's GPU.
-Setup downloads the image model, its VAE and its text encoder (Qwen3-VL-8B), and adds an `"images"` section to the config.
+Setup downloads the image model, its VAE, its text encoder (Qwen3-VL-8B) and, for the edits, its vision encoder (Qwen3-VL's mmproj), and adds an `"images"` section to the config.
 The image model is Q8_0 by default. The engine streams from RAM the layers that do not fit in VRAM, so the GPU's memory does not decide the size.
 The RAM does: when the four files (the vision encoder for the edits among them) and the engine's own (about 16.6 GB with Q8_0, 15.3 GB with Q6_K, 13.2 GB with Q4_K_M) do not fit the RAM the text model leaves, setup takes the largest that fits (Q6_K, Q4_K_M).
 With `--image-ssd-offload on` it keeps the size chosen and reads what does not fit from the SSD (slower).
@@ -1272,6 +1272,7 @@ With the same seed it makes the image stable-diffusion.cpp makes with the model 
 Qwen-Image-2.1-Turbo's weights are under the Qwen Research License, not a free software license: read it before any commercial use.
 
 The server makes images on `POST /v1/images/generations` (OpenAI's images API, plus `seed`), and the web page gets an Images tab.
+`POST /v1/images/edits` (OpenAI's multipart form with `image` or `image[]`, or JSON with `images: [{"image_url": ...}]`) makes an image from reference images (up to 3; PNG, JPEG, GIF, BMP): it can change them, or take the people and things in them as its subject. `size` `auto` takes the first reference's shape at about 1024x1024 pixels. On the web page, an image attached in the Images tab makes an edit.
 Each side is 256 to 2048 pixels. A size whose sides are not multiples of 16 (1920x1080) is made at the sides rounded up (1920x1088) and its middle cut out; the web page says so.
 The image engine starts with the first image and stays: its kernels are prepared once, and the same prompt's text states and the layers it holds in VRAM are kept for the next image.
 Image jobs run one at a time on the GPU. Before a job the engine says what the image needs in VRAM (the least, and the DiT whole with the VAE in one piece), and what the text model does meanwhile is `--image-gpu-policy`: `keep` (stays as it is), `shrink` (gives VRAM back through `--vram-elastic`), `unload` (its conversation saved, unloaded, restored at the next start), or `auto` (the default: `keep` when everything fits, else `shrink` when the engine can, else `keep` with the layers streamed when the least fits, else `unload`).
