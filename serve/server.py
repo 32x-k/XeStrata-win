@@ -5417,6 +5417,7 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
+                                 "image_note": svc.images.note() if svc.images is not None else None,
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path == "/update":                         # whether a newer release is out (About > Updates)
                 if not self._authorized():
@@ -6919,6 +6920,8 @@ def main() -> int:
                   "again", flush=True)
         print(f"[strata] image generation: {svc.images.model} {icfg.get('quant') or ''} on strata-image "
               f"(POST /v1/images/generations; GPU policy {svc.images.policy})", flush=True)
+        if svc.images.note():
+            print(f"[strata] image generation: {svc.images.note()}", flush=True)
         import atexit
         atexit.register(svc.images.close)               # the image engine ends with the server
     if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none

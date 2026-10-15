@@ -75,11 +75,18 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 });
 
 let tab = "chat";
+let noteShown = false;
 function showTab(name) {
   tab = ["chat", "images", "monitor", "about"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
   for (const v of ["chat", "images", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
-  if (tab === "images") $("img-prompt").focus();
+  if (tab === "images") {
+    $("img-prompt").focus();
+    if (health.image_note && !noteShown) {   // once a page load: setup lowered the image model's size for the RAM
+      noteShown = true;
+      toast("info", "Image model size lowered", health.image_note, 12000);
+    }
+  }
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
@@ -108,6 +115,8 @@ async function loadHealth() {
                                           : "Attach a text file (or drop it here)";
     $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
     $("tab-btn-images").hidden = !health.image_generation;
+    $("img-note").hidden = !health.image_note;
+    $("img-note").textContent = health.image_note || "";
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
     setTimeout(loadHealth, 2000);

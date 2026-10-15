@@ -2330,14 +2330,18 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
     asked = a.image_quant or QI.DEFAULT_QUANT
     ssd = getattr(a, "image_ssd_offload", None) == "on"
     quant = asked
+    lowered = None
     if not ssd and text_gb is not None:
         left = ram_gb() - text_gb
         fit, fits = QI.quant_for_ram(left)
         if QI.QUANTS.index(fit) < QI.QUANTS.index(asked):
             quant = fit
-            warn(f"image model {asked} needs ~{QI.ram_need_gb(asked):.0f} GB of RAM beside the text model "
-                 f"(~{left:.0f} GB left): {quant} instead. --image-ssd-offload on keeps {asked} and reads what does "
-                 "not fit from the SSD (slower)")
+            # kept in the config: the server says it at start and on the web page (the user's decision, 2026-10-15)
+            lowered = {"from": asked, "to": quant, "need_gb": round(QI.ram_need_gb(asked), 1),
+                       "ram_left_gb": round(max(left, 0.0), 1)}
+            warn(f"image model lowered from {asked} to {quant}: {asked} needs ~{QI.ram_need_gb(asked):.0f} GB of "
+                 f"RAM beside the text model, which leaves ~{max(left, 0):.0f} GB. --image-ssd-offload on keeps "
+                 f"{asked} and reads what does not fit from the SSD (slower)")
         if not fits:
             warn(f"even {quant} (~{QI.ram_need_gb(quant):.0f} GB) does not fit the ~{max(left, 0):.0f} GB of RAM "
                  "the text model leaves: images read part of the model from the SSD (slower), and the PC may run "
@@ -2360,6 +2364,8 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
         verify_sha256(dst, size, sha)
     cfg = QI.image_config(quant, exe, models_dir, uma=bool((gpu or {}).get("integrated")),
                           policy=a.image_gpu_policy or "auto", ssd_offload=ssd)
+    if lowered:
+        cfg["quant_lowered"] = lowered
     ok(f"image generation: {quant}, GPU policy {cfg['gpu_policy']}")
     return cfg
 
