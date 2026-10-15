@@ -88,7 +88,7 @@ private:
     Conv aqkv_, aproj_;
     struct Up {
         Res r[3];
-        Conv up;   // up.w null: no upsampling
+        Conv up;   // up.out 0: no upsampling
         int ft = 1;
     } up_[5];
     const float* gout_ = nullptr;
@@ -100,7 +100,7 @@ private:
     Conv eaqkv_, eaproj_;
     struct Down {
         Res r[2];
-        Conv down;   // down.w null: no downsampling
+        Conv down;   // down.out 0: no downsampling
         int ft = 1;  // the shortcut's frames (2 where the block also halves time)
     } down_[5];
     const float* egout_ = nullptr;

@@ -457,7 +457,7 @@ QiVae::Need QiVae::need(int64_t h, int64_t w) const {
         n.big32 = std::max(n.big32, H * W * std::max(c, co));
         n.big16 = std::max(n.big16, H * W * std::max(c, co));
         unfold = std::max(unfold, H * W * 9 * std::max(c, co));
-        if (u.up.w != nullptr) {
+        if (u.up.out > 0) {
             n.keep = std::max(n.keep, H * W * c);
             H *= 2;
             W *= 2;
@@ -539,7 +539,7 @@ void QiVae::decode_piece(const float* z, int64_t h, int64_t w, float* rgba) {
         const int64_t cin = c, co = u.r[0].c1.out;
         // the block's input, for its shortcut: in the buffer neither the residual blocks nor the upsampling write
         float* keep = nullptr;
-        if (u.up.w != nullptr) {
+        if (u.up.out > 0) {
             keep = alloc<float>(allocs_, H * W * cin);
             gpu::copy_async(keep, x, (size_t) (H * W * cin) * 4, s_);
         }
@@ -547,7 +547,7 @@ void QiVae::decode_piece(const float* z, int64_t h, int64_t w, float* rgba) {
             resblock(r, x, H, W, c);
             c = r.c1.out;
         }
-        if (u.up.w != nullptr) {
+        if (u.up.out > 0) {
             up2x16(x, H, W, co, a16_, s_);
             float* y = x == t0_ ? t1_ : t0_;
             conv(u.up, a16_, 2 * H, 2 * W, y);
@@ -577,7 +577,7 @@ QiVae::Need QiVae::encode_need(int64_t H, int64_t W) const {
         n.big16 = std::max(n.big16, h * w * std::max(c, co));
         unfold = std::max(unfold, h * w * 9 * std::max(c, co));
         n.keep = std::max(n.keep, h * w * c);
-        if (d.down.w != nullptr) {
+        if (d.down.out > 0) {
             h /= 2;
             w /= 2;
             unfold = std::max(unfold, h * w * 9 * co);
@@ -616,7 +616,7 @@ bool QiVae::encode(const float* rgba, int64_t H, int64_t W, float* z) {
             c = r.c1.out;
         }
         int64_t fs = 1;
-        if (d.down.w != nullptr) {   // zero row and column after the edge, then the 3 x 3 convolution of stride 2
+        if (d.down.out > 0) {   // zero row and column after the edge, then the 3 x 3 convolution of stride 2
             qi_to_f16(x, H * W * c, a16_, s_);
             float* y = x == t0_ ? t1_ : t0_;
             const int64_t Ho = H / 2, Wo = W / 2, K = 9 * c, rows = std::max<int64_t>(1, col_cap_ / K);
