@@ -185,11 +185,11 @@ python $u/sync_collect.py $o/serve xe<VERSION> <upstream tag>                 # 
 
 ### image generation
 
-And one more on the same GPUs (the user's decision of 2026-10-15): each engine's image generator as its own setup sets it up on the GPU, one 1024x1024 image of 8 steps from a fixed prompt and seed, by the upstream merge's `bench_image.py` (its references/measure.md, "Image generation": upstream's backend, how its `sd-cli` is built in its tree, the GPU's index); two images per engine, alternating, after a warm-up each; a few minutes a GPU.
+And one more on the same GPUs (the user's decision of 2026-10-15): each engine's image generator as its own setup sets it up on the GPU, one 1024x1024 image of 8 steps from a fixed prompt and seed, by the upstream merge's `bench_image.py` (its references/measure.md, "Image generation": XeStrata's resident engine measured warm, upstream's backend, how its `sd-cli` is built in its tree, the GPUs); two images per engine, alternating, after a warm-up each; a few minutes a GPU.
 
 ```sh
 XE_ROOT=<xe tree> UP_ROOT=<up tree> DATA=<data> QUANT=<Q8_0, Q6_K on a 12 GB card> UP_IMAGE_BACKEND=<vulkan|cuda|hip> \
-  [XE_IMAGE_GPU=N UP_IMAGE_GPU=N] PY=<python> ROUNDS=2 python $u/bench_image.py $o/image <GPU>
+  [XE_IMAGE_PCI=<PCI address> UP_IMAGE_GPU=N] PY=<python> ROUNDS=2 python $u/bench_image.py $o/image <GPU>
 python $u/sync_collect.py $o/image xe<VERSION> <upstream tag>                 # matrix-image.json
 ```
 

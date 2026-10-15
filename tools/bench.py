@@ -630,8 +630,9 @@ def run(cfg_path: Path, data: Path, gpus: list[dict], verbose: bool = False, ori
     C.ab_usage(out, GPU_LABEL, engines, usage_cfg, ctx, corpus["agent"], rounds=rounds, on_run=tagged,
                temperature=temperature)
     if cfg.get("images"):
-        # this PC's "images" section as setup wrote it; beside upstream, its own image generator where its setup
-        # built one (engine-image/BUILD.json names the backend), configured as its setup configures it
+        # this PC's "images" section as setup wrote it, on the text engine's GPU (its environment); beside upstream,
+        # its own image generator (sd-cli) where its setup built one (engine-image/BUILD.json names the backend),
+        # configured as its setup configures it
         img = [C.Engine(xe.name, "xe", [], "", root=ROOT, py=sys.executable)]
         cfgs = {"xe": cfg["images"]}
         up_root = engines[1].root if len(engines) > 1 else None
@@ -640,14 +641,14 @@ def run(cfg_path: Path, data: Path, gpus: list[dict], verbose: bool = False, ori
             meta = json.loads(stamp.read_text())
             u = C.Engine(engines[1].name, "up", [], "", root=Path(up_root), py=sys.executable)
             c = C.image_config(u, meta.get("backend", "vulkan"), cfg["images"].get("quant", "Q8_0"),
-                               str(stamp.parent / Path(cfg["images"]["exe"]).name),
+                               str(stamp.parent / ("sd-cli.exe" if os.name == "nt" else "sd-cli")),
                                str(Path(cfg["images"]["diffusion_model"]).parent.parent), cfg["images"].get("gpu"),
                                meta.get("lib_dirs"))
             if "error" not in c:
                 img.append(u)
                 cfgs["up"] = c
         say("  image generation (the merges' bench_image.py) ...")
-        C.ab_image(out, GPU_LABEL, img, cfgs, rounds=rounds, on_run=tagged)
+        C.ab_image(out, GPU_LABEL, img, cfgs, rounds=rounds, on_run=tagged, envs={"xe": xe.env})
     tagged(None)
     tables: list[str] = []
     C.collect(out, {e.arm: e.name for e in engines}, say=tables.append)

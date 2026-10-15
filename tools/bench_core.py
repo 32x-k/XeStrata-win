@@ -11,8 +11,9 @@ Three ways of running an engine:
   three follow-ups, 256 tokens a turn, greedy or at a temperature (t07 = 0.7, the default).
 - usage: the engine's own serve/server.py, streamed /v1/chat/completions: two short chats and a coding agent, at
   the temperature Qwen recommends (0.7) or another.
-- image: the engine's image generator (its serve/images.py, the sd-cli command its server runs), one 1024x1024 image
-  of the model card's 8 steps from a fixed prompt and seed.
+- image: the engine's image generator as its server runs it (its serve/images.py: XeStrata's resident strata-image,
+  measured warm; upstream's sd-cli, a process a request), one 1024x1024 image of the model card's 8 steps from a
+  fixed prompt and seed.
 
 The prompts come from XeStrata's sources at commit 58dbbe5.  A package has no git history, so the text is shipped in
 data/bench-corpus.json.xz (written from the repository by `make_corpus`) and tokenized with the pack's tokenizer by
@@ -821,9 +822,12 @@ def ab_usage(out: Path, gpu: str, engines: list[Engine], cfg: Callable[[Engine],
 IMAGE_REQUEST = {"prompt": "A red fox sitting in a snowy forest at dawn, photograph", "size": "1024x1024", "seed": 42}
 # Run by the engine tree's own Python with its tools/image/qimage.py and serve/images.py (both trees have modules of
 # those names, so each in a process of its own).  "make": the config section its setup writes for this GPU (with
-# setup's timed choices where the tree makes them, qimage.tune); "run": one image through the server's command.
+# setup's timed choices where the tree makes them, qimage.tune); "run": one image as its server makes it.  A tree whose
+# server keeps a resident image engine (XeStrata's strata-image) starts it and makes a warm-up image of another prompt
+# first, so the image measured is one the server makes while it runs ("cold_s": the warm-up's, with the start); one
+# whose server runs sd-cli for each request (upstream's) runs that command once.
 IMAGE_RUNNER = r"""
-import json, re, subprocess, sys, time
+import json, os, re, subprocess, sys, time
 from pathlib import Path
 job = json.load(sys.stdin)
 tree = Path(job["tree"])
@@ -831,6 +835,10 @@ sys.path[:0] = [str(tree), str(tree / "serve"), str(tree / "tools" / "image")]
 if job["do"] == "make":
     import qimage as QI
     m = job["make"]
+    if hasattr(QI, "IMAGE_EXE"):
+        cfg = QI.image_config(m["quant"], Path(m["exe"]), Path(m["models"]))
+        print(json.dumps(cfg))
+        sys.exit(0)
     kw = {"lib_dirs": m.get("lib_dirs") or ()}
     if m.get("gpu") is not None:
         kw["gpu"] = m["gpu"]
@@ -841,6 +849,29 @@ if job["do"] == "make":
     sys.exit(0)
 import images as IM
 cfg = job["cfg"]
+if hasattr(IM, "ImageEngine"):
+    env = dict(os.environ)
+    env.update(job.get("env") or {})
+    g = IM.ImageGen({**cfg, "out_dir": str(Path(job["png"]).parent / "image-engine")}, env=env)
+    try:
+        t0 = time.monotonic()
+        g.run(IM.parse_request({"prompt": "A lighthouse on a cliff at night, oil painting", "seed": 1,
+                                "size": job["request"].get("size")}, cfg))
+        cold = time.monotonic() - t0
+        t0 = time.monotonic()
+        pngs, fig = g.run(IM.parse_request(dict(job["request"]), cfg))
+        wall = time.monotonic() - t0
+    except IM.ImageJobFailed as e:
+        print(json.dumps({"rc": 1, "error": str(e)}))
+        sys.exit(0)
+    finally:
+        g.close()
+    Path(job["png"]).write_bytes(pngs[0])
+    Path(job["log"]).write_text(json.dumps(fig, indent=1) + "\n")
+    print(json.dumps({"rc": 0, "seconds": round(wall, 2), "cold_s": round(cold, 2),
+                      "text_s": round(fig["text_encode_ms"] / 1000, 3), "sampling_s": fig["sampling_s"],
+                      "decode_s": fig["vae_decode_s"], "backend": "strata-image"}))
+    sys.exit(0)
 cmd = IM.sd_cli_args(cfg, IM.parse_request(dict(job["request"]), cfg), job["png"])
 t0 = time.monotonic()
 p = subprocess.run(cmd, env=IM.image_env(cfg), capture_output=True, text=True, errors="replace")
@@ -879,10 +910,11 @@ def image_config(e: Engine, backend: str, quant: str, exe: str, models: str, gpu
 
 
 def ab_image(out: Path, gpu: str, engines: list[Engine], cfgs: dict[str, dict], rounds: int = ROUNDS,
-             on_run: Callable | None = None, dry: bool = False) -> None:
-    """OUT/image-runs/GPU-ARM-ROUND.json (the times), .txt (sd-cli's log) and .png: each engine's "images" config
-    (`cfgs`, by arm), one discarded warm-up per engine first (the files into the page cache), then the engines
-    alternating, one sd-cli process an image."""
+             on_run: Callable | None = None, dry: bool = False, envs: dict[str, dict] | None = None) -> None:
+    """OUT/image-runs/GPU-ARM-ROUND.json (the times), .txt (sd-cli's log, or the resident engine's figures) and .png:
+    each engine's "images" config (`cfgs`, by arm; `envs`: what a resident engine's environment adds, by arm), one
+    discarded warm-up per engine first (the files into the page cache), then the engines alternating, one process an
+    image (IMAGE_RUNNER)."""
     runs = out / "image-runs"
     runs.mkdir(parents=True, exist_ok=True)
 
@@ -894,7 +926,7 @@ def ab_image(out: Path, gpu: str, engines: list[Engine], cfgs: dict[str, dict], 
             print(f"{gpu} {e.arm} image {rnd}: {json.dumps(cfg)}")
             return
         r = image_job(e, {"do": "run", "cfg": cfg, "request": IMAGE_REQUEST, "png": str(runs / f"{stem}.png"),
-                          "log": str(runs / f"{stem}.txt")})
+                          "log": str(runs / f"{stem}.txt"), "env": (envs or {}).get(e.arm)})
         rec = {"gpu": gpu, "arm": e.arm, "round": rnd, "backend": cfg.get("backend"), "quant": cfg.get("quant"),
                "args": cfg.get("args"), "env": cfg.get("env"), **r}
         (runs / f"{stem}.json").write_text(json.dumps(rec, indent=1) + "\n")
