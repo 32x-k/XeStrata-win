@@ -313,6 +313,7 @@ The engine's options (added to the settings' `args`):
 | `--prompt-chunk N` | the most tokens prefill computes at once (default 4096; 0: none at once) |
 | `--max-t N` | the decode window's most tokens (default 8) |
 | `--spec N` | the most tokens of a window checking the MTP layer's drafts (default 3: two drafts; 0: off) |
+| `--draft-vocab PATH` | the MTP layer drafts only tokens of this subset (`data/draft_vocab*.bin`), reading less of the head (setup writes it into Qwen3.6's settings, after its `--draft-vocab` choice) |
 | `--rope-scaling none\|linear\|yarn`, `--rope-scale F`, `--yarn-orig-ctx N` | context extension |
 
 ### Less RAM than the model: the low-RAM mode

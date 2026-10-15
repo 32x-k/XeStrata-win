@@ -319,6 +319,7 @@ static void plain_usage(const std::string& arch) {
                  "  --max-t N            the decode window's most tokens (default 8)\n"
                  "  --spec N             speculative decoding with the model's MTP layer: windows of up to N tokens,\n"
                  "                       the last one and N - 1 drafts (default 3; 0: off; greedy only)\n"
+                 "  --draft-vocab PATH   the drafts over this token subset (int32 ids, data/draft_vocab*.bin)\n"
                  "  --rope-scaling none|linear|yarn, --rope-scale F, --yarn-orig-ctx N   context extension\n"
                  "  --dump-logits PATH   each generated token's logits, FP32 rows\n"
                  "  --serve              stay resident and take requests on stdin (server.py's protocol, text requests)\n"
@@ -385,6 +386,7 @@ int plain_main(int argc, char** argv) {
         else if (a == "--mmap-experts") opt.mmap_experts = true;
         else if (a == "--no-pcie-split") opt.pcie_split = false;
         else if (a == "--expert-profile") opt.profile = next("--expert-profile");
+        else if (a == "--draft-vocab") opt.draft_vocab = next("--draft-vocab");
         else if (a == "--prompt-chunk") opt.prompt_chunk = std::strtoll(next("--prompt-chunk"), nullptr, 10);
         else if (a == "--rope-scaling") opt.rope_scaling = next("--rope-scaling");
         else if (a == "--rope-scale") opt.rope_scale = std::strtod(next("--rope-scale"), nullptr);
