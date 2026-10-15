@@ -28,9 +28,14 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 
 namespace strata::image {
@@ -224,7 +229,8 @@ struct AttnKernel {
             for (int i = 0; i < CW; i += 8) {
                 sycl::vec<sycl::half, 8> pv;
                 for (int u = 0; u < 8; ++u) {
-                    const float p = m_new == -INFINITY ? 0.0f : sycl::exp(s[i + u] - m_new);
+                    // native::exp: P is FP16 anyway (the block's error unchanged; B70 11.4 -> 10.3 ms)
+                    const float p = m_new == -INFINITY ? 0.0f : sycl::native::exp(s[i + u] - m_new);
                     sum += p;
                     pv[u] = sycl::half(p);
                 }
@@ -237,13 +243,28 @@ struct AttnKernel {
             }
             sycl::group_barrier(sg);
             const uint16_t* vc0 = v16 + j0 * row + h * D;
-            for (int nt = 0; nt < NT; ++nt) {   // O += P . V, V's tiles from global memory
+            // O += P . V, V's tiles from global memory.  Intel's shapes read a tile of P once for the output's NT tiles
+            // (B70, a 1024 x 1024 block: 12.5 -> 11.9 ms); the RTX 4070 was 1.4% slower that way and keeps the order
+            // of reading it again for each
+            if constexpr (P == 0 || P == 1) {
                 for (int kc = 0; kc < CH / TK; ++kc) {
                     typename Ops::A pa;
-                    typename Ops::Br b;
                     Ops::load(sg, pa, at(ps, poff + (size_t) kc * TK), PLD);
-                    Ops::load(sg, b, vc0 + (int64_t) kc * TK * row + (int64_t) nt * TN, row);
-                    Ops::mad(sg, o[nt], pa, b);
+                    for (int nt = 0; nt < NT; ++nt) {
+                        typename Ops::Br b;
+                        Ops::load(sg, b, vc0 + (int64_t) kc * TK * row + (int64_t) nt * TN, row);
+                        Ops::mad(sg, o[nt], pa, b);
+                    }
+                }
+            } else {
+                for (int nt = 0; nt < NT; ++nt) {
+                    for (int kc = 0; kc < CH / TK; ++kc) {
+                        typename Ops::A pa;
+                        typename Ops::Br b;
+                        Ops::load(sg, pa, at(ps, poff + (size_t) kc * TK), PLD);
+                        Ops::load(sg, b, vc0 + (int64_t) kc * TK * row + (int64_t) nt * TN, row);
+                        Ops::mad(sg, o[nt], pa, b);
+                    }
                 }
             }
             sycl::group_barrier(sg);
@@ -289,17 +310,21 @@ int pick(const sycl::device& d) {
     return -1;
 }
 
+// The most sub-groups a work-group the device's local memory and work-group size take, up to 8.
 template<int P>
-sycl::event launch(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T,
-                   int64_t heads, int64_t n_text, const int32_t* key_lim, uint16_t* out16) {
+int nsg_most(const sycl::device& d) {
     using K = AttnKernel<P>;
-    // as many sub-groups a work-group as the device's local memory and work-group size take, up to 8: they share the
-    // keys' tiles in the caches
-    const sycl::device d = q.get_device();
     const size_t local = d.get_info<sycl::info::device::local_mem_size>();
     const size_t wg = d.get_info<sycl::info::device::max_work_group_size>();
     int nsg = 8;
     while (nsg > 1 && ((size_t) nsg * K::SG_BYTES > local || (size_t) nsg * K::SG > wg)) nsg /= 2;
+    return nsg;
+}
+
+template<int P>
+sycl::event launch(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T,
+                   int64_t heads, int64_t n_text, const int32_t* key_lim, uint16_t* out16, int nsg) {
+    using K = AttnKernel<P>;
     const int64_t bq = (int64_t) nsg * K::TM;
     const size_t groups = (size_t) ((T + bq - 1) / bq);
     return q.submit([&](sycl::handler& h) {
@@ -328,12 +353,43 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
     sycl::queue& q = core::Runtime::get().stream(stream);
     static core::PerDevice<int> per_device;
     const int p = per_device.get(q.get_device(), [&q] { return pick(q.get_device()); });
+    // The sub-groups a work-group: more share the keys' tiles in the caches, fewer leave the GPU freer to overlap
+    // work-groups.  The fastest of the most that fit, a half and a quarter of it, timed once a GPU on the first
+    // attention of 2048 rows or more (the images' own inputs; a small first image would not show it): 1024 x 1024
+    // block, the B70 4 (11.88 -> 11.44 ms), the RTX 4070 2 (11.55 -> 10.53 ms).  Until then, the most.
+    static core::PerDevice<std::shared_ptr<std::atomic<int>>> tuned_of;
+    std::atomic<int>& tuned = *tuned_of.get(q.get_device(), [] { return std::make_shared<std::atomic<int>>(0); });
+    auto run = [&](int nsg) -> sycl::event {
+        switch (p) {
+        case 0: return launch<0>(q, q16, k16, v16, T, heads, n_text, key_lim, out16, nsg);
+        case 1: return launch<1>(q, q16, k16, v16, T, heads, n_text, key_lim, out16, nsg);
+        case 2: return launch<2>(q, q16, k16, v16, T, heads, n_text, key_lim, out16, nsg);
+        default: return launch<3>(q, q16, k16, v16, T, heads, n_text, key_lim, out16, nsg);
+        }
+    };
+    const int most = p == 0 ? nsg_most<0>(q.get_device()) : p == 1 ? nsg_most<1>(q.get_device())
+                   : p == 2 ? nsg_most<2>(q.get_device()) : p == 3 ? nsg_most<3>(q.get_device()) : 1;
+    int nsg = tuned.load();
+    if (p >= 0 && nsg == 0 && T >= 2048) {
+        q.wait();
+        double best = 1e30;
+        std::string said;
+        for (int n = most; n >= std::max(1, most / 4); n /= 2) {
+            run(n).wait();   // its kernel built, its caches warm
+            const auto t0 = std::chrono::steady_clock::now();
+            run(n).wait();
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            said += (said.empty() ? "" : ", ") + std::to_string(n) + ": " + std::to_string(ms).substr(0, 5) + " ms";
+            if (ms < best) { best = ms; nsg = n; }
+        }
+        tuned.store(nsg);
+        std::fprintf(stderr, "strata-image: the attention takes %d sub-groups a work-group (timed at %lld rows: %s)\n",
+                     nsg, (long long) T, said.c_str());
+    }
+    if (nsg == 0) nsg = most;
     sycl::event e;
     switch (p) {
-    case 0: e = launch<0>(q, q16, k16, v16, T, heads, n_text, key_lim, out16); break;
-    case 1: e = launch<1>(q, q16, k16, v16, T, heads, n_text, key_lim, out16); break;
-    case 2: e = launch<2>(q, q16, k16, v16, T, heads, n_text, key_lim, out16); break;
-    case 3: e = launch<3>(q, q16, k16, v16, T, heads, n_text, key_lim, out16); break;
+    case 0: case 1: case 2: case 3: e = run(nsg); break;
     default:
         qi_attention_plain(q16, k16, v16, T, heads, head_dim, n_text, scratch, stream, key_lim);
         qi_to_f16(scratch, T * heads * head_dim, out16, stream);
