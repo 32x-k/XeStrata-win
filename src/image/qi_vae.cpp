@@ -171,6 +171,42 @@ void to_rgba(const float* x, int64_t HW, float* rgba, void* s) {
     });
 }
 
+// sub [C][th][tw] = z [C][h][w] rows y0.., columns x0..
+void crop_latent(const float* z, int64_t C, int64_t h, int64_t w, int64_t y0, int64_t x0, int64_t th, int64_t tw,
+                 float* sub, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (C * th * tw)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i / (th * tw), r = i % (th * tw), y = r / tw, x = r % tw;
+        sub[i] = z[(c * h + y0 + y) * w + x0 + x];
+    });
+}
+
+// acc [4][H][W] += piece [4][ph][pw] * weight, wsum [H][W] += weight, the piece at image row Y0, column X0; the weight
+// ramps from 0 to 1 over `ramp` pixels at each edge that meets another tile, 1 elsewhere
+void blend_add(const float* piece, int64_t ph, int64_t pw, int64_t Y0, int64_t X0, int64_t H, int64_t W, int64_t ramp,
+               bool top, bool bottom, bool left, bool right, float* acc, float* wsum, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (ph * pw)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t y = i / pw, x = i % pw;
+        auto edge = [ramp](int64_t d) { return sycl::fmin(1.0f, (float) (d + 1) / (float) (ramp + 1)); };
+        float wgt = 1.0f;
+        if (top) wgt *= edge(y);
+        if (bottom) wgt *= edge(ph - 1 - y);
+        if (left) wgt *= edge(x);
+        if (right) wgt *= edge(pw - 1 - x);
+        const int64_t p = (Y0 + y) * W + X0 + x;
+        for (int c = 0; c < 4; ++c) acc[c * H * W + p] += piece[c * ph * pw + i] * wgt;
+        wsum[p] += wgt;
+    });
+}
+
+void normalize(float* acc, const float* wsum, int64_t HW, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (4 * HW)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        acc[i] /= wsum[i % HW];
+    });
+}
+
 }  // namespace
 
 QiVae::QiVae() = default;
@@ -320,32 +356,89 @@ void QiVae::attention(float* x, int64_t H, int64_t W, int64_t C) {
     qi_axpy(x, t2_, 1.0f, HW * C, s_);
 }
 
-void QiVae::decode(const float* z, int64_t h, int64_t w, float* rgba) {
-    // the largest activation: each stage's pixels times its widest channel count
-    int64_t big32 = h * w * std::max<int64_t>(3 * cin_.out, h * w), H = h, W = w, big16 = 3 * h * w * cin_.out;
-    int64_t c = cin_.out;
+QiVae::Need QiVae::need(int64_t h, int64_t w) const {
+    // the largest activation: each stage's pixels times its widest channel count; the attention's scores [hw][hw]
+    Need n;
+    n.big32 = h * w * std::max<int64_t>(3 * cin_.out, h * w);
+    n.big16 = 3 * h * w * cin_.out;
+    int64_t H = h, W = w, c = cin_.out;
     for (const Up& u : up_) {
         const int64_t co = u.r[0].c1.out;
-        big32 = std::max(big32, H * W * std::max(c, co));
-        big16 = std::max(big16, H * W * std::max(c, co));
+        n.big32 = std::max(n.big32, H * W * std::max(c, co));
+        n.big16 = std::max(n.big16, H * W * std::max(c, co));
         if (u.up.w != nullptr) {
+            n.keep = std::max(n.keep, H * W * c);
             H *= 2;
             W *= 2;
-            big32 = std::max(big32, H * W * co);
-            big16 = std::max(big16, H * W * co);
+            n.big32 = std::max(n.big32, H * W * co);
+            n.big16 = std::max(n.big16, H * W * co);
         }
         c = co;
     }
-    grow(big16, big32);
+    return n;
+}
+
+uint64_t QiVae::scratch_bytes(int64_t h, int64_t w) const {
+    const Need n = need(h, w);
+    return (uint64_t) n.big16 * 2 + (uint64_t) n.big32 * 4 * 3 + (uint64_t) n.keep * 4 + (uint64_t) kColBytes;
+}
+
+void QiVae::drop_scratch() {
+    gpu::stream_sync(s_);
+    for (void* p : {(void*) a16_, (void*) col16_, (void*) t0_, (void*) t1_, (void*) t2_}) release(allocs_, p);
+    a16_ = col16_ = nullptr;
+    t0_ = t1_ = t2_ = nullptr;
+    cap16_ = cap32_ = 0;
+}
+
+void QiVae::decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t max_scratch) {
+    if (scratch_bytes(h, w) <= max_scratch) {
+        decode_piece(z, h, w, rgba);
+        return;
+    }
+    // square tiles of t latent pixels, the largest whose decode fits, a quarter of a tile overlapping its neighbours
+    int64_t t = std::min(h, w);
+    while (t > 8 && scratch_bytes(t, t) > max_scratch) t -= 4;
+    if (scratch_bytes(t, t) > max_scratch)
+        throw std::runtime_error("image engine (VAE): not enough GPU memory for a tile of the image");
+    const int64_t ov = std::max<int64_t>(2, t / 4), step = t - ov, H = 16 * h, W = 16 * w, C = pq_.in;
+    const int64_t th = std::min(t, h), tw = std::min(t, w);
+    float *sub = nullptr, *piece = nullptr, *wsum = nullptr;
+    if (!gpu::alloc_device(&sub, (size_t) (C * th * tw) * 4) ||
+        !gpu::alloc_device(&piece, (size_t) (int64_t{4 * 256} * th * tw) * 4) ||
+        !gpu::alloc_device(&wsum, (size_t) (H * W) * 4))
+        throw std::runtime_error(std::string("image engine (VAE): GPU memory: ") + gpu::last_error());
+    gpu::memset_async(rgba, 0, (size_t) (4 * H * W) * 4, s_);
+    gpu::memset_async(wsum, 0, (size_t) (H * W) * 4, s_);
+    for (int64_t y0 = 0;; y0 += step) {
+        const int64_t yy = std::min(y0, h - th);   // the last row of tiles ends at the edge
+        for (int64_t x0 = 0;; x0 += step) {
+            const int64_t xx = std::min(x0, w - tw);
+            crop_latent(z, C, h, w, yy, xx, th, tw, sub, s_);
+            decode_piece(sub, th, tw, piece);
+            blend_add(piece, 16 * th, 16 * tw, 16 * yy, 16 * xx, H, W, 16 * ov, yy > 0, yy + th < h, xx > 0,
+                      xx + tw < w, rgba, wsum, s_);
+            if (xx + tw >= w) break;
+        }
+        if (yy + th >= h) break;
+    }
+    normalize(rgba, wsum, H * W, s_);
+    gpu::stream_sync(s_);
+    gpu::free(sub);
+    gpu::free(piece);
+    gpu::free(wsum);
+}
+
+void QiVae::decode_piece(const float* z, int64_t h, int64_t w, float* rgba) {
+    const Need nd = need(h, w);
+    grow(nd.big16, nd.big32);
     if (h * w * h * w > col_cap_) throw std::runtime_error("image engine (VAE): the latent is too large for one piece");
-    H = h;
-    W = w;
+    int64_t H = h, W = w, c = cin_.out;
     float* x = t0_;
     unnorm_tokens16(z, mean_, std_, pq_.in, H * W, a16_, s_);
     conv(pq_, a16_, H, W, t1_);
     qi_to_f16(t1_, H * W * pq_.out, a16_, s_);
     conv(cin_, a16_, H, W, x);
-    c = cin_.out;
     resblock(mid0_, x, H, W, c);
     attention(x, H, W, c);
     resblock(mid1_, x, H, W, c);

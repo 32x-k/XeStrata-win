@@ -65,6 +65,10 @@ public:
     void drop_blocks() { blocks_stream_.drop(); }
     /// Frees the activations (grown again on use).
     void drop_activations();
+    /// The GPU memory the activations of a T-token sequence take, the MLP computed `mlp_rows` rows at a time (0: all).
+    uint64_t activation_bytes(int64_t T, int64_t mlp_rows = 0) const;
+    /// The rows the MLP takes at a time (0: all of them): its 2 x 12288-wide product is the largest activation.
+    void set_mlp_rows(int64_t rows);
 
 private:
     struct W {
@@ -96,7 +100,7 @@ private:
     std::vector<Block> blocks_;
     LayerStream blocks_stream_;
     // activations, grown on demand
-    int64_t cap_T_ = 0;
+    int64_t cap_T_ = 0, mlp_cap_ = 0, mlp_rows_ = 0;
     float *x_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *h_ = nullptr, *gu_ = nullptr;
     uint16_t *h16_ = nullptr, *q16_ = nullptr, *k16_ = nullptr, *v16_ = nullptr, *o16_ = nullptr;
     float *cos_ = nullptr, *sin_ = nullptr, *attn_scratch_ = nullptr;

@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -54,9 +55,12 @@ int main(int argc, char** argv) {
         if (!gpu::alloc_device(&dz, z.size() * 4) || !gpu::alloc_device(&img, (size_t) (4 * HW) * 4))
             throw std::runtime_error("alloc");
         gpu::copy(dz, z.data(), z.size() * 4);
-        vae.decode(dz, side, side, img);   // a warm-up
+        const char* cap = std::getenv("QI_VAE_SCRATCH_MIB");   // tiles when the whole image's buffers pass it
+        const uint64_t max_scratch = cap ? std::strtoull(cap, nullptr, 10) << 20 : UINT64_MAX;
+        std::printf("VAE working memory for the whole image: %.2f GB\n", (double) vae.scratch_bytes(side, side) / 1e9);
+        vae.decode(dz, side, side, img, max_scratch);   // a warm-up
         const auto t0 = std::chrono::steady_clock::now();
-        vae.decode(dz, side, side, img);
+        vae.decode(dz, side, side, img, max_scratch);
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::vector<float> got((size_t) (4 * HW));
         gpu::copy(got.data(), img, got.size() * 4);

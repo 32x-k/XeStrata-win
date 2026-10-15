@@ -229,7 +229,8 @@ void QiDit::ensure(int64_t T, int64_t HW) {
         k_ = alloc<float>(allocs_, T * C_);
         v_ = alloc<float>(allocs_, T * C_);
         h_ = alloc<float>(allocs_, T * std::max(C_, in_ch_));
-        gu_ = alloc<float>(allocs_, T * 2 * inter_);
+        mlp_rows_ = std::min(T, mlp_cap_ > 0 ? mlp_cap_ : T);
+        gu_ = alloc<float>(allocs_, mlp_rows_ * 2 * inter_);
         h16_ = alloc<uint16_t>(allocs_, T * std::max(C_, inter_));
         q16_ = alloc<uint16_t>(allocs_, TP * C_, true);
         k16_ = alloc<uint16_t>(allocs_, TP * C_, true);
@@ -237,7 +238,8 @@ void QiDit::ensure(int64_t T, int64_t HW) {
         o16_ = alloc<uint16_t>(allocs_, T * C_);
         cos_ = alloc<float>(allocs_, T * kHead / 2);
         sin_ = alloc<float>(allocs_, T * kHead / 2);
-        attn_scratch_ = alloc<float>(allocs_, T * C_);
+        // the plain attention's FP32 output: only where the matrix engines' path is not taken
+        if (std::strcmp(qi_attention_path(), "plain (FP32)") == 0) attn_scratch_ = alloc<float>(allocs_, T * C_);
         cap_T_ = T;
         rope_H_ = rope_W_ = rope_text_ = -1;
     }
@@ -354,16 +356,35 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
         qi_attention(q16_, k16_, v16_, T, heads_, kHead, n_text_, o16_, attn_scratch_, s_);
         product(o16_ + r0 * C, wo, h_, Tr);
         qi_gate_add(xr, h_, mod(1), ntr, Tr, C, s_);
-        qi_ln_mod16(xr, mod(2), ntr, Tr, C, h16_, s_);
-        product(h16_, wgu, gu_, Tr);
-        qi_swiglu16(gu_, Tr, inter_, h16_, s_);
-        product(h16_, wdown, h_, Tr);
-        qi_gate_add(xr, h_, mod(3), ntr, Tr, C, s_);
+        for (int64_t m0 = 0; m0 < Tr; m0 += mlp_rows_) {   // the MLP a band of rows at a time (its 2 x inter wide product)
+            const int64_t mr = std::min(mlp_rows_, Tr - m0), mt = std::max<int64_t>(0, std::min(ntr - m0, mr));
+            qi_ln_mod16(xr + m0 * C, mod(2), mt, mr, C, h16_, s_);
+            product(h16_, wgu, gu_, mr);
+            qi_swiglu16(gu_, mr, inter_, h16_, s_);
+            product(h16_, wdown, h_, mr);
+            qi_gate_add(xr + m0 * C, h_, mod(3), mt, mr, C, s_);
+        }
         blocks_stream_.end(bi);
     }
     qi_ln_mod16(x_ + n_text_ * C, scale_, 0, HW, C, h16_, s_);   // the final norm: row 0 of scale_ for every token
     product(h16_, pout_, h_, HW);
     qi_tokens_latent(h_, in_ch_, HW, out, s_);
+}
+
+uint64_t QiDit::activation_bytes(int64_t T, int64_t mlp_rows) const {
+    const int64_t TP = qi_attn_rows(T), mr = std::min(T, mlp_rows > 0 ? mlp_rows : T);
+    const bool plain = std::strcmp(qi_attention_path(), "plain (FP32)") == 0;
+    return (uint64_t) T * (uint64_t) C_ * 4 * 4 + (uint64_t) T * (uint64_t) std::max(C_, in_ch_) * 4 +
+           (uint64_t) mr * 2 * (uint64_t) inter_ * 4 + (uint64_t) T * (uint64_t) std::max(C_, inter_) * 2 +
+           (uint64_t) TP * (uint64_t) C_ * 2 * 3 + (uint64_t) T * (uint64_t) C_ * 2 + (uint64_t) T * kHead * 4 +
+           (plain ? (uint64_t) T * (uint64_t) C_ * 4 : 0);
+}
+
+void QiDit::set_mlp_rows(int64_t rows) {
+    if (rows != mlp_cap_) {
+        mlp_cap_ = rows;
+        drop_activations();
+    }
 }
 
 void QiDit::drop_activations() {

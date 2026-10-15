@@ -26,12 +26,23 @@ public:
     /// Reads the VAE's safetensors (the diffusers names) and puts the decoder's weights on the current GPU.
     bool open(const std::string& path, void* stream, std::string& err);
 
-    /// rgba [4][16 h][16 w] (device FP32, 0 .. 1) from the DiT's latent z [64][h][w] (device FP32).
-    void decode(const float* z, int64_t h, int64_t w, float* rgba);
+    /// rgba [4][16 h][16 w] (device FP32, 0 .. 1) from the DiT's latent z [64][h][w] (device FP32).  When the whole
+    /// image's working memory (scratch_bytes) passes `max_scratch`, the latent is decoded in overlapping tiles (the
+    /// largest that fit, a quarter of a tile apart) whose images are blended where they meet.
+    void decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t max_scratch = UINT64_MAX);
 
+    /// The GPU memory a decode of one h x w piece works in (its buffers, besides the weights).
+    uint64_t scratch_bytes(int64_t h, int64_t w) const;
+    /// Frees the working buffers (grown again on use).
+    void drop_scratch();
     uint64_t weight_bytes() const { return weight_bytes_; }
 
 private:
+    struct Need {
+        int64_t big16 = 0, big32 = 0, keep = 0;
+    };
+    Need need(int64_t h, int64_t w) const;
+    void decode_piece(const float* z, int64_t h, int64_t w, float* rgba);
     struct Conv {
         int64_t out = 0, in = 0, k = 1;
         const uint16_t* w = nullptr;   // [out][k][k][in] FP16
