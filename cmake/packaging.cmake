@@ -51,7 +51,7 @@ set(_pkg_engine_abs ${CMAKE_INSTALL_FULL_LIBDIR}/xestrata/engine)
 
 # ---- the engine
 set_target_properties(strata PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
-install(TARGETS strata RUNTIME DESTINATION ${_pkg_engine})
+install(TARGETS strata strata-image RUNTIME DESTINATION ${_pkg_engine})
 install(PROGRAMS ${STRATA_PACKAGE_VISION_DIR}/strata-vision-cpu ${STRATA_PACKAGE_VISION_DIR}/strata-vision-vulkan
         DESTINATION ${_pkg_engine})
 # the SYCL runtime the engine was built with: what libsycl loads for Level Zero and HIP (and CUDA in the contrib mode).

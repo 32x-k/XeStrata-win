@@ -33,7 +33,7 @@ from pathlib import Path
 # not use).  ze_loader.dll comes with Intel's driver, nvcuda.dll and nvml.dll with NVIDIA's.
 SYCL_DLLS = ("sycl9.dll", "ur_win_proxy_loader.dll", "ur_loader.dll", "ur_adapter_cuda.dll",
              "ur_adapter_level_zero.dll", "ur_adapter_level_zero_v2.dll", "xptifw.dll")
-ENGINE_EXES = ("strata.exe", "strata-device.exe")
+ENGINE_EXES = ("strata.exe", "strata-device.exe", "strata-image.exe")
 # what a Windows PC brings (the Visual C++ runtime, which xestrata.exe checks for) and what must never be carried
 FORBIDDEN = ("vcruntime*.dll", "msvcp*.dll", "concrt*.dll", "ucrtbase*.dll", "api-ms-win-*.dll", "nvcuda.dll",
              "nvml.dll", "cublas*.dll", "cudart*.dll", "mkl_*.dll")

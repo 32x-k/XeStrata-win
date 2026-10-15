@@ -142,7 +142,7 @@ if [ "$license" = contrib ]; then
     -DSTRATA_CUDA_PATH="$cuda_path" -DSTRATA_CUDA_PTX=
 fi
 cmake -G Ninja -S "$src" -B /build/engine "$@"
-targets="strata onemath_backend_libs"   # oneMath's backends: rocBLAS (AMD GPUs) in every package
+targets="strata strata-image onemath_backend_libs"   # oneMath's backends: rocBLAS (AMD GPUs) in every package
 # shellcheck disable=SC2086
 cmake --build /build/engine --target $targets -j "$jobs"
 
@@ -192,7 +192,7 @@ case "$distro" in
     : > /stage/debian/control
     # its own assignment, so that set -e stops on a failure (in a pipe the last command's status would hide it)
     # shellcheck disable=SC2046
-    substvars=$(cd /stage && dpkg-shlibdeps -O --ignore-missing-info -l"$eng/lib" "$eng"/strata "$eng"/strata-vision-* \
+    substvars=$(cd /stage && dpkg-shlibdeps -O --ignore-missing-info -l"$eng/lib" "$eng"/strata "$eng"/strata-image "$eng"/strata-vision-* \
       $(find "$eng/lib" -type f \( -name 'libsycl.so*' -o -name 'libur_loader.so*' -o -name 'libumf.so*' \
         -o -name 'libur_adapter_level_zero*' -o -name 'libonemath.so*' \)))
     shlibs=$(echo "$substvars" | sed -n 's/^shlibs:Depends=//p')

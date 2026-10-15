@@ -64,7 +64,7 @@ cmake -G Ninja -S "$src" -B /build/engine -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_XWIN=/build/xwin -DSTRATA_SYCL_WINDOWS="$sycl" -DSTRATA_CUDA_ARCHS="$archs" -DSTRATA_CUDA_PATH="$cuda_path" \
   -DSTRATA_CUDA_PTX= -DSTRATA_ONEMKL=OFF -DSTRATA_HIP_ARCHS= -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON \
   -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PORTABLE=ON -DSTRATA_GGML_DIR="$llama"
-cmake --build /build/engine --target strata strata-device -j "$jobs"
+cmake --build /build/engine --target strata strata-device strata-image -j "$jobs"
 
 # the launchers (framework-dependent: Windows' .NET 10 runtime runs them); Avalonia's build telemetry off
 export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 AVALONIA_TELEMETRY_OPTOUT=1 NUGET_PACKAGES=/cache/nuget

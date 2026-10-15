@@ -18,8 +18,8 @@ What the first run does (each step is skipped when it is already done):
      disk space
   2. asks the questions
   3. installs the Python packages it needs into .venv (numpy, jinja2, ...)
-  4. compiles the Strata engine for the GPU with a SYCL compiler (see docs/XE.md), and the image encoder when
-     images are wanted (on the CPU, and on the GPU through Vulkan)
+  4. compiles the Strata engine for the GPU with a SYCL compiler (see docs/XE.md) with its image generator, and the
+     image encoder when images are wanted (on the CPU, and on the GPU through Vulkan)
   5. downloads the model from Hugging Face (resumable), and the vision encoder if you want images
   6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes run-<model>.sh and starts the model
@@ -31,9 +31,9 @@ answers, no questions), --setup (install another model / change settings instead
 --host 0.0.0.0 --api-key KEY (reach it from other devices on your network), --experimental-speed-projection on|off
 (EXPERIMENTAL, off by default),
 --models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --check (only check this PC), --check-update
-(whether a newer XeStrata release is out), --images qwen-image|no (image generation: Qwen-Image-2.1-Turbo through
-stable-diffusion.cpp's Vulkan build, POST /v1/images/generations; --image-quant Q4_K_M|Q6_K|Q8_0, --image-backend
-vulkan|cpu, --image-gpu-policy auto|keep|shrink|unload; docs/IMAGES.md).
+(whether a newer XeStrata release is out), --images qwen-image|no (image generation: Qwen-Image-2.1-Turbo on
+XeStrata's image engine, POST /v1/images/generations; --image-quant Q4_K_M|Q6_K|Q8_0, --image-gpu-policy
+auto|keep|shrink|unload).
 
 Setup recommends, it never forces: the recommended answers are the defaults (--yes, or Enter), and a bigger choice
 than it recommends - a longer context, a size it thinks will not fit - is kept, with what it risks.  With --yes, an
@@ -448,6 +448,7 @@ def esp_download(data: Path) -> Path | None:
 VISION = {"gpu": {"max_tokens": 1024, "reserve_mib": 700},
           "cpu": {"max_tokens": 300, "reserve_mib": 700}}
 EXE = "strata.exe" if WIN else "strata"
+IMAGE_EXE = "strata-image.exe" if WIN else "strata-image"   # the image engine (serve/images.py), built with it
 # the image encoder, one binary per place it runs: the configs of different models may use different ones
 # the image encoders: on the CPU, and on the GPU through Vulkan
 VEXE = {k: v + (".exe" if WIN else "") for k, v in
@@ -2108,6 +2109,7 @@ def vulkan_missing() -> list:
 
 
 def cmake_build(src, bdir, target, defs, env=None):
+    """Configure `src` in `bdir` and build `target` (a name, or a list of names)."""
     cmake, ninja = find_tool("cmake"), find_tool("ninja")
     if cmake is None or ninja is None:
         fail("cmake / ninja not found after installing them", "run: .venv python -m pip install cmake ninja")
@@ -2121,7 +2123,8 @@ def cmake_build(src, bdir, target, defs, env=None):
     # a SYCL translation unit takes several GB to compile: as many jobs as the RAM allows, at most half the threads
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(ram_gb() // 12)))
     run(conf, env=env)
-    run([cmake, "--build", str(bdir), "--target", target, "-j", str(jobs)], env=env)
+    targets = [target] if isinstance(target, str) else list(target)
+    run([cmake, "--build", str(bdir), "--target", *targets, "-j", str(jobs)], env=env)
 
 
 ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/main/ggml")
@@ -2186,7 +2189,8 @@ def build_engine(visions, llama, comp: dict) -> Path:
             "hip_archs": comp.get("hip_archs", [])}
     if extra := engine_cmake_args():                   # (only when given: a build without them stays as it was)
         used["cmake_args"] = extra
-    engine_ok = xe and (eng / EXE).exists() and meta.get("src") == src and meta.get("compiler") == used
+    engine_ok = (xe and (eng / EXE).exists() and (eng / IMAGE_EXE).exists() and meta.get("src") == src
+                 and meta.get("compiler") == used)
     built = dict(meta.get("vision_srcs") or {}) if xe else {}
     missing = [v for v in dict.fromkeys(visions)
                if v in VEXE and not ((eng / VEXE[v]).exists() and built.get(v) == vsrc)]
@@ -2204,7 +2208,7 @@ def build_engine(visions, llama, comp: dict) -> Path:
             shutil.rmtree(bdir)                        # CMake keeps the compiler and the -D values it configured with
         say("  The engine's source changed: compiling it again (only what changed) ..." if xe and (eng / EXE).exists()
             and bdir.exists() else "  Compiling the Strata engine for the GPU (20-40 minutes, once) ...")
-        cmake_build(ROOT, bdir, "strata",
+        cmake_build(ROOT, bdir, ["strata", "strata-image"],
                     [f"-DCMAKE_CXX_COMPILER={comp['cxx']}", f"-DCMAKE_C_COMPILER={comp['cc']}",
                      f"-DSTRATA_LICENSE={comp['license']}",
                      f"-DSTRATA_CUDA_ARCHS={'auto' if comp['cuda_archs'] else ''}",
@@ -2214,6 +2218,7 @@ def build_engine(visions, llama, comp: dict) -> Path:
                      "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_PORTABLE=ON",
                      f"-DSTRATA_GGML_DIR={llama}", *(f"-D{x}" for x in used.get("cmake_args", []))], comp["env"])
         install_binary(bdir / EXE, eng / EXE)
+        install_binary(bdir / IMAGE_EXE, eng / IMAGE_EXE)
     for v in missing:
         llama_def = f"-DLLAMA_DIR={llama}"
         if v == "vulkan":
@@ -2286,12 +2291,8 @@ def update_installed_engine() -> None:
         warn(f"could not compile the updated engine{why}: starting the installed one")
 
 
-# ---- image generation (upstream 0.1.44, a5b3b6c2): stable-diffusion.cpp's sd-cli for Qwen-Image-2.1-Turbo.  XeStrata
-# builds its Vulkan backend for every GPU (the user's decision of 2026-10-14): free software on every maker's card,
-# where upstream builds CUDA and HIP ones; its SYCL backend needs oneMKL.  Linux only for now.
-IMAGE_ENGINE = ROOT / "engine-image"           # sd-cli for Qwen-Image-2.1-Turbo (tools/image/qimage.py), --images
-
-
+# ---- image generation: Qwen-Image-2.1-Turbo on XeStrata's own image engine (strata-image, built with the text
+# engine; serve/images.py).  upstream 0.1.44 (a5b3b6c2) runs stable-diffusion.cpp's sd-cli instead.
 def _qimage():
     if str(ROOT / "tools" / "image") not in sys.path:
         sys.path.insert(0, str(ROOT / "tools" / "image"))
@@ -2299,69 +2300,18 @@ def _qimage():
     return qimage
 
 
-def get_sd_cpp() -> Path:
-    """stable-diffusion.cpp and its ggml at the pinned commits (tools/image/qimage.py), as zips: no git."""
-    QI = _qimage()
-    src = ROOT / "third_party" / "stable-diffusion.cpp"
-    if QI.source_ok(src):
-        return src
-    z1 = ROOT / "third_party" / f"stable-diffusion.cpp-{QI.SD_CPP_COMMIT[:7]}.zip"
-    z2 = ROOT / "third_party" / f"sd-ggml-{QI.SD_GGML_COMMIT[:7]}.zip"
-    download(QI.SD_CPP_ZIP, z1, "stable-diffusion.cpp source")
-    download(QI.SD_GGML_ZIP, z2, "stable-diffusion.cpp's ggml source")
-    try:
-        src = QI.unpack_source(ROOT / "third_party", z1, z2)
-    finally:
-        for z in (z1, z2):
-            z.unlink(missing_ok=True)
-            z.with_name(z.name + ".done").unlink(missing_ok=True)
-    return src
-
-
-def build_image_engine(backend: str) -> Path:
-    """Compile sd-cli for `backend` (vulkan or cpu) into engine-image/ (again only when the pins or the backend
-    changed) -> its path."""
-    QI = _qimage()
-    IMAGE_ENGINE.mkdir(exist_ok=True)
-    exe, stamp = IMAGE_ENGINE / QI.SD_EXE, IMAGE_ENGINE / "BUILD.json"
-    want = QI.build_stamp(backend, None)
-    meta = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else {}
-    if exe.exists() and {k: meta.get(k) for k in want} == want:
-        ok(f"image generator already built ({backend})")
-        return exe
-    if backend == "vulkan" and (need := vulkan_missing()):   # ggml-vulkan: glslc, the Vulkan and SPIR-V headers
-        fail("compiling the image generator (Vulkan) needs the Vulkan headers, the SPIR-V headers and glslc",
-             f"install them: {install_cmd(need)} (or --image-backend cpu)")
-    src = get_sd_cpp()
-    say(f"  Compiling the image generator (stable-diffusion.cpp {QI.SD_CPP_COMMIT[:7]}, {backend}; 5-20 minutes, "
-        "once) ...")
-    bdir = ROOT / f"build-image-{backend}"
-    cmake_build(src, bdir, "sd-cli", QI.cmake_defs(backend))
-    built = bdir / "bin" / QI.SD_EXE
-    if not built.exists():
-        fail(f"the image generator's build finished without {built}", f"delete the folder {bdir.name} and run again")
-    shutil.copy2(built, exe)
-    stamp.write_text(json.dumps(want, indent=1))
-    ok(f"image generator compiled: {exe}")
-    return exe
-
-
-def setup_images(a, gpu: dict, models_dir: Path) -> dict | None:
-    """--images qwen-image: sd-cli and Qwen-Image-2.1-Turbo's three files -> the run config's "images" section
-    (serve/images.py); None for --images no, or when not wanted after all."""
+def setup_images(a, gpu: dict, models_dir: Path, eng: Path) -> dict | None:
+    """--images qwen-image: Qwen-Image-2.1-Turbo's three files for the image engine in `eng` -> the run config's
+    "images" section (serve/images.py); None for --images no, or when not wanted after all."""
     if not a.images or a.images == "no":
         return None
-    if WIN:
-        fail("image generation is set up on Linux only for now", "run setup without --images")
     QI = _qimage()
-    backend = a.image_backend or "vulkan"
-    gb = float((gpu or {}).get("vram_gb") or 0.0) if backend != "cpu" else 0.0
-    rec = QI.pick_quant(gb) if backend != "cpu" else "Q4_K_M"
-    quant = a.image_quant or rec
-    if QI.QUANTS.index(quant) > QI.QUANTS.index(rec):
-        warn(f"image model {quant}: setup recommends {rec} for {gb:.0f} GB of GPU memory; kept as you chose "
-             "(stable-diffusion.cpp then keeps part of it in RAM, which is slower)")
-    say(f"  Image generation: Qwen-Image-2.1-Turbo {quant} on {backend} (8 steps, CFG 1; POST /v1/images/generations)")
+    exe = eng / IMAGE_EXE
+    if not exe.exists():
+        fail(f"the image engine is missing ({exe})", "run setup again to compile the engine (it builds both)")
+    quant = a.image_quant or QI.DEFAULT_QUANT
+    say(f"  Image generation: Qwen-Image-2.1-Turbo {quant} on XeStrata's image engine (8 steps; "
+        "POST /v1/images/generations)")
     say("  " + QI.LICENSE_NOTE)
     need = sum(QI.FILES[k][2] for k in (quant, "vae", "llm")) / 1e9
     if ask(f"Download the image model ({need:.1f} GB) and set up image generation?", ["y", "n"], "y", a.yes) != "y":
@@ -2369,22 +2319,14 @@ def setup_images(a, gpu: dict, models_dir: Path) -> dict | None:
     models_dir.mkdir(parents=True, exist_ok=True)
     if free_gb(models_dir) < need + 5:
         warn(f"less than {need + 5:.0f} GB free for the image model: the download may run out of disk space")
-    exe = build_image_engine(backend)
     for name in (quant, "vae", "llm"):
         repo, path, size, sha = QI.FILES[name]
         dst = QI.local_path(models_dir, name)
         download(QI.file_url(name, hf_endpoint()), dst, f"image model: {Path(path).name}")
         verify_sha256(dst, size, sha)
-    cfg = QI.image_config(backend, quant, exe, models_dir, uma=bool(gpu.get("integrated")),
+    cfg = QI.image_config(quant, exe, models_dir, uma=bool((gpu or {}).get("integrated")),
                           policy=a.image_gpu_policy or "auto")
-    if backend == "vulkan":
-        say("  Timing the image generator on this GPU (flash attention and the VAE's convolutions; about a minute) ...")
-        QI.tune(cfg, say)
-        if "tuned" in cfg:
-            tu = cfg["tuned"]
-            ok(f"image generator: flash attention {'on' if tu['flash_attention'] else 'off'}, the VAE's convolutions "
-               f"{'computed directly' if tu['vae_conv_direct'] else 'through im2col'} (the faster forms here)")
-    ok(f"image generation: {quant} on {backend}, GPU policy {cfg['gpu_policy']}")
+    ok(f"image generation: {quant}, GPU policy {cfg['gpu_policy']}")
     return cfg
 
 
@@ -4061,12 +4003,11 @@ def main() -> int:
                          "the CPU): more reads small text and charts better, and takes longer to encode; remembered "
                          "for this model")
     ap.add_argument("--images", choices=["qwen-image", "no"],
-                    help="image generation (POST /v1/images/generations): Qwen-Image-2.1-Turbo through "
-                         "stable-diffusion.cpp, compiled here; no = take it out of the config (docs/IMAGES.md)")
+                    help="image generation (POST /v1/images/generations): Qwen-Image-2.1-Turbo on XeStrata's image "
+                         "engine; no = take it out of the config")
     ap.add_argument("--image-quant", choices=["Q4_K_M", "Q6_K", "Q8_0"],
-                    help="the image model's size (default by GPU memory: Q4_K_M up to 8 GB, Q6_K up to 12, Q8_0 above)")
-    ap.add_argument("--image-backend", choices=["vulkan", "cpu"],
-                    help="where images are made (default: vulkan, on the GPU of any maker)")
+                    help="the image model's size (default Q8_0; the smaller ones save disk and RAM, the GPU's memory "
+                         "does not need them)")
     ap.add_argument("--image-gpu-policy", choices=["auto", "keep", "shrink", "unload"],
                     help="what the text model does during an image job (default auto: stays loaded when both fit, "
                          "else gives VRAM back or is unloaded and its conversation restored afterwards)")
@@ -4952,7 +4893,7 @@ def main() -> int:
     elif a.vision_tokens is not None:
         warn("--vision-tokens: images are off for this model, so it is not used")
     if a.images:                                       # only when given: else an earlier "images" is carried over
-        cfg["images"] = setup_images(a, gpu, Path(a.models_dir))
+        cfg["images"] = setup_images(a, gpu, Path(a.models_dir), Path(cfg["exe"]).parent)
     return finish_setup(a, cfg, tag, port, adopted, vision != "none",
                         notes=agent_cache_note(cfg["args"], ram, MODELS[model]["ram_gb"]))
 
