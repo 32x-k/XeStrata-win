@@ -63,6 +63,8 @@ public:
     void finish(sycl::queue& queue);
     // Drains compute, transfer and every engine stream.
     void finish();
+    // finish() on every runtime made so far (it makes none), errors ignored: before the process ends on a signal.
+    static void finish_all() noexcept;
     // Exceptional teardown cannot unwind past memory still in use by the GPU.
     void free(void* pointer) noexcept;
     // Builds every kernel the binary carries for the device, on a thread of its own (the program: strata generate),

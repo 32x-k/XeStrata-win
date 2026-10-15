@@ -2064,9 +2064,18 @@ void route_stop_signals() {
     sigaddset(&set, SIGTERM);
     sigaddset(&set, SIGINT);
     if (pthread_sigmask(SIG_BLOCK, &set, nullptr) != 0) return;
+    // The GPUs' queues are drained first, for at most 5 s: on the B70 (xe driver) a copy-engine job still queued when
+    // the process ended read memory the exit had unmapped (an engine memory fault, and a reset).  Of 7 engines ended
+    // as everyday use's bench ends them (the server's process group at once) 4 faulted, with STRATA_COPY_ENGINE=0 as
+    // well (the runtime's own copies), and none once drained, 2026-10-15.
     std::thread([set] {
         int sig = 0;
         while (sigwait(&set, &sig) != 0) {}
+        std::thread([sig] {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            _exit(128 + sig);
+        }).detach();
+        strata::core::Runtime::finish_all();
         _exit(128 + sig);
     }).detach();
 #endif
