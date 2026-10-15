@@ -44,6 +44,13 @@ struct QiPlan {
     bool vae_tiled = false, text_cached = false;
 };
 
+/// The VRAM an image needs (bytes): `least`, the budget it runs in at all (the layers streamed, the MLP in bands, the
+/// VAE in tiles); `full`, the budget with the DiT's blocks resident and the VAE in one piece (the encoder, run once a
+/// prompt, streamed); `held`, what the engine holds now; `free`, the device's free VRAM.
+struct QiNeed {
+    uint64_t least = 0, full = 0, held = 0, free = 0;
+};
+
 class QiPipeline {
 public:
     bool open(const std::string& dit, const std::string& vae, const std::string& text, std::string& err);
@@ -60,6 +67,9 @@ public:
     void fit(uint64_t reserve);
     /// What the engine holds on the GPU now (an estimate of its own buffers).
     uint64_t held() const;
+
+    /// What an image of n_text prompt ids (after the system turn) at width x height needs (the parts opened).
+    QiNeed need(int64_t n_text, int64_t width, int64_t height);
 
     /// RGBA8 [height][width][4] of the request.  `step`: the DiT's progress (QiDit::sample), false to stop.
     std::vector<uint8_t> generate(const QiRequest& r, QiTimes* times = nullptr, QiPlan* plan = nullptr,

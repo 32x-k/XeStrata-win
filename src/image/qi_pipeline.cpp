@@ -83,6 +83,23 @@ void QiPipeline::fit(uint64_t reserve) {
     set_budget(have > reserve ? have - reserve : 0);
 }
 
+QiNeed QiPipeline::need(int64_t n_text, int64_t width, int64_t height) {
+    ensure_open();
+    const int64_t h = height / 16, w = width / 16, T = n_text + h * w;
+    const uint64_t fixed = dit_->weight_bytes() + vae_->weight_bytes() + kScratch;
+    QiNeed n;
+    n.least = fixed + std::max(dit_->activation_bytes(T, 512), vae_->scratch_min()) + dit_->block_min() +
+              te_->layer_min();
+    // the DiT's blocks resident (used 8 times an image), the encoder streamed (once a prompt), the VAE in one piece
+    n.full = fixed + dit_->block_bytes() + te_->layer_min() +
+             std::max(dit_->activation_bytes(T), vae_->scratch_bytes(h, w));
+    n.held = held();
+    size_t free = 0, total = 0;
+    gpu::mem_info(&free, &total);
+    n.free = free;
+    return n;
+}
+
 void QiPipeline::set_budget(uint64_t bytes) {
     budget_ = bytes;
     if (!(dit_ && vae_ && te_)) return;   // released: the next request plans with it
@@ -187,6 +204,13 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
         if (vae_->scratch_bytes(h, w) > vae_room) {
             dit_->drop_activations();
             vae_room = p.vae;
+        }
+        if (vae_->scratch_bytes(h, w) > vae_room && te_->layers_vram() > 0) {
+            // the encoder's layers too (the next prompt streams them back; the same prompt's states are kept)
+            te_->drop_layers();
+            te_set_ = 0;
+            vae_room += p.layers;
+            p.vae_tiled = vae_->scratch_bytes(h, w) > vae_room;
         }
         vae_->decode(x, h, w, rgba, vae_room);
         if (p.vae_tiled) vae_->drop_scratch();   // a tile's buffers: not worth keeping beside the layers

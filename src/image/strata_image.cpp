@@ -14,6 +14,9 @@
 // (serve/images.py), one at a time, answering each on stdout:
 //   IMG <width> <height> <seed> <drop> <out path> <ids, commas>   -> STEP <done> <steps> lines, then
 //                                                                    IMAGE key=value ... (times, the budget's split)
+//   NEED <width> <height> <n> the VRAM an image of n prompt ids needs (the parts opened)    -> NEED least_mib=...
+//                            full_mib=... held_mib=... free_mib=... (si::QiNeed)
+//   FREE                     the free VRAM and what the engine holds                        -> FREE free_mib=... held_mib=...
 //   BUDGET <MiB>             the VRAM the engine may take (0: the free VRAM at its start)      -> BUDGET budget_mib=...
 //   FIT <MiB>                the budget: what the engine holds and the free VRAM, less <MiB>  -> BUDGET budget_mib=...
 //   RELEASE [ALL]            frees the layers, activations and buffers (the cache); ALL also the parts' fixed weights
@@ -23,6 +26,7 @@
 // A request that fails answers ERROR <message> and the engine goes on.  Before the first line it makes a small image
 // (its kernels built and the library's first products set up) and lets its buffers go, then says READY budget_mib=<M>.
 
+#include "strata/core/gpu.hpp"
 #include "strata/image/qi_pipeline.hpp"
 
 #include <atomic>
@@ -138,6 +142,19 @@ int serve(si::QiPipeline& p) {
                 });
                 write_file(out, img);
                 std::printf("IMAGE %s\n", plan_kv(t, pl).c_str());
+            } else if (op == "NEED") {
+                int64_t w = 0, h = 0, n = 0;
+                ls >> w >> h >> n;
+                if (!ls) throw std::invalid_argument("NEED <width> <height> <n>");
+                const si::QiNeed nd = p.need(n, w, h);
+                std::printf("NEED least_mib=%llu full_mib=%llu held_mib=%llu free_mib=%llu\n",
+                            (unsigned long long) (nd.least >> 20), (unsigned long long) (nd.full >> 20),
+                            (unsigned long long) (nd.held >> 20), (unsigned long long) (nd.free >> 20));
+            } else if (op == "FREE") {
+                size_t free = 0, total = 0;
+                strata::gpu::mem_info(&free, &total);
+                std::printf("FREE free_mib=%llu held_mib=%llu\n", (unsigned long long) (free >> 20),
+                            (unsigned long long) (p.held() >> 20));
             } else if (op == "BUDGET") {
                 uint64_t mib = 0;
                 ls >> mib;
