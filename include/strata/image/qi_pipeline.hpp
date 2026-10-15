@@ -15,6 +15,7 @@
 #include "strata/image/qi_dit.hpp"
 #include "strata/image/qi_text.hpp"
 #include "strata/image/qi_vae.hpp"
+#include "strata/image/qi_vision.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -24,13 +25,27 @@
 
 namespace strata::image {
 
+/// An edit's reference image: RGBA8 [height][width][4] as read (qi_image_io).
+struct QiRef {
+    std::vector<uint8_t> rgba;
+    int64_t width = 0, height = 0;
+};
+
 struct QiRequest {
-    std::vector<int32_t> ids;   // the prompt in the model's chat form, tokenized
+    std::vector<int32_t> ids;   // the prompt in the model's chat form, tokenized; an edit's one <|image_pad|> per ref
     int64_t drop = 0;           // the leading ids whose states the DiT does not take (the system turn)
     int64_t width = 1024, height = 1024;   // multiples of 16
     uint64_t seed = 0;
     std::vector<float> sigmas;  // empty: Turbo's 8 steps
+    std::vector<QiRef> refs;    // an edit's reference images, in the order of their pads
 };
+
+/// The size an edit's reference image is worked at: the target's pixel count, the reference's shape, sides rounded to
+/// multiples of 32 (as stable-diffusion.cpp sizes it for Qwen-Image-2.1).
+void qi_ref_size(int64_t ref_w, int64_t ref_h, int64_t width, int64_t height, int64_t& w, int64_t& h);
+
+/// The token id of <|image_pad|> in Qwen3-VL's vocabulary.
+constexpr int32_t kImagePad = 151655;
 
 struct QiTimes {
     double text = 0, sampling = 0, decode = 0;
@@ -54,7 +69,8 @@ struct QiNeed {
 class QiPipeline {
 public:
     /// Reads the parts' files for their sizes; the parts go on the GPU with the first request (ensure_open).
-    bool open(const std::string& dit, const std::string& vae, const std::string& text, std::string& err);
+    bool open(const std::string& dit, const std::string& vae, const std::string& text, std::string& err,
+              const std::string& vision = "");
 
     /// The VRAM the engine may take (0: the free VRAM at open, less a margin, within STRATA_VRAM_LIMIT_MIB).
     void set_budget(uint64_t bytes);
@@ -70,8 +86,9 @@ public:
     uint64_t held() const;
 
     /// What an image of n_text prompt ids (after the system turn) at width x height needs (from the parts' sizes:
-    /// nothing put on the GPU).
-    QiNeed need(int64_t n_text, int64_t width, int64_t height);
+    /// nothing put on the GPU); refs: an edit's reference images' sizes (width, height as read).
+    QiNeed need(int64_t n_text, int64_t width, int64_t height,
+                const std::vector<std::pair<int64_t, int64_t>>& refs = {});
 
     /// RGBA8 [height][width][4] of the request.  `step`: the DiT's progress (QiDit::sample), false to stop.
     std::vector<uint8_t> generate(const QiRequest& r, QiTimes* times = nullptr, QiPlan* plan = nullptr,
@@ -81,9 +98,13 @@ private:
     QiPlan plan(int64_t T, int64_t h, int64_t w);
 
     void ensure_open();
+    void edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::vector<QiVisionOut>& vouts,
+                   std::vector<QiText::Image>& te_images, std::vector<QiDit::Ref>& dit_refs, std::vector<float*>& ref_z);
 
     void* s_ = nullptr;
-    std::string dit_path_, vae_path_, text_path_;
+    std::string dit_path_, vae_path_, text_path_, vision_path_;
+    std::unique_ptr<QiVision> vision_;           // an edit's, opened for it and let go after it
+    std::unique_ptr<QiVision> vision_size_;
     std::unique_ptr<QiText> te_;
     std::unique_ptr<QiDit> dit_;
     std::unique_ptr<QiVae> vae_;
