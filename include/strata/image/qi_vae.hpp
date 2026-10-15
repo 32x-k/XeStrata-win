@@ -24,7 +24,8 @@ public:
     QiVae& operator=(const QiVae&) = delete;
 
     /// Reads the VAE's safetensors (the diffusers names) and puts the decoder's weights on the current GPU.
-    bool open(const std::string& path, void* stream, std::string& err);
+    /// `dry`: read for its sizes only (weight_bytes, scratch_bytes), nothing put on the GPU; such a part cannot run.
+    bool open(const std::string& path, void* stream, std::string& err, bool dry = false);
 
     /// rgba [4][16 h][16 w] (device FP32, 0 .. 1) from the DiT's latent z [64][h][w] (device FP32).  When the whole
     /// image's working memory (scratch_bytes) passes `max_scratch`, the latent is decoded in overlapping tiles (the
@@ -70,6 +71,7 @@ private:
     prefill::Gemm gemm_;
     std::vector<void*> allocs_;
     uint64_t weight_bytes_ = 0;
+    bool dry_ = false;
     const float *mean_ = nullptr, *std_ = nullptr;
     Conv pq_, cin_, cout_;
     Res mid0_, mid1_;

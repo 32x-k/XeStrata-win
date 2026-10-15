@@ -41,7 +41,7 @@ QiText::~QiText() {
     for (void* p : allocs_) gpu::free(p);
 }
 
-bool QiText::open(const std::string& path, void* stream, std::string& err) {
+bool QiText::open(const std::string& path, void* stream, std::string& err, bool dry) {
     try {
         s_ = stream;
         g_ = std::make_unique<GgufFile>(path);
@@ -106,6 +106,7 @@ bool QiText::open(const std::string& path, void* stream, std::string& err) {
             for (const W* w : {&l.q, &l.k, &l.v, &l.o, &l.gate, &l.up, &l.down}) scratch = std::max(scratch, w->n * w->k);
             layers_.push_back(l);
         }
+        if (dry) return true;
         if (!gemm_.init(s_, scratch, err)) return false;
         layers_stream_.configure(layers_stream_.total(), s_);   // all resident until a budget is set
         return true;

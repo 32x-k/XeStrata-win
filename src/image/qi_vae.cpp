@@ -222,6 +222,11 @@ QiVae::Conv QiVae::conv_w(SafeTensors& st, const std::string& name) {
     c.out = t->shape[0];
     c.in = t->shape[1];
     c.k = t->shape[2];
+    if (dry_) {
+        weight_bytes_ += (uint64_t) (c.out * c.k * c.k * c.in) * 2;
+        c.b = vec(st, name + ".bias");
+        return c;
+    }
     const auto w = st.f32(name + ".weight");   // [out][in][k][k]
     std::vector<uint16_t> h((size_t) (c.out * c.k * c.k * c.in));
     for (int64_t o = 0; o < c.out; ++o)
@@ -239,6 +244,12 @@ QiVae::Conv QiVae::conv_w(SafeTensors& st, const std::string& name) {
 }
 
 const float* QiVae::vec(SafeTensors& st, const std::string& name) {
+    if (dry_) {
+        const SafeTensor* t = st.find(name);
+        if (t == nullptr) throw std::runtime_error("image engine (VAE): no " + name);
+        weight_bytes_ += (uint64_t) t->elements() * 4;
+        return nullptr;
+    }
     const auto v = st.f32(name);
     float* d = alloc<float>(allocs_, (int64_t) v.size());
     gpu::copy(d, v.data(), v.size() * 4);
@@ -256,14 +267,17 @@ QiVae::Res QiVae::res_w(SafeTensors& st, const std::string& p) {
     return r;
 }
 
-bool QiVae::open(const std::string& path, void* stream, std::string& err) {
+bool QiVae::open(const std::string& path, void* stream, std::string& err, bool dry) {
     try {
         s_ = stream;
+        dry_ = dry;
         SafeTensors st(path);
-        mean_ = alloc<float>(allocs_, 64);
-        std_ = alloc<float>(allocs_, 64);
-        gpu::copy((void*) mean_, kMean, sizeof(kMean));
-        gpu::copy((void*) std_, kStd, sizeof(kStd));
+        if (!dry_) {
+            mean_ = alloc<float>(allocs_, 64);
+            std_ = alloc<float>(allocs_, 64);
+            gpu::copy((void*) mean_, kMean, sizeof(kMean));
+            gpu::copy((void*) std_, kStd, sizeof(kStd));
+        }
         pq_ = conv_w(st, "post_quant_conv");
         cin_ = conv_w(st, "decoder.conv_in");
         mid0_ = res_w(st, "decoder.mid_block.resnets.0.");
@@ -279,6 +293,7 @@ bool QiVae::open(const std::string& path, void* stream, std::string& err) {
         }
         gout_ = vec(st, "decoder.norm_out.gamma");
         cout_ = conv_w(st, "decoder.conv_out");
+        if (dry_) return true;
         if (!gemm_.init(s_, 16, err)) return false;
         return true;
     } catch (const std::exception& e) {

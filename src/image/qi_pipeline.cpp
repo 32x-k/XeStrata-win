@@ -35,12 +35,12 @@ bool QiPipeline::open(const std::string& dit, const std::string& vae, const std:
     text_path_ = text;
     size_t free = 0, total = 0;
     gpu::mem_info(&free, &total);
-    try {
-        ensure_open();
-    } catch (const std::exception& e) {
-        err = e.what();
+    te_size_ = std::make_unique<QiText>();
+    dit_size_ = std::make_unique<QiDit>();
+    vae_size_ = std::make_unique<QiVae>();
+    if (!(te_size_->open(text, s_, err, true) && dit_size_->open(dit, s_, err, true) &&
+          vae_size_->open(vae, s_, err, true)))
         return false;
-    }
     // the budget a request plans with: what was free before the parts, less a margin, within the small-card limit the
     // engine takes too
     auto_budget_ = free > kMargin ? (uint64_t) free - kMargin : 0;
@@ -84,15 +84,15 @@ void QiPipeline::fit(uint64_t reserve) {
 }
 
 QiNeed QiPipeline::need(int64_t n_text, int64_t width, int64_t height) {
-    ensure_open();
+    const QiDit& dit = *dit_size_;
+    const QiText& te = *te_size_;
+    const QiVae& vae = *vae_size_;
     const int64_t h = height / 16, w = width / 16, T = n_text + h * w;
-    const uint64_t fixed = dit_->weight_bytes() + vae_->weight_bytes() + kScratch;
+    const uint64_t fixed = dit.weight_bytes() + vae.weight_bytes() + kScratch;
     QiNeed n;
-    n.least = fixed + std::max(dit_->activation_bytes(T, 512), vae_->scratch_min()) + dit_->block_min() +
-              te_->layer_min();
+    n.least = fixed + std::max(dit.activation_bytes(T, 512), vae.scratch_min()) + dit.block_min() + te.layer_min();
     // the DiT's blocks resident (used 8 times an image), the encoder streamed (once a prompt), the VAE in one piece
-    n.full = fixed + dit_->block_bytes() + te_->layer_min() +
-             std::max(dit_->activation_bytes(T), vae_->scratch_bytes(h, w));
+    n.full = fixed + dit.block_bytes() + te.layer_min() + std::max(dit.activation_bytes(T), vae.scratch_bytes(h, w));
     n.held = held();
     size_t free = 0, total = 0;
     gpu::mem_info(&free, &total);

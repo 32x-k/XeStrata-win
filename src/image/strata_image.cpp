@@ -14,7 +14,7 @@
 // (serve/images.py), one at a time, answering each on stdout:
 //   IMG <width> <height> <seed> <drop> <out path> <ids, commas>   -> STEP <done> <steps> lines, then
 //                                                                    IMAGE key=value ... (times, the budget's split)
-//   NEED <width> <height> <n> the VRAM an image of n prompt ids needs (the parts opened)    -> NEED least_mib=...
+//   NEED <width> <height> <n> the VRAM an image of n prompt ids needs (from the files)     -> NEED least_mib=...
 //                            full_mib=... held_mib=... free_mib=... (si::QiNeed)
 //   FREE                     the free VRAM and what the engine holds                        -> FREE free_mib=... held_mib=...
 //   BUDGET <MiB>             the VRAM the engine may take (0: the free VRAM at its start)      -> BUDGET budget_mib=...
@@ -24,7 +24,8 @@
 //   STOP                     (while an IMG runs) ends it after the step it is in               -> ERROR stopped
 //   QUIT                     ends the engine
 // A request that fails answers ERROR <message> and the engine goes on.  Before the first line it makes a small image
-// (its kernels built and the library's first products set up) and lets its buffers go, then says READY budget_mib=<M>.
+// (its kernels built and the library's first products set up; skipped when the GPU has no room) and lets its buffers
+// go, then says READY budget_mib=<M>.
 
 #include "strata/core/gpu.hpp"
 #include "strata/image/qi_pipeline.hpp"
@@ -106,12 +107,17 @@ struct Lines {
 };
 
 int serve(si::QiPipeline& p) {
-    {   // the warm-up: a 256 x 256 image of one step from token ids the vocabulary has
+    {   // the warm-up: a 256 x 256 image of one step from token ids the vocabulary has; where the GPU has no room
+        // for it now (another program holds it), the first request builds the kernels instead
         si::QiRequest r;
         for (int32_t i = 1; i <= 16; ++i) r.ids.push_back(i * 100);
         r.width = r.height = 256;
         r.sigmas = {1.0f, 0.0f};
-        p.generate(r);
+        try {
+            p.generate(r);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata-image: no warm-up (%s)\n", e.what());
+        }
         p.release(true);   // idle, the engine holds next to nothing on the GPU: the first request opens the parts
     }
     std::printf("READY budget_mib=%llu\n", (unsigned long long) (p.budget() >> 20));

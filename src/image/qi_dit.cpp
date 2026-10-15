@@ -99,6 +99,12 @@ QiDit::W QiDit::upload(const std::string& name) {
     w.n = t->shape.size() > 1 ? (int64_t) t->shape[1] : 1;
     const uint64_t bytes = tensor_payload_bytes(*t);
     if (bytes == 0) throw std::runtime_error("image engine: " + name + ": unknown type " + std::to_string(t->type));
+    if ((int) t->type == kTypeF32 && w.n > 1 && dry_) {
+        w.type = kTypeF16;
+        w.row_bytes = (uint64_t) w.k * 2;
+        weight_bytes_ += (uint64_t) (w.n * w.k) * 2;
+        return w;
+    }
     if ((int) t->type == kTypeF32 && w.n > 1) {   // a matrix in FP32 goes to the GPU as FP16 (the products take it)
         std::vector<uint16_t> h((size_t) (w.n * w.k));
         const auto* f = reinterpret_cast<const float*>(g_->tensor_data(*t));
@@ -111,12 +117,13 @@ QiDit::W QiDit::upload(const std::string& name) {
         weight_bytes_ += h.size() * 2;
         return w;
     }
-    uint8_t* d = alloc<uint8_t>(allocs_, (int64_t) bytes);
-    put(d, g_->tensor_data(*t), bytes);
     w.type = (int) t->type;
-    w.d = d;
     w.row_bytes = bytes / (uint64_t) w.n;
     weight_bytes_ += bytes;
+    if (dry_) return w;
+    uint8_t* d = alloc<uint8_t>(allocs_, (int64_t) bytes);
+    put(d, g_->tensor_data(*t), bytes);
+    w.d = d;
     return w;
 }
 
@@ -124,6 +131,10 @@ const float* QiDit::upload_f32(const std::string& name, float add) {
     const TensorInfo* t = g_->find("model.diffusion_model." + name);
     if (t == nullptr) throw std::runtime_error("image engine: the DiT has no " + name);
     const auto n = (int64_t) t->elements();
+    if (dry_) {
+        weight_bytes_ += (uint64_t) n * 4;
+        return nullptr;
+    }
     std::vector<float> h((size_t) n);
     const uint8_t* src = g_->tensor_data(*t);
     if ((int) t->type == kTypeF32) std::memcpy(h.data(), src, (size_t) n * 4);
@@ -137,9 +148,10 @@ const float* QiDit::upload_f32(const std::string& name, float add) {
     return d;
 }
 
-bool QiDit::open(const std::string& path, void* stream, std::string& err) {
+bool QiDit::open(const std::string& path, void* stream, std::string& err, bool dry) {
     try {
         s_ = stream;
+        dry_ = dry;
         g_ = std::make_unique<GgufFile>(path);
         iin_ = upload("img_in.weight");
         in_ch_ = iin_.k;
@@ -194,6 +206,7 @@ bool QiDit::open(const std::string& path, void* stream, std::string& err) {
         heads_ = C_ / kHead;
         for (const W* w : {&t1_, &t2_, &mod_, &nout_, &pout_, &tin_, &tout_, &iin_})
             scratch = std::max(scratch, w->n * w->k);
+        if (dry_) return true;
         if (!gemm_.init(s_, scratch, err)) return false;
         blocks_stream_.configure(blocks_stream_.total(), s_);   // all resident until a budget is set
         temb_ = alloc<float>(allocs_, 2 * C_);

@@ -45,7 +45,9 @@ public:
     QiDit& operator=(const QiDit&) = delete;
 
     /// Reads the DiT's GGUF (mapped) and puts its weights on the current GPU.  False with `err` on failure.
-    bool open(const std::string& path, void* stream, std::string& err);
+    /// `dry`: the file read for its sizes only (block_bytes, weight_bytes, activation_bytes...: what a budget is
+    /// planned with), nothing put on the GPU; such a part cannot run.
+    bool open(const std::string& path, void* stream, std::string& err, bool dry = false);
 
     /// The text encoder's states [n_text][4096] (host FP32): projected into the sequence's text rows; the prefix
     /// cache starts again.
@@ -107,6 +109,7 @@ private:
     prefill::Gemm gemm_;
     std::vector<void*> allocs_;
     uint64_t weight_bytes_ = 0;
+    bool dry_ = false;
     int64_t C_ = 4096, in_ch_ = 64, heads_ = 32, inter_ = 12288, n_text_ = 0;
     W t1_, t2_, mod_, nout_, pout_, tin_, tout_, iin_;
     const float* tnorm_ = nullptr;

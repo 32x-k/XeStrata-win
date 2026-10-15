@@ -26,7 +26,8 @@ public:
     QiText(const QiText&) = delete;
     QiText& operator=(const QiText&) = delete;
 
-    bool open(const std::string& path, void* stream, std::string& err);
+    /// `dry`: read for its sizes only (layer_bytes, layer_min), nothing put on the GPU; such a part cannot run.
+    bool open(const std::string& path, void* stream, std::string& err, bool dry = false);
 
     /// The last block's output [ids.size()][hidden] (host FP32) for the prompt's token ids.
     std::vector<float> encode(const std::vector<int32_t>& ids);

@@ -53,6 +53,7 @@ struct QiNeed {
 
 class QiPipeline {
 public:
+    /// Reads the parts' files for their sizes; the parts go on the GPU with the first request (ensure_open).
     bool open(const std::string& dit, const std::string& vae, const std::string& text, std::string& err);
 
     /// The VRAM the engine may take (0: the free VRAM at open, less a margin, within STRATA_VRAM_LIMIT_MIB).
@@ -68,7 +69,8 @@ public:
     /// What the engine holds on the GPU now (an estimate of its own buffers).
     uint64_t held() const;
 
-    /// What an image of n_text prompt ids (after the system turn) at width x height needs (the parts opened).
+    /// What an image of n_text prompt ids (after the system turn) at width x height needs (from the parts' sizes:
+    /// nothing put on the GPU).
     QiNeed need(int64_t n_text, int64_t width, int64_t height);
 
     /// RGBA8 [height][width][4] of the request.  `step`: the DiT's progress (QiDit::sample), false to stop.
@@ -85,6 +87,10 @@ private:
     std::unique_ptr<QiText> te_;
     std::unique_ptr<QiDit> dit_;
     std::unique_ptr<QiVae> vae_;
+    // the parts read for their sizes only (open, dry): what an image needs is known with nothing on the GPU
+    std::unique_ptr<QiText> te_size_;
+    std::unique_ptr<QiDit> dit_size_;
+    std::unique_ptr<QiVae> vae_size_;
     uint64_t budget_ = 0, auto_budget_ = 0;
     uint64_t dit_set_ = 0, te_set_ = 0;
     int64_t mlp_set_ = -1;
