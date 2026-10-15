@@ -6,7 +6,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 [English](BENCH.md) | 日本語
 
-XeStrata の速さは 3 つの測り方で測ります。
+XeStrata の速さは 3 つの測り方で測り、画像の生成を入れた PC ではその速さも測ります。
 利用者の `xestrata --bench` と、開発者の upstream 追従の計測は、同じ実装（`tools/bench_core.py`）で、同じプロンプト・会話・設定を使います。
 そのため、利用者の記録と開発機の記録を同じ表で比べられます。
 
@@ -15,6 +15,7 @@ XeStrata の速さは 3 つの測り方で測ります。
 | generate | `strata` を 1 回ずつ起動し、段のプロンプトを読んで 256 トークン書く（greedy） | カーネルと推測デコードの速さ |
 | serve | `strata --serve` に標準入力で 4 ターンのチャットを送る（段のプロンプトと、続きの質問 3 つ。1 ターン 256 トークン） | サーバーの出力ループと会話のチェックポイント（続きのターンの待ち時間） |
 | 通常使用 | `serve/server.py` を起動し、`/v1/chat/completions` にストリーミングで送る | 利用者が使う経路全体（チャットテンプレート、思考、ツール呼び出し） |
+| 画像の生成 | サーバーと同じ `sd-cli` のコマンドで、決まったプロンプトと種（42）から 1024×1024・8 ステップの画像を 1 枚ずつ作る | 1 枚の時間と、そのうちのサンプリングと VAE の時間 |
 
 段は、コーディングエージェントのプロンプト（XeStrata のソース 58dbbe5 を読ませたもの）の長さで、1K・4K・32K・64K・128K・192K・262K があります。
 各段の設定は、setup がその文脈に書くもの（8K を超えると K/V を INT8、64K 以上で `--kv-resident 32768`）です。
@@ -38,6 +39,7 @@ xestrata --bench --original-strata v0.1.41        # 同じモデルで upstream 
 - 測っている間は GPU を使います。xestrata のサーバーが動いていれば、止めるように言って終わります。
 - generate と serve の段は 64K・32K・1K のうち、設定の文脈に入るものです。通常使用は設定の文脈のまま測ります。
 - 複数の GPU に層を分けた設定では、generate と serve は測らず、通常使用だけを測ります。
+- 設定に画像の生成（`"images"`）があれば、最後にその設定のまま画像の生成を測ります（数分）。
 - 記録はデータフォルダの `records/bench-<日時>/` に書きます。どこにも送りません。
 
 | ファイル | 中身 |
@@ -45,7 +47,7 @@ xestrata --bench --original-strata v0.1.41        # 同じモデルで upstream 
 | `summary.md` | 報告に貼る要約（貼る前に中身を確かめてください） |
 | `record.json` | 機械、選ばれた経路、計測の全部 |
 | `tables.md` | 3 つの測り方の表 |
-| `runs/`・`serve-runs/`・`usage-runs/` | 1 回ずつのログ |
+| `runs/`・`serve-runs/`・`usage-runs/`・`image-runs/` | 1 回ずつのログ（画像は作った画像も） |
 
 ### --original-strata
 
@@ -60,6 +62,7 @@ xestrata --bench --original-strata v0.1.41        # 同じモデルで upstream 
 
 - NVIDIA の配布物と Intel の Docker イメージは自由ソフトウェアでないので、free のビルドでは NVIDIA と Intel の比較はしません。
 - upstream が 10 tok/s 以下と分かった欄は、その段の途中で止めて比べません（「止まった回」に出ます）。
+- 画像の生成は、取ってきた upstream のツリーで upstream の setup が `sd-cli` を作ってあるとき（`engine-image/`）だけ並べ、upstream の setup と同じ設定で動かします。
 
 ## xestrata --bench-original-compat
 

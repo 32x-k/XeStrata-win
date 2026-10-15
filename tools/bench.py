@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Setup's --bench: XeStrata's speed on this PC, measured as the upstream merges measure it (tools/bench_core.py:
-generate, serve and everyday use, two rounds each by default), and what a developer needs to read the numbers:
-the machine, the paths the engine chose, where the time goes.  With --original-strata TAG, upstream Strata's release
-TAG runs beside it on the same model files, the two taking turns.
+generate, serve and everyday use, two rounds each by default, and image generation where the config has it), and
+what a developer needs to read the numbers: the machine, the paths the engine chose, where the time goes.  With
+--original-strata TAG, upstream Strata's release TAG runs beside it on the same model files, the two taking turns.
 
 The record goes to <data>/records/bench-<time>/ in the upstream merges' layout (runs/, serve-runs/, usage-runs/,
 matrix*.json, which their sync_collect.py and judge.py read), with record.json (everything, this PC's names taken
@@ -493,6 +493,11 @@ def summary_md(rec: dict) -> str:
                                          ("decode_tok_s", "出力 (tok/s)", "pct"))]
         t = rec.get("temperature", C.TEMPERATURE)
         out += table(f"usage（server.py 経由、{'greedy' if not t else f'温度 {t:g}、top_p 0.8、top_k 20'}）", rows, names)
+    img = mx.get("image") or []
+    if img:
+        rows = [(label, "lower", [med(img, key, engine=n) for n in names])
+                for key, label in (("seconds", "1 枚 (s)"), ("sampling_s", "サンプリング (s)"), ("decode_s", "VAE (s)"))]
+        out += table("画像の生成（1024×1024、8 ステップ、種 42）", rows, names)
     stopped = [f"generate {r['engine']} {r['tier']} {r['round']}: {r['stopped']}" for r in gen if r.get("stopped")]
     stopped += [f"serve {r['engine']} {r['tier']} {r['mode']} {r['round']}: {r['stopped']}" for r in srv
                 if r.get("stopped")]
@@ -624,12 +629,32 @@ def run(cfg_path: Path, data: Path, gpus: list[dict], verbose: bool = False, ori
     say("  everyday use (the merges' bench_usage.py) ...")
     C.ab_usage(out, GPU_LABEL, engines, usage_cfg, ctx, corpus["agent"], rounds=rounds, on_run=tagged,
                temperature=temperature)
+    if cfg.get("images"):
+        # this PC's "images" section as setup wrote it; beside upstream, its own image generator where its setup
+        # built one (engine-image/BUILD.json names the backend), configured as its setup configures it
+        img = [C.Engine(xe.name, "xe", [], "", root=ROOT, py=sys.executable)]
+        cfgs = {"xe": cfg["images"]}
+        up_root = engines[1].root if len(engines) > 1 else None
+        stamp = Path(up_root) / "engine-image" / "BUILD.json" if up_root else None
+        if up_root is not None and stamp is not None and stamp.exists():
+            meta = json.loads(stamp.read_text())
+            u = C.Engine(engines[1].name, "up", [], "", root=Path(up_root), py=sys.executable)
+            c = C.image_config(u, meta.get("backend", "vulkan"), cfg["images"].get("quant", "Q8_0"),
+                               str(stamp.parent / Path(cfg["images"]["exe"]).name),
+                               str(Path(cfg["images"]["diffusion_model"]).parent.parent), cfg["images"].get("gpu"),
+                               meta.get("lib_dirs"))
+            if "error" not in c:
+                img.append(u)
+                cfgs["up"] = c
+        say("  image generation (the merges' bench_image.py) ...")
+        C.ab_image(out, GPU_LABEL, img, cfgs, rounds=rounds, on_run=tagged)
     tagged(None)
     tables: list[str] = []
     C.collect(out, {e.arm: e.name for e in engines}, say=tables.append)
     (out / "tables.md").write_text("\n".join(tables) + "\n", encoding="utf-8")
     rec["matrix"] = {k: json.loads((out / f).read_text()) for k, f in (
-        ("generate", "matrix.json"), ("serve", "matrix-serve.json"), ("usage", "matrix-usage.json"))
+        ("generate", "matrix.json"), ("serve", "matrix-serve.json"), ("usage", "matrix-usage.json"),
+        ("image", "matrix-image.json"))
         if (out / f).exists()}
     gen = {t: [parse_generate(f.read_text(errors="replace"))
                for f in sorted((out / "runs").glob(f"{GPU_LABEL}-xe-{t}-*.txt"))
