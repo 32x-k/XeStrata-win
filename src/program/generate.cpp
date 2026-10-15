@@ -1492,6 +1492,11 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
 // context not yet up to speed), and the low reading set the share.  Such a disturbance only ever slows a copy, so the
 // same 1 GiB is copied as four bursts of 256 MiB, timed one by one, and the fastest is the link's figure.  `samples`,
 // when given, gets every burst's reading for the log.
+// Each GPU's last link reading (probe_pcie_h2d_gbps), for the ones taken again after the model is loaded
+std::map<int, double>& link_readings() {
+    static std::map<int, double> seen;
+    return seen;
+}
 double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
     constexpr size_t kBytes = 256ull << 20;
     constexpr int kBursts = 4;
@@ -1533,7 +1538,47 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
     }
     strata::gpu::free(d);
     strata::gpu::free(h);
+    if (bw > 0.0) link_readings()[strata::core::current_device()] = bw;
     return bw;
+}
+
+// set_helper (the prompt path): an expert the helper GPU holds goes to it when moving its tokens' rows there and back
+// (2 x n_embd floats a token) over the helper's link takes less time than streaming the expert to this GPU over its
+// own: tokens < blob / (2 * n_embd * 4) x (the helper's link / this GPU's).  B70 (25 GB/s) + RTX 4070 (6 GB/s on a x4
+// link), IQ3_XXS: about 18.  The links are the readings taken at the start (probe_helper_links): read here, the probes
+// took 0.43 s of the first prompt's time to its first token.  STRATA_PREFILL_HELPER_ROWS=n sets it; 0 turns it off.
+void attach_prompt_helper(strata::prefill::Prefill& sp, strata::core::RemoteExperts& helper, const char* who) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || lay.fmt.empty()) return;
+    int64_t rows = -1;
+    double l0 = 0, lh = 0;
+    if (const char* v = std::getenv("STRATA_PREFILL_HELPER_ROWS")) rows = std::strtoll(v, nullptr, 10);
+    if (rows < 0) {
+        auto link = [&](int dev) {
+            const auto it = link_readings().find(dev);
+            return it != link_readings().end() ? it->second : -1.0;
+        };
+        l0 = link(strata::core::current_device());
+        lh = link(helper.device());
+        double blob = 0;
+        for (size_t l = 0; l < lay.fmt.size(); ++l) blob += (double) lay.blob_bytes((int64_t) l);
+        blob /= (double) lay.fmt.size();
+        rows = l0 > 0.0 && lh > 0.0 ? (int64_t) (blob / (2.0 * strata::kernels::cpu::H * 4) * lh / l0) : 0;
+    }
+    if (rows <= 0) {
+        if (l0 <= 0.0 || lh <= 0.0)
+            std::fprintf(stderr, "strata %s: the helper GPU takes no share of the prompt's experts%s\n", who,
+                         std::getenv("STRATA_PREFILL_HELPER_ROWS") ? " (STRATA_PREFILL_HELPER_ROWS)" : ": a link was not read");
+        return;
+    }
+    std::string err;
+    if (!sp.set_helper(&helper, rows, err)) {
+        std::fprintf(stderr, "strata %s: the helper GPU's prompt share: %s; this GPU streams those experts\n", who,
+                     err.c_str());
+        return;
+    }
+    std::fprintf(stderr, "strata %s: the helper GPU computes the prompt's experts it holds that at most %lld of a chunk's "
+                         "tokens route to (links %.1f and %.1f GB/s)\n", who, (long long) rows, l0, lh);
 }
 
 // The time of one small host->device copy (64 KiB, the median of 16 after a warmup): the fixed part of a layer
@@ -3015,6 +3060,14 @@ int main(int argc, char** argv) {
         for (const int d : split_devs) {
             const strata::core::OnDevice on(d);
             strata::prefill::Gemm::prepare();
+        }
+    // a helper GPU (--expert-cache-device1): both links, for its share of the prompt's experts (attach_prompt_helper),
+    // before the model takes the room the probe copies through; --layer-split auto reads them itself
+    if (o.expert_cache_remote[0] > 0 && native_pack)
+        for (const int d : {0, remote_dev[0]}) {
+            if (link_readings().count(d)) continue;
+            const strata::core::OnDevice on(d);
+            (void) probe_pcie_h2d_gbps();
         }
     strata::core::progress_at("starting: loading the weights, the session and the expert caches");
     {
@@ -6605,6 +6658,7 @@ int main(int argc, char** argv) {
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
         }
+        if (drive.d.remote_count > 0 && o.batch <= 0 && !multi_gpu) attach_prompt_helper(sp, *drive.d.remote[0], "serve");
         mem_mark("the head and the prompt path");
         kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
@@ -11687,6 +11741,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        if (drive.d.remote_count > 0 && !multi_gpu) attach_prompt_helper(prefill, *drive.d.remote[0], "generate");
         if (!o.mtp.empty()) {
             if (!mtp.bind(wt, &native_head, nullptr, err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());

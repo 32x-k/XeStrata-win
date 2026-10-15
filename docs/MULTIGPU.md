@@ -83,7 +83,7 @@ The log shows the choice (`layer split auto: K=...`); from there on it runs as i
   The first GPU is set when the engine starts and is not swapped, but when another first GPU is predicted faster, the log names the cards' order to set.
 - A hand-off between stages is priced from each GPU's link speed and the time of a small copy.
 - With two GPUs, the second is also priced, with the same model, as a helper cache (as `--expert-cache-device1`) instead of a stage, and the shorter time wins.
-  The first GPU then runs every layer, and the second holds the experts the first one's cache does not, as many as its free VRAM takes, and computes those of them that decode would have given the CPU.
+  The first GPU then runs every layer, and the second holds the experts the first one's cache does not, as many as its free VRAM takes, and computes those of them that decode would have given the CPU (and, in a short prompt, those few tokens route to: [DETAILS](DETAILS.md#prefill-tokenss)).
   The prediction counts the round trip over its link each layer (the inputs there, the results back).
   The log shows which one wins (`as a helper expert cache instead: ... -> the helper`).
   With `--pipeline-windows`, `--no-pool` or `--batch` the split stays.
