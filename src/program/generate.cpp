@@ -3635,10 +3635,11 @@ int main(int argc, char** argv) {
         // GPU's, the CPU's and the helper's shares overlap (the largest counts), and the helper's pays a round trip
         // over its link (the activations there, the rows back).  The faster prediction takes the GPU, said with
         // both times.  STRATA_SPLIT_ROLE=split / helper: that role whatever the prediction.  Two GPUs only, with the
-        // expert pool (the helper's rows are the pool's) and without --pipeline-windows (a split's own).
+        // expert pool (the helper's rows are the pool's), without --pipeline-windows (a split's own) and without --batch
+        // slots (their groups run one a GPU on a split; the helper was not tried with them).
         const char* role_env = std::getenv("STRATA_SPLIT_ROLE");
         const std::string role = role_env != nullptr ? role_env : "";
-        if (ns == 2 && !o.no_pool && o.pipeline_windows <= 0 && role != "split") {
+        if (ns == 2 && !o.no_pool && o.pipeline_windows <= 0 && o.batch <= 0 && role != "split") {
             const int h = 1;   // the second GPU's index in the measurements above
             std::vector<double> held0_l((size_t) L, 0.0), heldh_l((size_t) L, 0.0);
             const int64_t cap0 = std::max<int64_t>(cap_raw(0, 0, -1, true), 0);

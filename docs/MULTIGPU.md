@@ -86,7 +86,7 @@ The log shows the choice (`layer split auto: K=...`); from there on it runs as i
   The first GPU then runs every layer, and the second holds the experts the first one's cache does not, as many as its free VRAM takes, and computes those of them that decode would have given the CPU.
   The prediction counts the round trip over its link each layer (the inputs there, the results back).
   The log shows which one wins (`as a helper expert cache instead: ... -> the helper`).
-  With `--pipeline-windows` or `--no-pool` the split stays.
+  With `--pipeline-windows`, `--no-pool` or `--batch` the split stays.
 
 Environment variables change the model's assumptions:
 

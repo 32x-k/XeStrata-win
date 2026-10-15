@@ -86,7 +86,7 @@ CPU 内蔵の GPU は、`--split-device`（setup では `--gpus`）で指定し�
   1 枚目は全部の層を受け持ち、2 枚目は 1 枚目のキャッシュに入らないエキスパートを空いている VRAM の分だけ持って、decode で CPU に回るはずだったもののうち自分が持つものを計算します。
   層ごとに入力と結果をリンクで往復する時間も見積もりに入れます。
   選んだ方はログに出ます（`as a helper expert cache instead: ... -> the helper`）。
-  `--pipeline-windows` のとき、`--no-pool` のときは分割のままです。
+  `--pipeline-windows`、`--no-pool`、`--batch` のときは分割のままです。
 
 見積もりの前提は、環境変数で変えられます。
 
