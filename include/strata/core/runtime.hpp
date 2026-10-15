@@ -9,7 +9,6 @@
 #include <condition_variable>
 #include <exception>
 #include <list>
-#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -47,9 +46,6 @@ public:
     // priority_high, a hint the backend maps to its own (CUDA and HIP stream priorities, Level Zero's queue priority);
     // a runtime without the extension gives an ordinary stream.
     sycl::queue* create_stream(bool high_priority = false);
-    /// A stream a graph can be recorded on.  With AdaptiveCpp it is a native in-order queue (one HIP stream that
-    /// HIP's stream capture records), used only to record; elsewhere it is create_stream().
-    sycl::queue* create_capture_stream();
     // An engine stream for copies and events alone, on the GPU's copy engine where the device reports a copy-only
     // queue group (Level Zero); elsewhere an ordinary engine stream.  No kernel may go on it.
     sycl::queue* create_copy_stream();
@@ -58,12 +54,6 @@ public:
     std::string device_status();
     void destroy_stream(sycl::queue* stream);
     sycl::queue& stream(void* stream);
-    /// While a stream records a graph (AdaptiveCpp: HIP stream capture), the queue its work goes to instead:
-    /// stream() returns `to` for `from` until it is redirected to null.  recording_queue() is the native in-order
-    /// queue kept for recording `from`'s graphs.
-    void redirect(const sycl::queue* from, sycl::queue* to);
-    sycl::queue* redirected(const sycl::queue* from);
-    sycl::queue* recording_queue(const sycl::queue* from);
 
     sycl::event copy_async(void* dst, const void* src, uint64_t bytes,
                            const std::vector<sycl::event>& dependencies = {});
@@ -111,9 +101,6 @@ private:
     sycl::queue compute_, transfer_;
     std::mutex streams_mutex_;
     std::list<sycl::queue> streams_;
-    std::mutex redirect_mutex_;
-    std::map<const sycl::queue*, sycl::queue*> redirects_, recorders_;
-    std::atomic<int> n_redirects_{0};
     std::mutex watch_mutex_;
     std::condition_variable watch_cv_;
     std::list<Waiter> waiters_;

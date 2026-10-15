@@ -41,7 +41,7 @@
 
 #include <cmath>
 
-#if (defined(SYCL_LANGUAGE_VERSION) || defined(STRATA_ADAPTIVECPP))
+#if defined(SYCL_LANGUAGE_VERSION)
 #include <sycl/sycl.hpp>
 #endif
 
@@ -157,13 +157,13 @@ inline void rope_scaled_angle(float theta_extrap, float freq_scale, float corr_l
         const float ramp_mix = rope_yarn_ramp(corr_low, corr_high, pair) * ext_factor;
         theta = theta * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
         // "Get n-d magnitude scaling corrected for interpolation" - the log term only when correcting.
-#if (defined(SYCL_LANGUAGE_VERSION) || defined(STRATA_ADAPTIVECPP))
+#if defined(SYCL_LANGUAGE_VERSION)
         mscale *= 1.0f + 0.1f * sycl::log(1.0f / freq_scale);
 #else
         mscale *= 1.0f + 0.1f * std::log(1.0f / freq_scale);
 #endif
     }
-#if (defined(SYCL_LANGUAGE_VERSION) || defined(STRATA_ADAPTIVECPP))
+#if defined(SYCL_LANGUAGE_VERSION)
     cos_out = sycl::cos(theta) * mscale;
     sin_out = sycl::sin(theta) * mscale;
 #else
@@ -172,7 +172,7 @@ inline void rope_scaled_angle(float theta_extrap, float freq_scale, float corr_l
 #endif
 }
 
-#if (defined(SYCL_LANGUAGE_VERSION) || defined(STRATA_ADAPTIVECPP))
+#if defined(SYCL_LANGUAGE_VERSION)
 /// cos and sin of a pair's trained angle `theta`: as the unscaled kernels take them (sycl::cos / sycl::sin) when
 /// `scaled` is false, else through rope_scaled_angle with the process's constants.  `scaled` is the same for every
 /// work-item of a launch.

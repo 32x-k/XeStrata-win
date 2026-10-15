@@ -41,9 +41,7 @@
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_mmvq
 #include "strata/kernels/device_arch_tag.hpp"
 
-#if !defined(STRATA_ADAPTIVECPP)
 #include <sycl/ext/oneapi/experimental/graph.hpp>
-#endif
 
 #include <chrono>
 #include <cstdint>
@@ -794,9 +792,6 @@ using IQ4NLTraits = SmallTraits<IQ4NLBlock, 4>;
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 
 void native_mmvq_tune(int ggml_type, int n_in, int n_out, void* stream) {
-#if defined(STRATA_ADAPTIVECPP)
-    (void) ggml_type; (void) n_in; (void) n_out; (void) stream;   // no command graphs to time with: the default stays
-#else
     if (!native_mmvq_supported(ggml_type) || n_in <= 0 || n_out <= 0) return;
     auto& q = validate_stream(stream);
     const std::size_t wb = native_mmvq_weight_bytes(ggml_type, n_in, n_out);
@@ -855,7 +850,6 @@ void native_mmvq_tune(int ggml_type, int n_in, int n_out, void* stream) {
     }
     g_force_long = -1;
     sycl::free(w, q); sycl::free(x, q); sycl::free(y, q);
-#endif
 }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
 

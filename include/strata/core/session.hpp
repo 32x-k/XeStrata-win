@@ -432,9 +432,6 @@ struct PoolTiming {
 /// It must stay alive through return; the final stream drain completes its ordered copies.
 /// Optional `graphs`, captured by `session_capture` with `doorbell` false on this `parts`: `pre[l]` and `post[l]`
 /// are replayed instead of submitted kernel by kernel, and the position is staged for them (`stage_token`).
-/// Graphs captured with `scratch.y_miss` staged, no hits, no dumps and no per-layer sync run the layers on
-/// `strata::gpu::direct_stream()` where there is one: one launch, one wait and one launch per layer, with
-/// `stream` drained before the layers and the direct stream after them.
 bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,
                         SessionState& s, float* parts, PoolFn pool, HitFn hits, void* user,
                         SessionLoopScratch& scratch, void* stream, bool sync_every_layer, std::string& err,

@@ -2502,17 +2502,6 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-#if defined(STRATA_ADAPTIVECPP)
-    // Keep input, PLE, layers and head on one in-order queue.  The tokens take the pool path (session_token_pool,
-    // its layer graphs recorded with HIP's stream capture), never session_loop or the token graph, whose
-    // doorbells the GPU would wait on.  The captured graphs stay on for the verify windows of --spec
-    // (STRATA_ACPP_CAPTURE=0 turns them off).
-    if (const char* v = std::getenv("STRATA_ACPP_CAPTURE"); v != nullptr && std::strcmp(v, "0") == 0)
-        o.no_capture = true;
-    o.no_token_graph = true;
-    o.stream_token = true;
-    o.check_logits = true;
-#endif
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
     // the next discrete ones); "auto" chooses the K before anything is loaded (below).  The helper caches
     // (--expert-cache-remote) are not carried by the Xe engine at all (remote_experts.cpp).
@@ -5343,12 +5332,8 @@ int main(int argc, char** argv) {
 
     // ---- the graphs
     strata::core::SessionGraphs gr;
-    // the tokens' path: the direct pool path with --no-capture, and always with AdaptiveCpp (see above)
-#if defined(STRATA_ADAPTIVECPP)
-    const bool pool_path = true;
-#else
+    // the tokens' path: the direct pool path with --no-capture
     const bool pool_path = o.no_capture;
-#endif
     if (!pool_path && !native_pack) {   // plan v0.3 P6: a native pack runs verify windows only
         if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages)) {
             std::fprintf(stderr, "strata generate: session_capture: %s\n", err.c_str());
@@ -5356,24 +5341,16 @@ int main(int argc, char** argv) {
         }
     }
     // The direct pool path can replay each layer's `pre` and `post` as graphs captured without the doorbell: the
-    // runtime then takes one launch per graph instead of one per kernel.  With AdaptiveCpp on Windows HIP each
-    // submitted kernel cost about 35 us (its completion event forces a submission of its own) and a captured one
-    // about 3-8 us, so there it is the default (STRATA_POOL_GRAPHS=0 turns it off); elsewhere STRATA_POOL_GRAPHS=1
-    // turns it on.
+    // runtime then takes one launch per graph instead of one per kernel (STRATA_POOL_GRAPHS=1).
     const char* pool_graphs_env = std::getenv("STRATA_POOL_GRAPHS");
-#if defined(STRATA_ADAPTIVECPP)
-    const bool pool_graphs_wanted = pool_graphs_env == nullptr || std::strcmp(pool_graphs_env, "0") != 0;
-#else
     const bool pool_graphs_wanted = pool_graphs_env != nullptr && std::strcmp(pool_graphs_env, "1") == 0;
-#endif
     // --stage-timing records its events between the kernels, which a graph would not carry
     const bool pool_graphs =
         pool_path && pool_fn != nullptr && !native_pack && pool_graphs_wanted && !o.stage_timing;
-    // With the copies in the graphs (`y_miss`), the layers run on the direct stream; captured after the loop's
-    // scratch below, except for --gpu-stages, which measures the graphs before any token and stops.
-    auto capture_pool_graphs = [&](const float* y_miss) -> bool {
-        if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages, /*doorbell=*/false,
-                                           y_miss)) {
+    // Captured after the loop's scratch below, except for --gpu-stages, which measures the graphs before any token
+    // and stops.
+    auto capture_pool_graphs = [&]() -> bool {
+        if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages, /*doorbell=*/false)) {
             std::fprintf(stderr, "strata generate: session_capture (pool graphs): %s\n", err.c_str());
             return false;
         }
@@ -5382,12 +5359,11 @@ int main(int argc, char** argv) {
             pre_nodes += strata::gpu::graph_nodes(gr.execs[l]);
             post_nodes += strata::gpu::graph_nodes(gr.posts[l]);
         }
-        std::fprintf(stderr, "strata generate: the pool path replays %lld layer graph pairs (%zu + %zu nodes)%s\n",
-                     (long long) gr.n, pre_nodes, post_nodes,
-                     y_miss != nullptr ? " on a direct stream, the copies in the graphs" : "");
+        std::fprintf(stderr, "strata generate: the pool path replays %lld layer graph pairs (%zu + %zu nodes)\n",
+                     (long long) gr.n, pre_nodes, post_nodes);
         return true;
     };
-    if (pool_graphs && o.gpu_stages && !capture_pool_graphs(nullptr)) return 1;
+    if (pool_graphs && o.gpu_stages && !capture_pool_graphs()) return 1;
 
     // The direct path with a pool uses session_token_pool: each layer's routing is downloaded, computed
     // and combined before the next layer. session_token remains the explicit --no-pool ablation.
@@ -5803,10 +5779,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (pool_graphs && !gr.captured) {
-        // the copies go into the graphs only where session_token_pool will take the direct loop
-        const bool direct = hit_fn == nullptr && layer_stage == nullptr && !o.sync_every_layer &&
-                            strata::gpu::direct_stream() != nullptr;
-        if (!capture_pool_graphs(direct ? loop_scratch.y_miss : nullptr)) return 1;
+        if (!capture_pool_graphs()) return 1;
     }
     // Plan v0.3 P3: the whole token as ONE graph whenever nothing needs a host step between the ring and post[l]
     // (the VRAM expert tier and the per-layer dumps do).  `--no-token-graph` keeps two graphs per layer.

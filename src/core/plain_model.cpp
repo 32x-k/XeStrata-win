@@ -228,11 +228,7 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     }
     // not on the processor's own graphics through Level Zero yet: on the UHD 770 the driver aborted (its command stream
     // full) in the batched prompt and after some hundreds of segmented windows
-#if defined(STRATA_ADAPTIVECPP)
-    constexpr bool level_zero = false;   // AdaptiveCpp's Windows port drives HIP only
-#else
     const bool level_zero = Runtime::get().device().get_backend() == sycl::backend::ext_oneapi_level_zero;
-#endif
     if (const sycl::device& dev = Runtime::get().device(); integrated_gpu(dev) && level_zero) {
         err = "plain model: this model does not run on the processor's own graphics yet; choose another GPU (--gpu)";
         return false;

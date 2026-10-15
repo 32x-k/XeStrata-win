@@ -371,10 +371,6 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
 
 void bf16_gemv_fp32_mmvf_multi_tune(int64_t n_in, int64_t n_out, void* stream) {
     if (n_in <= 0 || (n_in & 1) != 0 || n_out < 64 || n_in > std::numeric_limits<int>::max()) return;
-#if defined(STRATA_ADAPTIVECPP)
-    (void) stream;   // command-graph tuning is optional; the default one-row form remains correct
-    return;
-#else
     auto& q = queue_for(stream);
     auto& table = rows_table(q);
     {
@@ -424,7 +420,6 @@ void bf16_gemv_fp32_mmvf_multi_tune(int64_t n_in, int64_t n_out, void* stream) {
     }
     std::lock_guard<std::mutex> lock(table.mutex);
     table.rows_mask[{n_in, n_out}] = mask;
-#endif
 }
 
 void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,

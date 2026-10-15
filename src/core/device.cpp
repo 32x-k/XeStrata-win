@@ -41,73 +41,29 @@
 #include <windows.h>
 #endif
 
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#endif
-
 namespace strata::core {
 namespace {
 // The backends the engine runs on: Level Zero for Intel GPUs, CUDA and HIP where the build has their targets.  The
 // same Intel GPU is listed by OpenCL as well, which the engine does not use.
 bool engine_backend(const sycl::device& d) {
     const auto b = d.get_backend();
-#if defined(STRATA_ADAPTIVECPP)
-    return b == sycl::backend::hip;
-#else
     return b == sycl::backend::ext_oneapi_level_zero || b == sycl::backend::ext_oneapi_cuda ||
            b == sycl::backend::ext_oneapi_hip;
-#endif
 }
 
 // A kernel with no work, built for the device to learn whether the binary carries code for it: a CUDA or HIP GPU
 // is listed whenever the runtime has the backend, also by a build without that target (STRATA_CUDA_ARCHS).
 struct ProbeKernel;
 
-#if defined(STRATA_ADAPTIVECPP)
-// AdaptiveCpp reports aspect::fp16=false because it implements only part of FP16 SYCL.
-// Check the half conversions/arithmetic this engine uses, and that this binary runs on the device.
-bool half_kernel_ok(const sycl::device& d) {
-    float* result = nullptr;
-    sycl::queue q(d);
-    try {
-        result = sycl::malloc_device<float>(3, q);
-        if (!result) return false;
-        // Read device inputs so the compiler cannot replace the half arithmetic with a constant result.
-        const float input[3] = {1.5f, 2.25f, 0.0f};
-        q.memcpy(result, input, sizeof input).wait_and_throw();
-        q.single_task([=] {
-            const sycl::half a = (sycl::half) result[0], b = (sycl::half) result[1];
-            result[2] = (float) (a * b);
-        });
-        float value = 0;
-        q.wait_and_throw();
-        q.memcpy(&value, result + 2, sizeof value).wait_and_throw();
-        sycl::free(result, q);
-        result = nullptr;
-        return value == 3.375f;
-    } catch (const std::exception&) {
-        q.wait();
-        if (result) sycl::free(result, q);
-        return false;
-    }
-}
-#endif
 
 // Why a GPU cannot run the engine, from what it reports (empty: it can).  The kernels take 32-wide sub-groups, FP16
 // and device and host USM; nothing is chosen by device ID or name (AGENTS.md).
 std::string unusable(const sycl::device& d) {
     if (!d.has(sycl::aspect::usm_device_allocations) || !d.has(sycl::aspect::usm_host_allocations))
         return "no device and host USM";
-#if defined(STRATA_ADAPTIVECPP)
-    if (!half_kernel_ok(d)) return "this build cannot run its half kernel";
-#else
     if (!d.has(sycl::aspect::fp16)) return "no FP16";
-#endif
     const auto sg = d.get_info<sycl::info::device::sub_group_sizes>();
     if (std::find(sg.begin(), sg.end(), size_t(32)) == sg.end()) return "no 32-wide sub-groups";
-#if !defined(STRATA_ADAPTIVECPP)
     try {
         const sycl::context ctx(d);
         (void) sycl::get_kernel_bundle<sycl::bundle_state::executable>(ctx, {d},
@@ -115,22 +71,16 @@ std::string unusable(const sycl::device& d) {
     } catch (const sycl::exception& e) {
         return std::string("this build has no code for it (") + e.what() + ")";
     }
-#endif
     return {};
 }
 
 bool integrated(const sycl::device& d) { return integrated_gpu(d); }
 
 std::string pci_of(const sycl::device& d) {
-#if defined(STRATA_ADAPTIVECPP)
-    (void) d;
-    return "?";
-#else
     if (!d.has(sycl::aspect::ext_intel_pci_address)) return "?";
     std::string s = d.get_info<sycl::ext::intel::info::device::pci_address>();
     for (auto& c : s) c = (char) std::tolower((unsigned char) c);
     return s;
-#endif
 }
 
 // No GPU on Level Zero, CUDA or HIP at all: the GPU's driver is missing, or the SYCL runtime did not load its adapter
@@ -201,24 +151,6 @@ std::vector<sycl::device> find_devices() {
 const std::vector<sycl::device>& engine_devices() {
     static const std::vector<sycl::device> devices = find_devices();
     return devices;
-}
-
-sycl::property_list ordered_properties() {
-#if defined(_WIN32) && defined(STRATA_ADAPTIVECPP)
-    // The native dedicated in-order path on Windows HIP failed kernel -> memcpy ordering in our
-    // bounded probe. A null executor keeps submission DAG-ordered, with explicit predecessor events.
-    return sycl::property_list{sycl::property::queue::in_order{},
-                               sycl::property::queue::AdaptiveCpp_inorder_executor{nullptr}};
-#else
-    return sycl::property_list{sycl::property::queue::in_order{}};
-#endif
-}
-
-[[maybe_unused]] sycl::event queue_marker(sycl::queue& q, const std::vector<sycl::event>& dependencies = {}) {
-    return q.submit([&](sycl::handler& h) {
-        if (!dependencies.empty()) h.depends_on(dependencies);
-        h.single_task([] {});
-    });
 }
 
 thread_local int t_current = 0;
@@ -298,8 +230,8 @@ sycl::async_handler Runtime::handler() {
 }
 
 Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), device_(device), context_(device_),
-    compute_(context_, device_, handler(), ordered_properties()),
-    transfer_(context_, device_, handler(), ordered_properties()), watchdog_([this] { watch(); }) {
+    compute_(context_, device_, handler(), sycl::property::queue::in_order{}),
+    transfer_(context_, device_, handler(), sycl::property::queue::in_order{}), watchdog_([this] { watch(); }) {
     marks_by_barrier_ = measure_marks();
 }
 
@@ -310,9 +242,6 @@ Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), d
 // timestamps is timed on a queue of its own, and events without timing are barriers where it is above 20 us each.
 // STRATA_EVENT_MARK=tag or barrier chooses instead.
 bool Runtime::measure_marks() {
-#if defined(STRATA_ADAPTIVECPP)
-    return true;   // standard marker kernels replace profiling tags and oneAPI barriers
-#else
     if (const char* v = std::getenv("STRATA_EVENT_MARK")) return std::strcmp(v, "barrier") == 0;
     constexpr int kMarks = 64;
     constexpr double kCostUs = 20.0;
@@ -336,12 +265,11 @@ bool Runtime::measure_marks() {
     } catch (const std::exception&) {
         return false;
     }
-#endif
 }
 
 sycl::queue* Runtime::create_stream(bool high_priority) {
     std::lock_guard<std::mutex> lock(streams_mutex_);
-#if defined(SYCL_EXT_ONEAPI_QUEUE_PRIORITY) && !defined(STRATA_ADAPTIVECPP)
+#if defined(SYCL_EXT_ONEAPI_QUEUE_PRIORITY)
     if (high_priority)
         return &streams_.emplace_back(context_, device_, handler(),
                                       sycl::property_list{sycl::property::queue::in_order{},
@@ -349,18 +277,7 @@ sycl::queue* Runtime::create_stream(bool high_priority) {
 #else
     (void) high_priority;
 #endif
-    return &streams_.emplace_back(context_, device_, handler(), ordered_properties());
-}
-
-sycl::queue* Runtime::create_capture_stream() {
-#if defined(STRATA_ADAPTIVECPP)
-    // Recording only: the DAG-ordered queues defer and spread their work over several HIP streams, which a
-    // stream capture cannot follow.  Nothing recorded here runs until the graph is replayed on an engine stream.
-    std::lock_guard<std::mutex> lock(streams_mutex_);
-    return &streams_.emplace_back(context_, device_, handler(), sycl::property_list{sycl::property::queue::in_order{}});
-#else
-    return create_stream();
-#endif
+    return &streams_.emplace_back(context_, device_, handler(), sycl::property::queue::in_order{});
 }
 
 // The prompt path's expert copies on the GPU's copy engine (upstream 01fe68dd, in its sycl/ port): Level Zero's v2
@@ -466,46 +383,14 @@ bool Runtime::owns(const sycl::queue* queue) {
 }
 
 sycl::queue& Runtime::stream(void* stream) {
-    auto* q = stream ? static_cast<sycl::queue*>(stream) : &compute_;
+    if (!stream) return compute_;
+    auto* q = static_cast<sycl::queue*>(stream);
     // a queue of another device's runtime is that device's: a kernel goes where its stream is, as with CUDA streams
-    if (stream && !owns(q) && owner_of_stream(q) == nullptr)
-        throw DeviceError("the stream is not a queue of the Xe runtime");
-    if (n_redirects_.load(std::memory_order_acquire) > 0) {
-        std::lock_guard<std::mutex> lock(redirect_mutex_);
-        if (auto it = redirects_.find(q); it != redirects_.end()) return *it->second;
-    }
+    if (!owns(q) && owner_of_stream(q) == nullptr) throw DeviceError("the stream is not a queue of the Xe runtime");
     return *q;
 }
 
-void Runtime::redirect(const sycl::queue* from, sycl::queue* to) {
-    std::lock_guard<std::mutex> lock(redirect_mutex_);
-    if (to != nullptr) {
-        if (redirects_.emplace(from, to).second) n_redirects_.fetch_add(1, std::memory_order_release);
-    } else if (redirects_.erase(from) != 0) {
-        n_redirects_.fetch_sub(1, std::memory_order_release);
-    }
-}
-
-sycl::queue* Runtime::redirected(const sycl::queue* from) {
-    std::lock_guard<std::mutex> lock(redirect_mutex_);
-    auto it = redirects_.find(from);
-    return it == redirects_.end() ? nullptr : it->second;
-}
-
-sycl::queue* Runtime::recording_queue(const sycl::queue* from) {
-    {
-        std::lock_guard<std::mutex> lock(redirect_mutex_);
-        if (auto it = recorders_.find(from); it != recorders_.end()) return it->second;
-    }
-    sycl::queue* rec = create_capture_stream();
-    std::lock_guard<std::mutex> lock(redirect_mutex_);
-    return recorders_.emplace(from, rec).first->second;
-}
-
 void Runtime::preload_kernels() {
-#if defined(STRATA_ADAPTIVECPP)
-    return;   // AdaptiveCpp's HIP images are built ahead of time and it has no SYCL kernel-bundle API
-#else
     if (preload_.joinable()) return;
     preload_ = std::thread([this] {
         int built = 0, skipped = 0;
@@ -521,7 +406,6 @@ void Runtime::preload_kernels() {
         if (std::getenv("STRATA_TRACE"))
             std::fprintf(stderr, "strata trace: %d kernels built ahead, %d not for this GPU\n", built, skipped);
     });
-#endif
 }
 
 Runtime::~Runtime() {
@@ -564,11 +448,7 @@ sycl::event Runtime::copy_async(void* dst, const void* src, uint64_t bytes,
 
 sycl::event Runtime::compute_after(const std::vector<sycl::event>& dependencies) {
     check_async();
-#if defined(STRATA_ADAPTIVECPP)
-    return queue_marker(compute_, dependencies);
-#else
     return compute_.ext_oneapi_submit_barrier(dependencies);
-#endif
 }
 
 void Runtime::wait(sycl::event event, const char* what) {
@@ -590,13 +470,8 @@ void Runtime::wait(sycl::event event, const char* what) {
 
 void Runtime::finish(sycl::queue& queue) {
     if (!owns(&queue)) throw DeviceError("cannot drain a queue not owned by the Xe runtime");
-#if defined(STRATA_ADAPTIVECPP)
-    wait(queue_marker(queue), &queue == &compute_ ? "compute queue drain"
-                               : &queue == &transfer_ ? "transfer queue drain" : "engine stream drain");
-#else
     wait(queue.ext_oneapi_submit_barrier(), &queue == &compute_ ? "compute queue drain"
                                             : &queue == &transfer_ ? "transfer queue drain" : "engine stream drain");
-#endif
 }
 void Runtime::finish() {
     finish(compute_);
@@ -638,19 +513,12 @@ uint64_t max_alloc_limit_bytes() {
 // with only Intel's or only NVIDIA's (the runtime opens each backend's library when it is there).  The HIP runtime
 // does not answer the integrated-GPU aspect; it says the same as unified host memory (hipDeviceAttributeIntegrated).
 bool integrated_gpu(const sycl::device& d) {
-#if defined(STRATA_ADAPTIVECPP)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    return d.get_info<sycl::info::device::host_unified_memory>();
-#pragma clang diagnostic pop
-#else
     if (d.has(sycl::aspect::ext_oneapi_is_integrated_gpu)) return true;
     if (d.get_backend() != sycl::backend::ext_oneapi_hip) return false;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     return d.get_info<sycl::info::device::host_unified_memory>();
 #pragma clang diagnostic pop
-#endif
 }
 
 // upstream 004b15cd (#409): an integrated GPU's memory is the system RAM, and what its runtime reports free need not
@@ -693,7 +561,7 @@ void apply_vram_limit(uint64_t& free, uint64_t& total) {
 }
 
 void restrict_hip_to_selector() {
-#if defined(_WIN32) && !defined(STRATA_ADAPTIVECPP)
+#if defined(_WIN32)
     // With the processor's graphics also seen by HIP (R9700 and Radeon 890M), hipHostMalloc of 7 GiB followed by one
     // of 1 MiB failed (hipErrorLaunchFailure), with no SYCL and no kernel; with either GPU alone seen, it passed
     if (std::getenv("HIP_VISIBLE_DEVICES") != nullptr) return;
@@ -731,11 +599,7 @@ int hip_gpus_seen() {
     if (std::getenv("ONEAPI_DEVICE_SELECTOR") != nullptr) return -1;
     int n = 0;
     for (const auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
-#if defined(STRATA_ADAPTIVECPP)
-        n += d.get_backend() == sycl::backend::hip;
-#else
         n += d.get_backend() == sycl::backend::ext_oneapi_hip;
-#endif
     return n;
 }
 
@@ -752,29 +616,21 @@ DeviceInfo device_info(int ordinal) {
     DeviceInfo out;
     out.ordinal = ordinal;
     out.name = d.get_info<sycl::info::device::name>();
-#if defined(STRATA_ADAPTIVECPP)
-    out.backend = d.get_backend() == sycl::backend::hip ? "HIP" : "other";
-    out.vendor_id = d.get_info<sycl::info::device::vendor_id>();
-    out.device_id = 0;
-#else
     out.backend = d.get_backend() == sycl::backend::ext_oneapi_level_zero ? "Level Zero"
                   : d.get_backend() == sycl::backend::ext_oneapi_cuda  ? "CUDA"
                   : d.get_backend() == sycl::backend::ext_oneapi_hip   ? "HIP"
                                                                        : "other";
     out.vendor_id = d.get_info<sycl::info::device::vendor_id>();
     out.device_id = d.has(sycl::aspect::ext_intel_device_id) ? d.get_info<sycl::ext::intel::info::device::device_id>() : 0;
-#endif
     out.driver_version = d.get_info<sycl::info::device::driver_version>();
     out.platform_version = d.get_platform().get_info<sycl::info::platform::version>();
     out.total_bytes = d.get_info<sycl::info::device::global_mem_size>();
-#if !defined(STRATA_ADAPTIVECPP)
     if (d.has(sycl::aspect::ext_intel_free_memory)) {
         try {
             out.free_bytes = d.get_info<sycl::ext::intel::info::device::free_memory>();
             out.free_bytes_known = true;
         } catch (const sycl::exception&) { /* Optional telemetry; never substitute zero for unknown. */ }
     }
-#endif
     uint64_t free = out.free_bytes_known ? out.free_bytes : out.total_bytes;
     apply_vram_limit(free, out.total_bytes);
     if (out.free_bytes_known) out.free_bytes = free;

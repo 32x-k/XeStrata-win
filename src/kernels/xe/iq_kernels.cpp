@@ -46,9 +46,7 @@
 #define GGML_COMMON_IMPL_SYCL
 #include "ggml-common.h"
 
-#if !defined(STRATA_ADAPTIVECPP)
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
-#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -1456,11 +1454,9 @@ sycl::event launch_dequant_flat(sycl::queue& q, int ty, const void* vx, int64_t 
 // memory (FP16, the dequantizers above: the values iq_dequant_f16 writes), and its sub-groups multiply them, each a
 // 32 x 64 tile of Y as 4 x 4 XMX accumulators, A read from X in global memory, B row-major from local memory.
 // The dequantization and the products do not overlap (bench/results/2026-10-02-iq-gemm).
-#if !defined(STRATA_ADAPTIVECPP)
 namespace mx = sycl::ext::oneapi::experimental::matrix;
 namespace ix = sycl::ext::intel::experimental::matrix;
 namespace syclex = sycl::ext::oneapi::experimental;
-#endif
 
 // [[maybe_unused]]: the device compiles for other GPUs leave out the code that uses GT_K (device_target.hpp)
 [[maybe_unused]] constexpr int GT_M = 8, GT_N = 16, GT_K = 16, G_SGM = 4, G_SGN = 4;
@@ -1618,11 +1614,9 @@ struct IqGemmKernel {
             }
 #endif
     }
-#if !defined(STRATA_ADAPTIVECPP)
     auto get(syclex::properties_tag) const {
         return syclex::properties{sycl::ext::intel::experimental::grf_size<256>, syclex::sub_group_size<16>};
     }
-#endif
 };
 
 template<int TYPE>

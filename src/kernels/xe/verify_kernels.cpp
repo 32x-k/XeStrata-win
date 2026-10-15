@@ -289,11 +289,7 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
     });
     const int rows = T - t_out_begin;
     if (rows <= 0) {
-#if defined(STRATA_ADAPTIVECPP)
-        return q.single_task([] {});
-#else
         return q.ext_oneapi_submit_barrier();
-#endif
     }
     // y = oc * rsqrt(mean(oc^2) + eps) * gamma * sigmoid(z) a head and token, with the one-group kernel's sums
     return q.submit([&](sycl::handler& hd) {
@@ -593,10 +589,6 @@ void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
             c.form.fill((int8_t) forced);
             return c;
         }
-#if defined(STRATA_ADAPTIVECPP)
-        c.form.fill((int8_t) kGdnPlain);
-        return c;   // command-graph tuning is optional; keep the portable plain form
-#else
         // scratch inputs of the model's shape; small values keep the recurrence finite
         const size_t n_state = (size_t) S * S * h_v, n_h = (size_t) kVerifyMaxT * C;
         const size_t n_g = (size_t) kVerifyMaxT * h_v, n_y = (size_t) kVerifyMaxT * S * h_v;
@@ -640,7 +632,6 @@ void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
         std::fprintf(stderr, "strata: GDN step forms for windows of 1..%d tokens: %s (0 one group a head, 1 split, "
                      "2 prefetch)\n", kVerifyMaxT, forms);
         return c;
-#endif
     });
 }
 
@@ -718,7 +709,6 @@ bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, con
     return true;
 }
 
-#if !defined(STRATA_ADAPTIVECPP)
 namespace {
 bool measure_graph_branches(sycl::queue& q, sycl::queue* side[2]) {
     namespace sx = sycl::ext::oneapi::experimental;
@@ -781,21 +771,13 @@ bool measure_graph_branches(sycl::queue& q, sycl::queue* side[2]) {
     return t_min[1] <= 0.95 * t_min[0];
 }
 }  // namespace
-#endif
 
 bool graph_branch_pays(void* stream, void* side0, void* side1) {
-#if defined(STRATA_ADAPTIVECPP)
-    (void) stream;
-    (void) side0;
-    (void) side1;
-    return false;
-#else
     auto& q = Q(stream);
     sycl::queue* side[2] = {&Q(side0), &Q(side1)};
     // measured once a device: the verify window and the draft layer both ask
     static core::PerDevice<bool> answers;
     return answers.get(q.get_device(), [&] { return measure_graph_branches(q, side); });
-#endif
 }
 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
@@ -1348,9 +1330,6 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
 }
 
 bool gpu_stamp_available() {
-#if defined(STRATA_ADAPTIVECPP)
-    return false;
-#else
     const sycl::device d = core::Runtime::get().compute().get_device();
     if (d.get_backend() == sycl::backend::ext_oneapi_cuda) return true;   // %globaltimer
     if (d.get_backend() == sycl::backend::ext_oneapi_hip) return true;    // the steady counter
@@ -1358,7 +1337,6 @@ bool gpu_stamp_available() {
     return d.has(sycl::aspect::ext_oneapi_clock_device);
 #else
     return false;
-#endif
 #endif
 }
 

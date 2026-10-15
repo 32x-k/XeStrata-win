@@ -14,9 +14,7 @@
 
 namespace strata::kernels {
 
-#if !defined(STRATA_ADAPTIVECPP)
 std::vector<sycl::ext::oneapi::experimental::matrix::combination> matrix_combinations(const sycl::device& d);
-#endif
 
 /// Whether STRATA_NO_BF16_MMA=1 is set (the products' BF16 library path takes it as well).
 bool no_bf16_mma();

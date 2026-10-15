@@ -229,7 +229,7 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
         // `moe_combine` needs the pool's answer and the pool needs the router's.
         auto capture = [&](bool post, strata::gpu::Graph** out, const char* what, int half = 0,
                            int stage_prefix = 0) -> bool {
-            strata::gpu::Stream cs = strata::gpu::stream_create_capture();
+            strata::gpu::Stream cs = strata::gpu::stream_create();
             if (cs == nullptr) {
                 err = std::string("session_capture: stream create failed");
                 return false;
@@ -894,53 +894,10 @@ bool session_token_pool(const WeightTable& tables, const ModelGeometry& g, int64
     // the captured QSA layers read their position from the pinned staging, which `pre` fills only when it runs
     if (graphs != nullptr) stage_token(g, pos, pos_base, s);
 
-    // ---- THE DIRECT LOOP: the graphs carry the copies, and the layers run on a HIP stream of their own, so a
-    // layer is one launch, one wait and one launch.  Through the runtime each of the five steps it replaces
-    // (launch, three downloads and a wait, upload, launch) was a submission of its own.
-    void* hs = (graphs != nullptr && graphs->staged_y_miss == scratch.y_miss && hits == nullptr &&
-                dump_layers == nullptr && !sync_every_layer)
-                   ? strata::gpu::direct_stream() : nullptr;
-    if (hs == nullptr && graphs != nullptr && graphs->staged_y_miss != nullptr) {
+    if (graphs != nullptr && graphs->staged_y_miss != nullptr) {
         // the graphs would repeat the copies this path makes (and overwrite the hits' combine)
-        err = "session_token_pool: graphs with staged copies need the direct loop (no hits, dumps or layer syncs)";
+        err = "session_token_pool: graphs with staged copies are not replayed here";
         return false;
-    }
-    if (hs != nullptr) {
-        // what the engine stream was given for this token (embedding, PLE) before the layers read it
-        if (!measured(&PoolTiming::final_drain, [&] { return strata::gpu::stream_sync(cs); }))
-            return gpu_error("drain before the layers");
-        bool ok = true;
-        try {
-            for (layer = 0; layer < g.n_layers && ok; ++layer) {
-                ok = measured(&PoolTiming::pre_submit, [&] {
-                         return strata::gpu::direct_graph_launch(graphs->execs[layer], hs);
-                     }) &&
-                     measured(&PoolTiming::routing_wait, [&] { return strata::gpu::direct_sync(hs); });
-                if (!ok) break;
-                if (pool != nullptr)
-                    measured(&PoolTiming::cpu_pool, [&] {
-                        pool(user, s.db->h_x_f, s.db->h_ids, s.db->h_weights, g.n_embd, s.k, scratch.y_miss);
-                        return true;
-                    });
-                else
-                    std::memset(scratch.y_miss, 0, parts_bytes);
-                ok = measured(&PoolTiming::post_submit, [&] {
-                    return strata::gpu::direct_graph_launch(graphs->posts[layer], hs);
-                });
-            }
-        } catch (const std::exception& e) {
-            err = "session_token_pool: layer " + std::to_string(layer) + ": " + e.what();
-            ok = false;
-        }
-        if (!ok && err.empty())
-            err = "session_token_pool: layer " + std::to_string(layer) + ": " + strata::gpu::last_error();
-        // the layers' results before the engine stream reads them, and the staging before it is reused
-        if (!measured(&PoolTiming::final_drain, [&] { return strata::gpu::direct_sync(hs); })) {
-            if (!err.empty()) err += "; ";
-            err += "session_token_pool: final sync: " + std::string(strata::gpu::last_error());
-            return false;
-        }
-        return ok;
     }
     auto run = [&]() -> bool {
         if (dump_layers != nullptr && !measured(&PoolTiming::dump_d2h_submit, [&] {

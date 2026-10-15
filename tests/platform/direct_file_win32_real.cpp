@@ -61,7 +61,7 @@ struct TinyFile {
     bool create() {
         // ASCII relative name: both CreateFileA and DirectFile's UTF-8 open resolve the same file.
         // CREATE_NEW fails rather than overwriting any existing file, even on a name collision.
-        path = "build/windows-acpp/direct-file-real/owned-" + std::to_string(GetCurrentProcessId()) +
+        path = "build/direct-file-real/owned-" + std::to_string(GetCurrentProcessId()) +
                "-" + std::to_string(GetTickCount64()) + ".bin";
         char absolute[MAX_PATH]{};
         char volume[MAX_PATH]{};
