@@ -2317,7 +2317,7 @@ def text_ram_gb(args: list, ram: float, model: str | None = None) -> float:
 
 
 def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | None = None) -> dict | None:
-    """--images qwen-image: Qwen-Image-2.1-Turbo's three files for the image engine in `eng` -> the run config's
+    """--images qwen-image: Qwen-Image-2.1-Turbo's four files for the image engine in `eng` -> the run config's
     "images" section (serve/images.py); None for --images no, or when not wanted after all.  `text_gb`: the RAM the
     text model keeps (text_ram_gb): the denoiser's quant is the largest whose files fit the rest (the user's decision
     of 2026-10-15), or the one asked for with --image-ssd-offload on (what does not fit read from the SSD)."""
@@ -2351,13 +2351,13 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
     say(f"  Image generation: Qwen-Image-2.1-Turbo {quant} on XeStrata's image engine (8 steps; "
         "POST /v1/images/generations)")
     say("  " + QI.LICENSE_NOTE)
-    need = sum(QI.FILES[k][2] for k in (quant, "vae", "llm")) / 1e9
+    need = sum(QI.FILES[k][2] for k in (quant, "vae", "llm", "mmproj")) / 1e9
     if ask(f"Download the image model ({need:.1f} GB) and set up image generation?", ["y", "n"], "y", a.yes) != "y":
         return None
     models_dir.mkdir(parents=True, exist_ok=True)
     if free_gb(models_dir) < need + 5:
         warn(f"less than {need + 5:.0f} GB free for the image model: the download may run out of disk space")
-    for name in (quant, "vae", "llm"):
+    for name in (quant, "vae", "llm", "mmproj"):
         repo, path, size, sha = QI.FILES[name]
         dst = QI.local_path(models_dir, name)
         download(QI.file_url(name, hf_endpoint()), dst, f"image model: {Path(path).name}")

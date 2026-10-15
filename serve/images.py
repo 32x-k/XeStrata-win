@@ -4,12 +4,14 @@
 """serve/images.py - image generation (Qwen-Image-2.1-Turbo) through XeStrata's own image engine, strata-image.
 
 POST /v1/images/generations takes OpenAI's request shape (prompt, size, n, response_format b64_json|url) plus Strata's
-own field seed.  The engine (src/image/strata_image.cpp, `strata-image --serve`) starts with the first image and stays:
-its kernels built once, the prompt's text states and the layers that fit in VRAM kept between images, and it takes one
-image a line on its standard input.  It runs Turbo's 8 steps (CFG 1, the Euler flow sampler, the model's own sigmas),
-the image the one stable-diffusion.cpp makes with the model card's command for the same seed (within LPIPS 0.03).  A
-size whose sides are not multiples of 16 (1920x1080) is made at the sides rounded up (1920x1088) and its middle cut
-out.
+own field seed; POST /v1/images/edits the same with reference images (OpenAI's multipart form, image or image[]; or JSON
+with images: [{"image_url": ...}]), which the image model edits or takes as its subject (Qwen-Image-2.1's edits: the
+vision encoder reads them into the prompt, the VAE's encoder into the DiT's).  The engine (src/image/strata_image.cpp,
+`strata-image --serve`) starts with the first image and stays: its kernels built once, the prompt's text states and
+the layers that fit in VRAM kept between images, and it takes one image a line on its standard input.  It runs Turbo's
+8 steps (CFG 1, the Euler flow sampler, the model's own sigmas), the image the one stable-diffusion.cpp makes with the
+model card's command for the same seed (within LPIPS 0.03).  A size whose sides are not multiples of 16 (1920x1080)
+is made at the sides rounded up (1920x1088) and its middle cut out.
 
 The GPU is shared with the text engine one job at a time: an image job takes the service's turn (the FIFO every chat
 request takes), so no chat turn runs on the GPU meanwhile.  The image engine works in the VRAM it is given: what it
@@ -29,12 +31,13 @@ The config's "images" section (written by setup --images, tools/image/qimage.py)
   {"exe": "engine/strata-image", "diffusion_model": "...Q8_0.gguf", "vae": "...",
    "llm": "...Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf", "quant": "Q8_0", "gpu_policy": "auto", "reload": "lazy"|"eager",
    "max_n": 4, "max_side": 2048, "timeout_s": 3600, "uma": false, "out_dir": null, "keep_files": 64,
-   "reserve_mib": 512, "spare_mib": 1024, "ssd_offload": false,
+   "vision": "...mmproj-F16.gguf", "max_refs": 3, "reserve_mib": 512, "spare_mib": 1024, "ssd_offload": false,
    "quant_lowered": {"from": "Q8_0", "to": "Q6_K", "need_gb": 15.5, "ram_left_gb": 14.0}}
-  reserve_mib: VRAM the image engine leaves free when it sizes itself; spare_mib: the free VRAM that must remain after
-  a job under keep for the engine to keep its layers; quant_lowered (only when setup lowered it): the size setup
-  took instead of the one asked for, because the RAM the text model leaves was short (note(): the server's log and
-  the web page say so).
+  vision: Qwen3-VL's vision encoder (mmproj), for the edits (without it they are refused); max_refs: the reference
+  images an edit takes at most; reserve_mib: VRAM the image engine leaves free when it sizes itself; spare_mib: the
+  free VRAM that must remain after a job under keep for the engine to keep its layers; quant_lowered (only when setup
+  lowered it): the size setup took instead of the one asked for, because the RAM the text model leaves was short
+  (note(): the server's log and the web page say so).
 """
 from __future__ import annotations
 
@@ -65,6 +68,9 @@ FILE_NAME = re.compile(r"^[0-9a-f]{32}\.png$")
 PROMPT_HEAD = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n<|im_start|>user\n"
 PROMPT_TAIL = "<|im_end|>\n<|im_start|>assistant\n"
 DROP = 14
+# an edit's reference image in the prompt: one pad, which the engine widens to the image's tokens
+REF_PROMPT = "{sep}<image{i}><|vision_start|><|image_pad|><|vision_end|>"
+REF_MAX_BYTES = 32 << 20
 START_TIMEOUT_S = 600              # the engine's start: the parts opened and a small image made (kernels built)
 
 
@@ -128,6 +134,64 @@ def parse_request(req: dict, cfg: dict) -> dict:
             "response_format": fmt}
 
 
+def image_dims(data: bytes) -> tuple[int, int]:
+    """(width, height) of a PNG, JPEG, GIF or BMP from its header; ImageRequestError for another format."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+        return struct.unpack(">II", data[16:24])
+    if data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 10:
+        return struct.unpack("<HH", data[6:10])
+    if data[:2] == b"BM" and len(data) >= 26:
+        w, h = struct.unpack("<ii", data[18:26])
+        return w, abs(h)
+    if data[:2] == b"\xff\xd8":
+        i = 2
+        while i + 9 < len(data):
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            if marker in (0xD8, 0x01, 0xFF) or 0xD0 <= marker <= 0xD7:
+                i += 1 if marker == 0xFF else 2
+                continue
+            length = struct.unpack(">H", data[i + 2:i + 4])[0]
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):   # a frame header: its size
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return w, h
+            i += 2 + length
+    raise ImageRequestError("a reference image: PNG, JPEG, GIF or BMP")
+
+
+def parse_edit_request(req: dict, images: list[bytes], cfg: dict) -> dict:
+    """An edit (/v1/images/edits): parse_request's fields with `images` (the reference images' bytes, PNG, JPEG, GIF or
+    BMP) as job["refs"].  size "auto" (or none): the first reference's shape at about 1024 x 1024 pixels, its sides
+    multiples of SIZE_STEP."""
+    if not cfg.get("vision"):
+        raise ImageRequestError("edits need the vision encoder: run setup with --images qwen-image again")
+    if not images:
+        raise ImageRequestError("image: one reference image or more")
+    max_refs = int(cfg.get("max_refs") or 3)
+    if len(images) > max_refs:
+        raise ImageRequestError(f"image: at most {max_refs} reference images")
+    dims = []
+    for data in images:
+        if len(data) > REF_MAX_BYTES:
+            raise ImageRequestError(f"image: at most {REF_MAX_BYTES >> 20} MiB each")
+        w, h = image_dims(data)
+        if w < 16 or h < 16:
+            raise ImageRequestError(f"image: {w}x{h} is too small")
+        dims.append((w, h))
+    if req.get("size") in (None, "auto"):
+        w0, h0 = dims[0]
+        side = int(cfg.get("max_side") or 2048)
+        tw = (1024 * 1024 * w0 / h0) ** 0.5
+        th = tw * h0 / w0
+        tw, th = (min(side, max(MIN_SIDE, round(v / SIZE_STEP) * SIZE_STEP)) for v in (tw, th))
+        req = {**req, "size": f"{tw}x{th}"}
+    job = parse_request(req, cfg)
+    job["refs"] = list(images)
+    return job
+
+
 def made_size(job: dict) -> tuple[int, int]:
     """The size the engine makes for `job`: each side rounded up to a multiple of SIZE_STEP."""
     def up(v) -> int:
@@ -150,11 +214,13 @@ def png_rgba(rgba: bytes, width: int, height: int, made_w: int, made_h: int) -> 
             + chunk(b"IDAT", zlib.compress(bytes(rows), 6)) + chunk(b"IEND", b""))
 
 
-def prompt_ids(tok, prompt: str) -> list[int]:
+def prompt_ids(tok, prompt: str, refs: int = 0) -> list[int]:
     """The prompt in the model's chat form, tokenized (Qwen3-VL's tokenizer): the user's text plain, so a special
-    token spelled in it stays text."""
-    text = PROMPT_HEAD + prompt + PROMPT_TAIL
-    return tok.encode(text, parse_special=True, plain=[(len(PROMPT_HEAD), len(PROMPT_HEAD) + len(prompt))])
+    token spelled in it stays text; an edit's `refs` reference images before it, one pad each (stable-diffusion.cpp's
+    prompt for Qwen-Image-2.1's edits, the pads widened by the engine)."""
+    head = PROMPT_HEAD + "".join(REF_PROMPT.format(sep=" " if i else "", i=i + 1) for i in range(refs))
+    text = head + prompt + PROMPT_TAIL
+    return tok.encode(text, parse_special=True, plain=[(len(head), len(head) + len(prompt))])
 
 
 def load_tokenizer(gguf: str):
@@ -199,6 +265,8 @@ class ImageEngine:
         """Start the engine and wait for READY -> its fields.  ImageJobFailed when it does not start."""
         cmd = [str(self.cfg["exe"]), "--dit", str(self.cfg["diffusion_model"]), "--vae", str(self.cfg["vae"]),
                "--text", str(self.cfg["llm"]), "--serve"]
+        if self.cfg.get("vision"):
+            cmd[-1:-1] = ["--vision", str(self.cfg["vision"])]
         self.lines = queue.Queue()
         logf = open(self.log_path, "a", encoding="utf-8", errors="replace")
         try:
@@ -333,7 +401,8 @@ class ImageGen:
                 "(what does not fit is read from the SSD, slower).")
 
     def missing(self) -> list[str]:
-        return [self.cfg[k] for k in ("exe", "diffusion_model", "vae", "llm") if not Path(self.cfg[k]).exists()]
+        keys = ("exe", "diffusion_model", "vae", "llm") + (("vision",) if self.cfg.get("vision") else ())
+        return [self.cfg[k] for k in keys if not Path(self.cfg[k]).exists()]
 
     def _say(self, text: str) -> None:
         print(f"[strata] {text}", flush=True)
@@ -368,8 +437,32 @@ class ImageGen:
         if self.tok is None:
             self.tok = load_tokenizer(self.cfg["llm"])
         if "ids" not in job:
-            job["ids"] = prompt_ids(self.tok, job["prompt"])
+            job["ids"] = prompt_ids(self.tok, job["prompt"], len(job.get("refs") or ()))
         return job["ids"]
+
+    def stage(self, job: dict) -> None:
+        """An edit's reference images into files the engine reads (job["ref_paths"]); unstage removes them."""
+        if job.get("refs") and not job.get("ref_paths"):
+            work = Path(tempfile.mkdtemp(prefix="refs-", dir=self.dir))
+            job["ref_dir"] = str(work)
+            job["ref_paths"] = []
+            for i, data in enumerate(job["refs"]):
+                p = work / f"ref_{i}"
+                p.write_bytes(data)
+                job["ref_paths"].append(str(p))
+
+    @staticmethod
+    def unstage(job: dict) -> None:
+        for p in job.pop("ref_paths", []) or []:
+            with contextlib.suppress(OSError):
+                os.unlink(p)
+        if job.get("ref_dir"):
+            with contextlib.suppress(OSError):
+                os.rmdir(job.pop("ref_dir"))
+
+    @staticmethod
+    def _refs_words(job: dict) -> str:
+        return "".join(f" REF:{p}" for p in job.get("ref_paths") or ())
 
     def need(self, job: dict) -> dict:
         """What the image needs, from the engine (started when it is not running): least_mib, full_mib (every layer
@@ -377,7 +470,8 @@ class ImageGen:
         with self.lock:
             self._ready()
             w, h = made_size(job)
-            return self.engine.ask(f"NEED {w} {h} {len(self.ids(job)) - DROP}", "NEED", 600)
+            self.stage(job)
+            return self.engine.ask(f"NEED {w} {h} {len(self.ids(job)) - DROP}{self._refs_words(job)}", "NEED", 600)
 
     def free_mib(self) -> int:
         """The device's free VRAM, as the engine sees it (its parts left as they are)."""
@@ -415,6 +509,7 @@ class ImageGen:
         try:
             with self.lock:
                 self._ready()
+                self.stage(job)
                 ids = ",".join(str(i) for i in self.ids(job))
                 for i in range(job["n"]):
                     if cancel is not None and cancel.is_set():
@@ -426,8 +521,8 @@ class ImageGen:
                     def step(done, steps, i=i):
                         self.progress = (i * steps + done, job["n"] * steps)
                     try:
-                        r = self.engine.ask(f"IMG {mw} {mh} {job['seed'] + i} {DROP} {out} {ids}", "IMAGE",
-                                            timeout, cancel, step)
+                        r = self.engine.ask(f"IMG {mw} {mh} {job['seed'] + i} {DROP} {out} {ids}"
+                                            f"{self._refs_words(job)}", "IMAGE", timeout, cancel, step)
                     except ImageJobFailed as e:
                         self.totals["failed"] += 1
                         why = "cancelled (the client left)" if str(e) == "stopped" else str(e)
@@ -437,13 +532,14 @@ class ImageGen:
                     parts.append(r)
         finally:
             self.progress = None
+            self.unstage(job)
             for p in work.iterdir():
                 with contextlib.suppress(OSError):
                     p.unlink()
             with contextlib.suppress(OSError):
                 work.rmdir()
         secs = time.monotonic() - t0
-        figures = {"seconds": round(secs, 2), "steps": job["steps"], "n": job["n"],
+        figures = {"seconds": round(secs, 2), "steps": job["steps"], "n": job["n"], "refs": len(job.get("refs") or ()),
                    "size": f"{job['width']}x{job['height']}", "seed": job["seed"], "engine": "strata-image",
                    "quant": self.cfg.get("quant"),
                    "text_encode_ms": round(sum(r.get("text_s", 0) for r in parts) * 1000, 1),

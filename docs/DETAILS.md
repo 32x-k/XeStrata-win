@@ -1265,7 +1265,7 @@ the model uses interleaved M-RoPE.
 Images are made by XeStrata's own image engine, `strata-image`, which setup builds with the text engine: the same SYCL kernels, on every maker's GPU.
 Setup downloads the image model, its VAE and its text encoder (Qwen3-VL-8B), and adds an `"images"` section to the config.
 The image model is Q8_0 by default. The engine streams from RAM the layers that do not fit in VRAM, so the GPU's memory does not decide the size.
-The RAM does: when the three files and the engine's own (about 15.5 GB with Q8_0, 14 GB with Q6_K, 12 GB with Q4_K_M) do not fit the RAM the text model leaves, setup takes the largest that fits (Q6_K, Q4_K_M).
+The RAM does: when the four files (the vision encoder for the edits among them) and the engine's own (about 16.6 GB with Q8_0, 15.3 GB with Q6_K, 13.2 GB with Q4_K_M) do not fit the RAM the text model leaves, setup takes the largest that fits (Q6_K, Q4_K_M).
 With `--image-ssd-offload on` it keeps the size chosen and reads what does not fit from the SSD (slower).
 When setup lowers it, setup, the server at start and the web page (the Images tab) say so.
 With the same seed it makes the image stable-diffusion.cpp makes with the model card's command (within an LPIPS of 0.03).

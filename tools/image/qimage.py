@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""tools/image/qimage.py - Qwen-Image-2.1-Turbo for XeStrata's image endpoint: the model's three files at pinned
+"""tools/image/qimage.py - Qwen-Image-2.1-Turbo for XeStrata's image endpoint: the model's four files at pinned
 Hugging Face revisions, and the run config's "images" section for XeStrata's own image engine (strata-image, built
 with the text engine).
 
@@ -9,7 +9,7 @@ setup.py (--images qwen-image) and tools/image/install.py use these pieces; serv
 
   files     the denoiser (DiT) quant (Unsloth's LPIPS vs bf16: Q4_K_M 0.153, Q6_K 0.055, Q8_0 0.036): the engine
             streams what does not fit in VRAM, so the GPU's memory does not decide it; the RAM does.  Q8_0 when the
-            three files fit the RAM the text model leaves, else the largest that fits (quant_for_ram), unless the
+            four files fit the RAM the text model leaves, else the largest that fits (quant_for_ram), unless the
             SSD offload is on (then the quant asked for, the rest read from the SSD).  The VAE (bf16); the
             Qwen3-VL-8B text encoder UD-Q4_K_XL (the model card's choice).  Each file is checked against the
             SHA-256 the Hugging Face API lists for it at the pinned revision.
@@ -37,6 +37,9 @@ FILES = {
             "71879ffd5321e6d10c3c87513e2b474b1252efa7f3dec2969214a9bf06a6dd5c"),
     "llm": ("unsloth/Qwen3-VL-8B-Instruct-GGUF", "Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf", 5_148_699_488,
             "e3d1a6e87c5cb31e054f2c3bc0dd82ffde052f613de5eef3665b7bd33c9b703e"),
+    # Qwen3-VL's vision encoder, for the edits: the reference images into the text encoder's prompt
+    "mmproj": ("unsloth/Qwen3-VL-8B-Instruct-GGUF", "mmproj-F16.gguf", 1_159_030_336,
+               "d406d03ebabefdef86a2c86bf0c1b65f9e046f7a81c218f25de4931b46a07fc4"),
 }
 QUANTS = ("Q4_K_M", "Q6_K", "Q8_0")
 LICENSE_NOTE = ("Qwen-Image-2.1-Turbo is under the Qwen Research License (not Apache 2.0): "
@@ -49,9 +52,9 @@ HOST_GB = 2.0          # the image engine's own RAM besides its files (its proce
 
 
 def ram_need_gb(quant: str) -> float:
-    """The RAM (GB) an image job keeps busy with `quant`: the three files, read through the OS file cache (the engine
+    """The RAM (GB) an image job keeps busy with `quant`: the four files, read through the OS file cache (the engine
     maps them), and the engine's own."""
-    return sum(FILES[k][2] for k in (quant, "vae", "llm")) / 1e9 + HOST_GB
+    return sum(FILES[k][2] for k in (quant, "vae", "llm", "mmproj")) / 1e9 + HOST_GB
 
 
 def quant_for_ram(ram_left_gb: float) -> tuple[str, bool]:
@@ -77,5 +80,6 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, uma: bool = False, 
     """The run config's "images" section (serve/images.py reads it)."""
     return {"model_name": "qwen-image-2.1-turbo", "exe": str(exe), "quant": quant,
             "diffusion_model": str(local_path(models_dir, quant)), "vae": str(local_path(models_dir, "vae")),
-            "llm": str(local_path(models_dir, "llm")), "gpu_policy": policy, "uma": bool(uma),
+            "llm": str(local_path(models_dir, "llm")), "vision": str(local_path(models_dir, "mmproj")),
+            "gpu_policy": policy, "uma": bool(uma),
             "ssd_offload": bool(ssd_offload)}

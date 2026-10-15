@@ -1211,13 +1211,24 @@ $("img-form").onsubmit = async (ev) => {
   const prompt = $("img-prompt").value.trim();
   if (!prompt) return;
   const size = $("img-size").value === "custom" ? `${$("img-w").value}x${$("img-h").value}` : $("img-size").value;
-  const body = {prompt, size, response_format: "b64_json"};
+  const refs = Array.from($("img-ref").files || []);
+  const body = {prompt, size: size === "auto" && !refs.length ? "1024x1024" : size, response_format: "b64_json"};
   if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
+  // with reference images: an edit, OpenAI's multipart form (the browser sets its boundary)
+  let url = "v1/images/generations", payload = JSON.stringify(body), hdrs = headers(true);
+  if (refs.length) {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(body)) form.append(k, String(v));
+    for (const f of refs) form.append("image[]", f, f.name);
+    url = "v1/images/edits";
+    payload = form;
+    hdrs = headers();
+  }
   $("img-go").disabled = true;
   const t0 = performance.now();
   $("img-hint").textContent = "Generating\u2026 (a minute or more on a small GPU)";
   try {
-    const r = await fetch("v1/images/generations", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+    const r = await fetch(url, {method: "POST", headers: hdrs, body: payload});
     const j = await r.json();
     if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
     for (const d of j.data) {

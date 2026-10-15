@@ -9,9 +9,9 @@
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time
 behind a FIFO (plan: one resident sequence).
-Image generation (optional, when the config has an "images" section): POST /v1/images/generations (OpenAI's shape,
-plus seed) runs Qwen-Image-2.1-Turbo on XeStrata's own image engine (strata-image, resident after the first image),
-one job at a time on the GPU the text engine uses (serve/images.py).
+Image generation (optional, when the config has an "images" section): POST /v1/images/generations and
+/v1/images/edits (OpenAI's shapes, plus seed) run Qwen-Image-2.1-Turbo on XeStrata's own image engine (strata-image,
+resident after the first image), one job at a time on the GPU the text engine uses (serve/images.py).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
@@ -5054,6 +5054,28 @@ def body_limit() -> int:
     return mib << 20 if mib > 0 else CHUNKED_BODY_MAX
 
 
+def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
+    """A multipart/form-data body (OpenAI's /v1/images/edits) -> (its text fields, the bytes of its image or image[]
+    files in order); whole numbers in the fields (n, seed, steps) as ints."""
+    from email.parser import BytesParser
+    from email.policy import HTTP
+    msg = BytesParser(policy=HTTP).parsebytes(b"Content-Type: " + ctype.encode("latin-1") + b"\r\n\r\n" + body)
+    if not msg.is_multipart():
+        raise ValueError("the multipart/form-data body could not be read")
+    fields: dict = {}
+    files: list[bytes] = []
+    for part in msg.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        raw = part.get_payload(decode=True)
+        data = raw if isinstance(raw, bytes) else b""
+        if name in ("image", "image[]"):
+            files.append(data)
+        elif isinstance(name, str) and name:
+            value = data.decode("utf-8", "replace")
+            fields[name] = int(value) if name in ("n", "seed", "steps") and value.strip().isdigit() else value
+    return fields, files
+
+
 class BadBody(Exception):
     """A request body that cannot be read (a malformed or oversized chunked body): the status and the sentence."""
 
@@ -5558,6 +5580,9 @@ def make_handler(svc: Service):
                                headers={"Retry-After": int(ra)} if ra else None)
                 return
             try:
+                if path == "/v1/images/edits":                # a form (OpenAI's multipart) or JSON: read there
+                    self._images_edit()
+                    return
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
@@ -5686,11 +5711,49 @@ def make_handler(svc: Service):
                                                       "with --images qwen-image)"}})
                 return
             job = images_api.parse_request(req, gen.cfg)        # ImageRequestError (a ValueError): 400
+            self._image_job(gen, job)
+
+        def _images_edit(self):
+            """POST /v1/images/edits (serve/images.py): reference images and a prompt in OpenAI's multipart form (image
+            or image[]), or JSON (images: [{"image_url": ...}], or image: a URL or a list), one image job in the GPU's
+            turn.  The images are read as a chat's are (data: URLs, http(s) URLs, local paths; formats stb_image does
+            not read converted to PNG)."""
+            gen = svc.images
+            if gen is None:
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
+                                           "message": "image generation is not set up on this server (run setup "
+                                                      "with --images qwen-image)"}})
+                return
+            body = self._body()
+            ctype = self.headers.get("Content-Type", "") or ""
+            if ctype.lower().startswith("multipart/form-data"):
+                req, files = parse_multipart(ctype, body)
+            else:
+                req = json.loads(body or b"{}")
+                if not isinstance(req, dict):
+                    raise ValueError("send a JSON object or a multipart form")
+                srcs = req.pop("images", None) or req.pop("image", None) or []
+                if isinstance(srcs, (str, dict)):
+                    srcs = [srcs]
+                files = []
+                for src in srcs:
+                    url = src.get("image_url") if isinstance(src, dict) else src
+                    if isinstance(url, dict):
+                        url = url.get("url")
+                    if not isinstance(url, str) or not url:
+                        raise ValueError("images: [{\"image_url\": a data: URL, an http(s) URL or a path}]")
+                    files.append(Vision.load(url))
+            job = images_api.parse_edit_request(req, [Vision.normalize(d) for d in files], gen.cfg)
+            self._image_job(gen, job)
+
+        def _image_job(self, gen, job):
+            """One image job (a generation or an edit) in the GPU's turn, answered as OpenAI's images API does."""
             svc.last_request_at = time.time()
             cancel = threading.Event()
             self._watch_client(cancel)
             print(f"[strata] image: {job['width']}x{job['height']}, n={job['n']}, {job['steps']} steps, "
-                  f"seed {job['seed']}", flush=True)
+                  f"seed {job['seed']}" + (f", {len(job['refs'])} reference image(s)" if job.get("refs") else ""),
+                  flush=True)
             try:
                 with images_api.gpu_turn(svc, gen, job, cancel) as policy:
                     images, figures = gen.run(job, cancel)
