@@ -9,6 +9,7 @@
 // and V (the prefix cache), and the later ones compute the image's rows alone.
 #pragma once
 
+#include "strata/image/qi_stream.hpp"
 #include "strata/prefill/gemm.hpp"
 
 #include <cstdint>
@@ -52,8 +53,18 @@ public:
 
     int64_t channels() const { return in_ch_; }
     int64_t hidden() const { return C_; }
-    /// The bytes the weights take on the GPU.
+    /// The bytes the weights outside the blocks take on the GPU (always there), and the blocks' (in the file).
     uint64_t weight_bytes() const { return weight_bytes_; }
+    uint64_t block_bytes() const { return blocks_stream_.total(); }
+    /// The two slots a streamed block walk takes at least.
+    uint64_t block_min() const { return 2 * (blocks_stream_.count() ? blocks_stream_.bytes(0) : 0); }
+    /// The VRAM the blocks may take: those that fit stay, the rest are streamed (LayerStream).
+    void set_block_budget(uint64_t bytes) { blocks_stream_.configure(bytes, s_); }
+    int resident_blocks() const { return blocks_stream_.resident(); }
+    /// Frees the blocks' VRAM (they come back from the file on use).
+    void drop_blocks() { blocks_stream_.drop(); }
+    /// Frees the activations (grown again on use).
+    void drop_activations();
 
 private:
     struct W {
@@ -63,8 +74,8 @@ private:
         uint64_t row_bytes = 0;
     };
     struct Block {
-        W q, k, v, o, gu, down;
-        const float *nq = nullptr, *nk = nullptr;
+        W q, k, v, o, gu, down;   // d: the offset within the block's region (LayerStream)
+        uint64_t nq = 0, nk = 0;  // the FP32 norms' offsets
         uint16_t *pk = nullptr, *pv = nullptr;   // the text rows' K and V (the prefix cache)
     };
     W upload(const std::string& name);
@@ -83,6 +94,7 @@ private:
     W t1_, t2_, mod_, nout_, pout_, tin_, tout_, iin_;
     const float* tnorm_ = nullptr;
     std::vector<Block> blocks_;
+    LayerStream blocks_stream_;
     // activations, grown on demand
     int64_t cap_T_ = 0;
     float *x_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *h_ = nullptr, *gu_ = nullptr;

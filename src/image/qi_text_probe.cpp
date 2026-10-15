@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -55,6 +56,7 @@ int main(int argc, char** argv) {
         strata::image::QiText te;
         std::string err;
         if (!te.open(argv[1], s, err)) throw std::runtime_error(err);
+        if (const char* b = std::getenv("QI_LAYER_BUDGET_MIB")) te.set_layer_budget(std::strtoull(b, nullptr, 10) << 20);
         const std::string dir = argv[2];
         const auto ids = load<int32_t>(dir + "/te_tokens_0.bin");
         const auto want = load<float>(dir + "/te_hidden_0.bin");
@@ -65,8 +67,8 @@ int main(int argc, char** argv) {
         const auto C = (size_t) te.hidden();
         compare("all", got.data(), want.data(), got.size());
         if (ids.size() > 14) compare("context", got.data() + 14 * C, want.data() + 14 * C, got.size() - 14 * C);
-        std::printf("text encoder: %.2f GB, %zu tokens in %.3f s\n", (double) te.weight_bytes() / 1e9, ids.size(),
-                    secs);
+        std::printf("text encoder: %.2f GB of layers, %d resident, %zu tokens in %.3f s\n",
+                    (double) te.layer_bytes() / 1e9, te.resident_layers(), ids.size(), secs);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-image-text-probe: %s\n", e.what());
         return 1;

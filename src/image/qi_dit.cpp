@@ -153,18 +153,39 @@ bool QiDit::open(const std::string& path, void* stream, std::string& err) {
         tout_ = upload("txt_in.out_layer.weight");
         tnorm_ = upload_f32("txt_in.text_norm.weight", 1.0f);   // zero-centred: the weight is w + 1
         int64_t scratch = 0;
-        for (int i = 0;; ++i) {
+        for (int i = 0;; ++i) {   // the blocks: spans of the mapped file, on the GPU through blocks_stream_
             const std::string p = "transformer_blocks." + std::to_string(i) + ".";
             if (g_->find("model.diffusion_model." + p + "attn.to_q.weight") == nullptr) break;
             Block b;
-            b.q = upload(p + "attn.to_q.weight");
-            b.k = upload(p + "attn.to_k.weight");
-            b.v = upload(p + "attn.to_v.weight");
-            b.o = upload(p + "attn.to_out.0.weight");
-            b.gu = upload(p + "img_mlp.gate_up.weight");
-            b.down = upload(p + "img_mlp.out.weight");
-            b.nq = upload_f32(p + "attn.norm_q.weight");
-            b.nk = upload_f32(p + "attn.norm_k.weight");
+            std::vector<LayerStream::Span> spans;
+            auto span = [&](const std::string& name, W& w) {
+                const std::string full = std::string(p).append(name);
+                const TensorInfo* t = g_->find(std::string("model.diffusion_model.").append(full));
+                if (t == nullptr) throw std::runtime_error(std::string("image engine: the DiT has no ").append(full));
+                w.type = (int) t->type;
+                w.k = (int64_t) t->shape[0];
+                w.n = t->shape.size() > 1 ? (int64_t) t->shape[1] : 1;
+                const uint64_t bytes = tensor_payload_bytes(*t);
+                w.row_bytes = bytes / (uint64_t) w.n;
+                spans.push_back({g_->tensor_data(*t), bytes, 0});
+                return spans.size() - 1;
+            };
+            W nq, nk;
+            const size_t iq = span("attn.to_q.weight", b.q), ik = span("attn.to_k.weight", b.k),
+                         iv = span("attn.to_v.weight", b.v), io = span("attn.to_out.0.weight", b.o),
+                         ig = span("img_mlp.gate_up.weight", b.gu), id = span("img_mlp.out.weight", b.down),
+                         inq = span("attn.norm_q.weight", nq), ink = span("attn.norm_k.weight", nk);
+            if (nq.type != 0 || nk.type != 0) throw std::runtime_error("image engine: the DiT's q/k norms are not FP32");
+            const int layer = blocks_stream_.add(spans);
+            auto off = [&](size_t k) { return blocks_stream_.offset(layer, (int) k); };
+            b.q.d = reinterpret_cast<const void*>(off(iq));
+            b.k.d = reinterpret_cast<const void*>(off(ik));
+            b.v.d = reinterpret_cast<const void*>(off(iv));
+            b.o.d = reinterpret_cast<const void*>(off(io));
+            b.gu.d = reinterpret_cast<const void*>(off(ig));
+            b.down.d = reinterpret_cast<const void*>(off(id));
+            b.nq = off(inq);
+            b.nk = off(ink);
             for (const W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down}) scratch = std::max(scratch, w->n * w->k);
             blocks_.push_back(b);
         }
@@ -174,6 +195,7 @@ bool QiDit::open(const std::string& path, void* stream, std::string& err) {
         for (const W* w : {&t1_, &t2_, &mod_, &nout_, &pout_, &tin_, &tout_, &iin_})
             scratch = std::max(scratch, w->n * w->k);
         if (!gemm_.init(s_, scratch, err)) return false;
+        blocks_stream_.configure(blocks_stream_.total(), s_);   // all resident until a budget is set
         temb_ = alloc<float>(allocs_, 2 * C_);
         mods_ = alloc<float>(allocs_, 8 * C_);
         scale_ = alloc<float>(allocs_, 2 * C_);
@@ -303,12 +325,22 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
     auto mod = [&](int i) { return mods_ + (int64_t) i * 2 * C; };
     float* xr = x_ + r0 * C;
     const size_t text_bytes = (size_t) (n_text_ * C) * 2;
-    for (Block& b : blocks_) {
+    for (int bi = 0; bi < (int) blocks_.size(); ++bi) {
+        Block& b = blocks_[(size_t) bi];
+        const uint8_t* base = blocks_stream_.begin(bi);   // the block's weights on the GPU (resident or a slot)
+        auto at = [base](const QiDit::W& w) {
+            QiDit::W r = w;
+            r.d = base + reinterpret_cast<uintptr_t>(w.d);
+            return r;
+        };
+        const QiDit::W wq = at(b.q), wk = at(b.k), wv = at(b.v), wo = at(b.o), wgu = at(b.gu), wdown = at(b.down);
+        const auto* nq = reinterpret_cast<const float*>(base + b.nq);
+        const auto* nk = reinterpret_cast<const float*>(base + b.nk);
         qi_ln_mod16(xr, mod(0), ntr, Tr, C, h16_, s_);
-        product(h16_, b.q, q_ + r0 * C, Tr);
-        product(h16_, b.k, k_ + r0 * C, Tr);
-        product(h16_, b.v, v_ + r0 * C, Tr);
-        qi_qk_norm_rope16(q_ + r0 * C, k_ + r0 * C, v_ + r0 * C, b.nq, b.nk, cos_ + r0 * kHead / 2,
+        product(h16_, wq, q_ + r0 * C, Tr);
+        product(h16_, wk, k_ + r0 * C, Tr);
+        product(h16_, wv, v_ + r0 * C, Tr);
+        qi_qk_norm_rope16(q_ + r0 * C, k_ + r0 * C, v_ + r0 * C, nq, nk, cos_ + r0 * kHead / 2,
                           sin_ + r0 * kHead / 2, Tr, heads_, kHead, q16_ + r0 * C, k16_ + r0 * C, v16_ + r0 * C, s_);
         if (n_text_ > 0) {
             if (prefix) {
@@ -320,17 +352,31 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
             }
         }
         qi_attention(q16_, k16_, v16_, T, heads_, kHead, n_text_, o16_, attn_scratch_, s_);
-        product(o16_ + r0 * C, b.o, h_, Tr);
+        product(o16_ + r0 * C, wo, h_, Tr);
         qi_gate_add(xr, h_, mod(1), ntr, Tr, C, s_);
         qi_ln_mod16(xr, mod(2), ntr, Tr, C, h16_, s_);
-        product(h16_, b.gu, gu_, Tr);
+        product(h16_, wgu, gu_, Tr);
         qi_swiglu16(gu_, Tr, inter_, h16_, s_);
-        product(h16_, b.down, h_, Tr);
+        product(h16_, wdown, h_, Tr);
         qi_gate_add(xr, h_, mod(3), ntr, Tr, C, s_);
+        blocks_stream_.end(bi);
     }
     qi_ln_mod16(x_ + n_text_ * C, scale_, 0, HW, C, h16_, s_);   // the final norm: row 0 of scale_ for every token
     product(h16_, pout_, h_, HW);
     qi_tokens_latent(h_, in_ch_, HW, out, s_);
+}
+
+void QiDit::drop_activations() {
+    for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) h_, (void*) gu_, (void*) h16_, (void*) q16_,
+                    (void*) k16_, (void*) v16_, (void*) o16_, (void*) cos_, (void*) sin_, (void*) attn_scratch_})
+        if (p != nullptr) {
+            allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), p), allocs_.end());
+            gpu::free(p);
+        }
+    x_ = q_ = k_ = v_ = h_ = gu_ = cos_ = sin_ = attn_scratch_ = nullptr;
+    h16_ = q16_ = k16_ = v16_ = o16_ = nullptr;
+    cap_T_ = 0;
+    rope_H_ = rope_W_ = rope_text_ = -1;
 }
 
 void QiDit::sample(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas) {

@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -64,7 +65,9 @@ int main(int argc, char** argv) {
         std::string err;
         const auto t0 = std::chrono::steady_clock::now();
         if (!dit.open(argv[1], s, err)) throw std::runtime_error(err);
-        std::printf("DiT: %.2f GB on the GPU, loaded in %.1f s\n", (double) dit.weight_bytes() / 1e9,
+        if (const char* b = std::getenv("QI_BLOCK_BUDGET_MIB")) dit.set_block_budget(std::strtoull(b, nullptr, 10) << 20);
+        std::printf("DiT: %.2f GB of blocks, %d resident, %.2f GB besides; opened in %.1f s\n",
+                    (double) dit.block_bytes() / 1e9, dit.resident_blocks(), (double) dit.weight_bytes() / 1e9,
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         const auto noise = load(dir, "noise"), cond = load(dir, "cond"), want_latent = load(dir, "latent_final");
         const int64_t C = dit.channels(), n_text = (int64_t) cond.size() / dit.hidden();
