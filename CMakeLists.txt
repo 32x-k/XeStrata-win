@@ -600,7 +600,7 @@ if(STRATA_ENABLE_XE)
 
   # the image engine (Qwen-Image-2.1's DiT, src/image/): its kernels, and strata-image-probe, one block of the DiT
   # against tools/image/qi21_ref.py's NumPy reference, timed
-  add_library(strata_image STATIC src/image/qi_kernels.cpp)
+  add_library(strata_image STATIC src/image/qi_kernels.cpp src/image/qi_attn.cpp)
   target_include_directories(strata_image PUBLIC include)
   target_link_libraries(strata_image PUBLIC strata_prefill)
   add_executable(strata-image-probe src/image/qi_block_probe.cpp)

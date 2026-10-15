@@ -12,6 +12,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/qi_kernels.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/prefill/gemm.hpp"
 
 #include <algorithm>
@@ -128,7 +129,9 @@ int main(int argc, char** argv) {
         float* v = device<float>(T * C);
         float* a = device<float>(T * C);
         float* gu = device<float>(T * 2 * inter);
-        uint16_t *q16 = device<uint16_t>(T * C), *k16 = device<uint16_t>(T * C), *v16 = device<uint16_t>(T * C);
+        const int64_t TP = strata::image::qi_attn_rows(T);
+        uint16_t *q16 = device<uint16_t>(TP * C), *k16 = device<uint16_t>(TP * C), *v16 = device<uint16_t>(TP * C);
+        for (uint16_t* z : {q16, k16, v16}) gpu::memset(z, 0, TP * C * sizeof(uint16_t));
         auto mod = [&](int i) { return md + (int64_t) i * 2 * C; };
 
         auto products_qkv = [&]() {
@@ -150,6 +153,8 @@ int main(int argc, char** argv) {
             strata::image::qi_gate_add(x, q, mod(3), n_text, T, C, s);
         };
         auto attention = [&]() { qi_attention_plain(q16, k16, v16, T, H, 128, n_text, a, s); };
+        uint16_t* o16 = device<uint16_t>(T * C);
+        auto attention_mx = [&]() { strata::image::qi_attention(q16, k16, v16, T, H, 128, n_text, o16, a, s); };
         auto sync = [&]() {
             if (!gpu::stream_sync(s)) throw std::runtime_error(std::string("sync: ") + gpu::last_error());
         };
@@ -169,6 +174,18 @@ int main(int argc, char** argv) {
         gpu::copy(got.data(), x, got.size() * sizeof(float));
         compare("attn", got_attn, want_attn);
         compare("block", got, want);
+        reset();
+        products_qkv();
+        attention_mx();
+        sync();
+        {
+            std::vector<uint16_t> h(T * C);
+            gpu::copy(h.data(), o16, h.size() * sizeof(uint16_t));
+            std::vector<float> f(h.size());
+            for (size_t i = 0; i < h.size(); ++i) f[i] = strata::kernels::f32_from_f16(h[i]);
+            std::printf("attention path: %s\n", strata::image::qi_attention_path());
+            compare("attn16", f, want_attn);
+        }
 
         auto timed = [&](auto&& fn) {
             std::vector<double> ms;
@@ -186,9 +203,12 @@ int main(int argc, char** argv) {
         };
         const double t_prod = timed([&]() { products_qkv(); products_rest(); });
         const double t_attn = timed(attention);
+        const double t_mx = timed(attention_mx);
         const double flops = 2.0 * (double) T * (4.0 * (double) C * (double) C + 3.0 * (double) C * (double) inter);
-        std::printf("time: products and element kernels %.2f ms (%.1f TFLOPS), plain attention %.2f ms\n", t_prod,
-                    flops / t_prod / 1e9, t_attn);
+        const double aflops = 4.0 * (double) T * (double) T * (double) C;
+        std::printf("time: products and element kernels %.2f ms (%.1f TFLOPS), plain attention %.2f ms, "
+                    "attention %.2f ms (%.1f TFLOPS)\n", t_prod, flops / t_prod / 1e9, t_attn, t_mx,
+                    aflops / t_mx / 1e9);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-image-probe: %s\n", e.what());
         return 1;
