@@ -7,11 +7,12 @@ with the text engine).
 
 setup.py (--images qwen-image) and tools/image/install.py use these pieces; serve/images.py runs the result.
 
-  files     the denoiser (DiT) quant: Q8_0 by default (Unsloth's LPIPS vs bf16: Q4_K_M 0.153, Q6_K 0.055, Q8_0 0.036);
-            the engine streams what does not fit in VRAM, so the GPU's memory does not decide it, and the smaller
-            files only save disk and RAM.  The VAE (bf16); the Qwen3-VL-8B text encoder UD-Q4_K_XL (the model card's
-            choice).  Each file is checked against the SHA-256 the Hugging Face API lists for it at the pinned
-            revision.
+  files     the denoiser (DiT) quant (Unsloth's LPIPS vs bf16: Q4_K_M 0.153, Q6_K 0.055, Q8_0 0.036): the engine
+            streams what does not fit in VRAM, so the GPU's memory does not decide it; the RAM does.  Q8_0 when the
+            three files fit the RAM the text model leaves, else the largest that fits (quant_for_ram), unless the
+            SSD offload is on (then the quant asked for, the rest read from the SSD).  The VAE (bf16); the
+            Qwen3-VL-8B text encoder UD-Q4_K_XL (the model card's choice).  Each file is checked against the
+            SHA-256 the Hugging Face API lists for it at the pinned revision.
 """
 from __future__ import annotations
 
@@ -44,6 +45,22 @@ LICENSE_NOTE = ("Qwen-Image-2.1-Turbo is under the Qwen Research License (not Ap
 MODEL_DIR = "qwen-image-2.1-turbo"
 IMAGE_EXE = "strata-image.exe" if os.name == "nt" else "strata-image"
 DEFAULT_QUANT = "Q8_0"
+HOST_GB = 2.0          # the image engine's own RAM besides its files (its process, the pinned relay, the prompt states)
+
+
+def ram_need_gb(quant: str) -> float:
+    """The RAM (GB) an image job keeps busy with `quant`: the three files, read through the OS file cache (the engine
+    maps them), and the engine's own."""
+    return sum(FILES[k][2] for k in (quant, "vae", "llm")) / 1e9 + HOST_GB
+
+
+def quant_for_ram(ram_left_gb: float) -> tuple[str, bool]:
+    """The largest denoiser whose files fit `ram_left_gb` (the RAM the text model leaves) -> (quant, fits); the
+    smallest, not fitting, when none does."""
+    for q in reversed(QUANTS):
+        if ram_need_gb(q) <= ram_left_gb:
+            return q, True
+    return QUANTS[0], False
 
 
 def file_url(name: str, endpoint: str = "https://huggingface.co") -> str:
@@ -55,8 +72,10 @@ def local_path(models_dir: Path, name: str) -> Path:
     return Path(models_dir) / MODEL_DIR / Path(FILES[name][1]).name
 
 
-def image_config(quant: str, exe: Path, models_dir: Path, *, uma: bool = False, policy: str = "auto") -> dict:
+def image_config(quant: str, exe: Path, models_dir: Path, *, uma: bool = False, policy: str = "auto",
+                 ssd_offload: bool = False) -> dict:
     """The run config's "images" section (serve/images.py reads it)."""
     return {"model_name": "qwen-image-2.1-turbo", "exe": str(exe), "quant": quant,
             "diffusion_model": str(local_path(models_dir, quant)), "vae": str(local_path(models_dir, "vae")),
-            "llm": str(local_path(models_dir, "llm")), "gpu_policy": policy, "uma": bool(uma)}
+            "llm": str(local_path(models_dir, "llm")), "gpu_policy": policy, "uma": bool(uma),
+            "ssd_offload": bool(ssd_offload)}

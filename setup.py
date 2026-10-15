@@ -32,8 +32,8 @@ answers, no questions), --setup (install another model / change settings instead
 (EXPERIMENTAL, off by default),
 --models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --check (only check this PC), --check-update
 (whether a newer XeStrata release is out), --images qwen-image|no (image generation: Qwen-Image-2.1-Turbo on
-XeStrata's image engine, POST /v1/images/generations; --image-quant Q4_K_M|Q6_K|Q8_0, --image-gpu-policy
-auto|keep|shrink|unload).
+XeStrata's image engine, POST /v1/images/generations; --image-quant Q4_K_M|Q6_K|Q8_0, --image-ssd-offload on|off,
+--image-gpu-policy auto|keep|shrink|unload).
 
 Setup recommends, it never forces: the recommended answers are the defaults (--yes, or Enter), and a bigger choice
 than it recommends - a longer context, a size it thinks will not fit - is kept, with what it risks.  With --yes, an
@@ -2300,16 +2300,50 @@ def _qimage():
     return qimage
 
 
-def setup_images(a, gpu: dict, models_dir: Path, eng: Path) -> dict | None:
+def text_ram_gb(args: list, ram: float, model: str | None = None) -> float:
+    """The RAM (GB) the text model's run config keeps for itself, the OS's room included: its RAM budget and the
+    OS's room (--resident-budget-gib), all of it when its experts are read through the file cache (--mmap-experts),
+    else the size's RAM (MODELS' "ram_gb") and a KV cache streamed into RAM (--kv-resident)."""
+    def val(flag):
+        return args[args.index(flag) + 1] if flag in args and args.index(flag) + 1 < len(args) else None
+    if "--mmap-experts" in args:
+        return ram
+    if val("--resident-budget-gib") is not None:
+        return float(val("--resident-budget-gib")) + UNSLOTH_RAM_LEFT_GB
+    gb = float(MODELS[model].get("ram_gb", ram)) if model in MODELS else ram
+    if "--kv-resident" in args and val("--max-context"):
+        gb += kv_streaming_ram_gb(int(val("--max-context")), val("--kv") or "int8")
+    return gb
+
+
+def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | None = None) -> dict | None:
     """--images qwen-image: Qwen-Image-2.1-Turbo's three files for the image engine in `eng` -> the run config's
-    "images" section (serve/images.py); None for --images no, or when not wanted after all."""
+    "images" section (serve/images.py); None for --images no, or when not wanted after all.  `text_gb`: the RAM the
+    text model keeps (text_ram_gb): the denoiser's quant is the largest whose files fit the rest (the user's decision
+    of 2026-10-15), or the one asked for with --image-ssd-offload on (what does not fit read from the SSD)."""
     if not a.images or a.images == "no":
         return None
     QI = _qimage()
     exe = eng / IMAGE_EXE
     if not exe.exists():
         fail(f"the image engine is missing ({exe})", "run setup again to compile the engine (it builds both)")
-    quant = a.image_quant or QI.DEFAULT_QUANT
+    asked = a.image_quant or QI.DEFAULT_QUANT
+    ssd = getattr(a, "image_ssd_offload", None) == "on"
+    quant = asked
+    if not ssd and text_gb is not None:
+        left = ram_gb() - text_gb
+        fit, fits = QI.quant_for_ram(left)
+        if QI.QUANTS.index(fit) < QI.QUANTS.index(asked):
+            quant = fit
+            warn(f"image model {asked} needs ~{QI.ram_need_gb(asked):.0f} GB of RAM beside the text model "
+                 f"(~{left:.0f} GB left): {quant} instead. --image-ssd-offload on keeps {asked} and reads what does "
+                 "not fit from the SSD (slower)")
+        if not fits:
+            warn(f"even {quant} (~{QI.ram_need_gb(quant):.0f} GB) does not fit the ~{max(left, 0):.0f} GB of RAM "
+                 "the text model leaves: images read part of the model from the SSD (slower), and the PC may run "
+                 "short of RAM while one is made")
+    elif ssd:
+        ok(f"image model {quant} with SSD offload: what does not fit in RAM is read from the SSD")
     say(f"  Image generation: Qwen-Image-2.1-Turbo {quant} on XeStrata's image engine (8 steps; "
         "POST /v1/images/generations)")
     say("  " + QI.LICENSE_NOTE)
@@ -2325,7 +2359,7 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path) -> dict | None:
         download(QI.file_url(name, hf_endpoint()), dst, f"image model: {Path(path).name}")
         verify_sha256(dst, size, sha)
     cfg = QI.image_config(quant, exe, models_dir, uma=bool((gpu or {}).get("integrated")),
-                          policy=a.image_gpu_policy or "auto")
+                          policy=a.image_gpu_policy or "auto", ssd_offload=ssd)
     ok(f"image generation: {quant}, GPU policy {cfg['gpu_policy']}")
     return cfg
 
@@ -4006,8 +4040,11 @@ def main() -> int:
                     help="image generation (POST /v1/images/generations): Qwen-Image-2.1-Turbo on XeStrata's image "
                          "engine; no = take it out of the config")
     ap.add_argument("--image-quant", choices=["Q4_K_M", "Q6_K", "Q8_0"],
-                    help="the image model's size (default Q8_0; the smaller ones save disk and RAM, the GPU's memory "
-                         "does not need them)")
+                    help="the image model's size (default Q8_0, lowered when its files would not fit the RAM the "
+                         "text model leaves; the GPU's memory does not decide it)")
+    ap.add_argument("--image-ssd-offload", choices=["on", "off"],
+                    help="on: keep the image model's size even when the RAM is short, and read what does not fit "
+                         "from the SSD (slower); off (default): a smaller size instead")
     ap.add_argument("--image-gpu-policy", choices=["auto", "keep", "shrink", "unload"],
                     help="what the text model does during an image job (default auto: stays loaded when both fit, "
                          "else gives VRAM back or is unloaded and its conversation restored afterwards)")
@@ -4893,7 +4930,8 @@ def main() -> int:
     elif a.vision_tokens is not None:
         warn("--vision-tokens: images are off for this model, so it is not used")
     if a.images:                                       # only when given: else an earlier "images" is carried over
-        cfg["images"] = setup_images(a, gpu, Path(a.models_dir), Path(cfg["exe"]).parent)
+        cfg["images"] = setup_images(a, gpu, Path(a.models_dir), Path(cfg["exe"]).parent,
+                                     text_ram_gb(cfg["args"], ram, model))
     return finish_setup(a, cfg, tag, port, adopted, vision != "none",
                         notes=agent_cache_note(cfg["args"], ram, MODELS[model]["ram_gb"]))
 

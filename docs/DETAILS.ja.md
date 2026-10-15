@@ -1243,7 +1243,9 @@ XeStrata はそれを、プロンプトの `<|image_pad|>` のトークンの位
 `./setup.sh --images qwen-image` で、文章のモデルとは別に Qwen-Image-2.1-Turbo で画像を作れるようにします（upstream 0.1.44）。
 画像は XeStrata 自身の画像のエンジン `strata-image` が作ります。setup が文章のエンジンと一緒にビルドし、同じ SYCL のカーネルでどのメーカーの GPU でも動きます。
 setup は画像のモデル、VAE、文の読み手（Qwen3-VL-8B）をダウンロードして、設定に `"images"` を足します。
-画像のモデルは既定で Q8_0 です。VRAM に入らない層はエンジンが RAM から流し込むので、GPU のメモリで大きさを選ぶ必要はありません（`--image-quant` で Q6_K や Q4_K_M にすると、ディスクと RAM が少なくて済みます）。
+画像のモデルは既定で Q8_0 です。VRAM に入らない層はエンジンが RAM から流し込むので、GPU のメモリでは大きさを選びません。
+選ぶのは RAM です。3 つのファイルとエンジンの分（Q8_0 で約 15.5 GB、Q6_K で約 14 GB、Q4_K_M で約 12 GB）が文章のモデルの残す RAM に入らなければ、setup は入る中で最も大きいもの（Q6_K、Q4_K_M）に下げます。
+`--image-ssd-offload on` なら下げずに選んだ大きさのまま入れ、入らない分は SSD から読みます（遅くなります）。
 同じ種なら、stable-diffusion.cpp がモデルのカードのコマンドで作る画像と同じ画像になります（LPIPS 0.03 以内）。
 Qwen-Image-2.1-Turbo の重みは Qwen Research License で、自由なソフトウェアのライセンスではありません。商用に使う前にそのライセンスを読んでください。
 
