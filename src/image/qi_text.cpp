@@ -59,6 +59,10 @@ bool QiText::open(const std::string& path, void* stream, std::string& err, bool 
         inter_ = (int64_t) num("feed_forward_length", 12288);
         theta_ = (float) num("rope.freq_base", 5e6);
         eps_ = (float) num("attention.layer_norm_rms_epsilon", 1e-6);
+        if (const MetaValue* sec = g_->get(a + ".rope.dimension_sections"); sec != nullptr && sec->items.size() >= 3) {
+            sec_h_ = (int) sec->items[1].num();
+            sec_w_ = (int) sec->items[2].num();
+        }
         if (layers <= 0) throw std::runtime_error("image engine (text): " + path + " has no blocks");
         const TensorInfo* e = g_->find("token_embd.weight");
         if (e == nullptr) throw std::runtime_error("image engine (text): no token_embd.weight");
@@ -137,10 +141,41 @@ void QiText::ensure(int64_t T) {
     cap_T_ = T;
 }
 
-std::vector<float> QiText::encode(const std::vector<int32_t>& ids) {
+std::vector<float> QiText::encode(const std::vector<int32_t>& ids, const std::vector<Image>& images) {
     const auto T = (int64_t) ids.size();
     if (T == 0) return {};
     ensure(T);
+    // the positions: each token its index, the images' tokens (time, row, column) from their first index, the tokens
+    // after an image moved on by its longer side less its count (Qwen3-VL's M-RoPE, as stable-diffusion.cpp builds it)
+    std::vector<int32_t> pos3;
+    int32_t* dpos = nullptr;
+    std::vector<float*> ds;   // the images' DeepStack blocks on the GPU, image by image, layer by layer
+    if (!images.empty()) {
+        pos3.resize((size_t) (3 * T));
+        for (int64_t t = 0; t < T; ++t) pos3[(size_t) t] = pos3[(size_t) (T + t)] = pos3[(size_t) (2 * T + t)] = (int32_t) t;
+        int64_t offset = 0;
+        for (const Image& im : images) {
+            if (im.index < 0 || im.index + im.rows > T || im.rows != im.grid_h * im.grid_w)
+                throw std::invalid_argument("image engine (text): an image's tokens do not fit the prompt");
+            const int64_t end = im.index + im.rows, next = im.index + std::max(im.grid_h, im.grid_w) + offset;
+            for (int64_t t = end; t < T; ++t)
+                for (int a = 0; a < 3; ++a) pos3[(size_t) (a * T + t)] = (int32_t) (next + t - end);
+            for (int64_t r = 0; r < im.rows; ++r) {
+                const int64_t base = im.index + offset;
+                pos3[(size_t) (im.index + r)] = (int32_t) base;
+                pos3[(size_t) (T + im.index + r)] = (int32_t) (base + r / im.grid_w);
+                pos3[(size_t) (2 * T + im.index + r)] = (int32_t) (base + r % im.grid_w);
+            }
+            offset += std::max(im.grid_h, im.grid_w) - im.rows;
+            for (const float* d : im.deepstack) {
+                float* g = alloc<float>(allocs_, im.rows * C_);
+                gpu::copy(g, d, (size_t) (im.rows * C_) * 4);
+                ds.push_back(g);
+            }
+        }
+        dpos = alloc<int32_t>(allocs_, 3 * T);
+        gpu::copy(dpos, pos3.data(), pos3.size() * 4);
+    }
     // the prompt's embedding rows, gathered from the mapped file, expanded on the GPU
     std::vector<uint8_t> host((size_t) (T * (int64_t) embd_row_bytes_));
     for (int64_t t = 0; t < T; ++t)
@@ -148,6 +183,8 @@ std::vector<float> QiText::encode(const std::vector<int32_t>& ids) {
                     embd_row_bytes_);
     gpu::copy(rows_, host.data(), host.size());
     kernels::dequant_f32(embd_type_, rows_, 0, T, C_, x_, s_);
+    for (const Image& im : images)   // the image pads' rows: the vision encoder's embeddings
+        gpu::copy_async(x_ + im.index * C_, im.main, (size_t) (im.rows * C_) * 4, s_);
     for (int li = 0; li < (int) layers_.size(); ++li) {
         const Layer& l = layers_[(size_t) li];
         const uint8_t* base = layers_stream_.begin(li);
@@ -157,7 +194,8 @@ std::vector<float> QiText::encode(const std::vector<int32_t>& ids) {
         gemm_.native(h16_, l.q.type, w(l.q), q_, T, l.q.n, l.q.k);
         gemm_.native(h16_, l.k.type, w(l.k), k_, T, l.k.n, l.k.k);
         gemm_.native(h16_, l.v.type, w(l.v), v_, T, l.v.n, l.v.k);
-        qi_text_qk_rope16(q_, k_, v_, f(l.qn), f(l.kn), T, heads_, kv_heads_, head_dim_, theta_, q16_, k16_, v16_, s_);
+        qi_text_qk_rope16(q_, k_, v_, f(l.qn), f(l.kn), T, heads_, kv_heads_, head_dim_, theta_, q16_, k16_, v16_, s_,
+                          dpos, sec_h_, sec_w_);
         qi_attention_causal(q16_, k16_, v16_, T, heads_, kv_heads_, head_dim_, a_, s_);
         qi_to_f16(a_, T * C_, h16_, s_);
         gemm_.native(h16_, l.o.type, w(l.o), h_, T, l.o.n, l.o.k);
@@ -169,10 +207,16 @@ std::vector<float> QiText::encode(const std::vector<int32_t>& ids) {
         gemm_.native(h16_, l.down.type, w(l.down), h_, T, l.down.n, l.down.k);
         qi_axpy(x_, h_, 1.0f, T * C_, s_);
         layers_stream_.end(li);
+        size_t k = 0;   // DeepStack: after layer li, the images' tokens get their block li
+        for (const Image& im : images)
+            for (size_t d = 0; d < im.deepstack.size(); ++d, ++k)
+                if ((int) d == li) qi_axpy(x_ + im.index * C_, ds[k], 1.0f, im.rows * C_, s_);
     }
     std::vector<float> out((size_t) (T * C_));
     gpu::stream_sync(s_);
     gpu::copy(out.data(), x_, out.size() * 4);
+    for (float* g : ds) release(allocs_, g);
+    release(allocs_, dpos);
     return out;
 }
 

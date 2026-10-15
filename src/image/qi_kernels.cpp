@@ -204,7 +204,7 @@ void qi_attention_plain(const uint16_t* q16, const uint16_t* k16, const uint16_t
 
 void qi_text_qk_rope16(const float* q, const float* k, const float* v, const float* wq, const float* wk, int64_t T,
                        int64_t q_heads, int64_t kv_heads, int64_t head_dim, float theta, uint16_t* q16, uint16_t* k16,
-                       uint16_t* v16, void* stream) {
+                       uint16_t* v16, void* stream, const int32_t* pos3, int sec_h, int sec_w) {
     if (T <= 0) return;
     if (head_dim % 2 != 0 || head_dim > 256) throw std::invalid_argument("qi_text_qk_rope16: head_dim");
     const size_t local = (size_t) head_dim;
@@ -224,7 +224,11 @@ void qi_text_qk_rope16(const float* q, const float* k, const float* v, const flo
             row[d] = n;
             sycl::group_barrier(it.get_group());
             const int64_t j = d < half ? d : d - half;
-            const float ang = (float) t * sycl::pow(theta, -2.0f * (float) j / (float) head_dim);
+            float pos = (float) t;
+            if (pos3 != nullptr)
+                pos = (float) (j % 3 == 1 && j < 3 * (int64_t) sec_h ? pos3[T + t]
+                               : j % 3 == 2 && j < 3 * (int64_t) sec_w ? pos3[2 * T + t] : pos3[t]);
+            const float ang = pos * sycl::pow(theta, -2.0f * (float) j / (float) head_dim);
             const float c = sycl::cos(ang), s = sycl::sin(ang);
             const float out = d < half ? n * c - row[d + half] * s : n * c + row[d - half] * s;
             (isq ? q16 : k16)[i] = f16_from_f32(out);

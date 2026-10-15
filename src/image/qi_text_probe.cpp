@@ -6,7 +6,8 @@
 //   strata-image-text-probe TEXT_ENCODER.gguf DUMP_DIR
 //
 // Prints how far the states are from the run's (all rows, and the rows after the 14 of the system turn: the DiT's
-// context) and the encoder's time.
+// context) and the encoder's time.  An edit's run (vit_out_0_K, the reference image's embeddings): its image pads
+// (<|image_pad|>, a run of them) take those, as in the run.
 
 #include "strata/core/runtime.hpp"
 #include "strata/image/qi_text.hpp"
@@ -60,9 +61,32 @@ int main(int argc, char** argv) {
         const std::string dir = argv[2];
         const auto ids = load<int32_t>(dir + "/te_tokens_0.bin");
         const auto want = load<float>(dir + "/te_hidden_0.bin");
-        te.encode(ids);   // a warm-up
+        // an edit's run: the image pads' run and the vision encoder's outputs
+        constexpr int32_t kImagePad = 151655;
+        std::vector<strata::image::QiText::Image> images;
+        std::vector<std::vector<float>> vit;
+        const auto first = std::find(ids.begin(), ids.end(), kImagePad);
+        if (first != ids.end()) {
+            strata::image::QiText::Image im;
+            im.index = first - ids.begin();
+            im.rows = std::count(ids.begin(), ids.end(), kImagePad);
+            const auto side = (int64_t) std::lround(std::sqrt((double) im.rows));   // a square reference
+            im.grid_h = im.grid_w = side;
+            for (int k = 0;; ++k) {
+                std::ifstream f(dir + "/vit_out_0_" + std::to_string(k) + ".bin");
+                if (!f) break;
+                vit.push_back(load<float>(dir + "/vit_out_0_" + std::to_string(k) + ".bin"));
+            }
+            if (vit.empty()) throw std::runtime_error("image pads but no vit_out_0_0");
+            im.main = vit[0].data();
+            for (size_t k = 1; k < vit.size(); ++k) im.deepstack.push_back(vit[k].data());
+            images.push_back(im);
+            std::printf("image: %lld pads from %lld, %zu DeepStack blocks\n", (long long) im.rows, (long long) im.index,
+                        im.deepstack.size());
+        }
+        te.encode(ids, images);   // a warm-up
         const auto t0 = std::chrono::steady_clock::now();
-        const auto got = te.encode(ids);
+        const auto got = te.encode(ids, images);
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         const auto C = (size_t) te.hidden();
         compare("all", got.data(), want.data(), got.size());

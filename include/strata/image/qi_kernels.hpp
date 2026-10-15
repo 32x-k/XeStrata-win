@@ -42,11 +42,12 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
 const char* qi_attention_path();
 
 /// The text encoder's q and k ([T][q_heads * head_dim], [T][kv_heads * head_dim]): each head RMS-normed (wq, wk; eps
-/// 1e-6), then rotated as NEOX does (pair (j, j + head_dim / 2) by position t times theta^(-2j / head_dim)); FP16 out,
-/// v as v16.
+/// 1e-6), then rotated as NEOX does (pair (j, j + head_dim / 2) by a position times theta^(-2j / head_dim)); FP16 out,
+/// v as v16.  The position: t, or with pos3 (three [T] rows: time, row, column) Qwen3-VL's interleaved M-RoPE, pair j
+/// by the row when j % 3 == 1 and j < 3 * sec_h, by the column when j % 3 == 2 and j < 3 * sec_w, else by the time.
 void qi_text_qk_rope16(const float* q, const float* k, const float* v, const float* wq, const float* wk, int64_t T,
                        int64_t q_heads, int64_t kv_heads, int64_t head_dim, float theta, uint16_t* q16, uint16_t* k16,
-                       uint16_t* v16, void* stream);
+                       uint16_t* v16, void* stream, const int32_t* pos3 = nullptr, int sec_h = 0, int sec_w = 0);
 
 /// Causal attention with grouped K/V heads (query head h reads K/V head h / (q_heads / kv_heads)): out [T][q_heads *
 /// head_dim] FP32, the plain form (the text encoder's few tokens).

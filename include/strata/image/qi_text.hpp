@@ -29,8 +29,17 @@ public:
     /// `dry`: read for its sizes only (layer_bytes, layer_min), nothing put on the GPU; such a part cannot run.
     bool open(const std::string& path, void* stream, std::string& err, bool dry = false);
 
-    /// The last block's output [ids.size()][hidden] (host FP32) for the prompt's token ids.
-    std::vector<float> encode(const std::vector<int32_t>& ids);
+    /// A reference image in the prompt: its `rows` image pads from ids[index] (one per merged patch, grid_h x grid_w in
+    /// rows) take the vision encoder's embeddings `main` [rows][hidden], and `deepstack[i]` [rows][hidden] is added to
+    /// them after layer i (host FP32).
+    struct Image {
+        int64_t index = 0, rows = 0, grid_h = 0, grid_w = 0;
+        const float* main = nullptr;
+        std::vector<const float*> deepstack;
+    };
+
+    /// The last block's output [ids.size()][hidden] (host FP32) for the prompt's token ids (and its images, in order).
+    std::vector<float> encode(const std::vector<int32_t>& ids, const std::vector<Image>& images = {});
 
     int64_t hidden() const { return C_; }
     /// The layers' bytes (in the file) and the two slots a streamed walk takes at least.
@@ -53,6 +62,7 @@ private:
         uint64_t attn_norm = 0, ffn_norm = 0, qn = 0, kn = 0;
     };
     void ensure(int64_t T);
+    int sec_h_ = 20, sec_w_ = 20;   // the M-RoPE's pairs by row and by column (rope.dimension_sections)
 
     std::unique_ptr<GgufFile> g_;
     void* s_ = nullptr;
