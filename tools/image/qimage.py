@@ -23,7 +23,6 @@ import os
 import re
 import shutil
 import sys
-import time
 import zipfile
 from pathlib import Path
 
@@ -201,42 +200,47 @@ def vulkan_env(uma: bool) -> dict:
 
 
 def tune(cfg: dict, say=print) -> dict:
-    """Flash attention in the DiT on or off, whichever is faster on this PC (on the B70 the sampling took half the time
-    without it, on the RTX 4070 and the RX 9060 XT it was faster with it, 2026-10-15): each form makes one 1024x1024
-    image of 2 steps, and an 8-step image is estimated as that run plus 3x its sampling.  Sets cfg["args"] to the
-    faster form and returns {form: estimated seconds} (a form that failed is left out)."""
+    """Two forms measured on this PC, each the faster one: flash attention in the DiT (on the B70 the sampling took
+    half the time without it, on the RTX 4070 and the RX 9060 XT it was faster with it) and the VAE's convolutions
+    computed directly (--vae-conv-direct: the decode 2.93 -> 2.25 s on the RTX 4070 and 4.88 -> 4.75 s on the RX 9060
+    XT, 3.07 -> 6.5 s on the B70; the image within 0.11/255 a pixel on average), 2026-10-15.  Two 1024x1024 images of 2
+    steps, one with flash attention and the plain VAE, one with neither: each switch changes only its own stage, so the
+    sampling times choose the first and the decode times the second.  Sets cfg["args"] and returns {"sampling": {...},
+    "decode": {...}} in seconds (a run that failed is left out, and a choice without both runs keeps the default)."""
     import subprocess
     import tempfile
     serve = Path(__file__).resolve().parents[2] / "serve"
     if str(serve) not in sys.path:
         sys.path.insert(0, str(serve))
     import images as IM   # serve/images.py: the command the server runs
-    base = [a for a in cfg.get("args") or [] if a != "--diffusion-fa"]
-    forms = {"flash-attention": ["--diffusion-fa"] + base, "no-flash-attention": base}
-    est: dict[str, float] = {}
+    base = [a for a in cfg.get("args") or [] if a not in ("--diffusion-fa", "--vae-conv-direct")]
+    runs = {"flash-attention": ["--diffusion-fa"] + base, "direct-vae": base + ["--vae-conv-direct"]}
+    times: dict[str, dict[str, float]] = {"sampling": {}, "decode": {}}
     with tempfile.TemporaryDirectory(prefix="strata-image-tune-") as tmp:
-        for name, args in forms.items():
+        for name, args in runs.items():
             c = dict(cfg, args=args)
             job = IM.parse_request({"prompt": "A red fox sitting in a snowy forest at dawn, photograph",
                                     "size": "1024x1024", "seed": 42, "steps": 2}, c)
-            t0 = time.monotonic()
             try:
                 p = subprocess.run(IM.sd_cli_args(c, job, str(Path(tmp) / f"{name}.png")), env=IM.image_env(c),
                                    capture_output=True, text=True, errors="replace", timeout=900)
             except (OSError, subprocess.TimeoutExpired) as e:
                 say(f"  image tuning: {name} did not run ({e})")
                 continue
-            wall = time.monotonic() - t0
-            m = re.findall(r"sampling completed, taking ([0-9.]+) ?s", p.stdout + p.stderr)
-            if p.returncode != 0 or not m:
+            s = re.findall(r"sampling completed, taking ([0-9.]+) ?s", p.stdout + p.stderr)
+            d = re.findall(r"decode_first_stage completed, taking ([0-9.]+) ?s", p.stdout + p.stderr)
+            if p.returncode != 0 or not s or not d:
                 say(f"  image tuning: {name} failed (exit {p.returncode})")
                 continue
-            est[name] = round(wall + 3 * float(m[-1]), 1)
-    if est:
-        best = min(est, key=lambda k: est[k])
-        cfg["args"] = forms[best]
-        cfg["tuned"] = {"estimated_s": est, "chosen": best}
-    return est
+            times["sampling"][name] = float(s[-1])
+            times["decode"][name] = float(d[-1])
+    fa, direct = "--diffusion-fa" in (cfg.get("args") or []), False
+    if len(times["sampling"]) == 2:
+        fa = times["sampling"]["flash-attention"] <= times["sampling"]["direct-vae"]
+        direct = times["decode"]["direct-vae"] < times["decode"]["flash-attention"]
+        cfg["args"] = (["--diffusion-fa"] if fa else []) + base + (["--vae-conv-direct"] if direct else [])
+        cfg["tuned"] = {"seconds": times, "flash_attention": fa, "vae_conv_direct": direct}
+    return times
 
 
 def image_config(backend: str, quant: str, exe: Path, models_dir: Path, *, uma: bool = False, gpu=None,
@@ -247,9 +251,9 @@ def image_config(backend: str, quant: str, exe: Path, models_dir: Path, *, uma: 
            "llm": str(local_path(models_dir, "llm")), "args": default_args(backend), "gpu_policy": policy,
            "uma": bool(uma), "sd_cpp": SD_CPP_COMMIT[:7]}
     if backend in NATIVE_BACKENDS:
-        cfg["native"] = bool(native)
+        cfg["native"] = bool(native)       # Strata's DiT runner (--model-args qwen_image_2_1_native=1)
     if backend == "vulkan" and (env := vulkan_env(uma)):
-        cfg["env"] = env       # Strata's DiT runner (--model-args qwen_image_2_1_native=1)
+        cfg["env"] = env
     if gpu is not None:
         cfg["gpu"] = gpu
     if lib_dirs:

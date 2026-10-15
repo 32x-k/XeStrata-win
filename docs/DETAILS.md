@@ -1264,9 +1264,9 @@ the model uses interleaved M-RoPE.
 Setup builds [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)'s (MIT) `sd-cli` with its Vulkan backend, downloads the image model, its VAE and its text encoder (Qwen3-VL-8B), and adds an `"images"` section to the config.
 The Vulkan build runs on every maker's GPU; `--image-backend cpu` makes images on the CPU (slowly).
 The image model's size follows the GPU memory (Q4_K_M up to 8 GB, Q6_K up to 12 GB, Q8_0 above; `--image-quant` changes it).
-Last, setup times the DiT's flash attention on and off on that GPU with an image of 2 steps and writes the faster into the config's `"args"` (about a minute).
+Last, setup makes two images of 2 steps on that GPU to time the DiT's flash attention on and off and the VAE's convolutions computed directly or not (`--vae-conv-direct`), and writes the faster of each into the config's `"args"` (about a minute).
 The weights reach the VRAM through a staging buffer (`GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1` in the config's `"env"`; not on integrated GPUs).
-A 1024x1024 image of 8 steps took 28 s on the B70 (Q8_0, without flash attention), 20 s on the RTX 4070 (Q6_K, with it) and 33 s on the RX 9060 XT (Q8_0, with it).
+A 1024x1024 image of 8 steps took 28 s on the B70 (Q8_0, without flash attention, the VAE as it was), 19 s on the RTX 4070 (Q6_K, with flash attention, the VAE direct) and 33 s on the RX 9060 XT (Q8_0, with flash attention, the VAE direct).
 Qwen-Image-2.1-Turbo's weights are under the Qwen Research License, not a free software license: read it before any commercial use.
 
 The server makes images on `POST /v1/images/generations` (OpenAI's images API, plus `seed` and `steps`), and the web page gets an Images tab.

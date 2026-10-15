@@ -1243,9 +1243,9 @@ XeStrata はそれを、プロンプトの `<|image_pad|>` のトークンの位
 setup は [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)（MIT）の `sd-cli` を Vulkan 版でビルドし、画像のモデル、VAE、文の読み手（Qwen3-VL-8B）をダウンロードして、設定に `"images"` を足します。
 Vulkan 版はどのメーカーの GPU でも動きます。`--image-backend cpu` で CPU でも作れます（遅い）。
 画像のモデルの大きさは GPU のメモリで選びます（8 GB まで Q4_K_M、12 GB まで Q6_K、それより上は Q8_0。`--image-quant` で変えられます）。
-setup は最後に、その GPU で DiT の flash attention のありなしを 2 ステップの画像で測り、速い方を設定の `"args"` に書きます（約 1 分）。
+setup は最後に、その GPU で 2 ステップの画像を 2 枚作って、DiT の flash attention のありなしと、VAE の畳み込みを直接計算するか（`--vae-conv-direct`）を測り、それぞれ速い方を設定の `"args"` に書きます（約 1 分）。
 重みは転送用の領域を経由して VRAM に送ります（設定の `"env"` の `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1`。CPU 内蔵の GPU では付けません）。
-1024×1024・8 ステップの 1 枚は、B70（Q8_0、flash attention なし）で 28 秒、RTX 4070（Q6_K、あり）で 20 秒、RX 9060 XT（Q8_0、あり）で 33 秒でした。
+1024×1024・8 ステップの 1 枚は、B70（Q8_0、flash attention なし、VAE はそのまま）で 28 秒、RTX 4070（Q6_K、flash attention あり、VAE は直接計算）で 19 秒、RX 9060 XT（Q8_0、flash attention あり、VAE は直接計算）で 33 秒でした。
 Qwen-Image-2.1-Turbo の重みは Qwen Research License で、自由なソフトウェアのライセンスではありません。商用に使う前にそのライセンスを読んでください。
 
 サーバーは `POST /v1/images/generations`（OpenAI の images API の形。`seed` と `steps` も受けます）で画像を作り、Web のページには「Images」のタブが出ます。
