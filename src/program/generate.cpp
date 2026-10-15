@@ -1644,6 +1644,105 @@ double bench_copy_gbps(bool to_device, bool pinned) {
     return bw;
 }
 
+// The median of `n` timed runs of `fn` (each one synchronous), in microseconds.
+template <class F> double median_us(int n, F fn) {
+    std::vector<double> t;
+    for (int i = 0; i < n; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!fn()) return -1.0;
+        t.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+    }
+    std::sort(t.begin(), t.end());
+    return t[t.size() / 2];
+}
+
+// Multi-GPU (a layer split, a peer tier): each GPU's link both ways and the fixed cost of a small copy and of a
+// launch waited for; for each later GPU with device 0, what moving activations from one to the other through the host
+// takes (a D2H on 0 and an H2D on the other, 64 KiB and 1 MiB) and the bandwidth when both read one RAM region at
+// once (does the RAM cap them?), and whether they can reach each other's memory directly.  `HW gpuN_...` and
+// `HW pair0N_...` lines; nothing on one GPU but its own.
+void hw_bench_gpus() {
+    namespace gpu = strata::gpu;
+    using strata::core::OnDevice;
+    const int n = strata::core::Runtime::count();
+    std::printf("HW gpus %d\n", n);
+    for (int d = 0; d < n; ++d) {
+        OnDevice on(d);
+        std::string name = gpu::device_name(d);
+        std::replace(name.begin(), name.end(), ' ', '_');
+        std::printf("HW gpu%d_name %s\n", d, name.c_str());
+        std::printf("HW gpu%d_h2d_gb_s %.2f\n", d, bench_copy_gbps(true, true));
+        std::printf("HW gpu%d_d2h_gb_s %.2f\n", d, bench_copy_gbps(false, true));
+        constexpr size_t kSmall = 64 << 10;
+        void* h = gpu::alloc_host(kSmall);
+        void* dv = gpu::alloc_device(kSmall);
+        if (h != nullptr && dv != nullptr) {
+            std::printf("HW gpu%d_copy_64k_us %.1f\n", d, median_us(64, [&] { return gpu::copy(dv, h, kSmall); }));
+            std::printf("HW gpu%d_launch_us %.1f\n", d, median_us(64, [&] { return gpu::memset(dv, 0, 4); }));
+        }
+        gpu::free(dv);
+        gpu::free(h);
+    }
+    for (int d = 1; d < n; ++d) {
+        constexpr size_t kBig = 256ull << 20;
+        // ordinary memory registered on both GPUs, as a layer split's arena is (one runtime's host USM is not
+        // another's: a Level Zero GPU's host memory cannot be registered on a CUDA one)
+        void* host = strata::platform::DirectFile::alloc_aligned(kBig);
+        void *d0 = nullptr, *d1 = nullptr;
+        {
+            OnDevice on(0);
+            d0 = gpu::alloc_device(kBig);
+        }
+        {
+            OnDevice on(d);
+            d1 = gpu::alloc_device(kBig);
+        }
+        const bool reg0 = host != nullptr && gpu::host_register_on(0, host, kBig);
+        const bool reg = reg0 && gpu::host_register_on(d, host, kBig);
+        if (host != nullptr && d0 != nullptr && d1 != nullptr && reg) {
+            std::memset(host, 0, kBig);
+            for (size_t bytes : {(size_t) 64 << 10, (size_t) 1 << 20}) {
+                const double us = median_us(32, [&] {
+                    bool ok;
+                    {
+                        OnDevice on(0);
+                        ok = gpu::copy(host, d0, bytes);
+                    }
+                    OnDevice on(d);
+                    return ok && gpu::copy(d1, host, bytes);
+                });
+                std::printf("HW pair0%d_relay_%zuk_us %.1f\n", d, bytes >> 10, us);
+            }
+            // both GPUs copy the same RAM region to themselves at once, four times each
+            auto stream_in = [&](int dev, void* dst, double* secs) {
+                OnDevice on(dev);
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < 4; ++i) gpu::copy(dst, host, kBig);
+                *secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            };
+            double s0 = 0, s1 = 0;
+            std::thread a(stream_in, 0, d0, &s0), b(stream_in, d, d1, &s1);
+            a.join();
+            b.join();
+            // each GPU's own rate while the other reads too (a share of the RAM's, or its link's)
+            std::printf("HW pair0%d_both_h2d_gb_s %.2f %.2f\n", d, (double) (4 * kBig) / s0 / 1e9,
+                        (double) (4 * kBig) / s1 / 1e9);
+        }
+        std::printf("HW pair0%d_peer_access %d\n", d, gpu::peer_access(0, d) ? 1 : 0);
+        if (reg) gpu::host_unregister_on(d, host);
+        if (reg0) gpu::host_unregister_on(0, host);
+        {
+            OnDevice on(d);
+            gpu::free(d1);
+        }
+        {
+            OnDevice on(0);
+            gpu::free(d0);
+        }
+        strata::platform::DirectFile::free_aligned(host);
+    }
+}
+
 // The SSD under the model: `path` read with O_DIRECT (past the page cache) in 8 MiB blocks by four threads, up to
 // 4 GiB of it, in GB/s.
 double bench_ssd_read_gbps(const std::string& path, double* gib_read) {
@@ -1697,8 +1796,8 @@ double bench_ssd_read_gbps(const std::string& path, double* gib_read) {
 }
 
 // `strata --hw-bench [--native GGUF | --pack DIR]`: the RAM with the expert pool's threads (every physical core, as
-// the pool and the host thread take them) and with one, the PCIe copies each way, the SSD under the model (the
-// native GGUF, else the pack's largest file).
+// the pool and the host thread take them) and with one, the PCIe copies each way, every GPU's and every pair's
+// (hw_bench_gpus), the SSD under the model (the native GGUF, else the pack's largest file).
 int hw_bench(const std::string& pack, const std::string& native) {
     const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
     const size_t ram = (size_t) strata::platform::total_physical_memory();
@@ -1710,6 +1809,7 @@ int hw_bench(const std::string& pack, const std::string& native) {
     std::printf("HW d2h_gb_s %.2f\n", bench_copy_gbps(false, true));
     std::printf("HW h2d_pageable_gb_s %.2f\n", bench_copy_gbps(true, false));
     std::printf("HW d2h_pageable_gb_s %.2f\n", bench_copy_gbps(false, false));
+    hw_bench_gpus();
     std::string file = native;
     if (file.empty() && !pack.empty()) {
         std::error_code ec;
