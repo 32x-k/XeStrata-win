@@ -70,6 +70,31 @@ class AmdOnWindows(unittest.TestCase):
         self.assertIn("HIP runtime", self.problem(None, ["gfx1201"]))
 
 
+class HipSelector(unittest.TestCase):
+    def selector(self, found, sel, win=True):
+        cfg: dict = {}
+        info = {g["index"]: g for g in found}
+        with mock.patch.object(setup, "WIN", win), mock.patch.object(setup, "gpu_info", side_effect=info.get):
+            setup.hip_selector(cfg, sel, found)
+        return (cfg.get("env") or {}).get("ONEAPI_DEVICE_SELECTOR")
+
+    AMD = [{"index": 0, "hip": 0}, {"index": 1, "hip": 1}]
+
+    def test_the_chosen_hip_gpus(self):
+        self.assertEqual(self.selector(self.AMD, [0]), "hip:0")
+        self.assertEqual(self.selector(self.AMD, [1, 0]), "hip:1,0")
+
+    def test_one_gpu_or_not_windows(self):
+        self.assertIsNone(self.selector(self.AMD[:1], [0]))
+        self.assertIsNone(self.selector(self.AMD, [0], win=False))
+
+    def test_a_gpu_of_another_backend_among_them(self):
+        # an Intel Arc beside the R9700: a hip: selector would hide it from the engine, and "None" is no number
+        mixed = [{"index": 0, "hip": None}, {"index": 1, "hip": 0}]
+        self.assertIsNone(self.selector(mixed, [1, 0]))
+        self.assertEqual(self.selector(mixed, [1]), "hip:0")
+
+
 class OtherInstalls(unittest.TestCase):
     def test_upstream_strata_folders_are_not_taken(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -18,8 +18,10 @@ set "PYTHONHOME="
 set "PYTHONPATH="
 set "PYTHONNOUSERSITE=1"
 "python\python.exe" "app\setup.py" %*
-if errorlevel 1 pause
-exit /b %errorlevel%
+rem setup's exit code, kept before pause sets it back to 0
+set "RC=%errorlevel%"
+if not "%RC%"=="0" pause
+exit /b %RC%
 
 :broken
 echo  This XeStrata folder is incomplete (python\python.exe, app\setup.py or app\PACKAGED is missing).

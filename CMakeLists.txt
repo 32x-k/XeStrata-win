@@ -132,6 +132,11 @@ endif()
 if(WIN32)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
+# __FILE__ (ggml's asserts and logs, the tests' messages) relative to the source and build folders, so the binaries
+# do not carry the build machine's paths (a user's home folder among them); the debug information keeps them
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|IntelLLVM|GNU")
+  add_compile_options(-fmacro-prefix-map=${CMAKE_SOURCE_DIR}/= -fmacro-prefix-map=${CMAKE_BINARY_DIR}/=build/)
+endif()
 
 option(STRATA_ENABLE_XE "Build the Intel Xe runtime and migrated kernels" ON)
 # The test suite and the micro benchmarks live in tests/ and bench/micro/, which the published source leaves out.

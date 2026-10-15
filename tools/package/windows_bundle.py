@@ -171,7 +171,12 @@ def unbundle_runtime(site: Path) -> None:
 
 
 def imports(readobj: str, dll: Path) -> list:
-    text = subprocess.run([readobj, "--coff-imports", str(dll)], capture_output=True, text=True, check=True).stdout
+    try:
+        text = subprocess.run([readobj, "--coff-imports", str(dll)], capture_output=True, text=True,
+                              check=True).stdout
+    except (OSError, subprocess.CalledProcessError) as e:
+        fail(f"llvm-readobj could not read the imports of {dll.name} ({e})")
+        return []
     return sorted(set(re.findall(r"Name:\s+(\S+\.dll)", text, re.I)))
 
 
@@ -297,7 +302,9 @@ def main() -> None:
     roots = {"sycl": a.sycl, "python": py, "llama": a.llama, "src": a.src, "nuget": a.nuget, "rocm": a.rocm}
     if a.rocm is not None:
         versions["onemath"] = "the tag CMakeLists.txt fetches"
-        sdk = a.rocm.as_posix().split("/site-packages")[0]
+        # the SDK's version from its wheel's record beside it (TheRock's rocm_sdk_devel), never the build machine's path
+        rec = sorted(a.rocm.parent.glob("rocm_sdk_devel-*.dist-info"))
+        sdk = rec[-1].name[len("rocm_sdk_devel-"):-len(".dist-info")] if rec else "version not recorded"
         versions["rocm"] = f"the ROCm SDK the engine was built with ({sdk})"
     components = [c for c in COMPONENTS if a.launcher is not None or c[0] not in DOTNET]
     components += AMD_COMPONENTS if a.rocm is not None else []

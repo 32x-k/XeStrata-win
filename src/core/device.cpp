@@ -636,8 +636,10 @@ DeviceInfo device_info(int ordinal) {
     if (out.free_bytes_known) out.free_bytes = free;
     out.compute_units = d.get_info<sycl::info::device::max_compute_units>();
     out.pci = pci_of(d);
-    out.arch = d.get_info<sycl::info::device::version>();
-    if (const size_t colon = out.arch.find(':'); colon != std::string::npos) out.arch.resize(colon);
+    if (d.get_backend() == sycl::backend::ext_oneapi_hip) {   // HIP's version is the gfx name; others' a version
+        out.arch = d.get_info<sycl::info::device::version>();
+        if (const size_t colon = out.arch.find(':'); colon != std::string::npos) out.arch.resize(colon);
+    }
     int n = 0;   // the runtime lists a backend's GPUs in the order ONEAPI_DEVICE_SELECTOR (and HIP) numbers them
     for (const auto& x : sycl::device::get_devices(sycl::info::device_type::gpu)) {
         if (x.get_backend() != d.get_backend()) continue;

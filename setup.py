@@ -1389,6 +1389,18 @@ def choose_gpus(a, found) -> list:
     return [single[0]["index"]]
 
 
+def hip_selector(cfg: dict, sel: list, found: list) -> None:
+    """On Windows with more than one GPU, the config's ONEAPI_DEVICE_SELECTOR=hip:N,M for the chosen GPUs: HIP maps
+    page-locked memory into every GPU it sees, and the engine narrows HIP to these (restrict_hip_to_selector).  Only
+    when every chosen GPU is a HIP one: a hip: selector would hide another backend's GPU from the engine."""
+    if not WIN or len(found) < 2:
+        return
+    nums = [gpu_info(i).get("hip") for i in sel]
+    if not nums or any(n is None for n in nums):
+        return
+    cfg["env"] = {**(cfg.get("env") or {}), "ONEAPI_DEVICE_SELECTOR": "hip:" + ",".join(str(n) for n in nums)}
+
+
 def gpu_info(pick=None):
     """The GPU Strata runs on: `pick` (its number in gpus()) if given, else the one with the most VRAM (ties: the
     lower number).  None when gpus() finds none.  The dict also says how many there are
@@ -3964,9 +3976,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (STRATA_GPU_PCI)
-    if WIN and gpu.get("hip") is not None and len(found) > 1:   # HIP maps page-locked memory into every GPU it
-        cfg["env"] = {**(cfg.get("env") or {}),               # sees: the engine narrows it to these
-                      "ONEAPI_DEVICE_SELECTOR": "hip:" + ",".join(str(gpu_info(i)["hip"]) for i in sel)}
+    hip_selector(cfg, sel, found)
     if a.host:
         cfg["host"] = a.host
     if a.api_key:
@@ -4976,9 +4986,7 @@ def main() -> int:
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (STRATA_GPU_PCI)
-    if WIN and gpu.get("hip") is not None and len(found) > 1:   # HIP maps page-locked memory into every GPU it
-        cfg["env"] = {**(cfg.get("env") or {}),               # sees: the engine narrows it to these
-                      "ONEAPI_DEVICE_SELECTOR": "hip:" + ",".join(str(gpu_info(i)["hip"]) for i in sel)}
+    hip_selector(cfg, sel, found)
     if len(sel) > 1:                                   # --gpus: the layer split's other cards (docs/MULTIGPU.md)
         cfg["gpu_pci"] = gpu["pci"]
         cfg["split_pci"] = [gpu_info(i)["pci"] for i in sel[1:]]
