@@ -603,8 +603,12 @@ if(STRATA_ENABLE_XE)
   # against stable-diffusion.cpp's values, timed
   add_library(strata_image STATIC src/image/qi_kernels.cpp src/image/qi_attn.cpp src/image/qi_dit.cpp
                            src/image/qi_vae.cpp src/image/qi_text.cpp src/image/qi_pipeline.cpp
-                           src/image/qi_stream.cpp src/image/qi_vision.cpp)
+                           src/image/qi_stream.cpp src/image/qi_vision.cpp src/image/qi_image_io.cpp)
   target_include_directories(strata_image PUBLIC include)
+  # stb_image (third_party/main/stb, MIT or the Unlicense) for an edit's reference image: its implementation in
+  # qi_image_io.cpp alone, its own warnings not the build's
+  target_include_directories(strata_image SYSTEM PRIVATE third_party/main/stb)
+  set_source_files_properties(src/image/qi_image_io.cpp PROPERTIES COMPILE_OPTIONS "-w")
   target_link_libraries(strata_image PUBLIC strata_prefill)
   add_executable(strata-image-probe src/image/qi_block_probe.cpp)
   target_link_libraries(strata-image-probe PRIVATE strata_image)
