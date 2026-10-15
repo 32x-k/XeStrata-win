@@ -41,6 +41,13 @@ public:
     bool owns(int64_t index) const { return owned_[(size_t) index] != 0; }
     /// This helper's cache holds (layer, expert): begin() will take its rows unless the plan gave them away.
     bool holds(int64_t layer, int32_t expert) const { return cache_.slot_of(layer, expert) >= 0; }
+    /// The engine device this helper runs on (-1: not open).
+    int device() const { return device_; }
+    /// (layer, expert)'s blob in this helper's VRAM, or null where it does not hold it.
+    const uint8_t* blob_on_device(int64_t layer, int32_t expert) const {
+        const int32_t slot = cache_.slot_of(layer, expert);
+        return slot >= 0 ? cache_.device_slot(slot) : nullptr;
+    }
     bool finish(float* out, std::string& err);
     int64_t resident() const { return cache_.resident(); }
     int64_t computed() const { return computed_; }

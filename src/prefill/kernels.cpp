@@ -1067,6 +1067,13 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
         dst[r * per + j] = x[(int64_t) src[r] * per + j];
     });
 }
+void gather_rows(const float* x, const int32_t* src, float* dst, int64_t n, int64_t width, void* stream) {
+    if (n <= 0) return;
+    Q(stream).parallel_for(sycl::range<1>((size_t) (n * width)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], r = i / width, j = i % width;
+        dst[i] = x[(int64_t) src[r] * width + j];
+    });
+}
 void scatter_rows(const float* src, const int32_t* dst_row, float* dst, int64_t n, int64_t width, void* stream) {
     if (n <= 0) return;
     Q(stream).parallel_for(sycl::range<1>((size_t) (n * width)), [=](sycl::id<1> id) {

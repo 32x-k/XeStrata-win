@@ -38,12 +38,13 @@ struct PrefillStats {
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
     int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
+    int64_t experts_helper = 0;     ///< ...computed on a helper GPU from its own cache instead of streamed (set_helper)
     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured with `auto`)
     double ms_ple = 0;
 };
 
 }  // namespace strata::prefill
-namespace strata::core { class MtpDrafter; }
+namespace strata::core { class MtpDrafter; class RemoteExperts; }
 namespace strata::prefill {
 
 class Prefill;
@@ -84,8 +85,19 @@ public:
     /// meanwhile (no batch slots).  Set before `init`.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
 
+    /// A helper GPU's expert cache (RemoteExperts: --expert-cache-device1, or --layer-split auto's helper).  A chunk
+    /// below the streamed-walk size hands it the experts this GPU does not hold and it does, routed by at most
+    /// `max_rows` of the chunk's tokens: it computes their rows from its VRAM (int8 products) while this GPU streams
+    /// the others, and they come back over the two links through host memory registered on both GPUs; their rows go
+    /// after the CPU pool's.  Not bit-identical to this GPU's rows (another GPU's products).  Only for a helper that
+    /// computes nothing else meanwhile (no batch slots).  False with `err` when the helper cannot take it (no int8
+    /// products there, no memory); the prompt path then streams every expert as before.
+    bool set_helper(core::RemoteExperts* helper, int64_t max_rows, std::string& err);
+
 private:
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;
+    struct HelperShare;
+    std::unique_ptr<HelperShare> helper_;
 
 public:
     /// E-9 (upstream c6c6594): the draft layer's K/V for prompt cells [cell0, cell0 + n) from their final residual

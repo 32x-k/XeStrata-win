@@ -11,6 +11,8 @@
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/remote_experts.hpp"
+#include "strata/platform/direct_file.hpp"
 
 #include "strata/core/layout.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -36,6 +38,7 @@
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/prefill/gemm.hpp"
+#include "strata/kernels/iq_mmq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/kernels.hpp"
 
@@ -602,6 +605,127 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
     return p;
 }
 }  // namespace
+
+// set_helper: a helper GPU's share of a small chunk's experts.  Per MoE layer this GPU gathers the rows of the tokens
+// the helper's experts read and copies them to `x_ex`, host memory registered on both GPUs; the helper copies them in,
+// multiplies them against its cache's blobs (int8 products through a table of the blobs, as the plain models' prompt
+// path takes them) and copies its rows to `d_ex`, which this GPU copies into Dm's tail before the combine.  The host
+// waits between the two GPUs: they share no events (another backend, as a B70's and an RTX 4070's).
+struct Prefill::HelperShare {
+    core::RemoteExperts* h = nullptr;
+    int prim = -1, dev = -1;       // this GPU, the helper
+    int64_t max_rows = 0;          // an expert's rows at most
+    int64_t cap = 0;               // a layer's rows at most
+    int32_t* tok_dev = nullptr;    // this GPU's: the tokens to gather, the gathered rows
+    float* xg = nullptr;
+    float* x_ex = nullptr;         // both GPUs': the rows there, the results back
+    float* d_ex = nullptr;
+    strata::gpu::Stream s = nullptr;   // the helper's
+    std::unique_ptr<mmq::Context> ctx;
+    float *x = nullptr, *gu = nullptr, *hh = nullptr, *d = nullptr;
+    void *xq = nullptr, *xq2 = nullptr, *hq = nullptr;
+    int32_t* meta = nullptr;       // src [cap] | bounds [cap + 1] | identity [cap]
+    const uint8_t** wtab = nullptr;
+    int32_t* h_meta = nullptr;     // the helper's host USM, staging the two above
+    const uint8_t** h_wtab = nullptr;
+    std::vector<int32_t> toks, tok_of;
+    bool live = false;
+    int64_t rows = 0;
+    ~HelperShare() {
+        try {
+            if (dev >= 0) {
+                const core::OnDevice on(dev);
+                if (s != nullptr) strata::gpu::stream_sync(s);
+                ctx.reset();
+                for (const void* p : {(const void*) x, (const void*) gu, (const void*) hh, (const void*) d, (const void*) xq,
+                                      (const void*) xq2, (const void*) hq, (const void*) meta, (const void*) wtab,
+                                      (const void*) h_meta, (const void*) h_wtab})
+                    strata::gpu::free(p);
+                if (s != nullptr) strata::gpu::stream_destroy(s);
+            }
+            if (prim >= 0) {
+                const core::OnDevice on(prim);
+                strata::gpu::device_sync();
+                strata::gpu::free(tok_dev);
+                strata::gpu::free(xg);
+            }
+            for (float* p : {x_ex, d_ex}) {
+                if (p == nullptr) continue;
+                if (prim >= 0) strata::gpu::host_unregister_on(prim, p);
+                if (dev >= 0) strata::gpu::host_unregister_on(dev, p);
+                strata::platform::DirectFile::free_aligned(p);
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "prefill: releasing the helper share: %s\n", e.what());
+        }
+    }
+};
+
+bool Prefill::set_helper(core::RemoteExperts* helper, int64_t max_rows, std::string& err) {
+    helper_.reset();
+    if (helper == nullptr || helper->device() < 0 || max_rows <= 0) return true;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || lay.fmt.empty()) { err = "the helper's prompt share needs a native pack"; return false; }
+    auto hs = std::make_unique<HelperShare>();
+    hs->h = helper;
+    hs->prim = core::current_device();
+    hs->max_rows = max_rows;
+    // a layer's rows at most: an 8192-row share is ~84 MB each of rows and results, and few layers of a chunk below
+    // the streamed walk's 2048 tokens give the helper more
+    hs->cap = 8192;
+    const int64_t cap = hs->cap;
+    int64_t gu_w = 0, ff = 0;
+    for (const auto& f : lay.fmt) { gu_w = std::max<int64_t>(gu_w, 2 * f.n_ff); ff = std::max<int64_t>(ff, f.n_ff); }
+    const size_t rows_b = (size_t) cap * N * sizeof(float);
+    try {
+        {
+            const core::OnDevice on(hs->dev = helper->device());
+            if (!mmq::chosen() && !mmq::built_dp4a()) { err = "the helper GPU has no int8 products"; return false; }
+            for (const auto& f : lay.fmt)
+                if (!mmq::supported(f.gu_type) || !mmq::supported(f.d_type) ||
+                    (strata::kernels::cpu::native_mixed_gu(f) && !mmq::supported(f.up_type))) {
+                    err = "the helper GPU's int8 products do not take these experts' types";
+                    return false;
+                }
+            hs->s = strata::gpu::stream_create();
+            hs->ctx = std::make_unique<mmq::Context>();
+            const bool ok = hs->s != nullptr &&
+                strata::gpu::alloc_device(&hs->x, rows_b) && strata::gpu::alloc_device(&hs->d, rows_b) &&
+                strata::gpu::alloc_device(&hs->gu, (size_t) cap * gu_w * sizeof(float)) &&
+                strata::gpu::alloc_device(&hs->hh, (size_t) cap * ff * sizeof(float)) &&
+                strata::gpu::alloc_device(&hs->xq, mmq::q8_bytes(cap, N) * 2) &&
+                strata::gpu::alloc_device(&hs->xq2, mmq::q8_bytes(cap, N) * 2) &&
+                strata::gpu::alloc_device(&hs->hq, mmq::q8_bytes(cap, ff) * 2) &&
+                strata::gpu::alloc_device(&hs->meta, (size_t) (3 * cap + 1) * sizeof(int32_t)) &&
+                strata::gpu::alloc_device(&hs->wtab, (size_t) cap * sizeof(void*)) &&
+                strata::gpu::alloc_host(&hs->h_meta, (size_t) (3 * cap + 1) * sizeof(int32_t)) &&
+                strata::gpu::alloc_host(&hs->h_wtab, (size_t) cap * sizeof(void*));
+            if (!ok) { err = std::string("the helper GPU's buffers: ") + strata::gpu::last_error(); return false; }
+            for (int64_t i = 0; i < cap; ++i) hs->h_meta[2 * cap + 1 + i] = (int32_t) i;   // the identity
+        }
+        if (!strata::gpu::alloc_device(&hs->tok_dev, (size_t) cap * sizeof(int32_t)) ||
+            !strata::gpu::alloc_device(&hs->xg, rows_b)) {
+            err = std::string("this GPU's buffers for the helper: ") + strata::gpu::last_error();
+            return false;
+        }
+        for (float** p : {&hs->x_ex, &hs->d_ex}) {
+            *p = static_cast<float*>(strata::platform::DirectFile::alloc_aligned(rows_b));
+            if (*p == nullptr) { err = "no host memory for the helper's rows"; return false; }
+            for (const int d : {hs->prim, hs->dev})
+                if (!strata::gpu::host_register_on(d, *p, rows_b)) {
+                    err = std::string("registering the helper's rows on GPU ") + std::to_string(d) + ": " +
+                          strata::gpu::last_error();
+                    return false;
+                }
+        }
+    } catch (const std::exception& e) {
+        err = std::string("the helper share: ") + e.what();
+        return false;
+    }
+    hs->tok_of.assign((size_t) 1 << 16, -1);
+    helper_ = std::move(hs);
+    return true;
+}
 
 Prefill::Prefill() : impl_(new Impl) {}
 Prefill::~Prefill() { release(); }
@@ -2073,7 +2197,27 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
-                    // set_cpu_pool: the experts the CPU computes this layer (their rows last: [T * K - rows_cpu, T * K))
+                    // set_helper: the experts the helper GPU computes this layer, the ones it holds that this GPU
+                    // would stream and at most max_rows tokens route to (their rows last, after the CPU's)
+                    std::vector<char> on_help;
+                    int64_t rows_help = 0, n_help = 0;
+                    if (helper_ && !stream_all && lay_c.native) {
+                        HelperShare& hs = *helper_;
+                        for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                            const int32_t c = m.cnt[(size_t) e];
+                            if (c == 0 || c > hs.max_rows || rows_help + c > hs.cap ||
+                                (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) ||
+                                !hs.h->holds(l, e))
+                                continue;
+                            if (on_help.empty()) on_help.assign((size_t) m.g->n_expert, 0);
+                            on_help[(size_t) e] = 1;
+                            rows_help += c;
+                            ++n_help;
+                        }
+                    }
+                    auto helped = [&](int32_t e) { return !on_help.empty() && on_help[(size_t) e]; };
+                    // set_cpu_pool: the experts the CPU computes this layer (their rows after the GPU's, before the
+                    // helper's: [rows_gpu, rows_gpu + rows_cpu))
                     std::vector<char> on_cpu;
                     std::vector<const uint8_t*> cpu_blob;   // their blobs, taken here (the CPU thread calls no ExpertSource)
                     int64_t rows_cpu = 0, n_cpu = 0, n_stream = 0;
@@ -2081,7 +2225,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         std::vector<std::pair<int32_t, int32_t>> cand;   // (tokens, expert)
                         for (int32_t e = 0; e < m.g->n_expert; ++e) {
                             const int32_t c = m.cnt[(size_t) e];
-                            if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0)) continue;
+                            if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) ||
+                                helped(e))
+                                continue;
                             ++n_stream;
                             // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
                             // short-lived buffer (the arena's unpinned part, the mapped files' pages; upstream 92bce20e)
@@ -2106,7 +2252,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             ++n_cpu;
                         }
                     }
-                    auto gpu_side = [&](int32_t e) { return on_cpu.empty() || !on_cpu[(size_t) e]; };
+                    auto gpu_side = [&](int32_t e) { return (on_cpu.empty() || !on_cpu[(size_t) e]) && !helped(e); };
                     // The experts, in id order: resident ones from VRAM, the others through the staging ring.  F8:
                     // first, out of that order, the resident experts of at most kIqGemmTileRows rows, whose products
                     // iq_gemm_grouped_f16 takes straight from their GGUF blocks in the cache (dequantized in local
@@ -2137,11 +2283,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     {
                         int32_t at = 0;
                         for (const int32_t e : order) { m.off[(size_t) e] = at; at += m.cnt[(size_t) e]; }
-                        for (int32_t e = 0; e < m.g->n_expert && !on_cpu.empty(); ++e)   // the CPU's block, last
+                        for (int32_t e = 0; e < m.g->n_expert && !on_cpu.empty(); ++e)   // the CPU's block
                             if (on_cpu[(size_t) e]) { m.off[(size_t) e] = at; at += m.cnt[(size_t) e]; }
+                        for (int32_t e = 0; e < m.g->n_expert && !on_help.empty(); ++e)   // the helper's, last
+                            if (on_help[(size_t) e]) { m.off[(size_t) e] = at; at += m.cnt[(size_t) e]; }
                         m.off[(size_t) m.g->n_expert] = at;
                     }
-                    const int64_t rows_gpu = T * K - rows_cpu;
+                    const int64_t rows_gpu = T * K - rows_cpu - rows_help;
                     std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
                     for (int64_t i = 0; i < T * K; ++i) {
                         const int32_t e = m.ids_host[(size_t) i];
@@ -2151,6 +2299,95 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                     m.slot_host.to_device(m.slot_dev, m.cs);
                     m.src_host.to_device(m.src_dev, m.cs);
+                    // set_helper: its rows' tokens gathered here and copied to the shared host rows (the host waits
+                    // for them: the helper's stream cannot wait on this GPU's), then its products, queued on its own
+                    // stream; the results come back at the combine
+                    if (rows_help > 0) {
+                        HelperShare& hs = *helper_;
+                        const auto& hf = lay.fmt[(size_t) l];
+                        const int64_t r0 = rows_gpu + rows_cpu;
+                        if (hs.tok_of.size() < (size_t) T) hs.tok_of.resize((size_t) T);
+                        hs.toks.clear();
+                        int32_t* src = hs.h_meta;
+                        int32_t* bounds = hs.h_meta + hs.cap;
+                        int64_t ne = 0, maxr = 0;
+                        for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                            if (!helped(e)) continue;
+                            bounds[ne] = m.off[(size_t) e] - (int32_t) r0;
+                            hs.h_wtab[ne++] = hs.h->blob_on_device(l, e);
+                            maxr = std::max<int64_t>(maxr, m.cnt[(size_t) e]);
+                        }
+                        bounds[ne] = (int32_t) rows_help;
+                        for (int64_t p = 0; p < rows_help; ++p) {
+                            const int32_t t = m.src_host[(size_t) (r0 + p)];
+                            if (hs.tok_of[(size_t) t] < 0) {
+                                hs.tok_of[(size_t) t] = (int32_t) hs.toks.size();
+                                hs.toks.push_back(t);
+                            }
+                            src[p] = hs.tok_of[(size_t) t];
+                        }
+                        for (const int32_t t : hs.toks) hs.tok_of[(size_t) t] = -1;
+                        const int64_t U = (int64_t) hs.toks.size();
+                        if (!strata::gpu::copy_async(hs.tok_dev, hs.toks.data(), (size_t) U * sizeof(int32_t), m.cs)) {
+                            err = std::string("prefill: the helper's tokens: ") + strata::gpu::last_error();
+                            return false;
+                        }
+                        gather_rows(m.mixed, hs.tok_dev, hs.xg, U, N, m.cs);
+                        if (!strata::gpu::copy_async(hs.x_ex, hs.xg, (size_t) U * N * sizeof(float), m.cs) ||
+                            !strata::gpu::stream_sync(m.cs)) {
+                            err = std::string("prefill: the helper's rows: ") + strata::gpu::last_error();
+                            return false;
+                        }
+                        try {
+                            const core::OnDevice on(hs.dev);
+                            const strata::gpu::Stream q = hs.s;
+                            int32_t* d_src = hs.meta;
+                            int32_t* d_bounds = hs.meta + hs.cap;
+                            const int32_t* d_ident = hs.meta + 2 * hs.cap + 1;
+                            const bool up_mixed = strata::kernels::cpu::native_mixed_gu(hf);
+                            const int up_type = up_mixed ? hf.up_type : hf.gu_type;
+                            const bool up_xq2 = strata::kernels::iq_mmq_type_dup(up_type) != strata::kernels::iq_mmq_type_dup(hf.gu_type);
+                            if (!strata::gpu::copy_async(hs.x, hs.x_ex, (size_t) U * N * sizeof(float), q) ||
+                                !strata::gpu::copy_async(d_src, src, (size_t) rows_help * sizeof(int32_t), q) ||
+                                !strata::gpu::copy_async(d_bounds, bounds, (size_t) (ne + 1) * sizeof(int32_t), q) ||
+                                (hs.live == false && !strata::gpu::copy_async(const_cast<int32_t*>(d_ident), hs.h_meta + 2 * hs.cap + 1,
+                                                                              (size_t) hs.cap * sizeof(int32_t), q)) ||
+                                !strata::gpu::copy_async(static_cast<void*>(hs.wtab), static_cast<const void*>(hs.h_wtab),
+                                                         (size_t) ne * sizeof(void*), q)) {
+                                err = std::string("prefill: the helper's tables: ") + strata::gpu::last_error();
+                                return false;
+                            }
+                            mmq::quantize(hs.x, d_src, hs.xq, hf.gu_type, N, N, rows_help, q);
+                            if (up_mixed && up_xq2) mmq::quantize(hs.x, d_src, hs.xq2, up_type, N, N, rows_help, q);
+                            const int64_t ff = hf.n_ff;
+                            mmq::Product gu;
+                            gu.type = hf.gu_type; gu.w_rows = 2 * ff; gu.w_cols = N; gu.n = (int) ne; gu.xq = hs.xq;
+                            gu.bounds = d_bounds; gu.ids = d_ident; gu.total_rows = rows_help; gu.max_rows = maxr;
+                            gu.rows = rows_help; gu.dst = hs.gu; gu.ld_dst = 2 * ff; gu.wtab = hs.wtab; gu.woff = 0;
+                            if (up_mixed) {   // the gate rows, then the up rows in their own type
+                                gu.w_rows = ff;
+                                hs.ctx->run(gu, q);
+                                gu.type = up_type; gu.xq = up_xq2 ? hs.xq2 : hs.xq; gu.dst = hs.gu + ff; gu.woff = hf.up_off;
+                            }
+                            hs.ctx->run(gu, q);
+                            mmq::swiglu(hs.gu, hs.hh, rows_help, ff, /*interleaved=*/false, q);
+                            mmq::quantize(hs.hh, nullptr, hs.hq, hf.d_type, ff, ff, rows_help, q);
+                            mmq::Product dn;
+                            dn.type = hf.d_type; dn.w_rows = N; dn.w_cols = ff; dn.n = (int) ne; dn.xq = hs.hq;
+                            dn.bounds = d_bounds; dn.ids = d_ident; dn.total_rows = rows_help; dn.max_rows = maxr;
+                            dn.rows = rows_help; dn.dst = hs.d; dn.ld_dst = N; dn.wtab = hs.wtab; dn.woff = hf.down_off;
+                            hs.ctx->run(dn, q);
+                            if (!strata::gpu::copy_async(hs.d_ex, hs.d, (size_t) rows_help * N * sizeof(float), q)) {
+                                err = std::string("prefill: the helper's results: ") + strata::gpu::last_error();
+                                return false;
+                            }
+                        } catch (const std::exception& e) {
+                            err = std::string("prefill: the helper GPU: ") + e.what();
+                            return false;
+                        }
+                        hs.live = true;
+                        hs.rows = rows_help;
+                    }
                     // set_cpu_pool: the CPU's experts on a thread while this one streams and runs the GPU's; their
                     // unweighted rows land in Dm's row order, so the combine weights them as any other row.  The
                     // blobs are taken here: the thread calls no ExpertSource (upstream 667f2eca)
@@ -2177,11 +2414,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             }
                             strata::gpu::event_record(m.cpu_ev[0], m.cs);
                         }
-                        cpu_fut = std::async(std::launch::async, [&m, &cf, &cpu_ms, T, rows_gpu, pool = cpu_pool_]() -> bool {
+                        cpu_fut = std::async(std::launch::async, [&m, &cf, &cpu_ms, T, rows_gpu, rows_cpu, pool = cpu_pool_]() -> bool {
                             const auto t0 = std::chrono::steady_clock::now();
                             if (m.cpu_nact.size() < (size_t) T) m.cpu_nact.resize((size_t) T);
                             std::vector<char> need((size_t) T, 0);   // the tokens the CPU's experts read
-                            for (int64_t p = rows_gpu; p < T * K; ++p) need[(size_t) m.src_host[(size_t) p]] = 1;
+                            for (int64_t p = rows_gpu; p < rows_gpu + rows_cpu; ++p) need[(size_t) m.src_host[(size_t) p]] = 1;
                             for (int64_t t = 0; t < T; ++t) {
                                 if (!need[(size_t) t]) continue;
                                 strata::kernels::cpu::native_quant_act(cf, m.cpu_x + (size_t) t * N, m.cpu_nact[(size_t) t].bytes);
@@ -2518,6 +2755,26 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         release_to((int32_t) m.g->n_expert);
                     }
                     pt.mark(kPfCombine, cs);
+                    if (rows_help > 0) {   // set_helper: its rows into Dm's tail, once its stream is done
+                        HelperShare& hs = *helper_;
+                        bool ok = false;
+                        {
+                            const core::OnDevice on(hs.dev);
+                            ok = strata::gpu::stream_sync(hs.s);
+                        }
+                        if (!ok || !strata::gpu::copy_async(m.Dm + (size_t) (rows_gpu + rows_cpu) * N, hs.d_ex,
+                                                            (size_t) rows_help * N * sizeof(float), m.cs)) {
+                            err = std::string("prefill: the helper GPU's rows: ") + strata::gpu::last_error();
+                            return false;
+                        }
+                        stats_.experts_helper += n_help;
+                        if (static bool said = false; !said) {
+                            said = true;
+                            std::fprintf(stderr, "strata: the helper GPU computes the prompt's experts it holds that at "
+                                                 "most %lld tokens route to (%lld of a layer's, %lld rows)\n",
+                                         (long long) hs.max_rows, (long long) n_help, (long long) rows_help);
+                        }
+                    }
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail
                         if (cpu_share_env() < 0.0) strata::gpu::event_record(m.cpu_ev[1], m.cs);   // after the GPU's experts
                         if (!cpu_fut.get()) { err = "prefill: the CPU experts failed"; return false; }
