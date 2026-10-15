@@ -37,8 +37,8 @@ static int list_devices() {
                     (unsigned long long) d.total_bytes);
         if (d.free_bytes_known) std::printf("%llu", (unsigned long long) d.free_bytes);
         else std::printf("null");
-        std::printf(", \"integrated\": %s, \"compute_units\": %u}\n", d.integrated ? "true" : "false",
-                    d.compute_units);
+        std::printf(", \"integrated\": %s, \"compute_units\": %u, \"arch\": %s, \"backend_ordinal\": %d}\n",
+                    d.integrated ? "true" : "false", d.compute_units, json_text(d.arch).c_str(), d.backend_ordinal);
     }
     return 0;
 }

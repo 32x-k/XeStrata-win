@@ -2818,6 +2818,8 @@ def child_env(cfg: dict) -> dict:
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries
+        if k == "ONEAPI_DEVICE_SELECTOR" and k in env:   # a --gpu for this start (setup sets it) wins, as below
+            continue
         env[str(k)] = str(v)
     if cfg.get("gpu_pci"):                           # the Xe engine: the GPU setup chose, by PCI address
         env.setdefault("STRATA_GPU_PCI", str(cfg["gpu_pci"]))   # a --gpu for this start (setup sets it) wins

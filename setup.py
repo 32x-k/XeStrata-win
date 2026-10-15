@@ -1271,7 +1271,9 @@ def gpus_from_engine():
     VRAM), an AMD card's gfx name; the render node is not needed (no device files to open)."""
     vendors = {0x8086: "intel", 0x10DE: "nvidia", 0x1002: "amd"}
     try:
-        lines = [json.loads(x) for x in engine_tool("--list-devices").splitlines() if x.strip()]
+        # every GPU, numbered as the runtime numbers a backend's GPUs: no selection of the caller's narrows them
+        env = {k: v for k, v in os.environ.items() if k not in ("ONEAPI_DEVICE_SELECTOR", "HIP_VISIBLE_DEVICES")}
+        lines = [json.loads(x) for x in engine_tool("--list-devices", env=env).splitlines() if x.strip()]
     except (OSError, ValueError, subprocess.SubprocessError) as e:
         warn(f"the engine could not list the GPUs: {e}")
         return []
@@ -1282,7 +1284,10 @@ def gpus_from_engine():
         found.append({"index": len(found), "name": d.get("name") or "GPU", "vram_gb": vram,
                       "device_id": d.get("device_id", 0), "driver": d.get("backend"), "integrated": integrated,
                       "supported": True, "pci": d.get("pci"), "bar_gb": vram, "link": None, "render": None,
-                      "vendor": vendors.get(d.get("vendor_id"), "other")})
+                      "vendor": vendors.get(d.get("vendor_id"), "other"),
+                      # the architecture the GPU reports (an AMD GPU's gfx name) and its HIP number
+                      "gfx": d.get("arch") if d.get("backend") == "HIP" else None,
+                      "hip": d.get("backend_ordinal") if d.get("backend") == "HIP" else None})
     return found
 
 
@@ -1305,14 +1310,13 @@ def gpu_problem(g, together=False):
         return None
     if g.get("vendor") == "nvidia" and license_mode(ARGS) != "contrib":
         return "an NVIDIA GPU needs the contrib build (--license contrib: NVIDIA's CUDA toolkit, not free software)"
-    if g.get("vendor") == "amd" and WIN:
-        return "AMD GPUs are not supported on Windows yet"
     if g.get("vendor") == "amd":
         if not PACKAGED and license_mode(ARGS) == "contrib-icpx":
             return "icpx has no AMD target: an AMD GPU needs the free or contrib build (--license free or contrib)"
         gfx = g.get("gfx")
         if not gfx:
-            return "the kernel's KFD (amdgpu's compute part, /dev/kfd) does not list it"
+            return ("the engine's HIP runtime does not list it" if WIN else
+                    "the kernel's KFD (amdgpu's compute part, /dev/kfd) does not list it")
         if not AMD_ARCH.fullmatch(gfx):
             return f"{gfx}: the engine needs an RDNA2 or later AMD GPU (gfx103x, gfx11xx, gfx12xx)"
         if PACKAGED:
@@ -1833,11 +1837,11 @@ def packaged_engine_dir() -> Path:
     return ROOT / PACKAGED["engine"] if PACKAGED else ROOT / "engine"
 
 
-def engine_tool(*args: str) -> str:
+def engine_tool(*args: str, env: dict | None = None) -> str:
     """strata-device's output for `args` (--list-devices, --cpu): where setup has no sysfs or /proc to read (Windows),
     the engine reports the GPUs and the CPU itself."""
     exe = packaged_engine_dir() / ("strata-device.exe" if WIN else "strata-device")
-    r = subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=120)
+    r = subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=120, env=env)
     if r.returncode != 0:
         raise subprocess.SubprocessError((r.stderr or r.stdout).strip() or f"{exe.name} {' '.join(args)} failed")
     return r.stdout
@@ -2674,15 +2678,16 @@ def has_data(folder: Path) -> bool:
 
 
 def other_installs(settings: dict) -> list:
-    """Strata folders besides this one that may hold model files: the ones this user ran before, and Strata* folders
-    next to this one (a zip unpacked again lands in e.g. `Strata-main (1)\\Strata-main`)."""
+    """XeStrata folders besides this one that may hold model files: the ones this user ran before, and XeStrata*
+    folders next to this one (a zip unpacked again lands in e.g. `XeStrata-main (1)\\XeStrata-main`).  Not upstream
+    Strata's: its folders hold its own model files, which data_folder would move."""
     cands = [Path(p) for p in settings.get("installs", [])]
     for base in dict.fromkeys((ROOT.parent, ROOT.parent.parent)):
         try:
             for d in base.iterdir():
-                if d.is_dir() and d.name.lower().startswith("strata"):
+                if d.is_dir() and d.name.lower().startswith("xestrata"):
                     cands.append(d)
-                    cands += [c for c in d.iterdir() if c.is_dir() and c.name.lower().startswith("strata")]
+                    cands += [c for c in d.iterdir() if c.is_dir() and c.name.lower().startswith("xestrata")]
         except OSError:
             pass
     found = []
@@ -3497,6 +3502,8 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
         check_gpus(gpu if isinstance(gpu, list) else [gpu], found)
         g = next(x for x in found if x["index"] == (gpu[0] if isinstance(gpu, list) else gpu))
         env = dict(os.environ, STRATA_GPU_PCI=g["pci"])
+        if WIN and g.get("hip") is not None:
+            env["ONEAPI_DEVICE_SELECTOR"] = f"hip:{g['hip']}"
         if cfg.get("split_pci"):                       # one card for this start, the saved split kept
             env["STRATA_LAYER_SPLIT"] = "off"
         ok("GPU: " + gpu_name(g) + " (this start)")
@@ -3949,6 +3956,9 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (STRATA_GPU_PCI)
+    if WIN and gpu.get("hip") is not None and len(found) > 1:   # HIP maps page-locked memory into every GPU it
+        cfg["env"] = {**(cfg.get("env") or {}),               # sees: the engine narrows it to these
+                      "ONEAPI_DEVICE_SELECTOR": "hip:" + ",".join(str(gpu_info(i)["hip"]) for i in sel)}
     if a.host:
         cfg["host"] = a.host
     if a.api_key:
@@ -4412,6 +4422,10 @@ def main() -> int:
     # ---- 1. the PC
     step(1, "checking your PC")
     found = gpus()
+    if not found and WIN:
+        fail("the engine lists no GPU",
+             "XeStrata for Windows needs an Intel Arc GPU, an NVIDIA GPU or an RDNA2 or later AMD GPU with its maker's "
+             "driver (AMD: AMD Software, which installs the HIP runtime amdhip64_7.dll)")
     if not found:
         fail("no Intel GPU on the xe or i915 driver, no AMD GPU on amdgpu and no NVIDIA GPU on NVIDIA's driver found",
              "Strata's Xe engine needs an Intel GPU (Intel Arc, or the processor's graphics) on the xe or i915 kernel "
@@ -4750,9 +4764,16 @@ def main() -> int:
     pack_bin = (pack_now / "experts.bin").exists() and (pack_now / "index.txt").exists()
     mtp_have = find_in(roots, "mtp/rt/experts.bin") is not None
     q2_avx = model == "Q2_0" and avx512 and family == "qwen"
-    need = to_fetch + (2 if mtp_have else 8) + (40 if q2_avx and not pack_bin else 0) + (1 if vision != "none" else 0)
-    if free_gb(models_dir) < need:
+    # the download goes into the models folder, the pack and the MTP layer into the data folder: each is counted on
+    # its own drive (--gguf-dir on one drive, --data-dir on another)
+    need_data = (2 if mtp_have else 8) + (40 if q2_avx and not pack_bin else 0) + (1 if vision != "none" else 0)
+    models_free, data_free = free_gb(models_dir), free_gb(data)   # (free_gb makes the folders: same_drive needs them)
+    same = same_drive(models_dir, data)
+    need = to_fetch + (need_data if same else 0)
+    if models_free < need:
         fail(f"not enough free disk space in {models_dir}: need ~{need:.0f} GB", "use --models-dir on a bigger drive")
+    if not same and data_free < need_data:
+        fail(f"not enough free disk space in {data}: need ~{need_data:.0f} GB", "use --data-dir on a bigger drive")
 
     llama, eng, enc, lib_dirs = prepare_engine(a, gpu, vision)
 
@@ -4947,6 +4968,9 @@ def main() -> int:
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (STRATA_GPU_PCI)
+    if WIN and gpu.get("hip") is not None and len(found) > 1:   # HIP maps page-locked memory into every GPU it
+        cfg["env"] = {**(cfg.get("env") or {}),               # sees: the engine narrows it to these
+                      "ONEAPI_DEVICE_SELECTOR": "hip:" + ",".join(str(gpu_info(i)["hip"]) for i in sel)}
     if len(sel) > 1:                                   # --gpus: the layer split's other cards (docs/MULTIGPU.md)
         cfg["gpu_pci"] = gpu["pci"]
         cfg["split_pci"] = [gpu_info(i)["pci"] for i in sel[1:]]

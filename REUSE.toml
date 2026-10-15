@@ -42,6 +42,11 @@ SPDX-License-Identifier = "LGPL-3.0-or-later"
 
 # free third-party material: under its own license
 [[annotations]]
+path = ["tools/package/licenses/origami-LICENSE.md"]
+SPDX-FileCopyrightText = "Advanced Micro Devices, Inc."
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
 path = ["third_party/main/ggml/**"]
 SPDX-FileCopyrightText = "2023-2026 The ggml authors"
 SPDX-License-Identifier = "MIT"
