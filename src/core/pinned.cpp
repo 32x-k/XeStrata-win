@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 
 #include <sys/stat.h>
@@ -521,6 +522,29 @@ bool PinnedArena::register_on(int device, std::string& err) {
             sycl::ext::oneapi::experimental::prepare_for_device_copy(p.first, p.second, ctx);
             regs.push_back(p.first);
         }
+        // Copies through the registration are read back once, both ends of every piece: on the UHD 770 beside a B70
+        // (Level Zero, 2026-10-15) a registration on the second GPU was taken without an error and that GPU's copies
+        // from the arena then came back wrong, where the same copies without it were right.  Such a GPU copies
+        // from the arena unregistered.
+        auto& rt = Runtime::at(device);
+        constexpr size_t kProbe = 64 << 10;
+        auto* d = static_cast<uint8_t*>(sycl::malloc_device(kProbe, rt.device(), rt.context()));
+        if (d == nullptr) throw std::runtime_error("no device memory to check the registration");
+        std::vector<uint8_t> back(kProbe);
+        std::string wrong;
+        for (const auto& p : pieces_) {
+            const size_t n = std::min(kProbe, p.second);
+            for (const size_t off : {(size_t) 0, p.second - n}) {
+                const uint8_t* src = static_cast<const uint8_t*>(p.first) + off;
+                rt.compute().memcpy(d, src, n).wait();
+                rt.compute().memcpy(back.data(), d, n).wait();
+                if (wrong.empty() && std::memcmp(back.data(), src, n) != 0)
+                    wrong = "copies through it came back wrong (byte " + std::to_string(off) + " of a " +
+                            std::to_string(p.second) + "-byte piece)";
+            }
+        }
+        rt.free(d);
+        if (!wrong.empty()) throw std::runtime_error(wrong);
     } catch (const std::exception& e) {
         for (void* r : regs)
             sycl::ext::oneapi::experimental::release_from_device_copy(r, Runtime::at(device).context());
