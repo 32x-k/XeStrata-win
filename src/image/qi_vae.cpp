@@ -207,6 +207,60 @@ void normalize(float* acc, const float* wsum, int64_t HW, void* s) {
     });
 }
 
+// out16 [HW][Cp] = rgba [4][HW] scaled to -1 .. 1, channels past 4 zero (the convolution reads 8 at a time)
+void rgba_tokens16(const float* rgba, int64_t HW, int64_t Cp, uint16_t* out16, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (HW * Cp)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t p = i / Cp, c = i - p * Cp;
+        out16[i] = f16_from_f32(c < 4 ? rgba[c * HW + p] * 2.f - 1.f : 0.f);
+    });
+}
+
+// col16[r][(dy * 3 + dx) * C + c] = in16[2y + dy][2x + dx][c] (0 past the bottom and right edges: the downsampler's
+// zero padding of one row and column there), output pixel p0 + r = y * (W / 2) + x
+void im2col3s2(const uint16_t* in16, int64_t H, int64_t W, int64_t C, int64_t p0, int64_t rows, uint16_t* col16,
+               void* s) {
+    const int64_t Wo = W / 2;
+    q_of(s).parallel_for(sycl::range<2>((size_t) (rows * 9), (size_t) (C / 8)), [=](sycl::id<2> id) {
+        const auto rk = static_cast<int64_t>(id[0]);
+        const int64_t r = rk / 9, kk = rk - r * 9, c8 = static_cast<int64_t>(id[1]) * 8;
+        const int64_t p = p0 + r, y = 2 * (p / Wo) + kk / 3, x = 2 * (p % Wo) + kk % 3;
+        sycl::vec<uint16_t, 8> v(0);
+        if (y < H && x < W) v = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(in16 + (y * W + x) * C + c8);
+        *reinterpret_cast<sycl::vec<uint16_t, 8>*>(col16 + (r * 9 + kk) * C + c8) = v;
+    });
+}
+
+// y [Ho][Wo][cout] += the down block's input xin [H][W][cin] averaged (AvgDown3D on one frame): output channel o is
+// the mean of the group of `g` = cin * ft * fs * fs / cout entries of index ((c * ft + t) * fs + a) * fs + b, frame t
+// 0 the zero padding in front when ft = 2, (a, b) the pixel's place in its fs x fs block
+void avgdown_add(float* y, const float* xin, int64_t H, int64_t W, int64_t cin, int64_t cout, int64_t ft, int64_t fs,
+                 void* s) {
+    const int64_t Ho = H / fs, Wo = W / fs, g = cin * ft * fs * fs / cout;
+    q_of(s).parallel_for(sycl::range<1>((size_t) (Ho * Wo * cout)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t o = i % cout, P = i / cout, xo = P % Wo, yo = P / Wo;
+        float sum = 0.f;
+        for (int64_t k = 0; k < g; ++k) {
+            const int64_t idx = o * g + k, b = idx % fs, a = (idx / fs) % fs, t = (idx / (fs * fs)) % ft,
+                          c = idx / (fs * fs * ft);
+            if (ft == 2 && t == 0) continue;   // the padded frame
+            sum += xin[((yo * fs + a) * W + xo * fs + b) * cin + c];
+        }
+        y[i] += sum / (float) g;
+    });
+}
+
+// z [C][HW] = (h [HW][ch] channel c < C - mean[c]) / std[c]: the encoder's mean, as the DiT's latent
+void norm_latent(const float* h, int64_t HW, int64_t ch, int64_t C, const float* mean, const float* sd, float* z,
+                 void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (C * HW)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i / HW, p = i - c * HW;
+        z[i] = (h[p * ch + c] - mean[c]) / sd[c];
+    });
+}
+
 }  // namespace
 
 QiVae::QiVae() = default;
@@ -220,7 +274,8 @@ QiVae::Conv QiVae::conv_w(SafeTensors& st, const std::string& name) {
     if (t == nullptr || t->shape.size() != 4) throw std::runtime_error("image engine (VAE): no " + name);
     Conv c;
     c.out = t->shape[0];
-    c.in = t->shape[1];
+    const int64_t in = t->shape[1];
+    c.in = (in + 7) / 8 * 8;   // the input channels padded with zeros to 8s (the unfolding reads 8 at a time)
     c.k = t->shape[2];
     if (dry_) {
         weight_bytes_ += (uint64_t) (c.out * c.k * c.k * c.in) * 2;
@@ -230,11 +285,11 @@ QiVae::Conv QiVae::conv_w(SafeTensors& st, const std::string& name) {
     const auto w = st.f32(name + ".weight");   // [out][in][k][k]
     std::vector<uint16_t> h((size_t) (c.out * c.k * c.k * c.in));
     for (int64_t o = 0; o < c.out; ++o)
-        for (int64_t i = 0; i < c.in; ++i)
+        for (int64_t i = 0; i < in; ++i)
             for (int64_t dy = 0; dy < c.k; ++dy)
                 for (int64_t dx = 0; dx < c.k; ++dx)
                     h[(size_t) (((o * c.k + dy) * c.k + dx) * c.in + i)] =
-                        kernels::f16_from_f32(w[(size_t) (((o * c.in + i) * c.k + dy) * c.k + dx)]);
+                        kernels::f16_from_f32(w[(size_t) (((o * in + i) * c.k + dy) * c.k + dx)]);
     uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
     gpu::copy(d, h.data(), h.size() * 2);
     c.w = d;
@@ -293,6 +348,25 @@ bool QiVae::open(const std::string& path, void* stream, std::string& err, bool d
         }
         gout_ = vec(st, "decoder.norm_out.gamma");
         cout_ = conv_w(st, "decoder.conv_out");
+        if (st.find("encoder.conv_in.weight") != nullptr) {   // the encoder, for the edits' reference images
+            ein_ = conv_w(st, "encoder.conv_in");
+            for (int i = 0; i < 5; ++i) {
+                const std::string p = "encoder.down_blocks." + std::to_string(i) + ".";
+                for (int j = 0; j < 2; ++j) down_[i].r[j] = res_w(st, p + "resnets." + std::to_string(j) + ".");
+                if (st.find(p + "downsampler.resample.1.weight") != nullptr)
+                    down_[i].down = conv_w(st, p + "downsampler.resample.1");
+                down_[i].ft = st.find(p + "downsampler.time_conv.weight") != nullptr ? 2 : 1;
+            }
+            emid0_ = res_w(st, "encoder.mid_block.resnets.0.");
+            emid1_ = res_w(st, "encoder.mid_block.resnets.1.");
+            eag_ = vec(st, "encoder.mid_block.attentions.0.norm.gamma");
+            eaqkv_ = conv_w(st, "encoder.mid_block.attentions.0.to_qkv");
+            eaproj_ = conv_w(st, "encoder.mid_block.attentions.0.proj");
+            egout_ = vec(st, "encoder.norm_out.gamma");
+            eout_ = conv_w(st, "encoder.conv_out");
+            quant_ = conv_w(st, "quant_conv");
+            has_encoder_ = true;
+        }
         if (dry_) return true;
         if (!gemm_.init(s_, 16, err)) return false;
         return true;
@@ -355,11 +429,11 @@ void QiVae::resblock(const Res& r, float*& x, int64_t H, int64_t W, int64_t cin)
     x = y;
 }
 
-void QiVae::attention(float* x, int64_t H, int64_t W, int64_t C) {
+void QiVae::attention(float* x, int64_t H, int64_t W, int64_t C, const float* g, const Conv& qkv_w, const Conv& proj) {
     const int64_t HW = H * W;
     float* qkv = x == t0_ ? t1_ : t0_;
-    rms16(x, ag_, HW, C, false, a16_, s_);
-    conv(aqkv_, a16_, H, W, qkv);
+    rms16(x, g, HW, C, false, a16_, s_);
+    conv(qkv_w, a16_, H, W, qkv);
     uint16_t *q16 = a16_, *k16 = a16_ + HW * C, *vt16 = a16_ + 2 * HW * C;
     split_qkv16(qkv, HW, C, q16, k16, vt16, s_);
     float* sc = t2_;
@@ -368,7 +442,7 @@ void QiVae::attention(float* x, int64_t H, int64_t W, int64_t C) {
     softmax16(sc, HW, HW, 1.0f / std::sqrt((float) C), p16, s_);
     gemm_.f16(p16, vt16, qkv, HW, C, HW);   // O = P . V (V^T's rows are V's columns)
     qi_to_f16(qkv, HW * C, a16_, s_);
-    conv(aproj_, a16_, H, W, t2_);
+    conv(proj, a16_, H, W, t2_);
     qi_axpy(x, t2_, 1.0f, HW * C, s_);
 }
 
@@ -459,7 +533,7 @@ void QiVae::decode_piece(const float* z, int64_t h, int64_t w, float* rgba) {
     qi_to_f16(t1_, H * W * pq_.out, a16_, s_);
     conv(cin_, a16_, H, W, x);
     resblock(mid0_, x, H, W, c);
-    attention(x, H, W, c);
+    attention(x, H, W, c, ag_, aqkv_, aproj_);
     resblock(mid1_, x, H, W, c);
     for (const Up& u : up_) {
         const int64_t cin = c, co = u.r[0].c1.out;
@@ -490,6 +564,88 @@ void QiVae::decode_piece(const float* z, int64_t h, int64_t w, float* rgba) {
     conv(cout_, a16_, H, W, out);
     to_rgba(out, H * W, rgba, s_);
     gpu::stream_sync(s_);
+}
+
+QiVae::Need QiVae::encode_need(int64_t H, int64_t W) const {
+    Need n;
+    int64_t h = H, w = W, c = ein_.in, unfold = H * W * 9 * ein_.in;
+    n.big32 = n.big16 = H * W * std::max(c, ein_.out);
+    c = ein_.out;
+    for (const Down& d : down_) {
+        const int64_t co = d.r[0].c1.out;
+        n.big32 = std::max(n.big32, h * w * std::max(c, co));
+        n.big16 = std::max(n.big16, h * w * std::max(c, co));
+        unfold = std::max(unfold, h * w * 9 * std::max(c, co));
+        n.keep = std::max(n.keep, h * w * c);
+        if (d.down.w != nullptr) {
+            h /= 2;
+            w /= 2;
+            unfold = std::max(unfold, h * w * 9 * co);
+        }
+        c = co;
+    }
+    // the middle's attention: q, k, v [hw][c] and the scores [hw][hw]
+    n.big32 = std::max(n.big32, h * w * std::max(3 * c, h * w));
+    n.big16 = std::max(n.big16, 3 * h * w * c);
+    n.big32 = std::max(n.big32, h * w * std::max(eout_.out, quant_.out));
+    n.col = std::max(h * w * h * w, std::min(unfold, kColBytes / 2));
+    return n;
+}
+
+uint64_t QiVae::encode_scratch_bytes(int64_t H, int64_t W) const {
+    const Need n = encode_need(H, W);
+    return (uint64_t) n.big16 * 2 + (uint64_t) n.big32 * 4 * 3 + (uint64_t) n.keep * 4 + (uint64_t) n.col * 2;
+}
+
+bool QiVae::encode(const float* rgba, int64_t H, int64_t W, float* z) {
+    if (!has_encoder_) return false;
+    if (H % 16 != 0 || W % 16 != 0 || H <= 0 || W <= 0)
+        throw std::invalid_argument("image engine (VAE): the sides must be multiples of 16");
+    const Need nd = encode_need(H, W);
+    grow(nd.big16, nd.big32, nd.col);
+    rgba_tokens16(rgba, H * W, ein_.in, a16_, s_);
+    float* x = t0_;
+    conv(ein_, a16_, H, W, x);
+    int64_t c = ein_.out;
+    for (const Down& d : down_) {
+        const int64_t cin = c;
+        float* keep = alloc<float>(allocs_, H * W * cin);   // the block's input, for its shortcut
+        gpu::copy_async(keep, x, (size_t) (H * W * cin) * 4, s_);
+        for (const Res& r : d.r) {
+            resblock(r, x, H, W, c);
+            c = r.c1.out;
+        }
+        int64_t fs = 1;
+        if (d.down.w != nullptr) {   // zero row and column after the edge, then the 3 x 3 convolution of stride 2
+            qi_to_f16(x, H * W * c, a16_, s_);
+            float* y = x == t0_ ? t1_ : t0_;
+            const int64_t Ho = H / 2, Wo = W / 2, K = 9 * c, rows = std::max<int64_t>(1, col_cap_ / K);
+            for (int64_t p0 = 0; p0 < Ho * Wo; p0 += rows) {
+                const int64_t n = std::min(rows, Ho * Wo - p0);
+                im2col3s2(a16_, H, W, c, p0, n, col16_, s_);
+                gemm_.f16(col16_, d.down.w, y + p0 * d.down.out, n, d.down.out, K);
+            }
+            bias_add(y, d.down.b, nullptr, Ho * Wo, d.down.out, s_);
+            x = y;
+            fs = 2;
+        }
+        avgdown_add(x, keep, H, W, cin, c, d.ft, fs, s_);
+        gpu::stream_sync(s_);
+        release(allocs_, keep);
+        H /= fs;
+        W /= fs;
+    }
+    resblock(emid0_, x, H, W, c);
+    attention(x, H, W, c, eag_, eaqkv_, eaproj_);
+    resblock(emid1_, x, H, W, c);
+    rms16(x, egout_, H * W, c, true, a16_, s_);
+    float* y = x == t0_ ? t1_ : t0_;
+    conv(eout_, a16_, H, W, y);
+    qi_to_f16(y, H * W * eout_.out, a16_, s_);
+    conv(quant_, a16_, H, W, t2_);
+    norm_latent(t2_, H * W, quant_.out, pq_.in, mean_, std_, z, s_);
+    gpu::stream_sync(s_);
+    return true;
 }
 
 }  // namespace strata::image

@@ -32,6 +32,14 @@ public:
     /// largest that fit, a quarter of a tile apart) whose images are blended where they meet.
     void decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t max_scratch = UINT64_MAX);
 
+    /// The encoder (a reference image for an edit): z [64][H / 16][W / 16] (device FP32, the DiT's latent, normalized
+    /// as the decoder's input is) from rgba [4][H][W] (device FP32, 0 .. 1), H and W multiples of 16.  False when the
+    /// VAE file has no encoder.
+    bool encode(const float* rgba, int64_t H, int64_t W, float* z);
+    bool has_encoder() const { return has_encoder_; }
+    /// The GPU memory an encode of an H x W image works in.
+    uint64_t encode_scratch_bytes(int64_t H, int64_t W) const;
+
     /// The GPU memory a decode of one h x w piece works in (its buffers, besides the weights).
     uint64_t scratch_bytes(int64_t h, int64_t w) const;
     /// The least a decode takes: an 8 x 8 tile's.
@@ -64,7 +72,8 @@ private:
     void conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out);
     // x [HW][C] -> x + the residual block (x replaced; scratch buffers)
     void resblock(const Res& r, float*& x, int64_t H, int64_t W, int64_t cin);
-    void attention(float* x, int64_t H, int64_t W, int64_t C);
+    void attention(float* x, int64_t H, int64_t W, int64_t C, const float* g, const Conv& qkv, const Conv& proj);
+    Need encode_need(int64_t H, int64_t W) const;
     void grow(int64_t elems16, int64_t elems32, int64_t col16);
 
     void* s_ = nullptr;
@@ -83,6 +92,18 @@ private:
         int ft = 1;
     } up_[5];
     const float* gout_ = nullptr;
+    // the encoder
+    bool has_encoder_ = false;
+    Conv ein_, eout_, quant_;
+    Res emid0_, emid1_;
+    const float* eag_ = nullptr;
+    Conv eaqkv_, eaproj_;
+    struct Down {
+        Res r[2];
+        Conv down;   // down.w null: no downsampling
+        int ft = 1;  // the shortcut's frames (2 where the block also halves time)
+    } down_[5];
+    const float* egout_ = nullptr;
     // scratch, grown on demand
     int64_t cap16_ = 0, cap32_ = 0;
     uint16_t *a16_ = nullptr, *col16_ = nullptr;
