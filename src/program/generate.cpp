@@ -2982,19 +2982,19 @@ int main(int argc, char** argv) {
     strata::core::progress_at("starting: building the GPU kernels (on a thread beside the load)");
     strata::core::Runtime::get().preload_kernels();   // beside the model's loading
     // and on every other GPU of a layer split, with its matrix products' library (each GPU builds its own kernels)
-    if (multi_gpu)
-        for (const int d : split_devs) strata::core::Runtime::at(d).preload_kernels();
+    std::vector<int> preloaded;
+    if (multi_gpu) preloaded = split_devs;
     for (int r = 0; r < 3; ++r)   // and on the helper GPUs
-        if (o.expert_cache_remote[(size_t) r] > 0) strata::core::Runtime::at(remote_dev[r]).preload_kernels();
+        if (o.expert_cache_remote[(size_t) r] > 0) preloaded.push_back(remote_dev[r]);
+    for (const int d : preloaded) strata::core::Runtime::at(d).preload_kernels();
     // stopped when main returns, whichever way (stop_preload)
     struct PreloadStop {
-        const std::vector<int>* split;
+        const std::vector<int>& others;
         ~PreloadStop() {
             strata::core::Runtime::get().stop_preload();
-            if (split != nullptr)
-                for (const int d : *split) strata::core::Runtime::at(d).stop_preload();
+            for (const int d : others) strata::core::Runtime::at(d).stop_preload();
         }
-    } preload_stop{multi_gpu ? &split_devs : nullptr};
+    } preload_stop{preloaded};
     // The matrix products' library (oneMath's backend) loaded and its first products run before the first prompt, and
     // what it holds on this GPU counted into the reserve when the cache is sized (blas_bytes), as for a library loaded
     // at its first use: hipBLASLt holds 0.2-0.3 GiB (172 MiB for its handle, ~78 for each kernel type's code), which
