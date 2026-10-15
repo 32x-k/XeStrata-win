@@ -212,6 +212,13 @@ int serve(si::QiPipeline& p) {
         } catch (const si::QiStopped&) {
             std::printf("ERROR stopped\n");
         } catch (const std::exception& e) {
+            if (op == "IMG") {   // a request that failed (short of memory) gives its cache back
+                try {
+                    p.release(false);
+                } catch (const std::exception& e2) {
+                    std::fprintf(stderr, "strata-image: release after a failed request: %s\n", e2.what());
+                }
+            }
             std::string m = e.what();
             for (char& c : m)
                 if (c == '\n') c = ' ';

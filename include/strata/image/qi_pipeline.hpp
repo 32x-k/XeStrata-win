@@ -95,7 +95,7 @@ public:
                                   const std::function<bool(int, int)>& step = {});
 
 private:
-    QiPlan plan(int64_t T, int64_t h, int64_t w);
+    QiPlan plan(int64_t T, int64_t h, int64_t w, int64_t n_ids = 0);
 
     void ensure_open();
     void edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::vector<QiVisionOut>& vouts,

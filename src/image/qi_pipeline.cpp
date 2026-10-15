@@ -105,17 +105,19 @@ QiNeed QiPipeline::need(int64_t n_text, int64_t width, int64_t height,
     const QiText& te = *te_size_;
     const QiVae& vae = *vae_size_;
     const int64_t h = height / 16, w = width / 16;
-    int64_t T = n_text + h * w;
+    int64_t T = n_text + h * w, te_T = n_text + 16;   // the encoder's tokens: the system turn's too
     uint64_t edit = 0;   // an edit's reference work before the sampling: the vision encoder and the VAE's encoder
     for (const auto& [rw0, rh0] : refs) {
         int64_t rw = 0, rh = 0;
         qi_ref_size(rw0, rh0, width, height, rw, rh);
         T += (rh / 16) * (rw / 16) - 1;   // the pad's place: the reference's latent tokens
+        te_T += (rh / 32) * (rw / 32) - 1;   // and in the encoder its image tokens
         const uint64_t v = vision_size_ ? vision_size_->weight_bytes() + vision_size_->scratch_bytes((rh / 16) * (rw / 16)) : 0;
         edit = std::max(edit, v + vae.encode_scratch_bytes(rh, rw) + (uint64_t) (4 * rh * rw) * 4);
     }
-    const uint64_t fixed = dit.weight_bytes() + vae.weight_bytes() + kScratch;
+    const uint64_t fixed = dit.weight_bytes() + vae.weight_bytes() + kScratch + dit.prefix_bytes(T - h * w);
     QiNeed n;
+    edit = std::max(edit, te.activation_bytes(te_T));   // the encoder's own buffers, before the DiT's
     n.least = fixed + std::max({dit.activation_bytes(T, 512), vae.scratch_min(), edit}) + dit.block_min() +
               te.layer_min();
     // the DiT's blocks resident (used 8 times an image), the encoder streamed (once a prompt), the VAE in one piece
@@ -152,10 +154,11 @@ void QiPipeline::release(bool all) {
     mlp_set_ = -1;
 }
 
-QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w) {
+QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids) {
     QiPlan p;
     p.budget = budget_ > 0 ? budget_ : auto_budget_;
-    p.fixed = dit_->weight_bytes() + vae_->weight_bytes() + kScratch;
+    // the prefix's rows and cache stay through the sampling and the decode (an edit's: its references' tokens too)
+    p.fixed = dit_->weight_bytes() + vae_->weight_bytes() + kScratch + (T > 0 ? dit_->prefix_bytes(T - h * w) : 0);
     if (p.budget <= p.fixed) throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
                                                       " MiB) is below the weights that always stay");
     const uint64_t avail = p.budget - p.fixed, dit_min = dit_->block_min(), te_min = te_->layer_min();
@@ -168,7 +171,8 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w) {
         p.activations = dit_->activation_bytes(T, rows);
     }
     // the room after the layers: the DiT's activations, and later the VAE's least (they take it in turn)
-    const uint64_t work = std::max(p.activations, vae_->scratch_min());
+    // the encoder's buffers too: they come and go before the DiT's (generate frees them after the encode)
+    const uint64_t work = std::max({p.activations, vae_->scratch_min(), te_->activation_bytes(n_ids)});
     if (avail < work + dit_min + te_min)
         throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
                                  " MiB) is too small for this image");
@@ -300,12 +304,14 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     const int64_t n_ctx = (int64_t) all_ids.size() - r.drop;
     int64_t n_pre = n_ctx;
     for (const QiDit::Ref& f : dit_refs) n_pre += f.h * f.w - f.slots;
-    QiPlan p = plan(n_pre + h * w, h, w);
+    QiPlan p = plan(n_pre + h * w, h, w, (int64_t) all_ids.size());
     if (!r.refs.empty()) {   // the references' states are not kept: another edit has other images
         last_states_ = te_->encode(all_ids, te_images);
+        te_->drop_activations();
         last_ids_.clear();
     } else if (r.ids != last_ids_) {
         last_states_ = te_->encode(r.ids);
+        te_->drop_activations();
         last_ids_ = r.ids;
     } else {
         p.text_cached = true;

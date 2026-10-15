@@ -91,6 +91,10 @@ public:
     void drop_activations();
     /// The GPU memory the activations of a T-token sequence take, the MLP computed `mlp_rows` rows at a time (0: all).
     uint64_t activation_bytes(int64_t T, int64_t mlp_rows = 0) const;
+    /// What a prefix of n rows holds while it is the context: its rows and every block's K and V (the prefix cache).
+    uint64_t prefix_bytes(int64_t n) const {
+        return (uint64_t) n * (uint64_t) C_ * (4 + (uint64_t) 4 * blocks_.size());
+    }
     /// The rows the MLP takes at a time (0: all of them): its 2 x 12288-wide product is the largest activation.
     void set_mlp_rows(int64_t rows);
 

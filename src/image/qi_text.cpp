@@ -141,6 +141,23 @@ void QiText::ensure(int64_t T) {
     cap_T_ = T;
 }
 
+uint64_t QiText::activation_bytes(int64_t T) const {
+    const int64_t kv = kv_heads_ * head_dim_;
+    return (uint64_t) T * ((uint64_t) (4 * C_ + 2 * kv + 2 * inter_) * 4 + (uint64_t) std::max(C_, inter_) * 2 +
+                           (uint64_t) (C_ + 2 * kv) * 2 + embd_row_bytes_);
+}
+
+void QiText::drop_activations() {
+    gpu::stream_sync(s_);
+    for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) a_, (void*) h_, (void*) gu_, (void*) h16_,
+                    (void*) q16_, (void*) k16_, (void*) v16_, (void*) rows_})
+        release(allocs_, p);
+    x_ = q_ = k_ = v_ = a_ = h_ = gu_ = nullptr;
+    h16_ = q16_ = k16_ = v16_ = nullptr;
+    rows_ = nullptr;
+    cap_T_ = 0;
+}
+
 std::vector<float> QiText::encode(const std::vector<int32_t>& ids, const std::vector<Image>& images) {
     const auto T = (int64_t) ids.size();
     if (T == 0) return {};
