@@ -42,8 +42,9 @@ The main ones:
   alpha and beta and the MTP layer's BF16 routers. Its answers were compared with llama.cpp's and it runs on the three
   makers' GPUs. Right after a prompt the VRAM tier is filled with the experts that prompt used most (upstream's q36
   idea), which makes decode 20-40% faster (Ornith and llm-jp too).
-- Image generation (Qwen-Image-2.1-Turbo, `POST /v1/images/generations`): stable-diffusion.cpp's `sd-cli`, built as the
-  Vulkan version for every maker's GPU.
+- Image generation (Qwen-Image-2.1-Turbo, `POST /v1/images/generations`): instead of upstream's stable-diffusion.cpp,
+  XeStrata's own SYCL image engine, `strata-image` (the DiT, the VAE and the text encoder; attention on the matrix
+  units; resident beside the server, streaming the layers that do not fit in VRAM).
 - Unsloth's files: the K-quant experts' weights are decoded once per grouped call (KqSplit, the same bits; B70
   UD-Q4_K_XL decode +7%). setup offers UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 as well (experimental).
 - The commit graph does every GDN and QSA layer in one launch (`STRATA_COMMIT_BATCH`, on by default).

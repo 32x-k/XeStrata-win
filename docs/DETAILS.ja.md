@@ -1241,17 +1241,18 @@ XeStrata はそれを、プロンプトの `<|image_pad|>` のトークンの位
 ## 画像の生成（任意）
 
 `./setup.sh --images qwen-image` で、文章のモデルとは別に Qwen-Image-2.1-Turbo で画像を作れるようにします（upstream 0.1.44）。
-setup は [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)（MIT）の `sd-cli` を Vulkan 版でビルドし、画像のモデル、VAE、文の読み手（Qwen3-VL-8B）をダウンロードして、設定に `"images"` を足します。
-Vulkan 版はどのメーカーの GPU でも動きます。`--image-backend cpu` で CPU でも作れます（遅い）。
-画像のモデルの大きさは GPU のメモリで選びます（8 GB まで Q4_K_M、12 GB まで Q6_K、それより上は Q8_0。`--image-quant` で変えられます）。
-setup は最後に、その GPU で 2 ステップの画像を 2 枚作って、DiT の flash attention のありなしと、VAE の畳み込みを直接計算するか（`--vae-conv-direct`）を測り、それぞれ速い方を設定の `"args"` に書きます（約 1 分）。
-重みは転送用の領域を経由して VRAM に送ります（設定の `"env"` の `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1`。CPU 内蔵の GPU では付けません）。
-1024×1024・8 ステップの 1 枚は、B70（Q8_0、flash attention なし、VAE はそのまま）で 28 秒、RTX 4070（Q6_K、flash attention あり、VAE は直接計算）で 19 秒、RX 9060 XT（Q8_0、flash attention あり、VAE は直接計算）で 33 秒でした。
+画像は XeStrata 自身の画像のエンジン `strata-image` が作ります。setup が文章のエンジンと一緒にビルドし、同じ SYCL のカーネルでどのメーカーの GPU でも動きます。
+setup は画像のモデル、VAE、文の読み手（Qwen3-VL-8B）をダウンロードして、設定に `"images"` を足します。
+画像のモデルは既定で Q8_0 です。VRAM に入らない層はエンジンが RAM から流し込むので、GPU のメモリで大きさを選ぶ必要はありません（`--image-quant` で Q6_K や Q4_K_M にすると、ディスクと RAM が少なくて済みます）。
+同じ種なら、stable-diffusion.cpp がモデルのカードのコマンドで作る画像と同じ画像になります（LPIPS 0.03 以内）。
 Qwen-Image-2.1-Turbo の重みは Qwen Research License で、自由なソフトウェアのライセンスではありません。商用に使う前にそのライセンスを読んでください。
 
-サーバーは `POST /v1/images/generations`（OpenAI の images API の形。`seed` と `steps` も受けます）で画像を作り、Web のページには「Images」のタブが出ます。
-画像の仕事は GPU で 1 つずつ動きます。その間の文章のモデルの扱いは `--image-gpu-policy` で決めます: `keep`（そのまま）、`shrink`（`--vram-elastic` で VRAM を空ける）、`unload`（会話を保存して外し、次の起動で戻す）、`auto`（既定。両方が入れば `keep`、入らなければ空けるか外す）。
-`tools/image/install.py --config <設定>` で、入っているモデルにあとから足せます。今は Linux だけです。
+サーバーは `POST /v1/images/generations`（OpenAI の images API の形。`seed` も受けます）で画像を作り、Web のページには「Images」のタブが出ます。
+大きさは一辺 256〜2048 ピクセルです。辺が 16 の倍数でない大きさ（1920×1080 など）は、16 の倍数に切り上げた大きさ（1920×1088）で作って真ん中を切り出し、Web のページはそのことを知らせます。
+画像のエンジンは最初の画像で起動して、そのまま残ります。カーネルの準備は 1 度だけで、同じプロンプトの文の状態と VRAM に載せた層は次の画像まで残ります。
+画像の仕事は GPU で 1 つずつ動きます。エンジンは仕事の前に、その画像に要る VRAM（最低限と、DiT を全部載せて VAE を 1 回で回せる量）を答え、文章のモデルの扱いは `--image-gpu-policy` で決めます: `keep`（そのまま）、`shrink`（`--vram-elastic` で VRAM を空ける）、`unload`（会話を保存して外し、次の起動で戻す）、`auto`（既定。全部が入れば `keep`、入らなければ空けられるときは `shrink`、最低限が入るなら層を流し込んで `keep`、それも入らなければ `unload`）。
+仕事のあと、`keep` で VRAM に余裕があるときだけ画像のエンジンは層を残し、それ以外は持っているものを手放します（待機中はプロセスだけの約 200 MiB）。
+`tools/image/install.py --config <設定>` で、入っているモデルにあとから足せます。
 
 ---
 

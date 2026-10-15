@@ -42,7 +42,7 @@ upstream の Strata 0.1.43.1 から 0.1.44.1（`296b59d2`）までの変更を X
 - Qwen3.6-35B-A3B（Unsloth の MTP の層付きの UD-Q4_K_XL・UD-Q6_K_XL・Q8_0）を、Ornith-1.5 と同じ plain の経路で読む。
   upstream は Qwen3.6 に CUDA 専用のエンジンを作りましたが、XeStrata では F32 の GDN の alpha・beta と MTP の層の BF16 の router を読めるようにしました。
   llama.cpp と答えを比べ、3 社の GPU で動かしています。prompt の直後に、その prompt が多く使ったエキスパートで VRAM の層を一度に埋める（upstream の q36 の考え方）ので、decode が 20〜40% 速くなりました（Ornith と llm-jp にも効きます）。
-- 画像の生成（Qwen-Image-2.1-Turbo、`POST /v1/images/generations`）。stable-diffusion.cpp の `sd-cli` を、どのメーカーの GPU でも Vulkan 版で作ります。
+- 画像の生成（Qwen-Image-2.1-Turbo、`POST /v1/images/generations`）。upstream の stable-diffusion.cpp の代わりに、XeStrata 自身の SYCL の画像のエンジン `strata-image` で作ります（DiT・VAE・文の読み手、行列ユニットの注意。サーバーの中で常駐し、VRAM に入らない層は流し込む）。
 - Unsloth のファイル: K-quant のエキスパートの重みを、グループの呼び出しで 1 回だけ展開する（KqSplit、同じビットの答え。B70 の UD-Q4_K_XL の decode +7%）。setup は UD-Q5_K_XL・UD-Q6_K_XL・Q8_0 も選べます（experimental）。
 - 確定のグラフで GDN と QSA の層をまとめて 1 回の起動にする（`STRATA_COMMIT_BATCH`、既定でオン）。
 - 層の分割の自動の配置（近い同点では窮屈なカードに余裕を残す、遅いリンクの重みは 4 倍の差から）、起動時の VRAM の空きの確認を後ろのカードにも。

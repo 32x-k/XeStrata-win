@@ -1262,17 +1262,18 @@ the model uses interleaved M-RoPE.
 ## Image generation (optional)
 
 `./setup.sh --images qwen-image` sets up image generation with Qwen-Image-2.1-Turbo beside the text model (upstream 0.1.44).
-Setup builds [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)'s (MIT) `sd-cli` with its Vulkan backend, downloads the image model, its VAE and its text encoder (Qwen3-VL-8B), and adds an `"images"` section to the config.
-The Vulkan build runs on every maker's GPU; `--image-backend cpu` makes images on the CPU (slowly).
-The image model's size follows the GPU memory (Q4_K_M up to 8 GB, Q6_K up to 12 GB, Q8_0 above; `--image-quant` changes it).
-Last, setup makes two images of 2 steps on that GPU to time the DiT's flash attention on and off and the VAE's convolutions computed directly or not (`--vae-conv-direct`), and writes the faster of each into the config's `"args"` (about a minute).
-The weights reach the VRAM through a staging buffer (`GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1` in the config's `"env"`; not on integrated GPUs).
-A 1024x1024 image of 8 steps took 28 s on the B70 (Q8_0, without flash attention, the VAE as it was), 19 s on the RTX 4070 (Q6_K, with flash attention, the VAE direct) and 33 s on the RX 9060 XT (Q8_0, with flash attention, the VAE direct).
+Images are made by XeStrata's own image engine, `strata-image`, which setup builds with the text engine: the same SYCL kernels, on every maker's GPU.
+Setup downloads the image model, its VAE and its text encoder (Qwen3-VL-8B), and adds an `"images"` section to the config.
+The image model is Q8_0 by default. The engine streams from RAM the layers that do not fit in VRAM, so the GPU's memory does not decide the size (`--image-quant` Q6_K or Q4_K_M saves disk and RAM).
+With the same seed it makes the image stable-diffusion.cpp makes with the model card's command (within an LPIPS of 0.03).
 Qwen-Image-2.1-Turbo's weights are under the Qwen Research License, not a free software license: read it before any commercial use.
 
-The server makes images on `POST /v1/images/generations` (OpenAI's images API, plus `seed` and `steps`), and the web page gets an Images tab.
-Image jobs run one at a time on the GPU. What the text model does meanwhile is `--image-gpu-policy`: `keep` (stays as it is), `shrink` (gives VRAM back through `--vram-elastic`), `unload` (its conversation saved, unloaded, restored at the next start), or `auto` (the default: `keep` when both fit, else shrink or unload).
-`tools/image/install.py --config <config>` adds it to an existing install. Linux only for now.
+The server makes images on `POST /v1/images/generations` (OpenAI's images API, plus `seed`), and the web page gets an Images tab.
+Each side is 256 to 2048 pixels. A size whose sides are not multiples of 16 (1920x1080) is made at the sides rounded up (1920x1088) and its middle cut out; the web page says so.
+The image engine starts with the first image and stays: its kernels are prepared once, and the same prompt's text states and the layers it holds in VRAM are kept for the next image.
+Image jobs run one at a time on the GPU. Before a job the engine says what the image needs in VRAM (the least, and the DiT whole with the VAE in one piece), and what the text model does meanwhile is `--image-gpu-policy`: `keep` (stays as it is), `shrink` (gives VRAM back through `--vram-elastic`), `unload` (its conversation saved, unloaded, restored at the next start), or `auto` (the default: `keep` when everything fits, else `shrink` when the engine can, else `keep` with the layers streamed when the least fits, else `unload`).
+After a job the image engine keeps its layers only under `keep` with VRAM to spare; otherwise it lets go of what it holds (idle, the process alone, about 200 MiB).
+`tools/image/install.py --config <config>` adds it to an existing install.
 
 ---
 
