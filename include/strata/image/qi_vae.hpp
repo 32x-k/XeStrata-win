@@ -33,13 +33,15 @@ public:
 
     /// The GPU memory a decode of one h x w piece works in (its buffers, besides the weights).
     uint64_t scratch_bytes(int64_t h, int64_t w) const;
+    /// The least a decode takes: an 8 x 8 tile's.
+    uint64_t scratch_min() const { return scratch_bytes(8, 8); }
     /// Frees the working buffers (grown again on use).
     void drop_scratch();
     uint64_t weight_bytes() const { return weight_bytes_; }
 
 private:
     struct Need {
-        int64_t big16 = 0, big32 = 0, keep = 0;
+        int64_t big16 = 0, big32 = 0, keep = 0, col = 0;
     };
     Need need(int64_t h, int64_t w) const;
     void decode_piece(const float* z, int64_t h, int64_t w, float* rgba);
@@ -60,7 +62,7 @@ private:
     // x [HW][C] -> x + the residual block (x replaced; scratch buffers)
     void resblock(const Res& r, float*& x, int64_t H, int64_t W, int64_t cin);
     void attention(float* x, int64_t H, int64_t W, int64_t C);
-    void grow(int64_t elems16, int64_t elems32);
+    void grow(int64_t elems16, int64_t elems32, int64_t col16);
 
     void* s_ = nullptr;
     prefill::Gemm gemm_;

@@ -287,7 +287,7 @@ bool QiVae::open(const std::string& path, void* stream, std::string& err) {
     }
 }
 
-void QiVae::grow(int64_t elems16, int64_t elems32) {
+void QiVae::grow(int64_t elems16, int64_t elems32, int64_t col16) {
     if (elems16 > cap16_) {
         release(allocs_, a16_);
         a16_ = alloc<uint16_t>(allocs_, elems16);
@@ -300,9 +300,10 @@ void QiVae::grow(int64_t elems16, int64_t elems32) {
         }
         cap32_ = elems32;
     }
-    if (col16_ == nullptr) {
-        col_cap_ = kColBytes / 2;
-        col16_ = alloc<uint16_t>(allocs_, col_cap_);
+    if (col16 > col_cap_) {
+        release(allocs_, col16_);
+        col16_ = alloc<uint16_t>(allocs_, col16);
+        col_cap_ = col16;
     }
 }
 
@@ -361,26 +362,30 @@ QiVae::Need QiVae::need(int64_t h, int64_t w) const {
     Need n;
     n.big32 = h * w * std::max<int64_t>(3 * cin_.out, h * w);
     n.big16 = 3 * h * w * cin_.out;
-    int64_t H = h, W = w, c = cin_.out;
+    int64_t H = h, W = w, c = cin_.out, unfold = 0;   // the largest stage's unfolded neighbourhoods
     for (const Up& u : up_) {
         const int64_t co = u.r[0].c1.out;
         n.big32 = std::max(n.big32, H * W * std::max(c, co));
         n.big16 = std::max(n.big16, H * W * std::max(c, co));
+        unfold = std::max(unfold, H * W * 9 * std::max(c, co));
         if (u.up.w != nullptr) {
             n.keep = std::max(n.keep, H * W * c);
             H *= 2;
             W *= 2;
             n.big32 = std::max(n.big32, H * W * co);
             n.big16 = std::max(n.big16, H * W * co);
+            unfold = std::max(unfold, H * W * 9 * co);
         }
         c = co;
     }
+    // the convolutions unfold a band of rows at a time into at most kColBytes; the attention's probabilities [hw][hw]
+    n.col = std::max(h * w * h * w, std::min(unfold, kColBytes / 2));
     return n;
 }
 
 uint64_t QiVae::scratch_bytes(int64_t h, int64_t w) const {
     const Need n = need(h, w);
-    return (uint64_t) n.big16 * 2 + (uint64_t) n.big32 * 4 * 3 + (uint64_t) n.keep * 4 + (uint64_t) kColBytes;
+    return (uint64_t) n.big16 * 2 + (uint64_t) n.big32 * 4 * 3 + (uint64_t) n.keep * 4 + (uint64_t) n.col * 2;
 }
 
 void QiVae::drop_scratch() {
@@ -388,7 +393,7 @@ void QiVae::drop_scratch() {
     for (void* p : {(void*) a16_, (void*) col16_, (void*) t0_, (void*) t1_, (void*) t2_}) release(allocs_, p);
     a16_ = col16_ = nullptr;
     t0_ = t1_ = t2_ = nullptr;
-    cap16_ = cap32_ = 0;
+    cap16_ = cap32_ = col_cap_ = 0;
 }
 
 void QiVae::decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t max_scratch) {
@@ -405,7 +410,7 @@ void QiVae::decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t m
     const int64_t th = std::min(t, h), tw = std::min(t, w);
     float *sub = nullptr, *piece = nullptr, *wsum = nullptr;
     if (!gpu::alloc_device(&sub, (size_t) (C * th * tw) * 4) ||
-        !gpu::alloc_device(&piece, (size_t) (int64_t{4 * 256} * th * tw) * 4) ||
+        !gpu::alloc_device(&piece, (size_t) ((int64_t) 4 * 256 * th * tw) * 4) ||
         !gpu::alloc_device(&wsum, (size_t) (H * W) * 4))
         throw std::runtime_error(std::string("image engine (VAE): GPU memory: ") + gpu::last_error());
     gpu::memset_async(rgba, 0, (size_t) (4 * H * W) * 4, s_);
@@ -431,8 +436,7 @@ void QiVae::decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t m
 
 void QiVae::decode_piece(const float* z, int64_t h, int64_t w, float* rgba) {
     const Need nd = need(h, w);
-    grow(nd.big16, nd.big32);
-    if (h * w * h * w > col_cap_) throw std::runtime_error("image engine (VAE): the latent is too large for one piece");
+    grow(nd.big16, nd.big32, nd.col);
     int64_t H = h, W = w, c = cin_.out;
     float* x = t0_;
     unnorm_tokens16(z, mean_, std_, pq_.in, H * W, a16_, s_);

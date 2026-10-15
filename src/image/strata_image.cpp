@@ -1,30 +1,173 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/strata_image.cpp - strata-image: Qwen-Image-2.1 text to image on the GPU, one image.
+// src/image/strata_image.cpp - strata-image: Qwen-Image-2.1 text to image on the GPU.
 //
-//   strata-image --dit DIT.gguf --vae VAE.safetensors --text TEXT_ENCODER.gguf --ids 1,2,3 [--drop N]
-//                [--width W] [--height H] [--seed S] [--budget-mib M] [--repeat N] --out IMAGE.rgba
+//   strata-image --dit DIT.gguf --vae VAE.safetensors --text TEXT_ENCODER.gguf [--budget-mib M]
+//                (--ids 1,2,3 [--drop N] [--width W] [--height H] [--seed S] [--repeat N] --out IMAGE.rgba | --serve)
 //
-// --ids: the prompt in the model's chat form, tokenized (the server's tokenizer); --drop: the leading ids of the
-// system turn; --budget-mib: the VRAM the engine may take (default: the free VRAM); --repeat: the image again N times
-// in the same process (the cache's effect).  Writes RGBA8 rows to --out and a line of times and of the budget's
-// split (JSON) to stdout a run.
+// One image: --ids, the prompt in the model's chat form, tokenized (the server's tokenizer); --drop, the leading ids of
+// the system turn; --budget-mib, the VRAM the engine may take (default: the free VRAM); --repeat, the image again N
+// times in the process (the cache's effect).  Writes RGBA8 rows to --out and a line of times and of the budget's split
+// (JSON) to stdout a run.
+//
+// --serve: the engine stays, its layers and the last prompt's states kept between requests, and takes lines on stdin
+// (serve/images.py), one at a time, answering each on stdout:
+//   IMG <width> <height> <seed> <drop> <out path> <ids, commas>   -> STEP <done> <steps> lines, then
+//                                                                    IMAGE key=value ... (times, the budget's split)
+//   BUDGET <MiB>             the VRAM the engine may take (0: the free VRAM at its start)      -> BUDGET budget_mib=...
+//   RELEASE                  frees the layers, activations and buffers (the cache)            -> RELEASE ok
+//   STOP                     (while an IMG runs) ends it after the step it is in               -> ERROR stopped
+//   QUIT                     ends the engine
+// A request that fails answers ERROR <message> and the engine goes on.  Before the first line it makes a small image
+// (its kernels built and the library's first products set up), then says READY budget_mib=<M>.
 
 #include "strata/image/qi_pipeline.hpp"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
+#include <iostream>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+
+namespace {
+
+namespace si = strata::image;
+
+std::vector<int32_t> parse_ids(const std::string& s) {
+    std::vector<int32_t> ids;
+    std::stringstream ss(s);
+    for (std::string tok; std::getline(ss, tok, ',');)
+        if (!tok.empty()) ids.push_back((int32_t) std::stol(tok));
+    return ids;
+}
+
+std::string plan_kv(const si::QiTimes& t, const si::QiPlan& p) {
+    char b[512];
+    std::snprintf(b, sizeof b,
+                  "text_s=%.3f sampling_s=%.3f decode_s=%.3f budget_mib=%llu blocks_mib=%llu resident_blocks=%d "
+                  "layers_mib=%llu resident_layers=%d activations_mib=%llu mlp_rows=%lld vae_mib=%llu vae_tiled=%d "
+                  "text_cached=%d",
+                  t.text, t.sampling, t.decode, (unsigned long long) (p.budget >> 20),
+                  (unsigned long long) (p.blocks >> 20), p.resident_blocks, (unsigned long long) (p.layers >> 20),
+                  p.resident_layers, (unsigned long long) (p.activations >> 20), (long long) p.mlp_rows,
+                  (unsigned long long) (p.vae >> 20), p.vae_tiled ? 1 : 0, p.text_cached ? 1 : 0);
+    return b;
+}
+
+void write_file(const std::string& path, const std::vector<uint8_t>& img) {
+    std::ofstream o(path, std::ios::binary);
+    o.write(reinterpret_cast<const char*>(img.data()), (std::streamsize) img.size());
+    if (!o) throw std::runtime_error("cannot write " + path);
+}
+
+// stdin's lines on a thread of their own, so that STOP reaches a running request
+struct Lines {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> q;
+    bool eof = false;
+    std::atomic<bool> stop{false};
+    void run() {
+        for (std::string line; std::getline(std::cin, line);) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line == "STOP") {
+                stop = true;
+                continue;
+            }
+            std::lock_guard<std::mutex> l(mu);
+            q.push_back(line);
+            cv.notify_all();
+        }
+        std::lock_guard<std::mutex> l(mu);
+        eof = true;
+        cv.notify_all();
+    }
+    bool next(std::string& line) {
+        std::unique_lock<std::mutex> l(mu);
+        cv.wait(l, [this] { return eof || !q.empty(); });
+        if (q.empty()) return false;
+        line = q.front();
+        q.pop_front();
+        return true;
+    }
+};
+
+int serve(si::QiPipeline& p) {
+    {   // the warm-up: a 256 x 256 image of one step from token ids the vocabulary has
+        si::QiRequest r;
+        for (int32_t i = 1; i <= 16; ++i) r.ids.push_back(i * 100);
+        r.width = r.height = 256;
+        r.sigmas = {1.0f, 0.0f};
+        p.generate(r);
+    }
+    std::printf("READY budget_mib=%llu\n", (unsigned long long) (p.budget() >> 20));
+    std::fflush(stdout);
+    Lines in;
+    std::thread reader([&in] { in.run(); });
+    reader.detach();   // ends with the process: a blocked getline cannot be woken
+    for (std::string line; in.next(line);) {
+        std::istringstream ls(line);
+        std::string op;
+        ls >> op;
+        try {
+            if (op == "QUIT") {
+                break;
+            } else if (op == "IMG") {
+                si::QiRequest r;
+                std::string out, ids;
+                ls >> r.width >> r.height >> r.seed >> r.drop >> out >> ids;
+                if (!ls || out.empty()) throw std::invalid_argument("IMG <width> <height> <seed> <drop> <out> <ids>");
+                r.ids = parse_ids(ids);
+                in.stop = false;
+                si::QiTimes t;
+                si::QiPlan pl;
+                const auto img = p.generate(r, &t, &pl, [&in](int done, int steps) {
+                    std::printf("STEP %d %d\n", done, steps);
+                    std::fflush(stdout);
+                    return !in.stop.load();
+                });
+                write_file(out, img);
+                std::printf("IMAGE %s\n", plan_kv(t, pl).c_str());
+            } else if (op == "BUDGET") {
+                uint64_t mib = 0;
+                ls >> mib;
+                p.set_budget(mib << 20);
+                std::printf("BUDGET budget_mib=%llu\n", (unsigned long long) (p.budget() >> 20));
+            } else if (op == "RELEASE") {
+                p.release();
+                std::printf("RELEASE ok\n");
+            } else if (!op.empty()) {
+                throw std::invalid_argument("unknown request " + op);
+            }
+        } catch (const si::QiStopped&) {
+            std::printf("ERROR stopped\n");
+        } catch (const std::exception& e) {
+            std::string m = e.what();
+            for (char& c : m)
+                if (c == '\n') c = ' ';
+            std::printf("ERROR %s\n", m.c_str());
+        }
+        std::fflush(stdout);
+    }
+    return 0;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
     try {
         std::string dit, vae, text, out, ids;
-        strata::image::QiRequest r;
+        si::QiRequest r;
         uint64_t budget = 0;
         int repeat = 1;
+        bool serving = false;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             auto val = [&]() -> std::string {
@@ -42,36 +185,25 @@ int main(int argc, char** argv) {
             else if (a == "--seed") r.seed = std::stoull(val());
             else if (a == "--budget-mib") budget = std::stoull(val()) << 20;
             else if (a == "--repeat") repeat = std::stoi(val());
+            else if (a == "--serve") serving = true;
             else throw std::invalid_argument("unknown option " + a);
         }
-        if (dit.empty() || vae.empty() || text.empty() || out.empty() || ids.empty()) {
-            std::fprintf(stderr, "usage: %s --dit F --vae F --text F --ids 1,2,3 [--drop N] [--width W] [--height H] "
-                         "[--seed S] --out IMAGE.rgba\n", argv[0]);
+        if (dit.empty() || vae.empty() || text.empty() || (!serving && (out.empty() || ids.empty()))) {
+            std::fprintf(stderr, "usage: %s --dit F --vae F --text F [--budget-mib M] (--ids 1,2,3 [--drop N] "
+                         "[--width W] [--height H] [--seed S] [--repeat N] --out IMAGE.rgba | --serve)\n", argv[0]);
             return 2;
         }
-        std::stringstream ss(ids);
-        for (std::string tok; std::getline(ss, tok, ',');)
-            if (!tok.empty()) r.ids.push_back((int32_t) std::stol(tok));
-        strata::image::QiPipeline p;
+        si::QiPipeline p;
         std::string err;
         if (!p.open(dit, vae, text, err)) throw std::runtime_error(err);
         if (budget > 0) p.set_budget(budget);
+        if (serving) return serve(p);
+        r.ids = parse_ids(ids);
         for (int k = 0; k < repeat; ++k) {
-            strata::image::QiTimes t;
-            strata::image::QiPlan pl;
-            const auto img = p.generate(r, &t, &pl);
-            std::ofstream o(out, std::ios::binary);
-            o.write(reinterpret_cast<const char*>(img.data()), (std::streamsize) img.size());
-            if (!o) throw std::runtime_error("cannot write " + out);
-            std::printf("{\"text_s\": %.3f, \"sampling_s\": %.3f, \"decode_s\": %.3f, \"budget_mib\": %llu, "
-                        "\"blocks_mib\": %llu, \"resident_blocks\": %d, \"layers_mib\": %llu, \"resident_layers\": %d, "
-                        "\"activations_mib\": %llu, \"mlp_rows\": %lld, \"vae_mib\": %llu, \"vae_tiled\": %s, "
-                        "\"text_cached\": %s}\n",
-                        t.text, t.sampling, t.decode, (unsigned long long) (pl.budget >> 20),
-                        (unsigned long long) (pl.blocks >> 20), pl.resident_blocks, (unsigned long long) (pl.layers >> 20),
-                        pl.resident_layers, (unsigned long long) (pl.activations >> 20), (long long) pl.mlp_rows,
-                        (unsigned long long) (pl.vae >> 20), pl.vae_tiled ? "true" : "false",
-                        pl.text_cached ? "true" : "false");
+            si::QiTimes t;
+            si::QiPlan pl;
+            write_file(out, p.generate(r, &t, &pl));
+            std::printf("%s\n", plan_kv(t, pl).c_str());
             std::fflush(stdout);
         }
     } catch (const std::exception& e) {

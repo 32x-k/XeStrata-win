@@ -77,11 +77,13 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w) {
         mlp = rows;
         p.activations = dit_.activation_bytes(T, rows);
     }
-    if (avail < p.activations + dit_min + te_min)
+    // the room after the layers: the DiT's activations, and later the VAE's least (they take it in turn)
+    const uint64_t work = std::max(p.activations, vae_.scratch_min());
+    if (avail < work + dit_min + te_min)
         throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
                                  " MiB) is too small for this image");
-    p.blocks = clampu(avail - p.activations - te_min, dit_min, dit_.block_bytes());
-    p.layers = clampu(avail - p.activations - p.blocks, te_min, te_.layer_bytes());
+    p.blocks = clampu(avail - work - te_min, dit_min, dit_.block_bytes());
+    p.layers = clampu(avail - work - p.blocks, te_min, te_.layer_bytes());
     p.mlp_rows = mlp;
     if (p.blocks != dit_set_) {
         dit_.set_block_budget(p.blocks);
@@ -106,7 +108,8 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w) {
     return p;
 }
 
-std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, QiPlan* plan_out) {
+std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, QiPlan* plan_out,
+                                          const std::function<bool(int, int)>& step) {
     using clock = std::chrono::steady_clock;
     if (r.width % 16 != 0 || r.height % 16 != 0 || r.width <= 0 || r.height <= 0)
         throw std::invalid_argument("image engine: the size must be a multiple of 16");
@@ -131,7 +134,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     std::vector<float> out((size_t) (4 * HW));
     try {
         gpu::copy(x, noise.data(), (size_t) n * 4);
-        dit_.sample(x, h, w, r.sigmas.empty() ? turbo_sigmas() : r.sigmas);
+        dit_.sample(x, h, w, r.sigmas.empty() ? turbo_sigmas() : r.sigmas, step);
         const auto t2 = clock::now();
         // the VAE beside the DiT's activations when it fits there; else they give way to it
         uint64_t vae_room = p.vae > p.activations ? p.vae - p.activations : 0;

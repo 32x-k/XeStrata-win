@@ -48,12 +48,14 @@ public:
 
     /// The VRAM the engine may take (0: the free VRAM at open, less a margin, within STRATA_VRAM_LIMIT_MIB).
     void set_budget(uint64_t bytes);
-    uint64_t budget() const { return budget_; }
+    /// The budget in force: the one set, else the free VRAM's at open.
+    uint64_t budget() const { return budget_ > 0 ? budget_ : auto_budget_; }
     /// Frees what the engine holds on the GPU beyond its fixed weights (the cache): the next request loads again.
     void release();
 
-    /// RGBA8 [height][width][4] of the request.
-    std::vector<uint8_t> generate(const QiRequest& r, QiTimes* times = nullptr, QiPlan* plan = nullptr);
+    /// RGBA8 [height][width][4] of the request.  `step`: the DiT's progress (QiDit::sample), false to stop.
+    std::vector<uint8_t> generate(const QiRequest& r, QiTimes* times = nullptr, QiPlan* plan = nullptr,
+                                  const std::function<bool(int, int)>& step = {});
 
 private:
     QiPlan plan(int64_t T, int64_t h, int64_t w);

@@ -13,7 +13,9 @@
 #include "strata/prefill/gemm.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -22,6 +24,11 @@ class GgufFile;
 }
 
 namespace strata::image {
+
+/// A request stopped on its caller's word (the step callback said so).
+struct QiStopped : std::runtime_error {
+    QiStopped() : std::runtime_error("image engine: stopped") {}
+};
 
 /// Philox 4x32-10 normal values as PyTorch's CUDA randn gives them for `seed` (the generator stable-diffusion.cpp
 /// uses): value i from counter (offset, 0, i, 0) and key (seed low, seed high), Box-Muller's sine half.
@@ -49,7 +56,10 @@ public:
     void forward(const float* x, float t, int64_t H, int64_t W, bool prefix, float* out);
 
     /// The flow sampler: x (device FP32 [64][H][W], the starting noise) through `sigmas` by Euler's steps.
-    void sample(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas);
+    /// `step` (if set) is called after each step with (steps done, steps); it returns false to stop (the sampler then
+    /// throws QiStopped).
+    void sample(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas,
+                const std::function<bool(int, int)>& step = {});
 
     int64_t channels() const { return in_ch_; }
     int64_t hidden() const { return C_; }

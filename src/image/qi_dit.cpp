@@ -400,12 +400,22 @@ void QiDit::drop_activations() {
     rope_H_ = rope_W_ = rope_text_ = -1;
 }
 
-void QiDit::sample(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas) {
+void QiDit::sample(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas,
+                   const std::function<bool(int, int)>& step) {
     const int64_t n = in_ch_ * H * W;
     float* v = alloc<float>(allocs_, n);
-    for (size_t i = 0; i + 1 < sigmas.size(); ++i) {
-        forward(x, sigmas[i] * 1000.0f, H, W, i > 0, v);
-        qi_axpy(x, v, sigmas[i + 1] - sigmas[i], n, s_);
+    const int steps = (int) sigmas.size() - 1;
+    for (int i = 0; i < steps; ++i) {
+        forward(x, sigmas[(size_t) i] * 1000.0f, H, W, i > 0, v);
+        qi_axpy(x, v, sigmas[(size_t) i + 1] - sigmas[(size_t) i], n, s_);
+        if (step) {
+            gpu::stream_sync(s_);
+            if (!step(i + 1, steps)) {
+                allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), (void*) v), allocs_.end());
+                gpu::free(v);
+                throw QiStopped();
+            }
+        }
     }
     gpu::stream_sync(s_);
     allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), (void*) v), allocs_.end());
