@@ -100,7 +100,8 @@ using Wm = Jm<16, 16, 16, 32>;   // the host's and the other devices' view: the 
 
 // the instances a device compile carries: SPIR-V Intel's shapes, NVPTX NVIDIA's, AMDGCN RDNA's WMMA
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
-[[maybe_unused]] constexpr bool built(int p) { return p == 2; }
+// (the FP16 tensor cores from sm_70 on: Pascal's code has no instance, and its GPUs report no shape: the plain kernel)
+[[maybe_unused]] constexpr bool built(int p) { return p == 2 && (STRATA_NV_ARCH == 0 || STRATA_NV_ARCH >= 700); }
 #elif defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
 [[maybe_unused]] constexpr bool built(int p) { return p == 3 && STRATA_AMD_WMMA; }
 #else
