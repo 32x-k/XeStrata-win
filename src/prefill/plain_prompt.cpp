@@ -304,7 +304,9 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     // the tier to the experts the prompt routed most, at once (upstream's q36 engine: up to 2048 slot replacements
     // after a prompt): the rounds between windows move at most adapt_swaps each, so an empty tier (no profile) took
     // a hundred windows to fill.  The copies run on the copy stream beside the first windows.
-    if (ok && !disp_.usage.empty() && !adapt(err, 2048)) return false;
+    int64_t n_free = 0;   // and every free slot: those copies displace nothing
+    for (const auto& f : free_) n_free += (int64_t) f.size();
+    if (ok && !disp_.usage.empty() && !adapt(err, std::max<int64_t>(2048, n_free))) return false;
     return ok;
 }
 

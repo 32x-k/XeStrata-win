@@ -1294,12 +1294,18 @@ bool PlainModel::adapt(std::string& err, int64_t max_swaps) {
         const float* u = disp_.usage.data() + l * E;
         const int32_t* r = res_.data() + l * E;
         for (int32_t e = 0; e < (int32_t) E; ++e) {
-            if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
+            if (r[e] < 0) { if (u[e] > 0.0f) cand.emplace_back(u[e], e); }
             else vict.emplace_back(u[e], e);
         }
-        for (size_t i = 0; i < free_[(size_t) l].size(); ++i) vict.emplace_back(-1.0f, -1);
+        // a free slot takes any expert routed since (an empty slot only costs a copy); one held, a missing expert
+        // routed at least twice
+        const size_t n_free = free_[(size_t) l].size();
+        for (size_t i = 0; i < n_free; ++i) vict.emplace_back(-1.0f, -1);
         if (cand.empty() || vict.empty()) continue;
         std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        size_t keep = 0;
+        while (keep < cand.size() && (keep < n_free || cand[keep].first >= 2.0f)) ++keep;
+        cand.resize(keep);
         const size_t nc = std::min(cand.size(), vict.size());
         std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                           [](auto& a, auto& b) { return a.first < b.first; });

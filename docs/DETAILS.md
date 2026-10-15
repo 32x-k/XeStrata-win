@@ -305,7 +305,7 @@ The engine's options (added to the settings' `args`):
 | `--expert-profile PATH` | fill the experts in VRAM in this profile's order at start |
 | `--expert-profile-save PATH` | write what this run learned as a profile |
 | `--adapt-every N` | windows between swaps of the experts in VRAM (default 4; 0: no swaps) |
-| `--adapt-swaps N` | the most experts one swap moves (default 96; the one right after a prompt moves up to 2,048, those the prompt used most) |
+| `--adapt-swaps N` | the most experts one swap moves (default 96; the one right after a prompt moves up to 2,048, those the prompt used most, and fills every free slot with any expert it used) |
 | `--adapt-mib-per-token N` | the swaps copy at most N MiB for each token read since the last one (default 48; 0: no bound) |
 | `--mmap-experts` | read the experts from the model file instead of loading them into RAM |
 | `--no-pcie-split` | the CPU computes every expert VRAM does not hold |
