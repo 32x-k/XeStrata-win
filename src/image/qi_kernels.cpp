@@ -156,4 +156,66 @@ void qi_to_f16(const float* x, int64_t n, uint16_t* y16, void* stream) {
     finish(stream, e, "qi_to_f16");
 }
 
+void qi_rms_norm16(const float* x, const float* w, int64_t rows, int64_t C, uint16_t* y16, void* stream) {
+    if (rows <= 0) return;
+    constexpr size_t local = 256;
+    const auto e = queue_for(stream).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) rows * local), sycl::range<1>(local)), [=](sycl::nd_item<1> it) {
+            const auto r = static_cast<int64_t>(it.get_group_linear_id());
+            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+            const float* xr = x + r * C;
+            float s = 0.f;
+            for (int64_t c = lane; c < C; c += local) s += xr[c] * xr[c];
+            const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) /
+                                               (float) C + kEps);
+            for (int64_t c = lane; c < C; c += local) y16[r * C + c] = f16_from_f32(xr[c] * inv * w[c]);
+        });
+    finish(stream, e, "qi_rms_norm16");
+}
+
+void qi_gelu16(const float* x, int64_t n, uint16_t* y16, void* stream) {
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
+        const float v = x[i];
+        y16[i] = f16_from_f32(0.5f * v * (1.f + sycl::tanh(0.7978845608028654f * (v + 0.044715f * v * v * v))));
+    });
+    finish(stream, e, "qi_gelu16");
+}
+
+void qi_silu(float* x, int64_t n, uint16_t* y16, void* stream) {
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
+        const float v = x[i] / (1.f + sycl::exp(-x[i]));
+        x[i] = v;
+        if (y16) y16[i] = f16_from_f32(v);
+    });
+    finish(stream, e, "qi_silu");
+}
+
+void qi_latent_tokens16(const float* latent, int64_t C, int64_t HW, uint16_t* tokens16, void* stream) {
+    if (HW <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (C * HW)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t p = i / C, c = i - p * C;
+        tokens16[i] = f16_from_f32(latent[c * HW + p]);
+    });
+    finish(stream, e, "qi_latent_tokens16");
+}
+
+void qi_tokens_latent(const float* tokens, int64_t C, int64_t HW, float* latent, void* stream) {
+    if (HW <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (C * HW)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i / HW, p = i - c * HW;
+        latent[i] = tokens[p * C + c];
+    });
+    finish(stream, e, "qi_tokens_latent");
+}
+
+void qi_axpy(float* x, const float* v, float a, int64_t n, void* stream) {
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { x[i] += a * v[i]; });
+    finish(stream, e, "qi_axpy");
+}
+
 }  // namespace strata::image

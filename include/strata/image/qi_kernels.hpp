@@ -47,4 +47,22 @@ void qi_swiglu16(const float* gu, int64_t T, int64_t inter, uint16_t* h16, void*
 /// y16 = FP16(x), n elements.
 void qi_to_f16(const float* x, int64_t n, uint16_t* y16, void* stream);
 
+/// y16[r] = FP16(x[r] / rms(x[r]) * w) (eps 1e-6), rows of C.
+void qi_rms_norm16(const float* x, const float* w, int64_t rows, int64_t C, uint16_t* y16, void* stream);
+
+/// y16 = FP16(GELU(x)), GELU's tanh form, n elements.
+void qi_gelu16(const float* x, int64_t n, uint16_t* y16, void* stream);
+
+/// x = SiLU(x) in place, and y16 = FP16 of it (y16 may be null), n elements.
+void qi_silu(float* x, int64_t n, uint16_t* y16, void* stream);
+
+/// tokens16[p][c] = FP16(latent[c][p]), p < HW, c < C: a latent [C][H][W] as the image's tokens.
+void qi_latent_tokens16(const float* latent, int64_t C, int64_t HW, uint16_t* tokens16, void* stream);
+
+/// latent[c][p] = tokens[p][c]: the tokens' outputs [HW][C] back as a latent [C][H][W].
+void qi_tokens_latent(const float* tokens, int64_t C, int64_t HW, float* latent, void* stream);
+
+/// x += a * v, n elements.
+void qi_axpy(float* x, const float* v, float a, int64_t n, void* stream);
+
 }  // namespace strata::image

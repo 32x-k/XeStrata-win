@@ -598,13 +598,16 @@ if(STRATA_ENABLE_XE)
   add_executable(strata src/program/generate.cpp src/program/plain_generate.cpp src/program/option_scope.cpp)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 
-  # the image engine (Qwen-Image-2.1's DiT, src/image/): its kernels, and strata-image-probe, one block of the DiT
-  # against tools/image/qi21_ref.py's NumPy reference, timed
-  add_library(strata_image STATIC src/image/qi_kernels.cpp src/image/qi_attn.cpp)
+  # the image engine (Qwen-Image-2.1's DiT, src/image/): its kernels and the DiT; strata-image-probe, one block of the
+  # DiT against tools/image/qi21_ref.py's NumPy reference, and strata-image-dit-probe, the whole DiT and its sampler
+  # against stable-diffusion.cpp's values, timed
+  add_library(strata_image STATIC src/image/qi_kernels.cpp src/image/qi_attn.cpp src/image/qi_dit.cpp)
   target_include_directories(strata_image PUBLIC include)
   target_link_libraries(strata_image PUBLIC strata_prefill)
   add_executable(strata-image-probe src/image/qi_block_probe.cpp)
   target_link_libraries(strata-image-probe PRIVATE strata_image)
+  add_executable(strata-image-dit-probe src/image/qi_dit_probe.cpp)
+  target_link_libraries(strata-image-dit-probe PRIVATE strata_image)
 
   if(STRATA_BUILD_TESTS)
     add_executable(elementwise_parity src/kernels/elementwise_parity.cpp)
