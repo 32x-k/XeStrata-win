@@ -754,7 +754,10 @@ function toolHtml(t, k) {
     (t.server ? `<span class="muted small">${esc(t.server)}</span>` : "") +
     `<span class="tool-call__preview muted">${esc(preview.slice(0, 200))}</span>` +
     `<span class="st-badge ${cls}">${esc(label)}</span>${t.ms != null && t.state !== "skipped" ? `<span class="muted small">${fmt(t.ms / 1000, 1)} s</span>` : ""}` +
-    `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>`;
+    `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>` +
+    // the images an image tool made, under its block (the server keeps them: /v1/images/files/)
+    (t.images && t.images.length ? `<div class="msg-images tool-images">${t.images.map((u) =>
+      `<a href="${esc(u.replace(/^\//, ""))}" target="_blank" rel="noopener"><img src="${esc(u.replace(/^\//, ""))}" alt="${esc(t.tool || "image")}"></a>`).join("")}</div>` : "");
 }
 // the answer's text with the tool blocks where the model called them
 function answerHtml(m) {
@@ -777,7 +780,7 @@ function onTool(m, x) {
   if (x.event === "call") {
     Object.assign(t, {name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running"});
   } else if (x.event === "result") {
-    Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms,
+    Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, images: x.images,
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
   }
 }
@@ -917,6 +920,7 @@ async function send() {
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
+  if (health.image_generation) body.strata_images = true;   // and make images when the conversation asks for one
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };

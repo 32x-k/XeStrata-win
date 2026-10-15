@@ -4611,6 +4611,28 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
 
 
 # ------------------------------------------------------------------------------------------------ MCP tool loop
+class ToolHubs:
+    """Hubs that run_with_mcp runs as one: the MCP servers' tools and the image tools (serve/images.py ImageTools)."""
+
+    def __init__(self, hubs: list):
+        self.hubs = hubs
+        self.settings = {"max_rounds": max(int(h.settings["max_rounds"]) for h in hubs)}
+
+    def routes(self) -> dict:
+        out: dict = {}
+        for h in self.hubs:
+            out.update(h.routes())
+        return out
+
+    def call(self, name: str, arguments, cancel=None) -> dict:
+        for h in self.hubs:
+            if name in h.routes():
+                return h.call(name, arguments, cancel)
+        text = f"error: there is no tool named {name!r}"
+        return {"ok": False, "text": text, "chars": len(text), "truncated": False, "ms": 0, "server": None,
+                "tool": name}
+
+
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
                  mcp_names):
     """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
@@ -4688,7 +4710,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
             results.append(r["text"])
             yield "mcp", {"event": "result", "id": c.id,
-                          **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
+                          **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")},
+                          **({"images": r["images"]} if r.get("images") else {})}
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
             break
@@ -5986,12 +6009,23 @@ def make_handler(svc: Service):
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
+            extra: list = []
+            hubs: list = []
             if use_mcp:
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
                     return
                 svc.mcp.wait(10)                                  # servers still starting (only right after start)
                 extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
-                use_mcp = bool(extra)
+                if extra:
+                    hubs.append(svc.mcp)
+            if req.get("strata_images") is True and svc.images is not None:   # opt-in: the image tools
+                image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load, Vision.normalize)
+                more = image_tools.template_tools(exclude=own | {t["name"] for t in extra})
+                if more:
+                    extra += more
+                    hubs.append(image_tools)
+            use_mcp = bool(hubs)
+            if use_mcp:
                 tools = (tools or []) + extra or None
             if force and use_mcp:
                 raise ValueError("a forced tool_choice with MCP tools is not supported")
@@ -6002,8 +6036,8 @@ def make_handler(svc: Service):
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
-                               {t["name"] for t in extra}) if use_mcp else None
+            run = run_with_mcp(svc, hubs[0] if len(hubs) == 1 else ToolHubs(hubs), messages, tools, kw, ids,
+                               thinking, max_new, max_req, req, cancel, {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)

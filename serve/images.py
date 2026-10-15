@@ -659,6 +659,102 @@ class ImageGen:
         return out
 
 
+# ------------------------------------------------------------------------------------------- chat's image tools
+FILE_REF = re.compile(r"/v1/images/files/([0-9a-f]{32}\.png)")
+TOOLS = [
+    {"name": "generate_image",
+     "description": "Make an image from a description with the image model on this computer (Qwen-Image-2.1-Turbo). "
+                    "Describe it in detail: the subject, the setting, the style, the light, and any text it shows in "
+                    "quotes. The image is shown to the user; the result says where it is.",
+     "parameters": {"type": "object", "properties": {
+         "prompt": {"type": "string", "description": "the image's description"},
+         "size": {"type": "string",
+                  "description": "WIDTHxHEIGHT, e.g. 1024x1024, 1536x1024 (wide), 1024x1536 (tall)"},
+         "seed": {"type": "integer", "description": "the same seed and prompt make the same image"}},
+         "required": ["prompt"]}},
+    {"name": "edit_image",
+     "description": "Change an image, or make a new one from it (its subject, its style): the conversation's last "
+                    "image (one the user attached or one made here) unless `image` names another (a "
+                    "/v1/images/files/... link from an earlier result). The new image is shown to the user.",
+     "parameters": {"type": "object", "properties": {
+         "prompt": {"type": "string", "description": "what to change, or what to make from the image"},
+         "image": {"type": "string", "description": "the image: a /v1/images/files/... link; default the last one"},
+         "size": {"type": "string", "description": "WIDTHxHEIGHT; default the image's shape at about 1024x1024"},
+         "seed": {"type": "integer"}},
+         "required": ["prompt"]}},
+]
+
+
+class ImageTools:
+    """generate_image and edit_image for a chat (or Responses) request that asks for them: the model writes a call,
+    the server makes the image in the GPU's turn as /v1/images does, keeps it (/v1/images/files/), and the call's
+    result tells the model where it is.  The hub run_with_mcp runs (template_tools, routes, call, settings)."""
+
+    def __init__(self, svc, gen: ImageGen, messages: list, load, normalize):
+        self.svc, self.gen, self.messages, self.load, self.normalize = svc, gen, messages, load, normalize
+        self.settings = {"max_rounds": 4}
+        self.made: list[str] = []          # the images this request made (file names)
+
+    def template_tools(self, exclude=()) -> list[dict]:
+        names = ("generate_image", "edit_image") if self.gen.cfg.get("vision") else ("generate_image",)
+        return [dict(t) for t in TOOLS if t["name"] in names and t["name"] not in exclude]
+
+    def routes(self) -> dict:
+        return {t["name"]: (None, t["name"]) for t in self.template_tools()}
+
+    def _file(self, name: str) -> bytes | None:
+        p = self.gen.file(name)
+        return p.read_bytes() if p is not None else None
+
+    def _image(self, which: str) -> bytes | None:
+        """The image an edit takes: a /v1/images/files/ link (or its file name), else the conversation's last."""
+        m = FILE_REF.search(which or "") or re.fullmatch(r"([0-9a-f]{32}\.png)", which or "")
+        if m:
+            return self._file(m.group(1))
+        if self.made:
+            return self._file(self.made[-1])
+        for msg in reversed(self.messages):
+            content = msg.get("content")
+            parts = content if isinstance(content, list) else [content]
+            for item in reversed(parts):
+                if isinstance(item, dict) and item.get("type") == "image" and item.get("source"):
+                    return self.load(item["source"])
+                text = item if isinstance(item, str) else item.get("text") if isinstance(item, dict) else None
+                found = FILE_REF.findall(text or "")
+                if found and (data := self._file(found[-1])) is not None:
+                    return data
+        return None
+
+    def call(self, name: str, arguments, cancel: threading.Event | None = None) -> dict:
+        t0 = time.monotonic()
+        args = arguments if isinstance(arguments, dict) else {}
+        urls: list[str] = []
+        try:
+            req = {k: args[k] for k in ("prompt", "size", "seed") if args.get(k) not in (None, "")}
+            if name == "generate_image":
+                job = parse_request(req, self.gen.cfg)
+            elif name == "edit_image":
+                data = self._image(str(args.get("image") or ""))
+                if data is None:
+                    raise ImageRequestError("there is no image in the conversation to edit")
+                job = parse_edit_request(req, [self.normalize(data)], self.gen.cfg)
+            else:
+                raise ImageRequestError(f"there is no tool named {name!r}")
+            with gpu_turn(self.svc, self.gen, job, cancel):
+                images, figures = self.gen.run(job, cancel)
+            names = [self.gen.store(png) for png in images]
+            self.made += names
+            urls = [f"/v1/images/files/{n}" for n in names]
+            text = (f"The image is made ({job['width']}x{job['height']}, seed {job['seed']}, "
+                    f"{figures['seconds']:.0f} s) and the user sees it: {urls[0]}. To change it, call edit_image "
+                    f"(its image: {urls[0]}).")
+            ok = True
+        except (ValueError, ImageJobFailed) as e:
+            text, ok = f"error: {e}", False
+        return {"ok": ok, "text": text, "chars": len(text), "truncated": False,
+                "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": name, "images": urls}
+
+
 # ------------------------------------------------------------------------------------------- the GPU turn
 def resolve_policy(svc, gen: ImageGen, need: dict) -> str:
     """auto -> keep / shrink / unload for this job (see the module's docstring); a fixed policy is kept, except that
