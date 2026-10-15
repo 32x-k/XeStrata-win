@@ -1,55 +1,68 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""serve/images.py - image generation (Qwen-Image-2.1-Turbo) through stable-diffusion.cpp's sd-cli.
+"""serve/images.py - image generation (Qwen-Image-2.1-Turbo) through XeStrata's own image engine, strata-image.
 
 POST /v1/images/generations takes OpenAI's request shape (prompt, size, n, response_format b64_json|url) plus Strata's
-own fields seed and steps.  Each request runs one `sd-cli` process with the arguments the model's card gives for
-stable-diffusion.cpp (8 steps, CFG 1, euler, Turbo's sigmas, --diffusion-fa) and returns the PNG files that process
-wrote, unchanged: an image from the API is byte for byte the image plain sd-cli writes with the same arguments.
+own field seed.  The engine (src/image/strata_image.cpp, `strata-image --serve`) starts with the first image and stays:
+its kernels built once, the prompt's text states and the layers that fit in VRAM kept between images, and it takes one
+image a line on its standard input.  It runs Turbo's 8 steps (CFG 1, the Euler flow sampler, the model's own sigmas),
+the image the one stable-diffusion.cpp makes with the model card's command for the same seed (within LPIPS 0.03).  A
+size whose sides are not multiples of 16 (1920x1080) is made at the sides rounded up (1920x1088) and its middle cut
+out.
 
 The GPU is shared with the text engine one job at a time: an image job takes the service's turn (the FIFO every chat
-request takes), so no chat turn runs on the GPU meanwhile, and the config's "gpu_policy" says what happens to the
-text engine during the job (gpu_turn):
+request takes), so no chat turn runs on the GPU meanwhile.  The image engine works in the VRAM it is given: what it
+holds and what is free, less a reserve; layers that do not fit are streamed from RAM, so it runs, more slowly, in a few
+GB.  Before each job it says what the image needs (NEED: the least, and the DiT resident with the VAE in one piece),
+and the config's "gpu_policy" says what happens to the text engine during the job (gpu_turn):
   keep    - it stays loaded and idle (an APU's shared memory, a card with room for both)
   shrink  - an engine started with --vram-elastic gives the image job VRAM from its expert cache and takes it back
             afterwards (POST /v1/vram's mechanism; the conversation stays in the engine)
   unload  - its conversation is saved to a session file, the engine is stopped, and the next start restores it
-  auto    - (default) keep when there is room for the image job next to it, else shrink when the engine can,
-            else unload
-The process per request keeps nothing on the GPU between images: when the job ends, all of its memory is free again.
+  auto    - (default) keep when the image fits beside it at full speed, else shrink when the engine can, else keep
+            when the image fits at all (its layers streamed), else unload
+After a job the image engine keeps what it holds (the next image starts warm) only under keep with VRAM to spare;
+otherwise it lets go of everything but its process (about 200 MiB).
 
-The config's "images" section (written by setup --images, tools/image/install.py):
-  {"exe": "engine-image/sd-cli", "backend": "vulkan", "diffusion_model": "...Q8_0.gguf", "vae": "...",
-   "llm": "...Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf", "quant": "Q8_0", "args": ["--diffusion-fa"],
-   "gpu_policy": "auto", "reload": "lazy"|"eager", "max_n": 4, "max_side": 2048, "timeout_s": 3600,
-   "lib_dirs": [...], "uma": false, "need_mib": null, "out_dir": null, "keep_files": 64,
-   "native": false}   (native: Strata's own DiT runner, tools/image/sdcpp_native; CUDA / HIP builds)
+The config's "images" section (written by setup --images, tools/image/qimage.py):
+  {"exe": "engine/strata-image", "diffusion_model": "...Q8_0.gguf", "vae": "...",
+   "llm": "...Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf", "quant": "Q8_0", "gpu_policy": "auto", "reload": "lazy"|"eager",
+   "max_n": 4, "max_side": 2048, "timeout_s": 3600, "uma": false, "out_dir": null, "keep_files": 64,
+   "reserve_mib": 512, "spare_mib": 1024}
+  reserve_mib: VRAM the image engine leaves free when it sizes itself; spare_mib: the free VRAM that must remain after
+  a job under keep for the engine to keep its layers.
 """
 from __future__ import annotations
 
 import base64
 import contextlib
 import os
+import queue
 import random
 import re
 import secrets
+import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+import zlib
 from pathlib import Path
 
-# Qwen-Image-2.1-Turbo's own schedule (model_index.json "sample_sigmas") plus the terminal 0, as Unsloth's card passes
-# it to sd-cli; it is an 8-step schedule, so another step count leaves the schedule to sd.cpp
-TURBO_SIGMAS = "1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568,0.0"
 TURBO_STEPS = 8
 MODEL_NAME = "qwen-image-2.1-turbo"
 POLICIES = ("auto", "keep", "shrink", "unload")
-SIZE_STEP = 32                     # sd.cpp's Qwen-Image-2.1 docs: dimensions divisible by 32
+SIZE_STEP = 16                     # the VAE's 8x and the DiT's 2x2 patches: sides made at a multiple of 16, then cut
 MIN_SIDE = 256
 FILE_NAME = re.compile(r"^[0-9a-f]{32}\.png$")
-STEP_LINE = re.compile(r"\|\s*(\d+)/(\d+)\s*-")      # sd.cpp's progress bar: "|====    | 3/8 - 14.1s/it"
+# the model's prompt (stable-diffusion.cpp's Qwen-Image template): the system turn, whose DROP leading ids' states the
+# DiT does not take, then the user's prompt as plain text
+PROMPT_HEAD = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n<|im_start|>user\n"
+PROMPT_TAIL = "<|im_end|>\n<|im_start|>assistant\n"
+DROP = 14
+START_TIMEOUT_S = 600              # the engine's start: the parts opened and a small image made (kernels built)
 
 
 class ImageRequestError(ValueError):
@@ -57,12 +70,11 @@ class ImageRequestError(ValueError):
 
 
 class ImageJobFailed(RuntimeError):
-    """sd-cli ended without the images (500); the message carries the end of its log."""
+    """The image engine did not make the images (500); the message says why."""
 
 
 def parse_size(value, max_side: int) -> tuple[int, int]:
-    """OpenAI's size, "1024x1024" (or "auto": 1024x1024) -> (width, height); each side a multiple of 32 from 256 to
-    max_side."""
+    """OpenAI's size, "1024x1024" (or "auto": 1024x1024) -> (width, height); each side from 256 to max_side."""
     if value is None or value == "auto":
         return 1024, 1024
     if not isinstance(value, str):
@@ -72,8 +84,8 @@ def parse_size(value, max_side: int) -> tuple[int, int]:
         raise ImageRequestError(f"size: WIDTHxHEIGHT, e.g. \"1024x1024\", not {value!r}")
     w, h = int(m.group(1)), int(m.group(2))
     for side in (w, h):
-        if side < MIN_SIDE or side > max_side or side % SIZE_STEP:
-            raise ImageRequestError(f"size {w}x{h}: each side a multiple of {SIZE_STEP} from {MIN_SIDE} to {max_side}")
+        if side < MIN_SIDE or side > max_side:
+            raise ImageRequestError(f"size {w}x{h}: each side from {MIN_SIDE} to {max_side}")
     return w, h
 
 
@@ -104,74 +116,178 @@ def parse_request(req: dict, cfg: dict) -> dict:
         raise ImageRequestError("output_format: only png")
     w, h = parse_size(req.get("size"), int(cfg.get("max_side") or 2048))
     n = _int_field(req, "n", 1, int(cfg.get("max_n") or 4), 1)
-    steps = _int_field(req, "steps", 1, 100, int(cfg.get("steps") or TURBO_STEPS))
+    if req.get("steps") not in (None, TURBO_STEPS):
+        raise ImageRequestError(f"steps: Qwen-Image-2.1-Turbo runs its own {TURBO_STEPS}-step schedule only")
     seed = _int_field(req, "seed", 0, 2**62, None)
     if seed is None:
         seed = random.SystemRandom().randrange(0, 2**31)
-    return {"prompt": prompt, "width": w, "height": h, "n": n, "steps": steps, "seed": seed, "response_format": fmt}
+    return {"prompt": prompt, "width": w, "height": h, "n": n, "steps": TURBO_STEPS, "seed": seed,
+            "response_format": fmt}
 
 
-def sd_cli_args(cfg: dict, job: dict, out_pattern: str) -> list[str]:
-    """The sd-cli command for one job: the model card's stable-diffusion.cpp command (8 steps, CFG 1, euler, Turbo's
-    sigmas, --diffusion-fa from the config's args), the size, seed and batch count, and the config's other args."""
-    cmd = [str(cfg["exe"]),
-           "--diffusion-model", str(cfg["diffusion_model"]), "--vae", str(cfg["vae"]), "--llm", str(cfg["llm"]),
-           "-p", job["prompt"],
-           "--steps", str(job["steps"]), "--cfg-scale", "1.0", "--sampling-method", "euler",
-           "-W", str(job["width"]), "-H", str(job["height"])]
-    if job["steps"] == TURBO_STEPS:
-        cmd += ["--sigmas", str(cfg.get("sigmas") or TURBO_SIGMAS)]
-    cmd += ["-s", str(job["seed"])]
-    if job["n"] > 1:
-        cmd += ["-b", str(job["n"])]
-    cmd += ["-o", out_pattern]
-    cmd += [str(a) for a in (cfg.get("args") or [])]
-    if cfg.get("native") is True:                   # Strata's DiT runner inside sd-cli (CUDA / HIP builds)
-        cmd += ["--model-args", "qwen_image_2_1_native=1"]
-    return cmd
+def made_size(job: dict) -> tuple[int, int]:
+    """The size the engine makes for `job`: each side rounded up to a multiple of SIZE_STEP."""
+    def up(v) -> int:
+        return -(-int(v) // SIZE_STEP) * SIZE_STEP
+    return up(job["width"]), up(job["height"])
 
 
-def image_env(cfg: dict, base: dict | None = None) -> dict:
-    """sd-cli's environment: the libraries its backend needs (ROCm's, setup's lib_dirs) first on the search path, the
-    GPU to use when the config names one, and the config's own "env"."""
-    env = dict(os.environ if base is None else base)
-    dirs = [str(d) for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
-    if dirs:
-        var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
-        env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
-    gpu = cfg.get("gpu")
-    if gpu is not None:
-        dev_var = {"cuda": "CUDA_VISIBLE_DEVICES", "hip": "HIP_VISIBLE_DEVICES",
-                   "vulkan": "GGML_VK_VISIBLE_DEVICES"}.get(str(cfg.get("backend")))
-        if dev_var:
-            env[dev_var] = str(gpu)
-            if dev_var == "CUDA_VISIBLE_DEVICES":
-                env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    for k, v in (cfg.get("env") or {}).items():
-        env[str(k)] = str(v)
-    return env
+def png_rgba(rgba: bytes, width: int, height: int, made_w: int, made_h: int) -> bytes:
+    """A PNG (8-bit RGBA, as stable-diffusion.cpp writes) of the middle width x height of an RGBA8 image of
+    made_w x made_h."""
+    x0, y0 = (made_w - width) // 2, (made_h - height) // 2
+    rows = bytearray()
+    for y in range(y0, y0 + height):
+        o = (y * made_w + x0) * 4
+        rows += b"\0" + rgba[o:o + width * 4]           # filter type 0 a row
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(rows), 6)) + chunk(b"IEND", b""))
 
 
-def need_mib(cfg: dict, width: int, height: int) -> int:
-    """The GPU memory an image job is planned with: the three model files plus the working buffers (about 2 GiB plus
-    4 GiB per megapixel at Turbo's settings; the 780M baseline peaked 7.4 GB over the weights at 1024x1024 on HIP);
-    the config's "need_mib" overrides it."""
-    if cfg.get("need_mib"):
-        return int(cfg["need_mib"])
-    files = 0
-    for k in ("diffusion_model", "vae", "llm"):
+def prompt_ids(tok, prompt: str) -> list[int]:
+    """The prompt in the model's chat form, tokenized (Qwen3-VL's tokenizer): the user's text plain, so a special
+    token spelled in it stays text."""
+    text = PROMPT_HEAD + prompt + PROMPT_TAIL
+    return tok.encode(text, parse_special=True, plain=[(len(PROMPT_HEAD), len(PROMPT_HEAD) + len(prompt))])
+
+
+def load_tokenizer(gguf: str):
+    """Qwen3-VL's tokenizer from the text encoder's GGUF (tools/strata_tokenizer.py)."""
+    tools = str(Path(__file__).resolve().parent.parent / "tools")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    import strata_tokenizer
+    return strata_tokenizer.Tokenizer.from_gguf(gguf)
+
+
+def _kv(line: str) -> dict:
+    out: dict = {}
+    for part in line.split()[1:]:
+        k, _, v = part.partition("=")
         try:
-            files += Path(cfg[k]).stat().st_size
-        except (OSError, KeyError, TypeError):
+            out[k] = float(v) if "." in v else int(v)
+        except ValueError:
+            out[k] = v
+    return out
+
+
+class ImageEngine:
+    """The resident `strata-image --serve`: one process, one request line at a time (the caller serializes)."""
+
+    def __init__(self, cfg: dict, env: dict, log_path: Path, say):
+        self.cfg, self.env, self.log_path, self.say = cfg, env, log_path, say
+        self.proc: subprocess.Popen | None = None
+        self.lines: queue.Queue = queue.Queue()
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def _pump(self, proc, logf) -> None:
+        for line in proc.stdout:
+            self.lines.put(line.rstrip("\r\n"))
+        self.lines.put(None)                          # the process ended
+        with contextlib.suppress(OSError, ValueError):
+            logf.close()
+
+    def start(self) -> dict:
+        """Start the engine and wait for READY -> its fields.  ImageJobFailed when it does not start."""
+        cmd = [str(self.cfg["exe"]), "--dit", str(self.cfg["diffusion_model"]), "--vae", str(self.cfg["vae"]),
+               "--text", str(self.cfg["llm"]), "--serve"]
+        self.lines = queue.Queue()
+        logf = open(self.log_path, "a", encoding="utf-8", errors="replace")
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=logf,
+                                         env=self.env, text=True, errors="replace", bufsize=1)
+        except OSError as e:
+            logf.close()
+            raise ImageJobFailed(f"the image engine did not start ({cmd[0]}): {e}") from e
+        try:
+            from serve.winjob import contain
+            contain(self.proc)                        # ends with the server (Windows)
+        except Exception:
             pass
-    work = (2 << 30) + int(4 * (1 << 30) * width * height / (1024 * 1024))
-    return (files + work) >> 20
+        threading.Thread(target=self._pump, args=(self.proc, logf), daemon=True).start()
+        t0 = time.monotonic()
+        while True:
+            line = self._next(time.monotonic() - t0, START_TIMEOUT_S)
+            if line.startswith("READY"):
+                self.say(f"image engine ready in {time.monotonic() - t0:.1f} s")
+                return _kv(line)
+
+    def _next(self, waited: float, limit: float, cancel: threading.Event | None = None) -> str:
+        """The engine's next line; ImageJobFailed when it ended or `limit` passed."""
+        while True:
+            try:
+                line = self.lines.get(timeout=0.25)
+            except queue.Empty:
+                if self.proc is not None and self.proc.poll() is not None and self.lines.empty():
+                    line = None
+                elif cancel is not None and cancel.is_set():
+                    self.send("STOP")
+                    cancel = None                     # the engine answers ERROR stopped after its step
+                    continue
+                elif waited > limit:
+                    self.close()
+                    raise ImageJobFailed(f"the image engine did not answer in {limit:g} s (it was stopped); "
+                                         f"its log: {self.log_path}")
+                else:
+                    waited += 0.25
+                    continue
+            if line is None:
+                code = self.proc.poll() if self.proc is not None else None
+                self.proc = None
+                raise ImageJobFailed(f"the image engine ended (exit code {code}); its log: {self.log_path}")
+            return line
+
+    def send(self, line: str) -> None:
+        proc = self.proc
+        try:
+            if proc is None or proc.stdin is None:
+                raise OSError("not running")
+            proc.stdin.write(line + "\n")
+            proc.stdin.flush()
+        except (OSError, ValueError) as e:
+            raise ImageJobFailed(f"the image engine is gone ({e}); its log: {self.log_path}") from e
+
+    def ask(self, line: str, want: str, timeout: float, cancel: threading.Event | None = None, step=None) -> dict:
+        """Send a request line and wait for its answer (the line starting with `want`) -> its fields; STEP lines go to
+        `step`.  ImageJobFailed on ERROR."""
+        self.send(line)
+        t0 = time.monotonic()
+        while True:
+            got = self._next(time.monotonic() - t0, timeout, cancel)
+            if got.startswith("STEP "):
+                if step is not None:
+                    done, steps = got.split()[1:3]
+                    step(int(done), int(steps))
+            elif got.startswith(want):
+                return _kv(got)
+            elif got.startswith("ERROR"):
+                raise ImageJobFailed(got[6:] or "the image engine failed")
+
+    def close(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        with contextlib.suppress(OSError, ValueError):
+            if proc.stdin is not None:
+                proc.stdin.write("QUIT\n")
+                proc.stdin.flush()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=10)
 
 
 class ImageGen:
-    """One sd-cli process per request, one request at a time (the service's turn, gpu_turn)."""
+    """The resident image engine, one request at a time (the service's turn, gpu_turn)."""
 
-    def __init__(self, cfg: dict, log=None):
+    def __init__(self, cfg: dict, log=None, env: dict | None = None):
         self.cfg = dict(cfg)
         policy = self.cfg.get("gpu_policy") or "auto"
         if policy not in POLICIES:
@@ -182,6 +298,9 @@ class ImageGen:
         for k in ("exe", "diffusion_model", "vae", "llm"):
             if not isinstance(self.cfg.get(k), str) or not self.cfg[k]:
                 raise ValueError(f'the config\'s "images" section needs "{k}" (run setup with --images again)')
+        if Path(self.cfg["exe"]).name.startswith("sd-cli"):
+            raise ValueError('the config\'s "images" section is for stable-diffusion.cpp, which XeStrata no longer '
+                             "uses (run setup with --images again)")
         self.policy, self.reload = policy, reload
         self.model = self.cfg.get("model_name") or MODEL_NAME
         self.log = log
@@ -189,7 +308,12 @@ class ImageGen:
         self.dir = Path(out) if out else Path(tempfile.mkdtemp(prefix="strata-images-"))
         self.dir.mkdir(parents=True, exist_ok=True)
         self.keep_files = int(self.cfg.get("keep_files") or 64)
-        self.lock = threading.Lock()              # one sd-cli at a time even when the service's turn is not taken
+        self.reserve = int(self.cfg.get("reserve_mib") or 512)
+        self.spare = int(self.cfg.get("spare_mib") or 1024)
+        self.lock = threading.Lock()              # one request line at a time even when the service's turn is not taken
+        self.engine = ImageEngine(self.cfg, dict(os.environ) if env is None else env, self.dir / "strata-image.log",
+                                  self._say)
+        self.tok = None
         self.totals = {"images": 0, "jobs": 0, "seconds": 0.0, "failed": 0}
         self.last: dict | None = None              # the last job's figures (/v1/status)
         self.progress: tuple | None = None         # (step, steps) of the running job
@@ -220,79 +344,100 @@ class ImageGen:
         p = self.dir / name
         return p if p.is_file() else None
 
-    def run(self, job: dict, cancel: threading.Event | None = None) -> tuple[list[bytes], dict]:
-        """Run sd-cli for `job` (parse_request's dict) -> (the PNG files' bytes in order, figures).  The caller holds
-        the GPU turn.  ImageJobFailed when sd-cli fails, times out or is cancelled."""
-        work = Path(tempfile.mkdtemp(prefix="job-", dir=self.dir))
-        pattern = str(work / "img_%d.png")
-        cmd = sd_cli_args(self.cfg, job, pattern)
-        timeout = float(self.cfg.get("timeout_s") or 3600)
-        logf = work / "sd-cli.log"
-        t0 = time.monotonic()
-        self.progress = (0, job["steps"])
-        with self.lock:
-            with open(logf, "w", encoding="utf-8", errors="replace") as lf:
-                try:
-                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                            stdin=subprocess.DEVNULL, env=image_env(self.cfg),
-                                            cwd=str(work), text=True, errors="replace", bufsize=1)
-                except OSError as e:
-                    raise ImageJobFailed(f"sd-cli did not start ({cmd[0]}): {e}") from e
-                try:
-                    from serve.winjob import contain
-                    contain(proc)                 # ends with the server (Windows)
-                except Exception:
-                    pass
-                why = None
+    def _ready(self) -> None:
+        if self.tok is None:
+            self.tok = load_tokenizer(self.cfg["llm"])
+        if not self.engine.alive():
+            self.engine.start()
 
-                def pump():
-                    for line in proc.stdout:
-                        lf.write(line)
-                        m = STEP_LINE.search(line)
-                        if m:
-                            self.progress = (int(m.group(1)), int(m.group(2)))
-                reader = threading.Thread(target=pump, daemon=True)
-                reader.start()
-                while proc.poll() is None:
-                    if cancel is not None and cancel.is_set():
-                        why = "cancelled (the client left)"
-                    elif time.monotonic() - t0 > timeout:
-                        why = f"it ran past timeout_s ({timeout:g} s)"
-                    if why:
-                        proc.kill()
-                        break
-                    time.sleep(0.2)
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=30)
-                reader.join(timeout=10)
-        secs = time.monotonic() - t0
-        self.progress = None
-        log = logf.read_text(encoding="utf-8", errors="replace")
-        outs = [work / f"img_{i}.png" for i in range(job["n"])]
+    def ids(self, job: dict) -> list[int]:
+        if self.tok is None:
+            self.tok = load_tokenizer(self.cfg["llm"])
+        if "ids" not in job:
+            job["ids"] = prompt_ids(self.tok, job["prompt"])
+        return job["ids"]
+
+    def need(self, job: dict) -> dict:
+        """What the image needs, from the engine (started when it is not running): least_mib, full_mib (every layer
+        resident), held_mib (what it holds now) and free_mib (the device's free VRAM)."""
+        with self.lock:
+            self._ready()
+            w, h = made_size(job)
+            return self.engine.ask(f"NEED {w} {h} {len(self.ids(job)) - DROP}", "NEED", 600)
+
+    def free_mib(self) -> int:
+        """The device's free VRAM, as the engine sees it (its parts left as they are)."""
+        with self.lock:
+            self._ready()
+            return int(self.engine.ask("FREE", "FREE", 60)["free_mib"])
+
+    def fit(self) -> int:
+        """The engine's budget set to what it holds and what is free now, less the reserve -> the budget (MiB)."""
+        with self.lock:
+            self._ready()
+            return int(self.engine.ask(f"FIT {self.reserve}", "BUDGET", 600).get("budget_mib", 0))
+
+    def release(self, everything: bool) -> None:
+        """The engine lets go of its cache (layers, activations, buffers); `everything`: its fixed weights too."""
+        with self.lock:
+            if self.engine.alive():
+                try:
+                    self.engine.ask("RELEASE ALL" if everything else "RELEASE", "RELEASE", 120)
+                except ImageJobFailed as e:
+                    self._say(f"image engine: release failed ({e})")
+
+    def close(self) -> None:
+        with self.lock:
+            self.engine.close()
+
+    def run(self, job: dict, cancel: threading.Event | None = None) -> tuple[list[bytes], dict]:
+        """Make `job`'s images (parse_request's dict) -> (the PNG files' bytes in order, figures).  The caller holds
+        the GPU turn.  ImageJobFailed when the engine fails, times out or the job is cancelled."""
+        timeout = float(self.cfg.get("timeout_s") or 3600)
+        mw, mh = made_size(job)
+        t0 = time.monotonic()
+        images, parts = [], []
+        work = Path(tempfile.mkdtemp(prefix="job-", dir=self.dir))
         try:
-            if why or proc.returncode != 0 or not all(p.is_file() for p in outs):
-                self.totals["failed"] += 1
-                tail = "\n".join(log.strip().splitlines()[-12:])
-                what = why or (f"sd-cli exited with code {proc.returncode}" if proc.returncode
-                               else "sd-cli wrote no image")
-                self._say(f"image job failed: {what}\n{tail}")
-                raise ImageJobFailed(f"{what}; the end of its log:\n{tail}")
-            images = [p.read_bytes() for p in outs]
+            with self.lock:
+                self._ready()
+                ids = ",".join(str(i) for i in self.ids(job))
+                for i in range(job["n"]):
+                    if cancel is not None and cancel.is_set():
+                        self.totals["failed"] += 1
+                        raise ImageJobFailed("cancelled (the client left)")
+                    self.progress = (i * TURBO_STEPS, job["n"] * TURBO_STEPS)
+                    out = work / f"img_{i}.rgba"
+
+                    def step(done, steps, i=i):
+                        self.progress = (i * steps + done, job["n"] * steps)
+                    try:
+                        r = self.engine.ask(f"IMG {mw} {mh} {job['seed'] + i} {DROP} {out} {ids}", "IMAGE",
+                                            timeout, cancel, step)
+                    except ImageJobFailed as e:
+                        self.totals["failed"] += 1
+                        why = "cancelled (the client left)" if str(e) == "stopped" else str(e)
+                        self._say(f"image job failed: {why}")
+                        raise ImageJobFailed(why) from e
+                    images.append(png_rgba(out.read_bytes(), job["width"], job["height"], mw, mh))
+                    parts.append(r)
         finally:
+            self.progress = None
             for p in work.iterdir():
                 with contextlib.suppress(OSError):
                     p.unlink()
             with contextlib.suppress(OSError):
                 work.rmdir()
+        secs = time.monotonic() - t0
         figures = {"seconds": round(secs, 2), "steps": job["steps"], "n": job["n"],
-                   "size": f"{job['width']}x{job['height']}", "seed": job["seed"],
-                   "backend": self.cfg.get("backend"), "quant": self.cfg.get("quant")}
-        for key, pat in (("text_encode_ms", r"get_learned_condition completed, taking ([0-9.]+) ?ms"),
-                         ("sampling_s", r"sampling completed, taking ([0-9.]+) ?s"),
-                         ("vae_decode_s", r"decode_first_stage completed, taking ([0-9.]+) ?s")):
-            m = re.findall(pat, log)
-            if m:
-                figures[key] = float(m[-1])
+                   "size": f"{job['width']}x{job['height']}", "seed": job["seed"], "engine": "strata-image",
+                   "quant": self.cfg.get("quant"),
+                   "text_encode_ms": round(sum(r.get("text_s", 0) for r in parts) * 1000, 1),
+                   "sampling_s": round(sum(r.get("sampling_s", 0) for r in parts), 2),
+                   "vae_decode_s": round(sum(r.get("decode_s", 0) for r in parts), 2),
+                   "plan": {k: v for k, v in parts[-1].items() if k not in ("text_s", "sampling_s", "decode_s")}}
+        if (mw, mh) != (job["width"], job["height"]):      # made larger and cut: the web page says so
+            figures["made_size"] = f"{mw}x{mh}"
         self.totals["jobs"] += 1
         self.totals["images"] += job["n"]
         self.totals["seconds"] += secs
@@ -319,8 +464,8 @@ class ImageGen:
                 "output_format": "png", "size": f"{job['width']}x{job['height']}", "strata": figures}
 
     def status(self) -> dict:
-        out = {"enabled": True, "model": self.model, "backend": self.cfg.get("backend"),
-               "quant": self.cfg.get("quant"), "gpu_policy": self.policy, **self.totals}
+        out = {"enabled": True, "model": self.model, "engine": "strata-image", "quant": self.cfg.get("quant"),
+               "gpu_policy": self.policy, "running": self.engine.alive(), **self.totals}
         if self.progress:
             out["step"], out["steps"] = self.progress
         if self.last:
@@ -329,9 +474,9 @@ class ImageGen:
 
 
 # ------------------------------------------------------------------------------------------- the GPU turn
-def resolve_policy(svc, gen: ImageGen, need: int) -> str:
+def resolve_policy(svc, gen: ImageGen, need: dict) -> str:
     """auto -> keep / shrink / unload for this job (see the module's docstring); a fixed policy is kept, except that
-    an engine that is not running has nothing to give back (keep)."""
+    an engine that is not running has nothing to give back (keep).  `need`: ImageGen.need's answer."""
     eng = svc.engine
     running = not hasattr(eng, "alive") or eng.alive()
     if not running or not hasattr(eng, "unload"):
@@ -340,11 +485,13 @@ def resolve_policy(svc, gen: ImageGen, need: int) -> str:
         return gen.policy
     if gen.cfg.get("uma"):
         return "keep"                         # an APU: the image job and the engine share the RAM either way
-    free = svc.free_vram_mib()
-    if free is None or free >= need:
+    room = need["free_mib"] + need["held_mib"] - gen.reserve
+    if room >= need["full_mib"]:
         return "keep"
     if engine_elastic(eng):
         return "shrink"
+    if room >= need["least_mib"]:
+        return "keep"                         # the image's layers streamed: slower than unloading only for a big batch
     return "unload"
 
 
@@ -388,13 +535,20 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                         if cancel is not None and cancel.is_set():
                             raise _client_gone(svc)
                         time.sleep(0.25)
-                need = need_mib(gen.cfg, job["width"], job["height"])
+                try:
+                    need = gen.need(job)
+                except ImageJobFailed:
+                    gen.totals["failed"] += 1
+                    raise
                 policy = resolve_policy(svc, gen, need)
                 with svc.status_lock:
                     svc.status.update(busy=True, phase="generating an image", started=time.time(),
                                       first_token=None, prompt_tokens=None, generated=None, max_tokens=None)
                 restore = _make_room(svc, gen, policy, need)
                 try:
+                    budget = gen.fit()
+                    gen._say(f"image job: {policy}, the image engine's budget {budget} MiB (the DiT resident from "
+                             f"{need['full_mib']} MiB, at least {need['least_mib']} MiB)")
                     yield policy
                 finally:
                     _give_back(svc, gen, policy, restore)
@@ -410,12 +564,13 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                 svc.status["queued"] -= 1
 
 
-def _make_room(svc, gen: ImageGen, policy: str, need: int):
+def _make_room(svc, gen: ImageGen, policy: str, need: dict):
     """Do what `policy` says before the job; -> what _give_back needs."""
     eng = svc.engine
     if policy == "shrink":
+        want = max(0, need["full_mib"] - need["held_mib"]) + gen.reserve
         try:
-            out = eng.vram(need)
+            out = eng.vram(want)
             gen._say(f"image job: the engine's expert cache gave VRAM back ({out.get('vram_free_mib')} MiB free)")
             return "shrunk"
         except Exception as e:                       # noqa: BLE001 - the job still runs, with what is free
@@ -441,6 +596,16 @@ def _make_room(svc, gen: ImageGen, policy: str, need: int):
 
 
 def _give_back(svc, gen: ImageGen, policy: str, restore) -> None:
+    """After the job: the image engine keeps its layers (the next image starts warm) only under keep with spare_mib
+    still free; else it lets them go, and the text engine gets back what it gave."""
+    keep = policy == "keep"
+    if keep:
+        try:
+            keep = gen.engine.alive() and gen.free_mib() >= gen.spare
+        except ImageJobFailed:
+            keep = False
+    if not keep:
+        gen.release(True)
     eng = svc.engine
     if restore == "shrunk":
         try:

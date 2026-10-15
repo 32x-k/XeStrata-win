@@ -10,8 +10,8 @@ Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/m
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time
 behind a FIFO (plan: one resident sequence).
 Image generation (optional, when the config has an "images" section): POST /v1/images/generations (OpenAI's shape,
-plus seed and steps) runs stable-diffusion.cpp's sd-cli for Qwen-Image-2.1-Turbo, one job at a time on the GPU the
-text engine uses (serve/images.py).
+plus seed) runs Qwen-Image-2.1-Turbo on XeStrata's own image engine (strata-image, resident after the first image),
+one job at a time on the GPU the text engine uses (serve/images.py).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
@@ -5677,7 +5677,7 @@ def make_handler(svc: Service):
                     svc.request_trace.record = None
 
         def _images(self, req):
-            """POST /v1/images/generations (serve/images.py): one sd-cli job in the GPU's turn."""
+            """POST /v1/images/generations (serve/images.py): one image job in the GPU's turn."""
             gen = svc.images
             if gen is None:
                 self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
@@ -6909,15 +6909,18 @@ def main() -> int:
                 for k, v in cfg["images"].items()}
         try:
             ilog = open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None
-            svc.images = images_api.ImageGen(icfg, log=ilog)
+            # the text engine's environment: the same GPU (STRATA_GPU_PCI, CUDA_VISIBLE_DEVICES) and libraries
+            svc.images = images_api.ImageGen(icfg, log=ilog, env=child_env(cfg))
         except ValueError as e:
             raise SystemExit(f"[strata] config: {e}")
         gone = svc.images.missing()
         if gone:
             print(f"[strata] image generation: missing {', '.join(gone)} - requests fail until setup --images has run "
                   "again", flush=True)
-        print(f"[strata] image generation: {svc.images.model} {icfg.get('quant') or ''} on "
-              f"{icfg.get('backend') or '?'} (POST /v1/images/generations; GPU policy {svc.images.policy})", flush=True)
+        print(f"[strata] image generation: {svc.images.model} {icfg.get('quant') or ''} on strata-image "
+              f"(POST /v1/images/generations; GPU policy {svc.images.policy})", flush=True)
+        import atexit
+        atexit.register(svc.images.close)               # the image engine ends with the server
     if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
         try:
             svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get(

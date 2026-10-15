@@ -1196,11 +1196,13 @@ poll();
 setInterval(() => { if (!switching) loadSwitcher(); }, 15000);   // a switch started elsewhere shows here too
 
 // ------------------------------------------------------------------ images (POST /v1/images/generations)
+$("img-size").onchange = () => { $("img-custom").hidden = $("img-size").value !== "custom"; };
 $("img-form").onsubmit = async (ev) => {
   ev.preventDefault();
   const prompt = $("img-prompt").value.trim();
   if (!prompt) return;
-  const body = {prompt, size: $("img-size").value, response_format: "b64_json"};
+  const size = $("img-size").value === "custom" ? `${$("img-w").value}x${$("img-h").value}` : $("img-size").value;
+  const body = {prompt, size, response_format: "b64_json"};
   if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
   $("img-go").disabled = true;
   const t0 = performance.now();
@@ -1215,11 +1217,14 @@ $("img-form").onsubmit = async (ev) => {
       img.src = "data:image/png;base64," + d.b64_json;
       img.alt = prompt;
       const cap = document.createElement("figcaption");
-      cap.textContent = `${j.size}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
+      const made = j.strata && j.strata.made_size ? ` (made at ${j.strata.made_size}, middle cut out)` : "";
+      cap.textContent = `${j.size}${made}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
       fig.append(img, cap);
       $("img-results").prepend(fig);
     }
     $("img-hint").textContent = "Done. Right-click an image to save it.";
+    if (j.strata && j.strata.made_size)
+      toast("info", `Made at ${j.strata.made_size}`, `The image model needs sides that are multiples of 16: the middle ${j.size} was cut out.`, 8000);
   } catch (e) {
     $("img-hint").textContent = "";
     toast("error", "No image", String(e.message || e), 8000);
