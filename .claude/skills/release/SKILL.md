@@ -183,12 +183,22 @@ python $u/sync_collect.py $o/serve xe<VERSION> <upstream tag>                 # 
 `XE` and `UP` are as above; serve and everyday use pass stdin to them, so upstream's `sycl/` wrapper runs `docker run -i`.
 `XE_ROOT` and `UP_ROOT` are the engines' worktrees (their `serve/server.py`), `PY` a Python with the server's packages (the data folder's `venv`); everyday use runs at a 262144 context with what setup writes for it.
 
-The record goes into `$o/`, in the data folder and never into git (XeStrata's own measurements are not shared, the user's decision of 2026-10-11): a README (the machines, the two engines' commits and builds, the method, the tables and what the numbers say), `matrix.json`, `serve/` (its `matrix-serve.json`, `matrix-usage.json` and runs), and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>` (as the speed-matrix record does).
+### image generation
+
+And one more on the same GPUs (the user's decision of 2026-10-15): each engine's image generator as its own setup sets it up on the GPU, one 1024x1024 image of 8 steps from a fixed prompt and seed, by the upstream merge's `bench_image.py` (its references/measure.md, "Image generation": upstream's backend, how its `sd-cli` is built in its tree, the GPU's index); two images per engine, alternating, after a warm-up each; a few minutes a GPU.
+
+```sh
+XE_ROOT=<xe tree> UP_ROOT=<up tree> DATA=<data> QUANT=<Q8_0, Q6_K on a 12 GB card> UP_IMAGE_BACKEND=<vulkan|cuda|hip> \
+  [XE_IMAGE_GPU=N UP_IMAGE_GPU=N] PY=<python> ROUNDS=2 python $u/bench_image.py $o/image <GPU>
+python $u/sync_collect.py $o/image xe<VERSION> <upstream tag>                 # matrix-image.json
+```
+
+The record goes into `$o/`, in the data folder and never into git (XeStrata's own measurements are not shared, the user's decision of 2026-10-11): a README (the machines, the two engines' commits and builds, the method, the tables and what the numbers say), `matrix.json`, `serve/` (its `matrix-serve.json`, `matrix-usage.json` and runs), `image/` (its `matrix-image.json`, runs and images), and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>` (as the speed-matrix record does).
 It is not committed; the release notes carry the tables.
 
 ## 10. The final release (確定報)
 
-The final release is reached a GPU at a time (the user's decision, 2026-10-11): as soon as one GPU's tables are complete (its generate table and its serve and everyday table both), add them to the notes (English and Japanese sections) and update the release (`gh release edit`, below), without waiting for the other GPUs.
+The final release is reached a GPU at a time (the user's decision, 2026-10-11): as soon as one GPU's tables are complete (its generate table, its serve and everyday table and its image table), add them to the notes (English and Japanese sections) and update the release (`gh release edit`, below), without waiting for the other GPUs.
 
 - The comparison section comes after the notes' other sections: its opening lines (the engines' versions, the model, the method), then the note on temperatures and what counts as equal (below) right after them, once, then the GPUs in a fixed order, the B70, the RTX 4070, the RX 9060 XT, each as its tables are done.
 - While some are missing, one line under the done ones names them: B70・RTX 4070: 計測中（後で足す） / B70, RTX 4070: being measured (added later).
@@ -231,20 +241,34 @@ Equal there is the upstream merge's check (`judge.py`): prefill within ±1%, the
 | agent decode (tok/s) | 46.2 | 45.0 | ≒ 同等（+3%） |
 ```
 
+Below that, its image table from `image/`'s medians, the same columns: the seconds of an image, of its sampling and of its VAE, with which build each engine ran (its backend and the image model's quant); the difference as a ratio of the times, upstream's over XeStrata's (`✅ 1.8 倍` / `✅ ×1.8` where XeStrata is faster; slower: `❌ 0.93 倍` / `❌ ×0.93`), within ±1% equal.
+
+```markdown
+**画像の生成**（1024×1024・8 ステップ、秒）
+
+| 計測 | XeStrata xe0.1.44.1-1（Vulkan、Q6_K） | upstream v0.1.44.1（CUDA、Q6_K） | 差 |
+| --- | ---: | ---: | --- |
+| 1 枚 | 18.7 | 17.4 | ❌ 0.93 倍 |
+| サンプリング | 13.9 | 12.4 | ❌ 0.89 倍 |
+| VAE | 2.2 | 2.0 | ❌ 0.91 倍 |
+```
+
 Right after the section's opening lines, once (not repeated for each GPU), one note in each language section, with the temperatures and what counts as equal:
 
 ```markdown
 > [!NOTE]
 > - **generate**：温度 0（greedy）。差が ±1% 以内なら ≒ 同等です。
 > - **serve と通常使用**：温度 0.7 で、それぞれのエンジンが自分の文を書くので、1 回ごとに中央値から 10% 前後ずれることがあります。差が prefill は ±1% 以内、待ち・decode・最初のトークンは ±5% 以内なら ≒ 同等です。
-> - どちらも、交互に 2 回ずつ測った中央値です。
+> - **画像の生成**：決まったプロンプトと種で 1 枚ずつ作った時間です。それぞれのエンジンの setup がその GPU に選ぶ作り方で動かします。差が ±1% 以内なら ≒ 同等です。
+> - どれも、交互に 2 回ずつ測った中央値です。
 ```
 
 ```markdown
 > [!NOTE]
 > - **generate**: temperature 0 (greedy). Within ±1% counts as ≈ equal.
 > - **serve and everyday use**: temperature 0.7, each engine writing its own text, so a run can land about 10% off the median. Within ±1% for prefill and ±5% for the wait, decode and first token counts as ≈ equal.
-> - Both are the median of two alternating runs.
+> - **image generation**: the time of an image from a fixed prompt and seed, each engine as its own setup sets it up on the GPU. Within ±1% counts as ≈ equal.
+> - All are the median of two alternating runs.
 ```
 
 ```sh

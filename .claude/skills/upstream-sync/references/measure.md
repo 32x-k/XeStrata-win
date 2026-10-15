@@ -10,13 +10,14 @@ The engines, each built in a worktree of its own under `.claude/worktrees/` (or 
 
 Each engine's own shipped expert profile. No other work on a machine while it measures.
 
-Every GPU runs three measurements, each with both engines, and step 8 judges all three:
+Every GPU runs four measurements, each with both engines, and step 8 judges all four:
 
 | Measurement | Script | What it covers |
 | --- | --- | --- |
 | generate | `bench_generate.py` | the kernels and the speculative loop, both engines writing one text (`--spec-follow`); every model file below |
 | serve | `bench_serve.py` | `strata --serve`'s own decode loop and the conversation checkpoints, a chat of four turns; IQ3_XXS |
 | everyday use | `bench_usage.py` | the whole path a user meets: `serve/server.py`, the chat template, streaming, chats and a coding agent; IQ3_XXS |
+| image generation | `bench_image.py` | each engine's image generator as its setup sets it up on the GPU (Qwen-Image-2.1-Turbo, sd-cli); the B70 too |
 
 Each GPU is one matrix path (the B70 XMX, the RTX 4070 tensor cores, the RX 9060 XT WMMA), and every GPU runs the same model files (their paths on each machine: `LOCAL.md`):
 
@@ -84,3 +85,19 @@ XE="..." UP="..." XE_ROOT=<xe tree> UP_ROOT=<up tree> XE_PROFILE=... UP_PROFILE=
 
 `XE` and `UP` are a binary or a wrapper, after `env K=V ...` if the engine needs variables (they go to its server's environment).
 `PY` is a Python with the server's packages (the data folder's `venv`).
+
+## Image generation
+
+`bench_image.py` runs each engine's image generator as its own setup sets it up on the GPU, through the command its server runs (`serve/images.py`): one 1024x1024 image of 8 steps a run from a fixed prompt and seed, the time of the image and of its sampling and VAE in it.
+XeStrata's is the Vulkan `sd-cli` with setup's timed choices (`qimage.tune`: flash attention, the VAE's convolutions); upstream's is the backend its setup picks for the GPU, `UP_IMAGE_BACKEND` (CUDA on the RTX 4070, HIP on the RX 9060 XT, Vulkan on the B70: there both trees' `sd-cli` are the same build, and the arguments differ), built in its tree by its setup (`python -c "import setup; setup.build_image_engine('cuda', {'arch': '89'})"` in the tag's worktree, with `STRATA_NVCC` where the default nvcc is too old; `'hip', {'arch': 'gfx1200'}` in the AMD container).
+The B70 is compared with upstream here too (the user's decision of 2026-10-15): an image takes a minute at most.
+A discarded warm-up per engine (the files into the page cache), then `ROUNDS` images per engine (the merge: 1), alternating:
+
+```sh
+XE_ROOT=<xe tree> UP_ROOT=<up tree> DATA=<data> QUANT=<Q8_0, Q6_K on a 12 GB card> UP_IMAGE_BACKEND=<cuda|hip|vulkan> \
+  [XE_IMAGE_GPU=N UP_IMAGE_GPU=N] PY=<python> ROUNDS=1 \
+  python .claude/skills/upstream-sync/scripts/bench_image.py $o/IQ3_XXS <GPU>
+```
+
+`XE_IMAGE_GPU` and `UP_IMAGE_GPU` pick the GPU among the backend's devices where the PC has more than one (`LOCAL.md`: Vulkan counts the processor's graphics first).
+Each `sd-cli` is checked against the backend asked for (its `BUILD.json`); a tree holds one build, so on the B70 upstream's Vulkan `sd-cli` is XeStrata's (`UP_SD_CLI=<xe tree>/engine-image/sd-cli`: the same pins and CMake options), and XeStrata's `XE_SD_CLI` points at a tree that has one.

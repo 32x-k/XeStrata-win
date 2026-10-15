@@ -9,6 +9,8 @@ the tier's prompt, the follow-ups (the median time a follow-up's prompt takes, i
 turns.
 When bench_usage.py ran too, OUT/usage-runs/*.json go to OUT/matrix-usage.json and a table per GPU: per conversation,
 the time to the first token (the median of its turns), the prompt and the output speed (the server's timings, summed).
+When bench_image.py ran too, OUT/image-runs/*.json go to OUT/matrix-image.json and a table per GPU: the seconds an
+image, its sampling and its VAE decode.
 The reading is tools/bench_core.py's (collect).
 
     python .claude/skills/upstream-sync/scripts/sync_collect.py OUT XE_NAME UP_NAME   # e.g. OUT xe0.1.41 v0.1.41

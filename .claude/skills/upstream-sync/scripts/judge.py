@@ -7,7 +7,8 @@ GPU, tier and mode, the prompt, the follow-ups' prompt time (lower is better) an
 matrix-usage.json (bench_usage.py) is judged on everyday use too: per GPU and conversation, the time to the first
 token (lower is better), the prompt and the output.  There each engine writes its own text, so all but the prompt
 speed move with it from round to round: those cells pass when XeStrata is at most SERVE_LIMIT worse, the prompt
-still at 1%.
+still at 1%.  A folder with a matrix-image.json (bench_image.py) is judged on image generation too: per GPU, the
+seconds an image (lower is better) at 1%, as the fixed seed makes it move less than that from run to run.
 
     python .claude/skills/upstream-sync/scripts/judge.py [--prev NAME=DIR]... OUT/IQ3_XXS ...
 
@@ -35,7 +36,9 @@ TIERS = ["1k", "4k", "32k", "64k", "128k", "192k", "262k"]
 MEASURES = (("prefill_tok_s", "prompt"), ("decode_tok_s", "output"))
 SERVE_MEASURES = (("prefill_tok_s", "prompt"), ("cont_ms", "follow"), ("decode_tok_s", "output"))
 USAGE_MEASURES = (("ttft_s", "first"), ("prefill_tok_s", "prompt"), ("decode_tok_s", "output"))
-LOWER_BETTER = {"ttft_s", "cont_ms"}
+IMAGE_MEASURES = (("seconds", "image"),)
+LOWER_BETTER = {"ttft_s", "cont_ms", "seconds"}
+STRICT = {"prefill_tok_s", "seconds"}         # judged at LIMIT wherever they are
 
 
 def median(rows, key):
@@ -64,7 +67,7 @@ def load(path):
                     x.setdefault("arm", "xe" if x.get("engine", "").startswith("xe") else "up")
                 return r
         return []
-    return rows("matrix.json"), rows("matrix-serve.json"), rows("matrix-usage.json")
+    return rows("matrix.json"), rows("matrix-serve.json"), rows("matrix-usage.json"), rows("matrix-image.json")
 
 
 records = [(pathlib.Path(a), load(pathlib.Path(a))) for a in args]
@@ -77,7 +80,7 @@ fails = judged = 0
 def cells(name, rec):
     """(GPU, key, where, rows, measures, limit) for each cell of a record: generate's, serve's, then everyday use's;
     `key` finds the same cell in another record."""
-    gen, serve, usage = rec
+    gen, serve, usage, image = rec
     for rows, measures, limit, modes in ((gen, MEASURES, LIMIT, [None]), (serve, SERVE_MEASURES, SERVE_LIMIT, None)):
         for gpu in sorted({r["gpu"] for r in rows}):
             for tier in TIERS:
@@ -93,6 +96,9 @@ def cells(name, rec):
             cell = [r for r in usage if (r["gpu"], r["conv"]) == (gpu, conv)]
             yield gpu, ("usage", gpu, conv), f"{name:10s} {'usage':12s} {gpu:8s} {conv:7s}", cell, USAGE_MEASURES, \
                 SERVE_LIMIT
+    for gpu in sorted({r["gpu"] for r in image}):
+        cell = [r for r in image if r["gpu"] == gpu]
+        yield gpu, ("image", gpu), f"{name:10s} {'image':12s} {gpu:8s} {'1024px':5s}", cell, IMAGE_MEASURES, LIMIT
 
 
 def against(where, key, xe, other, limit, what):
@@ -126,7 +132,7 @@ for folder, rec in records:
                 print(f"{where} FAIL  XeStrata did not finish (upstream {up:.1f})")
             else:
                 judged += 1
-                fails += not against(where, key, xe, up, LIMIT if key == "prefill_tok_s" else limit, "")
+                fails += not against(where, key, xe, up, LIMIT if key in STRICT else limit, "")
             before = median([r for r in prev.get(ckey, []) if r["arm"] == "xe"], key)
             if before is not None:
                 if xe is None:
@@ -135,7 +141,7 @@ for folder, rec in records:
                 else:
                     judged += 1
                     fails += not against(where, key, xe, before,
-                                         LIMIT if key == "prefill_tok_s" else SERVE_LIMIT, "prev ")
+                                         LIMIT if key in STRICT else SERVE_LIMIT, "prev ")
 fails += judged == 0                          # nothing measured is no win
 print("ALL PASS" if fails == 0 else f"FAIL {fails}")
 sys.exit(1 if fails else 0)
