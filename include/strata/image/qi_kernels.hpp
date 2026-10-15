@@ -77,4 +77,25 @@ void qi_tokens_latent(const float* tokens, int64_t C, int64_t HW, float* latent,
 /// x += a * v, n elements.
 void qi_axpy(float* x, const float* v, float a, int64_t n, void* stream);
 
+// --- the vision encoder (Qwen3-VL's ViT, src/image/qi_vision.cpp)
+
+/// y[t, :] += b, T rows of N.
+void qi_bias_add(float* y, const float* b, int64_t T, int64_t N, void* stream);
+
+/// y16 = LayerNorm(x) * w + b per row of C (eps), FP16 out.
+void qi_layer_norm16(const float* x, const float* w, const float* b, int64_t T, int64_t C, float eps, uint16_t* y16,
+                     void* stream);
+
+/// y16 = GELU(x), the exact (erf) form, n elements.
+void qi_gelu_erf16(const float* x, int64_t n, uint16_t* y16, void* stream);
+
+/// qkv [T][3 * heads * hd] (biased) -> q16, k16, v16 [rows][heads][128]: each head's hd channels, the rest zero (the
+/// attention takes 128); q and k rotated in 2D (channel j paired with j + hd / 2; the first hd / 4 pairs by the
+/// token's row yx[2t], the next by its column yx[2t + 1], each at theta^(-4j / hd)); q times q_scale.
+void qi_vit_qkv_rope16(const float* qkv, const int32_t* yx, int64_t T, int64_t heads, int64_t hd, float theta,
+                       float q_scale, uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream);
+
+/// out16 [T][heads * hd] = the first hd channels of each head of in16 [T][heads][128].
+void qi_unpad_heads16(const uint16_t* in16, int64_t T, int64_t heads, int64_t hd, uint16_t* out16, void* stream);
+
 }  // namespace strata::image

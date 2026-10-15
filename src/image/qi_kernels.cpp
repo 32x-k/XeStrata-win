@@ -359,4 +359,84 @@ void qi_axpy(float* x, const float* v, float a, int64_t n, void* stream) {
     finish(stream, e, "qi_axpy");
 }
 
+void qi_bias_add(float* y, const float* b, int64_t T, int64_t N, void* stream) {
+    if (T <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        y[i] += b[i % N];
+    });
+    finish(stream, e, "qi_bias_add");
+}
+
+void qi_layer_norm16(const float* x, const float* w, const float* b, int64_t T, int64_t C, float eps, uint16_t* y16,
+                     void* stream) {
+    if (T <= 0) return;
+    constexpr size_t L = 256;
+    const auto e = queue_for(stream).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) T * L), sycl::range<1>(L)), [=](sycl::nd_item<1> it) {
+            const auto t = static_cast<int64_t>(it.get_group_linear_id());
+            const auto l = static_cast<int64_t>(it.get_local_linear_id());
+            const float* r = x + t * C;
+            float s = 0.f, s2 = 0.f;
+            for (int64_t c = l; c < C; c += (int64_t) L) {
+                s += r[c];
+                s2 += r[c] * r[c];
+            }
+            s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
+            s2 = sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>());
+            const float mean = s / (float) C;
+            const float inv = 1.f / sycl::sqrt(sycl::fmax(s2 / (float) C - mean * mean, 0.f) + eps);
+            for (int64_t c = l; c < C; c += (int64_t) L) y16[t * C + c] = f16_from_f32((r[c] - mean) * inv * w[c] + b[c]);
+        });
+    finish(stream, e, "qi_layer_norm16");
+}
+
+void qi_gelu_erf16(const float* x, int64_t n, uint16_t* y16, void* stream) {
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
+        const float v = x[i];
+        y16[i] = f16_from_f32(0.5f * v * (1.f + sycl::erf(v * 0.70710678118654752f)));
+    });
+    finish(stream, e, "qi_gelu_erf16");
+}
+
+void qi_vit_qkv_rope16(const float* qkv, const int32_t* yx, int64_t T, int64_t heads, int64_t hd, float theta,
+                       float q_scale, uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream) {
+    if (T <= 0) return;
+    constexpr int64_t D = 128;
+    const int64_t C = heads * hd, half = hd / 2, quarter = hd / 4;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * heads * D)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t t = i / (heads * D), h = (i / D) % heads, d = i % D;
+        const int64_t o = t * heads * D + h * D + d;
+        if (d >= hd) {
+            q16[o] = k16[o] = v16[o] = 0;
+            return;
+        }
+        const float* row = qkv + t * 3 * C + h * hd;
+        const int64_t j = d < half ? d : d - half;              // the pair's frequency index
+        const float pos = (float) (j < quarter ? yx[2 * t] : yx[2 * t + 1]);
+        const int64_t f = j < quarter ? j : j - quarter;
+        const float ang = pos * sycl::pow(theta, -2.0f * (float) f / (float) half);
+        const float c = sycl::cos(ang), s = sycl::sin(ang);
+        auto rot = [&](const float* r) {
+            return d < half ? r[d] * c - r[d + half] * s : r[d] * c + r[d - half] * s;
+        };
+        q16[o] = f16_from_f32(rot(row) * q_scale);
+        k16[o] = f16_from_f32(rot(row + C));
+        v16[o] = f16_from_f32(row[2 * C + d]);
+    });
+    finish(stream, e, "qi_vit_qkv_rope16");
+}
+
+void qi_unpad_heads16(const uint16_t* in16, int64_t T, int64_t heads, int64_t hd, uint16_t* out16, void* stream) {
+    if (T <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * heads * hd)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t t = i / (heads * hd), r = i % (heads * hd), h = r / hd, d = r % hd;
+        out16[i] = in16[(t * heads + h) * 128 + d];
+    });
+    finish(stream, e, "qi_unpad_heads16");
+}
+
 }  // namespace strata::image
