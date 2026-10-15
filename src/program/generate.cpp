@@ -2554,8 +2554,7 @@ int main(int argc, char** argv) {
         }
     }
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
-    // the next discrete ones); "auto" chooses the K before anything is loaded (below).  The helper caches
-    // (--expert-cache-remote) are not carried by the Xe engine at all (remote_experts.cpp).
+    // the next discrete ones); "auto" chooses the K before anything is loaded (below).
     {   // the RAM guard (parking, session save/restore): --memory-limit-mib, else STRATA_MEMORY_LIMIT_MIB, else none
         int64_t mib = o.memory_limit_mib;
         if (mib < 0) {
@@ -2694,8 +2693,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: a layer split across GPUs needs --expert-profile\n");
             return 2;
         }
-        int n_vis = 1;
-        // one Xe device (docs/XE.md): no helper GPU is visible
+        const int n_vis = strata::core::Runtime::count();
         int next_free = 1;
         for (int r = 0; r < 3; ++r) {
             if (o.expert_cache_remote[(size_t) r] <= 0) continue;
@@ -2986,6 +2984,8 @@ int main(int argc, char** argv) {
     // and on every other GPU of a layer split, with its matrix products' library (each GPU builds its own kernels)
     if (multi_gpu)
         for (const int d : split_devs) strata::core::Runtime::at(d).preload_kernels();
+    for (int r = 0; r < 3; ++r)   // and on the helper GPUs
+        if (o.expert_cache_remote[(size_t) r] > 0) strata::core::Runtime::at(remote_dev[r]).preload_kernels();
     // stopped when main returns, whichever way (stop_preload)
     struct PreloadStop {
         const std::vector<int>* split;

@@ -13,7 +13,7 @@
 
 namespace strata::core {
 
-/// A static, profile-filled expert tier on another CUDA device. CUDA0 keeps all
+/// A static, profile-filled expert tier on another GPU. GPU 0 keeps all
 /// dense weights and state; results return through the existing pinned CPU rows.
 class RemoteExperts {
 public:
@@ -51,15 +51,36 @@ public:
     double ms_wait() const { return ms_wait_; }
 
 private:
-    // the Xe runtime has no helper GPU (src/core/remote_experts.cpp): only what the accessors above report
     int device_ = -1;
+    int64_t n_expert_ = 0;
+    int32_t groups_ = 0;
     int64_t computed_ = 0;
     int64_t launched_layers_ = 0;
     uint64_t returned_bytes_ = 0;
     uint64_t full_row_bytes_ = 0;
     double ms_begin_ = 0, ms_wait_ = 0;
     ExpertCache cache_;
+    void* stream_ = nullptr;
+    float* h_x_ = nullptr;     ///< host USM of this GPU's runtime: its kernels read it in place (zero copy)
+    float* h_out_ = nullptr;   ///< the same, written in place
+    void* h_meta_ = nullptr;
+    bool zero_copy_ = false;
+    float* d_x_ = nullptr;
+    float* d_out_ = nullptr;
+    uint8_t* d_q8_ = nullptr;
+    float* d_scales_ = nullptr;
+    void* d_scratch_ = nullptr;
+    void* d_meta_ = nullptr;  ///< one upload of the grouped indices, instead of five small copies
+    int32_t* d_start_ = nullptr;
+    int32_t* d_dst_ = nullptr;
+    int32_t* d_tok_ = nullptr;
+    int32_t* d_count_ = nullptr;
+    unsigned long long* d_ptr_ = nullptr;
     std::vector<uint8_t> owned_;
+    std::vector<uint8_t> layers_present_;
+    std::vector<int32_t> group_of_, group_id_;
+    std::vector<int32_t> start_, dst_, tok_, original_row_;
+    std::vector<unsigned long long> ptr_;
 };
 
 } // namespace strata::core
