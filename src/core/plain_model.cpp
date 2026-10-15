@@ -371,9 +371,9 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         }
     }
     // the states after a window's rows but its last, for going back to the last accepted draft: a window checks up to
-    // spec - 1 drafts
+    // spec - 1 drafts (at most the window kernel's snapshots)
     if (has_mtp_) {
-        opt_.spec = std::min(opt_.spec, opt_.max_t);
+        opt_.spec = std::min({opt_.spec, opt_.max_t, k::kNativeGdnMaxSnaps + 1});
         n_snap_ = opt_.spec - 1;
         gdn_snap_.assign(gdn_state_.size(), {});
         conv_snap_.assign(gdn_state_.size(), {});
@@ -900,24 +900,24 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
             proj(b.alpha, hn_, alpha_, T, false);
             proj(b.beta, hn_, beta_, T, false);
         }
-        for (int t = 0; t < T; ++t) {   // the recurrence, token by token
+        const int n_snaps = std::min(T - 1, n_snap_);   // the states after rows 0 .. n_snaps - 1, for spec_step
+        for (int t = 0; t < T; ++t) {   // each row's inputs; the convolution's history goes on row by row
             float* h = hc_ + (size_t) t * C;
             k::native_gdn_conv_silu(hist, qkv_ + (size_t) t * C, b.conv, craw_, h, C, s.ssm_d_conv, cs);
             k::native_gdn_l2_norm(h, HK, S, eps, cs);
             k::native_gdn_l2_norm(h + HK * S, HK, S, eps, cs);
-            k::native_gdn_beta_gate(beta_ + (size_t) t * HV, HV, cs);
             k::native_gdn_gate(alpha_ + (size_t) t * HV, b.dt, b.a, gate_ + (size_t) t * HV, HV, cs);
-            k::native_gdn_step(state, h, h + HK * S, h + 2 * HK * S, gate_ + (size_t) t * HV, beta_ + (size_t) t * HV,
-                               o_ + (size_t) t * ZV, gs, cs);
-            k::native_gdn_out_norm(o_ + (size_t) t * ZV, z_ + (size_t) t * ZV, b.ssm_norm, y_ + (size_t) t * ZV, HV, S,
-                                   eps, cs);
-            if (t < T - 1 && t < n_snap_) {   // the state after row t, for spec_step to go back to
-                k::MappedCopy c[2];
-                c[0] = {gdn_snap_[(size_t) b.gdn][(size_t) t], state, S * HV * S};
-                c[1] = {conv_snap_[(size_t) b.gdn][(size_t) t], hist, C * (s.ssm_d_conv - 1)};
-                k::copy_from_mapped_multi(c, 2, cs);
-            }
+            if (t < n_snaps)
+                k::copy_from_mapped(conv_snap_[(size_t) b.gdn][(size_t) t], hist, C * (s.ssm_d_conv - 1), cs);
         }
+        k::native_gdn_beta_gate(beta_, HV * T, cs);
+        // the recurrence over the window's rows in one launch (the state read and written once, the rows' states
+        // to go back to written beside): one launch a row read and wrote the 2 MiB state of Qwen3.6's 32 heads each
+        // time, 45 us a row on the RX 9060 XT (2026-10-15)
+        float* snaps[k::kNativeGdnMaxSnaps] = {};
+        for (int t = 0; t < n_snaps; ++t) snaps[t] = gdn_snap_[(size_t) b.gdn][(size_t) t];
+        k::native_gdn_step_rows(state, hc_, C, gate_, beta_, o_, ZV, T, snaps, n_snaps, gs, cs);
+        k::native_gdn_out_norm(o_, z_, b.ssm_norm, y_, HV * T, S, eps, cs);
         proj(b.ssm_out, y_, mix_, T, true);
     } else {
         const int64_t a = b.attn;
