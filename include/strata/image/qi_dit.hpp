@@ -71,6 +71,9 @@ public:
     /// The VRAM the blocks may take: those that fit stay, the rest are streamed (LayerStream).
     void set_block_budget(uint64_t bytes) { blocks_stream_.configure(bytes, s_); }
     int resident_blocks() const { return blocks_stream_.resident(); }
+    /// What the blocks and the activations hold on the GPU now.
+    uint64_t blocks_vram() const { return blocks_stream_.vram(); }
+    uint64_t activations_held() const { return cap_T_ > 0 ? activation_bytes(cap_T_, mlp_rows_) : 0; }
     /// Frees the blocks' VRAM (they come back from the file on use).
     void drop_blocks() { blocks_stream_.drop(); }
     /// Frees the activations (grown again on use).

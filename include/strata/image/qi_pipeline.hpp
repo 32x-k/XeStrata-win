@@ -17,6 +17,8 @@
 #include "strata/image/qi_vae.hpp"
 
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -51,7 +53,13 @@ public:
     /// The budget in force: the one set, else the free VRAM's at open.
     uint64_t budget() const { return budget_ > 0 ? budget_ : auto_budget_; }
     /// Frees what the engine holds on the GPU beyond its fixed weights (the cache): the next request loads again.
-    void release();
+    /// `all`: the fixed weights and the products' scratch too (the parts are opened again on the next request).
+    void release(bool all = false);
+    /// The budget set to what the engine holds and the VRAM free now, less `reserve` (another program's room): taken
+    /// before a request when the GPU's memory is shared.
+    void fit(uint64_t reserve);
+    /// What the engine holds on the GPU now (an estimate of its own buffers).
+    uint64_t held() const;
 
     /// RGBA8 [height][width][4] of the request.  `step`: the DiT's progress (QiDit::sample), false to stop.
     std::vector<uint8_t> generate(const QiRequest& r, QiTimes* times = nullptr, QiPlan* plan = nullptr,
@@ -60,10 +68,13 @@ public:
 private:
     QiPlan plan(int64_t T, int64_t h, int64_t w);
 
+    void ensure_open();
+
     void* s_ = nullptr;
-    QiText te_;
-    QiDit dit_;
-    QiVae vae_;
+    std::string dit_path_, vae_path_, text_path_;
+    std::unique_ptr<QiText> te_;
+    std::unique_ptr<QiDit> dit_;
+    std::unique_ptr<QiVae> vae_;
     uint64_t budget_ = 0, auto_budget_ = 0;
     uint64_t dit_set_ = 0, te_set_ = 0;
     int64_t mlp_set_ = -1;

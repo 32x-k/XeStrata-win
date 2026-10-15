@@ -15,11 +15,13 @@
 //   IMG <width> <height> <seed> <drop> <out path> <ids, commas>   -> STEP <done> <steps> lines, then
 //                                                                    IMAGE key=value ... (times, the budget's split)
 //   BUDGET <MiB>             the VRAM the engine may take (0: the free VRAM at its start)      -> BUDGET budget_mib=...
-//   RELEASE                  frees the layers, activations and buffers (the cache)            -> RELEASE ok
+//   FIT <MiB>                the budget: what the engine holds and the free VRAM, less <MiB>  -> BUDGET budget_mib=...
+//   RELEASE [ALL]            frees the layers, activations and buffers (the cache); ALL also the parts' fixed weights
+//                            and scratch, the parts opened again on the next IMG                -> RELEASE ok
 //   STOP                     (while an IMG runs) ends it after the step it is in               -> ERROR stopped
 //   QUIT                     ends the engine
 // A request that fails answers ERROR <message> and the engine goes on.  Before the first line it makes a small image
-// (its kernels built and the library's first products set up), then says READY budget_mib=<M>.
+// (its kernels built and the library's first products set up) and lets its buffers go, then says READY budget_mib=<M>.
 
 #include "strata/image/qi_pipeline.hpp"
 
@@ -106,6 +108,7 @@ int serve(si::QiPipeline& p) {
         r.width = r.height = 256;
         r.sigmas = {1.0f, 0.0f};
         p.generate(r);
+        p.release(true);   // idle, the engine holds next to nothing on the GPU: the first request opens the parts
     }
     std::printf("READY budget_mib=%llu\n", (unsigned long long) (p.budget() >> 20));
     std::fflush(stdout);
@@ -140,8 +143,15 @@ int serve(si::QiPipeline& p) {
                 ls >> mib;
                 p.set_budget(mib << 20);
                 std::printf("BUDGET budget_mib=%llu\n", (unsigned long long) (p.budget() >> 20));
+            } else if (op == "FIT") {
+                uint64_t mib = 0;
+                ls >> mib;
+                p.fit(mib << 20);
+                std::printf("BUDGET budget_mib=%llu\n", (unsigned long long) (p.budget() >> 20));
             } else if (op == "RELEASE") {
-                p.release();
+                std::string what;
+                ls >> what;
+                p.release(what == "ALL");
                 std::printf("RELEASE ok\n");
             } else if (!op.empty()) {
                 throw std::invalid_argument("unknown request " + op);

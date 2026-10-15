@@ -37,6 +37,8 @@ public:
     uint64_t scratch_min() const { return scratch_bytes(8, 8); }
     /// Frees the working buffers (grown again on use).
     void drop_scratch();
+    /// What the working buffers hold now.
+    uint64_t scratch_held() const { return (uint64_t) cap16_ * 2 + (uint64_t) cap32_ * 4 * 3 + (uint64_t) col_cap_ * 2; }
     uint64_t weight_bytes() const { return weight_bytes_; }
 
 private:
