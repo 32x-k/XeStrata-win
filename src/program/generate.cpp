@@ -6430,6 +6430,23 @@ int main(int argc, char** argv) {
                                  "--conversation-save are off (a parked conversation carries the draft layer's K/V)\n");
             o.conversation_save.clear();
         }
+        // STRATA_PREFILL_HELPER_SOURCE (opt-in): the prompt path may take a blob a helper's VRAM cache already
+        // holds from that cache instead of reading the files again.  The helpers are idle while a prompt is read
+        // (the serve path is serial: no batch slots), so the copy needs no ordering against their kernel streams.
+        // Default off: the prompt path's source is srcp, exactly as before.
+        std::vector<strata::core::RemoteExperts*> prefill_helpers;
+        prefill_helpers.reserve((size_t) drive.d.remote_count);
+        for (int r = 0; r < drive.d.remote_count; ++r) prefill_helpers.push_back(drive.d.remote[r]);
+        std::unique_ptr<strata::core::RemotePrefillSource> prefill_helper_src;
+        strata::core::ExpertSource* prefill_src = srcp;
+        uint64_t helper_blobs_before = 0, helper_bytes_before = 0;
+        if (const char* hv = std::getenv("STRATA_PREFILL_HELPER_SOURCE"); hv != nullptr && std::strtol(hv, nullptr, 10) != 0 &&
+            srcp != nullptr && !multi_gpu && stages.empty() && o.batch <= 0 && !prefill_helpers.empty()) {
+            prefill_helper_src = std::make_unique<strata::core::RemotePrefillSource>(*srcp, prefill_helpers);
+            prefill_src = prefill_helper_src.get();
+            std::fprintf(stderr, "strata serve: the prompt path reads the experts a helper cache holds from that "
+                                 "cache (STRATA_PREFILL_HELPER_SOURCE)\n");
+        }
         strata::prefill::Prefill sp;
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
@@ -6518,7 +6535,7 @@ int main(int argc, char** argv) {
         if (!multi_gpu && o.batch <= 0 && !o.no_pool && cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr))
             sp.set_cpu_pool(&pool);
         mem_mark("before the prompt path init");
-        if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
+        if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             if (err.find("fit") != std::string::npos)   // #85: say what frees VRAM
                 std::fprintf(stderr, "strata serve: the GPU has too little free VRAM for the prompt path: turn images "
@@ -11506,6 +11523,14 @@ int main(int argc, char** argv) {
                              (double) (remote_experts[(size_t) r].returned_bytes() - compact_before[(size_t) r]) / 1048576.0,
                              (double) (remote_experts[(size_t) r].full_row_bytes() - full_before[(size_t) r]) / 1048576.0,
                              remote_experts[(size_t) r].ms_begin(), remote_experts[(size_t) r].ms_wait());
+            if (prefill_helper_src) {
+                const uint64_t blobs = prefill_helper_src->helper_blobs(), bytes = prefill_helper_src->helper_bytes();
+                std::fprintf(stderr, "strata serve: prefill helper source: %lld blobs / %.1f MiB taken from a helper's "
+                                     "cache in this request\n",
+                             (long long) (blobs - helper_blobs_before), (double) (bytes - helper_bytes_before) / 1048576.0);
+                helper_blobs_before = blobs;
+                helper_bytes_before = bytes;
+            }
         }
         // --conversation-save: the parked conversations, then the live one (the newest file)
         if (disk.enabled()) {

@@ -71,17 +71,20 @@ void RemoteExperts::close() {
     try {
         const OnDevice on(device_);
         if (stream_) gpu::stream_sync(stream_);
+        if (read_stream_) gpu::stream_sync(read_stream_);
         cache_.close();
         for (const void* p : {(const void*) d_x_, (const void*) d_out_, (const void*) d_q8_, (const void*) d_scales_,
                               (const void*) d_scratch_, (const void*) d_meta_, (const void*) h_x_,
                               (const void*) h_out_, (const void*) h_meta_})
             gpu::free(p);
         if (stream_) gpu::stream_destroy(stream_);
+        if (read_stream_) gpu::stream_destroy(read_stream_);
     } catch (const std::exception& e) {   // teardown, from the destructor too: said, not thrown
         std::fprintf(stderr, "GPU%d experts: close: %s\n", device_, e.what());
     }
     device_ = -1;
     stream_ = nullptr;
+    read_stream_ = nullptr;
     h_x_ = h_out_ = d_x_ = d_out_ = nullptr;
     h_meta_ = d_meta_ = nullptr;
     d_q8_ = nullptr;
@@ -166,7 +169,9 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
             strata::kernels::native_expert_scratch_bytes(CAP, FF));
         const size_t rows = (size_t) CAP * H * sizeof(float);
         stream_ = gpu::stream_create();
+        read_stream_ = gpu::stream_create_copy();
         const char* step = stream_ == nullptr                                   ? "stream"
+                         : read_stream_ == nullptr                              ? "cache read stream"
                          : !gpu::alloc_host(&h_x_, rows)                        ? "input staging"
                          : !gpu::alloc_host(&h_out_, rows)                      ? "result staging"
                          : !gpu::alloc_host(&h_meta_, sizeof(RemoteMeta))       ? "metadata staging"
@@ -318,6 +323,69 @@ bool RemoteExperts::finish(float* out, std::string& err) {
     for (size_t i = 0; i < original_row_.size(); ++i)
         std::memcpy(out + (size_t) original_row_[i] * H, h_out_ + i * H, (size_t) H * sizeof(float));
     return true;
+}
+
+bool RemoteExperts::copy_cached_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst,
+                                      size_t n, uint8_t* hit, std::string& err) {
+    std::fill(hit, hit + n, 0);
+    if (device_ < 0 || read_stream_ == nullptr || n == 0) return true;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    std::lock_guard<std::mutex> lock(read_mu_);
+    try {
+        const OnDevice on(device_);
+        bool queued = false;
+        for (size_t i = 0; i < n; ++i) {
+            if (dst[i] == nullptr) continue;
+            const int32_t slot = cache_.slot_of(layers[i], experts[i]);
+            if (slot < 0) continue;
+            if (!gpu::copy_async(dst[i], cache_.device_slot(slot), (size_t) lay.blob_bytes(layers[i]), read_stream_)) {
+                err = failed(device_, "cache read");
+                // nothing may still be writing a caller's buffer when this returns: if the drain fails, forget
+                // every hit and let the caller refill all of them from its fallback
+                if (!gpu::stream_sync(read_stream_)) std::fill(hit, hit + n, 0);
+                return false;
+            }
+            hit[i] = 1;
+            queued = true;
+        }
+        if (queued && !gpu::stream_sync(read_stream_)) {
+            err = failed(device_, "cache read wait");
+            std::fill(hit, hit + n, 0);   // a failed wait means no copied buffer may be trusted
+            return false;
+        }
+    } catch (const std::exception& e) {
+        err = "GPU" + std::to_string(device_) + " experts: " + e.what();
+        std::fill(hit, hit + n, 0);
+        return false;
+    }
+    return true;
+}
+
+bool RemotePrefillSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+    if (dst != nullptr && from_helper(layer, expert)) {
+        const int32_t l = (int32_t) layer, e = (int32_t) expert;
+        uint8_t* d = dst;
+        std::string err;
+        for (RemoteExperts* h : helpers_) {
+            uint8_t got = 0;
+            const bool ok = h->copy_cached_blobs(&l, &e, &d, 1, &got, err);
+            if (got) {
+                helper_blobs_.fetch_add(1, std::memory_order_relaxed);
+                helper_bytes_.fetch_add(strata::kernels::cpu::expert_layout().blob_bytes(layer),
+                                        std::memory_order_relaxed);
+                return true;
+            }
+            if (!ok) break;
+        }
+        warn(err);
+    }
+    return fallback_.copy_blob(layer, expert, dst);
+}
+
+void RemotePrefillSource::warn(const std::string& err) {
+    if (err.empty() || warned_.exchange(true)) return;
+    std::fprintf(stderr, "prefill: a helper cache read failed (%s); the file source fills that blob instead\n",
+                 err.c_str());
 }
 
 }  // namespace strata::core
