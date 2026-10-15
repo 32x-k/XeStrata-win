@@ -137,6 +137,82 @@ void qi_attention_plain(const uint16_t* q16, const uint16_t* k16, const uint16_t
     finish(stream, e, "qi_attention_plain");
 }
 
+void qi_text_qk_rope16(const float* q, const float* k, const float* v, const float* wq, const float* wk, int64_t T,
+                       int64_t q_heads, int64_t kv_heads, int64_t head_dim, float theta, uint16_t* q16, uint16_t* k16,
+                       uint16_t* v16, void* stream) {
+    if (T <= 0) return;
+    if (head_dim % 2 != 0 || head_dim > 256) throw std::invalid_argument("qi_text_qk_rope16: head_dim");
+    const size_t local = (size_t) head_dim;
+    const int64_t heads = q_heads + kv_heads, half = head_dim / 2;
+    const auto e = queue_for(stream).submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> row(local, h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * heads) * local), sycl::range<1>(local)),
+                       [=](sycl::nd_item<1> it) {
+            const auto g = static_cast<int64_t>(it.get_group_linear_id());
+            const auto d = static_cast<int64_t>(it.get_local_linear_id());
+            const int64_t t = g / heads, hh = g - t * heads;
+            const bool isq = hh < q_heads;
+            const int64_t i = isq ? (t * q_heads + hh) * head_dim + d : (t * kv_heads + hh - q_heads) * head_dim + d;
+            const float val = isq ? q[i] : k[i];
+            const float ss = sycl::reduce_over_group(it.get_group(), val * val, sycl::plus<float>());
+            const float n = val / sycl::sqrt(ss / (float) head_dim + kEps) * (isq ? wq : wk)[d];
+            row[d] = n;
+            sycl::group_barrier(it.get_group());
+            const int64_t j = d < half ? d : d - half;
+            const float ang = (float) t * sycl::pow(theta, -2.0f * (float) j / (float) head_dim);
+            const float c = sycl::cos(ang), s = sycl::sin(ang);
+            const float out = d < half ? n * c - row[d + half] * s : n * c + row[d - half] * s;
+            (isq ? q16 : k16)[i] = f16_from_f32(out);
+            if (!isq) v16[i] = f16_from_f32(v[i]);
+        });
+    });
+    finish(stream, e, "qi_text_qk_rope16");
+}
+
+void qi_attention_causal(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t q_heads,
+                         int64_t kv_heads, int64_t head_dim, float* out, void* stream) {
+    if (T <= 0) return;
+    if (head_dim != 128) throw std::invalid_argument("qi_attention_causal: head_dim 128");
+    constexpr int64_t D = 128, TILE = 128;
+    const int64_t qrow = q_heads * D, krow = kv_heads * D, group = q_heads / kv_heads;
+    const float scale = 1.f / sycl::sqrt((float) D);
+    const auto e = queue_for(stream).submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> qs(D, h), ps(TILE, h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * q_heads * D)), sycl::range<1>(D)),
+                       [=](sycl::nd_item<1> it) {
+            const auto g = static_cast<int64_t>(it.get_group_linear_id());
+            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+            const int64_t t = g / q_heads, hh = g - t * q_heads, kh = hh / group;
+            qs[lane] = f32_from_f16(q16[t * qrow + hh * D + lane]) * scale;
+            sycl::group_barrier(it.get_group());
+            const int64_t keys = t + 1;
+            float m = -INFINITY, l = 0.f, acc = 0.f;
+            for (int64_t j0 = 0; j0 < keys; j0 += TILE) {
+                const int64_t j = j0 + lane;
+                float s = -INFINITY;
+                if (j < keys) {
+                    const uint16_t* kr = k16 + j * krow + kh * D;
+                    s = 0.f;
+                    for (int64_t d = 0; d < D; ++d) s += qs[d] * f32_from_f16(kr[d]);
+                }
+                const float nm = sycl::fmax(m, sycl::reduce_over_group(it.get_group(), s, sycl::maximum<float>()));
+                const float p = j < keys ? sycl::exp(s - nm) : 0.f;
+                const float corr = sycl::exp(m - nm);
+                l = l * corr + sycl::reduce_over_group(it.get_group(), p, sycl::plus<float>());
+                ps[lane] = p;
+                sycl::group_barrier(it.get_group());
+                acc *= corr;
+                const int64_t n = sycl::min(TILE, keys - j0);
+                for (int64_t jj = 0; jj < n; ++jj) acc += ps[jj] * f32_from_f16(v16[(j0 + jj) * krow + kh * D + lane]);
+                sycl::group_barrier(it.get_group());
+                m = nm;
+            }
+            out[t * qrow + hh * D + lane] = acc / l;
+        });
+    });
+    finish(stream, e, "qi_attention_causal");
+}
+
 void qi_swiglu16(const float* gu, int64_t T, int64_t inter, uint16_t* h16, void* stream) {
     if (T <= 0) return;
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * inter)), [=](sycl::id<1> id) {

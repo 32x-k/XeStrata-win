@@ -1,0 +1,75 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// src/image/qi_text_probe.cpp - strata-image-text-probe: the image model's text encoder on the GPU against
+// stable-diffusion.cpp's of one run (its te_tokens_0 and te_hidden_0: the prompt's ids and the last block's output).
+//
+//   strata-image-text-probe TEXT_ENCODER.gguf DUMP_DIR
+//
+// Prints how far the states are from the run's (all rows, and the rows after the 14 of the system turn: the DiT's
+// context) and the encoder's time.
+
+#include "strata/core/runtime.hpp"
+#include "strata/image/qi_text.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <fstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+template<class T> std::vector<T> load(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open " + path);
+    std::vector<char> raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::vector<T> v(raw.size() / sizeof(T));
+    std::copy(raw.begin(), raw.end(), reinterpret_cast<char*>(v.data()));
+    return v;
+}
+
+void compare(const char* what, const float* got, const float* want, size_t n) {
+    double dot = 0, ng = 0, nw = 0, err = 0, mag = 0;
+    for (size_t i = 0; i < n; ++i) {
+        dot += (double) got[i] * want[i];
+        ng += (double) got[i] * got[i];
+        nw += (double) want[i] * want[i];
+        err += std::fabs((double) got[i] - want[i]);
+        mag += std::fabs((double) want[i]);
+    }
+    std::printf("%-8s cos %.6f  rel %.3g\n", what, dot / std::sqrt(ng * nw), err / mag);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    if (argc < 3) {
+        std::fprintf(stderr, "usage: %s TEXT_ENCODER.gguf DUMP_DIR\n", argv[0]);
+        return 2;
+    }
+    try {
+        void* s = strata::core::Runtime::get().create_stream();
+        strata::image::QiText te;
+        std::string err;
+        if (!te.open(argv[1], s, err)) throw std::runtime_error(err);
+        const std::string dir = argv[2];
+        const auto ids = load<int32_t>(dir + "/te_tokens_0.bin");
+        const auto want = load<float>(dir + "/te_hidden_0.bin");
+        te.encode(ids);   // a warm-up
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto got = te.encode(ids);
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const auto C = (size_t) te.hidden();
+        compare("all", got.data(), want.data(), got.size());
+        if (ids.size() > 14) compare("context", got.data() + 14 * C, want.data() + 14 * C, got.size() - 14 * C);
+        std::printf("text encoder: %.2f GB, %zu tokens in %.3f s\n", (double) te.weight_bytes() / 1e9, ids.size(),
+                    secs);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "strata-image-text-probe: %s\n", e.what());
+        return 1;
+    }
+    return 0;
+}

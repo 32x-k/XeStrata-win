@@ -66,6 +66,18 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# `qwen2` (Qwen3-VL-8B, the image model's text encoder): llama.cpp's LLAMA_VOCAB_PRE_TYPE_QWEN2 (`src/llama-vocab.cpp`
+# L389 at de7fa0a3), the qwen35 shape with `\p{L}` alone (no combining marks).
+QWEN2_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 # `glm4` and `glm5` (GLM-5.3-Flash): llama.cpp's LLAMA_VOCAB_PRE_TYPE_CHATGLM4 (`src/llama-vocab.cpp` L406 at
 # de7fa0a3), the llama3 shape with `\p{L}` alone, and `ignore_merges` (L2407): a pre-token piece that is itself in
 # the vocabulary is that one token, without running the merges.
@@ -83,6 +95,7 @@ CHATGLM4_PATTERN = (
 # listed is refused: tokenizing it with another type's pattern gives plausible tokens the model was not trained on.
 PRE_TYPES = {
     "qwen35": (QWEN35_PATTERN, False, ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
+    "qwen2": (QWEN2_PATTERN, False, "llama.cpp de7fa0a3 src/llama-vocab.cpp L389 (LLAMA_VOCAB_PRE_TYPE_QWEN2)"),
     "glm4": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
     "glm5": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
 }

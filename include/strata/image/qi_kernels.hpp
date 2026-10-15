@@ -41,6 +41,18 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
 /// The path qi_attention takes on the current GPU, for the report.
 const char* qi_attention_path();
 
+/// The text encoder's q and k ([T][q_heads * head_dim], [T][kv_heads * head_dim]): each head RMS-normed (wq, wk; eps
+/// 1e-6), then rotated as NEOX does (pair (j, j + head_dim / 2) by position t times theta^(-2j / head_dim)); FP16 out,
+/// v as v16.
+void qi_text_qk_rope16(const float* q, const float* k, const float* v, const float* wq, const float* wk, int64_t T,
+                       int64_t q_heads, int64_t kv_heads, int64_t head_dim, float theta, uint16_t* q16, uint16_t* k16,
+                       uint16_t* v16, void* stream);
+
+/// Causal attention with grouped K/V heads (query head h reads K/V head h / (q_heads / kv_heads)): out [T][q_heads *
+/// head_dim] FP32, the plain form (the text encoder's few tokens).
+void qi_attention_causal(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t q_heads,
+                         int64_t kv_heads, int64_t head_dim, float* out, void* stream);
+
 /// h16[t, i] = gu[t, inter + i] * silu(gu[t, i]) (the fused gate_up product: gate first, then up).
 void qi_swiglu16(const float* gu, int64_t T, int64_t inter, uint16_t* h16, void* stream);
 
