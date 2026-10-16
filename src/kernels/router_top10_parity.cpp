@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -95,6 +96,36 @@ int run_case(const char* name, const std::vector<float>& logits, int n_tokens, i
     return (int) (id_bad + w_bad);
 }
 
+// The fast kernel (router_top10_set_variant 1, and 2 with its serial sum forced) against the work-group one (0): the
+// ids and weights must be BITWISE the same, on rows with ties, near-ties, a dominant expert and NaN.  Where the device
+// has no FP64 all three run the work-group kernel, so it passes trivially there.
+int run_variants(const std::vector<float>& logits, int n_tokens, int n_expert, int k) {
+    strata::parity::Device dev;
+    float* d_l = dev.upload(logits);
+    int* d_ids = dev.alloc<int>((size_t) n_tokens * k);
+    float* d_w = dev.alloc<float>((size_t) n_tokens * k);
+    std::vector<int> ids[3];
+    std::vector<float> w[3];
+    for (int v = 0; v < 3; ++v) {
+        ids[v].assign((size_t) n_tokens * k, -7);
+        w[v].assign((size_t) n_tokens * k, -7.0f);
+        strata::parity::copy_in(d_ids, ids[v].data(), ids[v].size());   // the same "previous contents" for the
+        strata::parity::copy_in(d_w, w[v].data(), w[v].size());           // ranks a NaN row leaves unwritten
+        strata::kernels::router_top10_set_variant(v);
+        strata::kernels::router_top10(d_l, n_tokens, n_expert, k, d_ids, d_w, nullptr);
+        strata::parity::copy_out(ids[v].data(), d_ids, ids[v].size());
+        strata::parity::copy_out(w[v].data(), d_w, w[v].size());
+    }
+    strata::kernels::router_top10_set_variant(-1);
+    long long bad = 0;
+    for (int v = 1; v < 3; ++v)
+        for (size_t i = 0; i < ids[0].size(); ++i)
+            if (ids[v][i] != ids[0][i] || std::memcmp(&w[v][i], &w[0][i], sizeof(float)) != 0) ++bad;
+    std::printf("  %-26s %d rows: fast and fast-serial against the work-group kernel: %s (%lld differ)\n",
+                "fast kernel, bitwise", n_tokens, bad ? "*** DIFFERENT ***" : "identical", bad);
+    return (int) bad;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -132,6 +163,25 @@ int main(int argc, char** argv) {
     std::vector<float> d((size_t) NT * NE, 0.0f);
     for (int t = 0; t < NT; ++t) d[(size_t) t * NE + (t % NE)] = 20.0f;
     bad += run_case("dominant expert", d, NT, NE, K, 1e-5);
+
+    // ---- the fast kernel against the work-group one: 8192 rows of every kind above, near-ties, and NaN rows
+    {
+        const int NV = 8192;
+        std::vector<float> v((size_t) NV * NE);
+        std::uniform_int_distribution<int> pick(0, NE - 1);
+        for (int t = 0; t < NV; ++t) {
+            float* row = &v[(size_t) t * NE];
+            const int kind = t % 6;
+            for (int e = 0; e < NE; ++e) row[e] = kind == 1 ? 0.5f : gauss(rng) * (kind == 5 ? 8.0f : 1.0f);
+            if (kind == 2)
+                for (int e = 0; e < 12; ++e) row[pick(rng)] = 2.0f;                         // exact ties
+            if (kind == 3)
+                for (int e = 0; e < 16; ++e) row[e] = 1.0f + (float) e * 1e-7f;             // near-ties
+            if (kind == 4) row[t % NE] = 20.0f;                                             // dominant
+            if (t % 97 == 0) row[pick(rng)] = std::nanf("");                                // NaN rows
+        }
+        bad += run_variants(v, NV, NE, K);
+    }
 
     // ---- THE CLAMP CANNOT TRIGGER, and that is provable rather than untested.
     // The sum of the top k of a probability vector over n outcomes is at least k/n (the minimum is the uniform

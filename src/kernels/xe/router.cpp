@@ -143,11 +143,139 @@ sycl::event router_top10_launch(sycl::queue& q, const float* logits, int n_token
         });
     });
 }
+// The same router, BIT-IDENTICAL, without its serial parts (Strata's router_top10_fast_kernel, its HIP build's;
+// here for every device with FP64).  The kernel above spends its time in the 512 dependent double adds of the serial
+// sum (FP64 is slow on consumer GPUs), the ten selection passes' 20 work-group barriers and the renormalisation's
+// reads of its ten weights back from global memory: 84 us a call on the R9700 against 12 us here.  Here:
+//   * the sum's only use is inv = (float) (1 / sum).  Every term is positive and the largest is exactly 1, so the
+//     serial sum and a tree sum both lie within 2^-43 (relative) of the exact sum; 1 / x and the float cast are
+//     monotone, so when [tree (1 - 2^-40), tree (1 + 2^-40)] maps to ONE float, that float is the serial sum's.
+//     Otherwise (about 1 row in 1000, or a non-finite sum) work-item 0 runs the serial sum as before;
+//   * the selection runs on sub-group 0 alone with the probabilities in registers (16 a lane, n_expert <= 512): the
+//     largest p with the lowest index on ties is unique, so the butterfly finds the expert the work-group did;
+//   * the renormalisation sums the k (<= 32) weights in rank order from registers and divides them in parallel.
+std::atomic<int> generic_variant{-1};   // -1: from STRATA_ROUTER_OLD; 0 the kernel above, 1 this one, 2 its serial sum
+constexpr int RF_PER = 16;
+template <bool FORCE_SERIAL>
+sycl::event router_top10_fast_launch(sycl::queue& q, const float* logits, int n_tokens, int n_expert, int k, int* ids,
+                                     float* weights, int threads, int nw) {
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<double, 1> s_ex(sycl::range<1>((size_t) n_expert), h);
+        sycl::local_accessor<float, 1> s_red(sycl::range<1>(RT_MAX_THREADS / WARP), h);
+        sycl::local_accessor<double, 1> s_dred(sycl::range<1>(RT_MAX_THREADS / WARP), h);
+        sycl::local_accessor<float, 1> s_inv(sycl::range<1>(1), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) n_tokens * threads, threads),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const auto g = it.get_group();
+            const sycl::sub_group sg = it.get_sub_group();
+            const int t = (int) it.get_group(0);
+            const int tid = (int) it.get_local_id(0), nt = threads;
+            const int warp = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+            const float* l = logits + (size_t) t * n_expert;
+            // the max: as the kernel above (exact, order-independent)
+            float mx = -INFINITY;
+            for (int x = tid; x < n_expert; x += nt) mx = sycl::fmax(mx, l[x]);
+            mx = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+            if (lane == 0) s_red[warp] = mx;
+            sycl::group_barrier(g);
+            if (warp == 0) {
+                float v = lane < nw ? s_red[lane] : -INFINITY;
+                v = sycl::reduce_over_group(sg, v, sycl::maximum<float>());
+                if (lane == 0) s_red[0] = v;
+            }
+            sycl::group_barrier(g);
+            mx = s_red[0];
+            // the exponentials (the same expression), and a tree sum of them for the bracket
+            double part = 0.0;
+            for (int x = tid; x < n_expert; x += nt) {
+                const double e = sycl::exp((double) l[x] - (double) mx);
+                s_ex[x] = e;
+                part += e;
+            }
+            for (int off = 16; off > 0; off >>= 1) part += sycl::permute_group_by_xor(sg, part, off);
+            if (lane == 0) s_dred[warp] = part;
+            sycl::group_barrier(g);
+            double tot = 0.0;
+            for (int w = 0; w < nw; ++w) tot += s_dred[w];
+            const double lo = tot * (1.0 - 0x1p-40), hi = tot * (1.0 + 0x1p-40);
+            const float f_lo = (float) (1.0 / hi), f_hi = (float) (1.0 / lo);
+            float inv;
+            if (!FORCE_SERIAL && tot >= 1.0 && hi < 1e300 && f_lo == f_hi) {
+                inv = f_lo;
+            } else {   // uniform over the work-group (every work-item computed the same tot): the serial sum
+                if (tid == 0) {
+                    double sum = 0.0;
+                    for (int x = 0; x < n_expert; ++x) sum += s_ex[x];
+                    s_inv[0] = (float) (1.0 / sum);
+                }
+                sycl::group_barrier(g);
+                inv = s_inv[0];
+            }
+            if (warp != 0) return;
+            // sub-group 0: lane holds experts lane + 32 j; p is the kernel above's expression
+            float pv[RF_PER];
+            unsigned live = 0;
+#pragma unroll
+            for (int j = 0; j < RF_PER; ++j) {
+                const int x = lane + WARP * j;
+                pv[j] = -INFINITY;
+                if (x < n_expert) { pv[j] = (float) (s_ex[x] * inv); live |= 1u << j; }
+            }
+            float my_w = 0.0f;
+            int my_id = 0, nsel = 0;
+            for (int i = 0; i < k; ++i) {
+                float bv = -INFINITY;
+                int bi = n_expert;   // a sentinel that loses to every real index
+#pragma unroll
+                for (int j = 0; j < RF_PER; ++j)
+                    if (((live >> j) & 1u) && pv[j] > bv) { bv = pv[j]; bi = lane + WARP * j; }
+                for (int off = 16; off > 0; off >>= 1)
+                    better(bv, bi, sycl::permute_group_by_xor(sg, bv, off), sycl::permute_group_by_xor(sg, bi, off));
+                if (bi >= n_expert) break;   // as the kernel above: no rank i or later is written (every p left is NaN)
+                if ((bi & (WARP - 1)) == lane) live &= ~(1u << (bi / WARP));
+                if (lane == i) { my_w = bv; my_id = bi; }
+                nsel = i + 1;
+            }
+            if (nsel == k) {
+                double s = 0.0;
+                for (int i = 0; i < k; ++i) s += (double) sycl::select_from_group(sg, my_w, i);
+                const double sc = sycl::fmax(s, 6.103515625e-05);       // 2**-14
+                if (lane < k) {
+                    ids[(size_t) t * k + lane] = my_id;
+                    weights[(size_t) t * k + lane] = (float) ((double) my_w / sc);
+                }
+            } else {   // the kernel above's tail exactly: unwritten ranks keep the buffer's contents, renormalised
+                if (lane < nsel) { ids[(size_t) t * k + lane] = my_id; weights[(size_t) t * k + lane] = my_w; }
+                sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::work_group);
+                sycl::group_barrier(sg);
+                if (lane == 0) {
+                    double s = 0.0;
+                    for (int i = 0; i < k; ++i) s += (double) weights[(size_t) t * k + i];
+                    const double sc = sycl::fmax(s, 6.103515625e-05);
+                    for (int i = 0; i < k; ++i)
+                        weights[(size_t) t * k + i] = (float) ((double) weights[(size_t) t * k + i] / sc);
+                }
+            }
+        });
+    });
+}
+
+int generic_router_variant() {
+    int v = generic_variant.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* old = std::getenv("STRATA_ROUTER_OLD");
+        v = old != nullptr && std::atoi(old) != 0 ? 0 : 1;
+        generic_variant.store(v, std::memory_order_relaxed);
+    }
+    return v;
+}
 }  // namespace
+
+void router_top10_set_variant(int variant) { generic_variant.store(variant, std::memory_order_relaxed); }
 
 // One work-group per token.  See the CUDA file for why each step is shaped as it is: the max is an exact tree, the
 // exponentials are computed once in parallel in double, the double sum stays serial and ascending, and the top k
-// are k passes of a stable argmax.
+// are k passes of a stable argmax.  With FP64, n_expert <= 512 and k <= 32 the fast kernel above, bit-identical.
 void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
                   void* stream) {
     if (n_tokens <= 0 || n_expert <= 0 || k <= 0) return;
@@ -159,7 +287,13 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
     threads = (threads + WARP - 1) & ~(WARP - 1);                  // whole sub-groups, for the reductions
     const int nw = threads / WARP;
     auto& q = queue_for(stream, false);
-    const auto e = xe::has_fp64(q)
+    const int variant = generic_router_variant();
+    const bool fast = variant != 0 && xe::has_fp64(q) && n_expert <= WARP * RF_PER && k <= WARP;
+    const auto e = fast ? (variant == 2 ? router_top10_fast_launch<true>(q, logits, n_tokens, n_expert, k, ids, weights,
+                                                                         threads, nw)
+                                        : router_top10_fast_launch<false>(q, logits, n_tokens, n_expert, k, ids,
+                                                                          weights, threads, nw))
+                 : xe::has_fp64(q)
                        ? router_top10_launch<double>(q, logits, n_tokens, n_expert, k, ids, weights, threads, nw)
                        : router_top10_launch<float>(q, logits, n_tokens, n_expert, k, ids, weights, threads, nw);
     if (!stream) core::Runtime::get().wait(e, "router_top10");

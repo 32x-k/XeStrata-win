@@ -20,4 +20,9 @@ namespace strata::kernels {
 void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
                   void* stream);
 
+// Which kernel router_top10 runs, for tests: 0 the work-group one, 1 the fast one (the default where the device has
+// FP64, n_expert <= 512 and k <= 32; STRATA_ROUTER_OLD=1 picks 0), 2 the fast one with its serial sum forced.
+// Both give bitwise the same ids and weights.
+void router_top10_set_variant(int variant);
+
 }  // namespace strata::kernels
