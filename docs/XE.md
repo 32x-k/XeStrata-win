@@ -419,11 +419,10 @@ The records above were taken before that and compare tokens only.
 Where the draft modes differ, there are two causes:
 
 - The MTP runs had fewer cached experts (the drafter takes VRAM), so some experts ran on the CPU instead of the GPU.
-- On Qwen IQ3_XXS, the suffix run differs from the no-draft run even with the same cache.
-  The CPU's multi-token expert kernels (IQ3_XXS gate/up and IQ4_NL down) sum in a different order from ggml's single-token dot.
-  With the CPU held to ggml's dot (`STRATA_NO_IQ256=1 STRATA_NO_IQ512=1 STRATA_NO_IQ4NL=1`) the draft modes give bit-identical logits,
-  so the GPU side of a multi-token window adds no difference.
-  The difference is kept: it moves only near-ties.
+- On Qwen IQ3_XXS, the suffix run differed from the no-draft run even with the same cache.
+  The CPU took its multi-token expert kernels (i-quant gate/up and IQ4_NL down) from two tokens on and ggml's single-token dot for one, so a token's rows were summed in another order alone than in a window.
+  From 2026-10-16 the CPU computes these and Q4_K, Q5_K and Q6_K with the multi-token kernels from one token on, and Q2_K, Q3_K and Q8_0 with ggml's dot at every token count. A token's rows are the same alone and in a window, and with the same cache the draft modes give bit-identical logits (the GPU side of a multi-token window added no difference before either).
+  `STRATA_IQ_MT_MIN=N` takes the multi-token kernels from N tokens as before (for comparisons).
 
 ### Why outputs change from run to run
 

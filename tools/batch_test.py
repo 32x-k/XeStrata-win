@@ -86,7 +86,7 @@ def main():
     ap.add_argument("--long-tokens", type=int, default=0,
                     help="the LAST prompt is read from about this many tokens of filler text first: its chunks run "
                          "beside the earlier slots' windows (the prompt path lends experts then)")
-    ap.add_argument("--mt-min", default="1", help="STRATA_IQ_MT_MIN for the engine (1: exact; empty: the default)")
+    ap.add_argument("--mt-min", default="", help="STRATA_IQ_MT_MIN for the engine (empty: the default, which is exact)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text())
     tok = tokenizer(cfg["tokenizer"])
