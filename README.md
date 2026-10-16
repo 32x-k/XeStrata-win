@@ -133,7 +133,7 @@ Values are tok/s; those measured twice are averages.
 
 Sent 20 questions in a row, `--serve` answered all 20, at 93 tok/s overall (Strata: 95 tok/s).
 
-decode is slower than Strata's mainly because computing on the CPU the experts the GPU cache does not hold takes longer: more of them go to the CPU than in Strata, while the GPU's verify and MTP's drafting take about as long as Strata's.
+One verify of speculative decoding takes about as long as Strata's (2026-10-16, a 50-token prompt: 22.9 ms and 23.1 ms). The decode difference comes from how many drafts are accepted: the sums are added in another order, so the output text differs a little, and with it how the drafts hit, so the difference varies with the prompt.
 
 ---
 
