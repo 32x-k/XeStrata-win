@@ -35,11 +35,10 @@ It keeps taking in upstream's releases; it now includes upstream XeStrata's main
 - The OpenAI-compatible API with `--serve` and `serve/server.py`
 - The native pack (`tools/iq_pack.py`), speculative decoding with MTP, `--resident-experts`, and prefill on rocBLAS
 
-These four things differ from upstream.
+These three things differ from upstream.
 
 - On Windows it comes as a zip, not a 7z, and `xestrata-cli.bat` installs and starts it on the console in place of upstream's `xestrata.exe` (the .NET window). The deb and rpm packages are for Linux.
 - On Windows, the RAM copy of the experts is page-locked by default only when HIP sees one GPU (and the RAM has room for it). With two or more GPUs seen by HIP (the processor's graphics included), the GPU can fail at an allocation after a large page-locked one. Choosing the GPU with `ONEAPI_DEVICE_SELECTOR=hip:N` makes XeStrata narrow `HIP_VISIBLE_DEVICES` to the same GPU.
-- The adaptive cache is slow to swap experts, and `--adapt-every 0` runs faster.
 - `--gpu-stages` does not work with the native pack.
 
 ### Installing (Windows, AMD and Intel GPUs)
@@ -133,7 +132,7 @@ Values are tok/s; those measured twice are averages.
 
 Sent 20 questions in a row, `--serve` answered all 20, at 93 tok/s overall (Strata: 95 tok/s).
 
-One verify of speculative decoding takes about as long as Strata's (2026-10-16, a 50-token prompt: 22.9 ms and 23.1 ms). The sums are added in another order, so the output text differs a little, and with it how the drafts hit, so the decode difference varies with the prompt. The table's 50-token prompt is one where this branch's drafts hit less. Over 12 prompts of different content, 300 tokens each, about as many drafts were accepted (2,011 and 2,016), and decode ran at 98.5 tok/s on this branch and 86.4 tok/s on Strata (this branch faster on all 12).
+One verify of speculative decoding takes about as long as Strata's (2026-10-16, a 50-token prompt: 22.9 ms and 23.1 ms). The sums are added in another order, so the output text differs a little, and with it how many MTP drafts are accepted, so the decode difference varies with the prompt. The table's 50-token prompt is one where fewer of this branch's drafts are accepted. Over 12 prompts of different content sent to one server in turn, 300 tokens each, about as many MTP drafts were accepted (2,011 and 2,016; acceptance 0.667 and 0.683), and decode ran at 98.5 tok/s on this branch and 86.4 tok/s on Strata (this branch faster on all 12). With the adaptive cache's swaps at their default (`--adapt-every 4`), this branch ran at 104.5 tok/s.
 
 ---
 
