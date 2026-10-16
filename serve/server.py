@@ -68,6 +68,7 @@ from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import release_check  # noqa: E402
+from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
@@ -863,6 +864,7 @@ class StrataEngine:
         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env,
                           **pin)
+        contain(self.proc)                               # ends with the server, however it ends (Windows)
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
         ready_q: queue.Queue = queue.Queue()
@@ -2371,6 +2373,7 @@ class Vision:
         self.proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
                           cwd=self.dir)
+        contain(self.proc)
         self.lines: queue.Queue = queue.Queue()    # its stdout, read on a thread so that a wait can time out
         threading.Thread(target=self._read, args=(self.proc, self.lines), daemon=True).start()
         line = self._line(VISION_READY_S)

@@ -34,6 +34,8 @@ import time
 import urllib.error
 import urllib.request
 
+from serve.winjob import contain
+
 PROTOCOL = "2025-06-18"               # the MCP revision Strata asks for; the server's answer is used as given
 DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0}
 
@@ -108,6 +110,7 @@ class StdioTransport:
                                          cwd=self.cfg.get("cwd") or None, env=env, **extra)
         except OSError as e:
             raise McpError(f"could not start {command!r}: {e}") from None
+        contain(self.proc)                              # ends with the server, however it ends (Windows)
         self._err_reader = threading.Thread(target=self._read_stderr, daemon=True)
         self._err_reader.start()
         threading.Thread(target=self._read, daemon=True).start()
