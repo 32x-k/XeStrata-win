@@ -307,7 +307,7 @@ The engine's options (added to the settings' `args`):
 | `--max-context N` | the KV cache's tokens (setup picks it from the GPU's VRAM) |
 | `--expert-profile PATH` | fill the experts in VRAM in this profile's order at start |
 | `--expert-profile-save PATH` | write what this run learned as a profile |
-| `--adapt-every N` | windows between swaps of the experts in VRAM (default 4; 0: no swaps) |
+| `--adapt-every N` | how often the experts in VRAM are swapped: at every 4N-th token of a request, the windows cut there, so the text does not depend on the drafting (the batch slots, `--pipeline-windows` and `--adapt-async`: every N windows) (default 4; 0: no swaps) |
 | `--adapt-swaps N` | the most experts one swap moves (default 96; the one right after a prompt moves up to 2,048, those the prompt used most, and fills every free slot with any expert it used) |
 | `--adapt-mib-per-token N` | the swaps copy at most N MiB for each token read since the last one (default 48; 0: no bound) |
 | `--mmap-experts` | read the experts from the model file instead of loading them into RAM |

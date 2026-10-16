@@ -7829,6 +7829,13 @@ int main(int argc, char** argv) {
                                  "a round every %d windows%s\n", (long long) a_cap, o.adapt_every,
                          a_arena ? " (arena: copy-in only)" : "");
         }
+        // the adaptive tier at fixed positions of the text, as the generate loop's (window-invariant output, #152):
+        // the serial loop of one request; the batch slots, the pipelined windows and --adapt-async keep the per-window
+        // rule (each window's rows counted, a round every --adapt-every windows)
+        const int64_t adapt_period =
+            !drive.d.usage.empty() && !ajob && o.batch <= 0 && o.pipeline_windows < 2 ? 4 * (int64_t) o.adapt_every : 0;
+        drive.d.usage_by_window = adapt_period > 0;
+        for (int st = 0; st < n_stages; ++st) stage_ver(st).set_route_record(adapt_period > 0);
         // the pipelined loop's side (see above): whether stage `st` has no window in flight; per home, the copies back
         // and in to queue at its next gap, the RAM fence still to pass and the gaps seen
         std::function<bool(int)> a_pl_idle;
@@ -11188,6 +11195,11 @@ int main(int argc, char** argv) {
                         chain_n = policy.chain(T, p_mtp, chain_n, cm);
                     }
                 }
+                if (adapt_period > 0) {   // the window ends at the adaptive tier's next position
+                    const int lim = (int) std::min<int64_t>(S, (p / adapt_period + 1) * adapt_period - p);
+                    T = std::min(T, lim);
+                    chain_n = std::max(0, std::min(chain_n, lim - T));
+                }
                 const int T_mtp = T;
                 T += chain_n;
                 const bool timed_round = !first_window;
@@ -11258,7 +11270,10 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
-                if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
+                if (adapt_period > 0)
+                    for (int st = 0; st < n_stages; ++st) stage_ver(st).add_routing(drive.d.usage.data(), g.n_expert, a + 1);
+                if (!drive.d.usage.empty() && !ajob &&
+                    (adapt_period > 0 ? (p + a + 1) / adapt_period > p / adapt_period : ((rounds + 1) % o.adapt_every) == 0))
                     adapt_thr = std::thread([&] {
                         strata::aux_cpus::pin_current_thread();
                         const Clock::time_point ta = Clock::now();
@@ -12103,6 +12118,16 @@ int main(int argc, char** argv) {
         setup_pcie_split(drive.d, g.n_layers, o, pcie_given, !split_devs.empty(), ver.fetch_branch(), pcie_split);
         const int64_t pcie0 = drive.d.pcie_experts;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        // the adaptive tier at fixed positions of the text: it counts the routing of the rows whose input was the
+        // text (Verifier::add_routing) and swaps when a window ends on a multiple of 4 x --adapt-every tokens, the
+        // windows cut there.  Counted per window (every row, the rejected drafts' too) and swapped every N windows,
+        // which experts ran on the CPU and which on the GPU (they round differently) depended on the drafting, and a
+        // greedy text with windows of 4 parted from the one with windows of 1 by the fifth token (2026-10-16, RTX 4070).
+        // The cut windows cost decode 1.3% there (16 prompts on one text: 57.2 -> 56.5 tok/s); every 32 or 64 tokens
+        // with the swaps and the decay scaled to the same rate was slower still (56.0, 55.7)
+        const int64_t adapt_period = drive.d.usage.empty() ? 0 : 4 * (int64_t) o.adapt_every;
+        drive.d.usage_by_window = adapt_period > 0;
+        ver.set_route_record(adapt_period > 0);
         int64_t swaps_total = 0;
         double ms_adapt = 0;
         strata::gpu::Stream adapt_stream = drive.d.usage.empty() ? nullptr : strata::gpu::stream_create();
@@ -12285,7 +12310,8 @@ int main(int argc, char** argv) {
             // The window's rows sit at p .. p + T - 1, and past the context there is no cell to verify them in: near
             // its end the window takes only the rows that fit (the admission checked the prompt and max_new, which a
             // full window can overrun)
-            const int room = (int) std::min<int64_t>(o.spec, o.max_context - p);
+            int room = (int) std::min<int64_t>(o.spec, o.max_context - p);
+            if (adapt_period > 0) room = (int) std::min<int64_t>(room, (p / adapt_period + 1) * adapt_period - p);
             T = std::min(T, room);
             // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
             int chain_n = 0, cm = 0;
@@ -12367,7 +12393,8 @@ int main(int argc, char** argv) {
             // GPU commits and drafts; it touches only the residency tables, which nothing reads until the next window
             std::thread adapt_thr;
             bool adapt_ok = true;
-            if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
+            if (adapt_period > 0) ver.add_routing(drive.d.usage.data(), g.n_expert, a + 1);
+            if (adapt_period > 0 && (p + a + 1) / adapt_period > p / adapt_period)
                 adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
             if (!ver.commit(a + 1, err)) {
                 if (adapt_thr.joinable()) adapt_thr.join();
@@ -12499,8 +12526,8 @@ int main(int argc, char** argv) {
                         drive.d.ms_plan / (double) rounds, drive.d.ms_actq / (double) rounds, drive.d.ms_jobs / (double) rounds,
                         drive.d.ms_run / (double) rounds);
         if (rounds > 0 && !drive.d.usage.empty())
-            std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
-                        (long long) swaps_total, o.adapt_every, ms_adapt / (double) rounds);
+            std::printf("%-24s %lld experts swapped into the VRAM tier (every %lld tokens, %.3f ms/round)\n", "adaptive tier",
+                        (long long) swaps_total, (long long) adapt_period, ms_adapt / (double) rounds);
         if (rounds > 0 && drive.d.pcie_num > 0)
             std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 of the misses)\n",
                         "pcie experts", (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers),
