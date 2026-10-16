@@ -2101,10 +2101,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     !helper_holds(e)) ++nmiss;
             }
         }
-        // STRATA_ROUTE_TAIL_SKIP=R (upstream 65268d99; opt-in, changes the output): a missed expert that EVERY token of
-        // the window routes only at rank >= R (the smallest weights of the top-k) is neither copied nor computed; its
-        // contribution is zero, without renormalisation (the others keep the weight the router gave them).  Less PCIe
-        // and CPU work.  Not with a helper GPU, which may hold it.
+        // STRATA_ROUTE_TAIL_SKIP=R (upstream 65268d99; opt-in, changes the output): a missed expert routed at rank >= R
+        // (the smallest weights of the top-k) contributes zero to that token, without renormalisation (the others keep
+        // the weight the router gave them); one that EVERY token of the window routes that low is neither copied nor
+        // computed.  Less PCIe and CPU work.  Per entry, not per expert: upstream zeroed a token's low-ranked expert
+        // only when no other token of the window needed it, so a token's output depended on the window's other rows
+        // (window-invariant output, #152).  Not with a helper GPU, which may hold it.
         const int tail_rank = tail_skip_rank();
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
@@ -2190,7 +2192,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
             }
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) kind[i] = kd;
+                if (first_of[i] == i0) kind[i] = kd != 0 && tail_rank > 0 && d.remote_count == 0 && i % k >= tail_rank
+                                                     ? -2 : kd;   // a tail entry of a missed expert (above)
             if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
             P.ptr[groups] = ptr;
             P.start[groups] = entries;
@@ -2210,7 +2213,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                                  : P.staging + (unsigned long long) q * (unsigned long long) bb;
             P.start2[q] = entries;
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) {
+                if (first_of[i] == i0 && kind[i] == 1) {
                     P.dst[entries] = (int32_t) i;
                     P.tok[entries] = (int32_t) (i / k);
                     ++entries;

@@ -165,7 +165,7 @@ They were carried one by one by hand.
 
 The main ones:
 
-- On serve's decode, `STRATA_ROUTE_TAIL_SKIP=7` (default): a missed expert that every token of a verify window routes at rank 7 or lower is neither read nor computed. Upstream keeps it off on HIP; XeStrata measured the KL, a task check and the speed again on the three makers' GPUs and turned it on for all of them.
+- On serve's decode, `STRATA_ROUTE_TAIL_SKIP=7` (default): a missed expert a token routes at rank 7 or lower contributes zero to that token (decided for each token, not for the window), and one that every token of a verify window routes that low is neither read nor computed. Upstream keeps it off on HIP; XeStrata measured the KL, a task check and the speed again on the three makers' GPUs and turned it on for all of them.
 - `STRATA_ROUTE_RESIDENT` and `STRATA_ROUTE_PRIOR`, which lean a verify window's routing towards the experts in VRAM (both opt-in; they change the answers).
 - The prefill CPU share's extension (experts in RAM that is not page-locked as well) and the rule that leaves it off by default when every expert is in VRAM or memory is short.
 - `--aux-cpus` (opt-in), `--ple-io direct` falling back to mmap when it measures slow, the stager's RAM profile, the embedding buffer's reuse.

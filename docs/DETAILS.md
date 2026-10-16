@@ -65,10 +65,11 @@ It speeds up handing back a given text nearly as it was, and slows ordinary chat
 (B70, IQ2_XS, K=3: rewriting a document 109.6 → 129.2, ordinary chat 71.1 → 68.3 tokens/s).
 `--lookup-chain-min M` is the match it needs before adding any (default 3 tokens).
 
-In the server's decode, a missed expert (not in VRAM) that every token of a verify window routes only at rank 7 or
-lower (the 8th to 10th of the top 10, the smallest weights) is neither read nor computed (`STRATA_ROUTE_TAIL_SKIP`,
-default 7, upstream b4e3407b). Its contribution is zero and the other experts keep their weights (no renormalisation),
-so the answers differ slightly.
+In the server's decode, a missed expert (not in VRAM) that a token routes at rank 7 or lower (the 8th to 10th of the
+top 10, the smallest weights) contributes zero to that token, and one that every token of a verify window routes that
+low is neither read nor computed (`STRATA_ROUTE_TAIL_SKIP`, default 7, upstream b4e3407b). The other experts keep their
+weights (no renormalisation), so the answers differ slightly. Upstream zeroes it only when no other token of the window
+needs the expert, so a token's output depended on the window's other rows; here it is decided for each token.
 It does nothing when every expert is in VRAM (nothing is skipped), with `--batch` and with a helper cache
 (`--expert-cache-device1..3`); on a layer split each stage skips its own.
 It is not on by default either when 90% or more of the experts are in VRAM (upstream's #1884: the misses are few and the

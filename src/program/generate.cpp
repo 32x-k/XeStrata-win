@@ -7618,8 +7618,8 @@ int main(int argc, char** argv) {
             if (tse == nullptr && !all_experts_resident && !nearly_all_cached && o.batch <= 0 && !helper)
                 strata::core::set_tail_skip_rank(7);
             if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
-                std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert that every token of a "
-                                     "verify window routes at rank %d or lower is skipped (answers differ slightly); "
+                std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert a token routes at rank "
+                                     "%d or lower contributes zero to it (answers differ slightly); "
                                      "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
                              tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
         }
