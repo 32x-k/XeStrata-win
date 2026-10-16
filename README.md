@@ -133,7 +133,7 @@ Values are tok/s; those measured twice are averages.
 
 Sent 20 questions in a row, `--serve` answered all 20, at 93 tok/s overall (Strata: 95 tok/s).
 
-One verify of speculative decoding takes about as long as Strata's (2026-10-16, a 50-token prompt: 22.9 ms and 23.1 ms). The decode difference comes from how many drafts are accepted: the sums are added in another order, so the output text differs a little, and with it how the drafts hit, so the difference varies with the prompt.
+One verify of speculative decoding takes about as long as Strata's (2026-10-16, a 50-token prompt: 22.9 ms and 23.1 ms). The sums are added in another order, so the output text differs a little, and with it how the drafts hit, so the decode difference varies with the prompt. The table's 50-token prompt is one where this branch's drafts hit less. Over 12 prompts of different content, 300 tokens each, about as many drafts were accepted (2,011 and 2,016), and decode ran at 98.5 tok/s on this branch and 86.4 tok/s on Strata (this branch faster on all 12).
 
 ---
 
