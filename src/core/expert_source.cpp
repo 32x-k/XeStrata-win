@@ -1934,22 +1934,32 @@ bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, doub
     CpuCalJobs cj;
     if (!cpu_cal_jobs(d, n_layers, layer, cj, why)) return false;
     constexpr int kCall = CpuCalJobs::kCall;
-    // the clocks up first (an idle CPU takes tens of ms to raise them; a decode keeps them up), then 1 and 8 experts
-    // a call in turns, 32 calls each, the mean
+    // three rounds, each after 100 ms of calls that keep the clocks up (an idle CPU takes tens of ms to raise them; a
+    // decode keeps them up): 1 and 8 experts a call in turns, 32 calls each, the median; the lowest round.  One round's
+    // mean read an expert 4-8x slow in 2 of 32 starts on the RX 9060 XT's machine (0.18 and 0.39 against 0.05 ms, the
+    // same beside the link: the whole round slow), and the split then sent the missed experts over PCIe for most of a
+    // 256-token decode
     const auto now = [] { return std::chrono::steady_clock::now(); };
-    for (const auto t0 = now(); now() - t0 < std::chrono::milliseconds(100);) {
-        cj.next(kCall);
-        d.pool->run_split_multi_native(cj.f, cj.jobs, kCall);
-    }
-    double ms[2] = {};
-    for (int rep = 0; rep < 32; ++rep)
-        for (int w = 0; w < 2; ++w) {
-            const int k = w == 0 ? 1 : kCall;
-            cj.next(k);
-            const auto t0 = now();
-            d.pool->run_split_multi_native(cj.f, cj.jobs, k);
-            ms[w] += std::chrono::duration<double, std::milli>(now() - t0).count() / 32.0;
+    double ms[2] = {1e30, 1e30};
+    for (int round = 0; round < 3; ++round) {
+        for (const auto t0 = now(); now() - t0 < std::chrono::milliseconds(100);) {
+            cj.next(kCall);
+            d.pool->run_split_multi_native(cj.f, cj.jobs, kCall);
         }
+        double one[2][32];
+        for (int rep = 0; rep < 32; ++rep)
+            for (int w = 0; w < 2; ++w) {
+                const int k = w == 0 ? 1 : kCall;
+                cj.next(k);
+                const auto t0 = now();
+                d.pool->run_split_multi_native(cj.f, cj.jobs, k);
+                one[w][rep] = std::chrono::duration<double, std::milli>(now() - t0).count();
+            }
+        for (int w = 0; w < 2; ++w) {
+            std::nth_element(one[w], one[w] + 16, one[w] + 32);
+            ms[w] = std::min(ms[w], one[w][16]);
+        }
+    }
     c = (ms[1] - ms[0]) / (kCall - 1);
     c0 = std::max(0.0, ms[0] - c);
     if (!(c > 0.0)) { why = "the CPU times did not grow with the experts"; return false; }
@@ -1982,8 +1992,8 @@ namespace {
 // upstream's 45 at a fixed share), and 3.5x beside a busy host, where the split gave the CPU nearly every missed expert
 // (26 against 40 tok/s).  The decode's own pool calls are set against the times the split read for them, and the CPU's
 // times are scaled by the ratio when it is off by more than 15%: after 512 calls with experts on the CPU, then 1,024 and
-// 2,048 more, three updates at most (as upstream's PcieAuto refines its share).  STRATA_PCIE_SPLIT_REFINE=0: the
-// start-up times stay.
+// 2,048 more, three updates at most (as upstream's PcieAuto refines its share), by up to 8x an update (4x left a
+// start-up reading 8x slow at 2x after the first update).  STRATA_PCIE_SPLIT_REFINE=0: the start-up times stay.
 void refine_split(ExpertDispatch& d, bool both, int experts, double ms) {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_PCIE_SPLIT_REFINE");
@@ -2001,7 +2011,7 @@ void refine_split(ExpertDispatch& d, bool both, int experts, double ms) {
     ++r.updates;
     r = ExpertDispatch::SplitRefine{0.0, 0.0, 0, 0, r.updates};
     if (!(ratio > 0.0) || (ratio >= 1.0 / 1.15 && ratio <= 1.15)) return;
-    const double f = std::min(4.0, std::max(0.25, ratio));
+    const double f = std::min(8.0, std::max(0.125, ratio));
     t.c0 *= f;
     t.c *= f;
     t.cb0 *= f;
