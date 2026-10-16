@@ -696,6 +696,9 @@ void usage() {
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
                  "                       the largest chunk up to 32768 whose buffers the expert cache can lend\n"
+                 "  --prefill-cpu-share S  the CPU pool's share of a short chunk's streamed experts where the default\n"
+                 "                       uses the pool (0-1; auto = measured each layer, the default; setup writes\n"
+                 "                       the share it measured, so a prompt reads the same way every run)\n"
                  "  --prefill-experts G  experts the prompt path dequantizes before one grouped product (1-64,\n"
                  "                       default 16; 9.4 MiB of VRAM each, taken from the lent cache slots)\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
@@ -2419,6 +2422,10 @@ int main(int argc, char** argv) {
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
         else if (a == "--prefill-until") o.prefill_until = std::strtoll(next("--prefill-until"), nullptr, 10);
         else if (a == "--prefill-experts") o.prefill_experts = (int) std::strtol(next("--prefill-experts"), nullptr, 10);
+        else if (a == "--prefill-cpu-share") {
+            const std::string v = next("--prefill-cpu-share");
+            strata::prefill::set_cpu_share(v == "auto" ? -1.0 : std::max(0.0, std::strtod(v.c_str(), nullptr)));
+        }
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") o.spec = (int) std::strtol(next("--spec"), nullptr, 10);
         else if (a == "--batch" || a == "--slots") o.batch = (int) std::strtol(next(a.c_str()), nullptr, 10);
@@ -10217,7 +10224,14 @@ int main(int argc, char** argv) {
             // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
             // continues from the slot with the same chunks (upstream #656's cooperative preemption, a slot as the park)
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
-                if (o.batch <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                if (o.batch <= 0) {
+                    const int64_t cpu0 = sp.stats().experts_cpu;
+                    if (!sp.run(ids.data() + a0, b0 - a0, a0, e)) return false;
+                    // the measured share, which setup's warm-up writes into the config (--prefill-cpu-share)
+                    if (strata::prefill::cpu_share_setting() < 0.0 && sp.stats().experts_cpu > cpu0)
+                        std::fprintf(stderr, "strata serve: prefill CPU share %.2f (measured)\n", sp.stats().cpu_share);
+                    return true;
+                }
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
                 for (int64_t q = a0; q < b0;) {
                     const int64_t r = std::min(b0, q + C);

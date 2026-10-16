@@ -43,6 +43,12 @@ struct PrefillStats {
     double ms_ple = 0;
 };
 
+/// --prefill-cpu-share: the CPU pool's share of a short chunk's streamed experts, fixed (0..1; negative: measured,
+/// the default) where the default arms the share at all.  STRATA_PREFILL_CPU_SHARE, when set, wins.  Before any prompt.
+void set_cpu_share(double share);
+/// The share in use: STRATA_PREFILL_CPU_SHARE's, else set_cpu_share's; -1 measured.
+double cpu_share_setting();
+
 }  // namespace strata::prefill
 namespace strata::core { class MtpDrafter; class RemoteExperts; }
 namespace strata::prefill {

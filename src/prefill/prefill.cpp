@@ -137,11 +137,15 @@ constexpr int64_t STREAM_ALL_MIN = 2048;
 // streamed expert, events around its expert work read after the next layer's routing sync, as running means): the
 // next layers hand the CPU g / (c + g), where both sides end together, so a GPU that streams faster than the CPU
 // computes gives it little.  x: a fixed x.  0: every expert on the GPU.  The CPU rounds differently from the GPU, so
-// an answer can differ slightly from the GPU-only one.
+// an answer can differ slightly from the GPU-only one.  Unset, --prefill-cpu-share (set_cpu_share) fixes the share
+// where the default arms it: the measured one moves from run to run, and which experts the CPU takes with it, so two
+// greedy runs of one prompt parted (2026-10-16, an RTX 4070: logits up to 1.5 apart at the first generated token).
+double g_cpu_share_fixed = -1.0;   // set_cpu_share: -1 measured
 inline double cpu_share_env() {   // -1: measured
     static const double v = [] {
         const char* e = std::getenv("STRATA_PREFILL_CPU_SHARE");
-        if (e == nullptr || std::strcmp(e, "auto") == 0) return -1.0;
+        if (e == nullptr) return g_cpu_share_fixed;
+        if (std::strcmp(e, "auto") == 0) return -1.0;
         return std::clamp(std::strtod(e, nullptr), 0.0, 1.0);
     }();
     return v;
@@ -244,6 +248,9 @@ std::string fit_failure(const Alloc& o) {
 }
 
 }  // namespace
+
+void set_cpu_share(double share) { g_cpu_share_fixed = share < 0.0 ? -1.0 : std::min(share, 1.0); }
+double cpu_share_setting() { return cpu_share_env(); }
 
 // Step 4 of the prompt-speed plan: the experts the arena could not pin (a third of the streamed ones on IQ3_S) are
 // copied into pinned buffers by these threads, ahead of the launches.  Copied in line by the launching thread they
