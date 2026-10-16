@@ -36,11 +36,12 @@ Windows is a target as well, built natively for the MSVC ABI with intel/llvm's c
 
 ## Free and non-free builds (Debian main)
 
-XeStrata builds in three modes, chosen by the CMake option `STRATA_LICENSE`, after the Debian archive's areas:
+XeStrata builds in two modes, chosen by the CMake option `STRATA_LICENSE`, after the Debian archive's areas:
 
-- free (`-DSTRATA_LICENSE=free`): free software only, so the program could go into Debian main. The SYCL compiler is intel/llvm's DPC++ 7 or later (its SYCL runtime libsycl 9; one built from source, or a distribution's as new); icpx is refused. Besides XeStrata's own kernels it uses only kernels and libraries that are free software by the DFSG (what Debian main would take): oneMath with rocBLAS (ROCm) for AMD GPUs' dense matrix products, for example.
+- free (`-DSTRATA_LICENSE=free`): free software only, so the program could go into Debian main. The SYCL compiler is intel/llvm's DPC++ 7 or later (its SYCL runtime libsycl 9; one built from source, or a distribution's as new). Besides XeStrata's own kernels it uses only kernels and libraries that are free software by the DFSG (what Debian main would take): oneMath with rocBLAS (ROCm) for AMD GPUs' dense matrix products, for example.
 - contrib-llvm (the default, `STRATA_LICENSE=contrib`): XeStrata's free source built with intel/llvm's CUDA target, for NVIDIA GPUs as well (`STRATA_CUDA_ARCHS` and `STRATA_ONEMKL` default to the build machine's GPUs, of every maker it has). Its dense matrix products go through oneMath (Apache-2.0; XeStrata's fork, which CMake fetches): oneMKL on Intel GPUs, cuBLAS on NVIDIA ones, rocBLAS on AMD ones (the free mode's path). It needs NVIDIA's CUDA toolkit to build and NVIDIA's driver to run, and oneMKL, none of them free software: the program could go into Debian contrib.
-- contrib-icpx (`-DSTRATA_LICENSE=contrib-icpx`): the same free source built with Intel oneAPI's icpx and the runtime libraries it links, with oneMKL for the dense matrix products (through oneMath) and the SYCL image encoder (ggml-sycl), for Intel GPUs. setup builds in this mode only when asked (`--license contrib-icpx`).
+
+Intel oneAPI's icpx is not taken in either mode: CMake refuses it. A third mode built with it, contrib-icpx, was removed on 2026-10-15 (the user's decision): intel/llvm reaches every maker's GPUs.
 
 The dense matrix products, by mode and GPU maker:
 
@@ -48,18 +49,17 @@ The dense matrix products, by mode and GPU maker:
 | --- | --- | --- | --- |
 | free | XeStrata's own kernels | AMD's runtime (rocBLAS) | — |
 | contrib-llvm | Intel's runtime (oneMKL) | AMD's runtime (rocBLAS) | NVIDIA's runtime (cuBLAS) |
-| contrib-icpx | Intel's runtime (oneMKL) | — | — |
 
-In reports, commit messages and documents, call the three modes free, contrib-llvm and contrib-icpx: "contrib" alone could be either of the last two.
-Name a build by its mode, not by its compiler or a former folder name ("llvm7", "contrib", "xe"): "built and tested in the free and contrib-llvm modes". The build folders carry the modes' names: `build/free`, `build/contrib-llvm` and `build/contrib-icpx`.
+In reports, commit messages and documents, call the two modes free and contrib-llvm.
+Name a build by its mode, not by its compiler or a former folder name ("llvm7", "contrib", "xe"): "built and tested in the free and contrib-llvm modes". The build folders carry the modes' names: `build/free` and `build/contrib-llvm`.
 contrib-llvm is the mode the code calls `contrib` (`STRATA_LICENSE=contrib`, `--license contrib`, the packages `xestrata-contrib-cuda<version>`); those names stay as they are.
 
 Rules:
 
-- XeStrata itself stays free software, and the free mode must build, run and pass its tests. Do not write anything that only the contrib-llvm or contrib-icpx mode can build or run, other than the paths for the GPUs only those modes reach (NVIDIA's, in the contrib-llvm mode).
-- A non-free dependency goes only on a path the contrib-llvm or contrib-icpx mode switches on, never in the free mode, and is never bundled. The free mode may be slower without it (an older free compiler, for example), never broken.
-- Keep one code path where the modes can share it: the engine's dense matrix products (`src/prefill/gemm.cpp`) go through oneMath in the contrib-llvm and contrib-icpx modes, and in the free mode where oneMath's backend for the GPU is free software (rocBLAS for AMD GPUs); elsewhere (and where oneMath has no backend for the GPU) through XeStrata's own kernels. The AMD path is the same in the free and contrib-llvm modes. Every other product is XeStrata's own kernels, or a DFSG-free library's, in every mode.
-- Build and test a change to the SYCL code with intel/llvm only, in the free and contrib-llvm modes: a free build (`build/free`, intel/llvm built from source as [docs/DEVTOOLS.md](docs/DEVTOOLS.md#intelllvm-from-source) describes) and a contrib-llvm one (`build/contrib-llvm`, `STRATA_CUDA_ARCHS`). A change that NVIDIA's device compile sees is also run on an NVIDIA GPU where one is there (else `unverified`). The contrib-icpx mode is not built or tested. The compilers differ in version: an extension one of them lacks needs a fallback (as `sycl_ext_oneapi_clock` in `verify_kernels.cpp`), and a warning one of them gives counts as new.
+- XeStrata itself stays free software, and the free mode must build, run and pass its tests. Do not write anything that only the contrib-llvm mode can build or run, other than the paths for the GPUs only that mode reaches (NVIDIA's).
+- A non-free dependency goes only on a path the contrib-llvm mode switches on, never in the free mode, and is never bundled. The free mode may be slower without it (an older free compiler, for example), never broken.
+- Keep one code path where the modes can share it: the engine's dense matrix products (`src/prefill/gemm.cpp`) go through oneMath in the contrib-llvm mode, and in the free mode where oneMath's backend for the GPU is free software (rocBLAS for AMD GPUs); elsewhere (and where oneMath has no backend for the GPU) through XeStrata's own kernels. The AMD path is the same in the free and contrib-llvm modes. Every other product is XeStrata's own kernels, or a DFSG-free library's, in every mode.
+- Build and test a change to the SYCL code with intel/llvm only, in the free and contrib-llvm modes: a free build (`build/free`, intel/llvm built from source as [docs/DEVTOOLS.md](docs/DEVTOOLS.md#intelllvm-from-source) describes) and a contrib-llvm one (`build/contrib-llvm`, `STRATA_CUDA_ARCHS`). A change that NVIDIA's device compile sees is also run on an NVIDIA GPU where one is there (else `unverified`). The compilers differ in version: an extension one of them lacks needs a fallback (as `sycl_ext_oneapi_clock` in `verify_kernels.cpp`), and a warning one of them gives counts as new.
 - `third_party/nonfree/` (below) stays optional in every mode.
 - The model itself (Qwen3.8-Flash-Next) is excluded from these rules.
 - Non-free tools a developer runs by hand, such as Intel SDE below, are allowed as long as they are not bundled and neither the build nor the tests require them.
@@ -68,7 +68,7 @@ Rules:
 
 Every change goes in only on these two conditions, whoever writes it: the maintainer, a coding agent, a pull request, a port from upstream or another project.
 
-- It was built and tested with intel/llvm, in the free and contrib-llvm modes (above). intel/llvm is the compiler that reaches every GPU maker's devices: a change built only with icpx (the contrib-icpx mode), or not built, does not go in.
+- It was built and tested with intel/llvm, in the free and contrib-llvm modes (above). intel/llvm is the compiler that reaches every GPU maker's devices: a change built only with another compiler (Intel oneAPI's icpx, for example), or not built, does not go in.
 - It depends on the hardware it was written on as little as it can (the first rule, above): not only no CUDA or other maker's API outside the paths only the contrib modes reach, but no value measured on one card (the B70's spin bounds or tile shapes, for example) hard-coded where it can be derived from what the device reports.
 
 A change that does not meet them, a pull request among others, does not go in as it is: it is a reference, and what it does is written again in XeStrata's code.
@@ -190,7 +190,7 @@ Work with the repository through `git`, not the GitHub CLI (`gh`), with these ex
 
 Do not create, comment on or edit issues and pull requests with `gh`.
 
-A pull request says which modes it was built in (free, contrib-llvm, contrib-icpx) and on which GPUs and CPUs it ran, and marks what was not checked `unverified`; one that does not is asked for it ([What goes in](#what-goes-in)).
+A pull request says which modes it was built in (free, contrib-llvm) and on which GPUs and CPUs it ran, and marks what was not checked `unverified`; one that does not is asked for it ([What goes in](#what-goes-in)).
 
 ## No agent self-attribution
 

@@ -357,10 +357,12 @@ sycl::event rows_kernel(sycl::queue& q, bool half, const uint16_t* X, const uint
     constexpr int NB = 16;
     const bool vec = K % 8 == 0 && ((uintptr_t) X | (uintptr_t) W) % 16 == 0;
     const int64_t nb = (N + NB - 1) / NB;
+    // the rows in the last dimension: a CUDA grid's second dimension is capped at 65535 blocks, which the rows of a
+    // large product (a VAE convolution's 262144 pixels) pass; the output blocks (N / 16) stay far below it
     return q.parallel_for(
-        sycl::nd_range<2>({(size_t) T, (size_t) nb * SG}, {1, SG}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+        sycl::nd_range<2>({(size_t) nb, (size_t) T * SG}, {1, SG}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
             const auto sg = it.get_sub_group();
-            const int64_t r = (int64_t) it.get_group(0), n0 = (int64_t) it.get_group(1) * NB;
+            const int64_t r = (int64_t) it.get_group(1), n0 = (int64_t) it.get_group(0) * NB;
             const int lane = (int) sg.get_local_linear_id();
             const auto val = [half](uint16_t b) {
                 return half ? (float) sycl::bit_cast<sycl::half>(b) : sycl::bit_cast<float>((uint32_t) b << 16);

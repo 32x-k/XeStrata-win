@@ -57,7 +57,7 @@ XeStrata は全体が LGPL 3 以降（LGPL-3.0-or-later）です（`COPYING.LESS
 XeStrata を、GPU や CPU のメーカーが出す計算ライブラリ（oneMKL、cuBLAS など）やその実行時ライブラリ（CUDA の実行時と
 ドライバー、oneAPI のコンパイラーの実行時など）とリンクしたものを、配布してよいという許可です。
 
-contrib-llvm と contrib-icpx のビルドと、それらのパッケージは、自由ソフトウェアでないこれらのライブラリとリンクします。
+contrib-llvm のビルドとそのパッケージは、自由ソフトウェアでないこれらのライブラリとリンクします。
 この許可がないと、LGPL のままではそれらを配布できません。
 
 XeStrata に入る変更は、この追加の許可を含めた条件で入ります。
@@ -78,7 +78,7 @@ XeStrata に入る変更は、この追加の許可を含めた条件で入り�
 誰が書いたものでも（メンテナー、プルリクエスト、upstream からの移植）、次の 2 つを満たす変更だけを入れます。
 
 1. **intel/llvm で、free と contrib-llvm の両方式でビルドと試験をした**こと。
-   icpx だけでビルドしたもの（contrib-icpx）や、ビルドしていないものは入れません。
+   ほかのコンパイラー（Intel oneAPI の icpx など）だけでビルドしたものや、ビルドしていないものは入れません。
    ビルドの方法は [docs/BUILD.ja.md](docs/BUILD.ja.md) と [docs/DEVTOOLS.ja.md](docs/DEVTOOLS.ja.md) にあります。
 1. **[型番に依存しない](#いちばん大切なルール-型番に依存しない)**こと。
    free の方式で、自由ソフトウェアでないものに頼りません。
@@ -87,7 +87,7 @@ XeStrata に入る変更は、この追加の許可を含めた条件で入り�
 
 プルリクエストには次を書いてください。
 
-- ビルドした方式（free、contrib-llvm、contrib-icpx）
+- ビルドした方式（free、contrib-llvm）
 - 動かした GPU と CPU
 - 確かめていないことには `unverified`
 

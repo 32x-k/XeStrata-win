@@ -18,22 +18,22 @@ What the first run does (each step is skipped when it is already done):
      disk space
   2. asks the questions
   3. installs the Python packages it needs into .venv (numpy, jinja2, ...)
-  4. compiles the Strata engine for the GPU with a SYCL compiler (see docs/XE.md), and the image encoder when
-     images are wanted (on the CPU; on the GPU through Vulkan, or SYCL with oneMKL in the contrib-icpx mode)
+  4. compiles the Strata engine for the GPU with a SYCL compiler (see docs/XE.md) with its image generator, and the
+     image encoder when images are wanted (on the CPU, and on the GPU through Vulkan)
   5. downloads the model from Hugging Face (resumable), and the vision encoder if you want images
   6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes run-<model>.sh and starts the model
 
 Options: --family qwen|swift, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S, --context 32768, --rope-scaling none|linear|yarn
 (--rope-scale F; past the trained 262144 setup adds yarn and the factor final context / 262144),
---vision yes|no|gpu|cpu, --vision-onednn on|off, --port 8095, --yes (recommended
+--vision yes|no|gpu|cpu, --port 8095, --yes (recommended
 answers, no questions), --setup (install another model / change settings instead of starting), --no-start,
 --host 0.0.0.0 --api-key KEY (reach it from other devices on your network), --experimental-speed-projection on|off
 (EXPERIMENTAL, off by default),
 --models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --check (only check this PC), --check-update
-(whether a newer XeStrata release is out), --images qwen-image|no (image generation: Qwen-Image-2.1-Turbo through
-stable-diffusion.cpp's Vulkan build, POST /v1/images/generations; --image-quant Q4_K_M|Q6_K|Q8_0, --image-backend
-vulkan|cpu, --image-gpu-policy auto|keep|shrink|unload; docs/IMAGES.md).
+(whether a newer XeStrata release is out), --images qwen-image|no (image generation: Qwen-Image-2.1-Turbo on
+XeStrata's image engine, POST /v1/images/generations; --image-quant Q4_K_M|Q6_K|Q8_0, --image-ssd-offload on|off,
+--image-gpu-policy auto|keep|shrink|unload).
 
 Setup recommends, it never forces: the recommended answers are the defaults (--yes, or Enter), and a bigger choice
 than it recommends - a longer context, a size it thinks will not fit - is kept, with what it risks.  With --yes, an
@@ -400,6 +400,7 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
     "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen (Apache-2.0), GGUFs with the MTP layer by Unsloth",
                "about": "35B, 3B active; a Qwen3.5 MoE with the Qwen tokenizer: Unsloth's 4-, 6- and 8-bit files",
                "tag": "qwen36-", "name": "qwen3.6-35b-a3b", "max_context": 262144, "plain": True,
+               "draft_vocab": True,   # the vocabulary of Qwen3.8's draft head subsets (data/draft_vocab*.bin)
                "models": {
                    "UD-Q4_K_XL": {"repo": _QWEN36, "file": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", "size": 22853663008,
                                   "sha256": "55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1",
@@ -447,10 +448,11 @@ def esp_download(data: Path) -> Path | None:
 VISION = {"gpu": {"max_tokens": 1024, "reserve_mib": 700},
           "cpu": {"max_tokens": 300, "reserve_mib": 700}}
 EXE = "strata.exe" if WIN else "strata"
+IMAGE_EXE = "strata-image.exe" if WIN else "strata-image"   # the image engine (serve/images.py), built with it
 # the image encoder, one binary per place it runs: the configs of different models may use different ones
-# the image encoders: on the CPU, on the GPU through Vulkan (free), on the GPU through SYCL (oneMKL: contrib-icpx)
+# the image encoders: on the CPU, and on the GPU through Vulkan
 VEXE = {k: v + (".exe" if WIN else "") for k, v in
-        {"cpu": "strata-vision-cpu", "vulkan": "strata-vision-vulkan", "gpu": "strata-vision-sycl"}.items()}
+        {"cpu": "strata-vision-cpu", "vulkan": "strata-vision-vulkan"}.items()}
 
 
 # ------------------------------------------------------------------------------------------------ output
@@ -922,15 +924,13 @@ def amd_elsewhere() -> str:
 
 # The distribution packages that building and running XeStrata from the source needs (docs/BUILD.md, "Packages"), by
 # distribution and part: "base" for the free and contrib modes (intel/llvm's build tools, the image encoders' and the
-# optional conversation compression's), "icpx" for the contrib-icpx mode in its place, and each GPU maker's (Intel's
-# oneMKL in the contrib mode only, NVIDIA's in the contrib mode only, AMD's not in the contrib-icpx mode).  On Arch the
+# optional conversation compression's), and each GPU maker's (Intel's oneMKL in the contrib mode only, NVIDIA's in the
+# contrib mode only).  On Arch the
 # Vulkan ICD is the GPU maker's own package, not one mesa-vulkan-drivers carries for both.
 PACKAGES = {
     "ubuntu": {
         "base": "python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc "
                 "spirv-headers mesa-vulkan-drivers libblosc2-dev",
-        "icpx": "python3-venv build-essential libblosc2-dev intel-oneapi-compiler-dpcpp-cpp intel-ocloc "
-                "intel-oneapi-mkl-sycl-devel",
         "intel": "libze1 libze-intel-gpu1 libigc2 libigdfcl2",
         "intel-contrib": "intel-oneapi-mkl-sycl-devel",
         "amd": "libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev "
@@ -940,7 +940,6 @@ PACKAGES = {
     "fedora": {
         "base": "python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static "
                 "vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel",
-        "icpx": "python3 gcc-c++ blosc2-devel intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel",
         "intel": "oneapi-level-zero oneapi-level-zero-devel intel-level-zero",
         "intel-contrib": "intel-oneapi-mkl-sycl-devel",
         "amd": "rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel "
@@ -948,16 +947,15 @@ PACKAGES = {
         "nvidia": "cuda-toolkit-13-4",
     },
     "arch": {
-        # Arch and its derivatives (ID_LIKE=arch).  Intel's oneAPI repository has no Arch packages: there is no icpx
-        # and no oneMKL (Intel's offline installer is the way to either), so the engine builds with intel/llvm from the
-        # source and an Intel GPU's dense products stay in XeStrata's own kernels.  zstd's package has no libzstd.a, so
+        # Arch and its derivatives (ID_LIKE=arch).  Intel's oneAPI repository has no Arch packages: there is no oneMKL
+        # (Intel's offline installer is the way to it), so an Intel GPU's dense products stay in XeStrata's own
+        # kernels.  zstd's package has no libzstd.a, so
         # intel/llvm's build links the shared one (tools/intel_llvm_build.py).
         # opencl-headers: intel/llvm's SYCL tools (sycl-ls, part of what its build installs) include CL/cl.h, and they
         # get no include for the OpenCL headers the configuration fetches (those are the runtime's own objects'); Arch's
         # clang does not bring the header in, Ubuntu's and Fedora's builds have it
         "base": "python base-devel git cmake ninja lld hwloc zstd vulkan-headers vulkan-icd-loader shaderc "
                 "spirv-headers opencl-headers blosc2",
-        "icpx": "",
         "intel": "level-zero-loader intel-compute-runtime vulkan-intel",
         "intel-contrib": "",
         # ROCm's clang (rocm-llvm) carries clang's runtime builtins too, which HIP's CMake package asks for where
@@ -992,21 +990,15 @@ def packages_for(distro: str, makers: set, mode: str) -> tuple:
     """The packages (PACKAGES) for a distribution ("ubuntu", "fedora", "arch"), the GPU makers ("intel", "amd",
     "nvidia") and the build mode, and the notes that go with them (the repositories, what a mode cannot build)."""
     p = PACKAGES[distro]
-    names = (p["icpx"] if mode == "contrib-icpx" else p["base"]).split()
+    names = p["base"].split()
     notes = []
-    if distro == "arch" and mode == "contrib-icpx":
-        notes.append("Arch: Intel oneAPI is not in its repositories, so these names cover no icpx: Intel's offline "
-                     "installer, or --license free")
     if "intel" in makers:
         names += p["intel"].split() + (p["intel-contrib"].split() if mode == "contrib" else [])
         if distro == "arch" and mode == "contrib":
-            notes.append("Arch: oneMKL (Intel's oneAPI repository) is not there either, and the contrib mode hands "
+            notes.append("Arch: oneMKL (Intel's oneAPI repository) is not there, and the contrib mode hands "
                          "the Intel GPU's dense products to it: Intel's offline installer, or --license free")
     if "amd" in makers:
-        if mode == "contrib-icpx":
-            notes.append("AMD GPUs: not with contrib-icpx (icpx has no AMD target); --license free or contrib")
-        else:
-            names += p["amd"].split()
+        names += p["amd"].split()
     if "nvidia" in makers:
         if mode == "contrib":
             names += p["nvidia"].split()
@@ -1311,8 +1303,6 @@ def gpu_problem(g, together=False):
     if g.get("vendor") == "nvidia" and license_mode(ARGS) != "contrib":
         return "an NVIDIA GPU needs the contrib build (--license contrib: NVIDIA's CUDA toolkit, not free software)"
     if g.get("vendor") == "amd":
-        if not PACKAGED and license_mode(ARGS) == "contrib-icpx":
-            return "icpx has no AMD target: an AMD GPU needs the free or contrib build (--license free or contrib)"
         gfx = g.get("gfx")
         if not gfx:
             return ("the engine's HIP runtime does not list it" if WIN else
@@ -1765,35 +1755,22 @@ def oneapi_env() -> dict | None:
     return _ONEAPI_ENV
 
 
-def oneapi_lib_dirs() -> list:
-    """The library folders the engine and the image encoders load at run time (the SYCL runtime; oneMKL for the SYCL
-    image encoder), which the server puts on LD_LIBRARY_PATH: the server does not run in oneAPI's environment."""
-    env = oneapi_env() or {}
-    return [d for d in env.get("LD_LIBRARY_PATH", "").split(os.pathsep) if d and Path(d).is_dir()]
-
-
 # ------------------------------------------------------------------------------------------------ the SYCL compiler
-# AGENTS.md, "Free and non-free builds": three build modes (--license).  free uses free software only:
+# AGENTS.md, "Free and non-free builds": two build modes (--license).  free uses free software only:
 # intel/llvm's DPC++ 7 or later, the distribution's (dpclang++) or one built from source (tools/intel_llvm_build.py,
 # --intel-llvm-build; setup offers to build it when the distribution's is older), for Intel GPUs.  contrib (the
 # default): intel/llvm built with its CUDA target (.tools/intel-llvm-contrib), for Intel and NVIDIA GPUs, with oneMKL
-# and cuBLAS for the dense products.  contrib-icpx: Intel oneAPI's icpx and oneMKL, Intel GPUs only.  Whether the
-# Intel GPU has its matrix engines (XMX) for a compiler is asked of the GPU itself (tools/xmx_probe.cpp), not read from
-# a version number.  Without XMX the engine still runs, its prompt path about 1.6
+# and cuBLAS for the dense products.  Intel oneAPI's icpx is not taken (the contrib-icpx mode was removed on
+# 2026-10-15).  Whether the Intel GPU has its matrix engines (XMX) for a compiler is asked of the GPU itself
+# (tools/xmx_probe.cpp), not read from a version number.  Without XMX the engine still runs, its prompt path about 1.6
 # times slower (the 2026-10-02-dp4a record); setup asks before building it so.
-LICENSES = ("free", "contrib", "contrib-icpx")
+LICENSES = ("free", "contrib")
 INTEL_LLVM_BUILD = ROOT / "tools" / "intel_llvm_build.py"
 INTEL_LLVM_DEFAULT = ROOT / ".tools" / "intel-llvm" / "install"
 INTEL_LLVM_CONTRIB = ROOT / ".tools" / "intel-llvm-contrib" / "install"
-ICPX_HOW = ("Intel oneAPI's compiler (not free software; Intel's apt repository):\n"
-            "         wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \\\n"
-            "           | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null\n"
-            "         echo \"deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] "
-            "https://apt.repos.intel.com/oneapi all main\" | sudo tee /etc/apt/sources.list.d/oneAPI.list\n"
-            "         sudo apt update && sudo apt install intel-oneapi-compiler-dpcpp-cpp")
 FREE_HOW = ("intel/llvm's DPC++ 7 or later (free software): build it here: ./setup.sh --intel-llvm-build (13 minutes "
             "on 28 threads, 3.5 GB), or a distribution's package of version 7 or later")
-MKL_HOW = ("oneMKL (not free software; Intel's apt repository, set up as for icpx in docs/BUILD.md#packages): "
+MKL_HOW = ("oneMKL (not free software; Intel's apt repository, set up as docs/BUILD.md#packages says): "
            "sudo apt install intel-oneapi-mkl-sycl-devel")
 # Intel's repositories carry apt and dnf packages, not Arch's: on Arch the oneAPI packages come from Intel's offline
 # installer, if they are wanted at all (the free and contrib modes build intel/llvm from the source)
@@ -1803,14 +1780,25 @@ ONEAPI_ARCH = ("Intel oneAPI is not in Arch's repositories (only apt's and dnf's
 
 
 def license_mode(a=None) -> str:
-    """The build mode: --license, else the one kept in the settings.  Settings from before the three modes kept
-    "nonfree": true for icpx, which is contrib-icpx now."""
+    """The build mode: --license, else the one kept in the settings.  Settings of icpx's builds (the removed
+    contrib-icpx mode, or "nonfree": true from before the modes) take the contrib mode."""
     if PACKAGED:
         return packaged_engine().get("license", "free")
     if a is not None and getattr(a, "license", None):
         return a.license
     st = load_settings()
-    return st.get("license") or ("contrib-icpx" if st.get("nonfree") else "contrib")
+    mode = st.get("license") or "contrib"
+    if mode == "contrib-icpx" or (st.get("nonfree") and not st.get("license")):
+        global _ICPX_SAID
+        if not _ICPX_SAID:
+            _ICPX_SAID = True
+            warn("the settings name the contrib-icpx mode (Intel oneAPI's icpx), which was removed: the engine is "
+                 "built in the contrib-llvm mode (--license contrib) instead; --license free chooses the free mode")
+        return "contrib"
+    return mode
+
+
+_ICPX_SAID = False
 
 
 def new_process_group() -> dict:
@@ -1921,15 +1909,6 @@ def os_compiler() -> dict | None:
             "cuda_archs": [], "hip_archs": [], "onemkl": False}
 
 
-def icpx_compiler() -> dict | None:
-    env = oneapi_env()
-    if env is None or shutil.which("icpx", path=env.get("PATH")) is None:
-        return None
-    return {"kind": "icpx", "cxx": shutil.which("icpx", path=env.get("PATH")),
-            "cc": shutil.which("icx", path=env.get("PATH")) or "icx", "env": env, "lib_dirs": oneapi_lib_dirs(),
-            "license": "contrib-icpx", "cuda_archs": [], "hip_archs": [], "onemkl": True}
-
-
 def amd_archs() -> list:
     """The ISA names of this PC's AMD GPUs the engine can run on: the build makes their code (STRATA_HIP_ARCHS)."""
     return sorted({g["gfx"] for g in gpus() if g.get("vendor") == "amd" and gpu_problem(g) is None})
@@ -2036,12 +2015,7 @@ def choose_compiler(a, gpu: dict) -> dict:
     pci = gpu["pci"]
     allow_no_xmx = a.allow_no_xmx or bool(st.get("allow_no_xmx"))
     kept = {}                                          # the intel/llvm folder to keep in the settings
-    if mode == "contrib-icpx":
-        comp = icpx_compiler()
-        if comp is None:
-            fail("--license contrib-icpx builds with Intel's icpx, which is not installed",
-                 ONEAPI_ARCH if distro_family() == "arch" else ICPX_HOW)
-    elif mode == "contrib" and cuda_archs():
+    if mode == "contrib" and cuda_archs():
         comp, d = contrib_compiler(a, st)
         kept = {"intel_llvm_contrib": str(d)}
     else:
@@ -2065,8 +2039,7 @@ def choose_compiler(a, gpu: dict) -> dict:
         if comp is None:
             if not a.intel_llvm_build and ask("Build intel/llvm here now (13 minutes on 28 threads, 3.5 GB)?",
                                               ["y", "n"], "y", a.yes) != "y":
-                fail("no SYCL compiler for the engine", FREE_HOW + "\n       (--license contrib-icpx builds with "
-                     "Intel's icpx, which is not free software)")
+                fail("no SYCL compiler for the engine", FREE_HOW)
             comp = free_compiler(build_intel_llvm(a))
             llvm_dir = str(INTEL_LLVM_DEFAULT)
         kept = {"intel_llvm": llvm_dir} if llvm_dir else {}
@@ -2114,8 +2087,7 @@ def choose_compiler(a, gpu: dict) -> dict:
             for k, v in choices.items():
                 say(f"  {k}) {v}")
             if ask("Which?", list(choices), "2", a.yes) == "2":
-                fail("stopped: no XMX for this GPU", "accept the slower prompt path (--allow-no-xmx)" +
-                     ("; or --license contrib-icpx (Intel's icpx)" if mode != "contrib-icpx" else ""))
+                fail("stopped: no XMX for this GPU", "accept the slower prompt path (--allow-no-xmx)")
             allow_no_xmx = True
     st = {k: v for k, v in load_settings().items() if k != "nonfree"}
     save_settings({**st, "license": mode, "allow_no_xmx": allow_no_xmx, **kept})
@@ -2129,15 +2101,13 @@ def choose_compiler(a, gpu: dict) -> dict:
     return comp
 
 
-def check_build_tools(comp: dict, sycl_vision: bool) -> None:
-    """What the build needs besides the SYCL compiler: g++ for the CPU image encoder, glslc and the Vulkan headers for
-    the Vulkan one, and oneMKL for the SYCL one (ggml-sycl, contrib-icpx).  Setup does not install them (no apt or
-    sudo from setup): it says what is missing."""
+def check_build_tools(comp: dict) -> None:
+    """What the build needs besides the SYCL compiler: g++ for the CPU image encoder (glslc and the Vulkan headers for
+    the Vulkan one: vulkan_missing).  Setup does not install them (no apt or sudo from setup): it says what is
+    missing."""
     missing = []
     if shutil.which("g++") is None:
         missing.append(tool_pkg("g++"))
-    if sycl_vision and not Path((oneapi_env() or {}).get("MKLROOT", "")).is_dir():
-        missing.append("oneMKL for the SYCL image encoder (intel-oneapi-mkl-sycl-devel from Intel's apt repository)")
     if missing:
         fail("missing: " + ", ".join(missing), "install them, then run it again (docs/XE.md lists the packages)")
 
@@ -2155,6 +2125,7 @@ def vulkan_missing() -> list:
 
 
 def cmake_build(src, bdir, target, defs, env=None):
+    """Configure `src` in `bdir` and build `target` (a name, or a list of names)."""
     cmake, ninja = find_tool("cmake"), find_tool("ninja")
     if cmake is None or ninja is None:
         fail("cmake / ninja not found after installing them", "run: .venv python -m pip install cmake ninja")
@@ -2168,7 +2139,8 @@ def cmake_build(src, bdir, target, defs, env=None):
     # a SYCL translation unit takes several GB to compile: as many jobs as the RAM allows, at most half the threads
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(ram_gb() // 12)))
     run(conf, env=env)
-    run([cmake, "--build", str(bdir), "--target", target, "-j", str(jobs)], env=env)
+    targets = [target] if isinstance(target, str) else list(target)
+    run([cmake, "--build", str(bdir), "--target", *targets, "-j", str(jobs)], env=env)
 
 
 ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/main/ggml")
@@ -2204,14 +2176,6 @@ def engine_is_xe(meta: dict) -> bool:
     return meta.get("source") == "local" and meta.get("backend") == "xe"
 
 
-def gpu_encoder(comp: dict) -> str:
-    """The GPU image encoder this build makes: ggml-sycl ("gpu") in the contrib-icpx mode with oneMKL, else Vulkan."""
-    env = oneapi_env() or {}
-    if comp.get("license") == "contrib-icpx" and Path(env.get("MKLROOT", "")).is_dir():
-        return "gpu"
-    return "vulkan"
-
-
 def engine_cmake_args() -> list:
     """--cmake-arg KEY=VALUE: CMake options of the user's for the engine's build (a ROCm or toolkit in a place CMake
     does not look, for example; a user could not hand setup one and changed setup.py), kept in the settings so that
@@ -2226,8 +2190,8 @@ def engine_cmake_args() -> list:
 
 
 def build_engine(visions, llama, comp: dict) -> Path:
-    """Compile the engine with `comp` (choose_compiler) and the image encoders in `visions` ("cpu", "vulkan", "gpu" =
-    SYCL); the results go to engine/.  A compiled engine or encoder whose source files or compiler changed since (a
+    """Compile the engine with `comp` (choose_compiler) and the image encoders in `visions` ("cpu", "vulkan"); the
+    results go to engine/.  A compiled engine or encoder whose source files or compiler changed since (a
     `git pull`, another intel/llvm) is compiled again.  Each encoder has its own binary, so installing one never
     replaces the other."""
     eng = ROOT / "engine"
@@ -2241,14 +2205,15 @@ def build_engine(visions, llama, comp: dict) -> Path:
             "hip_archs": comp.get("hip_archs", [])}
     if extra := engine_cmake_args():                   # (only when given: a build without them stays as it was)
         used["cmake_args"] = extra
-    engine_ok = xe and (eng / EXE).exists() and meta.get("src") == src and meta.get("compiler") == used
+    engine_ok = (xe and (eng / EXE).exists() and (eng / IMAGE_EXE).exists() and meta.get("src") == src
+                 and meta.get("compiler") == used)
     built = dict(meta.get("vision_srcs") or {}) if xe else {}
     missing = [v for v in dict.fromkeys(visions)
                if v in VEXE and not ((eng / VEXE[v]).exists() and built.get(v) == vsrc)]
     if engine_ok and not missing:
         ok("engine already built for this PC")
         return eng
-    check_build_tools(comp, "gpu" in missing)
+    check_build_tools(comp)
     if "vulkan" in missing and (need := vulkan_missing()):
         fail("the Vulkan image encoder needs: " + ", ".join(need), "install them: " + install_cmd(need))
     if not engine_ok:
@@ -2259,7 +2224,7 @@ def build_engine(visions, llama, comp: dict) -> Path:
             shutil.rmtree(bdir)                        # CMake keeps the compiler and the -D values it configured with
         say("  The engine's source changed: compiling it again (only what changed) ..." if xe and (eng / EXE).exists()
             and bdir.exists() else "  Compiling the Strata engine for the GPU (20-40 minutes, once) ...")
-        cmake_build(ROOT, bdir, "strata",
+        cmake_build(ROOT, bdir, ["strata", "strata-image"],
                     [f"-DCMAKE_CXX_COMPILER={comp['cxx']}", f"-DCMAKE_C_COMPILER={comp['cc']}",
                      f"-DSTRATA_LICENSE={comp['license']}",
                      f"-DSTRATA_CUDA_ARCHS={'auto' if comp['cuda_archs'] else ''}",
@@ -2269,15 +2234,10 @@ def build_engine(visions, llama, comp: dict) -> Path:
                      "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_PORTABLE=ON",
                      f"-DSTRATA_GGML_DIR={llama}", *(f"-D{x}" for x in used.get("cmake_args", []))], comp["env"])
         install_binary(bdir / EXE, eng / EXE)
+        install_binary(bdir / IMAGE_EXE, eng / IMAGE_EXE)
     for v in missing:
         llama_def = f"-DLLAMA_DIR={llama}"
-        if v == "gpu":                                 # ggml-sycl (oneMKL), a separate build from the CPU encoder
-            say("  Compiling the image encoder for the GPU (SYCL; 10-20 minutes, once) ...")
-            bdir = ROOT / "build-vision-sycl"
-            cmake_build(ROOT / "tools" / "vision", bdir, "strata-vision",
-                        [llama_def, "-DSTRATA_LICENSE=contrib-icpx", "-DSTRATA_VISION_SYCL=ON", "-DSTRATA_PORTABLE=ON",
-                         "-DCMAKE_C_COMPILER=icx", "-DCMAKE_CXX_COMPILER=icpx"], oneapi_env())
-        elif v == "vulkan":
+        if v == "vulkan":
             say("  Compiling the image encoder for the GPU (Vulkan; 5-15 minutes, once) ...")
             bdir = ROOT / "build-vision-vulkan"
             cmake_build(ROOT / "tools" / "vision", bdir, "strata-vision",
@@ -2288,22 +2248,16 @@ def build_engine(visions, llama, comp: dict) -> Path:
             cmake_build(ROOT / "tools" / "vision", bdir, "strata-vision", [llama_def, "-DSTRATA_PORTABLE=ON"])
         install_binary(bdir / "bin" / "strata-vision", eng / VEXE[v])
         built[v] = vsrc
-    # the engine's runtime only: the SYCL image encoder's oneAPI folders go into the configs that use it (main)
     stamp.write_text(json.dumps({"source": "local", "backend": "xe", "version": source_version(), "compiler": used,
                                  "lib_dirs": comp["lib_dirs"], "src": src, "vision_srcs": built}, indent=1))
     ok(f"engine compiled: {eng / EXE}")
     return eng
 
 
-def sycl_encoder_onednn() -> bool:
-    """Whether the SYCL image encoder was built with oneDNN: ggml-sycl takes it when it finds it installed."""
-    ninja = ROOT / "build-vision-sycl" / "build.ninja"
-    return ninja.exists() and "GGML_SYCL_DNNL=1" in ninja.read_text(errors="replace")
-
-
 def recorded_compiler(meta: dict) -> dict:
     """The compiler an installed engine was built with, for building it again after a `git pull` without asking.  An
-    engine from before the free build (no record) was built with icpx: it stays so, as --license contrib-icpx."""
+    engine icpx built (the removed contrib-icpx mode, or one from before the free build, with no record) is built
+    again by the compiler setup chooses (./setup.sh --setup)."""
     rec = meta.get("compiler") or {"kind": "icpx", "xmx": True}
     comp: dict | None
     if rec["kind"] == "intel-llvm":
@@ -2318,11 +2272,8 @@ def recorded_compiler(meta: dict) -> dict:
             fail(f"the engine was built with {Path(comp['cxx']).name}, older than intel/llvm 7 (which it now needs)",
                  "run ./setup.sh --setup to build it with intel/llvm 7 or later")
     else:
-        comp = icpx_compiler()
-        if comp is not None and "compiler" not in meta:
-            save_settings({**{k: v for k, v in load_settings().items() if k != "nonfree"}, "license": "contrib-icpx"})
-            say("  the installed engine was built with icpx (not free software): building it so again "
-                "(--license contrib-icpx); ./setup.sh --setup --license free chooses a free compiler")
+        fail("the engine was built with Intel oneAPI's icpx, which XeStrata no longer takes (the contrib-icpx mode was "
+             "removed)", "run ./setup.sh --setup to build it with intel/llvm (free or contrib)")
     if comp is None or not Path(comp["cxx"]).exists():
         fail("the compiler the engine was built with is gone", "run ./setup.sh --setup to choose one")
     comp["version"] = compiler_version(comp["cxx"], comp["env"])
@@ -2336,6 +2287,7 @@ def update_installed_engine() -> None:
     run here.  A package's engine is updated by apt or dnf."""
     if PACKAGED:
         return
+    remove_old_image_engine()
     eng = ROOT / "engine"
     info = eng / "BUILD.json"
     if not info.exists() or not (eng / EXE).exists():
@@ -2356,10 +2308,21 @@ def update_installed_engine() -> None:
         warn(f"could not compile the updated engine{why}: starting the installed one")
 
 
-# ---- image generation (upstream 0.1.44, a5b3b6c2): stable-diffusion.cpp's sd-cli for Qwen-Image-2.1-Turbo.  XeStrata
-# builds its Vulkan backend for every GPU (the user's decision of 2026-10-14): free software on every maker's card,
-# where upstream builds CUDA and HIP ones; its SYCL backend needs oneMKL.  Linux only for now.
-IMAGE_ENGINE = ROOT / "engine-image"           # sd-cli for Qwen-Image-2.1-Turbo (tools/image/qimage.py), --images
+# ---- image generation: Qwen-Image-2.1-Turbo on XeStrata's own image engine (strata-image, built with the text
+# engine; serve/images.py).  upstream 0.1.44 (a5b3b6c2) runs stable-diffusion.cpp's sd-cli instead.
+# what XeStrata's earlier image generator (stable-diffusion.cpp's sd-cli, before strata-image) left in the install
+OLD_IMAGE_ENGINE = ("engine-image", "build-image-vulkan", "build-image-cpu", "third_party/stable-diffusion.cpp")
+
+
+def remove_old_image_engine() -> None:
+    """The earlier sd-cli build, its build folders and its source, which nothing uses now: removed (a few GB)."""
+    if PACKAGED:
+        return
+    for rel in OLD_IMAGE_ENGINE:
+        p = ROOT / rel
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+            ok(f"removed {rel}/: the earlier image generator (sd-cli), which XeStrata's own image engine replaced")
 
 
 def _qimage():
@@ -2369,85 +2332,74 @@ def _qimage():
     return qimage
 
 
-def get_sd_cpp() -> Path:
-    """stable-diffusion.cpp and its ggml at the pinned commits (tools/image/qimage.py), as zips: no git."""
-    QI = _qimage()
-    src = ROOT / "third_party" / "stable-diffusion.cpp"
-    if QI.source_ok(src):
-        return src
-    z1 = ROOT / "third_party" / f"stable-diffusion.cpp-{QI.SD_CPP_COMMIT[:7]}.zip"
-    z2 = ROOT / "third_party" / f"sd-ggml-{QI.SD_GGML_COMMIT[:7]}.zip"
-    download(QI.SD_CPP_ZIP, z1, "stable-diffusion.cpp source")
-    download(QI.SD_GGML_ZIP, z2, "stable-diffusion.cpp's ggml source")
-    try:
-        src = QI.unpack_source(ROOT / "third_party", z1, z2)
-    finally:
-        for z in (z1, z2):
-            z.unlink(missing_ok=True)
-            z.with_name(z.name + ".done").unlink(missing_ok=True)
-    return src
+def text_ram_gb(args: list, ram: float, model: str | None = None) -> float:
+    """The RAM (GB) the text model's run config keeps for itself, the OS's room included: its RAM budget and the
+    OS's room (--resident-budget-gib), all of it when its experts are read through the file cache (--mmap-experts),
+    else the size's RAM (MODELS' "ram_gb") and a KV cache streamed into RAM (--kv-resident)."""
+    def val(flag):
+        return args[args.index(flag) + 1] if flag in args and args.index(flag) + 1 < len(args) else None
+    if "--mmap-experts" in args:
+        return ram
+    if val("--resident-budget-gib") is not None:
+        return float(val("--resident-budget-gib")) + UNSLOTH_RAM_LEFT_GB
+    gb = float(MODELS[model].get("ram_gb", ram)) if model in MODELS else ram
+    if "--kv-resident" in args and val("--max-context"):
+        gb += kv_streaming_ram_gb(int(val("--max-context")), val("--kv") or "int8")
+    return gb
 
 
-def build_image_engine(backend: str) -> Path:
-    """Compile sd-cli for `backend` (vulkan or cpu) into engine-image/ (again only when the pins or the backend
-    changed) -> its path."""
-    QI = _qimage()
-    IMAGE_ENGINE.mkdir(exist_ok=True)
-    exe, stamp = IMAGE_ENGINE / QI.SD_EXE, IMAGE_ENGINE / "BUILD.json"
-    want = QI.build_stamp(backend, None)
-    meta = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else {}
-    if exe.exists() and {k: meta.get(k) for k in want} == want:
-        ok(f"image generator already built ({backend})")
-        return exe
-    if backend == "vulkan" and (need := vulkan_missing()):   # ggml-vulkan: glslc, the Vulkan and SPIR-V headers
-        fail("compiling the image generator (Vulkan) needs the Vulkan headers, the SPIR-V headers and glslc",
-             f"install them: {install_cmd(need)} (or --image-backend cpu)")
-    src = get_sd_cpp()
-    say(f"  Compiling the image generator (stable-diffusion.cpp {QI.SD_CPP_COMMIT[:7]}, {backend}; 5-20 minutes, "
-        "once) ...")
-    bdir = ROOT / f"build-image-{backend}"
-    cmake_build(src, bdir, "sd-cli", QI.cmake_defs(backend))
-    built = bdir / "bin" / QI.SD_EXE
-    if not built.exists():
-        fail(f"the image generator's build finished without {built}", f"delete the folder {bdir.name} and run again")
-    shutil.copy2(built, exe)
-    stamp.write_text(json.dumps(want, indent=1))
-    ok(f"image generator compiled: {exe}")
-    return exe
-
-
-def setup_images(a, gpu: dict, models_dir: Path) -> dict | None:
-    """--images qwen-image: sd-cli and Qwen-Image-2.1-Turbo's three files -> the run config's "images" section
-    (serve/images.py); None for --images no, or when not wanted after all."""
+def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | None = None) -> dict | None:
+    """--images qwen-image: Qwen-Image-2.1-Turbo's four files for the image engine in `eng` -> the run config's
+    "images" section (serve/images.py); None for --images no, or when not wanted after all.  `text_gb`: the RAM the
+    text model keeps (text_ram_gb): the denoiser's quant is the largest whose files fit the rest (the user's decision
+    of 2026-10-15), or the one asked for with --image-ssd-offload on (what does not fit read from the SSD)."""
     if not a.images or a.images == "no":
         return None
-    if WIN:
-        fail("image generation is set up on Linux only for now", "run setup without --images")
+    remove_old_image_engine()
     QI = _qimage()
-    backend = a.image_backend or "vulkan"
-    gb = float((gpu or {}).get("vram_gb") or 0.0) if backend != "cpu" else 0.0
-    rec = QI.pick_quant(gb) if backend != "cpu" else "Q4_K_M"
-    quant = a.image_quant or rec
-    if QI.QUANTS.index(quant) > QI.QUANTS.index(rec):
-        warn(f"image model {quant}: setup recommends {rec} for {gb:.0f} GB of GPU memory; kept as you chose "
-             "(stable-diffusion.cpp then keeps part of it in RAM, which is slower)")
-    say(f"  Image generation: Qwen-Image-2.1-Turbo {quant} on {backend} (8 steps, CFG 1; POST /v1/images/generations)")
+    exe = eng / IMAGE_EXE
+    if not exe.exists():
+        fail(f"the image engine is missing ({exe})", "run setup again to compile the engine (it builds both)")
+    asked = a.image_quant or QI.DEFAULT_QUANT
+    ssd = getattr(a, "image_ssd_offload", None) == "on"
+    quant = asked
+    lowered = None
+    if not ssd and text_gb is not None:
+        left = ram_gb() - text_gb
+        fit, fits = QI.quant_for_ram(left)
+        if QI.QUANTS.index(fit) < QI.QUANTS.index(asked):
+            quant = fit
+            # kept in the config: the server says it at start and on the web page (the user's decision, 2026-10-15)
+            lowered = {"from": asked, "to": quant, "need_gb": round(QI.ram_need_gb(asked), 1),
+                       "ram_left_gb": round(max(left, 0.0), 1)}
+            warn(f"image model lowered from {asked} to {quant}: {asked} needs ~{QI.ram_need_gb(asked):.0f} GB of "
+                 f"RAM beside the text model, which leaves ~{max(left, 0):.0f} GB. --image-ssd-offload on keeps "
+                 f"{asked} and reads what does not fit from the SSD (slower)")
+        if not fits:
+            warn(f"even {quant} (~{QI.ram_need_gb(quant):.0f} GB) does not fit the ~{max(left, 0):.0f} GB of RAM "
+                 "the text model leaves: images read part of the model from the SSD (slower), and the PC may run "
+                 "short of RAM while one is made")
+    elif ssd:
+        ok(f"image model {quant} with SSD offload: what does not fit in RAM is read from the SSD")
+    say(f"  Image generation: Qwen-Image-2.1-Turbo {quant} on XeStrata's image engine (8 steps; "
+        "POST /v1/images/generations)")
     say("  " + QI.LICENSE_NOTE)
-    need = sum(QI.FILES[k][2] for k in (quant, "vae", "llm")) / 1e9
+    need = sum(QI.FILES[k][2] for k in (quant, "vae", "llm", "mmproj")) / 1e9
     if ask(f"Download the image model ({need:.1f} GB) and set up image generation?", ["y", "n"], "y", a.yes) != "y":
         return None
     models_dir.mkdir(parents=True, exist_ok=True)
     if free_gb(models_dir) < need + 5:
         warn(f"less than {need + 5:.0f} GB free for the image model: the download may run out of disk space")
-    exe = build_image_engine(backend)
-    for name in (quant, "vae", "llm"):
+    for name in (quant, "vae", "llm", "mmproj"):
         repo, path, size, sha = QI.FILES[name]
         dst = QI.local_path(models_dir, name)
         download(QI.file_url(name, hf_endpoint()), dst, f"image model: {Path(path).name}")
         verify_sha256(dst, size, sha)
-    cfg = QI.image_config(backend, quant, exe, models_dir, uma=bool(gpu.get("integrated")),
-                          policy=a.image_gpu_policy or "auto")
-    ok(f"image generation: {quant} on {backend}, GPU policy {cfg['gpu_policy']}")
+    cfg = QI.image_config(quant, exe, models_dir, uma=bool((gpu or {}).get("integrated")),
+                          policy=a.image_gpu_policy or "auto", ssd_offload=ssd)
+    if lowered:
+        cfg["quant_lowered"] = lowered
+    ok(f"image generation: {quant}, GPU policy {cfg['gpu_policy']}")
     return cfg
 
 
@@ -2940,8 +2892,6 @@ def choices_from_config(cfg_path: Path) -> dict:
             "context": int(ctx) if (ctx := val("--max-context")) else None,
             "kv": val("--kv") if val("--kv") in ("int8", "q4_0", "k8v4") else None,
             "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none",
-            "vision_onednn": (("on" if vis.get("onednn") else "off") if isinstance(vis, dict) and vis.get("gpu")
-                              else None),
             "esp": ("on" if Path(esp_path).name == ESP_VECTOR.name else esp_path) if esp_path else "off",
             "host": cfg.get("host"), "api_key": cfg.get("api_key"), "port": cfg.get("port"), "gpu": cfg.get("gpu"),
             "layer_split": cfg.get("layer_split"),
@@ -3871,13 +3821,10 @@ def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
         llama = get_llama_cpp()
         ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
         comp = choose_compiler(a, gpu)
-        enc = gpu_encoder(comp)
+        enc = "vulkan"
         eng = build_engine({"none": [], "gpu": [enc, "cpu"], "cpu": ["cpu"]}[vision], llama, comp)
-        # the runtime of the compiler the engine was built with (none for the distribution's), and oneAPI's only when
-        # this config uses the SYCL image encoder (oneMKL): a free install never puts oneAPI on the engine's library
-        # path
-        lib_dirs = list(dict.fromkeys(comp["lib_dirs"] +
-                                      (oneapi_lib_dirs() if vision == "gpu" and enc == "gpu" else [])))
+        # the runtime of the compiler the engine was built with (none for the distribution's)
+        lib_dirs = list(dict.fromkeys(comp["lib_dirs"]))
         ok(f"engine: {eng / EXE}")
     return llama, eng, enc, lib_dirs
 
@@ -3969,6 +3916,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     args = ["--native", str(gguf), "--max-context", str(ctx)]
     if fam.get("profile"):                             # the experts filled into VRAM at start, most routed first
         args += ["--expert-profile", str(ROOT / "data" / fam["profile"])]
+    if fam.get("draft_vocab"):                         # the MTP layer's drafts over a token subset (--draft-vocab)
+        args += ["--draft-vocab", str(ROOT / "data" / DRAFT_VOCABS.get(a.draft_vocab or "cjk", "draft_vocab.bin"))]
     if a.vram_reserve_mib is not None:
         warn("--vram-reserve-mib is not available for this model yet: not used")
     cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(STATE),
@@ -4134,21 +4083,19 @@ def main() -> int:
     ap.add_argument("--vision", choices=["yes", "no", "none", "gpu", "cpu"],
                     help="let the model read images (yes = gpu: the encoder on the GPU, the CPU encoder taking over "
                          "when it cannot start; cpu = on the CPU only)")
-    ap.add_argument("--vision-onednn", choices=["on", "off"],
-                    help="the SYCL image encoder with oneDNN, when built with it: a little faster, but an image's "
-                         "embeddings vary slightly from run to run (default off; the server's --vision-onednn "
-                         "overrides it for one start)")
     ap.add_argument("--vision-tokens", type=int, metavar="N",
                     help="the most image tokens a picture becomes (default 1024 with the encoder on the GPU, 300 on "
                          "the CPU): more reads small text and charts better, and takes longer to encode; remembered "
                          "for this model")
     ap.add_argument("--images", choices=["qwen-image", "no"],
-                    help="image generation (POST /v1/images/generations): Qwen-Image-2.1-Turbo through "
-                         "stable-diffusion.cpp, compiled here; no = take it out of the config (docs/IMAGES.md)")
+                    help="image generation (POST /v1/images/generations): Qwen-Image-2.1-Turbo on XeStrata's image "
+                         "engine; no = take it out of the config")
     ap.add_argument("--image-quant", choices=["Q4_K_M", "Q6_K", "Q8_0"],
-                    help="the image model's size (default by GPU memory: Q4_K_M up to 8 GB, Q6_K up to 12, Q8_0 above)")
-    ap.add_argument("--image-backend", choices=["vulkan", "cpu"],
-                    help="where images are made (default: vulkan, on the GPU of any maker)")
+                    help="the image model's size (default Q8_0, lowered when its files would not fit the RAM the "
+                         "text model leaves; the GPU's memory does not decide it)")
+    ap.add_argument("--image-ssd-offload", choices=["on", "off"],
+                    help="on: keep the image model's size even when the RAM is short, and read what does not fit "
+                         "from the SSD (slower); off (default): a smaller size instead")
     ap.add_argument("--image-gpu-policy", choices=["auto", "keep", "shrink", "unload"],
                     help="what the text model does during an image job (default auto: stays loaded when both fit, "
                          "else gives VRAM back or is unloaded and its conversation restored afterwards)")
@@ -4186,11 +4133,11 @@ def main() -> int:
                     help="where the model files come from: auto (default: Hugging Face), huggingface or modelscope "
                          "(mainland China: the same files, checked against ModelScope's published SHA-256; "
                          "STRATA_SOURCE)")
-    ap.add_argument("--license", choices=LICENSES,
+    ap.add_argument("--license", choices=[*LICENSES, "contrib-icpx"],
                     help="the build mode: free builds with free software only, for Intel and AMD GPUs; contrib (the "
                          "default) builds with intel/llvm's CUDA target for Intel, AMD and NVIDIA GPUs, and hands the "
-                         "dense matrix products to oneMKL, cuBLAS and rocBLAS; contrib-icpx builds with Intel oneAPI's "
-                         "icpx and oneMKL, for Intel GPUs, with the SYCL image encoder. Kept for later runs")
+                         "dense matrix products to oneMKL, cuBLAS and rocBLAS. Kept for later runs (contrib-icpx was "
+                         "removed: it stops with a pointer to contrib)")
     ap.add_argument("--intel-llvm", metavar="DIR",
                     help="build the engine with the intel/llvm installed in DIR (bin/clang++); kept for later runs")
     ap.add_argument("--cmake-arg", action="append", metavar="KEY=VALUE",
@@ -4282,6 +4229,9 @@ def main() -> int:
                          "--clients N, --compare DIR). --bench is XeStrata's own measurement")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    if a.license == "contrib-icpx":
+        fail("--license contrib-icpx: the contrib-icpx mode (Intel oneAPI's icpx) was removed",
+             "use --license contrib (contrib-llvm: intel/llvm, for Intel, AMD and NVIDIA GPUs), or --license free")
     if a.source:
         os.environ["STRATA_SOURCE"] = a.source
     if a.inspect:                                      # upstream #911: headers only, nothing is installed
@@ -4347,7 +4297,6 @@ def main() -> int:
                 adopted = prev
                 a.kv = a.kv or ch["kv"]
                 a.vision = a.vision or ch["vision"]
-                a.vision_onednn = a.vision_onednn or ch["vision_onednn"]
                 a.experimental_speed_projection = a.experimental_speed_projection or ch["esp"]
                 a.host, a.api_key = a.host or ch["host"], a.api_key or ch["api_key"]
                 a.port = a.port or ch["port"]
@@ -5037,20 +4986,15 @@ def main() -> int:
                    "threads": max(1, (os.cpu_count() or 8) // 2)}
         cfg["vision"] = {"mmproj": str(mmproj), "model": str(shards[0]), **cpu_enc}
         if vision == "gpu":
-            onednn = enc == "gpu" and a.vision_onednn == "on"   # oneDNN: ggml-sycl only
-            if onednn and not sycl_encoder_onednn():
-                warn("the SYCL image encoder was built without oneDNN (not installed): "
-                     "--vision-onednn on has no effect")
-                onednn = False
             # the GPU encoder takes the card by PCI address: with Vulkan the first GPU can be another card
             cfg["vision"] = {"mmproj": str(mmproj), "model": str(shards[0]), "exe": str(eng / VEXE[enc]),
                              "gpu": True, "gpu_pci": gpu["pci"], "max_tokens": vt,
-                             "onednn": onednn,
                              "fallback": cpu_enc}   # the server starts it when the GPU encoder does not start
     elif a.vision_tokens is not None:
         warn("--vision-tokens: images are off for this model, so it is not used")
     if a.images:                                       # only when given: else an earlier "images" is carried over
-        cfg["images"] = setup_images(a, gpu, Path(a.models_dir))
+        cfg["images"] = setup_images(a, gpu, Path(a.models_dir), Path(cfg["exe"]).parent,
+                                     text_ram_gb(cfg["args"], ram, model))
     return finish_setup(a, cfg, tag, port, adopted, vision != "none",
                         notes=agent_cache_note(cfg["args"], ram, MODELS[model]["ram_gb"]))
 

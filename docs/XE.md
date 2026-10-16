@@ -30,6 +30,60 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
 
+## Integration through Strata 0.1.44.1
+
+The changes of upstream Strata 0.1.43.1 to 0.1.44.1 (`296b59d2`) are carried into Xe.
+From this run on, Windows changes are taken too (except the HIP parts, which XeStrata's Windows build does not have).
+
+The main ones:
+
+- Qwen3.6-35B-A3B (Unsloth's UD-Q4_K_XL, UD-Q6_K_XL and Q8_0 with the MTP layer) is read on the same plain path as
+  Ornith-1.5. Upstream gave Qwen3.6 an engine of its own for CUDA; in XeStrata the plain path reads the GDN's F32
+  alpha and beta and the MTP layer's BF16 routers. Its answers were compared with llama.cpp's and it runs on the three
+  makers' GPUs. Right after a prompt the VRAM tier is filled with the experts that prompt used most (upstream's q36
+  idea), which makes decode 20-40% faster (Ornith and llm-jp too).
+- Image generation (Qwen-Image-2.1-Turbo, `POST /v1/images/generations`): instead of upstream's stable-diffusion.cpp,
+  XeStrata's own SYCL image engine, `strata-image` (the DiT, the VAE and the text encoder; attention on the matrix
+  units; resident beside the server, streaming the layers that do not fit in VRAM).
+- Unsloth's files: the K-quant experts' weights are decoded once per grouped call (KqSplit, the same bits; B70
+  UD-Q4_K_XL decode +7%). setup offers UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 as well (experimental).
+- The commit graph does every GDN and QSA layer in one launch (`STRATA_COMMIT_BATCH`, on by default).
+- The layer split's automatic placement (among near ties, the one that leaves the tightest card the most room; a slow
+  link's miss cost only from a 4x gap), and the VRAM check at start covers the later cards too.
+- The 16384-token prompt chunk only where the RAM covers its loan. The arena's MADV_HUGEPAGE is not asked for when
+  free 2 MiB blocks cover less than half of it (#2126).
+- serve: a long read gives way to a short request at its next chunk (#656), opencode's `<env>` block moved into the
+  first user message (`"env_to_user"`, opt-in), the image encoder only while there are pictures (`"elastic"`, opt-in),
+  an engine stopped inside the GPU runtime's set-up started again, how a crashed engine ended, the Responses API's
+  `reasoning_effort`, pictures matched by their bytes in the conversation cache (#2228), and the stdin reader's QUIT
+  race.
+- The quantization yardstick (`tools/quant_quality.py`, `tools/quant_formats.py`).
+- `STRATA_HC_Q8` (the hyper-connection down/up read in Q8_0; a BF16 pack's quantized at load): both forms are timed
+  at load and the faster kept; with Q8_0 on one GPU the BF16 copies leave the VRAM, and on AMD the read also writes
+  the next projections' q8_1 (B70 decode +3.5%; an approximation that changes the output).
+- Ported and kept opt-in: `STRATA_MTP_PRIO` and `STRATA_COPY_PRIO`, `STRATA_POOL_UMWAIT`, `STRATA_PCIE_MIN1`, `--adapt-async 1` in the arena
+  mode, `STRATA_DENSE_F32`.
+
+Fixed on XeStrata's side during this integration:
+
+- A failed GPU query is told from an unfinished one, and a wait ends with an error (issue #12). The "RAM is tight"
+  warning counts the experts actually placed in RAM (issue #11).
+- WSL2: setup not finding the GPU, a failure in the plain path's PCIe split, and a prompt buffer too large (the three
+  points of a report).
+- A container to install and run it with Podman (podman compose).
+
+Compared with upstream v0.1.44.1 on the three makers' GPUs (generate on five model files, serve, everyday use):
+on the RTX 4070 generate's decode is 8-21% faster on all five files and the prefill as fast or faster (IQ3_XXS at 1K
+16%, IQ2_XS 15%). On the RX 9060 XT the prefill is 2.1-3.2x, but IQ3_XXS's decode is 2.5-4.7% slower: upstream reads
+the hyper-connection down/up projections in Q8_0 by default on gfx12 (+4.4% when turned off and on in upstream).
+XeStrata times it at load and takes Q8_0 too, but gains only 0.6% on the RX 9060 XT. The B70 is not compared
+with upstream; on the same text it is as fast as XeStrata before this integration.
+
+Not ported: the Mac (Metal), upstream's `sycl/`, the NVFP4 experts (on GPUs without FP4 matrix units their prompts
+are slower than the IQ formats', and their quality below UD-Q4_K_XL's), upstream's CUDA-only Qwen3.6 engine, gfx1103
+in the gfx11 WMMA kernels (held with the RDNA2 and 3 items), `--prefill-head-alias` and the arena's pin by need (they
+do not fit XeStrata's USM and arena), and upstream's test tools and records.
+
 ## Integration through Strata 0.1.43.1
 
 The changes of upstream Strata 0.1.43 to 0.1.43.1 (`a0116b27`) are carried into Xe, except the Windows implementation.
@@ -279,7 +333,6 @@ The Xe library exports `embedding_gather`, `gdn_gate`, `scale_inplace`, `f32_to_
 The other declarations in `elementwise.hpp` are not ported and not provided by the library.
 These kernels and the parity oracle are compiled without fast math and without multiply/add contraction.
 
-Everything icpx compiles uses `-ffp-model=precise`: icpx defaults to fast, and upstream's host code was built with g++.
 All device code is built with `-foffload-fp32-prec-div -foffload-fp32-prec-sqrt`.
 CUDA divides and takes square roots with IEEE rounding by default; SYCL device code does not.
 `quantize_act_parity` sees the one-ulp difference in Q8_K's `1/iscale`.
@@ -430,29 +483,16 @@ The CPU encoder reads the pictures checked as llama.cpp does, on grids of both s
 Every model that runs was checked with images:
 two grid shapes, two images in one request, and a conversation that sends the image again and reuses its cache.
 
-The GPU encoder comes in two builds.
-Both take the B70 by its PCI address (`strata-vision --gpu-pci`, from the config's `vision.gpu_pci`):
+The GPU encoder is the Vulkan build (ggml-vulkan, `-DSTRATA_VISION_VULKAN=ON`).
+It takes the GPU by its PCI address (`strata-vision --gpu-pci`, from the config's `vision.gpu_pci`):
 with Vulkan the first GPU can be the processor's graphics or another card.
-
-- **Vulkan** (ggml-vulkan, `-DSTRATA_VISION_VULKAN=ON`): the free build's.
-  Its driver is Mesa, free software.
-  It encodes 7–9× faster than the CPU encoder (8 threads) and about half as fast as the SYCL one.
-  Its embeddings differ from the CPU encoder's by 2.4–3.1% (relative L2), less than the SYCL encoder's, and repeat bit for bit.
-- **SYCL** (ggml-sycl, `-DSTRATA_VISION_SYCL=ON`): in the contrib-icpx mode (`--license contrib-icpx`), when oneMKL is installed.
-  ggml-sycl links oneMKL, which is not free software.
-  Every node runs on the GPU; it encodes 13–20× faster than the CPU encoder, with the same answers or a rewording at a near-tie.
-  Its embeddings differ from the CPU encoder's by 3–6% (relative L2); it was adopted without a tolerance for that.
-
-ggml-sycl takes oneDNN (`intel-oneapi-dnnl-devel`) when it is installed at build time.
-With it the SYCL encoder is 1.2–1.5× faster per image, but the same image gives slightly different embeddings from run to run.
-So it is off unless chosen.
-`./setup.sh --vision-onednn on` writes `"onednn": true` in the config, and the server's `--vision-onednn on|off` overrides it for one start.
-The server sets `GGML_SYCL_ENABLE_DNN` and `GGML_SYCL_FA_ONEDNN` for the encoder; off gives the same bits as a build without oneDNN.
+On Intel GPUs its driver is Mesa, free software.
+It encodes 7–9× faster than the CPU encoder (8 threads); its embeddings differ from the CPU encoder's by 2.4–3.1% (relative L2) and repeat bit for bit.
+(The SYCL build of the contrib-icpx mode, ggml-sycl with oneMKL, was removed with that mode on 2026-10-15.)
 
 The server starts the encoders in this order until one is ready:
 
-1. the GPU encoder (with oneDNN if chosen)
-1. the GPU encoder without oneDNN
+1. the GPU encoder
 1. the CPU encoder (the config's `vision.fallback`)
 
 The console and `/v1/status` (`vision.encoder`, `vision.fallback`) say which one serves and why the ones before it did not start.

@@ -1539,6 +1539,11 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
 // context not yet up to speed), and the low reading set the share.  Such a disturbance only ever slows a copy, so the
 // same 1 GiB is copied as four bursts of 256 MiB, timed one by one, and the fastest is the link's figure.  `samples`,
 // when given, gets every burst's reading for the log.
+// Each GPU's last link reading (probe_pcie_h2d_gbps), for the ones taken again after the model is loaded
+std::map<int, double>& link_readings() {
+    static std::map<int, double> seen;
+    return seen;
+}
 double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
     constexpr size_t kBytes = 256ull << 20;
     constexpr int kBursts = 4;
@@ -1580,7 +1585,47 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
     }
     strata::gpu::free(d);
     strata::gpu::free(h);
+    if (bw > 0.0) link_readings()[strata::core::current_device()] = bw;
     return bw;
+}
+
+// set_helper (the prompt path): an expert the helper GPU holds goes to it when moving its tokens' rows there and back
+// (2 x n_embd floats a token) over the helper's link takes less time than streaming the expert to this GPU over its
+// own: tokens < blob / (2 * n_embd * 4) x (the helper's link / this GPU's).  B70 (25 GB/s) + RTX 4070 (6 GB/s on a x4
+// link), IQ3_XXS: about 18.  The links are the readings taken at the start (probe_helper_links): read here, the probes
+// took 0.43 s of the first prompt's time to its first token.  STRATA_PREFILL_HELPER_ROWS=n sets it; 0 turns it off.
+void attach_prompt_helper(strata::prefill::Prefill& sp, strata::core::RemoteExperts& helper, const char* who) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || lay.fmt.empty()) return;
+    int64_t rows = -1;
+    double l0 = 0, lh = 0;
+    if (const char* v = std::getenv("STRATA_PREFILL_HELPER_ROWS")) rows = std::strtoll(v, nullptr, 10);
+    if (rows < 0) {
+        auto link = [&](int dev) {
+            const auto it = link_readings().find(dev);
+            return it != link_readings().end() ? it->second : -1.0;
+        };
+        l0 = link(strata::core::current_device());
+        lh = link(helper.device());
+        double blob = 0;
+        for (size_t l = 0; l < lay.fmt.size(); ++l) blob += (double) lay.blob_bytes((int64_t) l);
+        blob /= (double) lay.fmt.size();
+        rows = l0 > 0.0 && lh > 0.0 ? (int64_t) (blob / (2.0 * strata::kernels::cpu::H * 4) * lh / l0) : 0;
+    }
+    if (rows <= 0) {
+        if (l0 <= 0.0 || lh <= 0.0)
+            std::fprintf(stderr, "strata %s: the helper GPU takes no share of the prompt's experts%s\n", who,
+                         std::getenv("STRATA_PREFILL_HELPER_ROWS") ? " (STRATA_PREFILL_HELPER_ROWS)" : ": a link was not read");
+        return;
+    }
+    std::string err;
+    if (!sp.set_helper(&helper, rows, err)) {
+        std::fprintf(stderr, "strata %s: the helper GPU's prompt share: %s; this GPU streams those experts\n", who,
+                     err.c_str());
+        return;
+    }
+    std::fprintf(stderr, "strata %s: the helper GPU computes the prompt's experts it holds that at most %lld of a chunk's "
+                         "tokens route to (links %.1f and %.1f GB/s)\n", who, (long long) rows, l0, lh);
 }
 
 // The time of one small host->device copy (64 KiB, the median of 16 after a warmup): the fixed part of a layer
@@ -1691,6 +1736,105 @@ double bench_copy_gbps(bool to_device, bool pinned) {
     return bw;
 }
 
+// The median of `n` timed runs of `fn` (each one synchronous), in microseconds.
+template <class F> double median_us(int n, F fn) {
+    std::vector<double> t;
+    for (int i = 0; i < n; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!fn()) return -1.0;
+        t.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+    }
+    std::sort(t.begin(), t.end());
+    return t[t.size() / 2];
+}
+
+// Multi-GPU (a layer split, a peer tier): each GPU's link both ways and the fixed cost of a small copy and of a
+// launch waited for; for each later GPU with device 0, what moving activations from one to the other through the host
+// takes (a D2H on 0 and an H2D on the other, 64 KiB and 1 MiB) and the bandwidth when both read one RAM region at
+// once (does the RAM cap them?), and whether they can reach each other's memory directly.  `HW gpuN_...` and
+// `HW pair0N_...` lines; nothing on one GPU but its own.
+void hw_bench_gpus() {
+    namespace gpu = strata::gpu;
+    using strata::core::OnDevice;
+    const int n = strata::core::Runtime::count();
+    std::printf("HW gpus %d\n", n);
+    for (int d = 0; d < n; ++d) {
+        OnDevice on(d);
+        std::string name = gpu::device_name(d);
+        std::replace(name.begin(), name.end(), ' ', '_');
+        std::printf("HW gpu%d_name %s\n", d, name.c_str());
+        std::printf("HW gpu%d_h2d_gb_s %.2f\n", d, bench_copy_gbps(true, true));
+        std::printf("HW gpu%d_d2h_gb_s %.2f\n", d, bench_copy_gbps(false, true));
+        constexpr size_t kSmall = 64 << 10;
+        void* h = gpu::alloc_host(kSmall);
+        void* dv = gpu::alloc_device(kSmall);
+        if (h != nullptr && dv != nullptr) {
+            std::printf("HW gpu%d_copy_64k_us %.1f\n", d, median_us(64, [&] { return gpu::copy(dv, h, kSmall); }));
+            std::printf("HW gpu%d_launch_us %.1f\n", d, median_us(64, [&] { return gpu::memset(dv, 0, 4); }));
+        }
+        gpu::free(dv);
+        gpu::free(h);
+    }
+    for (int d = 1; d < n; ++d) {
+        constexpr size_t kBig = 256ull << 20;
+        // ordinary memory registered on both GPUs, as a layer split's arena is (one runtime's host USM is not
+        // another's: a Level Zero GPU's host memory cannot be registered on a CUDA one)
+        void* host = strata::platform::DirectFile::alloc_aligned(kBig);
+        void *d0 = nullptr, *d1 = nullptr;
+        {
+            OnDevice on(0);
+            d0 = gpu::alloc_device(kBig);
+        }
+        {
+            OnDevice on(d);
+            d1 = gpu::alloc_device(kBig);
+        }
+        const bool reg0 = host != nullptr && gpu::host_register_on(0, host, kBig);
+        const bool reg = reg0 && gpu::host_register_on(d, host, kBig);
+        if (host != nullptr && d0 != nullptr && d1 != nullptr && reg) {
+            std::memset(host, 0, kBig);
+            for (size_t bytes : {(size_t) 64 << 10, (size_t) 1 << 20}) {
+                const double us = median_us(32, [&] {
+                    bool ok;
+                    {
+                        OnDevice on(0);
+                        ok = gpu::copy(host, d0, bytes);
+                    }
+                    OnDevice on(d);
+                    return ok && gpu::copy(d1, host, bytes);
+                });
+                std::printf("HW pair0%d_relay_%zuk_us %.1f\n", d, bytes >> 10, us);
+            }
+            // both GPUs copy the same RAM region to themselves at once, four times each
+            auto stream_in = [&](int dev, void* dst, double* secs) {
+                OnDevice on(dev);
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < 4; ++i) gpu::copy(dst, host, kBig);
+                *secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            };
+            double s0 = 0, s1 = 0;
+            std::thread a(stream_in, 0, d0, &s0), b(stream_in, d, d1, &s1);
+            a.join();
+            b.join();
+            // each GPU's own rate while the other reads too (a share of the RAM's, or its link's)
+            std::printf("HW pair0%d_both_h2d_gb_s %.2f %.2f\n", d, (double) (4 * kBig) / s0 / 1e9,
+                        (double) (4 * kBig) / s1 / 1e9);
+        }
+        std::printf("HW pair0%d_peer_access %d\n", d, gpu::peer_access(0, d) ? 1 : 0);
+        if (reg) gpu::host_unregister_on(d, host);
+        if (reg0) gpu::host_unregister_on(0, host);
+        {
+            OnDevice on(d);
+            gpu::free(d1);
+        }
+        {
+            OnDevice on(0);
+            gpu::free(d0);
+        }
+        strata::platform::DirectFile::free_aligned(host);
+    }
+}
+
 // The SSD under the model: `path` read with O_DIRECT (past the page cache) in 8 MiB blocks by four threads, up to
 // 4 GiB of it, in GB/s.
 double bench_ssd_read_gbps(const std::string& path, double* gib_read) {
@@ -1751,8 +1895,8 @@ double bench_ssd_read_gbps(const std::string& path, double* gib_read) {
 }
 
 // `strata --hw-bench [--native GGUF | --pack DIR]`: the RAM with the expert pool's threads (every physical core, as
-// the pool and the host thread take them) and with one, the PCIe copies each way, the SSD under the model (the
-// native GGUF, else the pack's largest file).
+// the pool and the host thread take them) and with one, the PCIe copies each way, every GPU's and every pair's
+// (hw_bench_gpus), the SSD under the model (the native GGUF, else the pack's largest file).
 int hw_bench(const std::string& pack, const std::string& native) {
     const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
     const size_t ram = (size_t) strata::platform::total_physical_memory();
@@ -1764,6 +1908,7 @@ int hw_bench(const std::string& pack, const std::string& native) {
     std::printf("HW d2h_gb_s %.2f\n", bench_copy_gbps(false, true));
     std::printf("HW h2d_pageable_gb_s %.2f\n", bench_copy_gbps(true, false));
     std::printf("HW d2h_pageable_gb_s %.2f\n", bench_copy_gbps(false, false));
+    hw_bench_gpus();
     std::string file = native;
     if (file.empty() && !pack.empty()) {
         std::error_code ec;
@@ -2121,9 +2266,18 @@ void route_stop_signals() {
     sigaddset(&set, SIGTERM);
     sigaddset(&set, SIGINT);
     if (pthread_sigmask(SIG_BLOCK, &set, nullptr) != 0) return;
+    // The GPUs' queues are drained first, for at most 5 s: on the B70 (xe driver) a copy-engine job still queued when
+    // the process ended read memory the exit had unmapped (an engine memory fault, and a reset).  Of 7 engines ended
+    // as everyday use's bench ends them (the server's process group at once) 4 faulted, with STRATA_COPY_ENGINE=0 as
+    // well (the runtime's own copies), and none once drained, 2026-10-15.
     std::thread([set] {
         int sig = 0;
         while (sigwait(&set, &sig) != 0) {}
+        std::thread([sig] {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            _exit(128 + sig);
+        }).detach();
+        strata::core::Runtime::finish_all();
         _exit(128 + sig);
     }).detach();
 #endif
@@ -2503,8 +2657,7 @@ int main(int argc, char** argv) {
         }
     }
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
-    // the next discrete ones); "auto" chooses the K before anything is loaded (below).  The helper caches
-    // (--expert-cache-remote) are not carried by the Xe engine at all (remote_experts.cpp).
+    // the next discrete ones); "auto" chooses the K before anything is loaded (below).
     {   // the RAM guard (parking, session save/restore): --memory-limit-mib, else STRATA_MEMORY_LIMIT_MIB, else none
         int64_t mib = o.memory_limit_mib;
         if (mib < 0) {
@@ -2634,7 +2787,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts needs --mmap-experts and a static --expert-profile\n");
         return 2;
     }
-    const bool multi_gpu = !split_devs.empty() && !split_same;
+    // a layer split across GPUs; --layer-split auto may give its GPU the helper cache's role instead (below)
+    bool multi_gpu = !split_devs.empty() && !split_same;
     // the helper-GPU expert caches (--expert-cache-remote, upstream's docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order
     int remote_dev[3] = {1, 2, 3};
@@ -2643,8 +2797,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: a layer split across GPUs needs --expert-profile\n");
             return 2;
         }
-        int n_vis = 1;
-        // one Xe device (docs/XE.md): no helper GPU is visible
+        const int n_vis = strata::core::Runtime::count();
         int next_free = 1;
         for (int r = 0; r < 3; ++r) {
             if (o.expert_cache_remote[(size_t) r] <= 0) continue;
@@ -2933,17 +3086,19 @@ int main(int argc, char** argv) {
     strata::core::progress_at("starting: building the GPU kernels (on a thread beside the load)");
     strata::core::Runtime::get().preload_kernels();   // beside the model's loading
     // and on every other GPU of a layer split, with its matrix products' library (each GPU builds its own kernels)
-    if (multi_gpu)
-        for (const int d : split_devs) strata::core::Runtime::at(d).preload_kernels();
+    std::vector<int> preloaded;
+    if (multi_gpu) preloaded = split_devs;
+    for (int r = 0; r < 3; ++r)   // and on the helper GPUs
+        if (o.expert_cache_remote[(size_t) r] > 0) preloaded.push_back(remote_dev[r]);
+    for (const int d : preloaded) strata::core::Runtime::at(d).preload_kernels();
     // stopped when main returns, whichever way (stop_preload)
     struct PreloadStop {
-        const std::vector<int>* split;
+        const std::vector<int>& others;
         ~PreloadStop() {
             strata::core::Runtime::get().stop_preload();
-            if (split != nullptr)
-                for (const int d : *split) strata::core::Runtime::at(d).stop_preload();
+            for (const int d : others) strata::core::Runtime::at(d).stop_preload();
         }
-    } preload_stop{multi_gpu ? &split_devs : nullptr};
+    } preload_stop{preloaded};
     // The matrix products' library (oneMath's backend) loaded and its first products run before the first prompt, and
     // what it holds on this GPU counted into the reserve when the cache is sized (blas_bytes), as for a library loaded
     // at its first use: hipBLASLt holds 0.2-0.3 GiB (172 MiB for its handle, ~78 for each kernel type's code), which
@@ -2963,6 +3118,14 @@ int main(int argc, char** argv) {
         for (const int d : split_devs) {
             const strata::core::OnDevice on(d);
             strata::prefill::Gemm::prepare();
+        }
+    // a helper GPU (--expert-cache-device1): both links, for its share of the prompt's experts (attach_prompt_helper),
+    // before the model takes the room the probe copies through; --layer-split auto reads them itself
+    if (o.expert_cache_remote[0] > 0 && native_pack)
+        for (const int d : {0, remote_dev[0]}) {
+            if (link_readings().count(d)) continue;
+            const strata::core::OnDevice on(d);
+            (void) probe_pcie_h2d_gbps();
         }
     strata::core::progress_at("starting: loading the weights, the session and the expert caches");
     {
@@ -3577,6 +3740,67 @@ int main(int argc, char** argv) {
                              as.c_str(), alt_ms, 100.0 * (alt_ms / best_ms - 1.0), ks.c_str(), best_ms, as.c_str());
             }
         }
+        // The other role for a second GPU: no stage of the split, but a helper expert cache (RemoteExperts, as
+        // --expert-cache-device1) beside CUDA0 alone.  CUDA0's cache takes the profile's hottest pairs as alone, the
+        // helper the next ones that fit its free memory (less RemoteExperts' 512 MiB and its staging); in a layer the
+        // GPU's, the CPU's and the helper's shares overlap (the largest counts), and the helper's pays a round trip
+        // over its link (the activations there, the rows back).  The faster prediction takes the GPU, said with
+        // both times.  STRATA_SPLIT_ROLE=split / helper: that role whatever the prediction.  Two GPUs only, with the
+        // expert pool (the helper's rows are the pool's), without --pipeline-windows (a split's own) and without --batch
+        // slots (their groups run one a GPU on a split; the helper was not tried with them).
+        const char* role_env = std::getenv("STRATA_SPLIT_ROLE");
+        const std::string role = role_env != nullptr ? role_env : "";
+        if (ns == 2 && !o.no_pool && o.pipeline_windows <= 0 && o.batch <= 0 && role != "split") {
+            const int h = 1;   // the second GPU's index in the measurements above
+            std::vector<double> held0_l((size_t) L, 0.0), heldh_l((size_t) L, 0.0);
+            const int64_t cap0 = std::max<int64_t>(cap_raw(0, 0, -1, true), 0);
+            const int64_t caph = free0[(size_t) h] - ((int64_t) (512 + 256) << 20);
+            int64_t u0 = 0, uh = 0, nh = 0;
+            bool full0 = false;
+            for (size_t r = 0; r < prof.size(); ++r) {
+                const int64_t l = prof[r].first, c = cost(l);
+                if (!full0) {
+                    if (u0 + c <= cap0) {
+                        u0 += c;
+                        held0_l[(size_t) l] += mass[r];
+                        continue;
+                    }
+                    full0 = true;
+                }
+                if (uh + c > caph) break;
+                uh += c;
+                heldh_l[(size_t) l] += mass[r];
+                ++nh;
+            }
+            const double rt = 2.0 * side_ms(h);
+            double ms = 0, kept = 0, all = 0;
+            for (int64_t l = 0; l < L; ++l) {
+                const double lm = layer_mass[(size_t) l];
+                const double hit0 = lm > 0 ? held0_l[(size_t) l] / lm : 1.0, hith = lm > 0 ? heldh_l[(size_t) l] / lm : 0.0;
+                const double experts = (double) Ka * rows * (double) lay.blob_bytes(l);
+                const double gpu = experts * hit0 / bw[0];
+                const double cpu = experts * std::max(0.0, 1.0 - hit0 - hith) / cpu_bw * link_scale[0];
+                const double help = hith > 0 ? experts * hith / bw[(size_t) h] + rt : 0.0;
+                ms += dense_layer / bw[0] + std::max({gpu, cpu, help});
+                kept += held0_l[(size_t) l] + heldh_l[(size_t) l];
+                all += lm;
+            }
+            ms += ((double) head_bytes + (drafts ? (rows - 1.0) * dense_layer : 0.0)) / bw[0];
+            const bool helper = nh > 0 && (role == "helper" || ms < best_ms);
+            std::fprintf(stderr, "strata generate: layer split auto: CUDA%d as a helper expert cache instead: %.1f ms per "
+                                 "decode window (%lld more experts there, ~%.1f%% of the routed mass on the GPUs) "
+                                 "against %.1f split at K=%s -> %s%s\n",
+                         dev_of_stage(h), ms, (long long) nh, all > 0 ? 100.0 * kept / all : 0.0, best_ms, ks.c_str(),
+                         helper ? "the helper" : "the split", role.empty() ? "" : " (STRATA_SPLIT_ROLE)");
+            if (helper) {
+                o.expert_cache_remote[0] = (int) nh;
+                remote_dev[0] = dev_of_stage(h);
+                split_devs.clear();
+                split_at.clear();
+                o.layer_split.clear();
+                multi_gpu = false;
+            }
+        }
     }
     // Layer split across GPUs (upstream e50f2663, 12c099b3, 13f70a34): every GPU holds only the dense weights of ITS
     // layers (the PLE tensors stay everywhere).  A full copy on each card (~1.5 GB for IQ2_XS) is VRAM the expert cache
@@ -3603,6 +3827,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: layer split: CUDA0 loads the dense weights of layers 0-%lld only\n",
                      (long long) split_at[0] - 1);
     }
+    // STRATA_HC_Q8 (upstream b60aab1b, one GPU): the layers' hyper-connection down / up projections are left out of
+    // the arena and loaded beside it, so that when NativeDense chooses their Q8_0 read their BF16 (1.17 GiB with
+    // IQ3_XXS, against 0.62 GiB of Q8_0) goes back to the expert cache.
+    std::set<std::string> hc_side, hc_others;
+    const bool hc_side_on = split_devs.empty() && !o.keep_canonical && !o.native_dense_gguf.empty() &&
+                            strata::core::NativeDense::hc_q8_wanted() &&
+                            strata::core::NativeDense::hc_side_names(o.pack, hc_side, hc_others, err) &&
+                            !hc_side.empty();
+    if (hc_side_on) skip.insert(hc_side.begin(), hc_side.end());
     uint64_t pool_bytes = 0;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -3638,12 +3871,36 @@ int main(int argc, char** argv) {
                          "skipped: served natively)\n",
                  (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), load_s(), skip.size());
     mem_mark("the pack weights");
+    strata::core::WeightTable hc_wt;
+    void* hc_arena = nullptr;
+    if (hc_side_on) {
+        uint64_t hc_bytes = 0;
+        if (!strata::core::WeightTable::pool_bytes(o.pack, hc_bytes, err, &hc_others) ||
+            !strata::gpu::alloc_device(&hc_arena, hc_bytes) ||
+            !hc_wt.load(o.pack, hc_arena, hc_bytes, err, &hc_others)) {
+            std::fprintf(stderr, "strata generate: the hyper-connection projections: %s\n",
+                         err.empty() ? strata::gpu::last_error() : err.c_str());
+            return 1;
+        }
+        strata::core::NativeDense::adopt(wt, hc_wt);
+    }
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
+        native_dense.set_hc_side(hc_side_on);
         if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
+        }
+        if (hc_side_on && native_dense.hc_q8_chosen()) {
+            if (!native_dense.drop_hc_bf16(wt, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            strata::gpu::free(hc_arena);
+            hc_arena = nullptr;
+            std::fprintf(stderr, "strata generate: STRATA_HC_Q8: the BF16 hyper-connection projections freed (%.2f "
+                                 "GiB back to the expert cache)\n", (double) hc_wt.report().arena_bytes / 1073741824.0);
         }
         std::fprintf(stderr, "strata generate: %zu native projection matrices, %.2f MiB of weights, in %.1f s\n",
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0), load_s());
@@ -6374,6 +6631,23 @@ int main(int argc, char** argv) {
                                  "--conversation-save are off (a parked conversation carries the draft layer's K/V)\n");
             o.conversation_save.clear();
         }
+        // STRATA_PREFILL_HELPER_SOURCE (opt-in): the prompt path may take a blob a helper's VRAM cache already
+        // holds from that cache instead of reading the files again.  The helpers are idle while a prompt is read
+        // (the serve path is serial: no batch slots), so the copy needs no ordering against their kernel streams.
+        // Default off: the prompt path's source is srcp, exactly as before.
+        std::vector<strata::core::RemoteExperts*> prefill_helpers;
+        prefill_helpers.reserve((size_t) drive.d.remote_count);
+        for (int r = 0; r < drive.d.remote_count; ++r) prefill_helpers.push_back(drive.d.remote[r]);
+        std::unique_ptr<strata::core::RemotePrefillSource> prefill_helper_src;
+        strata::core::ExpertSource* prefill_src = srcp;
+        uint64_t helper_blobs_before = 0, helper_bytes_before = 0;
+        if (const char* hv = std::getenv("STRATA_PREFILL_HELPER_SOURCE"); hv != nullptr && std::strtol(hv, nullptr, 10) != 0 &&
+            srcp != nullptr && !multi_gpu && stages.empty() && o.batch <= 0 && !prefill_helpers.empty()) {
+            prefill_helper_src = std::make_unique<strata::core::RemotePrefillSource>(*srcp, prefill_helpers);
+            prefill_src = prefill_helper_src.get();
+            std::fprintf(stderr, "strata serve: the prompt path reads the experts a helper cache holds from that "
+                                 "cache (STRATA_PREFILL_HELPER_SOURCE)\n");
+        }
         strata::prefill::Prefill sp;
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
@@ -6462,7 +6736,7 @@ int main(int argc, char** argv) {
         if (!multi_gpu && o.batch <= 0 && !o.no_pool && cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr))
             sp.set_cpu_pool(&pool);
         mem_mark("before the prompt path init");
-        if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
+        if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             if (err.find("fit") != std::string::npos)   // #85: say what frees VRAM
                 std::fprintf(stderr, "strata serve: the GPU has too little free VRAM for the prompt path: turn images "
@@ -6470,6 +6744,7 @@ int main(int argc, char** argv) {
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
         }
+        if (drive.d.remote_count > 0 && o.batch <= 0 && !multi_gpu) attach_prompt_helper(sp, *drive.d.remote[0], "serve");
         mem_mark("the head and the prompt path");
         kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
@@ -11467,6 +11742,14 @@ int main(int argc, char** argv) {
                              (double) (remote_experts[(size_t) r].returned_bytes() - compact_before[(size_t) r]) / 1048576.0,
                              (double) (remote_experts[(size_t) r].full_row_bytes() - full_before[(size_t) r]) / 1048576.0,
                              remote_experts[(size_t) r].ms_begin(), remote_experts[(size_t) r].ms_wait());
+            if (prefill_helper_src) {
+                const uint64_t blobs = prefill_helper_src->helper_blobs(), bytes = prefill_helper_src->helper_bytes();
+                std::fprintf(stderr, "strata serve: prefill helper source: %lld blobs / %.1f MiB taken from a helper's "
+                                     "cache in this request\n",
+                             (long long) (blobs - helper_blobs_before), (double) (bytes - helper_bytes_before) / 1048576.0);
+                helper_blobs_before = blobs;
+                helper_bytes_before = bytes;
+            }
         }
         // --conversation-save: the parked conversations, then the live one (the newest file)
         if (disk.enabled()) {
@@ -11561,6 +11844,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        if (drive.d.remote_count > 0 && !multi_gpu) attach_prompt_helper(prefill, *drive.d.remote[0], "generate");
         if (!o.mtp.empty()) {
             if (!mtp.bind(wt, &native_head, nullptr, err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());

@@ -6,7 +6,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 English | [日本語](BENCH.ja.md)
 
-XeStrata's speed is measured in three ways.
+XeStrata's speed is measured in three ways, and on a PC with image generation set up, that too.
 A user's `xestrata --bench` and a developer's measurements for an upstream merge share one implementation (`tools/bench_core.py`) and the same prompts, conversations and settings,
 so a user's record and the development machines' records go into the same tables.
 
@@ -15,6 +15,7 @@ so a user's record and the development machines' records go into the same tables
 | generate | `strata` started once per run, reading the tier's prompt and writing 256 tokens (greedy) | the kernels and the speculative decoding |
 | serve | a chat of four turns sent to `strata --serve` over stdin (the tier's prompt and three follow-up questions, 256 tokens a turn) | the server's decode loop and the conversation checkpoints (the wait before a follow-up's answer) |
 | everyday use | `serve/server.py` started, requests streamed to `/v1/chat/completions` | the whole path a user meets (the chat template, the thinking, tool calls) |
+| image generation | one 1024x1024 image of 8 steps a run from a fixed prompt and seed (42), made as the server makes it (XeStrata: its resident `strata-image`, an image once it is warm; upstream: an `sd-cli` process an image) | the time of an image, and its sampling and VAE in it |
 
 The tiers are lengths of a coding agent's prompt (XeStrata's sources at 58dbbe5, read as files): 1K, 4K, 32K, 64K, 128K, 192K and 262K.
 Each tier runs with what setup writes for its context (INT8 K/V above 8K, `--kv-resident 32768` from 64K).
@@ -38,6 +39,7 @@ xestrata --bench --original-strata v0.1.41        # upstream Strata's tag on the
 - The GPU is busy meanwhile. If a xestrata server is running, it says to stop it and ends.
 - generate and serve run the tiers of 64K, 32K and 1K that the config's context holds; everyday use runs at the config's context.
 - A config that splits the layers over several GPUs gets everyday use only, not generate and serve.
+- A config with image generation (`"images"`) gets it measured last, as configured (a few minutes).
 - The record goes to the data folder's `records/bench-<time>/`. Nothing is sent anywhere.
 
 | File | What it holds |
@@ -45,7 +47,7 @@ xestrata --bench --original-strata v0.1.41        # upstream Strata's tag on the
 | `summary.md` | the summary to paste into a report (read it before you paste it) |
 | `record.json` | the machine, the paths the engine chose, every measurement |
 | `tables.md` | the tables of the three measurements |
-| `runs/`, `serve-runs/`, `usage-runs/` | the log of each run |
+| `runs/`, `serve-runs/`, `usage-runs/`, `image-runs/` | the log of each run (and the images made) |
 
 ### --original-strata
 
@@ -60,6 +62,7 @@ Its engine is made as upstream's setup makes it:
 
 - NVIDIA's prebuilt engine and the Intel Docker image are not free software: a free build does not compare on NVIDIA and Intel GPUs.
 - A cell where upstream turns out to run at 10 tok/s or less is stopped in that tier and not compared (it is listed under the runs that stopped).
+- Image generation is compared only where upstream's setup built its `sd-cli` in the fetched tree (`engine-image/`), run with the settings upstream's setup writes.
 
 ## xestrata --bench-original-compat
 

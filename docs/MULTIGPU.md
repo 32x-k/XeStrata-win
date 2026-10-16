@@ -82,6 +82,11 @@ The log shows the choice (`layer split auto: K=...`); from there on it runs as i
   Up to four GPUs every order is tried, from five on the order by bandwidth (the fastest last); the config's order changes only for one predicted 2% faster or more.
   The first GPU is set when the engine starts and is not swapped, but when another first GPU is predicted faster, the log names the cards' order to set.
 - A hand-off between stages is priced from each GPU's link speed and the time of a small copy.
+- With two GPUs, the second is also priced, with the same model, as a helper cache (as `--expert-cache-device1`) instead of a stage, and the shorter time wins.
+  The first GPU then runs every layer, and the second holds the experts the first one's cache does not, as many as its free VRAM takes, and computes those of them that decode would have given the CPU (and, in a short prompt, those few tokens route to: [DETAILS](DETAILS.md#prefill-tokenss)).
+  The prediction counts the round trip over its link each layer (the inputs there, the results back).
+  The log shows which one wins (`as a helper expert cache instead: ... -> the helper`).
+  With `--pipeline-windows`, `--no-pool` or `--batch` the split stays.
 
 Environment variables change the model's assumptions:
 
@@ -91,6 +96,7 @@ Environment variables change the model's assumptions:
 | `STRATA_SPLIT_MASS_EXP` | 0.8 | a, where the expert of rank r by use takes a share (r+1)^-a of the routing |
 | `STRATA_SPLIT_CPU_GBPS` | measured | how fast the CPU reads the RAM (GB/s) |
 | `STRATA_SPLIT_NEAR_TIE_PCT` | 4 | the difference (%) within which another placement is named; 0 names none |
+| `STRATA_SPLIT_ROLE` | predicted | the second GPU's role with two GPUs: `split` a stage, `helper` the helper cache |
 
 `--vram-reserve-later-mib N` is the VRAM left free on the second and later GPUs (default: `--vram-reserve-mib`'s value; upstream 5c4105c0).
 The GPU that drives the monitors needs more headroom than one that drives none.

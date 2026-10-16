@@ -75,11 +75,18 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 });
 
 let tab = "chat";
+let noteShown = false;
 function showTab(name) {
   tab = ["chat", "images", "monitor", "about"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
   for (const v of ["chat", "images", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
-  if (tab === "images") $("img-prompt").focus();
+  if (tab === "images") {
+    $("img-prompt").focus();
+    if (health.image_note && !noteShown) {   // once a page load: setup lowered the image model's size for the RAM
+      noteShown = true;
+      toast("info", "Image model size lowered", health.image_note, 12000);
+    }
+  }
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
@@ -108,6 +115,8 @@ async function loadHealth() {
                                           : "Attach a text file (or drop it here)";
     $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
     $("tab-btn-images").hidden = !health.image_generation;
+    $("img-note").hidden = !health.image_note;
+    $("img-note").textContent = health.image_note || "";
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
     setTimeout(loadHealth, 2000);
@@ -745,7 +754,10 @@ function toolHtml(t, k) {
     (t.server ? `<span class="muted small">${esc(t.server)}</span>` : "") +
     `<span class="tool-call__preview muted">${esc(preview.slice(0, 200))}</span>` +
     `<span class="st-badge ${cls}">${esc(label)}</span>${t.ms != null && t.state !== "skipped" ? `<span class="muted small">${fmt(t.ms / 1000, 1)} s</span>` : ""}` +
-    `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>`;
+    `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>` +
+    // the images an image tool made, under its block (the server keeps them: /v1/images/files/)
+    (t.images && t.images.length ? `<div class="msg-images tool-images">${t.images.map((u) =>
+      `<a href="${esc(u.replace(/^\//, ""))}" target="_blank" rel="noopener"><img src="${esc(u.replace(/^\//, ""))}" alt="${esc(t.tool || "image")}"></a>`).join("")}</div>` : "");
 }
 // the answer's text with the tool blocks where the model called them
 function answerHtml(m) {
@@ -768,7 +780,7 @@ function onTool(m, x) {
   if (x.event === "call") {
     Object.assign(t, {name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running"});
   } else if (x.event === "result") {
-    Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms,
+    Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, images: x.images,
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
   }
 }
@@ -908,6 +920,7 @@ async function send() {
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
+  if (health.image_generation) body.strata_images = true;   // and make images when the conversation asks for one
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
@@ -1196,17 +1209,30 @@ poll();
 setInterval(() => { if (!switching) loadSwitcher(); }, 15000);   // a switch started elsewhere shows here too
 
 // ------------------------------------------------------------------ images (POST /v1/images/generations)
+$("img-size").onchange = () => { $("img-custom").hidden = $("img-size").value !== "custom"; };
 $("img-form").onsubmit = async (ev) => {
   ev.preventDefault();
   const prompt = $("img-prompt").value.trim();
   if (!prompt) return;
-  const body = {prompt, size: $("img-size").value, response_format: "b64_json"};
+  const size = $("img-size").value === "custom" ? `${$("img-w").value}x${$("img-h").value}` : $("img-size").value;
+  const refs = Array.from($("img-ref").files || []);
+  const body = {prompt, size: size === "auto" && !refs.length ? "1024x1024" : size, response_format: "b64_json"};
   if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
+  // with reference images: an edit, OpenAI's multipart form (the browser sets its boundary)
+  let url = "v1/images/generations", payload = JSON.stringify(body), hdrs = headers(true);
+  if (refs.length) {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(body)) form.append(k, String(v));
+    for (const f of refs) form.append("image[]", f, f.name);
+    url = "v1/images/edits";
+    payload = form;
+    hdrs = headers();
+  }
   $("img-go").disabled = true;
   const t0 = performance.now();
   $("img-hint").textContent = "Generating\u2026 (a minute or more on a small GPU)";
   try {
-    const r = await fetch("v1/images/generations", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+    const r = await fetch(url, {method: "POST", headers: hdrs, body: payload});
     const j = await r.json();
     if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
     for (const d of j.data) {
@@ -1215,11 +1241,14 @@ $("img-form").onsubmit = async (ev) => {
       img.src = "data:image/png;base64," + d.b64_json;
       img.alt = prompt;
       const cap = document.createElement("figcaption");
-      cap.textContent = `${j.size}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
+      const made = j.strata && j.strata.made_size ? ` (made at ${j.strata.made_size}, middle cut out)` : "";
+      cap.textContent = `${j.size}${made}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
       fig.append(img, cap);
       $("img-results").prepend(fig);
     }
     $("img-hint").textContent = "Done. Right-click an image to save it.";
+    if (j.strata && j.strata.made_size)
+      toast("info", `Made at ${j.strata.made_size}`, `The image model needs sides that are multiples of 16: the middle ${j.size} was cut out.`, 8000);
   } catch (e) {
     $("img-hint").textContent = "";
     toast("error", "No image", String(e.message || e), 8000);

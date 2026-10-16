@@ -512,7 +512,7 @@ what has been checked in [docs/XE.md](docs/XE.md).
 Before sending a report or a pull request, read [CONTRIBUTING.md](CONTRIBUTING.md) (no dependence on the model number, the licenses, the additional
 permission under GPL section 7, what goes in, and how to report).
 
-- **Building:** installing from the source, the three build modes (free, contrib-llvm, contrib-icpx), what setup does and the
+- **Building:** installing from the source, the two build modes (free, contrib-llvm), what setup does and the
   packages it needs, and how the deb and rpm packages are made are in [docs/BUILD.md](docs/BUILD.md).
   The development tools (lints, Intel SDE, GPU profilers): [docs/DEVTOOLS.md](docs/DEVTOOLS.md).
 - **Measuring the speed:** `xestrata --bench`, the upstream merges' measurements and the release table are in [docs/BENCH.md](docs/BENCH.md).
@@ -522,7 +522,7 @@ permission under GPL section 7, what goes in, and how to report).
   built and tested with intel/llvm in both the free and contrib-llvm modes, and depending on the hardware as little as it can
   (no CUDA or other maker's API relied on, no value measured on one card hard-coded). Others do not go in as they are: they
   are a reference, written again as XeStrata's code ([AGENTS.md](AGENTS.md#what-goes-in)).
-  A pull request says which modes it was built in (free, contrib-llvm, contrib-icpx) and on which GPUs and CPUs it ran,
+  A pull request says which modes it was built in (free, contrib-llvm) and on which GPUs and CPUs it ran,
   and marks what was not checked `unverified`.
 - **Upstream integration:** the changes of Strata up to 0.1.42 are carried into Xe, except the Windows
   implementation. Of the paths meant to be faster, those measured faster on the B70, the RTX 4070 or the RX 9060 XT
@@ -542,8 +542,8 @@ permission under GPL section 7, what goes in, and how to report).
   Each model's own license applies to its files.
 - **Parts it uses:**
    - parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT);
-   - [oneMath](https://github.com/uxlfoundation/oneMath) (Apache-2.0): the dense matrix products (the contrib-llvm and
-     contrib-icpx modes, and the free mode for AMD GPUs), which CMake fetches from XeStrata's fork with XeStrata's
+   - [oneMath](https://github.com/uxlfoundation/oneMath) (Apache-2.0): the dense matrix products (the contrib-llvm mode,
+     and the free mode for AMD GPUs), which CMake fetches from XeStrata's fork with XeStrata's
      changes ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), under the same license);
    - [intel/llvm](https://github.com/intel/llvm)'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib-llvm
      modes' compiler, built with XeStrata's fixes (`third_party/main/intel-llvm/patches/`, under the same license);

@@ -42,6 +42,10 @@ Every copyright holder whose work is in this repository, its license and where t
   under the LGPL: LGPL-3.0-or-later AND MIT) - text below and in
   third_party/main/ggml/LICENSE. setup also fetches llama.cpp (MIT, the same authors) into third_party/main/llama.cpp,
   with its own LICENSE
+- Copyright (c) 2017 Sean Barrett
+  MIT or public domain (the Unlicense), at your option - third_party/main/stb/stb_image.h (stb_image v2.30, an
+  unmodified copy), which the image engine (strata-image) is compiled with - third_party/main/stb/LICENSE,
+  LICENSES/MIT.txt, LICENSES/Unlicense.txt
 - Copyright 2021 The Outfit Project Authors (https://github.com/Outfitio/Outfit-Fonts)
   SIL Open Font License 1.1 - third_party/main/outfit/, the web app's font - third_party/main/outfit/OFL.txt
 - Copyright Codeplay Software Limited; changes Copyright 2026 MistVVK and the XeStrata contributors
@@ -69,15 +73,16 @@ Every copyright holder whose work is in this repository, its license and where t
 The deb and rpm packages (cmake/packaging.cmake) also carry, each with its license text: the SYCL runtime of
 intel/llvm (Apache-2.0 WITH LLVM-exception) built with XeStrata's fixes, llama.cpp's gguf-py (MIT, Copyright (c)
 2023-2026 The ggml authors), the license of ROCm's device libraries, parts of which the engine's code for AMD GPUs
-carries (NCSA, Copyright (c) 2014-2016 Advanced Micro Devices, Inc.), and in the contrib-llvm ones oneMath
-(Apache-2.0) with XeStrata's changes.
+carries (NCSA, Copyright (c) 2014-2016 Advanced Micro Devices, Inc.), stb_image's (MIT, Copyright (c) 2017 Sean
+Barrett), which the image engine is compiled with, and in the contrib-llvm ones oneMath (Apache-2.0) with XeStrata's
+changes.
 The engine in the contrib-llvm packages is compiled with NVIDIA's CUDA Toolkit, and its code for NVIDIA GPUs can contain
 parts of NVIDIA's libdevice; those parts are NVIDIA's, distributed under the NVIDIA CUDA Toolkit End User License
 Agreement.
 
 The models are not part of this repository; each model's own license applies to its files.
-Neither are the vendors' libraries the contrib-llvm and contrib-icpx modes link (Intel oneMKL and the runtime libraries of
-Intel's oneAPI compilers, NVIDIA cuBLAS and the CUDA runtime and driver); each one's own license applies to it.
+Neither are the vendors' libraries the contrib-llvm mode links (Intel oneMKL, NVIDIA cuBLAS and the CUDA runtime and
+driver); each one's own license applies to it.
 
 
 Strata (MIT License)

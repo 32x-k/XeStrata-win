@@ -491,7 +491,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 
 報告やプルリクエストを送る前に、[CONTRIBUTING.ja.md](CONTRIBUTING.ja.md)（型番に依存しないこと、ライセンス、GPL 第 7 条の追加の許可、取り込む変更の条件、報告の仕方）を読んでください。
 
-- **ビルド**: ソースから入れる方法、ビルドの 3 つの方式（free、contrib-llvm、contrib-icpx）、setup の振る舞いと要るパッケージ、
+- **ビルド**: ソースから入れる方法、ビルドの 2 つの方式（free、contrib-llvm）、setup の振る舞いと要るパッケージ、
   deb と rpm のパッケージの作り方は [docs/BUILD.ja.md](docs/BUILD.ja.md) にあります。
   開発に使う道具（リント、Intel SDE、GPU のプロファイラー）は [docs/DEVTOOLS.ja.md](docs/DEVTOOLS.ja.md) にあります。
 - **速さの測り方**: `xestrata --bench`、upstream 追従の計測、リリースの表の測り方は [docs/BENCH.ja.md](docs/BENCH.ja.md) にあります。
@@ -500,7 +500,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 - **取り込む変更**: 誰が書いたものでも（自分のコミット、プルリクエスト、upstream からの移植）、intel/llvm の free と contrib-llvm の両方式でビルドと試験をしたもので、
   機器への依存ができるだけ少ないもの（CUDA などメーカーの API に頼らない、1 枚のカードで測った値を決め打ちしない）だけを入れます。
   そうでないものはそのままは入れず、参考にして XeStrata のコードとして書き直します（[AGENTS.md](AGENTS.md#what-goes-in)）。
-  プルリクエストには、ビルドした方式（free、contrib-llvm、contrib-icpx）と、動かした GPU と CPU を書き、確かめていないことには `unverified` と付けてください。
+  プルリクエストには、ビルドした方式（free、contrib-llvm）と、動かした GPU と CPU を書き、確かめていないことには `unverified` と付けてください。
 - **upstream の取り込み**: Strata 0.1.42 までの変更を、Windows の実装を除いて Xe に移しています。
   速くするための経路は、B70・RTX 4070・RX 9060 XT で測って速くなったものを移します（[docs/XE.ja.md](docs/XE.ja.md#strata-0142-の取り込み)）。
 - **README と docs**: 日本語版（README.ja.md、docs/*.ja.md）を先に書き、英語版（README.md、docs/*.md）はその訳です。
@@ -518,7 +518,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
   モデルのファイルには、それぞれのライセンスが適用されます。
 - **使っている部品**:
    - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)（MIT）の一部。
-   - [oneMath](https://github.com/uxlfoundation/oneMath)（Apache-2.0）: 密な行列積（contrib-llvm と contrib-icpx、free では AMD の GPU）。
+   - [oneMath](https://github.com/uxlfoundation/oneMath)（Apache-2.0）: 密な行列積（contrib-llvm、free では AMD の GPU）。
      CMake が XeStrata の変更の入ったフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、同じライセンス）から取得します。
    - [intel/llvm](https://github.com/intel/llvm) の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib-llvm のコンパイラ。
      XeStrata の修正（`third_party/main/intel-llvm/patches/`、同じライセンス）を当ててビルドし、パッケージにはその SYCL の実行時を入れます。

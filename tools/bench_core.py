@@ -11,6 +11,9 @@ Three ways of running an engine:
   three follow-ups, 256 tokens a turn, greedy or at a temperature (t07 = 0.7, the default).
 - usage: the engine's own serve/server.py, streamed /v1/chat/completions: two short chats and a coding agent, at
   the temperature Qwen recommends (0.7) or another.
+- image: the engine's image generator as its server runs it (its serve/images.py: XeStrata's resident strata-image,
+  measured warm; upstream's sd-cli, a process a request), one 1024x1024 image of the model card's 8 steps from a
+  fixed prompt and seed.
 
 The prompts come from XeStrata's sources at commit 58dbbe5.  A package has no git history, so the text is shipped in
 data/bench-corpus.json.xz (written from the repository by `make_corpus`) and tokenized with the pack's tokenizer by
@@ -815,6 +818,129 @@ def ab_usage(out: Path, gpu: str, engines: list[Engine], cfg: Callable[[Engine],
             up_stopped |= e.arm == "up" and (why or "").startswith("stopped")
 
 
+# ------------------------------------------------------------------------------------------------ image generation
+IMAGE_REQUEST = {"prompt": "A red fox sitting in a snowy forest at dawn, photograph", "size": "1024x1024", "seed": 42}
+# Run by the engine tree's own Python with its tools/image/qimage.py and serve/images.py (both trees have modules of
+# those names, so each in a process of its own).  "make": the config section its setup writes for this GPU (with
+# setup's timed choices where the tree makes them, qimage.tune); "run": one image as its server makes it.  A tree whose
+# server keeps a resident image engine (XeStrata's strata-image) starts it and makes a warm-up image of another prompt
+# first, so the image measured is one the server makes while it runs ("cold_s": the warm-up's, with the start); one
+# whose server runs sd-cli for each request (upstream's) runs that command once.
+IMAGE_RUNNER = r"""
+import json, os, re, subprocess, sys, time
+from pathlib import Path
+job = json.load(sys.stdin)
+tree = Path(job["tree"])
+sys.path[:0] = [str(tree), str(tree / "serve"), str(tree / "tools" / "image")]
+if job["do"] == "make":
+    import qimage as QI
+    m = job["make"]
+    if hasattr(QI, "IMAGE_EXE"):
+        cfg = QI.image_config(m["quant"], Path(m["exe"]), Path(m["models"]))
+        print(json.dumps(cfg))
+        sys.exit(0)
+    kw = {"lib_dirs": m.get("lib_dirs") or ()}
+    if m.get("gpu") is not None:
+        kw["gpu"] = m["gpu"]
+    cfg = QI.image_config(m["backend"], m["quant"], Path(m["exe"]), Path(m["models"]), **kw)
+    if m["backend"] == "vulkan" and hasattr(QI, "tune"):
+        QI.tune(cfg, lambda s: print(s, file=sys.stderr))
+    print(json.dumps(cfg))
+    sys.exit(0)
+import images as IM
+cfg = job["cfg"]
+if hasattr(IM, "ImageEngine"):
+    env = dict(os.environ)
+    env.update(job.get("env") or {})
+    g = IM.ImageGen({**cfg, "out_dir": str(Path(job["png"]).parent / "image-engine")}, env=env)
+    try:
+        t0 = time.monotonic()
+        g.run(IM.parse_request({"prompt": "A lighthouse on a cliff at night, oil painting", "seed": 1,
+                                "size": job["request"].get("size")}, cfg))
+        cold = time.monotonic() - t0
+        t0 = time.monotonic()
+        pngs, fig = g.run(IM.parse_request(dict(job["request"]), cfg))
+        wall = time.monotonic() - t0
+    except IM.ImageJobFailed as e:
+        print(json.dumps({"rc": 1, "error": str(e)}))
+        sys.exit(0)
+    finally:
+        g.close()
+    Path(job["png"]).write_bytes(pngs[0])
+    Path(job["log"]).write_text(json.dumps(fig, indent=1) + "\n")
+    print(json.dumps({"rc": 0, "seconds": round(wall, 2), "cold_s": round(cold, 2),
+                      "text_s": round(fig["text_encode_ms"] / 1000, 3), "sampling_s": fig["sampling_s"],
+                      "decode_s": fig["vae_decode_s"], "backend": "strata-image"}))
+    sys.exit(0)
+cmd = IM.sd_cli_args(cfg, IM.parse_request(dict(job["request"]), cfg), job["png"])
+t0 = time.monotonic()
+p = subprocess.run(cmd, env=IM.image_env(cfg), capture_output=True, text=True, errors="replace")
+wall = time.monotonic() - t0
+log = p.stdout + p.stderr
+Path(job["log"]).write_text(log)
+def last(pat):
+    m = re.findall(pat, log)
+    return float(m[-1]) if m else None
+print(json.dumps({"rc": p.returncode, "seconds": round(wall, 2),
+                  "text_s": last(r"get_learned_condition completed, taking ([0-9.]+) ?s"),
+                  "sampling_s": last(r"sampling completed, taking ([0-9.]+) ?s"),
+                  "decode_s": last(r"decode_first_stage completed, taking ([0-9.]+) ?s")}))
+"""
+
+
+def image_job(e: Engine, job: dict, timeout: float = DEADLINE) -> dict:
+    """IMAGE_RUNNER in `e`'s tree with its Python -> its last line's JSON, or {"error": ...}."""
+    try:
+        p = subprocess.run([e.py, "-c", IMAGE_RUNNER], input=json.dumps({"tree": str(e.root), **job}),
+                           capture_output=True, text=True, errors="replace", timeout=timeout, cwd=str(e.root))
+    except (OSError, subprocess.TimeoutExpired) as err:
+        return {"error": str(err)}
+    try:
+        return json.loads(p.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"error": (p.stderr or p.stdout or f"exit {p.returncode}").strip()[-400:]}
+
+
+def image_config(e: Engine, backend: str, quant: str, exe: str, models: str, gpu: int | None = None,
+                 lib_dirs: list[str] | None = None) -> dict:
+    """The "images" section `e`'s setup writes for this GPU (its timed choices included) -> the config, or
+    {"error": ...}."""
+    return image_job(e, {"do": "make", "make": {"backend": backend, "quant": quant, "exe": exe, "models": models,
+                                                "gpu": gpu, "lib_dirs": lib_dirs or []}})
+
+
+def ab_image(out: Path, gpu: str, engines: list[Engine], cfgs: dict[str, dict], rounds: int = ROUNDS,
+             on_run: Callable | None = None, dry: bool = False, envs: dict[str, dict] | None = None) -> None:
+    """OUT/image-runs/GPU-ARM-ROUND.json (the times), .txt (sd-cli's log, or the resident engine's figures) and .png:
+    each engine's "images" config (`cfgs`, by arm; `envs`: what a resident engine's environment adds, by arm), one
+    discarded warm-up per engine first (the files into the page cache), then the engines alternating, one process an
+    image (IMAGE_RUNNER)."""
+    runs = out / "image-runs"
+    runs.mkdir(parents=True, exist_ok=True)
+
+    def one(e, rnd, stem):
+        if on_run:
+            on_run("image" if rnd else None)
+        cfg = cfgs[e.arm]
+        if dry:
+            print(f"{gpu} {e.arm} image {rnd}: {json.dumps(cfg)}")
+            return
+        r = image_job(e, {"do": "run", "cfg": cfg, "request": IMAGE_REQUEST, "png": str(runs / f"{stem}.png"),
+                          "log": str(runs / f"{stem}.txt"), "env": (envs or {}).get(e.arm)})
+        rec = {"gpu": gpu, "arm": e.arm, "round": rnd, "backend": cfg.get("backend"), "quant": cfg.get("quant"),
+               "args": cfg.get("args"), "env": cfg.get("env"), **r}
+        (runs / f"{stem}.json").write_text(json.dumps(rec, indent=1) + "\n")
+        took = (f"{r['seconds']} s (sampling {r['sampling_s']} s, VAE {r['decode_s']} s)" if r.get("rc") == 0 else
+                f"failed: {r.get('error') or r.get('rc')}")
+        print(f"{gpu} {e.arm} image {rnd}: {took}", flush=True)
+
+    for e in sorted(engines, key=lambda x: x.arm != "xe"):
+        one(e, 0, f"{gpu}-{e.arm}-warmup")
+    for r in range(1, rounds + 1):
+        for e in ordered(engines, r % 2 == 0):
+            one(e, r, f"{gpu}-{e.arm}-{r}")
+
+
 # ------------------------------------------------------------------------------------------------ the tables
 COLLECT_TIERS = ["1k", "4k", "32k", "64k", "128k", "192k", "262k"]
 
@@ -825,7 +951,9 @@ def collect(out: Path, names: dict[str, str], say: Callable = print) -> None:
     OUT/matrix-serve.json and, per GPU and mode, the tier's prompt, the follow-ups (the tokens they read over their
     prompt time) and the output of all four turns.  OUT/usage-runs/*.json -> OUT/matrix-usage.json and a table per
     GPU: per conversation, the time to the first token (the median of its turns), the prompt and the output speed
-    (the server's timings, summed).  `names`: the arms' names in the tables ({"xe": ..., "up": ...})."""
+    (the server's timings, summed).  OUT/image-runs/*.json -> OUT/matrix-image.json and a table per GPU: the seconds
+    an image, its sampling and its VAE decode, and the backend.  `names`: the arms' names in the tables ({"xe": ...,
+    "up": ...})."""
     rows = []
     for f in sorted((out / "runs").glob("*.txt")):
         m = re.fullmatch(r"(.+)-(xe|up)-(\w+)-(\d+)", f.stem)
@@ -889,6 +1017,30 @@ def collect(out: Path, names: dict[str, str], say: Callable = print) -> None:
                             cells.append(fmt.format(statistics.median(v)) if v else
                                          "too slow" if any(r["stopped"] for r in c) else "-")
                         say(f"| {name} | " + " | ".join(cells) + " |")
+
+    image = []
+    for f in sorted((out / "image-runs").glob("*.json")):
+        r = json.loads(f.read_text())
+        if r["round"] == 0:                       # the warm-ups
+            continue
+        ok = r.get("rc") == 0
+        image.append({"gpu": r["gpu"], "arm": r["arm"], "engine": names.get(r["arm"], r["arm"]), "round": r["round"],
+                      "backend": r.get("backend"), "quant": r.get("quant"),
+                      **{k: r.get(k) if ok else None for k in ("seconds", "text_s", "sampling_s", "decode_s")}})
+    if image:
+        (out / "matrix-image.json").write_text(json.dumps(image, indent=1) + "\n")
+        for gpu in sorted({r["gpu"] for r in image}):
+            say(f"\n### {gpu} image generation (1024x1024, 8 steps)\n\n| Engine | backend | image (s) | sampling (s) | "
+                "VAE (s) |\n| --- | --- | ---: | ---: | ---: |")
+            for name in names.values():
+                c = [r for r in image if (r["gpu"], r["engine"]) == (gpu, name)]
+                if not c:
+                    continue
+                cells = []
+                for key in ("seconds", "sampling_s", "decode_s"):
+                    v = [r[key] for r in c if r[key]]
+                    cells.append(f"{statistics.median(v):.1f}" if v else "-")
+                say(f"| {name} | {c[0]['backend']} {c[0]['quant']} | " + " | ".join(cells) + " |")
 
     usage = []
     for f in sorted((out / "usage-runs").glob("*.json")):

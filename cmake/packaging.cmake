@@ -42,7 +42,7 @@ if(STRATA_LICENSE STREQUAL "contrib")
     endif()
   endforeach()
 elseif(NOT STRATA_LICENSE STREQUAL "free")
-  message(FATAL_ERROR "STRATA_PACKAGE builds the free and contrib modes (contrib-icpx links icpx's runtime)")
+  message(FATAL_ERROR "STRATA_PACKAGE builds the free and contrib modes")
 endif()
 
 set(_pkg_share ${CMAKE_INSTALL_DATADIR}/xestrata)
@@ -51,7 +51,7 @@ set(_pkg_engine_abs ${CMAKE_INSTALL_FULL_LIBDIR}/xestrata/engine)
 
 # ---- the engine
 set_target_properties(strata PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
-install(TARGETS strata RUNTIME DESTINATION ${_pkg_engine})
+install(TARGETS strata strata-image RUNTIME DESTINATION ${_pkg_engine})
 install(PROGRAMS ${STRATA_PACKAGE_VISION_DIR}/strata-vision-cpu ${STRATA_PACKAGE_VISION_DIR}/strata-vision-vulkan
         DESTINATION ${_pkg_engine})
 # the SYCL runtime the engine was built with: what libsycl loads for Level Zero and HIP (and CUDA in the contrib mode).
@@ -126,6 +126,8 @@ install(FILES third_party/main/intel-llvm/LICENSE.TXT
 # ROCm's device libraries: the engine's code for AMD GPUs carries parts of them (NCSA asks for the notice with binaries)
 install(FILES third_party/main/rocm-device-libs/LICENSE.TXT
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.rocm-device-libs)
+install(FILES third_party/main/stb/LICENSE   # stb_image, compiled into strata-image
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.stb)
 if(TARGET onemath)
   install(FILES third_party/main/oneMath/LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}
           RENAME LICENSE.oneMath)

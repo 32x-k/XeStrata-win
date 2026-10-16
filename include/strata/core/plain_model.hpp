@@ -65,6 +65,10 @@ struct PlainOptions {
     /// A ranking of (MoE layer, expert) pairs (expert_cache.hpp's profile format) the VRAM tier is filled from at load,
     /// each layer up to its slots; empty: the tier starts empty and the adaptive rule fills it.
     std::string profile;
+    /// The MTP layer's drafts over a token subset (int32 ids, tools/draft_vocab.py's data/draft_vocab*.bin): a head of
+    /// those rows only, so a draft reads a part of the vocabulary; a token outside it is never drafted.  Empty: the
+    /// whole head.
+    std::string draft_vocab;
     /// The rope scaling, as llama.cpp's options: "yarn" / "linear" / "none" (empty: the file's), the factor (0: the
     /// file's), the trained context (0: the file's, else its context length).  llm-jp-4.1 at 256K: yarn, 4, 65536.
     std::string rope_scaling;
@@ -322,6 +326,10 @@ private:
     int64_t cur_pos_ = 0;
     std::vector<int32_t> drafts_;
     float* mtp_h_ = nullptr;
+    // the drafts' head over opt_.draft_vocab's subset (null: the whole head); a draft's pick is its index there
+    void* dhead_ = nullptr;
+    int64_t n_dvocab_ = 0;
+    std::vector<int32_t> dvocab_;
     bool mtp_h_set_ = false;   ///< prompt() left the trunk's last row in mtp_h_ (else forward's last row in hn_)
     int last_T_ = 0;           ///< the last forward window's size
     int64_t spec_windows_ = 0, spec_drafted_ = 0, spec_accepted_ = 0;

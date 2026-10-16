@@ -9,9 +9,9 @@
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time
 behind a FIFO (plan: one resident sequence).
-Image generation (optional, when the config has an "images" section): POST /v1/images/generations (OpenAI's shape,
-plus seed and steps) runs stable-diffusion.cpp's sd-cli for Qwen-Image-2.1-Turbo, one job at a time on the GPU the
-text engine uses (serve/images.py).
+Image generation (optional, when the config has an "images" section): POST /v1/images/generations and
+/v1/images/edits (OpenAI's shapes, plus seed) run Qwen-Image-2.1-Turbo on XeStrata's own image engine (strata-image,
+resident after the first image), one job at a time on the GPU the text engine uses (serve/images.py).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
@@ -2278,20 +2278,15 @@ def network_path(path: str) -> bool:
 
 
 def vision_label(cfg: dict) -> str:
-    return ("the GPU encoder" + (" with oneDNN" if cfg.get("onednn") else "")) if cfg.get("gpu") else "the CPU encoder"
+    return "the GPU encoder" if cfg.get("gpu") else "the CPU encoder"
 
 
-def vision_attempts(cfg: dict, onednn: str | None = None) -> list[dict]:
-    """The encoders to start, in order: the configured one, then (the GPU encoder with oneDNN) the same without
-    oneDNN, then the config's `fallback` (setup writes the CPU encoder there).  `onednn` ("on"/"off") overrides
-    the config's choice for this start."""
+def vision_attempts(cfg: dict) -> list[dict]:
+    """The encoders to start, in order: the configured one, then the config's `fallback` (setup writes the CPU
+    encoder there)."""
     first = dict(cfg)
     first.pop("fallback", None)
-    if onednn is not None and first.get("gpu"):
-        first["onednn"] = onednn == "on"
     out = [first]
-    if first.get("gpu") and first.get("onednn"):
-        out.append(dict(first, onednn=False))
     if isinstance(cfg.get("fallback"), dict):
         out.append(dict({k: cfg[k] for k in ("mmproj", "model") if k in cfg}, **cfg["fallback"]))
     return out
@@ -2339,11 +2334,6 @@ class Vision:
             args += ["--max-tokens", str(cfg["max_tokens"])]
         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
             args += ["--min-tokens", str(cfg["min_tokens"])]
-        if cfg.get("gpu"):
-            # ggml-sycl uses oneDNN whenever it was built with it; off unless asked for: without it the same image
-            # gives the same embeddings every time (the 2026-09-30-xe-vision-sycl record)
-            flag = "1" if cfg.get("onednn") else "0"
-            env = dict(os.environ if env is None else env, GGML_SYCL_ENABLE_DNN=flag, GGML_SYCL_FA_ONEDNN=flag)
         self.label = vision_label(cfg)
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload (#208)
@@ -4638,6 +4628,28 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
 
 
 # ------------------------------------------------------------------------------------------------ MCP tool loop
+class ToolHubs:
+    """Hubs that run_with_mcp runs as one: the MCP servers' tools and the image tools (serve/images.py ImageTools)."""
+
+    def __init__(self, hubs: list):
+        self.hubs = hubs
+        self.settings = {"max_rounds": max(int(h.settings["max_rounds"]) for h in hubs)}
+
+    def routes(self) -> dict:
+        out: dict = {}
+        for h in self.hubs:
+            out.update(h.routes())
+        return out
+
+    def call(self, name: str, arguments, cancel=None) -> dict:
+        for h in self.hubs:
+            if name in h.routes():
+                return h.call(name, arguments, cancel)
+        text = f"error: there is no tool named {name!r}"
+        return {"ok": False, "text": text, "chars": len(text), "truncated": False, "ms": 0, "server": None,
+                "tool": name}
+
+
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
                  mcp_names):
     """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
@@ -4715,7 +4727,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
             results.append(r["text"])
             yield "mcp", {"event": "result", "id": c.id,
-                          **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
+                          **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")},
+                          **({"images": r["images"]} if r.get("images") else {})}
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
             break
@@ -5081,6 +5094,28 @@ def body_limit() -> int:
     return mib << 20 if mib > 0 else CHUNKED_BODY_MAX
 
 
+def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
+    """A multipart/form-data body (OpenAI's /v1/images/edits) -> (its text fields, the bytes of its image or image[]
+    files in order); whole numbers in the fields (n, seed, steps) as ints."""
+    from email.parser import BytesParser
+    from email.policy import HTTP
+    msg = BytesParser(policy=HTTP).parsebytes(b"Content-Type: " + ctype.encode("latin-1") + b"\r\n\r\n" + body)
+    if not msg.is_multipart():
+        raise ValueError("the multipart/form-data body could not be read")
+    fields: dict = {}
+    files: list[bytes] = []
+    for part in msg.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        raw = part.get_payload(decode=True)
+        data = raw if isinstance(raw, bytes) else b""
+        if name in ("image", "image[]"):
+            files.append(data)
+        elif isinstance(name, str) and name:
+            value = data.decode("utf-8", "replace")
+            fields[name] = int(value) if name in ("n", "seed", "steps") and value.strip().isdigit() else value
+    return fields, files
+
+
 class BadBody(Exception):
     """A request body that cannot be read (a malformed or oversized chunked body): the status and the sentence."""
 
@@ -5444,6 +5479,7 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
+                                 "image_note": svc.images.note() if svc.images is not None else None,
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path == "/update":                         # whether a newer release is out (About > Updates)
                 if not self._authorized():
@@ -5584,6 +5620,9 @@ def make_handler(svc: Service):
                                headers={"Retry-After": int(ra)} if ra else None)
                 return
             try:
+                if path == "/v1/images/edits":                # a form (OpenAI's multipart) or JSON: read there
+                    self._images_edit()
+                    return
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
@@ -5704,7 +5743,7 @@ def make_handler(svc: Service):
                     svc.request_trace.record = None
 
         def _images(self, req):
-            """POST /v1/images/generations (serve/images.py): one sd-cli job in the GPU's turn."""
+            """POST /v1/images/generations (serve/images.py): one image job in the GPU's turn."""
             gen = svc.images
             if gen is None:
                 self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
@@ -5712,11 +5751,49 @@ def make_handler(svc: Service):
                                                       "with --images qwen-image)"}})
                 return
             job = images_api.parse_request(req, gen.cfg)        # ImageRequestError (a ValueError): 400
+            self._image_job(gen, job)
+
+        def _images_edit(self):
+            """POST /v1/images/edits (serve/images.py): reference images and a prompt in OpenAI's multipart form (image
+            or image[]), or JSON (images: [{"image_url": ...}], or image: a URL or a list), one image job in the GPU's
+            turn.  The images are read as a chat's are (data: URLs, http(s) URLs, local paths; formats stb_image does
+            not read converted to PNG)."""
+            gen = svc.images
+            if gen is None:
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
+                                           "message": "image generation is not set up on this server (run setup "
+                                                      "with --images qwen-image)"}})
+                return
+            body = self._body()
+            ctype = self.headers.get("Content-Type", "") or ""
+            if ctype.lower().startswith("multipart/form-data"):
+                req, files = parse_multipart(ctype, body)
+            else:
+                req = json.loads(body or b"{}")
+                if not isinstance(req, dict):
+                    raise ValueError("send a JSON object or a multipart form")
+                srcs = req.pop("images", None) or req.pop("image", None) or []
+                if isinstance(srcs, (str, dict)):
+                    srcs = [srcs]
+                files = []
+                for src in srcs:
+                    url = src.get("image_url") if isinstance(src, dict) else src
+                    if isinstance(url, dict):
+                        url = url.get("url")
+                    if not isinstance(url, str) or not url:
+                        raise ValueError("images: [{\"image_url\": a data: URL, an http(s) URL or a path}]")
+                    files.append(Vision.load(url))
+            job = images_api.parse_edit_request(req, [Vision.normalize(d) for d in files], gen.cfg)
+            self._image_job(gen, job)
+
+        def _image_job(self, gen, job):
+            """One image job (a generation or an edit) in the GPU's turn, answered as OpenAI's images API does."""
             svc.last_request_at = time.time()
             cancel = threading.Event()
             self._watch_client(cancel)
             print(f"[strata] image: {job['width']}x{job['height']}, n={job['n']}, {job['steps']} steps, "
-                  f"seed {job['seed']}", flush=True)
+                  f"seed {job['seed']}" + (f", {len(job['refs'])} reference image(s)" if job.get("refs") else ""),
+                  flush=True)
             try:
                 with images_api.gpu_turn(svc, gen, job, cancel) as policy:
                     images, figures = gen.run(job, cancel)
@@ -5949,12 +6026,23 @@ def make_handler(svc: Service):
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
+            extra: list = []
+            hubs: list = []
             if use_mcp:
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
                     return
                 svc.mcp.wait(10)                                  # servers still starting (only right after start)
                 extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
-                use_mcp = bool(extra)
+                if extra:
+                    hubs.append(svc.mcp)
+            if req.get("strata_images") is True and svc.images is not None:   # opt-in: the image tools
+                image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load, Vision.normalize)
+                more = image_tools.template_tools(exclude=own | {t["name"] for t in extra})
+                if more:
+                    extra += more
+                    hubs.append(image_tools)
+            use_mcp = bool(hubs)
+            if use_mcp:
                 tools = (tools or []) + extra or None
             if force and use_mcp:
                 raise ValueError("a forced tool_choice with MCP tools is not supported")
@@ -5965,8 +6053,8 @@ def make_handler(svc: Service):
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
-                               {t["name"] for t in extra}) if use_mcp else None
+            run = run_with_mcp(svc, hubs[0] if len(hubs) == 1 else ToolHubs(hubs), messages, tools, kw, ids,
+                               thinking, max_new, max_req, req, cancel, {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
@@ -6040,14 +6128,29 @@ def make_handler(svc: Service):
             def check(text, finish):
                 return validated_json(text, validator, finish)
 
+            image_tools = self.image_tools
+
+            def image_b64(url: str) -> str | None:
+                f = svc.images.file(url.rsplit("/", 1)[-1]) if svc.images is not None else None
+                return base64.b64encode(f.read_bytes()).decode("ascii") if f is not None else None
+
             def events():
                 yield from asm.start()
                 done = None
-                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+                if image_tools is not None:   # the image tools run here, each an image_generation_call item
+                    messages, kw = self.prepared
+                    source = run_with_mcp(svc, image_tools, messages, tools, kw, ids, thinking, max_new,
+                                          int(req.get("max_output_tokens") or 0), req, cancel,
+                                          set(image_tools.routes()))
+                else:
+                    source = svc.run(ids, thinking, tools, max_new, req, cancel)
+                for kind, x in source:
                     if kind == "ping":
                         yield None
                     elif kind == "event":
                         yield from asm.feed(x)
+                    elif kind == "mcp":
+                        yield from asm.image_call(cast(dict, x), image_b64)
                     elif kind == "done":
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
@@ -6112,6 +6215,12 @@ def make_handler(svc: Service):
             responses_api.check_request(req)
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
+            # OpenAI's hosted image_generation tool: this server's image tools, run here (serve/images.py)
+            self.image_tools = None
+            if "image_generation" in skipped and svc.images is not None and req.get("tool_choice") != "none":
+                self.image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load, Vision.normalize)
+                tools = (tools or []) + self.image_tools.template_tools(exclude={t["name"] for t in tools or []})
+                skipped = [k for k in skipped if k != "image_generation"]
             kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
             try:
                 self._no_local_images(messages)              # as on the chat route: no file read for a foreign page
@@ -6165,6 +6274,7 @@ def make_handler(svc: Service):
             include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
+            self.prepared = (messages, kw)
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
             return ids, thinking, tools, max_new, asm, validator, req
 
@@ -6784,9 +6894,6 @@ def main() -> int:
     ap.add_argument("--fit-max-tokens", action="store_true",
                     help="clamp max_tokens to the remaining context instead of rejecting the request "
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
-    ap.add_argument("--vision-onednn", choices=["on", "off"],
-                    help="the SYCL image encoder with oneDNN (a little faster; an image's embeddings vary slightly "
-                         "from run to run) or without; default: the config's \"onednn\" (setup: off)")
     ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY. "
                          "Several keys: separate them with commas (key1,key2), as llama.cpp does")
@@ -6861,7 +6968,7 @@ def main() -> int:
                       "encoder its VRAM): the encoder starts with the model instead", flush=True)
                 vcfg["elastic"] = False
             failed: list = []
-            for vc in vision_attempts(vcfg, a.vision_onednn):
+            for vc in vision_attempts(vcfg):
                 if failed:
                     print(f"[strata] images: trying {vision_label(vc)} instead", flush=True)
                 try:
@@ -6943,15 +7050,20 @@ def main() -> int:
                 for k, v in cfg["images"].items()}
         try:
             ilog = open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None
-            svc.images = images_api.ImageGen(icfg, log=ilog)
+            # the text engine's environment: the same GPU (STRATA_GPU_PCI, CUDA_VISIBLE_DEVICES) and libraries
+            svc.images = images_api.ImageGen(icfg, log=ilog, env=child_env(cfg))
         except ValueError as e:
             raise SystemExit(f"[strata] config: {e}")
         gone = svc.images.missing()
         if gone:
             print(f"[strata] image generation: missing {', '.join(gone)} - requests fail until setup --images has run "
                   "again", flush=True)
-        print(f"[strata] image generation: {svc.images.model} {icfg.get('quant') or ''} on "
-              f"{icfg.get('backend') or '?'} (POST /v1/images/generations; GPU policy {svc.images.policy})", flush=True)
+        print(f"[strata] image generation: {svc.images.model} {icfg.get('quant') or ''} on strata-image "
+              f"(POST /v1/images/generations; GPU policy {svc.images.policy})", flush=True)
+        if svc.images.note():
+            print(f"[strata] image generation: {svc.images.note()}", flush=True)
+        import atexit
+        atexit.register(svc.images.close)               # the image engine ends with the server
     if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
         try:
             svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get(

@@ -93,12 +93,21 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
           <label class="st-field">Size
             <select class="st-input" id="img-size">
               <option>1024x1024</option><option>1536x1024</option><option>1024x1536</option>
-              <option>768x768</option><option>512x512</option></select></label>
+              <option>768x768</option><option>512x512</option>
+              <option>1920x1080</option><option>1080x1920</option>
+              <option value="auto">auto (the reference's shape)</option>
+              <option value="custom">Custom&hellip;</option></select></label>
+          <label class="st-field" id="img-custom" hidden>Width &times; height
+            <span class="img-wh"><input class="st-input" id="img-w" type="number" min="256" max="2048" step="1" value="1024" aria-label="Width">
+            <input class="st-input" id="img-h" type="number" min="256" max="2048" step="1" value="1024" aria-label="Height"></span></label>
+          <label class="st-field">Edit an image (optional)
+            <input class="st-input" id="img-ref" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" multiple></label>
           <label class="st-field">Seed
             <input class="st-input" id="img-seed" type="number" min="0" placeholder="random"></label>
           <button type="submit" class="st-btn st-btn--primary" id="img-go">Generate</button>
         </div>
         <span class="composer-hint" id="img-hint">One image at a time; a chat request waits for it (and the other way round).</span>
+        <span class="composer-hint" id="img-note" hidden></span>
       </form>
       <div class="img-results" id="img-results"></div>
     </div>

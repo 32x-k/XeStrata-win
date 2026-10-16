@@ -484,6 +484,22 @@ void Runtime::finish() {
     for (auto* q : streams) finish(*q);
 }
 
+void Runtime::finish_all() noexcept {
+    std::vector<Runtime*> made;
+    {
+        std::lock_guard<std::mutex> lock(g_runtimes_mutex);
+        for (auto& r : runtimes())
+            if (r) made.push_back(r.get());
+    }
+    for (Runtime* r : made) {
+        try {
+            r->finish();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "Xe runtime: GPU %d not drained before the exit: %s\n", r->ordinal(), e.what());
+        }
+    }
+}
+
 void Runtime::free(void* pointer) noexcept {
     if (!pointer) return;
     try {

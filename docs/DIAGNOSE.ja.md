@@ -79,7 +79,7 @@ setup が作ったものは通常 `engine/` にあり、手動の CMake ビル�
 
 コンパイラの実体と版、CMake の実行条件、`CMakeCache.txt` の関係する項目、依存するプロジェクトの版を記録してください。
 主に `STRATA_LICENSE`、`STRATA_CUDA_ARCHS`、`STRATA_HIP_ARCHS`、`STRATA_ONEMKL`、`STRATA_PORTABLE` と、エンジンや画像のビルド条件を確認します。
-報告では free、contrib-llvm、contrib-icpx を区別してください。
+報告では free と contrib-llvm を区別してください。
 `STRATA_LICENSE=contrib` は contrib-llvm です。
 
 ソース版は、更新後のビルドに失敗すると以前のエンジンを保持して起動することがあります。

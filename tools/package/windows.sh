@@ -23,7 +23,7 @@ apt-get update -q
 # nvidia-cuda-toolkit: CUDA 12.4, for intel/llvm's CUDA target and the engine's NVIDIA code (not free software);
 # dotnet-sdk-10.0 for the launchers
 apt-get install -y -q --no-install-recommends git cmake ninja-build g++ libhwloc-dev libzstd-dev python3 python3-pip \
-  curl ca-certificates unzip ccache lld lld-21 llvm-21 dotnet-sdk-10.0 7zip nvidia-cuda-toolkit
+  curl ca-certificates unzip ccache lld lld-21 llvm-21 dotnet-sdk-10.0 7zip nvidia-cuda-toolkit opencl-headers
 cuda_path=/usr/lib/cuda
 
 # build.sh's compiler cache, shared with the Ubuntu packages (container.sh)
@@ -64,7 +64,7 @@ cmake -G Ninja -S "$src" -B /build/engine -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_XWIN=/build/xwin -DSTRATA_SYCL_WINDOWS="$sycl" -DSTRATA_CUDA_ARCHS="$archs" -DSTRATA_CUDA_PATH="$cuda_path" \
   -DSTRATA_CUDA_PTX= -DSTRATA_ONEMKL=OFF -DSTRATA_HIP_ARCHS= -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON \
   -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PORTABLE=ON -DSTRATA_GGML_DIR="$llama"
-cmake --build /build/engine --target strata strata-device -j "$jobs"
+cmake --build /build/engine --target strata strata-device strata-image -j "$jobs"
 
 # the launchers (framework-dependent: Windows' .NET 10 runtime runs them); Avalonia's build telemetry off
 export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 AVALONIA_TELEMETRY_OPTOUT=1 NUGET_PACKAGES=/cache/nuget

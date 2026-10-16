@@ -39,6 +39,7 @@
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/platform/memory.hpp"
 
@@ -370,9 +371,9 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         }
     }
     // the states after a window's rows but its last, for going back to the last accepted draft: a window checks up to
-    // spec - 1 drafts
+    // spec - 1 drafts (at most the window kernel's snapshots)
     if (has_mtp_) {
-        opt_.spec = std::min(opt_.spec, opt_.max_t);
+        opt_.spec = std::min({opt_.spec, opt_.max_t, k::kNativeGdnMaxSnaps + 1});
         n_snap_ = opt_.spec - 1;
         gdn_snap_.assign(gdn_state_.size(), {});
         conv_snap_.assign(gdn_state_.size(), {});
@@ -389,6 +390,46 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
                 gdn_snap_[g].push_back(st);
                 conv_snap_[g].push_back(cv);
             }
+    }
+    // the drafts' head over a token subset (Qwen3.8's draft head, mtp.cpp): on the RX 9060 XT the whole Q8_0 head of
+    // Qwen3.6's 248,320 tokens took 1.7 ms a draft, at the card's bandwidth, 2026-10-15.  The engine's row layouts
+    // (upload) rewrite each row in place, so a row keeps its GGUF type's size.
+    if (has_mtp_ && n_snap_ > 0 && !opt_.draft_vocab.empty()) {
+        std::vector<int32_t> ids;
+        if (FILE* f = std::fopen(opt_.draft_vocab.c_str(), "rb")) {
+            int32_t v = 0;
+            while (std::fread(&v, sizeof v, 1, f) == 1)
+                if (v >= 0 && v < n_vocab_) ids.push_back(v);
+            std::fclose(f);
+        }
+        const int gguf_type = head_.type == k::kNativeQ8Rows    ? kQ80
+                              : head_.type == k::kNativeQ6KRows ? kQ6K
+                                                                : head_.type;
+        const size_t row = head_.type == kBF16 ? (size_t) head_.n_in * 2
+                                               : k::cpu::native_row_bytes(gguf_type, head_.n_in);
+        int32_t* d_ids = nullptr;
+        if (ids.empty() || row == 0) {
+            std::fprintf(stderr, "strata plain: %s: no draft tokens read; the drafts use the whole head\n",
+                         opt_.draft_vocab.c_str());
+        } else if (!strata::gpu::alloc_device(&d_ids, ids.size() * 4) ||
+                   !strata::gpu::alloc_device(&dhead_, ids.size() * row)) {
+            err = "plain model: no VRAM for the drafts' head (" + std::to_string(ids.size()) + " tokens)";
+            return false;
+        } else {
+            allocs_.push_back(d_ids);
+            allocs_.push_back(dhead_);
+            if (!strata::gpu::copy(d_ids, ids.data(), ids.size() * 4)) {
+                err = "plain model: the drafts' head";
+                return false;
+            }
+            k::gather_rows(static_cast<const uint8_t*>(head_.data), (int64_t) row, d_ids, (int64_t) ids.size(),
+                           static_cast<uint8_t*>(dhead_), cs_);
+            if (!strata::gpu::stream_sync(cs_)) { err = "plain model: the drafts' head"; return false; }
+            n_dvocab_ = (int64_t) ids.size();
+            dvocab_ = std::move(ids);
+            std::fprintf(stderr, "strata plain: the drafts' head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
+                         (double) ((size_t) n_dvocab_ * row) / 1048576.0);
+        }
     }
     n_pages_ = (opt_.max_cells + qs.page_size - 1) / qs.page_size;
     opt_.max_cells = n_pages_ * qs.page_size;
@@ -859,24 +900,24 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
             proj(b.alpha, hn_, alpha_, T, false);
             proj(b.beta, hn_, beta_, T, false);
         }
-        for (int t = 0; t < T; ++t) {   // the recurrence, token by token
+        const int n_snaps = std::min(T - 1, n_snap_);   // the states after rows 0 .. n_snaps - 1, for spec_step
+        for (int t = 0; t < T; ++t) {   // each row's inputs; the convolution's history goes on row by row
             float* h = hc_ + (size_t) t * C;
             k::native_gdn_conv_silu(hist, qkv_ + (size_t) t * C, b.conv, craw_, h, C, s.ssm_d_conv, cs);
             k::native_gdn_l2_norm(h, HK, S, eps, cs);
             k::native_gdn_l2_norm(h + HK * S, HK, S, eps, cs);
-            k::native_gdn_beta_gate(beta_ + (size_t) t * HV, HV, cs);
             k::native_gdn_gate(alpha_ + (size_t) t * HV, b.dt, b.a, gate_ + (size_t) t * HV, HV, cs);
-            k::native_gdn_step(state, h, h + HK * S, h + 2 * HK * S, gate_ + (size_t) t * HV, beta_ + (size_t) t * HV,
-                               o_ + (size_t) t * ZV, gs, cs);
-            k::native_gdn_out_norm(o_ + (size_t) t * ZV, z_ + (size_t) t * ZV, b.ssm_norm, y_ + (size_t) t * ZV, HV, S,
-                                   eps, cs);
-            if (t < T - 1 && t < n_snap_) {   // the state after row t, for spec_step to go back to
-                k::MappedCopy c[2];
-                c[0] = {gdn_snap_[(size_t) b.gdn][(size_t) t], state, S * HV * S};
-                c[1] = {conv_snap_[(size_t) b.gdn][(size_t) t], hist, C * (s.ssm_d_conv - 1)};
-                k::copy_from_mapped_multi(c, 2, cs);
-            }
+            if (t < n_snaps)
+                k::copy_from_mapped(conv_snap_[(size_t) b.gdn][(size_t) t], hist, C * (s.ssm_d_conv - 1), cs);
         }
+        k::native_gdn_beta_gate(beta_, HV * T, cs);
+        // the recurrence over the window's rows in one launch (the state read and written once, the rows' states
+        // to go back to written beside): one launch a row read and wrote the 2 MiB state of Qwen3.6's 32 heads each
+        // time, 45 us a row on the RX 9060 XT (2026-10-15)
+        float* snaps[k::kNativeGdnMaxSnaps] = {};
+        for (int t = 0; t < n_snaps; ++t) snaps[t] = gdn_snap_[(size_t) b.gdn][(size_t) t];
+        k::native_gdn_step_rows(state, hc_, C, gate_, beta_, o_, ZV, T, snaps, n_snaps, gs, cs);
+        k::native_gdn_out_norm(o_, z_, b.ssm_norm, y_, HV * T, S, eps, cs);
         proj(b.ssm_out, y_, mix_, T, true);
     } else {
         const int64_t a = b.attn;
@@ -994,7 +1035,17 @@ bool PlainModel::record_mtp(int T, strata::gpu::Stream cs, std::string& err) {
     // the last row only: its norm is the next step's trunk row, and its logits pick the draft
     k::native_qsa_rms_norm_weighted(x_ + (size_t) (T - 1) * N, mtp_head_norm_, hn_, (int) N, 1, eps, cs);
     k::copy_from_mapped(mtp_h_, hn_, N, cs);
-    head_logits(hn_, 1, cs);
+    if (dhead_ != nullptr) {   // the subset's rows: logits_[i] is token dvocab_[i]'s
+        if (head_.type == kBF16) {
+            k::bf16_gemv_fp32_mmvf_multi(hn_, head_.n_in, static_cast<const uint16_t*>(dhead_), logits_,
+                                         (int) n_dvocab_, head_.n_in, (int) n_dvocab_, 1, cs);
+        } else {
+            k::native_quantize_q8_1(hn_, xq_, head_.n_in, 1, cs);
+            k::native_mmvq(head_.type, dhead_, xq_, logits_, head_.n_in, (int) n_dvocab_, 1, cs);
+        }
+    } else {
+        head_logits(hn_, 1, cs);
+    }
     return true;
 }
 
@@ -1104,7 +1155,7 @@ bool PlainModel::mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* dra
     k::SamplerParams sp;   // the drafts are greedy
     sp.greedy = true;
     sp.temperature = 0.0f;
-    k::sample_tokens(logits_, 1, (int) n_vocab_, nullptr, 0, sp, m_out_, cs_);
+    k::sample_tokens(logits_, 1, (int) (dhead_ != nullptr ? n_dvocab_ : n_vocab_), nullptr, 0, sp, m_out_, cs_);
     if (!strata::gpu::stream_sync(cs_)) {
         err = std::string("plain model: the MTP layer: ") + strata::gpu::last_error();
         return false;
@@ -1114,6 +1165,7 @@ bool PlainModel::mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* dra
         return false;
     }
     *draft = ((volatile int32_t*) h_out_)[0];
+    if (dhead_ != nullptr) *draft = *draft >= 0 && *draft < n_dvocab_ ? dvocab_[(size_t) *draft] : -1;
     return true;
 }
 
@@ -1242,12 +1294,18 @@ bool PlainModel::adapt(std::string& err, int64_t max_swaps) {
         const float* u = disp_.usage.data() + l * E;
         const int32_t* r = res_.data() + l * E;
         for (int32_t e = 0; e < (int32_t) E; ++e) {
-            if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
+            if (r[e] < 0) { if (u[e] > 0.0f) cand.emplace_back(u[e], e); }
             else vict.emplace_back(u[e], e);
         }
-        for (size_t i = 0; i < free_[(size_t) l].size(); ++i) vict.emplace_back(-1.0f, -1);
+        // a free slot takes any expert routed since (an empty slot only costs a copy); one held, a missing expert
+        // routed at least twice
+        const size_t n_free = free_[(size_t) l].size();
+        for (size_t i = 0; i < n_free; ++i) vict.emplace_back(-1.0f, -1);
         if (cand.empty() || vict.empty()) continue;
         std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        size_t keep = 0;
+        while (keep < cand.size() && (keep < n_free || cand[keep].first >= 2.0f)) ++keep;
+        cand.resize(keep);
         const size_t nc = std::min(cand.size(), vict.size());
         std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                           [](auto& a, auto& b) { return a.first < b.first; });

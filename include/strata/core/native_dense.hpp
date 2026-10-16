@@ -10,6 +10,13 @@
 
 namespace strata::core {
 class WeightTable;
+struct WeightRef;
+
+/// STRATA_HC_Q8 with the BF16 copies dropped (NativeDense::drop_hc_bf16): `w`'s BF16 values, its Q8_0 copy
+/// dequantized on `stream` into scratch `slot` (0-1 the prompt path's down and up, 2-3 the single-token read's),
+/// which `drop_hc_bf16` allocated; `w->data` when it is resident.  A slot holds one matrix at a time: its reader
+/// is done with it before the next view of the same slot is queued on the same stream.
+const uint16_t* hc_bf16_view(const WeightRef* w, int slot, void* stream);
 
 // Experimental GDN/QSA/shared-expert projection overrides. Upload unchanged native GGUF
 // blocks once, then attach them to the matching canonical WeightRef. Unsupported
@@ -39,6 +46,22 @@ public:
     /// the native kernel also reads, e.g. OrcaRouter's IQ3_XXS) serves the PLE from that row, so it is taken out
     /// of `skip` and `load` does not upload the GGUF key over it.  A quantized row leaves `skip` unchanged.
     static bool keep_unquantized_ple_key(const std::string& pack_dir, std::set<std::string>& skip, std::string& err);
+    /// STRATA_HC_Q8 (not 0): the layers' hyper-connection down / up projections can be read from Q8_0 copies, so
+    /// the canonical arena may leave their BF16 out (`hc_side_names`) and load it beside, to be dropped after `load`.
+    static bool hc_q8_wanted();
+    /// The pack's `blk.N.hc_{attn,ffn}_{down,up}.weight` rows (`hc`) and every other row (`others`), from its index.
+    static bool hc_side_names(const std::string& pack_dir, std::set<std::string>& hc, std::set<std::string>& others,
+                              std::string& err);
+    /// Points `main`'s rows at `side`'s loaded copies of them (the BF16 the canonical arena left out).
+    static void adopt(WeightTable& main, const WeightTable& side);
+    /// The next `load` may give the BF16 copies up (they are in a side allocation the caller frees after
+    /// `drop_hc_bf16`): no VRAM-share rule for the choice, since the Q8_0 copies then take less than they free.
+    void set_hc_side(bool on) { hc_side_ = on; }
+    /// After `load`: the Q8_0 read was chosen.
+    bool hc_q8_chosen() const { return !hc_q8_.empty(); }
+    /// The layers' BF16 down / up rows that have Q8_0 copies become non-resident (data null) and the dequantization
+    /// scratch hc_bf16_view uses is allocated here, at load, not on first use (a graph may capture the first use).
+    bool drop_hc_bf16(WeightTable& table, std::string& err);
     uint64_t weight_bytes() const { return bytes_; }
     size_t tensor_count() const { return weights_.size(); }
 
@@ -47,5 +70,6 @@ private:
     std::vector<void*> hc_q8_;   ///< STRATA_HC_Q8=1: the hyper-connection projections' Q8_0 copies
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
+    bool hc_side_ = false;
 };
 } // namespace strata::core

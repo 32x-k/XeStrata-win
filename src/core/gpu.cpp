@@ -449,6 +449,28 @@ bool host_register_on(int device, void* p, size_t bytes) {
     catch (const std::exception& e) { return fail("host_register_on", e); }
 }
 
+bool peer_access(int a, int b) {
+#if defined(SYCL_EXT_ONEAPI_PEER_ACCESS)
+    try {
+        const sycl::device& da = core::Runtime::at(a).device();
+        const sycl::device& db = core::Runtime::at(b).device();
+        if (da.get_backend() != db.get_backend()) return false;
+        return da.ext_oneapi_can_access_peer(db, sycl::ext::oneapi::peer_access::access_supported);
+    } catch (const std::exception&) {
+        return false;   // the backend does not answer the query: no peer access
+    }
+#else
+    (void) a;
+    (void) b;
+    return false;
+#endif
+}
+
+std::string device_name(int device) {
+    try { return core::Runtime::at(device).device().get_info<sycl::info::device::name>(); }
+    catch (const std::exception& e) { fail("device_name", e); return {}; }
+}
+
 void host_unregister_on(int device, void* p) {
     try { sx::release_from_device_copy(p, core::Runtime::at(device).context()); }
     catch (const std::exception& e) { fail("host_unregister_on", e); }

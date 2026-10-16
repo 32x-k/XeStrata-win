@@ -43,6 +43,9 @@ struct FusedGrArgs {
     /// then its fp16 scales), both or neither; fused_gr_read_multi reads them in place of w_down / w_up
     const uint8_t* q8_down = nullptr;  ///< [hc_lr][hc*n_embd]
     const uint8_t* q8_up = nullptr;    ///< [hc*n_embd][hc_lr]
+    /// with the Q8_0 read: this token's mixed is also written as q8_1 blocks here (n_embd / 32 of 36 bytes, bitwise
+    /// native_quantize_q8_1's) by a 32-column up (upstream 0a379a1f); every token's or none
+    void* q8_mixed = nullptr;
 };
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);
@@ -51,6 +54,19 @@ bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);
 /// each value rounded to the nearest).  Ordered on `stream`.
 void fused_gr_quantize_q8_0(const uint16_t* src, uint8_t* dst, int64_t nb, void* stream);
 void fused_gr_read(const FusedGrArgs& a, void* stream);
+/// STRATA_HC_Q8 with the BF16 copies dropped: a projection's Q8_0 values in kNativeQ8Rows' layout (`ne1` rows of
+/// `ne0`) as BF16 [ne1][ne0], for the readers that take BF16 (the prompt path, the single-token read).  On `stream`.
+void fused_gr_q8_rows_to_bf16(const uint8_t* q8, uint16_t* dst, int64_t ne0, int64_t ne1, void* stream);
+/// STRATA_HC_Q8 unset: one layer's read (`w`'s weights; its BF16 and its Q8_0 pointers) timed on a window of `n_tok`
+/// tokens, `reps` times after a warm-up, on zero inputs (the time does not depend on the values) -> the mean
+/// microseconds of the BF16 read and of the Q8_0 read, each with the launch that quantizes mixed to q8_1 after it,
+/// and of the Q8_0 read that writes the q8_1 itself (`q8_mixed`).
+void fused_gr_time_q8(const FusedGrArgs& w, int n_tok, int reps, void* stream, double& bf16_us, double& q8_us,
+                      double& q8f_us);
+/// The Q8_0 read writes mixed's q8_1 itself (the verify window's first half then skips its quantize launch), where
+/// fused_gr_time_q8 found it faster at load.  Process-wide.
+void fused_gr_set_q8_fuse(bool on);
+bool fused_gr_q8_fuse();
 
 /// Plan v0.3 P6: the same read for up to 8 tokens that share the weights (a verify window): the weights are read
 /// once for all of them.  `a[t]` is token t's arguments (its own R, pending write, lo, rs, inject, mixed; the four

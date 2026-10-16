@@ -58,7 +58,7 @@ The details are in [AGENTS.md](AGENTS.md#licenses) and `NOTICE`.
 XeStrata linked with a math or compute library a GPU or CPU maker publishes (oneMKL, cuBLAS and the like) and its
 runtime libraries (the CUDA runtime and driver, the runtime libraries of oneAPI's compilers and the like) may be conveyed.
 
-The contrib-llvm and contrib-icpx builds and their packages link these libraries, which are not free software.
+The contrib-llvm build and its packages link these libraries, which are not free software.
 Without this permission, the LGPL alone would not allow conveying them.
 
 A change goes into XeStrata under these terms, the additional permission included.
@@ -79,7 +79,7 @@ them: they go in under LGPL-3.0-or-later without the additional permission, and 
 Whoever wrote it (the maintainer, a pull request, a port from upstream), a change goes in only on these two conditions.
 
 1. **It was built and tested with intel/llvm, in both the free and contrib-llvm modes.**
-   A change built only with icpx (the contrib-icpx mode), or not built, does not go in.
+   A change built only with another compiler (Intel oneAPI's icpx, for example), or not built, does not go in.
    How to build: [docs/BUILD.md](docs/BUILD.md) and [docs/DEVTOOLS.md](docs/DEVTOOLS.md).
 1. **It keeps [the first rule](#the-first-rule-no-dependence-on-the-model-number)**: no dependence on the model number.
    The free mode relies on nothing that is not free software.
@@ -88,7 +88,7 @@ A change that does not meet them does not go in as it is: it is a reference, wri
 
 A pull request says:
 
-- which modes it was built in (free, contrib-llvm, contrib-icpx);
+- which modes it was built in (free, contrib-llvm);
 - on which GPUs and CPUs it ran;
 - what was not checked, marked `unverified`.
 

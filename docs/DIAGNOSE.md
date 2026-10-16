@@ -79,7 +79,7 @@ Do not infer the build mode from the directory name.
 
 Record the compiler executable and version, CMake invocation, relevant `CMakeCache.txt` entries and dependent projects' revisions.
 Check `STRATA_LICENSE`, `STRATA_CUDA_ARCHS`, `STRATA_HIP_ARCHS`, `STRATA_ONEMKL`, `STRATA_PORTABLE` and relevant engine and image build options.
-Distinguish free, contrib-llvm and contrib-icpx in the report.
+Distinguish free and contrib-llvm in the report.
 `STRATA_LICENSE=contrib` means contrib-llvm.
 
 A source installation may retain and start its old engine when a build after an update fails.

@@ -10,11 +10,6 @@
 # On the GPU through Vulkan (ggml-vulkan; free software: Mesa's drivers, libvulkan-dev, glslc):
 #   cmake -S tools/vision -B build-vision-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release \
 #         -DLLAMA_DIR=third_party/main/llama.cpp -DSTRATA_VISION_VULKAN=ON
-#
-# On the Intel GPU through SYCL (ggml-sycl, which needs oneMKL: the contrib-icpx build only), in oneAPI's environment:
-#   cmake -S tools/vision -B build-vision-sycl -G Ninja -DCMAKE_BUILD_TYPE=Release \
-#         -DLLAMA_DIR=third_party/main/llama.cpp -DSTRATA_LICENSE=contrib-icpx -DSTRATA_VISION_SYCL=ON \
-#         -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
 cmake_minimum_required(VERSION 3.21)
 project(strata_vision C CXX)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -23,17 +18,6 @@ endif()
 
 set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/main/llama.cpp" CACHE PATH "llama.cpp checkout")
 option(STRATA_VISION_VULKAN "run the vision encoder on the GPU through Vulkan (builds ggml-vulkan)" OFF)
-option(STRATA_VISION_SYCL "run the vision encoder on the Intel GPU through SYCL (ggml-sycl; needs icpx and oneMKL)"
-       OFF)
-# AGENTS.md: the free build uses free software only; ggml-sycl links oneMKL, which is not
-set(STRATA_LICENSE contrib CACHE STRING "build mode: free, contrib or contrib-icpx (icpx, oneMKL)")
-if(STRATA_VISION_SYCL AND NOT STRATA_LICENSE STREQUAL "contrib-icpx")
-  message(FATAL_ERROR "STRATA_VISION_SYCL needs oneMKL, which is not free software: use STRATA_VISION_VULKAN, or allow "
-                      "it with -DSTRATA_LICENSE=contrib-icpx")
-endif()
-if(STRATA_VISION_SYCL AND STRATA_VISION_VULKAN)
-  message(FATAL_ERROR "choose one of STRATA_VISION_SYCL and STRATA_VISION_VULKAN")
-endif()
 option(STRATA_PORTABLE "ggml for any AVX2 CPU; OFF: -march=native" ON)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
@@ -56,7 +40,7 @@ else()
   set(GGML_NATIVE ON CACHE BOOL "" FORCE)
 endif()
 set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
-set(GGML_SYCL ${STRATA_VISION_SYCL} CACHE BOOL "" FORCE)
+set(GGML_SYCL OFF CACHE BOOL "" FORCE)
 set(GGML_VULKAN ${STRATA_VISION_VULKAN} CACHE BOOL "" FORCE)
 
 add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)

@@ -41,7 +41,9 @@ One run per cell.
 | **IQ3_S** | 450 | 740 | 1,718 | 1,458 | 1,333 | 1,081 |
 | **Coder** | 936 | 1,573 | 2,015 | 1,659 | 1,499 | 1,188 |
 
-While a short prompt (a chunk below 2,048 tokens) is read, the decode CPU pool, idle then, computes the experts outside VRAM that few of its tokens route to (opt-in upstream, the default here: `STRATA_PREFILL_CPU_SHARE=auto`). It measures the CPU's and the GPU's time per expert and hands over the share at which both end together. With `STRATA_PREFILL_CPU_GATE=1` it also times neighbouring layers with and without the share, and shares only while the layers that share take less time per expert outside VRAM (upstream f2a3b946, #1282: on one PC the busy CPU slowed the host that issues the streams, and every share lost). The layers tried without the share cost more than that saved here, 1.3% of a 1K prompt's speed on the B70 and 4.4% on the RTX 4070, so it is off by default. `STRATA_DBG_CPU_GATE=1` prints those readings. The default leaves it off when the GPU cache holds every expert (nothing streams) and when the host is short of memory (less free RAM than the share's buffers and 3 GiB, or file pages of the experts it would read that the free RAM cannot keep) (upstream eaaa237e, 04dbe561; `STRATA_PREFILL_CPU_SHARE=auto` turns it on anyway). A buffer of the share that cannot be had ends the share instead of failing the request. The CPU computes in its own activation format, so an answer can differ a little from the GPU-only one. `STRATA_PREFILL_CPU_SHARE=0` keeps every expert on the GPU, `0.4` and the like a fixed share. 262- / 914-token prompts went from 319.2 to 383.1 / 736.3 to 828.0 tokens/s on the B70 and from 109.9 to 266.1 / 275.9 to 457.8 tokens/s on the RTX 4070 (one run each).
+While a short prompt (a chunk below 2,048 tokens) is read, the decode CPU pool, idle then, computes the experts outside VRAM that few of its tokens route to (opt-in upstream, the default here: `STRATA_PREFILL_CPU_SHARE=auto`). It measures the CPU's and the GPU's time per expert and hands over the share at which both end together. With `STRATA_PREFILL_CPU_GATE=1` it also times neighbouring layers with and without the share, and shares only while the layers that share take less time per expert outside VRAM (upstream f2a3b946, #1282: on one PC the busy CPU slowed the host that issues the streams, and every share lost). The layers tried without the share cost more than that saved here, 1.3% of a 1K prompt's speed on the B70 and 4.4% on the RTX 4070, so it is off by default. `STRATA_DBG_CPU_GATE=1` prints those readings. The default leaves it off when the GPU cache holds every expert (nothing streams) and when the host is short of memory (less free RAM than the share's buffers and 3 GiB, or file pages of the experts it would read that the free RAM cannot keep) (upstream eaaa237e, 04dbe561; `STRATA_PREFILL_CPU_SHARE=auto` turns it on anyway). A buffer of the share that cannot be had ends the share instead of failing the request. The CPU computes in its own activation format, so an answer can differ a little from the GPU-only one. The measured share moves a little from run to run, so two greedy runs with the same settings can part after some tokens too (as with the decode's PCIe share); to compare two runs' answers, fix both with `STRATA_PREFILL_CPU_SHARE=0` and `--pcie-frac 0`. `STRATA_PREFILL_CPU_SHARE=0` keeps every expert on the GPU, `0.4` and the like a fixed share. 262- / 914-token prompts went from 319.2 to 383.1 / 736.3 to 828.0 tokens/s on the B70 and from 109.9 to 266.1 / 275.9 to 457.8 tokens/s on the RTX 4070 (one run each).
+
+With a helper GPU (`--expert-cache-device1`, or the helper `--layer-split auto` chose), in the same short chunks the experts not in VRAM that the helper holds and few tokens route to are computed by the helper from its own VRAM. Their tokens' rows go to it through host memory registered on both GPUs, and the results come back the same way. How many tokens an expert may have is where moving its rows over the helper's link and back takes less time than streaming the expert to the first GPU, from both links as measured at the start (19 for a B70 and an RTX 4070 on x4). `STRATA_PREFILL_HELPER_ROWS=n` sets it, `0` turns it off. The helper computes with its int8 products, so the reply can differ slightly from the first GPU alone's (the first token's KL on a 1K prompt 0.011; the CPU share at 0.5: 0.020). On a B70 and an RTX 4070 a 1K prompt went from 693 to 735 tokens/s.
 
 ### Decode (tokens/s)
 
@@ -221,8 +223,12 @@ On an Arc Pro B70 (32 GB) with an i7-14700 and 96 GB of RAM (a 55 GiB RAM budget
 Its experts are Q4_K, Q5_K, Q5_1 and Q8_0 blocks, 77 GB of them: more than a 64 GB PC holds.
 setup downloads the shards from a pinned revision, checks their SHA-256 once, and packs the model with `--compat-bf16`.
 That turns its Q8_0 hyper-connection projections into BF16, the form the engine reads.
-`STRATA_HC_Q8=1` in the engine's environment makes the verify window's hyper-connection read (the final mixer's before the head too) read the GGUF's Q8_0 values themselves (upstream fe6c5260; 0.63 GiB more VRAM, and the answers change).
-On the B70 one read of 4 tokens went from 35.6 to 31.9 µs and the decode from 45.0 to 45.4 tokens/s; on an RTX 4070 the expert cache lost the VRAM and the decode went from 22.4 to 21.8 tokens/s.
+The verify window's hyper-connection read (the final mixer's before the head too) can read the GGUF's Q8_0 values themselves (upstream fe6c5260; a BF16 pack's are quantized to Q8_0 at load; 0.62 GiB more VRAM, and the answers change).
+At load the engine times the read in its BF16 and Q8_0 forms and keeps the Q8_0 one only when it is faster (`STRATA_HC_Q8=1`: always, `=0`: never).
+On one GPU, once the Q8_0 read is chosen the layers' BF16 copies leave the VRAM (upstream b60aab1b; 1.17 GiB with IQ3_XXS) and the expert cache gets their room; the prompt path turns the Q8_0 values back into BF16 in a scratch as it reads them.
+A layer split cannot drop the BF16, so there a GPU whose Q8_0 copies would take more than 5% of the free VRAM stays BF16.
+The Q8_0 read that also writes the next projections' q8_1, 32 columns a work-group (upstream 0a379a1f), is timed too and taken where it is faster (`STRATA_HC_Q8_FUSE=0/1` decides; the same answers).
+IQ3_XXS's 32K decode: B70 +3.5%, RTX 4070 the same (prefill +1%), RX 9060 XT +0.6% (there with the q8_1 written in the read).
 The engine reads the experts from the GGUF files in place.
 It keeps a RAM budget of them, the most-used first after the ones the GPU holds (`--resident-budget-gib N`).
 setup chooses the RAM less 24 GB for N, less the KV cache too when that lives in RAM:
@@ -301,7 +307,7 @@ The engine's options (added to the settings' `args`):
 | `--expert-profile PATH` | fill the experts in VRAM in this profile's order at start |
 | `--expert-profile-save PATH` | write what this run learned as a profile |
 | `--adapt-every N` | windows between swaps of the experts in VRAM (default 4; 0: no swaps) |
-| `--adapt-swaps N` | the most experts one swap moves (default 96; the one right after a prompt moves up to 2,048, those the prompt used most) |
+| `--adapt-swaps N` | the most experts one swap moves (default 96; the one right after a prompt moves up to 2,048, those the prompt used most, and fills every free slot with any expert it used) |
 | `--adapt-mib-per-token N` | the swaps copy at most N MiB for each token read since the last one (default 48; 0: no bound) |
 | `--mmap-experts` | read the experts from the model file instead of loading them into RAM |
 | `--no-pcie-split` | the CPU computes every expert VRAM does not hold |
@@ -309,6 +315,7 @@ The engine's options (added to the settings' `args`):
 | `--prompt-chunk N` | the most tokens prefill computes at once (default 4096; 0: none at once) |
 | `--max-t N` | the decode window's most tokens (default 8) |
 | `--spec N` | the most tokens of a window checking the MTP layer's drafts (default 3: two drafts; 0: off) |
+| `--draft-vocab PATH` | the MTP layer drafts only tokens of this subset (`data/draft_vocab*.bin`), reading less of the head (setup writes it into Qwen3.6's settings, after its `--draft-vocab` choice) |
 | `--rope-scaling none\|linear\|yarn`, `--rope-scale F`, `--yarn-orig-ctx N` | context extension |
 
 ### Less RAM than the model: the low-RAM mode
@@ -1183,7 +1190,7 @@ Nothing else changes.
 
 | Encoder on | Speed | Image tokens per picture |
 | --- | --- | --- |
-| **GPU** (recommended) | faster than the CPU encoder: 7–9× with Vulkan, 13–20× with SYCL (contrib-icpx) | up to 1,024 |
+| **GPU** (recommended) | 7–9× faster than the CPU encoder (Vulkan) | up to 1,024 |
 | CPU | slow | scaled down to about 300 |
 
 With images on, setup passes `--vram-reserve-mib 700` to the engine.
@@ -1197,7 +1204,7 @@ After `"elastic_idle_s"` (default 120) without a picture it stops between reques
 A `POST /v1/vram` while the encoder runs stacks the reserve on top of the encoder's share; an unload stops the encoder too.
 Without `"vram_elastic"` the server says so and starts the encoder with the model, as before.
 
-The two GPU encoder builds (Vulkan, and SYCL in contrib-icpx), how their results differ, and the order in which the server falls back to the CPU are in [XE.md](XE.md#images).
+The GPU encoder's build (Vulkan), its precision, and the order in which the server falls back to the CPU are in [XE.md](XE.md#images).
 A picture becomes up to 1,024 tokens of the context (a 640x480 photo: 300).
 The same picture sent again, as chat apps do on every turn, is encoded only once.
 
@@ -1260,14 +1267,23 @@ the model uses interleaved M-RoPE.
 ## Image generation (optional)
 
 `./setup.sh --images qwen-image` sets up image generation with Qwen-Image-2.1-Turbo beside the text model (upstream 0.1.44).
-Setup builds [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)'s (MIT) `sd-cli` with its Vulkan backend, downloads the image model, its VAE and its text encoder (Qwen3-VL-8B), and adds an `"images"` section to the config.
-The Vulkan build runs on every maker's GPU; `--image-backend cpu` makes images on the CPU (slowly).
-The image model's size follows the GPU memory (Q4_K_M up to 8 GB, Q6_K up to 12 GB, Q8_0 above; `--image-quant` changes it).
+Images are made by XeStrata's own image engine, `strata-image`, which setup builds with the text engine: the same SYCL kernels, on every maker's GPU.
+Setup downloads the image model, its VAE, its text encoder (Qwen3-VL-8B) and, for the edits, its vision encoder (Qwen3-VL's mmproj), and adds an `"images"` section to the config.
+The image model is Q8_0 by default. The engine streams from RAM the layers that do not fit in VRAM, so the GPU's memory does not decide the size.
+The RAM does: when the four files (the vision encoder for the edits among them) and the engine's own (about 16.6 GB with Q8_0, 15.3 GB with Q6_K, 13.2 GB with Q4_K_M) do not fit the RAM the text model leaves, setup takes the largest that fits (Q6_K, Q4_K_M).
+With `--image-ssd-offload on` it keeps the size chosen and reads what does not fit from the SSD (slower).
+When setup lowers it, setup, the server at start and the web page (the Images tab) say so.
+With the same seed it makes the image stable-diffusion.cpp makes with the model card's command (within an LPIPS of 0.03).
 Qwen-Image-2.1-Turbo's weights are under the Qwen Research License, not a free software license: read it before any commercial use.
 
-The server makes images on `POST /v1/images/generations` (OpenAI's images API, plus `seed` and `steps`), and the web page gets an Images tab.
-Image jobs run one at a time on the GPU. What the text model does meanwhile is `--image-gpu-policy`: `keep` (stays as it is), `shrink` (gives VRAM back through `--vram-elastic`), `unload` (its conversation saved, unloaded, restored at the next start), or `auto` (the default: `keep` when both fit, else shrink or unload).
-`tools/image/install.py --config <config>` adds it to an existing install. Linux only for now.
+The server makes images on `POST /v1/images/generations` (OpenAI's images API, plus `seed`), and the web page gets an Images tab.
+`POST /v1/images/edits` (OpenAI's multipart form with `image` or `image[]`, or JSON with `images: [{"image_url": ...}]`) makes an image from reference images (up to 3; PNG, JPEG, GIF, BMP): it can change them, or take the people and things in them as its subject. `size` `auto` takes the first reference's shape at about 1024x1024 pixels. On the web page, an image attached in the Images tab makes an edit.
+A conversation can make images too: `/v1/chat/completions` with `"strata_images": true` (the web page sends it) gives the model the tools `generate_image` and `edit_image`, and when it calls one the server makes the image and shows it there; `edit_image` changes the conversation's last image (one attached or one made in it). On `/v1/responses`, OpenAI's hosted `image_generation` tool does the same, and the image comes back as an `image_generation_call` item (its `result` the PNG in base64).
+Each side is 256 to 2048 pixels. A size whose sides are not multiples of 16 (1920x1080) is made at the sides rounded up (1920x1088) and its middle cut out; the web page says so.
+The image engine starts with the first image and stays: its kernels are prepared once, and the same prompt's text states and the layers it holds in VRAM are kept for the next image.
+Image jobs run one at a time on the GPU. Before a job the engine says what the image needs in VRAM (the least, and the DiT whole with the VAE in one piece), and what the text model does meanwhile is `--image-gpu-policy`: `keep` (stays as it is), `shrink` (gives VRAM back through `--vram-elastic`), `unload` (its conversation saved, unloaded, restored at the next start), or `auto` (the default: `keep` when everything fits, else `shrink` when the engine can, else `keep` with the layers streamed when the least fits, else `unload`).
+After a job the image engine keeps its layers only under `keep` with VRAM to spare; otherwise it lets go of what it holds (idle, the process alone, about 200 MiB).
+`tools/image/install.py --config <config>` adds it to an existing install.
 
 ---
 
@@ -1322,16 +1338,15 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 | Symptom | What to do |
 | --- | --- |
 | `no Intel GPU on the xe or i915 driver, no AMD GPU on amdgpu and no NVIDIA GPU on NVIDIA's driver found` | The Intel GPU is not on the xe or i915 driver, the AMD GPU not on amdgpu, and the NVIDIA GPU not on NVIDIA's; check the driver with `lspci -k`. For a discrete card, enable Above 4G Decoding and Re-Size BAR and disable CSM in the BIOS. |
-| `an NVIDIA GPU needs the contrib build` | `--license free` or `--license contrib-icpx` is chosen. NVIDIA GPUs run in the contrib-llvm build only: run setup again with `--license contrib`. |
+| `an NVIDIA GPU needs the contrib build` | `--license free` is chosen. NVIDIA GPUs run in the contrib-llvm build only: run setup again with `--license contrib`. |
 | `NVIDIA's CUDA toolkit is missing` | The CUDA toolkit that makes the NVIDIA GPU's code is not installed. Install it and run setup again (Ubuntu: `sudo apt install nvidia-cuda-toolkit`). |
-| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | The contrib-llvm or contrib-icpx build hands the Intel GPU's dense matrix products to oneMKL, which is missing. Install it ([BUILD.md](BUILD.md#packages)), or run setup again with `--license free`. |
+| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | The contrib-llvm build hands the Intel GPU's dense matrix products to oneMKL, which is missing. Install it ([BUILD.md](BUILD.md#packages)), or run setup again with `--license free`. |
 | `no access to the GPU` | Your user cannot open `/dev/dri/renderD*`: `sudo usermod -aG render $USER`, then log in again. |
 | `no access to the GPU's compute device (/dev/kfd)` | Your user cannot open `/dev/kfd`, which AMD GPUs compute through: `sudo usermod -aG render $USER`, then log in again. |
 | `... the engine needs an RDNA2 or later AMD GPU` | AMD GPUs older than RDNA2 do not run it. |
 | `... rocBLAS ... has no code for gfx...`, `... has no code for gfx...` | The distribution's rocBLAS (in a package, its engine) has no code for that GPU. On Ubuntu 26.04, it may run on Fedora 44 ([README](../README.md#amd-gpus)). |
 | `building for the AMD GPU needs ROCm's ...` | ROCm's packages that build the AMD GPU's code are missing. Install the ones named and run setup again (see also `./setup.sh --packages`). |
 | `... has no HIP target (AMD GPUs)` | intel/llvm was built before ROCm was installed. Let setup build it again when it asks, or run `python3 tools/intel_llvm_build.py --rebuild`. |
-| `an AMD GPU needs the free or contrib build` | `--license contrib-icpx` is chosen. icpx has no AMD target: run setup again with `--license free` or `--license contrib`. |
 | `no progress for 60 s ... reading the prompt` on Linux, and the stall report says `threads waiting on the disk (state D): 16 ...` | The engine waits for the drive, not a deadlock: the n-gram table is read at random (`--ple-io direct`), which a rotational disk cannot keep up with (upstream #605). The engine warns at start when the table is on one; `--ple-io ram` (it needs RAM for the table) or the model on an SSD fixes it. Setup adds `--ple-io ram` itself on a rotational disk when the RAM holds the table. |
 | `the SYCL runtime of ... lists no GPU` | The GPU's Level Zero driver (`libze-intel-gpu1`, Intel's compute-runtime) is missing or too old for it; install a newer one ([BUILD.md](BUILD.md#packages)). |
 | `... gives this GPU no XMX` | The compiler gives the GPU no XMX; choose from setup's options. It runs without XMX, with prefill taking about 1.6 times as long ([BUILD.md](BUILD.md#the-sycl-compiler)). |
@@ -1382,7 +1397,7 @@ When opening an issue, include the report and necessary log excerpts after remov
   The drafts are checked like the MTP's, so the output is the same.
 - **Prefill** runs in chunks of up to 32,768 tokens, with the experts streamed to the GPU over PCIe.
   The matrix products run on XMX on Intel GPUs, on WMMA on AMD GPUs (RDNA3 or later) and on tensor cores on NVIDIA
-  GPUs, and the dense ones go through oneMath: to oneMKL or cuBLAS in the contrib-llvm and contrib-icpx builds, and to
+  GPUs, and the dense ones go through oneMath: to oneMKL or cuBLAS in the contrib-llvm build, and to
   rocBLAS and hipBLASLt on AMD GPUs.
 
 Strata's design, measurements and bottlenecks are in upstream's paper, **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)** (measured on CUDA).
@@ -1407,7 +1422,7 @@ The model files are not part of it; their licenses apply to them (below).
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the i-quant formats, the GPU dot products and dequantizers transcribed in `src/kernels/xe/`,
   the CPU backend linked for the i-quant experts, the `mtmd` library and the GPU backends (Vulkan, SYCL) behind the image encoder (`tools/vision/`),
   and `gguf-py` used by the tools. See `third_party/main/ggml/LICENSE`.
-- **[oneMath](https://github.com/uxlfoundation/oneMath)** (Apache-2.0): the layer that hands the dense matrix products to oneMKL (Intel) and cuBLAS (NVIDIA) in the contrib-llvm and contrib-icpx modes, and to rocBLAS and hipBLASLt (AMD) in the free and contrib-llvm modes.
+- **[oneMath](https://github.com/uxlfoundation/oneMath)** (Apache-2.0): the layer that hands the dense matrix products to oneMKL (Intel) and cuBLAS (NVIDIA) in the contrib-llvm mode, and to rocBLAS and hipBLASLt (AMD) in the free and contrib-llvm modes.
   It is not in the repository: CMake fetches XeStrata's fork ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), oneMath with XeStrata's changes: cuBLAS's BF16 product, hipBLASLt in the rocBLAS backend), under oneMath's license. See `third_party/main/oneMath/LICENSE`.
 - **[intel/llvm](https://github.com/intel/llvm)**'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib-llvm modes' compiler and SYCL runtime.
   It is not in the repository: `tools/intel_llvm_build.py` fetches the release and builds it,

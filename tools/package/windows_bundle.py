@@ -43,7 +43,7 @@ SYCL_DLLS = ("sycl9.dll", "ur_win_proxy_loader.dll", "ur_loader.dll", "ur_adapte
              "ur_adapter_level_zero.dll", "ur_adapter_level_zero_v2.dll", "ur_adapter_hip.dll", "xptifw.dll")
 # the runtime's own: a runtime built for some makers' GPUs only (the AMD build's: HIP) lacks the other adapters
 SYCL_CORE = ("sycl9.dll", "ur_win_proxy_loader.dll", "ur_loader.dll")
-ENGINE_EXES = ("strata.exe", "strata-device.exe")
+ENGINE_EXES = ("strata.exe", "strata-device.exe", "strata-image.exe")
 # what a Windows PC brings (the Visual C++ runtime, which xestrata.exe checks for) and what must never be carried
 FORBIDDEN = ("vcruntime*.dll", "msvcp*.dll", "concrt*.dll", "ucrtbase*.dll", "api-ms-win-*.dll", "nvcuda.dll",
              "nvml.dll", "cublas*.dll", "cudart*.dll", "mkl_*.dll", "amdhip64*.dll", "ze_loader*.dll")
@@ -96,6 +96,8 @@ COMPONENTS = [
     ("gguf-py (llama.cpp)", "llama.cpp", "MIT", "https://github.com/ggml-org/llama.cpp", ["llama:LICENSE"], []),
     ("Outfit (the web app's font)", "outfit", "OFL-1.1", "https://github.com/Outfitio/Outfit-Fonts",
      ["src:third_party/main/outfit/OFL.txt"], []),
+    ("stb_image (compiled into strata-image.exe)", "2.30", "MIT OR Unlicense", "https://github.com/nothings/stb",
+     ["src:third_party/main/stb/LICENSE"], []),
     ("quantscope", "quantscope", "MIT OR Apache-2.0", "https://github.com/1872183316/quantscope",
      ["src:third_party/main/quantscope/LICENSE-MIT", "src:third_party/main/quantscope/LICENSE-APACHE"], []),
 ]

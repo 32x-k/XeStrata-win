@@ -41,7 +41,9 @@ MTP の推測デコードはオンです。
 | **IQ3_S** | 450 | 740 | 1,718 | 1,458 | 1,333 | 1,081 |
 | **Coder** | 936 | 1,573 | 2,015 | 1,659 | 1,499 | 1,188 |
 
-短いプロンプト（2,048 トークン未満のチャンク）では、VRAM にないエキスパートのうち少しのトークンにしか選ばれないものを、そのあいだ空いている decode 用の CPU のプールが計算します（upstream では opt-in、Xe は既定、`STRATA_PREFILL_CPU_SHARE=auto`）。CPU と GPU のエキスパートあたりの時間を測り、両方が同時に終わる割合を渡します。`STRATA_PREFILL_CPU_GATE=1` にすると、渡す層と渡さない層を隣どうしで交互に測り、VRAM にないエキスパートあたりの時間が渡す方で短いあいだだけ渡します（upstream f2a3b946、#1282。CPU が忙しいとストリームを出すホストが遅くなり、渡すと遅くなった PC があったため）。渡さない層を試す分だけ遅くなり、1K のプロンプトが B70 で 1.3%、RTX 4070 で 4.4% 遅くなったので、既定では使いません。`STRATA_DBG_CPU_GATE=1` でその測定を出します。GPU のキャッシュがすべてのエキスパートを持つとき（流すものがない）と、ホストのメモリが足りないとき（空き RAM が分担のバッファと 3 GiB より少ない、または読むエキスパートのファイルのページを空き RAM が持てない）は、既定では使いません（upstream eaaa237e・04dbe561、`STRATA_PREFILL_CPU_SHARE=auto` で使います）。分担のバッファを確保できなかったときは、その要求を失敗させずに分担を止めます。CPU の活性の形で計算するので、GPU だけのときと答えが少し変わります。`STRATA_PREFILL_CPU_SHARE=0` で GPU だけ、`0.4` などで決まった割合です。262 / 914 トークンのプロンプトは、B70 で 319.2 → 383.1 / 736.3 → 828.0 トークン/秒、RTX 4070 で 109.9 → 266.1 / 275.9 → 457.8 トークン/秒でした（各 1 回）。
+短いプロンプト（2,048 トークン未満のチャンク）では、VRAM にないエキスパートのうち少しのトークンにしか選ばれないものを、そのあいだ空いている decode 用の CPU のプールが計算します（upstream では opt-in、Xe は既定、`STRATA_PREFILL_CPU_SHARE=auto`）。CPU と GPU のエキスパートあたりの時間を測り、両方が同時に終わる割合を渡します。`STRATA_PREFILL_CPU_GATE=1` にすると、渡す層と渡さない層を隣どうしで交互に測り、VRAM にないエキスパートあたりの時間が渡す方で短いあいだだけ渡します（upstream f2a3b946、#1282。CPU が忙しいとストリームを出すホストが遅くなり、渡すと遅くなった PC があったため）。渡さない層を試す分だけ遅くなり、1K のプロンプトが B70 で 1.3%、RTX 4070 で 4.4% 遅くなったので、既定では使いません。`STRATA_DBG_CPU_GATE=1` でその測定を出します。GPU のキャッシュがすべてのエキスパートを持つとき（流すものがない）と、ホストのメモリが足りないとき（空き RAM が分担のバッファと 3 GiB より少ない、または読むエキスパートのファイルのページを空き RAM が持てない）は、既定では使いません（upstream eaaa237e・04dbe561、`STRATA_PREFILL_CPU_SHARE=auto` で使います）。分担のバッファを確保できなかったときは、その要求を失敗させずに分担を止めます。CPU の活性の形で計算するので、GPU だけのときと答えが少し変わります。測った割合は実行ごとに少し動くので、同じ設定の 2 回の greedy の答えも途中から分かれることがあります（decode の PCIe の分担も同じ）。2 回の答えを比べるときは `STRATA_PREFILL_CPU_SHARE=0` と `--pcie-frac 0` で両方を固定します。`STRATA_PREFILL_CPU_SHARE=0` で GPU だけ、`0.4` などで決まった割合です。262 / 914 トークンのプロンプトは、B70 で 319.2 → 383.1 / 736.3 → 828.0 トークン/秒、RTX 4070 で 109.9 → 266.1 / 275.9 → 457.8 トークン/秒でした（各 1 回）。
+
+補助の GPU（`--expert-cache-device1`、または `--layer-split auto` が選んだ補助）があるときは、同じ短いチャンクで、VRAM にないエキスパートのうち補助の GPU が持っていて少しのトークンにしか選ばれないものを、補助の GPU が自分の VRAM から計算します。そのトークンの行を両方の GPU に登録したホストのメモリで渡し、結果も同じ道で戻します。何トークンまで渡すかは、行を補助のリンクで往復する時間が、エキスパートを 1 枚目の GPU に流す時間より短くなる数で、起動時に測った両方のリンクの速さから決めます（B70 と RTX 4070 の x4 で 19）。`STRATA_PREFILL_HELPER_ROWS=n` で数を決め、`0` で使いません。補助の GPU の int8 の積で計算するので、1 枚目の GPU だけのときと答えが少し変わります（1K のプロンプトの最初のトークンの KL は 0.011、CPU の分担 0.5 は 0.020）。B70 と RTX 4070 で 1K のプロンプトは 693 → 735 トークン/秒でした。
 
 ### decode（トークン/秒）
 
@@ -212,8 +214,12 @@ Arc Pro B70（32 GB）と i7-14700、RAM 96 GB（RAM の予算 55 GiB）で、�
 エキスパートは Q4_K、Q5_K、Q5_1、Q8_0 のブロックで 77 GB あり、RAM 64 GB の PC には入りきりません。
 setup は、固定したリビジョンからシャードをダウンロードして SHA-256 を一度確かめ、`--compat-bf16` で pack にします。
 このとき、Q8_0 のハイパーコネクションの射影を、エンジンが読む BF16 に変えます。
-エンジンの環境に `STRATA_HC_Q8=1` を置くと、検証窓のハイパーコネクションの読み出し（ヘッドの前の最後のミキサーも）は、GGUF の Q8_0 の値そのものを読みます（upstream fe6c5260。VRAM を 0.63 GiB 多く使い、答えは変わります）。
-B70 では 1 回の読み出しが 4 トークンで 35.6 → 31.9 µs、decode は 45.0 → 45.4 トークン/秒、RTX 4070 では VRAM が減ったぶんエキスパートのキャッシュが小さくなり、22.4 → 21.8 トークン/秒でした。
+検証窓のハイパーコネクションの読み出し（ヘッドの前の最後のミキサーも）は、GGUF の Q8_0 の値そのものを読むこともできます（upstream fe6c5260。BF16 の pack では読み込み時に Q8_0 にします。VRAM を 0.62 GiB 多く使い、答えは変わります）。
+エンジンは読み込み時に、読み出しを BF16 と Q8_0 の両方の形で測り、速いときだけ Q8_0 で読みます（`STRATA_HC_Q8=1` で常に、`=0` で使わない）。
+GPU が 1 枚のときは、Q8_0 で読むと決めたら層の BF16 の写しを VRAM から外し（upstream b60aab1b。IQ3_XXS で 1.17 GiB）、そのぶんがエキスパートのキャッシュに回ります。prompt の経路は、使うたびに Q8_0 から BF16 を作業領域に戻します。
+層の分割では BF16 を外せないので、Q8_0 の写しが空いている VRAM の 5% を超える GPU では BF16 のままです。
+Q8_0 の読みが 32 列ずつで次の射影のための q8_1 まで書く形（upstream 0a379a1f）も測り、速い GPU ではそちらを使います（`STRATA_HC_Q8_FUSE=0/1` で決められます。答えは同じです）。
+IQ3_XXS の 32K の decode は、B70 で +3.5%、RTX 4070 で同等（prefill +1%）、RX 9060 XT で +0.6% でした（RX 9060 XT は q8_1 も読みの中で書く形）。
 エンジンは、エキスパートを GGUF のファイルからそのまま読みます。
 GPU が持つもの以外のうち、よく使うものから順に、RAM の予算の分だけを RAM に置きます（`--resident-budget-gib N`）。
 setup が選ぶ N は、RAM から 24 GB を引いた値で、KV キャッシュを RAM に置くときはさらにその分を引きます。
@@ -284,7 +290,7 @@ RAM がエキスパートに足りないとき、エンジンはエキスパー�
 | `--expert-profile PATH` | 起動時に、このプロファイルの順で VRAM のエキスパートを埋める |
 | `--expert-profile-save PATH` | この実行で学んだことをプロファイルとして書き出す |
 | `--adapt-every N` | VRAM のエキスパートを入れ替える間隔（窓の数、既定 4。0 で入れ替えない） |
-| `--adapt-swaps N` | 1 回に入れ替えるエキスパートの最大の数（既定 96。prompt の直後の 1 回は、その prompt が多く使ったものを 2,048 個まで） |
+| `--adapt-swaps N` | 1 回に入れ替えるエキスパートの最大の数（既定 96。prompt の直後の 1 回は、その prompt が多く使ったものを 2,048 個まで。空いた枠には、1 回でも使ったものを数に関わらず入れます） |
 | `--adapt-mib-per-token N` | 入れ替えで写す量の上限を、前の入れ替えから進んだトークンあたり N MiB にする（既定 48。0 で上限なし） |
 | `--mmap-experts` | エキスパートを RAM に読み込まず、モデルのファイルから読む |
 | `--no-pcie-split` | VRAM にないエキスパートを、すべて CPU で計算する |
@@ -292,6 +298,7 @@ RAM がエキスパートに足りないとき、エンジンはエキスパー�
 | `--prompt-chunk N` | prefill で一度にまとめて計算する最大のトークン数（既定 4096、0 でまとめない） |
 | `--max-t N` | decode の窓の最大のトークン数（既定 8） |
 | `--spec N` | MTP の層の推測デコードの窓の最大のトークン数（既定 3: 下書き 2 個。0 で使わない） |
+| `--draft-vocab PATH` | MTP の層の下書きを、このトークンの部分集合（`data/draft_vocab*.bin`）の中だけで作る。ヘッドを読む量が減ります（setup が Qwen3.6 の設定に、`--draft-vocab` の選択に従って書きます） |
 | `--rope-scaling none\|linear\|yarn`、`--rope-scale F`、`--yarn-orig-ctx N` | 文脈の延長 |
 
 ### RAM がモデルより少ないとき（省 RAM モード）
@@ -1163,7 +1170,7 @@ setup はエンコーダーをダウンロードし、小さな補助のプロ�
 
 | エンコーダーの場所 | 速さ | 画像 1 枚のトークン |
 | --- | --- | --- |
-| **GPU**（勧める） | CPU のエンコーダーより、Vulkan で 7〜9 倍、SYCL（contrib-icpx）で 13〜20 倍速い | 最大 1,024 |
+| **GPU**（勧める） | CPU のエンコーダーより 7〜9 倍速い（Vulkan） | 最大 1,024 |
 | CPU | 遅い | 約 300 に縮める |
 
 画像を有効にすると、setup はエンジンに `--vram-reserve-mib 700` を渡します。
@@ -1176,7 +1183,7 @@ GPU のエンコーダーが VRAM を使うぶん、エキスパートのキャ�
 エンコーダーが動いている間の `POST /v1/vram` は、エンコーダーの分の上に予約を積みます。モデルを外すとエンコーダーも止まります。
 `"vram_elastic"` がなければ、サーバーはそう言って、これまでどおりモデルと一緒にエンコーダーを起動します。
 
-GPU のエンコーダーの 2 つのビルド（Vulkan と contrib-icpx の SYCL）、精度の違い、GPU で動かないときに CPU へ切り替わる順は [XE.ja.md](XE.ja.md#画像) にあります。
+GPU のエンコーダーのビルド（Vulkan）、精度、GPU で動かないときに CPU へ切り替わる順は [XE.ja.md](XE.ja.md#画像) にあります。
 画像 1 枚は、文脈の最大 1,024 トークンになります（640x480 の写真なら 300）。
 チャットのアプリが毎回送り直す同じ画像は、一度だけエンコードします。
 
@@ -1239,14 +1246,23 @@ XeStrata はそれを、プロンプトの `<|image_pad|>` のトークンの位
 ## 画像の生成（任意）
 
 `./setup.sh --images qwen-image` で、文章のモデルとは別に Qwen-Image-2.1-Turbo で画像を作れるようにします（upstream 0.1.44）。
-setup は [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)（MIT）の `sd-cli` を Vulkan 版でビルドし、画像のモデル、VAE、文の読み手（Qwen3-VL-8B）をダウンロードして、設定に `"images"` を足します。
-Vulkan 版はどのメーカーの GPU でも動きます。`--image-backend cpu` で CPU でも作れます（遅い）。
-画像のモデルの大きさは GPU のメモリで選びます（8 GB まで Q4_K_M、12 GB まで Q6_K、それより上は Q8_0。`--image-quant` で変えられます）。
+画像は XeStrata 自身の画像のエンジン `strata-image` が作ります。setup が文章のエンジンと一緒にビルドし、同じ SYCL のカーネルでどのメーカーの GPU でも動きます。
+setup は画像のモデル、VAE、文の読み手（Qwen3-VL-8B）と、編集のための画像の読み手（Qwen3-VL の mmproj）をダウンロードして、設定に `"images"` を足します。
+画像のモデルは既定で Q8_0 です。VRAM に入らない層はエンジンが RAM から流し込むので、GPU のメモリでは大きさを選びません。
+選ぶのは RAM です。4 つのファイル（編集のための画像の読み手を含む）とエンジンの分（Q8_0 で約 16.6 GB、Q6_K で約 15.3 GB、Q4_K_M で約 13.2 GB）が文章のモデルの残す RAM に入らなければ、setup は入る中で最も大きいもの（Q6_K、Q4_K_M）に下げます。
+`--image-ssd-offload on` なら下げずに選んだ大きさのまま入れ、入らない分は SSD から読みます（遅くなります）。
+下げたときは、setup の画面、サーバーの起動時の表示、Web のページ（Images のタブ）がそのことを知らせます。
+同じ種なら、stable-diffusion.cpp がモデルのカードのコマンドで作る画像と同じ画像になります（LPIPS 0.03 以内）。
 Qwen-Image-2.1-Turbo の重みは Qwen Research License で、自由なソフトウェアのライセンスではありません。商用に使う前にそのライセンスを読んでください。
 
-サーバーは `POST /v1/images/generations`（OpenAI の images API の形。`seed` と `steps` も受けます）で画像を作り、Web のページには「Images」のタブが出ます。
-画像の仕事は GPU で 1 つずつ動きます。その間の文章のモデルの扱いは `--image-gpu-policy` で決めます: `keep`（そのまま）、`shrink`（`--vram-elastic` で VRAM を空ける）、`unload`（会話を保存して外し、次の起動で戻す）、`auto`（既定。両方が入れば `keep`、入らなければ空けるか外す）。
-`tools/image/install.py --config <設定>` で、入っているモデルにあとから足せます。今は Linux だけです。
+サーバーは `POST /v1/images/generations`（OpenAI の images API の形。`seed` も受けます）で画像を作り、Web のページには「Images」のタブが出ます。
+`POST /v1/images/edits`（OpenAI の形の multipart で `image` か `image[]`、または JSON の `images: [{"image_url": ...}]`）は、参照画像（3 枚まで、PNG・JPEG・GIF・BMP）を元に画像を作ります。参照画像を書き換えたり、その中の人や物を主題にしたりできます。`size` を `auto` にすると、参照画像の縦横比で約 1024×1024 画素にします。Web のページでも、Images のタブで画像を添付すると編集になります。
+会話からも画像を作れます。`/v1/chat/completions` に `"strata_images": true` を付けると（Web のページは付けます）、モデルに `generate_image` と `edit_image` の道具を渡し、モデルが呼ぶとサーバーが画像を作ってその場に出します。`edit_image` は、会話の最後の画像（添付したものか、会話で作ったもの）を直します。`/v1/responses` では OpenAI の組み込みの `image_generation` の道具を付けると同じことをし、作った画像を `image_generation_call` の項目（`result` に PNG の base64）で返します。
+大きさは一辺 256〜2048 ピクセルです。辺が 16 の倍数でない大きさ（1920×1080 など）は、16 の倍数に切り上げた大きさ（1920×1088）で作って真ん中を切り出し、Web のページはそのことを知らせます。
+画像のエンジンは最初の画像で起動して、そのまま残ります。カーネルの準備は 1 度だけで、同じプロンプトの文の状態と VRAM に載せた層は次の画像まで残ります。
+画像の仕事は GPU で 1 つずつ動きます。エンジンは仕事の前に、その画像に要る VRAM（最低限と、DiT を全部載せて VAE を 1 回で回せる量）を答え、文章のモデルの扱いは `--image-gpu-policy` で決めます: `keep`（そのまま）、`shrink`（`--vram-elastic` で VRAM を空ける）、`unload`（会話を保存して外し、次の起動で戻す）、`auto`（既定。全部が入れば `keep`、入らなければ空けられるときは `shrink`、最低限が入るなら層を流し込んで `keep`、それも入らなければ `unload`）。
+仕事のあと、`keep` で VRAM に余裕があるときだけ画像のエンジンは層を残し、それ以外は持っているものを手放します（待機中はプロセスだけの約 200 MiB）。
+`tools/image/install.py --config <設定>` で、入っているモデルにあとから足せます。
 
 ---
 
@@ -1303,16 +1319,15 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | 症状 | すること |
 | --- | --- |
 | `no Intel GPU on the xe or i915 driver, no AMD GPU on amdgpu and no NVIDIA GPU on NVIDIA's driver found` | Intel の GPU が xe か i915 のドライバーに、AMD の GPU が amdgpu に、NVIDIA の GPU が NVIDIA のドライバーにつながっていません。`lspci -k` でドライバーを確かめます。単体の GPU なら、BIOS で Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
-| `an NVIDIA GPU needs the contrib build` | `--license free` か `--license contrib-icpx` を選んでいます。NVIDIA の GPU は contrib-llvm のビルドでだけ使えるので、`--license contrib` で setup をやり直します。 |
+| `an NVIDIA GPU needs the contrib build` | `--license free` を選んでいます。NVIDIA の GPU は contrib-llvm のビルドでだけ使えるので、`--license contrib` で setup をやり直します。 |
 | `NVIDIA's CUDA toolkit is missing` | NVIDIA の GPU のコードを作る CUDA ツールキットがありません。入れてから setup をやり直します（Ubuntu: `sudo apt install nvidia-cuda-toolkit`）。 |
-| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | contrib-llvm か contrib-icpx のビルドで、Intel の GPU の密な行列積に使う oneMKL がありません。入れる（[BUILD.ja.md](BUILD.ja.md#パッケージ)）か、`--license free` で setup をやり直します。 |
+| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | contrib-llvm のビルドで、Intel の GPU の密な行列積に使う oneMKL がありません。入れる（[BUILD.ja.md](BUILD.ja.md#パッケージ)）か、`--license free` で setup をやり直します。 |
 | `no access to the GPU` | 自分のユーザーで `/dev/dri/renderD*` を開けません。`sudo usermod -aG render $USER` のあと、ログインし直します。 |
 | `no access to the GPU's compute device (/dev/kfd)` | AMD の GPU の計算に使う `/dev/kfd` を開けません。`sudo usermod -aG render $USER` のあと、ログインし直します。 |
 | `... the engine needs an RDNA2 or later AMD GPU` | RDNA2 より前の AMD の GPU では動きません。 |
 | `... rocBLAS ... has no code for gfx...`、`... has no code for gfx...` | ディストリビューションの rocBLAS（パッケージではそのエンジン）が、その GPU のコードを持っていません。Ubuntu 26.04 なら、Fedora 44 で動くことがあります（[README](../README.ja.md#amd-の-gpu)）。 |
 | `building for the AMD GPU needs ROCm's ...` | AMD の GPU のコードを作る ROCm のパッケージが足りません。示されたものを入れて、setup をやり直します（`./setup.sh --packages` も参照）。 |
 | `... has no HIP target (AMD GPUs)` | intel/llvm が、ROCm を入れる前にビルドされています。setup が尋ねたら作り直すか、`python3 tools/intel_llvm_build.py --rebuild` を実行します。 |
-| `an AMD GPU needs the free or contrib build` | `--license contrib-icpx` を選んでいます。icpx には AMD の対象がないので、`--license free` か `--license contrib` で setup をやり直します。 |
 | Linux で `no progress for 60 s ... reading the prompt` と出て、止まったときの報告に `threads waiting on the disk (state D): 16 ...` がある | エンジンが止まったのではなく、ドライブを待っています。n-gram の表をランダムに読む（`--ple-io direct`）のに、回転ディスクが追いつきません（upstream #605）。表が回転ディスクにあると、エンジンは起動時に警告します。`--ple-io ram`（表の分の RAM が要ります）か、モデルを SSD に置くと直ります。setup は、回転ディスクで RAM に表が入るなら、自分で `--ple-io ram` を付けます。 |
 | `the SYCL runtime of ... lists no GPU` | GPU の Level Zero のドライバー（`libze-intel-gpu1`、Intel の compute-runtime）がないか、その GPU には古すぎます。新しいものを入れます（[BUILD.ja.md](BUILD.ja.md#パッケージ)）。 |
 | `... gives this GPU no XMX` | そのコンパイラでは GPU の XMX が使えません。setup の選択肢から選びます。XMX なしでも動き、prefill に約 1.6 倍の時間がかかります（[BUILD.ja.md](BUILD.ja.md#sycl-のコンパイラ)）。 |
@@ -1361,7 +1376,7 @@ issue を立てるときは、秘密や個人情報を除いた報告と必要�
   推測は MTP のものと同じに確かめるので、出力は変わりません。
 - **prefill** は、最大 32,768 トークンの塊で処理し、エキスパートは PCIe で GPU に流します。
   行列積は、Intel の GPU では XMX、AMD の GPU では WMMA（RDNA3 以降）、NVIDIA の GPU では Tensor Core で計算し、
-  密な行列積は oneMath 経由で、contrib-llvm と contrib-icpx のビルドでは oneMKL か cuBLAS に、AMD の GPU では rocBLAS と hipBLASLt に任せます。
+  密な行列積は oneMath 経由で、contrib-llvm のビルドでは oneMKL か cuBLAS に、AMD の GPU では rocBLAS と hipBLASLt に任せます。
 
 Strata の設計、測定、ボトルネックは、upstream の論文 **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)**（英語、CUDA での測定）にあります。
 
@@ -1385,7 +1400,7 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)**（MIT）: i-quant の形式、`src/kernels/xe/` に書き写した GPU の内積と展開、
   i-quant のエキスパートのためにリンクする CPU のバックエンド、画像のエンコーダー（`tools/vision/`）の `mtmd` のライブラリと GPU のバックエンド（Vulkan、SYCL）、
   道具が使う `gguf-py`。`third_party/main/ggml/LICENSE` を参照。
-- **[oneMath](https://github.com/uxlfoundation/oneMath)**（Apache-2.0）: 密な行列積を、contrib-llvm と contrib-icpx では oneMKL（Intel）と cuBLAS（NVIDIA）に、free と contrib-llvm では rocBLAS と hipBLASLt（AMD）に渡す層。
+- **[oneMath](https://github.com/uxlfoundation/oneMath)**（Apache-2.0）: 密な行列積を、contrib-llvm では oneMKL（Intel）と cuBLAS（NVIDIA）に、free と contrib-llvm では rocBLAS と hipBLASLt（AMD）に渡す層。
   リポジトリには含めず、CMake が XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)。XeStrata の変更として cuBLAS の BF16 の積と rocBLAS の後端の hipBLASLt が入った oneMath）を取ってきます。oneMath と同じライセンスです。`third_party/main/oneMath/LICENSE` を参照。
 - **[intel/llvm](https://github.com/intel/llvm)** の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib-llvm のコンパイラと SYCL のランタイム。
   リポジトリには含めず、`tools/intel_llvm_build.py` がリリースを取ってきてビルドします。
