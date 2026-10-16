@@ -98,12 +98,13 @@ sudo dnf install hipcc rocm-hip-devel rocm-runtime-devel rocm-device-libs rocmin
 
 ### Windows (AMD GPUs, HIP)
 
-On Windows intel/llvm can be built with the HIP target alone, and XeStrata's free mode then runs on AMD GPUs.
+On Windows intel/llvm can be built with the HIP and Level Zero runtimes, and XeStrata's free mode then runs on AMD and Intel GPUs.
 `tools/intel_llvm_build.py` is Linux's, so the steps are taken by hand (the paths: `LOCAL.md`).
 
 - Needed: Visual Studio 2022 Build Tools (the C++ workload), CMake and Ninja, Python, and ROCm's SDK for Windows (AMD's TheRock Python wheels: clang, the HIP runtime, rocBLAS, hipBLASLt).
 - Apply `third_party/main/intel-llvm/patches` to intel/llvm v7.1.1 in order and run `buildbot/configure.py` with `--hip --hip-platform AMD`.
-  Three settings that are not source changes are needed: `/utf-8` (MSVC read the UTF-8 sources as CP932), `LLVM_ENABLE_DIA_SDK=OFF` (the Build Tools have no ATL), and `SYCL_ENABLE_BACKENDS=hip` with `LIBCLC_TARGETS_TO_BUILD=amdgcn--amdhsa`.
+  Three settings that are not source changes are needed: `/utf-8` (MSVC read the UTF-8 sources as CP932), `LLVM_ENABLE_DIA_SDK=OFF` (the Build Tools have no ATL), and `SYCL_ENABLE_BACKENDS=hip;level_zero` (CMake fetches Level Zero's loader and headers from GitHub) with `LIBCLC_TARGETS_TO_BUILD=amdgcn--amdhsa`.
+  So that the DLLs a zip carries hold no path of the build machine, add `/d1trimfile:<the intel/llvm folder>` (no trailing `\`) to `CMAKE_C_FLAGS` and `CMAKE_CXX_FLAGS`, and `/PDBALTPATH:%_PDB%` to `CMAKE_SHARED_LINKER_FLAGS` and `CMAKE_EXE_LINKER_FLAGS`.
   ROCm's place goes in `UR_HIP_ROCM_DIR` and `UR_HIP_LIB_DIR`.
 - Device libraries: the SDK's are bitcode of a newer LLVM than intel/llvm reads, so ROCm 7.2's are used (a Linux ROCm's `amdgcn/bitcode`).
   Windows device code has a 2-byte wchar_t: `tools/windows/device_libs_wchar.py` rewrites their `wchar_size` flag to 2, and `STRATA_ROCM_DEVICE_LIBS` gives them to the build.

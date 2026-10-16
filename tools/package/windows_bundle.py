@@ -46,11 +46,12 @@ SYCL_CORE = ("sycl9.dll", "ur_win_proxy_loader.dll", "ur_loader.dll")
 ENGINE_EXES = ("strata.exe", "strata-device.exe")
 # what a Windows PC brings (the Visual C++ runtime, which xestrata.exe checks for) and what must never be carried
 FORBIDDEN = ("vcruntime*.dll", "msvcp*.dll", "concrt*.dll", "ucrtbase*.dll", "api-ms-win-*.dll", "nvcuda.dll",
-             "nvml.dll", "cublas*.dll", "cudart*.dll", "mkl_*.dll", "amdhip64*.dll")
-# what the AMD build's DLLs import from Windows and from AMD's driver (amdhip64_7.dll): never followed into the folder
+             "nvml.dll", "cublas*.dll", "cudart*.dll", "mkl_*.dll", "amdhip64*.dll", "ze_loader*.dll")
+# what the AMD build's DLLs import from Windows and from AMD's and Intel's drivers (amdhip64_7.dll, ze_loader.dll):
+# never followed into the folder
 SYSTEM_DLL = re.compile(r"(?i)^(api-ms-win-.*|ext-ms-.*|kernel32|user32|advapi32|ole32|oleaut32|shell32|shlwapi|ws2_32|"
                         r"bcrypt|crypt32|dbghelp|version|setupapi|cfgmgr32|dxgi|d3d12|dxcore|ntdll|ucrtbase|"
-                        r"vcruntime140(_1)?|msvcp140(_atomic_wait|_1|_2)?|vcomp140|amdhip64_7)\.dll$")
+                        r"vcruntime140(_1)?|msvcp140(_atomic_wait|_1|_2)?|vcomp140|amdhip64_7|ze_loader)\.dll$")
 # the kernel libraries rocBLAS and hipBLASLt open from folders beside their DLLs
 ROCM_DATA = ("rocblas", "hipblaslt")
 # the Python packages the 7z carries (requirements.txt without the build tools, and colorama, which tqdm takes on
@@ -227,7 +228,10 @@ def main() -> None:
     if a.launcher is not None and a.nuget is None:
         fail("--launcher needs --nuget (the launchers' packages, for their notices)")
 
-    top_name = f"XeStrata-{a.version}-windows-x64" + ("-amd" if a.rocm else "")
+    # the AMD GPUs' build is named after the makers' GPUs it runs on: AMD's, and Intel's where the SYCL runtime has
+    # their Level Zero adapter
+    intel = (a.sycl / "bin" / "ur_adapter_level_zero.dll").is_file()
+    top_name = f"XeStrata-{a.version}-windows-x64" + (("-amd-intel" if intel else "-amd") if a.rocm else "")
     top = a.out / top_name
     shutil.rmtree(top, ignore_errors=True)
     top.mkdir(parents=True)

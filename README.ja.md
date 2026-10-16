@@ -12,7 +12,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 > この節は `feature/windows-r9700-sycl` ブランチで足したものです。区切り線から下は本家 XeStrata の README のままです。
 
 このブランチは、XeStrata を Windows 11 で AMD の GPU を使って動かすための移植です。
-intel/llvm（DPC++）を Windows の上で HIP のターゲットだけでビルドし、XeStrata を free モードでコンパイルします。
+intel/llvm（DPC++）を Windows の上で HIP と Level Zero（Intel の GPU）のランタイムを付けてビルドし、XeStrata を free モードでコンパイルします。
 本家の更新は取り込みながら進めていて、今は本家の main（上流 Strata 0.1.44.1 を取り込んだもの、2026-10-14）までを含みます。
 
 ### していること
@@ -24,8 +24,8 @@ intel/llvm（DPC++）を Windows の上で HIP のターゲットだけでビル
 
 ### 対応している GPU
 
-- Windows で動くのは AMD の GPU だけです（HIP）。配布用の zip には RDNA2 以降（gfx1030〜gfx1036、gfx1100〜gfx1103、gfx1150、gfx1151、gfx1200、gfx1201）のコードが入っています。確かめたのは Radeon AI PRO R9700（gfx1201、32 GB）だけです。
-- Windows では、Intel Arc と NVIDIA の GPU 向けにはビルドしていません。
+- Windows では AMD の GPU（HIP）と Intel Arc（Level Zero）で動きます。配布用の zip には、AMD の RDNA2 以降（gfx1030〜gfx1036、gfx1100〜gfx1103、gfx1150、gfx1151、gfx1200、gfx1201）のコードと、Intel の GPU 向けのコード（SPIR-V。起動するときにドライバーがコンパイルします）が入っています。確かめたのは Radeon AI PRO R9700（gfx1201、32 GB）だけです。
+- Windows では、NVIDIA の GPU 向けにはビルドしていません（free モードでは使えないため）。
 - Linux では本家の XeStrata と同じです（Intel Arc、AMD、NVIDIA）。
 
 ### Windows で使える機能
@@ -42,12 +42,12 @@ intel/llvm（DPC++）を Windows の上で HIP のターゲットだけでビル
 - 適応キャッシュはエキスパートの入れ替えが遅く、`--adapt-every 0` のほうが速く動きます。
 - `--gpu-stages` はネイティブパックでは動きません。
 
-### インストール（Windows、AMD の GPU）
+### インストール（Windows、AMD と Intel の GPU）
 
-1. [このフォークの Releases](https://github.com/32x-k/XeStrata-win/releases) から `XeStrata-<版>-windows-x64-amd.zip` をダウンロードして、浅いフォルダー（`C:\XeStrata` など）に展開します。中のパスが長いので、深いフォルダーでは展開に失敗することがあります。
+1. [このフォークの Releases](https://github.com/32x-k/XeStrata-win/releases) から `XeStrata-<版>-windows-x64-amd-intel.zip` をダウンロードして、浅いフォルダー（`C:\XeStrata` など）に展開します。中のパスが長いので、深いフォルダーでは展開に失敗することがあります。
 1. `xestrata-cli.bat` を実行します（ダブルクリックでも動きます）。GPU とモデルの選択、ダウンロード、モデルの準備を端末で進め、終わると起動します。次からは実行するとすぐ起動します。オプションは Linux の `xestrata` と同じです（`--help`）。
 
-- **要るもの**: AMD の GPU のドライバー（AMD Software。HIP のランタイム `amdhip64_7.dll` が一緒に入ります）と [Visual C++ の再頒布可能パッケージ](https://aka.ms/vs/17/release/vc_redist.x64.exe)。.NET は要りません。
+- **要るもの**: GPU のドライバー（AMD は AMD Software で、HIP のランタイム `amdhip64_7.dll` が一緒に入ります。Intel は Intel のグラフィックスのドライバーで、Level Zero のランタイム `ze_loader.dll` が一緒に入ります）と [Visual C++ の再頒布可能パッケージ](https://aka.ms/vs/17/release/vc_redist.x64.exe)。.NET は要りません。
   Visual C++ の再頒布可能パッケージがなければ、`xestrata-cli.bat` が知らせて止まります。rocBLAS と hipBLASLt は zip に入っています。
 - **GPU が 2 台以上のとき**（内蔵 GPU を含む）: setup は選んだ GPU を設定の `ONEAPI_DEVICE_SELECTOR=hip:N` に書き、エンジンが HIP に見せる GPU をそれだけに絞ります。
 - **置き場所**: zip のフォルダーには書き込みません。設定は `%APPDATA%\xestrata`、ログなどは `%LOCALAPPDATA%\xestrata`、モデルはデータのフォルダー（既定は `%LOCALAPPDATA%\xestrata\data`）に置きます。
@@ -65,7 +65,7 @@ intel/llvm（DPC++）を Windows の上で HIP のターゲットだけでビル
    python buildbot\configure.py -o build -t Release --hip --hip-platform AMD ^
      "--cmake-opt=-DCMAKE_INSTALL_PREFIX=<intel-llvm>/install" ^
      "--cmake-opt=-DUR_HIP_ROCM_DIR=<ROCm SDK>" "--cmake-opt=-DUR_HIP_LIB_DIR=<ROCm SDK>/lib" ^
-     "--cmake-opt=-DLIBCLC_TARGETS_TO_BUILD=amdgcn--amdhsa" "--cmake-opt=-DSYCL_ENABLE_BACKENDS=hip" ^
+     "--cmake-opt=-DLIBCLC_TARGETS_TO_BUILD=amdgcn--amdhsa" "--cmake-opt=-DSYCL_ENABLE_BACKENDS=hip;level_zero" ^
      "--cmake-opt=-DLLVM_ENABLE_DIA_SDK=OFF" ^
      "--cmake-opt=-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS /utf-8" ^
      "--cmake-opt=-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /GR /EHsc /utf-8"

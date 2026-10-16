@@ -12,7 +12,7 @@ English | [日本語](README.ja.md)
 > This section was added on the `feature/windows-r9700-sycl` branch. Everything below the rule is the upstream XeStrata README, unchanged.
 
 This branch ports XeStrata to Windows 11 with AMD GPUs.
-It builds intel/llvm (DPC++) on Windows with the HIP target only, and compiles XeStrata in the free mode with it.
+It builds intel/llvm (DPC++) on Windows with the HIP and Level Zero (Intel GPUs) runtimes, and compiles XeStrata in the free mode with it.
 It keeps taking in upstream's releases; it now includes upstream XeStrata's main (with upstream Strata 0.1.44.1, 2026-10-14).
 
 ### What it does
@@ -24,8 +24,8 @@ It keeps taking in upstream's releases; it now includes upstream XeStrata's main
 
 ### Supported GPUs
 
-- On Windows, only AMD GPUs run (HIP). The zip carries code for RDNA2 and later (gfx1030-gfx1036, gfx1100-gfx1103, gfx1150, gfx1151, gfx1200 and gfx1201). Only the Radeon AI PRO R9700 (gfx1201, 32 GB) has been tried.
-- On Windows, it is not built for Intel Arc or NVIDIA GPUs.
+- On Windows, it runs on AMD GPUs (HIP) and Intel Arc (Level Zero). The zip carries code for AMD's RDNA2 and later (gfx1030-gfx1036, gfx1100-gfx1103, gfx1150, gfx1151, gfx1200 and gfx1201) and for Intel GPUs (SPIR-V, which the driver compiles when the program starts). Only the Radeon AI PRO R9700 (gfx1201, 32 GB) has been tried.
+- On Windows, it is not built for NVIDIA GPUs (the free mode cannot use them).
 - On Linux, it is the same as upstream XeStrata (Intel Arc, AMD and NVIDIA).
 
 ### What works on Windows
@@ -42,12 +42,12 @@ These four things differ from upstream.
 - The adaptive cache is slow to swap experts, and `--adapt-every 0` runs faster.
 - `--gpu-stages` does not work with the native pack.
 
-### Installing (Windows, AMD GPUs)
+### Installing (Windows, AMD and Intel GPUs)
 
-1. Download `XeStrata-<version>-windows-x64-amd.zip` from [this fork's Releases](https://github.com/32x-k/XeStrata-win/releases) and unpack it into a short folder (`C:\XeStrata`, for example). Its paths are long, and unpacking into a deep folder can fail.
+1. Download `XeStrata-<version>-windows-x64-amd-intel.zip` from [this fork's Releases](https://github.com/32x-k/XeStrata-win/releases) and unpack it into a short folder (`C:\XeStrata`, for example). Its paths are long, and unpacking into a deep folder can fail.
 1. Run `xestrata-cli.bat` (a double-click works too). It goes through choosing the GPU and the model, the download and preparing the model on the console, then starts it. Later runs start it right away. Its options are those of `xestrata` on Linux (`--help`).
 
-- **You need**: the AMD GPU driver (AMD Software, which installs the HIP runtime `amdhip64_7.dll`) and the [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe). .NET is not needed.
+- **You need**: the GPU driver (AMD: AMD Software, which installs the HIP runtime `amdhip64_7.dll`; Intel: Intel's graphics driver, which installs the Level Zero runtime `ze_loader.dll`) and the [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe). .NET is not needed.
   Without the Visual C++ Redistributable, `xestrata-cli.bat` says so and stops. rocBLAS and hipBLASLt come in the zip.
 - **With two or more GPUs** (the processor's graphics included): setup writes the chosen GPU into the config as `ONEAPI_DEVICE_SELECTOR=hip:N`, and the engine narrows the GPUs HIP sees to it.
 - **Where things go**: nothing is written into the zip's folder. The settings go into `%APPDATA%\xestrata`, the logs and the like into `%LOCALAPPDATA%\xestrata`, and the models into the data folder (by default `%LOCALAPPDATA%\xestrata\data`).
@@ -65,7 +65,7 @@ The full steps are in [docs/DEVTOOLS.md](docs/DEVTOOLS.md), under "Windows (AMD 
    python buildbot\configure.py -o build -t Release --hip --hip-platform AMD ^
      "--cmake-opt=-DCMAKE_INSTALL_PREFIX=<intel-llvm>/install" ^
      "--cmake-opt=-DUR_HIP_ROCM_DIR=<ROCm SDK>" "--cmake-opt=-DUR_HIP_LIB_DIR=<ROCm SDK>/lib" ^
-     "--cmake-opt=-DLIBCLC_TARGETS_TO_BUILD=amdgcn--amdhsa" "--cmake-opt=-DSYCL_ENABLE_BACKENDS=hip" ^
+     "--cmake-opt=-DLIBCLC_TARGETS_TO_BUILD=amdgcn--amdhsa" "--cmake-opt=-DSYCL_ENABLE_BACKENDS=hip;level_zero" ^
      "--cmake-opt=-DLLVM_ENABLE_DIA_SDK=OFF" ^
      "--cmake-opt=-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS /utf-8" ^
      "--cmake-opt=-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /GR /EHsc /utf-8"

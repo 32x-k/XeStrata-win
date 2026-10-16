@@ -98,12 +98,13 @@ sudo dnf install hipcc rocm-hip-devel rocm-runtime-devel rocm-device-libs rocmin
 
 ### Windows（AMD の GPU、HIP）
 
-Windows では、intel/llvm を HIP のターゲットだけでビルドし、XeStrata の free モードを AMD の GPU で動かせます。
+Windows では、intel/llvm を HIP と Level Zero のランタイムを付けてビルドし、XeStrata の free モードを AMD と Intel の GPU で動かせます。
 `tools/intel_llvm_build.py` は Linux 用なので、手順は手で行います（パスは `LOCAL.md`）。
 
 - 要るもの: Visual Studio 2022 Build Tools（C++ のワークロード）、CMake と Ninja、Python、ROCm の Windows 用 SDK（AMD の TheRock の Python の wheel。clang、HIP のランタイム、rocBLAS、hipBLASLt を含む）。
 - intel/llvm v7.1.1 に `third_party/main/intel-llvm/patches` を番号順に当て、`buildbot/configure.py` を `--hip --hip-platform AMD` で動かします。
-  ソースの変更ではない設定が 3 つ要ります: MSVC が UTF-8 のソースを CP932 として読まないように `/utf-8`、Build Tools に ATL がないので `LLVM_ENABLE_DIA_SDK=OFF`、`SYCL_ENABLE_BACKENDS=hip` と `LIBCLC_TARGETS_TO_BUILD=amdgcn--amdhsa`。
+  ソースの変更ではない設定が 3 つ要ります: MSVC が UTF-8 のソースを CP932 として読まないように `/utf-8`、Build Tools に ATL がないので `LLVM_ENABLE_DIA_SDK=OFF`、`SYCL_ENABLE_BACKENDS=hip;level_zero`（Level Zero のローダーとヘッダーは CMake が GitHub から取ります）と `LIBCLC_TARGETS_TO_BUILD=amdgcn--amdhsa`。
+  配る zip に入れる DLL にビルドした PC のパスが残らないよう、`CMAKE_C_FLAGS` と `CMAKE_CXX_FLAGS` に `/d1trimfile:<intel/llvm のフォルダー>`（末尾に `\` を付けない）、`CMAKE_SHARED_LINKER_FLAGS` と `CMAKE_EXE_LINKER_FLAGS` に `/PDBALTPATH:%_PDB%` を足します。
   ROCm の場所は `UR_HIP_ROCM_DIR` と `UR_HIP_LIB_DIR` で渡します。
 - デバイスライブラリ: SDK のものは intel/llvm より新しい LLVM のビットコードで読めないので、ROCm 7.2 のもの（Linux の ROCm の `amdgcn/bitcode`）を使います。
   Windows のデバイスコードは wchar_t が 2 バイトなので、`tools/windows/device_libs_wchar.py` で `wchar_size` のフラグを 2 に書き換えてから、`STRATA_ROCM_DEVICE_LIBS` で渡します。
