@@ -3307,6 +3307,10 @@ class Service:
         the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
             return
+        if not self.loaded() and self.images is not None and self.images.engine.alive():
+            # an image job kept its layers while the engine was down: they go before the engine sizes its caches
+            print("[strata] the image engine lets go of its layers before the model loads", flush=True)
+            self.images.release(True)
         hook_failed = None
         if self.before_load:
             cmd = self.before_load

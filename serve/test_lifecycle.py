@@ -205,6 +205,24 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(self.engine.closes, 0)
         self.assertEqual(self.request("/v1/load", {}, {"Content-Type": "text/plain"})[0], 415)
 
+    def test_the_image_engine_lets_go_before_the_model_loads(self):
+        order = []
+        gen = mock.Mock()
+        gen.engine.alive.return_value = True
+        gen.status.return_value, gen.note.return_value = {"enabled": True}, None
+        gen.release.side_effect = lambda everything: order.append(("release", everything))
+        restart = self.engine.restart
+        self.engine.restart = lambda: (order.append(("restart",)), restart())
+        self.svc.images = gen
+        self.assertEqual(self.request("/v1/load", {"model": self.svc.model})[0], 200)
+        self.assertEqual(order, [("release", True), ("restart",)])
+        self.assertEqual(self.request("/v1/load", {"model": self.svc.model})[0], 200)   # loaded: nothing let go
+        self.assertEqual(order, [("release", True), ("restart",)])
+        self.request("/v1/unload", {})
+        gen.engine.alive.return_value = False                     # no image engine running: nothing to let go
+        self.assertEqual(self.request("/v1/load", {"model": self.svc.model})[0], 200)
+        self.assertEqual(order, [("release", True), ("restart",), ("restart",)])
+
 
 if __name__ == "__main__":
     unittest.main()
