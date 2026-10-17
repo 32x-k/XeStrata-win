@@ -11221,6 +11221,13 @@ int main(int argc, char** argv) {
                     T = std::min(T, lim);
                     chain_n = std::max(0, std::min(chain_n, lim - T));
                 }
+                {   // nor past the tokens still to be sent: a draft committed beyond them would be in the session but
+                    // not in the reply, so the next request of the chat could not continue it and would read again
+                    // from an earlier checkpoint - by the prompt path, with other bits than the decode's
+                    const int lim = (int) std::min<int64_t>(S, max_new - produced_n);
+                    T = std::min(T, lim);
+                    chain_n = std::max(0, std::min(chain_n, lim - T));
+                }
                 const int T_mtp = T;
                 T += chain_n;
                 const bool timed_round = !first_window;
