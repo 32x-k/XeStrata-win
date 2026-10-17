@@ -1270,6 +1270,12 @@ int adapt_lag() {
     return v;
 }
 
+/// A window that may start before the adaptive tier's swaps reach the device's residency table (STRATA_ADAPT_NOWAIT=1,
+/// STRATA_ADAPT_LAG > 1) plans every layer on the host: the device-side plan and the resident graph read that table and
+/// would take an expert the host already evicted as resident (upstream 3f2db5e2's case: the evicted expert computed on
+/// the CPU from no activation, or read from a slot being refilled).  set_always_publish turns both off.
+bool adapt_device_table_lags() { return adapt_nowait() || adapt_lag() > 1; }
+
 /// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
 void mem_mark(const char* where) {
     static const char* const env = std::getenv("STRATA_TRACE");
@@ -6839,6 +6845,7 @@ int main(int argc, char** argv) {
                     // --batch-mtp: every stage runs the first one's windows of two rows a slot (up to kVerifyMaxT rows,
                     // the hand-off's size) and bounds its captured batch layouts like it (upstream 48f2c47d)
                     if (batch_mtp) gs.ver.set_batch_graph_limit(64);
+                    if (adapt_device_table_lags()) gs.ver.set_always_publish(true);
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
                                        batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
@@ -6939,6 +6946,7 @@ int main(int argc, char** argv) {
                 stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
         }
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp: slot rotation makes many layouts (LRU)
+        if (adapt_device_table_lags()) ver.set_always_publish(true);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
             (use_mtp &&
@@ -12176,6 +12184,7 @@ int main(int argc, char** argv) {
         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
         vh.n_slots = xcache.slots();
         vh.h_res = host_res.empty() ? nullptr : host_res.data();   // every expert resident: windows without the host
+        if (adapt_device_table_lags()) ver.set_always_publish(true);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
