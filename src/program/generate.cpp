@@ -4187,7 +4187,9 @@ int main(int argc, char** argv) {
                                          "stall watchdog (#1425, #1629). --ple-io mmap was 40-100x faster on some DRAM-less "
                                          "NVMe drives but 7x slower on a SATA SSD (#2040), so it is not chosen for you; "
                                          "--ple-io ram needs the RAM for the table%s\n", rps, rps * 4096.0 / 1e6,
-                                 o.ple_io_explicit ? "" : " (kept direct: pass --ple-io mmap or --ple-io ram to change it)");
+                                 o.ple_io_explicit ? "" : " (kept direct: pass --ple-io mmap or --ple-io ram to change it; in a "
+                                                          "config file's \"args\" they are two entries: \"--ple-io\", "
+                                                          "\"mmap\")");
                 }
             }
         }
