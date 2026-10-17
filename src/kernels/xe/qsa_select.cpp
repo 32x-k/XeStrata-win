@@ -278,6 +278,65 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     finish(stream, e, "qsa_block_scores");
 }
 
+void qsa_block_scores_rows(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
+                           int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
+    if (nq <= 0) return;
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R)
+        throw core::DeviceError("qsa_block_scores_rows: unsupported indexer geometry");
+    static_assert(IDX_DIM == WARP * 4 && IDX_HEADS == 4, "the scatter below is for 4 heads of 4 values a lane");
+    const size_t gx = size_t((max_blocks + SCORE_WARPS - 1) / SCORE_WARPS);
+    const auto e = queue_for(stream).parallel_for(
+        sycl::nd_range<1>(gx * (size_t) (SCORE_WARPS * WARP), (size_t) (SCORE_WARPS * WARP)),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int64_t b = int64_t(it.get_group(0)) * SCORE_WARPS + int64_t(sg.get_group_linear_id());
+            const int64_t top = steps[(nq - 1) * kStepCount + kStepNBid];   // the last row's: the largest
+            if (b > top || b >= max_blocks) return;   // uniform over the sub-group
+            const int lane = int(sg.get_local_linear_id());
+            const bool hi16 = (lane & 16) != 0, hi8 = (lane & 8) != 0;
+            const float* kpool = pooled + b * IDX_DIM + (ptrdiff_t) lane * 4;
+            float k0 = 0.0f, k1 = 0.0f, k2 = 0.0f, k3 = 0.0f;
+            if (b < top) { k0 = kpool[0]; k1 = kpool[1]; k2 = kpool[2]; k3 = kpool[3]; }   // a completed block's key
+            for (int64_t qi = 0; qi < nq; ++qi) {
+                const int32_t* st = steps + qi * kStepCount;
+                const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid];
+                if (b > n_bid) continue;   // uniform
+                float kp0 = k0, kp1 = k1, kp2 = k2, kp3 = k3;
+                if (b == n_bid) {   // this row's tail block: the dead key
+                    const float* kd = dead + (ptrdiff_t) lane * 4;
+                    kp0 = kd[0]; kp1 = kd[1]; kp2 = kd[2]; kp3 = kd[3];
+                }
+                const float* q = q_idx + qi * IDX_HEADS * IDX_DIM + (ptrdiff_t) lane * 4;
+                float d[IDX_HEADS];
+                for (int h = 0; h < IDX_HEADS; ++h) {
+                    const float* q4 = q + (ptrdiff_t) h * IDX_DIM;
+                    d[h] = kp0 * q4[0] + kp1 * q4[1] + kp2 * q4[2] + kp3 * q4[3];   // qsa_block_scores' expression
+                }
+                // qsa_block_scores sums each head over the lanes by xor 16, 8, 4, 2, 1.  The same pairs here, with the
+                // heads spread: at 16 the low half keeps heads 0 and 1 and the high half 2 and 3, at 8 one head a
+                // lane, then 4, 2, 1 - every partial sum is the same two operands (a + b == b + a), so the same bits
+                const float s0 = sycl::permute_group_by_xor(sg, hi16 ? d[0] : d[2], 16);
+                const float s1 = sycl::permute_group_by_xor(sg, hi16 ? d[1] : d[3], 16);
+                const float a0 = (hi16 ? d[2] : d[0]) + s0, a1 = (hi16 ? d[3] : d[1]) + s1;
+                const float s2 = sycl::permute_group_by_xor(sg, hi8 ? a0 : a1, 8);
+                float c = (hi8 ? a1 : a0) + s2;   // head (hi16 ? 2 : 0) + (hi8 ? 1 : 0)
+                for (int o = 4; o > 0; o >>= 1) c += sycl::permute_group_by_xor(sg, c, o);
+                const float e1 = sycl::select_from_group(sg, c, 8), e2 = sycl::select_from_group(sg, c, 16),
+                            e3 = sycl::select_from_group(sg, c, 24);
+                if (lane == 0) {
+                    float score = 0.0f;
+                    score += c > 0.0f ? c : 0.0f;
+                    score += e1 > 0.0f ? e1 : 0.0f;
+                    score += e2 > 0.0f ? e2 : 0.0f;
+                    score += e3 > 0.0f ? e3 : 0.0f;
+                    if (b == n_bid && n_kv % R != 0) score += 1e9f;
+                    scores[qi * max_blocks + b] = score;
+                }
+            }
+        });
+    finish(stream, e, "qsa_block_scores_rows");
+}
+
 namespace {
 // upstream 65ce3299 (STRATA_SELECT_SIMT=1): the block scores below each query's n_bid as an FP32 tiled GEMM - rows
 // (query, indexer head) x columns (blocks), K = 128 through local memory in steps of 32, 2 queries x 4 heads x 4 blocks

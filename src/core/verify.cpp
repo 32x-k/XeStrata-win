@@ -1023,8 +1023,19 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     }
                 } else {
                 if (qbr && !join(1)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
-                qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
-                                 s, scores_ + (size_t) tb * max_blocks_, cs);
+                // the window's rows read each block's key once (upstream 5b6c9398's STRATA_QSA_ROWS; the same bits).
+                // STRATA_QSA_ROWS=0: a sub-group per row and block, as before
+                static const bool qsa_rows = [] {
+                    const char* v = std::getenv("STRATA_QSA_ROWS");
+                    return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+                }();
+                const float* q_win = qidx_ + (ptrdiff_t) tb * IQ * ID;
+                const int32_t* st_win = step_ + (ptrdiff_t) tb * kStepCount;
+                float* sc_win = scores_ + (size_t) tb * max_blocks_;
+                if (qsa_rows && n > 1)
+                    qsa_block_scores_rows(st.idx_pooled, st.idx_dead, q_win, st_win, n, max_blocks_, s, sc_win, cs);
+                else
+                    qsa_block_scores(st.idx_pooled, st.idx_dead, q_win, st_win, n, max_blocks_, s, sc_win, cs);
                 qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
                                sel_ + (size_t) tb * cap_, cs);
                 stamp(l, 11, grp);
