@@ -825,7 +825,8 @@ if(STRATA_HAVE_AVXVNNI_INTRINSICS)
 else()
   set(_strata_avxvnni STRATA_AVXVNNI=0)
 endif()
-set_property(SOURCE src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
+set_property(SOURCE src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/canon_expert.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+             ${_strata_avxvnni})
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 
@@ -869,10 +870,11 @@ if(STRATA_NATIVE_EXPERTS)
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
-                                           src/kernels/cpu/iq_avx2.cpp)
+                                           src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/canon_expert.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/main/ggml)
   set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${STRATA_AVX512_FLAGS}")
-  set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+  set_source_files_properties(src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/canon_expert.cpp
+                              PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)

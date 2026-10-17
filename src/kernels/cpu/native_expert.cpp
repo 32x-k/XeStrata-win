@@ -4,6 +4,7 @@
 // src/kernels/cpu/native_expert.cpp - plan v0.3 P6: native (GGUF-form) experts on the CPU through ggml-cpu.
 // See the header.  Nothing here is Strata arithmetic: the activation quantizers and the row dot products are
 // ggml-cpu's, so an IQ expert computes what llama.cpp's CPU backend computes for it.
+#include "strata/kernels/cpu/canon_expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
@@ -126,6 +127,7 @@ static_assert(sizeof(ActQ) <= sizeof(NativeAct) && alignof(ActQ) <= alignof(Nati
               "a Q2_0 layer's ActQ is kept in a NativeAct");
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    if (canon_layer(f)) { canon_quant(x, f.n_embd, 256, dst); return; }
     // native_gu_rows reads a Q2_0 layer's ActQ, not ggml's vec_dot_type
     if (f.gu_type == 42) { act_quant_any(x, (int) f.n_embd, *new (dst) ActQ); return; }
     if (q8k_avx2(f.gu_act)) { q8k_quant_avx2(x, dst, f.n_embd); return; }
@@ -133,6 +135,10 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
+    if (canon_layer(f)) {
+        canon_quant(h, f.n_ff, 32, dst, f.d_type == 42 ? CanonOrder::q2_planes : CanonOrder::iq4nl_calls);
+        return;
+    }
     if (q8k_avx2(f.d_act)) { q8k_quant_avx2(h, dst, f.n_ff); return; }
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
@@ -202,6 +208,7 @@ void part_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* 
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (canon_layer(f)) { canon_gu_rows(f, blob, act, nt, ff, r0, r1); return; }
     if (f.gu_type == 42) {   // Q2_0: Strata's GGUF-layout kernels on the ActQ native_quant_act wrote
         thread_local float ub[MAXT][kNativeMaxFF];
         float* up[MAXT] = {};
@@ -271,6 +278,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
+    if (canon_layer(f)) { canon_down_rows(f, blob, hq, nt, out, r0, r1); return; }
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.  From one
     // token on as the gate/up rows (#152): 0.062 / 0.065 ms a row set against ggml-cpu (i7-14700, one thread).

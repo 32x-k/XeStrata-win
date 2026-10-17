@@ -23,6 +23,7 @@
 //
 // Built with -DSTRATA_IQ_PARITY_DISPATCH_ONLY=1 it calls only the kernels' public entry points, so the same program
 // builds on an engine from before the variants (--bench --dispatch against it).
+#include "strata/kernels/cpu/canon_expert.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
@@ -175,28 +176,42 @@ void fill_blob(uint8_t* blob, const cpu::NativeFmt& f, uint64_t& seed) {
     fill_blocks(blob + f.down_off, f.bytes - f.down_off, f.d_type, seed);
 }
 
-// kMaxT tokens: the gate/up activation (ggml's vec_dot type, Q8_K for the i-quants), the down one in ggml's form and in
-// the Q2_0 kernels' form (ActQ), as the engine quantizes them
+// kMaxT tokens: the gate/up activation in ggml's vec_dot type (Q8_K for the i-quants) and the down one in ggml's form
+// and in the Q2_0 kernels' form (ActQ), what the kernels here take; and both as the engine quantizes them for its
+// dispatch (native_quant_act / native_quant_h: a layer of the canonical rows, canon_expert.hpp, has its own form)
 struct Acts {
-    std::vector<std::vector<uint8_t>> gu, dn;
+    std::vector<std::vector<uint8_t>> gu, dn, egu, eh;
     std::vector<cpu::ActQ> q2;
     const void* gup[kMaxT];
     const void* dnp[kMaxT];
+    const void* egup[kMaxT];
+    const void* ehp[kMaxT];
     const cpu::ActQ* q2p[kMaxT];
     Acts(const cpu::NativeFmt& f, unsigned seed)
         : gu(kMaxT, std::vector<uint8_t>(cpu::kNativeActBytes)), dn(kMaxT, std::vector<uint8_t>(cpu::kNativeHBytes)),
+          egu(kMaxT, std::vector<uint8_t>(cpu::kNativeActBytes)), eh(kMaxT, std::vector<uint8_t>(cpu::kNativeHBytes)),
           q2(kMaxT) {
         std::mt19937 rng(seed);
         std::normal_distribution<float> nd(0.f, 1.f);
         std::vector<float> x((size_t) kH), h((size_t) kFF);
+        const bool canon = cpu::canon_layer(f);
         for (int t = 0; t < kMaxT; ++t) {
             for (auto& v : x) v = nd(rng);
             for (auto& v : h) v = 0.05f * nd(rng);
-            cpu::native_quant_act(f, x.data(), gu[(size_t) t].data());
-            cpu::native_quant_h(f, h.data(), dn[(size_t) t].data());
+            cpu::native_quant_act(f, x.data(), egu[(size_t) t].data());
+            cpu::native_quant_h(f, h.data(), eh[(size_t) t].data());
+            if (canon) {
+                traits_cpu(f.gu_act)->from_float(x.data(), gu[(size_t) t].data(), kH);
+                traits_cpu(f.d_act)->from_float(h.data(), dn[(size_t) t].data(), kFF);
+            } else {
+                gu[(size_t) t] = egu[(size_t) t];
+                dn[(size_t) t] = eh[(size_t) t];
+            }
             if (cpu::cpu_avx2_ok()) cpu::act_quant_any(h.data(), (int) kFF, q2[(size_t) t]);
             gup[t] = gu[(size_t) t].data();
             dnp[t] = dn[(size_t) t].data();
+            egup[t] = egu[(size_t) t].data();
+            ehp[t] = eh[(size_t) t].data();
             q2p[t] = &q2[(size_t) t];
         }
     }
@@ -388,13 +403,13 @@ int check_engine_width(int type) {
     std::vector<float> one(kMaxT * R), ff(kMaxT * R);
     for (int t = 0; t < kMaxT; ++t) {
         float* o = &one[t * R];
-        cpu::native_gu_rows(f, blob.data(), &a.gup[t], 1, &o, 0, (int) kFF);
+        cpu::native_gu_rows(f, blob.data(), &a.egup[t], 1, &o, 0, (int) kFF);
     }
     size_t differ = 0;
     for (int nt = 2; nt <= kMaxT; ++nt) {
         float* fp[kMaxT];
         for (int t = 0; t < nt; ++t) fp[t] = &ff[t * R];
-        cpu::native_gu_rows(f, blob.data(), a.gup, nt, fp, 0, (int) kFF);
+        cpu::native_gu_rows(f, blob.data(), a.egup, nt, fp, 0, (int) kFF);
         for (int t = 0; t < nt; ++t) differ += rows_differ(fp[t], &one[t * R], R);
     }
     std::printf("  %-8s engine: multi-token from one token on, 2..8 tokens: %zu gate/up rows differ from the one-token "
@@ -496,11 +511,13 @@ int bench(const std::vector<std::string>& pairs, const std::vector<int>& nts, in
                                   kq_dn_v(v, dt, blob + f.down_off, f.d_row, a.dnp, nt, out);
                               }) : ggml_dn});
         ms.push_back({"ggml", ggml_gu, ggml_dn});
-        ms.push_back({"engine",   // what the pool calls: native_gu_rows, native_down_rows or (Q2_0) q2_rows_any
-                      [&](const uint8_t* blob, int nt) { cpu::native_gu_rows(f, blob, a.gup, nt, ff, 0, (int) kFF); },
+        ms.push_back({"engine",   // what the pool calls: native_gu_rows, native_down_rows or (Q2_0 off the canonical
+                                  // rows) q2_rows_any
+                      [&](const uint8_t* blob, int nt) { cpu::native_gu_rows(f, blob, a.egup, nt, ff, 0, (int) kFF); },
                       [&, dt](const uint8_t* blob, int nt) {
-                          if (dt == 42) cpu::q2_rows_any(blob + f.down_off, f.d_row, (int) (kFF / 64), a.q2p, nt, out, 0, (int) kH);
-                          else cpu::native_down_rows(f, blob, a.dnp, nt, out, 0, (int) kH);
+                          if (dt == 42 && !cpu::canon_layer(f))
+                              cpu::q2_rows_any(blob + f.down_off, f.d_row, (int) (kFF / 64), a.q2p, nt, out, 0, (int) kH);
+                          else cpu::native_down_rows(f, blob, a.ehp, nt, out, 0, (int) kH);
                       }});
 
         std::printf("\n%s: %zu experts of %.2f MB (%.0f MB), one thread\n", pair.c_str(), E, (double) f.bytes / 1048576.0,

@@ -60,14 +60,37 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
     for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
 }
 
+// The (block k0, block k0 + 1) sums of tokens t and t + 1 (8 int32 lanes each: e, o, e2, o2) in one go:
+// [token t's even, its odd, token t + 1's even, its odd] (exact).
+STRATA_ROWS_FN inline __m128 pair_sums2(__m256i e, __m256i o, __m256i e2, __m256i o2) {
+    const __m256i h = _mm256_hadd_epi32(_mm256_hadd_epi32(e, o), _mm256_hadd_epi32(e2, o2));
+    return _mm_cvtepi32_ps(_mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1)));
+}
+
+// Token u's (0 or 1) row of a token pair's sums [t's even blocks, t's odd blocks, u's even, u's odd]: even + odd.
+STRATA_ROWS_FN inline float canon_pair_sum(__m128 a, int u) {
+    const __m128 v = u ? _mm_movehl_ps(a, a) : a;
+    return _mm_cvtss_f32(v) + _mm_cvtss_f32(_mm_shuffle_ps(v, v, 1));
+}
+
+// One token's: [its even block's sum, its odd block's, the same again] (exact).
+STRATA_ROWS_FN inline __m128 pair_sums1(__m256i e, __m256i o) {
+    const __m256i h = _mm256_hadd_epi32(e, o);
+    const __m128i f = _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1));
+    return _mm_cvtepi32_ps(_mm_hadd_epi32(f, f));
+}
+
 // ---- IQ2_XS (17) with ggml's vectorized sign decode (arch/x86/quants.c, ggml_vec_dot_iq2_xs_q8_K):
 // the 7-bit sign indices never touch ksigns_iq2xs - the 8th sign bit is reconstructed by parity (two
 // shifts, a xor and ggml's bit_helper pshufb) and the per-half sign vectors come out of shuffles of one
 // 32-byte load.  The 8 scale bytes become all 16 half-scales with ggml's unpack trick.  The grid lookups
 // stay scalar loads into set_epi64x (ggml does the same).  Every token still only pays a load, a sign,
 // a maddubs, a madd and an add per half, into alternating accumulators.
-template <int NT> STRATA_ROWS_FN
-inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+// C: the canonical rows (row_dot_canon below) against xq / xd instead of y: a block's integer sum, and two blocks'
+// (d x the scale x 0.125) x sum into the even and the odd lane with one fma.
+template <bool C, int NT> STRATA_ROWS_FN
+inline void row_dot_iq2xs_impl(const uint8_t* row, int nblocks, const block_q8_K* const* y, const int8_t* const* xq,
+                               const float* const* xd, float* res) {
     static const uint8_t bit_sel[32] = {
         1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80, 1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80,
         1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80, 1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80 };
@@ -101,7 +124,12 @@ inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* con
     const int pf = prefetch_distance();
 
     __m256 accf[NT];
+    constexpr int NP = (NT + 1) / 2;
+    __m128 accc[NP];   // C: token pairs, lanes 0, 1 the first token's even and odd blocks, 2, 3 the second's
+    alignas(32) int32_t even[NT][8];   // C: the even block's sums, in memory until the odd one's (one token: even1)
+    __m256i even1 = _mm256_setzero_si256();
     for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+    for (int p = 0; p < NP; ++p) accc[p] = _mm_setzero_ps();
     for (int i = 0; i < nblocks; ++i) {
         const uint8_t* blk = row + (size_t) i * 74;
         rows_ahead(blk, pf);
@@ -134,18 +162,59 @@ inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* con
                     _mm_shuffle_epi8(scales, _mm_loadu_si128(reinterpret_cast<const __m128i*>(k_sc_shuffle) + H)));
                 const int off = 128 * jj + 32 * h;
                 for (int t = 0; t < NT; ++t) {
-                    const __m256i yv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y[t][i].qs + off));
+                    const int8_t* yq = C ? xq[t] + 256 * (ptrdiff_t) i + off : y[t][i].qs + off;
+                    const __m256i yv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(yq));
                     const __m256i ys = _mm256_sign_epi8(yv, sgn);
                     acc[t][h & 1] = madd_add(acc[t][h & 1], _mm256_maddubs_epi16(g, ys), sc);
                 }
             }
         }
-        const float dx = h2f(u16(blk)) * 0.125f;
-        for (int t = 0; t < NT; ++t)
-            accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d),
-                _mm256_cvtepi32_ps(_mm256_add_epi32(acc[t][0], acc[t][1])), accf[t]);
+        if constexpr (C) {
+            if ((i & 1) == 0) {
+                if constexpr (NT == 1) even1 = _mm256_add_epi32(acc[0][0], acc[0][1]);
+                else
+                    for (int t = 0; t < NT; ++t)
+                        _mm256_store_si256(reinterpret_cast<__m256i*>(even[t]), _mm256_add_epi32(acc[t][0], acc[t][1]));
+            } else if constexpr (NT == 1) {
+                const __m128 cw = _mm_cvtph_ps(_mm_set_epi16(0, 0, 0, 0, 0, 0, (short) u16(blk), (short) u16(blk - 74)));
+                const __m128 T = pair_sums1(even1, _mm256_add_epi32(acc[0][0], acc[0][1]));
+                const __m128 dx = _mm_castpd_ps(_mm_load_sd(reinterpret_cast<const double*>(xd[0] + i - 1)));
+                accc[0] = _mm_fmadd_ps(_mm_mul_ps(_mm_mul_ps(cw, dx), _mm_set1_ps(0.125f)), T, accc[0]);
+            } else {
+                const short h0 = (short) u16(blk - 74), h1 = (short) u16(blk);
+                const __m128 cw = _mm_cvtph_ps(_mm_set_epi16(0, 0, 0, 0, h1, h0, h1, h0));
+                __m256i odd[NT];
+                for (int t = 0; t < NT; ++t) odd[t] = _mm256_add_epi32(acc[t][0], acc[t][1]);
+                for (int p = 0; p < NP; ++p) {
+                    const int t = 2 * p, u = t + 1 < NT ? t + 1 : t;
+                    const __m128 T = pair_sums2(_mm256_load_si256(reinterpret_cast<const __m256i*>(even[t])), odd[t],
+                                                _mm256_load_si256(reinterpret_cast<const __m256i*>(even[u])), odd[u]);
+                    const __m128 dx = _mm_castpd_ps(
+                        _mm_unpacklo_pd(_mm_load_sd(reinterpret_cast<const double*>(xd[t] + i - 1)),
+                                        _mm_load_sd(reinterpret_cast<const double*>(xd[u] + i - 1))));
+                    accc[p] = _mm_fmadd_ps(_mm_mul_ps(_mm_mul_ps(cw, dx), _mm_set1_ps(0.125f)), T, accc[p]);
+                }
+            }
+        } else {
+            const float dx = h2f(u16(blk)) * 0.125f;
+            for (int t = 0; t < NT; ++t)
+                accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d),
+                    _mm256_cvtepi32_ps(_mm256_add_epi32(acc[t][0], acc[t][1])), accf[t]);
+        }
     }
-    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+    if constexpr (C) {
+        for (int p = 0; p < NP; ++p) {
+            res[2 * (size_t) p] = canon_pair_sum(accc[p], 0);
+            if (2 * p + 1 < NT) res[2 * p + 1] = canon_pair_sum(accc[p], 1);
+        }
+    } else {
+        for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+    }
+}
+
+template <int NT> STRATA_ROWS_FN
+inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+    row_dot_iq2xs_impl<false, NT>(row, nblocks, y, nullptr, nullptr, res);
 }
 
 // ---- Q4_K (12) and Q5_K (13): d, dmin, 12 bytes of 6-bit scales and mins, [Q5_K: qh[32]], qs[128].  ggml's
@@ -399,6 +468,107 @@ void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n
         case 6: gu_rows<TY, 6>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 7: gu_rows<TY, 7>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
         default: gu_rows<TY, 8>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+    }
+}
+
+// ---- canonical rows (canon_expert.cpp, iq_kernels.cpp's seg_dot_canon): the activation's int8 values with one scale
+// for each 256 (xd, a float each), a block's eight 32-value units' (2 ls + 1)-weighted integer sums added first, then
+// (d x the activation's scale) x K x that sum with one fma into the even or the odd blocks' sum, two blocks a step;
+// the two sums added at the end.  The same bits as the GPU's row.
+template <int TY, int NT> STRATA_ROWS_FN
+inline void row_dot_canon_gen(const uint8_t* row, int nblocks, const int8_t* const* xq, const float* const* xd,
+                              float* res) {
+    constexpr int NP = (NT + 1) / 2;   // token pairs: lanes 0, 1 the first token's even and odd sums, 2, 3 the second's
+    const int pf = prefetch_distance();
+    __m128 acc[NP];
+    for (int p = 0; p < NP; ++p) acc[p] = _mm_setzero_ps();
+    for (int k0 = 0; k0 < nblocks; k0 += 2) {   // nblocks even (canon_layer)
+        alignas(32) int32_t ev[NT][8];   // the even block's sums, in memory: registers stay for the decode
+        __m256i ev1 = _mm256_setzero_si256(), od[NT];   // one token: ev1
+        for (int b = 0; b < 2; ++b) {
+            const int i = k0 + b;
+            const uint8_t* blk = row + (size_t) i * Fmt32<TY>::bytes;
+            rows_ahead(blk, pf);
+            __m256i acci[NT];
+            for (int t = 0; t < NT; ++t) acci[t] = _mm256_setzero_si256();
+            for (int j = 0; j < 4; ++j)
+                for (int half = 0; half < 2; ++half) {
+                    __m256i g, sgn, sc;
+                    Fmt32<TY>::decode(blk, j, half, g, sgn, sc);
+                    const int off = 256 * i + 64 * j + 32 * half;
+                    for (int t = 0; t < NT; ++t) {
+                        const __m256i yv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq[t] + off));
+                        acci[t] = madd_add(acci[t], _mm256_maddubs_epi16(g, _mm256_sign_epi8(yv, sgn)), sc);
+                    }
+                }
+            for (int t = 0; t < NT; ++t) {
+                if (b == 1) od[t] = acci[t];
+                else if constexpr (NT == 1) ev1 = acci[t];
+                else _mm256_store_si256(reinterpret_cast<__m256i*>(ev[t]), acci[t]);
+            }
+        }
+        const uint8_t* b0 = row + (size_t) k0 * Fmt32<TY>::bytes;
+        const short h0 = (short) u16(b0), h1 = (short) u16(b0 + Fmt32<TY>::bytes);
+        const __m128 cw = _mm_cvtph_ps(_mm_set_epi16(0, 0, 0, 0, h1, h0, h1, h0));
+        for (int p = 0; p < NP; ++p) {
+            const int t = 2 * p, u = t + 1 < NT ? t + 1 : t;
+            __m128 T;
+            if constexpr (NT == 1) T = pair_sums1(ev1, od[0]);
+            else T = pair_sums2(_mm256_load_si256(reinterpret_cast<const __m256i*>(ev[t])), od[t],
+                                _mm256_load_si256(reinterpret_cast<const __m256i*>(ev[u])), od[u]);
+            const __m128 dx = _mm_castpd_ps(_mm_unpacklo_pd(_mm_load_sd(reinterpret_cast<const double*>(xd[t] + k0)),
+                                                            _mm_load_sd(reinterpret_cast<const double*>(xd[u] + k0))));
+            acc[p] = _mm_fmadd_ps(_mm_mul_ps(_mm_mul_ps(cw, dx), _mm_set1_ps(Fmt32<TY>::K)), T, acc[p]);
+        }
+    }
+    for (int p = 0; p < NP; ++p) {
+        res[2 * (size_t) p] = canon_pair_sum(acc[p], 0);
+        if (2 * p + 1 < NT) res[2 * p + 1] = canon_pair_sum(acc[p], 1);
+    }
+}
+
+template <int TY, int NT> STRATA_ROWS_FN
+inline void row_dot_canon(const uint8_t* row, int nblocks, const int8_t* const* xq, const float* const* xd,
+                          float* res) {
+    if constexpr (TY == 17) row_dot_iq2xs_impl<true, NT>(row, nblocks, nullptr, xq, xd, res);
+    else row_dot_canon_gen<TY, NT>(row, nblocks, xq, xd, res);
+}
+
+template <int TY, int NT> STRATA_ROWS_FN
+void canon_rows(const uint8_t* w, size_t row_bytes, int n, const int8_t* const* xq, const float* const* xd,
+                float* const* out, int r0, int r1) {
+    float res[NT];
+    for (int r = r0; r < r1; ++r) {
+        row_dot_canon<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, xq, xd, res);
+        for (int t = 0; t < NT; ++t) out[t][r] = res[t];
+    }
+}
+
+template <int TY> STRATA_ROWS_FN
+void canon_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const int8_t* const* xq, const float* const* xd,
+                   float* const* out, int r0, int r1) {
+    switch (nt) {
+        case 1: canon_rows<TY, 1>(w, row_bytes, n, xq, xd, out, r0, r1); break;
+        case 2: canon_rows<TY, 2>(w, row_bytes, n, xq, xd, out, r0, r1); break;
+        case 3: canon_rows<TY, 3>(w, row_bytes, n, xq, xd, out, r0, r1); break;
+        case 4: canon_rows<TY, 4>(w, row_bytes, n, xq, xd, out, r0, r1); break;
+        case 5: canon_rows<TY, 5>(w, row_bytes, n, xq, xd, out, r0, r1); break;
+        case 6: canon_rows<TY, 6>(w, row_bytes, n, xq, xd, out, r0, r1); break;
+        case 7: canon_rows<TY, 7>(w, row_bytes, n, xq, xd, out, r0, r1); break;
+        default: canon_rows<TY, 8>(w, row_bytes, n, xq, xd, out, r0, r1); break;
+    }
+}
+
+template <bool G> STRATA_ROWS_FN
+void canon_type(int type, int nt, const uint8_t* w, size_t row_bytes, int n, const int8_t* const* xq,
+                const float* const* xd, float* const* out, int r0, int r1) {
+    switch (type) {
+        case 16: canon_rows_nt<16>(nt, w, row_bytes, n, xq, xd, out, r0, r1); break;
+        case 17: canon_rows_nt<17>(nt, w, row_bytes, n, xq, xd, out, r0, r1); break;
+        case 18: canon_rows_nt<G ? 118 : 18>(nt, w, row_bytes, n, xq, xd, out, r0, r1); break;
+        case 21: canon_rows_nt<G ? 121 : 21>(nt, w, row_bytes, n, xq, xd, out, r0, r1); break;
+        case 22: canon_rows_nt<G ? 122 : 22>(nt, w, row_bytes, n, xq, xd, out, r0, r1); break;
+        default: break;
     }
 }
 
