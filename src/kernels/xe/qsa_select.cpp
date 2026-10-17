@@ -45,6 +45,28 @@ void finish(void* stream, const sycl::event& e, const char* what) {
 using local_atomic = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
                                       sycl::access::address_space::local_space>;
 
+// The radix digit of a pass: the highest d in 255..1 whose bins from 255 down to d hold `width` cells with the `above`
+// already counted, else 0, and the count above it.  The work-items 0..255 scan the bins in descending order (bin
+// 255 - t) and the one where the count reaches `width` writes the digit (upstream 6ef23b89: one work-item walked the 255
+// bins while the others waited); the same digit and count, so the same ids.  `h` is bin 255 - (t & 255), read by every
+// work-item (the scan is over the whole work-group; items 256 and up count 0).
+template <class G, class A>
+inline void pick_digit(const G& grp, int t, int h, int above, int64_t width, A& s_digit_above) {
+    const int v = t < 256 ? h : 0;
+    const int incl = sycl::inclusive_scan_over_group(grp, v, sycl::plus<int>());
+    const int excl = incl - v;
+    if (t < 255) {
+        if (above + excl < width && above + incl >= width) {
+            s_digit_above[0] = 255 - t;
+            s_digit_above[1] = above + excl;
+        }
+    } else if (t == 255 && above + excl < width) {   // none of 255..1 reaches width: digit 0
+        s_digit_above[0] = 0;
+        s_digit_above[1] = above + excl;
+    }
+    sycl::group_barrier(grp);
+}
+
 // the reference top-k: 256 work-items, each over a contiguous run of blocks, one shared histogram per digit
 sycl::event launch_topk_ref(sycl::queue& q, const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks,
                             int64_t cap, int32_t* ids) {
@@ -80,16 +102,7 @@ sycl::event launch_topk_ref(sycl::queue& q, const float* scores, const int32_t* 
                     if ((k & hi_mask) == (prefix & hi_mask)) local_atomic(hist[(k >> shift) & 255]).fetch_add(w);
                 }
                 sycl::group_barrier(grp);
-                if (t == 0) {
-                    int cum = above, d = 255;
-                    for (; d > 0; --d) {
-                        if (cum + hist[d] >= width) break;
-                        cum += hist[d];
-                    }
-                    s_digit_above[0] = d;
-                    s_digit_above[1] = cum;
-                }
-                sycl::group_barrier(grp);
+                pick_digit(grp, t, hist[255 - (t & 255)], above, width, s_digit_above);
                 prefix |= uint32_t(s_digit_above[0]) << shift;
                 above = s_digit_above[1];
                 sycl::group_barrier(grp);
@@ -174,16 +187,7 @@ sycl::event launch_topk_wide(sycl::queue& q, const float* scores, const int32_t*
                     hist[0][t] = sum;
                 }
                 sycl::group_barrier(grp);
-                if (t == 0) {
-                    int cum = above, d = 255;
-                    for (; d > 0; --d) {
-                        if (cum + hist[0][d] >= width) break;
-                        cum += hist[0][d];
-                    }
-                    s_digit_above[0] = d;
-                    s_digit_above[1] = cum;
-                }
-                sycl::group_barrier(grp);
+                pick_digit(grp, t, hist[0][255 - (t & 255)], above, width, s_digit_above);
                 prefix |= uint32_t(s_digit_above[0]) << shift;
                 above = s_digit_above[1];
                 sycl::group_barrier(grp);
