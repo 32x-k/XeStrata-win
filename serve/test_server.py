@@ -3657,6 +3657,19 @@ class ThinkingBudget(unittest.TestCase):
                                                      "messages": [{"role": "user", "content": "2+2?"}]})
         self.assertEqual(len(self.engine.prompts), 3)              # thinking off: no budget, one prompt each
 
+    def test_anthropic_thinking_budget_tokens_is_a_budget(self):
+        """0.1.45: thinking {type: enabled, budget_tokens: N} closes the thinking after N tokens (it was only a
+        level)."""
+        from serve.server import REASONING_WRAP_UP
+        code, b = self.post("/v1/messages", {"model": "m", "max_tokens": 400,
+                                             "thinking": {"type": "enabled", "budget_tokens": 30},
+                                             "messages": [{"role": "user", "content": "2+2?"}]})
+        self.assertEqual(code, 200, b)
+        thinking = "".join(c.get("thinking", "") for c in b["content"] if c["type"] == "thinking")
+        self.assertEqual(thinking, ThinkingEngine.THOUGHT[:30] + REASONING_WRAP_UP.split("</think>")[0])
+        self.assertEqual("".join(c.get("text", "") for c in b["content"] if c["type"] == "text"), ThinkingEngine.ANSWER)
+        self.assertEqual(len(self.engine.prompts), 2)
+
     def test_a_budget_the_thinking_stays_under(self):
         code, b = self.openai(reasoning_budget_tokens=10_000)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)

@@ -668,6 +668,11 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     # "output_config": {"effort": "low" | "medium" | "high"}
     thinking = req.get("thinking")
     effort = (req.get("output_config") or {}).get("effort") if isinstance(req.get("output_config"), dict) else None
+    # 0.1.45: Anthropic's budget_tokens is a real budget, not only a level: the thinking is closed (wrap-up, </think>,
+    # the answer) after that many tokens.  A reasoning_budget_tokens of the request's own wins.
+    bt = thinking.get("budget_tokens") if isinstance(thinking, dict) and thinking.get("type") != "disabled" else None
+    if isinstance(bt, int) and not isinstance(bt, bool) and bt > 0 and req.get("reasoning_budget_tokens") is None:
+        req["reasoning_budget_tokens"] = bt
     if isinstance(thinking, dict) and thinking.get("type") == "disabled":
         kwargs["enable_thinking"] = False
     elif effort:

@@ -700,7 +700,12 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   The engine continues from what it already holds, so nothing is read again.
   The wrap-up is part of the thinking the client sees and counts as output tokens.
   `"reasoning_budget_tokens": N` in `xestrata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget.
-  Off by default; Anthropic's `"thinking": {"budget_tokens": N}` still only chooses the level, as above.
+  Off by default; Anthropic's `"thinking": {"budget_tokens": N}` chooses the level, as above, and is also the budget (a `reasoning_budget_tokens` in the same request wins).
+- **max_tokens counts the thinking, so the answer keeps its room.** A client that caps the whole reply (the desktop agent's harness sends `max_completion_tokens: 8192` on every request) and a task the model thinks long about used to be cut off in the middle of the thinking, with no answer.
+  A request with thinking on, no budget of its own and `max_tokens` of 1,024 or more gets one: the thinking is wrapped up when only a quarter of the cap (at least 512 tokens) is left, and the model answers in that room (8,192: thinking up to 6,144, answer 2,048).
+  Requests without `max_tokens` (the rest of the context) get a budget of three quarters of it.
+  `"answer_room": false` in `xestrata-<model>.json` turns it off.
+  Qwen recommends up to 262,144 tokens of reasoning and 131,072 of answer: a client should not cap the reply far below what the context allows.
 - **Changing the effort without reading the prompt again (opt-in).** The effort's instruction is the first thing in the prompt, so a request that only changes the effort (an agent's "think harder" switch, `none` for a quick tool step) reads the whole conversation again.
   `"effort_position": "end"` in `xestrata-<model>.json` renders every request's prompt start as the default effort's and puts a `low` / `medium` effort in a short system turn right before the answer (no thinking: the empty thinking block, as always).
   The engine keeps its conversation checkpoint in front of that turn (`--tail-role-token`; the server checks that the engine knows it), so the next request reuses the conversation whatever its effort.
