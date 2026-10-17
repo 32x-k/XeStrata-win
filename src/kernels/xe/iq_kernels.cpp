@@ -1184,14 +1184,17 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
     });
 }
 
-// Mode 8 on the queue's device: STRATA_EXP_MODE=8 on any GPU (another value: the default kernels; upstream's modes 1-7
-// are gfx906's and not here), else Volta with STRATA_SM70_TABLE=1 (sm70_table.hpp).
+// Mode 8 on the queue's device: the default, where its local memory fits (the callers check it; the same bits as the
+// default kernels).  The window's entries' q8_1 rows are read once into local memory instead of by every weight row
+// (upstream f7eaf2de's STRATA_EXPDEC idea): B70 decode +0.8..+1.1% at 1K and 32K (two A/B runs), RTX 4070 equal.
+// STRATA_EXP_MODE=<another value> (0): the default kernels; upstream's modes 1-7 are gfx906's and not here.
 bool exp_mode8(sycl::queue& q) {
     static const int env = [] {
         const char* v = std::getenv("STRATA_EXP_MODE");
-        return v != nullptr ? std::atoi(v) : -1;
+        return v != nullptr ? (int) std::strtol(v, nullptr, 10) : -1;
     }();
-    return env >= 0 ? env == 8 : xe::sm70_table(q);
+    (void) q;
+    return env < 0 || env == 8;
 }
 
 size_t local_mem_bytes(sycl::queue& q) {
