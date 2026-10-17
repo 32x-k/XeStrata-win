@@ -1043,6 +1043,7 @@ A failure emits an SSE error and `[DONE]` without invalid content.
 Off by default, since it keeps prompts and answers in memory.
 Turn it on with `"api_monitor": true` in `xestrata-<model>.json` (or `serve/server.py --api-monitor`);
 otherwise nothing is recorded and the endpoints below answer 404.
+Apart from it, the server keeps in its process memory the text and tokens of its last few prompts, whatever `"api_monitor"` says, to encode the next turn faster; no endpoint shows them, and they are gone when the server stops.
 
 `/api-monitor` shows the model state, load/unload controls, active and queued requests,
 their request bodies, output, reasoning and non-stream response bodies, with the queue, load, first-token and decode times apart.
