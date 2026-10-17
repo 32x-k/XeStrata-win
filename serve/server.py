@@ -262,6 +262,15 @@ def _timeout_env(name: str, default: float) -> float | None:
 # engine_silence_s, or this variable). STRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs it);
 # without it nothing is ended.
 ENGINE_STALL_S = _timeout_env("STRATA_ENGINE_STALL_S", 90.0)
+# --batch: new requests take the control lines (one prompt read at a time) short prompts first: a prompt of at most
+# STRATA_ADMIT_SHORT_FIRST tokens goes before longer ones (opt-in; unset or 0: whoever gets the lock first), and a
+# longer one that waited STRATA_ADMIT_MAX_WAIT_S (default 30) counts as short.  A chat question then waits for the one
+# read in progress, not for every agent read that came before it.
+try:
+    ADMIT_SHORT_FIRST = max(0, int(os.environ.get("STRATA_ADMIT_SHORT_FIRST") or 0))
+except ValueError:
+    ADMIT_SHORT_FIRST = 0
+ADMIT_MAX_WAIT_S = _timeout_env("STRATA_ADMIT_MAX_WAIT_S", 30.0) or 0.0
 STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
 STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
 
@@ -996,7 +1005,7 @@ class StrataEngine:
             self.waiting = 0                            # requests waiting for the control lines (ctl)
             # #1603: ... and those that gave the lines back to wait for a slot
             self.admitting = 0
-            self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
+            self.wait_lens: list[list] = []        # ... their prompt lengths (a long read gives way to short ones)
             self.ctl_epoch = 0                          # how often the control lines were taken
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
@@ -1497,10 +1506,11 @@ class StrataEngine:
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
 
-    def _take_control(self, cancel, plen: int, after_epoch: int | None = None):
+    def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False):
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
-        `after_epoch`: a request whose read gave way lets the requests waiting then go first."""
-        entry = [plen]
+        `after_epoch`: a request whose read gave way lets the requests waiting then go first.
+        `new`: the request's first admission (STRATA_ADMIT_SHORT_FIRST orders only these)."""
+        entry = [plen, time.monotonic(), new]           # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST)
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
@@ -1514,7 +1524,17 @@ class StrataEngine:
                     raise EngineDied("the engine stopped while this request waited; it was not sent")
                 with self.slot_cv:
                     turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
+                    if turn and new and ADMIT_SHORT_FIRST > 0:
+                        turn = self._admit_next() is entry
                 if turn and self.ctl.acquire(timeout=0.5):
+                    if new and ADMIT_SHORT_FIRST > 0:
+                        with self.slot_cv:              # a shorter one came while this one waited in acquire()
+                            first = self._admit_next() is entry
+                        if not first:
+                            self.ctl.release()
+                            with self.slot_cv:
+                                self.slot_cv.notify_all()
+                            continue
                     if self.alive():
                         break
                     self.ctl.release()                  # it died (or is being restarted) while this one was getting
@@ -1536,6 +1556,18 @@ class StrataEngine:
             self.ctl_epoch += 1
             self.slot_cv.notify_all()
         return True
+
+    def _admit_next(self):
+        """STRATA_ADMIT_SHORT_FIRST=<tokens> (the caller holds slot_cv): the new request that takes the control lines
+        next - one whose prompt is at most that long (it reads little) before a longer one, in arrival order within
+        each; a longer one that has waited STRATA_ADMIT_MAX_WAIT_S counts as short (it is never held back for good).
+        Off (unset or 0): whoever gets the lock first, as before.  Only the order changes, never what is read."""
+        now = time.monotonic()
+        ordered = [e for e in self.wait_lens if len(e) > 2 and e[2]]
+        if not ordered:
+            return None
+        return min(ordered, key=lambda e: (0 if e[0] <= ADMIT_SHORT_FIRST or now - e[1] >= ADMIT_MAX_WAIT_S else 1,
+                                           e[1]))
 
     SOLO_AGAIN_MAX = 2      # how often a request left alone in a slot goes back to the solo path
     SOLO_AGAIN_MIN_LEFT = 32  # ... only with at least this many tokens still allowed (max_tokens)
@@ -1575,7 +1607,7 @@ class StrataEngine:
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
         carry = {}
-        ok = yield from self._take_control(cancel, len(prompt))
+        ok = yield from self._take_control(cancel, len(prompt), new=True)
         if not ok:
             return
         holding, born = True, self.gen                  # (the engine it now has the control lines of)
