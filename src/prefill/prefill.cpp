@@ -2789,6 +2789,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             give_back(consumed);
                         }
                     };
+                    // the MMQ group's last streamed copy into its ring slot (the copy queue is in order): the products
+                    // wait for it once, not each copy for its own (upstream 653f0113's grouped staged walk); -1: none yet
+                    int grp_last_copy = -1;
                     // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
                     // expert) is released once the blob is read
                     auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
@@ -2822,6 +2825,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
                             int64_t maxr = 0;
                             for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
+                            if (grp_last_copy >= 0) {
+                                pt.mark(kPfWaitCopy, cs);
+                                strata::gpu::stream_wait_event(m.cs, m.copied[grp_last_copy]);
+                                grp_last_copy = -1;
+                            }
                             pt.mark(kPfGemmGU, cs);
                             const uint8_t* ring0 = mmq_direct ? slot_ptr((int) (j0 % MMQ_RING)) : nullptr;
                             mmq::Product gu;
@@ -2904,8 +2912,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 ++stats_.experts_resident;
                                 if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
                             } else {
-                                pt.mark(kPfWaitCopy, cs);
-                                strata::gpu::stream_wait_event(m.cs, m.copied[stage_of[j]]);
+                                if (mmq_direct && group_env) {
+                                    grp_last_copy = stage_of[j];   // waited for once, before the group's products
+                                } else {
+                                    pt.mark(kPfWaitCopy, cs);
+                                    strata::gpu::stream_wait_event(m.cs, m.copied[stage_of[j]]);
+                                }
                                 if (!compute(j, slot_ptr(stage_of[j]), stage_of[j])) return false;
                             }
                         }
