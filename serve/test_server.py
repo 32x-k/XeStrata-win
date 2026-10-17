@@ -3628,6 +3628,35 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(text, ThinkingEngine.ANSWER)
         self.assertEqual(evs[-2]["delta"]["stop_reason"], "end_turn")
 
+    def test_a_cap_that_the_thinking_would_eat_leaves_room_to_answer(self):
+        """0.1.45: max_tokens counts the thinking; a thinking that would fill it gets closed with a quarter left (the
+        agent harness sends max_completion_tokens 8192; the pagoda's thinking took all of it and no answer came)."""
+        self.engine.THOUGHT = "Let me think step by step about two plus two. " * 40    # 1,800 reasoning tokens
+        code, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 1024,
+                                                     "messages": [{"role": "user", "content": "2+2?"}]})
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        self.assertLess(len(msg["reasoning_content"]), 1024 - 256)
+        self.assertEqual(len(self.engine.prompts), 2)              # the wrap-up continuation
+
+    def test_the_answer_room_has_its_limits(self):
+        self.engine.THOUGHT = "Let me think step by step about two plus two. " * 40
+        # below the floor: as before
+        code, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 300,
+                                                     "messages": [{"role": "user", "content": "2+2?"}]})
+        self.assertEqual(b["choices"][0]["finish_reason"], "length")
+        self.assertFalse(b["choices"][0]["message"]["content"])
+        self.svc.answer_room = False                               # the config's "answer_room": false
+        code, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 1024,
+                                                     "messages": [{"role": "user", "content": "2+2?"}]})
+        self.assertEqual(b["choices"][0]["finish_reason"], "length")
+        self.svc.answer_room = True
+        code, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 1024, "reasoning_effort": "none",
+                                                     "messages": [{"role": "user", "content": "2+2?"}]})
+        self.assertEqual(len(self.engine.prompts), 3)              # thinking off: no budget, one prompt each
+
     def test_a_budget_the_thinking_stays_under(self):
         code, b = self.openai(reasoning_budget_tokens=10_000)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
