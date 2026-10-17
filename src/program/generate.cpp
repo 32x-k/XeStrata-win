@@ -401,6 +401,9 @@ struct Options {
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
+    /// --vram-free-mib: the free VRAM at the start the auto expert cache counts at most (setup writes what its warm-up
+    /// saw, less a margin; -1: what is free)
+    int64_t vram_free_mib = -1;
     bool vram_reserve_given = false;   ///< --vram-reserve-mib on the command line (#496: no smaller automatic reserve)
     /// #533 (opt-in): the expert cache in physical segments (virtual memory), so the serve loop's `VRAM <reserve_mib>`
     /// command can give part of it back to other programs and take it again.  Off: one allocation.
@@ -739,6 +742,9 @@ void usage() {
                  "                       GPU via `moe_hit_grouped_s2`.  DEFAULT 0.  Measured at 4096 slots\n"
                  "                       with --expert-cache-per-layer: 54.4%% hits, CPU pool drain 19.1 -> 10.3\n"
                  "                       ms/token, -2.7 ms/token end to end.\n"
+                 "  --vram-free-mib N    size the auto expert cache as if at most N MiB of VRAM were free at the\n"
+                 "                       start (setup writes what its warm-up saw, less 32: the free VRAM moves a\n"
+                 "                       few MiB between starts, the cache's slots with it, and the answers' bits)\n"
                  "  --expert-cache-device1 N  pre-fill N experts on CUDA1 (experimental)\n"
                  "  --expert-cache-device2 N  pre-fill N more experts on CUDA2\n"
                  "  --expert-cache-device3 N  pre-fill N more experts on CUDA3\n"
@@ -2407,6 +2413,7 @@ int main(int argc, char** argv) {
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
         else if (a == "--vram-elastic") o.vram_elastic = true;
         else if (a == "--vram-segment-mib") o.vram_segment_mib = std::strtoll(next("--vram-segment-mib"), nullptr, 10);
+        else if (a == "--vram-free-mib") o.vram_free_mib = std::max<int64_t>(0, std::strtoll(next("--vram-free-mib"), nullptr, 10));
         else if (a == "--vram-reserve-mib") {
             o.vram_reserve_mib = (int) std::strtol(next("--vram-reserve-mib"), nullptr, 10);
             o.vram_reserve_given = true;
@@ -3031,6 +3038,16 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: CUDA%d context ready, %.2f GiB free before expert arena registration\n",
                      remote_dev[0], free_gib);
+    }
+    // the VRAM free before the engine takes any: setup's warm-up reads it from the log (--vram-free-mib)
+    size_t start_free_b = 0;
+    {
+        size_t total_b = 0;
+        strata::gpu::mem_info(&start_free_b, &total_b);
+        std::fprintf(stderr, "strata generate: %llu MiB of VRAM free at the start%s\n",
+                     (unsigned long long) (start_free_b >> 20),
+                     o.vram_free_mib >= 0 ? (" (the cache counts at most " + std::to_string(o.vram_free_mib) +
+                                             ": --vram-free-mib)").c_str() : "");
     }
     strata::core::progress_at("starting: building the GPU kernels (on a thread beside the load)");
     strata::core::Runtime::get().preload_kernels();   // beside the model's loading
@@ -4906,6 +4923,10 @@ int main(int argc, char** argv) {
         auto size_cache = [&] {
             strata::gpu::mem_info(&free_b, &total_b);
             free_b += (size_t) blas_bytes;   // the matrix library's VRAM is the reserve's (above)
+            // --vram-free-mib: what was free at the start beyond it is not counted, so a start with a few MiB more
+            // free gets the same cache
+            if (o.vram_free_mib >= 0 && start_free_b > ((size_t) o.vram_free_mib << 20))
+                free_b -= std::min(free_b, start_free_b - ((size_t) o.vram_free_mib << 20));
             // the draft layer's head and logits are allocated when it binds, after this: the CJK draft subset makes
             // them ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (upstream
             // b981f63)

@@ -3570,6 +3570,52 @@ def warm_up(cfg_path: Path) -> None:
             end_process_group(proc)
     if share is not None:
         fix_prefill_share(cfg_path, share)
+    free = start_free_mib(elog, since)
+    if free is not None:
+        fix_vram_free(cfg_path, free)
+
+
+def start_free_mib(elog: str | None, since: int) -> int | None:
+    """The VRAM free at the engine's start ("strata generate: N MiB of VRAM free at the start") in its log after byte
+    `since`, the lowest if it started more than once; None when the log has none."""
+    if not elog:
+        return None
+    try:
+        with open(elog, "rb") as f:
+            f.seek(since)
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    found = re.findall(r"strata generate: ([0-9]+) MiB of VRAM free at the start", text)
+    return min(int(v) for v in found) if found else None
+
+
+VRAM_FREE_MARGIN_MIB = 32   # the free VRAM moved by up to ~20 MiB between starts on the B70 (2026-10-17)
+
+
+def fix_vram_free(cfg_path: Path, free_mib: int) -> None:
+    """Write the free VRAM the warm-up's start saw, less a margin, into the config (--vram-free-mib): the auto expert
+    cache was sized from what was free at each start, which moved by a few MiB, the cache's slots with it, which
+    experts the prompt's CPU share took, and two greedy runs of one prompt parted (the B70, 2026-10-17)."""
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    a = list(cfg.get("args", []))
+    v = str(max(0, free_mib - VRAM_FREE_MARGIN_MIB))
+    if "--vram-free-mib" in a[:-1]:
+        a[a.index("--vram-free-mib") + 1] = v
+    else:
+        a += ["--vram-free-mib", v]
+    cfg["args"] = a
+    write_config(cfg_path, cfg)
+    st = load_settings()
+    st.setdefault("vram_free_mib", {})[hardware_key(cfg)] = v
+    save_settings(st)
+    ok(f"the expert cache is sized from at most {v} MiB of free VRAM (what this start saw, less "
+       f"{VRAM_FREE_MARGIN_MIB}; kept in the config, so it holds the same experts every run)")
+
+
+def saved_vram_free(cfg: dict) -> str | None:
+    """The free VRAM an earlier warm-up saw for this PC and model, less the margin (fix_vram_free), if any."""
+    return (load_settings().get("vram_free_mib") or {}).get(hardware_key(cfg))
 
 
 def measured_cpu_share(elog: str | None, since: int) -> float | None:
@@ -3993,6 +4039,9 @@ def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images
     share = saved_prefill_share(cfg)                   # measured once per PC and model: the warm-up then keeps it
     if share is not None and "--prefill-cpu-share" not in cfg["args"]:
         cfg["args"] = [*cfg["args"], "--prefill-cpu-share", share]
+    free = saved_vram_free(cfg)                        # the same for the free VRAM the cache is sized from
+    if free is not None and "--vram-free-mib" not in cfg["args"]:
+        cfg["args"] = [*cfg["args"], "--vram-free-mib", free]
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None,
                        getattr(a, "gpus_chosen", False))
     script = None if PACKAGED else write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)

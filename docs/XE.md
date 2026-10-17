@@ -434,6 +434,7 @@ Where the draft modes differ, there are two causes:
 Which experts run on the CPU follows the cache size, and that changes the output's last bits.
 `auto` sizes the cache from the free VRAM, so free VRAM moving between starts moves it by a slot or two and can change the output.
 Rounding it down to 64 slots gave every start on a machine the same cache, but it slowed the RTX 4070's decode by 3-4%, so it is not rounded.
+Setup's warm-up instead writes the VRAM free at its start, less 32 MiB, into the run config (`--vram-free-mib`): the engine does not count more free at its start than that, so a start with a little more free VRAM gets the same cache (on the B70 it moved by about 20 MiB between starts, 15 slots). A start with less free gets a smaller cache.
 When the same output is needed (comparisons across machines or settings too), fix it with `--expert-cache N`.
 
 ### The output head's VRAM refusal
