@@ -11,6 +11,19 @@ STRATA_ROWS_FN inline void canon_ahead(const uint8_t* p, int pf) {
     _mm_prefetch((const char*) p + pf + 64, _MM_HINT_T0);
 }
 
+// Four blocks' 16 code bytes (at b0, b0 + stride, ...) as the calls' first and second 4 bytes a lane: w0 = [b0's
+// dwords 0, 2, b1's 0, 2 | b2's 0, 2, b3's 0, 2], w1 the same with dwords 1, 3 (two loads a lane, one shufps each)
+STRATA_ROWS_FN inline void call_dwords(const uint8_t* b0, ptrdiff_t stride, __m256i& w0, __m256i& w1) {
+    const __m256 a = _mm256_castsi256_ps(_mm256_inserti128_si256(
+        _mm256_castsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b0))),
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(b0 + 2 * stride)), 1));
+    const __m256 b = _mm256_castsi256_ps(_mm256_inserti128_si256(
+        _mm256_castsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b0 + stride))),
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(b0 + 3 * stride)), 1));
+    w0 = _mm256_castps_si256(_mm256_shuffle_ps(a, b, 0x88));
+    w1 = _mm256_castps_si256(_mm256_shuffle_ps(a, b, 0xDD));
+}
+
 // acc + madd(p16, sc)
 STRATA_ROWS_FN inline __m256i madd_add(__m256i acc, __m256i p16, __m256i sc) {
 #if STRATA_ROWS_VNNI
@@ -64,11 +77,8 @@ template <int NT> STRATA_ROWS_FN void iq4nl_rows_nt(const uint8_t* row, int n, c
     for (int k0 = 0; k0 < nb; k0 += 4) {
         const auto* w = reinterpret_cast<const block_iq4_nl*>(row) + k0;
         canon_ahead(reinterpret_cast<const uint8_t*>(w), pf);
-        __m128i q[4];
-        for (int b = 0; b < 4; ++b)   // dwords 0, 2 | 1, 3 of the block's 16 bytes
-            q[b] = _mm_shuffle_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w[b].qs)), 0xD8);
-        const __m256i b02 = _mm256_set_m128i(_mm_unpacklo_epi64(q[2], q[3]), _mm_unpacklo_epi64(q[0], q[1]));
-        const __m256i b13 = _mm256_set_m128i(_mm_unpackhi_epi64(q[2], q[3]), _mm_unpackhi_epi64(q[0], q[1]));
+        __m256i b02, b13;
+        call_dwords(w[0].qs, (ptrdiff_t) sizeof(block_iq4_nl), b02, b13);
         __m256i wv[4], wa[4];
         wv[0] = _mm256_shuffle_epi8(kv, _mm256_and_si256(b02, m4));
         wv[1] = _mm256_shuffle_epi8(kv, _mm256_and_si256(b13, m4));
@@ -118,11 +128,8 @@ template <int NT> STRATA_ROWS_FN void q20_rows_nt(const uint8_t* row, int n, con
     for (; k0 + 4 <= nb; k0 += 4) {
         const uint8_t* b0 = row + (size_t) k0 * 18;
         canon_ahead(b0, pf);
-        __m128i q[4];
-        for (int b = 0; b < 4; ++b)
-            q[b] = _mm_shuffle_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b0 + 18 * (ptrdiff_t) b + 2)), 0xD8);
-        const __m256i w0 = _mm256_set_m128i(_mm_unpacklo_epi64(q[2], q[3]), _mm_unpacklo_epi64(q[0], q[1]));
-        const __m256i w1 = _mm256_set_m128i(_mm_unpackhi_epi64(q[2], q[3]), _mm_unpackhi_epi64(q[0], q[1]));
+        __m256i w0, w1;
+        call_dwords(b0 + 2, 18, w0, w1);
         __m256i c[8];   // c[2 p + h]
         for (int p = 0; p < 4; ++p) {
             c[2 * (size_t) p] = _mm256_and_si256(_mm256_srli_epi16(w0, 2 * p), m3);
@@ -140,10 +147,12 @@ template <int NT> STRATA_ROWS_FN void q20_rows_nt(const uint8_t* row, int n, con
             for (int m = 0; m < 8; ++m)
                 T = _mm256_dpbusd_avx_epi32(T, c[m], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb + 32 * (ptrdiff_t) m)));
 #else
-            __m256i s16 = _mm256_maddubs_epi16(c[0], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb)));
-            for (int m = 1; m < 8; ++m)
-                s16 = _mm256_add_epi16(s16, _mm256_maddubs_epi16(c[m], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb + 32 * (ptrdiff_t) m))));
-            __m256i T = _mm256_madd_epi16(s16, _mm256_set1_epi16(1));
+            __m256i s16[2];   // two chains of int16 sums (|sum| <= 4 x 762 each)
+            for (int m = 0; m < 2; ++m)
+                s16[m] = _mm256_maddubs_epi16(c[m], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb + 32 * (ptrdiff_t) m)));
+            for (int m = 2; m < 8; ++m)
+                s16[m & 1] = _mm256_add_epi16(s16[m & 1], _mm256_maddubs_epi16(c[m], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb + 32 * (ptrdiff_t) m))));
+            __m256i T = _mm256_madd_epi16(_mm256_add_epi16(s16[0], s16[1]), _mm256_set1_epi16(1));
 #endif
             T = _mm256_sub_epi32(T, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qs32[t] + 2 * (ptrdiff_t) k0)));
             const __m256 cT = _mm256_mul_ps(dw, _mm256_loadu_ps(dx[t] + 2 * (ptrdiff_t) k0));   // calls 2 k0 .. 2 k0 + 7
