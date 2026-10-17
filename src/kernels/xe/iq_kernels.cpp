@@ -31,6 +31,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 //
+#include "strata/kernels/canon_math.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
@@ -108,14 +109,25 @@ template<> struct Split<42> {   // Q2_0
         r.d = (float) bq2_0->d;
         return r;
     }
-    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+    static void parts(const W& r, const block_q8_1* bq8_1, int iqs, float& c, int& s) {
         const block_q8_1* chunk = bq8_1 + iqs;
         int sumi = 0;
         for (int j = 0; j < 4; ++j) {
             sumi = dp4a(get_int_b4(chunk->qs, j * 2 + 0), r.qx[j], sumi);
             sumi = dp4a(get_int_b4(chunk->qs, j * 2 + 1), r.qy[j], sumi);
         }
-        return r.d * low_half(chunk->ds) * (float) sumi;
+        s = sumi;
+        c = r.d * low_half(chunk->ds);
+    }
+    // the products' order an expert's row takes on every device and on the CPU (canon_math.hpp, seg_dot_multi)
+    static constexpr bool kParts = true;
+    // the calls in a row that share one activation scale (their integer sums add before the scale)
+    static constexpr int kGroup = 1;
+    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+        float c;
+        int s;
+        parts(r, bq8_1, iqs, c, s);
+        return c * (float) s;
     }
 };
 
@@ -146,9 +158,19 @@ template<> struct Split<16> {   // IQ2_XXS
         r.d = (float) bq2->d;
         return r;
     }
+    static void parts(const W& r, const block_q8_1* bq8_1, int iqs, float& c, int& s) {
+        s = signed_sum(r, &bq8_1[iqs / 2]) * r.ls;   // r.ls = 2 ls + 1: (2 ls + 1) / 8 a value
+        c = r.d * low_half(bq8_1[iqs / 2].ds) * 0.125f;
+    }
+    // the products' order an expert's row takes on every device and on the CPU (canon_math.hpp, seg_dot_multi)
+    static constexpr bool kParts = true;
+    // the calls in a row that share one activation scale (their integer sums add before the scale)
+    static constexpr int kGroup = 8;
     static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
-        const int sumi = signed_sum(r, &bq8_1[iqs / 2]) * r.ls / 8;
-        return r.d * low_half(bq8_1[iqs / 2].ds) * (float) sumi;
+        float c;
+        int s;
+        parts(r, bq8_1, iqs, c, s);
+        return c * (float) s;
     }
 };
 
@@ -170,10 +192,19 @@ template<> struct Split<18> {   // IQ3_XXS
         r.d = (float) bq3->d;
         return r;
     }
+    static void parts(const W& r, const block_q8_1* bq8_1, int iqs, float& c, int& s) {
+        s = signed_sum(r, &bq8_1[iqs / 2]) * (2 * r.ls + 1);   // d (0.5 + ls) / 2 a value: (2 ls + 1) / 4
+        c = r.d * low_half(bq8_1[iqs / 2].ds) * 0.25f;
+    }
+    // the products' order an expert's row takes on every device and on the CPU (canon_math.hpp, seg_dot_multi)
+    static constexpr bool kParts = true;
+    // the calls in a row that share one activation scale (their integer sums add before the scale)
+    static constexpr int kGroup = 8;
     static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
-        int sumi = signed_sum(r, &bq8_1[iqs / 2]);
-        sumi = (r.ls * sumi + sumi / 2) / 2;
-        return r.d * low_half(bq8_1[iqs / 2].ds) * (float) sumi;
+        float c;
+        int s;
+        parts(r, bq8_1, iqs, c, s);
+        return c * (float) s;
     }
 };
 
@@ -198,21 +229,32 @@ template<> struct Split<21> {   // IQ3_S
         r.d = (float) bq3->d;
         return r;
     }
-    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+    static void parts(const W& r, const block_q8_1* bq8_1, int iqs, float& c, int& s) {
         const int sumi = signed_sum(r, &bq8_1[iqs / 2]) * r.ls;
-        return r.d * low_half(bq8_1[iqs / 2].ds) * (float) sumi;
+        s = sumi;
+        c = r.d * low_half(bq8_1[iqs / 2].ds);
+    }
+    // the products' order an expert's row takes on every device and on the CPU (canon_math.hpp, seg_dot_multi)
+    static constexpr bool kParts = true;
+    // the calls in a row that share one activation scale (their integer sums add before the scale)
+    static constexpr int kGroup = 8;
+    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+        float c;
+        int s;
+        parts(r, bq8_1, iqs, c, s);
+        return c * (float) s;
     }
 };
 
 // IQ2_XS and IQ2_S: two half sums, each with its 4-bit scale
 struct SignedGrid2 { int g[8]; uint32_t m[8]; int ls0, ls1; float d; };
-inline float apply_ls2(const SignedGrid2& r, const block_q8_1* bq8_1, int iqs) {
+inline void parts_ls2(const SignedGrid2& r, const block_q8_1* bq8_1, int iqs, float& c, int& s) {
     const block_q8_1* q8 = &bq8_1[iqs / 2];
     int sumi0 = 0, sumi1 = 0;
     for (int j = 0; j < 4; ++j) sumi0 = dot_masked(r.g[j], get_int_b4(q8->qs, j), r.m[j], sumi0);
     for (int j = 4; j < 8; ++j) sumi1 = dot_masked(r.g[j], get_int_b4(q8->qs, j), r.m[j], sumi1);
-    const int sumi = (sumi0 * r.ls0 + sumi1 * r.ls1 + (sumi0 + sumi1) / 2) / 4;
-    return r.d * low_half(q8->ds) * (float) sumi;
+    s = sumi0 * (2 * r.ls0 + 1) + sumi1 * (2 * r.ls1 + 1);   // d (0.5 + ls) / 4 a value: (2 ls + 1) / 8
+    c = r.d * low_half(q8->ds) * 0.125f;
 }
 
 template<> struct Split<17> {   // IQ2_XS
@@ -234,7 +276,17 @@ template<> struct Split<17> {   // IQ2_XS
         r.d = (float) bq2->d;
         return r;
     }
-    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) { return apply_ls2(r, bq8_1, iqs); }
+    static void parts(const W& r, const block_q8_1* bq8_1, int iqs, float& c, int& s) { parts_ls2(r, bq8_1, iqs, c, s); }
+    // the products' order an expert's row takes on every device and on the CPU (canon_math.hpp, seg_dot_multi)
+    static constexpr bool kParts = true;
+    // the calls in a row that share one activation scale (their integer sums add before the scale)
+    static constexpr int kGroup = 8;
+    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+        float c;
+        int s;
+        parts(r, bq8_1, iqs, c, s);
+        return c * (float) s;
+    }
 };
 
 template<> struct Split<22> {   // IQ2_S
@@ -257,7 +309,17 @@ template<> struct Split<22> {   // IQ2_S
         r.d = (float) bq2->d;
         return r;
     }
-    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) { return apply_ls2(r, bq8_1, iqs); }
+    static void parts(const W& r, const block_q8_1* bq8_1, int iqs, float& c, int& s) { parts_ls2(r, bq8_1, iqs, c, s); }
+    // the products' order an expert's row takes on every device and on the CPU (canon_math.hpp, seg_dot_multi)
+    static constexpr bool kParts = true;
+    // the calls in a row that share one activation scale (their integer sums add before the scale)
+    static constexpr int kGroup = 8;
+    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+        float c;
+        int s;
+        parts(r, bq8_1, iqs, c, s);
+        return c * (float) s;
+    }
 };
 
 template<> struct Split<29> {   // IQ1_M
@@ -307,14 +369,27 @@ template<> struct Split<20> {   // IQ4_NL
         r.d = (float) bq4->d;
         return r;
     }
-    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+    static void parts(const W& r, const block_q8_1* bq8_1, int iqs, float& c, int& s) {
         const int* q8 = (const int*) bq8_1->qs + iqs;
         int sumi = 0;
         for (int l = 0; l < 2; ++l) {
             sumi = dp4a(r.v[l].x, q8[l + 0], sumi);
             sumi = dp4a(r.v[l].y, q8[l + 4], sumi);
         }
-        return r.d * low_half(bq8_1->ds) * (float) sumi;
+        s = sumi;
+        c = r.d * low_half(bq8_1->ds);
+    }
+    // the products' order an expert's row takes on every device and on the CPU (canon_math.hpp, seg_dot_multi)
+    static constexpr bool kParts = true;
+    // the calls in a row that share one activation scale (their integer sums add before the scale): one, though a
+    // block's two calls have the same scale, so a call is a lane's own fma and no lanes exchange sums (the CPU's rows
+    // add the 8 lanes as cheaply)
+    static constexpr int kGroup = 1;
+    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+        float c;
+        int s;
+        parts(r, bq8_1, iqs, c, s);
+        return c * (float) s;
     }
 };
 
@@ -727,10 +802,80 @@ inline const void* block_at(const uint8_t* row, int kbx) { return row + (size_t)
 // projection: 180-360 bytes) keeps its lanes busy and reduces in log2(LPR) steps.  Each block is loaded once for all
 // the entries (upstream 8ec94aa); entry e's sum is what one entry alone gives, bit for bit.  `grid`
 // (GridOf<TY>::T): the codebook the blocks are decoded with, when not the global table.
+template<class S, class = void> struct HasParts : std::false_type {};
+template<class S> struct HasParts<S, std::void_t<decltype(S::kParts)>> : std::true_type {};
+
+// A format with parts (canon_math.hpp; the CPU's rows take the same steps): the calls of a row that share one
+// activation scale (kGroup neighbouring calls, on kGroup neighbouring lanes, a block of an i-quant) add their exact
+// integer sums first, a butterfly of integers, and each lane then adds the group's scale times that sum in one
+// written-out fma; the lane sums are reduced over the lanes kGroup apart and more (the lanes of a group hold the same
+// sum).  With groups, every lane runs nb_all blocks' trips, so the integer butterflies see the whole sub-group, and a
+// lane whose row is out of range (nb 0) adds nothing; a call with a scale of its own (kGroup 1) is its lane's own
+// fma, in the plain loop, which was 2.5% faster on an RTX 4070 (the Q2_0 down rows).  Two trips a round of exchanges
+// (half the exchanges) were 5-13% slower on the B70 and the RTX 4070.
+template<int TY, int LPR, int NE, class G>
+inline void seg_dot_canon(const sycl::sub_group& sg, const uint8_t* row, const block_q8_1* const (&x)[NE], int n,
+                          int nb, int nb_all, int seg_lane, float (&out)[NE], const G* grid) {
+    STRATA_CANON_NO_CONTRACT
+    using F = Fmt<TY>;
+    constexpr int KG = F::S::kGroup;
+    static_assert(LPR % KG == 0 && (KG & (KG - 1)) == 0, "a group's calls on neighbouring lanes of one segment");
+    float s[NE];
+    for (int e = 0; e < NE; ++e) s[e] = 0.0f;
+    const int total = nb_all * F::ipb, mine = nb * F::ipb;
+    if constexpr (KG == 1) {   // no integer butterfly: each lane its own calls, as seg_dot_multi's plain loop
+        (void) total;
+        for (int k = seg_lane; k < mine; k += LPR) {
+            const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+            const auto wd = [&] {
+                if constexpr (std::is_void_v<G>) return F::S::load(block_at<F>(row, kbx), 0, iqs);
+                else return F::S::load(block_at<F>(row, kbx), 0, iqs, grid);
+            }();
+            const uint32_t xo32 = (uint32_t) kbx * (uint32_t) (F::qk / 32);   // in 32 bits (block_at)
+            const size_t xo = xo32;
+            for (int e = 0; e < NE; ++e)
+                if (e < n) {
+                    float c;
+                    int t;
+                    F::S::parts(wd, x[e] + xo, iqs, c, t);
+                    s[e] = canon::fma(c, (float) t, s[e]);
+                }
+        }
+    } else
+    for (int k0 = 0; k0 < total; k0 += LPR) {
+        const int k = k0 + seg_lane;
+        const bool on = k < mine;
+        const int kk = on ? k : 0, kbx = kk / F::ipb, iqs = F::step * (kk % F::ipb);
+        const auto wd = [&] {
+            if constexpr (std::is_void_v<G>) return F::S::load(block_at<F>(row, kbx), 0, iqs);
+            else return F::S::load(block_at<F>(row, kbx), 0, iqs, grid);
+        }();
+        const uint32_t xo32 = (uint32_t) kbx * (uint32_t) (F::qk / 32);   // in 32 bits (block_at)
+        const size_t xo = xo32;
+        for (int e = 0; e < NE; ++e)
+            if (e < n) {   // n is the whole sub-group's: the butterflies stay uniform
+                float c = 0.0f;
+                int t = 0;
+                if (on) F::S::parts(wd, x[e] + xo, iqs, c, t);
+                for (int o = KG / 2; o > 0; o >>= 1) t += sycl::permute_group_by_xor(sg, t, o);
+                if (on) s[e] = canon::fma(c, (float) t, s[e]);
+            }
+    }
+    for (int e = 0; e < NE; ++e) {
+        for (int o = LPR / 2; o >= KG; o >>= 1) s[e] += sycl::permute_group_by_xor(sg, s[e], o);
+        out[e] = s[e];
+    }
+}
+
 template<int TY, int LPR, int NE, class G = void>
 inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const block_q8_1* const (&x)[NE], int n,
-                          int nb, int seg_lane, float (&out)[NE], const G* grid = nullptr) {
+                          int nb, int nb_all, int seg_lane, float (&out)[NE], const G* grid = nullptr) {
     using F = Fmt<TY>;
+    if constexpr (HasParts<typename F::S>::value) {
+        seg_dot_canon<TY, LPR, NE, G>(sg, row, x, n, nb, nb_all, seg_lane, out, grid);
+        return;
+    } else {
+    (void) nb_all;
     float s[NE];
     for (int e = 0; e < NE; ++e) s[e] = 0.0f;
     for (int k = seg_lane; k < nb * F::ipb; k += LPR) {
@@ -746,6 +891,7 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
     for (int e = 0; e < NE; ++e) {
         for (int o = LPR / 2; o > 0; o >>= 1) s[e] += sycl::permute_group_by_xor(sg, s[e], o);
         out[e] = s[e];
+    }
     }
 }
 
@@ -858,7 +1004,7 @@ sycl::event launch_native_gu(sycl::queue& q, size_t cap_groups, const unsigned l
                 const block_q8_1* xs[kEntriesPass];
                 for (int j = 0; j < kEntriesPass; ++j) xs[j] = xq + (size_t) ent_tok[j < n ? e + j : e] * xb;
                 float s[kEntriesPass];
-                seg_dot_multi<TG, LPR, kEntriesPass>(sg, wr, xs, n, nb, seg_lane, s);
+                seg_dot_multi<TG, LPR, kEntriesPass>(sg, wr, xs, n, nb, (int) (L.n_embd / Fmt<TG>::qk), seg_lane, s);
                 if (valid && seg_lane == 0)
                     for (int j = 0; j < n; ++j) (is_up ? up : gate)[(size_t) (e + j) * L.n_ff + r] = s[j];
             }
@@ -890,7 +1036,7 @@ sycl::event launch_native_down(sycl::queue& q, size_t cap_groups, const unsigned
                 const block_q8_1* xs[kEntriesPass];
                 for (int j = 0; j < kEntriesPass; ++j) xs[j] = hq + (size_t) (j < n ? e + j : e) * hb;
                 float s[kEntriesPass];
-                seg_dot_multi<TD, LPR, kEntriesPass>(sg, wr, xs, n, nb, seg_lane, s);
+                seg_dot_multi<TD, LPR, kEntriesPass>(sg, wr, xs, n, nb, (int) (L.n_ff / Fmt<TD>::qk), seg_lane, s);
                 if (valid && seg_lane == 0)
                     for (int j = 0; j < n; ++j) out[(size_t) ent_dst[e + j] * L.n_embd + r] = s[j];
             }
@@ -953,19 +1099,19 @@ sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsi
                     const int i = (p * GU_ROWS + warp) * RPW + lane / LPR;   // gate row r0 + i, or up row r0 + i - 32
                     const uint8_t* wr = blob + (i < 32 ? (size_t) 0 : L.up_off) + (size_t) (r0 + (i & 31)) * L.gu_row;
                     float s[kEntriesPass];
-                    if constexpr (NG > 0) seg_dot_multi<TG, LPR, kEntriesPass>(sg, wr, xs, cn, nb, seg_lane, s, grid);
-                    else seg_dot_multi<TG, LPR, kEntriesPass>(sg, wr, xs, cn, nb, seg_lane, s);
+                    if constexpr (NG > 0) seg_dot_multi<TG, LPR, kEntriesPass>(sg, wr, xs, cn, nb, nb, seg_lane, s, grid);
+                    else seg_dot_multi<TG, LPR, kEntriesPass>(sg, wr, xs, cn, nb, nb, seg_lane, s);
                     if (seg_lane == 0)
                         for (int j = 0; j < cn; ++j) res[j * kM8Rows + i] = s[j];
                 }
                 sycl::group_barrier(it.get_group());
                 if (warp < cn) {   // native_expert_grouped's one-pass SwiGLU + q8_1 on entry c0 + warp's block
-                    const float gv = res[warp * kM8Rows + lane], uv = res[warp * kM8Rows + 32 + lane];
-                    const float xi = (gv / (1.0f + sycl::exp(-gv))) * uv;
+                    // the SwiGLU and the int8 scale of canon_math.hpp, as native_expert_grouped's pass
+                    const float xi = canon::silu_mul(res[warp * kM8Rows + lane], res[warp * kM8Rows + 32 + lane]);
                     const float amax = warp_max(sg, sycl::fabs(xi));
                     const float sum = warp_sum(sg, xi);
-                    const float d = xe::q8_1_finite(amax / 127.0f);
-                    const int8_t qv = xe::q8_1_quant(xi, d, amax);
+                    const float d = canon::q8_scale(amax);
+                    const int8_t qv = canon::q8_value(xi, canon::q8_inv(d));
                     block_q8_1* y = hq + (size_t) (c0 + warp) * hb + it.get_group(1);
                     y->qs[lane] = qv;
                     if (lane == 0) y->ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
@@ -1011,7 +1157,7 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
                     const int nb = valid ? (int) (L.n_ff / Fmt<TD>::qk) : 0;
                     float s[kEntriesPass];
                     seg_dot_multi<TD, LPR, kEntriesPass>(sg, blob + L.down_off + (size_t) (valid ? r : 0) * L.d_row,
-                                                         xs, cn, nb, seg_lane, s);
+                                                         xs, cn, nb, (int) (L.n_ff / Fmt<TD>::qk), seg_lane, s);
                     if (valid && seg_lane == 0)
                         for (int j = 0; j < cn; ++j) out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = s[j];
                 }
@@ -1037,22 +1183,20 @@ size_t local_mem_bytes(sycl::queue& q) {
 }
 
 // ---------------------------------------------------------------- q8_1 (quantize.cu)
-// n is a multiple of 32, so every sub-group is either wholly in range or wholly out of it.
-sycl::event launch_quantize_q8_1(sycl::queue& q, const float* x, block_q8_1* y, long long n,
-                                 const std::vector<sycl::event>& deps = {}) {
+// n is a multiple of 32, so every sub-group is either wholly in range or wholly out of it.  canon_math.hpp's scale (the
+// experts' activations: the CPU's rows of an expert quantize alike).
+sycl::event launch_quantize_q8_1_canon(sycl::queue& q, const float* x, block_q8_1* y, long long n) {
     const size_t total = (size_t) ((n + 255) / 256) * 256;
-    return q.parallel_for(sycl::nd_range<1>(total, 256), deps,
-                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kWarp)]] {
+    return q.parallel_for(sycl::nd_range<1>(total, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kWarp)]] {
         const long long i = (long long) it.get_global_linear_id();
         if (i >= n) return;
         const sycl::sub_group sg = it.get_sub_group();
         const float xi = x[i];
         const float amax = warp_max(sg, sycl::fabs(xi));
         const float sum = warp_sum(sg, xi);
-        const float d = xe::q8_1_finite(amax / 127.0f);   // #606: finite blocks bit for bit
-        const int8_t qv = xe::q8_1_quant(xi, d, amax);
+        const float d = canon::q8_scale(amax);
         const long long ib = i / 32, iqs = i % 32;
-        y[ib].qs[iqs] = qv;
+        y[ib].qs[iqs] = canon::q8_value(xi, canon::q8_inv(d));
         if (iqs == 0) y[ib].ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
     });
 }
@@ -1680,7 +1824,38 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
     const long long n = (long long) n_rows * n_cols;
     if (n <= 0) return;
     require(n_cols % 32 == 0, "quantize_q8_1_rows");
-    sync_if_needed(stream, launch_quantize_q8_1(queue_for(stream), x, (block_q8_1*) y, n), "quantize_q8_1_rows");
+    // the experts' activations with canon_math.hpp's scale, one scale for each 256 values (stored in each of their
+    // eight q8_1 blocks) where the rows are whole 256s: the i-quants' calls of a 256-value block then share it, and a
+    // row's products add their integer sums before the scale (seg_dot_canon; the CPU's canon_expert.cpp quantizes
+    // its rows the same way).  A row of another width: a scale for each 32.  The sum of each 32 (the K-quants' min
+    // term) as before.
+    block_q8_1* Y = (block_q8_1*) y;
+    if (n_cols % 256 == 0) {
+        const long long n8 = n / 8;
+        const size_t total = (size_t) ((n8 + 255) / 256) * 256;
+        sync_if_needed(stream, queue_for(stream).parallel_for(sycl::nd_range<1>(total, 256),
+                              [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kWarp)]] {
+            const long long j = (long long) it.get_global_linear_id();   // values 8j .. 8j + 7
+            const bool in = j < n8;
+            const sycl::sub_group sg = it.get_sub_group();
+            float v[8], a = 0.0f, sum = 0.0f;
+            for (int q = 0; q < 8; ++q) {
+                v[q] = in ? x[8 * j + q] : 0.0f;
+                a = sycl::fmax(a, sycl::fabs(v[q]));
+                sum += v[q];
+            }
+            const float amax = sycl::reduce_over_group(sg, a, sycl::maximum<float>());   // 32 lanes: 256 values
+            sum += sycl::permute_group_by_xor(sg, sum, 1);
+            sum += sycl::permute_group_by_xor(sg, sum, 2);
+            if (!in) return;
+            const float d = canon::q8_scale(amax), id = canon::q8_inv(d);
+            const long long ib = j / 4, o = 8 * (j % 4);
+            for (int q = 0; q < 8; ++q) Y[ib].qs[o + q] = canon::q8_value(v[q], id);
+            if (o == 0) Y[ib].ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+        }), "quantize_q8_1_rows");
+        return;
+    }
+    sync_if_needed(stream, launch_quantize_q8_1_canon(queue_for(stream), x, Y, n), "quantize_q8_1_rows");
 }
 
 void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
@@ -1917,15 +2092,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     const long long nh = (long long) cap_entries * L.n_ff;
     if (v1) {
-        q.parallel_for(sycl::range<1>((size_t) nh), [=](sycl::id<1> i) {
-            const float g = gate[i];
-            // CUDA used __expf; the precise exponential keeps SwiGLU within the reference's float rounding.
-            h[i] = (g / (1.0f + sycl::exp(-g))) * up[i];
-        });
-        launch_quantize_q8_1(q, h, hq, nh);
+        q.parallel_for(sycl::range<1>((size_t) nh), [=](sycl::id<1> i) { h[i] = canon::silu_mul(gate[i], up[i]); });
+        launch_quantize_q8_1_canon(q, h, hq, nh);
     } else {
         // SwiGLU into q8_1 in one pass over [grp_start[0], grp_start[n]): the product rounded to FP32 on its own, as
-        // when it went through memory, then launch_quantize_q8_1's body (a sub-group is one block of one entry)
+        // when it went through memory, then launch_quantize_q8_1_canon's body (a sub-group is one block of one entry)
         const int64_t n_ff = L.n_ff;
         q.parallel_for(sycl::nd_range<1>((size_t) ((nh + 255) / 256) * 256, 256),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kWarp)]] {
@@ -1934,12 +2105,12 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             const long long e = i / n_ff;
             if (e < grp_start[0] || e >= grp_start[*n_groups]) return;
             const sycl::sub_group sg = it.get_sub_group();
-            const float g = gate[i];
-            const float xi = (g / (1.0f + sycl::exp(-g))) * up[i];
+            // the SwiGLU and the int8 scale of canon_math.hpp: the CPU's rows of the same expert are the same bits
+            const float xi = canon::silu_mul(gate[i], up[i]);
             const float amax = warp_max(sg, sycl::fabs(xi));
             const float sum = warp_sum(sg, xi);
-            const float d = xe::q8_1_finite(amax / 127.0f);   // #606, as launch_quantize_q8_1
-            const int8_t qv = xe::q8_1_quant(xi, d, amax);
+            const float d = canon::q8_scale(amax);
+            const int8_t qv = canon::q8_value(xi, canon::q8_inv(d));
             const long long ib = i / 32, iqs = i % 32;
             hq[ib].qs[iqs] = qv;
             if (iqs == 0) hq[ib].ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
