@@ -2291,6 +2291,7 @@ int main(int argc, char** argv) {
     std::set_terminate(report_and_end);   // issue #10: an exception that leaves the engine is reported, not lost
     install_fatal_signals();               // issue #12: and a crash says what it was and where
     strata::core::restrict_hip_to_selector();   // before the HIP runtime reads HIP_VISIBLE_DEVICES
+    strata::core::no_hip_resource_cache();      // and its other variables
     route_stop_signals();
     strata::core::progress_at("starting: reading the options and opening the GPUs");
     // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is

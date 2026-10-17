@@ -30,6 +30,7 @@
 // (its kernels built and the library's first products set up; skipped when the GPU has no room) and lets its buffers
 // go, then says READY budget_mib=<M>.
 
+#include "strata/core/device.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/image/qi_image_io.hpp"
 #include "strata/image/qi_pipeline.hpp"
@@ -232,6 +233,8 @@ int serve(si::QiPipeline& p) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    strata::core::restrict_hip_to_selector();   // before the HIP runtime starts, as the text engine does
+    strata::core::no_hip_resource_cache();
     try {
         std::string dit, vae, text, vision, out, ids;
         std::vector<std::string> ref_paths;

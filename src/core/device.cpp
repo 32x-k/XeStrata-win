@@ -602,6 +602,17 @@ void restrict_hip_to_selector() {
 #endif
 }
 
+void no_hip_resource_cache() {
+#if defined(_WIN32)
+    // The image engine let go of everything and HIP still counted about 4 GiB of the R9700 as used (2026-10-17):
+    // the text engine loaded beside it sized its expert cache that much smaller.  With the cache at 0 it went back
+    // to 0.5 GiB, and an image took as long.
+    if (std::getenv("GPU_RESOURCE_CACHE_SIZE") != nullptr) return;
+    ::_putenv_s("GPU_RESOURCE_CACHE_SIZE", "0");
+    ::SetEnvironmentVariableA("GPU_RESOURCE_CACHE_SIZE", "0");
+#endif
+}
+
 int hip_gpus_seen() {
     if (const char* v = std::getenv("HIP_VISIBLE_DEVICES"); v != nullptr) {
         int n = 0;

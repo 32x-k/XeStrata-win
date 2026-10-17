@@ -53,6 +53,10 @@ uint64_t max_alloc_bytes();
 /// SYCL.  Before the runtime starts (main): a selector naming HIP GPUs by number ("hip:N", "hip:N,M") with
 /// HIP_VISIBLE_DEVICES unset becomes HIP_VISIBLE_DEVICES=N[,M] and "hip:*".  Windows only.
 void restrict_hip_to_selector();
+/// Windows' HIP runtime keeps freed device memory in a cache of its own (GPU_RESOURCE_CACHE_SIZE), which another
+/// process cannot have: before the runtime starts (main), the cache is set to nothing unless the variable is set.
+/// Windows only.
+void no_hip_resource_cache();
 /// The GPUs this process's HIP runtime sees: HIP_VISIBLE_DEVICES's entries when it is set, else SYCL's HIP GPUs when
 /// no ONEAPI_DEVICE_SELECTOR narrows them; -1 when that is not known.
 int hip_gpus_seen();
