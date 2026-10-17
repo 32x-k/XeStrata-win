@@ -49,6 +49,8 @@ Those that do not fit are read from the files on every prefill.
 Conversation parking (`--conversation-cache-mib`, `--conversation-save`) copies every GPU's session out and back.
 A saved file is read only by an engine with the same split points; `--layer-split auto` can choose others from what it measures, and then the earlier files are not read.
 
+A prefill chunk's rows go on to the next GPU in eight pieces (upstream 1d9758f8, opt-in there): the next GPU starts copying a piece in once it is in RAM, so the two GPUs' PCIe copies overlap, and it reads its chunks on one thread started once. `STRATA_HANDOFF_PIPE=P` (2 to 16) sets the pieces; `STRATA_HANDOFF_PIPE=0` goes back to one copy.
+
 ## GPU numbers
 
 The engine numbers the GPUs it can drive from 0.

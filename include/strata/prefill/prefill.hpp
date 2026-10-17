@@ -26,6 +26,7 @@
 #include <string>
 
 namespace strata::kernels::cpu { class ExpertPool; }
+namespace strata::gpu { struct Event; }
 
 namespace strata::prefill {
 
@@ -66,19 +67,36 @@ public:
     virtual bool chunk(const float* rows, const int64_t* tokens, int64_t T, int64_t p0, std::string& err) = 0;
     /// Waits for the last chunk the next stage was given (none: true); false with `err` when it failed.
     virtual bool wait(std::string& err) = 0;
+    /// STRATA_HANDOFF_PIPE: `chunk`, with `rows` still landing in `pieces` row pieces (handoff_piece), piece i done
+    /// when `landed[i]` is (events of this stage's device).  A link that cannot start on part of the rows waits for
+    /// them all here.
+    virtual bool chunk_pieces(const float* rows, gpu::Event* const* landed, int pieces, const int64_t* tokens,
+                              int64_t T, int64_t p0, std::string& err);
 };
+
+/// STRATA_HANDOFF_PIPE: rows [r0, r0 + nr) of piece i of a T-row chunk in P pieces (both sides of a hand-off).
+void handoff_piece(int64_t T, int P, int i, int64_t& r0, int64_t& nr);
 
 /// The next stage in this process: its `run` on a thread, so it reads chunk c while this stage reads chunk c + 1.
 class InProcessPrefill final : public PrefillLink {
 public:
+    InProcessPrefill();
+    ~InProcessPrefill() override;
+    InProcessPrefill(const InProcessPrefill&) = delete;
+    InProcessPrefill& operator=(const InProcessPrefill&) = delete;
     void bind(Prefill* next) { next_ = next; }
     bool chunk(const float* rows, const int64_t* tokens, int64_t T, int64_t p0, std::string& err) override;
     bool wait(std::string& err) override;
+    bool chunk_pieces(const float* rows, gpu::Event* const* landed, int pieces, const int64_t* tokens, int64_t T,
+                      int64_t p0, std::string& err) override;
 
 private:
+    bool start(const int64_t* tokens, int64_t T, int64_t p0);
     Prefill* next_ = nullptr;
     std::future<bool> run_;
     std::string err_;
+    struct Worker;
+    std::unique_ptr<Worker> worker_;   ///< STRATA_HANDOFF_PIPE: the next stage's chunks' thread (started once)
 };
 
 class Prefill {
@@ -189,13 +207,20 @@ public:
     }
     /// The previous stage in this process hands the rows of the chunk this stage reads next (pinned host memory,
     /// T x hc*n_embd floats, untouched until that chunk is read).  InProcessPrefill::chunk.
-    void accept_rows(const float* rows) { hand_in_ = rows; }
+    /// STRATA_HANDOFF_PIPE: `landed` (`pieces` events of the previous stage's device) say when each row piece is in.
+    void accept_rows(const float* rows, gpu::Event* const* landed = nullptr, int pieces = 0) {
+        hand_in_ = rows;
+        hand_ev_ = landed;
+        hand_pieces_ = pieces;
+    }
 
 private:
     int64_t stage_lb_ = 0, stage_le_ = -1;
     PrefillLink* next_ = nullptr;       ///< set_stage: the next stage, through this link only
     InProcessPrefill local_next_;
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+    gpu::Event* const* hand_ev_ = nullptr;   ///< STRATA_HANDOFF_PIPE: when each piece of them has landed (or null)
+    int hand_pieces_ = 0;
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;

@@ -49,6 +49,8 @@ setup は最初の GPU を `"gpu_pci"` に、後の GPU を `"split_pci"` に PC
 会話の退避（`--conversation-cache-mib`、`--conversation-save`）は、各 GPU のセッションを写して戻します。
 保存したファイルは同じ分割点のエンジンだけが読みます。`--layer-split auto` は測った値で分割点が変わることがあり、そのときは前のファイルを読みません。
 
+prefill のチャンクの行は、8 つに分けて次の GPU に渡します（upstream 1d9758f8。upstream では opt-in）。分けた 1 つが RAM に着いたところで次の GPU が取り込み始めるので、2 枚の PCIe の転送が重なります。次の GPU のチャンクは、一度だけ立てたスレッドで読みます。`STRATA_HANDOFF_PIPE=P`（2〜16）で分ける数を、`STRATA_HANDOFF_PIPE=0` で前の 1 回の転送に戻します。
+
 ## GPU の番号
 
 エンジンが使える GPU に、0 から番号を付けます。

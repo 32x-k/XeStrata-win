@@ -51,6 +51,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -455,6 +456,35 @@ struct PinnedUpload {
     }
 };
 
+// STRATA_HANDOFF_PIPE=P (2..16, default 8; 0/1 = the one copy; upstream 1d9758f8, opt-in there): a layer split hands a
+// chunk's rows on in P row pieces.  The stage records an event when its chunk's work is done and one after each piece's copy
+// into the pinned hand-off buffer, waits on the host only for the first (what on_stage_chunk's checkpoint parts and the
+// error check need), and starts the next stage at once: its thread queues piece i's upload once piece i has landed, so
+// the uploads overlap the remaining downloads (each GPU's own link).  The wait is the host's, not a queue's: the two
+// stages can be GPUs of two backends.  The same bytes land in the same rows before the next stage's first kernel:
+// exact.  No device memory; the events and the existing two pinned buffers per stage only.  B70 + RTX 4070, IQ3_XXS,
+// serve 32K, --layer-split 24: prompt 1,866 -> 1,868 tok/s, decode 75.8 -> 76.0 (equal), the same answers.
+static constexpr int kHandPiecesMax = 16;
+static int handoff_pipe_pieces() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_HANDOFF_PIPE");
+        const int p = e ? (int) std::strtol(e, nullptr, 10) : 8;
+        return p >= 2 ? std::min(p, kHandPiecesMax) : 0;
+    }();
+    return v;
+}
+// STRATA_HANDOFF_PIPE: the next stage's chunks run on one thread of the link's own, started once (std::async starts a
+// thread per chunk: ~1 ms from the hand-off to the next stage's first call, upstream's nsys on CUDA).  The futures are
+// the same (run's result, or what it threw), so the chain's waits do not change.  STRATA_HANDOFF_PIPE_WORKER=0: a
+// thread per chunk again, for an A/B of the two halves.
+static bool handoff_pipe_worker() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_HANDOFF_PIPE_WORKER");
+        return !e || std::strtol(e, nullptr, 10) != 0;
+    }();
+    return handoff_pipe_pieces() > 0 && v;
+}
+
 struct Prefill::Impl {
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
@@ -566,6 +596,10 @@ struct Prefill::Impl {
     // LAYER SPLIT, same process only: allocated in this stage's context, the next stage reads them where they are
     int device = -1;
     float* hand[2] = {};
+    // STRATA_HANDOFF_PIPE: per hand-off buffer, "the chunk's work is done" and one "landed" event per piece
+    int hand_pieces = 0;
+    strata::gpu::Event* hand_done[2] = {};
+    strata::gpu::Event* hand_ev[2][kHandPiecesMax] = {};
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
@@ -763,6 +797,9 @@ void Prefill::release() {
     for (int b = 0; b < 2; ++b) {
         if (impl_->mgrp_used[b]) strata::gpu::event_destroy(impl_->mgrp_used[b]);
         if (impl_->hand[b]) strata::gpu::free(impl_->hand[b]);
+        if (impl_->hand_done[b]) strata::gpu::event_destroy(impl_->hand_done[b]);
+        for (strata::gpu::Event* e : impl_->hand_ev[b])
+            if (e) strata::gpu::event_destroy(e);
         if (impl_->ple_copied[b]) strata::gpu::event_destroy(impl_->ple_copied[b]);
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) strata::gpu::free(impl_->ple_emb_host[b]);
     }
@@ -1056,6 +1093,16 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             err = "prefill: the layer split's hand-off buffers";
             return false;
         }
+    if (next_ != nullptr && handoff_pipe_pieces() > 0 && m.hand_pieces == 0) {   // events only: no device memory
+        bool ok = true;
+        auto make = [](strata::gpu::Event*& e) { return e != nullptr || strata::gpu::event_create(&e); };
+        for (int b = 0; b < 2; ++b) {   // (a retry after a failed init keeps the events it made)
+            ok = ok && make(m.hand_done[b]);
+            for (int i = 0; ok && i < handoff_pipe_pieces(); ++i) ok = make(m.hand_ev[b][i]);
+        }
+        if (!ok) { err = "prefill: the layer split's hand-off events (STRATA_HANDOFF_PIPE)"; return false; }
+        m.hand_pieces = handoff_pipe_pieces();
+    }
     if (m.tok_dev == nullptr) {
         if (!strata::gpu::alloc_device((void**) &m.tok_dev, (size_t) chunk * sizeof(int32_t))) {
             err = "prefill: the token id buffer";
@@ -1665,7 +1712,27 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         const auto tsetup = Clock::now();
         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
         // previous stage handed on
-        if (hand_in_ != nullptr) {
+        if (hand_in_ != nullptr && hand_ev_ != nullptr) {
+            // STRATA_HANDOFF_PIPE: each piece's upload is queued once its download on the stage before has landed.
+            // The stage before split the chunk it handed on (n rows); one chunk here is all of it, otherwise (a
+            // smaller chunk here) every piece is waited for before the one copy.
+            const bool whole = c0 == 0 && T == n;
+            bool ok = true;
+            for (int i = 0; ok && i < hand_pieces_; ++i) {
+                int64_t r0 = 0, nr = 0;
+                handoff_piece(n, hand_pieces_, i, r0, nr);
+                ok = strata::gpu::event_sync(hand_ev_[i]);
+                if (ok && whole && nr > 0)
+                    ok = strata::gpu::copy_async(m.R + (size_t) r0 * D, hand_in_ + (size_t) r0 * D, (size_t) nr * D * 4,
+                                                 m.cs);
+            }
+            if (ok && !whole) ok = strata::gpu::copy_async(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, m.cs);
+            if (!ok) {
+                err = std::string("prefill: the layer split's hand-off upload failed (STRATA_HANDOFF_PIPE): ") +
+                      strata::gpu::last_error();
+                return false;
+            }
+        } else if (hand_in_ != nullptr) {
             if (!strata::gpu::copy_async(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, m.cs)) {
                 err = "prefill: the layer split's hand-off upload failed";
                 return false;
@@ -3098,14 +3165,34 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         if (next_ != nullptr) {
             // the rows to the host buffer the next stage read two chunks ago (it has finished: waited below)
             float* h = m.hand[hand_buf];
-            if (!strata::gpu::copy_async(h, m.R, (size_t) T * D * 4, m.cs) ||
-                !strata::gpu::stream_sync(m.cs)) {
+            const int hp = m.hand_pieces;
+            if (hp > 0) {
+                // STRATA_HANDOFF_PIPE: the pieces' downloads stay queued; the host waits for the chunk's work only (the
+                // state on_stage_chunk saves, the error check), the next stage's uploads for the pieces' events
+                bool ok = strata::gpu::event_record(m.hand_done[hand_buf], m.cs);
+                for (int i = 0; ok && i < hp; ++i) {
+                    int64_t r0 = 0, nr = 0;
+                    handoff_piece(T, hp, i, r0, nr);
+                    if (nr > 0)
+                        ok = strata::gpu::copy_async(h + (size_t) r0 * D, m.R + (size_t) r0 * D, (size_t) nr * D * 4,
+                                                     m.cs);
+                    ok = ok && strata::gpu::event_record(m.hand_ev[hand_buf][i], m.cs);
+                }
+                if (!ok || !strata::gpu::event_sync(m.hand_done[hand_buf])) {
+                    err = std::string("prefill: the layer split's hand-off: ") + strata::gpu::last_error();
+                    return false;
+                }
+            } else if (!strata::gpu::copy_async(h, m.R, (size_t) T * D * 4, m.cs) ||
+                       !strata::gpu::stream_sync(m.cs)) {
                 err = std::string("prefill: the layer split's hand-off: ") + strata::gpu::last_error();
                 return false;
             }
             // this stage's state is at the chunk's end now (synced) and moves on with the next chunk below
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
-            if (!next_->wait(err) || !next_->chunk(h, tokens + c0, T, p0, err)) return false;
+            if (!next_->wait(err)) return false;
+            if (hp > 0 ? !next_->chunk_pieces(h, m.hand_ev[hand_buf], hp, tokens + c0, T, p0, err)
+                       : !next_->chunk(h, tokens + c0, T, p0, err))
+                return false;
             hand_buf ^= 1;
             continue;   // the last stage reports the chunk (on_chunk)
         }
@@ -3220,11 +3307,91 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
 
 // ---- the next stage in this process (PrefillLink)
 
+void handoff_piece(int64_t T, int P, int i, int64_t& r0, int64_t& nr) {
+    const int64_t per = (T + P - 1) / P;
+    r0 = std::min<int64_t>(T, (int64_t) i * per);
+    nr = std::min<int64_t>(T, r0 + per) - r0;
+}
+
+bool PrefillLink::chunk_pieces(const float* rows, gpu::Event* const* landed, int pieces, const int64_t* tokens,
+                               int64_t T, int64_t p0, std::string& err) {
+    for (int i = 0; i < pieces; ++i)
+        if (!strata::gpu::event_sync(landed[i])) {
+            err = std::string("prefill: the layer split's hand-off: ") + strata::gpu::last_error();
+            return false;
+        }
+    return chunk(rows, tokens, T, p0, err);
+}
+
+// STRATA_HANDOFF_PIPE: one thread that runs the jobs in turn
+struct InProcessPrefill::Worker {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::packaged_task<bool()>> jobs;
+    bool stop = false;
+    std::thread th;
+    Worker() {
+        th = std::thread([this] {
+            strata::aux_cpus::pin_current_thread();
+            for (;;) {
+                std::packaged_task<bool()> job;
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv.wait(lk, [this] { return stop || !jobs.empty(); });
+                    if (jobs.empty()) return;   // stopped, and every job taken has run (no broken promise)
+                    job = std::move(jobs.front());
+                    jobs.pop_front();
+                }
+                job();
+            }
+        });
+    }
+    std::future<bool> submit(std::packaged_task<bool()> job) {
+        std::future<bool> f = job.get_future();
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            jobs.push_back(std::move(job));
+        }
+        cv.notify_one();
+        return f;
+    }
+    ~Worker() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            stop = true;
+        }
+        cv.notify_one();
+        if (th.joinable()) th.join();
+    }
+};
+
+InProcessPrefill::InProcessPrefill() = default;
+
+InProcessPrefill::~InProcessPrefill() {
+    if (run_.valid()) run_.wait();   // the chain's last chunk, before the thread that would run the next one goes
+}
+
+bool InProcessPrefill::start(const int64_t* tokens, int64_t T, int64_t p0) {
+    if (handoff_pipe_worker()) {
+        if (!worker_) worker_ = std::make_unique<Worker>();
+        run_ = worker_->submit(
+            std::packaged_task<bool()>([this, tokens, T, p0] { return next_->run(tokens, T, p0, err_); }));
+    } else
+        run_ = std::async(std::launch::async, [this, tokens, T, p0] { return next_->run(tokens, T, p0, err_); });
+    return true;
+}
+
 bool InProcessPrefill::chunk(const float* rows, const int64_t* tokens, int64_t T, int64_t p0, std::string& err) {
     (void) err;
     next_->accept_rows(rows);
-    run_ = std::async(std::launch::async, [this, tokens, T, p0] { return next_->run(tokens, T, p0, err_); });
-    return true;
+    return start(tokens, T, p0);
+}
+
+bool InProcessPrefill::chunk_pieces(const float* rows, gpu::Event* const* landed, int pieces, const int64_t* tokens,
+                                    int64_t T, int64_t p0, std::string& err) {
+    (void) err;
+    next_->accept_rows(rows, landed, pieces);
+    return start(tokens, T, p0);
 }
 
 bool InProcessPrefill::wait(std::string& err) {
