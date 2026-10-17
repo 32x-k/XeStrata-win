@@ -2439,6 +2439,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const size_t nf = order.size();
                     for (int32_t e = 0; e < m.g->n_expert; ++e)
                         if (m.cnt[(size_t) e] > 0 && gpu_side(e) && !fusable(e)) order.push_back(e);
+                    // upstream 62fc7c8a (STRATA_MMQ_GROUP_SORT): an MMQ group's launch covers its largest expert's
+                    // rows (max_rows), so a layer whose GPU experts are all resident takes them in falling row count:
+                    // the groups' padding shrinks.  XeStrata's int8 products give each row the same bits whatever its
+                    // group-mates (no stream-k split), so the order changes no answer.  The streamed walk reads its
+                    // entries in id order: only a layer with nothing streamed.  STRATA_MMQ_GROUP_SORT=0: id order.
+                    static const bool group_sort = [] {
+                        const char* v = std::getenv("STRATA_MMQ_GROUP_SORT");
+                        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+                    }();
+                    if (group_sort && use_mmq && nf == 0 && m.host_res && m.cache && order.size() > (size_t) MMQ_GROUP &&
+                        std::all_of(order.begin(), order.end(), [&](int32_t e) {
+                            return m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                        }))
+                        std::stable_sort(order.begin(), order.end(),
+                                         [&](int32_t a, int32_t b) { return m.cnt[(size_t) a] > m.cnt[(size_t) b]; });
                     {
                         int32_t at = 0;
                         for (const int32_t e : order) { m.off[(size_t) e] = at; at += m.cnt[(size_t) e]; }
