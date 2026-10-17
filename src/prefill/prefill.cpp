@@ -868,18 +868,21 @@ int mmq_env() {
 bool mmq_wanted() { return mmq::chosen() && mmq_env() != 0; }
 
 // From how many rows an expert the FP16 path beats the int8 products on this GPU, timed once at the start on 8 experts
-// of the model's first int8 layer (its types and shape, synthetic blocks: any bits time alike) at 16 to 256 rows an
-// expert, in the calls a chunk makes: the int8 products from the blocks, against the experts dequantized to FP16 and
+// of the model's first int8 layer (its types and shape, synthetic blocks: any bits time alike) at 16 to 1024 rows an
+// expert (256 where the device cannot hold the larger buffers), in the calls a chunk makes: the int8 products from the blocks, against the experts dequantized to FP16 and
 // their grouped products.  The geometric middle of the last row count int8 won and the first it lost; INT64_MAX where
 // it won at every count, 0 where it lost at 16.  The int8 products were a fixed choice before (FP16 where Intel's XMX
 // take it): B70, Qwen3.8 IQ3_XXS, the int8 form 1K 923 -> 1074 tok/s, 4K 1594 -> 1604, 32K 2526 -> 2075.  Where the
-// timing cannot run, that fixed choice.
+// timing cannot run, that fixed choice.  The int8 time grows with the rows and the FP16 one hardly does, so a type whose
+// int8 products are cheap crosses later: B70, IQ3_S's IQ4_XS and UD-Q4_K_XL's K-quants still won at 256 rows
+// (487/609, 592/669 us), and a 32K chunk, about 600 rows an expert, ran its int8 products: 32K prompt 2,318 -> 1,896
+// and 2,125 -> 1,721 tok/s.
 int64_t int8_rows_below(const strata::kernels::cpu::NativeFmt& f, size_t blob) {
     namespace k = strata::kernels;
     const int64_t fixed = k::xmx_available(k::XmxType::f16) ? 0 : INT64_MAX;
     constexpr int G = 8;
-    constexpr int64_t RS[] = {16, 32, 64, 128, 256};
-    const int64_t FF = f.n_ff, NE = f.n_embd, RMAX = (int64_t) 256 * G;
+    constexpr int64_t RS[] = {16, 32, 64, 128, 256, 512, 1024};
+    const int64_t FF = f.n_ff, NE = f.n_embd;
     std::vector<void*> owned;
     struct FreeAll {
         std::vector<void*>& o;
@@ -890,6 +893,13 @@ int64_t int8_rows_below(const strata::kernels::cpu::NativeFmt& f, size_t blob) {
         if (p != nullptr) owned.push_back(p);
         return p;
     };
+    // the row buffers for the most rows timed: 1024 an expert, else 256 (a device short of memory)
+    int64_t r_top = 1024;
+    if (void* probe = strata::gpu::alloc_device((size_t) r_top * G * (NE * 10 + FF * 13 + 4) + mmq::q8_bytes(r_top * G, NE) * 2))
+        strata::gpu::free(probe);
+    else
+        r_top = 256;
+    const int64_t RMAX = r_top * G;
     auto* w = static_cast<uint8_t*>(dev((size_t) G * blob));
     auto* dq_gu = static_cast<uint16_t*>(dev((size_t) G * 2 * FF * NE * 2));
     auto* dq_d = static_cast<uint16_t*>(dev((size_t) G * NE * FF * 2));
@@ -939,6 +949,7 @@ int64_t int8_rows_below(const strata::kernels::cpu::NativeFmt& f, size_t blob) {
         int64_t won = 0;
         std::string said;
         for (const int64_t r : RS) {
+            if (r > r_top) break;
             std::vector<int32_t> hb(G + 1);
             for (int e = 0; e <= G; ++e) hb[(size_t) e] = (int32_t) (e * r);
             if (!strata::gpu::copy(bounds, hb.data(), hb.size() * 4)) return give_up("its row bounds could not be set");
