@@ -81,6 +81,7 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
 /// Experts [first, n) of a group, each a GGUF-native blob (gate rows at its start, up at `up_off`, down at
 /// `down_off`), into their slots of the group buffers (slot q at gu_dst + q * gu_stride and d_dst + q * d_stride), in
 /// one launch.  False, and nothing done, when an address or a size is not a multiple of 16 bytes (gather_native then).
+/// A null blob is skipped (an expert the products read in place).
 constexpr int kGatherGroupMax = 16;
 struct GatherGroup {
     const uint8_t* blob[kGatherGroupMax] = {};

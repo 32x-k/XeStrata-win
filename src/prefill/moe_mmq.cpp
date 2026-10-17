@@ -112,6 +112,7 @@ bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_byt
         const u32x4* src = nullptr;
         for (int k = 0; k < kGatherGroupMax; ++k)
             if (k == q) src = blobs.p[k];
+        if (src == nullptr) return;   // an expert the products read where it is (no copy)
         u32x4* ab = gu + q * gs;
         u32x4* cd = dd + q * ds;
         const int64_t step = (int64_t) it.get_global_range(1);
