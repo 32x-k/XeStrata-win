@@ -120,15 +120,15 @@ The full steps are in [docs/DEVTOOLS.md](docs/DEVTOOLS.md), under "Windows (AMD 
 Measured on 2026-10-14 on a PC with a Radeon AI PRO R9700, a Ryzen AI 9 HX 370, 28 GB of RAM and Windows 11.
 The model is Qwen3.8-Flash-Next's Q2_0 and the arguments are those above (4 tokens of speculative decoding with MTP).
 The comparison is the HIP build of Strata v0.1.43.1, XeStrata's upstream, on the same PC with the same model and prompts and Strata's default arguments.
-Values are tok/s; those measured twice are averages.
+Values measured twice are averages.
 
 | Prompt | Output | decode (this branch) | decode (Strata) | prefill (this branch) | prefill (Strata) |
 | --- | --- | --- | --- | --- | --- |
-| 50 tokens | 300 | 96 | 107 | 125 | 46 |
-| 190 tokens | 128 | 90 | 92 | 228 | 101 |
-| 2,301 tokens | 200 | 103 | 107 | 522 | 499 |
-| 18,801 tokens | 200 | 101 | 107 | 976 | 948 |
-| 40 tokens | 2,000 | 84 | 96 | 99 | 37 |
+| 50 tokens | 300 tokens | 96 tok/s | 107 tok/s | 125 tok/s | 46 tok/s |
+| 190 tokens | 128 tokens | 90 tok/s | 92 tok/s | 228 tok/s | 101 tok/s |
+| 2,301 tokens | 200 tokens | 103 tok/s | 107 tok/s | 522 tok/s | 499 tok/s |
+| 18,801 tokens | 200 tokens | 101 tok/s | 107 tok/s | 976 tok/s | 948 tok/s |
+| 40 tokens | 2,000 tokens | 84 tok/s | 96 tok/s | 99 tok/s | 37 tok/s |
 
 Sent 20 questions in a row, `--serve` answered all 20, at 93 tok/s overall (Strata: 95 tok/s).
 
