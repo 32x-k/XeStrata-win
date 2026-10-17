@@ -992,6 +992,7 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
   Ornith and llm-jp are not in the table and decode greedy as before.
   The order of precedence: the request, the web page's shared Chat settings, the config's `sampling` block, the card.
   Greedy is only for who asks for it: `temperature: 0` in the request, or `"sampling": {"temperature": 0}` in the config.
+  The web page sends no sampling of its own until you change its Sampling settings (it showed and sent 0.6 before); an old stored 0.6 with the default top_p and top_k counts as not set.
 - The penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`) ride the same path.
   `penalty_last_n` caps how many recent tokens they count over, 64 by default when any penalty is set.
   llama.cpp's names `repeat_penalty` and `repeat_last_n` work too, in the config's `sampling` block and in a request (upstream #1819).
