@@ -419,6 +419,11 @@ The records above were taken before that and compare tokens only.
 Where the draft modes differ, there are two causes:
 
 - The MTP runs had fewer cached experts (the drafter takes VRAM), so some experts ran on the CPU instead of the GPU.
+  From 2026-10-17 the CPU and the GPU (Intel, NVIDIA, AMD) compute the experts' i-quant (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S) gate and up rows and IQ4_NL and Q2_0 down rows alike, and an expert gives the same bits on either (`canon_math.hpp`, `canon_expert.cpp`).
+  The SwiGLU and the int8 scale are built from additions, multiplications and fmas only, the gate/up activations take one scale for each 256 values, and the integer sums of what shares a scale add first, then go into the GPU's lanes with fmas in the GPU's order.
+  The answer stays the same when the window, the PCIe split or the tier changes move an expert between the CPU and the GPU.
+  K-quant and BF16 experts (Unsloth's files, Ornith, llm-jp) are not covered.
+  `STRATA_CANON=0` takes the CPU's former kernels (for comparisons; the GPU's stay, so the CPU's and the GPU's results then differ).
 - On Qwen IQ3_XXS, the suffix run differed from the no-draft run even with the same cache.
   The CPU took its multi-token expert kernels (i-quant gate/up and IQ4_NL down) from two tokens on and ggml's single-token dot for one, so a token's rows were summed in another order alone than in a window.
   From 2026-10-16 the CPU computes these and Q4_K, Q5_K and Q6_K with the multi-token kernels from one token on, and Q2_K, Q3_K and Q8_0 with ggml's dot at every token count. A token's rows are the same alone and in a window, and with the same cache the draft modes give bit-identical logits (the GPU side of a multi-token window added no difference before either).
@@ -520,8 +525,9 @@ The name describes the quantization budget of a mixed-precision model.
 | PLE n-gram table, second shard | IQ4_NL | Integer n-gram hash, selected row reads/decode; existing PLE vectors and actual table rows |
 
 The native expert oracle in `src/kernels/native_expert_parity.cpp` uses ggml dequantization and host FP64 dot products before comparing the CPU and GPU paths.
+On the layers of the i-quant gate/up and IQ4_NL or Q2_0 down rows above, it also checks that the CPU's rows and the GPU's are the same bits, the tokens at once and one at a time.
 Its per-expert relative L1 bound of `3e-2` belongs to that comparison and is not a universal kernel tolerance.
-The GPU's q8_1 activation contract and the CPU's ggml `vec_dot_type` stay explicit.
+The GPU's q8_1 activation contract and the CPU's activations (`canon_expert.cpp`'s form for the experts' i-quant gate/up and IQ4_NL and Q2_0 down rows, ggml's `vec_dot_type` for the others) stay explicit.
 
 ## Validation inventory
 
