@@ -232,6 +232,7 @@ The Q8_0 read that also writes the next projections' q8_1, 32 columns a work-gro
 IQ3_XXS's 32K decode: B70 +3.5%, RTX 4070 the same (prefill +1%), RX 9060 XT +0.6% (there with the q8_1 written in the read).
 The engine reads the experts from the GGUF files in place.
 It keeps a RAM budget of them, the most-used first after the ones the GPU holds (`--resident-budget-gib N`).
+When the budget has room left, the slots the prompt path borrows keep their experts in RAM too (the engine prints `the prompt path's lend region: N of its M slots keep their experts in RAM too`; upstream f2e142f4, #1683); before, a budget always left them out, and every prompt read the lent slots' experts from the files again.
 setup chooses the RAM less 24 GB for N, less the KV cache too when that lives in RAM:
 36 GiB on a 64 GB PC with a 128K context.
 The rest come from the SSD while it answers.

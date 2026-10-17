@@ -222,6 +222,7 @@ Q8_0 の読みが 32 列ずつで次の射影のための q8_1 まで書く形�
 IQ3_XXS の 32K の decode は、B70 で +3.5%、RTX 4070 で同等（prefill +1%）、RX 9060 XT で +0.6% でした（RX 9060 XT は q8_1 も読みの中で書く形）。
 エンジンは、エキスパートを GGUF のファイルからそのまま読みます。
 GPU が持つもの以外のうち、よく使うものから順に、RAM の予算の分だけを RAM に置きます（`--resident-budget-gib N`）。
+予算に余りがあれば、prompt の経路が借りる枠のエキスパートも RAM に置きます（エンジンは `the prompt path's lend region: N of its M slots keep their experts in RAM too` と出します。upstream f2e142f4、#1683）。前は予算があるといつも外していたので、どの prompt も借りた枠のエキスパートをファイルから読み直していました。
 setup が選ぶ N は、RAM から 24 GB を引いた値で、KV キャッシュを RAM に置くときはさらにその分を引きます。
 文脈 128K の RAM 64 GB の PC では 36 GiB です。
 残りは、答えている間に SSD から読みます。
