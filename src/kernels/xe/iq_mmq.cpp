@@ -1301,6 +1301,45 @@ sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, 
     });
 }
 
+sycl::event iq_mmq_quantize_scatter(sycl::queue& q, const float* x, const int32_t* slot, void* xq, int64_t cols,
+                                    int64_t ld, int64_t tokens, int k_used, bool sums, bool dup) {
+    // as iq_mmq_quantize, with the rows reached from the token: the block of token t goes to its k_used rows
+    const int64_t oc = dup ? 2 * cols : cols, rep = dup ? 2 : 1, rows = tokens * k_used;
+    auto* x8 = static_cast<int8_t*>(xq);
+    auto* xs = reinterpret_cast<float*>(x8 + rows * oc);
+    const int64_t nb = cols / 32, onb = oc / 32;
+    float* xu = xs + rows * onb;
+    return q.parallel_for(sycl::range<1>((size_t) (tokens * nb)), [=](sycl::id<1> i) {
+        const int64_t t = (int64_t) i[0] / nb, b = (int64_t) i[0] % nb;
+        const float* xr = x + t * ld + b * 32;
+        float v[32], amax = 0.0f;
+        for (int j = 0; j < 32; ++j) { v[j] = xr[j]; amax = sycl::fmax(amax, sycl::fabs(v[j])); }
+        const float d = amax / 127.0f, id = amax > 0.0f ? 1.0f / d : 0.0f;
+        uint32_t p[8];
+        int sum = 0;
+        for (int j = 0; j < 8; ++j) {
+            uint32_t u = 0;
+            for (int k = 0; k < 4; ++k) {
+                const int qv = (int) sycl::round(v[4 * j + k] * id);
+                sum += qv;
+                u |= (uint32_t) (uint8_t) (int8_t) qv << (8 * k);
+            }
+            p[j] = u;
+        }
+        for (int k = 0; k < k_used; ++k) {
+            const int64_t r = slot[t * k_used + k];
+            for (int64_t c = 0; c < rep; ++c) {
+                const int64_t ob = b * rep + c;
+                u32x4* o = reinterpret_cast<u32x4*>(x8 + r * oc + ob * 32);
+                o[0] = u32x4{p[0], p[1], p[2], p[3]};
+                o[1] = u32x4{p[4], p[5], p[6], p[7]};
+                xs[r * onb + ob] = d;
+                if (sums) xu[r * onb + ob] = d * (float) sum;
+            }
+        }
+    });
+}
+
 sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_bytes, int64_t w_rows, int64_t w_cols,
                            int n, const void* xq, int64_t total_rows, const int32_t* bounds, int64_t max_rows,
                            const int32_t* ids, float* dst, int64_t ld_dst, const uint8_t* const* wtab, size_t woff,
