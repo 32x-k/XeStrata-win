@@ -6518,6 +6518,10 @@ int main(int argc, char** argv) {
                 const uint64_t cached = (uint64_t) std::max<int64_t>(0, (int64_t) xcache.bytes());
                 pin = (lay.total > cached ? lay.total - cached : 0) +
                       (uint64_t) std::max<int64_t>(0, lend_slots(8192)) * lay.max_blob;
+                // a copy already made is out of `available` (the plain-file path pins it before the chunk is chosen):
+                // counted again, it refused the bigger chunks once the budget's lend region (#1683) grew it (B70,
+                // UD-Q4_K_XL, --resident-budget-gib 99: 32K prompt 2,125 -> 1,760 tok/s, read in 8192-token chunks)
+                if (src.complement_ready()) pin = pin > src.resident_bytes() ? pin - src.resident_bytes() : 0;
             }
             if (hm.available >= pin + extra + (6ull << 30)) return true;
             std::fprintf(stderr, "strata generate: prompt chunks of %lld tokens not taken: they would hold %llu MiB more "
