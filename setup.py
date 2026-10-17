@@ -1610,6 +1610,10 @@ def check_shards(shards):
             fail(f"{s.name} is not a whole GGUF shard ({e})", "delete it and run setup again")
         need = g.data_start + max((t.offset + (t.expected_bytes() or 0) for t in g.tensors), default=0)
         have = s.stat().st_size
+        if not g.tensors:
+            # #2346: a metadata-only shard (Unsloth's UD-Q5_K_XL 00001, 10,946,618 bytes) ends at its header: the
+            # alignment padding before an empty data section is not in the file, so data_start can be past its end
+            need = min(need, have)
         if have < need:
             fail(f"{s.name} is short: {have:,} of {need:,} bytes ({need - have:,} missing)",
                  "delete it and run setup again (or copy the whole file into --gguf-dir)")
