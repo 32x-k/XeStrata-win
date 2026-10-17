@@ -987,7 +987,11 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
 - The run config's optional `sampling` block sets the defaults for requests that leave the fields out
   (`"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}`).
   A request's own fields always win.
-  With no block at all, a request without sampling keys decodes greedy.
+  With no block at all, a request without sampling keys gets the sampling the model card recommends (upstream #2685).
+  It is picked by the thinking state: Qwen3.8-Flash-Next (Swift and Gyro too) thinking temperature 1.0, top_p 0.95, top_k 20; not thinking temperature 0.7, top_p 0.8, top_k 20, presence_penalty 1.5; Qwen3.6-35B-A3B thinking 1.0 / 0.95 / 20 with presence_penalty 1.5, not thinking 0.7 / 0.8 / 20 with 1.5.
+  Ornith and llm-jp are not in the table and decode greedy as before.
+  The order of precedence: the request, the web page's shared Chat settings, the config's `sampling` block, the card.
+  Greedy is only for who asks for it: `temperature: 0` in the request, or `"sampling": {"temperature": 0}` in the config.
 - The penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`) ride the same path.
   `penalty_last_n` caps how many recent tokens they count over, 64 by default when any penalty is set.
   llama.cpp's names `repeat_penalty` and `repeat_last_n` work too, in the config's `sampling` block and in a request (upstream #1819).

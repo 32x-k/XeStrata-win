@@ -3064,6 +3064,8 @@ class Service:
         self.shared_path: str | None = None           # where they are kept between starts (next to the config)
         # #1641: the config's "reasoning_effort": the level for requests with none
         self.config_effort = None
+        # the model card whose sampling a request with none gets ("qwen4exp", "qwen35moe"): None = greedy as asked
+        self.model_arch: str | None = None
         self.fifo = threading.Lock()
         self.vram_reserve: int | None = None           # #533: the last POST /v1/vram reserve (None: the start's)
         self.slot_save_path: str | None = None        # --slot-save-path: /slots/0?action=save|restore (off when None)
@@ -4119,7 +4121,9 @@ class Service:
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
-        defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
+        # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
+        # apps; the request's own fields win over all of them
+        defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
@@ -5854,7 +5858,7 @@ def make_handler(svc: Service):
             if not svc.loaded() and not getattr(svc.engine, "unloaded", False):
                 self._json(503, {"error": {"message": "the engine is not running"}})
                 return
-            defaults = {**svc.sampling_defaults, **svc.shared}
+            defaults = {**model_card_sampling(svc.model_arch, True), **svc.sampling_defaults, **svc.shared}
             names = {"repetition_penalty": "repeat_penalty", "penalty_last_n": "repeat_last_n"}
             params = {names.get(k, k): v for k, v in defaults.items()
                       if k in ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
@@ -6952,6 +6956,38 @@ def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: lis
     return rp.ReplicaEngine(engines, load_tokens=load)
 
 
+# The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
+# run config's `sampling` block says otherwise.  Greedy is only for a request or config that asks for temperature 0.
+# min_p 0, repetition_penalty 1 and presence_penalty 0 are the engine's own "off", so they are not listed.
+MODEL_CARD_SAMPLING = {
+    # Qwen3.8-Flash-Next (and Gyro, the same base model)
+    "qwen4exp": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+                 "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+    # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
+    "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
+                  "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+}
+
+
+def card_family(cfg: dict) -> str | None:
+    """Which MODEL_CARD_SAMPLING set a config's model takes: Qwen3.8-Flash-Next and its variants (Swift, Gyro: upstream
+    gives every qwen4exp file the set, "qwen4exp"), Qwen3.6-35B-A3B ("qwen35moe"); None for the other models (Ornith,
+    llm-jp: their cards are not in the table), which stay greedy unless the request or the config's `sampling` block
+    says otherwise.  By the model's name, as the architecture alone does not tell Qwen3.6 from Ornith."""
+    name = str(cfg.get("model_name") or "qwen3.8-flash-next").lower()
+    if name.startswith(("qwen3.8", "swift")) or "gyro" in name:
+        return "qwen4exp"
+    if name.startswith("qwen3.6"):
+        return "qwen35moe"
+    return None
+
+
+def model_card_sampling(arch, thinking) -> dict:
+    """The model card's sampling for the family `arch` and the thinking state ({} for an unknown or unset family)."""
+    sets = MODEL_CARD_SAMPLING.get(arch) if arch else None
+    return dict(sets["thinking" if thinking else "instruct"]) if sets else {}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -7117,6 +7153,8 @@ def main() -> int:
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.vision_error = vision_error
     svc.vision_fallback = vision_fallback
+    if a.engine == "strata":                            # the model card's sampling when nothing else is said
+        svc.model_arch = card_family(cfg)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))

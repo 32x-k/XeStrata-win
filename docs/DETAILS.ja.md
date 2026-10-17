@@ -971,7 +971,11 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
   seed で再現させるなら、エンジンの設定に `--adapt-every 100000`（配置を固定）を足します。
 - 実行の設定の `sampling` のブロックは、項目を省いた要求の既定を決めます（`"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}`）。
   要求自身の項目がいつも優先します。
-  ブロックがなければ、サンプリングの項目のない要求は貪欲に生成します。
+  ブロックがなければ、サンプリングの項目のない要求はモデルカードの勧める値で生成します（upstream #2685）。
+  思考の有無で選び、Qwen3.8-Flash-Next（Swift・Gyro も）は思考ありで temperature 1.0・top_p 0.95・top_k 20、思考なしで temperature 0.7・top_p 0.8・top_k 20・presence_penalty 1.5、Qwen3.6-35B-A3B は思考ありで 1.0・0.95・20・presence_penalty 1.5、思考なしで 0.7・0.8・20・1.5 です。
+  Ornith と llm-jp は表になく、これまでどおり貪欲に生成します。
+  優先は要求、web の画面の共有のチャットの設定、設定の `sampling` のブロック、モデルカードの順です。
+  貪欲に生成するのは、要求の `temperature: 0` か、設定の `"sampling": {"temperature": 0}` で頼んだときだけです。
 - ペナルティ（`presence_penalty`、`frequency_penalty`、`repetition_penalty`）も同じ経路で効きます。
   `penalty_last_n` は数える直近のトークン数の上限で、どれかのペナルティがあれば既定は 64 です。
   llama.cpp の名前の `repeat_penalty` と `repeat_last_n` も、設定の `sampling` と要求で使えます（upstream #1819）。
