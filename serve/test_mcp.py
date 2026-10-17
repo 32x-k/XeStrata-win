@@ -446,5 +446,20 @@ class NoServers(unittest.TestCase):
             httpd.server_close()
 
 
+class StuckStdin(unittest.TestCase):
+    """A server that no longer reads its stdin: a request bigger than the pipe ends at its deadline, not never."""
+
+    def test_a_blocked_write_times_out_and_ends_the_server(self):
+        from serve.mcp import McpTimeout, StdioTransport
+        t = StdioTransport("stuck", {"command": sys.executable, "args": ["-c", "import time; time.sleep(60)"]})
+        t.start()
+        self.addCleanup(t.close)
+        t0 = time.monotonic()
+        with self.assertRaises(McpTimeout):
+            t.request("tools/call", {"blob": "x" * (8 << 20)}, timeout=1.0)
+        self.assertLess(time.monotonic() - t0, 15)
+        self.assertFalse(t.alive())
+
+
 if __name__ == "__main__":
     unittest.main()

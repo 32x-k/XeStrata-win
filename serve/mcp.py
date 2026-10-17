@@ -192,6 +192,34 @@ class StdioTransport:
         except (OSError, ValueError):
             raise McpError(f"the server stopped{self._tail()}") from None
 
+    def _send_within(self, msg: dict, timeout: float, cancel=None):
+        """_send with the request's deadline and stop button: a server that no longer reads its stdin leaves the write
+        blocked once the pipe is full, past any timeout.  The write runs on a thread of its own; one still blocked at
+        the deadline (or the stop) ends the server, which ends the write."""
+        done = threading.Event()
+        failed: list[McpError] = []
+
+        def write():
+            try:
+                self._send(msg)
+            except McpError as e:
+                failed.append(e)
+            finally:
+                done.set()
+        threading.Thread(target=write, daemon=True).start()
+        deadline = time.monotonic() + timeout
+        while not done.wait(0.05):
+            stopped = cancel is not None and cancel.is_set()
+            if stopped or time.monotonic() > deadline:
+                if self.proc is not None:
+                    self._kill_tree(self.proc)       # a half-written line leaves nothing to go on with
+                done.wait(5)
+                if stopped:
+                    raise McpCancelled("stopped")
+                raise McpTimeout(f"{msg.get('method', 'a message')}: the server did not read it in {timeout:g} s")
+        if failed:
+            raise failed[0]
+
     def request(self, method: str, params: dict, timeout: float, cancel=None):
         if not self.alive():
             raise McpError(f"the server is not running{self._tail()}")
@@ -201,13 +229,16 @@ class StdioTransport:
             rid = self.next_id
             self.pending[rid] = slot
         try:
-            self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
-            return _wait(slot, timeout, cancel, method)
+            t0 = time.monotonic()
+            self._send_within({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}, timeout, cancel)
+            return _wait(slot, max(0.0, timeout - (time.monotonic() - t0)), cancel, method)
         except (McpTimeout, McpCancelled) as e:
             with self.lock:
                 self.pending.pop(rid, None)
             try:                                         # tell the server to stop working on it
-                self.notify("notifications/cancelled", {"requestId": rid, "reason": str(e)})
+                if self.alive():
+                    self._send_within({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                                       "params": {"requestId": rid, "reason": str(e)}}, 5.0)
             except McpError:
                 pass
             raise

@@ -229,8 +229,8 @@ ThreadAffinity pin_current_thread(int core) {
     cpu_set_t prev;
     CPU_ZERO(&prev);
     if (pthread_getaffinity_np(pthread_self(), sizeof prev, &prev) != 0) return {};
-    for (int i = 0; i < CPU_SETSIZE && i < 64; ++i)
-        if (CPU_ISSET(i, &prev)) previous.mask |= 1ul << i;
+    for (int i = 0; i < CPU_SETSIZE; ++i)
+        if (CPU_ISSET(i, &prev)) previous.cpus.push_back(i);
     pin_this_thread(core);
 #endif
     previous.valid = true;
@@ -247,9 +247,9 @@ void restore_thread_affinity(const ThreadAffinity& previous) {
 #else
     cpu_set_t set;
     CPU_ZERO(&set);
-    for (int i = 0; i < 64; ++i)
-        if ((previous.mask >> i) & 1) CPU_SET(i, &set);
-    pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+    for (int i : previous.cpus) CPU_SET(i, &set);
+    if (const int rc = pthread_setaffinity_np(pthread_self(), sizeof set, &set); rc != 0)
+        std::fprintf(stderr, "strata cpu pool: host CPU affinity restoration failed: %d\n", rc);
 #endif
 }
 

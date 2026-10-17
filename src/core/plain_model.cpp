@@ -511,6 +511,8 @@ bool PlainModel::prompt_int8() const {
         if (k::cpu::native_mixed_gu(f) ? !k::iq_mmq_type_ok(f.up_type)   // gate and up: a product each
                                        : f.up_off != (size_t) FF * k::iq_mmq_row_bytes(f.gu_type, N))
             return false;
+        // a product each: their outputs in 128s too (n_ff 960 left each one's last 64 rows uncomputed)
+        if (k::cpu::native_mixed_gu(f) && FF % 128 != 0) return false;
     }
     return true;
 }

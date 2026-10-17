@@ -45,6 +45,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -173,10 +174,11 @@ int serve(si::QiPipeline& p) {
     }
     std::printf("READY budget_mib=%llu\n", (unsigned long long) (p.budget() >> 20));
     std::fflush(stdout);
-    Lines in;
-    std::thread reader([&in] { in.run(); });
+    // shared with the reader: it outlives serve() when QUIT returns while a getline still blocks
+    const auto in = std::make_shared<Lines>();
+    std::thread reader([in] { in->run(); });
     reader.detach();   // ends with the process: a blocked getline cannot be woken
-    for (std::string line; in.next(line);) {
+    for (std::string line; in->next(line);) {
         std::istringstream ls(line);
         std::string op;
         ls >> op;
@@ -190,13 +192,13 @@ int serve(si::QiPipeline& p) {
                 if (!ls || out.empty()) throw std::invalid_argument("IMG <width> <height> <seed> <drop> <out> <ids>");
                 r.ids = parse_ids(ids);
                 r.refs = read_refs(ls);
-                in.stop = false;
+                in->stop = false;
                 si::QiTimes t;
                 si::QiPlan pl;
                 const auto img = p.generate(r, &t, &pl, [&in](int done, int steps) {
                     std::printf("STEP %d %d\n", done, steps);
                     std::fflush(stdout);
-                    return !in.stop.load();
+                    return !in->stop.load();
                 });
                 const std::string utf8 = path_of(out);
                 write_file(std::filesystem::path(std::u8string(utf8.begin(), utf8.end())), img);

@@ -5786,6 +5786,11 @@ def make_handler(svc: Service):
                         url = url.get("url")
                     if not isinstance(url, str) or not url:
                         raise ValueError("images: [{\"image_url\": a data: URL, an http(s) URL or a path}]")
+                    if self._foreign_origin() and not url.startswith(("data:", "http://", "https://")):
+                        # as _no_local_images for a chat: a page of another origin does not have a file read
+                        raise ValueError("a web page of another origin cannot have a file on this computer read as "
+                                         "an image: send it as a data: URL (or add the page's origin to the config's "
+                                         "trusted_origins)")
                     files.append(Vision.load(url))
             job = images_api.parse_edit_request(req, [Vision.normalize(d) for d in files], gen.cfg)
             self._image_job(gen, job)

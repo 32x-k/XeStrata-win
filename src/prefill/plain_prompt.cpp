@@ -646,9 +646,12 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 // blocks differently (Q2_K against another type)
                 const int up_type = k::cpu::native_mixed_gu(f) ? f.up_type : f.gu_type;
                 const bool up_xq2 = k::iq_mmq_type_dup(up_type) != k::iq_mmq_type_dup(f.gu_type);
-                if (use_mmq) prefill::mmq::quantize(P.hn, P.src, P.xq, f.gu_type, N, N, T * K, cs);
+                // the shared rows carry the blocks' sums when either product reads them (Q4_K, Q5_K: gate Q6_K and
+                // up Q4_K left up's sums unwritten); the sums sit after the scales: one without them reads alike
+                const int xq_type = !up_xq2 && k::iq_mmq_type_sums(up_type) ? up_type : f.gu_type;
+                if (use_mmq) prefill::mmq::quantize(P.hn, P.src, P.xq, xq_type, N, N, T * K, cs);
                 if (use_mmq && up_xq2) prefill::mmq::quantize(P.hn, P.src, P.xq2, up_type, N, N, T * K, cs);
-                else prefill::gather_rows16(P.x16, P.src, P.xs16, T * K, N, cs);
+                if (!use_mmq) prefill::gather_rows16(P.x16, P.src, P.xs16, T * K, N, cs);   // (only FP16 reads them)
                 mark(1, t_mark);
                 const bool transient = src_->transient(ml, experts.empty() ? 0 : experts[0]);
                 int64_t max_rows = 0;

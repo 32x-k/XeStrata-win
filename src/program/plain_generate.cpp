@@ -164,6 +164,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     };
     const int64_t ctx = model.max_cells(), V = model.vocab();
     std::vector<int32_t> live;   // the tokens the state holds, positions 0 .. live.size() - 1
+    bool stale = false;          // a failed request left the state half written: the next one resets it
     std::vector<int32_t> out((size_t) opt.max_t);
     std::string err;
     std::printf("INFO context=%lld expert_slots=%lld\n", (long long) ctx, (long long) model.slots());
@@ -236,11 +237,12 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         while (common < live.size() && common < (size_t) n && live[common] == ids[common]) ++common;
         int64_t resume = std::min<int64_t>((int64_t) common, n - 1);
         if (model.recurrent() && resume != (int64_t) live.size()) resume = 0;
-        if (resume == 0 && !live.empty() && !model.reset(err)) {
+        if (resume == 0 && (!live.empty() || stale) && !model.reset(err)) {
             std::printf("FATAL %s\n", err.c_str());
             std::fflush(stdout);
             return 1;
         }
+        if (resume == 0) stale = false;
         live.resize((size_t) resume);
         std::printf("RESUME %lld\n", (long long) resume);
         std::fflush(stdout);
@@ -266,6 +268,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         }
         if (!ok) {   // the state is the device's, half written: the next request starts over
             live.clear();
+            stale = true;
             std::printf("ERR %s\n", err.c_str());
             std::fflush(stdout);
             continue;
@@ -307,6 +310,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         }
         if (!ok) {
             live.clear();
+            stale = true;
             std::printf("ERR %s\n", err.c_str());
             std::fflush(stdout);
             continue;

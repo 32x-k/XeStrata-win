@@ -91,7 +91,7 @@ struct ThreadAffinity {
 #if defined(_WIN32)
     std::vector<unsigned long> cpu_sets;   ///< the thread's selected CPU Sets; empty: the process defaults
 #else
-    unsigned long mask = 0;                ///< CPUs 0..63
+    std::vector<int> cpus;                 ///< the thread's CPUs (all of them: a mask of 64 lost CPU 64 and up)
 #endif
     bool valid = false;
 };

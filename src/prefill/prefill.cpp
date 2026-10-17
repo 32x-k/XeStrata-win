@@ -2506,7 +2506,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 err = std::string("prefill: the helper's tables: ") + strata::gpu::last_error();
                                 return false;
                             }
-                            mmq::quantize(hs.x, d_src, hs.xq, hf.gu_type, N, N, rows_help, q);
+                            // the sums for either product that reads them (as plain_prompt.cpp)
+                            const int xq_type =
+                                !up_xq2 && strata::kernels::iq_mmq_type_sums(up_type) ? up_type : hf.gu_type;
+                            mmq::quantize(hs.x, d_src, hs.xq, xq_type, N, N, rows_help, q);
                             if (up_mixed && up_xq2) mmq::quantize(hs.x, d_src, hs.xq2, up_type, N, N, rows_help, q);
                             const int64_t ff = hf.n_ff;
                             mmq::Product gu;

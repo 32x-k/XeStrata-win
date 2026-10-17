@@ -2318,7 +2318,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 return;
             }
             if (kind[i] == -2) {            // STRATA_ROUTE_TAIL_SKIP: a skipped tail expert contributes zero
-                std::memset(row, 0, (size_t) H * sizeof(float));
+                std::memset(row, 0, (size_t) W * sizeof(float));   // the row stride (native: the layer's n_embd)
                 ++d.tail_skipped;
                 continue;
             }
@@ -2715,7 +2715,9 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
                 if (!f) f = std::make_unique<strata::GgufFile>(path);
                 const std::string name = "blk." + std::to_string(lay.block_of(l)) + ".ffn_" + roles[r] + "_exps.weight";
                 const strata::TensorInfo* t = f->find(name);
-                const uint64_t want_type = (uint64_t) (r < 2 ? fm.gu_type : fm.d_type);
+                // up has a type of its own where gate and up differ (native_mixed_gu)
+                const int up_type = strata::kernels::cpu::native_mixed_gu(fm) ? fm.up_type : fm.gu_type;
+                const uint64_t want_type = (uint64_t) (r == 0 ? fm.gu_type : r == 1 ? up_type : fm.d_type);
                 // GGUF order: dim 0 is the row (the input), dim 1 the rows, dim 2 the experts
                 const uint64_t cols = (uint64_t) (r < 2 ? fm.n_embd : fm.n_ff);
                 const uint64_t rows = (uint64_t) (r < 2 ? fm.n_ff : fm.n_embd);
