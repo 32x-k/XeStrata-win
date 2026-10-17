@@ -1558,7 +1558,7 @@ bool FileExpertSource::has_resident(int64_t layer, int64_t expert) const {
     return resident_blob(index) != nullptr;
 }
 
-bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
+bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bounce) {
     err.clear();
     if (n <= xstage_cap_) return true;
     if (!staged_.empty()) { err = "FileExpertSource: exchange buffers are in use"; return false; }
@@ -1581,12 +1581,15 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     }
     const char* rotate_env = std::getenv("STRATA_EXCHANGE_ROTATE");
     const bool requested = rotate_env != nullptr && std::strcmp(rotate_env, "1") == 0;
-    const bool uniform = std::all_of(layer_blob_bytes_.begin(), layer_blob_bytes_.end(),
-                                     [blob](uint64_t b) { return b == blob; });
-    const bool eligible = requested && uniform && complement_pinned_ && !complement_partial_ &&
+    // layers of several block sizes (a GGUF's mixed i-quants): spares of every size, see ExchangeStorage
+    bounce = std::max<int64_t>(0, std::min(bounce, n));
+    const uint64_t rotate_total =
+        detail::ExchangeStorage::exchange_bytes_needed(layer_blob_bytes_, (size_t) n, (size_t) bounce);
+    const bool eligible = requested && rotate_total != 0 && rotate_total <= std::numeric_limits<size_t>::max() &&
+                          complement_pinned_ && !complement_partial_ &&
                           complement_host_ != nullptr && complement_device_ != nullptr && complement_bytes_ > 0 &&
                           complement_chunks_.empty();
-    const size_t total = (size_t) n * (size_t) blob;
+    const size_t total = eligible ? (size_t) rotate_total : (size_t) n * (size_t) blob;
     void* p = nullptr;
     if (strata::gpu::alloc_host(&p, total) == true && p != nullptr) {
         xstage_pinned_ = true;
@@ -1600,15 +1603,23 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     xstage_cap_ = n;
     xstage_blob_ = blob;
     if (requested) {
-        std::string reason = "it needs equal-size expert blobs and a fully page-locked RAM copy in one part";
+        std::string reason = "it needs a fully page-locked RAM copy in one part";
         void* device = nullptr;   // host USM: the device reads it at the same address
         if (eligible && xstage_pinned_ && strata::gpu::device_pointer(&device, p) && device != nullptr) {
             try {
-                if (exchange_storage_.initialize(complement_offsets_, (uint8_t*) complement_host_, complement_device_,
-                                                 complement_bytes_, xstage_, (const uint8_t*) device, (size_t) n,
-                                                 (size_t) blob, reason))
-                    std::fprintf(stderr, "FileExpertSource: exchange buffer rotation on: %lld buffers of %llu bytes; no "
-                                         "host copy at a commit\n", (long long) n, (unsigned long long) blob);
+                std::vector<uint64_t> sizes(complement_offsets_.size(), 0);
+                for (size_t i = 0; i < sizes.size(); ++i) {
+                    const size_t layer = n_expert_ > 0 ? i / (size_t) n_expert_ : 0;
+                    sizes[i] = layer < layer_blob_bytes_.size() ? layer_blob_bytes_[layer] : 0;
+                }
+                if (exchange_storage_.initialize_sized(complement_offsets_, sizes, (uint8_t*) complement_host_,
+                                                       complement_device_, complement_bytes_, xstage_,
+                                                       (const uint8_t*) device, (uint64_t) total, (size_t) n,
+                                                       (size_t) bounce, reason))
+                    std::fprintf(stderr, "FileExpertSource: exchange buffer rotation on: %lld buffers in %zu block "
+                                         "sizes (largest %llu bytes, %.2f GiB page-locked); no host copy at a commit\n",
+                                 (long long) n, exchange_storage_.block_sizes(), (unsigned long long) blob,
+                                 (double) total / 1073741824.0);
             } catch (const std::bad_alloc&) { reason = "its tables could not be allocated"; }
         } else if (eligible) {
             reason = "the exchange buffers could not be page-locked";
@@ -1620,15 +1631,18 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     return true;
 }
 
-uint8_t* FileExpertSource::exchange_buffer(int64_t q) const {
+uint8_t* FileExpertSource::exchange_buffer(int64_t q, int64_t layer) const {
     if (xstage_ == nullptr || q < 0 || q >= xstage_cap_) return nullptr;
-    if (exchange_storage_.active()) return exchange_storage_.spare((size_t) q).host;
+    if (exchange_storage_.active())
+        return layer >= 0 && layer < n_layers_
+                   ? exchange_storage_.spare((size_t) q, (size_t) layer_blob_bytes_[(size_t) layer]).host
+                   : exchange_storage_.spare((size_t) q).host;
     return xstage_ + (size_t) q * (size_t) xstage_blob_;
 }
 
 bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, int64_t q) {
     if (out < 0 || out >= n_expert_ || !has_resident(layer, in) || has_resident(layer, out) ||
-        exchange_buffer(q) == nullptr)
+        exchange_buffer(q, layer) == nullptr)
         return false;
     const size_t i_in = (size_t) layer * (size_t) n_expert_ + (size_t) in;
     const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
@@ -1636,7 +1650,7 @@ bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, in
     if (override_[i_out] != nullptr) return false;
     for (const Exchange& x : staged_)
         if (x.in == i_in || x.q == q) return false;
-    override_[i_out] = exchange_buffer(q);
+    override_[i_out] = exchange_buffer(q, layer);
     staged_.push_back({i_in, i_out, q, layer_blob_bytes_[(size_t) layer]});
     return true;
 }

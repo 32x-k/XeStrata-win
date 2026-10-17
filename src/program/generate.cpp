@@ -219,7 +219,7 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
         if (slot < 0) continue;
         const SwapHome home = locate(s.layer);
         const strata::core::OnDevice on(home.dev);
-        if (strata::gpu::copy_async(src.exchange_buffer(q), home.cache->device_slot(slot),
+        if (strata::gpu::copy_async(src.exchange_buffer(q, s.layer), home.cache->device_slot(slot),
                                     (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), home.stream) != true)
             return false;
         if (std::find_if(used.begin(), used.end(), [&](const SwapHome& h) { return h.stream == home.stream; }) == used.end())
@@ -6577,9 +6577,11 @@ int main(int argc, char** argv) {
             if (o.adapt_every > 0 && o.adapt_swaps > 0 && !src.reserve_exchanges(o.adapt_swaps, err)) {
                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str()); return 1;
             }
-            // --adapt-async: twice the exchange buffers - the second half bounces the copies in whose source is not
-            // page-locked (an asynchronous copy instead of the driver's staged, synchronous one)
-            if (o.adapt_async && !src.reserve_exchanges((int64_t) 2 * o.adapt_swaps, err)) adapt_async_off(err.c_str());
+            // --adapt-async: twice the exchange buffers of a round (a_cap below) - the second half bounces the copies in
+            // whose source is not page-locked (an asynchronous copy instead of the driver's staged, synchronous one);
+            // STRATA_EXCHANGE_ROTATE keeps that half apart, in the largest block size (upstream fa1d1d1e)
+            const int64_t a_round = std::min<int64_t>(o.adapt_swaps, 96);
+            if (o.adapt_async && !src.reserve_exchanges(2 * a_round, err, a_round)) adapt_async_off(err.c_str());
             // pageable buffers would make every copy of a round synchronous (the driver stages them): that is the blocking
             // tier's cost, so the asynchronous tier is not worth running - said, and the blocking tier stays (upstream 5288cd29)
             if (o.adapt_async && !src.exchange_pinned()) adapt_async_off("the exchange buffers could not be page-locked");
@@ -7968,7 +7970,7 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on(h.dev);
                 for (const ASwap& w : aswaps) {
                     if (w.home != hi || !w.exchange) continue;
-                    if (!strata::gpu::copy_async(src.exchange_buffer(w.j), h.cache->device_slot(w.slot),
+                    if (!strata::gpu::copy_async(src.exchange_buffer(w.j, w.layer), h.cache->device_slot(w.slot),
                                                  (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer), h.stream)) {
                         std::fprintf(stderr, "strata serve: adaptive tier: copy back of layer %d slot %d (GPU %d) failed: %s\n",
                                      (int) w.layer, (int) w.slot, h.dev, strata::gpu::last_error());
@@ -8195,8 +8197,9 @@ int main(int argc, char** argv) {
                         for (size_t hi = 0; hi < ahomes.size(); ++hi)
                             if (a_ram_due[hi] && a_gap_seq[hi] <= a_ram_mark[hi]) return true;
                     std::fill(a_ram_due.begin(), a_ram_due.end(), (uint8_t) 0);
-                    ajob->post([&] { src.commit_copies(); });
                     astate = AState::Commit;
+                    if (src.exchange_rotation()) continue;   // STRATA_EXCHANGE_ROTATE: no bytes move, the flip is all there is
+                    ajob->post([&] { src.commit_copies(); });
                     if (!drain) return true;
                     continue;
                 case AState::Commit:   // step 4
