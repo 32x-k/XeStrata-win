@@ -179,8 +179,13 @@ void fill_blob(uint8_t* blob, const cpu::NativeFmt& f, uint64_t& seed) {
 // kMaxT tokens: the gate/up activation in ggml's vec_dot type (Q8_K for the i-quants) and the down one in ggml's form
 // and in the Q2_0 kernels' form (ActQ), what the kernels here take; and both as the engine quantizes them for its
 // dispatch (native_quant_act / native_quant_h: a layer of the canonical rows, canon_expert.hpp, has its own form)
+struct alignas(64) HBuf {   // a down activation, 64-byte aligned as the pool's (SplitBufMulti::hq)
+    uint8_t bytes[cpu::kNativeHBytes];
+};
 struct Acts {
-    std::vector<std::vector<uint8_t>> gu, dn, egu, eh;
+    std::vector<std::vector<uint8_t>> gu, dn;
+    std::vector<cpu::NativeAct> egu;   // the engine's forms, aligned as the pool's buffers
+    std::vector<HBuf> eh;
     std::vector<cpu::ActQ> q2;
     const void* gup[kMaxT];
     const void* dnp[kMaxT];
@@ -189,8 +194,7 @@ struct Acts {
     const cpu::ActQ* q2p[kMaxT];
     Acts(const cpu::NativeFmt& f, unsigned seed)
         : gu(kMaxT, std::vector<uint8_t>(cpu::kNativeActBytes)), dn(kMaxT, std::vector<uint8_t>(cpu::kNativeHBytes)),
-          egu(kMaxT, std::vector<uint8_t>(cpu::kNativeActBytes)), eh(kMaxT, std::vector<uint8_t>(cpu::kNativeHBytes)),
-          q2(kMaxT) {
+          egu(kMaxT), eh(kMaxT), q2(kMaxT) {
         std::mt19937 rng(seed);
         std::normal_distribution<float> nd(0.f, 1.f);
         std::vector<float> x((size_t) kH), h((size_t) kFF);
@@ -198,20 +202,20 @@ struct Acts {
         for (int t = 0; t < kMaxT; ++t) {
             for (auto& v : x) v = nd(rng);
             for (auto& v : h) v = 0.05f * nd(rng);
-            cpu::native_quant_act(f, x.data(), egu[(size_t) t].data());
-            cpu::native_quant_h(f, h.data(), eh[(size_t) t].data());
+            cpu::native_quant_act(f, x.data(), egu[(size_t) t].bytes);
+            cpu::native_quant_h(f, h.data(), eh[(size_t) t].bytes);
             if (canon) {
                 traits_cpu(f.gu_act)->from_float(x.data(), gu[(size_t) t].data(), kH);
                 traits_cpu(f.d_act)->from_float(h.data(), dn[(size_t) t].data(), kFF);
             } else {
-                gu[(size_t) t] = egu[(size_t) t];
-                dn[(size_t) t] = eh[(size_t) t];
+                gu[(size_t) t].assign(egu[(size_t) t].bytes, egu[(size_t) t].bytes + cpu::kNativeActBytes);
+                dn[(size_t) t].assign(eh[(size_t) t].bytes, eh[(size_t) t].bytes + cpu::kNativeHBytes);
             }
             if (cpu::cpu_avx2_ok()) cpu::act_quant_any(h.data(), (int) kFF, q2[(size_t) t]);
             gup[t] = gu[(size_t) t].data();
             dnp[t] = dn[(size_t) t].data();
-            egup[t] = egu[(size_t) t].data();
-            ehp[t] = eh[(size_t) t].data();
+            egup[t] = egu[(size_t) t].bytes;
+            ehp[t] = eh[(size_t) t].bytes;
             q2p[t] = &q2[(size_t) t];
         }
     }
