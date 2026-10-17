@@ -515,6 +515,11 @@ struct Options {
     int64_t conversation_save_mib = 16384;
     int64_t conversation_save_hours = 48;
     bool conversation_save_compress = false;   // the floating-point parts through c-blosc2 (built only when found)
+    /// --serve: park only after the conversation has advanced this many tokens past the copy it would supersede.
+    /// A conversation that moved a few hundred tokens writes a full snapshot again, and the turn after that drops it
+    /// (drop_superseded) after writing the same bytes once more, so on a long single conversation every turn pays a
+    /// whole-snapshot copy for nothing.  0 = park every turn, as before.
+    int64_t conversation_cache_park_gain = 0;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -661,6 +666,9 @@ void usage() {
                  "                       wins; 0 = none). Parking and session save/restore keep their floor under it\n"
                  "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens, so\n"
                  "                       short side requests do not take the slots a long one needs (default 0 = park any)\n"
+                 "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
+                 "                       the copy it would supersede, so a turn that grew by a few hundred tokens does not\n"
+                 "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --conversation-save DIR  --serve: also keep parked conversations in DIR across restarts (default off;\n"
                  "                       needs --conversation-cache-mib)\n"
@@ -2481,12 +2489,12 @@ int main(int argc, char** argv) {
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
                  a == "--conversation-save-checkpoints" ||
                  a == "--conversation-save-mib" || a == "--conversation-save-hours" || a == "--session-min-free-mib" ||
-                 a == "--memory-limit-mib") {
+                 a == "--conversation-cache-park-gain" || a == "--memory-limit-mib") {
             const std::string value = next(a.c_str());
             int64_t parsed = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
             const int64_t limit = a == "--conversation-cache-slots" || a == "--conversation-save-checkpoints" ||
-                                          a == "--conversation-cache-min-tokens"
+                                          a == "--conversation-cache-min-tokens" || a == "--conversation-cache-park-gain"
                                       ? INT32_MAX
                                   : a == "--conversation-save-hours" ? INT64_MAX / 3600
                                                                      : INT64_MAX / (int64_t{1024} * 1024);
@@ -2497,6 +2505,7 @@ int main(int argc, char** argv) {
             if (a == "--conversation-cache-mib") o.conversation_cache_mib = parsed;
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = parsed;
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = parsed;
+            else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = parsed;
             else if (a == "--conversation-save-checkpoints") o.conversation_save_checkpoints = (int) parsed;
             else if (a == "--conversation-save-mib") o.conversation_save_mib = parsed;
             else if (a == "--conversation-save-hours") o.conversation_save_hours = parsed;
@@ -9810,7 +9819,17 @@ int main(int argc, char** argv) {
                 resume == req_pin && live_ok)
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
-            if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && !park_current(incoming ? incoming->bytes() : 0)) {
+            // --conversation-cache-park-gain N: a park now would supersede the entry parked_prefix_tokens() reports (the copy
+            // this conversation wrote last), so a conversation that advanced fewer than N tokens since then keeps it:
+            // it still holds this conversation's prefix, and re-parking writes the whole snapshot only for the next
+            // turn to drop it again.  0 (the default) parks every turn, as before.
+            const size_t park_held = o.conversation_cache_park_gain > 0
+                                         ? conversations.parked_prefix_tokens(live, live_imgs, checks, cvec_cached)
+                                         : 0;
+            const bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
+                                    (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain;
+            if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
+                !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }

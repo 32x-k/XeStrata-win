@@ -895,6 +895,8 @@ A chat and an agent's subagent can then alternate without re-reading each other.
   To fit the budget, too, the oldest parked conversation is dropped first.
 - `--conversation-cache-min-tokens N` (default 0 = every one) parks only conversations of at least N tokens (upstream 624070c5).
   A parked conversation takes one of the slots whatever its length, so a client that puts short side requests between the turns of a long conversation filled the slots with them and evicted the long one.
+- `--conversation-cache-park-gain N` (opt-in, default 0 = park every turn) parks a conversation again only after it advanced N tokens past the copy it would supersede (upstream d9cb22d2, #2265).
+  A turn that grew by a few hundred tokens keeps the older copy instead of writing a whole snapshot that the next turn drops; a resume from the older copy then reads up to N tokens again.
 - A copy that fails to go back stops the engine instead of letting it answer from half a state.
 - After a restore, the K/V pages a conversation has not changed are reused for its next copy (`STRATA_SNAPSHOT_FULL_CAPTURE=1` turns that off).
   The new pages get room for the next turns of at most an eighth of each buffer (and at most 16 MiB), which the budget counts like the rest of the copy (upstream 53f72571).
