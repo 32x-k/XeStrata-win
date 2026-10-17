@@ -31,6 +31,10 @@ import time
 ANSWERS = {"IMG": ("IMAGE",), "NEED": ("NEED",), "FREE": ("FREE",), "FIT": ("BUDGET",), "BUDGET": ("BUDGET",),
            "RELEASE": ("RELEASE",)}
 START_TIMEOUT_S = 600
+# An engine silent this long within a request (an image says STEP at each step; reading a prompt's layers from a hard
+# disk took 80 s) is taken as stuck: it is ended, the request answered ERROR, and the daemon ends with it (the next
+# server starts another), rather than the lock held for ever
+SILENT_S = 1800
 
 
 class Daemon:
@@ -91,7 +95,17 @@ class Daemon:
             try:
                 self.send(line)
                 while True:
-                    got = self.lines.get()
+                    try:
+                        got = self.lines.get(timeout=SILENT_S)
+                    except queue.Empty:
+                        self.say(f"the image engine said nothing for {SILENT_S} s in {op}: ended")
+                        with contextlib.suppress(OSError, ValueError):
+                            write(f, f"ERROR the image engine did not answer in {SILENT_S} s")
+                        if self.proc is not None:
+                            with contextlib.suppress(OSError):
+                                self.proc.kill()
+                        self.done.set()
+                        return
                     if got is None:
                         write(f, "ERROR the image engine ended")
                         self.done.set()

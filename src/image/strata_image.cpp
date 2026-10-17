@@ -14,6 +14,8 @@
 //
 // --serve: the engine stays, its layers and the last prompt's states kept between requests, and takes lines on stdin
 // (serve/images.py), one at a time, answering each on stdout:
+// A path on a request line is UTF-8 with %XX for a byte that is not printable ASCII and for % itself (a space, a
+// non-ASCII name), so that one word holds it (serve/images.py's path_word).
 //   IMG <width> <height> <seed> <drop> <out path> <ids, commas> [REF:<path>]...   -> STEP <done> <steps> lines,
 //                            then IMAGE key=value ... (times, the budget's split); REF: an edit's reference images
 //   NEED <width> <height> <n> [REF:<path>]...  the VRAM an image of n prompt ids needs (from the files)
@@ -40,6 +42,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <mutex>
@@ -51,6 +54,24 @@
 namespace {
 
 namespace si = strata::image;
+
+// a path word of a request line: %XX back to its byte
+std::string path_of(const std::string& word) {
+    auto hex = [&](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        throw std::invalid_argument("a path with a bad %XX: " + word);
+    };
+    std::string out;
+    for (size_t i = 0; i < word.size(); ++i) {
+        if (word[i] != '%') { out += word[i]; continue; }
+        if (i + 2 >= word.size()) throw std::invalid_argument("a path with a bad %XX: " + word);
+        out += (char) (hex(word[i + 1]) * 16 + hex(word[i + 2]));
+        i += 2;
+    }
+    return out;
+}
 
 std::vector<int32_t> parse_ids(const std::string& s) {
     std::vector<int32_t> ids;
@@ -67,7 +88,7 @@ std::vector<si::QiRef> read_refs(std::istringstream& ls) {
         if (word.rfind("REF:", 0) != 0) throw std::invalid_argument("unknown word " + word);
         si::QiRef f;
         std::string err;
-        f.rgba = si::load_rgba8(word.substr(4), f.width, f.height, err);
+        f.rgba = si::load_rgba8(path_of(word.substr(4)), f.width, f.height, err);
         if (f.rgba.empty()) throw std::invalid_argument(err);
         refs.push_back(std::move(f));
     }
@@ -78,7 +99,7 @@ std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls) {
     std::vector<std::pair<int64_t, int64_t>> sizes;
     for (std::string word; ls >> word;) {
         int64_t w = 0, h = 0;
-        if (word.rfind("REF:", 0) != 0 || !si::image_size(word.substr(4), w, h))
+        if (word.rfind("REF:", 0) != 0 || !si::image_size(path_of(word.substr(4)), w, h))
             throw std::invalid_argument("not an image: " + word);
         sizes.emplace_back(w, h);
     }
@@ -98,10 +119,10 @@ std::string plan_kv(const si::QiTimes& t, const si::QiPlan& p) {
     return b;
 }
 
-void write_file(const std::string& path, const std::vector<uint8_t>& img) {
+void write_file(const std::filesystem::path& path, const std::vector<uint8_t>& img) {
     std::ofstream o(path, std::ios::binary);
     o.write(reinterpret_cast<const char*>(img.data()), (std::streamsize) img.size());
-    if (!o) throw std::runtime_error("cannot write " + path);
+    if (!o) throw std::runtime_error("cannot write " + path.string());
 }
 
 // stdin's lines on a thread of their own, so that STOP reaches a running request
@@ -177,7 +198,8 @@ int serve(si::QiPipeline& p) {
                     std::fflush(stdout);
                     return !in.stop.load();
                 });
-                write_file(out, img);
+                const std::string utf8 = path_of(out);
+                write_file(std::filesystem::path(std::u8string(utf8.begin(), utf8.end())), img);
                 std::printf("IMAGE %s\n", plan_kv(t, pl).c_str());
             } else if (op == "NEED") {
                 int64_t w = 0, h = 0, n = 0;

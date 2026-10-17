@@ -8,6 +8,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_HDR
 #define STBI_NO_LINEAR
+#define STBI_WINDOWS_UTF8   // the paths are UTF-8 (a Windows name in Japanese, for one)
 #include "stb_image.h"
 
 #include <cstring>

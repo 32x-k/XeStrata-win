@@ -198,7 +198,12 @@ void LayerStream::worker() {
         {
             std::unique_lock<std::mutex> l(mu_);
             cv_.wait(l, [this] { return stop_ || !queue_.empty(); });
-            if (stop_) return;
+            if (stop_) {   // what is still queued is not filled: dropped, so that drop() does not wait for it
+                queue_.clear();
+                l.unlock();
+                cv_.notify_all();
+                return;
+            }
             i = queue_.front();
             const int k = slot_of(i);
             s = k >= 0 ? &slots_[k] : nullptr;

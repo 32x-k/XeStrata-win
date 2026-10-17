@@ -229,13 +229,9 @@ void QiDit::product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_
 
 void QiDit::ensure(int64_t T, int64_t HW) {
     if (T > cap_T_) {
-        for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) h_, (void*) gu_, (void*) h16_,
-                        (void*) q16_, (void*) k16_, (void*) v16_, (void*) o16_, (void*) cos_, (void*) sin_,
-                        (void*) attn_scratch_})
-            if (p != nullptr) {
-                allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), p), allocs_.end());
-                gpu::free(p);
-            }
+        // the old ones go first, their pointers and capacity with them: an allocation refused below leaves the rest
+        // null (none freed twice by the next ensure or drop_activations)
+        drop_activations();
         const int64_t TP = qi_attn_rows(T);
         x_ = alloc<float>(allocs_, T * C_);
         q_ = alloc<float>(allocs_, T * C_);
@@ -277,6 +273,7 @@ void QiDit::set_context(const float* ctx, int64_t n_ctx, const std::vector<Ref>&
     if (text_ != nullptr) {
         allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), (void*) text_), allocs_.end());
         gpu::free(text_);
+        text_ = nullptr;   // (a refused allocation below leaves no freed pointer behind)
     }
     text_ = alloc<float>(allocs_, n_pre * C_);
     // the prefix: the context's rows, each reference's pads its latent's tokens

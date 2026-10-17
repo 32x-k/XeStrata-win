@@ -240,11 +240,18 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
             }
         vouts.push_back(vision_->encode(rgb.data(), rw, rh));
         float *d = nullptr, *z = nullptr;
-        if (!gpu::alloc_device(&d, rgba.size() * 4) || !gpu::alloc_device(&z, (size_t) (64 * (rh / 16) * (rw / 16)) * 4))
+        if (!gpu::alloc_device(&z, (size_t) (64 * (rh / 16) * (rw / 16)) * 4))
             throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
-        ref_z.push_back(z);
-        gpu::copy(d, rgba.data(), rgba.size() * 4);
-        vae_->encode(d, rh, rw, z);
+        ref_z.push_back(z);   // the caller frees it, whatever happens below
+        if (!gpu::alloc_device(&d, rgba.size() * 4))
+            throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
+        try {
+            gpu::copy(d, rgba.data(), rgba.size() * 4);
+            vae_->encode(d, rh, rw, z);
+        } catch (...) {
+            gpu::free(d);
+            throw;
+        }
         gpu::free(d);
         grids.emplace_back(rw, rh);
     }
@@ -323,8 +330,11 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     const int64_t n = dit_->channels() * h * w, HW = r.width * r.height;
     const auto noise = philox_randn(r.seed, (uint64_t) n);
     float *x = nullptr, *rgba = nullptr;
-    if (!gpu::alloc_device(&x, (size_t) n * 4) || !gpu::alloc_device(&rgba, (size_t) (4 * HW) * 4))
-        throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
+    if (!gpu::alloc_device(&x, (size_t) n * 4) || !gpu::alloc_device(&rgba, (size_t) (4 * HW) * 4)) {
+        const std::string why = gpu::last_error();
+        gpu::free(x);   // the first one, when the second was refused
+        throw std::runtime_error("image engine: GPU memory: " + why);
+    }
     std::vector<float> out((size_t) (4 * HW));
     try {
         gpu::copy(x, noise.data(), (size_t) n * 4);

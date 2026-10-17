@@ -220,6 +220,12 @@ def png_rgba(rgba: bytes, width: int, height: int, made_w: int, made_h: int) -> 
             + chunk(b"IDAT", zlib.compress(bytes(rows), 6)) + chunk(b"IEND", b""))
 
 
+def path_word(path) -> str:
+    """A path as one word of a request line (strata-image's path_of): UTF-8, with %XX for a byte that is not printable
+    ASCII and for % itself - a space in a Windows user name (the temporary folder's path) split the line before."""
+    return "".join(chr(b) if 0x21 <= b <= 0x7e and b != 0x25 else f"%{b:02X}" for b in str(path).encode("utf-8"))
+
+
 def prompt_ids(tok, prompt: str, refs: int = 0) -> list[int]:
     """The prompt in the model's chat form, tokenized (Qwen3-VL's tokenizer): the user's text plain, so a special
     token spelled in it stays text; an edit's `refs` reference images before it, one pad each (stable-diffusion.cpp's
@@ -543,7 +549,7 @@ class ImageGen:
 
     @staticmethod
     def _refs_words(job: dict) -> str:
-        return "".join(f" REF:{p}" for p in job.get("ref_paths") or ())
+        return "".join(f" REF:{path_word(p)}" for p in job.get("ref_paths") or ())
 
     def need(self, job: dict) -> dict:
         """What the image needs, from the engine (started when it is not running): least_mib, full_mib (every layer
@@ -603,7 +609,7 @@ class ImageGen:
                     def step(done, steps, i=i):
                         self.progress = (i * steps + done, job["n"] * steps)
                     try:
-                        r = self.engine.ask(f"IMG {mw} {mh} {job['seed'] + i} {DROP} {out} {ids}"
+                        r = self.engine.ask(f"IMG {mw} {mh} {job['seed'] + i} {DROP} {path_word(out)} {ids}"
                                             f"{self._refs_words(job)}", "IMAGE", timeout, cancel, step)
                     except ImageJobFailed as e:
                         self.totals["failed"] += 1
@@ -849,7 +855,9 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                         raise _client_gone(svc)
             try:
                 if ctl is not None:                   # running parallel requests finish first
-                    while getattr(svc, "live_reqs", None):
+                    # those waiting for the control lines (the engine's `waiting`) are not running: they go after
+                    # the image (waiting for them here, with the lines held, waited for ever)
+                    while len(getattr(svc, "live_reqs", None) or ()) > getattr(svc.engine, "waiting", 0):
                         if cancel is not None and cancel.is_set():
                             raise _client_gone(svc)
                         time.sleep(0.25)
