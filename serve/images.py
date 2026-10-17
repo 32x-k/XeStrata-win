@@ -24,7 +24,10 @@ and the config's "gpu_policy" says what happens to the text engine during the jo
             afterwards (POST /v1/vram's mechanism; the conversation stays in the engine)
   unload  - its conversation is saved to a session file, the engine is stopped, and the next start restores it
   auto    - (default) keep when the image fits beside it at full speed, else shrink when the engine can, else keep
-            when the image fits at all (its layers streamed), else unload
+            when the image fits at all (its layers streamed) and the RAM available holds the image model's files
+            besides (ram_short), else unload: streamed beside the text engine with too little RAM, the image read
+            its layers from the disk and pushed the text engine's experts out of RAM (decode 88 -> 11 tok/s on a
+            PC with 28 GB of RAM, 2026-10-17)
 After a job the image engine keeps what it holds (the next image starts warm) only under keep with VRAM to spare;
 otherwise it lets go of everything but its process (about 200 MiB).  The daemon ends after daemon_idle_s (default
 1800) without a server.
@@ -778,8 +781,36 @@ def resolve_policy(svc, gen: ImageGen, need: dict) -> str:
     if engine_elastic(eng):
         return "shrink"
     if room >= need["least_mib"]:
-        return "keep"                         # the image's layers streamed: slower than unloading only for a big batch
+        short = ram_short(gen)
+        if short is None:
+            return "keep"                     # the image's layers streamed: slower than unloading only for a big batch
+        gen._say(f"image job: unload rather than stream the layers beside the model: the image model's files and "
+                 f"the engine need {short[0]} MiB of RAM, {short[1]} MiB is available")
     return "unload"
+
+
+# the image engine's own RAM besides its files (its process, the pinned relay, the prompt states): qimage's HOST_GB
+IMAGE_HOST_MIB = 2048
+
+
+def ram_short(gen: ImageGen) -> tuple[int, int] | None:
+    """(needed, available) MiB when the RAM available does not hold the image model's files (which streamed layers
+    are read from, through the OS file cache) and the image engine's own; None when it does or when either is not
+    known."""
+    from serve.session_save_retry import available_mib
+    avail = available_mib()
+    if avail is None:
+        return None
+    files = 0
+    for k in ("diffusion_model", "vae", "llm", "vision"):
+        f = gen.cfg.get(k)
+        if isinstance(f, str) and f:
+            try:
+                files += os.path.getsize(f)
+            except OSError:
+                return None
+    need = (files >> 20) + IMAGE_HOST_MIB
+    return (need, avail) if avail < need else None
 
 
 def engine_elastic(eng) -> bool:
