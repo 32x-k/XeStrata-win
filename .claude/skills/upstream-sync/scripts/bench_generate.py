@@ -9,7 +9,7 @@ off), 256 greedy tokens, each run a new process.  The runs are tools/bench_core.
       python .claude/skills/upstream-sync/scripts/bench_generate.py OUT GPU [--dry-run]
 
 XE and UP: the command that starts each engine (its strata binary, or a wrapper that runs it in its container);
-the generate options are appended; UP=none measures XeStrata alone (the B70 in a merge, judged against the previous
+the generate options are appended; UP=none measures XeStrata alone (judged against the previous
 record).  XE_PROFILE and UP_PROFILE: each engine's shipped expert profile (its
 data/expert-profile.bin).  DATA: the data folder (packs/qwen-iq3_xxs, models/...IQ3_XXS-0000N-of-00002.gguf, mtp/rt).
 IDS: the prompts of sync_prompts.py beside this script.  ROUNDS (default 2): runs per arm and tier.  Another model
