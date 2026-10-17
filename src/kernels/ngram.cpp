@@ -470,20 +470,30 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
     if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }
     const size_t n = n_tokens * (size_t) PLE_N_HEADS;
     if (impl_->mode == PleIo::Direct) {
-        // the rows read ahead (prefetch_rows), when they are this batch's in order
-        if (n_tokens > 0 && impl_->n_prefetch >= n_tokens && n_tokens <= Impl::kMaxPrefetch) {
+        // the rows read ahead (prefetch_rows), when every token of this batch is among them, in any order: a token
+        // found twice shares one slot (upstream 36381540, #2622)
+        if (n_tokens > 0 && n_tokens <= Impl::kMaxPrefetch) {
+            size_t matched[Impl::kMaxPrefetch];
             bool match = true;
-            for (size_t t = 0; t < n_tokens && match; ++t)
-                match = std::memcmp(impl_->prefetch_keys[t], rows + t * PLE_N_HEADS, sizeof(uint32_t) * PLE_N_HEADS) == 0;
+            for (size_t t = 0; t < n_tokens && match; ++t) {
+                size_t i = 0;
+                while (i < impl_->n_prefetch &&
+                       std::memcmp(impl_->prefetch_keys[i], rows + t * PLE_N_HEADS, sizeof(uint32_t) * PLE_N_HEADS) != 0)
+                    ++i;
+                match = i < impl_->n_prefetch;
+                matched[t] = i;
+            }
             if (match) {
                 bool ok = true;
-                for (size_t i = 0; i < impl_->n_prefetch; ++i)
-                    ok = impl_->reader.collect(impl_->prefetch_tickets[i], err) && ok;
+                for (size_t i = 0; i < impl_->n_prefetch; ++i) {   // every ticket drained, the first error kept
+                    std::string later;
+                    ok = impl_->reader.collect(impl_->prefetch_tickets[i], ok ? err : later) && ok;
+                }
                 impl_->n_prefetch = 0;
                 if (!ok) return false;
                 for (size_t t = 0; t < n_tokens; ++t)
                     for (int h = 0; h < PLE_N_HEADS; ++h)
-                        impl_->decode(impl_->prefetch_raw[t] + (size_t) h * impl_->rb,
+                        impl_->decode(impl_->prefetch_raw[matched[t]] + (size_t) h * impl_->rb,
                                       out + (t * PLE_N_HEADS + (size_t) h) * PLE_HEAD_DIM);
                 impl_->bytes_read += (uint64_t) n * impl_->rb;
                 return true;
