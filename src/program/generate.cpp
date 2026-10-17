@@ -3402,8 +3402,20 @@ int main(int argc, char** argv) {
             }
             return best;
         }();
+        // STRATA_SPLIT_SPEED_SCALE="1,0.55" (upstream 4a1ef86b, a test seam): each stage's speed times this factor, an
+        // unequal pair on two equal cards (#2644); unset = nothing changes
+        const char* speed_scale = std::getenv("STRATA_SPLIT_SPEED_SCALE");
         for (int i = 0; i < ns; ++i) {
             bw[(size_t) i] = gpu_bandwidth(dev_of_stage(i));
+            if (speed_scale != nullptr && *speed_scale != '\0') {
+                const char* p = speed_scale;
+                for (int k = 0; k < i && p != nullptr; ++k) {
+                    p = std::strchr(p, ',');
+                    if (p != nullptr) ++p;
+                }
+                const double f = p != nullptr ? std::strtod(p, nullptr) : 0.0;
+                if (f > 0.0) bw[(size_t) i] *= f;
+            }
             std::fprintf(stderr, "strata generate: layer split auto: CUDA%d reads %.0f GB/s, %.2f GiB free\n",
                          dev_of_stage(i), bw[(size_t) i] / 1e6, (double) free0[(size_t) i] / 1073741824.0);
         }
@@ -3423,10 +3435,18 @@ int main(int argc, char** argv) {
             copy_ms[(size_t) i] = probe_copy_latency_ms();
         }
         static const bool link_abs = [] { const char* v = std::getenv("STRATA_SPLIT_LINK_ABS"); return v && v[0] == '1'; }();
+        // STRATA_SPLIT_UNIFORM=1 (opt-in, upstream b8844516): no per-link scaling at all (the uniform miss cost before
+        // upstream 0.1.41), for links where any scaling moves auto off the balanced placement (2x RTX 3090 on x16 + x4:
+        // decode -4..-8%)
+        static const bool split_uniform = [] {
+            const char* v = std::getenv("STRATA_SPLIT_UNIFORM");
+            return v && v[0] == '1';
+        }();
         std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps);
         for (int i = 0; i < ns; ++i) {
             const double lbw = link_gbps[(size_t) i];
-            if (link_abs) link_scale[(size_t) i] = lbw > 0.0 ? std::clamp(20.0 / lbw, 1.0, 64.0) : 1.0;
+            if (split_uniform) link_scale[(size_t) i] = 1.0;
+            else if (link_abs) link_scale[(size_t) i] = lbw > 0.0 ? std::clamp(20.0 / lbw, 1.0, 64.0) : 1.0;
             std::fprintf(stderr, "strata generate: layer split auto: CUDA%d link %.1f GB/s (a 64 KiB copy %.3f ms) -> "
                                  "miss cost x%.2f\n",
                          dev_of_stage(i), lbw, copy_ms[(size_t) i], link_scale[(size_t) i]);
