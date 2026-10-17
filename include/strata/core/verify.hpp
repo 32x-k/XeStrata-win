@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <chrono>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -132,7 +133,7 @@ private:
 
 class Verifier {
 public:
-    Verifier() = default;
+    Verifier();
     ~Verifier();
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
@@ -467,6 +468,11 @@ private:
     bool segmented_ = false;
     std::vector<strata::gpu::Graph*> segs_[9];
     std::vector<strata::gpu::Graph*>* seg_out_ = nullptr;   // the segments of the window being captured
+    // The window graph launched from a thread of its own, so the host is at layer 0's ring while the launch call
+    // still returns (Windows: hipGraphLaunch of a window took 1.8 ms of host time, the GPU rang layer 0 after 0.7).
+    // STRATA_VERIFY_ASYNC_LAUNCH=1 / 0 forces it either way; the default is on on Windows only.
+    struct AsyncLaunch;
+    std::unique_ptr<AsyncLaunch> alaunch_;
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T

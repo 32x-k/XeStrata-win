@@ -44,11 +44,13 @@
 #include <vector>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <immintrin.h>
+#include <thread>
 
 namespace strata::core {
 namespace {
@@ -216,7 +218,63 @@ void Verifier::diag(std::FILE* f) const {
                  last_t_, (long long) last_pos0_, cur_layer_ + 1, rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_));
 }
 
+// The thread that launches the window graph (alaunch_ in verify.hpp).  launch() hands it a graph; wait() returns
+// once the launch call has returned, with its error if it failed.
+struct Verifier::AsyncLaunch {
+    std::mutex mu;
+    std::condition_variable cv;
+    strata::gpu::Graph* graph = nullptr;
+    strata::gpu::Stream stream = nullptr;
+    bool stop = false;
+    std::atomic<int> state{0};   // 0: idle, 1: handed over or launching, 2: the launch failed
+    std::string error;
+    std::thread th;
+
+    AsyncLaunch() : th([this] { loop(); }) {}
+    ~AsyncLaunch() {
+        { std::lock_guard<std::mutex> lk(mu); stop = true; }
+        cv.notify_one();
+        th.join();
+    }
+    void loop() {
+        for (;;) {
+            strata::gpu::Graph* g;
+            strata::gpu::Stream s;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [this] { return stop || graph != nullptr; });
+                if (graph == nullptr) return;
+                g = graph;
+                s = stream;
+                graph = nullptr;
+            }
+            const bool ok = strata::gpu::graph_launch(g, s);
+            if (ok) (void) strata::gpu::stream_idle(s);
+            else error = strata::gpu::last_error();
+            state.store(ok ? 0 : 2, std::memory_order_release);
+            state.notify_all();
+        }
+    }
+    void launch(strata::gpu::Graph* g, strata::gpu::Stream s) {
+        state.store(1, std::memory_order_relaxed);
+        { std::lock_guard<std::mutex> lk(mu); graph = g; stream = s; }
+        cv.notify_one();
+    }
+    bool failed() const { return state.load(std::memory_order_acquire) == 2; }
+    bool wait(std::string& err) {
+        int v;
+        while ((v = state.load(std::memory_order_acquire)) == 1) state.wait(1, std::memory_order_acquire);
+        if (v != 2) return true;
+        state.store(0, std::memory_order_relaxed);
+        err = "verify: launch: " + error;
+        return false;
+    }
+};
+
+Verifier::Verifier() = default;
+
 Verifier::~Verifier() {
+    alaunch_.reset();
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);
     if (cs_) strata::gpu::stream_sync(cs_);
@@ -1666,9 +1724,26 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
-    const bool le = strata::gpu::graph_launch(res ? exec_res_[T] : segmented_ ? segs_[T][0] : exec_[T], cs_);
-    if (!le) { err = std::string("verify: launch: ") + strata::gpu::last_error(); return false; }
-    (void) strata::gpu::stream_idle(cs_);
+    static const char* const async_env = std::getenv("STRATA_VERIFY_ASYNC_LAUNCH");
+#if defined(_WIN32)
+    static const bool async_on = async_env == nullptr || std::atoi(async_env) != 0;
+#else
+    static const bool async_on = async_env != nullptr && std::atoi(async_env) != 0;
+#endif
+    // the resident graph rings nothing and a segmented window launches on: those launch here
+    AsyncLaunch* const al = async_on && !res && !segmented_
+                                ? (alaunch_ ? alaunch_.get() : (alaunch_ = std::make_unique<AsyncLaunch>()).get())
+                                : nullptr;
+    struct Join {   // every return below comes after the launch call has returned
+        AsyncLaunch* a;
+        ~Join() { std::string e; if (a != nullptr) (void) a->wait(e); }
+    } join{al};
+    if (al != nullptr) al->launch(exec_[T], cs_);
+    else {
+        const bool le = strata::gpu::graph_launch(res ? exec_res_[T] : segmented_ ? segs_[T][0] : exec_[T], cs_);
+        if (!le) { err = std::string("verify: launch: ") + strata::gpu::last_error(); return false; }
+        (void) strata::gpu::stream_idle(cs_);
+    }
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
@@ -1682,6 +1757,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             *(volatile uint32_t*) h_flagA_ = UINT32_MAX;
             raise_flag(h_flagB_, UINT32_MAX);
             *flag = UINT32_MAX;
+            std::string le;
+            if (al != nullptr) (void) al->wait(le);
             strata::gpu::stream_sync(cs_);
             strata::gpu::stream_sync(copy_);
             return false;
@@ -1709,6 +1786,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
                 last_flush = now;
+                if (al != nullptr && al->failed()) { (void) al->wait(err); return false; }
                 const strata::gpu::Status st = strata::gpu::stream_status(cs_);
                 if (st == strata::gpu::Status::Failed) {
                     err = "verify: layer " + std::to_string(l) + ": " + strata::gpu::last_error();
@@ -1759,6 +1837,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         ms_pool += ms_since(b);
     }
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
+    if (al != nullptr && !al->wait(err)) return false;
     const bool se = strata::gpu::stream_sync(cs_);
     if (!se) { err = std::string("verify: ") + strata::gpu::last_error(); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
