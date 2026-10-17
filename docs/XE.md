@@ -30,6 +30,39 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
 
+## Integration through Strata 0.1.45
+
+The changes of upstream Strata 0.1.44.1 to 0.1.45 (`477ac13c`) are carried into Xe.
+
+The main ones:
+
+- The prompt's MoE products read the experts resident in VRAM from their cache slots directly (B70, 1K: prefill +13%). The input is quantized once a token and spread to its k rows.
+- The verify window's QSA block scores read a block's keys once for all of the window's rows (RTX 4070, 32K: decode +1.3%).
+- The experts' decode keeps the activations in work-group local memory, the default on every GPU it fits (B70: +1%).
+- The QSA top-k picks its radix digits with a cooperative scan; a layer whose experts are all resident groups its MMQ experts by their rows, most first.
+- A layer split's prefill hands a chunk's rows to the next GPU in eight pieces, so the two GPUs' copies overlap (`STRATA_HANDOFF_PIPE=0`: one copy).
+- The conversation cache: a new conversation that starts at another one's mid-conversation checkpoint borrows it (#1164); a conversation that grew little is not parked again (`--conversation-cache-park-gain`); checkpoints are kept spaced back from a conversation's end (`--prompt-cache-spread`).
+- The resident RAM mode: with room left in the budget, the experts of the slots the prompt path borrows are kept in RAM too (#1683).
+- `--layer-split auto`: when two cards leave a small stage, it picks again by the ratio of their room (#2644).
+- serve: the thinking limit (`max_tokens` and Anthropic's `budget_tokens`), the model card's sampling for a request without one, the prompt tokenized from the last shared prefix (#1852), the next turn sent to the slot that holds the conversation's checkpoint (#2518), short prompts admitted first (`STRATA_ADMIT_SHORT_FIRST`, opt-in), parser fixes.
+- Carried as opt-in: `STRATA_EXCHANGE_ROTATE`, `STRATA_RAM_ADAPT`, `STRATA_SPLIT_UNIFORM`.
+
+Fixed on XeStrata's side during the integration:
+
+- The boundary between the experts' int8 and FP16 products is timed up to 1024 rows an expert. Timed to 256 only, it read IQ3_S's and UD-Q4_K_XL's 32K chunks with the int8 products (B70, IQ3_S, 32K prefill 1,896 -> 2,425 tok/s).
+- The choice of the big prompt chunks no longer counts the RAM copy it has already made a second time (B70, UD-Q4_K_XL, 32K prefill 1,760 -> 2,412 tok/s).
+
+Compared with upstream v0.1.45 on the three makers' GPUs (generate on five model files, serve, everyday use, image generation); the B70 is now compared with upstream's `sycl/` port too.
+On the RTX 4070, generate's prefill is the same or faster on all five files (IQ3_XXS at 1K and IQ2_XS 17% faster, UD-Q4_K_XL 1%), and decode 13-30% faster.
+On the RX 9060 XT, prefill is 2.1-3.2 times as fast, and IQ3_XXS's decode, 2.5-4.7% slower in 0.1.44.1, is now the same to 7% faster.
+On the B70, prefill is 1.6-2.5 times as fast as upstream's `sycl/` port and decode 15-95% faster (UD-Q4_K_XL is not compared: the `sycl/` port's answers on it are broken).
+Image generation (1024x1024, 8 steps) takes XeStrata 7.6 s on the B70, 13.2 s on the RTX 4070 and 22.3 s on the RX 9060 XT, upstream's sd-cli 52 s, 25.5 s and 73.5 s.
+Against the XeStrata before the integration on the same text, decode is as fast on the B70 and the RTX 4070, and the B70's prefill at 1K 35% faster.
+
+Not carried: upstream's `sycl/`, the batch work (more than 8 slots on a layer split, the slots' GPU-to-GPU copies, the admission opt-ins, the one-launch rows),
+the Turing (sm_75) speed paths, `--prefill-pipe` (B70 + RTX 4070: prefill 38.6% slower in the smaller chunks), `STRATA_SPLIT_OVERLAP` (XeStrata's stages share no memory word between the GPUs),
+the CUDA opt-in paths without a measurement, and upstream's test tools and records.
+
 ## Integration through Strata 0.1.44.1
 
 The changes of upstream Strata 0.1.43.1 to 0.1.44.1 (`296b59d2`) are carried into Xe.

@@ -32,6 +32,39 @@ Qwen3.8 の prompt は、xmx_gemm が動く GPU では FP16 の経路のまま�
 `STRATA_NO_XMX=1` は XMX を使わない経路を選ばせます。
 CPU 内蔵のグラフィックス（開発機では UHD 770）は、確認用の 2 つ目の実機として使います。
 
+## Strata 0.1.45 の取り込み
+
+upstream の Strata 0.1.44.1 から 0.1.45（`477ac13c`）までの変更を Xe に移しています。
+
+移したものの主なものは次のとおりです。
+
+- prompt の MoE の積が、VRAM に常駐するエキスパートをキャッシュの枠から直接読む（B70 の 1K で prefill +13%）。入力の量子化はトークンごとに 1 回にし、k 行に配る。
+- 確認の窓の QSA の採点は、ブロックの鍵を 1 度読んで窓の行を全部まかなう（RTX 4070 の 32K で decode +1.3%）。
+- エキスパートの decode で、活性を作業グループのローカルメモリに置く形を、入るすべての GPU で既定にする（B70 で +1%）。
+- QSA の top-k の基数の桁を協調の走査で選ぶ。常駐のエキスパートの層は、MMQ のグループを行の数の多い順に組む。
+- 層の分割の prefill で、チャンクの行を 8 つに分けて次の GPU に渡し、2 枚の転送を重ねる（`STRATA_HANDOFF_PIPE=0` で 1 回の転送）。
+- 会話のキャッシュ: 新しい会話が別の会話の途中のチェックポイントで始まるときは借りる（#1164）、少ししか伸びていない会話は置き直さない（`--conversation-cache-park-gain`）、チェックポイントを会話の終わりから間を空けて残す（`--prompt-cache-spread`）。
+- RAM 常駐の形: 予算に余りがあれば、prompt の経路が借りる枠のエキスパートも RAM に置く（#1683）。
+- `--layer-split auto`: 2 枚で小さな段ができたら置き場所の広さの割合で選び直す（#2644）。
+- serve: 思考の上限（`max_tokens` と Anthropic の `budget_tokens`）、sampling のない要求にモデルカードの値、プロンプトを最後に共有した前置きからトークン化する（#1852）、次のターンを会話のチェックポイントを持つスロットへ送る（#2518）、短い prompt を先に受け入れる（`STRATA_ADMIT_SHORT_FIRST`、opt-in）、パーサーの修正。
+- opt-in のまま移したもの: `STRATA_EXCHANGE_ROTATE`、`STRATA_RAM_ADAPT`、`STRATA_SPLIT_UNIFORM`。
+
+この取り込みの間に XeStrata の側で直したもの:
+
+- int8 と FP16 のエキスパートの積の境目を、1 つのエキスパートに 1024 行まで測る。256 行までしか測らず、IQ3_S と UD-Q4_K_XL の 32K のチャンクを int8 で読んでいた（B70 の IQ3_S の 32K の prefill 1,896 → 2,425 tok/s）。
+- 大きな prompt のチャンクを取るかの判定で、もう置いた RAM の写しを数え直さない（B70 の UD-Q4_K_XL の 32K の prefill 1,760 → 2,412 tok/s）。
+
+upstream v0.1.45 と 3 社の GPU で比べました（generate は 5 つのモデルファイル、serve、通常使用、画像の生成）。B70 は今回から、upstream の `sycl/` 版とも比べています。
+RTX 4070 は、generate の prefill が 5 つのファイルのすべてで同等以上（IQ3_XXS の 1K と IQ2_XS は 17%、UD-Q4_K_XL は 1% 速い）、decode が 13〜30% 速いです。
+RX 9060 XT は prefill が 2.1〜3.2 倍で、0.1.44.1 では 2.5〜4.7% 遅かった IQ3_XXS の decode も同等から 7% 速くなりました。
+B70 は upstream の `sycl/` 版より prefill が 1.6〜2.5 倍、decode が 15〜95% 速いです（UD-Q4_K_XL は `sycl/` 版の答えが壊れていて比べていません）。
+画像の生成（1024x1024、8 ステップ）は、XeStrata が B70 で 7.6 秒、RTX 4070 で 13.2 秒、RX 9060 XT で 22.3 秒、upstream の sd-cli がそれぞれ 52 秒、25.5 秒、73.5 秒です。
+取り込みの前の XeStrata と同じ文で比べると、decode は B70 と RTX 4070 で同じ速さ、prefill は B70 の 1K が 35% 速くなりました。
+
+移していないのは、upstream の `sycl/`、バッチの改善（8 を超えるスロットの層の分割、スロットの GPU 間のコピー、受け入れの opt-in、行をまとめた起動）、Turing（sm_75）の速さの経路、
+`--prefill-pipe`（B70 + RTX 4070 では小さなチャンクで prefill が 38.6% 遅い）、`STRATA_SPLIT_OVERLAP`（XeStrata の段の受け渡しは GPU どうしで同じメモリの語を見られない）、
+計測のない CUDA の opt-in の経路、upstream の試験の道具と記録です。
+
 ## Strata 0.1.44.1 の取り込み
 
 upstream の Strata 0.1.43.1 から 0.1.44.1（`296b59d2`）までの変更を Xe に移しています。
