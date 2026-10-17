@@ -903,6 +903,9 @@ A chat and an agent's subagent can then alternate without re-reading each other.
   If it does not, it evicts the oldest parked conversations and checks again (upstream 940011da).
   If that is still not enough, or the copy does not fit the budget, it skips parking and reads the prompt as before.
   To fit the budget, too, the oldest parked conversation is dropped first.
+- A new conversation that starts with a checkpoint inside a parked one (subagents that share a system prompt and tool list, a compacted history) borrows the K/V up to there and the checkpoint, and the parked conversation stays where it is (the engine log says `borrowed`; upstream c9e571e0 and 2b296987, #1164).
+  A match on a parked conversation's live state or its deepest checkpoint is that conversation going on and moves it into the session as before; so does a match that reaches a pinned shared prefix (`pin=N`).
+  When the outgoing conversation fits only in the parked one's room, it keeps its place and the parked one is moved in whole, as before.
 - `--conversation-cache-min-tokens N` (default 0 = every one) parks only conversations of at least N tokens (upstream 624070c5).
   A parked conversation takes one of the slots whatever its length, so a client that puts short side requests between the turns of a long conversation filled the slots with them and evicted the long one.
 - `--conversation-cache-park-gain N` (opt-in, default 0 = park every turn) parks a conversation again only after it advanced N tokens past the copy it would supersede (upstream d9cb22d2, #2265).
