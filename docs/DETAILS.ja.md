@@ -1173,6 +1173,7 @@ Python の標準ライブラリだけを使うので、`.venv` ができる前�
 [`mmproj-Qwen3.8-Flash-Next-BF16.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)（0.9 GB、27 層の ViT と、言語モデルへの射影）です。
 使うかどうかは**任意**です。
 setup の「Images?」に yes と答えるか、`--vision gpu`（または `--vision cpu`）を付けて setup をもう一度実行します。
+yes（`--vision yes`）は、24 GB 以上のカードでは GPU のエンコーダー、それより小さいカードでは CPU のエンコーダーです。GPU のエンコーダーは VRAM を約 1.4 GB 空けておくので、16 GB のカードで文章の速さが 3〜5% 落ちたためです（upstream #2406 の計測）。`--vision gpu` を付ければ、小さいカードでも GPU のエンコーダーです。
 setup はエンコーダーをダウンロードし、小さな補助のプログラム（`strata-vision`、llama.cpp の `mtmd` のライブラリから）をビルドして、起動スクリプトに足します。
 ほかは何も変わりません。
 

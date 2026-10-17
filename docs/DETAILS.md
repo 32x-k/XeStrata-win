@@ -1194,6 +1194,7 @@ The model has an image encoder:
 [`mmproj-Qwen3.8-Flash-Next-BF16.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
 (0.9 GB, a 27-layer ViT plus the projector into the language model).
 It is **optional**: say yes when setup asks "Images?", or run setup again with `--vision gpu` (or `--vision cpu`).
+Yes (`--vision yes`) means the GPU encoder on a card of 24 GB and more and the CPU encoder on a smaller one: the GPU encoder keeps about 1.4 GB of VRAM free, which cost 3-5% of text speed on 16 GB cards (upstream #2406's measurement). `--vision gpu` keeps the GPU encoder on a small card too.
 setup downloads the encoder, builds a small helper (`strata-vision`, from llama.cpp's `mtmd` library) and adds it to your start script.
 Nothing else changes.
 

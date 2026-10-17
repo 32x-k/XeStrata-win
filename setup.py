@@ -2489,6 +2489,26 @@ def small_card_note(ctx: int, draft_vocab: str | None) -> list[str]:
     return lines
 
 
+IMAGES_GPU_ENCODER_MIN_VRAM_GB = 23.5   # upstream 45752724 (#2406): below this the images answer "yes" gets the CPU
+# encoder (a card of 12-16 GB: the GPU encoder's ~1.1-1.4 GB is ~850 expert slots lost, 3-5% of decode and prompt on a
+# P100 / A4000 16 GB, upstream's measurement; the cost is the VRAM the experts lose, whatever the card's maker)
+
+
+def images_encoder(asked: str, gpu: dict) -> str:
+    """Which encoder an images answer gets: "yes" (the question's y, or --vision yes) means the GPU encoder on a card of
+    24 GB and more and the CPU encoder below that (a picture then takes a few seconds, the text keeps the ~1 GB of VRAM
+    for experts).  --vision gpu is always kept (with a note on a small card); --vision cpu is kept."""
+    vram = gpu_expert_vram(gpu or {"vram_gb": 0.0})
+    small = 0 < vram < IMAGES_GPU_ENCODER_MIN_VRAM_GB
+    if asked == "gpu" and small:
+        warn(f"the GPU image encoder keeps ~1.4 GB of VRAM that a {vram:.0f} GB card would use for experts (upstream "
+             "measured 3-5% of decode on 16 GB cards, #2406): kept as you chose; --vision cpu reads pictures on the "
+             "CPU instead (a few seconds each)")
+    if asked == "yes":
+        return "cpu" if small else "gpu"
+    return asked
+
+
 def gpu_expert_vram(gpu) -> float:
     """The VRAM (GB) that can hold experts instead of RAM: none on the processor's graphics (its memory is the RAM),
     but an AMD APU's BIOS carve-out, which the OS does not see (upstream c4a329fe)."""
@@ -4722,12 +4742,18 @@ def main() -> int:
     elif a.vision:
         # yes = the GPU encoder, the CPU encoder its fallback.  Adopted without a tolerance on the embeddings (they
         # differ from the CPU encoder's by a few percent; the answers agree): the 2026-09-30-xe-vision-sycl record
-        vision = {"yes": "gpu", "no": "none"}.get(a.vision, a.vision)
+        vision = "none" if a.vision in ("no", "none") else images_encoder(a.vision, gpu)
     else:
+        small = 0 < gpu_expert_vram(gpu) < IMAGES_GPU_ENCODER_MIN_VRAM_GB
         say()
         say("  Images: the model can also read pictures (screenshots, photos, scanned pages). This adds a 0.9 GB")
-        say("  download; the image encoder runs on the GPU (on the CPU if it cannot start there).")
-        vision = "gpu" if ask("Do you want images?", ["y", "n"], "n", a.yes) == "y" else "none"
+        if small:
+            say("  download. On a card under 24 GB the encoder runs on the CPU (a few seconds per picture, nothing")
+            say("  taken from the GPU): the GPU encoder keeps ~1.4 GB of VRAM free, which cost 3-5% of text speed on")
+            say("  16 GB cards. --vision gpu if you want pictures in under a second.")
+        else:
+            say("  download; the image encoder runs on the GPU (on the CPU if it cannot start there).")
+        vision = images_encoder("yes", gpu) if ask("Do you want images?", ["y", "n"], "n", a.yes) == "y" else "none"
     ok("images: " + {"none": "off", "gpu": "on (encoder on the GPU, the CPU encoder as fallback)",
                      "cpu": "on (encoder on the CPU)"}[vision])
     if vision != "none" and MODELS[model].get("vision_untested"):
