@@ -35,16 +35,16 @@ namespace canon = strata::kernels::canon;
 inline float h2f(ggml_half h) { return _cvtsh_ss(h); }
 inline ggml_half f2h(float f) { return _cvtss_sh(f, _MM_FROUND_TO_NEAREST_INT); }
 
-// The CPU's form of a canonical activation (the same values as the GPU's q8_1 blocks, laid out for aligned loads):
-// the scales as floats (the fp16 value), each group's integer sum of its values (Q2_0's rows take code x q - sum q),
-// then the int8 values from a 64-byte boundary.
-inline size_t qs_offset(int64_t n_scales) { return (size_t) ((n_scales * 8 + 63) / 64 * 64); }
+// The CPU's form of a canonical activation of n values with a scale for each `group` (the same values as the GPU's
+// q8_1 blocks, laid out for aligned loads): the scales as floats (the fp16 value), each 32 values' integer sum (Q2_0's
+// rows take code x q - sum q), then the int8 values from a 64-byte boundary.
+inline size_t qs_offset(int64_t n, int group) { return (size_t) (((n / group) * 4 + (n / 32) * 4 + 63) / 64 * 64); }
 inline const float* act_scales(const void* a) { return static_cast<const float*>(a); }
-inline const int32_t* act_sums(const void* a, int64_t n_scales) {
-    return reinterpret_cast<const int32_t*>(static_cast<const float*>(a) + n_scales);
+inline const int32_t* act_sums(const void* a, int64_t n, int group) {
+    return reinterpret_cast<const int32_t*>(static_cast<const float*>(a) + n / group);
 }
-inline const int8_t* act_values(const void* a, int64_t n_scales) {
-    return static_cast<const int8_t*>(a) + qs_offset(n_scales);
+inline const int8_t* act_values(const void* a, int64_t n, int group) {
+    return static_cast<const int8_t*>(a) + qs_offset(n, group);
 }
 
 // Where value j of an activation of n values goes in the order a down projection's rows read it (canon_quant's
@@ -81,7 +81,7 @@ constexpr PosTables kPos{};
 // one IQ2_XS row of n values against an activation with a scale per 256 values (the reference loops)
 float iq2xs_row(const block_iq2_xs* w, int n, const void* a) {
     STRATA_CANON_NO_CONTRACT
-    const int8_t* xq = act_values(a, n / QK_K);
+    const int8_t* xq = act_values(a, n, QK_K);
     const float* xd = act_scales(a);
     float s[2] = {0.0f, 0.0f};
     const int nb = n / QK_K;
@@ -111,7 +111,7 @@ float iq2xs_row(const block_iq2_xs* w, int n, const void* a) {
 // 2 (block % 4) + call, a call the block's values 0-7 and 16-23, or 8-15 and 24-31
 float iq4nl_row(const block_iq4_nl* w, int n, const void* a) {
     STRATA_CANON_NO_CONTRACT
-    const int8_t* xq = act_values(a, n / QK4_NL);
+    const int8_t* xq = act_values(a, n, QK4_NL);
     const float* xd = act_scales(a);
     float s[8] = {};
     const int nb = n / QK4_NL;
@@ -165,6 +165,30 @@ inline __m256 silu_mul8(__m256 g, __m256 u) {
     return _mm256_mul_ps(_mm256_mul_ps(g, rcp8(_mm256_add_ps(_mm256_set1_ps(1.0f), e))), u);
 }
 
+// one Q2_0 gate/up row of n values against an activation in Q2_0's order with a scale per 256 values (the reference
+// loops): call k (32 values) d x the scale x its exact (code - 1) x q sum into the sum of k modulo 16, the 16 added
+// as the GPU's butterfly
+float q20_gu_row(const block_q2_0* w, int n, const void* a) {
+    STRATA_CANON_NO_CONTRACT
+    const int8_t* xq = act_values(a, n, QK_K);
+    const float* xd = act_scales(a);
+    float s[16] = {};
+    for (int k = 0; k < n / 32; ++k) {
+        const block_q2_0& b = w[k / 2];
+        int t = 0;
+        for (int i = 0; i < 32; ++i) {
+            const int v = 32 * (k % 2) + i;   // the value in its block
+            const int code = (b.qs[v / 4] >> (2 * (v % 4))) & 3;
+            t += (code - 1) * (int) xq[act_pos(32 * k + i, CanonOrder::q2_planes, n)];
+        }
+        const float c = h2f(b.d) * xd[(32 * k) / QK_K];
+        s[k % 16] = canon::fma(c, (float) t, s[k % 16]);
+    }
+    for (int o = 8; o > 0; o >>= 1)
+        for (int l = 0; l < o; ++l) s[l] += s[l + o];
+    return s[0];
+}
+
 // ---- the AVX2 forms of the down rows (the gate/up rows: iq_avx2's iq256_canon_rows)
 namespace plain {
 #define STRATA_ROWS_VNNI 0
@@ -212,9 +236,10 @@ bool canon_layer(const NativeFmt& f) {
         const char* v = std::getenv("STRATA_CANON");
         return v == nullptr || v[0] != '0';
     }();
-    const auto gu_ok = [](int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22; };
-    const auto fits = [](int64_t n, int group, size_t cap) { return (size_t) n + qs_offset(n / group) <= cap; };
-    return on && gu_ok(f.gu_type) && (f.up_type < 0 || gu_ok(f.up_type)) && (f.d_type == 20 || f.d_type == 42) &&
+    const auto gu_ok = [](int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 23 || t == 42; };
+    const auto fits = [](int64_t n, int group, size_t cap) { return (size_t) n + qs_offset(n, group) <= cap; };
+    const int up = f.up_type < 0 ? f.gu_type : f.up_type;
+    return on && gu_ok(f.gu_type) && gu_ok(up) && (f.gu_type == 42) == (up == 42) && (f.d_type == 20 || f.d_type == 42) &&
            f.n_embd % (int64_t{2} * QK_K) == 0 && f.n_ff % 128 == 0 && fits(f.n_embd, QK_K, kNativeActBytes) &&
            fits(f.n_ff, 32, kNativeHBytes);
 }
@@ -222,8 +247,8 @@ bool canon_layer(const NativeFmt& f) {
 void canon_quant(const float* x, int64_t n, int group, void* dst, CanonOrder order) {
     STRATA_CANON_NO_CONTRACT
     float* ds = static_cast<float*>(dst);
-    int32_t* sums = reinterpret_cast<int32_t*>(ds + n / group);
-    int8_t* q = static_cast<int8_t*>(dst) + qs_offset(n / group);
+    int32_t* sums = reinterpret_cast<int32_t*>(ds + n / group);   // one for each 32
+    int8_t* q = static_cast<int8_t*>(dst) + qs_offset(n, group);
     static const bool scalar = std::getenv("STRATA_CANON_SCALAR") != nullptr;   // the reference loops (A/B)
     if (scalar) {
         for (int64_t g0 = 0; g0 < n; g0 += group) {
@@ -234,13 +259,12 @@ void canon_quant(const float* x, int64_t n, int group, void* dst, CanonOrder ord
             }
             const float d = canon::q8_scale(amax), id = canon::q8_inv(d);
             ds[g0 / group] = h2f(f2h(d));   // the fp16 value the GPU's blocks hold
-            int sum = 0;
             for (int i = 0; i < group; ++i) {
                 const int8_t v = canon::q8_value(x[g0 + i], id);
                 q[act_pos(g0 + i, order, n)] = v;
-                sum += v;
+                if (i % 32 == 0) sums[(g0 + i) / 32] = 0;
+                sums[(g0 + i) / 32] += v;
             }
-            sums[g0 / group] = sum;
         }
         return;
     }
@@ -263,9 +287,8 @@ void canon_quant(const float* x, int64_t n, int group, void* dst, CanonOrder ord
         ds[g0 / group] = h2f(f2h(d));   // the fp16 value the GPU's blocks hold
         const __m256 vid = _mm256_set1_ps(id);
         int8_t* out = order == CanonOrder::plain ? q + g0 : tmp;
-        __m256i acc = _mm256_setzero_si256();
         for (int i = 0; i < group; i += 32) {
-            __m256i v[4];
+            __m256i v[4], acc = _mm256_setzero_si256();
             for (int j = 0; j < 4; ++j) {
                 const __m256 t = _mm256_mul_ps(_mm256_loadu_ps(xg + i + 8 * (ptrdiff_t) j), vid);
                 const __m256 r = _mm256_add_ps(t, _mm256_or_ps(_mm256_and_ps(t, signm), half));
@@ -274,18 +297,18 @@ void canon_quant(const float* x, int64_t n, int group, void* dst, CanonOrder ord
             }
             const __m256i p8 = _mm256_packs_epi16(_mm256_packs_epi32(v[0], v[1]), _mm256_packs_epi32(v[2], v[3]));
             _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i), _mm256_permutevar8x32_epi32(p8, perm));
+            __m128i s4 = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+            s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0x4E));
+            s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0xB1));
+            sums[(g0 + i) / 32] = _mm_cvtsi128_si32(s4);
         }
-        __m128i s4 = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
-        s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0x4E));
-        s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0xB1));
-        sums[g0 / group] = _mm_cvtsi128_si32(s4);
         if (order != CanonOrder::plain) {
-            if (group == 32) {   // a down activation's 32: its pattern's table
+            if (group == 32 || group == 256) {   // a down activation's 32, a Q2_0 gate/up's 256: the pattern's table
                 const bool q2 = order == CanonOrder::q2_planes;
                 const int64_t span = q2 ? ((g0 & ~int64_t{255}) + 256 <= n ? 256 : 64) : 128;
                 const uint8_t* tbl = (q2 ? (span == 256 ? kPos.q2 : kPos.q2_tail) : kPos.iq4) + (g0 & (span - 1));
                 int8_t* base = q + (g0 & ~(span - 1));
-                for (int i = 0; i < 32; ++i) base[tbl[i]] = tmp[i];
+                for (int i = 0; i < group; ++i) base[tbl[i]] = tmp[i];
             } else {
                 for (int i = 0; i < group; ++i) q[act_pos(g0 + i, order, n)] = tmp[i];
             }
@@ -299,14 +322,18 @@ void canon_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* a
     const int8_t* x[8];
     const float* dx[8];
     for (int t = 0; t < nt; ++t) {
-        x[t] = act_values(act[t], n / QK_K);
+        x[t] = act_values(act[t], n, QK_K);
         dx[t] = act_scales(act[t]);
     }
     const int up_type = f.up_type < 0 ? f.gu_type : f.up_type;
     const size_t up_row = f.up_row != 0 ? f.up_row : f.gu_row;
+    const int32_t* qs32[8];
+    if (f.gu_type == 42)
+        for (int t = 0; t < nt; ++t) qs32[t] = act_sums(act[t], n, QK_K);
     // iq_avx2's canonical rows (or the reference loops of IQ2_XS, A/B), a chunk of rows at a time for the gate and the
     // up rows, then the SwiGLU
-    static const bool scalar = std::getenv("STRATA_CANON_SCALAR") != nullptr && f.gu_type == 17 && up_type == 17;
+    static const bool scalar_env = std::getenv("STRATA_CANON_SCALAR") != nullptr;
+    const bool scalar = scalar_env && f.gu_type == up_type && (f.gu_type == 17 || f.gu_type == 42);
     constexpr int kChunk = 32;
     float gb[8][kChunk], ub[8][kChunk];
     for (int c0 = r0; c0 < r1; c0 += kChunk) {
@@ -317,12 +344,39 @@ void canon_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* a
             g[t] = gb[t] - c0;
             u[t] = ub[t] - c0;
         }
-        if (scalar) {
+        if (scalar && f.gu_type == 42) {
+            for (int r = c0; r < c1; ++r)
+                for (int t = 0; t < nt; ++t) {
+                    g[t][r] = q20_gu_row(reinterpret_cast<const block_q2_0*>(blob + (size_t) r * f.gu_row), n, act[t]);
+                    u[t][r] = q20_gu_row(reinterpret_cast<const block_q2_0*>(blob + f.up_off + (size_t) r * up_row), n, act[t]);
+                }
+        } else if (scalar) {
             for (int r = c0; r < c1; ++r)
                 for (int t = 0; t < nt; ++t) {
                     g[t][r] = iq2xs_row(reinterpret_cast<const block_iq2_xs*>(blob + (size_t) r * f.gu_row), n, act[t]);
                     u[t][r] = iq2xs_row(reinterpret_cast<const block_iq2_xs*>(blob + f.up_off + (size_t) r * up_row), n, act[t]);
                 }
+        } else if (f.gu_type == 42) {   // Q2_0 (the activation in its order)
+            with_nt(nt, [&](auto NTc) {
+                constexpr int NT = decltype(NTc)::value;
+                float gr[NT], ur[NT];
+                for (int r = c0; r < c1; ++r) {
+#if STRATA_AVXVNNI
+                    if (vnni_on()) {
+                        vnni::q20_gu_rows_nt<NT>(blob + (size_t) r * f.gu_row, n, x, dx, qs32, gr);
+                        vnni::q20_gu_rows_nt<NT>(blob + f.up_off + (size_t) r * up_row, n, x, dx, qs32, ur);
+                    } else
+#endif
+                    {
+                        plain::q20_gu_rows_nt<NT>(blob + (size_t) r * f.gu_row, n, x, dx, qs32, gr);
+                        plain::q20_gu_rows_nt<NT>(blob + f.up_off + (size_t) r * up_row, n, x, dx, qs32, ur);
+                    }
+                    for (int t = 0; t < NT && t < nt; ++t) {
+                        g[t][r] = gr[t];
+                        u[t][r] = ur[t];
+                    }
+                }
+            });
         } else {
             iq256_canon_rows(f.gu_type, blob, f.gu_row, n, x, dx, nt, g, c0, c1);
             iq256_canon_rows(up_type, blob + f.up_off, up_row, n, x, dx, nt, u, c0, c1);
@@ -342,13 +396,13 @@ void canon_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const*
     const int8_t* x[8];
     const float* dx[8];
     for (int t = 0; t < nt; ++t) {
-        x[t] = act_values(hq[t], n / QK4_NL);
+        x[t] = act_values(hq[t], n, QK4_NL);
         dx[t] = act_scales(hq[t]);
     }
     static const bool scalar = std::getenv("STRATA_CANON_SCALAR") != nullptr;
     if (f.d_type == 42) {   // Q2_0
         const int32_t* qs32[8];
-        for (int t = 0; t < nt; ++t) qs32[t] = act_sums(hq[t], n / 32);
+        for (int t = 0; t < nt; ++t) qs32[t] = act_sums(hq[t], n, 32);
         with_nt(nt, [&](auto NTc) {
             constexpr int NT = decltype(NTc)::value;
             for (int r = r0; r < r1; ++r) {

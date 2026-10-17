@@ -127,7 +127,10 @@ static_assert(sizeof(ActQ) <= sizeof(NativeAct) && alignof(ActQ) <= alignof(Nati
               "a Q2_0 layer's ActQ is kept in a NativeAct");
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
-    if (canon_layer(f)) { canon_quant(x, f.n_embd, 256, dst); return; }
+    if (canon_layer(f)) {   // a Q2_0 gate/up's values in the order its rows decode their codes
+        canon_quant(x, f.n_embd, 256, dst, f.gu_type == 42 ? CanonOrder::q2_planes : CanonOrder::plain);
+        return;
+    }
     // native_gu_rows reads a Q2_0 layer's ActQ, not ggml's vec_dot_type
     if (f.gu_type == 42) { act_quant_any(x, (int) f.n_embd, *new (dst) ActQ); return; }
     if (q8k_avx2(f.gu_act)) { q8k_quant_avx2(x, dst, f.n_embd); return; }

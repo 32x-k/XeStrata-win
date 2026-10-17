@@ -568,6 +568,7 @@ void canon_type(int type, int nt, const uint8_t* w, size_t row_bytes, int n, con
         case 18: canon_rows_nt<G ? 118 : 18>(nt, w, row_bytes, n, xq, xd, out, r0, r1); break;
         case 21: canon_rows_nt<G ? 121 : 21>(nt, w, row_bytes, n, xq, xd, out, r0, r1); break;
         case 22: canon_rows_nt<G ? 122 : 22>(nt, w, row_bytes, n, xq, xd, out, r0, r1); break;
+        case 23: canon_rows_nt<23>(nt, w, row_bytes, n, xq, xd, out, r0, r1); break;
         default: break;
     }
 }

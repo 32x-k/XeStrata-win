@@ -106,20 +106,52 @@ template <int NT> STRATA_ROWS_FN void iq4nl_rows_nt(const uint8_t* row, int n, c
     }
 }
 
+// Q2_0, four blocks (8 calls of 32 values) at b0: c[2 p + h] the codes of plane p of the calls' first (h 0) or second
+// 4 bytes, lane k call k; dw [d0, d0, d1, d1, d2, d2, d3, d3]
+STRATA_ROWS_FN inline void q20_step_codes(const uint8_t* b0, __m256i (&c)[8], __m256& dw) {
+    const __m256i m3 = _mm256_set1_epi8(3);
+    __m256i w0, w1;
+    call_dwords(b0 + 2, 18, w0, w1);
+    for (int p = 0; p < 4; ++p) {
+        c[2 * (size_t) p] = _mm256_and_si256(_mm256_srli_epi16(w0, 2 * p), m3);
+        c[2 * (size_t) p + 1] = _mm256_and_si256(_mm256_srli_epi16(w1, 2 * p), m3);
+    }
+    uint16_t h[4];
+    for (int b = 0; b < 4; ++b) std::memcpy(&h[b], b0 + 18 * (ptrdiff_t) b, 2);
+    dw = _mm256_permutevar8x32_ps(
+        _mm256_castps128_ps256(_mm_cvtph_ps(_mm_set_epi16(0, 0, 0, 0, (short) h[3], (short) h[2], (short) h[1],
+                                                          (short) h[0]))), _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3));
+}
+
+// the 8 calls' exact (code - 1) x q sums against 256 values in Q2_0's order at xb (qs: their 8 sums of q)
+STRATA_ROWS_FN inline __m256i q20_step_sums(const __m256i (&c)[8], const int8_t* xb, const int32_t* qs) {
+#if STRATA_ROWS_VNNI
+    __m256i T = _mm256_setzero_si256();
+    for (int m = 0; m < 8; ++m)
+        T = _mm256_dpbusd_avx_epi32(T, c[m], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb + 32 * (ptrdiff_t) m)));
+#else
+    __m256i s16[2];   // two chains of int16 sums (|sum| <= 4 x 762 each)
+    for (int m = 0; m < 2; ++m)
+        s16[m] = _mm256_maddubs_epi16(c[m], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb + 32 * (ptrdiff_t) m)));
+    for (int m = 2; m < 8; ++m)
+        s16[m & 1] = _mm256_add_epi16(s16[m & 1], _mm256_maddubs_epi16(c[m], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb + 32 * (ptrdiff_t) m))));
+    const __m256i T = _mm256_madd_epi16(_mm256_add_epi16(s16[0], s16[1]), _mm256_set1_epi16(1));
+#endif
+    return _mm256_sub_epi32(T, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qs)));
+}
+
 // one Q2_0 row against NT tokens' activations in Q2_0's order (canon_quant's q2_planes), with a scale for each 32
 // (dx) and their 32-value integer sums (qs32): each call of 32 values is (code - 1) x q summed as code x q - sum(q),
 // exact, then d x the scale x that sum into the sum of the call index modulo 4 (the GPU's 4 lanes a row); at the end
 // (lane 0 + lane 2) + (lane 1 + lane 3).
 //   Four blocks (8 calls) a step: 8 vectors (plane p of the calls' first or second 4 bytes), lane k of each holding
-// call k's codes, so the 8 products add vertically into the 8 calls' sums (without VNNI in int16, |sum| <= 8 x 762,
-// then one madd).  The weights: block b's dwords 0, 2 (the calls' first 4 bytes) and 1, 3, shifted by 2 p and masked.
+// call k's codes, so the 8 products add vertically into the 8 calls' sums (without VNNI in int16, then one madd).
 // A last pair of blocks (n / 64 not a multiple of 4) as two 64-value plane blocks (value 4 k + p at 16 p + k): the
 // 4-call form in 128 bits was 8% slower there with AVX-VNNI.
 template <int NT> STRATA_ROWS_FN void q20_rows_nt(const uint8_t* row, int n, const int8_t* const* x,
                                                   const float* const* dx, const int32_t* const* qs32, float* res) {
     STRATA_CANON_NO_CONTRACT
     const __m256i m3 = _mm256_set1_epi8(3);
-    const __m256i dup = _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3);
     __m128 acc[NT];
     for (int t = 0; t < NT; ++t) acc[t] = _mm_setzero_ps();
     const int nb = n / 64;   // even (canon_layer: n a multiple of 128)
@@ -128,34 +160,12 @@ template <int NT> STRATA_ROWS_FN void q20_rows_nt(const uint8_t* row, int n, con
     for (; k0 + 4 <= nb; k0 += 4) {
         const uint8_t* b0 = row + (size_t) k0 * 18;
         canon_ahead(b0, pf);
-        __m256i w0, w1;
-        call_dwords(b0 + 2, 18, w0, w1);
-        __m256i c[8];   // c[2 p + h]
-        for (int p = 0; p < 4; ++p) {
-            c[2 * (size_t) p] = _mm256_and_si256(_mm256_srli_epi16(w0, 2 * p), m3);
-            c[2 * p + 1] = _mm256_and_si256(_mm256_srli_epi16(w1, 2 * p), m3);
-        }
-        uint16_t h[4];
-        for (int b = 0; b < 4; ++b) std::memcpy(&h[b], b0 + 18 * (ptrdiff_t) b, 2);
-        const __m256 dw = _mm256_permutevar8x32_ps(
-            _mm256_castps128_ps256(_mm_cvtph_ps(_mm_set_epi16(0, 0, 0, 0, (short) h[3], (short) h[2], (short) h[1],
-                                                              (short) h[0]))), dup);
+        __m256i c[8];
+        __m256 dw;
+        q20_step_codes(b0, c, dw);
         for (int t = 0; t < NT; ++t) {
-            const int8_t* xb = x[t] + 64 * (ptrdiff_t) k0;
-#if STRATA_ROWS_VNNI
-            __m256i T = _mm256_setzero_si256();
-            for (int m = 0; m < 8; ++m)
-                T = _mm256_dpbusd_avx_epi32(T, c[m], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb + 32 * (ptrdiff_t) m)));
-#else
-            __m256i s16[2];   // two chains of int16 sums (|sum| <= 4 x 762 each)
-            for (int m = 0; m < 2; ++m)
-                s16[m] = _mm256_maddubs_epi16(c[m], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb + 32 * (ptrdiff_t) m)));
-            for (int m = 2; m < 8; ++m)
-                s16[m & 1] = _mm256_add_epi16(s16[m & 1], _mm256_maddubs_epi16(c[m], _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb + 32 * (ptrdiff_t) m))));
-            __m256i T = _mm256_madd_epi16(_mm256_add_epi16(s16[0], s16[1]), _mm256_set1_epi16(1));
-#endif
-            T = _mm256_sub_epi32(T, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qs32[t] + 2 * (ptrdiff_t) k0)));
-            const __m256 cT = _mm256_mul_ps(dw, _mm256_loadu_ps(dx[t] + 2 * (ptrdiff_t) k0));   // calls 2 k0 .. 2 k0 + 7
+            const __m256i T = q20_step_sums(c, x[t] + 64 * (ptrdiff_t) k0, qs32[t] + 2 * (ptrdiff_t) k0);
+            const __m256 cT = _mm256_mul_ps(dw, _mm256_loadu_ps(dx[t] + 2 * (ptrdiff_t) k0));   // calls 2 k0 .. + 7
             const __m256 Tf = _mm256_cvtepi32_ps(T);
             acc[t] = _mm_fmadd_ps(_mm256_castps256_ps128(cT), _mm256_castps256_ps128(Tf), acc[t]);
             acc[t] = _mm_fmadd_ps(_mm256_extractf128_ps(cT, 1), _mm256_extractf128_ps(Tf, 1), acc[t]);
@@ -192,5 +202,37 @@ template <int NT> STRATA_ROWS_FN void q20_rows_nt(const uint8_t* row, int n, con
     for (int t = 0; t < NT; ++t) {
         const __m128 v = _mm_add_ps(acc[t], _mm_movehl_ps(acc[t], acc[t]));
         res[t] = _mm_cvtss_f32(v) + _mm_cvtss_f32(_mm_shuffle_ps(v, v, 1));
+    }
+}
+
+// one Q2_0 gate/up row against NT tokens' activations in Q2_0's order with one scale for each 256 (dx) and their
+// 32-value sums (qs32): each call (32 values) d x the scale x its exact sum into the sum of the call index modulo 16
+// (the GPU's 16 lanes a gate/up row; two 8-lane sums, the steps of 8 calls in turn); at the end the GPU's
+// butterfly, ((l + l + 8) + (l + 4)) + ..., in four steps.  n a multiple of 256.
+template <int NT> STRATA_ROWS_FN void q20_gu_rows_nt(const uint8_t* row, int n, const int8_t* const* x,
+                                                     const float* const* dx, const int32_t* const* qs32, float* res) {
+    STRATA_CANON_NO_CONTRACT
+    __m256 acc[NT][2];
+    for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = _mm256_setzero_ps();
+    const int nb = n / 64;
+    const int pf = iq_prefetch_bytes();
+    for (int k0 = 0; k0 < nb; k0 += 4) {
+        const uint8_t* b0 = row + (size_t) k0 * 18;
+        canon_ahead(b0, pf);
+        __m256i c[8];
+        __m256 dw;
+        q20_step_codes(b0, c, dw);
+        const int h = (k0 >> 2) & 1;   // calls 2 k0 .. + 7 are lanes 0-7 or 8-15 of the 16
+        for (int t = 0; t < NT; ++t) {
+            const __m256i T = q20_step_sums(c, x[t] + 64 * (ptrdiff_t) k0, qs32[t] + 2 * (ptrdiff_t) k0);
+            const __m256 cT = _mm256_mul_ps(dw, _mm256_set1_ps(dx[t][k0 >> 2]));
+            acc[t][h] = _mm256_fmadd_ps(cT, _mm256_cvtepi32_ps(T), acc[t][h]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) {
+        const __m256 w = _mm256_add_ps(acc[t][0], acc[t][1]);                                   // l + (l + 8)
+        const __m128 u = _mm_add_ps(_mm256_castps256_ps128(w), _mm256_extractf128_ps(w, 1));    // + (l + 4)
+        const __m128 v = _mm_add_ps(u, _mm_movehl_ps(u, u));                                    // + (l + 2)
+        res[t] = _mm_cvtss_f32(v) + _mm_cvtss_f32(_mm_shuffle_ps(v, v, 1));                     // + (l + 1)
     }
 }

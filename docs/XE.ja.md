@@ -407,7 +407,7 @@ llama.cpp と分かれるのは、どれも参照の上位 2 候補が僅差の�
 
 - MTP の実行では、推測器が VRAM を使うので、キャッシュに入るエキスパートが減ります。
   そのぶん一部のエキスパートが、GPU ではなく CPU で計算されます。
-  2026-10-17 からは、i-quant（IQ2_XXS・IQ2_XS・IQ2_S・IQ3_XXS・IQ3_S）の gate と up、IQ4_NL と Q2_0 の down のエキスパートは、CPU と GPU（Intel・NVIDIA・AMD）で同じ計算をし、どちらで計算してもビット単位で同じ結果になります（`canon_math.hpp`、`canon_expert.cpp`）。
+  2026-10-17 からは、gate と up が i-quant（IQ2_XXS・IQ2_XS・IQ2_S・IQ3_XXS・IQ3_S）・IQ4_XS・Q2_0、down が IQ4_NL・Q2_0 のエキスパート（Qwen3.8 の 4 つのファイルのすべての層）は、CPU と GPU（Intel・NVIDIA・AMD）で同じ計算をし、どちらで計算してもビット単位で同じ結果になります（`canon_math.hpp`、`canon_expert.cpp`）。
   SwiGLU と int8 のスケールは足し算・掛け算・fma だけで作り、gate と up の活性は 256 個に 1 つのスケールで量子化し、スケールを共有する部分の整数の和を先に足してから、GPU のレーンと同じ順に fma で足します。
   窓の中身、PCIe の分担、入れ替えでエキスパートが CPU と GPU を行き来しても、答えは変わりません。
   K-quant や BF16 のエキスパート（Unsloth のファイル、Ornith、llm-jp）は対象外です。
@@ -514,9 +514,9 @@ server は、どちらかが準備できるまで、エンコーダーを次の�
 | PLE の n-gram の表（2 つ目のシャード） | IQ4_NL | 整数の n-gram のハッシュ、選んだ行の読み出しと展開。既存の PLE のベクトルと実際の表の行 |
 
 `src/kernels/native_expert_parity.cpp` のネイティブのエキスパートの参照は、ggml の展開とホストの FP64 の内積を使ってから、CPU と GPU の経路を比べます。
-上の i-quant の gate と up、IQ4_NL と Q2_0 の down の層では、CPU の行と GPU の行がビット単位で同じかも、トークンをまとめたときと 1 つずつのときで確かめます。
+上の型の gate と up、down の層では、CPU の行と GPU の行がビット単位で同じかも、トークンをまとめたときと 1 つずつのときで確かめます。
 エキスパートごとの相対 L1 の基準 `3e-2` は、この比較のためのもので、カーネル全般の許容誤差ではありません。
-GPU の q8_1 の活性化の約束と、CPU の活性化（i-quant の gate と up、IQ4_NL と Q2_0 の down のエキスパートは `canon_expert.cpp` の形、それ以外は ggml の `vec_dot_type`）は、明示したまま保ちます。
+GPU の q8_1 の活性化の約束と、CPU の活性化（上の型のエキスパートは `canon_expert.cpp` の形、それ以外は ggml の `vec_dot_type`）は、明示したまま保ちます。
 
 ## 検証の一覧
 

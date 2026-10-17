@@ -419,7 +419,7 @@ The records above were taken before that and compare tokens only.
 Where the draft modes differ, there are two causes:
 
 - The MTP runs had fewer cached experts (the drafter takes VRAM), so some experts ran on the CPU instead of the GPU.
-  From 2026-10-17 the CPU and the GPU (Intel, NVIDIA, AMD) compute the experts' i-quant (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S) gate and up rows and IQ4_NL and Q2_0 down rows alike, and an expert gives the same bits on either (`canon_math.hpp`, `canon_expert.cpp`).
+  From 2026-10-17 the CPU and the GPU (Intel, NVIDIA, AMD) compute the experts whose gate and up rows are i-quants (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S), IQ4_XS or Q2_0 and whose down rows are IQ4_NL or Q2_0 (every layer of the four Qwen3.8 files) alike, and an expert gives the same bits on either (`canon_math.hpp`, `canon_expert.cpp`).
   The SwiGLU and the int8 scale are built from additions, multiplications and fmas only, the gate/up activations take one scale for each 256 values, and the integer sums of what shares a scale add first, then go into the GPU's lanes with fmas in the GPU's order.
   The answer stays the same when the window, the PCIe split or the tier changes move an expert between the CPU and the GPU.
   K-quant and BF16 experts (Unsloth's files, Ornith, llm-jp) are not covered.
@@ -526,9 +526,9 @@ The name describes the quantization budget of a mixed-precision model.
 | PLE n-gram table, second shard | IQ4_NL | Integer n-gram hash, selected row reads/decode; existing PLE vectors and actual table rows |
 
 The native expert oracle in `src/kernels/native_expert_parity.cpp` uses ggml dequantization and host FP64 dot products before comparing the CPU and GPU paths.
-On the layers of the i-quant gate/up and IQ4_NL or Q2_0 down rows above, it also checks that the CPU's rows and the GPU's are the same bits, the tokens at once and one at a time.
+On the layers of the types above, it also checks that the CPU's rows and the GPU's are the same bits, the tokens at once and one at a time.
 Its per-expert relative L1 bound of `3e-2` belongs to that comparison and is not a universal kernel tolerance.
-The GPU's q8_1 activation contract and the CPU's activations (`canon_expert.cpp`'s form for the experts' i-quant gate/up and IQ4_NL and Q2_0 down rows, ggml's `vec_dot_type` for the others) stay explicit.
+The GPU's q8_1 activation contract and the CPU's activations (`canon_expert.cpp`'s form for the experts of the types above, ggml's `vec_dot_type` for the others) stay explicit.
 
 ## Validation inventory
 

@@ -405,14 +405,25 @@ template<> struct Split<23> {   // IQ4_XS
         r.d = (float) bq4->d;
         return r;
     }
-    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+    static void parts(const W& r, const block_q8_1* bq8_1, int iqs, float& c, int& s) {
         int sumi = 0;
         for (int j = 0; j < 4; ++j) {
             sumi = dp4a(r.v[j].x, get_int_b4(bq8_1[iqs / 4].qs, j + 0), sumi);
             sumi = dp4a(r.v[j].y, get_int_b4(bq8_1[iqs / 4].qs, j + 4), sumi);
         }
-        sumi *= r.ls;
-        return r.d * low_half(bq8_1[iqs / 4].ds) * (float) sumi;
+        s = sumi * r.ls;
+        c = r.d * low_half(bq8_1[iqs / 4].ds);
+    }
+    // the products' order an expert's gate/up row takes on every device and on the CPU (canon_math.hpp,
+    // seg_dot_multi); a down row's h has a scale for each 32, so there its calls stay apart
+    static constexpr bool kParts = true;
+    // the calls in a row that share one activation scale (their integer sums add before the scale)
+    static constexpr int kGroup = 8;
+    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+        float c;
+        int s;
+        parts(r, bq8_1, iqs, c, s);
+        return c * (float) s;
     }
 };
 
@@ -804,6 +815,11 @@ inline const void* block_at(const uint8_t* row, int kbx) { return row + (size_t)
 // (GridOf<TY>::T): the codebook the blocks are decoded with, when not the global table.
 template<class S, class = void> struct HasParts : std::false_type {};
 template<class S> struct HasParts<S, std::void_t<decltype(S::kParts)>> : std::true_type {};
+// a format with parts: the calls in a row that share one activation scale (0 for a format without)
+template<class S> constexpr int group_of() {
+    if constexpr (HasParts<S>::value) return S::kGroup;
+    else return 0;
+}
 
 // A format with parts (canon_math.hpp; the CPU's rows take the same steps): the calls of a row that share one
 // activation scale (kGroup neighbouring calls, on kGroup neighbouring lanes, a block of an i-quant) add their exact
@@ -867,11 +883,13 @@ inline void seg_dot_canon(const sycl::sub_group& sg, const uint8_t* row, const b
     }
 }
 
-template<int TY, int LPR, int NE, class G = void>
+// S256: the activation's scale is one for each 256 values (the gate/up rows' x, quantize_q8_1_rows); a down row's h
+// has one for each 32, where a format's calls of a block (kGroup > 1) do not share it: the plain loop
+template<int TY, int LPR, int NE, class G = void, bool S256 = true>
 inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const block_q8_1* const (&x)[NE], int n,
                           int nb, int nb_all, int seg_lane, float (&out)[NE], const G* grid = nullptr) {
     using F = Fmt<TY>;
-    if constexpr (HasParts<typename F::S>::value) {
+    if constexpr (HasParts<typename F::S>::value && (S256 || group_of<typename F::S>() == 1)) {
         seg_dot_canon<TY, LPR, NE, G>(sg, row, x, n, nb, nb_all, seg_lane, out, grid);
         return;
     } else {
@@ -1036,7 +1054,7 @@ sycl::event launch_native_down(sycl::queue& q, size_t cap_groups, const unsigned
                 const block_q8_1* xs[kEntriesPass];
                 for (int j = 0; j < kEntriesPass; ++j) xs[j] = hq + (size_t) (j < n ? e + j : e) * hb;
                 float s[kEntriesPass];
-                seg_dot_multi<TD, LPR, kEntriesPass>(sg, wr, xs, n, nb, (int) (L.n_ff / Fmt<TD>::qk), seg_lane, s);
+                seg_dot_multi<TD, LPR, kEntriesPass, void, false>(sg, wr, xs, n, nb, (int) (L.n_ff / Fmt<TD>::qk), seg_lane, s);
                 if (valid && seg_lane == 0)
                     for (int j = 0; j < n; ++j) out[(size_t) ent_dst[e + j] * L.n_embd + r] = s[j];
             }
@@ -1156,7 +1174,7 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
                     const bool valid = r < L.n_embd;
                     const int nb = valid ? (int) (L.n_ff / Fmt<TD>::qk) : 0;
                     float s[kEntriesPass];
-                    seg_dot_multi<TD, LPR, kEntriesPass>(sg, blob + L.down_off + (size_t) (valid ? r : 0) * L.d_row,
+                    seg_dot_multi<TD, LPR, kEntriesPass, void, false>(sg, blob + L.down_off + (size_t) (valid ? r : 0) * L.d_row,
                                                          xs, cn, nb, (int) (L.n_ff / Fmt<TD>::qk), seg_lane, s);
                     if (valid && seg_lane == 0)
                         for (int j = 0; j < cn; ++j) out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = s[j];
