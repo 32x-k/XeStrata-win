@@ -529,6 +529,7 @@ struct Options {
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
+    bool prompt_cache_spread = false;   ///< --prompt-cache-spread: keep checkpoints spread back from the end, not the latest
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
     /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
     int64_t prompt_cache_root = 2048;
@@ -681,6 +682,9 @@ void usage() {
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
                  "  --prompt-cache-tail  --serve, single GPU: one extra checkpoint near the prompt's end, at an existing\n"
                  "                       chunk boundary (default off; requires --prompt-cache and --prompt-cache-every > 0)\n"
+                 "  --prompt-cache-spread  --serve: keep the checkpoints spread back from the conversation's end (dense\n"
+                 "                       near it, thinner further back) instead of the most recently used: a client that\n"
+                 "                       rewrites its history N tokens back reads about N again, not the whole conversation\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
@@ -2516,6 +2520,7 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-save") o.conversation_save = next("--conversation-save");
         else if (a == "--conversation-save-compress") o.conversation_save_compress = true;
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
+        else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::strtoll(next("--prompt-cache-every"), nullptr, 10));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::strtoll(next("--prompt-cache-root"), nullptr, 10));
         else if (a == "--turn-token") o.turn_token = std::strtoll(next("--turn-token"), nullptr, 10);
@@ -7488,8 +7493,15 @@ int main(int argc, char** argv) {
                         for (size_t i = 0; i < n; ++i) pin_flags[i] = checks[i].pinned;
                         break;
                     }
-                const size_t victim = strata::program::conv_cache::eviction_victim(
-                    stamps.data(), n, o.prompt_cache, tail_flags.get(), pin_flags.get());
+                // --prompt-cache-spread (opt-in, upstream a7d4b754): the victim leaves the smallest gap for its distance
+                // from the newest, so the kept points thin out geometrically back from the end
+                std::vector<int64_t> lens(n);
+                for (size_t i = 0; i < n; ++i) lens[i] = (int64_t) checks[i].ids.size();
+                const size_t victim = o.prompt_cache_spread
+                    ? strata::program::conv_cache::spread_victim(lens.data(), stamps.data(), n, o.prompt_cache,
+                                                                 tail_flags.get(), pin_flags.get())
+                    : strata::program::conv_cache::eviction_victim(stamps.data(), n, o.prompt_cache, tail_flags.get(),
+                                                                   pin_flags.get());
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
         };

@@ -874,6 +874,10 @@ Two options are off by default (both on one GPU).
 
 - `--prompt-cache-tail` (an engine argument): one more checkpoint at a chunk boundary within one chunk of the prompt's end.
   A continuation that branches between the every-16K checkpoints reads less again. This checkpoint is evicted first and pushes out no other.
+- `--prompt-cache-spread` (an engine argument, opt-in, upstream a7d4b754): the checkpoints kept spread back from the conversation's end.
+  Least recent use keeps the newest: after a few short turns all 6 sit within the last 1-2K tokens, and an agent that rewrites its history a few thousand tokens back matches none of them and reads again from the system prompt.
+  With the flag the checkpoint that leaves is the one whose removal leaves the smallest gap for its distance from the newest, so the kept points thin out geometrically (after 200 turns of 1,000 tokens: 0, 1K, 3K, 8K, 43K and 200K before the end), and an edit d tokens back reads about d again.
+  The same number of checkpoints and RAM; the system-prompt root, a pinned prefix and the newest point are never dropped.
 - `STRATA_CACHE_MESSAGE_BOUNDARY=1` (the engine's environment): a checkpoint before the last user message (at the end of the turn before it).
   An agent that keeps a long history and replaces only the last message does not read the history again.
   It applies to a history of 8,192 tokens or more with a last message of at most 1,024; it splits the prompt's chunks and costs a fresh request the time of the snapshot.
