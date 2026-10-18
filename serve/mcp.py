@@ -61,9 +61,11 @@ class _Slot:
         self.error = None
 
 
-def _wait(slot: _Slot, timeout: float, cancel: threading.Event | None, what: str):
-    """Wait for a response, checking the chat's stop button and the deadline a few times a second."""
-    deadline = time.monotonic() + timeout
+def _wait(slot: _Slot, timeout: float, cancel: threading.Event | None, what: str, deadline: float | None = None):
+    """Wait for a response, checking the chat's stop button and the deadline a few times a second (`deadline`: the
+    request's own, when part of `timeout` went to sending it)."""
+    if deadline is None:
+        deadline = time.monotonic() + timeout
     while not slot.done.wait(0.05):
         if cancel is not None and cancel.is_set():
             raise McpCancelled("stopped")
@@ -231,7 +233,7 @@ class StdioTransport:
         try:
             t0 = time.monotonic()
             self._send_within({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}, timeout, cancel)
-            return _wait(slot, max(0.0, timeout - (time.monotonic() - t0)), cancel, method)
+            return _wait(slot, timeout, cancel, method, t0 + timeout)
         except (McpTimeout, McpCancelled) as e:
             with self.lock:
                 self.pending.pop(rid, None)
