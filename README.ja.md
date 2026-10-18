@@ -13,7 +13,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
 このブランチは、XeStrata を Windows 11 で AMD の GPU を使って動かすための移植です。
 intel/llvm（DPC++）を Windows の上で HIP と Level Zero（Intel の GPU）のランタイムを付けてビルドし、XeStrata を free モードでコンパイルします。
-本家の更新は取り込みながら進めていて、今は本家の main（上流 Strata 0.1.44.1 を取り込んだもの、2026-10-14）までを含みます。
+本家の更新は取り込みながら進めていて、今は本家の xe0.1.45-1（上流 Strata 0.1.45 を取り込んだもの、2026-10-18）までを含みます。
 
 ### していること
 

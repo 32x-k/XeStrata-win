@@ -5,7 +5,7 @@ The tables of step 7 of SKILL.md: how they are run. The check that reads them is
 The engines, each built in a worktree of its own under `.claude/worktrees/` (or in the AMD container):
 
 - XeStrata: `dev`'s HEAD, the contrib-llvm build; one GPU at a time with `ONEAPI_DEVICE_SELECTOR` (`level_zero:*`, `cuda:*`; `hip:*` in the container).
-- upstream on the B70: not measured (the user's decision of 2026-10-12, to save time): the B70 runs XeStrata alone, with `UP=none`, and is judged against the previous XeStrata's record (`judge.py --prev`, step 8).
+- upstream on the B70: the tag's `sycl/` port (the user's decision of 2026-10-18), built in its Docker image as its docs/INTEL.md says (`docker build -t strata-sycl-dev sycl/tools`, then its `build.sh` with `AOT=bmg-g31`) and run through `.claude/skills/release/scripts/up-sycl.sh` (`UP=` that script, with `UP_TREE`, `DATA` and `IDS` exported), which runs it as its `sycl/setup_intel.py` configures the card; its expert profile is the one that setup writes (`data/expert-profile-sycl.bin`).
 - upstream on the RTX 4070: the tag's CUDA build; on the RX 9060 XT: its HIP build; both with the CMake options the tag's own setup.py builds it with (`build_engine_hip`: `-DSTRATA_PREFILL_MMQ=ON`, which docs/AMD_HIP.md's plain build command leaves out; without it upstream's prefill takes a slower path).
 
 Each engine's own shipped expert profile. No other work on a machine while it measures.

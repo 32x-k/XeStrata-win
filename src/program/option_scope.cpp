@@ -20,8 +20,9 @@ const char* const kQwen38Only[] = {
     "--gr-fp32-activations", "--gr-native-mmvf", "--no-fused-gr", "--no-fused-gdn", "--no-fast-attn",
     "--no-fast-select", "--mtp-hnorm", "--vision", "--shared-late", "--shared-expert-arena", "--keep-canonical",
     "--cpu-oracle-q8-0", "--dump-final-r", "--dump-halves", "--dump-mixed", "--dump-residual", "--dump-layers",
-    "--prefill", "--prefill-experts", "--prefill-until", "--no-prefill-borrow", "--resident-experts",
-    "--resident-cpu-experts", "--resident-budget-gib", "--expert-cache-per-layer", "--expert-cache-cpu-order",
+    "--prefill", "--prefill-experts", "--prefill-cpu-share", "--prefill-until", "--no-prefill-borrow",
+    "--resident-experts", "--resident-cpu-experts", "--resident-budget-gib", "--expert-cache-per-layer",
+    "--expert-cache-cpu-order",
 };
 
 // the engine's options every model could take, which the other models' path does not have yet
@@ -31,9 +32,9 @@ const char* const kNotYet[] = {
     "--prompt-cache-tail", "--conversation-cache-mib", "--conversation-cache-min-free-mib",
     "--conversation-cache-slots", "--conversation-save", "--conversation-save-checkpoints",
     "--conversation-save-compress", "--conversation-save-hours", "--conversation-save-mib", "--session-min-free-mib",
-    "--kv", "--kv-grow", "--no-kv-grow", "--kv-resident", "--vram-reserve-mib", "--vram-reserve-later-mib",
-    "--vram-elastic", "--vram-segment-mib", "--expert-cache", "--adapt-async", "--adapt-decay",
-    "--pcie-frac", "--pcie-mode", "--pool-tasks", "--stats", "--stage-timing", "--spec-min-p",
+    "--kv", "--kv-grow", "--no-kv-grow", "--kv-resident", "--vram-reserve-mib", "--vram-free-mib",
+    "--vram-reserve-later-mib", "--vram-elastic", "--vram-segment-mib", "--expert-cache", "--adapt-async",
+    "--adapt-decay", "--pcie-frac", "--pcie-mode", "--pool-tasks", "--stats", "--stage-timing", "--spec-min-p",
     "--spec-split", "--no-spec-split", "--spec-follow", "--spec-oracle", "--spec-corrupt", "--suffix-draft",
     "--lookup-chain", "--lookup-chain-min", "--coupled-draft", "--no-coupled-draft", "--mtp", "--mtp-max-t",
     "--mtp-window", "--layer-split", "--gpu-stages", "--split-device", "--expert-cache-device1",

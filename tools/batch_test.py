@@ -29,7 +29,17 @@ QUESTIONS = [
     "Explain how a transformer's attention works, step by step.",
     "Donne une recette de tarte aux pommes, etape par etape.",
     "Describe the life cycle of a star like the Sun.",
+    "Erklaere ausfuehrlich, wie ein Dieselmotor funktioniert.",
+    "Write a Rust function that parses a CSV line with quoted fields, then explain it.",
+    "What were the main consequences of the invention of the printing press?",
+    "Explique le theoreme de Pythagore avec trois demonstrations differentes.",
+    "Describe how the immune system responds to a viral infection.",
+    "Explain the difference between processes and threads in an operating system.",
+    "Beschreibe die Geschichte des Roemischen Reiches in Grundzuegen.",
+    "How does public-key cryptography work? Give an example with RSA.",
 ]
+# more than 16 slots: the same questions again, asked to answer in German
+QUESTIONS = QUESTIONS + [q + " Answer in German." for q in QUESTIONS]
 
 
 def tokenizer(path):
@@ -86,7 +96,7 @@ def main():
     ap.add_argument("--long-tokens", type=int, default=0,
                     help="the LAST prompt is read from about this many tokens of filler text first: its chunks run "
                          "beside the earlier slots' windows (the prompt path lends experts then)")
-    ap.add_argument("--mt-min", default="1", help="STRATA_IQ_MT_MIN for the engine (1: exact; empty: the default)")
+    ap.add_argument("--mt-min", default="", help="STRATA_IQ_MT_MIN for the engine (empty: the default, which is exact)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text())
     tok = tokenizer(cfg["tokenizer"])

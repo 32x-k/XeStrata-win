@@ -209,6 +209,13 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+    /// The adaptive tier's routing counts: usage[l * n_expert + e] += 1 for each expert e routed at layer l (of this
+    /// verifier's layers) by the last window's first `rows` rows, the rows whose input was the text's (the last
+    /// accepted token and the accepted drafts).  The rejected rows' routing is not counted, and neither is a row
+    /// counted twice: the counts follow the text, not how it was cut into windows (window-invariant output, #152).
+    void add_routing(float* usage, int64_t n_expert, int rows) const;
+    /// Record every layer's routed ids for add_routing (off: no copies).  Before the first window is captured.
+    void set_route_record(bool on) { route_rec_ = on; }
     /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
     /// the same queue and the drafter reads nothing it writes, so it overlaps the draft.  Whoever reads or writes the
     /// session from another queue or the host afterwards (a new request, a checkpoint, the prompt path, the end of a
@@ -488,6 +495,8 @@ private:
     void note_nonfinite(int T, const int64_t* pos_b);   ///< the window's flags (+ STRATA_NAN_INJECT) -> nf_row_
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
+    int32_t* h_route_ = nullptr; int32_t* m_route_ = nullptr;   // n_layers * T * k: each layer's ids (add_routing)
+    bool route_rec_ = false;
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
     uint32_t* h_seq_ = nullptr;  uint32_t* m_seq_ = nullptr;
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;

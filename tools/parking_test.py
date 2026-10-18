@@ -42,7 +42,7 @@ def gen(eng, out, ids, n):
 
 def run(a, cfg, tok, with_b):
     # STRATA_SNAPSHOT_VERIFY: the engine reads the restored draft ring back (on the GPU that holds it) after a restore
-    eng = Engine(a.exe, cfg, 0, {"STRATA_IQ_MT_MIN": "1", "STRATA_SNAPSHOT_VERIFY": "1"}, a.extra.split())
+    eng = Engine(a.exe, cfg, 0, {"STRATA_SNAPSHOT_VERIFY": "1"}, a.extra.split())
     out = eng.lines()
     pa = tok.encode(chat(DOC * a.repeat + "\nSummarize this text in five sentences."), parse_special=True)
     reply, _ = gen(eng, out, pa, a.max_new)

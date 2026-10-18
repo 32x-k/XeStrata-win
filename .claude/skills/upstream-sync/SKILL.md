@@ -53,7 +53,7 @@ Write `.upstream-<version>.md` (add it to `.git/info/exclude`, as `.upstream-014
 | M | several GPUs | all |
 | N | NVIDIA, every generation (Pascal, Volta, Turing included) | as ideas (below) |
 | P | speed paths | as ideas (below) |
-| S | upstream's `sycl/` | not taken, and not measured in a merge (the release's table compares it) |
+| S | upstream's `sycl/` | not taken; its engine is what the B70 is compared with in steps 7 and 8 |
 | T | serve, setup, tools | ported (step 3) |
 | W | Windows | ported as the group it would otherwise be (E, P, T) is, onto XeStrata's Windows code (AGENTS.md, Operating systems); only a part for what XeStrata's Windows build does not have (a backend, upstream's own packaging) gets `N/A` |
 
@@ -207,7 +207,7 @@ The image cells (GPU; the seconds an image), read from `matrix-image.json`, pass
 The serve cells (GPU, tier, greedy or t07; prompt, follow-ups, output), read from `matrix-serve.json`, and the everyday cells (GPU, conversation; first token, prompt, output), read from `matrix-usage.json`, pass at most `SERVE_LIMIT` (`judge.py`, 5%) below upstream's, the prompt speed at 1%: each engine writes its own text there, so the other measures vary with the text from round to round (the rounds' seeds differ), up to 10% off a cell's median at temperature 0.7 on 2026-10-10.
 A cell upstream does not finish, finishes at 10 tok/s or less, or is stopped as that slow, is left out; one only XeStrata does not finish fails.
 A file whose experts do not fit in a machine's RAM budget, so that they are read from the SSD while it answers (SSD offload: UD-Q4_K_XL on the AMD container's 62 GB), is not run on that machine (the user's decision of 2026-10-09): as for GPUs there is no machine for (step 4), its paths are checked by the tests and the builds only, and the record lists its cells `unverified`.
-The B70 is not measured against upstream in a merge (the user's decision of 2026-10-12, to save time; it replaces the B70 rules of 2026-10-09 and 2026-10-11): it runs XeStrata alone (`UP=none`) and every cell of it is judged against the previous XeStrata (`prev` lines) only. Image generation is the exception (2026-10-15): on the B70 too it runs both engines. The RTX 4070 and the RX 9060 XT are judged against both. The release's speed table (/release) still compares the B70 with upstream's `sycl/`.
+The B70 is compared with upstream's `sycl/` port, as the release's speed table (/release) compares it (the user's decision of 2026-10-18; it replaces the decision of 2026-10-12, which measured XeStrata alone there): its engine is the tag's `sycl/` built in its Docker image and run through `.claude/skills/release/scripts/up-sycl.sh` (references/measure.md), and its image generation upstream's Vulkan `sd-cli`. Every GPU is judged against the tag and the previous XeStrata.
 
 Against the previous XeStrata (`prev` lines), every cell both records have is judged: the prompt at 1%, the rest at `SERVE_LIMIT`, since the text changes with the version (on the generate path it is the tag's).
 The previous XeStrata is not measured again: its record is the reference (the user's decision of 2026-10-12). A `prev` failure suspected of noise (another cell of the same run moved the other way, or upstream moved as much in the same run) is measured once more in the same setting; one still slower then, or not suspected of noise, is worked at once, the ideas' switches off one at a time with `ab_pair.py` (only the side that changed is measured: a greedy run of the same binary, settings and text is read from its record, AGENTS.md).

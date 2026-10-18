@@ -956,6 +956,16 @@ def write_results(res: dict, parent: Path, red, log_lines: list[str]) -> Path:
 
 
 # --------------------------------------------------------------------------------------------------------- main
+def server_base(host, port) -> str:
+    """The address to talk to for a locally started server. The config's `host` is the interface the server
+    binds - a specific IP, or a wildcard that is not connectable as written - so it cannot be polled as-is.
+    An explicit `--url` bypasses this; there the caller knows the address."""
+    host = host or "127.0.0.1"
+    host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)     # wildcard binds accept loopback
+    authority = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"http://{authority}:{port}"
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Measure this Strata install and write a shareable report (see the top of "
                                              "this file).")
@@ -1009,7 +1019,7 @@ def main(argv=None) -> int:
     else:
         assert cfg is not None                            # (no --url: a config was read above)
         port = a.port or int(cfg.get("port", 8080))
-        base = f"http://127.0.0.1:{port}"
+        base = server_base(cfg.get("host"), port)
     red = redactor(key=key)
     started = False
     try:

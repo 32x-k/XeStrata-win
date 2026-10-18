@@ -4,14 +4,17 @@
 # .claude/skills/release/scripts/bench.sh - a release's speed table on one GPU: the release and upstream's latest
 # release, IQ3_XXS, the six tiers of the 2026-10-04-speed-matrix record (1K to 262K) with what setup writes for
 # each context on this machine (images off; KV streaming only where the RAM holds it, from 2026-10-12), 256 greedy
-# tokens, each run a new process.
+# tokens, each run a new process.  Both engines follow the same continuation of each prompt (--spec-follow
+# IDS/TIER.follow, follow.sh beside this script, from 2026-10-16): each engine's own greedy text splits from the
+# other's within tens of tokens, and the drafts' acceptance on the text it splits into moved decode by up to 20%.
 #
 #   XE="CMD..." UP="CMD..." DATA=DIR IDS=DIR .claude/skills/release/scripts/bench.sh OUT GPU
 #
 # XE and UP: the command that starts each engine (its strata binary, or a wrapper that runs it in its container);
 # the generate options are appended.  XE_PROFILE and UP_PROFILE: each engine's shipped expert profile (its
 # data/expert-profile.bin).  DATA: the data folder (packs/qwen-iq3_xxs, models/...IQ3_XXS-0000N-of-00002.gguf,
-# mtp/rt).  IDS: the prompts of prompts.py beside this script.  ROUNDS (default 2): runs per arm and tier.
+# mtp/rt).  IDS: the prompts of prompts.py and the continuations of follow.sh beside this script.  ROUNDS (default
+# 2): runs per arm and tier.
 # OUT/runs/GPU-ARM-TIER-ROUND.txt gets each log; one discarded warm-up per arm first (JIT); the arms alternate,
 # the first arm changing from round to round.  bench-collect.py OUT reads them.
 # upstream plainly at SLOW tok/s or less (default 10) is stopped mid-run and not run again in that tier: its prompt
@@ -25,6 +28,9 @@ rounds=${ROUNDS:-2}
 slow=${SLOW:-10}
 P=$DATA/packs/qwen-iq3_xxs
 G=$DATA/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS
+for t in 1k 4k 32k 64k 128k 262k; do
+  [ -s "$IDS/$t.follow" ] || { echo "no $IDS/$t.follow: write the continuations with follow.sh first" >&2; exit 2; }
+done
 mkdir -p "$out/runs"
 # KV streaming where setup writes it for the model on this machine's RAM (setup.kv_streaming_wanted, through
 # tools/bench_core.py; upstream's setup decides the same, its sycl/ port again in up-sycl.sh)
@@ -73,7 +79,7 @@ run() {
   case $2 in 64k|128k|262k) read -r -a k <<< "${kvr[${C[1]}]}"; C+=("${k[@]}") ;; esac
   timeout 2400 "${cmd[@]}" --pack "$P" --native "$G-00001-of-00002.gguf" --ple-gguf "$G-00002-of-00002.gguf" \
     --expert-profile "$prof" --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp "$DATA/mtp/rt" \
-    "${C[@]}" --tokens-file "$IDS/$2.ids" --max-new 256 > "$3" 2>&1 &
+    "${C[@]}" --tokens-file "$IDS/$2.ids" --spec-follow "$IDS/$2.follow" --max-new 256 > "$3" 2>&1 &
   local pid=$! rc w=
   if [ "$1" = up ] && [ "$slow" -gt 0 ]; then watch_slow "$pid" "$3" & w=$!; fi
   wait "$pid"; rc=$?

@@ -389,6 +389,9 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
+    /// The decode loop counts `usage` itself from the windows' accepted rows (Verifier::add_routing): the dispatch
+    /// then leaves it alone.
+    bool usage_by_window = false;
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is
@@ -550,14 +553,20 @@ public:
     // buffer and calls `stage_exchange`: `out` is then read from that buffer, and `in` still from here (the CPU
     // computes both until the swap lands).  Once the slot copy has landed, `commit_exchanges` moves `out` into
     // `in`'s place, so the copy keeps holding exactly the experts the GPU does not - with no read of the file.
+    // STRATA_EXCHANGE_ROTATE=1 can instead transfer buffer ownership (fully pinned/mapped slots; a pack whose layers
+    // differ in block size keeps spares per size).
     /// Whether the compact copy holds `(layer, expert)`.
     bool has_resident(int64_t layer, int64_t expert) const;
     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
-    bool reserve_exchanges(int64_t n, std::string& err);
+    /// `bounce`: how many of the last buffers are only staged through and never hold an exchange (STRATA_EXCHANGE_ROTATE
+    /// keeps those in the largest block size alone).
+    bool reserve_exchanges(int64_t n, std::string& err, int64_t bounce = 0);
     int64_t exchange_capacity() const { return xstage_cap_; }
     /// The exchange buffers are page-locked (host USM): copies to and from them are asynchronous.
     bool exchange_pinned() const { return xstage_pinned_; }
-    uint8_t* exchange_buffer(int64_t q) const;
+    /// Buffer `q`.  `layer` >= 0: the buffer an exchange of that layer's experts stages into (STRATA_EXCHANGE_ROTATE with
+    /// several block sizes keeps one per size); without it, one that holds any layer's block.
+    uint8_t* exchange_buffer(int64_t q, int64_t layer = -1) const;
     /// Requires `has_resident(layer, in)`, `!has_resident(layer, out)` and `exchange_buffer(q)` holding out's blob.
     bool stage_exchange(int64_t layer, int64_t in, int64_t out, int64_t q);
     /// After the GPU copies of every staged swap have landed.  Returns how many exchanges were applied.
@@ -571,6 +580,13 @@ public:
     /// The compact copy's blob of `(layer, expert)`, or null; not counted as a read (any thread).
     const uint8_t* resident_blob(int64_t layer, int64_t expert) const;
     int64_t exchanges() const { return exchanges_; }
+    /// STRATA_RAM_ADAPT: the compact copy gives `out`'s place to `in`, read from the file, so the RAM tier can follow
+    /// the conversation as the VRAM tier does.  Both are experts of `layer` (one blob size), `out` is held by the copy
+    /// and `in` is not, no exchange is staged, and nothing may be reading `out`'s blob: the caller's thread, between
+    /// windows, with no adaptive round in flight.  A failed read leaves the copy as it was.  Not with
+    /// STRATA_EXCHANGE_ROTATE (false, nothing changes).
+    bool replace_resident(int64_t layer, int64_t in, int64_t out);
+    int64_t ram_adapts() const { return ram_adapts_; }
     /// STRATA_EXCHANGE_ROTATE=1 (opt-in, upstream 1e6cec80): a swap hands the exchange buffer over instead of copying
     /// the evicted blob into the RAM copy (equal-size blobs, a fully page-locked copy)
     bool exchange_rotation() const { return exchange_storage_.active(); }
@@ -669,6 +685,8 @@ private:
     std::unordered_map<int64_t, size_t> stage_of_;
     uint64_t stage_blob_ = 0;
     uint64_t stage_seq_ = 0;
+    int64_t ram_adapts_ = 0;                  ///< replace_resident: experts moved from the file into the compact copy
+    std::vector<uint8_t> ram_adapt_buf_;      ///< ...one blob, read here before it replaces another
     uint64_t epoch_ = 0;
     int64_t last_layer_ = -1;
     bool stage_grew_ = false;

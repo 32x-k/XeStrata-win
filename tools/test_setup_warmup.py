@@ -56,13 +56,14 @@ class WarmUp(unittest.TestCase):
 
     def test_no_key(self):
         seen, ok, _ = self.run_warm_up({})
-        self.assertEqual([a for _, a in seen], [None, None])
+        self.assertEqual([a for _, a in seen], [None, None, None])
         ok.assert_called_once()
 
     def test_the_configs_first_key(self):
         seen, ok, _ = self.run_warm_up({"api_key": " k1 , k2"})
-        self.assertEqual([u for u, _ in seen], ["v1/models", "v1/chat/completions"])
-        self.assertEqual([a for _, a in seen], ["Bearer k1", "Bearer k1"])
+        # the start, the question, and the prompt asked again for the CPU share (upstream 0.1.45)
+        self.assertEqual([u for u, _ in seen], ["v1/models", "v1/chat/completions", "v1/chat/completions"])
+        self.assertEqual([a for _, a in seen], ["Bearer k1"] * 3)
         ok.assert_called_once()
 
     def test_a_list_of_keys(self):

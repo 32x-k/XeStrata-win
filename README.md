@@ -13,7 +13,7 @@ English | [日本語](README.ja.md)
 
 This branch ports XeStrata to Windows 11 with AMD GPUs.
 It builds intel/llvm (DPC++) on Windows with the HIP and Level Zero (Intel GPUs) runtimes, and compiles XeStrata in the free mode with it.
-It keeps taking in upstream's releases; it now includes upstream XeStrata's main (with upstream Strata 0.1.44.1, 2026-10-14).
+It keeps taking in upstream's releases; it now includes upstream XeStrata's xe0.1.45-1 (with upstream Strata 0.1.45, 2026-10-18).
 
 ### What it does
 

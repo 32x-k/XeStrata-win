@@ -49,6 +49,8 @@ Those that do not fit are read from the files on every prefill.
 Conversation parking (`--conversation-cache-mib`, `--conversation-save`) copies every GPU's session out and back.
 A saved file is read only by an engine with the same split points; `--layer-split auto` can choose others from what it measures, and then the earlier files are not read.
 
+A prefill chunk's rows go on to the next GPU in eight pieces (upstream 1d9758f8, opt-in there): the next GPU starts copying a piece in once it is in RAM, so the two GPUs' PCIe copies overlap, and it reads its chunks on one thread started once. `STRATA_HANDOFF_PIPE=P` (2 to 16) sets the pieces; `STRATA_HANDOFF_PIPE=0` goes back to one copy.
+
 ## GPU numbers
 
 The engine numbers the GPUs it can drive from 0.
@@ -75,6 +77,9 @@ The log shows the choice (`layer split auto: K=...`); from there on it runs as i
 
 - When the choice gives a GPU only one or two layers, it chooses again among the placements that give every GPU three or more (upstream 1c6c82ef).
   A GPU with few layers has a small cache, and the prefill chunk shrinks to it.
+  On two GPUs it first chooses among the placements that give each GPU at least its share of the layers by its room for experts (upstream 3b848837, #2644): the estimate leans the layers to the faster card, and the three-layer rule landed on its own edge (the slower card with three layers) and left that card idle (upstream: an RTX 4060 Ti 16 GB with an RTX 3060 12 GB read a prompt at 452 tok/s instead of 802). The log says which rule chose the split.
+  `STRATA_SPLIT_SPEED_SCALE=1,0.55` multiplies each stage's read speed by the factor (a test seam for an unequal pair on two equal cards, upstream 4a1ef86b).
+- `STRATA_SPLIT_UNIFORM=1` (opt-in, upstream b8844516) prices every link's misses the same (the uniform cost before upstream 0.1.41), for links where any scaling moves auto off the balanced placement (upstream: 2x RTX 3090 on x16 + x4, decode -4..-8%).
 - On GPUs of different speed or link, when another placement whose split points lie three or more layers away is predicted within 4%, the log names it (`NEAR TIE`, upstream 8bb250d8).
   The prediction prices decode, not prefill, so it is worth a try; the choice stays.
 - Which of the later GPUs runs which stage is chosen from the same prediction (what upstream's "the faster card last", be8db787 and others, does).

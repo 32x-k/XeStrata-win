@@ -12,6 +12,7 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 
 namespace strata::prefill::mmq {
@@ -31,6 +32,18 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
     if (rows > 0)
         kernels::iq_mmq_quantize(Q(stream), x, ids, xq, cols, ld, rows, kernels::iq_mmq_type_sums(t),
                                  kernels::iq_mmq_type_dup(t));
+}
+
+void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, void* xq, int t, int64_t cols,
+                      int64_t ld, int64_t tokens, int k_used, void* stream) {
+    static const bool gather = [] {
+        const char* e = std::getenv("STRATA_QUANT_GATHER");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (gather) return quantize(x, src, xq, t, cols, ld, tokens * k_used, stream);
+    if (tokens > 0)
+        kernels::iq_mmq_quantize_scatter(Q(stream), x, slot, xq, cols, ld, tokens, k_used, kernels::iq_mmq_type_sums(t),
+                                         kernels::iq_mmq_type_dup(t));
 }
 
 Context::Context() {}
@@ -99,6 +112,7 @@ bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_byt
         const u32x4* src = nullptr;
         for (int k = 0; k < kGatherGroupMax; ++k)
             if (k == q) src = blobs.p[k];
+        if (src == nullptr) return;   // an expert the products read where it is (no copy)
         u32x4* ab = gu + q * gs;
         u32x4* cd = dd + q * ds;
         const int64_t step = (int64_t) it.get_global_range(1);

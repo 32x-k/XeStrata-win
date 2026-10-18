@@ -303,7 +303,7 @@ Verifier::~Verifier() {
     if (commit_done_) strata::gpu::event_destroy(commit_done_);
     if (arena_) strata::gpu::free(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_nf_};
+                     h_flagA_, h_plan_, h_flagB_, h_nf_, h_route_};
     for (void* h : hosts)
         if (h) strata::gpu::free(h);
 }
@@ -410,6 +410,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                      (void**) &m_nf_) &&
               mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
               mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
+              mapped((size_t) g.n_layers * T * K * 4, (void**) &h_route_, (void**) &m_route_) &&
               mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&
               mapped(64, (void**) &h_seq_, (void**) &m_seq_) &&
               mapped(64, (void**) &h_flag_, (void**) &m_flag_) &&
@@ -1096,8 +1097,19 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     }
                 } else {
                 if (qbr && !join(1)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
-                qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
-                                 s, scores_ + (size_t) tb * max_blocks_, cs);
+                // the window's rows read each block's key once (upstream 5b6c9398's STRATA_QSA_ROWS; the same bits).
+                // STRATA_QSA_ROWS=0: a sub-group per row and block, as before
+                static const bool qsa_rows = [] {
+                    const char* v = std::getenv("STRATA_QSA_ROWS");
+                    return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+                }();
+                const float* q_win = qidx_ + (ptrdiff_t) tb * IQ * ID;
+                const int32_t* st_win = step_ + (ptrdiff_t) tb * kStepCount;
+                float* sc_win = scores_ + (size_t) tb * max_blocks_;
+                if (qsa_rows && n > 1)
+                    qsa_block_scores_rows(st.idx_pooled, st.idx_dead, q_win, st_win, n, max_blocks_, s, sc_win, cs);
+                else
+                    qsa_block_scores(st.idx_pooled, st.idx_dead, q_win, st_win, n, max_blocks_, s, sc_win, cs);
                 qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
                                sel_ + (size_t) tb * cap_, cs);
                 stamp(l, 11, grp);
@@ -1184,6 +1196,9 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         if (!recording_res_)   // the resident graph asks the host nothing
             doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                              m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+        if (route_rec_ && !batch_rec_)   // add_routing's ids: every layer's, also where the host is not asked
+            copy_i32_from_mapped(m_route_ + ((size_t) l * (size_t) MT + (size_t) tb) * (size_t) K, ids_ + tb * K,
+                                 (int64_t) n * K, cs);
         stamp(l, 17, grp);
         {
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
@@ -1889,6 +1904,20 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     progress_at("decode");
     progress_beat();
     return true;
+}
+
+void Verifier::add_routing(float* usage, int64_t n_expert, int rows) const {
+    if (h_route_ == nullptr || !route_rec_) return;
+    const int64_t K = ss_->k;
+    rows = std::min(rows, last_t_);
+    for (int64_t l = lb_; l < le_; ++l)
+        for (int t = 0; t < rows; ++t) {
+            const volatile int32_t* ids = h_route_ + ((size_t) l * (size_t) max_t_ + (size_t) t) * (size_t) K;
+            for (int64_t j = 0; j < K; ++j) {
+                const int32_t e = ids[j];
+                if (e >= 0 && e < n_expert) usage[(size_t) l * (size_t) n_expert + (size_t) e] += 1.0f;
+            }
+        }
 }
 
 void Verifier::accumulate_profile(const unsigned long long* stamps) {

@@ -49,6 +49,8 @@ setup は最初の GPU を `"gpu_pci"` に、後の GPU を `"split_pci"` に PC
 会話の退避（`--conversation-cache-mib`、`--conversation-save`）は、各 GPU のセッションを写して戻します。
 保存したファイルは同じ分割点のエンジンだけが読みます。`--layer-split auto` は測った値で分割点が変わることがあり、そのときは前のファイルを読みません。
 
+prefill のチャンクの行は、8 つに分けて次の GPU に渡します（upstream 1d9758f8。upstream では opt-in）。分けた 1 つが RAM に着いたところで次の GPU が取り込み始めるので、2 枚の PCIe の転送が重なります。次の GPU のチャンクは、一度だけ立てたスレッドで読みます。`STRATA_HANDOFF_PIPE=P`（2〜16）で分ける数を、`STRATA_HANDOFF_PIPE=0` で前の 1 回の転送に戻します。
+
 ## GPU の番号
 
 エンジンが使える GPU に、0 から番号を付けます。
@@ -75,6 +77,9 @@ CPU 内蔵の GPU は、`--split-device`（setup では `--gpus`）で指定し�
 
 - 選んだ分割に 1〜2 層だけの GPU があれば、どの GPU も 3 層以上になる分割の中から選び直します（upstream 1c6c82ef）。
   層の少ない GPU のキャッシュは小さく、prefill のチャンクがその大きさに縮むためです。
+  GPU が 2 枚なら、その前に、どの GPU もエキスパートの置き場所の広さの割合だけ層を持つ分割の中から選びます（upstream 3b848837、#2644）。速い方に層を寄せる見積もりでは、3 層の決まりがその縁（遅い方が 3 層）に落ち、遅い方の GPU が遊んでいたためです（upstream: RTX 4060 Ti 16 GB と RTX 3060 12 GB で、prefill 802 tok/s のところが 452）。ログにどの決まりで選んだかを出します。
+  `STRATA_SPLIT_SPEED_SCALE=1,0.55` は、各段の読みの速さにこの倍率をかけます（同じ 2 枚で速さの違う組を試すため、upstream 4a1ef86b）。
+- `STRATA_SPLIT_UNIFORM=1`（opt-in、upstream b8844516）は、段ごとのリンクでの外れの値付けをやめます（upstream 0.1.41 より前の一様な値）。x16 と x4 の組のように、どの倍率でも自動の分割が釣り合った分割から外れるとき（upstream: RTX 3090 2 枚で decode −4〜−8%）のためです。
 - 速さかリンクの違う GPU の組で、分割点が 3 層以上離れた別の分割の見積もりが 4% 以内なら、その分割をログに出します（`NEAR TIE`、upstream 8bb250d8）。
   見積もりは decode だけを見ていて prefill を見ていないので、試す価値があります。選ぶ分割は変えません。
 - 2 枚目以降の GPU をどの段に置くかも、同じ見積もりで選びます（upstream be8db787 などの「速いカードを最後に」に当たります）。

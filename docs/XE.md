@@ -10,7 +10,7 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md); how to build it, what setup does and the packages it needs, in [BUILD](BUILD.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata xe0.1.44.1-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.1.44.1-1; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
+XeStrata xe0.1.45-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.1.45-1; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
@@ -29,6 +29,40 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_VRAM_LIMIT_MIB` caps the VRAM the engine sees, `STRATA_MAX_ALLOC_MIB` the largest allocation it assumes, and
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
+
+## Integration through Strata 0.1.45
+
+The changes of upstream Strata 0.1.44.1 to 0.1.45 (`477ac13c`) are carried into Xe.
+
+The main ones:
+
+- The prompt's MoE products read the experts resident in VRAM from their cache slots directly (B70, 1K: prefill +13%). The input is quantized once a token and spread to its k rows.
+- The verify window's QSA block scores read a block's keys once for all of the window's rows (RTX 4070, 32K: decode +1.3%).
+- The experts' decode keeps the activations in work-group local memory, the default on every GPU it fits (B70: +1%).
+- The QSA top-k picks its radix digits with a cooperative scan; a layer whose experts are all resident groups its MMQ experts by their rows, most first.
+- A layer split's prefill hands a chunk's rows to the next GPU in eight pieces, so the two GPUs' copies overlap (`STRATA_HANDOFF_PIPE=0`: one copy).
+- The conversation cache: a new conversation that starts at another one's mid-conversation checkpoint borrows it (#1164); a conversation that grew little is not parked again (`--conversation-cache-park-gain`); checkpoints are kept spaced back from a conversation's end (`--prompt-cache-spread`).
+- The resident RAM mode: with room left in the budget, the experts of the slots the prompt path borrows are kept in RAM too (#1683).
+- `--layer-split auto`: when two cards leave a small stage, it picks again by the ratio of their room (#2644).
+- serve: the thinking limit (`max_tokens` and Anthropic's `budget_tokens`), the model card's sampling for a request without one, the prompt tokenized from the last shared prefix (#1852), the next turn sent to the slot that holds the conversation's checkpoint (#2518), short prompts admitted first (`STRATA_ADMIT_SHORT_FIRST`, opt-in), parser fixes.
+- Carried as opt-in: `STRATA_EXCHANGE_ROTATE`, `STRATA_RAM_ADAPT`, `STRATA_SPLIT_UNIFORM`.
+
+Fixed on XeStrata's side during the integration:
+
+- The boundary between the experts' int8 and FP16 products is timed up to 1024 rows an expert. Timed to 256 only, it read IQ3_S's and UD-Q4_K_XL's 32K chunks with the int8 products (B70, IQ3_S, 32K prefill 1,896 -> 2,425 tok/s).
+- The choice of the big prompt chunks no longer counts the RAM copy it has already made a second time (B70, UD-Q4_K_XL, 32K prefill 1,760 -> 2,412 tok/s).
+- A layer split's later stages no longer hold a flat 1 GiB out of their expert caches, only their verify windows and, on the last stage, the draft head that binds after the cache (B70 + RTX 4070 at 10 GB: the second card's cache +560-700 slots, prefill +4-5%).
+
+Compared with upstream v0.1.45 on the three makers' GPUs (generate on five model files, serve, everyday use, image generation); the B70 is now compared with upstream's `sycl/` port too.
+On the RTX 4070, generate's prefill is the same or faster on all five files (IQ3_XXS at 1K and IQ2_XS 17% faster, UD-Q4_K_XL 1%), and decode 13-30% faster.
+On the RX 9060 XT, prefill is 2.1-3.2 times as fast, and IQ3_XXS's decode, 2.5-4.7% slower in 0.1.44.1, is now the same to 7% faster.
+On the B70, prefill is 1.6-2.5 times as fast as upstream's `sycl/` port and decode 15-95% faster (UD-Q4_K_XL is not compared: the `sycl/` port's answers on it are broken).
+Image generation (1024x1024, 8 steps) takes XeStrata 7.6 s on the B70, 13.2 s on the RTX 4070 and 22.3 s on the RX 9060 XT, upstream's sd-cli 52 s, 25.5 s and 73.5 s.
+Against the XeStrata before the integration on the same text, decode is as fast on the B70 and the RTX 4070, and the B70's prefill at 1K 35% faster.
+
+Not carried: upstream's `sycl/`, the batch work (more than 8 slots on a layer split, the slots' GPU-to-GPU copies, the admission opt-ins, the one-launch rows),
+the Turing (sm_75) speed paths, `--prefill-pipe` (B70 + RTX 4070: prefill 38.6% slower in the smaller chunks), `STRATA_SPLIT_OVERLAP` (XeStrata's stages share no memory word between the GPUs),
+the CUDA opt-in paths without a measurement, and upstream's test tools and records.
 
 ## Integration through Strata 0.1.44.1
 
@@ -165,7 +199,7 @@ They were carried one by one by hand.
 
 The main ones:
 
-- On serve's decode, `STRATA_ROUTE_TAIL_SKIP=7` (default): a missed expert that every token of a verify window routes at rank 7 or lower is neither read nor computed. Upstream keeps it off on HIP; XeStrata measured the KL, a task check and the speed again on the three makers' GPUs and turned it on for all of them.
+- On serve's decode, `STRATA_ROUTE_TAIL_SKIP=7` (default): a missed expert a token routes at rank 7 or lower contributes zero to that token (decided for each token, not for the window), and one that every token of a verify window routes that low is neither read nor computed. Upstream keeps it off on HIP; XeStrata measured the KL, a task check and the speed again on the three makers' GPUs and turned it on for all of them.
 - `STRATA_ROUTE_RESIDENT` and `STRATA_ROUTE_PRIOR`, which lean a verify window's routing towards the experts in VRAM (both opt-in; they change the answers).
 - The prefill CPU share's extension (experts in RAM that is not page-locked as well) and the rule that leaves it off by default when every expert is in VRAM or memory is short.
 - `--aux-cpus` (opt-in), `--ple-io direct` falling back to mmap when it measures slow, the stager's RAM profile, the embedding buffer's reuse.
@@ -419,17 +453,22 @@ The records above were taken before that and compare tokens only.
 Where the draft modes differ, there are two causes:
 
 - The MTP runs had fewer cached experts (the drafter takes VRAM), so some experts ran on the CPU instead of the GPU.
-- On Qwen IQ3_XXS, the suffix run differs from the no-draft run even with the same cache.
-  The CPU's multi-token expert kernels (IQ3_XXS gate/up and IQ4_NL down) sum in a different order from ggml's single-token dot.
-  With the CPU held to ggml's dot (`STRATA_NO_IQ256=1 STRATA_NO_IQ512=1 STRATA_NO_IQ4NL=1`) the draft modes give bit-identical logits,
-  so the GPU side of a multi-token window adds no difference.
-  The difference is kept: it moves only near-ties.
+  From 2026-10-17 the CPU and the GPU (Intel, NVIDIA, AMD) compute the experts whose gate and up rows are i-quants (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S), IQ4_XS or Q2_0 and whose down rows are IQ4_NL or Q2_0 (every layer of the four Qwen3.8 files) alike, and an expert gives the same bits on either (`canon_math.hpp`, `canon_expert.cpp`).
+  The SwiGLU and the int8 scale are built from additions, multiplications and fmas only, the gate/up activations take one scale for each 256 values, and the integer sums of what shares a scale add first, then go into the GPU's lanes with fmas in the GPU's order.
+  The answer stays the same when the window, the PCIe split or the tier changes move an expert between the CPU and the GPU.
+  K-quant and BF16 experts (Unsloth's files, Ornith, llm-jp) are not covered.
+  `STRATA_CANON=0` takes the CPU's former kernels (for comparisons; the GPU's stay, so the CPU's and the GPU's results then differ).
+- On Qwen IQ3_XXS, the suffix run differed from the no-draft run even with the same cache.
+  The CPU took its multi-token expert kernels (i-quant gate/up and IQ4_NL down) from two tokens on and ggml's single-token dot for one, so a token's rows were summed in another order alone than in a window.
+  From 2026-10-16 the CPU computes these and Q4_K, Q5_K and Q6_K with the multi-token kernels from one token on, and Q2_K, Q3_K and Q8_0 with ggml's dot at every token count. A token's rows are the same alone and in a window, and with the same cache the draft modes give bit-identical logits (the GPU side of a multi-token window added no difference before either).
+  `STRATA_IQ_MT_MIN=N` takes the multi-token kernels from N tokens as before (for comparisons).
 
 ### Why outputs change from run to run
 
 Which experts run on the CPU follows the cache size, and that changes the output's last bits.
 `auto` sizes the cache from the free VRAM, so free VRAM moving between starts moves it by a slot or two and can change the output.
 Rounding it down to 64 slots gave every start on a machine the same cache, but it slowed the RTX 4070's decode by 3-4%, so it is not rounded.
+Setup's warm-up instead writes the VRAM free at its start, less 32 MiB, into the run config (`--vram-free-mib`): the engine does not count more free at its start than that, so a start with a little more free VRAM gets the same cache (on the B70 it moved by about 20 MiB between starts, 15 slots). A start with less free gets a smaller cache.
 When the same output is needed (comparisons across machines or settings too), fix it with `--expert-cache N`.
 
 ### The output head's VRAM refusal
@@ -521,8 +560,9 @@ The name describes the quantization budget of a mixed-precision model.
 | PLE n-gram table, second shard | IQ4_NL | Integer n-gram hash, selected row reads/decode; existing PLE vectors and actual table rows |
 
 The native expert oracle in `src/kernels/native_expert_parity.cpp` uses ggml dequantization and host FP64 dot products before comparing the CPU and GPU paths.
+On the layers of the types above, it also checks that the CPU's rows and the GPU's are the same bits, the tokens at once and one at a time.
 Its per-expert relative L1 bound of `3e-2` belongs to that comparison and is not a universal kernel tolerance.
-The GPU's q8_1 activation contract and the CPU's ggml `vec_dot_type` stay explicit.
+The GPU's q8_1 activation contract and the CPU's activations (`canon_expert.cpp`'s form for the experts of the types above, ggml's `vec_dot_type` for the others) stay explicit.
 
 ## Validation inventory
 

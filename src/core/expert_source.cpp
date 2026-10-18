@@ -1129,6 +1129,7 @@ bool FileExpertSource::pin_cache_complement(
                                             additional_gpu_pairs, offsets, bytes, err)) return false;
     const bool what_fits = budget_bytes == kResidentWhatFits;   // #467: the soft mode's second try
     const int64_t lend_asked = lend_from_slot;   // #11: the lent slots whose experts stay on the files are read again
+    int64_t budget_lent = 0, budget_lendable = 0;   // the lend region's slots kept by a budget (below), and its size
     uint64_t budget_physical = 0;   // #403: the RAM reading a budget was sized from (0: no budget)
     if (budget_bytes > 0) {
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while
@@ -1183,6 +1184,36 @@ bool FileExpertSource::pin_cache_complement(
         std::fprintf(stderr, "FileExpertSource: RAM budget %.2f GiB: %lld of the %.2f GiB of experts the GPU cache does "
                              "not hold, by profile rank; the rest are read from the files\n",
                      (double) budget_bytes / 1073741824.0, (long long) held, (double) bytes / 1073741824.0);
+        // The prompt path's lend region under a budget.  Until now a budget turned the loan off (`lend_from_slot = -1`
+        // below), so every lent slot's expert was read from the pack during every prompt chunk and again when the slot
+        // was refilled after the prompt - even with room left in the budget.  Measured on an RX 6900 XT 16 GB with
+        // --resident-budget-gib 71 and UD-Q4_K_XL: the copy kept all 63.47 GiB of the experts outside the cache, 7.5
+        // GiB of the budget stayed unused, and every agent turn read 0.5-2.6 GB of the 1,231 lent slots' experts (3.6
+        // GiB) from the GGUF (a fresh 17K-token prompt 24 GB).  As the unbudgeted path does, take the lend region's
+        // experts from the last slot down (the order the borrowing takes them) while they fit in what the budget has
+        // left; the ones past it keep the file fallback, and `rank` keeps its precedence (the hottest experts first).
+        if (lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty()) {
+            budget_lendable = n_slots - lend_from_slot;
+            std::vector<size_t> order;   // the pairs in the lend region, highest slot first
+            for (size_t i = 0; i < primary_gpu_pairs.size(); ++i)
+                if (pair_slot[i] >= lend_from_slot && pair_slot[i] < n_slots) order.push_back(i);
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return pair_slot[a] > pair_slot[b]; });
+            const uint64_t at0 = at;
+            for (size_t i : order) {
+                const auto& pr = primary_gpu_pairs[i];
+                const size_t idx = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
+                const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
+                if (b > budget_bytes - at) break;   // a contiguous tail of the region: a short prompt lends only the last few
+                if (ranked[idx] != kNoComplement) continue;
+                ranked[idx] = at;
+                at += b;
+                ++budget_lent;
+            }
+            std::fprintf(stderr, "FileExpertSource: the prompt path's lend region: %lld of its %lld slots keep their experts "
+                                 "in RAM too (%.2f GiB of the budget's remaining %.2f GiB)\n",
+                         (long long) budget_lent, (long long) budget_lendable, (double) (at - at0) / 1073741824.0,
+                         (double) (budget_bytes - at0) / 1073741824.0);
+        }
         offsets.swap(ranked);
         bytes = at;
         lend_from_slot = -1;
@@ -1514,7 +1545,7 @@ bool FileExpertSource::pin_cache_complement(
     complement_partial_ = !pinned_ok && partial_pin > 0;
     complement_locked_ = locked;
     complement_lock_off_ = lock_off;
-    complement_lent_slots_ = lend ? n_slots - keep_from : 0;
+    complement_lent_slots_ = lend ? n_slots - keep_from : budget_lent;   // a budget keeps its own tail of the region
     complement_lent_slots_ += stage_lent;   // and the split stages' regions: the pairs the copy kept of them
     complement_ready_ = true;
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s\n",
@@ -1522,22 +1553,24 @@ bool FileExpertSource::pin_cache_complement(
                  (double) resident_bytes() / 1073741824.0, (double) pinned_bytes() / 1073741824.0,
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_t0).count(),
                  note.empty() ? "" : "; ", note.c_str());
-    if (lend)
+    const int64_t lendable_all = lend ? n_slots - lend_from_slot : budget_lendable;   // 0: no lend region at all
+    if (lendable_all > 0)
         std::fprintf(stderr, "FileExpertSource: %lld of the prompt path's %lld lendable slots keep their experts in RAM "
-                             "too%s\n", (long long) complement_lent_slots_, (long long) (n_slots - lend_from_slot),
-                     complement_lent_slots_ < n_slots - lend_from_slot
+                             "too%s\n", (long long) (lend ? n_slots - keep_from : budget_lent), (long long) lendable_all,
+                     (lend ? n_slots - keep_from : budget_lent) < lendable_all
                          ? " (the others are read from the file when lent: not enough RAM for them)" : "");
-    if (lend && complement_lent_slots_ < n_slots - lend_from_slot) {
+    if (lendable_all > 0 && (lend ? n_slots - keep_from : budget_lent) < lendable_all) {
         // below full coverage the uncovered experts are read from the files during a long prompt, which routes
         // through nearly all of them, so the reads repeat (upstream 14d9d2e1, f780961c, #1389: 18% uncovered cost 26%
         // of the prompt speed on a gfx1100; short prompts barely touch them).  A warning, not a refusal.
-        const long long lendable = (long long) (n_slots - lend_from_slot);
-        const long long missing = lendable - (long long) complement_lent_slots_;
+        const long long lendable = (long long) lendable_all;
+        const long long missing = lendable - (long long) (lend ? n_slots - keep_from : budget_lent);
         std::fprintf(stderr, "FileExpertSource: WARNING: %lld of %lld lendable slots (%.0f%%) will read their experts "
                              "from the files during a long prompt; expect a slower prompt read on 50K+ token prompts "
-                             "(one measurement: 18%% uncovered cost 26%%).  Free RAM and restart; the line above "
-                             "should read N of N\n",
-                     missing, lendable, 100.0 * (double) missing / (double) std::max<long long>(1, lendable));
+                             "(one measurement: 18%% uncovered cost 26%%).  %s and restart; the line above should read "
+                             "N of N\n",
+                     missing, lendable, 100.0 * (double) missing / (double) std::max<long long>(1, lendable),
+                     lend ? "Free RAM" : "Raise --resident-budget-gib (the lend region comes after the ranked experts)");
     }
     if (!stage_lend_regions_.empty()) {
         int64_t offered = 0;
@@ -1566,7 +1599,7 @@ bool FileExpertSource::has_resident(int64_t layer, int64_t expert) const {
     return resident_blob(index) != nullptr;
 }
 
-bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
+bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bounce) {
     err.clear();
     if (n <= xstage_cap_) return true;
     if (!staged_.empty()) { err = "FileExpertSource: exchange buffers are in use"; return false; }
@@ -1589,12 +1622,15 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     }
     const char* rotate_env = std::getenv("STRATA_EXCHANGE_ROTATE");
     const bool requested = rotate_env != nullptr && std::strcmp(rotate_env, "1") == 0;
-    const bool uniform = std::all_of(layer_blob_bytes_.begin(), layer_blob_bytes_.end(),
-                                     [blob](uint64_t b) { return b == blob; });
-    const bool eligible = requested && uniform && complement_pinned_ && !complement_partial_ &&
+    // layers of several block sizes (a GGUF's mixed i-quants): spares of every size, see ExchangeStorage
+    bounce = std::max<int64_t>(0, std::min(bounce, n));
+    const uint64_t rotate_total =
+        detail::ExchangeStorage::exchange_bytes_needed(layer_blob_bytes_, (size_t) n, (size_t) bounce);
+    const bool eligible = requested && rotate_total != 0 && rotate_total <= std::numeric_limits<size_t>::max() &&
+                          complement_pinned_ && !complement_partial_ &&
                           complement_host_ != nullptr && complement_device_ != nullptr && complement_bytes_ > 0 &&
                           complement_chunks_.empty();
-    const size_t total = (size_t) n * (size_t) blob;
+    const size_t total = eligible ? (size_t) rotate_total : (size_t) n * (size_t) blob;
     void* p = nullptr;
     if (strata::gpu::alloc_host(&p, total) == true && p != nullptr) {
         xstage_pinned_ = true;
@@ -1608,15 +1644,23 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     xstage_cap_ = n;
     xstage_blob_ = blob;
     if (requested) {
-        std::string reason = "it needs equal-size expert blobs and a fully page-locked RAM copy in one part";
+        std::string reason = "it needs a fully page-locked RAM copy in one part";
         void* device = nullptr;   // host USM: the device reads it at the same address
         if (eligible && xstage_pinned_ && strata::gpu::device_pointer(&device, p) && device != nullptr) {
             try {
-                if (exchange_storage_.initialize(complement_offsets_, (uint8_t*) complement_host_, complement_device_,
-                                                 complement_bytes_, xstage_, (const uint8_t*) device, (size_t) n,
-                                                 (size_t) blob, reason))
-                    std::fprintf(stderr, "FileExpertSource: exchange buffer rotation on: %lld buffers of %llu bytes; no "
-                                         "host copy at a commit\n", (long long) n, (unsigned long long) blob);
+                std::vector<uint64_t> sizes(complement_offsets_.size(), 0);
+                for (size_t i = 0; i < sizes.size(); ++i) {
+                    const size_t layer = n_expert_ > 0 ? i / (size_t) n_expert_ : 0;
+                    sizes[i] = layer < layer_blob_bytes_.size() ? layer_blob_bytes_[layer] : 0;
+                }
+                if (exchange_storage_.initialize_sized(complement_offsets_, sizes, (uint8_t*) complement_host_,
+                                                       complement_device_, complement_bytes_, xstage_,
+                                                       (const uint8_t*) device, (uint64_t) total, (size_t) n,
+                                                       (size_t) bounce, reason))
+                    std::fprintf(stderr, "FileExpertSource: exchange buffer rotation on: %lld buffers in %zu block "
+                                         "sizes (largest %llu bytes, %.2f GiB page-locked); no host copy at a commit\n",
+                                 (long long) n, exchange_storage_.block_sizes(), (unsigned long long) blob,
+                                 (double) total / 1073741824.0);
             } catch (const std::bad_alloc&) { reason = "its tables could not be allocated"; }
         } else if (eligible) {
             reason = "the exchange buffers could not be page-locked";
@@ -1628,15 +1672,18 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     return true;
 }
 
-uint8_t* FileExpertSource::exchange_buffer(int64_t q) const {
+uint8_t* FileExpertSource::exchange_buffer(int64_t q, int64_t layer) const {
     if (xstage_ == nullptr || q < 0 || q >= xstage_cap_) return nullptr;
-    if (exchange_storage_.active()) return exchange_storage_.spare((size_t) q).host;
+    if (exchange_storage_.active())
+        return layer >= 0 && layer < n_layers_
+                   ? exchange_storage_.spare((size_t) q, (size_t) layer_blob_bytes_[(size_t) layer]).host
+                   : exchange_storage_.spare((size_t) q).host;
     return xstage_ + (size_t) q * (size_t) xstage_blob_;
 }
 
 bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, int64_t q) {
     if (out < 0 || out >= n_expert_ || !has_resident(layer, in) || has_resident(layer, out) ||
-        exchange_buffer(q) == nullptr)
+        exchange_buffer(q, layer) == nullptr)
         return false;
     const size_t i_in = (size_t) layer * (size_t) n_expert_ + (size_t) in;
     const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
@@ -1644,7 +1691,7 @@ bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, in
     if (override_[i_out] != nullptr) return false;
     for (const Exchange& x : staged_)
         if (x.in == i_in || x.q == q) return false;
-    override_[i_out] = exchange_buffer(q);
+    override_[i_out] = exchange_buffer(q, layer);
     staged_.push_back({i_in, i_out, q, layer_blob_bytes_[(size_t) layer]});
     return true;
 }
@@ -1674,6 +1721,30 @@ int64_t FileExpertSource::commit_exchanges() {
     staged_.clear();
     exchanges_ += n;
     return n;
+}
+
+bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) {
+    if (!complement_ready_ || complement_host_ == nullptr || exchange_storage_.active() || !staged_.empty() ||
+        layer < 0 || layer >= n_layers_ || in < 0 || out < 0 || in >= n_expert_ || out >= n_expert_ || in == out)
+        return false;
+    const size_t i_in = (size_t) layer * (size_t) n_expert_ + (size_t) in;
+    const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
+    if (i_in >= complement_offsets_.size() || i_out >= complement_offsets_.size()) return false;
+    if (!override_.empty() && (override_[i_in] != nullptr || override_[i_out] != nullptr)) return false;
+    const uint64_t at = complement_offsets_[i_out], bytes = layer_blob_bytes_[(size_t) layer];
+    if (at == kNoComplement || complement_offsets_[i_in] != kNoComplement || at > complement_bytes_ ||
+        bytes > complement_bytes_ - at) return false;
+    // read beside the copy first: a failed read leaves `out` where it was
+    if (ram_adapt_buf_.size() < (size_t) bytes) ram_adapt_buf_.resize((size_t) bytes);
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!copy_from_files(layer, in, ram_adapt_buf_.data())) return false;
+    file_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
+                       std::memory_order_relaxed);
+    file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    std::memcpy((uint8_t*) complement_host_ + (size_t) at, ram_adapt_buf_.data(), (size_t) bytes);
+    if (!detail::exchange_cache_complement(complement_offsets_, i_out, i_in)) return false;
+    ++ram_adapts_;
+    return true;
 }
 
 void FileExpertSource::commit_copies() {
@@ -1975,22 +2046,32 @@ bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, doub
     CpuCalJobs cj;
     if (!cpu_cal_jobs(d, n_layers, layer, cj, why)) return false;
     constexpr int kCall = CpuCalJobs::kCall;
-    // the clocks up first (an idle CPU takes tens of ms to raise them; a decode keeps them up), then 1 and 8 experts
-    // a call in turns, 32 calls each, the mean
+    // three rounds, each after 100 ms of calls that keep the clocks up (an idle CPU takes tens of ms to raise them; a
+    // decode keeps them up): 1 and 8 experts a call in turns, 32 calls each, the median; the lowest round.  One round's
+    // mean read an expert 4-8x slow in 2 of 32 starts on the RX 9060 XT's machine (0.18 and 0.39 against 0.05 ms, the
+    // same beside the link: the whole round slow), and the split then sent the missed experts over PCIe for most of a
+    // 256-token decode
     const auto now = [] { return std::chrono::steady_clock::now(); };
-    for (const auto t0 = now(); now() - t0 < std::chrono::milliseconds(100);) {
-        cj.next(kCall);
-        d.pool->run_split_multi_native(cj.f, cj.jobs, kCall);
-    }
-    double ms[2] = {};
-    for (int rep = 0; rep < 32; ++rep)
-        for (int w = 0; w < 2; ++w) {
-            const int k = w == 0 ? 1 : kCall;
-            cj.next(k);
-            const auto t0 = now();
-            d.pool->run_split_multi_native(cj.f, cj.jobs, k);
-            ms[w] += std::chrono::duration<double, std::milli>(now() - t0).count() / 32.0;
+    double ms[2] = {1e30, 1e30};
+    for (int round = 0; round < 3; ++round) {
+        for (const auto t0 = now(); now() - t0 < std::chrono::milliseconds(100);) {
+            cj.next(kCall);
+            d.pool->run_split_multi_native(cj.f, cj.jobs, kCall);
         }
+        double one[2][32];
+        for (int rep = 0; rep < 32; ++rep)
+            for (int w = 0; w < 2; ++w) {
+                const int k = w == 0 ? 1 : kCall;
+                cj.next(k);
+                const auto t0 = now();
+                d.pool->run_split_multi_native(cj.f, cj.jobs, k);
+                one[w][rep] = std::chrono::duration<double, std::milli>(now() - t0).count();
+            }
+        for (int w = 0; w < 2; ++w) {
+            std::nth_element(one[w], one[w] + 16, one[w] + 32);
+            ms[w] = std::min(ms[w], one[w][16]);
+        }
+    }
     c = (ms[1] - ms[0]) / (kCall - 1);
     c0 = std::max(0.0, ms[0] - c);
     if (!(c > 0.0)) { why = "the CPU times did not grow with the experts"; return false; }
@@ -2023,8 +2104,8 @@ namespace {
 // upstream's 45 at a fixed share), and 3.5x beside a busy host, where the split gave the CPU nearly every missed expert
 // (26 against 40 tok/s).  The decode's own pool calls are set against the times the split read for them, and the CPU's
 // times are scaled by the ratio when it is off by more than 15%: after 512 calls with experts on the CPU, then 1,024 and
-// 2,048 more, three updates at most (as upstream's PcieAuto refines its share).  STRATA_PCIE_SPLIT_REFINE=0: the
-// start-up times stay.
+// 2,048 more, three updates at most (as upstream's PcieAuto refines its share), by up to 8x an update (4x left a
+// start-up reading 8x slow at 2x after the first update).  STRATA_PCIE_SPLIT_REFINE=0: the start-up times stay.
 void refine_split(ExpertDispatch& d, bool both, int experts, double ms) {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_PCIE_SPLIT_REFINE");
@@ -2042,7 +2123,7 @@ void refine_split(ExpertDispatch& d, bool both, int experts, double ms) {
     ++r.updates;
     r = ExpertDispatch::SplitRefine{0.0, 0.0, 0, 0, r.updates};
     if (!(ratio > 0.0) || (ratio >= 1.0 / 1.15 && ratio <= 1.15)) return;
-    const double f = std::min(4.0, std::max(0.25, ratio));
+    const double f = std::min(8.0, std::max(0.125, ratio));
     t.c0 *= f;
     t.c *= f;
     t.cb0 *= f;
@@ -2100,7 +2181,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     pt("begin");
     d.src->begin_layer(d.layers, ids, n_tok * k);
     pt("begun");
-    if (!d.usage.empty())
+    if (!d.usage.empty() && !d.usage_by_window)
         for (int64_t i = 0; i < n_tok * k; ++i)
             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
@@ -2132,10 +2213,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     !helper_holds(e)) ++nmiss;
             }
         }
-        // STRATA_ROUTE_TAIL_SKIP=R (upstream 65268d99; opt-in, changes the output): a missed expert that EVERY token of
-        // the window routes only at rank >= R (the smallest weights of the top-k) is neither copied nor computed; its
-        // contribution is zero, without renormalisation (the others keep the weight the router gave them).  Less PCIe
-        // and CPU work.  Not with a helper GPU, which may hold it.
+        // STRATA_ROUTE_TAIL_SKIP=R (upstream 65268d99; opt-in, changes the output): a missed expert routed at rank >= R
+        // (the smallest weights of the top-k) contributes zero to that token, without renormalisation (the others keep
+        // the weight the router gave them); one that EVERY token of the window routes that low is neither copied nor
+        // computed.  Less PCIe and CPU work.  Per entry, not per expert: upstream zeroed a token's low-ranked expert
+        // only when no other token of the window needed it, so a token's output depended on the window's other rows
+        // (window-invariant output, #152).  Not with a helper GPU, which may hold it.
         const int tail_rank = tail_skip_rank();
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
@@ -2221,7 +2304,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
             }
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) kind[i] = kd;
+                if (first_of[i] == i0) kind[i] = kd != 0 && tail_rank > 0 && d.remote_count == 0 && i % k >= tail_rank
+                                                     ? -2 : kd;   // a tail entry of a missed expert (above)
             if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
             P.ptr[groups] = ptr;
             P.start[groups] = entries;
@@ -2241,7 +2325,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                                  : P.staging + (unsigned long long) q * (unsigned long long) bb;
             P.start2[q] = entries;
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) {
+                if (first_of[i] == i0 && kind[i] == 1) {
                     P.dst[entries] = (int32_t) i;
                     P.tok[entries] = (int32_t) (i / k);
                     ++entries;

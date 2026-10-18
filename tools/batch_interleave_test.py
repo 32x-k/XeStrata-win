@@ -17,7 +17,7 @@ chunks interleaved with their windows), and a conversation's next turn continued
   7. F, A's history as a client sends it back without the reply's thinking, from slot 1's turn checkpoint: equal to
      F solo (which continues from the same checkpoint of the live chain)
 
-Exact comparisons need the same settings as batch_test.py (this script sets STRATA_IQ_MT_MIN=1):
+Exact comparisons need the same settings as batch_test.py:
   python tools/batch_interleave_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json \\
       --extra "--pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow"
 Without --no-prefill-borrow the slots decoding during C's read see the expert cache without the slots C's prompt
@@ -75,7 +75,7 @@ def main():
     D = chat(body + "\nWhat are the three most important ideas in the text above?")
     E = chat("Describe the life cycle of a star like the Sun.")
     print(f"prompts: A {len(A)}, B {len(B)}, C {len(C)} tokens", flush=True)
-    eng = Engine(a.exe, cfg, 3, {"STRATA_IQ_MT_MIN": "1"}, a.extra.split())
+    eng = Engine(a.exe, cfg, 3, {}, a.extra.split())
     eng.pending = []
     out = eng.lines()
 

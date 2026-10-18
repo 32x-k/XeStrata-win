@@ -471,6 +471,8 @@ static int iq256_variant_for(int type) noexcept {
 
 int iq256_variant() noexcept { return iq256_variant_for(21); }
 
+int iq_prefetch_bytes() noexcept { return prefetch_distance(); }
+
 int iq256_variants() noexcept { return kIq256Gather | (vnni_on() ? kIq256Vnni : 0); }
 
 void iq256_gu_rows_v(int variant, int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
@@ -499,6 +501,21 @@ void iq256_rows_v(int variant, int type, const uint8_t* w, size_t row_bytes, int
 #endif
     if (g) plain::dot_type<true>(type, nt, w, row_bytes, n, act, out, r0, r1);
     else plain::dot_type<false>(type, nt, w, row_bytes, n, act, out, r0, r1);
+}
+
+void iq256_canon_rows(int type, const uint8_t* w, size_t row_bytes, int n, const int8_t* const* xq,
+                      const float* const* xd, int nt, float* const* out, int r0, int r1) {
+    const int variant = iq256_variant_for(type);
+    const bool g = (variant & kIq256Gather) != 0;
+#if STRATA_AVXVNNI
+    if (variant & kIq256Vnni) {
+        if (g) vnni::canon_type<true>(type, nt, w, row_bytes, n, xq, xd, out, r0, r1);
+        else vnni::canon_type<false>(type, nt, w, row_bytes, n, xq, xd, out, r0, r1);
+        return;
+    }
+#endif
+    if (g) plain::canon_type<true>(type, nt, w, row_bytes, n, xq, xd, out, r0, r1);
+    else plain::canon_type<false>(type, nt, w, row_bytes, n, xq, xd, out, r0, r1);
 }
 
 void iq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,

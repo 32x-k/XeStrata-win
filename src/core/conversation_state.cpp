@@ -635,4 +635,22 @@ ConversationRestore conversation_split_restore(const SavedConversation& image,
     }
     return ConversationRestore::restored;
 }
+// upstream c9e571e0 (#1164): a borrowed checkpoint's K/V; the parked image stays as it is
+ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
+                                                          SessionState& ss, const ModelGeometry& g,
+                                                          const QsaState& draft, std::string& error) {
+    if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
+    const int64_t captured = (int64_t) image.live.ids.size();
+    if (upto < 1 || upto > captured) {
+        fail(error, "the borrowed prefix is not inside the parked conversation");
+        return ConversationRestore::invalid;
+    }
+    if (!sync(error)) return ConversationRestore::transfer_failed;
+    for (size_t j = 0; j < owned_qsa(ss, g); ++j)
+        if (!conversation_kv_restore_prefix(image.kv[j], owned(ss, j), g, captured, upto, true, error))
+            return ConversationRestore::transfer_failed;
+    if (!conversation_kv_restore_prefix(image.kv.back(), draft, g, captured, upto, false, error))
+        return ConversationRestore::transfer_failed;
+    return ConversationRestore::restored;
+}
 } // namespace strata::core

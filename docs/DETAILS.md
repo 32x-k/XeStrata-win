@@ -41,7 +41,7 @@ One run per cell.
 | **IQ3_S** | 450 | 740 | 1,718 | 1,458 | 1,333 | 1,081 |
 | **Coder** | 936 | 1,573 | 2,015 | 1,659 | 1,499 | 1,188 |
 
-While a short prompt (a chunk below 2,048 tokens) is read, the decode CPU pool, idle then, computes the experts outside VRAM that few of its tokens route to (opt-in upstream, the default here: `STRATA_PREFILL_CPU_SHARE=auto`). It measures the CPU's and the GPU's time per expert and hands over the share at which both end together. With `STRATA_PREFILL_CPU_GATE=1` it also times neighbouring layers with and without the share, and shares only while the layers that share take less time per expert outside VRAM (upstream f2a3b946, #1282: on one PC the busy CPU slowed the host that issues the streams, and every share lost). The layers tried without the share cost more than that saved here, 1.3% of a 1K prompt's speed on the B70 and 4.4% on the RTX 4070, so it is off by default. `STRATA_DBG_CPU_GATE=1` prints those readings. The default leaves it off when the GPU cache holds every expert (nothing streams) and when the host is short of memory (less free RAM than the share's buffers and 3 GiB, or file pages of the experts it would read that the free RAM cannot keep) (upstream eaaa237e, 04dbe561; `STRATA_PREFILL_CPU_SHARE=auto` turns it on anyway). A buffer of the share that cannot be had ends the share instead of failing the request. The CPU computes in its own activation format, so an answer can differ a little from the GPU-only one. The measured share moves a little from run to run, so two greedy runs with the same settings can part after some tokens too (as with the decode's PCIe share); to compare two runs' answers, fix both with `STRATA_PREFILL_CPU_SHARE=0` and `--pcie-frac 0`. `STRATA_PREFILL_CPU_SHARE=0` keeps every expert on the GPU, `0.4` and the like a fixed share. 262- / 914-token prompts went from 319.2 to 383.1 / 736.3 to 828.0 tokens/s on the B70 and from 109.9 to 266.1 / 275.9 to 457.8 tokens/s on the RTX 4070 (one run each).
+While a short prompt (a chunk below 2,048 tokens) is read, the decode CPU pool, idle then, computes the experts outside VRAM that few of its tokens route to (opt-in upstream, the default here: `STRATA_PREFILL_CPU_SHARE=auto`). It measures the CPU's and the GPU's time per expert and hands over the share at which both end together. With `STRATA_PREFILL_CPU_GATE=1` it also times neighbouring layers with and without the share, and shares only while the layers that share take less time per expert outside VRAM (upstream f2a3b946, #1282: on one PC the busy CPU slowed the host that issues the streams, and every share lost). The layers tried without the share cost more than that saved here, 1.3% of a 1K prompt's speed on the B70 and 4.4% on the RTX 4070, so it is off by default. `STRATA_DBG_CPU_GATE=1` prints those readings. The default leaves it off when the GPU cache holds every expert (nothing streams) and when the host is short of memory (less free RAM than the share's buffers and 3 GiB, or file pages of the experts it would read that the free RAM cannot keep) (upstream eaaa237e, 04dbe561; `STRATA_PREFILL_CPU_SHARE=auto` turns it on anyway). A buffer of the share that cannot be had ends the share instead of failing the request. The CPU computes in its own activation format, so an answer can differ a little from the GPU-only one. The measured share moved a little from run to run, and the experts the CPU took with it, so two greedy runs with the same settings parted after some tokens. Setup's warm-up therefore measures the share once per PC and model and writes it into the run config (`--prefill-cpu-share`): a prompt is read the same way every run. `--prefill-cpu-share auto` measures it in every prompt as before. The decode's PCIe share also changes from run to run, but it does not change the answer where the experts compute alike on the CPU and the GPU (i-quant, IQ4_XS or Q2_0 gate/up and IQ4_NL or Q2_0 down: the four Qwen3.8 files); to compare two runs' answers exactly on a model with experts of other types, add `--pcie-frac 0` as well. `STRATA_PREFILL_CPU_SHARE=0` keeps every expert on the GPU, `0.4` and the like a fixed share. 262- / 914-token prompts went from 319.2 to 383.1 / 736.3 to 828.0 tokens/s on the B70 and from 109.9 to 266.1 / 275.9 to 457.8 tokens/s on the RTX 4070 (one run each).
 
 With a helper GPU (`--expert-cache-device1`, or the helper `--layer-split auto` chose), in the same short chunks the experts not in VRAM that the helper holds and few tokens route to are computed by the helper from its own VRAM. Their tokens' rows go to it through host memory registered on both GPUs, and the results come back the same way. How many tokens an expert may have is where moving its rows over the helper's link and back takes less time than streaming the expert to the first GPU, from both links as measured at the start (19 for a B70 and an RTX 4070 on x4). `STRATA_PREFILL_HELPER_ROWS=n` sets it, `0` turns it off. The helper computes with its int8 products, so the reply can differ slightly from the first GPU alone's (the first token's KL on a 1K prompt 0.011; the CPU share at 0.5: 0.020). On a B70 and an RTX 4070 a 1K prompt went from 693 to 735 tokens/s.
 
@@ -65,10 +65,11 @@ It speeds up handing back a given text nearly as it was, and slows ordinary chat
 (B70, IQ2_XS, K=3: rewriting a document 109.6 → 129.2, ordinary chat 71.1 → 68.3 tokens/s).
 `--lookup-chain-min M` is the match it needs before adding any (default 3 tokens).
 
-In the server's decode, a missed expert (not in VRAM) that every token of a verify window routes only at rank 7 or
-lower (the 8th to 10th of the top 10, the smallest weights) is neither read nor computed (`STRATA_ROUTE_TAIL_SKIP`,
-default 7, upstream b4e3407b). Its contribution is zero and the other experts keep their weights (no renormalisation),
-so the answers differ slightly.
+In the server's decode, a missed expert (not in VRAM) that a token routes at rank 7 or lower (the 8th to 10th of the
+top 10, the smallest weights) contributes zero to that token, and one that every token of a verify window routes that
+low is neither read nor computed (`STRATA_ROUTE_TAIL_SKIP`, default 7, upstream b4e3407b). The other experts keep their
+weights (no renormalisation), so the answers differ slightly. Upstream zeroes it only when no other token of the window
+needs the expert, so a token's output depended on the window's other rows; here it is decided for each token.
 It does nothing when every expert is in VRAM (nothing is skipped), with `--batch` and with a helper cache
 (`--expert-cache-device1..3`); on a layer split each stage skips its own.
 It is not on by default either when 90% or more of the experts are in VRAM (upstream's #1884: the misses are few and the
@@ -231,6 +232,7 @@ The Q8_0 read that also writes the next projections' q8_1, 32 columns a work-gro
 IQ3_XXS's 32K decode: B70 +3.5%, RTX 4070 the same (prefill +1%), RX 9060 XT +0.6% (there with the q8_1 written in the read).
 The engine reads the experts from the GGUF files in place.
 It keeps a RAM budget of them, the most-used first after the ones the GPU holds (`--resident-budget-gib N`).
+When the budget has room left, the slots the prompt path borrows keep their experts in RAM too (the engine prints `the prompt path's lend region: N of its M slots keep their experts in RAM too`; upstream f2e142f4, #1683); before, a budget always left them out, and every prompt read the lent slots' experts from the files again.
 setup chooses the RAM less 24 GB for N, less the KV cache too when that lives in RAM:
 36 GiB on a 64 GB PC with a 128K context.
 The rest come from the SSD while it answers.
@@ -306,7 +308,7 @@ The engine's options (added to the settings' `args`):
 | `--max-context N` | the KV cache's tokens (setup picks it from the GPU's VRAM) |
 | `--expert-profile PATH` | fill the experts in VRAM in this profile's order at start |
 | `--expert-profile-save PATH` | write what this run learned as a profile |
-| `--adapt-every N` | windows between swaps of the experts in VRAM (default 4; 0: no swaps) |
+| `--adapt-every N` | how often the experts in VRAM are swapped: at every 4N-th token of a request, the windows cut there, so the text does not depend on the drafting (the batch slots, `--pipeline-windows` and `--adapt-async`: every N windows) (default 4; 0: no swaps) |
 | `--adapt-swaps N` | the most experts one swap moves (default 96; the one right after a prompt moves up to 2,048, those the prompt used most, and fills every free slot with any expert it used) |
 | `--adapt-mib-per-token N` | the swaps copy at most N MiB for each token read since the last one (default 48; 0: no bound) |
 | `--mmap-experts` | read the experts from the model file instead of loading them into RAM |
@@ -344,8 +346,13 @@ With every expert in RAM, the move into the GPU driver's memory (host USM) for t
   With `--pipeline-windows 2` ([MULTIGPU](MULTIGPU.md)) the decode loop queues each card's copies while that card has no window in flight, and the copies into the evicted slots and the moves into RAM wait until the windows that were in flight when they were decided have completed (upstream 13eee452; `STRATA_PIPELINE_ADAPT_ASYNC=0`: the waiting tier).
   `STRATA_EXCHANGE_ROTATE=1` (opt-in, upstream 1e6cec80) hands the exchange buffer's ownership over at a swap instead of
   copying the evicted expert into the RAM copy (the same tokens, fewer host copies).
-  It works only with a pack whose experts are all one size (the AVX-512 Q2_0 pack's `experts.bin`) and a fully
-  page-locked RAM copy; a native pack, whose blobs differ by layer, says so in the log and keeps the copying exchanges.
+  It works only with a fully page-locked RAM copy; a native pack whose blobs differ by layer (IQ3_XXS has nine sizes) keeps its spare buffers per size (upstream fa1d1d1e).
+  That takes more page-locked RAM (1.20 GiB with IQ3_XXS and `--adapt-swaps 80`). On the B70, IQ3_XXS, 4K, `--resident-experts --adapt-every 1 --adapt-swaps 80` decoded +1.4% (73.2 -> 74.3 tok/s) with the same tokens.
+- `STRATA_RAM_ADAPT=<n>` (opt-in, `--serve`, one GPU, upstream d7298883): the RAM copy follows the conversation too.
+  Without it the copy is chosen once, at start, so when the RAM cannot hold every expert the GPU does not, an expert outside the copy is read from the files (the SSD) every time the conversation routes to it.
+  With it, before a decode window and while no adaptive round is in flight, up to `n` experts the windows keep routing to (the adaptive tier's decayed count, 2 or more) take the RAM places of experts of their own layer that are not routed to (below 0.5): one pair per layer, the largest difference first, one file read each.
+  The RAM stays the same size; the routing, the weights and the VRAM tier's rule are untouched. It needs the adaptive tier (`--adapt-every`), and does nothing with `STRATA_EXCHANGE_ROTATE=1`, a layer split, a helper GPU or `--batch`.
+  Upstream measured decode +16.5% on an RTX 3060 12 GB with 32 GB of RAM (IQ2_XS). On the B70, IQ3_XXS with a 6 GiB RAM budget, serve at 32K was equal: the file reads come from the OS file cache there.
 - Otherwise they are read through the OS file cache (`--mmap-experts`), which re-reads them from the SSD as it runs: slower.
   Reading from the GGUF files, the prefill copies the experts with the SSD profile (many threads, a deep ring). When
   90% or more of the experts' pages are already in the page cache at the first prefill (Linux: a sample checked with
@@ -702,7 +709,12 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   The engine continues from what it already holds, so nothing is read again.
   The wrap-up is part of the thinking the client sees and counts as output tokens.
   `"reasoning_budget_tokens": N` in `xestrata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget.
-  Off by default; Anthropic's `"thinking": {"budget_tokens": N}` still only chooses the level, as above.
+  Off by default; Anthropic's `"thinking": {"budget_tokens": N}` chooses the level, as above, and is also the budget (a `reasoning_budget_tokens` in the same request wins).
+- **max_tokens counts the thinking, so the answer keeps its room.** A client that caps the whole reply (the desktop agent's harness sends `max_completion_tokens: 8192` on every request) and a task the model thinks long about used to be cut off in the middle of the thinking, with no answer.
+  A request with thinking on, no budget of its own and `max_tokens` of 1,024 or more gets one: the thinking is wrapped up when only a quarter of the cap (at least 512 tokens) is left, and the model answers in that room (8,192: thinking up to 6,144, answer 2,048).
+  Requests without `max_tokens` (the rest of the context) get a budget of three quarters of it.
+  `"answer_room": false` in `xestrata-<model>.json` turns it off.
+  Qwen recommends up to 262,144 tokens of reasoning and 131,072 of answer: a client should not cap the reply far below what the context allows.
 - **Changing the effort without reading the prompt again (opt-in).** The effort's instruction is the first thing in the prompt, so a request that only changes the effort (an agent's "think harder" switch, `none` for a quick tool step) reads the whole conversation again.
   `"effort_position": "end"` in `xestrata-<model>.json` renders every request's prompt start as the default effort's and puts a `low` / `medium` effort in a short system turn right before the answer (no thinking: the empty thinking block, as always).
   The engine keeps its conversation checkpoint in front of that turn (`--tail-role-token`; the server checks that the engine knows it), so the next request reuses the conversation whatever its effort.
@@ -871,6 +883,10 @@ Two options are off by default (both on one GPU).
 
 - `--prompt-cache-tail` (an engine argument): one more checkpoint at a chunk boundary within one chunk of the prompt's end.
   A continuation that branches between the every-16K checkpoints reads less again. This checkpoint is evicted first and pushes out no other.
+- `--prompt-cache-spread` (an engine argument, opt-in, upstream a7d4b754): the checkpoints kept spread back from the conversation's end.
+  Least recent use keeps the newest: after a few short turns all 6 sit within the last 1-2K tokens, and an agent that rewrites its history a few thousand tokens back matches none of them and reads again from the system prompt.
+  With the flag the checkpoint that leaves is the one whose removal leaves the smallest gap for its distance from the newest, so the kept points thin out geometrically (after 200 turns of 1,000 tokens: 0, 1K, 3K, 8K, 43K and 200K before the end), and an edit d tokens back reads about d again.
+  The same number of checkpoints and RAM; the system-prompt root, a pinned prefix and the newest point are never dropped.
 - `STRATA_CACHE_MESSAGE_BOUNDARY=1` (the engine's environment): a checkpoint before the last user message (at the end of the turn before it).
   An agent that keeps a long history and replaces only the last message does not read the history again.
   It applies to a history of 8,192 tokens or more with a last message of at most 1,024; it splits the prompt's chunks and costs a fresh request the time of the snapshot.
@@ -890,10 +906,16 @@ A chat and an agent's subagent can then alternate without re-reading each other.
   If it does not, it evicts the oldest parked conversations and checks again (upstream 940011da).
   If that is still not enough, or the copy does not fit the budget, it skips parking and reads the prompt as before.
   To fit the budget, too, the oldest parked conversation is dropped first.
+- A new conversation that starts with a checkpoint inside a parked one (subagents that share a system prompt and tool list, a compacted history) borrows the K/V up to there and the checkpoint, and the parked conversation stays where it is (the engine log says `borrowed`; upstream c9e571e0 and 2b296987, #1164).
+  A match on a parked conversation's live state or its deepest checkpoint is that conversation going on and moves it into the session as before; so does a match that reaches a pinned shared prefix (`pin=N`).
+  When the outgoing conversation fits only in the parked one's room, it keeps its place and the parked one is moved in whole, as before.
 - `--conversation-cache-min-tokens N` (default 0 = every one) parks only conversations of at least N tokens (upstream 624070c5).
   A parked conversation takes one of the slots whatever its length, so a client that puts short side requests between the turns of a long conversation filled the slots with them and evicted the long one.
+- `--conversation-cache-park-gain N` (opt-in, default 0 = park every turn) parks a conversation again only after it advanced N tokens past the copy it would supersede (upstream d9cb22d2, #2265).
+  A turn that grew by a few hundred tokens keeps the older copy instead of writing a whole snapshot that the next turn drops; a resume from the older copy then reads up to N tokens again.
 - A copy that fails to go back stops the engine instead of letting it answer from half a state.
 - After a restore, the K/V pages a conversation has not changed are reused for its next copy (`STRATA_SNAPSHOT_FULL_CAPTURE=1` turns that off).
+  The new pages get room for the next turns of at most an eighth of each buffer (and at most 16 MiB), which the budget counts like the rest of the copy (upstream 53f72571).
 
 **How the available RAM is read** (upstream daa76552): the RAM checked before parking a conversation and before saving or restoring a conversation file is the smallest of:
 
@@ -989,7 +1011,12 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
 - The run config's optional `sampling` block sets the defaults for requests that leave the fields out
   (`"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}`).
   A request's own fields always win.
-  With no block at all, a request without sampling keys decodes greedy.
+  With no block at all, a request without sampling keys gets the sampling the model card recommends (upstream #2685).
+  It is picked by the thinking state: Qwen3.8-Flash-Next (Swift and Gyro too) thinking temperature 1.0, top_p 0.95, top_k 20; not thinking temperature 0.7, top_p 0.8, top_k 20, presence_penalty 1.5; Qwen3.6-35B-A3B thinking 1.0 / 0.95 / 20 with presence_penalty 1.5, not thinking 0.7 / 0.8 / 20 with 1.5.
+  Ornith and llm-jp are not in the table and decode greedy as before.
+  The order of precedence: the request, the web page's shared Chat settings, the config's `sampling` block, the card.
+  Greedy is only for who asks for it: `temperature: 0` in the request, or `"sampling": {"temperature": 0}` in the config.
+  The web page sends no sampling of its own until you change its Sampling settings (it showed and sent 0.6 before); an old stored 0.6 with the default top_p and top_k counts as not set.
 - The penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`) ride the same path.
   `penalty_last_n` caps how many recent tokens they count over, 64 by default when any penalty is set.
   llama.cpp's names `repeat_penalty` and `repeat_last_n` work too, in the config's `sampling` block and in a request (upstream #1819).
@@ -1035,6 +1062,7 @@ A failure emits an SSE error and `[DONE]` without invalid content.
 Off by default, since it keeps prompts and answers in memory.
 Turn it on with `"api_monitor": true` in `xestrata-<model>.json` (or `serve/server.py --api-monitor`);
 otherwise nothing is recorded and the endpoints below answer 404.
+Apart from it, the server keeps in its process memory the text and tokens of its last few prompts, whatever `"api_monitor"` says, to encode the next turn faster; no endpoint shows them, and they are gone when the server stops.
 
 `/api-monitor` shows the model state, load/unload controls, active and queued requests,
 their request bodies, output, reasoning and non-stream response bodies, with the queue, load, first-token and decode times apart.
@@ -1185,6 +1213,7 @@ The model has an image encoder:
 [`mmproj-Qwen3.8-Flash-Next-BF16.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
 (0.9 GB, a 27-layer ViT plus the projector into the language model).
 It is **optional**: say yes when setup asks "Images?", or run setup again with `--vision gpu` (or `--vision cpu`).
+Yes (`--vision yes`) means the GPU encoder on a card of 24 GB and more and the CPU encoder on a smaller one: the GPU encoder keeps about 1.4 GB of VRAM free, which cost 3-5% of text speed on 16 GB cards (upstream #2406's measurement). `--vision gpu` keeps the GPU encoder on a small card too.
 setup downloads the encoder, builds a small helper (`strata-vision`, from llama.cpp's `mtmd` library) and adds it to your start script.
 Nothing else changes.
 

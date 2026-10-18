@@ -19,6 +19,13 @@ bool iq256_supported(int ggml_type) noexcept;
 void iq256_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                    int nt, float* const* ff, int r0, int r1);
 /// out[t][r] = w_r . a[t], rows [r0, r1).
+/// How far ahead (bytes) the rows prefetch their weights: STRATA_IQ_PREFETCH, default 2048, 0 off.
+int iq_prefetch_bytes() noexcept;
+/// The canonical rows (canon_expert.hpp) of an i-quant gate/up type (IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S,
+/// IQ4_XS): out[t][r] = row r against the int8 values xq[t] with one scale for each 256 (xd[t]), in the GPU's order;
+/// rows [r0, r1).
+void iq256_canon_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const int8_t* const* xq,
+                      const float* const* xd, int nt, float* const* out, int r0, int r1);
 void iq256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                 float* const* out, int r0, int r1);
 

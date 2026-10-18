@@ -84,8 +84,6 @@ A batch row's arithmetic is the single-token window's, so with greedy decoding *
 On the B70 this was checked for 3 conversations at once, for a long prompt read while two others decode, and for a next turn continued from its slot, each against its solo run.
 These settings make the comparison exact:
 
-- `STRATA_IQ_MT_MIN=1`: the multi-token CPU expert kernels for every group.
-  By default an expert's rows round differently alone than in a group, so the output depends on how many rows of a window share an expert, which differs between a batch and a request alone.
 - `--pcie-frac 0`: the PCIe share of the missed experts is chosen per window from the window's misses, so the same expert can run on the GPU in one window and on the CPU in another, which rounds differently.
 - `--adapt-every 1000000` (the VRAM tier fixed), and `--no-prefill-borrow` while a prompt is read beside decoding slots.
   Otherwise the slots' windows run the experts of the cache slots the prompt borrowed on the CPU.
@@ -121,7 +119,7 @@ Four scripts drive a built engine or a running server; each exits non-zero on a 
 | `tools/parking_test.py` | a follow-up to a conversation decodes the same tokens whether its state stayed live or came back from the parking cache. |
 | `tools/early_close_test.py` | a client that stops reading a streamed answer early (alone, and with a second request running) does not leave its tokens to the next request (server). |
 
-For exact comparisons pass `--pcie-frac 0 --adapt-every 1000000` (and the scripts set `STRATA_IQ_MT_MIN=1`):
+For exact comparisons pass `--pcie-frac 0 --adapt-every 1000000`:
 
 ```sh
 python3 tools/batch_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json --batch 3 --n 3 \

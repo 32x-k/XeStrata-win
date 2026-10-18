@@ -10,12 +10,14 @@
 //
 // (a) float reference: ggml's own dequantizer (`to_float`) and a float SwiGLU expert, (b) the CPU path
 // (ggml-cpu vec_dot with its quantized activations), (c) the GPU path (`native_expert_grouped`, q8_1
-// activations).  (b) and (c) each differ from (a) by their activation rounding only (a few 1e-3 relative).
+// activations).  (b) and (c) each differ from (a) by their activation rounding only (a few 1e-3 relative).  (d) a layer
+// of the canonical rows (canon_expert.hpp): the CPU's rows and the GPU's are the same bits.
 //
 //     build/native_expert_parity --bf16-embd
 //
 // The BF16 token embedding (--embd-gguf) on a random table, no model needed (in CTest).
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/kernels/cpu/canon_expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
@@ -28,6 +30,7 @@
 
 #include "parity_device.hpp"
 
+#include <array>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -140,6 +143,15 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
             ffp[k] = ff[k].data();
         }
         cpu::native_gu_rows(f, blob.data(), a, NT, ffp, 0, (int) FF);
+        // the kernels below are checked against ggml's vec_dot on ggml's activations (vec_dot_type); a layer of the
+        // canonical rows (canon_expert.hpp) quantizes its own form for native_gu_rows, so these get ggml's
+        const bool canon = cpu::canon_layer(f);
+        std::vector<std::vector<uint8_t>> actl(NT, std::vector<uint8_t>(cpu::kNativeActBytes));
+        const void* al[NT];
+        for (int k = 0; k < NT; ++k) {
+            if (canon) ggml_get_type_traits_cpu((ggml_type) f.gu_act)->from_float(x.data() + k * H, actl[k].data(), H);
+            al[k] = canon ? actl[k].data() : a[k];
+        }
         // either multi-token kernel: IQ4_XS has an AVX-2 one and no AVX-512 one, so the gate cannot be
         // iq512_supported alone - that would leave the format untested on every CPU.
         if (cpu::iq512_supported(f.gu_type) || cpu::iq256_supported(f.gu_type)) {
@@ -149,7 +161,7 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
             std::vector<float> gref((size_t) NT * FF);
             for (int k = 0; k < NT; ++k)
                 for (int64_t r = 0; r < FF; ++r)
-                    tc->vec_dot((int) H, &gref[k * FF + r], 0, blob.data() + r * f.gu_row, 0, a[k], 0, 1);
+                    tc->vec_dot((int) H, &gref[k * FF + r], 0, blob.data() + r * f.gu_row, 0, al[k], 0, 1);
             double usg = 0.0;
             {   // ggml single-token throughput, the weights cache-resident (compute bound)
                 const int it = 50;
@@ -157,8 +169,8 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
                 for (int i = 0; i < it; ++i)
                     for (int64_t r = 0; r < FF; ++r) {
                         float gg, uu;
-                        tc->vec_dot((int) H, &gg, 0, blob.data() + r * f.gu_row, 0, a[0], 0, 1);
-                        tc->vec_dot((int) H, &uu, 0, blob.data() + f.up_off + r * f.gu_row, 0, a[0], 0, 1);
+                        tc->vec_dot((int) H, &gg, 0, blob.data() + r * f.gu_row, 0, al[0], 0, 1);
+                        tc->vec_dot((int) H, &uu, 0, blob.data() + f.up_off + r * f.gu_row, 0, al[0], 0, 1);
                     }
                 auto t1 = std::chrono::steady_clock::now();
                 usg = std::chrono::duration<double, std::micro>(t1 - t0).count() / it;
@@ -168,7 +180,7 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
                 std::vector<float> g((size_t) NT * FF);
                 float* gp[NT];
                 for (int k = 0; k < NT; ++k) gp[k] = g.data() + k * FF;
-                (is512 ? cpu::iq512_rows : cpu::iq256_rows)(f.gu_type, blob.data(), f.gu_row, (int) H, a, NT, gp, 0, (int) FF);
+                (is512 ? cpu::iq512_rows : cpu::iq256_rows)(f.gu_type, blob.data(), f.gu_row, (int) H, al, NT, gp, 0, (int) FF);
                 const double rg = rel(g, gref);
                 std::printf("          %s %s gate rows vs ggml vec_dot: rel %.2e\n",
                             ggml_type_name((ggml_type) f.gu_type), tag, rg);
@@ -177,13 +189,16 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
                                 ggml_type_name((ggml_type) f.gu_type), tag, rg);   // not rounding (measured 3e-8)
                     ++failures;
                 }
-                float* f1[1] = {ffp[0]};
+                std::vector<float> fsb((size_t) NT * FF);   // the timed calls' output, apart from ff (read below)
+                float* fs[NT];
+                for (int k = 0; k < NT; ++k) fs[k] = fsb.data() + k * FF;
+                float* f1[1] = {fs[0]};
                 const int it = 50;
                 const auto gu = is512 ? cpu::iq512_gu_rows : cpu::iq256_gu_rows;
                 auto t0 = std::chrono::steady_clock::now();
-                for (int i = 0; i < it; ++i) gu(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, a, 1, f1, 0, (int) FF);
+                for (int i = 0; i < it; ++i) gu(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, al, 1, f1, 0, (int) FF);
                 auto t1 = std::chrono::steady_clock::now();
-                for (int i = 0; i < it; ++i) gu(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, a, NT, ffp, 0, (int) FF);
+                for (int i = 0; i < it; ++i) gu(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, al, NT, fs, 0, (int) FF);
                 auto t2 = std::chrono::steady_clock::now();
                 const double us1 = std::chrono::duration<double, std::micro>(t1 - t0).count() / it;
                 const double usn = std::chrono::duration<double, std::micro>(t2 - t1).count() / it;
@@ -201,6 +216,12 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
             op[k] = got_c.data() + k * H;
         }
         cpu::native_down_rows(f, blob.data(), hp, NT, op, 0, (int) H);
+        std::vector<std::vector<uint8_t>> hql(NT, std::vector<uint8_t>(cpu::kNativeHBytes));   // ggml's, as above
+        const void* hl[NT];
+        for (int k = 0; k < NT; ++k) {
+            if (canon) ggml_get_type_traits_cpu((ggml_type) f.d_act)->from_float(ff[k].data(), hql[k].data(), FF);
+            hl[k] = canon ? hql[k].data() : hp[k];
+        }
         if (f.d_type == 42) {
             // (b2) the GGUF-layout Q2_0 kernel the pool uses for Q2_0 down projections - the AVX-512 one
             // where the CPU has it, the AVX-2 one (q2_avx2.cpp) where it does not.  Calling the AVX-512
@@ -224,12 +245,12 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
             std::vector<float> alt((size_t) NT * H), refd((size_t) NT * H);
             float* altp[NT];
             for (int k = 0; k < NT; ++k) altp[k] = alt.data() + k * H;
-            cpu::iq4nl256_down_rows(blob.data() + f.down_off, f.d_row, (int) FF, hp, NT, altp, 0, (int) H);
+            cpu::iq4nl256_down_rows(blob.data() + f.down_off, f.d_row, (int) FF, hl, NT, altp, 0, (int) H);
             const auto* tdc = ggml_get_type_traits_cpu((ggml_type) f.d_type);
             for (int k = 0; k < NT; ++k)
                 for (int64_t r = 0; r < H; ++r)
                     tdc->vec_dot((int) FF, refd.data() + k * H + r, 0,
-                                 blob.data() + f.down_off + (size_t) r * f.d_row, 0, hp[k], 0, 1);
+                                 blob.data() + f.down_off + (size_t) r * f.d_row, 0, hl[k], 0, 1);
             const double rdn = rel(alt, refd);
             std::printf("          iq4_nl AVX-2 multi-token down vs ggml down: rel %.2e\n", rdn);
             if (rdn > 1e-5) {   // measured 1e-7; same reasoning as the gate/up rows above
@@ -239,13 +260,13 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
             const int it = 50;
             const auto t0 = std::chrono::steady_clock::now();
             for (int i = 0; i < it; ++i)
-                cpu::iq4nl256_down_rows(blob.data() + f.down_off, f.d_row, (int) FF, hp, NT, altp, 0, (int) H);
+                cpu::iq4nl256_down_rows(blob.data() + f.down_off, f.d_row, (int) FF, hl, NT, altp, 0, (int) H);
             const auto t1 = std::chrono::steady_clock::now();
             for (int i = 0; i < it; ++i)
                 for (int k = 0; k < NT; ++k)
                     for (int64_t r = 0; r < H; ++r)
                         tdc->vec_dot((int) FF, refd.data() + k * H + r, 0,
-                                    blob.data() + f.down_off + (size_t) r * f.d_row, 0, hp[k], 0, 1);
+                                    blob.data() + f.down_off + (size_t) r * f.d_row, 0, hl[k], 0, 1);
             const auto t2 = std::chrono::steady_clock::now();
             const double usn = std::chrono::duration<double, std::micro>(t1 - t0).count() / it;
             const double usg = std::chrono::duration<double, std::micro>(t2 - t1).count() / it;
@@ -356,6 +377,43 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
             const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / kIters;
             std::printf("          grouped bench: %d experts of %zu bytes a call, %.1f us, %.1f GB/s\n", kG, blob.size(), us,
                         (double) blob.size() * kG / us / 1e3);
+        }
+    }
+    // (d) the CPU's canonical rows (canon_expert.hpp) against the GPU's grouped experts: the same bits, the NT tokens at
+    // once and one at a time (an expert's rows on either side of a verify window, #152)
+    if (cpu::canon_layer(f)) {
+        std::vector<float> got_k((size_t) NT * H), ffb((size_t) NT * FF);
+        std::vector<cpu::NativeAct> aq((size_t) NT);
+        std::vector<std::array<uint8_t, cpu::kNativeHBytes>> hq((size_t) NT);
+        std::vector<const void*> acts((size_t) NT), hqs((size_t) NT);
+        std::vector<float*> ffp((size_t) NT), outp((size_t) NT);
+        for (int64_t t = 0; t < NT; ++t) {
+            cpu::native_quant_act(f, x.data() + t * H, aq[(size_t) t].bytes);
+            acts[(size_t) t] = aq[(size_t) t].bytes;
+            ffp[(size_t) t] = ffb.data() + t * FF;
+        }
+        for (int one = 0; one < 2; ++one) {   // the NT tokens at once, then one at a time
+            if (one) for (int64_t t = 0; t < NT; ++t) cpu::native_gu_rows(f, blob.data(), &acts[(size_t) t], 1, &ffp[(size_t) t], 0, (int) FF);
+            else cpu::native_gu_rows(f, blob.data(), acts.data(), (int) NT, ffp.data(), 0, (int) FF);
+            for (int64_t t = 0; t < NT; ++t) {
+                cpu::native_quant_h(f, ffp[(size_t) t], hq[(size_t) t].data());
+                hqs[(size_t) t] = hq[(size_t) t].data();
+                outp[(size_t) t] = got_k.data() + t * H;
+            }
+            if (one) for (int64_t t = 0; t < NT; ++t) cpu::native_down_rows(f, blob.data(), &hqs[(size_t) t], 1, &outp[(size_t) t], 0, (int) H);
+            else cpu::native_down_rows(f, blob.data(), hqs.data(), (int) NT, outp.data(), 0, (int) H);
+            size_t diff = 0;
+            double mx = 0;
+            for (size_t i = 0; i < got_k.size(); ++i) {
+                uint32_t a, b;
+                std::memcpy(&a, &got_k[i], 4);
+                std::memcpy(&b, &got_g[i], 4);
+                diff += a != b;
+                mx = std::max(mx, (double) std::fabs(got_k[i] - got_g[i]));
+            }
+            std::printf("          canon CPU (%s) vs GPU: %zu of %zu values differ (max abs %.3e)\n", one ? "1 token" : "NT tokens",
+                        diff, got_k.size(), mx);
+            if (diff != 0) ++failures;
         }
     }
     const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);

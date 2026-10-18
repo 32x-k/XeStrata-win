@@ -1626,6 +1626,10 @@ def check_shards(shards):
             fail(f"{s.name} is not a whole GGUF shard ({e})", "delete it and run setup again")
         need = g.data_start + max((t.offset + (t.expected_bytes() or 0) for t in g.tensors), default=0)
         have = s.stat().st_size
+        if not g.tensors:
+            # #2346: a metadata-only shard (Unsloth's UD-Q5_K_XL 00001, 10,946,618 bytes) ends at its header: the
+            # alignment padding before an empty data section is not in the file, so data_start can be past its end
+            need = min(need, have)
         if have < need:
             fail(f"{s.name} is short: {have:,} of {need:,} bytes ({need - have:,} missing)",
                  "delete it and run setup again (or copy the whole file into --gguf-dir)")
@@ -2499,6 +2503,26 @@ def small_card_note(ctx: int, draft_vocab: str | None) -> list[str]:
     else:
         lines.append("  close other programs that use the GPU.")
     return lines
+
+
+IMAGES_GPU_ENCODER_MIN_VRAM_GB = 23.5   # upstream 45752724 (#2406): below this the images answer "yes" gets the CPU
+# encoder (a card of 12-16 GB: the GPU encoder's ~1.1-1.4 GB is ~850 expert slots lost, 3-5% of decode and prompt on a
+# P100 / A4000 16 GB, upstream's measurement; the cost is the VRAM the experts lose, whatever the card's maker)
+
+
+def images_encoder(asked: str, gpu: dict) -> str:
+    """Which encoder an images answer gets: "yes" (the question's y, or --vision yes) means the GPU encoder on a card of
+    24 GB and more and the CPU encoder below that (a picture then takes a few seconds, the text keeps the ~1 GB of VRAM
+    for experts).  --vision gpu is always kept (with a note on a small card); --vision cpu is kept."""
+    vram = gpu_expert_vram(gpu or {"vram_gb": 0.0})
+    small = 0 < vram < IMAGES_GPU_ENCODER_MIN_VRAM_GB
+    if asked == "gpu" and small:
+        warn(f"the GPU image encoder keeps ~1.4 GB of VRAM that a {vram:.0f} GB card would use for experts (upstream "
+             "measured 3-5% of decode on 16 GB cards, #2406): kept as you chose; --vision cpu reads pictures on the "
+             "CPU instead (a few seconds each)")
+    if asked == "yes":
+        return "cpu" if small else "gpu"
+    return asked
 
 
 def gpu_expert_vram(gpu) -> float:
@@ -3540,6 +3564,12 @@ def warm_up(cfg_path: Path) -> None:
     keys = [str(k).strip() for k in keys] if isinstance(keys, list) else [k.strip() for k in str(keys).split(",")]
     key = next((k for k in keys if k), "")
     auth = {"Authorization": f"Bearer {key}"} if key else {}
+    elog = cfg.get("log")                              # the engine's own log: the prompt's CPU share it measured
+    try:
+        since = os.path.getsize(elog) if elog and os.path.isfile(elog) else 0
+    except OSError:
+        since = 0
+    share = None
     say("  Compiling the GPU code for this model: starting it once and asking two questions (1-3 minutes) ...")
     t0 = time.time()
     with open(log, "w", encoding="utf-8") as out:
@@ -3575,10 +3605,112 @@ def warm_up(cfg_path: Path) -> None:
                                                               "temperature": 0}).encode())
                 json.loads(urllib.request.urlopen(req, timeout=900).read())
             ok(f"GPU code compiled for this model ({time.time() - t0:.0f} s)")
+            # a text prompt of the same length again, the code compiled (other numbers: no cached prefix): the CPU's
+            # share of its experts measured now is the one kept
+            notes2 = " ".join(f"Note {i}: the {c} sensor read {i * 11 % 100} at step {i}."
+                              for i, c in zip(range(60), ["red", "blue", "green", "amber"] * 15))
+            again = [{"role": "user", "content": "Summarize these notes in two sentences.\n" + notes2}]
+            req = urllib.request.Request(base + "/v1/chat/completions",
+                                         headers={"Content-Type": "application/json", **auth},
+                                         data=json.dumps({"messages": again, "max_tokens": 1,
+                                                          "temperature": 0}).encode())
+            json.loads(urllib.request.urlopen(req, timeout=900).read())
+            share = measured_cpu_share(elog, since)
         except (RuntimeError, OSError, ValueError) as e:
             warn(f"the warm-up did not finish ({e}): the first request will take longer")
         finally:
             end_process_group(proc)
+    if share is not None:
+        fix_prefill_share(cfg_path, share)
+    free = start_free_mib(elog, since)
+    if free is not None:
+        fix_vram_free(cfg_path, free)
+
+
+def start_free_mib(elog: str | None, since: int) -> int | None:
+    """The VRAM free at the engine's start ("strata generate: N MiB of VRAM free at the start") in its log after byte
+    `since`, the lowest if it started more than once; None when the log has none."""
+    if not elog:
+        return None
+    try:
+        with open(elog, "rb") as f:
+            f.seek(since)
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    found = re.findall(r"strata generate: ([0-9]+) MiB of VRAM free at the start", text)
+    return min(int(v) for v in found) if found else None
+
+
+VRAM_FREE_MARGIN_MIB = 32   # the free VRAM moved by up to ~20 MiB between starts on the B70 (2026-10-17)
+
+
+def fix_vram_free(cfg_path: Path, free_mib: int) -> None:
+    """Write the free VRAM the warm-up's start saw, less a margin, into the config (--vram-free-mib): the auto expert
+    cache was sized from what was free at each start, which moved by a few MiB, the cache's slots with it, which
+    experts the prompt's CPU share took, and two greedy runs of one prompt parted (the B70, 2026-10-17)."""
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    a = list(cfg.get("args", []))
+    v = str(max(0, free_mib - VRAM_FREE_MARGIN_MIB))
+    if "--vram-free-mib" in a[:-1]:
+        a[a.index("--vram-free-mib") + 1] = v
+    else:
+        a += ["--vram-free-mib", v]
+    cfg["args"] = a
+    write_config(cfg_path, cfg)
+    st = load_settings()
+    st.setdefault("vram_free_mib", {})[hardware_key(cfg)] = v
+    save_settings(st)
+    ok(f"the expert cache is sized from at most {v} MiB of free VRAM (what this start saw, less "
+       f"{VRAM_FREE_MARGIN_MIB}; kept in the config, so it holds the same experts every run)")
+
+
+def saved_vram_free(cfg: dict) -> str | None:
+    """The free VRAM an earlier warm-up saw for this PC and model, less the margin (fix_vram_free), if any."""
+    return (load_settings().get("vram_free_mib") or {}).get(hardware_key(cfg))
+
+
+def measured_cpu_share(elog: str | None, since: int) -> float | None:
+    """The last prompt's CPU share the engine measured ("strata serve: prefill CPU share X (measured)") in its log
+    after byte `since`; None when it measured none (the share is not armed, or fixed already)."""
+    if not elog:
+        return None
+    try:
+        with open(elog, "rb") as f:
+            f.seek(since)
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    found = re.findall(r"strata serve: prefill CPU share ([0-9.]+) \(measured\)", text)
+    return float(found[-1]) if found else None
+
+
+def fix_prefill_share(cfg_path: Path, share: float) -> None:
+    """Write the measured prompt CPU share into the config (--prefill-cpu-share): measured anew in every run, it moved
+    a little, which experts the CPU took with it, and two greedy runs of one prompt parted (2026-10-16).  A
+    "--prefill-cpu-share auto" in the args is the user's and stays."""
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    a = list(cfg.get("args", []))
+    v = f"{share:.2f}"
+    if "--prefill-cpu-share" in a[:-1]:
+        i = a.index("--prefill-cpu-share")
+        if a[i + 1] == "auto":
+            return
+        a[i + 1] = v
+    else:
+        a += ["--prefill-cpu-share", v]
+    cfg["args"] = a
+    write_config(cfg_path, cfg)
+    st = load_settings()
+    st.setdefault("prefill_cpu_share", {})[hardware_key(cfg)] = v
+    save_settings(st)
+    ok(f"the CPU's share of a short prompt's experts, measured here: {v} (kept in the config, so a prompt is read the "
+       "same way every run)")
+
+
+def saved_prefill_share(cfg: dict) -> str | None:
+    """The prompt CPU share an earlier warm-up measured for this PC and model (fix_prefill_share), if any."""
+    return (load_settings().get("prefill_cpu_share") or {}).get(hardware_key(cfg))
 
 
 # upstream #629: the run config's keys setup writes itself (and rewrites on every setup run); any other key is the
@@ -3957,6 +4089,12 @@ def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images
             say("  " + line)
     for line in notes:
         say("  " + line)
+    share = saved_prefill_share(cfg)                   # measured once per PC and model: the warm-up then keeps it
+    if share is not None and "--prefill-cpu-share" not in cfg["args"]:
+        cfg["args"] = [*cfg["args"], "--prefill-cpu-share", share]
+    free = saved_vram_free(cfg)                        # the same for the free VRAM the cache is sized from
+    if free is not None and "--vram-free-mib" not in cfg["args"]:
+        cfg["args"] = [*cfg["args"], "--vram-free-mib", free]
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None,
                        getattr(a, "gpus_chosen", False))
     script = None if PACKAGED else write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
@@ -4637,12 +4775,18 @@ def main() -> int:
     elif a.vision:
         # yes = the GPU encoder, the CPU encoder its fallback.  Adopted without a tolerance on the embeddings (they
         # differ from the CPU encoder's by a few percent; the answers agree): the 2026-09-30-xe-vision-sycl record
-        vision = {"yes": "gpu", "no": "none"}.get(a.vision, a.vision)
+        vision = "none" if a.vision in ("no", "none") else images_encoder(a.vision, gpu)
     else:
+        small = 0 < gpu_expert_vram(gpu) < IMAGES_GPU_ENCODER_MIN_VRAM_GB
         say()
         say("  Images: the model can also read pictures (screenshots, photos, scanned pages). This adds a 0.9 GB")
-        say("  download; the image encoder runs on the GPU (on the CPU if it cannot start there).")
-        vision = "gpu" if ask("Do you want images?", ["y", "n"], "n", a.yes) == "y" else "none"
+        if small:
+            say("  download. On a card under 24 GB the encoder runs on the CPU (a few seconds per picture, nothing")
+            say("  taken from the GPU): the GPU encoder keeps ~1.4 GB of VRAM free, which cost 3-5% of text speed on")
+            say("  16 GB cards. --vision gpu if you want pictures in under a second.")
+        else:
+            say("  download; the image encoder runs on the GPU (on the CPU if it cannot start there).")
+        vision = images_encoder("yes", gpu) if ask("Do you want images?", ["y", "n"], "n", a.yes) == "y" else "none"
     ok("images: " + {"none": "off", "gpu": "on (encoder on the GPU, the CPU encoder as fallback)",
                      "cpu": "on (encoder on the CPU)"}[vision])
     if vision != "none" and MODELS[model].get("vision_untested"):
