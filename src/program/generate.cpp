@@ -2816,6 +2816,11 @@ int main(int argc, char** argv) {
     // out of them.
     const int64_t kPipeWindowMib = o.pipeline_windows > 0 ? 160 : 0;
     const int64_t kPipeSnapMib = o.pipeline_windows >= 2 ? 96 : 0;
+    // what a later stage keeps out of its expert cache besides the reserve: its verify windows ("window up to 6 tokens,
+    // 74.1 MiB of device buffers", rounded up as upstream 915f74fe does), and on the stage that carries the drafter
+    // what binds after its cache is sized (stage_room).  A flat 1 GiB was withheld from every later stage before: B70 +
+    // RTX 4070 at 10 GiB, Q2_0, the 4070 kept 1,393 MiB free after everything had loaded and its windows were captured
+    const int64_t kWindowMib = 96;
     if (o.prefill_auto && (o.no_prefill_borrow || o.expert_profile.empty())) {
         o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
         o.prefill_chunk = 2048;
@@ -3311,6 +3316,17 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: layer split auto: %s (the head left out of the sizes)\n", e.what());
             }
         }
+        // the drafter on the last stage, not loaded yet: its files (the layer as it loads) and at most a head's bytes
+        // for the draft head it binds
+        int64_t drafter_bytes = 0;
+        if (!o.mtp.empty()) {
+            std::error_code ec;
+            for (const char* f : {"dense.bin", "experts.bin"}) {
+                const auto b = std::filesystem::file_size(std::filesystem::path(o.mtp) / f, ec);
+                if (!ec) drafter_bytes += (int64_t) b;
+            }
+            drafter_bytes += (int64_t) head_bytes;
+        }
         auto weights_of = [&](int64_t lo, int64_t hi) -> uint64_t {
             uint64_t b = canon_all + nat_shared;
             for (int64_t l = 0; l < L; ++l)
@@ -3340,12 +3356,12 @@ int main(int argc, char** argv) {
         auto cap_raw = [&](int i, int64_t lo, int64_t hi, bool last) -> int64_t {
             const int64_t base_reserve =   // --vram-reserve-later-mib: the later cards' own reserve (upstream 5c4105c0)
                 i > 0 && o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
-            const int64_t reserve = (base_reserve + (i > 0 ? 1024 : kPipeSnapMib) + kPipeWindowMib) << 20;
+            const int64_t reserve = (base_reserve + (i > 0 ? kWindowMib : kPipeSnapMib) + kPipeWindowMib) << 20;
             const int64_t sess = (int64_t) strata::core::session_bytes(ga, o.max_context, Ka, lo, hi) *
                                  (1 + std::max(o.batch, 0));
             return free0[(size_t) ord[(size_t) i]] - reserve - (int64_t) weights_of(lo, hi) - sess -
                    prompt[(size_t) ord[(size_t) i]] -
-                   (last ? (int64_t) head_bytes : 0);
+                   (last ? (int64_t) head_bytes + drafter_bytes : 0);
         };
         // what a stage needs at least for its prompt path: its own buffers are in prompt[] already; a stage that
         // borrows them lends cache slots for the last-resort chunk of 512 tokens
@@ -4955,7 +4971,8 @@ int main(int argc, char** argv) {
         return (size_t) s0.gdn_alloc * ((size_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                         (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1)) * sizeof(float);
     };
-    auto stage_room = [&](int dev, bool later, const strata::core::SessionState& s) -> int64_t {
+    // `bind`: what binds on this GPU after its cache is sized (the drafters' heads and logits on the last stage)
+    auto stage_room = [&](int dev, bool later, const strata::core::SessionState& s, int64_t bind) -> int64_t {
         const strata::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
         if (const bool e = strata::gpu::mem_info(&fb, &tb); !e)
@@ -4966,7 +4983,7 @@ int main(int argc, char** argv) {
                                ? (int64_t) strata::prefill::Prefill::bytes_needed(g, s, o.prefill_chunk) : 0;
         const int64_t base_reserve =
             later && o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
-        const int64_t reserve = ((base_reserve + (later ? 1024 : kPipeSnapMib) + kPipeWindowMib) << 20) + pf;
+        const int64_t reserve = ((base_reserve + (later ? kWindowMib : kPipeSnapMib) + kPipeWindowMib) << 20) + pf + bind;
         return std::max<int64_t>((int64_t) fb - reserve, 0);
     };
     for (size_t i = 0; i < split_at.size(); ++i)
@@ -5347,7 +5364,12 @@ int main(int argc, char** argv) {
     for (auto& stp : stages) {
         GpuStage& st = *stp;
         const auto& lay = strata::kernels::cpu::expert_layout();
-        const int64_t room = stage_room(st.dev, true, st.ss);
+        int64_t bind = 0;   // the drafters bind on the last stage, after its cache (with its head)
+        if (&st == stages.back().get() && !o.mtp.empty() && st.head.loaded()) {
+            bind = (int64_t) mtp.bind_bytes(st.head.row_bytes(), n_vocab);
+            for (const auto& d : slot_mtp) bind += (int64_t) d->bind_bytes(st.head.row_bytes(), n_vocab);
+        }
+        const int64_t room = stage_room(st.dev, true, st.ss, bind);
         const strata::core::OnDevice on(st.dev);
         // the expert arena is registered for device copies with CUDA0's context only: this GPU's fills and adaptive
         // swaps copied from it as pageable memory (B70 + 4070, iq3_s: the swaps took 4.5 ms a window against 0.1).
