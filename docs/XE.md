@@ -51,6 +51,7 @@ Fixed on XeStrata's side during the integration:
 
 - The boundary between the experts' int8 and FP16 products is timed up to 1024 rows an expert. Timed to 256 only, it read IQ3_S's and UD-Q4_K_XL's 32K chunks with the int8 products (B70, IQ3_S, 32K prefill 1,896 -> 2,425 tok/s).
 - The choice of the big prompt chunks no longer counts the RAM copy it has already made a second time (B70, UD-Q4_K_XL, 32K prefill 1,760 -> 2,412 tok/s).
+- A layer split's later stages no longer hold a flat 1 GiB out of their expert caches, only their verify windows and, on the last stage, the draft head that binds after the cache (B70 + RTX 4070 at 10 GB: the second card's cache +560-700 slots, prefill +4-5%).
 
 Compared with upstream v0.1.45 on the three makers' GPUs (generate on five model files, serve, everyday use, image generation); the B70 is now compared with upstream's `sycl/` port too.
 On the RTX 4070, generate's prefill is the same or faster on all five files (IQ3_XXS at 1K and IQ2_XS 17% faster, UD-Q4_K_XL 1%), and decode 13-30% faster.
