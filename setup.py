@@ -1462,6 +1462,11 @@ def free_gb(path):
 
 
 # ------------------------------------------------------------------------------------------------ downloads
+# The files this run downloaded or copied itself: only these are deleted when their SHA-256 is wrong.  A file the
+# person already had (--gguf-dir, or put in the models folder by hand) is left as it is.
+FETCHED: set[Path] = set()
+
+
 def download(url, dst: Path, what=None):
     """Resumable HTTP(S) download with a progress line; `file://` and plain paths are copied (tests, mirrors).
     A finished file gets a <name>.done mark, so a later run skips it without asking the server."""
@@ -1474,6 +1479,7 @@ def download(url, dst: Path, what=None):
         if not src.exists():
             fail(f"not found: {src}")
         shutil.copyfile(src, dst)
+        FETCHED.add(dst)
         mark(dst)
         ok(f"{what or dst.name} copied")
         return
@@ -1543,6 +1549,7 @@ def download(url, dst: Path, what=None):
              f"the server says {total:,}",
              "check your internet connection and run it again (the download resumes where it stopped)")
     part.replace(dst)
+    FETCHED.add(dst)
     meta = ms_meta(*ms) if ms is not None else None
     if meta is not None and meta[1]:
         verify_sha256(dst, meta[0], meta[1])           # ModelScope's published hash; kept in the finish mark
@@ -1673,13 +1680,18 @@ def check_shards(shards):
 
 def verify_sha256(s: Path, size: int, sha: str) -> None:
     """A shard's size and SHA-256 against the pinned values (the Unsloth file); the result is kept in its finish mark,
-    so the minutes of hashing 111 GB happen once.  A wrong file is deleted, so the next run downloads it again."""
+    so the minutes of hashing 111 GB happen once.  A wrong file this run downloaded is deleted, so the next run
+    downloads it again; one the person already had (FETCHED) is left as it is, and setup stops naming it."""
     m = s.with_name(s.name + ".done")
     if m.exists() and f"sha256 {sha}" in m.read_text(encoding="utf-8", errors="replace"):
         return
+    own = s not in FETCHED
+    keep = ("it is not the pinned file: move it out of the folder (setup has not changed it) and run setup again "
+            "to download the pinned one, or use --gguf-dir with a folder that holds the pinned file")
     have = s.stat().st_size if s.exists() else -1
     if have != size:
-        fail(f"{s.name} is {have:,} bytes, not {size:,}", "delete it and run setup again (the download restarts)")
+        fail(f"{s.name} is {have:,} bytes, not {size:,}",
+             keep if own and have >= 0 else "delete it and run setup again (the download restarts)")
     say(f"  checking {s.name} (SHA-256, {size / 1e9:.1f} GB) ...")
     h = hashlib.sha256()
     with open(s, "rb") as f:
@@ -1689,6 +1701,8 @@ def verify_sha256(s: Path, size: int, sha: str) -> None:
                 break
             h.update(b)
     if h.hexdigest() != sha:
+        if own:
+            fail(f"{s.name} has the wrong SHA-256 ({h.hexdigest()}, expected {sha}): left as it is", keep)
         s.unlink(missing_ok=True)
         m.unlink(missing_ok=True)
         fail(f"{s.name} has the wrong SHA-256 ({h.hexdigest()}, expected {sha}): deleted",
