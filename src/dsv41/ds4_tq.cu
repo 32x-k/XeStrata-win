@@ -125,96 +125,150 @@ struct ActF16 {   // F16 rows: entry m = row rows[m] (ld halves a row)
     }
 };
 
-// ---------------------------------------------------------------- one 16-row tile over up to 16 entries
-// acc[i] (i < 8) = D[entry 8 kg + i][row r] of the tile: sum over the row's k values of x_entry * w, k % 128 == 0.
-// wrow: the tile's row r (this lane's) in the blob; nblk blocks.
-template <int K, bool COMPUTED, class Act>
-__device__ __forceinline__ void tile_dot(const uint8_t* __restrict__ wrow, int nblk, const uint32_t* lut, const Act& act, int ne,
-                                         float* acc_out) {
+// ---------------------------------------------------------------- the stream window by 32-bit loads
+// The same 128-bit window as stream_window, from aligned 32-bit loads (a record is 2 + 4 K bytes: its scale, then the stream, at
+// any 2-byte alignment): the array starts at the 4-byte floor of the record, the stream at bit 16 or 32 of it.  Loads past the
+// end of the record are skipped (the window bits above what a lane needs are junk anyway).
+template <int K>
+__device__ __forceinline__ void stream_window_u32(const uint8_t* rec, int kg, uint64_t& lo, uint64_t& hi) {
+    constexpr int bsz = 2 + 4 * K;
+    const uintptr_t ad = (uintptr_t) rec;
+    const uint32_t* pa = (const uint32_t*) (ad & ~(uintptr_t) 3);
+    const int off = 16 + 8 * (int) (ad & 3);                    // the stream's first bit in the array: 16 or 32
+    const int start = off + (kg ? 0 : 16 * K);
+    const int w0 = start >> 5, s = start & 31;
+    const int nwords = (int) (((ad & 3) + bsz + 3) >> 2);       // words that hold the record
+    uint32_t v[5];
+#pragma unroll
+    for (int i = 0; i < 5; ++i) v[i] = (w0 + i < nwords) ? pa[w0 + i] : 0u;
+    uint32_t r[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r[i] = (uint32_t) ((((uint64_t) v[i + 1] << 32) | v[i]) >> s);
+    lo = ((uint64_t) r[1] << 32) | r[0];
+    hi = ((uint64_t) r[3] << 32) | r[2];
+    if (!kg) {   // the upper half [16 K, 32 K) of the stream (16 K >= 64 bits); the bits past its end wrap to the stream's start
+        hi &= (1ull << (16 * K - 64)) - 1ull;
+        const uint32_t first = off == 16 ? (pa[0] >> 16) : pa[1];
+        const uint64_t wrap = (uint64_t) first & ((1ull << (15 - K)) - 1ull);
+        const int p = 16 * K - 64;
+        hi |= wrap << p;
+    }
+}
+
+// ---------------------------------------------------------------- NM 16-row tiles (matrices sharing the activations) over up to 16 entries
+// acc_out[mi][i] (i < 8) = D[entry 8 kg + i][row r] of matrix mi's tile: sum over the row's k values of x_entry * w, k % 128 == 0.
+// wrows[mi]: the tile's row r (this lane's) of matrix mi in the blob; nblk blocks.  The activation fragments are made once for all NM.
+template <int K, bool COMPUTED, int NM, bool WORDS, class Act>
+__device__ __forceinline__ void tile_dot(const uint8_t* const* wrows, int nblk, const uint32_t* lut, const Act& act, int ne,
+                                         float (*acc_out)[8]) {
     constexpr int bsz = 2 + 4 * K;
     const int lane = threadIdx.x & 31, r = lane & 15, kg = lane >> 4;
-    float tot[8];
+    float tot[NM][8];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) tot[i] = 0.0f;
+    for (int mi = 0; mi < NM; ++mi)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) tot[mi][i] = 0.0f;
     const bool have = r < ne;   // this lane's A rows (the entry m = r)
     for (int b = 0; b < nblk; ++b) {
-        const uint8_t* rec = wrow + (size_t) b * bsz;
-        const float d = half_bits_f(*(const uint16_t*) rec);
-        uint64_t lo, hi;
-        stream_window<K>(rec, kg, lo, hi);
+        float d[NM];
+        uint64_t lo[NM], hi[NM];
+#pragma unroll
+        for (int mi = 0; mi < NM; ++mi) {
+            const uint8_t* rec = wrows[mi] + (size_t) b * bsz;
+            d[mi] = half_bits_f(*(const uint16_t*) rec);
+            if (WORDS) stream_window_u32<K>(rec, kg, lo[mi], hi[mi]);
+            else stream_window<K>(rec, kg, lo[mi], hi[mi]);
+        }
 #if defined(DS4_TQ_WMMA)
-        float8_t acc = {0, 0, 0, 0, 0, 0, 0, 0};
+        float8_t acc[NM];
+#pragma unroll
+        for (int mi = 0; mi < NM; ++mi) acc[mi] = float8_t{0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
         for (int m = 0; m < 8; ++m) {
-            half8_t wf, ah, al;
+            half8_t ah, al;
+            {
+                float v[8];
+                if (have) act.load8(r, b * 128 + 64 * kg + 8 * m, v);
+                else {
 #pragma unroll
-            for (int s2 = 0; s2 < 2; ++s2) {
-                const int u = 2 * m + s2;
-                uint32_t w0, w1;
-                step_words<COMPUTED>(lut, state_at(lo, hi, (15 - u) * K), w0, w1);
-                wf[4 * s2 + 0] = __builtin_bit_cast(_Float16, (uint16_t) (w0 & 0xffffu));
-                wf[4 * s2 + 1] = __builtin_bit_cast(_Float16, (uint16_t) (w0 >> 16));
-                wf[4 * s2 + 2] = __builtin_bit_cast(_Float16, (uint16_t) (w1 & 0xffffu));
-                wf[4 * s2 + 3] = __builtin_bit_cast(_Float16, (uint16_t) (w1 >> 16));
-            }
-            float v[8];
-            if (have) act.load8(r, b * 128 + 64 * kg + 8 * m, v);
-            else {
+                    for (int j = 0; j < 8; ++j) v[j] = 0.0f;
+                }
 #pragma unroll
-                for (int j = 0; j < 8; ++j) v[j] = 0.0f;
+                for (int j = 0; j < 8; ++j) {
+                    const _Float16 h = (_Float16) v[j];
+                    ah[j] = h;
+                    al[j] = (_Float16) (v[j] - (float) h);
+                }
             }
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const _Float16 h = (_Float16) v[j];
-                ah[j] = h;
-                al[j] = (_Float16) (v[j] - (float) h);
+            for (int mi = 0; mi < NM; ++mi) {
+                half8_t wf;
+#pragma unroll
+                for (int s2 = 0; s2 < 2; ++s2) {
+                    const int u = 2 * m + s2;
+                    uint32_t w0, w1;
+                    step_words<COMPUTED>(lut, state_at(lo[mi], hi[mi], (15 - u) * K), w0, w1);
+                    wf[4 * s2 + 0] = __builtin_bit_cast(_Float16, (uint16_t) (w0 & 0xffffu));
+                    wf[4 * s2 + 1] = __builtin_bit_cast(_Float16, (uint16_t) (w0 >> 16));
+                    wf[4 * s2 + 2] = __builtin_bit_cast(_Float16, (uint16_t) (w1 & 0xffffu));
+                    wf[4 * s2 + 3] = __builtin_bit_cast(_Float16, (uint16_t) (w1 >> 16));
+                }
+                acc[mi] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ah, wf, acc[mi]);   // D[m = entry][n = weight row]
+                acc[mi] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(al, wf, acc[mi]);
             }
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ah, wf, acc);   // D[m = entry][n = weight row]
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(al, wf, acc);
         }
 #pragma unroll
-        for (int i = 0; i < 8; ++i) tot[i] += d * acc[i];
+        for (int mi = 0; mi < NM; ++mi)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) tot[mi][i] += d[mi] * acc[mi][i];
 #else
         // plain FMAs: this lane's row r, its 64 weights of the block against every entry (lane r + 16 kg' sums the halves)
-        float part[kMaxEnt];
+        float part[NM][kMaxEnt];
 #pragma unroll
-        for (int e = 0; e < kMaxEnt; ++e) part[e] = 0.0f;
+        for (int mi = 0; mi < NM; ++mi)
+#pragma unroll
+            for (int e = 0; e < kMaxEnt; ++e) part[mi][e] = 0.0f;
 #pragma unroll
         for (int m = 0; m < 8; ++m) {
-            float w[8];
+            float w[NM][8];
 #pragma unroll
-            for (int s2 = 0; s2 < 2; ++s2) {
-                uint32_t w0, w1;
-                step_words<COMPUTED>(lut, state_at(lo, hi, (15 - (2 * m + s2)) * K), w0, w1);
-                w[4 * s2 + 0] = half_bits_f(w0 & 0xffffu);
-                w[4 * s2 + 1] = half_bits_f(w0 >> 16);
-                w[4 * s2 + 2] = half_bits_f(w1 & 0xffffu);
-                w[4 * s2 + 3] = half_bits_f(w1 >> 16);
-            }
+            for (int mi = 0; mi < NM; ++mi)
+#pragma unroll
+                for (int s2 = 0; s2 < 2; ++s2) {
+                    uint32_t w0, w1;
+                    step_words<COMPUTED>(lut, state_at(lo[mi], hi[mi], (15 - (2 * m + s2)) * K), w0, w1);
+                    w[mi][4 * s2 + 0] = half_bits_f(w0 & 0xffffu);
+                    w[mi][4 * s2 + 1] = half_bits_f(w0 >> 16);
+                    w[mi][4 * s2 + 2] = half_bits_f(w1 & 0xffffu);
+                    w[mi][4 * s2 + 3] = half_bits_f(w1 >> 16);
+                }
 #pragma unroll
             for (int e = 0; e < kMaxEnt; ++e)
                 if (e < ne) {
                     float v[8];
                     act.load8(e, b * 128 + 64 * kg + 8 * m, v);
 #pragma unroll
-                    for (int j = 0; j < 8; ++j) part[e] = fmaf(w[j], v[j], part[e]);
+                    for (int mi = 0; mi < NM; ++mi)
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) part[mi][e] = fmaf(w[mi][j], v[j], part[mi][e]);
                 }
         }
         // entries 0..7 into tot[i] of the kg = 0 lane, 8..15 of the kg = 1 lane, so the output indexing matches the WMMA's
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const float p0 = part[i], p1 = part[8 + i];
-            // lane kg holds its half's partial of both; the full sum needs the partner's half (same row, other kg)
-            const float q0 = __shfl_xor(p0, 16), q1 = __shfl_xor(p1, 16);
-            tot[i] += d * (kg == 0 ? p0 + q0 : p1 + q1);
-        }
+        for (int mi = 0; mi < NM; ++mi)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float p0 = part[mi][i], p1 = part[mi][8 + i];
+                const float q0 = __shfl_xor(p0, 16), q1 = __shfl_xor(p1, 16);
+                tot[mi][i] += d[mi] * (kg == 0 ? p0 + q0 : p1 + q1);
+            }
 #endif
     }
 #pragma unroll
-    for (int i = 0; i < 8; ++i) acc_out[i] = tot[i];
+    for (int mi = 0; mi < NM; ++mi)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc_out[mi][i] = tot[mi][i];
 }
-// (the plain form: the block scale d is the row's, which both halves of the row read alike, so d * (sum of the halves) is
-// right; the halves' partial sums swap through the shuffle, kg 0 keeping entries 0..7 and kg 1 entries 8..15)
 
 __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {   // ds4_iq.cu's
     if (limit > 0.0f) {
@@ -261,7 +315,7 @@ __device__ __forceinline__ bool group_of(const Args& a, int grp, const uint8_t*&
 }
 
 // grid (n_ff / 64, groups): a wave = a 16-row tile of the gate and of the up of the group's expert, 16 entries a pass
-template <int K, bool COMPUTED>
+template <int K, bool COMPUTED, bool WORDS>
 __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
     __shared__ uint32_t lut[COMPUTED ? 1 : 2048];
     __shared__ int ent[kMaxEnt], xr[kMaxEnt];
@@ -286,19 +340,19 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
         __syncthreads();
         if (tile * kTileRows >= a.n_ff) continue;
         const ActQ8 act{a.xq, a.xd, xr, a.n_embd};
-        float ag[8], au[8];
-        tile_dot<K, COMPUTED>(g, a.n_embd / 128, lut, act, ne, ag);
-        tile_dot<K, COMPUTED>(u, a.n_embd / 128, lut, act, ne, au);
+        const uint8_t* wr[2] = {g, u};
+        float gu[2][8];
+        tile_dot<K, COMPUTED, 2, WORDS>(wr, a.n_embd / 128, lut, act, ne, gu);
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const int m = 8 * kg + i;
-            if (m < ne) a.h[(size_t) ent[m] * a.n_ff + row] = swiglu(ag[i], au[i], a.limit);
+            if (m < ne) a.h[(size_t) ent[m] * a.n_ff + row] = swiglu(gu[0][i], gu[1][i], a.limit);
         }
     }
 }
 
 // grid (n_embd / 64, groups): the down's tile of a wave against the entries' int8 h
-template <int K, bool COMPUTED>
+template <int K, bool COMPUTED, bool WORDS>
 __global__ void __launch_bounds__(kThreads) down_kernel(const Args a) {
     __shared__ uint32_t lut[COMPUTED ? 1 : 2048];
     __shared__ int ent[kMaxEnt];
@@ -318,12 +372,13 @@ __global__ void __launch_bounds__(kThreads) down_kernel(const Args a) {
         __syncthreads();
         if (tile * kTileRows >= a.n_embd) continue;
         const ActQ8 act{a.hq, a.hd, ent, a.n_ff};
-        float ad[8];
-        tile_dot<K, COMPUTED>(d, a.n_ff / 128, lut, act, ne, ad);
+        const uint8_t* wr[1] = {d};
+        float dd[1][8];
+        tile_dot<K, COMPUTED, 1, WORDS>(wr, a.n_ff / 128, lut, act, ne, dd);
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const int m = 8 * kg + i;
-            if (m < ne) a.part[(size_t) ent[m] * a.n_embd + row] = ad[i];
+            if (m < ne) a.part[(size_t) ent[m] * a.n_embd + row] = dd[0][i];
         }
     }
 }
@@ -332,7 +387,7 @@ __global__ void __launch_bounds__(kThreads) down_kernel(const Args a) {
 // grid (n_ff / 64, chunks of 16 rows, n_exp): expert e = blockIdx.z owns the sorted rows [bounds[e], bounds[e + 1]); local
 // row = sorted row - row0.  gate / up: F32 x[idx[local]] (ldx) -> F16 swiglu h[local * ldo + c]; down: F16 xh[local] (ldx) ->
 // F32 y[local * ldo + c].
-template <int K, bool COMPUTED, bool GATE_UP>
+template <int K, bool COMPUTED, bool GATE_UP, bool WORDS>
 __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
     __shared__ uint32_t lut[COMPUTED ? 1 : 2048];
     __shared__ int rowsel[kMaxEnt];
@@ -351,14 +406,15 @@ __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
     if ((int) threadIdx.x < ne) rowsel[threadIdx.x] = GATE_UP ? a.idx[r0 + threadIdx.x] : r0 + (int) threadIdx.x;
     __syncthreads();
     if (tile * kTileRows >= N) return;
-    float acc[8], accu[8];
+    float res[2][8];
     if (GATE_UP) {
         const ActF32 act{a.xf, rowsel, (size_t) a.ldx};
-        tile_dot<K, COMPUTED>(blob + a.tr[0] + (size_t) row * rb, Kin / 128, lut, act, ne, acc);
-        tile_dot<K, COMPUTED>(blob + a.tr[1] + (size_t) row * rb, Kin / 128, lut, act, ne, accu);
+        const uint8_t* wr[2] = {blob + a.tr[0] + (size_t) row * rb, blob + a.tr[1] + (size_t) row * rb};
+        tile_dot<K, COMPUTED, 2, WORDS>(wr, Kin / 128, lut, act, ne, res);
     } else {
         const ActF16 act{a.xh, rowsel, (size_t) a.ldx};
-        tile_dot<K, COMPUTED>(blob + a.tr[2] + (size_t) row * rb, Kin / 128, lut, act, ne, acc);
+        const uint8_t* wr[1] = {blob + a.tr[2] + (size_t) row * rb};
+        tile_dot<K, COMPUTED, 1, WORDS>(wr, Kin / 128, lut, act, ne, res);
     }
     const int kgl = threadIdx.x >> 4 & 1;
 #pragma unroll
@@ -366,14 +422,14 @@ __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
         const int m = 8 * kgl + i;
         if (m >= ne) continue;
         const size_t lr = (size_t) (r0 + m);
-        if (GATE_UP) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(swiglu(acc[i], accu[i], a.limit)));
-        else a.y[lr * a.ldo + row] = acc[i];
+        if (GATE_UP) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(swiglu(res[0][i], res[1][i], a.limit)));
+        else a.y[lr * a.ldo + row] = res[0][i];
     }
 }
 
 // ---------------------------------------------------------------- GEMV jobs
 // grid (n / 64): y[c * ycs + r] = alpha (row r . x_c) + bias[r] for ncol (<= 16) int8 activation columns
-template <int K, bool COMPUTED>
+template <int K, bool COMPUTED, bool WORDS>
 __global__ void __launch_bounds__(kThreads) mv_kernel(const MvJob j) {
     __shared__ uint32_t lut[COMPUTED ? 1 : 2048];
     __shared__ int cols[kMaxEnt];
@@ -385,12 +441,13 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const MvJob j) {
     if (tile * kTileRows >= j.n) return;
     const int row = tile * kTileRows + r;
     const ActQ8 act{j.xq, j.xd, cols, j.k};
-    float acc[8];
-    tile_dot<K, COMPUTED>(j.w + (size_t) row * j.ld, j.k / 128, lut, act, j.ncol, acc);
+    const uint8_t* wr[1] = {j.w + (size_t) row * j.ld};
+    float accm[1][8];
+    tile_dot<K, COMPUTED, 1, WORDS>(wr, j.k / 128, lut, act, j.ncol, accm);
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         const int m = 8 * kg + i;
-        if (m < j.ncol && row < j.n) j.y[(size_t) m * j.ycs + row] = j.alpha * acc[i] + (j.bias != nullptr ? j.bias[row] : 0.0f);
+        if (m < j.ncol && row < j.n) j.y[(size_t) m * j.ycs + row] = j.alpha * accm[0][i] + (j.bias != nullptr ? j.bias[row] : 0.0f);
     }
 }
 
@@ -406,6 +463,15 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const MvJob j) {
         default: return false;                      \
     }
 
+// 32-bit stream loads (STRATA_DS4_TQ_WORDS=1) or the 16-bit ones (default)
+bool use_words() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_DS4_TQ_WORDS");
+        return e != nullptr && std::atoi(e) != 0;   // (no gain measured on the R9700: 13.8 vs 14.2 ms a token)
+    }();
+    return on;
+}
+
 bool bad(const char* what) {
     std::fprintf(stderr, "ds4 tq: %s\n", what);
     return false;
@@ -413,38 +479,42 @@ bool bad(const char* what) {
 }  // namespace
 
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
+    const bool w = use_words();
     (void) ne_max;
     if (a.n_embd % 128 != 0 || a.n_ff % (kWaves * kTileRows) != 0) return bad("gate_up: geometry not covered");
     const dim3 grid((unsigned) (a.n_ff / (kWaves * kTileRows)), (unsigned) groups);
-#define GU_(K, C) gate_up_kernel<K, C><<<grid, kThreads, 0, s>>>(a)
+#define GU_(K, C) { if (w) gate_up_kernel<K, C, true><<<grid, kThreads, 0, s>>>(a); else gate_up_kernel<K, C, false><<<grid, kThreads, 0, s>>>(a); }
     DS4_TQ_SWITCH(a.tg, GU_)
 #undef GU_
     return true;
 }
 
 bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
+    const bool w = use_words();
     (void) ne_max;
     if (a.n_ff % 128 != 0 || a.n_embd % (kWaves * kTileRows) != 0) return bad("down: geometry not covered");
     const dim3 grid((unsigned) (a.n_embd / (kWaves * kTileRows)), (unsigned) groups);
-#define DN_(K, C) down_kernel<K, C><<<grid, kThreads, 0, s>>>(a)
+#define DN_(K, C) { if (w) down_kernel<K, C, true><<<grid, kThreads, 0, s>>>(a); else down_kernel<K, C, false><<<grid, kThreads, 0, s>>>(a); }
     DS4_TQ_SWITCH(a.td, DN_)
 #undef DN_
     return true;
 }
 
 bool set_gate_up(const SetArgs& a, cudaStream_t s) {
+    const bool w = use_words();
     if (a.n_embd % 128 != 0 || a.n_ff % (kWaves * kTileRows) != 0) return bad("set_gate_up: geometry not covered");
     const dim3 grid((unsigned) (a.n_ff / (kWaves * kTileRows)), (unsigned) ((a.max_rows + kMaxEnt - 1) / kMaxEnt), (unsigned) a.n_exp);
-#define SG_(K, C) set_kernel<K, C, true><<<grid, kThreads, 0, s>>>(a)
+#define SG_(K, C) { if (w) set_kernel<K, C, true, true><<<grid, kThreads, 0, s>>>(a); else set_kernel<K, C, true, false><<<grid, kThreads, 0, s>>>(a); }
     DS4_TQ_SWITCH(a.tg, SG_)
 #undef SG_
     return true;
 }
 
 bool set_down(const SetArgs& a, cudaStream_t s) {
+    const bool w = use_words();
     if (a.n_ff % 128 != 0 || a.n_embd % (kWaves * kTileRows) != 0) return bad("set_down: geometry not covered");
     const dim3 grid((unsigned) (a.n_embd / (kWaves * kTileRows)), (unsigned) ((a.max_rows + kMaxEnt - 1) / kMaxEnt), (unsigned) a.n_exp);
-#define SD_(K, C) set_kernel<K, C, false><<<grid, kThreads, 0, s>>>(a)
+#define SD_(K, C) { if (w) set_kernel<K, C, false, true><<<grid, kThreads, 0, s>>>(a); else set_kernel<K, C, false, false><<<grid, kThreads, 0, s>>>(a); }
     DS4_TQ_SWITCH(a.td, SD_)
 #undef SD_
     return true;
@@ -453,9 +523,10 @@ bool set_down(const SetArgs& a, cudaStream_t s) {
 bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     for (int i = 0; i < n; ++i) {
         const MvJob& j = jobs[i];
+        const bool w = use_words();
         if (j.k % 128 != 0 || j.n % kTileRows != 0 || j.ncol < 1 || j.ncol > kMaxEnt) return bad("mv: geometry not covered");
         const dim3 grid((unsigned) ((j.n + kWaves * kTileRows - 1) / (kWaves * kTileRows)));
-#define MV_(K, C) mv_kernel<K, C><<<grid, kThreads, 0, s>>>(j)
+#define MV_(K, C) { if (w) mv_kernel<K, C, true><<<grid, kThreads, 0, s>>>(j); else mv_kernel<K, C, false><<<grid, kThreads, 0, s>>>(j); }
         DS4_TQ_SWITCH(j.type, MV_)
 #undef MV_
     }
