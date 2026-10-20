@@ -110,6 +110,10 @@ On Windows intel/llvm can be built with the HIP and Level Zero runtimes, and XeS
   Windows device code has a 2-byte wchar_t: `tools/windows/device_libs_wchar.py` rewrites their `wchar_size` flag to 2, and `STRATA_ROCM_DEVICE_LIBS` gives them to the build.
 - Configure XeStrata with `-DSTRATA_LICENSE=free -DSTRATA_HIP_ARCHS=<GPU>`: with the SDK in `STRATA_ROCM_ROOT` oneMath's rocBLAS backend is built too (CMake applies `third_party/main/oneMath/patches/windows-gnu-driver.patch`).
 - At run time put intel/llvm's `install/bin`, oneMath's DLLs (the build's `bin`) and the SDK's `bin` on `PATH`, and choose the GPU with `ONEAPI_DEVICE_SELECTOR=hip:0`.
+- The image encoders (`tools/vision`) are built with MSVC and Ninja in a Visual Studio x64 environment, with the same pinned llama.cpp as the engine in `LLAMA_DIR`.
+  The GPU one (`-DSTRATA_VISION_VULKAN=ON`) needs [LunarG's Vulkan SDK](https://vulkan.lunarg.com/sdk/home) (the headers, `vulkan-1.lib` and `glslc`; version 1.4.363.0, as upstream's). Run its installer as administrator and put the SDK's place in the environment variable `VULKAN_SDK`.
+  The SDK is used for the build only and does not go into the zip: the zip's encoder runs on the GPU driver's `vulkan-1.dll`.
+  Put the CPU and GPU builds of `strata-vision.exe` in one folder as `strata-vision-cpu.exe` and `strata-vision-vulkan.exe` respectively, and pass it to `tools/package/windows_bundle.py` with `--vision`: they go into the zip's `app\engine\`.
 
 ### The contrib-llvm build (CUDA)
 

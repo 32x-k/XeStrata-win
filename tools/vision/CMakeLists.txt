@@ -10,10 +10,14 @@
 # On the GPU through Vulkan (ggml-vulkan; free software: Mesa's drivers, libvulkan-dev, glslc):
 #   cmake -S tools/vision -B build-vision-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release \
 #         -DLLAMA_DIR=third_party/main/llama.cpp -DSTRATA_VISION_VULKAN=ON
+#
+# On Windows (the zip's strata-vision-cpu.exe and strata-vision-vulkan.exe): the same commands from a Visual Studio
+# x64 prompt; the Vulkan one needs the LunarG Vulkan SDK (VULKAN_SDK: its headers, vulkan-1.lib and glslc), and runs
+# on the GPU driver's vulkan-1.dll.
 cmake_minimum_required(VERSION 3.21)
 project(strata_vision C CXX)
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  message(FATAL_ERROR "Strata vision supports Linux only")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT WIN32)
+  message(FATAL_ERROR "Strata vision supports Linux and Windows only")
 endif()
 
 set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/main/llama.cpp" CACHE PATH "llama.cpp checkout")
@@ -49,3 +53,16 @@ add_executable(strata-vision strata_vision.cpp)
 target_link_libraries(strata-vision PRIVATE mtmd llama)
 target_compile_features(strata-vision PRIVATE cxx_std_17)
 set_target_properties(strata-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+if(WIN32 AND STRATA_VISION_VULKAN)
+  # --gpu-pci on a driver without VK_EXT_pci_bus_info: the card by its adapter LUID (D3DKMT in gdi32, and Vulkan's
+  # deviceLUID), see vk_index_by_pci in strata_vision.cpp
+  find_package(Vulkan REQUIRED)
+  target_compile_definitions(strata-vision PRIVATE STRATA_VISION_VULKAN)
+  target_link_libraries(strata-vision PRIVATE Vulkan::Vulkan gdi32)
+endif()
+
+# opens a GGUF that has tensor types llama.cpp does not know (a Gyro quantization's TQK6 / TQK7) for its vocabulary only
+add_executable(strata-vision-gguf-test EXCLUDE_FROM_ALL gguf_meta_test.cpp)
+target_link_libraries(strata-vision-gguf-test PRIVATE llama)
+target_compile_features(strata-vision-gguf-test PRIVATE cxx_std_17)
+set_target_properties(strata-vision-gguf-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

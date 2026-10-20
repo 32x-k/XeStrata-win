@@ -34,6 +34,7 @@ It keeps taking in upstream's releases; it now includes upstream XeStrata's xe0.
 - Text generation with `strata.exe` (`--tokens-file`)
 - The OpenAI-compatible API with `--serve` and `serve/server.py`
 - The native pack (`tools/iq_pack.py`), speculative decoding with MTP, `--resident-experts`, and prefill on rocBLAS
+- Reading pictures (on the GPU through Vulkan with `strata-vision-vulkan.exe`, on the CPU with `strata-vision-cpu.exe`; when the GPU build does not start, the server switches to the CPU build)
 
 These three things differ from upstream.
 

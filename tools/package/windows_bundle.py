@@ -19,7 +19,8 @@ The folder (XeStrata-<version>-windows-x64/):
     xestrata.exe, xestrata-cli.exe and their .NET libraries   the launchers (windows/launcher), or xestrata-cli.bat
                                                               with WINDOWS.ja.md and WINDOWS.md (docs/)
     app/                  setup.py, serve/, tools/, data/ and gguf-py, read-only, with the PACKAGED record
-    app/engine/           the engine, its SYCL runtime (intel/llvm's) and BUILD.json
+    app/engine/           the engine, its SYCL runtime (intel/llvm's) and BUILD.json; with --vision the image encoders
+                          strata-vision-cpu.exe and strata-vision-vulkan.exe
     python/               Python's embeddable distribution with the packages setup and the server use
     NOTICE, COPYING, COPYING.LESSER, THIRD-PARTY-NOTICES.md, licenses/
 
@@ -45,14 +46,17 @@ SYCL_DLLS = ("sycl9.dll", "ur_win_proxy_loader.dll", "ur_loader.dll", "ur_adapte
 # the runtime's own: a runtime built for some makers' GPUs only (the AMD build's: HIP) lacks the other adapters
 SYCL_CORE = ("sycl9.dll", "ur_win_proxy_loader.dll", "ur_loader.dll")
 ENGINE_EXES = ("strata.exe", "strata-device.exe", "strata-image.exe")
+# the image encoders (tools/vision, --vision): on the CPU, and on the GPU through Vulkan
+VISION_EXES = ("strata-vision-cpu.exe", "strata-vision-vulkan.exe")
 # what a Windows PC brings (the Visual C++ runtime, which xestrata.exe checks for) and what must never be carried
 FORBIDDEN = ("vcruntime*.dll", "msvcp*.dll", "concrt*.dll", "ucrtbase*.dll", "api-ms-win-*.dll", "nvcuda.dll",
-             "nvml.dll", "cublas*.dll", "cudart*.dll", "mkl_*.dll", "amdhip64*.dll", "ze_loader*.dll")
-# what the AMD build's DLLs import from Windows and from AMD's and Intel's drivers (amdhip64_7.dll, ze_loader.dll):
-# never followed into the folder
+             "nvml.dll", "cublas*.dll", "cudart*.dll", "mkl_*.dll", "amdhip64*.dll", "ze_loader*.dll", "vulkan-1.dll")
+# what the AMD build's DLLs import from Windows and from AMD's and Intel's drivers (amdhip64_7.dll, ze_loader.dll, the
+# Vulkan loader vulkan-1.dll): never followed into the folder
 SYSTEM_DLL = re.compile(r"(?i)^(api-ms-win-.*|ext-ms-.*|kernel32|user32|advapi32|ole32|oleaut32|shell32|shlwapi|ws2_32|"
                         r"bcrypt|crypt32|dbghelp|version|setupapi|cfgmgr32|dxgi|d3d12|dxcore|ntdll|ucrtbase|"
-                        r"vcruntime140(_1)?|msvcp140(_atomic_wait|_1|_2)?|vcomp140|amdhip64_7|ze_loader)\.dll$")
+                        r"vcruntime140(_1)?|msvcp140(_atomic_wait|_1|_2)?|vcomp140|amdhip64_7|ze_loader|"
+                        r"vulkan-1)\.dll$")
 # the kernel libraries rocBLAS and hipBLASLt open from folders beside their DLLs
 ROCM_DATA = ("rocblas", "hipblaslt")
 # the Python packages the 7z carries (requirements.txt without the build tools, and colorama, which tqdm takes on
@@ -65,7 +69,7 @@ WHEELS = ("numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "p
 COMPONENTS = [
     ("XeStrata", "version", "LGPL-3.0-or-later (with MIT parts: NOTICE)", "https://github.com/MistVVK/XeStrata",
      [], ["xestrata.exe", "xestrata-cli.exe", "xestrata.dll", "xestrata-cli.dll", "Xestrata.Launcher.Core.dll",
-          *(f"app/engine/{e}" for e in ENGINE_EXES)]),
+          *(f"app/engine/{e}" for e in (*ENGINE_EXES, *VISION_EXES))]),
     ("intel/llvm (DPC++) SYCL runtime, with Unified Runtime, UMF and hwloc", "intel-llvm",
      "Apache-2.0 WITH LLVM-exception; UMF Apache-2.0 WITH LLVM-exception; hwloc BSD-3-Clause; Level Zero loader "
      "headers MIT", "https://github.com/intel/llvm", ["sycl:licenses/*"], [f"app/engine/{d}" for d in SYCL_DLLS]),
@@ -117,6 +121,18 @@ AMD_COMPONENTS = [
     ("AMD code object manager (comgr, ROCm)", "rocm", "Apache-2.0 WITH LLVM-exception",
      "https://github.com/ROCm/llvm-project/tree/amd-staging/amd/comgr", ["rocm:share/doc/amd_comgr/LICENSE.txt"],
      ["app/engine/amd_comgr*.dll"]),
+]
+# the image encoders' (--vision): what llama.cpp's mtmd compiles into them, as COMPONENTS
+VISION_COMPONENTS = [
+    ("llama.cpp, ggml and mtmd (compiled into strata-vision-*.exe)", "llama.cpp",
+     "MIT; vendored: xxhash BSD-2-Clause, rotate-bits MIT, stb_image MIT OR Unlicense, miniaudio MIT-0 OR Unlicense, "
+     "subprocess.h Unlicense, sha1 and sha256 public domain", "https://github.com/ggml-org/llama.cpp",
+     ["llama:LICENSE", "llama:vendor/hash/xxhash/LICENSE", "llama:vendor/hash/rotate-bits/LICENSE.md"],
+     [f"app/engine/{e}" for e in VISION_EXES]),
+    ("Vulkan-Headers (compiled into strata-vision-vulkan.exe; the loader vulkan-1.dll is the GPU driver's)",
+     "vulkan-headers", "Apache-2.0 OR MIT", "https://github.com/KhronosGroup/Vulkan-Headers",
+     [f"https://raw.githubusercontent.com/KhronosGroup/Vulkan-Headers/v1.4.363/{p}"
+      for p in ("LICENSE.md", "LICENSES/Apache-2.0.txt", "LICENSES/MIT.txt")], []),
 ]
 # the launchers' components, which a zip with xestrata-cli.bat does not carry
 DOTNET = (".NET application host", "Avalonia", "ANGLE (Avalonia's build)", "SkiaSharp and Skia",
@@ -221,6 +237,8 @@ def main() -> None:
     ap.add_argument("--launcher", type=Path, help="the .NET launchers (windows/launcher); without it xestrata-cli.bat")
     ap.add_argument("--nuget", type=Path, help="the NuGet cache the launchers were built from (with --launcher)")
     ap.add_argument("--rocm", type=Path, help="the ROCm SDK (bin/rocblas.dll, share/doc): the AMD GPUs' build")
+    ap.add_argument("--vision", type=Path, help="the folder with the image encoders (tools/vision built for Windows): "
+                                                "strata-vision-cpu.exe and strata-vision-vulkan.exe")
     ap.add_argument("--python-zip", type=Path, required=True)
     ap.add_argument("--version", required=True)
     ap.add_argument("--cuda-archs", default="", help="the engine's NVIDIA architectures, sm_60;sm_61;...")
@@ -268,6 +286,10 @@ def main() -> None:
     eng.mkdir()
     for e in ENGINE_EXES:
         shutil.copy2(a.engine / e, eng / e)
+    for e in VISION_EXES if a.vision is not None else ():
+        if not (a.vision / e).is_file():
+            fail(f"{a.vision / e} is missing")
+        shutil.copy2(a.vision / e, eng / e)
     for d in SYCL_DLLS:
         if (a.sycl / "bin" / d).is_file():
             shutil.copy2(a.sycl / "bin" / d, eng / d)
@@ -313,6 +335,7 @@ def main() -> None:
     lic = top / "licenses"
     lic.mkdir()
     versions = {"version": a.version, "dotnet": "10", "llama.cpp": "the commit setup.py pins",
+                "vulkan-headers": "1.4.363 (the Vulkan SDK the encoders were built with)",
                 "outfit": "third_party/main/outfit", "quantscope": "bfdf205",
                 "python": python_version(a.python_zip)}
     sycl_rec = json.loads((a.sycl / "XESTRATA.json").read_text())
@@ -330,6 +353,7 @@ def main() -> None:
         versions["rocm"] = f"the ROCm SDK the engine was built with ({sdk})"
     components = [c for c in COMPONENTS if a.launcher is not None or c[0] not in DOTNET]
     components += AMD_COMPONENTS if a.rocm is not None else []
+    components += VISION_COMPONENTS if a.vision is not None else []
     rows = []
     covered: set = set()
     files = [p.relative_to(top).as_posix() for p in top.rglob("*") if p.is_file()]

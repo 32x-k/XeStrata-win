@@ -110,6 +110,10 @@ Windows では、intel/llvm を HIP と Level Zero のランタイムを付け�
   Windows のデバイスコードは wchar_t が 2 バイトなので、`tools/windows/device_libs_wchar.py` で `wchar_size` のフラグを 2 に書き換えてから、`STRATA_ROCM_DEVICE_LIBS` で渡します。
 - XeStrata は `-DSTRATA_LICENSE=free -DSTRATA_HIP_ARCHS=<GPU>` で構成します。`STRATA_ROCM_ROOT` に SDK を渡すと、oneMath の rocBLAS のバックエンドもビルドされます（`third_party/main/oneMath/patches/windows-gnu-driver.patch` を CMake が当てます）。
 - 実行時は、intel/llvm の `install/bin`、oneMath の DLL（ビルドの `bin`）、SDK の `bin` を `PATH` に置き、`ONEAPI_DEVICE_SELECTOR=hip:0` で GPU を選びます。
+- 画像のエンコーダー（`tools/vision`）は、Visual Studio の x64 の環境で MSVC と Ninja を使ってビルドします。llama.cpp はエンジンと同じ固定版を `LLAMA_DIR` で渡します。
+  GPU 版（`-DSTRATA_VISION_VULKAN=ON`）には [LunarG の Vulkan SDK](https://vulkan.lunarg.com/sdk/home) が要ります（ヘッダー、`vulkan-1.lib`、`glslc`。版は上流と同じ 1.4.363.0）。インストーラーは管理者として実行し、環境変数 `VULKAN_SDK` に SDK の場所を入れます。
+  SDK はビルドのときにだけ使い、zip には入れません。zip のエンコーダーは、実行時に GPU のドライバーの `vulkan-1.dll` を使います。
+  CPU 版と GPU 版の `strata-vision.exe` を、それぞれ `strata-vision-cpu.exe` と `strata-vision-vulkan.exe` の名前で 1 つのフォルダーに置き、`tools/package/windows_bundle.py` に `--vision` で渡すと、zip の `app\engine\` に入ります。
 
 ### contrib-llvm 用のビルド（CUDA）
 

@@ -21,13 +21,16 @@
 // row i at grid position (x = i % nx, y = i / nx).  The text model is opened vocab-only (no weights).
 #include "ggml-cpu.h"
 #include "gguf.h"
+#include "gguf_meta.h"
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -37,8 +40,69 @@
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(_WIN32) && defined(STRATA_VISION_VULKAN)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <winternl.h>
+#include <d3dkmthk.h>
+#include <vulkan/vulkan.h>
+#endif
 
 namespace {
+
+#if defined(_WIN32) && defined(STRATA_VISION_VULKAN)
+// Windows: a driver without VK_EXT_pci_bus_info (AMD's) gives ggml no PCI address, so --gpu-pci finds no device.  The
+// adapter at that PCI address is found by its LUID instead (D3DKMT's adapter address), then the Vulkan device with the
+// same deviceLUID; its index in the Vulkan instance's device list is what GGML_VK_VISIBLE_DEVICES takes.  -1: none.
+int vk_index_by_pci(const std::string& pci) {
+    unsigned dom = 0, bus = 0, dev = 0, fn = 0;
+    if (std::sscanf(pci.c_str(), "%x:%x:%x.%x", &dom, &bus, &dev, &fn) != 4) return -1;
+    D3DKMT_ENUMADAPTERS2 en{};
+    if (D3DKMTEnumAdapters2(&en) != 0 || en.NumAdapters == 0) return -1;
+    std::vector<D3DKMT_ADAPTERINFO> ad(en.NumAdapters);
+    en.pAdapters = ad.data();
+    if (D3DKMTEnumAdapters2(&en) != 0) return -1;
+    LUID luid{};
+    bool found = false;
+    for (ULONG i = 0; i < en.NumAdapters; ++i) {
+        D3DKMT_ADAPTERADDRESS addr{};
+        D3DKMT_QUERYADAPTERINFO q{};
+        q.hAdapter = ad[i].hAdapter;
+        q.Type = KMTQAITYPE_ADAPTERADDRESS;
+        q.pPrivateDriverData = &addr;
+        q.PrivateDriverDataSize = sizeof addr;
+        if (!found && D3DKMTQueryAdapterInfo(&q) == 0 && addr.BusNumber == bus && addr.DeviceNumber == dev &&
+            addr.FunctionNumber == fn) {
+            luid = ad[i].AdapterLuid;
+            found = true;
+        }
+        D3DKMT_CLOSEADAPTER c{ad[i].hAdapter};
+        D3DKMTCloseAdapter(&c);
+    }
+    if (!found) return -1;
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    ci.pApplicationInfo = &app;
+    VkInstance inst = VK_NULL_HANDLE;
+    if (vkCreateInstance(&ci, nullptr, &inst) != VK_SUCCESS) return -1;
+    uint32_t n = 0;
+    vkEnumeratePhysicalDevices(inst, &n, nullptr);
+    std::vector<VkPhysicalDevice> pd(n);
+    vkEnumeratePhysicalDevices(inst, &n, pd.data());
+    int index = -1;
+    for (uint32_t i = 0; i < n && index < 0; ++i) {
+        VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        VkPhysicalDeviceProperties2 p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p.pNext = &id;
+        vkGetPhysicalDeviceProperties2(pd[i], &p);
+        if (id.deviceLUIDValid && std::memcmp(id.deviceLUID, &luid, sizeof luid) == 0) index = (int) i;
+    }
+    vkDestroyInstance(inst, nullptr);
+    return index;
+}
+#endif
 
 void quiet_log(ggml_log_level level, const char* text, void*) {
     if (level >= GGML_LOG_LEVEL_WARN) std::fputs(text, stderr);
@@ -93,11 +157,25 @@ int main(int argc, char** argv) {
     }
     llama_log_set(quiet_log, nullptr);
     mtmd_helper_log_set(quiet_log, nullptr);
+#if defined(_WIN32) && defined(STRATA_VISION_VULKAN)
+    // before the backends start: show ggml only the card at --gpu-pci (see vk_index_by_pci), unless the person chose
+    // the devices with GGML_VK_VISIBLE_DEVICES; mtmd then takes that one card as its first GPU
+    bool pci_by_luid = false;
+    if (gpu && !gpu_pci.empty() && std::getenv("GGML_VK_VISIBLE_DEVICES") == nullptr) {
+        const int vk = vk_index_by_pci(gpu_pci);
+        if (vk >= 0 && _putenv_s("GGML_VK_VISIBLE_DEVICES", std::to_string(vk).c_str()) == 0) pci_by_luid = true;
+        if (pci_by_luid)
+            std::fprintf(stderr, "strata-vision: the GPU at %s by its adapter LUID (Vulkan device %d)\n",
+                         gpu_pci.c_str(), vk);
+    }
+#endif
     llama_backend_init();
 
     const auto load_t0 = std::chrono::steady_clock::now();
     // ask the OS for the projector file up front (128 KiB steps) so the loader's sequential reads find it cached;
-    // STRATA_READ_AHEAD=0 turns it off, as in the engine
+    // STRATA_READ_AHEAD=0 turns it off, as in the engine.  Windows has no posix_fadvise: its cache manager reads
+    // ahead of the loader's sequential reads by itself
+#if !defined(_WIN32)
     if (const char* ra = std::getenv("STRATA_READ_AHEAD"); ra == nullptr || std::strtol(ra, nullptr, 10) != 0) {
         const int fd = open(mmproj.c_str(), O_RDONLY);
         if (fd >= 0) {
@@ -107,10 +185,12 @@ int main(int argc, char** argv) {
             close(fd);
         }
     }
-    llama_model_params mp = llama_model_default_params();
-    mp.vocab_only = true;
-    llama_model* text = llama_model_load_from_file(model.c_str(), mp);
-    if (!text) { std::printf("ERR cannot open the text model %s\n", model.c_str()); std::fflush(stdout); return 1; }
+#endif
+    // the vocabulary and header only: the weights (and their tensor types, which can be Strata-private ones such as
+    // Gyro's TQK6 / TQK7) are never touched - see gguf_meta.h
+    std::string how;
+    llama_model* text = strata_open_text_model(model, &how);
+    if (!text) { std::printf("ERR cannot open the text model %s (%s)\n", model.c_str(), how.c_str()); std::fflush(stdout); return 1; }
 
     mtmd_context_params cp = mtmd_context_params_default();
     cp.use_gpu = gpu;
@@ -121,6 +201,14 @@ int main(int argc, char** argv) {
             ggml_backend_dev_get_props(d, &props);
             if (props.device_id != nullptr && gpu_pci == props.device_id) cp.device = d;
         }
+#if defined(_WIN32) && defined(STRATA_VISION_VULKAN)
+        // no PCI address from the driver: the one card left visible is the one at --gpu-pci
+        for (size_t i = 0; pci_by_luid && i < ggml_backend_dev_count() && cp.device == nullptr; ++i) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            const enum ggml_backend_dev_type t = ggml_backend_dev_type(d);
+            if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) cp.device = d;
+        }
+#endif
         if (cp.device == nullptr) {
             std::printf("ERR no GPU at PCI address %s\n", gpu_pci.c_str());
             std::fflush(stdout);

@@ -34,6 +34,7 @@ intel/llvm（DPC++）を Windows の上で HIP と Level Zero（Intel の GPU）
 - `strata.exe` によるテキストの生成（`--tokens-file`）
 - `--serve` と `serve/server.py` による OpenAI 互換の API
 - ネイティブパック（`tools/iq_pack.py`）、MTP による推測デコード、`--resident-experts`、rocBLAS による prefill
+- 画像の読み取り（GPU では Vulkan の `strata-vision-vulkan.exe`、CPU では `strata-vision-cpu.exe`。GPU 版が起動しないときは、サーバーが CPU 版に切り替えます）
 
 本家と違うところは次の 3 つです。
 
