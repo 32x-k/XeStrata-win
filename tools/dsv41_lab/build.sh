@@ -7,3 +7,5 @@ NVCC=${NVCC:-/usr/local/cuda-12.9/bin/nvcc}
 mkdir -p out
 g++ -O2 -std=c++17 -I../../third_party/ggml -c ../trellis/tqenc.cpp -o out/tqenc.o
 $NVCC -O3 -std=c++17 -arch=$ARCH -lineinfo -o out/tqk_lab tqk_lab.cu out/tqenc.o -lpthread
+# DeepSeek kernel lab: links src/dsv41/ds4_kernels.cu unmodified
+$NVCC -O3 -std=c++17 -arch=$ARCH -lineinfo -I../../include -o out/ds4_lab ds4_lab.cu ../../src/dsv41/ds4_kernels.cu
