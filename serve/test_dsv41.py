@@ -280,6 +280,22 @@ class Parser(unittest.TestCase):
                          [("get_weather", {"city": "Rome"})])
 
 
+class ReadyTimeout(unittest.TestCase):
+    """A 300+ GB model read from a slow disk needs more than the default 900 s before READY: the config's "engine_ready_s"."""
+
+    def test_the_config_sets_it_and_a_bad_value_is_said(self):
+        from serve import server
+        before = server.ENGINE_READY_S
+        self.addCleanup(setattr, server, "ENGINE_READY_S", before)
+        server.apply_ready_timeout({})
+        self.assertEqual(server.ENGINE_READY_S, before)
+        server.apply_ready_timeout({"engine_ready_s": 3600})
+        self.assertEqual(server.ENGINE_READY_S, 3600.0)
+        for bad in (0, -5, "soon", True):
+            with self.assertRaises(ValueError):
+                server.apply_ready_timeout({"engine_ready_s": bad})
+
+
 class Api(unittest.TestCase):
     """Both APIs against a fake engine that replays scripted DeepSeek text."""
 

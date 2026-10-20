@@ -7350,7 +7350,7 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     args = ["--pack", str(pack), "--max-context", str(ctx), "--eos", "1", *plan["args"]]
     cfg = {"exe": str(exe), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": fam["name"], "arch": fam["arch"], "log": str(home() / f"strata-{tag.lower()}.log"),
-           "lib_dirs": lib_dirs, "port": port}
+           "lib_dirs": lib_dirs, "port": port, "engine_ready_s": 3600}      # 300+ GB read from the files: a slow disk needs its time
     if cuda_tk == 12:
         cfg["cuda"] = 12
     if hip:

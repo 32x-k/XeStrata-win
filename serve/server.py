@@ -2902,6 +2902,18 @@ def layer_split_value(cfg: dict) -> str:
     return ",".join(str(x) for x in vals)
 
 
+def apply_ready_timeout(cfg: dict) -> None:
+    """The config's "engine_ready_s": how long a start may take before READY (default ENGINE_READY_S, 900).  A model of 300+ GB read
+    from a slow disk (DeepSeek-V4.1-Flash: setup writes 3600) needs more.  ValueError for anything but a number > 0."""
+    global ENGINE_READY_S
+    v = cfg.get("engine_ready_s")
+    if v is None:
+        return
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not v > 0:
+        raise ValueError(f'"engine_ready_s" must be a number of seconds above 0, not {v!r}')
+    ENGINE_READY_S = float(v)
+
+
 def layer_split_of(cfg: dict) -> bool:
     """Several GPUs in the config are a layer split, unless the args put the later card(s) to another use: with
     --peer-device the second card is an expert-cache tier, and the engine refuses that beside --layer-split (#665)."""
@@ -8004,6 +8016,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
         try:
             silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
+            apply_ready_timeout(cfg)
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         try:

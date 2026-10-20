@@ -200,6 +200,7 @@ class Install(unittest.TestCase):
         self.assertEqual(a[a.index("--tp") + 1], "2")
         self.assertTrue(Path(a[a.index("--pack") + 1]).match("*packs/deepseek-v4.1-flash-ud-q8_k_xl"))
         self.assertEqual(self.cfg["gpu"], [0, 1, 2, 3])
+        self.assertEqual(self.cfg["engine_ready_s"], 3600)
         self.assertEqual(self.cfg["backend"], "hip")
         self.assertTrue(self.cfg["tokenizer"].endswith("tokenizer"))
         self.assertNotIn("--vision", a)
