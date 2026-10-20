@@ -580,6 +580,14 @@ __global__ void broadcast_streams_kernel(const float* __restrict__ x, float* __r
     R[(size_t) t * n * hc + i] = x[(size_t) t * n + i % n];
 }
 
+__global__ void hc_mean_streams_kernel(const float* __restrict__ R, float* __restrict__ out, int64_t n, int hc) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float s = 0.0f;
+    for (int c = 0; c < hc; ++c) s += R[(size_t) c * n + i];
+    out[i] = s / (float) hc;
+}
+
 __global__ void copy_indexed_kernel(float* __restrict__ dst, const float* __restrict__ src, int64_t stride,
                                     const int32_t* __restrict__ index, int64_t n) {
     const int idx = *index;
@@ -1512,6 +1520,11 @@ void broadcast_streams(const float* x, float* R, int64_t n_embd, int hc, int n_t
     broadcast_streams_kernel<<<dim3((unsigned) ((n_embd * hc + 255) / 256), (unsigned) n_tok), 256, 0,
                                (cudaStream_t) stream>>>(x, R, n_embd, hc);
     check("broadcast_streams");
+}
+
+void hc_mean_streams(const float* R, float* out, int64_t n_embd, int hc, void* stream) {
+    hc_mean_streams_kernel<<<(unsigned) ((n_embd + 255) / 256), 256, 0, (cudaStream_t) stream>>>(R, out, n_embd, hc);
+    check("hc_mean_streams");
 }
 
 void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* index, int64_t n, void* stream) {

@@ -627,6 +627,10 @@ Verifier::~Verifier() {
     if (h_commitb_) cudaFreeHost(h_commitb_);
     if (qcnt_) cudaFree(qcnt_);
     if (d_spec_) cudaFree(d_spec_);
+    if (tap_file_) std::fclose(tap_file_);
+    if (tap_dev_) cudaFree(tap_dev_);
+    if (tap_scratch_) cudaFree(tap_scratch_);
+    if (h_tap_) cudaFreeHost(h_tap_);
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
@@ -652,6 +656,18 @@ Verifier::~Verifier() {
                      h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
+}
+
+// STRATA_TAP_FILE: one record per row of the window: int32 position, int32 input token, then n_taps x n_embd floats
+void Verifier::tap_write(int T, const int32_t* tokens, int64_t pos0) {
+    if (tap_file_ == nullptr) return;
+    const size_t per = tap_layers_.size() * (size_t) g_->n_embd;
+    for (int t = 0; t < T; ++t) {
+        const int32_t hdr[2] = {(int32_t) (pos0 + t), tokens[t]};
+        std::fwrite(hdr, sizeof hdr, 1, tap_file_);
+        std::fwrite(h_tap_ + (size_t) t * per, sizeof(float), per, tap_file_);
+    }
+    std::fflush(tap_file_);
 }
 
 bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) {
@@ -763,6 +779,36 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed " + strata::core::pin_exhausted_hint(); return false; }
+    // STRATA_TAP_FILE: the DFlash2 experiment's hook (see verify.hpp); off unless the variable is set
+    if (const char* tap_path = std::getenv("STRATA_TAP_FILE"); tap_path != nullptr && tap_path[0] != '\0' && lb_ == 0 &&
+        le_ == g.n_layers) {
+        tap_layers_.clear();
+        const char* tl = std::getenv("STRATA_TAP_LAYERS");
+        std::string list = tl != nullptr && tl[0] != '\0' ? tl : "5,15,25,35,45";
+        for (size_t i = 0; i < list.size();) {
+            const size_t j = list.find(',', i);
+            const int l = std::atoi(list.substr(i, j == std::string::npos ? std::string::npos : j - i).c_str());
+            if (l >= 0 && l < g.n_layers - 1) tap_layers_.push_back(l);
+            if (j == std::string::npos) break;
+            i = j + 1;
+        }
+        tap_slot_.assign((size_t) g.n_layers, -1);
+        for (size_t i = 0; i < tap_layers_.size(); ++i) tap_slot_[(size_t) tap_layers_[i]] = (int) i;
+        const size_t nt = tap_layers_.size();
+        if (nt == 0 || cudaMalloc((void**) &tap_dev_, (size_t) T * nt * N * 4) != cudaSuccess ||
+            cudaMalloc((void**) &tap_scratch_, (size_t) HC * N * 4) != cudaSuccess ||
+            !mapped((size_t) T * nt * N * 4, (void**) &h_tap_, (void**) &m_tap_)) {
+            err = "verify: the STRATA_TAP_FILE buffers could not be allocated";
+            return false;
+        }
+        tap_file_ = std::fopen(tap_path, "wb");
+        if (tap_file_ == nullptr) { err = std::string("verify: cannot write STRATA_TAP_FILE ") + tap_path; return false; }
+        const int32_t hdr[4] = {0x50415453 /* 'STAP' */, 1, (int32_t) N, (int32_t) nt};
+        std::fwrite(hdr, sizeof hdr, 1, tap_file_);
+        for (int l : tap_layers_) { const int32_t v = l; std::fwrite(&v, sizeof v, 1, tap_file_); }
+        tap_on_ = true;
+        std::fprintf(stderr, "strata: STRATA_TAP_FILE %s: %zu taps of %lld floats per row\n", tap_path, nt, (long long) N);
+    }
     if (bal_ != nullptr) {   // set_pcie_balance: four stamp words per (layer, group)
         if (!mapped((size_t) g.n_layers * 2 * 4 * 8, (void**) &h_bal_, (void**) &m_bal_)) {
             err = "verify: mapped balance stamps allocation failed";
@@ -2132,6 +2178,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
         stamp(l, 24, grp);
+        if (tap_on_ && !batch_rec_ && l < (int64_t) tap_slot_.size() && tap_slot_[(size_t) l] >= 0) {
+            // the layer's completed output: R with this FFN half's write applied (the next layer's read would fold it)
+            const int64_t nt = (int64_t) tap_layers_.size();
+            for (int t = tb; t < te; ++t) {
+                cudaMemcpyAsync(tap_scratch_, Rt(t), (size_t) HC * N * 4, cudaMemcpyDeviceToDevice, cs);
+                gr_write(tap_scratch_, bo_ + t * N, inj2_ + t * HC, gs, tap_scratch_, cs);
+                hc_mean_streams(tap_scratch_, tap_dev_ + ((size_t) t * nt + (size_t) tap_slot_[(size_t) l]) * N, N, (int) HC, cs);
+            }
+        }
         if (l == g.n_layers - 1) {
             if (!fuse_head_gr) {
                 if (dec_batch && !g_no_multi_gr) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
@@ -2259,6 +2314,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
     }
     stamp(g.n_layers, 1, 0);
+    if (tap_on_ && !batch_rec_) copy_from_mapped(m_tap_, tap_dev_, (int64_t) T * (int64_t) tap_layers_.size() * N, cs);
     return true;
 }
 
@@ -3040,6 +3096,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
     }
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    if (tap_on_ && !batch_rec_) tap_write(T, tokens, pos0);
     note_nonfinite(T, nullptr);
     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
         static bool reported = false;
