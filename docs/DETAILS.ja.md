@@ -243,6 +243,33 @@ Arc Pro B70（32 GB）と i7-14700、RAM 96 GB で、setup の設定のまま、
 
 答えは、どの実行でも同じトークンでした。
 
+### Gyro（agentionai）
+
+**[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)** は、agentionai による Qwen3.8-Flash-Next の量子化で、Gyro-S と Gyro-M の 2 つです（upstream 0.2.0）。
+エキスパートは、トレリス符号のブロック（ggml の型 TQ2_T、TQK6、TQK7）を、ブロック 128 のアダマール回転をした基底で持ちます。
+エンジンは、エキスパートの入力（gate・up の x と down の h）を同じ回転にかけてから掛けます。CPU のエキスパート、GPU の decode の窓、補助の GPU、prompt の FP16 の経路のどれでもです。
+prompt の int8 の積は回転しないので、回転したエキスパートの層は FP16 の経路を通ります。
+ファイルはどちらも 1 つで、その半分ほどは n-gram の表です。表は SSD に置いたまま読むので、速い SSD に置いてください。
+
+| | Gyro-S | Gyro-M |
+| --- | --- | --- |
+| ファイル | `Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf` | `Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf` |
+| ダウンロード | 58.5 GB | 92.0 GB |
+| 使うメモリ（VRAM と RAM の合計） | 27.6 GB | 35 GB |
+| エキスパート | gate・up TQK6、down TQK7 | TQ2_T |
+
+setup は、固定したリビジョンからファイルを落として SHA-256 を確かめ、`--compat-bf16` で pack にします。
+pack の `native_experts.txt` は xs2 になり、回転の符号と層は横の `hadamard.txt` に入ります。回転できない前のエンジンは、この pack を断ります。
+どちらも誰の既定でもなく、メモリの目安は RAM ではなく VRAM と RAM の合計です。画像は、元のモデルのエンコーダーで読みます。
+
+```sh
+./setup.sh --setup --family gyro --model Gyro-S
+```
+
+Radeon AI PRO R9700（32 GB）と Ryzen AI 9 HX 370、RAM 27.6 GB で、Gyro-S のエキスパートはすべて VRAM に入りました（24,576 個、24.0 GiB）。
+13,290 トークンの prompt は 1,198 トークン/秒で読み、その中ほどの一文を正しく答えました。
+日本語の 6 つの質問を 18 回答させると、decode は全体で 60.0 トークン/秒、中国語にしかない字が入ったのは 5 回答（16 字）でした（同じ条件で Q2_0 は 107.7 トークン/秒、10 回答、IQ3_XXS は 63.0 トークン/秒、1 回答）。
+
 ### Qwen3.8-Flash-Next 以外のモデル（Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B）
 
 setup の最初の質問では、Qwen3.8-Flash-Next とは作りの違う 3 つの MoE モデルも選べます。
@@ -1424,6 +1451,8 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
   （カードによれば Apache-2.0）で、Strata での対応は @pjgmobile の PR #54 によるものです。
   Swift 1.5 は UkisAI の [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)。
   UD-IQ4_XS と UD-Q4_K_XL は Unsloth の [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)。
+  Gyro-S と Gyro-M は agentionai の [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)。
+  その形式（`third_party/main/ggml-tq/`、MIT）と CPU・GPU のカーネルは、Laurent Zuijdwijk が agentionai の llama.cpp のフォークと Strata に書いたものを、XeStrata が移したものです。
   重みにはそれぞれのライセンスが適用されます。
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)**（MIT）: i-quant の形式、`src/kernels/xe/` に書き写した GPU の内積と展開、
   i-quant のエキスパートのためにリンクする CPU のバックエンド、画像のエンコーダー（`tools/vision/`）の `mtmd` のライブラリと GPU のバックエンド（Vulkan、SYCL）、

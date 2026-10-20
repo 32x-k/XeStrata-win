@@ -253,6 +253,33 @@ every run from a cold OS cache:
 
 The answers were the same tokens in every run.
 
+### Or: Gyro (agentionai)
+
+**[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)** is agentionai's quantization of Qwen3.8-Flash-Next in two sizes, Gyro-S and Gyro-M (upstream 0.2.0).
+Its experts are trellis-coded blocks (ggml types TQ2_T, TQK6, TQK7) in a basis rotated by a block-128 Hadamard transform.
+The engine rotates the experts' inputs (gate/up's x and down's h) the same way before it multiplies: on the CPU's experts, the GPU's decode window, the helper GPUs and the prompt's FP16 path.
+The prompt's int8 products do not rotate, so the rotated experts' layers take the FP16 path.
+Each size is one file, about half of it the n-gram table; the table is read from the SSD, so keep the file on a fast one.
+
+| | Gyro-S | Gyro-M |
+| --- | --- | --- |
+| File | `Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf` | `Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf` |
+| Download | 58.5 GB | 92.0 GB |
+| Memory it uses (VRAM and RAM together) | 27.6 GB | 35 GB |
+| Experts | gate/up TQK6, down TQK7 | TQ2_T |
+
+setup downloads the file from a pinned revision, checks its SHA-256, and packs it with `--compat-bf16`.
+The pack's `native_experts.txt` is xs2, and the rotation's signs and layers are in `hadamard.txt` beside it; an older engine, which cannot rotate, refuses the pack.
+Neither is anyone's default, and the memory figure is the VRAM and the RAM together, not the RAM. Images are read with the original model's encoder.
+
+```sh
+./setup.sh --setup --family gyro --model Gyro-S
+```
+
+On a Radeon AI PRO R9700 (32 GB) with a Ryzen AI 9 HX 370 and 27.6 GB of RAM, every Gyro-S expert fit the VRAM (24,576 of them, 24.0 GiB).
+A 13,290-token prompt was read at 1,198 tokens/s, and the sentence in its middle was answered correctly.
+Six Japanese questions answered 18 times decoded at 60.0 tokens/s overall, and 5 answers had characters only Chinese uses (16 of them) (the same runs: Q2_0 107.7 tokens/s, 10 answers; IQ3_XXS 63.0 tokens/s, 1 answer).
+
 ### Or: models other than Qwen3.8-Flash-Next (Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B)
 
 setup's first question also offers three MoE models built differently from Qwen3.8-Flash-Next.
@@ -1447,6 +1474,8 @@ The model files are not part of it; their licenses apply to them (below).
   (Apache-2.0 per its card); its support in Strata came from @pjgmobile's PR #54.
   Swift 1.5: [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI.
   UD-IQ4_XS and UD-Q4_K_XL: [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) by Unsloth.
+  Gyro-S and Gyro-M: [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) by agentionai.
+  Their format (`third_party/main/ggml-tq/`, MIT) and the CPU and GPU kernels are Laurent Zuijdwijk's, for agentionai's llama.cpp fork and Strata, ported by XeStrata.
   Their licenses apply to the weights.
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the i-quant formats, the GPU dot products and dequantizers transcribed in `src/kernels/xe/`,
   the CPU backend linked for the i-quant experts, the `mtmd` library and the GPU backends (Vulkan, SYCL) behind the image encoder (`tools/vision/`),
