@@ -61,6 +61,33 @@ def lib() -> ctypes.CDLL:
 _hip = None
 
 
+class _gpu_lock:
+    """TQENC_GPU_LOCK=<card number>: take the box locks (shared /data/gpu.lock, exclusive ~/locks/gpu<N>.lock) around every GPU
+    call and release them in between, so a long job that is mostly host work does not keep the card from other users."""
+
+    def __enter__(self):
+        self.fds = []
+        card = os.environ.get("TQENC_GPU_LOCK")
+        if card is None:
+            return self
+        import fcntl
+        import time
+        while True:   # yield to a worker that queues all the cards (its chain starts with the gpu0 lock)
+            if not os.path.exists(os.path.expanduser("~/locks/EXCL_WAIT")):
+                break
+            time.sleep(5)
+        for path, mode in (("/data/gpu.lock", fcntl.LOCK_SH), (os.path.expanduser("~/locks/gpu%s.lock" % card), fcntl.LOCK_EX)):
+            fd = os.open(path, os.O_RDWR | os.O_CREAT)
+            fcntl.flock(fd, mode)
+            self.fds.append(fd)
+        return self
+
+    def __exit__(self, *a):
+        for fd in reversed(self.fds):
+            os.close(fd)
+        return False
+
+
 def hip_lib() -> ctypes.CDLL:
     """libtqenc_hip.so (sh tools/trellis/build.sh hip; run under the box GPU locks, HIP_VISIBLE_DEVICES picks the card)."""
     global _hip
@@ -105,8 +132,9 @@ def encode(w: np.ndarray, t: int, h: np.ndarray | None = None, iters: int = 1, n
     if gpu:
         if exact or t == TQ2_T:
             raise ValueError("the GPU encoder has no exact search and no TQ2_T")
-        tot = hip_lib().tqh_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, scale_tries, 0,
-                                   err.ctypes.data, stats.ctypes.data, None, 0)
+        with _gpu_lock():
+            tot = hip_lib().tqh_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, scale_tries, 0,
+                                       err.ctypes.data, stats.ctypes.data, None, 0)
         return out, err, tot, {"nonfinite_blocks": int(stats[0]), "zero_blocks": int(stats[1])}
     tot = lib().tqe_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, exact, scale_tries, threads,
                            err.ctypes.data, stats.ctypes.data)
