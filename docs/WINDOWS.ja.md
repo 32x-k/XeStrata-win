@@ -38,6 +38,7 @@ Visual C++ の再頒布可能パッケージがなければ、`xestrata-cli.bat`
 | 別の大きさ・別のモデル | `--setup --family gyro --model Gyro-M` など |
 | ほかの PC やスマートフォンからつなぐ | `--setup --host 0.0.0.0 --api-key <秘密の文字列>` |
 | ポート | `--port 8096` |
+| 画像の読み取り | `--setup --vision yes`（GPU 版か CPU 版かを決めるときは `gpu` か `cpu`、やめるときは `no`） |
 | ほかのプログラムのために空けておく VRAM | `--setup --vram-reserve-mib 3072` |
 | モデルの置き場所 | `--setup --data-dir D:\XeStrata-data` |
 

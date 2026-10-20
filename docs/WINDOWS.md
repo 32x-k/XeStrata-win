@@ -38,6 +38,7 @@ You can also pass only what you want to change as options.
 | Another size or another model | `--setup --family gyro --model Gyro-M`, for example |
 | Connecting from other PCs or a phone | `--setup --host 0.0.0.0 --api-key <a secret string>` |
 | The port | `--port 8096` |
+| Reading pictures | `--setup --vision yes` (`gpu` or `cpu` to choose the GPU or the CPU build, `no` to turn it off) |
 | VRAM left free for other programs | `--setup --vram-reserve-mib 3072` |
 | Where the models go | `--setup --data-dir D:\XeStrata-data` |
 
