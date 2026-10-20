@@ -90,7 +90,7 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=2)
     ap.add_argument("--ncand", type=int, default=2)
     ap.add_argument("--chunk", type=int, default=16)
-    ap.add_argument("--damp", type=float, default=0.01, help="ldl: damping, a fraction of the mean diagonal of H")
+    ap.add_argument("--damp", type=float, default=0.3, help="ldl: damping, a fraction of the mean diagonal of H")
     a = ap.parse_args()
     layers = [int(x) for x in a.layers.split(",")]
     var = pathlib.Path(a.var)
