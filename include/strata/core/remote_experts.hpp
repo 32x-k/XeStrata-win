@@ -88,6 +88,9 @@ private:
     float* d_out_ = nullptr;
     uint8_t* d_q8_ = nullptr;
     float* d_scales_ = nullptr;
+    float* d_xr_ = nullptr;                 // Gyro: the Hadamard-rotated expert input (CAP x H)
+    const float* d_sx_ = nullptr;           // Gyro: device sign vectors (x: H, h: FF); nullptr = identity
+    const float* d_sh_ = nullptr;
     void* d_scratch_ = nullptr;
     void* d_meta_ = nullptr;  ///< one upload of the grouped indices, instead of five small copies
     int32_t* d_start_ = nullptr;

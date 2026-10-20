@@ -114,6 +114,15 @@ inline const char* ggml_type_name(uint32_t t) {
         return "Q1_0";
     case 42:
         return "Q2_0";
+    // the agentionai llama.cpp fork: the trellis expert types of its Gyro files (third_party/main/ggml-tq)
+    case 143:
+        return "PTQ1_0";
+    case 144:
+        return "TQ2_T";
+    case 145:
+        return "TQK6";
+    case 146:
+        return "TQK7";
     default:
         return "?";
     }
@@ -215,6 +224,24 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 42:
         elems = 64;
         bytes = 18;
+        return true;
+    // the trellis types: 128 values = an fp16 scale + 32 steps of K bits (K = 8 TQ2_T, 6 TQK6, 7 TQK7);
+    // PTQ1_0 = 26 B of base-3 digits + an fp16 scale
+    case 143:
+        elems = 128;
+        bytes = 28;
+        return true;
+    case 144:
+        elems = 128;
+        bytes = 34;
+        return true;
+    case 145:
+        elems = 128;
+        bytes = 26;
+        return true;
+    case 146:
+        elems = 128;
+        bytes = 30;
         return true;
     default:
         return false;

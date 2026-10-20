@@ -10,6 +10,8 @@
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/hadamard.hpp"
+#include "strata/kernels/cpu/tq_cpu.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -18,11 +20,20 @@
 #include <cstdlib>
 #include <mutex>
 #include <new>
+#include <vector>
 
 namespace strata::kernels::cpu {
 namespace {
 
 const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
+
+// Do the trellis rows take Strata's own kernels (tq_cpu.hpp)?  Always, unless STRATA_NO_TQ_KERNELS=1 asks for ggml-cpu's
+// vec_dot AND this ggml has the type (the agentionai fork; an upstream ggml does not, and must never be asked about it).
+bool tq_rows_own(int type) {
+    if (!tq_supported(type)) return false;
+    if (tq_kernels_enabled()) return true;
+    return type >= (int) GGML_TYPE_COUNT || traits(type) == nullptr || traits(type)->vec_dot == nullptr;
+}
 
 void init_once() {
     static std::once_flag once;
@@ -48,12 +59,13 @@ bool iq256_supported(int type) noexcept {
 bool kq256_supported(int type) noexcept { return type == 10 || type == 11 || type == 12 || type == 13 || type == 14; }
 
 size_t native_row_bytes(int type, int64_t n) {
+    if (tq_supported(type)) return n > 0 && n % kTqBlock == 0 ? (size_t) (n / kTqBlock) * tq_block_bytes(type) : 0;
     if (type < 0 || type >= GGML_TYPE_COUNT || n <= 0 || n % ggml_blck_size((ggml_type) type)) return 0;
     return ggml_row_size((ggml_type) type, n);
 }
 
 bool native_row_to_float(int type, const void* src, float* dst, int64_t n) {
-    if (native_row_bytes(type, n) == 0) return false;
+    if (tq_supported(type) || native_row_bytes(type, n) == 0) return false;
     const ggml_type_traits* t = ggml_get_type_traits((ggml_type) type);
     if (t == nullptr || t->to_float == nullptr) return false;
     t->to_float(src, dst, n);
@@ -63,48 +75,61 @@ bool native_row_to_float(int type, const void* src, float* dst, int64_t n) {
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err, int up_type) {
     init_once();
     if (up_type < 0) up_type = gu_type;
-    const ggml_type_traits_cpu* tu = traits(up_type);
-    const ggml_type_traits_cpu* tg = traits(gu_type);
-    const ggml_type_traits_cpu* td = traits(d_type);
-    if (tg == nullptr || tg->vec_dot == nullptr || td == nullptr || td->vec_dot == nullptr) {
-        err = "native experts: ggml-cpu has no dot product for type " + std::to_string(tg && tg->vec_dot ? d_type : gu_type);
+    // The trellis types (Gyro, ggml types 144-146) are not in a ggml built from upstream (and an upstream ggml indexes its
+    // type table by the id, so asking it about 144 reads past the table): their geometry and activation format (Q8_0)
+    // are known here, and their rows run on tq_cpu.hpp.
+    const bool tq_g = tq_supported(gu_type), tq_u = tq_supported(up_type), tq_d = tq_supported(d_type);
+    if (tq_g != tq_u || (tq_g && up_type != gu_type)) {
+        err = "native experts: a trellis gate with an up of another type";
         return false;
     }
-    const ggml_type_traits_cpu* ag = traits(tg->vec_dot_type);
-    const ggml_type_traits_cpu* ad = traits(td->vec_dot_type);
+    const ggml_type_traits_cpu* tu = tq_u ? nullptr : traits(up_type);
+    const ggml_type_traits_cpu* tg = tq_g ? nullptr : traits(gu_type);
+    const ggml_type_traits_cpu* td = tq_d ? nullptr : traits(d_type);
+    if ((!tq_g && (tg == nullptr || tg->vec_dot == nullptr)) || (!tq_d && (td == nullptr || td->vec_dot == nullptr))) {
+        err = "native experts: ggml-cpu has no dot product for type " +
+              std::to_string(!tq_g && !(tg && tg->vec_dot) ? gu_type : d_type);
+        return false;
+    }
+    const ggml_type vdt_g = tq_g ? GGML_TYPE_Q8_0 : tg->vec_dot_type;
+    const ggml_type vdt_d = tq_d ? GGML_TYPE_Q8_0 : td->vec_dot_type;
+    const ggml_type_traits_cpu* ag = traits(vdt_g);
+    const ggml_type_traits_cpu* ad = traits(vdt_d);
     if (ag == nullptr || ag->from_float == nullptr || ad == nullptr || ad->from_float == nullptr) {
         err = "native experts: ggml-cpu cannot quantize an activation for this layer";
         return false;
     }
-    if (tu == nullptr || tu->vec_dot == nullptr || tu->vec_dot_type != tg->vec_dot_type) {
+    if (!tq_u && (tu == nullptr || tu->vec_dot == nullptr || tu->vec_dot_type != vdt_g)) {
         err = "native experts: gate and up of types that read different activations";
         return false;
     }
-    if (n_embd % ggml_blck_size((ggml_type) gu_type) || n_embd % ggml_blck_size((ggml_type) up_type) ||
-        n_ff % ggml_blck_size((ggml_type) d_type) ||
-        n_embd % ggml_blck_size(tg->vec_dot_type) || n_ff % ggml_blck_size(td->vec_dot_type)) {
+    const int64_t blk_g = tq_g ? kTqBlock : ggml_blck_size((ggml_type) gu_type);
+    const int64_t blk_u = tq_u ? kTqBlock : ggml_blck_size((ggml_type) up_type);
+    const int64_t blk_d = tq_d ? kTqBlock : ggml_blck_size((ggml_type) d_type);
+    if (n_embd % blk_g || n_embd % blk_u || n_ff % blk_d || n_embd % ggml_blck_size(vdt_g) ||
+        n_ff % ggml_blck_size(vdt_d) || (tq_g && n_embd > kTqMaxN) || (tq_d && n_ff > kTqMaxN)) {
         err = "native experts: expert geometry is not whole blocks";
         return false;
     }
     f.gu_type = gu_type;
     f.d_type = d_type;
-    f.gu_act = (int) tg->vec_dot_type;
-    f.d_act = (int) td->vec_dot_type;
+    f.gu_act = (int) vdt_g;
+    f.d_act = (int) vdt_d;
     f.n_embd = n_embd;
     f.n_ff = n_ff;
     f.up_type = up_type;
-    f.gu_row = ggml_row_size((ggml_type) gu_type, n_embd);
-    f.up_row = ggml_row_size((ggml_type) up_type, n_embd);
-    f.d_row = ggml_row_size((ggml_type) d_type, n_ff);
+    f.gu_row = native_row_bytes(gu_type, n_embd);
+    f.up_row = native_row_bytes(up_type, n_embd);
+    f.d_row = native_row_bytes(d_type, n_ff);
     f.up_off = f.gu_row * (size_t) n_ff;
     f.down_off = f.up_off + f.up_row * (size_t) n_ff;
     f.bytes = f.down_off + f.d_row * (size_t) n_embd;
-    f.act_bytes = gu_type == 42 ? sizeof(ActQ) : ggml_row_size(tg->vec_dot_type, n_embd);
+    f.act_bytes = gu_type == 42 ? sizeof(ActQ) : ggml_row_size(vdt_g, n_embd);
     if (gu_type == 42 && n_embd > H) {
         err = "native experts: a Q2_0 layer wider than the ActQ";
         return false;
     }
-    f.h_bytes = ggml_row_size(td->vec_dot_type, n_ff);
+    f.h_bytes = ggml_row_size(vdt_d, n_ff);
     if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes || n_ff > kNativeMaxFF) {
         err = "native experts: activation larger than the pool's buffers";
         return false;
@@ -127,6 +152,12 @@ static_assert(sizeof(ActQ) <= sizeof(NativeAct) && alignof(ActQ) <= alignof(Nati
               "a Q2_0 layer's ActQ is kept in a NativeAct");
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    if (f.had_gu) {   // Hadamard-folded gate/up: quantize H (s * x), never x itself (hadamard.hpp)
+        thread_local std::vector<float> tmp;
+        tmp.assign(x, x + f.n_embd);
+        hadamard_rotate(tmp.data(), (int) f.n_embd, f.had_block, f.gu_signs);
+        x = tmp.data();
+    }
     if (canon_layer(f)) {   // a Q2_0 gate/up's values in the order its rows decode their codes
         canon_quant(x, f.n_embd, 256, dst, f.gu_type == 42 ? CanonOrder::q2_planes : CanonOrder::plain);
         return;
@@ -138,6 +169,12 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
+    if (f.had_d) {
+        thread_local std::vector<float> tmp;
+        tmp.assign(h, h + f.n_ff);
+        hadamard_rotate(tmp.data(), (int) f.n_ff, f.had_block, f.d_signs);
+        h = tmp.data();
+    }
     if (canon_layer(f)) {
         canon_quant(h, f.n_ff, 32, dst, f.d_type == 42 ? CanonOrder::q2_planes : CanonOrder::iq4nl_calls);
         return;
@@ -212,6 +249,14 @@ void part_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
     if (canon_layer(f)) { canon_gu_rows(f, blob, act, nt, ff, r0, r1); return; }
+    // The trellis types (TQ2_T / TQK6 / TQK7): Strata's own kernels (tq_cpu.hpp), for every group size - they decode
+    // each block once for the group and give the same bits at any group size
+    if (tq_rows_own(f.gu_type)) {
+        for (int t0 = 0; t0 < nt; t0 += kTqMaxTokens)
+            tq_gu_rows(tq_isa(), f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act + t0,
+                       nt - t0 < kTqMaxTokens ? nt - t0 : kTqMaxTokens, ff + t0, r0, r1);
+        return;
+    }
     if (f.gu_type == 42) {   // Q2_0: Strata's GGUF-layout kernels on the ActQ native_quant_act wrote
         thread_local float ub[MAXT][kNativeMaxFF];
         float* up[MAXT] = {};
@@ -282,6 +327,12 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
     if (canon_layer(f)) { canon_down_rows(f, blob, hq, nt, out, r0, r1); return; }
+    if (tq_rows_own(f.d_type)) {   // the trellis types, as in native_gu_rows
+        for (int t0 = 0; t0 < nt; t0 += kTqMaxTokens)
+            tq_rows(tq_isa(), f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq + t0,
+                    nt - t0 < kTqMaxTokens ? nt - t0 : kTqMaxTokens, out + t0, r0, r1);
+        return;
+    }
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.  From one
     // token on as the gate/up rows (#152): 0.062 / 0.065 ms a row set against ggml-cpu (i7-14700, one thread).

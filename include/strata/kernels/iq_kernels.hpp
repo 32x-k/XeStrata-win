@@ -2,8 +2,9 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/kernels/iq_kernels.hpp - the i-quant formats (IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
-// IQ4_NL) and Q2_0 on the GPU for the IQ2_XS / IQ3_XXS model files, and Q4_K / Q5_K / Q5_1 / Q8_0 for Unsloth's
-// UD-Q4_K_XL (gate/up Q4_K or Q5_K, down Q5_1 or Q8_0, a Q8_0 embedding).
+// IQ4_NL) and Q2_0 on the GPU for the IQ2_XS / IQ3_XXS model files, Q4_K / Q5_K / Q5_1 / Q8_0 for Unsloth's
+// UD-Q4_K_XL (gate/up Q4_K or Q5_K, down Q5_1 or Q8_0, a Q8_0 embedding), and the trellis types TQ2_T / TQK6 / TQK7
+// of agentionai's Gyro files (ggml 144-146 of the agentionai llama.cpp fork, third_party/main/ggml-tq).
 //
 // The block layouts, codebook grids and dot products are llama.cpp's (ggml-common.h, ggml-cuda/vecdotq.cuh,
 // ggml-cuda/dequantize.cuh; MIT, see third_party/main/ggml/LICENSE and VERSION.txt), so a weight means exactly what it
@@ -72,12 +73,25 @@ struct NativeExpertLayout {
     size_t up_row = 0;                  // bytes per up row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob
+    // prism.hadamard (Gyro): the down weights are Hadamard-folded, so native_expert_grouped rotates h before
+    // quantizing it (hadamard_rows).  had_block 0 = none; d_signs is a DEVICE vector of n_ff signs or nullptr.
+    int had_block = 0;
+    const float* d_signs = nullptr;
 };
 /// Whether `native_expert_grouped` has kernels for this gate/up and down type pair at these dimensions, and the
 /// prompt path's dequantizer takes both (checked for every layer at startup, before anything is allocated).
 /// `up_type` (-1: the gate's): the up rows' type where it differs.
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type = -1) noexcept;
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type = -1);
+
+/// prism.hadamard (Gyro, upstream fbf045eb): y = H_block (signs * x) per block of `block` values of each of `rows`
+/// rows of `width` (x == y allowed).  `signs`: a device vector of `width` signs, or nullptr (identity).  The same floats
+/// as the CPU's hadamard_rotate (cpu/hadamard.hpp).  The f16 form rotates in place, computing in float.
+void hadamard_rows(const float* x, float* y, int64_t rows, int64_t width, int block, const float* signs, void* stream);
+void hadamard_rows_f16(uint16_t* x, int64_t rows, int64_t width, int block, const float* signs, void* stream);
+/// A copy on this thread's current device of the host sign vector `host` of `width` signs, made on first use and kept
+/// for the process.  Call it at setup, not while a graph is recorded.  nullptr for a nullptr `host`.
+const float* hadamard_device_signs(const float* host, int width);
 
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);

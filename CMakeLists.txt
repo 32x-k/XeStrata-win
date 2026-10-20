@@ -389,8 +389,9 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp src/kernels/xe/prompt_attn.cpp
                                     src/kernels/xe/matrix_report.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_ngram)
-  # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/main/ggml)
-  target_include_directories(strata_kernels PRIVATE third_party/main/ggml)
+  # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/main/ggml),
+  # and the trellis formats' (third_party/main/ggml-tq)
+  target_include_directories(strata_kernels PRIVATE third_party/main/ggml third_party/main/ggml-tq)
   # Packed embeddings require separate multiply/add rounding; parity also checks signed zero.
   target_compile_options(strata_kernels PRIVATE -fno-fast-math -ffp-contract=off)
 
@@ -836,7 +837,7 @@ if(STRATA_BUILD_TESTS)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
+            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/hadamard.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -910,10 +911,16 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
+  # the trellis expert rows of agentionai's Gyro files (TQ2_T, TQK6, TQK7; upstream d0a02fe4, eca3aef3): tq_cpu.cpp
+  # for any x86-64, tq_avx2.cpp and tq_avx512.cpp with their ISA's flags, taken at run time (tq_isa)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
-                                           src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/canon_expert.cpp)
-  target_include_directories(strata_kernels_cpu PRIVATE third_party/main/ggml)
-  set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${STRATA_AVX512_FLAGS}")
+                                           src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/canon_expert.cpp
+                                           src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp
+                                           src/kernels/cpu/tq_avx512.cpp)
+  target_include_directories(strata_kernels_cpu PRIVATE third_party/main/ggml third_party/main/ggml-tq)
+  set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS
+                              "${STRATA_AVX512_FLAGS}")
+  set_source_files_properties(src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   set_source_files_properties(src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/canon_expert.cpp
                               PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
@@ -946,10 +953,16 @@ if(STRATA_NATIVE_EXPERTS)
   if(STRATA_ENABLE_XE AND STRATA_BUILD_TESTS)
     # one native expert three ways on real GGUF rows (float reference, CPU, GPU): needs shard 1, not in CTest
     add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
-    target_include_directories(native_expert_parity PRIVATE third_party/main/ggml)
+    target_include_directories(native_expert_parity PRIVATE third_party/main/ggml third_party/main/ggml-tq)
     target_link_libraries(native_expert_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact)
     # the BF16 token embedding (--embd-gguf) gathered and dequantized bit for bit: synthetic, so in CTest
     add_test(NAME native_expert_parity_bf16_embd COMMAND native_expert_parity --bf16-embd)
+    # the trellis types of the Gyro files (Gyro-S tqk6/tqk7, Gyro-M tq2_t), plain and Hadamard-folded: synthetic
+    foreach(_pair tqk6/tqk7 tq2_t/tq2_t)
+      string(REPLACE "/" "_" _name "${_pair}")
+      add_test(NAME native_expert_parity_${_name} COMMAND native_expert_parity --synthetic-tq ${_pair})
+      add_test(NAME native_expert_parity_hadamard_${_name} COMMAND native_expert_parity --synthetic-tq ${_pair} --hadamard)
+    endforeach()
     # UD-Q4_K_XL's expert pairs (and Q8_0 alone) and OrcaRouter Q4_K_S's q4_K/q5_0 on synthetic ggml-quantized
     # weights at 2560/640 (upstream efeffd8, d652cd6): GPU and CPU experts against the float reference, GPU
     # dequantizers against to_float

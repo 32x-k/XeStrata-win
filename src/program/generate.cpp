@@ -38,6 +38,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -3113,6 +3114,11 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        // Gyro (prism.hadamard) packs: every expert path rotates its activations (the CPU pool: native_quant_act / _h;
+        // the GPU's verify window, the helper GPUs, the prompt's FP16 path: hadamard_rows; upstream fbf045eb, 294c95eb)
+        if (strata::kernels::cpu::hadamard_spec().any())
+            std::fprintf(stderr, "strata generate: Hadamard-folded experts (hadamard.txt, block %d)\n",
+                         strata::kernels::cpu::hadamard_spec().block);
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
     if (o.expert_cache_remote[0] > 0) {

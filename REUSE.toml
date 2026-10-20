@@ -52,6 +52,11 @@ SPDX-FileCopyrightText = "2023-2026 The ggml authors"
 SPDX-License-Identifier = "MIT"
 
 [[annotations]]
+path = ["third_party/main/ggml-tq/**"]
+SPDX-FileCopyrightText = ["2023-2026 The ggml authors", "2026 Niko1221 and the Strata contributors"]
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
 path = ["third_party/main/oneMath/LICENSE"]
 SPDX-FileCopyrightText = "The oneMath contributors"
 SPDX-License-Identifier = "Apache-2.0"

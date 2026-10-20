@@ -42,6 +42,12 @@ struct NativeFmt {
     size_t up_off = 0, down_off = 0;    ///< inside the blob
     size_t bytes = 0;                   ///< the whole blob
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, or the ActQ; n_ff of d_act)
+    /// prism.hadamard (hadamard.hpp): the experts of this layer are stored in a rotated basis, and
+    /// native_quant_act / native_quant_h apply y = H_block (signs * x) before quantizing.  had_block 0 = none.
+    int had_block = 0;
+    bool had_gu = false, had_d = false;
+    const float* gu_signs = nullptr;    ///< n_embd signs for x (nullptr: identity)
+    const float* d_signs = nullptr;     ///< n_ff signs for h (nullptr: identity)
 };
 
 /// Whether the layer's gate and up rows are of different types (a NativeFmt filled by native_fmt; one built another
@@ -63,9 +69,9 @@ size_t native_row_bytes(int type, int64_t n);
 
 /// x (n_embd floats) -> the gate/up activation the layer's rows read (act_bytes): a Q2_0 layer's is Strata's ActQ,
 /// any other layer's its vec_dot_type.  Every caller gets the right one from here, so none chooses by type.  `dst` is
-/// a NativeAct's bytes, or kNativeActBytes as aligned.
+/// a NativeAct's bytes, or kNativeActBytes as aligned.  Rotated first when the layer is Hadamard-folded.
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
-/// h (n_ff floats) -> the down activation (h_bytes).
+/// h (n_ff floats) -> the down activation (h_bytes), rotated first when the layer is Hadamard-folded.
 void native_quant_h(const NativeFmt& f, const float* h, void* dst);
 
 /// From how many tokens native_gu_rows gives this gate/up type to a multi-token kernel (#152; ggml-cpu's per-token dot
