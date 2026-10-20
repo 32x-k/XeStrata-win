@@ -6,11 +6,11 @@
 // shared expert), a window's grouped experts (bit for bit the token path's), the prompt path's expert sets and the CPU
 // lane's rows; and the KV caches' packed rows (ds4_kernels.cu) against the BF16 rows bit for bit.  Needs a GPU, no
 // model.  ds4_gguf_test [n_embd n_ff] | --kv (the caches alone)
-#include "../src/ds4/ds4_gguf.cuh"
-#include "../src/ds4/ds4_gguf_cpu.hpp"
-#include "../src/ds4/ds4_iq.cuh"
-#include "../src/ds4/ds4_kernels.cuh"
-#include "../src/ds4/ds4_q6k.cuh"
+#include "../../src/dsv41/ds4_gguf.cuh"
+#include "../../src/dsv41/ds4_gguf_cpu.hpp"
+#include "../../src/dsv41/ds4_iq.cuh"
+#include "../../src/dsv41/ds4_kernels.cuh"
+#include "../../src/dsv41/ds4_q6k.cuh"
 
 #include "ggml.h"   // (the low-bit types' reference values: ggml's own dequantize_row_*)
 
