@@ -8,6 +8,7 @@ Modes (all from the ORIGINAL Qwen weights, rotated into the file's basis with th
   q8     Q8_0 (types 8/8): the near-lossless reference for the swapped layers
   plain  TQK6 gate/up + TQK7 down, plain-MSE trellis encode (tools/tqenc.py)
   diag   the same with per-input-column importance weights h = E[x^2]^power from the calibration dump (STRATA_ACT_DUMP)
+  ldl    the same with block feedback from the full second-moment matrix of the dump (STRATA_ACT_DUMP_COV=1), blockldl.py
 
   python3 tools/trellis/build_swap.py --gguf SHIPPED --pack PACK --orig DIR --layers 4,16,28,40 --mode plain --var DIR [--gpu]
 """
@@ -25,6 +26,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 import gguf_reader  # noqa: E402
+import blockldl  # noqa: E402
 import tqenc  # noqa: E402
 
 N_EXP, N_EMBD, N_FF = 512, 2560, 640
@@ -62,13 +64,24 @@ def load_h(dump_dir, layer, kind, power):
     return (h / h.mean()).astype(np.float32), int(count)
 
 
+def load_hessian(dump_dir, layer, kind):
+    p = pathlib.Path(dump_dir) / ("act_L%d_%s.bin" % (layer, kind))
+    raw = p.read_bytes()
+    n, count = np.frombuffer(raw[:16], dtype=np.int64)
+    n = int(n)
+    if len(raw) < 16 + 8 * n + 8 * n * n:
+        raise SystemExit("%s has no covariance (run the calibration with STRATA_ACT_DUMP_COV=1)" % p)
+    cov = np.frombuffer(raw[16 + 8 * n:16 + 8 * n + 8 * n * n], dtype=np.float64).reshape(n, n)
+    return cov / max(int(count), 1)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True)
     ap.add_argument("--pack", required=True)
     ap.add_argument("--orig", required=True)
     ap.add_argument("--layers", required=True)
-    ap.add_argument("--mode", required=True, choices=["q8", "plain", "diag"])
+    ap.add_argument("--mode", required=True, choices=["q8", "plain", "diag", "ldl"])
     ap.add_argument("--var", required=True)
     ap.add_argument("--dump-dir", default=None)
     ap.add_argument("--power", type=float, default=1.0)
@@ -77,6 +90,7 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=2)
     ap.add_argument("--ncand", type=int, default=2)
     ap.add_argument("--chunk", type=int, default=16)
+    ap.add_argument("--damp", type=float, default=0.01, help="ldl: damping, a fraction of the mean diagonal of H")
     a = ap.parse_args()
     layers = [int(x) for x in a.layers.split(",")]
     var = pathlib.Path(a.var)
@@ -126,6 +140,10 @@ def main() -> int:
         gu_raw = np.memmap(pathlib.Path(a.orig) / ("L%d_gate_up.bf16" % l), dtype=np.uint16, mode="r").reshape(N_EXP, 2 * N_FF, N_EMBD)
         dn_raw = np.memmap(pathlib.Path(a.orig) / ("L%d_down.bf16" % l), dtype=np.uint16, mode="r").reshape(N_EXP, N_EMBD, N_FF)
         h_gu = h_dn = None
+        fb_gu = fb_dn = None
+        if a.mode == "ldl":
+            fb_gu = blockldl.feedback_matrices(blockldl.hessian_factor(load_hessian(a.dump_dir, l, "gu"), a.damp))
+            fb_dn = blockldl.feedback_matrices(blockldl.hessian_factor(load_hessian(a.dump_dir, l, "dn"), a.damp))
         if a.mode == "diag":
             h_gu, c1 = load_h(a.dump_dir, l, "gu", a.power)
             h_dn, c2 = load_h(a.dump_dir, l, "dn", a.power)
@@ -139,12 +157,27 @@ def main() -> int:
             mats = {"gate": (gu[:, :N_FF], signs[N_EMBD], h_gu, row_gu, N_FF, t_gate, gu_t),
                     "up": (gu[:, N_FF:], signs[N_EMBD], h_gu, row_gu, N_FF, t_gate, gu_t),
                     "down": (dn, signs[N_FF], h_dn, row_d, N_EMBD, t_down, d_t)}
+            ldl_done = {}
+            if a.mode == "ldl":
+                # gate and up share H: one batch of rows
+                both = np.concatenate([tqenc.rotate(np.ascontiguousarray(gu[:, :N_FF]), signs[N_EMBD]).reshape(-1, N_EMBD),
+                                       tqenc.rotate(np.ascontiguousarray(gu[:, N_FF:]), signs[N_EMBD]).reshape(-1, N_EMBD)])
+                pk, dec = blockldl.encode_ldl(both, gu_t, fb_gu, gpu=a.gpu, iters=a.iters, ncand=a.ncand, threads=a.threads)
+                half = pk.shape[0] // 2
+                ldl_done["gate"] = (pk[:half].reshape(half, -1), dec[:half])
+                ldl_done["up"] = (pk[half:].reshape(half, -1), dec[half:])
+                wrd = tqenc.rotate(np.ascontiguousarray(dn), signs[N_FF]).reshape(-1, N_FF)
+                pk, dec = blockldl.encode_ldl(wrd, d_t, fb_dn, gpu=a.gpu, iters=a.iters, ncand=a.ncand, threads=a.threads)
+                ldl_done["down"] = (pk.reshape(pk.shape[0], -1), dec)
             for role, (w, sg, h, row, n_out, tb, ty) in mats.items():
                 wr = tqenc.rotate(np.ascontiguousarray(w), sg)           # [chunk, n_out, n_in]
                 n_in = wr.shape[-1]
                 if a.mode == "q8":
                     data = q8_0_quantize(wr)
                     dec = None
+                elif a.mode == "ldl":
+                    data, dec = ldl_done[role]
+                    err_sum[role] += float(np.sum((wr.reshape(-1, n_in).astype(np.float64) - dec) ** 2))
                 else:
                     packed, tot = enc(wr.reshape(-1, n_in), ty, h if a.mode == "diag" else None)
                     data = packed
