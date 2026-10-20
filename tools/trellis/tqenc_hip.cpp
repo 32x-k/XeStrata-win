@@ -44,6 +44,23 @@ __device__ __forceinline__ uint16_t f2h(float f) { return __half_as_ushort(__flo
 // weight index of component j at processing position p (TQK)
 __device__ __forceinline__ int widx_d(int p, int j) { return 4 * (31 - p) + j; }
 
+// the computed codebook of TQK5X / TQK4X (src/kernels/cpu/tq_computed.hpp): four fp16 from two LCG words, no table
+__device__ __forceinline__ void comp_vals(uint32_t s, float* w) {
+    const uint32_t r0 = ((s * 89226354u + 64248484u) & 0x8FFF8FFFu) ^ 0x3B603B60u;
+    const uint32_t r1 = ((s * 0x9E3779B1u + 0x7F4A7C15u) & 0x8FFF8FFFu) ^ 0x3B603B60u;
+    w[0] = h2f((uint16_t) (r0 & 0xffffu));
+    w[1] = h2f((uint16_t) (r0 >> 16));
+    w[2] = h2f((uint16_t) (r1 & 0xffffu));
+    w[3] = h2f((uint16_t) (r1 >> 16));
+}
+
+__device__ __forceinline__ float comp_cost(uint32_t s, const float* t, const float* h) {
+    float w[4];
+    comp_vals(s, w);
+    const float e0 = t[0] - w[0], e1 = t[1] - w[1], e2 = t[2] - w[2], e3 = t[3] - w[3];
+    return h[0] * e0 * e0 + h[1] * e1 * e1 + h[2] * e2 * e2 + h[3] * e3 * e3;
+}
+
 struct Pass {
     const float* w;
     const float* h;            // null: ones
@@ -59,7 +76,7 @@ struct Pass {
     int* c_out;                // free: junction group [nb]
 };
 
-template <int K, int SL>
+template <int K, int SL, bool COMP>
 __global__ void __launch_bounds__(32768 >> SL) pass_kernel(Pass P) {
     constexpr int SPT = 1 << SL;          // states per thread
     constexpr int NT = 32768 >> SL;       // threads per workgroup
@@ -101,6 +118,7 @@ __global__ void __launch_bounds__(32768 >> SL) pass_kernel(Pass P) {
         float D[SPT];
         // tables of step q into parity q & 1
         auto build = [&](int q) {
+            if constexpr (COMP) return;
             const int p = (P.rot + q) & 31;
             const float t0 = Tt[p][0], t1 = Tt[p][1], t2 = Tt[p][2], t3 = Tt[p][3];
             const float h0 = Hh[p][0], h1 = Hh[p][1], h2 = Hh[p][2], h3 = Hh[p][3];
@@ -113,12 +131,21 @@ __global__ void __launch_bounds__(32768 >> SL) pass_kernel(Pass P) {
         };
         build(0);
         __syncthreads();
+        {
+            float tc[4], hc[4];
+            if constexpr (COMP) {
+                const int p0 = P.rot & 31;
+                for (int i = 0; i < 4; ++i) { tc[i] = Tt[p0][i]; hc[i] = Hh[p0][i]; }
+            }
 #pragma unroll
-        for (int j = 0; j < SPT; ++j) {
-            const uint32_t x = x0 + (uint32_t) j * kC;
-            float v = tab[0][0][x >> 21] + tab[0][1][(x >> 10) & 2047u];
-            if (fc >= 0 && (((SPT * tid + j) & (G - 1)) != fc)) v = kInf;
-            D[j] = v;
+            for (int j = 0; j < SPT; ++j) {
+                const uint32_t x = x0 + (uint32_t) j * kC;
+                float v;
+                if constexpr (COMP) v = comp_cost((uint32_t) (SPT * tid + j), tc, hc);
+                else v = tab[0][0][x >> 21] + tab[0][1][(x >> 10) & 2047u];
+                if (fc >= 0 && (((SPT * tid + j) & (G - 1)) != fc)) v = kInf;
+                D[j] = v;
+            }
         }
         for (int q = 1; q < 32; ++q) {
             const int par = q & 1;
@@ -167,15 +194,28 @@ __global__ void __launch_bounds__(32768 >> SL) pass_kernel(Pass P) {
             // and 128 live registers spill): an empty asm makes x0 "new" every step
             uint32_t x0s = x0;
             asm volatile("" : "+v"(x0s));
+            float tc[4], hc[4];
+            if constexpr (COMP) {
+                const int pq = (P.rot + q) & 31;
+                for (int i = 0; i < 4; ++i) { tc[i] = Tt[pq][i]; hc[i] = Hh[pq][i]; }
+            }
 #pragma unroll
             for (int j4 = 0; j4 < SPT / 4; ++j4) {
                 const float4 mm = m4[j4];
                 const uint32_t xa = x0s + (uint32_t) (4 * j4) * kC;
                 const uint32_t xb = xa + kC, xc = xb + kC, xd = xc + kC;
-                D[4 * j4 + 0] = mm.x + tab[par][0][xa >> 21] + tab[par][1][(xa >> 10) & 2047u];
-                D[4 * j4 + 1] = mm.y + tab[par][0][xb >> 21] + tab[par][1][(xb >> 10) & 2047u];
-                D[4 * j4 + 2] = mm.z + tab[par][0][xc >> 21] + tab[par][1][(xc >> 10) & 2047u];
-                D[4 * j4 + 3] = mm.w + tab[par][0][xd >> 21] + tab[par][1][(xd >> 10) & 2047u];
+                if constexpr (COMP) {
+                    const uint32_t sa = (uint32_t) (SPT * tid + 4 * j4);
+                    D[4 * j4 + 0] = mm.x + comp_cost(sa, tc, hc);
+                    D[4 * j4 + 1] = mm.y + comp_cost(sa + 1, tc, hc);
+                    D[4 * j4 + 2] = mm.z + comp_cost(sa + 2, tc, hc);
+                    D[4 * j4 + 3] = mm.w + comp_cost(sa + 3, tc, hc);
+                } else {
+                    D[4 * j4 + 0] = mm.x + tab[par][0][xa >> 21] + tab[par][1][(xa >> 10) & 2047u];
+                    D[4 * j4 + 1] = mm.y + tab[par][0][xb >> 21] + tab[par][1][(xb >> 10) & 2047u];
+                    D[4 * j4 + 2] = mm.z + tab[par][0][xc >> 21] + tab[par][1][(xc >> 10) & 2047u];
+                    D[4 * j4 + 3] = mm.w + tab[par][0][xd >> 21] + tab[par][1][(xd >> 10) & 2047u];
+                }
                 if ((j4 & 3) == 3) __builtin_amdgcn_sched_barrier(0);   // 16 states at a time: do not batch all the gathers
             }
         }
@@ -225,14 +265,15 @@ __global__ void __launch_bounds__(32768 >> SL) pass_kernel(Pass P) {
 
 // ------------------------------------------------------------------------------------------------ per-block stages
 
-__device__ __forceinline__ void state_cb(const float2* lutq, uint32_t s, float* c) {
+__device__ __forceinline__ void state_cb(const float2* lutq, int comp, uint32_t s, float* c) {
+    if (comp) { comp_vals(s, c); return; }
     const uint32_t x = s * 0x9e3779b1u;
     const float2 a = lutq[x >> 21], b = lutq[(x >> 10) & 2047u];
     c[0] = a.x; c[1] = a.y; c[2] = b.x; c[3] = b.y;
 }
 
 __global__ void init_kernel(const float* w, const float* h, int64_t nb, uint16_t* dcur, uint8_t* active, uint8_t* status,
-                            double* sumhw2, double mult, int first, uint16_t fixed_scale) {
+                            double* sumhw2, double mult, int first, uint16_t fixed_scale, double cb_rms) {
     const int64_t b = blockIdx.x * (int64_t) blockDim.x + threadIdx.x;
     if (b >= nb) return;
     double s2 = 0, sh2 = 0, amax = 0;
@@ -251,7 +292,7 @@ __global__ void init_kernel(const float* w, const float* h, int64_t nb, uint16_t
     }
     if (status[b] != 0) { active[b] = 0; return; }
     const double rms = sqrt(s2 / 128.0);
-    double dd = rms / 1.072 * mult;
+    double dd = rms / cb_rms * mult;
     uint16_t dh = f2h((float) fmin(dd, 65504.0));
     if (dh == 0) dh = 1;
     if (fixed_scale) dh = fixed_scale;
@@ -260,12 +301,12 @@ __global__ void init_kernel(const float* w, const float* h, int64_t nb, uint16_t
 }
 
 // error of (states by position st, fp16 scale dh)
-__device__ double fit_d(const float* w, const float* h, int64_t b, const uint16_t* st, uint16_t dh, const float2* lutq) {
+__device__ double fit_d(const float* w, const float* h, int64_t b, const uint16_t* st, uint16_t dh, const float2* lutq, int comp) {
     const float d = h2f(dh);
     double e = 0;
     for (int p = 0; p < 32; ++p) {
         float c[4];
-        state_cb(lutq, st[p], c);
+        state_cb(lutq, comp, st[p], c);
         for (int j = 0; j < 4; ++j) {
             const int wi = widx_d(p, j);
             const float rec = d * c[j];
@@ -279,7 +320,7 @@ __device__ double fit_d(const float* w, const float* h, int64_t b, const uint16_
 // pick the best candidate, then the scale refinement step of encode_block
 __global__ void refine_kernel(const float* w, const float* h, int64_t nb, int nc, const uint16_t* st_c, const float* cost_c,
                               uint16_t* dcur, uint8_t* active, uint16_t* best_d, double* best_err, uint16_t* best_st,
-                              const float2* lutq, int fixed_scale) {
+                              const float2* lutq, int fixed_scale, int comp) {
     const int64_t b = blockIdx.x * (int64_t) blockDim.x + threadIdx.x;
     if (b >= nb || !active[b]) return;
     int bc = -1;
@@ -292,7 +333,7 @@ __global__ void refine_kernel(const float* w, const float* h, int64_t nb, int nc
     uint16_t st[32];
     for (int p = 0; p < 32; ++p) st[p] = st_c[((int64_t) bc * nb + b) * 32 + p];
     const uint16_t dh = dcur[b];
-    const double e = fit_d(w, h, b, st, dh, lutq);
+    const double e = fit_d(w, h, b, st, dh, lutq, comp);
     if (e < best_err[b]) {
         best_err[b] = e;
         best_d[b] = dh;
@@ -302,7 +343,7 @@ __global__ void refine_kernel(const float* w, const float* h, int64_t nb, int nc
     double num = 0, den = 0;
     for (int p = 0; p < 32; ++p) {
         float c[4];
-        state_cb(lutq, st[p], c);
+        state_cb(lutq, comp, st[p], c);
         for (int j = 0; j < 4; ++j) {
             const int wi = widx_d(p, j);
             const double hi = h ? (double) h[b * 128 + wi] : 1.0, cc = c[j];
@@ -313,7 +354,7 @@ __global__ void refine_kernel(const float* w, const float* h, int64_t nb, int nc
     if (den <= 0 || num <= 0) { active[b] = 0; return; }
     const uint16_t nh = f2h((float) fmin(num / den, 65504.0));
     if (nh == 0 || nh == dh) { active[b] = 0; return; }
-    const double en = fit_d(w, h, b, st, nh, lutq);
+    const double en = fit_d(w, h, b, st, nh, lutq, comp);
     if (en < best_err[b]) {
         best_err[b] = en;
         best_d[b] = nh;
@@ -359,17 +400,22 @@ __global__ void init_best_kernel(int64_t nb, double* best_err, uint8_t* have) {
     best_err[b] = 1e300;
 }
 
-template <int K>
+template <int K, bool COMP>
 void launch_pass(const Pass& P, int grid) {
-    hipLaunchKernelGGL((pass_kernel<K, kSL>), dim3(grid), dim3(NT), 0, 0, P);
+    hipLaunchKernelGGL((pass_kernel<K, kSL, COMP>), dim3(grid), dim3(NT), 0, 0, P);
 }
 
-void launch_pass_k(int K, const Pass& P, int grid) {
+void launch_pass_k(int K, bool comp, const Pass& P, int grid) {
+    if (comp) {   // TQK5X / TQK4X
+        if (K == 4) launch_pass<4, true>(P, grid);
+        else launch_pass<5, true>(P, grid);
+        return;
+    }
     switch (K) {
-        case 4: launch_pass<4>(P, grid); break;
-        case 5: launch_pass<5>(P, grid); break;
-        case 6: launch_pass<6>(P, grid); break;
-        default: launch_pass<7>(P, grid); break;
+        case 4: launch_pass<4, false>(P, grid); break;
+        case 5: launch_pass<5, false>(P, grid); break;
+        case 6: launch_pass<6, false>(P, grid); break;
+        default: launch_pass<7, false>(P, grid); break;
     }
 }
 
@@ -419,7 +465,9 @@ TQH_EXPORT double tqh_encode(int type, const float* w, const float* h, int64_t n
                              int scale_tries, int device, double* err_out, int64_t* stats, double* timing,
                              int fixed_scale_bits) {
     const int K = tqenc::type_kbits(type);
-    if (K < 4 || K > 7 || tqenc::type_computed(type)) return -1.0;   // the computed codebook of TQK5X / TQK4X has no 2048-point table: CPU only
+    if (K < 4 || K > 7) return -1.0;
+    const bool comp = tqenc::type_computed(type);
+    const double cb_rms = tqenc::codebook_rms(type);
     ensure_dev(device);
     const int bb = 2 + 4 * K, G = 1 << (15 - K);
     const int nc = std::max(1, std::min(ncand, 8));
@@ -457,24 +505,24 @@ TQH_EXPORT double tqh_encode(int type, const float* w, const float* h, int64_t n
         const auto t0 = std::chrono::steady_clock::now();
         for (int tr = 0; tr < tries; ++tr) {
             hipLaunchKernelGGL(init_kernel, dim3(gb), dim3(tb), 0, 0, dw, dh, nb, dcur, active, status, sumhw2, mult[tr],
-                               tr == 0 ? 1 : 0, (uint16_t) fixed_scale_bits);
+                               tr == 0 ? 1 : 0, (uint16_t) fixed_scale_bits, cb_rms);
             for (int it = 0; it <= (fixed_scale_bits ? 0 : iters); ++it) {
                 Pass P{};
                 P.w = dw; P.h = dh; P.dcur = dcur; P.active = active; P.nb = nb; P.lutq = g_dev.lutq; P.bp_scratch = bp;
                 const int grid = (int) std::min<int64_t>(nb, grid_cap);
                 for (int r = 0; r < nc; ++r) {
                     P.rot = rots[r]; P.cin = nullptr; P.c_out = c_all + (int64_t) r * nb;
-                    launch_pass_k(K, P, grid);
+                    launch_pass_k(K, comp, P, grid);
                 }
                 hipLaunchKernelGGL(dedupe_kernel, dim3(gb), dim3(tb), 0, 0, nb, nc, c_all);
                 HCHECK(hipMemset(cost_c, 0x7f, (size_t) nc * nb * sizeof(float)));   // skipped candidates cost "infinity"
                 for (int r = 0; r < nc; ++r) {
                     P.rot = 0; P.cin = c_all + (int64_t) r * nb; P.c_out = nullptr;
                     P.st_out = st_c + (int64_t) r * nb * 32; P.cost_out = cost_c + (int64_t) r * nb;
-                    launch_pass_k(K, P, grid);
+                    launch_pass_k(K, comp, P, grid);
                 }
                 hipLaunchKernelGGL(refine_kernel, dim3(gb), dim3(tb), 0, 0, dw, dh, nb, nc, st_c, cost_c, dcur, active,
-                                   best_d, best_err, best_st, g_dev.lutq, fixed_scale_bits);
+                                   best_d, best_err, best_st, g_dev.lutq, fixed_scale_bits, comp ? 1 : 0);
                 npass += 2 * nc;
                 if (std::getenv("TQH_DEBUG")) {
                     HCHECK(hipDeviceSynchronize());

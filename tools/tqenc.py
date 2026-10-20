@@ -152,8 +152,8 @@ def encode(w: np.ndarray, t: int, h: np.ndarray | None = None, iters: int = 1, n
             raise ValueError("importance weights must have the shape of w")
         hp = h.ctypes.data
     if gpu:
-        if exact or t == TQ2_T or t in COMPUTED:
-            raise ValueError("the GPU encoder has no exact search, no TQ2_T and no computed-codebook types (TQK5X / TQK4X)")
+        if exact or t == TQ2_T:
+            raise ValueError("the GPU encoder has no exact search and no TQ2_T")
         with _gpu_lock() as gl:
             if gl.ok:
                 tot = hip_lib().tqh_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, scale_tries, 0,

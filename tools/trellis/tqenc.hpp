@@ -45,6 +45,8 @@ enum Type : int {
 };
 /// Whether the type's codebook is the computed one (TQK5X, TQK4X).
 bool type_computed(int type);
+/// rms of the codebook values (the first scale guess is rms(block) / this): 1.072 for the table, 0.88 for the computed code.
+double codebook_rms(int type);
 
 /// bits per step (8, 6, 7, 5, 4), 0 for any other type.
 int type_kbits(int type);

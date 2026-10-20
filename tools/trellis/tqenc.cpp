@@ -83,6 +83,8 @@ int type_kbits(int type) {
 
 bool type_computed(int type) { return type == TQK5X || type == TQK4X; }
 
+double codebook_rms(int type);
+
 namespace {
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -390,6 +392,7 @@ const float* codebook_state(int type, uint32_t state) {
 }
 
 const int16_t* codebook_table(int type) { return cb(type_computed(type)).tab; }
+double codebook_rms(int type) { return cb(type_computed(type)).rms; }
 
 const float* point_table() {
     static float pts[4096];

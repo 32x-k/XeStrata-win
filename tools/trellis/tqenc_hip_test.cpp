@@ -18,13 +18,13 @@ using namespace tqenc;
 static int g_fail = 0;
 #define CHECK(c, ...) do { if (!(c)) { ++g_fail; std::printf("  FAIL line %d: %s  ", __LINE__, #c); std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
-static const char* tname(int t) { return t == TQK6 ? "TQK6" : t == TQK7 ? "TQK7" : t == TQK5T ? "TQK5T" : "TQK4T"; }
+static const char* tname(int t) { return t == TQK6 ? "TQK6" : t == TQK7 ? "TQK7" : t == TQK5T ? "TQK5T" : t == TQK4T ? "TQK4T" : t == TQK5X ? "TQK5X" : "TQK4X"; }
 
 int main(int argc, char** argv) {
     const long big = argc > 1 ? std::atol(argv[1]) : 131072;   // blocks for the speed runs
     std::mt19937_64 rng(77);
     std::normal_distribution<float> nd(0.f, 1.f);
-    const int types[4] = {TQK4T, TQK5T, TQK6, TQK7};
+    const int types[6] = {TQK4T, TQK5T, TQK4X, TQK5X, TQK6, TQK7};
     for (int type : types) {
         const int bb = block_bytes(type);
         std::printf("== %s\n", tname(type));
