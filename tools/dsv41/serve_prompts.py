@@ -4,7 +4,25 @@ Starts the engine in --serve mode (appended), waits for READY, sends GEN for eve
 generated ids with the llama.cpp reference's greedy ids (expect_ids), and prints one line each:
   id mode  prompt_tokens  n_gen  match_prefix/n_expect  first_divergence  prefill ms  decode tok/s
 """
-import json, subprocess, sys, time
+import json, os, subprocess, sys, time
+
+def _bytes_map():
+    bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    cs = bs[:]; n = 0
+    for b in range(256):
+        if b not in bs: bs.append(b); cs.append(256 + n); n += 1
+    return {chr(c): b for b, c in zip(bs, cs)}
+_BM = _bytes_map()
+try:
+    _VOC = {i: t for t, i in json.load(open(os.environ.get("DS_VOCAB", "/data/dsv41-port/pack/tokenizer/vocab.json"))).items()}
+except Exception:
+    _VOC = {}
+def detok(ids):
+    b = bytearray()
+    for i in ids:
+        for ch in _VOC.get(i, "?"):
+            b.append(_BM.get(ch, 63))
+    return b.decode("utf-8", "replace")
 
 prompts_path, out_path = sys.argv[1], sys.argv[2]
 cmd = sys.argv[sys.argv.index("--") + 1:] + ["--serve"]
@@ -27,7 +45,10 @@ res = []
 for pr in prompts:
     ids = pr["ids"]
     mx = min(pr["max_tokens"], max(len(pr["expect_ids"]) + 4, 8))
-    p.stdin.write("GEN %d %s\n" % (mx, ",".join(map(str, ids))))
+    if pr.get("pic"):
+        p.stdin.write("GENI %d %s %s\n" % (pr.get("max_tokens", 40), pr["pic"], ",".join(map(str, ids))))
+    else:
+        p.stdin.write("GEN %d %s\n" % (mx, ",".join(map(str, ids))))
     p.stdin.flush()
     gen, done = [], None
     while True:
@@ -40,6 +61,8 @@ for pr in prompts:
             done = line.split()
             break
     exp = pr["expect_ids"]
+    if pr.get("pic") or os.environ.get("SHOW_TEXT"):
+        print("TEXT", repr(detok(gen)), flush=True)
     n = 0
     while n < min(len(gen), len(exp)) and gen[n] == exp[n]:
         n += 1
