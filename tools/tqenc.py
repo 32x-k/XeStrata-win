@@ -14,10 +14,13 @@ import pathlib
 
 import numpy as np
 
-TQ2_T, TQK6, TQK7, TQK5X, TQK4X = 144, 145, 146, 224, 225
-TYPE_NAMES = {TQ2_T: "TQ2_T", TQK6: "TQK6", TQK7: "TQK7", TQK5X: "TQK5X", TQK4X: "TQK4X"}
+TQ2_T, TQK6, TQK7, TQK5X, TQK4X, TQK5T, TQK4T = 144, 145, 146, 224, 225, 226, 227
+# TQK5X / TQK4X: experimental version 2, the computed (LUT-free) codebook (src/kernels/cpu/tq_computed.hpp);
+# TQK5T / TQK4T: version 1, the fork's point table (what the first pilots and the Gyro-S checks used for K5 / K4)
+TYPE_NAMES = {TQ2_T: "TQ2_T", TQK6: "TQK6", TQK7: "TQK7", TQK5X: "TQK5X", TQK4X: "TQK4X", TQK5T: "TQK5T", TQK4T: "TQK4T"}
 TYPE_BY_NAME = {v: k for k, v in TYPE_NAMES.items()}
-KBITS = {TQ2_T: 8, TQK6: 6, TQK7: 7, TQK5X: 5, TQK4X: 4}
+KBITS = {TQ2_T: 8, TQK6: 6, TQK7: 7, TQK5X: 5, TQK4X: 4, TQK5T: 5, TQK4T: 4}
+COMPUTED = (TQK5X, TQK4X)
 BLOCK = 128
 
 
@@ -149,8 +152,8 @@ def encode(w: np.ndarray, t: int, h: np.ndarray | None = None, iters: int = 1, n
             raise ValueError("importance weights must have the shape of w")
         hp = h.ctypes.data
     if gpu:
-        if exact or t == TQ2_T:
-            raise ValueError("the GPU encoder has no exact search and no TQ2_T")
+        if exact or t == TQ2_T or t in COMPUTED:
+            raise ValueError("the GPU encoder has no exact search, no TQ2_T and no computed-codebook types (TQK5X / TQK4X)")
         with _gpu_lock() as gl:
             if gl.ok:
                 tot = hip_lib().tqh_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, scale_tries, 0,
@@ -235,7 +238,7 @@ def rel_mse(ref: np.ndarray, approx: np.ndarray) -> float:
 #   | u32 n_sign_bytes | sign bits (1 = +1, LSB first, one per input column) | u32 hadamard block (128) | packed blocks
 # An unknown version or type is refused before any data is read.
 TQX_MAGIC = b"TQXP"
-TQX_VERSION = 1
+TQX_VERSION = 2   # 2: types 224 / 225 are the computed codebook; a version 1 file means the point table (226 / 227)
 
 
 def write_tqx(path, t: int, rows: int, cols: int, packed: np.ndarray, signs: np.ndarray | None) -> None:
@@ -254,8 +257,10 @@ def read_tqx(path):
     if data[:4] != TQX_MAGIC:
         raise ValueError("not a TQXP file")
     ver, t, rows, cols, flags, nsb = struct.unpack_from("<IIIIII", data, 4)
-    if ver != TQX_VERSION:
-        raise ValueError("unsupported TQXP version %d (this reader handles %d)" % (ver, TQX_VERSION))
+    if ver == 1 and t in (TQK5X, TQK4X):
+        t += 2   # a version 1 file: the point table
+    elif ver != TQX_VERSION:
+        raise ValueError("unsupported TQXP version %d (this reader handles %d, and 1 for the point-table K5 / K4)" % (ver, TQX_VERSION))
     if t not in KBITS:
         raise ValueError("unknown trellis type %d" % t)
     at = 4 + 24

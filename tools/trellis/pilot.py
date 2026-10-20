@@ -29,7 +29,7 @@ import gguf_reader  # noqa: E402
 import tqenc  # noqa: E402
 
 MXFP4_LUT = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], dtype=np.float32)
-RATES = {"K4": tqenc.TQK4X, "K5": tqenc.TQK5X, "K6": tqenc.TQK6, "K7": tqenc.TQK7}
+RATES = {"K4": tqenc.TQK4X, "K5": tqenc.TQK5X, "K6": tqenc.TQK6, "K7": tqenc.TQK7, "K4t": tqenc.TQK4T, "K5t": tqenc.TQK5T}   # K4 / K5: computed codebook (v2); K4t / K5t: point table (v1)
 CFGS = {
     "fast": dict(iters=0, ncand=1, scale_tries=1),
     "default": dict(iters=1, ncand=1, scale_tries=1),

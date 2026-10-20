@@ -33,7 +33,7 @@ for n in (2304, 5120):
     check(np.abs(tqenc.unrotate(Wr, s) - W).max() < 1e-5, "unrotate(rotate(W)) == W")
     Ux = tqenc.rotate(x[None, :], s)[0]
     check(np.abs(Wr @ Ux - W @ x).max() < 1e-3, "Wrot (U x) == W x before quantization")
-    for t in (tqenc.TQK4X, tqenc.TQK5X, tqenc.TQK6, tqenc.TQK7, tqenc.TQ2_T):
+    for t in (tqenc.TQK4X, tqenc.TQK5X, tqenc.TQK4T, tqenc.TQK5T, tqenc.TQK6, tqenc.TQK7, tqenc.TQ2_T):
         packed, err, tot, st = tqenc.encode(Wr, t, iters=0)
         check(packed.shape == (8 * n // 128, tqenc.block_bytes(t)), "packed shape")
         Q = tqenc.decode(packed, t).reshape(8, n)

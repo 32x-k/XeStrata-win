@@ -53,9 +53,9 @@ static int g_fail = 0, g_checks = 0;
         }                                                                                         \
     } while (0)
 
-static const int kTypes[5] = {TQ2_T, TQK6, TQK7, TQK5X, TQK4X};
+static const int kTypes[7] = {TQ2_T, TQK6, TQK7, TQK5X, TQK4X, TQK5T, TQK4T};
 static const char* tname(int t) {
-    return t == TQ2_T ? "TQ2_T" : t == TQK6 ? "TQK6" : t == TQK7 ? "TQK7" : t == TQK5X ? "TQK5X" : "TQK4X";
+    return t == TQ2_T ? "TQ2_T" : t == TQK6 ? "TQK6" : t == TQK7 ? "TQK7" : t == TQK5X ? "TQK5X" : t == TQK4X ? "TQK4X" : t == TQK5T ? "TQK5T" : "TQK4T";
 }
 
 template <int KB>
@@ -111,9 +111,33 @@ static void t1() {
 
 static void t2() {
     std::printf("T2 codebook == decoder table\n");
-    const int16_t* a = codebook_table();
-    const int16_t* b = kc::tq_state_table();
-    CHECK(std::memcmp(a, b, 32768 * 4 * sizeof(int16_t)) == 0, "tables differ");
+    for (int type : kTypes) {
+        const int16_t* a = codebook_table(type);
+        const int16_t* b = kc::tq_state_table_for(type);
+        CHECK(std::memcmp(a, b, 32768 * 4 * sizeof(int16_t)) == 0, "%s: encoder and decoder tables differ", tname(type));
+    }
+    // the computed codebook: its own definition, evaluated bit by bit here (not through tq_computed.hpp), is what both use
+    {
+        const int16_t* c = codebook_table(TQK5X);
+        int bad = 0, big = 0;
+        for (uint32_t s = 0; s < 32768; ++s)
+            for (int i = 0; i < 2; ++i) {
+                const uint32_t A[2] = {89226354u, 0x9E3779B1u}, B[2] = {64248484u, 0x7F4A7C15u};
+                const uint32_t r = ((s * A[i] + B[i]) & 0x8FFF8FFFu) ^ 0x3B603B60u;
+                for (int hw = 0; hw < 2; ++hw) {
+                    const uint16_t h = (uint16_t) (hw ? r >> 16 : r & 0xffff);
+                    const float v = half_to_float(h) * 8192.0f;
+                    bad += c[4 * s + 2 * i + hw] != (int16_t) v || v != std::floor(v);
+                    big += std::fabs(v) >= 16384.0f || std::fabs(v) < 1023.0f;
+                }
+            }
+        CHECK(bad == 0, "computed codebook differs from its definition (%d)", bad);
+        CHECK(big == 0, "computed codebook value out of [0.125, 2) (%d)", big);
+        // the distribution: rms and the share of the weights below / above one
+        double ss = 0;
+        for (int i = 0; i < 32768 * 4; ++i) ss += (double) c[i] * c[i];
+        std::printf("  computed codebook: rms %.4f (table: %.4f), all values exact integers at 2^13\n", std::sqrt(ss / (32768.0 * 4)) / 8192.0, 1.072);
+    }
 }
 
 static void t3() {
@@ -153,7 +177,7 @@ static float naive(int type, const float (*T)[4], const float (*H)[4], int rot, 
     std::vector<std::vector<float>> D(32, std::vector<float>(32768, 1e30f));
     std::vector<std::vector<int>> B(32, std::vector<int>(32768, -1));
     auto cost = [&](int p, uint32_t s) {
-        const float* c = codebook_state(s);
+        const float* c = codebook_state(type, s);
         float e = 0;
         for (int j = 0; j < 4; ++j) { const float d = T[p][j] - c[j]; e += H[p][j] * d * d; }
         return e;
@@ -232,7 +256,7 @@ static void t4() {
                 double sum = 0;
                 for (int q = 0; q < 32; ++q) {
                     const int p = (cc.rot + q) & 31;
-                    const float* c = codebook_state(sa[p]);
+                    const float* c = codebook_state(type, sa[p]);
                     for (int j = 0; j < 4; ++j) { const double d = T[p][j] - c[j]; sum += H[p][j] * d * d; }
                 }
                 CHECK(std::fabs(sum - a) < 1e-3 * std::max(1.0, (double) a), "path cost %.6f vs reported %.6f", sum, a);
@@ -359,7 +383,7 @@ static void t7() {
         const double tot = encode_blocks(type, w.data(), nullptr, (int64_t) rows * nbr, enc.data(), p, 8, errs.data(), &nf, &zb);
         (void) tot;
         // decoder reference: tq_states.hpp + the state table
-        const int16_t* tab = kc::tq_state_table();
+        const int16_t* tab = kc::tq_state_table_for(type);
         std::vector<float> ref((size_t) rows * n), ours((size_t) rows * n);
         for (int64_t b = 0; b < (int64_t) rows * nbr; ++b) {
             const uint8_t* blk = enc.data() + b * bb;

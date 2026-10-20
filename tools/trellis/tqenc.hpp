@@ -1,5 +1,5 @@
 // tools/trellis/tqenc.hpp - tail-biting Viterbi ENCODER for the trellis expert formats (TQ2_T, TQK6, TQK7 of the
-// agentionai llama.cpp fork, ggml types 144-146) and two experimental lower-rate versions (TQK5X, TQK4X).
+// agentionai llama.cpp fork, ggml types 144-146) and two experimental lower-rate versions (TQK5X, TQK4X, and the table-based TQK5T, TQK4T).
 //
 // Standalone (no ggml, no Strata engine): it only needs third_party/ggml/ggml-common-tq.h (the 2048-point codebook).
 // The decoders it must match are src/kernels/cpu/tq_states.hpp / tq_cpu.cpp (tools/trellis/tqenc_test.cpp checks
@@ -21,9 +21,11 @@
 // as predecessor.  The search fixes that group c (exact: all G values; approximate: c taken from a free Viterbi pass
 // on the cyclically rotated sequence, QTIP's approach, optionally the best of several rotations).
 //
-// New experimental types: TQK5X (id 224, 22 bytes / 128 weights, 1.375 bpw) and TQK4X (id 225, 18 bytes, 1.125 bpw):
-// the TQK rule with K = 5 / 4, nothing else changed (same hash, codebook, mask, bit order, circular stream, fp16
-// scale).  EXPERIMENTAL_VERSION = 1: not in any ggml enum, not in any GGUF reader.
+// New experimental types (EXPERIMENTAL_VERSION 2; not in any ggml enum or GGUF reader; ids away from the fork's 143-149):
+//   TQK5X (224, 22 bytes / 128 weights, 1.375 bpw) and TQK4X (225, 18 bytes, 1.125 bpw): the TQK rule with K = 5 / 4 and the
+//     COMPUTED codebook (src/kernels/cpu/tq_computed.hpp: two LCG words per state masked into four fp16, no table);
+//   TQK5T (226) and TQK4T (227): version 1, the same K = 5 / 4 layout with the fork's hashed point table (what the first
+//     pilots used).  Same bit order, circular stream, 15-bit mask and fp16 scale in all of them.
 #pragma once
 
 #include <cstddef>
@@ -33,10 +35,16 @@ namespace tqenc {
 
 inline constexpr int kBlock = 128;
 inline constexpr int kStates = 1 << 15;
-inline constexpr int kExperimentalVersion = 1;
+inline constexpr int kExperimentalVersion = 2;
 
 // ggml type ids of the fork (decoders exist) and the experimental ones (encoder + Strata CPU decoder only)
-enum Type : int { TQ2_T = 144, TQK6 = 145, TQK7 = 146, TQK5X = 224, TQK4X = 225 };
+enum Type : int {
+    TQ2_T = 144, TQK6 = 145, TQK7 = 146,    // the fork's types (hashed point table)
+    TQK5X = 224, TQK4X = 225,               // experimental version 2: K = 5 / 4 with the computed (LUT-free) codebook, tq_computed.hpp
+    TQK5T = 226, TQK4T = 227                // experimental version 1: K = 5 / 4 with the fork's point table (the first pilots)
+};
+/// Whether the type's codebook is the computed one (TQK5X, TQK4X).
+bool type_computed(int type);
 
 /// bits per step (8, 6, 7, 5, 4), 0 for any other type.
 int type_kbits(int type);
@@ -58,8 +66,8 @@ struct BlockResult {
 };
 
 /// The codebook entry of a state as the decoder sees it: four floats (int16 table / 8192, exact).
-const float* codebook_state(uint32_t state);   // 4 floats
-const int16_t* codebook_table();                // 32768 * 4 int16, the decoder's tq_state_table()
+const float* codebook_state(int type, uint32_t state);   // 4 floats
+const int16_t* codebook_table(int type);                // 32768 * 4 int16, the decoder's tq_state_table()
 /// The 2048 codebook points as the decoder sees them (x, y interleaved): round(fp16 * 8192) / 8192.  The GPU encoder
 /// uploads this table; it must be built by the host compiler (ggml-common-tq.h makes its table __device__ under hipcc).
 const float* point_table();                     // 4096 floats

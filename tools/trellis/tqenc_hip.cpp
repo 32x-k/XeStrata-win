@@ -419,7 +419,7 @@ TQH_EXPORT double tqh_encode(int type, const float* w, const float* h, int64_t n
                              int scale_tries, int device, double* err_out, int64_t* stats, double* timing,
                              int fixed_scale_bits) {
     const int K = tqenc::type_kbits(type);
-    if (K < 4 || K > 7) return -1.0;
+    if (K < 4 || K > 7 || tqenc::type_computed(type)) return -1.0;   // the computed codebook of TQK5X / TQK4X has no 2048-point table: CPU only
     ensure_dev(device);
     const int bb = 2 + 4 * K, G = 1 << (15 - K);
     const int nc = std::max(1, std::min(ncand, 8));
