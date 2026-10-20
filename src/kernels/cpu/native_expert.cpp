@@ -206,7 +206,7 @@ void act_dump_record(int layer, int kind, const float* v, int64_t n) {
             for (int64_t j = 0; j < n; ++j) row[j] += vi * v[j];
         }
     ++a.count;
-    if (++d.records % 2000 == 0) {
+    if (++d.records % (d.cov ? 400000 : 2000) == 0) {
         d.mu.unlock();
         ActDump::act_dump_flush();
         d.mu.lock();
