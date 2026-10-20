@@ -620,7 +620,7 @@ int score(strata::ds4::Model& m, const std::string& ids_path, const std::string&
             }
             a += (size_t) T;
         }
-        std::fprintf(sj, "%s{\"name\": \"%s\", \"first_line\": %lld, \"n\": %lld, \"ppl\": %.6f, \"top1\": %.6f}", si ? ", " : "",
+        std::fprintf(sj, "%s{\"name\": \"%s\", \"first_line\": %lld, \"end_line\": %lld, \"n\": %lld, \"ppl\": %.6f, \"top1\": %.6f}", si ? ", " : "",
                      segs[si].name.c_str(), first, first + cnt, cnt, std::exp(sum_nll / (double) std::max(1LL, cnt)),
                      (double) top1 / (double) std::max(1LL, cnt));
         std::fprintf(stderr, "score %s: %lld positions, ppl %.4f, top-1 %.4f (%.0f s)\n", segs[si].name.c_str(), cnt,
