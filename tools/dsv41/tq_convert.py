@@ -91,6 +91,9 @@ def main():
     gpu_lock = threading.Lock()
     for L in [int(x) for x in a.layers.split(",")]:
         path = os.path.join(a.out, "tq-L%d.bin" % L)
+        if all("layers.%d.ffn.experts.%s" % (L, r) in idx for r, _ in ROLES) and os.path.exists(path):
+            print("layer %d: already in %s, skipped" % (L, idx_path), flush=True)
+            continue
         sizes = {}
         offs = {}
         off = 0

@@ -331,7 +331,7 @@ def main() -> int:
                                           "in <model>/.. when there is one)")
     ap.add_argument("--mmproj", help="unsloth's vision tower GGUF (mmproj-*.gguf, clip / deepseek41v): its tensors become the "
                                      "checkpoint's vision.* / aligner.* (default: the first mmproj*.gguf in <model>/..)")
-    ap.add_argument("--tq-experts", help="a folder tq_convert.py wrote (tq.json + tq-L<layer>.bin): the routed experts of the layers "
+    ap.add_argument("--tq-experts", nargs="+", help="folders tq_convert.py wrote (tq.json + tq-L<layer>.bin): the routed experts of the layers "
                                          "listed there are read from it as trellis types (TQK5X ..), the others keep their MXFP4")
     ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's; default <model>/../dspark/dspark.json)")
     ap.add_argument("--engram", help="the folder of the Engram tables' GGUF set, for a quant that leaves them out "
@@ -552,14 +552,15 @@ def main() -> int:
     # trellis experts from tq_convert.py: per layer the three roles stacked [n_exp][rows][row bytes] in one file
     tq_layers = []
     if a.tq_experts:
-        tqd = pathlib.Path(a.tq_experts).expanduser().resolve()
-        tq_idx = json.loads((tqd / "tq.json").read_text())
-        by_layer = {}
-        for key, ent in tq_idx.items():
-            m = re.match(r"layers\.(\d+)\.ffn\.experts\.(w[123])$", key)
-            if not m:
-                raise SystemExit("tq.json: %s is not a layer's expert role" % key)
-            by_layer.setdefault(int(m.group(1)), {})[m.group(2)] = ent
+        by_layer, tq_dirs = {}, {}
+        for d in a.tq_experts:
+            tqd = pathlib.Path(d).expanduser().resolve()
+            for key, ent in json.loads((tqd / "tq.json").read_text()).items():
+                m = re.match(r"layers\.(\d+)\.ffn\.experts\.(w[123])$", key)
+                if not m:
+                    raise SystemExit("tq.json: %s is not a layer's expert role" % key)
+                by_layer.setdefault(int(m.group(1)), {})[m.group(2)] = ent
+                tq_dirs[(int(m.group(1)), m.group(2))] = tqd
         TQTYPES = {v[0]: k for k, v in TYPES.items()}
         for il, roles in sorted(by_layer.items()):
             if sorted(roles) != ["w1", "w2", "w3"]:
@@ -576,7 +577,7 @@ def main() -> int:
                     raise SystemExit("tq.json: unknown type %s" % tname)
                 n_exp, rows, cols = shape
                 per = total // n_exp
-                f = tqd / fname
+                f = tq_dirs[(il, role)] / fname
                 if not f.is_file() or f.stat().st_size < off + total:
                     raise SystemExit("%s: missing or short" % f)
                 try:
@@ -589,7 +590,7 @@ def main() -> int:
                 for e in range(n_exp):
                     tensors.append(("layers.%d.ffn.experts.%d.%s.weight" % (il, e, role), tname, fi, off + e * per, per, [rows, cols]))
             tq_layers.append(il)
-        print("trellis experts from %s: layers %s" % (tqd, tq_layers))
+        print("trellis experts from %s: layers %s" % (", ".join(a.tq_experts), tq_layers))
     drafter = pathlib.Path(a.drafter).expanduser().resolve() if a.drafter else model.parent / "dspark" / "dspark.json"
     if a.drafter and not drafter.is_file():
         raise SystemExit("%s: no drafter there" % drafter)
