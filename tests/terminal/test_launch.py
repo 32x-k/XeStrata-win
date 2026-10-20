@@ -109,6 +109,9 @@ class CatalogRules(unittest.TestCase):
             models, families, contexts, source = cat.tables()
             self.assertEqual(source, "setup.py")                       # the same tables setup.py and the app read
             for r in rows:
+                if r.family == "deepseek41":                           # its one size is in MULTI_FILE_FAMILIES (nine shards), not in MODELS
+                    self.assertAlmostEqual(r.download_gb, 508.4)
+                    continue
                 self.assertAlmostEqual(r.download_gb, models[r.model]["download_gb"])
             rec = [r for r in rows if r.recommended]
             self.assertEqual([(r.family, r.model) for r in rec], [("qwen", "IQ3_S")])      # 64 + 12 GB: the 64 GB tier
