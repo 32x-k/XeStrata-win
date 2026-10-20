@@ -70,6 +70,9 @@ def main():
     ap.add_argument("--type", required=True, choices=sorted(TYPES))
     ap.add_argument("--cfg", default="fast", choices=sorted(CFGS))
     ap.add_argument("--experts", type=int, default=0, help="only the first N experts (tests; the others stay zero streams)")
+    ap.add_argument("--act", default="", help="calibration dir with L<l>_gu.f64 [n_exp][dim], L<l>_dn.f64 [n_exp][ff] (sums of x^2 of the "
+                    "gate/up and down inputs per expert) and L<l>_cnt.u64 [n_exp]: an input-column weighted encode (error = sum h (w - dec)^2)")
+    ap.add_argument("--prior", type=float, default=64.0, help="pseudo-count of the layer-mean prior for rarely used experts")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--cpu", action="store_true", help="the CPU encoder instead of the card")
     a = ap.parse_args()
@@ -99,6 +102,13 @@ def main():
         with open(path, "wb") as f:
             f.truncate(off)
         fd = os.open(path, os.O_RDWR)
+        act = None
+        if a.act:
+            gu = np.fromfile("%s/L%d_gu.f64" % (a.act, L), dtype=np.float64).reshape(n_exp, dim)
+            dn = np.fromfile("%s/L%d_dn.f64" % (a.act, L), dtype=np.float64).reshape(n_exp, ff)
+            cnt = np.fromfile("%s/L%d_cnt.u64" % (a.act, L), dtype=np.uint64).astype(np.float64)
+            tot = max(cnt.sum(), 1.0)
+            act = (gu, dn, cnt, gu.sum(0) / tot, dn.sum(0) / tot)
         for role, rname in ROLES:
             rows, cols, total = sizes[role]
             t0 = time.time()
@@ -115,8 +125,15 @@ def main():
                 if key not in mm:
                     mm[key] = np.memmap(os.path.join(model_dir, key), dtype=np.uint8, mode="r")
                 w = decode_mxfp4(np.asarray(mm[key][off_:off_ + nb]), cols)
+                h = None
+                if act is not None:   # the input columns' mean x^2 of this expert, shrunk toward the layer's mean by the prior
+                    gu_, dn_, cnt_, mg, md = act
+                    sq, m = (dn_[e], md) if role == "w2" else (gu_[e], mg)
+                    hc = (sq + a.prior * m) / (cnt_[e] + a.prior)
+                    hc = np.maximum(hc / hc.mean(), 1e-3).astype(np.float32)
+                    h = np.ascontiguousarray(np.broadcast_to(hc, (rows, cols)))
                 with gpu_lock:
-                    packed, err, tot, st = tqenc.encode(w, t, gpu=not a.cpu, **cfg)
+                    packed, err, tot, st = tqenc.encode(w, t, h=h, gpu=not a.cpu, **cfg)
                 dec = tqenc.decode(packed, t).reshape(rows, cols)
                 err2[e] = ((w.astype(np.float64) - dec) ** 2).sum()
                 ref2[e] = (w.astype(np.float64) ** 2).sum()
