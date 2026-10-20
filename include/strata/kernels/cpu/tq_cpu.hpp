@@ -74,7 +74,7 @@ void tq_gu_rows(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, si
 
 /// Largest token group per call and widest row the kernels take.
 inline constexpr int kTqMaxTokens = 8;
-inline constexpr int kTqMaxN = 4096;
+inline constexpr int kTqMaxN = 5120;   // (DeepSeek-V4.1 hidden width; was 4096)
 
 namespace tq_detail {
 /// One token's Q8_0 activation unpacked for the kernels: the int8 values widened to int16 and the scales as floats.

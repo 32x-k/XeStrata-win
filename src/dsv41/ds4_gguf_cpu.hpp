@@ -36,6 +36,16 @@ void iq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, cons
                     float* const* ff, int r0, int r1, float limit);
 /// out[t][r] = down_r . hq[t] for rows [r0, r1).
 void iq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0, int r1);
+/// The trellis types (ds4_iq.cuh's is_tq; ds4_tq_cpu.cpp, Strata's tq_cpu kernels): the same four calls, reached from the
+/// iq_cpu_* ones above for those types (their activations: F32 scale a 32 values, then the int8 values).
+bool tq_cpu_type(int type);
+int tq_cpu_act();
+bool tq_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err);
+void tq_cpu_quant(const float* x, int k, void* dst);
+void tq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt, float* const* ff,
+                    int r0, int r1, float limit);
+void tq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0, int r1);
+
 /// The CPU lane's MXFP4 rows in the device's arithmetic (ds4_gguf.cu's mx_dot): the activations rounded to int8 per 32
 /// values as the device rounds them (q8_round's q and scale), each block's products summed exactly in integers, then
 /// times (weight scale x activation scale) into F32 sums - the same numbers as the device up to the order of the

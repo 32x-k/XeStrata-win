@@ -22,12 +22,23 @@ namespace strata::ds4::gguf::iq {
 constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kIQ2_XXS = 16, kIQ3_XXS = 18, kIQ3_S = 21, kIQ2_S = 22,
               kIQ4_XS = 23;
 
+/// The trellis types (Strata's, ds4_tq.cu): ggml's TQK6 / TQK7 (145 / 146, the table codebook) and the experimental
+/// TQK5X / TQK4X (224 / 225, computed codebook) and TQK5T / TQK4T (226 / 227, table): a block of 128 values is
+/// {fp16 d; 32 steps of K bits}, 2 + 4 K bytes (tools/trellis/tqenc.hpp).  They go through the same entry points below.
+constexpr int kTQK6 = 145, kTQK7 = 146, kTQK5X = 224, kTQK4X = 225, kTQK5T = 226, kTQK4T = 227;
+constexpr int tq_kbits(int type) {
+    return type == kTQK6 ? 6 : type == kTQK7 ? 7 : (type == kTQK5X || type == kTQK5T) ? 5 : (type == kTQK4X || type == kTQK4T) ? 4 : 0;
+}
+constexpr bool is_tq(int type) { return tq_kbits(type) > 0; }
+
 /// Whether the device kernels take this ggml type.
 bool supported(int type);
-/// Bytes of a block (256 values) of the type (0: not one of these).
+/// Values a block of the type holds (256; the trellis types 128; 0: not one of these).
+int block_values(int type);
+/// Bytes of a block of the type (0: not one of these).
 int block_bytes(int type);
-/// Bytes of a row of k values (k % 256 == 0).
-inline size_t row_bytes(int type, int64_t k) { return (size_t) (k / 256) * (size_t) block_bytes(type); }
+/// Bytes of a row of k values (k % block_values == 0).
+inline size_t row_bytes(int type, int64_t k) { return (size_t) (k / block_values(type)) * (size_t) block_bytes(type); }
 /// The type's name ("?" when unknown).
 const char* name(int type);
 
@@ -100,5 +111,15 @@ struct MvJob {
     float alpha = 1.0f;
 };
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
+
+/// The trellis types' kernels (ds4_tq.cu), reached from the entry points above for those types: arithmetic as the CPU lane's
+/// (ds4_tq_cpu.cpp: int8 activations with an F32 scale a 32, exact weights), on the tensor cores of gfx12 (WMMA) or in FMAs.
+namespace tq {
+bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s);
+bool down(const Args& a, int groups, int ne_max, cudaStream_t s);
+bool set_gate_up(const SetArgs& a, cudaStream_t s);
+bool set_down(const SetArgs& a, cudaStream_t s);
+bool mv(const MvJob* jobs, int n, cudaStream_t s);
+}  // namespace tq
 
 }  // namespace strata::ds4::gguf::iq

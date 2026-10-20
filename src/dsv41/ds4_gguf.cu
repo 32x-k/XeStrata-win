@@ -1002,9 +1002,9 @@ int launch_errors() { return g_errors.load(std::memory_order_relaxed); }
 
 size_t type_row_bytes(int type, int64_t k) {
     if (type == kTypeMXFP4) return k % kMxBlock == 0 ? mx_row_bytes(k) : 0;
-    return iq::supported(type) && k % 256 == 0 ? iq::row_bytes(type, k) : 0;
+    return iq::supported(type) && k % iq::block_values(type) == 0 ? iq::row_bytes(type, k) : 0;
 }
-int type_block(int type) { return type == kTypeMXFP4 ? kMxBlock : iq::supported(type) ? 256 : 0; }
+int type_block(int type) { return type == kTypeMXFP4 ? kMxBlock : iq::supported(type) ? iq::block_values(type) : 0; }
 const char* type_name(int type) { return type == kTypeMXFP4 ? "MXFP4" : iq::name(type); }
 
 namespace {
@@ -1024,8 +1024,8 @@ bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq:
     ia.limit = limit;
     ia.tg = expert_type(lay, 0);
     ia.td = expert_type(lay, 2);
-    if (ia.tg != expert_type(lay, 1) || !iq::supported(ia.tg) || !iq::supported(ia.td) || n_embd % 256 != 0 ||
-        n_ff % 256 != 0) {
+    if (ia.tg != expert_type(lay, 1) || !iq::supported(ia.tg) || !iq::supported(ia.td) || n_embd % iq::block_values(ia.tg) != 0 ||
+        n_ff % iq::block_values(ia.td) != 0) {
         std::fprintf(stderr, "ds4 gguf %s: expert types %s / %s / %s (n_embd %d, n_ff %d) not covered\n", who,
                      type_name(expert_type(lay, 0)), type_name(expert_type(lay, 1)), type_name(expert_type(lay, 2)),
                      n_embd, n_ff);

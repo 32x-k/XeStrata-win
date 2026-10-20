@@ -910,7 +910,10 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
 
 bool supported(int t) { return block_bytes(t) > 0; }
 
+int block_values(int t) { return is_tq(t) ? 128 : block_bytes(t) > 0 ? 256 : 0; }
+
 int block_bytes(int t) {
+    if (is_tq(t)) return 2 + 4 * tq_kbits(t);
     switch (t) {
         case kIQ2_XXS: return Ty<kIQ2_XXS>::B;
         case kIQ2_S: return Ty<kIQ2_S>::B;
@@ -926,6 +929,12 @@ int block_bytes(int t) {
 
 const char* name(int t) {
     switch (t) {
+        case kTQK6: return "TQK6";
+        case kTQK7: return "TQK7";
+        case kTQK5X: return "TQK5X";
+        case kTQK4X: return "TQK4X";
+        case kTQK5T: return "TQK5T";
+        case kTQK4T: return "TQK4T";
         case kIQ2_XXS: return "IQ2_XXS";
         case kIQ2_S: return "IQ2_S";
         case kIQ3_XXS: return "IQ3_XXS";
@@ -939,6 +948,7 @@ const char* name(int t) {
 }
 
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
+    if (is_tq(a.tg)) return tq::gate_up(a, groups, ne_max, s);
     if (a.n_embd % 256 != 0 || a.n_ff % (kWarps * kGuRW) != 0) return false;
     const dim3 grid((unsigned) (a.n_ff / (kWarps * kGuRW)), (unsigned) groups);
 #define GU_(T) gu_ne<T>(a, grid, ne_max, s)
@@ -948,6 +958,7 @@ bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
 }
 
 bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
+    if (is_tq(a.td)) return tq::down(a, groups, ne_max, s);
     if (a.n_ff % 256 != 0 || a.n_embd % (kWarps * kDnRW) != 0) return false;
     const dim3 grid((unsigned) (a.n_embd / (kWarps * kDnRW)), (unsigned) groups);
 #define DN_(T) dn_ne<T>(a, grid, ne_max, s)
@@ -957,15 +968,18 @@ bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
 }
 
 bool light_gate_up(const SetArgs& a, cudaStream_t s) {
+    if (is_tq(a.tg)) return false;   // (the trellis sets take the tiles for every expert)
     if (a.n_exp > kLightMaxExp || !light_on() || a.n_embd % 256 != 0 || a.n_ff % 256 != 0) return false;
     return light_set(a, true, s);
 }
 bool light_down(const SetArgs& a, cudaStream_t s) {
+    if (is_tq(a.td)) return false;
     if (a.n_exp > kLightMaxExp || !light_on() || a.n_embd % 256 != 0 || a.n_ff % 256 != 0) return false;
     return light_set(a, false, s);
 }
 
 bool set_gate_up(const SetArgs& a, cudaStream_t s) {
+    if (is_tq(a.tg)) return tq::set_gate_up(a, s);
     if (a.n_embd % 256 != 0 || a.n_ff % BN != 0) return false;
     SetArgs t = a;
     if (light_gate_up(a, s)) {   // the experts of a few rows; the tiles the others
@@ -980,6 +994,7 @@ bool set_gate_up(const SetArgs& a, cudaStream_t s) {
 }
 
 bool set_down(const SetArgs& a, cudaStream_t s) {
+    if (is_tq(a.td)) return tq::set_down(a, s);
     if (a.n_ff % 256 != 0 || a.n_embd % BN != 0) return false;
     SetArgs t = a;
     if (light_down(a, s)) {
@@ -994,6 +1009,17 @@ bool set_down(const SetArgs& a, cudaStream_t s) {
 }
 
 bool mv(const MvJob* jobs, int n, cudaStream_t s) {
+    {   // the trellis jobs go to their kernels, the others on
+        MvJob tqj[64], oth[64];
+        int nt = 0, no = 0;
+        if (n > 64) return false;
+        for (int i = 0; i < n; ++i) (is_tq(jobs[i].type) ? tqj[nt++] : oth[no++]) = jobs[i];
+        if (nt > 0) {
+            if (!tq::mv(tqj, nt, s)) return false;
+            if (no == 0) return true;
+            return mv(oth, no, s);
+        }
+    }
     // the jobs by type, up to kMaxJobs a launch
     bool done[64] = {};
     if (n > 64) return false;

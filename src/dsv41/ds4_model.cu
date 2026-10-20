@@ -1478,7 +1478,7 @@ struct Model::Impl {
     // expert's matrix r at the same stride from expert 0's in one file (the GGUF's [n_exp][out][in] tensor)
     // (the other block types: lay.fmt stays kFmtMXFP4 - read in place as these - and lay.K[r] is role r's ggml type)
     static int gg_type_of(const std::string& dtype) {
-        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 16, 18, 21, 22, 23})
+        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 16, 18, 21, 22, 23, 145, 146, 224, 225, 226, 227})
             if (dtype == gg::type_name(t)) return t;
         return -1;
     }
