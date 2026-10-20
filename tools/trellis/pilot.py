@@ -150,6 +150,11 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="jsonl results")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--pattern", default="blk.{L}.ffn_{R}_exps.weight")
+    ap.add_argument("--gpu", action="store_true", help="encode on the GPU (run under the box locks, HIP_VISIBLE_DEVICES)")
+    ap.add_argument("--act-diag-dir", default=None,
+                    help="directory with L<layer>_<role>.npy = E[x^2] per input channel of that projection (calibration "
+                         "second moments, diagonal).  Adds act_diag (the exact diagonal-Hessian error) and an importance-weighted "
+                         "encode (h = E[x^2]; in the Hadamard basis h = the block average of it)")
     a = ap.parse_args()
 
     if a.remote:
@@ -180,13 +185,19 @@ def main() -> int:
                     x_cache[n_in] = (np.random.default_rng(7).standard_normal((n_in, a.tokens)).astype(np.float32),
                                      synth_x(n_in, a.tokens, 9))
                 Xi, Xs = x_cache[n_in]
+                diag = None
+                if a.act_diag_dir:
+                    dp = pathlib.Path(a.act_diag_dir) / ("L%d_%s.npy" % (layer, role))
+                    if dp.exists():
+                        diag = np.load(dp).astype(np.float64)
+                        assert diag.shape == (n_in,), (dp, diag.shape)
                 for had in (False, True):
                     sg = sign_cache[n_in] if had else None
                     Wr = tqenc.rotate(W, sg) if had else W
                     for rname in a.rates.split(","):
                         t = RATES[rname]
                         t0 = time.time()
-                        packed, err, tot, st = tqenc.encode(Wr, t, threads=a.threads, **cfg)
+                        packed, err, tot, st = tqenc.encode(Wr, t, threads=a.threads, gpu=a.gpu, **cfg)
                         sec = time.time() - t0
                         dec = tqenc.decode(packed, t).reshape(Wr.shape)
                         What = tqenc.unrotate(dec, sg) if had else dec
@@ -195,6 +206,16 @@ def main() -> int:
                                    act_iso=act_err(W, What, Xi), act_syn=act_err(W, What, Xs),
                                    bpw=tqenc.bpw(t), seconds=sec, zero_blocks=st["zero_blocks"], cfg=a.cfg,
                                    x_kind="placeholder: iso gaussian / synthetic outlier channels")
+                        if diag is not None:
+                            hv = np.maximum(diag, 1e-30).astype(np.float32)
+                            rec["act_diag"] = float(np.sum(((W - What).astype(np.float64) ** 2) * hv) / np.sum((W.astype(np.float64) ** 2) * hv))
+                            hb = hv if not had else np.repeat(hv.reshape(-1, 128).mean(axis=1), 128)
+                            hw = np.broadcast_to(hb, Wr.shape).astype(np.float32)
+                            packed2, _, _, _ = tqenc.encode(Wr, t, h=hw, threads=a.threads, gpu=a.gpu, **cfg)
+                            dec2 = tqenc.decode(packed2, t).reshape(Wr.shape)
+                            What2 = tqenc.unrotate(dec2, sg) if had else dec2
+                            rec["act_diag_weighted_encode"] = float(np.sum(((W - What2).astype(np.float64) ** 2) * hv) / np.sum((W.astype(np.float64) ** 2) * hv))
+                            rec["mse_weighted_encode"] = float(np.sum((W.astype(np.float64) - What2) ** 2) / en)
                         out.write(json.dumps(rec) + "\n")
                         out.flush()
                         print("L%-3d %-4s e%-3d %s %-5s mse %.4f (%.2f dB)  act_iso %.4f  act_syn %.4f  %.1fs" % (

@@ -58,8 +58,35 @@ def lib() -> ctypes.CDLL:
     return _lib
 
 
+_hip = None
+
+
+def hip_lib() -> ctypes.CDLL:
+    """libtqenc_hip.so (sh tools/trellis/build.sh hip; run under the box GPU locks, HIP_VISIBLE_DEVICES picks the card)."""
+    global _hip
+    if _hip is None:
+        cands = [os.environ.get("TQENC_HIP_LIB", ""),
+                 str(pathlib.Path(__file__).resolve().parent.parent / "build-tqenc" / "libtqenc_hip.so")]
+        last = None
+        for c in cands:
+            if not c:
+                continue
+            try:
+                _hip = ctypes.CDLL(c)
+                break
+            except OSError as e:
+                last = e
+        if _hip is None:
+            raise RuntimeError("libtqenc_hip.so not found: %s" % last)
+        _hip.tqh_encode.restype = ctypes.c_double
+        _hip.tqh_encode.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p,
+                                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+    return _hip
+
+
 def encode(w: np.ndarray, t: int, h: np.ndarray | None = None, iters: int = 1, ncand: int = 1, exact: int = 0,
-           scale_tries: int = 1, threads: int = 0):
+           scale_tries: int = 1, threads: int = 0, gpu: bool = False):
     """w: float32 array whose last axis is a multiple of 128.  Returns (packed uint8 [nblocks, block_bytes],
     per-block error float64 [nblocks], total error, stats dict).  Error = sum h (w - decoded)^2 (h = 1 if None)."""
     w = np.ascontiguousarray(w, dtype=np.float32)
@@ -75,6 +102,12 @@ def encode(w: np.ndarray, t: int, h: np.ndarray | None = None, iters: int = 1, n
         if h.shape != w.shape:
             raise ValueError("importance weights must have the shape of w")
         hp = h.ctypes.data
+    if gpu:
+        if exact or t == TQ2_T:
+            raise ValueError("the GPU encoder has no exact search and no TQ2_T")
+        tot = hip_lib().tqh_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, scale_tries, 0,
+                                   err.ctypes.data, stats.ctypes.data, None, 0)
+        return out, err, tot, {"nonfinite_blocks": int(stats[0]), "zero_blocks": int(stats[1])}
     tot = lib().tqe_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, exact, scale_tries, threads,
                            err.ctypes.data, stats.ctypes.data)
     return out, err, tot, {"nonfinite_blocks": int(stats[0]), "zero_blocks": int(stats[1])}
