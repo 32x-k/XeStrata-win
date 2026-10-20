@@ -17,6 +17,7 @@ windows/xestrata-cli.bat, which needs no .NET.
 The folder (XeStrata-<version>-windows-x64/):
 
     xestrata.exe, xestrata-cli.exe and their .NET libraries   the launchers (windows/launcher), or xestrata-cli.bat
+                                                              with WINDOWS.ja.md and WINDOWS.md (docs/)
     app/                  setup.py, serve/, tools/, data/ and gguf-py, read-only, with the PACKAGED record
     app/engine/           the engine, its SYCL runtime (intel/llvm's) and BUILD.json
     python/               Python's embeddable distribution with the packages setup and the server use
@@ -241,6 +242,8 @@ def main() -> None:
     # ---- the launchers
     if a.launcher is None:
         shutil.copy2(a.src / "windows" / "xestrata-cli.bat", top / "xestrata-cli.bat")
+        for name in ("WINDOWS.ja.md", "WINDOWS.md"):   # how to use xestrata-cli.bat (docs/WINDOWS.md)
+            shutil.copy2(a.src / "docs" / name, top / name)
     else:
         for f in a.launcher.iterdir():
             if f.suffix == ".pdb":

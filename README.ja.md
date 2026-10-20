@@ -51,6 +51,7 @@ intel/llvm（DPC++）を Windows の上で HIP と Level Zero（Intel の GPU）
 - **GPU が 2 台以上のとき**（内蔵 GPU を含む）: setup は選んだ GPU を設定の `ONEAPI_DEVICE_SELECTOR=hip:N` に書き、エンジンが HIP に見せる GPU をそれだけに絞ります。
 - **置き場所**: zip のフォルダーには書き込みません。設定は `%APPDATA%\xestrata`、ログなどは `%LOCALAPPDATA%\xestrata`、モデルはデータのフォルダー（既定は `%LOCALAPPDATA%\xestrata\data`）に置きます。
 - **更新**: 新しい zip を別のフォルダーに展開して、そちらの `xestrata-cli.bat` を実行します。設定とモデルはそのまま使います。
+- **使い方**: 設定の変え方、持っているモデルのファイルの使い方、置き場所は [docs/WINDOWS.ja.md](docs/WINDOWS.ja.md) にあります。zip の中にも `WINDOWS.ja.md` と `WINDOWS.md` として入っています。
 
 ### ビルド
 

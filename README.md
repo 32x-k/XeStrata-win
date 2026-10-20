@@ -51,6 +51,7 @@ These three things differ from upstream.
 - **With two or more GPUs** (the processor's graphics included): setup writes the chosen GPU into the config as `ONEAPI_DEVICE_SELECTOR=hip:N`, and the engine narrows the GPUs HIP sees to it.
 - **Where things go**: nothing is written into the zip's folder. The settings go into `%APPDATA%\xestrata`, the logs and the like into `%LOCALAPPDATA%\xestrata`, and the models into the data folder (by default `%LOCALAPPDATA%\xestrata\data`).
 - **Updating**: unpack the new zip into another folder and run its `xestrata-cli.bat`. The settings and the models are kept.
+- **Using it**: changing the settings, using model files you already have and where things go are in [docs/WINDOWS.md](docs/WINDOWS.md). The zip carries it too, as `WINDOWS.ja.md` and `WINDOWS.md`.
 
 ### Building
 
