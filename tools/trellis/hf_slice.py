@@ -8,6 +8,7 @@ the environment for gated ones - it is sent as a header and never printed).
 """
 from __future__ import annotations
 
+import concurrent.futures as cf
 import json
 import os
 import struct
@@ -28,6 +29,25 @@ def _get(url: str, start: int | None = None, end: int | None = None) -> bytes:
         req.add_header("Range", "bytes=%d-%d" % (start, end))
     with urllib.request.urlopen(req, timeout=120) as r:
         return r.read()
+
+
+def get_parallel(url: str, start: int, end: int, workers: int = 16, piece: int = 8 << 20) -> bytes:
+    """bytes start..end (inclusive) of url, in `piece`-byte range requests on `workers` threads (one stream of a CDN
+    object is slow, a dozen are not)."""
+    spans = [(a, min(end, a + piece - 1)) for a in range(start, end + 1, piece)]
+    if len(spans) == 1:
+        return _get(url, start, end)
+
+    def one(sp):
+        for attempt in range(6):
+            try:
+                return _get(url, sp[0], sp[1])
+            except Exception:
+                if attempt == 5:
+                    raise
+        return b""
+    with cf.ThreadPoolExecutor(workers) as ex:
+        return b"".join(ex.map(one, spans))
 
 
 def bf16_to_f32(raw: bytes | np.ndarray) -> np.ndarray:
@@ -54,7 +74,7 @@ class Repo:
         h, base = self.header(shard)
         return shard, h[name], base
 
-    def tensor(self, name: str, lead: slice | int | None = None) -> np.ndarray:
+    def tensor(self, name: str, lead: slice | int | None = None, workers: int = 16) -> np.ndarray:
         """The tensor `name` as float32.  lead: an index or slice on the first axis (e.g. an expert), fetched alone."""
         shard, t, base = self.info(name)
         shape = t["shape"]
@@ -67,7 +87,7 @@ class Repo:
             i0, i1 = lead, lead + 1
         else:
             i0, i1 = lead.start or 0, lead.stop
-        raw = _get(self.base + shard, base + s + i0 * inner, base + s + i1 * inner - 1)
+        raw = get_parallel(self.base + shard, base + s + i0 * inner, base + s + i1 * inner - 1, workers)
         out_shape = [i1 - i0] + shape[1:]
         if t["dtype"] == "BF16":
             return bf16_to_f32(raw).reshape(out_shape)
