@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/ds4/ds4_main.cpp - maya-ds4: DeepSeek-V4.1-Flash on Maya.
 //
 //   maya-ds4 --pack <model>/maya-ds4 --ids 0,128803,... --n 16          greedy tokens after the ids
@@ -11,9 +13,10 @@
 // that prompt's end; anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
 // (the file: see read_pics); the state is shared only where the same picture sits at the same place.
 #include "ds4_model.hpp"
-#include "strata/platform/env_alias.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <numeric>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -512,10 +515,127 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     return 0;
 }
 
+
+// ---- Strata addition: teacher-forced scoring (the quality gate) -------------------------------------------------
+// --score IDS.json --score-out RUN.tsv: every segment of a tools/quant_quality.py ids file (name + ids) is read through
+// the model from a fresh state; per position the log-probability of the text's next token and the 64 most likely
+// tokens go out in the STRATA_LOGPOS row format that `quant_quality.py compare` reads (natural logs, full-vocabulary
+// log-softmax in double).  RUN.tsv.seg.json lists each segment's first line and size.
+struct ScoreSeg {
+    std::string name;
+    std::vector<int> ids;
+};
+
+bool read_score_ids(const std::string& path, std::vector<ScoreSeg>& segs, std::string& err) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        err = path + ": cannot open";
+        return false;
+    }
+    std::string s;
+    char buf[1 << 16];
+    size_t k;
+    while ((k = std::fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, k);
+    std::fclose(f);
+    size_t p = 0;
+    for (;;) {
+        const size_t n0 = s.find("\"name\"", p);
+        if (n0 == std::string::npos) break;
+        const size_t q0 = s.find('"', s.find(':', n0) + 1);
+        const size_t q1 = s.find('"', q0 + 1);
+        const size_t i0 = s.find("\"ids\"", q1);
+        if (q0 == std::string::npos || q1 == std::string::npos || i0 == std::string::npos) break;
+        const size_t b0 = s.find('[', i0), b1 = s.find(']', b0);
+        if (b0 == std::string::npos || b1 == std::string::npos) break;
+        ScoreSeg g;
+        g.name = s.substr(q0 + 1, q1 - q0 - 1);
+        g.ids = parse_ids(s.substr(b0 + 1, b1 - b0 - 1));
+        segs.push_back(std::move(g));
+        p = b1;
+    }
+    if (segs.empty()) {
+        err = path + ": no segments (expected quant_quality.py's ids file)";
+        return false;
+    }
+    return true;
+}
+
+int score(strata::ds4::Model& m, const std::string& ids_path, const std::string& out_path, int window, int eos) {
+    std::vector<ScoreSeg> segs;
+    std::string err;
+    if (!read_score_ids(ids_path, segs, err)) {
+        std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
+        return 1;
+    }
+    std::FILE* out = std::fopen(out_path.c_str(), "wb");
+    std::FILE* sj = std::fopen((out_path + ".seg.json").c_str(), "wb");
+    if (out == nullptr || sj == nullptr) {
+        std::fprintf(stderr, "strata-dsv41: cannot write %s\n", out_path.c_str());
+        return 1;
+    }
+    std::fprintf(sj, "{\"segments\": [");
+    const int V = m.vocab();
+    long long line = 0;
+    std::vector<float> lg;
+    std::vector<int> order;
+    const double t0 = now_ms();
+    for (size_t si = 0; si < segs.size(); ++si) {
+        const std::vector<int>& ids = segs[si].ids;
+        m.reset();
+        const long long first = line;
+        double sum_nll = 0.0;
+        long long top1 = 0, cnt = 0;
+        for (size_t a = 0; a + 1 < ids.size();) {
+            const int T = (int) std::min<size_t>((size_t) window, ids.size() - 1 - a);   // (positions a .. a+T-1 are scored)
+            if (!m.feed(ids.data() + a, T, T, err) || !m.logits(lg) || lg.size() < (size_t) T * (size_t) V) {
+                std::fprintf(stderr, "strata-dsv41: %s\n", err.empty() ? "no logits" : err.c_str());
+                return 1;
+            }
+            for (int t = 0; t < T; ++t) {
+                const float* r = lg.data() + (size_t) t * (size_t) V;
+                float mx = r[0];
+                for (int v = 1; v < V; ++v) mx = std::max(mx, r[v]);
+                double z = 0.0;
+                for (int v = 0; v < V; ++v) z += std::exp((double) (r[v] - mx));
+                const double lz = std::log(z) + (double) mx;
+                order.resize((size_t) V);
+                std::iota(order.begin(), order.end(), 0);
+                std::partial_sort(order.begin(), order.begin() + 64, order.end(), [&](int x, int y) {
+                    return r[x] > r[y] || (r[x] == r[y] && x < y);
+                });
+                const int tgt = ids[a + (size_t) t + 1];
+                const double lt = (double) r[tgt] - lz;
+                const double la = (double) r[order[0]] - lz;
+                const double le = eos >= 0 && eos < V ? (double) r[eos] - lz : -1e30;
+                // logp(target) with the end token left out of the distribution, as the engine's row has it
+                const double lt_ne = tgt == eos ? lt : std::log(std::max(1e-300, std::exp(lt) / std::max(1e-300, 1.0 - std::exp(le))));
+                std::fprintf(out, "%zu\t%d\t%.6f\t%d\t%.6f\t%d\t%.6f\t%.6f", a + (size_t) t, tgt, lt, order[0], la,
+                             order[0] == tgt ? 1 : 0, le, lt_ne);
+                for (int j = 0; j < 64; ++j) std::fprintf(out, "\t%d:%.6f", order[(size_t) j], (double) r[order[(size_t) j]] - lz);
+                std::fprintf(out, "\n");
+                ++line;
+                ++cnt;
+                top1 += order[0] == tgt;
+                sum_nll -= lt;
+            }
+            a += (size_t) T;
+        }
+        std::fprintf(sj, "%s{\"name\": \"%s\", \"first_line\": %lld, \"n\": %lld, \"ppl\": %.6f, \"top1\": %.6f}", si ? ", " : "",
+                     segs[si].name.c_str(), first, cnt, std::exp(sum_nll / (double) std::max(1LL, cnt)),
+                     (double) top1 / (double) std::max(1LL, cnt));
+        std::fprintf(stderr, "score %s: %lld positions, ppl %.4f, top-1 %.4f (%.0f s)\n", segs[si].name.c_str(), cnt,
+                     std::exp(sum_nll / (double) std::max(1LL, cnt)), (double) top1 / (double) std::max(1LL, cnt),
+                     (now_ms() - t0) / 1000.0);
+        std::fflush(out);
+    }
+    std::fprintf(sj, "]}\n");
+    std::fclose(sj);
+    std::fclose(out);
+    return 0;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
-    strata::platform::env_aliases();   // (MAYA_* settings under their older names too)
     strata::ds4::Options o;
     std::string ids_s, dump, eos = "1";
     int n = 0, window = 16;
@@ -524,6 +644,7 @@ int main(int argc, char** argv) {
     unsigned long long cli_seed = 1;
     bool serve_mode = false;
     std::string images, enc_rgb, enc_out;
+    std::string score_ids, score_out;
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -571,6 +692,8 @@ int main(int argc, char** argv) {
         else if (a == "--n") n = std::atoi(val("--n").c_str());
         else if (a == "--window") window = std::max(1, std::atoi(val("--window").c_str()));   // (> 16: the chunked prompt path)
         else if (a == "--dump-logits") dump = val("--dump-logits");
+        else if (a == "--score") score_ids = val("--score");
+        else if (a == "--score-out") score_out = val("--score-out");
         else if (a == "--serve") serve_mode = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
         else if (a == "--help" || a == "-h") {
@@ -597,6 +720,7 @@ int main(int argc, char** argv) {
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf);
+    if (!score_ids.empty()) return score(m, score_ids, score_out.empty() ? score_ids + ".tsv" : score_out, window, std::atoi(eos.c_str()));
 
     if (!enc_rgb.empty()) {   // the vision tower alone: a picture's span rows (BF16 [rows][dim]) into --dump-image
         std::vector<uint8_t> px((size_t) std::max(0, enc_w) * std::max(0, enc_h) * 3);

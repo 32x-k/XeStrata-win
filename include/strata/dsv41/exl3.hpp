@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // include/strata/kernels/exl3.hpp - EXL3 (exllamav3) quantized weights on the device: the decode GEMV, the routed
 // experts, and the full reconstruction for the prompt path.
 //
@@ -22,7 +24,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace strata::kernels::exl3 {
+namespace strata::dsv41k::exl3 {
 
 /// The weight type the engine's MvJob / WSlot carry for EXL3: their weight pointer is a (host) const Mat*.
 constexpr int kTypeEXL3 = 200;
@@ -182,4 +184,4 @@ void rows_f16(const float* x, int ldx, const int* idx, int nrows, int ncols, uin
 /// Launch failures of this family since the process started (each is also printed).
 int launch_errors();
 
-}  // namespace strata::kernels::exl3
+}  // namespace strata::dsv41k::exl3

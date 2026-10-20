@@ -1,7 +1,9 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/ds4/ds4_gguf_cpu.cpp - a GGUF's MXFP4 experts on the CPU lane (see ds4_gguf_cpu.hpp).
 #include "ds4_gguf_cpu.hpp"
 
-#include "strata/kernels/cpu/exl3_cpu.hpp"
+#include "strata/dsv41/exl3_cpu.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -338,7 +340,7 @@ void q8_round(const float* x, int k, float* out) {
 
 void mx_cpu_rows(const uint8_t* w, size_t rb, int k, int r0, int r1, const float* const* x, int n, float* const* y) {
 #if defined(MX_X86)
-    static const bool avx2 = strata::kernels::cpu::exl3_cpu_tier() >= 1;
+    static const bool avx2 = strata::dsv41k::cpu::exl3_cpu_tier() >= 1;
     if (avx2) return rows_avx2(w, rb, k, r0, r1, x, n, y);
 #endif
     rows_scalar(w, rb, k, r0, r1, x, n, y);

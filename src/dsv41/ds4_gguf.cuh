@@ -1,6 +1,8 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/ds4/ds4_gguf.cuh - a GGUF's weights on the device for maya-ds4 (unsloth's DeepSeek-V4.1-Flash-1017 GGUFs,
 // tools/ds4/pack_gguf.py): the dense matrices in BF16 and the routed experts in MXFP4.  They stand in for
-// strata::kernels::exl3's matrices and experts (an x3::Mat with fmt kFmtBF16, an x3::ExpertLayout with fmt kFmtMXFP4)
+// strata::dsv41k::exl3's matrices and experts (an x3::Mat with fmt kFmtBF16, an x3::ExpertLayout with fmt kFmtMXFP4)
 // with the same arguments and the same results' layout, so the engine's paths (decode, verify windows, chunked prompts,
 // tensor parallel) take either format.
 //
@@ -12,7 +14,7 @@
 // the token path gives it (the same kernel, the same order).
 #pragma once
 
-#include "strata/kernels/exl3.hpp"
+#include "strata/dsv41/exl3.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -20,7 +22,7 @@
 
 namespace strata::ds4::gguf {
 
-namespace x3 = strata::kernels::exl3;
+namespace x3 = strata::dsv41k::exl3;
 
 constexpr int kFmtBF16 = 1;    // x3::Mat::fmt
 constexpr int kFmtMXFP4 = 2;   // x3::ExpertLayout::fmt (and an expert's matrix as an x3::Mat)

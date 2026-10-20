@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+# Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 """dumpscan.py DUMP_L [--pos P] [--dim 5120] [--hc 4] - one run's DS4_DUMP_L records: each layer's residual stream at
 position P against the other positions (its norm over the median norm, its largest |value| and where, non-finite
 values) - where a position's stream blows up or goes non-finite."""

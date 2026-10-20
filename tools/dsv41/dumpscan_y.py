@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+# Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 """dumpscan_y.py DUMP_Y DUMP_R --pos P [--layers a-b] - one run's expert set rows (DS4_DUMP_Y, DS4_DUMP_R): position
 P's rows a layer - its experts, their rows and P's place in them, |h| and |y| against the layer's median row."""
 import argparse

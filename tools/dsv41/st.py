@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+# Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 """tools/ds4/st.py - every tensor of a DeepSeek-V4.1 model directory, read in place.
 
     st = SafeTensors(Path("~/models/DSV4").expanduser())

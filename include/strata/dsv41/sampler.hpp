@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // include/strata/kernels/sampler.hpp - the sampler chain, host-callable (P2.S2).
 //
 //     penalties -> top_k -> top_p -> min_p -> temperature -> pick
@@ -11,7 +13,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace strata::kernels {
+namespace strata::dsv41k {
 
 struct SamplerParams {
     int top_k = 20;              // sampled path: 1..64 as given; 0 (off) or more than 64 keep the widest list, 64
@@ -89,4 +91,4 @@ inline void penalty_rows(const int32_t* tail, int64_t n_tail, const int32_t* win
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace strata::dsv41k

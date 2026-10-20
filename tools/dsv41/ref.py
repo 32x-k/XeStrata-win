@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+# Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 """tools/ds4/ref.py - a whole-sequence DeepSeek-V4.1 forward in torch over an EXL3 checkpoint (the engine's oracle).
 
     python tools/ds4/ref.py --model ~/models/DSV4 --text "The capital of France is" [--dump out.npz] [--gen 8]

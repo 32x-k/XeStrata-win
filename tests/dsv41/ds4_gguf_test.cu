@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // tests/ds4_gguf_test.cu - maya-ds4's GGUF kernels (src/ds4/ds4_gguf.cu, ds4_gguf_cpu.cpp) against a plain
 // double-precision reference of random BF16 matrices and MXFP4 experts: the GEMVs (BF16 / MXFP4, 1..16 activations,
 // aligned or not), the token experts (gate / up / swiglu / down / combine, experts off the device, the CPU part, the
@@ -26,7 +28,7 @@
 #include <vector>
 
 namespace gg = strata::ds4::gguf;
-namespace x3 = strata::kernels::exl3;
+namespace x3 = strata::dsv41k::exl3;
 
 namespace {
 

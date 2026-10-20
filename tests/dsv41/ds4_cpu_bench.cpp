@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // tests/ds4_cpu_bench.cpp - how fast does this CPU run DeepSeek-V4.1-Flash's EXL3 experts (5120 -> 2304 -> 5120, K 3)?
 //
 //   ds4_cpu_bench [--threads N] [--node 0|1|-1] [--mode band|rows] [--experts N] [--per-call N] [--iters N]
@@ -5,7 +7,7 @@
 // Random trellis words in memory bound to --node (-1: wherever the first touch puts them), --threads workers pinned to
 // that node's physical cores (CPU i is on node i % 2 here, CPUs 0..43 the physical cores), each call computing
 // --per-call experts' gate and up (all columns) from one activation: the time of a matrix pass and its GB/s.
-#include "strata/kernels/cpu/exl3_cpu.hpp"
+#include "strata/dsv41/exl3_cpu.hpp"
 #include "../src/ds4/ds4_pool.hpp"
 
 #include <sys/mman.h>
@@ -20,7 +22,7 @@
 #include <string>
 #include <vector>
 
-namespace kc = strata::kernels::cpu;
+namespace kc = strata::dsv41k::cpu;
 
 static void* node_alloc(size_t bytes, int node) {
     void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/ds4/ds4_vision.cuh - DeepSeek-V4.1's vision tower on one GPU (DeepSeek's inference/vision.py):
 //   patches (14 x 14 RGB, scaled to [-1, 1]) -> Linear(588 -> 1024)
 //   32 blocks: x += attn(rmsnorm(x)) (16 heads of 64, full bidirectional attention over the image, a 2D rotary on q

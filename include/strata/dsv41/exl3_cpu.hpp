@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // include/strata/kernels/cpu/exl3_cpu.hpp - EXL3 routed experts on the CPU (the fast path's CPU lane).
 //
 // The mul1 codebook is affine in the byte sum of state * 0x83DCD12D: w = fp16(1024 + s) * k_inv + k_bias (one FP16
@@ -12,7 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace strata::kernels::cpu {
+namespace strata::dsv41k::cpu {
 
 /// One EXL3 matrix (mul1 codebook): k inputs, n outputs, K bits (1..8), tiles in exllamav3's natural layout.
 struct Exl3Part {
@@ -64,4 +66,4 @@ bool exl3_cpu_band_acc_on(int tier, const Exl3Part& m, const float* const* xh, i
 /// ... and, with the parts' acc summed over every slice, the outputs (the codebook's affine form, H, svh).
 void exl3_cpu_band_out(const Exl3Part& m, const float* acc, float xsum, int c0, float* y);
 
-}  // namespace strata::kernels::cpu
+}  // namespace strata::dsv41k::cpu

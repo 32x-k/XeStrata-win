@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/ds4/ds4_gguf_cpu.hpp - a GGUF's MXFP4 experts on the CPU lane of maya-ds4 (the format: ds4_gguf.cuh).  The
 // weights are read where they lie (the GGUF file's mapping), each block decoded once for all the activations of a
 // call (mx_rows: int8 dots, the CPU's best vector tier at run time; a scalar loop otherwise).
@@ -16,7 +18,7 @@ constexpr int kMxCpuMaxN = 8;   // activations a call
 void mx_cpu_rows(const uint8_t* w, size_t rb, int k, int r0, int r1, const float* const* x, int n, float* const* y);
 
 /// A GGUF's low-bit experts (ds4_iq.cuh's types) on the CPU lane - ggml-cpu's arithmetic through the GLM CPU lane's
-/// native experts (strata::kernels::cpu::native_*: its AVX-512 / AVX2 multi-token rows where they are ggml's bit for bit,
+/// native experts (strata::dsv41k::cpu::native_*: its AVX-512 / AVX2 multi-token rows where they are ggml's bit for bit,
 /// ggml's dots otherwise; ds4_iq_cpu.cpp): an activation quantized once to the weight type's vec_dot_type (Q8_K: an F32
 /// scale per 256 values - the device takes one per 32, so the two sides agree to that rounding), each row one dot.
 struct IqCpu {

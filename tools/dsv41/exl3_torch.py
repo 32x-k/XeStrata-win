@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+# Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 """tools/ds4/exl3_torch.py - EXL3 (exllamav3) matrices decoded on the GPU with torch, for the DeepSeek-V4.1 reference.
 
 The format is include/strata/kernels/exl3.hpp's; this is tools/exl3_pack.py's numpy decoder (exl3_states, exl3_values,

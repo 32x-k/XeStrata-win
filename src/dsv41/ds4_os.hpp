@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/ds4/ds4_os.hpp - the few OS services maya-ds4 needs, on Linux and on Windows: files read at an offset and
 // mapped read-only (the experts read in place), page-cache hints, anonymous host memory on a NUMA node, thread pinning,
 // each NUMA node's physical cores, the RAM this process can still get.  (On Windows as src/core/expert_source.cpp

@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/kernels/cpu/exl3_cpu.cpp - EXL3 routed experts on the CPU (see include/strata/kernels/cpu/exl3_cpu.hpp).
 //
 // The vector kernels follow exllamav3's CPU expert kernel (MIT, turboderp - exllamav3_ext/cpu/moe_mul1.cpp, its
@@ -7,9 +9,8 @@
 // device's FP16 constant, so the CPU lane computes what the device kernels compute up to the FP16 rounding of each
 // weight.  The AVX-512 and AVX2 tiers do the same FMAs in the same order: they give the same bits (the bands,
 // the split-K pieces, the GEMM's sums and the vectorised transforms alike).
-#include "strata/kernels/cpu/exl3_cpu.hpp"
+#include "strata/dsv41/exl3_cpu.hpp"
 
-#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
 #include <algorithm>
@@ -44,7 +45,18 @@
 #define EXL3_AVX2_INLINE inline
 #endif
 
-namespace strata::kernels::cpu {
+namespace strata::dsv41k::cpu {
+// Strata's cpu_avx2_ok lives in strata_kernels_cpu, which this path does not link: AVX2 + FMA here
+static bool cpu_avx2_ok() {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#else
+    return false;
+#endif
+}
+using strata::kernels::f32_from_f16;
+using strata::kernels::f16_from_f32;
 namespace {
 
 constexpr uint32_t kMul1 = 0x83DCD12Du;
@@ -1266,4 +1278,4 @@ void exl3_cpu_band(const Exl3Part& m, const float* xh, float xsum, int c0, float
     exl3_cpu_band_out(m, acc, xsum, c0, y);
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace strata::dsv41k::cpu

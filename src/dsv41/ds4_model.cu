@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/ds4/ds4_model.cu - DeepSeek-V4.1-Flash on Maya (see ds4_model.hpp).
 //
 // The layer, for one token at position p (DeepSeek's inference/model.py, Block.forward with the lagged pre-mix):
@@ -19,11 +21,11 @@
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
 #include "ds4_vision.cuh"
-#include "strata/kernels/cpu/exl3_cpu.hpp"
-#include "strata/kernels/exl3.hpp"
+#include "strata/dsv41/exl3_cpu.hpp"
+#include "strata/dsv41/exl3.hpp"
 #include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/glm_fast.hpp"
-#include "strata/kernels/sampler.hpp"
+#include "strata/dsv41/moe_win.hpp"
+#include "strata/dsv41/sampler.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -53,9 +55,9 @@
 #endif
 
 namespace strata::ds4 {
-namespace x3 = strata::kernels::exl3;
-namespace kc = strata::kernels::cpu;
-namespace gf = strata::kernels::glmf;
+namespace x3 = strata::dsv41k::exl3;
+namespace kc = strata::dsv41k::cpu;
+namespace gf = strata::dsv41k::glmf;
 namespace gg = strata::ds4::gguf;
 
 #define CK(call)                                                                            \
@@ -840,8 +842,8 @@ struct Model::Impl {
     // a sampled round's drafts: the distribution q each one was drawn from (its kept list, on the head device) for
     // verify()'s rule - a point at the draft for the drafter's argmax; and the chain they were drawn with (verify()
     // checks it is its own)
-    strata::kernels::SpecList* d_specq = nullptr;
-    std::vector<strata::kernels::SpecList> h_specq = std::vector<strata::kernels::SpecList>(kWin);
+    strata::dsv41k::SpecList* d_specq = nullptr;
+    std::vector<strata::dsv41k::SpecList> h_specq = std::vector<strata::dsv41k::SpecList>(kWin);
     bool drafts_q = false;
     float dq_temp = 0.0f, dq_top_p = 1.0f, dq_min_p = 0.0f;
     int dq_top_k = 0;
@@ -5451,7 +5453,7 @@ struct Model::Impl {
             cudaSetDevice(hd.id);
         } else {
             CK(cudaMemcpyAsync(d_ints, h_idx, 4, cudaMemcpyHostToDevice, hd.st));
-            strata::kernels::SamplerParams sp;
+            strata::dsv41k::SamplerParams sp;
             sp.greedy = true;
             sp.temperature = 0.0f;
             if (drafts_q) {   // the request's own chain: draft i drawn as the model's token i would be (verify's counter + i)
@@ -5466,9 +5468,9 @@ struct Model::Impl {
                 markov_add(hd.logits + (size_t) i * V, d_mk_embed, d_mk_head, d_ints + i, V, R, hd.st);
                 if (drafts_q) {
                     sp.counter = dq_counter + (uint64_t) i;
-                    strata::kernels::sample_draft(hd.logits + (size_t) i * V, 1, V, sp, d_specq + i, d_ints + i + 1, hd.st);
+                    strata::dsv41k::sample_draft(hd.logits + (size_t) i * V, 1, V, sp, d_specq + i, d_ints + i + 1, hd.st);
                 } else
-                    strata::kernels::sample_tokens(hd.logits + (size_t) i * V, 1, V, nullptr, 0, sp, d_ints + i + 1, hd.st);
+                    strata::dsv41k::sample_tokens(hd.logits + (size_t) i * V, 1, V, nullptr, 0, sp, d_ints + i + 1, hd.st);
             }
         }
         confidence(hd.x, d_mk_embed, d_ints, d_conf, T, D, R, d_confv, hd.st);
@@ -5507,7 +5509,7 @@ struct Model::Impl {
                    const float* bias) {
         Dev& d = devs[(size_t) head_dev];
         cudaSetDevice(d.id);
-        strata::kernels::SamplerParams sp;
+        strata::dsv41k::SamplerParams sp;
         sp.temperature = temperature;
         sp.greedy = temperature <= 0.0f;
         sp.top_p = top_p;
@@ -5516,7 +5518,7 @@ struct Model::Impl {
         sp.seed = seed;
         sp.counter = counter;
         sp.logit_bias = bias;
-        strata::kernels::sample_tokens(d.logits + (size_t) row * g.vocab, 1, g.vocab, nullptr, 0, sp, d.tok, d.st);
+        strata::dsv41k::sample_tokens(d.logits + (size_t) row * g.vocab, 1, g.vocab, nullptr, 0, sp, d.tok, d.st);
         int t = -1;
         cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);
         cudaStreamSynchronize(d.st);
@@ -5546,10 +5548,10 @@ struct Model::Impl {
         cudaSetDevice(hd.id);
         int m = 0;
         if (temperature <= 0.0f) {
-            strata::kernels::SamplerParams sp;
+            strata::dsv41k::SamplerParams sp;
             sp.greedy = true;
             sp.temperature = 0.0f;
-            strata::kernels::sample_tokens(hd.logits, T, V, nullptr, 0, sp, d_ints + 16, hd.st);   // (the T rows at once)
+            strata::dsv41k::sample_tokens(hd.logits, T, V, nullptr, 0, sp, d_ints + 16, hd.st);   // (the T rows at once)
             CK(cudaMemcpyAsync(h_idx, d_ints + 16, (size_t) T * 4, cudaMemcpyDeviceToHost, hd.st));
             CK(cudaStreamSynchronize(hd.st));
             while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
@@ -5567,12 +5569,12 @@ struct Model::Impl {
                     h_specq[(size_t) i].ids[0] = drafts[(size_t) i];
                     h_specq[(size_t) i].p[0] = 1.0;
                 }
-                CK(cudaMemcpyAsync(d_specq, h_specq.data(), (size_t) n * sizeof(strata::kernels::SpecList),
+                CK(cudaMemcpyAsync(d_specq, h_specq.data(), (size_t) n * sizeof(strata::dsv41k::SpecList),
                                    cudaMemcpyHostToDevice, hd.st));
             }
             for (int i = 0; i < n; ++i) h_idx[i] = drafts[(size_t) i];
             CK(cudaMemcpyAsync(d_ints + 32, h_idx, (size_t) n * 4, cudaMemcpyHostToDevice, hd.st));
-            strata::kernels::SamplerParams sp;
+            strata::dsv41k::SamplerParams sp;
             sp.greedy = false;
             sp.temperature = temperature;
             sp.top_p = top_p;
@@ -5580,7 +5582,7 @@ struct Model::Impl {
             sp.min_p = min_p;
             sp.seed = seed;
             sp.counter = counter;
-            strata::kernels::sample_verify(hd.logits, n, V, sp, d_specq, d_ints + 32, d_ints + 16, hd.st);
+            strata::dsv41k::sample_verify(hd.logits, n, V, sp, d_specq, d_ints + 32, d_ints + 16, hd.st);
             CK(cudaMemcpyAsync(h_idx, d_ints + 16, (size_t) n * 4, cudaMemcpyDeviceToHost, hd.st));
             CK(cudaStreamSynchronize(hd.st));
             while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
@@ -7632,7 +7634,7 @@ struct Model::Impl {
     int sample(float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter) {
         Dev& d = devs[(size_t) head_dev];
         cudaSetDevice(d.id);
-        strata::kernels::SamplerParams sp;
+        strata::dsv41k::SamplerParams sp;
         sp.temperature = temperature;
         sp.greedy = temperature <= 0.0f;
         sp.top_p = top_p;
@@ -7640,7 +7642,7 @@ struct Model::Impl {
         sp.min_p = min_p;
         sp.seed = seed;
         sp.counter = counter;
-        strata::kernels::sample_tokens(d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab, 1, g.vocab, nullptr, 0,
+        strata::dsv41k::sample_tokens(d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab, 1, g.vocab, nullptr, 0,
                                        sp, d.tok, d.st);
         int t = -1;
         cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);

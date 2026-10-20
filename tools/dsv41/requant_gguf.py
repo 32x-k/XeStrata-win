@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+# Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 """tools/ds4/requant_gguf.py - a DeepSeek-V4.1 GGUF requantized by a recipe (the routed experts in ggml's low-bit types,
 the dense matrices in Q8_0), through ggml's own quantizers (libggml-base, ctypes) - a quick test model for maya-ds4's
 low-bit expert kernels until the real Maya quants exist.

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+# Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 """dumpcmp.py - two maya-ds4 runs' debug dumps side by side (the prompt path's numerics: where two runs part).
 
   layers A B [--pos P]       DS4_DUMP_L files: each layer record's relative error between the runs - the median over

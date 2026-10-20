@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/ds4/ds4_engram_io.hpp - DeepSeek's Engram (n-gram memory) rows read off the decode's critical path.
 //
 // A token's Engram rows depend only on the token ids, so they are asked for as soon as the window's tokens are known

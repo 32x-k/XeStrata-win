@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/ds4/ds4_mx_kern.inc - the CPU lane's int8 MXFP4 rows (ds4_gguf_cpu.hpp: mx_rows), one body for the x86 tiers.
 // ds4_gguf_cpu.cpp includes it once a tier, inside its unnamed namespace, after <immintrin.h>, with
 //   MXK_NS    the tier's namespace

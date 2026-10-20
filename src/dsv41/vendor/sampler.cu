@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/kernels/cuda/sampler.cu - P2.S2: the sampler chain, in llama.cpp's order.
 //
 //     penalties -> top_k -> top_p -> min_p -> temperature -> pick
@@ -13,7 +15,7 @@
 // Both kernels put ONE BLOCK per token over the vocabulary: `sampler_greedy_kernel` is the plain argmax,
 // `sampler_kernel` runs the sampled chain as `top_k` block-argmax rounds followed by the top_p / temperature /
 // draw chain (its header says why the selection must be parallel and why the tie rule keeps the semantics).
-#include "strata/kernels/sampler.hpp"
+#include "strata/dsv41/sampler.hpp"
 
 #include <cuda_runtime.h>
 
@@ -21,7 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace strata::dsv41k {
 namespace {
 
 // Philox 4x32-10, the counter-based generator the phase asks for.  Counter-based matters because it makes the
@@ -576,4 +578,4 @@ void sample_verify(const float* logits, int n_tokens, int n_vocab, const Sampler
     spec_launched("sample_verify", stream);
 }
 
-}  // namespace strata::kernels
+}  // namespace strata::dsv41k

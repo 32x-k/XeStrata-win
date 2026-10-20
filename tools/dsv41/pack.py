@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+# Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 """tools/ds4/pack.py - the engine's pack for a DeepSeek-V4.1 EXL3 model, beside the model's files (no weights copied).
 
     python tools/ds4/pack.py --model ~/models/DSV4

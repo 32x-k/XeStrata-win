@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+# Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 # tools/ds4/bytecheck.sh - maya-ds4's byte-identity check of two builds (a change that must not move a bit: the same
 # prompt through each, every logit row dumped, the files compared byte for byte, the greedy tokens compared).
 #

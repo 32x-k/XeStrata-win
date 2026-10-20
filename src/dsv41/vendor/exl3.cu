@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/kernels/cuda/exl3.cu - the EXL3 device kernels (the format: include/strata/kernels/exl3.hpp).
 //
 // The codebooks and the trellis window arithmetic follow exllamav3 (MIT, turboderp - exllamav3_ext/quant/
@@ -17,7 +19,7 @@
 // NVIDIA GPUs before sm_80 (V100, T4, RTX 20) decode with v1.1.8's kernels instead (exl3_legacy.cu, use_legacy
 // below): this file's CUDA-core fallback was slower there (a V100 with EXL3-3.05bpw: decode 4.9 -> 4.4 tok/s).  The
 // prompt path below is this file's on every GPU.
-#include "strata/kernels/exl3.hpp"
+#include "strata/dsv41/exl3.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -32,7 +34,7 @@
 #include <utility>
 
 #if !defined(STRATA_USE_HIP)
-namespace strata::kernels::exl3::legacy {   // exl3_legacy.cu: v1.1.8's decode kernels
+namespace strata::dsv41k::exl3::legacy {   // exl3_legacy.cu: v1.1.8's decode kernels
 int launch_errors();
 bool prepare(cudaStream_t s);
 bool several_ok();
@@ -40,14 +42,14 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s);
 void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s);
 void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
 bool win_experts(const WinArgs& a, cudaStream_t s);
-}  // namespace strata::kernels::exl3::legacy
+}  // namespace strata::dsv41k::exl3::legacy
 #define EXL3_LEGACY(call) \
     if (use_legacy()) return legacy::call
 #else
 #define EXL3_LEGACY(call) (void) 0
 #endif
 
-namespace strata::kernels::exl3 {
+namespace strata::dsv41k::exl3 {
 namespace {
 
 constexpr int kThreads = 256, kWarps = 8;
@@ -1740,4 +1742,4 @@ void reconstruct_inner(const Mat& m, uint16_t* dst, cudaStream_t s) {
     launch_check("reconstruct_inner");
 }
 
-}  // namespace strata::kernels::exl3
+}  // namespace strata::dsv41k::exl3

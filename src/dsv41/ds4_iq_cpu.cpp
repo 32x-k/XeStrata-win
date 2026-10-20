@@ -1,10 +1,14 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/ds4/ds4_iq_cpu.cpp - a GGUF's low-bit experts on the CPU lane (see ds4_gguf_cpu.hpp): the GLM CPU lane's native
 // experts (src/kernels/cpu/native_expert.cpp), whose arithmetic is ggml-cpu's - and for IQ3_XXS / IQ3_S (Maya-S's
 // down, Maya-M's gate / up / down) rows of our own, the same numbers bit for bit, faster.
 #include "ds4_gguf_cpu.hpp"
-
+// Strata port: the low-bit (IQ) experts have no CPU lane here (they need Maya's native_expert split-base rows); the stub
+// branch below answers for them.  MXFP4, the source format, has its own CPU rows (ds4_gguf_cpu.cpp).
+#undef STRATA_NATIVE_EXPERTS
 #if defined(STRATA_NATIVE_EXPERTS)
-#include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"  // (only with STRATA_NATIVE_EXPERTS)
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -42,7 +46,7 @@
 namespace strata::ds4::gguf {
 
 #if defined(STRATA_NATIVE_EXPERTS)
-namespace kc = strata::kernels::cpu;
+namespace kc = strata::dsv41k::cpu;
 namespace {
 kc::NativeFmt native(const IqCpu& f) {   // (the fields the rows read; no lookups)
     kc::NativeFmt n;

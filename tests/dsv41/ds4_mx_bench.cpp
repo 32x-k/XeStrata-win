@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // tests/ds4_mx_bench.cpp - how fast does this CPU run DeepSeek-V4.1-Flash's MXFP4 experts on the CPU lane?
 //
 //   ds4_mx_bench [--threads 1,6,12] [--T 1,2,4,8,16] [--experts 16] [--per-layer 3] [--secs 0.4] [--pf 0]

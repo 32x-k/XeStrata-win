@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+# Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 """tools/ds4/vision_pack.py - DeepSeek-V4.1's vision tower (the part of the model that reads pictures, which the GGUFs
 leave out) for a GGUF install: shard 1 of DeepSeek's own checkpoint (model-00001-of-00048, the tower's vision.* and the
 aligner's aligner.* tensors, BF16, nothing else) and config.json (their geometry) from download_gguf.json's "vision"

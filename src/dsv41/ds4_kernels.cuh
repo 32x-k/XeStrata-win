@@ -1,5 +1,7 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/ds4/ds4_kernels.cuh - DeepSeek-V4.1's own device kernels for a window of T tokens (1 <= T <= kWin) at positions
-// p0 .. p0 + T - 1 (the EXL3 matrices go through strata::kernels::exl3).  The math is DeepSeek's inference/model.py
+// p0 .. p0 + T - 1 (the EXL3 matrices go through strata::dsv41k::exl3).  The math is DeepSeek's inference/model.py
 // (MIT); tools/ds4/ref.py is the oracle the engine is checked against.  Every pointer is device memory, every activation
 // F32, rows of a window back to back; the KV caches keep the reference's FP8 / FP4 roundings packed as DeepSeek stores
 // them (codes and scales, kv_row_bytes), the window attention's working rows BF16 (those values are exact in BF16).

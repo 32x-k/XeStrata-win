@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+# Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 """tools/ds4/ref_gguf.py - tools/ds4/ref.py's oracle over a GGUF (tools/ds4/pack_gguf.py's pack): the same forward,
 each weight dequantised in torch from the GGUF's own blocks (BF16, Q8_0, MXFP4, MXFP8) - a check of maya-ds4's GGUF
 path that shares none of its code.

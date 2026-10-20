@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+# Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 """tools/ds4/engram_hash.py - DeepSeek-V4.1's Engram n-gram hashes (after DeepSeek's inference/engram.py, MIT).
 
 A position is hashed as the n-grams (2 .. max_ngram_size) that end there, each over n_heads heads; every (n-gram

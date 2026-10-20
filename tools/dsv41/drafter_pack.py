@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+# Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 """tools/ds4/drafter_pack.py - DeepSeek-V4.1's DSpark drafter (the speculative decoder the GGUFs leave out) for a GGUF
 install: its three blocks from DeepSeek's own checkpoint (the shards that hold only them, model-00044..46-of-00048),
 in the formats the GGUF path runs, as one file beside them that pack_gguf.py adds to the pack.

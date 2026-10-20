@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/kernels/cuda/exl3_legacy.cu - v1.1.8's EXL3 decode kernels, kept for NVIDIA GPUs before sm_80 (V100, T4,
 // RTX 20): #180's decode kernels run the tiles on the tensor cores from sm_80 on, and their CUDA-core fallback was
 // slower here than these (a V100 with EXL3-3.05bpw: decode 4.9 -> 4.4 tok/s).  exl3.cu's mv / moe_gate_up / moe_down
@@ -17,7 +19,7 @@
 //     blocks: the partial sums go to a per-stream scratch and the LAST block of an output block adds them up in
 //     split order (deterministic) and runs the output rotation.
 #if !defined(STRATA_USE_HIP)   // (AMD runs exl3.cu's kernels; EXL3 does not run there anyway)
-#include "strata/kernels/exl3.hpp"
+#include "strata/dsv41/exl3.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -29,7 +31,7 @@
 #include <mutex>
 #include <utility>
 
-namespace strata::kernels::exl3::legacy {
+namespace strata::dsv41k::exl3::legacy {
 namespace {
 
 constexpr int kThreads = 256, kWarps = 8;
@@ -961,5 +963,5 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     return true;
 }
 
-}  // namespace strata::kernels::exl3::legacy
+}  // namespace strata::dsv41k::exl3::legacy
 #endif
