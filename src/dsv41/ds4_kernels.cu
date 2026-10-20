@@ -5,12 +5,16 @@
 #include "ds4_kernels.cuh"
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
+#include "ds4_attn_split.cuh"
 
 #include <cuda_fp16.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
+#include <cstdlib>
+#include <map>
+#include <mutex>
 #include <cstdio>
 
 namespace strata::ds4 {
@@ -1760,6 +1764,40 @@ int cdiv(int a, int b) { return (a + b - 1) / b; }
 
 }  // namespace
 
+namespace {
+
+// ---- the split-KV attention's scratch: a device allocation a (device, stream), made on first use and kept
+constexpr int kSplitG = 4, kSplitR = 40, kSplitCap = 24, kSplitMaxT = 5;
+bool split_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("DS4_ATTN_SPLIT");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    return on;
+}
+attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
+    static std::mutex mu;
+    static std::map<std::pair<int, cudaStream_t>, attnsplit::AttnSplitScratch> m;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = m.find({dev, s});
+    if (it != m.end()) return it->second;
+    attnsplit::AttnSplitScratch sc;
+    sc.nsplit = kSplitCap;
+    sc.max_t = kSplitMaxT;
+    const size_t np = (size_t) kSplitMaxT * heads * kSplitCap;
+    if (cudaMalloc((void**) &sc.part, np * 512 * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void**) &sc.ml, np * 2 * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        if (sc.part != nullptr) cudaFree(sc.part);
+        sc = attnsplit::AttnSplitScratch{};
+    }
+    m[{dev, s}] = sc;
+    return sc;
+}
+}  // namespace
+
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
@@ -1927,6 +1965,21 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
         sparse_attn_kernel<false><<<dim3(heads, T), kThreads, 0, s>>>(q, win, (const uint16_t*) ckv, sel, sel_stride, a,
                                                                        sink, heads, d, scale, out);
         return;
+    }
+    // a decode step / short verify window of packed rows: the split-KV kernel (Strata's CUDA lab, ds4_attn_split.cuh; 2.9x at
+    // one query on an A4000).  The same inputs; the merge sums the chunks in another order, so the bits differ in the last
+    // place (4e-7 against a double reference).  DS4_ATTN_SPLIT=0 keeps the original kernels.
+    if (ckv_fmt == kKvFp4 && a.gen == 0 && T >= 1 && T <= kSplitMaxT && heads % kSplitG == 0 && split_enabled()) {
+        int total_max = 0;
+        for (int t = 0; t < T; ++t) total_max = std::max(total_max, a.nwin[t] + a.nsel[t]);
+        if (total_max > 0 && total_max <= kSplitCap * kSplitR) {
+            const attnsplit::AttnSplitScratch sc = split_scratch(s, heads);
+            if (sc.part != nullptr) {
+                attnsplit::sparse_attn_split<kSplitG, kSplitR>(q, win, (const uint8_t*) ckv, kv_row_bytes(kKvFp4, d), sel,
+                                                               sel_stride, a, sink, heads, T, scale, out, sc, total_max, s);
+                return;
+            }
+        }
     }
     // a few queries (a decode step, a short window): their selected rows decoded once a query into the scratch, then
     // the BF16 rows' kernel itself (heads_per_block -1: this way at any T)
