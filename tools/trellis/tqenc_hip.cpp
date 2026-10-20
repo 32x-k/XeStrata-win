@@ -163,15 +163,20 @@ __global__ void __launch_bounds__(32768 >> SL) pass_kernel(Pass P) {
             }
             __syncthreads();
             const float4* m4 = reinterpret_cast<const float4*>(&mbuf[par][(SPT * tid) & (G - 1)]);
+            // keep the compiler from caching the 2 * SPT hashed table addresses across the steps (they are loop invariant,
+            // and 128 live registers spill): an empty asm makes x0 "new" every step
+            uint32_t x0s = x0;
+            asm volatile("" : "+v"(x0s));
 #pragma unroll
             for (int j4 = 0; j4 < SPT / 4; ++j4) {
                 const float4 mm = m4[j4];
-                const uint32_t xa = x0 + (uint32_t) (4 * j4) * kC;
+                const uint32_t xa = x0s + (uint32_t) (4 * j4) * kC;
                 const uint32_t xb = xa + kC, xc = xb + kC, xd = xc + kC;
                 D[4 * j4 + 0] = mm.x + tab[par][0][xa >> 21] + tab[par][1][(xa >> 10) & 2047u];
                 D[4 * j4 + 1] = mm.y + tab[par][0][xb >> 21] + tab[par][1][(xb >> 10) & 2047u];
                 D[4 * j4 + 2] = mm.z + tab[par][0][xc >> 21] + tab[par][1][(xc >> 10) & 2047u];
                 D[4 * j4 + 3] = mm.w + tab[par][0][xd >> 21] + tab[par][1][(xd >> 10) & 2047u];
+                if ((j4 & 3) == 3) __builtin_amdgcn_sched_barrier(0);   // 16 states at a time: do not batch all the gathers
             }
         }
         // final state
