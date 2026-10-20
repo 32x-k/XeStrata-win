@@ -270,7 +270,7 @@ def flags_text(s: LaunchSettings, *, preset: str | None = None) -> str:
     else:
         if s.model_path:
             parts.append(f'--model-path "{s.model_path}"')
-        elif s.model:
+        if s.model:                                   # own files the table recognised say which model they are, so the line stays exact
             parts.append(f"--model {s.model.lower()}" + (f" --family {s.family}" if s.family and s.family != "qwen" else ""))
         if s.data_dir:
             parts.append(f'--data-dir "{s.data_dir}"')

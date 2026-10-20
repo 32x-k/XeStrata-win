@@ -339,6 +339,34 @@ def plain_issue(code: str) -> str:
     return f"{name}: {words}" if name else words
 
 
+def problem_words(issues: list, limit: int = 3) -> str:
+    """The problems of a file set as ONE sentence part, each said once: the same reason for several files names the files together
+    ("a.gguf and b.gguf: the file is cut short"), a reason that was already given is not given again, and a long list is cut with a count.
+    A folder that holds several models does not also say "not a size Strata knows"."""
+    codes = [str(x) for x in issues or []]
+    if "multiple_model_groups" in codes:
+        codes = [x for x in codes if x != "unrecognized_or_unsupported_model_variant"]
+    by_reason: dict[str, list[str]] = {}
+    for code in codes:
+        words = plain_issue(code)
+        name, sep, reason = words.partition(": ")
+        if sep and name.lower().endswith(".gguf"):
+            by_reason.setdefault(reason, []).append(name)
+        else:
+            by_reason.setdefault(words, [])
+    parts = []
+    for reason, names in by_reason.items():
+        if not names:
+            parts.append(reason)
+        elif len(names) <= 2:
+            parts.append(f"{' and '.join(names)}: {reason}")
+        else:
+            parts.append(f"{names[0]}, {names[1]} and {len(names) - 2} more files: {reason}")
+    if len(parts) > limit:
+        parts = parts[:limit] + [f"and {len(parts) - limit} more problem" + ("s" if len(parts) - limit > 1 else "")]
+    return "; ".join(parts)
+
+
 UNSUPPORTED_MODEL_TYPE = ("This model type isn't supported by the Strata engine. "
                           "Add it as a Custom model API (llama-server) instead.")
 # The picture readers Strata ships a pinned copy of (setup downloads and checks one of these next to the model).
@@ -494,6 +522,30 @@ def import_target(picked: str, plan: dict) -> str:
     except OSError:
         pass
     return plan.get("model_dir") or picked
+
+
+def own_path_problem(picked: str) -> tuple[str, str] | None:
+    """(what is wrong, what to do) when the path a person gave for their own model files is not there or holds no model file, in plain
+    words; None when there is something to look at. Said before anything is installed or downloaded, with the path the person typed."""
+    path = Path(absolute(picked))
+    kind = "file" if path.name.lower().endswith(".gguf") else "folder"
+    try:
+        if not path.exists():
+            if path.is_symlink():
+                return (f"This {kind} is a shortcut to something that is not there any more: {path}.",
+                        "Point it at the real folder, or at the .gguf file itself. Nothing was downloaded or changed.")
+            return (f"This {kind} does not exist: {path}.",
+                    "Check the spelling, and that the drive or folder is connected (in Docker or a virtual machine it has to be shared with it). "
+                    "Nothing was downloaded or changed.")
+        if path.is_dir():
+            has_files = any(entry.name.lower().endswith(".gguf") for entry in os.scandir(path))
+            if not has_files and not _folders_with_models(path):
+                return (f"There are no .gguf model files in {path}, nor in the folders inside it.",
+                        "Point it at the folder that holds the model's .gguf files (names like ...-00001-of-00002.gguf), or at one of the files. "
+                        "Nothing was downloaded or changed.")
+    except OSError:
+        return None
+    return None
 
 
 def plan_import(raw_path: str) -> dict:

@@ -259,7 +259,7 @@ class ModelStep(Base):
         async def case(app, pilot, ctx):
             await press(pilot, "enter", "o")
             self.assertIn("Type or paste the folder", text_of(app))
-            with mock.patch("strata_control.models.plan_import", return_value=plan) as pi:
+            with mock.patch("strata_control.models.plan_import", return_value=plan) as pi, mock.patch("strata_control.models.own_path_problem", return_value=None):
                 await typed(pilot, "/data/models/IQ3_XXS")
                 await press(pilot, "enter")
             self.assertEqual(ctx.settings.model_path, os.path.abspath("/data/models/IQ3_XXS"))
@@ -274,12 +274,23 @@ class ModelStep(Base):
 
         async def case(app, pilot, ctx):
             await press(pilot, "enter", "o")
-            with mock.patch("strata_control.models.plan_import", return_value=plan):
+            with mock.patch("strata_control.models.plan_import", return_value=plan), mock.patch("strata_control.models.own_path_problem", return_value=None):
                 await typed(pilot, "/x")
                 await press(pilot, "enter")
             t = flat(app)
             self.assertIn("some parts of the model are missing", t)
             self.assertIn("pick a model from the list", t)
+            self.assertIsNone(ctx.settings.model_path)
+        self.run_app(case)
+
+    def test_own_files_folder_that_is_not_there_is_named(self):
+        async def case(app, pilot, ctx):
+            await press(pilot, "enter", "o")
+            await typed(pilot, "/no/such/folder")
+            await press(pilot, "enter")
+            t = flat(app)
+            self.assertIn("does not exist", t)
+            self.assertIn("Nothing was downloaded", t)
             self.assertIsNone(ctx.settings.model_path)
         self.run_app(case)
 

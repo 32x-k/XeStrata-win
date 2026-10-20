@@ -310,12 +310,23 @@ def download_text(dl: dict, already: bool, label: str | None = None) -> str:
     return f"{label}: {dl['done_gb']:.1f} of {dl['total_gb']:.1f} GB" if label else f"Downloading {dl['done_gb']:.1f} of {dl['total_gb']:.1f} GB"
 
 
+_END = object()
+
+
+def _elapsed(seconds: float) -> str:
+    """'40 s', '3 min' (plain, rounded down)."""
+    seconds = int(seconds)
+    return f"{seconds} s" if seconds < 90 else f"{seconds // 60} min"
+
+
 class Runner:
     def __init__(self, s: S.LaunchSettings, *, catalog: Catalog | None = None, emit: Callable[[Event], None] | None = None,
                  cancel: threading.Event | None = None, feed: str | None = None, python: str | None = None,
                  components_dir: str | None = None, hardware: dict | None = None,
-                 confirm: Callable[[str, str], bool] | None = None, assume_yes: bool = False, move_data: bool = False):
+                 confirm: Callable[[str, str], bool] | None = None, assume_yes: bool = False, move_data: bool = False,
+                 retune: bool = False):
         self.s = s
+        self.retune = retune                  # --retune: measure again even when a tuning result for this model on this computer is stored
         self.move_data = move_data            # --move-data / the answer "move": the model files already here go to the new --data-dir
         self.confirm = confirm                # asked (title, text) before a model is downloaded with no engine; True = go on
         self.assume_yes = assume_yes          # --yes: no questions
@@ -331,6 +342,7 @@ class Runner:
         self.notices: list[str] = []
         self.tune_result: dict | None = None
         self.config_path: Path | None = None
+        self._own_checked = False
 
     # ---- small helpers
     def emit(self, stage: str, text: str, pct: float | None = None, level: str = "info", **data: Any) -> None:
@@ -623,10 +635,55 @@ class Runner:
         """(title, text) of the question before a download starts, naming exactly what is fetched."""
         return self.model_state().question()
 
+    #: seconds of silence from setup before a "still working" line (packing a 40 GB model prints nothing for minutes)
+    HEARTBEAT_S = 30.0
+
+    def _read_lines(self, p: subprocess.Popen):
+        """The lines setup prints, and None whenever a second passes with none, so a silent step can say it is still going and a cancel is
+        seen at once."""
+        import queue
+        q: queue.Queue = queue.Queue()
+
+        def pump() -> None:
+            try:
+                for ln in p.stdout:                          # type: ignore[union-attr]
+                    q.put(ln)
+            finally:
+                q.put(_END)
+        threading.Thread(target=pump, daemon=True).start()
+        while True:
+            try:
+                ln = q.get(timeout=min(1.0, max(0.05, self.HEARTBEAT_S / 2)))
+            except queue.Empty:
+                yield None
+                continue
+            if ln is _END:
+                return
+            yield ln
+
+    def progress_job(self) -> dict:
+        """What the download figure is counted over: the folder setup writes the model into (the data folder it is GIVEN, which may be the
+        person's --data-dir and not the default one) and every file of the install with the catalog's total, so a model in several shards
+        shows 'of 66.4 GB' from the start and not the size of the file being fetched."""
+        s, cat = self.s, self.catalog
+        data = Path(s.data_dir) if s.data_dir else (self.existing_data_dir() or cat.data_dir())
+        models_dir = data / "models"
+        job = {"folder": str(models_dir / cat.tag_of(s.family, s.model)),
+               "total_gb": float(next((r.download_gb for r in cat.rows() if r.family == s.family and r.model == s.model), 0) or 0)}
+        try:
+            setup_module = cat.strata.setup_module()
+            if setup_module is not None and not s.model_path:
+                job["files"] = cat.mcp.expected_files(setup_module, str(s.family), str(s.model), models_dir, self.vision_word() != "no")
+                first = next((f for f in job["files"] if f.get("role") == "model"), None)
+                if first:                                    # the folder setup names it (Q2_0), not the lower-case run-config tag (q2_0)
+                    job["folder"] = str(Path(first["path"]).parent)
+        except Exception:                                    # noqa: BLE001 - progress is a convenience; the folder scan still counts
+            pass
+        return job
+
     def ensure_model(self) -> Path:
         s, cat = self.s, self.catalog
-        if s.model_path:
-            self.resolve_own_files()
+        self.check_own_files()
         self.resolved_vision()
         if not (s.family and s.model):
             raise LaunchError("No model was chosen.", "Choose a model, or use --model NAME (strata launch --help lists them).", 2)
@@ -641,7 +698,8 @@ class Runner:
             adopted = self.adopt_prepared_files("no Mac model installer in this Terminal")
             if adopted is not None:
                 return adopted
-        self.emit("model", f"Getting {title} ready (a download may be large; it continues where it stopped if interrupted)…", 0)
+        self.emit("model", f"Preparing {title} from your model files…" if s.model_path else
+                  f"Getting {title} ready (a download may be large; it continues where it stopped if interrupted)…", 0)
         argv = [self.python, str(cat.src / "setup.py"), *self.setup_args()]
         env = self._env()
         env.update(STRATA_CONTROL_INSTALL="1", STRATA_INSTALL_DIR=str(cat.root), PYTHONNOUSERSITE="1")
@@ -656,20 +714,32 @@ class Runner:
         p = self._spawn(argv, env=env, cwd=str(cat.src))
         lines: list[str] = []
         already: bool | None = None                          # all the model's files were on disk before this run wrote anything
-        folder = str(cat.data_dir() / "models" / cat.tag_of(s.family, s.model))
-        total = float(next((r.download_gb for r in cat.rows() if r.family == s.family and r.model == s.model), 0) or 0)
-        for line in p.stdout:                                # type: ignore[union-attr]
+        job = self.progress_job()
+        step_seen, step_since, quiet_since, said = None, time.monotonic(), time.monotonic(), None
+        for line in self._read_lines(p):
             if self.cancel.is_set():
                 self._stop_children()
                 raise Cancelled()
+            if line is None:                                 # nothing printed for a while: the long steps (packing, converting) are silent
+                if said and said[1] != "download" and time.monotonic() - quiet_since >= self.HEARTBEAT_S:
+                    quiet_since = time.monotonic()
+                    self.emit("model", f"{said[0]} (still working, {_elapsed(time.monotonic() - step_since)} so far)", None, step=step_seen)
+                continue
+            quiet_since = time.monotonic()
             line = line.rstrip()
             if not line:
                 continue
             lines.append(line)
             lines[:] = lines[-1500:]
             prog = cat.mcp.install_progress(lines)
-            prog = cat.mcp.combined_progress(prog, {"folder": folder, "total_gb": total})
+            prog = cat.mcp.combined_progress(prog, job)
             dl, phase, label = prog.get("download"), prog.get("phase"), prog.get("label")
+            if prog.get("step") != step_seen:
+                step_seen, step_since = prog.get("step"), time.monotonic()
+            if label and not dl:
+                said = (label, phase)
+            else:
+                said = None
             if dl and dl.get("total_gb", 0) >= 0.05 and not (s.model_path and phase == "download"):
                 if phase == "download" and already is None:
                     already = float(dl["percent"]) >= 99.5
@@ -695,7 +765,8 @@ class Runner:
             if adopted is not None:
                 return adopted
             raise LaunchError("The model could not be installed." + (f" {err}." if err else ""),
-                              hint or "Run it again: finished steps are skipped and a download continues where it stopped.", 6)
+                              hint or ("Run it again: finished steps are skipped." if s.model_path else
+                                       "Run it again: finished steps are skipped and a download continues where it stopped."), 6)
         path, _desc = self.installed_state()
         if path is None:
             raise LaunchError("Setup finished but no run config was written for this model.",
@@ -737,12 +808,22 @@ class Runner:
         self.emit("model", f"Used your prepared model files and wrote the run settings ({path.name}); this card is not one the built-in downloader sets up.", 100, level="warn")
         return path
 
+    def check_own_files(self) -> None:
+        """The person's own model files, looked at once: a path that is not there or holds no model is said in plain words first, and the
+        files are matched to the catalog model (resolve_own_files). Nothing else is done with a path that was already checked."""
+        if self.s.model_path and not self._own_checked:
+            self.resolve_own_files()
+            self._own_checked = True
+
     def resolve_own_files(self) -> None:
         """"Use model files I already have": the fingerprint table says which catalog model the files are, and which folder holds them (the
         person may have named the folder above it). When the person also named the model (--model), the files are never refused here: setup
         takes the files of that model out of the folder by name, as it always did (0.1.45), and says what is wrong when it cannot."""
         from strata_control import models
         s = self.s
+        problem = models.own_path_problem(s.model_path)
+        if problem:                                          # before the engine or setup are touched, with the path as typed
+            raise LaunchError(problem[0], problem[1], 2)
         given = bool(s.family and s.model)
         try:
             plan = models.plan_import(models.absolute(s.model_path))
@@ -760,7 +841,7 @@ class Runner:
         sel = plan.get("candidate_selection") or {}
         fam, model = sel.get("family"), sel.get("model")
         if not (fam and model) or plan.get("issues"):
-            issues = "; ".join(plain_issue(str(x)) for x in (plan.get("issues") or [])[:3]) or "they are not a model Strata knows"
+            issues = models.problem_words(plan.get("issues") or []) or "they are not a model Strata knows"
             more = " " + next((m for m in plan.get("messages") or [] if "holds" in m), "")
             raise LaunchError(f"These files cannot be used as they are ({issues}).{more.rstrip()}",
                               "Choose the matching model in the list, or check that every shard is in the folder.", 5)
@@ -811,16 +892,23 @@ class Runner:
         if s.tune == "skip":
             return
         from strata_control import presets
-        if s.tuned_preset:
-            try:
-                presets.find(s.tuned_preset)
-                self.emit("tune", "This preset is already tuned for this computer.", 100)
+        if not self.retune:
+            if s.tuned_preset:
+                try:
+                    presets.find(s.tuned_preset)
+                    self.emit("tune", "This preset is already tuned for this computer.", 100)
+                    return
+                except presets.PresetError:
+                    pass
+            elif s.tuned_at:                                 # measured before: the standard settings were already the fastest, nothing was saved
+                self.emit("tune", f"Already tuned on {s.tuned_at}: this computer runs best with the standard settings. Nothing to do.", 100)
                 return
-            except presets.PresetError:
-                pass
-        elif s.tuned_at:                                     # measured before: the standard settings were already the fastest, nothing was saved
-            self.emit("tune", f"Already tuned on {s.tuned_at}: this computer runs best with the standard settings. Nothing to do.", 100)
-            return
+            stored = self.stored_tuning()
+            if stored:                                       # the same model and choices were tuned on this computer before (a run by flags, no preset)
+                s.tuned_preset, s.tuned_at = stored["id"], stored["date"]
+                self.emit("tune", f"This model was already tuned for this computer on {stored['date']} ('{stored['name']}'), so that result is used "
+                                  "and nothing is measured again. Add --retune to measure again.", 100)
+                return
         mode = "thorough" if s.tune == "thorough" else "quick"
         status_file = launch_dir() / f"{self.name}.tune.json"
         try:
@@ -865,6 +953,22 @@ class Runner:
         elif result and result.get("outcome") == "default_confirmed":
             s.tuned_at = time.strftime("%Y-%m-%d")
         self.emit("tune", f"Tuning result: {word}. {sentence}", 100, level="info" if word in ("faster", "already fastest") else "warn", word=word)
+
+    def stored_tuning(self) -> dict | None:
+        """The tuning result stored for this launch's model, choices and computer (the active preset of its slot in the shared presets store,
+        which the start applies), or None. A result whose computer changed in a way that matters (a different card, processor or memory,
+        another model file) is not reused: it is measured again."""
+        if self.config_path is None:
+            return None
+        from strata_control import presets
+        try:
+            _cfg, info = presets.overlay(read_config(self.config_path))
+            if not info.get("applied") or not info.get("preset"):
+                return None
+            made = str(presets.load(info["preset"]["id"]).get("created") or "")[:10]
+            return {"id": info["preset"]["id"], "name": info["preset"]["name"], "date": made or time.strftime("%Y-%m-%d")}
+        except Exception:                                    # noqa: BLE001 - an unreadable store means: measure
+            return None
 
     tune_word: str | None = None
 
@@ -933,14 +1037,79 @@ class Runner:
         return tunnel
 
     # ---- all of it
+    def row(self):
+        """The catalog row of the chosen model (None for a model the list does not carry)."""
+        s = self.s
+        return next((r for r in self.catalog.rows() if (r.family, r.model) == (s.family, s.model)), None)
+
+    def download_plan(self) -> dict:
+        """What this launch would download, in numbers and words (nothing is changed): the model's missing files, and for a model that is
+        not on this computer yet also the draft layer and the picture reader that setup fetches after it. 0 when everything is here."""
+        from strata_control import engine_component
+        from strata_control.discovery import MMPROJ_GB, MTP_FETCH_GB
+        s = self.s
+        st = self.model_state()
+        parts = [{"kind": p.kind, "label": p.label, "gb": round(p.gb, 1)} for p in st.parts if p.gb >= 0.05]     # a part already on disk is not a download
+        row = self.row()
+        helpers = s.family in ("qwen", "swift", "coder", "unsloth")
+        wants_pictures = s.vision not in (None, "off") and row is not None and bool(row.images)
+        if helpers and (st.own_files or not st.installed):
+            # a model that is not set up yet (or the person's own files) comes without the draft layer and the picture reader: setup fetches them
+            # next to the prepared data, unless they are there already
+            have = {p["kind"] for p in parts}
+            try:
+                data = Path(st.folder) if st.folder else (Path(s.data_dir) if s.data_dir else (self.existing_data_dir() or self.catalog.data_dir()))
+                if s.mtp != "off" and "mtp" not in have and not (data / "mtp" / "rt" / "experts.bin").is_file():
+                    parts.append({"kind": "mtp", "label": "the draft layer", "gb": MTP_FETCH_GB})
+                has_reader = list((data / "models").glob("mmproj*.gguf")) or list((data / "Models").glob("mmproj*.gguf"))
+                if wants_pictures and "mmproj" not in have and not has_reader:
+                    parts.append({"kind": "mmproj", "label": "the picture reader", "gb": MMPROJ_GB})
+            except OSError:
+                pass
+        gb = round(sum(p["gb"] for p in parts), 1)
+        engine = True
+        try:
+            engine = bool(engine_component.status(Path(self.components_dir) if self.components_dir else None).get("usable"))
+        except Exception:                                    # noqa: BLE001 - the plan must not fail on this
+            pass
+        if gb < 0.05:
+            text = ("Nothing to download: your model files are used where they are." if st.own_files
+                    else "Nothing to download: the model is already on this computer.")
+        else:
+            names = [f"{p['label']} ({p['gb']:.1f} GB)" for p in parts]
+            what = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+            text = f"About {gb:.1f} GB to download: {what}."
+            if st.on_disk_gb >= 1:
+                text += f" {st.on_disk_gb:.0f} GB of the model is already in its folder."
+            if st.own_files:
+                text += " Your model files are used where they are."
+        if not engine:
+            text += " The engine for your graphics card is downloaded first (from the update source; its size is shown when it starts)."
+        return {"gb": gb, "parts": parts, "engine_missing": not engine, "own_files": st.own_files, "text": text}
+
     def plan(self) -> dict:
         s = self.s
+        self.check_own_files()
         warns = [n.line() for n in (*S.check_access(s),)]
+        row = self.row()
+        try:
+            self.resolved_vision()
+        except Exception:                                    # noqa: BLE001
+            pass
+        try:
+            download = self.download_plan()
+        except Exception:                                    # noqa: BLE001 - a plan that cannot count the download still shows the rest
+            download = {"gb": None, "parts": [], "engine_missing": None, "own_files": bool(s.model_path),
+                        "text": "How much would be downloaded could not be worked out here."}
+        title = row.title if row is not None else (f"{s.family} {s.model}" if s.model else None)
+        model = {"title": title, "family": s.family, "model": s.model, "model_gb": row.download_gb if row is not None else None,
+                 "own_files": bool(s.model_path), "folder": s.model_path}
         return {"profile": self.profile, "settings": s.to_dict(with_key=False), "warnings": warns,
-                "flags": S.flags_text(s), "steps": list(STAGES)}
+                "flags": S.flags_text(s), "steps": list(STAGES), "model": model, "download": download}
 
     def run(self, *, start: bool = True) -> Result:
         try:
+            self.check_own_files()                           # a wrong --model-path is said before the engine is downloaded
             self.ensure_engine()
             self.check_cancel()
             base = self.ensure_model()

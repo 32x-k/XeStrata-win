@@ -30,6 +30,9 @@ examples:
 """
 
 
+PICTURE_WORDS = {"off": "off", "on": "on", "cpu": "on (the reader runs on the processor)", "gpu": "on (the reader runs on the graphics card)"}
+
+
 def _choice(label: str, options: tuple[str, ...]):
     def convert(value: str) -> str:
         v = str(value).strip().lower()
@@ -110,6 +113,9 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
     a.add_argument("--no-api-key", action="store_true", help="share beyond this computer without an API key (a warning is shown, nothing is refused)")
     o = p.add_argument_group("running")
     o.add_argument("--save-preset", metavar="NAME", help="save these choices under this name")
+    o.add_argument("--retune", action="store_true",
+                   help="with --tune (quick is used when --tune is not given): measure again even when this model was already tuned on this computer "
+                        "(by default a stored tuning result is reused and no measuring is done)")
     o.add_argument("--no-tui", action="store_true", help="no screens: serve, print the address and return")
     o.add_argument("--open", action="store_true", help="open the server's web page in your browser once it is serving (nothing opens a browser without this)")
     o.add_argument("--yes", action="store_true", help="do not ask questions (for one: whether to download the model on a computer with no engine yet)")
@@ -309,6 +315,17 @@ def gpu_notices(s: S.LaunchSettings, comp) -> list[S.Notice]:
 def _say(line: str = "") -> None:
     sys.stdout.write(line + "\n")
     sys.stdout.flush()
+
+
+def _interrupted_move_notice() -> None:
+    """One line when a move of the models folder was left unfinished (never blocks the launch)."""
+    try:
+        from strata_control import discovery, models_move
+        st = models_move.interrupted(discovery.data_dir(Path.home() / "Strata")[0])
+    except Exception:
+        return
+    if st:
+        _say("A move of your models was interrupted. Finish it with `strata models move --resume`, or keep them where they are with `strata models move --leave`.")
 
 
 def _printer(quiet: bool = False):
@@ -541,6 +558,8 @@ def run_launch(a: argparse.Namespace) -> int:
             if a.model or a.model_path:
                 return fail(str(e), 5)
         s, notices = settings_from_args(a, catalog)
+        if not machine:
+            _interrupted_move_notice()
         have_choices = bool(a.preset or a.model or a.model_path or a.context or a.vision or a.parallel or a.access or a.tune)
         interactive = sys.stdin.isatty() and sys.stdout.isatty() and not a.no_tui and not machine and not a.plan
         plain_questions = False
@@ -559,6 +578,14 @@ def run_launch(a: argparse.Namespace) -> int:
             return _tui(app.run_tui, None, catalog=catalog, feed=a.feed, open_page=bool(a.open))
         if catalog is None:
             return fail("This Terminal does not carry the model list. Install it again with the one-line installer.", 5)
+        if getattr(a, "retune", False) and s.tune == "skip":
+            s.tune = "quick"
+        runner = Runner(s, catalog=catalog, emit=_printer(machine), feed=a.feed, assume_yes=bool(a.yes or machine), confirm=_ask_yes,
+                        retune=bool(getattr(a, "retune", False)))
+        try:
+            runner.check_own_files()                         # the person's own files: a wrong path is said now, and the files name the model
+        except LaunchError as e:
+            return fail(f"{e.text}" + (f" {e.next}" if e.next else ""), e.code)
         s, notes = apply_defaults(s, catalog)
         errors = [n for n in notes if n.level == "error"]
         if errors:
@@ -569,8 +596,7 @@ def run_launch(a: argparse.Namespace) -> int:
         if not s.name:
             s.name = f"{s.model or 'model'} {S.context_label(s.context)}"
         move_data = _move_data_choice(a, s, catalog, machine)
-        runner = Runner(s, catalog=catalog, emit=_printer(machine), feed=a.feed, assume_yes=bool(a.yes or machine), confirm=_ask_yes,
-                        move_data=move_data)
+        runner.s, runner.move_data = s, move_data
         if a.plan:
             plan = runner.plan()
             plan["warnings"] = [n.line() for n in notes]
@@ -578,8 +604,14 @@ def run_launch(a: argparse.Namespace) -> int:
                 print(json.dumps({"schema_version": 1, "ok": True, "plan": plan}))
             else:
                 _say(f"Plan for '{s.name}':")
-                _say(f"  model     {s.family} {s.model}" if s.model else f"  model     your files at {s.model_path}")
-                _say(f"  context   {S.context_label(s.context)}    pictures {s.vision}    parallel {s.parallel or 'fit to your card'}")
+                m = plan.get("model") or {}
+                size = f", {m['model_gb']:.0f} GB" if m.get("model_gb") else ""
+                if s.model_path:
+                    _say(f"  model     {m.get('title') or 'your model files'}{size}   (your files in {s.model_path})")
+                else:
+                    _say(f"  model     {m.get('title') or f'{s.family} {s.model}'}{size}")
+                _say(f"  context   {S.context_label(s.context)}    pictures {PICTURE_WORDS.get(s.vision or 'off', s.vision)}    parallel {s.parallel or 'fit to your card'}")
+                _say(f"  download  {(plan.get('download') or {}).get('text', '')}")
                 _say(f"  tuning    {s.tune}    access {S.ACCESS_WORDS[s.access]}, port {s.port}"
                      + ("    API key on" if s.api_key else ""))
                 for n in notes:
@@ -605,7 +637,7 @@ def run_launch(a: argparse.Namespace) -> int:
         if interactive and have_choices:
             from strata_cli.launch import app
             return _tui(app.run_tui, s, catalog=catalog, feed=a.feed, auto_run=True, save=bool(a.save_preset), open_page=bool(a.open),
-                         move_data=move_data)
+                         move_data=move_data, retune=bool(getattr(a, "retune", False)))
         try:
             result = runner.run()
         except LaunchError as e:

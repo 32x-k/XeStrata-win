@@ -795,10 +795,16 @@ class FlagsCommand(unittest.TestCase):
         self.assertEqual(p["settings"]["api_key"], "set")
 
     def test_model_path_is_used_instead_of_a_catalog_model(self):
-        p = self.plan("--model-path", "/data/models/IQ3_XXS")
-        s = p["settings"]
-        self.assertEqual(s["model_path"], str(Path("/data/models/IQ3_XXS")))
-        self.assertIsNone(s["model"])
+        import tempfile
+        from tests.terminal.test_own_files import IQ3XXS, gguf_bytes
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "IQ3_XXS"
+            folder.mkdir()
+            for n in IQ3XXS:
+                (folder / n).write_bytes(gguf_bytes(["IQ3_XXS"]))
+            s = self.plan("--model-path", str(folder))["settings"]
+        self.assertEqual(s["model_path"], str(folder))
+        self.assertEqual((s["family"], s["model"]), ("qwen", "IQ3_XXS"))      # the files say which model they are
 
     def test_no_choices_and_no_terminal_does_not_start_anything(self):
         with mock.patch.dict(os.environ, {"CI": "1"}), mock.patch.object(Runner, "run", side_effect=AssertionError("must not run")):

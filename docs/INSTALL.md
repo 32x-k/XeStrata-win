@@ -311,7 +311,9 @@ The model files are the only big part (70 to 190 GB). Put them where there is ro
 
 - **In the app:** the first screen shows the model folder with a button to change it, and Settings > Storage changes it
   later. Pick a folder you can save files in; a whole drive (`D:\`) becomes `D:\Strata`, which Strata makes and says so.
-  Models you already have in the old folder stay there and keep working; nothing is moved or deleted for you.
+  Change folder then asks what to do with your models: move them (copied file by file and checked before the old copies are removed; you can stop at any time),
+  keep them where they are and also use the new folder, or start empty (the old files are never deleted). From the Terminal the same move is
+  `strata models move NEW_FOLDER` (add `--plan` to see what it would do first).
 - **In the Terminal:** `strata launch --data-dir D:\Strata` once. The folder is remembered for the next `strata launch`
   and `strata models list`. Until you give it one, the Terminal uses the folder the app chose; the app keeps its own setting
   (Settings > Storage) and does not read the Terminal's. `--move-data` moves the models you already have into it; without it they stay where they

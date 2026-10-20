@@ -63,6 +63,7 @@ import zipfile
 from pathlib import Path
 
 from strata_control import acquisition
+from strata_control import atomic
 from strata_control import draft_layer
 from strata_control.discovery import in_trash
 from strata_control import user_args
@@ -2108,7 +2109,7 @@ def _save_pieces(part: Path, total: int, done: set):
         side = part.with_name(part.name + ".chunks")
         tmp = side.with_name(side.name + ".tmp")
         tmp.write_text(json.dumps({"v": 1, "total": total, "chunk": DL_CHUNK, "done": _ranges(done)}), encoding="utf-8")
-        os.replace(tmp, side)
+        atomic.replace(tmp, side)
     except OSError:
         pass                                            # only costs re-downloading a few pieces after a stop
 
@@ -5438,7 +5439,7 @@ def move_into(src: Path, dst: Path) -> None:
     if not dst.exists():
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(src, dst)
+            atomic.replace(src, dst)
             return
         except OSError:
             if not src.is_dir():
@@ -5608,7 +5609,7 @@ def write_config(path: Path, cfg: dict):
     a setup stopped half-way (a closed window, a full disk) never leaves an empty strata-*.json behind."""
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
-    os.replace(tmp, path)
+    atomic.replace(tmp, path)
 
 
 # #629: the run config's keys setup writes itself (and rewrites on every setup run); any other key is the user's - a

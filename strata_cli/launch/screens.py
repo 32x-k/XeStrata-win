@@ -492,8 +492,11 @@ class ModelScreen(Base):
         self.check_own(path)
 
     def check_own(self, path: str) -> None:
-        from strata_cli.launch.runner import plain_issue
         from strata_control import models
+        problem = models.own_path_problem(path)
+        if problem:
+            self.say(f"{problem[0]} {problem[1]}", True)
+            return
         try:
             plan = models.plan_import(models.absolute(path))
         except Exception as e:                               # noqa: BLE001
@@ -510,7 +513,7 @@ class ModelScreen(Base):
             self.menu().select((sel["family"], sel["model"]))
             self.paint()
         else:
-            why = "; ".join(plain_issue(str(x)) for x in (plan.get("issues") or [])[:3]) or "they are not a model Strata knows"
+            why = models.problem_words(plan.get("issues") or []) or "they are not a model Strata knows"
             holds = next((m for m in plan.get("messages") or [] if "holds" in m), "")
             self.say(f"These files cannot be used as they are ({why}). " + (holds + " " if holds else "") +
                      "Check that every shard is in the folder, or pick a model from the list.", True)

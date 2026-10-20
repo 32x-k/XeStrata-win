@@ -495,7 +495,7 @@ export interface SetupState {
   step: number;
   completedAt?: string;
   history: { step: number; at: string }[];
-  app: { version: string; modelsDir: string; dataDir: string };
+  app: { version: string; modelsDir: string; dataDir: string; modelsDirNotice?: string };
 }
 
 export interface EngineEvent {

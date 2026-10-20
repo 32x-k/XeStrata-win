@@ -966,6 +966,17 @@ async function api(req, res, path, method, url) {
   if(path==='/api/native'&&method==='GET')return json(res,200,await native.refresh(url.searchParams.get('refresh')==='1'));
   if(path==='/api/native'&&method==='PATCH')return json(res,200,await native.configure(await readBody(req)));
   if(path==='/api/native/directory'&&method==='POST')return json(res,200,native.setDownloadDirectory((await readBody(req)).directory));
+  /* Settings > Storage > Models folder: pick (or type) a folder, say what it means, then start the choice. Copying is Control's (strata models move). */
+  if(path==='/api/native/models-folder/plan'&&method==='POST'){
+   const typed=await typedFolder((await readBody(req)).path,{isAbsolute});
+   const picked=typed?{path:typed}:await chooseFolder('Choose a folder for your models');
+   if(picked.unavailable){const u=chooserUnavailable(picked);return error(res,501,u.message,{code:u.code});}
+   if(picked.cancelled)return json(res,200,{cancelled:true});
+   return json(res,200,{plan:await native.planModelsFolder(picked.path)});}
+  if(path==='/api/native/models-folder/start'&&method==='POST'){const body=await readBody(req);const result=await native.startModelsFolder({folder:body.path,choice:body.choice,stopRunning:body.stopRunning===true});return json(res,result.id?202:200,result);}
+  if(path==='/api/native/models-folder/interrupted'&&method==='GET')return json(res,200,{interrupted:await native.interruptedMove()});
+  if(path==='/api/native/models-folder/resume'&&method==='POST'){const body=await readBody(req);return json(res,202,await native.finishInterruptedMove({stopRunning:body.stopRunning===true}));}
+  if(path==='/api/native/models-folder/leave'&&method==='POST')return json(res,200,await native.leaveInterruptedMove());
   if(path==='/api/native/plan'&&method==='POST')return json(res,200,await native.plan(await readBody(req)));
   if(path==='/api/native/operations'&&method==='POST'){if(storageChanging)return error(res,409,'Wait for the model folder check to finish.');const body=await readBody(req);return json(res,202,native.operation(body.kind,body.args));}
   if(path==='/api/native/logs'&&method==='GET')return json(res,200,{logs:native.logs()});
@@ -1010,7 +1021,7 @@ async function api(req, res, path, method, url) {
   if(nativeSettingsFile&&method==='POST')return json(res,200,await native.openSettingsFile(nativeSettingsFile[1]));
 
   // Credentials are handled only on the host. Responses and events expose a key-set flag.
-  return error(res,404,'Unknown native control action.');}catch(e){return error(res,/Finish|Unload|running|current operation/.test(e.message)?409:400,e.message);}}
+  return error(res,404,'Unknown native control action.');}catch(e){return error(res,/Finish|Unload|running|current operation/.test(e.message)?409:400,e.message,{...(e.code&&typeof e.code==='string'?{code:e.code}:{}),...(e.details?{details:String(e.details)}:{})});}}
 
   if (path === '/api/model-providers' && method === 'GET') return json(res, 200, withPictureAnswers(modelProviders.list()));
   if (path === '/api/model-providers/discover' && method === 'POST') {

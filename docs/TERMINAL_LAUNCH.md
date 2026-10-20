@@ -70,7 +70,7 @@ strata launch --list-presets | --delete-preset NAME | --status | --stop [--prese
 
 `strata launch --help` lists everything with examples. An unknown model or flag gets a plain message with the closest match. Presets are small files in `launch-presets/` beside the profiles
 folder; the run uses the shared profile `launch-<name>` and the shared tuning presets (`strata presets`), so the app sees them too. Flags next to `--preset` change that start only
-(add `--save-preset` to keep them).
+(add `--save-preset` to keep them). `--plan` shows the model (also for your own files, which it recognises), the context, the picture setting and what would be downloaded and how big (0 when everything is already here). A model that was tuned before for the same choices on the same computer is not measured again by `--tune quick`; the stored result is used and the run says so. Add `--retune` to measure again.
 
 ## Connect your apps: `strata connect`
 

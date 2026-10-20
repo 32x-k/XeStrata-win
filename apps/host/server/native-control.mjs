@@ -2,8 +2,8 @@
 import { spawn } from 'node:child_process';
 import {chooseParallel,applyParallel,withoutParallel,FALLBACK_NOTE} from './native-parallel.mjs';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, realpathSync, copyFileSync, renameSync, unlinkSync, chmodSync, statSync, accessSync, constants } from 'node:fs';
-import { join, resolve, dirname, basename } from 'node:path';
+import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, realpathSync, copyFileSync, renameSync, rmSync, statfsSync, unlinkSync, chmodSync, statSync, accessSync, constants } from 'node:fs';
+import { join, resolve, dirname, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:net';
 import { NATIVE_FIELDS, APP_OWNED_FIELDS, withoutDraftLayer, validateNativeSettings, validateMcpServers, publicMcpServers, publicNativeEnv, restoreNativeEnv } from './native-settings.mjs';
@@ -52,7 +52,8 @@ export function createNativeControl({directory,requests=()=>[],changed=()=>{},sp
  let defaultId=null,timer=null,closing=false,polling=false;
  const emit=()=>{const value=state();writeFileSync(join(directory,'native-jobs.json'),JSON.stringify(value.jobs),{mode:0o600});changed(value);};
  const append=(instanceId,line)=>{logs.push({at:new Date().toISOString(),instanceId,line:String(line).slice(0,2000)});if(logs.length>400)logs.shift();};
- function state(){return {...snapshot,downloadDirectory:preferences.downloadDirectory??(modelsDirectory?modelsDirectory():snapshot.installed?.data_folder),fields:nativeFields(),instances:[...instances.values()].map(({key,configPath,fingerprint,mcpServers,...i})=>structuredClone(i)),defaultId,jobs:[...jobs.values()].slice(-12).map(({process,abort,engineAbort,rawResult,...j})=>j),capabilities:{responses:sourceText().includes('/v1/responses'),updates:!!snapshot.available,rollback:previousEngine(),componentUpdates:packaged&&typeof control.update==='function',calibration:packaged?false:snapshot.hardware?.gpus?.some(g=>/nvidia/i.test(g.name??''))??false}};}
+ function diskSpace(path){try{const s=statfsSync(path);return {free:Number(s.bavail)*Number(s.bsize),total:Number(s.blocks)*Number(s.bsize)};}catch{return null;}}
+ function state(){const folder=preferences.downloadDirectory??(modelsDirectory?modelsDirectory():snapshot.installed?.data_folder),space=folder?diskSpace(folder):null;return {...snapshot,downloadDirectory:folder,downloadFreeBytes:space?.free??null,downloadTotalBytes:space?.total??null,fields:nativeFields(),instances:[...instances.values()].map(({key,configPath,fingerprint,mcpServers,...i})=>structuredClone(i)),defaultId,jobs:[...jobs.values()].slice(-12).map(({process,abort,engineAbort,rawResult,...j})=>j),capabilities:{responses:sourceText().includes('/v1/responses'),updates:!!snapshot.available,rollback:previousEngine(),componentUpdates:packaged&&typeof control.update==='function',calibration:packaged?false:snapshot.hardware?.gpus?.some(g=>/nvidia/i.test(g.name??''))??false}};}
  let sourceCache={path:'',time:0,text:''};
  function sourceText(){try{const path=join(packaged?control.control.dir:preferences.repo,'serve/server.py'),time=statSync(path).mtimeMs;if(sourceCache.path===path&&sourceCache.time===time)return sourceCache.text;sourceCache={path,time,text:readFileSync(path,'utf8')};return sourceCache.text;}catch{return '';}}
  function nativeFields(){const source=sourceText();return NATIVE_FIELDS.map(field=>({...field,supported:APP_OWNED_FIELDS.includes(field.id)||field.id.startsWith('vision_')||field.id.startsWith('mcp_')||field.id==='vram_reserve_mib'||source.includes(field.id)}));}
@@ -126,7 +127,7 @@ export function createNativeControl({directory,requests=()=>[],changed=()=>{},sp
   refreshing=(async()=>{try{const [catalog,status]=packaged?await (async()=>{const s=await tool('strata_status',{hardware:true});const c=await tool('strata_models').catch(error=>({families:[],contexts:[],recommendation:{family:null,model:null},context_note:'',error:error.message}));return [c,s];})():await Promise.all([tool('strata_models'),tool('strata_status',{hardware:true})]);let visionReader=false;if(packaged){try{const e=await control.engine();const root=e?.engine?.root??(e?.engine?.exe?dirname(e.engine.exe):'');visionReader=!!root&&['strata-vision','strata-vision.exe'].some(n=>existsSync(join(root,n)));}catch{visionReader=false;}}const markImages=c=>c&&Array.isArray(c.families)?{...c,families:c.families.map(f=>({...f,imagesCapable:!!f.images,images:!!f.images&&visionReader,sizes:(f.sizes??[]).map(s=>({...s,imagesCapable:!!s.images,images:!!s.images&&visionReader}))}))}:c;snapshot={available:true,repo:packaged?status.installDir:repo(),version:packaged?(control.version??null):await execute('git',['describe','--tags','--always'],repo()).then(s=>s.trim()).catch(()=>null),summary:status.summary,catalog:markEngine(packaged?markImages(catalog):catalog,status.engine),engineInfo:{version:status.engine?.version??null,source:status.engine?.source??null},visionReader:packaged?visionReader:true,installed:installedInfo(status.installed),hardware:status.hardware,error:null,install:status.install,external:status.running??null,...(packaged?{packaged:true,installDir:status.installDir,engine:status.engine,installerError:status.installerError}:{})};lastRead=Date.now();if(status.install?.running&&![...jobs.values()].some(j=>j.state==='running'))begin('install',j=>watchInstall(j,status.install));}catch(error){snapshot={...snapshot,available:false,error:error.message};lastRead=Date.now();}emit();return state();})().finally(()=>{refreshing=null;});const run=refreshing;if(!force&&snapshot.available){run.catch(()=>{});return state();}return run;
  }
  function configure({repository}){if(packaged){if(instances.size||[...jobs.values()].some(j=>j.state==='running'))throw new Error('Unload models and finish operations before changing the installation.');const next=realpathSync(String(repository));if(!statSync(next).isDirectory())throw new Error('Choose the folder that holds your Strata model configurations.');preferences={...preferences,installDir:next};packagedInstall=null;disconnect();writeFileSync(settingsPath,JSON.stringify(preferences,null,2),{mode:0o600});lastRead=0;return refresh(true);}if(instances.size||[...jobs.values()].some(j=>j.state==='running'))throw new Error('Unload models and finish operations before changing the installation.');const next=realpathSync(String(repository));const old=preferences;preferences={...preferences,repo:next};try{repo();}catch(e){preferences=old;throw e;}disconnect();writeFileSync(settingsPath,JSON.stringify(preferences,null,2),{mode:0o600});lastRead=0;return refresh(true);}
- function setDownloadDirectory(input){if([...jobs.values()].some(j=>j.state==='running'))throw new Error('Finish the current operation before changing the folder.');if(typeof input!=='string'||!input.trim()||/[\r\n\0]/.test(input))throw new Error('Choose a model folder.');let path;try{path=realpathSync(input.trim());}catch{throw new Error('That folder does not exist. Check the path, or that the drive is connected.');}if(!statSync(path).isDirectory())throw new Error('Choose a folder, not a file.');/* A whole drive (D:\) is not filled with models: D:\Strata is made and used. */if(isDriveRoot(path)){const own=dataFolderFromPick(path).path;makeFolder(own);path=realpathSync(own);}try{accessSync(path,constants.R_OK|constants.W_OK);}catch{throw new Error('Strata cannot write in that folder. Choose a folder you can save files in.');}preferences={...preferences,downloadDirectory:path};/* the same choice for the installer and the Terminal: the Control settings file */if(packaged)rememberDataFolder(controlSettingsFile(),path,Date.now()/1000,true);writeFileSync(settingsPath,JSON.stringify(preferences,null,2),{mode:0o600});shareDataFolder();emit();return state();}
+ function setDownloadDirectory(input,{insideJob=false}={}){if(!insideJob&&[...jobs.values()].some(j=>j.state==='running'))throw new Error('Finish the current operation before changing the folder.');if(typeof input!=='string'||!input.trim()||/[\r\n\0]/.test(input))throw new Error('Choose a model folder.');let path;try{path=realpathSync(input.trim());}catch{throw new Error('That folder does not exist. Check the path, or that the drive is connected.');}if(!statSync(path).isDirectory())throw new Error('Choose a folder, not a file.');/* A whole drive (D:\) is not filled with models: D:\Strata is made and used. */if(isDriveRoot(path)){const own=dataFolderFromPick(path).path;makeFolder(own);path=realpathSync(own);}try{accessSync(path,constants.R_OK|constants.W_OK);}catch{throw new Error('Strata cannot write in that folder. Choose a folder you can save files in.');}preferences={...preferences,downloadDirectory:path};/* the same choice for the installer and the Terminal: the Control settings file */if(packaged)rememberDataFolder(controlSettingsFile(),path,Date.now()/1000,true);writeFileSync(settingsPath,JSON.stringify(preferences,null,2),{mode:0o600});shareDataFolder();emit();return state();}
  function recordFile(model){if(!safeId(model))throw new Error('Choose an installed model.');const entry=snapshot.installed?.models?.find(i=>i.model===model);if(!entry)throw new Error('This model is not installed. Download and prepare it first.');const path=realpathSync(entry.configPath??join(repo(),entry.config));if(dirname(path)!==repo()||!/^strata-[a-z0-9_-]+\.json$/i.test(basename(path)))throw new Error('The model configuration is outside the Strata installation.');return {entry,path};}
  function record(model){const {entry,path}=recordFile(model);return {entry,path,config:readJson(path)};}
  /* The text file a power user edits by hand: where it is and what is wrong in it (run-config-check.mjs). */
@@ -377,10 +378,104 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   return autotuner.start(job,job.kind==='recheck'?'recheck':'tune',{configPath:path,presetId:args.presetId,mode:args.mode,use:args.use,goal:room?'room':'speed',leaveRam:room?20:0,allowSmallDifferences:args.allowSmallDifferences===true,name:args.name},{onProgress:p=>{job.summary=p.text??job.summary;emit();}});
  }
  function operation(kind,args={}){if(!['install','load','benchmark','tune','autotune','recheck','calibrate','update-engine','update-strata','rollback','remove'].includes(kind))throw new Error('Choose a supported native operation.');if(!snapshot.available)throw new Error(snapshot.error??'Connect the native Strata installation first.');if(kind==='install'||kind==='load'){const refusal=engineRefusal(snapshot.catalog,args.model,snapshot.engineInfo);if(refusal)throw new Error(refusal);}return begin(kind,job=>kind==='install'?install(job,args):kind==='load'?loadEngine(job,args):kind==='benchmark'?benchmark(job,args):kind==='tune'?tune(job,args):kind==='autotune'||kind==='recheck'?autotune(job,args):kind==='remove'?removeModel(job,args):program(job,args),{guided:args.guided===true,model:args.model,...(args.family?{family:args.family}:{})});}
- async function cancel(id){const job=jobs.get(id);if(!job||job.state!=='running')throw new Error('This operation is no longer running.');if(job.kind==='install'){job.engineAbort?.abort();await tool('strata_install',{cancel:true});}else if(job.abort)job.abort.abort();else if(job.process){if(!['tune','calibrate','autotune','recheck'].includes(job.kind))throw new Error('File updates cannot be cancelled safely while files are being replaced.');job.state='cancelled';await stopProcess(job.process);}job.state='cancelled';job.summary=job.kind==='install'?'Stopped. Completed downloads are kept.':'Stopped.';emit();return state();}
+ /* ---- The models folder card (0.2.2): what a picked folder means, and the three choices. The copying is Control's (strata models move). ---- */
+ const currentModelsFolder=()=>preferences.downloadDirectory??(modelsDirectory?modelsDirectory():snapshot.installed?.data_folder)??null;
+ const moveFile=()=>join(directory,'models-move.cancel');
+ const folderWords=error=>({message:error.message,details:error.details||''});
+ /** A picked folder as the data folder: a whole drive (D:\) becomes D:\Strata, and the person is told (the models then live in D:\Strata\Models). */
+ function pickedModelsFolder(input){
+  if(typeof input!=='string'||!input.trim()||/[\r\n\0]/.test(input))throw new Error('Choose a models folder.');
+  const picked=resolve(input.trim()),target=dataFolderFromPick(picked);
+  return {picked,folder:target.path,wholeDrive:!!target.note,shown:target.note?join(target.path,'Models'):target.path};
+ }
+ async function planModelsFolder(input){
+  if(!packaged)throw new Error('Changing the models folder is part of the Strata app.');
+  const now=currentModelsFolder();if(!now)throw new Error('Strata is still reading your models folder. Try again in a moment.');
+  const pick=pickedModelsFolder(input),plan=await control.planModelsMove(now,pick.folder);
+  return {...plan,...pick,current:now,running:instances.size,busy:[...jobs.values()].some(j=>j.state==='running')};
+ }
+ /* "Start empty": the old models are no longer listed. Their run configs are moved (not deleted) into old-models beside the others; the model files are not touched. */
+ function setAsideConfigs(old){
+  const folder=repo(),kept=join(folder,'old-models'),aside=[];
+  const under=value=>typeof value==='string'&&[ 'models','packs','mtp' ].some(item=>{const base=join(old,item).toLowerCase();const v=value.toLowerCase();return v===base||v.startsWith(base+sep)||v.startsWith(base+'/');});
+  const scan=value=>Array.isArray(value)?value.some(scan):value&&typeof value==='object'?Object.values(value).some(scan):under(value);
+  for(const name of readdirSync(folder)){
+   if(!/^strata-[a-z0-9_-]+\.json$/i.test(name)||name.endsWith('.shared-settings.json'))continue;
+   if(!scan(readJson(join(folder,name))))continue;
+   mkdirSync(kept,{recursive:true});renameSync(join(folder,name),join(kept,name));aside.push(name);
+  }
+  return aside;
+ }
+ async function startModelsFolder({folder:input,choice,stopRunning=false}){
+  if(!packaged)throw new Error('Changing the models folder is part of the Strata app.');
+  if(!['move','keep','empty'].includes(choice))throw new Error('Choose what to do with your models.');
+  if([...jobs.values()].some(j=>j.state==='running'))throw new Error('Finish or stop the download to change the folder.');
+  const plan=await planModelsFolder(input);
+  if(plan.issue)throw Object.assign(new Error(plan.issue.message),{details:plan.issue.details,code:plan.issue.code});
+  if(!plan.choices[choice].possible)throw Object.assign(new Error(plan.choices[choice].reason||'That choice is not possible here.'),{code:'not_possible'});
+  if(instances.size){
+   if(!stopRunning)throw Object.assign(new Error('A model is running. Stop it first, then change the folder.'),{code:'running'});
+   for(const id of [...instances.keys()])await unload(id);
+  }
+  const old=plan.current,target=plan.folder;
+  if(choice!=='move'){
+   makeFolder(target);
+   const aside=choice==='empty'?setAsideConfigs(old):[];
+   setDownloadDirectory(target);lastRead=0;await refresh(true);
+   return {done:true,choice,folder:target,oldFolder:old,setAside:aside};
+  }
+  return runModelsMove(old,target,(from,to,options)=>control.moveModels(from,to,options));
+ }
+ /* The move as a job (the progress dialog reads it). `run` is moveModels for a new move, resumeModelsMove for "Finish it". */
+ function runModelsMove(old,target,run){
+  rmSync(moveFile(),{force:true});
+  return begin('models-move',async job=>{
+   job.cancelFile=moveFile();job.summary='Starting…';
+   try{
+    const result=await run(old,target,{installDir:repo(),cancelFile:moveFile(),onEvent:event=>{
+     if(event.event!=='progress')return;
+     job.progress={done:event.done,total:event.total,file:event.file,group:event.group,index:event.index,count:event.count,secondsLeft:event.seconds_left||0,sameDrive:!!event.same_drive};
+     job.summary=`${Math.round(event.done/1e8)/10} of ${Math.round(event.total/1e8)/10} GB`;emit();}});
+    const finished={done:!!result.done,stopped:!!result.stopped,moved:result.moved??[],remaining:result.remaining??[],bytes:result.bytes_moved??0,total:result.total_bytes??0,from:old,to:target,files:result.files_moved??0,sameDrive:!!result.same_drive};
+    /* Only a whole move changes the folder the app uses: a stopped move leaves it where it was, and every model works where it is. */
+    if(result.done){setDownloadDirectory(target,{insideJob:true});finished.folder=target;}
+    job.progress=null;
+    return {summary:result.done?'Your models are moved.':'Moving stopped. Nothing was lost.',...finished};
+   }catch(error){
+    const left=error.output;
+    job.result={failed:true,code:error.code,moved:left?.moved??[],remaining:left?.remaining??[],bytes:left?.bytes_moved??0,total:left?.total_bytes??0,from:old,to:target};
+    job.progress=null;
+    throw error;
+   }finally{rmSync(moveFile(),{force:true});}
+  },{family:undefined});
+ }
+ /* "A move was interrupted. Finish it or leave it": the next start finds the unfinished move (Control keeps a note in the models folder in use). */
+ async function interruptedMove(){
+  if(!packaged)return null;
+  const now=currentModelsFolder();if(!now)return null;
+  if([...jobs.values()].some(j=>j.kind==='models-move'&&j.state==='running'))return null;
+  try{return await control.interruptedModelsMove(now);}catch{return null;}
+ }
+ async function finishInterruptedMove({stopRunning=false}={}){
+  const st=await interruptedMove();if(!st)throw new Error('No move was interrupted.');
+  if([...jobs.values()].some(j=>j.state==='running'))throw new Error('Finish or stop the download to change the folder.');
+  if(instances.size){
+   if(!stopRunning)throw Object.assign(new Error('A model is running. Stop it first, then change the folder.'),{code:'running'});
+   for(const id of [...instances.keys()])await unload(id);
+  }
+  return runModelsMove(st.from,st.to,(from,to,options)=>control.resumeModelsMove(from,options));
+ }
+ async function leaveInterruptedMove(){
+  const st=await interruptedMove();if(!st)throw new Error('No move was interrupted.');
+  if([...jobs.values()].some(j=>j.state==='running'))throw new Error('Finish or stop the download to change the folder.');
+  const result=await control.leaveModelsMove(st.from,{installDir:repo()});
+  lastRead=0;await refresh(true);
+  return {done:true,folder:st.from,partial:st.to,removed:result.removed??0,restored:result.restored??0};
+ }
+ async function cancel(id){const job=jobs.get(id);if(!job||job.state!=='running')throw new Error('This operation is no longer running.');if(job.kind==='install'){job.engineAbort?.abort();await tool('strata_install',{cancel:true});}else if(job.kind==='models-move'){/* a safe stop: the copy in flight is dropped, files already moved stay */try{writeFileSync(job.cancelFile,'stop');}catch{/* the run ends anyway */}job.summary='Stopping…';emit();return state();}else if(job.abort)job.abort.abort();else if(job.process){if(!['tune','calibrate','autotune','recheck'].includes(job.kind))throw new Error('File updates cannot be cancelled safely while files are being replaced.');job.state='cancelled';await stopProcess(job.process);}job.state='cancelled';job.summary=job.kind==='install'?'Stopped. Completed downloads are kept.':'Stopped.';emit();return state();}
  async function close(){closing=true;clearInterval(timer);const installing=packaged&&child&&[...jobs.values()].some(j=>j.kind==='install'&&j.state==='running');if(installing)await send('tools/call',{name:'strata_install',arguments:{cancel:true}},15000).catch(()=>{});const operations=[];for(const job of jobs.values()){job.abort?.abort();if(job.process)operations.push(stopProcess(job.process));if(job.state==='running')job.state='cancelled';}await Promise.all(operations);await Promise.all([...instances.keys()].map(id=>unload(id,true).catch(()=>{})));disconnect();}
  // Remove nonserializable process references from public jobs.
  const publicState=()=>{const value=state();value.jobs=value.jobs.map(({process,engineAbort,rawResult,...job})=>job);return value;};
  async function localPreview(path){if(!packaged)throw new Error('Checking local model files is part of the Strata app.');if(typeof path!=='string'||!path.trim()||[...path].some(c=>c.charCodeAt(0)<32))throw new Error('Choose a folder.');return control.importPlan(path.trim());}
- return {state:publicState,tuneStatus,tuneEffective,tuneOff,tunePresets:{list:()=>autotuner.list(),action:(kind,id,extra)=>autotuner.action(kind,id,extra),undoFor:async args=>autotuner.undoFor(tuneConfig(args).path)},refresh,localPreview,configure,setDownloadDirectory,plan,settings,save,settingsFile,openSettingsFile,operation,cancel,unload,resolveInstance,poll,logs:()=>logs.slice(),benchmarkReport:()=>readJson(join(directory,'native-benchmark.json'),null),setDefault(id){defaultId=resolveInstance(id).id;emit();return publicState();},hasLive:()=>[...instances.values()].some(i=>i.status==='ready'),readyInstances:()=>[...instances.values()].filter(i=>i.status==='ready'),close};
+ return {state:publicState,tuneStatus,tuneEffective,tuneOff,tunePresets:{list:()=>autotuner.list(),action:(kind,id,extra)=>autotuner.action(kind,id,extra),undoFor:async args=>autotuner.undoFor(tuneConfig(args).path)},refresh,localPreview,configure,setDownloadDirectory,planModelsFolder,startModelsFolder,interruptedMove,finishInterruptedMove,leaveInterruptedMove,plan,settings,save,settingsFile,openSettingsFile,operation,cancel,unload,resolveInstance,poll,logs:()=>logs.slice(),benchmarkReport:()=>readJson(join(directory,'native-benchmark.json'),null),setDefault(id){defaultId=resolveInstance(id).id;emit();return publicState();},hasLive:()=>[...instances.values()].some(i=>i.status==='ready'),readyInstances:()=>[...instances.values()].filter(i=>i.status==='ready'),close};
 }
