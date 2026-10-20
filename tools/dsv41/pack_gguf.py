@@ -323,6 +323,11 @@ def main() -> int:
     ap.add_argument("--model", required=True, help="the directory of the GGUF's shards")
     ap.add_argument("--out", help="default: <model>/maya-ds4")
     ap.add_argument("--vision", help="vision_pack.py's folder (default: <model>/../vision; taken when it is there)")
+    ap.add_argument("--dspark-gguf", help="unsloth's DSpark drafter GGUF (dspark-*-Q8_0.gguf, architecture dflash): its three "
+                                          "blocks become mtp.0-2 beside the trunk's tensors (default: the first dspark-*.gguf "
+                                          "in <model>/.. when there is one)")
+    ap.add_argument("--mmproj", help="unsloth's vision tower GGUF (mmproj-*.gguf, clip / deepseek41v): its tensors become the "
+                                     "checkpoint's vision.* / aligner.* (default: the first mmproj*.gguf in <model>/..)")
     ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's; default <model>/../dspark/dspark.json)")
     ap.add_argument("--engram", help="the folder of the Engram tables' GGUF set, for a quant that leaves them out "
                                      "(default: <model>/../Engram, when it is whole)")
@@ -431,10 +436,118 @@ def main() -> int:
     files = names
     if eg_from:
         print("Engram tables from %s (%d shards)" % (eg_dir, len(eg_from)))
+    # the DSpark drafter from unsloth's GGUF (architecture dflash): blk.N.* -> mtp.N.*, the head tensors under the
+    # checkpoint's names (fc -> main_proj, enc.output_norm -> main_norm, output_norm -> norm of the last block,
+    # conf_proj -> confidence_head.proj, markov_w1 / w2 -> markov_head.embed / head)
+    ds_path = pathlib.Path(a.dspark_gguf).expanduser().resolve() if a.dspark_gguf else next(
+        iter(sorted(model.parent.glob("dspark-*.gguf"))), None)
+    dspark_gguf = False
+    if ds_path is not None:
+        if not ds_path.is_file():
+            raise SystemExit("%s: no DSpark GGUF there" % ds_path)
+        dg = Gguf(ds_path)
+        if dg.kv.get("general.architecture") != "dflash":
+            raise SystemExit("%s: not a DSpark (dflash) GGUF" % ds_path)
+        nb = int(dg.kv["dflash.block_count"])
+        files.append(rel(ds_path))
+        fi = len(files) - 1
+        HEAD = {"fc.weight": "mtp.0.main_proj.weight", "enc.output_norm.weight": "mtp.0.main_norm.weight",
+                "output_norm.weight": "mtp.%d.norm.weight" % (nb - 1),
+                "conf_proj.weight": "mtp.%d.confidence_head.proj.weight" % (nb - 1),
+                "markov_w1.weight": "mtp.%d.markov_head.embed.weight" % (nb - 1),
+                "markov_w2.weight": "mtp.%d.markov_head.head.weight" % (nb - 1)}
+        groups = int(kv["%s.attention.output_group_count" % kv["general.architecture"]])
+        bad = []
+        for name, typ, dims, off in dg.tensors:
+            if typ not in TYPES:
+                raise SystemExit("%s: %s has ggml type %d, which the engine does not read" % (ds_path.name, name, typ))
+            tname, per, bpb = TYPES[typ]
+            nel = 1
+            for d in dims:
+                nel *= d
+            nbytes = nel // per * bpb
+            m = re.match(r"blk\.(\d+)\.(.+)$", name)
+            if m and m.group(2) in LAYER:
+                ck = "mtp.%s.%s" % (m.group(1), LAYER[m.group(2)])
+            elif name in HEAD:
+                ck = HEAD[name]
+            else:
+                bad.append(name)
+                continue
+            shape = list(reversed(dims))
+            base = dg.data_start + off
+            if ck.endswith(".attn.wo_a.slice"):
+                part = nbytes // groups
+                for i in range(groups):
+                    tensors.append(("%s.%d.weight" % (ck, i), tname, fi, base + i * part, part, [shape[0] // groups, shape[1]]))
+            elif ".ffn.experts." in ck:
+                n, part = shape[0], nbytes // shape[0]
+                pre, role = ck.rsplit(".", 1)
+                for i in range(n):
+                    tensors.append(("%s.%d.%s.weight" % (pre, i, role), tname, fi, base + i * part, part, shape[1:]))
+            else:
+                tensors.append((ck, tname, fi, base, nbytes, shape))
+        if bad:
+            raise SystemExit("DSpark GGUF tensors the pack does not map (%d): %s" % (len(bad), ", ".join(bad[:12])))
+        dspark_gguf = True
+        print("DSpark drafter from %s: %d blocks" % (ds_path.name, nb))
+    # the vision tower from unsloth's mmproj GGUF (clip, projector deepseek41v): llama.cpp's names -> the checkpoint's;
+    # the F32 norms / biases / marker rows are read as BF16 by the engine; mlp.w1 is the file's gate and up
+    mm_path = pathlib.Path(a.mmproj).expanduser().resolve() if a.mmproj else next(
+        iter(sorted(model.parent.glob("mmproj*.gguf"))), None)
+    mm_geo = {}
+    if mm_path is not None:
+        if not mm_path.is_file():
+            raise SystemExit("%s: no mmproj GGUF there" % mm_path)
+        mg = Gguf(mm_path)
+        if mg.kv.get("clip.projector_type") != "deepseek41v":
+            raise SystemExit("%s: not a DeepSeek-V4.1 vision GGUF (projector %r)" % (mm_path, mg.kv.get("clip.projector_type")))
+        files.append(rel(mm_path))
+        fi = len(files) - 1
+        FIX = {"v.patch_embd.weight": "vision.patch_embed.proj.weight", "v.patch_embd.bias": "vision.patch_embed.proj.bias",
+               "v.post_ln.weight": "vision.norm.weight", "mm.1.weight": "aligner.w1.weight", "mm.1.bias": "aligner.w1.bias",
+               "mm.2.weight": "aligner.w2.weight", "mm.2.bias": "aligner.w2.bias", "v.token_embd.img_start": "image_start",
+               "v.image_newline": "image_newline", "v.token_embd.img_end": "image_end"}
+        BLK = {"ln1.weight": "norm1.weight", "ln2.weight": "norm2.weight", "attn_qkv.weight": "attn.wqkv.weight",
+               "attn_qkv.bias": "attn.wqkv.bias", "attn_out.weight": "attn.wo.weight", "attn_out.bias": "attn.wo.bias",
+               "ffn_gate.weight": "mlp.gate.weight", "ffn_up.weight": "mlp.up.weight", "ffn_down.weight": "mlp.w2.weight"}
+        bad = []
+        for name, typ, dims, off in mg.tensors:
+            if typ not in TYPES:
+                raise SystemExit("%s: %s has ggml type %d, which the engine does not read" % (mm_path.name, name, typ))
+            tname, per, bpb = TYPES[typ]
+            nel = 1
+            for d in dims:
+                nel *= d
+            m = re.match(r"v\.blk\.(\d+)\.(.+)$", name)
+            if m and m.group(2) in BLK:
+                ck = "vision.blocks.%s.%s" % (m.group(1), BLK[m.group(2)])
+            elif name in FIX:
+                ck = FIX[name]
+            else:
+                bad.append(name)
+                continue
+            shape = list(reversed(dims))
+            if name == "v.patch_embd.weight":    # conv [out][3][14][14] -> [out][3 * 14 * 14], the same bytes
+                shape = [shape[0], nel // shape[0]]
+            tensors.append((ck, tname, fi, mg.data_start + off, nel // per * bpb, shape))
+        if bad:
+            raise SystemExit("mmproj tensors the pack does not map (%d): %s" % (len(bad), ", ".join(bad[:12])))
+        k = lambda n, d=None: mg.kv.get("clip.vision." + n, d)  # noqa: E731
+        toks = kv.get("tokenizer.ggml.tokens", [])
+        img_id = next((i for i, t in enumerate(toks) if t == "<｜deepseek_image｜>"), None)
+        if img_id is None:
+            raise SystemExit("the vocabulary has no <｜deepseek_image｜> token")
+        mm_geo = {"vision.num_hidden_layers": k("block_count"), "vision.hidden_size": k("embedding_length"),
+                  "vision.num_attention_heads": k("attention.head_count"), "vision.intermediate_size": k("feed_forward_length"),
+                  "vision.patch_size": k("patch_size"), "vision.downsample_ratio": k("projector.scale_factor"),
+                  "vision.rope_theta": 10000, "vision.max_image_tokens": 1024, "vision.min_pixels": k("image_min_pixels"),
+                  "image_token_id": img_id}
+        print("vision tower from %s: %d blocks, image token %d" % (mm_path.name, mm_geo["vision.num_hidden_layers"], img_id))
     drafter = pathlib.Path(a.drafter).expanduser().resolve() if a.drafter else model.parent / "dspark" / "dspark.json"
     if a.drafter and not drafter.is_file():
         raise SystemExit("%s: no drafter there" % drafter)
-    drafter_in = drafter.is_file() and drafter.with_suffix(".bin").is_file()
+    drafter_in = (drafter.is_file() and drafter.with_suffix(".bin").is_file()) and not dspark_gguf
     if drafter_in:
         files.append(rel(drafter.with_suffix(".bin")))
         groups = int(kv["%s.attention.output_group_count" % kv["general.architecture"]])
@@ -461,6 +574,8 @@ def main() -> int:
         for name, dt, off, nb, shape in info["tensors"]:
             tensors.append((name, dt, len(files) - 1, off, nb, shape))
         vision = info["config"]
+    if mm_geo and not vision:
+        vision = mm_geo
     vocab = next(t[5][0] for t in tensors if t[0] == "embed.weight")
     geo = geometry(kv, vocab)
 
@@ -492,7 +607,7 @@ def main() -> int:
     by = {}
     for t in tensors:
         by[t[1]] = by.get(t[1], 0) + t[4]
-    extras = [w for w, there in (("the DSpark drafter", drafter_in), ("the vision tower", bool(vision))) if there]
+    extras = [w for w, there in (("the DSpark drafter", drafter_in or dspark_gguf), ("the vision tower", bool(vision))) if there]
     print("%s: %d tensors in %d files (%s), Engram %d layers x %d hash columns%s -> %s" %
           (model.name, len(tensors), len(files), ", ".join("%s %.1f GB" % (k, v / 1e9) for k, v in sorted(by.items())),
            nl, cols, "".join(", " + w for w in extras), out))

@@ -4212,6 +4212,20 @@ struct Model::Impl {
     std::string vision_err;              // why the tower did not load (pictures off), or empty
     std::vector<uint16_t> img_mark[3];   // image_start, image_newline, image_end: BF16 [dim]
     std::vector<Image> imgs;             // the pictures of the prompt being fed, by start
+    // a BF16 (or, rounded to nearest even, F32) tensor of n values into dst
+    bool read_bf16(const Tensor& t, size_t n, void* dst) {
+        if (t.dtype == "BF16") return t.bytes == n * 2 && pk.read(t, dst);
+        if (t.dtype != "F32" || t.bytes != n * 4) return false;
+        std::vector<float> f(n);
+        if (!pk.read(t, f.data())) return false;
+        uint16_t* o = (uint16_t*) dst;
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t u;
+            std::memcpy(&u, &f[i], 4);
+            o[i] = (uint16_t) ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+        }
+        return true;
+    }
     bool load_vision(std::string& err) {
         vg.layers = (int) pk.num("vision.num_hidden_layers", 0);
         const int tok = (int) pk.num("image_token_id", -1);
@@ -4224,18 +4238,31 @@ struct Model::Impl {
         for (int i = 0; i < 3; ++i) {
             const Tensor* t = pk.get(mark[i]);
             img_mark[i].resize((size_t) g.dim);
-            if (t == nullptr || t->dtype != "BF16" || t->bytes != (uint64_t) g.dim * 2 || !pk.read(*t, img_mark[i].data())) {
-                err = std::string(mark[i]) + ": not a BF16 row of the model's width";
+            if (t == nullptr || !read_bf16(*t, (size_t) g.dim, img_mark[i].data())) {
+                err = std::string(mark[i]) + ": not a BF16 (or F32) row of the model's width";
                 return false;
             }
         }
         const double t0 = now_ms();
         Dev& d = devs[0];
+        // the tower's tensors as BF16: the checkpoint's own, or a GGUF's mmproj (F32 norms / biases / marker rows, which
+        // came from BF16, converted back exactly; mlp.w1 as the two files' gate and up, the halves of its rows)
         auto read = [this](const std::string& n, std::vector<int64_t>& shape, void* dst) {
             const Tensor* t = pk.get(n);
-            if (t == nullptr || t->dtype != "BF16") return false;
+            if (t == nullptr && n.size() > 13 && n.compare(n.size() - 13, 13, "mlp.w1.weight") == 0) {
+                const std::string pre = n.substr(0, n.size() - 13);
+                const Tensor* tg = pk.get(pre + "mlp.gate.weight");
+                const Tensor* tu = pk.get(pre + "mlp.up.weight");
+                if (tg == nullptr || tu == nullptr || tg->shape.size() != 2 || tg->shape != tu->shape) return false;
+                shape = {tg->shape[0] * 2, tg->shape[1]};
+                const size_t half = (size_t) tg->shape[0] * (size_t) tg->shape[1];
+                return dst == nullptr || (read_bf16(*tg, half, dst) && read_bf16(*tu, half, (uint16_t*) dst + half));
+            }
+            if (t == nullptr) return false;
             shape = t->shape;
-            return dst == nullptr || pk.read(*t, dst);
+            size_t n_el = 1;
+            for (int64_t x : t->shape) n_el *= (size_t) x;
+            return dst == nullptr || read_bf16(*t, n_el, dst);
         };
         if (!vt.load(vg, d.id, read, err)) return false;
         img_tok = tok;
