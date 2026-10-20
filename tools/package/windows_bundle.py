@@ -379,6 +379,8 @@ def main() -> None:
                 fail(f"{name}: no license text {t}")
             for text in found:
                 dst = lic / f"{slug}-{text.name}"
+                if dst in kept:                        # two texts of one name (llama.cpp's LICENSE, xxhash's)
+                    dst = lic / f"{slug}-{text.parent.name}-{text.name}"
                 shutil.copy2(text, dst)
                 kept.append(dst)
         for g in globs:
