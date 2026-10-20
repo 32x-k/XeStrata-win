@@ -53,8 +53,8 @@ FORBIDDEN = ("vcruntime*.dll", "msvcp*.dll", "concrt*.dll", "ucrtbase*.dll", "ap
              "nvml.dll", "cublas*.dll", "cudart*.dll", "mkl_*.dll", "amdhip64*.dll", "ze_loader*.dll", "vulkan-1.dll")
 # what the AMD build's DLLs import from Windows and from AMD's and Intel's drivers (amdhip64_7.dll, ze_loader.dll, the
 # Vulkan loader vulkan-1.dll): never followed into the folder
-SYSTEM_DLL = re.compile(r"(?i)^(api-ms-win-.*|ext-ms-.*|kernel32|user32|advapi32|ole32|oleaut32|shell32|shlwapi|ws2_32|"
-                        r"bcrypt|crypt32|dbghelp|version|setupapi|cfgmgr32|dxgi|d3d12|dxcore|ntdll|ucrtbase|"
+SYSTEM_DLL = re.compile(r"(?i)^(api-ms-win-.*|ext-ms-.*|kernel32|user32|gdi32|advapi32|ole32|oleaut32|shell32|shlwapi|"
+                        r"ws2_32|bcrypt|crypt32|dbghelp|version|setupapi|cfgmgr32|dxgi|d3d12|dxcore|ntdll|ucrtbase|"
                         r"vcruntime140(_1)?|msvcp140(_atomic_wait|_1|_2)?|vcomp140|amdhip64_7|ze_loader|"
                         r"vulkan-1)\.dll$")
 # the kernel libraries rocBLAS and hipBLASLt open from folders beside their DLLs
