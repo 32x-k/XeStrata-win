@@ -31,11 +31,16 @@ namespace strata::kernels::cpu {
 
 enum class TqIsa : int { scalar = 0, avx2 = 1, avx512 = 2 };
 
-/// TQ2_T (144), TQK6 (145), TQK7 (146).
+/// EXPERIMENTAL lower-rate versions of the TQK rule (tools/trellis/tqenc.hpp, version 1; Strata-internal ids, not ggml
+/// types, not in any GGUF): TQK5X = 22 bytes / 128 weights (1.375 bpw), TQK4X = 18 bytes (1.125 bpw).  Same hash,
+/// codebook, 15-bit mask, LSB-first circular stream and fp16 scale as TQK6/7 with K = 5 / 4.
+inline constexpr int kTqTypeK5X = 224;
+inline constexpr int kTqTypeK4X = 225;
+/// TQ2_T (144), TQK6 (145), TQK7 (146) and the experimental TQK5X / TQK4X.
 bool tq_supported(int ggml_type) noexcept;
-/// Bits per step: 8, 6, 7 (0 for any other type).
+/// Bits per step: 8, 6, 7, 5, 4 (0 for any other type).
 int tq_kbits(int ggml_type) noexcept;
-/// Values per block of the trellis types, and bytes per block (2 + 4 * bits: 34, 26, 30).
+/// Values per block of the trellis types, and bytes per block (2 + 4 * bits: 34, 26, 30, 22, 18).
 constexpr int kTqBlock = 128;
 inline size_t tq_block_bytes(int ggml_type) noexcept { return (size_t) (2 + 4 * tq_kbits(ggml_type)); }
 /// The best ISA this CPU runs (capped by STRATA_TQ_ISA).

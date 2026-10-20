@@ -81,6 +81,8 @@ void tq_rows_avx2(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct
                   float* const* out, int r0, int r1) {
     if (kb == 8) rows_t<8>(w, row_bytes, n, a, nt, out, r0, r1);
     else if (kb == 6) rows_t<6>(w, row_bytes, n, a, nt, out, r0, r1);
+    else if (kb == 5) rows_t<5>(w, row_bytes, n, a, nt, out, r0, r1);   // experimental TQK5X
+    else if (kb == 4) rows_t<4>(w, row_bytes, n, a, nt, out, r0, r1);   // experimental TQK4X
     else rows_t<7>(w, row_bytes, n, a, nt, out, r0, r1);
 }
 

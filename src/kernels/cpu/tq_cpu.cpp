@@ -89,9 +89,11 @@ const int16_t* tq_state_table() {
     return g_table;
 }
 
-bool tq_supported(int t) noexcept { return t == 144 || t == 145 || t == 146; }
+bool tq_supported(int t) noexcept { return t == 144 || t == 145 || t == 146 || t == kTqTypeK5X || t == kTqTypeK4X; }
 
-int tq_kbits(int t) noexcept { return t == 144 ? 8 : t == 145 ? 6 : t == 146 ? 7 : 0; }
+int tq_kbits(int t) noexcept {
+    return t == 144 ? 8 : t == 145 ? 6 : t == 146 ? 7 : t == kTqTypeK5X ? 5 : t == kTqTypeK4X ? 4 : 0;
+}
 
 bool tq_isa_ok(TqIsa isa) {
 #if defined(STRATA_TQ_X86)
@@ -144,6 +146,8 @@ void tq_rows_scalar(int kb, const uint8_t* w, size_t row_bytes, int n, const TqA
                     float* const* out, int r0, int r1) {
     if (kb == 8) rows_scalar_t<8>(w, row_bytes, n, a, nt, out, r0, r1);
     else if (kb == 6) rows_scalar_t<6>(w, row_bytes, n, a, nt, out, r0, r1);
+    else if (kb == 5) rows_scalar_t<5>(w, row_bytes, n, a, nt, out, r0, r1);   // experimental TQK5X
+    else if (kb == 4) rows_scalar_t<4>(w, row_bytes, n, a, nt, out, r0, r1);   // experimental TQK4X
     else rows_scalar_t<7>(w, row_bytes, n, a, nt, out, r0, r1);
 }
 
