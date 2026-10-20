@@ -808,6 +808,38 @@ class Runner:
         self.emit("model", f"Used your prepared model files and wrote the run settings ({path.name}); this card is not one the built-in downloader sets up.", 100, level="warn")
         return path
 
+    def deepseek_files(self) -> bool:
+        """--model-path names DeepSeek-V4.1-Flash's shards (a folder, the repository's folder with UD-Q8_K_XL inside, or one shard): they are
+        that model, whatever the fingerprint table of the Flash-Next files says.  True when it did (s.family / s.model / s.model_path set); a
+        shard missing from the folder is said now, in plain words, before an engine or a download is touched."""
+        s = self.s
+        try:
+            mod = self.catalog.strata.setup_module()
+            shard = getattr(mod, "DSV41_SHARD", None)
+            if shard is None or not s.model_path:
+                return False
+            p = Path(s.model_path)
+            folders = [p, p / "UD-Q8_K_XL"] if p.is_dir() else [p.parent]
+            first = shard.format(i=1)
+            others = [shard.format(i=i) for i in range(1, 10)]
+            folder = next((f for f in folders if any((f / n).exists() for n in others)), None)
+        except Exception:                                    # noqa: BLE001 - not DeepSeek's: the usual check goes on
+            return False
+        if folder is None:
+            return False
+        if s.family and s.family != "deepseek41":
+            raise LaunchError(f"These are DeepSeek-V4.1-Flash's files, not {s.family} {s.model}'s.",
+                              "Leave --model out, or use --model UD-Q8_K_XL.", 2)
+        missing = [n for n in others if not (folder / n).exists()]
+        if missing:
+            raise LaunchError(f"DeepSeek-V4.1-Flash is in nine parts and {len(missing)} of them are not in {folder} "
+                              f"(first missing: {missing[0]}).",
+                              "Put every part in the folder (or drop --model-path and let Strata download them: about 508 GB). "
+                              "Nothing was downloaded or changed.", 5)
+        s.family, s.model, s.model_path = "deepseek41", s.model or "UD-Q8_K_XL", str(folder)
+        self.emit("model", "These files are DeepSeek-V4.1-Flash UD-Q8_K_XL; they are used where they are.", None)
+        return True
+
     def check_own_files(self) -> None:
         """The person's own model files, looked at once: a path that is not there or holds no model is said in plain words first, and the
         files are matched to the catalog model (resolve_own_files). Nothing else is done with a path that was already checked."""
@@ -824,6 +856,8 @@ class Runner:
         problem = models.own_path_problem(s.model_path)
         if problem:                                          # before the engine or setup are touched, with the path as typed
             raise LaunchError(problem[0], problem[1], 2)
+        if self.deepseek_files():
+            return
         given = bool(s.family and s.model)
         try:
             plan = models.plan_import(models.absolute(s.model_path))
@@ -879,7 +913,16 @@ class Runner:
         if cur.get("overrides") != want:
             profiles.save(name, {**cur, "overrides": want}, expected_revision=rev)
 
+    def multi_file(self) -> bool:
+        """The chosen model is DeepSeek-V4.1-Flash (setup.py MULTI_FILE_FAMILIES): nine shards, its own engine; no tuning and no parallel slots."""
+        try:
+            return bool(self.s.family and self.catalog.strata.multi_family(self.s.family))
+        except Exception:                                    # noqa: BLE001
+            return False
+
     def catalog_parallel(self) -> int | None:
+        if self.multi_file():                                # the DeepSeek engine answers one request at a time: no --batch to pass
+            return None
         try:
             comp = self.catalog.computer()
             return S.fit_parallel(comp.main_vram_gb) if comp.usable_gpus else None
@@ -890,6 +933,9 @@ class Runner:
     def tune(self) -> None:
         s = self.s
         if s.tune == "skip":
+            return
+        if self.multi_file():
+            self.emit("tune", "Tuning is not offered for DeepSeek-V4.1-Flash yet: it starts with the engine's own settings.", 100)
             return
         from strata_control import presets
         if not self.retune:
@@ -1104,8 +1150,49 @@ class Runner:
         title = row.title if row is not None else (f"{s.family} {s.model}" if s.model else None)
         model = {"title": title, "family": s.family, "model": s.model, "model_gb": row.download_gb if row is not None else None,
                  "own_files": bool(s.model_path), "folder": s.model_path}
-        return {"profile": self.profile, "settings": s.to_dict(with_key=False), "warnings": warns,
-                "flags": S.flags_text(s), "steps": list(STAGES), "model": model, "download": download}
+        out = {"profile": self.profile, "settings": s.to_dict(with_key=False), "warnings": warns,
+               "flags": S.flags_text(s), "steps": list(STAGES), "model": model, "download": download}
+        if self.multi_file():
+            out["placement"] = self.placement()
+        return out
+
+    def dsv41_engine(self) -> bool | None:
+        """Whether the installed engine carries strata-dsv41 (True / False); None when no engine is installed yet or it cannot be told."""
+        own = (os.environ.get("STRATA_DSV41_EXE") or "").strip()
+        if own:
+            return Path(own).is_file()
+        try:
+            from strata_control import engine_component as ec
+            rep = ec.status()
+            exe = (rep.get("engine") or {}).get("exe") if rep.get("usable") else None
+            if not exe:
+                return None
+            folder = Path(str(exe)).parent
+            return any((folder / n).is_file() for n in ("strata-dsv41", "strata-dsv41.exe"))
+        except Exception:                                    # noqa: BLE001
+            return None
+
+    def placement(self) -> dict:
+        """Where DeepSeek-V4.1-Flash would go on this computer's cards (strata_control/dsv41_fit.py): the cards this launch names, else every
+        card that counts; the real numbers in plain words, with the n-gram table's SSD note and the RAM / disk warnings (never a refusal)."""
+        s = self.s
+        hw = self.catalog.hardware()
+        try:
+            data = Path(s.data_dir) if s.data_dir else self.catalog.data_dir()
+            free = None if (s.model_path or self.model_state().remaining_gb < 1) else self.catalog.disk_free(data)
+        except Exception:                                    # noqa: BLE001 - a plan that cannot read the disk still shows the rest
+            free = None
+        p = self.catalog.strata.dsv41_plan(hw, free, s.gpus)
+        warnings = list(p["warnings"])
+        engine = self.dsv41_engine()
+        if engine is False:
+            warnings.append("The engine installed here has no DeepSeek-V4.1 engine (strata-dsv41) yet: setup stops with a message before "
+                            "anything is downloaded. Update Strata, or build it (cmake -DSTRATA_BUILD_DSV41=ON) and set STRATA_DSV41_EXE.")
+        return {"verdict": p["verdict"], "lines": p["lines"], "warnings": warnings, "cards": p["cards"], "args": p["args"],
+                "engine_has_dsv41": engine,
+                "experts_in_vram": p["experts_in_vram"], "experts_total": p["experts_total"], "vram_experts_gb": p["vram_experts_gb"],
+                "cpu_experts_gb": p["cpu_experts_gb"], "ram_needed_gb": p.get("ram_needed_gb"), "engram_gb": p["engram_gb"],
+                "download_gb": p["download_gb"], "measured": p["measured"]}
 
     def run(self, *, start: bool = True) -> Result:
         try:
