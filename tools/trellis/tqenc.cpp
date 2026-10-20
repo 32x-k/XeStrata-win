@@ -2,6 +2,7 @@
 #include "tqenc.hpp"
 
 #include "ggml-common-tq.h"
+#include "../dsv41_lab/computed_codes.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -88,6 +89,7 @@ namespace {
 struct Codebook {
     int16_t tab[kStates * 4];
     alignas(64) float soa[4][kStates];
+    double cb_rms = 1.072;
     Codebook() {
         for (uint32_t s = 0; s < (uint32_t) kStates; ++s) {
             const uint32_t x = s * 0x9e3779b1u;
@@ -99,6 +101,17 @@ struct Codebook {
                     tab[4 * s + 2 * h + j] = q;
                     soa[2 * h + j][s] = (float) q * (1.0f / 8192.0f);
                 }
+        }
+        // research hook (tools/dsv41_lab/computed_codes.hpp): TQE_CODE=1mad|3inst|3sum|3single replaces the table by a computed
+        // LUT-free code (the same shift trellis, the same search); cb_rms then is the code's own rms
+        if (tqcode::Kind k = tqcode::kind_of(std::getenv("TQE_CODE")); k != tqcode::kNone) {
+            double ss = 0;
+            for (uint32_t s = 0; s < (uint32_t) kStates; ++s) {
+                float v[4];
+                tqcode::code4(k, s, v);
+                for (int j = 0; j < 4; ++j) { soa[j][s] = v[j]; ss += (double) v[j] * v[j]; tab[4 * s + j] = (int16_t) std::lround(std::max(-32767.0, std::min(32767.0, v[j] * 8192.0))); }
+            }
+            cb_rms = std::sqrt(ss / (4.0 * kStates));
         }
     }
 };
@@ -424,7 +437,7 @@ BlockResult encode_block(int type, const float* w, const float* h, uint8_t* dst,
     if (amax == 0.0) { r.status = 1; return r; }
     const double rms = std::sqrt(sumw2 / 128.0);
     // initial scale: the codebook has unit-ish rms
-    constexpr double kCbRms = 1.072;
+    const double kCbRms = cb().cb_rms;
     static const double mult[7] = {1.0, 0.9, 1.1, 0.8, 1.2, 0.7, 1.3};
 
     Search se;
