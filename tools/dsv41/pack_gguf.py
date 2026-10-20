@@ -482,10 +482,13 @@ def main() -> int:
         for name, dt, fi, off, nb, shape in tensors:
             f.write("t %s %s %d %d %d %s\n" % (name, dt, fi, off, nb, " ".join(map(str, shape))))
     nl, cols = write_engram(out / "engram.bin", kv, vocab)
-    # the server's chat template (pack.py's, so both formats chat alike); the GGUF's own when it is not there
-    template = pathlib.Path(__file__).resolve().parent / "chat_template.jinja"
-    write_tokenizer(out / "tokenizer", kv,
-                    template.read_text(encoding="utf-8") if template.exists() else kv.get("tokenizer.chat_template"))
+    # the server's chat template: the GGUF's own (unsloth's, byte-identical to DeepSeek's encoding.py on the 9 cases we
+    # checked: chat, thinking, effort, system, multi-turn, tools, tool results).  Project Maya's tools/ds4/chat_template.jinja
+    # lost the tool associations and later system instructions (their #299), so it is NOT used here.
+    template = kv.get("tokenizer.chat_template")
+    if not template:
+        sys.exit("%s: the GGUF has no tokenizer.chat_template; refusing to fall back to the old Maya template (#299)" % model)
+    write_tokenizer(out / "tokenizer", kv, template)
     by = {}
     for t in tensors:
         by[t[1]] = by.get(t[1], 0) + t[4]
