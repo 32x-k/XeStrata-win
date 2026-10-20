@@ -21,7 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-#if defined(STRATA_USE_HIP) && (defined(__GFX12__) || defined(__gfx1200__) || defined(__gfx1201__))
+#if defined(STRATA_USE_HIP) && !defined(DS4_TQ_PORTABLE) && (defined(__GFX12__) || defined(__gfx1200__) || defined(__gfx1201__))
 #define DS4_TQ_WMMA 1
 #endif
 

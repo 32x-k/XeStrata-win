@@ -51,5 +51,25 @@ The server speaks to the engine as it does for the other models, so `/v1/chat/co
   A value marked `string="true"` stays a string.
 - Defaults when a request names none: temperature 1.0, top_p 1.0.
 
-Not in this version: pictures, the DSpark drafter, several requests at once (`--parallel` is ignored with a note), tuning
+Pictures and the DSpark drafter are in the engine (strata-dsv41 reads them from the unsloth mmproj and dspark files beside the model; the server side is not wired yet). Not in this version: several requests at once (`--parallel` is ignored with a note), tuning
 (`--tune` is skipped with a note).
+
+## Compressed experts (trellis), for testing
+
+`strata-dsv41` reads the routed experts in the trellis types as well as the source MXFP4: TQK6 and TQK7 (agentionai's files), and the
+experimental TQK5X / TQK4X (computed codebook) and TQK5T / TQK4T (table codebook), see `tools/trellis/README.md`. A layer may be converted
+while the others stay MXFP4. On the GPU they run on the tensor cores of gfx12 (and in plain FMAs elsewhere), on the CPU lane on Strata's
+AVX-512 / AVX2 kernels; the build needs `-DSTRATA_NATIVE_EXPERTS=ON` for the CPU lane.
+
+```
+# 1. the pack of the source model (also takes the DSpark and mmproj files that sit beside the model folder)
+python tools/dsv41/pack_gguf.py --model DIR/UD-Q8_K_XL --out PACK
+# 2. re-encode some layers (HIP encoder; one layer at K5 is 2.3 GB, the whole model 93 GB)
+python tools/dsv41/tq_convert.py --pack PACK --out CONV --layers 1,7,14 --type K5      # K4 K5 K4T K5T K6 K7
+# 3. the pack that reads them
+python tools/dsv41/pack_gguf.py --model DIR/UD-Q8_K_XL --out PACK2 --tq-experts CONV
+strata-dsv41 --pack PACK2 --score data/quant_quality/v1/set.ids.json --score-out RUN.tsv      # teacher-forced top-64 rows
+```
+
+The encode is plain error (no rotation, no activation weights). The tests are `ds4_tq_test` (device and CPU lane against a double
+reference, needs one GPU) and `tqw_hip_test`.
