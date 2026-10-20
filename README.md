@@ -49,7 +49,7 @@ These three things differ from upstream.
 
 - **You need**: the GPU driver (AMD: AMD Software, which installs the HIP runtime `amdhip64_7.dll`; Intel: Intel's graphics driver, which installs the Level Zero runtime `ze_loader.dll`) and the [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe). .NET is not needed.
   Without the Visual C++ Redistributable, `xestrata-cli.bat` says so and stops. rocBLAS and hipBLASLt come in the zip.
-- **With two or more GPUs** (the processor's graphics included): setup writes the chosen GPU into the config as `ONEAPI_DEVICE_SELECTOR=hip:N`, and the engine narrows the GPUs HIP sees to it.
+- **With two or more GPUs** (the processor's graphics included): when the chosen GPU is an AMD one, setup writes it into the config as `ONEAPI_DEVICE_SELECTOR=hip:N`, and the engine narrows the GPUs HIP sees to it. With an Intel GPU chosen, setup writes no such setting and the engine takes the GPU by its PCI address.
 - **Where things go**: nothing is written into the zip's folder. The settings go into `%APPDATA%\xestrata`, the logs and the like into `%LOCALAPPDATA%\xestrata`, and the models into the data folder (by default `%LOCALAPPDATA%\xestrata\data`).
 - **Updating**: unpack the new zip into another folder and run its `xestrata-cli.bat`. The settings and the models are kept.
 - **Using it**: changing the settings, using model files you already have and where things go are in [docs/WINDOWS.md](docs/WINDOWS.md). The zip carries it too, as `WINDOWS.ja.md` and `WINDOWS.md`.
