@@ -63,22 +63,41 @@ _hip = None
 
 class _gpu_lock:
     """TQENC_GPU_LOCK=<card number>: take the box locks (shared /data/gpu.lock, exclusive ~/locks/gpu<N>.lock) around every GPU
-    call and release them in between, so a long job that is mostly host work does not keep the card from other users."""
+    call and release them in between, so a long job that is mostly host work does not keep the card from other users.
+    TQENC_GPU_WAIT=<seconds> (default: wait for ever): give up after that long; `ok` is then False and encode() uses the CPU."""
+
+    def __init__(self):
+        self.fds = []
+        self.ok = True
 
     def __enter__(self):
-        self.fds = []
         card = os.environ.get("TQENC_GPU_LOCK")
         if card is None:
             return self
         import fcntl
         import time
-        while True:   # yield to a worker that queues all the cards (its chain starts with the gpu0 lock)
-            if not os.path.exists(os.path.expanduser("~/locks/EXCL_WAIT")):
-                break
-            time.sleep(5)
+        wait = float(os.environ.get("TQENC_GPU_WAIT", "1e9"))
+        t0 = time.time()
+        while os.path.exists(os.path.expanduser("~/locks/EXCL_WAIT")):   # a writer is waiting for the box
+            if time.time() - t0 > wait:
+                self.ok = False
+                return self
+            time.sleep(2)
         for path, mode in (("/data/gpu.lock", fcntl.LOCK_SH), (os.path.expanduser("~/locks/gpu%s.lock" % card), fcntl.LOCK_EX)):
             fd = os.open(path, os.O_RDWR | os.O_CREAT)
-            fcntl.flock(fd, mode)
+            while True:
+                try:
+                    fcntl.flock(fd, mode | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.time() - t0 > wait:
+                        os.close(fd)
+                        self.ok = False
+                        for f in reversed(self.fds):
+                            os.close(f)
+                        self.fds = []
+                        return self
+                    time.sleep(0.2)
             self.fds.append(fd)
         return self
 
@@ -132,10 +151,12 @@ def encode(w: np.ndarray, t: int, h: np.ndarray | None = None, iters: int = 1, n
     if gpu:
         if exact or t == TQ2_T:
             raise ValueError("the GPU encoder has no exact search and no TQ2_T")
-        with _gpu_lock():
-            tot = hip_lib().tqh_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, scale_tries, 0,
-                                       err.ctypes.data, stats.ctypes.data, None, 0)
-        return out, err, tot, {"nonfinite_blocks": int(stats[0]), "zero_blocks": int(stats[1])}
+        with _gpu_lock() as gl:
+            if gl.ok:
+                tot = hip_lib().tqh_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, scale_tries, 0,
+                                           err.ctypes.data, stats.ctypes.data, None, 0)
+                return out, err, tot, {"nonfinite_blocks": int(stats[0]), "zero_blocks": int(stats[1])}
+        threads = int(os.environ.get("TQENC_CPU_THREADS", threads or 24))   # the card stayed busy: the CPU encoder, same blocks
     tot = lib().tqe_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, exact, scale_tries, threads,
                            err.ctypes.data, stats.ctypes.data)
     return out, err, tot, {"nonfinite_blocks": int(stats[0]), "zero_blocks": int(stats[1])}
