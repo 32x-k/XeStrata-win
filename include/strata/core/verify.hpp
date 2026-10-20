@@ -547,6 +547,18 @@ private:
     int32_t* h_commit_ = nullptr; int32_t* m_commit_ = nullptr; // [n_keep, n_keep-1, pos_0 .. pos_{T-1}]
     float* h_ple_ = nullptr;     float* m_ple_ = nullptr;       // T * n_embd
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
+    // STRATA_TAP_FILE (off by default; nothing is allocated or captured without it): the DFlash2 experiment's hook.
+    // After each layer in STRATA_TAP_LAYERS (default 5,15,25,35,45) the window copies the layer's completed output
+    // (the residual with its pending FFN write applied, the mean of the hc streams) per row; run() appends
+    // (pos, token, taps) records to the file.
+    bool tap_on_ = false;
+    std::vector<int> tap_layers_;                 ///< the tapped layer ids (zero-based, completed outputs)
+    std::vector<int> tap_slot_;                   ///< layer -> slot in tap_layers_, or -1
+    float* tap_dev_ = nullptr;                    ///< [max_t][n_taps][n_embd]
+    float* tap_scratch_ = nullptr;                ///< one row's streams, [hc][n_embd]
+    float* h_tap_ = nullptr;     float* m_tap_ = nullptr;       ///< the mapped copy of tap_dev_
+    std::FILE* tap_file_ = nullptr;
+    void tap_write(int T, const int32_t* tokens, int64_t pos0);
     uint32_t* h_nf_ = nullptr;   uint32_t* m_nf_ = nullptr;     // #879: kVerifyMaxT * kNonfiniteBlocks flags
     int nf_row_ = -1;                     ///< nonfinite_row()
     int64_t nf_pos_ = -1;                 ///< nonfinite_pos()
