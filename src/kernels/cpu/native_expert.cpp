@@ -170,8 +170,8 @@ struct ActDump {
     static void act_dump_flush();
 };
 ActDump& act_dump() {
-    static ActDump d;
-    return d;
+    static ActDump* d = new ActDump;   // never destroyed: the atexit flush must still find it
+    return *d;
 }
 void ActDump::act_dump_flush() {
     ActDump& d = act_dump();
