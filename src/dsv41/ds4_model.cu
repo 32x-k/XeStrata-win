@@ -1078,7 +1078,7 @@ struct Model::Impl {
     };
     std::mutex prof_mu;
     std::vector<ProfMark> prof_marks;
-    std::vector<cudaEvent_t> prof_pool;
+    std::map<int, std::vector<cudaEvent_t>> prof_pool;   // by device: an event belongs to the device it was made on
     bool prof_window = false;   // (decode windows only: T == 1)
     // ... and a run of chunks' (prof_chunk): a layer's start, after its attention, after the routing and the shared
     // expert, after its experts (the streamed ones' waits for their reads in it); printed after the run
@@ -1087,13 +1087,18 @@ struct Model::Impl {
     void prof_mark(const Dev& d, int stage) {
         if (!prof_window && !prof_chunk) return;
         std::lock_guard<std::mutex> lk(prof_mu);
+        int cur = 0;
+        cudaGetDevice(&cur);
+        cudaSetDevice(d.id);   // (events of another device are an "invalid resource handle")
         cudaEvent_t e = nullptr;
-        if (prof_pool.empty()) cudaEventCreate(&e);
+        std::vector<cudaEvent_t>& pool = prof_pool[d.id];
+        if (pool.empty()) cudaEventCreate(&e);
         else {
-            e = prof_pool.back();
-            prof_pool.pop_back();
+            e = pool.back();
+            pool.pop_back();
         }
         cudaEventRecord(e, d.st);
+        cudaSetDevice(cur);
         prof_marks.push_back({&d, e, stage});
     }
     void prof_collect() {
@@ -1104,6 +1109,7 @@ struct Model::Impl {
             auto it = std::find_if(last.begin(), last.end(), [&](const auto& x) { return x.first == m.d; });
             if (it != last.end()) {
                 float ms = 0.0f;
+                cudaSetDevice(m.d->id);
                 if (cudaEventElapsedTime(&ms, it->second, m.ev) == cudaSuccess)
                     (prof_chunk ? cprof_ms : st.prof_ms)[m.stage] += ms;
                 it->second = m.ev;
@@ -1111,7 +1117,7 @@ struct Model::Impl {
                 last.push_back({m.d, m.ev});
             }
         }
-        for (const ProfMark& m : prof_marks) prof_pool.push_back(m.ev);
+        for (const ProfMark& m : prof_marks) prof_pool[m.d->id].push_back(m.ev);
         prof_marks.clear();
         if (!prof_chunk) ++st.prof_tokens;
     }
@@ -1730,7 +1736,7 @@ struct Model::Impl {
                 const int ty = gg_type_of(kv.second.dtype);
                 if (ty >= 0) blk = std::max(blk, gg::type_block(ty));
             }
-            while (tp > 1 && (g.ff % tp != 0 || (g.ff / tp) % blk != 0 || (g.ff / tp) % 128 != 0 || g.heads % tp != 0 ||
+            while (tp > 1 && (g.ff % tp != 0 || (g.ff / tp) % blk != 0 || (g.ff / tp) % (std::getenv("DS4_TP_ALIGN") ? std::atoi(std::getenv("DS4_TP_ALIGN")) : 128) != 0 || g.heads % tp != 0 ||
                               g.o_groups % tp != 0))
                 --tp;
             if (tp != o.tp)
