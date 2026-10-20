@@ -6,6 +6,7 @@
 #include "tqk_gemv3.cuh"
 #include "tqk_repack.hpp"
 #include "../trellis/tqenc.hpp"
+#include "strata/kernels/cpu/tq_cpu.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -168,24 +169,51 @@ int main(int argc, char** argv) {
                 const int rows = 256, in = 768, nblk = in / 128;
                 std::vector<uint8_t> mw; fill_random(mw, K, (int64_t) rows * nblk);
                 std::vector<float> dec((size_t) rows * in); tqenc::decode_blocks(type, mw.data(), (int64_t) rows * nblk, dec.data());
-                std::vector<float> x((size_t) nb * in); for (auto& v : x) v = frnd();
-                std::vector<double> ref((size_t) nb * rows), refabs((size_t) nb * rows);
-                for (int c = 0; c < nb; ++c) for (int r = 0; r < rows; ++r) { double s = 0, sa = 0; for (int i = 0; i < in; ++i) { const double t = (double) dec[(size_t) r * in + i] * x[(size_t) c * in + i]; s += t; sa += std::fabs(t); } ref[(size_t) c * rows + r] = s; refabs[(size_t) c * rows + r] = sa; }
                 uint8_t* mwd; CK(cudaMalloc(&mwd, mw.size())); CK(cudaMemcpy(mwd, mw.data(), mw.size(), cudaMemcpyHostToDevice));
-                float* xd = dev_f32(x); float* yd; CK(cudaMalloc(&yd, (size_t) nb * rows * 4));
                 const KFn kf = pick_k(K, nb, variant); const uint64_t* scd = nullptr; uint8_t* wd = mwd;
                 if (kf.tql) { std::vector<uint32_t> words; std::vector<uint64_t> sc; repack_tql(K, mw.data(), rows, nblk, words, sc);
                     CK(cudaMalloc(&wd, words.size() * 4)); CK(cudaMemcpy(wd, words.data(), words.size() * 4, cudaMemcpyHostToDevice));
                     uint64_t* t; CK(cudaMalloc(&t, sc.size() * 8)); CK(cudaMemcpy(t, sc.data(), sc.size() * 8, cudaMemcpyHostToDevice)); scd = t; }
-                if (kf.tql) { const size_t n = (size_t) nb * (in / 128) * 32; uint4* xb; CK(cudaMalloc(&xb, n * 16)); prep_b<<<(int) ((n + 255) / 256), 256>>>(xd, in, nb, in, xb); CK(cudaDeviceSynchronize()); xd = (float*) xb; }
-                Job j{wd, xd, yd, rows, in, rows, scd, in}; Job* jd; CK(cudaMalloc(&jd, sizeof(Job))); CK(cudaMemcpy(jd, &j, sizeof(Job), cudaMemcpyHostToDevice));
-                launch(kf, jd, 1, rows, in); CK(cudaGetLastError());
-                std::vector<float> y((size_t) nb * rows); CK(cudaMemcpy(y.data(), yd, y.size() * 4, cudaMemcpyDeviceToHost));
+                auto gpu_run = [&](const std::vector<float>& x) {
+                    float* xd = dev_f32(x); float* yd; CK(cudaMalloc(&yd, (size_t) nb * rows * 4));
+                    float* xj = xd;
+                    if (kf.tql) { const size_t n = (size_t) nb * (in / 128) * 32; uint4* xb; CK(cudaMalloc(&xb, n * 16)); prep_b<<<(int) ((n + 255) / 256), 256>>>(xd, in, nb, in, xb); CK(cudaDeviceSynchronize()); xj = (float*) xb; }
+                    Job j{wd, xj, yd, rows, in, rows, scd, in}; Job* jd; CK(cudaMalloc(&jd, sizeof(Job))); CK(cudaMemcpy(jd, &j, sizeof(Job), cudaMemcpyHostToDevice));
+                    launch(kf, jd, 1, rows, in); CK(cudaGetLastError());
+                    std::vector<float> y((size_t) nb * rows); CK(cudaMemcpy(y.data(), yd, y.size() * 4, cudaMemcpyDeviceToHost));
+                    cudaFree(xd); cudaFree(yd); cudaFree(jd); if (kf.tql) cudaFree(xj);
+                    return y;
+                };
+                // (1) random F32 activations vs a double reference on the decoded weights
+                std::vector<float> x((size_t) nb * in); for (auto& v : x) v = frnd();
+                std::vector<double> ref((size_t) nb * rows), refabs((size_t) nb * rows);
+                for (int c = 0; c < nb; ++c) for (int r = 0; r < rows; ++r) { double s = 0, sa = 0; for (int i = 0; i < in; ++i) { const double t = (double) dec[(size_t) r * in + i] * x[(size_t) c * in + i]; s += t; sa += std::fabs(t); } ref[(size_t) c * rows + r] = s; refabs[(size_t) c * rows + r] = sa; }
+                std::vector<float> y = gpu_run(x);
                 double worst = 0; for (size_t i = 0; i < y.size(); ++i) worst = std::max(worst, std::fabs(y[i] - ref[i]) / (refabs[i] + 1e-30));
                 const bool ok = worst < 2e-6;
-                std::printf("gemv nb=%d: max |y - ref| / sum|w x| = %.2e %s\n", nb, worst, ok ? "ok" : "FAIL");
-                fails += !ok;
-                cudaFree(mwd); cudaFree(xd); cudaFree(yd); cudaFree(jd);
+                // (2) the CPU kernel of the repo (tq_cpu scalar and AVX2, Q8_0 activations): same weights; the GPU runs on the dequantised Q8_0 activations
+                std::vector<uint8_t> q8((size_t) nb * (in / 32) * 34); std::vector<float> xq((size_t) nb * in);
+                for (int c = 0; c < nb; ++c) for (int b = 0; b < in / 32; ++b) {
+                    float amax = 0; for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[(size_t) c * in + b * 32 + i]));
+                    const uint16_t dh = tqenc::float_to_half(amax / 127.f); const float df = amax / 127.f, id = df ? 1.f / df : 0.f, dr = tqenc::half_to_float(dh);
+                    uint8_t* blk = &q8[((size_t) c * (in / 32) + b) * 34]; std::memcpy(blk, &dh, 2);
+                    for (int i = 0; i < 32; ++i) { const int qv = (int) std::lround(x[(size_t) c * in + b * 32 + i] * id); blk[2 + i] = (uint8_t) (int8_t) qv; xq[(size_t) c * in + b * 32 + i] = qv * dr; }
+                }
+                std::vector<float> ycpu_s((size_t) nb * rows), ycpu_a((size_t) nb * rows);
+                const bool have_avx2 = strata::kernels::cpu::tq_isa_ok(strata::kernels::cpu::TqIsa::avx2);
+                { const void* act[8]; float* os[8]; float* oa[8];
+                  for (int c = 0; c < nb; ++c) { act[c] = &q8[(size_t) c * (in / 32) * 34]; os[c] = &ycpu_s[(size_t) c * rows]; oa[c] = &ycpu_a[(size_t) c * rows]; }
+                  const size_t row_bytes = (size_t) nblk * bsz;
+                  strata::kernels::cpu::tq_rows(strata::kernels::cpu::TqIsa::scalar, type, mw.data(), row_bytes, in, act, nb, os, 0, rows);
+                  if (have_avx2) strata::kernels::cpu::tq_rows(strata::kernels::cpu::TqIsa::avx2, type, mw.data(), row_bytes, in, act, nb, oa, 0, rows); }
+                std::vector<float> yq = gpu_run(xq);
+                std::vector<double> refq((size_t) nb * rows);
+                for (int c = 0; c < nb; ++c) for (int r = 0; r < rows; ++r) { double s = 0, sa = 0; for (int i = 0; i < in; ++i) { const double t = (double) dec[(size_t) r * in + i] * xq[(size_t) c * in + i]; s += t; sa += std::fabs(t); } refq[(size_t) c * rows + r] = s; refabs[(size_t) c * rows + r] = sa; }
+                double w_gc = 0, w_cr = 0, w_ac = 0;
+                for (size_t i = 0; i < yq.size(); ++i) { const double den = refabs[i] + 1e-30; w_gc = std::max(w_gc, std::fabs(yq[i] - ycpu_s[i]) / den); w_cr = std::max(w_cr, std::fabs(ycpu_s[i] - refq[i]) / den); if (have_avx2) w_ac = std::max(w_ac, std::fabs(ycpu_a[i] - ycpu_s[i]) / den); }
+                std::printf("gemv nb=%d: GPU vs double ref %.2e %s | vs CPU kernel of the repo (Q8_0 acts): GPU-CPU %.2e, CPU-double %.2e, avx2-scalar %.2e (all / sum|w x|)\n", nb, worst, ok ? "ok" : "FAIL", w_gc, w_cr, w_ac);
+                fails += !ok || w_gc > 5e-6;
+                cudaFree(mwd); if (kf.tql) { cudaFree(wd); }
             }
             cudaFree(dw); cudaFree(dout);
         }
@@ -249,4 +277,10 @@ int main(int argc, char** argv) {
     }
     std::printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PARITY OK", fails);
     return fails ? 1 : 0;
+}
+
+// tq_cpu.cpp needs these probes from expert_layout.cpp: answer from the CPU itself
+namespace strata::kernels::cpu {
+bool cpu_avx2_ok() { return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c"); }
+bool cpu_avx512_ok() { return false; }
 }

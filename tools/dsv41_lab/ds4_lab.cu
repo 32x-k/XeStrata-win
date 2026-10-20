@@ -5,6 +5,7 @@
 // math (DeepSeek model.py), not from the kernels.
 //   ds4_lab [--tokens 1,2,3,4,5] [--only name,name] [--ctx 8192] [--reps 100]
 #include "../../src/dsv41/ds4_kernels.cuh"
+#include "attn_split.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -284,6 +285,25 @@ static void test_attn(int T, int ncache) {
     }
     char ex[96]; std::snprintf(ex, sizeof ex, "64 heads x 512, 128 win + 512 sel, cache %d rows", ncache);
     report("sparse_attn (fp4 ckv)", T, max_rel(gg, rr), 1e-4, time_us([&] { sparse_attn(dq.p, dwin.p, dck.p, dsel.p, nsel, ar, dsink.p, heads, d, T, scale, dout.p, g_s, kKvFp4, 0, &scr); }), ex);
+    // split-KV version (tools/dsv41_lab/attn_split.cuh), same inputs
+    {
+        const int total = nwin + nsel;
+        auto run = [&](const char* nm, auto launch_fn, int R) {
+            const int nsplit = (total + R - 1) / R;
+            Dev<float> part, ml; part.alloc((size_t) T * heads * nsplit * d); ml.alloc((size_t) T * heads * nsplit * 2);
+            strata::ds4lab::AttnSplitScratch ss; ss.part = part.p; ss.ml = ml.p; ss.nsplit = nsplit; ss.max_t = T;
+            Dev<float> o3; o3.alloc((size_t) T * heads * d);
+            auto go = [&] { launch_fn(dq.p, dwin.p, dck.p, rb, dsel.p, nsel, ar, dsink.p, heads, T, scale, o3.p, ss, total, g_s); };
+            go(); CK(cudaStreamSynchronize(g_s)); CK(cudaGetLastError());
+            auto oo = o3.get(); std::vector<float> g3;
+            for (int t = 0; t < T; t += std::max(1, T / 2)) for (int h = 0; h < heads; h += 7) for (int e = 0; e < d; ++e) g3.push_back(oo[((size_t) t * heads + h) * d + e]);
+            report(nm, T, max_rel(g3, rr), 1e-4, time_us(go), ex);
+        };
+        run("attn_split G4 R40", [](auto... a) { strata::ds4lab::sparse_attn_split<4, 40>(a...); }, 40);
+        run("attn_split G8 R40", [](auto... a) { strata::ds4lab::sparse_attn_split<8, 40>(a...); }, 40);
+        run("attn_split G4 R20", [](auto... a) { strata::ds4lab::sparse_attn_split<4, 20>(a...); }, 20);
+        run("attn_split G2 R32", [](auto... a) { strata::ds4lab::sparse_attn_split<2, 32>(a...); }, 32);
+    }
     // the packed-rows kernel (no scratch): used from 8 queries on, timed here at this T for comparison
     sparse_attn(dq.p, dwin.p, dck.p, dsel.p, nsel, ar, dsink.p, heads, d, T, scale, dout.p, g_s, kKvFp4, 0, nullptr); CK(cudaStreamSynchronize(g_s));
     { auto o2 = dout.get(); std::vector<float> g2; for (int t = 0; t < T; t += std::max(1, T / 2)) for (int h = 0; h < heads; h += 7) for (int e = 0; e < d; ++e) g2.push_back(o2[((size_t) t * heads + h) * d + e]);
