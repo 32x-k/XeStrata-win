@@ -40,7 +40,10 @@ TYPES = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 8: ("Q8_0", 32, 34), 30: ("BF16", 1
          # the low-bit expert types (the Maya quants' experts; the engine's ds4_iq kernels)
          10: ("Q2_K", 256, 84), 11: ("Q3_K", 256, 110), 12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176),
          14: ("Q6_K", 256, 210), 16: ("IQ2_XXS", 256, 66), 17: ("IQ2_XS", 256, 74), 18: ("IQ3_XXS", 256, 98),
-         20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82), 23: ("IQ4_XS", 256, 136)}
+         20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82), 23: ("IQ4_XS", 256, 136),
+         # the trellis types (tools/trellis/tqenc.hpp; 145 / 146 are the agentionai fork's ggml ids, 224-227 Strata's own)
+         145: ("TQK6", 128, 26), 146: ("TQK7", 128, 30), 224: ("TQK5X", 128, 22), 225: ("TQK4X", 128, 18),
+         226: ("TQK5T", 128, 22), 227: ("TQK4T", 128, 18)}
 # the Engram set a quant without the tables takes them from by default, beside it (or inside its folder): unsloth's
 # MXFP8 shard of them, where setups before v1.1.17 put it for Maya-S (--engram: any other)
 ENGRAM_SETS = ("Engram",)
@@ -328,6 +331,8 @@ def main() -> int:
                                           "in <model>/.. when there is one)")
     ap.add_argument("--mmproj", help="unsloth's vision tower GGUF (mmproj-*.gguf, clip / deepseek41v): its tensors become the "
                                      "checkpoint's vision.* / aligner.* (default: the first mmproj*.gguf in <model>/..)")
+    ap.add_argument("--tq-experts", help="a folder tq_convert.py wrote (tq.json + tq-L<layer>.bin): the routed experts of the layers "
+                                         "listed there are read from it as trellis types (TQK5X ..), the others keep their MXFP4")
     ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's; default <model>/../dspark/dspark.json)")
     ap.add_argument("--engram", help="the folder of the Engram tables' GGUF set, for a quant that leaves them out "
                                      "(default: <model>/../Engram, when it is whole)")
@@ -544,6 +549,47 @@ def main() -> int:
                   "vision.rope_theta": 10000, "vision.max_image_tokens": 1024, "vision.min_pixels": k("image_min_pixels"),
                   "image_token_id": img_id}
         print("vision tower from %s: %d blocks, image token %d" % (mm_path.name, mm_geo["vision.num_hidden_layers"], img_id))
+    # trellis experts from tq_convert.py: per layer the three roles stacked [n_exp][rows][row bytes] in one file
+    tq_layers = []
+    if a.tq_experts:
+        tqd = pathlib.Path(a.tq_experts).expanduser().resolve()
+        tq_idx = json.loads((tqd / "tq.json").read_text())
+        by_layer = {}
+        for key, ent in tq_idx.items():
+            m = re.match(r"layers\.(\d+)\.ffn\.experts\.(w[123])$", key)
+            if not m:
+                raise SystemExit("tq.json: %s is not a layer's expert role" % key)
+            by_layer.setdefault(int(m.group(1)), {})[m.group(2)] = ent
+        TQTYPES = {v[0]: k for k, v in TYPES.items()}
+        for il, roles in sorted(by_layer.items()):
+            if sorted(roles) != ["w1", "w2", "w3"]:
+                raise SystemExit("tq.json: layer %d lacks a role (has %s)" % (il, sorted(roles)))
+            if len({r[0] for r in roles.values()}) != 1 or roles["w1"][0] != roles["w3"][0]:
+                raise SystemExit("tq.json: layer %d: gate and up must be one type" % il)
+            drop = re.compile(r"layers\.%d\.ffn\.experts\.\d+\.w[123]\.weight$" % il)
+            kept = [t for t in tensors if not drop.match(t[0])]
+            if len(kept) == len(tensors):
+                raise SystemExit("layer %d has no routed experts in the GGUF to replace" % il)
+            tensors[:] = kept
+            for role, (tname, fname, off, total, shape) in roles.items():
+                if tname not in TQTYPES:
+                    raise SystemExit("tq.json: unknown type %s" % tname)
+                n_exp, rows, cols = shape
+                per = total // n_exp
+                f = tqd / fname
+                if not f.is_file() or f.stat().st_size < off + total:
+                    raise SystemExit("%s: missing or short" % f)
+                try:
+                    relf = os.path.relpath(f, model).replace(os.sep, "/")
+                except ValueError:
+                    raise SystemExit("%s must be on the model's drive" % f)
+                if relf not in files:
+                    files.append(relf)
+                fi = files.index(relf)
+                for e in range(n_exp):
+                    tensors.append(("layers.%d.ffn.experts.%d.%s.weight" % (il, e, role), tname, fi, off + e * per, per, [rows, cols]))
+            tq_layers.append(il)
+        print("trellis experts from %s: layers %s" % (tqd, tq_layers))
     drafter = pathlib.Path(a.drafter).expanduser().resolve() if a.drafter else model.parent / "dspark" / "dspark.json"
     if a.drafter and not drafter.is_file():
         raise SystemExit("%s: no drafter there" % drafter)
@@ -607,7 +653,7 @@ def main() -> int:
     by = {}
     for t in tensors:
         by[t[1]] = by.get(t[1], 0) + t[4]
-    extras = [w for w, there in (("the DSpark drafter", drafter_in or dspark_gguf), ("the vision tower", bool(vision))) if there]
+    extras = [w for w, there in (("the DSpark drafter", drafter_in or dspark_gguf), ("the vision tower", bool(vision)), ("trellis experts in layers %s" % tq_layers, bool(tq_layers))) if there]
     print("%s: %d tensors in %d files (%s), Engram %d layers x %d hash columns%s -> %s" %
           (model.name, len(tensors), len(files), ", ".join("%s %.1f GB" % (k, v / 1e9) for k, v in sorted(by.items())),
            nl, cols, "".join(", " + w for w in extras), out))
