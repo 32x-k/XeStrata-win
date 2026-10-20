@@ -1,0 +1,213 @@
+// tools/dsv41_lab/tqk_lab.cu - parity + speed of the trellis expert kernels (tqk_gemv.cuh) with synthetic weights.
+//   tqk_lab [--k 4,5,6,7] [--nb 1,2,3,4,5] [--reps 200] [--quick]
+// Parity: dequant vs tqenc::decode_blocks (bit exact), GEMV vs a double reference on the host-decoded weights.
+// Bench: one decode token of a routed layer = top-6 experts x (gate, up: 2304 x 5120; down: 5120 x 2304).
+#include "tqk_gemv.cuh"
+#include "../trellis/tqenc.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { std::printf("CUDA error %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); std::exit(2); } } while (0)
+
+using namespace tqlab;
+
+static uint64_t g_rng = 0x9e3779b97f4a7c15ull;
+static uint64_t rnd() { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17; return g_rng; }
+static float frnd() { return (float) ((rnd() >> 40) * (1.0 / 16777216.0)) * 2.f - 1.f; }
+
+static int type_of(int K) { return K == 4 ? 225 : K == 5 ? 224 : K == 6 ? 145 : 146; }
+
+// random legal weights: any bit pattern is a legal stream; scale = a normal-ish fp16 in [0.02, 0.5]
+static void fill_random(std::vector<uint8_t>& w, int K, int64_t nblocks) {
+    const int bsz = 2 + 4 * K;
+    w.resize((size_t) nblocks * bsz);
+    for (size_t i = 0; i < w.size(); i += 8) { uint64_t r = rnd(); std::memcpy(&w[i], &r, std::min<size_t>(8, w.size() - i)); }
+    for (int64_t b = 0; b < nblocks; ++b) {
+        const uint16_t d = tqenc::float_to_half(0.02f + 0.48f * (frnd() * 0.5f + 0.5f));
+        std::memcpy(&w[(size_t) b * bsz], &d, 2);
+    }
+}
+
+__global__ void rd_kernel(const float4* p, size_t n4, float* o) {
+    float s = 0;
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n4; i += (size_t) gridDim.x * blockDim.x) { float4 v = p[i]; s += v.x + v.y + v.z + v.w; }
+    if (s == 1234.5f) *o = s;
+}
+typedef void (*gemv_fn)(const Job*, const float2*, int);
+template <int K, int NB, int RPW> static gemv_fn pick_rpw(int rpw) { (void) rpw; return gemv_v1<K, NB, RPW>; }
+template <int K, int NB> static gemv_fn pick(int variant) {
+    switch (variant) {
+        case 1: return gemv_v1<K, NB, 1>;
+        default: return gemv_v1<K, NB, 2>;
+    }
+}
+template <int K> static gemv_fn pick_nb(int nb, int variant) {
+    switch (nb) {
+        case 1: return pick<K, 1>(variant);
+        case 2: return pick<K, 2>(variant);
+        case 3: return pick<K, 3>(variant);
+        case 4: return pick<K, 4>(variant);
+        default: return pick<K, 5>(variant);
+    }
+}
+static gemv_fn pick_k(int K, int nb, int variant) {
+    switch (K) {
+        case 4: return pick_nb<4>(nb, variant);
+        case 5: return pick_nb<5>(nb, variant);
+        case 6: return pick_nb<6>(nb, variant);
+        default: return pick_nb<7>(nb, variant);
+    }
+}
+static int variant_rpw(int variant) { return variant == 1 ? 1 : 2; }
+
+static void launch(gemv_fn f, int variant, const Job* jd, int njobs, int rows, int in, const float2* lut, cudaStream_t s = 0) {
+    const int rpw = variant_rpw(variant), per_cta = 8 * rpw;
+    dim3 grid((rows + per_cta - 1) / per_cta, njobs);
+    f<<<grid, 256, 0, s>>>(jd, lut, in);
+}
+
+static float* dev_f32(const std::vector<float>& h) {
+    float* d; CK(cudaMalloc(&d, h.size() * 4)); CK(cudaMemcpy(d, h.data(), h.size() * 4, cudaMemcpyHostToDevice)); return d;
+}
+
+int main(int argc, char** argv) {
+    std::vector<int> Ks = {4, 5, 6, 7}, NBs = {1, 2, 3, 4, 5};
+    int reps = 200, variant = 2, dev = 0;
+    bool quick = false;
+    auto parse = [](const char* s) { std::vector<int> v; for (const char* p = s; *p;) { v.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; } return v; };
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--k" && i + 1 < argc) Ks = parse(argv[++i]);
+        else if (a == "--nb" && i + 1 < argc) NBs = parse(argv[++i]);
+        else if (a == "--reps" && i + 1 < argc) reps = std::atoi(argv[++i]);
+        else if (a == "--variant" && i + 1 < argc) variant = std::atoi(argv[++i]);
+        else if (a == "--dev" && i + 1 < argc) dev = std::atoi(argv[++i]);
+        else if (a == "--quick") quick = true;
+    }
+    CK(cudaSetDevice(dev));
+    cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, dev));
+    std::printf("device %s sm_%d%d, %d SMs, mem clock %d kHz bus %d bit\n", prop.name, prop.major, prop.minor, prop.multiProcessorCount,
+                prop.memoryClockRate, prop.memoryBusWidth);
+
+    // point table (x, y) as the CPU decoder sees it
+    const float* pt = tqenc::point_table();
+    float2* lut; CK(cudaMalloc(&lut, 2048 * sizeof(float2))); CK(cudaMemcpy(lut, pt, 2048 * sizeof(float2), cudaMemcpyHostToDevice));
+
+    // streaming bandwidth baseline: read-only sum over 512 MB
+    {
+        const size_t n = 128u << 20;   // floats
+        float4* buf; CK(cudaMalloc(&buf, n * 4)); CK(cudaMemset(buf, 0, n * 4));
+        cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+        float* o; CK(cudaMalloc(&o, 4));
+        rd_kernel<<<prop.multiProcessorCount * 8, 256>>>(buf, n / 4, o); CK(cudaDeviceSynchronize());
+        cudaEventRecord(e0);
+        for (int i = 0; i < 10; ++i) rd_kernel<<<prop.multiProcessorCount * 8, 256>>>(buf, n / 4, o);
+        cudaEventRecord(e1); CK(cudaEventSynchronize(e1));
+        float ms; cudaEventElapsedTime(&ms, e0, e1);
+        std::printf("stream-read baseline: %.1f GB/s (spec 448)\n", 10.0 * n * 4 / (ms * 1e-3) / 1e9);
+        cudaFree(buf); cudaFree(o);
+    }
+
+    int fails = 0;
+    for (int K : Ks) {
+        const int type = type_of(K), bsz = 2 + 4 * K;
+        std::printf("\n== K=%d (type %d, %d B / 128 weights, %.3f bpw) ==\n", K, type, bsz, bsz * 8 / 128.0);
+        // ---- parity 1: dequant bit exact vs the CPU decoder (random streams + encoded N(0,1) rows)
+        {
+            const int64_t nblocks = 4096;
+            std::vector<uint8_t> w; fill_random(w, K, nblocks);
+            // second half: really encoded Gaussian weights
+            const int64_t nenc = 256;
+            std::vector<float> g(nenc * 128); for (auto& v : g) { float u = 0; for (int i = 0; i < 12; ++i) u += frnd() * 0.5f + 0.5f; v = u - 6.f; }
+            std::vector<uint8_t> enc(nenc * bsz);
+            tqenc::Params p; double err = 0; int64_t nf = 0, zb = 0;
+            err = tqenc::encode_blocks(type, g.data(), nullptr, nenc, enc.data(), p, 4, nullptr, &nf, &zb);
+            std::memcpy(&w[(size_t) (nblocks - nenc) * bsz], enc.data(), enc.size());
+            std::vector<float> ref((size_t) nblocks * 128);
+            tqenc::decode_blocks(type, w.data(), nblocks, ref.data());
+            uint8_t* dw; float* dout; CK(cudaMalloc(&dw, w.size())); CK(cudaMalloc(&dout, ref.size() * 4));
+            CK(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice));
+            const int thr = 256; const int64_t units = nblocks * 8;
+            auto fn = K == 4 ? dequant_f32<4> : K == 5 ? dequant_f32<5> : K == 6 ? dequant_f32<6> : dequant_f32<7>;
+            fn<<<(int) ((units + thr - 1) / thr), thr>>>(dw, lut, dout, nblocks); CK(cudaGetLastError());
+            std::vector<float> got(ref.size()); CK(cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost));
+            size_t bad = 0; for (size_t i = 0; i < got.size(); ++i) if (std::memcmp(&got[i], &ref[i], 4) != 0) ++bad;
+            double sq = 0, ee = 0; for (int64_t i = 0; i < nenc * 128; ++i) { const double r = got[(size_t) (nblocks - nenc) * 128 + i]; sq += (double) g[i] * g[i]; ee += (r - g[i]) * (r - g[i]); }
+            std::printf("dequant: %zu / %zu weights differ from tqenc::decode_blocks (bit exact %s); encoded N(0,1) SQNR %.2f dB (encoder err %.3f)\n",
+                        bad, got.size(), bad ? "NO" : "yes", 10 * std::log10(sq / ee), err / (nenc * 128));
+            fails += bad != 0;
+            // ---- parity 2: GEMV vs double reference on the decoded weights, rows x in small
+            for (int nb : NBs) {
+                const int rows = 96, in = 640, nblk = in / 128;
+                std::vector<uint8_t> mw; fill_random(mw, K, (int64_t) rows * nblk);
+                std::vector<float> dec((size_t) rows * in); tqenc::decode_blocks(type, mw.data(), (int64_t) rows * nblk, dec.data());
+                std::vector<float> x((size_t) nb * in); for (auto& v : x) v = frnd();
+                std::vector<double> ref((size_t) nb * rows), refabs((size_t) nb * rows);
+                for (int c = 0; c < nb; ++c) for (int r = 0; r < rows; ++r) { double s = 0, sa = 0; for (int i = 0; i < in; ++i) { const double t = (double) dec[(size_t) r * in + i] * x[(size_t) c * in + i]; s += t; sa += std::fabs(t); } ref[(size_t) c * rows + r] = s; refabs[(size_t) c * rows + r] = sa; }
+                uint8_t* mwd; CK(cudaMalloc(&mwd, mw.size())); CK(cudaMemcpy(mwd, mw.data(), mw.size(), cudaMemcpyHostToDevice));
+                float* xd = dev_f32(x); float* yd; CK(cudaMalloc(&yd, (size_t) nb * rows * 4));
+                Job j{mwd, xd, yd, rows, in, rows}; Job* jd; CK(cudaMalloc(&jd, sizeof(Job))); CK(cudaMemcpy(jd, &j, sizeof(Job), cudaMemcpyHostToDevice));
+                launch(pick_k(K, nb, variant), variant, jd, 1, rows, in, lut); CK(cudaGetLastError());
+                std::vector<float> y((size_t) nb * rows); CK(cudaMemcpy(y.data(), yd, y.size() * 4, cudaMemcpyDeviceToHost));
+                double worst = 0; for (size_t i = 0; i < y.size(); ++i) worst = std::max(worst, std::fabs(y[i] - ref[i]) / (refabs[i] + 1e-30));
+                const bool ok = worst < 2e-6;
+                std::printf("gemv nb=%d: max |y - ref| / sum|w x| = %.2e %s\n", nb, worst, ok ? "ok" : "FAIL");
+                fails += !ok;
+                cudaFree(mwd); cudaFree(xd); cudaFree(yd); cudaFree(jd);
+            }
+            cudaFree(dw); cudaFree(dout);
+        }
+        if (quick) continue;
+        // ---- bench: top-6 experts of a layer, gate/up 2304 x 5120 (12 matrices), down 5120 x 2304 (6 matrices)
+        const int E = 6;
+        const int rows_gu = 2304, in_gu = 5120, rows_dn = 5120, in_dn = 2304;
+        const size_t mat_gu = (size_t) rows_gu * (in_gu / 128) * bsz, mat_dn = (size_t) rows_dn * (in_dn / 128) * bsz;
+        std::vector<uint8_t> hw;
+        fill_random(hw, K, (int64_t) rows_gu * (in_gu / 128));
+        uint8_t* big; CK(cudaMalloc(&big, mat_gu * 2 * E + mat_dn * E));
+        // distinct bytes per matrix (so nothing is cached across matrices): reuse one random block with different scales is
+        // not needed, the memory system does not see values; upload the same bytes to each slot.
+        std::vector<Job> hj_gu, hj_dn;
+        const int maxnb = *std::max_element(NBs.begin(), NBs.end());
+        std::vector<float> xg((size_t) maxnb * in_gu), xdn((size_t) E * maxnb * in_dn);
+        for (auto& v : xg) v = frnd(); for (auto& v : xdn) v = frnd();
+        float* xg_d = dev_f32(xg); float* xdn_d = dev_f32(xdn);
+        float* yg_d; CK(cudaMalloc(&yg_d, (size_t) 2 * E * maxnb * rows_gu * 4)); float* yd_d; CK(cudaMalloc(&yd_d, (size_t) E * maxnb * rows_dn * 4));
+        for (int e = 0; e < E; ++e) {
+            for (int m = 0; m < 2; ++m) {
+                uint8_t* p = big + (size_t) (e * 2 + m) * mat_gu;
+                CK(cudaMemcpy(p, hw.data(), mat_gu, cudaMemcpyHostToDevice));
+                hj_gu.push_back(Job{p, xg_d, yg_d + (size_t) (e * 2 + m) * maxnb * rows_gu, rows_gu, in_gu, rows_gu});
+            }
+            uint8_t* p = big + 2 * E * mat_gu + (size_t) e * mat_dn;
+            std::vector<uint8_t> hd; fill_random(hd, K, (int64_t) rows_dn * (in_dn / 128));
+            CK(cudaMemcpy(p, hd.data(), mat_dn, cudaMemcpyHostToDevice));
+            hj_dn.push_back(Job{p, xdn_d + (size_t) e * maxnb * in_dn, yd_d + (size_t) e * maxnb * rows_dn, rows_dn, in_dn, rows_dn});
+        }
+        Job *jgu, *jdn; CK(cudaMalloc(&jgu, sizeof(Job) * hj_gu.size())); CK(cudaMalloc(&jdn, sizeof(Job) * hj_dn.size()));
+        CK(cudaMemcpy(jgu, hj_gu.data(), sizeof(Job) * hj_gu.size(), cudaMemcpyHostToDevice)); CK(cudaMemcpy(jdn, hj_dn.data(), sizeof(Job) * hj_dn.size(), cudaMemcpyHostToDevice));
+        const double bytes_layer = (double) (mat_gu * 2 + mat_dn) * E, weights_layer = (double) (rows_gu * (double) in_gu * 2 + rows_dn * (double) in_dn) * E;
+        // flush L2 between reps would only matter for tiny sets: 6 x 3 matrices exceed the 4 MB L2 many times over.
+        for (int nb : NBs) {
+            gemv_fn f = pick_k(K, nb, variant);
+            cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+            for (int w = 0; w < 5; ++w) { launch(f, variant, jgu, 2 * E, rows_gu, in_gu, lut); launch(f, variant, jdn, E, rows_dn, in_dn, lut); }
+            CK(cudaDeviceSynchronize()); cudaEventRecord(e0);
+            for (int r = 0; r < reps; ++r) { launch(f, variant, jgu, 2 * E, rows_gu, in_gu, lut); launch(f, variant, jdn, E, rows_dn, in_dn, lut); }
+            cudaEventRecord(e1); CK(cudaEventSynchronize(e1)); CK(cudaGetLastError());
+            float ms; cudaEventElapsedTime(&ms, e0, e1); const double us = ms * 1e3 / reps;
+            const double gbs = bytes_layer / (us * 1e-6) / 1e9, roof_us = bytes_layer / 448e9 * 1e6;
+            std::printf("bench nb=%d: %8.1f us / layer (top-6 gate+up+down)  %6.1f GB/s  %6.2f Gweights/s  roof(448 GB/s) %7.1f us  = %4.1f%% of roof  | 43 layers: %.2f ms\n",
+                        nb, us, gbs, weights_layer / (us * 1e-6) / 1e9, roof_us, 100 * roof_us / us, us * 43 / 1e3);
+        }
+        cudaFree(big); cudaFree(jgu); cudaFree(jdn); cudaFree(xg_d); cudaFree(xdn_d); cudaFree(yg_d); cudaFree(yd_d);
+    }
+    std::printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PARITY OK", fails);
+    return fails ? 1 : 0;
+}
