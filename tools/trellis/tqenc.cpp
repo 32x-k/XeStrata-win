@@ -2,7 +2,7 @@
 #include "tqenc.hpp"
 
 #include "ggml-common-tq.h"
-#include "../dsv41_lab/computed_codes.hpp"
+#include "tq_computed.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -75,11 +75,15 @@ int type_kbits(int type) {
         case TQ2_T: return 8;
         case TQK6: return 6;
         case TQK7: return 7;
-        case TQK5X: return 5;
-        case TQK4X: return 4;
+        case TQK5X: case TQK5T: return 5;
+        case TQK4X: case TQK4T: return 4;
         default: return 0;
     }
 }
+
+bool type_computed(int type) { return type == TQK5X || type == TQK4X; }
+
+double codebook_rms(int type);
 
 namespace {
 
@@ -89,8 +93,21 @@ namespace {
 struct Codebook {
     int16_t tab[kStates * 4];
     alignas(64) float soa[4][kStates];
-    double cb_rms = 1.072;
-    Codebook() {
+    double rms = 1.072;   // of the weights: the first scale guess is rms(block) / this
+    explicit Codebook(bool computed) {
+        if (computed) {   // tq_computed.hpp
+            double ss = 0;
+            for (uint32_t s = 0; s < (uint32_t) kStates; ++s) {
+                strata::kernels::cpu::tq_detail::comp_state4(s, tab + 4 * s);
+                for (int j = 0; j < 4; ++j) {
+                    soa[j][s] = (float) tab[4 * s + j] * (1.0f / 8192.0f);
+                    ss += (double) soa[j][s] * soa[j][s];
+                }
+            }
+            rms = std::sqrt(ss / (4.0 * kStates));
+            return;
+        }
+        double ss = 0;
         for (uint32_t s = 0; s < (uint32_t) kStates; ++s) {
             const uint32_t x = s * 0x9e3779b1u;
             const uint32_t pts[2] = {x >> 21, (x >> 10) & 2047u};
@@ -100,28 +117,20 @@ struct Codebook {
                     const int16_t q = (int16_t) (v < 0.0f ? v - 0.5f : v + 0.5f);
                     tab[4 * s + 2 * h + j] = q;
                     soa[2 * h + j][s] = (float) q * (1.0f / 8192.0f);
+                    ss += (double) soa[2 * h + j][s] * soa[2 * h + j][s];
                 }
         }
-        // research hook (tools/dsv41_lab/computed_codes.hpp): TQE_CODE=1mad|3inst|3sum|3single replaces the table by a computed
-        // LUT-free code (the same shift trellis, the same search); cb_rms then is the code's own rms
-        if (tqcode::Kind k = tqcode::kind_of(std::getenv("TQE_CODE")); k != tqcode::kNone) {
-            double ss = 0;
-            for (uint32_t s = 0; s < (uint32_t) kStates; ++s) {
-                float v[4];
-                tqcode::code4(k, s, v);
-                for (int j = 0; j < 4; ++j) { soa[j][s] = v[j]; ss += (double) v[j] * v[j]; tab[4 * s + j] = (int16_t) std::lround(std::max(-32767.0, std::min(32767.0, v[j] * 8192.0))); }
-            }
-            cb_rms = std::sqrt(ss / (4.0 * kStates));
-        }
+        rms = std::sqrt(ss / (4.0 * kStates));
     }
 };
 
-const Codebook& cb() {
-    static const Codebook c;
-    return c;
+const Codebook& cb(bool computed) {
+    static const Codebook table(false), comp(true);
+    return computed ? comp : table;
 }
 
 struct Geo {
+    const Codebook* cbk = nullptr;
     int K = 0;
     bool t2 = false;   // TQ2_T (byte stream, the other shift direction)
     int G = 0;         // predecessor groups
@@ -129,6 +138,7 @@ struct Geo {
 
 Geo geo_for(int type) {
     Geo g;
+    g.cbk = &cb(type_computed(type));
     g.K = type_kbits(type);
     g.t2 = type == TQ2_T;
     g.G = g.t2 ? 128 : (1 << (15 - g.K));
@@ -177,8 +187,8 @@ inline float min_range(const float* p, int n) {
 }
 
 // out[i] = add[i] + sum_j h_j (t_j - cb_j[s0 + i])^2   for i in [0, n)
-inline void step_cost(float* out, const float* add, int s0, int n, const float* t, const float* h) {
-    const float *c0 = cb().soa[0] + s0, *c1 = cb().soa[1] + s0, *c2 = cb().soa[2] + s0, *c3 = cb().soa[3] + s0;
+inline void step_cost(const Codebook& C, float* out, const float* add, int s0, int n, const float* t, const float* h) {
+    const float *c0 = C.soa[0] + s0, *c1 = C.soa[1] + s0, *c2 = C.soa[2] + s0, *c3 = C.soa[3] + s0;
     int i = 0;
 #if TQENC_AVX2
     const __m256 t0 = _mm256_set1_ps(t[0]), t1 = _mm256_set1_ps(t[1]), t2 = _mm256_set1_ps(t[2]), t3 = _mm256_set1_ps(t[3]);
@@ -200,10 +210,10 @@ inline void step_cost(float* out, const float* add, int s0, int n, const float* 
 }
 
 // the broadcast variant: out[i] = a + cost(s0 + i)
-inline void step_cost_bc(float* out, float a, int s0, int n, const float* t, const float* h) {
+inline void step_cost_bc(const Codebook& C, float* out, float a, int s0, int n, const float* t, const float* h) {
     alignas(32) float tmp[256];
     for (int i = 0; i < n; ++i) tmp[i] = a;
-    step_cost(out, tmp, s0, n, t, h);
+    step_cost(C, out, tmp, s0, n, t, h);
 }
 
 // min and first index of the minimum over p[0..n)
@@ -233,7 +243,7 @@ float viterbi(const Geo& g, const float (*T)[4], const float (*H)[4], int rot, i
     // q = 0
     {
         const int p = rot & 31;
-        step_cost(cur, sc.zero, 0, kStates, T[p], H[p]);
+        step_cost(*g.cbk, cur, sc.zero, 0, kStates, T[p], H[p]);
         if (fixed_c >= 0) {
             if (g.t2) {   // gsucc(s) = s >> 8 == c: the 256 states [c<<8, c<<8 + 256) allowed
                 for (int s = 0; s < kStates; ++s)
@@ -271,7 +281,7 @@ float viterbi(const Geo& g, const float (*T)[4], const float (*H)[4], int rot, i
                     if (row[a] < m[a]) { m[a] = row[a]; sc.am[a] = h; }
             }
             for (int a = 0; a < 128; ++a) bp[a] = (uint16_t) (a + 128 * sc.am[a]);
-            for (int b = 0; b < 128; ++b) step_cost_bc(cur + 256 * b, m[b], 256 * b, 256, T[p], H[p]);
+            for (int b = 0; b < 128; ++b) step_cost_bc(*g.cbk, cur + 256 * b, m[b], 256 * b, 256, T[p], H[p]);
         } else {
             const int span = 1 << K;
             for (int a = 0; a < G; ++a) {
@@ -279,7 +289,7 @@ float viterbi(const Geo& g, const float (*T)[4], const float (*H)[4], int rot, i
                 m[a] = min_arg_range(prev + (size_t) a * span, span, &arg);
                 bp[a] = (uint16_t) ((a << K) + arg);
             }
-            for (int base = 0; base < kStates; base += G) step_cost(cur + base, m, base, G, T[p], H[p]);
+            for (int base = 0; base < kStates; base += G) step_cost(*g.cbk, cur + base, m, base, G, T[p], H[p]);
         }
     }
     // final state
@@ -375,13 +385,14 @@ int debug_groups(int type) { return geo_for(type).G; }
 int debug_widx(int type, int p, int j) { return widx(geo_for(type), p, j); }
 void debug_pack(int type, const uint16_t* st, uint8_t* qs) { pack_stream(geo_for(type), st, qs); }
 
-const float* codebook_state(uint32_t state) {
+const float* codebook_state(int type, uint32_t state) {
     static thread_local float v[4];
-    for (int j = 0; j < 4; ++j) v[j] = cb().soa[j][state & 0x7fff];
+    for (int j = 0; j < 4; ++j) v[j] = cb(type_computed(type)).soa[j][state & 0x7fff];
     return v;
 }
 
-const int16_t* codebook_table() { return cb().tab; }
+const int16_t* codebook_table(int type) { return cb(type_computed(type)).tab; }
+double codebook_rms(int type) { return cb(type_computed(type)).rms; }
 
 const float* point_table() {
     static float pts[4096];
@@ -416,7 +427,7 @@ void decode_blocks(int type, const uint8_t* src, int64_t nblocks, float* out) {
         const float d = half_to_float(dh);
         for (int t = 0; t < 32; ++t) {
             const uint32_t s = block_state(type, blk + 2, t);
-            for (int j = 0; j < 4; ++j) out[b * 128 + 4 * t + j] = d * cb().soa[j][s];
+            for (int j = 0; j < 4; ++j) out[b * 128 + 4 * t + j] = d * cb(type_computed(type)).soa[j][s];
         }
     }
 }
@@ -437,7 +448,7 @@ BlockResult encode_block(int type, const float* w, const float* h, uint8_t* dst,
     if (amax == 0.0) { r.status = 1; return r; }
     const double rms = std::sqrt(sumw2 / 128.0);
     // initial scale: the codebook has unit-ish rms
-    const double kCbRms = cb().cb_rms;
+    const double kCbRms = g.cbk->rms;
     static const double mult[7] = {1.0, 0.9, 1.1, 0.8, 1.2, 0.7, 1.3};
 
     Search se;
@@ -458,7 +469,7 @@ BlockResult encode_block(int type, const float* w, const float* h, uint8_t* dst,
         for (int p = 0; p < 32; ++p)
             for (int j = 0; j < 4; ++j) {
                 const int wi = widx(g, p, j);
-                const float rec = d * cb().soa[j][st[p]];
+                const float rec = d * g.cbk->soa[j][st[p]];
                 const double df = (double) w[wi] - rec;
                 e += (h ? h[wi] : 1.0) * df * df;
             }
@@ -490,7 +501,7 @@ BlockResult encode_block(int type, const float* w, const float* h, uint8_t* dst,
             for (int p = 0; p < 32; ++p)
                 for (int j = 0; j < 4; ++j) {
                     const int wi = widx(g, p, j);
-                    const double hi = h ? h[wi] : 1.0, c = cb().soa[j][se.st[p]];
+                    const double hi = h ? h[wi] : 1.0, c = g.cbk->soa[j][se.st[p]];
                     num += hi * w[wi] * c;
                     den += hi * c * c;
                 }
@@ -586,5 +597,5 @@ TQE_EXPORT double tqe_encode(int type, const float* w, const float* h, int64_t n
     if (stats) { stats[0] = nf; stats[1] = zb; }
     return e;
 }
-TQE_EXPORT const int16_t* tqe_table() { return tqenc::codebook_table(); }
+TQE_EXPORT const int16_t* tqe_table(int type) { return tqenc::codebook_table(type); }
 }

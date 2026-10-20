@@ -1,7 +1,11 @@
 # Trellis encoder (research, branch f-dsv41-enc)
 
 An encoder for the trellis expert formats that Strata already decodes (TQ2_T, TQK6, TQK7 of agentionai's llama.cpp fork)
-and for two experimental lower rates, TQK5X (22 bytes per 128 weights, 1.375 bpw) and TQK4X (18 bytes, 1.125 bpw).
+and for two experimental lower rates, K5 (22 bytes per 128 weights, 1.375 bpw) and K4 (18 bytes, 1.125 bpw), in two versions:
+TQK5X / TQK4X (ids 224 / 225, experimental version 2) use a computed codebook, two LCG words per state masked into four fp16
+(`src/kernels/cpu/tq_computed.hpp`, from the z440 lab's "3single"), and TQK5T / TQK4T (226 / 227, version 1) the fork's
+hashed point table. On real DeepSeek expert tensors the computed code costs 0.02 to 0.04 dB (K5 7.07 against 7.10 dB, K4 5.61
+against 5.63) and needs no table lookups in a GEMV. The fork's types keep their table.
 Written for the DeepSeek-V4.1-Flash compression plan (gate 2 and the start of gate 3). Nothing here changes an existing
 type, layout or default; the engine's CPU decoder only gains K = 5 and 4 (ids 224 / 225, experimental version 1).
 

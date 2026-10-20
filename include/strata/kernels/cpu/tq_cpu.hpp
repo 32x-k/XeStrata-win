@@ -34,9 +34,11 @@ enum class TqIsa : int { scalar = 0, avx2 = 1, avx512 = 2 };
 /// EXPERIMENTAL lower-rate versions of the TQK rule (tools/trellis/tqenc.hpp, version 1; Strata-internal ids, not ggml
 /// types, not in any GGUF): TQK5X = 22 bytes / 128 weights (1.375 bpw), TQK4X = 18 bytes (1.125 bpw).  Same hash,
 /// codebook, 15-bit mask, LSB-first circular stream and fp16 scale as TQK6/7 with K = 5 / 4.
-inline constexpr int kTqTypeK5X = 224;
-inline constexpr int kTqTypeK4X = 225;
-/// TQ2_T (144), TQK6 (145), TQK7 (146) and the experimental TQK5X / TQK4X.
+inline constexpr int kTqTypeK5X = 224;   ///< version 2: K = 5 with the computed codebook (tq_computed.hpp)
+inline constexpr int kTqTypeK4X = 225;   ///< version 2: K = 4, computed codebook
+inline constexpr int kTqTypeK5T = 226;   ///< version 1: K = 5 with the fork's point table (the first pilots)
+inline constexpr int kTqTypeK4T = 227;   ///< version 1: K = 4, point table
+/// TQ2_T (144), TQK6 (145), TQK7 (146) and the experimental TQK5X / TQK4X / TQK5T / TQK4T.
 bool tq_supported(int ggml_type) noexcept;
 /// Bits per step: 8, 6, 7, 5, 4 (0 for any other type).
 int tq_kbits(int ggml_type) noexcept;
@@ -54,8 +56,12 @@ bool tq_isa_ok(TqIsa isa);
 bool tq_kernels_enabled();
 const char* tq_isa_name(TqIsa isa);
 
-/// The 32768 x 4 int16 state table (filled on first use; thread-safe).
+/// The 32768 x 4 int16 state table of the fork's types (filled on first use; thread-safe).
 const int16_t* tq_state_table();
+/// The same for the computed codebook of TQK5X / TQK4X (tq_computed.hpp).
+const int16_t* tq_state_table_computed();
+/// The table a type decodes with.
+const int16_t* tq_state_table_for(int ggml_type);
 
 /// Rows [r0, r1) of a trellis matrix (`row_bytes` per row, `n` weights per row) against `nt` (<= 8) Q8_0
 /// activations of n values: out[t][r] = w_r . a[t].
@@ -78,11 +84,11 @@ struct TqAct {
 };
 void unpack_act(const void* q8_0, int n, TqAct& a);
 // the per-ISA row kernels (dot products only; `out[t][r]` for rows [r0, r1))
-void tq_rows_scalar(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+void tq_rows_scalar(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                     float* const* out, int r0, int r1);
-void tq_rows_avx2(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+void tq_rows_avx2(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                   float* const* out, int r0, int r1);
-void tq_rows_avx512(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+void tq_rows_avx512(int kb, const int16_t* tab, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                     float* const* out, int r0, int r1);
 }  // namespace tq_detail
 

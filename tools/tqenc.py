@@ -14,10 +14,13 @@ import pathlib
 
 import numpy as np
 
-TQ2_T, TQK6, TQK7, TQK5X, TQK4X = 144, 145, 146, 224, 225
-TYPE_NAMES = {TQ2_T: "TQ2_T", TQK6: "TQK6", TQK7: "TQK7", TQK5X: "TQK5X", TQK4X: "TQK4X"}
+TQ2_T, TQK6, TQK7, TQK5X, TQK4X, TQK5T, TQK4T = 144, 145, 146, 224, 225, 226, 227
+# TQK5X / TQK4X: experimental version 2, the computed (LUT-free) codebook (src/kernels/cpu/tq_computed.hpp);
+# TQK5T / TQK4T: version 1, the fork's point table (what the first pilots and the Gyro-S checks used for K5 / K4)
+TYPE_NAMES = {TQ2_T: "TQ2_T", TQK6: "TQK6", TQK7: "TQK7", TQK5X: "TQK5X", TQK4X: "TQK4X", TQK5T: "TQK5T", TQK4T: "TQK4T"}
 TYPE_BY_NAME = {v: k for k, v in TYPE_NAMES.items()}
-KBITS = {TQ2_T: 8, TQK6: 6, TQK7: 7, TQK5X: 5, TQK4X: 4}
+KBITS = {TQ2_T: 8, TQK6: 6, TQK7: 7, TQK5X: 5, TQK4X: 4, TQK5T: 5, TQK4T: 4}
+COMPUTED = (TQK5X, TQK4X)
 BLOCK = 128
 
 
@@ -59,6 +62,52 @@ def lib() -> ctypes.CDLL:
 
 
 _hip = None
+
+
+class _gpu_lock:
+    """TQENC_GPU_LOCK=<card number>: take the box locks (shared /data/gpu.lock, exclusive ~/locks/gpu<N>.lock) around every GPU
+    call and release them in between, so a long job that is mostly host work does not keep the card from other users.
+    TQENC_GPU_WAIT=<seconds> (default: wait for ever): give up after that long; `ok` is then False and encode() uses the CPU."""
+
+    def __init__(self):
+        self.fds = []
+        self.ok = True
+
+    def __enter__(self):
+        card = os.environ.get("TQENC_GPU_LOCK")
+        if card is None:
+            return self
+        import fcntl
+        import time
+        wait = float(os.environ.get("TQENC_GPU_WAIT", "1e9"))
+        t0 = time.time()
+        while os.path.exists(os.path.expanduser("~/locks/EXCL_WAIT")):   # a writer is waiting for the box
+            if time.time() - t0 > wait:
+                self.ok = False
+                return self
+            time.sleep(2)
+        for path, mode in (("/data/gpu.lock", fcntl.LOCK_SH), (os.path.expanduser("~/locks/gpu%s.lock" % card), fcntl.LOCK_EX)):
+            fd = os.open(path, os.O_RDWR | os.O_CREAT)
+            while True:
+                try:
+                    fcntl.flock(fd, mode | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.time() - t0 > wait:
+                        os.close(fd)
+                        self.ok = False
+                        for f in reversed(self.fds):
+                            os.close(f)
+                        self.fds = []
+                        return self
+                    time.sleep(0.2)
+            self.fds.append(fd)
+        return self
+
+    def __exit__(self, *a):
+        for fd in reversed(self.fds):
+            os.close(fd)
+        return False
 
 
 def hip_lib() -> ctypes.CDLL:
@@ -105,9 +154,12 @@ def encode(w: np.ndarray, t: int, h: np.ndarray | None = None, iters: int = 1, n
     if gpu:
         if exact or t == TQ2_T:
             raise ValueError("the GPU encoder has no exact search and no TQ2_T")
-        tot = hip_lib().tqh_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, scale_tries, 0,
-                                   err.ctypes.data, stats.ctypes.data, None, 0)
-        return out, err, tot, {"nonfinite_blocks": int(stats[0]), "zero_blocks": int(stats[1])}
+        with _gpu_lock() as gl:
+            if gl.ok:
+                tot = hip_lib().tqh_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, scale_tries, 0,
+                                           err.ctypes.data, stats.ctypes.data, None, 0)
+                return out, err, tot, {"nonfinite_blocks": int(stats[0]), "zero_blocks": int(stats[1])}
+        threads = int(os.environ.get("TQENC_CPU_THREADS", threads or 24))   # the card stayed busy: the CPU encoder, same blocks
     tot = lib().tqe_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, exact, scale_tries, threads,
                            err.ctypes.data, stats.ctypes.data)
     return out, err, tot, {"nonfinite_blocks": int(stats[0]), "zero_blocks": int(stats[1])}
@@ -186,7 +238,7 @@ def rel_mse(ref: np.ndarray, approx: np.ndarray) -> float:
 #   | u32 n_sign_bytes | sign bits (1 = +1, LSB first, one per input column) | u32 hadamard block (128) | packed blocks
 # An unknown version or type is refused before any data is read.
 TQX_MAGIC = b"TQXP"
-TQX_VERSION = 1
+TQX_VERSION = 2   # 2: types 224 / 225 are the computed codebook; a version 1 file means the point table (226 / 227)
 
 
 def write_tqx(path, t: int, rows: int, cols: int, packed: np.ndarray, signs: np.ndarray | None) -> None:
@@ -205,8 +257,10 @@ def read_tqx(path):
     if data[:4] != TQX_MAGIC:
         raise ValueError("not a TQXP file")
     ver, t, rows, cols, flags, nsb = struct.unpack_from("<IIIIII", data, 4)
-    if ver != TQX_VERSION:
-        raise ValueError("unsupported TQXP version %d (this reader handles %d)" % (ver, TQX_VERSION))
+    if ver == 1 and t in (TQK5X, TQK4X):
+        t += 2   # a version 1 file: the point table
+    elif ver != TQX_VERSION:
+        raise ValueError("unsupported TQXP version %d (this reader handles %d, and 1 for the point-table K5 / K4)" % (ver, TQX_VERSION))
     if t not in KBITS:
         raise ValueError("unknown trellis type %d" % t)
     at = 4 + 24
