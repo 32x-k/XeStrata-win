@@ -1771,7 +1771,7 @@ constexpr int kSplitG = 4, kSplitR = 40, kSplitCap = 24, kSplitMaxT = 5;
 bool split_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("DS4_ATTN_SPLIT");
-        return e == nullptr || std::atoi(e) != 0;
+        return e != nullptr && std::atoi(e) != 0;   // opt-in: no gain measured on 4x R9700 (21.8 vs 21.9 tok/s)
     }();
     return on;
 }
@@ -1968,7 +1968,7 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     }
     // a decode step / short verify window of packed rows: the split-KV kernel (Strata's CUDA lab, ds4_attn_split.cuh; 2.9x at
     // one query on an A4000).  The same inputs; the merge sums the chunks in another order, so the bits differ in the last
-    // place (4e-7 against a double reference).  DS4_ATTN_SPLIT=0 keeps the original kernels.
+    // place (4e-7 against a double reference).  DS4_ATTN_SPLIT=1 turns it on (off by default: no measurable decode gain on the R9700 box, the decode is bound elsewhere).
     if (ckv_fmt == kKvFp4 && a.gen == 0 && T >= 1 && T <= kSplitMaxT && heads % kSplitG == 0 && split_enabled()) {
         int total_max = 0;
         for (int t = 0; t < T; ++t) total_max = std::max(total_max, a.nwin[t] + a.nsel[t]);
@@ -2091,7 +2091,7 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
     if (a.nm > 2 && a.sums != nullptr && a.bflags != nullptr) {   // (the reduce-scatter: ar_rs_kernel)
         static const bool f16 = [] {
             const char* e = std::getenv("DS4_AR_F16");
-            return e == nullptr || std::atoi(e) != 0;   // (on unless DS4_AR_F16=0)
+            return e != nullptr && std::atoi(e) != 0;   // opt-in: no gain measured on 4x R9700 (21.8 vs 21.9 tok/s)   // (on unless DS4_AR_F16=0)
         }();
         const int n4 = n / 4;
         const int blocks = std::max(1, std::min(kArBlocks, cdiv(n4, kThreads)));
