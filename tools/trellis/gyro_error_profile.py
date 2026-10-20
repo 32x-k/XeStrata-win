@@ -31,7 +31,8 @@ def main() -> int:
     ap.add_argument("--roles", default="gate,down")
     a = ap.parse_args()
     g = gguf_reader.GGUFFile(a.gguf)
-    mm = mmap.mmap(open(a.gguf, "rb").fileno(), 0, access=mmap.ACCESS_READ)
+    fh = open(a.gguf, "rb")
+    mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
     by = {t.name: t for t in g.tensors}
     sw = [int(x) for x in g.metadata["prism.hadamard.sign_widths"]]
     sv = np.array(g.metadata["prism.hadamard.sign_values"], dtype=np.float32)
@@ -56,7 +57,7 @@ def main() -> int:
                 raw = np.frombuffer(mm, dtype=np.uint8, count=n_out * rb, offset=g.data_start + ti.offset + e * n_out * rb)
                 Wd = tqenc.decode(raw, t).reshape(n_out, n_in)
                 Wr = tqenc.rotate(W, signs[n_in])
-                packed, _, _, _ = tqenc.encode(Wr, t, iters=3, ncand=3)
+                packed, _, _, _ = tqenc.encode(Wr, t, iters=3, ncand=3, threads=8)
                 Wo = tqenc.decode(packed, t).reshape(n_out, n_in)
                 Ed, Eo = (Wr - Wd).astype(np.float64), (Wr - Wo).astype(np.float64)
                 print("L%d e%d %s %s" % (layer, e, role, ti.type_name))
