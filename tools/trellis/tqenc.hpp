@@ -60,6 +60,9 @@ struct BlockResult {
 /// The codebook entry of a state as the decoder sees it: four floats (int16 table / 8192, exact).
 const float* codebook_state(uint32_t state);   // 4 floats
 const int16_t* codebook_table();                // 32768 * 4 int16, the decoder's tq_state_table()
+/// The 2048 codebook points as the decoder sees them (x, y interleaved): round(fp16 * 8192) / 8192.  The GPU encoder
+/// uploads this table; it must be built by the host compiler (ggml-common-tq.h makes its table __device__ under hipcc).
+const float* point_table();                     // 4096 floats
 
 /// The state of step t (0..31) of a block's stream, by the decoder's rule, written bit by bit (independent of
 /// tq_states.hpp).  qs = the 4K stream bytes.

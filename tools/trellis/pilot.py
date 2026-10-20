@@ -56,24 +56,40 @@ def decode_q8_0(raw: np.ndarray, n_in: int) -> np.ndarray:
 
 
 class Source:
-    """Yields float32 [rows, n_in] row subsets of one expert's projection."""
+    """Yields float32 [rows, n_in] row subsets of one expert's projection.  Local GGUF files (mmap) or, with
+    remote=(repo, rev, [shard paths]), the same files read by HTTP range requests (headers and the few experts needed)."""
 
-    def __init__(self, gguf_paths):
-        self.files = []
+    def __init__(self, gguf_paths=None, remote=None, tmpdir="/tmp"):
         self.tensors = {}
-        for p in gguf_paths:
-            g = gguf_reader.GGUFFile(p)
-            fh = open(p, "rb")
-            mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
-            self.files.append((g, fh, mm))
-            for t in g.tensors:
-                self.tensors[t.name] = (g, mm, t)
+        if gguf_paths:
+            for p in gguf_paths:
+                g = gguf_reader.GGUFFile(p)
+                fh = open(p, "rb")
+                mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+                for t in g.tensors:
+                    self.tensors[t.name] = (g, (lambda off, n, mm=mm: np.frombuffer(mm, dtype=np.uint8, count=n, offset=off)), t)
+        if remote:
+            import urllib.request
+            repo, rev, shards = remote
+            for sh in shards:
+                url = "https://huggingface.co/%s/resolve/%s/%s" % (repo, rev, sh)
+
+                def rd(off, n, url=url):
+                    req = urllib.request.Request(url, headers={"Range": "bytes=%d-%d" % (off, off + n - 1)})
+                    with urllib.request.urlopen(req, timeout=300) as r:
+                        return np.frombuffer(r.read(), dtype=np.uint8)
+                hdr = rd(0, 6 << 20)
+                tp = pathlib.Path(tmpdir) / ("hdr_%s" % pathlib.Path(sh).name)
+                tp.write_bytes(hdr.tobytes())
+                g = gguf_reader.GGUFFile(tp)
+                for t in g.tensors:
+                    self.tensors[t.name] = (g, rd, t)
 
     def names(self, needle):
         return sorted(n for n in self.tensors if needle in n)
 
     def expert_rows(self, name: str, expert: int, rows: np.ndarray) -> np.ndarray:
-        g, mm, ti = self.tensors[name]
+        g, rd, ti = self.tensors[name]
         n_in, n_out = ti.shape[0], ti.shape[1]
         if ti.type_name == "MXFP4":
             rb = n_in // 32 * 17
@@ -86,9 +102,10 @@ class Source:
         else:
             raise ValueError("%s: tensor type %s is not readable by this pilot" % (name, ti.type_name))
         base = g.data_start + ti.offset + expert * n_out * rb
+        whole = rd(base, n_out * rb)     # one expert's projection (6.3 MB for MXFP4 2304 x 5120), then the row subset
         out = np.empty((len(rows), n_in), dtype=np.float32)
         for k, r in enumerate(rows):
-            raw = np.frombuffer(mm, dtype=np.uint8, count=rb, offset=base + int(r) * rb)
+            raw = whole[int(r) * rb:(int(r) + 1) * rb]
             if ti.type_name == "MXFP4":
                 out[k] = decode_mxfp4(raw, n_in)[0]
             elif ti.type_name == "Q8_0":
@@ -119,9 +136,11 @@ def act_err(W, What, X):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gguf", nargs="+", required=True)
-    ap.add_argument("--layers", default="0,7,15,23,31,39")
-    ap.add_argument("--experts", default="0,1,128,255")
+    ap.add_argument("--gguf", nargs="+", default=None)
+    ap.add_argument("--remote", default=None, help="REPO@REV: read the shards named in --shards by HTTP range requests")
+    ap.add_argument("--shards", nargs="+", default=[])
+    ap.add_argument("--layers", default="1,7,14,21,30,38")
+    ap.add_argument("--experts", default="0,97,200,383")
     ap.add_argument("--roles", default="gate,up,down")
     ap.add_argument("--rates", default="K4,K5,K6,K7")
     ap.add_argument("--rows", type=int, default=256)
@@ -133,7 +152,11 @@ def main() -> int:
     ap.add_argument("--pattern", default="blk.{L}.ffn_{R}_exps.weight")
     a = ap.parse_args()
 
-    src = Source(a.gguf)
+    if a.remote:
+        repo, rev = a.remote.split("@")
+        src = Source(remote=(repo, rev, a.shards))
+    else:
+        src = Source(a.gguf)
     rng = np.random.default_rng(a.seed)
     cfg = CFGS[a.cfg]
     sign_cache, x_cache = {}, {}
@@ -144,7 +167,7 @@ def main() -> int:
             if name not in src.tensors:
                 print("no tensor", name, "(have e.g. %s)" % src.names("exps")[:3])
                 continue
-            g, mm, ti = src.tensors[name]
+            g, rd, ti = src.tensors[name]
             n_in, n_out, n_exp = ti.shape[0], ti.shape[1], ti.shape[2]
             for e in [int(x) for x in a.experts.split(",")]:
                 if e >= n_exp:

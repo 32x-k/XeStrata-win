@@ -130,8 +130,10 @@ inline int gpred(const Geo& g, uint32_t s) { return g.t2 ? (int) (s & 0x7f) : (i
 inline int widx(const Geo& g, int p, int j) { return g.t2 ? 4 * p + j : 4 * (31 - p) + j; }
 
 struct Scratch {
-    alignas(64) float hist[32][kStates];
+    alignas(64) float D[2][kStates];        // the two live columns of the DP
+    alignas(64) uint16_t bp[32][2048];      // per step and predecessor group: the best predecessor state
     alignas(64) float m[2048];
+    alignas(64) int32_t am[2048];
     alignas(64) float zero[kStates];
 };
 
@@ -191,52 +193,84 @@ inline void step_cost_bc(float* out, float a, int s0, int n, const float* t, con
     step_cost(out, tmp, s0, n, t, h);
 }
 
+// min and first index of the minimum over p[0..n)
+inline float min_arg_range(const float* p, int n, int* arg) {
+    const float m = min_range(p, n);
+    int i = 0;
+#if TQENC_AVX2
+    const __m256 vm = _mm256_set1_ps(m);
+    for (; i + 8 <= n; i += 8) {
+        const int mask = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(p + i), vm, _CMP_EQ_OQ));
+        if (mask) { *arg = i + __builtin_ctz((unsigned) mask); return m; }
+    }
+#endif
+    for (; i < n; ++i)
+        if (p[i] == m) { *arg = i; return m; }
+    *arg = 0;
+    return m;
+}
+
 // T[p][4]: targets of processing position p (weights / d), H[p][4]: importance.  rot: the sequence is processed from
 // position rot (cyclically); fixed_c >= 0: tail-biting with the successor group of the first state and the predecessor
 // group of the last state both == fixed_c.  Writes the states by position into st[32]; returns the path cost.
 float viterbi(const Geo& g, const float (*T)[4], const float (*H)[4], int rot, int fixed_c, uint16_t* st) {
     Scratch& sc = scratch();
     const int K = g.K, G = g.G;
+    float* cur = sc.D[0];
     // q = 0
     {
         const int p = rot & 31;
-        step_cost(sc.hist[0], sc.zero, 0, kStates, T[p], H[p]);
+        step_cost(cur, sc.zero, 0, kStates, T[p], H[p]);
         if (fixed_c >= 0) {
-            float* h0 = sc.hist[0];
             if (g.t2) {   // gsucc(s) = s >> 8 == c: the 256 states [c<<8, c<<8 + 256) allowed
                 for (int s = 0; s < kStates; ++s)
-                    if ((s >> 8) != fixed_c) h0[s] = kInf;
+                    if ((s >> 8) != fixed_c) cur[s] = kInf;
             } else {      // s & (G-1) == c
                 for (int s = 0; s < kStates; ++s)
-                    if ((s & (G - 1)) != fixed_c) h0[s] = kInf;
+                    if ((s & (G - 1)) != fixed_c) cur[s] = kInf;
             }
         }
     }
     for (int q = 1; q < 32; ++q) {
-        const float* prev = sc.hist[q - 1];
-        float* cur = sc.hist[q];
+        const float* prev = cur;
+        cur = sc.D[q & 1];
         const int p = (rot + q) & 31;
         float* m = sc.m;
+        uint16_t* bp = sc.bp[q];
         if (g.t2) {
-            // m[a] = min over h of prev[a + 128 h]
-            for (int a = 0; a < 128; ++a) m[a] = prev[a];
+            // m[a] = min over h of prev[a + 128 h], argmin h
+            for (int a = 0; a < 128; ++a) { m[a] = prev[a]; sc.am[a] = 0; }
             for (int h = 1; h < 256; ++h) {
                 const float* row = prev + 128 * h;
                 int a = 0;
 #if TQENC_AVX2
-                for (; a + 8 <= 128; a += 8) _mm256_storeu_ps(m + a, _mm256_min_ps(_mm256_loadu_ps(m + a), _mm256_loadu_ps(row + a)));
+                const __m256i vh = _mm256_set1_epi32(h);
+                for (; a + 8 <= 128; a += 8) {
+                    const __m256 r = _mm256_loadu_ps(row + a), mm = _mm256_loadu_ps(m + a);
+                    const __m256 lt = _mm256_cmp_ps(r, mm, _CMP_LT_OQ);   // strictly smaller: the first minimum stays
+                    _mm256_storeu_ps(m + a, _mm256_blendv_ps(mm, r, lt));
+                    const __m256i old = _mm256_loadu_si256((const __m256i*) (sc.am + a));
+                    _mm256_storeu_si256((__m256i*) (sc.am + a), _mm256_castps_si256(_mm256_blendv_ps(
+                        _mm256_castsi256_ps(old), _mm256_castsi256_ps(vh), lt)));
+                }
 #endif
-                for (; a < 128; ++a) m[a] = std::min(m[a], row[a]);
+                for (; a < 128; ++a)
+                    if (row[a] < m[a]) { m[a] = row[a]; sc.am[a] = h; }
             }
+            for (int a = 0; a < 128; ++a) bp[a] = (uint16_t) (a + 128 * sc.am[a]);
             for (int b = 0; b < 128; ++b) step_cost_bc(cur + 256 * b, m[b], 256 * b, 256, T[p], H[p]);
         } else {
             const int span = 1 << K;
-            for (int a = 0; a < G; ++a) m[a] = min_range(prev + (size_t) a * span, span);
+            for (int a = 0; a < G; ++a) {
+                int arg;
+                m[a] = min_arg_range(prev + (size_t) a * span, span, &arg);
+                bp[a] = (uint16_t) ((a << K) + arg);
+            }
             for (int base = 0; base < kStates; base += G) step_cost(cur + base, m, base, G, T[p], H[p]);
         }
     }
     // final state
-    const float* last = sc.hist[31];
+    const float* last = cur;
     int best = -1;
     float bc = 3e38f;
     if (fixed_c < 0) {
@@ -257,23 +291,7 @@ float viterbi(const Geo& g, const float (*T)[4], const float (*H)[4], int rot, i
     uint32_t s = (uint32_t) best;
     st[(rot + 31) & 31] = (uint16_t) s;
     for (int q = 31; q >= 1; --q) {
-        const int gv = gsucc(g, s);
-        const float* prev = sc.hist[q - 1];
-        int arg = -1;
-        float mv = 3e38f;
-        if (g.t2) {
-            for (int h = 0; h < 256; ++h) {
-                const int x = gv + 128 * h;
-                if (prev[x] < mv) { mv = prev[x]; arg = x; }
-            }
-        } else {
-            const int span = 1 << K;
-            for (int i = 0; i < span; ++i) {
-                const int x = (gv << K) + i;
-                if (prev[x] < mv) { mv = prev[x]; arg = x; }
-            }
-        }
-        s = (uint32_t) arg;
+        s = sc.bp[q][gsucc(g, s)];
         st[(rot + q - 1) & 31] = (uint16_t) s;
     }
     return bc;
@@ -351,6 +369,19 @@ const float* codebook_state(uint32_t state) {
 }
 
 const int16_t* codebook_table() { return cb().tab; }
+
+const float* point_table() {
+    static float pts[4096];
+    static std::once_flag once;
+    std::call_once(once, [] {
+        for (int i = 0; i < 4096; ++i) {
+            const float x = half_to_float(tq_lut_f16[i]) * 8192.0f;
+            const int16_t q = (int16_t) (x < 0.0f ? x - 0.5f : x + 0.5f);
+            pts[i] = (float) q * (1.0f / 8192.0f);
+        }
+    });
+    return pts;
+}
 
 uint32_t block_state(int type, const uint8_t* qs, int t) {
     const int K = type_kbits(type);
