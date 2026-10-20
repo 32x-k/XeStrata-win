@@ -594,5 +594,5 @@ TQE_EXPORT double tqe_encode(int type, const float* w, const float* h, int64_t n
     if (stats) { stats[0] = nf; stats[1] = zb; }
     return e;
 }
-TQE_EXPORT const int16_t* tqe_table() { return tqenc::codebook_table(); }
+TQE_EXPORT const int16_t* tqe_table(int type) { return tqenc::codebook_table(type); }
 }
