@@ -16187,6 +16187,20 @@ int main(int argc, char** argv) {
         std::vector<int32_t> drafts((size_t) o.spec, 0);
         std::vector<float> dprob((size_t) o.spec, 1.0f);
         std::vector<int64_t> window_hist((size_t) o.spec + 1, 0);
+        // STRATA_SPEC_T_CYCLE=1,2,3,4,5,6,7,8 (bench only, off by default): the window size cycles through the list, so one run
+        // measures the cost of each verify width (with --spec-oracle drafts every row is accepted); the first round of a
+        // width (its graph capture) is not counted
+        std::vector<int> t_cycle;
+        if (const char* tc = std::getenv("STRATA_SPEC_T_CYCLE"); tc != nullptr && tc[0] != '\0') {
+            for (const char* q = tc; *q != '\0';) {
+                const int v = std::atoi(q);
+                if (v >= 1 && v <= o.spec) t_cycle.push_back(v);
+                while (*q != '\0' && *q != ',') ++q;
+                if (*q == ',') ++q;
+            }
+        }
+        std::vector<double> t_cycle_ms((size_t) o.spec + 1, 0.0);
+        std::vector<int64_t> t_cycle_n((size_t) o.spec + 1, 0), t_cycle_seen((size_t) o.spec + 1, 0);
         // plan v0.3 P6: with a native pack the first window is the last prompt token alone (it produces the first
         // generated token and the MTP's first cell); otherwise the token loop already did that.
         bool first_window = native_pack;
@@ -16258,6 +16272,7 @@ int main(int argc, char** argv) {
                 while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
             }
             if (first_window) T = 1;
+            if (!t_cycle.empty() && !first_window) T = t_cycle[(size_t) (rounds % (int64_t) t_cycle.size())];
             bool from_sfx = false;
             int sfx_match = 0;
             if (o.suffix_draft > 0 && !first_window) {
@@ -16400,6 +16415,10 @@ int main(int argc, char** argv) {
             p += a + 1;
             const double round_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             total_ms += round_ms;
+            if (!t_cycle.empty() && timed_round && T <= o.spec && t_cycle_seen[(size_t) T]++ > 0) {
+                t_cycle_ms[(size_t) T] += round_ms;
+                ++t_cycle_n[(size_t) T];
+            }
             if (timed_round && chain_n == 0) policy.observe(from_sfx, T, a, sfx_match, round_ms);
             else if (timed_round) policy.observe_chain(T_mtp, chain_n, a, cm, round_ms);
             if (rounds % 64 == 0)
@@ -16430,6 +16449,12 @@ int main(int argc, char** argv) {
         if (o.lookup_chain > 0)
             std::printf("%-24s %lld windows, chained drafts accepted %lld of %lld\n", "lookup chain",
                         (long long) chain_windows, (long long) chain_ok, (long long) chain_drafts);
+        if (!t_cycle.empty()) {
+            std::printf("%-24s", "window cost (ms/round)");
+            for (size_t i = 1; i < t_cycle_ms.size(); ++i)
+                if (t_cycle_n[i] > 0) std::printf(" T%zu:%.2f(n=%lld)", i, t_cycle_ms[i] / (double) t_cycle_n[i], (long long) t_cycle_n[i]);
+            std::printf("\n");
+        }
         std::printf("%-24s", "accepted per round");
         for (size_t i = 0; i < accepted_hist.size(); ++i) std::printf(" %zu:%lld", i, (long long) accepted_hist[i]);
         std::printf("\n");
