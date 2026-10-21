@@ -247,7 +247,9 @@ __global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict_
     }
 }
 
-__global__ void attn_merge_kernel(const float* __restrict__ part, float* __restrict__ out) {
+__device__ __forceinline__ void quant_block(float v, int blk, int col, int K, int8_t* __restrict__ xq, float* __restrict__ xd);
+
+__global__ void attn_merge_kernel(const float* __restrict__ part, int8_t* __restrict__ xq, float* __restrict__ xd) {
     const int a = blockIdx.x;                      // kvh * 32 + qi
     const int kvh = a >> 5, qi = a & 31, d = threadIdx.x;
     float M = -INFINITY;
@@ -261,7 +263,8 @@ __global__ void attn_merge_kernel(const float* __restrict__ part, float* __restr
         o = fmaf(p[2 + d], w, o);
     }
     const int row = qi >> 2, g = qi & 3;
-    out[((size_t) row * 32 + kvh * kDf2Gqa + g) * HD + d] = L > 0.0f ? o / L : 0.0f;
+    // the output row `row`, head kvh * 4 + g, dims d: quant block (kvh * 4 + g) * 4 + d / 32 of the 4096-wide row
+    quant_block(L > 0.0f ? o / L : 0.0f, (kvh * kDf2Gqa + g) * (HD / 32) + (d >> 5), row, 32 * HD, xq, xd);
 }
 
 // ---- Q8 GEMM for up to 8 activation columns (the drafter's matrices)
@@ -390,6 +393,98 @@ __global__ void conv_quant_kernel(const float* __restrict__ x, const float* __re
     quant_block(acc, blk, b, H, xq, xd);
 }
 
+// h += conv(x) (the finish convolution with its residual), then RMS norm of the new h with `gamma` -> xn (optional) and the planar quantization.
+// One block of 1024 threads per row: a warp owns whole 32-blocks (80 of them for 2560), so the quantization needs no exchange.
+__global__ void __launch_bounds__(1024) conv_rms_quant_kernel(const float* __restrict__ x, const float* __restrict__ dyn, int dyn_stride, const float* __restrict__ base,
+                                                              float* __restrict__ h, const float* __restrict__ gamma, float* __restrict__ xn, int H, int group,
+                                                              float eps, int8_t* __restrict__ xq, float* __restrict__ xd) {
+    const int b = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int groups = H / group, nb = H / 32;
+    __shared__ float red[32];
+    float v[3];
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int blk = warp + j * 32;
+        v[j] = 0.0f;
+        if (blk < nb) {
+            const int c = blk * 32 + lane;
+            float acc = 0.0f;
+#pragma unroll
+            for (int o = 0; o < 2; ++o) {
+                if (b - o < 0) continue;
+                const float k = base[o * H + c] + dyn[(size_t) b * dyn_stride + o * groups + c / group];
+                acc = fmaf(k, x[(size_t) (b - o) * H + c], acc);
+            }
+            v[j] = h[(size_t) b * H + c] + acc;
+            h[(size_t) b * H + c] = v[j];
+            ss += v[j] * v[j];
+        }
+    }
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if (lane == 0) red[warp] = ss;
+    __syncthreads();
+    float tot = 0.0f;
+    for (int w = 0; w < 32; ++w) tot += red[w];
+    const float scale = rsqrtf(tot / (float) H + eps);
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int blk = warp + j * 32;
+        if (blk < nb) {
+            const int c = blk * 32 + lane;
+            const float y = v[j] * scale * gamma[c];
+            if (xn) xn[(size_t) b * H + c] = y;
+            quant_block(y, blk, b, H, xq, xd);
+        }
+    }
+}
+
+// q and k of the block: per (row, head) RMS norm and rope; blockIdx.y < q_heads is a q head (-> qo, row-major rows), the rest k heads (-> ko)
+__global__ void norm_rope_qk_kernel(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ gq, const float* __restrict__ gk,
+                                    const float* __restrict__ table, float* __restrict__ qo, float* __restrict__ ko, int q_heads, int k_heads, float eps) {
+    const int r = blockIdx.x, hh = blockIdx.y, d = threadIdx.x;
+    const bool isq = hh < q_heads;
+    const int h = isq ? hh : hh - q_heads, heads = isq ? q_heads : k_heads;
+    const float* in = isq ? q : k;
+    const float* gamma = isq ? gq : gk;
+    float* out = isq ? qo : ko;
+    __shared__ float red[4];
+    __shared__ float y[HD];
+    const float x = in[((size_t) r * heads + h) * HD + d];
+    float ss = x * x;
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if ((d & 31) == 0) red[d >> 5] = ss;
+    __syncthreads();
+    const float v = x * rsqrtf((red[0] + red[1] + red[2] + red[3]) / (float) HD + eps) * gamma[d];
+    y[d] = v;
+    __syncthreads();
+    const int i = d & 63;
+    const float c = table[(r * 2 + 0) * 64 + i], sn = table[(r * 2 + 1) * 64 + i];
+    out[((size_t) r * heads + h) * HD + d] = d < 64 ? v * c - y[d + 64] * sn : v * c + y[d - 64] * sn;
+}
+
+// the context update's ring write: K norm + rope of (row, head) and the V copy, both into the head-major ring slot pos % slots
+__global__ void kv_ring_kernel(const float* __restrict__ kin, const float* __restrict__ vin, const float* __restrict__ gk, const int32_t* __restrict__ pos,
+                               const float* __restrict__ table, float* __restrict__ kring, float* __restrict__ vring, int slots, int heads, float eps) {
+    const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    __shared__ float red[4];
+    __shared__ float y[HD];
+    const float x = kin[((size_t) r * heads + h) * HD + d];
+    float ss = x * x;
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if ((d & 31) == 0) red[d >> 5] = ss;
+    __syncthreads();
+    const float v = x * rsqrtf((red[0] + red[1] + red[2] + red[3]) / (float) HD + eps) * gk[d];
+    y[d] = v;
+    __syncthreads();
+    const int i = d & 63;
+    const float c = table[(r * 2 + 0) * 64 + i], sn = table[(r * 2 + 1) * 64 + i];
+    const int slot = (int) (pos[r] % slots);
+    const size_t at = ((size_t) h * slots + slot) * HD + d;
+    kring[at] = d < 64 ? v * c - y[d + 64] * sn : v * c + y[d - 64] * sn;
+    vring[at] = vin[((size_t) r * heads + h) * HD + d];
+}
+
 // silu(gate) * up then the planar quantization: grid (ceil(I / 32 / 8), rows), 256 threads
 __global__ void swiglu_quant_kernel(const float* __restrict__ gate, const float* __restrict__ up, int I, int8_t* __restrict__ xq, float* __restrict__ xd) {
     const int blk = blockIdx.x * 8 + (threadIdx.x >> 5), b = blockIdx.y, lane = threadIdx.x & 31;
@@ -413,6 +508,16 @@ __global__ void q8_tile_kernel(const uint8_t* __restrict__ blocks, int8_t* __res
     dpl[(g * 8 * nb) + (int64_t) st * 128 + r * 16 + bi] = __ushort_as_half(dh);
     int8_t* o = qs + g * 8 * n_in + (int64_t) st * 4096 + r * 512 + bi * 32;
     for (int i = 0; i < 32; ++i) o[i] = (int8_t) src[2 + i];
+}
+
+// Reads a list of small tensors (norm weights, the convolutions' base kernels, ...) once, so they sit in the caches before the first kernel that needs them
+// (the verify window before the drafter streams gigabytes through them, and every dependent small kernel would otherwise wait for DRAM).
+struct Df2Touch { const float* p[48]; int n[48]; int count; };
+__global__ void touch_kernel(Df2Touch t, float* __restrict__ sink) {
+    float s = 0.0f;
+    for (int i = 0; i < t.count; ++i)
+        for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < t.n[i]; j += gridDim.x * blockDim.x) s += t.p[i][j];
+    if (s == 1.2345e30f) sink[0] = s;
 }
 
 // ---- top-16
@@ -591,11 +696,39 @@ void df2_copy_rows(const float* in, float* out, const int32_t* pos, int slot_mod
 }
 
 void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
-                   int ring_slots, int window, float* part, float* out, void* stream) {
+                   int ring_slots, int window, float* part, void* xq, float* xd, void* stream) {
     attn_part_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant);
     check("attn_part");
-    attn_merge_kernel<<<kDf2Kv * 32, HD, 0, (cudaStream_t) stream>>>(part, out);
+    attn_merge_kernel<<<kDf2Kv * 32, HD, 0, (cudaStream_t) stream>>>(part, static_cast<int8_t*>(xq), xd);
     check("attn_merge");
+}
+
+void df2_conv_rms_quant(const float* x, const float* dyn, int dyn_stride, const float* base, float* h, const float* gamma, float* xn, int rows, int H, int group,
+                        float eps, void* xq, float* xd, void* stream) {
+    if (H > 3 * 1024) throw std::invalid_argument("df2_conv_rms_quant: H too large");
+    conv_rms_quant_kernel<<<rows, 1024, 0, (cudaStream_t) stream>>>(x, dyn, dyn_stride, base, h, gamma, xn, H, group, eps, static_cast<int8_t*>(xq), xd);
+    check("conv_rms_quant");
+}
+
+void df2_norm_rope_qk(const float* q, const float* k, const float* gq, const float* gk, const float* table, float* qo, float* ko, int rows, int q_heads, int k_heads,
+                      float eps, void* stream) {
+    norm_rope_qk_kernel<<<dim3(rows, q_heads + k_heads), HD, 0, (cudaStream_t) stream>>>(q, k, gq, gk, table, qo, ko, q_heads, k_heads, eps);
+    check("norm_rope_qk");
+}
+
+void df2_kv_ring(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table, float* kring, float* vring, int slots, int rows,
+                 int heads, float eps, void* stream) {
+    kv_ring_kernel<<<dim3(rows, heads), HD, 0, (cudaStream_t) stream>>>(kin, vin, gk, pos, table, kring, vring, slots, heads, eps);
+    check("kv_ring");
+}
+
+void df2_touch(const float* const* ptrs, const int* counts, int n, float* sink, void* stream) {
+    Df2Touch t;
+    if (n > 48) n = 48;
+    for (int i = 0; i < n; ++i) { t.p[i] = ptrs[i]; t.n[i] = counts[i]; }
+    t.count = n;
+    touch_kernel<<<40, 256, 0, (cudaStream_t) stream>>>(t, sink);
+    check("touch");
 }
 
 void df2_gemm_variant(int v) { g_gemm_variant = v; }

@@ -16332,6 +16332,8 @@ int main(int argc, char** argv) {
         auto draft_next = [&](int T_, int a_) -> bool {
 #if defined(STRATA_HAVE_DFLASH2)
             if (use_df2) {
+                static const bool wait_commit_first = std::getenv("STRATA_DF2_WAITCOMMIT") != nullptr;   // measurement: no overlap with the async commit
+                if (wait_commit_first && !ver.wait_commit(err)) return false;
                 int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                 float pp[strata::core::Dflash2Drafter::kDrafts];
                 if (!df2.draft(ver.tap_dev(), a_ + 1, p, outv[(size_t) a_], dd, pp, err)) return false;

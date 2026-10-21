@@ -208,6 +208,12 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
         cudaEventCreate(&ev_a_);
         cudaEventCreate(&ev_b_);
     }
+    // the small f32 tensors the round touches first (see df2_touch)
+    for (const Tensor& t : tensors_)
+        if (t.dtype == "f32" && t.rows * t.cols * 4 <= (1 << 20) && touch_n_ < 48) {
+            touch_p_[touch_n_] = reinterpret_cast<const float*>(blob_ + t.off);
+            touch_c_[touch_n_++] = (int) (t.rows * t.cols);
+        }
     return alloc(err);
 }
 
@@ -348,10 +354,8 @@ bool Dflash2Drafter::record_context(const float* taps, int n, cudaStream_t cs, s
             const std::string kp = p + "self_attn.k_proj.weight", vp = p + "self_attn.v_proj.weight";
             gemm({kp.c_str(), vp.c_str()}, {kc_, vc_}, n, cs, xqc_, xdc_);
             stamp("gemm:kp");
-            df2_norm_rope(kc_, NKV_ * HD_, f32(p + "self_attn.k_norm.weight"), d_meta_ + 0, rt_ctx_, kring_[l], kRing, n, NKV_, eps_, cs);
-            stamp("df2_norm_rope");
-            df2_copy_rows(vc_, vring_[l], d_meta_ + 0, kRing, n, NKV_ * HD_, cs);
-            stamp("df2_copy_rows");
+            df2_kv_ring(kc_, vc_, f32(p + "self_attn.k_norm.weight"), d_meta_ + 0, rt_ctx_, kring_[l], vring_[l], kRing, n, NKV_, eps_, cs);
+            stamp("df2_kv_ring");
             if (fork_) cudaEventRecord(ev_ctx_[l], cs);   // layer l's keys and values are in the ring
         }
     } catch (const std::exception& e) {
@@ -369,6 +373,8 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
         stamp("df2_rope_table");
         embed_(d_meta_ + 24, B, h_, cs);
         stamp("embed_");
+        df2_rms_quant(h_, f32("layers.0.input_layernorm.weight"), xn_, B, N_, eps_, xqp_, xdp_, cs);
+        stamp("df2_rms_quant");
         for (int l = 0; l < L_; ++l) {
             const std::string p = "layers." + std::to_string(l) + ".";
             const float* base_a = f32(p + "attention_conv.base_kernel");
@@ -376,44 +382,36 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
             const std::string akp = p + "attention_conv.kernel_projection.weight", mkp = p + "mlp_conv.kernel_projection.weight";
             const std::string qp = p + "self_attn.q_proj.weight", kp = p + "self_attn.k_proj.weight", vp = p + "self_attn.v_proj.weight";
             const std::string gp = p + "mlp.gate_proj.weight", up = p + "mlp.up_proj.weight";
-            df2_rms_quant(h_, f32(p + "input_layernorm.weight"), xn_, B, N_, eps_, xqp_, xdp_, cs);
-            stamp("df2_rms_quant");
-            gemm({akp.c_str()}, {dyn_}, B, cs, xqp_, xdp_);
+            if (!skip_part("tiny")) gemm({akp.c_str()}, {dyn_}, B, cs, xqp_, xdp_);
             stamp("gemm:akp");
-            df2_conv_quant(xn_, dyn_, 640, base_a, B, N_, group_, xqp_, xdp_, cs);
+            if (!skip_part("small")) df2_conv_quant(xn_, dyn_, 640, base_a, B, N_, group_, xqp_, xdp_, cs);
             stamp("df2_conv_quant");
             if (!skip_part("qkvo")) gemm({qp.c_str(), kp.c_str(), vp.c_str()}, {q_, k_, v_}, B, cs, xqp_, xdp_);
             stamp("gemm:qp");
-            df2_norm_rope(q_, NH_ * HD_, f32(p + "self_attn.q_norm.weight"), d_meta_ + 8, rt_blk_, qn_, 0, B, NH_, eps_, cs);
-            stamp("df2_norm_rope");
-            df2_norm_rope(k_, NKV_ * HD_, f32(p + "self_attn.k_norm.weight"), d_meta_ + 8, rt_blk_, kblk_, 0, B, NKV_, eps_, cs);
-            stamp("df2_norm_rope");
+            if (!skip_part("small")) df2_norm_rope_qk(q_, k_, f32(p + "self_attn.q_norm.weight"), f32(p + "self_attn.k_norm.weight"), rt_blk_, qn_, kblk_, B, NH_, NKV_, eps_, cs);
+            stamp("df2_norm_rope_qk");
             if (fork_) cudaStreamWaitEvent(cs, ev_ctx_[l], 0);   // the context update has written this layer's ring
-            if (!skip_part("attn")) df2_attention(qn_, kring_[l], vring_[l], kblk_, v_, d_meta_ + 17, kRing, window_, part_, ao_, cs);
+            if (!skip_part("attn")) df2_attention(qn_, kring_[l], vring_[l], kblk_, v_, d_meta_ + 17, kRing, window_, part_, xqp_, xdp_, cs);
             stamp("df2_attention");
-            df2_quant_rows(ao_, NH_ * HD_, B, xqp_, xdp_, cs);
-            stamp("df2_quant_rows");
             if (!skip_part("qkvo")) gemm({(p + "self_attn.o_proj.weight").c_str()}, {o_}, B, cs, xqp_, xdp_);
             stamp("gemm:o_proj");
-            df2_conv(o_, dyn_ + 320, 640, base_a + 2 * N_, h_, h_, B, N_, group_, cs);
-            stamp("df2_conv");
-            df2_rms_quant(h_, f32(p + "post_attention_layernorm.weight"), xn_, B, N_, eps_, xqp_, xdp_, cs);
-            stamp("df2_rms_quant");
-            gemm({mkp.c_str()}, {dyn_}, B, cs, xqp_, xdp_);
+            if (!skip_part("small")) df2_conv_rms_quant(o_, dyn_ + 320, 640, base_a + 2 * N_, h_, f32(p + "post_attention_layernorm.weight"), xn_, B, N_, group_, eps_, xqp_, xdp_, cs);
+            stamp("df2_conv_rms_quant");
+            if (!skip_part("tiny")) gemm({mkp.c_str()}, {dyn_}, B, cs, xqp_, xdp_);
             stamp("gemm:mkp");
-            df2_conv_quant(xn_, dyn_, 640, base_m, B, N_, group_, xqp_, xdp_, cs);
+            if (!skip_part("small")) df2_conv_quant(xn_, dyn_, 640, base_m, B, N_, group_, xqp_, xdp_, cs);
             stamp("df2_conv_quant");
             if (!skip_part("mlp")) gemm({gp.c_str(), up.c_str()}, {gate_, up_}, B, cs, xqp_, xdp_);
             stamp("gemm:gp");
-            df2_swiglu_quant(gate_, up_, B, I_, xqp_, xdp_, cs);
+            if (!skip_part("small")) df2_swiglu_quant(gate_, up_, B, I_, xqp_, xdp_, cs);
             stamp("df2_swiglu_quant");
             if (!skip_part("mlp")) gemm({(p + "mlp.down_proj.weight").c_str()}, {mlp_}, B, cs, xqp_, xdp_);
             stamp("gemm:mlp.down_proj");
-            df2_conv(mlp_, dyn_ + 320, 640, base_m + 2 * N_, h_, h_, B, N_, group_, cs);
-            stamp("df2_conv");
+            // the next layer's input norm, or after the last layer the final norm (-> fn_, the rows the head and the selector read)
+            const std::string next_gamma = l + 1 < L_ ? "layers." + std::to_string(l + 1) + ".input_layernorm.weight" : std::string("norm.weight");
+            if (!skip_part("small")) df2_conv_rms_quant(mlp_, dyn_ + 320, 640, base_m + 2 * N_, h_, f32(next_gamma), l + 1 < L_ ? xn_ : fn_, B, N_, group_, eps_, xqp_, xdp_, cs);
+            stamp("df2_conv_rms_quant");
         }
-        native_qsa_rms_norm_weighted(h_, f32("norm.weight"), fn_, N_, B, eps_, cs);
-        stamp("native_qsa_rms_norm_weighted");
         native_quantize_q8_1(fn_ + N_, xq_, N_, kDrafts, cs);   // rows 1..7, the head's format
         df2_quant_rows(fn_ + N_, N_, kDrafts, xqp_, xdp_, cs);   // and the selector projection's
         if (!skip_part("head")) native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, kDrafts, cs);
@@ -437,11 +435,19 @@ bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "dflash2: begin capture"; return false; }
     kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
     // the context update (fc, the keys and values) and the block's front run side by side: they meet before each layer's attention
-    fork_ = prof_ == nullptr && cs2_ != nullptr;
+    // measured: -0.3 ms a round on an RTX 3060, +0.0..0.7 on a Strix Halo (gfx1151), so the HIP builds keep one stream (STRATA_DF2_FORK=1 / 0 overrides)
+#if defined(STRATA_USE_HIP)
+    static const bool fork_default = false;
+#else
+    static const bool fork_default = true;
+#endif
+    static const bool fork_on = [] { const char* e = std::getenv("STRATA_DF2_FORK"); return e && e[0] ? e[0] == '1' : fork_default; }();
+    fork_ = fork_on && prof_ == nullptr && cs2_ != nullptr;
     if (fork_) {
         cudaEventRecord(ev_fork_, cs_);
         cudaStreamWaitEvent(cs2_, ev_fork_, 0);
     }
+    if (touch_n_ > 0 && prof_ == nullptr && !skip_part("notouch")) kernels::df2_touch(touch_p_, touch_c_, touch_n_, hsel_, cs_);
     bool ok = record_context(taps, n, fork_ ? cs2_ : cs_, err);
     if (fork_) cudaEventRecord(ev_join_, cs2_);
     if (ok) ok = record_block(cs_, err);

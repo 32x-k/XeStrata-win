@@ -24,6 +24,8 @@ int main(int argc, char** argv) {
     cudaMalloc((void**) &vb, 8 * 1024 * 4);
     cudaMalloc((void**) &part, (size_t) kDf2MaxChunks * 8 * 32 * 130 * 4);
     cudaMalloc((void**) &out, 8 * 32 * 128 * 4);
+    float* xdb;
+    cudaMalloc((void**) &xdb, 8 * 128 * 4);
     cudaMalloc((void**) &pos, 4);
     std::vector<float> h((size_t) ring * 1024);
     for (size_t i = 0; i < h.size(); ++i) h[i] = (float) ((int) (i * 2654435761u >> 20) % 2001 - 1000) / 1000.0f;
@@ -39,16 +41,16 @@ int main(int argc, char** argv) {
     cudaEventCreate(&b);
     for (int v : {0, 1, 2, 3}) {
         df2_attention_variant(v);
-        df2_attention(q, kr, vr, kb, vb, pos, ring, 2048, part, out, nullptr);
+        df2_attention(q, kr, vr, kb, vb, pos, ring, 2048, part, out, xdb, nullptr);
         cudaDeviceSynchronize();
         cudaEventRecord(a);
-        for (int i = 0; i < iters; ++i) df2_attention(q, kr, vr, kb, vb, pos, ring, 2048, part, out, nullptr);
+        for (int i = 0; i < iters; ++i) df2_attention(q, kr, vr, kb, vb, pos, ring, 2048, part, out, xdb, nullptr);
         cudaEventRecord(b);
         cudaEventSynchronize(b);
         float ms;
         cudaEventElapsedTime(&ms, a, b);
-        std::vector<float> o(8 * 32 * 128);
-        cudaMemcpy(o.data(), out, o.size() * 4, cudaMemcpyDeviceToHost);
+        std::vector<float> o(8 * 128);
+        cudaMemcpy(o.data(), xdb, o.size() * 4, cudaMemcpyDeviceToHost);
         double sum = 0;
         for (float x : o) sum += x;
         const double kv_bytes = 2.0 * (ctx + 8) * 1024 * 4;

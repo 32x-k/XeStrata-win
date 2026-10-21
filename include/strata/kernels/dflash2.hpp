@@ -40,9 +40,9 @@ void df2_copy_rows(const float* in, float* out, const int32_t* pos, int slot_mod
 /// Attention of the block's 8 query rows (q: [8][32][128], already normed and rotated) over the context ring (kring, vring:
 /// head-major [8][ring_slots][128]) and the block's own keys (kblk, vblk: [8][8][128]).  Row i at position s + i sees context position j when
 /// s + i - j < window (j in [max(0, s - window + 1), s - 1], slot j % ring_slots) and every block key.  `s` is read from *anchor_pos
-/// on the device.  Partials in `part` ([kDf2MaxChunks][8][32][130] floats) are combined into out [8][32*128].
+/// on the device.  Partials in `part` ([kDf2MaxChunks][8][32][130] floats) are combined and the 8 output rows (4096 wide) written planar-quantized to xq / xd.
 void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
-                   int ring_slots, int window, float* part, float* out, void* stream);
+                   int ring_slots, int window, float* part, void* xq, float* xd, void* stream);
 
 /// The Q8 GEMM the drafter's matrices run on.  A weight matrix is TILED (see the layout note in dflash2.cu; df2_q8_tile makes it from GGUF Q8_0 blocks):
 /// the int8 plane at `w` (n_out * n_in bytes) then the fp16 scale plane.  Activations are planar (df2_quant_rows and the fused quantizers below):
@@ -64,6 +64,20 @@ void df2_conv_quant(const float* x, const float* dyn, int dyn_stride, const floa
 void df2_swiglu_quant(const float* gate, const float* up, int rows, int I, void* xq, float* xd, void* stream);
 /// GGUF Q8_0 blocks (34 bytes) of a matrix with rows of n_in -> the tiled qs plane and the tiled d plane (count = rows * n_in / 32 blocks).
 void df2_q8_tile(const void* blocks, void* qs, void* dpl, int n_in, int64_t count, void* stream);
+
+/// h += conv(x) (the finish convolution with the residual), then the RMS norm of the new h (weights gamma) -> xn (optional) and the planar quantization.
+/// rows <= 8, H <= 3072 (H a multiple of 32).
+void df2_conv_rms_quant(const float* x, const float* dyn, int dyn_stride, const float* base, float* h, const float* gamma, float* xn, int rows, int H, int group,
+                        float eps, void* xq, float* xd, void* stream);
+/// The block's q (q_heads x 128) and k (k_heads x 128) per row: RMS norm and rope with the table of the block's positions -> qo, ko (row-major).
+void df2_norm_rope_qk(const float* q, const float* k, const float* gq, const float* gk, const float* table, float* qo, float* ko, int rows, int q_heads, int k_heads,
+                      float eps, void* stream);
+/// The context update's write: K (norm + rope) and V of `rows` rows into the head-major rings at slot pos[r] % slots.
+void df2_kv_ring(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table, float* kring, float* vring, int slots, int rows,
+                 int heads, float eps, void* stream);
+
+/// Reads n small f32 tensors (ptrs[i], counts[i] floats; n <= 48) once to bring them into the caches; sink: one float of scratch.
+void df2_touch(const float* const* ptrs, const int* counts, int n, float* sink, void* stream);
 
 /// Top-16 per row of logits [rows][n] (value-descending; ties to the lower index).  idx_map (optional) maps a column to a token id.
 /// scratch: rows * kDf2TopBlocks * 16 * 2 words.  Outputs val[rows][16] and tok[rows][16].  n <= 4096 * kDf2TopBlocks.

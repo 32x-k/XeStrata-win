@@ -124,6 +124,9 @@ private:
     float* xdc_ = nullptr;
     cudaStream_t cs2_ = nullptr;    ///< the context update's branch of the round graph
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr, ev_ctx_[8] = {};
+    const float* touch_p_[48] = {};
+    int touch_c_[48] = {};
+    int touch_n_ = 0;
     bool fork_ = false;             ///< recording the forked graph: layer l's attention waits for ev_ctx_[l]
     float *fcy_ = nullptr, *hctx_ = nullptr, *kc_ = nullptr, *vc_ = nullptr;
     float *h_ = nullptr, *xn_ = nullptr, *xc_ = nullptr, *dyn_ = nullptr, *q_ = nullptr, *qn_ = nullptr, *k_ = nullptr, *v_ = nullptr, *kblk_ = nullptr;
