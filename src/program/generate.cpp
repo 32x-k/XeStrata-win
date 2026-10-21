@@ -11037,7 +11037,7 @@ int main(int argc, char** argv) {
         if (spec_cost && use_mtp)
             mtp.set_chain_rule([&](int idx, float pj) {
                 const bool k = policy.keep_draft(chain_st, idx, pj, S_mtp);
-                chain_rows = 1 + chain_st.kept;
+                chain_rows = chain_st.best_rows;
                 return k;
             });
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
@@ -16250,7 +16250,7 @@ int main(int argc, char** argv) {
         if (spec_cost && use_mtp)
             mtp.set_chain_rule([&](int idx, float pj) {
                 const bool k = policy.keep_draft(chain_st, idx, pj, S_mtp);
-                chain_rows = 1 + chain_st.kept;
+                chain_rows = chain_st.best_rows;
                 return k;
             });
         std::vector<int32_t> sbuf((size_t) o.spec, 0);

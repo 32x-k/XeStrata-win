@@ -46,17 +46,20 @@ public:
     double lookup_rate(int match) const;   // current q for a match length
     double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens
 
-    /// COST-AWARE MTP WINDOW (STRATA_SPEC_COST=1): the MTP chain is drafted one step at a time and keeps going only while the
-    /// next row is expected to pay: keep draft j (a window of j + 2 rows instead of j + 1) when
-    ///   (E + q_j) / cost(j + 2)  >=  (1 + margin) * E / cost(j + 1)
-    /// with E = 1 + q_0 + .. + q_{j-1} the expected tokens of the window so far, q_j = prod_{i<=j} a(p_i), a() the acceptance measured for
-    /// MTP drafts of that probability (draft_rate), cost() the measured round time of that window size (cost_ms: it includes the draft).
+    /// COST-AWARE MTP WINDOW (STRATA_SPEC_COST=1): the MTP chain is drafted one step at a time; after draft j (probability p_j)
+    ///   E_j = 1 + q_0 + .. + q_j,  q_i = prod_{k<=i} a(p_k)   a() = the acceptance measured for MTP drafts of that probability
+    /// is the expected tokens of the window of j + 2 rows, worth E_j / cost(j + 2) tokens per ms (cost() = the measured round time of
+    /// that window size, which includes the draft).  The window is the best of the widths seen; the chain goes on only while one or two
+    /// more drafts could still beat it (the cost is not convex: on a card with experts in RAM a window of 3 costs about a window of 2).
     /// It only chooses which rows are verified; the output is unchanged.
     struct ChainState {
         double q = 1.0, e = 1.0;
-        int kept = 0;                     ///< drafts kept so far = the window's rows - 1
+        double best_v = 0.0;
+        int best_rows = 1;                ///< the window to verify: 1 + the drafts kept
+        int kept = 0;                     ///< best_rows - 1
     };
-    /// Draft `idx` (0-based, probability p) was just computed: does it join the window?  idx == 0 starts a new chain.
+    /// Draft `idx` (0-based, probability p) was just computed: update `st` and say whether to compute draft idx + 1.
+    /// idx == 0 starts a new chain.  `cap` = the widest window (rows).
     bool keep_draft(ChainState& st, int idx, float p, int cap) const;
     /// After a round of the MTP window T whose drafts were p[0..T-1): `accepted` of them held.  Teaches draft_rate().
     void observe_probs(const float* p, int n_window_drafts, int accepted);

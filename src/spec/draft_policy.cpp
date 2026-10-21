@@ -133,16 +133,30 @@ void DraftPolicy::observe_probs(const float* p, int n, int accepted) {
 }
 
 bool DraftPolicy::keep_draft(ChainState& st, int idx, float p, int cap) const {
-    if (idx == 0) st = ChainState{};
-    st.q *= draft_rate(p);
-    if (idx + 2 > std::clamp(cap, 1, max_t_)) return false;      // no row left for it
-    const double c0 = cost_ms(idx + 1), c1 = std::max(c0, cost_ms(idx + 2));   // a wider window never costs less
-    const bool keep = (st.e + st.q) / c1 >= (1.0 + margin_ / 3.0) * st.e / c0;
-    if (keep) {
-        st.e += st.q;
-        st.kept = idx + 1;
+    cap = std::clamp(cap, 1, max_t_);
+    if (idx == 0) {
+        st = ChainState{};
+        st.best_v = 1.0 / cost_ms(1);
     }
-    return keep;
+    const double a = draft_rate(p);
+    st.q *= a;
+    st.e += st.q;
+    const int rows = idx + 2;
+    if (rows <= cap) {
+        const double v = st.e / cost_ms(rows);
+        if (v > st.best_v * (1.0 + margin_ / 3.0)) {
+            st.best_v = v;
+            st.best_rows = rows;
+        }
+        // a width not measured yet is tried a few times when the chain is likely to hold that far
+        if (cost_n_[rows] < kProbes && st.q >= 0.15) st.best_rows = rows;
+    }
+    st.kept = st.best_rows - 1;
+    if (rows + 1 > cap) return false;                       // no row left for another draft
+    // one or two more drafts, each as likely to hold as this one did, could they beat the best width so far?
+    const double v1 = (st.e + st.q * a) / cost_ms(rows + 1);
+    const double v2 = rows + 2 <= cap ? (st.e + st.q * a + st.q * a * a) / cost_ms(rows + 2) : 0.0;
+    return std::max(v1, v2) > st.best_v * (1.0 + margin_ / 3.0) || (cost_n_[rows + 1] < kProbes && st.q * a >= 0.15);
 }
 
 double DraftPolicy::chain_rate(int match) const {
