@@ -357,6 +357,10 @@ public:
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
     std::string profile_report();
+    /// STRATA_VERIFY_PROFILE: the same stage split, one line per window size T (bench: with STRATA_SPEC_T_CYCLE). Resets.
+    std::string profile_by_t_report();
+    /// STRATA_ROUTE_STATS=1: per window size, the routed experts per layer: distinct, and new per row (not in the rows before it). Resets.
+    std::string route_stats_report();
 
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;
@@ -415,7 +419,8 @@ private:
     bool instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const std::vector<int>& key, const char* what,
                               std::string& err);
     void collect_profile();   ///< STRATA_VERIFY_PROFILE: add the last window's stamps to prof_sum_
-    void accumulate_profile(const unsigned long long* stamps);   ///< one window's stamps (host copy) into prof_sum_
+    void accumulate_profile(const unsigned long long* stamps);
+    void accumulate_profile_inner(const unsigned long long* stamps);   ///< one window's stamps (host copy) into prof_sum_
     // pipelined windows (pl_launch ...)
     cudaStream_t ext_stream_ = nullptr;   ///< set_stream: the stage's shared stream (not destroyed here)
     bool always_publish_ = false;
@@ -506,6 +511,11 @@ private:
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
+    double prof_t_sum_[9][2][kProfPer] = {};   // the same per window size T (1..8), for profile_by_t_report
+    int64_t prof_t_win_[9] = {};
+    bool rs_on_ = false;                      // STRATA_ROUTE_STATS
+    unsigned long long* rs_dev_ = nullptr;    // [9 T][n_layers][8 rows]: experts of row r that no earlier row of the window routed to
+    int64_t rs_win_[9] = {};
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;

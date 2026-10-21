@@ -16454,6 +16454,12 @@ int main(int argc, char** argv) {
             for (size_t i = 1; i < t_cycle_ms.size(); ++i)
                 if (t_cycle_n[i] > 0) std::printf(" T%zu:%.2f(n=%lld)", i, t_cycle_ms[i] / (double) t_cycle_n[i], (long long) t_cycle_n[i]);
             std::printf("\n");
+            {   // STRATA_VERIFY_PROFILE / STRATA_ROUTE_STATS: the same split per window width (bench only)
+                const std::string pt = ver.profile_by_t_report();
+                if (!pt.empty()) std::printf("GPU stages per window width (ms):\n%s", pt.c_str());
+                const std::string rs = ver.route_stats_report();
+                if (!rs.empty()) std::printf("routed experts per window width:\n%s", rs.c_str());
+            }
         }
         std::printf("%-24s", "accepted per round");
         for (size_t i = 0; i < accepted_hist.size(); ++i) std::printf(" %zu:%lld", i, (long long) accepted_hist[i]);

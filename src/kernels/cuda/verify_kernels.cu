@@ -588,6 +588,21 @@ __global__ void hc_mean_streams_kernel(const float* __restrict__ R, float* __res
     out[i] = s / (float) hc;
 }
 
+__global__ void route_marginal_stats_kernel(const int32_t* __restrict__ ids, int n, int k, unsigned long long* acc) {
+    const int r = threadIdx.x;
+    if (r >= n) return;
+    int fresh = 0;
+    for (int j = 0; j < k; ++j) {
+        const int32_t e = ids[r * k + j];
+        bool seen = false;
+        for (int j2 = 0; j2 < j && !seen; ++j2) seen = ids[r * k + j2] == e;
+        for (int r2 = 0; r2 < r && !seen; ++r2)
+            for (int j2 = 0; j2 < k && !seen; ++j2) seen = ids[r2 * k + j2] == e;
+        if (!seen) ++fresh;
+    }
+    atomicAdd(acc + r, (unsigned long long) fresh);
+}
+
 __global__ void copy_indexed_kernel(float* __restrict__ dst, const float* __restrict__ src, int64_t stride,
                                     const int32_t* __restrict__ index, int64_t n) {
     const int idx = *index;
@@ -1525,6 +1540,11 @@ void broadcast_streams(const float* x, float* R, int64_t n_embd, int hc, int n_t
 void hc_mean_streams(const float* R, float* out, int64_t n_embd, int hc, void* stream) {
     hc_mean_streams_kernel<<<(unsigned) ((n_embd + 255) / 256), 256, 0, (cudaStream_t) stream>>>(R, out, n_embd, hc);
     check("hc_mean_streams");
+}
+
+void route_marginal_stats(const int32_t* ids, int n, int k, unsigned long long* acc, void* stream) {
+    route_marginal_stats_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(ids, n, k, acc);
+    check("route_marginal_stats");
 }
 
 void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* index, int64_t n, void* stream) {

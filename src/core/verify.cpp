@@ -923,6 +923,16 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 #endif
     }
     prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr;
+    if (const char* rs = std::getenv("STRATA_ROUTE_STATS"); rs != nullptr && rs[0] == '1') {
+        const size_t nrs = (size_t) 9 * (size_t) g.n_layers * 8;
+        if (cudaMalloc((void**) &rs_dev_, nrs * 8) == cudaSuccess) {
+            cudaMemset(rs_dev_, 0, nrs * 8);
+            rs_on_ = true;
+        } else {
+            rs_dev_ = nullptr;
+            cudaGetLastError();
+        }
+    }
     if (prof_on_) {
         const size_t np = (size_t) g.n_layers * kProfPer + 4;
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
@@ -1959,6 +1969,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
+        if (rs_on_ && G == 1 && n <= 8 && T <= 8)
+            strata::kernels::route_marginal_stats(ids_ + tb * K, n, (int) K, rs_dev_ + ((size_t) T * (size_t) g.n_layers + (size_t) l) * 8, cs);
         if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -2318,6 +2330,66 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     return true;
 }
 
+std::string Verifier::profile_by_t_report() {
+    if (!prof_on_) return std::string();
+    static const char* names[kProfPer] = {"-", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "q8+kv-idx",
+                                          "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
+                                          "attention", "gate", "", "out-proj", "router+plan", "shared+quant",
+                                          "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
+                                          "(gap)", "head", "hc0 norm", "hc0 down", "hc0 up", "hc1 norm", "hc1 down", "hc1 up"};
+    std::string out;
+    char b[96];
+    for (int T = 1; T <= 8; ++T) {
+        if (prof_t_win_[T] == 0) continue;
+        double total = 0;
+        std::snprintf(b, sizeof b, "T%d (n=%lld):", T, (long long) prof_t_win_[T]);
+        out += b;
+        for (int k = 0; k < 2; ++k) {
+            out += k == 0 ? " GDN[" : " | QSA[";
+            for (int i = 0; i < kProfPer; ++i) {
+                if (prof_t_sum_[T][k][i] <= 0) continue;
+                total += prof_t_sum_[T][k][i];
+                std::snprintf(b, sizeof b, " %s %.3f", names[i], prof_t_sum_[T][k][i] / 1e6 / (double) prof_t_win_[T]);
+                out += b;
+            }
+            out += " ]";
+        }
+        std::snprintf(b, sizeof b, " | total %.2f ms\n", total / 1e6 / (double) prof_t_win_[T]);
+        out += b;
+    }
+    std::memset(prof_t_sum_, 0, sizeof prof_t_sum_);
+    std::memset(prof_t_win_, 0, sizeof prof_t_win_);
+    return out;
+}
+
+std::string Verifier::route_stats_report() {
+    if (!rs_on_ || rs_dev_ == nullptr || g_ == nullptr) return std::string();
+    const int64_t L = g_->n_layers;
+    std::vector<unsigned long long> h((size_t) 9 * (size_t) L * 8);
+    cudaMemcpy(h.data(), rs_dev_, h.size() * 8, cudaMemcpyDeviceToHost);
+    std::string out;
+    char b[160];
+    for (int T = 1; T <= 8; ++T) {
+        if (rs_win_[T] == 0) continue;
+        double row[8] = {};
+        for (int64_t l = 0; l < L; ++l)
+            for (int r = 0; r < 8; ++r) row[r] += (double) h[((size_t) T * (size_t) L + (size_t) l) * 8 + (size_t) r];
+        const double denom = (double) rs_win_[T] * (double) L;
+        double sum = 0;
+        for (int r = 0; r < T; ++r) sum += row[r] / denom;
+        std::snprintf(b, sizeof b, "T%d (n=%lld): distinct experts per layer %.2f; new per row:", T, (long long) rs_win_[T], sum);
+        out += b;
+        for (int r = 0; r < T; ++r) {
+            std::snprintf(b, sizeof b, " %.2f", row[r] / denom);
+            out += b;
+        }
+        out += "\n";
+    }
+    cudaMemset(rs_dev_, 0, h.size() * 8);
+    std::memset(rs_win_, 0, sizeof rs_win_);
+    return out;
+}
+
 std::string Verifier::profile_report() {
     if (!prof_on_ || prof_windows_ == 0) return std::string();
     static const char* names[kProfPer] = {"-", "hc-read0", "q8+qkv/q-idx gemv", "conv", "ab", "z", "rec", "q8+kv-idx",
@@ -2651,6 +2723,7 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
     last_t_ = T;
+    if (rs_on_ && T >= 1 && T <= 8) ++rs_win_[T];
     last_pos0_ = pos0;
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     staged_ = true;
@@ -2662,6 +2735,17 @@ void Verifier::collect_profile() {
 }
 
 void Verifier::accumulate_profile(const unsigned long long* stamps) {
+    double before[2][kProfPer];
+    std::memcpy(before, prof_sum_, sizeof before);
+    accumulate_profile_inner(stamps);
+    if (last_t_ >= 1 && last_t_ <= 8) {
+        for (int k = 0; k < 2; ++k)
+            for (int i = 0; i < kProfPer; ++i) prof_t_sum_[last_t_][k][i] += prof_sum_[k][i] - before[k][i];
+        ++prof_t_win_[last_t_];
+    }
+}
+
+void Verifier::accumulate_profile_inner(const unsigned long long* stamps) {
     const ModelGeometry& g = *g_;
     const int64_t L = g.n_layers;
     auto at = [&](int64_t l, int i) { return stamps[(size_t) (l * kProfPer + i)]; };
