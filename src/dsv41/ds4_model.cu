@@ -1071,6 +1071,7 @@ struct Model::Impl {
     // attention, after the routing and the shared expert, after the experts' gate / up, after the wait for the CPU
     // lane, after the down pass and the post - read after the token's sync, each the time since the mark before it
     bool prof_on = std::getenv("DS4_PROF") != nullptr;
+    std::FILE* trace_f = std::getenv("DS4_TRACE") != nullptr ? std::fopen(std::getenv("DS4_TRACE"), "wb") : nullptr;
     struct ProfMark {
         const Dev* d;
         cudaEvent_t ev;
@@ -5169,6 +5170,15 @@ struct Model::Impl {
                 int tok_of[kWin * kPicks];
                 int nslots = 0;
                 std::vector<std::pair<int, int>> picks;   // (expert, t * kPicks + i), CPU-lane only
+                if (trace_f != nullptr && !l.mtp) {   // DS4_TRACE=file: one record a route request: u8 layer, u8 T, T x k int16 expert ids
+                    uint8_t hd[2] = {(uint8_t) li, (uint8_t) T};
+                    std::fwrite(hd, 1, 2, trace_f);
+                    for (int t = 0; t < T; ++t)
+                        for (int i = 0; i < l.k_exp; ++i) {
+                            const int16_t v = (int16_t) r.ids[t][i];
+                            std::fwrite(&v, 2, 1, trace_f);
+                        }
+                }
                 const bool dsk = disk_skip_w > 0.0f && !l.mtp && li >= disk_skip_from && li < g.nl;
                 for (int t = 0; t < T; ++t) {
                     float wsum = 0.0f;   // (DISK_SKIP_W: the token's route weights)
