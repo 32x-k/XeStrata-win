@@ -12,6 +12,7 @@ namespace {
 constexpr double kShape[DraftPolicy::kMaxT + 1] = {0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6};
 constexpr double kCostAlpha = 0.1;    // EMA weight of a new round time
 constexpr double kTokAlpha = 0.05;    // EMA weight of a new MTP window outcome
+constexpr double kCalDecay = 0.995;   // the MTP probability -> acceptance table fades slowly
 constexpr double kDecay = 0.97;       // lookup counts: older windows fade
 // Before a bucket has data: the longer the match, the likelier its continuation (llama.cpp's lookup decoding gates
 // on the same thing); worth 4 observations, so a few real windows override it
@@ -105,6 +106,50 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
         mtp_tok_[t] = mtp_n_[t] > 0 ? (1.0 - kTokAlpha) * mtp_tok_[t] + kTokAlpha * got : got;
         mtp_n_[t] += 1.0;
     }
+}
+
+namespace {
+int p_bucket(double p) {
+    const int b = (int) (p * 8.0);
+    return b < 0 ? 0 : b > 7 ? 7 : b;
+}
+}  // namespace
+
+// Until a bucket has data a draft is as likely to hold as the MTP says (worth kPriorN observations); measured
+// acceptance of the MTP chain is not the same as its own softmax (code and thinking text are over-confident).
+double DraftPolicy::draft_rate(double p) const {
+    const int b = p_bucket(p);
+    const double centre = std::clamp(p, 0.0, 1.0);
+    return (pa_ok_[b] + kPriorN * centre) / (pa_n_[b] + kPriorN);
+}
+
+void DraftPolicy::observe_probs(const float* p, int n, int accepted) {
+    // draft j was reached when the drafts before it held; it held when j < accepted
+    for (int j = 0; j < n && j <= accepted; ++j) {
+        const int b = p_bucket(p[j]);
+        pa_ok_[b] = kCalDecay * pa_ok_[b] + (j < accepted ? 1.0 : 0.0);
+        pa_n_[b] = kCalDecay * pa_n_[b] + 1.0;
+    }
+}
+
+int DraftPolicy::best_rows(const float* p, int n, int cap) const {
+    cap = std::clamp(cap, 1, max_t_);
+    const int m = std::min(n, cap - 1);
+    double q = 1.0, e = 1.0, floor_cost = cost_ms(1);
+    double best_v = e / floor_cost;
+    int best_t = 1;
+    for (int j = 0; j < m; ++j) {
+        q *= draft_rate(p[j]);
+        e += q;
+        const int t = j + 2;
+        floor_cost = std::max(floor_cost, cost_ms(t));
+        const double v = e / floor_cost;
+        if (v > best_v * (1.0 + margin_)) {
+            best_v = v;
+            best_t = t;
+        }
+    }
+    return best_t;
 }
 
 double DraftPolicy::chain_rate(int match) const {
