@@ -735,6 +735,21 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(tune_rocblas PRIVATE hip::host roc::rocblas)
   endif()
 
+  # DFlash2 drafter tools (not built by default: cmake --build <dir> --target dflash2_parity dflash2_gemm_bench dflash2_attn_bench): the drafter against
+  # the torch port on a synthetic case (needs the pack and a case file, tools/dflash2/mk_parity_case.py), and the timing of its Q8 GEMM and attention
+  add_executable(dflash2_parity EXCLUDE_FROM_ALL src/core/dflash2_parity.cpp)
+  target_include_directories(dflash2_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(dflash2_parity PRIVATE strata_engine strata_kernels ${_strata_gpu_runtime_target})
+  add_executable(dflash2_gemm_bench EXCLUDE_FROM_ALL src/core/dflash2_gemm_bench.cpp)
+  target_include_directories(dflash2_gemm_bench PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(dflash2_gemm_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_executable(dflash2_launch_bench EXCLUDE_FROM_ALL src/core/dflash2_launch_bench.cu)
+  target_include_directories(dflash2_launch_bench PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(dflash2_launch_bench PRIVATE ${_strata_gpu_runtime_target})
+  add_executable(dflash2_attn_bench EXCLUDE_FROM_ALL src/core/dflash2_attn_bench.cpp)
+  target_include_directories(dflash2_attn_bench PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(dflash2_attn_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+
   add_executable(strata src/program/generate.cpp)
   strata_utf8_manifest(strata)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
@@ -1084,11 +1099,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(verify_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME verify_parity COMMAND verify_parity --selftest)
   endif()
-  # the DFlash2 drafter against the torch port on a synthetic case: needs the pack and a case file (tools/dflash2/mk_parity_case.py), so not a ctest
-  add_executable(dflash2_parity src/core/dflash2_parity.cpp)
-  target_include_directories(dflash2_parity PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(dflash2_parity PRIVATE strata_engine strata_kernels ${_strata_gpu_runtime_target})
-
   add_executable(fused_gr_bench src/kernels/fused_gr_bench.cpp)
   target_include_directories(fused_gr_bench PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(fused_gr_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})

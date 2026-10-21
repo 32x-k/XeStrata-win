@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -57,6 +58,9 @@ public:
     /// selector's pick and its probability).  The taps pointer must be the same device buffer on every call (graphs are captured on it).
     bool draft(const float* taps_dev, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err);
 
+    /// Captures the eight round graphs (n_new = 1..8) on `taps` now, so no round pays for a capture.
+    bool prepare(const float* taps_dev, std::string& err);
+
     uint64_t vram_bytes() const { return vram_; }
     int64_t n_draft_vocab() const { return n_dvocab_; }
     int n_embd() const { return N_; }
@@ -65,7 +69,7 @@ public:
     /// Diagnostics (STRATA_DF2_DUMP): the final normalized block rows of the last draft(), host copy.
     bool debug_rows(std::vector<float>& rows, std::string& err);
 
-    double ms_draft = 0, ms_gpu = 0, ms_ctx = 0;
+    double ms_draft = 0, ms_gpu = 0, ms_ctx = 0, ms_capture = 0;
     int64_t rounds = 0;
 
 private:
@@ -73,8 +77,8 @@ private:
     const Tensor& find(const std::string& name) const;
     const void* q8(const std::string& name) const { return blob_ + find(name).off; }
     const float* f32(const std::string& name) const { return reinterpret_cast<const float*>(blob_ + find(name).off); }
-    void mm(const std::string& name, const void* xq, float* y, int ncols);   ///< Q8_0 matrix x ncols activation columns (quantized in xq)
-    void quant(const float* x, int n_in, int ncols);
+    /// planar Q8 matrices (1..3 of them, same input width) times the planar activations in xqp_ / xdp_ (ncols columns)
+    void gemm(std::initializer_list<const char*> names, std::initializer_list<float*> outs, int ncols, cudaStream_t cs, const uint8_t* xq, const float* xd);
     bool record_context(const float* taps, int n, cudaStream_t cs, std::string& err);
     bool record_block(cudaStream_t cs, std::string& err);
     bool capture(int n, const float* taps, std::string& err);
@@ -84,6 +88,7 @@ private:
     void stamp(const char* name);
     void prof_collect();
     void prof_report() const;
+    void prof_free();
 
     int device_ = -1;
     cudaStream_t cs_ = nullptr;
@@ -112,7 +117,14 @@ private:
     float* hp_out_ = nullptr;
     float *kring_[8] = {}, *vring_[8] = {};
     float *rt_ctx_ = nullptr, *rt_blk_ = nullptr;
-    uint8_t* xq_ = nullptr;
+    uint8_t* xq_ = nullptr;         ///< the head's q8_1 activations
+    uint8_t* xqp_ = nullptr;        ///< planar activations of the drafter's own GEMMs (kernels/dflash2.hpp)
+    float* xdp_ = nullptr;
+    uint8_t* xqc_ = nullptr;        ///< the same for the context update, which runs beside the block
+    float* xdc_ = nullptr;
+    cudaStream_t cs2_ = nullptr;    ///< the context update's branch of the round graph
+    cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr, ev_ctx_[8] = {};
+    bool fork_ = false;             ///< recording the forked graph: layer l's attention waits for ev_ctx_[l]
     float *fcy_ = nullptr, *hctx_ = nullptr, *kc_ = nullptr, *vc_ = nullptr;
     float *h_ = nullptr, *xn_ = nullptr, *xc_ = nullptr, *dyn_ = nullptr, *q_ = nullptr, *qn_ = nullptr, *k_ = nullptr, *v_ = nullptr, *kblk_ = nullptr;
     float *ao_ = nullptr, *o_ = nullptr, *gate_ = nullptr, *up_ = nullptr, *mlp_ = nullptr, *part_ = nullptr, *fn_ = nullptr;

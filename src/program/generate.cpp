@@ -16027,7 +16027,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --draft dflash2: %s; the MTP drafts instead\n", err.c_str());
             use_df2 = false;
         }
-        if (use_df2) std::fprintf(stderr, "strata generate: DFlash2 drafter on (%s), the MTP layer stays as the fallback\n", o.draft_model.c_str());
+        if (use_df2 && !df2.prepare(ver.tap_dev(), err)) {
+            std::fprintf(stderr, "strata generate: --draft dflash2: %s; the MTP drafts instead\n", err.c_str());
+            use_df2 = false;
+        }
+        if (use_df2) std::fprintf(stderr, "strata generate: DFlash2 drafter on (%s, graphs captured in %.0f ms), the MTP layer stays as the fallback\n", o.draft_model.c_str(), df2.ms_capture);
 #endif
         mem_mark("the verifier and the drafter's binding");
         ver.set_sampling(sp);   // the CLI's own sampling (until 0.1.19 this loop was always greedy); no penalties here
@@ -16332,6 +16336,23 @@ int main(int argc, char** argv) {
                 float pp[strata::core::Dflash2Drafter::kDrafts];
                 if (!df2.draft(ver.tap_dev(), a_ + 1, p, outv[(size_t) a_], dd, pp, err)) return false;
                 for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
+                // what the MTP does while it drafts: the PLE rows of the tokens the next window will hold are read ahead
+                // (the window's gather would otherwise wait for them: 1.8 ms a round on strix)
+                if (ss.ple.ready() && ss.ple.table != nullptr) {
+                    int n_pf = 0;
+                    const int cap = std::min<int>(S_mtp, (int) drafts.size() + 1);
+                    for (int t = 1; t < cap && (o.spec_min_p <= 0.0 || dprob[(size_t) t - 1] >= (float) o.spec_min_p); ++t) ++n_pf;
+                    int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
+                    auto pf = [&](int32_t tok) {
+                        uint32_t rows16[strata::kernels::PLE_N_HEADS];
+                        strata::kernels::ngram_rows(&tok, prev, 1, ss.ple.consts, rows16);
+                        prev[0] = prev[1];
+                        prev[1] = tok;
+                        ss.ple.table->prefetch_rows(rows16);
+                    };
+                    pf(outv[(size_t) a_]);
+                    for (int i = 0; i < n_pf; ++i) pf(drafts[(size_t) i]);
+                }
                 return true;
             }
 #endif

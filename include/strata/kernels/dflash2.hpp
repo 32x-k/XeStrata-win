@@ -14,8 +14,8 @@ constexpr int kDf2Rows = 8;            ///< block rows (the anchor + 7 masks) an
 constexpr int kDf2Kv = 8;              ///< K/V heads
 constexpr int kDf2Gqa = 4;             ///< query heads per K/V head
 constexpr int kDf2Hd = 128;            ///< head dim
-constexpr int kDf2Chunk = 256;         ///< keys per attention block
-constexpr int kDf2MaxChunks = 9;       ///< ceil((2047 context keys + 8 block keys) / kDf2Chunk)
+constexpr int kDf2Chunk = 128;         ///< keys per attention block
+constexpr int kDf2MaxChunks = 17;      ///< ceil((2047 context keys + 8 block keys) / kDf2Chunk)
 constexpr int kDf2TopK = 16;
 constexpr int kDf2TopBlocks = 64;      ///< partial top-k blocks per row (a block holds at most 4096 logits)
 
@@ -38,11 +38,32 @@ void df2_norm_rope(const float* in, int in_stride, const float* gamma, const int
 void df2_copy_rows(const float* in, float* out, const int32_t* pos, int slot_mod, int rows, int cols, void* stream);
 
 /// Attention of the block's 8 query rows (q: [8][32][128], already normed and rotated) over the context ring (kring, vring:
-/// [ring_slots][8][128]) and the block's own keys (kblk, vblk: [8][8][128]).  Row i at position s + i sees context position j when
+/// head-major [8][ring_slots][128]) and the block's own keys (kblk, vblk: [8][8][128]).  Row i at position s + i sees context position j when
 /// s + i - j < window (j in [max(0, s - window + 1), s - 1], slot j % ring_slots) and every block key.  `s` is read from *anchor_pos
 /// on the device.  Partials in `part` ([kDf2MaxChunks][8][32][130] floats) are combined into out [8][32*128].
 void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
                    int ring_slots, int window, float* part, float* out, void* stream);
+
+/// The Q8 GEMM the drafter's matrices run on.  A weight matrix is TILED (see the layout note in dflash2.cu; df2_q8_tile makes it from GGUF Q8_0 blocks):
+/// the int8 plane at `w` (n_out * n_in bytes) then the fp16 scale plane.  Activations are planar (df2_quant_rows and the fused quantizers below):
+/// xq is int8 [col][n_in] (8 columns of n_in bytes), xd float [col][n_in / 32].  Up to 3 matrices that share the input run in one launch; y (matrix i)
+/// is [ncols][n_out].  n_in a multiple of 512, n_out of 16, ncols 1..8 (the other columns of xq are read and dropped).
+/// Bench only: pick a GEMM kernel variant (0 = the default).
+void df2_gemm_variant(int v);
+/// Bench only: attention variants (bit 0 skips Q K^T, bit 1 skips P V).
+void df2_attention_variant(int v);
+struct Df2Mat { const void* w; float* y; int n_out; };
+void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_in, int ncols, void* stream);
+/// Planar quantization of rows x[ncols][K].
+void df2_quant_rows(const float* x, int K, int ncols, void* xq, float* xd, void* stream);
+/// RMS norm (weights gamma) of `rows` rows of N, written to xn (optional) and quantized.
+void df2_rms_quant(const float* h, const float* gamma, float* xn, int rows, int N, float eps, void* xq, float* xd, void* stream);
+/// df2_conv without residual, then quantized.
+void df2_conv_quant(const float* x, const float* dyn, int dyn_stride, const float* base, int rows, int H, int group, void* xq, float* xd, void* stream);
+/// silu(gate) * up of `rows` rows of I, quantized.
+void df2_swiglu_quant(const float* gate, const float* up, int rows, int I, void* xq, float* xd, void* stream);
+/// GGUF Q8_0 blocks (34 bytes) of a matrix with rows of n_in -> the tiled qs plane and the tiled d plane (count = rows * n_in / 32 blocks).
+void df2_q8_tile(const void* blocks, void* qs, void* dpl, int n_in, int64_t count, void* stream);
 
 /// Top-16 per row of logits [rows][n] (value-descending; ties to the lower index).  idx_map (optional) maps a column to a token id.
 /// scratch: rows * kDf2TopBlocks * 16 * 2 words.  Outputs val[rows][16] and tok[rows][16].  n <= 4096 * kDf2TopBlocks.
