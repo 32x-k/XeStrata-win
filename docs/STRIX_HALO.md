@@ -119,6 +119,11 @@ export STRATA_PF_SWITCH_MIN_T=4096
 export STRATA_PREFILL_STREAM_MIN=128   # prompt reads of 128-1,023 tokens on the fused experts too (below)
 ```
 
+`STRATA_HC_Q8=1` measured on the Strix Halo (IQ3_S, gfx1151, 2026-10-21, MTP 4 drafts / min-p 0.5): **+8.4%**
+on `json_extract` at fixed windows (53.55 -> 58.03 tok/s), at the cost of **94 of 250 output tokens differing** from
+the BF16 read (first at 60). It halves the hyper-connection weight bytes (13.29 -> 7.15 MB per read; cold read
+93.8 -> 20.3 us, 142 -> 352 GB/s). Experimental, opt-in only, never a default.
+
 `STRATA_PF_FUSED=1` reaches only chunks of `STRATA_PREFILL_STREAM_MIN` tokens or more (1,024 by default, the floor measured on
 a discrete card, where a smaller chunk does not pay for streaming every expert); a smaller read runs its experts through MMQ.
 With every expert in the unified memory nothing streams, and MMQ is the slow part: an agent's turn - a tool result of ~1,000
