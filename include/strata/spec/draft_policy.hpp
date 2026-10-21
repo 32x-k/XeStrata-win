@@ -46,13 +46,19 @@ public:
     double lookup_rate(int match) const;   // current q for a match length
     double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens
 
-    /// COST-AWARE MTP WINDOW (STRATA_SPEC_COST=1 / --spec-cost): the window of 1..cap rows with the best expected committed
-    /// tokens per ms, from the MTP chain's draft probabilities p[0..n) (n = drafts computed; the chain is drafted in full):
-    ///   E(T) = 1 + q_1 + .. + q_{T-1},  q_j = prod_{i<=j} a(p_i),  a() = the acceptance measured for drafts of that probability
-    ///   cost(T) = the measured round time of that window size (cost_ms, kept non-decreasing)
-    /// A wider window is taken only if its E/cost beats the narrower best by `margin`.  Only chooses which rows are verified.
-    int best_rows(const float* p, int n, int cap) const;
-    /// After a round of the MTP window T whose drafts were p[0..T-1): `accepted` of them held.  Teaches a().
+    /// COST-AWARE MTP WINDOW (STRATA_SPEC_COST=1): the MTP chain is drafted one step at a time and keeps going only while the
+    /// next row is expected to pay: keep draft j (a window of j + 2 rows instead of j + 1) when
+    ///   (E + q_j) / cost(j + 2)  >=  (1 + margin) * E / cost(j + 1)
+    /// with E = 1 + q_0 + .. + q_{j-1} the expected tokens of the window so far, q_j = prod_{i<=j} a(p_i), a() the acceptance measured for
+    /// MTP drafts of that probability (draft_rate), cost() the measured round time of that window size (cost_ms: it includes the draft).
+    /// It only chooses which rows are verified; the output is unchanged.
+    struct ChainState {
+        double q = 1.0, e = 1.0;
+        int kept = 0;                     ///< drafts kept so far = the window's rows - 1
+    };
+    /// Draft `idx` (0-based, probability p) was just computed: does it join the window?  idx == 0 starts a new chain.
+    bool keep_draft(ChainState& st, int idx, float p, int cap) const;
+    /// After a round of the MTP window T whose drafts were p[0..T-1): `accepted` of them held.  Teaches draft_rate().
     void observe_probs(const float* p, int n_window_drafts, int accepted);
     double draft_rate(double p) const;     // acceptance of an MTP draft that came with probability p
 

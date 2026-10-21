@@ -132,24 +132,17 @@ void DraftPolicy::observe_probs(const float* p, int n, int accepted) {
     }
 }
 
-int DraftPolicy::best_rows(const float* p, int n, int cap) const {
-    cap = std::clamp(cap, 1, max_t_);
-    const int m = std::min(n, cap - 1);
-    double q = 1.0, e = 1.0, floor_cost = cost_ms(1);
-    double best_v = e / floor_cost;
-    int best_t = 1;
-    for (int j = 0; j < m; ++j) {
-        q *= draft_rate(p[j]);
-        e += q;
-        const int t = j + 2;
-        floor_cost = std::max(floor_cost, cost_ms(t));
-        const double v = e / floor_cost;
-        if (v > best_v * (1.0 + margin_)) {
-            best_v = v;
-            best_t = t;
-        }
+bool DraftPolicy::keep_draft(ChainState& st, int idx, float p, int cap) const {
+    if (idx == 0) st = ChainState{};
+    st.q *= draft_rate(p);
+    if (idx + 2 > std::clamp(cap, 1, max_t_)) return false;      // no row left for it
+    const double c0 = cost_ms(idx + 1), c1 = std::max(c0, cost_ms(idx + 2));   // a wider window never costs less
+    const bool keep = (st.e + st.q) / c1 >= (1.0 + margin_ / 3.0) * st.e / c0;
+    if (keep) {
+        st.e += st.q;
+        st.kept = idx + 1;
     }
-    return best_t;
+    return keep;
 }
 
 double DraftPolicy::chain_rate(int match) const {
