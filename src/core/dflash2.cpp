@@ -208,12 +208,6 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
         cudaEventCreate(&ev_a_);
         cudaEventCreate(&ev_b_);
     }
-    // the small f32 tensors the round touches first (see df2_touch)
-    for (const Tensor& t : tensors_)
-        if (t.dtype == "f32" && t.rows * t.cols * 4 <= (1 << 20) && touch_n_ < 48) {
-            touch_p_[touch_n_] = reinterpret_cast<const float*>(blob_ + t.off);
-            touch_c_[touch_n_++] = (int) (t.rows * t.cols);
-        }
     return alloc(err);
 }
 
@@ -447,7 +441,6 @@ bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
         cudaEventRecord(ev_fork_, cs_);
         cudaStreamWaitEvent(cs2_, ev_fork_, 0);
     }
-    if (touch_n_ > 0 && prof_ == nullptr && !skip_part("notouch")) kernels::df2_touch(touch_p_, touch_c_, touch_n_, hsel_, cs_);
     bool ok = record_context(taps, n, fork_ ? cs2_ : cs_, err);
     if (fork_) cudaEventRecord(ev_join_, cs2_);
     if (ok) ok = record_block(cs_, err);

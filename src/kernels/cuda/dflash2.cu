@@ -510,16 +510,6 @@ __global__ void q8_tile_kernel(const uint8_t* __restrict__ blocks, int8_t* __res
     for (int i = 0; i < 32; ++i) o[i] = (int8_t) src[2 + i];
 }
 
-// Reads a list of small tensors (norm weights, the convolutions' base kernels, ...) once, so they sit in the caches before the first kernel that needs them
-// (the verify window before the drafter streams gigabytes through them, and every dependent small kernel would otherwise wait for DRAM).
-struct Df2Touch { const float* p[48]; int n[48]; int count; };
-__global__ void touch_kernel(Df2Touch t, float* __restrict__ sink) {
-    float s = 0.0f;
-    for (int i = 0; i < t.count; ++i)
-        for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < t.n[i]; j += gridDim.x * blockDim.x) s += t.p[i][j];
-    if (s == 1.2345e30f) sink[0] = s;
-}
-
 // ---- top-16
 constexpr int TK_CHUNK_MAX = 4096;
 __device__ __forceinline__ bool better(float va, int ia, float vb, int ib) { return va > vb || (va == vb && ia < ib); }
@@ -720,15 +710,6 @@ void df2_kv_ring(const float* kin, const float* vin, const float* gk, const int3
                  int heads, float eps, void* stream) {
     kv_ring_kernel<<<dim3(rows, heads), HD, 0, (cudaStream_t) stream>>>(kin, vin, gk, pos, table, kring, vring, slots, heads, eps);
     check("kv_ring");
-}
-
-void df2_touch(const float* const* ptrs, const int* counts, int n, float* sink, void* stream) {
-    Df2Touch t;
-    if (n > 48) n = 48;
-    for (int i = 0; i < n; ++i) { t.p[i] = ptrs[i]; t.n[i] = counts[i]; }
-    t.count = n;
-    touch_kernel<<<40, 256, 0, (cudaStream_t) stream>>>(t, sink);
-    check("touch");
 }
 
 void df2_gemm_variant(int v) { g_gemm_variant = v; }
