@@ -52,6 +52,13 @@ double DraftPolicy::cost_ms(int t) const {
     return den > 0 ? num / den : kShape[t];
 }
 
+double DraftPolicy::clamp_sample(int t, double ms) const {
+    if (!robust_) return ms;
+    const double known = cost_ms(t);           // the measured value, or the scaled guess from the other widths
+    if (cost_n_[t] > 0 || known > 0.0) return std::min(ms, 2.0 * known);
+    return ms;
+}
+
 void DraftPolicy::seed_costs(const double* ms, int n, double weight) {
     for (int t = 1; t <= std::min(n, kMaxT); ++t)
         if (ms[t - 1] > 0.0 && cost_n_[t] == 0) {
@@ -112,6 +119,7 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
     if (round_ms > 0) {
+        round_ms = clamp_sample(t, round_ms);
         cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
         cost_n_[t] += 1.0;
         last_[t] = rounds_;
@@ -214,6 +222,7 @@ int DraftPolicy::chain(int t_mtp, double p_mtp, int k_avail, int match) const {
 void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, double round_ms) {
     const int t = std::clamp(t_mtp + k, 1, kMaxT);
     if (round_ms > 0) {
+        round_ms = clamp_sample(t, round_ms);
         cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
         cost_n_[t] += 1.0;
         last_[t] = rounds_;

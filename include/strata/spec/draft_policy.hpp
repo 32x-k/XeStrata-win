@@ -51,6 +51,9 @@ public:
     void seed_costs(const double* ms, int n, double weight);
     /// The measured round cost of every window size seen: "T1:39.8(n=120) T2:..." for the log / the next process's table.
     std::string cost_table_text() const;
+    /// STRATA_SPEC_COST: a round time far above what is known for that width (the first use of a width captures its graph; a stalled
+    /// round) counts as a tenth of a sample, so one capture cannot price a width out of use.  Off: the cost EMA as it always was.
+    void set_robust(bool on) { robust_ = on; }
 
     /// COST-AWARE MTP WINDOW (STRATA_SPEC_COST=1): the MTP chain is drafted one step at a time; after draft j (probability p_j)
     ///   E_j = 1 + q_0 + .. + q_j,  q_i = prod_{k<=i} a(p_k)   a() = the acceptance measured for MTP drafts of that probability
@@ -83,6 +86,8 @@ private:
     std::array<double, kBuckets> ok_{}, bad_{};            // lookup drafts accepted / windows cut short, decayed
     std::array<double, kBuckets> cok_{}, cbad_{};          // chained lookup drafts, the same (reached rounds only)
     double rounds_ = 0;                                    // rounds observed so far
+    bool robust_ = false;
+    double clamp_sample(int t, double ms) const;
     static constexpr int kPBuckets = 8;
     std::array<double, kPBuckets> pa_ok_{}, pa_n_{};       // MTP drafts reached / accepted by probability bucket (decayed)
     std::array<double, kMaxT + 1> last_{};                 // the round at which each size was last measured

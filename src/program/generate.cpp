@@ -11034,6 +11034,7 @@ int main(int argc, char** argv) {
         const bool spec_cost = [] { const char* v = std::getenv("STRATA_SPEC_COST"); return v != nullptr && v[0] == '1'; }();   // cost-aware MTP window (A/B arm)
         strata::spec::DraftPolicy::ChainState chain_st;
         int chain_rows = 1;   // the window the cost-aware rule kept in the MTP chain just drafted
+        policy.set_robust(spec_cost);
         if (spec_cost && use_mtp)
             mtp.set_chain_rule([&](int idx, float pj) {
                 const bool k = policy.keep_draft(chain_st, idx, pj, S_mtp);
@@ -16257,6 +16258,7 @@ int main(int argc, char** argv) {
             }
             policy.seed_costs(ms, n, 6.0);
         }
+        policy.set_robust(spec_cost);
         if (spec_cost && use_mtp)
             mtp.set_chain_rule([&](int idx, float pj) {
                 const bool k = policy.keep_draft(chain_st, idx, pj, S_mtp);
