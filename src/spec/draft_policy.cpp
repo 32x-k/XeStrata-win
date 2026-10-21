@@ -2,6 +2,7 @@
 #include "strata/spec/draft_policy.hpp"
 
 #include <algorithm>
+#include <cstdio>
 
 namespace strata::spec {
 namespace {
@@ -49,6 +50,25 @@ double DraftPolicy::cost_ms(int t) const {
             den += w;
         }
     return den > 0 ? num / den : kShape[t];
+}
+
+void DraftPolicy::seed_costs(const double* ms, int n, double weight) {
+    for (int t = 1; t <= std::min(n, kMaxT); ++t)
+        if (ms[t - 1] > 0.0 && cost_n_[t] == 0) {
+            cost_[t] = ms[t - 1];
+            cost_n_[t] = weight;
+        }
+}
+
+std::string DraftPolicy::cost_table_text() const {
+    std::string out;
+    char b[64];
+    for (int t = 1; t <= kMaxT; ++t)
+        if (cost_n_[t] > 0) {
+            std::snprintf(b, sizeof b, "%sT%d:%.2f(n=%.0f)", out.empty() ? "" : " ", t, cost_[t], cost_n_[t]);
+            out += b;
+        }
+    return out;
 }
 
 bool DraftPolicy::stale(int t) const { return cost_n_[t] > 0 && rounds_ - last_[t] > kStaleRounds; }

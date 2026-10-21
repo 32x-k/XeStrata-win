@@ -16,6 +16,7 @@
 #pragma once
 
 #include <array>
+#include <string>
 
 namespace strata::spec {
 
@@ -45,6 +46,11 @@ public:
     double chain_rate(int match) const;
     double lookup_rate(int match) const;   // current q for a match length
     double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens
+    /// A per-card row-cost table (round ms of the windows of 1..n rows, the draft included) counted as `weight` earlier rounds each:
+    /// the start of a process that already knows the card (STRATA_SPEC_COST_TABLE; tuning time), replaced by what it then measures.
+    void seed_costs(const double* ms, int n, double weight);
+    /// The measured round cost of every window size seen: "T1:39.8(n=120) T2:..." for the log / the next process's table.
+    std::string cost_table_text() const;
 
     /// COST-AWARE MTP WINDOW (STRATA_SPEC_COST=1): the MTP chain is drafted one step at a time; after draft j (probability p_j)
     ///   E_j = 1 + q_0 + .. + q_j,  q_i = prod_{k<=i} a(p_k)   a() = the acceptance measured for MTP drafts of that probability

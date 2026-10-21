@@ -16247,6 +16247,16 @@ int main(int argc, char** argv) {
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         strata::spec::DraftPolicy::ChainState chain_st;
         int chain_rows = 1;   // STRATA_SPEC_COST: the window the cost-aware rule kept in the MTP chain just drafted
+        if (const char* tab = std::getenv("STRATA_SPEC_COST_TABLE"); spec_cost && tab != nullptr && tab[0] != '\0') {
+            double ms[strata::spec::DraftPolicy::kMaxT] = {};
+            int n = 0;
+            for (const char* q = tab; *q != '\0' && n < strata::spec::DraftPolicy::kMaxT;) {
+                ms[n++] = std::atof(q);
+                while (*q != '\0' && *q != ',') ++q;
+                if (*q == ',') ++q;
+            }
+            policy.seed_costs(ms, n, 6.0);
+        }
         if (spec_cost && use_mtp)
             mtp.set_chain_rule([&](int idx, float pj) {
                 const bool k = policy.keep_draft(chain_st, idx, pj, S_mtp);
@@ -16489,6 +16499,7 @@ int main(int argc, char** argv) {
         if (o.lookup_chain > 0)
             std::printf("%-24s %lld windows, chained drafts accepted %lld of %lld\n", "lookup chain",
                         (long long) chain_windows, (long long) chain_ok, (long long) chain_drafts);
+        if (spec_cost) std::printf("%-24s %s\n", "spec cost table", policy.cost_table_text().c_str());
         if (!t_cycle.empty()) {
             std::printf("%-24s", "window cost (ms/round)");
             for (size_t i = 1; i < t_cycle_ms.size(); ++i)
