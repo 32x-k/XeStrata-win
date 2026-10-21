@@ -55,8 +55,13 @@ double DraftPolicy::cost_ms(int t) const {
 double DraftPolicy::clamp_sample(int t, double ms) const {
     if (!robust_) return ms;
     const double known = cost_ms(t);           // the measured value, or the scaled guess from the other widths
-    if (cost_n_[t] > 0 || known > 0.0) return std::min(ms, 2.0 * known);
-    return ms;
+    if (cost_n_[t] == 0) {
+        // the first use of a width captures its graph: that round says nothing about its cost, the guess from the other widths stands in
+        for (int u = 1; u <= kMaxT; ++u)
+            if (cost_n_[u] > 0) return known;
+        return ms;
+    }
+    return std::min(ms, 2.0 * known);
 }
 
 void DraftPolicy::seed_costs(const double* ms, int n, double weight) {
@@ -120,7 +125,8 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
     t = std::clamp(t, 1, kMaxT);
     if (round_ms > 0) {
         round_ms = clamp_sample(t, round_ms);
-        cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
+        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
+        cost_[t] = cost_n_[t] > 0 ? (1.0 - alpha) * cost_[t] + alpha * round_ms : round_ms;
         cost_n_[t] += 1.0;
         last_[t] = rounds_;
     }
@@ -223,7 +229,8 @@ void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, doubl
     const int t = std::clamp(t_mtp + k, 1, kMaxT);
     if (round_ms > 0) {
         round_ms = clamp_sample(t, round_ms);
-        cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
+        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
+        cost_[t] = cost_n_[t] > 0 ? (1.0 - alpha) * cost_[t] + alpha * round_ms : round_ms;
         cost_n_[t] += 1.0;
         last_[t] = rounds_;
     }
