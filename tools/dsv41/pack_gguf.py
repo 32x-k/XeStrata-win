@@ -333,6 +333,7 @@ def main() -> int:
                                      "checkpoint's vision.* / aligner.* (default: the first mmproj*.gguf in <model>/..)")
     ap.add_argument("--tq-experts", nargs="+", help="folders tq_convert.py wrote (tq.json + tq-L<layer>.bin): the routed experts of the layers "
                                          "listed there are read from it as trellis types (TQK5X ..), the others keep their MXFP4")
+    ap.add_argument("--tq-layers", help="only these layers (comma list) of the --tq-experts folders")
     ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's; default <model>/../dspark/dspark.json)")
     ap.add_argument("--engram", help="the folder of the Engram tables' GGUF set, for a quant that leaves them out "
                                      "(default: <model>/../Engram, when it is whole)")
@@ -561,6 +562,9 @@ def main() -> int:
                     raise SystemExit("tq.json: %s is not a layer's expert role" % key)
                 by_layer.setdefault(int(m.group(1)), {})[m.group(2)] = ent
                 tq_dirs[(int(m.group(1)), m.group(2))] = tqd
+        if a.tq_layers:
+            keep = {int(x) for x in a.tq_layers.split(",")}
+            by_layer = {il: r for il, r in by_layer.items() if il in keep}
         TQTYPES = {v[0]: k for k, v in TYPES.items()}
         for il, roles in sorted(by_layer.items()):
             if sorted(roles) != ["w1", "w2", "w3"]:
