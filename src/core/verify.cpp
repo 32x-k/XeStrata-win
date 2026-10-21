@@ -56,7 +56,9 @@
 #include "strata/core/progress.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#if defined(STRATA_HAVE_DFLASH2)
 #include "strata/kernels/dflash2.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -2190,8 +2192,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // the layer's completed output: R with this FFN half's write applied (the next layer's read would fold it), the mean of
             // the hc streams, all rows of the group in one launch
             const int64_t nt = (int64_t) tap_layers_.size();
+#if defined(STRATA_HAVE_DFLASH2)
             strata::kernels::df2_tap_gr(Rt(tb), HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, tap_dev_ + ((size_t) tb * nt + (size_t) tap_slot_[(size_t) l]) * N,
                                         nt * N, n, N, (int) HC, cs);
+#else   // builds without the DFlash2 kernels (Metal, SYCL): the research dump's per-row path
+            for (int t = tb; t < te; ++t) {
+                cudaMemcpyAsync(tap_scratch_, Rt(t), (size_t) HC * N * 4, cudaMemcpyDeviceToDevice, cs);
+                gr_write(tap_scratch_, bo_ + t * N, inj2_ + t * HC, gs, tap_scratch_, cs);
+                hc_mean_streams(tap_scratch_, tap_dev_ + ((size_t) t * nt + (size_t) tap_slot_[(size_t) l]) * N, N, (int) HC, cs);
+            }
+#endif
         }
         if (l == g.n_layers - 1) {
             if (!fuse_head_gr) {
