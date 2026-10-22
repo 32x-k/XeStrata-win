@@ -254,13 +254,25 @@ def _pid_exists(pid: int, started: int | None = None) -> bool:
     return True
 
 
-def _child_present(child: dict) -> bool:
+_MARKER_SLACK = 2.0   # seconds: the child starts before its marker is written; this much of clock rounding is allowed
+
+
+def _child_present(child: dict, written: float | None = None) -> bool:
     """Whether the child recorded in an owner marker is still there. A marker without a creation time (Windows could not
     read it when the child started) cannot tell the recorded server from a later process that reused the number, so
-    a live process that is not a Python or Strata executable is a reused number: the child is gone (#3488)."""
+    a live process that is not a Python or Strata executable is a reused number: the child is gone (#3488).
+
+    `written` is when the marker was written (its file time). The child was started before that, so a process that was created
+    AFTER it cannot be the child, whatever its image: the number was reused. This is what clears a marker left by a force-killed app
+    when the number now belongs to another Python program (2026-10-22: every load said "still present", and removing the marker by
+    hand was the only way out)."""
     started = child.get("started") if type(child.get("started")) is int else None
     if not _pid_exists(child["pid"], started):
         return False
+    if started is None and written is not None:
+        created = procs.started_epoch(child["pid"])
+        if created is not None and created > written + _MARKER_SLACK:
+            return False
     if WINDOWS and started is None:
         image = winproc.process_image(child["pid"])
         if image is not None:
@@ -307,9 +319,10 @@ def _recover_stale(name: str, *, wait: float) -> bool:
                 child.get("phase") != "owned" or type(child.get("pid")) is not int or child["pid"] <= 0:
             raise ProfileError("lost host child launch is unverified; inspect before recovery", 6)
         deadline = time.monotonic() + min(45.0, max(5.0, wait))
-        while _child_present(child) and time.monotonic() < deadline:
+        written = details.st_mtime
+        while _child_present(child, written) and time.monotonic() < deadline:
             time.sleep(0.1)
-        if _child_present(child):
+        if _child_present(child, written):
             raise ProfileError("lost host child is still present; retry after it exits", 6)
         if not isinstance(child.get("ready"), str):
             raise ProfileError("lost host ready path is invalid; inspect before recovery", 6)

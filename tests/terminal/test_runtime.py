@@ -21,7 +21,7 @@ from unittest import mock
 from strata_cli.cli import main
 from strata_cli import bench
 from strata_cli.client import Endpoint
-from strata_control import calibration, journal, management, owner_transport, profiles, recipes, runtime
+from strata_control import calibration, journal, management, owner_transport, procs, profiles, recipes, runtime
 
 
 WINDOWS = os.name == "nt"
@@ -1158,6 +1158,53 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(runtime._child_present(child))
             image.return_value = r"C:\Windows\System32\svchost.exe"
             self.assertTrue(runtime._child_present({"pid": 1, "started": 5}))   # a creation time decides by itself
+
+    def test_a_process_created_after_the_marker_was_written_is_not_the_recorded_child(self):
+        # 2026-10-22: the app was force-killed, its marker had no creation time, the number now belonged to another Python program, and every
+        # load said "lost host child is still present" until the marker was deleted by hand. The child was started BEFORE its marker was written.
+        child = {"pid": 4242}
+        with mock.patch.object(runtime, "_pid_exists", return_value=True), \
+                mock.patch.object(runtime.winproc, "process_image", create=True, return_value="C:\\Python\\python.exe"), \
+                mock.patch.object(runtime.procs, "started_epoch") as created:
+            created.return_value = 1000.0 + 60
+            self.assertFalse(runtime._child_present(child, written=1000.0), "created a minute after the marker: another process")
+            created.return_value = 1000.0 - 5
+            self.assertTrue(runtime._child_present(child, written=1000.0), "created before the marker: could be the child, keep refusing")
+            created.return_value = 1000.0 + 1.5
+            self.assertTrue(runtime._child_present(child, written=1000.0), "inside the clock slack: keep refusing")
+            created.return_value = None
+            self.assertTrue(runtime._child_present(child, written=1000.0), "creation time unreadable: never guess")
+            created.return_value = 1000.0 + 60
+            self.assertTrue(runtime._child_present({"pid": 4242, "started": 7}, written=1000.0) is True, "a recorded creation time decides by itself")
+            self.assertTrue(runtime._child_present(child), "no marker time: unchanged")
+
+    def test_a_marker_left_by_a_killed_app_is_cleaned_up_when_its_number_belongs_to_a_later_program(self):
+        victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        try:
+            state_path, marker = self._stale_host(victim.pid)             # a marker with no creation time (Windows could not read it)
+            old = time.time() - 3600
+            os.utime(marker, (old, old))                                  # written an hour ago: the victim started after it
+            started = runtime.start("local", wait=10, shutdown_timeout=2)
+            self.assertTrue(started["ok"], started)
+            self.assertFalse(marker.exists(), "the stale marker was removed")
+            self.assertIsNone(victim.poll(), "the program that reused the number was left alone")
+        finally:
+            victim.kill()
+            victim.wait(timeout=10)
+
+    def test_started_epoch_reads_a_live_process_and_nothing_for_a_dead_number(self):
+        victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        try:
+            now = time.time()
+            created = procs.started_epoch(victim.pid)
+            self.assertIsNotNone(created)
+            self.assertLess(abs(created - now), 60)
+        finally:
+            victim.kill()
+            victim.wait(timeout=10)
+        self.assertIsNone(procs.started_epoch(victim.pid))
+        self.assertIsNone(procs.started_epoch(0))
+        self.assertIsNone(procs.started_epoch(-5))
 
     @unittest.skipUnless(WINDOWS, "os.kill(pid, 0) ends a process on Windows; liveness is a handle query")
     def test_liveness_check_does_not_end_the_process_it_asks_about(self):
