@@ -364,6 +364,9 @@ def gpu_notices(s: S.LaunchSettings, comp) -> list[S.Notice]:
     note = comp.other_vendor_note
     if note:
         out.append(S.Notice("warn", note, ""))
+    new_card = comp.new_card_note
+    if new_card:
+        out.append(S.Notice("warn", new_card[0], new_card[1]))
     return out
 
 

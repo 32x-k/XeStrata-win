@@ -11,7 +11,7 @@ import json
 import sys
 from pathlib import Path
 
-from strata_control import acquisition, drafting, drafting_fetch
+from strata_control import acquisition, drafting
 
 
 def add_parser(sp) -> None:
@@ -55,6 +55,7 @@ def _inputs(a) -> dict:
 
 
 def run(a) -> int:
+    from strata_control import drafting_fetch      # here, not at the top: it pulls in the network code, which a started engine's command line must not load
     machine = a.output in ("json", "jsonl")
     want = _inputs(a)
     folder = want["data_dir"]

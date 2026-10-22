@@ -675,7 +675,7 @@ class RuntimeTests(unittest.TestCase):
             self.config.write_text(json.dumps(edited), encoding="utf-8")
             plan = runtime.plan_restart("local", allow_source_migration=True)
             code, result = self._cli("restart", "--profile", "local", "--allow-source-migration",
-                                     "--startup-wait", "5", "--wait", "20",
+                                     "--startup-wait", "30", "--wait", "20",
                                      "--if-source-sha256", plan["candidate_source_sha256"])
         self.assertEqual(code, 6)
         self.assertFalse(result["ok"])
@@ -772,7 +772,7 @@ class RuntimeTests(unittest.TestCase):
             proposed["source_config"] = str(next_config)
             profiles.save("local", proposed, expected_revision=revision)
             digest = hashlib.sha256(next_config.read_bytes()).hexdigest()
-            result = runtime.restart("local", timeout=20, startup_wait=5, allow_source_switch=True,
+            result = runtime.restart("local", timeout=20, startup_wait=30, allow_source_switch=True,
                                      expected_source_sha256=digest)
         self.assertFalse(result["ok"])
         self.assertTrue(result["rolled_back"])
