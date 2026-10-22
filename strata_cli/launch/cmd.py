@@ -304,9 +304,14 @@ def apply_defaults(s: S.LaunchSettings, catalog) -> tuple[S.LaunchSettings, list
         notices += S.check_context(s, max_fit_tokens=None)
     if s.access != "local" and not s.api_key and not s.no_key:
         from strata_cli.launch import access
-        s.api_key = access.new_key()
-        notices.append(S.Notice("warn", "A new API key was made, because the server is shared beyond this computer.",
-                                "It is saved with the preset; show it with: strata launch --show-key"))
+        kept = access.kept_key(s.name or f"{s.model or 'model'} {S.context_label(s.context)}")
+        s.api_key = kept or access.new_key()
+        if kept:
+            notices.append(S.Notice("warn", "The API key from the earlier launch is kept, so apps that use it keep working.",
+                                    "A different one: add --new-key. Show it with: strata launch --show-key"))
+        else:
+            notices.append(S.Notice("warn", "A new API key was made, because the server is shared beyond this computer.",
+                                    "It is saved with the preset; show it with: strata launch --show-key"))
     notices += gpu_notices(s, comp)
     notices += S.check_access(s)
     vram = comp.main_vram_gb or None

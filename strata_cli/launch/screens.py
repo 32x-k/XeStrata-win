@@ -1340,7 +1340,7 @@ class AccessScreen(Base):
         s = self.ctx.settings
         s.access = kind
         if kind != "local" and not s.api_key and not s.no_key:
-            s.api_key = acc.new_key()
+            s.api_key = acc.kept_key() or acc.new_key()
             self.say("An API key was made for you (recommended beyond this computer). Press t if you want no key.")
         elif kind != "local" and s.no_key:
             self.say(S.NO_KEY_PUBLIC if kind == "cloudflare" else S.NO_KEY_NETWORK, True)
@@ -1389,7 +1389,7 @@ class AccessScreen(Base):
         s = self.ctx.settings
         s.access = self.menu().current.key
         if s.access != "local" and not s.api_key and not s.no_key:
-            s.api_key = acc.new_key()
+            s.api_key = acc.kept_key() or acc.new_key()
 
     def action_back(self) -> None:
         if self.input_open():

@@ -41,5 +41,48 @@ class StatusLogsDiscoveryTests(unittest.TestCase):
         self.assertEqual(endpoint.call_args[0][0], "http://127.0.0.1:9999")
 
 
+class KeptKeyTests(unittest.TestCase):
+    """#8 (E05/G01): a key made for a launch survives a restart."""
+
+    def setUp(self):
+        import tempfile
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.cfg = os.path.join(self.temp.name, "launch.json")
+
+    def _write(self, key):
+        with open(self.cfg, "w", encoding="utf-8") as f:
+            json.dump({"api_key": key}, f)
+
+    def test_key_of_the_launch_config_is_kept(self):
+        from strata_cli.launch import access
+        self._write("sk-strata-AAA")
+        with mock.patch("strata_control.profiles.load", return_value=({"source_config": self.cfg}, "r")):
+            self.assertEqual(access.kept_key("gyro-s 32K"), "sk-strata-AAA")
+
+    def test_no_key_and_none_are_not_kept(self):
+        from strata_cli.launch import access
+        self._write("none")
+        with mock.patch("strata_control.profiles.load", return_value=({"source_config": self.cfg}, "r")),              mock.patch("strata_control.profiles.list_profiles", return_value=[]):
+            self.assertIsNone(access.kept_key("gyro-s 32K"))
+
+    def test_newest_launch_config_is_the_fallback(self):
+        from strata_cli.launch import access
+        self._write("sk-strata-BBB")
+        rows = [{"id": "launch-other", "source_config": self.cfg}, {"id": "other", "source_config": "x"}]
+        with mock.patch("strata_control.profiles.load", side_effect=Exception("none")),              mock.patch("strata_cli.launch.store.load", return_value=None),              mock.patch("strata_control.profiles.list_profiles", return_value=rows):
+            self.assertEqual(access.kept_key("gyro-s 64K"), "sk-strata-BBB")
+
+    def test_apply_defaults_reuses_the_key_and_new_key_is_a_different_step(self):
+        from strata_cli.launch import cmd, settings as S
+        from tests.terminal.launch_support import HW_12, Home, catalog
+        s = S.LaunchSettings(family="qwen", model="IQ3_XXS")
+        s.access = "lan"
+        with Home(), mock.patch("strata_cli.launch.access.kept_key", return_value="sk-strata-KEPT"):
+            s2, notes = cmd.apply_defaults(s, catalog(HW_12))
+        self.assertEqual(s2.api_key, "sk-strata-KEPT")
+        self.assertFalse(any("A new API key was made" in n.line() for n in notes))
+
+
 if __name__ == "__main__":
     unittest.main()
