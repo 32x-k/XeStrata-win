@@ -309,11 +309,22 @@ def require_acquisition(what: str) -> None:
     acquisition.require(what, "`strata update` from a terminal")
 
 
+def downgrade_words(sequence, accepted, state_file: Path) -> str:
+    """A feed older than the one already accepted (A01b/A05), in plain words: both numbers, the folder that remembers the newer one, and one next step.
+    The sentence keeps "older than the one already accepted" so a log search for the old text still finds it."""
+    return (f"this update source is older than the one already accepted on this computer (its sequence is {sequence}, the accepted one is "
+            f"{accepted}; refusing a replayed feed). The newer one is remembered in {state_file.parent}. Use the newest release folder; "
+            f"if you really want this older one, delete {state_file} and run this again.")
+
+
 def open_feed(ctx: Context, state: State) -> feedmod.Feed:
     require_acquisition("the update feed")
     last = (state.data.get("feed") or {}).get("sequence")
     ctx.say("feed", "Reading the signed update feed")
-    loaded = feedmod.fetch(ctx.source, ctx.trusted, last_sequence=last, channel=ctx.channel, now=ctx.now)
+    try:
+        loaded = feedmod.fetch(ctx.source, ctx.trusted, last_sequence=last, channel=ctx.channel, now=ctx.now)
+    except feedmod.FeedDowngrade as exc:
+        raise feedmod.FeedDowngrade(downgrade_words(exc.sequence, exc.accepted, state.path)) from None
     info = state.section("feed")
     info.update({"sequence": loaded.sequence, "key_id": loaded.key_id, "source": ctx.source, "channel": loaded.channel,
                  "checked_at": (ctx.now or dt.datetime.now(dt.timezone.utc)).isoformat()})
