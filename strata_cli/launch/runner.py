@@ -1147,6 +1147,7 @@ class Runner:
                          "--name", (s.name or self.name))
         if s.tune_allow_small:
             argv.append("--allow-small-differences")
+        self.stop_own_server_for_tuning()
         self.emit("tune", "Tuning for the best speed. Close other heavy programs while it measures.", 0)
         p = self._spawn(argv)
         out_lines: list[str] = []
@@ -1181,6 +1182,26 @@ class Runner:
         elif result and result.get("outcome") == "default_confirmed":
             s.tuned_at = time.strftime("%Y-%m-%d")
         self.emit("tune", f"Tuning result: {word}. {sentence}", 100, level="info" if word in ("faster", "already fastest") else "warn", word=word)
+
+    restart_after = True                                     # run(start=False) measures only: nothing starts the model again
+
+    def stop_own_server_for_tuning(self) -> None:
+        """The measuring engine needs the card, so this launch's own server (the same profile) is stopped first and `start()` brings it back with
+        the result (E07). Other engines are never touched here; the tuner says plainly when another program holds the card."""
+        from strata_control import runtime
+        from strata_control.profiles import ProfileError
+        try:
+            serving = runtime.status(self.profile).get("state") in ("ready", "starting")
+        except Exception:                                    # noqa: BLE001 - no state to read: nothing of ours is running
+            return
+        if not serving:
+            return
+        self.emit("tune", "Stopping the model to measure; it starts again afterwards." if self.restart_after
+                  else "Stopping the model to measure.", 0)
+        try:
+            runtime.stop(self.profile, timeout=120)
+        except ProfileError as e:
+            raise LaunchError(f"The running model could not be stopped to measure: {e}.", "Run `strata launch --stop` first, then measure again.", 6) from None
 
     def stored_tuning(self) -> dict | None:
         """The tuning result stored for this launch's model, choices and computer (the active preset of its slot in the shared presets store,
@@ -1432,6 +1453,7 @@ class Runner:
             return ""
 
     def run(self, *, start: bool = True) -> Result:
+        self.restart_after = start
         try:
             self.check_own_files()                           # a wrong --model-path is said before the engine is downloaded
             self.ensure_engine()

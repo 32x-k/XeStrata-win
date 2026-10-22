@@ -84,5 +84,67 @@ class KeptKeyTests(unittest.TestCase):
         self.assertFalse(any("A new API key was made" in n.line() for n in notes))
 
 
+from tests.terminal import test_updater, update_fixture as fx   # noqa: E402  (shared update fixtures)
+from strata_control import updater                                  # noqa: E402
+
+
+class OwnLaunchHoldsTheCardTests(test_updater.UpdaterCase):
+    """#10 (H04/H06): the engine update says one next step when Strata's own launch holds the card."""
+
+    def test_test_start_failure_with_own_launch_serving_gives_the_next_step(self):
+        self.install_current()
+        self.publish(("0.1.47", fx.GOOD_ENGINE))
+        flag = {"held": False}
+
+        def runner(stage_root, staged, ctx):
+            flag["held"] = True
+            raise updater.TestStartFailed(staged.version, "CUDA error: out of memory (raw engine text)")
+
+        serving = lambda: [{"profile": "launch-gyro-s-32k", "state": "ready"}] if flag["held"] else []
+        out = updater.run_update(self.ctx(test_start=runner, serving=serving), control=False)
+        result = out["results"][0]
+        self.assertEqual((out["exit_code"], result["status"]), (7, "failed"))
+        self.assertIn("strata launch --stop", result["error"])
+        self.assertIn("run `strata update` again", result["error"])
+        self.assertNotIn("raw engine text", result["error"])
+
+    def test_own_launch_serving_before_the_test_is_also_one_plain_step(self):
+        self.install_current()
+        self.publish(("0.1.47", fx.GOOD_ENGINE))
+        out = updater.run_update(self.ctx(serving=lambda: [{"profile": "launch-gyro-s-32k", "state": "ready"}]), control=False)
+        self.assertEqual(out["exit_code"], 7)
+        self.assertIn("Stop the model first (`strata launch --stop`)", out["results"][0]["error"])
+
+
+class RetuneStopsOwnServerTests(unittest.TestCase):
+    """#10 (E07): measuring while the same launch serves stops it first, and says so."""
+
+    def _runner(self, state):
+        from strata_cli.launch import settings as S
+        from strata_cli.launch.runner import Runner
+        class Bare(Runner):
+            profile = "launch-x"
+        r = Bare.__new__(Bare)
+        r.s = S.LaunchSettings(name="x")
+        r.restart_after = True
+        r.said = []
+        r.emit = lambda *a, **k: r.said.append(a[1])
+        return r
+
+    def test_serving_profile_is_stopped_and_the_line_is_plain(self):
+        r = self._runner(None)
+        with mock.patch("strata_control.runtime.status", return_value={"state": "ready"}),              mock.patch("strata_control.runtime.stop") as stop:
+            r.stop_own_server_for_tuning()
+        stop.assert_called_once()
+        self.assertEqual(r.said, ["Stopping the model to measure; it starts again afterwards."])
+
+    def test_nothing_is_stopped_when_nothing_serves(self):
+        r = self._runner(None)
+        with mock.patch("strata_control.runtime.status", return_value={"state": "stopped"}),              mock.patch("strata_control.runtime.stop") as stop:
+            r.stop_own_server_for_tuning()
+        stop.assert_not_called()
+        self.assertEqual(r.said, [])
+
+
 if __name__ == "__main__":
     unittest.main()
