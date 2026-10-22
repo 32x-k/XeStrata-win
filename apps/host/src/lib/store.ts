@@ -19,6 +19,7 @@ import { noModelNotice } from './no-model';
 import { taskHandoverMessage, taskHandoverTitle, chatHandoverMessage, chatHandoverTitle } from './task-handover';
 import type { Task } from './tasks';
 import { postWithFolderFallback } from './folder-pick';
+import { createSessionWriter } from './session-persist';
 import { setTranslationLanguage, tr, validLanguage, type Language } from './i18n';
 /**
  * Strata app store.
@@ -1008,12 +1009,33 @@ export async function scopeSkill(id: string, workspaceId: string | null) {
 
 /* ---------------------------------------------------------------- sessions */
 
-function persistSessions(sessions: Session[]) {
-  try {
-    localStorage.setItem(SESSION_KEY, JSON.stringify(sessions));
-  } catch {
-    /* quota — sessions are a cache, not the source of truth */
-  }
+const sessionWriter = createSessionWriter({
+  write: (json) => {
+    try {
+      localStorage.setItem(SESSION_KEY, json);
+    } catch {
+      /* quota — sessions are a cache, not the source of truth */
+    }
+  },
+});
+
+/**
+ * Save the chat list. A one-off change (new, rename, delete, pin) is written now; `soon` is for the streaming
+ * path, where a write per token grew the renderer to gigabytes (#3604, #3603): those are coalesced to one a second.
+ */
+function persistSessions(sessions: Session[], soon = false) {
+  sessionWriter.schedule(sessions);
+  if (!soon) sessionWriter.flush();
+}
+
+/** Write the newest chat list now: a turn ended, or the page is going away. */
+export function flushSessions() {
+  sessionWriter.flush();
+}
+
+if (typeof window !== 'undefined' && typeof document !== 'undefined' && window.addEventListener) {
+  window.addEventListener('pagehide', flushSessions);
+  document.addEventListener?.('visibilitychange', () => { if (document.visibilityState === 'hidden') flushSessions(); });
 }
 
 export function newSession(): Session {
@@ -1120,7 +1142,7 @@ export function renameSession(id: string, title: string) {
 
 function patchSession(id: string, fn: (s: Session) => Session) {
   const sessions = state.sessions.map((s) => (s.id === id ? fn(s) : s));
-  persistSessions(sessions);
+  persistSessions(sessions, true);
   set({ sessions });
 }
 
@@ -1756,6 +1778,8 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
             tps: typeof frame.tps === 'number' ? frame.tps : m.tps,
             promptTps: typeof frame.promptTps === 'number' ? frame.promptTps : m.promptTps,
           }));
+          // The final text is in `state`: write it once now instead of waiting for the coalescing timer.
+          flushSessions();
         }
       },
       turnAbort.signal,
@@ -1772,6 +1796,8 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
       patchAssistant((m) => ({ ...m, streaming: false }));
     }
   } finally {
+    // A cancelled or failed turn is still worth keeping.
+    flushSessions();
     clearStatus(sessionId);
     markTurn(sessionId, null);
     const next = releasedMessages.get(sessionId)?.shift();
