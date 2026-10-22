@@ -1366,6 +1366,56 @@ export async function retryLast(messageId?: string) {
   }
 }
 
+/** The open chat's last question and the answer that failed under it (null when the chat does not end that way). */
+function failedExchange(): { prompt: string; sessionId: string } | null {
+  const sessionId = state.activeSession;
+  const chat = state.sessions.find(s => s.id === sessionId);
+  if (!sessionId || !chat || state.streaming) return null;
+  const reply = chat.messages[chat.messages.length - 1], ask = chat.messages[chat.messages.length - 2];
+  return reply?.role === 'assistant' && reply.error && ask?.role === 'user' ? { prompt: ask.content, sessionId } : null;
+}
+/** Takes the failed question and its error out of the transcript, so asking again does not show the question twice. */
+function dropFailedExchange(sessionId: string) {
+  patchSession(sessionId, s => ({ ...s, messages: s.messages.slice(0, -2) }));
+}
+
+/**
+ * The error card of a conversation that no longer fits the model's window: summarise the older messages (the same as typing /compact), then
+ * ask the last question again in the same chat.
+ */
+export async function summarizeAndContinue() {
+  const failed = failedExchange();
+  if (!failed) return;
+  dropFailedExchange(failed.sessionId);
+  await sendMessage('/compact');
+  await sendMessage(failed.prompt);
+}
+
+/**
+ * The error card of a message that is too large to send: the host makes it small enough (its text as a file in the chat's folder that the
+ * assistant reads in parts, or a shortened preview), and that is sent in its place.
+ */
+export async function sendOversized(mode: 'file' | 'preview') {
+  const failed = failedExchange();
+  if (!failed) return;
+  let reply: { message?: string };
+  try {
+    reply = await api.post<{ message?: string }>('/api/chat/oversize', { sessionId: failed.sessionId, mode, text: failed.prompt, nativeModelId: nativeState()?.instances.length ? nativeState()?.defaultId : undefined });
+  } catch {
+    pushToast('error', 'The message could not be prepared. Try a shorter message.');
+    return;
+  }
+  if (!reply.message) return;
+  dropFailedExchange(failed.sessionId);
+  await sendMessage(reply.message);
+}
+
+/** A new, empty chat, opened. */
+export function startNewChat() {
+  const session = newSession();
+  go('chat', session.id);
+}
+
 /**
  * Forks a conversation at a message, leaving the original untouched.
  *
@@ -1733,9 +1783,15 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
             tps: typeof frame.tps === 'number' ? frame.tps : m.tps,
             promptTps: typeof frame.promptTps === 'number' ? frame.promptTps : m.promptTps,
           }));
+        } else if (type === 'context') {
+          // What the context holds after each model request of an agent turn: the meter follows the turn instead of waiting for its end.
+          const used = Number(frame.contextTokens), max = Number(frame.contextMax);
+          if (Number.isFinite(used) && used > 0) patchAssistant((m) => ({ ...m, contextUsed: used, ...(Number.isFinite(max) && max > 0 ? { contextMax: max } : {}) }));
         } else if (type === 'error') {
           clearStatus(sessionId);
-          patchAssistant((m) => ({ ...m, error: plainFailure(String(frame.message ?? 'Engine error')).message, streaming: false }));
+          // A sentence the host wrote for the person (it carries its catalog key) is shown in their language as it is; anything else is made plain here.
+          const said = typeof frame.key === 'string' ? tr(frame.key, Array.isArray(frame.values) ? frame.values : undefined) : plainFailure(String(frame.message ?? 'Engine error')).message;
+          patchAssistant((m) => ({ ...m, error: said, streaming: false, ...(typeof frame.code === 'string' ? { errorCode: frame.code } : {}), ...(typeof frame.details === 'string' && frame.details ? { errorDetail: frame.details } : {}) }));
         } else if (type === 'done') {
           clearStatus(sessionId);
           patchSession(sessionId, (sess) => ({

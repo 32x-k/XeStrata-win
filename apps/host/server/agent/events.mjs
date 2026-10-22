@@ -9,6 +9,8 @@
 
 import { toolUpdate, TokenCount, fmtTokens } from './status.mjs';
 import { askFor } from './ask.mjs';
+import { FIT_TEXT, fill } from './context-fit.mjs';
+import { isContextOverflow } from './context-budget.mjs';
 
 const SHELL = new Set(['pwsh', 'bash', 'job_kill', 'job_output', 'job_list']);
 const WRITE = new Set(['write', 'edit']);
@@ -196,8 +198,10 @@ export class TurnProjector {
    * no question ever reaches the person: the card goes straight from running to denied, without a moment where it
    * offers Approve and Deny buttons that would do nothing.
    */
-  constructor({ startedAt = Date.now(), policy = 'ask' } = {}) {
+  constructor({ startedAt = Date.now(), policy = 'ask', window = 0 } = {}) {
     this.startedAt = startedAt;
+    this.window = Number(window) || 0;   // the model's window, for the figures in the line that says the chat was summarised
+    this.summarizing = false;
     this.policy = policy;
     this.byPolicy = new Set();       // callIds the approval policy rejected without asking
     this.tools = new Map();          // callId -> { card, calledAt }
@@ -303,6 +307,7 @@ export class TurnProjector {
           this.tokensIn += prompt;
           this.tokensOut += Number(c.usage.outputTokens) || 0;
           this.contextTokens = prompt + (Number(c.usage.outputTokens) || 0);
+          out.push({ type: 'context', contextTokens: this.contextTokens, contextMax: this.window || undefined });
         }
       }
       return out;
@@ -371,6 +376,22 @@ export class TurnProjector {
         if (frame) out.push(frame);
         break;
       }
+      case 'compaction/start':
+        // The Harness is summarising the older messages to make room: say so while it does, and again (once) when it is done.
+        this.summarizing = true;
+        this.#status({ phase: 'compacting', code: 'compacting', text: FIT_TEXT.summarizing, key: FIT_TEXT.summarizing, values: [] });
+        break;
+      case 'compaction/end':
+        if (!this.summarizing) break;
+        this.summarizing = false;
+        this.#afterTool();
+        if (!d.error) {
+          const before = this.window > 0 && this.contextTokens ? Math.min(100, Math.round(100 * this.contextTokens / this.window)) : null;
+          const text = before === null ? FIT_TEXT.summarizedShort : FIT_TEXT.summarizedWas;
+          const values = before === null ? [] : [before];
+          out.push({ type: 'delta', own: true, text: '\n\n' + fill(text, values), key: text, values, noteReason: 'compacted' });
+        }
+        break;
       case 'turn/start':
         // The parent woke up again (a helper finished and reported back): the message goes on, as a new paragraph.
         this.ended = null;
@@ -420,7 +441,7 @@ export class TurnProjector {
       case 'aborted':
         return [{ type: 'done', ...base, ...usage, finishReason: 'aborted', cancelled: true }];
       case 'error':
-        return [{ type: 'error', message: friendlyFailure(reason.error), code: reason.error?.code ?? 'UNKNOWN' }];
+        return [{ type: 'error', message: friendlyFailure(reason.error), code: isContextFailure(reason.error) ? 'CONTEXT_WINDOW_EXCEEDED' : reason.error?.code ?? 'UNKNOWN', ...(isContextFailure(reason.error) ? { key: FIT_TEXT.full, details: String(reason.error?.message ?? '') } : {}) }];
       case 'blocked':
         return [{ type: 'error', message: 'The agent stopped because this turn was blocked by policy.', code: 'BLOCKED' }];
       default:
@@ -429,10 +450,15 @@ export class TurnProjector {
   }
 }
 
+/** Whether a failure is the model server saying the conversation does not fit its window (its code, or the engine's own words). */
+export function isContextFailure(failure) {
+  return isContextOverflow(failure) || /context window|too long for|exceeds the context/i.test(String(failure?.message ?? ''));
+}
+
 /** A model-route failure in words a user can act on. */
 export function friendlyFailure(failure) {
   const message = String(failure?.message ?? 'The model request failed.');
-  if (/context window|too long|exceeds/i.test(message)) return `The conversation no longer fits the model's context window. ${clip(message, 200)}`;
+  if (isContextFailure(failure)) return FIT_TEXT.full;
   if (/ECONNREFUSED|fetch failed|connect/i.test(message)) return `The model is not reachable. ${clip(message, 200)}`;
   if (/401|403|credential|api key/i.test(message)) return 'The model rejected the credentials. Check the connection in Settings.';
   return clip(message, 400);

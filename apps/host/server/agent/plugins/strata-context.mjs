@@ -81,6 +81,26 @@ export function apply(ctx, config = {}) {
     };
   }
 
+  // The host asks, with /strata-context, how much of the window the chat holds right now: the same measured number compaction decides on
+  // (JSON in the command's text: { tokens, window }). Before a message goes out, and after /compact, so the person is told true figures.
+  ctx.inject(['commands'], (commandCtx) => {
+    commandCtx.commands.register({
+      definitionId: 'strata-context',
+      name: 'strata-context',
+      description: 'Reports how many tokens the conversation holds now and the size of the model window',
+      handler: async (invocation) => {
+        try {
+          const session = invocation.agent.session;
+          const tokens = meter.measure(session).totalTokens;
+          const config = session.requestHeader?.()?.config;
+          let window = 0;
+          if (config) window = (await llm.resolveModelInfo(config.provider, config.model))?.context?.contextWindow ?? 0;
+          return { kind: 'success', text: JSON.stringify({ tokens, window }) };
+        } catch (e) { return { kind: 'error', text: `strata-context: ${e.message}` }; }
+      },
+    });
+  });
+
   /** A finished stream: its chunks, the text it wrote and why it ended. */
   async function drain(iterable) {
     let text = '', finish = null;
