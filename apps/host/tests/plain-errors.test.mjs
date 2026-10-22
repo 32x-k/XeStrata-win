@@ -73,3 +73,31 @@ test('every plain message and next step is translated in all eight languages', (
   assert.doesNotMatch(plainFailure('server_exited (exit code 0xC0000135)').message + plainFailure('server_exited (exit code 0xC0000135)').next, /memory|Leave 20/i);
   setTranslationLanguage('en');
 });
+
+test('missing model files are named, in every language, with a next step (#3478)', async () => {
+  const { missingFilesError, missingNames } = await import('../server/missing-files.mjs');
+  const names = missingNames([{ part: 'engine', file: 'strata.exe', status: 'missing' }, { part: 'native', file: 'Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf', status: 'missing' }, { part: 'vision/mmproj', file: 'mmproj-F16.gguf', status: 'missing' }],
+    [['C:', 'models', 'Qwen3.6-35B-A3B-UD-Q4_K_XL-00002-of-00003.gguf'].join(String.fromCharCode(92)), '/data/models/mmproj-F16.gguf']);
+  assert.deepEqual(names, ['Qwen3.6-35B-A3B-UD-Q4_K_XL-00002-of-00003.gguf', 'mmproj-F16.gguf', 'the engine program', 'Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf']);
+  const error = missingFilesError('qwen36-q4', names);
+  assert.match(error.message, /missing: Qwen3\.6-35B-A3B-UD-Q4_K_XL-00002-of-00003\.gguf, mmproj-F16\.gguf, the engine program, Qwen3\.6-35B-A3B-UD-Q4_K_XL\.gguf\. Use Download/);
+  assert.match(error.details[0], /Missing for qwen36-q4: /);
+  const more = missingFilesError('m', ['a.gguf', 'b.gguf', 'c.gguf', 'd.gguf', 'e.gguf', 'f.gguf']);
+  assert.match(more.message, /a\.gguf, b\.gguf, c\.gguf, d\.gguf and 2 more\./);
+  const f = plainFailure(error.message);
+  assert.equal(f.kind, 'model-files-missing');
+  assert.equal(f.message, 'These model files are missing: Qwen3.6-35B-A3B-UD-Q4_K_XL-00002-of-00003.gguf, mmproj-F16.gguf, the engine program, Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf.');
+  assert.ok(f.next && f.detail === error.message);
+  for (const language of languages) {
+    setTranslationLanguage(language);
+    const shown = plainFailureText(error.message);
+    if (language !== 'en') {
+      assert.notEqual(shown.message, f.message, `${language}: the sentence is translated`);
+      assert.notEqual(shown.next, f.next, `${language}: the next step is translated`);
+    }
+    assert.ok(shown.message.includes('mmproj-F16.gguf'), `${language}: the file names survive`);
+    assert.doesNotMatch(shown.message, /\{0\}/);
+  }
+  setTranslationLanguage('en');
+  assert.equal(plainFailure(missingFilesError('m', []).message).kind, 'plain', 'with no names the old sentence is left as it was');
+});

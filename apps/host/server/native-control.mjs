@@ -1,4 +1,5 @@
 /** Native Strata control plane. All user actions are explicit; opening the UI only reads state. */
+import {missingFilesError,missingNames} from './missing-files.mjs';
 import { spawn } from 'node:child_process';
 import {chooseParallel,applyParallel,withoutParallel,FALLBACK_NOTE} from './native-parallel.mjs';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
@@ -106,8 +107,8 @@ export function createNativeControl({directory,requests=()=>[],changed=()=>{},sp
    packagedInstall=list.install_dir;
    const engine=await control.engine();
    const installer=await mcpCall('strata_status',{hardware:true}).catch(error=>({error:error.message}));
-   const disk=Object.fromEntries((installer.installed?.models??[]).map(m=>[m.model,{diskGb:m.disk_gb,diskBytes:m.disk_bytes,sharedBytes:m.shared_bytes,removableGb:m.removable_gb,partsMissing:m.parts_missing??0}]));
-   const models=(list.models??[]).filter(m=>m.component_status!=='invalid'&&m.source_config).map(m=>({...(disk[m.id]??{}),model:m.id,config:basename(m.source_config),configPath:m.source_config,model_name:m.name,context:m.context_tokens??0,backend:m.backend,ready:m.component_status==='present'&&!(disk[m.id]?.partsMissing),images:'off',port:undefined,last_used:null}));
+   const disk=Object.fromEntries((installer.installed?.models??[]).map(m=>[m.model,{diskGb:m.disk_gb,diskBytes:m.disk_bytes,sharedBytes:m.shared_bytes,removableGb:m.removable_gb,partsMissing:m.parts_missing??0,missingFiles:m.missing_files}]));
+   const models=(list.models??[]).filter(m=>m.component_status!=='invalid'&&m.source_config).map(m=>({...(disk[m.id]??{}),model:m.id,config:basename(m.source_config),configPath:m.source_config,model_name:m.name,context:m.context_tokens??0,backend:m.backend,ready:m.component_status==='present'&&!(disk[m.id]?.partsMissing),missing:missingNames(m.missing,disk[m.id]?.missingFiles),images:'off',port:undefined,last_used:null}));
    const cores=os.cpus().length;
    return {summary:engine.usable?`Strata Control is ready; engine ${engine.engine.version} (${engine.engine.platform}-${engine.engine.backend}).`:(engine.notice??'No engine for this PC was found.'),
     installDir:list.install_dir,engine:{usable:engine.usable,notice:engine.notice,wrongMake:engine.wrongMake===true,version:engine.engine?.version??null,backend:engine.backend,componentsDir:engine.components_dir,previous:engine.previous??null,pinned:engine.pinned??null,updateNotice:engine.update_notice??null},
@@ -230,7 +231,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   return {cfg,resources,visionPreferences,parallelChoice,parallelNote};
  }
  async function loadEngine(job,args){
-  await refresh(true);if(job.state!=='running')return;const {config,entry,path:configFile}=record(args.model);assertSettingsFile(configFile);if(packaged){const engine=await control.engine();if(!engine.usable)throw new Error(ENGINE_NOT_RECOGNISED+(engine.notice?` ${engine.notice}`:''));}if(!entry.ready)throw new Error('Some model files are missing. Use Download / repair to restore them.');
+  await refresh(true);if(job.state!=='running')return;const {config,entry,path:configFile}=record(args.model);assertSettingsFile(configFile);if(packaged){const engine=await control.engine();if(!engine.usable)throw new Error(ENGINE_NOT_RECOGNISED+(engine.notice?` ${engine.notice}`:''));}if(!entry.ready){const error=missingFilesError(args.model,entry.missing);append(args.model,error.details[0]);throw error;}
   if(externalRunning().length)throw new Error('A Strata server is already running outside this UI. Stop it before loading here, or connect its API in Settings → Models.');
   if(args.multiple&&instances.size>=8)throw new Error('Unload an instance before adding another. Up to eight native instances can run here.');
   const {cfg,resources,visionPreferences,parallelChoice,parallelNote:chosenNote}=buildConfig(args,config);

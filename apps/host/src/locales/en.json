@@ -3489,5 +3489,7 @@
   "s8643": "Only your processor and memory are used.",
   "s8644": "For experts: the engine starts on cards {0} (Main last).",
   "s8645": "Not saved while you keep the recommendation: Strata picks again if you add or remove a card.",
-  "s8646": "Not used: {0} (another make of graphics card than this engine drives)."
+  "s8646": "Not used: {0} (another make of graphics card than this engine drives).",
+  "s8647": "These model files are missing: {0}.",
+  "s8648": "Press Download & load again to fetch them. Files that are already there are kept. If the same files are listed again, open Details and share them when you ask for help."
 }

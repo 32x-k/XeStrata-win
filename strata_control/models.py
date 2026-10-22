@@ -143,6 +143,18 @@ def _arg(args: list[str], flag: str) -> str | None:
         return None
 
 
+def _missing_parts(report: dict) -> list[dict]:
+    """The required parts a model's run config names that are not there: {"part": the component, "file": its file or folder name,
+    "status": "missing" | "invalid"}. The app names them so a person is not told only that "some files are missing" (#3478)."""
+    found = []
+    for item in report.get("components", []):
+        if item.get("required") and item.get("status") in ("missing", "invalid"):
+            where = item.get("path")
+            found.append({"part": _short(item.get("name")), "file": _short(os.path.basename(str(where).rstrip("/\\"))) if where else None,
+                          "status": item["status"]})
+    return found[:12]
+
+
 def _summary(model_id: str, path: Path, raw: bytes, cfg: dict, report: dict) -> dict:
     context = _arg(cfg["args"], "--max-context")
     context_tokens = int(context) if isinstance(context, str) and 1 <= len(context) <= 8 and \
@@ -154,6 +166,7 @@ def _summary(model_id: str, path: Path, raw: bytes, cfg: dict, report: dict) -> 
             "context_tokens": context_tokens,
             "component_status": "present" if report["ok"] else "missing_or_invalid",
             "issue_codes": [item.get("code") for item in report["issues"]][:32],
+            "missing": _missing_parts(report),
             "execution_compatibility": "unverified"}
 
 

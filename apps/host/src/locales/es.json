@@ -3489,5 +3489,7 @@
   "s8643": "Solo se usan tu procesador y tu memoria.",
   "s8644": "Para expertos: el motor arranca en las tarjetas {0} (la principal al final).",
   "s8645": "No se guarda mientras mantengas la recomendación: Strata elige de nuevo si añades o quitas una tarjeta.",
-  "s8646": "No se usa: {0} (otra marca de tarjeta gráfica distinta de la que maneja este motor)."
+  "s8646": "No se usa: {0} (otra marca de tarjeta gráfica distinta de la que maneja este motor).",
+  "s8647": "Faltan estos archivos del modelo: {0}.",
+  "s8648": "Pulse de nuevo «Descargar y cargar» para obtenerlos. Los archivos que ya están se conservan. Si vuelven a aparecer los mismos archivos, abra los detalles y compártalos cuando pida ayuda."
 }

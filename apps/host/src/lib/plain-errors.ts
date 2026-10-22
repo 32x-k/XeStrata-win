@@ -8,13 +8,15 @@ import { tr } from './i18n';
 
 export interface PlainFailure { message: string; next?: string; detail?: string; kind: string }
 
-interface Rule { kind: string; match: RegExp; message: string; next?: string; detail?: (m: RegExpMatchArray, raw: string) => string | undefined }
+interface Rule { kind: string; match: RegExp; message: string | ((m: RegExpMatchArray) => string); next?: string; detail?: (m: RegExpMatchArray, raw: string) => string | undefined }
 
 const MEMORY = 'The model stopped while starting, most likely because the PC ran low on memory.';
 const MEMORY_NEXT = 'Close other programs and try again, or choose “Leave 20% for my work”. In Expert mode you can also turn on the low-RAM option, so part of the model is read from the SSD.';
 
 /** Order matters: the first rule that matches wins. */
 const RULES: Rule[] = [
+  // The host names the files it could not find (#3478). The sentence with the names is a template in every language: tr() fills it.
+  { kind: 'model-files-missing', match: /Some model files are missing: (.+?)\. Use Download/i, message: m => `These model files are missing: ${m[1]}.`, next: 'Press Download & load again to fetch them. Files that are already there are kept. If the same files are listed again, open Details and share them when you ask for help.' },
   { kind: 'tunnel-own-running', match: /Strata’s tunnel for this address is already running \(PID/i, message: 'Strata’s tunnel for this address is already running.', next: 'Stop it first, or use it as it is, then connect again here.' },
   { kind: 'gpu-shared', match: /GPU \d+ is already used by .*, so this model did not fit there/i, message: 'Another model on the same graphics card left no room for this one.', next: 'Load it on a different GPU, or unload the other model first.' },
   { kind: 'gpu-no-code', match: /none of this computer.s graphics cards has code in this Strata engine|not an architecture this Strata engine was compiled for/i, message: 'This Strata engine has no code for the graphics card it tried to use.', next: 'Pick another card under Run on, or open Details to see which cards were found and what the engine is built for.' },
@@ -50,7 +52,7 @@ export function plainFailure(raw: string | null | undefined): PlainFailure {
   for (const rule of RULES) {
     const m = text.match(rule.match);
     if (!m) continue;
-    return { kind: rule.kind, message: rule.message, next: rule.next, detail: rule.detail ? rule.detail(m, text) : text };
+    return { kind: rule.kind, message: typeof rule.message === 'function' ? rule.message(m) : rule.message, next: rule.next, detail: rule.detail ? rule.detail(m, text) : text };
   }
   return { kind: 'plain', message: text.replace(/^./, c => c.toUpperCase()) };
 }
