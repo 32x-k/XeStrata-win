@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import './system-ca.mjs';        // #3722: the operating system's certificates, before any HTTPS request
 import { createCloudflare } from './cloudflare.mjs';
 import { createConnectorInstaller } from './cloudflared-install.mjs';
 import { findRunningConnector } from './cloudflared-find.mjs';
