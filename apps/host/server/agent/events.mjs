@@ -157,6 +157,9 @@ export function withPlain(raw) {
   return plain ? `${plain}\n\nDetails: ${raw.replace(/^Error:\s*/, '')}` : raw;
 }
 
+/** What a launch that printed nothing proves, and no more. */
+export const LAUNCHED_TEXT = 'The command finished without an error, so the program was started. Strata cannot confirm that a window or page actually opened.';
+
 /** A command whose whole point is to open something: it has no output to show when it worked. */
 const LAUNCH = /(^|[\s;|&(])(start-process|start|invoke-item|ii|explorer(?:\.exe)?|xdg-open|open|notepad(?:\.exe)?|code)(?=[\s;|&)]|$)/i;
 
@@ -172,9 +175,10 @@ export function outcomeText(tool, text, args = {}) {
     text = text.replace(/\r?\n?\[stderr\]\r?\n(?:Cannot create type\. Only core types are supported in this language mode\.[\s\S]*?CannotCreateTypeConstrainedLanguage\s*)+$/, '');
     if (!text.trim()) text = '(no output)';
   }
-  // Starting a program or opening a folder prints nothing when it worked. The model used to read "finished, nothing to show" as "cannot tell
-  // whether it opened" and told the person so; a launch that returned without an error did start, and the result says that plainly.
-  if ((tool === 'pwsh' || tool === 'bash') && /^\(no output\)$/.test(text.trim()) && LAUNCH.test(String(args?.command ?? ''))) return 'Started. The program, folder or file was opened.';
+  // Starting a program or opening a folder prints nothing when it worked, and also when it did not (a browser given a file:// address, a
+  // program that closed at once). T9 / #3576: the card used to say "was opened", and the model repeated it ("I previewed it in a browser to
+  // confirm it renders"). It says what is known: the command returned without an error.
+  if ((tool === 'pwsh' || tool === 'bash') && /^\(no output\)$/.test(text.trim()) && LAUNCH.test(String(args?.command ?? ''))) return LAUNCHED_TEXT;
   if ((tool === 'pwsh' || tool === 'bash') && /^\(no output\)$/.test(text.trim())) return 'The command finished without any error. It printed nothing, so there is nothing more to show.';
   return text;
 }

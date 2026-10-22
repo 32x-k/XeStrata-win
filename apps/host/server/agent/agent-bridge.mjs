@@ -111,11 +111,12 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
  * @param {string|null} [options.componentsDir]         where installed components live
  * @param {() => Array} options.localInstances          ready local instances (see profile.mjs)
  * @param {() => Array} options.connections             saved API connections WITH their keys (host-internal)
+ * @param {() => (string|null)} [options.defaultLocalId]  the local instance the chat runs on: its tool servers are the agent's (T5)
  * @param {NodeJS.ProcessEnv} [options.env]
  * @param {string} [options.nodePath]                   the Node runtime that runs the Harness
  * @param {(line:string)=>void} [options.log]
  */
-export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = null, gate = true, localInstances, connections, tools = () => undefined, skillsDir = () => null, onGoal = () => {}, onPlan = () => {}, onQueue = () => {}, proxyBase = null, searchMock = null, expertSampling = () => null, stallMs = 4 * 60_000, stallToolMs = 20 * 60_000, env = process.env, nodePath = process.execPath, log = () => {}, startTimeoutMs = 120_000, sessionReadyMs = 60_000, sessionRetryMs = 1_500 }) {
+export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = null, gate = true, localInstances, connections, tools = () => undefined, defaultLocalId = () => null, skillsDir = () => null, onGoal = () => {}, onPlan = () => {}, onQueue = () => {}, proxyBase = null, searchMock = null, expertSampling = () => null, stallMs = 4 * 60_000, stallToolMs = 20 * 60_000, env = process.env, nodePath = process.execPath, log = () => {}, startTimeoutMs = 120_000, sessionReadyMs = 60_000, sessionRetryMs = 1_500 }) {
   const root = join(dataDir, 'agent');
   const home = join(root, 'home');
   const sessionsFile = join(root, 'sessions.json');
@@ -171,7 +172,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
   /** The agent's profile now, plus where its shaped routes really lead (read by the forwarding endpoint). */
   let shapeTargets = {};
   function buildProfileNow() {
-    const profile = buildProfile({ local: localInstances(), connections: connections(), gate, tools: tools(), skillsDir: skillsDir(), proxyBase, searchMock });
+    const profile = buildProfile({ local: localInstances(), connections: connections(), gate, tools: tools(), skillsDir: skillsDir(), proxyBase, searchMock, defaultLocalId: defaultLocalId() });
     shapeTargets = profile.shapeTargets ?? {};
     return profile;
   }
@@ -193,6 +194,8 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       harness: { version: h.version },
       runtime: rt?.hp.running ? { pid: rt.hp.pid, generation: rt.generation } : null,
       routes: profile.routes.map(({ route, kind, modelId, name, contextWindow }) => ({ route, kind, modelId, name, contextWindow })),
+      // tool servers that could not be wired (a name the rule does not allow, no program or address): the chat says so
+      skippedServers: profile.mcpSkipped ?? [],
       activeTurns: activeTurns(),
       pendingApprovals: pending.size,
     };

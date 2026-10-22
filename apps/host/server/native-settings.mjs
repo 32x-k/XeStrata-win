@@ -1,3 +1,4 @@
+import { validMcpName, MCP_NAME_HELP } from './mcp-names.mjs';
 /** Editable native keys. Unknown config keys and program paths stay intact. */
 export const NATIVE_FIELDS=[
  {id:'reasoning_budget_tokens',label:'Thinking token budget',group:'Responses',type:'number',min:0,max:1048576,hint:'Leave blank for the model default.'},
@@ -56,7 +57,9 @@ export function publicMcpServers(servers){return Object.fromEntries(Object.entri
 export function validateMcpServers(servers,previous={}){
  if(!servers||typeof servers!=='object'||Array.isArray(servers)||Object.keys(servers).length>30)throw new Error('MCP servers must be an object with at most 30 entries.');
  const out={};for(const [name,s] of Object.entries(servers)){
-  if(!/^[a-z0-9_-]{1,64}$/i.test(name)||!s||typeof s!=='object'||Array.isArray(s))throw new Error('Give each tool server a simple, unique name.');
+  if(!s||typeof s!=='object'||Array.isArray(s))throw new Error('Give each tool server a simple, unique name.');
+  // a name that was saved before the 32-character rule stays saveable (unrelated settings must not be blocked); the agent reports it as left out
+  if(!validMcpName(name)&&!Object.hasOwn(previous??{},name))throw new Error(MCP_NAME_HELP);
   if(!!s.command===!!s.url)throw new Error(`${name}: choose a command or HTTP URL.`);
   for(const key of Object.keys(s))if(!['command','args','env','cwd','url','headers','disabled'].includes(key))throw new Error(`${name}: unsupported property ${key}.`);
   if(s.command&&(typeof s.command!=='string'||s.command.length>1000||/[\n\r\0]/.test(s.command)))throw new Error(`${name}: choose a valid program.`);

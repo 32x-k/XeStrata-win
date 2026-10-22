@@ -15,6 +15,7 @@ import { materializeSkills, parseSkillFile, skillSlug, writeCreatedSkill } from 
 import { systemFonts } from './fonts.mjs';
 import { tuningDir } from './platform-paths.mjs';
 import { createAgentBridge, plainTurnFailure } from './agent/agent-bridge.mjs';
+import { mcpSkippedNotices } from './agent/profile.mjs';
 import { createAgentTools } from './agent/tools-settings.mjs';
 import { withPlainStatus } from './agent/status.mjs';
 import { findBrowser, findPlaywrightMcp } from './agent/browser-probe.mjs';
@@ -180,6 +181,7 @@ const agent = createAgentBridge({
   componentsDir: componentsDirectory(),
   // The installer ships the Harness next to the host (<install>/host/server -> <install>/harness).
   bundledDir: resolve(HERE, '..', '..', 'harness'),
+  defaultLocalId: () => native.defaultInstanceId(),
   localInstances: () => native.readyInstances().map(i => ({
     id: i.id, label: i.label, baseUrl: `http://127.0.0.1:${i.port}/v1`, modelId: i.apiModelId,
     context: i.metrics?.engine?.max_context ?? i.context ?? undefined, key: i.key, vision: i.vision,
@@ -1934,6 +1936,8 @@ async function api(req, res, path, method, url) {
     if (chatId && !agentSkip) {
       const capability = agent.status();
       if (capability.state !== 'unavailable') {
+        const skipped = mcpSkippedNotices(capability.skippedServers);
+        for (const notice of skipped) res.write(`${JSON.stringify({ type: 'notice', ...notice })}\n`);
         await runAgentTurn({ res, controller, chatId, body, message, workspaceId, images });
         res.end();
         return undefined;
