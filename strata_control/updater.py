@@ -76,6 +76,35 @@ class TestStartFailed(UpdateError):
     BUSY = re.compile(r"timed?[ -]?out|out of memory|\boom\b|not enough (gpu |video |free )?memory|vram|memory allocation|"
                       r"cudaerrormemory|device (is )?(busy|in use)|resource busy|no free (gpu|memory)", re.I)
 
+    @staticmethod
+    def plain(label: str, reason: str, busy: bool, hint: str | None) -> str:
+        """The one text of a failed test start (X01): what did not work in plain words, that nothing was changed, and one next step. The engine's
+        own words stay in ``reason`` (the state file, the JSON output and the kept log), never in this sentence."""
+        what = "Control" if label.startswith("Control") else "engine"
+        head = (f"The new {label} did not start correctly on this computer, so it was not installed. Your current {what} is unchanged."
+                if what == "Control" else
+                f"The new engine {label} did not start correctly on this computer, so it was not installed. Your current engine is unchanged.")
+        low = reason.lower()
+        if what == "Control":
+            cause = f"It answered `--version` with: {reason.split('--version said', 1)[1].strip()}" if "--version said" in low else \
+                "It did not answer `--version` in time or at all."
+        elif "one-token probe" in low:
+            cause = "The engine started but stopped before it answered a test question."
+        elif "--version exited" in low or "could not run" in low:
+            cause = "The engine program did not run on this computer."
+        elif "no installed model" in low:
+            cause = "There is no installed model to test the engine with."
+        elif low.startswith("it "):                      # Strata's own plain sentences ("it was still loading the model after 10 minutes")
+            cause = reason[:1].upper() + reason[1:].rstrip(".") + "."
+        elif busy:
+            cause = "The graphics card or memory was in use."
+        else:
+            cause = "The engine reported a problem while it started."
+        if hint is None:
+            hint = ("Run `strata update --force` to try again; if it fails again, report it with the log." if not busy and what == "engine"
+                    else "Run `strata update` again.")
+        return f"{head} {cause} {hint}"
+
     def __init__(self, label: str, reason: str, *, busy: bool | None = None, hint: str | None = None):
         # busy: True/False says outright whether the card or memory was busy (the wait-expired reasons carry the engine's log tail, which
         # mentions VRAM on every healthy start and must not be read as a busy card, #3683); None reads it from the words of the reason
@@ -83,8 +112,7 @@ class TestStartFailed(UpdateError):
         if hint is None and self.busy:
             hint = ("The graphics card or memory looks busy: close programs that use the card (games, video, other models) "
                     "and run `strata update` again.")
-        super().__init__(f"The new engine {label} did not pass its test start ({reason}). It was not installed; "
-                         "your current engine is unchanged." + (" " + hint if hint else ""), 6)
+        super().__init__(self.plain(label, reason, self.busy, hint), 6)
         self.label = label
         self.reason = reason
 
@@ -1007,6 +1035,10 @@ def rollback_engine(ctx: Context) -> dict:
         except (ec.ComponentProblem, OSError) as exc:
             raise UpdateError(f"the previous engine ({previous}) can no longer be used: {exc}", 5) from None
         current, _ = installed_engine(ctx.components, ctx.hardware)
+        if current is not None and current.root.name == previous:
+            # an earlier rollback is still in force (S3: the text said "0.1.45.3 -> 0.1.45.3"): there is nothing to leave behind
+            raise UpdateError(f"the engine is already the previous one ({current.version}); there is nothing older to return to. "
+                              "Run `strata update --force` to try the newer version again.", 2)
         leaving = current.root.name if current else None
         before_identity = preset_marks.identity_of(current, _manifest_sha(current.root)) if current else None
         section["pinned"] = previous

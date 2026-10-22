@@ -218,8 +218,10 @@ class EngineUpdate(UpdaterCase):
         out = updater.run_update(self.ctx(), control=False)
         result = out["results"][0]
         self.assertEqual((out["exit_code"], result["status"]), (6, "failed"), out)
-        self.assertIn("did not pass its test start", result["error"])
+        self.assertIn("did not start correctly on this computer", result["error"])
         self.assertIn("unchanged", result["error"])
+        self.assertNotIn("server_exited", result["error"], "the engine's own words stay out of the sentence")
+        self.assertIn("strata update --force", result["error"])
         self.assertEqual(self.resolved(), "0.1.45")
         self.assertEqual(self.engine_folders(), [f"0.1.45-{PLATFORM}-cuda-cuda13"], "the failed engine was never put in the live folder")
         self.assertEqual(sorted(p.name for p in (self.components / ".s").iterdir()), [])
@@ -478,7 +480,7 @@ class LazyModel(UpdaterCase):
         self.assertEqual(verify.call_args.kwargs["load"], True)
 
     def test_an_engine_that_cannot_answer_does_not_pass(self):
-        with self.assertRaisesRegex(updater.TestStartFailed, "one-token probe"):
+        with self.assertRaisesRegex(updater.TestStartFailed, "before it answered a test question"):
             self.run_default({"ok": True, "state": "ready", "generation_ready": False}, {"ok": False, "state": "failed", "error": "probe_generation_no_tokens"})
     def expired(self, phase, words, busy):
         # #3683: the engine log always mentions VRAM, so a wait that expired used to be blamed on a busy graphics card

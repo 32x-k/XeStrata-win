@@ -115,9 +115,8 @@ class MaxTokens(unittest.TestCase):
                          ("98179", "0", "17565", "699.6", "0"))
 
     def test_unset_budget_is_the_rest_of_the_context(self):
-        cases = {"openai": [{"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None},
-                            {"max_completion_tokens": -1}, {"max_completion_tokens": None, "max_tokens": None}],
-                 "anthropic": [{"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None}]}
+        cases = {"openai": [{}, {"max_tokens": None}, {"max_completion_tokens": None, "max_tokens": None}],
+                 "anthropic": [{}, {"max_tokens": None}]}
         for api, budgets in cases.items():
             for budget in budgets:
                 with self.subTest(api=api, budget=budget):
@@ -125,6 +124,16 @@ class MaxTokens(unittest.TestCase):
                     self.assertEqual(s, 200, b)
                     self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - pt)
                     self.assertGreater(ct, 1024)          # the whole answer, not cut at the old 1024 fallback
+
+    def test_a_budget_below_one_is_a_400_that_names_the_field(self):
+        """K05 (0.2.3): -1 and 0 used to mean "no cap"; a client bug could then hold the only slot for the whole context."""
+        for api, field in (("openai", "max_tokens"), ("openai", "max_completion_tokens"), ("anthropic", "max_tokens")):
+            for value in (-1, 0):
+                with self.subTest(api=api, field=field, value=value):
+                    s, b, _, _ = self.call(api, **{field: value})
+                    self.assertEqual(s, 400, b)
+                    self.assertIn(f"{field} must be at least 1", b["error"]["message"])
+                    self.assertIn("Leave it out", b["error"]["message"])
 
     def test_explicit_budget_is_honoured(self):
         for api, budget in [("openai", {"max_tokens": 50}), ("openai", {"max_completion_tokens": 50}),
@@ -225,7 +234,7 @@ class MaxTokens(unittest.TestCase):
             over = pa - pt0                          # the Anthropic template may differ slightly
             with self.subTest(api=api, room=5):     # a few tokens left: the budget is exactly those
                 text = "y" * (CTX - CTX_SLACK - overhead - over - 5)
-                s, b, pt, ct = self.call(api, text=text, max_tokens=-1)
+                s, b, pt, ct = self.call(api, text=text, max_tokens=None)
                 self.assertEqual(s, 200, b)
                 self.assertEqual(self.engine.last_max_new, 5)
                 self.assertEqual(ct, 5)
@@ -244,7 +253,7 @@ class MaxTokens(unittest.TestCase):
                 with self.subTest(api=api):
                     out = io.StringIO()
                     with contextlib.redirect_stdout(out):
-                        _, _, pt, _ = self.call(api, max_tokens=-1)
+                        _, _, pt, _ = self.call(api, max_tokens=None)
                     self.assertIn(f"max_new={CTX - CTX_SLACK - pt} ", out.getvalue())
         finally:
             del os.environ["STRATA_DEBUG"]
