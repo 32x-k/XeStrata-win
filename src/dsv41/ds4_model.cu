@@ -1527,7 +1527,7 @@ struct Model::Impl {
     // expert's matrix r at the same stride from expert 0's in one file (the GGUF's [n_exp][out][in] tensor)
     // (the other block types: lay.fmt stays kFmtMXFP4 - read in place as these - and lay.K[r] is role r's ggml type)
     static int gg_type_of(const std::string& dtype) {
-        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 13, 14, 16, 18, 21, 22, 23, 145, 146, 224, 225, 226, 227})
+        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 13, 14, 16, 17, 18, 21, 22, 23, 145, 146, 224, 225, 226, 227})
             if (dtype == gg::type_name(t)) return t;
         return -1;
     }
@@ -2264,12 +2264,29 @@ struct Model::Impl {
             const Tensor* t = pk.get("embed.weight");
             const size_t nv = (size_t) g.vocab * g.dim;
             const bool q8 = t != nullptr && t->dtype == "Q8_0" && t->bytes == nv / 32 * gg::kQ8Bytes;
-            if (t == nullptr || (!q8 && (t->dtype != "BF16" || t->bytes != nv * 2))) {
-                err = "embed.weight: not a BF16 (or Q8_0) [vocab][dim] table";
+            // other block types (a GGUF whose dense tensors are Q4_K / Q5_K / Q6_K: the IST-DAS sets' Q5_K embed.weight):
+            // each row through ggml's to_float, to the same BF16 the host table holds
+            const int ety = t != nullptr ? gg_type_of(t->dtype) : -1;
+            const size_t erb = ety > 0 ? gg::type_row_bytes(ety, g.dim) : 0;
+            const bool qrow = t != nullptr && !(t->dtype == "BF16") && erb > 0 && t->bytes == (size_t) g.vocab * erb;
+            if (t == nullptr || (!q8 && !qrow && (t->dtype != "BF16" || t->bytes != nv * 2))) {
+                err = "embed.weight: not a BF16 (or Q8_0 / a ggml block type) [vocab][dim] table";
                 return false;
             }
             if (!halloc(embed_pinned, nv, err)) return false;
-            if (q8) {   // (a GGUF's: each value rounded to BF16, a row at a time)
+            if (qrow) {   // (ggml's decode of each row, rounded to BF16 as the Q8_0 path rounds)
+                std::vector<uint8_t> row(erb);
+                for (size_t r = 0; r < (size_t) g.vocab; ++r) {
+                    if (!pk.read_at(t->file, t->off + r * erb, erb, row.data())) {
+                        err = "embed.weight: read failed";
+                        return false;
+                    }
+                    if (!gg::gg_row_to_bf16(ety, row.data(), g.dim, embed_pinned + r * g.dim)) {
+                        err = "embed.weight: ggml has no decode for " + t->dtype;
+                        return false;
+                    }
+                }
+            } else if (q8) {   // (a GGUF's: each value rounded to BF16, a row at a time)
                 std::vector<uint8_t> row((size_t) g.dim / 32 * gg::kQ8Bytes);
                 for (size_t r = 0; r < (size_t) g.vocab; ++r) {
                     if (!pk.read_at(t->file, t->off + r * row.size(), row.size(), row.data())) {

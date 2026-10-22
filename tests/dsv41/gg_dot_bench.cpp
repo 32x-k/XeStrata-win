@@ -101,10 +101,12 @@ int main(int argc, char** argv) {
     const double t_gg = pass(0, p0.data());
     const double t_own = pass(1, p1.data());
     long bad = 0, differ = 0;
-    double worst = 0;
+    double worst = 0, worst_ref = 0, absmax = 0, absdiff = 0;
     for (int t = 0; t < nt; ++t)
         for (long r = 0; r < rows; ++r) {
             const float x = o0[(size_t) t][(size_t) r], y = o1[(size_t) t][(size_t) r];
+            absmax = std::max(absmax, (double) std::fabs(x));
+            absdiff = std::max(absdiff, (double) std::fabs((double) x - y));
             if (std::memcmp(&x, &y, 4) != 0) {
                 ++differ;
                 const double rel = std::fabs((double) x - y) / (std::fabs((double) x) + 1e-3);
@@ -112,6 +114,40 @@ int main(int argc, char** argv) {
                 if (rel > 1e-5) ++bad;
             }
         }
+    // The pass criterion above divides by one value's magnitude, so a token whose dot cancels to near zero fails it while
+    // agreeing to a few ulps.  The real bound is the L1 norm of the products (|x - ref| <= eps * sum|w x|): decode a
+    // sample of rows with ggml's own to_float and the activation as its Q8_K blocks hold it, and compare in double.
+    int sampled = 0;
+    {
+        const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) type);
+        std::vector<float> wrow((size_t) n);
+        // the activations (Q8_K: float d, int8 qs[256], int16 bsums[16]) as the rows see them
+        std::vector<std::vector<float>> xv((size_t) nt, std::vector<float>((size_t) n));
+        for (int t = 0; t < nt; ++t)
+            for (int b = 0; b < n / 256; ++b) {
+                const uint8_t* p = (const uint8_t*) ap[(size_t) t] + (size_t) b * (f.act_bytes / (size_t) (n / 256));
+                float d;
+                std::memcpy(&d, p, 4);
+                const int8_t* q = (const int8_t*) (p + 4);
+                for (int j = 0; j < 256; ++j) xv[(size_t) t][(size_t) b * 256 + j] = d * (float) q[j];
+            }
+        const long step = std::max(1L, rows / 64);
+        for (long r = 0; r < rows && sampled < 64; r += step, ++sampled) {
+            if (tt == nullptr || tt->to_float == nullptr) break;
+            tt->to_float(w.data() + (size_t) r * rb, wrow.data(), n);
+            for (int t = 0; t < nt; ++t) {
+                double ref = 0, l1 = 0;
+                for (int j = 0; j < n; ++j) {
+                    const double pr = (double) wrow[(size_t) j] * (double) xv[(size_t) t][(size_t) j];
+                    ref += pr;
+                    l1 += std::fabs(pr);
+                }
+                const double g = o0[(size_t) t][(size_t) r], o = o1[(size_t) t][(size_t) r];
+                worst_ref = std::max(worst_ref, std::fabs(g - ref) / (l1 + 1e-30));
+                worst_ref = std::max(worst_ref, std::fabs(o - ref) / (l1 + 1e-30));
+            }
+        }
+    }
     // memory ceiling: a plain read of the same bytes on the same threads
     double t_rd = 1e30;
     for (int r = 0; r < reps + 1; ++r) {
@@ -132,8 +168,10 @@ int main(int argc, char** argv) {
     std::printf("type %d nt %d threads %d: %.2f GB of weights (%ld rows)\n", type, nt, threads, gb, rows);
     std::printf("  ggml-cpu rows %.3f s = %.1f GB/s | Strata AVX2 rows %.3f s = %.1f GB/s (x%.2f) | plain read %.1f GB/s\n", t_gg, gb / t_gg,
                 t_own, gb / t_own, t_gg / t_own, gb / t_rd);
-    std::printf("  results: %ld of %ld differ in bits, worst relative %.2e, %ld beyond 1e-5\n", differ, (long) nt * rows, worst, bad);
-    if (bad != 0 || (exact && differ != 0)) {
+    std::printf("  results: %ld of %ld differ in bits, worst |x-y|/|x| %.2e, %ld beyond 1e-5\n", differ, (long) nt * rows, worst, bad);
+    std::printf("  vs a double reference on %d sampled rows: worst %.2e of the L1 norm (tol 1e-5); |x-y| max %.2e of |x| max %.2e\n",
+                sampled, worst_ref, absdiff, absmax);
+    if (worst_ref > 1e-5 || absdiff > 1e-6 * absmax + 1e-30 || (exact && differ != 0)) {
         std::printf("FAIL\n");
         return 1;
     }

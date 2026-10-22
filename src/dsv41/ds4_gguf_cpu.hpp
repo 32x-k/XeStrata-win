@@ -48,6 +48,9 @@ void tq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int
 
 /// ggml block types on the CPU lane through ggml-cpu's row dots (ds4_gg_cpu.cpp), for the IQ / K-quant experts.
 bool gg_cpu_type(int type);
+/// One row of a GGUF block type (Q4_K / Q5_K / Q6_K / Q8_0 / any type ggml has a to_float for) -> k values as BF16
+/// (round to nearest even), the host embedding's format.  False: ggml has no decode for this type.
+bool gg_row_to_bf16(int type, const uint8_t* row, int k, uint16_t* out);
 bool gg_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err);
 void gg_cpu_quant(int act, const float* x, int k, void* dst);
 void gg_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt, float* const* ff,

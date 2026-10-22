@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 #if defined(STRATA_DSV41_TQ_CPU)
@@ -125,6 +126,24 @@ void gg_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, cons
 void gg_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0, int r1) {
     dots(f.td, down, f.d_row, f.n_ff, hq, nt, out, r0, r1);
 }
+
+// a row of any ggml block type -> BF16 on the host (the embedding table's reader; Q5_K / Q4_K / Q6_K / Q8_0 rows of a
+// GGUF whose dense tensors are not BF16): ggml's own to_float, then the same round-to-nearest-even to BF16 the Q8_0 path uses
+bool gg_row_to_bf16(int type, const uint8_t* row, int k, uint16_t* out) {
+    init_once();
+    const ggml_type_traits* t = ggml_get_type_traits((ggml_type) type);
+    if (t == nullptr || t->to_float == nullptr) return false;
+    static thread_local std::vector<float> f;
+    f.resize((size_t) k);
+    t->to_float(row, f.data(), k);
+    for (int i = 0; i < k; ++i) {
+        uint32_t u;
+        std::memcpy(&u, &f[(size_t) i], 4);
+        u += 0x7fffu + ((u >> 16) & 1u);
+        out[i] = (uint16_t) (u >> 16);
+    }
+    return true;
+}
 }  // namespace strata::ds4::gguf
 #else
 namespace strata::ds4::gguf {
@@ -136,5 +155,6 @@ bool gg_cpu_fmt(int, int, int, int, IqCpu&, std::string& err) {
 void gg_cpu_quant(int, const float*, int, void*) {}
 void gg_cpu_gate_up(const IqCpu&, const uint8_t*, const uint8_t*, const void* const*, int, float* const*, int, int, float) {}
 void gg_cpu_down(const IqCpu&, const uint8_t*, const void* const*, int, float* const*, int, int) {}
+bool gg_row_to_bf16(int, const uint8_t*, int, uint16_t*) { return false; }
 }  // namespace strata::ds4::gguf
 #endif

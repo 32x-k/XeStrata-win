@@ -20,8 +20,8 @@ namespace strata::ds4::gguf::iq {
 
 // ggml type ids
 constexpr int kQ5_K = 13, kQ6_K = 14;   // (the dense matrices' K-quants, GEMV only)
-constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kIQ2_XXS = 16, kIQ3_XXS = 18, kIQ3_S = 21, kIQ2_S = 22,
-              kIQ4_XS = 23;
+constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18, kIQ3_S = 21,
+              kIQ2_S = 22, kIQ4_XS = 23;
 
 /// The trellis types (Strata's, ds4_tq.cu): ggml's TQK6 / TQK7 (145 / 146, the table codebook) and the experimental
 /// TQK5X / TQK4X (224 / 225, computed codebook) and TQK5T / TQK4T (226 / 227, table): a block of 128 values is

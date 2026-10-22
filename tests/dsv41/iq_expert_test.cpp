@@ -1,0 +1,305 @@
+// Strata. The i-quant routed experts of the DeepSeek-V4.1 path (ds4_iq.cu on the device, ds4_iq_cpu.cpp on the CPU lane)
+// against ggml's own decode of the same bytes plus a double reference: the token path (gate/up, down), the window path
+// (grouped entries), the prompt sets (gate/up and down), and the CPU lane on the same experts.  Random legal blocks: any
+// bit pattern with a sane F16 scale is one.  This is the H2 gate for a new type (IQ2_XS first): the kernel's integer sums
+// must equal ggml's weights times the same activations.
+//   iq_expert_test [--type 16,17,18,21,22,23] [--bench] [--iq256 0|1]
+#include "../../src/dsv41/ds4_gguf_cpu.hpp"
+#include "../../src/dsv41/ds4_iq.cuh"
+
+#include <hip/hip_runtime.h>
+
+#include "ggml.h"   // ggml_get_type_traits(type)->to_float: ggml's decode of the same blocks
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <random>
+#include <string>
+#include <vector>
+
+namespace iq = strata::ds4::gguf::iq;
+namespace gg = strata::ds4::gguf;
+#define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::printf("HIP error %s at %d\n", hipGetErrorString(e_), __LINE__); std::exit(2); } } while (0)
+
+template <typename T> static T* up(const std::vector<T>& v) {
+    T* d; CK(hipMalloc(&d, std::max<size_t>(1, v.size() * sizeof(T)))); CK(hipMemcpy(d, v.data(), v.size() * sizeof(T), hipMemcpyHostToDevice)); return d;
+}
+template <typename T> static std::vector<T> down_(const T* d, size_t n) {
+    std::vector<T> v(n); CK(hipMemcpy(v.data(), d, n * sizeof(T), hipMemcpyDeviceToHost)); return v;
+}
+static float h2f(uint16_t h) {
+    const int s = h >> 15, e = (h >> 10) & 31, m = h & 1023;
+    float f = e == 0 ? std::ldexp((float) m, -24) : std::ldexp(1.0f + m / 1024.0f, e - 15);
+    return s ? -f : f;
+}
+static uint16_t f2h(float f) {   // round to nearest even, normal range
+    uint32_t u; std::memcpy(&u, &f, 4);
+    const uint32_t s = (u >> 16) & 0x8000u; int e = (int) ((u >> 23) & 0xff) - 127 + 15; uint32_t m = u & 0x7fffffu;
+    uint32_t hm = m >> 13; const uint32_t rem = m & 0x1fffu;
+    uint32_t v = ((uint32_t) e << 10) | hm;
+    if (rem > 0x1000u || (rem == 0x1000u && (v & 1))) ++v;
+    return (uint16_t) (s | v);
+}
+
+struct Q8 { std::vector<int8_t> q; std::vector<float> d; std::vector<float> xhat; };
+// the engine's q8_quant: sc = max|x| / 127 per 32, q = round-half-even(x / sc)
+static Q8 quant(const float* x, int k) {
+    Q8 r; r.q.resize(k); r.d.resize(k / 32); r.xhat.resize(k);
+    for (int b = 0; b < k / 32; ++b) {
+        float am = 0; for (int j = 0; j < 32; ++j) am = std::max(am, std::fabs(x[b * 32 + j]));
+        const float sc = am / 127.0f; r.d[b] = sc;
+        for (int j = 0; j < 32; ++j) { const int q = am > 0 ? (int) std::nearbyint(x[b * 32 + j] / sc) : 0; r.q[b * 32 + j] = (int8_t) q; r.xhat[b * 32 + j] = (float) q * sc; }
+    }
+    return r;
+}
+static double swiglu(double g, double u, double lim) {
+    if (lim > 0) { g = std::min(g, lim); u = std::min(std::max(u, -lim), lim); }
+    return g / (1.0 + std::exp(-g)) * u;
+}
+static double dotd(const float* w, const float* x, int k, double* sabs = nullptr) {
+    double s = 0, sa = 0; for (int i = 0; i < k; ++i) { const double t = (double) w[i] * x[i]; s += t; sa += std::fabs(t); } if (sabs) *sabs = sa; return s;
+}
+// an activation buffer of a ggml type (Q8_K for the i-quant rows) decoded by ggml itself
+static std::vector<float> act_values(int type, const void* act, int k) {
+    std::vector<float> v((size_t) k);
+    if (type == 15) {   // Q8_K: float d, int8 qs[256], int16 bsums[16] - no to_float (an intermediate type)
+        const int nb = k / 256;
+        const size_t bs = ggml_row_size((ggml_type) type, k) / (size_t) nb;
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* p = (const uint8_t*) act + (size_t) b * bs;
+            float d; std::memcpy(&d, p, 4);
+            const int8_t* qs = (const int8_t*) (p + 4);
+            for (int j = 0; j < 256; ++j) v[(size_t) b * 256 + j] = d * (float) qs[j];
+        }
+        return v;
+    }
+    const ggml_type_traits* t = ggml_get_type_traits((ggml_type) type);
+    if (t == nullptr || t->to_float == nullptr) { std::printf("no to_float for activation type %d\n", type); std::exit(2); }
+    t->to_float(act, v.data(), k);
+    return v;
+}
+
+struct Mat { std::vector<uint8_t> bytes; std::vector<float> w; int rows = 0, k = 0; };
+// random legal blocks of `type` for a rows x k matrix, decoded by ggml itself
+static Mat make_mat(std::mt19937_64& rng, int type, int rows, int k) {
+    Mat m; m.rows = rows; m.k = k;
+    const int bv = iq::block_values(type), bb = iq::block_bytes(type);
+    const size_t nblk = (size_t) rows * (k / bv);
+    m.bytes.resize(nblk * (size_t) bb);
+    for (auto& b : m.bytes) b = (uint8_t) rng();
+    for (size_t b = 0; b < nblk; ++b) {   // a sane F16 scale in the first two bytes (every type here has d at offset 0)
+        const uint16_t d = f2h(0.02f + 0.0002f * (float) (rng() % 600));
+        std::memcpy(&m.bytes[b * (size_t) bb], &d, 2);
+    }
+    m.w.resize((size_t) rows * k);
+    const ggml_type_traits* tr = ggml_get_type_traits((ggml_type) type);
+    if (tr == nullptr || tr->to_float == nullptr) { std::printf("ggml has no to_float for type %d\n", type); std::exit(2); }
+    const size_t rb = (size_t) (k / bv) * (size_t) bb;
+    for (int r = 0; r < rows; ++r) tr->to_float(&m.bytes[(size_t) r * rb], &m.w[(size_t) r * k], k);
+    return m;
+}
+
+// one decode token of the DeepSeek shape (n_embd 5120, n_ff 2304, top-6 experts): gate/up + down launches, per-layer time
+static void bench(int type) {
+    const int E = 5120, FF = 2304, NE = 6;
+    const size_t rb_g = iq::row_bytes(type, E), rb_d = iq::row_bytes(type, FF);
+    auto al = [](size_t n) { return (n + 255) / 256 * 256; };
+    const size_t off[3] = {0, al(FF * rb_g), al(FF * rb_g) * 2}, blob = off[2] + al((size_t) E * rb_d);
+    std::mt19937_64 rng(5);
+    std::vector<uint8_t> one(blob);
+    for (auto& b : one) b = (uint8_t) rng();
+    std::vector<unsigned long long> plan(NE);
+    for (int e = 0; e < NE; ++e) { uint8_t* d; CK(hipMalloc(&d, blob)); CK(hipMemcpy(d, one.data(), blob, hipMemcpyHostToDevice)); plan[e] = (unsigned long long) d; }
+    std::vector<int8_t> xq(E, 3), hq((size_t) NE * FF, 3); std::vector<float> xd(E / 32, 0.01f), hd((size_t) NE * FF / 32, 0.01f);
+    iq::Args a{};
+    a.plan_ptr = up(plan); a.n_embd = E; a.n_ff = FF; a.limit = 10.0f; a.xq = up(xq); a.xd = up(xd); a.hq = up(hq); a.hd = up(hd); a.tg = a.td = type;
+    for (int r = 0; r < 3; ++r) a.tr[r] = off[r];
+    float *dh, *dp; CK(hipMalloc(&dh, (size_t) NE * FF * 4)); CK(hipMalloc(&dp, (size_t) NE * E * 4)); a.h = dh; a.part = dp;
+    hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
+    for (int rep = 0; rep < 5; ++rep) { iq::gate_up(a, NE, 1, 0); iq::down(a, NE, 1, 0); }
+    CK(hipDeviceSynchronize());
+    float ms_gu = 0, ms_dn = 0;
+    for (int part = 0; part < 2; ++part) {
+        hipEventRecord(e0);
+        for (int rep = 0; rep < 100; ++rep) { if (part == 0) iq::gate_up(a, NE, 1, 0); else iq::down(a, NE, 1, 0); }
+        hipEventRecord(e1); hipEventSynchronize(e1);
+        float ms; hipEventElapsedTime(&ms, e0, e1);
+        (part == 0 ? ms_gu : ms_dn) = ms / 100;
+    }
+    const double bytes = (double) NE * blob;
+    std::printf("bench %-7s 6 experts x 40 layers: gate/up %.0f us, down %.0f us, layer %.0f us -> %.0f GB/s, %.2f Tw/s, 40 layers %.1f ms/token\n",
+                iq::name(type), ms_gu * 1e3, ms_dn * 1e3, (ms_gu + ms_dn) * 1e3,
+                bytes / ((ms_gu + ms_dn) * 1e-3) / 1e9,
+                (double) NE * 3 * FF * E / ((ms_gu + ms_dn) * 1e-3) / 1e12, 40.0 * (ms_gu + ms_dn));
+}
+
+int main(int argc, char** argv) {
+    std::vector<int> types = {16, 17, 22, 18, 21, 23};
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--bench") {
+            std::vector<int> bt;
+            if (i + 1 < argc && argv[i + 1][0] != '-') { for (const char* p = argv[++i]; *p;) { bt.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; } }
+            else bt = types;
+            for (int t : bt) bench(t);
+            return 0;
+        } else if (std::string(argv[i]) == "--type" && i + 1 < argc) {
+            types.clear(); for (const char* p = argv[++i]; *p;) { types.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; }
+        } else if (std::string(argv[i]) == "--iq256" && i + 1 < argc) {
+            gg::gg_cpu_set_iq256(std::atoi(argv[++i]));
+        }
+    }
+    std::mt19937_64 rng(11);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    int fails = 0;
+    auto report = [&](const char* what, int type, double worst, double tol) {
+        const bool ok = worst <= tol;
+        std::printf("%-7s %-22s worst %.2e (tol %.0e) %s\n", iq::name(type), what, worst, tol, ok ? "ok" : "FAIL");
+        fails += !ok;
+    };
+    for (int type : types) {
+        if (!iq::supported(type)) { std::printf("%-7s not a device type here\n", iq::name(type)); ++fails; continue; }
+        const int E = 512, FF = 256, NEXP = 3, T = 4;
+        const float lim = 7.0f;
+        const size_t rb_g = iq::row_bytes(type, E), rb_d = iq::row_bytes(type, FF);
+        auto al = [](size_t n) { return (n + 255) / 256 * 256; };
+        const size_t off[3] = {0, al(FF * rb_g), al(FF * rb_g) * 2}, blob = off[2] + al((size_t) E * rb_d);
+        std::vector<Mat> G(NEXP), U(NEXP), D(NEXP);
+        auto refh = [&](int e, int r, const float* xv, double& scale) {
+            double sg, su;
+            const double g = dotd(&G[e].w[(size_t) r * E], xv, E, &sg), u = dotd(&U[e].w[(size_t) r * E], xv, E, &su);
+            scale = sg + su + 1e-30;
+            return swiglu(g, u, lim);
+        };
+        std::vector<uint8_t> blobs((size_t) NEXP * blob, 0);
+        for (int e = 0; e < NEXP; ++e) {
+            G[e] = make_mat(rng, type, FF, E); U[e] = make_mat(rng, type, FF, E); D[e] = make_mat(rng, type, E, FF);
+            std::memcpy(&blobs[e * blob + off[0]], G[e].bytes.data(), G[e].bytes.size());
+            std::memcpy(&blobs[e * blob + off[1]], U[e].bytes.data(), U[e].bytes.size());
+            std::memcpy(&blobs[e * blob + off[2]], D[e].bytes.data(), D[e].bytes.size());
+        }
+        uint8_t* dblob = up(blobs);
+        std::vector<float> x((size_t) T * E);
+        for (auto& v : x) v = nd(rng) * (1.0f + 3.0f * (rng() % 7 == 0));
+        std::vector<Q8> qx(T);
+        std::vector<int8_t> xq((size_t) T * E); std::vector<float> xd((size_t) T * E / 32);
+        for (int t = 0; t < T; ++t) { qx[t] = quant(&x[(size_t) t * E], E); std::memcpy(&xq[(size_t) t * E], qx[t].q.data(), E); std::memcpy(&xd[(size_t) t * E / 32], qx[t].d.data(), E / 32 * 4); }
+        const int8_t* dxq = up(xq); const float* dxd = up(xd);
+
+        // ---- token path
+        std::vector<float> href((size_t) NEXP * FF);
+        std::vector<Q8> qh(NEXP);
+        {
+            std::vector<unsigned long long> plan(NEXP);
+            for (int e = 0; e < NEXP; ++e) plan[e] = (unsigned long long) (dblob + e * blob);
+            iq::Args a{};
+            a.plan_ptr = up(plan); a.n_embd = E; a.n_ff = FF; a.limit = lim; a.xq = dxq; a.xd = dxd; a.tg = a.td = type;
+            for (int r = 0; r < 3; ++r) a.tr[r] = off[r];
+            float* dh; CK(hipMalloc(&dh, (size_t) NEXP * FF * 4)); a.h = dh;
+            if (!iq::gate_up(a, NEXP, 1, 0)) { std::printf("gate_up refused\n"); return 1; }
+            CK(hipDeviceSynchronize());
+            const auto h = down_(dh, (size_t) NEXP * FF);
+            double worst = 0;
+            for (int e = 0; e < NEXP; ++e)
+                for (int r = 0; r < FF; ++r) {
+                    double sc;
+                    const double ref = refh(e, r, qx[0].xhat.data(), sc);
+                    href[(size_t) e * FF + r] = (float) ref;
+                    worst = std::max(worst, std::fabs(h[(size_t) e * FF + r] - ref) / sc);
+                }
+            report("token gate_up", type, worst, 1e-5);
+            std::vector<int8_t> hq((size_t) NEXP * FF); std::vector<float> hd((size_t) NEXP * FF / 32);
+            for (int e = 0; e < NEXP; ++e) { qh[e] = quant(&href[(size_t) e * FF], FF); std::memcpy(&hq[(size_t) e * FF], qh[e].q.data(), FF); std::memcpy(&hd[(size_t) e * FF / 32], qh[e].d.data(), FF / 32 * 4); }
+            a.hq = up(hq); a.hd = up(hd);
+            float* dp; CK(hipMalloc(&dp, (size_t) NEXP * E * 4)); a.part = dp;
+            if (!iq::down(a, NEXP, 1, 0)) { std::printf("down refused\n"); return 1; }
+            CK(hipDeviceSynchronize());
+            const auto part = down_(dp, (size_t) NEXP * E);
+            worst = 0;
+            for (int e = 0; e < NEXP; ++e)
+                for (int r = 0; r < E; ++r) {
+                    double sa; const double ref = dotd(&D[e].w[(size_t) r * FF], qh[e].xhat.data(), FF, &sa);
+                    worst = std::max(worst, std::fabs(part[(size_t) e * E + r] - ref) / (sa + 1e-30));
+                }
+            report("token down", type, worst, 1e-6);
+
+            // ---- the prompt sets: expert 0 owns rows [0, 37), expert 2 [37, 42)
+            const int NR = 42;
+            std::vector<int> bounds = {0, 37, 37, 42}, idx(NR);
+            for (int i = 0; i < NR; ++i) idx[i] = i % T;
+            iq::SetArgs q{};
+            q.wbase = dblob; q.stride = blob; for (int r = 0; r < 3; ++r) q.tr[r] = off[r];
+            q.bounds = up(bounds); q.row0 = 0; q.max_rows = 37; q.n_exp = 3; q.n_embd = E; q.n_ff = FF; q.limit = lim;
+            q.tg = q.td = type; q.xf = up(x); q.idx = up(idx); q.ldx = E;
+            uint16_t* dh16; CK(hipMalloc(&dh16, (size_t) NR * FF * 2)); q.h = dh16; q.ldo = FF;
+            if (!iq::set_gate_up(q, 0)) { std::printf("set_gate_up refused\n"); return 1; }
+            CK(hipDeviceSynchronize());
+            const auto h16 = down_(dh16, (size_t) NR * FF);
+            double w2 = 0;
+            for (int e = 0; e < 3; ++e)
+                for (int lr = bounds[e]; lr < bounds[e + 1]; ++lr)
+                    for (int r = 0; r < FF; ++r) {
+                        double sc;
+                        const double ref = refh(e, r, &x[(size_t) idx[lr] * E], sc);
+                        w2 = std::max(w2, std::fabs((double) h2f(h16[(size_t) lr * FF + r]) - ref) / sc);
+                    }
+            report("set gate_up (f16)", type, w2, 1e-2);
+            q.xh = dh16; q.ldx = FF;
+            float* dy; CK(hipMalloc(&dy, (size_t) NR * E * 4)); q.y = dy; q.ldo = E;
+            if (!iq::set_down(q, 0)) { std::printf("set_down refused\n"); return 1; }
+            CK(hipDeviceSynchronize());
+            const auto y = down_(dy, (size_t) NR * E);
+            w2 = 0;
+            for (int e = 0; e < 3; ++e)
+                for (int lr = bounds[e]; lr < bounds[e + 1]; ++lr) {
+                    std::vector<float> hf(FF);
+                    for (int c = 0; c < FF; ++c) hf[c] = h2f(h16[(size_t) lr * FF + c]);
+                    for (int r = 0; r < E; ++r) {
+                        double sa; const double ref = dotd(&D[e].w[(size_t) r * FF], hf.data(), FF, &sa);
+                        w2 = std::max(w2, std::fabs(y[(size_t) lr * E + r] - ref) / (sa + 1e-30));
+                    }
+                }
+            // (the prompt sets' tiles take F16 operands for the i-quants: the tile's own rounding, not the token path's)
+            report("set down", type, w2, 3e-3);
+        }
+
+        // ---- the CPU lane on the same experts and inputs (ggml-cpu's rows, or Strata's AVX2 ones with DS4_GG_IQ256=1)
+        {
+            gg::IqCpu fm; std::string err;
+            if (!gg::iq_cpu_fmt(type, type, E, FF, fm, err)) { std::printf("%-7s cpu lane: %s\n", iq::name(type), err.c_str()); ++fails; }
+            else {
+                std::vector<uint8_t> act(fm.act_bytes), hact(fm.h_bytes);
+                gg::iq_cpu_quant(fm.gu_act, x.data(), E, act.data());
+                // (the CPU lane rounds the activation to its own type - Q8_K, one F32 scale per 256 values - so the
+                //  reference is that quantized activation, not the device's per-32 one)
+                const std::vector<float> xhat = act_values(fm.gu_act, act.data(), E);
+                double wg = 0, wd = 0;
+                for (int e = 0; e < NEXP; ++e) {
+                    std::vector<float> hc(FF), yc(E);
+                    float* hp[1] = {hc.data()}; float* yp[1] = {yc.data()};
+                    const void* ap[1] = {act.data()};
+                    gg::iq_cpu_gate_up(fm, &blobs[e * blob + off[0]], &blobs[e * blob + off[1]], ap, 1, hp, 0, FF, lim);
+                    for (int r = 0; r < FF; ++r) {
+                        double sg, su;
+                        const double g = dotd(&G[e].w[(size_t) r * E], xhat.data(), E, &sg);
+                        const double u = dotd(&U[e].w[(size_t) r * E], xhat.data(), E, &su);
+                        wg = std::max(wg, std::fabs(hc[r] - swiglu(g, u, lim)) / (sg + su + 1e-30));
+                    }
+                    gg::iq_cpu_quant(fm.d_act, &href[(size_t) e * FF], FF, hact.data());
+                    const std::vector<float> hhat = act_values(fm.d_act, hact.data(), FF);
+                    const void* hpp[1] = {hact.data()};
+                    gg::iq_cpu_down(fm, &blobs[e * blob + off[2]], hpp, 1, yp, 0, E);
+                    for (int r = 0; r < E; ++r) { double sa; const double ref = dotd(&D[e].w[(size_t) r * FF], hhat.data(), FF, &sa); wd = std::max(wd, std::fabs(yc[r] - ref) / (sa + 1e-30)); }
+                }
+                report("cpu gate_up vs ref", type, wg, 1e-5);
+                report("cpu down vs ref", type, wd, 1e-5);
+                std::printf("%-7s cpu rows: %s\n", iq::name(type), gg::iq_cpu_own_rows(type) ? "Strata AVX2" : "ggml-cpu");
+            }
+        }
+        CK(hipFree(dblob));
+    }
+    std::printf("%s\n", fails ? "FAILED" : "ALL OK");
+    return fails;
+}

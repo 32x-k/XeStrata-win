@@ -1,4 +1,4 @@
-﻿# Strata Engine - top-level build (P1.S1).
+# Strata Engine - top-level build (P1.S1).
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -799,14 +799,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       # the trellis experts (device kernels ds4_tq.cu, CPU lane ds4_tq_cpu.cpp) against a double reference; needs a GPU, no model
       set_source_files_properties(tests/dsv41/tq_expert_test.cpp PROPERTIES LANGUAGE HIP)
       add_executable(ds4_tq_test tests/dsv41/tq_expert_test.cpp src/dsv41/ds4_tq.cu src/dsv41/ds4_iq.cu src/dsv41/ds4_tq_cpu.cpp
-                     src/dsv41/ds4_iq_cpu.cpp tools/trellis/tqenc.cpp)
+                     src/dsv41/ds4_iq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp tools/trellis/tqenc.cpp)
       target_include_directories(ds4_tq_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
                                  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
       target_link_libraries(ds4_tq_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} Threads::Threads)
       target_compile_definitions(ds4_tq_test PRIVATE STRATA_DSV41_TQ_CPU=1)
       # the same with the plain-FMA tile instead of the gfx12 WMMA one (what CUDA and gfx11 builds run)
       add_executable(ds4_tq_test_portable tests/dsv41/tq_expert_test.cpp src/dsv41/ds4_tq.cu src/dsv41/ds4_iq.cu src/dsv41/ds4_tq_cpu.cpp
-                     src/dsv41/ds4_iq_cpu.cpp tools/trellis/tqenc.cpp)
+                     src/dsv41/ds4_iq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp tools/trellis/tqenc.cpp)
       target_include_directories(ds4_tq_test_portable PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
                                  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
       target_link_libraries(ds4_tq_test_portable PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} Threads::Threads)
@@ -816,6 +816,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       endif()
       if(STRATA_ENABLE_HIP)
         target_compile_options(ds4_tq_test PRIVATE "$<$<COMPILE_LANGUAGE:HIP,CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/dsv41/hip_extra.h>")
+      endif()
+      # the i-quant experts (ds4_iq.cu) against ggml's own decode of the same blocks + a double reference, device and CPU
+      # lane, for every type the device takes: the gate a new type (IQ2_XS ..) has to pass before the engine uses it
+      set_source_files_properties(tests/dsv41/iq_expert_test.cpp PROPERTIES LANGUAGE HIP)
+      add_executable(ds4_iq_test tests/dsv41/iq_expert_test.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
+                     src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp)
+      target_include_directories(ds4_iq_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
+      target_link_libraries(ds4_iq_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} Threads::Threads)
+      target_compile_definitions(ds4_iq_test PRIVATE STRATA_DSV41_TQ_CPU=1)
+      if(STRATA_ENABLE_HIP)
+        target_compile_options(ds4_iq_test PRIVATE "$<$<COMPILE_LANGUAGE:HIP,CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/dsv41/hip_extra.h>")
       endif()
     endif()
     if(STRATA_ENABLE_HIP)
