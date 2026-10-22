@@ -17,21 +17,52 @@ import sys
 
 import numpy as np
 
-try:
-    from safetensors import safe_open
-except ImportError:  # pragma: no cover
-    sys.exit("needs the safetensors package")
+
+class SafeTensors:
+    """A .safetensors file read with numpy alone (no torch, no safetensors package: this runs on the person's PC, where neither is
+    installed). The format is a little-endian u64 header length, a JSON header {name: {dtype, shape, data_offsets}}, then the raw data."""
+
+    def __init__(self, path):
+        self.path = path
+        with open(path, "rb") as fh:
+            (n,) = struct.unpack("<Q", fh.read(8))
+            if n > (64 << 20):
+                raise ValueError("not a safetensors file (header too large)")
+            self.header = json.loads(fh.read(n))
+        self.base = 8 + n
+        self.header.pop("__metadata__", None)
+
+    def raw(self, name):
+        """-> (dtype string, shape, uint8 memmap of the tensor's bytes)"""
+        info = self.header[name]
+        lo, hi = info["data_offsets"]
+        return info["dtype"], info["shape"], np.memmap(self.path, dtype=np.uint8, mode="r", offset=self.base + lo, shape=(hi - lo,))
+
+    def get_float32(self, name):
+        """-> float32 ndarray (bf16 and f16 tensors are widened exactly)"""
+        dtype, shape, data = self.raw(name)
+        if dtype == "BF16":
+            return (np.frombuffer(data, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(shape)
+        if dtype == "F16":
+            return np.frombuffer(data, dtype=np.float16).astype(np.float32).reshape(shape)
+        if dtype == "F32":
+            return np.frombuffer(data, dtype=np.float32).reshape(shape).copy()
+        raise ValueError("%s: unsupported dtype %s" % (name, dtype))
+
+    def get_bf16_bits(self, name):
+        dtype, shape, data = self.raw(name)
+        if dtype != "BF16":
+            raise ValueError("%s: expected BF16, found %s" % (name, dtype))
+        return np.frombuffer(data, dtype=np.uint16).reshape(shape).copy()
 
 
 def load_tensor(f, name):
     """-> float32 ndarray (bf16 tensors are widened exactly)"""
-    return f.get_tensor(name).float().numpy()
+    return f.get_float32(name)
 
 
 def raw_bf16(f, name):
-    import torch
-    t = f.get_tensor(name)
-    return np.ascontiguousarray(t.view(torch.int16).numpy().view(np.uint16))
+    return np.ascontiguousarray(f.get_bf16_bits(name))
 
 
 def quant_q8_0(w):
@@ -49,13 +80,12 @@ def quant_q8_0(w):
     return out.tobytes()
 
 
-def main():
-    if len(sys.argv) < 4:
-        sys.exit(__doc__)
-    st_path, cfg_path, out_path = sys.argv[1:4]
-    cfg = json.load(open(cfg_path))
+def pack(st_path, cfg_path, out_path, say=print):
+    """Write the engine's runtime file for the drafter in `st_path` (+ its config.json). Returns the number of bytes written."""
+    with open(cfg_path, encoding="utf-8") as fh:
+        cfg = json.load(fh)
     dc = cfg["dflash_config"]
-    f = safe_open(st_path, "pt")
+    f = SafeTensors(st_path)
     tensors = []
     blobs = []
 
@@ -120,7 +150,14 @@ def main():
         for t, b in zip(tensors, blobs):
             o.seek(base + t["offset"])
             o.write(b)
-    print("wrote %s: %d tensors, %.1f MB" % (out_path, len(tensors), (base + off) / 1e6))
+    say("wrote %s: %d tensors, %.1f MB" % (out_path, len(tensors), (base + off) / 1e6))
+    return base + off
+
+
+def main():
+    if len(sys.argv) < 4:
+        sys.exit(__doc__)
+    pack(*sys.argv[1:4])
 
 
 if __name__ == "__main__":

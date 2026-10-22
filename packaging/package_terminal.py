@@ -107,6 +107,7 @@ PAYLOAD = (
 TOOLS_SUBSET = (
     "strata_tokenizer.py",
     "gguf_reader.py",
+    "dflash2_pack.py",     # the DFlash2 drafter: strata_control/drafting_fetch.py packs the download with it (numpy only)
 )
 
 #: What `strata launch` and the desktop app's installer need on top of the read-only terminal: the model catalog and GPU probe
