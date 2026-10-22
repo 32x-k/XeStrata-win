@@ -1282,6 +1282,7 @@ def _bench_standard(a: argparse.Namespace, machine: bool) -> int:
     import tempfile
     lease = benchmark_lease(saved["id"], out) if saved else contextlib.nullcontext()
     proc, scratch, engine_log, run_log, log_start = None, None, None, None, 0
+    stop_problem = None
     try:
         with lease, contextlib.redirect_stdout(sys.stderr):
             def log(message: str) -> None:
@@ -1301,13 +1302,23 @@ def _bench_standard(a: argparse.Namespace, machine: bool) -> int:
                                               engine_run_log=(run_log, log_start) if proc is not None else None,
                                               started_engine=proc is not None, hash_model=not a.skip_model_hash)
     finally:
-        bench_standard.stop_engine(proc)
+        stop_problem = bench_standard.stop_engine(proc)
+        if not isinstance(stop_problem, str):
+            stop_problem = None
         if scratch is not None:
             shutil.rmtree(scratch, ignore_errors=True)
     ok = doc["run"]["status"] == "complete"
+    if stop_problem:   # #3438: a stop that failed is not a normal finish: the engine may still hold the port and the GPU
+        ok = False
+        print(f"\nERROR: the engine this run started could not be stopped: {stop_problem}. It may still hold the server port "
+              "and the GPU: stop it by hand before the next run. This run is marked FAILED.", file=sys.stderr, flush=True)
+        try:
+            (out_dir / "ENGINE-NOT-STOPPED.txt").write_text(stop_problem + "\n", encoding="utf-8")
+        except OSError:
+            pass
     path = out_dir / "results.json"
     if machine:
-        print(json.dumps({"schema_version": 1, "ok": ok, "path": str(path.resolve()), "status": doc["run"]["status"],
+        print(json.dumps({"schema_version": 1, "ok": ok, "path": str(path.resolve()), "status": "failed" if stop_problem else doc["run"]["status"], "engine_stop_error": stop_problem,
                           "quality": doc["quality"], "summaries": doc["summaries"]}, ensure_ascii=False, allow_nan=False))
     else:
         print(bench_standard.format_plain(doc))
