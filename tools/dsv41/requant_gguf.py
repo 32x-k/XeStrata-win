@@ -48,7 +48,7 @@ GT = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 8: ("Q8_0", 32, 34), 10: ("Q2_K", 256,
       12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176), 14: ("Q6_K", 256, 210), 16: ("IQ2_XXS", 256, 66),
       17: ("IQ2_XS", 256, 74), 18: ("IQ3_XXS", 256, 98), 19: ("IQ1_S", 256, 50), 20: ("IQ4_NL", 32, 18),
       21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82), 23: ("IQ4_XS", 256, 136), 29: ("IQ1_M", 256, 56),
-      30: ("BF16", 1, 2), 39: ("MXFP4", 32, 17), 67: ("MXFP8", 32, 33)}
+      30: ("BF16", 1, 2), 39: ("MXFP4", 32, 17), 43: ("MXFP8", 32, 33), 67: ("MXFP8", 32, 33)}
 BYNAME = {v[0]: k for k, v in GT.items()}
 NEED_IMATRIX = {16, 17, 19, 29}
 ROLE = {"ffn_gate_exps.weight": "gate", "ffn_up_exps.weight": "up", "ffn_down_exps.weight": "down"}
@@ -152,7 +152,7 @@ def plan_type(recipe: dict, name: str, typ: int, dims: list[int]) -> int | None:
     """The output type of a tensor (None: copied as it is, -1: left out)."""
     m = re.match(r"blk\.(\d+)\.(.+)$", name)
     short = m.group(2) if m else name
-    if short.startswith("engram_"):
+    if short.startswith("engram_") or short.startswith("per_layer_token_embd"):
         return None if recipe.get("engram", "skip") == "keep" else -1
     if m and short in ROLE:
         role = ROLE[short]

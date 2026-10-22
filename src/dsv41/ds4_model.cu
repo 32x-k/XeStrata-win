@@ -1246,12 +1246,60 @@ struct Model::Impl {
         CK(cudaMemcpy(dst, tmp.data(), t.bytes, cudaMemcpyHostToDevice));
         return true;
     }
+    // a dense matrix in a ggml block type (x3::Mat fmt kFmtGG, row = k / 256 blocks): whole, or part of its rows / inputs
+    bool mat_gg(Dev& d, const std::string& pre, const Tensor& t, int ggt, x3::Mat& m, std::string& err, size_t* acct, int part,
+                int np, bool cols) {
+        if (t.shape.size() != 2 || t.shape[1] % 256 != 0) {
+            err = pre + ": a " + t.dtype + " tensor that is not a matrix of whole blocks";
+            return false;
+        }
+        int n = (int) t.shape[0], k = (int) t.shape[1];
+        const size_t rb = gg::type_row_bytes(ggt, k), bb = rb / ((size_t) k / 256);
+        std::vector<uint8_t> w((size_t) n * rb);
+        if (t.bytes != w.size() || !pk.read(t, w.data())) {
+            err = pre + ": read failed";
+            return false;
+        }
+        if (np > 1) {
+            const int whole = cols ? n : k, wd = whole / np;
+            if (whole % np != 0 || wd % (cols ? 1 : 256) != 0) {
+                err = pre + ": " + std::to_string(whole) + (cols ? " outputs" : " inputs") + " do not split in " + std::to_string(np) + " parts";
+                return false;
+            }
+            std::vector<uint8_t> p;
+            if (cols) {
+                p.assign(w.begin() + (long) ((size_t) part * wd * rb), w.begin() + (long) ((size_t) (part + 1) * wd * rb));
+                n = wd;
+            } else {
+                const size_t pb = (size_t) (wd / 256) * bb, off = (size_t) (part * wd / 256) * bb;
+                p.resize((size_t) n * pb);
+                for (size_t r = 0; r < (size_t) n; ++r) std::memcpy(p.data() + r * pb, w.data() + r * rb + off, pb);
+                k = wd;
+            }
+            w.swap(p);
+        }
+        uint8_t* dp = nullptr;
+        if (!dalloc(d, dp, w.size(), err, acct)) return false;
+        cudaSetDevice(d.id);
+        CK(cudaMemcpy(dp, w.data(), w.size(), cudaMemcpyHostToDevice));
+        m = x3::Mat{};
+        m.fmt = gg::kFmtGG;
+        m.K = ggt;
+        m.raw = dp;
+        m.k = k;
+        m.n = n;
+        m.ld = (int) gg::type_row_bytes(ggt, k);
+        return true;
+    }
     // a GGUF's BF16 or Q8_0 matrix ([out][in]) onto the device, as mat() takes an EXL3 one: whole, or part `part` of its
     // columns (outputs: a range of its rows) or of its rows (inputs: a range of each row, whole Q8_0 blocks) - a
     // standalone [n][k] matrix
     bool mat_bf16(Dev& d, const std::string& pre, const Tensor& t, x3::Mat& m, std::string& err, size_t* acct, int part,
                   int np, bool cols) {
         const bool q8 = t.dtype == "Q8_0";
+        // a ggml K-quant dense matrix (Q4_K / Q5_K / Q6_K: 256 values a block; the GEMV path of ds4_iq)
+        const int ggt = (t.dtype == "Q4_K" || t.dtype == "Q5_K" || t.dtype == "Q6_K") ? gg_type_of(t.dtype) : -1;
+        if (ggt > 0) return mat_gg(d, pre, t, ggt, m, err, acct, part, np, cols);
         if (t.shape.size() != 2 || (q8 && t.shape[1] % 32 != 0)) {
             err = pre + ": a " + t.dtype + " tensor that is not a matrix";
             return false;
@@ -1313,7 +1361,7 @@ struct Model::Impl {
     // splits evenly, its groups only as wide as that goes)
     bool mat(Dev& d, const std::string& pre, x3::Mat& m, std::string& err, size_t* acct, int part = 0, int np = 1,
              bool cols = true, int rot = 0) {
-        if (const Tensor* tw = pk.get(pre + ".weight"); tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0"))
+        if (const Tensor* tw = pk.get(pre + ".weight"); tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0" || tw->dtype == "Q4_K" || tw->dtype == "Q5_K" || tw->dtype == "Q6_K"))
             return mat_bf16(d, pre, *tw, m, err, acct, part, np, cols);
         const Tensor* tr = pk.get(pre + ".trellis");
         const Tensor* su = pk.get(pre + ".suh");
@@ -1479,7 +1527,7 @@ struct Model::Impl {
     // expert's matrix r at the same stride from expert 0's in one file (the GGUF's [n_exp][out][in] tensor)
     // (the other block types: lay.fmt stays kFmtMXFP4 - read in place as these - and lay.K[r] is role r's ggml type)
     static int gg_type_of(const std::string& dtype) {
-        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 16, 18, 21, 22, 23, 145, 146, 224, 225, 226, 227})
+        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 13, 14, 16, 18, 21, 22, 23, 145, 146, 224, 225, 226, 227})
             if (dtype == gg::type_name(t)) return t;
         return -1;
     }

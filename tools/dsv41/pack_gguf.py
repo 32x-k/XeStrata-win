@@ -333,6 +333,8 @@ def main() -> int:
                                      "checkpoint's vision.* / aligner.* (default: the first mmproj*.gguf in <model>/..)")
     ap.add_argument("--tq-experts", nargs="+", help="folders tq_convert.py wrote (tq.json + tq-L<layer>.bin): the routed experts of the layers "
                                          "listed there are read from it as trellis types (TQK5X ..), the others keep their MXFP4")
+    ap.add_argument("--dense-override", help="a folder dense_requant.py wrote (dense.json + dense.bin): its tensors replace the same-named "
+                                             "dense matrices of the GGUF (K-quants of the attention / shared experts)")
     ap.add_argument("--tq-layers", help="only these layers (comma list) of the --tq-experts folders")
     ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's; default <model>/../dspark/dspark.json)")
     ap.add_argument("--engram", help="the folder of the Engram tables' GGUF set, for a quant that leaves them out "
@@ -442,6 +444,25 @@ def main() -> int:
     files = names
     if eg_from:
         print("Engram tables from %s (%d shards)" % (eg_dir, len(eg_from)))
+    # dense matrices requantized by dense_requant.py replace the GGUF's BF16 ones
+    n_dense = 0
+    if a.dense_override:
+        dd = pathlib.Path(a.dense_override).expanduser().resolve()
+        dj = json.loads((dd / "dense.json").read_text())
+        try:
+            relf = os.path.relpath(dd / "dense.bin", model).replace(os.sep, "/")
+        except ValueError:
+            raise SystemExit("%s must be on the model's drive" % dd)
+        if relf not in files:
+            files.append(relf)
+        dfi = files.index(relf)
+        pos = {t[0]: i for i, t in enumerate(tensors)}
+        for name, (tname, fname, off, nb, shape) in dj.items():
+            if name not in pos:
+                raise SystemExit("dense override: %s is not in the pack" % name)
+            tensors[pos[name]] = (name, tname, dfi, off, nb, shape)
+            n_dense += 1
+        print("dense override from %s: %d tensors" % (dd, n_dense))
     # the DSpark drafter from unsloth's GGUF (architecture dflash): blk.N.* -> mtp.N.*, the head tensors under the
     # checkpoint's names (fc -> main_proj, enc.output_norm -> main_norm, output_norm -> norm of the last block,
     # conf_proj -> confidence_head.proj, markov_w1 / w2 -> markov_head.embed / head)
@@ -658,7 +679,7 @@ def main() -> int:
     by = {}
     for t in tensors:
         by[t[1]] = by.get(t[1], 0) + t[4]
-    extras = [w for w, there in (("the DSpark drafter", drafter_in or dspark_gguf), ("the vision tower", bool(vision)), ("trellis experts in layers %s" % tq_layers, bool(tq_layers))) if there]
+    extras = [w for w, there in (("the DSpark drafter", drafter_in or dspark_gguf), ("the vision tower", bool(vision)), ("trellis experts in layers %s" % tq_layers, bool(tq_layers)), ("%d dense matrices requantized" % n_dense, bool(n_dense))) if there]
     print("%s: %d tensors in %d files (%s), Engram %d layers x %d hash columns%s -> %s" %
           (model.name, len(tensors), len(files), ", ".join("%s %.1f GB" % (k, v / 1e9) for k, v in sorted(by.items())),
            nl, cols, "".join(", " + w for w in extras), out))

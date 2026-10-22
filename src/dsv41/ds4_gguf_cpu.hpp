@@ -46,6 +46,14 @@ void tq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, cons
                     int r0, int r1, float limit);
 void tq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0, int r1);
 
+/// ggml block types on the CPU lane through ggml-cpu's row dots (ds4_gg_cpu.cpp), for the IQ / K-quant experts.
+bool gg_cpu_type(int type);
+bool gg_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err);
+void gg_cpu_quant(int act, const float* x, int k, void* dst);
+void gg_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt, float* const* ff,
+                    int r0, int r1, float limit);
+void gg_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0, int r1);
+
 /// The CPU lane's MXFP4 rows in the device's arithmetic (ds4_gguf.cu's mx_dot): the activations rounded to int8 per 32
 /// values as the device rounds them (q8_round's q and scale), each block's products summed exactly in integers, then
 /// times (weight scale x activation scale) into F32 sums - the same numbers as the device up to the order of the

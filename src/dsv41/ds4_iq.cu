@@ -35,6 +35,9 @@ template <> struct Ty<kIQ4_XS> { static constexpr int B = 136, TAB = 4, MIN = 0;
 template <> struct Ty<kQ4_K> { static constexpr int B = 144, TAB = 0, MIN = 1; };
 template <> struct Ty<kQ2_K> { static constexpr int B = 84, TAB = 0, MIN = 1; };
 template <> struct Ty<kQ3_K> { static constexpr int B = 110, TAB = 0, MIN = 0; };
+// the dense matrices' 5- and 6-bit K-quants (GEMV only: ds4_iq's mv; not an expert type)
+template <> struct Ty<kQ5_K> { static constexpr int B = 176, TAB = 0, MIN = 1; };
+template <> struct Ty<kQ6_K> { static constexpr int B = 210, TAB = 0, MIN = 0; };
 // MXFP4 (ds4_gguf.cu's own kernels everywhere else): a block of 32 values, an E8M0 scale then 16 code bytes; the light
 // sets take it too
 constexpr int kMXFP4 = 39;
@@ -207,6 +210,32 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         s.s0 = s.s1 = sc;
         s.d = h2f(b);
         s.m0 = s.m1 = h2f(b + 2) * (float) m;
+    } else if constexpr (T == kQ5_K) {   // d, dmin, scales[12], qh[32], qs[128]: weight = d sc (nibble + 16 hbit) - dmin m
+        int sc, m;
+        q4k_scale(b + 4, ib, sc, m);
+        const uint8_t* qs = b + 48 + 32 * (ib >> 1);
+        const uint8_t* qh = b + 16;
+        const int sh = 4 * (ib & 1);
+#pragma unroll
+        for (int t = 0; t < 8; ++t)
+            s.q[t] = (int) (((ld4(qs + 4 * t) >> sh) & 0x0f0f0f0fu) | (((ld4(qh + 4 * t) >> ib) & 0x01010101u) << 4));
+        s.s0 = s.s1 = sc;
+        s.d = h2f(b);
+        s.m0 = s.m1 = h2f(b + 2) * (float) m;
+    } else if constexpr (T == kQ6_K) {   // ql[128], qh[64], scales int8[16], d: weight = d sc (q - 32), q 6 bits
+        const int h = ib >> 2, quarter = ib & 3;
+        const uint8_t* ql = b + 64 * h + (quarter & 1 ? 32 : 0);
+        const uint8_t* qh = b + 128 + 32 * h;
+        const int sh = 4 * (quarter >> 1);
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const uint32_t x = ((ld2(ql + 4 * t) >> sh) & 0x0f0f0f0fu) | (((ld2(qh + 4 * t) >> (2 * quarter)) & 0x03030303u) << 4);
+            s.q[t] = (int) __vsub4(x, 0x20202020u);
+        }
+        const int8_t* scl = (const int8_t*) (b + 192) + 8 * h + 2 * quarter;
+        s.s0 = scl[0];
+        s.s1 = scl[1];
+        s.d = h2f(b + 208);
     } else if constexpr (T == kQ2_K) {
         const int n = ib >> 2, j = ib & 3;
         const uint8_t* qs = b + 16 + 32 * n;
@@ -921,6 +950,8 @@ int block_bytes(int t) {
         case kIQ3_S: return Ty<kIQ3_S>::B;
         case kIQ4_XS: return Ty<kIQ4_XS>::B;
         case kQ4_K: return Ty<kQ4_K>::B;
+        case kQ5_K: return Ty<kQ5_K>::B;
+        case kQ6_K: return Ty<kQ6_K>::B;
         case kQ2_K: return Ty<kQ2_K>::B;
         case kQ3_K: return Ty<kQ3_K>::B;
         default: return 0;
@@ -941,6 +972,8 @@ const char* name(int t) {
         case kIQ3_S: return "IQ3_S";
         case kIQ4_XS: return "IQ4_XS";
         case kQ4_K: return "Q4_K";
+        case kQ5_K: return "Q5_K";
+        case kQ6_K: return "Q6_K";
         case kQ2_K: return "Q2_K";
         case kQ3_K: return "Q3_K";
         default: return "?";
@@ -1037,7 +1070,11 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
                 done[k] = true;
             }
 #define MV_(T) mv_nc<T>(J, nj, max_n, max_c, s)
-            DS4_IQ_SWITCH(t, MV_)
+            switch (t) {   // the experts' types and the dense matrices' 5- and 6-bit ones
+                case kQ5_K: MV_(kQ5_K); break;
+                case kQ6_K: MV_(kQ6_K); break;
+                default: DS4_IQ_SWITCH(t, MV_)
+            }
 #undef MV_
         }
     return true;
