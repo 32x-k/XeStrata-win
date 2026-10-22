@@ -319,10 +319,10 @@ class FolderStep(Base):
             self.assertIn("Free space in that folder's drive", t)
             f = app.screen.query_one("#folderpath")
             f.value = ""
-            await typed(pilot, "D:/Strata-data")
-            self.assertEqual(f.value, "D:/Strata-data")
+            await typed(pilot, str(self.home.base / "Strata-data"))
+            self.assertEqual(f.value, str(self.home.base / "Strata-data"))
             await press(pilot, "enter")
-            self.assertEqual(ctx.settings.data_dir, "D:/Strata-data")
+            self.assertEqual(ctx.settings.data_dir, str(self.home.base / "Strata-data"))
             self.assertIn("How much text should it remember at once?", text_of(app))
         self.run_app(case)
 

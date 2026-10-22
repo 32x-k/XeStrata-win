@@ -787,8 +787,20 @@ class FolderScreen(Base):
                     "Press Enter to keep it, or type another folder (it is created if it does not exist). Models you already have stay where "
                     "they are and stay usable; the new folder is for new downloads.", style=MUTE)
 
+    def typed(self) -> str:
+        return self.query_one("#folderpath", Input).value.strip().strip('"')
+
+    def action_next(self) -> None:
+        """The folder is checked before going on (B05): a path that cannot hold the models is said here, in plain words, and not saved."""
+        from strata_control import folders
+        found = folders.problem(self.typed())
+        if found:
+            self.say(folders.words(found), True)
+            return
+        super().action_next()
+
     def commit(self) -> None:
-        value = self.query_one("#folderpath", Input).value.strip().strip('"')
+        value = self.typed()
         default = str(self.ctx.default_folder())
         self.ctx.settings.data_dir = None if (not value or value == default) else value
 
@@ -1340,7 +1352,7 @@ class AccessScreen(Base):
         s = self.ctx.settings
         s.access = kind
         if kind != "local" and not s.api_key and not s.no_key:
-            s.api_key = acc.new_key()
+            s.api_key = acc.kept_key() or acc.new_key()
             self.say("An API key was made for you (recommended beyond this computer). Press t if you want no key.")
         elif kind != "local" and s.no_key:
             self.say(S.NO_KEY_PUBLIC if kind == "cloudflare" else S.NO_KEY_NETWORK, True)
@@ -1389,7 +1401,7 @@ class AccessScreen(Base):
         s = self.ctx.settings
         s.access = self.menu().current.key
         if s.access != "local" and not s.api_key and not s.no_key:
-            s.api_key = acc.new_key()
+            s.api_key = acc.kept_key() or acc.new_key()
 
     def action_back(self) -> None:
         if self.input_open():
@@ -1439,7 +1451,7 @@ class SaveScreen(Base):
                  ("Parallel", f"{s.parallel} at a time" if s.parallel else f"fit to your card ({S.fit_parallel(self.ctx.computer.main_vram_gb)})"),
                  ("Tuning", {"quick": "quick (about 20 min)", "thorough": "thorough (up to 2 h)", "skip": "skipped"}[s.tune]),
                  ("Access", f"{S.ACCESS_WORDS[s.access]}, port {s.port}" + (", API key on" if s.api_key else ", no API key")),
-                 ("Storage", s.data_dir or "Strata's data folder")]
+                 ("Storage", s.data_dir or str(self.ctx.default_folder()))]
         if s.extra:
             lines.append(("Advanced", ", ".join(f"{k}={v}" for k, v in s.extra.items())))
         return lines

@@ -243,6 +243,8 @@ def _maybe_wait(a, ctx, machine: bool) -> None:
     if not serving:
         return
     names = ", ".join(item.get("profile", "an engine") for item in serving)
+    if any(str(item.get("profile", "")).startswith("launch-") for item in serving):
+        return                                   # Strata's own launch: run_update says the one next step (stop the model first) instead of asking
     if machine or not sys.stdin.isatty():
         return                                   # run_update raises Busy (exit 7) with the same names
     answer = input(f"{names} is serving. Wait for it to stop and then update? [y/N] ").strip().lower()

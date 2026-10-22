@@ -44,6 +44,7 @@ class Ctx:
     feed: str | None = None
     move_data: bool = False
     retune: bool = False
+    restart: bool = False
     notes: list[str] = field(default_factory=list)
     start_own_files: bool = False
     picked_in_list: bool = False
@@ -188,6 +189,8 @@ class Ctx:
 class LaunchApp(App):
     TITLE = "strata launch"
     CSS = CSS
+    # Textual's own ctrl+c only shows a "Do you want to quit?" note, and Escape pressed next also went Back (B13): ctrl+c quits like ctrl+q and q
+    BINDINGS = [Binding("ctrl+c", "quit", "Quit", show=False, priority=True)]
 
     def __init__(self, ctx: Ctx, *, auto_run: bool = False) -> None:
         super().__init__()
@@ -201,6 +204,13 @@ class LaunchApp(App):
         self.run_screen: RunScreen | None = None
         self.running = False
         self.current = "start"
+
+    def action_quit(self) -> None:
+        """ctrl+q and ctrl+c, as q on the screens: leave at once. Only a running download or tuning asks first ("Stop now?"), because work would be lost."""
+        if self.running and self.run_screen is not None:
+            self.stop_run(self.run_screen)
+        else:
+            self.exit(None)
 
     def on_mount(self) -> None:
         if self.auto_run:
@@ -264,7 +274,8 @@ class LaunchApp(App):
         s = self.ctx.settings
         self.cancel = threading.Event()
         self.runner = Runner(s, catalog=self.ctx.catalog, emit=self._emit, cancel=self.cancel, feed=self.ctx.feed, confirm=self._ask_from_run,
-                             move_data=self.ctx.move_data, retune=self.ctx.retune)
+                             move_data=self.ctx.move_data, retune=self.ctx.retune, restart=self.ctx.restart,
+                             confirm_restart=self._ask_restart)
         gb = getattr(self.runner, "download_gb", lambda: 0.0)() if not confirmed else 0.0
         if gb >= 1.0:
             free = self.ctx.catalog.disk_free(s.data_dir or self.ctx.catalog.data_dir())
@@ -288,9 +299,13 @@ class LaunchApp(App):
         self.running = True
         threading.Thread(target=self._work, daemon=True).start()
 
-    def _ask_from_run(self, title: str, text: str) -> bool:
+    def _ask_restart(self, title: str, text: str) -> bool:
+        """Another model is serving other choices: ask once, in the same pop-up, whether to restart it. Cancel leaves it running."""
+        return self._ask_from_run(title, text, [("go", "Restart"), ("no", "Cancel")], default=False)
+
+    def _ask_from_run(self, title: str, text: str, options: list[tuple[str, str]] | None = None, default: bool = True) -> bool:
         """A question from the run (a worker thread): show it on the screen and wait for the answer. Enter means yes."""
-        box: dict[str, bool] = {"go": True}
+        box: dict[str, bool] = {"go": default}
         answered = threading.Event()
 
         def done(choice: str | None) -> None:
@@ -298,7 +313,7 @@ class LaunchApp(App):
             answered.set()
 
         def show() -> None:
-            self.push_screen(ConfirmScreen(title, text, [("go", "Download anyway"), ("no", "Not now")]), done)
+            self.push_screen(ConfirmScreen(title, text, options or [("go", "Download anyway"), ("no", "Not now")]), done)
 
         try:
             self.call_from_thread(show)
@@ -405,7 +420,8 @@ def run_monitor(info: dict, *, keep_default: bool = True, color: str = "auto") -
 
 
 def run_tui(settings: S.LaunchSettings | None, *, catalog: Catalog | None = None, feed: str | None = None, auto_run: bool = False,
-            save: bool = False, open_page: bool = False, move_data: bool = False, retune: bool = False) -> int:
+            save: bool = False, open_page: bool = False, move_data: bool = False, retune: bool = False,
+            restart: bool = False) -> int:
     """Open the launch screens. `settings` given and `auto_run`: skip the questions and go straight to the run."""
     catalog = catalog or Catalog()
     print("Looking at this computer…", flush=True)
@@ -420,7 +436,7 @@ def run_tui(settings: S.LaunchSettings | None, *, catalog: Catalog | None = None
             s.name = f"{s.model or 'model'} {S.context_label(s.context)}"
         if save:
             store.save(s, s.name)
-    ctx = Ctx(catalog=catalog, computer=computer, rows=rows, settings=s, glyphs=Glyphs(), feed=feed, move_data=move_data, retune=retune)
+    ctx = Ctx(catalog=catalog, computer=computer, rows=rows, settings=s, glyphs=Glyphs(), feed=feed, move_data=move_data, retune=retune, restart=restart)
     app = LaunchApp(ctx, auto_run=auto_run)
     result = app.run()
     if getattr(app, "return_code", 0) not in (0, None) or getattr(app, "_exception", None) is not None:
