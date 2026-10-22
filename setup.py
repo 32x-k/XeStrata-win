@@ -63,6 +63,9 @@ import zipfile
 from pathlib import Path
 
 from strata_control import acquisition
+from strata_control import tls
+
+tls.install()      # #3722: HTTPS checks the server against the operating system's certificates (what Chrome and curl.exe do)
 from strata_control import atomic
 from strata_control import draft_layer
 from strata_control.discovery import in_trash
@@ -741,7 +744,12 @@ def _urlopen(req, timeout=None):
     """Every network request of this file goes through here: starting and serving never reach the network
     (strata_control/acquisition.py), only an explicit setup, update or install does."""
     acquisition.require("a download")
-    return urllib.request.urlopen(req, timeout=timeout)
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.URLError as e:
+        if tls.is_certificate_error(e):               # not the raw urlopen text, and never a way to skip the check
+            raise tls.CertificateProblem(tls.host_of(req.full_url if hasattr(req, "full_url") else str(req))) from None
+        raise
 
 
 def run(cmd, cwd=None, env=None, check=True, quiet=False):
@@ -2667,6 +2675,8 @@ def download(url, dst: Path, what=None):
                 fail(f"cannot reach {url.split('/')[2]} ({e})",
                      "check your internet connection and run it again" + source_hint(url))
             time.sleep(5)
+        except tls.CertificateProblem as e:           # the same answer five times: no retry
+            fail(f"cannot download from {url.split('/')[2]}: its security certificate was not accepted", str(e))
         except OSError as e:
             if attempt == 4:
                 fail(f"cannot reach {url.split('/')[2]} ({e})",
