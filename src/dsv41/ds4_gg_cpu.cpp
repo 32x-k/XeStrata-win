@@ -74,7 +74,7 @@ void gg_cpu_quant(int act, const float* x, int k, void* dst) {
 }
 
 // Strata's AVX2 multi-token rows for the i-quants (iq256_rows: each 32-value chunk decoded once, every token applies it;
-// the integer sums are ggml's, only the float additions come in another order).  DS4_GG_IQ256=0: ggml-cpu's row dots.
+// the integer sums are ggml's, only the float additions come in another order).  Opt-in until the end-to-end A/B is done: DS4_GG_IQ256=1.
 static int g_iq256 = -1;   // -1: from the environment and the CPU, 0 off, 1 on
 void gg_cpu_set_iq256(int mode) { g_iq256 = mode; }
 static bool use_iq256(int type) {
@@ -85,7 +85,7 @@ static bool use_iq256(int type) {
         __builtin_cpu_init();
         avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
 #endif
-        g_iq256 = avx2 && (v == nullptr || std::atoi(v) != 0) ? 1 : 0;
+        g_iq256 = avx2 && v != nullptr && std::atoi(v) != 0 ? 1 : 0;
     }
     return g_iq256 == 1 && strata::kernels::cpu::iq256_supported(type);
 }
