@@ -787,6 +787,7 @@ struct Options {
     /// --draft dflash2 --draft-model PACK (opt-in, CUDA / HIP): the DFlash2 block drafter for Qwen3.8-Flash-Next (tools/dflash2_pack.py) drafts instead
     /// of the MTP layer, which stays loaded as the fallback.  Needs --mtp, --spec and a native pack; a missing pack falls back to the MTP.
     std::string draft, draft_model;
+    int draft_cap = 0;   ///< --draft-cap N: the widest verify window with --draft dflash2 (0 = by card class, see where the drafter loads)
     /// A control vector on the residual stream (strata/kernels/cvec.hpp), with llama.cpp's flags: the
     /// `experimental-speed-projection` profile passes `--control-vector-scaled FILE:1.0 --control-vector-layer-range
     /// 4 44 --cvec-mode project --cvec-dir per-layer`.  None by default; --serve switches a loaded one per request.
@@ -941,6 +942,7 @@ void usage() {
                  "  --mtp-draft-vocab FILE  opt-in: the draft head's token subset (default <mtp>/draft_vocab.bin)\n"
                  "  --draft mtp|dflash2  the draft source (default mtp); dflash2 needs --draft-model PACK (tools/dflash2_pack.py)\n"
                  "                       and keeps the MTP layer loaded as the fallback (opt-in, Flash-Next, CUDA / HIP)\n"
+                 "  --draft-cap N        the widest verify window with --draft dflash2 (default by card: 5 on Strix Halo / iGPU, --spec as given elsewhere)\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
@@ -2688,6 +2690,7 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--draft-model") o.draft_model = next("--draft-model");
+        else if (a == "--draft-cap") o.draft_cap = std::max(0, std::atoi(next("--draft-cap")));
         else if (a == "--control-vector") o.cvec_files.push_back({next("--control-vector"), 1.0f});
         else if (a == "--control-vector-scaled") {
             // FILE:SCALE, comma-separated; the LAST colon splits, so a Windows path (C:\...) keeps its drive
@@ -5447,6 +5450,28 @@ int main(int argc, char** argv) {
             if (why == nullptr) {
                 if (df2.load(o.draft_model, 0, err)) {
                     use_df2 = true;
+                    // Per card class, from the measured A/Bs (notes-dflash2-p1.md): on Strix Halo a window of 5 is the agent-safe pick (cap 6 ties on
+                    // agent prompts); a 12 GB NVIDIA card is slower with DFlash2 than with the MTP at every cap but code, which only the user can know.
+                    // Recommend, never force: the window is capped for the card unless --draft-cap says otherwise, and a small NVIDIA card gets one plain line.
+                    cudaDeviceProp dp{};
+                    if (cudaGetDeviceProperties(&dp, 0) == cudaSuccess) {
+#if defined(STRATA_USE_HIP)
+                        const bool uma = strata::kernels::gfx_arch_is_gfx1151(dp.gcnArchName);
+#else
+                        const bool uma = false;
+#endif
+                        const int cap = o.draft_cap > 0 ? o.draft_cap : (uma ? 5 : 0);
+                        if (cap > 0 && o.spec > cap) {
+                            std::fprintf(stderr, "strata generate: --draft dflash2: windows capped at %d tokens (%s; --draft-cap N changes it)\n", cap,
+                                         o.draft_cap > 0 ? "as asked" : "the width measured best on this card");
+                            o.spec = cap;
+                        }
+#if !defined(STRATA_USE_HIP)
+                        if (o.draft_cap == 0 && dp.totalGlobalMem < (size_t) 13 << 30)
+                            std::fprintf(stderr, "strata generate: --draft dflash2: on a 12 GB NVIDIA card the MTP drafter was faster in most measurements "
+                                                 "(code prompts at a window of 6 gained 3%%); continuing as asked\n");
+#endif
+                    }
                 } else {
                     std::fprintf(stderr, "strata generate: --draft dflash2: %s; the MTP drafts instead\n", err.c_str());
                 }
@@ -16360,8 +16385,10 @@ int main(int argc, char** argv) {
 #endif
             return mtp.draft(T_, outv.data(), p, a_, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
         };
+        int win_cap = o.spec;   // the widest window the VRAM allows (lowered on an out-of-memory capture, see below)
         while ((int64_t) produced.size() < max_new) {
             const Clock::time_point t0 = Clock::now();
+        retry_round:
             strata::core::progress_at("spec loop: choosing the window", (int64_t) produced.size());
             int T = S_mtp;
             if (use_mtp && o.spec_min_p > 0.0) {
@@ -16383,7 +16410,7 @@ int main(int argc, char** argv) {
             // The window's rows sit at p .. p + T - 1, and past the context there is no cell to verify them in: near
             // its end the window takes only the rows that fit (the admission checked the prompt and max_new, which a
             // full window can overrun)
-            const int room = (int) std::min<int64_t>(o.spec, o.max_context - p);
+            const int room = (int) std::min<int64_t>(win_cap, o.max_context - p);
             T = std::min(T, room);
             // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
             int chain_n = 0, cm = 0;
@@ -16426,6 +16453,15 @@ int main(int argc, char** argv) {
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
             if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
+                // The graph of a window size is captured the first time it is used, and the draft source took VRAM: when the capture runs
+                // out of memory the window gets one row narrower (the widths below it are already captured) instead of the run failing.
+                if (T > 2 && !first_window && err.find("out of memory") != std::string::npos) {
+                    win_cap = T - 1;
+                    --window_hist[(size_t) T];
+                    std::fprintf(stderr, "strata generate: not enough VRAM left for a %d-token verify window: windows are %d tokens at most from here\n", T, win_cap);
+                    err.clear();
+                    goto retry_round;
+                }
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
