@@ -91,7 +91,8 @@ def mmproj_name(catalog, family: str | None) -> str:
 
 
 def assess(catalog, family: str | None, model: str | None, *, vision: str = "off", model_path: str | None = None,
-           data_dir: str | Path | None = None, config: Path | None = None, desc: dict | None = None, rows: list | None = None) -> ModelState:
+           data_dir: str | Path | None = None, config: Path | None = None, desc: dict | None = None, rows: list | None = None,
+           mtp: str | None = None) -> ModelState:
     """The state of `family model` for these choices. `config` / `desc` are the installed run config and its description (looked up when
     not given)."""
     st = ModelState()
@@ -104,7 +105,7 @@ def assess(catalog, family: str | None, model: str | None, *, vision: str = "off
         first = _first_gguf(Path(model_path))
         beside = discovery.prepared_beside(first) if first else {}
         st.folder = beside.get("data_dir")
-        if beside.get("pack") is not None and beside.get("mtp") is None:
+        if beside.get("pack") is not None and beside.get("mtp") is None and mtp != "off":
             st.parts.append(Part("mtp", "the draft layer", MTP_FETCH_GB))
         if wants_pictures and beside.get("pack") is not None and not beside.get("mmproj"):
             st.parts.append(Part("mmproj", "the picture reader", MMPROJ_GB))
@@ -128,7 +129,7 @@ def assess(catalog, family: str | None, model: str | None, *, vision: str = "off
             st.parts.append(Part("weights", "the model", max(st.total_gb, 0.0)))
             return st
         for m in fp.missing():
-            if m.kind == "mtp":
+            if m.kind == "mtp" and mtp != "off":
                 st.parts.append(Part("mtp", "the draft layer", MTP_FETCH_GB))
             elif m.kind == "mmproj" and wants_pictures:
                 st.parts.append(Part("mmproj", "the picture reader", MMPROJ_GB))

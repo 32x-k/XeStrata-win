@@ -76,12 +76,15 @@ class TestStartFailed(UpdateError):
     BUSY = re.compile(r"timed?[ -]?out|out of memory|\boom\b|not enough (gpu |video |free )?memory|vram|memory allocation|"
                       r"cudaerrormemory|device (is )?(busy|in use)|resource busy|no free (gpu|memory)", re.I)
 
-    def __init__(self, label: str, reason: str):
-        self.busy = bool(self.BUSY.search(reason))
+    def __init__(self, label: str, reason: str, *, busy: bool | None = None, hint: str | None = None):
+        # busy: True/False says outright whether the card or memory was busy (the wait-expired reasons carry the engine's log tail, which
+        # mentions VRAM on every healthy start and must not be read as a busy card, #3683); None reads it from the words of the reason
+        self.busy = bool(self.BUSY.search(reason)) if busy is None else busy
+        if hint is None and self.busy:
+            hint = ("The graphics card or memory looks busy: close programs that use the card (games, video, other models) "
+                    "and run `strata update` again.")
         super().__init__(f"The new engine {label} did not pass its test start ({reason}). It was not installed; "
-                         "your current engine is unchanged."
-                         + (" The graphics card or memory looks busy: close programs that use the card (games, video, other models) "
-                            "and run `strata update` again." if self.busy else ""), 6)
+                         "your current engine is unchanged." + (" " + hint if hint else ""), 6)
         self.label = label
         self.reason = reason
 
@@ -702,6 +705,48 @@ def _warn_if_deep(ctx: Context, folder: Path, longest_inside: int) -> None:
         ctx.say("warn", words, component="engine")
 
 
+def _test_progress(ctx: Context, component: ec.EngineComponent):
+    """What the person sees while the staged engine is test-started: a line when the phase changes and one about every 30 seconds,
+    so a long load or a stuck probe is never a silent wait (#3683: 10 minutes of nothing, then a timeout)."""
+    began = time.monotonic()
+    seen = {"phase": None, "at": 0.0}
+    words = {"loading": "is loading the model",
+             "verifying_generation": "has loaded the model; waiting for it to answer one token",
+             "ready_file_not_matched": "says it is ready; checking that it is the engine Strata started"}
+
+    def progress(status: dict) -> None:
+        phase = status.get("phase") if status.get("state") == "starting" else None
+        if phase not in words:
+            return
+        now = time.monotonic()
+        if phase != seen["phase"] or now - seen["at"] >= 30:
+            seen["phase"], seen["at"] = phase, now
+            ctx.say("test", f"Engine {component.version} {words[phase]} ({int(now - began)} s)", component="engine")
+
+    return progress
+
+
+def _test_start_failure(component: ec.EngineComponent, started: dict, ctx: Context, tail: str) -> TestStartFailed:
+    """The plain reason a test start did not pass, in the words of what the engine was doing when it ran out of time."""
+    error = started.get("error")
+    minutes = max(1, int(min(ctx.test_timeout, 600) // 60))
+    log = updates_dir(ctx.components) / "logs" / f"test-start-{component.version}.log"
+    if error == "startup_wait_expired":
+        phase = started.get("phase")
+        kept = f" The engine's log from this test is in {log}."
+        if phase == "verifying_generation":
+            return TestStartFailed(component.version, f"it loaded the model but did not answer one token within {minutes} minutes",
+                                   busy=False, hint="Nothing was changed. Run `strata update` again; if it happens again, report it with the log." + kept)
+        if phase == "ready_file_not_matched":
+            return TestStartFailed(component.version, f"it reported that it was ready, but Strata could not match it to the engine process it "
+                                   f"started", busy=False,
+                                   hint="This looks like a problem in Strata, not in your engine or card. Nothing was changed; report it with the log." + kept)
+        return TestStartFailed(component.version, f"it was still loading the model after {minutes} minutes", busy=True,
+                               hint="Nothing was changed. A slow disk or a card that other programs are using can do this: close them and run "
+                                    "`strata update` again." + kept)
+    return TestStartFailed(component.version, f"it did not answer a one-token probe ({error or started.get('state')}){tail}")
+
+
 def default_test_start(stage_root: Path, component: ec.EngineComponent, ctx: Context) -> dict:
     """Start the staged engine through the real start path (owner runtime, `component:strata-engine`, a saved model), wait for
     the one-token generation probe, and stop it. Everything runs in an isolated runtime, profile and component folder, so a
@@ -732,15 +777,16 @@ def default_test_start(stage_root: Path, component: ec.EngineComponent, ctx: Con
             profiles.create(name, str(config_path))
             started = None
             try:
-                started = runtime.start(name, wait=min(ctx.test_timeout, 600), shutdown_timeout=20)
+                started = runtime.start(name, wait=min(ctx.test_timeout, 600), shutdown_timeout=20,
+                                        on_status=_test_progress(ctx, component))
                 if started.get("ok") and started.get("state") == "ready" and started.get("generation_ready") is not True:
                     # a server that loads its model on the first request is "ready" without having generated anything:
                     # force the load and the one-token probe, because that is what the new engine has to be able to do
+                    ctx.say("test", f"Engine {component.version} is up; asking it for one token", component="engine")
                     started = {**started, **runtime.verify(name, timeout=min(ctx.test_timeout, 600), load=True)}
                 if not started.get("ok") or started.get("state") != "ready" or started.get("generation_ready") is not True:
-                    raise TestStartFailed(component.version,
-                                          f"it did not answer a one-token probe ({started.get('error') or started.get('state')})"
-                                          + _log_tail(sandbox, component))
+                    _keep_log(sandbox, component, ctx)
+                    raise _test_start_failure(component, started, ctx, _log_tail(sandbox, component))
                 _keep_log(sandbox, component, ctx)
                 return {"mode": "full", "model": cfg.get("model_name") or source.stem, "state": started["state"],
                         "generation_ready": True, "detail": "started, answered a one-token probe, stopped"}

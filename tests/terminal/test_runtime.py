@@ -1195,6 +1195,53 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(profiles.ProfileError, "Everyone"):
                 runtime.runtime_dir()
 
+    def test_ready_pid_may_be_a_child_of_the_launcher_on_windows_only(self):
+        # #3683: a Windows venv's python.exe starts the real interpreter as its child, so the server that writes the ready file
+        # is one process below the pid the host started. It must still match; a stranger or a distant process must not.
+        parents = {200: 100, 300: 200, 400: 300, 500: 400}
+        with mock.patch.object(runtime.procs, "parent_of", side_effect=lambda pid: parents.get(pid)):
+            with mock.patch.object(runtime, "WINDOWS", True):
+                self.assertTrue(runtime._ready_pid_is_child(100, 100))
+                self.assertTrue(runtime._ready_pid_is_child(200, 100))
+                self.assertTrue(runtime._ready_pid_is_child(300, 100))
+                self.assertTrue(runtime._ready_pid_is_child(400, 100))
+                self.assertFalse(runtime._ready_pid_is_child(500, 100))      # too far below
+                self.assertFalse(runtime._ready_pid_is_child(999, 100))      # unrelated
+                self.assertFalse(runtime._ready_pid_is_child(None, 100))
+                self.assertFalse(runtime._ready_pid_is_child("200", 100))
+                self.assertFalse(runtime._ready_pid_is_child(0, 100))
+            with mock.patch.object(runtime, "WINDOWS", False):
+                self.assertTrue(runtime._ready_pid_is_child(100, 100))
+                self.assertFalse(runtime._ready_pid_is_child(200, 100))      # POSIX has no launcher in between
+
+    @unittest.skipUnless(WINDOWS, "the venv launcher is a Windows thing")
+    def test_server_started_through_a_launcher_process_becomes_ready(self):
+        launcher = self.root / "launcher.cmd"
+        launcher.write_bytes(f'@echo off\r\n"{sys.executable}" %*\r\n'.encode())
+        host = runtime.Host("local", shutdown_timeout=2, startup_wait=20)
+        plan, args, source, original = host._plan()
+        with mock.patch.object(sys, "executable", str(launcher)):
+            host._launch(args, source, original, plan["profile_revision"])
+        try:
+            result = host._wait_ready(30)
+            self.assertTrue(result["ok"], result)
+            self.assertTrue(result["generation_ready"])
+            ready = json.loads(host.ready_path.read_text(encoding="utf-8"))
+            self.assertNotEqual(ready["pid"], host.child.pid)               # the server is below the launcher
+        finally:
+            host._stop_child()
+
+    def test_a_ready_file_that_is_not_ours_is_named_in_the_status_phase(self):
+        host = runtime.Host("local", shutdown_timeout=2, startup_wait=10)
+        host.child = mock.Mock(pid=111)
+        host.child.poll.return_value = None
+        host.ready_path = self.root / "ready.json"
+        host.ready_path.write_text(json.dumps({"pid": 222, "instance_id": "a" * 32}), encoding="utf-8")
+        with mock.patch.object(runtime.procs, "parent_of", return_value=None):
+            self.assertEqual(host._status()["phase"], "ready_file_not_matched")
+        host.ready_path.unlink()
+        self.assertEqual(host._status()["phase"], "loading")
+
     def test_exclusive_lease_waits_for_shared_holders_and_shared_holders_coexist(self):
         first = runtime.acquire_activity_lease(shared=True)
         second = runtime.acquire_activity_lease(shared=True)

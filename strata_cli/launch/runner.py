@@ -34,12 +34,75 @@ ROOT = Path(__file__).resolve().parents[2]
 WINDOWS = os.name == "nt"
 
 
+def install_isolation_words(catalog, data_dir: str | os.PathLike | None = None) -> list[str]:
+    """Round 8, N5: a clean test (a scratch data folder) silently ran an OLDER install found elsewhere (its run config and engine 0.1.41).
+    When a data folder was chosen (--data-dir, or STRATA_DATA_DIR from the installer) and the install in use is outside it, say which one is used
+    and why. Nothing is moved or switched."""
+    chosen = data_dir or os.environ.get("STRATA_DATA_DIR")
+    places = getattr(catalog, "places", None) or []
+    if not chosen or not places or places[0].source == "explicit":
+        return []
+    main = Path(places[0].path)
+    try:
+        inside = os.path.commonpath([os.path.abspath(main), os.path.abspath(chosen)]) == os.path.abspath(chosen)
+    except ValueError:
+        inside = False
+    if inside:
+        return []
+    return [f"Strata is using the earlier install in {main} ({places[0].configs} saved model setting(s) and its engine settings), not a clean one in "
+            f"{chosen}: the data folder only says where model files are kept. To test from scratch, use a new user account or remove the earlier install first."]
+
+
+#: the first engine whose Metal build reads Gyro files (round 8, M: 0.1.45.3 was reused and failed on missing TQK6/TQK7 kernels)
+GYRO_METAL_ENGINE = (0, 1, 47)
+
+
+def version_tuple(version: str | None) -> tuple[int, ...]:
+    """'0.1.45.3' -> (0, 1, 45, 3); () when it is not a dotted run of numbers (a source build says so itself)."""
+    m = re.match(r"\d+(?:\.\d+)*", str(version or "").strip())
+    return tuple(int(x) for x in m.group(0).split(".")) if m else ()
+
+
+def python_failure(lines: list[str]) -> str | None:
+    """The last line of a Python traceback in setup.py's output (ModuleNotFoundError: No module named 'calibrate'), or None when the
+    output holds no traceback. Frames are skipped; the exception line is the first unindented line after the last 'Traceback'."""
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].startswith("Traceback (most recent call last)"):
+            for line in lines[i + 1:]:
+                if line.strip() and not line[:1].isspace():
+                    return line.strip()[:300]
+            return None
+    return None
+
+
+def missing_file(failure: str) -> bool:
+    """An import or file error: the install itself is short of a file, which an update of Strata brings back."""
+    return failure.startswith(("ModuleNotFoundError", "ImportError", "FileNotFoundError"))
+
+
 class LaunchError(RuntimeError):
     """A step could not be done. `text` says what it means; `next` says what to do."""
 
     def __init__(self, text: str, next: str = "", code: int = 6):
         super().__init__((text + " " + next).strip())
         self.text, self.next, self.code = text, next, code
+
+
+def setup_failure(lines: list[str], err: str, hint: str, details: str | None, own_files: bool) -> LaunchError:
+    """The error for a setup.py run that exited non-zero. setup.py's own `[X]` line (err) is the message when there is one; when it
+    stopped with a Python error instead, that error's last line is (#3613, #3467: a file missing from the Terminal's tools/ ended every
+    launch after a tune with only "The model could not be installed"). `details` is the file that holds the rest of its output."""
+    crashed = python_failure(lines) if not err else None
+    if crashed:
+        where = f" The whole setup output is in {details}." if details else ""
+        if missing_file(crashed):
+            return LaunchError(f"The model could not be installed. A file that setup needs is missing from this Strata install ({crashed}).",
+                               "Update Strata (`strata update`) and run it again." + where, 6)
+        return LaunchError(f"The model could not be installed. Setup stopped with an error ({crashed}).", "Run it again." + where, 6)
+    return LaunchError("The model could not be installed." + (f" {err}." if err else ""),
+                       (hint or ("Run it again: finished steps are skipped." if own_files else
+                                 "Run it again: finished steps are skipped and a download continues where it stopped."))
+                       + (f" Details: {details}" if details else ""), 6)
 
 
 class Cancelled(LaunchError):
@@ -384,6 +447,7 @@ class Runner:
         self.hardware_override = hardware
         self.children: list[subprocess.Popen] = []
         self.notices: list[str] = []
+        self.identity_notes: list[str] = []
         self.tune_result: dict | None = None
         self.config_path: Path | None = None
         self._own_checked = False
@@ -449,12 +513,18 @@ class Runner:
         from strata_control import engine_component as ec
         root = Path(self.components_dir) if self.components_dir else None
         report = ec.status(root)
+        stale = None
         if report.get("usable"):
             eng = report["engine"]
-            self.emit("engine", f"Engine {eng['version']} ({eng['backend']}) is installed.", 100)
-            return
+            stale = self.stale_engine(eng.get("version"))
+            if not stale:
+                self.emit("engine", f"Engine {eng['version']} ({eng['backend']}) is installed.", 100)
+                return
         feed = self.feed or os.environ.get("STRATA_UPDATE_FEED")
-        self.emit("engine", "No engine is installed yet. Getting the one for your graphics card…", 0)
+        if stale:
+            self.emit("engine", stale + " Looking for a newer one…", 0, level="warn")
+        else:
+            self.emit("engine", "No engine is installed yet. Getting the one for your graphics card…", 0)
         argv = self._cli("update", "--no-control", "--output", "jsonl")
         if feed:
             argv += ["--feed", feed]
@@ -486,6 +556,19 @@ class Runner:
                     self.emit("engine", str(ev.get("message") or ""))
             last = ev
         code = p.wait()
+        if stale:
+            # an engine is there and was too old: warn, never refuse (round 8, M: 0.1.45.3 was reused although 0.1.47 existed, and Gyro-S failed
+            # on kernels only the newer engine has). Whatever the update did, say where it stands.
+            after = ec.status(root)
+            now = (after.get("engine") or {}).get("version") if after.get("usable") else None
+            still = self.stale_engine(now) if now else stale
+            if still:
+                self.notices.append(still + " Run `strata update`, then start it again.")
+                self.emit("engine", still + (" The update did not bring a newer one." if code == 0 else " The update did not finish.") +
+                          " Run `strata update`, then start it again.", 100, level="warn")
+            else:
+                self.emit("engine", f"Engine {now} is installed.", 100)
+            return
         if code == 0:
             # `strata update` exits 0 when the feed simply has no engine for this PC (or only one for another card family). That is not an
             # engine: refuse here, before the model (tens of GB) is touched.
@@ -506,6 +589,27 @@ class Runner:
             raise LaunchError("The engine could not be installed." + (f" {why}" if why else ""),
                               "Check your internet connection, or point Strata at an update source with --feed, then try again.", 6)
         self.emit("engine", "The engine is installed.", 100)
+
+    def needed_engine(self) -> tuple[int, ...] | None:
+        """The oldest engine this model runs on, from setup.py's own tables (MIN_ENGINE for everything, GYRO_ENGINE for Gyro), or None."""
+        try:
+            mod = self.catalog.strata.setup_module()
+            need = tuple(getattr(mod, "MIN_ENGINE", ()) or ())
+            if self.s.family == "gyro":
+                need = max(need, tuple(getattr(mod, "GYRO_ENGINE", ()) or ()))
+                if sys.platform == "darwin":
+                    need = max(need, GYRO_METAL_ENGINE)      # the Metal Gyro kernels (TQK6/TQK7/TQ2_T) first shipped in 0.1.47; CUDA, HIP, SYCL had them earlier
+            return need or None
+        except Exception:                                    # noqa: BLE001 - no table, no check
+            return None
+
+    def stale_engine(self, version: str | None) -> str | None:
+        """A plain sentence when the installed engine is older than the model needs, else None."""
+        have = version_tuple(version)
+        need = self.needed_engine()
+        if not have or not need or have >= need:
+            return None
+        return f"The engine installed here ({version}) is older than this model needs ({'.'.join(map(str, need))} or newer)."
 
     def no_engine(self, reason: str) -> None:
         """There is no engine for this computer and none to get. This is a warning, not a refusal: the model may still be downloaded, because
@@ -593,6 +697,8 @@ class Runner:
             args += ["--kv", s.kv]
         if fam in ("qwen", "coder"):
             args += ["--experimental-speed-projection", "off"]
+        if s.mtp in ("on", "off") and fam in ("qwen", "swift", "coder", "unsloth"):
+            args += ["--mtp", s.mtp]                      # round 8, N3: "--mtp off" never reached setup, which then fetched the 5.2 GB draft layer
         data = s.data_dir or self.existing_data_dir()
         if data:
             args += ["--data-dir", str(data)]
@@ -607,6 +713,8 @@ class Runner:
             args += ["--gpu-roles", ",".join(f"{k}={v}" for k, v in sorted(s.gpu_roles.items(), key=lambda kv: int(kv[0])))]
         elif s.gpus:
             args += ["--gpus", ",".join(str(g) for g in s.gpus)] if len(s.gpus) > 1 else ["--gpu", str(s.gpus[0])]
+        else:
+            args += self.installed_card_args()
         if sys.platform == "darwin":
             # a Mac's setup (Control mode, strata_control/mac_fit.py) takes fewer options (no --kv, --gpu, speed projection)
             keep = {"--yes", "--no-start", "--family", "--model", "--context", "--vision", "--data-dir", "--gguf-dir", "--move-data",
@@ -623,6 +731,25 @@ class Runner:
                     i += 2 if i + 1 < len(args) and not args[i + 1].startswith("--") else 1
             args = out
         return args
+
+    def installed_card_args(self) -> list[str]:
+        """--gpu-roles / --gpus of the installed config when the launch names no cards itself. A change of context or pictures runs setup again;
+        without these it picked the cards and the Main/Helper roles afresh and reset an explicit choice (round 8, F3: 0=main,1=helper
+        came back as 0=helper,1=main). Only a choice that was made ("gpus_asked" / roles) is forwarded, never the automatic pick."""
+        try:
+            path, _desc = self.installed_state()
+            base = read_config(path) if path is not None else None
+            if not isinstance(base, dict):
+                return []
+            roles = base.get("gpu_roles")
+            if isinstance(roles, dict) and roles:
+                return ["--gpu-roles", ",".join(f"{k}={v}" for k, v in sorted(roles.items(), key=lambda kv: int(kv[0])))]
+            cards = installed_cards(base)
+            if cards:
+                return ["--gpus", ",".join(str(g) for g in cards)] if len(cards) > 1 else ["--gpu", str(cards[0])]
+        except Exception:                                    # noqa: BLE001 - never block a launch over remembering the cards
+            pass
+        return []
 
     def installed_state(self) -> tuple[Path | None, dict | None]:
         tag = self.catalog.tag_of(self.s.family, self.s.model)
@@ -664,7 +791,7 @@ class Runner:
         if s.family and s.model and not s.model_path:
             path, desc = self.installed_state()
         return modelstate.assess(self.catalog, s.family, s.model, vision=s.vision, model_path=s.model_path, data_dir=s.data_dir,
-                                 config=path, desc=desc)
+                                 config=path, desc=desc, mtp=s.mtp)
 
     def download_gb(self) -> float:
         """How much would be downloaded for this launch right now: 0 when everything is on disk (the model is installed with these choices
@@ -810,9 +937,7 @@ class Runner:
             adopted = self.adopt_prepared_files(err)
             if adopted is not None:
                 return adopted
-            raise LaunchError("The model could not be installed." + (f" {err}." if err else ""),
-                              hint or ("Run it again: finished steps are skipped." if s.model_path else
-                                       "Run it again: finished steps are skipped and a download continues where it stopped."), 6)
+            raise setup_failure(lines, err, hint, self.keep_setup_output(lines), bool(s.model_path))
         path, _desc = self.installed_state()
         if path is None:
             raise LaunchError("Setup finished but no run config was written for this model.",
@@ -820,6 +945,18 @@ class Runner:
         self.emit("model", f"{title} is ready.", 100)
         self.check_pictures(path)
         return path
+
+    def keep_setup_output(self, lines: list[str]) -> str | None:
+        """The last lines setup.py printed, kept next to the launch's other logs so a failed install can be read afterwards (the message
+        shows one line; a traceback needs the rest). Best effort: None when it cannot be written."""
+        try:
+            folder = launch_dir()
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f"{self.name}.setup.log"
+            path.write_text("\n".join(lines[-400:]) + "\n", encoding="utf-8", errors="replace")
+            return str(path)
+        except (OSError, ValueError):
+            return None
 
     def adopt_prepared_files(self, setup_error: str) -> Path | None:
         """The installer cannot set this graphics card up (Intel Arc, for one): if the model's files and prepared pack are already on disk,
@@ -843,7 +980,7 @@ class Runner:
         cfg, problems = adopt.plan(family=s.family, model=s.model, model_dir=model_dir, data_dir=data_dir, src=cat.src,
                                    context=s.context or 32768, kv=s.kv, model_name=f"{fam.get('name', s.family)}-{s.model.lower()}", family_def=fam,
                                    log=cat.root / f"strata-{tag}.log", backend=backend,
-                                   vram_gb=float(cat.computer().main_vram_gb or 0), notes=self.notices)
+                                   vram_gb=float(cat.computer().main_vram_gb or 0), notes=self.notices, pack_name=tag.lower())
         if cfg is None:
             raise LaunchError("The installer cannot set up this graphics card yet, and the files Strata would need to write the settings itself are not all there: "
                               + "; ".join(problems) + ".",
@@ -879,6 +1016,14 @@ class Runner:
                 return
             raise LaunchError(f"These model files cannot be used: {e}.", "Pick the folder with every shard of one model, or a .gguf file of it.", 5) from None
         if given:
+            sel = plan.get("candidate_selection") or {}
+            if sel.get("family") and sel.get("model") and (sel["family"], sel["model"]) != (s.family, s.model):
+                # round 8, N8: --family swift was accepted for an IQ3_XXS file. The files are not refused (setup takes the named model's files
+                # out of the folder by name), but the person is told what the file header says.
+                words = (f"These files look like {sel['family']} {sel['model']} (by the file headers), not {s.family} {s.model}. "
+                         f"Setup will look for {s.family} {s.model} files in that folder and may stop; to use these files, leave out --family and --model.")
+                self.identity_notes.append(words)
+                self.notices.append(words)
             hold = [h for h in plan.get("folder_holds") or [] if (h.get("family"), h.get("model")) == (s.family, s.model)]
             if len(hold) == 1 and hold[0].get("folder"):
                 s.model_path = hold[0]["folder"]
@@ -1057,8 +1202,8 @@ class Runner:
             raise LaunchError(f"The server could not start: {box['e']}", _log_hint(self.config_path), 6)
         r = box["r"]
         if not r.get("ok"):
-            raise LaunchError(f"The server did not become ready ({r.get('state')}: {r.get('error') or r.get('message') or 'see the engine log'}).",
-                              _log_hint(self.config_path), 6)
+            text, nxt = explain_engine_exit(r, self.config_path)
+            raise LaunchError(text, nxt, 6)
         self.emit("start", "The model is loaded and answering.", 100)
 
     # ---- 6. access
@@ -1108,11 +1253,20 @@ class Runner:
                 data = Path(st.folder) if st.folder else (Path(s.data_dir) if s.data_dir else (self.existing_data_dir() or self.catalog.data_dir()))
                 if s.mtp != "off" and "mtp" not in have and not (data / "mtp" / "rt" / "experts.bin").is_file():
                     parts.append({"kind": "mtp", "label": "the draft layer", "gb": MTP_FETCH_GB})
-                has_reader = list((data / "models").glob("mmproj*.gguf")) or list((data / "Models").glob("mmproj*.gguf"))
+                places = [data / "models", data / "Models"]
+                if s.model_path:                             # setup uses a reader that sits with the person's own files (setup.py --gguf-dir)
+                    own = Path(s.model_path)
+                    places += [own if own.is_dir() else own.parent, (own if own.is_dir() else own.parent).parent]
+                has_reader = any(list(d.glob("mmproj*.gguf")) for d in places if d.is_dir())
                 if wants_pictures and "mmproj" not in have and not has_reader:
                     parts.append({"kind": "mmproj", "label": "the picture reader", "gb": MMPROJ_GB})
             except OSError:
                 pass
+        gap = self.ready_pack_gap() if st.own_files else None
+        if gap:
+            # a ready-made pack (NVFP4) is taken from setup's own models folder, not from where the person's files are (round 8, N2: the plan
+            # said "nothing to download" and setup then asked for 129 GB): count what setup will fetch
+            parts = [p for p in parts if p["kind"] != "weights"] + [{"kind": "weights", "label": "the ready-made pack", "gb": gap["gb"]}]
         gb = round(sum(p["gb"] for p in parts), 1)
         engine = True
         try:
@@ -1130,14 +1284,64 @@ class Runner:
                 text += f" {st.on_disk_gb:.0f} GB of the model is already in its folder."
             if st.own_files:
                 text += " Your model files are used where they are."
+            if gap:
+                text += (f" This is a ready-made pack, and setup takes it from its own folder ({gap['folder']}), not from where your files are. "
+                         "Copy or link your pack there to use it as it is" +
+                         (f"; only {gap['free_gb']:.0f} GB are free on that drive, so choose a bigger drive with --data-dir" if gap.get("free_gb") is not None and gap["free_gb"] < gap["gb"] else "") + ".")
+            if any(p["kind"] == "mmproj" for p in parts):
+                text += " To skip the picture reader (the model then answers text only), add --vision off; or put its mmproj file next to your model files."
+            if any(p["kind"] == "mtp" for p in parts):
+                text += " To skip the draft layer (a little slower, less memory), add --mtp off."
         if not engine:
             text += " The engine for your graphics card is downloaded first (from the update source; its size is shown when it starts)."
         return {"gb": gb, "parts": parts, "engine_missing": not engine, "own_files": st.own_files, "text": text}
+
+    def ready_pack_gap(self) -> dict | None:
+        """For a ready-made pack family (NVFP4): what setup would still fetch into its models folder for these choices, {gb, folder, free_gb}, or None."""
+        s = self.s
+        try:
+            mod = self.catalog.strata.setup_module()
+            _m, families, _c, _src = self.catalog.tables()
+            if mod is None or not (families.get(s.family or "") or {}).get("ready") or not hasattr(mod, "ready_needed"):
+                return None
+            data = Path(s.data_dir) if s.data_dir else (self.existing_data_dir() or self.catalog.data_dir())
+            models_dir = data / "models"
+            need = 0
+            for f in mod.ready_needed(s.model, models_dir):
+                if not mod.ready_verified(mod.ready_where(models_dir, f), f[5]):
+                    need += int(f[4])
+            if need <= 0:
+                return None
+            probe = next((q for q in (models_dir, *models_dir.parents) if q.exists()), None)
+            free = self.catalog.disk_free(probe) if probe is not None else None
+            return {"gb": round(need / 1e9, 1), "folder": str(models_dir), "free_gb": free}
+        except Exception:                                    # noqa: BLE001 - a plan that cannot work this out still shows the rest
+            return None
+
+    def preflight_words(self) -> list[str]:
+        """Plain warnings for `--plan` that the run itself would meet: an engine older than the model needs, an earlier install taking the
+        place of a clean one, files that are not the model that was named. Nothing is changed."""
+        out: list[str] = list(self.identity_notes)
+        try:
+            from strata_control import engine_component as ec
+            report = ec.status(Path(self.components_dir) if self.components_dir else None)
+            if report.get("usable"):
+                stale = self.stale_engine(report["engine"].get("version"))
+                if stale:
+                    out.append(stale + " Starting will look for a newer one first; `strata update` does the same.")
+        except Exception:                                    # noqa: BLE001
+            pass
+        try:
+            out += install_isolation_words(self.catalog, self.s.data_dir)
+        except Exception:                                    # noqa: BLE001
+            pass
+        return out
 
     def plan(self) -> dict:
         s = self.s
         self.check_own_files()
         warns = [n.line() for n in (*S.check_access(s),)]
+        warns += self.preflight_words()
         row = self.row()
         try:
             self.resolved_vision()
@@ -1202,6 +1406,65 @@ def _read_json(path: Path) -> dict | None:
         return json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+
+
+#: lines of an engine log that say why it stopped (the last one wins), and a plain next step for the causes we know. Recommend, never force.
+CAUSE_LINE = re.compile(r"error|exception|failed|cannot|can't|could not|no device|not found|out of memory|unsupported|abort|invalid|missing|"
+                        r"no kernel|illegal|denied|refus", re.I)
+KNOWN_CAUSES = (
+    (re.compile(r"no device of requested type|device not found|no (gpu|sycl|level.zero) device|permission denied.*(dri|render)", re.I),
+     "The engine could not open the graphics card. On Linux the account must be allowed to use it: add it to the render group "
+     "(`sudo usermod -aG render $USER`), log in again and start it again."),
+    (re.compile(r"out of memory|not enough (gpu |video |free )?memory|cudaerrormemory|allocation failed", re.I),
+     "The card or memory ran out. Close other programs that use the card, or choose a smaller context (`--context 16k`) and start again."),
+    (re.compile(r"tqk\d|no kernel|unsupported (quant|type|model)|unknown (quant|tensor) type", re.I),
+     "This engine is too old for this model. Update it with `strata update` and start again."),
+    (re.compile(r"dll|libcu|cannot open shared object|0xc0000135", re.I),
+     "A library the engine needs is missing. Update the engine (`strata update`) or install the graphics driver again."),
+)
+
+
+def engine_log_tail(config: Path | None, limit: int = 65536) -> tuple[list[str], str | None]:
+    """(last lines of the engine log, its path); ([], path-or-None) when it cannot be read."""
+    log = None
+    if config:
+        try:
+            log = read_config(config).get("log")
+        except (OSError, ValueError):
+            log = None
+    if not log:
+        return [], None
+    try:
+        with open(log, "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - limit))
+            data = stream.read().decode("utf-8", "replace")
+    except OSError:
+        return [], str(log)
+    return [x.rstrip() for x in data.splitlines() if x.strip()], str(log)
+
+
+def explain_engine_exit(result: dict, config: Path | None) -> tuple[str, str]:
+    """(text, next) for a start that did not reach ready: the stage, the cause line from the engine log, the next step and the log path
+    (round 8, L3: an Arc engine died with 'No device of requested type available' and the person saw only 'server_exited')."""
+    lines, log = engine_log_tail(config)
+    lines = lines or [x.strip() for x in str(result.get("log_tail") or "").split(" | ") if x.strip()]
+    cause = next((x for x in reversed(lines) if CAUSE_LINE.search(x) and not x.lstrip().startswith(("strata generate: ", "strata serve: expert"))), None)
+    cause = (cause or (lines[-1] if lines else "")).strip()
+    cause = re.sub(r"^(\[strata\]\s*)?(\d{4}-\d\d-\d\d[ T][\d:.]+\s*)?", "", cause)[:240]
+    state, why = result.get("state"), result.get("error") or result.get("message")
+    if why == "startup_wait_expired":
+        stage = "The model did not finish loading in time"
+    elif why == "server_exited" or result.get("engine_exit_code") is not None:
+        code = result.get("engine_exit_code")
+        stage = "The engine stopped while it was loading the model" + (f" (exit code {code})" if code not in (None, 0) else "")
+    else:
+        stage = f"The server did not become ready ({state}: {why or 'see the engine log'})"
+    text = stage + (f": {cause}" if cause else ".")
+    if not text.endswith((".", "!")):
+        text += "."
+    step = next((words for pattern, words in KNOWN_CAUSES if pattern.search(" ".join([cause, str(why or "")]))), "Run it again; if it repeats, report the log.")
+    return text, step + (f" The engine's log: {log}" if log else " The engine's log has the reason (strata logs, or the log named in the run config).")
 
 
 def _log_hint(config: Path | None) -> str:

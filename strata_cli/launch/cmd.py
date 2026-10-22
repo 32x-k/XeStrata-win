@@ -465,7 +465,15 @@ def _move_data_choice(a: argparse.Namespace, s: S.LaunchSettings, catalog, machi
         gb = library.movable_library(catalog.data_dir(), Path(a.data_dir).expanduser())
     except Exception:                                        # noqa: BLE001 - no answer to "where are my models": nothing to ask about
         return False
-    return library.ask_move(gb, Path(a.data_dir).expanduser()) if gb > 0 else False
+    if gb <= 0:
+        return False
+    new = Path(a.data_dir).expanduser()
+    if getattr(a, "no_tui", False) or not sys.stdin.isatty():
+        # --no-tui and a run without a keyboard never ask (round 8, M): the default that loses nothing, said out loud
+        size = f"{gb:.0f} GB" if gb >= 10 else f"{gb:.1f} GB"
+        _say(f"Keeping your {size} of models where they are; {new} is used for new downloads. (--move-data moves them instead.)")
+        return False
+    return library.ask_move(gb, new)
 
 
 def open_page(url: str) -> bool:
@@ -615,8 +623,8 @@ def run_launch(a: argparse.Namespace) -> int:
         interactive = sys.stdin.isatty() and sys.stdout.isatty() and not a.no_tui and not machine and not a.plan
         plain_questions = False
         if not have_choices and not interactive and not a.plan:
-            if machine or catalog is None or not _can_ask():
-                return fail("`strata launch` with no choices opens screens, and this is not a terminal. Name what to start: --preset NAME, or --model NAME "
+            if machine or a.no_tui or catalog is None or not _can_ask():     # --no-tui never asks (round 8, M)
+                return fail("`strata launch` with no choices opens screens, and this is not a terminal (or --no-tui was given). Name what to start: --preset NAME, or --model NAME "
                             "(strata launch --help has examples; --plan shows what would happen without changing anything).", 2)
             # Git Bash, mintty and some editor panels cannot show the screens although a person is typing: go on in plain lines, and ask first
             plain_questions = True

@@ -468,6 +468,30 @@ def _engine_preflight(plan: dict) -> None:
         raise ProfileError(str(exc), exc.exit_code) from None
 
 
+def _ready_pid_is_child(ready_pid, child_pid: int) -> bool:
+    """Is the process named in the ready file the one this host started?
+
+    Normally the pids are equal. A Windows venv (the python.exe of a source checkout's .venv) starts its real interpreter as a
+    CHILD of the launcher it was given, so the server that writes the ready file is one process below the pid ``Popen`` returned
+    (#3683: the staged engine was ready, this check never matched, and the start waited out its whole deadline). Only on Windows,
+    and only for a process that sits within three parents of the process this host started, so another process cannot pass."""
+    if type(ready_pid) is not int or ready_pid <= 0:
+        return False
+    if ready_pid == child_pid:
+        return True
+    if not WINDOWS:
+        return False
+    current = ready_pid
+    for _ in range(3):
+        parent = procs.parent_of(current)
+        if parent is None or parent <= 0:
+            return False
+        if parent == child_pid:
+            return True
+        current = parent
+    return False
+
+
 def _check_start_candidate(name: str, expected_profile_revision: str | None,
                            expected_source_sha256: str | None) -> tuple[dict, str]:
     plan, digest = _start_candidate(name)
@@ -481,8 +505,12 @@ def _check_start_candidate(name: str, expected_profile_revision: str | None,
 def start(name: str, *, wait: float = 300, shutdown_timeout: float = 30,
           expected_profile_revision: str | None = None,
           expected_source_sha256: str | None = None,
-          die_with_pid: int | None = None) -> dict:
+          die_with_pid: int | None = None, on_status=None) -> dict:
     """Start the saved profile under a new owner host.
+
+    ``on_status`` (optional) is called with each status answer while the start waits (about every 0.2 s; the caller throttles), so a
+    caller can show progress. The result of a wait that ran out names the last phase (``loading``, ``verifying_generation``,
+    ``ready_file_not_matched``).
 
     The owner host is a background service: it is not tied to the terminal or the process that ran this command and
     keeps serving after they end. It stops on `runtime stop`, when its server ends, or - only if `die_with_pid`
@@ -542,14 +570,20 @@ def start(name: str, *, wait: float = 300, shutdown_timeout: float = 30,
     if wait == 0:
         return {"ok": True, "profile": name, "state": "starting", "plan": plan}
     deadline = time.monotonic() + wait
+    result: dict = {}
     while time.monotonic() < deadline:
         result = _rpc(name, "status")
+        if on_status is not None:
+            try:
+                on_status(result)
+            except Exception:                                   # noqa: BLE001 - progress must never break a start
+                on_status = None
         if result.get("state") in ("ready", "failed"):
             return {**result, "ok": result["state"] == "ready",
                     "exit_code": 6 if result["state"] == "failed" else 0}
         time.sleep(0.2)
     return {"ok": False, "profile": name, "state": "starting", "error": "startup_wait_expired",
-            "exit_code": 8}
+            "phase": result.get("phase"), "exit_code": 8}
 
 
 def plan_stop(name: str) -> dict:
@@ -901,7 +935,7 @@ class Host:
         if self.ready_path is not None:
             try:
                 ready = json.loads(self.ready_path.read_text(encoding="utf-8"))
-                if ready.get("pid") == child.pid and isinstance(ready.get("instance_id"), str):
+                if _ready_pid_is_child(ready.get("pid"), child.pid) and isinstance(ready.get("instance_id"), str):
                     key = (child.pid, ready["instance_id"])
                     if self.probe_key != key:
                         self.probe_key, self.probe_result = key, None
@@ -920,9 +954,13 @@ class Host:
                     return {**base, "state": "ready", "instance_id": ready["instance_id"],
                             "model_state": ready.get("model_state"),
                             **self.probe_result}
+                if isinstance(ready, dict):
+                    # the server published its ready file but it is not the process this host started: say so, so a wait that
+                    # ends can name it (before #3683 this looked exactly like a model that was still loading)
+                    return {**base, "state": "starting", "phase": "ready_file_not_matched"}
             except (OSError, ValueError):
                 pass
-        return {**base, "state": "starting"}
+        return {**base, "state": "starting", "phase": "loading"}
 
     def _wait_ready(self, timeout: float) -> dict:
         deadline = time.monotonic() + timeout
@@ -1139,7 +1177,7 @@ class Host:
                 return {"ok": False, "state": current["state"], "error": "runtime_not_ready", "exit_code": 6}
             try:
                 ready = json.loads(self.ready_path.read_text(encoding="utf-8"))
-                if ready.get("pid") != self.child.pid or ready.get("instance_id") != current["instance_id"]:
+                if not _ready_pid_is_child(ready.get("pid"), self.child.pid) or ready.get("instance_id") != current["instance_id"]:
                     raise readiness.ReadinessError("probe_instance_mismatch")
                 host = self.args[self.args.index("--host") + 1]
                 result = readiness.verify(ready, self.source_bytes, expected_host=host,

@@ -139,6 +139,13 @@ def _print_check(report: dict) -> None:
             "current": f"{installed} is up to date", "none-for-this-pc": eng.get("note") or "the feed has no engine for this PC",
             "not-in-feed": "the feed lists no engines"}.get(eng["status"], eng.get("note") or eng["status"])
     print(f"  Engine   {text}")
+    pick = eng.get("offered")
+    if pick and eng["status"] in ("available", "install", "current"):
+        # round 8, N9: the list below names only the packages that were NOT chosen; say which one was
+        label = pick.get("label") or (f"{pick.get('version')} {pick.get('platform')}-{pick.get('backend')}" + (f"-{pick['variant']}" if pick.get("variant") else ""))
+        print(f"           selected for this PC: {label}")
+    if eng.get("reasons"):
+        print("           not used for this PC:")
     for reason in eng.get("reasons") or []:
         print(f"           - {reason}")
     if eng.get("note") and eng["status"] not in ("failed-before", "skipped", "current"):
