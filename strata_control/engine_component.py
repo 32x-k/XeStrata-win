@@ -471,15 +471,15 @@ def detect_backend(environ=None) -> tuple[str | None, str]:
     return None, "no GPU tool answered"
 
 
-def _drm_vendor_backend() -> str | None:
+def _drm_vendor_backend(root: str = "/sys/class/drm") -> str | None:
     """Linux without the vendor tools on PATH (a HIP box that runs ROCm from Python wheels has no rocminfo): the PCI
     vendor of the display adapters decides. NVIDIA 0x10de -> cuda, AMD 0x1002 -> hip, Intel 0x8086 -> sycl, in that
     order. Read-only sysfs, nothing is run."""
-    if not os.path.isdir("/sys/class/drm"):
+    if not os.path.isdir(root):
         return None
     vendors = set()
     try:
-        for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
+        for card in sorted(Path(root).glob("card[0-9]*")):
             if "-" in card.name:
                 continue
             try:
