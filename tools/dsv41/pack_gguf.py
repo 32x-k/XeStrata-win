@@ -335,6 +335,10 @@ def main() -> int:
                                          "listed there are read from it as trellis types (TQK5X ..), the others keep their MXFP4")
     ap.add_argument("--dense-override", help="a folder dense_requant.py wrote (dense.json + dense.bin): its tensors replace the same-named "
                                              "dense matrices of the GGUF (K-quants of the attention / shared experts)")
+    ap.add_argument("--override-experts", help="a second requantized GGUF folder (requant_gguf.py output): its routed experts replace the main "
+                                               "model's for --override-roles (gate,up,down) in --override-layers (default all): mixed-bit packs")
+    ap.add_argument("--override-roles", default="down")
+    ap.add_argument("--override-layers", default="")
     ap.add_argument("--tq-layers", help="only these layers (comma list) of the --tq-experts folders")
     ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's; default <model>/../dspark/dspark.json)")
     ap.add_argument("--engram", help="the folder of the Engram tables' GGUF set, for a quant that leaves them out "
@@ -444,6 +448,47 @@ def main() -> int:
     files = names
     if eg_from:
         print("Engram tables from %s (%d shards)" % (eg_dir, len(eg_from)))
+    # experts of a second requantized model replace the main one's for some roles / layers (the byte layouts are per tensor: any mix of types)
+    n_ov = 0
+    if a.override_experts:
+        od = pathlib.Path(a.override_experts).expanduser().resolve()
+        roles_ov = {"gate": "w1", "up": "w3", "down": "w2"}
+        want = {roles_ov[r] for r in a.override_roles.split(",")}
+        lay_ov = None
+        if a.override_layers:
+            lay_ov = set()
+            for part in a.override_layers.split(","):
+                lo, _, hi = part.partition("-")
+                lay_ov.update(range(int(lo), int(hi or lo) + 1))
+        ogs = [Gguf(pth) for pth in sorted(od.glob("*.gguf"))]
+        new = []
+        for og in ogs:
+            try:
+                orel = os.path.relpath(og.path, model).replace(os.sep, "/")
+            except ValueError:
+                raise SystemExit("%s must be on the model's drive" % od)
+            files.append(orel)
+            ofi = len(files) - 1
+            for name, typ, dims, off in og.tensors:
+                m = re.match(r"blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$", name)
+                if not m or typ not in TYPES:
+                    continue
+                il, role = int(m.group(1)), {"gate": "w1", "up": "w3", "down": "w2"}[m.group(2)]
+                if role not in want or (lay_ov is not None and il not in lay_ov):
+                    continue
+                tname, per, bpb = TYPES[typ]
+                nel = 1
+                for d in dims:
+                    nel *= d
+                nbytes = nel // per * bpb
+                shape = list(reversed(dims))
+                n, part = shape[0], nbytes // shape[0]
+                for i in range(n):
+                    new.append(("layers.%d.ffn.experts.%d.%s.weight" % (il, i, role), tname, ofi, og.data_start + off + i * part, part, shape[1:]))
+        names_new = {t[0] for t in new}
+        tensors[:] = [t for t in tensors if t[0] not in names_new] + new
+        n_ov = len(new)
+        print("experts overridden from %s: %d tensors (roles %s, layers %s)" % (od, n_ov, a.override_roles, a.override_layers or "all"))
     # dense matrices requantized by dense_requant.py replace the GGUF's BF16 ones
     n_dense = 0
     if a.dense_override:
@@ -679,7 +724,7 @@ def main() -> int:
     by = {}
     for t in tensors:
         by[t[1]] = by.get(t[1], 0) + t[4]
-    extras = [w for w, there in (("the DSpark drafter", drafter_in or dspark_gguf), ("the vision tower", bool(vision)), ("trellis experts in layers %s" % tq_layers, bool(tq_layers)), ("%d dense matrices requantized" % n_dense, bool(n_dense))) if there]
+    extras = [w for w, there in (("the DSpark drafter", drafter_in or dspark_gguf), ("the vision tower", bool(vision)), ("trellis experts in layers %s" % tq_layers, bool(tq_layers)), ("%d dense matrices requantized" % n_dense, bool(n_dense)), ("%d experts from %s" % (n_ov, a.override_experts), bool(n_ov))) if there]
     print("%s: %d tensors in %d files (%s), Engram %d layers x %d hash columns%s -> %s" %
           (model.name, len(tensors), len(files), ", ".join("%s %.1f GB" % (k, v / 1e9) for k, v in sorted(by.items())),
            nl, cols, "".join(", " + w for w in extras), out))
