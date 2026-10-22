@@ -257,7 +257,7 @@ std::string own_tuning_dir() {
     char p[4096] = {};
     const DWORD n = GetModuleFileNameA(nullptr, p, (DWORD) sizeof(p));
     std::string s(p, n);
-    const size_t k = s.find_last_of("\/");
+    const size_t k = s.find_last_of("\\/");
     return k == std::string::npos ? std::string() : s.substr(0, k + 1) + "tuning/";
 #else
     char p[4096] = {};
