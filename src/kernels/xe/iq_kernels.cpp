@@ -1763,6 +1763,9 @@ inline void dq_one(const void* vx, int64_t ibs, const Out& o, int tid) {
     else if constexpr (TYPE == 23) dq_iq4_xs(vx, ibs, o, tid);
     else if constexpr (TYPE == 29) dq_iq1_m(vx, ibs, o, tid);
     else if constexpr (TYPE == 42) dq_q2_0(vx, ibs, o, tid);
+    // the trellis types: work-item tid writes values [8 tid, 8 tid + 8) of the 256-value piece, as the decoders above
+    // that take whole runs of 8 (upstream 2411e7cd)
+    else if constexpr (TYPE == 144 || TYPE == 145 || TYPE == 146) dq_tq<TYPE>(vx, ibs, o, tid);
     else static_assert(TYPE == 16, "iq_gemm: type");
 }
 
@@ -1904,8 +1907,8 @@ sycl::event launch_iq_gemm(sycl::queue& q, const sycl::half* X, const IqGemmPtrs
     });
 }
 
-// the formats iq_gemm_grouped_f16 dequantizes into its tile (dq_one); the K-quants and Q5_1 / Q8_0 take the fp16
-// dequant and xmx_gemm_grouped instead
+// the i-quants and Q2_0, which iq_gemm_grouped_f16 dequantizes into its tile (dq_one) as the trellis types; the
+// K-quants and Q5_1 / Q8_0 take the fp16 dequant and xmx_gemm_grouped instead
 bool in_iq_gemm(int t) { return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42; }
 bool is_tq(int t) { return t == 144 || t == 145 || t == 146; }
 bool is_iq(int t) {
@@ -2161,7 +2164,7 @@ const float* hadamard_device_signs(const float* host, int width) {
 }
 
 bool iq_gemm_grouped_ok(int t, int64_t N, int64_t K) noexcept {
-    return in_iq_gemm(t) && N > 0 && N % 128 == 0 && K > 0 && K % 128 == 0;
+    return (in_iq_gemm(t) || is_tq(t)) && N > 0 && N % 128 == 0 && K > 0 && K % 128 == 0;
 }
 
 void iq_gemm_grouped_f16(int t, const uint16_t* X, const void* const* W, int64_t interleave, float* Y, int64_t ldy,
@@ -2183,6 +2186,9 @@ void iq_gemm_grouped_f16(int t, const uint16_t* X, const void* const* W, int64_t
         case 22: e = launch_iq_gemm<22>(q, x, w, interleave, Y, ldy, bounds, G, max_rows, N, K); break;
         case 23: e = launch_iq_gemm<23>(q, x, w, interleave, Y, ldy, bounds, G, max_rows, N, K); break;
         case 29: e = launch_iq_gemm<29>(q, x, w, interleave, Y, ldy, bounds, G, max_rows, N, K); break;
+        case 144: e = launch_iq_gemm<144>(q, x, w, interleave, Y, ldy, bounds, G, max_rows, N, K); break;
+        case 145: e = launch_iq_gemm<145>(q, x, w, interleave, Y, ldy, bounds, G, max_rows, N, K); break;
+        case 146: e = launch_iq_gemm<146>(q, x, w, interleave, Y, ldy, bounds, G, max_rows, N, K); break;
         default: e = launch_iq_gemm<42>(q, x, w, interleave, Y, ldy, bounds, G, max_rows, N, K); break;
     }
     sync_if_needed(stream, e, "iq_gemm_grouped_f16");

@@ -35,6 +35,7 @@
 #include "ggml-cpu.h"
 #include "ggml-common-tq.h"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/xmx_gemm.hpp"
 
 #include "ggml.h"
 
@@ -743,6 +744,43 @@ static int check_synthetic_tq(const std::string& pair, bool had, void* s) {
     };
     failures += dequant_check(gu, blob.data(), G, "gate");
     failures += dequant_check(dt, blob.data() + f.down_off, D, "down");
+    // (e) the prompt path's products straight from the blocks (iq_gemm_grouped_f16, F8's resident experts) against
+    // the dequantized weights through xmx_gemm_grouped, every bit: gate/up interleaved, and down
+    if (!strata::kernels::xmx_available(strata::kernels::XmxType::f16)) {
+        std::printf("          iq_gemm_grouped_f16: skipped (no XMX for FP16 on this GPU)\n");
+    } else {
+        void* dblob = par::alloc_bytes(blob.size());
+        par::copy_bytes_in(dblob, blob.data(), blob.size());
+        auto* dbounds = static_cast<int32_t*>(par::alloc_bytes(8));
+        const int32_t bd[2] = {0, NT};
+        par::copy_bytes_in(dbounds, bd, 8);
+        auto product = [&](int t, const uint8_t* w, int64_t inter, int64_t N, int64_t K, const char* what) {
+            std::vector<uint16_t> xh((size_t) NT * K);
+            for (auto& v : xh) v = (uint16_t) ggml_fp32_to_fp16(nd(nrng));
+            auto* dxh = static_cast<uint16_t*>(par::alloc_bytes(xh.size() * 2));
+            auto* dw16 = static_cast<uint16_t*>(par::alloc_bytes((size_t) N * K * 2));
+            auto* dy = static_cast<float*>(par::alloc_bytes((size_t) NT * N * 4));
+            auto* dy2 = static_cast<float*>(par::alloc_bytes((size_t) NT * N * 4));
+            par::copy_bytes_in(dxh, xh.data(), xh.size() * 2);
+            const void* wp[1] = {w};
+            strata::kernels::iq_gemm_grouped_f16(t, dxh, wp, inter, dy, N, dbounds, 1, NT, N, K, s);
+            if (inter) strata::kernels::iq_dequant_gu_f16(t, w, w + f.up_off, inter, K, dw16, s);
+            else strata::kernels::iq_dequant_f16(t, w, N * K, dw16, s);
+            strata::kernels::xmx_gemm_grouped(dxh, dw16, 0, dy2, dbounds, 1, NT, N, K, s);
+            par::sync();
+            std::vector<float> a((size_t) NT * N), b((size_t) NT * N);
+            par::copy_bytes_out(a.data(), dy, a.size() * 4);
+            par::copy_bytes_out(b.data(), dy2, b.size() * 4);
+            size_t differ = 0;
+            for (size_t i = 0; i < a.size(); ++i) differ += float_bits(a[i]) != float_bits(b[i]);
+            std::printf("          %s %s iq_gemm_grouped_f16 vs dequant + xmx_gemm_grouped: %zu of %zu values differ\n",
+                        what, strata::ggml_type_name((uint32_t) t), differ, a.size());
+            return differ ? 1 : 0;
+        };
+        const auto* db = static_cast<const uint8_t*>(dblob);
+        failures += product(gu, db, FF, 2 * FF, H, "gate/up");
+        failures += product(dt, db + f.down_off, 0, H, FF, "down");
+    }
     const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
     const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
     std::printf("synthetic-tq %s%s  cpu rel %.2e  gpu rel %.2e  cpu-gpu %.2e  %s\n", pair.c_str(), had ? " +hadamard" : "",

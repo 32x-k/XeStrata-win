@@ -2448,8 +2448,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     for (int32_t e = 0; e < m.g->n_expert; ++e) routed += m.cnt[(size_t) e] > 0;
                     const int64_t below = mmq_plan().int8_below;
                     // Gyro (prism.hadamard, upstream fbf045eb): folded gate/up take H (s * x), folded down H (s * h),
-                    // on the FP16 path (its rows rotated in fp16 storage, computed in float); the int8 products and the
-                    // F8 products from the GGUF blocks do not rotate, so a folded layer never takes them
+                    // on the FP16 paths (its rows rotated in fp16 storage, computed in float): the dequantized one and
+                    // F8's products from the GGUF blocks (upstream 2411e7cd); the int8 products do not rotate, so a
+                    // folded layer never takes them
                     const bool had_gu = lay.native && lay.fmt[(size_t) l].had_gu;
                     const bool had_d = lay.native && lay.fmt[(size_t) l].had_d;
                     const int had_block = lay.native ? lay.fmt[(size_t) l].had_block : 0;
@@ -2529,7 +2530,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
                     }();
                     const strata::kernels::cpu::NativeFmt* ffmt = lay.native ? &lay.fmt[(size_t) l] : nullptr;
-                    const bool fuse_res = fused_on && !use_mmq && ffmt != nullptr && !had_gu && !had_d && m.host_res && m.cache &&
+                    const bool fuse_res = fused_on && !use_mmq && ffmt != nullptr && m.host_res && m.cache &&
                                           strata::kernels::xmx_available(strata::kernels::XmxType::f16) &&
                                           ffmt->up_off == (size_t) ffmt->n_ff * ffmt->gu_row &&
                                           strata::kernels::iq_gemm_grouped_ok(ffmt->gu_type, 2 * ffmt->n_ff, ffmt->n_embd) &&
@@ -2767,6 +2768,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             strata::kernels::iq_gemm_grouped_f16(ffmt->gu_type, m.Xs, fgu.data(), ffmt->n_ff, m.GU, 1280,
                                                                  m.xb_dev + j0, G, maxr, 1280, N, m.cs);
                             swiglu_interleaved(m.GU + r0 * 1280, m.Hh + r0 * 640, nr, m.cs);
+                            if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + r0 * 640, nr, 640, had_block, had_sh, m.cs);
                             pt.mark(kPfGemmD, cs);
                             strata::kernels::iq_gemm_grouped_f16(ffmt->d_type, m.Hh, fd.data(), 0, m.Dm, N,
                                                                  m.xb_dev + j0, G, maxr, N, 640, m.cs);
