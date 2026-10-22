@@ -335,7 +335,7 @@ def main() -> int:
                                          "listed there are read from it as trellis types (TQK5X ..), the others keep their MXFP4")
     ap.add_argument("--dense-override", help="a folder dense_requant.py wrote (dense.json + dense.bin): its tensors replace the same-named "
                                              "dense matrices of the GGUF (K-quants of the attention / shared experts)")
-    ap.add_argument("--override-experts", help="a second requantized GGUF folder (requant_gguf.py output): its routed experts replace the main "
+    ap.add_argument("--override-experts", nargs="+", help="requantized GGUF folders, each DIR or DIR:roles (requant_gguf.py output): their routed experts replace the main "
                                                "model's for --override-roles (gate,up,down) in --override-layers (default all): mixed-bit packs")
     ap.add_argument("--override-roles", default="down")
     ap.add_argument("--override-layers", default="")
@@ -450,10 +450,11 @@ def main() -> int:
         print("Engram tables from %s (%d shards)" % (eg_dir, len(eg_from)))
     # experts of a second requantized model replace the main one's for some roles / layers (the byte layouts are per tensor: any mix of types)
     n_ov = 0
-    if a.override_experts:
-        od = pathlib.Path(a.override_experts).expanduser().resolve()
+    for spec in (a.override_experts or []):
+        dpath, _, drl = spec.partition(":")
+        od = pathlib.Path(dpath).expanduser().resolve()
         roles_ov = {"gate": "w1", "up": "w3", "down": "w2"}
-        want = {roles_ov[r] for r in a.override_roles.split(",")}
+        want = {roles_ov[r] for r in (drl or a.override_roles).split(",")}
         lay_ov = None
         if a.override_layers:
             lay_ov = set()
@@ -487,8 +488,8 @@ def main() -> int:
                     new.append(("layers.%d.ffn.experts.%d.%s.weight" % (il, i, role), tname, ofi, og.data_start + off + i * part, part, shape[1:]))
         names_new = {t[0] for t in new}
         tensors[:] = [t for t in tensors if t[0] not in names_new] + new
-        n_ov = len(new)
-        print("experts overridden from %s: %d tensors (roles %s, layers %s)" % (od, n_ov, a.override_roles, a.override_layers or "all"))
+        n_ov += len(new)
+        print("experts overridden from %s: %d tensors (roles %s, layers %s)" % (od, len(new), drl or a.override_roles, a.override_layers or "all"))
     # dense matrices requantized by dense_requant.py replace the GGUF's BF16 ones
     n_dense = 0
     if a.dense_override:
