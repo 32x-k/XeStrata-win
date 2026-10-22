@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { engineProgressMark } from './agent/engine-progress.mjs';
 import { createCloudflare } from './cloudflare.mjs';
 import { createConnectorInstaller } from './cloudflared-install.mjs';
 import { findRunningConnector } from './cloudflared-find.mjs';
@@ -174,6 +175,8 @@ const agent = createAgentBridge({
   // The person's Response settings (thinking budget, Expert sampling) reach the agent's model through this host's own forwarding endpoint.
   proxyBase: `http://127.0.0.1:${PORT}/api/internal/agent-llm`,
   expertSampling: () => samplingFromExpert(store.get().expert),
+  // How far a local engine has got (the 2 s /metrics poll), for the agent's stall watchdog: it moves while a long prompt is read.
+  engineProgress: instanceId => engineProgressMark(native.readyInstances().find(i => i.id === instanceId)),
   onPlan: (chatId, event, plan) => hub.send('plan', { chatId, event, plan }),
   onQueue: (chatId, queue) => hub.send('queue', { chatId, queue }),
   dataDir: store.DATA_DIR,

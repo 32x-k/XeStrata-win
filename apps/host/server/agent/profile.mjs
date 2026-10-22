@@ -202,6 +202,9 @@ export function buildProfile({ local = [], connections = [], gate = true, tools 
       api: 'openai-completions',
       baseURL: inst.baseUrl,
       apiKeyEnv: keyEnv,
+      // A long prompt read sends only SSE comments, which pi-ai's OpenAI client drops, so its 300 s stream-idle timer would cut the
+      // request five minutes in (#3623). 60 minutes is a backstop: serve ends a hung engine and the bridge's watchdog ends a lost turn.
+      streamIdleTimeoutMs: 60 * 60_000,
       // The Strata server reads the thinking level from `chat_template_kwargs` (enable_thinking, reasoning_effort) or from a top-level
       // reasoning_effort; a top-level `enable_thinking` (pi-ai's `qwen` format) is ignored, so the model went on thinking with the menu on Off.
       compat: THINKING_COMPAT,

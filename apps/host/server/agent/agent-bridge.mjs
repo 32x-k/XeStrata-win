@@ -115,7 +115,7 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
  * @param {string} [options.nodePath]                   the Node runtime that runs the Harness
  * @param {(line:string)=>void} [options.log]
  */
-export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = null, gate = true, localInstances, connections, tools = () => undefined, skillsDir = () => null, onGoal = () => {}, onPlan = () => {}, onQueue = () => {}, proxyBase = null, searchMock = null, expertSampling = () => null, stallMs = 4 * 60_000, stallToolMs = 20 * 60_000, env = process.env, nodePath = process.execPath, log = () => {}, startTimeoutMs = 120_000, sessionReadyMs = 60_000, sessionRetryMs = 1_500 }) {
+export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = null, gate = true, localInstances, connections, tools = () => undefined, skillsDir = () => null, onGoal = () => {}, onPlan = () => {}, onQueue = () => {}, proxyBase = null, searchMock = null, expertSampling = () => null, engineProgress = () => null, engineGraceMs = 30 * 60_000, stallMs = 4 * 60_000, stallToolMs = 20 * 60_000, env = process.env, nodePath = process.execPath, log = () => {}, startTimeoutMs = 120_000, sessionReadyMs = 60_000, sessionRetryMs = 1_500 }) {
   const root = join(dataDir, 'agent');
   const home = join(root, 'home');
   const sessionsFile = join(root, 'sessions.json');
@@ -415,7 +415,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       abortFromRuntime: reason => finishTurn(reason), finish: failure => finishTurn(failure),
       // Helper agents (subagents) the Harness started for this chat, and the state of the run around them.
       children: new Map(), subagentCalls: new Map(), parentOpen: false, stopping: false, settleTimer: null, mode: appliedMode,
-      plan: null, advancing: false, goalRun: false, lastActivity: Date.now(), watchdog: null,
+      plan: null, advancing: false, goalRun: false, lastActivity: Date.now(), heard: Date.now(), engineMark: null, watchdog: null,
       research: researchTopic ? { phase: 'gather', nudged: false, waitingStart: false } : null,
     };
     c.turn = turn;
@@ -428,6 +428,13 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       if (turn.finished || turn.stopping) return;
       const toolRunning = [...projector.tools.values()].some(x => x.card?.state === 'running' || x.card?.state === 'proposed') || pending.size > 0 && pendingFor(chatId).length > 0;
       const limit = toolRunning ? stallToolMs : stallMs;
+      // A local engine reading a long prompt sends the Harness nothing for minutes (#3623). Its /metrics progress counts as activity,
+      // for at most engineGraceMs after the Harness last spoke: progress for another chat cannot keep a lost turn alive forever.
+      if (turn.route?.kind === 'local' && Date.now() - turn.heard < engineGraceMs) {
+        let mark = null;
+        try { mark = engineProgress(turn.route.instanceId); } catch { /* no progress known: the Harness alone decides */ }
+        if (mark != null && mark !== turn.engineMark) { turn.engineMark = mark; turn.lastActivity = Date.now(); return; }
+      }
       if (Date.now() - turn.lastActivity < limit) return;
       turn.stalledFor = Math.round((Date.now() - turn.lastActivity) / 1000);
       turn.stopping = true;
@@ -501,6 +508,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
     function handle(item) {
       if (turn.finished) return;
       turn.lastActivity = Date.now();
+      turn.heard = turn.lastActivity;
       if (item.type === 'event') {
         const e = item.event;
         if (e.seq <= turn.lastSeq) return;
@@ -538,7 +546,7 @@ export function createAgentBridge({ dataDir, componentsDir = null, bundledDir = 
       emitRow(child, true);
       const fold = item => {
         if (turn.finished) return;
-        turn.lastActivity = Date.now();
+        turn.lastActivity = turn.heard = Date.now();
         // A helper that finishes before its throttled "working" row went out would show queued -> completed and never "working": send the held row first.
         if (item.type === 'event' && item.event.type === 'turn/end' && child.rowPending) emitRow(child, true);
         const { frames, row } = cp.consume(item);
