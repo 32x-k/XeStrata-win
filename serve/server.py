@@ -72,6 +72,7 @@ tls.install()       # #3722: image URLs and tool servers over HTTPS are checked 
 from strata_control import hipblaslt_tuning  # noqa: E402
 from strata_control import vision_reader  # noqa: E402
 from strata_control import draft_layer  # noqa: E402
+from strata_control import drafting  # noqa: E402
 from strata_control import user_args  # noqa: E402
 from strata_control import gpu_roles  # noqa: E402
 from serve import ready as ready_file  # noqa: E402
@@ -494,6 +495,18 @@ def start_failure_hint(log: str | None, offset: int) -> str:
     said = [x.strip()[len("strata mtp: "):] for x in text.splitlines()
             if x.strip().startswith("strata mtp: ") and ("draft head over" in x or "hint:" in x)]
     return ". mtp: " + DRAFT_HEAD_FAIL + ". " + (" ".join(said) if said else "Hint: " + DRAFT_HEAD_HINT)
+
+
+def start_log_text(log: str | None, offset: int, limit: int = 1 << 20) -> str:
+    """Everything this engine start has written to the log so far (at most `limit` bytes), "" when there is no log."""
+    if not log:
+        return ""
+    try:
+        with open(log, "rb") as f:
+            f.seek(max(0, offset))
+            return f.read(limit).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return ""
 
 
 def start_log_tail(log: str | None, offset: int, n: int = 20) -> str:
@@ -1109,6 +1122,10 @@ class StrataEngine:
         if self.info.get("engine"):
             self.info["version"] = str(self.info["engine"])
         self.terminal_stages = read_engine_stage_log(log, log_start) if log else []
+        try:                                            # which drafter runs, and in plain words why not the one that was asked for
+            self.info.update(drafting.engine_info(args, start_log_text(log, log_start), drafting.take_note()))
+        except Exception:                               # noqa: BLE001 - a note must never stop a start
+            pass
         self.ended = False                              # READY: alive from here (restart() set it True, #344)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
@@ -3027,6 +3044,22 @@ def layer_split_of(cfg: dict) -> bool:
     return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
 
 
+_CARD_CLASS: list = []
+
+
+def drafting_card_class() -> str:
+    """The class of this computer's graphics card for the drafter table (strata_control/drafting.py), looked up once."""
+    if not _CARD_CLASS:
+        archs: list[str] = []
+        try:
+            from strata_control import engine_component
+            archs = list(engine_component.cuda_archs_present()) + list(engine_component.hip_archs_present())
+        except Exception:                                    # noqa: BLE001 - an unknown card is the "other" class, never an error
+            pass
+        _CARD_CLASS.append(drafting.card_class(archs))
+    return _CARD_CLASS[0]
+
+
 def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
@@ -3036,6 +3069,17 @@ def engine_args(cfg: dict) -> list[str]:
     # so a setup run or the app rewriting "args" cannot undo them (#3216 #3215 #3270)
     if cfg.get("user_args"):
         args = user_args.merge(args, cfg["user_args"])
+    # "drafting": auto | mtp | dflash2 | off (strata_control/drafting.py; the Models screen and `strata launch --drafting` write it): which drafter
+    # guesses ahead. A choice that cannot be applied starts the MTP and says why in the engine's /metrics ("drafting_note").
+    if cfg.get("drafting") is not None or drafting.suggest(drafting_card_class()) != "mtp":
+        shaped = {**cfg, "args": args}
+        decision = drafting.apply(shaped, klass=drafting_card_class(), data_dir=drafting.data_dir_of(args))
+        args = shaped["args"]
+        drafting.remember_note(decision.note)
+        if decision.note:
+            print(f"[strata] drafting: {decision.note}", flush=True)
+        elif decision.flags:
+            print(f"[strata] drafting: DFlash2 ({' '.join(decision.flags[:2])})", flush=True)
     # "mtp": false (the Models settings, `strata launch --mtp off`, or by hand): no draft layer, whatever the args say.  A setup run
     # that writes --mtp back into the args cannot undo it, because this is applied at every start.
     if draft_layer.is_off(cfg):
