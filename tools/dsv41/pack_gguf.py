@@ -137,10 +137,36 @@ LAYER = {
 GLOBAL = {"token_embd.weight": "embed.weight", "output_norm.weight": "norm.weight", "output.weight": "head.weight"}
 
 
+ALIASES = {
+    # the same quantity under another key: llama.cpp's / unsloth's spelling -> the alternative (the IST-DAS sets write
+    # the engine's own names into the GGUF and keep deepseek41.engram_* instead of the dotted Engram keys)
+    "attention.kv_source_layers": ("kv_source_layer_ids",),
+    "attention.indexer.source_layers": ("index_source_layer_ids",),
+    "attention.indexer.candidate_source_layer": ("attention.candidate_source_layer_id",),
+    "attention.indexer.candidate_top_k_blocks": ("attention.candidate_topk_blocks",),
+    "attention.indexer.candidate_block_size": ("attention.candidate_block_size",),
+    "dspark.target_layers": ("dspark_target_layer_ids",),
+    "dspark.block_size": ("dspark_block_size",),
+    "dspark.noise_token_id": ("dspark_noise_token_id",),
+    "dspark.markov_rank": ("dspark_markov_rank",),
+    "dspark.expert_count": ("dspark_n_routed_experts",),
+    "dspark.expert_used_count": ("dspark_num_experts_per_tok",),
+    "engram.layers": ("engram_layer_ids",),
+}
+
+
 def geometry(kv: dict, vocab: int) -> dict:
     """config.json's text_config names (what the engine reads) from the GGUF's deepseek41.* keys."""
     a = kv["general.architecture"]
-    g = lambda k, d=None: kv.get("%s.%s" % (a, k), d)  # noqa: E731
+
+    def g(k, d=None):
+        v = kv.get("%s.%s" % (a, k))
+        if v is None:
+            for alt in ALIASES.get(k, ()):
+                v = kv.get("%s.%s" % (a, alt))
+                if v is not None:
+                    break
+        return d if v is None else v
     nl = g("block_count")
     ratios = list(g("attention.compress_ratios", []))
     out = {
@@ -341,8 +367,19 @@ def main() -> int:
     ap.add_argument("--override-layers", default="")
     ap.add_argument("--tq-layers", help="only these layers (comma list) of the --tq-experts folders")
     ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's; default <model>/../dspark/dspark.json)")
+    ap.add_argument("--dspark-noise-token", type=int, help="the drafter's noise token id (dspark_noise_token_id), for a quant "
+                                                          "whose GGUF does not state it (the IST-DAS sets): DeepSeek-V4.1-Flash's is 128799")
+    ap.add_argument("--dspark-markov-rank", type=int, help="the markov head's rank (dspark_markov_rank); default: the drafter's "
+                                                          "markov tensor shape")
+    ap.add_argument("--skip-tensors", help="a regex of the GGUF's tensor names to leave out (a --dense-override supplies them "
+                                           "instead): e.g. attn_output_a, for a quant that stores the grouped wo_a as one "
+                                           "interleaved 3-D tensor instead of o_groups matrices")
     ap.add_argument("--engram", help="the folder of the Engram tables' GGUF set, for a quant that leaves them out "
                                      "(default: <model>/../Engram, when it is whole)")
+    ap.add_argument("--engram-meta", help="a GGUF whose metadata carries the Engram's hash parameters (llama.cpp's ple.* / "
+                                          "engram.*: layers, head offsets, vocab sizes, multipliers, token map), for a quant whose own "
+                                          "shards leave them out (the IST-DAS sets name the Engram only in deepseek41.engram_* keys and "
+                                          "carry no token map); the tables themselves still come from --engram")
     ap.add_argument("--shards", nargs="+", help="the GGUF's files in --model (default: every .gguf there - one "
                                                 "model's; the setup names them: a folder may hold an earlier layout)")
     a = ap.parse_args()
@@ -362,6 +399,13 @@ def main() -> int:
         raise SystemExit("%s: %d of the %d shards are here" % (model, len(shards), split) if len(counts) < 2 else
                          "%s: the shards of more than one GGUF split (-of-%s): name the model's own with --shards" %
                          (model, ", -of-".join(counts)))
+    # a quant whose shards leave the Engram's metadata out (the IST-DAS sets: deepseek41.engram_* only, no token map):
+    # the hash parameters come from --engram-meta, a GGUF of the same model that still has llama.cpp's ple.* / engram.*
+    if a.engram_meta:
+        mg = Gguf(pathlib.Path(a.engram_meta).expanduser().resolve())
+        for k, v in mg.kv.items():
+            if ".engram." in k or ".ple." in k or k.endswith(".embedding_length_per_layer_input"):
+                kv.setdefault(k, v)
     ple_to_engram(kv)
     for g in gs:
         split_ple(g, kv)
@@ -401,10 +445,17 @@ def main() -> int:
     gs_all = gs + list(eg_from.values())
     names = [g.path.name for g in gs] + [rel(p) for p in eg_from]
 
-    tensors, unknown = [], []
+    tensors, unknown, skipped = [], [], []
+    skip_re = re.compile(a.skip_tensors) if a.skip_tensors else None
     for fi, g in enumerate(gs_all):
         for name, typ, dims, off in g.tensors:
+            if skip_re is not None and skip_re.search(name):
+                skipped.append("%s (asked for)" % name)
+                continue
             if typ not in TYPES:
+                if typ in (24, 25, 26, 27, 28):   # I8 / I16 / I32 / I64 / F64: metadata carried as tensors, not weights
+                    skipped.append("%s (type %d)" % (name, typ))   # (the IST-DAS sets' engram_token_map.weight)
+                    continue
                 raise SystemExit("%s: %s has ggml type %d, which the engine does not read" % (g.path.name, name, typ))
             tname, per, bpb = TYPES[typ]
             nel = 1
@@ -443,6 +494,8 @@ def main() -> int:
             tensors.append((ck, tname, fi, base, nbytes, shape))
     if unknown:
         raise SystemExit("tensors the pack does not map (%d): %s" % (len(unknown), ", ".join(unknown[:12])))
+    if skipped:
+        print("not weights, left out (%d): %s" % (len(skipped), ", ".join(skipped[:8])))
     # the DSpark drafter (drafter_pack.py's dspark.bin beside the quants' folders, from DeepSeek's checkpoint): its
     # three blocks as mtp.0-2, so the engine drafts with them
     files = names
@@ -503,14 +556,19 @@ def main() -> int:
             files.append(relf)
         dfi = files.index(relf)
         pos = {t[0]: i for i, t in enumerate(tensors)}
-        n_here = 0
+        n_here = n_add = 0
         for name, (tname, fname, off, nb, shape) in dj.items():
             if name not in pos:
-                raise SystemExit("dense override: %s is not in the pack" % name)
+                # a tensor the quant leaves out (a --skip-tensors'd one, or a set that stores it under another layout):
+                # the override supplies it
+                tensors.append((name, tname, dfi, off, nb, shape))
+                pos[name] = len(tensors) - 1
+                n_add += 1
+                continue
             tensors[pos[name]] = (name, tname, dfi, off, nb, shape)
             n_here += 1
-        n_dense += n_here
-        print("dense override from %s: %d tensors (a later folder wins)" % (dd, n_here))
+        n_dense += n_here + n_add
+        print("dense override from %s: %d tensors replaced, %d added (a later folder wins)" % (dd, n_here, n_add))
     # the DSpark drafter from unsloth's GGUF (architecture dflash): blk.N.* -> mtp.N.*, the head tensors under the
     # checkpoint's names (fc -> main_proj, enc.output_norm -> main_norm, output_norm -> norm of the last block,
     # conf_proj -> confidence_head.proj, markov_w1 / w2 -> markov_head.embed / head)
@@ -523,6 +581,22 @@ def main() -> int:
         dg = Gguf(ds_path)
         if dg.kv.get("general.architecture") != "dflash":
             raise SystemExit("%s: not a DSpark (dflash) GGUF" % ds_path)
+        # the engine's dspark.* geometry: a quant built by another tool (the IST-DAS sets) leaves it out, the drafter
+        # carries all of it except the noise token (a model constant) and the markov head's rank (the tensor's shape)
+        for k, dk in (("block_size", "block_size"), ("expert_count", "expert_count"),
+                      ("expert_used_count", "expert_used_count"), ("target_layers", "target_layers")):
+            v = dg.kv.get("dflash." + dk)
+            if v is not None:
+                kv.setdefault("%s.dspark.%s" % (arch, k), v)
+        if a.dspark_noise_token is not None:
+            kv.setdefault("%s.dspark.noise_token_id" % arch, int(a.dspark_noise_token))
+        if a.dspark_markov_rank is not None:
+            kv.setdefault("%s.dspark.markov_rank" % arch, int(a.dspark_markov_rank))
+        else:
+            for name, typ, dims, off in dg.tensors:
+                if "markov" in name and len(dims) == 2:
+                    kv.setdefault("%s.dspark.markov_rank" % arch, int(dims[0]))
+                    break
         nb = int(dg.kv["dflash.block_count"])
         files.append(rel(ds_path))
         fi = len(files) - 1
