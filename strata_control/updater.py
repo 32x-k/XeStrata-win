@@ -224,7 +224,8 @@ def detect_hardware(environ=None) -> dict:
         environ = {**environ, ec.ENV_BACKEND: "hip"}
     backend, how = ec.detect_backend(environ)
     hw = {"platform": host_platform(), "backend": backend, "backend_source": how, "runtime": ec.runtime_version(),
-          "nvidia_driver": None, "cuda_archs": [], "gfx": [], "gpu_names": [], "variant_wanted": prefer}
+          "nvidia_driver": None, "cuda_archs": [], "gfx": [], "gpu_names": [], "variant_wanted": prefer,
+          "makes": sorted(ec.gpu_makes_present())}
     if backend == "cuda":
         hw["nvidia_driver"] = ec.nvidia_driver_version()
         hw["cuda_archs"] = ec.cuda_archs_present()
@@ -477,7 +478,52 @@ def decide_engine(feed: feedmod.Feed, ctx: Context, state: State) -> dict:
     return _choose_engine(feed, ctx, state)[0]
 
 
+GPU_MAKES = ("cuda", "hip", "sycl")
+
+
+def installed_gpu_makes(root: Path, platform: str | None) -> set[str]:
+    """The GPU makes (cuda / hip / sycl) of the engines installed for this platform, whatever their state."""
+    try:
+        found, _ = ec.scan(root)
+    except OSError:
+        return set()
+    return {item.backend for item in found if item.platform == platform and item.backend in GPU_MAKES}
+
+
+def make_guard(ctx: Context) -> str | None:
+    """Never cross GPU makes (#3688). An update replaces the engine; it does not convert the PC from one make of card to another,
+    and a package for the wrong make can only fail its test start. When the engine already installed is for a different make
+    than the one detected:
+      - if this PC really has a card of the installed make too (the display adapters / PCI vendors say so), the update stays
+        on the installed make (a PC with an NVIDIA card and an AMD card keeps the engine it was set up with);
+      - otherwise nothing is chosen and the returned sentence says why.
+    An explicit ask (``--backend``, ``STRATA_ENGINE_BACKEND``) is the person's decision and passes. Returns None when the update
+    may go on."""
+    hw = ctx.hardware
+    want = hw.get("backend")
+    if want not in GPU_MAKES or hw.get("backend_source") in ("environment", "requested", "installed engine"):
+        return None
+    have = installed_gpu_makes(ctx.components, hw.get("platform"))
+    if not have or want in have:
+        return None
+    here = set(hw.get("makes") or [])
+    keep = [make for make in GPU_MAKES if make in have and make in here]
+    if keep:
+        ctx.hardware = {**detect_hardware({**ctx.environ, ec.ENV_BACKEND: keep[0]}), "backend_source": "installed engine"}
+        return None
+    mine = " and ".join(ec.MAKE_NAMES[m] for m in GPU_MAKES if m in have)
+    return (f"The engine installed here is for {mine} cards, but this update would give your PC {ec.MAKE_NAMES[want]} one. "
+            f"Nothing was changed. If you really changed your graphics card, download the {ec.MAKE_NAMES[want]} version "
+            f"from {ec.RELEASES_URL}.")
+
+
 def _choose_engine(feed: feedmod.Feed, ctx: Context, state: State) -> tuple[dict, feedmod.EnginePackage | None]:
+    refusal = make_guard(ctx)
+    if refusal:
+        installed, _ = installed_engine(ctx.components, {**ctx.hardware, "backend": next(iter(sorted(installed_gpu_makes(ctx.components, ctx.hardware.get("platform")))), None)})
+        return {"installed": _engine_view(installed), "offered": None, "reasons": [refusal], "status": "wrong-make", "note": refusal,
+                "download_bytes": 0, "previous": state.section("engine").get("previous"), "pinned": state.section("engine").get("pinned"),
+                "problem": None}, None
     installed, missing_reason = installed_engine(ctx.components, ctx.hardware)
     sticky = {**ctx.hardware, "installed_variant": installed.variant if installed is not None and installed.backend == "hip" else ""}
     offered, reasons = feedmod.select_engine([p for p in feed.engine], sticky)
@@ -844,6 +890,9 @@ def update_engine(ctx: Context, feed: feedmod.Feed, state: State) -> dict:
             result["reasons"] = decision["reasons"]
         return result
     root = ctx.components
+    have_makes = installed_gpu_makes(root, pkg.platform)
+    if pkg.backend in GPU_MAKES and have_makes and pkg.backend not in have_makes and ctx.hardware.get("backend_source") not in ("environment", "requested"):
+        raise UpdateError(f"the {pkg.label} engine is for another make of graphics card than the installed one; nothing was staged", 5)
     _warn_if_deep(ctx, ec.engine_dir(root) / folder_name(pkg), longpath.LONGEST_IN_PACKAGE.get(pkg.backend, longpath.LONGEST_IN_PACKAGE_DEFAULT) + 1)
     _free_space_check(root, pkg.size + pkg.installed_bytes, ctx, pkg.sha256, "engine")
     archive = _download(ctx, "engine", pkg.url, pkg.size, pkg.sha256, f"engine {pkg.label}", feed)

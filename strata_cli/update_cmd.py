@@ -136,7 +136,7 @@ def _print_check(report: dict) -> None:
     offered = (eng["offered"] or {}).get("version")
     text = {"available": f"update available: {installed} -> {offered} ({_mib(eng['download_bytes'])})",
             "install": f"no engine installed yet; {offered} is the one for this PC ({_mib(eng['download_bytes'])})",
-            "current": f"{installed} is up to date", "none-for-this-pc": eng.get("note") or "the feed has no engine for this PC",
+            "current": f"{installed} is up to date", "none-for-this-pc": eng.get("note") or "the feed has no engine for this PC", "wrong-make": eng.get("note") or "nothing was changed",
             "not-in-feed": "the feed lists no engines"}.get(eng["status"], eng.get("note") or eng["status"])
     print(f"  Engine   {text}")
     pick = eng.get("offered")
@@ -176,6 +176,7 @@ def run(a) -> int:
         hardware = updater.detect_hardware()
         if a.backend:
             hardware["backend"] = a.backend
+            hardware["backend_source"] = "requested"             # the person's own decision: the make guard lets it through
         lines: list = []
         cancel = threading.Event()
         ctx = updater.Context(components=root, source="", trusted={}, hardware=hardware, emit=_emit_factory(a, lines), cancel=cancel,

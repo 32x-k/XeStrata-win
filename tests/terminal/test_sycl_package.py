@@ -56,7 +56,7 @@ class ArcChoice(unittest.TestCase):
                     mock.patch.object(ec, "host_platform", return_value=platform), \
                     mock.patch.object(updater, "host_platform", return_value=platform), \
                     mock.patch.object(ec, "_drm_vendor_backend", lambda: real(drm)), \
-                    mock.patch.object(ec, "_windows_vendor_backend", lambda: real(drm)):      # the test PC may be Windows: either probe answers
+                    mock.patch.object(ec, "windows_display_adapters", return_value=[]),                     mock.patch.object(ec, "_windows_vendor_backend", lambda: real(drm)):      # the test PC may be Windows: either probe answers
                 return updater.detect_hardware(environ or {})
 
     def pick(self, hardware):
