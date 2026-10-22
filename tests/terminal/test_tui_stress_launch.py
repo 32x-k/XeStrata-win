@@ -148,5 +148,72 @@ class SecondLaunchTests(unittest.TestCase):
             self.assertIn("--restart", f.read())
 
 
+class ModelPathWins(unittest.TestCase):
+    """C08: --model-path and --data-dir are honoured even when an installed copy with the same model and context exists."""
+
+    def setUp(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        self.home = Home().__enter__()
+        self.addCleanup(self.home.__exit__, None, None, None)
+        p = mock.patch.object(Catalog, "hardware", lambda self, fresh=False: dict(HW_12, disk_free_gb=500.0))
+        p.start()
+        self.addCleanup(p.stop)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.installed = self.base / "dl-data"
+        (self.installed / "models" / "Q2_0").mkdir(parents=True)
+        self.gguf = self.installed / "models" / "Q2_0" / "m.gguf"
+        self.gguf.write_bytes(b"x")
+        self.pack = self.installed / "packs" / "q2_0"
+        self.pack.mkdir(parents=True)
+        self.cfg_path = self.base / "strata-q2_0.json"
+        self.cfg_path.write_text(json.dumps({"args": ["--model", str(self.gguf), "--pack", str(self.pack), "--max-context", "32768"]}), encoding="utf-8")
+        self.mine = self.base / "documents"
+        self.mine.mkdir()
+        (self.mine / "mine.gguf").write_bytes(b"y")
+
+    def runner(self, **fields):
+        s = S.LaunchSettings(family="qwen", model="Q2_0", context=32768, **fields)
+        return Runner(s, catalog=catalog())
+
+    def test_installed_copy_serves_when_nothing_was_given(self):
+        self.assertTrue(self.runner().installed_serves_request(self.cfg_path))
+
+    def test_a_model_path_elsewhere_is_not_served_by_the_installed_copy(self):
+        self.assertFalse(self.runner(model_path=str(self.mine)).installed_serves_request(self.cfg_path))
+        self.assertFalse(self.runner(model_path=str(self.mine / "mine.gguf")).installed_serves_request(self.cfg_path))
+
+    def test_a_model_path_that_is_the_installed_folder_is_the_installed_copy(self):
+        self.assertTrue(self.runner(model_path=str(self.installed / "models" / "Q2_0")).installed_serves_request(self.cfg_path))
+
+    def test_a_data_dir_elsewhere_is_not_served_by_the_installed_copy(self):
+        self.assertFalse(self.runner(data_dir=str(self.base / "c08-data")).installed_serves_request(self.cfg_path))
+        self.assertTrue(self.runner(data_dir=str(self.installed)).installed_serves_request(self.cfg_path))
+
+    def test_ensure_model_runs_setup_with_the_given_path_instead_of_reusing_the_profile(self):
+        r = self.runner(model_path=str(self.mine))
+        said = []
+        r.emit_cb = lambda e: said.append(e.text)
+        desc = {"context": 32768, "kv": "int8", "images": "off"}
+        with mock.patch.object(Runner, "check_own_files"), mock.patch.object(Runner, "resolved_vision"),              mock.patch.object(Runner, "installed_state", return_value=(self.cfg_path, desc)),              mock.patch.object(Runner, "_spawn", side_effect=RuntimeError("setup would run")):
+            with self.assertRaises(RuntimeError):
+                r.ensure_model()
+        self.assertFalse(any("already installed with these choices" in x for x in said))
+        self.assertTrue(any("uses the folder you gave" in x for x in said))
+        self.assertIn(str(self.mine), r.setup_args())
+
+    def test_without_a_path_the_installed_copy_is_still_reused(self):
+        r = self.runner()
+        said = []
+        r.emit_cb = lambda e: said.append(e.text)
+        desc = {"context": 32768, "kv": "int8", "images": "off"}
+        with mock.patch.object(Runner, "check_own_files"), mock.patch.object(Runner, "resolved_vision"),              mock.patch.object(Runner, "installed_state", return_value=(self.cfg_path, desc)):
+            self.assertEqual(r.ensure_model(), self.cfg_path)
+        self.assertTrue(any("already installed with these choices" in x for x in said))
+
+
 if __name__ == "__main__":
     unittest.main()

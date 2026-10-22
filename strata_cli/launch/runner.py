@@ -231,6 +231,11 @@ def desc_matches(desc: dict, s: S.LaunchSettings) -> bool:
     return True
 
 
+def _inside(path: Path, folder: Path) -> bool:
+    a, b = os.path.normcase(str(path)), os.path.normcase(str(folder))
+    return a == b or a.startswith(b.rstrip("\\/") + os.sep)
+
+
 def files_present(cfg: dict) -> list[str]:
     """The model files a run config names that are missing (empty list: all there)."""
     missing = []
@@ -776,6 +781,32 @@ class Runner:
         desc = self.catalog.strata.describe_config(path)
         return path, desc
 
+    def installed_serves_request(self, path: Path) -> bool:
+        """C08: the installed copy is what this launch asked for. A --model-path (or the Folder step's own files) and a --data-dir always win:
+        when the installed config names files outside them, it is not reused (that served another copy without a word) and setup runs with
+        the given folders, which rewrites the config so the profile follows."""
+        s = self.s
+        if not (s.model_path or s.data_dir):
+            return True
+        try:
+            cfg = read_config(path)
+            args = [str(a) for a in cfg.get("args") or []]
+            if s.model_path:
+                want = Path(s.model_path).expanduser().resolve()
+                folder = want if want.is_dir() else want.parent
+                ggufs = [Path(a) for a in args if a.lower().endswith(".gguf")]
+                if not ggufs or not all(_inside(g.resolve(), folder) for g in ggufs):
+                    return False
+                if s.data_dir:
+                    packs = [Path(args[i + 1]) for i, a in enumerate(args[:-1]) if a == "--pack"]
+                    return all(_inside(pk.resolve(), Path(s.data_dir).expanduser().resolve()) for pk in packs)
+                return True
+            from strata_control import discovery
+            found = discovery.footprint(cfg, path).data_dir
+            return found is not None and os.path.normcase(str(Path(found).resolve())) == os.path.normcase(str(Path(s.data_dir).expanduser().resolve()))
+        except Exception:                                    # noqa: BLE001 - when in doubt do what was asked: run setup with the given folders
+            return False
+
     def existing_data_dir(self) -> Path | None:
         """The data folder to give setup when the person chose none: the folder the model already lives in (its run config names its files),
         else the folder the desktop app uses, so a helper file that is missing is fetched next to the rest, never into a second folder.
@@ -879,8 +910,11 @@ class Runner:
             raise LaunchError("No model was chosen.", "Choose a model, or use --model NAME (strata launch --help lists them).", 2)
         path, desc = self.installed_state()
         if path is not None and desc is not None and desc_matches(desc, s) and not files_present(read_config(path)):
-            self.emit("model", f"{s.family} {s.model} is already installed with these choices.", 100)
-            return path
+            if self.installed_serves_request(path):
+                self.emit("model", f"{s.family} {s.model} is already installed with these choices.", 100)
+                return path
+            self.emit("model", "The model already installed here is somewhere else than the folder you gave, so Strata uses the folder you gave "
+                               "and points this launch at it.", 0)
         title = f"{s.family} {s.model}"
         if sys.platform == "darwin" and not (cat.src / "strata_control" / "mac_fit.py").is_file():
             # a Terminal from before the Mac rules moved into strata_control/mac_fit.py: setup.py cannot install a Mac model in its Control
