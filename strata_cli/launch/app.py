@@ -189,6 +189,8 @@ class Ctx:
 class LaunchApp(App):
     TITLE = "strata launch"
     CSS = CSS
+    # Textual's own ctrl+c only shows a "Do you want to quit?" note, and Escape pressed next also went Back (B13): ctrl+c quits like ctrl+q and q
+    BINDINGS = [Binding("ctrl+c", "quit", "Quit", show=False, priority=True)]
 
     def __init__(self, ctx: Ctx, *, auto_run: bool = False) -> None:
         super().__init__()
@@ -202,6 +204,13 @@ class LaunchApp(App):
         self.run_screen: RunScreen | None = None
         self.running = False
         self.current = "start"
+
+    def action_quit(self) -> None:
+        """ctrl+q and ctrl+c, as q on the screens: leave at once. Only a running download or tuning asks first ("Stop now?"), because work would be lost."""
+        if self.running and self.run_screen is not None:
+            self.stop_run(self.run_screen)
+        else:
+            self.exit(None)
 
     def on_mount(self) -> None:
         if self.auto_run:
