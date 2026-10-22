@@ -127,6 +127,7 @@ class RetuneStopsOwnServerTests(unittest.TestCase):
         r = Bare.__new__(Bare)
         r.s = S.LaunchSettings(name="x")
         r.restart_after = True
+        r._stop_first = []
         r.said = []
         r.emit = lambda *a, **k: r.said.append(a[1])
         return r

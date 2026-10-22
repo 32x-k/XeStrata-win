@@ -1473,7 +1473,7 @@ class SaveScreen(Base):
             model = dict(lines)["Model"].replace("Qwen3.8-Flash-Next ", "")
             rows = [f"{model} \u00b7 {S.context_label(s.context)} \u00b7 memory {s.kv or 'int8'}",
                     f"Pictures {'on' if s.vision != 'off' else 'off'} \u00b7 Parallel {s.parallel or 'auto'} \u00b7 Tuning {s.tune}",
-                    f"Access {s.access}, port {s.port}" + f" \u00b7 Storage {s.data_dir or self.ctx.default_folder()}"]
+                    f"Access {s.access}, port {s.port}" + (f" \u00b7 Storage {s.data_dir}" if s.data_dir else "")]
             t.append("Save, then launch   name:\n" if tiny else "Save as preset, then launch   name:\n", style=f"bold {ACCENT}")
             for ln in rows[:2 if tiny else 3]:
                 t.append("  " + ln + "\n")
