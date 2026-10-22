@@ -37,7 +37,9 @@ import { createHash } from 'node:crypto';
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
-export async function startScriptedWorker({ port = 0, chunkDelayMs = 40, model = 'scripted-model', serial = false } = {}) {
+export async function startScriptedWorker({ port = 0, chunkDelayMs = 40, model = 'scripted-model', serial = false, window = 0, charsPerToken = 0 } = {}) {
+  // `window` + `charsPerToken` make it behave like the engine: every request's prompt is counted (its size over charsPerToken), the usage it
+  // reports is that count, and a prompt that leaves no room to answer is refused with the engine's own 400 ("requests are never truncated").
   // `serial` stands in for an engine with one request slot: the next request waits until the one before it has finished.
   let tail = Promise.resolve();
   const turn = () => { let release; const mine = new Promise(r => { release = r; }); const wait = tail; tail = tail.then(() => mine); return wait.then(() => release); };
@@ -72,6 +74,11 @@ export async function startScriptedWorker({ port = 0, chunkDelayMs = 40, model =
       authSha: req.headers.authorization ? createHash('sha256').update(req.headers.authorization).digest('hex') : null,
       promptChars: raw.length, raw,
     });
+    const counted = charsPerToken > 0 ? Math.ceil(raw.length / charsPerToken) : 0;
+    if (window > 0 && counted > 0 && counted > window - 64) {
+      requests.at(-1).refused = counted;
+      return json(400, { error: { type: 'invalid_request_error', message: `request exceeds the context window: prompt (${counted} tokens) leaves no room to answer in the context (${window}); requests are never truncated` } });
+    }
     const shellName = () => (body.tools ?? []).find(t => ['bash', 'pwsh'].includes(t.function?.name))?.function?.name ?? 'bash';
     const shellCommand = (file, value) => (shellName() === 'pwsh' ? `Add-Content -Path '${file}' -Value '${value}'` : `echo ${value} >> ${file}`);
     let closed = false;
@@ -80,7 +87,7 @@ export async function startScriptedWorker({ port = 0, chunkDelayMs = 40, model =
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
     const id = `chatcmpl-${requests.length}`;
     const send = (delta, finish = null, extra = {}) => res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: 0, model: body.model, choices: [{ index: 0, delta, finish_reason: finish }], ...extra })}\n\n`);
-    let promptTokens = 100 + messages.length;
+    let promptTokens = counted || 100 + messages.length;
     const finish = (reason, tokens = 10) => {
       send({}, reason);
       res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: 0, model: body.model, choices: [], usage: { prompt_tokens: promptTokens, completion_tokens: tokens, total_tokens: promptTokens + tokens } })}\n\n`);
