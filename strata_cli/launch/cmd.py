@@ -127,6 +127,9 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
     o.add_argument("--retune", action="store_true",
                    help="with --tune (quick is used when --tune is not given): measure again even when this model was already tuned on this computer "
                         "(by default a stored tuning result is reused and no measuring is done)")
+    o.add_argument("--restart", action="store_true",
+                   help="when a model is already serving other choices (or holds the port), stop it and start these. Without it the screens ask once "
+                        "and --no-tui refuses; --yes alone never restarts. The same choices are never restarted: the running address is printed")
     o.add_argument("--no-tui", action="store_true", help="no screens: serve, print the address and return")
     o.add_argument("--open", action="store_true", help="open the server's web page in your browser once it is serving (nothing opens a browser without this)")
     o.add_argument("--yes", action="store_true", help="do not ask questions (for one: whether to download the model on a computer with no engine yet)")
@@ -648,13 +651,13 @@ def run_launch(a: argparse.Namespace) -> int:
             if catalog is None:
                 return fail("This Terminal does not carry the model list, so the screens cannot open. Install it again with the one-line installer.", 5)
             from strata_cli.launch import app
-            return _tui(app.run_tui, None, catalog=catalog, feed=a.feed, open_page=bool(a.open))
+            return _tui(app.run_tui, None, catalog=catalog, feed=a.feed, open_page=bool(a.open), restart=bool(getattr(a, "restart", False)))
         if catalog is None:
             return fail("This Terminal does not carry the model list. Install it again with the one-line installer.", 5)
         if getattr(a, "retune", False) and s.tune == "skip":
             s.tune = "quick"
         runner = Runner(s, catalog=catalog, emit=_printer(machine), feed=a.feed, assume_yes=bool(a.yes or machine), confirm=_ask_yes,
-                        retune=bool(getattr(a, "retune", False)))
+                        retune=bool(getattr(a, "retune", False)), restart=bool(getattr(a, "restart", False)))
         try:
             runner.check_own_files()                         # the person's own files: a wrong path is said now, and the files name the model
         except LaunchError as e:
@@ -720,7 +723,7 @@ def run_launch(a: argparse.Namespace) -> int:
         if interactive and have_choices:
             from strata_cli.launch import app
             return _tui(app.run_tui, s, catalog=catalog, feed=a.feed, auto_run=True, save=bool(a.save_preset), open_page=bool(a.open),
-                         move_data=move_data, retune=bool(getattr(a, "retune", False)))
+                         move_data=move_data, retune=bool(getattr(a, "retune", False)), restart=bool(getattr(a, "restart", False)))
         try:
             result = runner.run()
         except LaunchError as e:
@@ -739,12 +742,12 @@ def run_launch(a: argparse.Namespace) -> int:
                 _say(result.final_text)
             return 0
         if machine:
-            print(json.dumps({"schema_version": 1, "ok": True, "name": s.name, "profile": result.profile, "urls": result.urls,
+            print(json.dumps({"schema_version": 1, "ok": True, "name": s.name, "profile": result.profile, "urls": result.urls, "reused": result.reused,
                               "api_key": "set" if result.key else None, "tuned": result.tune_word,
                               "notices": result.notices + [n.line() for n in notes]}))
             return 0
         _say("")
-        _say("Strata is serving.")
+        _say("Already serving these choices; nothing was restarted." if result.reused else "Strata is serving.")
         for u in result.urls:
             label = ("This computer" if "127.0.0.1" in u else "Cloudflare" if "trycloudflare" in u else
                      "Tailscale" if ("ts.net" in u or u.split("//")[1].startswith("100.")) else "Network")
