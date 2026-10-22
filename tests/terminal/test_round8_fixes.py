@@ -201,6 +201,20 @@ class EngineIsFreshEnough(unittest.TestCase):
             self.assertIsNone(r.stale_engine("0.1.47"))
             self.assertIsNone(r.stale_engine("source"))
 
+    def test_gyro_on_a_mac_needs_engine_0_1_47(self):
+        with Home():
+            r = Runner(S.LaunchSettings(family="gyro", model="Gyro-S", context=32768, vision="off"), catalog=catalog(HW_12))
+            with mock.patch.object(sys, "platform", "darwin"):
+                self.assertEqual(r.needed_engine(), (0, 1, 47))
+                self.assertIn("older than this model needs (0.1.47", r.stale_engine("0.1.45.3"))
+                self.assertIsNone(r.stale_engine("0.1.47"))
+            with mock.patch.object(sys, "platform", "linux"):
+                self.assertLess(r.needed_engine(), (0, 1, 47))               # CUDA, HIP and SYCL had the kernels earlier
+                self.assertIsNone(r.stale_engine("0.1.46"))
+            with mock.patch.object(sys, "platform", "darwin"):
+                q = Runner(S.LaunchSettings(family="qwen", model="IQ3_XXS", context=32768, vision="off"), catalog=catalog(HW_12))
+                self.assertLess(q.needed_engine(), (0, 1, 47))              # only Gyro is held to it
+
     def test_a_stale_engine_is_updated_or_said_never_ignored(self):
         with Home():
             r = runner_for()

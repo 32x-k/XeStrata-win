@@ -53,6 +53,10 @@ def install_isolation_words(catalog, data_dir: str | os.PathLike | None = None) 
             f"{chosen}: the data folder only says where model files are kept. To test from scratch, use a new user account or remove the earlier install first."]
 
 
+#: the first engine whose Metal build reads Gyro files (round 8, M: 0.1.45.3 was reused and failed on missing TQK6/TQK7 kernels)
+GYRO_METAL_ENGINE = (0, 1, 47)
+
+
 def version_tuple(version: str | None) -> tuple[int, ...]:
     """'0.1.45.3' -> (0, 1, 45, 3); () when it is not a dotted run of numbers (a source build says so itself)."""
     m = re.match(r"\d+(?:\.\d+)*", str(version or "").strip())
@@ -593,6 +597,8 @@ class Runner:
             need = tuple(getattr(mod, "MIN_ENGINE", ()) or ())
             if self.s.family == "gyro":
                 need = max(need, tuple(getattr(mod, "GYRO_ENGINE", ()) or ()))
+                if sys.platform == "darwin":
+                    need = max(need, GYRO_METAL_ENGINE)      # the Metal Gyro kernels (TQK6/TQK7/TQ2_T) first shipped in 0.1.47; CUDA, HIP, SYCL had them earlier
             return need or None
         except Exception:                                    # noqa: BLE001 - no table, no check
             return None
