@@ -34,12 +34,46 @@ ROOT = Path(__file__).resolve().parents[2]
 WINDOWS = os.name == "nt"
 
 
+def python_failure(lines: list[str]) -> str | None:
+    """The last line of a Python traceback in setup.py's output (ModuleNotFoundError: No module named 'calibrate'), or None when the
+    output holds no traceback. Frames are skipped; the exception line is the first unindented line after the last 'Traceback'."""
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].startswith("Traceback (most recent call last)"):
+            for line in lines[i + 1:]:
+                if line.strip() and not line[:1].isspace():
+                    return line.strip()[:300]
+            return None
+    return None
+
+
+def missing_file(failure: str) -> bool:
+    """An import or file error: the install itself is short of a file, which an update of Strata brings back."""
+    return failure.startswith(("ModuleNotFoundError", "ImportError", "FileNotFoundError"))
+
+
 class LaunchError(RuntimeError):
     """A step could not be done. `text` says what it means; `next` says what to do."""
 
     def __init__(self, text: str, next: str = "", code: int = 6):
         super().__init__((text + " " + next).strip())
         self.text, self.next, self.code = text, next, code
+
+
+def setup_failure(lines: list[str], err: str, hint: str, details: str | None, own_files: bool) -> LaunchError:
+    """The error for a setup.py run that exited non-zero. setup.py's own `[X]` line (err) is the message when there is one; when it
+    stopped with a Python error instead, that error's last line is (#3613, #3467: a file missing from the Terminal's tools/ ended every
+    launch after a tune with only "The model could not be installed"). `details` is the file that holds the rest of its output."""
+    crashed = python_failure(lines) if not err else None
+    if crashed:
+        where = f" The whole setup output is in {details}." if details else ""
+        if missing_file(crashed):
+            return LaunchError(f"The model could not be installed. A file that setup needs is missing from this Strata install ({crashed}).",
+                               "Update Strata (`strata update`) and run it again." + where, 6)
+        return LaunchError(f"The model could not be installed. Setup stopped with an error ({crashed}).", "Run it again." + where, 6)
+    return LaunchError("The model could not be installed." + (f" {err}." if err else ""),
+                       (hint or ("Run it again: finished steps are skipped." if own_files else
+                                 "Run it again: finished steps are skipped and a download continues where it stopped."))
+                       + (f" Details: {details}" if details else ""), 6)
 
 
 class Cancelled(LaunchError):
@@ -810,9 +844,7 @@ class Runner:
             adopted = self.adopt_prepared_files(err)
             if adopted is not None:
                 return adopted
-            raise LaunchError("The model could not be installed." + (f" {err}." if err else ""),
-                              hint or ("Run it again: finished steps are skipped." if s.model_path else
-                                       "Run it again: finished steps are skipped and a download continues where it stopped."), 6)
+            raise setup_failure(lines, err, hint, self.keep_setup_output(lines), bool(s.model_path))
         path, _desc = self.installed_state()
         if path is None:
             raise LaunchError("Setup finished but no run config was written for this model.",
@@ -820,6 +852,18 @@ class Runner:
         self.emit("model", f"{title} is ready.", 100)
         self.check_pictures(path)
         return path
+
+    def keep_setup_output(self, lines: list[str]) -> str | None:
+        """The last lines setup.py printed, kept next to the launch's other logs so a failed install can be read afterwards (the message
+        shows one line; a traceback needs the rest). Best effort: None when it cannot be written."""
+        try:
+            folder = launch_dir()
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f"{self.name}.setup.log"
+            path.write_text("\n".join(lines[-400:]) + "\n", encoding="utf-8", errors="replace")
+            return str(path)
+        except (OSError, ValueError):
+            return None
 
     def adopt_prepared_files(self, setup_error: str) -> Path | None:
         """The installer cannot set this graphics card up (Intel Arc, for one): if the model's files and prepared pack are already on disk,
