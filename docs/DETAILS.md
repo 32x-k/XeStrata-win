@@ -756,6 +756,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   A flagged window emits none of its tokens; the engine prints a line with the position and ends the request with `DONE ... nonfinite` (a slot: `BDONE <slot> <n> nonfinite`).
   The next request first drops the live session, every checkpoint, every parked conversation and every idle slot, and reads its prompt from token 0 (a slot still running finishes its reply and is not kept after it).
   The server sends a request that has sent nothing yet again once, transparently; a reply that had started ends as `"length"`; a second fire on the retry ends the request with an error (503 before an answer, an error event in a stream).
+  When the flagged window was one that reads the prompt's short tail (the part after the last turn boundary, read through the verify windows, `--short-read`), the retry reads its whole prompt through the batched path instead, and the engine prints a line saying so (upstream #3465: a reporter's prompts failed in that tail every time and passed with `--short-read 0`).
   The kernel only writes flags, so an answer without a NaN is the one the engine gives with `STRATA_NAN_GUARD=0` (no kernel recorded).
   Debug switch: `STRATA_NAN_INJECT=<n>[,<n>...]` reports the n-th window the engine checks as non-finite.
 - **Anthropic requests that don't ask for thinking (opt-in).** By default a `/v1/messages` request with no `"thinking"`, effort or budget thinks as the model's template does.
