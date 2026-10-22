@@ -477,3 +477,12 @@ class TheDownloadPlanListsIt(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ControlReportsWhetherTheEngineServesIt(unittest.TestCase):
+    def test_the_plan_says_it_so_the_app_can_hide_the_choice(self):
+        for served in (False, True):
+            with mock.patch.object(drafting, "ENGINE_SERVES_DFLASH2", served):
+                code, out, err = run_cli(["drafting", "plan", "--mode", "auto", "--family", "gyro", "--data-dir", tempfile.gettempdir(), "--output", "json"])
+                self.assertEqual(code, 0, err)
+                self.assertIs(json.loads(out)["serves"], served)

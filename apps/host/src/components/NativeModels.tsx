@@ -20,6 +20,7 @@ import { go, setSettingsSection, selectRemoteModel, pushToast } from '../lib/sto
 import { nativeAction, useNative, type NativeJob } from '../lib/native';
 import { tuneEffective } from '../lib/native-tune';
 import { tunedFields } from '../lib/tune-values';
+import { draftingChoices as draftingOptions } from '../lib/drafting';
 import { NativeSettings } from './NativeSettings';
 import { NativeSettingsFile } from './NativeSettingsFile';
 import { RunImageModel } from './RunImageModel';
@@ -101,7 +102,7 @@ export function NativeModels({ onOtherModels, onReady, onImport, onConnectEngine
     // A layer split written for another number of cards no longer fits: back to automatic.
     useEffect(() => { if (cardsGpus.length <= 1 && split !== 'auto') setSplit('auto'); }, [cardsGpus.length]);
     // Drafting (which drafter guesses ahead): DFlash2 is for Qwen3.8-Flash-Next only (the qwen and gyro families), so no other model is offered it.
-    const draftingChoices = selectedSize ? (['qwen', 'gyro'].includes(String(selectedSize.sourceFamily ?? selectedFamily?.family)) ? ['auto', 'mtp', 'dflash2', 'off'] : ['auto', 'mtp', 'off']) : null;
+    const draftingChoices = selectedSize ? draftingOptions(selectedSize.sourceFamily ?? selectedFamily?.family, native?.capabilities?.dflash2) : null;
     const draftingWords: Record<string, string> = { auto: 'Auto (recommended)', mtp: 'MTP', dflash2: 'DFlash2', off: 'Off' };
     const values = useMemo(() => ({ family: selectedSize?.sourceFamily, model: selectedSize?.model, context, vision: selectedSize?.images ? vision : 'no', kv, low_ram: lowRam, resourceProfile, ...(cardsGpus.length > 1 ? { gpus: cardsGpus.join(',') } : cardsGpus.length === 1 ? { gpu: cardsGpus[0] } : {}), loadAfter: true, multiple: expert && multiple }), [selectedSize?.sourceFamily, selectedSize?.model, context, vision, kv, lowRam, resourceProfile, cardsGpus.join(','), expert, multiple]);
     const downloadValues = { ...values, ...(draftingChoices ? { drafting } : {}), vision: selectedSize?.images && vision !== 'no' ? 'yes' : 'no', loadVision: selectedSize?.images ? vision : 'no' };
