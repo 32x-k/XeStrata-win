@@ -1663,7 +1663,7 @@ def choose_roles(a, found) -> list:
     roles = dict(gpu_roles.recommend(cards)["roles"])
     say()
     say("  Strata recommends a role for each graphics card. Main does the last steps of every answer; a Helper holds part of the model;")
-    say("  Off leaves the card alone (a card with 8 GB or less starts Off). Details: docs/MULTI_GPU.md.")
+    say("  Off leaves the card alone (a card with 8 GB or less starts Off beside a bigger card). Details: docs/MULTI_GPU.md.")
     by = {c["index"]: c for c in cards}
     for i in sorted(roles):
         say(f"    GPU {i + 1}  {gpu_roles.short_name(by[i]):<22} {by[i]['vram_gb']:>4.0f} GB   {roles[i].capitalize()}")

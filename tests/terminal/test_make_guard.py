@@ -147,6 +147,28 @@ class Decision(unittest.TestCase):
         self.assertIn("another make", str(caught.exception))
 
 
+class Pascal(unittest.TestCase):
+    """#3655: a GTX 1080 (sm_61) is a working machine on the CUDA 12 engine; the CUDA 13 build has no code for it and is never chosen."""
+
+    FEED = [package("cuda", "cuda13", ("sm_75", "sm_86", "sm_89", "sm_120")),
+            feedmod._engine_package({"version": "0.1.47", "platform": WIN, "backend": "cuda", "variant": "cuda12", "min_driver": {"nvidia": "525.60"},
+                                     "archs": ["sm_60", "sm_61", "sm_70", "sm_75", "sm_80", "sm_86", "sm_89"], "min_runtime": None, "build_id": "b-12",
+                                     "format": "zip", "url": "e-12.zip", "size": 10, "sha256": "a" * 64, "manifest_sha256": "b" * 64,
+                                     "installed_bytes": 20, "notes": ""})]
+
+    def hardware(self, archs):
+        return {"platform": WIN, "backend": "cuda", "runtime": None, "nvidia_driver": "581.15", "cuda_archs": archs, "gfx": [], "gpu_names": []}
+
+    def test_two_gtx_1080_get_the_cuda_12_engine(self):
+        best, reasons = feedmod.select_engine(self.FEED, self.hardware(["sm_61", "sm_61"]))
+        self.assertEqual(best.variant, "cuda12")
+        self.assertTrue(any("cuda13" in r or "sm_75" in r for r in reasons), "the CUDA 13 build is refused for the card")
+
+    def test_a_newer_card_still_gets_the_newest_build(self):
+        best, _ = feedmod.select_engine(self.FEED, self.hardware(["sm_86"]))
+        self.assertEqual(best.variant, "cuda13")
+
+
 class Host(unittest.TestCase):
     def test_the_app_shows_the_sentence_not_the_no_engine_for_this_card_text(self):
         text = (Path(__file__).resolve().parents[2] / "apps" / "host" / "server" / "updates.mjs").read_text(encoding="utf-8")
