@@ -37,6 +37,7 @@ import multiprocessing as mp
 import os
 import pathlib
 import re
+import shutil
 import struct
 import sys
 import time
@@ -398,8 +399,24 @@ def main() -> int:
     total = sum(o[2] for o in outs)
     print("plan: %d shards, %.1f GB (%s), %d jobs" % (len(outs), total / 1e9,
           ", ".join("%s %.1f GB" % (k, v / 1e9) for k, v in sorted(plan_sizes.items())), len(jobs)), flush=True)
-    if a.dry_run:
-        return 0
+    # the free-space check the release runbook promises (DEEPSEEK-RELEASE.MD 9.6 item 5): the plan's bytes against what
+    # the output's filesystem has, with 2% of headroom.  It runs in --dry-run too, so the operator sees the verdict
+    # before committing hours of CPU.
+    probe = out if out.exists() else next((p for p in [out.parent, pathlib.Path("/")] if p.exists()), pathlib.Path("/"))
+    du = shutil.disk_usage(probe)
+    print("space: %.1f GB planned, %.1f GB free on %s%s" % (total / 1e9, du.free / 1e9, probe,
+          "" if du.free * 0.98 >= total else "  <- NOT ENOUGH"), flush=True)
+    if a.dry_run:   # nothing is written: report the verdict, and 3 when the space is short (so `--dry-run && requant` works)
+        return 0 if du.free * 0.98 >= total else 3
+    if a.resume:
+        have = sum(p.stat().st_size for p in out.glob("*.gguf") if p.is_file()) if out.exists() else 0
+        need = max(0, total - have)
+        if du.free * 0.98 < need:
+            raise SystemExit("%s: %d GB free, %d GB more needed (%d GB already written) - free space first"
+                             % (out, du.free / 1e9, need / 1e9, have / 1e9))
+    elif du.free * 0.98 < total:
+        raise SystemExit("%s: %d GB free, %d GB needed - free space first (or --out elsewhere)"
+                         % (out, du.free / 1e9, total / 1e9))
     out.mkdir(parents=True, exist_ok=True)
     for opath, head, size in outs:
         if a.resume and opath.is_file() and opath.stat().st_size == size:
