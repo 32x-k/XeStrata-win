@@ -6024,6 +6024,19 @@ int main(int argc, char** argv) {
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         int64_t slots = ((int64_t) free_b - reserve) / blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
+#if defined(STRATA_GPU_METAL)
+        // Metal: the decode window reads its experts from its own arena (metal/src/engine/window.cpp), and the device copies the shared host
+        // code makes - this cache included - are given back before the arena is sized.  An auto cache of everything that is "free" (14.56 GiB on
+        // a 32 GB Mac) only held the memory the arena and the prompt buffers need, left 85 MiB free at the first request, and was touched
+        // again after it was given back.  1500 slots is the cache the identity gates run with; --expert-cache N sets another.
+        constexpr int64_t kMetalAutoCacheSlots = 1500;
+        if (slots > kMetalAutoCacheSlots) {
+            std::fprintf(stderr, "strata generate: expert cache auto: %d slots, not %lld: on a Mac the engine reads its experts from its own arena and "
+                                 "this cache would only hold memory the arena and the prompt buffers need (--expert-cache N sets it)\n",
+                         (int) kMetalAutoCacheSlots, (long long) slots);
+            slots = kMetalAutoCacheSlots;
+        }
+#endif
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
                              "draft head) -> %d slots\n",
@@ -8626,6 +8639,15 @@ int main(int argc, char** argv) {
                                  "%lld MiB free\n",
                          (long long) o.prefill_chunk, (long long) (borrow_bytes >> 20), (long long) (free_b >> 20));
         }
+#if defined(STRATA_GPU_METAL)
+        // Metal: the prompt path's buffers are the Metal window's own (a region of its expert arena, metal/src/engine/window.cpp) - there is
+        // no loan of expert-cache slots.  Taking one anyway made short prompts end in `Prefill::relayout` ("a chunk of at most 0": the Metal
+        // Prefill has no borrowed layout) and long ones refill "lent" slots through a copy into device allocations the Metal window had given back.
+        for (PfPart& p : pf_parts) { p.first = -1; p.first_now = -1; }
+        lend_first = -1;
+        borrow = nullptr;
+        borrow_bytes = 0;
+#endif
         bool any_loan = borrow != nullptr;
         for (size_t i = 1; i < pf_parts.size(); ++i) any_loan = any_loan || pf_parts[i].first >= 0;
         if (any_loan) {
