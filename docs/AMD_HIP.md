@@ -63,20 +63,20 @@ the kernel's amdgpu driver (no ROCm install needed):
 
 The rest of setup is the same as on NVIDIA: the model download, the start script, the server.
 
-## Ready-made packages (0.2.2)
+## Ready-made packages (0.2.3)
 
-The 0.2.2 release carries one AMD engine package per card family. The Terminal one-liner and `strata update` pick the package whose
+The 0.2.3 release carries one AMD engine package per card family. The Terminal one-liner and `strata update` pick the package whose
 GPU code covers the card; the full installers carry one package each. Any app installer also works: install it, press **Update engine**
 in Settings (or run `strata update`) and the matching package downloads.
 
 | Package (variant) | OS | GPU code inside | ROCm | Installer |
 | --- | --- | --- | --- | --- |
-| `rx9070` | Windows | gfx1200, gfx1201 | 10.2.0a20260930 (TheRock) | `Strata-0.2.2-windows-hip.exe` |
-| `rdna3` | Windows | gfx1100, gfx1101, gfx1102, gfx1151 | 10.2.0a20260930 | `Strata-0.2.2-windows-hip-rdna3.exe` |
+| `rx9070` | Windows | gfx1200, gfx1201 | 10.2.0a20260930 (TheRock) | `Strata-0.2.3-windows-hip.exe` |
+| `rdna3` | Windows | gfx1100, gfx1101, gfx1102, gfx1151 | 10.2.0a20260930 | `Strata-0.2.3-windows-hip-rdna3.exe` |
 | `rdna2` (0.2.2) | Windows | gfx1030, gfx1031 | 10.2.0a20260930 | no installer of its own: any app installer, then Update engine |
-| `rx9070` | Linux | gfx1200, gfx1201 | 7.10.0a20251120 (`gfx120X-all` wheels) | `Strata-0.2.2-linux-amd-rx9070.AppImage` |
-| `rx7900` | Linux | gfx1100, gfx1101, gfx1102 | 7.10.0a20251120 (`gfx110X-dgpu` wheels) | `Strata-0.2.2-linux-amd-rx7900.AppImage` |
-| `halo` | Linux | gfx1151 | 7.14.1 (TheRock) | `Strata-0.2.2-linux-amd-strixhalo.AppImage` |
+| `rx9070` | Linux | gfx1200, gfx1201 | 7.10.0a20251120 (`gfx120X-all` wheels) | `Strata-0.2.3-linux-amd-rx9070.AppImage` |
+| `rx7900` | Linux | gfx1100, gfx1101, gfx1102 | 7.10.0a20251120 (`gfx110X-dgpu` wheels) | `Strata-0.2.3-linux-amd-rx7900.AppImage` |
+| `halo` | Linux | gfx1151 | 7.14.1 (TheRock) | `Strata-0.2.3-linux-amd-strixhalo.AppImage` |
 | `rx6000` (0.2.2) | Linux | gfx1030, gfx1031 | 7.13.0a20260515 (`gfx103X-all` wheels) | no installer of its own: any app installer, then Update engine |
 
 `rdna3` and `halo` were added to the release after the first upload (feed sequence 101). Why the split: on Windows one ROCm 10.2 library
