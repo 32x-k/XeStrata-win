@@ -13,6 +13,7 @@
 // that prompt's end; anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
 // (the file: see read_pics); the state is shared only where the same picture sits at the same place.
 #include "ds4_model.hpp"
+#include "ds4_packinfo.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -74,7 +75,8 @@ void usage() {
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
-                 "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
+                 "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"
+                 "           | --pack-info)\n");
 }
 
 // stdin lines on a thread, so a request can see STOP while it decodes
@@ -643,6 +645,7 @@ int main(int argc, char** argv) {
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
     bool serve_mode = false;
+    bool pack_info_mode = false;
     std::string images, enc_rgb, enc_out;
     std::string score_ids, score_out;
     int enc_w = 0, enc_h = 0;
@@ -695,6 +698,7 @@ int main(int argc, char** argv) {
         else if (a == "--score") score_ids = val("--score");
         else if (a == "--score-out") score_out = val("--score-out");
         else if (a == "--serve") serve_mode = true;
+        else if (a == "--pack-info") pack_info_mode = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
         else if (a == "--help" || a == "-h") {
             usage();
@@ -704,6 +708,13 @@ int main(int argc, char** argv) {
             usage();
             return 2;
         }
+    }
+    if (pack_info_mode) {   // the pack's description only: no device, no weights, no lock
+        if (o.pack.empty()) {
+            usage();
+            return 2;
+        }
+        return strata::ds4::pack_info(o.pack, stdout);
     }
     if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty())) {
         usage();
