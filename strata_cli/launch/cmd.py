@@ -212,6 +212,10 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
     elif a.family and s.model:
         s.family = a.family
     if a.data_dir:
+        from strata_control import folders
+        found = folders.problem(a.data_dir)
+        if found:
+            raise ValueError(folders.words(found))                  # one plain line and a next step, before anything is written (B05)
         s.data_dir = a.data_dir
     if a.context:
         s.context = a.context

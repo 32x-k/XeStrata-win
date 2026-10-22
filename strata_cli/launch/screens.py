@@ -787,8 +787,20 @@ class FolderScreen(Base):
                     "Press Enter to keep it, or type another folder (it is created if it does not exist). Models you already have stay where "
                     "they are and stay usable; the new folder is for new downloads.", style=MUTE)
 
+    def typed(self) -> str:
+        return self.query_one("#folderpath", Input).value.strip().strip('"')
+
+    def action_next(self) -> None:
+        """The folder is checked before going on (B05): a path that cannot hold the models is said here, in plain words, and not saved."""
+        from strata_control import folders
+        found = folders.problem(self.typed())
+        if found:
+            self.say(folders.words(found), True)
+            return
+        super().action_next()
+
     def commit(self) -> None:
-        value = self.query_one("#folderpath", Input).value.strip().strip('"')
+        value = self.typed()
         default = str(self.ctx.default_folder())
         self.ctx.settings.data_dir = None if (not value or value == default) else value
 
@@ -1439,7 +1451,7 @@ class SaveScreen(Base):
                  ("Parallel", f"{s.parallel} at a time" if s.parallel else f"fit to your card ({S.fit_parallel(self.ctx.computer.main_vram_gb)})"),
                  ("Tuning", {"quick": "quick (about 20 min)", "thorough": "thorough (up to 2 h)", "skip": "skipped"}[s.tune]),
                  ("Access", f"{S.ACCESS_WORDS[s.access]}, port {s.port}" + (", API key on" if s.api_key else ", no API key")),
-                 ("Storage", s.data_dir or "Strata's data folder")]
+                 ("Storage", s.data_dir or str(self.ctx.default_folder()))]
         if s.extra:
             lines.append(("Advanced", ", ".join(f"{k}={v}" for k, v in s.extra.items())))
         return lines
@@ -1461,7 +1473,7 @@ class SaveScreen(Base):
             model = dict(lines)["Model"].replace("Qwen3.8-Flash-Next ", "")
             rows = [f"{model} \u00b7 {S.context_label(s.context)} \u00b7 memory {s.kv or 'int8'}",
                     f"Pictures {'on' if s.vision != 'off' else 'off'} \u00b7 Parallel {s.parallel or 'auto'} \u00b7 Tuning {s.tune}",
-                    f"Access {s.access}, port {s.port}" + (f" \u00b7 Storage {s.data_dir}" if s.data_dir else "")]
+                    f"Access {s.access}, port {s.port}" + f" \u00b7 Storage {s.data_dir or self.ctx.default_folder()}"]
             t.append("Save, then launch   name:\n" if tiny else "Save as preset, then launch   name:\n", style=f"bold {ACCENT}")
             for ln in rows[:2 if tiny else 3]:
                 t.append("  " + ln + "\n")

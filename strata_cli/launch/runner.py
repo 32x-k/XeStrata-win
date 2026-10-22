@@ -98,6 +98,17 @@ def setup_failure(lines: list[str], err: str, hint: str, details: str | None, ow
         if missing_file(crashed):
             return LaunchError(f"The model could not be installed. A file that setup needs is missing from this Strata install ({crashed}).",
                                "Update Strata (`strata update`) and run it again." + where, 6)
+        if crashed.startswith("PermissionError"):
+            folder = re.findall(r"'([^']+)'", crashed)
+            shown = folder[-1] if folder else None
+            try:                                              # the folder Strata was told to use, not a file inside it
+                shown = str(Path(shown).parent) if shown and Path(shown).name in ("models", "packs", "mtp") else shown
+            except (OSError, ValueError):
+                pass
+            return LaunchError("The model could not be installed. " + (f"Windows would not let Strata write to {shown}" if shown else
+                               "Windows would not let Strata write to a folder") + " (access denied).",
+                               "Pick a folder you own for the model files (the Folder step, or --data-dir D:\\Strata-models) and start again. "
+                               "Nothing was downloaded." + where, 6)
         return LaunchError(f"The model could not be installed. Setup stopped with an error ({crashed}).", "Run it again." + where, 6)
     return LaunchError("The model could not be installed." + (f" {err}." if err else ""),
                        (hint or ("Run it again: finished steps are skipped." if own_files else
