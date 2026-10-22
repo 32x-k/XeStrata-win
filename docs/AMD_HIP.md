@@ -1097,3 +1097,27 @@ passes. Additional unpublished upstream fixture suites are not covered.
 The published performance table explicitly identifies the measured development
 snapshot; it must not be read as a benchmark of every subsequent rebase. Vision, long-context stress, broad answer-quality
 equivalence, other AMD cards, and mixed-vendor inference are not validated here.
+
+## Strix Halo: 8-bit hyper-connection weights (default on gfx1151)
+
+On a Strix Halo (gfx1151) the hyper-connection down / up projections are read as Q8_0 by default (quantized at load from the pack, or the GGUF's own Q8_0),
+which halves the 13.3 MB each read moves. Decode is about 9% faster (5 interleaved pairs per prompt on IQ3_S, MTP 4 drafts / min-p 0.5; json / code / tool
+call / chat / agent between +7.9% and +10.7%). `STRATA_HC_Q8=0` restores the bf16 read. Other cards are unchanged (gfx12 has had it on since 0.1.4x).
+Not bit-identical to the bf16 read: a greedy answer can pick another token at a near tie and then go its own way.
+
+How far it moves the model, measured with the quant-quality yardstick (teacher forced, 5 texts of 1,000 tokens, reference = bf16 read; RTX A4000, IQ3_XXS,
+2026-10-22 — the Q8_0 weights are the same bytes on every card):
+
+| text | top-1 same | KL |
+| --- | ---: | ---: |
+| code | 97.9% | 0.0077 |
+| documents | 93.5% | 0.0229 |
+| English | 94.7% | 0.0107 |
+| other languages | 98.0% | 0.0060 |
+| agent transcript | 93.0% | 0.0779 |
+| all 4,995 positions | 95.4% | 0.0251 |
+
+For scale, the same yardstick with the bf16 read on both sides and only the experts computed on the CPU instead of the GPU (a rounding-only difference the
+engine takes whenever an expert is not resident) gives code 0.0062, documents 0.0195, English 0.0088, other languages 0.0048, agent 0.0745, all 0.0228
+(top-1 95.4%). The 8-bit read is at that level. The agent text's number rests on a few near-tie positions (the top 20 of 999 carry half of it); finer blocks
+(16 or 8 values) did not lower it, and 8-bit hyper-connection weights in the first six layers alone give the full figure, in the last 24 layers a third of it.
