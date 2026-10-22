@@ -333,7 +333,7 @@ def main() -> int:
                                      "checkpoint's vision.* / aligner.* (default: the first mmproj*.gguf in <model>/..)")
     ap.add_argument("--tq-experts", nargs="+", help="folders tq_convert.py wrote (tq.json + tq-L<layer>.bin): the routed experts of the layers "
                                          "listed there are read from it as trellis types (TQK5X ..), the others keep their MXFP4")
-    ap.add_argument("--dense-override", help="a folder dense_requant.py wrote (dense.json + dense.bin): its tensors replace the same-named "
+    ap.add_argument("--dense-override", action="append", help="a folder dense_requant.py wrote (dense.json + dense.bin): its tensors replace the same-named "
                                              "dense matrices of the GGUF (K-quants of the attention / shared experts)")
     ap.add_argument("--override-experts", nargs="+", help="requantized GGUF folders, each DIR or DIR:roles (requant_gguf.py output): their routed experts replace the main "
                                                "model's for --override-roles (gate,up,down) in --override-layers (default all): mixed-bit packs")
@@ -492,8 +492,8 @@ def main() -> int:
         print("experts overridden from %s: %d tensors (roles %s, layers %s)" % (od, len(new), drl or a.override_roles, a.override_layers or "all"))
     # dense matrices requantized by dense_requant.py replace the GGUF's BF16 ones
     n_dense = 0
-    if a.dense_override:
-        dd = pathlib.Path(a.dense_override).expanduser().resolve()
+    for dsrc in (a.dense_override or []):
+        dd = pathlib.Path(dsrc).expanduser().resolve()
         dj = json.loads((dd / "dense.json").read_text())
         try:
             relf = os.path.relpath(dd / "dense.bin", model).replace(os.sep, "/")
@@ -503,12 +503,14 @@ def main() -> int:
             files.append(relf)
         dfi = files.index(relf)
         pos = {t[0]: i for i, t in enumerate(tensors)}
+        n_here = 0
         for name, (tname, fname, off, nb, shape) in dj.items():
             if name not in pos:
                 raise SystemExit("dense override: %s is not in the pack" % name)
             tensors[pos[name]] = (name, tname, dfi, off, nb, shape)
-            n_dense += 1
-        print("dense override from %s: %d tensors" % (dd, n_dense))
+            n_here += 1
+        n_dense += n_here
+        print("dense override from %s: %d tensors (a later folder wins)" % (dd, n_here))
     # the DSpark drafter from unsloth's GGUF (architecture dflash): blk.N.* -> mtp.N.*, the head tensors under the
     # checkpoint's names (fc -> main_proj, enc.output_norm -> main_norm, output_norm -> norm of the last block,
     # conf_proj -> confidence_head.proj, markov_w1 / w2 -> markov_head.embed / head)

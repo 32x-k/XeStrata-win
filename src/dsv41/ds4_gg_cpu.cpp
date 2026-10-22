@@ -11,6 +11,7 @@
 #if defined(STRATA_DSV41_TQ_CPU)
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "strata/kernels/cpu/iq_avx2.hpp"
 
 #include <mutex>
 #include <vector>
@@ -72,7 +73,28 @@ void gg_cpu_quant(int act, const float* x, int k, void* dst) {
     t->from_float_ref(x, dst, k);
 }
 
+// Strata's AVX2 multi-token rows for the i-quants (iq256_rows: each 32-value chunk decoded once, every token applies it;
+// the integer sums are ggml's, only the float additions come in another order).  DS4_GG_IQ256=0: ggml-cpu's row dots.
+static int g_iq256 = -1;   // -1: from the environment and the CPU, 0 off, 1 on
+void gg_cpu_set_iq256(int mode) { g_iq256 = mode; }
+static bool use_iq256(int type) {
+    if (g_iq256 < 0) {
+        const char* v = std::getenv("DS4_GG_IQ256");
+        bool avx2 = false;
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+        __builtin_cpu_init();
+        avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
+#endif
+        g_iq256 = avx2 && (v == nullptr || std::atoi(v) != 0) ? 1 : 0;
+    }
+    return g_iq256 == 1 && strata::kernels::cpu::iq256_supported(type);
+}
+
 static void dots(int type, const uint8_t* w, size_t rb, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
+    if (nt > 0 && use_iq256(type)) {
+        strata::kernels::cpu::iq256_rows(type, w, rb, n, act, nt, out, r0, r1);
+        return;
+    }
     const ggml_type_traits_cpu* tc = ggml_get_type_traits_cpu((ggml_type) type);
     if (dbg()) std::fprintf(stderr, "gg dots type %d n %d rows %d..%d nt %d\n", type, n, r0, r1, nt);
     for (int r = r0; r < r1; ++r)
