@@ -40,13 +40,13 @@ double DraftPolicy::lookup_rate(int match) const {
 
 double DraftPolicy::cost_ms(int t) const {
     t = std::clamp(t, 1, kMaxT);
-    if (cost_n_[t] > 0) return cost_[t];
+    if (cost_n_[bk_][t] > 0) return cost_[bk_][t];
     // scale from the measured sizes, weighting each by how often it was seen
     double num = 0.0, den = 0.0;
     for (int u = 1; u <= kMaxT; ++u)
-        if (cost_n_[u] > 0) {
-            const double w = std::min(cost_n_[u], 20.0);
-            num += w * cost_[u] * kShape[t] / kShape[u];
+        if (cost_n_[bk_][u] > 0) {
+            const double w = std::min(cost_n_[bk_][u], 20.0);
+            num += w * cost_[bk_][u] * kShape[t] / kShape[u];
             den += w;
         }
     return den > 0 ? num / den : kShape[t];
@@ -55,35 +55,65 @@ double DraftPolicy::cost_ms(int t) const {
 double DraftPolicy::clamp_sample(int t, double ms) const {
     if (!robust_) return ms;
     const double known = cost_ms(t);           // the measured value, or the scaled guess from the other widths
-    if (cost_n_[t] == 0) {
+    if (cost_n_[bk_][t] == 0) {
         // the first use of a width captures its graph: that round says nothing about its cost, the guess from the other widths stands in
         for (int u = 1; u <= kMaxT; ++u)
-            if (cost_n_[u] > 0) return known;
+            if (cost_n_[bk_][u] > 0) return known;
         return ms;
     }
     return std::min(ms, 2.0 * known);
 }
 
-void DraftPolicy::seed_costs(const double* ms, int n, double weight) {
+void DraftPolicy::seed_costs(const double* ms, int n, double weight, int bucket) {
+    bucket = std::clamp(bucket, 0, kCtxBuckets - 1);
     for (int t = 1; t <= std::min(n, kMaxT); ++t)
-        if (ms[t - 1] > 0.0 && cost_n_[t] == 0) {
-            cost_[t] = ms[t - 1];
-            cost_n_[t] = weight;
+        if (ms[t - 1] > 0.0 && cost_n_[bucket][t] == 0) {
+            cost_[bucket][t] = ms[t - 1];
+            cost_n_[bucket][t] = weight;
         }
+}
+
+void DraftPolicy::set_context(long long pos) {
+    if (!robust_) return;
+    const int nb = pos < 6000 ? 0 : pos < 24000 ? 1 : 2;
+    if (nb == bk_) return;
+    bool has = false;
+    for (int t = 1; t <= kMaxT; ++t) has = has || cost_n_[nb][t] > 0;
+    if (!has) {   // nothing measured at this length yet: the nearest bucket that has data is the prior (one sample's worth)
+        for (int d = 1; d < kCtxBuckets && !has; ++d)
+            for (const int src : {nb - d, nb + d}) {
+                if (src < 0 || src >= kCtxBuckets || has) continue;
+                for (int t = 1; t <= kMaxT; ++t)
+                    if (cost_n_[src][t] > 0) {
+                        cost_[nb][t] = cost_[src][t];
+                        cost_n_[nb][t] = 1.0;
+                        last_[nb][t] = rounds_;
+                        has = true;
+                    }
+            }
+    }
+    bk_ = nb;
 }
 
 std::string DraftPolicy::cost_table_text() const {
     std::string out;
     char b[64];
-    for (int t = 1; t <= kMaxT; ++t)
-        if (cost_n_[t] > 0) {
-            std::snprintf(b, sizeof b, "%sT%d:%.2f(n=%.0f)", out.empty() ? "" : " ", t, cost_[t], cost_n_[t]);
-            out += b;
-        }
+    for (int k = 0; k < kCtxBuckets; ++k) {
+        bool any = false;
+        for (int t = 1; t <= kMaxT; ++t) any = any || cost_n_[k][t] > 0;
+        if (!any) continue;
+        out += (out.empty() ? "" : " | ");
+        out += k == 0 ? "ctx<6K:" : k == 1 ? "ctx<24K:" : "ctx>=24K:";
+        for (int t = 1; t <= kMaxT; ++t)
+            if (cost_n_[k][t] > 0) {
+                std::snprintf(b, sizeof b, " T%d:%.2f(n=%.0f)", t, cost_[k][t], cost_n_[k][t]);
+                out += b;
+            }
+    }
     return out;
 }
 
-bool DraftPolicy::stale(int t) const { return cost_n_[t] > 0 && rounds_ - last_[t] > kStaleRounds; }
+bool DraftPolicy::stale(int t) const { return cost_n_[bk_][t] > 0 && rounds_ - last_[bk_][t] > kStaleRounds; }
 
 double DraftPolicy::mtp_tokens(int t) const {
     if (mtp_n_[t] > 0) return mtp_tok_[t];
@@ -114,7 +144,7 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
     }
     // a guessed cost can keep the policy from ever measuring a size: the first few times a confident lookup would
     // need a size not measured yet, it is tried (verification keeps the output; only the one round's speed is at stake)
-    if (t_full > p.t && (cost_n_[t_full] < kProbes || stale(t_full)) && q >= 0.85) {
+    if (t_full > p.t && (cost_n_[bk_][t_full] < kProbes || stale(t_full)) && q >= 0.85) {
         p.lookup = true;
         p.t = t_full;
     }
@@ -125,10 +155,10 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
     t = std::clamp(t, 1, kMaxT);
     if (round_ms > 0) {
         round_ms = clamp_sample(t, round_ms);
-        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
-        cost_[t] = cost_n_[t] > 0 ? (1.0 - alpha) * cost_[t] + alpha * round_ms : round_ms;
-        cost_n_[t] += 1.0;
-        last_[t] = rounds_;
+        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
+        cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
+        cost_n_[bk_][t] += 1.0;
+        last_[bk_][t] = rounds_;
     }
     rounds_ += 1.0;
     if (lookup) {
@@ -183,14 +213,14 @@ bool DraftPolicy::keep_draft(ChainState& st, int idx, float p, int cap) const {
             st.best_rows = rows;
         }
         // a width not measured yet is tried a few times when the chain is likely to hold that far
-        if (cost_n_[rows] < kProbes && st.q >= 0.15) st.best_rows = rows;
+        if (cost_n_[bk_][rows] < kProbes && st.q >= 0.15) st.best_rows = rows;
     }
     st.kept = st.best_rows - 1;
     if (rows + 1 > cap) return false;                       // no row left for another draft
     // one or two more drafts, each as likely to hold as this one did, could they beat the best width so far?
     const double v1 = (st.e + st.q * a) / cost_ms(rows + 1);
     const double v2 = rows + 2 <= cap ? (st.e + st.q * a + st.q * a * a) / cost_ms(rows + 2) : 0.0;
-    return std::max(v1, v2) > st.best_v * (1.0 + margin_ / 3.0) || (cost_n_[rows + 1] < kProbes && st.q * a >= 0.15);
+    return std::max(v1, v2) > st.best_v * (1.0 + margin_ / 3.0) || (cost_n_[bk_][rows + 1] < kProbes && st.q * a >= 0.15);
 }
 
 double DraftPolicy::chain_rate(int match) const {
@@ -221,7 +251,7 @@ int DraftPolicy::chain(int t_mtp, double p_mtp, int k_avail, int match) const {
         return best_k;
     }
     // as choose(): a size whose cost is only guessed is tried a few times when the continuation looks likely
-    if ((cost_n_[t_full] < kProbes || stale(t_full)) && p_mtp * c >= 0.6) return kmax;
+    if ((cost_n_[bk_][t_full] < kProbes || stale(t_full)) && p_mtp * c >= 0.6) return kmax;
     return 0;
 }
 
@@ -229,10 +259,10 @@ void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, doubl
     const int t = std::clamp(t_mtp + k, 1, kMaxT);
     if (round_ms > 0) {
         round_ms = clamp_sample(t, round_ms);
-        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
-        cost_[t] = cost_n_[t] > 0 ? (1.0 - alpha) * cost_[t] + alpha * round_ms : round_ms;
-        cost_n_[t] += 1.0;
-        last_[t] = rounds_;
+        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
+        cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
+        cost_n_[bk_][t] += 1.0;
+        last_[bk_][t] = rounds_;
     }
     rounds_ += 1.0;
     // the MTP part is an ordinary MTP window as far as its own drafts go

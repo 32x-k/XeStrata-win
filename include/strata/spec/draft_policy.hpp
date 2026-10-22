@@ -24,6 +24,7 @@ class DraftPolicy {
 public:
     static constexpr int kMaxT = 8;
     static constexpr int kBuckets = 4;
+    static constexpr int kCtxBuckets = 3;   // STRATA_SPEC_COST: row costs per context length (< 6K, < 24K, longer)
 
     explicit DraftPolicy(int max_t, double margin = 0.03);
 
@@ -48,7 +49,10 @@ public:
     double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens
     /// A per-card row-cost table (round ms of the windows of 1..n rows, the draft included) counted as `weight` earlier rounds each:
     /// the start of a process that already knows the card (STRATA_SPEC_COST_TABLE; tuning time), replaced by what it then measures.
-    void seed_costs(const double* ms, int n, double weight);
+    void seed_costs(const double* ms, int n, double weight, int bucket = 0);
+    /// STRATA_SPEC_COST: the context position of the next round; selects the row-cost table of its length (a row of attention costs
+    /// more at 16K than at 1K).  A bucket with no measurement yet starts from the nearest one that has.  A no-op without set_robust(true).
+    void set_context(long long pos);
     /// The measured round cost of every window size seen: "T1:39.8(n=120) T2:..." for the log / the next process's table.
     std::string cost_table_text() const;
     /// STRATA_SPEC_COST: a round time far above what is known for that width (the first use of a width captures its graph; a stalled
@@ -81,7 +85,8 @@ private:
 
     int max_t_;
     double margin_;
-    std::array<double, kMaxT + 1> cost_{}, cost_n_{};      // round ms by window size
+    std::array<std::array<double, kMaxT + 1>, kCtxBuckets> cost_{}, cost_n_{};   // round ms by context bucket and window size
+    int bk_ = 0;                                           // the current context bucket
     std::array<double, kMaxT + 1> mtp_tok_{}, mtp_n_{};    // tokens committed by MTP windows of that size
     std::array<double, kBuckets> ok_{}, bad_{};            // lookup drafts accepted / windows cut short, decayed
     std::array<double, kBuckets> cok_{}, cbad_{};          // chained lookup drafts, the same (reached rounds only)
@@ -90,7 +95,7 @@ private:
     double clamp_sample(int t, double ms) const;
     static constexpr int kPBuckets = 8;
     std::array<double, kPBuckets> pa_ok_{}, pa_n_{};       // MTP drafts reached / accepted by probability bucket (decayed)
-    std::array<double, kMaxT + 1> last_{};                 // the round at which each size was last measured
+    std::array<std::array<double, kMaxT + 1>, kCtxBuckets> last_{};   // the round at which each size was last measured
 };
 
 }  // namespace strata::spec

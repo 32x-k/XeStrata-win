@@ -14734,6 +14734,7 @@ int main(int argc, char** argv) {
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
+                policy.set_context(p);
                 if (use_mtp && spec_cost && !first_window) {
                     T = std::clamp(chain_rows, 1, S_mtp);
                 } else if (use_mtp && req_spec_min_p > 0.0) {
@@ -16249,14 +16250,19 @@ int main(int argc, char** argv) {
         strata::spec::DraftPolicy::ChainState chain_st;
         int chain_rows = 1;   // STRATA_SPEC_COST: the window the cost-aware rule kept in the MTP chain just drafted
         if (const char* tab = std::getenv("STRATA_SPEC_COST_TABLE"); spec_cost && tab != nullptr && tab[0] != '\0') {
+            // "T1,T2,..;T1,T2,..;T1,..": the row costs of the 3 context buckets (< 6K, < 24K, longer); one list seeds the first
             double ms[strata::spec::DraftPolicy::kMaxT] = {};
-            int n = 0;
-            for (const char* q = tab; *q != '\0' && n < strata::spec::DraftPolicy::kMaxT;) {
-                ms[n++] = std::atof(q);
-                while (*q != '\0' && *q != ',') ++q;
-                if (*q == ',') ++q;
+            int n = 0, bucket = 0;
+            for (const char* q = tab; *q != '\0' && bucket < strata::spec::DraftPolicy::kCtxBuckets;) {
+                if (n < strata::spec::DraftPolicy::kMaxT) ms[n++] = std::atof(q);
+                while (*q != '\0' && *q != ',' && *q != ';') ++q;
+                const bool end_list = *q == ';' || *q == '\0';
+                if (*q != '\0') ++q;
+                if (end_list) {
+                    policy.seed_costs(ms, n, 6.0, bucket++);
+                    n = 0;
+                }
             }
-            policy.seed_costs(ms, n, 6.0);
         }
         policy.set_robust(spec_cost);
         if (spec_cost && use_mtp)
@@ -16309,6 +16315,7 @@ int main(int argc, char** argv) {
             const Clock::time_point t0 = Clock::now();
             strata::core::progress_at("spec loop: choosing the window", (int64_t) produced.size());
             int T = S_mtp;
+            policy.set_context(p);
             if (use_mtp && spec_cost && !first_window) {
                 T = std::clamp(chain_rows, 1, S_mtp);
             } else if (use_mtp && o.spec_min_p > 0.0) {
