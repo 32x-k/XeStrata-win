@@ -3509,5 +3509,19 @@
   "s9017": "Neuen Chat beginnen",
   "s9018": "Die Nachricht konnte nicht vorbereitet werden. Versuchen Sie es mit einer kürzeren Nachricht.",
   "s9019": "Die letzte Strata-Sitzung wird noch beendet.",
-  "s9020": "Warten Sie einen Moment und versuchen Sie es erneut. Wenn es wieder passiert, starten Sie den Computer neu."
+  "s9020": "Warten Sie einen Moment und versuchen Sie es erneut. Wenn es wieder passiert, starten Sie den Computer neu.",
+  "s9021": "Vorausraten",
+  "s9022": "Automatisch (empfohlen)",
+  "s9023": "MTP",
+  "s9024": "DFlash2",
+  "s9025": "Vorausraten: MTP (DFlash2 hat nicht hineingepasst)",
+  "s9026": "Vorausraten: MTP (DFlash2 ist in diesem Modus nicht verfügbar)",
+  "s9027": "Vorausraten: MTP (DFlash2 gibt es nur für Qwen3.8-Flash-Next)",
+  "s9028": "Vorausraten: MTP (der DFlash2-Entwurfsbaustein ist noch nicht heruntergeladen)",
+  "s9029": "Wenn Sie DFlash2 wählen, wird auch sein Entwurfsbaustein heruntergeladen: etwa {0} GB, einmalig. Passt er nicht in den Grafikspeicher, nutzt das Modell stattdessen MTP.",
+  "s9030": "DFlash2-Entwurfsbaustein wird heruntergeladen …",
+  "s9031": "DFlash2-Entwurfsbaustein wird für die Engine vorbereitet …",
+  "s9032": "Der DFlash2-Entwurfsbaustein ist bereit.",
+  "s9033": "Der DFlash2-Entwurfsbaustein konnte nicht heruntergeladen werden, deshalb startet das Modell mit MTP. Das Modell wird geladen …",
+  "s9034": "Das Modell wird geladen …"
 }

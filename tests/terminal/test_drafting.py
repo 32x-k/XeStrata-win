@@ -223,7 +223,7 @@ class WhatTheEngineSaid(unittest.TestCase):
 
     def test_choices_that_never_reached_the_engine_keep_their_own_words(self):
         self.assertEqual(drafting.engine_info(["--mtp", "/m"], "", drafting.NOT_SUPPORTED)["drafting_note"],
-                         "Drafting: MTP (DFlash2 is for Qwen3.8-Flash-Next only; this model uses the MTP)")
+                         "Drafting: MTP (DFlash2 is for Qwen3.8-Flash-Next only)")
         self.assertEqual(drafting.engine_info(["--mtp", "/m"]), {"drafting": "mtp", "drafting_note": ""})
         self.assertEqual(drafting.engine_info(["--spec", "4"]), {"drafting": "off", "drafting_note": ""})
 
@@ -232,7 +232,23 @@ class WhatTheEngineSaid(unittest.TestCase):
         self.assertEqual(drafting.summary_line(drafting.Decision("dflash2", "dflash2")), "Drafting: DFlash2")
         self.assertEqual(drafting.summary_line(drafting.Decision("off", "off")), "Drafting: Off")
         self.assertEqual(drafting.summary_line(drafting.Decision("dflash2", "mtp", drafting.NOT_DOWNLOADED)),
-                         "Drafting: MTP (The DFlash2 drafter is not downloaded yet; this start uses the MTP)")
+                         "Drafting: MTP (the DFlash2 drafter isn't downloaded yet)")
+
+
+class WordsMatchTheApp(unittest.TestCase):
+    def test_every_line_the_engine_start_can_say_is_in_the_apps_catalog_in_all_eight_languages(self):
+        folder = ROOT / "apps" / "host" / "src" / "locales"
+        catalogs = {l: json.loads((folder / f"{l}.json").read_text(encoding="utf-8")) for l in ("en", "de", "es", "ja", "ko", "pt", "ru", "zh")}
+        ids = {v: k for k, v in catalogs["en"].items()}
+        self.assertEqual(len(drafting.REASONS), 4)
+        for reason in drafting.REASONS:
+            line = drafting.mtp_line(reason)
+            self.assertIn(line, ids, line)
+            for lang, catalog in catalogs.items():
+                self.assertTrue(catalog[ids[line]].strip(), f"{line} in {lang}")
+        # and what the engine's log makes of them
+        self.assertEqual(drafting.fallback_note("--draft dflash2: out of memory"), drafting.mtp_line(drafting.DIDNT_FIT))
+        self.assertEqual(drafting.fallback_note("--draft dflash2 is off: it is for one card and the CLI run"), drafting.mtp_line(drafting.NOT_HERE))
 
 
 class TerminalFlag(unittest.TestCase):
@@ -386,6 +402,57 @@ class FetchAndPack(unittest.TestCase):
         self.assertEqual(payload["gb"], 1.2)
 
 
+class TheAppAsksControl(unittest.TestCase):
+    """The app calls `strata drafting plan|fetch --config <run config> --mode <choice>` before a load; Control decides, the app never reads the table."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data = Path(self.tmp.name) / "data"
+        self.cfg = Path(self.tmp.name) / "strata-gyro.json"
+        self.cfg.write_text(json.dumps({"model_name": GYRO, "args": ["--pack", str(self.data / "packs" / "gyro"), "--mtp", str(self.data / "mtp" / "rt")]}))
+
+    def plan(self, *extra):
+        code, out, err = run_cli(["drafting", "plan", "--config", str(self.cfg), "--output", "json", *extra])
+        self.assertEqual(code, 0, err)
+        return json.loads(out)
+
+    def test_nothing_is_needed_for_auto_mtp_or_off(self):
+        for mode in ("auto", "mtp", "off"):
+            plan = self.plan("--mode", mode)
+            self.assertFalse(plan["needed"], mode)
+            self.assertEqual(plan["gb"], 0.0)
+        self.assertEqual(self.plan("--mode", "off")["drafter"], "off")
+
+    def test_dflash2_is_needed_once_the_engine_can_serve_it_and_not_before(self):
+        before = self.plan("--mode", "dflash2")
+        self.assertFalse(before["needed"], "while the engine cannot serve it nothing is downloaded")
+        self.assertEqual(before["line"], "Drafting: MTP (DFlash2 isn't available in this mode)")
+        with serving_dflash2():
+            plan = self.plan("--mode", "dflash2")
+            self.assertTrue(plan["needed"])
+            self.assertEqual(plan["gb"], 1.2)
+            self.assertEqual(Path(plan["pack"]), drafting.pack_path(self.data), "the data folder comes from the run config's own arguments")
+            self.cfg.write_text(json.dumps({"model_name": "qwen3.8-flash-next-coder-iq3_xxs", "drafting": "dflash2", "args": ["--pack", str(self.data / "packs" / "c")]}))
+            other = self.plan()
+            self.assertFalse(other["needed"])
+            self.assertEqual(other["note"], drafting.NOT_SUPPORTED)
+
+    def test_a_model_that_is_not_installed_yet_is_asked_about_by_its_family(self):
+        with serving_dflash2():
+            for family, needed in (("gyro", True), ("qwen", True), ("coder", False), ("swift", False)):
+                code, out, err = run_cli(["drafting", "plan", "--family", family, "--mode", "dflash2", "--data-dir", str(self.data), "--output", "json"])
+                self.assertEqual(code, 0, err)
+                self.assertEqual(json.loads(out)["needed"], needed, family)
+
+    def test_fetch_if_needed_does_nothing_when_nothing_is_needed(self):
+        code, out, err = run_cli(["drafting", "fetch", "--config", str(self.cfg), "--mode", "auto", "--if-needed", "--output", "jsonl"])
+        self.assertEqual(code, 0, err)
+        last = json.loads(out.strip().splitlines()[-1])
+        self.assertEqual((last["ok"], last["skipped"], last["pack"]), (True, True, None))
+        self.assertFalse(drafting.pack_path(self.data).exists())
+
+
 class TheDownloadPlanListsIt(unittest.TestCase):
     """`strata launch --plan --drafting dflash2` adds the drafter to the download when it would be used."""
 
@@ -395,7 +462,7 @@ class TheDownloadPlanListsIt(unittest.TestCase):
         with Home() as home:
             runner = Runner(S.LaunchSettings(family="qwen", model="Q2_0", context=32768, vision="off", drafting="dflash2"), catalog=catalog(HW_12))
             line = runner.drafting_plan_line()
-            self.assertEqual(line, "Drafting: MTP (DFlash2 isn't available in this mode yet; this start uses the MTP)")
+            self.assertEqual(line, "Drafting: MTP (DFlash2 isn't available in this mode)")
             self.assertNotIn("dflash2", [p["kind"] for p in runner.download_plan()["parts"]], "nothing to fetch while the engine cannot serve it")
             with serving_dflash2():
                 kinds = {p["kind"]: p for p in runner.download_plan()["parts"]}

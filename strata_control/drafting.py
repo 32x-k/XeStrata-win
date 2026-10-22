@@ -145,9 +145,18 @@ def normalize(value: Any) -> str:
 #: else (flags, download, pack, fallback text) is in place and tested with it on.
 ENGINE_SERVES_DFLASH2 = False
 
-NOT_SUPPORTED = "DFlash2 is for Qwen3.8-Flash-Next only; this model uses the MTP."
-NOT_SERVED = "DFlash2 isn't available in this mode yet; this start uses the MTP."
-NOT_DOWNLOADED = "The DFlash2 drafter is not downloaded yet; this start uses the MTP."
+#: Why the MTP runs when something else was asked for: a closed set of short reasons, each one is a sentence in the interface catalog in all eight
+#: languages (the line is "Drafting: MTP (<reason>)").
+DIDNT_FIT = "DFlash2 didn't fit"
+NOT_HERE = "DFlash2 isn't available in this mode"
+NOT_SUPPORTED = "DFlash2 is for Qwen3.8-Flash-Next only"
+NOT_DOWNLOADED = "the DFlash2 drafter isn't downloaded yet"
+NOT_SERVED = NOT_HERE
+REASONS = (DIDNT_FIT, NOT_HERE, NOT_SUPPORTED, NOT_DOWNLOADED)
+
+
+def mtp_line(reason: str) -> str:
+    return f"Drafting: MTP ({reason})"
 
 
 def decide(mode: Any, *, klass: str, model_name: str | None = None, family: str | None = None, data_dir: str | Path | None = None) -> Decision:
@@ -223,11 +232,7 @@ def apply(cfg: dict[str, Any], *, klass: str, data_dir: str | Path | None = None
 
 # --------------------------------------------------------------------------------------------------- what the engine said
 
-_FALLBACK = re.compile(r"--draft dflash2(?: is off)?:\s*(?P<why>[^\n]*?)(?:\.\s|;\s|$)")
 _ON = re.compile(r"DFlash2 drafter on\b")
-
-DIDNT_FIT = "DFlash2 didn't fit"
-NOT_HERE = "DFlash2 isn't available in this mode"
 
 
 def fallback_note(log_text: str) -> str:
@@ -243,7 +248,7 @@ def fallback_note(log_text: str) -> str:
         reason = NOT_HERE
     else:
         reason = DIDNT_FIT
-    return f"Drafting: MTP ({reason})"
+    return mtp_line(reason)
 
 
 def summary_line(decision: Decision, engine_note: str = "") -> str:
@@ -251,7 +256,7 @@ def summary_line(decision: Decision, engine_note: str = "") -> str:
     if engine_note:
         return engine_note
     if decision.note:
-        return f"Drafting: MTP ({decision.note.rstrip('.')})"
+        return mtp_line(decision.note)
     return f"Drafting: {LABELS.get(decision.drafter, decision.drafter) if decision.drafter != 'mtp' else 'MTP'}"
 
 
@@ -281,5 +286,5 @@ def engine_info(args: list[Any], log_text: str = "", note: str = "") -> dict[str
     if asked_dflash2 and not fell_back:
         return {"drafting": "dflash2", "drafting_note": ""}
     drafter = "mtp" if "--mtp" in items else "off"
-    text = fell_back or (f"Drafting: MTP ({note.rstrip('.')})" if note and drafter == "mtp" else "")
+    text = fell_back or (mtp_line(note) if note and drafter == "mtp" else "")
     return {"drafting": drafter, "drafting_note": text}
