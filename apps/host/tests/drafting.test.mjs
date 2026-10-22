@@ -31,7 +31,7 @@ test('Off leaves the draft layer out of every start, the same as "Draft layer (M
 
 test('the Models screen offers the choice next to context, DFlash2 only for Qwen3.8-Flash-Next, and carries it to the plan and the load', () => {
   const screen = read('../src/components/NativeModels.tsx');
-  assert.match(screen, /\['qwen', 'gyro'\]\.includes\(String\(selectedSize\.sourceFamily \?\? selectedFamily\?\.family\)\) \? \['auto', 'mtp', 'dflash2', 'off'\] : \['auto', 'mtp', 'off'\]/);
+  assert.match(screen, /draftingOptions\(selectedSize\.sourceFamily \?\? selectedFamily\?\.family, native\?\.capabilities\?\.dflash2\)/);
   assert.match(screen, /draftingWords: Record<string, string> = \{ auto: 'Auto \(recommended\)', mtp: 'MTP', dflash2: 'DFlash2', off: 'Off' \}/);
   const row = screen.slice(screen.indexOf('<div className="native-choice__row">'), screen.indexOf('{roleCards.length > 1 ? <GpuRoles'));
   assert.ok(row.indexOf('Conversation context') < row.indexOf('tr("Drafting")') && row.indexOf('tr("Drafting")') < row.indexOf('Computer use'), 'in the same row, between context and computer use');
@@ -98,4 +98,26 @@ test('every sentence of the Drafting choice is in the catalog in all eight langu
       if (l !== 'en' && text.length > 25) assert.notEqual(t, text, `${id} is translated in ${l}`);
     }
   }
+});
+
+test('DFlash2 is offered only for Qwen3.8-Flash-Next AND only once the engine serves it; until then the setting is Auto / MTP / Off', async () => {
+  const { transform } = await import('esbuild');
+  const code = (await transform(read('../src/lib/drafting.ts'), { loader: 'ts', format: 'esm' })).code;
+  const { draftingChoices } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
+  const off = ['auto', 'mtp', 'off'], all = ['auto', 'mtp', 'dflash2', 'off'];
+  // the engine does not serve it (this release): never offered
+  for (const family of ['qwen', 'gyro', 'coder', 'swift', undefined]) {
+    assert.deepEqual(draftingChoices(family, false), off, `${family}, not served`);
+    assert.deepEqual(draftingChoices(family, undefined), off, `${family}, Control has not answered`);
+    assert.deepEqual(draftingChoices(family, null), off);
+  }
+  // the engine serves it: only the models it is for
+  assert.deepEqual(draftingChoices('qwen', true), all);
+  assert.deepEqual(draftingChoices('gyro', true), all);
+  for (const family of ['coder', 'swift', 'unsloth', 'nvfp4', undefined]) assert.deepEqual(draftingChoices(family, true), off, `${family}, served`);
+  // the app learns it from Control, once, and false until Control answers
+  const host = read('../server/native-control.mjs');
+  assert.match(host, /dflash2:dflash2Served===true/);
+  assert.match(host, /dflash2Served=p\.serves===true/);
+  assert.match(host, /function probeDrafting\(\)\{if\(!packaged\|\|dflash2Served!==null/);
 });

@@ -61,7 +61,7 @@ def run(a) -> int:
     needed = drafting.needs_pack(**want)
     if a.drafting_command == "plan":
         decision = drafting.decide(want["mode"], klass=want["klass"], model_name=want["model_name"], family=want["family"], data_dir=folder)
-        result = {**drafting_fetch.plan(folder), "needed": needed, "drafter": decision.drafter, "note": decision.note,
+        result = {**drafting_fetch.plan(folder), "needed": needed, "serves": drafting.ENGINE_SERVES_DFLASH2, "drafter": decision.drafter, "note": decision.note,
                   "line": drafting.summary_line(decision)}
         if (a.config or a.mode) and not needed:           # asked about a model: nothing to download unless the choice uses the drafter
             result["gb"] = 0.0
