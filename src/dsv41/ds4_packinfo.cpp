@@ -4,6 +4,7 @@
 // pack's whole description (tools/dsv41/pack_gguf.py).  The same report is the first line of every benchmark log.
 #include "ds4_packinfo.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -211,6 +212,24 @@ int pack_info(const std::string& dir, std::FILE* out) {
     std::fprintf(out, "  dense types:");
     for (const auto& d : dense_types) std::fprintf(out, " %s", d.c_str());
     std::fprintf(out, "\n");
+    // the geometry the engine needs at run time but that is easy to lose in a pack built by another tool: DSpark's block
+    // size / noise token / markov rank (0 there means it drafts one token a run, i.e. it is off) and the Engram's layers
+    {
+        auto kvn = [&](const char* k) {
+            auto it = kv.find(k);
+            return it == kv.end() ? 0 : std::atoll(it->second.c_str());
+        };
+        const int n_mtp = (int) std::count_if(t.begin(), t.end(), [](const auto& p) { return p.first.rfind("mtp.", 0) == 0; });
+        const long long nl_eg = num("engram_layer_ids", -1);
+        std::fprintf(out, "  dspark: block_size %lld, noise_token_id %lld, markov_rank %lld, routed experts %lld of %lld%s\n",
+                     num("dspark_block_size", 0), num("dspark_noise_token_id", 0), num("dspark_markov_rank", 0),
+                     num("dspark_n_routed_experts", 0), num("dspark_num_experts_per_tok", 0),
+                     num("dspark_block_size", 0) == 0 ? "  <- DSpark cannot draft (block size 0)" : "");
+        std::fprintf(out, "  mtp tensors: %d%s\n", n_mtp, n_mtp == 0 ? "  <- no DSpark drafter in the pack" : "");
+        auto it = kv.find("engram_layer_ids");
+        std::fprintf(out, "  engram layers: %s%s\n", it == kv.end() ? "(none)" : it->second.c_str(),
+                     it == kv.end() ? "  <- the Engram tables are not used" : "");
+    }
     if (no_kernel.empty()) {
         std::fprintf(out, "  no GPU kernel: none (every tensor is a device type)\n");
     } else {
