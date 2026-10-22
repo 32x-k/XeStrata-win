@@ -5890,6 +5890,14 @@ def data_folder(requested: str | None, move: bool = False, yes: bool = True, set
     settings = load_settings()
     remembered = Path(settings["data_dir"]) if settings.get("data_dir") else home().parent / "Strata-data"
     dest = Path(requested).expanduser().resolve() if requested else remembered
+    from strata_control import folders
+    bad = folders.problem(dest)
+    if bad and requested:
+        fail(folders.words(bad)[:400], "Nothing was downloaded or changed, and the folder was not saved as your data folder.")
+    if bad and settings.get("data_dir"):                # an unusable folder saved earlier: go back to the default and say so; never keep it
+        warn(f"The data folder saved before cannot be used ({bad[0]}) Using {home().parent / 'Strata-data'} instead.")
+        remembered = dest = home().parent / "Strata-data"
+        settings = {k: v for k, v in settings.items() if k != "data_dir"}
     try:
         dest.mkdir(parents=True, exist_ok=True)
     except OSError as e:                                # e.g. no write access next to the Strata folder
@@ -5976,6 +5984,9 @@ def data_folder_in_place() -> tuple:
     configs name their model files, so an install made by an earlier Strata starts from where it is."""
     settings = load_settings()
     dest = Path(settings["data_dir"]) if settings.get("data_dir") else home().parent / "Strata-data"
+    from strata_control import folders
+    if settings.get("data_dir") and folders.problem(dest):      # a folder saved earlier that cannot be used: the default, and it is not kept
+        dest = home().parent / "Strata-data"
     return dest, []
 
 

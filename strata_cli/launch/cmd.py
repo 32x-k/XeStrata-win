@@ -127,6 +127,9 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
     o.add_argument("--retune", action="store_true",
                    help="with --tune (quick is used when --tune is not given): measure again even when this model was already tuned on this computer "
                         "(by default a stored tuning result is reused and no measuring is done)")
+    o.add_argument("--restart", action="store_true",
+                   help="when a model is already serving other choices (or holds the port), stop it and start these. Without it the screens ask once "
+                        "and --no-tui refuses; --yes alone never restarts. The same choices are never restarted: the running address is printed")
     o.add_argument("--no-tui", action="store_true", help="no screens: serve, print the address and return")
     o.add_argument("--open", action="store_true", help="open the server's web page in your browser once it is serving (nothing opens a browser without this)")
     o.add_argument("--yes", action="store_true", help="do not ask questions (for one: whether to download the model on a computer with no engine yet)")
@@ -209,6 +212,10 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
     elif a.family and s.model:
         s.family = a.family
     if a.data_dir:
+        from strata_control import folders
+        found = folders.problem(a.data_dir)
+        if found:
+            raise ValueError(folders.words(found))                  # one plain line and a next step, before anything is written (B05)
         s.data_dir = a.data_dir
     if a.context:
         s.context = a.context
@@ -304,9 +311,14 @@ def apply_defaults(s: S.LaunchSettings, catalog) -> tuple[S.LaunchSettings, list
         notices += S.check_context(s, max_fit_tokens=None)
     if s.access != "local" and not s.api_key and not s.no_key:
         from strata_cli.launch import access
-        s.api_key = access.new_key()
-        notices.append(S.Notice("warn", "A new API key was made, because the server is shared beyond this computer.",
-                                "It is saved with the preset; show it with: strata launch --show-key"))
+        kept = access.kept_key(s.name or f"{s.model or 'model'} {S.context_label(s.context)}")
+        s.api_key = kept or access.new_key()
+        if kept:
+            notices.append(S.Notice("warn", "The API key from the earlier launch is kept, so apps that use it keep working.",
+                                    "A different one: add --new-key. Show it with: strata launch --show-key"))
+        else:
+            notices.append(S.Notice("warn", "A new API key was made, because the server is shared beyond this computer.",
+                                    "It is saved with the preset; show it with: strata launch --show-key"))
     notices += gpu_notices(s, comp)
     notices += S.check_access(s)
     vram = comp.main_vram_gb or None
@@ -643,13 +655,13 @@ def run_launch(a: argparse.Namespace) -> int:
             if catalog is None:
                 return fail("This Terminal does not carry the model list, so the screens cannot open. Install it again with the one-line installer.", 5)
             from strata_cli.launch import app
-            return _tui(app.run_tui, None, catalog=catalog, feed=a.feed, open_page=bool(a.open))
+            return _tui(app.run_tui, None, catalog=catalog, feed=a.feed, open_page=bool(a.open), restart=bool(getattr(a, "restart", False)))
         if catalog is None:
             return fail("This Terminal does not carry the model list. Install it again with the one-line installer.", 5)
         if getattr(a, "retune", False) and s.tune == "skip":
             s.tune = "quick"
         runner = Runner(s, catalog=catalog, emit=_printer(machine), feed=a.feed, assume_yes=bool(a.yes or machine), confirm=_ask_yes,
-                        retune=bool(getattr(a, "retune", False)))
+                        retune=bool(getattr(a, "retune", False)), restart=bool(getattr(a, "restart", False)))
         try:
             runner.check_own_files()                         # the person's own files: a wrong path is said now, and the files name the model
         except LaunchError as e:
@@ -715,7 +727,7 @@ def run_launch(a: argparse.Namespace) -> int:
         if interactive and have_choices:
             from strata_cli.launch import app
             return _tui(app.run_tui, s, catalog=catalog, feed=a.feed, auto_run=True, save=bool(a.save_preset), open_page=bool(a.open),
-                         move_data=move_data, retune=bool(getattr(a, "retune", False)))
+                         move_data=move_data, retune=bool(getattr(a, "retune", False)), restart=bool(getattr(a, "restart", False)))
         try:
             result = runner.run()
         except LaunchError as e:
@@ -734,12 +746,12 @@ def run_launch(a: argparse.Namespace) -> int:
                 _say(result.final_text)
             return 0
         if machine:
-            print(json.dumps({"schema_version": 1, "ok": True, "name": s.name, "profile": result.profile, "urls": result.urls,
+            print(json.dumps({"schema_version": 1, "ok": True, "name": s.name, "profile": result.profile, "urls": result.urls, "reused": result.reused,
                               "api_key": "set" if result.key else None, "tuned": result.tune_word,
                               "notices": result.notices + [n.line() for n in notes]}))
             return 0
         _say("")
-        _say("Strata is serving.")
+        _say("Already serving these choices; nothing was restarted." if result.reused else "Strata is serving.")
         for u in result.urls:
             label = ("This computer" if "127.0.0.1" in u else "Cloudflare" if "trycloudflare" in u else
                      "Tailscale" if ("ts.net" in u or u.split("//")[1].startswith("100.")) else "Network")

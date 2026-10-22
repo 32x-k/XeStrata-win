@@ -99,6 +99,17 @@ def setup_failure(lines: list[str], err: str, hint: str, details: str | None, ow
         if missing_file(crashed):
             return LaunchError(f"The model could not be installed. A file that setup needs is missing from this Strata install ({crashed}).",
                                "Update Strata (`strata update`) and run it again." + where, 6)
+        if crashed.startswith("PermissionError"):
+            folder = re.findall(r"'([^']+)'", crashed)
+            shown = folder[-1] if folder else None
+            try:                                              # the folder Strata was told to use, not a file inside it
+                shown = str(Path(shown).parent) if shown and Path(shown).name in ("models", "packs", "mtp") else shown
+            except (OSError, ValueError):
+                pass
+            return LaunchError("The model could not be installed. " + (f"Windows would not let Strata write to {shown}" if shown else
+                               "Windows would not let Strata write to a folder") + " (access denied).",
+                               "Pick a folder you own for the model files (the Folder step, or --data-dir D:\\Strata-models) and start again. "
+                               "Nothing was downloaded." + where, 6)
         return LaunchError(f"The model could not be installed. Setup stopped with an error ({crashed}).", "Run it again." + where, 6)
     return LaunchError("The model could not be installed." + (f" {err}." if err else ""),
                        (hint or ("Run it again: finished steps are skipped." if own_files else
@@ -132,6 +143,7 @@ class Result:
     serving: bool = True                   # False: the model is ready but nothing was started (no engine yet)
     engine_problem: str | None = None      # the plain reason there is no engine, when serving is False
     final_text: str = ""                   # what to tell the person when serving is False
+    reused: bool = False                   # the same choices were already serving: nothing was stopped or started
 
 
 NO_ENGINE_NEXT = ("Update Strata (`strata update`) and run `strata launch` again. Nothing was downloaded, and any model files you already have are kept.")
@@ -218,6 +230,11 @@ def desc_matches(desc: dict, s: S.LaunchSettings) -> bool:
     if s.vision in ("gpu", "cpu") and images != s.vision:
         return False
     return True
+
+
+def _inside(path: Path, folder: Path) -> bool:
+    a, b = os.path.normcase(str(path)), os.path.normcase(str(folder))
+    return a == b or a.startswith(b.rstrip("\\/") + os.sep)
 
 
 def files_present(cfg: dict) -> list[str]:
@@ -436,8 +453,11 @@ class Runner:
                  cancel: threading.Event | None = None, feed: str | None = None, python: str | None = None,
                  components_dir: str | None = None, hardware: dict | None = None,
                  confirm: Callable[[str, str], bool] | None = None, assume_yes: bool = False, move_data: bool = False,
-                 retune: bool = False):
+                 retune: bool = False, restart: bool = False, confirm_restart: Callable[[str, str], bool] | None = None):
         self.s = s
+        self.restart = restart                # --restart: a server that serves other choices (or holds this port) is stopped and replaced without asking
+        self.confirm_restart = confirm_restart  # the screens: asked (question, detail) once; True = restart. None (no screens) and no --restart: refuse in one line
+        self._stop_first: list[str] = []      # other launch profiles that hold this port; stopped before the measuring and the start
         self.retune = retune                  # --retune: measure again even when a tuning result for this model on this computer is stored
         self.move_data = move_data            # --move-data / the answer "move": the model files already here go to the new --data-dir
         self.confirm = confirm                # asked (title, text) before a model is downloaded with no engine; True = go on
@@ -765,6 +785,32 @@ class Runner:
         desc = self.catalog.strata.describe_config(path)
         return path, desc
 
+    def installed_serves_request(self, path: Path) -> bool:
+        """C08: the installed copy is what this launch asked for. A --model-path (or the Folder step's own files) and a --data-dir always win:
+        when the installed config names files outside them, it is not reused (that served another copy without a word) and setup runs with
+        the given folders, which rewrites the config so the profile follows."""
+        s = self.s
+        if not (s.model_path or s.data_dir):
+            return True
+        try:
+            cfg = read_config(path)
+            args = [str(a) for a in cfg.get("args") or []]
+            if s.model_path:
+                want = Path(s.model_path).expanduser().resolve()
+                folder = want if want.is_dir() else want.parent
+                ggufs = [Path(a) for a in args if a.lower().endswith(".gguf")]
+                if not ggufs or not all(_inside(g.resolve(), folder) for g in ggufs):
+                    return False
+                if s.data_dir:
+                    packs = [Path(args[i + 1]) for i, a in enumerate(args[:-1]) if a == "--pack"]
+                    return all(_inside(pk.resolve(), Path(s.data_dir).expanduser().resolve()) for pk in packs)
+                return True
+            from strata_control import discovery
+            found = discovery.footprint(cfg, path).data_dir
+            return found is not None and os.path.normcase(str(Path(found).resolve())) == os.path.normcase(str(Path(s.data_dir).expanduser().resolve()))
+        except Exception:                                    # noqa: BLE001 - when in doubt do what was asked: run setup with the given folders
+            return False
+
     def existing_data_dir(self) -> Path | None:
         """The data folder to give setup when the person chose none: the folder the model already lives in (its run config names its files),
         else the folder the desktop app uses, so a helper file that is missing is fetched next to the rest, never into a second folder.
@@ -868,8 +914,11 @@ class Runner:
             raise LaunchError("No model was chosen.", "Choose a model, or use --model NAME (strata launch --help lists them).", 2)
         path, desc = self.installed_state()
         if path is not None and desc is not None and desc_matches(desc, s) and not files_present(read_config(path)):
-            self.emit("model", f"{s.family} {s.model} is already installed with these choices.", 100)
-            return path
+            if self.installed_serves_request(path):
+                self.emit("model", f"{s.family} {s.model} is already installed with these choices.", 100)
+                return path
+            self.emit("model", "The model already installed here is somewhere else than the folder you gave, so Strata uses the folder you gave "
+                               "and points this launch at it.", 0)
         title = f"{s.family} {s.model}"
         if sys.platform == "darwin" and not (cat.src / "strata_control" / "mac_fit.py").is_file():
             # a Terminal from before the Mac rules moved into strata_control/mac_fit.py: setup.py cannot install a Mac model in its Control
@@ -1151,6 +1200,7 @@ class Runner:
                          "--name", (s.name or self.name))
         if s.tune_allow_small:
             argv.append("--allow-small-differences")
+        self.stop_own_server_for_tuning()
         self.emit("tune", "Tuning for the best speed. Close other heavy programs while it measures.", 0)
         p = self._spawn(argv)
         out_lines: list[str] = []
@@ -1186,6 +1236,27 @@ class Runner:
             s.tuned_at = time.strftime("%Y-%m-%d")
         self.emit("tune", f"Tuning result: {word}. {sentence}", 100, level="info" if word in ("faster", "already fastest") else "warn", word=word)
 
+    restart_after = True                                     # run(start=False) measures only: nothing starts the model again
+
+    def stop_own_server_for_tuning(self) -> None:
+        """The measuring engine needs the card, so this launch's own server (the same profile) is stopped first and `start()` brings it back with
+        the result (E07). Other engines are never touched here; the tuner says plainly when another program holds the card."""
+        from strata_control import runtime
+        from strata_control.profiles import ProfileError
+        self.stop_others()
+        try:
+            serving = runtime.status(self.profile).get("state") in ("ready", "starting")
+        except Exception:                                    # noqa: BLE001 - no state to read: nothing of ours is running
+            return
+        if not serving:
+            return
+        self.emit("tune", "Stopping the model to measure; it starts again afterwards." if self.restart_after
+                  else "Stopping the model to measure.", 0)
+        try:
+            runtime.stop(self.profile, timeout=120)
+        except ProfileError as e:
+            raise LaunchError(f"The running model could not be stopped to measure: {e}.", "Run `strata launch --stop` first, then measure again.", 6) from None
+
     def stored_tuning(self) -> dict | None:
         """The tuning result stored for this launch's model, choices and computer (the active preset of its slot in the shared presets store,
         which the start applies), or None. A result whose computer changed in a way that matters (a different card, processor or memory,
@@ -1204,11 +1275,116 @@ class Runner:
 
     tune_word: str | None = None
 
+    # ---- 0. a server is already running
+    CHOICE_SKIP = ("schema", "name", "tuned_preset", "tuned_at", "last_used", "created", "api_key")
+
+    def choices(self) -> dict:
+        """The choices that make one server different from another (not the bookkeeping, and the key only as a fingerprint)."""
+        import hashlib
+        d = {k: v for k, v in self.s.to_dict(with_key=False).items() if k not in self.CHOICE_SKIP}
+        d["key"] = hashlib.sha256(("none" if self.s.no_key and not self.s.api_key else self.s.api_key or "").encode("utf-8")).hexdigest()[:16]
+        return json.loads(json.dumps(d, sort_keys=True))
+
+    def _choices_file(self, profile: str | None = None) -> Path:
+        return launch_dir() / f"{(profile or self.profile)[7:]}.choices.json"
+
+    def save_choices(self) -> None:
+        try:
+            write_private(self._choices_file(), self.choices())
+        except OSError:
+            pass
+
+    def _saved_choices(self, profile: str) -> dict | None:
+        try:
+            return json.loads(self._choices_file(profile).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def serving_launches(self) -> list[dict]:
+        """Launch servers that are up now (this one included): [{profile, name, port, choices}]."""
+        from strata_control import profiles, runtime
+        out = []
+        try:
+            listing = profiles.list_profiles()
+        except Exception:                                    # noqa: BLE001
+            return out
+        for row in listing:
+            pid = row["id"]
+            if not pid.startswith("launch-"):
+                continue
+            try:
+                if runtime.status(pid).get("state") not in ("ready", "starting"):
+                    continue
+                prof, _rev = profiles.load(pid)
+            except Exception:                                # noqa: BLE001
+                continue
+            port = int((prof.get("overrides") or {}).get("port", S.DEFAULT_PORT))
+            out.append({"profile": pid, "name": pid[7:], "port": port, "choices": self._saved_choices(pid)})
+        return out
+
+    @staticmethod
+    def describe_running(row: dict) -> str:
+        c = row.get("choices") or {}
+        bits = []
+        if c.get("context"):
+            bits.append(f"context {S.context_label(c['context'])}")
+        if c.get("vision"):
+            bits.append(f"pictures {c['vision']}")
+        if c.get("access"):
+            bits.append(f"access {S.ACCESS_WORDS.get(c['access'], c['access'])}")
+        return f"{row['name']} is serving on port {row['port']}" + (f" ({', '.join(bits)})" if bits else "")
+
+    def check_serving(self) -> "Result | None":
+        """G04/E01. The same choices already serving: return that server (nothing stops or starts). Other choices on this profile, or another
+        launch on this port: ask once on the screens, go on with --restart, else refuse in one line and change nothing. A launch on another port
+        runs beside the others (the person asked for two), with a warning about graphics memory."""
+        running = self.serving_launches()
+        if not running:
+            return None
+        own = next((r for r in running if r["profile"] == self.profile), None)
+        same_port = [r for r in running if r["profile"] != self.profile and r["port"] == int(self.s.port)]
+        beside = [r for r in running if r["profile"] != self.profile and r["port"] != int(self.s.port)]
+        if own and not self.retune and not same_port and own["choices"] == self.choices() and own["port"] == int(self.s.port):
+            self.config_path = launch_dir() / f"{self.name}.json"
+            urls = acc.urls_for(self.s, tunnel_url=(acc.tunnel_info(self.profile) or {}).get("url"))
+            self.emit("done", "Already serving these choices; nothing was restarted.", 100, urls=urls)
+            return Result(self.profile, urls, self.s.api_key, None, self.notices, str(self.config_path), reused=True)
+        for r in beside:
+            self.notices.append(f"{r['name']} is already loaded on port {r['port']}. Two models at once may not fit in the graphics memory; "
+                                "the new one can fail to start. Stop the first with `strata launch --stop` if it does.")
+        blocking = ([own] if own and not self.retune else []) + same_port
+        if not blocking:
+            return None
+        what = "; ".join(self.describe_running(r) for r in blocking)
+        if not self.restart:
+            if self.confirm_restart is not None:
+                if not self.confirm_restart("Restart the model with these settings?", "Answers in progress stop."):
+                    raise LaunchError("Left as it is: the running model keeps serving.", "", 130)
+            else:
+                raise LaunchError(f"A model is already running: {what}. These choices are different.",
+                                  "Add --restart to stop it and start these, or run `strata launch --stop` first.", 6)
+        self._stop_first = [r["profile"] for r in same_port]
+        return None
+
+    def stop_others(self) -> None:
+        """Stop the other launch servers that hold this port, so the new one gets it (no "port already in use")."""
+        from strata_control import runtime
+        from strata_control.profiles import ProfileError
+        for pid in self._stop_first:
+            self.emit("start", f"Stopping {pid[7:]} so the new choices can use port {int(self.s.port)}…", None)
+            try:
+                runtime.stop(pid, timeout=120)
+                acc.stop_tunnel(pid)
+            except ProfileError as e:
+                raise LaunchError(f"The running server {pid[7:]} could not be stopped: {e}.", "Run `strata launch --stop` first.", 6) from None
+        self._stop_first = []
+
     # ---- 5. start
     def start(self) -> None:
         from strata_control import runtime
         from strata_control.profiles import ProfileError
         name = self.profile
+        self.stop_others()
         st = runtime.status(name)
         if st.get("state") in ("ready", "starting"):
             self.emit("start", "A server for this preset is already running; restarting it with these choices…")
@@ -1442,8 +1618,13 @@ class Runner:
             return ""
 
     def run(self, *, start: bool = True) -> Result:
+        self.restart_after = start
         try:
             self.check_own_files()                           # a wrong --model-path is said before the engine is downloaded
+            if start:
+                reused = self.check_serving()                # before anything is downloaded or stopped
+                if reused is not None:
+                    return reused
             self.ensure_engine()
             self.check_cancel()
             base = self.ensure_model()
@@ -1464,6 +1645,7 @@ class Runner:
             if not start:
                 return Result(self.profile, [], self.s.api_key, self.tune_word, self.notices, str(cfg))
             self.start()
+            self.save_choices()
             tunnel = self.open_access()
             urls = acc.urls_for(self.s, tunnel_url=tunnel)
             res = Result(self.profile, urls, self.s.api_key, self.tune_word, self.notices, str(cfg), tunnel)

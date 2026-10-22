@@ -59,10 +59,17 @@ class UpdateError(RuntimeError):
         self.exit_code = exit_code
 
 
+LAUNCH_NEXT_STEP = "Stop the model first (`strata launch --stop`), then run `strata update` again. Nothing was changed."
+
+
 class Busy(UpdateError):
     """An engine is serving, so nothing was installed or switched."""
 
     def __init__(self, serving: list[dict]):
+        if any(str(item.get("profile", "")).startswith("launch-") for item in serving):
+            super().__init__("Strata's own launch is using the graphics card. " + LAUNCH_NEXT_STEP, 7)
+            self.serving = serving
+            return
         names = ", ".join(item.get("profile", "an engine") for item in serving) or "an engine"
         super().__init__(f"{names} is serving. Stop it (or wait until it is idle) and run the update again; "
                          "the update never replaces or tests an engine while one is serving.", 7)
@@ -951,6 +958,12 @@ def update_engine(ctx: Context, feed: feedmod.Feed, state: State) -> dict:
         try:
             smoke = runner(stage_root, staged, ctx)
         except TestStartFailed as exc:
+            try:                                             # a model of Strata's own launch holds the card: one next step, not the engine's words
+                own = [s for s in ctx.serving() if str(s.get("profile", "")).startswith("launch-")]
+            except Exception:                                # noqa: BLE001
+                own = []
+            if own:
+                raise Busy(own) from None
             section = state.section("engine")
             at = (ctx.now or dt.datetime.now(dt.timezone.utc)).isoformat()
             if not exc.busy:                                 # a busy card says nothing about the engine: the next update tries again
