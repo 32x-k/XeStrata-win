@@ -219,8 +219,13 @@ export function apply(ctx, config = {}) {
   ctx.on('tools/pre-execute', async (exec, next) => {
     const agent = exec.agent;
     if (!agent || exec.name === 'run_code') return next();
+    // Fail closed (T4): a session whose preset cannot be read (a reset in progress, a helper whose chat is gone) is treated as Manual, so
+    // anything this file cannot prove is read-only still asks. It used to run unasked.
     let preset;
-    try { preset = effectivePreset(agent.session); } catch { return next(); }
+    try { preset = effectivePreset(agent.session); } catch (e) {
+      preset = MANUAL_PRESET;
+      try { console.warn(`[strata-gate] could not read the permission mode for this call (${e?.message ?? e}); treating it as Manual`); } catch { /* logging must never decide a permission */ }
+    }
     // A helper that was set to ask while the chat was in Manual must stop asking the moment the chat leaves Manual,
     // so a mode change applies to the very next tool call of a running goal and its helpers.
     if (preset !== MANUAL_PRESET && agent.session.header?.origin === 'subagent' && ctx.approval.overrideOf(agent.session) === 'ask') {
