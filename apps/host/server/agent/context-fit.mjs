@@ -17,17 +17,23 @@ export const COUNT_ABOVE_CHARS = 3000;
 export const replyRoom = window => Math.max(512, Math.min(REPLY_FLOOR, Math.floor(window / 8)));
 
 /**
- * @param {{window:number, pressure?:number, base?:number, messageTokens:number}} input
- *   `pressure` is what the chat holds now (measured), `base` what an empty chat holds, `messageTokens` the new message.
+ * @param {{window:number, pressure?:number, base?:number, messageTokens:number, threshold?:number}} input
+ *   `pressure` is what the chat holds now (measured), `base` what an empty chat holds, `messageTokens` the new message, `threshold` where the
+ *   Harness starts summarising by itself. The Harness looks at that only before its NEXT step, so a big message that arrives now would otherwise
+ *   be sent on top of a chat already near the threshold (2026-10-22: 54K of 64K held by the time it was looked at): summarise first.
  * @returns {{action:'send'|'summarize'|'too-large', room:number, needs:number}}
  */
-export function decideFit({ window, pressure = 0, base: given = BASE_TOKENS, messageTokens }) {
+export function decideFit({ window, pressure = 0, base: given = BASE_TOKENS, messageTokens, threshold = 0 }) {
   const reply = replyRoom(window);
   const base = Math.min(given, Math.floor(window * 0.6));   // on a small window the first prompt cannot be what the window is made of
   // A chat holds at least what an empty one does (the system prompt and the tools), so a new chat is not counted as empty.
   const needs = Math.max(pressure, base) + messageTokens + reply;
   if (!(window > 0) || !(messageTokens >= 0)) return { action: 'send', room: Infinity, needs: 0 };
-  if (needs <= window) return { action: 'send', room: window - needs, needs };
+  if (needs <= window) {
+    const worthIt = pressure > base + window * 0.1;   // older messages worth summarising: more than a tenth of the window beyond the first prompt
+    if (threshold > 0 && worthIt && pressure + messageTokens > threshold) return { action: 'summarize', room: window - needs, needs, why: 'threshold' };
+    return { action: 'send', room: window - needs, needs };
+  }
   // Not as it stands. Does the message fit in an otherwise empty chat (only the system prompt and the tools before it)?
   if (base + messageTokens + reply <= window) return { action: 'summarize', room: window - (base + messageTokens + reply), needs };
   return { action: 'too-large', room: window - (base + messageTokens + reply), needs };

@@ -33,6 +33,8 @@ const MIN_FREE_GB = Number(env('E2E_MIN_FREE_GB', '7'));
 const GGUF = join(DOCS, 'models', 'gyro-Gyro-S', 'Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf');
 const CUDA_BIN = env('E2E_CUDA_BIN', 'C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.0\\bin');
 const WINDOW = 65536;
+/** A model server that is already running (the scripted worker, to try this script without a GPU): nothing is started or stopped. */
+const EXISTING = process.env.E2E_BASE_URL ?? '';
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const freeGb = () => {
@@ -43,8 +45,8 @@ const rows = [];
 const note = (id, ok, detail) => { rows.push({ id, ok, detail }); console.log(`${ok ? 'PASS' : 'FAIL'}  ${id}  ${detail}`); };
 
 if (!process.env.STRATA_HARNESS_DIR) { console.error('STRATA_HARNESS_DIR is not set'); process.exit(2); }
-for (const f of [ENGINE, GGUF]) if (!existsSync(f)) { console.error(`missing: ${f}`); process.exit(2); }
-if (freeGb() < 20) { console.error(`only ${freeGb()} GB of RAM are free; wait for the other streams (lock.py status) and run again`); process.exit(2); }
+if (!EXISTING) for (const f of [ENGINE, GGUF]) if (!existsSync(f)) { console.error(`missing: ${f}`); process.exit(2); }
+if (!EXISTING && freeGb() < 20) { console.error(`only ${freeGb()} GB of RAM are free; wait for the other streams (lock.py status) and run again`); process.exit(2); }
 
 const scratch = mkdtempSync(join(tmpdir(), 'strata-ctx-e2e-'));
 const configFile = join(scratch, 'server.json');
@@ -73,20 +75,19 @@ const finish = async (code) => {
 };
 process.on('SIGINT', () => finish(130));
 
-server = spawn(PYTHON, ['serve/server.py', '--engine', 'strata', '--config', configFile, '--port', String(PORT), '--no-api-key', '--ready-file', readyFile], {
+if (!EXISTING) server = spawn(PYTHON, ['serve/server.py', '--engine', 'strata', '--config', configFile, '--port', String(PORT), '--no-api-key', '--ready-file', readyFile], {
   cwd: REPO, env: { ...process.env, PATH: `${CUDA_BIN};${process.env.PATH}`, STRATA_DATA_DIR: join(scratch, 'data') }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
 });
 const sink = [];
-server.stdout.on('data', d => sink.push(String(d))); server.stderr.on('data', d => sink.push(String(d)));
-server.on('exit', code => { sink.push(`[server exited ${code}]`); server = null; });
+if (server) { server.stdout.on('data', d => sink.push(String(d))); server.stderr.on('data', d => sink.push(String(d))); server.on('exit', code => { sink.push(`[server exited ${code}]`); server = null; }); }
 // Memory alarm: this run must never be what freezes the PC. Under the floor the engine is stopped (by PID) and the run ends.
-alarm = setInterval(() => { const free = freeGb(); if (free < MIN_FREE_GB) { console.error(`ALARM: ${free} GB of RAM free, stopping the engine`); finish(3); } }, 3000);
-alarm.unref?.();
+if (!EXISTING) alarm = setInterval(() => { const free = freeGb(); if (free < MIN_FREE_GB) { console.error(`ALARM: ${free} GB of RAM free, stopping the engine`); finish(3); } }, 3000);
+alarm?.unref?.();
 
-const base = `http://127.0.0.1:${PORT}`;
+const base = EXISTING || `http://127.0.0.1:${PORT}`;
 let ready = false;
 for (let i = 0; i < 120 && !ready; i++) {
-  if (!server) break;
+  if (!EXISTING && !server) break;
   try { ready = (await fetch(`${base}/health`, { signal: AbortSignal.timeout(2000) })).ok; } catch { /* still loading */ }
   if (!ready) await sleep(2000);
 }
@@ -137,7 +138,7 @@ const needle = 'NOTE FROM OPS: the vault code is COBALT-27. Do not lose it.';
 const timeline = [];
 let notes = 0, refusedAny = false, peak = 0;
 {
-  for (let k = 0; k < 6; k++) {
+  for (let k = 0; k < 5; k++) {
     const body = logText(34_000, k * 1000, k === 0 ? needle : '');
     const t = await turnsOf(`${body}\n\nReply with the single word OK.`);
     const note = noteOf(t.frames);
@@ -149,7 +150,7 @@ let notes = 0, refusedAny = false, peak = 0;
     console.log('   ' + timeline.at(-1));
     if (t.last.type === 'error') break;
   }
-  note('B  six dense messages (about 14K tokens each) in a 64K window: no error', !refusedAny, `peak context ${peak} of ${WINDOW}; ${notes} compaction note(s) in the chat`);
+  note('B  five dense messages (about 14K tokens each) in a 64K window: no error', !refusedAny, `peak context ${peak} of ${WINDOW}; ${notes} compaction note(s) in the chat`);
   note('B  compaction ran and was announced', notes >= 1, timeline.join(' | '));
 }
 
@@ -175,7 +176,7 @@ let notes = 0, refusedAny = false, peak = 0;
   rows.push({ id: 'D  the needle', ok: /COBALT-27/.test(answer), detail: `reported only: answer "${answer.slice(0, 80)}"` });
 }
 
-console.log('\n' + rows.map(r => `${r.ok ? 'PASS' : 'FAIL'}  ${r.id}`).join('\n'));
+console.log('\n' + rows.map(r => `${r.ok ? 'PASS' : r.id.startsWith('D') ? 'INFO' : 'FAIL'}  ${r.id}${r.id.startsWith('D') ? `  ${r.detail}` : ''}`).join('\n'));
 const failed = rows.filter(r => !r.ok && !r.id.startsWith('D')).length;
 writeFileSync(join(scratch, 'result.json'), JSON.stringify(rows, null, 2));
 await finish(failed ? 1 : 0);

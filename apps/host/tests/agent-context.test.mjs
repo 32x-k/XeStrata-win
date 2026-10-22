@@ -162,6 +162,17 @@ test('fit: a message that fits is sent, one that fits after a summary is summari
   assert.equal(decideFit({ window: 8192, pressure: 0, messageTokens: 5000 }).action, 'too-large', 'a small window has less room for a message');
 });
 
+test('fit: a big message on a chat already near the compaction threshold summarises first, so the window is never come close to', () => {
+  // 64K window: the Harness starts summarising at 40,142 (profile.mjs), but looks only before its NEXT step; a message that arrives now is not in that count.
+  const at = { window: 65536, threshold: 40142, messageTokens: 14400 };
+  const near = decideFit({ ...at, pressure: 39840 });
+  assert.equal(near.action, 'summarize'); assert.equal(near.why, 'threshold');
+  assert.equal(decideFit({ ...at, pressure: 15000 }).action, 'send', 'still under the threshold with the message on top');
+  assert.equal(decideFit({ ...at, pressure: 13000, messageTokens: 30000 }).action, 'send', 'a chat that holds little beyond its first prompt has nothing worth summarising');
+  assert.equal(decideFit({ window: 65536, messageTokens: 14400, pressure: 39840 }).action, 'send', 'no threshold given: only the window decides');
+  assert.equal(decideFit({ ...at, pressure: 59048, messageTokens: 5000 }).why, undefined, 'a refusal-sized case is the old rule, not the threshold');
+});
+
 test('count: the engine\'s own number, or nothing when it cannot be had (then nothing is blocked)', async () => {
   const sent = [];
   const ok = async (url, init) => { sent.push([url, JSON.parse(init.body), init.headers]); return { ok: true, json: async () => ({ input_tokens: 70141 }) }; };
