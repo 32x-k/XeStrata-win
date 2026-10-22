@@ -731,7 +731,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
 
 - **Keep Windows awake while it works (opt-in, upstream #1727).** `"prevent_sleep": true` in `xestrata-<model>.json` keeps the PC from going to sleep while at least one request is running or waiting (Windows' `SetThreadExecutionState` with `ES_SYSTEM_REQUIRED`; the screen may still turn off).
   The normal sleep rules come back when the server is idle and when it exits. Default off; on Linux it does nothing (one line at startup says so).
-- **A hard thinking budget (opt-in).** `"reasoning_budget_tokens": N` in a request (OpenAI or Anthropic) caps the thinking at N tokens.
+- **A hard thinking budget (opt-in).** `"reasoning_budget_tokens": N` (or llama.cpp's `"thinking_budget_tokens": N`, which clients written for llama-server send) in a request (OpenAI or Anthropic) caps the thinking at N tokens.
   When it gets there the server ends it with a short wrap-up line and `</think>`, and the model answers from there.
   The engine continues from what it already holds, so nothing is read again.
   The wrap-up is part of the thinking the client sees and counts as output tokens.
@@ -771,6 +771,10 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   While the model reads a long prompt the stream sends keep-alive messages, so agents do not time out.
   The server window prints progress every 15 s, and `GET /status` says what it is doing (`reading the prompt`, `answering`, tokens so far).
   Closing the connection or pressing stop in your app really stops the model, so the next request starts at once.
+- **Which tool calls come back as calls** (upstream #3075, #3441). A call counts only when it names a tool the request declared.
+  A call for another name, or any call in a Chat Completions or Anthropic request that declared no tools, is returned as the text it was written as, so a client never runs a tool it did not offer (the Responses route keeps its own rule for Codex's compaction requests).
+  A call whose opener drifted by a token, `<=NAME>`, `<function:NAME>` or `<NAME>` instead of `<function=NAME>`, is read as the call when NAME is a declared tool.
+  A `<tool_call>` block that still does not read as a call is counted in the server window.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8095/v1`, any API key.
 - **OpenCode** (upstream #543). A starting point for `opencode.jsonc` (in your project, or `~/.config/opencode/`).
   The field names are OpenCode's, so check its config docs if your version differs:
@@ -834,6 +838,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   Only XeStrata's own page can save (JSON, with the API key when one is set, as for the Chat settings); the network, key, MCP and program keys are not editable there.
 - **From other devices on your network.** The server listens on your PC only (`127.0.0.1`) unless you say otherwise:
   run `./setup.sh --host 0.0.0.0 --api-key some-long-secret` (kept in the model's config for the next starts), or add `"host": "0.0.0.0"` and `"api_key": "..."` to `xestrata-<model>.json`.
+  The key is recommended, not required: without one the server still starts and warns that anyone who can reach the port can use the model and its tools (upstream 2f361a37). To say it is on purpose, use `--no-api-key` on the server or `"api_key": "none"` in the config, which also silences the note about an empty key in the config.
   The server window then prints this PC's addresses (`from other devices: http://192.168.x.x:8095/`).
   Open that on the other device, or use `.../v1` as an API base URL.
 - **From the internet.** Put a tunnel in front of it, for example

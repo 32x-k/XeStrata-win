@@ -711,7 +711,7 @@ print(r.choices[0].message.content)
 
 - **処理中は Windows をスリープさせない（任意、upstream #1727）**: `xestrata-<model>.json` に `"prevent_sleep": true` を書くと、要求を 1 つでも処理中か待ち行列に持っている間は PC がスリープしません（Windows の `SetThreadExecutionState` の `ES_SYSTEM_REQUIRED`。画面は消えることがあります）。
   server が何もしていないときと終わるときは、通常のスリープの設定に戻します。既定は無効で、Linux では何もしません（起動時に 1 行で知らせます）。
-- **思考の厳密な上限（任意）**: 要求に `"reasoning_budget_tokens": N`（OpenAI でも Anthropic でも）を付けると、思考を N トークンで打ち切ります。
+- **思考の厳密な上限（任意）**: 要求に `"reasoning_budget_tokens": N`（OpenAI でも Anthropic でも。llama-server 向けのクライアントが送る llama.cpp の `"thinking_budget_tokens": N` も同じ）を付けると、思考を N トークンで打ち切ります。
   そこに達すると、server は短い締めの行と `</think>` で思考を終え、モデルはそこから答えます。
   エンジンは持っている状態から続けるので、何も読み直しません。
   締めの行は、クライアントから見える思考の一部で、出力のトークンに数えます。
@@ -752,6 +752,10 @@ print(r.choices[0].message.content)
   長いプロンプトを読む間は keep-alive を送るので、エージェントがタイムアウトしません。
   server のウィンドウは 15 秒ごとに進み具合を出し、`GET /status` は何をしているか（`reading the prompt`、`answering`、そこまでのトークン数）を返します。
   接続を閉じるか、アプリで止めると、モデルも本当に止まるので、次の要求はすぐに始まります。
+- **ツールの呼び出しとして返すもの**: 呼び出しになるのは、要求が宣言したツールの名前を挙げたものだけです（upstream #3075、#3441）。
+  ほかの名前の呼び出しと、ツールを宣言していない Chat Completions や Anthropic の要求での呼び出しは、書かれたとおりの文字として返すので、クライアントが自分で出していないツールを動かすことはありません（Responses の経路は、Codex の圧縮の要求のために前の扱いのままです）。
+  `<function=NAME>` の代わりに `<=NAME>`、`<function:NAME>`、`<NAME>` と書かれた呼び出しも、NAME が宣言したツールなら呼び出しとして読みます。
+  それでも呼び出しとして読めない `<tool_call>` のブロックは、その数を server のウィンドウに出します。
 - **チャットのアプリ**: 「OpenAI 互換」の接続先を持つアプリなら使えます。
   ベース URL は `http://127.0.0.1:8095/v1`、API キーは何でも構いません。
 - **OpenCode**（upstream #543）: `opencode.jsonc`（プロジェクトの中か `~/.config/opencode/`）の出発点です。
@@ -817,6 +821,7 @@ print(r.choices[0].message.content)
   保存できるのは XeStrata 自身のページだけです（JSON、API キーがあればそれも。Chat の設定と同じ）。ネットワーク、キー、MCP、プログラムのキーは、そこでは変えられません。
 - **同じネットワークのほかの機器から**: 指定しなければ、server はこの PC（`127.0.0.1`）でだけ待ち受けます。
   `./setup.sh --host 0.0.0.0 --api-key 長い秘密の文字列` で起動するか（モデルの設定に保存され、次からも使われます）、`xestrata-<model>.json` に `"host": "0.0.0.0"` と `"api_key": "..."` を書きます。
+  キーは勧めるだけで、なくても server は起動し、ポートに届く人なら誰でもモデルとそのツールを使えると警告します（upstream 2f361a37）。キーなしが意図どおりなら、server に `--no-api-key` を付けるか、設定に `"api_key": "none"` と書きます。こうすると、設定のキーが空だという注意も出ません。
   server のウィンドウに、この PC のアドレスが出ます（`from other devices: http://192.168.x.x:8095/`）。
   ほかの機器でそれを開くか、`.../v1` を API のベース URL に使います。
 - **インターネットから**: 前にトンネルを置きます。

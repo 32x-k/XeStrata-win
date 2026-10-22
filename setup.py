@@ -4302,7 +4302,7 @@ def main() -> int:
                                           "for 3 GPUs), one rising number per GPU after the first - not layers per "
                                           "card; or auto (the default: measured on this PC)")
     ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = also other "
-                                   "devices on your network (issue #26; set --api-key too)")
+                                   "devices on your network (issue #26; an --api-key is recommended)")
     ap.add_argument("--no-browser", dest="browser", action="store_false", default=None,
                     help="do not open the chat page in the browser when the model is ready (for a harness or an app "
                          "that uses the API; remembered for this model, also in run-<model>.sh)")

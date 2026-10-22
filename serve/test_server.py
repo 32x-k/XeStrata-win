@@ -89,7 +89,8 @@ class MaxTokens(unittest.TestCase):
             return s, b, u.get("prompt_tokens"), u.get("completion_tokens")
         s, b = self.post("/v1/messages", {"model": "m", "messages": msgs, **budget})
         u = b.get("usage", {})
-        return s, b, u.get("input_tokens"), u.get("output_tokens")
+        prompt = sum(u.get(k) or 0 for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+        return s, b, prompt if u else None, u.get("output_tokens")
 
     def test_anthropic_thinks_only_when_asked(self):
         # #278: Anthropic's thinking is opt-in; "thinking", an effort or a reasoning_budget_tokens (#123) asks for it
@@ -3329,7 +3330,9 @@ class UsageAndStatus(unittest.TestCase):
     def test_anthropic(self):
         u = self.chat("/v1/messages")["usage"]
         self.assertEqual(u["cache_read_input_tokens"], ClockedEngine.REUSED)
-        self.assertEqual(u["input_tokens"] + u["cache_read_input_tokens"], len(self.engine.last_prompt))
+        self.assertEqual(u["input_tokens"], 1)                     # what was read now is kept: written to the cache
+        self.assertEqual(u["input_tokens"] + u["cache_creation_input_tokens"] + u["cache_read_input_tokens"],
+                         len(self.engine.last_prompt))
         self.assertGreater(u["output_tokens"], 0)
 
     def test_v1_status(self):
@@ -3746,6 +3749,18 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(b["usage"]["completion_tokens"], 20 + len(extra) + len(ThinkingEngine.ANSWER) + 1)
         self.assertEqual(b["usage"]["prompt_tokens"], len(first))
 
+    def test_llama_cpp_thinking_budget_tokens_is_the_same_budget(self):
+        """llama.cpp's name (pi-llama-cpp sends it): the same wrap-up; reasoning_budget_tokens wins when both
+        are set."""
+        from serve.server import REASONING_WRAP_UP
+        wrap = REASONING_WRAP_UP.split("</think>")[0]
+        code, b = self.openai(thinking_budget_tokens=20)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT[:20] + wrap)
+        code, b = self.openai(reasoning_budget_tokens=10, thinking_budget_tokens=20)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT[:10] + wrap)
+
     def test_a_stop_string_is_found_in_the_answer_after_the_wrap_up(self):
         """#454: the continuation after the thinking budget is cut at a stop string too."""
         code, b = self.openai(reasoning_budget_tokens=20, stop=["answer is"])
@@ -4006,6 +4021,41 @@ class ForcedToolChoice(unittest.TestCase):
                 args[tc["index"]] = args.get(tc["index"], "") + tc["function"].get("arguments", "")
             finish = c["choices"][0]["finish_reason"] or finish
         return finish, [(names[i], json.loads(args[i])) for i in sorted(names)], reasoning
+
+    def says(self, answer):
+        """The engine answers `answer` after an empty thought."""
+        def generate(ids, max_new, sampling, cancel, embeddings=None):
+            self.engine.prompts.append(list(ids))
+            yield from self.tok.encode("</think>\n\n" + answer) + self.tok.encode("<|im_end|>", parse_special=True)
+        self.engine.generate = generate
+
+    def test_a_call_the_request_never_offered_stays_text(self):
+        """#3075: the model goes on writing the format it was shown; a request that offered no such tool gets text."""
+        from serve.frontend import CALL_END, CALL_START
+        answer = ("I will check that.\n" + CALL_START + "\n<function=lookup>\n<parameter=q>\n2+2\n</parameter>\n"
+                  "</function>\n" + CALL_END + "\nHere is the report.")
+        self.says(answer)
+        for label, extra in {"nothing declared": {"tools": []}, "tool_choice none": {"tool_choice": "none"},
+                             "other tools": {}}.items():
+            for stream in (False, True):
+                with self.subTest(case=label, stream=stream):
+                    code, b = self.openai(stream=stream, **extra)
+                    finish, calls, _ = self.call_of(code, b, stream)
+                    self.assertEqual((finish, calls), ("stop", []), b)
+                    if not stream:
+                        content = b["choices"][0]["message"]["content"] or ""
+                        self.assertIn("Here is the report.", content)
+                        self.assertIn("<function=lookup>", content)
+
+    def test_a_call_with_a_dropped_function_keyword_is_still_the_call(self):
+        """#3441: `<=search>` for `<function=search>`, as a model under a large tool surface writes it."""
+        from serve.frontend import CALL_END, CALL_START
+        self.says(CALL_START + "\n<=search>\n<parameter=q>\n2+2\n</parameter>\n</function>\n" + CALL_END)
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                code, b = self.openai(stream=stream)
+                finish, calls, _ = self.call_of(code, b, stream)
+                self.assertEqual((finish, calls), ("tool_calls", [("search", {"q": "2+2"})]), b)
 
     def test_required_and_named_after_the_thinking(self):
         for choice in ("required", self.NAMED):
