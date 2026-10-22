@@ -73,8 +73,8 @@ test('the store keeps the code and the engine\'s text of an error, shows a sente
   assert.match(store, /errorDetail: frame\.details/);
   assert.match(store, /type === 'context'/);
   const summarize = store.slice(store.indexOf('export async function summarizeAndContinue'), store.indexOf('export async function sendOversized'));
-  assert.ok(summarize.indexOf("sendMessage('/compact')") > 0 && summarize.indexOf('sendMessage(failed.prompt)') > summarize.indexOf("sendMessage('/compact')"), 'summarise first, then ask the same question again');
-  assert.ok(summarize.indexOf('dropFailedExchange') < summarize.indexOf("sendMessage('/compact')"), 'the failed question is not shown twice');
+  assert.ok(summarize.indexOf("sendMessage('/compact')") > 0 && summarize.indexOf("sendMessage('Please answer my last message now.')") > summarize.indexOf("sendMessage('/compact')"), 'summarise first, then ask for the answer');
+  assert.doesNotMatch(summarize, /failed.prompt|dropFailedExchange/, 'the refused question is not sent a second time (it is already in the conversation, and a large one twice would not fit)');
   const oversized = store.slice(store.indexOf('export async function sendOversized'), store.indexOf('export function startNewChat'));
   assert.match(oversized, /'\/api\/chat\/oversize'/);
   assert.ok(oversized.indexOf('dropFailedExchange') > oversized.indexOf("'/api/chat/oversize'"), 'the failed message stays until the shorter one is ready');

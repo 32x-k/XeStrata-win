@@ -1381,14 +1381,13 @@ function dropFailedExchange(sessionId: string) {
 
 /**
  * The error card of a conversation that no longer fits the model's window: summarise the older messages (the same as typing /compact), then
- * ask the last question again in the same chat.
+ * ask the assistant to answer. The refused question is already in the assistant's conversation (it is the newest message, and a summary keeps
+ * the newest message as it is), so it is not sent a second time: a large one twice would not fit either.
  */
 export async function summarizeAndContinue() {
-  const failed = failedExchange();
-  if (!failed) return;
-  dropFailedExchange(failed.sessionId);
+  if (!failedExchange()) return;
   await sendMessage('/compact');
-  await sendMessage(failed.prompt);
+  await sendMessage('Please answer my last message now.');
 }
 
 /**
