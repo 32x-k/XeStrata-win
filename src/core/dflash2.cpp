@@ -192,7 +192,20 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
             return false;
         }
     }
-    if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess || cudaStreamCreateWithFlags(&cs2_, cudaStreamNonBlocking) != cudaSuccess) {
+    // the draft round runs while the verifier's async commit still has work on the card: a high-priority stream keeps it from queueing behind that
+    // (CUDA by default; on HIP only with STRATA_DF2_PRIO=1, where the engine's other streams keep the default priority)
+    int prio_lo = 0, prio_hi = 0;
+#if defined(STRATA_USE_HIP)
+    static const bool hi_prio = [] { const char* e = std::getenv("STRATA_DF2_PRIO"); return e && e[0] == '1'; }();
+    if (hi_prio) hipDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
+    if (hipStreamCreateWithPriority(&cs_, hipStreamNonBlocking, hi_prio ? prio_hi : 0) != cudaSuccess ||
+        hipStreamCreateWithPriority(&cs2_, hipStreamNonBlocking, hi_prio ? prio_hi : 0) != cudaSuccess) {
+#else
+    static const bool hi_prio = [] { const char* e = std::getenv("STRATA_DF2_PRIO"); return !(e && e[0] == '0'); }();
+    cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
+    if (cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, hi_prio ? prio_hi : 0) != cudaSuccess ||
+        cudaStreamCreateWithPriority(&cs2_, cudaStreamNonBlocking, hi_prio ? prio_hi : 0) != cudaSuccess) {
+#endif
         err = "dflash2: stream";
         return false;
     }

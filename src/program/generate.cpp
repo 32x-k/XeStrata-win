@@ -787,6 +787,7 @@ struct Options {
     /// --draft dflash2 --draft-model PACK (opt-in, CUDA / HIP): the DFlash2 block drafter for Qwen3.8-Flash-Next (tools/dflash2_pack.py) drafts instead
     /// of the MTP layer, which stays loaded as the fallback.  Needs --mtp, --spec and a native pack; a missing pack falls back to the MTP.
     std::string draft, draft_model;
+    double draft_conf = 0.0;   ///< --draft-conf P: with --draft dflash2 the window ends where the product of the selector's probabilities falls below P (replaces --spec-min-p)
     int draft_cap = 0;   ///< --draft-cap N: the widest verify window with --draft dflash2 (0 = by card class, see where the drafter loads)
     /// A control vector on the residual stream (strata/kernels/cvec.hpp), with llama.cpp's flags: the
     /// `experimental-speed-projection` profile passes `--control-vector-scaled FILE:1.0 --control-vector-layer-range
@@ -942,6 +943,7 @@ void usage() {
                  "  --mtp-draft-vocab FILE  opt-in: the draft head's token subset (default <mtp>/draft_vocab.bin)\n"
                  "  --draft mtp|dflash2  the draft source (default mtp); dflash2 needs --draft-model PACK (tools/dflash2_pack.py)\n"
                  "                       and keeps the MTP layer loaded as the fallback (opt-in, Flash-Next, CUDA / HIP)\n"
+                 "  --draft-conf P       with --draft dflash2: end the window where the product of the selector's probabilities falls below P (default 0 = --spec-min-p)\n"
                  "  --draft-cap N        the widest verify window with --draft dflash2 (default by card: 5 on Strix Halo / iGPU, --spec as given elsewhere)\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
@@ -2690,6 +2692,7 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--draft-model") o.draft_model = next("--draft-model");
+        else if (a == "--draft-conf") o.draft_conf = std::clamp(std::atof(next("--draft-conf")), 0.0, 1.0);
         else if (a == "--draft-cap") o.draft_cap = std::max(0, std::atoi(next("--draft-cap")));
         else if (a == "--control-vector") o.cvec_files.push_back({next("--control-vector"), 1.0f});
         else if (a == "--control-vector-scaled") {
@@ -16368,7 +16371,12 @@ int main(int argc, char** argv) {
                 if (ss.ple.ready() && ss.ple.table != nullptr) {
                     int n_pf = 0;
                     const int cap = std::min<int>(S_mtp, (int) drafts.size() + 1);
-                    for (int t = 1; t < cap && (o.spec_min_p <= 0.0 || dprob[(size_t) t - 1] >= (float) o.spec_min_p); ++t) ++n_pf;
+                    double chain = 1.0;
+                    for (int t = 1; t < cap; ++t) {
+                        if (o.draft_conf > 0.0) { if ((chain *= (double) dprob[(size_t) t - 1]) < o.draft_conf) break; }
+                        else if (o.spec_min_p > 0.0 && dprob[(size_t) t - 1] < (float) o.spec_min_p) break;
+                        ++n_pf;
+                    }
                     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
                     auto pf = [&](int32_t tok) {
                         uint32_t rows16[strata::kernels::PLE_N_HEADS];
@@ -16395,6 +16403,13 @@ int main(int argc, char** argv) {
                 T = 1;
                 while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
             }
+#if defined(STRATA_HAVE_DFLASH2)
+            if (use_df2 && o.draft_conf > 0.0) {   // DFlash2's own confidence: the chance that every draft so far holds, from the selector's probabilities
+                T = 1;
+                double chain = 1.0;
+                while (T < S_mtp && (chain *= (double) dprob[(size_t) T - 1]) >= o.draft_conf) ++T;
+            }
+#endif
             if (first_window) T = 1;
             if (!t_cycle.empty() && !first_window) T = t_cycle[(size_t) (rounds % (int64_t) t_cycle.size())];
             bool from_sfx = false;
