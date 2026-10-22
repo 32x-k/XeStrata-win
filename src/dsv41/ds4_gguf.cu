@@ -1002,10 +1002,12 @@ int launch_errors() { return g_errors.load(std::memory_order_relaxed); }
 
 size_t type_row_bytes(int type, int64_t k) {
     if (type == kTypeMXFP4) return k % kMxBlock == 0 ? mx_row_bytes(k) : 0;
-    return iq::supported(type) && k % iq::block_values(type) == 0 ? iq::row_bytes(type, k) : 0;
+    // known(), not supported(): a type with no device kernel still has a layout, and its rows are read by the CPU lane
+    return iq::known(type) && k % iq::block_values(type) == 0 ? iq::row_bytes(type, k) : 0;
 }
-int type_block(int type) { return type == kTypeMXFP4 ? kMxBlock : iq::supported(type) ? iq::block_values(type) : 0; }
+int type_block(int type) { return type == kTypeMXFP4 ? kMxBlock : iq::known(type) ? iq::block_values(type) : 0; }
 const char* type_name(int type) { return type == kTypeMXFP4 ? "MXFP4" : iq::name(type); }
+bool type_on_device(int type) { return type == kTypeMXFP4 || iq::supported(type); }
 
 namespace {
 size_t row_stride(const x3::Mat& m) {   // values (BF16) or bytes (MXFP4, Q8_0, a low-bit type) a row

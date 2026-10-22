@@ -34,6 +34,11 @@ template <> struct Ty<kIQ3_XXS> { static constexpr int B = 98, TAB = 256, MIN = 
 template <> struct Ty<kIQ3_S> { static constexpr int B = 110, TAB = 512, MIN = 0; };
 template <> struct Ty<kIQ4_XS> { static constexpr int B = 136, TAB = 4, MIN = 0; };
 template <> struct Ty<kQ4_K> { static constexpr int B = 144, TAB = 0, MIN = 1; };
+// The types with a known layout and no device kernel (the CPU lane's ggml dots take them): their row bytes are needed to
+// lay a pack out, nothing else.  Ty<> gives the block; the kernels are never instantiated for them.
+template <> struct Ty<kIQ1_S> { static constexpr int B = 50, TAB = 2048, MIN = 0; };
+template <> struct Ty<kIQ1_M> { static constexpr int B = 56, TAB = 2048, MIN = 0; };
+template <> struct Ty<kIQ4_NL> { static constexpr int B = 18, TAB = 16, MIN = 0; };
 template <> struct Ty<kQ2_K> { static constexpr int B = 84, TAB = 0, MIN = 1; };
 template <> struct Ty<kQ3_K> { static constexpr int B = 110, TAB = 0, MIN = 0; };
 // the dense matrices' 5- and 6-bit K-quants (GEMV only: ds4_iq's mv; not an expert type)
@@ -967,9 +972,23 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
 
 }  // namespace
 
-bool supported(int t) { return block_bytes(t) > 0; }
+bool supported(int t) {
+    // the types the kernels below are instantiated for (DS4_IQ_SWITCH + the trellis ones + the dense K-quants)
+    switch (t) {
+        case kIQ2_XXS: case kIQ2_XS: case kIQ2_S: case kIQ3_XXS: case kIQ3_S: case kIQ4_XS:
+        case kQ4_K: case kQ5_K: case kQ6_K: case kQ2_K: case kQ3_K:
+            return true;
+        default:
+            return is_tq(t);
+    }
+}
 
-int block_values(int t) { return is_tq(t) ? 128 : block_bytes(t) > 0 ? 256 : 0; }
+bool known(int t) { return block_bytes(t) > 0; }
+
+int block_values(int t) {
+    if (t == kIQ4_NL) return 32;   // (ggml's QK4_NL: the only type here whose block is not 256 values)
+    return is_tq(t) ? 128 : block_bytes(t) > 0 ? 256 : 0;
+}
 
 int block_bytes(int t) {
     if (is_tq(t)) return 2 + 4 * tq_kbits(t);
@@ -985,6 +1004,9 @@ int block_bytes(int t) {
         case kQ6_K: return Ty<kQ6_K>::B;
         case kQ2_K: return Ty<kQ2_K>::B;
         case kQ3_K: return Ty<kQ3_K>::B;
+        case kIQ1_S: return Ty<kIQ1_S>::B;   // (a known layout, no device kernel: the CPU lane's)
+        case kIQ1_M: return Ty<kIQ1_M>::B;
+        case kIQ4_NL: return Ty<kIQ4_NL>::B;
         default: return 0;
     }
 }
@@ -1008,6 +1030,9 @@ const char* name(int t) {
         case kQ6_K: return "Q6_K";
         case kQ2_K: return "Q2_K";
         case kQ3_K: return "Q3_K";
+        case kIQ1_S: return "IQ1_S";
+        case kIQ1_M: return "IQ1_M";
+        case kIQ4_NL: return "IQ4_NL";
         default: return "?";
     }
 }

@@ -629,6 +629,7 @@ struct Layer {
     x3::ExpertLayout lay;
     size_t blob = 0;                            // bytes of one expert's blob
     int n_vram = 0;
+    bool cpu_only = false;   // a role's type has no device kernel: every expert of this layer is the CPU lane's
     uint8_t* vram_base = nullptr;
     std::vector<int> slot;                      // expert -> VRAM slot or -1
     std::vector<int> ram;                       // expert -> RAM-tier slot or -1 (a GGUF's in-place experts; empty: none)
@@ -1527,7 +1528,7 @@ struct Model::Impl {
     // expert's matrix r at the same stride from expert 0's in one file (the GGUF's [n_exp][out][in] tensor)
     // (the other block types: lay.fmt stays kFmtMXFP4 - read in place as these - and lay.K[r] is role r's ggml type)
     static int gg_type_of(const std::string& dtype) {
-        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 13, 14, 16, 17, 18, 21, 22, 23, 145, 146, 224, 225, 226, 227})
+        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 145, 146, 224, 225, 226, 227})
             if (dtype == gg::type_name(t)) return t;
         return -1;
     }
@@ -1571,6 +1572,17 @@ struct Model::Impl {
             return false;
         }
         l.blob = off;
+        // a type the device kernels do not take (IQ1_S / IQ1_M / IQ4_NL today): the layer stays on the CPU lane, where
+        // ggml-cpu's row dots read it - one warning, then the placement code keeps it out of VRAM
+        for (int r = 0; r < 3; ++r)
+            if (!gg::type_on_device(l.lay.K[r])) {
+                l.cpu_only = true;
+                std::fprintf(stderr,
+                             "ds4: layer %d %s is %s: no GPU kernel for it, its experts stay on the CPU lane "
+                             "(ggml-cpu's rows; VRAM tier: none)\n", l.il, r == 2 ? "down" : "gate/up",
+                             gg::type_name(l.lay.K[r]));
+                break;
+            }
         return true;
     }
     const uint8_t* mx_mat(const Layer& l, int e, int r) const {   // expert e's matrix r: its RAM-tier slot, else the file's
@@ -3536,10 +3548,14 @@ struct Model::Impl {
                 }
             double want = 0;
             for (const Layer& l : L)
-                if (l.grp == (int) gi && !l.mtp) want += (double) ucount(l) * l.n_exp;
+                if (l.grp == (int) gi && !l.mtp && !l.cpu_only) want += (double) ucount(l) * l.n_exp;
             const double frac = want > 0 ? std::min(1.0, std::max(0.0, budget_t) / want) : 0.0;
             for (Layer& l : L) {
                 if (l.grp != (int) gi || l.mtp) continue;
+                if (l.cpu_only) {   // (its type has no device kernel: the CPU lane reads every expert of it)
+                    l.n_vram = 0;
+                    continue;
+                }
                 l.n_vram = std::min(l.n_exp, (int) std::floor(frac * l.n_exp));
                 // never more than fits: the floor of each layer's share can still round up the total
                 while (l.n_vram > 0 && (double) ucount(l) * l.n_vram > budget) --l.n_vram;
@@ -3549,7 +3565,7 @@ struct Model::Impl {
                 if (l.grp == (int) gi) used += (double) ucount(l) * l.n_vram;
             // what the floors left: whole experts, layer by layer
             for (Layer& l : L) {
-                if (l.grp != (int) gi) continue;
+                if (l.grp != (int) gi || l.cpu_only) continue;
                 while (l.n_vram < l.n_exp && used + (double) ucount(l) <= budget) {
                     ++l.n_vram;
                     used += (double) ucount(l);

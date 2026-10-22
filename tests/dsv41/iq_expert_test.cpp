@@ -160,7 +160,8 @@ int main(int argc, char** argv) {
         fails += !ok;
     };
     for (int type : types) {
-        if (!iq::supported(type)) { std::printf("%-7s not a device type here\n", iq::name(type)); ++fails; continue; }
+        if (!iq::supported(type) && !iq::known(type)) { std::printf("%-7s not a type this engine knows\n", iq::name(type)); ++fails; continue; }
+        const bool dev = iq::supported(type);   // (IQ1_S / IQ1_M / IQ4_NL: a known layout, no device kernel - CPU lane only)
         const int E = 512, FF = 256, NEXP = 3, T = 4;
         const float lim = 7.0f;
         const size_t rb_g = iq::row_bytes(type, E), rb_d = iq::row_bytes(type, FF);
@@ -188,10 +189,18 @@ int main(int argc, char** argv) {
         for (int t = 0; t < T; ++t) { qx[t] = quant(&x[(size_t) t * E], E); std::memcpy(&xq[(size_t) t * E], qx[t].q.data(), E); std::memcpy(&xd[(size_t) t * E / 32], qx[t].d.data(), E / 32 * 4); }
         const int8_t* dxq = up(xq); const float* dxd = up(xd);
 
-        // ---- token path
+        // ---- the reference h of every expert's rows for token 0 (the CPU lane and the device share it)
         std::vector<float> href((size_t) NEXP * FF);
         std::vector<Q8> qh(NEXP);
-        {
+        for (int e = 0; e < NEXP; ++e)
+            for (int r = 0; r < FF; ++r) {
+                double sc;
+                href[(size_t) e * FF + r] = (float) refh(e, r, qx[0].xhat.data(), sc);
+            }
+        for (int e = 0; e < NEXP; ++e) qh[e] = quant(&href[(size_t) e * FF], FF);
+
+        // ---- token path (device; skipped for a type with no device kernel)
+        if (dev) {
             std::vector<unsigned long long> plan(NEXP);
             for (int e = 0; e < NEXP; ++e) plan[e] = (unsigned long long) (dblob + e * blob);
             iq::Args a{};
@@ -206,12 +215,11 @@ int main(int argc, char** argv) {
                 for (int r = 0; r < FF; ++r) {
                     double sc;
                     const double ref = refh(e, r, qx[0].xhat.data(), sc);
-                    href[(size_t) e * FF + r] = (float) ref;
                     worst = std::max(worst, std::fabs(h[(size_t) e * FF + r] - ref) / sc);
                 }
             report("token gate_up", type, worst, 1e-5);
             std::vector<int8_t> hq((size_t) NEXP * FF); std::vector<float> hd((size_t) NEXP * FF / 32);
-            for (int e = 0; e < NEXP; ++e) { qh[e] = quant(&href[(size_t) e * FF], FF); std::memcpy(&hq[(size_t) e * FF], qh[e].q.data(), FF); std::memcpy(&hd[(size_t) e * FF / 32], qh[e].d.data(), FF / 32 * 4); }
+            for (int e = 0; e < NEXP; ++e) { std::memcpy(&hq[(size_t) e * FF], qh[e].q.data(), FF); std::memcpy(&hd[(size_t) e * FF / 32], qh[e].d.data(), FF / 32 * 4); }
             a.hq = up(hq); a.hd = up(hd);
             float* dp; CK(hipMalloc(&dp, (size_t) NEXP * E * 4)); a.part = dp;
             if (!iq::down(a, NEXP, 1, 0)) { std::printf("down refused\n"); return 1; }

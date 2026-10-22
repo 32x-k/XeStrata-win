@@ -27,8 +27,11 @@ size_t row_size(int type, int64_t k) { return ggml_row_size((ggml_type) type, k)
 }  // namespace
 
 bool gg_cpu_type(int type) {
+    // every type ggml-cpu has a row dot for (ds4_gguf.cu's known types); the i-quants with a device kernel are usually
+    // placed in VRAM, but a pack may hand any of them to this lane
     switch (type) {
-        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 21: case 22: case 23: return true;
+        case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 20: case 21: case 22:
+        case 23: case 29: return true;
         default: return false;
     }
 }

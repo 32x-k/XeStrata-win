@@ -20,8 +20,8 @@ namespace strata::ds4::gguf::iq {
 
 // ggml type ids
 constexpr int kQ5_K = 13, kQ6_K = 14;   // (the dense matrices' K-quants, GEMV only)
-constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18, kIQ3_S = 21,
-              kIQ2_S = 22, kIQ4_XS = 23;
+constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18, kIQ1_S = 19,
+              kIQ4_NL = 20, kIQ3_S = 21, kIQ2_S = 22, kIQ4_XS = 23, kIQ1_M = 29;
 
 /// The trellis types (Strata's, ds4_tq.cu): ggml's TQK6 / TQK7 (145 / 146, the table codebook) and the experimental
 /// TQK5X / TQK4X (224 / 225, computed codebook) and TQK5T / TQK4T (226 / 227, table): a block of 128 values is
@@ -34,6 +34,9 @@ constexpr bool is_tq(int type) { return tq_kbits(type) > 0; }
 
 /// Whether the device kernels take this ggml type.
 bool supported(int type);
+/// Whether the type's block layout is known (its row bytes can be computed) - a superset of supported(): a type the CPU
+/// lane's ggml dots take but no device kernel does (IQ1_S, IQ1_M, IQ4_NL today) is known and must stay out of VRAM.
+bool known(int type);
 /// Values a block of the type holds (256; the trellis types 128; 0: not one of these).
 int block_values(int type);
 /// Bytes of a block of the type (0: not one of these).

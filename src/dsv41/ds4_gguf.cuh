@@ -49,6 +49,9 @@ size_t type_row_bytes(int type, int64_t k);
 int type_block(int type);
 /// The type's name (ggml's), "?" when unknown.
 const char* type_name(int type);
+/// Whether the device kernels take this type (MXFP4 is its own path; the i-quants and K-quants ds4_iq.cu instantiates).
+/// A false here with a layout known to type_row_bytes() means the CPU lane reads it and it must not enter the VRAM tier.
+bool type_on_device(int type);
 
 /// The per-stream scratch of the MXFP4 experts on the current device (once per stream, as x3::prepare).
 bool prepare(cudaStream_t s);
