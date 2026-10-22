@@ -3491,5 +3491,6 @@
   "s8645": "Wird nicht gespeichert, solange Sie die Empfehlung behalten: Strata wählt neu, wenn Sie eine Karte hinzufügen oder entfernen.",
   "s8646": "Nicht genutzt: {0} (anderer Grafikkarten-Hersteller als der, den diese Engine ansteuert).",
   "s8647": "Diese Modelldateien fehlen: {0}.",
-  "s8648": "Drücken Sie noch einmal auf „Herunterladen und laden“, um sie zu holen. Vorhandene Dateien bleiben erhalten. Werden dieselben Dateien wieder aufgelistet, öffnen Sie die Details und teilen Sie sie mit, wenn Sie um Hilfe bitten."
+  "s8648": "Drücken Sie noch einmal auf „Herunterladen und laden“, um sie zu holen. Vorhandene Dateien bleiben erhalten. Werden dieselben Dateien wieder aufgelistet, öffnen Sie die Details und teilen Sie sie mit, wenn Sie um Hilfe bitten.",
+  "s8649": "Dieses Update wurde beim Neustart der App unterbrochen. Ein späteres Update ist abgeschlossen, Sie müssen nichts tun."
 }

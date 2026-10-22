@@ -3491,5 +3491,6 @@
   "s8645": "Não é guardado enquanto mantiver a recomendação: o Strata escolhe de novo se adicionar ou remover uma placa.",
   "s8646": "Não usada: {0} (outra marca de placa de vídeo diferente da que este motor controla).",
   "s8647": "Estes arquivos do modelo estão faltando: {0}.",
-  "s8648": "Pressione Baixar e carregar de novo para buscá-los. Os arquivos que já estão aí são mantidos. Se os mesmos arquivos aparecerem de novo, abra os Detalhes e compartilhe-os ao pedir ajuda."
+  "s8648": "Pressione Baixar e carregar de novo para buscá-los. Os arquivos que já estão aí são mantidos. Se os mesmos arquivos aparecerem de novo, abra os Detalhes e compartilhe-os ao pedir ajuda.",
+  "s8649": "Esta atualização foi interrompida quando o aplicativo reiniciou. Uma atualização posterior terminou, então não há nada a fazer."
 }
