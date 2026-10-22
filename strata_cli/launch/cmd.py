@@ -99,6 +99,10 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
     g.add_argument("--mtp", type=_choice("a draft layer setting", S.MTP_MODES), metavar="on|off",
                    help="the draft layer that makes answers faster. off starts without it: about 1 GB less graphics memory and less RAM, "
                         "slower answers; use it when the engine stops at start on a small card or a PC with little RAM. Default: on")
+    g.add_argument("--drafting", type=_choice("a drafting setting", S.DRAFTING_MODES), metavar="auto|mtp|dflash2|off",
+                   help="which drafter guesses words ahead to make answers faster: auto (recommended: Strata picks from what it measured on cards like yours; "
+                        "that is the MTP today), mtp, dflash2 (Qwen3.8-Flash-Next only; downloads a 1.2 GB drafter once) or off. If DFlash2 cannot run "
+                        "(not enough graphics memory, or a model it is not for) the MTP is used and the start says why")
     g.add_argument("--gpu", metavar="LIST", help="graphics card numbers to use, e.g. 0 or 0,1 (default: the engine's choice)")
     g.add_argument("--gpu-roles", metavar="LIST", help="a role for each graphics card: main, helper or off, e.g. 1=main,0=helper (cards you do not name are off). "
                    "Main does the last steps of every answer; a helper holds part of the model")
@@ -216,6 +220,8 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
         s.parallel = a.parallel
     if a.mtp:
         s.mtp = a.mtp
+    if a.drafting:
+        s.drafting = a.drafting
     if a.gpu and getattr(a, "gpu_roles", None):
         raise ValueError("Use --gpu (which cards) or --gpu-roles (a role for each card), not both.")
     if a.gpu:
@@ -619,7 +625,7 @@ def run_launch(a: argparse.Namespace) -> int:
         s, notices = settings_from_args(a, catalog)
         if not machine:
             _interrupted_move_notice()
-        have_choices = bool(a.preset or a.model or a.model_path or a.context or a.vision or a.parallel or a.access or a.tune)
+        have_choices = bool(a.preset or a.model or a.model_path or a.context or a.vision or a.parallel or a.access or a.tune or a.drafting)
         interactive = sys.stdin.isatty() and sys.stdout.isatty() and not a.no_tui and not machine and not a.plan
         plain_questions = False
         if not have_choices and not interactive and not a.plan:
@@ -672,6 +678,8 @@ def run_launch(a: argparse.Namespace) -> int:
                     _say(f"  model     {m.get('title') or f'{s.family} {s.model}'}{size}")
                 _say(f"  context   {S.context_label(s.context)}    pictures {PICTURE_WORDS.get(s.vision or 'off', s.vision)}    parallel {s.parallel or 'fit to your card'}")
                 _say(f"  download  {(plan.get('download') or {}).get('text', '')}")
+                if plan.get("drafting"):
+                    _say(f"  drafting  {plan['drafting'].replace('Drafting: ', '', 1)}")
                 _say(f"  tuning    {s.tune}    access {S.ACCESS_WORDS[s.access]}, port {s.port}"
                      + ("    API key on" if s.api_key else ""))
                 for n in notes:

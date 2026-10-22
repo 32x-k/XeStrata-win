@@ -356,6 +356,8 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
         cfg["api_key"] = "none"                              # served without a key on purpose (the server warns once at start)
     else:
         cfg.pop("api_key", None)
+    if s.drafting:                                           # strata_control/drafting.py: serve/server.py applies it at every start
+        cfg["drafting"] = s.drafting
     cfg.setdefault("exe", "component:strata-engine")
     cfg["open_browser"] = False                              # strata launch never opens a browser by itself (only `--open` does, after the start)
     if isinstance(cfg.get("args"), list):
@@ -1042,6 +1044,40 @@ class Runner:
         self.emit("model", f"These files are {fam} {model}.", None)
 
     # ---- 3. config and profile
+    def drafting_inputs(self, cfg: dict) -> dict:
+        """What strata_control/drafting.py needs to decide for this launch: the choice, the card class, the model and the data folder."""
+        from strata_control import drafting, engine_component
+        try:
+            archs = list(engine_component.cuda_archs_present()) + list(engine_component.hip_archs_present())
+        except Exception:                                    # noqa: BLE001 - an unknown card is the "other" class
+            archs = []
+        mode = self.s.drafting if self.s.drafting is not None else cfg.get("drafting")
+        return {"mode": mode, "klass": drafting.card_class(archs), "model_name": cfg.get("model_name"), "family": self.s.family,
+                "data_dir": drafting.data_dir_of(cfg.get("args") or []) or (Path(self.s.data_dir) if self.s.data_dir else None)}
+
+    def ensure_drafter(self, base_path: Path) -> None:
+        """Fetch the DFlash2 drafter when this launch will use it and it is not here yet. Never stops the launch: if it cannot be had, the model
+        starts with the MTP and the person is told (recommend, never force)."""
+        from strata_control import drafting, drafting_fetch
+        try:
+            want = self.drafting_inputs(read_config(base_path))
+            if want["data_dir"] is None or not drafting.needs_pack(**want):
+                return
+            self.emit("model", "Downloading the DFlash2 drafter (1.2 GB, once)…", 0)
+
+            def show(step: str, done: int, total: int) -> None:
+                self.check_cancel()
+                self.emit("model", f"{step} {done / 1e9:.2f} of {total / 1e9:.2f} GB" if total > 1 and done < total else step,
+                          100.0 * done / total if total > 0 else None)
+            drafting_fetch.ensure(want["data_dir"], progress=show, cancel=self.cancel)
+        except Cancelled:
+            raise
+        except Exception as e:                               # noqa: BLE001 - the MTP still runs
+            text = f"{e} The model starts with the MTP instead." if isinstance(e, drafting_fetch.DraftingError) else \
+                "The DFlash2 drafter could not be downloaded. The model starts with the MTP instead."
+            self.notices.append(text)
+            self.emit("model", text, None, level="warn")
+
     def build_config(self, base_path: Path) -> Path:
         from strata_control import tune_knobs
         base = read_config(base_path)
@@ -1205,6 +1241,21 @@ class Runner:
             text, nxt = explain_engine_exit(r, self.config_path)
             raise LaunchError(text, nxt, 6)
         self.emit("start", "The model is loaded and answering.", 100)
+        self.report_drafting()
+
+    def report_drafting(self) -> None:
+        """Say which drafter runs when the engine fell back from the one that was asked for ("Drafting: MTP (DFlash2 didn't fit)"). Best effort."""
+        try:
+            import urllib.request
+            headers = {"Authorization": f"Bearer {self.s.api_key}"} if self.s.api_key else {}
+            with urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{int(self.s.port)}/metrics", headers=headers), timeout=4) as resp:
+                info = (json.loads(resp.read().decode("utf-8", "replace")).get("engine") or {})
+        except Exception:                                    # noqa: BLE001 - the line is a convenience
+            return
+        note = str(info.get("drafting_note") or "")
+        if note:
+            self.notices.append(note)
+            self.emit("start", note, None)
 
     # ---- 6. access
     def open_access(self) -> str | None:
@@ -1262,6 +1313,15 @@ class Runner:
                     parts.append({"kind": "mmproj", "label": "the picture reader", "gb": MMPROJ_GB})
             except OSError:
                 pass
+        try:
+            from strata_control import drafting
+            _b, _cfg = self.installed_state()
+            want = self.drafting_inputs(_cfg or {})
+            want["data_dir"] = want["data_dir"] or self.existing_data_dir() or self.catalog.data_dir()
+            if drafting.needs_pack(**want):                   # chosen DFlash2 (or Auto picking it) and the drafter is not here: it is part of the download
+                parts.append({"kind": "dflash2", "label": "the DFlash2 drafter", "gb": drafting.DOWNLOAD_GB})
+        except Exception:                                    # noqa: BLE001 - the plan still shows the rest
+            pass
         gap = self.ready_pack_gap() if st.own_files else None
         if gap:
             # a ready-made pack (NVFP4) is taken from setup's own models folder, not from where the person's files are (round 8, N2: the plan
@@ -1292,6 +1352,8 @@ class Runner:
                 text += " To skip the picture reader (the model then answers text only), add --vision off; or put its mmproj file next to your model files."
             if any(p["kind"] == "mtp" for p in parts):
                 text += " To skip the draft layer (a little slower, less memory), add --mtp off."
+            if any(p["kind"] == "dflash2" for p in parts):
+                text += " To skip the DFlash2 drafter, add --drafting mtp."
         if not engine:
             text += " The engine for your graphics card is downloaded first (from the update source; its size is shown when it starts)."
         return {"gb": gb, "parts": parts, "engine_missing": not engine, "own_files": st.own_files, "text": text}
@@ -1356,7 +1418,18 @@ class Runner:
         model = {"title": title, "family": s.family, "model": s.model, "model_gb": row.download_gb if row is not None else None,
                  "own_files": bool(s.model_path), "folder": s.model_path}
         return {"profile": self.profile, "settings": s.to_dict(with_key=False), "warnings": warns,
-                "flags": S.flags_text(s), "steps": list(STAGES), "model": model, "download": download}
+                "flags": S.flags_text(s), "steps": list(STAGES), "model": model, "download": download, "drafting": self.drafting_plan_line()}
+
+    def drafting_plan_line(self) -> str:
+        """The drafting line of --plan: what drafts, or why not what was asked for. Nothing is changed or downloaded."""
+        from strata_control import drafting
+        try:
+            base, cfg = self.installed_state()
+            want = self.drafting_inputs(cfg or {})
+            return drafting.summary_line(drafting.decide(want["mode"], klass=want["klass"], model_name=want["model_name"], family=want["family"],
+                                                        data_dir=want["data_dir"]))
+        except Exception:                                    # noqa: BLE001
+            return ""
 
     def run(self, *, start: bool = True) -> Result:
         try:
@@ -1364,6 +1437,8 @@ class Runner:
             self.ensure_engine()
             self.check_cancel()
             base = self.ensure_model()
+            self.check_cancel()
+            self.ensure_drafter(base)
             self.check_cancel()
             self.emit("config", "Writing this launch's settings…")
             cfg = self.build_config(base)

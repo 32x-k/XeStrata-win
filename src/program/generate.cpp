@@ -2821,6 +2821,17 @@ int main(int argc, char** argv) {
             // So its expert arena stays unregistered.  STRATA_UMA_REGISTER=1 (or STRATA_ARENA_PIN_GIB=0) registers it as before.
             if (strata::core::igpu_uma_arena_default(ad.gcnArchName, all_igpu, win_host))
                 strata::core::arena_uma_no_register_flag().store(true);
+            // gfx1151 on Windows (#1630 capped a bare `--prefill auto` at 6144 for a 7900 XTX's commit charge): the Strix Halo has its
+            // 8192 chunk back.  IQ3_S, 8K prompt: 691 -> 787 tok/s (one chunk streams 1,785 experts instead of 2,782), 64K 713 -> 748;
+            // 4K is one chunk already.  STRATA_GFX1151_CHUNK=0 (or STRATA_GFX1151_DEFAULTS=0) keeps 6144.
+            if (win_host && all_igpu && o.prefill_auto_bare && o.prefill_auto_cap > 0 && std::strncmp(ad.gcnArchName, "gfx1151", 7) == 0) {
+                const char* c1 = std::getenv("STRATA_GFX1151_CHUNK");
+                const char* d1 = std::getenv("STRATA_GFX1151_DEFAULTS");
+                if (!(c1 != nullptr && c1[0] == '0') && !(d1 != nullptr && d1[0] == '0')) {
+                    o.prefill_auto_cap = 0;
+                    o.prefill_chunk = std::max<int64_t>(o.prefill_chunk, 8192);
+                }
+            }
         } else (void) cudaGetLastError();
     }
 #endif
@@ -15745,6 +15756,9 @@ int main(int argc, char** argv) {
                 k = 0;                                 // a fixed chunk that does not fit: its own buffers, as before
             }
             const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+#if defined(STRATA_GPU_METAL)
+            k = 0;   // Metal: no loan of expert-cache slots (the prompt buffers are the Metal window's own); the refill after it copied into given-back allocations
+#endif
             if (k > 0) {   // the lent slots are refilled after the prompt
                 const int32_t first = (int32_t) (xcache.slots() - k);
                 // the elastic K/V first: its hot experts move into slots of the loan, which are refilled after it
