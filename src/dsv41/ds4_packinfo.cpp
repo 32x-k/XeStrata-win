@@ -61,6 +61,8 @@ int pack_info(const std::string& dir, std::FILE* out) {
     const long long nl = num("num_hidden_layers", 0), ne = num("n_routed_experts", 0), topk = num("num_experts_per_tok", 0);
     const long long dim = num("hidden_size", 0), ff = num("moe_intermediate_size", 0), vocab = num("vocab_size", 0);
     std::map<std::string, Tensor> t;
+    std::vector<std::string> files;
+    std::map<int, double> need;   // bytes the pack needs from each file (its largest tensor end)
     {
         std::FILE* f = std::fopen((dir + "/tensors.txt").c_str(), "r");
         if (f == nullptr) {
@@ -70,18 +72,29 @@ int pack_info(const std::string& dir, std::FILE* out) {
         std::vector<char> buf(1 << 16);
         while (std::fgets(buf.data(), (int) buf.size(), f) != nullptr) {
             char* s = buf.data();
+            if (s[0] == 'f') {   // file <i> <name>
+                char name[4096];
+                int i = 0;
+                if (std::sscanf(s, "file %d %4095s", &i, name) == 2) {
+                    if ((int) files.size() <= i) files.resize((size_t) i + 1);
+                    files[(size_t) i] = name;
+                }
+                continue;
+            }
             if (s[0] != 't') continue;
             char* save = nullptr;
             ::strtok_r(s, " \n", &save);
             const char* name = ::strtok_r(nullptr, " \n", &save);
             const char* dt = ::strtok_r(nullptr, " \n", &save);
-            (void) ::strtok_r(nullptr, " \n", &save);   // file
-            (void) ::strtok_r(nullptr, " \n", &save);   // offset
+            const char* fi = ::strtok_r(nullptr, " \n", &save);
+            const char* off = ::strtok_r(nullptr, " \n", &save);
             const char* nb = ::strtok_r(nullptr, " \n", &save);
-            if (name == nullptr || dt == nullptr || nb == nullptr) continue;
+            if (name == nullptr || dt == nullptr || fi == nullptr || off == nullptr || nb == nullptr) continue;
             Tensor x;
             x.dtype = dt;
             x.bytes = (double) std::strtoull(nb, nullptr, 10);
+            const int idx = std::atoi(fi);
+            need[idx] = std::max(need[idx], (double) std::strtoull(off, nullptr, 10) + x.bytes);
             while (const char* d = ::strtok_r(nullptr, " \n", &save)) x.shape.push_back(std::atoll(d));
             t[name] = std::move(x);
         }
@@ -90,6 +103,32 @@ int pack_info(const std::string& dir, std::FILE* out) {
     if (t.empty()) {
         std::fprintf(out, "pack-info: %s/tensors.txt: no tensors\n", dir.c_str());
         return 1;
+    }
+    // the files the pack points at: they must be there, and at least as long as the largest tensor end says (the weights
+    // live elsewhere; a pack whose model_dir was cleaned up still describes itself perfectly - this is the check)
+    const std::string md = kv.count("model_dir") ? kv["model_dir"] : "";
+    int missing = 0;
+    for (const auto& [i, n] : need) {
+        const std::string name = (size_t) i < files.size() ? files[(size_t) i] : "";
+        if (name.empty()) {
+            std::fprintf(out, "  file %d: no name in tensors.txt\n", i);
+            ++missing;
+            continue;
+        }
+        const std::string path = md + "/" + name;
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (f == nullptr) {
+            std::fprintf(out, "  MISSING %s (%.2f GB wanted)\n", path.c_str(), n / 1e9);
+            ++missing;
+            continue;
+        }
+        std::fseek(f, 0, SEEK_END);
+        const long long sz = std::ftell(f);
+        std::fclose(f);
+        if ((double) sz + 0.5 < n) {
+            std::fprintf(out, "  SHORT %s: %.2f GB there, %.2f GB wanted\n", path.c_str(), (double) sz / 1e9, n / 1e9);
+            ++missing;
+        }
     }
 
     // ---- the expert map: layer -> role types and bytes an expert
@@ -185,6 +224,12 @@ int pack_info(const std::string& dir, std::FILE* out) {
             }
         }
     }
+    if (missing > 0) {
+        std::fprintf(out, "  %d of %zu files missing or short: this pack cannot load (build it again, or point model_dir at "
+                          "the weights)\n", missing, need.size());
+        return 2;
+    }
+    std::fprintf(out, "  files: %zu, all present and long enough\n", need.size());
     return 0;
 }
 
