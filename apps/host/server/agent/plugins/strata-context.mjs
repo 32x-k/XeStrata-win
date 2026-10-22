@@ -16,7 +16,6 @@
  * request the Harness marks `purpose: 'compaction'` is touched in `llm.stream`. Nothing in the Harness is rewritten: a Harness update
  * that renames either leaves compaction as it was, and the test that runs the real Harness fails.
  */
-import { appendFileSync } from 'node:fs';
 import { densityOf, estimateMessage, estimateTools, isContextOverflow, MAX_DENSITY, pressureNow, promptTokensOf, splitMessages, summaryBudget, usageOfEvent, WINDOW_SLACK } from '../context-budget.mjs';
 
 export const name = 'strata-context';
@@ -29,14 +28,10 @@ const wrapped = new WeakSet();
 /** Densities that made a summary request fail on this server, per session id (the next request starts from a more careful one). */
 const careful = new Map();
 
-const debugFile = process.env.STRATA_CONTEXT_DEBUG ?? '';
-const dbg = text => { if (debugFile) { try { appendFileSync(debugFile, `${text}\n`); } catch { /* debug only */ } } };
-
-export function apply(ctx, config = {}) {
+export function apply(ctx) {
   const meter = ctx.tokenMeter;
   const llm = ctx.llm;
-  const log = (level, text) => { try { ctx.logger?.[level]?.(`strata-context: ${text}`); } catch { /* logging never blocks */ } dbg(`${level} ${text}`); };
-  dbg(`apply meter=${meter?.constructor?.name} llm=${llm?.constructor?.name}`);
+  const log = (level, text) => { try { ctx.logger?.[level]?.(`strata-context: ${text}`); } catch { /* logging never blocks */ } };
 
   // 1. The measured size of the prompt, from the model server's own report for each answer.
   if (meter && typeof meter.measure === 'function' && !wrapped.has(meter)) {
@@ -45,7 +40,6 @@ export function apply(ctx, config = {}) {
     meter.measure = function measure(session, requestHeader) {
       const m = original.call(this, session, requestHeader);
       const sample = samples.get(session);
-      dbg(`measure total=${m.totalTokens} surface=${m.surfaceTokens} baseline=${m.baseline?.kind}:${m.baseline?.tokens} sample=${JSON.stringify(sample ?? null)}`);
       if (!sample) return m;
       const now = m.surfaceTokens + estimateTools(requestHeader ?? session.requestHeader?.());
       const total = Math.max(m.totalTokens, pressureNow({ sample, now }));
@@ -66,7 +60,6 @@ export function apply(ctx, config = {}) {
         const sample = { real, estimated };
         samples.set(session, sample);
         if (session.id) bySessionId.set(String(session.id), sample);
-        dbg(`sample real=${real} estimated=${estimated}`);
       } catch (e) { log('warn', `could not record a measurement: ${e.message}`); }
     });
   }
