@@ -1039,7 +1039,7 @@ class Runner:
         sel = plan.get("candidate_selection") or {}
         fam, model = sel.get("family"), sel.get("model")
         if not (fam and model) or plan.get("issues"):
-            issues = models.problem_words(plan.get("issues") or []) or "they are not a model Strata knows"
+            issues = models.problem_words(plan.get("issues") or [], missing=plan.get("missing_shards")) or "they are not a model Strata knows"
             more = " " + next((m for m in plan.get("messages") or [] if "holds" in m), "")
             raise LaunchError(f"These files cannot be used as they are ({issues}).{more.rstrip()}",
                               "Choose the matching model in the list, or check that every shard is in the folder.", 5)

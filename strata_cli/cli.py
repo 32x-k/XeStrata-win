@@ -606,7 +606,7 @@ def _models(a: argparse.Namespace) -> int:
 def _import_problem(plan: dict) -> str:
     """Why `models import --plan` refused, in plain words (the codes stay in --output json)."""
     from strata_control import models as own_models
-    words = own_models.problem_words(plan.get("issues") or [])
+    words = own_models.problem_words(plan.get("issues") or [], missing=plan.get("missing_shards"))
     text = f"These files cannot be used as they are: {words}."
     holds = next((m for m in plan.get("messages") or [] if "holds" in m), "")
     if holds:
