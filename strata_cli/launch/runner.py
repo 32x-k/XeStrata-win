@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from strata_cli.launch import access as acc
+from strata_cli.launch import modelstate
 from strata_cli.launch import settings as S
 from strata_cli.launch.catalog import Catalog, CatalogUnavailable
 
@@ -365,8 +366,10 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
     if log:
         cfg["log"] = log
     apply_cards(cfg, gpus)
-    if s.mtp == "off":                                       # no draft layer for this launch (serve/server.py applies "mtp": false at every start)
-        from strata_control import draft_layer
+    from strata_control import drafting as _drafting
+    drafting_off = _drafting.normalize(s.drafting if s.drafting is not None else cfg.get("drafting")) == "off"
+    if s.mtp == "off" or drafting_off:                       # no draft layer for this launch (serve/server.py applies "mtp": false at every start)
+        from strata_control import draft_layer              # --drafting off: the written file carries no --mtp either (it was left in before)
         cfg["mtp"] = False
         draft_layer.apply(cfg)
     elif s.mtp == "on":
@@ -699,8 +702,9 @@ class Runner:
             args += ["--kv", s.kv]
         if fam in ("qwen", "coder"):
             args += ["--experimental-speed-projection", "off"]
-        if s.mtp in ("on", "off") and fam in ("qwen", "swift", "coder", "unsloth"):
-            args += ["--mtp", s.mtp]                      # round 8, N3: "--mtp off" never reached setup, which then fetched the 5.2 GB draft layer
+        mtp_word = modelstate.mtp_choice(s.mtp, s.drafting)
+        if mtp_word in ("on", "off") and fam in modelstate.HELPER_FAMILIES:
+            args += ["--mtp", mtp_word]                      # round 8, N3: "--mtp off" never reached setup, which then fetched the 5.2 GB draft layer
         data = s.data_dir or self.existing_data_dir()
         if data:
             args += ["--data-dir", str(data)]
@@ -793,7 +797,7 @@ class Runner:
         if s.family and s.model and not s.model_path:
             path, desc = self.installed_state()
         return modelstate.assess(self.catalog, s.family, s.model, vision=s.vision, model_path=s.model_path, data_dir=s.data_dir,
-                                 config=path, desc=desc, mtp=s.mtp)
+                                 config=path, desc=desc, mtp=s.mtp, drafting=s.drafting)
 
     def download_gb(self) -> float:
         """How much would be downloaded for this launch right now: 0 when everything is on disk (the model is installed with these choices
@@ -1294,7 +1298,7 @@ class Runner:
         st = self.model_state()
         parts = [{"kind": p.kind, "label": p.label, "gb": round(p.gb, 1)} for p in st.parts if p.gb >= 0.05]     # a part already on disk is not a download
         row = self.row()
-        helpers = s.family in ("qwen", "swift", "coder", "unsloth")
+        helpers = s.family in modelstate.HELPER_FAMILIES
         wants_pictures = s.vision not in (None, "off") and row is not None and bool(row.images)
         if helpers and (st.own_files or not st.installed):
             # a model that is not set up yet (or the person's own files) comes without the draft layer and the picture reader: setup fetches them
@@ -1302,7 +1306,7 @@ class Runner:
             have = {p["kind"] for p in parts}
             try:
                 data = Path(st.folder) if st.folder else (Path(s.data_dir) if s.data_dir else (self.existing_data_dir() or self.catalog.data_dir()))
-                if s.mtp != "off" and "mtp" not in have and not (data / "mtp" / "rt" / "experts.bin").is_file():
+                if modelstate.mtp_choice(s.mtp, s.drafting) != "off" and "mtp" not in have and not (data / "mtp" / "rt" / "experts.bin").is_file():
                     parts.append({"kind": "mtp", "label": "the draft layer", "gb": MTP_FETCH_GB})
                 places = [data / "models", data / "Models"]
                 if s.model_path:                             # setup uses a reader that sits with the person's own files (setup.py --gguf-dir)
@@ -1328,9 +1332,11 @@ class Runner:
             # said "nothing to download" and setup then asked for 129 GB): count what setup will fetch
             parts = [p for p in parts if p["kind"] != "weights"] + [{"kind": "weights", "label": "the ready-made pack", "gb": gap["gb"]}]
         gb = round(sum(p["gb"] for p in parts), 1)
-        engine = True
+        engine, here = True, []
         try:
-            engine = bool(engine_component.status(Path(self.components_dir) if self.components_dir else None).get("usable"))
+            report = engine_component.status(Path(self.components_dir) if self.components_dir else None)
+            engine = bool(report.get("usable"))
+            here = [str(i.get("version")) for i in report.get("installed") or [] if i.get("version")]
         except Exception:                                    # noqa: BLE001 - the plan must not fail on this
             pass
         if gb < 0.05:
@@ -1354,9 +1360,13 @@ class Runner:
                 text += " To skip the draft layer (a little slower, less memory), add --mtp off."
             if any(p["kind"] == "dflash2" for p in parts):
                 text += " To skip the DFlash2 drafter, add --drafting mtp."
-        if not engine:
+        if not engine and here:
+            # B03: an engine IS installed, but this plan cannot use it (its signature cannot be checked here, or it is for another card): not "missing"
+            text += (f" An engine ({', '.join(here[:3])}) is installed, but it did not pass Strata's check on this computer, so Strata looks for a working one "
+                     "first. `strata components engine` says why.")
+        elif not engine:
             text += " The engine for your graphics card is downloaded first (from the update source; its size is shown when it starts)."
-        return {"gb": gb, "parts": parts, "engine_missing": not engine, "own_files": st.own_files, "text": text}
+        return {"gb": gb, "parts": parts, "engine_missing": not engine and not here, "engine_usable": engine, "own_files": st.own_files, "text": text}
 
     def ready_pack_gap(self) -> dict | None:
         """For a ready-made pack family (NVFP4): what setup would still fetch into its models folder for these choices, {gb, folder, free_gb}, or None."""

@@ -315,7 +315,7 @@ class FolderStep(Base):
             await press(pilot, "enter", "enter")
             t = text_of(app)
             self.assertIn("Where should the model files be stored?", t)
-            self.assertIn("Not downloaded yet: about 84 GB", t)
+            self.assertIn("Not downloaded yet: about 90 GB", t)
             self.assertIn("Free space in that folder's drive", t)
             f = app.screen.query_one("#folderpath")
             f.value = ""

@@ -108,7 +108,7 @@ class Ctx:
         from strata_cli.launch import modelstate
         s = self.settings
         return modelstate.assess(self.catalog, s.family, s.model, vision=s.vision, model_path=s.model_path,
-                                 data_dir=data_dir if data_dir is not None else s.data_dir, rows=self.rows)
+                                 data_dir=data_dir if data_dir is not None else s.data_dir, rows=self.rows, mtp=s.mtp, drafting=s.drafting)
 
     def default_folder(self) -> Path:
         """The folder the Folder step starts with: where the chosen model already is (installed, or the person's own files with their
