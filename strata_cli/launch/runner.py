@@ -1392,6 +1392,8 @@ class Runner:
                 runtime.stop(name, timeout=120)
             except ProfileError as e:
                 raise LaunchError(f"The running server could not be stopped: {e}.", "Run `strata launch --stop` first.", 6) from None
+        self.check_port_free()
+        self._marks = self.log_marks()                       # what the logs already held: only this attempt's lines are ever quoted
         self.emit("start", "Starting the engine and loading the model. The first start can take a few minutes.", None)
         done = threading.Event()
         box: dict[str, Any] = {}
@@ -1415,13 +1417,68 @@ class Runner:
                 raise Cancelled()
             self.emit("start", f"Loading the model… {int(time.monotonic() - t0)} s", None)
         if "e" in box:
+            self.end_failed_start()
             raise LaunchError(f"The server could not start: {box['e']}", _log_hint(self.config_path), 6)
         r = box["r"]
         if not r.get("ok"):
-            text, nxt = explain_engine_exit(r, self.config_path)
+            text, nxt = explain_engine_exit(r, self.config_path, marks=self._marks, server_log=self.server_log_path())
+            self.end_failed_start()
             raise LaunchError(text, nxt, 6)
         self.emit("start", "The model is loaded and answering.", 100)
         self.report_drafting()
+
+    _marks: dict | None = None
+
+    def server_log_path(self) -> Path | None:
+        try:
+            from strata_control import runtime
+            return runtime.runtime_dir() / f"{self.profile}.server.log"
+        except Exception:                                    # noqa: BLE001
+            return None
+
+    def log_marks(self) -> dict:
+        """{log path: size now} for the engine log and the runtime's server log, so a failed start quotes only what this attempt wrote."""
+        marks = {}
+        paths = [self.server_log_path()]
+        try:
+            paths.append(Path(read_config(self.config_path).get("log"))) if self.config_path else None
+        except (OSError, ValueError, TypeError):
+            pass
+        for path in paths:
+            try:
+                marks[str(path)] = Path(path).stat().st_size if path else 0
+            except OSError:
+                if path:
+                    marks[str(path)] = 0
+        return marks
+
+    def check_port_free(self) -> None:
+        """Before the host starts: a port another program holds is said at once, in words (X01), and nothing is left running."""
+        import socket
+        port = int(self.s.port)
+        busy = False
+        for host in ("127.0.0.1",):
+            try:
+                with socket.create_connection((host, port), timeout=1.0):
+                    busy = True
+            except OSError:
+                pass
+        if not busy:
+            return
+        raise LaunchError(f"Port {port} is already in use by another program.",
+                          f"Close it, or start with a different port (for example --port {port + 1}).", 6)
+
+    def end_failed_start(self) -> None:
+        """A start that failed leaves nothing alive: the runtime host of this attempt is stopped, or ended by its recorded identity."""
+        from strata_control import runtime
+        try:
+            runtime.stop(self.profile, timeout=30)
+        except Exception:                                    # noqa: BLE001
+            pass
+        try:
+            runtime.cleanup(self.profile)
+        except Exception:                                    # noqa: BLE001
+            pass
 
     def report_drafting(self) -> None:
         """Say which drafter runs when the engine fell back from the one that was asked for ("Drafting: MTP (DFlash2 didn't fit)"). Best effort."""
@@ -1691,8 +1748,25 @@ KNOWN_CAUSES = (
 )
 
 
-def engine_log_tail(config: Path | None, limit: int = 65536) -> tuple[list[str], str | None]:
-    """(last lines of the engine log, its path); ([], path-or-None) when it cannot be read."""
+def _lines_since(path: str | os.PathLike | None, mark: int | None, limit: int = 65536) -> list[str]:
+    """Lines written to a log after `mark` bytes (the whole tail when there is no mark); a log that got shorter was started over."""
+    if not path:
+        return []
+    try:
+        with open(path, "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            start = 0 if (mark is None or mark > size) else mark
+            stream.seek(max(start, size - limit))
+            data = stream.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    return [x.rstrip() for x in data.splitlines() if x.strip()]
+
+
+def engine_log_tail(config: Path | None, limit: int = 65536, since: dict | None = None) -> tuple[list[str], str | None]:
+    """(last lines of the engine log, its path); ([], path-or-None) when it cannot be read. With `since` (log sizes before the attempt)
+    only this attempt's lines are returned."""
     log = None
     if config:
         try:
@@ -1701,6 +1775,8 @@ def engine_log_tail(config: Path | None, limit: int = 65536) -> tuple[list[str],
             log = None
     if not log:
         return [], None
+    if since is not None:
+        return _lines_since(log, since.get(str(log)), limit), str(log)
     try:
         with open(log, "rb") as stream:
             stream.seek(0, os.SEEK_END)
@@ -1711,10 +1787,20 @@ def engine_log_tail(config: Path | None, limit: int = 65536) -> tuple[list[str],
     return [x.rstrip() for x in data.splitlines() if x.strip()], str(log)
 
 
-def explain_engine_exit(result: dict, config: Path | None) -> tuple[str, str]:
+def explain_engine_exit(result: dict, config: Path | None, marks: dict | None = None, server_log: Path | None = None) -> tuple[str, str]:
     """(text, next) for a start that did not reach ready: the stage, the cause line from the engine log, the next step and the log path
     (round 8, L3: an Arc engine died with 'No device of requested type available' and the person saw only 'server_exited')."""
-    lines, log = engine_log_tail(config)
+    server_lines = _lines_since(server_log, (marks or {}).get(str(server_log))) if (server_log and marks is not None) else []
+    for x in server_lines:                                   # the server's own refusal (server.py: error: ...) is the cause when there is one
+        busy = re.search(r"port (\d+) is already in use", x)
+        if busy:
+            return (f"Port {busy.group(1)} is already in use by another program.",
+                    f"Close it, or start with a different port (for example --port {int(busy.group(1)) + 1}). The server's log: {server_log}")
+    lines, log = engine_log_tail(config, since=marks)
+    if marks is not None and not lines:
+        own = [x for x in server_lines if re.search(r"server\.py: error:|error:", x, re.I)]
+        if own:
+            lines, log = own, str(server_log)
     lines = lines or [x.strip() for x in str(result.get("log_tail") or "").split(" | ") if x.strip()]
     cause = next((x for x in reversed(lines) if CAUSE_LINE.search(x) and not x.lstrip().startswith(("strata generate: ", "strata serve: expert"))), None)
     cause = (cause or (lines[-1] if lines else "")).strip()
