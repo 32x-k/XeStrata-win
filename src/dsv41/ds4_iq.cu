@@ -3,6 +3,7 @@
 // src/ds4/ds4_iq.cu - a GGUF's low-bit routed experts on the device (see ds4_iq.cuh).  The block layouts and grids are
 // ggml's (ggml-common.h, MIT, third_party/ggml/LICENSE); the sign and grid tricks are llama.cpp's vecdotq.cuh.
 #include "ds4_iq.cuh"
+#include "ds4_numerics.cuh"
 
 #include <cuda_fp16.h>
 #if !defined(STRATA_USE_HIP)
@@ -1007,7 +1008,59 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
     else mv_kernel<T, 16><<<grid, kThreads, 0, s>>>(J);
 }
 
+
+// ---------------------------------------------------------------- whole matrices as 16-bit rows (the chunked prompt's GEMMs)
+// n rows of k values from `raw` (ld bytes a row): one thread a 32-value sub-block, the sub-block's codes and scales from decode<>
+// (value = d s q - m of its half, ggml's dequantize_row_*), rounded to BF16 (bf16) or F16
+template <int T>
+__global__ void __launch_bounds__(kThreads) dq_rows_kernel(const uint8_t* __restrict__ raw, size_t ld, int k, int n,
+                                                           uint16_t* __restrict__ dst, bool bf16) {
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    load_tab<T>(tab);
+    __syncthreads();
+    const int nsb = k / 32;
+    const size_t total = (size_t) n * (size_t) nsb;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
+        const size_t r = i / (size_t) nsb;
+        const int kb = (int) (i - r * (size_t) nsb);
+        Sub sb;
+        sb.m0 = sb.m1 = 0.0f;
+        decode<T>(raw + r * ld, kb, tab, sb);
+        const float d0 = __fmul_rn(sb.d, (float) sb.s0), d1 = __fmul_rn(sb.d, (float) sb.s1);
+        uint16_t* o = dst + r * (size_t) k + (size_t) kb * 32;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            const int q = (int) (int8_t) ((uint32_t) sb.q[j >> 2] >> (8 * (j & 3)));
+            const float v = j < 16 ? __fsub_rn(__fmul_rn(d0, (float) q), sb.m0) : __fsub_rn(__fmul_rn(d1, (float) q), sb.m1);
+            o[j] = bf16 ? strata::ds4::bf16_rn(v) : __half_as_ushort(__float2half_rn(v));
+        }
+    }
+}
+
 }  // namespace
+
+bool dequant_rows(int type, const void* raw, size_t ld, int k, int n, uint16_t* dst, bool bf16, cudaStream_t s) {
+    if (raw == nullptr || k % 256 != 0 || n <= 0) return false;
+    const unsigned blocks = (unsigned) std::min<size_t>(((size_t) n * (size_t) (k / 32) + kThreads - 1) / kThreads, 65535);
+#define DS4_DQ(T) dq_rows_kernel<T><<<blocks, kThreads, 0, s>>>((const uint8_t*) raw, ld, k, n, dst, bf16)
+    switch (type) {
+        case kIQ2_XXS: DS4_DQ(kIQ2_XXS); break;
+        case kIQ2_XS: DS4_DQ(kIQ2_XS); break;
+        case kIQ2_S: DS4_DQ(kIQ2_S); break;
+        case kIQ3_XXS: DS4_DQ(kIQ3_XXS); break;
+        case kIQ3_S: DS4_DQ(kIQ3_S); break;
+        case kIQ4_XS: DS4_DQ(kIQ4_XS); break;
+        case kIQ1_M: DS4_DQ(kIQ1_M); break;
+        case kQ4_K: DS4_DQ(kQ4_K); break;
+        case kQ5_K: DS4_DQ(kQ5_K); break;
+        case kQ6_K: DS4_DQ(kQ6_K); break;
+        case kQ2_K: DS4_DQ(kQ2_K); break;
+        case kQ3_K: DS4_DQ(kQ3_K); break;
+        default: return false;
+    }
+#undef DS4_DQ
+    return cudaGetLastError() == cudaSuccess;
+}
 
 bool supported(int t) {
     // the types the kernels below are instantiated for (DS4_IQ_SWITCH + the trellis ones + the dense K-quants)

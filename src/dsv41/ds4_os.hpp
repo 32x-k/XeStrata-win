@@ -61,8 +61,16 @@ inline fd_t open_ro(const std::string& path) {
 /// kBadFd where the filesystem refuses it, or on Windows, whose unbuffered reads of a mapped file take a slow path)
 inline fd_t open_direct(const std::string& path) {
 #if defined(_WIN32)
-    (void) path;
-    return kBadFd;
+    // FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED: the disk straight into an aligned buffer, any number of reads in flight on
+    // one handle (DS4_WIN_DIRECT=0: none, the page cache's buffered reads as before)
+    static const bool off = [] {
+        const char* v = std::getenv("DS4_WIN_DIRECT");
+        return v != nullptr && std::atoi(v) == 0;
+    }();
+    if (off) return kBadFd;
+    HANDLE h = CreateFileW(wide(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
+    return h == INVALID_HANDLE_VALUE ? kBadFd : (fd_t) h;
 #else
     const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
     return fd < 0 ? kBadFd : (fd_t) fd;
@@ -78,8 +86,40 @@ inline uint64_t direct_span(uint64_t off, uint64_t n) {
 }
 inline bool pread_direct(fd_t f, void* dst, uint64_t n, uint64_t off) {
 #if defined(_WIN32)
-    (void) f, (void) dst, (void) n, (void) off;
-    return false;
+    struct Ev {   // (each thread its own, closed when it ends)
+        HANDLE h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        ~Ev() {
+            if (h != nullptr) CloseHandle(h);
+        }
+    };
+    static thread_local Ev ev;
+    if (ev.h == nullptr) return false;
+    const uint64_t a0 = off & ~(kDirectAlign - 1), need = direct_span(off, n), want = (off - a0) + n;
+    uint8_t* p = (uint8_t*) dst;
+    uint64_t got = 0;
+    while (got < need) {
+        const DWORD ask = (DWORD) std::min<uint64_t>(need - got, 1ull << 30);   // (a multiple of 4096)
+        OVERLAPPED ov{};
+        const uint64_t at = a0 + got;
+        ov.Offset = (DWORD) (at & 0xffffffffu);
+        ov.OffsetHigh = (DWORD) (at >> 32);
+        ov.hEvent = ev.h;
+        ResetEvent(ev.h);
+        DWORD r = 0;
+        if (!ReadFile((HANDLE) f, p + got, ask, nullptr, &ov)) {
+            const DWORD e = GetLastError();
+            if (e == ERROR_HANDLE_EOF) break;
+            if (e != ERROR_IO_PENDING) return false;
+        }
+        if (!GetOverlappedResult((HANDLE) f, &ov, &r, TRUE)) {
+            if (GetLastError() == ERROR_HANDLE_EOF) break;
+            return false;
+        }
+        if (r == 0) break;   // (the file's end: the last aligned read is short)
+        got += r;
+        if (r % kDirectAlign != 0) break;
+    }
+    return got >= want;
 #else
     const uint64_t a0 = off & ~(kDirectAlign - 1), need = direct_span(off, n), want = (off - a0) + n;
     uint8_t* p = (uint8_t*) dst;
@@ -370,7 +410,7 @@ inline void pin_thread(std::thread& t, int cpu) {
 #if defined(_WIN32)
 /// Each NUMA node's physical cores (the first logical CPU of each), processor group 0 - Windows' answer to
 /// /sys/devices/system/node; empty if the OS does not say.
-inline std::vector<std::vector<int>> node_cores() {
+inline std::vector<std::vector<int>> node_cores(bool smt = false) {   // (smt: every logical CPU of a core, not its first)
     std::vector<std::vector<int>> nodes;
     auto query = [](LOGICAL_PROCESSOR_RELATIONSHIP rel, std::vector<uint8_t>& buf) {
         DWORD len = 0;
@@ -398,7 +438,12 @@ inline std::vector<std::vector<int>> node_cores() {
                     break;
                 }
             for (size_t n = 0; n < masks.size() && first >= 0; ++n)
-                if ((masks[n] >> first) & 1) nodes[n].push_back(first);
+                if ((masks[n] >> first) & 1) {
+                    nodes[n].push_back(first);
+                    if (smt)
+                        for (int b = first + 1; b < 64; ++b)
+                            if ((m >> b) & 1) nodes[n].push_back(b);
+                }
         }
         o += e->Size;
     }

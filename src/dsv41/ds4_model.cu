@@ -20,6 +20,7 @@
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
+#include "ds4_store.hpp"
 #include "ds4_vision.cuh"
 #include "strata/dsv41/exl3_cpu.hpp"
 #include "strata/dsv41/exl3.hpp"
@@ -111,7 +112,11 @@ std::vector<int> cpu_list(const std::string& s) {   // "0-3,8,10-11"
 // each NUMA node's physical cores (the first logical CPU of each core), in order
 std::vector<std::vector<int>> node_cores() {
 #if defined(_WIN32)
-    std::vector<std::vector<int>> nodes = os::node_cores();
+    static const bool smt = [] {   // DS4_CPU_SMT=1: the second hardware thread of every core as well (memory-bound rows gain from it)
+        const char* v = std::getenv("DS4_CPU_SMT");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    std::vector<std::vector<int>> nodes = os::node_cores(smt);
 #else
     std::vector<std::vector<int>> nodes;
     for (int n = 0; n < 64; ++n) {
@@ -981,6 +986,8 @@ struct Model::Impl {
         const char* v = std::getenv("STRATA_DS4_DISK_SKIP_FROM");
         return v != nullptr ? std::max(0, std::atoi(v)) : 0;
     }();
+    // the RAM store (--ssd-cache): the CPU lane's experts in slots a policy owns, read unbuffered (null: off)
+    std::unique_ptr<ExpertStore> store;
     bool in_ram(const Layer& l, int e) const {   // (DISK_SKIP_W) expert e's pages in RAM now
         if (!l.ram.empty() && l.ram[(size_t) e] >= 0) return true;
         if (l.lay.fmt == gg::kFmtMXFP4) {
@@ -1586,6 +1593,10 @@ struct Model::Impl {
         return true;
     }
     const uint8_t* mx_mat(const Layer& l, int e, int r) const {   // expert e's matrix r: its RAM-tier slot, else the file's
+        if (store) {
+            const int s = store->find(l.il, e);
+            if (s >= 0) return store->mat(s, r);
+        }
         if (!l.ram.empty() && l.ram[(size_t) e] >= 0)   // (a copy with NH > 1: part 0's rows only - whole: read_mx)
             return copy_mode ? ram_part[(size_t) l.ram[(size_t) e]][0] + cp_lay[(size_t) l.il][(size_t) r]
                              : ram_slots[(size_t) l.ram[(size_t) e]] + l.lay.trellis[r];
@@ -2389,6 +2400,7 @@ struct Model::Impl {
             const uint64_t avail = ram_avail();
             warm_bytes = avail > kRamMargin ? std::min<uint64_t>(avail - kRamMargin, (uint64_t) need) : 0;
             if (avail == ~uint64_t{0}) warm_bytes = (uint64_t) need;
+            if (store_gb() > 0) warm_bytes = 0;   // (the store is the RAM tier: nothing to warm in the OS cache)
             std::fprintf(stderr,
                          "ds4: the experts VRAM leaves over (~%.1f GB) are read in place from the model's files%s "
                          "(%.1f GB of RAM free to keep them: the most-routed %.1f GB read ahead; prompts in chunks of %d)\n",
@@ -2416,6 +2428,7 @@ struct Model::Impl {
         if (!place_experts(err)) return false;
         if (!load_experts(err)) return false;
         if (pk.gguf) make_pools();
+        init_store();
         if (chunk > 0) {
             // the CPU lane's parts pinned (the chunks stream them to the GPUs by DMA), each layer's virtual slots
             const double tr = now_ms();
@@ -4171,6 +4184,46 @@ struct Model::Impl {
         return s.str();
     }
 
+    double store_gb() const {
+        if (!pk.gguf) return 0.0;
+        if (const char* v = std::getenv("DS4_STORE_GB")) return std::atof(v);
+        return o.ssd_cache_gb;
+    }
+    void init_store() {
+        const double gb = store_gb();
+        if (gb <= 0.0 || L.empty() || L[0].lay.fmt != gg::kFmtMXFP4 || !file_experts) return;
+        std::vector<ExpertStore::LayerGeo> geo((size_t) g.nl);   // (the trunk's layers: the drafter's bigger experts stay in place)
+        for (const Layer& l : L) {
+            if (l.il >= g.nl) continue;
+            ExpertStore::LayerGeo& gl = geo[(size_t) l.il];
+            gl.n_exp = l.n_exp;
+            for (int r = 0; r < 3; ++r) {
+                gl.file[r] = l.mx_file[r];
+                gl.off[r] = l.mx_off[r];
+                gl.stride[r] = l.mx_stride[r];
+                gl.bytes[r] = mx_part_bytes(l, r);
+            }
+        }
+        std::vector<std::string> paths;
+        ExpertStore::Cfg cfg;
+        cfg.budget_bytes = (size_t) (gb * 1e9);
+        cfg.threads = std::getenv("DS4_STORE_THREADS") ? std::atoi(std::getenv("DS4_STORE_THREADS")) : 8;
+        cfg.floor_bytes = (size_t) (std::getenv("DS4_STORE_FLOOR_GB") ? std::atof(std::getenv("DS4_STORE_FLOOR_GB")) : 8.0) << 30;
+        cfg.policy = (ExpertStore::Policy) (std::getenv("DS4_STORE_POLICY") ? std::atoi(std::getenv("DS4_STORE_POLICY")) : o.ssd_policy);
+        cfg.ram_avail = [] { return ram_avail(); };
+        bool direct = true;
+        for (os::fd_t f : pk.dfds) direct = direct && f != os::kBadFd;
+        auto st = std::make_unique<ExpertStore>();
+        if (!st->init(cfg, geo, pk.fds, pk.dfds, pk.pfds)) {
+            std::fprintf(stderr, "ds4: --ssd-cache: the store could not start\n");
+            return;
+        }
+        store = std::move(st);
+        std::fprintf(stderr, "ds4: RAM store: up to %zu slots of %.1f MB (%.1f GB), policy %d, %d reader threads, %s reads\n",
+                     store->slots_max(), store->slot_bytes() / 1e6, store->slots_max() * (double) store->slot_bytes() / 1e9,
+                     (int) cfg.policy, cfg.threads, direct ? "unbuffered" : "BUFFERED (no direct handle)");
+    }
+
     int cpu_threads() const {
         int n = 0;
         for (const auto& pl : pools) n += pl->size() - 1;
@@ -4599,7 +4652,7 @@ struct Model::Impl {
             // more than computing a warm expert, 0.34 ms a 6.3 MB matrix on Windows)
             std::vector<std::pair<const void*, size_t>> want;
             for (const Ent& en : ents)
-                if (l.ram.empty() || l.ram[(size_t) en.e] < 0)
+                if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
                     for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
             os::prefetch_cold(want);
         }
@@ -4689,7 +4742,7 @@ struct Model::Impl {
         {   // (os::prefetch, as above)
             std::vector<std::pair<const void*, size_t>> want;
             for (const Ent& en : ents)
-                if (l.ram.empty() || l.ram[(size_t) en.e] < 0)
+                if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
                     for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
             os::prefetch(want);
         }
@@ -4747,10 +4800,31 @@ struct Model::Impl {
         run_nodes(ne * DB, f);
     }
 
+    // the window's CPU-lane experts made ready (and pinned) in the store for the length of the call
+    struct StoreHold {
+        Impl* m = nullptr;
+        int layer = 0;
+        std::vector<int> es;
+        std::vector<char> ok;
+        StoreHold(Impl* m_, const Layer& l, const std::vector<Ent>& ents) {
+            if (!m_->store) return;
+            m = m_;
+            layer = l.il;
+            for (const Ent& en : ents)
+                if ((l.ram.empty() || l.ram[(size_t) en.e] < 0) && std::find(es.begin(), es.end(), en.e) == es.end()) es.push_back(en.e);
+            m->store->ensure(layer, es.data(), (int) es.size(), ok);
+        }
+        ~StoreHold() {
+            if (m) m->store->release(layer, es.data(), (int) es.size(), ok);
+        }
+    };
     void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
                      const int* ord = nullptr) {
         if (ldx == 0) ldx = (size_t) g.dim;
-        if (l.lay.fmt == gg::kFmtMXFP4) return cpu_experts_mx(l, x, ents, ldx, ord);
+        if (l.lay.fmt == gg::kFmtMXFP4) {
+            StoreHold hold(this, l, ents);
+            return cpu_experts_mx(l, x, ents, ldx, ord);
+        }
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH, GQ = E / 256, DQ = FF / 128;
         const int GB = FFh / 128, DB = Eh / 128, EB = E / 128, FB = FF / 128;
         const int ne = (int) ents.size();
@@ -5215,7 +5289,9 @@ struct Model::Impl {
                     if (a == 1 && (rk[e] == 0 || rk[e] > i + 1)) rk[e] = (uint8_t) (i + 1);
                     if ((fl[e] & 8) || !file_read(n, e)) continue;
                     fl[e] |= 8;
-                    for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
+                    if (store) store->prefetch(j, e);
+                    else
+                        for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
                     ++st.ahead_pf;
                 }
         }
@@ -7930,7 +8006,25 @@ void Model::checkpoint(int slot) { p_->checkpoint(slot); }
 bool Model::restore(int64_t limit) { return p_->restore(limit); }
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
 void Model::save_profile() const { p_->save_profile(); }
-const Stats& Model::stats() const { return p_->st; }
+const Stats& Model::stats() const {
+    Stats& st = p_->st;
+    if (p_->store) {   // (the store keeps its own counters: copied in when asked)
+        const ExpertStore& x = *p_->store;
+        st.store_hits = x.stats().hits.load();
+        st.store_misses = x.stats().misses.load();
+        st.store_prefetched = x.stats().prefetched.load();
+        st.store_pf_used = x.stats().prefetch_used.load();
+        st.store_pf_wasted = x.stats().prefetch_wasted.load();
+        st.store_evictions = x.stats().evictions.load();
+        st.store_bytes = x.stats().bytes_read.load();
+        st.store_fails = x.stats().fails.load();
+        st.store_wait_ms = x.stats().wait_ns.load() / 1e6;
+        st.store_busy_ms = x.busy_ms();
+        st.store_slots = (int64_t) x.slots_allocated();
+        st.store_slots_max = (int64_t) x.slots_max();
+    }
+    return st;
+}
 std::string Model::describe() const { return p_->describe(); }
 std::vector<std::string> Model::info_lines() const { return p_->info_lines(); }
 

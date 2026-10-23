@@ -32,6 +32,11 @@ struct Options {
     // the CPU lane's experts read in place from the model's files, the page cache keeping what fits, instead of
     // copied into RAM: 1 on, 0 off, -1 (auto) where the RAM this process can get does not hold them
     int mmap_experts = -1;
+    // the experts the VRAM leaves over are cached in RAM by a store of their own (ds4_store.hpp): whole experts read unbuffered into
+    // slots, a replacement policy (0 lru, 1 lfu, 2 lfu then lru), filled on demand and by the lookahead's guesses.  GB of RAM at
+    // most (never past the RAM the process can still get less 8 GB); 0: off, the OS page cache as before
+    double ssd_cache_gb = 0.0;
+    int ssd_policy = 0;
     bool dspark = true;              // load the DSpark drafter (the checkpoint's mtp.* blocks) for speculative decoding
     float dspark_conf = 0.5f;         // a draft is verified while its confidence (sigmoid) is at least this
     // tensor parallelism: runs of tp GPUs of one kind (the same memory) take the same layers, each a share of the
@@ -73,6 +78,12 @@ struct Stats {
     int64_t ahead_picks = 0, ahead_hit_k = 0, ahead_hit = 0, ahead_hit2 = 0;
     int64_t ahead_cold = 0, ahead_cold_hit = 0, ahead_pf = 0;
     int64_t ahead_rank_n[16] = {}, ahead_rank_hit[16] = {};   // the next-layer guesses by rank, and how many were picked
+    // the RAM store (--ssd-cache), totals since the load: reads asked for and found there (hits), missed (misses), started ahead
+    // of use (prefetched) of which used / given up unused, slots given up, bytes read, ms the CPU lane waited for the reads
+    int64_t store_hits = 0, store_misses = 0, store_prefetched = 0, store_pf_used = 0, store_pf_wasted = 0, store_evictions = 0;
+    int64_t store_bytes = 0, store_fails = 0;
+    double store_wait_ms = 0.0, store_busy_ms = 0.0;
+    int64_t store_slots = 0, store_slots_max = 0;
     int64_t drafts_offered = 0, drafts_accepted = 0, drafts_rounds = 0;
     // per draft position (the 1st .. 8th of a round): verified with all the drafts before it accepted, and accepted
     int64_t draft_reached[8] = {}, draft_kept[8] = {};

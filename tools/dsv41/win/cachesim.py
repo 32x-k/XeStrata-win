@@ -22,6 +22,9 @@ import struct
 import sys
 
 
+WARM = 0   # accesses before this index warm the cache but are not counted
+
+
 def read_trace(path, k=6):
     """-> list of steps; a step = list of (layer, [rows of expert ids], guesses or None)."""
     data = open(path, 'rb').read()
@@ -85,15 +88,16 @@ class Sizes:
 def sim_lru(acc, size, cap):
     od = collections.OrderedDict()
     used = hits = hitb = tot = totb = 0
-    for _, l, e in acc:
+    for i, (_, l, e) in enumerate(acc):
         k = (l, e)
         sz = size(l)
-        tot += 1
-        totb += sz
+        cnt = i >= WARM
+        tot += cnt
+        totb += sz * cnt
         if k in od:
             od.move_to_end(k)
-            hits += 1
-            hitb += sz
+            hits += cnt
+            hitb += sz * cnt
             continue
         od[k] = sz
         used += sz
@@ -111,12 +115,13 @@ def sim_lfu(acc, size, cap, half_life_acc=20000):
     for t, (_, l, e) in enumerate(acc):
         k = (l, e)
         sz = size(l)
-        tot += 1
-        totb += sz
+        cnt = t >= WARM
+        tot += cnt
+        totb += sz * cnt
         # CRF: decayed count, kept in log space: v = log(count) + lam * t
         if k in res:
-            hits += 1
-            hitb += sz
+            hits += cnt
+            hitb += sz * cnt
         old = score.get(k)
         v = lam * t
         score[k] = v if old is None else v + math.log1p(math.exp(old - v)) if old - v < 50 else old
@@ -153,13 +158,14 @@ def pick_static(freq, size, cap):
 
 def sim_static(acc, size, chosen):
     hits = hitb = tot = totb = 0
-    for _, l, e in acc:
+    for i, (_, l, e) in enumerate(acc):
         sz = size(l)
-        tot += 1
-        totb += sz
+        cnt = i >= WARM
+        tot += cnt
+        totb += sz * cnt
         if (l, e) in chosen:
-            hits += 1
-            hitb += sz
+            hits += cnt
+            hitb += sz * cnt
     return hits, hitb, tot, totb
 
 
@@ -167,19 +173,20 @@ def sim_static_lru(acc, size, cap, chosen, pinned_bytes):
     od = collections.OrderedDict()
     used = hits = hitb = tot = totb = 0
     room = cap - pinned_bytes
-    for _, l, e in acc:
+    for i, (_, l, e) in enumerate(acc):
         k = (l, e)
         sz = size(l)
-        tot += 1
-        totb += sz
+        cnt = i >= WARM
+        tot += cnt
+        totb += sz * cnt
         if k in chosen:
-            hits += 1
-            hitb += sz
+            hits += cnt
+            hitb += sz * cnt
             continue
         if k in od:
             od.move_to_end(k)
-            hits += 1
-            hitb += sz
+            hits += cnt
+            hitb += sz * cnt
             continue
         od[k] = sz
         used += sz
@@ -203,11 +210,12 @@ def sim_belady(acc, size, cap):
     for i, (_, l, e) in enumerate(acc):
         k = (l, e)
         sz = size(l)
-        tot += 1
-        totb += sz
+        cnt = i >= WARM
+        tot += cnt
+        totb += sz * cnt
         if k in res:
-            hits += 1
-            hitb += sz
+            hits += cnt
+            hitb += sz * cnt
             res[k] = nxt[i]
             heapq.heappush(heap, (-nxt[i], k))
             continue
@@ -300,9 +308,11 @@ def main():
     ap.add_argument('--sizes', default='C:/ds-ista-work/sizes.json')
     ap.add_argument('--caps', default='20,30,40,44', help='cache sizes in GB (VRAM hot set + pinned RAM)')
     ap.add_argument('--train', nargs='*', default=[], help='traces the static profile is built from (others than the test)')
+    ap.add_argument('--warm-steps', type=int, default=0, help='steps at the start that fill the cache but are not counted')
     ap.add_argument('--skip', default='', help='policies to skip (comma): lru,lfu,static,static+lru,belady,ahead')
     a = ap.parse_args()
     size = Sizes(a.sizes)
+    global WARM
     skip = set(a.skip.split(','))
     train_acc = []
     for t in a.train:
@@ -311,6 +321,12 @@ def main():
         steps = read_trace(path)
         acc = accesses(steps)
         nsteps = len(steps)
+        WARM = 0
+        if a.warm_steps:
+            WARM = next((i for i, x in enumerate(acc) if x[0] >= a.warm_steps), len(acc))
+            nsteps -= a.warm_steps
+        uniq = len({(l, e) for _, l, e in acc})
+        print('   unique experts touched: %d of 15360 (%.1f%%), %.1f GB' % (uniq, 100 * uniq / 15360, sum(size(l) for l, e in {(l, e) for _, l, e in acc}) / 1e9))
         print('== %s: %d steps, %d expert accesses (%.1f a step)' % (os.path.basename(path), nsteps, len(acc), len(acc) / max(1, nsteps)))
         tb = sum(size(l) for _, l, _ in acc) / nsteps
         print('   bytes a step (union per layer): %.2f GB' % (tb / 1e9))
