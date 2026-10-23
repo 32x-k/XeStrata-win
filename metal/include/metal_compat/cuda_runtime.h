@@ -42,6 +42,15 @@
 #endif
 
 #include "cuda_device_builtins.h"
+#include <cmath>
+
+using std::fmaxf;
+using std::fminf;
+using std::sqrtf;
+using std::fabsf;
+using std::powf;
+using std::expf;
+using std::logf;
 
 // CUDA's headers put min/max in scope for integers; the sources rely on it
 template <typename T> static inline T min(T a, T b) { return strata_min(a, b); }

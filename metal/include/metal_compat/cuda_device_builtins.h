@@ -7,6 +7,10 @@
 
 #include <cstdint>
 
+struct dim3 {
+    unsigned x, y, z;
+    dim3(unsigned _x = 1, unsigned _y = 1, unsigned _z = 1) : x(_x), y(_y), z(_z) {}
+};
 struct strata_dim3 { unsigned x, y, z; };
 static strata_dim3 threadIdx{0, 0, 0}, blockIdx{0, 0, 0}, blockDim{1, 1, 1}, gridDim{1, 1, 1};
 
@@ -116,3 +120,30 @@ static inline float __fdiv_rn(float a, float b) { return a / b; }
 static inline float __frcp_rn_(float a) { return 1.0f / a; }
 template <typename T> static inline T strata_min(T a, T b) { return a < b ? a : b; }
 template <typename T> static inline T strata_max(T a, T b) { return a > b ? a : b; }
+
+// the last names the kernel sources use (a full-list compile found twelve families, 2026-10-23): the grid type above, a
+// system fence, the funnel shift, the hardware transcendentals and the read-only/volatile loads.
+static inline void __threadfence_system() {}
+static inline unsigned __funnelshift_r(unsigned lo, unsigned hi, unsigned shift) {
+    const unsigned long long v = ((unsigned long long) hi << 32) | lo;
+    return (unsigned) ((v >> (shift & 31)) & 0xffffffffu);
+}
+static inline unsigned __funnelshift_l(unsigned lo, unsigned hi, unsigned shift) {
+    const unsigned long long v = ((unsigned long long) hi << 32) | lo;
+    return (unsigned) (((v << (shift & 31)) >> 32) & 0xffffffffu);
+}
+static inline float rsqrtf(float a) { return 1.0f / __builtin_sqrtf(a); }
+static inline float __expf(float a) { return __builtin_expf(a); }
+static inline float __logf(float a) { return __builtin_logf(a); }
+static inline float __sinf(float a) { return __builtin_sinf(a); }
+static inline float __cosf(float a) { return __builtin_cosf(a); }
+static inline void sincosf(float a, float* s, float* c) { *s = __builtin_sinf(a); *c = __builtin_cosf(a); }
+static inline int __float2int_rn(float a) { return (int) __builtin_roundf(a); }
+static inline int __float2int_rz(float a) { return (int) a; }
+static inline int __float2int_rd(float a) { return (int) __builtin_floorf(a); }
+static inline int __float2int_ru(float a) { return (int) __builtin_ceilf(a); }
+template <typename T> static inline T __ldg(const T* p) { return *p; }
+template <typename T> static inline T __ldcv(const T* p) { return *p; }
+static inline unsigned __shfl_up_sync(unsigned, unsigned v, int) { return v; }
+static inline float __shfl_up_sync(unsigned, float v, int) { return v; }
+static inline unsigned __shfl_sync(unsigned, unsigned v, int) { return v; }
