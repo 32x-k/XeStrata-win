@@ -804,6 +804,7 @@ struct Model::Impl {
     unsigned win_seq = 0;             // the windows the threads ran (the hand-offs' seq)
     // the chunked prompt path (threads mode): chunk tokens a pass, runs shorter than chunk_min in windows
     int chunk = 0, chunk_min = 512;
+    static constexpr bool kChunkedPromptDefault = true;   // the layer-major prompt is the default (gate: KL 0.1685 vs 0.1686, 8K prompt 6x, decode within 2% - ds4 notes-dsv41-r97)
     static constexpr int kFlowChunkMin = 2;   // chunk_min with every device's layers on the flow (see load)
     // --prefill-chunk at most (route() runs in kVlRows-row slabs).  The default stays kVlRows: a 16384-token chunk
     // reads a 16K prompt's experts once instead of twice (V100: 461.8 -> 321.3 s, 736 -> 506 GB read) but its buffers
@@ -1849,7 +1850,13 @@ struct Model::Impl {
         // prompt path (its own thread a GPU) as asked for - also where the experts' blocks took the groups' width down
         // to 1 (a 256-value type's: Maya's quants), which left every prompt in windows of 16
         par = o.threads || tp > 1;
-        prompt_par = par || o.tp > 1;
+        // the chunked (layer-major) prompt path: with --tp / --threads as before; --prefill-chunk N (N > 0) or
+        // kChunkedPromptDefault bring it to a single card's default run too (a host thread a GPU for the prompt only;
+        // decode stays as asked).  --prefill-chunk 0 keeps the windows of 16 (DS4_WINDOWS=1 the same).  Off by default
+        // until a prompt costs the decode nothing: its buffers hold VRAM the windowed path gives to experts
+        prompt_par = par || o.tp > 1 ||
+                     ((o.prefill_chunk > 0 || (o.prefill_chunk < 0 && kChunkedPromptDefault)) &&
+                      std::getenv("DS4_WINDOWS") == nullptr);
         const bool tp_all = tp > 1 && tp == (int) devs.size();
         for (size_t i = 0; i < devs.size();) {
             Group G;
@@ -1893,7 +1900,8 @@ struct Model::Impl {
                         o.vram_experts;
             file_experts = exp_b - std::max(0.0, room - other_b) + (double) kRamMargin > (double) ram_avail();
         }
-        chunk = prompt_par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : file_experts ? kVlRows : 2048) : 0;
+        const bool own_default = !(par || o.tp > 1);   // (the single-card default run the chunked path newly takes: chunks of 1024 - 8K prompt 370 tok/s on 4 x R9700, 214 at 8192; the threads / tp runs keep theirs)
+        chunk = prompt_par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : own_default ? 1024 : file_experts ? kVlRows : 2048) : 0;
         const char* dc = std::getenv("DS4_CHUNK");   // (tests: down to 16, a short prompt in several chunks)
         if (dc != nullptr) chunk = prompt_par ? std::atoi(dc) : 0;
         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));
@@ -2444,7 +2452,54 @@ struct Model::Impl {
         }
 
         // the chunked prompt path's buffers (before the experts: they take what is left)
-        if (chunk > 0 && !alloc_chunks(err)) return false;
+        if (chunk > 0) {
+            // recommend, never force: a chunk the cards cannot hold in buffers is halved (down to 256 rows) and then the
+            // prompt runs in windows of 16, said in one line - the load only fails for a reason that is not this
+            std::vector<size_t> na0, sc0;
+            for (Dev& d : devs) {
+                na0.push_back(d.allocs.size());
+                sc0.push_back(d.scratch);
+            }
+            const size_t nh = host_allocs.size();
+            std::string aerr;
+            while (chunk > 0 && !alloc_chunks(aerr)) {
+                for (size_t di = 0; di < devs.size(); ++di) {
+                    Dev& d = devs[di];
+                    cudaSetDevice(d.id);
+                    cudaDeviceSynchronize();
+                    if (di < chunks.size() && chunks[di]) {
+                        if (chunks[di]->blas) cublasDestroy(chunks[di]->blas);
+                        if (chunks[di]->cs) cudaStreamDestroy(chunks[di]->cs);
+                    }
+                    while (d.allocs.size() > na0[di]) {
+                        cudaFree(d.allocs.back());
+                        d.allocs.pop_back();
+                    }
+                    d.scratch = sc0[di];
+                }
+                while (host_allocs.size() > nh) {
+                    cudaFreeHost(host_allocs.back());
+                    host_allocs.pop_back();
+                }
+                chunks.clear();
+                const int was = chunk;
+                chunk = chunk > 512 ? chunk / 2 / 16 * 16 : 0;
+                if (chunk > 0) {
+                    eg_cap = (size_t) chunk;
+                    std::fprintf(stderr, "ds4: the prompt path's buffers for chunks of %d rows did not fit (%s): trying %d\n",
+                                 was, aerr.c_str(), chunk);
+                } else {
+                    prompt_par = false;
+                    eg_cap = (size_t) kWin;
+                    tap_cap = kWin;
+                    std::fprintf(stderr, "ds4: the prompt path's buffers did not fit (%s): prompts run in windows of %d "
+                                         "tokens (slower on long prompts; more free GPU memory or a lower --reserve-mib "
+                                         "brings the chunks back)\n", aerr.c_str(), kWin);
+                }
+                aerr.clear();
+            }
+            if (chunk > 0 && aerr.empty()) err.clear();
+        }
         // the CPU lane's experts read in place (decided above): how much of them the load reads ahead, from what VRAM
         // now leaves over
         if (file_experts) {
@@ -2644,6 +2699,26 @@ struct Model::Impl {
         return (size_t) chunk * ((size_t) g.hc * g.dim * 4 + 8 * 4 + topk_stride() * 4 + cand_stride() * 4);
     }
 
+    // the staging ring's size (MB) for the experts a chunk streams from the CPU lane: 400 where a good part of them are
+    // streamed; 16 where the cards hold most of the experts (they are within 30% of fitting) (a 4-card box) - the ring's VRAM is then worth more
+    // as expert slots, and the decode after a prompt keeps the windowed path's speed (R9700 x4: 29.6 -> 31.7 tok/s)
+    size_t ring_mb_auto() const {
+        double exp_b = 0, other_b = 0, room = 0;
+        for (const auto& kt : pk.t) {
+            const std::string& n = kt.first;
+            if (n.find(".engram.embed.") != std::string::npos || n.rfind("vision.", 0) == 0 || n == "embed.weight" ||
+                (!o.dspark && n.rfind("mtp.", 0) == 0))
+                continue;
+            (n.find(".ffn.experts.") != std::string::npos ? exp_b : other_b) += (double) kt.second.bytes;
+        }
+        for (const Dev& d : devs)
+            room += std::max(0.0, (double) d.free0 - (double) ((size_t) o.reserve_mib << 20) - 1.5 * (1 << 30)) * o.vram_experts;
+        const bool fit = exp_b > 0 && exp_b <= 1.3 * std::max(1.0, room - other_b);   // (R9700 x4: 1.16 -> ring 16: decode -1.8% after a prompt, 64: -4.4%, 400: -4.6%)
+        if (o.verbose)
+            std::fprintf(stderr, "ds4: staging ring: experts %.1f GB, VRAM room %.1f GB, dense %.1f GB -> %d MB\n", exp_b / 1e9,
+                         room / 1e9, other_b / 1e9, fit ? 16 : 400);
+        return fit ? 16 : 400;
+    }
     bool alloc_chunks(std::string& err) {
         chunks.resize(devs.size());
         const int D = g.dim, H = g.hc, HD = g.hd;
@@ -2702,7 +2777,7 @@ struct Model::Impl {
                     return false;
             }
             if (stride > 0) {   // DS4_RING_MB (400) of slots in kParts batches
-                const size_t mb = std::getenv("DS4_RING_MB") ? (size_t) std::atoi(std::getenv("DS4_RING_MB")) : 400;
+                const size_t mb = std::getenv("DS4_RING_MB") ? (size_t) std::atoi(std::getenv("DS4_RING_MB")) : ring_mb_auto();
                 c.ring_stride = stride;
                 c.ring_n = std::max(Chunk::kParts, (int) ((mb << 20) / stride) / Chunk::kParts * Chunk::kParts);
                 if (!dalloc(d, c.ring, (size_t) c.ring_n * stride, err)) return false;
@@ -4812,10 +4887,16 @@ struct Model::Impl {
     // in four rounds (the gate / up split-K pieces, each preparing its two input blocks of every token; each band's
     // sums / codebook / Hadamard / swiglu and that block of the down input, which both nodes then read whole; the down
     // pieces; the down bands).  yd[slot] gets each row's expert output.
+    static constexpr int kEntMax = kWin > kc::kExl3CpuMaxN ? kWin : kc::kExl3CpuMaxN;
     struct Ent {
         int e = 0, n = 0, slot0 = 0;
-        int tok[kc::kExl3CpuMaxN] = {};
+        int tok[kEntMax] = {};
     };
+    // tokens an entry holds: the i-quant GGUF experts take a whole window's tokens of an expert in one call (the CPU
+    // lane's exact multi-token rows, 7+ tokens an expert: decoded once for all), the others (MXFP4, EXL3) up to 8
+    static int ent_cap(const Layer& l) {
+        return l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay) ? kEntMax : kc::kExl3CpuMaxN;
+    }
     void run_nodes(int n, const std::function<void(int)>* f) {
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->start(n, f[X]);
         pools[0]->help();
@@ -4962,8 +5043,8 @@ struct Model::Impl {
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / GB] : j / GB)];
                 const int r0 = X * FFh + (j % GB) * RB, r1 = std::min(X * FFh + FFh, r0 + RB);
-                const void* ap[gg::kMxCpuMaxN];
-                float* hp[gg::kMxCpuMaxN];
+                const void* ap[kEntMax];
+                float* hp[kEntMax];
                 for (int i = 0; i < en.n; ++i) {
                     ap[i] = x_act(en, i);
                     hp[i] = c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) X * FFh;   // (part X's rows of h)
@@ -4982,8 +5063,8 @@ struct Model::Impl {
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
                 const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
-                const void* hp[gg::kMxCpuMaxN];
-                float* yp[gg::kMxCpuMaxN];
+                const void* hp[kEntMax];
+                float* yp[kEntMax];
                 for (int i = 0; i < en.n; ++i) {
                     hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
                     yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
@@ -5301,6 +5382,49 @@ struct Model::Impl {
         }
     }
 
+    // after a chunked prompt: the expert cache catches up with what the prompt picked at once - a window prompt gets
+    // its swaps one tick at a time over its hundreds of windows, a chunked one has a single tick - so the decode that
+    // follows finds the hot experts in VRAM.  Rounds of the ordinary swap rule (the hottest CPU-lane pick of each layer
+    // in, its coldest VRAM expert out) until nothing is worth moving or DS4_SETTLE_MS (6000) is spent
+    void cache_settle() {
+        if (!o.expert_cache || cache_ths.empty()) return;
+        static const double budget = env_f("DS4_SETTLE_MS", 6000.0f);
+        if (budget <= 0.0) return;
+        const double t0 = now_ms();
+        const int64_t s0 = st.swaps;
+        while (now_ms() - t0 < budget) {
+            for (Layer& l : L) {
+                if (l.mtp || l.spare_vram < 0 || l.swap_pending) continue;
+                l.cpu_hits.clear();
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (l.slot[(size_t) e] < 0 && l.heat[(size_t) e] >= 2.0f) l.cpu_hits.push_back(e);
+            }
+            cache_tick_swaps(0);
+            if (sw_inflight == 0) break;   // (nothing queued: every layer's best CPU-lane expert is not hotter than its coldest VRAM one)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (store && env_f("DS4_SETTLE_STORE", 1.0f) != 0.0f) {   // the RAM store too: a window prompt fills it through the CPU
+            // lane's picks, a chunked one streams past it - the hottest CPU-lane experts of the prompt into its free slots
+            std::vector<std::pair<float, std::pair<int, int>>> hot;
+            for (const Layer& l : L) {
+                if (l.mtp) continue;
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (l.slot[(size_t) e] < 0 && l.heat[(size_t) e] >= 4.0f) hot.push_back({l.heat[(size_t) e], {l.il, e}});
+            }
+            std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::vector<std::pair<int, int>> list;
+            for (const auto& h : hot) {
+                if (list.size() >= store->slots_max()) break;
+                list.push_back(h.second);
+            }
+            const double ts = now_ms();
+            const size_t n = store->preload(list, 0);
+            if (o.verbose) std::fprintf(stderr, "ds4: RAM store: %zu hot experts read after the prompt (%.0f ms)\n", n, now_ms() - ts);
+        }
+        if (o.verbose && st.swaps > s0)
+            std::fprintf(stderr, "ds4: expert cache: %lld swaps after the prompt (%.0f ms)\n", (long long) (st.swaps - s0),
+                         now_ms() - t0);
+    }
     void cache_tick(int T) {
         cache_tick_swaps(T);
         store_sync();
@@ -5630,7 +5754,7 @@ struct Model::Impl {
                     en.e = picks[a].first;
                     en.slot0 = nslots;
                     en.n = 0;
-                    while (a < picks.size() && picks[a].first == en.e && en.n < kc::kExl3CpuMaxN) {
+                    while (a < picks.size() && picks[a].first == en.e && en.n < ent_cap(l)) {
                         const int t = picks[a].second / kPicks, i = picks[a].second % kPicks;
                         en.tok[en.n++] = t;
                         tok_of[nslots] = t;
@@ -6417,7 +6541,12 @@ struct Model::Impl {
             uint32_t* pr = prof.data() + (size_t) l.il * g.n_exp;
             for (int e = 0; e < l.n_exp; ++e) {
                 const int v = L0.vs_pin[e];
-                pr[e] += (uint32_t) (b[(size_t) v + 1] - b[(size_t) v]);
+                const int cnt = b[(size_t) v + 1] - b[(size_t) v];
+                pr[e] += (uint32_t) cnt;
+                if (cnt > 0) {   // (the expert cache learns from a chunked prompt as from windows: heat, and the CPU lane's hits)
+                    l.heat[(size_t) e] += (float) cnt;
+                    if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
+                }
             }
             st.experts += (int64_t) T * l.k_exp;
         }
@@ -7281,6 +7410,11 @@ struct Model::Impl {
         pos += n;
         st.tokens += n;
         cache_tick(n);
+        if (lm_end_.on) {   // (the layer cache's RAM back before the store and the swaps want it)
+            lm_end();
+            lm_end_.on = false;
+        }
+        cache_settle();
         const int nr = std::min(T_last, tap_cap);
         if (!seed_drafter(pos - nr, nr, 0, err)) return false;
         if (snap_slot >= 0) {   // checkpoint `snap_slot` from what the layers kept (the drafter's blocks: as they are -
@@ -8066,11 +8200,11 @@ struct Model::Impl {
                 }
                 ++nvex;
             } else {
-                for (size_t a = 0; a < pe.size(); a += kc::kExl3CpuMaxN) {
+                for (size_t a = 0; a < pe.size(); a += (size_t) ent_cap(l)) {
                     Ent en;
                     en.e = e;
                     en.slot0 = nslots;
-                    en.n = (int) std::min<size_t>(kc::kExl3CpuMaxN, pe.size() - a);
+                    en.n = (int) std::min<size_t>((size_t) ent_cap(l), pe.size() - a);
                     for (int i = 0; i < en.n; ++i) {
                         en.tok[i] = pe[a + (size_t) i].first;
                         cpu_rows.push_back({pe[a + (size_t) i].first, h_w[pe[a + (size_t) i].first * kPicks + pe[a + (size_t) i].second]});

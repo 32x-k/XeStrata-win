@@ -684,7 +684,7 @@ int profile_run(strata::ds4::Model& m, const std::string& ids_path, int window) 
 // ---- Strata H100 addition: DSpark acceptance log ---------------------------------------------------------------
 // --spec-eval IDS.json --n N: each segment is a prompt: fed from reset, then N greedy tokens decoded with the drafter, every
 // draft verified (--dspark-conf 0); DS4_ROUND_LOG=file gets a line a round (segment name, drafts, accepted, confidences).
-int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int window, float conf_min) {
+int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int window, float conf_min, bool spec) {
     std::vector<ScoreSeg> segs;
     std::string err;
     if (!read_score_ids(ids_path, segs, err)) {
@@ -714,7 +714,7 @@ int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int win
         bool stop = false;
         while (emitted < n && !stop) {
             int off = 0, acc = 0;
-            if (!round(m, tok, n - emitted, true, conf_min, 0.0f, 1.0f, 1, 0.0f, 1, counter, got, off, acc, err)) {
+            if (!round(m, tok, n - emitted, spec, conf_min, 0.0f, 1.0f, 1, 0.0f, 1, counter, got, off, acc, err)) {
                 std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
                 return 1;
             }
@@ -735,10 +735,14 @@ int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int win
 }
 }  // namespace
 
+#ifndef DS4_BUILD_ID
+#define DS4_BUILD_ID "unknown"
+#endif
+
 int main(int argc, char** argv) {
     strata::ds4::Options o;
     std::string ids_s, dump, eos = "1";
-    int n = 0, window = 16;
+    int n = 0, window = 0;   // (0: the model's feed unit - a whole prompt on the chunked path; 16 for the scoring runs)
     bool spec = true;
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
@@ -794,7 +798,13 @@ int main(int argc, char** argv) {
         }
         else if (a == "--temperature") temp = (float) std::atof(val("--temperature").c_str());
         else if (a == "--seed") cli_seed = std::strtoull(val("--seed").c_str(), nullptr, 10);
-        else if (a == "--verbose" || a == "-v") o.verbose = true;
+        else if (a == "--verbose" || a == "-v") {
+            o.verbose = true;
+            std::fprintf(stderr, "ds4: build %s (%s)\n", DS4_BUILD_ID, STRATA_VERSION);
+        } else if (a == "--version") {
+            std::printf("strata-dsv41 %s build %s\n", STRATA_VERSION, DS4_BUILD_ID);
+            return 0;
+        }
         else if (a == "--ids") ids_s = val("--ids");
         else if (a == "--n") n = std::atoi(val("--n").c_str());
         else if (a == "--window") window = std::max(1, std::atoi(val("--window").c_str()));   // (> 16: the chunked prompt path)
@@ -837,8 +847,10 @@ int main(int argc, char** argv) {
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf);
+    const int window_given = window;
+    if (window == 0) window = 16;   // (the scoring / profiling runs; the plain run below takes the model's feed unit)
     if (!prof_ids.empty()) return profile_run(m, prof_ids, window);
-    if (!spec_ids.empty()) return spec_eval(m, spec_ids, n, window, o.dspark_conf);
+    if (!spec_ids.empty()) return spec_eval(m, spec_ids, n, window, o.dspark_conf, spec);
     if (!score_ids.empty()) return score(m, score_ids, score_out.empty() ? score_ids + ".tsv" : score_out, window, std::atoi(eos.c_str()));
 
     if (!enc_rgb.empty()) {   // the vision tower alone: a picture's span rows (BF16 [rows][dim]) into --dump-image
@@ -896,6 +908,7 @@ int main(int argc, char** argv) {
     }
     std::FILE* df = dump.empty() ? nullptr : std::fopen(dump.c_str(), "wb");
     std::vector<float> lg;
+    if (window_given == 0) window = df != nullptr ? 16 : std::max(16, std::min(m.feed_unit(), 1 << 30));
     const double t0 = now_ms();
     for (size_t a = 0; a < ids.size();) {
         const int T = (int) std::min<size_t>((size_t) window, ids.size() - a);
