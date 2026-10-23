@@ -2343,6 +2343,60 @@ def network_path(path: str) -> bool:
     return p.startswith("\\\\") or p.startswith("\\??\\")
 
 
+def vision_log_tail(log=None, limit: int = 16384) -> str:
+    """The last `limit` bytes of the encoder's stderr file (`log` is the file object it was started with; "" when there
+    is none or it cannot be read)."""
+    try:
+        name = getattr(log, "name", None)
+        if name:
+            with open(name, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - limit))
+                return f.read().decode("utf-8", "replace")
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+# What the GPU runtimes print when the reader has no code for the card it runs on (a binary built without that
+# architecture: upstream #3669).
+_VISION_ARCH_SIGNS = ("device kernel image is invalid", "no kernel image is available", "im2col failed",
+                      "unsupported gpu architecture", "invalid device function", "unknown gpu architecture")
+
+
+def vision_start_error(line: str, log=None, code: int | None = None, waited: float | None = None) -> str:
+    """The message when the image encoder answered something other than READY (upstream I3).  An encoder that dies
+    before it prints anything gave a blank reason: now the last lines of its stderr (`log`, the file it was started
+    with), its exit status (`code`) and, for a kernel-image error, the card hint come with it.  `waited`: it said
+    nothing for that many seconds."""
+    text = line.strip()
+    tail = vision_log_tail(log)
+    both = (text + chr(10) + tail).lower()
+    lines = [x.strip() for x in tail.splitlines() if x.strip()]
+    if any(sign in both for sign in _VISION_ARCH_SIGNS):
+        evidence = next((x for x in reversed(lines) if any(sign in x.lower() for sign in _VISION_ARCH_SIGNS)), text)
+        return ("the vision encoder did not start: it has no code for this graphics card (a kernel-image error: the "
+                "picture reader was built for other card generations than yours). Update the engine, or read pictures "
+                "on the CPU (run setup again with --vision cpu). From the encoder: " + evidence[:300])
+    if text:
+        msg = "the vision encoder did not start: " + text
+    elif waited is not None:
+        msg = f"the vision encoder did not start: it said nothing for {waited:g} s (it never reported READY)"
+    else:
+        msg = "the vision encoder did not start: it ended without saying anything"
+    extra = []
+    if code is not None:
+        words = engine_exit_words(code)
+        if words:
+            extra.append(words)
+    shown = [x for x in lines[-3:] if x != text]
+    if shown:
+        extra.append("last lines of its log: " + " | ".join(x[:200] for x in shown))
+    if extra:
+        msg += " (" + "; ".join(extra) + ")"
+    return msg
+
+
 def vision_label(cfg: dict) -> str:
     return "the GPU encoder" if cfg.get("gpu") else "the CPU encoder"
 
@@ -2387,19 +2441,8 @@ class Vision:
         return Path(tempfile.mkdtemp(prefix="strata-vision-"))
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
-        def absolute(p):                                # the encoder runs in its own dir (#480)
-            return os.path.abspath(p) if os.path.dirname(str(p)) else p
-        args = [absolute(cfg["exe"]), "--mmproj", absolute(cfg["mmproj"]), "--model", absolute(cfg["model"])]
-        if cfg.get("gpu"):
-            args.append("--gpu")
-            if cfg.get("gpu_pci"):
-                args += ["--gpu-pci", str(cfg["gpu_pci"])]
-        if cfg.get("threads"):
-            args += ["--threads", str(cfg["threads"])]
-        if cfg.get("max_tokens"):
-            args += ["--max-tokens", str(cfg["max_tokens"])]
-        if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
-            args += ["--min-tokens", str(cfg["min_tokens"])]
+        args = self.reader_args(cfg)
+        self.max_tokens = self.token_limit(cfg)
         self.label = vision_label(cfg)
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload (#208)
@@ -2421,6 +2464,49 @@ class Vision:
                 shutil.rmtree(self.dir, ignore_errors=True)
                 raise
 
+    # What a picture may become when the config does not say (setup writes the same numbers, setup.VISION): an old,
+    # hand-edited or migrated config without vision.max_tokens left the reader unclamped, and upstream #3690 saw one
+    # picture become 93,700 image tokens (I7).  A key that is there is the person's: 0 means no limit, as before.
+    DEFAULT_MAX_TOKENS = {"gpu": 1024, "cpu": 300}
+
+    @staticmethod
+    def token_limit(cfg: dict) -> int:
+        """The --max-tokens of a reader config: its max_tokens, else the default of its kind (GPU 1024, CPU 300)."""
+        if cfg.get("max_tokens") is not None:
+            try:
+                return max(0, int(cfg["max_tokens"]))
+            except (TypeError, ValueError):
+                pass
+        return Vision.DEFAULT_MAX_TOKENS["gpu" if cfg.get("gpu") else "cpu"]
+
+    @staticmethod
+    def reader_args(cfg: dict) -> list:
+        def absolute(p):                                # the encoder runs in its own dir (#480)
+            return os.path.abspath(p) if os.path.dirname(str(p)) else p
+        args = [absolute(cfg["exe"]), "--mmproj", absolute(cfg["mmproj"]), "--model", absolute(cfg["model"])]
+        if cfg.get("gpu"):
+            args.append("--gpu")
+            if cfg.get("gpu_pci"):
+                args += ["--gpu-pci", str(cfg["gpu_pci"])]
+        if cfg.get("threads"):
+            args += ["--threads", str(cfg["threads"])]
+        limit = Vision.token_limit(cfg)
+        if limit:
+            args += ["--max-tokens", str(limit)]
+        if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
+            args += ["--min-tokens", str(cfg["min_tokens"])]
+        return args
+
+    def warn_if_over_limit(self, tokens: int) -> None:
+        """I7: one picture that became more than 4 times the limit is logged with the numbers, so the next report has
+        them (the reader's own stderr has the warm-up line).  A reader built before the limit was enforced inside it
+        (strata-vision refuses these now) still lets them by."""
+        limit = getattr(self, "max_tokens", 0)
+        if limit and tokens > 4 * limit:
+            print(f"[strata] images: one picture became {tokens} image tokens, more than 4 times the limit of {limit} "
+                  "(vision.max_tokens); the picture reader is not applying its limit. Update the engine, and send the "
+                  "line 'strata-vision: warmed up at N image tokens' from the reader's log with the report", flush=True)
+
     def _start(self):
         """Start the encoder process and wait (bounded) for its READY; RuntimeError when it does not come."""
         args, log, env = self.spawn
@@ -2436,8 +2522,12 @@ class Vision:
         if line is None or not line.startswith("READY"):
             why = ("no answer within %d s" % VISION_READY_S if line == "" else
                    "it exited" if line is None else line.strip())
+            code = self.proc.poll() if hasattr(self.proc, "poll") else None   # one that died has its status already
             self._stop(why)
-            raise RuntimeError("the vision encoder did not start: " + why)
+            if code is None:
+                code = getattr(self.proc, "returncode", None)
+            raise RuntimeError(vision_start_error("", log, waited=VISION_READY_S) if line == "" else
+                               vision_start_error(line or "", log, code))
         self.stopped = False
 
     def alive(self) -> bool:
@@ -2602,6 +2692,9 @@ class Vision:
                 return self.cache[key]
             if self.dead:
                 raise ValueError("images are unavailable: " + self.dead)
+            # an elastic encoder not started yet, or one that was unloaded
+            if self.proc is None or self.proc.stdin is None:
+                raise ValueError("the picture reader is not running")
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
             try:
@@ -2622,6 +2715,7 @@ class Vision:
             if not line.startswith("OK"):
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else line))
             self.cache[key] = (out, int(line.split()[1]))
+            self.warn_if_over_limit(self.cache[key][1])
             held = {str(p) for p in keep} | {str(out)}
             for old in list(self.cache):                               # oldest first, but never one still in use
                 if len(self.cache) <= 64:
@@ -3954,8 +4048,9 @@ class Service:
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
                         with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
+                            self._vision_up()         # an elastic encoder is not running until a picture needs it
                             self.vision.encode(src)
-                    except (ValueError, OSError) as e:
+                    except (ValueError, OSError, RuntimeError) as e:    # RuntimeError: the encoder did not start
                         why = str(e)
                 if why is not None:
                     print(f"[strata] a picture a tool returned was left out of the prompt: {why}", flush=True)
