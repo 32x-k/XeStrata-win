@@ -684,7 +684,7 @@ int profile_run(strata::ds4::Model& m, const std::string& ids_path, int window) 
 // ---- Strata H100 addition: DSpark acceptance log ---------------------------------------------------------------
 // --spec-eval IDS.json --n N: each segment is a prompt: fed from reset, then N greedy tokens decoded with the drafter, every
 // draft verified (--dspark-conf 0); DS4_ROUND_LOG=file gets a line a round (segment name, drafts, accepted, confidences).
-int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int window, float conf_min) {
+int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int window, float conf_min, bool spec) {
     std::vector<ScoreSeg> segs;
     std::string err;
     if (!read_score_ids(ids_path, segs, err)) {
@@ -714,7 +714,7 @@ int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int win
         bool stop = false;
         while (emitted < n && !stop) {
             int off = 0, acc = 0;
-            if (!round(m, tok, n - emitted, true, conf_min, 0.0f, 1.0f, 1, 0.0f, 1, counter, got, off, acc, err)) {
+            if (!round(m, tok, n - emitted, spec, conf_min, 0.0f, 1.0f, 1, 0.0f, 1, counter, got, off, acc, err)) {
                 std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
                 return 1;
             }
@@ -838,7 +838,7 @@ int main(int argc, char** argv) {
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf);
     if (!prof_ids.empty()) return profile_run(m, prof_ids, window);
-    if (!spec_ids.empty()) return spec_eval(m, spec_ids, n, window, o.dspark_conf);
+    if (!spec_ids.empty()) return spec_eval(m, spec_ids, n, window, o.dspark_conf, spec);
     if (!score_ids.empty()) return score(m, score_ids, score_out.empty() ? score_ids + ".tsv" : score_out, window, std::atoi(eos.c_str()));
 
     if (!enc_rgb.empty()) {   // the vision tower alone: a picture's span rows (BF16 [rows][dim]) into --dump-image
