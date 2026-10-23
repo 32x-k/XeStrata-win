@@ -502,6 +502,19 @@ struct Dev {
 
 // the chunked prompt path's buffers on a device: a chunk of C tokens through a layer at once (the attention in slabs of
 // A queries, the indexer in slabs of AI), its GEMMs through FP16 reconstructions of the weights and cuBLAS
+// DS4_PRED_DUMP: a fixed +-1 random projection of the router input (D -> 256), one block a token
+__global__ void pred_proj_k(const float* x, int D, float* out) {
+    const int t = blockIdx.x, j = threadIdx.x;   // 256 threads
+    const float* xr = x + (size_t) t * D;
+    float a = 0.0f;
+    for (int d = 0; d < D; ++d) {
+        unsigned h = (unsigned) d * 2654435761u ^ ((unsigned) j + 1u) * 40503u;
+        h ^= h >> 15; h *= 2246822519u; h ^= h >> 13; h *= 3266489917u; h ^= h >> 16;
+        a += (h & 1u) ? xr[d] : -xr[d];
+    }
+    out[(size_t) t * 256 + j] = a * rsqrtf((float) D);
+}
+
 struct Chunk {
     int C = 0, A = 0, AI = 0;
     float *h = nullptr, *x = nullptr, *acc = nullptr, *qr = nullptr, *kvr = nullptr, *ckr = nullptr, *cgr = nullptr,
@@ -1084,6 +1097,13 @@ struct Model::Impl {
     // attention, after the routing and the shared expert, after the experts' gate / up, after the wait for the CPU
     // lane, after the down pass and the post - read after the token's sync, each the time since the mark before it
     bool prof_on = std::getenv("DS4_PROF") != nullptr;
+    // DS4_PRED_DUMP=file (predictor data, the chunked prompt path): per layer and chunk u8 layer, u16 T, T x 384 fp16 router
+    // logits, T x 256 fp16 projection of the router input.  DS4_XIN_DUMP=file (expert similarity inputs): u8 layer, u16 T,
+    // T x D fp32 router inputs, the first DS4_XIN_N (1024) tokens of each layer.
+    std::FILE* pred_f = std::getenv("DS4_PRED_DUMP") != nullptr ? std::fopen(std::getenv("DS4_PRED_DUMP"), "wb") : nullptr;
+    std::FILE* xin_f = std::getenv("DS4_XIN_DUMP") != nullptr ? std::fopen(std::getenv("DS4_XIN_DUMP"), "wb") : nullptr;
+    int xin_n = std::getenv("DS4_XIN_N") ? std::atoi(std::getenv("DS4_XIN_N")) : 1024;
+    std::array<int, 64> xin_got{};
     std::FILE* trace_f = std::getenv("DS4_TRACE") != nullptr ? std::fopen(std::getenv("DS4_TRACE"), "wb") : nullptr;
     struct ProfMark {
         const Dev* d;
@@ -6246,6 +6266,37 @@ struct Model::Impl {
             std::fwrite(gl.data(), 4, gl.size(), dump_r);
             std::fwrite(gb.data(), 4, gb.size(), dump_r);
             std::fflush(dump_r);
+        }
+        if (mi == 0 && !l.mtp && (pred_f != nullptr || xin_f != nullptr)) {
+            std::lock_guard<std::mutex> lk(dump_mu);
+            if (pred_f != nullptr) {
+                float* dp = nullptr;
+                CK(cudaMalloc(&dp, (size_t) T * 256 * 4));
+                pred_proj_k<<<T, 256, 0, s>>>(c.x, (int) D, dp);
+                std::vector<float> hp((size_t) T * 256), hl((size_t) T * l.n_exp);
+                CK(cudaMemcpyAsync(hp.data(), dp, hp.size() * 4, cudaMemcpyDeviceToHost, s));
+                CK(cudaMemcpy2DAsync(hl.data(), (size_t) l.n_exp * 4, c.glog, 1024 * 4, (size_t) l.n_exp * 4, (size_t) T,
+                                     cudaMemcpyDeviceToHost, s));
+                CK(cudaStreamSynchronize(s));
+                CK(cudaFree(dp));
+                std::vector<uint16_t> o(hp.size() + hl.size());
+                for (size_t i = 0; i < hl.size(); ++i) o[i] = strata::kernels::f16_from_f32(hl[i]);
+                for (size_t i = 0; i < hp.size(); ++i) o[hl.size() + i] = strata::kernels::f16_from_f32(hp[i]);
+                const uint8_t hd[3] = {(uint8_t) l.il, (uint8_t) (T & 255), (uint8_t) (T >> 8)};
+                std::fwrite(hd, 1, 3, pred_f);
+                std::fwrite(o.data(), 2, o.size(), pred_f);
+            }
+            if (xin_f != nullptr && xin_got[(size_t) l.il] < xin_n) {   // up to 32 evenly spaced tokens of the chunk
+                const int tk = std::min(std::min(T, 32), xin_n - xin_got[(size_t) l.il]);
+                const int stride = std::max(1, T / tk);
+                std::vector<float> hx((size_t) T * D);
+                CK(cudaMemcpyAsync(hx.data(), c.x, hx.size() * 4, cudaMemcpyDeviceToHost, s));
+                CK(cudaStreamSynchronize(s));
+                const uint8_t hd[3] = {(uint8_t) l.il, (uint8_t) (tk & 255), (uint8_t) (tk >> 8)};
+                std::fwrite(hd, 1, 3, xin_f);
+                for (int i = 0; i < tk; ++i) std::fwrite(hx.data() + (size_t) std::min(T - 1, i * stride) * D, 4, (size_t) D, xin_f);
+                xin_got[(size_t) l.il] += tk;
+            }
         }
         if (mi == 0 && trace_f != nullptr && !l.mtp) {   // DS4_TRACE: a chunk's picks, u8 (layer | 0x80), u16 T, T x k int16 ids
             std::vector<int> ri((size_t) T * kPicks);
