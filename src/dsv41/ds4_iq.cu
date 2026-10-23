@@ -515,14 +515,19 @@ template <int T, bool F = true> constexpr int kTabWords = F && Fast<T>::WORDS > 
 
 // Persistent grids (blocks looping over work items) only for the types with a codebook worth keeping in the block (8 KiB and
 // more); the others run a block (tile, group) as before - their blocks leave at once when the group is empty.
+#if defined(STRATA_USE_HIP)
+template <int T>
+constexpr bool kPersist = false;   // (HIP keeps the release grids)
+#else
 template <int T>
 constexpr bool kPersist = kTabWords<T> * 4 >= 8192;
+#endif
 
 template <int T, bool F = true>
 __device__ __forceinline__ void load_tab_fast(uint32_t* tab) {
     if constexpr (!F || Fast<T>::WORDS == 0) {
         load_tab<T>(tab);
-#if !defined(STRATA_USE_HIP)   // (kIq1mCodes exists on CUDA only; a non-dependent name is looked up even in the dead branch)
+#if !defined(STRATA_USE_HIP)
     } else if constexpr (T == kIQ1_M) {   // a copy of the generated table (ds4_iq1m_codes.inc): 2048 x 16 bytes
         const uint4* src = (const uint4*) kIq1mCodes;
         uint4* dst = (uint4*) tab;
