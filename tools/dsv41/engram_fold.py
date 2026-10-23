@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import sys
 
 import numpy as np
@@ -112,6 +113,7 @@ def main() -> int:
     ap.add_argument("--model", required=True, help="the folder of the quant's GGUF shards")
     ap.add_argument("--out", required=True, help="the override folder to write (dense.json + dense.bin)")
     ap.add_argument("--layers", default="", help="comma list of Engram layers; default: every layer with an engram_k")
+    ap.add_argument("--gate-kv-from", default="", help="a known-good pack to copy engram.gate/wkv from (the ple table stays the only difference)")
     a = ap.parse_args()
     model = pathlib.Path(a.model).expanduser().resolve()
     out = pathlib.Path(a.out).expanduser().resolve()
@@ -137,6 +139,30 @@ def main() -> int:
         blobs.append(data)
         idx[name] = [tname, "dense.bin", off, len(data), shape]
         off += len(data)
+
+    # --gate-kv-from PACK: take the gate and the kv from a pack that is known good (the engine's own layout, already in the
+    # right orientation) instead of deriving them from their k/q/wkv.  That leaves the ple table as the only difference
+    # between the two packs, which is the only way to score their IQ4_NL Engram against our MXFP8 one.
+    if a.gate_kv_from:
+        src = pathlib.Path(a.gate_kv_from).expanduser().resolve()
+        md = [l.split(None, 1)[1] for l in (src / "ds4.txt").read_text().splitlines() if l.startswith("model_dir ")][0]
+        files, want = {}, {}
+        for line in (src / "tensors.txt").read_text().splitlines():
+            f = line.split()
+            if not f:
+                continue
+            if f[0] == "file":
+                files[int(f[1])] = " ".join(f[2:])
+            elif f[0] == "t" and re.match(r"layers\.\d+\.engram\.(gate|wkv)\.weight$", f[1]):
+                want[f[1]] = (f[2], int(f[3]), int(f[4]), int(f[5]), [int(x) for x in f[6:]])
+        for name, (tname, fi, o, nb, shape) in sorted(want.items()):
+            p = (pathlib.Path(md) / files[fi]).resolve()
+            add(name, tname, np.fromfile(p, dtype=np.uint8, count=nb, offset=o).tobytes(), shape)
+            print("%s: copied from %s (%s, %d bytes)" % (name, src.name, tname, nb))
+        (out / "dense.bin").write_bytes(b"".join(blobs))
+        json.dump(idx, open(out / "dense.json", "w"), indent=1)
+        print("wrote %s (%.2f MB), dense.json with %d tensors" % (out / "dense.bin", os.path.getsize(out / "dense.bin") / 1e6, len(idx)))
+        return 0
 
     for il in layers:
         kg, kt = find(gs, "blk.%d.engram_k.weight" % il)
