@@ -527,5 +527,26 @@ class Api(unittest.TestCase):
         self.assertEqual(last["decode_tok_s"], 100.0)
 
 
+class PickTemplateTests(unittest.TestCase):
+    """A pack made from another GGUF can ship the V4-Flash template (`tool_calls`, no space): the V4.1 model then
+    writes malformed calls (P2003 install test).  The server swaps in the V4.1 template for such a pack."""
+
+    def test_v4flash_pack_template_is_replaced(self):
+        import tempfile
+        from serve import dsml
+        with tempfile.TemporaryDirectory() as d:
+            old = Path(d) / "old.jinja"
+            old.write_text("{%- set dsml_token = '｜DSML｜' -%}{{ '<' + dsml_token + 'tool_calls>' }}", encoding="utf-8")
+            self.assertEqual(dsml.pick_template(old), (dsml.FIXTURE_TEMPLATE, True))
+            same = Path(d) / "same.jinja"
+            same.write_text(dsml.FIXTURE_TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8")
+            self.assertEqual(dsml.pick_template(same), (same, False))
+            self.assertEqual(dsml.pick_template(Path(d) / "none.jinja"), (dsml.FIXTURE_TEMPLATE, False))
+
+    def test_fixture_is_accepted(self):
+        from serve import dsml
+        self.assertTrue(dsml.v41_template_ok(dsml.FIXTURE_TEMPLATE.read_text(encoding="utf-8")))
+
+
 if __name__ == "__main__":
     unittest.main()
