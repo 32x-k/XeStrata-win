@@ -1,3 +1,31 @@
+// The CUDA function-space qualifiers and the few launch/kernel spellings the shared sources use.  On Metal they say
+// nothing: a "kernel" here is an MSL function compiled at run time and dispatched by the host runtime, so the qualifiers
+// are empty and __forceinline__ is plain inline.  Part of the metal_compat layer (M5 Max, 2026-10-23).
+#ifndef __host__
+#define __host__
+#endif
+#ifndef __device__
+#define __device__
+#endif
+#ifndef __global__
+#define __global__
+#endif
+#ifndef __shared__
+#define __shared__
+#endif
+#ifndef __constant__
+#define __constant__
+#endif
+#ifndef __forceinline__
+#define __forceinline__ inline
+#endif
+#ifndef __launch_bounds__
+#define __launch_bounds__(...)
+#endif
+#ifndef __restrict__
+#define __restrict__
+#endif
+
 // metal/include/metal_compat/cuda_runtime.h - the CUDA runtime names the host files use, on Metal.
 //
 // The HIP build's approach (include/strata/hip_compat/cuda_runtime.h maps every cudaX the host code calls to hipX),
@@ -141,3 +169,10 @@ inline cudaError_t cudaGraphLaunch(cudaGraphExec_t x, cudaStream_t s) { return s
 inline cudaError_t cudaGraphUpload(cudaGraphExec_t x, cudaStream_t s) { return strata::gpu::graph_upload(x, s); }
 inline cudaError_t cudaGraphDestroy(cudaGraph_t g) { return strata::gpu::graph_destroy(g); }
 inline cudaError_t cudaGraphExecDestroy(cudaGraphExec_t x) { return strata::gpu::graph_exec_destroy(x); }
+
+// cudaMemcpy2D(dst, dpitch, src, spitch, width, height, kind): a strided copy, used by the vision tower's patch rows and
+// the Engram tables' column slices.  The Metal runtime has no pitched copy yet, so this reports failure rather than
+// copying nothing silently.
+inline strata::gpu::Error cudaMemcpy2D(void*, size_t, const void*, size_t, size_t, size_t, strata::gpu::CopyKind) {
+    return strata::gpu::kErrorUnsupported;   // cudaMemcpy2D_unimplemented_marker
+}

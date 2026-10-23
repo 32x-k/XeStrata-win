@@ -46,6 +46,10 @@ static inline long syscall(long, ...) { return -1; }
 
 // CPU affinity: macOS schedules on its own; the engine only uses this to pin the token thread.  No-op, reported as success.
 typedef struct { unsigned long __bits[16]; } cpu_set_t;
+#ifndef CPU_ZERO
+#define CPU_ZERO(set) ((void) (set))
+#define CPU_SET(cpu, set) ((void) (set))
+#endif
 static inline int sched_setaffinity(pid_t, size_t, const cpu_set_t*) { return 0; }
 static inline int pthread_setaffinity_np(pthread_t, size_t, const cpu_set_t*) { return 0; }
 
