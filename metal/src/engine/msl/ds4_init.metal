@@ -173,3 +173,69 @@ kernel void ds4_hc_mix(device const float* h [[buffer(0)]], device const float* 
     ss = ds4_block_sum(ss, red, lane, w);
     if (tid == 0) mixes[(size_t) t * 32u + m] = acc * rsqrt(ss / float(hcdim) + eps);
 }
+
+// ds4_kernels.cu:268  hc_split_kernel - the sinkhorn normalisation of the hyper-connection mix.
+// This is the SCALAR path of the CUDA kernel (lane 0 of the threadgroup does the token, a local 8x8 matrix), applied for every
+// hc including 4: it computes the same mathematics as the warp-lane version, only without the shuffles.  Correctness first -
+// the lane-parallel hc == 4 version can be added behind a profile.
+kernel void ds4_hc_split(device const float* mixes [[buffer(0)]], device const float* scale [[buffer(1)]],
+                         device const float* base [[buffer(2)]], device float* pre [[buffer(3)]],
+                         device float* post [[buffer(4)]], device float* comb [[buffer(5)]],
+                         constant uint& hc [[buffer(6)]], constant uint& iters [[buffer(7)]],
+                         constant float& eps [[buffer(8)]], uint b [[threadgroup_position_in_grid]],
+                         uint lane [[thread_index_in_threadgroup]]) {
+    if (lane != 0u) return;
+    const device float* mx = mixes + (size_t) b * 32u;
+    device float* pr = pre + (size_t) b * 8u;
+    device float* po = post + (size_t) b * 8u;
+    device float* cb = comb + (size_t) b * 64u;
+    for (uint i = 0; i < 8u; ++i) {
+        if (i >= hc) break;
+        pr[i] = 1.0f / (1.0f + exp(-(mx[i] * scale[0] + base[i]))) + eps;
+        po[i] = 2.0f / (1.0f + exp(-(mx[hc + i] * scale[1] + base[hc + i])));
+    }
+    float c[8][8];
+    for (uint j = 0; j < 8u; ++j) {
+        if (j >= hc) break;
+        float m = -3.402823466e+38f;
+        for (uint k = 0; k < 8u; ++k) {
+            if (k >= hc) break;
+            c[j][k] = mx[2u * hc + j * hc + k] * scale[2] + base[2u * hc + j * hc + k];
+            m = fmax(m, c[j][k]);
+        }
+        float s = 0.0f;
+        for (uint k = 0; k < 8u; ++k) {
+            if (k >= hc) break;
+            c[j][k] = exp(c[j][k] - m);
+            s += c[j][k];
+        }
+        for (uint k = 0; k < 8u; ++k) {
+            if (k >= hc) break;
+            c[j][k] = c[j][k] / s + eps;
+        }
+    }
+    for (uint k = 0; k < 8u; ++k) {
+        if (k >= hc) break;
+        float s = 0.0f;
+        for (uint j = 0; j < 8u; ++j) if (j < hc) s += c[j][k];
+        for (uint j = 0; j < 8u; ++j) if (j < hc) c[j][k] /= s + eps;
+    }
+    for (uint it = 1; it < iters; ++it) {
+        for (uint j = 0; j < 8u; ++j) {
+            if (j >= hc) break;
+            float s = 0.0f;
+            for (uint k = 0; k < 8u; ++k) if (k < hc) s += c[j][k];
+            for (uint k = 0; k < 8u; ++k) if (k < hc) c[j][k] /= s + eps;
+        }
+        for (uint k = 0; k < 8u; ++k) {
+            if (k >= hc) break;
+            float s = 0.0f;
+            for (uint j = 0; j < 8u; ++j) if (j < hc) s += c[j][k];
+            for (uint j = 0; j < 8u; ++j) if (j < hc) c[j][k] /= s + eps;
+        }
+    }
+    for (uint j = 0; j < 8u; ++j) {
+        if (j >= hc) break;
+        for (uint k = 0; k < 8u; ++k) { if (k >= hc) break; cb[j * hc + k] = c[j][k]; }
+    }
+}

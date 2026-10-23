@@ -198,4 +198,46 @@ bool hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float 
     return true;
 }
 
+
+// ds4_kernels.cu:1908 - hc_split: the sinkhorn normalisation (scalar path; see the MSL comment)
+bool hc_split(const float* mixes, const float* scale, const float* base, int hc, int iters, float hc_eps, int T,
+              float* pre, float* post, float* comb) {
+    if (!ensure()) return false;
+    void* hm = strata::gpu::host_view((void*) mixes);
+    void* hp = strata::gpu::host_view((void*) pre);
+    void* ho = strata::gpu::host_view((void*) post);
+    void* hc_ = strata::gpu::host_view((void*) comb);
+    if (!hm || !hp || !ho || !hc_) { std::fprintf(stderr, "dsv41 metal: hc_split has no host view\n"); return false; }
+    const size_t page = 16384;
+    auto wrap = [&](void* host, size_t bytes) {
+        return g_cx->wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)), ((bytes + page - 1) / page) * page);
+    };
+    auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
+    mtl::Buffer bm = wrap(hm, (size_t) T * 32 * 4 + 65536);
+    mtl::Buffer bp = wrap(hp, (size_t) T * 8 * 4 + 65536);
+    mtl::Buffer bo = wrap(ho, (size_t) T * 8 * 4 + 65536);
+    mtl::Buffer bc = wrap(hc_, (size_t) T * 64 * 4 + 65536);
+    if (!bm.handle || !bp.handle || !bo.handle || !bc.handle) return false;
+    // scale and base come from the engine like every other operand: reach them through host_view, not as raw host pointers
+    void* hs = strata::gpu::host_view((void*) scale);
+    void* hb = strata::gpu::host_view((void*) base);
+    if (!hs || !hb) { std::fprintf(stderr, "dsv41 metal: hc_split scale/base have no host view\n"); return false; }
+    const size_t nbase = (size_t) (2 * hc + hc * hc);
+    mtl::Buffer bs = wrap(hs, 256);
+    mtl::Buffer bb = wrap(hb, (nbase * 4 + 65535) / 65536 * 65536 + 65536);
+    if (!bs.handle || !bb.handle) return false;
+    mtl::Pipeline pl;
+    try { pl = g_cx->pipeline(g_lib, "ds4_hc_split"); } catch (...) { return false; }
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.args = {mtl::Arg::B(bm, off(hm)), mtl::Arg::B(bs, off(hs)), mtl::Arg::B(bb, off(hb)), mtl::Arg::B(bp, off(hp)),
+              mtl::Arg::B(bo, off(ho)), mtl::Arg::B(bc, off(hc_)), mtl::Arg::V((unsigned) hc),
+              mtl::Arg::V((unsigned) iters), mtl::Arg::V((float) hc_eps)};
+    d.grid[0] = (uint32_t) T;
+    d.grid[1] = d.grid[2] = 1;
+    d.tg[0] = 32; d.tg[1] = d.tg[2] = 1;
+    g_cx->run({d});
+    return true;
+}
+
 }  // namespace strata::dsv41::metal_host

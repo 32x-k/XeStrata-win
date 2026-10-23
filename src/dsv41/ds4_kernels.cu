@@ -1905,6 +1905,9 @@ void hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float 
 }
 void hc_split(const float* mixes, const float* scale, const float* base, int hc, int iters, float hc_eps, int T,
               float* pre, float* post, float* comb, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    if (strata::dsv41::metal_host::hc_split(mixes, scale, base, hc, iters, hc_eps, T, pre, post, comb)) return;
+#endif
     strata_ds4_launch(hc_split_kernel, T, 32, 0, s, mixes, scale, base, hc, iters, hc_eps, pre, post, comb);
 }
 void hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int hc, int T, float eps, float* x,

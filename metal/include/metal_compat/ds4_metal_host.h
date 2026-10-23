@@ -32,6 +32,10 @@ struct FinishIn {
     uint8_t* pdst;
     long long pdst_stride;
 };
+// ds4_kernels.cu:1908 hc_split (the sinkhorn normalisation)
+bool hc_split(const float* mixes, const float* scale, const float* base, int hc, int iters, float hc_eps, int T,
+              float* pre, float* post, float* comb);
+
 // ds4_kernels.cu:1901 hc_mix
 bool hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes);
 
