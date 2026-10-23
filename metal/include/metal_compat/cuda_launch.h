@@ -20,4 +20,12 @@ static inline void strata_ds4_launch(K kernel, A&&...) {
 }
 
 // the call sites sit inside namespaces whose first argument would win argument-dependent lookup: force the global one
-#define strata_ds4_launch(...) ::strata_ds4_launch(__VA_ARGS__)
+// the call sites carry their own location, so a run names the exact launch that needs a dispatch
+#define strata_ds4_launch(...) ::strata_ds4_launch_at(__FILE__, __LINE__, __VA_ARGS__)
+
+// the macro adds the call site's location, so a run names the exact launch that still needs a Metal dispatch
+template <typename K, typename... A>
+static inline void strata_ds4_launch_at(const char* file, int line, K, A&&...) {
+    std::fprintf(stderr, "strata metal: kernel launch with no Metal dispatch at %s:%d\n", file, line);
+    std::abort();
+}
