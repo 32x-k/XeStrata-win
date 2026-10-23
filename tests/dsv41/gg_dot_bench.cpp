@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,10 +27,103 @@ using clk = std::chrono::steady_clock;
 
 static double secs(clk::time_point a) { return std::chrono::duration<double>(clk::now() - a).count(); }
 
+// ---- --expert: the engine's expert pipeline on random experts (gate+up+SwiGLU, quantize h, down) in jobs of 64 rows over N threads, for
+// ggml-cpu's dots (mode 0), the default rule (2) and the AVX2 rows always (1); GB/s of all three matrices' bytes, outputs compared bit for bit.
+static void fill_blocks(uint8_t* w, size_t bytes, int type, uint64_t seed) {
+    uint64_t st = 0x9E3779B97F4A7C15ull ^ (seed * 0xD1B54A32D192ED03ull);
+    auto next = [&st] { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+    for (size_t o = 0; o + 8 <= bytes; o += 8) { const uint64_t v = next(); std::memcpy(w + o, &v, 8); }
+    const size_t bb = ggml_type_size((ggml_type) type);
+    for (size_t o = 0; o + bb <= bytes; o += bb) {
+        const ggml_fp16_t d = ggml_fp32_to_fp16(0.002f + 0.001f * (float) (next() % 16));
+        if (type == 29) {
+            uint16_t sc[4];
+            std::memcpy(sc, w + o + 48, 8);
+            for (int k = 0; k < 4; ++k) sc[k] = (uint16_t) ((sc[k] & 0x0fff) | ((d >> (4 * k)) & 0xf) << 12);
+            std::memcpy(w + o + 48, sc, 8);
+        } else {
+            std::memcpy(w + o, &d, sizeof d);
+        }
+    }
+}
+
+static int run_expert(int tg, int td, int threads, long mb, int nt, int reps) {
+    ggml_cpu_init();
+    const int E = 5120, FF = 2304;
+    IqCpu f;
+    std::string err;
+    if (!gg_cpu_fmt(tg, td, E, FF, f, err)) { std::fprintf(stderr, "gg_cpu_fmt: %s\n", err.c_str()); return 2; }
+    const size_t gbytes = f.gu_row * FF, dbytes = f.d_row * E, ebytes = 2 * gbytes + dbytes;
+    const int ne = (int) std::max(2L, (long) ((size_t) mb * 1000000 / ebytes));
+    std::vector<uint8_t> gw((size_t) ne * gbytes), uw((size_t) ne * gbytes), dw((size_t) ne * dbytes);
+    for (int e = 0; e < ne; ++e) {
+        fill_blocks(&gw[(size_t) e * gbytes], gbytes, tg, 3 * (uint64_t) e + 1);
+        fill_blocks(&uw[(size_t) e * gbytes], gbytes, tg, 3 * (uint64_t) e + 2);
+        fill_blocks(&dw[(size_t) e * dbytes], dbytes, td, 3 * (uint64_t) e + 3);
+    }
+    uint64_t st = 12345;
+    auto next = [&st] { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+    std::vector<std::vector<uint8_t>> act((size_t) nt, std::vector<uint8_t>(f.act_bytes));
+    for (int t = 0; t < nt; ++t) {
+        std::vector<float> x((size_t) E);
+        for (auto& v : x) v = ((float) (next() % 2001) - 1000.0f) * 1e-3f;
+        gg_cpu_quant(f.gu_act, x.data(), E, act[(size_t) t].data());
+    }
+    std::vector<float> h((size_t) ne * nt * FF), y((size_t) ne * nt * E);
+    std::vector<uint8_t> hq((size_t) ne * nt * f.h_bytes);
+    const int RB = 64;
+    auto run_jobs = [&](long njobs, const std::function<void(long)>& fn) {
+        std::atomic<long> cur{0};
+        std::vector<std::thread> th;
+        for (int k = 0; k < threads; ++k)
+            th.emplace_back([&] { for (;;) { const long j = cur.fetch_add(1); if (j >= njobs) break; fn(j); } });
+        for (auto& t : th) t.join();
+    };
+    auto pass = [&](int mode) {
+        gg_cpu_set_iq256(mode);
+        double best = 1e30;
+        for (int r = 0; r < reps + 1; ++r) {
+            const auto t0 = clk::now();
+            const long gb = (FF + RB - 1) / RB, db = (E + RB - 1) / RB;
+            run_jobs((long) ne * gb, [&](long j) {
+                const int e = (int) (j / gb), r0 = (int) (j % gb) * RB, r1 = std::min(FF, r0 + RB);
+                const void* ap[64];
+                float* hp[64];
+                for (int t = 0; t < nt; ++t) { ap[t] = act[(size_t) t].data(); hp[t] = &h[((size_t) e * nt + t) * FF]; }
+                gg_cpu_gate_up(f, &gw[(size_t) e * gbytes], &uw[(size_t) e * gbytes], ap, nt, hp, r0, r1, 10.0f);
+            });
+            run_jobs((long) ne * nt, [&](long j) { gg_cpu_quant(f.d_act, &h[(size_t) j * FF], FF, &hq[(size_t) j * f.h_bytes]); });
+            run_jobs((long) ne * db, [&](long j) {
+                const int e = (int) (j / db), r0 = (int) (j % db) * RB, r1 = std::min(E, r0 + RB);
+                const void* hp[64];
+                float* yp[64];
+                for (int t = 0; t < nt; ++t) { hp[t] = &hq[((size_t) e * nt + t) * f.h_bytes]; yp[t] = &y[((size_t) e * nt + t) * E]; }
+                gg_cpu_down(f, &dw[(size_t) e * dbytes], hp, nt, yp, r0, r1);
+            });
+            if (r > 0) best = std::min(best, secs(t0));
+        }
+        return best;
+    };
+    const double gb = (double) ne * ebytes / 1e9;
+    std::vector<float> y0;
+    double t0s = 0;
+    int rc = 0;
+    for (int mode : {0, 2, 1}) {
+        const double t = pass(mode);
+        if (mode == 0) { y0 = y; t0s = t; }
+        const bool same = std::memcmp(y0.data(), y.data(), y.size() * 4) == 0;
+        std::printf("expert gate/up %d down %d nt %d threads %d: %d experts, %.2f GB | mode %s %.3f s = %.1f GB/s (x%.2f) %s\n", tg, td, nt,
+                    threads, ne, gb, mode == 0 ? "ggml " : mode == 2 ? "auto " : "own  ", t, gb / t, t0s / t, same ? "bit-identical" : "DIFFERENT");
+        if (!same) rc = 1;
+    }
+    return rc;
+}
+
 int main(int argc, char** argv) {
     int type = 18, threads = 32, nt = 1, reps = 3;
     long mb = 3072;
-    bool exact = false;
+    bool exact = false, expert = false;
+    int dtype = -1;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto val = [&] { return i + 1 < argc ? std::atol(argv[++i]) : 0L; };
@@ -39,7 +133,10 @@ int main(int argc, char** argv) {
         else if (a == "--nt") nt = (int) val();
         else if (a == "--reps") reps = (int) val();
         else if (a == "--exact") exact = true;
+        else if (a == "--expert") expert = true;
+        else if (a == "--dtype") dtype = (int) val();
     }
+    if (expert) return run_expert(type, dtype < 0 ? type : dtype, threads, mb, nt, reps);
     ggml_cpu_init();
     const int n = 5120;   // a gate / up row
     IqCpu f;
@@ -57,7 +154,14 @@ int main(int argc, char** argv) {
     const size_t bb = ggml_type_size((ggml_type) type);
     for (size_t o = 0; o + bb <= w.size(); o += bb) {   // the blocks' F16 scale: a small normal value
         const ggml_fp16_t d = ggml_fp32_to_fp16(0.002f + 0.001f * (float) (next() % 16));
-        std::memcpy(&w[o], &d, sizeof d);
+        if (type == 29) {   // IQ1_M: no d field - its f16 is spread over the top nibbles of the four scale words (bytes 48..55)
+            uint16_t sc[4];
+            std::memcpy(sc, &w[o + 48], 8);
+            for (int k = 0; k < 4; ++k) sc[k] = (uint16_t) ((sc[k] & 0x0fff) | ((d >> (4 * k)) & 0xf) << 12);
+            std::memcpy(&w[o + 48], sc, 8);
+        } else {
+            std::memcpy(&w[o], &d, sizeof d);
+        }
     }
     std::vector<std::vector<uint8_t>> a((size_t) nt, std::vector<uint8_t>(f.act_bytes));
     std::vector<const void*> ap((size_t) nt);
