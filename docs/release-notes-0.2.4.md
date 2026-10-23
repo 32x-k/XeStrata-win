@@ -53,7 +53,7 @@ These are the 2.00-bit set. The 2.25-bit set reads 13% more data per token, so e
 - DSpark is off on PCs where the CPU is the limit.
 - Not in this release: Mac and Strix Halo. DeepSeek V4.1-Flash does not run there yet.
 - Output on 12 GB cards is 4 to 8 tokens/s. That is usable for chat and slow for long agent runs.
-- The answers can differ from run to run with the same prompt when experts move between the card and the CPU. The cause is which experts sit on the card at that moment.
+- The same prompt can give a slightly different answer from one run to the next. At some words the model's top choices are nearly tied, and small differences in how the numbers are added up decide between them.
 
 ## Updating
 
