@@ -318,7 +318,11 @@ public:
             const size_t c = chunks_.size() - 1, first = c * kChunk;
             bool busy = false;
             for (size_t i = first; i < nalloc_ && !busy; ++i) {
-                const Slot& sp = slots_[i];
+                Slot& sp = slots_[i];
+                if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {   // (read by now)
+                    try_ready(sp);
+                    if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
+                }
                 busy = sp.pin > 0 || sp.visible || sp.state.load(std::memory_order_acquire) == kLoading;
             }
             if (busy) break;

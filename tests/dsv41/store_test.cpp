@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <thread>
 
 using namespace strata::ds4;
 
@@ -31,12 +32,16 @@ int main(int argc, char** argv) {
     std::printf("direct handle: %s\n", dfd != os::kBadFd ? "yes" : "NO (buffered)");
     ExpertStore::LayerGeo geo;
     geo.n_exp = 384;
+    uint64_t at = 0;
     for (int r = 0; r < 3; ++r) {
         geo.file[r] = 0;
         geo.off[r] = offs[r];
         geo.stride[r] = mb;
         geo.bytes[r] = mb;
+        geo.tr[r] = at;   // the engine's blob layout with the store's 8192-byte gaps
+        at += ((mb + 255) & ~(uint64_t) 255) + ExpertStore::kSlack;
     }
+    geo.blob = at;
     ExpertStore st;
     ExpertStore::Cfg cfg;
     cfg.budget_bytes = (size_t) (gb * 1e9);
@@ -44,7 +49,7 @@ int main(int argc, char** argv) {
     cfg.policy = (ExpertStore::Policy) policy;
     cfg.floor_bytes = 4ull << 30;
     cfg.ram_avail = [] { return os::ram_avail(); };
-    if (!st.init(cfg, {geo}, {fd}, {dfd}, {pfd})) {
+    if (!st.init(cfg, {geo}, {dfd}, {pfd})) {
         std::printf("init failed\n");
         return 2;
     }
@@ -75,6 +80,27 @@ int main(int argc, char** argv) {
                         if (s < 0 || std::memcmp(st.mat(s, r), ref.data(), mb) != 0) ++bad;
                     }
         st.release(0, es, 6, ok);
+    }
+    // guesses queued behind demand, cancelled, and a shrink: the store must still give the file's bytes
+    for (int round = 0; round < 3; ++round) {
+        for (int e = 100; e < 140; ++e) st.prefetch(0, e);
+        st.cancel_stale(0);
+        int es[6] = {5 + round, 17, 200, 201, 202, 250 + round};
+        std::vector<char> ok;
+        st.ensure(0, es, 6, ok);
+        for (int i = 0; i < 6; ++i)
+            if (ok[(size_t) i]) {
+                const int sl = st.find(0, es[i]);
+                for (int r = 0; r < 3; ++r) {
+                    os::pread_full(fd, ref.data(), mb, offs[r] + (uint64_t) es[i] * mb);
+                    ++checked;
+                    if (sl < 0 || std::memcmp(st.mat(sl, r), ref.data(), mb) != 0) ++bad;
+                }
+            }
+        st.release(0, es, 6, ok);
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));   // (the guesses read by now)
+        const size_t g = st.shrink_chunks(1);
+        std::printf("round %d: shrank %zu chunk(s), %zu slots left, cancelled %lld\n", round, g, st.slots_allocated(), (long long) st.stats().cancelled.load());
     }
     const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     const auto& s = st.stats();
