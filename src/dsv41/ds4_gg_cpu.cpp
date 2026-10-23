@@ -149,8 +149,9 @@ static bool want_512(int type, int nt) {
     }
     if (g_iq512 == 0 || !strata::kernels::cpu::iq512x_supported(type)) return false;
     if (g_iq512 == 1) return true;
-    (void) nt;
-    return false;   // (the default rule is filled in from the Zen 4 numbers)
+    // Zen 4 (Ryzen 5 7600, 6 threads): IQ2_XXS at 16 tokens 3.2 -> 4.0 GB/s over the AVX2 rows (x4.2 against ggml's dot), no gain at 4
+    // tokens, IQ3_XXS the same as AVX2 at every count and slower at one - so the AVX-512 rows only for a prompt chunk's tokens on IQ2_XXS
+    return nt >= 7 && type == 16;
 }
 // 0: ggml-cpu's dot, 1: the AVX2 rows, 2: the AVX-512 rows
 static int use_iq256(int type, int nt) {
