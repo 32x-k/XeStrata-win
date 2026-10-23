@@ -440,10 +440,22 @@ def main() -> int:
             if picked:
                 g.tensors = picked
                 eg_from[p] = g
+    # what the --dense-override folders supply: a tensor they provide is not "missing" here even though neither the quant's
+    # shards nor an Engram set carry it (engram_fold.py supplies the Engram gate and kv from the quant's own k/q/wkv, 2026-10-23)
+    # the GGUF part names -> the engine's names (LAYER maps "engram_kv.weight" -> "engram.kv.weight")
+    ov_names = set()
+    for dsrc in (a.dense_override or []):
+        try:
+            ov_names |= set(json.loads((pathlib.Path(dsrc).expanduser().resolve() / "dense.json").read_text()).keys())
+        except (OSError, ValueError):
+            pass
     for il in kv.get("%s.engram.layers" % arch, []):
         for part in ("engram_embd", "engram_kv", "engram_gate"):
             nm = "blk.%d.%s.weight" % (il, part)
-            if nm not in have and not any(t[0] == nm for g in eg_from.values() for t in g.tensors):
+            # a dense override names tensors the way the pack does, not the way the GGUF does
+            eng_nm = "layers.%d.%s" % (il, LAYER[part + ".weight"])
+            if (nm not in have and eng_nm not in ov_names
+                    and not any(t[0] == nm for g in eg_from.values() for t in g.tensors)):
                 raise SystemExit("%s: missing - not in the quant's shards nor in an Engram set (--engram, or "
                                  "<model>/../Engram/: unsloth's UD-Q8_K_XL shard of the Engram tables)" % nm)
     rel = lambda p: os.path.relpath(p, model).replace(os.sep, "/")  # noqa: E731
