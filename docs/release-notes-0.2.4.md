@@ -65,7 +65,6 @@ Everything from 0.2.3 is attached again, so the release page still holds every f
 
 - **IST-DAS** for the 2.00 and 2.25-bit sets of DeepSeek V4.1-Flash.
 - **Unsloth** for the DSpark drafter GGUF.
-- **Project Maya (mw00, MIT)**, whose DeepSeek engine this port started from.
 
 ---
 
