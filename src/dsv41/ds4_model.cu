@@ -2667,6 +2667,22 @@ struct Model::Impl {
         return (size_t) chunk * ((size_t) g.hc * g.dim * 4 + 8 * 4 + topk_stride() * 4 + cand_stride() * 4);
     }
 
+    // the staging ring's size (MB) for the experts a chunk streams from the CPU lane: 400 where a good part of them are
+    // streamed; 64 where the cards hold at least 90% of the experts (a 4-card box) - the ring's VRAM is then worth more
+    // as expert slots, and the decode after a prompt keeps the windowed path's speed (R9700 x4: 29.6 -> 31.7 tok/s)
+    size_t ring_mb_auto() const {
+        double exp_b = 0, other_b = 0, room = 0;
+        for (const auto& kt : pk.t) {
+            const std::string& n = kt.first;
+            if (n.find(".engram.embed.") != std::string::npos || n.rfind("vision.", 0) == 0 || n == "embed.weight" ||
+                (!o.dspark && n.rfind("mtp.", 0) == 0))
+                continue;
+            (n.find(".ffn.experts.") != std::string::npos ? exp_b : other_b) += (double) kt.second.bytes;
+        }
+        for (const Dev& d : devs)
+            room += std::max(0.0, (double) d.free0 - (double) ((size_t) o.reserve_mib << 20) - 1.5 * (1 << 30)) * o.vram_experts;
+        return exp_b > 0 && exp_b - std::max(0.0, room - other_b) <= 0.1 * exp_b ? 64 : 400;
+    }
     bool alloc_chunks(std::string& err) {
         chunks.resize(devs.size());
         const int D = g.dim, H = g.hc, HD = g.hd;
@@ -2725,7 +2741,7 @@ struct Model::Impl {
                     return false;
             }
             if (stride > 0) {   // DS4_RING_MB (400) of slots in kParts batches
-                const size_t mb = std::getenv("DS4_RING_MB") ? (size_t) std::atoi(std::getenv("DS4_RING_MB")) : 400;
+                const size_t mb = std::getenv("DS4_RING_MB") ? (size_t) std::atoi(std::getenv("DS4_RING_MB")) : ring_mb_auto();
                 c.ring_stride = stride;
                 c.ring_n = std::max(Chunk::kParts, (int) ((mb << 20) / stride) / Chunk::kParts * Chunk::kParts);
                 if (!dalloc(d, c.ring, (size_t) c.ring_n * stride, err)) return false;
@@ -4834,8 +4850,14 @@ struct Model::Impl {
     // pieces; the down bands).  yd[slot] gets each row's expert output.
     struct Ent {
         int e = 0, n = 0, slot0 = 0;
-        int tok[kc::kExl3CpuMaxN] = {};
+        int tok[kEntMax] = {};
     };
+    // tokens an entry holds: the i-quant GGUF experts take a whole window's tokens of an expert in one call (the CPU
+    // lane's exact multi-token rows, 7+ tokens an expert: decoded once for all), the others (MXFP4, EXL3) up to 8
+    static constexpr int kEntMax = kWin > kc::kExl3CpuMaxN ? kWin : kc::kExl3CpuMaxN;
+    static int ent_cap(const Layer& l) {
+        return l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay) ? kEntMax : kc::kExl3CpuMaxN;
+    }
     void run_nodes(int n, const std::function<void(int)>* f) {
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->start(n, f[X]);
         pools[0]->help();
@@ -4982,8 +5004,8 @@ struct Model::Impl {
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / GB] : j / GB)];
                 const int r0 = X * FFh + (j % GB) * RB, r1 = std::min(X * FFh + FFh, r0 + RB);
-                const void* ap[gg::kMxCpuMaxN];
-                float* hp[gg::kMxCpuMaxN];
+                const void* ap[kEntMax];
+                float* hp[kEntMax];
                 for (int i = 0; i < en.n; ++i) {
                     ap[i] = x_act(en, i);
                     hp[i] = c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) X * FFh;   // (part X's rows of h)
@@ -5002,8 +5024,8 @@ struct Model::Impl {
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
                 const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
-                const void* hp[gg::kMxCpuMaxN];
-                float* yp[gg::kMxCpuMaxN];
+                const void* hp[kEntMax];
+                float* yp[kEntMax];
                 for (int i = 0; i < en.n; ++i) {
                     hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
                     yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
@@ -5675,7 +5697,7 @@ struct Model::Impl {
                     en.e = picks[a].first;
                     en.slot0 = nslots;
                     en.n = 0;
-                    while (a < picks.size() && picks[a].first == en.e && en.n < kc::kExl3CpuMaxN) {
+                    while (a < picks.size() && picks[a].first == en.e && en.n < ent_cap(l)) {
                         const int t = picks[a].second / kPicks, i = picks[a].second % kPicks;
                         en.tok[en.n++] = t;
                         tok_of[nslots] = t;
@@ -8086,11 +8108,11 @@ struct Model::Impl {
                 }
                 ++nvex;
             } else {
-                for (size_t a = 0; a < pe.size(); a += kc::kExl3CpuMaxN) {
+                for (size_t a = 0; a < pe.size(); a += (size_t) ent_cap(l)) {
                     Ent en;
                     en.e = e;
                     en.slot0 = nslots;
-                    en.n = (int) std::min<size_t>(kc::kExl3CpuMaxN, pe.size() - a);
+                    en.n = (int) std::min<size_t>((size_t) ent_cap(l), pe.size() - a);
                     for (int i = 0; i < en.n; ++i) {
                         en.tok[i] = pe[a + (size_t) i].first;
                         cpu_rows.push_back({pe[a + (size_t) i].first, h_w[pe[a + (size_t) i].first * kPicks + pe[a + (size_t) i].second]});
