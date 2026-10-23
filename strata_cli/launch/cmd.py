@@ -542,6 +542,15 @@ def _screens_missing() -> str | None:
     return next((m for m in ("rich", "textual") if importlib.util.find_spec(m) is None), None)
 
 
+def final_hint_lines(s, preset_saved: bool) -> list[str]:
+    """The last lines of a flag launch: how to connect an app and how to stop.  `--preset "<name>"` is suggested only when a preset by that name exists
+    (--preset NAME, or --save-preset NAME); otherwise the plain command, and how to keep the settings."""
+    if preset_saved:
+        return [f"  Connect an app:  strata connect opencode      Stop:  strata launch --stop --preset \"{s.name}\""]
+    return ["  Connect an app:  strata connect opencode      Stop:  strata launch --stop",
+            "  To keep these settings for next time, add --save-preset NAME."]
+
+
 def _tui(run, *args, **kw) -> int:
     """Open the screens. An error of the screens themselves ends with a plain sentence and a non-zero exit code, never a traceback and exit 0
     (tester report T02)."""
@@ -804,7 +813,8 @@ def run_launch(a: argparse.Namespace) -> int:
             _say(f"  {'Anthropic apps':<14} {result.urls[0]}   (Claude Code: ANTHROPIC_BASE_URL, no /v1 at the end)")
         if result.key:
             from strata_cli.launch import access
-            _say(f"  {'API key':<14} {access.mask_key(result.key)}   (show it: strata launch --show-key --preset \"{s.name}\")")
+            _say(f"  {'API key':<14} {access.mask_key(result.key)}   (show it: strata launch --show-key"
+                 + (f" --preset \"{s.name}\")" if (a.preset or a.save_preset) else ")"))
         for n in result.notices:
             _say(f"[!] {n}")
         local = next((u for u in result.urls if "127.0.0.1" in u), result.urls[0] if result.urls else "")
@@ -816,7 +826,8 @@ def run_launch(a: argparse.Namespace) -> int:
             _say(f"  Watch it:    STRATA_API_KEY=$(strata launch --show-key) strata monitor --url {local} --credential-env STRATA_API_KEY")
         else:
             _say(f"  Watch it:    strata monitor --url {local}")
-        _say(f"  Connect an app:  strata connect opencode      Stop:  strata launch --stop --preset \"{s.name}\"")
+        for line in final_hint_lines(s, bool(a.preset or a.save_preset)):
+            _say(line)
         return 0
     except store.PresetError as e:
         return fail(str(e), 2)
