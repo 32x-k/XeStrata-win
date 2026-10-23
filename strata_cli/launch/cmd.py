@@ -531,6 +531,13 @@ def open_page(url: str) -> bool:
         return False
 
 
+def _screens_missing() -> str | None:
+    """The Python package the screens need that this install lacks ("rich" / "textual"), None when both are there.  A source install made before
+    setup installed them has neither: `strata launch` then goes on in plain lines instead of stopping with a traceback."""
+    import importlib.util
+    return next((m for m in ("rich", "textual") if importlib.util.find_spec(m) is None), None)
+
+
 def _tui(run, *args, **kw) -> int:
     """Open the screens. An error of the screens themselves ends with a plain sentence and a non-zero exit code, never a traceback and exit 0
     (tester report T02)."""
@@ -668,14 +675,21 @@ def run_launch(a: argparse.Namespace) -> int:
         have_choices = bool(a.preset or a.model or a.model_path or a.context or a.vision or a.parallel or a.access or a.tune or a.drafting)
         interactive = sys.stdin.isatty() and sys.stdout.isatty() and not a.no_tui and not machine and not a.plan
         plain_questions = False
+        no_screens_package = None
+        if interactive and _screens_missing():
+            no_screens_package = _screens_missing()
+            interactive = False
+            _say(f"The screens need a Python package this install does not have yet ({no_screens_package}), so Strata goes on in plain lines. "
+                 "Run setup again (START-HERE / ./setup.sh) to get the screens.")
         if not have_choices and not interactive and not a.plan:
             if machine or a.no_tui or catalog is None or not _can_ask():     # --no-tui never asks (round 8, M)
                 return fail("`strata launch` with no choices opens screens, and this is not a terminal (or --no-tui was given). Name what to start: --preset NAME, or --model NAME "
                             "(strata launch --help has examples; --plan shows what would happen without changing anything).", 2)
             # Git Bash, mintty and some editor panels cannot show the screens although a person is typing: go on in plain lines, and ask first
             plain_questions = True
-            _say("This window cannot show Strata's screens (Git Bash and similar windows do not pass the keyboard through). "
-                 "For the screens, open Windows Terminal, PowerShell or cmd, or run `winpty strata launch`. Going on with plain questions.")
+            if no_screens_package is None:
+                _say("This window cannot show Strata's screens (Git Bash and similar windows do not pass the keyboard through). "
+                     "For the screens, open Windows Terminal, PowerShell or cmd, or run `winpty strata launch`. Going on with plain questions.")
         if interactive and not have_choices:
             if catalog is None:
                 return fail("This Terminal does not carry the model list, so the screens cannot open. Install it again with the one-line installer.", 5)

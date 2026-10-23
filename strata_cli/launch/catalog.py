@@ -72,6 +72,8 @@ def verdict(on_this_pc: str | None) -> tuple[str, str]:
         return TIGHT, "not checked (this computer's memory could not be read)"
     if low.startswith("does not fit"):
         return NO, "too big (can still try)"
+    if "free disk space" in low:                           # DeepSeek: fits in memory, not on the disk (still allowed)
+        return TIGHT, "tight: needs more disk space"
     if "low-ram mode" in low:
         return FITS, "fits, a bit slower"
     if "part of its experts" in low or "read from the ssd" in low:
