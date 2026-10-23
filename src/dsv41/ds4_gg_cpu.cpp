@@ -91,12 +91,12 @@ static bool use_iq256(int type) {
 #endif
         g_iq256 = avx2 && v != nullptr && std::atoi(v) != 0 ? 1 : 0;
     }
-    return g_iq256 == 1 && strata::kernels::cpu::iq256_supported(type);
+    return g_iq256 == 1 && strata::kernels::cpu::iq256x_supported(type);
 }
 
 static void dots(int type, const uint8_t* w, size_t rb, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
     if (nt > 0 && use_iq256(type)) {
-        strata::kernels::cpu::iq256_rows(type, w, rb, n, act, nt, out, r0, r1);
+        strata::kernels::cpu::iq256x_rows(type, w, rb, n, act, nt, out, r0, r1);
         return;
     }
     const ggml_type_traits_cpu* tc = ggml_get_type_traits_cpu((ggml_type) type);

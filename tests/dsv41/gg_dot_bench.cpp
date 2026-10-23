@@ -57,7 +57,14 @@ int main(int argc, char** argv) {
     const size_t bb = ggml_type_size((ggml_type) type);
     for (size_t o = 0; o + bb <= w.size(); o += bb) {   // the blocks' F16 scale: a small normal value
         const ggml_fp16_t d = ggml_fp32_to_fp16(0.002f + 0.001f * (float) (next() % 16));
-        std::memcpy(&w[o], &d, sizeof d);
+        if (type == 29) {   // IQ1_M: no d field - its f16 is spread over the top nibbles of the four scale words (bytes 48..55)
+            uint16_t sc[4];
+            std::memcpy(sc, &w[o + 48], 8);
+            for (int k = 0; k < 4; ++k) sc[k] = (uint16_t) ((sc[k] & 0x0fff) | ((d >> (4 * k)) & 0xf) << 12);
+            std::memcpy(&w[o + 48], sc, 8);
+        } else {
+            std::memcpy(&w[o], &d, sizeof d);
+        }
     }
     std::vector<std::vector<uint8_t>> a((size_t) nt, std::vector<uint8_t>(f.act_bytes));
     std::vector<const void*> ap((size_t) nt);

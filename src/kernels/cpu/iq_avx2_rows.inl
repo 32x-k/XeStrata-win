@@ -78,7 +78,7 @@ void gu_ggml_one(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const
     }
 }
 
-template <int TY, int NT> STRATA_ROWS_FN
+template <int TY, int NT, bool EX = false> STRATA_ROWS_FN
 inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     const int pf = prefetch_distance();
     __m256 accf[NT];
@@ -100,11 +100,14 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
                 }
             }
         }
-        const float dx = h2f(u16(blk)) * Fmt32<TY>::K;
+        // EX (the DeepSeek CPU lane's rows): ggml's float order, so a token's dot is the same bits as ggml-cpu's whatever
+        // number of tokens share the pass - block scale f16(d) * y.d, the format's constant K after the sum, ggml's hsum.
+        // Without EX the order of the main engine's rows (unchanged).
+        const float dx = EX ? h2f(u16(blk)) : h2f(u16(blk)) * Fmt32<TY>::K;
         for (int t = 0; t < NT; ++t)
             accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d), _mm256_cvtepi32_ps(acci[t]), accf[t]);
     }
-    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+    for (int t = 0; t < NT; ++t) res[t] = EX ? Fmt32<TY>::K * ggml_hsum8(accf[t]) : hsum8(accf[t]);
 }
 
 // ---- IQ2_XS (17) with ggml's vectorized sign decode (arch/x86/quants.c, ggml_vec_dot_iq2_xs_q8_K):
@@ -197,13 +200,84 @@ inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* con
     for (int t = 0; t < NT; ++t) res[t] = GGML ? 0.125f * ggml_hsum8(accf[t]) : hsum8(accf[t]);
 }
 
-template <int TY, int NT> STRATA_ROWS_FN
-inline void row_dot_any(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
-    if constexpr (TY == 17) row_dot_iq2xs<NT>(row, nblocks, y, res);
-    else                    row_dot<TY, NT>(row, nblocks, y, res);
+// ---- IQ1_M (29): 56-byte blocks (qs[32], qh[16], scales[8] holding the 3-bit sub-scales and, in their top nibbles, the
+// block's f16 d), ggml's ggml_vec_dot_iq1_m_q8_K (AVX2): s = hsum(sum d*sumi1) + 0.125 * hsum(sum d*sumi2), sumi1 the
+// grid dot, sumi2 the +-1 delta dot.  The grid values are -1/0/1 bytes: |g| and the sign half of ggml's mul_add_epi8
+// are taken once per weight chunk, each token then costs two signs, two maddubs, two madds and the adds.
+template <int NT> STRATA_ROWS_FN
+inline void row_dot_iq1m(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+    const __m256i mask = _mm256_set1_epi16(0x7);
+    const __m256i mone = _mm256_set1_epi16(1);
+    const __m256i mone8 = _mm256_set1_epi8(1);
+    const __m256i mtwo8 = _mm256_set1_epi8(2);
+    const __m256i scales_shift = _mm256_set_epi64x(9, 3, 6, 0);
+    const __m256i neg8 = _mm256_set1_epi8(-1);
+    const int pf = prefetch_distance();
+    __m256 acc1[NT], acc2[NT];
+    for (int t = 0; t < NT; ++t) acc1[t] = acc2[t] = _mm256_setzero_ps();
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* blk = row + (size_t) i * 56;
+        rows_ahead(blk, pf);
+        const uint8_t* qs = blk;
+        const uint8_t* qh = blk + 32;
+        const uint8_t* scb = blk + 48;
+        const uint16_t sc0 = u16(scb), sc1 = u16(scb + 2), sc2 = u16(scb + 4), sc3 = u16(scb + 6);
+        const uint16_t d16 = (uint16_t) ((sc0 >> 12) | ((sc1 >> 8) & 0x00f0) | ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000));
+        __m256i scales = _mm256_set1_epi64x((long long) u64(scb));
+        scales = _mm256_srlv_epi64(scales, scales_shift);
+        scales = _mm256_add_epi16(_mm256_slli_epi16(_mm256_and_si256(scales, mask), 1), mone);
+        __m256i sidx1 = _mm256_set1_epi16(0x0100);
+        __m256i sidx2 = _mm256_add_epi8(sidx1, _mm256_set1_epi8(8));
+        __m256i s1[NT], s2[NT];
+        for (int t = 0; t < NT; ++t) s1[t] = s2[t] = _mm256_setzero_si256();
+        for (int it = 0; it < 4; ++it) {
+            const uint8_t* q = qs + 8 * it;
+            const uint8_t* h = qh + 4 * it;
+            const __m256i g1 = _mm256_set_epi64x(
+                (long long) iq1s_grid[q[3] | (((uint16_t) h[1] << 4) & 0x700)], (long long) iq1s_grid[q[2] | (((uint16_t) h[1] << 8) & 0x700)],
+                (long long) iq1s_grid[q[1] | (((uint16_t) h[0] << 4) & 0x700)], (long long) iq1s_grid[q[0] | (((uint16_t) h[0] << 8) & 0x700)]);
+            const __m256i g2 = _mm256_set_epi64x(
+                (long long) iq1s_grid[q[7] | (((uint16_t) h[3] << 4) & 0x700)], (long long) iq1s_grid[q[6] | (((uint16_t) h[3] << 8) & 0x700)],
+                (long long) iq1s_grid[q[5] | (((uint16_t) h[2] << 4) & 0x700)], (long long) iq1s_grid[q[4] | (((uint16_t) h[2] << 8) & 0x700)]);
+            const __m256i dl1 = _mm256_set_epi64x(h[1] & 0x80 ? -1LL : 0x0101010101010101LL, h[1] & 0x08 ? -1LL : 0x0101010101010101LL,
+                                                  h[0] & 0x80 ? -1LL : 0x0101010101010101LL, h[0] & 0x08 ? -1LL : 0x0101010101010101LL);
+            const __m256i dl2 = _mm256_set_epi64x(h[3] & 0x80 ? -1LL : 0x0101010101010101LL, h[3] & 0x08 ? -1LL : 0x0101010101010101LL,
+                                                  h[2] & 0x80 ? -1LL : 0x0101010101010101LL, h[2] & 0x08 ? -1LL : 0x0101010101010101LL);
+            const __m256i a1 = _mm256_sign_epi8(g1, g1), a2 = _mm256_sign_epi8(g2, g2);
+            const __m256i sc_a = _mm256_shuffle_epi8(scales, sidx1);
+            const __m256i sc_b = _mm256_shuffle_epi8(scales, sidx2);
+            sidx1 = _mm256_add_epi8(sidx1, mtwo8);
+            sidx2 = _mm256_add_epi8(sidx2, mtwo8);
+            for (int t = 0; t < NT; ++t) {
+                const __m256i q8a = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + 64 * it));
+                const __m256i q8b = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + 64 * it + 32));
+                const __m256i dot1 = _mm256_maddubs_epi16(a1, _mm256_sign_epi8(q8a, g1));
+                const __m256i dot2 = _mm256_maddubs_epi16(a2, _mm256_sign_epi8(q8b, g2));
+                const __m256i dot3 = _mm256_maddubs_epi16(mone8, _mm256_sign_epi8(q8a, dl1));
+                const __m256i dot4 = _mm256_maddubs_epi16(mone8, _mm256_sign_epi8(q8b, dl2));
+                s1[t] = madd_add(madd_add(s1[t], dot1, sc_a), dot2, sc_b);
+                s2[t] = madd_add(madd_add(s2[t], dot3, sc_a), dot4, sc_b);
+            }
+        }
+        (void) neg8;
+        const float dx = h2f(d16);
+        for (int t = 0; t < NT; ++t) {
+            const __m256 d = _mm256_set1_ps(y[t][i].d * dx);
+            acc1[t] = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(s1[t]), acc1[t]);
+            acc2[t] = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(s2[t]), acc2[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) res[t] = ggml_hsum8(acc1[t]) + 0.125f * ggml_hsum8(acc2[t]);
 }
 
-template <int TY, int NT> STRATA_ROWS_FN
+template <int TY, int NT, bool EX = false> STRATA_ROWS_FN
+inline void row_dot_any(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+    if constexpr (TY == 29) row_dot_iq1m<NT>(row, nblocks, y, res);
+    else if constexpr (TY == 17) row_dot_iq2xs<NT, EX>(row, nblocks, y, res);
+    else                    row_dot<TY, NT, EX>(row, nblocks, y, res);
+}
+
+template <int TY, int NT, bool EX> STRATA_ROWS_FN
 void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, float* const* ff,
              int r0, int r1) {
     const block_q8_K* y[NT];
@@ -211,78 +285,80 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const voi
     const int nb = n / QK_K;
     float g[NT], u[NT];
     for (int r = r0; r < r1; ++r) {
-        row_dot_any<TY, NT>(blob + (size_t) r * gu_row, nb, y, g);
-        row_dot_any<TY, NT>(blob + up_off + (size_t) r * gu_row, nb, y, u);
+        row_dot_any<TY, NT, EX>(blob + (size_t) r * gu_row, nb, y, g);
+        row_dot_any<TY, NT, EX>(blob + up_off + (size_t) r * gu_row, nb, y, u);
         for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
     }
 }
 
-template <int TY, int NT> STRATA_ROWS_FN
+template <int TY, int NT, bool EX> STRATA_ROWS_FN
 void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0, int r1) {
     const block_q8_K* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
     float res[NT];
     for (int r = r0; r < r1; ++r) {
-        row_dot_any<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, res);
+        row_dot_any<TY, NT, EX>(w + (size_t) r * row_bytes, n / QK_K, y, res);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }
 }
 
-template <int TY> STRATA_ROWS_FN
+template <int TY, bool EX> STRATA_ROWS_FN
 void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                 float* const* ff, int r0, int r1) {
     switch (nt) {
-        case 1: gu_rows<TY, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 2: gu_rows<TY, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 3: gu_rows<TY, 3>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 4: gu_rows<TY, 4>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 5: gu_rows<TY, 5>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 6: gu_rows<TY, 6>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 7: gu_rows<TY, 7>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        default: gu_rows<TY, 8>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 1: gu_rows<TY, 1, EX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 2: gu_rows<TY, 2, EX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 3: gu_rows<TY, 3, EX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 4: gu_rows<TY, 4, EX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 5: gu_rows<TY, 5, EX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 6: gu_rows<TY, 6, EX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 7: gu_rows<TY, 7, EX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        default: gu_rows<TY, 8, EX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
     }
 }
 
-template <int TY> STRATA_ROWS_FN
+template <int TY, bool EX> STRATA_ROWS_FN
 void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0,
                  int r1) {
     switch (nt) {
-        case 1: dot_rows<TY, 1>(w, row_bytes, n, act, out, r0, r1); break;
-        case 2: dot_rows<TY, 2>(w, row_bytes, n, act, out, r0, r1); break;
-        case 3: dot_rows<TY, 3>(w, row_bytes, n, act, out, r0, r1); break;
-        case 4: dot_rows<TY, 4>(w, row_bytes, n, act, out, r0, r1); break;
+        case 1: dot_rows<TY, 1, EX>(w, row_bytes, n, act, out, r0, r1); break;
+        case 2: dot_rows<TY, 2, EX>(w, row_bytes, n, act, out, r0, r1); break;
+        case 3: dot_rows<TY, 3, EX>(w, row_bytes, n, act, out, r0, r1); break;
+        case 4: dot_rows<TY, 4, EX>(w, row_bytes, n, act, out, r0, r1); break;
         default: for (int t0 = 0; t0 < nt; t0 += 4) {
             const int k = nt - t0 < 4 ? nt - t0 : 4;
-            dot_rows_nt<TY>(k, w, row_bytes, n, act + t0, out + t0, r0, r1);
+            dot_rows_nt<TY, EX>(k, w, row_bytes, n, act + t0, out + t0, r0, r1);
         }
     }
 }
 
 // The decode of each format for a variant: the gathered one (kIq256Gather) for IQ3_XXS, IQ3_S and IQ2_S.
-template <bool G> STRATA_ROWS_FN
+template <bool G, bool EX = false> STRATA_ROWS_FN
 void gu_type(int type, int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
              float* const* ff, int r0, int r1) {
     switch (type) {
-        case 16: gu_rows_nt<16>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 17: gu_rows_nt<17>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 18: gu_rows_nt<G ? 118 : 18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 21: gu_rows_nt<G ? 121 : 21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 22: gu_rows_nt<G ? 122 : 22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 23: gu_rows_nt<23>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 16: gu_rows_nt<16, EX>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 17: gu_rows_nt<17, EX>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 18: gu_rows_nt<G ? 118 : 18, EX>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 21: gu_rows_nt<G ? 121 : 21, EX>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 22: gu_rows_nt<G ? 122 : 22, EX>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 23: gu_rows_nt<23, EX>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 29: gu_rows_nt<29, EX>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         default: break;
     }
 }
 
-template <bool G> STRATA_ROWS_FN
+template <bool G, bool EX = false> STRATA_ROWS_FN
 void dot_type(int type, int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out,
               int r0, int r1) {
     switch (type) {
-        case 16: dot_rows_nt<16>(nt, w, row_bytes, n, act, out, r0, r1); break;
-        case 17: dot_rows_nt<17>(nt, w, row_bytes, n, act, out, r0, r1); break;
-        case 18: dot_rows_nt<G ? 118 : 18>(nt, w, row_bytes, n, act, out, r0, r1); break;
-        case 21: dot_rows_nt<G ? 121 : 21>(nt, w, row_bytes, n, act, out, r0, r1); break;
-        case 22: dot_rows_nt<G ? 122 : 22>(nt, w, row_bytes, n, act, out, r0, r1); break;
-        case 23: dot_rows_nt<23>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 16: dot_rows_nt<16, EX>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 17: dot_rows_nt<17, EX>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 18: dot_rows_nt<G ? 118 : 18, EX>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 21: dot_rows_nt<G ? 121 : 21, EX>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 22: dot_rows_nt<G ? 122 : 22, EX>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 23: dot_rows_nt<23, EX>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 29: dot_rows_nt<29, EX>(nt, w, row_bytes, n, act, out, r0, r1); break;
         default: break;
     }
 }
