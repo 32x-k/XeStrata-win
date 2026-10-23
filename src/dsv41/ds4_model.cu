@@ -6247,6 +6247,18 @@ struct Model::Impl {
             std::fwrite(gb.data(), 4, gb.size(), dump_r);
             std::fflush(dump_r);
         }
+        if (mi == 0 && trace_f != nullptr && !l.mtp) {   // DS4_TRACE: a chunk's picks, u8 (layer | 0x80), u16 T, T x k int16 ids
+            std::vector<int> ri((size_t) T * kPicks);
+            CK(cudaMemcpy(ri.data(), c.ridx, ri.size() * 4, cudaMemcpyDeviceToHost));
+            std::lock_guard<std::mutex> lk(dump_mu);
+            const uint8_t hd[3] = {(uint8_t) (l.il | 0x80), (uint8_t) (T & 255), (uint8_t) (T >> 8)};
+            std::fwrite(hd, 1, 3, trace_f);
+            for (int t = 0; t < T; ++t)
+                for (int i = 0; i < l.k_exp; ++i) {
+                    const int16_t v = (int16_t) ri[(size_t) t * kPicks + i];
+                    std::fwrite(&v, 2, 1, trace_f);
+                }
+        }
         if (mi == 0) {   // the profile (the CPU lane's experts: by the plan's order)
             uint32_t* pr = prof.data() + (size_t) l.il * g.n_exp;
             for (int e = 0; e < l.n_exp; ++e) {
