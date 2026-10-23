@@ -251,6 +251,7 @@ static void bench_big(int type, int mib) {
 
 int main(int argc, char** argv) {
     std::vector<int> types = {16, 17, 22, 18, 21, 23, 29};
+    std::vector<int> devs;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--bench-big") {   // [types] [MiB]
             std::vector<int> bt; int mib = 640;
@@ -265,6 +266,8 @@ int main(int argc, char** argv) {
             else bt = types;
             for (int t : bt) bench(t);
             return 0;
+        } else if (std::string(argv[i]) == "--devices" && i + 1 < argc) {   // every check on each device in turn, in this process;
+            devs.clear(); for (const char* p = argv[++i]; *p;) { devs.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; }   // the later ones bit-compared to the first
         } else if (std::string(argv[i]) == "--dump" && i + 1 < argc) {
             g_dump = std::fopen(argv[++i], "wb"); if (!g_dump) { std::printf("cannot write %s\n", argv[i]); return 2; }
         } else if (std::string(argv[i]) == "--cmp" && i + 1 < argc) {
@@ -275,9 +278,21 @@ int main(int argc, char** argv) {
             gg::gg_cpu_set_iq256(std::atoi(argv[++i]));
         }
     }
+    int fails = 0;
+    if (devs.size() > 1) {   // the first device writes its outputs, the others compare to them
+        if (g_dump || g_cmp) { std::printf("--devices takes neither --dump nor --cmp\n"); return 2; }
+    }
+    for (size_t di = 0; di < std::max<size_t>(1, devs.size()); ++di) {
+    if (!devs.empty()) {
+        CK(hipSetDevice(devs[di]));
+        if (devs.size() > 1) {
+            if (g_dump) { std::fclose(g_dump); g_dump = nullptr; }
+            if (di == 0) g_dump = std::fopen("iq_devices.bin", "wb"); else { g_cmp = std::fopen("iq_devices.bin", "rb"); g_cmp_n = g_cmp_bad = 0; }
+        }
+        std::printf("---- device %d\n", devs[di]);
+    }
     std::mt19937_64 rng(11);
     std::normal_distribution<float> nd(0.f, 1.f);
-    int fails = 0;
     auto report = [&](const char* what, int type, double worst, double tol) {
         const bool ok = worst <= tol;
         std::printf("%-7s %-22s worst %.2e (tol %.0e) %s\n", iq::name(type), what, worst, tol, ok ? "ok" : "FAIL");
@@ -436,6 +451,8 @@ int main(int argc, char** argv) {
             }
         }
         CK(hipFree(dblob));
+    }
+    if (g_cmp && devs.size() > 1) { std::fclose(g_cmp); g_cmp = nullptr; std::printf("device %d vs device %d: %ld buffers, %ld differ\n", devs[di], devs[0], g_cmp_n, g_cmp_bad); fails += g_cmp_bad != 0; }
     }
     if (g_cmp) { std::printf("bit-compare vs golden: %ld buffers, %ld differ -> %s\n", g_cmp_n, g_cmp_bad, g_cmp_bad ? "DIFFERENT" : "IDENTICAL"); fails += g_cmp_bad != 0; }
     if (g_dump) std::fclose(g_dump);

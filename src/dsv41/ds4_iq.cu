@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 
@@ -144,10 +145,9 @@ struct Sub {
     float d, m0, m1;
     int s0, s1;
 };
+// (b: the block's address, ib: the sub-block in it (0 for the 32-value types); the token kernels keep ib fixed a lane)
 template <int T>
-__device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, const uint32_t* tab, Sub& s) {
-    const int ib = kb & 7;
-    const uint8_t* b = row + (size_t) (kQK<T> == 32 ? kb : kb >> 3) * Ty<T>::B;
+__device__ __forceinline__ void decode_b(const uint8_t* __restrict__ b, int ib, const uint32_t* tab, Sub& s) {
     if constexpr (T == kMXFP4) {   // codes: value j in byte j's low nibble, j + 16 in its high one (any alignment)
         const uint32_t t[4] = {0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu};   // ggml's kvalues_mxfp4
 #pragma unroll
@@ -341,6 +341,10 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         s.d = h2f(b + 108);
     }
 }
+template <int T>
+__device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, const uint32_t* tab, Sub& s) {
+    decode_b<T>(row + (size_t) (kQK<T> == 32 ? kb : kb >> 3) * Ty<T>::B, kb & 7, tab, s);
+}
 // the sub-block against 32 int8 activations (xa: values 0..15, xb: 16..31), before their scale: an exact integer dot,
 // its scales in F32 (explicit roundings: every instantiation the same bits)
 template <int T>
@@ -517,12 +521,10 @@ __device__ __forceinline__ void load_tab_fast(uint32_t* tab) {
     }
 }
 template <int T>
-__device__ __forceinline__ void decode_fast(const uint8_t* __restrict__ row, int kb, const uint32_t* tab, Sub& s) {
+__device__ __forceinline__ void decode_fast_b(const uint8_t* __restrict__ b, int ib, const uint32_t* tab, Sub& s) {
     if constexpr (Fast<T>::WORDS == 0) {
-        decode<T>(row, kb, tab, s);
+        decode_b<T>(b, ib, tab, s);
     } else if constexpr (T == kIQ1_M) {   // (56-byte blocks in 1120-byte rows at 256-aligned offsets: 8-byte aligned)
-        const int ib = kb & 7;
-        const uint8_t* b = row + (size_t) (kb >> 3) * Ty<T>::B;
         const uint32_t qsw = *(const uint32_t*) (b + 4 * ib);
         const uint32_t qhw = *(const uint16_t*) (b + 32 + 2 * ib);
         const uint2 sw = *(const uint2*) (b + 48);
@@ -586,6 +588,8 @@ constexpr int kGuRW = 1, kDnRW = 2;   // rows a warp: gate / up (n_embd 5120: 10
 template <int T, int NE, int RW = kGuRW>
 __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
     constexpr int LPR = 32 / RW;
+    constexpr int kBPS = kQK<T> == 32 ? 1 : 8, kStep = LPR / kBPS;   // sub-blocks a block; blocks a lane steps
+    static_assert(LPR % kBPS == 0, "a lane keeps one sub-block position");
     __shared__ __align__(16) uint32_t tab[kTabWords<T>];
     __shared__ int es[NE], xr[NE];
     const uint8_t* blob;
@@ -594,7 +598,7 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
     load_tab_fast<T>(tab);
     const int lane32 = threadIdx.x & 31;
     const size_t rb = row_bytes_t<T>(a.n_embd);
-    const int nsb = a.n_embd / 32;
+    const int nsb = a.n_embd / 32, nblk = nsb / kBPS;
     const int ntile = a.n_ff / (kWarps * RW);
     for (int mm = m0; mm < m1; mm += NE) {
         const int ne = min(NE, m1 - mm);
@@ -608,15 +612,18 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
         // (a persistent grid: blockIdx.x strides over the row tiles, the codebook is loaded once a block)
         for (int tile = blockIdx.x; tile < ntile; tile += gridDim.x) {
             const int row = (tile * kWarps + (threadIdx.x >> 5)) * RW + lane32 / LPR, lane = lane32 % LPR;
+            const int ib0 = kBPS == 8 ? lane & 7 : 0, blk0 = kBPS == 8 ? lane >> 3 : lane;
             const uint8_t* g = blob + a.tr[0] + (size_t) row * rb;
             const uint8_t* u = blob + a.tr[1] + (size_t) row * rb;
             float ag[NE], au[NE];
 #pragma unroll
             for (int i = 0; i < NE; ++i) ag[i] = au[i] = 0.0f;
-            for (int kb = lane; kb < nsb; kb += LPR) {
+            // a lane's sub-blocks: kb = lane + LPR j = 8 blk + ib with ib fixed (the 32-value types: blk = kb)
+            for (int blk = blk0; blk < nblk; blk += kStep) {
+                const int kb = blk * kBPS + ib0;
                 Sub sg, su;
-                decode_fast<T>(g, kb, tab, sg);
-                decode_fast<T>(u, kb, tab, su);
+                decode_fast_b<T>(g + (size_t) blk * Ty<T>::B, ib0, tab, sg);
+                decode_fast_b<T>(u + (size_t) blk * Ty<T>::B, ib0, tab, su);
 #pragma unroll
                 for (int i = 0; i < NE; ++i)
                     if (i < ne) {
@@ -641,6 +648,8 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
 template <int T, int NE, int RW = kDnRW>
 __global__ void __launch_bounds__(kThreads) down_kernel(const Args a) {
     constexpr int LPR = 32 / RW;
+    constexpr int kBPS = kQK<T> == 32 ? 1 : 8, kStep = LPR / kBPS;   // sub-blocks a block; blocks a lane steps
+    static_assert(LPR % kBPS == 0, "a lane keeps one sub-block position");
     __shared__ __align__(16) uint32_t tab[kTabWords<T>];
     __shared__ int es[NE];
     const uint8_t* blob;
@@ -648,7 +657,7 @@ __global__ void __launch_bounds__(kThreads) down_kernel(const Args a) {
     if (!group(a, blockIdx.y, blob, m0, m1)) return;
     load_tab_fast<T>(tab);
     const int lane32 = threadIdx.x & 31;
-    const int nsb = a.n_ff / 32;
+    const int nsb = a.n_ff / 32, nblk = nsb / kBPS;
     const int ntile = a.n_embd / (kWarps * RW);
     for (int mm = m0; mm < m1; mm += NE) {
         const int ne = min(NE, m1 - mm);
@@ -657,13 +666,15 @@ __global__ void __launch_bounds__(kThreads) down_kernel(const Args a) {
         __syncthreads();
         for (int tile = blockIdx.x; tile < ntile; tile += gridDim.x) {
             const int row = (tile * kWarps + (threadIdx.x >> 5)) * RW + lane32 / LPR, lane = lane32 % LPR;
+            const int ib0 = kBPS == 8 ? lane & 7 : 0, blk0 = kBPS == 8 ? lane >> 3 : lane;
             const uint8_t* d = blob + a.tr[2] + (size_t) row * row_bytes_t<T>(a.n_ff);
             float ad[NE];
 #pragma unroll
             for (int i = 0; i < NE; ++i) ad[i] = 0.0f;
-            for (int kb = lane; kb < nsb; kb += LPR) {
+            for (int blk = blk0; blk < nblk; blk += kStep) {
+                const int kb = blk * kBPS + ib0;
                 Sub sd;
-                decode_fast<T>(d, kb, tab, sd);
+                decode_fast_b<T>(d + (size_t) blk * Ty<T>::B, ib0, tab, sd);
 #pragma unroll
                 for (int i = 0; i < NE; ++i)
                     if (i < ne) {
@@ -980,14 +991,20 @@ bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later, STRATA_DS4_NO_TC=1 keeps 
 #if defined(STRATA_USE_HIP)
     return false;
 #else
-    static const bool ok = [] {
-        int dev = 0, major = 0;
-        cudaGetDevice(&dev);
+    // (per device: the cards of a multi-GPU run need not be the same generation)
+    static std::atomic<int> state[16];   // 0: unknown, 1: tensor cores, 2: the F32 kernel
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) return false;
+    int v = state[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        int major = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        const char* v = std::getenv("STRATA_DS4_NO_TC");
-        return major >= 7 && !(v != nullptr && v[0] == '1');
-    }();
-    return ok;
+        const char* e = std::getenv("STRATA_DS4_NO_TC");
+        v = major >= 7 && !(e != nullptr && e[0] == '1') ? 1 : 2;
+        state[dev].store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
 #endif
 }
 
@@ -1080,10 +1097,12 @@ struct LightBuf {
     size_t cap = 0;
 };
 std::mutex g_lmu;
-std::unordered_map<cudaStream_t, LightBuf> g_light;
+std::map<std::pair<int, cudaStream_t>, LightBuf> g_light;   // (device, stream): the default stream 0 is one handle on every device
 LightBuf* light_buf(cudaStream_t s, int k) {
     std::lock_guard<std::mutex> lk(g_lmu);
-    LightBuf& b = g_light[s];
+    int dev = 0;
+    cudaGetDevice(&dev);
+    LightBuf& b = g_light[{dev, s}];
     const size_t need = (size_t) kLightMaxExp * kLightRows * (size_t) std::max(k, 8192);
     if (b.cap < need) {
         if (b.q != nullptr) cudaFree(b.q);
