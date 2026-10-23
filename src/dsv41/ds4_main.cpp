@@ -74,7 +74,7 @@ void usage() {
     std::fprintf(stderr,
                  "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]\n"
-                 "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
+                 "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"
@@ -781,6 +781,7 @@ int main(int argc, char** argv) {
             o.dspark = v != "none";   // none: not even loaded
             o.dspark_auto = v == "auto";
         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
+        else if (a == "--dspark-block") o.dspark_block = std::max(0, std::atoi(val("--dspark-block").c_str()));
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
         else if (a == "--prefill-chunk") o.prefill_chunk = std::max(0, std::atoi(val("--prefill-chunk").c_str()));
         else if (a == "--threads") o.threads = val("--threads") != "off";
@@ -930,6 +931,8 @@ int main(int argc, char** argv) {
                      (long long) s0.eg_rows, 100.0 * (double) s0.eg_hits / (double) s0.eg_rows, (long long) s0.eg_reads);
     const long long io0 = io_read_bytes();
     std::vector<int> out;
+    std::vector<double> tok_ms;   // (DS4_TOKLOG: each token's time since the one before - the latency ledger)
+    double t_prev = t1;
     unsigned long long counter = 0;
     long long d_off = 0, d_acc = 0, rounds = 0;
     bool cool = false;
@@ -938,6 +941,11 @@ int main(int argc, char** argv) {
         std::vector<int> got;
         for (;;) {
             out.push_back(tok);
+            {
+                const double tn = now_ms();
+                tok_ms.push_back(tn - t_prev);
+                t_prev = tn;
+            }
             std::printf("%d,", tok);
             std::fflush(stdout);
             if ((tok == 1 && std::getenv("DS4_NO_EOS") == nullptr) || (int) out.size() >= n) break;   // (DS4_NO_EOS: decode n tokens whatever)
@@ -969,6 +977,13 @@ int main(int argc, char** argv) {
                      rounds, d_off, d_acc, (double) out.size() / (double) rounds, (s1.draft_ms - s0.draft_ms) / nv,
                      s1.verify_ms - s0.verify_ms, (long long) (s1.drafts_offered > 0 ? 0 : 0));
         std::fprintf(stderr, "dspark %s\n", per_position(s0, s1).c_str());
+    }
+    if (std::getenv("DS4_TOKLOG") != nullptr && tok_ms.size() > 8) {   // the decode's tokens after the first (which carries the prompt's tail)
+        std::vector<double> v(tok_ms.begin() + 1, tok_ms.end());
+        std::sort(v.begin(), v.end());
+        std::fprintf(stderr, "token latency ms: p50 %.0f p95 %.0f p99 %.0f max %.0f mean %.0f (%zu tokens)\n", v[v.size() / 2],
+                     v[(size_t) ((double) v.size() * 0.95)], v[(size_t) ((double) v.size() * 0.99)], v.back(),
+                     std::accumulate(v.begin(), v.end(), 0.0) / (double) v.size(), v.size());
     }
     const double t2 = now_ms();
     const auto& s = m.stats();

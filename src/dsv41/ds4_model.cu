@@ -1942,6 +1942,7 @@ struct Model::Impl {
             }
         }
         if (!o.dspark) g.n_mtp = 0;
+        if (o.dspark_block > 0 && std::getenv("DS4_DSPARK_MAX") == nullptr) max_drafts = o.dspark_block;   // (--dspark-block N: at most N drafts a round)
         L.resize((size_t) (g.nl + g.n_mtp));
         int last_src = -1;
         for (int il = 0; il < g.nl + g.n_mtp; ++il) {
