@@ -22,6 +22,10 @@
 #endif
 #include <windows.h>
 #include <psapi.h>   // (K32QueryWorkingSetEx: kernel32's, no psapi.lib)
+#include <timeapi.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "winmm.lib")
+#endif
 #else
 #include <fcntl.h>
 #include <pthread.h>
@@ -33,6 +37,17 @@
 #endif
 
 namespace strata::ds4::os {
+
+/// Windows sleeps in 15.6 ms ticks unless a process asks for finer ones: the CPU lane's service thread naps (sleep_for 20 us)
+/// between tokens, and the device's first wait of the next token then waits out the tick.  1 ms for the process's life
+/// (Project Maya #358); DS4_TIMER_MS=0 leaves the system's resolution alone.  Elsewhere nothing.
+inline void fine_timer() {
+#if defined(_WIN32)
+    const char* v = std::getenv("DS4_TIMER_MS");
+    const int ms = v != nullptr ? std::atoi(v) : 1;
+    if (ms > 0) timeBeginPeriod((UINT) ms);
+#endif
+}
 
 using fd_t = intptr_t;
 constexpr fd_t kBadFd = -1;

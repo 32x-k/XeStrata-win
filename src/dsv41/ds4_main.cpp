@@ -13,6 +13,7 @@
 // that prompt's end; anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
 // (the file: see read_pics); the state is shared only where the same picture sits at the same place.
 #include "ds4_model.hpp"
+#include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
 
 #include <algorithm>
@@ -740,6 +741,7 @@ int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int win
 #endif
 
 int main(int argc, char** argv) {
+    strata::ds4::os::fine_timer();
     strata::ds4::Options o;
     std::string ids_s, dump, eos = "1";
     int n = 0, window = 0;   // (0: the model's feed unit - a whole prompt on the chunked path; 16 for the scoring runs)
