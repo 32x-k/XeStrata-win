@@ -14,6 +14,10 @@
 #include <string>
 #include <vector>
 
+#if defined(_MSC_VER)
+#include <cstring>
+#define strtok_r strtok_s
+#endif
 namespace strata::ds4 {
 namespace {
 

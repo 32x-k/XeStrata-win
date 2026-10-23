@@ -1272,9 +1272,24 @@ __global__ void __launch_bounds__(1024) confidence_kernel(const float* __restric
 }
 
 // ---------------------------------------------------------------- engram
+// ggml's kvalues_iq4nl (the Engram tables of the IST-DAS sets are IQ4_NL: blocks of 32 values, F16 d + 16 bytes of nibbles)
+__device__ __forceinline__ float iq4nl_value(const uint8_t* __restrict__ row, int e) {
+    static constexpr int8_t kv[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+    const uint8_t* b = row + (size_t) (e >> 5) * 18;
+    const int j = e & 31;
+    const int nib = j < 16 ? (b[2 + j] & 0xf) : (b[2 + j - 16] >> 4);
+    const float d = __half2float(__ushort_as_half((unsigned short) (b[0] | (b[1] << 8))));
+    return __fmul_rn(d, (float) kv[nib]);
+}
+
 __global__ void engram_dequant_kernel(const uint8_t* __restrict__ rows, const uint8_t* __restrict__ scales, int hd,
-                                      float* __restrict__ out, bool q6k) {
+                                      float* __restrict__ out, int fmt) {
     const int r = blockIdx.x;
+    const bool q6k = fmt == 1;
+    if (fmt == 2) {
+        for (int e = threadIdx.x; e < hd; e += blockDim.x) out[(size_t) r * hd + e] = iq4nl_value(rows + (size_t) r * hd, e);
+        return;
+    }
     if (q6k) {   // (ggml Q6_K superblocks at the row's start)
         for (int e = threadIdx.x; e < hd; e += blockDim.x)
             out[(size_t) r * hd + e] = q6k_value(rows + (size_t) r * hd + (size_t) (e / 256) * kQ6kBytes, e % 256);
@@ -1685,10 +1700,15 @@ __global__ void __launch_bounds__(kThreads) hc_mix_scale_kernel(const float* __r
 }
 
 __global__ void engram_dequant_tok_kernel(const uint8_t* __restrict__ src, size_t per, int cols, int hd,
-                                          float* __restrict__ out, bool q6k) {
+                                          float* __restrict__ out, int fmt) {
     const int r = blockIdx.x, t = r / cols, c = r - t * cols;
     const uint8_t* rows = src + (size_t) t * per + (size_t) c * hd;
     const uint8_t* scales = src + (size_t) t * per + (size_t) cols * hd + (size_t) c * (hd / 32);
+    const bool q6k = fmt == 1;
+    if (fmt == 2) {
+        for (int e = threadIdx.x; e < hd; e += blockDim.x) out[(size_t) r * hd + e] = iq4nl_value(rows, e);
+        return;
+    }
     if (q6k) {   // (ggml Q6_K superblocks at the row's start)
         for (int e = threadIdx.x; e < hd; e += blockDim.x)
             out[(size_t) r * hd + e] = q6k_value(rows + (size_t) (e / 256) * kQ6kBytes, e % 256);
@@ -1856,7 +1876,7 @@ void hc_post_inplace(const float* y, float* h, const float* post, const float* c
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
     hc_mix_scale_kernel<<<T, kThreads, 0, s>>>(h, hcdim, n_mix, eps, mixes);
 }
-void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s, bool q6k) {
+void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s, int q6k) {
     if (T > 0) engram_dequant_tok_kernel<<<T * cols, kThreads, 0, s>>>(src, per, cols, hd, out, q6k);
 }
 void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos,
@@ -2053,7 +2073,7 @@ void confidence(const float* x, const uint16_t* E, const int* tok, const float* 
     confidence_kernel<<<T, 1024, 0, s>>>(x, E, tok, w, dim, R, out);
 }
 
-void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, bool q6k) {
+void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, int q6k) {
     engram_dequant_kernel<<<n, kThreads, 0, s>>>(rows, scales, hd, out, q6k);
 }
 

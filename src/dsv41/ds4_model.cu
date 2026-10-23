@@ -2343,12 +2343,18 @@ struct Model::Impl {
                 eg_win.emplace_back(new EgBatch());
                 const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
                 const bool q6k = tw != nullptr && tw->dtype == "Q6_K";
+                const bool iq4 = tw != nullptr && tw->dtype == "IQ4_NL";   // (the IST-DAS sets' tables: 32-value blocks of 18 bytes)
+                if (iq4 && pk.eg_hd % 32 != 0) {
+                    err = "Engram layer " + std::to_string(g.eg_layers[(size_t) li]) + ": IQ4_NL rows of " +
+                          std::to_string(pk.eg_hd) + " values (not whole blocks of 32)";
+                    return false;
+                }
                 if (q6k && pk.eg_hd % 256 != 0) {
                     err = "Engram layer " + std::to_string(g.eg_layers[(size_t) li]) + ": Q6_K rows of " +
                           std::to_string(pk.eg_hd) + " values (not whole superblocks of 256)";
                     return false;
                 }
-                eg_q6k.push_back(q6k ? 1 : 0);
+                eg_q6k.push_back(q6k ? 1 : iq4 ? 2 : 0);
             }
             if (o.verbose)
                 std::fprintf(stderr, "ds4: Engram rows read on %d threads, issued with the tokens, collected before "
@@ -4432,7 +4438,8 @@ struct Model::Impl {
         const Tensor* tw = pk.get(P + "weight");
         const Tensor* ts = pk.get(P + "scale");
         const bool mx8 = tw->dtype == "MXFP8";   // (a GGUF: the scales between the codes, one per 32)
-        const bool q6k = eg_q6k[(size_t) li] != 0;   // (a GGUF: one Q6_K superblock a 256 values, its scales inside)
+        const bool q6k = eg_q6k[(size_t) li] == 1;   // (a GGUF: one Q6_K superblock a 256 values, its scales inside)
+        const bool iq4 = eg_q6k[(size_t) li] == 2;   // (a GGUF: IQ4_NL blocks of 32 values: F16 d, 16 nibble bytes)
         std::unordered_map<uint64_t, int> first;   // a row this batch reads already -> its read
         int64_t hits = 0;
         {
@@ -4482,8 +4489,8 @@ struct Model::Impl {
                             r.mx8 = true;
                             r.n = (uint32_t) (hd / 32 * 33);
                             r.off = tw->off + (uint64_t) id * r.n;
-                        } else if (q6k) {   // (into the row's code bytes; its scale bytes unused)
-                            r.n = (uint32_t) (hd / 256 * 210);
+                        } else if (q6k || iq4) {   // (into the row's code bytes; its scale bytes unused)
+                            r.n = (uint32_t) (q6k ? hd / 256 * 210 : hd / 32 * 18);
                             r.off = tw->off + (uint64_t) id * r.n;
                         } else {
                             r.n = (uint32_t) hd;
@@ -5795,7 +5802,7 @@ struct Model::Impl {
             CK(cudaEventRecord(c.eg_ev[slot], s));
             for (int s0 = 0; s0 < T; s0 += 256) {
                 const int ns = std::min(256, T - s0);
-                engram_dequant_tok(c.eg_rows + (size_t) s0 * per, per, cols, ns, ehd, c.eg_x, s, eg_q6k[(size_t) l.eg] != 0);
+                engram_dequant_tok(c.eg_rows + (size_t) s0 * per, per, cols, ns, ehd, c.eg_x, s, (int) eg_q6k[(size_t) l.eg]);
                 x3::rows_f16(c.eg_x, cols * ehd, nullptr, ns, cols * ehd, c.eg_x16, s);
                 if (!gemm(d, c, l.eg_wkv, c.eg_x16, cols * ehd, ns, c.eg_kv, (H + 1) * D, 0.0f, err)) return false;
                 engram_gate(c.h + (size_t) s0 * H * D, c.eg_kv, l.eg_w, H, D, ns, g.eps, s);
@@ -7320,7 +7327,7 @@ struct Model::Impl {
             for (int t = 0; t < T; ++t)
                 CK(cudaMemcpyAsync(sc + (size_t) t * cols * (ehd / 32), src + (size_t) t * per + (size_t) cols * ehd,
                                    (size_t) cols * (ehd / 32), cudaMemcpyHostToDevice, s));
-            engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, eg_q6k[(size_t) l.eg] != 0);
+            engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, (int) eg_q6k[(size_t) l.eg]);
             if (!mv(d, {job(l.eg_wkv, d.eg_x, d.eg_kv, T, (size_t) cols * ehd, (size_t) (H + 1) * D)}, err)) return false;
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
         }

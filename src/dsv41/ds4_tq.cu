@@ -25,6 +25,9 @@
 #define DS4_TQ_WMMA 1
 #endif
 
+#if !defined(STRATA_USE_HIP) && defined(__CUDACC__)   // (HIP's non-sync shuffle name, for the portable lane on CUDA)
+#define __shfl_xor(v, m) __shfl_xor_sync(0xffffffffu, (v), (m))
+#endif
 namespace strata::ds4::gguf::iq::tq {
 namespace {
 

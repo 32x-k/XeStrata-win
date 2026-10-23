@@ -795,9 +795,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_link_libraries(ds4_gg_bench PRIVATE strata_kernels_cpu Threads::Threads)
       target_compile_definitions(ds4_gg_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
     endif()
+    set(_strata_dsv41_test_lang CUDA)
+    if(STRATA_ENABLE_HIP)
+      set(_strata_dsv41_test_lang HIP)
+    endif()
     if(STRATA_NATIVE_EXPERTS)
       # the trellis experts (device kernels ds4_tq.cu, CPU lane ds4_tq_cpu.cpp) against a double reference; needs a GPU, no model
-      set_source_files_properties(tests/dsv41/tq_expert_test.cpp PROPERTIES LANGUAGE HIP)
+      set_source_files_properties(tests/dsv41/tq_expert_test.cpp PROPERTIES LANGUAGE ${_strata_dsv41_test_lang})
       add_executable(ds4_tq_test tests/dsv41/tq_expert_test.cpp src/dsv41/ds4_tq.cu src/dsv41/ds4_iq.cu src/dsv41/ds4_tq_cpu.cpp
                      src/dsv41/ds4_iq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp tools/trellis/tqenc.cpp)
       target_include_directories(ds4_tq_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
@@ -819,7 +823,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       endif()
       # the i-quant experts (ds4_iq.cu) against ggml's own decode of the same blocks + a double reference, device and CPU
       # lane, for every type the device takes: the gate a new type (IQ2_XS ..) has to pass before the engine uses it
-      set_source_files_properties(tests/dsv41/iq_expert_test.cpp PROPERTIES LANGUAGE HIP)
+      set_source_files_properties(tests/dsv41/iq_expert_test.cpp PROPERTIES LANGUAGE ${_strata_dsv41_test_lang})
       add_executable(ds4_iq_test tests/dsv41/iq_expert_test.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
                      src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp)
       target_include_directories(ds4_iq_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}

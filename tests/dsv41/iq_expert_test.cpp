@@ -3,11 +3,15 @@
 // (grouped entries), the prompt sets (gate/up and down), and the CPU lane on the same experts.  Random legal blocks: any
 // bit pattern with a sane F16 scale is one.  This is the H2 gate for a new type (IQ2_XS first): the kernel's integer sums
 // must equal ggml's weights times the same activations.
-//   iq_expert_test [--type 16,17,18,21,22,23] [--bench] [--iq256 0|1]
+//   iq_expert_test [--type 16,17,18,21,22,23,29] [--bench] [--iq256 0|1]
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
 #include "../../src/dsv41/ds4_iq.cuh"
 
+#if defined(__CUDACC__) || defined(STRATA_DSV41_TEST_CUDA)
+#include "hip_as_cuda.h"
+#else
 #include <hip/hip_runtime.h>
+#endif
 
 #include "ggml.h"   // ggml_get_type_traits(type)->to_float: ggml's decode of the same blocks
 
@@ -92,6 +96,11 @@ static Mat make_mat(std::mt19937_64& rng, int type, int rows, int k) {
     for (auto& b : m.bytes) b = (uint8_t) rng();
     for (size_t b = 0; b < nblk; ++b) {   // a sane F16 scale in the first two bytes (every type here has d at offset 0)
         const uint16_t d = f2h(0.02f + 0.0002f * (float) (rng() % 600));
+        if (type == 29) {   // IQ1_M has no d field: F16 d is spread over the top nibbles of its four u16 scale words (bytes 48..55)
+            uint8_t* sc = &m.bytes[b * (size_t) bb + 48];
+            for (int i = 0; i < 4; ++i) sc[2 * i + 1] = (uint8_t) ((sc[2 * i + 1] & 0x0f) | (((d >> (4 * i)) & 15) << 4));
+            continue;
+        }
         std::memcpy(&m.bytes[b * (size_t) bb], &d, 2);
     }
     m.w.resize((size_t) rows * k);
@@ -137,7 +146,7 @@ static void bench(int type) {
 }
 
 int main(int argc, char** argv) {
-    std::vector<int> types = {16, 17, 22, 18, 21, 23};
+    std::vector<int> types = {16, 17, 22, 18, 21, 23, 29};
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--bench") {
             std::vector<int> bt;

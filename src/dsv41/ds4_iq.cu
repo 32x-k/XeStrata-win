@@ -37,7 +37,7 @@ template <> struct Ty<kQ4_K> { static constexpr int B = 144, TAB = 0, MIN = 1; }
 // The types with a known layout and no device kernel (the CPU lane's ggml dots take them): their row bytes are needed to
 // lay a pack out, nothing else.  Ty<> gives the block; the kernels are never instantiated for them.
 template <> struct Ty<kIQ1_S> { static constexpr int B = 50, TAB = 2048, MIN = 0; };
-template <> struct Ty<kIQ1_M> { static constexpr int B = 56, TAB = 2048, MIN = 0; };
+template <> struct Ty<kIQ1_M> { static constexpr int B = 56, TAB = 2048, MIN = 0; };   // (the device kernels: ggml's iq1s_grid_gpu, a u32 of eight 4-bit grid+1 values)
 template <> struct Ty<kIQ4_NL> { static constexpr int B = 18, TAB = 16, MIN = 0; };
 template <> struct Ty<kQ2_K> { static constexpr int B = 84, TAB = 0, MIN = 1; };
 template <> struct Ty<kQ3_K> { static constexpr int B = 110, TAB = 0, MIN = 0; };
@@ -71,6 +71,7 @@ __device__ __forceinline__ void load_tab(uint32_t* tab) {
                               : T == kIQ2_XS ? (const uint32_t*) iq2xs_grid
                               : T == kIQ2_S   ? (const uint32_t*) iq2s_grid
                               : T == kIQ3_XXS ? (const uint32_t*) iq3xxs_grid
+                              : T == kIQ1_M   ? (const uint32_t*) iq1s_grid_gpu
                                               : (const uint32_t*) iq3s_grid;
         for (int i = threadIdx.x; i < Ty<T>::TAB; i += blockDim.x) tab[i] = src[i];
     }
@@ -197,6 +198,27 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         }
         s.s0 = s.s1 = 2 * (int) (aux >> 28) + 1;
         s.d = h2f(b) * 0.25f;
+    } else if constexpr (T == kIQ1_M) {   // qs[32], qh[16], scales u16[4] (four 3-bit scales each; their top nibbles are d)
+        // weight = d (2 sc + 1) (grid + delta), grid in {-1, 0, 1}, delta = +-1/8: with 8 (grid + delta) = 8 v - 8 +- 1 (v =
+        // grid + 1, the table's nibbles: values 0..3 are nibbles 0,2,4,6 and 4..7 nibbles 1,3,5,7) as an int8 every 8-value
+        // group is an exact integer code, and d / 8 is the scale
+        const uint16_t* scp = (const uint16_t*) (b + 48);
+        const uint32_t sc = (uint32_t) scp[ib >> 1] >> (6 * (ib & 1));
+        const uint8_t* qs = b + 4 * ib;
+        const uint8_t* qh = b + 32 + 2 * ib;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t h = (uint32_t) qh[l >> 1] >> (4 * (l & 1));
+            const uint32_t e = tab[(uint32_t) qs[l] | ((h & 7u) << 8)];
+            const uint32_t dl = (h & 8u) ? 0xf7f7f7f7u : 0xf9f9f9f9u;   // -8 -+ 1 in each byte
+            s.q[2 * l] = (int) __vadd4((e & 0x0f0f0f0fu) << 3, dl);
+            s.q[2 * l + 1] = (int) __vadd4(((e >> 4) & 0x0f0f0f0fu) << 3, dl);
+        }
+        s.s0 = 2 * (int) (sc & 7u) + 1;
+        s.s1 = 2 * (int) ((sc >> 3) & 7u) + 1;
+        const uint32_t du = ((uint32_t) scp[0] >> 12) | (((uint32_t) scp[1] >> 8) & 0x00f0u) | (((uint32_t) scp[2] >> 4) & 0x0f00u) |
+                            ((uint32_t) scp[3] & 0xf000u);
+        s.d = __half2float(__ushort_as_half((unsigned short) du)) * 0.125f;
     } else if constexpr (T == kIQ3_S) {
         const uint8_t* qs = b + 2;
         const uint32_t w0 = ld2(qs + 8 * ib), w1 = ld2(qs + 8 * ib + 4), h = b[66 + ib], s4 = ld2(b + 74 + 4 * ib);
@@ -349,6 +371,20 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
         for (int j = 0; j < 8; ++j) {
             const float gv = (float) ((j < 4 ? g.x >> (8 * j) : g.y >> (8 * (j - 4))) & 255u);
             w[j] = (sg >> j) & 1u ? -(dl * gv) : dl * gv;
+        }
+    } else if constexpr (T == kIQ1_M) {
+        const uint16_t* scp = (const uint16_t*) (b + 48);
+        const uint32_t sc = (uint32_t) scp[ib >> 1] >> (6 * (ib & 1));
+        const uint32_t h = (uint32_t) b[32 + 2 * ib + (p >> 1)] >> (4 * (p & 1));
+        const uint32_t e = tab[(uint32_t) b[4 * ib + p] | ((h & 7u) << 8)];
+        const uint32_t du = ((uint32_t) scp[0] >> 12) | (((uint32_t) scp[1] >> 8) & 0x00f0u) | (((uint32_t) scp[2] >> 4) & 0x0f00u) |
+                            ((uint32_t) scp[3] & 0xf000u);
+        const float dl = __half2float(__ushort_as_half((unsigned short) du)) * (float) (2 * (int) ((sc >> (p < 2 ? 0 : 3)) & 7u) + 1);
+        const float delta = (h & 8u) ? -0.125f : 0.125f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int gv = (int) (((j < 4 ? e : e >> 4) >> (8 * (j & 3))) & 15u) - 1;
+            w[j] = dl * ((float) gv + delta);
         }
     } else if constexpr (T == kIQ3_XXS || T == kIQ3_S) {
         const uint8_t* qs = b + 2;
@@ -854,6 +890,7 @@ bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later, STRATA_DS4_NO_TC=1 keeps 
     switch (t) {                     \
         case kIQ2_XXS: F(kIQ2_XXS); break; \
         case kIQ2_XS: F(kIQ2_XS); break;   \
+        case kIQ1_M: F(kIQ1_M); break;     \
         case kIQ2_S: F(kIQ2_S); break;     \
         case kIQ3_XXS: F(kIQ3_XXS); break; \
         case kIQ3_S: F(kIQ3_S); break;     \
@@ -975,7 +1012,7 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
 bool supported(int t) {
     // the types the kernels below are instantiated for (DS4_IQ_SWITCH + the trellis ones + the dense K-quants)
     switch (t) {
-        case kIQ2_XXS: case kIQ2_XS: case kIQ2_S: case kIQ3_XXS: case kIQ3_S: case kIQ4_XS:
+        case kIQ2_XXS: case kIQ2_XS: case kIQ2_S: case kIQ3_XXS: case kIQ3_S: case kIQ4_XS: case kIQ1_M:
         case kQ4_K: case kQ5_K: case kQ6_K: case kQ2_K: case kQ3_K:
             return true;
         default:
