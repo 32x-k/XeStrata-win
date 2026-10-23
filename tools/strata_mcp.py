@@ -1221,7 +1221,7 @@ class Strata:
                     verdict = "fits" if have_gb >= d["ram_gb"] else "tight" if have_gb >= d["ram_gb"] - 8 else "does not fit"
                     try:
                         if own and own.get("multi_file"):       # DeepSeek-V4.1-Flash: strata_control/dsv41_fit.py (cards + RAM, the n-gram table on the SSD)
-                            verdict = self.dsv41_words(hw, m)
+                            verdict = self.dsv41_words(hw, m, installed=tag in have)
                         elif own:                       # its own engine path: no budget or low-RAM mode of Flash-Next's to judge by
                             pass
                         elif d.get("budget") and S and hasattr(S, "unsloth_budget") and not S.unsloth_budget(m, ram):
@@ -1269,8 +1269,20 @@ class Strata:
             cards = [c for c in cards if int(c.get("index", -1)) in {int(i) for i in only}]
         return dsv41_fit.plan(cards, (hw or {}).get("ram_gb"), disk_free, vendor=(hw or {}).get("engine_vendor"), model=model)
 
-    def dsv41_words(self, hw, model=None) -> str:
-        """The catalog's `on_this_pc` text for DeepSeek-V4.1-Flash (strata_cli/launch/catalog.verdict reads its first words)."""
+    def dsv41_words(self, hw, model=None, installed: bool = False) -> str:
+        """The catalog's `on_this_pc` text for DeepSeek-V4.1-Flash, with the disk it needs (download and preparation) beside the memory: a set that
+        fits in memory but not on the disk is "tight", never refused (strata_cli/launch/catalog.verdict reads its first words)."""
+        words = self._dsv41_memory_words(hw, model)
+        free = (hw or {}).get("disk_free_gb")
+        if installed or free is None or words.startswith("does not fit"):
+            return words
+        pl = self.dsv41_plan(hw, free, model=model)
+        if pl.get("disk_ok") is False:
+            return (f"tight: it needs about {pl['disk_need_gb']:.0f} GB of free disk space (the download and its preparation) and this computer has "
+                    f"{free:.0f} GB free; free some space or choose another drive when you install it ({words})")
+        return words
+
+    def _dsv41_memory_words(self, hw, model=None) -> str:
         pl = self.dsv41_plan(hw, model=model)
         v = pl["verdict"]
         if v == "no_card":

@@ -71,8 +71,39 @@ The server speaks to the engine as it does for the other models, so `/v1/chat/co
   A value marked `string="true"` stays a string.
 - Defaults when a request names none: temperature 1.0, top_p 1.0.
 
-Pictures and the DSpark drafter are in the engine (strata-dsv41 reads them from the unsloth mmproj and dspark files beside the model; the server side is not wired yet). Not in this version: several requests at once (`--parallel` is ignored with a note), tuning
-(`--tune` is skipped with a note).
+Not in this version: several requests at once (`--parallel` is ignored with a warning) and pictures (`--vision` is ignored with a warning).
+
+## Tuning
+
+`strata launch --tune quick` (or `thorough`, or the Tuning screen) works for DeepSeek with its own short tuner, `tools/dsv41/tune.py`. It starts
+the engine a few times on a fixed short question and measures the answer speed: the standard settings first, then the DSpark drafter forced on,
+then a shorter draft block (3), then one CPU thread for each physical core (thorough also tries every logical thread). A setting is kept only for a
+gain of more than 5%, and the result is written into the launch's settings. Expect about 5 to 10 minutes (each run loads the model, which takes
+1 to 3 minutes); close other heavy programs first. If a run fails or the computer is too busy to tell, the standard settings stay and one plain line
+says so. The RAM store (`--ssd-cache`) sizes itself when the model starts, so the tuner does not touch it, and the context stays what you chose.
+
+## The engine package
+
+DeepSeek's engine, `strata-dsv41`, is a separate download from the Strata engine: when you choose DeepSeek, setup (or `strata launch`) fetches the
+package for your computer from the signed update feed (resumable, signature and every file checked) and installs it in `engine-dsv41/` beside
+`engine/`. The Qwen engine's files are never changed. If the feed has no package for your graphics card, setup says so in plain words and stops before
+anything big is downloaded.
+
+### Getting the engine by hand
+
+If the automatic download does not work for you (no access to the update feed, or an offline computer), download the engine package yourself from
+the release page: the file is named `strata-dsv41-<version>-<system>-<backend>-<variant>.tar.gz` (Windows and Linux; pick the one for your system and
+graphics card). Check it against `SHA256SUMS.txt` on the release page if you like. Then give it to Strata in either of two ways:
+
+```
+strata launch --model ist-das-2.00bpw --dsv41-package PATH-TO-THE-FILE
+python setup.py --family deepseek41 --dsv41-package PATH-TO-THE-FILE
+```
+
+or put the file in the `engine-dsv41/` folder (setup tells you its exact place when it cannot find the engine) and run the same command again.
+Strata checks the package before it uses it: it must be the DeepSeek engine (not the Strata engine) for your system, its manifest must be signed by a key
+Strata trusts, and every file must match the hash in the manifest. A damaged or foreign file is refused with a plain line and nothing is installed.
+The unpacked folder works as well as the archive. The Strata (Qwen) engine is not touched either way.
 
 ## Compressed experts (trellis), for testing
 

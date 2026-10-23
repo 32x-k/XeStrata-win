@@ -130,5 +130,74 @@ class Dsv41Engine(unittest.TestCase):
         self.assertFalse((self.root / "data" / "engine-dsv41").exists() and any((self.root / "data" / "engine-dsv41").iterdir()))
 
 
+class ManualPackage(Dsv41Engine):
+    """A package the person downloaded by hand: a .tar.gz / .zip or the unpacked folder, checked before it is installed."""
+
+    def archive(self, version="0.1.49"):
+        folder = build(self.root / f"man-{version}", version, self.key)
+        out = self.root / "dl"
+        out.mkdir(exist_ok=True)
+        entry = feed_tool.pack_engine(folder, out, prefix="strata-dsv41")
+        return folder, out / Path(entry["url"]).name
+
+    def test_a_downloaded_archive_is_checked_and_installed_beside_the_engine(self):
+        _folder, archive = self.archive()
+        lines = []
+        exe = dsv41_engine.install_package(self.root / "data" / "engine-dsv41", archive, emit=lines.append)
+        self.assertIsNotNone(exe, lines)
+        self.assertTrue(exe.is_file())
+        self.assertIn("signed, every file matches", " ".join(lines))
+        self.assertEqual(self.tree(self.eng), self.before)
+
+    def test_an_unpacked_folder_works_too(self):
+        folder, _ = self.archive()
+        exe = dsv41_engine.install_package(self.root / "data" / "engine-dsv41", folder)
+        self.assertIsNotNone(exe)
+
+    def test_a_damaged_file_is_refused_and_nothing_is_installed(self):
+        folder, _ = self.archive()
+        (folder / EXE).write_bytes(b"tampered")
+        lines = []
+        self.assertIsNone(dsv41_engine.install_package(self.root / "data" / "engine-dsv41", folder, emit=lines.append))
+        self.assertIn("did not pass its check", " ".join(lines))
+        dest = self.root / "data" / "engine-dsv41"
+        self.assertFalse(dest.exists() and any(p.is_dir() for p in dest.iterdir()))
+
+    def test_a_package_signed_by_an_unknown_key_is_refused(self):
+        other = fx.make_key()
+        folder = build(self.root / "foreign", "0.1.49", other)
+        lines = []
+        self.assertIsNone(dsv41_engine.install_package(self.root / "data" / "engine-dsv41", folder, emit=lines.append))
+        self.assertIn("did not pass its check", " ".join(lines))
+
+    def test_the_strata_engine_package_is_not_taken_for_deepseeks(self):
+        src = self.root / "qsrc"
+        src.mkdir()
+        (src / "strata").write_bytes(b"qwen engine")
+        folder = package_engine.build(src, "cuda", "0.1.49", components.host_platform(), self.root / "qout", entry="strata", archs=("sm_86",),
+                                      min_driver={"nvidia": "580.65"}, build_id="q", variant="cuda13")
+        feed_tool.sign_package(folder, self.key)
+        lines = []
+        self.assertIsNone(dsv41_engine.install_package(self.root / "data" / "engine-dsv41", folder, emit=lines.append))
+        self.assertIn("not the DeepSeek engine", " ".join(lines))
+
+    def test_a_missing_or_wrong_file_is_said_plainly(self):
+        lines = []
+        self.assertIsNone(dsv41_engine.install_package(self.root / "x", self.root / "nope.tar.gz", emit=lines.append))
+        self.assertIn("is not there", " ".join(lines))
+        junk = self.root / "notes.txt"
+        junk.write_text("x")
+        self.assertIsNone(dsv41_engine.install_package(self.root / "x", junk, emit=lines.append))
+        self.assertIn("not a package file", " ".join(lines))
+
+    def test_files_put_in_the_folder_are_found(self):
+        _f, archive = self.archive()
+        dest = self.root / "data" / "engine-dsv41"
+        dest.mkdir(parents=True)
+        shutil.copy(archive, dest / archive.name)
+        (dest / "readme.txt").write_text("x")
+        self.assertEqual([p.name for p in dsv41_engine.pending(dest)], [archive.name])
+
+
 if __name__ == "__main__":
     unittest.main()

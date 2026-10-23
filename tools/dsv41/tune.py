@@ -142,6 +142,7 @@ def tune(config: Path, mode: str = "quick", n: int = 48, timeout: int = 1500, me
             if v > best * GAIN:
                 best, best_args = v, cand
                 res["changed"].append(label)
+    tried = ", ".join(f"{k} {v:.1f}" for k, v in res["speeds"].items())
     if res["changed"]:
         new = [a for a in best_args]
         cfg["args"] = new
@@ -151,6 +152,10 @@ def tune(config: Path, mode: str = "quick", n: int = 48, timeout: int = 1500, me
                             f"({base:.1f} -> {best:.1f} tokens a second). The RAM store sizes itself when the model starts.")
     else:
         res["lines"].append(f"Your computer already runs DeepSeek best with the standard settings ({base:.1f} tokens a second); nothing changed.")
+    if len(res["speeds"]) > 1:
+        res["lines"].append(f"Tried (tokens a second): {tried}.")
+    else:
+        res["lines"].append("Only the standard settings could be timed here, so there was nothing to compare.")
     return res
 
 
