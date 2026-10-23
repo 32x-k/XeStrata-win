@@ -41,6 +41,11 @@ TYPES = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 8: ("Q8_0", 32, 34), 30: ("BF16", 1
          10: ("Q2_K", 256, 84), 11: ("Q3_K", 256, 110), 12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176),
          14: ("Q6_K", 256, 210), 16: ("IQ2_XXS", 256, 66), 17: ("IQ2_XS", 256, 74), 18: ("IQ3_XXS", 256, 98),
          20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82), 23: ("IQ4_XS", 256, 136),
+         # the two 1.x-bit types the IST-DAS 2.00 set uses: device kernels since 2026-10-23 (ds4_iq.cu), so packs with
+         # them load and run entirely on the card.  (The integer metadata tensors - engram_token_map and the like - stay
+         # OUT of this table on purpose: the pack tool skips a tensor whose type it does not know, which is exactly right
+         # for them, and adding them here made them "unmapped" instead.)
+         19: ("IQ1_S", 256, 50), 29: ("IQ1_M", 256, 56),
          # the trellis types (tools/trellis/tqenc.hpp; 145 / 146 are the agentionai fork's ggml ids, 224-227 Strata's own)
          145: ("TQK6", 128, 26), 146: ("TQK7", 128, 30), 224: ("TQK5X", 128, 22), 225: ("TQK4X", 128, 18),
          226: ("TQK5T", 128, 22), 227: ("TQK4T", 128, 18)}

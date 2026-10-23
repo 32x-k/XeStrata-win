@@ -884,7 +884,10 @@ struct Model::Impl {
     EgRowCache eg_cache;
     std::mutex eg_cache_mu;
     std::vector<std::unique_ptr<EgBatch>> eg_win;
-    std::vector<uint8_t> eg_q6k;   // Engram layer li's table in ggml Q6_K (a row one superblock a 256 values), else FP8
+    // Engram layer li's embed rows, as the pack stores them: 0 MXFP8 ([scale, 32 codes] blocks, 33 bytes a 32), 1
+    // ggml Q6_K (210 bytes a 256), 2 ggml IQ4_NL (18 bytes a 32: an fp16 d and 16 nibble bytes), 3 an old pack's FP8
+    // codes with their E8M0 scales in a tensor of their own (see eg_issue)
+    std::vector<uint8_t> eg_fmt;
     std::atomic<int64_t> eg_rows_n{0}, eg_hits_n{0}, eg_reads_n{0}, eg_wait_ns{0}, eg_io_ns{0};
     uint16_t* h_emb = nullptr;        // the window's embedding rows
     std::vector<float> c_xh, c_xsb, c_acc, c_xhd, c_xsd, c_accd, c_yd;
@@ -2341,14 +2344,41 @@ struct Model::Impl {
             eg_io.start(paths, nth);
             for (int li = 0; li < pk.eg_layers; ++li) {
                 eg_win.emplace_back(new EgBatch());
-                const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
-                const bool q6k = tw != nullptr && tw->dtype == "Q6_K";
-                if (q6k && pk.eg_hd % 256 != 0) {
-                    err = "Engram layer " + std::to_string(g.eg_layers[(size_t) li]) + ": Q6_K rows of " +
-                          std::to_string(pk.eg_hd) + " values (not whole superblocks of 256)";
+                const std::string id = std::to_string(g.eg_layers[(size_t) li]);
+                const Tensor* tw = pk.get("layers." + id + ".engram.embed.weight");
+                // The row layout the reader and the dequant take.  A type not here (or no tensor at all) would be read
+                // as some other format's bytes - the old code then read the scale tensor of a pack that has none and
+                // crashed in eg_issue - so refuse the pack once, with the type's name, before any token is read.
+                int fmt;
+                if (tw == nullptr) {
+                    std::fprintf(stderr, "ds4: Engram layer %s: engram.embed.weight is missing from the pack\n", id.c_str());
+                    std::exit(2);
+                } else if (tw->dtype == "MXFP8") {
+                    fmt = 0;
+                } else if (tw->dtype == "Q6_K") {
+                    fmt = 1;
+                } else if (tw->dtype == "IQ4_NL") {
+                    fmt = 2;
+                } else if (pk.get("layers." + id + ".engram.embed.scale") != nullptr) {
+                    fmt = 3;   // (an old pack: FP8 codes in one tensor, their E8M0 scales in another)
+                } else {
+                    std::fprintf(stderr,
+                                 "ds4: Engram layer %s: engram.embed.weight type %s is not one the Engram reader handles "
+                                 "(MXFP8, Q6_K, IQ4_NL)\n",
+                                 id.c_str(), tw->dtype.c_str());
+                    std::exit(2);
+                }
+                if (fmt == 1 && pk.eg_hd % 256 != 0) {
+                    err = "Engram layer " + id + ": Q6_K rows of " + std::to_string(pk.eg_hd) +
+                          " values (not whole superblocks of 256)";
                     return false;
                 }
-                eg_q6k.push_back(q6k ? 1 : 0);
+                if (fmt == 2 && pk.eg_hd % 32 != 0) {
+                    err = "Engram layer " + id + ": IQ4_NL rows of " + std::to_string(pk.eg_hd) +
+                          " values (not whole blocks of 32)";
+                    return false;
+                }
+                eg_fmt.push_back((uint8_t) fmt);
             }
             if (o.verbose)
                 std::fprintf(stderr, "ds4: Engram rows read on %d threads, issued with the tokens, collected before "
@@ -4431,8 +4461,10 @@ struct Model::Impl {
         const std::string P = "layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.";
         const Tensor* tw = pk.get(P + "weight");
         const Tensor* ts = pk.get(P + "scale");
-        const bool mx8 = tw->dtype == "MXFP8";   // (a GGUF: the scales between the codes, one per 32)
-        const bool q6k = eg_q6k[(size_t) li] != 0;   // (a GGUF: one Q6_K superblock a 256 values, its scales inside)
+        const int fmt = eg_fmt[(size_t) li];
+        const bool mx8 = fmt == 0;   // (a GGUF: the scales between the codes, one per 32)
+        const bool q6k = fmt == 1;   // (a GGUF: one Q6_K superblock a 256 values, its scales inside)
+        const bool iq4 = fmt == 2;   // (a GGUF: 18-byte blocks a 32 values, d and 16 nibble bytes, no scales)
         std::unordered_map<uint64_t, int> first;   // a row this batch reads already -> its read
         int64_t hits = 0;
         {
@@ -4484,6 +4516,9 @@ struct Model::Impl {
                             r.off = tw->off + (uint64_t) id * r.n;
                         } else if (q6k) {   // (into the row's code bytes; its scale bytes unused)
                             r.n = (uint32_t) (hd / 256 * 210);
+                            r.off = tw->off + (uint64_t) id * r.n;
+                        } else if (iq4) {   // (the same: one contiguous row, its blocks' d inside them, no scales)
+                            r.n = (uint32_t) (hd / 32 * 18);
                             r.off = tw->off + (uint64_t) id * r.n;
                         } else {
                             r.n = (uint32_t) hd;
@@ -5795,7 +5830,7 @@ struct Model::Impl {
             CK(cudaEventRecord(c.eg_ev[slot], s));
             for (int s0 = 0; s0 < T; s0 += 256) {
                 const int ns = std::min(256, T - s0);
-                engram_dequant_tok(c.eg_rows + (size_t) s0 * per, per, cols, ns, ehd, c.eg_x, s, eg_q6k[(size_t) l.eg] != 0);
+                engram_dequant_tok(c.eg_rows + (size_t) s0 * per, per, cols, ns, ehd, c.eg_x, s, (int) eg_fmt[(size_t) l.eg]);
                 x3::rows_f16(c.eg_x, cols * ehd, nullptr, ns, cols * ehd, c.eg_x16, s);
                 if (!gemm(d, c, l.eg_wkv, c.eg_x16, cols * ehd, ns, c.eg_kv, (H + 1) * D, 0.0f, err)) return false;
                 engram_gate(c.h + (size_t) s0 * H * D, c.eg_kv, l.eg_w, H, D, ns, g.eps, s);
@@ -7320,7 +7355,7 @@ struct Model::Impl {
             for (int t = 0; t < T; ++t)
                 CK(cudaMemcpyAsync(sc + (size_t) t * cols * (ehd / 32), src + (size_t) t * per + (size_t) cols * ehd,
                                    (size_t) cols * (ehd / 32), cudaMemcpyHostToDevice, s));
-            engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, eg_q6k[(size_t) l.eg] != 0);
+            engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, (int) eg_fmt[(size_t) l.eg]);
             if (!mv(d, {job(l.eg_wkv, d.eg_x, d.eg_kv, T, (size_t) cols * ehd, (size_t) (H + 1) * D)}, err)) return false;
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
         }

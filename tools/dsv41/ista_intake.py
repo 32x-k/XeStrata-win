@@ -227,7 +227,17 @@ def main() -> int:
     report: list[str] = ["# IST-DAS intake, commit %s" % commit, "", "run %s" % time.strftime("%Y-%m-%dT%H:%M:%S%z"), ""]
 
     log("listing %s at %s" % (REPO, commit[:7]))
-    tree = repo_tree(commit)
+    try:
+        tree = repo_tree(commit)
+    except Exception as e:      # noqa: BLE001  (HF's API rate-limits unauthenticated boxes; the files are already local)
+        if not a.no_download:
+            raise
+        log("  the Hub API is not answering (%r); building the file list from disk" % (e,))
+        tree = []
+        for set_name in [s.strip() for s in a.sets.split(",") if s.strip()]:
+            for p in sorted((root / set_name).glob("*.gguf")):
+                tree.append(("%s/%s" % (set_name, p.name), p.stat().st_size))
+        tree.sort()
     (rep_dir / "tree.txt").write_text("\n".join("%s %d" % (p, s) for p, s in tree))
     report += ["## Files at this commit", "", "| path | GB |", "|---|---|"]
     report += ["| %s | %.2f |" % (p, s / 1e9) for p, s in tree]
