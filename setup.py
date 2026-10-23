@@ -7687,20 +7687,10 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     return start(cfg_path, port)
 
 
-# DeepSeek's engine is its own package, downloaded when DeepSeek is chosen and unpacked in engine-dsv41/ beside the engine: the Qwen engine's
-# files are never touched.  Same places as the engine packages (--prebuilt / STRATA_PREBUILT_URL: a release folder, a mirror, a local folder),
-# one asset for each kind of computer, and a <asset>.sha256 beside it (checked when it is there; a GitHub release without one is checked
-# against the digest GitHub publishes, like the engine).
+# DeepSeek's engine is its own package (feed member "dsv41", strata_control/dsv41_engine.py), downloaded when DeepSeek is chosen and unpacked in
+# <data>/engine-dsv41/<version>-<platform>-<backend>/ beside the engine: the Qwen engine's files are never touched.  Fetched, verified and
+# resumed like an engine update (the signed feed; --feed / STRATA_UPDATE_FEED name another one, as for `strata update`).
 DSV41_ENGINE_DIR = "engine-dsv41"
-DSV41_ENGINE_ASSETS = {"windows-cuda": "strata-dsv41-windows-x64-cuda13.zip", "linux-cuda": "strata-dsv41-linux-x64-cuda13.zip",
-                       "linux-hip": "strata-dsv41-linux-x64-hip-gfx120x.zip"}
-
-
-def dsv41_engine_asset(hip: bool) -> str | None:
-    """The DeepSeek engine package for this computer, None where there is none (Windows AMD, Mac, Intel)."""
-    if hip:
-        return None if WIN else DSV41_ENGINE_ASSETS["linux-hip"]
-    return DSV41_ENGINE_ASSETS["windows-cuda" if WIN else "linux-cuda"]
 
 
 def dsv41_engine_dir(eng: Path) -> Path:
@@ -7708,63 +7698,22 @@ def dsv41_engine_dir(eng: Path) -> Path:
     return (home() if CONTROL else Path(eng).parent) / DSV41_ENGINE_DIR
 
 
-def get_dsv41_engine(url_base, eng: Path, hip: bool) -> Path | None:
-    """Download, check and unpack the DeepSeek engine package next to the engine `eng`; the folder, or None when it cannot be had (no package
-    for this computer or version, no internet).  Resumes like the model files (download()); the engine in `eng` is not touched."""
-    asset = dsv41_engine_asset(hip)
-    dest = dsv41_engine_dir(eng)
-    if asset is None or not url_base:
-        return None
+def get_dsv41_engine(eng: Path, hip: bool) -> Path | None:
+    """Download, check and unpack the DeepSeek engine package next to the engine `eng`; its strata-dsv41, or None when it cannot be had."""
     acquisition.require("the DeepSeek engine")
-    base = prebuilt_bases(url_base)[-1] if url_base != PREBUILT_URL else prebuilt_bases(url_base)[0]
-    work = dest.parent / (DSV41_ENGINE_DIR + ".download")
-    work.mkdir(parents=True, exist_ok=True)
-    z, side = work / asset, work / (asset + ".sha256")
+    from strata_control import dsv41_engine
+    from strata_cli import update_cmd
+    root = dsv41_engine_dir(eng)
+    source = update_cmd._feed_source(argparse.Namespace(feed=None), root.parent)
     say("  Downloading the DeepSeek engine (its own package, separate from the Strata engine) ...")
-    try:
-        download(base + asset, z, "DeepSeek engine")
-    except SystemExit:
-        warn(f"no DeepSeek engine package at {base} ({asset})")
-        return None
-    want = None
-    try:
-        download(base + asset + ".sha256", side, "its SHA-256")
-        want = side.read_text(encoding="utf-8", errors="replace").split()[0].lower()
-    except (SystemExit, OSError, IndexError):
-        side.unlink(missing_ok=True)
-    if want:
-        h = hashlib.sha256()
-        with open(z, "rb") as f:
-            for b in iter(lambda: f.read(8 << 20), b""):
-                h.update(b)
-        if h.hexdigest() != want:
-            drop_archive(z)
-            side.unlink(missing_ok=True)
-            fail(f"the downloaded {asset} does not match its SHA-256 (it was deleted)", "run setup again; if it keeps failing, the mirror's file is damaged")
-        ok(f"{asset} matches its SHA-256")
-    else:
-        try:
-            verify_engine_archive(z, asset, base)
-        except UnverifiedEngine as e:
-            drop_archive(z)
-            fail(f"the DeepSeek engine package was refused: {e}", "run setup again later")
-    tmp = work / "_unpack"
-    shutil.rmtree(tmp, ignore_errors=True)
-    with zipfile.ZipFile(z) as f:
-        f.extractall(tmp)
-    exe_name = "strata-dsv41.exe" if WIN else "strata-dsv41"
-    inner = tmp if (tmp / exe_name).is_file() else next((d for d in tmp.iterdir() if d.is_dir() and (d / exe_name).is_file()), None)
-    if inner is None:
-        shutil.rmtree(tmp, ignore_errors=True)
-        drop_archive(z)
-        fail(f"{asset} has no {exe_name}", "tell us: the package is wrong")
-    if not WIN:
-        (inner / exe_name).chmod(0o755)
-    shutil.rmtree(dest, ignore_errors=True)
-    shutil.move(str(inner), str(dest))
-    shutil.rmtree(work, ignore_errors=True)
-    ok(f"DeepSeek engine installed: {dest}")
-    return dest
+    hw = None
+    if hip:
+        from strata_control import updater
+        hw = {**updater.detect_hardware(), "backend": "hip", "backend_source": "requested"}
+    exe = dsv41_engine.install(root, source, hardware=hw, emit=lambda m: say("  " + m))
+    if exe is None:
+        warn("no DeepSeek engine package could be fetched (see above)")
+    return exe
 
 
 def dsv41_exe(eng: Path) -> Path | None:
@@ -7774,9 +7723,8 @@ def dsv41_exe(eng: Path) -> Path | None:
     if own:
         return Path(own) if Path(own).is_file() else None
     name = "strata-dsv41.exe" if WIN else "strata-dsv41"
-    exe = dsv41_engine_dir(eng) / name
-    if not exe.is_file():
-        exe = Path(eng) / name
+    from strata_control import dsv41_engine
+    exe = dsv41_engine.find(dsv41_engine_dir(eng)) or (Path(eng) / name)
     if exe.is_file() and not WIN and not os.access(exe, os.X_OK):      # a package copied without its modes (scp / tar from Windows): fix it, do not stop
         try:
             exe.chmod(0o755)
@@ -7972,7 +7920,7 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     llama, eng, meta, lib_dirs, gpu, _vision = engine_step(a, gpu, hip, amd, cuda_tk, "none")
     exe = dsv41_exe(eng)
     if exe is None and not getattr(a, "build", False):
-        get_dsv41_engine(getattr(a, "prebuilt", None), eng, hip)
+        get_dsv41_engine(eng, hip)
         exe = dsv41_exe(eng)
     if exe is not None and exe.parent != Path(eng):
         lib_dirs = [*lib_dirs, str(exe.parent)]            # its own package carries the libraries it needs

@@ -385,13 +385,7 @@ class OfficialSets(unittest.TestCase):
 class EnginePackage(unittest.TestCase):
     """DeepSeek's engine is its own package beside the engine; the Qwen engine folder is never written."""
 
-    def test_asset_names_and_folder(self):
-        with mock.patch.object(setup, "WIN", True):
-            self.assertEqual(setup.dsv41_engine_asset(False), "strata-dsv41-windows-x64-cuda13.zip")
-            self.assertIsNone(setup.dsv41_engine_asset(True))                  # Windows AMD: no package
-        with mock.patch.object(setup, "WIN", False):
-            self.assertEqual(setup.dsv41_engine_asset(False), "strata-dsv41-linux-x64-cuda13.zip")
-            self.assertEqual(setup.dsv41_engine_asset(True), "strata-dsv41-linux-x64-hip-gfx120x.zip")
+    def test_the_package_folder_is_beside_the_engine(self):
         self.assertEqual(setup.dsv41_engine_dir(Path("/d/engine")), Path("/d") / "engine-dsv41")
 
     def test_the_own_package_is_found_before_the_old_place(self):
@@ -402,9 +396,9 @@ class EnginePackage(unittest.TestCase):
             self.assertIsNone(setup.dsv41_exe(eng))
             (eng / name).write_text("old")
             self.assertEqual(setup.dsv41_exe(eng), eng / name)                 # an all-in-one engine still works
-            (Path(d) / "engine-dsv41").mkdir()
-            (Path(d) / "engine-dsv41" / name).write_text("new")
-            self.assertEqual(setup.dsv41_exe(eng), Path(d) / "engine-dsv41" / name)
+            (Path(d) / "engine-dsv41" / "0.1.49-x").mkdir(parents=True)
+            (Path(d) / "engine-dsv41" / "0.1.49-x" / name).write_text("new")
+            self.assertEqual(setup.dsv41_exe(eng), Path(d) / "engine-dsv41" / "0.1.49-x" / name)
 
 
 class InstallOfficial(Install):
