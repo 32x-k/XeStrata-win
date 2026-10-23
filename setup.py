@@ -7375,7 +7375,8 @@ def dsv41_smoke(exe: Path, pack: Path, lib_dirs, gpus=None, timeout: int = 5400)
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, f"the test run did not finish: {e}"
     text = ((r.stdout or "") + (r.stderr or "")).strip()
-    return r.returncode == 0, text[-1500:]
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"            # the reply is printed by say()/fail(): a Windows console code page cannot show DeepSeek's special tokens
+    return r.returncode == 0, text[-1500:].encode(enc, "replace").decode(enc, "replace")
 
 
 def dsv41_cards(gpu: dict, all_cards: list | None, asked: bool) -> list:
