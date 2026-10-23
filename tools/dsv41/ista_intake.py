@@ -187,7 +187,8 @@ def pack_info(pack: pathlib.Path) -> str:
 
 
 def eval_pack(pack: pathlib.Path, tag: str) -> list[str]:
-    r = run(["bash", "-lc", "cd /data/dsv41-port && bash session16.sh %s" % pack])
+    # session16.sh takes the pack directory NAME (it prefixes packs/ itself), never a path
+    r = run(["bash", "-lc", "cd /data/dsv41-port && bash session16.sh %s" % pack.name])
     (PORT / "runs" / ("eval_%s.log" % tag)).write_text((r.stdout or "") + (r.stderr or ""))
     rows = [l for l in (r.stdout or "").splitlines() if l.startswith("s16_") or l.startswith("rc=")]
     return rows
