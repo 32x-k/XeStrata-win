@@ -1534,8 +1534,23 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_test(NAME batch_groups_test COMMAND batch_groups_test)
 endif()
 
-add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/hadamard.cpp)
+# The CPU kernel library is x86-only (AVX-512 / AVX2 intrinsics in expert.cpp and q2_avx2.cpp, a few in pool.cpp and
+# expert_layout.cpp).  On anything else - an arm64 Mac, a Neoverse box - the portable files are what build, and the DeepSeek
+# CPU lane goes through ggml-cpu's rows instead (ds4_gg_cpu.cpp), which carry their own NEON kernels.  Found on the M5 Max
+# (2026-10-23): the build died on "unsupported option '-mavx512f' for target 'arm64-apple-darwin27.2.0'".
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|x86|i[3-6]86)$")
+  set(STRATA_CPU_KERNELS_X86 TRUE)
+else()
+  set(STRATA_CPU_KERNELS_X86 FALSE)
+endif()
+if(STRATA_CPU_KERNELS_X86)
+  add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
+              src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/hadamard.cpp)
+else()
+  # non-x86: the portable files, plus the two AVX2-row entry points as "not supported" so the CPU lane links and keeps
+  # ggml-cpu's own rows (iq256_portable.cpp; the DeepSeek path only needs them to answer false)
+  add_library(strata_kernels_cpu STATIC src/kernels/cpu/hadamard.cpp src/kernels/cpu/iq256_portable.cpp)
+endif()
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -1639,13 +1654,19 @@ if(STRATA_NATIVE_EXPERTS)
     add_subdirectory(${strata_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
-  # one-pass static linking has no cycle to resolve)
-  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
-                                           src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
-                                           src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp
-                                           src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp
-                                           src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp)
+  # one-pass static linking has no cycle to resolve).  On a non-x86 host only the portable ones join: tq_cpu.cpp and
+  # native_expert.cpp are the trellis/CPU fallbacks, everything with _avx* in the name is intrinsics for x86 only.
+  if(STRATA_CPU_KERNELS_X86)
+    target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
+                                             src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
+                                             src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp
+                                             src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp
+                                             src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp)
+  else()
+    target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/tq_cpu.cpp)
+  endif()
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
+  if(STRATA_CPU_KERNELS_X86)
   if(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp
                                 PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
@@ -1683,6 +1704,7 @@ if(STRATA_NATIVE_EXPERTS)
                                 "-msse4.2;-mavx;-mno-avx2;-mno-fma;-mno-f16c")
   endif()
   set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
+  endif()   # STRATA_CPU_KERNELS_X86 (the x86 sources, their ISA flags and their avxvnni copies)
   if(STRATA_ISA_FLOOR STREQUAL "avx")
     target_compile_definitions(strata_kernels_cpu PRIVATE STRATA_ISA_FLOOR_AVX=1)
   elseif(STRATA_ISA_FLOOR STREQUAL "none")
