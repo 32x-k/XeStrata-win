@@ -25,3 +25,19 @@ kernel void ds4_embed(device const ushort* rows [[buffer(0)]], device float* h [
     const float v = as_type<float>(bits);
     for (uint s = 0; s < hc; ++s) h[((size_t) t * hc + s) * dim + e] = v;
 }
+
+// ds4_model.cu:2737  cublasSgemm(OP_T, OP_N, n_mix, T, hcd, ...) - the mHC mixes: mixes[t][m] = h[t] . fn[m]
+// one thread an output element; both operands F32, alpha = 1, beta = 0 (every call site seen)
+kernel void ds4_sgemm_tn(device const float* A [[buffer(0)]], device const float* B [[buffer(1)]],
+                         device float* C [[buffer(2)]], constant uint& m [[buffer(3)]], constant uint& nt [[buffer(4)]],
+                         constant uint& k [[buffer(5)]], constant uint& lda [[buffer(6)]], constant uint& ldb [[buffer(7)]],
+                         constant uint& ldc [[buffer(8)]], uint gid [[thread_position_in_grid]]) {
+    const uint total = m * nt;
+    if (gid >= total) return;
+    const uint t = gid / m, mm = gid % m;
+    const device float* a = A + (size_t) mm * lda;    // row mm of A
+    const device float* b = B + (size_t) t * ldb;     // row t of B
+    float acc = 0.0f;
+    for (uint i = 0; i < k; ++i) acc += a[i] * b[i];
+    C[(size_t) t * ldc + mm] = acc;
+}

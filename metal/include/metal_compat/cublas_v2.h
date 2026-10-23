@@ -12,6 +12,7 @@
 #include <cstdlib>
 
 #include "cuda_runtime.h"
+#include "ds4_metal_host.h"   // the kernels that have a Metal dispatch
 
 typedef void* cublasHandle_t;
 
@@ -40,8 +41,14 @@ static inline cublasStatus_t cublasSetWorkspace(cublasHandle_t, void*, size_t) {
     std::abort();
 }
 
-static inline cublasStatus_t cublasSgemm(cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int,
-                                         const float*, const float*, int, const float*, int, const float*, float*, int) {
+static inline cublasStatus_t cublasSgemm(cublasHandle_t, cublasOperation_t opA, cublasOperation_t opB, int m, int n, int k,
+                                         const float* alpha, const float* A, int lda, const float* B, int ldb,
+                                         const float* beta, float* C, int ldc) {
+    // the mHC mixes (ds4_model.cu:2737): C = A^T B, F32, alpha 1, beta 0
+    if (opA == CUBLAS_OP_T && opB == CUBLAS_OP_N && alpha && beta && *alpha == 1.0f && *beta == 0.0f &&
+        strata::dsv41::metal_host::sgemm_tn(A, B, C, m, n, k, lda, ldb, ldc)) {
+        return CUBLAS_STATUS_SUCCESS;
+    }
     strata_metal_dense_gemm_missing("cublasSgemm");
 }
 
