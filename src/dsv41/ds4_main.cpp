@@ -735,6 +735,10 @@ int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int win
 }
 }  // namespace
 
+#ifndef DS4_BUILD_ID
+#define DS4_BUILD_ID "unknown"
+#endif
+
 int main(int argc, char** argv) {
     strata::ds4::Options o;
     std::string ids_s, dump, eos = "1";
@@ -794,7 +798,13 @@ int main(int argc, char** argv) {
         }
         else if (a == "--temperature") temp = (float) std::atof(val("--temperature").c_str());
         else if (a == "--seed") cli_seed = std::strtoull(val("--seed").c_str(), nullptr, 10);
-        else if (a == "--verbose" || a == "-v") o.verbose = true;
+        else if (a == "--verbose" || a == "-v") {
+            o.verbose = true;
+            std::fprintf(stderr, "ds4: build %s (%s)\n", DS4_BUILD_ID, STRATA_VERSION);
+        } else if (a == "--version") {
+            std::printf("strata-dsv41 %s build %s\n", STRATA_VERSION, DS4_BUILD_ID);
+            return 0;
+        }
         else if (a == "--ids") ids_s = val("--ids");
         else if (a == "--n") n = std::atoi(val("--n").c_str());
         else if (a == "--window") window = std::max(1, std::atoi(val("--window").c_str()));   // (> 16: the chunked prompt path)
