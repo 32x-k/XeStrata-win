@@ -5364,6 +5364,24 @@ struct Model::Impl {
             if (sw_inflight == 0) break;   // (nothing queued: every layer's best CPU-lane expert is not hotter than its coldest VRAM one)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
+        if (store && env_f("DS4_SETTLE_STORE", 1.0f) != 0.0f) {   // the RAM store too: a window prompt fills it through the CPU
+            // lane's picks, a chunked one streams past it - the hottest CPU-lane experts of the prompt into its free slots
+            std::vector<std::pair<float, std::pair<int, int>>> hot;
+            for (const Layer& l : L) {
+                if (l.mtp) continue;
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (l.slot[(size_t) e] < 0 && l.heat[(size_t) e] >= 4.0f) hot.push_back({l.heat[(size_t) e], {l.il, e}});
+            }
+            std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::vector<std::pair<int, int>> list;
+            for (const auto& h : hot) {
+                if (list.size() >= store->slots_allocated()) break;
+                list.push_back(h.second);
+            }
+            const double ts = now_ms();
+            const size_t n = store->preload(list, 0);
+            if (o.verbose) std::fprintf(stderr, "ds4: RAM store: %zu hot experts read after the prompt (%.0f ms)\n", n, now_ms() - ts);
+        }
         if (o.verbose && st.swaps > s0)
             std::fprintf(stderr, "ds4: expert cache: %lld swaps after the prompt (%.0f ms)\n", (long long) (st.swaps - s0),
                          now_ms() - t0);
