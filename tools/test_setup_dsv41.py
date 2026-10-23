@@ -360,7 +360,8 @@ class OfficialSets(unittest.TestCase):
         cmd = setup.dsv41_pack_cmd(folder, names, Path("/s/engram-IQ4_NL.gguf"), Path("/s/meta.gguf"), Path("/s/dspark.gguf"), pack)
         self.assertTrue(cmd[1].endswith("pack_gguf.py"))
         self.assertEqual(cmd[2:], ["--model", str(folder), "--shards", *names, "--engram", str(Path("/s/engram-IQ4_NL.gguf")),
-                                   "--engram-meta", str(Path("/s/meta.gguf")), "--dspark-gguf", str(Path("/s/dspark.gguf")), "--out", str(pack)])
+                                   "--engram-meta", str(Path("/s/meta.gguf")), "--dspark-gguf", str(Path("/s/dspark.gguf")),
+                                   "--dspark-noise-token", "128799", "--dspark-markov-rank", "256", "--out", str(pack)])
         for bad in ("--skip-tensors", "--dense-override", "--override-experts", "--tq-experts"):      # these give garbage text on the official sets
             self.assertNotIn(bad, cmd)
 

@@ -139,7 +139,9 @@ def build(src: Path, backend: str, version: str, target: str, out: Path, *, entr
             manifest["notes"] = notes
         (staging / ec.MANIFEST).write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
         if os.name != "nt":
-            (staging / entrypoint).chmod(0o755)
+            for exe_name in (entrypoint, DSV41_EXE, "strata-vision", "strata-vision-hip"):      # the programs setup starts: executable in the tar
+                if (staging / exe_name).is_file():
+                    (staging / exe_name).chmod(0o755)
         ec.verify(ec.read_manifest(staging), full=True)
         staging.rename(folder)
     except BaseException:

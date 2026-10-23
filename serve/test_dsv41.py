@@ -345,6 +345,56 @@ class Api(unittest.TestCase):
         self.assertEqual(msg["content"].strip(), "Hello!")
         self.assertEqual(r["choices"][0]["finish_reason"], "stop")
 
+    ANSWER = "17 x 23 = 391. The answer is 391."
+
+    def test_no_closing_think_tag_makes_the_text_the_answer(self):
+        """The 2-bit sets write the answer after <think> and stop without </think>: it must not arrive as reasoning only (P2003)."""
+        for effort in (None, "low", "medium", "high"):
+            with self.subTest(effort=effort, api="openai"):
+                self.start(self.ANSWER)
+                status, r = self.chat(**({"reasoning_effort": effort} if effort else {}))
+                self.assertEqual(status, 200, r)
+                msg = r["choices"][0]["message"]
+                self.assertEqual(msg["content"].strip(), self.ANSWER)
+                self.assertFalse(msg.get("reasoning_content"))
+                self.assertEqual(r["choices"][0]["finish_reason"], "stop")
+            with self.subTest(effort=effort, api="anthropic"):
+                self.start(self.ANSWER)
+                status, r = self.post("/v1/messages", {"model": "x", "max_tokens": 400,
+                                                       "messages": [{"role": "user", "content": "hi"}],
+                                                       **({"output_config": {"effort": effort}} if effort else {})})
+                self.assertEqual(status, 200, r)
+                self.assertEqual([b["type"] for b in r["content"]], ["text"])
+                self.assertEqual(r["content"][0]["text"].strip(), self.ANSWER)
+
+    def test_no_closing_think_tag_streaming_ends_with_the_answer_as_content(self):
+        self.start(self.ANSWER)
+        status, raw = self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 400,
+                                                         "stream": True}, raw=True)
+        self.assertEqual(status, 200)
+        chunks = [json.loads(l[6:]) for l in raw.splitlines() if l.startswith("data: ") and l != "data: [DONE]"]
+        content = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks if c["choices"])
+        self.assertEqual(content.strip(), self.ANSWER)
+        status, raw = self.post("/v1/messages", {"model": "x", "max_tokens": 400, "stream": True,
+                                                 "messages": [{"role": "user", "content": "hi"}]}, raw=True)
+        self.assertEqual(status, 200)
+        self.assertIn('"text_delta"', raw)
+        self.assertIn("391", raw)
+
+    def test_a_turn_cut_by_max_tokens_is_not_turned_into_an_answer(self):
+        self.start(self.ANSWER * 30)
+        status, r = self.chat(max_tokens=8)
+        msg = r["choices"][0]["message"]
+        self.assertEqual(r["choices"][0]["finish_reason"], "length")
+        self.assertFalse(msg.get("content"))
+        self.assertTrue(msg.get("reasoning_content"))
+
+    def test_a_normal_closed_think_is_unchanged(self):
+        self.start("Reasoning here.</think>The answer.")
+        status, r = self.chat()
+        msg = r["choices"][0]["message"]
+        self.assertEqual((msg["reasoning_content"], msg["content"].strip()), ("Reasoning here.", "The answer."))
+
     def test_thinking_off(self):
         self.start("Hello!")
         for extra in ({"chat_template_kwargs": {"enable_thinking": False}}, {"reasoning_effort": "none"}):
