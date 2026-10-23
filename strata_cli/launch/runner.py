@@ -1265,7 +1265,8 @@ class Runner:
         mode = "thorough" if s.tune == "thorough" else "quick"
         argv = [sys.executable, str(Path(__file__).resolve().parents[2] / "tools" / "dsv41" / "tune.py"), "--config", str(cfg), "--mode", mode,
                 "--output", "json"]
-        self.emit("tune", "Tuning DeepSeek for the best speed: a few short test runs (1-3 minutes each). Close other heavy programs.", 0)
+        self.emit("tune", "Tuning DeepSeek: it times a short question with your standard settings, then with the DSpark drafter on (and, if that helps, a shorter "
+                          "draft block) and the CPU threads set to your physical cores; each run loads the model once. It keeps only a clear gain. Close other heavy programs.", 0)
         try:
             p = self._spawn(argv)
         except Exception as e:                           # noqa: BLE001 - a tune never stops a launch
@@ -1830,21 +1831,54 @@ class Runner:
         except Exception:                                    # noqa: BLE001
             return ""
 
-    def dsv41_engine(self) -> bool | None:
-        """Whether the installed engine carries strata-dsv41 (True / False); None when no engine is installed yet or it cannot be told."""
+    def dsv41_engine_found(self) -> tuple[Path | None, bool | None]:
+        """(strata-dsv41 already installed, or None; whether the engine can be told at all).  Looks where setup puts DeepSeek's own engine package
+        (engine-dsv41/ beside the engine, in Strata's own folder, and in the data folder), and at STRATA_DSV41_EXE (a build of your own)."""
+        from strata_control import dsv41_engine
         own = (os.environ.get("STRATA_DSV41_EXE") or "").strip()
         if own:
-            return Path(own).is_file()
+            return (Path(own) if Path(own).is_file() else None), True
+        folders: list[Path] = []
         try:
             from strata_control import engine_component as ec
             rep = ec.status()
             exe = (rep.get("engine") or {}).get("exe") if rep.get("usable") else None
-            if not exe:
-                return None
-            folder = Path(str(exe)).parent
-            return any((d / n).is_file() for d in (folder, folder.parent / "engine-dsv41") for n in ("strata-dsv41", "strata-dsv41.exe"))
+            if exe:
+                folder = Path(str(exe)).parent
+                folders += [folder.parent / dsv41_engine.DIR]
+                try:
+                    folders.append(self.catalog.strata.setup_module().dsv41_engine_dir(folder))
+                except Exception:                            # noqa: BLE001
+                    pass
+                known = True
+            else:
+                known = None
         except Exception:                                    # noqa: BLE001
-            return None
+            known = None
+        try:                                                 # where the setup this Terminal runs puts it (its own engine folder, or Strata's folder)
+            mod = self.catalog.strata.setup_module()
+            folders += [Path(self.catalog.root) / dsv41_engine.DIR,      # setup runs here in the app's installer mode: its home() is this folder
+                        mod.dsv41_engine_dir(Path(mod.ROOT) / "engine"), Path(mod.home()) / dsv41_engine.DIR]
+        except Exception:                                    # noqa: BLE001
+            pass
+        try:
+            folders.append((Path(self.s.data_dir) if self.s.data_dir else self.catalog.data_dir()) / dsv41_engine.DIR)
+        except Exception:                                    # noqa: BLE001
+            pass
+        for f in folders:
+            found = dsv41_engine.find(f)
+            if found is not None:
+                return found, True
+        for f in folders[:1]:                                # the engine's own folder: an all-in-one package carries it
+            for n in ("strata-dsv41", "strata-dsv41.exe"):
+                if (f.parent / n).is_file():
+                    return f.parent / n, True
+        return None, known
+
+    def dsv41_engine(self) -> bool | None:
+        """Whether the installed engine carries strata-dsv41 (True / False); None when no engine is installed yet or it cannot be told."""
+        found, known = self.dsv41_engine_found()
+        return True if found is not None else (False if known else None)
 
     def placement(self) -> dict:
         """Where DeepSeek-V4.1-Flash would go on this computer's cards (strata_control/dsv41_fit.py): the cards this launch names, else every
@@ -1858,7 +1892,11 @@ class Runner:
             free = None
         p = self.catalog.strata.dsv41_plan(hw, free, s.gpus, model=s.model)
         warnings = list(p["warnings"])
-        engine = self.dsv41_engine()
+        found, known = self.dsv41_engine_found()
+        engine = True if found is not None else (False if known else None)
+        if found is not None:
+            ver = next((part for part in (found.parent.name.split("-")[0], ) if part[:1].isdigit()), "")
+            p["lines"].append("DeepSeek engine: installed" + (f", {ver}" if ver else "") + ".")
         if engine is False:
             warnings.append("DeepSeek runs on its own engine package (about 70 MB, separate from the Strata engine): setup downloads it first. "
                             "If it cannot be fetched, setup stops with a message before the model is downloaded.")

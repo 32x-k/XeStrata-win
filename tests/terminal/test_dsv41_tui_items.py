@@ -48,6 +48,36 @@ class Advanced(unittest.TestCase):
         self.assertIn("not in this engine's list", next(r for r in rows if r.name == "--dsparkk").description)
 
 
+class Presets(unittest.TestCase):
+    def test_a_saved_preset_is_read_from_where_it_is_written_whatever_the_data_dir(self):
+        import tempfile
+        from strata_cli.launch import settings as S, store
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict("os.environ", {"STRATA_LAUNCH_PRESET_DIR": d}):
+            s = S.LaunchSettings(family="deepseek41", model="IST-DAS-2.00bpw", data_dir=str(Path(d) / "elsewhere"), name="DS 8K")
+            store.save(s, "DS 8K")
+            self.assertEqual([p.name for p in store.list_presets()], ["DS 8K"])
+            self.assertEqual(store.preset_dir(), Path(d))          # (the folder does not depend on the launch's --data-dir)
+
+
+class PlanEngine(unittest.TestCase):
+    def test_an_installed_deepseek_engine_is_named_in_the_plan_not_downloaded(self):
+        import tempfile
+        from strata_cli.launch import runner as R
+        with tempfile.TemporaryDirectory() as d:
+            pkg = Path(d) / "engine-dsv41" / "0.1.49-windows-x86_64-cuda-cuda13"
+            pkg.mkdir(parents=True)
+            exe = pkg / ("strata-dsv41.exe" if sys.platform == "win32" else "strata-dsv41")
+            exe.write_bytes(b"x")
+            fake = mock.MagicMock()
+            fake.s.data_dir = d
+            fake.catalog.data_dir.return_value = Path(d)
+            fake.catalog.strata.setup_module.side_effect = RuntimeError("no setup")
+            with mock.patch.dict("os.environ", {"STRATA_DSV41_EXE": ""}),                     mock.patch("strata_control.engine_component.status", return_value={"usable": False}):
+                found, known = R.Runner.dsv41_engine_found(fake)
+            self.assertEqual(found, exe)
+            self.assertTrue(known)
+
+
 class Disk(unittest.TestCase):
     def setUp(self):
         import strata_mcp as M
