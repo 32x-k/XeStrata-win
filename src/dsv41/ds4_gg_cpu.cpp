@@ -183,15 +183,16 @@ static bool want_512(int type, int nt) {
     }
     if (g_iq512 == 0 || !strata::kernels::cpu::iq512x_supported(type)) return false;
     if (g_iq512 == 1) return true;
-    // by CPU (measured, ds4_gg_bench --expert at 16 tokens; the AVX-512 rows tie the AVX2 ones at 4 tokens and lose at one):
-    //  Zen 5 (AMD family 0x1A, Strix Halo): IQ2_XXS 8.1 -> 10.9 GB/s, IQ3_XXS 10.8 -> 13.9;
-    //  Zen 4 (family 0x19, Ryzen 5 7600): IQ2_XXS 3.2 -> 4.0, IQ3_XXS no gain;
-    //  anything else with AVX-512 (Intel): not measured, so the AVX2 rows.
-    // and only for a prompt chunk's tokens (7 and more)
-    if (nt < 7) return false;
+    // by CPU (measured, ds4_gg_bench --expert; the rows are bit-identical to ggml's dot everywhere):
+    //  Zen 5 (AMD family 0x1A, Strix Halo, 16 threads, GB/s of weights ggml -> AVX-512 rows): one token IQ2_XXS 35 -> 44, IQ2_XS 37 -> 48,
+    //  IQ1_M 32 -> 36 (the sign masks by popcount, IQ1_M's indices by pdep: no table loads), IQ3_XXS 43 -> 45; 4 tokens x2.5-3.5; 16 tokens x4.4-4.8;
+    //  Zen 4 (family 0x19): see the Zen 4 table; anything else with AVX-512 (Intel): not measured, so the AVX2 rows
     const int fam = amd_family();
-    if (fam >= 0x1A) return type == 16 || type == 18;
-    if (fam == 0x19) return type == 16;
+    if (fam >= 0x1A) {
+        if (type == 16 || type == 17 || type == 29) return true;
+        return type == 18 && nt >= 2;
+    }
+    if (fam == 0x19) return nt >= 7 && type == 16;
     return false;
 }
 // 0: ggml-cpu's dot, 1: the AVX2 rows, 2: the AVX-512 rows
