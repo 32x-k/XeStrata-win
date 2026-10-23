@@ -190,6 +190,20 @@ Weitere Auswahl:
 
 Alle Größen, Downloads und was wo läuft: [docs/MODELS.md](docs/MODELS.md).
 
+### DeepSeek V4.1-Flash (im Terminal, ab 0.2.4)
+
+[DeepSeek V4.1-Flash](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) ist ein anderes, deutlich größeres Modell. ISTA-DASLab hat die beiden Sets unten gebaut. Strata startet sie auf einem PC mit einer 12-GB-Grafikkarte und 46 bis 64 GB RAM und liest den Rest von der SSD. Es läuft auf NVIDIA-RTX-Karten der Serien 30 bis 50 und auf der Radeon AI PRO R9700. Es nutzt ein eigenes Engine-Paket, `strata-dsv41`, das `strata launch` lädt, wenn du DeepSeek wählst. Die Desktop-App bietet es noch nicht an.
+
+| Set | Download | Qualität im Vergleich zum Originalmodell | Antwortet mit |
+| --- | ---: | --- | --- |
+| **IQ2_XXS** (2.00 Bit) | 257 GB | KL 0,169, Perplexität 3,64 (+16 %) | 6 bis 9 Tokens/s auf einer RTX 3060, etwa 5 auf einer RTX 5070 |
+| **IQ2_XS** (2.25 Bit) | 274 GB | KL 0,110, Perplexität 3,40 (+8 %); Code +3,5 %, Agent-Aufgaben +2,5 % | etwa 11 Tokens/s auf einer Radeon AI PRO R9700 |
+| **IQ4_NL** (Engram-Tabelle, kein drittes Modell) | 111 GB, schon in beiden Downloads oben enthalten | Die 4-Bit-Engram-Nachschlagetabelle, die das Modell aus RAM oder SSD liest. Beide Sets nutzen diese eine Datei (`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`). | n/a |
+
+4x Radeon AI PRO R9700: etwa 31 Tokens/s, 55 bis 69 mit DSpark.
+
+Starte es mit `strata launch --model ist-das-2.00bpw` (oder `ist-das-2.25bpw`). Details, Geschwindigkeiten je Karte und die manuelle Installation: [docs/DEEPSEEK41.md](docs/DEEPSEEK41.md).
+
 ## Wie schnell ist es?
 
 Gemessen mit einer Grafikkarte mit 12 GB (RTX 5070, Ryzen 5 7600, 64 GB RAM). Ergebnisse anderer Karten findest du hier:

@@ -9,3 +9,7 @@ MIT License, the full text is in `LICENSE` beside this file. The notice stays wi
 
 Changes made while porting into Strata are listed in the git history of the `src/dsv41` directory
 (the first commit of each file is the unmodified upstream copy).
+
+Later changes taken from Project Maya releases v1.1.18 to v1.1.26 (the same approach re-written onto Strata's engine,
+for example the long-prompt layer skip, the thinking budget, conversation slots) are covered by the same copyright
+and permission notice, in `LICENSE` beside this file.

@@ -182,6 +182,20 @@ Gyro 可在 NVIDIA 和 AMD 显卡（AMD 为实验性支持）以及 Linux 上的
 
 所有尺寸、下载大小，以及各种配置能跑什么：[docs/MODELS.md](docs/MODELS.md)。
 
+### DeepSeek V4.1-Flash（终端版，0.2.4 起）
+
+[DeepSeek V4.1-Flash](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) 是另一个大得多的模型。下面两个版本由 ISTA-DASLab 制作。Strata 在一台有一块 12 GB 显卡和 46 到 64 GB 内存的电脑上运行它们，其余部分从固态硬盘读取。它可在 NVIDIA RTX 30 到 50 系列显卡和 Radeon AI PRO R9700 上运行。它使用自己的引擎包 `strata-dsv41`，你选择 DeepSeek 时由 `strata launch` 下载。桌面应用暂时不提供它。
+
+| 版本 | 下载大小 | 与原模型相比的质量 | 生成速度 |
+| --- | ---: | --- | --- |
+| **IQ2_XXS** (2.00 位) | 257 GB | KL 0.169，困惑度 3.64（+16%） | RTX 3060 上每秒 6 到 9 个 token，RTX 5070 上约 5 个 |
+| **IQ2_XS** (2.25 位) | 274 GB | KL 0.110，困惑度 3.40（+8%）；代码 +3.5%，智能体任务 +2.5% | 一块 Radeon AI PRO R9700 上每秒约 11 个 token |
+| **IQ4_NL**（Engram 表，不是第三个模型） | 111 GB，已包含在上面两个下载中 | 模型从内存或固态硬盘读取的 4 位 Engram 查找表。两个版本共用这一个文件（`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`）。 | 不适用 |
+
+4 块 Radeon AI PRO R9700：每秒约 31 个 token，使用 DSpark 时为 55 到 69。
+
+用 `strata launch --model ist-das-2.00bpw`（或 `ist-das-2.25bpw`）启动。详情、各显卡的速度和手动安装见 [docs/DEEPSEEK41.md](docs/DEEPSEEK41.md)。
+
 ## 速度如何？
 
 以下数据基于 12 GB 显卡（RTX 5070、Ryzen 5 7600、64 GB 内存）。其他显卡的结果见：

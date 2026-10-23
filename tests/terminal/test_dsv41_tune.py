@@ -51,6 +51,18 @@ class Tune(unittest.TestCase):
         self.assertEqual(len(calls), 4)                                    # baseline, drafter on, block 3, threads
         self.assertIn("tuned", json.loads(self.cfg.read_text()))
 
+    def test_the_result_says_what_was_tried(self):
+        res, _ = self.run_tune(lambda a: 4.5)
+        text = " ".join(res["lines"])
+        self.assertIn("Tried (tokens a second): standard 4.5", text)
+        self.assertIn("the drafter on (DSpark) 4.5", text)
+
+    def test_a_single_timing_says_there_was_nothing_to_compare(self):
+        def only_baseline(a):
+            return 4.5 if "--dspark" in a and a[a.index("--dspark") + 1] == "auto" and "--cpu-threads" not in a else None
+        res, _ = self.run_tune(only_baseline)
+        self.assertIn("nothing to compare", " ".join(res["lines"]))
+
     def test_noise_changes_nothing(self):
         before = self.cfg.read_text()
         res, _ = self.run_tune(lambda a: 4.5 + 0.1 * (len(a) % 2))
