@@ -2668,7 +2668,7 @@ struct Model::Impl {
     }
 
     // the staging ring's size (MB) for the experts a chunk streams from the CPU lane: 400 where a good part of them are
-    // streamed; 64 where the cards hold at least 90% of the experts (a 4-card box) - the ring's VRAM is then worth more
+    // streamed; 64 where the cards hold most of the experts (they are within 30% of fitting) (a 4-card box) - the ring's VRAM is then worth more
     // as expert slots, and the decode after a prompt keeps the windowed path's speed (R9700 x4: 29.6 -> 31.7 tok/s)
     size_t ring_mb_auto() const {
         double exp_b = 0, other_b = 0, room = 0;
@@ -2681,7 +2681,7 @@ struct Model::Impl {
         }
         for (const Dev& d : devs)
             room += std::max(0.0, (double) d.free0 - (double) ((size_t) o.reserve_mib << 20) - 1.5 * (1 << 30)) * o.vram_experts;
-        const bool fit = exp_b > 0 && exp_b - std::max(0.0, room - other_b) <= 0.1 * exp_b;
+        const bool fit = exp_b > 0 && exp_b <= 1.3 * std::max(1.0, room - other_b);   // (the cards hold most of them: R9700 x4 1.16, 2 x 3090 ~3, one card 5+)
         if (o.verbose)
             std::fprintf(stderr, "ds4: staging ring: experts %.1f GB, VRAM room %.1f GB, dense %.1f GB -> %d MB\n", exp_b / 1e9,
                          room / 1e9, other_b / 1e9, fit ? 64 : 400);
