@@ -1967,6 +1967,11 @@ def _read_json(path: Path) -> dict | None:
 #: lines of an engine log that say why it stopped (the last one wins), and a plain next step for the causes we know. Recommend, never force.
 CAUSE_LINE = re.compile(r"error|exception|failed|cannot|can't|could not|no device|not found|out of memory|unsupported|abort|invalid|missing|"
                         r"no kernel|illegal|denied|refus", re.I)
+# The GPU runtime (ROCm) failed while the card was being set up, often right after another engine exited: the runtime's own text
+# ("terminate called after throwing an instance of 'rocr::AMD::hsa_exception'") stays in the log, not in the sentence shown.
+HSA_START = re.compile(r"hsa_exception|HSA_STATUS_ERROR", re.I)
+HSA_START_NEXT = ("The graphics card was not ready yet; wait a few seconds and run it again. If it keeps happening, restart the PC "
+                  "and report the log.")
 KNOWN_CAUSES = (
     (re.compile(r"no device of requested type|device not found|no (gpu|sycl|level.zero) device|permission denied.*(dri|render)", re.I),
      "The engine could not open the graphics card. On Linux the account must be allowed to use it: add it to the render group "
@@ -2045,10 +2050,19 @@ def explain_engine_exit(result: dict, config: Path | None, marks: dict | None = 
         stage = "The engine stopped while it was loading the model" + (f" (exit code {code})" if code not in (None, 0) else "")
     else:
         stage = f"The server did not become ready ({state}: {why or 'see the engine log'})"
+    hsa = HSA_START.search(" ".join(lines + [str(why or "")]))   # the runtime's own text is kept out of the sentence (it is in the log)
+    if hsa:
+        # a real cause in the same log (out of memory, no permission on the card ...) wins: its line is the cause shown
+        real = next((x for x in reversed(lines) if any(p.search(x) for p, _ in KNOWN_CAUSES)), None)
+        if real:
+            hsa = None
+            cause = re.sub(r"^(\[strata\]\s*)?(\d{4}-\d\d-\d\d[ T][\d:.]+\s*)?", "", real.strip())[:240]
+        else:
+            cause = ""
     text = stage + (f": {cause}" if cause else ".")
     if not text.endswith((".", "!")):
         text += "."
-    step = next((words for pattern, words in KNOWN_CAUSES if pattern.search(" ".join([cause, str(why or "")]))), "Run it again; if it repeats, report the log.")
+    step = HSA_START_NEXT if hsa else next((words for pattern, words in KNOWN_CAUSES if pattern.search(" ".join([cause, str(why or "")]))), "Run it again; if it repeats, report the log.")
     return text, step + (f" The engine's log: {log}" if log else " The engine's log has the reason (strata logs, or the log named in the run config).")
 
 

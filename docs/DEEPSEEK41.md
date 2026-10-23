@@ -26,10 +26,19 @@ with an out-of-memory message. Both are said before anything is downloaded.
 
 ## The official 2-bit versions (the ones for a normal PC)
 
-Setup offers two official sets (helcig/tmp-oct26-2, pinned): **IST-DAS 2.00 bpw** (138 GB) and **IST-DAS 2.25 bpw** (155 GB). Both use the
+Setup offers two official sets (ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF, pinned): **IST-DAS 2.00 bpw** (138 GB) and **IST-DAS 2.25 bpw** (155 GB). Both use the
 same 111 GB n-gram table (downloaded once into `models/deepseek-v4.1-flash-shared`) and the 8 GB DSpark drafter: 257 GB of disk for
 2.00, 274 GB for 2.25, 412 GB for both. Quality against the original model: perplexity +16% on 2.00, +8% on 2.25 (code and agent work
 about +3.5% / +2.5% on 2.25).
+
+| File | Size | What it is |
+| --- | ---: | --- |
+| IQ2_XXS shards (2.00 bpw), 4 files | 138 GB | the model, first set |
+| IQ2_XS shards (2.25 bpw), 4 files | 155 GB | the model, second set |
+| IQ4_NL: `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` | 111 GB | the 4-bit Engram lookup table the model reads from RAM or SSD. Not a third model: both sets use this one file, and it is already in their download sizes |
+| DSpark drafter (Q8_0) | 8 GB | the small draft model (Unsloth) |
+
+138 + 111 + 8 = 257 GB for 2.00; 155 + 111 + 8 = 274 GB for 2.25.
 
 Measured: an RTX 5070 (12 GB) with 64 GB of RAM and a 3.6 GB/s NVMe drive answers at about 4.7 tokens/s and reads prompts at 121
 tokens/s (4K) to 231 tokens/s (8K, layer-major path); an RTX 3060 (12 GB) with 46 GB of RAM about 7.2 tokens/s; four R9700 about 31

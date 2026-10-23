@@ -23,7 +23,7 @@ import strata_tokenizer as ST  # noqa: E402
 from serve import frontend  # noqa: E402
 from serve.dsml import DsmlOutputParser, DsmlTranslator, to_dsml_force  # noqa: E402
 from serve.frontend import ChatTemplate, OutputParser, openai_to_messages  # noqa: E402
-from serve.server import (FAMILY_MODEL_NAMES, MockEngine, Service, default_model_name, model_card_sampling,  # noqa: E402
+from serve.server import (FAMILY_MODEL_NAMES, MockEngine, REASONING_WRAP_UP, Service, default_model_name, model_card_sampling,  # noqa: E402
                           serve)
 
 FIX = ROOT / "serve" / "fixtures" / "deepseek41"
@@ -296,8 +296,8 @@ class ReadyTimeout(unittest.TestCase):
                 server.apply_ready_timeout({"engine_ready_s": bad})
 
 
-class Api(unittest.TestCase):
-    """Both APIs against a fake engine that replays scripted DeepSeek text."""
+class ApiBase(unittest.TestCase):
+    """Both APIs against a fake engine that replays scripted DeepSeek text (the helpers; Api has the tests)."""
 
     @classmethod
     def setUpClass(cls):
@@ -334,6 +334,8 @@ class Api(unittest.TestCase):
         body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 400, **extra}
         return self.post("/v1/chat/completions", body)
 
+
+class Api(ApiBase):
     # -- thinking --------------------------------------------------------------------------------
     def test_thinking_by_default(self):
         self.start("The user greets me.</think>\n\nHello!")
@@ -525,6 +527,131 @@ class Api(unittest.TestCase):
         last = m["requests"][-1]
         # produced tokens over the engine's decode time (10 ms a token in the fake), never over the prompt's time
         self.assertEqual(last["decode_tok_s"], 100.0)
+
+
+class ThinkForever(DsEngine):
+    """Thinks without end (random letters) until the thinking is closed in the prompt, then answers."""
+
+    ANSWER = "Four."
+
+    def __init__(self, tok):
+        super().__init__(tok, "")
+        self.prompts = []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        self.last_prompt = list(ids)
+        got = 0
+        try:
+            if self.tok.decode(list(ids[-14:])).endswith("</think>\n\n"):
+                out = self.tok.encode(self.ANSWER) + [EOS]
+            else:
+                import random
+                rng = random.Random(len(ids))          # (no repeated token: the server's loop guard would end it)
+                out = self.tok.encode("".join(chr(97 + rng.randrange(26)) for _ in range(max_new)))
+            for t in out[:max_new]:
+                if cancel.is_set():
+                    return
+                got += 1
+                yield t
+        finally:
+            self.last = {"generated": got, "prompt_tokens": len(ids), "prompt_ms": 50.0, "decode_ms": got * 10.0,
+                         "finish": "stop"}
+
+
+class SmallCap(ApiBase):
+    """A short max_tokens (200-600) with the thinking on: it was all spent on the thinking and no text block came.
+    With no budget of the client's own the thinking is capped at half of max_tokens (this family only)."""
+
+    def start_forever(self):
+        self.start("")
+        engine = ThinkForever(self.tok)
+        self.svc.engine = engine
+        self.engine = engine
+        return engine
+
+    def text_of(self, r):
+        return "".join(c.get("text", "") for c in r["content"] if c["type"] == "text")
+
+    def test_every_short_cap_gets_an_answer_on_both_apis(self):
+        for cap in (200, 400, 600):
+            for api in ("anthropic", "openai"):
+                with self.subTest(cap=cap, api=api):
+                    self.start_forever()
+                    if api == "anthropic":
+                        status, r = self.post("/v1/messages", {"model": "x", "max_tokens": cap, "thinking": {"type": "enabled"},
+                                                               "messages": [{"role": "user", "content": "2+2?"}]})
+                        self.assertEqual(status, 200, r)
+                        self.assertEqual(self.text_of(r), ThinkForever.ANSWER)
+                        self.assertLessEqual(r["usage"]["output_tokens"], cap)
+                    else:
+                        status, r = self.chat(max_tokens=cap)
+                        self.assertEqual(status, 200, r)
+                        self.assertEqual(r["choices"][0]["message"]["content"], ThinkForever.ANSWER)
+                        self.assertLessEqual(r["usage"]["completion_tokens"], cap)
+                    first = self.engine.prompts[0]
+                    self.assertEqual(len(self.engine.prompts), 2)          # the thinking was wrapped up, then answered
+                    self.assertEqual(len(self.engine.prompts[1]) - len(first), cap // 2 - 0 + len(self.tok.encode(
+                        REASONING_WRAP_UP, parse_special=True)))
+
+    def test_thinking_off_is_untouched(self):
+        for cap in (200, 400, 600):
+            with self.subTest(cap=cap):
+                self.start("Plain answer.")
+                status, r = self.chat(max_tokens=cap, reasoning_effort="none")
+                self.assertEqual(status, 200, r)
+                self.assertEqual(r["choices"][0]["message"]["content"], "Plain answer.")
+                status, r = self.post("/v1/messages", {"model": "x", "max_tokens": cap, "thinking": {"type": "disabled"},
+                                                       "messages": [{"role": "user", "content": "hi"}]})
+                self.assertEqual(self.text_of(r), "Plain answer.")
+
+    def test_a_client_budget_wins(self):
+        self.start_forever()
+        status, r = self.chat(max_tokens=600, reasoning_budget_tokens=20)
+        self.assertEqual(status, 200, r)
+        self.assertEqual(len(self.engine.prompts[1]) - len(self.engine.prompts[0]), 20 + len(self.tok.encode(
+            REASONING_WRAP_UP, parse_special=True)))
+
+    def test_a_tool_call_under_a_short_cap_still_parses(self):
+        for cap in (200, 400, 600):
+            with self.subTest(cap=cap):
+                self.start("Need it.</think>" + call(("f", [("a", "1", True)])))
+                status, r = self.chat(max_tokens=cap, tools=[{"type": "function", "function": {
+                    "name": "f", "description": "f", "parameters": {"type": "object", "properties": {"a": {"type": "string"}}}}}])
+                self.assertEqual(status, 200, r)
+                calls = r["choices"][0]["message"]["tool_calls"]
+                self.assertEqual(calls[0]["function"]["name"], "f")
+                self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"a": "1"})
+                self.assertEqual(len(self.engine.last_prompt) > 0, True)
+
+    def test_the_family_default_thinking_budget(self):
+        """DeepSeek-V4.1 only, as Maya ships it: 32768 thinking tokens when neither the request nor the config names a budget."""
+        self.start("ok")
+        self.assertEqual(self.svc.reasoning_budget({}), 32768)
+        self.assertIsNone(self.svc.reasoning_budget({"reasoning_budget_tokens": 0}))        # a request turns it off
+        self.assertEqual(self.svc.reasoning_budget({"reasoning_budget_tokens": 50}), 50)    # and its own wins
+        self.assertEqual(self.svc.reasoning_budget({"thinking_budget_tokens": 70}), 70)
+        self.svc.reasoning_budget_tokens, self.svc.reasoning_budget_configured = 90, True
+        self.assertEqual(self.svc.reasoning_budget({}), 90)                                 # the config's wins
+        self.svc.reasoning_budget_tokens = 0                                                # the config says none
+        self.assertIsNone(self.svc.reasoning_budget({}))
+        self.svc.reasoning_budget_configured = False
+        self.svc.set_family(None)
+        self.assertIsNone(self.svc.reasoning_budget({}))                                    # other families: none
+
+    def test_the_default_budget_closes_a_long_thinking(self):
+        self.start_forever()
+        status, r = self.chat(max_tokens=5000)
+        self.assertEqual(status, 200, r)
+        self.assertEqual(r["choices"][0]["message"]["content"], ThinkForever.ANSWER)
+        status, r = self.chat(max_tokens=300, reasoning_effort="none")                      # thinking off: no budget, no wrap-up
+        self.assertEqual(len(self.engine.prompts), 3)
+
+    def test_other_families_keep_the_old_behaviour(self):
+        self.start_forever()
+        self.svc.set_family(None)
+        status, r = self.chat(max_tokens=300)
+        self.assertEqual(len(self.engine.prompts), 1)                       # no wrap-up: Qwen's serving is as it was
 
 
 class PickTemplateTests(unittest.TestCase):
