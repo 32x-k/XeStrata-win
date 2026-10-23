@@ -530,6 +530,7 @@ class Api(unittest.TestCase):
     # -- the shared start of an agent's and its sub-agents' prompts (the engine keeps its state there) ------------
     def test_the_system_prompt_and_tools_are_the_shared_start(self):
         self.start("ok")
+        self.auto_pin("1")
         sysmsg = {"role": "system", "content": "You are an agent. " * 20}
         body = {"messages": [sysmsg, {"role": "user", "content": "task one"}], "tools": [WEATHER], "max_tokens": 40}
         self.assertEqual(self.post("/v1/chat/completions", body)[0], 200)
@@ -544,24 +545,29 @@ class Api(unittest.TestCase):
         self.assertEqual(self.engine.last_sampling["strata_prefix"]["tokens"], n)
         self.assertEqual(self.engine.last_prompt[:n], ids[:n])
 
+    def auto_pin(self, value):
+        old = os.environ.get("STRATA_DS4_AUTO_PIN")
+        if value is None:
+            os.environ.pop("STRATA_DS4_AUTO_PIN", None)
+        else:
+            os.environ["STRATA_DS4_AUTO_PIN"] = value
+        self.addCleanup(lambda: os.environ.pop("STRATA_DS4_AUTO_PIN", None) if old is None
+                        else os.environ.__setitem__("STRATA_DS4_AUTO_PIN", old))
+
     def test_no_shared_start_without_a_system_prompt_or_when_switched_off(self):
         self.start("ok")
+        self.auto_pin("1")
         self.chat()
-        self.assertNotIn("strata_prefix", self.engine.last_sampling)
+        self.assertNotIn("strata_prefix", self.engine.last_sampling)     # no system message
         body = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}], "max_tokens": 40}
-        old = os.environ.get("STRATA_DS4_AUTO_PIN")
-        os.environ["STRATA_DS4_AUTO_PIN"] = "0"
-        try:
+        for off in (None, "0"):                                           # off by default, and when switched off
+            self.auto_pin(off)
             self.post("/v1/chat/completions", body)
             self.assertNotIn("strata_prefix", self.engine.last_sampling)
-        finally:
-            if old is None:
-                os.environ.pop("STRATA_DS4_AUTO_PIN", None)
-            else:
-                os.environ["STRATA_DS4_AUTO_PIN"] = old
 
     def test_a_clients_own_prefix_wins(self):
         self.start("ok")
+        self.auto_pin("1")
         body = {"messages": [{"role": "system", "content": "s " * 30}, {"role": "user", "content": "u"}],
                 "max_tokens": 40, "strata_prefix": {"tokens": 7}}
         self.post("/v1/chat/completions", body)
@@ -592,7 +598,7 @@ class SlotEnv(unittest.TestCase):
     def test_deepseek_gets_a_folder_in_the_data_folder_and_the_default_switch(self):
         env = self.env({"arch": "deepseek41", "log": str(Path("data") / "strata-deepseek.log"), "args": []})
         self.assertEqual(Path(env["STRATA_DS4_SLOT_DIR"]), Path("data") / "ds4-slots")
-        self.assertEqual(env["STRATA_DS4_SLOT_KEEP"], "1")
+        self.assertEqual(env["STRATA_DS4_SLOT_KEEP"], "0")
         self.assertEqual(env["STRATA_DS4_SLOT_GB"], "2")
 
     def test_the_configs_own_settings_win(self):
