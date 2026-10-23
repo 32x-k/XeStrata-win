@@ -35,7 +35,7 @@ struct Options {
     // the experts the VRAM leaves over are cached in RAM by a store of their own (ds4_store.hpp): whole experts read unbuffered into
     // slots, a replacement policy (0 lru, 1 lfu, 2 lfu then lru), filled on demand and by the lookahead's guesses.  GB of RAM at
     // most (never past the RAM the process can still get less 8 GB); 0: off, the OS page cache as before
-    double ssd_cache_gb = 0.0;
+    double ssd_cache_gb = -1.0;   // < 0: auto (the RAM the process can get less a floor, at most 48 GB; off below 4 GB), 0: off
     int ssd_policy = 0;
     bool dspark = true;              // load the DSpark drafter (the checkpoint's mtp.* blocks) for speculative decoding
     float dspark_conf = 0.5f;         // a draft is verified while its confidence (sigmoid) is at least this

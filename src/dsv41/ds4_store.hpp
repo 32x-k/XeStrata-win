@@ -196,6 +196,44 @@ public:
         if (where_[(size_t) layer][(size_t) e] >= 0) return;
         if (start_fill(layer, e, false) >= 0) st_.prefetched.fetch_add(1, std::memory_order_relaxed);
     }
+    /// Reads the experts of `list` (layer, expert; hottest first) into free slots and returns when they are in (a start that
+    /// is already warm: the profile's hottest, so the first tokens find them).  The first `list.size()` fit the arena less
+    /// `leave` slots; returns how many were read.
+    size_t preload(const std::vector<std::pair<int, int>>& list, size_t leave) {
+        size_t n = 0;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            const size_t room = nmax_ > leave ? nmax_ - leave : 0;
+            const size_t take = std::min(list.size(), room);
+            for (size_t k = take; k-- > 0;) {   // (coldest first: the hottest get the newest ticks)
+                const int layer = list[k].first, e = list[k].second;
+                if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) continue;
+                if (where_[(size_t) layer][(size_t) e] >= 0) continue;
+                const int s = start_fill(layer, e, false);
+                if (s < 0) break;
+                slots_[(size_t) s].prefetch = false;   // (warm, not a guess)
+                ++n;
+            }
+        }
+        for (size_t i = 0;; ++i) {   // until every read is done
+            bool busy = false;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                for (size_t j = 0; j < nalloc_; ++j) {
+                    Slot& sp = slots_[j];
+                    if (sp.state.load(std::memory_order_acquire) != kLoading) continue;
+                    if (sp.left.load(std::memory_order_acquire) > 0) busy = true;
+                    else {
+                        try_ready(sp);
+                        if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
+                    }
+                }
+            }
+            if (!busy) break;
+            io_->wait_any(5000);
+        }
+        return n;
+    }
     /// An access the host saw for an expert the GPU computed (keeps it warm in the policy's eyes).
     void touch(int layer, int e) {
         if (layer < 0 || layer >= (int) where_.size()) return;

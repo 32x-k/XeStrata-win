@@ -2434,6 +2434,7 @@ struct Model::Impl {
         if (!load_experts(err)) return false;
         if (pk.gguf) make_pools();
         init_store();
+        preload_store();
         if (chunk > 0) {
             // the CPU lane's parts pinned (the chunks stream them to the GPUs by DMA), each layer's virtual slots
             const double tr = now_ms();
@@ -4190,9 +4191,17 @@ struct Model::Impl {
     }
 
     double store_gb() const {
-        if (!pk.gguf) return 0.0;
-        if (const char* v = std::getenv("DS4_STORE_GB")) return std::atof(v);
-        return o.ssd_cache_gb;
+        static double cached = -2.0;   // (decided once: the layout of the blobs depends on it)
+        if (cached > -1.5) return cached;
+        double gb = o.ssd_cache_gb;
+        if (const char* v = std::getenv("DS4_STORE_GB")) gb = std::atof(v);
+        if (!pk.gguf) gb = 0.0;
+        else if (gb < 0.0) {   // auto: the RAM free now less 12 GB for the system and the owner's programs, 48 GB at most
+            const uint64_t avail = ram_avail();
+            const double room = avail == ~uint64_t{0} ? 0.0 : (double) avail / 1e9 - 12.0;
+            gb = room >= 4.0 ? std::min(48.0, room) : 0.0;
+        }
+        return cached = gb;
     }
     void init_store() {
         const double gb = store_gb();
@@ -4278,6 +4287,34 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: RAM store: the GPU takes its slots over PCIe (%s), %zu slots kept evictable\n",
                          zc_stage_buf != nullptr ? "copied into a staging area at the PCIe rate first" : "off", cfg.reserve);
         }
+    }
+    // the profile's hottest experts (VRAM's left out) read into the store before the first token (DS4_STORE_PRELOAD=0: not)
+    void preload_store() {
+        if (!store) return;
+        if (std::getenv("DS4_STORE_PRELOAD") && std::atoi(std::getenv("DS4_STORE_PRELOAD")) == 0) return;
+        std::vector<std::pair<double, std::pair<int, int>>> cand;
+        double tot = 0;
+        for (const Layer& l : L) {
+            if (l.il >= g.nl) continue;
+            const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+            for (int e = 0; e < l.n_exp; ++e) tot += p[e];
+        }
+        if (tot <= 0) return;   // (no profile yet: the first tokens fill it)
+        for (const Layer& l : L) {
+            if (l.il >= g.nl) continue;
+            const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+            for (int e = 0; e < l.n_exp; ++e)
+                if (l.slot[(size_t) e] < 0 && p[e] > 0) cand.push_back({(double) p[e] / (double) l.blob, {l.il, e}});
+        }
+        std::stable_sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::vector<std::pair<int, int>> list;
+        list.reserve(cand.size());
+        for (const auto& c : cand) list.push_back(c.second);
+        const double t0 = now_ms();
+        const size_t leave = (size_t) (std::getenv("DS4_STORE_RESERVE") ? std::atoi(std::getenv("DS4_STORE_RESERVE")) : 192) + 64;
+        const size_t n = store->preload(list, leave);
+        std::fprintf(stderr, "ds4: RAM store: %zu of the profile's hottest experts read in (%.1f GB) in %.1f s\n", n,
+                     (double) n * (double) L[0].blob / 1e9, (now_ms() - t0) / 1000.0);
     }
     // at a window boundary: the store's ready slots become the device's (zero-copy) experts, taken back when it needs the room;
     // each touched layer's whole table is written again (VRAM slots, the store's, 0), in stream order before the next window
