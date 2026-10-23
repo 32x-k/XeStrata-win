@@ -5,7 +5,7 @@
 // steps of 64; each i-quant block is decoded ONCE into shared memory as F16 (code * the sub-block's scale: the product is exact up
 // to the F16 rounding of the scale and the product) and then shared by every row of the tile; x as F16 rows next to it, both
 // double-buffered, one barrier a step.  The F32 FMA tile of today (set_kernel) decodes the weights once per 64 rows and does
-// scalar FMAs.  Default OFF: STRATA_DS4_HIPK=1 switches it on (gfx12 only, the types below, experts of more than 16 rows).
+// scalar FMAs.  Default ON for gfx12, STRATA_DS4_HIPK=0 switches it off (gfx12 only, the types below, experts of more than 16 rows).
 #pragma once
 #if defined(STRATA_USE_HIP)
 
@@ -217,7 +217,7 @@ __global__ void __launch_bounds__(256) set_kernel(const SetArgs a, int dbg) {
 
 #include "ds4_iq_hip_r.inc"
 
-inline bool ok_device() {   // gfx12 and STRATA_DS4_HIPK=1
+inline bool ok_device() {   // gfx12 unless STRATA_DS4_HIPK=0
     static std::atomic<int> state[16];
     int dev = 0;
     cudaGetDevice(&dev);
@@ -227,7 +227,7 @@ inline bool ok_device() {   // gfx12 and STRATA_DS4_HIPK=1
         cudaDeviceProp prop{};
         const bool gfx12 = cudaGetDeviceProperties(&prop, dev) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx12", 5) == 0;
         const char* e = std::getenv("STRATA_DS4_HIPK");
-        v = gfx12 && e != nullptr && e[0] != '0' ? 1 : 2;
+        v = gfx12 && !(e != nullptr && e[0] == '0') ? 1 : 2;   // (on by default on gfx12; STRATA_DS4_HIPK=0 off)
         state[dev].store(v, std::memory_order_relaxed);
     }
     return v == 1;
