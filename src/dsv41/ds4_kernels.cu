@@ -1831,6 +1831,33 @@ void route_ahead(const float* logits, const float* bias, int n, int m, int T, Re
         route_ahead_kernel<<<T, 512, 0, s>>>(logits, bias, n, m, req, off);
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { wait_seq_kernel<<<1, 32, 0, s>>>(seq_ptr, seq); }
+
+// the RAM store's experts for the device (a decode token, window of one): a pick the VRAM table left at 0 whose expert the store holds
+// (zc_tab[expert] = the slot's device address over PCIe, 0: not) is copied to staging slot i with wide coalesced loads (the PCIe
+// rate; the expert kernels' own small loads over PCIe ran at a tenth of it), then the plan points at the copy
+__global__ void zc_copy_kernel(const unsigned long long* __restrict__ plan, const int* __restrict__ idx,
+                               const unsigned long long* __restrict__ zc_tab, uint8_t* __restrict__ stage, size_t stride, size_t bytes) {
+    const int i = blockIdx.y;
+    if (plan[i] != 0) return;
+    const unsigned long long p = zc_tab[idx[i]];
+    if (p == 0) return;
+    const uint4* src = (const uint4*) p;
+    uint4* dst = (uint4*) (stage + (size_t) i * stride);
+    const size_t n = bytes / 16;
+    for (size_t o = (size_t) blockIdx.x * blockDim.x + threadIdx.x; o < n; o += (size_t) gridDim.x * blockDim.x) dst[o] = src[o];
+}
+__global__ void zc_fix_kernel(unsigned long long* __restrict__ plan, const int* __restrict__ idx, const unsigned long long* __restrict__ zc_tab,
+                              int k, uint8_t* __restrict__ stage, size_t stride) {
+    const int i = threadIdx.x;
+    if (i >= k || plan[i] != 0) return;
+    if (zc_tab[idx[i]] != 0) plan[i] = (unsigned long long) (stage + (size_t) i * stride);
+}
+void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int k, uint8_t* stage, size_t stride, size_t bytes,
+              cudaStream_t s) {
+    zc_copy_kernel<<<dim3(64, k), 256, 0, s>>>(plan, idx, zc_tab, stage, stride, bytes);
+    zc_fix_kernel<<<1, 32, 0, s>>>(plan, idx, zc_tab, k, stage, stride);
+}
+
 void init_pre(float* pre, int T, cudaStream_t s) { init_pre_kernel<<<cdiv(T * 8, 128), 128, 0, s>>>(pre, T); }
 
 void embed(const uint16_t* rows, int T, float* h, int dim, int hc, cudaStream_t s) {

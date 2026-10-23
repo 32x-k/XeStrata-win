@@ -199,7 +199,7 @@ private:
                 ok = true;
                 buffered_.fetch_add(j.len, std::memory_order_relaxed);
             }
-            if (ok && j.keep != nullptr && j.mem == nullptr) std::memcpy(j.keep, j.dst + lead, (size_t) j.len);
+            if (ok && j.keep != nullptr && j.mem == nullptr) std::memmove(j.keep, j.dst + lead, (size_t) j.len);   // (keep may overlap dst: the store reads in place and moves up)
             busy_us_.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                    std::chrono::steady_clock::now() - t0).count(),
                                std::memory_order_relaxed);

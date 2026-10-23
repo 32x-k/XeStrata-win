@@ -659,6 +659,8 @@ struct Layer {
     uint8_t* ring_bak = nullptr;
     float *c_snap = nullptr, *c_rows = nullptr;
     unsigned long long* vram_tab = nullptr;     // device [n_exp]
+    std::vector<uint8_t> zc;                    // (the RAM store) expert -> 1: its store slot is GPU-visible, the device computes it over PCIe
+    unsigned long long* zc_tab = nullptr;       // device [n_exp]: those slots' device addresses (0: none) - the decode token's zc_stage reads it
     std::vector<std::array<x3::Mat, 3>> vm;     // expert -> its gate, up, down as EXL3 views of its VRAM blob
     std::vector<uint64_t> region_off;           // expert -> file region (offset, bytes, file)
     std::vector<uint64_t> region_bytes;
@@ -988,6 +990,9 @@ struct Model::Impl {
     }();
     // the RAM store (--ssd-cache): the CPU lane's experts in slots a policy owns, read unbuffered (null: off)
     std::unique_ptr<ExpertStore> store;
+    uint8_t* zc_stage_buf = nullptr;   // device: k staging slots for the store's experts of a decode token
+    size_t zc_stride = 0;
+    bool zc_copy = true;               // DS4_STORE_STAGE=0: the expert kernels read the arena over PCIe themselves
     bool in_ram(const Layer& l, int e) const {   // (DISK_SKIP_W) expert e's pages in RAM now
         if (!l.ram.empty() && l.ram[(size_t) e] >= 0) return true;
         if (l.lay.fmt == gg::kFmtMXFP4) {
@@ -1568,7 +1573,7 @@ struct Model::Impl {
             l.lay.trellis[r] = off;
             l.lay.suh[r] = l.lay.svh[r] = off;
             l.lay.K[r] = ty;
-            off += align256(bytes);
+            off += align256(bytes) + (store_gb() > 0 ? ExpertStore::kSlack : 0);   // (the store's aligned reads spill into the gaps)
         }
         l.lay.fmt = gg::kFmtMXFP4;
         if (!gg::mx_experts(l.lay) && (gg::expert_type(l.lay, 0) != gg::expert_type(l.lay, 1) ||
@@ -4202,26 +4207,105 @@ struct Model::Impl {
                 gl.off[r] = l.mx_off[r];
                 gl.stride[r] = l.mx_stride[r];
                 gl.bytes[r] = mx_part_bytes(l, r);
+                gl.tr[r] = l.lay.trellis[r];
             }
+            gl.blob = l.blob;
         }
-        std::vector<std::string> paths;
         ExpertStore::Cfg cfg;
         cfg.budget_bytes = (size_t) (gb * 1e9);
         cfg.threads = std::getenv("DS4_STORE_THREADS") ? std::atoi(std::getenv("DS4_STORE_THREADS")) : 8;
         cfg.floor_bytes = (size_t) (std::getenv("DS4_STORE_FLOOR_GB") ? std::atof(std::getenv("DS4_STORE_FLOOR_GB")) : 8.0) << 30;
         cfg.policy = (ExpertStore::Policy) (std::getenv("DS4_STORE_POLICY") ? std::atoi(std::getenv("DS4_STORE_POLICY")) : o.ssd_policy);
         cfg.ram_avail = [] { return ram_avail(); };
+        cfg.reserve = (size_t) (std::getenv("DS4_STORE_RESERVE") ? std::atoi(std::getenv("DS4_STORE_RESERVE")) : 192);
+        const bool want_zc = !(std::getenv("DS4_STORE_ZC") && std::atoi(std::getenv("DS4_STORE_ZC")) == 0) && devs.size() == 1 &&
+                             L[0].nm == 1;
+        if (want_zc) {   // the arena's chunks registered for the GPU to read in place (zero-copy over PCIe)
+            const int dev0 = devs[0].id;
+            cfg.map_chunk = [dev0](void* h, size_t n) -> void* {
+                cudaSetDevice(dev0);
+                if (cudaHostRegister(h, n, cudaHostRegisterMapped | cudaHostRegisterPortable) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    return nullptr;
+                }
+                void* d = nullptr;
+                if (cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    cudaHostUnregister(h);
+                    return nullptr;
+                }
+                if (d != h) std::fprintf(stderr, "ds4: RAM store: chunk host %p -> device %p (not the identity)\n", h, d);
+                return d;
+            };
+            cfg.unmap_chunk = [dev0](void* h) {
+                cudaSetDevice(dev0);
+                cudaHostUnregister(h);
+            };
+        }
         bool direct = true;
         for (os::fd_t f : pk.dfds) direct = direct && f != os::kBadFd;
         auto st = std::make_unique<ExpertStore>();
-        if (!st->init(cfg, geo, pk.fds, pk.dfds, pk.pfds)) {
+        if (!st->init(cfg, geo, pk.dfds, pk.pfds)) {
             std::fprintf(stderr, "ds4: --ssd-cache: the store could not start\n");
             return;
         }
         store = std::move(st);
+        for (Layer& l : L)
+            if (l.il < g.nl && want_zc) l.zc.assign((size_t) l.n_exp, 0);
         std::fprintf(stderr, "ds4: RAM store: up to %zu slots of %.1f MB (%.1f GB), policy %d, %d reader threads, %s reads\n",
                      store->slots_max(), store->slot_bytes() / 1e6, store->slots_max() * (double) store->slot_bytes() / 1e9,
                      (int) cfg.policy, cfg.threads, direct ? "unbuffered" : "BUFFERED (no direct handle)");
+        if (want_zc) {
+            if (!store->gpu_mapped()) {
+                std::fprintf(stderr, "ds4: RAM store: the arena could not be mapped for the GPU: zero-copy off\n");
+                for (Layer& l : L) l.zc.clear();
+            } else {
+                zc_stride = (store->max_blob() + 4095) & ~(size_t) 4095;
+                cudaSetDevice(devs[0].id);
+                if (cudaMalloc((void**) &zc_stage_buf, zc_stride * kPicks) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    zc_stage_buf = nullptr;
+                    for (Layer& l : L) l.zc.clear();
+                } else {
+                    for (Layer& l : L)
+                        if (!l.zc.empty() && cudaMalloc((void**) &l.zc_tab, (size_t) l.n_exp * 8) == cudaSuccess) cudaMemset(l.zc_tab, 0, (size_t) l.n_exp * 8);
+                        else if (!l.zc.empty()) {
+                            (void) cudaGetLastError();
+                            l.zc.clear();
+                        }
+                }
+            }
+            std::fprintf(stderr, "ds4: RAM store: the GPU takes its slots over PCIe (%s), %zu slots kept evictable\n",
+                         zc_stage_buf != nullptr ? "copied into a staging area at the PCIe rate first" : "off", cfg.reserve);
+        }
+    }
+    // at a window boundary: the store's ready slots become the device's (zero-copy) experts, taken back when it needs the room;
+    // each touched layer's whole table is written again (VRAM slots, the store's, 0), in stream order before the next window
+    void store_sync() {
+        if (!store || !store->gpu_mapped()) return;
+        std::vector<ExpertStore::Vis> ev;
+        store->sync(ev, [&](int layer, int e) { return L[(size_t) layer].slot[(size_t) e] < 0; });
+        if (ev.empty()) return;
+        std::vector<char> dirty(L.size(), 0);
+        for (const auto& v : ev) {
+            Layer& l = L[(size_t) v.layer];
+            if (l.zc.empty()) continue;
+            l.zc[(size_t) v.e] = v.dev != 0 ? 1 : 0;
+            dirty[(size_t) v.layer] = 1;
+        }
+        for (Layer& l : L) {
+            if (!dirty[(size_t) l.il]) continue;
+            if (l.zc_tab == nullptr) continue;
+            std::vector<unsigned long long> tab((size_t) l.n_exp, 0ull);
+            for (int e = 0; e < l.n_exp; ++e)
+                if (l.zc[(size_t) e]) {
+                    const int s = l.slot[(size_t) e] < 0 ? store->find(l.il, e) : -1;
+                    tab[(size_t) e] = s >= 0 ? store->dev_blob(s) : 0ull;
+                    if (s < 0) l.zc[(size_t) e] = 0;
+                }
+            cudaSetDevice(devs[0].id);
+            cudaMemcpyAsync(l.zc_tab, tab.data(), tab.size() * 8, cudaMemcpyHostToDevice, devs[0].st);
+        }
     }
 
     int cpu_threads() const {
@@ -5109,6 +5193,10 @@ struct Model::Impl {
     }
 
     void cache_tick(int T) {
+        cache_tick_swaps(T);
+        store_sync();
+    }
+    void cache_tick_swaps(int T) {
         if (!o.expert_cache || cache_ths.empty()) return;
         std::vector<Swap> ready;
         std::vector<RamSwap> rready;
@@ -5150,6 +5238,10 @@ struct Model::Impl {
                 l.ram[(size_t) sw.in] = -1;
             }
             l.slot[(size_t) sw.in] = l.spare_vram;
+            if (!l.zc.empty() && l.zc[(size_t) sw.in]) {   // (VRAM's now: not the store's to compute any more)
+                l.zc[(size_t) sw.in] = 0;
+                store->unmark(l.il, sw.in);
+            }
             if (l.nm == 1) set_vm(l, sw.in, l.spare_vram);
             l.hh[(size_t) sw.in] = {nullptr, nullptr, nullptr, nullptr};
             l.host[(size_t) sw.in] = nullptr;
@@ -5380,6 +5472,11 @@ struct Model::Impl {
                         }
                         if (l.slot[(size_t) e] < 0) {
                             l.cpu_hits.push_back(e);
+                            if (T == 1 && !l.zc.empty() && l.zc[(size_t) e]) {   // the device computed it from the store's slot
+                                store->touch(li, e);
+                                ++st.store_zc;
+                                continue;
+                            }
                             if (dsk && r.w[t][i] < disk_skip_w * wsum && !in_ram(l, e)) {
                                 ++st.skipped;
                                 continue;
@@ -7682,6 +7779,8 @@ struct Model::Impl {
                 ma.n_ff = FF;
                 ma.limit = g.lim;
                 const bool mx = lay.fmt == gg::kFmtMXFP4;
+                if (zc_stage_buf != nullptr && l.zc_tab != nullptr)   // (the store's experts copied to VRAM at the PCIe rate first)
+                    zc_stage(d.plan_ptr, d.ridx, l.zc_tab, l.k_exp, zc_stage_buf, zc_stride, l.blob, s);
                 if (mx) gg::moe_gate_up(ma, d.x, d.xg, s);
                 else x3::moe_gate_up(ma, d.x, d.xg, s);
                 prof_mark(d, 3);
@@ -8020,6 +8119,7 @@ const Stats& Model::stats() const {
         st.store_fails = x.stats().fails.load();
         st.store_wait_ms = x.stats().wait_ns.load() / 1e6;
         st.store_busy_ms = x.busy_ms();
+        st.store_zc_visible = (int64_t) x.visible_count();
         st.store_slots = (int64_t) x.slots_allocated();
         st.store_slots_max = (int64_t) x.slots_max();
     }

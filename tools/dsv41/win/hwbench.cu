@@ -95,10 +95,49 @@ static void bench_nvme(const char* path, size_t block, int qd, double secs, bool
     CloseHandle(f);
 }
 
+// GPU kernels reading host memory over PCIe in place (zero-copy): the pinned + mapped (or registered) arena as a weights source
+__global__ void zc_sum(const int4* __restrict__ p, size_t n, unsigned long long* out) {
+    unsigned long long acc = 0;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const int4 v = p[i];
+        acc += (unsigned) v.x ^ (unsigned) v.y ^ (unsigned) v.z ^ (unsigned) v.w;
+    }
+    if (acc == 0x123456789ull) atomicAdd(out, acc);
+}
+static void bench_zc(size_t mib) {
+    const size_t n = mib << 20;
+    for (int mode = 0; mode < 2; ++mode) {
+        void *h = nullptr, *dp = nullptr;
+        if (mode == 0) {
+            if (cudaHostAlloc(&h, n, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) { printf("hostalloc failed\n"); continue; }
+        } else {
+            h = VirtualAlloc(nullptr, n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            memset(h, 1, n);
+            if (cudaHostRegister(h, n, cudaHostRegisterMapped | cudaHostRegisterPortable) != cudaSuccess) { printf("hostregister failed\n"); continue; }
+        }
+        memset(h, 1, n);
+        cudaHostGetDevicePointer(&dp, h, 0);
+        unsigned long long* out; cudaMalloc(&out, 8);
+        for (int blocks : {64, 256, 1024}) {
+            zc_sum<<<blocks, 256>>>((const int4*) dp, n / 16, out);
+            cudaDeviceSynchronize();
+            cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+            cudaEventRecord(a);
+            for (int r = 0; r < 4; ++r) zc_sum<<<blocks, 256>>>((const int4*) dp, n / 16, out);
+            cudaEventRecord(b); cudaEventSynchronize(b);
+            float ms; cudaEventElapsedTime(&ms, a, b);
+            printf("zero-copy %s %zu MiB, %d blocks: %.2f GB/s\n", mode == 0 ? "cudaHostAlloc(mapped)" : "VirtualAlloc+cudaHostRegister(mapped)", mib, blocks, 4.0 * n / 1e9 / (ms / 1e3));
+        }
+        if (mode == 0) cudaFreeHost(h); else { cudaHostUnregister(h); VirtualFree(h, 0, MEM_RELEASE); }
+        cudaFree(out);
+    }
+}
+
 int main(int argc, char** argv) {
     std::string m = argc > 1 ? argv[1] : "";
     if (m == "ram") bench_ram(argc > 2 ? atoi(argv[2]) : 6, argc > 3 ? atoi(argv[3]) : 512);
     else if (m == "pcie") bench_pcie();
+    else if (m == "zc") bench_zc(argc > 2 ? atoi(argv[2]) : 1024);
     else if (m == "nvme" && argc > 5) bench_nvme(argv[2], (size_t)atoi(argv[3]) << 10, atoi(argv[4]), atof(argv[5]), argc > 6 && std::string(argv[6]) == "seq");
     else printf("usage: hwbench ram|pcie|nvme ...\n");
 }

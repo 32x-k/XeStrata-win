@@ -2,16 +2,18 @@
 // from the model's files by unbuffered requests (the OS page cache neither used nor disturbed), kept in a fixed arena of slots
 // that a replacement policy owns, filled on demand (the CPU lane's picks) and ahead of time (the lookahead's guesses).
 //
-// An expert (layer, e) is three matrices at three file offsets (the GGUF's one tensor a role and layer).  A slot holds their
-// bytes at 4096-aligned places (unbuffered reads land the file range rounded out to 4096 at an aligned address; the matrix's
-// first byte is `lead` bytes into it), so mat(slot, r) is the pointer the CPU lane's rows read - the same bytes as the file's
-// mapping, so every answer is the same.  Nothing here touches a device.
+// A slot holds an expert in the engine's blob layout (gate | up | down at the layer's offsets tr[r], the same as a VRAM slot), so
+// the CPU lane's rows read it in place and - when the arena is registered with the GPU - the device kernels read it over PCIe
+// (zero-copy, 24 GB/s on a 5070) through the same plan pointers as a VRAM expert.  An expert is three matrices at three file
+// offsets (the GGUF's one tensor a role and layer): each is read aligned (4096) into the slot and moved into place (the read's
+// lead of up to 4095 bytes), the blob layout leaving 8192 bytes between matrices (and around the blob) for the aligned spans.
 //
-// Memory: slots are allocated in chunks as they are first needed (VirtualAlloc / mmap, private memory, not pinned), never past
-// `max_slots` nor past the RAM this process can still get less `floor_bytes` (the owner's session and the system keep theirs).
+// Memory: slots are allocated in chunks as they are first needed (private memory), never past the budget nor past the RAM this
+// process can still get less `floor_bytes` (the owner's session and the system keep theirs).
 //
-// Policy (pick the slot to give up, among the unpinned ready ones): lru (oldest touch), lfu (lowest decayed hit count), or
-// lfu with an LRU tie-break.  A slot whose expert a window is computing is pinned from ensure() to release().
+// Policy (the slot to give up, among the unpinned, not GPU-visible ones): lru (oldest touch), lfu (lowest decayed hit count).
+// A slot whose expert a window is computing is pinned from ensure() to release(); a slot the GPU may read is `visible` until
+// sync() takes it back at a window boundary (the GPU idle), which also publishes the newly ready ones.
 #pragma once
 
 #include "ds4_os.hpp"
@@ -40,15 +42,20 @@ public:
         int file[3] = {-1, -1, -1};
         uint64_t off[3] = {0, 0, 0}, stride[3] = {0, 0, 0};   // matrix r of expert e: file[r], off[r] + e stride[r]
         uint64_t bytes[3] = {0, 0, 0};
+        uint64_t tr[3] = {0, 0, 0};                            // matrix r's place in the blob
+        uint64_t blob = 0;                                     // the blob's bytes (gaps of 8192 between matrices)
     };
-    enum Policy { kLru = 0, kLfu = 1, kLfuLru = 2 };
+    enum Policy { kLru = 0, kLfu = 1 };
     struct Stats {
         std::atomic<int64_t> hits{0}, misses{0}, prefetched{0}, prefetch_used{0}, prefetch_wasted{0}, evictions{0}, fails{0};
-        std::atomic<int64_t> bytes_read{0}, wait_ns{0};
+        std::atomic<int64_t> bytes_read{0}, wait_ns{0}, no_slot{0};
+    };
+    struct Vis {                 // a slot the GPU may read from now on (dev != 0), or no longer (dev == 0)
+        int layer = 0, e = 0;
+        unsigned long long dev = 0;
     };
 
     struct Cfg {
-        const std::vector<std::string>* paths = nullptr;   // the files, by the layers' file indices
         int threads = 8;
         size_t budget_bytes = 0;           // the arena at most (grown in chunks as slots are first needed)
         size_t floor_bytes = 8ull << 30;   // RAM left alone
@@ -56,24 +63,26 @@ public:
         float decay = 0.97f;               // lfu: heat x decay every `decay_every` accesses of its layer
         int decay_every = 240;
         std::function<uint64_t()> ram_avail;   // the RAM this process can still get (~0: unknown)
+        // a new chunk of the arena for the GPU to read in place: returns the device address of `host` (null: not visible)
+        std::function<void*(void* host, size_t bytes)> map_chunk;
+        std::function<void(void* host)> unmap_chunk;
+        size_t reserve = 192;              // slots kept evictable (not visible) for the window's demand and guesses
     };
 
-    bool init(const Cfg& c, const std::vector<LayerGeo>& layers, const std::vector<os::fd_t>& fds, const std::vector<os::fd_t>& dfds,
-              const std::vector<os::fd_t>& pfds) {
+    bool init(const Cfg& c, const std::vector<LayerGeo>& layers, const std::vector<os::fd_t>& dfds, const std::vector<os::fd_t>& pfds) {
         cfg_ = c;
         geo_ = layers;
-        fds_ = fds;
         dfds_ = dfds;
         pfds_ = pfds;
-        slot_bytes_ = 0;
-        for (const LayerGeo& g : geo_) {
-            size_t need = 0;
-            for (int r = 0; r < 3; ++r) need += (size_t) g.bytes[r] + 2 * os::kDirectAlign;
-            slot_bytes_ = std::max(slot_bytes_, need);
-        }
-        slot_bytes_ = (slot_bytes_ + os::kDirectAlign - 1) & ~(size_t) (os::kDirectAlign - 1);
-        if (slot_bytes_ == 0 || c.budget_bytes < slot_bytes_) return false;
+        size_t blob = 0;
+        for (const LayerGeo& g : geo_) blob = std::max<size_t>(blob, g.blob);
+        slot_bytes_ = (blob + 2 * kSlack + os::kDirectAlign - 1) & ~(size_t) (os::kDirectAlign - 1);
+        if (blob == 0 || c.budget_bytes < slot_bytes_) return false;
         nmax_ = c.budget_bytes / slot_bytes_;
+        // one reserved range for the whole arena (chunks committed as they are needed), 64 KB aligned chunks
+        arena_bytes_ = ((nmax_ + kChunk - 1) / kChunk) * kChunk * slot_bytes_;
+        arena_ = (uint8_t*) os::range_reserve(arena_bytes_);
+        if (arena_ == nullptr) return false;
         slots_.reset(new Slot[nmax_]);
         where_.resize(geo_.size());
         heat_.resize(geo_.size());
@@ -83,11 +92,14 @@ public:
             heat_[l].assign((size_t) geo_[l].n_exp, 0.0f);
         }
         io_.reset(new IoQueue(std::max(1, c.threads)));
+        grow();   // (the first chunk now: whether the GPU can map it is known from the start)
         return true;
     }
     ~ExpertStore() {
         io_.reset();
-        for (auto& ch : chunks_) os::anon_free(ch.first, ch.second);
+        for (size_t i = 0; i < chunks_.size(); ++i)
+            if (cfg_.unmap_chunk && chunk_dev_[i] != nullptr) cfg_.unmap_chunk(chunks_[i].first);
+        os::range_release(arena_, arena_bytes_);
     }
 
     size_t slot_bytes() const { return slot_bytes_; }
@@ -95,8 +107,9 @@ public:
     size_t slots_max() const { return nmax_; }
     const Stats& stats() const { return st_; }
     double busy_ms() const { return io_ ? io_->busy_ms() : 0.0; }
+    static constexpr size_t kSlack = 8192;
 
-    /// The slot holding (layer, e) ready to read, or -1.  (Any thread; a slot found stays valid while it is pinned.)
+    /// The slot holding (layer, e) ready to read, or -1.  (Any thread; a slot found stays valid while it is pinned or visible.)
     int find(int layer, int e) const {
         if (layer < 0 || layer >= (int) where_.size()) return -1;   // (a layer the store does not cover: the DSpark drafter's)
         const int s = where_[(size_t) layer][(size_t) e];
@@ -105,11 +118,18 @@ public:
         try_ready(sp);
         return sp.state.load(std::memory_order_acquire) == kReady && sp.layer == layer && sp.expert == e ? s : -1;
     }
-    const uint8_t* mat(int slot, int r) const { return slots_[(size_t) slot].base + slots_[(size_t) slot].lead[r]; }
+    const uint8_t* mat(int slot, int r) const { return slots_[(size_t) slot].base + geo_[(size_t) slots_[(size_t) slot].layer].tr[r]; }
+    const uint8_t* blob(int slot) const { return slots_[(size_t) slot].base; }
+    /// The device address of the slot's blob (0: the arena is not mapped for the GPU)
+    unsigned long long dev_blob(int slot) const {
+        const size_t c = (size_t) slot / kChunk;
+        if (c >= chunk_dev_.size() || chunk_dev_[c] == nullptr) return 0;
+        return (unsigned long long) ((uint8_t*) chunk_dev_[c] + (slots_[(size_t) slot].base - (uint8_t*) chunks_[c].first));
+    }
 
     /// Makes the experts es[0..n) of `layer` ready and pinned (reading what is not here), waiting for the reads; the
-    /// caller releases them.  False if a read failed or no slot could be had for one (then none of the failed ones is
-    /// pinned: ok[i] says which are; the caller reads those another way).
+    /// caller releases them.  False if a read failed or no slot could be had for one (ok[i] says which are fine; the caller
+    /// reads the others another way).
     bool ensure(int layer, const int* es, int n, std::vector<char>& ok) {
         ok.assign((size_t) n, 0);
         if (layer < 0 || layer >= (int) geo_.size()) return false;
@@ -176,33 +196,110 @@ public:
         if (where_[(size_t) layer][(size_t) e] >= 0) return;
         if (start_fill(layer, e, false) >= 0) st_.prefetched.fetch_add(1, std::memory_order_relaxed);
     }
-    /// Heat of an expert as the policy sees it (tests / the report).
-    float heat(int layer, int e) const { return heat_[(size_t) layer][(size_t) e]; }
+    /// An access the host saw for an expert the GPU computed (keeps it warm in the policy's eyes).
+    void touch(int layer, int e) {
+        if (layer < 0 || layer >= (int) where_.size()) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        touch_heat(layer, e);
+        const int s = where_[(size_t) layer][(size_t) e];
+        if (s >= 0) slots_[(size_t) s].tick = ++clock_;
+    }
+    bool gpu_mapped() const { return !chunk_dev_.empty() && chunk_dev_[0] != nullptr; }
+    /// The arena's address range (the device sees its host pointers as they are when the mapping is the identity)
+    unsigned long long arena_lo() const { return (unsigned long long) (uintptr_t) arena_; }
+    unsigned long long arena_hi() const { return (unsigned long long) (uintptr_t) (arena_ + arena_bytes_); }
+    bool identity_mapped() const {
+        for (size_t i = 0; i < chunks_.size(); ++i)
+            if (chunk_dev_[i] != nullptr && chunk_dev_[i] != chunks_[i].first) return false;
+        return true;
+    }
+    size_t max_blob() const { return slot_bytes_ - 2 * kSlack; }
+
+    /// At a window boundary (nothing reading the slots; the caller applies `ev` to the device's table before the next window):
+    /// every ready slot not visible yet becomes visible (`gpu_ok(layer, e)`: false for an expert VRAM holds), and visible
+    /// slots of the lowest score are taken back until `cfg.reserve` slots can be given up.  Returns the number of events.
+    size_t sync(std::vector<Vis>& ev, const std::function<bool(int, int)>& gpu_ok) {
+        std::lock_guard<std::mutex> lk(mu_);
+        size_t nvis = 0, nfree = 0;
+        for (size_t i = 0; i < nalloc_; ++i) {
+            Slot& sp = slots_[i];
+            if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {
+                try_ready(sp);
+                if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
+            }
+            const int st = sp.state.load(std::memory_order_acquire);
+            if (st == kFree) {
+                ++nfree;
+                continue;
+            }
+            if (st != kReady) continue;
+            if (sp.visible) {
+                ++nvis;
+                continue;
+            }
+            if (sp.pin == 0) ++nfree;
+            if (sp.pin == 0 && dev_blob((int) i) != 0 && gpu_ok(sp.layer, sp.expert) && !sp.prefetch) {
+                sp.visible = true;
+                ++nvis;
+                if (sp.pin == 0) --nfree;
+                ev.push_back({sp.layer, sp.expert, dev_blob((int) i)});
+            }
+        }
+        // give slots back until the reserve is there: the visible ones with the lowest score
+        if (nfree < cfg_.reserve && nvis > 0) {
+            std::vector<std::pair<double, size_t>> cand;
+            cand.reserve(nvis);
+            for (size_t i = 0; i < nalloc_; ++i)
+                if (slots_[i].visible && slots_[i].state.load(std::memory_order_acquire) == kReady) cand.push_back({score(slots_[i]), i});
+            const size_t want = std::min(cand.size(), cfg_.reserve - nfree);
+            std::partial_sort(cand.begin(), cand.begin() + (long) want, cand.end());
+            for (size_t k = 0; k < want; ++k) {
+                Slot& sp = slots_[cand[k].second];
+                sp.visible = false;
+                ev.push_back({sp.layer, sp.expert, 0ull});
+            }
+        }
+        return ev.size();
+    }
+    /// An expert VRAM took over: no longer a visible slot
+    void unmark(int layer, int e) {
+        if (layer < 0 || layer >= (int) where_.size()) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        const int s = where_[(size_t) layer][(size_t) e];
+        if (s >= 0) slots_[(size_t) s].visible = false;
+    }
+    size_t visible_count() const {
+        size_t n = 0;
+        for (size_t i = 0; i < nalloc_; ++i) n += slots_[i].visible ? 1 : 0;
+        return n;
+    }
 
 private:
     static constexpr int kFree = 0, kLoading = 1, kReady = 2, kFailed = 3;
+    static constexpr size_t kChunk = 64;   // slots a chunk of the arena
     struct Slot {
-        uint8_t* base = nullptr;
-        uint32_t lead[3] = {0, 0, 0};
+        uint8_t* base = nullptr;   // the blob's first byte
         int layer = -1, expert = -1, pin = 0;
-        bool prefetch = false;
+        bool prefetch = false, visible = false;
         std::atomic<int> state{kFree}, left{0};
         std::atomic<bool> bad{false};
         uint64_t tick = 0;
     };
 
+    double score(const Slot& sp) const {
+        if (cfg_.policy == kLru) return (double) sp.tick;
+        return (double) heat_[(size_t) sp.layer][(size_t) sp.expert] + 1e-9 * (double) sp.tick;
+    }
     void touch_heat(int layer, int e) {
         heat_[(size_t) layer][(size_t) e] += 1.0f;
-        if (cfg_.policy != kLru && ++hits_in_layer_[(size_t) layer] % (uint64_t) cfg_.decay_every == 0) {
-            // (the layer's heat x decay: a linear pass over 384 floats every 240 accesses of that layer)
-            for (float& h : heat_[(size_t) layer]) h *= cfg_.decay;
-        }
+        if (cfg_.policy != kLru && ++hits_in_layer_[(size_t) layer] % (uint64_t) cfg_.decay_every == 0)
+            for (float& h : heat_[(size_t) layer]) h *= cfg_.decay;   // (a linear pass over 384 floats every 240 accesses of that layer)
     }
     // a slot for (layer, e) and its reads started; -1 if there is none to be had.  mu_ held.
     int start_fill(int layer, int e, bool demand) {
         int s = take_slot(demand);
         if (s < 0) {
-            st_.fails.fetch_add(1, std::memory_order_relaxed);
+            st_.no_slot.fetch_add(1, std::memory_order_relaxed);
             return -1;
         }
         Slot& sp = slots_[(size_t) s];
@@ -215,6 +312,7 @@ private:
         sp.expert = e;
         sp.pin = demand ? 1 : 0;
         sp.prefetch = !demand;
+        sp.visible = false;
         sp.tick = ++clock_;
         sp.state.store(kLoading, std::memory_order_release);
         sp.bad.store(false);
@@ -222,20 +320,22 @@ private:
         where_[(size_t) layer][(size_t) e] = s;
         const LayerGeo& g = geo_[(size_t) layer];
         IoQueue::Job jobs[3];
-        size_t at = 0;
         for (int r = 0; r < 3; ++r) {
             const uint64_t off = g.off[r] + (uint64_t) e * g.stride[r];
             const uint64_t lead = off % os::kDirectAlign;
-            sp.lead[r] = (uint32_t) (at + lead);
+            uint8_t* fin = sp.base + g.tr[r];   // where the matrix belongs
+            // the aligned read lands the file's byte `off` at dst + lead: dst is fin - lead rounded down to 4096 (its span spills
+            // under 4096 bytes either way into the blob's gaps), the matrix is then moved up to fin
+            uint8_t* dst = (uint8_t*) ((uintptr_t) (fin - lead) & ~(uintptr_t) (os::kDirectAlign - 1));
             IoQueue::Job& j = jobs[r];
             j.fd = pfds_[(size_t) g.file[r]];
             j.dfd = dfds_[(size_t) g.file[r]];
             j.off = off;
             j.len = g.bytes[r];
-            j.dst = sp.base + at;
+            j.dst = dst;
+            j.keep = fin;
             j.left = &sp.left;
             j.bad = &sp.bad;
-            at += os::direct_span(off, g.bytes[r]);
         }
         st_.bytes_read.fetch_add((int64_t) (g.bytes[0] + g.bytes[1] + g.bytes[2]), std::memory_order_relaxed);
         io_->push(jobs, 3);
@@ -261,19 +361,20 @@ private:
     }
     bool grow() {
         if (nalloc_ >= nmax_) return false;
-        constexpr size_t kChunk = 64;   // slots
         const size_t n = std::min(kChunk, nmax_ - nalloc_);
         const size_t bytes = n * slot_bytes_;
         const uint64_t avail = cfg_.ram_avail ? cfg_.ram_avail() : ~uint64_t{0};
         if (avail != ~uint64_t{0} && avail < bytes + cfg_.floor_bytes) return false;
-        void* p = os::anon_alloc(bytes, -1, 1);
-        if (p == nullptr) return false;
+        void* p = arena_ + nalloc_ * slot_bytes_;
+        if (!os::range_commit(p, bytes)) return false;
         chunks_.push_back({p, bytes});
-        for (size_t i = 0; i < n; ++i) slots_[nalloc_ + i].base = (uint8_t*) p + i * slot_bytes_;
+        void* dev = cfg_.map_chunk ? cfg_.map_chunk(p, bytes) : nullptr;
+        chunk_dev_.push_back(dev);
+        for (size_t i = 0; i < n; ++i) slots_[nalloc_ + i].base = (uint8_t*) p + i * slot_bytes_ + kSlack;
         nalloc_ += n;
         return true;
     }
-    // the slot to give up (or a free one): the policy's lowest among the unpinned ready ones.  mu_ held.
+    // the slot to give up (or a free one): the policy's lowest among the unpinned, not visible, ready ones.  mu_ held.
     int take_slot(bool demand) {
         for (size_t i = free_hint_; i < nalloc_; ++i)
             if (slots_[i].state.load(std::memory_order_acquire) == kFree) {
@@ -287,20 +388,14 @@ private:
             Slot& sp = slots_[i];
             if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {
                 try_ready(sp);
-                if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);   // (failed: freed)
+                if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
                 if (sp.state.load(std::memory_order_acquire) == kFree) {
                     free_hint_ = std::min(free_hint_, i);
                     return (int) i;
                 }
             }
-            if (sp.pin > 0 || sp.state.load(std::memory_order_acquire) != kReady) continue;
-            double v;
-            if (cfg_.policy == kLru) v = (double) sp.tick;
-            else {
-                const double h = heat_[(size_t) sp.layer][(size_t) sp.expert];
-                v = cfg_.policy == kLfu ? h : h * 1e12 + (double) sp.tick;   // lfu with the age as tie-break
-                if (cfg_.policy == kLfuLru) v = h + 1e-9 * (double) sp.tick;
-            }
+            if (sp.pin > 0 || sp.visible || sp.state.load(std::memory_order_acquire) != kReady) continue;
+            const double v = score(sp);
             if (best < 0 || v < bv) {
                 best = (int) i;
                 bv = v;
@@ -313,10 +408,12 @@ private:
 
     Cfg cfg_;
     std::vector<LayerGeo> geo_;
-    std::vector<os::fd_t> fds_, dfds_, pfds_;
-    size_t slot_bytes_ = 0, nmax_ = 0, nalloc_ = 0, free_hint_ = 0;
+    std::vector<os::fd_t> dfds_, pfds_;
+    size_t slot_bytes_ = 0, nmax_ = 0, nalloc_ = 0, free_hint_ = 0, arena_bytes_ = 0;
+    uint8_t* arena_ = nullptr;
     std::unique_ptr<Slot[]> slots_;
     std::vector<std::pair<void*, size_t>> chunks_;
+    std::vector<void*> chunk_dev_;
     std::vector<std::vector<int>> where_;
     std::vector<std::vector<float>> heat_;
     std::vector<uint64_t> hits_in_layer_;

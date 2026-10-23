@@ -375,6 +375,32 @@ inline void* anon_alloc(size_t bytes, int node, int nodes) {
     return m;
 #endif
 }
+/// An address range of `bytes` reserved (no memory behind it yet), and pieces of it made real: the store's arena is one range so a
+/// kernel can tell its pointers by [lo, hi).  nullptr: it could not be had.
+inline void* range_reserve(size_t bytes) {
+#if defined(_WIN32)
+    return VirtualAlloc(nullptr, bytes, MEM_RESERVE, PAGE_READWRITE);
+#else
+    void* m = ::mmap(nullptr, bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    return m == MAP_FAILED ? nullptr : m;
+#endif
+}
+inline bool range_commit(void* p, size_t bytes) {
+#if defined(_WIN32)
+    return VirtualAlloc(p, bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+#else
+    return ::mprotect(p, bytes, PROT_READ | PROT_WRITE) == 0;
+#endif
+}
+inline void range_release(void* p, size_t bytes) {
+    if (p == nullptr) return;
+#if defined(_WIN32)
+    (void) bytes;
+    VirtualFree(p, 0, MEM_RELEASE);
+#else
+    ::munmap(p, bytes);
+#endif
+}
 inline void anon_free(void* p, size_t bytes) {
     if (p == nullptr) return;
 #if defined(_WIN32)
