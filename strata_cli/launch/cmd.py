@@ -84,6 +84,8 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
     g.add_argument("--preset", metavar="NAME", help="start a saved preset (other flags change it for this start)")
     g.add_argument("--model", metavar="NAME", help="the model size, e.g. iq3_xxs, q2_0, ud-q4_k_xl (any case)")
     g.add_argument("--family", metavar="NAME", help="the model family when a size is offered by several (qwen, swift, coder, ...)")
+    g.add_argument("--dsv41-package", metavar="FILE", help="DeepSeek: the engine package you downloaded from the release page (.tar.gz or .zip); "
+                                                          "it is checked and installed instead of being fetched")
     g.add_argument("--model-path", metavar="PATH", help="use model files you already have: a folder of shards or one .gguf file")
     g.add_argument("--data-dir", metavar="DIR", help="where downloaded model files are stored (default: Strata's data folder)")
     g.add_argument("--move-data", action="store_true",
@@ -199,6 +201,8 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
     s = store.load(a.preset) if a.preset else S.LaunchSettings()
     if a.preset:
         s.name = s.name or a.preset
+    if getattr(a, "dsv41_package", None):
+        s.dsv41_package = str(Path(a.dsv41_package).expanduser())
     if a.model_path:
         s.model_path = str(Path(a.model_path).expanduser())
         if not a.model:

@@ -7710,12 +7710,29 @@ def dsv41_engine_dir(eng: Path) -> Path:
     return (home() if CONTROL else Path(eng).parent) / DSV41_ENGINE_DIR
 
 
-def get_dsv41_engine(eng: Path, hip: bool) -> Path | None:
-    """Download, check and unpack the DeepSeek engine package next to the engine `eng`; its strata-dsv41, or None when it cannot be had."""
-    acquisition.require("the DeepSeek engine")
+def dsv41_manual_steps(eng: Path) -> str:
+    return (f"If you downloaded the DeepSeek engine package from the release page (the file strata-dsv41-...-{'windows' if WIN else 'linux'}-....{'zip' if WIN else 'tar.gz'}), "
+            f"run the same command again with --dsv41-package PATH-OF-THE-FILE (strata launch accepts it too), or put the file in {dsv41_engine_dir(eng)} "
+            "and run it again. Strata checks it before it is used.")
+
+
+def get_dsv41_engine(eng: Path, hip: bool, package: str | None = None) -> Path | None:
+    """The DeepSeek engine package next to the engine `eng`: one the person gave (--dsv41-package) or put in engine-dsv41/ by hand, else downloaded from
+    the signed feed.  Checked first either way; its strata-dsv41, or None when it cannot be had."""
     from strata_control import dsv41_engine
-    from strata_cli import update_cmd
     root = dsv41_engine_dir(eng)
+    if package:
+        exe = dsv41_engine.install_package(root, package, emit=lambda m: say("  " + m))
+        if exe is None:
+            fail("the DeepSeek engine package you gave could not be used", "see the line above; nothing else was changed")
+        return exe
+    for f in dsv41_engine.pending(root):
+        say(f"  Found {f.name} in {root}: checking it ...")
+        exe = dsv41_engine.install_package(root, f, emit=lambda m: say("  " + m))
+        if exe is not None:
+            return exe
+    acquisition.require("the DeepSeek engine")
+    from strata_cli import update_cmd
     source = update_cmd._feed_source(argparse.Namespace(feed=None), root.parent)
     say("  Downloading the DeepSeek engine (its own package, separate from the Strata engine) ...")
     hw = None
@@ -7932,7 +7949,7 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     llama, eng, meta, lib_dirs, gpu, _vision = engine_step(a, gpu, hip, amd, cuda_tk, "none")
     exe = dsv41_exe(eng)
     if exe is None and not getattr(a, "build", False):
-        get_dsv41_engine(eng, hip)
+        get_dsv41_engine(eng, hip, getattr(a, "dsv41_package", None))
         exe = dsv41_exe(eng)
     if exe is not None and exe.parent != Path(eng):
         lib_dirs = [*lib_dirs, str(exe.parent)]            # its own package carries the libraries it needs
@@ -7940,8 +7957,8 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
         if os.environ.get("STRATA_VERBOSE") == "1" or "--verbose" in sys.argv:
             say("  Details for developers: build it with cmake -DSTRATA_BUILD_DSV41=ON and point STRATA_DSV41_EXE at it.")
         fail("DeepSeek's engine is not available for this computer yet",
-             "Supported graphics cards: NVIDIA RTX 30 and RTX 50 series, and the Radeon AI PRO R9700. Update Strata later (a newer version may add "
-             "your card), or pick another model. Nothing has been downloaded.")
+             "Supported graphics cards: NVIDIA RTX 30 and RTX 50 series, and the Radeon AI PRO R9700. " + dsv41_manual_steps(eng)
+             + " Or update Strata later (a newer version may add your card), or pick another model. Nothing has been downloaded.")
     ok(f"engine: {exe}")
 
     step(5, f"downloading {fam['title']} {model}")
@@ -8370,6 +8387,8 @@ def main() -> int:
     ap.add_argument("--set-default-data-dir", action="store_true",
                     help="with --data-dir: remember the new folder as the data folder without moving anything")
     ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
+    ap.add_argument("--dsv41-package", metavar="FILE", help="DeepSeek: the engine package you downloaded from the release page (a .tar.gz or .zip, "
+                                                           "or its unpacked folder); it is checked and installed instead of being fetched")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with every shard: "
                                        "<name>-00001-of-0000N.gguf ... -0000N-of-0000N.gguf)")
     ap.add_argument("--yes", action="store_true", help="accept the recommended answers")

@@ -739,6 +739,8 @@ class Runner:
         if s.model_path:
             p = Path(s.model_path)
             args += ["--gguf-dir", str(p if p.is_dir() else p.parent)]
+        if s.dsv41_package and s.family == "deepseek41":
+            args += ["--dsv41-package", s.dsv41_package]
         if s.gpu_roles:
             args += ["--gpu-roles", ",".join(f"{k}={v}" for k, v in sorted(s.gpu_roles.items(), key=lambda kv: int(kv[0])))]
         elif s.gpus:

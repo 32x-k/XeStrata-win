@@ -89,6 +89,22 @@ package for your computer from the signed update feed (resumable, signature and 
 `engine/`. The Qwen engine's files are never changed. If the feed has no package for your graphics card, setup says so in plain words and stops before
 anything big is downloaded.
 
+### Getting the engine by hand
+
+If the automatic download does not work for you (no access to the update feed, or an offline computer), download the engine package yourself from
+the release page: the file is named `strata-dsv41-<version>-<system>-<backend>-<variant>.tar.gz` (Windows and Linux; pick the one for your system and
+graphics card). Check it against `SHA256SUMS.txt` on the release page if you like. Then give it to Strata in either of two ways:
+
+```
+strata launch --model ist-das-2.00bpw --dsv41-package PATH-TO-THE-FILE
+python setup.py --family deepseek41 --dsv41-package PATH-TO-THE-FILE
+```
+
+or put the file in the `engine-dsv41/` folder (setup tells you its exact place when it cannot find the engine) and run the same command again.
+Strata checks the package before it uses it: it must be the DeepSeek engine (not the Strata engine) for your system, its manifest must be signed by a key
+Strata trusts, and every file must match the hash in the manifest. A damaged or foreign file is refused with a plain line and nothing is installed.
+The unpacked folder works as well as the archive. The Strata (Qwen) engine is not touched either way.
+
 ## Compressed experts (trellis), for testing
 
 `strata-dsv41` reads the routed experts in the trellis types as well as the source MXFP4: TQK6 and TQK7 (agentionai's files), and the
