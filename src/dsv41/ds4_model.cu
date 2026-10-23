@@ -4848,13 +4848,13 @@ struct Model::Impl {
     // in four rounds (the gate / up split-K pieces, each preparing its two input blocks of every token; each band's
     // sums / codebook / Hadamard / swiglu and that block of the down input, which both nodes then read whole; the down
     // pieces; the down bands).  yd[slot] gets each row's expert output.
+    static constexpr int kEntMax = kWin > kc::kExl3CpuMaxN ? kWin : kc::kExl3CpuMaxN;
     struct Ent {
         int e = 0, n = 0, slot0 = 0;
         int tok[kEntMax] = {};
     };
     // tokens an entry holds: the i-quant GGUF experts take a whole window's tokens of an expert in one call (the CPU
     // lane's exact multi-token rows, 7+ tokens an expert: decoded once for all), the others (MXFP4, EXL3) up to 8
-    static constexpr int kEntMax = kWin > kc::kExl3CpuMaxN ? kWin : kc::kExl3CpuMaxN;
     static int ent_cap(const Layer& l) {
         return l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay) ? kEntMax : kc::kExl3CpuMaxN;
     }
