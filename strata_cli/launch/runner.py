@@ -809,35 +809,44 @@ class Runner:
         return path
 
     def deepseek_files(self) -> bool:
-        """--model-path names DeepSeek-V4.1-Flash's shards (a folder, the repository's folder with UD-Q8_K_XL inside, or one shard): they are
-        that model, whatever the fingerprint table of the Flash-Next files says.  True when it did (s.family / s.model / s.model_path set); a
-        shard missing from the folder is said now, in plain words, before an engine or a download is touched."""
+        """--model-path names DeepSeek-V4.1-Flash's shards (a folder, the repository's folder with the set's own folder inside - UD-Q8_K_XL,
+        2.00bpw, 2.25bpw - or one shard): they are that model, whatever the fingerprint table of the Flash-Next files says.  True when it did
+        (s.family / s.model / s.model_path set); a shard missing from the folder is said now, in plain words, before an engine or a download
+        is touched."""
         s = self.s
         try:
             mod = self.catalog.strata.setup_module()
-            shard = getattr(mod, "DSV41_SHARD", None)
-            if shard is None or not s.model_path:
+            fam = getattr(mod, "MULTI_FILE_FAMILIES", {}).get("deepseek41")
+            if fam is None or not s.model_path:
                 return False
             p = Path(s.model_path)
-            folders = [p, p / "UD-Q8_K_XL"] if p.is_dir() else [p.parent]
-            first = shard.format(i=1)
-            others = [shard.format(i=i) for i in range(1, 10)]
-            folder = next((f for f in folders if any((f / n).exists() for n in others)), None)
+            found = None
+            order = ([s.model] if s.model in fam["models"] else []) + [m for m in fam["models"] if m != s.model]
+            for m in order:
+                d = fam["models"][m]
+                folders = [p, p / (d.get("subdir") or m)] if p.is_dir() else [p.parent]
+                folder = next((f for f in folders if any((f / n).exists() for n in d["shards"])), None)
+                if folder is not None:
+                    found = (m, d, folder)
+                    break
         except Exception:                                    # noqa: BLE001 - not DeepSeek's: the usual check goes on
             return False
-        if folder is None:
+        if found is None:
             return False
+        model, d, folder = found
         if s.family and s.family != "deepseek41":
             raise LaunchError(f"These are DeepSeek-V4.1-Flash's files, not {s.family} {s.model}'s.",
-                              "Leave --model out, or use --model UD-Q8_K_XL.", 2)
+                              "Leave --model out, or use --model " + model + ".", 2)
+        others = list(d["shards"])
         missing = [n for n in others if not (folder / n).exists()]
         if missing:
-            raise LaunchError(f"DeepSeek-V4.1-Flash is in nine parts and {len(missing)} of them are not in {folder} "
+            parts = {4: "four", 9: "nine"}.get(len(others), str(len(others)))
+            raise LaunchError(f"DeepSeek-V4.1-Flash {d.get('label', model)} is in {parts} parts and {len(missing)} of them are not in {folder} "
                               f"(first missing: {missing[0]}).",
-                              "Put every part in the folder (or drop --model-path and let Strata download them: about 508 GB). "
+                              "Put every part in the folder (or drop --model-path and let Strata download them). "
                               "Nothing was downloaded or changed.", 5)
-        s.family, s.model, s.model_path = "deepseek41", s.model or "UD-Q8_K_XL", str(folder)
-        self.emit("model", "These files are DeepSeek-V4.1-Flash UD-Q8_K_XL; they are used where they are.", None)
+        s.family, s.model, s.model_path = "deepseek41", model, str(folder)
+        self.emit("model", f"These files are DeepSeek-V4.1-Flash {model}; they are used where they are.", None)
         return True
 
     def check_own_files(self) -> None:
@@ -1182,7 +1191,7 @@ class Runner:
             free = None if (s.model_path or self.model_state().remaining_gb < 1) else self.catalog.disk_free(data)
         except Exception:                                    # noqa: BLE001 - a plan that cannot read the disk still shows the rest
             free = None
-        p = self.catalog.strata.dsv41_plan(hw, free, s.gpus)
+        p = self.catalog.strata.dsv41_plan(hw, free, s.gpus, model=s.model)
         warnings = list(p["warnings"])
         engine = self.dsv41_engine()
         if engine is False:

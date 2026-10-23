@@ -36,8 +36,10 @@ class LaunchDeepSeek(unittest.TestCase):
 
     def test_the_model_is_in_the_list(self):
         rows = [r for r in catalog(self.hw).rows() if r.family == "deepseek41"]
-        self.assertEqual([r.model for r in rows], ["UD-Q8_K_XL"])
-        r = rows[0]
+        self.assertEqual([r.model for r in rows], ["IST-DAS-2.00bpw", "IST-DAS-2.25bpw", "UD-Q8_K_XL"])
+        self.assertEqual([r.download_gb for r in rows[:2]], [256.8, 273.8])
+        self.assertEqual(catalog(self.hw).resolve("ist-das-2.25bpw"), ("deepseek41", "IST-DAS-2.25bpw"))
+        r = rows[2]
         self.assertEqual((r.id, r.download_gb, r.verdict, r.images), ("deepseek-v4.1-flash-ud-q8_k_xl", 508.4, "fits", False))
         self.assertEqual(catalog(self.hw).resolve("ud-q8_k_xl"), ("deepseek41", "UD-Q8_K_XL"))
         self.assertEqual(catalog(self.hw).max_context("deepseek41", "UD-Q8_K_XL"), 8192)
@@ -80,7 +82,7 @@ class LaunchDeepSeek(unittest.TestCase):
         self.assertIn("read from the SSD", out)
         self.assertIn("free disk space", out)
         self.assertIn("It is still allowed", out)
-        row = next(r for r in catalog(self.hw).rows() if r.family == "deepseek41")
+        row = next(r for r in catalog(self.hw).rows() if r.family == "deepseek41" and r.model == "UD-Q8_K_XL")
         self.assertEqual(row.verdict, "no")                         # "too big (can still try)": the plan above is printed and nothing is refused
 
     def test_no_card_is_said(self):
