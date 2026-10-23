@@ -4560,11 +4560,25 @@ struct Model::Impl {
             cs.assign((size_t) NH, {});
             for (size_t i = 0; i < all.size(); ++i) cs[i * (size_t) NH / all.size()].push_back(all[i]);
         }
+        static const int lane_free = [] {
+            const char* v = std::getenv("STRATA_DS4_LANE_FREE");
+            return v != nullptr ? std::max(0, std::atoi(v)) : 2;
+        }();
+        size_t lane_cpus = 0;
+        for (const auto& v : cs) lane_cpus += v.size();
+        const bool lane_takes_all = lane_cpus >= (size_t) std::max(1u, std::thread::hardware_concurrency());
         for (int X = 0; X < (int) cs.size() && X < std::max(NH, 1); ++X) {
             std::vector<int> c = cs[(size_t) X];
             if (file_experts && NH == 1)
                 for (size_t Y = 1; Y < cs.size(); ++Y) c.insert(c.end(), cs[Y].begin(), cs[Y].end());
             if (X == 0 && !c.empty()) c.erase(c.begin());   // the host thread's core (it helps node 0's pool)
+            // cores of the first pool left free beside the host thread's, for the thread that launches the decode's kernels
+            // (and waits on the device) and whatever else the PC runs: with a worker spinning on every other logical CPU
+            // that thread waits for a core (Project Maya #359, a 20-core Windows 11 PC: decode 28.3 -> 55.5 tok/s).  Only
+            // when the lane would take every logical CPU and --cpu-threads is not given.
+            // STRATA_DS4_LANE_FREE: the cores left free (2 by default, 0: as before)
+            if (X == 0 && o.cpu_threads <= 0 && lane_free > 0 && (int) c.size() > lane_free + 1 && lane_takes_all)
+                c.resize(c.size() - (size_t) lane_free);
             int nw = (int) c.size();
             if (o.cpu_threads > 0) nw = std::max(X == 0 ? 0 : 1, std::min(nw, o.cpu_threads / NH - (X == 0 ? 1 : 0)));
             pools.push_back(std::make_unique<Pool>(nw, c, 20000));   // spin through a token's layers (20 ms)
