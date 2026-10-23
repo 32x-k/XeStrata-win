@@ -3,6 +3,9 @@
 // src/ds4/ds4_kernels.cu - DeepSeek-V4.1's device kernels (see ds4_kernels.cuh).  No fast math here: the rotary
 // angles, the softmaxes and the roundings follow the reference's F32 arithmetic.  A window's token is blockIdx.y.
 #include "ds4_kernels.cuh"
+#if defined(STRATA_METAL)
+#include <ds4_metal_host.h>
+#endif
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
 #include "ds4_attn_split.cuh"
@@ -1859,9 +1862,17 @@ void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long
     strata_ds4_launch(zc_fix_kernel, 1, 32, 0, s, plan, idx, zc_tab, k, stage, stride);
 }
 
-void init_pre(float* pre, int T, cudaStream_t s) { strata_ds4_launch(init_pre_kernel, cdiv(T * 8, 128), 128, 0, s, pre, T); }
+void init_pre(float* pre, int T, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    if (strata::dsv41::metal_host::init_pre(pre, T, s)) return;   // the ported MSL kernel
+#endif
+    strata_ds4_launch(init_pre_kernel, cdiv(T * 8, 128), 128, 0, s, pre, T);
+}
 
 void embed(const uint16_t* rows, int T, float* h, int dim, int hc, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    if (strata::dsv41::metal_host::embed(rows, T, h, dim, hc, s)) return;
+#endif
     strata_ds4_launch(embed_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, rows, h, dim, hc);
 }
 

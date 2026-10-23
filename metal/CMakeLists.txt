@@ -144,6 +144,6 @@ add_executable(strata_ds4 ${STRATA_DS4_SOURCES})
 target_include_directories(strata_ds4 PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include/metal_compat ${STRATA_ROOT}/include ${DS4} ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${STRATA_ROOT}/third_party/ggml ${STRATA_GGML_DIR}/ggml/include ${STRATA_GGML_DIR}/ggml/src ${STRATA_GGML_DIR}/ggml/src/ggml-cpu)
-target_compile_definitions(strata_ds4 PRIVATE STRATA_METAL=1)
+target_compile_definitions(strata_ds4 PRIVATE STRATA_METAL=1)   # the real host CPU lane (ds4_gg_cpu.cpp)
 target_compile_options(strata_ds4 PRIVATE -Wno-unused-parameter -Wno-deprecated-declarations -Wno-implicit-function-declaration)
 target_link_libraries(strata_ds4 PRIVATE strata_metal_kernels strata_metal_host)

@@ -24,10 +24,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <map>
-#include <mutex>
+#include <mutex>   // recursive_mutex
 #include <thread>
 #include <vector>
 
@@ -162,16 +163,26 @@ MTL::CommandBuffer* open_cb(StreamImpl* s) {
     }
     return s->cb;
 }
+// StreamImpl's encoder/command-buffer state is touched from the loader, the prefetcher and the compute path.
+// Without this lock two encoders can be open on one command buffer at once, which Metal asserts on.
+static std::recursive_mutex g_stream_mu;   // encode_copy/flush nest
+
 void end_encoder(StreamImpl* s) {
-    if (s->enc) { s->enc->endEncoding(); s->enc = nullptr; }
+    if (s->enc) { if (std::getenv("STRATA_GPU_TRACE")) std::fprintf(stderr, "[gpu] close compute enc %p\n", (void*) s->enc);
+        s->enc->endEncoding(); s->enc = nullptr; }
 }
 MTL::ComputeCommandEncoder* encoder(StreamImpl* s) {
-    if (!s->enc) s->enc = open_cb(s)->computeCommandEncoder();   // serial dispatch: each dispatch sees the last
+        std::lock_guard<std::recursive_mutex> lk(g_stream_mu);
+    if (!s->enc) { s->enc = open_cb(s)->computeCommandEncoder();
+        if (std::getenv("STRATA_GPU_TRACE")) std::fprintf(stderr, "[gpu] open compute enc %p (cb %p)\n", (void*) s->enc, (void*) s->cb); }   // serial dispatch: each dispatch sees the last
     return s->enc;
 }
 void flush(StreamImpl* s) {
+    std::lock_guard<std::recursive_mutex> lk(g_stream_mu);
     if (!s->cb) return;
     end_encoder(s);
+    if (std::getenv("STRATA_GPU_TRACE")) std::fprintf(stderr, "[gpu] signal %llu on cb %p (enc %p)\n",
+                                 (unsigned long long) (s->submitted + 1), (void*) s->cb, (void*) s->enc);
     s->cb->encodeSignalEvent(s->tl, ++s->submitted);
     s->cb->commit();
     s->cb->release();
@@ -195,6 +206,7 @@ void check_purged(const Alloc* a, const char* what) {
 }
 
 Error encode_copy(StreamImpl* s, void* dst, const void* src, size_t n) {
+    std::lock_guard<std::recursive_mutex> lk(g_stream_mu);
     size_t od = 0, os = 0;
     const Alloc* ad = find(dst, &od);
     const Alloc* as = find(src, &os);
@@ -203,6 +215,7 @@ Error encode_copy(StreamImpl* s, void* dst, const void* src, size_t n) {
     if (ad && as) {   // buffer to buffer: a blit, in stream order
         end_encoder(s);
         MTL::BlitCommandEncoder* b = open_cb(s)->blitCommandEncoder();
+        if (std::getenv("STRATA_GPU_TRACE")) std::fprintf(stderr, "[gpu] blit copy %zu\n", n);
         b->copyFromBuffer(as->buf, os, ad->buf, od, n);
         b->endEncoding();
         ++rt().stats.blits;
@@ -219,6 +232,7 @@ Error encode_copy(StreamImpl* s, void* dst, const void* src, size_t n) {
 }
 
 Error encode_fill(StreamImpl* s, void* p, int value, size_t n) {
+    std::lock_guard<std::recursive_mutex> lk(g_stream_mu);
     size_t off = 0;
     const Alloc* a = find(p, &off);
     if (!a) return fail(kErrorInvalidValue);
@@ -232,6 +246,7 @@ Error encode_fill(StreamImpl* s, void* p, int value, size_t n) {
 }
 
 Error encode_dispatch(StreamImpl* s, const Op& o) {
+    std::lock_guard<std::recursive_mutex> lk(g_stream_mu);
     MTL::ComputeCommandEncoder* e = encoder(s);
     e->setComputePipelineState(o.pipe);
     if (o.big_args.empty()) e->setBytes(o.args, o.arg_bytes, 0);

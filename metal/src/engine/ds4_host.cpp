@@ -12,6 +12,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+
+#include <strata/gpu/runtime.hpp>
 #include <vector>
 
 namespace strata::dsv41::metal_host {
@@ -26,7 +28,7 @@ bool ensure(mtl::Context& cx) {
     if (g_tried && g_lib < 0) return false;
     g_tried = true;
     // the kernel lives in its own file and is self-contained (metal_stdlib + ggml_grids.h)
-    g_lib = cx.compile({"src/engine/msl/ds4_quant.metal"}, "", false);
+    g_lib = cx.compile({"../src/engine/msl/ds4_quant.metal"}, "", false);
     if (g_lib < 0) {
         std::fprintf(stderr, "dsv41 metal: compiling ds4_quant.metal failed\n");
         return false;
@@ -58,6 +60,82 @@ bool q8_quant(mtl::Context& cx, const float* x, int ldx, int n, void* q, void* d
     ds.tg[1] = ds.tg[2] = 1;
     mtl::require_fit(p, 32, "ds4_q8_quant");
     cx.run({ds});
+    return true;
+}
+
+}  // namespace strata::dsv41::metal_host
+
+namespace strata::dsv41::metal_host {
+namespace {
+mtl::Context* g_init_cx = nullptr;
+int g_lib_init = -1;
+
+mtl::Context& init_cx() {
+    if (!g_init_cx) {
+        g_init_cx = new mtl::Context();
+        g_lib_init = g_init_cx->compile({"../src/engine/msl/ds4_init.metal"}, "", false);
+        if (g_lib_init < 0) std::fprintf(stderr, "dsv41 metal: compiling ds4_init.metal failed\n");
+    }
+    return *g_init_cx;
+}
+}  // namespace
+
+// ds4_kernels.cu:1477 - pre[i] = (i % 8) == 0 ? 1 : 0 for i < T*8
+bool init_pre(float* pre, int T, void*) {
+    init_cx();
+    if (g_lib_init < 0) return false;
+    void* host = strata::gpu::host_view(pre);
+    if (!host) { std::fprintf(stderr, "dsv41 metal: init_pre has no host view\n"); return false; }
+    const size_t bytes = (size_t) T * 8 * sizeof(float);
+    const size_t page = 16384;
+    mtl::Buffer bp = init_cx().wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)),
+                                    ((bytes + page - 1) / page) * page);
+    if (!bp.handle) { std::fprintf(stderr, "dsv41 metal: init_pre wrap failed\n"); return false; }
+    const uintptr_t delta = (uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1));
+    mtl::Pipeline pl;
+    try {
+        pl = init_cx().pipeline(g_lib_init, "ds4_init_pre");
+    } catch (...) {
+        return false;
+    }
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.args = {mtl::Arg::B(bp, delta), mtl::Arg::V((unsigned) T)};
+    d.grid[0] = (uint32_t) ((T * 8 + 127) / 128);
+    d.grid[1] = d.grid[2] = 1;
+    d.tg[0] = 128;
+    d.tg[1] = d.tg[2] = 1;
+    init_cx().run({d});
+    return true;
+}
+
+
+// ds4_kernels.cu:130 - the BF16 embedding gather, hc copies a token
+bool embed(const uint16_t* rows, int T, float* h, int dim, int hc, void*) {
+    init_cx();
+    if (g_lib_init < 0) { std::fprintf(stderr, "dsv41 metal: embed: no library\n"); return false; }
+    void* hrows = strata::gpu::host_view((void*) rows);
+    void* hh = strata::gpu::host_view(h);
+    if (!hrows || !hh) { std::fprintf(stderr, "dsv41 metal: embed has no host view\n"); return false; }
+    const size_t page = 16384;
+    auto wrap = [&](void* host, size_t bytes) {
+        return init_cx().wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)), ((bytes + page - 1) / page) * page);
+    };
+    mtl::Buffer br = wrap(hrows, (size_t) T * dim * 2);
+    mtl::Buffer bh = wrap(hh, (size_t) T * hc * dim * 4);
+    if (!br.handle || !bh.handle) { std::fprintf(stderr, "dsv41 metal: embed wrap failed\n"); return false; }
+    const size_t dro = (size_t) (((uintptr_t) hrows) - (((uintptr_t) hrows) & ~(uintptr_t) (page - 1)));
+    const size_t dho = (size_t) (((uintptr_t) hh) - (((uintptr_t) hh) & ~(uintptr_t) (page - 1)));
+    mtl::Pipeline pl;
+    try { pl = init_cx().pipeline(g_lib_init, "ds4_embed"); } catch (...) { return false; }
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.args = {mtl::Arg::B(br, dro), mtl::Arg::B(bh, dho), mtl::Arg::V((unsigned) dim), mtl::Arg::V((unsigned) hc)};
+    d.grid[0] = (uint32_t) ((dim + 255) / 256);
+    d.grid[1] = (uint32_t) T;
+    d.grid[2] = 1;
+    d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
+    init_cx().run({d});
     return true;
 }
 
