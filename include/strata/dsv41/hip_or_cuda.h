@@ -36,6 +36,7 @@ inline hipError_t hipMemcpy(T* dst, const T* src, size_t n, int kind) {
 }
 inline hipError_t hipMemset(void* p, int v, size_t n) { return cudaMemset(p, v, n); }
 inline hipError_t hipDeviceSynchronize() { return cudaDeviceSynchronize(); }
+inline hipError_t hipSetDevice(int d) { return cudaSetDevice(d); }
 inline const char* hipGetErrorString(hipError_t e) { return cudaGetErrorString(e); }
 inline hipError_t hipEventCreate(hipEvent_t* e) { return cudaEventCreate(e); }
 inline hipError_t hipEventRecord(hipEvent_t e, hipStream_t s = nullptr) { return cudaEventRecord(e, s); }

@@ -144,24 +144,155 @@ static void bench(int type) {
                 (double) NE * 3 * FF * E / ((ms_gu + ms_dn) * 1e-3) / 1e12, 40.0 * (ms_gu + ms_dn));
 }
 
+
+// --dump F / --cmp F: every device output of a run as raw bits, to a file / against one (a kernel change that keeps the sums
+// exact and the float order must leave all of them identical)
+static FILE* g_dump = nullptr; static FILE* g_cmp = nullptr; static long g_cmp_bad = 0, g_cmp_n = 0;
+static void bits(const char* what, int type, const void* p, size_t bytes) {
+    if (!g_dump && !g_cmp) return;
+    if (g_dump) { std::fwrite(p, 1, bytes, g_dump); return; }
+    std::vector<uint8_t> ref(bytes);
+    if (std::fread(ref.data(), 1, bytes, g_cmp) != bytes) { std::printf("cmp: golden file too short at %s %s\n", iq::name(type), what); ++g_cmp_bad; return; }
+    ++g_cmp_n;
+    if (std::memcmp(ref.data(), p, bytes) != 0) {
+        size_t bad = 0, first = 0; for (size_t i = 0; i < bytes; ++i) if (ref[i] != ((const uint8_t*) p)[i]) { if (!bad) first = i; ++bad; }
+        std::printf("%-7s %-22s BITS DIFFER: %zu of %zu bytes (first at %zu)\n", iq::name(type), what, bad, bytes, first);
+        ++g_cmp_bad;
+    }
+}
+// the real shapes (n_embd 5120, n_ff 2304): the plan path (6 groups of one entry) and the grouped path (windows of 3 and 2)
+static void real_shape_bits(int type) {
+    std::mt19937_64 rng(1000 + type);   // (its own stream: the main loop's random experts are the same with or without this)
+    const int E = 5120, FF = 2304, NG = 2, NEnt = 5;
+    const size_t rb_g = iq::row_bytes(type, E), rb_d = iq::row_bytes(type, FF);
+    auto al = [](size_t n) { return (n + 255) / 256 * 256; };
+    const size_t off[3] = {0, al(FF * rb_g), al(FF * rb_g) * 2}, blob = off[2] + al((size_t) E * rb_d);
+    std::vector<uint8_t> hb((size_t) NG * blob);
+    for (auto& b : hb) b = (uint8_t) rng();
+    for (size_t b = 0; b < hb.size() / (size_t) iq::block_bytes(type); ++b) {   // sane F16 scales (the same placement as make_mat)
+        const uint16_t d = f2h(0.02f + 0.0002f * (float) (rng() % 600));
+        uint8_t* p = &hb[b * (size_t) iq::block_bytes(type)];
+        if (type == 29) { p[49] = (uint8_t) ((p[49] & 0x0f) | ((d & 0x000f) << 4)); p[51] = (uint8_t) ((p[51] & 0x0f) | (d & 0x00f0)); p[53] = (uint8_t) ((p[53] & 0x0f) | ((d & 0x0f00) >> 4)); p[55] = (uint8_t) ((p[55] & 0x0f) | ((d & 0xf000) >> 8)); }
+        else std::memcpy(p, &d, 2);
+    }
+    uint8_t* dblob = up(hb);
+    std::vector<int8_t> xq(E), hq((size_t) NEnt * FF); std::vector<float> xd(E / 32), hd((size_t) NEnt * FF / 32);
+    for (auto& v : xq) v = (int8_t) ((int) (rng() % 255) - 127);
+    for (auto& v : hq) v = (int8_t) ((int) (rng() % 255) - 127);
+    for (auto& v : xd) v = 0.002f + 0.0001f * (float) (rng() % 100);
+    for (auto& v : hd) v = 0.002f + 0.0001f * (float) (rng() % 100);
+    iq::Args a{};
+    a.n_embd = E; a.n_ff = FF; a.limit = 10.0f; a.xq = up(xq); a.xd = up(xd); a.hq = up(hq); a.hd = up(hd); a.tg = a.td = type;
+    for (int r = 0; r < 3; ++r) a.tr[r] = off[r];
+    float *dh, *dp; CK(hipMalloc(&dh, (size_t) NEnt * FF * 4)); CK(hipMalloc(&dp, (size_t) NEnt * E * 4)); a.h = dh; a.part = dp;
+    std::vector<unsigned long long> plan = {(unsigned long long) dblob, (unsigned long long) (dblob + blob), 0ull, (unsigned long long) dblob};
+    a.plan_ptr = up(plan);
+    CK(hipMemset(dh, 0, (size_t) NEnt * FF * 4)); CK(hipMemset(dp, 0, (size_t) NEnt * E * 4));
+    if (!iq::gate_up(a, 4, 1, 0) || !iq::down(a, 4, 1, 0)) { std::printf("real shape: refused\n"); return; }
+    CK(hipDeviceSynchronize());
+    { auto h = down_(dh, (size_t) NEnt * FF); bits("real plan h", type, h.data(), h.size() * 4); auto p = down_(dp, (size_t) NEnt * E); bits("real plan part", type, p.data(), p.size() * 4); }
+    std::vector<unsigned long long> gp = {(unsigned long long) dblob, (unsigned long long) (dblob + blob)};
+    std::vector<int> gs = {0, 3, 5}, ge = {0, 1, 2, 3, 4}, ng = {NG};
+    a.plan_ptr = nullptr; a.grp_ptr = up(gp); a.grp_start = up(gs); a.grp_ent = up(ge); a.n_groups = up(ng);
+    CK(hipMemset(dh, 0, (size_t) NEnt * FF * 4)); CK(hipMemset(dp, 0, (size_t) NEnt * E * 4));
+    if (!iq::gate_up(a, NG, 3, 0) || !iq::down(a, NG, 3, 0)) { std::printf("real shape grouped: refused\n"); return; }
+    CK(hipDeviceSynchronize());
+    { auto h = down_(dh, (size_t) NEnt * FF); bits("real grp h", type, h.data(), h.size() * 4); auto p = down_(dp, (size_t) NEnt * E); bits("real grp part", type, p.data(), p.size() * 4); }
+    CK(hipFree(dblob));
+}
+
+// the same DeepSeek decode token over a working set far past L2 (>= 640 MiB of distinct expert blobs, rotated launch by launch),
+// so the rate is DRAM's, not L2's: gate/up and down timed apart; ne = entries a group (1: the decode token)
+static void bench_big(int type, int mib) {
+    const int E = 5120, FF = 2304, NE = 6;
+    const size_t rb_g = iq::row_bytes(type, E), rb_d = iq::row_bytes(type, FF);
+    auto al = [](size_t n) { return (n + 255) / 256 * 256; };
+    const size_t off[3] = {0, al(FF * rb_g), al(FF * rb_g) * 2}, blob = off[2] + al((size_t) E * rb_d);
+    const int L = std::max(2, (int) (((size_t) mib << 20) / (NE * blob)) + 1);   // layers rotated
+    std::mt19937_64 rng(5);
+    std::vector<uint8_t> one(blob);
+    for (auto& b : one) b = (uint8_t) rng();
+    std::vector<unsigned long long> plan((size_t) L * NE);
+    for (auto& p : plan) { uint8_t* d; CK(hipMalloc(&d, blob)); CK(hipMemcpy(d, one.data(), blob, hipMemcpyHostToDevice)); p = (unsigned long long) d; }
+    std::vector<int8_t> xq(E, 3), hq((size_t) NE * FF, 3); std::vector<float> xd(E / 32, 0.01f), hd((size_t) NE * FF / 32, 0.01f);
+    for (int i = 0; i < E; ++i) xq[i] = (int8_t) ((int) (rng() % 255) - 127);
+    for (size_t i = 0; i < hq.size(); ++i) hq[i] = (int8_t) ((int) (rng() % 255) - 127);
+    unsigned long long* dplan = up(plan);
+    iq::Args a{};
+    a.n_embd = E; a.n_ff = FF; a.limit = 10.0f; a.xq = up(xq); a.xd = up(xd); a.hq = up(hq); a.hd = up(hd); a.tg = a.td = type;
+    for (int r = 0; r < 3; ++r) a.tr[r] = off[r];
+    float *dh, *dp; CK(hipMalloc(&dh, (size_t) NE * FF * 4)); CK(hipMalloc(&dp, (size_t) NE * E * 4)); a.h = dh; a.part = dp;
+    hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
+    double us[2] = {0, 0};
+    for (int part = 0; part < 2; ++part) {
+        auto run = [&](int reps) {
+            hipEventRecord(e0);
+            for (int rep = 0; rep < reps; ++rep) {
+                a.plan_ptr = dplan + (size_t) (rep % L) * NE;
+                if (part == 0) iq::gate_up(a, NE, 1, 0); else iq::down(a, NE, 1, 0);
+            }
+            hipEventRecord(e1); hipEventSynchronize(e1);
+            float ms; hipEventElapsedTime(&ms, e0, e1);
+            return (double) ms;
+        };
+        double ms = 0; int reps = 2 * L;
+        while (ms < 300.0) { ms = run(reps); reps *= 2; }   // warm-up: clocks ramp, ~300 ms
+        const int n = std::max(L, (int) (reps / 2 * 40.0 / ms));   // ~40 ms a window
+        double best = 1e30;
+        for (int w = 0; w < 7; ++w) best = std::min(best, run(n) * 1e3 / n);   // the best of 7 windows (clocks/thermals wander)
+        us[part] = best;
+    }
+    const double bg = (double) NE * (off[2]) , bd = (double) NE * al((size_t) E * rb_d);   // bytes read a launch
+    std::printf("big %-7s ws %4.0f MiB: gate/up %6.1f us (%5.0f GB/s)  down %6.1f us (%5.0f GB/s)  layer %6.1f us -> %5.0f GB/s, %.2f Tw/s\n",
+                iq::name(type), (double) L * NE * blob / 1048576.0, us[0], bg / us[0] * 1e-3, us[1], bd / us[1] * 1e-3, us[0] + us[1],
+                (bg + bd) / (us[0] + us[1]) * 1e-3, (double) NE * 3 * FF * E / ((us[0] + us[1]) * 1e-6) / 1e12);
+    for (auto p : plan) hipFree((void*) p);
+}
+
 int main(int argc, char** argv) {
     std::vector<int> types = {16, 17, 22, 18, 21, 23, 29};
+    std::vector<int> devs;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--bench") {
+        if (std::string(argv[i]) == "--bench-big") {   // [types] [MiB]
+            std::vector<int> bt; int mib = 640;
+            if (i + 1 < argc && argv[i + 1][0] != '-') { for (const char* p = argv[++i]; *p;) { bt.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; } }
+            else bt = types;
+            if (i + 1 < argc && argv[i + 1][0] != '-') mib = std::atoi(argv[++i]);
+            for (int t : bt) bench_big(t, mib);
+            return 0;
+        } else if (std::string(argv[i]) == "--bench") {
             std::vector<int> bt;
             if (i + 1 < argc && argv[i + 1][0] != '-') { for (const char* p = argv[++i]; *p;) { bt.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; } }
             else bt = types;
             for (int t : bt) bench(t);
             return 0;
+        } else if (std::string(argv[i]) == "--devices" && i + 1 < argc) {   // every check on each device in turn, in this process;
+            devs.clear(); for (const char* p = argv[++i]; *p;) { devs.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; }   // the later ones bit-compared to the first
+        } else if (std::string(argv[i]) == "--dump" && i + 1 < argc) {
+            g_dump = std::fopen(argv[++i], "wb"); if (!g_dump) { std::printf("cannot write %s\n", argv[i]); return 2; }
+        } else if (std::string(argv[i]) == "--cmp" && i + 1 < argc) {
+            g_cmp = std::fopen(argv[++i], "rb"); if (!g_cmp) { std::printf("cannot read %s\n", argv[i]); return 2; }
         } else if (std::string(argv[i]) == "--type" && i + 1 < argc) {
             types.clear(); for (const char* p = argv[++i]; *p;) { types.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; }
         } else if (std::string(argv[i]) == "--iq256" && i + 1 < argc) {
             gg::gg_cpu_set_iq256(std::atoi(argv[++i]));
         }
     }
+    int fails = 0;
+    if (devs.size() > 1) {   // the first device writes its outputs, the others compare to them
+        if (g_dump || g_cmp) { std::printf("--devices takes neither --dump nor --cmp\n"); return 2; }
+    }
+    for (size_t di = 0; di < std::max<size_t>(1, devs.size()); ++di) {
+    if (!devs.empty()) {
+        CK(hipSetDevice(devs[di]));
+        if (devs.size() > 1) {
+            if (g_dump) { std::fclose(g_dump); g_dump = nullptr; }
+            if (di == 0) g_dump = std::fopen("iq_devices.bin", "wb"); else { g_cmp = std::fopen("iq_devices.bin", "rb"); g_cmp_n = g_cmp_bad = 0; }
+        }
+        std::printf("---- device %d\n", devs[di]);
+    }
     std::mt19937_64 rng(11);
     std::normal_distribution<float> nd(0.f, 1.f);
-    int fails = 0;
     auto report = [&](const char* what, int type, double worst, double tol) {
         const bool ok = worst <= tol;
         std::printf("%-7s %-22s worst %.2e (tol %.0e) %s\n", iq::name(type), what, worst, tol, ok ? "ok" : "FAIL");
@@ -218,6 +349,7 @@ int main(int argc, char** argv) {
             if (!iq::gate_up(a, NEXP, 1, 0)) { std::printf("gate_up refused\n"); return 1; }
             CK(hipDeviceSynchronize());
             const auto h = down_(dh, (size_t) NEXP * FF);
+            bits("token h", type, h.data(), h.size() * 4);
             double worst = 0;
             for (int e = 0; e < NEXP; ++e)
                 for (int r = 0; r < FF; ++r) {
@@ -233,6 +365,7 @@ int main(int argc, char** argv) {
             if (!iq::down(a, NEXP, 1, 0)) { std::printf("down refused\n"); return 1; }
             CK(hipDeviceSynchronize());
             const auto part = down_(dp, (size_t) NEXP * E);
+            bits("token part", type, part.data(), part.size() * 4);
             worst = 0;
             for (int e = 0; e < NEXP; ++e)
                 for (int r = 0; r < E; ++r) {
@@ -253,6 +386,7 @@ int main(int argc, char** argv) {
             if (!iq::set_gate_up(q, 0)) { std::printf("set_gate_up refused\n"); return 1; }
             CK(hipDeviceSynchronize());
             const auto h16 = down_(dh16, (size_t) NR * FF);
+            bits("set h16", type, h16.data(), h16.size() * 2);
             double w2 = 0;
             for (int e = 0; e < 3; ++e)
                 for (int lr = bounds[e]; lr < bounds[e + 1]; ++lr)
@@ -267,6 +401,8 @@ int main(int argc, char** argv) {
             if (!iq::set_down(q, 0)) { std::printf("set_down refused\n"); return 1; }
             CK(hipDeviceSynchronize());
             const auto y = down_(dy, (size_t) NR * E);
+            bits("set y", type, y.data(), y.size() * 4);
+            real_shape_bits(type);
             w2 = 0;
             for (int e = 0; e < 3; ++e)
                 for (int lr = bounds[e]; lr < bounds[e + 1]; ++lr) {
@@ -316,6 +452,10 @@ int main(int argc, char** argv) {
         }
         CK(hipFree(dblob));
     }
+    if (g_cmp && devs.size() > 1) { std::fclose(g_cmp); g_cmp = nullptr; std::printf("device %d vs device %d: %ld buffers, %ld differ\n", devs[di], devs[0], g_cmp_n, g_cmp_bad); fails += g_cmp_bad != 0; }
+    }
+    if (g_cmp) { std::printf("bit-compare vs golden: %ld buffers, %ld differ -> %s\n", g_cmp_n, g_cmp_bad, g_cmp_bad ? "DIFFERENT" : "IDENTICAL"); fails += g_cmp_bad != 0; }
+    if (g_dump) std::fclose(g_dump);
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails;
 }
