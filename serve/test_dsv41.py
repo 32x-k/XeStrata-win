@@ -527,6 +527,54 @@ class Api(unittest.TestCase):
         self.assertEqual(last["decode_tok_s"], 100.0)
 
 
+    # -- the shared start of an agent's and its sub-agents' prompts (the engine keeps its state there) ------------
+    def test_the_system_prompt_and_tools_are_the_shared_start(self):
+        self.start("ok")
+        sysmsg = {"role": "system", "content": "You are an agent. " * 20}
+        body = {"messages": [sysmsg, {"role": "user", "content": "task one"}], "tools": [WEATHER], "max_tokens": 40}
+        self.assertEqual(self.post("/v1/chat/completions", body)[0], 200)
+        n = self.engine.last_sampling["strata_prefix"]["tokens"]
+        ids = self.engine.last_prompt
+        self.assertTrue(0 < n < len(ids) - 1)
+        self.assertIn("get_weather", self.tok.decode(ids[:n]))            # the tools are in the shared start
+        self.assertNotIn("task one", self.tok.decode(ids[:n]))            # the first user message is not
+        # another agent behind the same system prompt and tools, another task: the same boundary, the same start
+        body["messages"] = [sysmsg, {"role": "user", "content": "a different task for the sub-agent"}]
+        self.assertEqual(self.post("/v1/chat/completions", body)[0], 200)
+        self.assertEqual(self.engine.last_sampling["strata_prefix"]["tokens"], n)
+        self.assertEqual(self.engine.last_prompt[:n], ids[:n])
+
+    def test_no_shared_start_without_a_system_prompt_or_when_switched_off(self):
+        self.start("ok")
+        self.chat()
+        self.assertNotIn("strata_prefix", self.engine.last_sampling)
+        body = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}], "max_tokens": 40}
+        old = os.environ.get("STRATA_DS4_AUTO_PIN")
+        os.environ["STRATA_DS4_AUTO_PIN"] = "0"
+        try:
+            self.post("/v1/chat/completions", body)
+            self.assertNotIn("strata_prefix", self.engine.last_sampling)
+        finally:
+            if old is None:
+                os.environ.pop("STRATA_DS4_AUTO_PIN", None)
+            else:
+                os.environ["STRATA_DS4_AUTO_PIN"] = old
+
+    def test_a_clients_own_prefix_wins(self):
+        self.start("ok")
+        body = {"messages": [{"role": "system", "content": "s " * 30}, {"role": "user", "content": "u"}],
+                "max_tokens": 40, "strata_prefix": {"tokens": 7}}
+        self.post("/v1/chat/completions", body)
+        self.assertEqual(self.engine.last_sampling["strata_prefix"], {"tokens": 7})
+
+    def test_the_qwen_path_asks_for_no_prefix(self):
+        # the same request on a server that is not DeepSeek's: nothing is added (Qwen keeps its own cache logic)
+        svc = Service(MockEngine(self.tok, "ok"), self.tok, ChatTemplate(ROOT / "serve" / "chat_template.jinja"))
+        req = {}
+        svc.prepare([{"role": "system", "content": "s"}, {"role": "user", "content": "u"}], None, {}, 16, req=req)
+        self.assertEqual(req, {})
+
+
 class PickTemplateTests(unittest.TestCase):
     """A pack made from another GGUF can ship the V4-Flash template (`tool_calls`, no space): the V4.1 model then
     writes malformed calls (P2003 install test).  The server swaps in the V4.1 template for such a pack."""
