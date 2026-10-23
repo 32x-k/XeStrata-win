@@ -4236,6 +4236,7 @@ struct Model::Impl {
         cfg.policy = (ExpertStore::Policy) (std::getenv("DS4_STORE_POLICY") ? std::atoi(std::getenv("DS4_STORE_POLICY")) : o.ssd_policy);
         cfg.ram_avail = [] { return ram_avail(); };
         cfg.reserve = (size_t) (std::getenv("DS4_STORE_RESERVE") ? std::atoi(std::getenv("DS4_STORE_RESERVE")) : 192);
+        cfg.vis_percent = std::getenv("DS4_STORE_ZC_FRAC") ? std::atoi(std::getenv("DS4_STORE_ZC_FRAC")) : 50;
         // (the GPU computing the store's experts over PCIe is opt-in, DS4_STORE_ZC=1: measured slower than the CPU lane alone on a
         // 5070 / PCIe 5.0 - the staging copy sits in the layer's critical path - and its answers depend on the timing of which lane
         // took which expert, the CPU lane's are the mmap path's byte for byte)
@@ -5244,6 +5245,19 @@ struct Model::Impl {
     void cache_tick(int T) {
         cache_tick_swaps(T);
         store_sync();
+        store_watch();
+    }
+    // the store gives RAM back when the PC runs short (the owner opened something): below 4 GB free, a 0.7 GB chunk at a time
+    // until 5 GB are free again (checked every 16 windows); it grows again by itself once 8 GB beside its chunk are free
+    void store_watch() {
+        if (!store) return;
+        static int tick = 0;
+        if (++tick % 16 != 0) return;
+        const uint64_t avail = ram_avail();
+        if (avail == ~uint64_t{0} || avail >= (4ull << 30)) return;
+        const size_t chunks = 1 + (size_t) (((5ull << 30) - avail) / (700ull << 20));
+        const size_t n = store->shrink_chunks(chunks);
+        if (n > 0) std::fprintf(stderr, "ds4: RAM store: %.1f GB free: gave back %zu chunks (%zu slots left)\n", avail / 1e9, n, store->slots_allocated());
     }
     void cache_tick_swaps(int T) {
         if (!o.expert_cache || cache_ths.empty()) return;
@@ -5467,6 +5481,7 @@ struct Model::Impl {
                 Layer& l = L[(size_t) li];
                 uint32_t* pr = prof.data() + (size_t) li * g.n_exp;
                 ents.clear();
+                if (store && li > 0 && li < g.nl) store->cancel_stale(li - 1);   // (guesses for layers the token has passed: dropped unread)
                 // lookahead: the guesses made for this layer (when they are for this request), counted on decode
                 const uint8_t* fl = T == 1 && !ahead_for.empty() && ahead_for[(size_t) li] == next
                                         ? ahead_fl.data() + (size_t) li * 1024 : nullptr;

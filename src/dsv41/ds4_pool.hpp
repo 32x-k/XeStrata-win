@@ -145,6 +145,7 @@ public:
         const uint8_t* mem = nullptr;   // non-null: a copy of len bytes from memory to dst instead of a read
         const void* map = nullptr;      // the range in the file's mapping: all in the page cache, it is read buffered
         uint8_t* keep = nullptr;        // non-null (a read): the len bytes read copied here as well
+        std::atomic<bool>* cancel = nullptr;   // set before the job starts: it is dropped unread (bad is set, left counted down)
     };
     explicit IoQueue(int n) {
         for (int i = 0; i < n; ++i) th_.emplace_back([this] { loop(); });
@@ -157,10 +158,11 @@ public:
         cv_.notify_all();
         for (auto& t : th_) t.join();
     }
-    void push(const Job* jobs, int n) {
+    /// low: a read that can wait (a guess) - the jobs of the first queue are all taken before any of this one's
+    void push(const Job* jobs, int n, bool low = false) {
         {
             std::lock_guard<std::mutex> lk(mu_);
-            for (int i = 0; i < n; ++i) q_.push_back(jobs[i]);
+            for (int i = 0; i < n; ++i) (low ? ql_ : q_).push_back(jobs[i]);
         }
         if (n == 1) cv_.notify_one();
         else cv_.notify_all();
@@ -180,10 +182,21 @@ private:
             Job j;
             {
                 std::unique_lock<std::mutex> lk(mu_);
-                cv_.wait(lk, [&] { return quit_ || !q_.empty(); });
-                if (quit_ && q_.empty()) return;
-                j = q_.front();
-                q_.pop_front();
+                cv_.wait(lk, [&] { return quit_ || !q_.empty() || !ql_.empty(); });
+                if (quit_ && q_.empty() && ql_.empty()) return;
+                std::deque<Job>& qq = q_.empty() ? ql_ : q_;
+                j = qq.front();
+                qq.pop_front();
+            }
+            if (j.cancel != nullptr && j.cancel->load(std::memory_order_acquire)) {   // (dropped unread)
+                if (j.bad != nullptr) j.bad->store(true, std::memory_order_release);
+                if (j.left != nullptr) j.left->fetch_sub(1, std::memory_order_acq_rel);
+                {
+                    std::lock_guard<std::mutex> lk(done_mu_);
+                    ++done_;
+                }
+                done_cv_.notify_all();
+                continue;
             }
             const auto t0 = std::chrono::steady_clock::now();
             const uint64_t lead = j.off % os::kDirectAlign;
@@ -215,7 +228,7 @@ private:
     std::vector<std::thread> th_;
     std::mutex mu_, done_mu_;
     std::condition_variable cv_, done_cv_;
-    std::deque<Job> q_;
+    std::deque<Job> q_, ql_;
     uint64_t done_ = 0;
     bool quit_ = false;
     std::atomic<uint64_t> busy_us_{0}, direct_{0}, buffered_{0};

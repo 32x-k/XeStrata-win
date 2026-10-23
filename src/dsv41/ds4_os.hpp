@@ -392,6 +392,15 @@ inline bool range_commit(void* p, size_t bytes) {
     return ::mprotect(p, bytes, PROT_READ | PROT_WRITE) == 0;
 #endif
 }
+/// A committed piece of a reserved range given back to the system (its address range stays reserved)
+inline void range_decommit(void* p, size_t bytes) {
+#if defined(_WIN32)
+    VirtualFree(p, bytes, MEM_DECOMMIT);
+#else
+    ::madvise(p, bytes, MADV_DONTNEED);
+    ::mprotect(p, bytes, PROT_NONE);
+#endif
+}
 inline void range_release(void* p, size_t bytes) {
     if (p == nullptr) return;
 #if defined(_WIN32)

@@ -48,7 +48,7 @@ public:
     enum Policy { kLru = 0, kLfu = 1 };
     struct Stats {
         std::atomic<int64_t> hits{0}, misses{0}, prefetched{0}, prefetch_used{0}, prefetch_wasted{0}, evictions{0}, fails{0};
-        std::atomic<int64_t> bytes_read{0}, wait_ns{0}, no_slot{0};
+        std::atomic<int64_t> bytes_read{0}, wait_ns{0}, no_slot{0}, cancelled{0};
     };
     struct Vis {                 // a slot the GPU may read from now on (dev != 0), or no longer (dev == 0)
         int layer = 0, e = 0;
@@ -67,6 +67,7 @@ public:
         std::function<void*(void* host, size_t bytes)> map_chunk;
         std::function<void(void* host)> unmap_chunk;
         size_t reserve = 192;              // slots kept evictable (not visible) for the window's demand and guesses
+        int vis_percent = 100;             // the share of experts the GPU may take (by a fixed hash): the rest stay the CPU lane's, so both lanes work
     };
 
     bool init(const Cfg& c, const std::vector<LayerGeo>& layers, const std::vector<os::fd_t>& dfds, const std::vector<os::fd_t>& pfds) {
@@ -234,6 +235,15 @@ public:
         }
         return n;
     }
+    /// Guesses still waiting in the queue for a layer the token is past: dropped unread (their slots free once the queue has gone by)
+    void cancel_stale(int layer_now) {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (size_t i = 0; i < nalloc_; ++i) {
+            Slot& sp = slots_[i];
+            if (sp.prefetch && sp.pin == 0 && sp.layer >= 0 && sp.layer <= layer_now && sp.state.load(std::memory_order_acquire) == kLoading)
+                sp.cancel.store(true, std::memory_order_release);
+        }
+    }
     /// An access the host saw for an expert the GPU computed (keeps it warm in the policy's eyes).
     void touch(int layer, int e) {
         if (layer < 0 || layer >= (int) where_.size()) return;
@@ -276,7 +286,7 @@ public:
                 continue;
             }
             if (sp.pin == 0) ++nfree;
-            if (sp.pin == 0 && dev_blob((int) i) != 0 && gpu_ok(sp.layer, sp.expert) && !sp.prefetch) {
+            if (sp.pin == 0 && dev_blob((int) i) != 0 && gpu_ok(sp.layer, sp.expert) && !sp.prefetch && vis_hash(sp.layer, sp.expert) < cfg_.vis_percent) {
                 sp.visible = true;
                 ++nvis;
                 if (sp.pin == 0) --nfree;
@@ -299,6 +309,42 @@ public:
         }
         return ev.size();
     }
+    /// RAM is short: gives back whole chunks from the end of the arena (their experts forgotten) - up to `want`, stopping at one
+    /// with a slot in use (pinned, loading, or GPU-visible).  Returns the chunks given back.
+    size_t shrink_chunks(size_t want) {
+        std::lock_guard<std::mutex> lk(mu_);
+        size_t done = 0;
+        while (done < want && !chunks_.empty()) {
+            const size_t c = chunks_.size() - 1, first = c * kChunk;
+            bool busy = false;
+            for (size_t i = first; i < nalloc_ && !busy; ++i) {
+                const Slot& sp = slots_[i];
+                busy = sp.pin > 0 || sp.visible || sp.state.load(std::memory_order_acquire) == kLoading;
+            }
+            if (busy) break;
+            for (size_t i = first; i < nalloc_; ++i) {
+                Slot& sp = slots_[i];
+                if (sp.layer >= 0 && sp.expert >= 0) {
+                    where_[(size_t) sp.layer][(size_t) sp.expert] = -1;
+                    st_.evictions.fetch_add(1, std::memory_order_relaxed);
+                }
+                sp.layer = sp.expert = -1;
+                sp.prefetch = false;
+                sp.state.store(kFree, std::memory_order_release);
+                sp.base = nullptr;
+            }
+            if (cfg_.unmap_chunk && chunk_dev_[c] != nullptr) cfg_.unmap_chunk(chunks_[c].first);
+            os::range_decommit(chunks_[c].first, chunks_[c].second);
+            chunks_.pop_back();
+            chunk_dev_.pop_back();
+            nalloc_ = first;
+            free_hint_ = std::min(free_hint_, first);
+            ++done;
+            ++shrunk_;
+        }
+        return done;
+    }
+    size_t shrunk() const { return shrunk_; }
     /// An expert VRAM took over: no longer a visible slot
     void unmark(int layer, int e) {
         if (layer < 0 || layer >= (int) where_.size()) return;
@@ -320,10 +366,11 @@ private:
         int layer = -1, expert = -1, pin = 0;
         bool prefetch = false, visible = false;
         std::atomic<int> state{kFree}, left{0};
-        std::atomic<bool> bad{false};
+        std::atomic<bool> bad{false}, cancel{false};
         uint64_t tick = 0;
     };
 
+    static int vis_hash(int layer, int e) { return (int) (((unsigned) layer * 2654435761u + (unsigned) e * 40503u) >> 7) % 100; }
     double score(const Slot& sp) const {
         if (cfg_.policy == kLru) return (double) sp.tick;
         return (double) heat_[(size_t) sp.layer][(size_t) sp.expert] + 1e-9 * (double) sp.tick;
@@ -354,6 +401,7 @@ private:
         sp.tick = ++clock_;
         sp.state.store(kLoading, std::memory_order_release);
         sp.bad.store(false);
+        sp.cancel.store(false);
         sp.left.store(3, std::memory_order_release);
         where_[(size_t) layer][(size_t) e] = s;
         const LayerGeo& g = geo_[(size_t) layer];
@@ -374,9 +422,10 @@ private:
             j.keep = fin;
             j.left = &sp.left;
             j.bad = &sp.bad;
+            j.cancel = demand ? nullptr : &sp.cancel;
         }
         st_.bytes_read.fetch_add((int64_t) (g.bytes[0] + g.bytes[1] + g.bytes[2]), std::memory_order_relaxed);
-        io_->push(jobs, 3);
+        io_->push(jobs, 3, !demand);   // (a guess waits behind every demand read)
         return s;
     }
     // loading -> ready once its reads are done and whole (lock-free; a failed one is cleaned up by finish / take_slot)
@@ -392,7 +441,8 @@ private:
             sp.layer = sp.expert = -1;
             sp.state.store(kFree, std::memory_order_release);
             sp.prefetch = false;
-            st_.fails.fetch_add(1, std::memory_order_relaxed);
+            if (sp.cancel.load()) st_.cancelled.fetch_add(1, std::memory_order_relaxed);
+            else st_.fails.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         sp.state.store(kReady, std::memory_order_release);
@@ -449,6 +499,7 @@ private:
     std::vector<os::fd_t> dfds_, pfds_;
     size_t slot_bytes_ = 0, nmax_ = 0, nalloc_ = 0, free_hint_ = 0, arena_bytes_ = 0;
     uint8_t* arena_ = nullptr;
+    size_t shrunk_ = 0;
     std::unique_ptr<Slot[]> slots_;
     std::vector<std::pair<void*, size_t>> chunks_;
     std::vector<void*> chunk_dev_;
