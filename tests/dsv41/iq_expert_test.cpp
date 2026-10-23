@@ -214,23 +214,29 @@ static void bench_big(int type, int mib) {
     for (auto& b : one) b = (uint8_t) rng();
     std::vector<unsigned long long> plan((size_t) L * NE);
     for (auto& p : plan) { uint8_t* d; CK(hipMalloc(&d, blob)); CK(hipMemcpy(d, one.data(), blob, hipMemcpyHostToDevice)); p = (unsigned long long) d; }
-    std::vector<int8_t> xq(E, 3), hq((size_t) NE * FF, 3); std::vector<float> xd(E / 32, 0.01f), hd((size_t) NE * FF / 32, 0.01f);
-    for (int i = 0; i < E; ++i) xq[i] = (int8_t) ((int) (rng() % 255) - 127);
+    const int NW = std::getenv("DS4_BENCH_WIN") ? std::max(1, std::min(16, std::atoi(std::getenv("DS4_BENCH_WIN")))) : 0;   // window path: NW entries a group
+    const int NEN = std::max(1, NW) * NE;   // entries
+    std::vector<int8_t> xq((size_t) 8 * E, 3), hq((size_t) NEN * FF, 3); std::vector<float> xd((size_t) 8 * E / 32, 0.01f), hd((size_t) NEN * FF / 32, 0.01f);
+    for (size_t i = 0; i < xq.size(); ++i) xq[i] = (int8_t) ((int) (rng() % 255) - 127);
     for (size_t i = 0; i < hq.size(); ++i) hq[i] = (int8_t) ((int) (rng() % 255) - 127);
     if (const char* e = std::getenv("DS4_BENCH_ACTIVE")) { const int na = std::atoi(e); for (int l = 0; l < L; ++l) for (int k = na; k < NE; ++k) plan[(size_t) l * NE + k] = 0; }   // (empty plan entries)
     unsigned long long* dplan = up(plan);
     iq::Args a{};
     a.n_embd = E; a.n_ff = FF; a.limit = 10.0f; a.xq = up(xq); a.xd = up(xd); a.hq = up(hq); a.hd = up(hd); a.tg = a.td = type;
     for (int r = 0; r < 3; ++r) a.tr[r] = off[r];
-    float *dh, *dp; CK(hipMalloc(&dh, (size_t) NE * FF * 4)); CK(hipMalloc(&dp, (size_t) NE * E * 4)); a.h = dh; a.part = dp;
+    float *dh, *dp; CK(hipMalloc(&dh, (size_t) NEN * FF * 4)); CK(hipMalloc(&dp, (size_t) NEN * E * 4)); a.h = dh; a.part = dp;
+    std::vector<int> gstart(NE + 1), gent(NEN), ngrp(1, NE);
+    for (int g = 0; g <= NE; ++g) gstart[g] = g * std::max(1, NW);
+    for (int i = 0; i < NEN; ++i) gent[i] = i;
+    a.grp_start = up(gstart); a.grp_ent = up(gent); a.n_groups = up(ngrp);
     hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
     double us[2] = {0, 0};
     for (int part = 0; part < 2; ++part) {
         auto run = [&](int reps) {
             hipEventRecord(e0);
             for (int rep = 0; rep < reps; ++rep) {
-                a.plan_ptr = dplan + (size_t) (rep % L) * NE;
-                if (part == 0) iq::gate_up(a, NE, 1, 0); else iq::down(a, NE, 1, 0);
+                if (NW) a.grp_ptr = dplan + (size_t) (rep % L) * NE; else a.plan_ptr = dplan + (size_t) (rep % L) * NE;
+                if (part == 0) iq::gate_up(a, NE, std::max(1, NW), 0); else iq::down(a, NE, std::max(1, NW), 0);
             }
             hipEventRecord(e1); hipEventSynchronize(e1);
             float ms; hipEventElapsedTime(&ms, e0, e1);
