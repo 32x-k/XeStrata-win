@@ -59,6 +59,11 @@ def sensible(text: str) -> tuple[bool, str]:
 
 
 def main() -> int:
+    for st in (sys.stdout, sys.stderr):       # the reply has DeepSeek's special tokens (fullwidth bars): a Windows console code page cannot print them
+        try:
+            st.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", required=True)
     ap.add_argument("--pack", required=True)
@@ -77,7 +82,7 @@ def main() -> int:
         if a.gpus:
             cmd += ["--gpus", a.gpus]
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=a.timeout, env=dict(os.environ))
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=a.timeout, env=dict(os.environ))
         except (OSError, subprocess.TimeoutExpired) as e:
             print(f"the engine did not finish the test run: {e}")
             return 2

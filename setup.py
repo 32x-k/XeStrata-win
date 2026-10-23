@@ -7355,7 +7355,7 @@ def dsv41_engine_env(lib_dirs) -> dict:
 def dsv41_pack_info(exe: Path, pack: Path, lib_dirs) -> tuple[bool, str]:
     """`strata-dsv41 --pack-info --pack P`: (True, text) when every file of the pack is there (no MISSING line), else (False, text)."""
     try:
-        r = subprocess.run([str(exe), "--pack-info", "--pack", str(pack)], capture_output=True, text=True, timeout=300,
+        r = subprocess.run([str(exe), "--pack-info", "--pack", str(pack)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
                            env=dsv41_engine_env(lib_dirs))
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, f"the engine could not read the pack: {e}"
@@ -7370,7 +7370,8 @@ def dsv41_smoke(exe: Path, pack: Path, lib_dirs, gpus=None, timeout: int = 5400)
     if gpus:
         cmd += ["--gpus", ",".join(str(g) for g in gpus)]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=dsv41_engine_env(lib_dirs))
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                           env=dsv41_engine_env(lib_dirs))
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, f"the test run did not finish: {e}"
     text = ((r.stdout or "") + (r.stderr or "")).strip()
