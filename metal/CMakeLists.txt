@@ -122,3 +122,21 @@ target_link_libraries(strata_metal_kernels PUBLIC strata_metal_host mtl_rt)
 
 add_executable(strata ${S}/program/generate.cpp)
 target_link_libraries(strata PRIVATE strata_metal_kernels strata_metal_host strata_metal_kernels)
+
+# --- the DeepSeek engine on this Metal runtime (M5MAX-DEEPSEEK-PLAN.md, steps 3+).  The .cu sources are compiled as C++
+# through include/metal_compat, which gives them CUDA's names over the Metal runtime; the kernel entry points they call are
+# the Metal implementations in src/engine/* or the stubs from tools/gen_stubs.py that stop the engine with the name.
+set(DS4 ${STRATA_ROOT}/src/dsv41)
+set(STRATA_DS4_SOURCES
+  ${DS4}/ds4_main.cpp
+  ${DS4}/ds4_model.cu ${DS4}/ds4_gguf.cu ${DS4}/ds4_iq.cu ${DS4}/ds4_kernels.cu ${DS4}/ds4_tq.cu
+  ${DS4}/ds4_gg_cpu.cpp ${DS4}/ds4_gguf_cpu.cpp ${DS4}/ds4_iq_cpu.cpp ${DS4}/ds4_tq_cpu.cpp ${DS4}/ds4_packinfo.cpp)
+set_source_files_properties(${DS4}/ds4_model.cu ${DS4}/ds4_gguf.cu ${DS4}/ds4_iq.cu ${DS4}/ds4_kernels.cu ${DS4}/ds4_tq.cu
+                            PROPERTIES LANGUAGE CXX)
+add_executable(strata_ds4 ${STRATA_DS4_SOURCES})
+target_include_directories(strata_ds4 PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/metal_compat ${STRATA_ROOT}/include ${DS4}
+  ${STRATA_ROOT}/third_party/ggml ${STRATA_GGML_DIR}/ggml/include ${STRATA_GGML_DIR}/ggml/src)
+target_compile_definitions(strata_ds4 PRIVATE STRATA_METAL=1)
+target_compile_options(strata_ds4 PRIVATE -Wno-unused-parameter -Wno-deprecated-declarations -Wno-implicit-function-declaration)
+target_link_libraries(strata_ds4 PRIVATE strata_metal_kernels strata_metal_host)
