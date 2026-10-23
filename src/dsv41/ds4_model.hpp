@@ -8,7 +8,9 @@
 // its own 128-token window, the compressed groups completed by its position.  The state a token leaves is the
 // 128-token window ring of every layer, the compressors' partial groups, the compressed KV and index keys of the KV
 // source layers (append-only), and the Engram n-gram history; checkpoint() / restore() keep the first two (the rest is
-// truncated by position) so a conversation can go back to the end of its last prompt.
+// truncated by position) so a conversation can go back to the end of its last prompt.  A conversation that leaves the
+// model altogether (another chat answered in between) is a slot: slot_save / slot_load take the same state - the
+// compressed KV and index keys included, which a checkpoint leaves in place - through a file or a host buffer.
 #pragma once
 
 #include <cstddef>
@@ -146,6 +148,23 @@ public:
     void checkpoint(int slot = 0);
     bool restore(int64_t limit);
     int64_t restorable(int64_t limit) const;
+    /// Checkpoint 1 also becomes the anchor (kept until a restore goes before it): the position before the end of the
+    /// first prompt of a run that continued in place, where a re-rendered history (earlier reasoning dropped) splits.
+    void pin();
+    /// The positions restore() can go back to, latest first (a slot keeps them: it can be taken back at any of them).
+    std::vector<int64_t> check_positions() const;
+
+    /// The conversation in the model into `out` (slot_save): its position, its tokens, every window ring (the DSpark
+    /// blocks' included), the compressors' partial groups and each KV source's compressed KV and index keys up to it,
+    /// the pieces the state a prompt continues is made of.  0 and err: nothing was set aside (it holds pictures, there
+    /// is no conversation, or the conversation is already set aside - unchanged since).
+    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err);
+    /// `data` (a slot's bytes) back into the model: the state at the slot's position n_pos, as slot_save took it -
+    /// what a prompt that continues the slot's tokens reads on from (the caller checked the tokens are a prefix).
+    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err);
+    /// What a saved conversation must match: this engine's version, this model's geometry and files and the drafter's
+    /// blocks - a slot naming anything else is not this model's state (a file's .meta says so; slot_load refuses).
+    std::string slot_identity() const;
 
     /// The vision tower: the token every position of an image's span carries (-1: no tower).
     int image_token() const;

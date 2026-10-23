@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <future>
@@ -920,7 +921,14 @@ struct Model::Impl {
         std::vector<std::vector<uint8_t>> win;
         std::vector<std::vector<float>> comp;
     };
-    Check ck[2];                      // the end of the last prompt, and the position before it
+    static constexpr int kChecks = 4;
+    Check ck[kChecks];                // the end of the last prompt, the position before it, the anchor (the position
+                                      // before the end of the first prompt of the run of prompts that each continued
+                                      // the last in place: a chat template that drops earlier turns' reasoning at a new
+                                      // user message re-renders the history from about there) and the prefix (where the
+                                      // server said the prompt's shared start - system prompt and tools - ends: another
+                                      // agent behind the same start goes back to it)
+    bool slot_held = false;           // slot_save took this state and nothing has changed it since
     std::vector<uint32_t> prof;       // [nl][n_exp] routed-expert hits
     Stats st;
     int cur_topk_n[kWin] = {}, cur_cand_n[kWin] = {};   // what the latest indexer / candidate source left, per query
@@ -4528,7 +4536,8 @@ struct Model::Impl {
         pos = 0;
         toks.clear();
         ctoks.clear();
-        ck[0].pos = ck[1].pos = -1;
+        slot_held = false;
+        for (Check& c0 : ck) c0.pos = -1;
         for (Layer& l0 : L)
             for (int m = 0; m < l0.nm; ++m) {
                 Layer& l = member(l0, m);
@@ -4547,7 +4556,7 @@ struct Model::Impl {
     // the state at pos into checkpoint `slot` (the window rings and the compressors' partial groups: the rest of the
     // state is indexed by position, and what lies past a restored position is written again)
     void checkpoint(int slot) {
-        Check& c = ck[slot & 1];
+        Check& c = ck[slot & (kChecks - 1)];
         c.pos = pos;
         c.win.resize(L.size());
         c.comp.resize(L.size() * 2);
@@ -4574,13 +4583,40 @@ struct Model::Impl {
     // the checkpoint at or before position limit (the state's tokens agree with a new prompt up to there), or -1
     int best_check(int64_t limit) const {
         int b = -1;
-        for (int i = 0; i < 2; ++i)
+        for (int i = 0; i < kChecks; ++i)
             if (ck[i].pos >= 0 && ck[i].pos <= limit && ck[i].pos <= pos && (b < 0 || ck[i].pos > ck[b].pos)) b = i;
         return b;
     }
     int64_t restorable(int64_t limit) const {
         const int b = best_check(limit);
         return b < 0 ? -1 : ck[b].pos;
+    }
+
+    // checkpoint 1 (the position before the last prompt's end) becomes the anchor too
+    void pin() {
+        if (ck[1].pos > 0) ck[2] = ck[1];
+    }
+    // the checkpoints the state can go back to (what a slot of it keeps), latest first
+    std::vector<int64_t> check_positions() const {
+        std::vector<int64_t> v;
+        for (const Check& c : ck)
+            if (c.pos > 0 && c.pos <= pos && c.win.size() == L.size() &&
+                std::find(v.begin(), v.end(), c.pos) == v.end())
+                v.push_back(c.pos);
+        std::sort(v.rbegin(), v.rend());
+        return v;
+    }
+    // the checkpoints a slot keeps (each with its role: 0, 1 or the anchor)
+    std::vector<int> slot_checks() const {
+        std::vector<int> v;
+        for (int i = 0; i < kChecks; ++i)
+            if (ck[i].pos > 0 && ck[i].pos <= pos && ck[i].win.size() == L.size()) v.push_back(i);
+        return v;
+    }
+    size_t check_bytes() const {
+        size_t n = 16;
+        for (const Layer& l : L) n += (size_t) g.win * win_rb() + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
+        return n;
     }
 
     bool restore(int64_t limit) {
@@ -4606,9 +4642,360 @@ struct Model::Impl {
         pos = c.pos;
         toks.resize((size_t) pos);
         ctoks.resize((size_t) pos);
+        slot_held = false;
         for (Check& o2 : ck)   // a later checkpoint saw tokens the state no longer has
             if (o2.pos > pos) o2.pos = -1;
         return true;
+    }
+
+    // ---- the kept conversations (a slot): the state out of the model and back, through a file or a host buffer.
+    // A prompt that continues the state is reused in place (checkpoint / restore, the compressed KV left where it is);
+    // a conversation that leaves the model for another one is a slot - the whole state: the position, its tokens,
+    // every window ring (the DSpark blocks' included), the compressors' partial groups and each KV source's compressed
+    // KV and index keys up to it (rows 0 .. pos / ratio, the groups its position completed; one the prompt has not
+    // completed yet lives in the compressor's partial group).  A tensor parallel group's members hold the same state,
+    // so one member's ring is saved and written back into all of them.  Text only: a conversation that holds pictures
+    // is not a slot (the Engram history's rows are the tokens' again, no -1 among them).
+    static constexpr uint64_t kSlotMagic = 0x31544f4c53345344ull;   // "DS4SLOT1" (little endian)
+
+    int64_t src_rows(const Src& s) const { return pos / std::max(1, s.ratio); }
+
+    // the slot's bytes: the header, the tokens, every layer's ring and partial group, every source's rows, the end
+    size_t slot_bytes() const {
+        size_t n = 8 + 8 + slot_identity().size() + 8 + (size_t) pos * 4;
+        for (const Layer& l : L) n += 8 + (size_t) g.win * win_rb() + 8 + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
+        for (const Src& s : srcs) n += 8 + (size_t) src_rows(s) * (ckv_rb() + ik_rb());
+        n += 8 + slot_checks().size() * check_bytes();   // (the checkpoints: what the slot can be taken back at)
+        return n + 8;
+    }
+
+    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err) {
+        if (slot_held) {
+            err = "it is already set aside";
+            return 0;
+        }
+        if (pos <= 0) {
+            err = "there is no conversation";
+            return 0;
+        }
+        if ((int64_t) toks.size() != pos) {
+            err = "the state's tokens do not match its position";
+            return 0;
+        }
+        if (!imgs.empty()) {
+            err = "it holds pictures";
+            return 0;
+        }
+        const std::string id = slot_identity();
+        out.assign(slot_bytes(), 0);
+        uint8_t* p = out.data();
+        size_t off = 0;
+        const auto put = [&](const void* s, size_t b) {
+            std::memcpy(p + off, s, b);
+            off += b;
+        };
+        const uint64_t il = id.size(), n = (uint64_t) pos;
+        put(&kSlotMagic, 8);
+        put(&il, 8);
+        put(id.data(), (size_t) il);
+        put(&n, 8);
+        put(toks.data(), (size_t) n * 4);
+        for (Dev& d : devs) {   // (the devices' work ends before their state is read)
+            cudaSetDevice(d.id);
+            cudaStreamSynchronize(d.st);
+        }
+        for (size_t i = 0; i < L.size(); ++i) {
+            const Layer& l = L[i];
+            const Dev& d = devs[(size_t) l.dev];
+            cudaSetDevice(d.id);
+            const uint64_t wb = (uint64_t) g.win * win_rb();
+            put(&wb, 8);
+            if (cudaMemcpy(p + off, l.win, (size_t) wb, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                err = l.name + "window ring: " + cudaGetErrorString(cudaGetLastError());
+                return 0;
+            }
+            off += (size_t) wb;
+            const uint64_t cn = l.c_kv ? (uint64_t) l.ratio * (uint64_t) g.hd : 0;
+            put(&cn, 8);
+            if (cn > 0) {
+                const size_t cb = (size_t) cn * 4;
+                if (cudaMemcpy(p + off, l.c_kv, cb, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                    cudaMemcpy(p + off + cb, l.c_score, cb, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    err = l.name + "compressor's group: " + cudaGetErrorString(cudaGetLastError());
+                    return 0;
+                }
+                off += 2 * cb;
+            }
+        }
+        for (const Src& s : srcs) {
+            const uint64_t rows = (uint64_t) src_rows(s);
+            put(&rows, 8);
+            if (rows == 0) continue;
+            const int di = L[(size_t) s.layer].dev;
+            const uint8_t* ckv = s.ckv[(size_t) di];
+            const uint8_t* ik = s.ik[(size_t) di];   // (a pack whose sources are not index sources: none, zeros)
+            if (ckv == nullptr) {
+                err = "source layer " + std::to_string(s.layer) + "'s rows are not on its device";
+                return 0;
+            }
+            const size_t cb = (size_t) rows * ckv_rb(), ib = (size_t) rows * ik_rb();
+            cudaSetDevice(devs[(size_t) di].id);
+            if (cudaMemcpy(p + off, ckv, cb, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                (ik != nullptr && cudaMemcpy(p + off + cb, ik, ib, cudaMemcpyDeviceToHost) != cudaSuccess)) {
+                err = "source layer " + std::to_string(s.layer) + "'s compressed KV: " + cudaGetErrorString(cudaGetLastError());
+                return 0;
+            }
+            off += cb + ib;
+        }
+        {
+            const std::vector<int> cs = slot_checks();
+            const uint64_t nc = cs.size();
+            put(&nc, 8);
+            for (int k : cs) {
+                const Check& c = ck[k];
+                const uint64_t role = (uint64_t) k, cp = (uint64_t) c.pos;
+                put(&role, 8);
+                put(&cp, 8);
+                for (size_t i = 0; i < L.size(); ++i) {
+                    put(c.win[i].data(), (size_t) g.win * win_rb());
+                    if (L[i].c_kv) {
+                        put(c.comp[2 * i].data(), (size_t) L[i].ratio * g.hd * 4);
+                        put(c.comp[2 * i + 1].data(), (size_t) L[i].ratio * g.hd * 4);
+                    }
+                }
+            }
+        }
+        if (off + 8 != out.size()) {
+            err = "the state's size does not add up";
+            return 0;
+        }
+        put(&kSlotMagic, 8);
+        slot_held = true;
+        return (uint64_t) off;
+    }
+
+    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
+        size_t off = 0;
+        bool wrote = false, ok = false;
+        // a load that stops after some of another conversation's state went into the layers leaves a state no
+        // checkpoint can repair: it is reset (the prompt is read from token 0), never served from the mix
+        struct FailClosed {
+            Impl& p;
+            const bool& wrote;
+            const bool& ok;
+            ~FailClosed() {
+                if (!ok && wrote) p.reset();
+            }
+        } guard{*this, wrote, ok};
+        const auto room = [&](size_t b) { return b <= bytes && off <= bytes - b; };
+        uint64_t magic = 0, il = 0, n = 0;
+        if (!room(16)) {
+            err = "the slot is cut short";
+            return false;
+        }
+        std::memcpy(&magic, data + off, 8);
+        std::memcpy(&il, data + off + 8, 8);
+        off += 16;
+        if (magic != kSlotMagic || il == 0 || il > (1u << 20)) {
+            err = "not a saved conversation";
+            return false;
+        }
+        if (!room((size_t) il + 8)) {
+            err = "the slot is cut short";
+            return false;
+        }
+        {
+            std::string id((size_t) il, '\0');
+            std::memcpy(id.data(), data + off, (size_t) il);
+            off += (size_t) il;
+            std::memcpy(&n, data + off, 8);
+            off += 8;
+            if (id != slot_identity()) {
+                err = "another model's, or another engine version's, conversation";
+                return false;
+            }
+        }
+        if (n != (uint64_t) n_pos || n_pos <= 0 || n_pos > o.max_context || !room((size_t) n * 4)) {
+            err = "the conversation's position is not this prompt's";
+            return false;
+        }
+        std::vector<int32_t> toks_in((size_t) n);
+        std::memcpy(toks_in.data(), data + off, (size_t) n * 4);
+        off += (size_t) n * 4;
+        for (Dev& d : devs) {   // (their work ends before the state is written over)
+            cudaSetDevice(d.id);
+            cudaStreamSynchronize(d.st);
+        }
+        for (size_t i = 0; i < L.size(); ++i) {
+            Layer& l = L[i];
+            const Dev& d = devs[(size_t) l.dev];
+            cudaSetDevice(d.id);
+            uint64_t wb = 0, cn = 0;
+            if (!room(8)) {
+                err = "the slot is cut short";
+                return false;
+            }
+            std::memcpy(&wb, data + off, 8);
+            off += 8;
+            if (wb != (uint64_t) g.win * win_rb() || !room((size_t) wb + 8)) {
+                err = l.name + "window ring of another size";
+                return false;
+            }
+            wrote = true;
+            for (int m = 0; m < l.nm; ++m) {
+                Layer& lm = member(l, m);
+                if (cudaMemcpy(lm.win, data + off, (size_t) wb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = l.name + "window ring: " + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+            }
+            off += (size_t) wb;
+            std::memcpy(&cn, data + off, 8);
+            off += 8;
+            if (cn != (l.c_kv ? (uint64_t) l.ratio * (uint64_t) g.hd : 0)) {
+                err = l.name + "compressor's group of another size";
+                return false;
+            }
+            if (cn > 0) {
+                const size_t cb = (size_t) cn * 4;
+                if (!room(2 * cb)) {
+                    err = "the slot is cut short";
+                    return false;
+                }
+                for (int m = 0; m < l.nm; ++m) {
+                    Layer& lm = member(l, m);
+                    if (cudaMemcpy(lm.c_kv, data + off, cb, cudaMemcpyHostToDevice) != cudaSuccess ||
+                        cudaMemcpy(lm.c_score, data + off + cb, cb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                        err = l.name + "compressor's group: " + cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+                }
+                off += 2 * cb;
+            }
+        }
+        for (const Src& s : srcs) {
+            uint64_t rows = 0;
+            if (!room(8)) {
+                err = "the slot is cut short";
+                return false;
+            }
+            std::memcpy(&rows, data + off, 8);
+            off += 8;
+            if (rows != (uint64_t) (n_pos / std::max(1, s.ratio))) {
+                err = "source layer " + std::to_string(s.layer) + "'s rows are not this conversation's";
+                return false;
+            }
+            if (rows == 0) continue;
+            const size_t cb = (size_t) rows * ckv_rb(), ib = (size_t) rows * ik_rb();
+            if (!room(cb + ib)) {
+                err = "the slot is cut short";
+                return false;
+            }
+            for (size_t di = 0; di < devs.size(); ++di) {
+                if (s.ckv[di] == nullptr && s.ik[di] == nullptr) continue;
+                cudaSetDevice(devs[di].id);
+                if (s.ckv[di] != nullptr && cudaMemcpy(s.ckv[di], data + off, cb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = "source layer " + std::to_string(s.layer) + "'s compressed KV: " + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                if (s.ik[di] != nullptr &&
+                    cudaMemcpy(s.ik[di], data + off + cb, ib, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = "source layer " + std::to_string(s.layer) + "'s index keys: " + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+            }
+            off += cb + ib;
+        }
+        Check got[kChecks];   // the slot's checkpoints: the positions it can be taken back at
+        {
+            uint64_t nc = 0;
+            if (!room(8)) {
+                err = "the slot is cut short";
+                return false;
+            }
+            std::memcpy(&nc, data + off, 8);
+            off += 8;
+            if (nc > (uint64_t) kChecks) {
+                err = "the slot's checkpoints are damaged";
+                return false;
+            }
+            for (uint64_t k = 0; k < nc; ++k) {
+                uint64_t role = 0, cp = 0;
+                if (!room(16)) {
+                    err = "the slot is cut short";
+                    return false;
+                }
+                std::memcpy(&role, data + off, 8);
+                std::memcpy(&cp, data + off + 8, 8);
+                off += 16;
+                if (role >= (uint64_t) kChecks || got[role].pos >= 0 || cp == 0 || cp > (uint64_t) n_pos) {
+                    err = "the slot's checkpoints are damaged";
+                    return false;
+                }
+                Check& c = got[role];
+                c.pos = (int64_t) cp;
+                c.win.resize(L.size());
+                c.comp.resize(L.size() * 2);
+                for (size_t i = 0; i < L.size(); ++i) {
+                    const size_t wb = (size_t) g.win * win_rb(), cb = L[i].c_kv ? (size_t) L[i].ratio * g.hd * 4 : 0;
+                    if (!room(wb + 2 * cb)) {
+                        err = "the slot is cut short";
+                        return false;
+                    }
+                    c.win[i].assign(data + off, data + off + wb);
+                    off += wb;
+                    if (cb > 0) {
+                        c.comp[2 * i].resize(cb / 4);
+                        c.comp[2 * i + 1].resize(cb / 4);
+                        std::memcpy(c.comp[2 * i].data(), data + off, cb);
+                        std::memcpy(c.comp[2 * i + 1].data(), data + off + cb, cb);
+                        off += 2 * cb;
+                    }
+                }
+            }
+        }
+        uint64_t end = 0;
+        if (!room(8)) {
+            err = "the slot is cut short";
+            return false;
+        }
+        std::memcpy(&end, data + off, 8);
+        off += 8;
+        if (end != kSlotMagic) {
+            err = "the slot does not end where it should";
+            return false;
+        }
+        pos = n_pos;
+        toks.swap(toks_in);
+        ctoks.resize((size_t) pos);
+        for (size_t i = 0; i < (size_t) pos; ++i)
+            ctoks[i] = toks[i] < pk.eg_vocab ? pk.eg_map[(size_t) toks[i]] : 0;
+        for (int k = 0; k < kChecks; ++k) ck[k] = std::move(got[k]);   // (the slot's own; the old ones held the state
+                                                               // this one replaced)
+        slot_held = false;
+        ok = true;
+        return true;
+    }
+
+    std::string slot_identity() const {
+        const auto size_of = [](const std::string& p) {
+            std::error_code ec;
+            const auto s = std::filesystem::file_size(p, ec);
+            return ec ? 0ull : (unsigned long long) s;
+        };
+        std::ostringstream id;
+        id << "strata-ds4-session-3 engine=" << STRATA_VERSION << " mtp=" << g.n_mtp << " dim=" << g.dim << " hd=" << g.hd
+           << " win=" << g.win << " ratios=";
+        for (int r : g.ratios) id << r << ",";
+        id << " kv=";
+        for (int v : g.kv_src) id << v << ",";
+        id << " ix=";
+        for (int v : g.ix_src) id << v << ",";
+        id << " ds4.txt:" << size_of(pk.dir + "/ds4.txt") << " engram.bin:" << size_of(pk.dir + "/engram.bin")
+           << " tensors.txt:" << size_of(pk.dir + "/tensors.txt");
+        for (size_t i = 0; i < pk.files.size(); ++i)
+            id << " " << pk.files[i] << ":" << os::file_size(pk.fds[i]);
+        return id.str();
     }
 
     size_t bounce_bytes() const {
@@ -6211,6 +6598,7 @@ struct Model::Impl {
         pos = p0 + keep;
         toks.resize((size_t) pos);
         ctoks.resize((size_t) pos);
+        slot_held = false;
     }
 
     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
@@ -7583,6 +7971,7 @@ struct Model::Impl {
                 return false;
             }
         const int64_t p0 = pos;
+        slot_held = false;   // (the state grows now: what slot_save took is no longer the conversation)
         for (int t = 0; t < T; ++t) {
             toks.push_back(tk[t]);
             ctoks.push_back(ctok(pos + t, tk[t]));
@@ -8404,7 +8793,14 @@ const std::vector<int32_t>& Model::tokens() const { return p_->toks; }
 void Model::reset() { p_->reset(); }
 void Model::checkpoint(int slot) { p_->checkpoint(slot); }
 bool Model::restore(int64_t limit) { return p_->restore(limit); }
+void Model::pin() { p_->pin(); }
+std::vector<int64_t> Model::check_positions() const { return p_->check_positions(); }
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
+uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err) { return p_->slot_save(out, err); }
+bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
+    return p_->slot_load(data, bytes, n_pos, err);
+}
+std::string Model::slot_identity() const { return p_->slot_identity(); }
 void Model::save_profile() const { p_->save_profile(); }
 const Stats& Model::stats() const {
     Stats& st = p_->st;
