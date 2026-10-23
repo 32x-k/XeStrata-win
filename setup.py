@@ -704,7 +704,7 @@ DSV41_ALL_FILES = {**DSV41_FILES, **DSV41_ISTA_FILES}
 DSV41_PROFILES = ROOT / "data" / "dsv41"           # the shipped hot-expert profiles (profile-2.00.bin, profile-2.25.bin, + .sha256)
 DSV41_CONTEXT = 8192          # the context the engine was checked at (4096 and 8192; 64K is not tried yet)
 MULTI_FILE_FAMILIES = {
-    "deepseek41": {"title": "DeepSeek-V4.1-Flash", "by": "DeepSeek; GGUFs by Unsloth", "arch": "deepseek41",
+    "deepseek41": {"title": "DeepSeek-V4.1-Flash", "by": "DeepSeek; the 2-bit GGUFs by IST-DAS, UD-Q8_K_XL by Unsloth", "arch": "deepseek41",
                    "about": "a big model that runs on a PC with a 12 GB card and 64 GB of RAM (the two official 2-bit versions: 257 or "
                             "274 GB of disk, about 5-7 words a second) or, in Unsloth's 508 GB version, on several graphics cards",
                    "hf": hf(DSV41_REPO) + "UD-Q8_K_XL/", "tag": "deepseek-v4.1-flash-", "name": "deepseek-v4.1-flash",
@@ -7408,6 +7408,8 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
         model = names[int(ask("Which version?", [str(i) for i in range(1, len(names) + 1)], "1", a.yes)) - 1]
     ok(f"size: {model}")
     md = fam["models"][model]
+    say("  Its GGUF files: " + ("IST-DAS (huggingface.co/helcig/tmp-oct26-2), with the DSpark drafter and a small metadata file from Unsloth"
+                              if md.get("recipe") == "ista" else "Unsloth (huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)"))
     ista = md.get("recipe") == "ista"
     tag = fam["tag"] + model
     cards = dsv41_cards(gpu, all_cards, bool(a.gpu is not None or a.gpus))
