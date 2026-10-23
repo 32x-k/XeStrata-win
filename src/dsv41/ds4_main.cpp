@@ -736,7 +736,7 @@ int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int win
 int main(int argc, char** argv) {
     strata::ds4::Options o;
     std::string ids_s, dump, eos = "1";
-    int n = 0, window = 16;
+    int n = 0, window = 0;   // (0: the model's feed unit - a whole prompt on the chunked path; 16 for the scoring runs)
     bool spec = true;
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
@@ -834,6 +834,8 @@ int main(int argc, char** argv) {
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf);
+    const int window_given = window;
+    if (window == 0) window = 16;   // (the scoring / profiling runs; the plain run below takes the model's feed unit)
     if (!prof_ids.empty()) return profile_run(m, prof_ids, window);
     if (!spec_ids.empty()) return spec_eval(m, spec_ids, n, window, o.dspark_conf);
     if (!score_ids.empty()) return score(m, score_ids, score_out.empty() ? score_ids + ".tsv" : score_out, window, std::atoi(eos.c_str()));
@@ -887,6 +889,7 @@ int main(int argc, char** argv) {
     }
     std::FILE* df = dump.empty() ? nullptr : std::fopen(dump.c_str(), "wb");
     std::vector<float> lg;
+    if (window_given == 0) window = df != nullptr ? 16 : std::max(16, std::min(m.feed_unit(), 1 << 30));
     const double t0 = now_ms();
     for (size_t a = 0; a < ids.size();) {
         const int T = (int) std::min<size_t>((size_t) window, ids.size() - a);

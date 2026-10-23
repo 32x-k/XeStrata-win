@@ -791,6 +791,7 @@ struct Model::Impl {
     unsigned win_seq = 0;             // the windows the threads ran (the hand-offs' seq)
     // the chunked prompt path (threads mode): chunk tokens a pass, runs shorter than chunk_min in windows
     int chunk = 0, chunk_min = 512;
+    static constexpr bool kChunkedPromptDefault = false;   // flip once the chunk buffers are elastic (decode unchanged)
     static constexpr int kFlowChunkMin = 2;   // chunk_min with every device's layers on the flow (see load)
     // --prefill-chunk at most (route() runs in kVlRows-row slabs).  The default stays kVlRows: a 16384-token chunk
     // reads a 16K prompt's experts once instead of twice (V100: 461.8 -> 321.3 s, 736 -> 506 GB read) but its buffers
@@ -1829,7 +1830,13 @@ struct Model::Impl {
         // prompt path (its own thread a GPU) as asked for - also where the experts' blocks took the groups' width down
         // to 1 (a 256-value type's: Maya's quants), which left every prompt in windows of 16
         par = o.threads || tp > 1;
-        prompt_par = par || o.tp > 1;
+        // the chunked (layer-major) prompt path: with --tp / --threads as before; --prefill-chunk N (N > 0) or
+        // kChunkedPromptDefault bring it to a single card's default run too (a host thread a GPU for the prompt only;
+        // decode stays as asked).  --prefill-chunk 0 keeps the windows of 16 (DS4_WINDOWS=1 the same).  Off by default
+        // until a prompt costs the decode nothing: its buffers hold VRAM the windowed path gives to experts
+        prompt_par = par || o.tp > 1 ||
+                     ((o.prefill_chunk > 0 || (o.prefill_chunk < 0 && kChunkedPromptDefault)) &&
+                      std::getenv("DS4_WINDOWS") == nullptr);
         const bool tp_all = tp > 1 && tp == (int) devs.size();
         for (size_t i = 0; i < devs.size();) {
             Group G;
@@ -2413,7 +2420,54 @@ struct Model::Impl {
         }
 
         // the chunked prompt path's buffers (before the experts: they take what is left)
-        if (chunk > 0 && !alloc_chunks(err)) return false;
+        if (chunk > 0) {
+            // recommend, never force: a chunk the cards cannot hold in buffers is halved (down to 256 rows) and then the
+            // prompt runs in windows of 16, said in one line - the load only fails for a reason that is not this
+            std::vector<size_t> na0, sc0;
+            for (Dev& d : devs) {
+                na0.push_back(d.allocs.size());
+                sc0.push_back(d.scratch);
+            }
+            const size_t nh = host_allocs.size();
+            std::string aerr;
+            while (chunk > 0 && !alloc_chunks(aerr)) {
+                for (size_t di = 0; di < devs.size(); ++di) {
+                    Dev& d = devs[di];
+                    cudaSetDevice(d.id);
+                    cudaDeviceSynchronize();
+                    if (di < chunks.size() && chunks[di]) {
+                        if (chunks[di]->blas) cublasDestroy(chunks[di]->blas);
+                        if (chunks[di]->cs) cudaStreamDestroy(chunks[di]->cs);
+                    }
+                    while (d.allocs.size() > na0[di]) {
+                        cudaFree(d.allocs.back());
+                        d.allocs.pop_back();
+                    }
+                    d.scratch = sc0[di];
+                }
+                while (host_allocs.size() > nh) {
+                    cudaFreeHost(host_allocs.back());
+                    host_allocs.pop_back();
+                }
+                chunks.clear();
+                const int was = chunk;
+                chunk = chunk > 512 ? chunk / 2 / 16 * 16 : 0;
+                if (chunk > 0) {
+                    eg_cap = (size_t) chunk;
+                    std::fprintf(stderr, "ds4: the prompt path's buffers for chunks of %d rows did not fit (%s): trying %d\n",
+                                 was, aerr.c_str(), chunk);
+                } else {
+                    prompt_par = false;
+                    eg_cap = (size_t) kWin;
+                    tap_cap = kWin;
+                    std::fprintf(stderr, "ds4: the prompt path's buffers did not fit (%s): prompts run in windows of %d "
+                                         "tokens (slower on long prompts; more free GPU memory or a lower --reserve-mib "
+                                         "brings the chunks back)\n", aerr.c_str(), kWin);
+                }
+                aerr.clear();
+            }
+            if (chunk > 0 && aerr.empty()) err.clear();
+        }
         // the CPU lane's experts read in place (decided above): how much of them the load reads ahead, from what VRAM
         // now leaves over
         if (file_experts) {
@@ -5267,6 +5321,31 @@ struct Model::Impl {
         }
     }
 
+    // after a chunked prompt: the expert cache catches up with what the prompt picked at once - a window prompt gets
+    // its swaps one tick at a time over its hundreds of windows, a chunked one has a single tick - so the decode that
+    // follows finds the hot experts in VRAM.  Rounds of the ordinary swap rule (the hottest CPU-lane pick of each layer
+    // in, its coldest VRAM expert out) until nothing is worth moving or DS4_SETTLE_MS (6000) is spent
+    void cache_settle() {
+        if (!o.expert_cache || cache_ths.empty()) return;
+        static const double budget = env_f("DS4_SETTLE_MS", 6000.0f);
+        if (budget <= 0.0) return;
+        const double t0 = now_ms();
+        const int64_t s0 = st.swaps;
+        while (now_ms() - t0 < budget) {
+            for (Layer& l : L) {
+                if (l.mtp || l.spare_vram < 0 || l.swap_pending) continue;
+                l.cpu_hits.clear();
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (l.slot[(size_t) e] < 0 && l.heat[(size_t) e] >= 2.0f) l.cpu_hits.push_back(e);
+            }
+            cache_tick_swaps(0);
+            if (sw_inflight == 0) break;   // (nothing queued: every layer's best CPU-lane expert is not hotter than its coldest VRAM one)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (o.verbose && st.swaps > s0)
+            std::fprintf(stderr, "ds4: expert cache: %lld swaps after the prompt (%.0f ms)\n", (long long) (st.swaps - s0),
+                         now_ms() - t0);
+    }
     void cache_tick(int T) {
         cache_tick_swaps(T);
         store_sync();
@@ -6352,7 +6431,12 @@ struct Model::Impl {
             uint32_t* pr = prof.data() + (size_t) l.il * g.n_exp;
             for (int e = 0; e < l.n_exp; ++e) {
                 const int v = L0.vs_pin[e];
-                pr[e] += (uint32_t) (b[(size_t) v + 1] - b[(size_t) v]);
+                const int cnt = b[(size_t) v + 1] - b[(size_t) v];
+                pr[e] += (uint32_t) cnt;
+                if (cnt > 0) {   // (the expert cache learns from a chunked prompt as from windows: heat, and the CPU lane's hits)
+                    l.heat[(size_t) e] += (float) cnt;
+                    if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
+                }
             }
             st.experts += (int64_t) T * l.k_exp;
         }
@@ -7216,6 +7300,7 @@ struct Model::Impl {
         pos += n;
         st.tokens += n;
         cache_tick(n);
+        cache_settle();
         const int nr = std::min(T_last, tap_cap);
         if (!seed_drafter(pos - nr, nr, 0, err)) return false;
         if (snap_slot >= 0) {   // checkpoint `snap_slot` from what the layers kept (the drafter's blocks: as they are -
