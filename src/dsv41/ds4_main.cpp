@@ -130,6 +130,11 @@ std::string per_position(const strata::ds4::Stats& s0, const strata::ds4::Stats&
     return pp;
 }
 
+static std::FILE* g_round_log = nullptr;
+static std::string g_round_tag;
+static std::vector<float> g_round_conf;
+static int g_round_nd = 0;
+
 // One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts while their
 // confidence holds (at most `room` - 1 of them), verified together; else a plain step.  `out` gets the tokens that follow
 // tok (the accepted drafts, then the trunk's next), the last of them the next round's tok.
@@ -142,12 +147,19 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         std::vector<int> drafts;
         std::vector<float> conf;
         if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter)) return false;
+        g_round_conf = conf;
+        g_round_nd = (int) drafts.size();
         int keep = 0;
         while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min) ++keep;
         if (keep > 0) {
             drafts.resize((size_t) keep);
             int acc = 0, next = -1;
             if (!m.verify(tok, drafts, temperature, top_p, top_k, min_p, seed, counter, acc, next, err)) return false;
+            if (g_round_log != nullptr) {   // DS4_ROUND_LOG: tag, drafts offered, accepted, the confidences
+                std::fprintf(g_round_log, "%s\t%d\t%d", g_round_tag.c_str(), keep, acc);
+                for (int i = 0; i < keep; ++i) std::fprintf(g_round_log, "\t%.4f", g_round_conf[(size_t) i]);
+                std::fprintf(g_round_log, "\n");
+            }
             counter += (unsigned long long) acc + 1;
             for (int i = 0; i < acc; ++i) out.push_back(drafts[(size_t) i]);
             out.push_back(next);
@@ -635,6 +647,90 @@ int score(strata::ds4::Model& m, const std::string& ids_path, const std::string&
     std::fclose(out);
     return 0;
 }
+// ---- Strata H100 addition: profile run -------------------------------------------------------------------------
+// --profile-run IDS.json: every segment is fed through the model from a fresh state (no logits); the engine's expert
+// profile (--expert-profile FILE, counts a layer and expert) and DS4_TRACE collect the routing.  The profile is saved
+// every 10 segments.  --window sets the chunk (a chunked prompt path above 16).
+int profile_run(strata::ds4::Model& m, const std::string& ids_path, int window) {
+    std::vector<ScoreSeg> segs;
+    std::string err;
+    if (!read_score_ids(ids_path, segs, err)) {
+        std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
+        return 1;
+    }
+    const double t0 = now_ms();
+    long long tot = 0;
+    for (size_t si = 0; si < segs.size(); ++si) {
+        const std::vector<int>& ids = segs[si].ids;
+        m.reset();
+        for (size_t a = 0; a < ids.size();) {
+            const int T = (int) std::min<size_t>((size_t) window, ids.size() - a);
+            if (!m.feed(ids.data() + a, T, 0, err)) {
+                std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
+                return 1;
+            }
+            a += (size_t) T;
+        }
+        tot += (long long) ids.size();
+        std::fprintf(stderr, "profile-run %zu/%zu %s: %zu tokens, %lld in all, %.0f s, %.1f tok/s\n", si + 1, segs.size(),
+                     segs[si].name.c_str(), ids.size(), tot, (now_ms() - t0) / 1000.0, 1000.0 * (double) tot / (now_ms() - t0));
+        if ((si + 1) % 10 == 0) m.save_profile();
+    }
+    m.save_profile();
+    return 0;
+}
+// ---- Strata H100 addition: DSpark acceptance log ---------------------------------------------------------------
+// --spec-eval IDS.json --n N: each segment is a prompt: fed from reset, then N greedy tokens decoded with the drafter, every
+// draft verified (--dspark-conf 0); DS4_ROUND_LOG=file gets a line a round (segment name, drafts, accepted, confidences).
+int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int window, float conf_min) {
+    std::vector<ScoreSeg> segs;
+    std::string err;
+    if (!read_score_ids(ids_path, segs, err)) {
+        std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
+        return 1;
+    }
+    if (const char* f = std::getenv("DS4_ROUND_LOG")) g_round_log = std::fopen(f, "wb");
+    const double t0 = now_ms();
+    for (size_t si = 0; si < segs.size(); ++si) {
+        const std::vector<int>& ids = segs[si].ids;
+        g_round_tag = segs[si].name;
+        m.reset();
+        for (size_t a = 0; a < ids.size();) {
+            const int T = (int) std::min<size_t>((size_t) window, ids.size() - a);
+            const bool last = a + (size_t) T == ids.size();
+            if (!m.feed(ids.data() + a, T, last ? 1 : 0, err)) {
+                std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
+                return 1;
+            }
+            a += (size_t) T;
+        }
+        unsigned long long counter = 0;
+        int tok = m.sample(0.0f, 1.0f, 1, 0.0f, 1, counter++);
+        std::vector<int> got;
+        int emitted = 1;
+        long long rounds = 0, acc_all = 0;
+        bool stop = false;
+        while (emitted < n && !stop) {
+            int off = 0, acc = 0;
+            if (!round(m, tok, n - emitted, true, conf_min, 0.0f, 1.0f, 1, 0.0f, 1, counter, got, off, acc, err)) {
+                std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
+                return 1;
+            }
+            ++rounds;
+            acc_all += acc;
+            for (int t : got) {
+                ++emitted;
+                if (t == 1) stop = true;
+            }
+            tok = got.back();
+        }
+        std::fprintf(stderr, "spec-eval %zu/%zu %s: prompt %zu, %d tokens, %lld rounds, %.2f tokens a round, accepted %lld (%.0f s)\n", si + 1,
+                     segs.size(), segs[si].name.c_str(), ids.size(), emitted, rounds, (double) (emitted - 1) / (double) std::max(1LL, rounds),
+                     acc_all, (now_ms() - t0) / 1000.0);
+        if (g_round_log != nullptr) std::fflush(g_round_log);
+    }
+    return 0;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -647,7 +743,7 @@ int main(int argc, char** argv) {
     bool serve_mode = false;
     bool pack_info_mode = false;
     std::string images, enc_rgb, enc_out;
-    std::string score_ids, score_out;
+    std::string score_ids, score_out, prof_ids, spec_ids;
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -702,6 +798,8 @@ int main(int argc, char** argv) {
         else if (a == "--dump-logits") dump = val("--dump-logits");
         else if (a == "--score") score_ids = val("--score");
         else if (a == "--score-out") score_out = val("--score-out");
+        else if (a == "--profile-run") prof_ids = val("--profile-run");
+        else if (a == "--spec-eval") spec_ids = val("--spec-eval");
         else if (a == "--serve") serve_mode = true;
         else if (a == "--pack-info") pack_info_mode = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
@@ -721,7 +819,7 @@ int main(int argc, char** argv) {
         }
         return strata::ds4::pack_info(o.pack, stdout);
     }
-    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty())) {
+    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty() && prof_ids.empty() && spec_ids.empty())) {
         usage();
         return 2;
     }
@@ -736,6 +834,8 @@ int main(int argc, char** argv) {
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf);
+    if (!prof_ids.empty()) return profile_run(m, prof_ids, window);
+    if (!spec_ids.empty()) return spec_eval(m, spec_ids, n, window, o.dspark_conf);
     if (!score_ids.empty()) return score(m, score_ids, score_out.empty() ? score_ids + ".tsv" : score_out, window, std::atoi(eos.c_str()));
 
     if (!enc_rgb.empty()) {   // the vision tower alone: a picture's span rows (BF16 [rows][dim]) into --dump-image
