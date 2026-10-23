@@ -2433,8 +2433,6 @@ struct Model::Impl {
         if (!place_experts(err)) return false;
         if (!load_experts(err)) return false;
         if (pk.gguf) make_pools();
-        init_store();
-        preload_store();
         if (chunk > 0) {
             // the CPU lane's parts pinned (the chunks stream them to the GPUs by DMA), each layer's virtual slots
             const double tr = now_ms();
@@ -2571,6 +2569,8 @@ struct Model::Impl {
                 workers.back()->start();
             }
         calibrate_paths();
+        init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
+        preload_store();
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         reset();
         return true;
@@ -2956,15 +2956,24 @@ struct Model::Impl {
         it.k = k;
         it.e = e;
         it.v = v;
-        const bool in_ram = !l.ram.empty() && l.ram[(size_t) e] >= 0;
-        if (in_ram && ram_pinned) {   // (DMA'd from where it lies)
+        bool in_ram = !l.ram.empty() && l.ram[(size_t) e] >= 0;
+        const uint8_t* store_blob = nullptr;   // (the RAM store holds it: copied into staging like a RAM-tier slot, no read)
+        if (!in_ram && store && l.nm == 1) {
+            const int ss = store->find(l.il, e);
+            if (ss >= 0) {
+                store_blob = store->blob(ss);
+                in_ram = true;
+            }
+        }
+        if (in_ram && ram_pinned && store_blob == nullptr) {   // (DMA'd from where it lies)
             const uint8_t* p = ram_slots[(size_t) l.ram[(size_t) e]];
             for (int r = 0; r < 3; ++r) it.src[r] = p + l.lay.trellis[r] + mx_read_off(l, mi, r);
             ++c.it_ram;
             return;
         }
         if (in_ram)   // (copied into staging by io, then DMA'd; copy_mode: from its NH parts, flow_pump)
-            it.ram = copy_mode ? ram_part[(size_t) l.ram[(size_t) e]][0] : ram_slots[(size_t) l.ram[(size_t) e]];
+            it.ram = store_blob != nullptr ? store_blob
+                     : copy_mode ? ram_part[(size_t) l.ram[(size_t) e]][0] : ram_slots[(size_t) l.ram[(size_t) e]];
         bool hit = false;
         if (!in_ram && c.lc != nullptr && l.nm == 1) {   // layer-major: from the layer cache, or kept for the chunks after
             const size_t i = c.base + c.items.size() - 1, stride = (l.blob + 63) & ~(size_t) 63;
@@ -2995,7 +3004,7 @@ struct Model::Impl {
             it.src[r] = sb + (in_ram || hit ? 0 : off % os::kDirectAlign);
             sb += flow_region(r);
         }
-        it.left.store(in_ram && copy_mode ? 3 * NH : 3, std::memory_order_relaxed);
+        it.left.store(in_ram && copy_mode && store_blob == nullptr ? 3 * NH : 3, std::memory_order_relaxed);
         ++(in_ram ? c.it_ram : hit ? c.it_lc : c.it_file);
     }
     // the likely experts of (chunk k, layer il) for T tokens, first in its stream: the CPU lane's experts whose chance
@@ -4227,7 +4236,10 @@ struct Model::Impl {
         cfg.policy = (ExpertStore::Policy) (std::getenv("DS4_STORE_POLICY") ? std::atoi(std::getenv("DS4_STORE_POLICY")) : o.ssd_policy);
         cfg.ram_avail = [] { return ram_avail(); };
         cfg.reserve = (size_t) (std::getenv("DS4_STORE_RESERVE") ? std::atoi(std::getenv("DS4_STORE_RESERVE")) : 192);
-        const bool want_zc = !(std::getenv("DS4_STORE_ZC") && std::atoi(std::getenv("DS4_STORE_ZC")) == 0) && devs.size() == 1 &&
+        // (the GPU computing the store's experts over PCIe is opt-in, DS4_STORE_ZC=1: measured slower than the CPU lane alone on a
+        // 5070 / PCIe 5.0 - the staging copy sits in the layer's critical path - and its answers depend on the timing of which lane
+        // took which expert, the CPU lane's are the mmap path's byte for byte)
+        const bool want_zc = std::getenv("DS4_STORE_ZC") && std::atoi(std::getenv("DS4_STORE_ZC")) != 0 && devs.size() == 1 &&
                              L[0].nm == 1;
         if (want_zc) {   // the arena's chunks registered for the GPU to read in place (zero-copy over PCIe)
             const int dev0 = devs[0].id;
