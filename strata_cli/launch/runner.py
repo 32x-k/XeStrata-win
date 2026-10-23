@@ -1969,7 +1969,7 @@ CAUSE_LINE = re.compile(r"error|exception|failed|cannot|can't|could not|no devic
                         r"no kernel|illegal|denied|refus", re.I)
 # The GPU runtime (ROCm) failed while the card was being set up, often right after another engine exited: the runtime's own text
 # ("terminate called after throwing an instance of 'rocr::AMD::hsa_exception'") stays in the log, not in the sentence shown.
-HSA_START = re.compile(r"hsa_exception|HSA_STATUS_ERROR|hsaKmt", re.I)
+HSA_START = re.compile(r"hsa_exception|HSA_STATUS_ERROR", re.I)
 HSA_START_NEXT = ("The graphics card was not ready yet; wait a few seconds and run it again. If it keeps happening, restart the PC "
                   "and report the log.")
 KNOWN_CAUSES = (
@@ -2052,7 +2052,13 @@ def explain_engine_exit(result: dict, config: Path | None, marks: dict | None = 
         stage = f"The server did not become ready ({state}: {why or 'see the engine log'})"
     hsa = HSA_START.search(" ".join(lines + [str(why or "")]))   # the runtime's own text is kept out of the sentence (it is in the log)
     if hsa:
-        cause = ""
+        # a real cause in the same log (out of memory, no permission on the card ...) wins: its line is the cause shown
+        real = next((x for x in reversed(lines) if any(p.search(x) for p, _ in KNOWN_CAUSES)), None)
+        if real:
+            hsa = None
+            cause = re.sub(r"^(\[strata\]\s*)?(\d{4}-\d\d-\d\d[ T][\d:.]+\s*)?", "", real.strip())[:240]
+        else:
+            cause = ""
     text = stage + (f": {cause}" if cause else ".")
     if not text.endswith((".", "!")):
         text += "."
