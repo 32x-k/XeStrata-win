@@ -455,6 +455,14 @@ def main() -> int:
     arch = kv["general.architecture"]
     int_tensors_to_engram(gs, kv)
     layers = kv.get("%s.engram.layers" % arch, [])
+    # An official IST-DAS set (helcig/tmp-oct26-2) carries the Engram gate/kv as their own k, q, wkv tensors and a 3-D attn_output_a, and the
+    # plain recipe (--engram --engram-meta --dspark-gguf, no --skip-tensors, no --dense-override) packs them as they are.  Rebuilding them
+    # (engram_fold.py + a wo_a override) gave a pack with garbage output on the final 2.00 set (P2003, 2026-10-23), and the pack still loads,
+    # so it fails in the user's chat, not at install.  Say so before it is built.
+    if any(n.endswith(".engram_wkv.weight") for n in have) and (a.skip_tensors or a.dense_override):
+        sys.stderr.write("pack_gguf: WARNING: this looks like an official IST-DAS set (it has engram_k/q/wkv tensors) and --skip-tensors / "
+                         "--dense-override are used.  The official sets pack correctly WITHOUT them; a pack rebuilt with them produced "
+                         "garbage text on the final 2.00 set.  Drop both unless you are testing exactly that.\n")
 
     def has_part(il, part, names):
         if "blk.%d.%s.weight" % (il, part) in names:
