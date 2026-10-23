@@ -624,6 +624,29 @@ class SmallCap(ApiBase):
                 self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"a": "1"})
                 self.assertEqual(len(self.engine.last_prompt) > 0, True)
 
+    def test_the_family_default_thinking_budget(self):
+        """DeepSeek-V4.1 only, as Maya ships it: 32768 thinking tokens when neither the request nor the config names a budget."""
+        self.start("ok")
+        self.assertEqual(self.svc.reasoning_budget({}), 32768)
+        self.assertIsNone(self.svc.reasoning_budget({"reasoning_budget_tokens": 0}))        # a request turns it off
+        self.assertEqual(self.svc.reasoning_budget({"reasoning_budget_tokens": 50}), 50)    # and its own wins
+        self.assertEqual(self.svc.reasoning_budget({"thinking_budget_tokens": 70}), 70)
+        self.svc.reasoning_budget_tokens, self.svc.reasoning_budget_configured = 90, True
+        self.assertEqual(self.svc.reasoning_budget({}), 90)                                 # the config's wins
+        self.svc.reasoning_budget_tokens = 0                                                # the config says none
+        self.assertIsNone(self.svc.reasoning_budget({}))
+        self.svc.reasoning_budget_configured = False
+        self.svc.set_family(None)
+        self.assertIsNone(self.svc.reasoning_budget({}))                                    # other families: none
+
+    def test_the_default_budget_closes_a_long_thinking(self):
+        self.start_forever()
+        status, r = self.chat(max_tokens=5000)
+        self.assertEqual(status, 200, r)
+        self.assertEqual(r["choices"][0]["message"]["content"], ThinkForever.ANSWER)
+        status, r = self.chat(max_tokens=300, reasoning_effort="none")                      # thinking off: no budget, no wrap-up
+        self.assertEqual(len(self.engine.prompts), 3)
+
     def test_other_families_keep_the_old_behaviour(self):
         self.start_forever()
         self.svc.set_family(None)
