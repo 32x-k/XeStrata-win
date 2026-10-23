@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import re
 
-from serve.frontend import OutputParser
+from serve.frontend import Event, OutputParser
 
 DSML = "｜DSML｜"
 _OPEN = "<" + DSML
@@ -168,6 +168,19 @@ class DsmlOutputParser(OutputParser):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.dsml = DsmlTranslator(self._on_param)
+        # The 2-bit sets often write the whole answer after <think> and stop (EOS) without </think>: everything would be reasoning and
+        # the reply empty (P2003 install test, 4 of 4 prompts).  The reasoning text is kept here; finish() hands it over as the answer
+        # when the turn ended on a stop with no answer and no call.
+        self._reasoning: list[str] = []
+        self._answered = False
+
+    def _watch(self, evs):
+        for ev in evs:
+            if ev.kind == "reasoning":
+                self._reasoning.append(ev.text)
+            elif ev.kind in ("tool_start", "tool_call") or (ev.kind == "content" and ev.text.strip()):
+                self._answered = True
+        return evs
 
     def _on_param(self, tool, name, is_string) -> None:
         """string="true": the value is a string whatever it looks like ("123", "true"), as the template wrote it."""
@@ -186,12 +199,19 @@ class DsmlOutputParser(OutputParser):
             self.sdeclared[name] = "string"
 
     def feed(self, delta: str):
-        return super().feed(self.dsml.feed(delta))
+        return self._watch(super().feed(self.dsml.feed(delta)))
 
     def finish(self, reason: str | None = None):
         rest = self.dsml.flush()
-        out = super().feed(rest) if rest else []
-        return out + super().finish(reason)
+        out = self._watch(super().feed(rest) if rest else [])
+        out += self._watch(super().finish(reason))
+        text = "".join(self._reasoning).strip()
+        if reason in (None, "stop") and text and not self._answered:
+            # no </think> and no answer: the text IS the answer.  A streaming client has already seen it as reasoning and now gets
+            # it as content; the non-streaming collectors (server.py) drop the identical reasoning.
+            self._answered = True
+            out.append(Event("content", text))
+        return out
 
     @property
     def clean(self) -> bool:
