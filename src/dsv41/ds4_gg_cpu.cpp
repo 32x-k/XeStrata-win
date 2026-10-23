@@ -139,11 +139,8 @@ static bool own_ok(int type) {
 static bool use_iq256(int type, int nt) {
     if (g_iq256 < 0) {
         const char* v = std::getenv("DS4_GG_IQ256");
-        bool avx2 = false;
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-        __builtin_cpu_init();
-        avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
-#endif
+        // (ggml-cpu's own answer: built with AVX2 + FMA + F16C, which is also what makes its dots the AVX2 ones these rows match)
+        const bool avx2 = ggml_cpu_has_avx2() && ggml_cpu_has_fma() && ggml_cpu_has_f16c();
         g_iq256 = !avx2 ? 0 : v == nullptr ? 2 : std::atoi(v) != 0 ? 1 : 0;
     }
     if (g_iq256 == 0 || !strata::kernels::cpu::iq256x_supported(type)) return false;
