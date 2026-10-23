@@ -2,6 +2,9 @@
 // Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/ds4/ds4_gguf.cu - a GGUF's BF16 matrices and MXFP4 experts on the device (see ds4_gguf.cuh).
 #include "ds4_gguf.cuh"
+#if defined(STRATA_METAL)
+#include <ds4_metal_host.h>
+#endif
 
 #include "ds4_iq.cuh"
 #include "ds4_numerics.cuh"
@@ -198,6 +201,9 @@ __global__ void __launch_bounds__(kThreads) q8_quant_kernel(const float* __restr
 }
 void q8_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
     const dim3 grid((unsigned) ((k / 32 + kWarps - 1) / kWarps), (unsigned) rows);
+#if defined(STRATA_METAL)
+    if (::strata::dsv41::metal_host::q8_quant_rows(x, ldx, rows, k, (int8_t*) q, d)) return;
+#endif
     strata_ds4_launch(q8_quant_kernel, grid, kThreads, 0, s, x, ldx, k, q, d);
 }
 
@@ -1040,12 +1046,26 @@ template <int NC>
 void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
     if (f == 1) {
+#if defined(STRATA_METAL)
+        // the MXFP4 matvec: the engine's jobs go across as they are (same layout on both sides)
+        if (max_n > 0 && nj > 0 &&
+            ::strata::dsv41::metal_host::mx_mv((const void*) &J, nj, max_n, sizeof(BfJob), 1)) return;
+#endif
         if (vec) strata_ds4_launch(mx_mv_kernel<NC, true, false>, grid, kThreads, 0, s, J);
         else strata_ds4_launch(mx_mv_kernel<NC, false, false>, grid, kThreads, 0, s, J);
     } else if (f == 2) {   // (vec here: every row 4-byte aligned, so staged)
+#if defined(STRATA_METAL)
+        if (max_n > 0 && nj > 0 &&
+            ::strata::dsv41::metal_host::mx_mv((const void*) &J, nj, max_n, sizeof(BfJob), 2)) return;
+#endif
         if (vec) strata_ds4_launch(q8_mv_kernel<NC, true>, grid, kThreads, 0, s, J);
         else strata_ds4_launch(q8_mv_kernel<NC, false>, grid, kThreads, 0, s, J);
     } else {
+#if defined(STRATA_METAL)
+        // the BF16 matvec (vec: the rows and activations 16-byte aligned, so the 8-value step is safe)
+        if (vec && max_n > 0 && nj > 0 &&
+            ::strata::dsv41::metal_host::mx_mv((const void*) &J, nj, max_n, sizeof(BfJob), 0)) return;
+#endif
         if (vec) strata_ds4_launch(bf16_mv_kernel<NC, true>, grid, kThreads, 0, s, J);
         else strata_ds4_launch(bf16_mv_kernel<NC, false>, grid, kThreads, 0, s, J);
     }
@@ -1265,6 +1285,10 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     c.out_stride = (size_t) a.n_embd;
     c.k = a.k;
     c.n_embd = a.n_embd;
+#if defined(STRATA_METAL)
+    if (!::strata::dsv41::metal_host::mx_combine(c.plan_ptr, c.plan_w, c.part, c.cpu_part, c.cpu_stride,
+                                                 c.cpu_flag, c.sh_out, c.out, c.out_stride, 1, c.k, c.n_embd))
+#endif
     strata_ds4_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), 1), 128, 0, s, c);
     check("moe_down");
 }
@@ -1312,7 +1336,10 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     q8_quant(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);   // (rows of picks not on the device: unused)
     if (mx) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
     else iq::down(ia, groups, a.T, s);
+#if !defined(STRATA_METAL)
+    // (this port's dispatches are synchronous and nothing is published to wait for: ds4_kernels.cu's wait_seq)
     if (a.wait_ptr != nullptr) strata_ds4_launch(mx_wait_kernel, 1, 32, 0, s, a.wait_ptr, a.wait_val);
+#endif
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;
     c.plan_w = a.plan_w;
@@ -1325,6 +1352,11 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     c.out_stride = a.out_stride;
     c.k = a.k;
     c.n_embd = a.n_embd;
+#if defined(STRATA_METAL)
+    // mx_combine_kernel on the Metal dispatch; the launch below is the fallback
+    if (!::strata::dsv41::metal_host::mx_combine(c.plan_ptr, c.plan_w, c.part, c.cpu_part, c.cpu_stride,
+                                                 c.cpu_flag, c.sh_out, c.out, c.out_stride, a.T, c.k, c.n_embd))
+#endif
     strata_ds4_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), (unsigned) a.T), 128, 0, s, c);
     check("win_experts");
     return true;

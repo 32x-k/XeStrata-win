@@ -3,6 +3,9 @@
 // src/ds4/ds4_iq.cu - a GGUF's low-bit routed experts on the device (see ds4_iq.cuh).  The block layouts and grids are
 // ggml's (ggml-common.h, MIT, third_party/ggml/LICENSE); the sign and grid tricks are llama.cpp's vecdotq.cuh.
 #include "ds4_iq.cuh"
+#if defined(STRATA_METAL)
+#include <ds4_metal_host.h>
+#endif
 #include "ds4_numerics.cuh"
 
 #include <cuda_fp16.h>
@@ -1179,6 +1182,12 @@ const char* name(int t) {
 }
 
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    // gate_up_kernel on the Metal dispatch (the prompt / window path's expert GEMM); the launch below is the fallback
+    if (::strata::dsv41::metal_host::iq_gu(a.plan_ptr, a.grp_ptr, a.grp_start, a.grp_ent, a.n_groups, a.tr, a.n_embd,
+                                           a.n_ff, a.limit, a.xq, a.xd, a.h, a.tg, groups))
+        return true;
+#endif
     if (is_tq(a.tg)) return tq::gate_up(a, groups, ne_max, s);
     if (a.n_embd % 256 != 0 || a.n_ff % (kWarps * kGuRW) != 0) return false;
     const dim3 grid((unsigned) (a.n_ff / (kWarps * kGuRW)), (unsigned) groups);
@@ -1189,6 +1198,12 @@ bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
 }
 
 bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    // down_kernel on the Metal dispatch; the launch below is the fallback
+    if (::strata::dsv41::metal_host::iq_dn(a.plan_ptr, a.grp_ptr, a.grp_start, a.grp_ent, a.n_groups, a.tr, a.n_embd,
+                                           a.n_ff, a.hq, a.hd, a.part, a.td, groups))
+        return true;
+#endif
     if (is_tq(a.td)) return tq::down(a, groups, ne_max, s);
     if (a.n_ff % 256 != 0 || a.n_embd % (kWarps * kDnRW) != 0) return false;
     const dim3 grid((unsigned) (a.n_embd / (kWarps * kDnRW)), (unsigned) groups);
@@ -1240,6 +1255,9 @@ bool set_down(const SetArgs& a, cudaStream_t s) {
 }
 
 bool mv(const MvJob* jobs, int n, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    if (n > 0 && n <= 64 && ::strata::dsv41::metal_host::iq_mv((const void*) jobs, n)) return true;
+#endif
     {   // the trellis jobs go to their kernels, the others on
         MvJob tqj[64], oth[64];
         int nt = 0, no = 0;

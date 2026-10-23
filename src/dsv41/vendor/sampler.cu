@@ -16,6 +16,9 @@
 // `sampler_kernel` runs the sampled chain as `top_k` block-argmax rounds followed by the top_p / temperature /
 // draw chain (its header says why the selection must be parallel and why the tie rule keeps the semantics).
 #include "strata/dsv41/sampler.hpp"
+#if defined(STRATA_METAL)
+#include <ds4_metal_host.h>
+#endif
 
 #include <cuda_runtime.h>
 
@@ -525,6 +528,13 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
     if (p.greedy || p.temperature <= 0.0f) {
         // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
         const int gthreads = 1024;
+#if defined(STRATA_METAL)
+        // sampler_greedy_kernel on the Metal dispatch; the launch below is the fallback
+        if (::strata::dsv41::metal_host::sample_greedy(logits, n_tokens, n_vocab, history, history_len,
+                                                       p.penalty_last_n, p.penalty_repeat, p.penalty_freq,
+                                                       p.penalty_present, p.logit_bias, out))
+            return;
+#endif
         strata_ds4_launch(sampler_greedy_kernel, (unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream, 
             logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
     } else {
