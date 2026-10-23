@@ -583,6 +583,16 @@ int score(strata::ds4::Model& m, const std::string& ids_path, const std::string&
         std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
         return 1;
     }
+    // DS4_SCORE_PREFIX=N (a test of the long-prompt layer skip): the segments are joined into one stream, its first N
+    // tokens are read as one prompt (logits of the last row only: the path a long prompt takes, where the skip applies)
+    // and only the positions after them are scored, in windows
+    const long long prefix_n = std::getenv("DS4_SCORE_PREFIX") ? std::atoll(std::getenv("DS4_SCORE_PREFIX")) : 0;
+    if (prefix_n > 0 && segs.size() > 1) {
+        ScoreSeg all;
+        all.name = "concat";
+        for (const ScoreSeg& sg : segs) all.ids.insert(all.ids.end(), sg.ids.begin(), sg.ids.end());
+        segs.assign(1, all);
+    }
     std::FILE* out = std::fopen(out_path.c_str(), "wb");
     std::FILE* sj = std::fopen((out_path + ".seg.json").c_str(), "wb");
     if (out == nullptr || sj == nullptr) {
@@ -601,7 +611,15 @@ int score(strata::ds4::Model& m, const std::string& ids_path, const std::string&
         const long long first = line;
         double sum_nll = 0.0;
         long long top1 = 0, cnt = 0;
-        for (size_t a = 0; a + 1 < ids.size();) {
+        size_t a0 = 0;
+        if (prefix_n > 0 && (size_t) prefix_n + 1 < ids.size()) {
+            a0 = (size_t) prefix_n;
+            if (!m.feed(ids.data(), (int) a0, 1, err)) {
+                std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
+                return 1;
+            }
+        }
+        for (size_t a = a0; a + 1 < ids.size();) {
             const int T = (int) std::min<size_t>((size_t) window, ids.size() - 1 - a);   // (positions a .. a+T-1 are scored)
             if (!m.feed(ids.data() + a, T, T, err) || !m.logits(lg) || lg.size() < (size_t) T * (size_t) V) {
                 std::fprintf(stderr, "strata-dsv41: %s\n", err.empty() ? "no logits" : err.c_str());
