@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""engram_fold.py - a pack of their data with none of ours: fold the Engram gate and rename the kv straight from the
-quant's own GGUF shards, so `pack_gguf --engram <their engram-IQ4_NL.gguf>` needs no Engram set for those two tensors.
+"""engram_fold.py - the Engram tensors a pack needs, folded out of the quant's own shards, so a pack built around their
+`engram-IQ4_NL.gguf` uses none of our substitutes.
 
-The IST-DAS sets store the Engram as three per-layer tensors (`blk.N.engram_k`, `engram_q`, `engram_wkv`); the engine's
-layout wants `engram.gate` (k*q folded) and `engram.wkv` (their wkv, renamed).  Their `engram-IQ4_NL.gguf` carries only the
-ple table, so without this fold a pack built around their Engram file stops at "blk.1.engram_kv.weight: missing".
+The IST-DAS sets keep the Engram as three per-layer tensors (`blk.N.engram_k`, `engram_q`, `engram_wkv`); the engine's
+layout wants `engram.gate` (k*q folded, [4, 5120] F32) and `engram.wkv` ([25600, 6144] BF16).  Theirs are stored the other
+way round - their `engram_wkv` is `[6144, 25600]` and their `k/q` are `[5120, 4]` - so this tool dequantises, transposes and
+writes the engine's layout:
 
-The output is a `dense_requant.py`-style folder (dense.json + dense.bin) for `pack_gguf.py --dense-override`, which supplies
-tensors a pack would otherwise take from an Engram set.  Nothing is requantised: the gate is computed in float and written
-F32, the kv is copied byte for byte.
+  gate = transpose(k) * transpose(q)      F32
+  wkv  = transpose(dequant(wkv))          BF16
+
+Output is a `dense_requant.py`-style folder (dense.json + dense.bin) for `pack_gguf.py --dense-override`.
 
 usage:
   engram_fold.py --model /data/helcig/set200/2.00bpw --out /data/helcig/engram_fold_200 [--layers 1,14]
@@ -26,13 +28,10 @@ import sys
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-import pack_gguf  # noqa: E402  (its GGUF reader and its type table; one source of truth for both)
-
-# the types the fold can read as float; the kv is copied, so any type is fine for it
-FLOATY = {"F32", "F16", "BF16"}
+import pack_gguf  # noqa: E402  (its GGUF reader and its type table)
 
 
-def shards(model: pathlib.Path) -> list[pack_gguf.Gguf]:
+def shards(model: pathlib.Path):
     return [pack_gguf.Gguf(p) for p in sorted(model.glob("*.gguf"))]
 
 
@@ -52,18 +51,59 @@ def nbytes(typ: int, dims) -> int:
     return nel // per * bpb if per > 1 else nel * bpb
 
 
-def to_float(g, t) -> np.ndarray:
+def dequant_q5k(raw: np.ndarray, nblocks: int) -> np.ndarray:
+    """ggml block_q5_K (176 B, 256 values): f16 d, f16 dmin, uint8 scales[12], qh[32], qs[128]."""
+    b = raw.reshape(nblocks, 176)
+    d = b[:, 0:2].copy().view(np.float16).astype(np.float32).reshape(-1)
+    dmin = b[:, 2:4].copy().view(np.float16).astype(np.float32).reshape(-1)
+    scales, qh, qs = b[:, 4:16].astype(np.int32), b[:, 16:48].astype(np.int32), b[:, 48:176].astype(np.int32)
+    sc = np.empty((nblocks, 8), np.float32)
+    mn = np.empty((nblocks, 8), np.float32)
+    # ggml's get_scale_min_k4: the first four 6-bit scales are bytes 0..3 (low) and 4..7 (mins);
+    # the last four take the top two bits of bytes 0..3 plus the low/high nibbles of 8..11
+    for j in range(8):
+        if j < 4:
+            sc[:, j] = scales[:, j] & 63
+            mn[:, j] = scales[:, j + 4] & 63
+        else:
+            sc[:, j] = (scales[:, j + 4] & 0xF) | ((scales[:, j - 4] >> 6) << 4)
+            mn[:, j] = (scales[:, j + 4] >> 4) | ((scales[:, j] >> 6) << 4)
+    out = np.empty((nblocks, 256), dtype=np.float32)
+    for j in range(4):
+        for half in range(2):
+            d1 = d * sc[:, j * 2 + half]
+            m1 = dmin * mn[:, j * 2 + half]
+            q = qs[:, j * 32:(j + 1) * 32]
+            h = (qh >> (j * 2 + half)) & 1
+            nib = ((q & 0xF) if half == 0 else (q >> 4)) + (h << 4)
+            out[:, j * 64 + half * 32: j * 64 + half * 32 + 32] = d1[:, None] * nib - m1[:, None]
+    return out.reshape(-1)
+
+
+def dequant(g, t) -> np.ndarray:
     name, typ, dims, off = t
     tname = pack_gguf.TYPES[typ][0]
-    if tname not in FLOATY:
-        raise SystemExit("%s: type %s is not one the fold reads (%s)" % (name, tname, ", ".join(sorted(FLOATY))))
     nb = nbytes(typ, dims)
     raw = np.fromfile(g.path, dtype=np.uint8, count=nb, offset=off)
+    if tname == "Q5_K":
+        return dequant_q5k(raw, nb // 176).astype(np.float64)
+    if tname == "Q4_K":
+        raise SystemExit("%s: Q4_K not handled by the fold yet (Q5_K, F32, F16, BF16 are)" % name)
     if tname == "F32":
         return raw.view(np.float32).astype(np.float64)
     if tname == "BF16":
         return (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32).astype(np.float64)
-    return raw.view(np.float16).astype(np.float64)
+    if tname == "F16":
+        return raw.view(np.float16).astype(np.float64)
+    raise SystemExit("%s: type %s is not one the fold reads" % (name, tname))
+
+
+def to_bf16_bytes(v: np.ndarray) -> bytes:
+    """F32 -> BF16, round to nearest even (what ggml's ggml_compute_fp32_to_bf16 does)."""
+    u = v.astype(np.float32).view(np.uint32)
+    lsb = (u >> 16) & 1
+    rounded = (u + 0x7FFF + lsb) >> 16
+    return rounded.astype(np.uint16).tobytes()
 
 
 def main() -> int:
@@ -104,18 +144,19 @@ def main() -> int:
         if kt is None or qt is None:
             print("layer %d: no engram_k/q in these shards, skipped" % il)
             continue
-        k, q = to_float(kg, kt), to_float(qg, qt)
+        # their k/q are [5120, 4] (ne0 = 5120): the engine's gate is [4, 5120]
+        k = dequant(kg, kt).reshape(kt[2][1], kt[2][0]).T
+        q = dequant(qg, qt).reshape(qt[2][1], qt[2][0]).T
         if k.shape != q.shape:
-            raise SystemExit("layer %d: k %s and q %s differ in shape" % (il, k.shape, q.shape))
+            raise SystemExit("layer %d: k %s and q %s differ after the transpose" % (il, k.shape, q.shape))
         gate = (k * q).astype(np.float32)
-        add("layers.%d.engram.gate.weight" % il, "F32", gate.tobytes(), list(kt[2]))
-        kv_note = "MISSING"
+        add("layers.%d.engram.gate.weight" % il, "F32", gate.tobytes(), [gate.shape[1], gate.shape[0]])
+        note = "MISSING"
         if wt is not None:
-            nb = nbytes(wt[1], wt[2])
-            add("layers.%d.engram.wkv.weight" % il, pack_gguf.TYPES[wt[1]][0],
-                np.fromfile(wg.path, dtype=np.uint8, count=nb, offset=wt[3]).tobytes(), list(wt[2]))
-            kv_note = "%s %s" % (pack_gguf.TYPES[wt[1]][0], list(wt[2]))
-        print("layer %d: gate %s folded from k*q (F32), kv %s" % (il, list(kt[2]), kv_note))
+            w = dequant(wg, wt).reshape(wt[2][1], wt[2][0]).T.astype(np.float32)
+            add("layers.%d.engram.wkv.weight" % il, "BF16", to_bf16_bytes(w), [w.shape[1], w.shape[0]])
+            note = "BF16 [%d, %d]" % (w.shape[1], w.shape[0])
+        print("layer %d: gate [%d, %d] F32, wkv %s" % (il, gate.shape[1], gate.shape[0], note))
 
     (out / "dense.bin").write_bytes(b"".join(blobs))
     json.dump(idx, open(out / "dense.json", "w"), indent=1)
