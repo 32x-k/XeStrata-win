@@ -18,6 +18,8 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <type_traits>
 #include <map>
 #include <mutex>
 #include <unordered_map>
@@ -1172,8 +1174,12 @@ void dn_ne(const Args& a, int groups, int ne, cudaStream_t s) {
     else if (ne <= 8) launch_dn<T, 8>(a, groups, s);
     else launch_dn<T, 16>(a, groups, s);
 }
+#include "ds4_iq_hip.inc"
 template <int T, bool GU>
 void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+    if (hipk::launch<T, GU>(a, s)) return;   // (gfx12, STRATA_DS4_HIPK=1: the matrix-core tiles)
+#endif
 #if !defined(STRATA_USE_HIP)
     if (tc_ok()) {
         set_tc_kernel<T, GU><<<grid, kThreads, 0, s>>>(a);

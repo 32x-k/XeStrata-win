@@ -7465,8 +7465,10 @@ struct Model::Impl {
                 for (auto& kv : agg) tot += kv.second.ms;
                 for (auto& kv : agg)
                     std::fprintf(stderr,
-                                 "ds4 prof  expert kernels type %-8s %-7s %9.1f ms  calls %5ld  rows/expert %6.1f  ~%5.1f TFLOPS (2048-wide ffn)\n",
+                                 "ds4 prof  expert kernels type %-8s %-7s %9.1f ms  calls %5ld  experts %6ld (%.1f us each, %.1f a call)  rows/expert %6.1f  ~%5.1f TFLOPS\n",
                                  gg::iq::name(kv.first.first), kv.first.second ? "down" : "gate+up", kv.second.ms, kv.second.calls,
+                                 kv.second.experts, kv.second.experts > 0 ? 1e3 * kv.second.ms / (double) kv.second.experts : 0.0,
+                                 kv.second.calls > 0 ? (double) kv.second.experts / (double) kv.second.calls : 0.0,
                                  kv.second.experts > 0 ? (double) kv.second.rows / (double) kv.second.experts : 0.0,
                                  kv.second.ms > 0 ? kv.second.flops / kv.second.ms / 1e9 : 0.0);
                 std::fprintf(stderr, "ds4 prof  expert kernels total %.1f ms\n", tot);
