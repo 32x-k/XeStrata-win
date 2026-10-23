@@ -18,6 +18,11 @@
 
 #include <mutex>
 #include <vector>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__x86_64__)
+#include <cpuid.h>
+#endif
 
 namespace strata::ds4::gguf {
 namespace {
@@ -139,6 +144,35 @@ static bool own_ok(int type, int impl) {
     });
     return ok[impl][k];
 }
+// the AMD family (0x19 Zen 3/4, 0x1A Zen 5), 0 on any other vendor or if it cannot be read
+static int amd_family() {
+    static const int fam = [] {
+#if defined(_MSC_VER)
+        int r[4];
+        __cpuid(r, 0);
+        char v[13];
+        std::memcpy(v, &r[1], 4); std::memcpy(v + 4, &r[3], 4); std::memcpy(v + 8, &r[2], 4);
+        v[12] = 0;
+        if (std::strcmp(v, "AuthenticAMD") != 0) return 0;
+        __cpuid(r, 1);
+        const unsigned eax = (unsigned) r[0];
+#elif defined(__x86_64__)
+        unsigned a, b, c, d;
+        if (!__get_cpuid(0, &a, &b, &c, &d)) return 0;
+        char v[13];
+        std::memcpy(v, &b, 4); std::memcpy(v + 4, &d, 4); std::memcpy(v + 8, &c, 4);
+        v[12] = 0;
+        if (std::strcmp(v, "AuthenticAMD") != 0) return 0;
+        if (!__get_cpuid(1, &a, &b, &c, &d)) return 0;
+        const unsigned eax = a;
+#else
+        return 0;
+#endif
+        const unsigned base = (eax >> 8) & 0xF;
+        return (int) (base == 0xF ? base + ((eax >> 20) & 0xFF) : base);
+    }();
+    return fam;
+}
 // DS4_GG_IQ512: 1 takes the AVX-512 rows (bit-identical too) where the CPU has AVX-512 F/BW/VL/DQ/VNNI/VBMI, 0 never; unset: the rule
 // below, from the measurements on Zen 4.
 static int g_iq512 = -1;
@@ -149,9 +183,16 @@ static bool want_512(int type, int nt) {
     }
     if (g_iq512 == 0 || !strata::kernels::cpu::iq512x_supported(type)) return false;
     if (g_iq512 == 1) return true;
-    // Zen 4 (Ryzen 5 7600, 6 threads): IQ2_XXS at 16 tokens 3.2 -> 4.0 GB/s over the AVX2 rows (x4.2 against ggml's dot), no gain at 4
-    // tokens, IQ3_XXS the same as AVX2 at every count and slower at one - so the AVX-512 rows only for a prompt chunk's tokens on IQ2_XXS
-    return nt >= 7 && type == 16;
+    // by CPU (measured, ds4_gg_bench --expert at 16 tokens; the AVX-512 rows tie the AVX2 ones at 4 tokens and lose at one):
+    //  Zen 5 (AMD family 0x1A, Strix Halo): IQ2_XXS 8.1 -> 10.9 GB/s, IQ3_XXS 10.8 -> 13.9;
+    //  Zen 4 (family 0x19, Ryzen 5 7600): IQ2_XXS 3.2 -> 4.0, IQ3_XXS no gain;
+    //  anything else with AVX-512 (Intel): not measured, so the AVX2 rows.
+    // and only for a prompt chunk's tokens (7 and more)
+    if (nt < 7) return false;
+    const int fam = amd_family();
+    if (fam >= 0x1A) return type == 16 || type == 18;
+    if (fam == 0x19) return type == 16;
+    return false;
 }
 // 0: ggml-cpu's dot, 1: the AVX2 rows, 2: the AVX-512 rows
 static int use_iq256(int type, int nt) {
