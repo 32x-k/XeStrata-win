@@ -14,6 +14,11 @@
 #include <cstdint>
 #include <cstring>
 
+// called by the gpu layer's synchronisation: everything batched must reach the GPU before a host read
+extern "C" void ds4_metal_flush();
+
+#define DSV41_PROBE(fmt, ...) do { static bool once_ = false; if (!once_) { once_ = true; std::fprintf(stderr, "[probe] " fmt, __VA_ARGS__); } } while (0)
+
 namespace strata::dsv41::metal_host {
 
 // mirrors metal/src/engine/msl/ds4_init.metal's Ds4Finish (Metal has no 'long long': 64-bit is 'long')
@@ -1407,6 +1412,11 @@ bool moe_win_group_cpu(const void* plan_ptr, void* grp_ptr, void* grp_start, voi
     }
     *ng_out = ng;
     return true;
+}
+
+
+extern "C" void ds4_metal_flush() {
+    if (g_cx) g_cx->flush_runs();
 }
 
 }  // namespace strata::dsv41::metal_host

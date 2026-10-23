@@ -189,6 +189,8 @@ void flush(StreamImpl* s) {
     s->cb = nullptr;
     s->pending = 0;
 }
+extern "C" void ds4_metal_flush();
+
 Error wait_value(MTL::SharedEvent* ev, uint64_t v) {
     while (ev->signaledValue() < v) std::this_thread::yield();
     ++rt().stats.host_syncs;
@@ -373,6 +375,7 @@ Error get_device(int* dev) { *dev = 0; return kSuccess; }
 Error set_device(int dev) { return dev == 0 ? kSuccess : fail(kErrorInvalidValue); }
 Error device_count(int* n) { *n = rt().dev ? 1 : 0; return kSuccess; }
 Error device_synchronize() {
+    ds4_metal_flush();
     Runtime& r = rt();
     StreamImpl* s = S(nullptr);
     flush(s);

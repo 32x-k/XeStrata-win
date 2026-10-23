@@ -29,6 +29,9 @@ std::string read_file(const std::string& path) {
 }
 
 struct Context::Impl {
+    id<MTLCommandBuffer> cb_def = nil;   // the open command buffer single dispatches accumulate in
+    id<MTLComputeCommandEncoder> enc_def = nil;
+    int def_n = 0;
     id<MTLDevice> dev;
     id<MTLCommandQueue> q;
     std::vector<id<MTLLibrary>> libs;
@@ -272,8 +275,31 @@ static void encode(id<MTLComputeCommandEncoder> enc, const Dispatch& d) {
             threadsPerThreadgroup:MTLSizeMake(d.tg[0], d.tg[1], d.tg[2])];
 }
 
+void Context::flush_runs() {
+    if (impl_->cb_def == nil) return;
+    [impl_->enc_def endEncoding];
+    [impl_->cb_def commit];
+    [impl_->cb_def waitUntilCompleted];
+    if (impl_->cb_def.status != MTLCommandBufferStatusCompleted)
+        std::fprintf(stderr, "mtl: deferred command buffer failed: %s\n", [[impl_->cb_def.error localizedDescription] UTF8String]);
+    impl_->cb_def = nil;
+    impl_->enc_def = nil;
+    impl_->def_n = 0;
+}
+
 double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, bool barrier_between) {
     @autoreleasepool {
+        if (ds.size() == 1 && reps == 1 && !barrier_between) {
+            if (impl_->cb_def == nil || impl_->def_n >= 20000) {
+                flush_runs();
+                impl_->cb_def = [impl_->q commandBufferWithUnretainedReferences];
+                impl_->enc_def = [impl_->cb_def computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+            }
+            encode(impl_->enc_def, ds[0]);
+            ++impl_->def_n;
+            return 0.0;
+        }
+        flush_runs();
         id<MTLCommandBuffer> cb = [impl_->q commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> enc =
             [cb computeCommandEncoderWithDispatchType:concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
