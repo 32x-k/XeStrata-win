@@ -635,6 +635,41 @@ int score(strata::ds4::Model& m, const std::string& ids_path, const std::string&
     std::fclose(out);
     return 0;
 }
+// ---- Strata H100 addition: profile run -------------------------------------------------------------------------
+// --profile-run IDS.json: every segment is fed through the model from a fresh state (no logits); the engine's expert
+// profile (--expert-profile FILE, counts a layer and expert) and DS4_TRACE collect the routing.  The profile is saved
+// every 10 segments.  --window sets the chunk (a chunked prompt path above 16).
+int profile_run(strata::ds4::Model& m, const std::string& ids_path, int window) {
+    std::vector<ScoreSeg> segs;
+    std::string err;
+    if (!read_score_ids(ids_path, segs, err)) {
+        std::fprintf(stderr, "strata-dsv41: %s
+", err.c_str());
+        return 1;
+    }
+    const double t0 = now_ms();
+    long long tot = 0;
+    for (size_t si = 0; si < segs.size(); ++si) {
+        const std::vector<int>& ids = segs[si].ids;
+        m.reset();
+        for (size_t a = 0; a < ids.size();) {
+            const int T = (int) std::min<size_t>((size_t) window, ids.size() - a);
+            if (!m.feed(ids.data() + a, T, 0, err)) {
+                std::fprintf(stderr, "strata-dsv41: %s
+", err.c_str());
+                return 1;
+            }
+            a += (size_t) T;
+        }
+        tot += (long long) ids.size();
+        std::fprintf(stderr, "profile-run %zu/%zu %s: %zu tokens, %lld in all, %.0f s, %.1f tok/s
+", si + 1, segs.size(),
+                     segs[si].name.c_str(), ids.size(), tot, (now_ms() - t0) / 1000.0, 1000.0 * (double) tot / (now_ms() - t0));
+        if ((si + 1) % 10 == 0) m.save_profile();
+    }
+    m.save_profile();
+    return 0;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -647,7 +682,7 @@ int main(int argc, char** argv) {
     bool serve_mode = false;
     bool pack_info_mode = false;
     std::string images, enc_rgb, enc_out;
-    std::string score_ids, score_out;
+    std::string score_ids, score_out, prof_ids;
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -702,6 +737,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-logits") dump = val("--dump-logits");
         else if (a == "--score") score_ids = val("--score");
         else if (a == "--score-out") score_out = val("--score-out");
+        else if (a == "--profile-run") prof_ids = val("--profile-run");
         else if (a == "--serve") serve_mode = true;
         else if (a == "--pack-info") pack_info_mode = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
@@ -736,6 +772,7 @@ int main(int argc, char** argv) {
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf);
+    if (!prof_ids.empty()) return profile_run(m, prof_ids, window);
     if (!score_ids.empty()) return score(m, score_ids, score_out.empty() ? score_ids + ".tsv" : score_out, window, std::atoi(eos.c_str()));
 
     if (!enc_rgb.empty()) {   // the vision tower alone: a picture's span rows (BF16 [rows][dim]) into --dump-image
