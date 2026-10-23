@@ -221,5 +221,76 @@ class SaveWaitsForRestartAnswer(unittest.TestCase):
         self.assertEqual(after, ["IQ3_S 32K"])                          # saved once the run went on
 
 
+class DraftingOffConfig(unittest.TestCase):
+    """B10: the saved launch config has no --mtp in args when "mtp" is false, whatever made it false."""
+
+    BASE = {"args": ["--model", "m.gguf", "--mtp", "C:/x/mtp", "--spec-min-p", "0.5", "--batch-mtp", "--max-context", "32768"], "exe": "x"}
+
+    def derive(self, base, **kw):
+        from strata_control import tune_knobs
+        s = S.LaunchSettings(family="gyro", model="Gyro-S", context=32768, **kw)
+        return R.derive_config(base, s, bool_flags=tune_knobs.BOOL_FLAGS)
+
+    def test_drafting_off_and_mtp_off(self):
+        for kw in ({"drafting": "off"}, {"mtp": "off"}, {"drafting": "off", "extra": {"prefill": "4096"}}):
+            with self.subTest(kw=kw):
+                cfg = self.derive(self.BASE, **kw)
+                self.assertIs(cfg["mtp"], False)
+                self.assertNotIn("--mtp", cfg["args"])
+                self.assertIn("--max-context", cfg["args"])
+
+    def test_an_installed_config_that_already_says_mtp_false(self):
+        cfg = self.derive({**self.BASE, "mtp": False})
+        self.assertIs(cfg["mtp"], False)
+        self.assertNotIn("--mtp", cfg["args"])
+        self.assertNotIn("--spec-min-p", cfg["args"])
+
+    def test_mtp_stays_when_it_is_on(self):
+        cfg = self.derive(self.BASE)
+        self.assertIn("--mtp", cfg["args"])
+
+
+class ReusedDataLine(unittest.TestCase):
+    """C08 note: one line says where the pack and the draft layer are read from."""
+
+    def setUp(self):
+        self.home = Home().__enter__()
+        self.addCleanup(self.home.__exit__, None, None, None)
+        p = mock.patch.object(Catalog, "hardware", lambda self, fresh=False: dict(HW_12, disk_free_gb=500.0))
+        p.start()
+        self.addCleanup(p.stop)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+
+    def runner(self, cfg_args, **fields):
+        cfg = self.base / "strata-x.json"
+        cfg.write_text(json.dumps({"args": cfg_args}))
+        s = S.LaunchSettings(family="qwen", model="Q2_0", context=32768, **fields)
+        r = Runner(s, catalog=catalog())
+        r.said = []
+        r.emit_cb = lambda e: r.said.append(e.text)
+        return r, cfg
+
+    def test_pack_and_draft_layer_from_the_old_folder_are_named(self):
+        old = self.base / "dl-data"
+        r, cfg = self.runner(["--pack", str(old / "packs" / "x"), "--mtp", str(old / "mtp" / "rt")],
+                             model_path=str(self.base / "docs"), data_dir=str(self.base / "c08-data"))
+        r.say_reused_data(cfg)
+        self.assertEqual(len(r.said), 1)
+        self.assertIn("the prepared pack and the draft layer are read from", r.said[0].lower())
+        self.assertIn("dl-data", r.said[0])
+        self.assertIn("nothing was copied", r.said[0])
+
+    def test_no_line_when_they_are_in_the_given_folder_or_nothing_was_given(self):
+        new = self.base / "c08-data"
+        r, cfg = self.runner(["--pack", str(new / "packs" / "x")], model_path=str(self.base / "docs"), data_dir=str(new))
+        r.say_reused_data(cfg)
+        self.assertEqual(r.said, [])
+        r, cfg = self.runner(["--pack", str(self.base / "o" / "packs" / "x")], model_path=str(self.base / "docs"))
+        r.say_reused_data(cfg)
+        self.assertEqual(r.said, [])
+
+
 if __name__ == "__main__":
     unittest.main()

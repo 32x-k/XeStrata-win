@@ -396,6 +396,8 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
         cfg["args"] = tune_knobs.apply_to_argv([str(x) for x in cfg.get("args") or []], a_changes)
         if e_changes:
             cfg["env"] = tune_knobs.apply_to_env(dict(cfg.get("env") or {}), e_changes)
+    from strata_control import draft_layer
+    draft_layer.apply(cfg)                                   # "mtp": false (from the installed config too) never sits beside --mtp in the saved args (B10)
     return cfg
 
 
@@ -1000,8 +1002,36 @@ class Runner:
             raise LaunchError("Setup finished but no run config was written for this model.",
                               "Run `strata launch` again; if it repeats, the setup output above says why.", 6)
         self.emit("model", f"{title} is ready.", 100)
+        self.say_reused_data(path)
         self.check_pictures(path)
         return path
+
+    def say_reused_data(self, path: Path) -> None:
+        """C08 note: your own model files are used where they are, and when the prepared pack or the draft layer are read from another data folder
+        than the one given, one line says where from."""
+        s = self.s
+        if not (s.model_path and s.data_dir):
+            return
+        try:
+            args = [str(a) for a in read_config(path).get("args") or []]
+            want = Path(s.data_dir).expanduser().resolve()
+            elsewhere = []
+            for flag, label in (("--pack", "the prepared pack"), ("--mtp", "the draft layer")):
+                if flag in args and args.index(flag) + 1 < len(args):
+                    value = args[args.index(flag) + 1]
+                    if value.isdigit():
+                        continue
+                    place = Path(value).expanduser().resolve()
+                    if not _inside(place, want):
+                        elsewhere.append((label, place))
+            if elsewhere:
+                folders = sorted({str(pl.parent.parent if pl.parent.name in ("packs", "mtp") else pl.parent) for _l, pl in elsewhere})
+                text = (f"{' and '.join(l for l, _p in elsewhere).capitalize()} {'is' if len(elsewhere) == 1 else 'are'} read from "
+                        f"{', '.join(folders)}, not from {want}; nothing was copied.")
+                self.notices.append(text)
+                self.emit("model", text, 100)
+        except (OSError, ValueError):
+            pass
 
     def keep_setup_output(self, lines: list[str]) -> str | None:
         """The last lines setup.py printed, kept next to the launch's other logs so a failed install can be read afterwards (the message
