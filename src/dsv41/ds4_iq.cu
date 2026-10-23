@@ -96,6 +96,10 @@ __device__ __forceinline__ int sgn4(uint32_t g, uint32_t b) {
     const uint32_t lo = (((b & 15u) * 0x10204080u) & 0x80808080u) >> 7;
     return (int) ((g ^ (lo * 255u)) + lo);
 }
+// per-byte wrapping add (CUDA's __vadd4, which HIP has not): no carry crosses a byte
+__device__ __forceinline__ uint32_t add4(uint32_t a, uint32_t b) {
+    return ((a & 0x7f7f7f7fu) + (b & 0x7f7f7f7fu)) ^ ((a ^ b) & 0x80808080u);
+}
 __device__ __forceinline__ int2 tab16(uint32_t q4, const uint32_t* t) {   // vecdotq's get_int_from_table_16
     uint32_t tmp[2];
     const uint32_t sel = 0x32103210u | ((q4 & 0x88888888u) >> 1);
@@ -212,8 +216,8 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
             const uint32_t h = (uint32_t) qh[l >> 1] >> (4 * (l & 1));
             const uint32_t e = tab[(uint32_t) qs[l] | ((h & 7u) << 8)];
             const uint32_t dl = (h & 8u) ? 0xf7f7f7f7u : 0xf9f9f9f9u;   // -8 -+ 1 in each byte
-            s.q[2 * l] = (int) __vadd4((e & 0x0f0f0f0fu) << 3, dl);
-            s.q[2 * l + 1] = (int) __vadd4(((e >> 4) & 0x0f0f0f0fu) << 3, dl);
+            s.q[2 * l] = (int) add4((e & 0x0f0f0f0fu) << 3, dl);
+            s.q[2 * l + 1] = (int) add4(((e >> 4) & 0x0f0f0f0fu) << 3, dl);
         }
         s.s0 = 2 * (int) (sc & 7u) + 1;
         s.s1 = 2 * (int) ((sc >> 3) & 7u) + 1;
