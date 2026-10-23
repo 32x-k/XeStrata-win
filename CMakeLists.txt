@@ -2297,3 +2297,19 @@ if(STRATA_HIP_GFX906)
   add_executable(gfx906_qsa_query_swizzle_probe bench/gfx906_qsa_query_swizzle_probe.cpp)
   target_link_libraries(gfx906_qsa_query_swizzle_probe PRIVATE strata_kernels ${_strata_gpu_runtime_target})
 endif()
+
+# ---- DeepSeek-V4.1 on a box with no GPU toolkit ------------------------------------------------
+# The whole DSV41 block above lives inside if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP), so with neither backend on
+# -DSTRATA_BUILD_DSV41=ON was silently unused and the host-side benchmark could not be built at all (found on p1004,
+# 2026-10-23: the CPU lane is exactly what a box without a usable GPU needs to measure).  This branch builds the one target
+# that has no device code, so the CPU-lane A/B runs anywhere.
+if(STRATA_BUILD_DSV41 AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906)
+  message(STATUS "STRATA_BUILD_DSV41: no GPU backend, building the host-side benchmark only (ds4_gg_bench)")
+  if(STRATA_NATIVE_EXPERTS)
+    add_executable(ds4_gg_bench tests/dsv41/gg_dot_bench.cpp src/dsv41/ds4_gg_cpu.cpp)
+    target_include_directories(ds4_gg_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41
+                               ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
+    target_link_libraries(ds4_gg_bench PRIVATE strata_kernels_cpu Threads::Threads)
+    target_compile_definitions(ds4_gg_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
+  endif()
+endif()
