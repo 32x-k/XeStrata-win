@@ -3441,34 +3441,35 @@ struct Model::Impl {
                 sa.n_embd = D;
                 sa.n_ff = FF;
                 sa.limit = g.lim;
+                EkMark ek{};
+                const bool ekp = prof_chunk;
+                if (ekp) {
+                    std::lock_guard<std::mutex> lk(prof_mu);
+                    ek.e0 = ek_ev();
+                    ek.e1 = ek_ev();
+                    ek.e2 = ek_ev();
+                    ek.tg = gg::expert_type(sa.lay, 0);
+                    ek.td = gg::expert_type(sa.lay, 2);
+                    ek.nrows = nrows;
+                    ek.nexp = j - i0;
+                    ek.maxrows = max_rows;
+                    ek.ff = FF;
+                    cudaGetDevice(&ek.dev);
+                    cudaEventRecord(ek.e0, d.st);
+                }
                 if (sa.lay.fmt == gg::kFmtMXFP4) {
                     gg::set_gate_up(sa, c.x, D, c.row_tok + a, c.h16, FF, d.st);
+                    if (ekp) cudaEventRecord(ek.e1, d.st);
                     gg::set_down(sa, c.h16, FF, c.y, D, d.st);
                 } else {
-                    EkMark ek{};
-                    const bool ekp = prof_chunk;
-                    if (ekp) {
-                        std::lock_guard<std::mutex> lk(prof_mu);
-                        ek.e0 = ek_ev();
-                        ek.e1 = ek_ev();
-                        ek.e2 = ek_ev();
-                        ek.tg = gg::expert_type(sa.lay, 0);
-                        ek.td = gg::expert_type(sa.lay, 2);
-                        ek.nrows = nrows;
-                        ek.nexp = j - i0;
-                        ek.maxrows = max_rows;
-                        ek.ff = FF;
-                        cudaGetDevice(&ek.dev);
-                        cudaEventRecord(ek.e0, d.st);
-                    }
                     x3::set_gate_up(sa, c.x, D, c.row_tok + a, c.h16, FF, d.st);
                     if (ekp) cudaEventRecord(ek.e1, d.st);
                     x3::set_down(sa, c.h16, FF, c.y, D, d.st);
-                    if (ekp) {
-                        cudaEventRecord(ek.e2, d.st);
-                        std::lock_guard<std::mutex> lk(prof_mu);
-                        ek_marks.push_back(ek);
-                    }
+                }
+                if (ekp) {
+                    cudaEventRecord(ek.e2, d.st);
+                    std::lock_guard<std::mutex> lk(prof_mu);
+                    ek_marks.push_back(ek);
                 }
                 if (dump_y != nullptr && (dump_y_layer < 0 || l.il == dump_y_layer)) {
                     std::vector<int> bb(b + i0, b + j + 1);
