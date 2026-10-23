@@ -373,7 +373,7 @@ class OfficialSets(unittest.TestCase):
             self.assertEqual(p["args"], [])
         p = dsv41_fit.plan([RTX5070], 64.0, 100.0, model=ISTA)
         text = " ".join(p["lines"]) + " ".join(p["warnings"])
-        for needle in ("4.7", "7.2", "31 tokens/s", "free disk space", "only once" if False else "downloads it once"):
+        for needle in ("4.7", "7.2", "31 tokens a second", "free disk space", "only once" if False else "downloads it once"):
             self.assertIn(needle, text)
         self.assertFalse(p["disk_ok"])
         p225 = dsv41_fit.plan([RTX5070], 64.0, None, model="IST-DAS-2.25bpw")

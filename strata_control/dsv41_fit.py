@@ -13,7 +13,7 @@ card, and computes the rest of the experts on the CPU, reading them in place fro
 
 Measured (r9700, 4 x Radeon AI PRO R9700 32 GB, 251 GB RAM, 2026-10-20, f-dsv41-port 01389205e): per card 3.4-4.7 GB of dense
 weights, 28.5-29.8 GB of experts (1,505-1,575 of its 3,840), ~0.6 GB free; 6,197 experts (116.5 GB) in graphics memory and
-9,163 (172.3 GB) on the CPU lane; --tp 2: prompts 143-181 tokens/s (3K prompts), answers 25-31 tokens/s.  Pure functions, no I/O:
+9,163 (172.3 GB) on the CPU lane; --tp 2: prompts 143-181 tokens a second (3K prompts), answers 25-31 tokens a second.  Pure functions, no I/O:
 setup.py, tools/strata_mcp.py and strata_cli/launch import it.  Recommend, never force: nothing here refuses a computer.
 """
 
@@ -44,16 +44,16 @@ REST_RAM_GB = 9.0                     # RAM the engine and the system keep besid
 SPARE_FITS_GB = 4.0                   # RAM left beyond the CPU lane's experts below which "fits" becomes "tight"
 DISK_HEADROOM_GB = 6.0                # the pack folder (hash tables, tokenizer) and room to work
 SMALLEST_CARD_GB = 8.0                # a card under this adds little: the dense weights alone are ~4 GB of it per card of four
-MEASURED = ("4 x Radeon AI PRO R9700 (32 GB) with 251 GB of RAM: prompts of 3,000 tokens read at 143-181 tokens/s, answers "
-            "at 25-31 tokens/s (--tp 2); one answer at a time")
+MEASURED = ("4 x Radeon AI PRO R9700 (32 GB) with 251 GB of RAM: prompts of 3,000 tokens read at 143-181 tokens a second, answers "
+            "at 25-31 tokens a second (--tp 2); one answer at a time")
 
 
 # The two official IST-DAS sets (helcig/tmp-oct26-2, setup.py DSV41_ISTA_FILES): 4 shards each (the experts as IQ1_M / IQ2 / IQ3 types, the
 # dense weights Q8_0 / Q5_K), plus ONE Engram (110.6 GB, IQ4_NL, shared by both sets, stays on the SSD) and the DSpark drafter (8.0 GB).
 # Measured 2026-10-23 (f-dsv41-rel): quality against the original model (ppl +16% for 2.00, +7.7-8.3% for 2.25; code / agent +3.5% / +2.5%
-# on 2.25); speed on the owner PC (RTX 5070 12 GB, 64 GB RAM, 3.6 GB/s NVMe): answers ~4.7 tokens/s, prompts 121 tokens/s at 4K and
-# 231 tokens/s at 8K; RTX 3060 12 GB with 46 GB of RAM (the engine held to 36 GB): answers ~7.2 tokens/s on 2.00; 4 x Radeon AI PRO
-# R9700: answers ~31 tokens/s, prompts 330-373 tokens/s at 8K.
+# on 2.25); speed on the owner PC (RTX 5070 12 GB, 64 GB RAM, 3.6 GB/s NVMe): answers ~4.7 tokens a second, prompts 121 tokens a second at 4K and
+# 231 tokens a second at 8K; RTX 3060 12 GB with 46 GB of RAM (the engine held to 36 GB): answers ~7.2 tokens a second on 2.00; 4 x Radeon AI PRO
+# R9700: answers ~31 tokens a second, prompts 330-373 tokens a second at 8K.
 ISTA_ENGRAM_BYTES = 110_595_290_720
 ISTA_DSPARK_BYTES = 7_976_914_240
 ISTA_META_BYTES = 5_780_589          # the first shard of Unsloth's UD-Q8_K_XL: only the metadata --engram-meta reads
@@ -68,9 +68,9 @@ ISTA_SETS = {
 }
 ISTA_DENSE_GB = 6.16                  # the dense weights in the shards (attention, router, shared experts, the head; the embedding stays on the CPU)
 ISTA_DENSE_ON_GPU_GB = 4.5            # what a card holds of them with a 12 GB card (measured on the 5070 / 3060: the engine places the rest itself)
-ISTA_MEASURED = ("an RTX 5070 (12 GB) with 64 GB of RAM and a 3.6 GB/s NVMe drive: answers about 4.7 tokens/s, a 4,000-token prompt "
-                 "read at 121 tokens/s; an RTX 3060 (12 GB) with 46 GB of RAM: about 7.2 tokens/s; four Radeon AI PRO R9700 cards: "
-                 "about 31 tokens/s")
+ISTA_MEASURED = ("an RTX 5070 (12 GB) with 64 GB of RAM and a 3.6 GB/s NVMe drive: answers about 4.7 tokens a second, a 4,000-token prompt "
+                 "read at 121 tokens a second; an RTX 3060 (12 GB) with 46 GB of RAM: about 7.2 tokens a second; four Radeon AI PRO R9700 cards: "
+                 "about 31 tokens a second")
 
 
 def variant(model: str | None) -> dict | None:
@@ -82,41 +82,6 @@ def variant(model: str | None) -> dict | None:
 
 def variant_key(model: str | None) -> str | None:
     return next((k for k in ISTA_SETS if k.lower() == str(model or "").lower()), None)
-
-
-def ista_download_bytes(model: str, have_engram: bool = False) -> int:
-    v = variant(model)
-    return v["set_bytes"] + ISTA_DSPARK_BYTES + ISTA_META_BYTES + (0 if have_engram else ISTA_ENGRAM_BYTES)
-
-
-# The two official IST-DAS sets (helcig/tmp-oct26-2, setup.py DSV41_ISTA_FILES): 4 shards each (the experts as IQ1_M / IQ2 / IQ3 types, the
-# dense weights Q8_0 / Q5_K), plus ONE Engram (110.6 GB, IQ4_NL, shared by both sets, stays on the SSD) and the DSpark drafter (8.0 GB).
-# Measured 2026-10-23 (f-dsv41-rel): quality against the original model (ppl +16% for 2.00, +7.7-8.3% for 2.25; code / agent +3.5% / +2.5%
-# on 2.25); speed on the owner PC (RTX 5070 12 GB, 64 GB RAM, 3.6 GB/s NVMe): answers ~4.7 tokens/s, prompts 121 tokens/s at 4K and
-# 231 tokens/s at 8K; RTX 3060 12 GB with 46 GB of RAM (the engine held to 36 GB): answers ~7.2 tokens/s on 2.00; 4 x Radeon AI PRO
-# R9700: answers ~31 tokens/s, prompts 330-373 tokens/s at 8K.
-ISTA_ENGRAM_BYTES = 110_595_290_720
-ISTA_DSPARK_BYTES = 7_976_914_240
-ISTA_META_BYTES = 5_780_589          # the first shard of Unsloth's UD-Q8_K_XL: only the metadata --engram-meta reads
-ISTA_SETS = {
-    "IST-DAS-2.00bpw": {"title": "IST-DAS 2.00 bpw", "set_bytes": 138_238_892_160, "experts_gb": 132.07, "profile": "profile-2.00.bin",
-                        "ram_ok_gb": 40.0, "disk_total": 257.0,
-                        "quality": "about 16% above the original model's perplexity (the 2-bit price)"},
-    "IST-DAS-2.25bpw": {"title": "IST-DAS 2.25 bpw", "set_bytes": 155_225_823_328, "experts_gb": 149.06, "profile": "profile-2.25.bin",
-                        "ram_ok_gb": 44.0, "disk_total": 274.0,
-                        "quality": "about 8% above the original model's perplexity (code and agent work about 2.5-3.5% above), "
-                                   "the better of the two, 17 GB more disk"},
-}
-ISTA_DENSE_GB = 6.16                  # the dense weights in the shards (attention, router, shared experts, the head; the embedding stays on the CPU)
-ISTA_DENSE_ON_GPU_GB = 4.5            # what a card holds of them with a 12 GB card (the engine places the rest itself)
-ISTA_MEASURED = ("an RTX 5070 (12 GB) with 64 GB of RAM and a 3.6 GB/s NVMe drive: answers about 4.7 tokens/s, a 4,000-token prompt "
-                 "read at 121 tokens/s; an RTX 3060 (12 GB) with 46 GB of RAM: about 7.2 tokens/s; four Radeon AI PRO R9700 cards: "
-                 "about 31 tokens/s")
-
-
-def variant(model: str | None) -> dict | None:
-    """The official-set entry for a model name (case-insensitive), None for UD-Q8_K_XL and anything else."""
-    return ISTA_SETS.get(variant_key(model)) if variant_key(model) else None
 
 
 def ista_download_bytes(model: str, have_engram: bool = False) -> int:
@@ -167,7 +132,7 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
                vendor: str | None) -> dict[str, Any]:
     """plan() for an official IST-DAS set (ISTA_SETS): the same keys, the measured speeds in plain words.  RAM classes: with RAM for every
     expert the CPU lane keeps ("fits"), with 40 GB or more the engine's RAM store keeps the hot experts and reads the rest from the SSD
-    ("tight": measured 4.7 tokens/s on 64 GB, 7.2 on 46 GB), under 40 GB it is untested and slower ("spills").  Never a refusal."""
+    ("tight": measured 4.7 tokens a second on 64 GB, 7.2 on 46 GB), under 40 GB it is untested and slower ("spills").  Never a refusal."""
     v = variant(model)
     keep, ignored = gpu_fit.usable_cards(gpu_fit.for_vendor(list(cards or []), vendor)[0]) if vendor else gpu_fit.usable_cards(list(cards or []))
     keep = [c for c in keep if float(c.get("vram_gb") or 0) >= SMALLEST_CARD_GB]
