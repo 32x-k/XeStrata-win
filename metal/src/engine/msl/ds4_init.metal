@@ -41,3 +41,75 @@ kernel void ds4_sgemm_tn(device const float* A [[buffer(0)]], device const float
     for (uint i = 0; i < k; ++i) acc += a[i] * b[i];
     C[(size_t) t * ldc + mm] = acc;
 }
+
+// ds4_kernels.cu:1894  finish_kernel<false> - RMS norm (f.w), mrope (f.rd), rounding (f.quant), then store to x or dst.
+// The mrope and rounding branches are not written yet; the host wrapper will decline until they are.
+struct Ds4Finish {
+    device float* w;
+    float eps;
+    int rd, pos, inverse, vpp, pos_step;
+    device float* freqs;
+    int quant;
+    device ushort* dst;
+    long dst_stride;
+    device uchar* pdst;
+    long pdst_stride;
+};
+
+static inline float ds4_warp_sum(float v) {
+    v += simd_shuffle_xor(v, 16);
+    v += simd_shuffle_xor(v, 8);
+    v += simd_shuffle_xor(v, 4);
+    v += simd_shuffle_xor(v, 2);
+    v += simd_shuffle_xor(v, 1);
+    return v;
+}
+static inline float ds4_block_sum(float v, threadgroup float* red, ushort lane, ushort w) {
+    v = ds4_warp_sum(v);
+    if (lane == 0) red[w] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (w == 0) {
+        float t = lane < 8 ? red[lane] : 0.0f;
+        t = ds4_warp_sum(t);
+        if (lane == 0) red[0] = t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return red[0];
+}
+
+kernel void ds4_finish(device float* x [[buffer(0)]], constant long& stride [[buffer(1)]],
+                       constant uint& len [[buffer(2)]], constant Ds4Finish& f [[buffer(3)]],
+                       uint tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]],
+                       ushort w [[simdgroup_index_in_threadgroup]], uint b [[threadgroup_position_in_grid]]) {
+    threadgroup float red[8];
+    device float* v = x + (long) b * stride;
+    const uint nj = (len + 255u) / 256u;
+    float r[32];
+    float ss = 0.0f;
+    for (uint j = 0; j < 32u; ++j) {
+        if (j >= nj) break;
+        const uint e = tid + j * 256u;
+        r[j] = e < len ? v[e] : 0.0f;
+        ss += r[j] * r[j];
+    }
+    if (f.w != nullptr) {
+        const float tot = ds4_block_sum(ss, red, lane, w);
+        const float inv = rsqrt(tot / float(len) + f.eps);
+        for (uint j = 0; j < 32u; ++j) {
+            if (j >= nj) break;
+            const uint e = tid + j * 256u;
+            if (e < len) r[j] = r[j] * inv * f.w[e];
+        }
+    }
+    for (uint j = 0; j < 32u; ++j) {
+        if (j >= nj) break;
+        const uint e = tid + j * 256u;
+        if (e >= len) continue;
+        if (f.dst != nullptr) {
+            const uint bits = as_type<uint>(r[j]);
+            f.dst[e] = ushort((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);   // BF16 round to nearest even
+        } else {
+            v[e] = r[j];
+        }
+    }
+}
