@@ -761,8 +761,8 @@ class FolderScreen(Base):
             out.append("The free space of that folder could not be read.", style=MUTE)
         moving = self.models_that_would_move(value)
         if moving:
-            out.append(f"\nModel files Strata already keeps in {moving} are moved into this folder when you start "
-                       "(quick on the same drive; on another drive they stay where they are and are used from there).", style=WARN)
+            out.append(f"\nModel files Strata already keeps in {moving} stay there and keep working. This folder is used for new downloads. "
+                       "To move them here, use: strata models move.", style=MUTE)
         self.query_one("#folderinfo", Static).update(out)
 
     def models_that_would_move(self, value: str) -> str | None:

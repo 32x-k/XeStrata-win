@@ -98,5 +98,46 @@ class FailedStart(unittest.TestCase):
         self.assertEqual(calls, ["stop", "cleanup"])
 
 
+class FolderChangeMovesNothing(unittest.TestCase):
+    """The Folder step text: changing the folder never moves the models Strata already keeps (only --move-data / strata models move do)."""
+
+    def setUp(self):
+        self.home = Home().__enter__()
+        self.addCleanup(self.home.__exit__, None, None, None)
+        p = mock.patch.object(Catalog, "hardware", lambda self, fresh=False: dict(HW_12, disk_free_gb=500.0))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_start_passes_no_move_flag_unless_asked(self):
+        s = S.LaunchSettings(family="qwen", model="IQ3_XXS", context=32768, data_dir=str(self.home.base / "new"))
+        self.assertNotIn("--move-data", Runner(s, catalog=catalog()).setup_args())
+        self.assertIn("--move-data", Runner(s, catalog=catalog(), move_data=True).setup_args())
+
+    def test_setup_keeps_the_existing_models_where_they_are(self):
+        import contextlib
+        import io
+        import setup
+        base = self.home.base
+        old, new, root = base / "old-data", base / "new-data", base / "Strata"
+        root.mkdir()
+        weights = old / "models" / "Q2_0" / "w.gguf"
+        weights.parent.mkdir(parents=True)
+        weights.write_bytes(b"x" * 100)
+        env = {"APPDATA": str(base / "appdata"), "XDG_CONFIG_HOME": str(base / "appdata")}
+        with mock.patch.dict(os.environ, env), mock.patch.object(setup, "ROOT", root), mock.patch.object(setup, "_CONTROL_HOME", None):
+            os.environ.pop("STRATA_SETTINGS_FILE", None)
+            setup.settings_path().parent.mkdir(parents=True, exist_ok=True)
+            setup.settings_path().write_text(json.dumps({"data_dir": str(old), "installs": []}), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                setup.data_folder(str(new), move=False, yes=True, set_default=True)
+        self.assertTrue(weights.is_file())
+        self.assertFalse((new / "models").exists())
+
+    def test_the_screen_text_says_they_stay(self):
+        src = open(os.path.join(os.path.dirname(R.__file__), "screens.py"), encoding="utf-8").read()
+        self.assertIn("stay there and keep working", src)
+        self.assertNotIn("are moved into this folder when you start", src)
+
+
 if __name__ == "__main__":
     unittest.main()
