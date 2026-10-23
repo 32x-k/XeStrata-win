@@ -99,7 +99,7 @@ HF_REVISIONS = {
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",                  # 2026-10-12
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": "1ada08422e404aca51ab9df665f089f34c419c6b",           # 2026-10-13
     "unsloth/DeepSeek-V4.1-Flash-1017-GGUF": "f924b94f19c1fea02c06a65c8475b0a45e2b88b1",             # 2026-10-20 (the port's reference)
-    "helcig/tmp-oct26-2": "851709dcf0d97f091a4bdce758b2e4b0b468dd26",                                # 2026-10-23 (the official IST-DAS DeepSeek sets)
+    "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF": "0d8f49fb15df73789a9c237a1b8b7b088423dbc0",    # 2026-10-24 (ISTA-DASLab's final 2.00 / 2.25 bpw sets and Engram)
 }
 
 
@@ -678,15 +678,31 @@ DSV41_FILES = {
     "dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf": (7976914240, "6ba6ac1b331c540691a209e7fc97dec2a24e295acb1e755c84c7d24a4373927a"),
     "mmproj-BF16.gguf": (972208288, "9a1ef7c40d0d702c7ed8c5f863f60abae64091387ba3fce0ad19ce9beeda3bf9"),
 }
-# The two OFFICIAL IST-DAS sets (helcig/tmp-oct26-2 at the revision above; Hub LFS sha256 = what the files hash to): 4 shards each, plus ONE
-# Engram table (110.6 GB, the same file for both sets: downloaded once into the shared folder) and the DSpark drafter and the 5.8 MB
-# metadata shard of Unsloth's set that pack_gguf --engram-meta reads (both pinned in DSV41_FILES above).  This is the set a normal PC runs
-# (64 GB RAM + a 12 GB card; docs/DEEPSEEK41.md); the UD-Q8_K_XL entry stays for the big machines.
-DSV41_ISTA_REPO = "helcig/tmp-oct26-2"
-DSV41_ISTA_ENGRAM = "engram-IQ4_NL.gguf"
-DSV41_ISTA_SHARD = "model-{bpw}-{i:05d}-of-00004.gguf"
+# The two OFFICIAL IST-DAS sets (ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF at the revision above, a flat repository; Hub LFS sha256 = what the
+# files hash to): IQ2_XXS is the 2.00 bpw set and IQ2_XS the 2.25 bpw set, 4 shards each, plus ONE Engram table (110.6 GB, the same file for both sets:
+# downloaded once into the shared folder) and the DSpark drafter and the 5.8 MB metadata shard of Unsloth's set that pack_gguf --engram-meta reads
+# (both pinned in DSV41_FILES above).  This is the set a normal PC runs (64 GB RAM + a 12 GB card; docs/DEEPSEEK41.md); the UD-Q8_K_XL entry stays
+# for the big machines.
+DSV41_ISTA_REPO = "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF"
+DSV41_ISTA_ENGRAM = "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"
+DSV41_ISTA_SHARD = "DeepSeek-V4.1-Flash-1017-GSQ-RCO-{quant}-{i:05d}-of-00004.gguf"
 DSV41_DSPARK = "dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"
 DSV41_ISTA_FILES = {
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf": (39535776992, "4c65307992ab586c527ca1f6f64062aa96a33b23c02b7fed103f45f75e854798"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00002-of-00004.gguf": (39494617536, "933461a974fcccee741bf2f9798201e72ab4aa3f8a952be56f849896ca6ea30e"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00003-of-00004.gguf": (39423838496, "bbf91fa346a85ebaf32dd4fd5c456b534d780d381e54f46ac90783a481373240"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00004-of-00004.gguf": (36771591232, "e5b2f8781fab688cd4bc3bc7a69651b5dbb90ed94965657c6bead8bb4774f3cf"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf": (39075714624, "d46efb67ccffd8fb5d7f18b423896381b9e06d8491e161c370ddf3b05b07e050"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00002-of-00004.gguf": (39388449504, "cec1b2c3da429dc768b8bb9bc4dc4403d81f74d34db660a6a34ee3e555bf2c70"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00003-of-00004.gguf": (39246891616, "9d9c2140fcb134a0b9a74dedd0e5167e68077af6d08ce7f856bce112f0a35dd3"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00004.gguf": (20527837312, "9b790a2297ed3cdede379fc984f4a52bb95f3b23724c797af11d1fa6a69db059"),
+    "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf": (110595290816, "eb19f30d368d393784e1fc54fdfaffc427ebb2110bf3762fdf5a8fbb9a2d740a"),
+}
+# The files the first release of these sets was downloaded as (helcig/tmp-oct26-2, 2026-10-23: model-2.00bpw-0000N-of-00004.gguf, model-2.25bpw-...,
+# engram-IQ4_NL.gguf, usually in a 2.00bpw/ or 2.25bpw/ folder): testers and our boxes have them.  They are the same weights: shards 2-4 are the
+# same bytes as today's, and shard 1 and the Engram differ only in their GGUF header (metadata).  setup accepts them from "files already here"
+# (size and SHA-256 checked against these pins) and never downloads them.  Not in REPO_PINS: nothing is fetched under these names.
+DSV41_LEGACY_FILES = {
     "model-2.00bpw-00001-of-00004.gguf": (39075713728, "78ab9efc46a26647c3e94b322c99cd7e2af261dd28b38f2712e128562db1ef47"),
     "model-2.00bpw-00002-of-00004.gguf": (39388449504, "cec1b2c3da429dc768b8bb9bc4dc4403d81f74d34db660a6a34ee3e555bf2c70"),
     "model-2.00bpw-00003-of-00004.gguf": (39246891616, "9d9c2140fcb134a0b9a74dedd0e5167e68077af6d08ce7f856bce112f0a35dd3"),
@@ -697,13 +713,19 @@ DSV41_ISTA_FILES = {
     "model-2.25bpw-00004-of-00004.gguf": (36771591232, "e5b2f8781fab688cd4bc3bc7a69651b5dbb90ed94965657c6bead8bb4774f3cf"),
     "engram-IQ4_NL.gguf": (110595290720, "1f17d8ae37e9df3bb45f7ef1b4fcd1706d7b759af0413c117bf8e92aed459281"),
 }
+# today's name -> the name it had in the first release
+DSV41_LEGACY_NAMES = {
+    **{DSV41_ISTA_SHARD.format(quant="IQ2_XXS", i=i): "model-2.00bpw-%05d-of-00004.gguf" % i for i in range(1, 5)},
+    **{DSV41_ISTA_SHARD.format(quant="IQ2_XS", i=i): "model-2.25bpw-%05d-of-00004.gguf" % i for i in range(1, 5)},
+    DSV41_ISTA_ENGRAM: "engram-IQ4_NL.gguf",
+}
 # the files every official set shares (name -> where it comes from); they live in models/deepseek-v4.1-flash-shared, once
 DSV41_SHARED = {
-    DSV41_ISTA_ENGRAM: hf(DSV41_ISTA_REPO) + "2.00bpw/",
+    DSV41_ISTA_ENGRAM: hf(DSV41_ISTA_REPO),
     DSV41_SHARD.format(i=1): hf(DSV41_REPO) + "UD-Q8_K_XL/",      # only its metadata is read (pack_gguf --engram-meta)
     DSV41_DSPARK: hf(DSV41_REPO),
 }
-DSV41_ALL_FILES = {**DSV41_FILES, **DSV41_ISTA_FILES}
+DSV41_ALL_FILES = {**DSV41_FILES, **DSV41_ISTA_FILES, **DSV41_LEGACY_FILES}
 DSV41_PROFILES = ROOT / "data" / "dsv41"           # the shipped hot-expert profiles (profile-2.00.bin, profile-2.25.bin, + .sha256)
 DSV41_CONTEXT = 8192          # the context the engine was checked at (4096 and 8192; 64K is not tried yet)
 MULTI_FILE_FAMILIES = {
@@ -725,15 +747,15 @@ MULTI_FILE_FAMILIES["deepseek41"]["models"] = {
         "about": "the smaller official version: 138 GB of model + 111 GB n-gram table + 8 GB drafter (257 GB of disk). Runs on a PC with "
                  "a 12 GB card and 40-64 GB of RAM at about 5-7 tokens a second; quality about 16% above the original model's "
                  "perplexity",
-        "ram_gb": 40, "recipe": "ista", "subdir": "2.00bpw", "profile": "profile-2.00.bin", "hf": hf(DSV41_ISTA_REPO) + "2.00bpw/",
-        "shards": [DSV41_ISTA_SHARD.format(bpw="2.00bpw", i=i) for i in range(1, 5)],
+        "ram_gb": 40, "recipe": "ista", "subdir": None, "legacy_subdir": "2.00bpw", "profile": "profile-2.00.bin", "hf": hf(DSV41_ISTA_REPO),
+        "shards": [DSV41_ISTA_SHARD.format(quant="IQ2_XXS", i=i) for i in range(1, 5)],
         "shared": [DSV41_ISTA_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK]},
     "IST-DAS-2.25bpw": {
         "label": "IST-DAS 2.25 bpw",
         "about": "the better official version: 155 GB of model + 111 GB n-gram table + 8 GB drafter (274 GB of disk, 17 GB more than "
                  "2.00). About the same speed; quality about 8% above the original model's perplexity (code and agent work 2.5-3.5%)",
-        "ram_gb": 44, "recipe": "ista", "subdir": "2.25bpw", "profile": "profile-2.25.bin", "hf": hf(DSV41_ISTA_REPO) + "2.25bpw/",
-        "shards": [DSV41_ISTA_SHARD.format(bpw="2.25bpw", i=i) for i in range(1, 5)],
+        "ram_gb": 44, "recipe": "ista", "subdir": None, "legacy_subdir": "2.25bpw", "profile": "profile-2.25.bin", "hf": hf(DSV41_ISTA_REPO),
+        "shards": [DSV41_ISTA_SHARD.format(quant="IQ2_XS", i=i) for i in range(1, 5)],
         "shared": [DSV41_ISTA_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK]},
     "UD-Q8_K_XL": {
         "label": "Unsloth UD-Q8_K_XL",
@@ -754,7 +776,7 @@ REPO_PINS = {
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": QWEN36_FILES,
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": GYRO_FILES,
     "unsloth/DeepSeek-V4.1-Flash-1017-GGUF": DSV41_FILES,
-    "helcig/tmp-oct26-2": DSV41_ISTA_FILES,
+    "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF": DSV41_ISTA_FILES,
 }
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
 ESP_VECTOR = ROOT / "data" / "experimental-speed-projection" / "Qwen3.8-Flash-Next-experimental-speed-projection.gguf"
@@ -7768,9 +7790,25 @@ def dsv41_folder(a, fam: dict, tag: str, model: str = "UD-Q8_K_XL") -> Path:
     if a.gguf_dir:
         folder = Path(a.gguf_dir)
         d = fam["models"][model]
-        sub = d.get("subdir") or model
-        return folder / sub if (folder / sub).is_dir() and not (folder / d["shards"][0]).exists() else folder
+        names = [n for s in d["shards"] for n in (s, DSV41_LEGACY_NAMES.get(s)) if n]
+        if any((folder / n).exists() for n in names):
+            return folder
+        for sub in (d.get("subdir"), d.get("legacy_subdir"), model):          # the set's own folder inside (the first release used 2.00bpw/, 2.25bpw/)
+            if sub and (folder / sub).is_dir():
+                return folder / sub
+        return folder
     return Path(a.models_dir) / tag
+
+
+def dsv41_pick(folder: Path, name: str) -> Path:
+    """`name` in `folder`, or the file it was called in the first release (DSV41_LEGACY_NAMES; the same weights) when only that one is there;
+    else `name` (where it will be downloaded to)."""
+    if (folder / name).exists():
+        return folder / name
+    old = DSV41_LEGACY_NAMES.get(name)
+    if old and (folder / old).exists():
+        return folder / old
+    return folder / name
 
 
 def dsv41_shared_dir(a, fam: dict) -> Path:
@@ -7783,7 +7821,7 @@ def dsv41_find_shared(a, name: str, folder: Path, shared: Path) -> Path:
     """The file `name` (an Engram, the drafter, ...) the person already has: in the shared folder, beside the shards, or (--gguf-dir) in the
     folder above them or one folder level down from either; else where it will be downloaded to (the shared folder).  The size must be the
     pinned one, so a half-copied file is not taken for the file."""
-    size = DSV41_ALL_FILES[name][0]
+    names = [n for n in (name, DSV41_LEGACY_NAMES.get(name)) if n]            # today's name, and the first release's (the same weights)
     roots = [shared, folder]
     if a.gguf_dir:
         base = Path(a.gguf_dir)
@@ -7798,12 +7836,13 @@ def dsv41_find_shared(a, name: str, folder: Path, shared: Path) -> Path:
         except OSError:
             continue
         for k in kids:
-            f = k / name
-            try:
-                if f.is_file() and f.stat().st_size == size:
-                    return f
-            except OSError:
-                pass
+            for n in names:
+                f = k / n
+                try:
+                    if f.is_file() and f.stat().st_size == DSV41_ALL_FILES[n][0]:
+                        return f
+                except OSError:
+                    pass
     return shared / name
 
 
@@ -7883,14 +7922,14 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
         model = names[int(ask("Which version?", [str(i) for i in range(1, len(names) + 1)], "1", a.yes)) - 1]
     ok(f"size: {model}")
     md = fam["models"][model]
-    say("  Its GGUF files: " + ("IST-DAS (huggingface.co/helcig/tmp-oct26-2), with the DSpark drafter and a small metadata file from Unsloth"
+    say("  Its GGUF files: " + ("IST-DAS / ISTA-DASLab (huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF), with the DSpark drafter and a small metadata file from Unsloth"
                               if md.get("recipe") == "ista" else "Unsloth (huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)"))
     ista = md.get("recipe") == "ista"
     tag = fam["tag"] + model
     cards = dsv41_cards(gpu, all_cards, bool(a.gpu is not None or a.gpus))
     ctx = a.context or DSV41_CONTEXT
     folder = dsv41_folder(a, fam, tag, model)
-    shards = [folder / n for n in md["shards"]]
+    shards = [dsv41_pick(folder, n) for n in md["shards"]]
     shared_dir = dsv41_shared_dir(a, fam)
     shared = [dsv41_find_shared(a, n, folder, shared_dir) for n in md.get("shared", [])]
     own_files = {f: bool(a.gguf_dir) or f.parent != shared_dir for f in shared}         # a file found outside setup's own folder is the person's
@@ -7899,7 +7938,7 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
         p = f.with_name(f.name + ".part")
         return p.stat().st_size if p.is_file() else 0
 
-    left = sum(0 if f.exists() and (done(f) or a.gguf_dir or own_files.get(f)) else fam["sha256"][f.name][0] - partial(f)
+    left = sum(0 if f.exists() and (done(f) or a.gguf_dir or own_files.get(f) or f.name in DSV41_LEGACY_FILES) else fam["sha256"][f.name][0] - partial(f)
                for f in [*shards, *shared]) / 1e9
     probe = folder if folder.exists() else (folder.parent if folder.parent.exists() else Path(a.models_dir))
     free = free_gb(probe)
@@ -7968,9 +8007,11 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
         else:
             if a.gguf_dir and not f.exists():
                 fail(f"{f} is missing", f"put {f.name} in {folder}, or drop --gguf-dir to download it")
-            if not a.gguf_dir:
+            if not a.gguf_dir and f.name not in DSV41_LEGACY_FILES:      # (a first-release file is checked, never fetched under its old name)
                 download((md.get("hf") or fam["hf"]) + f.name, f)
-        verify_sha256(f, *fam["sha256"][f.name], own=bool(a.gguf_dir))
+        if f.name in DSV41_LEGACY_FILES:
+            ok(f"{f.name}: a file of the first release of this set (the same weights); it is used as it is")
+        verify_sha256(f, *fam["sha256"][f.name], own=bool(a.gguf_dir) or f.name in DSV41_LEGACY_FILES)
     for f in shared:                                  # the Engram, the drafter, the metadata shard: once for every official set
         if f.exists() and (done(f) or own_files[f]):
             ok(f"{f.name} already here ({f.parent})")
@@ -7991,7 +8032,7 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
             have_pack = False
     if not have_pack:
         if ista:
-            run(dsv41_pack_cmd(folder, md["shards"], shared[0], shared[1], shared[2], pack))
+            run(dsv41_pack_cmd(folder, [f.name for f in shards], shared[0], shared[1], shared[2], pack))
         else:
             run([sys.executable, str(ROOT / "tools" / "dsv41" / "pack_gguf.py"), "--model", str(folder), "--out", str(pack)])
     if ista:

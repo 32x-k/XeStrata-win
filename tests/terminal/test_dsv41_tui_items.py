@@ -101,3 +101,19 @@ class Disk(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FinalHint(unittest.TestCase):
+    def test_no_preset_means_the_plain_stop_command_and_a_way_to_keep_the_settings(self):
+        from strata_cli.launch import settings as S
+        s = S.LaunchSettings(name="IST-DAS-2.00bpw 8K")
+        lines = cmd.final_hint_lines(s, False)
+        text = "\n".join(lines)
+        self.assertIn("strata launch --stop", text)
+        self.assertNotIn("--preset", text.replace("--save-preset", ""))
+        self.assertIn("--save-preset NAME", text)
+
+    def test_a_saved_preset_keeps_its_name_in_the_hint(self):
+        from strata_cli.launch import settings as S
+        s = S.LaunchSettings(name="Office")
+        self.assertIn('--stop --preset "Office"', "\n".join(cmd.final_hint_lines(s, True)))
