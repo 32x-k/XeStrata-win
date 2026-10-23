@@ -513,6 +513,11 @@ template <int T> struct Fast { static constexpr int WORDS = 0; };
 // larger codebook's shared memory costs them occupancy: they keep decode<T>)
 template <int T, bool F = true> constexpr int kTabWords = F && Fast<T>::WORDS > 0 ? Fast<T>::WORDS : (Ty<T>::TAB > 0 ? Ty<T>::TAB : 1);
 
+// Persistent grids (blocks looping over work items) only for the types with a codebook worth keeping in the block (8 KiB and
+// more); the others run a block (tile, group) as before - their blocks leave at once when the group is empty.
+template <int T>
+constexpr bool kPersist = kTabWords<T> * 4 >= 8192;
+
 template <int T, bool F = true>
 __device__ __forceinline__ void load_tab_fast(uint32_t* tab) {
     if constexpr (!F || Fast<T>::WORDS == 0) {
@@ -595,16 +600,17 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int gro
     static_assert(LPR % kBPS == 0, "a lane keeps one sub-block position");
     __shared__ __align__(16) uint32_t tab[kTabWords<T>];
     __shared__ int es[NE], xr[NE];
-    load_tab_fast<T>(tab);   // (once a block: it then takes work items (group, row tile) round the grid)
+    bool loaded = false;   // (the codebook once a block, when its first live item comes: a block of empty groups leaves at once)
     const int lane32 = threadIdx.x & 31;
     const size_t rb = row_bytes_t<T>(a.n_embd);
     const int nsb = a.n_embd / 32, nblk = nsb / kBPS;
     const int ntile = a.n_ff / (kWarps * RW);
-    for (int item = blockIdx.x; item < groups * ntile; item += gridDim.x) {
-    const int grp = item / ntile, tile = item % ntile;
+    for (int item = kPersist<T> ? blockIdx.x : 0; item < (kPersist<T> ? groups * ntile : 1); item += kPersist<T> ? gridDim.x : 1) {
+    const int grp = kPersist<T> ? item / ntile : blockIdx.y, tile = kPersist<T> ? item % ntile : blockIdx.x;
     const uint8_t* blob;
     int m0, m1;
     if (!group(a, grp, blob, m0, m1)) continue;   // (uniform)
+    if (!loaded) { load_tab_fast<T>(tab); loaded = true; }
     for (int mm = m0; mm < m1; mm += NE) {
         const int ne = min(NE, m1 - mm);
         __syncthreads();
@@ -657,15 +663,16 @@ __global__ void __launch_bounds__(kThreads) down_kernel(const Args a, int groups
     static_assert(LPR % kBPS == 0, "a lane keeps one sub-block position");
     __shared__ __align__(16) uint32_t tab[kTabWords<T>];
     __shared__ int es[NE];
-    load_tab_fast<T>(tab);
+    bool loaded = false;
     const int lane32 = threadIdx.x & 31;
     const int nsb = a.n_ff / 32, nblk = nsb / kBPS;
     const int ntile = a.n_embd / (kWarps * RW);
-    for (int item = blockIdx.x; item < groups * ntile; item += gridDim.x) {
-    const int grp = item / ntile, tile = item % ntile;
+    for (int item = kPersist<T> ? blockIdx.x : 0; item < (kPersist<T> ? groups * ntile : 1); item += kPersist<T> ? gridDim.x : 1) {
+    const int grp = kPersist<T> ? item / ntile : blockIdx.y, tile = kPersist<T> ? item % ntile : blockIdx.x;
     const uint8_t* blob;
     int m0, m1;
     if (!group(a, grp, blob, m0, m1)) continue;
+    if (!loaded) { load_tab_fast<T>(tab); loaded = true; }
     for (int mm = m0; mm < m1; mm += NE) {
         const int ne = min(NE, m1 - mm);
         __syncthreads();
@@ -1000,13 +1007,13 @@ __global__ void __launch_bounds__(kThreads) light_kernel(const SetArgs a, const 
                                                                           const float* __restrict__ xd) {
     constexpr bool kF = NE <= 4;   // (the fast codebook only for the few-row kernels, which loop over work items round the grid)
     __shared__ __align__(16) uint32_t tab[kTabWords<T, kF>];
-    load_tab_fast<T, kF>(tab);
-    __syncthreads();
     const int N = GATE_UP ? a.n_ff : a.n_embd, ntile = (N + kWarps - 1) / kWarps;
-    if constexpr (kF) {
-        for (int item = blockIdx.x; item < a.n_exp * ntile; item += gridDim.x) light_item<T, NE, GATE_UP, kF>(a, xq, xd, tab, item, ntile);
-    } else {
-        light_item<T, NE, GATE_UP, kF>(a, xq, xd, tab, blockIdx.x, ntile);   // (one item a block: items blocks)
+    bool loaded = false;   // (the codebook when the first live item comes)
+    for (int item = kPersist<T> ? blockIdx.x : 0; item < (kPersist<T> ? a.n_exp * ntile : 1); item += kPersist<T> ? gridDim.x : 1) {
+        const int e = kPersist<T> ? item / ntile : blockIdx.y, ne = a.bounds[e + 1] - a.bounds[e];
+        if (ne <= 0 || ne > NE) continue;   // (uniform)
+        if (!loaded) { load_tab_fast<T, kF>(tab); __syncthreads(); loaded = true; }
+        light_item<T, NE, GATE_UP, kF>(a, xq, xd, tab, kPersist<T> ? item : (int) (blockIdx.y * ntile + blockIdx.x), ntile);
     }
 }
 
@@ -1126,20 +1133,23 @@ int resident_ctas() {   // (a static a kernel: the occupancy differs by the code
 // The grid: CUDA takes the device's resident blocks (at most one a work item) and every block loops over the items (group, row
 // tile) round the grid (group by group, so that the blocks work on one expert's rows together): whichever groups are active,
 // they share all the blocks, and a block loads its codebook once.  HIP: a block an item (the full grid).
-// (only for the types with a codebook worth keeping in the block: 8 KiB and more; the others take a block an item as before)
 template <int T>
-constexpr bool kPersist = kTabWords<T> * 4 >= 8192;
-template <int T>
-inline int items_grid(int items, int resident) { return kPersist<T> ? std::max(1, std::min(items, resident)) : items; }
+inline int items_grid(int items, int resident) { return std::max(1, std::min(items, resident)); }
 template <int T, int NE>
 void launch_gu(const Args& a, int groups, cudaStream_t s) {
-    const int items = groups * (a.n_ff / (kWarps * kGuRW));
-    gate_up_kernel<T, NE><<<items_grid<T>(items, resident_ctas<gate_up_kernel<T, NE, kGuRW>>()), kThreads, 0, s>>>(a, groups);
+    const int tiles = a.n_ff / (kWarps * kGuRW);
+    if constexpr (kPersist<T>)
+        gate_up_kernel<T, NE><<<items_grid<T>(groups * tiles, resident_ctas<gate_up_kernel<T, NE, kGuRW>>()), kThreads, 0, s>>>(a, groups);
+    else
+        gate_up_kernel<T, NE><<<dim3((unsigned) tiles, (unsigned) groups), kThreads, 0, s>>>(a, groups);
 }
 template <int T, int NE>
 void launch_dn(const Args& a, int groups, cudaStream_t s) {
-    const int items = groups * (a.n_embd / (kWarps * kDnRW));
-    down_kernel<T, NE><<<items_grid<T>(items, resident_ctas<down_kernel<T, NE, kDnRW>>()), kThreads, 0, s>>>(a, groups);
+    const int tiles = a.n_embd / (kWarps * kDnRW);
+    if constexpr (kPersist<T>)
+        down_kernel<T, NE><<<items_grid<T>(groups * tiles, resident_ctas<down_kernel<T, NE, kDnRW>>()), kThreads, 0, s>>>(a, groups);
+    else
+        down_kernel<T, NE><<<dim3((unsigned) tiles, (unsigned) groups), kThreads, 0, s>>>(a, groups);
 }
 template <int T>
 void gu_ne(const Args& a, int groups, int ne, cudaStream_t s) {
@@ -1207,8 +1217,10 @@ template <int T, bool GU>
 void launch_light(const SetArgs& a, const LightBuf& b, cudaStream_t s) {
     const int tiles = ((GU ? a.n_ff : a.n_embd) + kWarps - 1) / kWarps;
     if (a.max_rows <= 4) {   // few rows: work items round a persistent grid (the codebook per block is then the cost)
-        const int items = a.n_exp * tiles;
-        light_kernel<T, 4, GU><<<items_grid<T>(items, resident_ctas<light_kernel<T, 4, GU>>()), kThreads, 0, s>>>(a, b.q, b.d);
+        if constexpr (kPersist<T>)
+            light_kernel<T, 4, GU><<<items_grid<T>(a.n_exp * tiles, resident_ctas<light_kernel<T, 4, GU>>()), kThreads, 0, s>>>(a, b.q, b.d);
+        else   // (a small codebook: the release's kernel, which is the faster there)
+            light_kernel_rows<T, 4, GU><<<dim3((unsigned) tiles, (unsigned) a.n_exp), kThreads, 0, s>>>(a, b.q, b.d);
     } else {   // more rows: compute bound, the release's kernel and grid
         const dim3 grid((unsigned) tiles, (unsigned) a.n_exp);
         if (a.max_rows <= 8) light_kernel_rows<T, 8, GU><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
