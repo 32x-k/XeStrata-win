@@ -186,13 +186,14 @@ static bool want_512(int type, int nt) {
     // by CPU (measured, ds4_gg_bench --expert; the rows are bit-identical to ggml's dot everywhere):
     //  Zen 5 (AMD family 0x1A, Strix Halo, 16 threads, GB/s of weights ggml -> AVX-512 rows): one token IQ2_XXS 35 -> 44, IQ2_XS 37 -> 48,
     //  IQ1_M 32 -> 36 (the sign masks by popcount, IQ1_M's indices by pdep: no table loads), IQ3_XXS 43 -> 45; 4 tokens x2.5-3.5; 16 tokens x4.4-4.8;
-    //  Zen 4 (family 0x19): see the Zen 4 table; anything else with AVX-512 (Intel): not measured, so the AVX2 rows
+    //  Zen 4 (family 0x19, Ryzen 5 7600, 6 threads): one token IQ2_XXS 15.9 -> 19.7, IQ2_XS 20.6 -> 24.2, IQ1_M 16.7 -> 17.6-18.2, IQ3_XXS 22.4 -> 23.8
+    //  (noise-level); 2 tokens x1.5-2.2; 4 tokens x2.4-3.3; 16 tokens x2.8-4.6;
+    //  anything else with AVX-512 (Intel): not measured, so the AVX2 rows
     const int fam = amd_family();
-    if (fam >= 0x1A) {
-        if (type == 16 || type == 17 || type == 29) return true;
-        return type == 18 && nt >= 2;
-    }
-    if (fam == 0x19) return nt >= 7 && type == 16;
+    if (fam < 0x19) return false;
+    if (type == 16 || type == 17) return true;
+    if (type == 18) return nt >= 2;
+    if (type == 29) return nt >= 2 || fam >= 0x1A;
     return false;
 }
 // 0: ggml-cpu's dot, 1: the AVX2 rows, 2: the AVX-512 rows
