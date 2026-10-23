@@ -2681,7 +2681,11 @@ struct Model::Impl {
         }
         for (const Dev& d : devs)
             room += std::max(0.0, (double) d.free0 - (double) ((size_t) o.reserve_mib << 20) - 1.5 * (1 << 30)) * o.vram_experts;
-        return exp_b > 0 && exp_b - std::max(0.0, room - other_b) <= 0.1 * exp_b ? 64 : 400;
+        const bool fit = exp_b > 0 && exp_b - std::max(0.0, room - other_b) <= 0.1 * exp_b;
+        if (o.verbose)
+            std::fprintf(stderr, "ds4: staging ring: experts %.1f GB, VRAM room %.1f GB, dense %.1f GB -> %d MB\n", exp_b / 1e9,
+                         room / 1e9, other_b / 1e9, fit ? 64 : 400);
+        return fit ? 64 : 400;
     }
     bool alloc_chunks(std::string& err) {
         chunks.resize(devs.size());
