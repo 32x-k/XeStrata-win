@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 import strata_tokenizer as ST  # noqa: E402
-from serve import frontend  # noqa: E402
+from serve import frontend, server  # noqa: E402
 from serve.dsml import DsmlOutputParser, DsmlTranslator, to_dsml_force  # noqa: E402
 from serve.frontend import ChatTemplate, OutputParser, openai_to_messages  # noqa: E402
 from serve.server import (FAMILY_MODEL_NAMES, MockEngine, Service, default_model_name, model_card_sampling,  # noqa: E402
@@ -573,6 +573,36 @@ class Api(unittest.TestCase):
         req = {}
         svc.prepare([{"role": "system", "content": "s"}, {"role": "user", "content": "u"}], None, {}, 16, req=req)
         self.assertEqual(req, {})
+
+
+class SlotEnv(unittest.TestCase):
+    """The engine's kept conversations: the folder and the switch reach the DeepSeek engine only."""
+
+    KEYS = ("STRATA_DS4_SLOT_KEEP", "STRATA_DS4_SLOT_DIR")
+
+    def env(self, cfg):
+        saved = {k: os.environ.pop(k, None) for k in self.KEYS}
+        try:
+            return server.child_env(cfg)
+        finally:
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_deepseek_gets_a_folder_in_the_data_folder_and_the_default_switch(self):
+        env = self.env({"arch": "deepseek41", "log": str(Path("data") / "strata-deepseek.log"), "args": []})
+        self.assertEqual(Path(env["STRATA_DS4_SLOT_DIR"]), Path("data") / "ds4-slots")
+        self.assertEqual(env["STRATA_DS4_SLOT_KEEP"], server.DS41_SLOT_KEEP_DEFAULT)
+
+    def test_the_configs_own_settings_win(self):
+        env = self.env({"arch": "deepseek41", "log": "x/y.log",
+                        "env": {"STRATA_DS4_SLOT_KEEP": "1", "STRATA_DS4_SLOT_DIR": "elsewhere"}})
+        self.assertEqual((env["STRATA_DS4_SLOT_KEEP"], env["STRATA_DS4_SLOT_DIR"]), ("1", "elsewhere"))
+
+    def test_other_families_get_nothing(self):
+        for arch in ("qwen4exp", None, "gyro"):
+            env = self.env({"arch": arch, "log": "x/y.log"} if arch else {"log": "x/y.log"})
+            self.assertFalse([k for k in env if k.startswith("STRATA_DS4_")], arch)
 
 
 class PickTemplateTests(unittest.TestCase):
