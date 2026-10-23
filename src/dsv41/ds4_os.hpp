@@ -18,6 +18,9 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
+#if defined(__APPLE__)
+#include "ds4_os_apple.h"   // the Linux calls below, on macOS
+#endif
 #define NOMINMAX
 #endif
 #include <windows.h>
