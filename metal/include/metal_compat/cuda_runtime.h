@@ -36,6 +36,17 @@
 // uses another one fails to compile on Metal, which is the point.
 #pragma once
 
+// CUDA's alignment qualifier
+#ifndef __align__
+#define __align__(n) alignas(n)
+#endif
+
+#include "cuda_device_builtins.h"
+
+// CUDA's headers put min/max in scope for integers; the sources rely on it
+template <typename T> static inline T min(T a, T b) { return strata_min(a, b); }
+template <typename T> static inline T max(T a, T b) { return strata_max(a, b); }
+
 #include <cstddef>
 #include <cstdint>
 

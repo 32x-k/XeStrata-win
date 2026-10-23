@@ -5,6 +5,7 @@
 // truncation CUDA's __float2bfloat16_rn does; fp8 is E4M3 with the same rounding.
 #pragma once
 
+#include "cuda_fp16.h"   // __half_raw, which the fp8 conversions return
 #include <cstdint>
 #include <cstring>
 
@@ -52,3 +53,7 @@ static inline uint16_t __nv_cvt_fp8_to_halfraw(__nv_fp8_storage_t v, int) {
     else { he = e - 7 + 15; hm = m << 7; }
     return (uint16_t) (sign | (he << 10) | hm);
 }
+
+// the conversion modes __nv_cvt_float_to_fp8 / __nv_cvt_fp8_to_halfraw take (CUDA spells them as an enum)
+enum __nv_fp8_interpretation_t { __NV_E4M3 = 0, __NV_E5M2 = 1 };
+enum __nv_saturation_t { __NV_NOSAT = 0, __NV_SATFINITE = 1 };
