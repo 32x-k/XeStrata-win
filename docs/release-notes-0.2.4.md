@@ -53,13 +53,26 @@ These are the 2.00-bit set. The 2.25-bit set reads 13% more data per token, so e
 
 ## Updating
 
-- **From 0.2.3 or 0.2.3.1:** run `strata update` in the Terminal. It fetches Control 0.1.49 and, on Windows NVIDIA, Linux NVIDIA and Linux AMD (Radeon AI PRO R9700 and RX 9070) PCs, the engine package that carries DeepSeek. Other engine packages stay at 0.1.48. The app is not touched.
+- **From 0.2.3 or 0.2.3.1:** run `strata update` in the Terminal. It fetches Control 0.1.49. Your Qwen engine does not change: every engine package is still the 0.1.48 file, byte for byte.
 - **Mac:** the Mac Terminal and engine stay on 0.1.48. DeepSeek is not on the Mac yet.
 - **New installs:** the install command (`install.ps1` on Windows, `install.sh` on Linux) installs this version.
 
+## The DeepSeek engine is a separate download
+
+DeepSeek runs on its own engine package, `strata-dsv41`, which sits beside your Qwen engine and never replaces it. There are two ways to get it.
+
+- **Automatic:** choose DeepSeek in `strata launch` or `strata setup`. Strata downloads the package that fits your PC, checks its signature and installs it.
+- **By hand:** download the package for your system from this page, check it against `SHA256SUMS.txt`, and run `strata launch --model ist-das-2.00bpw --dsv41-package PATH-TO-FILE` (or `python setup.py --family deepseek41 --dsv41-package PATH-TO-FILE`). Strata checks that it is the DeepSeek engine, that it fits your system and that its signature and file hashes are good, and refuses anything else. You can also put the file in the `engine-dsv41` folder next to `engine`.
+
+| System | File |
+|---|---|
+| Windows, NVIDIA RTX 30 / 40 / 50 | `strata-dsv41-0.1.49-windows-x86_64-cuda-cuda13.tar.gz` |
+| Linux, NVIDIA RTX 30 / 40 / 50 | `strata-dsv41-0.1.49-linux-x86_64-cuda-cuda13.tar.gz` |
+| Linux, Radeon AI PRO R9700 / RX 9070 | `strata-dsv41-0.1.49-linux-x86_64-hip-rx9070.tar.gz` |
+
 ## Downloads
 
-Everything from 0.2.3 is attached again, so the release page still holds every file. New in this release: `strata-control-0.1.49-windows-x86_64.zip`, `strata-control-0.1.49-linux-x86_64.tar.gz` and the three engine packages `strata-engine-0.1.49-windows-x86_64-cuda-cuda13`, `strata-engine-0.1.49-linux-x86_64-cuda-cuda13` and `strata-engine-0.1.49-linux-x86_64-hip-rx9070`. The installers, AppImages, dmg and the other engine packages are the 0.2.3 files.
+Everything from 0.2.3 is attached again, so the release page still holds every file. New in this release: `strata-control-0.1.49-windows-x86_64.zip`, `strata-control-0.1.49-linux-x86_64.tar.gz` and the three DeepSeek packages above. The installers, AppImages, dmg and the Qwen engine packages are the 0.2.3 files.
 
 ## Thanks
 
