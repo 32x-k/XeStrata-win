@@ -5379,7 +5379,7 @@ struct Model::Impl {
             std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             std::vector<std::pair<int, int>> list;
             for (const auto& h : hot) {
-                if (list.size() >= store->slots_allocated()) break;
+                if (list.size() >= store->slots_max()) break;
                 list.push_back(h.second);
             }
             const double ts = now_ms();
