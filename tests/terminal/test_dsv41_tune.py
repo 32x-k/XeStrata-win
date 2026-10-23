@@ -48,7 +48,7 @@ class Tune(unittest.TestCase):
         args = json.loads(self.cfg.read_text())["args"]
         self.assertEqual(args[args.index("--dspark") + 1], "on")
         self.assertIn("faster", " ".join(res["lines"]))
-        self.assertEqual(len(calls), 3)                                    # baseline, drafter on, threads
+        self.assertEqual(len(calls), 4)                                    # baseline, drafter on, block 3, threads
         self.assertIn("tuned", json.loads(self.cfg.read_text()))
 
     def test_noise_changes_nothing(self):

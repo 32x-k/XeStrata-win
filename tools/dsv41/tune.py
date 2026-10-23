@@ -5,7 +5,7 @@
 What it does (a few short decode runs through the engine's own command line; each loads the model, so about 1-3 minutes each):
   1. the launch's own settings (the baseline);
   2. the same with the DSpark drafter forced on (`--dspark on --dspark-conf 0.65`) against `--dspark auto`, which leaves it unloaded on a
-     small card: kept only when it is clearly faster;
+     small card: kept only when it is clearly faster; with it on, a draft block of 3 against the pack's own (5);
   3. the CPU threads: the number of physical cores against every logical thread (SMT), when they differ: kept only when clearly faster.
 The RAM store (`--ssd-cache`) sizes itself from the free memory at start, so it is left as the engine's own; the line says so.
 A setting is changed only for a gain of more than 5% (run-to-run noise on this engine is about 5%).  Whatever is kept is written into
@@ -119,12 +119,18 @@ def tune(config: Path, mode: str = "quick", n: int = 48, timeout: int = 1500, me
         best, best_args = base, base_args
         say(f"  standard settings: {base:.2f} tokens a second")
         trials = [("the drafter on (DSpark)", lambda a: with_flag(with_flag(a, "--dspark", "on"), "--dspark-conf", "0.65"))]
+        trials.append(("a shorter draft block (3)", lambda a: with_flag(a, "--dspark-block", "3")))
         cores, logical = physical_cores(), os.cpu_count() or 0
         if cores and logical and logical > cores and "--cpu-threads" not in base_args:
             trials.append((f"{cores} CPU threads (one for each physical core)", lambda a, c=cores: with_flag(a, "--cpu-threads", str(c))))
         if mode == "thorough" and cores:
             trials.append(("every logical CPU thread", lambda a, c=logical: with_flag(a, "--cpu-threads", str(c))))
-        for label, make in trials:
+        queue = list(trials)
+        while queue:
+            label, make = queue.pop(0)
+            if label == "a shorter draft block (3)":
+                if "on" != (best_args[best_args.index("--dspark") + 1] if "--dspark" in best_args else ""):
+                    continue                                       # only with the drafter on: with `auto` it may not even be loaded
             cand = make(best_args)
             say(f"  trying {label} ...")
             v = measure_fn(exe, cand, f, n, timeout, env)
