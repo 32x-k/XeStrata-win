@@ -4193,7 +4193,7 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
             meta = {}
         ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
         if meta.get("backend") == "hip" and meta.get("source") == "prebuilt" and ver >= WIN_HIP_MIN_ENGINE and \
-                gpu["arch"] in arch_numbers(meta.get("archs")) and not updating:
+                gpu["arch"] in arch_names(meta.get("archs")) and not updating:
             ok("ready-made AMD engine already installed")
             return eng
     if not url_base:
@@ -4235,11 +4235,11 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
         why = "it is not a HIP engine"
     elif ver < WIN_HIP_MIN_ENGINE:
         why = f"it is version {meta.get('version')}; this setup needs {'.'.join(map(str, WIN_HIP_MIN_ENGINE))}"
-    elif gpu["arch"] not in arch_numbers(meta.get("archs")):
-        why = (f"it is built for {', '.join(meta.get('archs', []))}; your GPU is {gpu['arch']}.  A card it has no code "
+    elif gpu["arch"] not in arch_names(meta.get("archs")):
+        why = (f"it is built for {', '.join(arch_names(meta.get('archs')))}; your GPU is {gpu['arch']}.  A card it has no code "
                "for runs from a self-build of the engine: see docs/AMD_HIP.md (--build)")   # #881
         if is_strix_halo(gpu):                         # never a zip without gfx1151 code: say so, and what to do
-            why = (f"it is built for {', '.join(meta.get('archs', [])) or 'other GPUs'} and has no gfx1151 code: your "
+            why = (f"it is built for {', '.join(arch_names(meta.get('archs'))) or 'other GPUs'} and has no gfx1151 code: your "
                    f"{gpu['name']} (Strix Halo) needs a ready-made engine from Strata 0.1.40 or newer, whose zip is "
                    "built for gfx1151 too.  Until then: the Linux guide docs/STRIX_HALO.md, or compile the engine "
                    "here with tools\\hip\\build_windows.bat (its default list has gfx1151) and start setup with "
@@ -4253,7 +4253,7 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
     shutil.rmtree(tmp, ignore_errors=True)
     drop_archive(z)
     hip_runtime_beside_exe(eng)                        # #468 #461
-    ok(f"ready-made AMD engine {meta.get('version', '')} for {', '.join(meta.get('archs', []))} "
+    ok(f"ready-made AMD engine {meta.get('version', '')} for {', '.join(arch_names(meta.get('archs')))} "
        f"(ROCm {meta.get('rocm', '?')})")
     return eng
 
