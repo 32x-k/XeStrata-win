@@ -93,6 +93,12 @@ public:
         }
         io_.reset(new IoQueue(std::max(1, c.threads)));
         grow();   // (the first chunk now: whether the GPU can map it is known from the start)
+        // DS4_STORE_PREGROW=1: the whole arena now.  cuMemHostRegister (the GPU mapping of a chunk) taken while a kernel of
+        // the decode is running waited on it for good on Linux (H100, driver 580): registering all chunks before the first
+        // kernel avoids it
+        if (std::getenv("DS4_STORE_PREGROW") != nullptr)
+            while (grow()) {
+            }
         return true;
     }
     ~ExpertStore() {
