@@ -37,6 +37,10 @@ struct Options {
     // most (never past the RAM the process can still get less 8 GB); 0: off, the OS page cache as before
     double ssd_cache_gb = -1.0;   // < 0: auto (the RAM the process can get less a floor, at most 48 GB; off below 4 GB), 0: off
     int ssd_policy = 0;
+    // dspark_auto: the drafter is loaded only where the routed experts fit the GPUs (more than 1.5x what they have, the verify rounds
+    // read 3.3x the bytes of a token and measured no faster than plain decoding, and the drafter's 7 GB of experts take the VRAM the
+    // trunk's hottest would have had); --dspark on / off / none says it outright
+    bool dspark_auto = true;
     bool dspark = true;              // load the DSpark drafter (the checkpoint's mtp.* blocks) for speculative decoding
     float dspark_conf = 0.5f;         // a draft is verified while its confidence (sigmoid) is at least this
     // tensor parallelism: runs of tp GPUs of one kind (the same memory) take the same layers, each a share of the

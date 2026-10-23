@@ -22,6 +22,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <fstream>
+#include <sstream>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -773,6 +775,7 @@ int main(int argc, char** argv) {
             const std::string v = val("--dspark");
             spec = v != "off";
             o.dspark = v != "none";   // none: not even loaded
+            o.dspark_auto = v == "auto";
         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
         else if (a == "--prefill-chunk") o.prefill_chunk = std::max(0, std::atoi(val("--prefill-chunk").c_str()));
@@ -863,6 +866,12 @@ int main(int argc, char** argv) {
             std::fclose(o2);
         }
         return 0;
+    }
+    if (!ids_s.empty() && ids_s[0] == '@') {   // --ids @file: the ids in a file (a command line is 32 KB on Windows)
+        std::ifstream idf(ids_s.substr(1));
+        std::stringstream ss;
+        ss << idf.rdbuf();
+        ids_s = ss.str();
     }
     const std::vector<int> ids = parse_ids(ids_s);
     if (!images.empty()) {   // --images: a GENI file's pictures, for the prompt's spans

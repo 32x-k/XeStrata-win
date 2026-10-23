@@ -249,11 +249,72 @@ static void bench_big(int type, int mib) {
     for (auto p : plan) hipFree((void*) p);
 }
 
+// the light sets (experts of <= 16 rows: DSpark verify windows, short prompts): n_exp experts of `rows` rows each, gate/up and down
+static void bench_light(int type, int nexp, int rows) {
+    const int E = 5120, FF = 2304;
+    const size_t rb_g = iq::row_bytes(type, E), rb_d = iq::row_bytes(type, FF);
+    auto al = [](size_t n) { return (n + 255) / 256 * 256; };
+    const size_t off[3] = {0, al(FF * rb_g), al(FF * rb_g) * 2}, blob = off[2] + al((size_t) E * rb_d);
+    std::mt19937_64 rng(7);
+    std::vector<uint8_t> one(blob);
+    for (auto& b : one) b = (uint8_t) rng();
+    uint8_t* w; CK(hipMalloc(&w, blob * nexp));
+    for (int e = 0; e < nexp; ++e) CK(hipMemcpy(w + (size_t) e * blob, one.data(), blob, hipMemcpyHostToDevice));
+    const int NR = nexp * rows, T = 8;
+    std::vector<int> bounds(nexp + 1), idx(NR);
+    for (int e = 0; e <= nexp; ++e) bounds[e] = e * rows;
+    for (int i = 0; i < NR; ++i) idx[i] = i % T;
+    std::vector<float> x((size_t) T * E);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (auto& v : x) v = nd(rng);
+    std::vector<uint16_t> h((size_t) NR * FF, 0x3c00);
+    iq::SetArgs q{};
+    q.wbase = w; q.stride = blob; for (int r = 0; r < 3; ++r) q.tr[r] = off[r];
+    q.bounds = up(bounds); q.row0 = 0; q.max_rows = rows; q.n_exp = nexp; q.n_embd = E; q.n_ff = FF; q.limit = 7.0f;
+    q.tg = q.td = type; q.xf = up(x); q.idx = up(idx); q.ldx = E;
+    uint16_t* dh; CK(hipMalloc(&dh, (size_t) NR * FF * 2)); q.h = dh; q.ldo = FF;
+    q.xh = up(h);
+    float* dy; CK(hipMalloc(&dy, (size_t) NR * E * 4));
+    hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
+    double us[2] = {0, 0};
+    for (int part = 0; part < 2; ++part) {
+        auto run = [&](int reps) {
+            hipEventRecord(e0);
+            for (int rep = 0; rep < reps; ++rep) {
+                if (part == 0) { q.h = dh; q.ldo = FF; iq::light_gate_up(q, 0); }
+                else { q.y = dy; q.ldo = E; q.ldx = FF; iq::light_down(q, 0); }
+            }
+            hipEventRecord(e1); hipEventSynchronize(e1);
+            float ms; hipEventElapsedTime(&ms, e0, e1);
+            return (double) ms;
+        };
+        double ms = 0; int reps = 4;
+        while (ms < 200.0) { ms = run(reps); reps *= 2; }
+        const int n = std::max(2, (int) (reps / 2 * 40.0 / ms));
+        double best = 1e30;
+        for (int wnd = 0; wnd < 5; ++wnd) best = std::min(best, run(n) * 1e3 / n);
+        us[part] = best;
+    }
+    const double bytes = (double) nexp * (off[2] + al((size_t) E * rb_d));
+    std::printf("light %-7s %3d experts x %2d rows: gate/up %7.1f us  down %7.1f us  -> %6.0f GB/s of weights, %.2f Tw/s\n", iq::name(type), nexp, rows,
+                us[0], us[1], bytes / ((us[0] + us[1]) * 1e-6) / 1e9, (double) nexp * 3 * FF * E / ((us[0] + us[1]) * 1e-6) / 1e12);
+    hipFree(w);
+}
+
 int main(int argc, char** argv) {
     std::vector<int> types = {16, 17, 22, 18, 21, 23, 29};
     std::vector<int> devs;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--bench-big") {   // [types] [MiB]
+        if (std::string(argv[i]) == "--bench-light") {   // [types] [n_exp] [rows list]
+            std::vector<int> bt, rl = {1, 2, 4};
+            int nexp = 24;
+            if (i + 1 < argc && argv[i + 1][0] != '-') { for (const char* p = argv[++i]; *p;) { bt.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; } }
+            else bt = types;
+            if (i + 1 < argc && argv[i + 1][0] != '-') nexp = std::atoi(argv[++i]);
+            if (i + 1 < argc && argv[i + 1][0] != '-') { rl.clear(); for (const char* p = argv[++i]; *p;) { rl.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; } }
+            for (int t : bt) for (int r : rl) bench_light(t, nexp, r);
+            return 0;
+        } else if (std::string(argv[i]) == "--bench-big") {   // [types] [MiB]
             std::vector<int> bt; int mib = 640;
             if (i + 1 < argc && argv[i + 1][0] != '-') { for (const char* p = argv[++i]; *p;) { bt.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; } }
             else bt = types;
