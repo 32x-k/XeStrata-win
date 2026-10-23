@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 // STRATA_AVXVNNI (CMake: the compiler has the AVX-VNNI intrinsics): GCC and Clang compile them only inside functions
 // with target("avxvnni") - the VNNI copy of iq_avx2_rows.inl.

@@ -55,7 +55,8 @@ bool gg_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err
 void gg_cpu_quant(int act, const float* x, int k, void* dst);
 void gg_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt, float* const* ff,
                     int r0, int r1, float limit);
-/// -1: from the environment (DS4_GG_IQ256=1 turns Strata's AVX2 i-quant rows on, default off), 0 ggml-cpu, 1 forced (benches).
+/// -1: from the environment (default: Strata's AVX2 i-quant rows, bit-identical to ggml-cpu's dot, from 2 tokens - 1 on IQ3_S, 3 on IQ1_M;
+/// DS4_GG_IQ256=0 never, =1 always), 0 ggml-cpu, 1 always (benches), 2 the default rule.
 void gg_cpu_set_iq256(int mode);
 void gg_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0, int r1);
 
