@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 import strata_tokenizer as ST  # noqa: E402
-from serve import frontend  # noqa: E402
+from serve import frontend, server  # noqa: E402
 from serve.dsml import DsmlOutputParser, DsmlTranslator, to_dsml_force  # noqa: E402
 from serve.frontend import ChatTemplate, OutputParser, openai_to_messages  # noqa: E402
 from serve.server import (FAMILY_MODEL_NAMES, MockEngine, REASONING_WRAP_UP, Service, default_model_name, model_card_sampling,  # noqa: E402
@@ -528,6 +528,90 @@ class Api(ApiBase):
         # produced tokens over the engine's decode time (10 ms a token in the fake), never over the prompt's time
         self.assertEqual(last["decode_tok_s"], 100.0)
 
+
+    # -- the shared start of an agent's and its sub-agents' prompts (the engine keeps its state there) ------------
+    def test_the_system_prompt_and_tools_are_the_shared_start(self):
+        self.start("ok")
+        self.auto_pin("1")
+        sysmsg = {"role": "system", "content": "You are an agent. " * 20}
+        body = {"messages": [sysmsg, {"role": "user", "content": "task one"}], "tools": [WEATHER], "max_tokens": 40}
+        self.assertEqual(self.post("/v1/chat/completions", body)[0], 200)
+        n = self.engine.last_sampling["strata_prefix"]["tokens"]
+        ids = self.engine.last_prompt
+        self.assertTrue(0 < n < len(ids) - 1)
+        self.assertIn("get_weather", self.tok.decode(ids[:n]))            # the tools are in the shared start
+        self.assertNotIn("task one", self.tok.decode(ids[:n]))            # the first user message is not
+        # another agent behind the same system prompt and tools, another task: the same boundary, the same start
+        body["messages"] = [sysmsg, {"role": "user", "content": "a different task for the sub-agent"}]
+        self.assertEqual(self.post("/v1/chat/completions", body)[0], 200)
+        self.assertEqual(self.engine.last_sampling["strata_prefix"]["tokens"], n)
+        self.assertEqual(self.engine.last_prompt[:n], ids[:n])
+
+    def auto_pin(self, value):
+        old = os.environ.get("STRATA_DS4_AUTO_PIN")
+        if value is None:
+            os.environ.pop("STRATA_DS4_AUTO_PIN", None)
+        else:
+            os.environ["STRATA_DS4_AUTO_PIN"] = value
+        self.addCleanup(lambda: os.environ.pop("STRATA_DS4_AUTO_PIN", None) if old is None
+                        else os.environ.__setitem__("STRATA_DS4_AUTO_PIN", old))
+
+    def test_no_shared_start_without_a_system_prompt_or_when_switched_off(self):
+        self.start("ok")
+        self.auto_pin("1")
+        self.chat()
+        self.assertNotIn("strata_prefix", self.engine.last_sampling)     # no system message
+        body = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}], "max_tokens": 40}
+        for off in (None, "0"):                                           # off by default, and when switched off
+            self.auto_pin(off)
+            self.post("/v1/chat/completions", body)
+            self.assertNotIn("strata_prefix", self.engine.last_sampling)
+
+    def test_a_clients_own_prefix_wins(self):
+        self.start("ok")
+        self.auto_pin("1")
+        body = {"messages": [{"role": "system", "content": "s " * 30}, {"role": "user", "content": "u"}],
+                "max_tokens": 40, "strata_prefix": {"tokens": 7}}
+        self.post("/v1/chat/completions", body)
+        self.assertEqual(self.engine.last_sampling["strata_prefix"], {"tokens": 7})
+
+    def test_the_qwen_path_asks_for_no_prefix(self):
+        # the same request on a server that is not DeepSeek's: nothing is added (Qwen keeps its own cache logic)
+        svc = Service(MockEngine(self.tok, "ok"), self.tok, ChatTemplate(ROOT / "serve" / "chat_template.jinja"))
+        req = {}
+        svc.prepare([{"role": "system", "content": "s"}, {"role": "user", "content": "u"}], None, {}, 16, req=req)
+        self.assertEqual(req, {})
+
+
+class SlotEnv(unittest.TestCase):
+    """The engine's kept conversations: the folder and the switch reach the DeepSeek engine only."""
+
+    KEYS = ("STRATA_DS4_SLOT_KEEP", "STRATA_DS4_SLOT_DIR")
+
+    def env(self, cfg):
+        saved = {k: os.environ.pop(k, None) for k in self.KEYS}
+        try:
+            return server.child_env(cfg)
+        finally:
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_deepseek_gets_a_folder_in_the_data_folder_and_the_default_switch(self):
+        env = self.env({"arch": "deepseek41", "log": str(Path("data") / "strata-deepseek.log"), "args": []})
+        self.assertEqual(Path(env["STRATA_DS4_SLOT_DIR"]), Path("data") / "ds4-slots")
+        self.assertEqual(env["STRATA_DS4_SLOT_KEEP"], "0")
+        self.assertEqual(env["STRATA_DS4_SLOT_GB"], "2")
+
+    def test_the_configs_own_settings_win(self):
+        env = self.env({"arch": "deepseek41", "log": "x/y.log",
+                        "env": {"STRATA_DS4_SLOT_KEEP": "1", "STRATA_DS4_SLOT_DIR": "elsewhere"}})
+        self.assertEqual((env["STRATA_DS4_SLOT_KEEP"], env["STRATA_DS4_SLOT_DIR"]), ("1", "elsewhere"))
+
+    def test_other_families_get_nothing(self):
+        for arch in ("qwen4exp", None, "gyro"):
+            env = self.env({"arch": arch, "log": "x/y.log"} if arch else {"log": "x/y.log"})
+            self.assertFalse([k for k in env if k.startswith("STRATA_DS4_")], arch)
 
 class ThinkForever(DsEngine):
     """Thinks without end (random letters) until the thinking is closed in the prompt, then answers."""
