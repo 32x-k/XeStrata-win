@@ -61,7 +61,7 @@ static void bench_pcie() {
 }
 
 static void bench_nvme(const char* path, size_t block, int qd, double secs, bool seq) {
-    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
     if (f == INVALID_HANDLE_VALUE) { printf("open failed %lu\n", GetLastError()); return; }
     LARGE_INTEGER sz; GetFileSizeEx(f, &sz);
     HANDLE port = CreateIoCompletionPort(f, nullptr, 0, 1);

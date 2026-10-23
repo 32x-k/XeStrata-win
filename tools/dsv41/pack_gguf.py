@@ -40,7 +40,7 @@ TYPES = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 8: ("Q8_0", 32, 34), 30: ("BF16", 1
          # the low-bit expert types (the Maya quants' experts; the engine's ds4_iq kernels)
          10: ("Q2_K", 256, 84), 11: ("Q3_K", 256, 110), 12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176),
          14: ("Q6_K", 256, 210), 16: ("IQ2_XXS", 256, 66), 17: ("IQ2_XS", 256, 74), 18: ("IQ3_XXS", 256, 98),
-         20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82), 23: ("IQ4_XS", 256, 136),
+         19: ("IQ1_S", 256, 50), 29: ("IQ1_M", 256, 56), 20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82), 23: ("IQ4_XS", 256, 136),
          # the trellis types (tools/trellis/tqenc.hpp; 145 / 146 are the agentionai fork's ggml ids, 224-227 Strata's own)
          145: ("TQK6", 128, 26), 146: ("TQK7", 128, 30), 224: ("TQK5X", 128, 22), 225: ("TQK4X", 128, 18),
          226: ("TQK5T", 128, 22), 227: ("TQK4T", 128, 18)}
@@ -268,8 +268,12 @@ def int_tensors_to_engram(gs, kv: dict):
             with g.path.open("rb") as f:
                 f.seek(g.data_start + off)
                 kv["%s.engram.%s" % (a, key)] = list(struct.unpack("<%d%s" % (n, fmt), f.read(n * sz)))
-    if "%s.engram.pad_token_id" % a not in kv and "%s.engram_pad_token_id" % a in kv:
-        kv["%s.engram.pad_token_id" % a] = kv["%s.engram_pad_token_id" % a]
+    # the IST-DAS spelling of the Engram's scalar keys -> the dotted ones this pack reads
+    for dotted, theirs in (("engram.layers", "engram.layer_ids"), ("engram.max_ngram_size", "engram_max_ngram_size"),
+                           ("engram.head_count", "engram_n_heads"), ("engram.head_dim", "engram_head_dim"),
+                           ("engram.pad_token_id", "engram_pad_token_id")):
+        if "%s.%s" % (a, dotted) not in kv and "%s.%s" % (a, theirs) in kv:
+            kv["%s.%s" % (a, dotted)] = kv["%s.%s" % (a, theirs)]
 
 
 def split_ple(g: Gguf, kv: dict):
@@ -444,8 +448,8 @@ def main() -> int:
     # Looked for only when the quant's shards leave some out.
     have = {t[0] for g in gs for t in g.tensors}
     arch = kv["general.architecture"]
-    layers = kv.get("%s.engram.layers" % arch, [])
     int_tensors_to_engram(gs, kv)
+    layers = kv.get("%s.engram.layers" % arch, [])
 
     def has_part(il, part, names):
         if "blk.%d.%s.weight" % (il, part) in names:

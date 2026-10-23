@@ -25,7 +25,7 @@ namespace {
 // and not in the pack's tensor list is fine; a tensor whose type is not here is the CPU lane's (ggml-cpu's row dots).
 bool device_type(const std::string& t) {
     static const std::set<std::string> ok = {"MXFP4", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ2_XXS", "IQ2_XS",
-                                             "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "TQK6", "TQK7", "TQK5X", "TQK4X",
+                                             "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ1_M", "TQK6", "TQK7", "TQK5X", "TQK4X",
                                              "TQK5T", "TQK4T"};
     return ok.count(t) != 0;
 }
@@ -127,8 +127,13 @@ int pack_info(const std::string& dir, std::FILE* out) {
             ++missing;
             continue;
         }
+#if defined(_WIN32)
+        _fseeki64(f, 0, SEEK_END);   // (long is 32 bits there: the weights are far past 2 GB)
+        const long long sz = _ftelli64(f);
+#else
         std::fseek(f, 0, SEEK_END);
         const long long sz = std::ftell(f);
+#endif
         std::fclose(f);
         if ((double) sz + 0.5 < n) {
             std::fprintf(out, "  SHORT %s: %.2f GB there, %.2f GB wanted\n", path.c_str(), (double) sz / 1e9, n / 1e9);

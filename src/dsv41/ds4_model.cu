@@ -5259,13 +5259,31 @@ struct Model::Impl {
                 int nslots = 0;
                 std::vector<std::pair<int, int>> picks;   // (expert, t * kPicks + i), CPU-lane only
                 if (trace_f != nullptr && !l.mtp) {   // DS4_TRACE=file: one record a route request: u8 layer, u8 T, T x k int16 expert ids
-                    uint8_t hd[2] = {(uint8_t) li, (uint8_t) T};
+                    // DS4_TRACE_AHEAD=1: T has bit 7 set and the guesses follow: u8 na1, u8 na2, T x (na1 + na2) int16 (the
+                    // next layer's likely picks by rank, then the one after's), as the lookahead made them for THIS layer's
+                    // predecessors (the request carries the guesses for the layers after it)
+                    static const bool with_ahead = std::getenv("DS4_TRACE_AHEAD") != nullptr;
+                    uint8_t hd[2] = {(uint8_t) li, (uint8_t) (T | (with_ahead ? 0x80 : 0))};
                     std::fwrite(hd, 1, 2, trace_f);
                     for (int t = 0; t < T; ++t)
                         for (int i = 0; i < l.k_exp; ++i) {
                             const int16_t v = (int16_t) r.ids[t][i];
                             std::fwrite(&v, 2, 1, trace_f);
                         }
+                    if (with_ahead) {
+                        const uint8_t na[2] = {(uint8_t) std::max(0, std::min(r.na[0], kAhead1)), (uint8_t) std::max(0, std::min(r.na[1], kPicks))};
+                        std::fwrite(na, 1, 2, trace_f);
+                        for (int t = 0; t < T; ++t) {
+                            for (int i = 0; i < na[0]; ++i) {
+                                const int16_t v = (int16_t) r.ahead[t][i];
+                                std::fwrite(&v, 2, 1, trace_f);
+                            }
+                            for (int i = 0; i < na[1]; ++i) {
+                                const int16_t v = (int16_t) r.ahead[t][kAhead1 + i];
+                                std::fwrite(&v, 2, 1, trace_f);
+                            }
+                        }
+                    }
                 }
                 const bool dsk = disk_skip_w > 0.0f && !l.mtp && li >= disk_skip_from && li < g.nl;
                 for (int t = 0; t < T; ++t) {
