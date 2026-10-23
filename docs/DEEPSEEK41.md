@@ -26,10 +26,19 @@ with an out-of-memory message. Both are said before anything is downloaded.
 
 ## The official 2-bit versions (the ones for a normal PC)
 
-Setup offers two official sets (helcig/tmp-oct26-2, pinned): **IST-DAS 2.00 bpw** (138 GB) and **IST-DAS 2.25 bpw** (155 GB). Both use the
+Setup offers two official sets (ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF, pinned): **IST-DAS 2.00 bpw** (138 GB) and **IST-DAS 2.25 bpw** (155 GB). Both use the
 same 111 GB n-gram table (downloaded once into `models/deepseek-v4.1-flash-shared`) and the 8 GB DSpark drafter: 257 GB of disk for
 2.00, 274 GB for 2.25, 412 GB for both. Quality against the original model: perplexity +16% on 2.00, +8% on 2.25 (code and agent work
 about +3.5% / +2.5% on 2.25).
+
+| File | Size | What it is |
+| --- | ---: | --- |
+| IQ2_XXS shards (2.00 bpw), 4 files | 138 GB | the model, first set |
+| IQ2_XS shards (2.25 bpw), 4 files | 155 GB | the model, second set |
+| IQ4_NL: `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` | 111 GB | the 4-bit Engram lookup table the model reads from RAM or SSD. Not a third model: both sets use this one file, and it is already in their download sizes |
+| DSpark drafter (Q8_0) | 8 GB | the small draft model (Unsloth) |
+
+138 + 111 + 8 = 257 GB for 2.00; 155 + 111 + 8 = 274 GB for 2.25.
 
 Measured: an RTX 5070 (12 GB) with 64 GB of RAM and a 3.6 GB/s NVMe drive answers at about 4.7 tokens/s and reads prompts at 121
 tokens/s (4K) to 231 tokens/s (8K, layer-major path); an RTX 3060 (12 GB) with 46 GB of RAM about 7.2 tokens/s; four R9700 about 31
@@ -70,9 +79,45 @@ The server speaks to the engine as it does for the other models, so `/v1/chat/co
   server turns them into OpenAI `tool_calls` and Anthropic `tool_use`, including `tool_choice`, streamed arguments and calls written inside the thinking.
   A value marked `string="true"` stays a string.
 - Defaults when a request names none: temperature 1.0, top_p 1.0.
+- Agents and sub-agents that take turns can skip reading their prompts again (off in this version, a switch for testing). With
+  `STRATA_DS4_SLOT_KEEP=1` the engine sets a conversation aside when another request takes the model (about 17 MB per 6.5K tokens) and takes it
+  back when the next prompt continues it, also after a restart. Slots live in `ds4-slots` next to the run log, are capped at 2 GB
+  (`STRATA_DS4_SLOT_GB`) and are removed after a week. `STRATA_DS4_AUTO_PIN=1` also keeps the system prompt and tools shared by an agent
+  and its sub-agents as a checkpoint.
 
-Pictures and the DSpark drafter are in the engine (strata-dsv41 reads them from the unsloth mmproj and dspark files beside the model; the server side is not wired yet). Not in this version: several requests at once (`--parallel` is ignored with a note), tuning
-(`--tune` is skipped with a note).
+Not in this version: several requests at once (`--parallel` is ignored with a warning) and pictures (`--vision` is ignored with a warning).
+
+## Tuning
+
+`strata launch --tune quick` (or `thorough`, or the Tuning screen) works for DeepSeek with its own short tuner, `tools/dsv41/tune.py`. It starts
+the engine a few times on a fixed short question and measures the answer speed: the standard settings first, then the DSpark drafter forced on,
+then a shorter draft block (3), then one CPU thread for each physical core (thorough also tries every logical thread). A setting is kept only for a
+gain of more than 5%, and the result is written into the launch's settings. Expect about 5 to 10 minutes (each run loads the model, which takes
+1 to 3 minutes); close other heavy programs first. If a run fails or the computer is too busy to tell, the standard settings stay and one plain line
+says so. The RAM store (`--ssd-cache`) sizes itself when the model starts, so the tuner does not touch it, and the context stays what you chose.
+
+## The engine package
+
+DeepSeek's engine, `strata-dsv41`, is a separate download from the Strata engine: when you choose DeepSeek, setup (or `strata launch`) fetches the
+package for your computer from the signed update feed (resumable, signature and every file checked) and installs it in `engine-dsv41/` beside
+`engine/`. The Qwen engine's files are never changed. If the feed has no package for your graphics card, setup says so in plain words and stops before
+anything big is downloaded.
+
+### Getting the engine by hand
+
+If the automatic download does not work for you (no access to the update feed, or an offline computer), download the engine package yourself from
+the release page: the file is named `strata-dsv41-<version>-<system>-<backend>-<variant>.tar.gz` (Windows and Linux; pick the one for your system and
+graphics card). Check it against `SHA256SUMS.txt` on the release page if you like. Then give it to Strata in either of two ways:
+
+```
+strata launch --model ist-das-2.00bpw --dsv41-package PATH-TO-THE-FILE
+python setup.py --family deepseek41 --dsv41-package PATH-TO-THE-FILE
+```
+
+or put the file in the `engine-dsv41/` folder (setup tells you its exact place when it cannot find the engine) and run the same command again.
+Strata checks the package before it uses it: it must be the DeepSeek engine (not the Strata engine) for your system, its manifest must be signed by a key
+Strata trusts, and every file must match the hash in the manifest. A damaged or foreign file is refused with a plain line and nothing is installed.
+The unpacked folder works as well as the archive. The Strata (Qwen) engine is not touched either way.
 
 ## Compressed experts (trellis), for testing
 

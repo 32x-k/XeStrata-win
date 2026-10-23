@@ -739,6 +739,8 @@ class Runner:
         if s.model_path:
             p = Path(s.model_path)
             args += ["--gguf-dir", str(p if p.is_dir() else p.parent)]
+        if s.dsv41_package and s.family == "deepseek41":
+            args += ["--dsv41-package", s.dsv41_package]
         if s.gpu_roles:
             args += ["--gpu-roles", ",".join(f"{k}={v}" for k, v in sorted(s.gpu_roles.items(), key=lambda kv: int(kv[0])))]
         elif s.gpus:
@@ -1263,7 +1265,8 @@ class Runner:
         mode = "thorough" if s.tune == "thorough" else "quick"
         argv = [sys.executable, str(Path(__file__).resolve().parents[2] / "tools" / "dsv41" / "tune.py"), "--config", str(cfg), "--mode", mode,
                 "--output", "json"]
-        self.emit("tune", "Tuning DeepSeek for the best speed: a few short test runs (1-3 minutes each). Close other heavy programs.", 0)
+        self.emit("tune", "Tuning DeepSeek: it times a short question with your standard settings, then with the DSpark drafter on (and, if that helps, a shorter "
+                          "draft block) and the CPU threads set to your physical cores; each run loads the model once. It keeps only a clear gain. Close other heavy programs.", 0)
         try:
             p = self._spawn(argv)
         except Exception as e:                           # noqa: BLE001 - a tune never stops a launch
@@ -1828,21 +1831,54 @@ class Runner:
         except Exception:                                    # noqa: BLE001
             return ""
 
-    def dsv41_engine(self) -> bool | None:
-        """Whether the installed engine carries strata-dsv41 (True / False); None when no engine is installed yet or it cannot be told."""
+    def dsv41_engine_found(self) -> tuple[Path | None, bool | None]:
+        """(strata-dsv41 already installed, or None; whether the engine can be told at all).  Looks where setup puts DeepSeek's own engine package
+        (engine-dsv41/ beside the engine, in Strata's own folder, and in the data folder), and at STRATA_DSV41_EXE (a build of your own)."""
+        from strata_control import dsv41_engine
         own = (os.environ.get("STRATA_DSV41_EXE") or "").strip()
         if own:
-            return Path(own).is_file()
+            return (Path(own) if Path(own).is_file() else None), True
+        folders: list[Path] = []
         try:
             from strata_control import engine_component as ec
             rep = ec.status()
             exe = (rep.get("engine") or {}).get("exe") if rep.get("usable") else None
-            if not exe:
-                return None
-            folder = Path(str(exe)).parent
-            return any((d / n).is_file() for d in (folder, folder.parent / "engine-dsv41") for n in ("strata-dsv41", "strata-dsv41.exe"))
+            if exe:
+                folder = Path(str(exe)).parent
+                folders += [folder.parent / dsv41_engine.DIR]
+                try:
+                    folders.append(self.catalog.strata.setup_module().dsv41_engine_dir(folder))
+                except Exception:                            # noqa: BLE001
+                    pass
+                known = True
+            else:
+                known = None
         except Exception:                                    # noqa: BLE001
-            return None
+            known = None
+        try:                                                 # where the setup this Terminal runs puts it (its own engine folder, or Strata's folder)
+            mod = self.catalog.strata.setup_module()
+            folders += [Path(self.catalog.root) / dsv41_engine.DIR,      # setup runs here in the app's installer mode: its home() is this folder
+                        mod.dsv41_engine_dir(Path(mod.ROOT) / "engine"), Path(mod.home()) / dsv41_engine.DIR]
+        except Exception:                                    # noqa: BLE001
+            pass
+        try:
+            folders.append((Path(self.s.data_dir) if self.s.data_dir else self.catalog.data_dir()) / dsv41_engine.DIR)
+        except Exception:                                    # noqa: BLE001
+            pass
+        for f in folders:
+            found = dsv41_engine.find(f)
+            if found is not None:
+                return found, True
+        for f in folders[:1]:                                # the engine's own folder: an all-in-one package carries it
+            for n in ("strata-dsv41", "strata-dsv41.exe"):
+                if (f.parent / n).is_file():
+                    return f.parent / n, True
+        return None, known
+
+    def dsv41_engine(self) -> bool | None:
+        """Whether the installed engine carries strata-dsv41 (True / False); None when no engine is installed yet or it cannot be told."""
+        found, known = self.dsv41_engine_found()
+        return True if found is not None else (False if known else None)
 
     def placement(self) -> dict:
         """Where DeepSeek-V4.1-Flash would go on this computer's cards (strata_control/dsv41_fit.py): the cards this launch names, else every
@@ -1856,7 +1892,11 @@ class Runner:
             free = None
         p = self.catalog.strata.dsv41_plan(hw, free, s.gpus, model=s.model)
         warnings = list(p["warnings"])
-        engine = self.dsv41_engine()
+        found, known = self.dsv41_engine_found()
+        engine = True if found is not None else (False if known else None)
+        if found is not None:
+            ver = next((part for part in (found.parent.name.split("-")[0], ) if part[:1].isdigit()), "")
+            p["lines"].append("DeepSeek engine: installed" + (f", {ver}" if ver else "") + ".")
         if engine is False:
             warnings.append("DeepSeek runs on its own engine package (about 70 MB, separate from the Strata engine): setup downloads it first. "
                             "If it cannot be fetched, setup stops with a message before the model is downloaded.")
@@ -1927,6 +1967,11 @@ def _read_json(path: Path) -> dict | None:
 #: lines of an engine log that say why it stopped (the last one wins), and a plain next step for the causes we know. Recommend, never force.
 CAUSE_LINE = re.compile(r"error|exception|failed|cannot|can't|could not|no device|not found|out of memory|unsupported|abort|invalid|missing|"
                         r"no kernel|illegal|denied|refus", re.I)
+# The GPU runtime (ROCm) failed while the card was being set up, often right after another engine exited: the runtime's own text
+# ("terminate called after throwing an instance of 'rocr::AMD::hsa_exception'") stays in the log, not in the sentence shown.
+HSA_START = re.compile(r"hsa_exception|HSA_STATUS_ERROR", re.I)
+HSA_START_NEXT = ("The graphics card was not ready yet; wait a few seconds and run it again. If it keeps happening, restart the PC "
+                  "and report the log.")
 KNOWN_CAUSES = (
     (re.compile(r"no device of requested type|device not found|no (gpu|sycl|level.zero) device|permission denied.*(dri|render)", re.I),
      "The engine could not open the graphics card. On Linux the account must be allowed to use it: add it to the render group "
@@ -2005,10 +2050,19 @@ def explain_engine_exit(result: dict, config: Path | None, marks: dict | None = 
         stage = "The engine stopped while it was loading the model" + (f" (exit code {code})" if code not in (None, 0) else "")
     else:
         stage = f"The server did not become ready ({state}: {why or 'see the engine log'})"
+    hsa = HSA_START.search(" ".join(lines + [str(why or "")]))   # the runtime's own text is kept out of the sentence (it is in the log)
+    if hsa:
+        # a real cause in the same log (out of memory, no permission on the card ...) wins: its line is the cause shown
+        real = next((x for x in reversed(lines) if any(p.search(x) for p, _ in KNOWN_CAUSES)), None)
+        if real:
+            hsa = None
+            cause = re.sub(r"^(\[strata\]\s*)?(\d{4}-\d\d-\d\d[ T][\d:.]+\s*)?", "", real.strip())[:240]
+        else:
+            cause = ""
     text = stage + (f": {cause}" if cause else ".")
     if not text.endswith((".", "!")):
         text += "."
-    step = next((words for pattern, words in KNOWN_CAUSES if pattern.search(" ".join([cause, str(why or "")]))), "Run it again; if it repeats, report the log.")
+    step = HSA_START_NEXT if hsa else next((words for pattern, words in KNOWN_CAUSES if pattern.search(" ".join([cause, str(why or "")]))), "Run it again; if it repeats, report the log.")
     return text, step + (f" The engine's log: {log}" if log else " The engine's log has the reason (strata logs, or the log named in the run config).")
 
 

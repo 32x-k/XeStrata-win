@@ -16,6 +16,7 @@
 #include "ds4_engram_io.hpp"
 
 #include "ds4_gguf.cuh"
+#include "ds4_iq.cuh"
 #include "ds4_gguf_cpu.hpp"
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
@@ -41,6 +42,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <future>
@@ -583,6 +585,7 @@ struct Chunk {
     int spec_k = -1, spec_il = -1, n_spec = 0;   // the likely items queued last: (chunk, layer), how many, from where
     size_t spec_begin = 0;
     std::vector<int> fl_layers, fl_T;        // the device's trunk layers in order; the run's chunk sizes
+    int fl_yoco = -1, fl_cut_k = 0, fl_cut_r = 0;   // Run::yoco / cut_k / cut_r: what a layer's chunk streams for
     int bc_n = 0, bc_w = 0;                  // a batch's compacted bounds: bc_n regions of bc_w, by batch count
     int *bc_pin = nullptr, *bc_dev = nullptr;
     uint64_t n_batch = 0;
@@ -813,6 +816,7 @@ struct Model::Impl {
     std::vector<std::unique_ptr<Chunk>> chunks;   // per device
     size_t eg_cap = kWin;             // tokens h_eg holds
     int tap_cap = kWin;               // rows h_taps holds (a chunk seeds the drafter with its last 128)
+    static constexpr int kYocoMin = 1024;   // a long prompt's skip (forward_chunks): the fewest rows worth skipping
     bool logits_all = false;          // the last feed was a chunk with logits for every row (chunk_logits)
     std::vector<float> chunk_logits;
     std::function<void(int64_t)> progress;   // a run of chunks: the tokens done so far (the main thread, while it waits)
@@ -920,7 +924,14 @@ struct Model::Impl {
         std::vector<std::vector<uint8_t>> win;
         std::vector<std::vector<float>> comp;
     };
-    Check ck[2];                      // the end of the last prompt, and the position before it
+    static constexpr int kChecks = 4;
+    Check ck[kChecks];                // the end of the last prompt, the position before it, the anchor (the position
+                                      // before the end of the first prompt of the run of prompts that each continued
+                                      // the last in place: a chat template that drops earlier turns' reasoning at a new
+                                      // user message re-renders the history from about there) and the prefix (where the
+                                      // server said the prompt's shared start - system prompt and tools - ends: another
+                                      // agent behind the same start goes back to it)
+    bool slot_held = false;           // slot_save took this state and nothing has changed it since
     std::vector<uint32_t> prof;       // [nl][n_exp] routed-expert hits
     Stats st;
     int cur_topk_n[kWin] = {}, cur_cand_n[kWin] = {};   // what the latest indexer / candidate source left, per query
@@ -1121,7 +1132,30 @@ struct Model::Impl {
     // ... and a run of chunks' (prof_chunk): a layer's start, after its attention, after the routing and the shared
     // expert, after its experts (the streamed ones' waits for their reads in it); printed after the run
     bool prof_chunk = false;
-    double cprof_ms[4] = {};
+    // DS4_PROF stages of the chunked prompt (finer ones than the decode's 0..5): 0 between layers, 1 attention rest (wq_b, wo,
+    // hc_post), 2 router-side tail (shared expert), 3 experts (+ waits), 4 Engram, 5 attn mHC (mix, split, norm), 6 attention
+    // projections (wq_a, wkv, compressor), 7 compressor + indexer, 8 q_b + rope, 9 sparse attention, 10 ffn mHC + router + sort
+    double cprof_ms[16] = {};
+    // DS4_PROF: the experts' kernels alone, by type (events around the gate/up and down calls of run_set)
+    struct EkMark {
+        cudaEvent_t e0, e1, e2;
+        int tg, td, nrows, nexp, maxrows, dev, ff;
+    };
+    std::vector<EkMark> ek_marks;
+    std::map<int, std::vector<cudaEvent_t>> ek_pool;   // by device
+    cudaEvent_t ek_ev() {
+        int cur = 0;
+        cudaGetDevice(&cur);
+        std::vector<cudaEvent_t>& pl = ek_pool[cur];
+        if (!pl.empty()) {
+            cudaEvent_t e = pl.back();
+            pl.pop_back();
+            return e;
+        }
+        cudaEvent_t e = nullptr;
+        cudaEventCreate(&e);
+        return e;
+    }
     void prof_mark(const Dev& d, int stage) {
         if (!prof_window && !prof_chunk) return;
         std::lock_guard<std::mutex> lk(prof_mu);
@@ -3203,8 +3237,22 @@ struct Model::Impl {
             if (v >= l.n_slots + c.n_spec && b[(size_t) v + 1] > b[(size_t) v]) flow_push(c, l, mi, k, e, v);
         }
     }
-    // the next (chunk, layer) of the device after (k, il) in the run's order (false: none)
+    // the next (chunk, layer) of the device after (k, il) in the run's order that streams experts (false: none) - a
+    // long prompt's skip leaves out its early chunks' layers from Run::yoco on (kv_only there: no experts)
     bool flow_next(const Chunk& c, int k, int il, int& k2, int& il2) const {
+        while (flow_next1(c, k, il, k2, il2)) {
+            if (c.fl_yoco < 0 || k2 >= c.fl_cut_k || il2 < c.fl_yoco) return true;
+            k = k2;
+            il = il2;
+        }
+        return false;
+    }
+    // the rows chunk k runs layer il on (a long prompt's skip: the cut chunk's from cut_r on, from the yoco layer on)
+    static int fl_rows(const Chunk& c, int k, int il) {
+        const int T = c.fl_T[(size_t) k];
+        return c.fl_yoco >= 0 && k == c.fl_cut_k && il >= c.fl_yoco ? T - c.fl_cut_r : T;
+    }
+    bool flow_next1(const Chunk& c, int k, int il, int& k2, int& il2) const {
         const auto it = std::find(c.fl_layers.begin(), c.fl_layers.end(), il);
         const size_t i = (size_t) (it - c.fl_layers.begin());
         if (c.lm) {   // (layer-major: the layer's next chunk, then the next layer's first)
@@ -3345,7 +3393,7 @@ struct Model::Impl {
         flow_rest(c, k, L0.il, b);
         const size_t lb = c.spec_begin, le = c.base + c.items.size(), n_lay = le - lb;
         int k2 = 0, il2 = 0;
-        if (flow_next(c, k, L0.il, k2, il2)) flow_spec(c, k2, il2, c.fl_T[(size_t) k2]);
+        if (flow_next(c, k, L0.il, k2, il2)) flow_spec(c, k2, il2, fl_rows(c, k2, il2));
         const size_t R = (size_t) c.ring_n, bmax = std::max<size_t>(1, R / 2);
         int v_done = 0;
         while (c.n_comp < le) {
@@ -3417,12 +3465,35 @@ struct Model::Impl {
                 sa.n_embd = D;
                 sa.n_ff = FF;
                 sa.limit = g.lim;
+                EkMark ek{};
+                const bool ekp = prof_chunk;
+                if (ekp) {
+                    std::lock_guard<std::mutex> lk(prof_mu);
+                    ek.e0 = ek_ev();
+                    ek.e1 = ek_ev();
+                    ek.e2 = ek_ev();
+                    ek.tg = gg::expert_type(sa.lay, 0);
+                    ek.td = gg::expert_type(sa.lay, 2);
+                    ek.nrows = nrows;
+                    ek.nexp = j - i0;
+                    ek.maxrows = max_rows;
+                    ek.ff = FF;
+                    cudaGetDevice(&ek.dev);
+                    cudaEventRecord(ek.e0, d.st);
+                }
                 if (sa.lay.fmt == gg::kFmtMXFP4) {
                     gg::set_gate_up(sa, c.x, D, c.row_tok + a, c.h16, FF, d.st);
+                    if (ekp) cudaEventRecord(ek.e1, d.st);
                     gg::set_down(sa, c.h16, FF, c.y, D, d.st);
                 } else {
                     x3::set_gate_up(sa, c.x, D, c.row_tok + a, c.h16, FF, d.st);
+                    if (ekp) cudaEventRecord(ek.e1, d.st);
                     x3::set_down(sa, c.h16, FF, c.y, D, d.st);
+                }
+                if (ekp) {
+                    cudaEventRecord(ek.e2, d.st);
+                    std::lock_guard<std::mutex> lk(prof_mu);
+                    ek_marks.push_back(ek);
                 }
                 if (dump_y != nullptr && (dump_y_layer < 0 || l.il == dump_y_layer)) {
                     std::vector<int> bb(b + i0, b + j + 1);
@@ -4528,7 +4599,8 @@ struct Model::Impl {
         pos = 0;
         toks.clear();
         ctoks.clear();
-        ck[0].pos = ck[1].pos = -1;
+        slot_held = false;
+        for (Check& c0 : ck) c0.pos = -1;
         for (Layer& l0 : L)
             for (int m = 0; m < l0.nm; ++m) {
                 Layer& l = member(l0, m);
@@ -4547,7 +4619,7 @@ struct Model::Impl {
     // the state at pos into checkpoint `slot` (the window rings and the compressors' partial groups: the rest of the
     // state is indexed by position, and what lies past a restored position is written again)
     void checkpoint(int slot) {
-        Check& c = ck[slot & 1];
+        Check& c = ck[slot & (kChecks - 1)];
         c.pos = pos;
         c.win.resize(L.size());
         c.comp.resize(L.size() * 2);
@@ -4574,13 +4646,40 @@ struct Model::Impl {
     // the checkpoint at or before position limit (the state's tokens agree with a new prompt up to there), or -1
     int best_check(int64_t limit) const {
         int b = -1;
-        for (int i = 0; i < 2; ++i)
+        for (int i = 0; i < kChecks; ++i)
             if (ck[i].pos >= 0 && ck[i].pos <= limit && ck[i].pos <= pos && (b < 0 || ck[i].pos > ck[b].pos)) b = i;
         return b;
     }
     int64_t restorable(int64_t limit) const {
         const int b = best_check(limit);
         return b < 0 ? -1 : ck[b].pos;
+    }
+
+    // checkpoint 1 (the position before the last prompt's end) becomes the anchor too
+    void pin() {
+        if (ck[1].pos > 0) ck[2] = ck[1];
+    }
+    // the checkpoints the state can go back to (what a slot of it keeps), latest first
+    std::vector<int64_t> check_positions() const {
+        std::vector<int64_t> v;
+        for (const Check& c : ck)
+            if (c.pos > 0 && c.pos <= pos && c.win.size() == L.size() &&
+                std::find(v.begin(), v.end(), c.pos) == v.end())
+                v.push_back(c.pos);
+        std::sort(v.rbegin(), v.rend());
+        return v;
+    }
+    // the checkpoints a slot keeps (each with its role: 0, 1 or the anchor)
+    std::vector<int> slot_checks() const {
+        std::vector<int> v;
+        for (int i = 0; i < kChecks; ++i)
+            if (ck[i].pos > 0 && ck[i].pos <= pos && ck[i].win.size() == L.size()) v.push_back(i);
+        return v;
+    }
+    size_t check_bytes() const {
+        size_t n = 16;
+        for (const Layer& l : L) n += (size_t) g.win * win_rb() + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
+        return n;
     }
 
     bool restore(int64_t limit) {
@@ -4606,9 +4705,360 @@ struct Model::Impl {
         pos = c.pos;
         toks.resize((size_t) pos);
         ctoks.resize((size_t) pos);
+        slot_held = false;
         for (Check& o2 : ck)   // a later checkpoint saw tokens the state no longer has
             if (o2.pos > pos) o2.pos = -1;
         return true;
+    }
+
+    // ---- the kept conversations (a slot): the state out of the model and back, through a file or a host buffer.
+    // A prompt that continues the state is reused in place (checkpoint / restore, the compressed KV left where it is);
+    // a conversation that leaves the model for another one is a slot - the whole state: the position, its tokens,
+    // every window ring (the DSpark blocks' included), the compressors' partial groups and each KV source's compressed
+    // KV and index keys up to it (rows 0 .. pos / ratio, the groups its position completed; one the prompt has not
+    // completed yet lives in the compressor's partial group).  A tensor parallel group's members hold the same state,
+    // so one member's ring is saved and written back into all of them.  Text only: a conversation that holds pictures
+    // is not a slot (the Engram history's rows are the tokens' again, no -1 among them).
+    static constexpr uint64_t kSlotMagic = 0x31544f4c53345344ull;   // "DS4SLOT1" (little endian)
+
+    int64_t src_rows(const Src& s) const { return pos / std::max(1, s.ratio); }
+
+    // the slot's bytes: the header, the tokens, every layer's ring and partial group, every source's rows, the end
+    size_t slot_bytes() const {
+        size_t n = 8 + 8 + slot_identity().size() + 8 + (size_t) pos * 4;
+        for (const Layer& l : L) n += 8 + (size_t) g.win * win_rb() + 8 + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
+        for (const Src& s : srcs) n += 8 + (size_t) src_rows(s) * (ckv_rb() + ik_rb());
+        n += 8 + slot_checks().size() * check_bytes();   // (the checkpoints: what the slot can be taken back at)
+        return n + 8;
+    }
+
+    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err) {
+        if (slot_held) {
+            err = "it is already set aside";
+            return 0;
+        }
+        if (pos <= 0) {
+            err = "there is no conversation";
+            return 0;
+        }
+        if ((int64_t) toks.size() != pos) {
+            err = "the state's tokens do not match its position";
+            return 0;
+        }
+        if (!imgs.empty()) {
+            err = "it holds pictures";
+            return 0;
+        }
+        const std::string id = slot_identity();
+        out.assign(slot_bytes(), 0);
+        uint8_t* p = out.data();
+        size_t off = 0;
+        const auto put = [&](const void* s, size_t b) {
+            std::memcpy(p + off, s, b);
+            off += b;
+        };
+        const uint64_t il = id.size(), n = (uint64_t) pos;
+        put(&kSlotMagic, 8);
+        put(&il, 8);
+        put(id.data(), (size_t) il);
+        put(&n, 8);
+        put(toks.data(), (size_t) n * 4);
+        for (Dev& d : devs) {   // (the devices' work ends before their state is read)
+            cudaSetDevice(d.id);
+            cudaStreamSynchronize(d.st);
+        }
+        for (size_t i = 0; i < L.size(); ++i) {
+            const Layer& l = L[i];
+            const Dev& d = devs[(size_t) l.dev];
+            cudaSetDevice(d.id);
+            const uint64_t wb = (uint64_t) g.win * win_rb();
+            put(&wb, 8);
+            if (cudaMemcpy(p + off, l.win, (size_t) wb, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                err = l.name + "window ring: " + cudaGetErrorString(cudaGetLastError());
+                return 0;
+            }
+            off += (size_t) wb;
+            const uint64_t cn = l.c_kv ? (uint64_t) l.ratio * (uint64_t) g.hd : 0;
+            put(&cn, 8);
+            if (cn > 0) {
+                const size_t cb = (size_t) cn * 4;
+                if (cudaMemcpy(p + off, l.c_kv, cb, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                    cudaMemcpy(p + off + cb, l.c_score, cb, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    err = l.name + "compressor's group: " + cudaGetErrorString(cudaGetLastError());
+                    return 0;
+                }
+                off += 2 * cb;
+            }
+        }
+        for (const Src& s : srcs) {
+            const uint64_t rows = (uint64_t) src_rows(s);
+            put(&rows, 8);
+            if (rows == 0) continue;
+            const int di = L[(size_t) s.layer].dev;
+            const uint8_t* ckv = s.ckv[(size_t) di];
+            const uint8_t* ik = s.ik[(size_t) di];   // (a pack whose sources are not index sources: none, zeros)
+            if (ckv == nullptr) {
+                err = "source layer " + std::to_string(s.layer) + "'s rows are not on its device";
+                return 0;
+            }
+            const size_t cb = (size_t) rows * ckv_rb(), ib = (size_t) rows * ik_rb();
+            cudaSetDevice(devs[(size_t) di].id);
+            if (cudaMemcpy(p + off, ckv, cb, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                (ik != nullptr && cudaMemcpy(p + off + cb, ik, ib, cudaMemcpyDeviceToHost) != cudaSuccess)) {
+                err = "source layer " + std::to_string(s.layer) + "'s compressed KV: " + cudaGetErrorString(cudaGetLastError());
+                return 0;
+            }
+            off += cb + ib;
+        }
+        {
+            const std::vector<int> cs = slot_checks();
+            const uint64_t nc = cs.size();
+            put(&nc, 8);
+            for (int k : cs) {
+                const Check& c = ck[k];
+                const uint64_t role = (uint64_t) k, cp = (uint64_t) c.pos;
+                put(&role, 8);
+                put(&cp, 8);
+                for (size_t i = 0; i < L.size(); ++i) {
+                    put(c.win[i].data(), (size_t) g.win * win_rb());
+                    if (L[i].c_kv) {
+                        put(c.comp[2 * i].data(), (size_t) L[i].ratio * g.hd * 4);
+                        put(c.comp[2 * i + 1].data(), (size_t) L[i].ratio * g.hd * 4);
+                    }
+                }
+            }
+        }
+        if (off + 8 != out.size()) {
+            err = "the state's size does not add up";
+            return 0;
+        }
+        put(&kSlotMagic, 8);
+        slot_held = true;
+        return (uint64_t) off;
+    }
+
+    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
+        size_t off = 0;
+        bool wrote = false, ok = false;
+        // a load that stops after some of another conversation's state went into the layers leaves a state no
+        // checkpoint can repair: it is reset (the prompt is read from token 0), never served from the mix
+        struct FailClosed {
+            Impl& p;
+            const bool& wrote;
+            const bool& ok;
+            ~FailClosed() {
+                if (!ok && wrote) p.reset();
+            }
+        } guard{*this, wrote, ok};
+        const auto room = [&](size_t b) { return b <= bytes && off <= bytes - b; };
+        uint64_t magic = 0, il = 0, n = 0;
+        if (!room(16)) {
+            err = "the slot is cut short";
+            return false;
+        }
+        std::memcpy(&magic, data + off, 8);
+        std::memcpy(&il, data + off + 8, 8);
+        off += 16;
+        if (magic != kSlotMagic || il == 0 || il > (1u << 20)) {
+            err = "not a saved conversation";
+            return false;
+        }
+        if (!room((size_t) il + 8)) {
+            err = "the slot is cut short";
+            return false;
+        }
+        {
+            std::string id((size_t) il, '\0');
+            std::memcpy(id.data(), data + off, (size_t) il);
+            off += (size_t) il;
+            std::memcpy(&n, data + off, 8);
+            off += 8;
+            if (id != slot_identity()) {
+                err = "another model's, or another engine version's, conversation";
+                return false;
+            }
+        }
+        if (n != (uint64_t) n_pos || n_pos <= 0 || n_pos > o.max_context || !room((size_t) n * 4)) {
+            err = "the conversation's position is not this prompt's";
+            return false;
+        }
+        std::vector<int32_t> toks_in((size_t) n);
+        std::memcpy(toks_in.data(), data + off, (size_t) n * 4);
+        off += (size_t) n * 4;
+        for (Dev& d : devs) {   // (their work ends before the state is written over)
+            cudaSetDevice(d.id);
+            cudaStreamSynchronize(d.st);
+        }
+        for (size_t i = 0; i < L.size(); ++i) {
+            Layer& l = L[i];
+            const Dev& d = devs[(size_t) l.dev];
+            cudaSetDevice(d.id);
+            uint64_t wb = 0, cn = 0;
+            if (!room(8)) {
+                err = "the slot is cut short";
+                return false;
+            }
+            std::memcpy(&wb, data + off, 8);
+            off += 8;
+            if (wb != (uint64_t) g.win * win_rb() || !room((size_t) wb + 8)) {
+                err = l.name + "window ring of another size";
+                return false;
+            }
+            wrote = true;
+            for (int m = 0; m < l.nm; ++m) {
+                Layer& lm = member(l, m);
+                if (cudaMemcpy(lm.win, data + off, (size_t) wb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = l.name + "window ring: " + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+            }
+            off += (size_t) wb;
+            std::memcpy(&cn, data + off, 8);
+            off += 8;
+            if (cn != (l.c_kv ? (uint64_t) l.ratio * (uint64_t) g.hd : 0)) {
+                err = l.name + "compressor's group of another size";
+                return false;
+            }
+            if (cn > 0) {
+                const size_t cb = (size_t) cn * 4;
+                if (!room(2 * cb)) {
+                    err = "the slot is cut short";
+                    return false;
+                }
+                for (int m = 0; m < l.nm; ++m) {
+                    Layer& lm = member(l, m);
+                    if (cudaMemcpy(lm.c_kv, data + off, cb, cudaMemcpyHostToDevice) != cudaSuccess ||
+                        cudaMemcpy(lm.c_score, data + off + cb, cb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                        err = l.name + "compressor's group: " + cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+                }
+                off += 2 * cb;
+            }
+        }
+        for (const Src& s : srcs) {
+            uint64_t rows = 0;
+            if (!room(8)) {
+                err = "the slot is cut short";
+                return false;
+            }
+            std::memcpy(&rows, data + off, 8);
+            off += 8;
+            if (rows != (uint64_t) (n_pos / std::max(1, s.ratio))) {
+                err = "source layer " + std::to_string(s.layer) + "'s rows are not this conversation's";
+                return false;
+            }
+            if (rows == 0) continue;
+            const size_t cb = (size_t) rows * ckv_rb(), ib = (size_t) rows * ik_rb();
+            if (!room(cb + ib)) {
+                err = "the slot is cut short";
+                return false;
+            }
+            for (size_t di = 0; di < devs.size(); ++di) {
+                if (s.ckv[di] == nullptr && s.ik[di] == nullptr) continue;
+                cudaSetDevice(devs[di].id);
+                if (s.ckv[di] != nullptr && cudaMemcpy(s.ckv[di], data + off, cb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = "source layer " + std::to_string(s.layer) + "'s compressed KV: " + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                if (s.ik[di] != nullptr &&
+                    cudaMemcpy(s.ik[di], data + off + cb, ib, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = "source layer " + std::to_string(s.layer) + "'s index keys: " + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+            }
+            off += cb + ib;
+        }
+        Check got[kChecks];   // the slot's checkpoints: the positions it can be taken back at
+        {
+            uint64_t nc = 0;
+            if (!room(8)) {
+                err = "the slot is cut short";
+                return false;
+            }
+            std::memcpy(&nc, data + off, 8);
+            off += 8;
+            if (nc > (uint64_t) kChecks) {
+                err = "the slot's checkpoints are damaged";
+                return false;
+            }
+            for (uint64_t k = 0; k < nc; ++k) {
+                uint64_t role = 0, cp = 0;
+                if (!room(16)) {
+                    err = "the slot is cut short";
+                    return false;
+                }
+                std::memcpy(&role, data + off, 8);
+                std::memcpy(&cp, data + off + 8, 8);
+                off += 16;
+                if (role >= (uint64_t) kChecks || got[role].pos >= 0 || cp == 0 || cp > (uint64_t) n_pos) {
+                    err = "the slot's checkpoints are damaged";
+                    return false;
+                }
+                Check& c = got[role];
+                c.pos = (int64_t) cp;
+                c.win.resize(L.size());
+                c.comp.resize(L.size() * 2);
+                for (size_t i = 0; i < L.size(); ++i) {
+                    const size_t wb = (size_t) g.win * win_rb(), cb = L[i].c_kv ? (size_t) L[i].ratio * g.hd * 4 : 0;
+                    if (!room(wb + 2 * cb)) {
+                        err = "the slot is cut short";
+                        return false;
+                    }
+                    c.win[i].assign(data + off, data + off + wb);
+                    off += wb;
+                    if (cb > 0) {
+                        c.comp[2 * i].resize(cb / 4);
+                        c.comp[2 * i + 1].resize(cb / 4);
+                        std::memcpy(c.comp[2 * i].data(), data + off, cb);
+                        std::memcpy(c.comp[2 * i + 1].data(), data + off + cb, cb);
+                        off += 2 * cb;
+                    }
+                }
+            }
+        }
+        uint64_t end = 0;
+        if (!room(8)) {
+            err = "the slot is cut short";
+            return false;
+        }
+        std::memcpy(&end, data + off, 8);
+        off += 8;
+        if (end != kSlotMagic) {
+            err = "the slot does not end where it should";
+            return false;
+        }
+        pos = n_pos;
+        toks.swap(toks_in);
+        ctoks.resize((size_t) pos);
+        for (size_t i = 0; i < (size_t) pos; ++i)
+            ctoks[i] = toks[i] < pk.eg_vocab ? pk.eg_map[(size_t) toks[i]] : 0;
+        for (int k = 0; k < kChecks; ++k) ck[k] = std::move(got[k]);   // (the slot's own; the old ones held the state
+                                                               // this one replaced)
+        slot_held = false;
+        ok = true;
+        return true;
+    }
+
+    std::string slot_identity() const {
+        const auto size_of = [](const std::string& p) {
+            std::error_code ec;
+            const auto s = std::filesystem::file_size(p, ec);
+            return ec ? 0ull : (unsigned long long) s;
+        };
+        std::ostringstream id;
+        id << "strata-ds4-session-3 engine=" << STRATA_VERSION << " mtp=" << g.n_mtp << " dim=" << g.dim << " hd=" << g.hd
+           << " win=" << g.win << " ratios=";
+        for (int r : g.ratios) id << r << ",";
+        id << " kv=";
+        for (int v : g.kv_src) id << v << ",";
+        id << " ix=";
+        for (int v : g.ix_src) id << v << ",";
+        id << " ds4.txt:" << size_of(pk.dir + "/ds4.txt") << " engram.bin:" << size_of(pk.dir + "/engram.bin")
+           << " tensors.txt:" << size_of(pk.dir + "/tensors.txt");
+        for (size_t i = 0; i < pk.files.size(); ++i)
+            id << " " << pk.files[i] << ":" << os::file_size(pk.fds[i]);
+        return id.str();
     }
 
     size_t bounce_bytes() const {
@@ -5487,6 +5937,11 @@ struct Model::Impl {
             l.slot[(size_t) sw.in] = l.spare_vram;
             if (!l.zc.empty() && l.zc[(size_t) sw.in]) {   // (VRAM's now: not the store's to compute any more)
                 l.zc[(size_t) sw.in] = 0;
+                if (l.zc_tab != nullptr) {   // (the device's table too: its entry pointed into the slot the store now reuses - when `in` left VRAM later,
+                                             // zc_stage copied whatever lay there, another expert's blob, into the plan)
+                    cudaSetDevice(devs[0].id);
+                    cudaMemsetAsync(l.zc_tab + sw.in, 0, 8, devs[0].st);
+                }
                 store->unmark(l.il, sw.in);
             }
             if (l.nm == 1) set_vm(l, sw.in, l.spare_vram);
@@ -6211,6 +6666,7 @@ struct Model::Impl {
         pos = p0 + keep;
         toks.resize((size_t) pos);
         ctoks.resize((size_t) pos);
+        slot_held = false;
     }
 
     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
@@ -6219,8 +6675,10 @@ struct Model::Impl {
 
     // layer L0 for a chunk of T tokens at p0 as group member mi: layer()'s arithmetic over the chunk's rows (the
     // projections as GEMMs, the attention and the indexer in slabs, the routed experts as sorted rows: the VRAM ones in
-    // place, the CPU lane's streamed in batches)
-    bool layer_chunk(Layer& L0, int mi, int64_t p0, int T, const WinPlan& wp, Streamer& S, std::string& err) {
+    // place, the CPU lane's streamed in batches).  kv_only (a long prompt's first pass, Run::stop): only what the layers
+    // after it read of these rows - its compressed KV and index keys - and nothing of its own attention or experts
+    bool layer_chunk(Layer& L0, int mi, int64_t p0, int T, const WinPlan& wp, Streamer& S, std::string& err,
+                     bool kv_only = false) {
         Layer& l = member(L0, mi);
         Dev& d = devs[(size_t) l.dev];
         Chunk& c = *chunks[(size_t) l.dev];
@@ -6247,40 +6705,45 @@ struct Model::Impl {
                 engram_gate(c.h + (size_t) s0 * H * D, c.eg_kv, l.eg_w, H, D, ns, g.eps, s);
             }
         }
+        prof_mark(d, 4);
         // attention
         if (!hc_mix_chunk(d, c, c.h, l.hca_fn, T, c.mix, err)) return false;
         hc_split(c.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, c.a_pre, c.a_post, c.a_comb, s);
         hc_pre_norm(c.h, c.pre, l.attn_norm, D, H, T, g.eps, c.x, s);
         x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
-        if (!gemm(d, c, l.wq_a, c.x16, D, T, c.qr, g.q_lora, 0.0f, err) ||
-            !gemm(d, c, l.wkv, c.x16, D, T, c.kvr, HD, 0.0f, err))
+        prof_mark(d, 5);
+        if (!kv_only && (!gemm(d, c, l.wq_a, c.x16, D, T, c.qr, g.q_lora, 0.0f, err) ||
+                         !gemm(d, c, l.wkv, c.x16, D, T, c.kvr, HD, 0.0f, err)))
             return false;
         if (l.kv_src && !gemm(d, c, l.c_wkv, c.x16, D, T, c.ckr, HD, 0.0f, err)) return false;
         if (l.kv_src && l.ratio > 1 && !gemm(d, c, l.c_wgate, c.x16, D, T, c.cgr, HD, 0.0f, err)) return false;
-        Finish fq;
-        fq.w = l.q_norm;
-        fq.eps = g.eps;
-        finish(c.qr, T, g.q_lora, g.q_lora, fq, s);
-        x3::rows_f16(c.qr, g.q_lora, nullptr, T, g.q_lora, c.qr16, s);
-        // the window rows: the ring's (positions p0 - win ..) then the chunk's
-        ring_to_ext(l.win, c.ext, p0, g.win, HD, s);
-        Finish fk;
-        fk.w = l.kv_norm;
-        fk.eps = g.eps;
-        fk.rd = g.rd;
-        fk.pos = (int) p0;
-        fk.freqs = freqs;
-        fk.quant = 1;
-        fk.dst = c.ext + (size_t) g.win * HD;
-        fk.dst_stride = HD;
-        finish(c.kvr, T, HD, HD, fk, s);
-        // feed_mark's checkpoint: the ring as it was before row snap_t - the old ring, then the chunk's rows before it
-        const bool snap = wp.snap_t >= 0 && mi == 0 && L0.snap_win != nullptr;
-        if (snap) {
-            CK(cudaMemcpyAsync(L0.snap_win, l.win, (size_t) g.win * win_rb(), cudaMemcpyDeviceToDevice, s));
-            if (wp.snap_t > 0) ext_to_ring(c.ext, L0.snap_win, p0, g.win, wp.snap_t, HD, s, nullptr);
+        prof_mark(d, 6);
+        const bool snap = !kv_only && wp.snap_t >= 0 && mi == 0 && L0.snap_win != nullptr;
+        if (!kv_only) {
+            Finish fq;
+            fq.w = l.q_norm;
+            fq.eps = g.eps;
+            finish(c.qr, T, g.q_lora, g.q_lora, fq, s);
+            x3::rows_f16(c.qr, g.q_lora, nullptr, T, g.q_lora, c.qr16, s);
+            // the window rows: the ring's (positions p0 - win ..) then the chunk's
+            ring_to_ext(l.win, c.ext, p0, g.win, HD, s);
+            Finish fk;
+            fk.w = l.kv_norm;
+            fk.eps = g.eps;
+            fk.rd = g.rd;
+            fk.pos = (int) p0;
+            fk.freqs = freqs;
+            fk.quant = 1;
+            fk.dst = c.ext + (size_t) g.win * HD;
+            fk.dst_stride = HD;
+            finish(c.kvr, T, HD, HD, fk, s);
+            // feed_mark's checkpoint: the ring as it was before row snap_t - the old ring, then the chunk's rows before it
+            if (snap) {
+                CK(cudaMemcpyAsync(L0.snap_win, l.win, (size_t) g.win * win_rb(), cudaMemcpyDeviceToDevice, s));
+                if (wp.snap_t > 0) ext_to_ring(c.ext, L0.snap_win, p0, g.win, wp.snap_t, HD, s, nullptr);
+            }
+            ext_to_ring(c.ext, l.win, p0, g.win, T, HD, s, nullptr);
         }
-        ext_to_ring(c.ext, l.win, p0, g.win, T, HD, s, nullptr);
         const uint8_t* ckv = nullptr;
         const long long ss = (long long) o.max_context + 64;
         if (l.ratio > 0) {
@@ -6328,7 +6791,7 @@ struct Model::Impl {
                     fi.pdst_stride = (long long) ik_rb();
                     finish(c.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
                 }
-                if (clen_max > 0) {
+                if (clen_max > 0 && !kv_only) {
                     if (!gemm_f16w(c, l.i_wproj, g.ix_heads, D, c.x16, D, T,
                                    1.0f / std::sqrt((float) g.ix_hd) / std::sqrt((float) g.ix_heads), c.iw, 64, err))
                         return false;
@@ -6409,6 +6872,8 @@ struct Model::Impl {
             }
             ckv = sr.ckv[(size_t) l.dev];
         }
+        if (kv_only) return true;
+        prof_mark(d, 7);
         // the attention in slabs: q, the sparse attention, wo_a, wo_b (this member's share) into acc
         if (NHL == 0) CK(cudaMemsetAsync(c.acc, 0, (size_t) T * D * sizeof(*c.acc), s));   // (no heads)
         for (int a0 = 0; a0 < T && NHL > 0; a0 += c.A) {
@@ -6420,6 +6885,7 @@ struct Model::Impl {
             fr.vpp = NHL;
             fr.freqs = freqs;
             finish(c.q, na * NHL, HD, HD, fr, s);
+            prof_mark(d, 8);
             AttnRows ar;
             ar.gen = 1;
             ar.p0 = p0;
@@ -6429,6 +6895,7 @@ struct Model::Impl {
             ar.kcap = g.ix_topk;
             sparse_attn(c.q, c.ext, ckv, c.topk + (size_t) a0 * topk_stride(), (int) topk_stride(), ar, l.sink, NHL, HD,
                         na, 1.0f / std::sqrt((float) HD), c.o, s, kKvFp4, 0, &d.attn_scr);   // (a short last slab)
+            prof_mark(d, 9);
             Finish fo;
             fo.rd = g.rd;
             fo.pos = (int) (p0 + a0);
@@ -6466,6 +6933,7 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(l.vs_dev, l.vs_pin, (size_t) l.n_exp * 4, cudaMemcpyHostToDevice, s));   // (this member's)
         moe_sort(c.ridx, T, l.k_exp, l.vs_dev, n_vs, c.bounds, c.row_tok, c.pos, s);
         CK(cudaMemcpyAsync(c.bounds_pin, c.bounds, (size_t) (n_vs + 1) * 4, cudaMemcpyDeviceToHost, s));
+        prof_mark(d, 10);
         // the shared expert into acc while the host waits for the bounds
         if (!gemm(d, c, l.s1, c.x16, D, T, c.sg, FF, 0.0f, err) || !gemm(d, c, l.s3, c.x16, D, T, c.su, FF, 0.0f, err))
             return false;
@@ -6629,7 +7097,39 @@ struct Model::Impl {
         std::vector<int> T;
         std::vector<unsigned> seq;
         int64_t snap_pos = -1;   // feed_mark: the position whose state before it the layers keep (-1: none)
+        // a long prompt's skip (forward_chunks): the cut at row cut_r of chunk cut_k - the chunks before it go through
+        // the layers before `yoco`, that layer as layer_chunk's kv_only and none after it; chunk cut_k's rows before
+        // cut_r the same, its rows from cut_r on and the chunks after it through every layer (yoco -1: no skip)
+        int yoco = -1, cut_k = 0, cut_r = 0;
+        bool runs(int k, int il) const { return yoco < 0 || k >= cut_k || il <= yoco; }
+        bool kv_only(int k, int il) const { return yoco >= 0 && k < cut_k && il == yoco; }
+        int r0(int k, int il) const { return yoco >= 0 && k == cut_k && il >= yoco ? cut_r : 0; }   // the first row
     };
+    // layer L0 over chunk k per a long prompt's skip (Run): its kv_only, or its rows from Run::r0 on - the chunk's
+    // buffers seen from that row (the yoco layer: its kv_only over the rows before it first)
+    bool run_layer(Layer& L0, int mi, int64_t p0, int T, const WinPlan& wp, Streamer& S, std::string& err,
+                   const Run& run, int k, int il) {
+        if (run.kv_only(k, il)) return layer_chunk(L0, mi, p0, T, wp, S, err, true);
+        const int r0 = run.r0(k, il);
+        if (r0 <= 0) return layer_chunk(L0, mi, p0, T, wp, S, err);
+        if (il == run.yoco) {
+            WinPlan w0 = wp;
+            w0.snap_t = -1;
+            if (!layer_chunk(L0, mi, p0, r0, w0, S, err, true)) return false;
+        }
+        Chunk& c = *chunks[(size_t) member(L0, mi).dev];
+        float* const h0 = c.h;
+        float* const pre0 = c.pre;
+        c.h += (size_t) r0 * g.hc * g.dim;
+        c.pre += (size_t) r0 * 8;
+        WinPlan w1 = wp;
+        w1.snap_t = wp.snap_t >= r0 ? wp.snap_t - r0 : -1;
+        const bool ok = layer_chunk(L0, mi, p0 + r0, T - r0, w1, S, err);
+        c.h = h0;
+        c.pre = pre0;
+        return ok;
+    }
+
     // layer-major (c.lm: a run of several chunks, device di every trunk layer, the flow set up by run_dev_chunks):
     // layer after layer, each through all the chunks in order - a chunk's state to host memory after each of its
     // layers and back before the next - so a layer's experts are read from the files once for the whole run (the
@@ -6647,7 +7147,8 @@ struct Model::Impl {
         std::vector<std::pair<int, int>> egu;   // (Engram layer, chunk)
         for (int il : c.fl_layers)
             if (L[(size_t) il].eg >= 0)
-                for (int k = 0; k < nk; ++k) egu.push_back({L[(size_t) il].eg, k});
+                for (int k = 0; k < nk; ++k)
+                    if (run.runs(k, il)) egu.push_back({L[(size_t) il].eg, k});
         const size_t eg_per = (size_t) (pk.eg_ngram - 1) * pk.eg_heads * (pk.eg_hd + pk.eg_hd / 32);
         auto read_eg = [this, &c, &run, &egu, eg_per](size_t u) {
             if (u >= 2) cudaEventSynchronize(c.eg_ev[u % 2]);
@@ -6662,6 +7163,7 @@ struct Model::Impl {
             Layer& L0 = L[(size_t) il];
             const bool last_l = li + 1 == c.fl_layers.size();
             for (int k = 0; k < nk; ++k) {
+                if (!run.runs(k, il)) continue;   // (a skipped early chunk: nothing after the yoco layer)
                 const int64_t p0 = run.p0[(size_t) k];
                 const int T = run.T[(size_t) k], slot = k % 2;
                 const bool last_k = k + 1 == nk;
@@ -6703,8 +7205,10 @@ struct Model::Impl {
                                              (size_t) nr, cudaMemcpyDeviceToHost, s));
                     }
                 }
-                if (!layer_chunk(L0, 0, p0, T, wp, S, err)) return false;
+                const bool kvo = run.kv_only(k, il);
+                if (!run_layer(L0, 0, p0, T, wp, S, err, run, k, il)) return false;
                 if (dump_l != nullptr) dump_layer(d, c.h, il, p0, T);
+                if (kvo) continue;   // (no layer after it reads this chunk's state)
                 if (!last_l) {   // the chunk's state kept for the next layer
                     const Xfer x = chunk_xfer(c.lm_state + (size_t) k * hb, c, T, true);
                     for (int i = 0; i < x.n; ++i)
@@ -6756,6 +7260,9 @@ struct Model::Impl {
                 for (int m = 0; m < L[(size_t) il].nm; ++m)
                     if (member(L[(size_t) il], m).dev == di) c.fl_layers.push_back(il);
             c.fl_T = run.T;
+            c.fl_yoco = run.yoco;
+            c.fl_cut_k = run.cut_k;
+            c.fl_cut_r = run.cut_r;
             c.spec_k = c.spec_il = -1;
             c.wait_ms = 0;
             c.it_file = c.it_ram = c.it_spec = c.it_spec_unused = c.it_lc = 0;
@@ -6772,6 +7279,7 @@ struct Model::Impl {
         }
         for (int k = 0; k < nk && !c.flow; ++k)
             for (int il = 0; il < g.nl; ++il) {
+                if (!run.runs(k, il) || run.kv_only(k, il)) continue;   // (a long prompt's skip: no experts there)
                 const Layer& L0 = L[(size_t) il];
                 bool here = false;
                 for (int m = 0; m < L0.nm; ++m) here = here || member(L0, m).dev == di;
@@ -6827,7 +7335,7 @@ struct Model::Impl {
             wp.snap_t = run.snap_pos >= p0 && run.snap_pos < p0 + T ? (int) (run.snap_pos - p0) : -1;
             bool started = false;
             std::vector<char> got(srcs.size(), 0);
-            for (int il = 0; il < g.nl; ++il) {
+            for (int il = 0; il < g.nl && run.runs(k, il); ++il) {
                 Layer& L0 = L[(size_t) il];
                 int mi = -1;
                 for (int m = 0; m < L0.nm; ++m)
@@ -6882,7 +7390,7 @@ struct Model::Impl {
                                              (size_t) nr, cudaMemcpyDeviceToHost, s));
                     }
                 }
-                if (!layer_chunk(L0, mi, p0, T, wp, S, err)) return false;
+                if (!run_layer(L0, mi, p0, T, wp, S, err, run, k, il)) return false;
                 if (dump_l != nullptr && mi == 0) dump_layer(d, c.h, il, p0, T);
                 const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
                 if (last && mi == 0 && il + 1 < g.nl) {   // the hand-off, once the next group took the chunk before last
@@ -7267,6 +7775,33 @@ struct Model::Impl {
         }
     }
 
+    // the first layer of a long prompt's second half (forward_chunks' two passes), or -1: the first with compress ratio 1
+    // (V4.1: 20), every one after it ratio 1 too and owning no compressed KV or index keys of its own (they read its),
+    // every trunk layer on one GPU.  The settings' MAYA_DS4_PROMPT_SKIP (STRATA_DS4_PROMPT_SKIP; DS4_YOCO for tests):
+    // 1 (the default) the skip, 2 DeepSeek's own serving's (the last 128 rows only: faster, the answers shift a
+    // little), 0 off
+    static int yoco_mode() {
+        static const int m = [] {
+            const char* v = std::getenv("DS4_YOCO");
+            if (v == nullptr) v = std::getenv("STRATA_DS4_PROMPT_SKIP");
+            return v != nullptr ? std::atoi(v) : 1;
+        }();
+        return m;
+    }
+    int yoco_layer() const {
+        if (yoco_mode() == 0 || chunk <= 0 || g.nl < 2 || (int) g.ratios.size() < g.nl) return -1;
+        int yl = -1;
+        for (int il = 0; il < g.nl && yl < 0; ++il)
+            if (g.ratios[(size_t) il] == 1) yl = il;
+        if (yl <= 0 || !L[(size_t) yl].kv_src) return -1;
+        for (int il = 0; il < g.nl; ++il) {
+            const Layer& l = L[(size_t) il];
+            if (l.nm != 1 || l.dev != L[0].dev) return -1;
+            if (il > yl && (g.ratios[(size_t) il] != 1 || l.kv_src)) return -1;
+        }
+        return yl;
+    }
+
     // n tokens at positions pos .. in chunks of equal size (at most `chunk`), pipelined over the groups; the logits of
     // the last min(logits_rows, 16) rows (logits_rows > 16: a run of one chunk, every row's into chunk_logits)
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1) {
@@ -7280,12 +7815,33 @@ struct Model::Impl {
                 err = "token " + std::to_string(tk[t]) + " out of range";
                 return false;
             }
+        // a long prompt's skip: the layers from yoco_layer() on (V4.1: 20-39) read the earlier positions only through
+        // that layer's compressed KV and index keys, and each looks back one window (win - 1 positions) more than the
+        // layer before - so they need their own work only on the last keep = (nl - yoco) (win - 1) + win rows for the
+        // run's last rows and the rings the decode reads to be what the full work gives (up to the experts' summing
+        // order).  The chunks stay as they are: the ones before the cut go through the layers before yoco and its
+        // kv_only, the cut's chunk through those over all its rows and through the rest from the cut on (Run::r0, a
+        // view of its buffers), the chunks after it through every layer - each layer's experts read as without the
+        // skip.  One GPU (DS4_YOCO=1; 0: off); not with every row's logits (tests)
+        const int yl = logits_rows > kWin ? -1 : yoco_layer();
+        // (DS4_YOCO_KEEP=<rows>: fewer - DeepSeek's own serving replays the last 128 tokens through those layers
+        //  (DeepInfer's "SWA bounded replay"), which shifts the answers a little; at least one window)
+        static const int keep_env = std::getenv("DS4_YOCO_KEEP") ? std::atoi(std::getenv("DS4_YOCO_KEEP")) : 0;
+        const int keep = yl <= 0 ? 0
+                         : keep_env > 0 ? std::max(keep_env, g.win)
+                         : yoco_mode() == 2 ? g.win : (g.nl - yl) * (g.win - 1) + g.win;
+        const int a = yl > 0 && n - keep >= kYocoMin ? n - keep : 0;
         const int nc = (n + chunk - 1) / chunk, per = (n + nc - 1) / nc;
         Run run;
-        for (int a = 0; a < n; a += per) {
-            run.p0.push_back(pos + a);
-            run.T.push_back(std::min(per, n - a));
+        for (int x = 0; x < n; x += per) {
+            run.p0.push_back(pos + x);
+            run.T.push_back(std::min(per, n - x));
             run.seq.push_back(++win_seq);
+        }
+        if (a > 0) {
+            run.yoco = yl;
+            run.cut_k = a / per;
+            run.cut_r = a - run.cut_k * per;
         }
         logits_all = logits_rows > kWin;
         if (logits_all) chunk_logits.resize((size_t) n * g.vocab);
@@ -7373,6 +7929,52 @@ struct Model::Impl {
                          "ds4 prompt GPU time, %d tokens: attention %.0f ms, routing + shared expert %.0f ms, experts %.0f ms "
                          "(with the waits for streamed ones), between layers %.0f ms\n",
                          n, cprof_ms[1], cprof_ms[2], cprof_ms[3], cprof_ms[0]);
+            {   // the finer table (ms, % of the sum)
+                static const char* nm_[16] = {"between layers", "attn rest (q_b, wo_a/b, hc_post)", "shared expert", "experts (incl waits)",
+                                              "engram", "attn mHC (mix/split/norm)", "attn projections", "compressor + indexer",
+                                              "q_b + rope", "sparse attention", "ffn mHC + router + sort", "", "", "", "", ""};
+                double sum = 0;
+                for (double v : cprof_ms) sum += v;
+                for (int i = 0; i < 11; ++i)
+                    std::fprintf(stderr, "ds4 prof  %-34s %9.1f ms %5.1f%%\n", nm_[i], cprof_ms[i], sum > 0 ? 100.0 * cprof_ms[i] / sum : 0.0);
+                struct Agg {
+                    double ms = 0, flops = 0;
+                    long calls = 0, rows = 0, experts = 0;
+                };
+                std::map<std::pair<int, int>, Agg> agg;   // (type, role 0 gate+up, 1 down)
+                {
+                    std::lock_guard<std::mutex> lk(prof_mu);
+                    for (const EkMark& m : ek_marks) {
+                        float a = 0, b = 0;
+                        cudaSetDevice(m.dev);
+                        cudaEventElapsedTime(&a, m.e0, m.e1);
+                        cudaEventElapsedTime(&b, m.e1, m.e2);
+                        Agg& x = agg[{m.tg, 0}];
+                        x.ms += a;
+                        x.flops += 2.0 * 2.0 * m.nrows * (double) g.dim * (double) m.ff;
+                        x.calls++, x.rows += m.nrows, x.experts += m.nexp;
+                        Agg& y = agg[{m.td, 1}];
+                        y.ms += b;
+                        y.flops += 2.0 * m.nrows * (double) g.dim * (double) m.ff;
+                        y.calls++, y.rows += m.nrows, y.experts += m.nexp;
+                        ek_pool[m.dev].push_back(m.e0);
+                        ek_pool[m.dev].push_back(m.e1);
+                        ek_pool[m.dev].push_back(m.e2);
+                    }
+                    ek_marks.clear();
+                }
+                double tot = 0;
+                for (auto& kv : agg) tot += kv.second.ms;
+                for (auto& kv : agg)
+                    std::fprintf(stderr,
+                                 "ds4 prof  expert kernels type %-8s %-7s %9.1f ms  calls %5ld  experts %6ld (%.1f us each, %.1f a call)  rows/expert %6.1f  ~%5.1f TFLOPS\n",
+                                 gg::iq::name(kv.first.first), kv.first.second ? "down" : "gate+up", kv.second.ms, kv.second.calls,
+                                 kv.second.experts, kv.second.experts > 0 ? 1e3 * kv.second.ms / (double) kv.second.experts : 0.0,
+                                 kv.second.calls > 0 ? (double) kv.second.experts / (double) kv.second.calls : 0.0,
+                                 kv.second.experts > 0 ? (double) kv.second.rows / (double) kv.second.experts : 0.0,
+                                 kv.second.ms > 0 ? kv.second.flops / kv.second.ms / 1e9 : 0.0);
+                std::fprintf(stderr, "ds4 prof  expert kernels total %.1f ms\n", tot);
+            }
             for (double& v : cprof_ms) v = 0;
             prof_chunk = false;
         }
@@ -7583,6 +8185,7 @@ struct Model::Impl {
                 return false;
             }
         const int64_t p0 = pos;
+        slot_held = false;   // (the state grows now: what slot_save took is no longer the conversation)
         for (int t = 0; t < T; ++t) {
             toks.push_back(tk[t]);
             ctoks.push_back(ctok(pos + t, tk[t]));
@@ -8404,7 +9007,14 @@ const std::vector<int32_t>& Model::tokens() const { return p_->toks; }
 void Model::reset() { p_->reset(); }
 void Model::checkpoint(int slot) { p_->checkpoint(slot); }
 bool Model::restore(int64_t limit) { return p_->restore(limit); }
+void Model::pin() { p_->pin(); }
+std::vector<int64_t> Model::check_positions() const { return p_->check_positions(); }
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
+uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err) { return p_->slot_save(out, err); }
+bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
+    return p_->slot_load(data, bytes, n_pos, err);
+}
+std::string Model::slot_identity() const { return p_->slot_identity(); }
 void Model::save_profile() const { p_->save_profile(); }
 const Stats& Model::stats() const {
     Stats& st = p_->st;
