@@ -453,8 +453,10 @@ class Runner:
                  cancel: threading.Event | None = None, feed: str | None = None, python: str | None = None,
                  components_dir: str | None = None, hardware: dict | None = None,
                  confirm: Callable[[str, str], bool] | None = None, assume_yes: bool = False, move_data: bool = False,
-                 retune: bool = False, restart: bool = False, confirm_restart: Callable[[str, str], bool] | None = None):
+                 retune: bool = False, restart: bool = False, confirm_restart: Callable[[str, str], bool] | None = None,
+                 after_check: Callable[[], None] | None = None):
         self.s = s
+        self.after_check = after_check        # called once when nothing blocks the launch (no server, the same one, or "Restart" was answered): the screens save the preset then
         self.restart = restart                # --restart: a server that serves other choices (or holds this port) is stopped and replaced without asking
         self.confirm_restart = confirm_restart  # the screens: asked (question, detail) once; True = restart. None (no screens) and no --restart: refuse in one line
         self._stop_first: list[str] = []      # other launch profiles that hold this port; stopped before the measuring and the start
@@ -1322,6 +1324,17 @@ class Runner:
             out.append({"profile": pid, "name": pid[7:], "port": port, "choices": self._saved_choices(pid)})
         return out
 
+    def running_phrase(self, row: dict) -> str:
+        """`Gyro-S is running on port 8080 with 32K` for the restart question."""
+        c = row.get("choices") or {}
+        title = None
+        try:
+            title = next((r.title for r in self.catalog.rows() if r.family == c.get("family") and r.model == c.get("model")), None)
+        except Exception:                                    # noqa: BLE001
+            title = None
+        title = title or ("Your model files" if c.get("model_path") else row["name"])
+        return f"{title} is running on port {row['port']}" + (f" with {S.context_label(c['context'])}" if c.get("context") else "")
+
     @staticmethod
     def describe_running(row: dict) -> str:
         c = row.get("choices") or {}
@@ -1340,11 +1353,13 @@ class Runner:
         runs beside the others (the person asked for two), with a warning about graphics memory."""
         running = self.serving_launches()
         if not running:
+            self.checked()
             return None
         own = next((r for r in running if r["profile"] == self.profile), None)
         same_port = [r for r in running if r["profile"] != self.profile and r["port"] == int(self.s.port)]
         beside = [r for r in running if r["profile"] != self.profile and r["port"] != int(self.s.port)]
         if own and not self.retune and not same_port and own["choices"] == self.choices() and own["port"] == int(self.s.port):
+            self.checked()
             self.config_path = launch_dir() / f"{self.name}.json"
             urls = acc.urls_for(self.s, tunnel_url=(acc.tunnel_info(self.profile) or {}).get("url"))
             self.emit("done", "Already serving these choices; nothing was restarted.", 100, urls=urls)
@@ -1354,17 +1369,24 @@ class Runner:
                                 "the new one can fail to start. Stop the first with `strata launch --stop` if it does.")
         blocking = ([own] if own and not self.retune else []) + same_port
         if not blocking:
+            self.checked()
             return None
         what = "; ".join(self.describe_running(r) for r in blocking)
         if not self.restart:
             if self.confirm_restart is not None:
-                if not self.confirm_restart("Restart the model with these settings?", "Answers in progress stop."):
+                if not self.confirm_restart(f"{self.running_phrase(blocking[0])}. Restart it with these settings?", "Answers in progress stop."):
                     raise LaunchError("Left as it is: the running model keeps serving.", "", 130)
             else:
                 raise LaunchError(f"A model is already running: {what}. These choices are different.",
                                   "Add --restart to stop it and start these, or run `strata launch --stop` first.", 6)
         self._stop_first = [r["profile"] for r in same_port]
+        self.checked()
         return None
+
+    def checked(self) -> None:
+        cb, self.after_check = self.after_check, None
+        if cb is not None:
+            cb()
 
     def stop_others(self) -> None:
         """Stop the other launch servers that hold this port, so the new one gets it (no "port already in use")."""

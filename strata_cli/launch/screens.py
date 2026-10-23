@@ -1525,10 +1525,15 @@ class SaveScreen(Base):
         s.name = name
         if choice in ("save", "save_launch"):
             try:
-                store.save(s, name)
+                if choice == "save":
+                    store.save(s, name)
+                else:
+                    store.check_name(name)                   # saved by the run once the restart question (if any) is answered "Restart"
             except store.PresetError as e:
                 self.say(str(e), True)
                 return
+            if choice == "save_launch":
+                self.ctx.pending_save = name
         if choice == "save":
             self.app.exit(None)
             self.app.stopped_after_save = True       # type: ignore[attr-defined]

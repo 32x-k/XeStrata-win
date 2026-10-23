@@ -45,6 +45,7 @@ class Ctx:
     move_data: bool = False
     retune: bool = False
     restart: bool = False
+    pending_save: str | None = None          # the preset name "Save as a preset and launch" saves once nothing blocks the launch
     notes: list[str] = field(default_factory=list)
     start_own_files: bool = False
     picked_in_list: bool = False
@@ -275,7 +276,7 @@ class LaunchApp(App):
         self.cancel = threading.Event()
         self.runner = Runner(s, catalog=self.ctx.catalog, emit=self._emit, cancel=self.cancel, feed=self.ctx.feed, confirm=self._ask_from_run,
                              move_data=self.ctx.move_data, retune=self.ctx.retune, restart=self.ctx.restart,
-                             confirm_restart=self._ask_restart)
+                             confirm_restart=self._ask_restart, after_check=self._save_pending)
         gb = getattr(self.runner, "download_gb", lambda: 0.0)() if not confirmed else 0.0
         if gb >= 1.0:
             free = self.ctx.catalog.disk_free(s.data_dir or self.ctx.catalog.data_dir())
@@ -298,6 +299,14 @@ class LaunchApp(App):
         self.show(screen)
         self.running = True
         threading.Thread(target=self._work, daemon=True).start()
+
+    def _save_pending(self) -> None:
+        name, self.ctx.pending_save = self.ctx.pending_save, None
+        if name:
+            try:
+                store.save(self.ctx.settings, name)
+            except store.PresetError:
+                pass
 
     def _ask_restart(self, title: str, text: str) -> bool:
         """Another model is serving other choices: ask once, in the same pop-up, whether to restart it. Cancel leaves it running."""
@@ -349,6 +358,7 @@ class LaunchApp(App):
             self.call_from_thread(screen.on_failure, f"Something unexpected went wrong: {type(e).__name__}: {e}")
             return
         self.running = False
+        self._save_pending()                         # a runner that never asked (nothing was running) still saves what was chosen
         s = self.ctx.settings
         try:
             if s.name and store.load(s.name, missing_ok=True) is not None:

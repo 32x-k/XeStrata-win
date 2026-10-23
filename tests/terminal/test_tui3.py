@@ -139,5 +139,87 @@ class FolderChangeMovesNothing(unittest.TestCase):
         self.assertNotIn("are moved into this folder when you start", src)
 
 
+class SaveWaitsForRestartAnswer(unittest.TestCase):
+    """Save as a preset and launch: nothing is saved before the restart question is answered Restart."""
+
+    def _runner(self, **kw):
+        s = S.LaunchSettings(family="qwen", model="IQ3_XXS", context=32768, name="gyro")
+        return Runner(s, catalog=catalog(), **kw)
+
+    def setUp(self):
+        self.home = Home().__enter__()
+        self.addCleanup(self.home.__exit__, None, None, None)
+        p = mock.patch.object(Catalog, "hardware", lambda self, fresh=False: dict(HW_12, disk_free_gb=500.0))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def rows(self, r):
+        return [{"profile": "launch-gyro", "name": "gyro", "port": 8080,
+                 "choices": {**r.choices(), "context": 65536, "family": "qwen", "model": "IQ3_XXS"}}]
+
+    def test_cancel_saves_nothing_and_the_question_names_the_running_model(self):
+        saved, asked = [], []
+        r = self._runner(confirm_restart=lambda q, d: asked.append((q, d)) or False, after_check=lambda: saved.append(1))
+        with mock.patch.object(Runner, "serving_launches", lambda self: self.rows_):
+            Runner.rows_ = self.rows(r)
+            with self.assertRaises(LaunchError):
+                r.run()
+        self.assertEqual(saved, [])
+        self.assertIn("is running on port 8080 with 64K. Restart it with these settings?", asked[0][0])
+        self.assertIn("IQ3_XXS", asked[0][0])
+        self.assertEqual(asked[0][1], "Answers in progress stop.")
+
+    def test_restart_saves_after_the_answer(self):
+        order = []
+        r = self._runner(confirm_restart=lambda q, d: order.append("asked") or True, after_check=lambda: order.append("saved"))
+        Runner.rows_ = self.rows(r)
+        with mock.patch.object(Runner, "serving_launches", lambda self: self.rows_),              mock.patch.object(Runner, "ensure_engine", side_effect=RuntimeError("went on")):
+            with self.assertRaises(RuntimeError):
+                r.run()
+        self.assertEqual(order, ["asked", "saved"])
+
+    def test_nothing_running_saves_at_once(self):
+        saved = []
+        r = self._runner(after_check=lambda: saved.append(1))
+        with mock.patch.object(Runner, "serving_launches", lambda self: []),              mock.patch.object(Runner, "ensure_engine", side_effect=RuntimeError("went on")):
+            with self.assertRaises(RuntimeError):
+                r.run()
+        self.assertEqual(saved, [1])
+
+    def test_the_save_screen_no_longer_writes_the_preset_itself(self):
+        import asyncio
+        from strata_cli.launch import store
+        from tests.terminal.test_launch_tui import Base, FakeRunner, press, make_ctx
+        from strata_cli.launch.app import LaunchApp
+
+        class Case(Base):
+            def runTest(self):
+                pass
+
+        case = Case()
+        case.setUp()
+        self.addCleanup(case.tearDown)
+        seen = {}
+
+        class Holding(FakeRunner):
+            def run(self, start=True):
+                seen["presets_during_run"] = [p.name for p in store.list_presets()]
+                return super().run(start)
+
+        with mock.patch("strata_cli.launch.app.Runner", Holding):
+            async def go():
+                app = LaunchApp(make_ctx())
+                async with app.run_test(size=(110, 34)) as pilot:
+                    await pilot.pause(0.2)
+                    await press(pilot, *("enter",) * 7, "n", "enter")
+                    self.assertEqual(store.list_presets(), [])           # still nothing on the Save screen
+                    await press(pilot, "enter")
+                    await pilot.pause(0.8)
+                    return [p.name for p in store.list_presets()]
+            after = asyncio.run(go())
+        self.assertEqual(seen["presets_during_run"], [])               # not saved before the runner's check
+        self.assertEqual(after, ["IQ3_S 32K"])                          # saved once the run went on
+
+
 if __name__ == "__main__":
     unittest.main()

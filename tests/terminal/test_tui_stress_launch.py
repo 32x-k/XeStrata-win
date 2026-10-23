@@ -69,7 +69,9 @@ class SecondLaunchTests(unittest.TestCase):
              mock.patch("strata_control.runtime.stop") as stop:
             with self.assertRaises(LaunchError) as cm:
                 r.run()
-        self.assertEqual(asked, [("Restart the model with these settings?", "Answers in progress stop.")])
+        self.assertEqual(len(asked), 1)
+        self.assertIn("Restart it with these settings?", asked[0][0])
+        self.assertEqual(asked[0][1], "Answers in progress stop.")
         self.assertEqual(cm.exception.code, 130)
         stop.assert_not_called()
 
