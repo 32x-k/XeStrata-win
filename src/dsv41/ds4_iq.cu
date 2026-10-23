@@ -515,8 +515,13 @@ template <int T, bool F = true> constexpr int kTabWords = F && Fast<T>::WORDS > 
 
 // Persistent grids (blocks looping over work items) only for the types with a codebook worth keeping in the block (8 KiB and
 // more); the others run a block (tile, group) as before - their blocks leave at once when the group is empty.
+#if defined(STRATA_USE_HIP)
+template <int T>
+constexpr bool kPersist = false;   // (HIP keeps the release grids)
+#else
 template <int T>
 constexpr bool kPersist = kTabWords<T> * 4 >= 8192;
+#endif
 
 template <int T, bool F = true>
 __device__ __forceinline__ void load_tab_fast(uint32_t* tab) {
