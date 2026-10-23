@@ -161,7 +161,8 @@ static void bits(const char* what, int type, const void* p, size_t bytes) {
     }
 }
 // the real shapes (n_embd 5120, n_ff 2304): the plan path (6 groups of one entry) and the grouped path (windows of 3 and 2)
-static void real_shape_bits(int type, std::mt19937_64& rng) {
+static void real_shape_bits(int type) {
+    std::mt19937_64 rng(1000 + type);   // (its own stream: the main loop's random experts are the same with or without this)
     const int E = 5120, FF = 2304, NG = 2, NEnt = 5;
     const size_t rb_g = iq::row_bytes(type, E), rb_d = iq::row_bytes(type, FF);
     auto al = [](size_t n) { return (n + 255) / 256 * 256; };
@@ -222,19 +223,24 @@ static void bench_big(int type, int mib) {
     for (int r = 0; r < 3; ++r) a.tr[r] = off[r];
     float *dh, *dp; CK(hipMalloc(&dh, (size_t) NE * FF * 4)); CK(hipMalloc(&dp, (size_t) NE * E * 4)); a.h = dh; a.part = dp;
     hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
-    const int REPS = 3 * L;
     double us[2] = {0, 0};
     for (int part = 0; part < 2; ++part) {
-        for (int pass = 0; pass < 2; ++pass) {   // pass 0 warms up
+        auto run = [&](int reps) {
             hipEventRecord(e0);
-            for (int rep = 0; rep < REPS; ++rep) {
+            for (int rep = 0; rep < reps; ++rep) {
                 a.plan_ptr = dplan + (size_t) (rep % L) * NE;
                 if (part == 0) iq::gate_up(a, NE, 1, 0); else iq::down(a, NE, 1, 0);
             }
             hipEventRecord(e1); hipEventSynchronize(e1);
             float ms; hipEventElapsedTime(&ms, e0, e1);
-            if (pass) us[part] = ms * 1e3 / REPS;
-        }
+            return (double) ms;
+        };
+        double ms = 0; int reps = 2 * L;
+        while (ms < 300.0) { ms = run(reps); reps *= 2; }   // warm-up: clocks ramp, ~300 ms
+        const int n = std::max(L, (int) (reps / 2 * 40.0 / ms));   // ~40 ms a window
+        double best = 1e30;
+        for (int w = 0; w < 7; ++w) best = std::min(best, run(n) * 1e3 / n);   // the best of 7 windows (clocks/thermals wander)
+        us[part] = best;
     }
     const double bg = (double) NE * (off[2]) , bd = (double) NE * al((size_t) E * rb_d);   // bytes read a launch
     std::printf("big %-7s ws %4.0f MiB: gate/up %6.1f us (%5.0f GB/s)  down %6.1f us (%5.0f GB/s)  layer %6.1f us -> %5.0f GB/s, %.2f Tw/s\n",
@@ -381,7 +387,7 @@ int main(int argc, char** argv) {
             CK(hipDeviceSynchronize());
             const auto y = down_(dy, (size_t) NR * E);
             bits("set y", type, y.data(), y.size() * 4);
-            real_shape_bits(type, rng);
+            real_shape_bits(type);
             w2 = 0;
             for (int e = 0; e < 3; ++e)
                 for (int lr = bounds[e]; lr < bounds[e + 1]; ++lr) {
