@@ -4729,7 +4729,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     if not (eng / EXE).exists():
         fail("the ready-made engine archive has no " + EXE)
     if not WIN:
-        for x in (EXE, VEXE):
+        for x in (EXE, VEXE, "strata-dsv41"):
             if (eng / x).exists():
                 (eng / x).chmod(0o755)
     ok(f"ready-made engine {meta.get('version', '')} for {', '.join('sm_' + str(a) for a in archs)} (CUDA "
@@ -7288,6 +7288,11 @@ def dsv41_exe(eng: Path) -> Path | None:
     if own:
         return Path(own) if Path(own).is_file() else None
     exe = Path(eng) / ("strata-dsv41.exe" if WIN else "strata-dsv41")
+    if exe.is_file() and not WIN and not os.access(exe, os.X_OK):      # a package copied without its modes (scp / tar from Windows): fix it, do not stop
+        try:
+            exe.chmod(0o755)
+        except OSError:
+            pass
     return exe if exe.is_file() else None
 
 
