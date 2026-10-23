@@ -213,8 +213,11 @@ class Install(unittest.TestCase):
     def test_no_engine_stops_before_the_download(self):
         rc, out = self.install(engine=False)
         self.assertEqual(rc, 1, out)
-        self.assertIn("no DeepSeek-V4.1 engine (strata-dsv41)", out)
-        self.assertIn("nothing has been downloaded", out)
+        self.assertIn("DeepSeek's engine is not available for this computer yet", out)
+        self.assertIn("RTX 30", out)
+        self.assertNotIn("cmake", out)
+        self.assertNotIn("STRATA_DSV41_EXE", out)
+        self.assertIn("Nothing has been downloaded", out)
         self.assertFalse([c for c in self.calls if c[0] == "get"])
 
     def test_own_files_are_checked_not_downloaded(self):

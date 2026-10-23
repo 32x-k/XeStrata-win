@@ -7925,9 +7925,11 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     if exe is not None and exe.parent != Path(eng):
         lib_dirs = [*lib_dirs, str(exe.parent)]            # its own package carries the libraries it needs
     if exe is None:
-        fail(f"this engine ({meta.get('version')}) has no DeepSeek-V4.1 engine (strata-dsv41) yet",
-             "update Strata, or compile it with cmake -DSTRATA_BUILD_DSV41=ON and point STRATA_DSV41_EXE at it, then run setup again "
-             "(nothing has been downloaded)")
+        if os.environ.get("STRATA_VERBOSE") == "1" or "--verbose" in sys.argv:
+            say("  Details for developers: build it with cmake -DSTRATA_BUILD_DSV41=ON and point STRATA_DSV41_EXE at it.")
+        fail("DeepSeek's engine is not available for this computer yet",
+             "Supported graphics cards: NVIDIA RTX 30 and RTX 50 series, and the Radeon AI PRO R9700. Update Strata later (a newer version may add "
+             "your card), or pick another model. Nothing has been downloaded.")
     ok(f"engine: {exe}")
 
     step(5, f"downloading {fam['title']} {model}")
@@ -8464,7 +8466,9 @@ def main() -> int:
             a.gpus = ",".join(str(i) for i in order)
         else:
             a.gpu = order[0]
-    say("Strata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
+    say("Strata - " + (MULTI_FILE_FAMILIES[a.family]["title"] if a.family in MULTI_FILE_FAMILIES else
+                       OWN_PATH_FAMILIES[a.family]["title"] if a.family in OWN_PATH_FAMILIES else "Qwen3.8-Flash-Next")
+        + " on a normal PC (a GPU + system RAM + CPU)")
     have = installed_configs()
     # A plain start of an installed model finds everything where it already is: it creates, moves and copies nothing
     # (the model paths are in the run config; the data folder is the one settings.json remembers).  Setting up, checking,
