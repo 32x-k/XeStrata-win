@@ -163,7 +163,7 @@ static void bits(const char* what, int type, const void* p, size_t bytes) {
 // the real shapes (n_embd 5120, n_ff 2304): the plan path (6 groups of one entry) and the grouped path (windows of 3 and 2)
 static void real_shape_bits(int type) {
     std::mt19937_64 rng(1000 + type);   // (its own stream: the main loop's random experts are the same with or without this)
-    const int E = 5120, FF = 2304, NG = 2, NEnt = 5;
+    const int E = 5120, FF = 2304, NG = 2, NEnt = 12;
     const size_t rb_g = iq::row_bytes(type, E), rb_d = iq::row_bytes(type, FF);
     auto al = [](size_t n) { return (n + 255) / 256 * 256; };
     const size_t off[3] = {0, al(FF * rb_g), al(FF * rb_g) * 2}, blob = off[2] + al((size_t) E * rb_d);
@@ -176,7 +176,7 @@ static void real_shape_bits(int type) {
         else std::memcpy(p, &d, 2);
     }
     uint8_t* dblob = up(hb);
-    std::vector<int8_t> xq(E), hq((size_t) NEnt * FF); std::vector<float> xd(E / 32), hd((size_t) NEnt * FF / 32);
+    std::vector<int8_t> xq(2 * E), hq((size_t) NEnt * FF); std::vector<float> xd(2 * E / 32), hd((size_t) NEnt * FF / 32);
     for (auto& v : xq) v = (int8_t) ((int) (rng() % 255) - 127);
     for (auto& v : hq) v = (int8_t) ((int) (rng() % 255) - 127);
     for (auto& v : xd) v = 0.002f + 0.0001f * (float) (rng() % 100);
@@ -198,6 +198,24 @@ static void real_shape_bits(int type) {
     if (!iq::gate_up(a, NG, 3, 0) || !iq::down(a, NG, 3, 0)) { std::printf("real shape grouped: refused\n"); return; }
     CK(hipDeviceSynchronize());
     { auto h = down_(dh, (size_t) NEnt * FF); bits("real grp h", type, h.data(), h.size() * 4); auto p = down_(dp, (size_t) NEnt * E); bits("real grp part", type, p.data(), p.size() * 4); }
+    // more windows: a bound of 7 groups with 3 live (dynamic count), 5/1/3 entries (ne_max 5: the 8-entry kernels), then 9 groups of
+    // one entry with 4 live; entries index the h/hq rows, their input row is entry >> 3
+    {
+        std::vector<unsigned long long> gp2 = {(unsigned long long) dblob, (unsigned long long) (dblob + blob), (unsigned long long) dblob, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull};
+        std::vector<int> gs2 = {0, 5, 6, 9, 9, 9, 9, 9, 9, 9}, ge2 = {3, 1, 4, 0, 2, 7, 5, 6, 8, 11, 10, 9}, ng2 = {3};
+        a.grp_ptr = up(gp2); a.grp_start = up(gs2); a.grp_ent = up(ge2); a.n_groups = up(ng2);
+        CK(hipMemset(dh, 0, (size_t) NEnt * FF * 4)); CK(hipMemset(dp, 0, (size_t) NEnt * E * 4));
+        if (!iq::gate_up(a, 7, 5, 0) || !iq::down(a, 7, 5, 0)) { std::printf("real shape window 2: refused\n"); return; }
+        CK(hipDeviceSynchronize());
+        { auto h = down_(dh, (size_t) NEnt * FF); bits("real win2 h", type, h.data(), h.size() * 4); auto p = down_(dp, (size_t) NEnt * E); bits("real win2 part", type, p.data(), p.size() * 4); }
+        std::vector<int> gs3 = {0, 1, 2, 3, 4, 4, 4, 4, 4, 4}, ng3 = {4};
+        std::vector<unsigned long long> gp3 = {(unsigned long long) (dblob + blob), (unsigned long long) dblob, (unsigned long long) (dblob + blob), (unsigned long long) dblob, 0ull, 0ull, 0ull, 0ull, 0ull};
+        a.grp_ptr = up(gp3); a.grp_start = up(gs3); a.n_groups = up(ng3);
+        CK(hipMemset(dh, 0, (size_t) NEnt * FF * 4)); CK(hipMemset(dp, 0, (size_t) NEnt * E * 4));
+        if (!iq::gate_up(a, 9, 1, 0) || !iq::down(a, 9, 1, 0)) { std::printf("real shape window 3: refused\n"); return; }
+        CK(hipDeviceSynchronize());
+        { auto h = down_(dh, (size_t) NEnt * FF); bits("real win3 h", type, h.data(), h.size() * 4); auto p = down_(dp, (size_t) NEnt * E); bits("real win3 part", type, p.data(), p.size() * 4); }
+    }
     CK(hipFree(dblob));
 }
 
@@ -214,22 +232,29 @@ static void bench_big(int type, int mib) {
     for (auto& b : one) b = (uint8_t) rng();
     std::vector<unsigned long long> plan((size_t) L * NE);
     for (auto& p : plan) { uint8_t* d; CK(hipMalloc(&d, blob)); CK(hipMemcpy(d, one.data(), blob, hipMemcpyHostToDevice)); p = (unsigned long long) d; }
-    std::vector<int8_t> xq(E, 3), hq((size_t) NE * FF, 3); std::vector<float> xd(E / 32, 0.01f), hd((size_t) NE * FF / 32, 0.01f);
-    for (int i = 0; i < E; ++i) xq[i] = (int8_t) ((int) (rng() % 255) - 127);
+    const int NW = std::getenv("DS4_BENCH_WIN") ? std::max(1, std::min(16, std::atoi(std::getenv("DS4_BENCH_WIN")))) : 0;   // window path: NW entries a group
+    const int NEN = std::max(1, NW) * NE;   // entries
+    std::vector<int8_t> xq((size_t) 8 * E, 3), hq((size_t) NEN * FF, 3); std::vector<float> xd((size_t) 8 * E / 32, 0.01f), hd((size_t) NEN * FF / 32, 0.01f);
+    for (size_t i = 0; i < xq.size(); ++i) xq[i] = (int8_t) ((int) (rng() % 255) - 127);
     for (size_t i = 0; i < hq.size(); ++i) hq[i] = (int8_t) ((int) (rng() % 255) - 127);
+    if (const char* e = std::getenv("DS4_BENCH_ACTIVE")) { const int na = std::atoi(e); for (int l = 0; l < L; ++l) for (int k = na; k < NE; ++k) plan[(size_t) l * NE + k] = 0; }   // (empty plan entries)
     unsigned long long* dplan = up(plan);
     iq::Args a{};
     a.n_embd = E; a.n_ff = FF; a.limit = 10.0f; a.xq = up(xq); a.xd = up(xd); a.hq = up(hq); a.hd = up(hd); a.tg = a.td = type;
     for (int r = 0; r < 3; ++r) a.tr[r] = off[r];
-    float *dh, *dp; CK(hipMalloc(&dh, (size_t) NE * FF * 4)); CK(hipMalloc(&dp, (size_t) NE * E * 4)); a.h = dh; a.part = dp;
+    float *dh, *dp; CK(hipMalloc(&dh, (size_t) NEN * FF * 4)); CK(hipMalloc(&dp, (size_t) NEN * E * 4)); a.h = dh; a.part = dp;
+    std::vector<int> gstart(NE + 1), gent(NEN), ngrp(1, NE);
+    for (int g = 0; g <= NE; ++g) gstart[g] = g * std::max(1, NW);
+    for (int i = 0; i < NEN; ++i) gent[i] = i;
+    a.grp_start = up(gstart); a.grp_ent = up(gent); a.n_groups = up(ngrp);
     hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
     double us[2] = {0, 0};
     for (int part = 0; part < 2; ++part) {
         auto run = [&](int reps) {
             hipEventRecord(e0);
             for (int rep = 0; rep < reps; ++rep) {
-                a.plan_ptr = dplan + (size_t) (rep % L) * NE;
-                if (part == 0) iq::gate_up(a, NE, 1, 0); else iq::down(a, NE, 1, 0);
+                if (NW) a.grp_ptr = dplan + (size_t) (rep % L) * NE; else a.plan_ptr = dplan + (size_t) (rep % L) * NE;
+                if (part == 0) iq::gate_up(a, NE, std::max(1, NW), 0); else iq::down(a, NE, std::max(1, NW), 0);
             }
             hipEventRecord(e1); hipEventSynchronize(e1);
             float ms; hipEventElapsedTime(&ms, e0, e1);
@@ -246,11 +271,11 @@ static void bench_big(int type, int mib) {
     std::printf("big %-7s ws %4.0f MiB: gate/up %6.1f us (%5.0f GB/s)  down %6.1f us (%5.0f GB/s)  layer %6.1f us -> %5.0f GB/s, %.2f Tw/s\n",
                 iq::name(type), (double) L * NE * blob / 1048576.0, us[0], bg / us[0] * 1e-3, us[1], bd / us[1] * 1e-3, us[0] + us[1],
                 (bg + bd) / (us[0] + us[1]) * 1e-3, (double) NE * 3 * FF * E / ((us[0] + us[1]) * 1e-6) / 1e12);
-    for (auto p : plan) hipFree((void*) p);
+    for (auto p : plan) if (p) hipFree((void*) p);
 }
 
 // the light sets (experts of <= 16 rows: DSpark verify windows, short prompts): n_exp experts of `rows` rows each, gate/up and down
-static void bench_light(int type, int nexp, int rows) {
+static void bench_light(int type, int nexp, int rows, bool tiles = false) {
     const int E = 5120, FF = 2304;
     const size_t rb_g = iq::row_bytes(type, E), rb_d = iq::row_bytes(type, FF);
     auto al = [](size_t n) { return (n + 255) / 256 * 256; };
@@ -261,6 +286,7 @@ static void bench_light(int type, int nexp, int rows) {
     uint8_t* w; CK(hipMalloc(&w, blob * nexp));
     for (int e = 0; e < nexp; ++e) CK(hipMemcpy(w + (size_t) e * blob, one.data(), blob, hipMemcpyHostToDevice));
     const int NR = nexp * rows, T = 8;
+    if (tiles && rows <= 16) { std::printf("tiles: rows > 16 only\n"); return; }
     std::vector<int> bounds(nexp + 1), idx(NR);
     for (int e = 0; e <= nexp; ++e) bounds[e] = e * rows;
     for (int i = 0; i < NR; ++i) idx[i] = i % T;
@@ -270,7 +296,7 @@ static void bench_light(int type, int nexp, int rows) {
     std::vector<uint16_t> h((size_t) NR * FF, 0x3c00);
     iq::SetArgs q{};
     q.wbase = w; q.stride = blob; for (int r = 0; r < 3; ++r) q.tr[r] = off[r];
-    q.bounds = up(bounds); q.row0 = 0; q.max_rows = rows; q.n_exp = nexp; q.n_embd = E; q.n_ff = FF; q.limit = 7.0f;
+    q.bounds = up(bounds); q.row0 = 0; q.max_rows = rows; q.skip_le = 0; q.n_exp = nexp; q.n_embd = E; q.n_ff = FF; q.limit = 7.0f;
     q.tg = q.td = type; q.xf = up(x); q.idx = up(idx); q.ldx = E;
     uint16_t* dh; CK(hipMalloc(&dh, (size_t) NR * FF * 2)); q.h = dh; q.ldo = FF;
     q.xh = up(h);
@@ -281,8 +307,8 @@ static void bench_light(int type, int nexp, int rows) {
         auto run = [&](int reps) {
             hipEventRecord(e0);
             for (int rep = 0; rep < reps; ++rep) {
-                if (part == 0) { q.h = dh; q.ldo = FF; iq::light_gate_up(q, 0); }
-                else { q.y = dy; q.ldo = E; q.ldx = FF; iq::light_down(q, 0); }
+                if (part == 0) { q.h = dh; q.ldo = FF; if (tiles) iq::set_gate_up(q, 0); else iq::light_gate_up(q, 0); }
+                else { q.y = dy; q.ldo = E; q.ldx = FF; if (tiles) iq::set_down(q, 0); else iq::light_down(q, 0); }
             }
             hipEventRecord(e1); hipEventSynchronize(e1);
             float ms; hipEventElapsedTime(&ms, e0, e1);
@@ -296,8 +322,8 @@ static void bench_light(int type, int nexp, int rows) {
         us[part] = best;
     }
     const double bytes = (double) nexp * (off[2] + al((size_t) E * rb_d));
-    std::printf("light %-7s %3d experts x %2d rows: gate/up %7.1f us  down %7.1f us  -> %6.0f GB/s of weights, %.2f Tw/s\n", iq::name(type), nexp, rows,
-                us[0], us[1], bytes / ((us[0] + us[1]) * 1e-6) / 1e9, (double) nexp * 3 * FF * E / ((us[0] + us[1]) * 1e-6) / 1e12);
+    std::printf("%s %-7s %3d experts x %2d rows: gate/up %7.1f us  down %7.1f us  -> %6.0f GB/s of weights, %.2f Tw/s, %.1f TMAC/s\n", tiles ? "tiles" : "light", iq::name(type), nexp, rows,
+                us[0], us[1], bytes / ((us[0] + us[1]) * 1e-6) / 1e9, (double) nexp * 3 * FF * E / ((us[0] + us[1]) * 1e-6) / 1e12, (double) NR * 3 * FF * E / ((us[0] + us[1]) * 1e-6) / 1e12);
     hipFree(w);
 }
 
@@ -305,7 +331,16 @@ int main(int argc, char** argv) {
     std::vector<int> types = {16, 17, 22, 18, 21, 23, 29};
     std::vector<int> devs;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--bench-light") {   // [types] [n_exp] [rows list]
+        if (std::string(argv[i]) == "--bench-tiles") {   // [types] [n_exp] [rows list]: the prompt sets' tensor-core tiles
+            std::vector<int> bt, rl = {32, 128};
+            int nexp = 48;
+            if (i + 1 < argc && argv[i + 1][0] != '-') { for (const char* p = argv[++i]; *p;) { bt.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; } }
+            else bt = types;
+            if (i + 1 < argc && argv[i + 1][0] != '-') nexp = std::atoi(argv[++i]);
+            if (i + 1 < argc && argv[i + 1][0] != '-') { rl.clear(); for (const char* p = argv[++i]; *p;) { rl.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; } }
+            for (int t : bt) for (int r : rl) bench_light(t, nexp, r, true);
+            return 0;
+        } else if (std::string(argv[i]) == "--bench-light") {   // [types] [n_exp] [rows list]
             std::vector<int> bt, rl = {1, 2, 4};
             int nexp = 24;
             if (i + 1 < argc && argv[i + 1][0] != '-') { for (const char* p = argv[++i]; *p;) { bt.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; } }
