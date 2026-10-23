@@ -430,6 +430,7 @@ class InstallOfficial(Install):
         a = self.cfg["args"]
         self.assertEqual(a[a.index("--dspark") + 1], "auto")                    # never "off": that still loads the drafter and takes the VRAM
         self.assertNotIn("off", a)
+        self.assertEqual(a[a.index("--prefill-chunk") + 1], "1024")             # the layer-major prompt path
         self.assertNotIn("--ssd-cache", a)                                      # the store sizes itself
         self.assertEqual(a[a.index("--max-context") + 1], "8192")
         self.assertIn("checked: every file the engine needs is there", out)
