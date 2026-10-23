@@ -678,7 +678,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // the conversation continues, reused in place - a conversation has to be in the model first: a fresh engine
         // (the start of a run, so every restart) holds 0 tokens, and every prompt "continues" that to token 0; taken
         // as a continuation, the take below would never run for the folder's conversations, the case they are for
-        if (n_state > 0 && c == n_state && n_state < r.ids.size()) {
+        if ((n_state > 0 || slot_max <= 0) && c == n_state && n_state < r.ids.size()) {   // (slots off: as before)
             from = n_state;
             continued = true;
         }
@@ -790,7 +790,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         held = std::move(pics);
         m.checkpoint(0);
-        if (!continued) m.pin();   // (a new run of prompts: where it may be rendered again from)
+        if (!continued && slot_max > 0) m.pin();   // (a new run of prompts: where it may be rendered again from)
         const double t1 = now_ms();
         long long produced = 0;
         const char* finish = "length";
