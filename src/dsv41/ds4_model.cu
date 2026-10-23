@@ -1899,6 +1899,17 @@ struct Model::Impl {
         if (o.vision_only) return true;
 
         // layers: roles and the sources they read
+        if (o.dspark_auto && o.dspark && g.n_mtp > 0) {   // (see Options::dspark_auto)
+            double exp_b = 0, room_b = 0;
+            for (const auto& kt : pk.t)
+                if (kt.first.rfind("layers.", 0) == 0 && kt.first.find(".ffn.experts.") != std::string::npos) exp_b += (double) kt.second.bytes;
+            for (const Dev& d : devs) room_b += std::max(0.0, (double) d.free0 - (double) ((size_t) o.reserve_mib << 20));
+            if (exp_b > 1.5 * room_b) {
+                o.dspark = false;
+                std::fprintf(stderr, "ds4: DSpark not loaded: the routed experts (%.0f GB) are far more than the GPU holds (%.0f GB), where its verify "
+                                     "rounds read 3.3x a token's bytes and gain nothing (--dspark on loads it anyway)\n", exp_b / 1e9, room_b / 1e9);
+            }
+        }
         if (!o.dspark) g.n_mtp = 0;
         L.resize((size_t) (g.nl + g.n_mtp));
         int last_src = -1;
