@@ -26,7 +26,7 @@ with an out-of-memory message. Both are said before anything is downloaded.
 
 ## The official 2-bit versions (the ones for a normal PC)
 
-Setup offers two official sets (helcig/tmp-oct26-2, pinned): **IST-DAS 2.00 bpw** (138 GB) and **IST-DAS 2.25 bpw** (155 GB). Both use the
+Setup offers two official sets (ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF, pinned): **IST-DAS 2.00 bpw** (138 GB) and **IST-DAS 2.25 bpw** (155 GB). Both use the
 same 111 GB n-gram table (downloaded once into `models/deepseek-v4.1-flash-shared`) and the 8 GB DSpark drafter: 257 GB of disk for
 2.00, 274 GB for 2.25, 412 GB for both. Quality against the original model: perplexity +16% on 2.00, +8% on 2.25 (code and agent work
 about +3.5% / +2.5% on 2.25).

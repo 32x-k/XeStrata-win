@@ -6,12 +6,12 @@ Strata now runs DeepSeek V4.1-Flash on a PC with one 12 GB graphics card and 46 
 
 ## What you get
 
-- **DeepSeek V4.1-Flash** in the model list of Setup, in two sizes from IST-DAS:
+- **DeepSeek V4.1-Flash** in the model list of Setup, in two sizes from [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF):
 
   | set | download | quality against the original model |
   |---|---|---|
-  | 2.00 bits | 257 GB | perplexity +16%; code and agent text +8.5% and +5.9% |
-  | 2.25 bits | 274 GB | perplexity +7.7% to +8.3%; code and agent text +3.5% and +2.5% |
+  | IQ2_XXS (2.00 bits) | 257 GB | perplexity +16%; code and agent text +8.5% and +5.9% |
+  | IQ2_XS (2.25 bits) | 274 GB | perplexity +7.7% to +8.3%; code and agent text +3.5% and +2.5% |
 
   "Perplexity" is how surprised the model is by a fixed set of 4,995 test texts; lower is closer to the original. Pick 2.25 for coding and agent work when you have the disk. Setup shows both sizes and warns if your PC is short of disk or RAM. It does not stop you.
 - Setup downloads the files, builds the model folder and starts the engine. You set no flags.
@@ -76,7 +76,7 @@ Everything from 0.2.3 is attached again, so the release page still holds every f
 
 ## Thanks
 
-- **IST-DAS** for the 2.00 and 2.25-bit sets of DeepSeek V4.1-Flash.
+- **ISTA-DASLab** for the IQ2_XXS and IQ2_XS sets of DeepSeek V4.1-Flash ([ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)).
 - **Unsloth** for the DSpark drafter GGUF.
 
 ---
