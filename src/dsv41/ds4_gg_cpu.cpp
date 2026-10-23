@@ -112,7 +112,7 @@ static bool own_ok(int type) {
                 std::memcpy(&w[o], &d, sizeof d);
             }
         }
-        for (int nt : {1, 2, 3, 4, 5, 6, 8}) {
+        for (int nt : {1, 2, 3, 4, 5, 6, 8, 16, 33}) {
             std::vector<std::vector<uint8_t>> a((size_t) nt, std::vector<uint8_t>(ab));
             std::vector<const void*> ap((size_t) nt);
             std::vector<std::vector<float>> o0((size_t) nt, std::vector<float>(rows)), o1 = o0;
@@ -164,8 +164,14 @@ static void dots(int type, const uint8_t* w, size_t rb, int n, const void* const
 
 void gg_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt, float* const* ff, int r0,
                     int r1, float limit) {
-    static thread_local std::vector<float> tmp[8];
-    float* uo[8];
+    constexpr int kMaxTok = 64;   // (the prompt path: a chunk's tokens an expert)
+    static thread_local std::vector<float> tmp[kMaxTok];
+    float* uo[kMaxTok];
+    if (nt > kMaxTok) {   // (more than a pass takes: in pieces)
+        for (int t0 = 0; t0 < nt; t0 += kMaxTok)
+            gg_cpu_gate_up(f, gate, up, act + t0, nt - t0 < kMaxTok ? nt - t0 : kMaxTok, ff + t0, r0, r1, limit);
+        return;
+    }
     for (int t = 0; t < nt; ++t) {
         tmp[t].resize((size_t) r1);
         uo[t] = tmp[t].data();

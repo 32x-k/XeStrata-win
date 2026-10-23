@@ -350,6 +350,188 @@ void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act,
     }
 }
 
+// ---- many tokens an expert (the prompt: a chunk's tokens routed to one expert), EX rows only.
+// The weights of a 256-value block are decoded once into signed int8 (the grid magnitude times the sign) and every token of the
+// call applies them.  The activations come as u8 (q8 + 128, made once per call for all the rows): maddubs(act_u8, w_s8) needs no
+// per-token sign, and sum(w * q) = sum(w * (q + 128)) - 128 * sum(w) with the second sum made once per weight block (corr), so the
+// integer sums are exactly ggml's, lane for lane (no int16 overflow: |w| <= 62 for these grids, 255 * 62 * 2 < 32767).
+// A token costs, per 32 values, one maddubs, one madd and one add (the single-token form has a sign on top).
+constexpr int kWideTokens = 64;
+
+STRATA_ROWS_FN inline void wide_prep(const block_q8_K* y, int nb, uint8_t* u) {
+    const __m256i flip = _mm256_set1_epi8((char) 0x80);
+    for (int i = 0; i < nb; ++i)
+        for (int c = 0; c < 8; ++c)
+            _mm256_storeu_si256((__m256i*) (u + (size_t) i * 256 + 32 * c),
+                                _mm256_xor_si256(_mm256_loadu_si256((const __m256i*) (y[i].qs + 32 * c)), flip));
+}
+
+template <int TY> STRATA_ROWS_FN
+void dot_rows_wide(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int T, float* const* out, int r0, int r1) {
+    // tokens in tiles of kTile and rows in groups of kRows: a tile's activation slice of one block (kTile * 256 B) and the group's
+    // accumulators (kRows * kTile * 32 B) stay in L1 while the group's rows go past, the tile's whole activation in L2
+#ifndef STRATA_WIDE_TILE
+#define STRATA_WIDE_TILE 16
+#endif
+#ifndef STRATA_WIDE_ROWS
+#define STRATA_WIDE_ROWS 8
+#endif
+    constexpr int kTile = STRATA_WIDE_TILE, kRows = STRATA_WIDE_ROWS;
+    const int nb = n / QK_K;
+    static thread_local std::vector<uint8_t> ubuf;
+    static thread_local std::vector<float> accb;
+    ubuf.resize((size_t) (T < kTile ? T : kTile) * n);
+    accb.resize((size_t) kRows * kTile * 8);
+    const __m256i one8 = _mm256_set1_epi8(1);
+    const int pf = prefetch_distance();
+    for (int t0 = 0; t0 < T; t0 += kTile) {
+        const int tt = T - t0 < kTile ? T - t0 : kTile;
+        const block_q8_K* y[kTile];
+        for (int t = 0; t < tt; ++t) {
+            y[t] = (const block_q8_K*) act[t0 + t];
+            wide_prep(y[t], nb, ubuf.data() + (size_t) t * n);
+        }
+        for (int rg = r0; rg < r1; rg += kRows) {
+            const int rr = r1 - rg < kRows ? r1 - rg : kRows;
+            for (int k = 0; k < rr * tt; ++k) _mm256_storeu_ps(&accb[(size_t) k * 8], _mm256_setzero_ps());
+            for (int i = 0; i < nb; ++i) {
+                for (int q = 0; q < rr; ++q) {
+                    const uint8_t* blk = w + (size_t) (rg + q) * row_bytes + (size_t) i * Fmt32<TY>::bytes;
+                    rows_ahead(blk, pf);
+                    __m256i w8[8], sc[8];
+                    __m256i corr = _mm256_setzero_si256();
+                    for (int j = 0; j < 4; ++j)
+                        for (int half = 0; half < 2; ++half) {
+                            __m256i g, sgn, s;
+                            Fmt32<TY>::decode(blk, j, half, g, sgn, s);
+                            const int k = 2 * j + half;
+                            w8[k] = _mm256_sign_epi8(g, sgn);
+                            sc[k] = s;
+                            corr = madd_add(corr, _mm256_maddubs_epi16(one8, w8[k]), s);
+                        }
+                    const __m256i corr128 = _mm256_slli_epi32(corr, 7);
+                    const float dx = h2f(u16(blk));
+                    float* accq = &accb[(size_t) q * tt * 8];
+                    for (int t = 0; t < tt; ++t) {
+                        const uint8_t* u = ubuf.data() + (size_t) t * n + (size_t) i * 256;
+                        __m256i a0 = _mm256_setzero_si256(), a1 = _mm256_setzero_si256();
+                        for (int k = 0; k < 8; k += 2) {
+                            a0 = madd_add(a0, _mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i*) (u + 32 * k)), w8[k]), sc[k]);
+                            a1 = madd_add(a1, _mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i*) (u + 32 * k + 32)), w8[k + 1]), sc[k + 1]);
+                        }
+                        const __m256i s = _mm256_sub_epi32(_mm256_add_epi32(a0, a1), corr128);
+                        float* ap = accq + (size_t) t * 8;
+                        _mm256_storeu_ps(ap, _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d), _mm256_cvtepi32_ps(s), _mm256_loadu_ps(ap)));
+                    }
+                }
+            }
+            for (int q = 0; q < rr; ++q)
+                for (int t = 0; t < tt; ++t)
+                    out[t0 + t][rg + q] = Fmt32<TY>::K * ggml_hsum8(_mm256_loadu_ps(&accb[((size_t) q * tt + t) * 8]));
+        }
+    }
+}
+
+// IQ1_M the same way: its grid bytes are already signed (-1, 0, 1), and the delta dot keeps the pair sums of the activation
+// (maddubs(1, q8), made once per tile).  Two float accumulators a (row, token), ggml's sum d*sumi1 and sum d*sumi2.
+STRATA_ROWS_FN
+void dot_rows_wide_iq1m(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int T, float* const* out, int r0, int r1) {
+    constexpr int kTile = STRATA_WIDE_TILE, kRows = STRATA_WIDE_ROWS;
+    const int nb = n / QK_K;
+    static thread_local std::vector<uint8_t> ubuf;
+    static thread_local std::vector<int16_t> pbuf;
+    static thread_local std::vector<float> accb;
+    ubuf.resize((size_t) (T < kTile ? T : kTile) * n);
+    pbuf.resize((size_t) (T < kTile ? T : kTile) * n);
+    accb.resize((size_t) kRows * kTile * 16);
+    const __m256i one8 = _mm256_set1_epi8(1);
+    const __m256i mask = _mm256_set1_epi16(0x7);
+    const __m256i mone = _mm256_set1_epi16(1);
+    const __m256i mtwo8 = _mm256_set1_epi8(2);
+    const __m256i scales_shift = _mm256_set_epi64x(9, 3, 6, 0);
+    const __m256i nib_shift = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+    const __m256i m7 = _mm256_set1_epi32(7), m8 = _mm256_set1_epi32(8);
+    const int pf = prefetch_distance();
+    for (int t0 = 0; t0 < T; t0 += kTile) {
+        const int tt = T - t0 < kTile ? T - t0 : kTile;
+        const block_q8_K* y[kTile];
+        for (int t = 0; t < tt; ++t) {
+            y[t] = (const block_q8_K*) act[t0 + t];
+            wide_prep(y[t], nb, ubuf.data() + (size_t) t * n);
+            iq1m_pre_build(y[t], nb, pbuf.data() + (size_t) t * n);
+        }
+        for (int rg = r0; rg < r1; rg += kRows) {
+            const int rr = r1 - rg < kRows ? r1 - rg : kRows;
+            for (int k = 0; k < rr * tt * 2; ++k) _mm256_storeu_ps(&accb[(size_t) k * 8], _mm256_setzero_ps());
+            for (int i = 0; i < nb; ++i) {
+                for (int q = 0; q < rr; ++q) {
+                    const uint8_t* blk = w + (size_t) (rg + q) * row_bytes + (size_t) i * 56;
+                    rows_ahead(blk, pf);
+                    const uint8_t* qs = blk;
+                    const uint8_t* qh = blk + 32;
+                    const uint8_t* scb = blk + 48;
+                    const uint16_t sc0 = u16(scb), sc1 = u16(scb + 2), sc2 = u16(scb + 4), sc3 = u16(scb + 6);
+                    const uint16_t d16 = (uint16_t) ((sc0 >> 12) | ((sc1 >> 8) & 0x00f0) | ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000));
+                    __m256i scales = _mm256_set1_epi64x((long long) u64(scb));
+                    scales = _mm256_srlv_epi64(scales, scales_shift);
+                    scales = _mm256_add_epi16(_mm256_slli_epi16(_mm256_and_si256(scales, mask), 1), mone);
+                    __m256i sidx1 = _mm256_set1_epi16(0x0100);
+                    __m256i sidx2 = _mm256_add_epi8(sidx1, _mm256_set1_epi8(8));
+                    __m256i g1[4], g2[4], sa[4], sb[4], ssa[4], ssb[4];
+                    __m256i corr = _mm256_setzero_si256();
+                    for (int it = 0; it < 4; ++it) {
+                        const __m256i v8 = _mm256_srlv_epi32(_mm256_set1_epi32((int) u32(qh + 4 * it)), nib_shift);
+                        const __m256i idx = _mm256_or_si256(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) (qs + 8 * it))),
+                                                            _mm256_slli_epi32(_mm256_and_si256(v8, m7), 8));
+                        alignas(32) int32_t ix[8];
+                        _mm256_store_si256((__m256i*) ix, idx);
+                        g1[it] = _mm256_set_epi64x((long long) iq1s_grid[ix[3]], (long long) iq1s_grid[ix[2]],
+                                                   (long long) iq1s_grid[ix[1]], (long long) iq1s_grid[ix[0]]);
+                        g2[it] = _mm256_set_epi64x((long long) iq1s_grid[ix[7]], (long long) iq1s_grid[ix[6]],
+                                                   (long long) iq1s_grid[ix[5]], (long long) iq1s_grid[ix[4]]);
+                        const __m256i neg = _mm256_cmpeq_epi32(_mm256_and_si256(v8, m8), m8);
+                        const __m256i n1 = _mm256_cvtepi32_epi64(_mm256_castsi256_si128(neg));
+                        const __m256i n2 = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(neg, 1));
+                        sa[it] = _mm256_shuffle_epi8(scales, sidx1);
+                        sb[it] = _mm256_shuffle_epi8(scales, sidx2);
+                        ssa[it] = _mm256_sign_epi16(sa[it], _mm256_or_si256(n1, mone));
+                        ssb[it] = _mm256_sign_epi16(sb[it], _mm256_or_si256(n2, mone));
+                        sidx1 = _mm256_add_epi8(sidx1, mtwo8);
+                        sidx2 = _mm256_add_epi8(sidx2, mtwo8);
+                        corr = madd_add(madd_add(corr, _mm256_maddubs_epi16(one8, g1[it]), sa[it]), _mm256_maddubs_epi16(one8, g2[it]), sb[it]);
+                    }
+                    const __m256i corr128 = _mm256_slli_epi32(corr, 7);
+                    const float dx = h2f(d16);
+                    float* accq = &accb[(size_t) q * tt * 16];
+                    for (int t = 0; t < tt; ++t) {
+                        const uint8_t* u = ubuf.data() + (size_t) t * n + (size_t) i * 256;
+                        const int16_t* pp = pbuf.data() + (size_t) t * n + (size_t) i * 128;
+                        __m256i a0 = _mm256_setzero_si256(), a1 = _mm256_setzero_si256();
+                        __m256i b0 = _mm256_setzero_si256(), b1 = _mm256_setzero_si256();
+                        for (int it = 0; it < 4; ++it) {
+                            a0 = madd_add(a0, _mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i*) (u + 64 * it)), g1[it]), sa[it]);
+                            a1 = madd_add(a1, _mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i*) (u + 64 * it + 32)), g2[it]), sb[it]);
+                            b0 = madd_add(b0, _mm256_loadu_si256((const __m256i*) (pp + 32 * it)), ssa[it]);
+                            b1 = madd_add(b1, _mm256_loadu_si256((const __m256i*) (pp + 32 * it + 16)), ssb[it]);
+                        }
+                        const __m256i s1 = _mm256_sub_epi32(_mm256_add_epi32(a0, a1), corr128);
+                        const __m256i s2 = _mm256_add_epi32(b0, b1);
+                        const __m256 d = _mm256_set1_ps(y[t][i].d * dx);
+                        float* ap = accq + (size_t) t * 16;
+                        _mm256_storeu_ps(ap, _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(s1), _mm256_loadu_ps(ap)));
+                        _mm256_storeu_ps(ap + 8, _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(s2), _mm256_loadu_ps(ap + 8)));
+                    }
+                }
+            }
+            for (int q = 0; q < rr; ++q)
+                for (int t = 0; t < tt; ++t) {
+                    const float* ap = &accb[((size_t) q * tt + t) * 16];
+                    out[t0 + t][rg + q] = ggml_hsum8(_mm256_loadu_ps(ap)) + 0.125f * ggml_hsum8(_mm256_loadu_ps(ap + 8));
+                }
+        }
+    }
+}
+
 template <int TY, bool EX> STRATA_ROWS_FN
 void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                 float* const* ff, int r0, int r1) {
@@ -368,6 +550,13 @@ void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n
 template <int TY, bool EX> STRATA_ROWS_FN
 void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0,
                  int r1) {
+    if constexpr (EX) {
+        if (nt >= 7) {   // (a prompt chunk's tokens: one decode of a block for all of them)
+            if constexpr (TY == 29) dot_rows_wide_iq1m(w, row_bytes, n, act, nt, out, r0, r1);
+            else dot_rows_wide<TY>(w, row_bytes, n, act, nt, out, r0, r1);
+            return;
+        }
+    }
     switch (nt) {
         case 1: dot_rows<TY, 1, EX>(w, row_bytes, n, act, out, r0, r1); break;
         case 2: dot_rows<TY, 2, EX>(w, row_bytes, n, act, out, r0, r1); break;
