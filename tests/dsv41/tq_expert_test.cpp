@@ -7,7 +7,7 @@
 #include "../../src/dsv41/ds4_iq.cuh"
 #include "../../tools/trellis/tqenc.hpp"
 
-#include <hip/hip_runtime.h>
+#include "strata/dsv41/hip_or_cuda.h"   // HIP names on a HIP build, the CUDA runtime otherwise
 
 #include <algorithm>
 #include <cmath>

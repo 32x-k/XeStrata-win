@@ -84,7 +84,8 @@ def dequant(g, t) -> np.ndarray:
     name, typ, dims, off = t
     tname = pack_gguf.TYPES[typ][0]
     nb = nbytes(typ, dims)
-    raw = np.fromfile(g.path, dtype=np.uint8, count=nb, offset=off)
+    # Gguf's tensor offsets are relative to the shard's data section; pack_gguf adds data_start when it writes a pack
+    raw = np.fromfile(g.path, dtype=np.uint8, count=nb, offset=g.data_start + off)
     if tname == "Q5_K":
         return dequant_q5k(raw, nb // 176).astype(np.float64)
     if tname == "Q4_K":

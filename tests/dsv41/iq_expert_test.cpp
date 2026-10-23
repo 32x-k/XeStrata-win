@@ -7,7 +7,7 @@
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
 #include "../../src/dsv41/ds4_iq.cuh"
 
-#include <hip/hip_runtime.h>
+#include "strata/dsv41/hip_or_cuda.h"   // HIP names on a HIP build, the CUDA runtime otherwise
 
 #include "ggml.h"   // ggml_get_type_traits(type)->to_float: ggml's decode of the same blocks
 
