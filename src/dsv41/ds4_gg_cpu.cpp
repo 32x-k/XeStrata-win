@@ -12,7 +12,9 @@
 #if defined(STRATA_DSV41_TQ_CPU)
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
+#include "strata/kernels/cpu/iq_avx512.hpp"
 
 #include <mutex>
 #include <vector>
@@ -86,12 +88,12 @@ void gg_cpu_quant(int act, const float* x, int k, void* dst) {
 static int g_iq256 = -1;   // -1: from the environment and the CPU, 0 off, 1 always, 2 from min_tokens(type)
 void gg_cpu_set_iq256(int mode) { g_iq256 = mode; }
 static int min_tokens(int type) { return type == 21 ? 1 : type == 29 ? 3 : 2; }
-static bool own_ok(int type) {
-    static std::once_flag once[32];
-    static bool ok[32];
+static bool own_ok(int type, int impl) {
+    static std::once_flag once[2][32];
+    static bool ok[2][32];
     const int k = type & 31;
-    std::call_once(once[k], [&] {
-        ok[k] = false;
+    std::call_once(once[impl][k], [&] {
+        ok[impl][k] = false;
         const ggml_type_traits_cpu* tc = ggml_get_type_traits_cpu((ggml_type) type);
         const ggml_type_traits_cpu* q8 = tc ? ggml_get_type_traits_cpu(tc->vec_dot_type) : nullptr;
         if (tc == nullptr || tc->vec_dot == nullptr || q8 == nullptr || q8->from_float == nullptr) return;
@@ -125,33 +127,57 @@ static bool own_ok(int type) {
                 p1[(size_t) t] = o1[(size_t) t].data();
                 for (int r = 0; r < rows; ++r) tc->vec_dot(n, &o0[(size_t) t][(size_t) r], 0, w.data() + (size_t) r * rb, 0, ap[(size_t) t], 0, 1);
             }
-            strata::kernels::cpu::iq256x_rows(type, w.data(), rb, n, ap.data(), nt, p1.data(), 0, rows);
+            if (impl == 1) strata::kernels::cpu::iq512x_rows(type, w.data(), rb, n, ap.data(), nt, p1.data(), 0, rows);
+            else strata::kernels::cpu::iq256x_rows(type, w.data(), rb, n, ap.data(), nt, p1.data(), 0, rows);
             for (int t = 0; t < nt; ++t)
                 if (std::memcmp(o0[(size_t) t].data(), o1[(size_t) t].data(), rows * sizeof(float)) != 0) {
                     if (dbg() || std::getenv("DS4_GG_VERBOSE")) std::fprintf(stderr, "ds4: CPU lane type %d: AVX2 rows differ from ggml-cpu's dot at %d tokens, not used\n", type, nt);
                     return;
                 }
         }
-        ok[k] = true;
+        ok[impl][k] = true;
     });
-    return ok[k];
+    return ok[impl][k];
 }
-static bool use_iq256(int type, int nt) {
+// DS4_GG_IQ512: 1 takes the AVX-512 rows (bit-identical too) where the CPU has AVX-512 F/BW/VL/DQ/VNNI/VBMI, 0 never; unset: the rule
+// below, from the measurements on Zen 4.
+static int g_iq512 = -1;
+static bool want_512(int type, int nt) {
+    if (g_iq512 < 0) {
+        const char* v = std::getenv("DS4_GG_IQ512");
+        g_iq512 = !strata::kernels::cpu::cpu_avx512_ok() ? 0 : v == nullptr ? 2 : std::atoi(v) != 0 ? 1 : 0;
+    }
+    if (g_iq512 == 0 || !strata::kernels::cpu::iq512x_supported(type)) return false;
+    if (g_iq512 == 1) return true;
+    (void) nt;
+    return false;   // (the default rule is filled in from the Zen 4 numbers)
+}
+// 0: ggml-cpu's dot, 1: the AVX2 rows, 2: the AVX-512 rows
+static int use_iq256(int type, int nt) {
     if (g_iq256 < 0) {
         const char* v = std::getenv("DS4_GG_IQ256");
         // (ggml-cpu's own answer: built with AVX2 + FMA + F16C, which is also what makes its dots the AVX2 ones these rows match)
         const bool avx2 = ggml_cpu_has_avx2() && ggml_cpu_has_fma() && ggml_cpu_has_f16c();
         g_iq256 = !avx2 ? 0 : v == nullptr ? 2 : std::atoi(v) != 0 ? 1 : 0;
     }
-    if (g_iq256 == 0 || !strata::kernels::cpu::iq256x_supported(type)) return false;
-    if (g_iq256 == 2 && nt < min_tokens(type)) return false;
-    return own_ok(type);
+    if (g_iq256 == 0) return 0;
+    if (want_512(type, nt) && own_ok(type, 1)) return 2;
+    if (!strata::kernels::cpu::iq256x_supported(type)) return 0;
+    if (g_iq256 == 2 && nt < min_tokens(type)) return 0;
+    return own_ok(type, 0) ? 1 : 0;
 }
 
 static void dots(int type, const uint8_t* w, size_t rb, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
-    if (nt > 0 && use_iq256(type, nt)) {
-        strata::kernels::cpu::iq256x_rows(type, w, rb, n, act, nt, out, r0, r1);
-        return;
+    if (nt > 0) {
+        const int impl = use_iq256(type, nt);
+        if (impl == 2) {
+            strata::kernels::cpu::iq512x_rows(type, w, rb, n, act, nt, out, r0, r1);
+            return;
+        }
+        if (impl == 1) {
+            strata::kernels::cpu::iq256x_rows(type, w, rb, n, act, nt, out, r0, r1);
+            return;
+        }
     }
     const ggml_type_traits_cpu* tc = ggml_get_type_traits_cpu((ggml_type) type);
     if (dbg()) std::fprintf(stderr, "gg dots type %d n %d rows %d..%d nt %d\n", type, n, r0, r1, nt);
