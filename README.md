@@ -196,6 +196,7 @@ Every size, download and what fits where: [docs/MODELS.md](docs/MODELS.md).
 | --- | ---: | --- | --- |
 | **IQ2_XXS** (2.00 bits) | 257 GB | KL 0.169, perplexity 3.64 (+16%) | 6 to 9 tokens/s on an RTX 3060, about 5 on an RTX 5070 |
 | **IQ2_XS** (2.25 bits) | 274 GB | KL 0.110, perplexity 3.40 (+8%); code +3.5%, agent work +2.5% | about 11 tokens/s on one Radeon AI PRO R9700 |
+| **IQ4_NL** (Engram table, not a third model) | 111 GB, already in both downloads above | The 4-bit Engram lookup table the model reads from RAM or SSD. Both sets use this one file (`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`). | n/a |
 
 4x Radeon AI PRO R9700: about 31 tokens/s, 55 to 69 with DSpark.
 
