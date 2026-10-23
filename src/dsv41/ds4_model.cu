@@ -16,6 +16,7 @@
 #include "ds4_engram_io.hpp"
 
 #include "ds4_gguf.cuh"
+#include "ds4_iq.cuh"
 #include "ds4_gguf_cpu.hpp"
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
@@ -1123,7 +1124,30 @@ struct Model::Impl {
     // ... and a run of chunks' (prof_chunk): a layer's start, after its attention, after the routing and the shared
     // expert, after its experts (the streamed ones' waits for their reads in it); printed after the run
     bool prof_chunk = false;
-    double cprof_ms[4] = {};
+    // DS4_PROF stages of the chunked prompt (finer ones than the decode's 0..5): 0 between layers, 1 attention rest (wq_b, wo,
+    // hc_post), 2 router-side tail (shared expert), 3 experts (+ waits), 4 Engram, 5 attn mHC (mix, split, norm), 6 attention
+    // projections (wq_a, wkv, compressor), 7 compressor + indexer, 8 q_b + rope, 9 sparse attention, 10 ffn mHC + router + sort
+    double cprof_ms[16] = {};
+    // DS4_PROF: the experts' kernels alone, by type (events around the gate/up and down calls of run_set)
+    struct EkMark {
+        cudaEvent_t e0, e1, e2;
+        int tg, td, nrows, nexp, maxrows, dev, ff;
+    };
+    std::vector<EkMark> ek_marks;
+    std::map<int, std::vector<cudaEvent_t>> ek_pool;   // by device
+    cudaEvent_t ek_ev() {
+        int cur = 0;
+        cudaGetDevice(&cur);
+        std::vector<cudaEvent_t>& pl = ek_pool[cur];
+        if (!pl.empty()) {
+            cudaEvent_t e = pl.back();
+            pl.pop_back();
+            return e;
+        }
+        cudaEvent_t e = nullptr;
+        cudaEventCreate(&e);
+        return e;
+    }
     void prof_mark(const Dev& d, int stage) {
         if (!prof_window && !prof_chunk) return;
         std::lock_guard<std::mutex> lk(prof_mu);
@@ -3433,12 +3457,35 @@ struct Model::Impl {
                 sa.n_embd = D;
                 sa.n_ff = FF;
                 sa.limit = g.lim;
+                EkMark ek{};
+                const bool ekp = prof_chunk;
+                if (ekp) {
+                    std::lock_guard<std::mutex> lk(prof_mu);
+                    ek.e0 = ek_ev();
+                    ek.e1 = ek_ev();
+                    ek.e2 = ek_ev();
+                    ek.tg = gg::expert_type(sa.lay, 0);
+                    ek.td = gg::expert_type(sa.lay, 2);
+                    ek.nrows = nrows;
+                    ek.nexp = j - i0;
+                    ek.maxrows = max_rows;
+                    ek.ff = FF;
+                    cudaGetDevice(&ek.dev);
+                    cudaEventRecord(ek.e0, d.st);
+                }
                 if (sa.lay.fmt == gg::kFmtMXFP4) {
                     gg::set_gate_up(sa, c.x, D, c.row_tok + a, c.h16, FF, d.st);
+                    if (ekp) cudaEventRecord(ek.e1, d.st);
                     gg::set_down(sa, c.h16, FF, c.y, D, d.st);
                 } else {
                     x3::set_gate_up(sa, c.x, D, c.row_tok + a, c.h16, FF, d.st);
+                    if (ekp) cudaEventRecord(ek.e1, d.st);
                     x3::set_down(sa, c.h16, FF, c.y, D, d.st);
+                }
+                if (ekp) {
+                    cudaEventRecord(ek.e2, d.st);
+                    std::lock_guard<std::mutex> lk(prof_mu);
+                    ek_marks.push_back(ek);
                 }
                 if (dump_y != nullptr && (dump_y_layer < 0 || l.il == dump_y_layer)) {
                     std::vector<int> bb(b + i0, b + j + 1);
@@ -6270,16 +6317,19 @@ struct Model::Impl {
                 engram_gate(c.h + (size_t) s0 * H * D, c.eg_kv, l.eg_w, H, D, ns, g.eps, s);
             }
         }
+        prof_mark(d, 4);
         // attention
         if (!hc_mix_chunk(d, c, c.h, l.hca_fn, T, c.mix, err)) return false;
         hc_split(c.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, c.a_pre, c.a_post, c.a_comb, s);
         hc_pre_norm(c.h, c.pre, l.attn_norm, D, H, T, g.eps, c.x, s);
         x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
+        prof_mark(d, 5);
         if (!kv_only && (!gemm(d, c, l.wq_a, c.x16, D, T, c.qr, g.q_lora, 0.0f, err) ||
                          !gemm(d, c, l.wkv, c.x16, D, T, c.kvr, HD, 0.0f, err)))
             return false;
         if (l.kv_src && !gemm(d, c, l.c_wkv, c.x16, D, T, c.ckr, HD, 0.0f, err)) return false;
         if (l.kv_src && l.ratio > 1 && !gemm(d, c, l.c_wgate, c.x16, D, T, c.cgr, HD, 0.0f, err)) return false;
+        prof_mark(d, 6);
         const bool snap = !kv_only && wp.snap_t >= 0 && mi == 0 && L0.snap_win != nullptr;
         if (!kv_only) {
             Finish fq;
@@ -6435,6 +6485,7 @@ struct Model::Impl {
             ckv = sr.ckv[(size_t) l.dev];
         }
         if (kv_only) return true;
+        prof_mark(d, 7);
         // the attention in slabs: q, the sparse attention, wo_a, wo_b (this member's share) into acc
         if (NHL == 0) CK(cudaMemsetAsync(c.acc, 0, (size_t) T * D * sizeof(*c.acc), s));   // (no heads)
         for (int a0 = 0; a0 < T && NHL > 0; a0 += c.A) {
@@ -6446,6 +6497,7 @@ struct Model::Impl {
             fr.vpp = NHL;
             fr.freqs = freqs;
             finish(c.q, na * NHL, HD, HD, fr, s);
+            prof_mark(d, 8);
             AttnRows ar;
             ar.gen = 1;
             ar.p0 = p0;
@@ -6455,6 +6507,7 @@ struct Model::Impl {
             ar.kcap = g.ix_topk;
             sparse_attn(c.q, c.ext, ckv, c.topk + (size_t) a0 * topk_stride(), (int) topk_stride(), ar, l.sink, NHL, HD,
                         na, 1.0f / std::sqrt((float) HD), c.o, s, kKvFp4, 0, &d.attn_scr);   // (a short last slab)
+            prof_mark(d, 9);
             Finish fo;
             fo.rd = g.rd;
             fo.pos = (int) (p0 + a0);
@@ -6492,6 +6545,7 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(l.vs_dev, l.vs_pin, (size_t) l.n_exp * 4, cudaMemcpyHostToDevice, s));   // (this member's)
         moe_sort(c.ridx, T, l.k_exp, l.vs_dev, n_vs, c.bounds, c.row_tok, c.pos, s);
         CK(cudaMemcpyAsync(c.bounds_pin, c.bounds, (size_t) (n_vs + 1) * 4, cudaMemcpyDeviceToHost, s));
+        prof_mark(d, 10);
         // the shared expert into acc while the host waits for the bounds
         if (!gemm(d, c, l.s1, c.x16, D, T, c.sg, FF, 0.0f, err) || !gemm(d, c, l.s3, c.x16, D, T, c.su, FF, 0.0f, err))
             return false;
@@ -7487,6 +7541,52 @@ struct Model::Impl {
                          "ds4 prompt GPU time, %d tokens: attention %.0f ms, routing + shared expert %.0f ms, experts %.0f ms "
                          "(with the waits for streamed ones), between layers %.0f ms\n",
                          n, cprof_ms[1], cprof_ms[2], cprof_ms[3], cprof_ms[0]);
+            {   // the finer table (ms, % of the sum)
+                static const char* nm_[16] = {"between layers", "attn rest (q_b, wo_a/b, hc_post)", "shared expert", "experts (incl waits)",
+                                              "engram", "attn mHC (mix/split/norm)", "attn projections", "compressor + indexer",
+                                              "q_b + rope", "sparse attention", "ffn mHC + router + sort", "", "", "", "", ""};
+                double sum = 0;
+                for (double v : cprof_ms) sum += v;
+                for (int i = 0; i < 11; ++i)
+                    std::fprintf(stderr, "ds4 prof  %-34s %9.1f ms %5.1f%%\n", nm_[i], cprof_ms[i], sum > 0 ? 100.0 * cprof_ms[i] / sum : 0.0);
+                struct Agg {
+                    double ms = 0, flops = 0;
+                    long calls = 0, rows = 0, experts = 0;
+                };
+                std::map<std::pair<int, int>, Agg> agg;   // (type, role 0 gate+up, 1 down)
+                {
+                    std::lock_guard<std::mutex> lk(prof_mu);
+                    for (const EkMark& m : ek_marks) {
+                        float a = 0, b = 0;
+                        cudaSetDevice(m.dev);
+                        cudaEventElapsedTime(&a, m.e0, m.e1);
+                        cudaEventElapsedTime(&b, m.e1, m.e2);
+                        Agg& x = agg[{m.tg, 0}];
+                        x.ms += a;
+                        x.flops += 2.0 * 2.0 * m.nrows * (double) g.dim * (double) m.ff;
+                        x.calls++, x.rows += m.nrows, x.experts += m.nexp;
+                        Agg& y = agg[{m.td, 1}];
+                        y.ms += b;
+                        y.flops += 2.0 * m.nrows * (double) g.dim * (double) m.ff;
+                        y.calls++, y.rows += m.nrows, y.experts += m.nexp;
+                        ek_pool[m.dev].push_back(m.e0);
+                        ek_pool[m.dev].push_back(m.e1);
+                        ek_pool[m.dev].push_back(m.e2);
+                    }
+                    ek_marks.clear();
+                }
+                double tot = 0;
+                for (auto& kv : agg) tot += kv.second.ms;
+                for (auto& kv : agg)
+                    std::fprintf(stderr,
+                                 "ds4 prof  expert kernels type %-8s %-7s %9.1f ms  calls %5ld  experts %6ld (%.1f us each, %.1f a call)  rows/expert %6.1f  ~%5.1f TFLOPS\n",
+                                 gg::iq::name(kv.first.first), kv.first.second ? "down" : "gate+up", kv.second.ms, kv.second.calls,
+                                 kv.second.experts, kv.second.experts > 0 ? 1e3 * kv.second.ms / (double) kv.second.experts : 0.0,
+                                 kv.second.calls > 0 ? (double) kv.second.experts / (double) kv.second.calls : 0.0,
+                                 kv.second.experts > 0 ? (double) kv.second.rows / (double) kv.second.experts : 0.0,
+                                 kv.second.ms > 0 ? kv.second.flops / kv.second.ms / 1e9 : 0.0);
+                std::fprintf(stderr, "ds4 prof  expert kernels total %.1f ms\n", tot);
+            }
             for (double& v : cprof_ms) v = 0;
             prof_chunk = false;
         }
