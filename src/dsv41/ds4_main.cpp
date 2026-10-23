@@ -643,8 +643,7 @@ int profile_run(strata::ds4::Model& m, const std::string& ids_path, int window) 
     std::vector<ScoreSeg> segs;
     std::string err;
     if (!read_score_ids(ids_path, segs, err)) {
-        std::fprintf(stderr, "strata-dsv41: %s
-", err.c_str());
+        std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
         return 1;
     }
     const double t0 = now_ms();
@@ -655,15 +654,13 @@ int profile_run(strata::ds4::Model& m, const std::string& ids_path, int window) 
         for (size_t a = 0; a < ids.size();) {
             const int T = (int) std::min<size_t>((size_t) window, ids.size() - a);
             if (!m.feed(ids.data() + a, T, 0, err)) {
-                std::fprintf(stderr, "strata-dsv41: %s
-", err.c_str());
+                std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
                 return 1;
             }
             a += (size_t) T;
         }
         tot += (long long) ids.size();
-        std::fprintf(stderr, "profile-run %zu/%zu %s: %zu tokens, %lld in all, %.0f s, %.1f tok/s
-", si + 1, segs.size(),
+        std::fprintf(stderr, "profile-run %zu/%zu %s: %zu tokens, %lld in all, %.0f s, %.1f tok/s\n", si + 1, segs.size(),
                      segs[si].name.c_str(), ids.size(), tot, (now_ms() - t0) / 1000.0, 1000.0 * (double) tot / (now_ms() - t0));
         if ((si + 1) % 10 == 0) m.save_profile();
     }
