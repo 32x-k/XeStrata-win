@@ -7340,6 +7340,10 @@ struct Model::Impl {
         pos += n;
         st.tokens += n;
         cache_tick(n);
+        if (lm_end_.on) {   // (the layer cache's RAM back before the store and the swaps want it)
+            lm_end();
+            lm_end_.on = false;
+        }
         cache_settle();
         const int nr = std::min(T_last, tap_cap);
         if (!seed_drafter(pos - nr, nr, 0, err)) return false;
