@@ -163,7 +163,7 @@ static void bits(const char* what, int type, const void* p, size_t bytes) {
 // the real shapes (n_embd 5120, n_ff 2304): the plan path (6 groups of one entry) and the grouped path (windows of 3 and 2)
 static void real_shape_bits(int type) {
     std::mt19937_64 rng(1000 + type);   // (its own stream: the main loop's random experts are the same with or without this)
-    const int E = 5120, FF = 2304, NG = 2, NEnt = 5;
+    const int E = 5120, FF = 2304, NG = 2, NEnt = 12;
     const size_t rb_g = iq::row_bytes(type, E), rb_d = iq::row_bytes(type, FF);
     auto al = [](size_t n) { return (n + 255) / 256 * 256; };
     const size_t off[3] = {0, al(FF * rb_g), al(FF * rb_g) * 2}, blob = off[2] + al((size_t) E * rb_d);
@@ -176,7 +176,7 @@ static void real_shape_bits(int type) {
         else std::memcpy(p, &d, 2);
     }
     uint8_t* dblob = up(hb);
-    std::vector<int8_t> xq(E), hq((size_t) NEnt * FF); std::vector<float> xd(E / 32), hd((size_t) NEnt * FF / 32);
+    std::vector<int8_t> xq(2 * E), hq((size_t) NEnt * FF); std::vector<float> xd(2 * E / 32), hd((size_t) NEnt * FF / 32);
     for (auto& v : xq) v = (int8_t) ((int) (rng() % 255) - 127);
     for (auto& v : hq) v = (int8_t) ((int) (rng() % 255) - 127);
     for (auto& v : xd) v = 0.002f + 0.0001f * (float) (rng() % 100);
@@ -198,6 +198,24 @@ static void real_shape_bits(int type) {
     if (!iq::gate_up(a, NG, 3, 0) || !iq::down(a, NG, 3, 0)) { std::printf("real shape grouped: refused\n"); return; }
     CK(hipDeviceSynchronize());
     { auto h = down_(dh, (size_t) NEnt * FF); bits("real grp h", type, h.data(), h.size() * 4); auto p = down_(dp, (size_t) NEnt * E); bits("real grp part", type, p.data(), p.size() * 4); }
+    // more windows: a bound of 7 groups with 3 live (dynamic count), 5/1/3 entries (ne_max 5: the 8-entry kernels), then 9 groups of
+    // one entry with 4 live; entries index the h/hq rows, their input row is entry >> 3
+    {
+        std::vector<unsigned long long> gp2 = {(unsigned long long) dblob, (unsigned long long) (dblob + blob), (unsigned long long) dblob, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull};
+        std::vector<int> gs2 = {0, 5, 6, 9, 9, 9, 9, 9, 9, 9}, ge2 = {3, 1, 4, 0, 2, 7, 5, 6, 8, 11, 10, 9}, ng2 = {3};
+        a.grp_ptr = up(gp2); a.grp_start = up(gs2); a.grp_ent = up(ge2); a.n_groups = up(ng2);
+        CK(hipMemset(dh, 0, (size_t) NEnt * FF * 4)); CK(hipMemset(dp, 0, (size_t) NEnt * E * 4));
+        if (!iq::gate_up(a, 7, 5, 0) || !iq::down(a, 7, 5, 0)) { std::printf("real shape window 2: refused\n"); return; }
+        CK(hipDeviceSynchronize());
+        { auto h = down_(dh, (size_t) NEnt * FF); bits("real win2 h", type, h.data(), h.size() * 4); auto p = down_(dp, (size_t) NEnt * E); bits("real win2 part", type, p.data(), p.size() * 4); }
+        std::vector<int> gs3 = {0, 1, 2, 3, 4, 4, 4, 4, 4, 4}, ng3 = {4};
+        std::vector<unsigned long long> gp3 = {(unsigned long long) (dblob + blob), (unsigned long long) dblob, (unsigned long long) (dblob + blob), (unsigned long long) dblob, 0ull, 0ull, 0ull, 0ull, 0ull};
+        a.grp_ptr = up(gp3); a.grp_start = up(gs3); a.n_groups = up(ng3);
+        CK(hipMemset(dh, 0, (size_t) NEnt * FF * 4)); CK(hipMemset(dp, 0, (size_t) NEnt * E * 4));
+        if (!iq::gate_up(a, 9, 1, 0) || !iq::down(a, 9, 1, 0)) { std::printf("real shape window 3: refused\n"); return; }
+        CK(hipDeviceSynchronize());
+        { auto h = down_(dh, (size_t) NEnt * FF); bits("real win3 h", type, h.data(), h.size() * 4); auto p = down_(dp, (size_t) NEnt * E); bits("real win3 part", type, p.data(), p.size() * 4); }
+    }
     CK(hipFree(dblob));
 }
 
