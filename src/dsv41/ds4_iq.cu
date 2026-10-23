@@ -952,9 +952,9 @@ bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later, STRATA_DS4_NO_TC=1 keeps 
     }
 
 template <int T, int NE>
-void launch_gu(const Args& a, dim3 grid, cudaStream_t s) { gate_up_kernel<T, NE><<<grid, kThreads, 0, s>>>(a); }
+void launch_gu(const Args& a, dim3 grid, cudaStream_t s) { strata_ds4_launch(gate_up_kernel<T, NE>, grid, kThreads, 0, s, a); }
 template <int T, int NE>
-void launch_dn(const Args& a, dim3 grid, cudaStream_t s) { down_kernel<T, NE><<<grid, kThreads, 0, s>>>(a); }
+void launch_dn(const Args& a, dim3 grid, cudaStream_t s) { strata_ds4_launch(down_kernel<T, NE>, grid, kThreads, 0, s, a); }
 template <int T>
 void gu_ne(const Args& a, dim3 grid, int ne, cudaStream_t s) {
     if (ne <= 1) launch_gu<T, 1>(a, grid, s);
@@ -973,16 +973,16 @@ template <int T, bool GU>
 void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
 #if !defined(STRATA_USE_HIP)
     if (tc_ok()) {
-        set_tc_kernel<T, GU><<<grid, kThreads, 0, s>>>(a);
+        strata_ds4_launch(set_tc_kernel<T, GU>, grid, kThreads, 0, s, a);
         return;
     }
 #endif
     if (a.max_rows <= 16) {   // (a block of 64 rows would do 64 rows' FMAs for the few there are)
         grid.x = (unsigned) ((a.max_rows + 15) / 16);
-        set_kernel<T, GU, 16><<<grid, kThreads, 0, s>>>(a);
+        strata_ds4_launch(set_kernel<T, GU, 16>, grid, kThreads, 0, s, a);
         return;
     }
-    set_kernel<T, GU><<<grid, kThreads, 0, s>>>(a);
+    strata_ds4_launch(set_kernel<T, GU>, grid, kThreads, 0, s, a);
 }
 // the light sets' int8 rows, per stream (kLightMaxExp kLightRows rows of k)
 struct LightBuf {
@@ -1018,16 +1018,16 @@ bool light_on() {   // STRATA_DS4_NO_LIGHT=1: every set through the GEMM tiles
 template <int T, bool GU>
 void launch_light(const SetArgs& a, const LightBuf& b, cudaStream_t s) {
     const dim3 grid((unsigned) (((GU ? a.n_ff : a.n_embd) + kWarps - 1) / kWarps), (unsigned) a.n_exp);
-    if (a.max_rows <= 4) light_kernel<T, 4, GU><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
-    else if (a.max_rows <= 8) light_kernel<T, 8, GU><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
-    else light_kernel<T, kLightRows, GU><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
+    if (a.max_rows <= 4) strata_ds4_launch(light_kernel<T, 4, GU>, grid, kThreads, 0, s, a, b.q, b.d);
+    else if (a.max_rows <= 8) strata_ds4_launch(light_kernel<T, 8, GU>, grid, kThreads, 0, s, a, b.q, b.d);
+    else strata_ds4_launch(light_kernel<T, kLightRows, GU>, grid, kThreads, 0, s, a, b.q, b.d);
 }
 bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     const int K = gu ? a.n_embd : a.n_ff;
     LightBuf* b = light_buf(s, K);
     if (b == nullptr) return false;
     const dim3 gq((unsigned) ((K / 32 + kWarps - 1) / kWarps), (unsigned) (a.n_exp * kLightRows));
-    light_q8_kernel<<<gq, kThreads, 0, s>>>(gu ? a.xf : nullptr, gu ? nullptr : a.xh, a.idx, a.ldx, K, a.bounds,
+    strata_ds4_launch(light_q8_kernel, gq, kThreads, 0, s, gu ? a.xf : nullptr, gu ? nullptr : a.xh, a.idx, a.ldx, K, a.bounds,
                                             a.row0, b->q, b->d);
     if (gu) {
         if (a.tg == kMXFP4) {
@@ -1052,9 +1052,9 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
-    if (max_c <= 1) mv_kernel<T, 1><<<grid, kThreads, 0, s>>>(J);
-    else if (max_c <= 4) mv_kernel<T, 4><<<grid, kThreads, 0, s>>>(J);
-    else mv_kernel<T, 16><<<grid, kThreads, 0, s>>>(J);
+    if (max_c <= 1) strata_ds4_launch(mv_kernel<T, 1>, grid, kThreads, 0, s, J);
+    else if (max_c <= 4) strata_ds4_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, J);
+    else strata_ds4_launch(mv_kernel<T, 16>, grid, kThreads, 0, s, J);
 }
 
 
@@ -1091,7 +1091,7 @@ __global__ void __launch_bounds__(kThreads) dq_rows_kernel(const uint8_t* __rest
 bool dequant_rows(int type, const void* raw, size_t ld, int k, int n, uint16_t* dst, bool bf16, cudaStream_t s) {
     if (raw == nullptr || k % 256 != 0 || n <= 0) return false;
     const unsigned blocks = (unsigned) std::min<size_t>(((size_t) n * (size_t) (k / 32) + kThreads - 1) / kThreads, 65535);
-#define DS4_DQ(T) dq_rows_kernel<T><<<blocks, kThreads, 0, s>>>((const uint8_t*) raw, ld, k, n, dst, bf16)
+#define DS4_DQ(T) strata_ds4_launch(dq_rows_kernel<T>, blocks, kThreads, 0, s, (const uint8_t*) raw, ld, k, n, dst, bf16)
     switch (type) {
         case kIQ2_XXS: DS4_DQ(kIQ2_XXS); break;
         case kIQ2_XS: DS4_DQ(kIQ2_XS); break;

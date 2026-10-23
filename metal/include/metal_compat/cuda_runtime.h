@@ -1,4 +1,5 @@
 // The CUDA function-space qualifiers and the few launch/kernel spellings the shared sources use.  On Metal they say
+#include "cuda_launch.h"
 // nothing: a "kernel" here is an MSL function compiled at run time and dispatched by the host runtime, so the qualifiers
 // are empty and __forceinline__ is plain inline.  Part of the metal_compat layer (M5 Max, 2026-10-23).
 #ifndef __host__
@@ -42,6 +43,7 @@
 #endif
 
 #include "cuda_device_builtins.h"
+
 #include <cmath>
 
 using std::fmaxf;
@@ -93,6 +95,12 @@ inline constexpr unsigned cudaEventDefault = strata::gpu::kEventDefault;
 inline constexpr unsigned cudaEventDisableTiming = strata::gpu::kEventDisableTiming;
 inline constexpr unsigned cudaEventBlockingSync = strata::gpu::kEventBlockingSync;
 inline constexpr unsigned cudaStreamNonBlocking = strata::gpu::kStreamNonBlocking;
+enum cudaStreamCaptureStatus { cudaStreamCaptureStatusNone = 0, cudaStreamCaptureStatusActive = 1, cudaStreamCaptureStatusInvalidated = 2 };
+static inline strata::gpu::Error cudaStreamIsCapturing(strata::gpu::Stream, cudaStreamCaptureStatus* st) {
+    if (st) *st = cudaStreamCaptureStatusNone;
+    return strata::gpu::kSuccess;
+}
+
 enum cudaStreamCaptureMode { cudaStreamCaptureModeGlobal = 0, cudaStreamCaptureModeThreadLocal = 1, cudaStreamCaptureModeRelaxed = 2 };
 // (the compute capability is asked by the 0.1.45 Turing defaults in verify.cpp: no answer here, which reads as "not a Turing card")
 enum cudaDeviceAttr {
@@ -195,4 +203,11 @@ inline cudaError_t cudaGraphExecDestroy(cudaGraphExec_t x) { return strata::gpu:
 // copying nothing silently.
 inline strata::gpu::Error cudaMemcpy2D(void*, size_t, const void*, size_t, size_t, size_t, strata::gpu::CopyKind) {
     return strata::gpu::kErrorUnsupported;   // cudaMemcpy2D_unimplemented_marker
+}
+
+// occupancy query: the Metal runtime decides its own threadgroup limits, so answer "one block" and let the caller size grids
+template <typename K, typename... A>
+static inline strata::gpu::Error cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* n, K&&, int, A&&...) {
+    if (n) *n = 1;
+    return strata::gpu::kSuccess;
 }

@@ -1823,15 +1823,15 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
                    unsigned vl, int na0, int na1) {
-    route_publish_kernel<<<T, 512, 0, s>>>(logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
+    strata_ds4_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
                                            vl != 0 ? bias_vl : nullptr, vl);
-    if (req != nullptr) publish_kernel<<<1, 1, 0, s>>>(req, T, seq, na0, na1);
+    if (req != nullptr) strata_ds4_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1);
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s) {
     if (req != nullptr && m > 0 && T > 0 && n <= 1024 && off + m <= kAhead)
-        route_ahead_kernel<<<T, 512, 0, s>>>(logits, bias, n, m, req, off);
+        strata_ds4_launch(route_ahead_kernel, T, 512, 0, s, logits, bias, n, m, req, off);
 }
-void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { wait_seq_kernel<<<1, 32, 0, s>>>(seq_ptr, seq); }
+void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { strata_ds4_launch(wait_seq_kernel, 1, 32, 0, s, seq_ptr, seq); }
 
 // the RAM store's experts for the device (a decode token, window of one): a pick the VRAM table left at 0 whose expert the store holds
 // (zc_tab[expert] = the slot's device address over PCIe, 0: not) is copied to staging slot i with wide coalesced loads (the PCIe
@@ -1855,14 +1855,14 @@ __global__ void zc_fix_kernel(unsigned long long* __restrict__ plan, const int* 
 }
 void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int k, uint8_t* stage, size_t stride, size_t bytes,
               cudaStream_t s) {
-    zc_copy_kernel<<<dim3(64, k), 256, 0, s>>>(plan, idx, zc_tab, stage, stride, bytes);
-    zc_fix_kernel<<<1, 32, 0, s>>>(plan, idx, zc_tab, k, stage, stride);
+    strata_ds4_launch(zc_copy_kernel, dim3(64, k), 256, 0, s, plan, idx, zc_tab, stage, stride, bytes);
+    strata_ds4_launch(zc_fix_kernel, 1, 32, 0, s, plan, idx, zc_tab, k, stage, stride);
 }
 
-void init_pre(float* pre, int T, cudaStream_t s) { init_pre_kernel<<<cdiv(T * 8, 128), 128, 0, s>>>(pre, T); }
+void init_pre(float* pre, int T, cudaStream_t s) { strata_ds4_launch(init_pre_kernel, cdiv(T * 8, 128), 128, 0, s, pre, T); }
 
 void embed(const uint16_t* rows, int T, float* h, int dim, int hc, cudaStream_t s) {
-    embed_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(rows, h, dim, hc);
+    strata_ds4_launch(embed_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, rows, h, dim, hc);
 }
 
 void finish(float* x, int n_vec, int len, long long stride, const Finish& f, cudaStream_t s) {
@@ -1876,76 +1876,76 @@ void finish(float* x, int n_vec, int len, long long stride, const Finish& f, cud
             std::fprintf(stderr, "ds4 finish: packed rows of quant %d, %d values not covered\n", f.quant, len);
             return;
         }
-        finish_kernel<true><<<n_vec, kThreads, 0, s>>>(x, len, stride, f);
+        strata_ds4_launch(finish_kernel<true>, n_vec, kThreads, 0, s, x, len, stride, f);
     } else
-        finish_kernel<false><<<n_vec, kThreads, 0, s>>>(x, len, stride, f);
+        strata_ds4_launch(finish_kernel<false>, n_vec, kThreads, 0, s, x, len, stride, f);
 }
 
 void hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
-    hc_mix_kernel<<<dim3(n_mix, T), kThreads, 0, s>>>(h, fn, hcdim, eps, mixes);
+    strata_ds4_launch(hc_mix_kernel, dim3(n_mix, T), kThreads, 0, s, h, fn, hcdim, eps, mixes);
 }
 void hc_split(const float* mixes, const float* scale, const float* base, int hc, int iters, float hc_eps, int T,
               float* pre, float* post, float* comb, cudaStream_t s) {
-    hc_split_kernel<<<T, 32, 0, s>>>(mixes, scale, base, hc, iters, hc_eps, pre, post, comb);
+    strata_ds4_launch(hc_split_kernel, T, 32, 0, s, mixes, scale, base, hc, iters, hc_eps, pre, post, comb);
 }
 void hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int hc, int T, float eps, float* x,
                  cudaStream_t s) {
-    hc_pre_norm_kernel<<<T, 1024, 0, s>>>(h, mix, w, dim, hc, eps, x);
+    strata_ds4_launch(hc_pre_norm_kernel, T, 1024, 0, s, h, mix, w, dim, hc, eps, x);
 }
 void hc_post(const float* y, const float* res, const float* post, const float* comb, int dim, int hc, int T,
              float* out, cudaStream_t s) {
-    hc_post_kernel<<<dim3(cdiv(dim * hc, kThreads), T), kThreads, 0, s>>>(y, res, post, comb, dim, hc, out);
+    strata_ds4_launch(hc_post_kernel, dim3(cdiv(dim * hc, kThreads), T), kThreads, 0, s, y, res, post, comb, dim, hc, out);
 }
 
 void hc_post_inplace(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T,
                      cudaStream_t s) {
-    hc_post_inplace_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(y, h, post, comb, dim, hc);
+    strata_ds4_launch(hc_post_inplace_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, y, h, post, comb, dim, hc);
 }
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
-    hc_mix_scale_kernel<<<T, kThreads, 0, s>>>(h, hcdim, n_mix, eps, mixes);
+    strata_ds4_launch(hc_mix_scale_kernel, T, kThreads, 0, s, h, hcdim, n_mix, eps, mixes);
 }
 void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s, int fmt) {
-    if (T > 0) engram_dequant_tok_kernel<<<T * cols, kThreads, 0, s>>>(src, per, cols, hd, out, fmt);
+    if (T > 0) strata_ds4_launch(engram_dequant_tok_kernel, T * cols, kThreads, 0, s, src, per, cols, hd, out, fmt);
 }
 void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos,
               cudaStream_t s) {
-    moe_sort_kernel<false><<<n_vs, kThreads, 0, s>>>(idx, T, k, vs, bounds, row_tok, pos);
-    bounds_scan_kernel<<<1, 32, 0, s>>>(bounds, n_vs);
-    moe_sort_kernel<true><<<n_vs, kThreads, 0, s>>>(idx, T, k, vs, bounds, row_tok, pos);
+    strata_ds4_launch(moe_sort_kernel<false>, n_vs, kThreads, 0, s, idx, T, k, vs, bounds, row_tok, pos);
+    strata_ds4_launch(bounds_scan_kernel, 1, 32, 0, s, bounds, n_vs);
+    strata_ds4_launch(moe_sort_kernel<true>, n_vs, kThreads, 0, s, idx, T, k, vs, bounds, row_tok, pos);
 }
 void moe_combine(float* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1, int dim,
                  cudaStream_t s) {
-    if (r1 > r0 && T > 0) moe_combine_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(acc, y, pos, w, k, r0, r1, dim);
+    if (r1 > r0 && T > 0) strata_ds4_launch(moe_combine_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, acc, y, pos, w, k, r0, r1, dim);
 }
 
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, cudaStream_t s) {
-    gemv_f16_kernel<<<dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s>>>(W, x, n, k, alpha, y);
+    strata_ds4_launch(gemv_f16_kernel, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, alpha, y);
 }
 void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T, float alpha, float* y, size_t ldy,
                    cudaStream_t s) {
     if (T > 0)
-        gemv_f16_rows_kernel<<<dim3(cdiv(n, kThreads / 32), cdiv(T, kRowsT)), kThreads, 0, s>>>(W, x, ldx, n, k, T, alpha,
+        strata_ds4_launch(gemv_f16_rows_kernel, dim3(cdiv(n, kThreads / 32), cdiv(T, kRowsT)), kThreads, 0, s, W, x, ldx, n, k, T, alpha,
                                                                                                y, ldy);
 }
 
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
-    if (T > 0) gemv_f32_kernel<<<dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s>>>(W, x, n, k, y, ldy);
+    if (T > 0) strata_ds4_launch(gemv_f32_kernel, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, y, ldy);
 }
 
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
            cudaStream_t s, const float* bias_vl, const VlBits* vl) {
     static const VlBits none = {};
-    route_kernel<<<T, 512, 0, s>>>(logits, bias, n, k, route_scale, idx, w, vl != nullptr ? bias_vl : nullptr,
+    strata_ds4_launch(route_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, idx, w, vl != nullptr ? bias_vl : nullptr,
                                    vl != nullptr ? *vl : none);
 }
 
 void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s) {
-    if (n > 0) swiglu_kernel<<<cdiv(n, kThreads), kThreads, 0, s>>>(g, u, n, lim, h);
+    if (n > 0) strata_ds4_launch(swiglu_kernel, cdiv(n, kThreads), kThreads, 0, s, g, u, n, lim, h);
 }
 
 void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,
                   int d, const float* w, float eps, float* latent, cudaStream_t s) {
-    compress_kernel<<<1, 512, 0, s>>>(kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent);
+    strata_ds4_launch(compress_kernel, 1, 512, 0, s, kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent);
 }
 
 void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n, const int* cand,
@@ -1959,16 +1959,16 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
     const size_t smem = (size_t) (heads * hd + heads) * sizeof(float);
     const dim3 grid(cdiv(n, kThreads), T);
     if (kfmt == kKvFp4p)
-        index_score_kernel<128, kKvFp4p><<<grid, kThreads, smem, s>>>(q, w, (const uint8_t*) k, heads, n, cand,
+        strata_ds4_launch(index_score_kernel<128, kKvFp4p>, grid, kThreads, smem, s, q, w, (const uint8_t*) k, heads, n, cand,
                                                                        cand_stride, blk, lim, out, out_stride);
     else
-        index_score_kernel<128, kKvBf16><<<grid, kThreads, smem, s>>>(q, w, (const uint8_t*) k, heads, n, cand,
+        strata_ds4_launch(index_score_kernel<128, kKvBf16>, grid, kThreads, smem, s, q, w, (const uint8_t*) k, heads, n, cand,
                                                                        cand_stride, blk, lim, out, out_stride);
 }
 
 void topk(const float* vals, long long stride, int T, const Rows& r, const int* cand, int cand_stride, int blk,
           int* out, int out_stride, cudaStream_t s) {
-    topk_kernel<<<T, 1024, 0, s>>>(vals, stride, r, cand, cand_stride, blk, out, out_stride);
+    strata_ds4_launch(topk_kernel, T, 1024, 0, s, vals, stride, r, cand, cand_stride, blk, out, out_stride);
 }
 
 void cand_blocks(const float* score, long long stride, int T, const Rows& r, int blk, float* bm, long long bm_stride,
@@ -1985,7 +1985,7 @@ void cand_blocks(const float* score, long long stride, int T, const Rows& r, int
             rb.k[t] = r.k[t];
             nb_max = rb.n[t] > nb_max ? rb.n[t] : nb_max;
         }
-    block_max_kernel<<<dim3(cdiv(nb_max, kThreads), T), kThreads, 0, s>>>(score, stride, r, blk, bm, bm_stride);
+    strata_ds4_launch(block_max_kernel, dim3(cdiv(nb_max, kThreads), T), kThreads, 0, s, score, stride, r, blk, bm, bm_stride);
     topk(bm, bm_stride, T, rb, nullptr, 0, 1, out, out_stride, s);
 }
 
@@ -2010,7 +2010,7 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
         return;
     }
     if (ckv_fmt == kKvBf16) {
-        sparse_attn_kernel<false><<<dim3(heads, T), kThreads, 0, s>>>(q, win, (const uint16_t*) ckv, sel, sel_stride, a,
+        strata_ds4_launch(sparse_attn_kernel<false>, dim3(heads, T), kThreads, 0, s, q, win, (const uint16_t*) ckv, sel, sel_stride, a,
                                                                        sink, heads, d, scale, out);
         return;
     }
@@ -2033,15 +2033,15 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     // the BF16 rows' kernel itself (heads_per_block -1: this way at any T)
     const bool few = heads_per_block == -1 || (heads_per_block == 0 && T <= kAttnScratchT);
     if (few && scr != nullptr && scr->rows != nullptr && T <= scr->max_t && sel_stride <= scr->cap) {
-        unpack_sel_kernel<<<dim3(cdiv(sel_stride, kStage), T), kThreads, 0, s>>>((const uint8_t*) ckv, sel, sel_stride, a,
+        strata_ds4_launch(unpack_sel_kernel, dim3(cdiv(sel_stride, kStage), T), kThreads, 0, s, (const uint8_t*) ckv, sel, sel_stride, a,
                                                                                scr->cap, scr->rows);
 #if !defined(STRATA_USE_HIP)
         if (T == 1)   // (V100: the loads ahead pay for the decode's kernel at one query, not at more)
-            sparse_attn_kernel<true, 8><<<dim3(heads, T), kThreads, 0, s>>>(q, win, scr->rows, nullptr, scr->cap, a, sink,
+            strata_ds4_launch(sparse_attn_kernel<true, 8>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
                                                                              heads, d, scale, out);
         else
 #endif
-            sparse_attn_kernel<true, 0><<<dim3(heads, T), kThreads, 0, s>>>(q, win, scr->rows, nullptr, scr->cap, a, sink,
+            strata_ds4_launch(sparse_attn_kernel<true, 0>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
                                                                              heads, d, scale, out);
         return;
     }
@@ -2054,86 +2054,86 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     if (heads % G != 0) G = 1;
     const dim3 grid(heads / G, T);
     const uint8_t* c = (const uint8_t*) ckv;
-    if (G == 8) sparse_attn_packed_kernel<8><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
-    else if (G == 4) sparse_attn_packed_kernel<4><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
-    else if (G == 2) sparse_attn_packed_kernel<2><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
-    else sparse_attn_packed_kernel<1><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    if (G == 8) strata_ds4_launch(sparse_attn_packed_kernel<8>, grid, kThreads, 0, s, q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    else if (G == 4) strata_ds4_launch(sparse_attn_packed_kernel<4>, grid, kThreads, 0, s, q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    else if (G == 2) strata_ds4_launch(sparse_attn_packed_kernel<2>, grid, kThreads, 0, s, q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    else strata_ds4_launch(sparse_attn_packed_kernel<1>, grid, kThreads, 0, s, q, win, c, sel, sel_stride, a, sink, heads, scale, out);
 }
 
 void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s) {
-    ring_to_ext_kernel<<<n, kThreads, 0, s>>>(ring, ext, (long long) p0, n, d);
+    strata_ds4_launch(ring_to_ext_kernel, n, kThreads, 0, s, ring, ext, (long long) p0, n, d);
 }
 void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, int d, cudaStream_t s, uint8_t* backup) {
     if (d % 32 != 0) {
         std::fprintf(stderr, "ds4 ext_to_ring: row of %d not covered\n", d);
         return;
     }
-    ext_to_ring_kernel<<<T, kThreads, 0, s>>>(ext, ring, (long long) p0, n, T, d, backup);
+    strata_ds4_launch(ext_to_ring_kernel, T, kThreads, 0, s, ext, ring, (long long) p0, n, T, d, backup);
 }
 void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s) {
     if (T > keep)
-        ring_restore_kernel<<<T - keep, kThreads, 0, s>>>(ring, backup, (long long) p0, n, keep, kv_row_bytes(kKvFp8, d));
+        strata_ds4_launch(ring_restore_kernel, T - keep, kThreads, 0, s, ring, backup, (long long) p0, n, keep, kv_row_bytes(kKvFp8, d));
 }
 void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s) {
     if (T > keep && b.n > 0)
-        ring_restore_batch_kernel<<<dim3(T - keep, b.n), kThreads, 0, s>>>(b, (long long) p0, n, keep,
+        strata_ds4_launch(ring_restore_batch_kernel, dim3(T - keep, b.n), kThreads, 0, s, b, (long long) p0, n, keep,
                                                                              kv_row_bytes(kKvFp8, d));
 }
 void hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_stride, cudaStream_t s) {
-    hc_mean_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(h, hc, dim, out, out_stride);
+    strata_ds4_launch(hc_mean_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, h, hc, dim, out, out_stride);
 }
-void iota_rows(int* out, int T, int n, int stride, cudaStream_t s) { iota_rows_kernel<<<T, 64, 0, s>>>(out, n, stride); }
+void iota_rows(int* out, int T, int n, int stride, cudaStream_t s) { strata_ds4_launch(iota_rows_kernel, T, 64, 0, s, out, n, stride); }
 void markov_add(float* logits, const uint16_t* E, const uint16_t* H, const int* tok, int V, int R, cudaStream_t s) {
-    markov_kernel<<<cdiv(V, kThreads / 32), kThreads, (size_t) R * sizeof(float), s>>>(logits, E, H, tok, V, R);
+    strata_ds4_launch(markov_kernel, cdiv(V, kThreads / 32), kThreads, (size_t) R * sizeof(float), s, logits, E, H, tok, V, R);
 }
 void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn, int R, cudaStream_t s) {
-    markov_share_kernel<<<cdiv(vn, kThreads / 32), kThreads, (size_t) R * sizeof(float), s>>>(logits, H, erow, vn, R);
+    strata_ds4_launch(markov_share_kernel, cdiv(vn, kThreads / 32), kThreads, (size_t) R * sizeof(float), s, logits, H, erow, vn, R);
 }
 void argmax_share(const float* row, int vn, int v0, unsigned* slot, unsigned seq, cudaStream_t s) {
-    argmax_share_kernel<<<1, 1024, 0, s>>>(row, vn, v0, slot, seq);
+    strata_ds4_launch(argmax_share_kernel, 1, 1024, 0, s, row, vn, v0, slot, seq);
 }
 void markov_pick(const unsigned* slots, int nm, unsigned seq, int* tok, const uint16_t* E, uint16_t* erow, int R,
                  cudaStream_t s) {
-    markov_pick_kernel<<<1, 256, 0, s>>>(slots, nm, seq, tok, E, erow, R);
+    strata_ds4_launch(markov_pick_kernel, 1, 256, 0, s, slots, nm, seq, tok, E, erow, R);
 }
 void confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out,
                 cudaStream_t s) {
-    confidence_kernel<<<T, 1024, 0, s>>>(x, E, tok, w, dim, R, out);
+    strata_ds4_launch(confidence_kernel, T, 1024, 0, s, x, E, tok, w, dim, R, out);
 }
 
 void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, int fmt) {
-    engram_dequant_kernel<<<n, kThreads, 0, s>>>(rows, scales, hd, out, fmt);
+    strata_ds4_launch(engram_dequant_kernel, n, kThreads, 0, s, rows, scales, hd, out, fmt);
 }
 
 void engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int T, float eps, cudaStream_t s) {
-    engram_gate_kernel<<<dim3(hc, T), 1024, 0, s>>>(h, kv, w, hc, dim, eps);
+    strata_ds4_launch(engram_gate_kernel, dim3(hc, T), 1024, 0, s, h, kv, w, hc, dim, eps);
 }
 
 void gather_rows(const float* x, const Gather& g, int n, int cols, float* out, cudaStream_t s) {
-    if (n > 0) gather_kernel<<<dim3(cdiv(cols, kThreads), n), kThreads, 0, s>>>(x, g, cols, out);
+    if (n > 0) strata_ds4_launch(gather_kernel, dim3(cdiv(cols, kThreads), n), kThreads, 0, s, x, g, cols, out);
 }
 
 void combine(const float* ed, const float* cpu, const float* sh, const Combine& c, int T, int dim, float* out,
              cudaStream_t s) {
-    combine_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(ed, cpu, sh, c, dim, out);
+    strata_ds4_launch(combine_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, ed, cpu, sh, c, dim, out);
 }
 
 void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaStream_t s) {
     size_t total = 0;
     for (int i = 0; i < x.n; ++i) total += x.bytes[i] / 16;
     const int blocks = (int) std::max<size_t>(1, std::min<size_t>(64, (total + kThreads - 1) / kThreads));
-    xfer_put_kernel<<<blocks, kThreads, 0, s>>>(x, flag, seq, cnt);
+    strata_ds4_launch(xfer_put_kernel, blocks, kThreads, 0, s, x, flag, seq, cnt);
 }
 void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s) {
     size_t total = 0;
     for (int i = 0; i < x.n; ++i) total += x.bytes[i] / 16;
     const int blocks = (int) std::max<size_t>(1, std::min<size_t>(64, (total + kThreads - 1) / kThreads));
-    xfer_get_kernel<<<blocks, kThreads, 0, s>>>(x, flag, seq);
+    strata_ds4_launch(xfer_get_kernel, blocks, kThreads, 0, s, x, flag, seq);
 }
 void wait_flags(const unsigned* flags, int n, int stride, unsigned seq, cudaStream_t s) {
-    if (n > 0) wait_flags_kernel<<<1, 32, 0, s>>>(flags, n, stride, seq);
+    if (n > 0) strata_ds4_launch(wait_flags_kernel, 1, 32, 0, s, flags, n, stride, seq);
 }
-void set_flag(unsigned* flag, unsigned v, cudaStream_t s) { set_flag_kernel<<<1, 1, 0, s>>>(flag, v); }
+void set_flag(unsigned* flag, unsigned v, cudaStream_t s) { strata_ds4_launch(set_flag_kernel, 1, 1, 0, s, flag, v); }
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s) {
     const int slot = (int) (seq % (unsigned) a.slots);
     if (a.nm > 2 && a.sums != nullptr && a.bflags != nullptr) {   // (the reduce-scatter: ar_rs_kernel)
@@ -2144,9 +2144,9 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
         const int n4 = n / 4;
         const int blocks = std::max(1, std::min(kArBlocks, cdiv(n4, kThreads)));
         if (f16)
-            ar_rs16_kernel<<<blocks, kThreads, 0, s>>>(x, n4, a.data, a.sums, a.stride, a.bflags, a.nm, mi, slot, a.slots, seq);
+            strata_ds4_launch(ar_rs16_kernel, blocks, kThreads, 0, s, x, n4, a.data, a.sums, a.stride, a.bflags, a.nm, mi, slot, a.slots, seq);
         else
-            ar_rs_kernel<<<blocks, kThreads, 0, s>>>(x, n4, a.data, a.sums, a.stride, a.bflags, a.nm, mi, slot, a.slots, seq);
+            strata_ds4_launch(ar_rs_kernel, blocks, kThreads, 0, s, x, n4, a.data, a.sums, a.stride, a.bflags, a.nm, mi, slot, a.slots, seq);
         return;
     }
     Xfer xp;
@@ -2157,7 +2157,7 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
     xfer_put(xp, a.flags + ((size_t) mi * a.slots + slot) * 32, seq, cnt, s);
     const int n4 = n / 4;
     const int blocks = std::max(1, std::min(64, cdiv(n4, kThreads)));
-    ar_sum_kernel<<<blocks, kThreads, 0, s>>>(x, n4, a.data, a.stride, a.flags, a.nm, mi, slot, a.slots, seq);
+    strata_ds4_launch(ar_sum_kernel, blocks, kThreads, 0, s, x, n4, a.data, a.stride, a.flags, a.nm, mi, slot, a.slots, seq);
 }
 
 }  // namespace strata::ds4

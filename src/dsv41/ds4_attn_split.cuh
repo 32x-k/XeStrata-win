@@ -198,8 +198,8 @@ void sparse_attn_split(const float* q, const uint16_t* win, const uint8_t* ckv, 
                        const AttnRows& ar, const float* sink, int heads, int T, float scale, float* out, const AttnSplitScratch& sc,
                        int total_max, cudaStream_t s) {
     const int nsplit = (total_max + R - 1) / R;
-    attn_part<G, R><<<dim3(heads / G, nsplit, T), 256, 0, s>>>(q, win, ckv, ckv_row_bytes, sel, sel_stride, ar, heads, scale, sc.part, sc.ml, sc.nsplit);
-    attn_merge<<<dim3(heads, T), 256, 0, s>>>(sc.part, sc.ml, sink, heads, sc.nsplit, R, ar, out);
+    strata_ds4_launch(attn_part<G, R>, dim3(heads / G, nsplit, T), 256, 0, s, q, win, ckv, ckv_row_bytes, sel, sel_stride, ar, heads, scale, sc.part, sc.ml, sc.nsplit);
+    strata_ds4_launch(attn_merge, dim3(heads, T), 256, 0, s, sc.part, sc.ml, sink, heads, sc.nsplit, R, ar, out);
 }
 
 }  // namespace attnsplit

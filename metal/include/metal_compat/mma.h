@@ -29,10 +29,10 @@ template <typename Use, int M, int N, int K, typename T, typename Layout = void>
     std::abort();
 }
 
-template <typename F, typename T> inline void fill_fragment(F&, T) { strata_metal_wmma_missing("fill_fragment"); }
-template <typename F, typename P> inline void load_matrix_sync(F&, const P*, unsigned, unsigned = 0) { strata_metal_wmma_missing("load_matrix_sync"); }
-template <typename F> inline void mma_sync(F&, const F&, const F&, const F&) { strata_metal_wmma_missing("mma_sync"); }
-template <typename F, typename P> inline void store_matrix_sync(P*, const F&, unsigned, layout_t) { strata_metal_wmma_missing("store_matrix_sync"); }
+template <typename... A> inline void fill_fragment(A&&...) { strata_metal_wmma_missing("fill_fragment"); }
+template <typename... A> inline void load_matrix_sync(A&&...) { strata_metal_wmma_missing("load_matrix_sync"); }
+template <typename... A> inline void mma_sync(A&&...) { strata_metal_wmma_missing("mma_sync"); }   // variadic: the engine passes four fragments of different types
+template <typename... A> inline void store_matrix_sync(A&&...) { strata_metal_wmma_missing("store_matrix_sync"); }
 
 }   // namespace wmma
 }   // namespace nvcuda

@@ -47,7 +47,7 @@ __global__ void moe_win_group_kernel(const __grid_constant__ MoeWin w) {
 }  // namespace
 
 void moe_win_group(const MoeWin& w, cudaStream_t s) {
-    moe_win_group_kernel<<<1, 32, 0, s>>>(w);
+    strata_ds4_launch(moe_win_group_kernel, 1, 32, 0, s, w);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "dsv41: moe_win_group: %s\n", cudaGetErrorString(e));

@@ -85,3 +85,15 @@ static inline float __fadd_rn(float a, float b) { return a + b; }
 static inline float __fmaf_rn(float a, float b, float c) { return a * b + c; }
 static inline float __frcp_rn(float a) { return 1.0f / a; }
 static inline float __fsqrt_rn(float a) { return __builtin_sqrtf(a); }
+
+// the half2 pack/unpack and arithmetic helpers the trellis and vision paths use
+static inline __half2 __halves2half2(__half lo, __half hi) { __half2 h; h.x = lo.x; h.y = hi.x; return h; }
+static inline __half2 __half2half2(__half v) { __half2 h; h.x = v.x; h.y = v.x; return h; }
+static inline __half __low2half(__half2 h) { __half o; o.x = h.x; return o; }
+static inline __half __high2half(__half2 h) { __half o; o.x = h.y; return o; }
+static inline float __low2float(__half2 h) { return strata_f16_bits_to_f32(h.x); }
+static inline float __high2float(__half2 h) { return strata_f16_bits_to_f32(h.y); }
+static inline __half2 __hadd2(__half2 a, __half2 b) { return __floats2half2_rn(__half2float(__low2half(a)) + __half2float(__low2half(b)), __half2float(__high2half(a)) + __half2float(__high2half(b))); }
+static inline __half2 __hmul2(__half2 a, __half2 b) { return __floats2half2_rn(__half2float(__low2half(a)) * __half2float(__low2half(b)), __half2float(__high2half(a)) * __half2float(__high2half(b))); }
+static inline __half2 __hfma2(__half2 a, __half2 b, __half2 c) { return __floats2half2_rn(__half2float(__low2half(a)) * __half2float(__low2half(b)) + __half2float(__low2half(c)), __half2float(__high2half(a)) * __half2float(__high2half(b)) + __half2float(__high2half(c))); }
+static inline __half2 __hneg2(__half2 a) { __half2 h; h.x = a.x ^ 0x8000u; h.y = a.y ^ 0x8000u; return h; }

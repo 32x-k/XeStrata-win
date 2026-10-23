@@ -198,7 +198,7 @@ __global__ void __launch_bounds__(kThreads) q8_quant_kernel(const float* __restr
 }
 void q8_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
     const dim3 grid((unsigned) ((k / 32 + kWarps - 1) / kWarps), (unsigned) rows);
-    q8_quant_kernel<<<grid, kThreads, 0, s>>>(x, ldx, k, q, d);
+    strata_ds4_launch(q8_quant_kernel, grid, kThreads, 0, s, x, ldx, k, q, d);
 }
 
 // 8 E2M1 codes (a word of 4 code bytes) -> their values as int8: .x the low nibbles' (values 0..3 of the word's bytes),
@@ -1040,14 +1040,14 @@ template <int NC>
 void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
     if (f == 1) {
-        if (vec) mx_mv_kernel<NC, true, false><<<grid, kThreads, 0, s>>>(J);
-        else mx_mv_kernel<NC, false, false><<<grid, kThreads, 0, s>>>(J);
+        if (vec) strata_ds4_launch(mx_mv_kernel<NC, true, false>, grid, kThreads, 0, s, J);
+        else strata_ds4_launch(mx_mv_kernel<NC, false, false>, grid, kThreads, 0, s, J);
     } else if (f == 2) {   // (vec here: every row 4-byte aligned, so staged)
-        if (vec) q8_mv_kernel<NC, true><<<grid, kThreads, 0, s>>>(J);
-        else q8_mv_kernel<NC, false><<<grid, kThreads, 0, s>>>(J);
+        if (vec) strata_ds4_launch(q8_mv_kernel<NC, true>, grid, kThreads, 0, s, J);
+        else strata_ds4_launch(q8_mv_kernel<NC, false>, grid, kThreads, 0, s, J);
     } else {
-        if (vec) bf16_mv_kernel<NC, true><<<grid, kThreads, 0, s>>>(J);
-        else bf16_mv_kernel<NC, false><<<grid, kThreads, 0, s>>>(J);
+        if (vec) strata_ds4_launch(bf16_mv_kernel<NC, true>, grid, kThreads, 0, s, J);
+        else strata_ds4_launch(bf16_mv_kernel<NC, false>, grid, kThreads, 0, s, J);
     }
 }
 void mv_set(int f, const BfJobs& J, int nj, int max_n, int max_c, bool vec, cudaStream_t s) {
@@ -1165,8 +1165,8 @@ void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s) {
     const size_t ld = row_stride(m);
     const size_t total = (size_t) m.n * (size_t) m.k;
     const unsigned blocks = (unsigned) std::min<size_t>((total + 255) / 256, 65535);
-    if (m.fmt == kFmtQ8_0) q8_rows_kernel<<<blocks, 256, 0, s>>>((const uint8_t*) m.raw, ld, m.k, m.n, dst, bf16);
-    else bf16_rows_kernel<<<blocks, 256, 0, s>>>((const uint16_t*) m.raw, ld, m.k, m.n, dst, bf16);
+    if (m.fmt == kFmtQ8_0) strata_ds4_launch(q8_rows_kernel, blocks, 256, 0, s, (const uint8_t*) m.raw, ld, m.k, m.n, dst, bf16);
+    else strata_ds4_launch(bf16_rows_kernel, blocks, 256, 0, s, (const uint16_t*) m.raw, ld, m.k, m.n, dst, bf16);
     check("rows");
 }
 
@@ -1175,15 +1175,15 @@ namespace {
 template <int NE>
 struct GateUpK {
     static void run(const MxArgs& m, dim3 grid, cudaStream_t s) {
-        if (mx_row_bytes(m.n_embd) % 4 == 0) mx_gate_up_kernel<NE, true><<<grid, kThreads, 0, s>>>(m);
-        else mx_gate_up_kernel<NE, false><<<grid, kThreads, 0, s>>>(m);
+        if (mx_row_bytes(m.n_embd) % 4 == 0) strata_ds4_launch(mx_gate_up_kernel<NE, true>, grid, kThreads, 0, s, m);
+        else strata_ds4_launch(mx_gate_up_kernel<NE, false>, grid, kThreads, 0, s, m);
     }
 };
 template <int NE>
 struct DownK {
     static void run(const MxArgs& m, dim3 grid, cudaStream_t s) {
-        if (mx_row_bytes(m.n_ff) % 4 == 0) mx_down_kernel<NE, true><<<grid, kThreads, 0, s>>>(m);
-        else mx_down_kernel<NE, false><<<grid, kThreads, 0, s>>>(m);
+        if (mx_row_bytes(m.n_ff) % 4 == 0) strata_ds4_launch(mx_down_kernel<NE, true>, grid, kThreads, 0, s, m);
+        else strata_ds4_launch(mx_down_kernel<NE, false>, grid, kThreads, 0, s, m);
     }
 };
 template <template <int> class Kern>
@@ -1265,7 +1265,7 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     c.out_stride = (size_t) a.n_embd;
     c.k = a.k;
     c.n_embd = a.n_embd;
-    mx_combine_kernel<<<dim3((unsigned) ((a.n_embd + 127) / 128), 1), 128, 0, s>>>(c);
+    strata_ds4_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), 1), 128, 0, s, c);
     check("moe_down");
 }
 
@@ -1312,7 +1312,7 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     q8_quant(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);   // (rows of picks not on the device: unused)
     if (mx) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
     else iq::down(ia, groups, a.T, s);
-    if (a.wait_ptr != nullptr) mx_wait_kernel<<<1, 32, 0, s>>>(a.wait_ptr, a.wait_val);
+    if (a.wait_ptr != nullptr) strata_ds4_launch(mx_wait_kernel, 1, 32, 0, s, a.wait_ptr, a.wait_val);
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;
     c.plan_w = a.plan_w;
@@ -1325,7 +1325,7 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     c.out_stride = a.out_stride;
     c.k = a.k;
     c.n_embd = a.n_embd;
-    mx_combine_kernel<<<dim3((unsigned) ((a.n_embd + 127) / 128), (unsigned) a.T), 128, 0, s>>>(c);
+    strata_ds4_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), (unsigned) a.T), 128, 0, s, c);
     check("win_experts");
     return true;
 }
@@ -1400,12 +1400,12 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
     k.ldo = ldh;
     const dim3 grid((unsigned) ((sa.max_rows + BM - 1) / BM), (unsigned) (sa.n_ff / BN), (unsigned) sa.n_exp);
 #if !defined(STRATA_USE_HIP)
-    if (tc_ok()) mx_set_tc_kernel<true><<<grid, kThreads, 0, s>>>(k);
+    if (tc_ok()) strata_ds4_launch(mx_set_tc_kernel<true>, grid, kThreads, 0, s, k);
 #else
-    if (tc_ok()) mx_set_wmma_kernel<true><<<grid, kThreads, 0, s>>>(k);
+    if (tc_ok()) strata_ds4_launch(mx_set_wmma_kernel<true>, grid, kThreads, 0, s, k);
 #endif
     else
-        mx_set_kernel<true><<<grid, kThreads, 0, s>>>(k);
+        strata_ds4_launch(mx_set_kernel<true>, grid, kThreads, 0, s, k);
     check("set_gate_up");
 }
 
@@ -1457,12 +1457,12 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
     k.ldo = ldy;
     const dim3 grid((unsigned) ((sa.max_rows + BM - 1) / BM), (unsigned) (sa.n_embd / BN), (unsigned) sa.n_exp);
 #if !defined(STRATA_USE_HIP)
-    if (tc_ok()) mx_set_tc_kernel<false><<<grid, kThreads, 0, s>>>(k);
+    if (tc_ok()) strata_ds4_launch(mx_set_tc_kernel<false>, grid, kThreads, 0, s, k);
 #else
-    if (tc_ok()) mx_set_wmma_kernel<false><<<grid, kThreads, 0, s>>>(k);
+    if (tc_ok()) strata_ds4_launch(mx_set_wmma_kernel<false>, grid, kThreads, 0, s, k);
 #endif
     else
-        mx_set_kernel<false><<<grid, kThreads, 0, s>>>(k);
+        strata_ds4_launch(mx_set_kernel<false>, grid, kThreads, 0, s, k);
     check("set_down");
 }
 

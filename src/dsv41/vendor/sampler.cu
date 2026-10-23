@@ -525,12 +525,12 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
     if (p.greedy || p.temperature <= 0.0f) {
         // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
         const int gthreads = 1024;
-        sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
+        strata_ds4_launch(sampler_greedy_kernel, (unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream, 
             logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
     } else {
         // The same block-per-token shape: the selection's k argmax rounds reduce inside the block.  See
         // `sampler_kernel`'s header for what the old one-thread-per-token launch cost.
-        sampler_kernel<0><<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
+        strata_ds4_launch(sampler_kernel<0>, (unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream, 
             logits, n_vocab, n_tokens, history, history_len, p, out, nullptr, nullptr);
     }
     const cudaError_t e = cudaGetLastError();
@@ -564,7 +564,7 @@ void sample_draft(const float* logits, int n_tokens, int n_vocab, const SamplerP
                   void* stream) {
     if (n_tokens <= 0) return;
     spec_check("sample_draft", n_tokens, n_vocab, p);
-    sampler_kernel<1><<<(unsigned) n_tokens, 1024, 0, (cudaStream_t) stream>>>(logits, n_vocab, n_tokens, nullptr, 0,
+    strata_ds4_launch(sampler_kernel<1>, (unsigned) n_tokens, 1024, 0, (cudaStream_t) stream, logits, n_vocab, n_tokens, nullptr, 0,
                                                                                 p, out, q, nullptr);
     spec_launched("sample_draft", stream);
 }
@@ -573,7 +573,7 @@ void sample_verify(const float* logits, int n_tokens, int n_vocab, const Sampler
                    const int* draft, int* out, void* stream) {
     if (n_tokens <= 0) return;
     spec_check("sample_verify", n_tokens, n_vocab, p);
-    sampler_kernel<2><<<(unsigned) n_tokens, 1024, 0, (cudaStream_t) stream>>>(logits, n_vocab, n_tokens, nullptr, 0,
+    strata_ds4_launch(sampler_kernel<2>, (unsigned) n_tokens, 1024, 0, (cudaStream_t) stream, logits, n_vocab, n_tokens, nullptr, 0,
                                                                                 p, out, const_cast<SpecList*>(q), draft);
     spec_launched("sample_verify", stream);
 }

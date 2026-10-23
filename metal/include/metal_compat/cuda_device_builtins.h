@@ -1,3 +1,10 @@
+#ifndef __grid_constant__
+#define __grid_constant__
+#endif
+#ifndef __device_builtin__
+#define __device_builtin__
+#endif
+
 // cuda_device_builtins.h - the CUDA device built-ins, declared for the HOST compile only.
 //
 // The DeepSeek kernels are compiled twice in this port: as C++ here, to enumerate exactly which API the device code uses,
@@ -16,10 +23,6 @@ static strata_dim3 threadIdx{0, 0, 0}, blockIdx{0, 0, 0}, blockDim{1, 1, 1}, gri
 
 static inline void __syncthreads() {}
 static inline void __syncwarp(unsigned = 0xffffffffu) {}
-static inline unsigned __shfl_down_sync(unsigned, unsigned v, int) { return v; }
-static inline unsigned __shfl_xor_sync(unsigned, unsigned v, int) { return v; }
-static inline float __shfl_down_sync(unsigned, float v, int) { return v; }
-static inline float __shfl_xor_sync(unsigned, float v, int) { return v; }
 static inline unsigned __ballot_sync(unsigned, int) { return 0; }
 static inline int __popc(unsigned v) { return __builtin_popcount(v); }
 static inline int __ffs(unsigned v) { return __builtin_ffs((int) v); }
@@ -144,6 +147,19 @@ static inline int __float2int_rd(float a) { return (int) __builtin_floorf(a); }
 static inline int __float2int_ru(float a) { return (int) __builtin_ceilf(a); }
 template <typename T> static inline T __ldg(const T* p) { return *p; }
 template <typename T> static inline T __ldcv(const T* p) { return *p; }
-static inline unsigned __shfl_up_sync(unsigned, unsigned v, int) { return v; }
-static inline float __shfl_up_sync(unsigned, float v, int) { return v; }
-static inline unsigned __shfl_sync(unsigned, unsigned v, int) { return v; }
+
+// shuffles: one template each, so int/unsigned/float/short all bind (CUDA has overloads; a template is the same thing here)
+template <typename T> static inline T __shfl_xor_sync(unsigned, T v, int) { return v; }
+template <typename T> static inline T __shfl_down_sync(unsigned, T v, int) { return v; }
+template <typename T> static inline T __shfl_up_sync(unsigned, T v, int) { return v; }
+template <typename T> static inline T __shfl_sync(unsigned, T v, int) { return v; }
+
+// the integer multiply-high and the bitwise atomics the sampler uses
+static inline unsigned __umulhi(unsigned a, unsigned b) { return (unsigned) (((unsigned long long) a * b) >> 32); }
+static inline int __mulhi(int a, int b) { return (int) (((long long) a * b) >> 32); }
+static inline unsigned atomicOr(unsigned* p, unsigned v) { const unsigned o = *p; *p = o | v; return o; }
+static inline unsigned atomicAnd(unsigned* p, unsigned v) { const unsigned o = *p; *p = o & v; return o; }
+static inline unsigned atomicXor(unsigned* p, unsigned v) { const unsigned o = *p; *p = o ^ v; return o; }
+static inline unsigned atomicExch(unsigned* p, unsigned v) { const unsigned o = *p; *p = v; return o; }
+static inline unsigned atomicInc(unsigned* p, unsigned v) { const unsigned o = *p; *p = (o >= v ? 0 : o + 1); return o; }
+static inline unsigned atomicDec(unsigned* p, unsigned v) { const unsigned o = *p; *p = (o == 0 || o > v ? v : o - 1); return o; }

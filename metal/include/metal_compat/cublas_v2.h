@@ -21,6 +21,7 @@ enum cublasOperation_t { CUBLAS_OP_N = 0, CUBLAS_OP_T = 1, CUBLAS_OP_C = 2 };
 enum cublasComputeType_t { CUBLAS_COMPUTE_16F = 64, CUBLAS_COMPUTE_32F = 68, CUBLAS_COMPUTE_32F_FAST_16F = 74 };
 enum cublasGemmAlgo_t { CUBLAS_GEMM_DEFAULT = -1, CUBLAS_GEMM_DEFAULT_TENSOR_OP = 99 };
 enum cudaDataType_t { CUDA_R_32F = 0, CUDA_R_16F = 2, CUDA_R_16BF = 14, CUDA_R_8F_E4M3 = 28 };
+using cudaDataType = cudaDataType_t;   // the engine names it both ways
 
 static inline cublasStatus_t cublasCreate(cublasHandle_t* h) {
     *h = (void*) 1;   // the Metal runtime is a singleton: the handle carries no state
