@@ -933,7 +933,9 @@ A chat and an agent's subagent can then alternate without re-reading each other.
 
 - Requests still run one at a time.
   Nothing tells conversations apart but their tokens, pictures and control-vector setting.
-- The default is 0 (off); `--prompt-cache 0` turns it off too.
+- Without `--conversation-cache-mib` the budget is sized from the RAM that is free once the model is loaded:
+  40% of what is left above `--conversation-cache-min-free-mib`, in steps of 256 MiB, at most 8192 MiB, and off when that is under 1024 MiB.
+  The engine log says which in one line. `--conversation-cache-mib 0` turns it off, and so does `--prompt-cache 0`.
   Parked conversations are not kept across restarts, unless [the next section](#keeping-parked-conversations-across-restarts-opt-in) is set up.
 - Before each copy the engine checks that `--conversation-cache-min-free-mib N` (default 2560) of RAM stays free (the figure is read as below).
   If it does not, it evicts the oldest parked conversations and checks again (upstream 940011da).

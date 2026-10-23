@@ -500,8 +500,9 @@ struct Options {
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
     int prompt_cache = 6;
     /// --serve: parked conversations (upstream ccc660b): a host-RAM budget for whole sessions put aside when another
-    /// conversation takes the session, at most `slots` of them, and the RAM that must stay free when one is parked
-    int64_t conversation_cache_mib = 0;
+    /// conversation takes the session, at most `slots` of them, and the RAM that must stay free when one is parked;
+    /// -1: not given, --serve sizes it from the free RAM (#3493), 0: off
+    int64_t conversation_cache_mib = -1;
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
     /// --serve: park only conversations of at least this many tokens.  Every parked conversation costs one of
@@ -659,7 +660,7 @@ void usage() {
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
-                 "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
+                 "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default: sized from the free RAM, up to 8192; 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
                  "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
@@ -7328,6 +7329,25 @@ int main(int argc, char** argv) {
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
+        // #3493: no --conversation-cache-mib given: size the cache for agent use from the RAM that is free now that the model is
+        // loaded (an agent Harness alternates a long main conversation with shorter ones; with the cache off every request read
+        // its whole prompt again, Reused 0 on 12 of 12).  An explicit value, 0 included, is never touched; without --mtp
+        // nothing is parked (above), so it stays off.
+        if (o.conversation_cache_mib < 0) {
+            if (o.serve && use_mtp && o.prompt_cache > 0 && o.conversation_cache_slots > 0) {
+                o.conversation_cache_mib = strata::core::auto_conversation_cache_mib(strata::core::available_host_bytes(),
+                                                                                    o.conversation_cache_min_free_mib);
+                if (o.conversation_cache_mib > 0)
+                    std::fprintf(stderr, "strata serve: conversation cache sized from the free RAM: %lld MiB for up to %d parked "
+                                         "conversations, so an agent's next turn reuses its prompt (--conversation-cache-mib N sets it, 0 turns it off)\n",
+                                 (long long) o.conversation_cache_mib, o.conversation_cache_slots);
+                else
+                    std::fprintf(stderr, "strata serve: conversation cache off: not enough free RAM to park conversations "
+                                         "(--conversation-cache-mib N asks for one anyway)\n");
+            } else {
+                o.conversation_cache_mib = 0;
+            }
+        }
         // ---- parked conversations (--conversation-cache-mib, upstream ccc660b-cecf697): when a request continues
         // another conversation than the live one, the live one's K/V, running state and checkpoints are copied to
         // host RAM first, and a parked one whose tokens start the request is put back instead of read again.  Saved

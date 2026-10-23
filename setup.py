@@ -3194,20 +3194,6 @@ def two_socket_note(sockets) -> list[str]:
             f"the config's args ({SETUP_CMD} --calibrate measures it on this PC)"]
 
 
-AGENT_CACHE_FREE_GB = 24       # upstream bench #882 #440: RAM left beside the model for the conversation cache
-AGENT_CACHE_MIB = 8192
-
-
-def agent_cache_note(args, ram: float, model_ram_gb: float) -> list[str]:
-    """upstream 3772ded7c (bench #882 #440): for several agents or clients at once, a tip to keep each one's
-    conversation.  Text only: the config is not touched."""
-    if "--conversation-cache-mib" in args or ram - model_ram_gb < AGENT_CACHE_FREE_GB:
-        return []
-    return [f"tip: for several agents or clients at once, --conversation-cache-mib {AGENT_CACHE_MIB} in the config's "
-            "args keeps each one's conversation; without it they were measured re-reading ~90% of their prompts "
-            "(docs/DETAILS.md)"]
-
-
 def hardware_key(cfg: dict) -> str:
     """What a calibration is valid for: this GPU, CPU and RAM, and the model with its context and images setting
     (the context's KV cache and the image encoder take VRAM from the expert cache)."""
@@ -5202,8 +5188,7 @@ def main() -> int:
     if a.images:                                       # only when given: else an earlier "images" is carried over
         cfg["images"] = setup_images(a, gpu, Path(a.models_dir), Path(cfg["exe"]).parent,
                                      text_ram_gb(cfg["args"], ram, model))
-    return finish_setup(a, cfg, tag, port, adopted, vision != "none",
-                        notes=agent_cache_note(cfg["args"], ram, MODELS[model]["ram_gb"]))
+    return finish_setup(a, cfg, tag, port, adopted, vision != "none")
 
 
 if __name__ == "__main__":
