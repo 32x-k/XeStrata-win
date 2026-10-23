@@ -1838,7 +1838,7 @@ class Runner:
             if not exe:
                 return None
             folder = Path(str(exe)).parent
-            return any((folder / n).is_file() for n in ("strata-dsv41", "strata-dsv41.exe"))
+            return any((d / n).is_file() for d in (folder, folder.parent / "engine-dsv41") for n in ("strata-dsv41", "strata-dsv41.exe"))
         except Exception:                                    # noqa: BLE001
             return None
 
@@ -1856,8 +1856,8 @@ class Runner:
         warnings = list(p["warnings"])
         engine = self.dsv41_engine()
         if engine is False:
-            warnings.append("The engine installed here has no DeepSeek-V4.1 engine (strata-dsv41) yet: setup stops with a message before "
-                            "anything is downloaded. Update Strata, or build it (cmake -DSTRATA_BUILD_DSV41=ON) and set STRATA_DSV41_EXE.")
+            warnings.append("DeepSeek runs on its own engine package (about 70 MB, separate from the Strata engine): setup downloads it first. "
+                            "If it cannot be fetched, setup stops with a message before the model is downloaded.")
         return {"verdict": p["verdict"], "lines": p["lines"], "warnings": warnings, "cards": p["cards"], "args": p["args"],
                 "engine_has_dsv41": engine,
                 "experts_in_vram": p["experts_in_vram"], "experts_total": p["experts_total"], "vram_experts_gb": p["vram_experts_gb"],

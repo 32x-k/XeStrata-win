@@ -382,6 +382,31 @@ class OfficialSets(unittest.TestCase):
         self.assertEqual(dsv41_fit.plan([RTX5070], 64.0, None, model="UD-Q8_K_XL")["verdict"], "spills")        # the big set is unchanged
 
 
+class EnginePackage(unittest.TestCase):
+    """DeepSeek's engine is its own package beside the engine; the Qwen engine folder is never written."""
+
+    def test_asset_names_and_folder(self):
+        with mock.patch.object(setup, "WIN", True):
+            self.assertEqual(setup.dsv41_engine_asset(False), "strata-dsv41-windows-x64-cuda13.zip")
+            self.assertIsNone(setup.dsv41_engine_asset(True))                  # Windows AMD: no package
+        with mock.patch.object(setup, "WIN", False):
+            self.assertEqual(setup.dsv41_engine_asset(False), "strata-dsv41-linux-x64-cuda13.zip")
+            self.assertEqual(setup.dsv41_engine_asset(True), "strata-dsv41-linux-x64-hip-gfx120x.zip")
+        self.assertEqual(setup.dsv41_engine_dir(Path("/d/engine")), Path("/d") / "engine-dsv41")
+
+    def test_the_own_package_is_found_before_the_old_place(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict("os.environ", {"STRATA_DSV41_EXE": ""}):
+            eng = Path(d) / "engine"
+            eng.mkdir()
+            name = "strata-dsv41.exe" if setup.WIN else "strata-dsv41"
+            self.assertIsNone(setup.dsv41_exe(eng))
+            (eng / name).write_text("old")
+            self.assertEqual(setup.dsv41_exe(eng), eng / name)                 # an all-in-one engine still works
+            (Path(d) / "engine-dsv41").mkdir()
+            (Path(d) / "engine-dsv41" / name).write_text("new")
+            self.assertEqual(setup.dsv41_exe(eng), Path(d) / "engine-dsv41" / name)
+
+
 class InstallOfficial(Install):
     """install_dsv41 for an official set, the engine and the tools mocked."""
 
