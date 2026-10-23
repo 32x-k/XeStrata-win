@@ -23,7 +23,7 @@ Output is the speed of the answer. Prompt is how fast Strata reads what you send
 | PC | output | prompt |
 |---|---|---|
 | RTX 5070 12 GB, 64 GB RAM | about 5 tokens/s (code) | 231 tokens/s at 8K |
-| RTX 3060 12 GB, 46 GB RAM | 6 to 7.7 tokens/s | about 103 tokens/s at 8K |
+| RTX 3060 12 GB, 46 GB RAM | about 6 to 9 tokens/s (6.1-6.7 without DSpark, 8.2-8.7 with) | about 103 tokens/s at 8K |
 | 4x Radeon AI PRO R9700 (AMD) | about 31 tokens/s | about 360 tokens/s at 8K, 557 at 32K |
 
 These are the 2.00-bit set. The 2.25-bit set reads 13% more data per token, so expect it to be a little slower. Your drive matters: the 12 GB cards spend most of each token waiting on the SSD and on the CPU, and a slow NVMe drive lowers every number above.
@@ -33,7 +33,7 @@ These are the 2.00-bit set. The 2.25-bit set reads 13% more data per token, so e
 - **A RAM expert store that sizes itself.** The model is a mixture of experts: each token uses a few of thousands of small blocks. Strata keeps the busiest ones in RAM, takes whatever RAM is free, and reads the rest from the SSD with direct reads. On the RTX 5070 PC with 64 GB this gave 4.3 to 4.9 tokens/s where memory-mapping the files gave 1.8 to 2.2.
 - **Hot-expert profiles ship with the engine,** so the first prompts do not start cold.
 - **Faster prompts.** The engine now reads long prompts layer by layer in big chunks instead of 16 tokens at a time. A 200-token prompt went from 3.6 to 6.4 tokens/s on the RTX 5070 PC, and 8K prompts reach 231 tokens/s.
-- **DSpark** (a small draft model from Unsloth) is on where it measured faster and off on CPU-bound PCs. On the RTX 3060 PC (20 threads) it raised decode by 8% on code and 26% on agent text. On the 4x R9700 box it raised 31 tokens/s to 55 to 69. On the RTX 5070 PC with a 6-core Ryzen 5 7600 it gave no gain at any setting (code 4.64 tokens/s with it off against 4.33 at best with it on; agent 3.41 against 2.86 to 3.21), because checking the drafts costs the CPU about what the saved tokens are worth. There `--dspark auto` does not load the drafter.
+- **DSpark** (a small draft model from Unsloth) is on where it measured faster and off on CPU-bound PCs. On the RTX 3060 PC (20 threads) it raised decode from 6.1-6.7 to 8.2-8.7 tokens/s. On the 4x R9700 box it raised 31 tokens/s to 55 to 69. On the RTX 5070 PC with a 6-core Ryzen 5 7600 it gave no gain at any setting (code 4.64 tokens/s with it off against 4.33 at best with it on; agent 3.41 against 2.86 to 3.21), because checking the drafts costs the CPU about what the saved tokens are worth. There `--dspark auto` does not load the drafter.
 - **Faster CPU rows.** The engine has new exact rows for the experts the CPU computes: AVX-512 on Zen 4 and Zen 5, AVX2 on other CPUs, chosen automatically. On the Ryzen 5 7600 PC with an RTX 5070 (2.00 set, DSpark on, three alternating pairs, identical text in all six runs), decode went from 4.08 to 5.11 tokens/s (+25%) and prompt reading rose 26%. This was measured on one CPU, a Zen 4. Zen 5 gained more in the kernel tests.
 - **Cards and engines:** tested on an RTX 3060 (Linux, full model), an RTX 5070 (Windows) and the Radeon AI PRO R9700 (gfx1201, Linux). The RTX 30 kernels (sm_86) were also checked on an RTX A4000. Windows on RTX 30 is built but was not run here. RX 9070 (gfx1200) is built but untested. The engine packages carry `strata-dsv41` next to `strata`.
 
