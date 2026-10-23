@@ -217,6 +217,7 @@ static void bench_big(int type, int mib) {
     std::vector<int8_t> xq(E, 3), hq((size_t) NE * FF, 3); std::vector<float> xd(E / 32, 0.01f), hd((size_t) NE * FF / 32, 0.01f);
     for (int i = 0; i < E; ++i) xq[i] = (int8_t) ((int) (rng() % 255) - 127);
     for (size_t i = 0; i < hq.size(); ++i) hq[i] = (int8_t) ((int) (rng() % 255) - 127);
+    if (const char* e = std::getenv("DS4_BENCH_ACTIVE")) { const int na = std::atoi(e); for (int l = 0; l < L; ++l) for (int k = na; k < NE; ++k) plan[(size_t) l * NE + k] = 0; }   // (empty plan entries)
     unsigned long long* dplan = up(plan);
     iq::Args a{};
     a.n_embd = E; a.n_ff = FF; a.limit = 10.0f; a.xq = up(xq); a.xd = up(xd); a.hq = up(hq); a.hd = up(hd); a.tg = a.td = type;
@@ -246,11 +247,11 @@ static void bench_big(int type, int mib) {
     std::printf("big %-7s ws %4.0f MiB: gate/up %6.1f us (%5.0f GB/s)  down %6.1f us (%5.0f GB/s)  layer %6.1f us -> %5.0f GB/s, %.2f Tw/s\n",
                 iq::name(type), (double) L * NE * blob / 1048576.0, us[0], bg / us[0] * 1e-3, us[1], bd / us[1] * 1e-3, us[0] + us[1],
                 (bg + bd) / (us[0] + us[1]) * 1e-3, (double) NE * 3 * FF * E / ((us[0] + us[1]) * 1e-6) / 1e12);
-    for (auto p : plan) hipFree((void*) p);
+    for (auto p : plan) if (p) hipFree((void*) p);
 }
 
 // the light sets (experts of <= 16 rows: DSpark verify windows, short prompts): n_exp experts of `rows` rows each, gate/up and down
-static void bench_light(int type, int nexp, int rows) {
+static void bench_light(int type, int nexp, int rows, bool tiles = false) {
     const int E = 5120, FF = 2304;
     const size_t rb_g = iq::row_bytes(type, E), rb_d = iq::row_bytes(type, FF);
     auto al = [](size_t n) { return (n + 255) / 256 * 256; };
@@ -261,6 +262,7 @@ static void bench_light(int type, int nexp, int rows) {
     uint8_t* w; CK(hipMalloc(&w, blob * nexp));
     for (int e = 0; e < nexp; ++e) CK(hipMemcpy(w + (size_t) e * blob, one.data(), blob, hipMemcpyHostToDevice));
     const int NR = nexp * rows, T = 8;
+    if (tiles && rows <= 16) { std::printf("tiles: rows > 16 only\n"); return; }
     std::vector<int> bounds(nexp + 1), idx(NR);
     for (int e = 0; e <= nexp; ++e) bounds[e] = e * rows;
     for (int i = 0; i < NR; ++i) idx[i] = i % T;
@@ -270,7 +272,7 @@ static void bench_light(int type, int nexp, int rows) {
     std::vector<uint16_t> h((size_t) NR * FF, 0x3c00);
     iq::SetArgs q{};
     q.wbase = w; q.stride = blob; for (int r = 0; r < 3; ++r) q.tr[r] = off[r];
-    q.bounds = up(bounds); q.row0 = 0; q.max_rows = rows; q.n_exp = nexp; q.n_embd = E; q.n_ff = FF; q.limit = 7.0f;
+    q.bounds = up(bounds); q.row0 = 0; q.max_rows = rows; q.skip_le = 0; q.n_exp = nexp; q.n_embd = E; q.n_ff = FF; q.limit = 7.0f;
     q.tg = q.td = type; q.xf = up(x); q.idx = up(idx); q.ldx = E;
     uint16_t* dh; CK(hipMalloc(&dh, (size_t) NR * FF * 2)); q.h = dh; q.ldo = FF;
     q.xh = up(h);
@@ -281,8 +283,8 @@ static void bench_light(int type, int nexp, int rows) {
         auto run = [&](int reps) {
             hipEventRecord(e0);
             for (int rep = 0; rep < reps; ++rep) {
-                if (part == 0) { q.h = dh; q.ldo = FF; iq::light_gate_up(q, 0); }
-                else { q.y = dy; q.ldo = E; q.ldx = FF; iq::light_down(q, 0); }
+                if (part == 0) { q.h = dh; q.ldo = FF; if (tiles) iq::set_gate_up(q, 0); else iq::light_gate_up(q, 0); }
+                else { q.y = dy; q.ldo = E; q.ldx = FF; if (tiles) iq::set_down(q, 0); else iq::light_down(q, 0); }
             }
             hipEventRecord(e1); hipEventSynchronize(e1);
             float ms; hipEventElapsedTime(&ms, e0, e1);
@@ -296,8 +298,8 @@ static void bench_light(int type, int nexp, int rows) {
         us[part] = best;
     }
     const double bytes = (double) nexp * (off[2] + al((size_t) E * rb_d));
-    std::printf("light %-7s %3d experts x %2d rows: gate/up %7.1f us  down %7.1f us  -> %6.0f GB/s of weights, %.2f Tw/s\n", iq::name(type), nexp, rows,
-                us[0], us[1], bytes / ((us[0] + us[1]) * 1e-6) / 1e9, (double) nexp * 3 * FF * E / ((us[0] + us[1]) * 1e-6) / 1e12);
+    std::printf("%s %-7s %3d experts x %2d rows: gate/up %7.1f us  down %7.1f us  -> %6.0f GB/s of weights, %.2f Tw/s, %.1f TMAC/s\n", tiles ? "tiles" : "light", iq::name(type), nexp, rows,
+                us[0], us[1], bytes / ((us[0] + us[1]) * 1e-6) / 1e9, (double) nexp * 3 * FF * E / ((us[0] + us[1]) * 1e-6) / 1e12, (double) NR * 3 * FF * E / ((us[0] + us[1]) * 1e-6) / 1e12);
     hipFree(w);
 }
 
@@ -305,7 +307,16 @@ int main(int argc, char** argv) {
     std::vector<int> types = {16, 17, 22, 18, 21, 23, 29};
     std::vector<int> devs;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--bench-light") {   // [types] [n_exp] [rows list]
+        if (std::string(argv[i]) == "--bench-tiles") {   // [types] [n_exp] [rows list]: the prompt sets' tensor-core tiles
+            std::vector<int> bt, rl = {32, 128};
+            int nexp = 48;
+            if (i + 1 < argc && argv[i + 1][0] != '-') { for (const char* p = argv[++i]; *p;) { bt.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; } }
+            else bt = types;
+            if (i + 1 < argc && argv[i + 1][0] != '-') nexp = std::atoi(argv[++i]);
+            if (i + 1 < argc && argv[i + 1][0] != '-') { rl.clear(); for (const char* p = argv[++i]; *p;) { rl.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; } }
+            for (int t : bt) for (int r : rl) bench_light(t, nexp, r, true);
+            return 0;
+        } else if (std::string(argv[i]) == "--bench-light") {   // [types] [n_exp] [rows list]
             std::vector<int> bt, rl = {1, 2, 4};
             int nexp = 24;
             if (i + 1 < argc && argv[i + 1][0] != '-') { for (const char* p = argv[++i]; *p;) { bt.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; } }
