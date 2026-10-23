@@ -21,6 +21,7 @@ split behave for DeepSeek as they do for the other families, and there is one pl
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from serve.frontend import Event, OutputParser
 
@@ -217,6 +218,29 @@ class DsmlOutputParser(OutputParser):
     def clean(self) -> bool:
         """No tag is held back anywhere: a clean point to stop the thinking at."""
         return not self.buf and not self.dsml.held
+
+
+FIXTURE_TEMPLATE = Path(__file__).resolve().parent / "fixtures" / "deepseek41" / "chat_template.jinja"
+
+
+def v41_template_ok(text: str) -> bool:
+    """The V4.1 model writes its call block as `<｜DSML｜ calls>` / `<｜DSML｜ invoke ...` (a space after the DSML token).
+    Packs made from another GGUF ship the V4-Flash template (`<｜DSML｜tool_calls>`, no space): the model then sees one
+    spelling in the prompt and writes another, and only 2 of 11 tool-call tries came back as real calls (P2003 install
+    test; 0 of 4 vs 6 of 6 with this template on the same pack)."""
+    return " calls>" in text
+
+
+def pick_template(pack_template: Path | None) -> tuple[Path, bool]:
+    """(the template file to render with, True when it replaced a pack template that spells the call block otherwise)."""
+    if pack_template is not None and pack_template.exists():
+        try:
+            if v41_template_ok(pack_template.read_text(encoding="utf-8")):
+                return pack_template, False
+        except OSError:
+            return pack_template, False
+        return FIXTURE_TEMPLATE, True
+    return FIXTURE_TEMPLATE, False
 
 
 def to_dsml_force(force: str | None) -> str | None:

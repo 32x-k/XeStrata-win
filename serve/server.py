@@ -5503,6 +5503,7 @@ class Service:
                                       "strata-<model>.json for every request) leaves room to answer", flush=True)
                             if os.environ.get("STRATA_DEBUG") and raw_ids:
                                 print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                                print(f"[strata] raw ids: {list(raw_ids)}", flush=True)
                         st["busy"] = False
                         st.pop("tail", None)                     # #212: the answer's end is not kept once it is done
                         st.pop("tool", None)
@@ -8377,6 +8378,12 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             delay_s=getattr(a, "script_delay", 0.0) or 0.0), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
+    if (cfg.get("arch") or "") == "deepseek41":
+        from serve import dsml
+        tpl, swapped = dsml.pick_template(tpl)
+        if swapped:
+            print("[strata] this pack's chat template spells the tool-call block differently from the V4.1 model's; "
+                  "using the V4.1 template so tool calls come back as real calls", flush=True)
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
