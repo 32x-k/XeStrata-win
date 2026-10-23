@@ -183,6 +183,19 @@ Gyro は NVIDIA と AMD のカード（AMD は実験的）、および Linux 上
 
 すべてのサイズ、ダウンロード、どの構成で何が動くかは [docs/MODELS.md](docs/MODELS.md) にあります。
 
+### DeepSeek V4.1-Flash（ターミナル版、0.2.4 から）
+
+[DeepSeek V4.1-Flash](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) は、これとは別のずっと大きなモデルです。下の 2 つのセットは ISTA-DASLab が作りました。Strata は、12 GB のグラフィックスカード 1 枚と 46 から 64 GB の RAM を持つ PC でこれを動かし、残りは SSD から読みます。NVIDIA RTX 30 から 50 シリーズのカードと Radeon AI PRO R9700 で動きます。専用のエンジンパッケージ `strata-dsv41` を使い、DeepSeek を選ぶと `strata launch` がダウンロードします。デスクトップアプリはまだ対応していません。
+
+| セット | ダウンロード | 元のモデルとの品質差 | 出力速度 |
+| --- | ---: | --- | --- |
+| **IQ2_XXS** (2.00 ビット) | 257 GB | KL 0.169、パープレキシティ 3.64（+16%） | RTX 3060 で毎秒 6 から 9 トークン、RTX 5070 で約 5 |
+| **IQ2_XS** (2.25 ビット) | 274 GB | KL 0.110、パープレキシティ 3.40（+8%）、コード +3.5%、エージェント作業 +2.5% | Radeon AI PRO R9700 1 枚で毎秒約 11 トークン |
+
+Radeon AI PRO R9700 4 枚：毎秒約 31 トークン、DSpark ありで 55 から 69。
+
+`strata launch --model ist-das-2.00bpw`（または `ist-das-2.25bpw`）で起動します。詳細、カードごとの速度、手動インストールは [docs/DEEPSEEK41.md](docs/DEEPSEEK41.md) にあります。
+
 ## どのくらい速い？
 
 12 GBのグラフィックスカード（RTX 5070、Ryzen 5 7600、RAM 64 GB）での数値です。ほかのカードの結果は

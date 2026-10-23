@@ -24,7 +24,8 @@ Output is the speed of the answer. Prompt is how fast Strata reads what you send
 |---|---|---|
 | RTX 5070 12 GB, 64 GB RAM | about 5 tokens/s (code) | 231 tokens/s at 8K |
 | RTX 3060 12 GB, 46 GB RAM | about 6 to 9 tokens/s (6.1-6.7 without DSpark, 8.2-8.7 with) | about 103 tokens/s at 8K |
-| 4x Radeon AI PRO R9700 (AMD) | about 31 tokens/s | about 360 tokens/s at 8K, 557 at 32K |
+| 1x Radeon AI PRO R9700 (AMD), IQ2_XS | about 11 tokens/s | not measured |
+| 4x Radeon AI PRO R9700 (AMD) | about 31 tokens/s (55 to 69 with DSpark) | about 360 tokens/s at 8K, 557 at 32K |
 
 These are the 2.00-bit set. The 2.25-bit set reads 13% more data per token, so expect it to be a little slower. Your drive matters: the 12 GB cards spend most of each token waiting on the SSD and on the CPU, and a slow NVMe drive lowers every number above.
 

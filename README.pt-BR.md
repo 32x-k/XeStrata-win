@@ -183,6 +183,19 @@ Mais opções:
 
 Todos os tamanhos, downloads e o que cabe em cada configuração: [docs/MODELS.md](docs/MODELS.md).
 
+### DeepSeek V4.1-Flash (no Terminal, a partir da 0.2.4)
+
+[DeepSeek V4.1-Flash](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) é outro modelo, bem maior. A ISTA-DASLab fez os dois conjuntos abaixo. O Strata os executa em um PC com uma placa de vídeo de 12 GB e de 46 a 64 GB de RAM, e lê o resto do seu SSD. Ele roda em placas NVIDIA RTX das séries 30 a 50 e na Radeon AI PRO R9700. Usa um pacote de motor próprio, `strata-dsv41`, que o `strata launch` baixa quando você escolhe o DeepSeek. O app de desktop ainda não o oferece.
+
+| Conjunto | Download | Qualidade em relação ao modelo original | Responde a |
+| --- | ---: | --- | --- |
+| **IQ2_XXS** (2.00 bits) | 257 GB | KL 0,169, perplexidade 3,64 (+16%) | 6 a 9 tokens/s em uma RTX 3060, cerca de 5 em uma RTX 5070 |
+| **IQ2_XS** (2.25 bits) | 274 GB | KL 0,110, perplexidade 3,40 (+8%); código +3,5%, tarefas de agente +2,5% | cerca de 11 tokens/s em uma Radeon AI PRO R9700 |
+
+4x Radeon AI PRO R9700: cerca de 31 tokens/s, 55 a 69 com DSpark.
+
+Inicie com `strata launch --model ist-das-2.00bpw` (ou `ist-das-2.25bpw`). Detalhes, velocidades por placa e a instalação manual: [docs/DEEPSEEK41.md](docs/DEEPSEEK41.md).
+
 ## Qual é a velocidade?
 
 Com base numa placa de vídeo de 12 GB (RTX 5070, Ryzen 5 7600, 64 GB de RAM). Veja resultados de outras placas:
