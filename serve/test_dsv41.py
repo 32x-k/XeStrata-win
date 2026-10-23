@@ -592,7 +592,8 @@ class SlotEnv(unittest.TestCase):
     def test_deepseek_gets_a_folder_in_the_data_folder_and_the_default_switch(self):
         env = self.env({"arch": "deepseek41", "log": str(Path("data") / "strata-deepseek.log"), "args": []})
         self.assertEqual(Path(env["STRATA_DS4_SLOT_DIR"]), Path("data") / "ds4-slots")
-        self.assertEqual(env["STRATA_DS4_SLOT_KEEP"], server.DS41_SLOT_KEEP_DEFAULT)
+        self.assertEqual(env["STRATA_DS4_SLOT_KEEP"], "1")
+        self.assertEqual(env["STRATA_DS4_SLOT_GB"], "2")
 
     def test_the_configs_own_settings_win(self):
         env = self.env({"arch": "deepseek41", "log": "x/y.log",

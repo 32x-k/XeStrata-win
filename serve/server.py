@@ -3477,16 +3477,18 @@ def hip_auto_devices(cfg: dict, env: dict) -> list[int] | None:
     return visible
 
 
-DS41_SLOT_KEEP_DEFAULT = "0"      # the engine keeps a displaced conversation in RAM and in the slot folder (see below)
+DS41_SLOT_KEEP_DEFAULT = "1"      # the engine keeps a displaced conversation in RAM and in the slot folder (see below)
+DS41_SLOT_GB_DEFAULT = "2"        # the folder's cap in GB (a 6.5K-token conversation is about 17 MB)
 
 
 def deepseek_slot_env(env: dict, cfg: dict) -> None:
     """DeepSeek-V4.1 only.  The engine sets a conversation aside when another request takes the model and takes it back
     at its checkpoints (agents and sub-agents that take turns do not read their prompts again).  STRATA_DS4_SLOT_KEEP
     switches it (the default above; a config's env or the shell wins); the folder is `ds4-slots` next to the run log, in
-    Strata's data folder (STRATA_DS4_SLOT_DIR names another), and the engine caps it (STRATA_DS4_SLOT_GB, 16) and
-    removes what is older than a week or not this model's."""
+    Strata's data folder (STRATA_DS4_SLOT_DIR names another), and the engine caps it (STRATA_DS4_SLOT_GB, 2 here, 16 in the engine) and
+    removes what is older than a week or not this model's.  On by default; STRATA_DS4_SLOT_KEEP=0 turns it off."""
     env.setdefault("STRATA_DS4_SLOT_KEEP", DS41_SLOT_KEEP_DEFAULT)
+    env.setdefault("STRATA_DS4_SLOT_GB", DS41_SLOT_GB_DEFAULT)
     log = cfg.get("log")
     if "STRATA_DS4_SLOT_DIR" not in env and log:
         env["STRATA_DS4_SLOT_DIR"] = str(Path(log).parent / "ds4-slots")
