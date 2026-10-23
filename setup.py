@@ -706,7 +706,7 @@ DSV41_CONTEXT = 8192          # the context the engine was checked at (4096 and 
 MULTI_FILE_FAMILIES = {
     "deepseek41": {"title": "DeepSeek-V4.1-Flash", "by": "DeepSeek; the 2-bit GGUFs by IST-DAS, UD-Q8_K_XL by Unsloth", "arch": "deepseek41",
                    "about": "a big model that runs on a PC with a 12 GB card and 64 GB of RAM (the two official 2-bit versions: 257 or "
-                            "274 GB of disk, about 5-7 words a second) or, in Unsloth's 508 GB version, on several graphics cards",
+                            "274 GB of disk, about 5-7 tokens a second) or, in Unsloth's 508 GB version, on several graphics cards",
                    "hf": hf(DSV41_REPO) + "UD-Q8_K_XL/", "tag": "deepseek-v4.1-flash-", "name": "deepseek-v4.1-flash",
                    "license": "DeepSeek's model license: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
                    "models": {"UD-Q8_K_XL": {"about": "Unsloth Dynamic 8-bit: the experts in MXFP4 as DeepSeek made them, the rest "
@@ -720,7 +720,7 @@ MULTI_FILE_FAMILIES["deepseek41"]["models"] = {
     "IST-DAS-2.00bpw": {
         "label": "IST-DAS 2.00 bpw",
         "about": "the smaller official version: 138 GB of model + 111 GB n-gram table + 8 GB drafter (257 GB of disk). Runs on a PC with "
-                 "a 12 GB card and 40-64 GB of RAM at about 5-7 words a second; quality about 16% above the original model's "
+                 "a 12 GB card and 40-64 GB of RAM at about 5-7 tokens a second; quality about 16% above the original model's "
                  "perplexity",
         "ram_gb": 40, "recipe": "ista", "subdir": "2.00bpw", "profile": "profile-2.00.bin", "hf": hf(DSV41_ISTA_REPO) + "2.00bpw/",
         "shards": [DSV41_ISTA_SHARD.format(bpw="2.00bpw", i=i) for i in range(1, 5)],
@@ -5638,7 +5638,7 @@ def data_folder(requested: str | None, move: bool = False, yes: bool = True, set
                        ["keep", "move"], "keep", False) == "move"
         if held and not move:
             for folder in held:
-                say(f"  your model files stay in {folder}; {dest} is used for new downloads")
+                say(f"  Models you already have in {folder} stay there; new downloads go to {dest}.")
             if set_default:
                 save_settings({**settings, "data_dir": str(dest)})
             return dest, held
@@ -7338,10 +7338,12 @@ def dsv41_find_shared(a, name: str, folder: Path, shared: Path) -> Path:
 
 def dsv41_pack_cmd(folder: Path, shards: list, engram: Path, meta: Path, dspark: Path, pack: Path) -> list:
     """The pack recipe for an official IST-DAS set - this and nothing else: another one (--skip-tensors / --dense-override + engram_fold)
-    packs without an error and gives garbage text (P2003, 2026-10-23).  --shards names the four files, so an Engram or another
+    packs without an error and gives garbage text (P2003, 2026-10-23).  The drafter's noise token (128799) and markov rank (256) are stated:
+    the IST-DAS GGUFs do not carry them, and a pack with noise id 0 drafts deep less often (decode ~10% slower with DSpark).  --shards names the four files, so an Engram or another
     set in the same folder is not read as part of the model."""
     return [sys.executable, str(ROOT / "tools" / "dsv41" / "pack_gguf.py"), "--model", str(folder), "--shards", *[Path(n).name for n in shards],
-            "--engram", str(engram), "--engram-meta", str(meta), "--dspark-gguf", str(dspark), "--out", str(pack)]
+            "--engram", str(engram), "--engram-meta", str(meta), "--dspark-gguf", str(dspark),
+            "--dspark-noise-token", "128799", "--dspark-markov-rank", "256", "--out", str(pack)]
 
 
 def dsv41_engine_env(lib_dirs) -> dict:
@@ -7437,6 +7439,14 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     if left:
         say(f"  Download: {left:.0f} GB to fetch (checked against pinned sizes and SHA-256; it resumes if it stops). At 50 MB/s that "
             f"is {left * 1e9 / 50e6 / 3600:.1f} hours. Files you already have: --gguf-dir DIR.")
+    else:
+        say("  Nothing to download: the files are already here.")
+    unchecked = [f for f in [*shards, *shared] if f.exists() and f"sha256 {fam['sha256'][f.name][1]}" not in
+                 (f.with_name(f.name + ".done").read_text(encoding="utf-8", errors="replace") if done(f) else "")]
+    if unchecked:
+        gb = sum(fam["sha256"][f.name][0] for f in unchecked) / 1e9
+        say(f"  The files already here ({gb:.0f} GB) are checked against their SHA-256 once, now: about {max(1, round(gb / 55))} minutes on a fast "
+            "drive (4-5 minutes for the 257 GB of 2.00), longer on a slow one. The next runs skip it.")
     for w in plan["warnings"]:
         if "free disk space" in w:
             continue                                                      # the disk is a hard limit, said below
@@ -8260,7 +8270,7 @@ def main() -> int:
             for mname in ("IST-DAS-2.00bpw", "IST-DAS-2.25bpw", "UD-Q8_K_XL"):
                 ds = dsv41_fit.plan(cards_ok, ram, None, model=mname)
                 tail = {"fits": f"fits ({ds['experts_in_vram']:,} of {ds['experts_total']:,} experts in graphics memory, the rest on the CPU)",
-                        "tight": ("runs, with the experts RAM cannot hold read from the SSD (about 5-7 words a second measured)"
+                        "tight": ("runs, with the experts RAM cannot hold read from the SSD (about 5-7 tokens a second measured)"
                                   if ds.get("variant") else "fits, but RAM is tight"),
                         "spills": (f"works but slow: less RAM than it was measured with (46-64 GB)" if ds.get("variant")
                                    else f"about {ds['spill_gb']:.0f} GB of its experts would be read from the SSD (slow)"),

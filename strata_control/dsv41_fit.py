@@ -227,7 +227,7 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
             elif float(ram_gb) >= v["ram_ok_gb"]:
                 out["verdict"] = "tight"
                 lines.append(f"This computer has {ram_gb:.0f} GB of RAM: Strata keeps the experts you use most in RAM (it sizes this itself) and "
-                             "reads the rest from the SSD. Measured: about 4.7 words a second on 64 GB of RAM and a 12 GB card, about 7 on "
+                             "reads the rest from the SSD. Measured: about 4.7 tokens a second on 64 GB of RAM and a 12 GB card, about 7 on "
                              "46 GB with a faster drive. More RAM or a faster NVMe drive makes it quicker.")
             else:
                 out["verdict"] = "spills"
