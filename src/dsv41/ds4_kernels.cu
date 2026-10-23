@@ -1898,6 +1898,9 @@ void finish(float* x, int n_vec, int len, long long stride, const Finish& f, cud
 }
 
 void hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    if (strata::dsv41::metal_host::hc_mix(h, fn, hcdim, n_mix, T, eps, mixes)) return;
+#endif
     strata_ds4_launch(hc_mix_kernel, dim3(n_mix, T), kThreads, 0, s, h, fn, hcdim, eps, mixes);
 }
 void hc_split(const float* mixes, const float* scale, const float* base, int hc, int iters, float hc_eps, int T,
@@ -1915,9 +1918,15 @@ void hc_post(const float* y, const float* res, const float* post, const float* c
 
 void hc_post_inplace(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T,
                      cudaStream_t s) {
+#if defined(STRATA_METAL)
+    if (strata::dsv41::metal_host::hc_post(y, h, post, comb, dim, hc, T)) return;
+#endif
     strata_ds4_launch(hc_post_inplace_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, y, h, post, comb, dim, hc);
 }
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    if (strata::dsv41::metal_host::hc_mix_scale(h, hcdim, n_mix, T, eps, mixes)) return;
+#endif
     strata_ds4_launch(hc_mix_scale_kernel, T, kThreads, 0, s, h, hcdim, n_mix, eps, mixes);
 }
 void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s, int fmt) {

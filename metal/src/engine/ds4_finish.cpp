@@ -102,4 +102,100 @@ bool finish(float* x, int n_vec, int len, long long stride, const FinishIn& f) {
     return true;
 }
 
+
+// ds4_kernels.cu:1677 - hc_post_inplace: h[t][k][e] = post[t][k]*y[t][e] + sum_j comb[t][j][k]*h_old[t][j][e]
+bool hc_post(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T) {
+    if (!ensure()) return false;
+    void* hy = strata::gpu::host_view((void*) y);
+    void* hh = strata::gpu::host_view(h);
+    if (!hy || !hh) { std::fprintf(stderr, "dsv41 metal: hc_post has no host view\n"); return false; }
+    const size_t page = 16384;
+    auto wrap = [&](void* host, size_t bytes) {
+        return g_cx->wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)), ((bytes + page - 1) / page) * page);
+    };
+    auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
+    mtl::Buffer by = wrap(hy, (size_t) T * dim * 4 + 65536);
+    mtl::Buffer bh = wrap(hh, (size_t) T * hc * dim * 4 + 65536);
+    if (!by.handle || !bh.handle) return false;
+    // post is [T][8], comb is [T][64], straight from the caller's host/shared memory
+    mtl::Buffer bp = g_cx->alloc((size_t) T * 8 * 4);
+    mtl::Buffer bc = g_cx->alloc((size_t) T * 64 * 4);
+    if (!bp.ptr || !bc.ptr) return false;
+    std::memcpy(bp.ptr, post, (size_t) T * 8 * 4);
+    std::memcpy(bc.ptr, comb, (size_t) T * 64 * 4);
+    mtl::Pipeline pl;
+    try { pl = g_cx->pipeline(g_lib, "ds4_hc_post"); } catch (...) { return false; }
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.args = {mtl::Arg::B(by, off(hy)), mtl::Arg::B(bh, off(hh)), mtl::Arg::B(bp), mtl::Arg::B(bc),
+              mtl::Arg::V((unsigned) dim), mtl::Arg::V((unsigned) hc)};
+    d.grid[0] = (uint32_t) ((dim + 255) / 256);
+    d.grid[1] = (uint32_t) T;
+    d.grid[2] = 1;
+    d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
+    g_cx->run({d});
+    g_cx->free(bp);
+    g_cx->free(bc);
+    return true;
+}
+
+
+// ds4_kernels.cu:1692 - hc_mix_scale: mixes[t][i] *= rsqrt(sum(h[t])^2 / hcdim + eps)
+bool hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes) {
+    if (!ensure()) return false;
+    void* hh = strata::gpu::host_view((void*) h);
+    void* hm = strata::gpu::host_view((void*) mixes);
+    if (!hh || !hm) { std::fprintf(stderr, "dsv41 metal: hc_mix_scale has no host view\n"); return false; }
+    const size_t page = 16384;
+    auto wrap = [&](void* host, size_t bytes) {
+        return g_cx->wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)), ((bytes + page - 1) / page) * page);
+    };
+    auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
+    mtl::Buffer bh = wrap(hh, (size_t) T * hcdim * 4 + 65536);
+    mtl::Buffer bm = wrap(hm, (size_t) T * 32 * 4 + 65536);
+    if (!bh.handle || !bm.handle) return false;
+    mtl::Pipeline pl;
+    try { pl = g_cx->pipeline(g_lib, "ds4_hc_mix_scale"); } catch (...) { return false; }
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.args = {mtl::Arg::B(bh, off(hh)), mtl::Arg::B(bm, off(hm)), mtl::Arg::V((unsigned) hcdim),
+              mtl::Arg::V((unsigned) n_mix), mtl::Arg::V(eps)};
+    d.grid[0] = (uint32_t) T;
+    d.grid[1] = d.grid[2] = 1;
+    d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
+    g_cx->run({d});
+    return true;
+}
+
+
+// ds4_kernels.cu:1901 - hc_mix: mixes[t][m] = (h[t] . fn[m]) * rsqrt(mean(h[t]^2) + eps)
+bool hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes) {
+    if (!ensure()) return false;
+    void* hh = strata::gpu::host_view((void*) h);
+    void* hf = strata::gpu::host_view((void*) fn);
+    void* hm = strata::gpu::host_view((void*) mixes);
+    if (!hh || !hf || !hm) { std::fprintf(stderr, "dsv41 metal: hc_mix has no host view\n"); return false; }
+    const size_t page = 16384;
+    auto wrap = [&](void* host, size_t bytes) {
+        return g_cx->wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)), ((bytes + page - 1) / page) * page);
+    };
+    auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
+    mtl::Buffer bh = wrap(hh, (size_t) T * hcdim * 4 + 65536);
+    mtl::Buffer bf = wrap(hf, (size_t) n_mix * hcdim * 4 + 65536);
+    mtl::Buffer bm = wrap(hm, (size_t) T * 32 * 4 + 65536);
+    if (!bh.handle || !bf.handle || !bm.handle) return false;
+    mtl::Pipeline pl;
+    try { pl = g_cx->pipeline(g_lib, "ds4_hc_mix"); } catch (...) { return false; }
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.args = {mtl::Arg::B(bh, off(hh)), mtl::Arg::B(bf, off(hf)), mtl::Arg::B(bm, off(hm)),
+              mtl::Arg::V((unsigned) hcdim), mtl::Arg::V(eps)};
+    d.grid[0] = (uint32_t) n_mix;
+    d.grid[1] = (uint32_t) T;
+    d.grid[2] = 1;
+    d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
+    g_cx->run({d});
+    return true;
+}
+
 }  // namespace strata::dsv41::metal_host

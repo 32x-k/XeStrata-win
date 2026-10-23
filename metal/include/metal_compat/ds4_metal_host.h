@@ -32,6 +32,15 @@ struct FinishIn {
     uint8_t* pdst;
     long long pdst_stride;
 };
+// ds4_kernels.cu:1901 hc_mix
+bool hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes);
+
+// ds4_kernels.cu:1692 hc_mix_scale
+bool hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes);
+
+// ds4_kernels.cu:1677 hc_post_inplace
+bool hc_post(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T);
+
 bool finish(float* x, int n_vec, int len, long long stride, const FinishIn& f);
 
 bool sgemm_tn(const float* A, const float* B, float* C, int m, int nt, int k, int lda, int ldb, int ldc);
