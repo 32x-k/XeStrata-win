@@ -5503,6 +5503,11 @@ struct Model::Impl {
             l.slot[(size_t) sw.in] = l.spare_vram;
             if (!l.zc.empty() && l.zc[(size_t) sw.in]) {   // (VRAM's now: not the store's to compute any more)
                 l.zc[(size_t) sw.in] = 0;
+                if (l.zc_tab != nullptr) {   // (the device's table too: its entry pointed into the slot the store now reuses - when `in` left VRAM later,
+                                             // zc_stage copied whatever lay there, another expert's blob, into the plan)
+                    cudaSetDevice(devs[0].id);
+                    cudaMemsetAsync(l.zc_tab + sw.in, 0, 8, devs[0].st);
+                }
                 store->unmark(l.il, sw.in);
             }
             if (l.nm == 1) set_vm(l, sw.in, l.spare_vram);
