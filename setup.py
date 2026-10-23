@@ -7529,13 +7529,12 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     step(7, "writing the start script")
     # --dspark auto, never off: "off" still LOADS the drafter, and its 7 GB of experts take the graphics memory (found 2026-10-23);
     # auto keeps it unloaded when the experts are far larger than the card.  The RAM store sizes itself (--ssd-cache auto is the
-    # engine's default), and <pack>/expert-profile.bin is read from the pack folder without a flag.  --prefill-chunk 1024 is the layer-major
-    # prompt path (measured: 8K prompt 231 tokens/s on a 12 GB PC against 3.7 windowed, 330-373 on 4 x R9700; text identical); the engine's
-    # own default is still windowed, so it is written here as a recommended default (the person can change it).  --dspark-conf 0.65: the
+    # engine's default), and <pack>/expert-profile.bin is read from the pack folder without a flag.  The layer-major chunked prompt is the engine's own default now (f-dsv41-rel d6f18babe: 1024 on a single card,
+    # its own choice for several), so no --prefill-chunk is written.  --dspark-conf 0.65: the
     # drafts' confidence floor (H100 replay, DSPARK-DEFAULTS.md: within 0.01-0.02 of the per-class best, never below 0.3).  The engine has
     # no flag for the draft block (3 in the same table): it reads the block size from the pack, so only the floor is written.
     args = ["--pack", str(pack), "--max-context", str(ctx), "--eos", "1", "--dspark", "auto",
-            *(["--prefill-chunk", "1024", "--dspark-conf", "0.65"] if md.get("recipe") == "ista" else []), *plan["args"]]
+            *(["--dspark-conf", "0.65"] if md.get("recipe") == "ista" else []), *plan["args"]]
     cfg = {"exe": str(exe), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": fam["name"], "arch": fam["arch"], "log": str(home() / f"strata-{tag.lower()}.log"),
            "lib_dirs": lib_dirs, "port": port, "engine_ready_s": 3600}      # 300+ GB read from the files: a slow disk needs its time
