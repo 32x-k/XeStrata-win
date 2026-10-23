@@ -5037,12 +5037,16 @@ struct Model::Impl {
             return;
         }
         const float lim = g.lim;
-        {   // (os::prefetch, as above)
+        {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
+            // range, ~0.13 ms an IQ2_XXS expert, on the lane's critical path before the first entry computes.
+            // DS4_IQ_PF_ALL=1: every range, as before)
             std::vector<std::pair<const void*, size_t>> want;
             for (const Ent& en : ents)
                 if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
                     for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
-            os::prefetch(want);
+            static const bool pf_all = std::getenv("DS4_IQ_PF_ALL") != nullptr && std::atoi(std::getenv("DS4_IQ_PF_ALL")) != 0;
+            if (pf_all) os::prefetch(want);
+            else os::prefetch_cold(want);
         }
         // the activations in c_xh's bytes, E 4 apart: token t's (t < kWin) at row t - quantized once, whatever number of
         // entries take it - then a row a slot (kWin + slot): a token past the window's input (none on the decode or
