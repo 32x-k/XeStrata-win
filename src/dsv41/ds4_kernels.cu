@@ -2123,6 +2123,23 @@ void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaSt
     for (int i = 0; i < x.n; ++i) total += x.bytes[i] / 16;
     const int blocks = (int) std::max<size_t>(1, std::min<size_t>(64, (total + kThreads - 1) / kThreads));
     xfer_put_kernel<<<blocks, kThreads, 0, s>>>(x, flag, seq, cnt);
+    // (another GPU, or the host, waits for this flag: on Windows the put must not sit in the queue - #303: two RTX 3080s
+    //  hung at the first hand-off, the receiver spinning on a flag whose writer had never been submitted)
+    win_submit(s);
+}
+void win_submit(cudaStream_t s) {
+#if defined(_WIN32)
+    static const bool on = [] {
+        const char* v = std::getenv("DS4_WIN_SUBMIT");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (on) {
+        (void) cudaStreamQuery(s);
+        (void) cudaGetLastError();
+    }
+#else
+    (void) s;
+#endif
 }
 void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s) {
     size_t total = 0;
@@ -2133,7 +2150,10 @@ void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s)
 void wait_flags(const unsigned* flags, int n, int stride, unsigned seq, cudaStream_t s) {
     if (n > 0) wait_flags_kernel<<<1, 32, 0, s>>>(flags, n, stride, seq);
 }
-void set_flag(unsigned* flag, unsigned v, cudaStream_t s) { set_flag_kernel<<<1, 1, 0, s>>>(flag, v); }
+void set_flag(unsigned* flag, unsigned v, cudaStream_t s) {
+    set_flag_kernel<<<1, 1, 0, s>>>(flag, v);
+    win_submit(s);   // (the writer on another GPU waits for this acknowledgement before its next put - #384)
+}
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s) {
     const int slot = (int) (seq % (unsigned) a.slots);
     if (a.nm > 2 && a.sums != nullptr && a.bflags != nullptr) {   // (the reduce-scatter: ar_rs_kernel)

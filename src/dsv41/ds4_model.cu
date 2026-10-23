@@ -3047,16 +3047,10 @@ struct Model::Impl {
     }
 
     // ---- the flow (see Chunk)
-    // Windows' HIP runtime submits queued work only when the host waits on the GPU: the flow's copies and the compute
-    // it queued between its waits are submitted at once (cudaStreamQuery does that without waiting); elsewhere nothing
-    static void kick(cudaStream_t s) {
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
-        (void) cudaStreamQuery(s);
-        (void) cudaGetLastError();
-#else
-        (void) s;
-#endif
-    }
+    // Windows (WDDM: HIP's runtime and CUDA's driver alike) submits queued work only when the host waits on the GPU:
+    // the flow's copies and the compute it queued between its waits are submitted at once (win_submit); elsewhere
+    // nothing.  (CUDA too since #303: two RTX 3080s hung before the first layer, one GPU spinning on the other's flow)
+    static void kick(cudaStream_t s) { win_submit(s); }
     size_t flow_region(int r) const {   // a part's room in a staging slot (read from its offset rounded down)
         return ((flow_part[r] + os::kDirectAlign - 1) & ~(size_t) (os::kDirectAlign - 1)) + os::kDirectAlign;
     }
