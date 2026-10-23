@@ -85,6 +85,12 @@ class LaunchDeepSeek(unittest.TestCase):
         row = next(r for r in catalog(self.hw).rows() if r.family == "deepseek41" and r.model == "UD-Q8_K_XL")
         self.assertEqual(row.verdict, "no")                         # "too big (can still try)": the plan above is printed and nothing is refused
 
+    def test_the_plan_names_dspark_not_mtp(self):
+        code, out, err = run_cli(["launch", "--plan", "--model", "ud-q8_k_xl", "--no-tui"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("drafting  DSpark", out)
+        self.assertNotIn("MTP", out)
+
     def test_no_card_is_said(self):
         self.hw = {**HW_12, "gpus": []}
         code, out, err = run_cli(["launch", "--plan", "--model", "ud-q8_k_xl", "--no-tui"])

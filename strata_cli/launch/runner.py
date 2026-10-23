@@ -1818,6 +1818,8 @@ class Runner:
     def drafting_plan_line(self) -> str:
         """The drafting line of --plan: what drafts, or why not what was asked for. Nothing is changed or downloaded."""
         from strata_control import drafting
+        if self.multi_file():                                # DeepSeek drafts with its own DSpark drafter (the --dspark auto the config writes), not MTP
+            return "Drafting: DSpark (used when it speeds up answers on this computer)"
         try:
             base, cfg = self.installed_state()
             want = self.drafting_inputs(cfg or {})
