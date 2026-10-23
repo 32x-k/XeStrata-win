@@ -26,7 +26,7 @@ Output is the speed of the answer. Prompt is how fast Strata reads what you send
 | RTX 5070 12 GB, 64 GB RAM | about 5 tokens/s (code) | 231 tokens/s at 8K |
 | RTX 3060 12 GB, 46 GB RAM | about 6 to 9 tokens/s (6.1-6.7 without DSpark, 8.2-8.7 with) | about 103 tokens/s at 8K |
 | 1x Radeon AI PRO R9700 (AMD), IQ2_XS | about 11 tokens/s | not measured |
-| 4x Radeon AI PRO R9700 (AMD) | about 31 tokens/s (55 to 69 with DSpark) | about 360 tokens/s at 8K, 557 at 32K |
+| 4x Radeon AI PRO R9700 (AMD) | about 31 tokens/s (55 to 69 with DSpark) | about 320 tokens/s at 8K, about 750 at 32K |
 
 These are the 2.00-bit set. The 2.25-bit set reads 13% more data per token, so expect it to be a little slower. Your drive matters: the 12 GB cards spend most of each token waiting on the SSD and on the CPU, and a slow NVMe drive lowers every number above.
 
@@ -35,6 +35,7 @@ These are the 2.00-bit set. The 2.25-bit set reads 13% more data per token, so e
 - **A RAM expert store that sizes itself.** The model is a mixture of experts: each token uses a few of thousands of small blocks. Strata keeps the busiest ones in RAM, takes whatever RAM is free, and reads the rest from the SSD with direct reads. On the RTX 5070 PC with 64 GB this gave 4.3 to 4.9 tokens/s where memory-mapping the files gave 1.8 to 2.2.
 - **Hot-expert profiles ship with the engine,** so the first prompts do not start cold.
 - **Faster prompts.** The engine now reads long prompts layer by layer in big chunks instead of 16 tokens at a time. A 200-token prompt went from 3.6 to 6.4 tokens/s on the RTX 5070 PC, and 8K prompts reach 231 tokens/s.
+- **Faster prompts on Radeon AI PRO R9700.** New matrix-core kernels (RDNA4) read prompts about 64% faster at 8K and 69% faster at 32K on 4 cards (196 to 320 and 445 to 755 tokens/s), and about 22% faster at 8K on one card. Answer speed does not change. They are on by default on these cards.
 - **Faster long prompts.** A prompt over about 3,700 tokens skips work that the last 20 layers cannot use (a 16K prompt is about 34% faster). In the 799 positions we compared, the model's top choice for the next word was the same with and without the skip in 99.75% of them.
 - **Thinking budget.** When neither your request nor your config sets one, DeepSeek thinks for at most 32,768 tokens. A request can set its own budget; 0 turns the limit off.
 - **DSpark** (a small draft model from Unsloth) is on where it measured faster and off on CPU-bound PCs. On the RTX 3060 PC (20 threads) it raised decode from 6.1-6.7 to 8.2-8.7 tokens/s. On the 4x R9700 box it raised 31 tokens/s to 55 to 69. On the RTX 5070 PC with a 6-core Ryzen 5 7600 it gave no gain at any setting (code 4.64 tokens/s with it off against 4.33 at best with it on; agent 3.41 against 2.86 to 3.21), because checking the drafts costs the CPU about what the saved tokens are worth. There `--dspark auto` does not load the drafter.
