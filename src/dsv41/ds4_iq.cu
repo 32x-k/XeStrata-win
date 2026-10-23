@@ -506,11 +506,13 @@ template <> struct Fast<kIQ1_M> { static constexpr int WORDS = 8192; };
 #else
 template <int T> struct Fast { static constexpr int WORDS = 0; };
 #endif
-template <int T> constexpr int kTabWords = Fast<T>::WORDS > 0 ? Fast<T>::WORDS : (Ty<T>::TAB > 0 ? Ty<T>::TAB : 1);
+// F: whether the fast form is wanted (the kernels of many rows a pass are bound by the dot products and their registers, and the
+// larger codebook's shared memory costs them occupancy: they keep decode<T>)
+template <int T, bool F = true> constexpr int kTabWords = F && Fast<T>::WORDS > 0 ? Fast<T>::WORDS : (Ty<T>::TAB > 0 ? Ty<T>::TAB : 1);
 
-template <int T>
+template <int T, bool F = true>
 __device__ __forceinline__ void load_tab_fast(uint32_t* tab) {
-    if constexpr (Fast<T>::WORDS == 0) {
+    if constexpr (!F || Fast<T>::WORDS == 0) {
         load_tab<T>(tab);
     } else if constexpr (T == kIQ1_M) {
         for (int j = threadIdx.x; j < 4096; j += blockDim.x) {
@@ -520,9 +522,9 @@ __device__ __forceinline__ void load_tab_fast(uint32_t* tab) {
         }
     }
 }
-template <int T>
+template <int T, bool F = true>
 __device__ __forceinline__ void decode_fast_b(const uint8_t* __restrict__ b, int ib, const uint32_t* tab, Sub& s) {
-    if constexpr (Fast<T>::WORDS == 0) {
+    if constexpr (!F || Fast<T>::WORDS == 0) {
         decode_b<T>(b, ib, tab, s);
     } else if constexpr (T == kIQ1_M) {   // (56-byte blocks in 1120-byte rows at 256-aligned offsets: 8-byte aligned)
         const uint32_t qsw = *(const uint32_t*) (b + 4 * ib);
@@ -941,50 +943,56 @@ __global__ void __launch_bounds__(kThreads) light_q8_kernel(const float* __restr
 // grid (n_ff / 8 or n_embd / 8, n_exp): a light expert's rows, a warp a row of the weights (gate and up, or down), every
 // row of the expert a pass -> h16 (the F16 swiglu) or y
 template <int T, int NE, bool GATE_UP>
-__global__ void __launch_bounds__(kThreads) light_kernel(const SetArgs a, const int8_t* __restrict__ xq,
+__global__ void __launch_bounds__(kThreads, NE >= 8 ? 4 : 1) light_kernel(const SetArgs a, const int8_t* __restrict__ xq,
                                                           const float* __restrict__ xd) {
-    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    constexpr int kBPS = kQK<T> == 32 ? 1 : 8, kStep = 32 / kBPS;   // (as the token kernels: a lane keeps its sub-block position)
+    constexpr bool kF = NE <= 4;
+    __shared__ __align__(16) uint32_t tab[kTabWords<T, kF>];
     const int e = blockIdx.y;
     const int lo = a.bounds[e] - a.row0, ne = a.bounds[e + 1] - a.bounds[e];
     if (ne <= 0 || ne > NE) return;   // (uniform: the tiles take an expert of more rows)
-    load_tab<T>(tab);
+    load_tab_fast<T, kF>(tab);
     __syncthreads();
-    const int K = GATE_UP ? a.n_embd : a.n_ff, N = GATE_UP ? a.n_ff : a.n_embd, nsb = K / 32;
-    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-    if (row >= N) return;
+    const int K = GATE_UP ? a.n_embd : a.n_ff, N = GATE_UP ? a.n_ff : a.n_embd, nsb = K / 32, nblk = nsb / kBPS;
+    const int lane = threadIdx.x & 31;
+    const int ib0 = kBPS == 8 ? lane & 7 : 0, blk0 = kBPS == 8 ? lane >> 3 : lane;
     const uint8_t* blob = a.wbase + (size_t) e * a.stride;
     const size_t rb = row_bytes_t<T>(K);
-    const uint8_t* w0 = blob + a.tr[GATE_UP ? 0 : 2] + (size_t) row * rb;
-    const uint8_t* w1 = blob + a.tr[1] + (size_t) row * rb;
     const size_t q0 = (size_t) e * kLightRows;
-    float a0[NE], a1[NE];
+    // (a persistent grid, as the token kernels': blockIdx.x strides over the tiles of kWarps rows)
+    for (int row = blockIdx.x * kWarps + (threadIdx.x >> 5); row < N; row += gridDim.x * kWarps) {
+        const uint8_t* w0 = blob + a.tr[GATE_UP ? 0 : 2] + (size_t) row * rb;
+        const uint8_t* w1 = blob + a.tr[1] + (size_t) row * rb;
+        float a0[NE], a1[NE];
 #pragma unroll
-    for (int i = 0; i < NE; ++i) a0[i] = a1[i] = 0.0f;
-    for (int kb = lane; kb < nsb; kb += 32) {
-        Sub s0, s1;
-        decode<T>(w0, kb, tab, s0);
-        if (GATE_UP) decode<T>(w1, kb, tab, s1);
+        for (int i = 0; i < NE; ++i) a0[i] = a1[i] = 0.0f;
+        for (int blk = blk0; blk < nblk; blk += kStep) {
+            const int kb = blk * kBPS + ib0;
+            Sub s0, s1;
+            decode_fast_b<T, kF>(w0 + (size_t) blk * Ty<T>::B, ib0, tab, s0);
+            if (GATE_UP) decode_fast_b<T, kF>(w1 + (size_t) blk * Ty<T>::B, ib0, tab, s1);
+#pragma unroll
+            for (int i = 0; i < NE; ++i)
+                if (i < ne) {
+                    const int4* xp = (const int4*) (xq + (q0 + i) * K + (size_t) kb * 32);
+                    const int4 xa = xp[0], xb = xp[1];
+                    const float dx = xd[(q0 + i) * nsb + kb];
+                    a0[i] = fmaf(dx, sub_dot<T>(s0, xa, xb), a0[i]);
+                    if (GATE_UP) a1[i] = fmaf(dx, sub_dot<T>(s1, xa, xb), a1[i]);
+                }
+        }
 #pragma unroll
         for (int i = 0; i < NE; ++i)
             if (i < ne) {
-                const int4* xp = (const int4*) (xq + (q0 + i) * K + (size_t) kb * 32);
-                const int4 xa = xp[0], xb = xp[1];
-                const float dx = xd[(q0 + i) * nsb + kb];
-                a0[i] = fmaf(dx, sub_dot<T>(s0, xa, xb), a0[i]);
-                if (GATE_UP) a1[i] = fmaf(dx, sub_dot<T>(s1, xa, xb), a1[i]);
+                const float v0 = warp_sum(a0[i]);
+                const float v1 = GATE_UP ? warp_sum(a1[i]) : 0.0f;
+                if (lane == 0) {
+                    const size_t lr = (size_t) (lo + i);
+                    if (GATE_UP) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(swiglu(v0, v1, a.limit)));
+                    else a.y[lr * a.ldo + row] = v0;
+                }
             }
     }
-#pragma unroll
-    for (int i = 0; i < NE; ++i)
-        if (i < ne) {
-            const float v0 = warp_sum(a0[i]);
-            const float v1 = GATE_UP ? warp_sum(a1[i]) : 0.0f;
-            if (lane == 0) {
-                const size_t lr = (size_t) (lo + i);
-                if (GATE_UP) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(swiglu(v0, v1, a.limit)));
-                else a.y[lr * a.ldo + row] = v0;
-            }
-        }
 }
 
 bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later, STRATA_DS4_NO_TC=1 keeps the F32 kernel
@@ -1029,10 +1037,9 @@ bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later, STRATA_DS4_NO_TC=1 keeps 
 
 // CUDA: a persistent grid (the resident blocks of the device, split over the groups), each block looping over row tiles with
 // its codebook loaded once; HIP keeps the full grid (one tile a block)
-template <typename K>
-int resident_ctas(K kernel) {
+template <auto Kernel>
+int resident_ctas() {   // (a static a kernel: the occupancy differs by the codebook's shared memory)
 #if defined(STRATA_USE_HIP)
-    (void) kernel;
     return 1 << 30;
 #else
     static std::atomic<int> cache[16];
@@ -1043,7 +1050,8 @@ int resident_ctas(K kernel) {
     if (v == 0) {
         int sms = 0, per = 0;
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, kernel, kThreads, 0);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, Kernel, kThreads, 0);
+        if (const char* e = std::getenv("DS4_IQ_MAX_SMS")) sms = std::min(sms, std::max(1, std::atoi(e)));   // (benchmarking: a smaller card)
         if (const char* e = std::getenv("DS4_IQ_CTA_PER_SM")) per = std::min(per, std::max(1, std::atoi(e)));
         v = std::max(1, sms * std::max(per, 1));
         cache[dev].store(v, std::memory_order_relaxed);
@@ -1053,12 +1061,12 @@ int resident_ctas(K kernel) {
 }
 template <int T, int NE>
 void launch_gu(const Args& a, dim3 grid, cudaStream_t s) {
-    grid.x = (unsigned) std::max(1, std::min((int) grid.x, resident_ctas(gate_up_kernel<T, NE, kGuRW>) / (int) grid.y));
+    grid.x = (unsigned) std::max(1, std::min((int) grid.x, resident_ctas<gate_up_kernel<T, NE, kGuRW>>() / (int) grid.y));
     gate_up_kernel<T, NE><<<grid, kThreads, 0, s>>>(a);
 }
 template <int T, int NE>
 void launch_dn(const Args& a, dim3 grid, cudaStream_t s) {
-    grid.x = (unsigned) std::max(1, std::min((int) grid.x, resident_ctas(down_kernel<T, NE, kDnRW>) / (int) grid.y));
+    grid.x = (unsigned) std::max(1, std::min((int) grid.x, resident_ctas<down_kernel<T, NE, kDnRW>>() / (int) grid.y));
     down_kernel<T, NE><<<grid, kThreads, 0, s>>>(a);
 }
 template <int T>
@@ -1125,10 +1133,15 @@ bool light_on() {   // STRATA_DS4_NO_LIGHT=1: every set through the GEMM tiles
 }
 template <int T, bool GU>
 void launch_light(const SetArgs& a, const LightBuf& b, cudaStream_t s) {
-    const dim3 grid((unsigned) (((GU ? a.n_ff : a.n_embd) + kWarps - 1) / kWarps), (unsigned) a.n_exp);
-    if (a.max_rows <= 4) light_kernel<T, 4, GU><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
-    else if (a.max_rows <= 8) light_kernel<T, 8, GU><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
-    else light_kernel<T, kLightRows, GU><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
+    dim3 grid((unsigned) (((GU ? a.n_ff : a.n_embd) + kWarps - 1) / kWarps), (unsigned) a.n_exp);
+    if (a.max_rows <= 4) {   // (persistent for a few rows: the codebook per block is then the cost; more rows are compute, the full grid balances)
+        grid.x = (unsigned) std::max(1, std::min((int) grid.x, resident_ctas<light_kernel<T, 4, GU>>() / std::max(1, (int) grid.y)));
+        light_kernel<T, 4, GU><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
+    } else if (a.max_rows <= 8) {
+        light_kernel<T, 8, GU><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
+    } else {
+        light_kernel<T, kLightRows, GU><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
+    }
 }
 bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     const int K = gu ? a.n_embd : a.n_ff;
