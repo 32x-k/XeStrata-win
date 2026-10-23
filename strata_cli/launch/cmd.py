@@ -277,6 +277,24 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
     return s, notices
 
 
+def _placement_lines(placement: dict | None) -> None:
+    """DeepSeek-V4.1-Flash's plan: the cards, the experts in graphics memory and on the CPU, the n-gram table on the SSD, the warnings."""
+    if not placement:
+        return
+    import textwrap
+    _say("  placement")
+    for line in placement.get("lines") or []:
+        wrapped = textwrap.wrap(line, 94) or [""]
+        _say("    - " + wrapped[0])
+        for w in wrapped[1:]:
+            _say("      " + w)
+    for line in placement.get("warnings") or []:
+        wrapped = textwrap.wrap(line, 90) or [""]
+        _say("  [!] " + wrapped[0])
+        for w in wrapped[1:]:
+            _say("      " + w)
+
+
 def apply_defaults(s: S.LaunchSettings, catalog) -> tuple[S.LaunchSettings, list[S.Notice]]:
     """Fill what was left open with the recommendation for this computer, and collect warnings (never errors for a bad fit)."""
     notices: list[S.Notice] = []
@@ -308,6 +326,16 @@ def apply_defaults(s: S.LaunchSettings, catalog) -> tuple[S.LaunchSettings, list
                 if s.vision == "off" and r.images and catalog.reader_state() == "missing":
                     notices.append(S.Notice("warn", "The engine installed here has no picture reader, so pictures are off.",
                                             "Update the engine to read pictures, or add --vision off to silence this."))
+        if catalog.strata.multi_family(s.family):           # DeepSeek-V4.1-Flash: one request at a time, no tuning, no pictures yet
+            if s.parallel and s.parallel > 1:
+                notices.append(S.Notice("warn", f"{s.model} answers one request at a time in this Strata version, so --parallel {s.parallel} is not used.", ""))
+                s.parallel = None
+            if s.vision not in (None, "off"):
+                notices.append(S.Notice("warn", "DeepSeek-V4.1-Flash cannot read pictures in this Strata version, so pictures are off.", ""))
+            s.vision = "off"
+            if s.tune not in (None, "skip"):
+                notices.append(S.Notice("warn", "Tuning is not offered for DeepSeek-V4.1-Flash yet; it starts with the engine's own settings.", ""))
+                s.tune = "skip"
         notices += S.check_context(s, max_fit_tokens=None)
     if s.access != "local" and not s.api_key and not s.no_key:
         from strata_cli.launch import access
@@ -691,10 +719,11 @@ def run_launch(a: argparse.Namespace) -> int:
                     _say(f"  model     {m.get('title') or 'your model files'}{size}   (your files in {s.model_path})")
                 else:
                     _say(f"  model     {m.get('title') or f'{s.family} {s.model}'}{size}")
-                _say(f"  context   {S.context_label(s.context)}    pictures {PICTURE_WORDS.get(s.vision or 'off', s.vision)}    parallel {s.parallel or 'fit to your card'}")
+                _say(f"  context   {S.context_label(s.context)}    pictures {PICTURE_WORDS.get(s.vision or 'off', s.vision)}    parallel {('one at a time' if plan.get('placement') else s.parallel or 'fit to your card')}")
                 _say(f"  download  {(plan.get('download') or {}).get('text', '')}")
                 if plan.get("drafting"):
                     _say(f"  drafting  {plan['drafting'].replace('Drafting: ', '', 1)}")
+                _placement_lines(plan.get("placement"))
                 _say(f"  tuning    {s.tune}    access {S.ACCESS_WORDS[s.access]}, port {s.port}"
                      + ("    API key on" if s.api_key else ""))
                 for n in notes:
