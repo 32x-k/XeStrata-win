@@ -401,6 +401,20 @@ class EnginePackage(unittest.TestCase):
             self.assertEqual(setup.dsv41_exe(eng), Path(d) / "engine-dsv41" / "0.1.49-x" / name)
 
 
+class SharedFiles(unittest.TestCase):
+    def test_the_drafter_beside_the_sets_folder_is_found_from_the_set_folder(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "off" / "2.00bpw").mkdir(parents=True)
+            (root / "dspark").mkdir()
+            f = root / "dspark" / setup.DSV41_DSPARK
+            f.write_bytes(b"x")
+            a = argparse.Namespace(gguf_dir=str(root / "off" / "2.00bpw"))
+            with mock.patch.dict(setup.DSV41_ALL_FILES, {setup.DSV41_DSPARK: (1, "0" * 64)}):
+                got = setup.dsv41_find_shared(a, setup.DSV41_DSPARK, root / "off" / "2.00bpw", root / "models" / "shared")
+            self.assertEqual(got, f)
+
+
 class InstallOfficial(Install):
     """install_dsv41 for an official set, the engine and the tools mocked."""
 

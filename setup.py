@@ -7758,7 +7758,7 @@ def dsv41_find_shared(a, name: str, folder: Path, shared: Path) -> Path:
     roots = [shared, folder]
     if a.gguf_dir:
         base = Path(a.gguf_dir)
-        roots += [base, base.parent]
+        roots += [base, base.parent, base.parent.parent]          # (strata launch hands over the set's own folder: 2.00bpw/)
     seen = []
     for r in roots:
         if r in seen:
