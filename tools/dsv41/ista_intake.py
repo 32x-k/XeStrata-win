@@ -40,10 +40,17 @@ PY = "/data/dsv41/hfvenv/bin/python"
 HF = "/data/dsv41/hfvenv/bin/hf"
 TOOLS = PORT / "src/tools/dsv41"
 # the substitutions the published sets need today (HANDOVER.md §6; Phase 1 removes them)
-ENGRAM_DIR = pathlib.Path("/home/niko/engram-ista/2.00bpw")
-DSPARK = pathlib.Path("/data/dsv41/source/dspark-DeepSeek-V4.1-Flash-Q8_0.gguf")
-DENSE_WOA = pathlib.Path("/home/niko/dsv41-dense/wo_a_q5k")
-DENSE_HEAD = pathlib.Path("/home/niko/dsv41-dense/head_q6k")
+# the Engram every live pack uses: the reference MXFP8 tables (shards 8/9 of the UD set, 203 GB).  The IST-DAS IQ4_NL
+# Engram (110.6 GB) is a separate Phase 1.3 experiment, so the intake does not depend on it.
+ENGRAM_DIR = pathlib.Path("/home/niko/dsv41-c0/t2/Engram")
+DSPARK = pathlib.Path("/data/dsv41/source/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf")
+DENSE_WOA = pathlib.Path("/home/niko/dsv41-dense/woaQ5_K")
+DENSE_HEAD = pathlib.Path("/home/niko/dsv41-dense/headQ6_K")
+# the UD set's first shard carries the Engram hash parameters as ple.* metadata and the vision tower carries the mmproj
+ENGRAM_META = pathlib.Path("/data/dsv41/source/UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf")
+MMPROJ = pathlib.Path("/data/dsv41/source/mmproj-BF16.gguf")
+DSPARK_NOISE = "128799"     # dspark_noise_token_id for this model (see the h225 pack)
+DSPARK_RANK = "256"         # dspark_markov_rank
 # ggml type ids the device kernels take (src/dsv41/ds4_iq.cu's supported() plus MXFP4); kept in sync with --pack-info
 DEVICE_TYPES = {0, 1, 2, 3, 8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 39}
 TYPE_NAMES = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1", 8: "Q8_0", 9: "Q8_1",
@@ -126,16 +133,25 @@ def pack_set(commit: str, set_name: str, root: pathlib.Path, report: list[str]) 
     if pack.exists():
         report.append("- pack already exists: %s" % pack)
         return pack
+    # the exact recipe the hand-built h225 pack used (HANDOVER.md §6 and h4_225.sh): no requant, our MXFP8 Engram, and the
+    # three workarounds Phase 1 removes - the interleaved 3-D attn_output_a, the engram_(k|q|wkv) tensors, and the Engram
+    # hash parameters that live in the UD set's metadata (--engram-meta), without which pack_gguf sees no Engram layers.
     cmd = [PY, str(TOOLS / "pack_gguf.py"), "--model", str(setdir), "--out", str(pack)]
     if ENGRAM_DIR.exists():
-        cmd += ["--engram", str(ENGRAM_DIR.parent)]
+        cmd += ["--engram", str(ENGRAM_DIR)]
+    if ENGRAM_META.exists():
+        cmd += ["--engram-meta", str(ENGRAM_META)]
+    if MMPROJ.exists():
+        cmd += ["--mmproj", str(MMPROJ)]
     if DENSE_WOA.exists():
         cmd += ["--dense-override", str(DENSE_WOA)]
     if DENSE_HEAD.exists():
         cmd += ["--dense-override", str(DENSE_HEAD)]
-    cmd += ["--skip-tensors", r"blk\.\d+\.attn_output_a\.weight"]
+    cmd += ["--skip-tensors", r"attn_output_a|engram_(k|q|wkv)\."]
     if DSPARK.exists():
-        cmd += ["--dspark-gguf", str(DSPARK), "--dspark-noise-token", "128799", "--dspark-markov-rank", "256"]
+        # pack_gguf fills the block/MTP geometry from the drafter but not the noise token or the markov rank: without them
+        # the pack reports dspark_noise_token_id 0 and DSpark drafts one token a round (the 2026-10-22 bug).
+        cmd += ["--dspark-gguf", str(DSPARK), "--dspark-noise-token", DSPARK_NOISE, "--dspark-markov-rank", DSPARK_RANK]
     log("  pack: %s" % " ".join(cmd[2:]))
     r = run(cmd, cwd=str(PORT))
     (PORT / "runs").mkdir(exist_ok=True)

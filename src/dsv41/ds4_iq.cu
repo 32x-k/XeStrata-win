@@ -34,8 +34,8 @@ template <> struct Ty<kIQ3_XXS> { static constexpr int B = 98, TAB = 256, MIN = 
 template <> struct Ty<kIQ3_S> { static constexpr int B = 110, TAB = 512, MIN = 0; };
 template <> struct Ty<kIQ4_XS> { static constexpr int B = 136, TAB = 4, MIN = 0; };
 template <> struct Ty<kQ4_K> { static constexpr int B = 144, TAB = 0, MIN = 1; };
-// The types with a known layout and no device kernel (the CPU lane's ggml dots take them): their row bytes are needed to
-// lay a pack out, nothing else.  Ty<> gives the block; the kernels are never instantiated for them.
+// The 1.5- and 1.75-bit types (IQ1_S, IQ1_M: an 11-bit index into iq1s_grid_gpu, whose 8 values are 4-bit codes) and
+// IQ4_NL (32 values a block: its codebook's 16 int8 values are the first 4 words of its table)
 template <> struct Ty<kIQ1_S> { static constexpr int B = 50, TAB = 2048, MIN = 0; };
 template <> struct Ty<kIQ1_M> { static constexpr int B = 56, TAB = 2048, MIN = 0; };
 template <> struct Ty<kIQ4_NL> { static constexpr int B = 18, TAB = 16, MIN = 0; };
@@ -48,11 +48,12 @@ template <> struct Ty<kQ6_K> { static constexpr int B = 210, TAB = 0, MIN = 0; }
 // sets take it too
 constexpr int kMXFP4 = 39;
 template <> struct Ty<kMXFP4> { static constexpr int B = 17, TAB = 0, MIN = 0; };
-template <int T> constexpr int kQK = T == kMXFP4 ? 32 : 256;   // values a block
+template <int T> constexpr int kQK = T == kMXFP4 || T == kIQ4_NL ? 32 : 256;   // values a block
 static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_xs) == 74 && sizeof(block_iq2_s) == 82 &&
                   sizeof(block_iq3_xxs) == 98 &&
                   sizeof(block_iq3_s) == 110 && sizeof(block_iq4_xs) == 136 && sizeof(block_q4_K) == 144 &&
-                  sizeof(block_q2_K) == 84 && sizeof(block_q3_K) == 110,
+                  sizeof(block_q2_K) == 84 && sizeof(block_q3_K) == 110 && sizeof(block_iq1_s) == 50 &&
+                  sizeof(block_iq1_m) == 56 && sizeof(block_iq4_nl) == 18,
               "ggml's block sizes");
 
 template <int T>
@@ -61,7 +62,7 @@ __host__ __device__ __forceinline__ size_t row_bytes_t(int k) { return (size_t) 
 // the type's codebook into shared memory (u32 words; IQ4_XS: its 16 values, from bytes - an int8 table's alignment)
 template <int T>
 __device__ __forceinline__ void load_tab(uint32_t* tab) {
-    if constexpr (T == kIQ4_XS) {
+    if constexpr (T == kIQ4_XS || T == kIQ4_NL) {
         if (threadIdx.x < 4) {
             const uint8_t* kv = (const uint8_t*) kvalues_iq4nl + 4 * threadIdx.x;
             tab[threadIdx.x] = (uint32_t) kv[0] | (uint32_t) kv[1] << 8 | (uint32_t) kv[2] << 16 | (uint32_t) kv[3] << 24;
@@ -69,8 +70,9 @@ __device__ __forceinline__ void load_tab(uint32_t* tab) {
     } else if constexpr (Ty<T>::TAB > 0) {
         const uint32_t* src = T == kIQ2_XXS  ? (const uint32_t*) iq2xxs_grid
                               : T == kIQ2_XS ? (const uint32_t*) iq2xs_grid
-                              : T == kIQ2_S   ? (const uint32_t*) iq2s_grid
+                              : T == kIQ2_S  ? (const uint32_t*) iq2s_grid
                               : T == kIQ3_XXS ? (const uint32_t*) iq3xxs_grid
+                              : T == kIQ1_S || T == kIQ1_M ? (const uint32_t*) iq1s_grid_gpu
                                               : (const uint32_t*) iq3s_grid;
         for (int i = threadIdx.x; i < Ty<T>::TAB; i += blockDim.x) tab[i] = src[i];
     }
@@ -104,6 +106,19 @@ __device__ __forceinline__ int2 tab16(uint32_t q4, const uint32_t* t) {   // vec
         tmp[i] = __byte_perm(lo, hi, sel >> sh);
     }
     return make_int2((int) __byte_perm(tmp[0], tmp[1], 0x6420), (int) __byte_perm(tmp[0], tmp[1], 0x7531));
+}
+// iq1s_grid_gpu's 8 values in 4 bytes, 4 bits each (low nibbles: values 0..3, high: 4..7; 0 is -1, 2 is +1) -> the 4
+// values as int8 codes 8 (n - 1) + 1, or - 1 when the group's delta is negative: ggml's weight dl ((n - 1) +- 0.125), whose
+// dl (2 sc + 1) / 8 is this kernel's per-sub-block scale, is then d * (s0 lo + s1 hi) exactly
+__device__ __forceinline__ uint32_t iq1_codes(uint32_t n, bool neg) {
+    const uint32_t c = (uint32_t) __vsub4((int) (n * 8u), 0x07070707);   // (n * 8 - 7) in each byte: no carry (n <= 15)
+    return neg ? (uint32_t) __vsub4((int) c, 0x02020202) : c;
+}
+// IQ1_M has no d field: its F16 scale is the top nibbles of its four u16 scales (ggml's dequantize_row_iq1_m)
+__device__ __forceinline__ uint16_t iq1m_d(const uint8_t* b) {
+    const uint32_t s0 = (uint32_t) b[48] | (uint32_t) b[49] << 8, s1 = (uint32_t) b[50] | (uint32_t) b[51] << 8;
+    const uint32_t s2 = (uint32_t) b[52] | (uint32_t) b[53] << 8, s3 = (uint32_t) b[54] | (uint32_t) b[55] << 8;
+    return (uint16_t) ((s0 >> 12) | ((s1 >> 8) & 0x00f0u) | ((s2 >> 4) & 0x0f00u) | (s3 & 0xf000u));
 }
 __device__ __forceinline__ int q3k_scale(const uint8_t* sc, int is) {
     const int lo = is < 8 ? sc[is] & 15 : sc[is - 8] >> 4;
@@ -223,6 +238,45 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         }
         s.s0 = s.s1 = ls - 32;
         s.d = h2f(b);
+    } else if constexpr (T == kIQ1_S) {   // d, qs[32] (4 a 32-value sub-block), qh[8] u16: 11-bit grid, 3-bit scale, delta
+        const uint8_t* qs = b + 2;
+        const uint16_t qh = ((const uint16_t*) (b + 34))[ib];
+        const bool neg = (qh & 0x8000u) != 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t g = tab[qs[4 * ib + l] | (((qh >> (3 * l)) & 7u) << 8)];
+            s.q[2 * l] = (int) iq1_codes(g & 0x0F0F0F0Fu, neg);
+            s.q[2 * l + 1] = (int) iq1_codes((g >> 4) & 0x0F0F0F0Fu, neg);
+        }
+        s.s0 = s.s1 = 2 * (int) ((qh >> 12) & 7u) + 1;
+        s.d = h2f(b) * 0.125f;
+    } else if constexpr (T == kIQ1_M) {   // qs[32], qh[16], scales[8]: no d field; 11-bit grid, two 3-bit scales a 32
+        const uint8_t* qs = b + 4 * ib;
+        const uint8_t qh0 = b[32 + 2 * ib], qh1 = b[33 + 2 * ib];
+        const uint16_t sc = ((const uint16_t*) (b + 48))[ib >> 1];
+        const int sh = 6 * (ib & 1);
+        const uint32_t ii[4] = {qs[0] | ((uint32_t) (qh0 << 8) & 0x700u), qs[1] | ((uint32_t) (qh0 << 4) & 0x700u),
+                                qs[2] | ((uint32_t) (qh1 << 8) & 0x700u), qs[3] | ((uint32_t) (qh1 << 4) & 0x700u)};
+        const bool neg[4] = {(qh0 & 0x08u) != 0, (qh0 & 0x80u) != 0, (qh1 & 0x08u) != 0, (qh1 & 0x80u) != 0};
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t g = tab[ii[l]];
+            s.q[2 * l] = (int) iq1_codes(g & 0x0F0F0F0Fu, neg[l]);
+            s.q[2 * l + 1] = (int) iq1_codes((g >> 4) & 0x0F0F0F0Fu, neg[l]);
+        }
+        s.s0 = 2 * (int) ((sc >> sh) & 7u) + 1;
+        s.s1 = 2 * (int) ((sc >> (sh + 3)) & 7u) + 1;
+        s.d = __half2float(__ushort_as_half(iq1m_d(b))) * 0.125f;
+    } else if constexpr (T == kIQ4_NL) {   // d, qs[16]: a block of 32 values, its codebook's int8 a nibble
+        const uint8_t* qs = b + 2;   // (18-byte blocks: even, so ld2's 2-byte alignment - not ld4's 4)
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int2 v = tab16(ld2(qs + 4 * t), tab);
+            s.q[t] = v.x;
+            s.q[4 + t] = v.y;
+        }
+        s.s0 = s.s1 = 1;
+        s.d = h2f(b);
     } else if constexpr (T == kQ4_K) {
         int sc, m;
         q4k_scale(b + 4, ib, sc, m);
@@ -316,7 +370,7 @@ __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int
 template <int T>
 __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, int p, const uint32_t* tab, float* w) {
     const int ib = kb & 7;
-    const uint8_t* b = row + (size_t) (kb >> 3) * Ty<T>::B;
+    const uint8_t* b = row + (size_t) (kQK<T> == 32 ? kb : kb >> 3) * Ty<T>::B;
     if constexpr (T == kIQ2_XXS) {
         const uint8_t* q = b + 2 + 8 * ib;
         const uint32_t a1 = ld2(q + 4);
@@ -377,6 +431,35 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
         const int ls = ((b[4 + (ib >> 1)] >> (4 * (ib & 1))) & 15) | (((sh >> (2 * ib)) & 3) << 4);
         const float dl = h2f(b) * (float) (ls - 32);
         const uint8_t* qs = b + 8 + 16 * ib + 8 * (p & 1);
+        const int8_t* kv = (const int8_t*) tab;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) w[j] = dl * (float) kv[p < 2 ? qs[j] & 15 : qs[j] >> 4];
+    } else if constexpr (T == kIQ1_S) {
+        const uint16_t qh = ((const uint16_t*) (b + 34))[ib];
+        const uint32_t g = tab[b[2 + 4 * ib + p] | (((qh >> (3 * p)) & 7u) << 8)];
+        const uint32_t c0 = iq1_codes(g & 0x0F0F0F0Fu, (qh & 0x8000u) != 0);
+        const uint32_t c1 = iq1_codes((g >> 4) & 0x0F0F0F0Fu, (qh & 0x8000u) != 0);
+        const float dl = h2f(b) * (float) (2 * (int) ((qh >> 12) & 7u) + 1) * 0.125f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) w[j] = dl * (float) (int8_t) (c0 >> (8 * j));
+#pragma unroll
+        for (int j = 0; j < 4; ++j) w[4 + j] = dl * (float) (int8_t) (c1 >> (8 * j));
+    } else if constexpr (T == kIQ1_M) {
+        const uint8_t* qs = b + 4 * ib;
+        const uint8_t qh0 = b[32 + 2 * ib], qh1 = b[33 + 2 * ib], qh = p < 2 ? qh0 : qh1;
+        const uint16_t sc = ((const uint16_t*) (b + 48))[ib >> 1];
+        const uint32_t g = tab[qs[p] | ((uint32_t) (qh << (p & 1 ? 4 : 8)) & 0x700u)];
+        const bool neg = (p & 1 ? qh & 0x80u : qh & 0x08u) != 0;
+        const uint32_t c0 = iq1_codes(g & 0x0F0F0F0Fu, neg), c1 = iq1_codes((g >> 4) & 0x0F0F0F0Fu, neg);
+        const int sh = (int) ((sc >> (6 * (ib & 1) + (p < 2 ? 0 : 3))) & 7u);
+        const float dl = __half2float(__ushort_as_half(iq1m_d(b))) * (float) (2 * sh + 1) * 0.125f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) w[j] = dl * (float) (int8_t) (c0 >> (8 * j));
+#pragma unroll
+        for (int j = 0; j < 4; ++j) w[4 + j] = dl * (float) (int8_t) (c1 >> (8 * j));
+    } else if constexpr (T == kIQ4_NL) {
+        const float dl = h2f(b);
+        const uint8_t* qs = b + 2 + 8 * (p & 1);
         const int8_t* kv = (const int8_t*) tab;
 #pragma unroll
         for (int j = 0; j < 8; ++j) w[j] = dl * (float) kv[p < 2 ? qs[j] & 15 : qs[j] >> 4];
@@ -858,6 +941,9 @@ bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later, STRATA_DS4_NO_TC=1 keeps 
         case kIQ3_XXS: F(kIQ3_XXS); break; \
         case kIQ3_S: F(kIQ3_S); break;     \
         case kIQ4_XS: F(kIQ4_XS); break;   \
+        case kIQ1_S: F(kIQ1_S); break;     \
+        case kIQ1_M: F(kIQ1_M); break;     \
+        case kIQ4_NL: F(kIQ4_NL); break;   \
         case kQ4_K: F(kQ4_K); break;       \
         case kQ2_K: F(kQ2_K); break;       \
         case kQ3_K: F(kQ3_K); break;       \
@@ -976,6 +1062,7 @@ bool supported(int t) {
     // the types the kernels below are instantiated for (DS4_IQ_SWITCH + the trellis ones + the dense K-quants)
     switch (t) {
         case kIQ2_XXS: case kIQ2_XS: case kIQ2_S: case kIQ3_XXS: case kIQ3_S: case kIQ4_XS:
+        case kIQ1_S: case kIQ1_M: case kIQ4_NL:
         case kQ4_K: case kQ5_K: case kQ6_K: case kQ2_K: case kQ3_K:
             return true;
         default:
@@ -1004,7 +1091,7 @@ int block_bytes(int t) {
         case kQ6_K: return Ty<kQ6_K>::B;
         case kQ2_K: return Ty<kQ2_K>::B;
         case kQ3_K: return Ty<kQ3_K>::B;
-        case kIQ1_S: return Ty<kIQ1_S>::B;   // (a known layout, no device kernel: the CPU lane's)
+        case kIQ1_S: return Ty<kIQ1_S>::B;
         case kIQ1_M: return Ty<kIQ1_M>::B;
         case kIQ4_NL: return Ty<kIQ4_NL>::B;
         default: return 0;
