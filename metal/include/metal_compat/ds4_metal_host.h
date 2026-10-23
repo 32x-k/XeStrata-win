@@ -20,6 +20,20 @@ namespace strata::dsv41::metal_host {
 bool init_pre(float* pre, int T, void* stream);
 // ds4_kernels.cu:130 embed_kernel: h[(t*hc + s)*dim + e] = bf16(rows[t*dim + e])
 // ds4_model.cu:2737 cublasSgemm(OP_T, OP_N, ...): C[t][m] = sum_k A[m][k] * B[t][k], F32, alpha 1, beta 0
+// ds4_kernels.cu:1894 finish_kernel<false>, the engine's Finish as ds4_kernels.cuh declares it
+struct FinishIn {
+    const float* w;
+    float eps;
+    int rd, pos, inverse, vpp, pos_step;
+    const float* freqs;
+    int quant;
+    const uint16_t* dst;
+    long long dst_stride;
+    uint8_t* pdst;
+    long long pdst_stride;
+};
+bool finish(float* x, int n_vec, int len, long long stride, const FinishIn& f);
+
 bool sgemm_tn(const float* A, const float* B, float* C, int m, int nt, int k, int lda, int ldb, int ldc);
 
 bool embed(const uint16_t* rows, int T, float* h, int dim, int hc, void* stream);

@@ -1882,16 +1882,19 @@ void finish(float* x, int n_vec, int len, long long stride, const Finish& f, cud
         return;
     }
     if (n_vec <= 0) return;
-    std::fprintf(stderr, "ds4 finish: variant %s quant %d len %d dst %p pdst %p w %p rd %d\n",
-                 f.pdst ? "pack" : "plain", f.quant, len, (void*) f.dst, (void*) f.pdst, (const void*) f.w, f.rd);
     if (f.pdst != nullptr) {
         if (f.quant < kKvFp8 || f.quant > kKvFp4p || len % 32 != 0) {
             std::fprintf(stderr, "ds4 finish: packed rows of quant %d, %d values not covered\n", f.quant, len);
             return;
         }
         strata_ds4_launch(finish_kernel<true>, n_vec, kThreads, 0, s, x, len, stride, f);
-    } else
+    } else {
+#if defined(STRATA_METAL)
+        const auto& mf = *reinterpret_cast<const strata::dsv41::metal_host::FinishIn*>(&f);
+        if (strata::dsv41::metal_host::finish(x, n_vec, len, stride, mf)) return;   // the ported MSL kernel
+#endif
         strata_ds4_launch(finish_kernel<false>, n_vec, kThreads, 0, s, x, len, stride, f);
+    }
 }
 
 void hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
