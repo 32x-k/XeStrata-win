@@ -42,6 +42,7 @@ struct Options {
     // trunk's hottest would have had); --dspark on / off / none says it outright
     bool dspark_auto = true;
     bool dspark = true;              // load the DSpark drafter (the checkpoint's mtp.* blocks) for speculative decoding
+    int dspark_block = 0;             // at most this many drafts a round (--dspark-block N; 0: the pack's block size)
     float dspark_conf = 0.5f;         // a draft is verified while its confidence (sigmoid) is at least this
     // tensor parallelism: runs of tp GPUs of one kind (the same memory) take the same layers, each a share of the
     // heads, of the output projection and of every expert's FFN, summed through host-mapped memory (a GPU unlike the
