@@ -240,4 +240,62 @@ bool hc_split(const float* mixes, const float* scale, const float* base, int hc,
     return true;
 }
 
+
+// ds4_kernels.cu:1938 - moe_sort: count each virtual slot's picks, prefix-sum the counts, fill in token order.
+// Three dispatches on one command buffer, so their order is the order of the calls (serial dispatch).
+bool moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos) {
+    if (!ensure()) return false;
+    void* hi = strata::gpu::host_view((void*) idx);
+    void* hv = strata::gpu::host_view((void*) vs);
+    void* hb = strata::gpu::host_view((void*) bounds);
+    void* hr = strata::gpu::host_view((void*) row_tok);
+    void* hp = strata::gpu::host_view((void*) pos);
+    if (!hi || !hv || !hb || !hr || !hp) { std::fprintf(stderr, "dsv41 metal: moe_sort has no host view\n"); return false; }
+    const size_t page = 16384;
+    auto wrap = [&](void* host, size_t bytes) {
+        return g_cx->wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)), ((bytes + page - 1) / page) * page);
+    };
+    auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
+    const size_t t_bytes = (size_t) T * k * 4 + 65536;
+    mtl::Buffer bi = wrap(hi, t_bytes);
+    mtl::Buffer bv = wrap(hv, (size_t) n_vs * 4 + 65536);
+    mtl::Buffer bb = wrap(hb, (size_t) (n_vs + 2) * 4 + 65536);
+    mtl::Buffer br = wrap(hr, t_bytes);
+    mtl::Buffer bp = wrap(hp, t_bytes);
+    if (!bi.handle || !bv.handle || !bb.handle || !br.handle || !bp.handle) return false;
+    mtl::Pipeline pc, pf, ps;
+    try {
+        pc = g_cx->pipeline(g_lib, "ds4_moe_sort_count");
+        pf = g_cx->pipeline(g_lib, "ds4_moe_sort_fill");
+        ps = g_cx->pipeline(g_lib, "ds4_bounds_scan");
+    } catch (...) { return false; }
+    // 1. counts
+    mtl::Dispatch d1;
+    d1.p = &pc;
+    d1.args = {mtl::Arg::B(bi, off(hi)), mtl::Arg::V((unsigned) T), mtl::Arg::V((unsigned) k),
+               mtl::Arg::B(bv, off(hv)), mtl::Arg::B(bb, off(hb))};
+    d1.grid[0] = (uint32_t) n_vs;
+    d1.grid[1] = d1.grid[2] = 1;
+    d1.tg[0] = 256; d1.tg[1] = d1.tg[2] = 1;
+    g_cx->run({d1});
+    // 2. the exclusive prefix over the slots
+    mtl::Dispatch d2;
+    d2.p = &ps;
+    d2.args = {mtl::Arg::B(bb, off(hb)), mtl::Arg::V((unsigned) n_vs)};
+    d2.grid[0] = 1;
+    d2.grid[1] = d2.grid[2] = 1;
+    d2.tg[0] = 32; d2.tg[1] = d2.tg[2] = 1;
+    g_cx->run({d2});
+    // 3. the fill
+    mtl::Dispatch d3;
+    d3.p = &pf;
+    d3.args = {mtl::Arg::B(bi, off(hi)), mtl::Arg::V((unsigned) T), mtl::Arg::V((unsigned) k),
+               mtl::Arg::B(bv, off(hv)), mtl::Arg::B(bb, off(hb)), mtl::Arg::B(br, off(hr)), mtl::Arg::B(bp, off(hp))};
+    d3.grid[0] = (uint32_t) n_vs;
+    d3.grid[1] = d3.grid[2] = 1;
+    d3.tg[0] = 256; d3.tg[1] = d3.tg[2] = 1;
+    g_cx->run({d3});
+    return true;
+}
+
 }  // namespace strata::dsv41::metal_host

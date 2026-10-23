@@ -1937,6 +1937,9 @@ void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd,
 }
 void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos,
               cudaStream_t s) {
+#if defined(STRATA_METAL)
+    if (strata::dsv41::metal_host::moe_sort(idx, T, k, vs, n_vs, bounds, row_tok, pos)) return;
+#endif
     strata_ds4_launch(moe_sort_kernel<false>, n_vs, kThreads, 0, s, idx, T, k, vs, bounds, row_tok, pos);
     strata_ds4_launch(bounds_scan_kernel, 1, 32, 0, s, bounds, n_vs);
     strata_ds4_launch(moe_sort_kernel<true>, n_vs, kThreads, 0, s, idx, T, k, vs, bounds, row_tok, pos);

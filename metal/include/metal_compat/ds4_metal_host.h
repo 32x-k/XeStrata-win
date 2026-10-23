@@ -32,6 +32,9 @@ struct FinishIn {
     uint8_t* pdst;
     long long pdst_stride;
 };
+// ds4_kernels.cu:1938 moe_sort: counts, prefix, fill
+bool moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos);
+
 // ds4_kernels.cu:1908 hc_split (the sinkhorn normalisation)
 bool hc_split(const float* mixes, const float* scale, const float* base, int hc, int iters, float hc_eps, int T,
               float* pre, float* post, float* comb);

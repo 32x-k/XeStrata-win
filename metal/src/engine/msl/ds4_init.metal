@@ -239,3 +239,73 @@ kernel void ds4_hc_split(device const float* mixes [[buffer(0)]], device const f
         for (uint k = 0; k < 8u; ++k) { if (k >= hc) break; cb[j * hc + k] = c[j][k]; }
     }
 }
+
+// ds4_kernels.cu:1938  moe_sort - count each virtual slot's picks, prefix-sum the counts, then fill in token order.
+// kPicks = 8 (ds4_kernels.cuh:19): idx is [T][8], so q -> (t = q/8, i = q%8).
+kernel void ds4_bounds_scan(device int* bounds [[buffer(0)]], constant uint& n_vs [[buffer(1)]],
+                            uint tid [[thread_index_in_threadgroup]]) {
+    if (tid != 0u) return;
+    bounds[0] = 0;
+    for (uint s = 0; s < n_vs; ++s) bounds[s + 1] += bounds[s];
+}
+
+// simd_ballot returns a simd_vote, which does not cast to an integer in this toolchain; the same counts come from the
+// prefix-sum and sum primitives, which give a lane its offset inside its simdgroup and the group its total.
+static inline int ds4_warp_prefix(bool hit) { return simd_prefix_exclusive_sum(hit ? 1 : 0); }
+static inline int ds4_warp_total(bool hit) { return simd_sum(hit ? 1 : 0); }
+
+kernel void ds4_moe_sort_count(device const int* idx [[buffer(0)]], constant uint& T [[buffer(1)]],
+                               constant uint& kk [[buffer(2)]], device const int* vs [[buffer(3)]],
+                               device int* bounds [[buffer(4)]], uint slot [[threadgroup_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup int warp_n[8];
+    threadgroup int base_s;
+    const uint wp = tid / 32u, lane = tid % 32u;
+    if (tid == 0u) base_s = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint n = T * kk;
+    for (uint q = tid; q < n; q += 256u) {
+        const uint t = q / kk, i = q - t * kk;
+        const bool hit = vs[idx[t * 8u + i]] == int(slot);
+        // one vote a warp: the running offset needs each warp's count, accumulated in slot order
+        const int wtot = ds4_warp_total(hit);
+        if ((tid % 32u) == 0u) warp_n[wp] = wtot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int total = 0;
+        for (uint w = 0; w < 8u; ++w) total += warp_n[w];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) base_s += total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) bounds[slot + 1] = base_s;
+}
+
+kernel void ds4_moe_sort_fill(device const int* idx [[buffer(0)]], constant uint& T [[buffer(1)]],
+                              constant uint& kk [[buffer(2)]], device const int* vs [[buffer(3)]],
+                              device int* bounds [[buffer(4)]], device int* row_tok [[buffer(5)]],
+                              device int* pos [[buffer(6)]], uint slot [[threadgroup_position_in_grid]],
+                              uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup int warp_n[8];
+    threadgroup int base_s;
+    const uint wp = tid / 32u, lane = tid % 32u;
+    if (tid == 0u) base_s = bounds[slot];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint n = T * kk;
+    for (uint q = tid; q < n; q += 256u) {
+        const uint t = q / kk, i = q - t * kk;
+        const bool hit = vs[idx[t * 8u + i]] == int(slot);
+        const int wpre = ds4_warp_prefix(hit), wtot = ds4_warp_total(hit);
+        if ((tid % 32u) == 0u) warp_n[wp] = wtot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int before = 0, total = 0;
+        for (uint w = 0; w < 8u; ++w) { if (w < wp) before += warp_n[w]; total += warp_n[w]; }
+        if (hit) {
+            const int r = base_s + before + wpre;
+            row_tok[r] = int(t);
+            pos[t * 8u + i] = r;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) base_s += total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
