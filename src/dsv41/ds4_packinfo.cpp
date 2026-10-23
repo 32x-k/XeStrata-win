@@ -3,6 +3,7 @@
 // would go to the CPU lane, or stop the load).  Host only, no device, no weights read: tensors.txt and ds4.txt are the
 // pack's whole description (tools/dsv41/pack_gguf.py).  The same report is the first line of every benchmark log.
 #include "ds4_packinfo.hpp"
+#include "ds4_iq.cuh"      // iq::supported / iq::name: the device-type list below is derived from the kernels, not copied
 
 #include <algorithm>
 #include <cstdio>
@@ -23,10 +24,18 @@ namespace {
 
 // The ggml block types the device kernels take (ds4_iq.cu's Ty<> / DS4_IQ_SWITCH + ds4_gguf.cu's MXFP4).  A name here
 // and not in the pack's tensor list is fine; a tensor whose type is not here is the CPU lane's (ggml-cpu's row dots).
+// It was a copy of the supported() switch and fell behind when IQ1_S, IQ1_M and IQ4_NL got kernels (2026-10-23), so it is
+// now the switch itself, by type name.
+
 bool device_type(const std::string& t) {
-    static const std::set<std::string> ok = {"MXFP4", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ2_XXS", "IQ2_XS",
-                                             "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ1_M", "TQK6", "TQK7", "TQK5X", "TQK4X",
-                                             "TQK5T", "TQK4T"};
+    static const std::set<std::string> ok = [] {
+        std::set<std::string> s = {"MXFP4", "TQK6", "TQK7", "TQK5X", "TQK4X", "TQK5T", "TQK4T"};   // ds4_gguf.cu / trellis
+        for (int ty = 0; ty < 64; ++ty) {
+            const char* n = gguf::iq::name(ty);
+            if (n && std::strcmp(n, "?") != 0 && gguf::iq::supported(ty)) s.insert(n);
+        }
+        return s;
+    }();
     return ok.count(t) != 0;
 }
 // The types the dense path reads as they are (ds4_gguf.cu: BF16 / F32 / MXFP8 rows, Q8_0 rows; ds4_iq's GEMV for the

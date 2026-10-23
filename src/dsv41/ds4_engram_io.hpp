@@ -89,9 +89,9 @@ private:
     std::vector<std::unique_ptr<uint8_t[]>> blocks_;
 };
 
-/// One row to fetch: its codes to dst, its scales to scales.  mx8: n bytes at off of a file, [scale, 32 codes] blocks
-/// (a GGUF's MXFP8 row); else n code bytes at off and n2 scale bytes at off2 of file2 (two reads; n2 0: none - a
-/// GGUF's Q6_K row, its scales inside its n bytes).
+/// One row to fetch: its bytes to dst, its scales to scales.  mx8: n bytes at off of a file, [scale, 32 codes] blocks
+/// (a GGUF's MXFP8 row); else n row bytes at off and n2 scale bytes at off2 of file2 (two reads; n2 0: none - a GGUF's
+/// Q6_K or IQ4_NL row, their scales inside their n bytes: 210 a 256 values, 18 a 32).
 struct EgRead {
     int file = -1;
     uint64_t off = 0;

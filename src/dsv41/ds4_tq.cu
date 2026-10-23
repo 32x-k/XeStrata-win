@@ -262,7 +262,7 @@ __device__ __forceinline__ void tile_dot(const uint8_t* const* wrows, int nblk, 
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 const float p0 = part[mi][i], p1 = part[mi][8 + i];
-                const float q0 = __shfl_xor(p0, 16), q1 = __shfl_xor(p1, 16);
+                const float q0 = __shfl_xor_sync(0xffffffffu, p0, 16), q1 = __shfl_xor_sync(0xffffffffu, p1, 16);
                 tot[mi][i] += d[mi] * (kg == 0 ? p0 + q0 : p1 + q1);
             }
 #endif

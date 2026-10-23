@@ -34,8 +34,8 @@ constexpr bool is_tq(int type) { return tq_kbits(type) > 0; }
 
 /// Whether the device kernels take this ggml type.
 bool supported(int type);
-/// Whether the type's block layout is known (its row bytes can be computed) - a superset of supported(): a type the CPU
-/// lane's ggml dots take but no device kernel does (IQ1_S, IQ1_M, IQ4_NL today) is known and must stay out of VRAM.
+/// Whether the type's block layout is known (its row bytes can be computed).  It covered more than supported() while
+/// IQ1_S, IQ1_M and IQ4_NL had no device kernel; they have one now, so both take the same types.
 bool known(int type);
 /// Values a block of the type holds (256; the trellis types 128; 0: not one of these).
 int block_values(int type);

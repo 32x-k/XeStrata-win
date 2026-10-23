@@ -7,11 +7,7 @@
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
 #include "../../src/dsv41/ds4_iq.cuh"
 
-#if defined(__CUDACC__) || defined(STRATA_DSV41_TEST_CUDA)
-#include "hip_as_cuda.h"
-#else
-#include <hip/hip_runtime.h>
-#endif
+#include "strata/dsv41/hip_or_cuda.h"   // HIP names on a HIP build, the CUDA runtime otherwise
 
 #include "ggml.h"   // ggml_get_type_traits(type)->to_float: ggml's decode of the same blocks
 
@@ -94,14 +90,17 @@ static Mat make_mat(std::mt19937_64& rng, int type, int rows, int k) {
     const size_t nblk = (size_t) rows * (k / bv);
     m.bytes.resize(nblk * (size_t) bb);
     for (auto& b : m.bytes) b = (uint8_t) rng();
-    for (size_t b = 0; b < nblk; ++b) {   // a sane F16 scale in the first two bytes (every type here has d at offset 0)
+    for (size_t b = 0; b < nblk; ++b) {   // a sane F16 scale: at offset 0 (every type here but IQ1_M has d there)
         const uint16_t d = f2h(0.02f + 0.0002f * (float) (rng() % 600));
-        if (type == 29) {   // IQ1_M has no d field: F16 d is spread over the top nibbles of its four u16 scale words (bytes 48..55)
-            uint8_t* sc = &m.bytes[b * (size_t) bb + 48];
-            for (int i = 0; i < 4; ++i) sc[2 * i + 1] = (uint8_t) ((sc[2 * i + 1] & 0x0f) | (((d >> (4 * i)) & 15) << 4));
-            continue;
+        uint8_t* p = &m.bytes[b * (size_t) bb];
+        if (type == 29) {   // block_iq1_m has no d field: its F16 scale is the top nibbles of its four u16 scales
+            p[49] = (uint8_t) ((p[49] & 0x0f) | ((d & 0x000f) << 4));
+            p[51] = (uint8_t) ((p[51] & 0x0f) | (d & 0x00f0));
+            p[53] = (uint8_t) ((p[53] & 0x0f) | ((d & 0x0f00) >> 4));
+            p[55] = (uint8_t) ((p[55] & 0x0f) | ((d & 0xf000) >> 8));
+        } else {
+            std::memcpy(p, &d, 2);
         }
-        std::memcpy(&m.bytes[b * (size_t) bb], &d, 2);
     }
     m.w.resize((size_t) rows * k);
     const ggml_type_traits* tr = ggml_get_type_traits((ggml_type) type);
