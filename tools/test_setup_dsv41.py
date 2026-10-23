@@ -512,6 +512,30 @@ class InstallOfficial(Install):
         got = [c[2].name for c in self.calls if c[0] == "get"]
         self.assertEqual(got, [f"DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-{i:05d}-of-00004.gguf" for i in range(1, 5)])      # only the four shards
 
+    def test_the_first_releases_files_are_used_as_they_are_nothing_is_downloaded_but_the_small_files(self):
+        own = self.root / "own"
+        sub = own / "2.00bpw"
+        sub.mkdir(parents=True)
+        for i in range(1, 5):
+            (sub / f"model-2.00bpw-{i:05d}-of-00004.gguf").write_bytes(b"GGUF")
+        (sub / "engram-IQ4_NL.gguf").write_bytes(b"E")
+        (own / "dspark").mkdir()
+        (own / "dspark" / setup.DSV41_DSPARK).write_bytes(b"D")
+        tiny = {n: (4, "0" * 64) for n in setup.DSV41_LEGACY_FILES if n.startswith("model-2.00bpw")}
+        tiny["engram-IQ4_NL.gguf"] = (1, "0" * 64)
+        tiny[setup.DSV41_DSPARK] = (1, "0" * 64)
+        with mock.patch.dict(setup.DSV41_ALL_FILES, tiny):
+            rc, out = self.install_ista(gguf_dir=str(own))
+        self.assertEqual(rc, 0, out)
+        got = [c[2].name for c in self.calls if c[0] == "get"]
+        self.assertEqual(got, [setup.DSV41_SHARD.format(i=1)])                 # only the 5.8 MB metadata shard
+        pack = [c for c in self.calls if c[0] == "run"][-1][1]
+        shards = pack[pack.index("--shards") + 1:pack.index("--engram")]
+        self.assertEqual(shards, [f"model-2.00bpw-{i:05d}-of-00004.gguf" for i in range(1, 5)])      # packed from the files as they are
+        self.assertTrue(pack[pack.index("--engram") + 1].endswith("engram-IQ4_NL.gguf"))
+        self.assertIn("model", pack[pack.index("--model") + 1] + "model")
+        self.assertEqual(Path(pack[pack.index("--model") + 1]), sub)
+
     def test_pack_info_profile_smoke_and_the_launch_flags(self):
         rc, out = self.install_ista()
         self.assertEqual(rc, 0, out)

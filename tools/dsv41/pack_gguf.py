@@ -316,6 +316,17 @@ def short(g: Gguf):
     return None if have >= need else "%s: %d of %d bytes" % (g.path.name, have, need)
 
 
+def is_engram_file(g) -> bool:
+    """The Engram table's GGUF: general.architecture 'engram' (the first release) or 'deepseek41-engram' (ISTA-DASLab's final files)."""
+    arch = str(g.kv.get("general.architecture") or "")
+    return arch == "engram" or arch.endswith("-engram")
+
+
+def model_kv(gs):
+    """The metadata of the model: of the first group whose architecture IS deepseek41 - never an Engram file's, whatever order they come in."""
+    return next((g.kv for g in gs if g.kv.get("general.architecture") == "deepseek41"), None)
+
+
 def engram_set(model: pathlib.Path, explicit: str | None):
     """The Engram tables' GGUF set for a quant that leaves them out: (its folder, its files read), or (None, []).
     explicit (--engram): that folder, whole; else the first whole one of ENGRAM_SETS beside the quant or in its
@@ -427,9 +438,15 @@ def main() -> int:
         raise SystemExit("%s: no .gguf files" % model if not shards else
                          "%s: not there" % next(p for p in shards if not p.is_file()))
     gs = [Gguf(p) for p in shards]
-    kv = next((g.kv for g in gs if "general.architecture" in g.kv), None)
-    if kv is None or kv["general.architecture"] not in ("deepseek41",):
-        raise SystemExit("%s: not a DeepSeek-V4.1 GGUF (architecture %r)" % (model, kv and kv.get("general.architecture")))
+    if not a.shards:                       # a folder's *.gguf: the Engram table (architecture 'engram', today 'deepseek41-engram') is not a model shard
+        keep = [i for i, g in enumerate(gs) if not is_engram_file(g)]
+        shards, gs = [shards[i] for i in keep], [gs[i] for i in keep]
+        if not gs:
+            raise SystemExit("%s: no model shards (only an Engram table)" % model)
+    kv = model_kv(gs)
+    if kv is None:
+        arch = next((g.kv.get("general.architecture") for g in gs), None)
+        raise SystemExit("%s: not a DeepSeek-V4.1 GGUF (architecture %r)" % (model, arch))
     split = int(kv.get("split.count", 1))
     if split != len(shards):
         counts = sorted({m.group(1) for m in (re.search(r"-of-(\d{5})\.gguf$", p.name) for p in shards) if m})
