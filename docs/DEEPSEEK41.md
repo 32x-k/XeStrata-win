@@ -40,7 +40,7 @@ engram-IQ4_NL.gguf --engram-meta <UD shard 1> --dspark-gguf dspark-...-Q8_0.gguf
 that packs without an error and gives garbage text), copies the shipped hot-expert profile (`data/dsv41/profile-2.00.bin` or `-2.25.bin`)
 into the pack as `expert-profile.bin`, checks `strata-dsv41 --pack-info` (every file present) and answers a 16-token test question
 (`tools/dsv41/smoke.py`, the text must name Paris). The start script passes `--dspark auto` (never `off`: `off` still loads the drafter
-and its 7 GB of experts take the graphics memory); the RAM store sizes itself.
+and its 7 GB of experts take the graphics memory); the RAM store sizes itself. Long prompts use the engine's fast chunked path on its own (no flag is written: the engine picks the chunk size for your cards).
 
 ## Install
 
