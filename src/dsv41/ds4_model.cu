@@ -4283,6 +4283,9 @@ struct Model::Impl {
             return;
         }
         store = std::move(st);
+        // (the router lookahead's guesses are not read ahead with the store: measured 4.5 against 4.7 tok/s, 62% of the guesses are right and
+        // the SSD is the narrow part; DS4_AHEAD=1 turns them on)
+        if (std::getenv("DS4_AHEAD") == nullptr) ahead_mode = 0;
         for (Layer& l : L)
             if (l.il < g.nl && want_zc) l.zc.assign((size_t) l.n_exp, 0);
         std::fprintf(stderr, "ds4: RAM store: up to %zu slots of %.1f MB (%.1f GB), policy %d, %d reader threads, %s reads\n",
