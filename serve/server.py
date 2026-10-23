@@ -201,7 +201,8 @@ VISION_START = "<|vision_start|>"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
 ANSWER_ROOM_MIN_CAP = 1024    # 0.1.45: from this max_tokens on, thinking without a budget is closed early enough to leave room to answer
-ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
+DS41_SMALL_CAP_MIN = 48       # DeepSeek-V4.1 only: from this max_tokens up to ANSWER_ROOM_MIN_CAP, thinking is capped at half of it
+ANSWER_RESERVE_MIN = 512     # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
@@ -5051,6 +5052,14 @@ class Service:
             # A request with a budget of its own, or max_tokens below ANSWER_ROOM_MIN_CAP, is left as it was.
             budget = max_new - min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
             if max_new <= 32768: print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
+                  "(\"answer_room\": false in the config turns this off)", flush=True)
+        if (thinking and not budget and self.answer_room and self.family == "deepseek41"
+                and max_new and DS41_SMALL_CAP_MIN <= max_new < ANSWER_ROOM_MIN_CAP):
+            # DeepSeek-V4.1 only: a short max_tokens (/v1/messages and /v1/chat/completions with 200-600) was spent
+            # entirely on the thinking, so no text block ever arrived.  With no budget of the client's own, the thinking
+            # is capped at half of max_tokens; then the wrap-up, </think> and the answer follow in the other half.
+            budget = max_new // 2
+            print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
                   "(\"answer_room\": false in the config turns this off)", flush=True)
         if budget and max_new and max_new > 0:
             # #984: a budget at or near max_tokens never fires before the reply is cut off while still thinking, so
