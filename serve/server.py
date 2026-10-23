@@ -7914,18 +7914,6 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
     return rp.ReplicaEngine(engines, load_tokens=load)
 
 
-def check_max_tokens(req) -> None:
-    """K05: an answer length below 1 (``"max_tokens": -1``, 0) is a 400 that names the field and says what to do. It used to be read as "no cap", so a
-    client bug could hold the only slot for the whole context. A field that is absent or null is not checked (the answer then uses the room left)."""
-    if not isinstance(req, dict):
-        return
-    for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
-        value = req.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and value < 1:
-            raise ValueError(f"{key} must be at least 1 (the request said {value:g}). Leave it out to let the answer use the room that is left "
-                             "in the context.")
-
-
 def check_request_sampling(req) -> None:
     """A request's sampling field of the wrong JSON type ("temperature": "0.7", "top_k": 40.0, "seed": true) is a 400
     that names the field, as the same value is through POST /settings or the run config.  Unchecked, the value
@@ -7933,7 +7921,6 @@ def check_request_sampling(req) -> None:
     types are checked: a number (int or float, never bool) for temperature, top_p, min_p and the three penalties; an
     integer (never bool or float) for top_k, penalty_last_n and seed.  Ranges behave as before (a temperature <= 0 is
     greedy, top_k 0 or above 64 is clamped, a seed <= 0 is unset), and an absent or null field is not checked."""
-    check_max_tokens(req)
     if isinstance(req, dict):      # #1819: llama.cpp's names; the OpenAI-style field wins when both are sent
         if req.get("repeat_penalty") is not None and req.get("repetition_penalty") is None:
             req["repetition_penalty"] = req["repeat_penalty"]

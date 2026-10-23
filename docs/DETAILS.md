@@ -1069,9 +1069,8 @@ print(r.choices[0].message.content)
   Claude Code ask for 32,000 on every request); the thinking budget follows the shortened cap. For the strict llama.cpp
   behaviour (400) set `"fit_max_tokens": false` in `strata-<model>.json` or pass `--no-fit-max-tokens` to
   `serve/server.py`. A prompt that leaves no room at all is always refused.
-- **`max_tokens` and the `model` field (0.2.3).** `max_tokens`, `max_completion_tokens` and `max_output_tokens` must be at least 1 when
-  they are sent: `-1` and `0` used to mean "no cap" and are now a 400 that names the field ("max_tokens must be at least 1 ... Leave it
-  out to let the answer use the room that is left"). Leave the field out for the rest of the context. The `model` field is not matched
+- **`max_tokens` and the `model` field.** `max_tokens`, `max_completion_tokens` and `max_output_tokens` of `-1` or `0`, like a
+  field that is left out, mean "no cap": the answer may use the room left in the context (clients send `-1` for that). The `model` field is not matched
   against the loaded model on purpose: one server serves one model, and OpenAI clients often send a name of their own (`gpt-4o`, `local`),
   so any name is answered by the loaded model (a name from `aliases` and the model's own name work the same). Only `GET /v1/models` says what
   is loaded.
