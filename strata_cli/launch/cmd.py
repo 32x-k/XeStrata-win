@@ -332,10 +332,7 @@ def apply_defaults(s: S.LaunchSettings, catalog) -> tuple[S.LaunchSettings, list
                 s.parallel = None
             if s.vision not in (None, "off"):
                 notices.append(S.Notice("warn", "DeepSeek-V4.1-Flash cannot read pictures in this Strata version, so pictures are off.", ""))
-            s.vision = "off"
-            if s.tune not in (None, "skip"):
-                notices.append(S.Notice("warn", "Tuning is not offered for DeepSeek-V4.1-Flash yet; it starts with the engine's own settings.", ""))
-                s.tune = "skip"
+            s.vision = "off"                                 # (tuning is DeepSeek's own short tune: tools/dsv41/tune.py, run by the launch)
         notices += S.check_context(s, max_fit_tokens=None)
     if s.access != "local" and not s.api_key and not s.no_key:
         from strata_cli.launch import access

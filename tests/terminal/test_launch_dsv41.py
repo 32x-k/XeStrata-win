@@ -95,11 +95,11 @@ class LaunchDeepSeek(unittest.TestCase):
         p = self.plan("--model", "ud-q8_k_xl", "--parallel", "4", "--vision", "on", "--tune", "quick")
         s = p["settings"]
         self.assertFalse(s.get("parallel"))
-        self.assertEqual((s["vision"], s["tune"]), ("off", "skip"))
+        self.assertEqual((s["vision"], s["tune"]), ("off", "quick"))          # the DeepSeek tune is real now: the choice stays
         text = " ".join(p["warnings"])
         self.assertIn("one request at a time", text)
         self.assertIn("cannot read pictures", text)
-        self.assertIn("Tuning is not offered", text)
+        self.assertNotIn("Tuning is not offered", text)
 
     def test_setup_is_asked_for_the_family_and_the_files(self):
         s = S.LaunchSettings(family="deepseek41", model="UD-Q8_K_XL", context=8192, vision="off", tune="skip",

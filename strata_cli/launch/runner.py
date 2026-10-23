@@ -1252,12 +1252,54 @@ class Runner:
             return None
 
     # ---- 4. tuning
+    def tune_deepseek(self) -> None:
+        """DeepSeek-V4.1-Flash has its own short tuner (tools/dsv41/tune.py: the drafter on or off, the CPU threads; the RAM store sizes itself):
+        a few test runs of the engine, a result written into this launch's config, and the standard settings on any failure."""
+        s = self.s
+        cfg = getattr(self, "config_path", None)
+        if cfg is None:
+            self.emit("tune", "There are no DeepSeek settings to tune yet, so it starts with the standard ones.", 100, level="warn")
+            return
+        mode = "thorough" if s.tune == "thorough" else "quick"
+        argv = [sys.executable, str(Path(__file__).resolve().parents[2] / "tools" / "dsv41" / "tune.py"), "--config", str(cfg), "--mode", mode,
+                "--output", "json"]
+        self.emit("tune", "Tuning DeepSeek for the best speed: a few short test runs (1-3 minutes each). Close other heavy programs.", 0)
+        try:
+            p = self._spawn(argv)
+        except Exception as e:                           # noqa: BLE001 - a tune never stops a launch
+            self.emit("tune", f"The DeepSeek tuner could not start ({type(e).__name__}), so the standard settings run.", 100, level="warn")
+            return
+        lines: list[str] = []
+        reader = threading.Thread(target=lambda: lines.extend(p.stdout.readlines()), daemon=True)   # type: ignore[union-attr]
+        reader.start()
+        while p.poll() is None:
+            if self.cancel.is_set():
+                self._stop_children()
+                raise Cancelled()
+            time.sleep(1.0)
+        reader.join(timeout=3)
+        result = None
+        for line in reversed(lines):
+            try:
+                result = json.loads(line).get("result")
+                break
+            except (ValueError, AttributeError):
+                continue
+        if result is None:
+            self.tune_word = "failed"
+            self.emit("tune", "The DeepSeek tuner did not finish, so the standard settings run. Nothing was changed.", 100, level="warn")
+            return
+        self.tune_result = result
+        self.tune_word = "faster" if result.get("changed") else "already fastest"
+        s.tuned_at = time.strftime("%Y-%m-%d")
+        self.emit("tune", " ".join(result.get("lines") or ["Tuning finished."]), 100, level="info", word=self.tune_word)
+
     def tune(self) -> None:
         s = self.s
         if s.tune == "skip":
             return
         if self.multi_file():
-            self.emit("tune", "Tuning is not offered for DeepSeek-V4.1-Flash yet: it starts with the engine's own settings.", 100)
+            self.tune_deepseek()
             return
         from strata_control import presets
         if not self.retune:
