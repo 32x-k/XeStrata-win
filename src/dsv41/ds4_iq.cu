@@ -522,10 +522,12 @@ template <int T, bool F = true>
 __device__ __forceinline__ void load_tab_fast(uint32_t* tab) {
     if constexpr (!F || Fast<T>::WORDS == 0) {
         load_tab<T>(tab);
+#if !defined(STRATA_USE_HIP)   // (kIq1mCodes exists on CUDA only; a non-dependent name is looked up even in the dead branch)
     } else if constexpr (T == kIQ1_M) {   // a copy of the generated table (ds4_iq1m_codes.inc): 2048 x 16 bytes
         const uint4* src = (const uint4*) kIq1mCodes;
         uint4* dst = (uint4*) tab;
         for (int j = threadIdx.x; j < 2048; j += blockDim.x) dst[j] = src[j];
+#endif
     }
 }
 template <int T, bool F = true>
