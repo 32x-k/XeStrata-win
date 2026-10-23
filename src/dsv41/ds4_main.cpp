@@ -138,12 +138,24 @@ static std::string g_round_tag;
 static std::vector<float> g_round_conf;
 static int g_round_nd = 0;
 
+// The drafts' cut on the product of their confidences (DeepInfer's cumulative rule): a draft is verified while the chance
+// that it and every draft before it are kept stays at least this - a long window whose later drafts are likely lost is
+// not verified whole.  STRATA_DS4_DSPARK_CUM=F, a request's dspark_cum key; 0: off, only the floor on each draft's own
+// confidence (dspark_conf).  Project Maya's default 0.5 (a Radeon 8065S: decode +6.5%, the same tokens)
+float dspark_cum_default() {
+    static const float v = [] {
+        const char* e = std::getenv("STRATA_DS4_DSPARK_CUM");
+        return e != nullptr ? (float) std::atof(e) : 0.5f;
+    }();
+    return v;
+}
+
 // One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts while their
 // confidence holds (at most `room` - 1 of them), verified together; else a plain step.  `out` gets the tokens that follow
 // tok (the accepted drafts, then the trunk's next), the last of them the next round's tok.
 bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, float temperature, float top_p, int top_k,
            float min_p, unsigned long long seed, unsigned long long& counter, std::vector<int>& out, int& offered,
-           int& accepted, std::string& err) {
+           int& accepted, std::string& err, float cum_min = -1.0f) {
     out.clear();
     offered = accepted = 0;
     if (spec && room > 1 && m.draft_block() > 0) {
@@ -153,7 +165,11 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         g_round_conf = conf;
         g_round_nd = (int) drafts.size();
         int keep = 0;
-        while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min) ++keep;
+        if (cum_min < 0) cum_min = dspark_cum_default();
+        float cum = 1.0f;
+        while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min &&
+               (cum *= conf[(size_t) keep]) >= cum_min)
+            ++keep;
         if (keep > 0) {
             drafts.resize((size_t) keep);
             int acc = 0, next = -1;
@@ -183,6 +199,7 @@ struct Req {
     unsigned long long seed = 0;
     int spec = -1;          // spec=0|1: this request drafts or not (-1: as the engine was started)
     float conf = -1.0f;     // dspark_conf=F: the drafts' confidence floor for this request (-1: the engine's)
+    float cum = -1.0f;      // dspark_cum=F: the cut on the product of the confidences (-1: the engine's, dspark_cum_default)
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
 };
@@ -278,6 +295,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "seed") r.seed = std::strtoull(v.c_str(), nullptr, 10);
         else if (k == "spec") r.spec = std::atoi(v.c_str()) != 0;
         else if (k == "dspark_conf") r.conf = std::strtof(v.c_str(), nullptr);
+        else if (k == "dspark_cum" || k == "spec_cum") r.cum = std::strtof(v.c_str(), nullptr);
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
@@ -496,7 +514,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
                 if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
                            r.min_p, r.seed, counter, got,
-                           off, acc, err)) {
+                           off, acc, err, r.cum)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     finish = "cancel";
                     break;
