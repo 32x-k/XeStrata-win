@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
 import io
 import json
 import re
@@ -177,6 +178,7 @@ class Install(unittest.TestCase):
             self.exe.parent.mkdir(parents=True, exist_ok=True)
             self.exe.write_text("x")
         cards = cards or FOUR
+        kw.setdefault("model", "UD-Q8_K_XL")
         gpu = {"index": 0, "count": len(cards), "vram_gb": 32.0, "name": "R9700", "cards": cards}
         return run(setup.install_dsv41, args(models_dir=str(self.root / "models"), **kw), "deepseek41", gpu, True, [], 13, [], 8080, ram,
                    None, cards)
@@ -247,7 +249,7 @@ class Install(unittest.TestCase):
         self.assertIn(str(own / "UD-Q8_K_XL"), pack)
 
     def test_little_ram_is_asked_and_kept_with_an_explicit_model(self):
-        rc, out = self.install(ram=64.0, cards=FOUR[:1], model="UD-Q8_K_XL")
+        rc, out = self.install(ram=64.0, cards=FOUR[:1])
         self.assertEqual(rc, 0, out)
         self.assertIn("read from the SSD", out)
         self.assertIn("installing UD-Q8_K_XL with 64 GB of RAM, as you chose", out)
@@ -255,7 +257,7 @@ class Install(unittest.TestCase):
         self.assertNotIn("--tp", self.cfg["args"])
 
     def test_little_ram_with_yes_alone_stops_where_the_rule_says(self):
-        rc, out = self.install(ram=64.0, cards=FOUR[:1])
+        rc, out = self.install(ram=24.0, cards=FOUR[:1], model=None)        # the version was not chosen on the command line
         self.assertEqual(rc, 1, out)
         self.assertIn("more RAM or cards fix it", out)
         self.assertFalse([c for c in self.calls if c[0] == "get"])
@@ -283,13 +285,17 @@ class Catalog(unittest.TestCase):
         s = M.Strata(ROOT)
         fam = next(f for f in s.model_table({"ram_gb": 251.0, "gpus": [{**c, "usable": True} for c in FOUR], "engine_vendor": "amd"})
                    if f["family"] == "deepseek41")
-        (size,) = fam["sizes"]
+        self.assertEqual([x["model"] for x in fam["sizes"]], ["IST-DAS-2.00bpw", "IST-DAS-2.25bpw", "UD-Q8_K_XL"])
+        small_sets = {x["model"]: x for x in fam["sizes"]}
+        self.assertEqual((small_sets["IST-DAS-2.00bpw"]["download_gb"], small_sets["IST-DAS-2.25bpw"]["download_gb"]), (256.8, 273.8))
+        self.assertTrue(small_sets["IST-DAS-2.00bpw"]["on_this_pc"].startswith("fits"))
+        size = small_sets["UD-Q8_K_XL"]
         self.assertEqual((size["model"], size["id"], size["download_gb"], size["images"]), ("UD-Q8_K_XL", "deepseek-v4.1-flash-ud-q8_k_xl", 508.4, False))
         self.assertTrue(size["on_this_pc"].startswith("fits"))
         self.assertTrue(size["mem_total"] and size["multi_file"])
         self.assertEqual(size["gpu_options"]["recommended"], "all")
         small = next(f for f in s.model_table({"ram_gb": 32.0, "gpus": []}) if f["family"] == "deepseek41")
-        self.assertTrue(small["sizes"][0]["on_this_pc"].startswith("does not fit"))
+        self.assertTrue(all(x["on_this_pc"].startswith("does not fit") for x in small["sizes"]))      # no card
 
     def test_the_install_plan(self):
         import strata_mcp as M
@@ -306,6 +312,161 @@ class Catalog(unittest.TestCase):
         files = M.expected_files(s.setup_module(), "deepseek41", "UD-Q8_K_XL", Path("/m"), False)
         self.assertEqual(len(files), 9)
         self.assertEqual(sum(f["bytes"] for f in files), 508_376_763_197)
+
+
+ISTA = "IST-DAS-2.00bpw"
+RTX5070 = {"index": 0, "name": "NVIDIA GeForce RTX 5070", "vram_gb": 12.0, "vendor": "nvidia"}
+
+
+class OfficialSets(unittest.TestCase):
+    """The two official IST-DAS sets (helcig/tmp-oct26-2): the catalog, the pins, the pack recipe, the fit words."""
+
+    def test_the_pinned_files(self):
+        fam = setup.MULTI_FILE_FAMILIES["deepseek41"]
+        self.assertEqual(list(fam["models"]), ["IST-DAS-2.00bpw", "IST-DAS-2.25bpw", "UD-Q8_K_XL"])         # the official sets first
+        self.assertEqual(setup.HF_REVISIONS["helcig/tmp-oct26-2"], "851709dcf0d97f091a4bdce758b2e4b0b468dd26")
+        self.assertIs(setup.REPO_PINS["helcig/tmp-oct26-2"], setup.DSV41_ISTA_FILES)
+        self.assertEqual(len(setup.DSV41_ISTA_FILES), 9)                       # 2 x 4 shards + the Engram
+        for n, (size, sha) in setup.DSV41_ISTA_FILES.items():
+            self.assertRegex(sha, r"^[0-9a-f]{64}$", n)
+        eng = setup.DSV41_ISTA_FILES["engram-IQ4_NL.gguf"]
+        self.assertEqual(eng, (110_595_290_720, "1f17d8ae37e9df3bb45f7ef1b4fcd1706d7b759af0413c117bf8e92aed459281"))
+        self.assertEqual(setup.DSV41_ALL_FILES["dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"],
+                         (7_976_914_240, "6ba6ac1b331c540691a209e7fc97dec2a24e295acb1e755c84c7d24a4373927a"))
+        sums = {m: sum(setup.DSV41_ALL_FILES[n][0] for n in fam["models"][m]["shards"]) for m in list(fam["models"])[:2]}
+        self.assertEqual(sums, {"IST-DAS-2.00bpw": 138_238_892_160, "IST-DAS-2.25bpw": 155_225_823_328})
+        self.assertEqual(sums["IST-DAS-2.00bpw"], dsv41_fit.ISTA_SETS["IST-DAS-2.00bpw"]["set_bytes"])
+        self.assertEqual(sums["IST-DAS-2.25bpw"], dsv41_fit.ISTA_SETS["IST-DAS-2.25bpw"]["set_bytes"])
+        self.assertEqual(setup.DSV41_ISTA_FILES["engram-IQ4_NL.gguf"][0], dsv41_fit.ISTA_ENGRAM_BYTES)
+        for m in ("IST-DAS-2.00bpw", "IST-DAS-2.25bpw"):                        # both sets name the same shared files: the Engram is downloaded once
+            self.assertEqual(fam["models"][m]["shared"], [setup.DSV41_ISTA_ENGRAM, setup.DSV41_SHARD.format(i=1), setup.DSV41_DSPARK])
+            for n in fam["models"][m]["shared"]:
+                self.assertIn(n, setup.DSV41_SHARED)
+                self.assertIn(n, setup.DSV41_ALL_FILES)
+        self.assertRegex(setup.DSV41_SHARED[setup.DSV41_ISTA_ENGRAM], r"helcig/tmp-oct26-2/resolve/851709dc[0-9a-f]{32}/2\.00bpw/$")
+        self.assertRegex(fam["models"]["IST-DAS-2.25bpw"]["hf"], r"helcig/tmp-oct26-2/resolve/851709dc[0-9a-f]{32}/2\.25bpw/$")
+
+    def test_shipped_profiles_match_their_hashes(self):
+        import hashlib
+        for n in ("profile-2.00.bin", "profile-2.25.bin"):
+            data = (setup.DSV41_PROFILES / n).read_bytes()
+            self.assertEqual(len(data), 66048)                                 # uint32 [43][384]
+            want = (setup.DSV41_PROFILES / (n + ".sha256")).read_text().split()[0]
+            self.assertEqual(hashlib.sha256(data).hexdigest(), want)
+
+    def test_the_pack_recipe_is_the_plain_one(self):
+        folder, pack = Path("/m/set"), Path("/d/pack")
+        names = [f"model-2.00bpw-{i:05d}-of-00004.gguf" for i in range(1, 5)]
+        cmd = setup.dsv41_pack_cmd(folder, names, Path("/s/engram-IQ4_NL.gguf"), Path("/s/meta.gguf"), Path("/s/dspark.gguf"), pack)
+        self.assertTrue(cmd[1].endswith("pack_gguf.py"))
+        self.assertEqual(cmd[2:], ["--model", str(folder), "--shards", *names, "--engram", str(Path("/s/engram-IQ4_NL.gguf")),
+                                   "--engram-meta", str(Path("/s/meta.gguf")), "--dspark-gguf", str(Path("/s/dspark.gguf")), "--out", str(pack)])
+        for bad in ("--skip-tensors", "--dense-override", "--override-experts", "--tq-experts"):      # these give garbage text on the official sets
+            self.assertNotIn(bad, cmd)
+
+    def test_fit_words_use_the_measured_numbers(self):
+        for ram, verdict in ((64.0, "tight"), (46.0, "tight"), (24.0, "spills"), (256.0, "fits")):
+            p = dsv41_fit.plan([RTX5070], ram, None, model=ISTA)
+            self.assertEqual(p["verdict"], verdict, ram)
+            self.assertAlmostEqual(p["download_gb"], 256.8, delta=0.1)
+            self.assertEqual(p["args"], [])
+        p = dsv41_fit.plan([RTX5070], 64.0, 100.0, model=ISTA)
+        text = " ".join(p["lines"]) + " ".join(p["warnings"])
+        for needle in ("4.7", "7.2", "31 tokens/s", "free disk space", "only once" if False else "downloads it once"):
+            self.assertIn(needle, text)
+        self.assertFalse(p["disk_ok"])
+        p225 = dsv41_fit.plan([RTX5070], 64.0, None, model="IST-DAS-2.25bpw")
+        self.assertAlmostEqual(p225["download_gb"], 273.8, delta=0.1)
+        self.assertEqual(dsv41_fit.plan([], 64.0, None, model=ISTA)["verdict"], "no_card")
+        self.assertEqual(dsv41_fit.plan([RTX5070], 64.0, None, model="UD-Q8_K_XL")["verdict"], "spills")        # the big set is unchanged
+
+
+class InstallOfficial(Install):
+    """install_dsv41 for an official set, the engine and the tools mocked."""
+
+    def install_ista(self, model=ISTA, ram=64.0, **kw):
+        self.packinfo_ok = True
+        self.smoke_ok = True
+        patches = [mock.patch.object(setup, "dsv41_pack_info", lambda exe, pack, libs: (self.packinfo_ok, "files: 6, all present and long enough")),
+                   mock.patch.object(setup, "dsv41_smoke", lambda *a, **k: (self.smoke_ok, "The capital of France is Paris.")
+                                     if self.smoke_ok else (False, "test question failed: the answer is empty"))]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        return self.install(ram=ram, cards=[RTX5070], model=model, **kw)
+
+    def test_downloads_the_set_the_engram_once_and_the_drafter(self):
+        rc, out = self.install_ista()
+        self.assertEqual(rc, 0, out)
+        get = [c for c in self.calls if c[0] == "get"]
+        folder = self.root / "models" / "deepseek-v4.1-flash-IST-DAS-2.00bpw"
+        shared = self.root / "models" / "deepseek-v4.1-flash-shared"
+        self.assertEqual([c[2] for c in get][:4], [folder / f"model-2.00bpw-{i:05d}-of-00004.gguf" for i in range(1, 5)])
+        self.assertEqual([c[2] for c in get][4:], [shared / setup.DSV41_ISTA_ENGRAM, shared / setup.DSV41_SHARD.format(i=1),
+                                                  shared / setup.DSV41_DSPARK])
+        self.assertTrue(get[0][1].endswith("/2.00bpw/model-2.00bpw-00001-of-00004.gguf"))
+        self.assertEqual(sum(1 for c in self.calls if c[0] == "sha"), 7)
+        pack = [c for c in self.calls if c[0] == "run"][-1][1]
+        self.assertIn("--engram-meta", pack)
+        self.assertNotIn("--skip-tensors", pack)
+
+    def test_the_second_set_does_not_download_the_engram_again(self):
+        shared = self.root / "models" / "deepseek-v4.1-flash-shared"
+        shared.mkdir(parents=True)
+        shared_names = (setup.DSV41_ISTA_ENGRAM, setup.DSV41_SHARD.format(i=1), setup.DSV41_DSPARK)
+        for n in shared_names:
+            (shared / n).write_bytes(b"x")
+            (shared / (n + ".done")).write_text("ok")
+        tiny = {n: (1, setup.DSV41_ALL_FILES[n][1]) for n in shared_names}      # the stand-in files are one byte long
+        with mock.patch.dict(setup.DSV41_ALL_FILES, tiny):
+            rc, out = self.install_ista(model="IST-DAS-2.25bpw")
+        self.assertEqual(rc, 0, out)
+        got = [c[2].name for c in self.calls if c[0] == "get"]
+        self.assertEqual(got, [f"model-2.25bpw-{i:05d}-of-00004.gguf" for i in range(1, 5)])      # only the four shards
+
+    def test_pack_info_profile_smoke_and_the_launch_flags(self):
+        rc, out = self.install_ista()
+        self.assertEqual(rc, 0, out)
+        a = self.cfg["args"]
+        self.assertEqual(a[a.index("--dspark") + 1], "auto")                    # never "off": that still loads the drafter and takes the VRAM
+        self.assertNotIn("off", a)
+        self.assertNotIn("--prefill-chunk", a)                                  # the engine's own default is the layer-major prompt path
+        self.assertEqual(a[a.index("--dspark-conf") + 1], "0.65")                # never a floor below 0.3             # the layer-major prompt path
+        self.assertNotIn("--ssd-cache", a)                                      # the store sizes itself
+        self.assertEqual(a[a.index("--max-context") + 1], "8192")
+        self.assertIn("checked: every file the engine needs is there", out)
+        self.assertIn("test question answered sensibly", out)
+        self.assertTrue(Path(a[a.index("--pack") + 1]).match("*packs/deepseek-v4.1-flash-ist-das-2.00bpw"))
+
+    def test_an_incomplete_pack_stops_with_the_missing_file(self):
+        self.packinfo_ok = False
+        patches = [mock.patch.object(setup, "dsv41_pack_info", lambda exe, pack, libs: (False, "  MISSING x.gguf (1.00 GB wanted)")),
+                   mock.patch.object(setup, "dsv41_smoke", lambda *a, **k: (True, "Paris"))]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        rc, out = self.install(ram=64.0, cards=[RTX5070], model=ISTA)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("pack is not complete", out)
+        self.assertIn("MISSING", out)
+
+    def test_a_failed_text_check_is_said_plainly_and_stops(self):
+        patches = [mock.patch.object(setup, "dsv41_pack_info", lambda exe, pack, libs: (True, "all present")),
+                   mock.patch.object(setup, "dsv41_smoke", lambda *a, **k: (False, "!!!!\ntest question failed: the answer is empty"))]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        rc, out = self.install(ram=64.0, cards=[RTX5070], model=ISTA)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("does not answer sensibly", out)
+        self.assertIn("run setup again", out)
+        self.assertFalse(self.cfg)                                              # no start script for a model that failed its check
+
+    def test_a_disk_that_cannot_hold_the_set_stops(self):
+        with mock.patch.object(setup, "free_gb", lambda p: 100.0):
+            rc, out = self.install_ista()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not enough free disk space", out)
 
 
 if __name__ == "__main__":
