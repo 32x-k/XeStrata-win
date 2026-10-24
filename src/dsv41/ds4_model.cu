@@ -5655,26 +5655,82 @@ struct Model::Impl {
     struct StoreHold {
         Impl* m = nullptr;
         int layer = 0;
-        std::vector<int> es;
+        std::vector<int> es, sl;
         std::vector<char> ok;
+        // lazy: the reads are started here and waited for by wait_all() / wait_expert(); the destructor releases
         StoreHold(Impl* m_, const Layer& l, const std::vector<Ent>& ents) {
             if (!m_->store) return;
             m = m_;
             layer = l.il;
             for (const Ent& en : ents)
                 if ((l.ram.empty() || l.ram[(size_t) en.e] < 0) && std::find(es.begin(), es.end(), en.e) == es.end()) es.push_back(en.e);
-            m->store->ensure(layer, es.data(), (int) es.size(), ok);
+            m->store->begin(layer, es.data(), (int) es.size(), ok, sl);
+        }
+        int idx(int e) const {
+            for (size_t i = 0; i < es.size(); ++i)
+                if (es[i] == e) return (int) i;
+            return -1;
+        }
+        // expert e needs no waiting: not a store expert (RAM copy) or its reads are done
+        bool ready(int e) const {
+            if (!m) return true;
+            const int i = idx(e);
+            return i < 0 || m->store->loaded(sl[(size_t) i]);
+        }
+        void wait_expert(int e) {
+            if (!m) return;
+            const int i = idx(e);
+            if (i >= 0) m->store->wait_slots(sl, ok, i, i + 1);
+        }
+        void wait_all() {
+            if (m) m->store->wait_slots(sl, ok, 0, (int) es.size());
         }
         ~StoreHold() {
             if (m) m->store->release(layer, es.data(), (int) es.size(), ok);
         }
     };
+    // DS4_MISS_SPLIT=0: the old order (wait for every read, then compute); default: the entries whose reads are done
+    // computed first, the others each as its read lands (the same bits: every entry's rows are independent)
     void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
                      const int* ord = nullptr) {
         if (ldx == 0) ldx = (size_t) g.dim;
         if (l.lay.fmt == gg::kFmtMXFP4) {
             StoreHold hold(this, l, ents);
-            return cpu_experts_mx(l, x, ents, ldx, ord);
+            static const bool split = std::getenv("DS4_MISS_SPLIT") == nullptr || std::atoi(std::getenv("DS4_MISS_SPLIT")) != 0;
+            if (!split || ord != nullptr || !hold.m || ents.size() < 2) {
+                hold.wait_all();
+                return cpu_experts_mx(l, x, ents, ldx, ord);
+            }
+            std::vector<Ent> hot, cold;
+            for (const Ent& en : ents) (hold.ready(en.e) ? hot : cold).push_back(en);
+            if (cold.empty()) {
+                hold.wait_all();
+                return cpu_experts_mx(l, x, ents, ldx, ord);
+            }
+            for (const Ent& en : hot) hold.wait_expert(en.e);   // (done reading: only the bookkeeping)
+            if (!hot.empty()) cpu_experts_mx(l, x, hot, ldx, nullptr);
+            // the ones that came in meanwhile first, then the rest in the order they land
+            std::vector<char> done(cold.size(), 0);
+            for (size_t left = cold.size(); left > 0;) {
+                size_t pick = cold.size();
+                for (size_t i = 0; i < cold.size(); ++i)
+                    if (!done[i] && hold.ready(cold[i].e)) {
+                        pick = i;
+                        break;
+                    }
+                if (pick == cold.size())
+                    for (size_t i = 0; i < cold.size(); ++i)
+                        if (!done[i]) {
+                            pick = i;
+                            break;
+                        }
+                hold.wait_expert(cold[pick].e);
+                std::vector<Ent> one(1, cold[pick]);
+                cpu_experts_mx(l, x, one, ldx, nullptr);
+                done[pick] = 1;
+                --left;
+            }
+            return;
         }
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH, GQ = E / 256, DQ = FF / 128;
         const int GB = FFh / 128, DB = Eh / 128, EB = E / 128, FB = FF / 128;
