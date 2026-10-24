@@ -90,7 +90,7 @@ export function NativeSettings({ model }: {
       <summary>{tr('Native engine settings')}</summary>
       {error ? <><ErrorNotice message={tr('Couldn’t load model settings.')} next={tr('Check that the engine is connected and this model is installed, then try again.')} onRetry={() => setRevision(value => value + 1)}/><details className="native-settings-diagnostic"><summary className="small">{tr('Details')}</summary><p className="small muted">{error}</p></details></> : <p className="small muted" role="status">{tr('Reading saved settings…')}</p>}
     </details>;
-    const rows = (native?.fields ?? []).filter(f => `${tr(f.label)} ${f.id} ${tr(f.group)}`.toLowerCase().includes(query.toLowerCase()));
+    const rows = (native?.fields ?? []).filter(f => (!f.forModel || model.toLowerCase().includes(f.forModel)) && `${tr(f.label)} ${f.id} ${tr(f.group)}`.toLowerCase().includes(query.toLowerCase()));
     return <details className="native-settings"><summary>{tr("Native engine settings")}</summary>{tr(tuned?.changed?.length ? <div className="native-tuned"><p className="small"><strong>{tr("Your tuning '{0}' sets", [tuned.preset?.name ?? ''])}</strong></p><ul>{tuned.changed.map(c => { const d = describeChange(c); return <li key={c.flag}><span>{d.name}</span><b>{d.now || tr('off')}</b>{d.was !== null ? <small className="muted">{tr("was {0}", [d.was])}</small> : null}</li>; })}</ul></div> : null)}<p className="small muted">{tr(!original ? 'Reading saved settings… ' : '')}{tr("Settings for this model. Blank values use Strata\u2019s defaults.")}</p><div className="editor-tabs" role="tablist" aria-label={tr("Native settings editor")}>{tr(['fields', 'json', 'tools'].map(t => <button key={t} role="tab" aria-selected={tab === t} onClick={() => chooseTab(t)}>{tr(t === 'fields' ? 'Parameters' : t === 'json' ? 'JSON' : 'MCP tools')}</button>))}</div>
   {tr(tab === 'fields' ? <><input className="st-input" type="search" aria-label={tr("Search native parameters")} placeholder={tr("Search parameters…")} value={query} onChange={e => setQuery(e.target.value)}/>{tr(['Responses', 'GPU & memory', 'Serving', 'Image reading', 'Tools', 'Recovery'].map(group => rows.some(f => f.group === group) ? <section className="native-settings-group" key={group}><h3 className="h4">{tr(group)}</h3>{tr(rows.filter(f => f.group === group).map(f => <label className="native-setting-row" key={f.id}><span><strong>{tr(f.label)}</strong>{tr(f.supported === false ? <small>{tr("Requires a newer Strata installation.")}</small> : f.hint ? <small>{tr(f.hint)}</small> : null)}</span><NativeFieldInput field={f} value={values[f.id]} onChange={v => change(f.id, v)}/></label>))}</section> : null))}<section className="native-settings-group"><h3 className="h4">{tr("Sampling")}</h3>{tr([['temperature', 'Temperature'], ['top_p', 'Top-p'], ['top_k', 'Top-k'], ['min_p', 'Min-p'], ['repetition_penalty', 'Repetition penalty'], ['presence_penalty', 'Presence penalty'], ['frequency_penalty', 'Frequency penalty'], ['penalty_last_n', 'Penalty window'], ['seed', 'Seed']].map(([id, label]) => <label className="native-setting-row" key={id}><span><strong>{tr(label)}</strong></span><input className="st-input" aria-label={tr("Native {0}", [label])} inputMode="decimal" value={values.sampling?.[id] ?? ''} onChange={e => {
                     const sampling = { ...values.sampling };
@@ -112,9 +112,22 @@ function NativeFieldInput({ field, value, onChange }: {
         return <NativeAliases field={field} value={value} onChange={onChange}/>;
     if (field.type === 'boolean')
         return <Select disabled={field.supported === false} ariaLabel={tr(field.label)} value={value === null || value === undefined ? '' : String(value)} options={[{ value: '', label: 'Default' }, { value: 'true', label: 'On' }, { value: 'false', label: 'Off' }]} onChange={v => onChange(v === '' ? null : v === 'true')}/>;
+    if (field.id === 'ds_experts')
+        return <DeepSeekSpeed field={field} value={value} onChange={onChange}/>;
     if (field.type === 'enum')
         return <Select disabled={field.supported === false} ariaLabel={tr(field.label)} value={value ?? ''} options={[{ value: '', label: 'Default' }, ...(field.choices ?? []).map(v => ({ value: v, label: v }))]} onChange={v => onChange(v || null)}/>;
     return <input disabled={field.supported === false} className="st-input" aria-label={tr(field.label)} inputMode={field.type === 'number' ? 'numeric' : undefined} placeholder={tr("Default")} value={Array.isArray(value) ? value.join(', ') : value ?? ''} onChange={e => onChange(e.target.value === '' ? null : field.type === 'array' ? e.target.value.split(',').map(s => s.trim()).filter(Boolean) : field.type === 'number' ? Number(e.target.value) : e.target.value)}/>;
+}
+/** DeepSeek's Speed choice. The engine's own rule (--experts auto): Faster (5 experts) when the graphics cards in use total 16 GB (17,179,869,184 bytes) or less, else Full quality (6). */
+const SIXTEEN_GIB = 17179869184;
+function DeepSeekSpeed({ field, value, onChange }: { field: NativeField; value: any; onChange: (v: any) => void }) {
+    const native = useNative();
+    const cards = (native?.hardware?.gpus ?? []).filter(g => g.usable !== false);
+    const total = cards.reduce((sum, g) => sum + (g.vram_gb ?? 0) * 1073741824, 0);
+    const faster = total > 0 && total <= SIXTEEN_GIB;
+    return <Select disabled={field.supported === false} ariaLabel={tr(field.label)} value={value === null || value === undefined ? '' : String(value)}
+      options={[{ value: '', label: tr(faster ? 'Default (Faster on this PC)' : 'Default (Full quality on this PC)') }, { value: '5', label: tr('Faster') }, { value: '6', label: tr('Full quality') }]}
+      onChange={v => onChange(v === '' ? null : v)}/>;
 }
 function NativeAliases({ field, value, onChange }: {
     field: NativeField;

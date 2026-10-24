@@ -225,6 +225,27 @@ test('packaged: a model id with dots (DeepSeek) is listed, loaded from its run c
   } finally { await f.native.close(); f.cleanup(); }
 });
 
+test('packaged: the Speed choice of DeepSeek passes --experts 5 or 6 only when chosen; "Default" passes nothing', async () => {
+  const id = 'deepseek-v4.1-flash-ist-das-2.00bpw';
+  const run = async (values, extraArgs = []) => {
+    const f = packagedFixture({ ids: [id] });
+    try {
+      writeFileSync(join(f.install, `strata-${id}.json`), JSON.stringify({ exe: join(f.install, 'engine-dsv41', 'strata-dsv41'), arch: 'deepseek41', tokenizer: join(f.install, 'tok'), args: ['--pack', join(f.install, 'pack'), '--max-context', '8192', ...extraArgs], model_name: 'deepseek-v4.1-flash', port: 8080 }));
+      await f.native.refresh(true);
+      const job = await finish(f.native, f.native.operation('load', { model: id, ...(values ? { values } : {}) }).id);
+      assert.equal(job.state, 'done', job.error);
+      return f.saved[0];
+    } finally { await f.native.close(); f.cleanup(); }
+  };
+  const flags = cfg => { const i = cfg.args.indexOf('--experts'); return i < 0 ? null : cfg.args[i + 1]; };
+  assert.equal(flags(await run(null)), null, 'nothing chosen: the engine decides (--experts auto)');
+  assert.equal(flags(await run({ ds_experts: '5' })), '5');
+  assert.equal(flags(await run({ ds_experts: '6' }, ['--experts', '5'])), '6', 'the choice replaces an older flag');
+  assert.equal(flags(await run({ ds_experts: null }, ['--experts', '5'])), null, 'Default clears an older flag');
+  const cfg = await run({ ds_experts: '5' });
+  assert.equal('ds_experts' in cfg, false, 'the app-only key is not handed to the engine');
+});
+
 test('packaged: no engine for this PC is the notice, and nothing is started', async () => {
   const f = packagedFixture({ engineUsable: false });
   try {
