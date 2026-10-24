@@ -86,7 +86,7 @@ class Fit(unittest.TestCase):
 
     def test_four_amd_cards_run_the_ista_sets_with_a_plain_layer_split(self):
         # r9700, 2026-10-23: 8K prompt 370 tokens a second with --tp 1 against 196 with the engine's default (2)
-        for model in ("IST-DAS-2.00bpw", "IST-DAS-2.25bpw"):
+        for model in ("IST-DAS-1.75bpw", "IST-DAS-2.00bpw", "IST-DAS-2.25bpw"):
             p = dsv41_fit.plan(FOUR, 251.0, 900.0, model=model)
             self.assertEqual((p["tp"], p["args"]), (1, ["--tp", "1"]), model)
         # two and three cards keep pairs; other makes keep pairs; one card needs no flag; the Unsloth set is not changed

@@ -56,6 +56,7 @@ These are the 2.00-bit set. The 2.25-bit set reads 13% more data per token, so e
 - Not in this release: Mac and Strix Halo. DeepSeek V4.1-Flash does not run there yet.
 - Output on 12 GB cards is 4 to 8 tokens/s. That is usable for chat and slow for long agent runs.
 - The same prompt can give a slightly different answer from one run to the next. At some words the model's top choices are nearly tied, and small differences in how the numbers are added up decide between them.
+- If you set up DeepSeek on 4 or more AMD cards before 0.2.4, run setup again to get the faster prompt settings.
 
 ## Updating
 
