@@ -77,6 +77,16 @@ def python_failure(lines: list[str]) -> str | None:
     return None
 
 
+def argparse_failure(lines: list[str]) -> str:
+    """setup.py's own refusal of an option ("setup.py: error: argument --kv: invalid choice: ..."), which is neither an [X] line nor a
+    traceback (#3785): the words after "error:" are the cause."""
+    for line in reversed(lines):
+        found = re.match(r"\s*(?:setup|strata)(?:\.py)?: error: (.+)", line)
+        if found:
+            return found.group(1).strip()[:300]
+    return ""
+
+
 def missing_file(failure: str) -> bool:
     """An import or file error: the install itself is short of a file, which an update of Strata brings back."""
     return failure.startswith(("ModuleNotFoundError", "ImportError", "FileNotFoundError"))
@@ -99,6 +109,7 @@ def setup_failure(lines: list[str], err: str, hint: str, details: str | None, ow
     """The error for a setup.py run that exited non-zero. setup.py's own `[X]` line (err) is the message when there is one; when it
     stopped with a Python error instead, that error's last line is (#3613, #3467: a file missing from the Terminal's tools/ ended every
     launch after a tune with only "The model could not be installed"). `details` is the file that holds the rest of its output."""
+    err = err or argparse_failure(lines)
     crashed = python_failure(lines) if not err else None
     if crashed:
         where = f" The whole setup output is in {details}." if details else ""
