@@ -976,6 +976,7 @@ struct Model::Impl {
     std::atomic<int> layer_of[kRing];
     std::thread service;
     std::atomic<bool> quit{false};
+    std::thread store_bg;   // the RAM store's fill beyond the first 48 GB, read after the model is ready (preload_store)
     bool sync_decode = std::getenv("DS4_SYNC") != nullptr;
     // a window of one through moe_gate_up / moe_down (DS4_MOE_TOKEN=0: win_experts, whose down rows run
     // before the wait for the CPU lane - the same bits, no faster)
@@ -1246,6 +1247,7 @@ struct Model::Impl {
             }
         quit.store(true);
         if (service.joinable()) service.join();
+        if (store_bg.joinable()) store_bg.join();   // (the store's background fill: it checks quit between its pieces)
         {
             std::lock_guard<std::mutex> lk(pf_mu);
         }
@@ -4454,17 +4456,27 @@ struct Model::Impl {
         return s.str();
     }
 
+    // The most the automatic store may take: all of the trunk's routed experts (the CPU lane's are a part of them; a store larger
+    // than they are is never filled), never less than the old 48 GB.  A PC whose free RAM holds them all (the 251 GB R9700 box:
+    // 115 GB of CPU-lane experts, 1 card, 2.00 set: 12.6 -> 21.4 tokens/s with the whole set resident, misses 15.4 -> 1.5 a token)
+    // gets every one; the RAM that the room below leaves (free - 12 GB) is what bounds it elsewhere.
+    double store_cap_gb() const {
+        double b = 0;
+        for (const auto& kt : pk.t)
+            if (kt.first.find(".ffn.experts.") != std::string::npos && kt.first.rfind("mtp.", 0) != 0) b += (double) kt.second.bytes;
+        return std::max(48.0, b / 1e9);
+    }
     double store_gb() const {
         static double cached = -2.0;   // (decided once: the layout of the blobs depends on it)
         if (cached > -1.5) return cached;
         double gb = o.ssd_cache_gb;
         if (const char* v = std::getenv("DS4_STORE_GB")) gb = std::atof(v);
         if (!pk.gguf) gb = 0.0;
-        else if (gb < 0.0) {   // auto: the RAM free now less 12 GB for the system and the owner's programs, 48 GB at most
+        else if (gb < 0.0) {   // auto: the RAM free now less 12 GB for the system and the owner's programs, all the experts at most
             const uint64_t avail = ram_avail();
             avail0_ = avail;
             const double room = avail == ~uint64_t{0} ? 0.0 : (double) avail / 1e9 - 12.0;
-            gb = room >= 4.0 ? std::min(48.0, room) : 0.0;
+            gb = room >= 4.0 ? std::min(store_cap_gb(), room) : 0.0;
         }
         return cached = gb;
     }
@@ -4482,7 +4494,7 @@ struct Model::Impl {
         const bool uma = avail0_ != ~uint64_t{0} && avail0_ > avail && (double) (avail0_ - avail) / 1e9 >= 4.0;
         const double ctx_gb = uma ? 1.1e-4 * std::max(0.0, (double) o.max_context - 16384.0) : 0.0;
         const double room = (double) avail / 1e9 - 12.0 - ctx_gb;
-        const double now = room >= 4.0 ? std::min(48.0, room) : 0.0;
+        const double now = room >= 4.0 ? std::min(store_cap_gb(), room) : 0.0;
         if (now < gb)
             std::fprintf(stderr, "ds4: RAM store: %.1f GB of RAM free after the GPU's weights: store sized %.1f GB, not %.1f\n",
                          (double) avail / 1e9, now, gb);
@@ -4604,9 +4616,31 @@ struct Model::Impl {
         for (const auto& c : cand) list.push_back(c.second);
         const double t0 = now_ms();
         const size_t leave = (size_t) (std::getenv("DS4_STORE_RESERVE") ? std::atoi(std::getenv("DS4_STORE_RESERVE")) : 192) + 64;
-        const size_t n = store->preload(list, leave);
-        std::fprintf(stderr, "ds4: RAM store: %zu of the profile's hottest experts read in (%.1f GB) in %.1f s\n", n,
-                     (double) n * (double) L[0].blob / 1e9, (now_ms() - t0) / 1000.0);
+        // The first 48 GB (what a store held before it could take every expert) are read before the first token; the rest of the
+        // hottest-first list is read after it, in pieces of 128 experts on a thread of its own, behind the model's own reads (a
+        // guess's priority) - the same bytes.  Opt-in (DS4_STORE_BG=1): "ready" comes 9 s sooner on the 251 GB R9700 box (24 s against 34), but a prompt sent at
+        // once then waits for the same SSD (200 tokens: 18.7 s against 9.0), so the first answer starts no sooner and decode after
+        // it measured 3.7% lower; it only pays when the first prompt comes more than ~10 s after ready.
+        const size_t first = !(std::getenv("DS4_STORE_BG") && std::atoi(std::getenv("DS4_STORE_BG")) == 1)
+                                 ? list.size()
+                                 : std::min(list.size(), (size_t) (48e9 / (double) std::max<size_t>(1, L[0].blob)));
+        const std::vector<std::pair<int, int>> head(list.begin(), list.begin() + (long) first), tail(list.begin() + (long) first, list.end());
+        const size_t n = store->preload(head, leave);
+        std::fprintf(stderr, "ds4: RAM store: %zu of the profile's hottest experts read in (%.1f GB) in %.1f s%s\n", n,
+                     (double) n * (double) L[0].blob / 1e9, (now_ms() - t0) / 1000.0,
+                     tail.empty() ? "" : "; the rest is read in the background");
+        if (tail.empty()) return;
+        store_bg = std::thread([this, tail, leave] {
+            const double tb = now_ms();
+            size_t got = 0;
+            std::vector<std::pair<int, int>> piece;
+            for (size_t i = 0; i < tail.size() && !quit.load(std::memory_order_relaxed); i += 128) {
+                piece.assign(tail.begin() + (long) i, tail.begin() + (long) std::min(tail.size(), i + 128));
+                got += store->preload(piece, leave);
+            }
+            std::fprintf(stderr, "ds4: RAM store: %zu more experts (%.1f GB) read in the background in %.1f s\n", got,
+                         (double) got * (double) L[0].blob / 1e9, (now_ms() - tb) / 1000.0);
+        });
     }
     // at a window boundary: the store's ready slots become the device's (zero-copy) experts, taken back when it needs the room;
     // each touched layer's whole table is written again (VRAM slots, the store's, 0), in stream order before the next window
