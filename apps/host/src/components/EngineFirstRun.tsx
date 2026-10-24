@@ -15,6 +15,7 @@ export interface FirstRunInfo {
     message?: string | null;
     reasons?: string[];
     details?: string;
+    freeBytes?: number;
 }
 
 const MB = 1024 * 1024;
@@ -147,6 +148,7 @@ export function EngineFirstRun({ onDone }: { onDone: () => void }) {
         let main, actions;
         if (info.status === 'offer' && info.offer) {
             main = <>{found}<p>{tr("To run models on it, Strata needs one download:")}<br/><strong>{tr("The engine for this card")}: {mb(info.offer.bytes)} MB</strong></p>
+                {info.freeBytes !== undefined && info.freeBytes < info.offer.bytes * 2.5 ? <p className="small inline-error">{tr("The engine needs about {0} GB of free space on this drive and only {1} GB is free. Free some space, then continue.", [Math.ceil(info.offer.bytes * 2.5 / 1e9), (info.freeBytes / 1e9).toFixed(1)])}</p> : null}
                 <p className="small muted">{tr("It comes from Strata’s own update server and is checked before it is used. Your models and chats are never touched by it.")}</p></>;
             actions = <><Btn variant="primary" disabled={busy} onClick={() => void start()}>{tr(failed ? 'Continue' : 'Download the engine')}</Btn>{pick("I already have the file…")}</>;
         }

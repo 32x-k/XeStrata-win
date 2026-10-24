@@ -32,7 +32,7 @@ import { findBrowser, findPlaywrightMcp } from './agent/browser-probe.mjs';
  */
 import http from 'node:http';
 import { homedir } from 'node:os';
-import { cpSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { statfsSync, cpSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { spawn } from 'node:child_process';
 import { execFile } from 'node:child_process';
@@ -1330,7 +1330,9 @@ async function api(req, res, path, method, url) {
   if (path === '/api/setup' && method === 'GET') return json(res, 200, setupState());
   if (path === '/api/engine/first-run' && method === 'GET') {
     if (!control?.updateCheck) return json(res, 200, { status: 'unavailable', gpus: [] });
-    return json(res, 200, await engineFirstRun({ control, gpus: hardware.cachedHardware()?.gpus ?? [] }));
+    const info = await engineFirstRun({ control, gpus: hardware.cachedHardware()?.gpus ?? [] });
+    try { let at = componentsDirectory(); while (at && !existsSync(at) && dirname(at) !== at) at = dirname(at); const f = statfsSync(at); info.freeBytes = Number(f.bavail) * Number(f.bsize); } catch { /* unknown: no warning */ }
+    return json(res, 200, info);
   }
   if (path === '/api/engine/job' && method === 'GET') {
     // The newest engine download / file install, read without waiting for the native snapshot to connect (the first-run card needs it before that).
