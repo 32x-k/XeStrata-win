@@ -143,6 +143,17 @@ static int g_round_nd = 0;
 // One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts while their
 // confidence holds (at most `room` - 1 of them), verified together; else a plain step.  `out` gets the tokens that follow
 // tok (the accepted drafts, then the trunk's next), the last of them the next round's tok.
+struct RoundTimes {   // DS4_ROUND_TIMES: where a decode round's time goes (ms, summed), printed at exit
+    double draft = 0, verify = 0, step = 0;
+    long rounds = 0, spec_rounds = 0, steps = 0;
+    ~RoundTimes() {
+        if (std::getenv("DS4_ROUND_TIMES") && rounds > 0)
+            std::fprintf(stderr, "rounds: %ld (%ld speculative, %ld plain steps): draft %.1f ms (%.2f a round), verify %.1f ms (%.2f), plain step %.1f ms (%.2f)\n",
+                         rounds, spec_rounds, steps, draft, spec_rounds ? draft / (double) spec_rounds : 0.0, verify, spec_rounds ? verify / (double) spec_rounds : 0.0,
+                         step, steps ? step / (double) steps : 0.0);
+    }
+} g_rt;
+static double rt_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, float temperature, float top_p, int top_k,
            float min_p, unsigned long long seed, unsigned long long& counter, std::vector<int>& out, int& offered,
            int& accepted, std::string& err) {
@@ -151,7 +162,10 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     if (spec && room > 1 && m.draft_block() > 0) {
         std::vector<int> drafts;
         std::vector<float> conf;
+        ++g_rt.rounds;
+        const double rt0 = rt_now();
         if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter)) return false;
+        g_rt.draft += rt_now() - rt0;
         g_round_conf = conf;
         g_round_nd = (int) drafts.size();
         int keep = 0;
@@ -159,7 +173,10 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         if (keep > 0) {
             drafts.resize((size_t) keep);
             int acc = 0, next = -1;
+            const double rt1 = rt_now();
             if (!m.verify(tok, drafts, temperature, top_p, top_k, min_p, seed, counter, acc, next, err)) return false;
+            g_rt.verify += rt_now() - rt1;
+            ++g_rt.spec_rounds;
             if (g_round_log != nullptr) {   // DS4_ROUND_LOG: tag, drafts offered, accepted, the confidences
                 std::fprintf(g_round_log, "%s\t%d\t%d", g_round_tag.c_str(), keep, acc);
                 for (int i = 0; i < keep; ++i) std::fprintf(g_round_log, "\t%.4f", g_round_conf[(size_t) i]);
@@ -173,8 +190,11 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
             return true;
         }
     }
+    const double rt2 = rt_now();
     if (!m.step(tok, true, err)) return false;
     out.push_back(m.sample(temperature, top_p, top_k, min_p, seed, counter++));
+    g_rt.step += rt_now() - rt2;
+    ++g_rt.steps;
     return true;
 }
 
@@ -738,7 +758,13 @@ int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int win
 }
 }  // namespace
 
+#if defined(STRATA_METAL)
+#include "sampler_stat.inc"
+#endif
 int main(int argc, char** argv) {
+#if defined(STRATA_METAL)
+    if (argc > 1 && std::string(argv[1]) == "--sampler-test") return sampler_stat::run(argc - 1, argv + 1);   // (the sampler's statistics harness)
+#endif
 #if defined(__APPLE__)
     if (std::getenv("DS4_BT")) {   // a crash prints where it was (no debugger on the Mac box)
         signal(SIGSEGV, [](int) { void* fr[40]; const int n = backtrace(fr, 40); backtrace_symbols_fd(fr, n, 2); _exit(139); });
