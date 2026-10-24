@@ -9,9 +9,11 @@
 // text rows not), and adds each stream's projection and MLP (GELU, tanh form) back through its gates.  The text stream
 // changes with the time, so nothing of it is kept between steps beyond its input projection.
 //
-// The weights come from the bf16 safetensors (Comfy-Org/Mage-Flow's files as they are).  With q8 each block is
-// quantized to 8 bits on the host as it is read, once, and the file's pages are dropped from the page cache: half the
-// VRAM and the bytes a streamed block moves.  Where the GPU's library takes int8 products (prefill::Gemm::i8_usable) the
+// The weights come from the bf16 safetensors (Comfy-Org/Mage-Flow's files as they are).  A file with a shared low-rank
+// modulation (MageTrail's, bluvoll's mageflow-lowrank-modulation-v1) projects SiLU(temb) once a step to a few hundred
+// values (modulation_down) and each block's modulations from those: its FP32 factors stay FP32, as the format asks.
+// With q8 each block is quantized to 8 bits on the host as it is read, once, and the file's pages are dropped from the
+// page cache: half the VRAM and the bytes a streamed block moves.  Where the GPU's library takes int8 products (prefill::Gemm::i8_usable) the
 // weights are rotated in groups and quantized with a scale a row, and so are the activations a token at each product
 // (W8A8, qi_rows_i8: ComfyUI's int8 form, the rotation spreading the outlier channels below); elsewhere as Q8_0, the
 // products dequantizing it to FP16 each time.  Without q8 the bf16 bytes
@@ -129,7 +131,7 @@ public:
 
 private:
     struct W {
-        int type = 0;            // 8 Q8_0, 30 BF16, 1 F16
+        int type = 0;            // 8 Q8_0, 1 F16, 32 F32 (the low-rank modulations)
         int64_t n = 0, k = 0;    // n rows of k
         const void* d = nullptr; // a block's: its offset in the block's region; else a device pointer
         uint64_t row_bytes = 0;
@@ -149,7 +151,8 @@ private:
     // y is left the product's sums, for the reader to scale and add the bias to as the view says.
     MfOut product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
                   const float* bias, bool same_input = false, bool defer = false);
-    // a block's modulation y [w.n] = SiLU(temb) . w^T + bias (tsil: its FP16 copy, for a 16-bit w)
+    // a block's modulation y [w.n] = SiLU(temb) . w^T + bias (tsil: its FP16 copy, for a 16-bit w); an F32 w (the
+    // low-rank form) reads the shared projection mlow_ instead
     void modulation(const uint16_t* tsil, const W& w, const uint8_t* base, float* y, const float* bias);
     void ensure(int64_t hw, int n, int64_t max_text);
     void rope_tables(int64_t h, int64_t w);
@@ -167,6 +170,8 @@ private:
     std::vector<int64_t> axes_{16, 56, 56};
     // the parts outside the blocks, FP16 on the GPU
     W img_in_, txt_in_, t1_, t2_, nout_, pout_;
+    W mdown_;   // the shared low-rank modulation's projection (F32, device; n 0 without one)
+    float *b_mdown_ = nullptr, *mlow_ = nullptr;
     const float *b_img_in_ = nullptr, *b_txt_in_ = nullptr, *b_t1_ = nullptr, *b_t2_ = nullptr, *b_nout_ = nullptr,
                 *b_pout_ = nullptr, *txt_norm_ = nullptr;
     std::vector<Block> blocks_;

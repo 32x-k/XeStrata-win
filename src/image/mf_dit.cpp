@@ -36,7 +36,7 @@ namespace syclex = sycl::ext::oneapi::experimental;
 using strata::kernels::f16_from_f32;
 
 // kTypeW8: int8 rows rotated as qi_rows_i8 rotates them, then a scale a row (FP32), for prefill::Gemm::i8
-constexpr int kTypeF16 = 1, kTypeQ8_0 = 8, kTypeW8 = -8;
+constexpr int kTypeF16 = 1, kTypeQ8_0 = 8, kTypeW8 = -8, kTypeF32 = 32;
 constexpr float kEps = 1e-6f;
 
 sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
@@ -404,6 +404,21 @@ void q8_0_vec(const uint8_t* w, const float* x, const float* b, float* y, int64_
     });
 }
 
+// y[n] = x . w[n] + b[n] (b null: none): w N rows of K FP32, x FP32; a work-group of 32 a row
+void f32_vec(const float* w, const float* x, const float* b, float* y, int64_t N, int64_t K, void* s) {
+    constexpr int64_t local = 32;
+    q_of(s).parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (N * local)), sycl::range<1>((size_t) local)),
+                         [=](sycl::nd_item<1> it) {
+        const auto n = static_cast<int64_t>(it.get_group_linear_id());
+        const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+        const float* row = w + n * K;
+        float acc = 0.f;
+        for (int64_t k = lane; k < K; k += local) acc += row[k] * x[k];
+        acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+        if (lane == 0) y[n] = acc + (b != nullptr ? b[n] : 0.f);
+    });
+}
+
 // y[t] = y[t] * rs[t] + b (rs null: 1; b null: none)
 void rows_back(float* y, const float* rs, const float* b, int64_t T, int64_t N, void* s) {
     q_of(s).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
@@ -471,6 +486,14 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
             if (t->dtype != "BF16") throw std::runtime_error("image engine (Mage-Flow DiT): " + name + " is not bf16");
             return *t;
         };
+        // a block's modulation in the low-rank form: F32 [6 hidden][rank]
+        auto lowrank = [&](const std::string& name) -> const SafeTensor& {
+            const SafeTensor* t = st.find(name);
+            if (t == nullptr) throw std::runtime_error("image engine (Mage-Flow DiT): no " + name);
+            if (t->dtype != "F32" || t->shape.size() != 2 || t->shape[1] != mdown_.n)
+                throw std::runtime_error("image engine (Mage-Flow DiT): " + name + " is not F32 [6 hidden][rank]");
+            return *t;
+        };
         // the parts outside the blocks: FP16 weights and FP32 vectors on the GPU
         auto dense = [&](const std::string& name, const float** bias) {
             const SafeTensor& t = tensor(name + ".weight");
@@ -510,6 +533,24 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
             gpu::copy(d, v.data(), v.size() * 4);
             txt_norm_ = d;
         }
+        // the shared low-rank modulation (MageTrail's): SiLU(temb) to a few hundred values, FP32
+        if (const SafeTensor* t = st.find("modulation_down.weight"); t != nullptr) {
+            if (t->dtype != "F32" || t->shape.size() != 2 || t->shape[1] != C_)
+                throw std::runtime_error("image engine (Mage-Flow DiT): modulation_down is not F32 [rank][hidden]");
+            mdown_.type = kTypeF32;
+            mdown_.n = t->shape[0];
+            mdown_.k = t->shape[1];
+            weight_bytes_ += (uint64_t) (mdown_.n * mdown_.k + 2 * mdown_.n) * 4;
+            if (!dry_) {
+                const auto wv = st.f32("modulation_down.weight");
+                const auto bv = st.f32("modulation_down.bias");
+                float* dw = alloc<float>(allocs_, (int64_t) wv.size());
+                gpu::copy(dw, wv.data(), wv.size() * 4);
+                mdown_.d = dw;
+                b_mdown_ = alloc<float>(allocs_, (int64_t) bv.size());
+                gpu::copy(b_mdown_, bv.data(), bv.size() * 4);
+            }
+        }
         hd_ = tensor("transformer_blocks.0.attn.norm_q.weight").shape[0];
         heads_ = C_ / hd_;
         int64_t axes_sum = 0;
@@ -539,10 +580,18 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
             // the block's host bytes: the quantized weights (q8), then every FP32 vector
             uint64_t qbytes = 0, vbytes = 0;
             for (const Item& it : items) {
-                const SafeTensor& t = tensor(p + it.name + ".weight");
+                const bool mod = mdown_.n > 0 && (it.w == &b.imod || it.w == &b.tmod);
+                const SafeTensor& t = mod ? lowrank(p + it.name + ".weight") : tensor(p + it.name + ".weight");
                 it.w->n = t.shape[0];
                 it.w->k = t.shape[1];
                 if (it.w->k % 32 != 0) throw std::runtime_error("image engine (Mage-Flow DiT): columns not 32s");
+                if (mod) {   // the low-rank modulation's FP32 factors, as they are
+                    it.w->type = kTypeF32;
+                    it.w->row_bytes = (uint64_t) it.w->k * 4;
+                    if (q8_) qbytes += it.w->row_bytes * (uint64_t) it.w->n;
+                    vbytes += (uint64_t) it.w->n * 4;
+                    continue;
+                }
                 // the modulations stay Q8_0: their one row (the time's embedding) scales, shifts and gates every
                 // row of the block, and a scale for all of it costs the most (RTX 4070, Turbo's 4 steps, the final
                 // latent's cosine to the reference: 0.991 all Q8_0, 0.961 with W8A8 modulations alone, 0.981 with all
@@ -563,10 +612,14 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
             uint64_t at = 0;
             std::vector<size_t> wspan(items.size()), bspan(items.size()), nspan(norms.size());
             for (size_t j = 0; j < items.size(); ++j) {
-                const SafeTensor& t = tensor(p + items[j].name + ".weight");
+                const SafeTensor& t = *st.find(p + items[j].name + ".weight");
                 const W& w = *items[j].w;
                 const uint64_t bytes = w.row_bytes * (uint64_t) w.n + (w.type == kTypeW8 ? (uint64_t) w.n * 4 : 0);
-                if (q8_) {
+                if (q8_ && w.type == kTypeF32) {
+                    if (!dry_) std::memcpy(host.data() + at, data + t.begin, bytes);
+                    spans.push_back({host.data() + at, bytes, 0});
+                    at += bytes;
+                } else if (q8_) {
                     if (!dry_)
                         quantize_matrix(reinterpret_cast<const uint16_t*>(data + t.begin), w.n, w.k, host.data() + at,
                                         w.type == kTypeW8);
@@ -595,7 +648,7 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
             if (q8_ && !dry_) {   // the block's bf16 pages: read once, not kept in the page cache
                 uint64_t lo = UINT64_MAX, hi = 0;
                 for (const Item& it : items) {
-                    const SafeTensor& t = tensor(p + it.name + ".weight");
+                    const SafeTensor& t = *st.find(p + it.name + ".weight");
                     lo = std::min(lo, st.data_base() + t.begin);
                     hi = std::max(hi, st.data_base() + t.end);
                 }
@@ -612,8 +665,9 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
                 const Block& b = blocks_[(size_t) i];
                 for (const W* w : {&b.imod, &b.tmod, &b.q, &b.k, &b.v, &b.tq, &b.tk, &b.tv, &b.o, &b.to, &b.imlp1,
                                    &b.imlp2, &b.tmlp1, &b.tmlp2})
-                    bf16_to_f16_inplace(reinterpret_cast<uint16_t*>(d + reinterpret_cast<uintptr_t>(w->d)),
-                                        w->n * w->k, q);
+                    if (w->type != kTypeF32)
+                        bf16_to_f16_inplace(reinterpret_cast<uint16_t*>(d + reinterpret_cast<uintptr_t>(w->d)),
+                                            w->n * w->k, q);
             });
         if (dry_) return true;
         if (!gemm_.init(s_, scratch, err)) return false;
@@ -623,6 +677,7 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
         mod_i_ = alloc<float>(allocs_, 6 * C_);
         mod_t_ = alloc<float>(allocs_, 6 * C_);
         nmod_ = alloc<float>(allocs_, 2 * C_);
+        if (mdown_.n > 0) mlow_ = alloc<float>(allocs_, mdown_.n);
         return true;
     } catch (const std::exception& e) {
         err = e.what();
@@ -670,6 +725,10 @@ MfOut MfDit::product(const uint16_t* x16, const float* rs, const W& w, const uin
 }
 
 void MfDit::modulation(const uint16_t* tsil, const W& w, const uint8_t* base, float* y, const float* bias) {
+    if (w.type == kTypeF32) {
+        f32_vec(reinterpret_cast<const float*>(base + reinterpret_cast<uintptr_t>(w.d)), mlow_, bias, y, w.n, w.k, s_);
+        return;
+    }
     if (w.type != kTypeQ8_0) {
         product(tsil, nullptr, w, base, y, 1, bias);
         return;
@@ -847,6 +906,7 @@ void MfDit::time_embedding(float sigma) {
     product(t16_ + 256, nullptr, t2_, nullptr, temb_, 1, b_t2_);
     gpu::copy_async(nmod_, temb_, (size_t) C_ * 4, s_);   // temb kept; its SiLU below
     qi_silu(nmod_, C_, t16_ + 256 + C_, s_);
+    if (mdown_.n > 0) f32_vec(static_cast<const float*>(mdown_.d), nmod_, b_mdown_, mlow_, mdown_.n, mdown_.k, s_);
 }
 
 void MfDit::set_context(int i, const float* states, int64_t rows) {
