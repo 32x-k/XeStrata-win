@@ -159,6 +159,17 @@ bool finish(float* x, int n_vec, int len, long long stride, const FinishIn& f) {
     d.tg[0] = 256;
     d.tg[1] = d.tg[2] = 1;
     g_cx->run({d});
+    // The fp8-rounding finishes (the KV rows, the attention output) are read stale by the next dispatch when it shares their
+    // command buffer: end the buffer after them (committed, not waited for: the queue orders the buffers).
+    static const bool no_split = std::getenv("DS4_NO_FINISH_SPLIT") != nullptr;
+    if (f.quant && !no_split) g_cx->split_runs();
+    if (const char* fm2 = std::getenv("DS4_FLUSH_FINISH_CTX")) { if (f.quant) { if (std::atoi(fm2) == 2) g_cx->split_runs(); else g_cx->flush_runs(); } }
+    if (const char* fm = std::getenv("DS4_FLUSH_FINISH")) {   // debugging: which finish calls need a drain after them
+        const int m = std::atoi(fm);
+        if ((m == 1 && f.dst) || (m == 2 && f.rd > 0) || (m == 3 && f.w) || (m == 4 && f.quant) || (m == 5 && !f.dst) ||
+            (m == 6 && f.dst == nullptr && f.rd == 0) || (m == 7 && f.rd > 0 && f.inverse) || (m == 8 && f.rd > 0 && !f.inverse && !f.dst) || (m == 9 && f.rd > 0 && !f.dst) || (m == 10 && (f.dst || f.inverse)) || (m == 11 && f.rd > 0 && !f.inverse))
+            ds4_metal_flush();
+    }
     return true;
 }
 

@@ -7780,6 +7780,8 @@ struct Model::Impl {
                 CK(cudaMemcpyAsync(sc + (size_t) t * cols * (ehd / 32), src + (size_t) t * per + (size_t) cols * ehd,
                                    (size_t) cols * (ehd / 32), cudaMemcpyHostToDevice, s));
             engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, (int) eg_fmt[(size_t) l.eg]);
+            dump_sub(d, "eg_rows", l.il, p0, T, d.eg_rows, (size_t) T * cols * ehd);
+            dump_sub(d, "eg_x", l.il, p0, T, d.eg_x, (size_t) T * cols * ehd * 4);
             if (std::getenv("DS4_DBG_EG")) {
                 dbg_nf("eg_x", l.il, d.eg_x, (size_t) T * cols * ehd);
                 const float* xv = (const float*) strata::gpu::host_view(d.eg_x);
@@ -7796,7 +7798,11 @@ struct Model::Impl {
             }
             if (!mv(d, {job(l.eg_wkv, d.eg_x, d.eg_kv, T, (size_t) cols * ehd, (size_t) (H + 1) * D)}, err)) return false;
             if (std::getenv("DS4_DBG_EG")) dbg_nf("eg_kv", l.il, d.eg_kv, (size_t) T * (H + 1) * D);
+            dump_sub(d, "eg_kv", l.il, p0, T, d.eg_kv, (size_t) T * (H + 1) * D * 4);
+            dump_sub(d, "eg_h0", l.il, p0, T, d.h, (size_t) T * H * D * 4);
+            dump_sub(d, "eg_w", l.il, p0, 1, l.eg_w, (size_t) H * D * 4);
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
+            dump_sub(d, "eg_h", l.il, p0, T, d.h, (size_t) T * H * D * 4);
             if (std::getenv("DS4_DBG_EG")) dbg_nf("h_after_gate", l.il, d.h, (size_t) T * H * D);
         }
         dump_sub(d, "h_in", l.il, p0, T, d.h, (size_t) T * H * D * 4);
@@ -7852,6 +7858,7 @@ struct Model::Impl {
         finish(d.kvr, T, HD, HD, fk, s);
         if (!l.mtp) ext_to_ring(d.ext, l.win, p0, g.win, T, HD, s, spec_win ? l.ring_bak : nullptr);
         dump_sub(d, "kv_win", l.il, p0, T, d.ext + (size_t) g.win * HD, (size_t) T * HD * 4);
+        dump_sub(d, "ext", l.il, p0, T, d.ext, ((size_t) g.win + T) * HD * 2);   // (BF16 rows: the ring's, then this window's)
         AttnRows ar;
         for (int t = 0; t < T; ++t) {
             if (l.mtp) {

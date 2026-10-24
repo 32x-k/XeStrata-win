@@ -181,7 +181,7 @@ kernel void ds4_finish(device float* x [[buffer(0)]], constant long& stride [[bu
         if (e >= len) continue;
         if (f.dst != nullptr) {
             const uint bits = as_type<uint>(r[j]);
-            f.dst[e] = ushort((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);   // BF16 round to nearest even
+            f.dst[(long) b * f.dst_stride + (long) e] = ushort((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);   // BF16 round to nearest even, the vector's own row
         } else {
             v[e] = r[j];
         }
@@ -622,7 +622,7 @@ kernel void ds4_ext_to_ring(device const ushort* ext [[buffer(0)]], device uchar
     const device ushort* src = ext + (size_t) (n + t) * d;
     for (uint e0 = 0; e0 < d; e0 += 256u) {
         const uint e = e0 + tid;
-        const float v = e < d ? float(as_type<half>(src[e])) : 0.0f;
+        const float v = e < d ? as_type<float>(uint(src[e]) << 16) : 0.0f;   // (BF16 bits, not half)
         uint a = as_type<uint>(v) & 0x7fffffffu;             // magnitudes ordered as bits
         for (uint o = 16u; o > 0u; o >>= 1u) a = max(a, simd_shuffle_xor(a, o));
         const int k = a == 0u ? 0 : int(a >> 23) - 135 + (((a & 0x7fffffu) > 0x600000u) ? 1 : 0);

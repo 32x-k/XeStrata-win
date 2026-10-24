@@ -322,6 +322,7 @@ Error free_alloc(void* p) {
     size_t off = 0;
     const Alloc* a = find(p, &off);
     if (!a || off != 0) return fail(kErrorInvalidValue);
+    if (std::getenv("DS4_TRACE_FREE")) std::fprintf(stderr, "gpu free %zu bytes (host=%d) at %p\n", a->bytes, (int) a->host, p);
     device_synchronize();   // as cudaFree: the GPU is done with it
     std::lock_guard<std::mutex> lk(r.mu);
     MTL::Buffer* b = a->buf;
@@ -348,6 +349,8 @@ void* buffer_for_cpu_impl(const void* cpu, size_t bytes, size_t* off) {
     *off = (uintptr_t) cpu - ic->first;
     return (void*) a.buf;
 }
+
+MTL::ResidencySet* residency_set_impl() { return rt().rs; }
 
 void* host_view(const void* p) {
     size_t off = 0;
@@ -703,3 +706,8 @@ Stats stats() { return rt().stats; }
 extern "C" void* ds4_gpu_buffer_for_cpu(const void* cpu, size_t bytes, size_t* off) {
     return strata::gpu::buffer_for_cpu_impl(cpu, bytes, off);
 }
+
+// The residency set every strata::gpu stream queue carries: the Context's queue (mtl_rt) needs it too, because kernels
+// dereference raw gpuAddresses (weights, ring buffers, job arrays) that no setBuffer names, and memory that is not resident
+// reads as zeros.
+extern "C" void* ds4_gpu_residency_set() { return (void*) strata::gpu::residency_set_impl(); }

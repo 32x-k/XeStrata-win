@@ -775,12 +775,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     endif()
     target_include_directories(strata_dsv41_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
     target_link_libraries(strata_dsv41_kernels PUBLIC ${_strata_gpu_runtime_target})
+    target_compile_options(strata_dsv41_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-include ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_launch.h>)
     add_executable(strata-dsv41 src/dsv41/ds4_main.cpp src/dsv41/ds4_model.cu src/dsv41/ds4_kernels.cu src/dsv41/ds4_vision.cu
                    src/dsv41/ds4_gguf.cu src/dsv41/ds4_gguf_cpu.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
                    src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp)
     target_include_directories(strata-dsv41 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
                                ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
     target_link_libraries(strata-dsv41 PRIVATE strata_dsv41_kernels ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+    target_compile_options(strata-dsv41 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-include ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_launch.h>)
     find_package(Threads REQUIRED)
     target_link_libraries(strata-dsv41 PRIVATE Threads::Threads)
     if(WIN32 AND STRATA_ENABLE_HIP)   # cudaMemGetInfo is the DXGI-budgeted hip_compat::mem_get_info (src/core/device.cu): on a Strix Halo the

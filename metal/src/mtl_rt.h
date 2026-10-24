@@ -101,6 +101,7 @@ public:
 
     // Encodes `ds` into ONE compute encoder (serial or concurrent dispatch type) and ONE command buffer, `reps`
     // times over; commits and waits.  Returns the GPU time (GPUEndTime - GPUStartTime) in seconds.
+    void split_runs();   // commit the batched dispatches as their own command buffer, without waiting
     void flush_runs();   // commit and wait for the dispatches batched since the last flush
     double run(const std::vector<Dispatch>& ds, int reps = 1, bool concurrent = false, bool barrier_between = false);
     // A dependency graph in ONE concurrent encoder: a memory barrier only before dispatches with `barrier` set, so

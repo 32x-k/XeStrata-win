@@ -33,10 +33,12 @@ std::string read_file(const std::string& path) {
     return ss.str();
 }
 
+extern "C" void* ds4_gpu_residency_set() __attribute__((weak_import));
 struct Context::Impl {
     id<MTLCommandBuffer> cb_def = nil;   // the open command buffer single dispatches accumulate in
     id<MTLComputeCommandEncoder> enc_def = nil;
     int def_n = 0;
+    id<MTLCommandBuffer> inflight = nil;   // the last committed-but-not-waited deferred buffer (the queue runs them in order)
     std::vector<void*> graveyard;   // buffers freed while the deferred command buffer still references them (it holds none)
     std::recursive_mutex mu;   // helper threads (the stager, the expert cache) flush too: one writer on the open encoder
     id<MTLDevice> dev;
@@ -64,6 +66,10 @@ Context::Context() : impl_(new Impl) {
         std::exit(2);
     }
     impl_->q = [impl_->dev newCommandQueue];
+    if (ds4_gpu_residency_set && !std::getenv("DS4_NO_RESIDENCY")) {
+        id<MTLResidencySet> rs = (__bridge id<MTLResidencySet>)ds4_gpu_residency_set();
+        if (rs) [impl_->q addResidencySet:rs];
+    }
     // env, then <exe dir>/metal/ (a component package), then the compiled-in source-tree path
     ggml_common_path = strata_metal::resource("STRATA_GGML_COMMON", "ggml-common.h", STRATA_GGML_COMMON_DEFAULT);
     kernel_dir = strata_metal::resource("STRATA_METAL_KERNELS", "kernels", STRATA_METAL_KERNELS_DEFAULT);
@@ -267,7 +273,7 @@ void Context::free(Buffer& b) {
     // is still queued is read after it is gone (or after another alloc took its memory: the job arrays of iq_mv read the
     // NEXT call's jobs, measured as rows of zeros and different tokens every run).  Hold it until the buffer has completed.
     std::lock_guard<std::recursive_mutex> lk_(impl_->mu);
-    const bool hold = impl_->cb_def != nil;
+    const bool hold = impl_->cb_def != nil || impl_->inflight != nil;
     if (b.chunks) {
         for (void* h : *b.chunks) {
             if (hold) impl_->graveyard.push_back(h);
@@ -294,6 +300,8 @@ static void encode(id<MTLComputeCommandEncoder> enc, const Dispatch& d) {
         if (a.buf) {
             size_t o;
             id<MTLBuffer> mb = BO(*a.buf, a.off, o);
+            static const bool chkbuf = std::getenv("DS4_CHECK_BUF") != nullptr;
+            if (chkbuf && o >= [mb length]) std::fprintf(stderr, "mtl: %s arg %zu: offset %zu past the buffer (%zu bytes; Buffer.bytes %zu bias %zu off %zu)\n", d.p->name.c_str(), i, o, (size_t) [mb length], a.buf->bytes, a.buf->bias, (size_t) a.off);
             [enc setBuffer:mb offset:o atIndex:i];
         }
         else
@@ -326,21 +334,41 @@ static void ds4_report_counts() {
 extern "C" unsigned long long ds4_dispatch_seq() { return g_disp_count.load(); }
 
 extern "C" void ds4_gpu_sync_all_streams_weak() __asm("_ds4_gpu_sync_all_streams") __attribute__((weak_import));
+void Context::split_runs() {
+    // Commit the batched dispatches as their own command buffer WITHOUT waiting: the queue runs buffers in order and makes each
+    // one's writes visible to the next.  (Measured: a producer kernel's output was read stale by the next dispatch of the same
+    // buffer for two kernels in a layer; ending the buffer after them is enough, no wait needed.)
+    std::lock_guard<std::recursive_mutex> lk_(impl_->mu);
+    if (impl_->cb_def == nil) return;
+    ++g_cb_count;
+    [impl_->enc_def endEncoding];
+    [impl_->cb_def commit];
+    impl_->inflight = impl_->cb_def;
+    impl_->cb_def = nil;
+    impl_->enc_def = nil;
+    impl_->def_n = 0;
+}
+
 void Context::flush_runs() {
     if (std::getenv("DS4_TRACE_DISP") && impl_->cb_def != nil) std::fprintf(stderr, "TRACE flush_runs (%d queued)\n", impl_->def_n);
     std::lock_guard<std::recursive_mutex> lk_(impl_->mu);
     if (!g_count_reg) { g_count_reg = true; std::atexit(ds4_report_counts); }
-    if (impl_->cb_def == nil) return;
-    ++g_cb_count;
-    { const double d = impl_->cb_def.GPUEndTime - impl_->cb_def.GPUStartTime; if (d > 0) g_gpu_ms += d * 1000.0; }
-    [impl_->enc_def endEncoding];
-    [impl_->cb_def commit];
-    [impl_->cb_def waitUntilCompleted];
-    if (impl_->cb_def.status != MTLCommandBufferStatusCompleted)
-        std::fprintf(stderr, "mtl: deferred command buffer failed: %s\n", [[impl_->cb_def.error localizedDescription] UTF8String]);
-    impl_->cb_def = nil;
-    impl_->enc_def = nil;
-    impl_->def_n = 0;
+    if (impl_->cb_def != nil) {
+        ++g_cb_count;
+        [impl_->enc_def endEncoding];
+        [impl_->cb_def commit];
+        impl_->inflight = impl_->cb_def;
+        impl_->cb_def = nil;
+        impl_->enc_def = nil;
+        impl_->def_n = 0;
+    }
+    if (impl_->inflight != nil) {
+        [impl_->inflight waitUntilCompleted];
+        { const double d = impl_->inflight.GPUEndTime - impl_->inflight.GPUStartTime; if (d > 0) g_gpu_ms += d * 1000.0; }
+        if (impl_->inflight.status != MTLCommandBufferStatusCompleted)
+            std::fprintf(stderr, "mtl: deferred command buffer failed: %s\n", [[impl_->inflight.error localizedDescription] UTF8String]);
+        impl_->inflight = nil;
+    }
     for (void* h : impl_->graveyard) { id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
     impl_->graveyard.clear();
 }
@@ -370,7 +398,9 @@ double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, 
             ++impl_->def_n;
             ++g_disp_count;
             static const bool each = std::getenv("DS4_FLUSH_EACH") != nullptr;   // debugging: every dispatch alone, in order
-            if (each) {
+            static const std::string only = std::getenv("DS4_FLUSH_AFTER") ? std::getenv("DS4_FLUSH_AFTER") : "";   // ",name1,name2,"
+            const bool listed = !only.empty() && only.find("," + ds[0].p->name + ",") != std::string::npos;
+            if (each || listed) {
                 if (ds4_gpu_sync_all_streams_weak) ds4_gpu_sync_all_streams_weak();
                 flush_runs();
             }
