@@ -11,7 +11,7 @@ from unittest import mock
 from strata_cli.launch import settings as S
 from strata_cli.launch.app import LaunchApp
 from strata_cli.launch.runner import (Runner, apply_experts, derive_config, dsv41_engine_version, engine_takes_experts, experts_from_log,
-                                      used_vram_gb)
+                                      faster_by_default, used_vram_gb, uses_integrated_gpu)
 from strata_cli.launch.screens import SpeedScreen, flow_for
 from tests.terminal import test_launch as TL
 from tests.terminal.launch_support import Home, text_of
@@ -131,6 +131,36 @@ class Resolve(unittest.TestCase):
         self.assertEqual(used_vram_gb(comp, S.LaunchSettings(gpus=[0])), 12)
         self.assertEqual(used_vram_gb(comp, S.LaunchSettings(gpu_roles={"0": "main", "1": "off"})), 12)
 
+    def test_an_integrated_gpu_is_faster_by_default_whatever_its_memory(self):          # Strix Halo: 96 GB of shared memory, the engine says 5
+        halo = {"index": 0, "vram_gb": 96, "vendor": "amd", "uma": True, "name": "AMD Radeon 8060S (gfx1151)"}
+        comp = mock.Mock(usable_gpus=[halo])
+        s = S.LaunchSettings()
+        self.assertTrue(uses_integrated_gpu(comp, s))
+        self.assertTrue(faster_by_default(comp, s))
+        for key in ("integrated", "unified_memory"):
+            other = {"index": 0, "vram_gb": 64, "vendor": "amd", key: True}
+            self.assertTrue(faster_by_default(mock.Mock(usable_gpus=[other]), s), key)
+        big = {"index": 0, "vram_gb": 96, "vendor": "amd"}                               # a 96 GB discrete card is still Full quality
+        self.assertFalse(faster_by_default(mock.Mock(usable_gpus=[big]), s))
+        mac = {"index": 0, "vram_gb": 0, "vendor": "apple", "unified_gb": 64}
+        self.assertFalse(uses_integrated_gpu(mock.Mock(usable_gpus=[mac]), s))           # DeepSeek is not on the Mac
+        two = mock.Mock(usable_gpus=[{"index": 0, "vram_gb": 24, "vendor": "nvidia"}, {"index": 1, "vram_gb": 32, "vendor": "amd", "uma": True}])
+        self.assertFalse(uses_integrated_gpu(two, S.LaunchSettings(gpus=[0])))            # only the cards this launch uses count
+        self.assertTrue(uses_integrated_gpu(two, S.LaunchSettings(gpus=[1])))
+
+    def test_the_label_and_the_plan_say_faster_on_strix_halo_and_the_guard_still_holds(self):
+        cat = mock.Mock()
+        cat.strata.multi_family.return_value = True
+        cat.computer.return_value = mock.Mock(usable_gpus=[{"index": 0, "vram_gb": 96, "vendor": "amd", "uma": True}])
+        r = Runner(S.LaunchSettings(family="deepseek41", model="IST-DAS-2.00bpw"), catalog=cat, emit=lambda e: None)
+        r.dsv41_engine_found = lambda: (Path(self.engine), True)
+        self.assertEqual(r.resolved_speed(), ("faster", True))
+        self.assertIn("Faster (default on this PC)", r.speed_line())
+        self.assertIsNone(r.experts_flag())                                              # not chosen: the engine's auto rule decides
+        r.dsv41_engine_found = lambda: (Path("/x/engine-dsv41/0.1.49.2-a/strata-dsv41"), True)
+        self.assertIsNone(r.resolved_speed())                                            # engine below 0.1.50: no line, no flag
+        self.assertEqual(r.speed_line(), "")
+
     def test_the_engines_own_line_wins_in_the_summary(self):
         r = self.runner(12)
         self.assertIn("Faster (default on this PC)", r.speed_line(5))
@@ -245,7 +275,7 @@ class Screen(unittest.TestCase):
     def test_the_screen_offers_two_choices_and_remembers_only_a_change(self):
         ctx = make_ctx()
         ctx.settings.family, ctx.settings.model = "deepseek41", "IST-DAS-2.00bpw"
-        faster_here = S.faster_default(used_vram_gb(ctx.computer, ctx.settings))
+        faster_here = faster_by_default(ctx.computer, ctx.settings)
         ctx._speed_ok = True
         app = LaunchApp(ctx)
 
