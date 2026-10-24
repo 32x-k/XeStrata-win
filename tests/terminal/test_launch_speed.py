@@ -9,7 +9,7 @@ from unittest import mock
 
 from strata_cli.launch import settings as S
 from strata_cli.launch.app import LaunchApp
-from strata_cli.launch.runner import Runner, apply_experts, derive_config
+from strata_cli.launch.runner import Runner, apply_experts, derive_config, experts_from_log, used_vram_gb
 from strata_cli.launch.screens import SpeedScreen, flow_for
 from tests.terminal import test_launch as TL
 from tests.terminal.launch_support import Home, text_of
@@ -20,9 +20,9 @@ run_cli = TL.run_cli
 
 class Words(unittest.TestCase):
     def test_the_default_is_faster_up_to_16_gb_of_graphics_memory(self):
-        for gb in (8, 12, 15.9, 16, 16.4):
+        for gb in (8, 12, 15.9, 16.0):                       # the engine's rule: 16 GiB or less (17,179,869,184 bytes)
             self.assertTrue(S.faster_default(gb), gb)
-        for gb in (20, 24, 48, 0, None):
+        for gb in (16.01, 16.4, 20, 24, 48, 0, None):
             self.assertFalse(S.faster_default(gb), gb)
 
     def test_plain_words_and_the_quality_note(self):
@@ -57,22 +57,50 @@ class EngineFlag(unittest.TestCase):
 
 
 class Resolve(unittest.TestCase):
-    def runner(self, vram_gb, **kw):
+    def runner(self, *cards, **kw):
         cat = mock.Mock()
         cat.strata.multi_family.return_value = True
-        cat.computer.return_value = mock.Mock(total_vram_gb=vram_gb)
+        gpus = [{"index": i, "vram_gb": gb} for i, gb in enumerate(cards)]
+        cat.computer.return_value = mock.Mock(usable_gpus=gpus)
         return Runner(S.LaunchSettings(family="deepseek41", model="IST-DAS-2.00bpw", **kw), catalog=cat, emit=lambda e: None)
 
-    def test_a_12_gb_pc_gets_faster_and_a_big_one_full_quality_by_default(self):
+    def test_a_12_gb_pc_gets_faster_and_a_big_one_full_quality_in_the_words(self):
         self.assertEqual(self.runner(12).resolved_speed(), ("faster", True))
-        self.assertEqual(self.runner(12).experts_flag(), 5)
         self.assertEqual(self.runner(96).resolved_speed(), ("full", True))
-        self.assertEqual(self.runner(96).experts_flag(), 6)
+        self.assertEqual(self.runner(8, 8).resolved_speed(), ("faster", True))         # summed over the cards, as the engine sums them
+        self.assertEqual(self.runner(12, 12).resolved_speed(), ("full", True))
 
-    def test_a_choice_wins_over_the_default(self):
-        self.assertEqual(self.runner(12, speed="full").resolved_speed(), ("full", False))
+    def test_nothing_is_passed_to_the_engine_unless_the_person_chose(self):
+        for cards in ((12,), (96,), (8, 8)):
+            self.assertIsNone(self.runner(*cards).experts_flag(), cards)                # the engine's --experts auto decides: one rule
         self.assertEqual(self.runner(12, speed="full").experts_flag(), 6)
         self.assertEqual(self.runner(96, speed="faster").experts_flag(), 5)
+
+    def test_a_choice_wins_over_the_default_in_the_words(self):
+        self.assertEqual(self.runner(12, speed="full").resolved_speed(), ("full", False))
+
+    def test_only_the_cards_the_launch_uses_are_summed(self):
+        comp = mock.Mock(usable_gpus=[{"index": 0, "vram_gb": 12}, {"index": 1, "vram_gb": 24}])
+        self.assertEqual(used_vram_gb(comp, S.LaunchSettings()), 36)
+        self.assertEqual(used_vram_gb(comp, S.LaunchSettings(gpus=[0])), 12)
+        self.assertEqual(used_vram_gb(comp, S.LaunchSettings(gpu_roles={"0": "main", "1": "off"})), 12)
+
+    def test_the_engines_own_line_wins_in_the_summary(self):
+        r = self.runner(12)
+        self.assertIn("Faster (default on this PC)", r.speed_line(5))
+        self.assertIn("Full quality (default on this PC)", r.speed_line(6))             # the engine said 6 although the rule here said Faster
+        self.assertIn("Full quality: all 6 experts per word", self.runner(12, speed="full").speed_line(5))   # a choice stays what was chosen
+
+    def test_the_number_is_read_back_from_the_engine_log(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "e.log"
+            log.write_text("ds4: loading\nds4: experts per word: 6\nlater\nds4: experts per word: 5\n", encoding="utf-8")
+            self.assertEqual(experts_from_log(log), 5)
+            log.write_text("nothing here\n", encoding="utf-8")
+            self.assertIsNone(experts_from_log(log))
+            self.assertIsNone(experts_from_log(Path(d) / "missing.log"))
 
     def test_the_line_has_the_note_only_for_faster(self):
         self.assertIn(S.FASTER_NOTE, self.runner(12).speed_line())
@@ -138,6 +166,7 @@ class Screen(unittest.TestCase):
     def test_the_screen_offers_two_choices_and_remembers_only_a_change(self):
         ctx = make_ctx()
         ctx.settings.family, ctx.settings.model = "deepseek41", "IST-DAS-2.00bpw"
+        faster_here = S.faster_default(used_vram_gb(ctx.computer, ctx.settings))
         app = LaunchApp(ctx)
 
         async def go():
@@ -152,7 +181,7 @@ class Screen(unittest.TestCase):
                 screen = app.screen
                 self.assertIsInstance(screen, SpeedScreen)
                 screen.commit()
-                self.assertEqual(ctx.settings.speed, None if S.faster_default(ctx.computer.total_vram_gb) else "faster")
+                self.assertEqual(ctx.settings.speed, None if faster_here else "faster")
                 await press(pilot, "down")
                 screen.commit()
                 self.assertIn(ctx.settings.speed, (None, "full"))

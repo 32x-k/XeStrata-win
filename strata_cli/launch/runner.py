@@ -398,6 +398,33 @@ def cards_for_launch(s: S.LaunchSettings, catalog, ram_gb: float | None = None, 
         return None
 
 
+def used_vram_gb(computer, s: "S.LaunchSettings") -> float:
+    """Graphics memory (GiB) of the cards this launch uses, summed as the engine sums it: the cards named (--gpu, the Cards step; a role other than
+    off), else every card that can be used."""
+    cards = list(computer.usable_gpus)
+    chosen = None
+    if s.gpu_roles:
+        chosen = {int(k) for k, v in s.gpu_roles.items() if str(v) != "off"}
+    elif s.gpus:
+        chosen = {int(g) for g in s.gpus}
+    if chosen is not None:
+        cards = [c for c in cards if int(c.get("index", 0)) in chosen]
+    return sum(float(c.get("vram_gb") or 0) for c in cards)
+
+
+EXPERTS_LINE = re.compile(r"experts per word: (\d+)")
+
+
+def experts_from_log(path) -> int | None:
+    """The engine's own answer, read back from its startup line "experts per word: N" (the last one in the log), None when it is not there."""
+    try:
+        data = Path(path).read_bytes()[-262144:].decode("utf-8", "replace")
+    except (OSError, TypeError, ValueError):
+        return None
+    found = EXPERTS_LINE.findall(data)
+    return int(found[-1]) if found else None
+
+
 def apply_experts(cfg: dict, experts: int | None) -> None:
     """DeepSeek's speed choice as the engine flag: --experts 5 (Faster) or --experts 6 (Full quality), replacing one already in the saved args."""
     if experts is None or not isinstance(cfg.get("args"), list):
@@ -1921,12 +1948,12 @@ class Runner:
         return out
 
     def resolved_speed(self) -> tuple[str, bool] | None:
-        """DeepSeek's speed: ("faster" | "full", whether it is the default for this PC); None for any other model. Faster is the default on a PC
-        with 16 GB of graphics memory or less."""
+        """DeepSeek's speed: ("faster" | "full", whether it is the default for this PC); None for any other model. The default is the engine's own
+        rule (`--experts auto`: 5 when the cards used total 16 GiB or less); only an explicit choice is written as --experts."""
         if not self.multi_file():
             return None
         try:
-            default = S.faster_default(self.catalog.computer().total_vram_gb)
+            default = S.faster_default(used_vram_gb(self.catalog.computer(), self.s))
         except Exception:                                    # noqa: BLE001 - when the cards cannot be read, the engine's own default stands
             default = False
         if self.s.speed in S.SPEED_MODES:
@@ -1934,15 +1961,20 @@ class Runner:
         return ("faster" if default else "full"), True
 
     def experts_flag(self) -> int | None:
-        """The value of the engine's --experts for this launch (5 or 6), None for a model that has no such choice."""
-        speed = self.resolved_speed()
-        return None if speed is None else (5 if speed[0] == "faster" else 6)
+        """The engine's --experts for this launch: 5 or 6 only when the person chose; None (nothing is passed, the engine's `--experts auto`
+        decides) when they did not, and for a model that has no such choice."""
+        if self.resolved_speed() is None or self.s.speed not in S.SPEED_MODES:
+            return None
+        return 5 if self.s.speed == "faster" else 6
 
-    def speed_line(self) -> str:
-        """The speed line of --plan and of the summary, in plain words, with the quality note when it is Faster."""
+    def speed_line(self, engine_experts: int | None = None) -> str:
+        """The speed line of --plan and of the summary, in plain words, with the quality note when it is Faster. `engine_experts`: what the
+        running engine said at its start ("experts per word: N"); it wins over the rule above, so the words are always the engine's."""
         speed = self.resolved_speed()
         if speed is None:
             return ""
+        if engine_experts is not None and not self.s.speed:
+            speed = ("faster" if engine_experts < 6 else "full", True)
         text = "Speed: " + S.speed_words(speed[0], speed[1])
         return text + (". " + S.FASTER_NOTE if speed[0] == "faster" else "")
 

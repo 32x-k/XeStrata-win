@@ -29,13 +29,14 @@ MTP_MODES = ("on", "off")
 #: strata_control/drafting.py MODES (tests/terminal/test_drafting.py keeps the two the same)
 DRAFTING_MODES = ("auto", "mtp", "dflash2", "off")
 SPEED_MODES = ("faster", "full")             # DeepSeek: 5 experts per word (Faster) or all 6 (Full quality)
-FASTER_VRAM_GB = 16.5                         # Faster is the default on a PC with this much graphics memory or less (the owner's 0.2.4.3 decision)
+FASTER_VRAM_GIB = 16.0                        # the engine's rule (src/dsv41/ds4_experts_rule.hpp): `--experts auto` is 5 when the cards used total 16 GiB or less
 FASTER_NOTE = "Faster uses 5 of 6 experts per word: a small quality change, usually not noticeable."
 
 
 def faster_default(total_vram_gb: float | None) -> bool:
-    """Faster is the default on a PC with 16 GB of graphics memory or less, in all (the cards that can be used together)."""
-    return bool(total_vram_gb) and float(total_vram_gb) <= FASTER_VRAM_GB
+    """Mirrors the engine's `--experts auto`: Faster (5 experts) when the cards the launch uses total 16 GiB (17,179,869,184 bytes) or less.
+    The engine decides at its start; this only says the same thing in the screens and in --plan, so the two never disagree."""
+    return bool(total_vram_gb) and float(total_vram_gb) <= FASTER_VRAM_GIB
 
 
 def speed_words(speed: str, default: bool) -> str:

@@ -839,9 +839,12 @@ def run_launch(a: argparse.Namespace) -> int:
             from strata_cli.launch import access
             _say(f"  {'API key':<14} {access.mask_key(result.key)}   (show it: strata launch --show-key"
                  + (f" --preset \"{s.name}\")" if (a.preset or a.save_preset) else ")"))
-        speed_line = runner.speed_line() if hasattr(runner, "speed_line") else ""
-        if speed_line and not isinstance(speed_line, str):
-            speed_line = ""
+        speed_line = ""
+        if hasattr(runner, "speed_line"):
+            from strata_cli.launch.runner import experts_from_log
+            speed_line = runner.speed_line(experts_from_log(_engine_log_of(result.config) or None))
+            if not isinstance(speed_line, str):
+                speed_line = ""
         if speed_line:
             _say(f"  {'Speed':<14} {speed_line.replace('Speed: ', '', 1)}")
         engine_log = _engine_log_of(result.config)

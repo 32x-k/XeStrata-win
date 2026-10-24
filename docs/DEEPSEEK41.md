@@ -90,7 +90,7 @@ Not in this version: several requests at once (`--parallel` is ignored with a wa
 
 ## Speed: Faster or Full quality
 
-DeepSeek picks 6 experts for every word it writes. **Faster** uses 5 of them (engine flag `--experts 5`): a small quality change, usually not noticeable, and answers come sooner. It is the default on a PC with 16 GB of graphics memory or less. **Full quality** uses all 6 (`--experts 6`).
+DeepSeek picks 6 experts for every word it writes. **Faster** uses 5 of them (engine flag `--experts 5`): a small quality change, usually not noticeable, and answers come sooner. It is the default on a PC whose graphics cards total 16 GiB or less: the engine decides that itself (`--experts auto`), and Strata passes `--experts` only when you choose. **Full quality** uses all 6 (`--experts 6`).
 
 In `strata launch` the guided screens have a Speed step for DeepSeek; with flags use `--speed faster|full`, or `--full-quality` in scripts. `strata launch --plan` shows which one this PC gets.
 
