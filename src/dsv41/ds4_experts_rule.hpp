@@ -2,7 +2,7 @@
 //
 // The model routes every word to its top 6 experts.  On a PC with a small graphics card the CPU lane and the SSD set the speed, and
 // each expert dropped saves their bytes: the router's top N are kept and their weights renormalised (the same selection the full
-// model makes, a shorter list).  The default is 5 where the graphics memory is 16 GiB or less, the model's own count elsewhere;
+// model makes, a shorter list).  The default is 5 where the graphics memory is 16 GiB or less, or the GPU shares the PC's RAM, the model's own count elsewhere;
 // --experts N says it outright (--experts 6: full quality), DS4_TOPK=N is the test override over everything.
 #pragma once
 
@@ -15,11 +15,12 @@ constexpr uint64_t kFasterModeVramMax = 16ull << 30;   // GiB of graphics memory
 constexpr int kFasterModeExperts = 5;
 
 // requested: --experts (-1: not given, the rule decides); vram_bytes: the total memory of the cards the engine uses;
-// model_k: the experts a word takes in the model.  The result is in 1 .. model_k.
-inline int experts_per_word(int requested, uint64_t vram_bytes, int model_k) {
+// model_k: the experts a word takes in the model; integrated: a GPU that shares the PC's RAM (Strix Halo: part of the experts live only on
+// the SSD, each expert dropped is less read - measured 5 against 6 on a Radeon 8065S: decode +11..13%, prompts +5..7%).  The result is in 1 .. model_k.
+inline int experts_per_word(int requested, uint64_t vram_bytes, int model_k, bool integrated = false) {
     if (model_k <= 1) return model_k;
     int n = requested;
-    if (n < 1) n = vram_bytes != 0 && vram_bytes <= kFasterModeVramMax ? kFasterModeExperts : model_k;
+    if (n < 1) n = integrated || (vram_bytes != 0 && vram_bytes <= kFasterModeVramMax) ? kFasterModeExperts : model_k;
     if (n > model_k) n = model_k;
     return n < 1 ? 1 : n;
 }

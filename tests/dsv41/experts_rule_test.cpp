@@ -30,6 +30,12 @@ int main() {
     CHECK_EQ(experts_per_word(-1, 24 * GiB, 6), 6);
     CHECK_EQ(experts_per_word(-1, 4 * 32 * GiB, 6), 6);
     CHECK_EQ(experts_per_word(-1, 2 * 12 * GiB, 6), 6);   // two 12 GB cards hold 24 GiB in all
+    // a GPU that shares the PC's RAM (Strix Halo, ~91 GiB visible): faster mode whatever the size; discrete cards by size only
+    CHECK_EQ(experts_per_word(-1, 91 * GiB, 6, true), 5);
+    CHECK_EQ(experts_per_word(-1, 24 * GiB, 6, false), 6);   // a discrete 24 GB card
+    CHECK_EQ(experts_per_word(-1, 12 * GiB, 6, false), 5);   // a discrete 12 GB card
+    CHECK_EQ(experts_per_word(6, 91 * GiB, 6, true), 6);     // --experts 6 wins on the unified-memory GPU too
+    CHECK_EQ(experts_per_word(-1, 91 * GiB, 4, true), 4);    // never raised
     // unknown memory (0): the model's count, never a silent cut
     CHECK_EQ(experts_per_word(-1, 0, 6), 6);
     // the flag decides, both ways
