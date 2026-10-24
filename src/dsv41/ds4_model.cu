@@ -4454,17 +4454,27 @@ struct Model::Impl {
         return s.str();
     }
 
+    // The most the automatic store may take: all of the trunk's routed experts (the CPU lane's are a part of them; a store larger
+    // than they are is never filled), never less than the old 48 GB.  A PC whose free RAM holds them all (the 251 GB R9700 box:
+    // 115 GB of CPU-lane experts, 1 card, 2.00 set: 12.6 -> 21.4 tokens/s with the whole set resident, misses 15.4 -> 1.5 a token)
+    // gets every one; the RAM that the room below leaves (free - 12 GB) is what bounds it elsewhere.
+    double store_cap_gb() const {
+        double b = 0;
+        for (const auto& kt : pk.t)
+            if (kt.first.find(".ffn.experts.") != std::string::npos && kt.first.rfind("mtp.", 0) != 0) b += (double) kt.second.bytes;
+        return std::max(48.0, b / 1e9);
+    }
     double store_gb() const {
         static double cached = -2.0;   // (decided once: the layout of the blobs depends on it)
         if (cached > -1.5) return cached;
         double gb = o.ssd_cache_gb;
         if (const char* v = std::getenv("DS4_STORE_GB")) gb = std::atof(v);
         if (!pk.gguf) gb = 0.0;
-        else if (gb < 0.0) {   // auto: the RAM free now less 12 GB for the system and the owner's programs, 48 GB at most
+        else if (gb < 0.0) {   // auto: the RAM free now less 12 GB for the system and the owner's programs, all the experts at most
             const uint64_t avail = ram_avail();
             avail0_ = avail;
             const double room = avail == ~uint64_t{0} ? 0.0 : (double) avail / 1e9 - 12.0;
-            gb = room >= 4.0 ? std::min(48.0, room) : 0.0;
+            gb = room >= 4.0 ? std::min(store_cap_gb(), room) : 0.0;
         }
         return cached = gb;
     }
@@ -4482,7 +4492,7 @@ struct Model::Impl {
         const bool uma = avail0_ != ~uint64_t{0} && avail0_ > avail && (double) (avail0_ - avail) / 1e9 >= 4.0;
         const double ctx_gb = uma ? 1.1e-4 * std::max(0.0, (double) o.max_context - 16384.0) : 0.0;
         const double room = (double) avail / 1e9 - 12.0 - ctx_gb;
-        const double now = room >= 4.0 ? std::min(48.0, room) : 0.0;
+        const double now = room >= 4.0 ? std::min(store_cap_gb(), room) : 0.0;
         if (now < gb)
             std::fprintf(stderr, "ds4: RAM store: %.1f GB of RAM free after the GPU's weights: store sized %.1f GB, not %.1f\n",
                          (double) avail / 1e9, now, gb);
