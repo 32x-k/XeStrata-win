@@ -1,4 +1,4 @@
-import { copyAndTell } from '../lib/copy-text';
+import { copyText } from '../lib/clipboard';
 import { tr } from '../lib/i18n';
 import { appBaseUrl } from '../lib/connect-urls';
 import { deviceLabel, instanceLabel } from '../lib/runtime-models';
@@ -9,7 +9,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Btn, Dialog, Empty, Icon, IconBtn, Seg, Select, ErrorNotice } from '../components/ui';
 import { Screen, SectionHead } from '../components/layout';
 import { clockTime, duration, tokens } from '../lib/format';
-import { cancelRequest, setLocalSharing, setServingAccess, useStore } from '../lib/store';
+import { cancelRequest, setLocalSharing, setServingAccess, useStore, pushToast } from '../lib/store';
 export function ServingScreen() {
     const serving = useStore(s => s.serving);
     const storedRuntime = useStore(s => s.runtime), hardware = useStore(s => s.hardware);
@@ -74,7 +74,7 @@ export function ServingScreen() {
         }
     }
     async function copyConnectionValue(value: string, label: string) {
-        await copyAndTell(value, label);
+        await copyText(value, label, { toast: pushToast });
     }
     const code = `curl ${serving.baseUrl}${protocol === 'responses' ? '/responses' : protocol === 'openai' ? serving.endpoints.openai : serving.endpoints.anthropic} \\\n  -H 'Content-Type: application/json'${serving.access.apiKeySet ? " \\\n  -H 'Authorization: Bearer YOUR_API_KEY'" : ''} \\\n  -d '${JSON.stringify({ model: loaded?.apiModelId ?? 'YOUR_MODEL_ID', ...(protocol === 'responses' ? { input: 'Hello', store: false } : { ...(protocol === 'anthropic' ? { max_tokens: 256 } : {}), messages: [{ role: 'user', content: 'Hello' }] }) }, null, 2)}'`;
     return <Screen title={tr("Serving")} actions={<><Btn icon="link" onClick={() => setCloudflareOpen(true)}>{tr("Cloudflare tunnel")}</Btn><IconBtn name="info" title={tr("Connection guide")} onClick={() => setGuide(true)}/></>}><div className="stack stack--lg">
