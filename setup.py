@@ -249,6 +249,9 @@ GYRO_FILES = {
         (58487015808, "c6ea1b08ca312f99095b27588ba35976b53f948268e7f91e7761926aa01d9c87"),
     "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf":
         (91965774272, "7aa36d15131d255179ab6c87fa9c9f81a0b541fc9e81e959d4c3e29eb20feb5f"),
+    # 2026-10-12: TQP5 / TQP6 / TQP7 experts (pair trellis, as Gyro-Coder-L's), the 8-bit n-gram table of 10-13
+    "Qwen3.8-Flash-Next-Gyro-L-TQ3_0.gguf":
+        (108323559808, "5428a5646eaeaa56cc00a892f92e7546aeadb255233503969ad25cf48c7f359b"),
 }
 # agentionai's Gyro-Coder (2026-10-21): 256 of each layer's 512 experts kept for code, the rest as Gyro's.  Coder-L's
 # experts are TQP5 / TQP6 / TQP7 (pair trellis, 3.2 bits a weight), Coder's TQ2_T (2.1 bits).
@@ -316,6 +319,10 @@ MODELS: dict[str, dict[str, Any]] = {
                         "VRAM together)",
                "download_gb": 92.0, "ram_gb": 42.1, "arena_gb": 32.1, "families": ("gyro",),
                "file": "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf", "shards": 1, "vision": True},
+    "Gyro-L": {"about": "the best of the Gyro sizes, close to IQ3_S, slower than Gyro-M (59 GB of RAM, or 61 GB of RAM "
+                        "and VRAM together)",
+               "download_gb": 108.3, "ram_gb": 58.4, "arena_gb": 48.4, "families": ("gyro",),
+               "file": "Qwen3.8-Flash-Next-Gyro-L-TQ3_0.gguf", "shards": 1, "vision": True},
     # Gyro-Coder (agentionai): the same memory rule
     "Gyro-Coder-L": {"about": "half the experts, kept for code, at 3.2 bits (35 GB of RAM, or 37 GB of RAM and VRAM "
                               "together); weaker outside coding",
@@ -530,8 +537,8 @@ FAMILIES: dict[str, dict[str, Any]] = {
                 "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS}},
     # agentionai's Gyro quantizations (see GYRO_FILES): after the regular families, never the default
     "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)", "by": "Gyro quantizations by agentionai",
-             "about": "Gyro-S (36 GB of RAM, or 38 GB of RAM and VRAM together) and Gyro-M (43 or 45 GB): for PCs "
-                      "with little memory; 58 and 92 GB downloads (the files include the n-gram table)",
+             "about": "Gyro-S (36 GB of RAM, or 38 GB of RAM and VRAM together), Gyro-M (43 or 45 GB) and Gyro-L "
+                      "(59 or 61 GB): 58, 92 and 108 GB downloads (the files include the n-gram table)",
              "hf": hf("agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"), "file": "Qwen3.8-Flash-Next-{q}.gguf", "shards": 1,
              "tag": "gyro-", "name": "qwen3.8-flash-next-gyro", "vision": True, "pack_args": ["--compat-bf16"],
              "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"), "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",

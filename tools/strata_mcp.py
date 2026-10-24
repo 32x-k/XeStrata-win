@@ -85,6 +85,9 @@ FALLBACK_MODELS = {
     "Gyro-M": {"about": "about IQ3_XXS quality with about 20% less GPU memory (43 GB of RAM, or 45 GB of RAM and "
                         "VRAM together)",
                "download_gb": 92.0, "ram_gb": 42.1, "arena_gb": 32.1, "families": ("gyro",), "vision": True},
+    "Gyro-L": {"about": "the best of the Gyro sizes, close to IQ3_S, slower than Gyro-M (59 GB of RAM, or 61 GB of RAM "
+                        "and VRAM together)",
+               "download_gb": 108.3, "ram_gb": 58.4, "arena_gb": 48.4, "families": ("gyro",), "vision": True},
     "Gyro-Coder-L": {"about": "half the experts, kept for code, at 3.2 bits (35 GB of RAM, or 37 GB of RAM and VRAM "
                               "together); weaker outside coding",
                      "download_gb": 84.0, "ram_gb": 34.2, "arena_gb": 24.2, "families": ("gyro-coder",),
@@ -105,8 +108,8 @@ FALLBACK_FAMILIES = {
                                                                   "(UD-Q4_K_XL, 111 GB: experimental)",
                 "tag": "unsloth-", "vision": False},
     "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)",
-             "about": "Gyro-S (36 GB of RAM, or 38 GB of RAM and VRAM together) and Gyro-M (43 or 45 GB): for PCs "
-                      "with little memory",
+             "about": "Gyro-S (36 GB of RAM, or 38 GB of RAM and VRAM together), Gyro-M (43 or 45 GB) and Gyro-L "
+                      "(59 or 61 GB)",
              "tag": "gyro-"},
     "gyro-coder": {"title": "Qwen3.8-Flash-Next Gyro-Coder",
                    "about": "half the experts (kept for code): Gyro-Coder-L (35 GB of RAM, or 37 GB of RAM and VRAM "
