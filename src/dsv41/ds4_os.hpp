@@ -77,7 +77,13 @@ inline fd_t open_direct(const std::string& path) {
     return h == INVALID_HANDLE_VALUE ? kBadFd : (fd_t) h;
 #else
     const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
-    return fd < 0 ? kBadFd : (fd_t) fd;
+    if (fd < 0) return kBadFd;
+#if defined(__APPLE__)
+    // (O_DIRECT is 0 here: without F_NOCACHE these reads went through the unified buffer cache at 3.4 GB/s; the disk does 10-18 GB/s
+    // unbuffered, and the experts' pages no longer push the CPU lane's hot ones out of the cache)
+    if (std::getenv("DS4_MAC_BUFFERED_READS") == nullptr) fcntl(fd, F_NOCACHE, 1);
+#endif
+    return (fd_t) fd;
 #endif
 }
 /// [off, off + n) through an unbuffered descriptor into dst, a kDirectAlign-aligned buffer of at least

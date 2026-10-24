@@ -91,6 +91,7 @@ public:
     // no-copy buffer over the pages it spans, made resident.  0: not mappable (the cap on buffers is reached, or the pages are not
     // ours).  The first dispatch that reads cold pages waits for them (the buffer is wired on use).
     uint64_t zc_map(const void* p, size_t bytes);
+    Pipeline pipeline_uncached(int lib, const std::string& fn, const Constants& c);
     size_t zc_count() const;
     uint64_t allocated() const { return allocated_; }   // bytes of alloc() + wrap() buffers so far
 

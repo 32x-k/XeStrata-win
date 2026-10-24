@@ -426,6 +426,27 @@ uint64_t Context::zc_map(const void* p, size_t bytes) {
 size_t Context::zc_count() const { std::lock_guard<std::mutex> lk(g_zc_mu); return g_zc.size(); }
 
 Pipeline Context::pipeline(int lib, const std::string& fn, const Constants& c) {
+    // (cached: the host helpers ask for the same pipeline a dispatch at a time; newComputePipelineState costs ~0.3 ms and
+    // [MTLDevice name] reads the preferences - the prompt path's expert copies (3 a streamed expert) spent seconds there)
+    static std::mutex cache_mu;
+    static std::map<std::string, Pipeline> cache;
+    std::string key = std::to_string(lib) + "|" + fn;
+    for (const auto& v : c.vals) key += "|" + std::to_string(v.index) + ":" + std::to_string(v.type) + ":" + std::to_string(v.v);
+    key += "|" + std::to_string((uintptr_t) this);
+    {
+        std::lock_guard<std::mutex> lk(cache_mu);
+        auto it = cache.find(key);
+        if (it != cache.end()) return it->second;
+    }
+    Pipeline made = pipeline_uncached(lib, fn, c);
+    {
+        std::lock_guard<std::mutex> lk(cache_mu);
+        cache[key] = made;
+    }
+    return made;
+}
+
+Pipeline Context::pipeline_uncached(int lib, const std::string& fn, const Constants& c) {
     NSError* err = nil;
     id<MTLFunction> f;
     NSString* name = [NSString stringWithUTF8String:fn.c_str()];
@@ -479,7 +500,7 @@ Pipeline Context::pipeline(int lib, const std::string& fn, const Constants& c) {
             p.name += (i ? "," : "") + std::to_string(c.vals[i].index) + "=" + std::to_string((int)c.vals[i].v);
         p.name += "}";
     }
-    g_device_name = [[impl_->dev name] UTF8String];
+    if (g_device_name == "unknown GPU") g_device_name = [[impl_->dev name] UTF8String];
     return p;
 }
 
