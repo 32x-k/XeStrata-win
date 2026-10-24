@@ -172,7 +172,7 @@ Com menos RAM do que a linha indica, ainda pode funcionar, só que mais devagar:
 
 Um modelo bem maior, que roda numa única placa de vídeo de 12 GB com 46 a 64 GB de RAM. O Strata mantém na memória as partes mais
 usadas e lê o resto do seu SSD. A [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)
-fez os conjuntos. Ele roda em placas NVIDIA RTX das séries 30 a 50 e na Radeon AI PRO R9700. Escolha no `strata launch`. O
+fez os conjuntos. Ele roda em placas NVIDIA RTX das séries 30, 40 e 50 e na Radeon AI PRO R9700. Escolha no `strata launch`. O
 app de desktop ainda não o oferece.
 
 | Conjunto | Download | Qualidade | Escreve código a |
