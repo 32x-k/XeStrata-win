@@ -925,7 +925,8 @@ class Runner:
         if not (s.family and s.model):
             raise LaunchError("No model was chosen.", "Choose a model, or use --model NAME (strata launch --help lists them).", 2)
         path, desc = self.installed_state()
-        if path is not None and desc is not None and desc_matches(desc, s) and not files_present(read_config(path)):
+        if path is not None and desc is not None and desc_matches(desc, s) and not files_present(read_config(path)) \
+                and not self.dsv41_engine_missing(read_config(path)):
             if self.installed_serves_request(path):
                 self.emit("model", f"{s.family} {s.model} is already installed with these choices.", 100)
                 return path
@@ -1219,6 +1220,7 @@ class Runner:
         base = read_config(base_path)
         cfg = derive_config(base, self.s, bool_flags=tune_knobs.BOOL_FLAGS,
                             log=str(launch_dir() / f"{self.name}.engine.log"), gpus=cards_for_launch(self.s, self.catalog, base=base))
+        self.use_own_dsv41_engine(cfg)
         out = launch_dir() / f"{self.name}.json"
         write_private(out, cfg)
         self.config_path = out
@@ -1837,6 +1839,34 @@ class Runner:
         except Exception:                                    # noqa: BLE001
             return ""
 
+    def dsv41_engine_missing(self, cfg: dict) -> bool:
+        """An installed DeepSeek model whose config names an engine that is gone (an older package folder an update removed, or another install's) while
+        this install has no DeepSeek engine package either: not 'already installed' - setup runs, which fetches the package through the feed or says in
+        one plain line what to do (--dsv41-package, or the engine-dsv41 folder), instead of the start failing on a missing file."""
+        if cfg.get("arch") != "deepseek41":
+            return False
+        exe = str(cfg.get("exe") or "")
+        if exe and Path(exe).is_file():
+            return False
+        return self.dsv41_engine_found()[0] is None
+
+    def use_own_dsv41_engine(self, cfg: dict) -> None:
+        """DeepSeek: the run config's engine is the DeepSeek engine package of THIS install (engine-dsv41/ here), not the path the installed model's
+        config was written with: that config can come from another Strata install on this computer (the model is shared between installs) or name
+        an older package folder that an update has replaced.  Only when this install has no package does the config's own path stay."""
+        if cfg.get("arch") != "deepseek41":
+            return
+        found, _known = self.dsv41_engine_found()
+        if found is None:
+            return
+        old = str(cfg.get("exe") or "")
+        if os.path.normcase(os.path.normpath(old)) != os.path.normcase(os.path.normpath(str(found))):
+            cfg["exe"] = str(found)
+            if old:
+                self.notices.append("DeepSeek runs on this install's own engine package, not the one the model's earlier settings named.")
+        libs = [d for d in (cfg.get("lib_dirs") or []) if "engine-dsv41" not in str(d)]
+        cfg["lib_dirs"] = [*libs, str(Path(found).parent)]          # its own folder carries the libraries it needs
+
     def dsv41_engine_found(self) -> tuple[Path | None, bool | None]:
         """(strata-dsv41 already installed, or None; whether the engine can be told at all).  Looks where setup puts DeepSeek's own engine package
         (engine-dsv41/ beside the engine, in Strata's own folder, and in the data folder), and at STRATA_DSV41_EXE (a build of your own)."""
@@ -1844,7 +1874,7 @@ class Runner:
         own = (os.environ.get("STRATA_DSV41_EXE") or "").strip()
         if own:
             return (Path(own) if Path(own).is_file() else None), True
-        folders: list[Path] = []
+        folders: list[Path] = [Path(self.catalog.root) / dsv41_engine.DIR]       # this install's own package first
         try:
             from strata_control import engine_component as ec
             rep = ec.status()
