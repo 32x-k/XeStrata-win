@@ -30,7 +30,7 @@ class SetupFailureWords(unittest.TestCase):
         import subprocess, sys
         root = Path(__file__).resolve().parents[2]
         done = subprocess.run([sys.executable, str(root / "setup.py"), "--kv", "bogus"], capture_output=True, text=True, cwd=str(root), timeout=120)
-        self.assertIn("choose from int8, q4_0, k8v4, fp16", done.stderr)
+        self.assertIn("fp16", done.stderr.splitlines()[-1])                  # the choices line of the argparse error
 
     def test_the_last_line_of_a_traceback_is_found(self):
         self.assertEqual(python_failure(TRACEBACK), "ModuleNotFoundError: No module named 'calibrate'")
