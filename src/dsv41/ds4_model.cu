@@ -1967,7 +1967,25 @@ struct Model::Impl {
             file_experts = exp_b - std::max(0.0, room - other_b) + (double) kRamMargin > (double) ram_avail();
         }
         const bool own_default = !(par || o.tp > 1);   // (the single-card default run the chunked path newly takes: chunks of 1024 - 8K prompt 370 tok/s on 4 x R9700, 214 at 8192; the threads / tp runs keep theirs)
-        chunk = prompt_par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : own_default ? 1024 : file_experts ? kVlRows : 2048) : 0;
+        // the chunk of the cases that are not the experts-read-in-place one (8192, measured best there): an explicit --tp 1 single card
+        // (was 1024) and the experts copied into RAM (was 2048) take 4096 from 10 GiB of VRAM (ds4_experts_rule.hpp)
+        int own_chunk = 1024, copy_chunk = 2048;
+        if (!devs.empty() && (own_default || !file_experts)) {
+            uint64_t vmin = ~0ull;
+            for (const Dev& dv : devs) vmin = std::min<uint64_t>(vmin, (uint64_t) dv.total);
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+            const bool hip_build = true;
+#else
+            const bool hip_build = false;
+#endif
+            own_chunk = prefill_chunk_default(vmin, hip_build, 1024);
+            copy_chunk = prefill_chunk_default(vmin, hip_build, 2048);
+            const int shown = own_default ? own_chunk : copy_chunk;
+            if (prompt_par && o.prefill_chunk < 0 && shown == 4096)
+                std::fprintf(stderr, "ds4: prompts in chunks of %d tokens (%.0f GiB of graphics memory: bigger chunks read the experts fewer times; "
+                                     "--prefill-chunk N changes it)\n", shown, (double) vmin / (double) (1ull << 30));
+        }
+        chunk = prompt_par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : own_default ? own_chunk : file_experts ? kVlRows : copy_chunk) : 0;
         const char* dc = std::getenv("DS4_CHUNK");   // (tests: down to 16, a short prompt in several chunks)
         if (dc != nullptr) chunk = prompt_par ? std::atoi(dc) : 0;
         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));
