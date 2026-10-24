@@ -75,34 +75,43 @@ void im2col3(const uint16_t* in16, int64_t H, int64_t W, int64_t C, int64_t p0, 
     });
 }
 
-// the group norm's partial sums: part[p][g] = the sum over pixel p's channels of group g of x - m, or of (x - m)^2
-// with `sq`, m the group's mean in stats[2 g] (0 without `sq`)
+// the group norm's partial sums over chunks of kGnChunk pixels, a work-group a chunk and group: part[k][g] = the sum
+// over chunk k's pixels and group g's channels of x - m, or of (x - m)^2 with `sq`, m the group's mean in stats[2 g]
+// (0 without `sq`).  A pixel a sum (the Flux2 VAE's millions of them) left gn_stats too long a loop
+constexpr int64_t kGnChunk = 1024;
+int64_t gn_chunks(int64_t HW) { return (HW + kGnChunk - 1) / kGnChunk; }
 void gn_partial(const float* x, const float* stats, int64_t HW, int64_t C, bool sq, float* part, void* s) {
-    const int64_t cg = C / kGroups;
-    q_of(s).parallel_for(sycl::range<1>((size_t) (HW * kGroups)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t p = i / kGroups, g = i - p * kGroups;
-        const float* r = x + p * C + g * cg;
+    constexpr int64_t local = 64;
+    const int64_t cg = C / kGroups, nk = gn_chunks(HW);
+    q_of(s).parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (nk * kGroups * local)),
+                                           sycl::range<1>((size_t) local)),
+                         [=](sycl::nd_item<1> it) {
+        const auto wg = static_cast<int64_t>(it.get_group_linear_id());
+        const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+        const int64_t k = wg / kGroups, g = wg - k * kGroups, p0 = k * kGnChunk;
+        const int64_t n = sycl::min(kGnChunk, HW - p0) * cg;
         const float m = sq ? stats[2 * g] : 0.f;
         float a = 0.f;
-        for (int64_t c = 0; c < cg; ++c) {
-            const float d = r[c] - m;
+        for (int64_t i = lane; i < n; i += local) {
+            const int64_t p = i / cg;
+            const float d = x[(p0 + p) * C + g * cg + i - p * cg] - m;
             a += sq ? d * d : d;
         }
-        part[i] = a;
+        a = sycl::reduce_over_group(it.get_group(), a, sycl::plus<float>());
+        if (lane == 0) part[wg] = a;
     });
 }
 
 // stats[g] = the mean of group g over every pixel from gn_partial's sums, or with `sq` 1 / std in stats[2 g + 1]: two
 // passes in FP32 (the mean, then the squares about it) where one pass would need FP64, which not every GPU has
 void gn_stats(const float* part, int64_t HW, int64_t C, bool sq, float* stats, void* s) {
-    const int64_t cg = C / kGroups;
+    const int64_t cg = C / kGroups, nk = gn_chunks(HW);
     const float inv_n = 1.f / (float) (HW * cg);
     q_of(s).parallel_for(sycl::range<1>((size_t) kGroups), [=](sycl::id<1> id) {
         const auto g = static_cast<int64_t>(id[0]);
-        float a = 0.f, comp = 0.f;   // Kahan's sum over up to 16384 pixels
-        for (int64_t p = 0; p < HW; ++p) {
-            const float y = part[p * kGroups + g] - comp, t = a + y;
+        float a = 0.f, comp = 0.f;   // Kahan's sum over the chunks
+        for (int64_t k = 0; k < nk; ++k) {
+            const float y = part[k * kGroups + g] - comp, t = a + y;
             comp = (t - a) - y;
             a = t;
         }
