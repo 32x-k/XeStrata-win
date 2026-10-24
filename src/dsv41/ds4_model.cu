@@ -3818,7 +3818,16 @@ struct Model::Impl {
                 cudaSetDevice(devs[(size_t) m].id);
                 size_t fr = 0, tot = 0;
                 CK(cudaMemGetInfo(&fr, &tot));
-                budget = std::min(budget, std::max(0.0, ((double) fr - (double) ((size_t) o.reserve_mib << 20))) *
+                // (an integrated GPU, Windows: its memory is the system's.  What it allocates after the experts - the long
+                // prompt's buffers, the GEMM workspaces - spills into RAM when the experts took every byte of the GPU's
+                // address space, and on a 32K prompt that ran the machine out of RAM.  So the experts leave room for them,
+                // growing with the context.  DS4_UMA_GPU_RESERVE_GB: that room, tests)
+                double uma_extra = 0.0;
+                if (commit_charged(devs[(size_t) m])) {
+                    uma_extra = (4.0 + 2.0e-4 * std::max(0.0, (double) o.max_context - 16384.0)) * (double) (1ull << 30);
+                    if (const char* v = std::getenv("DS4_UMA_GPU_RESERVE_GB")) uma_extra = std::atof(v) * (double) (1ull << 30);
+                }
+                budget = std::min(budget, std::max(0.0, ((double) fr - (double) ((size_t) o.reserve_mib << 20) - uma_extra)) *
                                               o.vram_experts);
                 charged = charged || commit_charged(devs[(size_t) m]);
             }
