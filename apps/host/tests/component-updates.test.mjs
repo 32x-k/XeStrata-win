@@ -103,6 +103,23 @@ test('createControl: the update calls ask the explicit commands; a failed step c
   await assert.rejects(failing.update({}), err => err.code === 'engine_serving' && /serving/.test(err.message) && err.exitCode === 7);
 });
 
+test('the Settings check says so, in plain words, when the own update check of the app fails, and keeps the raw text for Details', async () => {
+  const feed = (control = { installed: '0.2.5', offered: '0.2.5', status: 'current' }) => ({ version: '0.2.5', async updateCheck() { return { ok: true, feed: { sequence: 3 }, engine: { installed: { version: '0.1.50' }, offered: { version: '0.1.50' }, status: 'current' }, control, app: { status: 'not-in-feed' } }; } });
+  const failing = { check: async () => { throw new Error('error decoding response body for url (http://127.0.0.1:19090/latest.json)'); } };
+  const nothing = await checkComponentUpdates({ control: feed(), appUpdater: failing, appVersion: '0.2.5' });
+  assert.equal(nothing.strata.status, 'error', 'it no longer says "up to date" when the app could not be checked');
+  assert.match(nothing.strata.message, /couldn't check for a new version of the app itself/);
+  assert.doesNotMatch(nothing.strata.message, /decoding|http|latest\.json/, 'no raw text in the main line');
+  assert.match(nothing.strata.details, /error decoding response body/);
+  const withControl = await checkComponentUpdates({ control: feed({ installed: '0.2.5', offered: '0.2.6', status: 'available' }), appUpdater: failing, appVersion: '0.2.5' });
+  assert.equal(withControl.strata.status, 'available');
+  assert.match(withControl.strata.message, /new version of Strata is available.*couldn't check for a new version of the app itself/s);
+  assert.match(withControl.strata.details, /decoding/);
+  const fine = await checkComponentUpdates({ control: feed(), appUpdater: { check: async () => ({ available: false }) }, appVersion: '0.2.5' });
+  assert.equal(fine.strata.status, 'current');
+  assert.equal(fine.strata.details, undefined);
+});
+
 test('the Settings update check maps the feed to the existing result shape', async () => {
   const report = overrides => ({ ok: true, feed: { sequence: 3 }, engine: { installed: { version: '0.1.45' }, offered: { version: '0.1.46' }, status: 'available', download_bytes: 505 * (1 << 20) }, control: { installed: '0.1.45', offered: '0.1.45', status: 'current' }, app: { status: 'not-in-feed' }, ...overrides });
   const make = value => ({ version: '0.1.45', async updateCheck() { if (value instanceof Error) throw value; return value; } });
