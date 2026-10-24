@@ -380,12 +380,13 @@ void softmax_wg16(const float* sc, int64_t rows, int64_t n, float scale, uint16_
     });
 }
 
-// the latent tokens of a tile: zt [th tw][128] = z's rows y0 .. y0 + th, columns x0 .. x0 + tw (z w wide)
-void tile_gather(const float* z, int64_t w, int64_t y0, int64_t x0, int64_t th, int64_t tw, float* zt, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (th * tw * 128)), [=](sycl::id<1> id) {
+// a tile of x [..][w][C]: xt [th][tw][C] = x's rows y0 .. y0 + th, columns x0 .. x0 + tw
+void tile_gather(const float* x, int64_t w, int64_t C, int64_t y0, int64_t x0, int64_t th, int64_t tw, float* xt,
+                 void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (th * tw * C)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
-        const int64_t p = i / 128, c = i - p * 128, y = p / tw, x = p - y * tw;
-        zt[i] = z[((y0 + y) * w + x0 + x) * 128 + c];
+        const int64_t p = i / C, c = i - p * C, y = p / tw, xx = p - y * tw;
+        xt[i] = x[((y0 + y) * w + x0 + xx) * C + c];
     });
 }
 
@@ -637,8 +638,7 @@ bool MfVae::open(const std::string& path, void* stream, std::string& err, bool d
 }
 
 uint64_t MfVae::least_scratch_bytes(int64_t h, int64_t w) const {
-    if (!f2_) return scratch_bytes(h, w);
-    return std::min(f2_scratch_bytes(h, w), f2_tiled_bytes(h, w, std::min({h, w, kF2TileMin})));
+    return f2_ ? f2_least_bytes(h, w) : scratch_bytes(h, w);
 }
 
 uint64_t MfVae::scratch_bytes(int64_t h, int64_t w) const {
@@ -687,7 +687,8 @@ void MfVae::drop_scratch() {
         release(allocs_, p);
     f2_x_ = f2_y_ = f2_t_ = f2_q_ = nullptr;
     f2_qk16_ = f2_p16_ = nullptr;
-    f2_cap_ = f2_rows_ = 0;
+    f2_cap_ = F2Sizes();
+    f2_held_ = 0;
 }
 
 void MfVae::conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out) {
@@ -976,12 +977,17 @@ void MfVae::decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t l
     float* rgb = nullptr;
     if (!gpu::alloc_device(&rgb, (size_t) (3 * HW) * 4))
         throw std::runtime_error(std::string("image engine (Mage-VAE): GPU memory: ") + gpu::last_error());
-    int64_t t = 0;   // the Flux2 VAE's tile side in tokens, where the whole does not fit: the largest that does
-    if (f2_ && f2_scratch_bytes(h, w) > limit)
-        for (t = std::max(h, w) - 1; t > kF2TileMin && f2_tiled_bytes(h, w, t) > limit; --t) {
+    tiled_ = f2_ && f2_scratch_bytes(h, w) > limit;
+    if (tiled_) {   // the Flux2 VAE where the whole does not fit: the deepest front and largest tiles that do
+        auto [k, t] = f2_tiling(h, w, limit);
+        if (k < 0) {   // nothing fits: the least, which may still find the room
+            k = 0;
+            t = std::min({h, w, kF2TileMin});
         }
-    if (t > 0) f2_decode_tiled(z, h, w, rgb, std::max(t, kF2TileMin));
-    else decode_raw(z, h, w, rgb);
+        f2_decode_tiled(z, h, w, rgb, k, t);
+    } else {
+        decode_raw(z, h, w, rgb);
+    }
     to_rgba(rgb, HW, rgba, s_);
     gpu::stream_sync(s_);
     gpu::free(rgb);
@@ -1042,48 +1048,47 @@ void MfVae::open_flux2(SafeTensors& st) {
     C_ = cin_.out;
 }
 
-// the scratch of an h x w latent: the walk of f2_decode_raw's sizes.  Its activations x, y, t (FP32) and a16 hold the
-// largest tensor; the unfolded neighbourhoods a band of rows; the attention's q, k, v (FP16) all of the middle's
-// positions, its scores and probabilities a band of query rows
-namespace {
-struct F2Sizes {
-    int64_t most = 0, pix = 0, cin = 0, mid = 0, rows = 0;
-};
-}  // namespace
-
-static F2Sizes f2_sizes(int64_t h, int64_t w, int64_t C, const std::vector<int64_t>& level_out,
-                        const std::vector<bool>& level_up, int64_t cin_max) {
+// The sizes of the stages from level k0 up to k1 (front: from the latent, its 1 x 1 convolution, conv_in and the
+// middle first; tail: norm_out and conv_out after) of an h x w latent's region: the largest tensor (most, values), the
+// largest number of positions (pix), the middle's positions (mid, its attention's; 0 without the front), and its band
+// of query rows whose scores take 64 MiB (16M FP32)
+MfVae::F2Sizes MfVae::f2_walk(int64_t h, int64_t w, int k0, int k1, bool front, bool tail) const {
     F2Sizes z;
-    int64_t pix = 4 * h * w;
-    z.mid = pix;
-    z.most = std::max({pix * 32, pix * 3 * C});
-    int64_t c = C;
-    for (size_t i = 0; i < level_out.size(); ++i) {
-        z.most = std::max(z.most, pix * std::max(c, level_out[i]));
-        c = level_out[i];
-        if (level_up[i]) {
+    int64_t pix = 4 * h * w, c = C_;
+    for (int i = 0; i < k0; ++i) {
+        const F2Level& l = f2_levels_[(size_t) i];
+        if (!l.blocks.empty()) c = l.blocks.back().c2.out;
+        if (l.up.out > 0) {
             pix *= 4;
+            c = l.up.out;
+        }
+    }
+    if (front) {
+        z.mid = pix;
+        z.most = std::max(pix * 32, pix * 3 * C_);
+        z.rows = std::max<int64_t>(1, std::min<int64_t>(z.mid, (int64_t) (16 << 20) / z.mid));
+    }
+    z.most = std::max(z.most, pix * c);
+    for (int i = k0; i < k1; ++i) {
+        const F2Level& l = f2_levels_[(size_t) i];
+        for (const F2Res& r : l.blocks) z.most = std::max(z.most, pix * std::max(r.c1.in, r.c2.out));
+        if (!l.blocks.empty()) c = l.blocks.back().c2.out;
+        if (l.up.out > 0) {
+            pix *= 4;
+            c = l.up.out;
             z.most = std::max(z.most, pix * c);
         }
     }
-    z.most = std::max(z.most, pix * 3);
+    if (tail) z.most = std::max(z.most, pix * 3);
     z.pix = pix;
-    z.cin = cin_max;
-    // a band of query rows whose scores take 64 MiB (16M FP32), at least one row
-    z.rows = std::max<int64_t>(1, std::min<int64_t>(z.mid, (int64_t) (16 << 20) / z.mid));
+    z.c = c;
     return z;
 }
 
-uint64_t MfVae::f2_scratch_bytes(int64_t h, int64_t w) const {
-    std::vector<int64_t> lo;
-    std::vector<bool> lu;
+uint64_t MfVae::f2_bytes(const F2Sizes& z) const {
     int64_t cmax = C_;
-    for (const F2Level& l : f2_levels_) {
-        lo.push_back(l.blocks.empty() ? C_ : l.blocks.back().c2.out);
-        lu.push_back(l.up.out > 0);
+    for (const F2Level& l : f2_levels_)
         for (const F2Res& r : l.blocks) cmax = std::max(cmax, r.c1.in);
-    }
-    const F2Sizes z = f2_sizes(h, w, C_, lo, lu, cmax);
     const int64_t col_rows = std::min<int64_t>(z.pix, 32768);
     return (uint64_t) z.most * (3 * 4 + 2) +                           // x, y, t; a16
            (uint64_t) col_rows * 9 * cmax * 2 +                        // the unfolded neighbourhoods, a band
@@ -1092,31 +1097,40 @@ uint64_t MfVae::f2_scratch_bytes(int64_t h, int64_t w) const {
            (uint64_t) z.rows * z.mid * (4 + 2);                        // a band's scores, probabilities
 }
 
-void MfVae::f2_grow(int64_t h, int64_t w) {
-    if (h * w <= f2_cap_) return;
+uint64_t MfVae::f2_scratch_bytes(int64_t h, int64_t w) const {
+    return f2_bytes(f2_walk(h, w, 0, (int) f2_levels_.size(), true, true));
+}
+
+// the larger of two stages' sizes, which share the buffers
+static MfVae::F2Sizes f2_max(const MfVae::F2Sizes& a, const MfVae::F2Sizes& b) {
+    MfVae::F2Sizes z;
+    z.most = std::max(a.most, b.most);
+    z.pix = std::max(a.pix, b.pix);
+    z.mid = std::max(a.mid, b.mid);
+    z.rows = std::max(a.rows, b.rows);
+    return z;
+}
+
+void MfVae::f2_grow(const F2Sizes& z) {
+    if (z.most <= f2_cap_.most && z.pix <= f2_cap_.pix && z.mid <= f2_cap_.mid && z.rows <= f2_cap_.rows) return;
+    const F2Sizes n = f2_max(z, f2_cap_);
     drop_scratch();
-    std::vector<int64_t> lo;
-    std::vector<bool> lu;
     int64_t cmax = C_;
-    for (const F2Level& l : f2_levels_) {
-        lo.push_back(l.blocks.empty() ? C_ : l.blocks.back().c2.out);
-        lu.push_back(l.up.out > 0);
+    for (const F2Level& l : f2_levels_)
         for (const F2Res& r : l.blocks) cmax = std::max(cmax, r.c1.in);
-    }
-    const F2Sizes z = f2_sizes(h, w, C_, lo, lu, cmax);
-    f2_x_ = alloc<float>(allocs_, z.most);
-    f2_y_ = alloc<float>(allocs_, z.most);
-    f2_t_ = alloc<float>(allocs_, z.most);
-    a16_ = alloc<uint16_t>(allocs_, z.most);
-    col_cap_ = std::min<int64_t>(z.pix, 32768) * 9 * cmax;
+    f2_x_ = alloc<float>(allocs_, n.most);
+    f2_y_ = alloc<float>(allocs_, n.most);
+    f2_t_ = alloc<float>(allocs_, n.most);
+    a16_ = alloc<uint16_t>(allocs_, n.most);
+    col_cap_ = std::min<int64_t>(n.pix, 32768) * 9 * cmax;
     col16_ = alloc<uint16_t>(allocs_, col_cap_);
-    gn_part_ = alloc<float>(allocs_, z.pix * kGroups * 2);
+    gn_part_ = alloc<float>(allocs_, n.pix * kGroups * 2);
     vec_ = alloc<float>(allocs_, 4 * cmax);
-    f2_qk16_ = alloc<uint16_t>(allocs_, z.mid * C_ * 3);
-    f2_q_ = alloc<float>(allocs_, z.rows * z.mid);
-    f2_p16_ = alloc<uint16_t>(allocs_, z.rows * z.mid);
-    f2_rows_ = z.rows;
-    f2_cap_ = h * w;
+    f2_qk16_ = alloc<uint16_t>(allocs_, n.mid * C_ * 3);
+    f2_q_ = alloc<float>(allocs_, n.rows * n.mid);
+    f2_p16_ = alloc<uint16_t>(allocs_, n.rows * n.mid);
+    f2_cap_ = n;
+    f2_held_ = f2_bytes(n);
 }
 
 // the two of x, y, t that are not `x`
@@ -1148,15 +1162,15 @@ void MfVae::f2_resblock(const F2Res& r, float*& x, int64_t H, int64_t W) {
 
 // x += proj(softmax(q k^T / sqrt(C)) v), q, k, v of GN(x): one head over every position, a band of query rows at a time
 void MfVae::f2_attention(float* x, int64_t H, int64_t W) {
-    const int64_t T = H * W, C = f2_attn_.qkv.in;
+    const int64_t T = H * W, C = f2_attn_.qkv.in, rows = f2_cap_.rows;
     float *qkv = nullptr, *o = nullptr;
     f2_others(x, qkv, o);
     gn_silu16(x, f2_attn_.nw, f2_attn_.nb, T, C, false, a16_);
     conv(f2_attn_.qkv, a16_, H, W, qkv);
     uint16_t *q16 = f2_qk16_, *k16 = f2_qk16_ + T * C, *vt16 = f2_qk16_ + 2 * T * C;
     qkv_split16(qkv, T, C, q16, k16, vt16, s_);
-    for (int64_t r0 = 0; r0 < T; r0 += f2_rows_) {
-        const int64_t n = std::min(f2_rows_, T - r0);
+    for (int64_t r0 = 0; r0 < T; r0 += rows) {
+        const int64_t n = std::min(rows, T - r0);
         gemm_.f16(q16 + r0 * C, k16, f2_q_, n, T, C);
         softmax_wg16(f2_q_, n, T, 1.0f / std::sqrt((float) C), f2_p16_, s_);
         gemm_.f16(f2_p16_, vt16, o + r0 * C, n, C, T);
@@ -1166,19 +1180,26 @@ void MfVae::f2_attention(float* x, int64_t H, int64_t W) {
     qi_axpy(x, qkv, 1.0f, T * C, s_);
 }
 
-void MfVae::f2_decode_raw(const float* z, int64_t h, int64_t w, float* rgb) {
-    f2_grow(h, w);
-    int64_t H = 2 * h, W = 2 * w;
+// the stages up to level k of the latent z (h x w): x [H][W][c] in one of x, y, t
+void MfVae::f2_front(const float* z, int64_t h, int64_t w, int k, float*& x, int64_t& H, int64_t& W, int64_t& c) {
+    H = 2 * h;
+    W = 2 * w;
     f2_unpatch16(z, f2_mean_, f2_std_, h, w, a16_, s_);
     conv(f2_pq_, a16_, H, W, f2_t_);
     qi_to_f16(f2_t_, H * W * f2_pq_.out, a16_, s_);
-    float* x = f2_x_;
+    x = f2_x_;
     conv(cin_, a16_, H, W, x);
     f2_resblock(f2_mid_[0], x, H, W);
     f2_attention(x, H, W);
     f2_resblock(f2_mid_[1], x, H, W);
-    int64_t c = C_;
-    for (const F2Level& l : f2_levels_) {
+    c = C_;
+    f2_levels(0, k, x, H, W, c);
+}
+
+// levels k0 .. k1 - 1 on x [H][W][c]
+void MfVae::f2_levels(int k0, int k1, float*& x, int64_t& H, int64_t& W, int64_t& c) {
+    for (int i = k0; i < k1; ++i) {
+        const F2Level& l = f2_levels_[(size_t) i];
         for (const F2Res& r : l.blocks) f2_resblock(r, x, H, W);
         if (!l.blocks.empty()) c = l.blocks.back().c2.out;
         if (l.up.out > 0) {
@@ -1192,6 +1213,10 @@ void MfVae::f2_decode_raw(const float* z, int64_t h, int64_t w, float* rgb) {
             c = l.up.out;
         }
     }
+}
+
+// norm_out and conv_out of x [H][W][c]: rgb [3][H][W]
+void MfVae::f2_tail(const float* x, int64_t H, int64_t W, int64_t c, float* rgb) {
     gn_silu16(x, gnw_, gnb_, H * W, c, true, a16_);
     float *y = nullptr, *unused = nullptr;
     f2_others(x, y, unused);
@@ -1199,20 +1224,64 @@ void MfVae::f2_decode_raw(const float* z, int64_t h, int64_t w, float* rgb) {
     hwc3_to_chw(y, H * W, rgb, s_);
 }
 
-// the scratch of a tiled decode with tiles of t x t tokens: a tile's own, its latent and image, and the blend's planes
-uint64_t MfVae::f2_tiled_bytes(int64_t h, int64_t w, int64_t t) const {
-    const int64_t th = std::min(h, t), tw = std::min(w, t);
-    return f2_scratch_bytes(th, tw) + (uint64_t) (th * tw * 128) * 4 + (uint64_t) (3 * th * tw * kPix) * 4 +
-           (uint64_t) (4 * h * w * kPix) * 4;
+void MfVae::f2_decode_raw(const float* z, int64_t h, int64_t w, float* rgb) {
+    const int n = (int) f2_levels_.size();
+    f2_grow(f2_walk(h, w, 0, n, true, true));
+    float* x = nullptr;
+    int64_t H = 0, W = 0, c = 0;
+    f2_front(z, h, w, n, x, H, W, c);
+    f2_tail(x, H, W, c, rgb);
 }
 
-void MfVae::f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, int64_t t) {
+// A tiled decode: the stages up to level k on the whole latent (its statistics and the middle's attention over all of
+// it), their output kept, and the levels from k on in tiles of t x t tokens.  Its scratch: the buffers the two share,
+// the output kept, a tile's input and image, and the blend's planes
+uint64_t MfVae::f2_tiled_bytes(int64_t h, int64_t w, int k, int64_t t) const {
+    const int n = (int) f2_levels_.size();
+    const int64_t th = std::min(h, t), tw = std::min(w, t);
+    const F2Sizes f = f2_walk(h, w, 0, k, true, false), b = f2_walk(th, tw, k, n, false, true);
+    const F2Sizes bi = f2_walk(th, tw, k, k, false, false);   // a tile's input
+    return f2_bytes(f2_max(f, b)) + (uint64_t) (f.pix * f.c) * 4 + (uint64_t) (bi.pix * bi.c) * 4 +
+           (uint64_t) (3 * th * tw * kPix) * 4 + (uint64_t) (4 * h * w * kPix) * 4;
+}
+
+// the deepest front and the largest tiles within `limit` -> (k, t); (-1, 0) when nothing fits
+std::pair<int, int64_t> MfVae::f2_tiling(int64_t h, int64_t w, uint64_t limit) const {
+    const int n = (int) f2_levels_.size();
+    const int64_t least = std::min({h, w, kF2TileMin});
+    for (int k = n; k >= 0; --k) {
+        if (f2_tiled_bytes(h, w, k, least) > limit) continue;
+        int64_t t = std::max(h, w);
+        while (t > least && f2_tiled_bytes(h, w, k, t) > limit) --t;
+        return {k, t};
+    }
+    return {-1, 0};
+}
+
+uint64_t MfVae::f2_least_bytes(int64_t h, int64_t w) const {
+    const int n = (int) f2_levels_.size();
+    const int64_t least = std::min({h, w, kF2TileMin});
+    uint64_t b = f2_scratch_bytes(h, w);
+    for (int k = 0; k <= n; ++k) b = std::min(b, f2_tiled_bytes(h, w, k, least));
+    return b;
+}
+
+void MfVae::f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, int k, int64_t t) {
+    const int n = (int) f2_levels_.size();
     const int64_t th = std::min(h, t), tw = std::min(w, t), H = h * kPatch, W = w * kPatch;
+    const F2Sizes f = f2_walk(h, w, 0, k, true, false), b = f2_walk(th, tw, k, n, false, true);
+    f2_grow(f2_max(f, b));
     std::vector<void*> tmp;
-    float* zt = alloc<float>(tmp, th * tw * 128);
-    float* trgb = alloc<float>(tmp, 3 * th * tw * kPix);
     float* acc = alloc<float>(tmp, 4 * H * W);
+    float* trgb = alloc<float>(tmp, 3 * th * tw * kPix);
     gpu::memset_async(acc, 0, (size_t) (4 * H * W) * 4, s_);
+    // the front on the whole, its output kept [FH][FW][c]: s positions a token
+    float* x = nullptr;
+    int64_t FH = 0, FW = 0, c = 0;
+    f2_front(z, h, w, k, x, FH, FW, c);
+    const int64_t sp = FH / h;
+    float* kept = alloc<float>(tmp, FH * FW * c);
+    gpu::copy_async(kept, x, (size_t) (FH * FW * c) * 4, s_);
     // the tiles' corners: t apart less the overlap, the last flush with the edge
     auto starts = [](int64_t n, int64_t side) {
         std::vector<int64_t> v;
@@ -1228,8 +1297,11 @@ void MfVae::f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, in
     const auto ys = starts(h, th), xs = starts(w, tw);
     for (const int64_t y0 : ys)
         for (const int64_t x0 : xs) {
-            tile_gather(z, w, y0, x0, th, tw, zt, s_);
-            f2_decode_raw(zt, th, tw, trgb);
+            int64_t TH = th * sp, TW = tw * sp, tc = c;
+            float* tx = f2_x_;
+            tile_gather(kept, FW, c, y0 * sp, x0 * sp, TH, TW, tx, s_);
+            f2_levels(k, n, tx, TH, TW, tc);
+            f2_tail(tx, TH, TW, tc, trgb);
             tile_blend(trgb, th * kPatch, tw * kPatch, y0 * kPatch, x0 * kPatch, H, W, kF2Overlap * kPatch, y0 > 0,
                        y0 + th < h, x0 > 0, x0 + tw < w, acc, s_);
         }

@@ -541,6 +541,7 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
             te_set_ = 0;
         }
         vae_->decode(x, h, w, rgba, room);
+        p.vae_tiled = vae_->last_tiled();
         if (vae_->scratch_bytes(h, w) > p.vae) vae_->drop_scratch();
         gpu::copy(out.data(), rgba, out.size() * 4);
         const auto t3 = clock::now();

@@ -20,15 +20,17 @@
 // with group norms, one self-attention over every position in the middle, three nearest 2x upsamplings: 8 x 8 pixels
 // a position).  It has no encoder here (no edit model takes it).  Its activations are channels-last FP32 at each
 // level's size: the largest, 256 channels at the full size after the last upsampling, holds 1 GiB at 1024 x 1024.
-// Where the whole does not fit the room decode is given, it decodes overlapping tiles of the latent (4 tokens, 64
-// pixels, on each side shared) and blends them linearly across the overlap, as ComfyUI's tiled decode does; the
-// group norms then take each tile's statistics.
+// Where the whole does not fit the room decode is given, it runs the stages up to the deepest level that fits on the
+// whole latent (the middle's attention and the group norms there over all of it) and the rest in overlapping tiles (4
+// tokens, 64 pixels, on each side shared), blended linearly across the overlap as ComfyUI's tiled decode does; the
+// group norms of the tiled levels take each tile's statistics.
 #pragma once
 
 #include "strata/prefill/gemm.hpp"
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::image {
@@ -69,11 +71,14 @@ public:
     uint64_t scratch_bytes(int64_t h, int64_t w) const;
     /// The least of it: the Flux2 VAE's in its smallest tiles; Mage-VAE's whole.
     uint64_t least_scratch_bytes(int64_t h, int64_t w) const;
+    /// The last decode went in tiles.
+    bool last_tiled() const { return tiled_; }
     void drop_scratch();
-    uint64_t scratch_held() const {
-        const int64_t n = f2_ ? f2_cap_ : cap_hw_;
-        return n > 0 ? scratch_bytes(n, 1) : 0;
-    }
+    uint64_t scratch_held() const { return f2_ ? f2_held_ : cap_hw_ > 0 ? scratch_bytes(cap_hw_, 1) : 0; }
+    /// The Flux2 VAE's stage sizes (mf_vae.cpp's f2_walk).
+    struct F2Sizes {
+        int64_t most = 0, pix = 0, mid = 0, rows = 0, c = 0;
+    };
     uint64_t weight_bytes() const { return weight_bytes_; }
 
     /// The CoD decoder's output [h w][384] and the 21 blocks' output [h w][384] of the last decode (device FP32), for
@@ -131,11 +136,18 @@ private:
     void f2_others(const float* x, float*& a, float*& b) const;
     void f2_resblock(const F2Res& r, float*& x, int64_t H, int64_t W);
     void f2_attention(float* x, int64_t H, int64_t W);
+    void f2_front(const float* z, int64_t h, int64_t w, int k, float*& x, int64_t& H, int64_t& W, int64_t& c);
+    void f2_levels(int k0, int k1, float*& x, int64_t& H, int64_t& W, int64_t& c);
+    void f2_tail(const float* x, int64_t H, int64_t W, int64_t c, float* rgb);
     void f2_decode_raw(const float* z, int64_t h, int64_t w, float* rgb);
-    void f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, int64_t t);
-    uint64_t f2_tiled_bytes(int64_t h, int64_t w, int64_t t) const;
+    void f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, int k, int64_t t);
+    F2Sizes f2_walk(int64_t h, int64_t w, int k0, int k1, bool front, bool tail) const;
+    uint64_t f2_bytes(const F2Sizes& z) const;
+    uint64_t f2_tiled_bytes(int64_t h, int64_t w, int k, int64_t t) const;
+    std::pair<int, int64_t> f2_tiling(int64_t h, int64_t w, uint64_t limit) const;
+    uint64_t f2_least_bytes(int64_t h, int64_t w) const;
     uint64_t f2_scratch_bytes(int64_t h, int64_t w) const;
-    void f2_grow(int64_t h, int64_t w);
+    void f2_grow(const F2Sizes& z);
 
     void* s_ = nullptr;
     prefill::Gemm gemm_;
@@ -169,13 +181,14 @@ private:
     // the Flux2 VAE (f2_): its batch norm's mean and std (sqrt(var + 1e-4)) by the token's 128 values, the 1 x 1
     // convolution after it, conv_in, the middle (two ResNet blocks around the attention), the levels from the
     // smallest, and norm_out / conv_out in gnw_, gnb_ and cout_
-    bool f2_ = false;
+    bool f2_ = false, tiled_ = false;
     const float *f2_mean_ = nullptr, *f2_std_ = nullptr;
     Conv f2_pq_;
     F2Res f2_mid_[2];
     Attn f2_attn_;
     std::vector<F2Level> f2_levels_;
-    int64_t f2_cap_ = 0, f2_rows_ = 0;   // the latent positions (h w) the scratch holds; the attention's query band
+    F2Sizes f2_cap_;           // what the scratch holds (rows: the attention's query band)
+    uint64_t f2_held_ = 0;
     float *f2_x_ = nullptr, *f2_y_ = nullptr, *f2_t_ = nullptr, *f2_q_ = nullptr;
     uint16_t *f2_qk16_ = nullptr, *f2_p16_ = nullptr;
 };
