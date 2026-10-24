@@ -55,7 +55,7 @@ def flow_for(ctx) -> list[str]:
     ids = [sid for sid, _ in STEPS]
     if len(ctx.computer.usable_gpus) < 2:
         ids.remove("cards")
-    if getattr(ctx.settings, "family", None) == "deepseek41" and speed_choice_available(ctx):
+    if getattr(getattr(ctx, "settings", None), "family", None) == "deepseek41" and speed_choice_available(ctx):
         ids.insert(ids.index("context") + 1, "speed")
     return ids
 
