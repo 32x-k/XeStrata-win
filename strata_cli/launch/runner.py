@@ -1092,6 +1092,27 @@ class Runner:
         self.emit("model", f"Used your prepared model files and wrote the run settings ({path.name}); this card is not one the built-in downloader sets up.", 100, level="warn")
         return path
 
+    @staticmethod
+    def deepseek_set_in(mod, model_path, prefer: str | None = None):
+        """(set name, its catalog entry, the folder) when `model_path` (a folder, the folder above the set's own folder, or one shard) holds shards
+        of an official DeepSeek-V4.1-Flash set - recognised by the pinned shard names (the first release's names too), never by the generic GGUF
+        fingerprint table, which does not know DeepSeek (its shard 8 is a table, not a layer: "could not be read", #3914) - else None."""
+        fam = getattr(mod, "MULTI_FILE_FAMILIES", {}).get("deepseek41")
+        if fam is None or not model_path:
+            return None
+        p = Path(model_path)
+        legacy = getattr(mod, "DSV41_LEGACY_NAMES", {})
+        order = ([prefer] if prefer in fam["models"] else []) + [m for m in fam["models"] if m != prefer]
+        for m in order:
+            d = fam["models"][m]
+            subs = [d.get("subdir"), d.get("legacy_subdir"), m]
+            folders = [p, *[p / x for x in subs if x]] if p.is_dir() else [p.parent]
+            names = [n for s in d["shards"] for n in (s, legacy.get(s)) if n]
+            folder = next((f for f in folders if any((f / n).exists() for n in names)), None)
+            if folder is not None:
+                return m, d, folder
+        return None
+
     def deepseek_files(self) -> bool:
         """--model-path names DeepSeek-V4.1-Flash's shards (a folder, the repository's folder with the set's own folder inside - UD-Q8_K_XL,
         2.00bpw, 2.25bpw - or one shard): they are that model, whatever the fingerprint table of the Flash-Next files says.  True when it did
@@ -1103,16 +1124,7 @@ class Runner:
             fam = getattr(mod, "MULTI_FILE_FAMILIES", {}).get("deepseek41")
             if fam is None or not s.model_path:
                 return False
-            p = Path(s.model_path)
-            found = None
-            order = ([s.model] if s.model in fam["models"] else []) + [m for m in fam["models"] if m != s.model]
-            for m in order:
-                d = fam["models"][m]
-                folders = [p, p / (d.get("subdir") or m)] if p.is_dir() else [p.parent]
-                folder = next((f for f in folders if any((f / n).exists() for n in d["shards"])), None)
-                if folder is not None:
-                    found = (m, d, folder)
-                    break
+            found = self.deepseek_set_in(mod, s.model_path, s.model)
         except Exception:                                    # noqa: BLE001 - not DeepSeek's: the usual check goes on
             return False
         if found is None:
@@ -1122,7 +1134,8 @@ class Runner:
             raise LaunchError(f"These are DeepSeek-V4.1-Flash's files, not {s.family} {s.model}'s.",
                               "Leave --model out, or use --model " + model + ".", 2)
         others = list(d["shards"])
-        missing = [n for n in others if not (folder / n).exists()]
+        legacy = getattr(mod, "DSV41_LEGACY_NAMES", {})
+        missing = [n for n in others if not (folder / n).exists() and not (legacy.get(n) and (folder / legacy[n]).exists())]
         if missing:
             parts = {4: "four", 9: "nine"}.get(len(others), str(len(others)))
             raise LaunchError(f"DeepSeek-V4.1-Flash {d.get('label', model)} is in {parts} parts and {len(missing)} of them are not in {folder} "
