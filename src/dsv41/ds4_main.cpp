@@ -19,6 +19,7 @@
 // read stops there for a checkpoint, so a request behind the same start - another agent - goes back to it instead of
 // reading it again (also without slots).  STRATA_DS4_REUSE=0 turns every reuse off (each request reads its whole prompt).
 #include "ds4_model.hpp"
+#include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
 #include "ds4_slotmeta.hpp"
 
@@ -148,12 +149,24 @@ static std::string g_round_tag;
 static std::vector<float> g_round_conf;
 static int g_round_nd = 0;
 
+// The drafts' cut on the product of their confidences (DeepInfer's cumulative rule): a draft is verified while the chance
+// that it and every draft before it are kept stays at least this - a long window whose later drafts are likely lost is
+// not verified whole.  STRATA_DS4_DSPARK_CUM=F, a request's dspark_cum key; 0: off, only the floor on each draft's own
+// confidence (dspark_conf).  Off by default (not measured faster on code: H100 / owner PC); Project Maya runs 0.5 (a Radeon 8065S: decode +6.5%, the same tokens)
+float dspark_cum_default() {
+    static const float v = [] {
+        const char* e = std::getenv("STRATA_DS4_DSPARK_CUM");
+        return e != nullptr ? (float) std::atof(e) : 0.0f;
+    }();
+    return v;
+}
+
 // One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts while their
 // confidence holds (at most `room` - 1 of them), verified together; else a plain step.  `out` gets the tokens that follow
 // tok (the accepted drafts, then the trunk's next), the last of them the next round's tok.
 bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, float temperature, float top_p, int top_k,
            float min_p, unsigned long long seed, unsigned long long& counter, std::vector<int>& out, int& offered,
-           int& accepted, std::string& err) {
+           int& accepted, std::string& err, float cum_min = -1.0f) {
     out.clear();
     offered = accepted = 0;
     if (spec && room > 1 && m.draft_block() > 0) {
@@ -163,7 +176,11 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         g_round_conf = conf;
         g_round_nd = (int) drafts.size();
         int keep = 0;
-        while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min) ++keep;
+        if (cum_min < 0) cum_min = dspark_cum_default();
+        float cum = 1.0f;
+        while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min &&
+               (cum *= conf[(size_t) keep]) >= cum_min)
+            ++keep;
         if (keep > 0) {
             drafts.resize((size_t) keep);
             int acc = 0, next = -1;
@@ -196,6 +213,7 @@ struct Req {
     long long pin = 0;      // pin=N: the first N prompt tokens are a start other requests share (a system prompt and its
                             // tools): the state at N is kept as a checkpoint, so another agent behind the same start
                             // goes back to it instead of reading it again
+    float cum = -1.0f;      // dspark_cum=F: the cut on the product of the confidences (-1: the engine's, dspark_cum_default)
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
 };
@@ -292,6 +310,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "spec") r.spec = std::atoi(v.c_str()) != 0;
         else if (k == "dspark_conf") r.conf = std::strtof(v.c_str(), nullptr);
         else if (k == "pin") r.pin = std::atoll(v.c_str());
+        else if (k == "dspark_cum" || k == "spec_cum") r.cum = std::strtof(v.c_str(), nullptr);
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
@@ -756,7 +775,17 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // (pin=N: the read stops at N for a checkpoint of the shared start; only when this read crosses N, and N leaves
         //  the prompt's last token to the usual end)
         const size_t pin_at = (r.pin >= 256 && (size_t) r.pin + 1 < total) ? (size_t) r.pin : 0;
+        // a STOP while the prompt is read ends it there (the engine's run of chunks at a layer or chunk, windows between
+        // feeds) and goes back to the state before this prompt - kept here first, in checkpoint 1, which the prompt's
+        // own end overwrites as before - so the next request still shares the conversation up to it
+        if (from > 0 && from < total) m.checkpoint(1);
+        m.set_cancel([&in] { return in.stop.load(); });
+        bool stopped = false;
         while (ok && done < total) {
+            if (in.stop.load()) {
+                stopped = true;
+                break;
+            }
             size_t n = std::min<size_t>((size_t) m.feed_unit(), total - done);
             if (pin_at > done && pin_at < done + n) n = pin_at - done;
             // (the prompt's end: the last token in the same run, the checkpoint before it kept on the way)
@@ -778,7 +807,20 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 next_pp = done + 64;
             }
         }
+        m.set_cancel(nullptr);
         m.set_images({});
+        if (stopped || (!ok && m.cancelled())) {
+            const bool back = from > 0 && m.restore((int64_t) from) && (size_t) m.pos() == from;
+            if (!back) {
+                m.reset();
+                held.clear();
+            }
+            std::fprintf(stderr, "ds4 serve: stopped while reading the prompt of %zu tokens, after %.0f ms%s\n",
+                         total, now_ms() - t0, back ? "; the conversation before it is kept" : "");
+            std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", r.ids.size(), now_ms() - t0, back ? from : (size_t) 0);
+            std::fflush(stdout);
+            continue;
+        }
         if (!ok) {
             std::fprintf(stderr, "ds4: %s\n", err.c_str());
             std::printf("ERR %s\n", err.c_str());
@@ -855,7 +897,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
                 if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
                            r.min_p, r.seed, counter, got,
-                           off, acc, err)) {
+                           off, acc, err, r.cum)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     finish = "cancel";
                     break;
@@ -1143,6 +1185,7 @@ int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int win
 #endif
 
 int main(int argc, char** argv) {
+    strata::ds4::os::fine_timer();
     strata::ds4::Options o;
     std::string ids_s, dump, eos = "1";
     int n = 0, window = 0;   // (0: the model's feed unit - a whole prompt on the chunked path; 16 for the scoring runs)

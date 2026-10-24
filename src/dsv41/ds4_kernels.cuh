@@ -279,6 +279,9 @@ struct Xfer {
     int n = 0;
 };
 void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaStream_t s);
+// Windows (WDDM, CUDA and HIP alike) holds launches back until the host waits or queries the stream: the work queued on
+// `s` submitted now (cudaStreamQuery, which does not wait).  Elsewhere nothing.  DS4_WIN_SUBMIT=0: off (A/B tests)
+void win_submit(cudaStream_t s);
 void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s);
 /// Waits (one thread) until flags[i * stride] >= seq for i < n (a pipelined chunk's readers have taken a buffer);
 /// set_flag: *flag = v after a system fence (a reader's acknowledgement).

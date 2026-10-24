@@ -38,6 +38,7 @@
 #include <deque>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -820,6 +821,36 @@ struct Model::Impl {
     bool logits_all = false;          // the last feed was a chunk with logits for every row (chunk_logits)
     std::vector<float> chunk_logits;
     std::function<void(int64_t)> progress;   // a run of chunks: the tokens done so far (the main thread, while it waits)
+    // a Stop while a run of chunks goes through the layers (Model::set_cancel, asked while forward_chunks waits): one
+    // GPU stops after the layer (or the layer's chunk) it is on (halt); several stop at a chunk every one of them
+    // reaches - none starts chunk halt_k or later, halt_k one past the latest any started - so no device waits on a
+    // hand-off that never comes (Project Maya v1.1.20)
+    std::function<bool()> cancel;
+    std::atomic<bool> halt{false};
+    std::mutex halt_mu;
+    int halt_k = INT_MAX, halt_seen = -1;
+    bool halted = false;                      // the last run ended early on a Stop
+    static constexpr const char* kHalted = "stopped";
+    bool chunk_go(int k) {   // chunk k may start on this device (several GPUs)
+        std::lock_guard<std::mutex> lk(halt_mu);
+        if (k >= halt_k) return false;
+        halt_seen = std::max(halt_seen, k);
+        return true;
+    }
+    bool halt_now() const { return devs.size() == 1 && halt.load(std::memory_order_acquire); }
+    // a run's early end on device di: the expert reads still in flight land first (they count down items the next run
+    // clears), then its streams are idle
+    bool halt_end(int di, std::string& err) {
+        Chunk& c = *chunks[(size_t) di];
+        cudaSetDevice(devs[(size_t) di].id);
+        if (c.flow)
+            for (size_t i = c.base; i < c.n_read; ++i)
+                while (fit(c, i).left.load(std::memory_order_acquire) != 0) c.io->wait_any(500);
+        if (c.cs != nullptr) cudaStreamSynchronize(c.cs);
+        cudaStreamSynchronize(devs[(size_t) di].st);
+        err = kHalted;
+        return false;
+    }
     std::vector<cudaEvent_t> chunk_done;     // on the last layer's device: chunk k through every layer
     std::unique_ptr<std::atomic<int>[]> chunk_rec;   // chunk k's event recorded
     // a prompt the flow could take: the flow or windows of 16, whichever this PC runs it faster (pick_path) - this
@@ -2422,6 +2453,11 @@ struct Model::Impl {
             // the Engram rows' reader: threads enough to keep an SSD's queue busy (reads from the page cache need few);
             // the row cache a small share of the RAM free (DS4_ENGRAM_CACHE_MB: its size, 0 off; DS4_ENGRAM_THREADS)
             const size_t row = (size_t) pk.eg_hd + pk.eg_hd / 32;
+#if defined(_WIN32)
+            // (Windows: each thread's ReadFile is synchronous, so the threads are the queue depth - Project Maya: a 28K-token
+            //  prompt in one chunk, 10 threads 17.1 s, 64 13.4 s on a 20-core PC.  Here (6 cores, shipped profile) 64 readers
+            //  gave +4.5% on a 4K prompt but no decode gain in every pair: DS4_ENGRAM_THREADS=64 turns them on)
+#endif
             const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
             int nth = (int) std::min(16u, std::max(4u, hw / 2));
             if (const char* e = std::getenv("DS4_ENGRAM_THREADS")) nth = std::max(1, std::atoi(e));
@@ -2431,7 +2467,30 @@ struct Model::Impl {
             eg_cache.init((size_t) ((mb << 20) / row), row);
             std::vector<std::string> paths;
             for (const std::string& fn : pk.files) paths.push_back(pk.model_dir + "/" + fn);
-            eg_io.start(paths, nth);
+            // Windows: the Engram tables' files that hold nothing else are unmapped and read unbuffered - an SSD's
+            // queue kept by the reader threads instead of the page cache's (whose reads of one file from many threads
+            // went ~255K rows a second here); unbuffered reads of a mapped file take a slow path, so only unmapped
+            // ones (off by default: -8% on a 4K prompt here; DS4_EG_DIRECT=1 turns it on)
+            std::vector<char> eg_direct(pk.files.size(), 0);
+#if defined(_WIN32)
+            if (pk.gguf && std::getenv("DS4_EG_DIRECT") != nullptr && std::atoi(std::getenv("DS4_EG_DIRECT")) != 0) {
+                std::vector<char> eg_file(pk.files.size(), 0), other(pk.files.size(), 0);
+                for (const auto& kt : pk.t)
+                    if (kt.second.file >= 0 && (size_t) kt.second.file < pk.files.size())
+                        (kt.first.find(".engram.embed.") != std::string::npos ? eg_file : other)[(size_t) kt.second.file] = 1;
+                for (size_t i = 0; i < pk.files.size(); ++i)
+                    if (eg_file[i] && !other[i]) {
+                        if (i < pk.maps.size() && pk.maps[i].first != nullptr) {
+                            os::unmap(pk.maps[i].first, pk.maps[i].second);
+                            pk.maps[i] = {nullptr, 0};
+                        }
+                        eg_direct[i] = 1;
+                        if (o.verbose) std::fprintf(stderr, "ds4: %s unmapped, its Engram rows read unbuffered\n",
+                                                    pk.files[i].c_str());
+                    }
+            }
+#endif
+            eg_io.start(paths, nth, eg_direct);
             for (int li = 0; li < pk.eg_layers; ++li) {
                 eg_win.emplace_back(new EgBatch());
                 const std::string id = std::to_string(g.eg_layers[(size_t) li]);
@@ -3081,16 +3140,10 @@ struct Model::Impl {
     }
 
     // ---- the flow (see Chunk)
-    // Windows' HIP runtime submits queued work only when the host waits on the GPU: the flow's copies and the compute
-    // it queued between its waits are submitted at once (cudaStreamQuery does that without waiting); elsewhere nothing
-    static void kick(cudaStream_t s) {
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
-        (void) cudaStreamQuery(s);
-        (void) cudaGetLastError();
-#else
-        (void) s;
-#endif
-    }
+    // Windows (WDDM: HIP's runtime and CUDA's driver alike) submits queued work only when the host waits on the GPU:
+    // the flow's copies and the compute it queued between its waits are submitted at once (win_submit); elsewhere
+    // nothing.  (CUDA too since #303: two RTX 3080s hung before the first layer, one GPU spinning on the other's flow)
+    static void kick(cudaStream_t s) { win_submit(s); }
     size_t flow_region(int r) const {   // a part's room in a staging slot (read from its offset rounded down)
         return ((flow_part[r] + os::kDirectAlign - 1) & ~(size_t) (os::kDirectAlign - 1)) + os::kDirectAlign;
     }
@@ -4577,11 +4630,25 @@ struct Model::Impl {
             cs.assign((size_t) NH, {});
             for (size_t i = 0; i < all.size(); ++i) cs[i * (size_t) NH / all.size()].push_back(all[i]);
         }
+        static const int lane_free = [] {
+            const char* v = std::getenv("STRATA_DS4_LANE_FREE");
+            return v != nullptr ? std::max(0, std::atoi(v)) : 2;
+        }();
+        size_t lane_cpus = 0;
+        for (const auto& v : cs) lane_cpus += v.size();
+        const bool lane_takes_all = lane_cpus >= (size_t) std::max(1u, std::thread::hardware_concurrency());
         for (int X = 0; X < (int) cs.size() && X < std::max(NH, 1); ++X) {
             std::vector<int> c = cs[(size_t) X];
             if (file_experts && NH == 1)
                 for (size_t Y = 1; Y < cs.size(); ++Y) c.insert(c.end(), cs[Y].begin(), cs[Y].end());
             if (X == 0 && !c.empty()) c.erase(c.begin());   // the host thread's core (it helps node 0's pool)
+            // cores of the first pool left free beside the host thread's, for the thread that launches the decode's kernels
+            // (and waits on the device) and whatever else the PC runs: with a worker spinning on every other logical CPU
+            // that thread waits for a core (Project Maya #359, a 20-core Windows 11 PC: decode 28.3 -> 55.5 tok/s).  Only
+            // when the lane would take every logical CPU and --cpu-threads is not given.
+            // STRATA_DS4_LANE_FREE: the cores left free (2 by default, 0: as before)
+            if (X == 0 && o.cpu_threads <= 0 && lane_free > 0 && (int) c.size() > lane_free + 1 && lane_takes_all)
+                c.resize(c.size() - (size_t) lane_free);
             int nw = (int) c.size();
             if (o.cpu_threads > 0) nw = std::max(X == 0 ? 0 : 1, std::min(nw, o.cpu_threads / NH - (X == 0 ? 1 : 0)));
             pools.push_back(std::make_unique<Pool>(nw, c, 20000));   // spin through a token's layers (20 ms)
@@ -5464,12 +5531,16 @@ struct Model::Impl {
             return;
         }
         const float lim = g.lim;
-        {   // (os::prefetch, as above)
+        {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
+            // range, ~0.13 ms an IQ2_XXS expert, on the lane's critical path before the first entry computes.
+            // off by default (the mmap path, owner PC: not faster in every pair); DS4_IQ_PF_COLD=1 turns it on)
             std::vector<std::pair<const void*, size_t>> want;
             for (const Ent& en : ents)
                 if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
                     for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
-            os::prefetch(want);
+            static const bool pf_all = std::getenv("DS4_IQ_PF_COLD") == nullptr || std::atoi(std::getenv("DS4_IQ_PF_COLD")) == 0;
+            if (pf_all) os::prefetch(want);
+            else os::prefetch_cold(want);
         }
         // the activations in c_xh's bytes, E 4 apart: token t's (t < kWin) at row t - quantized once, whatever number of
         // entries take it - then a row a slot (kWin + slot): a token past the window's input (none on the decode or
@@ -6941,6 +7012,16 @@ struct Model::Impl {
         x3::rows_f16(c.sg, FF, nullptr, T, FF, c.sh16, s);
         if (!gemm(d, c, l.s2, c.sh16, FF, T, c.acc, D, 0.0f, err)) return false;
         prof_mark(d, 2);
+        // the expert stream's copies keep going while the device runs this layer's attention, routing and shared expert:
+        // the next items (this layer's likely experts, queued when the layer before routed) go out as they are ready and
+        // ring slots free, not only once the bounds are back (Project Maya #360; DS4_FLOW_PUMP_WAIT=0: wait as before)
+        static const bool pump_wait = std::getenv("DS4_FLOW_PUMP_WAIT") == nullptr ||
+                                      std::atoi(std::getenv("DS4_FLOW_PUMP_WAIT")) != 0;
+        if (c.flow && pump_wait)
+            while (cudaStreamQuery(s) == cudaErrorNotReady) {
+                if (!flow_pump(c, err)) return false;
+                std::this_thread::yield();
+            }
         CK(cudaStreamSynchronize(s));
         std::vector<int> b(c.bounds_pin, c.bounds_pin + n_vs + 1);
         if (dump_r != nullptr && mi == 0) {
@@ -7164,6 +7245,7 @@ struct Model::Impl {
             const bool last_l = li + 1 == c.fl_layers.size();
             for (int k = 0; k < nk; ++k) {
                 if (!run.runs(k, il)) continue;   // (a skipped early chunk: nothing after the yoco layer)
+                if (halt_now()) return halt_end(di, err);   // (a Stop: one GPU, this one)
                 const int64_t p0 = run.p0[(size_t) k];
                 const int T = run.T[(size_t) k], slot = k % 2;
                 const bool last_k = k + 1 == nk;
@@ -7318,6 +7400,7 @@ struct Model::Impl {
         std::future<void> eg_next;
         if (!egs.empty()) eg_next = std::async(std::launch::async, read_eg, 0);
         for (int k = 0; k < nk; ++k) {
+            if (!chunk_go(k)) return halt_end(di, err);   // (a Stop: the chunks every device reaches are done)
             const int64_t p0 = run.p0[(size_t) k];
             const int T = run.T[(size_t) k], slot = k % 2;
             const bool last_k = k + 1 == nk;
@@ -7336,6 +7419,7 @@ struct Model::Impl {
             bool started = false;
             std::vector<char> got(srcs.size(), 0);
             for (int il = 0; il < g.nl && run.runs(k, il); ++il) {
+                if (halt_now()) return halt_end(di, err);   // (one GPU: after the layer it is on)
                 Layer& L0 = L[(size_t) il];
                 int mi = -1;
                 for (int m = 0; m < L0.nm; ++m)
@@ -7884,6 +7968,14 @@ struct Model::Impl {
             }
         } lm_end_{this, lm};
         std::vector<std::string> errs(devs.size());
+        halted = false;
+        halt.store(false);
+        {
+            std::lock_guard<std::mutex> lk(halt_mu);
+            halt_k = INT_MAX;
+            halt_seen = -1;
+        }
+        bool halting = false;
         for (size_t di = 0; di < devs.size(); ++di)
             workers[di]->submit([this, di, &run, &errs] {
                 std::string e;
@@ -7893,6 +7985,12 @@ struct Model::Impl {
         for (;;) {
             bool all = true;
             for (auto& w : workers) all = all && w->idle();
+            if (!all && !halting && cancel && cancel()) {   // a Stop: the devices end the run early
+                halting = true;
+                std::lock_guard<std::mutex> lk(halt_mu);
+                halt_k = halt_seen + 1;
+                halt.store(true, std::memory_order_release);
+            }
             if (progress && lm) {   // (layer-major: the share of the layers every chunk went through)
                 const int nd = lm_layers.load(std::memory_order_acquire);
                 if (nd > 0 && nd < g.nl) progress((int64_t) n * nd / g.nl);
@@ -7906,9 +8004,15 @@ struct Model::Impl {
             if (all) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-        for (const std::string& e : errs)
-            if (!e.empty()) {
+        for (const std::string& e : errs)   // (a device's failure first: a Stop's early end is not one)
+            if (!e.empty() && e != kHalted) {
                 err = e;
+                return false;
+            }
+        for (const std::string& e : errs)
+            if (e == kHalted) {
+                halted = true;
+                err = "stopped while reading the prompt";
                 return false;
             }
         st.layer_ms += now_ms() - tl;
@@ -8952,6 +9056,7 @@ bool Model::step(int token, bool logits, std::string& err) { return p_->step(tok
 bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     Impl& p = *p_;
     p.pm.last = -1;
+    p.halted = false;
     if (p.chunk > 0 && n >= p.chunk_min) {   // a long run - or one the flow could take, if it is the faster path here
         const double t0 = now_ms();   // (every row's logits (tests): the chunked path, which keeps them all)
         const bool ok = logits_rows > kWin || p.pick_path(n) ? p.forward_chunks(tokens, n, logits_rows, err)
@@ -8964,6 +9069,7 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
 bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err) {
     Impl& p = *p_;
     p.pm.last = -1;
+    p.halted = false;
     const double t0 = now_ms();
     if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && p.pick_path(n)) {   // (the last token rides along; its layers
         const bool ok = p.forward_chunks(tokens, n, logits_rows, err, slot);   // keep the state before it)
@@ -8978,6 +9084,8 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
 }
 int Model::feed_unit() const { return p_->chunk > 0 ? std::max(p_->chunk, (int) p_->o.max_context) : kWin; }
 void Model::set_progress(std::function<void(int64_t)> f) { p_->progress = std::move(f); }
+void Model::set_cancel(std::function<bool()> f) { p_->cancel = std::move(f); }
+bool Model::cancelled() const { return p_->halted; }
 int Model::sample(float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter) {
     return p_->sample(t, tp, tk, mp, seed, counter);
 }

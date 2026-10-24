@@ -22,6 +22,10 @@
 #endif
 #include <windows.h>
 #include <psapi.h>   // (K32QueryWorkingSetEx: kernel32's, no psapi.lib)
+#include <timeapi.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "winmm.lib")
+#endif
 #else
 #include <fcntl.h>
 #include <pthread.h>
@@ -33,6 +37,18 @@
 #endif
 
 namespace strata::ds4::os {
+
+/// Windows sleeps in 15.6 ms ticks unless a process asks for finer ones: the CPU lane's service thread naps (sleep_for 20 us)
+/// between tokens, and the device's first wait of the next token then waits out the tick.  1 ms for the process's life
+/// (Project Maya #358).  Off by default (owner PC, shipped profile, 3 pairs: not faster in every pair); DS4_TIMER_MS=1 turns it on.
+/// Elsewhere nothing.
+inline void fine_timer() {
+#if defined(_WIN32)
+    const char* v = std::getenv("DS4_TIMER_MS");
+    const int ms = v != nullptr ? std::atoi(v) : 0;
+    if (ms > 0) timeBeginPeriod((UINT) ms);
+#endif
+}
 
 using fd_t = intptr_t;
 constexpr fd_t kBadFd = -1;
@@ -132,6 +148,33 @@ inline bool pread_direct(fd_t f, void* dst, uint64_t n, uint64_t off) {
         if ((uint64_t) r % kDirectAlign != 0) break;
     }
     return got >= want;
+#endif
+}
+/// Windows: the file opened for unbuffered reads (FILE_FLAG_NO_BUFFERING), for a file no view of this process maps -
+/// unbuffered reads of a mapped file take a slow path there (open_direct); kBadFd elsewhere
+inline fd_t open_unbuffered(const std::string& path) {
+#if defined(_WIN32)
+    HANDLE h = CreateFileW(wide(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING, nullptr);
+    return h == INVALID_HANDLE_VALUE ? kBadFd : (fd_t) h;
+#else
+    (void) path;
+    return kBadFd;
+#endif
+}
+/// [off, off + n) through open_unbuffered's handle (one thread's) into buf, kDirectAlign-aligned and at least
+/// direct_span(off, n) bytes: the bytes land at buf + off % kDirectAlign
+inline bool pread_unbuffered(fd_t f, void* buf, uint64_t n, uint64_t off) {
+#if defined(_WIN32)
+    const uint64_t a0 = off & ~(kDirectAlign - 1), span = direct_span(off, n);
+    OVERLAPPED ov{};
+    ov.Offset = (DWORD) a0;
+    ov.OffsetHigh = (DWORD) (a0 >> 32);
+    DWORD got = 0;
+    return ReadFile((HANDLE) f, buf, (DWORD) span, &got, &ov) && got >= (off - a0) + n;
+#else
+    (void) f, (void) buf, (void) n, (void) off;
+    return false;
 #endif
 }
 /// The same file opened for reads from many threads at once (Windows runs the reads of a synchronous handle one at a
