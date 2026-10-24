@@ -35,7 +35,7 @@ export function memoryNeeded(v: FitInput): number {
 const KV_BYTES: Record<string, number> = { fp16: 2112, int8: 1056, q4_0: 576, k8v4: 816 };
 const KV_LAYERS = 13, KV_FACTOR = 1.054, BASE_CONTEXT = 32768;
 export function cacheGb(context: number, kv = 'int8'): number {
-  return context * KV_LAYERS * (KV_BYTES[String(kv).toLowerCase()] ?? KV_BYTES.int8) * KV_FACTOR / 2 ** 30;
+  return (121 + context * KV_LAYERS * (KV_BYTES[String(kv).toLowerCase()] ?? KV_BYTES.int8) * KV_FACTOR / 2 ** 20) / 1024;   // 121 MiB fixed per session
 }
 export interface CacheChoice { context: number; kv?: string }
 
