@@ -4531,7 +4531,12 @@ struct Model::Impl {
             const int dev0 = devs[0].id;
             cfg.map_chunk = [dev0](void* h, size_t n) -> void* {
                 cudaSetDevice(dev0);
-                if (cudaHostRegister(h, n, cudaHostRegisterMapped | cudaHostRegisterPortable) != cudaSuccess) {
+                unsigned reg_flags = cudaHostRegisterMapped | cudaHostRegisterPortable;
+#if defined(STRATA_USE_HIP)
+                // (test arm: DS4_ZC_COARSE=1, hipExtHostRegisterCoarseGrained, which ROCm Core SDK 10.1 honors on Windows; the store is read-only to the GPU)
+                if (std::getenv("DS4_ZC_COARSE") && std::atoi(std::getenv("DS4_ZC_COARSE")) != 0) reg_flags |= 0x8u;
+#endif
+                if (cudaHostRegister(h, n, reg_flags) != cudaSuccess) {
                     (void) cudaGetLastError();
                     return nullptr;
                 }

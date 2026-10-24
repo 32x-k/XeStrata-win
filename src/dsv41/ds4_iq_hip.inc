@@ -10,6 +10,9 @@
 #if defined(STRATA_USE_HIP)
 
 namespace hipk {
+// test hooks: force_mode -1 = the default rules, 0 = never, 1 = on wherever the device has the WMMA tiles (gfx11 / gfx12); launches counts the tiles taken
+inline std::atomic<int>& force_mode() { static std::atomic<int> f{-1}; return f; }
+inline std::atomic<long long>& launches() { static std::atomic<long long> n{0}; return n; }
 constexpr int kStH = 72;   // halves a shared row: 64 + 8 (the pad spreads the banks; rows stay 16-byte aligned)
 using hv2 = _Float16 __attribute__((ext_vector_type(2)));
 using hv8 = _Float16 __attribute__((ext_vector_type(8)));
@@ -233,9 +236,21 @@ __global__ void __launch_bounds__(256) set_kernel(const SetArgs a, int dbg) {
 
 inline bool ok_device() {   // gfx12 unless STRATA_DS4_HIPK=0
     static std::atomic<int> state[16];
+    static std::atomic<int> capable[16];   // 1: gfx11 / gfx12
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 16) return false;
+    if (const int f = force_mode().load(std::memory_order_relaxed); f >= 0) {
+        if (f == 0) return false;
+        int c = capable[dev].load(std::memory_order_relaxed);
+        if (c == 0) {
+            cudaDeviceProp pr{};
+            const bool g = cudaGetDeviceProperties(&pr, dev) == cudaSuccess && (std::strncmp(pr.gcnArchName, "gfx12", 5) == 0 || std::strncmp(pr.gcnArchName, "gfx11", 5) == 0);
+            c = g ? 1 : 2;
+            capable[dev].store(c, std::memory_order_relaxed);
+        }
+        return c == 1;
+    }
     int v = state[dev].load(std::memory_order_relaxed);
     if (v == 0) {
         cudaDeviceProp prop{};
@@ -274,6 +289,7 @@ inline bool run(const SetArgs& a, cudaStream_t s) {
     const dim3 grid((unsigned) ((a.max_rows + BM - 1) / BM), (unsigned) (N / BN), (unsigned) a.n_exp);
     static const int dbg = std::getenv("HIPK_DBG") ? std::atoi(std::getenv("HIPK_DBG")) : 0;
     set_kernel<T, GU, BM, BN, WM, WN><<<grid, 256, 0, s>>>(a, dbg);
+    launches().fetch_add(1, std::memory_order_relaxed);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 // false: not taken (the caller's tiles do it)

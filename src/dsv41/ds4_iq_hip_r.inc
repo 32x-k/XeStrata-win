@@ -205,5 +205,6 @@ inline bool runr(const SetArgs& a, cudaStream_t s) {
     const dim3 grid((unsigned) ((a.max_rows + BM - 1) / BM), (unsigned) (N / BN), (unsigned) a.n_exp);
     static const int dbg = std::getenv("HIPK_DBG") ? std::atoi(std::getenv("HIPK_DBG")) : 0;
     set_kernel_r<T, GU, BM, NW, NTW><<<grid, NW * 32, 0, s>>>(a, dbg);
+    launches().fetch_add(1, std::memory_order_relaxed);
     return cudaPeekAtLastError() == cudaSuccess;
 }
