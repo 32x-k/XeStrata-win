@@ -806,7 +806,8 @@ def flush_typed_ahead() -> None:
         pass
 
 
-def ask(question, choices, default, yes):
+def ask(question, choices, default, yes, free=False):
+    """`question`'s answer, one of `choices` (`free`: any line, checked by the caller); the default without one."""
     if yes:
         return default
     flush_typed_ahead()
@@ -821,6 +822,8 @@ def ask(question, choices, default, yes):
             return default
         if not a:
             return default
+        if free:
+            return a
         if a.lower() in [c.lower() for c in choices]:
             return next(c for c in choices if c.lower() == a.lower())
         say(f"  please answer one of: {', '.join(choices)}")
@@ -3797,6 +3800,58 @@ def image_plan(a, choice: str, text_gb: float | None) -> dict:
             "names": QI.file_names(quant, enc, tquant, dit)}
 
 
+def ask_images(cfg_path: Path) -> str | None:
+    """Image generation asked on the console: the image models (numbers, comma-separated), the default of several, and
+    their -uncensored text encoder -> an --images value; None to leave the config's as it is (none before, none now).
+    The answers the model's config `cfg_path` was written with are the defaults."""
+    QI = _qimage()
+    plain = [c for c in QI.IMAGE_MODELS if not c.endswith("-uncensored")]
+    by_name = {v[0]: k for k, v in QI.IMAGE_MODELS.items()}
+    now: list[str] = []
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        cfg = {}
+    if isinstance(cfg, dict) and isinstance(cfg.get("images"), dict):
+        now = [by_name[s["model_name"]] for s in [cfg["images"], *(cfg.get("image_models") or [])]
+               if isinstance(s, dict) and s.get("model_name") in by_name]
+    had = [c.removesuffix("-uncensored") for c in now]
+    say()
+    say("  Image generation: models that make images besides the text model (POST /v1/images/generations and the")
+    say("  web page's Images tab). One runs on the GPU at a time; with several, the web page and the API's \"model\"")
+    say("  choose, and a request that names none gets the default.")
+    for i, c in enumerate(plain, 1):
+        _, dit, enc = QI.IMAGE_MODELS[c]
+        names = QI.file_names(QI.dit_quants(dit)[-1], enc, QI.DEFAULT_TEXT_QUANT, dit)
+        need = QI.ram_need_gb(QI.dit_quants(dit)[-1], enc, QI.DEFAULT_TEXT_QUANT, dit)
+        say(f"    {i}. {c}: {QI.ABOUT.get(c, '')} (download {sum(QI.FILES[n][2] for n in names) / 1e9:.0f} GB, "
+            f"~{need:.0f} GB of RAM)")
+    default = ",".join(str(plain.index(c) + 1) for c in had if c in plain) or "none"
+    while True:
+        got = ask("Which image models? (numbers, comma-separated; none: no image generation)", [], default, False,
+                  free=True)
+        if got.lower() in ("none", "no", "n", ""):
+            return "no" if now else None
+        try:
+            picks = [plain[int(x) - 1] for x in got.replace(" ", "").split(",")]
+            if len(set(picks)) == len(picks) and all(int(x) >= 1 for x in got.replace(" ", "").split(",")):
+                break
+        except (ValueError, IndexError):
+            pass
+        say(f"  please answer numbers from 1 to {len(plain)}, comma-separated, or none")
+    if len(picks) > 1:
+        first = had[0] if had and had[0] in picks else picks[0]
+        say("  " + ", ".join(f"{i}. {c}" for i, c in enumerate(picks, 1)))
+        d = int(ask("Which is the default?", [str(i) for i in range(1, len(picks) + 1)], str(picks.index(first) + 1),
+                    False))
+        picks = [picks[d - 1], *(c for i, c in enumerate(picks, 1) if i != d)]
+    if any(c + "-uncensored" in QI.IMAGE_MODELS for c in picks):
+        unc = ask("Their text encoder with its refusal direction removed (-uncensored)?", ["y", "n"],
+                  "y" if any(c.endswith("-uncensored") for c in now) else "n", False) == "y"
+        picks = [c + "-uncensored" if unc and c + "-uncensored" in QI.IMAGE_MODELS else c for c in picks]
+    return ",".join(picks)
+
+
 def setup_images(a, gpu: dict, models_dir: Path, eng: Path,
                  text_gb: float | None = None) -> tuple[dict, list[dict]] | None:
     """--images (one choice of qimage.IMAGE_MODELS, or several, comma-separated): their files for the image engine in
@@ -6418,6 +6473,8 @@ def main() -> int:
     if vision != "none" and MODELS[model].get("vision_untested"):
         warn(f"images with {model} are untested: users report them working upstream, but this file has not been run "
              "with images (upstream #967); tell us if the answers look wrong")
+    if a.images is None and not a.yes and not JSON_OUT:   # asked here only interactively: --images says it, and the
+        a.images = ask_images(CONF / f"xestrata-{tag.lower()}.json")   # launcher (--json) passes it
     # The low-RAM mode's two variants.  resident: the experts the GPU's cache does not hold are copied from the model
     # files into RAM once (--resident-experts; the engine keeps what fits the RAM it finds free and reads the rest
     # from the files).  mmap: they are read through the OS file cache.  The GPU's share: its VRAM less the dense
