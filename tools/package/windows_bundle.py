@@ -5,22 +5,12 @@
 
     windows_bundle.py --src DIR --engine DIR --sycl DIR --launcher DIR --nuget DIR --python-zip ZIP --wheels DIR
                       --llama DIR --version V --cuda-archs A;B --out DIR
-    windows_bundle.py --src DIR --engine DIR --sycl DIR --rocm DIR --hip-archs A;B --python-zip ZIP --wheels DIR
-                      --llama DIR --version V --format zip --out DIR
-
-The second form is the AMD GPUs' build (the engine built on Windows with intel/llvm's HIP target, README.md's Windows
-section): their SYCL adapter, the engine's oneMath with its rocBLAS backend (in the engine's bin/), and rocBLAS,
-hipBLASLt and the AMD code object manager from the ROCm SDK, with the DLLs they import (found from the import tables
-with the SDK's llvm-readobj); the HIP runtime itself comes with AMD's driver.  Without --launcher the launcher is
-windows/xestrata-cli.bat, which needs no .NET.
 
 The folder (XeStrata-<version>-windows-x64/):
 
-    xestrata.exe, xestrata-cli.exe and their .NET libraries   the launchers (windows/launcher), or xestrata-cli.bat
-                                                              with WINDOWS.ja.md and WINDOWS.md (docs/)
+    xestrata.exe, xestrata-cli.exe and their .NET libraries   the launchers (windows/launcher)
     app/                  setup.py, serve/, tools/, data/ and gguf-py, read-only, with the PACKAGED record
-    app/engine/           the engine, its SYCL runtime (intel/llvm's) and BUILD.json; with --vision the image encoders
-                          strata-vision-cpu.exe and strata-vision-vulkan.exe
+    app/engine/           the engine, its SYCL runtime (intel/llvm's) and BUILD.json
     python/               Python's embeddable distribution with the packages setup and the server use
     NOTICE, COPYING, COPYING.LESSER, THIRD-PARTY-NOTICES.md, licenses/
 
@@ -40,39 +30,41 @@ import zipfile
 from pathlib import Path
 
 # The SYCL runtime's DLLs a Windows engine loads (sycl-jit.dll, the runtime compiler, is not: 120 MB the engine does
-# not use).  ze_loader.dll comes with Intel's driver, nvcuda.dll and nvml.dll with NVIDIA's.
-SYCL_DLLS = ("sycl9.dll", "ur_win_proxy_loader.dll", "ur_loader.dll", "ur_adapter_cuda.dll",
-             "ur_adapter_level_zero.dll", "ur_adapter_level_zero_v2.dll", "ur_adapter_hip.dll", "xptifw.dll")
-# the runtime's own: a runtime built for some makers' GPUs only (the AMD build's: HIP) lacks the other adapters
-SYCL_CORE = ("sycl9.dll", "ur_win_proxy_loader.dll", "ur_loader.dll")
-ENGINE_EXES = ("strata.exe", "strata-device.exe", "strata-image.exe")
-# the image encoders (tools/vision, --vision): on the CPU, and on the GPU through Vulkan
-VISION_EXES = ("strata-vision-cpu.exe", "strata-vision-vulkan.exe")
+# not use).  ze_loader.dll comes with Intel's driver, nvcuda.dll and nvml.dll with NVIDIA's, amdhip64_7.dll with AMD's.
+SYCL_DLLS = ("sycl9.dll", "ur_win_proxy_loader.dll", "ur_adapter_cuda.dll", "ur_adapter_hip.dll",
+             "ur_adapter_level_zero.dll", "ur_adapter_level_zero_v2.dll", "xptifw.dll")
+ENGINE_EXES = ("strata.exe", "strata-device.exe", "strata-image.exe", "strata-vision-cpu.exe")
+# oneMath and its oneMKL backend (the engine's build folder's bin/), which loads oneMKL where the user installed it
+ONEMATH_DLLS = ("onemath.dll", "onemath_blas_mklgpu.dll", "onemath_blas_cublas.dll", "onemath_blas_rocblas.dll")
+# AMD GPUs' image attention: the engine's module that opens aotriton (on an AMD GPU only), aotriton's library (built
+# in the engine's build, liblzma linked in) and its kernels' images, which it finds beside it
+AOTRITON_DLLS = ("strata_sdpa_aotriton.dll", "aotriton_v2.dll")
+# Intel GPUs' image attention: oneDNN (built in the engine's build, onednn/bin/)
+ONEDNN_DLLS = ("dnnl.dll",)
 # what a Windows PC brings (the Visual C++ runtime, which xestrata.exe checks for) and what must never be carried
 FORBIDDEN = ("vcruntime*.dll", "msvcp*.dll", "concrt*.dll", "ucrtbase*.dll", "api-ms-win-*.dll", "nvcuda.dll",
-             "nvml.dll", "cublas*.dll", "cudart*.dll", "mkl_*.dll", "amdhip64*.dll", "ze_loader*.dll", "vulkan-1.dll")
-# what the AMD build's DLLs import from Windows and from AMD's and Intel's drivers (amdhip64_7.dll, ze_loader.dll, the
-# Vulkan loader vulkan-1.dll): never followed into the folder
-SYSTEM_DLL = re.compile(r"(?i)^(api-ms-win-.*|ext-ms-.*|kernel32|user32|gdi32|advapi32|ole32|oleaut32|shell32|shlwapi|"
-                        r"ws2_32|bcrypt|crypt32|dbghelp|version|setupapi|cfgmgr32|dxgi|d3d12|dxcore|ntdll|ucrtbase|"
-                        r"vcruntime140(_1)?|msvcp140(_atomic_wait|_1|_2)?|vcomp140|amdhip64_7|ze_loader|"
-                        r"vulkan-1)\.dll$")
-# the kernel libraries rocBLAS and hipBLASLt open from folders beside their DLLs
-ROCM_DATA = ("rocblas", "hipblaslt")
-# the Python packages the 7z carries (requirements.txt without the build tools, and colorama, which tqdm takes on
+             "nvml.dll", "cublas*.dll", "cudart*.dll", "mkl_*.dll", "amdhip64*.dll", "amd_comgr*.dll", "rocblas*.dll",
+             "*hipblaslt*.dll")
+# the Python packages the 7z carries (requirements.txt, and colorama, which tqdm takes on
 # Windows): a wheel not named here stops the script
 WHEELS = ("numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "psutil", "markupsafe", "certifi",
-          "charset-normalizer", "charset_normalizer", "idna", "urllib3", "colorama")
+          "charset-normalizer", "charset_normalizer", "idna", "urllib3", "colorama", "pip")
 
 # name, version (a key of `versions`, or the text), license, source, license texts (paths relative to `roots`' keys, or
 # URLs), the files in the folder it covers (globs relative to its top)
 COMPONENTS = [
     ("XeStrata", "version", "LGPL-3.0-or-later (with MIT parts: NOTICE)", "https://github.com/MistVVK/XeStrata",
      [], ["xestrata.exe", "xestrata-cli.exe", "xestrata.dll", "xestrata-cli.dll", "Xestrata.Launcher.Core.dll",
-          *(f"app/engine/{e}" for e in (*ENGINE_EXES, *VISION_EXES))]),
+          *(f"app/engine/{e}" for e in ENGINE_EXES), f"app/engine/{AOTRITON_DLLS[0]}"]),
+    ("oneMath (XeStrata's fork)", "onemath", "Apache-2.0", "https://github.com/MistVVK/oneMath", ["onemath:LICENSE"],
+     [f"app/engine/{d}" for d in ONEMATH_DLLS]),
+    ("ROCm BLAS headers (rocBLAS, hipBLASLt and hipblas-common; compiled into onemath_blas_rocblas.dll)",
+     "ROCm 7.1 (Ubuntu 26.04's)", "MIT",
+     "https://github.com/ROCm/rocm-libraries", ["rocm:LICENSE-*.txt"], []),
     ("intel/llvm (DPC++) SYCL runtime, with Unified Runtime, UMF and hwloc", "intel-llvm",
      "Apache-2.0 WITH LLVM-exception; UMF Apache-2.0 WITH LLVM-exception; hwloc BSD-3-Clause; Level Zero loader "
-     "headers MIT", "https://github.com/intel/llvm", ["sycl:licenses/*"], [f"app/engine/{d}" for d in SYCL_DLLS]),
+     "headers MIT; AMD's HIP headers MIT", "https://github.com/intel/llvm", ["sycl:licenses/*"],
+     [f"app/engine/{d}" for d in SYCL_DLLS]),
     (".NET application host", "dotnet", "MIT", "https://github.com/dotnet/runtime",
      ["https://raw.githubusercontent.com/dotnet/runtime/main/LICENSE.TXT",
       "https://raw.githubusercontent.com/dotnet/runtime/main/THIRD-PARTY-NOTICES.TXT"], []),
@@ -101,43 +93,24 @@ COMPONENTS = [
     ("gguf-py (llama.cpp)", "llama.cpp", "MIT", "https://github.com/ggml-org/llama.cpp", ["llama:LICENSE"], []),
     ("Outfit (the web app's font)", "outfit", "OFL-1.1", "https://github.com/Outfitio/Outfit-Fonts",
      ["src:third_party/main/outfit/OFL.txt"], []),
+    ("AOTriton (its library and kernels' images)", "0.14.2b", "MIT; the images can carry parts of aiter (MIT), "
+     "FlyDSL's kernels (Apache-2.0) and Triton (MIT)", "https://github.com/ROCm/aotriton",
+     ["src:third_party/main/aotriton/LICENSE", "src:third_party/main/aotriton/LICENSE.aiter",
+      "src:third_party/main/aotriton/LICENSE.FlyDSL", "src:third_party/main/aotriton/LICENSE.triton"],
+     ["app/engine/aotriton_v2.dll", "app/engine/aotriton.images/*"]),
+    ("liblzma of XZ Utils (linked into aotriton_v2.dll)", "5.8.1", "0BSD", "https://tukaani.org/xz/",
+     ["src:third_party/main/xz/COPYING.0BSD"], []),
+    ("oneDNN", "3.12", "Apache-2.0 (parts of it under other licenses, listed in THIRD-PARTY-PROGRAMS)",
+     "https://github.com/uxlfoundation/oneDNN",
+     ["src:third_party/main/oneDNN/LICENSE", "src:third_party/main/oneDNN/THIRD-PARTY-PROGRAMS"],
+     ["app/engine/dnnl.dll"]),
+    ("cuDNN Frontend (compiled into strata-image.exe)", "1.31.0", "Apache-2.0 (parts MIT)",
+     "https://github.com/NVIDIA/cudnn-frontend", ["src:third_party/main/cudnn-frontend/LICENSE.txt"], []),
     ("stb_image (compiled into strata-image.exe)", "2.30", "MIT OR Unlicense", "https://github.com/nothings/stb",
      ["src:third_party/main/stb/LICENSE"], []),
     ("quantscope", "quantscope", "MIT OR Apache-2.0", "https://github.com/1872183316/quantscope",
      ["src:third_party/main/quantscope/LICENSE-MIT", "src:third_party/main/quantscope/LICENSE-APACHE"], []),
 ]
-
-# the AMD build's (--rocm): name, version key, license, source, texts, globs, as COMPONENTS
-AMD_COMPONENTS = [
-    ("oneMath, XeStrata's fork (dense products on rocBLAS)", "onemath", "Apache-2.0",
-     "https://github.com/MistVVK/oneMath", ["src:third_party/main/oneMath/LICENSE"], ["app/engine/onemath*.dll"]),
-    ("rocBLAS (ROCm)", "rocm", "MIT", "https://github.com/ROCm/rocm-libraries/tree/develop/projects/rocblas",
-     ["rocm:share/doc/rocblas/LICENSE.md"], ["app/engine/rocblas.dll"]),
-    ("hipBLASLt, with TensileLite (ROCm)", "rocm", "MIT",
-     "https://github.com/ROCm/rocm-libraries/tree/develop/projects/hipblaslt", ["rocm:share/doc/hipblaslt/LICENSE.md"],
-     ["app/engine/libhipblaslt.dll", "app/engine/libtensilelite-host.dll"]),
-    ("origami (ROCm, hipBLASLt's)", "rocm", "MIT", "https://github.com/ROCm/rocm-libraries/tree/develop/shared/origami",
-     ["src:tools/package/licenses/origami-LICENSE.md"], ["app/engine/origami.dll"]),
-    ("AMD code object manager (comgr, ROCm)", "rocm", "Apache-2.0 WITH LLVM-exception",
-     "https://github.com/ROCm/llvm-project/tree/amd-staging/amd/comgr", ["rocm:share/doc/amd_comgr/LICENSE.txt"],
-     ["app/engine/amd_comgr*.dll"]),
-]
-# the image encoders' (--vision): what llama.cpp's mtmd compiles into them, as COMPONENTS
-VISION_COMPONENTS = [
-    ("llama.cpp, ggml and mtmd (compiled into strata-vision-*.exe)", "llama.cpp",
-     "MIT; vendored: xxhash BSD-2-Clause, rotate-bits MIT, stb_image MIT OR Unlicense, miniaudio MIT-0 OR Unlicense, "
-     "subprocess.h Unlicense, sha1 and sha256 public domain", "https://github.com/ggml-org/llama.cpp",
-     ["llama:LICENSE", "llama:vendor/hash/xxhash/LICENSE", "llama:vendor/hash/rotate-bits/LICENSE.md"],
-     [f"app/engine/{e}" for e in VISION_EXES]),
-    ("Vulkan-Headers (compiled into strata-vision-vulkan.exe; the loader vulkan-1.dll is the GPU driver's)",
-     "vulkan-headers", "Apache-2.0 OR MIT", "https://github.com/KhronosGroup/Vulkan-Headers",
-     [f"https://raw.githubusercontent.com/KhronosGroup/Vulkan-Headers/v1.4.363/{p}"
-      for p in ("LICENSE.md", "LICENSES/Apache-2.0.txt", "LICENSES/MIT.txt")], []),
-]
-# the launchers' components, which a zip with xestrata-cli.bat does not carry
-DOTNET = (".NET application host", "Avalonia", "ANGLE (Avalonia's build)", "SkiaSharp and Skia",
-          "HarfBuzzSharp and HarfBuzz", "FSharp.Core", "MicroCom.Runtime",
-          "Tmds.DBus.Protocol (Avalonia's Linux part, not used on Windows)")
 
 # the program's files from the source tree (as cmake/packaging.cmake installs them on Linux)
 APP_FILES = ("setup.py", "chat.py", "requirements.txt")
@@ -163,22 +136,9 @@ def fetch(url: str) -> bytes:
         return r.read()
 
 
-def python_version(python_zip: Path) -> str:
-    """The version in the name of python.org's embeddable zip (python-3.14.8-embed-amd64.zip)."""
-    m = re.search(r"\d+\.\d+(?:\.\d+)?", python_zip.stem)
-    return m.group(0) if m else python_zip.stem
-
-
-def version_key(v: str) -> tuple:
-    """A NuGet version's order: its numbers, then a pre-release (1.0.0-beta1) before the release (1.0.0)."""
-    main, _, pre = v.partition("-")
-    nums = tuple(int(x) if x.isdigit() else 0 for x in main.split("."))
-    return nums, (0, pre) if pre else (1, "")
-
-
 def nuget_version(nuget: Path, package: str) -> str:
     versions = sorted((p.name for p in (nuget / package).iterdir() if p.is_dir()),
-                      key=version_key)
+                      key=lambda v: [int(x) if x.isdigit() else x for x in v.replace("-", ".").split(".")])
     if not versions:
         fail(f"no NuGet package {package} in {nuget}")
     return versions[-1]
@@ -203,70 +163,27 @@ def unbundle_runtime(site: Path) -> None:
         lib.unlink()
 
 
-def imports(readobj: str, dll: Path) -> list:
-    try:
-        text = subprocess.run([readobj, "--coff-imports", str(dll)], capture_output=True, text=True,
-                              check=True).stdout
-    except (OSError, subprocess.CalledProcessError) as e:
-        fail(f"llvm-readobj could not read the imports of {dll.name} ({e})")
-        return []
-    return sorted(set(re.findall(r"Name:\s+(\S+\.dll)", text, re.I)))
-
-
-def copy_imports(readobj: str, eng: Path, dirs: list) -> None:
-    """Every DLL the engine folder's programs and libraries import, from `dirs` (the first that has it), into the
-    folder, and what those import in turn; Windows' own and the driver's (SYSTEM_DLL) stay out."""
-    todo = [p for p in eng.iterdir() if p.suffix.lower() in (".exe", ".dll")]
-    while todo:
-        path = todo.pop()
-        for name in imports(readobj, path):
-            if SYSTEM_DLL.match(name) or (eng / name).exists():
-                continue
-            src = next((d / name for d in dirs if (d / name).is_file()), None)
-            if src is None:
-                fail(f"{path.name} imports {name}, which none of {', '.join(map(str, dirs))} has")
-                return
-            shutil.copy2(src, eng / name)
-            todo.append(eng / name)
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    for name in ("src", "engine", "sycl", "wheels", "llama", "out"):
+    for name in ("src", "engine", "sycl", "launcher", "nuget", "wheels", "llama", "rocm", "out"):
         ap.add_argument(f"--{name}", type=Path, required=True)
-    ap.add_argument("--launcher", type=Path, help="the .NET launchers (windows/launcher); without it xestrata-cli.bat")
-    ap.add_argument("--nuget", type=Path, help="the NuGet cache the launchers were built from (with --launcher)")
-    ap.add_argument("--rocm", type=Path, help="the ROCm SDK (bin/rocblas.dll, share/doc): the AMD GPUs' build")
-    ap.add_argument("--vision", type=Path, help="the folder with the image encoders (tools/vision built for Windows): "
-                                                "strata-vision-cpu.exe and strata-vision-vulkan.exe")
     ap.add_argument("--python-zip", type=Path, required=True)
     ap.add_argument("--version", required=True)
-    ap.add_argument("--cuda-archs", default="", help="the engine's NVIDIA architectures, sm_60;sm_61;...")
-    ap.add_argument("--hip-archs", default="", help="the engine's AMD architectures, gfx1030;gfx1100;... (with --rocm)")
-    ap.add_argument("--format", choices=("7z", "zip"), default="7z")
-    ap.add_argument("--source", default="https://github.com/MistVVK/XeStrata", help="where XeStrata's source is")
+    ap.add_argument("--cuda-archs", required=True, help="the engine's NVIDIA architectures, sm_60;sm_61;...")
+    ap.add_argument("--hip-archs", required=True, help="the engine's AMD architectures, gfx1030;gfx1100;...")
+    ap.add_argument("--mkl-version", required=True, help="the oneMKL the engine was built with, 2026.2.0")
     a = ap.parse_args()
-    if a.launcher is not None and a.nuget is None:
-        fail("--launcher needs --nuget (the launchers' packages, for their notices)")
 
-    # the AMD GPUs' build is named after the makers' GPUs it runs on: AMD's, and Intel's where the SYCL runtime has
-    # their Level Zero adapter
-    intel = (a.sycl / "bin" / "ur_adapter_level_zero.dll").is_file()
-    top_name = f"XeStrata-{a.version}-windows-x64" + (("-amd-intel" if intel else "-amd") if a.rocm else "")
+    top_name = f"XeStrata-{a.version}-windows-x64"
     top = a.out / top_name
     shutil.rmtree(top, ignore_errors=True)
     top.mkdir(parents=True)
 
     # ---- the launchers
-    if a.launcher is None:
-        shutil.copy2(a.src / "windows" / "xestrata-cli.bat", top / "xestrata-cli.bat")
-        for name in ("WINDOWS.ja.md", "WINDOWS.md"):   # how to use xestrata-cli.bat (docs/WINDOWS.md)
-            shutil.copy2(a.src / "docs" / name, top / name)
-    else:
-        for f in a.launcher.iterdir():
-            if f.suffix == ".pdb":
-                continue
-            (copy_tree(f, top / f.name) if f.is_dir() else shutil.copy2(f, top / f.name))
+    for f in a.launcher.iterdir():
+        if f.suffix == ".pdb":
+            continue
+        (copy_tree(f, top / f.name) if f.is_dir() else shutil.copy2(f, top / f.name))
 
     # ---- the program
     app = top / "app"
@@ -286,29 +203,25 @@ def main() -> None:
     eng.mkdir()
     for e in ENGINE_EXES:
         shutil.copy2(a.engine / e, eng / e)
-    for e in VISION_EXES if a.vision is not None else ():
-        if not (a.vision / e).is_file():
-            fail(f"{a.vision / e} is missing")
-        shutil.copy2(a.vision / e, eng / e)
     for d in SYCL_DLLS:
-        if (a.sycl / "bin" / d).is_file():
-            shutil.copy2(a.sycl / "bin" / d, eng / d)
-        elif d in SYCL_CORE:
-            fail(f"{a.sycl / 'bin' / d} is missing")
-    if a.rocm is not None:
-        for f in (a.engine / "bin").glob("onemath*.dll"):   # oneMath and its rocBLAS backend, which it loads by name
-            shutil.copy2(f, eng / f.name)
-        readobj = shutil.which("llvm-readobj") or str(a.rocm / "lib" / "llvm" / "bin" / "llvm-readobj.exe")
-        copy_imports(readobj, eng, [a.engine / "bin", a.sycl / "bin", a.rocm / "bin"])
-        for d in ROCM_DATA:
-            if (eng / f"{'lib' if d == 'hipblaslt' else ''}{d}.dll").exists() and (a.rocm / "bin" / d).is_dir():
-                copy_tree(a.rocm / "bin" / d, eng / d)
+        shutil.copy2(a.sycl / "bin" / d, eng / d)
+    for d in ONEMATH_DLLS:
+        shutil.copy2(a.engine / "bin" / d, eng / d)
+    for d in ONEDNN_DLLS:
+        shutil.copy2(a.engine / "onednn" / "bin" / d, eng / d)
+    aot = a.engine / "_deps" / "aotriton" / "aotriton"
+    shutil.copy2(a.engine / AOTRITON_DLLS[0], eng / AOTRITON_DLLS[0])
+    shutil.copy2(aot / "lib" / AOTRITON_DLLS[1], eng / AOTRITON_DLLS[1])
+    shutil.copytree(aot / "lib" / "aotriton.images", eng / "aotriton.images")
     archs = [x for x in a.cuda_archs.split(";") if x]
-    hip_archs = [x for x in a.hip_archs.split(";") if x]
     (eng / "BUILD.json").write_text(json.dumps({
-        "source": "package", "backend": "xe", "package": top_name, "version": a.version,
-        "license": "contrib" if archs else "free", "cuda_archs": archs, "hip_archs": hip_archs, "runtime": {},
-        "lib_dirs": []}, indent=1) + "\n")
+        "source": "package", "backend": "xe", "package": top_name, "version": a.version, "license": "contrib",
+        "cuda_archs": archs, "hip_archs": [x for x in a.hip_archs.split(";") if x],
+        # oneMKL's pip packages for the Python the 7z carries (setup names them), the version the engine was built with,
+        # without the SYCL runtime they depend on (the 7z's)
+        "runtime": {"onemkl_pip": [f"onemkl-sycl-blas=={a.mkl_version}", f"mkl=={a.mkl_version}", "tbb==2023.*",
+                                   f"onemkl-license=={a.mkl_version}"]}, "lib_dirs": []},
+        indent=1) + "\n")
 
     # ---- Python: the embeddable distribution without its Visual C++ runtime (the user's, which xestrata.exe checks)
     # and its ._pth (which would leave the script's folder off sys.path: setup.py imports serve/ from beside it), and
@@ -335,35 +248,28 @@ def main() -> None:
     lic = top / "licenses"
     lic.mkdir()
     versions = {"version": a.version, "dotnet": "10", "llama.cpp": "the commit setup.py pins",
-                "vulkan-headers": "1.4.363 (the Vulkan SDK the encoders were built with)",
                 "outfit": "third_party/main/outfit", "quantscope": "bfdf205",
-                "python": python_version(a.python_zip)}
+                "python": a.python_zip.stem.split("-")[1]}
     sycl_rec = json.loads((a.sycl / "XESTRATA.json").read_text())
     versions["intel-llvm"] = f"{sycl_rec['tag']} ({sycl_rec['commit'][:12]}, with XeStrata's patches)"
-    if a.launcher is not None:
-        for pkg in ("avalonia", "avalonia.angle.windows.natives", "skiasharp", "harfbuzzsharp", "fsharp.core",
-                    "microcom.runtime", "tmds.dbus.protocol"):
-            versions[pkg] = nuget_version(a.nuget, pkg)
-    roots = {"sycl": a.sycl, "python": py, "llama": a.llama, "src": a.src, "nuget": a.nuget, "rocm": a.rocm}
-    if a.rocm is not None:
-        versions["onemath"] = "the tag CMakeLists.txt fetches"
-        # the SDK's version from its wheel's record beside it (TheRock's rocm_sdk_devel), never the build machine's path
-        rec = sorted(a.rocm.parent.glob("rocm_sdk_devel-*.dist-info"))
-        sdk = rec[-1].name[len("rocm_sdk_devel-"):-len(".dist-info")] if rec else "version not recorded"
-        versions["rocm"] = f"the ROCm SDK the engine was built with ({sdk})"
-    components = [c for c in COMPONENTS if a.launcher is not None or c[0] not in DOTNET]
-    components += AMD_COMPONENTS if a.rocm is not None else []
-    components += VISION_COMPONENTS if a.vision is not None else []
+    # the fork's tag the engine's build fetched (CMakeLists.txt pins it)
+    m = re.search(r"tags/([\w.-]+)\.tar\.gz", (a.engine / "CMakeCache.txt").read_text())
+    versions["onemath"] = m.group(1) if m else "the archive CMakeLists.txt pins"
+    for pkg in ("avalonia", "avalonia.angle.windows.natives", "skiasharp", "harfbuzzsharp", "fsharp.core",
+                "microcom.runtime", "tmds.dbus.protocol"):
+        versions[pkg] = nuget_version(a.nuget, pkg)
+    roots = {"sycl": a.sycl, "python": py, "llama": a.llama, "src": a.src, "nuget": a.nuget, "rocm": a.rocm,
+             "onemath": a.engine / "_deps" / "strata_onemath-src"}
     rows = []
     covered: set = set()
     files = [p.relative_to(top).as_posix() for p in top.rglob("*") if p.is_file()]
-    for name, ver_key, license_, source, texts, globs in components:
+    for name, ver_key, license_, source, texts, globs in COMPONENTS:
         version = versions.get(ver_key, ver_key)
         slug = "".join(c if c.isalnum() else "-" for c in name.split(" (")[0].lower()).strip("-")
         kept = []
         for t in texts:
             if t.startswith("http"):
-                url = t.format(avalonia=versions.get("avalonia", ""))
+                url = t.format(avalonia=versions["avalonia"])
                 data = fetch(url)
                 dst = lic / f"{slug}-{Path(url).name}"
                 dst.write_bytes(data)
@@ -379,8 +285,6 @@ def main() -> None:
                 fail(f"{name}: no license text {t}")
             for text in found:
                 dst = lic / f"{slug}-{text.name}"
-                if dst in kept:                        # two texts of one name (llama.cpp's LICENSE, xxhash's)
-                    dst = lic / f"{slug}-{text.parent.name}-{text.name}"
                 shutil.copy2(text, dst)
                 kept.append(dst)
         for g in globs:
@@ -396,7 +300,9 @@ def main() -> None:
             fail(f"{dist.name}: no license text in the wheel")
         kept = []
         for text in wheel_texts:
-            dst = lic / f"python-{field('Name').lower()}-{text.name}"
+            # a text below licenses/'s own folders (pip's of the packages it vendors, all named LICENSE) by its path
+            parts = text.relative_to(dist).parts
+            dst = lic / f"python-{field('Name').lower()}-{'-'.join(parts[1:]) if len(parts) > 2 else text.name}"
             shutil.copy2(text, dst)
             kept.append(dst.relative_to(top).as_posix())
         record = (dist / "RECORD").read_text().splitlines()
@@ -416,25 +322,19 @@ def main() -> None:
 
     lines = ["# Third-party notices", "",
              f"XeStrata {a.version} for Windows carries the components below. XeStrata itself is under the LGPL "
-             f"(`NOTICE`, `COPYING`, `COPYING.LESSER`); its source is at {a.source}. "
+             "(`NOTICE`, `COPYING`, `COPYING.LESSER`); its source is at https://github.com/MistVVK/XeStrata. "
              "The license texts are in `licenses/`.", "",
-             "The Microsoft Visual C++ runtime, the GPU makers' drivers and NVIDIA's libraries and AMD's HIP runtime "
-             "are not part of it: they come with Windows' Visual C++ Redistributable and the drivers.", "",
+             "The Microsoft Visual C++ runtime, the GPU makers' drivers and NVIDIA's libraries are not part of it: "
+             "they come with Windows' Visual C++ Redistributable and the drivers.", "",
              "| Component | Version | License | Source | Texts |", "| --- | --- | --- | --- | --- |"]
     for name, version, license_, source, kept in rows:
         lines.append(f"| {name} | {version} | {license_} | {source} | {', '.join(f'`{k}`' for k in kept)} |")
     (top / "THIRD-PARTY-NOTICES.md").write_text("\n".join(lines) + "\n")
 
-    archive = a.out / f"{top_name}.{a.format}"
+    archive = a.out / f"{top_name}.7z"
     archive.unlink(missing_ok=True)
-    if a.format == "zip":
-        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-            for f in sorted(top.rglob("*")):
-                if f.is_file():
-                    z.write(f, f.relative_to(a.out).as_posix())
-    else:
-        subprocess.run(["7z", "a", "-t7z", "-mx=9", "-bd", str(archive), top_name], cwd=a.out, check=True,
-                       stdout=subprocess.DEVNULL)
+    subprocess.run(["7z", "a", "-t7z", "-mx=9", "-bd", str(archive), top_name], cwd=a.out, check=True,
+                   stdout=subprocess.DEVNULL)
     say(f"{archive} ({archive.stat().st_size / 2**20:.0f} MiB)")
 
 

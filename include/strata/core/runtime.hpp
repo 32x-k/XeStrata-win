@@ -17,6 +17,9 @@ namespace strata::core {
 
 /// Whether a GPU is the processor's own graphics (src/core/device.cpp).
 bool integrated_gpu(const sycl::device& d);
+/// The version of the Intel Graphics Compiler whose GEP simplification the runtime turned off for the engine's
+/// Level Zero GPU ("2.28.4"; "unknown" when the library carries none), empty when it did not (src/core/device.cpp).
+std::string compiler_workaround();
 
 // One runtime per engine device: its context owns its queues and every USM allocation made on it. Cross-queue
 // consumers must depend on the producer event; in-order applies within a queue.  Device 0 is the GPU find_devices

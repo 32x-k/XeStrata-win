@@ -45,12 +45,12 @@ The engine builds in two modes (AGENTS.md, "Free and non-free builds"), chosen b
 
 - **free** (`-DSTRATA_LICENSE=free`): built with intel/llvm's DPC++ 7 or later (its SYCL runtime is libsycl 9).
   Free software only; no oneAPI environment is used.
-  Validated with intel/llvm v7.1.1 built from source by `tools/intel_llvm_build.py` (see [Setup](#setup)).
+  Validated with intel/llvm v7.2.0 built from source by `tools/intel_llvm_build.py` (see [Setup](#setup)).
   A distribution's package of version 7 or later serves as well; an older one (Ubuntu 26.04's `dpclang++` 6.2) is refused by CMake and setup.
   6.2's SYCL runtime reported no XMX for the Arc Pro B70, and the prefill path took about 1.6 times as long.
   With intel/llvm built with ROCm's HIP, `STRATA_HIP_ARCHS` (`gfx1200`, for example) makes the code for AMD GPUs (RDNA2 and later: gfx103x, gfx11xx, gfx12xx) as well.
   ROCm is free software, so this is the same in the free and contrib-llvm modes ([DEVTOOLS.md](DEVTOOLS.md#hip-amd-gpus)).
-  `auto` (the default) takes this PC's AMD GPUs as the kernel's KFD reports them, and `rocblas` every RDNA2 or later GPU the distribution's rocBLAS has code for and the SYCL compiler has a target for (the packages are built so; intel/llvm 7.1.1 has none for gfx1152 and gfx1153).
+  `auto` (the default) takes this PC's AMD GPUs as the kernel's KFD reports them, and `rocblas` every RDNA2 or later GPU the distribution's rocBLAS has code for and the SYCL compiler has a target for (the packages are built so; intel/llvm 7.2.0 has none for gfx1152 and gfx1153).
   For ROCm's device libraries (`ockl.bc`), CMake builds a test kernel for the AMD GPU with AMD's in `/opt/rocm*`, the distribution's and the SYCL compiler's own (`tools/intel_llvm_build.py` builds them with it), in that order, and takes the first that builds.
   The installed ROCm's are taken where they build; the compiler's own where those are of a newer LLVM than the compiler's, which it cannot read (ROCm 7.14's, for example).
   When none does, it stops with each one's reason (bitcode of a newer LLVM than the compiler's, files the compiler asks for that are missing).
@@ -62,7 +62,7 @@ The engine builds in two modes (AGENTS.md, "Free and non-free builds"), chosen b
 - **contrib-llvm** (the default, `-DSTRATA_LICENSE=contrib`): intel/llvm built with its CUDA target (`tools/intel_llvm_build.py --contrib`), and with `STRATA_CUDA_ARCHS` (`sm_89`, for example) the code for NVIDIA GPUs as well.
   XeStrata's source is the free mode's and stays free software,
   but the build needs NVIDIA's CUDA toolkit and a run NVIDIA's driver, neither of them free software (XeStrata ships neither).
-  Validated to build for sm_89 with Ubuntu 26.04's `nvidia-cuda-toolkit` 12.4 and intel/llvm v7.1.1.
+  Validated to build for sm_89 with Ubuntu 26.04's `nvidia-cuda-toolkit` 12.4 and intel/llvm v7.2.0.
   Validated to run on an RTX 4070 (sm_89).
   The engine links no maker's driver library: the SYCL runtime and oneMath open the ones that are there at run time.
   So it runs without NVIDIA's driver and CUDA on a PC with only Intel GPUs, and without Level Zero on one with only NVIDIA GPUs
@@ -81,7 +81,7 @@ On a PC with several CUDA toolkits (a distribution's `/usr/lib/cuda` and NVIDIA'
 `STRATA_CUDA_PATH`'s default, `auto`, tries each toolkit found (`CUDA_PATH`, `CUDA_HOME`, `CUDA_ROOT`, `/usr/local/cuda-*`, `/opt/cuda`, `/usr/lib/cuda`, the `nvcc` on PATH) and takes the one that builds code for the most of this PC's NVIDIA GPUs, then the newest architectures for them, then has cuBLAS, then is the newest (`cmake/StrataCuda.cmake`).
 The GPU code and oneMath's cuBLAS both use it; a toolkit without cuBLAS gets no cuBLAS backend, and the dense products run on XeStrata's own kernels.
 Each GPU gets code for its architecture, or the newest older one the toolkit builds, and the driver compiles that PTX for the GPU.
-intel/llvm 7.1.1's SYCL has no name above sm_90, so an architecture without one (an RTX 50's sm_120) is built through the generic NVIDIA target (`nvptx64-nvidia-cuda` with `--cuda-gpu-arch`); an executable takes it once, for the oldest GPU that needs it. A toolkit before CUDA 12.8 cannot build it, and the GPU gets sm_90 code.
+intel/llvm 7.2.0's SYCL has no name above sm_90, so an architecture without one (an RTX 50's sm_120) is built through the generic NVIDIA target (`nvptx64-nvidia-cuda` with `--cuda-gpu-arch`); an executable takes it once, for the oldest GPU that needs it. A toolkit before CUDA 12.8 cannot build it, and the GPU gets sm_90 code.
 oneMath's cuBLAS backend takes one architecture, the oldest (the products themselves run inside cuBLAS).
 An executable built with CUDA 13.1 for sm_89 and the generic sm_120 took the sm_89 image on the 4070 and passed its 52 CTest tests.
 An old GPU a toolkit dropped (Volta in CUDA 13, for one) makes it take a toolkit that has it, if there is one; otherwise it gets a warning and no code.
@@ -91,7 +91,7 @@ A driver older than the toolkit cannot load it, so `STRATA_CUDA_PTX`'s default, 
 A PTX 7.8 build passed its 52 CTest tests on an RTX 4070.
 The driver needs CUDA 12.0 or later (525 or later) for the functions intel/llvm's CUDA adapter calls (SYCL graphs: `cuGraphAddKernelNode_v2`).
 Both variables default to `auto`; a value given is used as it is (to build for another machine).
-CMake fetches oneMath from XeStrata's fork on GitHub when it configures ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), tag `xestrata-3`, checking the archive's SHA-256): oneMath with XeStrata's changes (cuBLAS's BF16 product, hipBLASLt in the rocBLAS backend, the cuBLAS and rocBLAS backends' targets kept apart, so that one build makes both, and the rocBLAS backend without what HIP and SYCL deprecate), with oneMath's `develop` merged into it.
+CMake fetches oneMath from XeStrata's fork on GitHub when it configures ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), tag `xestrata-10`, checking the archive's SHA-256): oneMath with XeStrata's changes (cuBLAS's BF16 product, hipBLASLt in the rocBLAS backend, the int8 products in the rocBLAS and cuBLAS backends, the cuBLAS and rocBLAS backends' targets kept apart, so that one build makes both, the rocBLAS backend without what HIP and SYCL deprecate, and Windows built by the GNU-style clang++ of the cross build, its cuBLAS and rocBLAS backends with Windows' import libraries), with oneMath's `develop` merged into it.
 On a machine without the network, give it the same archive with `STRATA_ONEMATH_SOURCE` (a local file or URL).
 The changes are listed in [third_party/main/README.md](../third_party/main/README.md).
 Where oneMath has no backend for the GPU the own kernels take the products.
@@ -313,6 +313,10 @@ It prints other choices too, as in `./setup.sh --packages fedora44/intel,amd --l
 | NVIDIA GPUs (contrib-llvm) | `nvidia-cuda-toolkit` and NVIDIA's driver | `cuda-toolkit-13-4` (NVIDIA's CUDA repository) and NVIDIA's driver | `cuda` and NVIDIA's driver |
 
 - The packages starting with `intel-oneapi-` are in Intel's oneAPI repository (Intel's guides show how to add it: [APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html), [DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)).
+- Intel GPU drivers (`libze-intel-gpu1` and the rest) ship old on Ubuntu 24.04/26.04 (26.04 has compute-runtime 26.05 and IGC 2.28).
+  Below compute-runtime 26.22 a driver state can refuse device allocations while the VRAM is free (Intel's [compute-runtime #916](https://github.com/intel/compute-runtime/issues/916); the driver works around an xe kernel bug fixed in Linux 7.1 — on XeStrata's side, [#34](https://github.com/MistVVK/XeStrata/issues/34)).
+  On Ubuntu 24.04/26.04 with the HWE kernel, setup points to [Intel's graphics PPA](https://launchpad.net/~kobuk-team/+archive/ubuntu/intel-graphics) (a newer compute-runtime and IGC) and stops the start until it is updated (`--old-driver` starts anyway).
+  On the GA kernel it recommends moving to the HWE kernel with the PPA, or Fedora 44 / Podman (whose IGC is 2.32 or later; [Troubleshooting](DETAILS.md#troubleshooting)).
 - The common row's Vulkan packages (`libvulkan-dev` and the others) are for the GPU image encoder, and `libblosc2-dev` (`blosc2-devel`) for compressing the saved conversations (optional; [`conversation_save_compress`](DETAILS.md#keeping-parked-conversations-across-restarts-opt-in)).
 - The AMD row's `clang-21` and `libclang-rt-21-dev` (on Fedora `rocm-clang` and `rocm-clang-runtime-devel`: ROCm's clang and its runtime) compile nothing (intel/llvm does the compiling).
   HIP's CMake package, which oneMath's rocBLAS backend reads, asks the compiler for clang's runtime builtins (`libclang_rt.builtins`) to add them to the link.
@@ -384,7 +388,7 @@ tools/package/build.sh fedora44 cuda13.4
 | cuda13.4 | Fedora 44 | `cuda-toolkit-13-4` from NVIDIA's repository | sm_75, sm_80, sm_86, sm_89, sm_90 |
 | cuda12.4 | Ubuntu 26.04 | `nvidia-cuda-toolkit` | sm_60, sm_61, sm_70, sm_75, sm_80, sm_86, sm_89, sm_90 |
 
-Every variant has AMD code for the GPUs the distribution's rocBLAS (ROCm 7.1) has code for (but gfx1152 and gfx1153, which intel/llvm 7.1.1 has no target for).
+Every variant has AMD code for the GPUs the distribution's rocBLAS (ROCm 7.1) has code for (but gfx1152 and gfx1153, which intel/llvm 7.2.0 has no target for).
 
 | Distribution | AMD code |
 | --- | --- |
@@ -394,7 +398,7 @@ Every variant has AMD code for the GPUs the distribution's rocBLAS (ROCm 7.1) ha
 - A cuda variant is named after the CUDA version it is built with.
   NVIDIA's repository for Fedora 44 has CUDA 13.3 and 13.4 only, so Fedora's is 13.4; it has no CUDA 12 either, so cuda12.4 is Ubuntu's only.
 - CUDA 13 builds no Pascal (sm_60, sm_61) or Volta (sm_70) code: a P100, P40 or V100 takes cuda12.4.
-- intel/llvm 7.1.1's SYCL has no name above sm_90: newer GPUs (an RTX 50) run sm_90's PTX, which their driver compiles.
+- intel/llvm 7.2.0's SYCL has no name above sm_90: newer GPUs (an RTX 50) run sm_90's PTX, which their driver compiles.
 - The PTX is the toolkit's version, so the driver must support that CUDA version.
 
 ### The Windows 7z
@@ -405,7 +409,7 @@ The Windows 7z is built with the same `tools/package/build.sh`, in a disposable 
 tools/package/build.sh windows cuda12.4      # XeStrata-<version>-windows-x64.7z
 ```
 
-- All of it is cross-built on Linux for Windows: intel/llvm (the Linux contrib toolchain and the SYCL runtime for Windows), the engine (the contrib-llvm mode, the NVIDIA code as the cuda12.4 deb's), the .NET launchers (`dotnet-sdk-10.0`), and Python's embeddable distribution with the wheels; `tools/package/windows_bundle.py` makes the folder and the 7z.
+- All of it is cross-built on Linux for Windows: intel/llvm (the Linux contrib toolchain and the SYCL runtime for Windows), the engine (the contrib-llvm mode, the NVIDIA code as the cuda12.4 deb's), the image encoder on the CPU (`strata-vision-cpu.exe`; no Vulkan one, so pictures are read on the CPU), the .NET launchers (`dotnet-sdk-10.0`), and Python's embeddable distribution with the wheels; `tools/package/windows_bundle.py` makes the folder and the 7z.
 - The MSVC CRT and the Windows SDK come from Microsoft through xwin, its license accepted (they are not free software and do not go into the 7z). Neither do the Windows CUDA headers and import libraries.
 - It uses the Ubuntu 26.04 packages' ccache (`build/pkg-ccache/ubuntu26.04/`) and keeps xwin's and NuGet's downloads in `build/pkg-cache/windows/`.
 - Every exe, DLL and Python package in the 7z must be one of `windows_bundle.py`'s components; a Visual C++ runtime or an NVIDIA library in it stops the build.
@@ -468,7 +472,7 @@ The image is built on the user's PC and not distributed: the contrib packages' i
 | --- | --- | --- |
 | `XESTRATA_VERSION` | `latest` | the release's tag (`xe0.1.43.1`, for example) |
 | `XESTRATA_VARIANT` | `contrib-cuda13.4` | the rpm's variant |
-| `XESTRATA_NONFREE` | `1` | `0` leaves out oneMKL and cuBLAS (Intel's and NVIDIA's dense products then run on XeStrata's own kernels) |
+| `XESTRATA_NONFREE` | `1` | `0` leaves out oneMKL and NVIDIA's cuBLAS and cuDNN (Intel's and NVIDIA's dense products and NVIDIA's image attention then run on XeStrata's own kernels) |
 
 - **A local rpm**: one rpm in `container/rpm/` is installed instead of the release's.
   `xestrata-free`, which the Releases do not have, is made with `tools/package/build.sh fedora44 free` and put there.

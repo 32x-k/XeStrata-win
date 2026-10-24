@@ -15,12 +15,13 @@
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include <oneapi/math/blas.hpp>
+#include <filesystem>
 #include <future>
 #include <memory>
 #include <mutex>
-#include <filesystem>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -59,13 +60,69 @@ struct Trial {
 struct Backend {
     bool blas = !env_on("STRATA_NO_BLAS");
     bool bf16 = !strata::kernels::no_bf16_mma();
+    int i8 = -1;   // whether the backend takes int8 products (Gemm::i8_usable's trial; -1 before it)
     std::shared_future<Trial> ready;   // Gemm::prepare's trial, until it is settled
 };
 std::mutex g_mutex;
 std::unordered_map<sycl::device, Backend> g_backends;
 
+// Windows: the GPU makers' libraries the 7z does not carry, where their installers put them, for oneMath's backends to
+// load: before the PATH the user set, oneMKL of the series the engine was built with (the Library\bin pip's oneMKL makes
+// in the Python the 7z carries, <7z>\python beside <7z>\app\engine, and oneAPI's mkl folder of the series, under
+// ONEAPI_ROOT, which the installer sets, else its default folder); after it oneAPI's tbb folder and MKLROOT's for
+// oneMKL; the CUDA toolkit's (CUDA_PATH) and the folders pip's nvidia-cublas-cu12 and nvidia-cuda-runtime-cu12 make in
+// that Python for cuBLAS; the folder AMD's rocm-sdk-libraries-<family> makes in that Python for rocBLAS and
+// hipBLASLt (free software, but built for each GPU family; the import libraries name its DLLs,
+// tools/package/win_rocm.sh).  Without them the backend does not load and the products take XeStrata's own kernels.
+void add_library_dirs() {
+#if defined(_WIN32)
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::vector<std::string> roots;
+        if (const char* r = std::getenv("ONEAPI_ROOT")) roots.emplace_back(r);
+        roots.emplace_back("C:\\Program Files (x86)\\Intel\\oneAPI");
+        // oneMKL of the series the engine was built with first, before the PATH's (another series's SYCL library may
+        // not load on the engine's SYCL runtime: setup.py's ONEMKL_SERIES): pip's in the Python the 7z carries and
+        // oneAPI's folder of the series
+        std::vector<std::string> first;
+        std::vector<std::string> dirs;
+        for (const std::string& r : roots) {
+#if defined(STRATA_ONEMKL_SERIES)
+            first.push_back(r + "\\mkl\\" + std::string(STRATA_ONEMKL_SERIES) + "\\bin");
+#endif
+            dirs.push_back(r + "\\tbb\\latest\\bin");
+        }
+        if (const char* m = std::getenv("MKLROOT")) dirs.push_back(std::string(m) + "\\bin");
+        if (const char* c = std::getenv("CUDA_PATH")) dirs.push_back(std::string(c) + "\\bin");
+        char exe[MAX_PATH] = {};
+        if (GetModuleFileNameA(nullptr, exe, MAX_PATH) > 0) {
+            const std::filesystem::path site =
+                std::filesystem::path(exe).parent_path().parent_path().parent_path() / "python" / "Lib" / "site-packages";
+            for (const char* sub : {"cublas", "cuda_runtime"}) dirs.push_back((site / "nvidia" / sub / "bin").string());
+            // pip's oneMKL (onemkl-sycl-blas, mkl, tbb): their DLLs in the Python's Library\bin
+            first.insert(first.begin(), (site.parent_path().parent_path() / "Library" / "bin").string());
+            // AMD's rocm-sdk-libraries-<family> (rocBLAS and hipBLASLt): one folder for the GPU family it was made for
+            std::error_code ec;
+            for (const auto& e : std::filesystem::directory_iterator(site, ec))
+                if (e.path().filename().string().rfind("_rocm_sdk_libraries_", 0) == 0)
+                    dirs.push_back((e.path() / "bin").string());
+        }
+        const char* old = std::getenv("PATH");
+        std::string path;
+        std::error_code ec;
+        for (const std::string& d : first)
+            if (std::filesystem::is_directory(d, ec)) path += d + ";";
+        path += old != nullptr ? old : "";
+        for (const std::string& d : dirs)
+            if (std::filesystem::is_directory(d, ec)) path += ";" + d;
+        _putenv_s("PATH", path.c_str());
+    });
+#endif
+}
+
 // The backend of `dev`, its trial's outcome taken in (waited for) the first time
 Backend backend(const sycl::device& dev) {
+    add_library_dirs();
     std::shared_future<Trial> ready;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -211,6 +268,7 @@ void Gemm::prepare() {
     // first prompt): one small product of each type on a queue of its own, beside the model's loading.  An error of the
     // BF16 one (thrown, or reported by the queue afterwards) leaves the BF16 products to XeStrata's own kernels.
     sycl::queue& c = core::Runtime::get().compute();
+    add_library_dirs();
     std::lock_guard<std::mutex> lock(g_mutex);
     Backend& b = g_backends[c.get_device()];
     if (!b.blas || b.ready.valid()) return;
@@ -366,6 +424,64 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         strata::kernels::xmx_gemm(XmxType::f16, X, W, Y, T, N, K, ldy, stream_);
     else
         strata::kernels::gemm_rows(XmxType::f16, X, W, Y, T, N, K, ldy, stream_);
+}
+
+bool Gemm::i8_usable(void* stream) {
+#if STRATA_ONEMATH
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    const Backend b = backend(q.get_device());
+    if (!b.blas) return false;
+    if (b.i8 >= 0) return b.i8 != 0;
+    // a small product on a queue of its own, so that an error the backend reports afterwards is caught here: a backend
+    // without int8 products (XeStrata's oneMath before xestrata-5: rocBLAS's and cuBLAS's) throws at the call
+    constexpr int64_t n = 64;
+    auto failed = std::make_shared<bool>(false);
+    sycl::queue t(q.get_context(), q.get_device(),
+                  [failed](const sycl::exception_list& l) { *failed = *failed || l.size() > 0; },
+                  sycl::property::queue::in_order{});
+    auto* x = sycl::malloc_device<int8_t>(2 * n * n, t);
+    auto* y = sycl::malloc_device<int32_t>(n * n, t);
+    bool ok = x != nullptr && y != nullptr;
+    if (ok) {
+        try {
+            t.fill<int8_t>(x, 1, 2 * n * n);
+            namespace om = oneapi::math;
+            om::blas::column_major::gemm_batch(t, om::transpose::trans, om::transpose::nontrans, n, n, n, 1.0f, x, n,
+                                               n * n, x + n * n, n, n * n, 0.0f, y, n, n * n, 1);
+            t.wait_and_throw();
+            int32_t v = 0;
+            t.memcpy(&v, y, sizeof v).wait();
+            ok = !*failed && v == n;
+        } catch (const std::exception&) {
+            ok = false;
+        }
+    }
+    t.wait();
+    if (x != nullptr) sycl::free(x, t);
+    if (y != nullptr) sycl::free(y, t);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_backends[q.get_device()].i8 = ok ? 1 : 0;
+    return ok;
+#else
+    (void) stream;
+    return false;
+#endif
+}
+
+void Gemm::i8(const int8_t* X, const int8_t* W, int32_t* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+              void* stream) {
+#if STRATA_ONEMATH
+    if (T <= 0 || N <= 0) return;
+    namespace om = oneapi::math;
+    if (ldy <= 0) ldy = N;
+    // one product of a batch (gemm_batch: oneMath's int8 product), the strides those of a whole matrix (oneMKL checks
+    // them even for one)
+    om::blas::column_major::gemm_batch(core::Runtime::get().stream(stream), om::transpose::trans,
+                                       om::transpose::nontrans, N, T, K, 1.0f, W, K, N * K, X, K, T * K, 0.0f, Y, ldy,
+                                       ldy * T, 1);
+#else
+    (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy; (void) stream;
+#endif
 }
 
 bool Gemm::f16_groups(const uint16_t* X, const uint16_t* W, int64_t w_stride, float* Y, const int32_t* bounds, int G,

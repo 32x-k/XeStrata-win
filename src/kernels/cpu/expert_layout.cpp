@@ -300,8 +300,8 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') {
             if (!line.empty() && line[0] == '#') {
-                // The version: upstream Strata's "# strata native experts vN" (v2-v5 known) or XeStrata's own
-                // "# xestrata native experts xsN" (xs1, xs2), numbered apart so neither is taken for the other.  A
+                // The version: upstream Strata's "# strata native experts vN" (v2-v4 known) or XeStrata's own
+                // "# xestrata native experts xsN" (xs1), numbered apart so neither is taken for the other.  A
                 // version this engine does not know may mean columns it would misread, so it is refused.
                 static const char up_tag[] = "# strata native experts v", xs_tag[] = "# xestrata native experts xs";
                 const bool up = line.compare(0, sizeof up_tag - 1, up_tag) == 0;
@@ -309,9 +309,9 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 if (up || xs) {
                     const char* num = line.c_str() + (up ? sizeof up_tag : sizeof xs_tag) - 1;
                     const int v = (int) std::strtol(num, nullptr, 10);
-                    // xs2: xs1 and hadamard.txt beside it (Gyro), as upstream's v5 is its v4 and hadamard.txt
+                    // xs2: xs1's lines with Hadamard-folded experts (hadamard.txt), what upstream's v5 says
                     L.version = up ? v : v >= 2 ? 5 : 4;
-                    if (v > (up ? kExpertLayoutVersion : 2)) {
+                    if (v > (up ? 5 : 2)) {
                         err = std::string("native_experts.txt is ") + (up ? "v" : "xs") + std::to_string(v) +
                               "; this engine reads upstream's v2-v5 and XeStrata's xs1-xs2 (repack with this "
                               "checkout's tools/iq_pack.py)";

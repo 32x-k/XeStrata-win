@@ -5,6 +5,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/platform/memory.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU core_gpu
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -17,6 +18,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <map>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -57,8 +59,9 @@ thread_local std::string g_error;
 // The live alloc_device blocks, so a refusal can say how much this process holds (the refusals seen so far came
 // with ~26 GiB free in the runs that passed, cause unknown: the 2026-09-30-xe-iq3xxs record)
 std::mutex g_live_mu;
-std::map<const void*, size_t> g_live;
+std::map<const void*, std::pair<size_t, int>> g_live;   // the block's bytes and engine device
 size_t g_live_bytes = 0;
+std::map<int, size_t> g_live_on;                        // per engine device
 
 std::string refusal_state() {
     size_t held = 0, n = 0;
@@ -74,8 +77,17 @@ std::string refusal_state() {
         if (d.has(sycl::aspect::ext_intel_free_memory))
             free_mib = std::to_string(d.get_info<sycl::ext::intel::info::device::free_memory>() >> 20) + " MiB";
     } catch (const std::exception& e) { free_mib = std::string("unreadable: ") + e.what(); }
+    std::string ram;
+    // the xe driver gives VRAM only with RAM free beside it, and the file cache does not count as free there: a big
+    // model file read just before (by any program) left in the cache refused the allocations (B70, 2026-10-19)
+    uint64_t mem_free = 0, cached = 0;
+    if (strata::core::Runtime::get().device().get_backend() == sycl::backend::ext_oneapi_level_zero &&
+        strata::platform::free_and_cached(mem_free, cached) && cached > mem_free)
+        ram = "; the RAM free is " + std::to_string(mem_free >> 30) + " GiB and the file cache holds " +
+              std::to_string(cached >> 30) + " GiB, which this GPU's driver does not take as free: "
+              "`sync; echo 1 | sudo tee /proc/sys/vm/drop_caches` empties it";
     return "; device free " + free_mib + ", this process holds " + std::to_string(held >> 20) + " MiB in " +
-           std::to_string(n) + " blocks";
+           std::to_string(n) + " blocks" + ram;
 }
 
 bool fail(const char* what, const std::exception& e) {
@@ -196,25 +208,92 @@ void* alloc_device(size_t bytes) {
             return nullptr;
         }
         std::lock_guard<std::mutex> lock(g_live_mu);
-        g_live[p] = bytes;
+        g_live[p] = {bytes, rt().ordinal()};
         g_live_bytes += bytes;
+        g_live_on[rt().ordinal()] += bytes;
         return p;
     } catch (const std::exception& e) { fail("alloc_device", e); return nullptr; }
 }
 
+namespace {
+std::mutex g_pin_mu;
+void* g_pin_soft = nullptr;
+void* g_pin_hard = nullptr;
+void* host_usm(size_t bytes) {
+    try {
+        return sycl::malloc_host(bytes, rt().context());
+    } catch (const std::exception&) { return nullptr; }
+}
+}  // namespace
+
 void* alloc_host(size_t bytes) {
     try {
         void* p = sycl::malloc_host(bytes, rt().context());
+        if (p == nullptr) {   // the hard reserve back, once
+            void* hard = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_pin_mu);
+                std::swap(hard, g_pin_hard);
+            }
+            if (hard != nullptr) {
+                free(hard);
+                std::fprintf(stderr, "strata: pinned memory: %zu bytes refused, the reserve given back for them\n", bytes);
+                p = sycl::malloc_host(bytes, rt().context());
+            }
+        }
         if (!p) g_error = "alloc_host: " + std::to_string(bytes) + " bytes refused";
         return p;
     } catch (const std::exception& e) { fail("alloc_host", e); return nullptr; }
+}
+
+void pin_reserve_take() {
+    uint64_t mib = 0;
+    if (const char* e = std::getenv("STRATA_PIN_RESERVE_MIB"); e != nullptr && *e != '\0') {
+        mib = std::strtoull(e, nullptr, 10);
+    } else {
+#if defined(_WIN32)
+        try {
+            if (rt().device().get_backend() == sycl::backend::ext_oneapi_cuda) mib = 640;
+        } catch (const std::exception&) { mib = 0; }
+#endif
+    }
+    if (mib == 0) return;
+    std::lock_guard<std::mutex> lock(g_pin_mu);
+    if (g_pin_soft != nullptr || g_pin_hard != nullptr) return;
+    auto take = [](uint64_t want) -> void* {
+        for (uint64_t b = want << 20; b >= (16ull << 20); b /= 2)
+            if (void* p = host_usm((size_t) b)) return p;
+        return nullptr;
+    };
+    g_pin_soft = take(mib);
+    g_pin_hard = take(std::max<uint64_t>(mib / 4, 64));
+}
+
+void pin_reserve_release_soft() {
+    void* p = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_pin_mu);
+        std::swap(p, g_pin_soft);
+    }
+    if (p != nullptr) free(p);
+}
+
+void pin_reserve_release() {
+    pin_reserve_release_soft();
+    void* p = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_pin_mu);
+        std::swap(p, g_pin_hard);
+    }
+    if (p != nullptr) free(p);
 }
 
 void free(const void* p) {
     {
         std::lock_guard<std::mutex> lock(g_live_mu);
         if (auto it = g_live.find(p); it != g_live.end()) {
-            g_live_bytes -= it->second;
+            g_live_bytes -= it->second.first;
+            g_live_on[it->second.second] -= it->second.first;
             g_live.erase(it);
         }
     }
@@ -423,7 +502,12 @@ bool mem_info(size_t* free_bytes, size_t* total_bytes) {
 #if defined(_WIN32)
         windows_allocatable(d, free);
 #endif
-        core::apply_vram_limit(free, total);
+        size_t held = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_live_mu);
+            if (auto it = g_live_on.find(rt().ordinal()); it != g_live_on.end()) held = it->second;
+        }
+        core::apply_vram_limit(free, total, held);
         if (free_bytes) *free_bytes = (size_t) free;
         if (total_bytes) *total_bytes = (size_t) total;
         return true;
@@ -452,7 +536,7 @@ bool host_register_on(int device, void* p, size_t bytes) {
 bool peer_access(int a, int b) {
 #if defined(SYCL_EXT_ONEAPI_PEER_ACCESS)
     try {
-        const sycl::device& da = core::Runtime::at(a).device();
+        sycl::device da = core::Runtime::at(a).device();   // a copy: ext_oneapi_can_access_peer is not const
         const sycl::device& db = core::Runtime::at(b).device();
         if (da.get_backend() != db.get_backend()) return false;
         return da.ext_oneapi_can_access_peer(db, sycl::ext::oneapi::peer_access::access_supported);

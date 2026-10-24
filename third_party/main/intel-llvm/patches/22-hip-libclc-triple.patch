@@ -1,0 +1,28 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+hip-libclc-triple: a fix to intel/llvm v7.2.0, applied by tools/intel_llvm_build.py.
+
+configure.py builds libclc's AMD libspirv as the LLVM runtime target amdgcn-amd-amdhsa-llvm, into
+lib/clang/<N>/lib/amdgcn-amd-amdhsa-llvm, but the driver compiles SYCL's AMD device code for
+amdgcn-amd-amdhsa and looks for libspirv.l64.signed_char.bc under that name: every compile for an AMD
+GPU stopped ("cannot find 'libspirv.l64.signed_char.bc'"), and with the folder linked it warned on
+every link that the two modules' target triples differ.  Fixed, the AMD libspirv is built for
+amdgcn-amd-amdhsa.
+---
+diff --git a/buildbot/configure.py b/buildbot/configure.py
+index 4874c0a445..650c034fd6 100644
+--- a/buildbot/configure.py
++++ b/buildbot/configure.py
+@@ -29,7 +29,9 @@ def do_configure(args, passthrough_args):
+     if sys.platform != "darwin":
+         llvm_external_projects += ";libdevice"
+ 
+-    libclc_amd_target_names = ";amdgcn-amd-amdhsa-llvm"
++    # Modified 2026 by MistVVK and the XeStrata contributors: the AMD libspirv is built for amdgcn-amd-amdhsa, the
++    # triple the driver compiles SYCL's AMD device code for and looks for the library by (hip-libclc-triple)
++    libclc_amd_target_names = ";amdgcn-amd-amdhsa"
+     libclc_nvidia_target_names = ";nvptx64-nvidia-cuda"
+ 
+     sycl_enable_jit = "OFF"

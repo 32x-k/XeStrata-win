@@ -159,6 +159,7 @@ void LayerStream::load_resident(int i) {
     check(gpu::event_record(relay_free_, copy_), "an event");
     // the compute stream waits for the copy where it uses the layer
     check(gpu::stream_wait_event(compute_, relay_free_), "a wait");
+    if (prepare_) prepare_(i, l.d);
     l.loaded = true;
 }
 
@@ -176,6 +177,7 @@ void LayerStream::request(int i) {
     next_slot_ ^= 1;
     s.layer = i;
     s.issued = false;
+    s.prepared = false;
     queue_.push_back(i);
     cv_.notify_all();
 }
@@ -249,6 +251,15 @@ const uint8_t* LayerStream::begin(int i) {
     if (k < 0 || k > 1) throw std::logic_error("image engine (layers): a begun layer has no slot");
     Slot* s = &slots_[k];
     check(gpu::stream_wait_event(compute_, s->ready), "a wait");
+    if (prepare_) {
+        bool first;
+        {
+            std::lock_guard<std::mutex> l(mu_);
+            first = !s->prepared;
+            s->prepared = true;
+        }
+        if (first) prepare_(i, s->d);
+    }
     // the next streamed layer, wrapping to the first streamed one (the DiT's next step)
     int j = i + 1;
     if (j >= (int) layers_.size()) j = resident_;

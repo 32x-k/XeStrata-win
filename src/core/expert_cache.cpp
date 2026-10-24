@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
-
+#include "strata/core/device.hpp"
 #include "strata/core/gpu.hpp"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <numeric>
 #include <utility>
@@ -274,6 +275,44 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
 
 namespace {
 bool g_cache_vmm = false;   // set_vmm
+
+// STRATA_TEST_ALLOC_FAIL=N: the first N single allocations of the cache fail as a refused allocation does, so the
+// piece fallback and its give-up can be tested without a driver in that state (the B70's xe, 2026-10-22: 25.5 GiB
+// refused with 26.4 GiB reported free, every retry after it refused).
+bool fake_alloc_fail() {
+    static const char* const kEnv = "STRATA_TEST_ALLOC_FAIL";
+    const char* v = std::getenv(kEnv);
+    char* end = nullptr;
+    const long n = v != nullptr ? std::strtol(v, &end, 10) : 0;
+    if (n <= 0 || end == v) return false;
+    char one[8] = "1";
+    std::snprintf(one, sizeof one, "%ld", n - 1);   // counts down, so a test can stage several cases
+#if defined(_WIN32)
+    _putenv_s(kEnv, one);
+#else
+    ::setenv(kEnv, one, 1);
+#endif
+    return true;
+}
+
+// STRATA_TEST_PIECE_FAIL=N: the first N piece allocations from the second piece on fail (never the first: a refusal
+// of it leaves no prefix to keep, the same give-up as no piece at all).
+bool fake_piece_fail(bool first) {
+    if (first) return false;
+    static const char* const kEnv = "STRATA_TEST_PIECE_FAIL";
+    const char* v = std::getenv(kEnv);
+    char* end = nullptr;
+    const long n = v != nullptr ? std::strtol(v, &end, 10) : 0;
+    if (n <= 0 || end == v) return false;
+    char one[8];
+    std::snprintf(one, sizeof one, "%ld", n - 1);
+#if defined(_WIN32)
+    _putenv_s(kEnv, one);
+#else
+    ::setenv(kEnv, one, 1);
+#endif
+    return true;
+}
 }  // namespace
 
 void ExpertCache::set_vmm(bool enabled) { g_cache_vmm = enabled; }
@@ -291,6 +330,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     }
 
     const uint64_t want = (uint64_t) n_slots * (uint64_t) blob_bytes;
+    alloc_refused_ = false;
 
     // ---- **THE ALLOCATION IS CHECKED AGAINST THE CARD, NOT AGAINST THE REQUEST.**
     //
@@ -301,14 +341,12 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     size_t free_b = 0, total_b = 0;
     if (strata::gpu::mem_info(&free_b, &total_b)) {
         if ((uint64_t) free_b < want) {
-            char buf[320];
-            std::snprintf(buf, sizeof buf,
-                          "ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of VRAM is free "
-                          "(%.2f GiB of %.2f GiB total). Lower --expert-cache.",
-                          (long long) n_slots, (long long) blob_bytes, (double) want / 1073741824.0,
-                          (double) free_b / 1073741824.0, (double) (total_b - free_b) / 1073741824.0,
-                          (double) total_b / 1073741824.0);
-            err = buf;
+            err = "ExpertCache: " + std::to_string(n_slots) + " slots of " +
+                  std::to_string((long long) (blob_bytes >> 20)) + " MiB = " +
+                  std::to_string((long long) (want >> 20)) + " MiB, but only " +
+                  std::to_string((long long) (free_b >> 20)) + " MiB of VRAM is free (" +
+                  std::to_string((long long) ((total_b - free_b) >> 20)) + " MiB of " +
+                  std::to_string((long long) (total_b >> 20)) + " MiB total). Lower --expert-cache.";
             return false;
         }
     }
@@ -327,13 +365,42 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
         base_ = r->base();
         vmm_ = std::move(r);
-    } else if (!strata::gpu::alloc_device((void**) &base_, (size_t) want)) {
-        base_ = nullptr;
-        char buf[256];
-        std::snprintf(buf, sizeof buf, "ExpertCache: device allocation of %.2f GiB failed: %s",
-                      (double) want / 1073741824.0, strata::gpu::last_error());
-        err = buf;
-        return false;
+    } else {
+        void* taken = nullptr;
+        bool got = strata::gpu::alloc_device(&taken, (size_t) want);
+        if (got && fake_alloc_fail()) {
+            strata::gpu::free(taken);
+            taken = nullptr;
+            got = false;
+        }
+        if (!got) {
+            alloc_refused_ = true;
+            // The one allocation was refused.  A driver can refuse one large allocation while smaller ones fit, and
+            // a refused allocation leaves its bytes counted as used, so every smaller whole-arena retry is refused by
+            // the check above (the B70's xe driver, 2026-10-22: 25.5 GiB refused with 26.4 GiB reported free, then
+            // eight retries, all refused).  Take the cache in pieces instead - an eighth of it at most each - and
+            // keep the prefix the device gives; `blob_bytes > 1` keeps open_sized's byte-sized route out (it builds
+            // its own pieces from the real slot table).
+            const uint64_t piece = std::min(std::max<uint64_t>(want / 8, 256u << 20), max_alloc_bytes());
+            int64_t fitted = 0;
+            if (want > piece && blob_bytes > 1) {
+                std::vector<uint64_t> off((size_t) n_slots + 1, 0);
+                for (size_t i = 0; i < (size_t) n_slots; ++i) off[i + 1] = off[i] + (uint64_t) blob_bytes;
+                if (alloc_pieces(off, piece, true, &fitted, err)) {
+                    std::fprintf(stderr, "strata: expert cache: the one allocation of %lld MiB was refused; %lld slots "
+                                         "(%lld MiB) taken in pieces instead\n",
+                                 (long long) (want >> 20), (long long) fitted,
+                                 (long long) (slot_end(fitted) >> 20));
+                    start_tables(fitted, n_layers, n_expert, blob_bytes);
+                    return true;
+                }
+            }
+            base_ = nullptr;
+            err = "ExpertCache: device allocation of " + std::to_string((long long) (want >> 20)) + " MiB failed: " +
+                  strata::gpu::last_error();
+            return false;
+        }
+        base_ = static_cast<uint8_t*>(taken);
     }
     // Zeroed so a slot read before it is filled is a DETERMINISTIC wrong answer rather than whatever the
     // allocator handed back.  A stale block of a previous process's memory would still sum to finite floats.
@@ -370,37 +437,48 @@ void ExpertCache::start_tables(int64_t n_slots, int64_t n_layers, int64_t n_expe
 // set_max_piece: the slots in runs of at most piece_max_ bytes, taken from the end so the last run (the prompt path's
 // loan) is the largest; each run one allocation.  off_ gets each slot's address relative to slot 0's (modulo 2^64:
 // the kernels add it to slot 0's address), size_off_ the offsets by size for bytes().
-bool ExpertCache::open_pieces(const std::vector<uint64_t>& size_off, std::string& err) {
+bool ExpertCache::alloc_pieces(const std::vector<uint64_t>& size_off, uint64_t piece_max, bool best_effort,
+                               int64_t* fitted, std::string& err) {
     const size_t n = size_off.size() - 1;
     const uint64_t want = size_off.back();
-    size_t free_b = 0, total_b = 0;
-    if (strata::gpu::mem_info(&free_b, &total_b) && (uint64_t) free_b < want) {
-        char buf[256];
-        std::snprintf(buf, sizeof buf, "ExpertCache: %.2f GiB of slots, but only %.2f GiB of VRAM is free",
-                      (double) want / 1073741824.0, (double) free_b / 1073741824.0);
-        err = buf;
-        return false;
+    if (!best_effort) {
+        size_t free_b = 0, total_b = 0;
+        if (strata::gpu::mem_info(&free_b, &total_b) && (uint64_t) free_b < want) {
+            err = "ExpertCache: " + std::to_string((long long) (want >> 20)) + " MiB of slots, but only " +
+                  std::to_string((long long) (free_b >> 20)) + " MiB of VRAM is free";
+            return false;
+        }
     }
     std::vector<size_t> first;   // each run's first slot, from the last run back
     for (size_t end = n; end > 0;) {
         size_t b = end;
-        while (b > 0 && size_off[end] - size_off[b - 1] <= piece_max_) --b;
+        while (b > 0 && size_off[end] - size_off[b - 1] <= piece_max) --b;
         if (b == end) { err = "ExpertCache: a slot is larger than the device's largest allocation"; return false; }
         first.push_back(b);
         end = b;
     }
     std::reverse(first.begin(), first.end());
     std::vector<uint64_t> addr(n + 1, 0);
+    size_t done = 0;   // pieces actually allocated (a best-effort stop leaves the tail unallocated)
     for (size_t r = 0; r < first.size(); ++r) {
         const size_t lo = first[r], hi = r + 1 < first.size() ? first[r + 1] : n;
         const uint64_t bytes = size_off[hi] - size_off[lo];
         void* p = nullptr;
-        if (!strata::gpu::alloc_device(&p, (size_t) bytes) || !strata::gpu::memset(p, 0, (size_t) bytes)) {
+        bool got = strata::gpu::alloc_device(&p, (size_t) bytes);
+        if (got && fake_piece_fail(r == 0)) {
+            strata::gpu::free(p);
+            p = nullptr;
+            got = false;
+        }
+        if (!got || !strata::gpu::memset(p, 0, (size_t) bytes)) {
             if (p != nullptr) strata::gpu::free(p);
-            char buf[256];
-            std::snprintf(buf, sizeof buf, "ExpertCache: device allocation of %.2f GiB (a piece of %.2f GiB) failed: %s",
-                          (double) bytes / 1073741824.0, (double) want / 1073741824.0, strata::gpu::last_error());
-            err = buf;
+            // best effort: the pieces before this one stay, the slots they cover are the cache
+            if (best_effort && r > 0) {
+                if (fitted != nullptr) *fitted = (int64_t) first[r];
+                break;
+            }
+            err = "ExpertCache: device allocation of " + std::to_string((long long) (bytes >> 20)) + " MiB (a piece of " +
+                  std::to_string((long long) (want >> 20)) + " MiB) failed: " + strata::gpu::last_error();
             close();
             return false;
         }
@@ -408,11 +486,30 @@ bool ExpertCache::open_pieces(const std::vector<uint64_t>& size_off, std::string
         else pieces_.push_back(p);
         const uint64_t at = (uint64_t) (uintptr_t) p - (uint64_t) (uintptr_t) base_;
         for (size_t i = lo; i <= hi; ++i) addr[i] = at + (size_off[i] - size_off[lo]);
+        if (best_effort && fitted != nullptr) *fitted = (int64_t) hi;   // slots [0, hi) are covered
+        ++done;
     }
-    last_piece_first_ = (int64_t) first.back();
+    if (best_effort && fitted != nullptr && *fitted <= 0) {
+        err = "ExpertCache: not even one piece of the cache could be allocated";
+        close();
+        return false;
+    }
+    // the last ALLOCATED piece's first slot: the slots from it lie back to back (a best-effort stop takes pieces
+    // [0, done), and `first.back()` would name an unallocated one)
+    last_piece_first_ = done > 1 ? (int64_t) first[done - 1] : 0;
     off_ = std::move(addr);
     size_off_ = size_off;
     return true;
+}
+
+bool ExpertCache::open_pieces(const std::vector<uint64_t>& size_off, std::string& err) {
+    return alloc_pieces(size_off, piece_max_, false, nullptr, err);
+}
+
+bool ExpertCache::zero_arena() {
+    if (base_ == nullptr) return true;
+    if (!pieces_.empty()) return true;   // zeroed piece by piece as alloc_pieces took them
+    return strata::gpu::memset(base_, 0, (size_t) std::max<int64_t>(mapped_bytes(), 0));
 }
 
 bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert,
@@ -433,7 +530,22 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
         return true;
     }
     // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
-    if (!open((int64_t) off.back(), n_layers, n_expert, 1, err)) return false;
+    if (!open((int64_t) off.back(), n_layers, n_expert, 1, err)) {
+        // The one allocation was refused (see open()'s pieces fallback - `alloc_refused_` says the allocation, not
+        // the pre-check, was what failed): try the same arena in pieces of an eighth (at least 256 MiB, at most the
+        // device's largest allocation), keeping the prefix the device gives.
+        const uint64_t want = off.back();
+        const uint64_t piece = std::min(std::max<uint64_t>(want / 8, 256u << 20), max_alloc_bytes());
+        int64_t fitted = 0;
+        if (alloc_refused_ && want > piece && alloc_pieces(off, piece, true, &fitted, err)) {
+            std::fprintf(stderr, "strata: expert cache: the one allocation of %lld MiB was refused; %lld slots "
+                                 "(%lld MiB) taken in pieces instead\n",
+                         (long long) (want >> 20), (long long) fitted, (long long) (slot_end(fitted) >> 20));
+            start_tables(fitted, n_layers, n_expert, mx);   // seeds the layers' cursors on these slots (#369)
+            return true;
+        }
+        return false;
+    }
     slots_ = (int64_t) slot_bytes.size();
     live_slots_ = slots_;
     blob_ = mx;

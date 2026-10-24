@@ -41,6 +41,12 @@ public:
     static bool f16_groups(const uint16_t* X, const uint16_t* W, int64_t w_stride, float* Y, const int32_t* bounds,
                            int G, int64_t N, int64_t K, void* stream);
 
+    /// Whether `stream`'s GPU takes i8: oneMath's backend for it has int8 products (asked of it once, by a trial).
+    static bool i8_usable(void* stream);
+    /// Y[T, N] (int32, row stride ldy) = X[T, K] . W[N, K]^T, both int8 row-major, int32 sums, through oneMath; only
+    /// where i8_usable says yes.
+    static void i8(const int8_t* X, const int8_t* W, int32_t* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                   void* stream);
     /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0);

@@ -58,9 +58,9 @@ xestrata --bench --original-strata v0.1.41        # 同じモデルで upstream 
 | --- | --- |
 | NVIDIA | リリースの配布物（SHA-256 を確かめる） |
 | AMD | タグのソースを HIP でビルド |
-| Intel | upstream の `sycl/` を Docker でビルド（sudo なしで docker が使えること）。その `sycl/setup_intel.py` がカードに書く設定で動かす |
+| Intel | upstream の `sycl/` を rootless の Podman のコンテナでビルド（podman が使えること）。その `sycl/setup_intel.py` がカードに書く設定で動かす |
 
-- NVIDIA の配布物と Intel の Docker イメージは自由ソフトウェアでないので、free のビルドでは NVIDIA と Intel の比較はしません。
+- NVIDIA の配布物と upstream の Intel のコンテナのイメージは自由ソフトウェアでないので、free のビルドでは NVIDIA と Intel の比較はしません。
 - upstream が 10 tok/s 以下と分かった欄は、その段の途中で止めて比べません（「止まった回」に出ます）。
 - 画像の生成は、取ってきた upstream のツリーで upstream の setup が `sd-cli` を作ってあるとき（`engine-image/`）だけ並べ、upstream の setup と同じ設定で動かします。
 
@@ -101,7 +101,7 @@ A="..." B="..." PROFILE=... DATA=<data> IDS=<ids> python $S/ab_pair.py generate|
 
 - モデルの既定は IQ3_XXS です。RAM の少ない PC では、setup が書いたモデルの設定を `CONFIG=xestrata-<モデル>.json` で渡すと、そのモデルのファイルと設定（RAM の予算、calibrate の結果）で両エンジンを測ります。
   ファイルを直接指定するときは `PACK`・`NATIVE`・`PLE`（と両エンジンに足すオプションの `EXTRA`）です。通常使用の文脈は `CONTEXT`（既定 262144）、会話は `CONVS`（既定 `chat-ja chat-en agent`）、段は `TIERS` で変えられます。
-- `XE` と `UP` は各エンジンのバイナリかラッパーです。前に `env K=V ...` を付けられます。serve と通常使用のラッパーは標準入力を通すこと（`docker run -i`）。
+- `XE` と `UP` は各エンジンのバイナリかラッパーです。前に `env K=V ...` を付けられます。serve と通常使用のラッパーは標準入力を通すこと（`podman run -i`）。
 - 回数は generate が 2 回、serve と通常使用が 3 回です（`ROUNDS` で変えられます）。serve と通常使用は各エンジンが自分のテキストを書くので、温度 0.7 では 1 回ごとに中央値から 10% 前後ずれます。
 - generate は `--spec-follow` で両エンジンに upstream の答えをなぞらせ、テキストの違いを除きます。serve にはこの機能がありません。
 - 合格の幅: generate と、serve・通常使用の最初の prefill の速さは、XeStrata が upstream より 1% 以上遅くないこと。serve・通常使用のそれ以外（続きのターンの待ち時間、decode、最初のトークンまでの時間）は 5% 以上悪くないこと。

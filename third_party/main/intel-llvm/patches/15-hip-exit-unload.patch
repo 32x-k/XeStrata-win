@@ -2,7 +2,7 @@ SPDX-FileCopyrightText: The LLVM project contributors
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-hip-exit-unload: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+hip-exit-unload: a fix to intel/llvm v7.2.0, applied by tools/intel_llvm_build.py.
 
 At a process's exit the SYCL runtime unregisters its device images from the executable's finalizers, which
 run after the HIP runtime has torn itself down, and the HIP adapter's urProgramRelease then unloaded the
@@ -13,12 +13,12 @@ released after it is not unloaded: the process is ending and the driver reclaims
 outside SYCL_ENABLE_KERNEL_FUSION, which a build without amd_comgr leaves undefined.
 ---
 diff --git a/unified-runtime/source/adapters/hip/program.cpp b/unified-runtime/source/adapters/hip/program.cpp
-index cd45448..c726b8e 100644
+index d63175baa0..8c4453d4a7 100644
 --- a/unified-runtime/source/adapters/hip/program.cpp
 +++ b/unified-runtime/source/adapters/hip/program.cpp
-@@ -5,12 +5,29 @@
- // Part of the Unified-Runtime Project, under the Apache License v2.0 with LLVM
- // Exceptions. See LICENSE.TXT
+@@ -4,12 +4,29 @@
+ // Part of the LLVM Project, under the Apache License v2.0 with LLVM
+ // Exceptions. See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 +// Modified 2026 by MistVVK and the XeStrata contributors: no module unload after the process began to exit (hip-exit-unload)
  //
@@ -46,7 +46,7 @@ index cd45448..c726b8e 100644
  #ifdef SYCL_ENABLE_KERNEL_FUSION
  #ifdef UR_COMGR_VERSION4_INCLUDE
  #include <amd_comgr.h>
-@@ -235,6 +252,7 @@ ur_result_t ur_program_handle_t_::buildProgram(const char *BuildOptions) {
+@@ -234,6 +251,7 @@ ur_result_t ur_program_handle_t_::buildProgram(const char *BuildOptions) {
  
    UR_CHECK_ERROR(hipModuleLoadDataEx(&Module, static_cast<const void *>(Binary),
                                       NumberOfOptions, Options, OptionVals));
@@ -54,7 +54,7 @@ index cd45448..c726b8e 100644
  
    BuildStatus = UR_PROGRAM_BUILD_STATUS_SUCCESS;
  
-@@ -447,7 +465,7 @@ urProgramRelease(ur_program_handle_t hProgram) {
+@@ -446,7 +464,7 @@ urProgramRelease(ur_program_handle_t hProgram) {
      try {
        ScopedDevice Active(hProgram->getDevice());
        auto HIPModule = hProgram->get();

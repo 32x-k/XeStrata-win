@@ -10,7 +10,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 エンジンが GPU に求めること、移植した計算と検証の一覧をまとめます。
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md)、ビルドの方法、setup の振る舞い、要るパッケージは [BUILD](BUILD.ja.md) にあります。
 
-XeStrata xe0.1.45-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.1.45-1。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
+XeStrata xe0.2.2-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.2-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
 移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.39（`6f32ec07`）までの変更の一部を取り込んでいます
 （[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
 同じ SYCL のコードを、intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib-llvm のビルド、[ビルド](BUILD.ja.md#ビルド)）。
@@ -31,6 +31,81 @@ Qwen3.8 の prompt は、xmx_gemm が動く GPU では FP16 の経路のまま�
 `STRATA_VRAM_LIMIT_MIB` はエンジンから見える VRAM を、`STRATA_MAX_ALLOC_MIB` は想定する最大の確保量を制限し、
 `STRATA_NO_XMX=1` は XMX を使わない経路を選ばせます。
 CPU 内蔵のグラフィックス（開発機では UHD 770）は、確認用の 2 つ目の実機として使います。
+
+## Strata 0.2.2 の取り込み
+
+upstream の Strata 0.2.1.1 から 0.2.2（`011c9e60`）までの変更を Xe に移しています。
+この間の upstream の変更の多くは、アプリ・ターミナル・Mac・upstream の `sycl/` のもので、移していません（0.2.0-beta と同じ理由）。
+
+移したものは次のとおりです。
+
+- CPU のプール: ワーカーの置き場所を起動時に言い、`--pool-cores`（実験的）で置き場所を指定できる。エンジンのスレッドに名前を付ける。serve は設定の `pool_cores` をエンジンに渡す。
+- 推測デコード: 開始の規則を `spec_loop_runs` にまとめ、`STRATA_SPEC_WATCH` で止まりを見張る。
+- serve: prefill の短い残りの窓で logits が非有限になったら、次の要求は prompt 全体をまとめて読む。エンジンを起動できないときは、接続を切らずに理由つきの 503 を返す。`"api_key": "none"` と `--no-api-key` でキーなしを選べる。
+- serve: Anthropic の usage で、次の要求のために残したトークンを `cache_creation_input_tokens` として返す。llama.cpp の `thinking_budget_tokens` も思考の上限として読む。1 トークンずれた囲みのツールの呼び出しを読み、宣言していないツールの呼び出しは文として返す。done の行の速さはエンジンの decode の時間から取る。
+- setup: SHA-256 が合わないダウンロードは消さずに違う部分だけ取り直し、大きなファイルの確かめにも進み具合を出す。`--gguf-dir` の利用者のファイルは消さない。空き容量は入り切らないときだけ止める。ごみ箱の中のフォルダーを前のインストールとして覚えない。
+- iq_pack: experts.bin の書き込みが途中で止まったら、書き終えた層を残して次の層から続ける。
+
+この取り込みの間に XeStrata の側で直したもの:
+
+- intel/llvm v7.2.0 での後退: XMX の積と grouped の積の `joint_matrix_prefetch` を外す（IGC 2.28 が v7.2.0 の先読みを扱えず、B70 の 1K の prefill が 468 → 751 tok/s）。AMD 向けの libspirv に GroupNonUniform の shuffle を足す（パッチ `hip-group-shuffle`）。iq_mmq の作業グループの大きさを属性で宣言し、AMD でのレジスターの退避をなくす（RX 9060 XT の 32K の prefill が 1,113 → 1,250 tok/s）。
+- 推測デコード: 窓のグラフを作った回の時間を窓の選び方の測りに入れない。測っていない大きさの窓の時間は、いちばん近い測った小さい大きさから見積もる。Gyro の trellis の層では、VRAM の入れ替えの位置で窓を切らない（Gyro-M の decode が B70 の 1K で 48.0 → 54.2 tok/s）。グラフのない大きさの窓は、VRAM が足りなければ収まる大きさに縮める（B70 の 262K で落ちなくなった）。
+
+upstream v0.2.2 と 3 社の GPU で比べました（generate は IQ3_XXS と Gyro-M を 3 枚、Q2_0・IQ2_XS・IQ3_S・UD-Q4_K_XL を B70 と RTX 4070、IQ3_XXS の serve と通常使用）。
+IQ3_XXS の generate では、B70 は upstream の `sycl/` 版より prefill が 1.8〜3.0 倍、decode が 12〜61% 速いです。
+RTX 4070 は prefill が 1.02〜1.16 倍、decode が 25〜37% 速いです。RX 9060 XT は prefill が 2.1〜2.7 倍、decode が 2〜7% 速いです。
+Gyro-M の generate では、B70 は prefill が 1.3〜2.0 倍、decode が 8〜11% 速いです。RX 9060 XT は prefill が 1.3〜2.3 倍、decode が 1〜2% 速いです。
+RTX 4070 は prefill が 1.08〜1.12 倍で、decode は 32K で同等、1K で upstream の文をなぞらせると 3% 遅く、XeStrata 自身の文では 17% 速いです。
+
+移していないのは、CPU のプールを NUMA のノードごとに分ける形（XeStrata のプールにはノードの土台がありません）、アプリとターミナル、Mac、upstream の `sycl/`、
+CUDA の Gyro の decode で trellis のコードブックを共有メモリに置く形と、その Pascal 向けのカーネル（XeStrata の SYCL のカーネルで試し、RX 9060 XT で 17〜19% 遅く、B70 と RTX 4070 でも速くなりませんでした）、HIP の gfx11 と gfx1151 だけの直しです。
+
+## Strata 0.2.1.1 の取り込み
+
+upstream の Strata 0.2.0-beta から 0.2.1.1（`9ae93f7b`）までの変更を Xe に移しています。
+この間の upstream の変更の多くは、新しいアプリ・ターミナル・Docker・Mac のもので、移していません（0.2.0-beta と同じ理由）。
+
+移したものは次のとおりです。
+
+- setup: Meteor Lake・Arrow Lake-H の LP-E コアを E コアに数える。低 RAM の収まりの判定で、下書きの層の VRAM（約 1 GB）を数える。
+- ダウンロード: 既定 16 本の接続、1 つの要求で隣の 4 片、長さを返さない HEAD には 0-0 を聞く。MTP の取得は切れやすい回線でも続き、setup が止まれば止まる。
+- setup: 新しい `--data-dir` はモデルのファイルを勝手に動かさず、前の置き場所も見つけ続ける（`--move-data`、`--set-default-data-dir`）。
+- serve: エンジンが signal 9 で終わった理由に、有限の RLIMIT_RTTIME（rtkit のない PipeWire）を挙げる。
+- Windows: `strata.exe`・`strata-image.exe`・`strata-device.exe` に UTF-8 のマニフェストを付け、ANSI でない文字のパスを通す。
+- `--batch`: 2 枚の NVIDIA の GPU の層の分割では、既定のグループを 1 つの直列にする（upstream の計測で +12〜18%）。
+
+RX 9060 XT で upstream v0.2.1.1 と比べました（IQ3_XXS の generate）。prefill が 2.1〜2.7 倍、decode が 3〜7% 速いです。
+upstream のエンジンの変更は、ほかの GPU の計測の経路（1 枚の GPU、エキスパートを RAM に置く）に効かないので、B70 と RTX 4070 は 0.2.0-beta の比べを使っています。
+
+移していないのは、アプリとターミナル、Docker の配布、Mac、upstream の `sycl/`、HIP の内蔵 GPU と hipBLASLt の表と GPU のキューの開き方（RX 9060 XT の XeStrata の prompt は起動ごとに 1.5% の幅に収まっていて、upstream の直した 2 つの速さに分かれる現象は出ていません）、
+experts.bin の pack の I/O の先読みとファイルの段（その土台が XeStrata にありません）、Intel の GPU の画像の読み手（XeStrata は Vulkan の読み手を持ちます）です。
+
+## Strata 0.2.0-beta の取り込み
+
+upstream の Strata 0.1.45 から 0.2.0-beta（`3d1fb480`）までの変更を Xe に移しています。
+正式な 0.2.0 が出たら、その差分を足します。
+
+移したものの主なものは次のとおりです。
+
+- Gyro-S と Gyro-M（agentionai）: trellis 量子化の型（TQ2_T・TQK6・TQK7）と、エキスパートの Hadamard の回転。CPU（AVX2・AVX-512）と GPU（decode と prompt）で計算し、setup の一覧に載せる。pack の版は xs2。
+- setup: ダウンロードするモデルのファイルを大きさと SHA-256 で固定する。大きなファイルは複数の接続でダウンロードする。ビルドの道具（cmake・ninja）は実行時の requirements から分ける。SSD でも RAM に余裕があれば `--ple-io ram` を付ける。画像を読めるモデルでは画像を既定で入にする。
+- serve: 文脈に収まらない `max_tokens` は、400 にせず残りの余地まで縮める（`--no-fit-max-tokens` で以前のように断る）。
+- CPU のプールの既定のワーカーを、32 本とコンテナの CPU の割り当てまでにする。cgroup の RAM の判定では、きれいなページキャッシュを回収できるものに数える。
+- 適応の段で入れ替えたエキスパートは、既定で 2 つ目の窓から使う（`STRATA_ADAPT_LAG=2`、RTX 4070 で decode +8.6%）。
+- 画像の読み手（strata-vision）は、文章のモデルの語彙とヘッダーだけを読む（Gyro の型のファイルでも開ける）。
+
+この取り込みの間に XeStrata の側で直したもの:
+
+- VRAM のエキスパートの入れ替えの位置で窓を切るのは、CPU と GPU で丸めが違う層があるモデルだけにする（`STRATA_ADAPT_CUT=0|1`）。Qwen3.8 の 4 つのファイルはすべての層が CPU と GPU で同じビットになるので、窓を切らない。同じ文で decode は RTX 4070 で 59.3 → 61.3、B70 で 80.5 → 86.9 tok/s。
+
+upstream v0.2.0-beta と 3 社の GPU で比べました（generate は 5 つのモデルファイル、serve、通常使用、画像の生成）。
+IQ3_XXS の generate では、B70 は upstream の `sycl/` 版より prefill が 1.7〜3.0 倍、decode が 18〜38% 速いです。
+RTX 4070 は prefill が 1.02〜1.14 倍、decode が 23〜34% 速いです。RX 9060 XT は prefill が 2.1〜2.7 倍、decode は同等から 8% 速いです。
+画像の生成（1024x1024、8 ステップ）は、XeStrata が B70 で 7.6 秒、RTX 4070 で 13.9 秒、RX 9060 XT で 22.5 秒、upstream がそれぞれ 52.0 秒、26.6 秒、73.7 秒です。
+
+移していないのは、upstream の新しいアプリ（`apps/`）とターミナル（`strata_cli`・`strata_control`）、配布の変更（インストーラー、署名つきの配信、エンジンの部品の更新）、NVFP4、upstream の `sycl/`、
+CUDA と HIP だけの速さの経路（sm_120 の切り替えなど）、HIP の仮想メモリでの `--kv-grow`（intel/llvm の HIP のアダプターに仮想メモリの拡張がない）、
+GGUF をその場で読む省 RAM の形（写さずに使うエキスパートと I/O の先読み）、upstream の試験の道具と記録です。
 
 ## Strata 0.1.45 の取り込み
 
@@ -582,7 +657,7 @@ XeStrata はそのまま使っていて、Xe での調整は一部しか済ん�
 | --- | --- | --- |
 | `src/program/generate.cpp` | ネイティブの pack で、キャッシュにないエキスパートを PCIe で運ぶ割合 0.55（正準形は 0.2）。リンクの速さ（256 MiB の転送 4 回の最良）/ 20 GB/s で縮める | 新しい開発機で測ると、0.15 で 2〜4% 速く、それより大きい割合はどれも遅かった。0.55 はこの測定に支持されない |
 | `tools/calibrate.py` | 基準は Ryzen 5 7600 と RTX 5070。PCIe の割合の候補 0、0.2、0.35、0.55、0.75、推測の下限 0.3、0.5、0.7、ワーカー数の候補。交互の確認で 3% を超えて速いときだけ採用 | 候補と基準は upstream のまま |
-| `setup.py` | `--spec 4`、`--spec-min-p 0.5`、`--expert-cache auto`、`--prefill auto` | `--prefill auto` は 32768 トークンの塊まで選ぶように変えた。既定のリングで収まらない塊は、リングを 96 スロットにして選ぶ（upstream #583。B70 を 8 GB に絞った IQ3_S で、8K と 32K のプロンプトが 1.5〜2 倍）。ほかは upstream のまま |
+| `setup.py` | `--spec 4`、`--spec-min-p 0.5`、`--expert-cache auto`、`--prefill auto` | `--prefill auto` は 32768 トークンの塊まで選ぶように変えた。既定のリングで収まらない塊は、リングを 96 スロットにして選ぶ（upstream #583。B70 を 8 GB に絞った IQ3_S で、8K と 32K のプロンプトが 1.5〜2 倍）。それでも収まらなければ、int8 の積の組の作業領域（GU・H・Hq）を塊全体でなく 1 組の行数で確保して選び直す（RTX 4070 の IQ3_XXS 32K で塊が 8192 → 16384、prefill 1,194 → 2,058 tok/s。組の形で丸めが変わるので答えは上限なしの実行と少し違いうる）。窓の大きさは `--spec-min-p` の下限でなく、測った窓の時間と補正した確率から 1 ms あたりの出力で決める（`--spec-window auto`、[DETAILS](DETAILS.ja.md#この-pc-に合わせて調整する--calibrate)）。ほかは upstream のまま |
 | `src/program/generate.cpp` | VRAM の予約 700 MiB（小さい GPU では 300 まで）、prefill の経路のスロットの借り方と塊の選び方、4 ラウンドごとのキャッシュの入れ替え（最大 96 個） | upstream のまま |
 | `src/program/generate.cpp` と CPU のプール | 物理コア数に基づくワーカー数とホストのワーカー、キャッシュのヒットの通知、グラフとドアベルの段取り | ワーカー数は新しい開発機で測り、7〜19 で速さが変わらなかったので既定のまま |
 | `src/kernels/cpu/iq_avx512.cpp` | ソフトウェアのプリフェッチの距離と、AVX-512 向けの調整 | 開発機は AVX-512 を持たないので測っていない |

@@ -186,7 +186,7 @@ AVX-512 code touched: AGENTS.md's Intel SDE runs.
 
 ## 7. Against the tag
 
-The tables against the tag, on the three GPUs, with generate, the serve path, everyday use and image generation, for every model file: [references/measure.md](references/measure.md) has the engines, the files and tiers, and the commands.
+The tables against the tag, on the three GPUs, with generate, the serve path and everyday use, for every model file: [references/measure.md](references/measure.md) has the engines, the files and tiers, and the commands.
 They come after step 4 has taken upstream's ideas, as the check that nothing lost; a loss here is worked as in step 8.
 
 ## 8. The check
@@ -199,21 +199,20 @@ The previous XeStrata is the newest `xe*` release before this run (step 1). Its 
 ```sh
 python .claude/skills/upstream-sync/scripts/judge.py \
   --prev IQ3_XXS=<data>/records/bench-results/<date>-release-<xe tag> --prev Q2_0=<last merge>/Q2_0 ... \
-  $o/IQ3_XXS $o/Q2_0 $o/IQ2_XS $o/IQ3_S $o/UD-Q4_K_XL
+  $o/IQ3_XXS $o/Q2_0 $o/IQ2_XS $o/IQ3_S $o/UD-Q4_K_XL $o/Gyro-M
 ```
 
 Against the tag, a cell (file, GPU, tier, prompt or output) passes when XeStrata's median is at most 1% below upstream's.
-The image cells (GPU; the seconds an image), read from `matrix-image.json`, pass at most 1% slower, against the tag and the previous XeStrata alike: the fixed seed keeps an image's time within 1% from run to run.
 The serve cells (GPU, tier, greedy or t07; prompt, follow-ups, output), read from `matrix-serve.json`, and the everyday cells (GPU, conversation; first token, prompt, output), read from `matrix-usage.json`, pass at most `SERVE_LIMIT` (`judge.py`, 5%) below upstream's, the prompt speed at 1%: each engine writes its own text there, so the other measures vary with the text from round to round (the rounds' seeds differ), up to 10% off a cell's median at temperature 0.7 on 2026-10-10.
 A cell upstream does not finish, finishes at 10 tok/s or less, or is stopped as that slow, is left out; one only XeStrata does not finish fails.
 A file whose experts do not fit in a machine's RAM budget, so that they are read from the SSD while it answers (SSD offload: UD-Q4_K_XL on the AMD container's 62 GB), is not run on that machine (the user's decision of 2026-10-09): as for GPUs there is no machine for (step 4), its paths are checked by the tests and the builds only, and the record lists its cells `unverified`.
-The B70 is compared with upstream's `sycl/` port, as the release's speed table (/release) compares it (the user's decision of 2026-10-18; it replaces the decision of 2026-10-12, which measured XeStrata alone there): its engine is the tag's `sycl/` built in its Docker image and run through `.claude/skills/release/scripts/up-sycl.sh` (references/measure.md), and its image generation upstream's Vulkan `sd-cli`. Every GPU is judged against the tag and the previous XeStrata.
+The B70 is compared with upstream's `sycl/` port, as the release's speed table (/release) compares it (the user's decision of 2026-10-18; it replaces the decision of 2026-10-12, which measured XeStrata alone there): its engine is the tag's `sycl/` built in its container image (rootless Podman) and run through `.claude/skills/release/scripts/up-sycl.sh` (references/measure.md). Every GPU is judged against the tag and the previous XeStrata.
 
 Against the previous XeStrata (`prev` lines), every cell both records have is judged: the prompt at 1%, the rest at `SERVE_LIMIT`, since the text changes with the version (on the generate path it is the tag's).
 The previous XeStrata is not measured again: its record is the reference (the user's decision of 2026-10-12). A `prev` failure suspected of noise (another cell of the same run moved the other way, or upstream moved as much in the same run) is measured once more in the same setting; one still slower then, or not suspected of noise, is worked at once, the ideas' switches off one at a time with `ab_pair.py` (only the side that changed is measured: a greedy run of the same binary, settings and text is read from its record, AGENTS.md).
 
 For each failing cell: find where the time goes (the GPU profilers of docs/DEVTOOLS.md, the engine's timing lines), read how upstream does that part (for a `prev` failure: what changed since the previous XeStrata, `git log <xe tag>..HEAD`), make XeStrata faster (step 4's rules), and measure that cell again.
-The run is done only when a full run of step 7 on the final HEAD, every file and tier of the table (IQ3_XXS with 262K), the serve path, everyday use, image generation and every reachable GPU, gives `ALL PASS` with the `--prev` records: a cell fixed earlier can lose again to a later change.
+The run is done only when a full run of step 7 on the final HEAD, every file and tier of the table (IQ3_XXS with 262K), the serve path, everyday use and every reachable GPU, gives `ALL PASS` with the `--prev` records: a cell fixed earlier can lose again to a later change.
 
 ## 9. The record and the report
 

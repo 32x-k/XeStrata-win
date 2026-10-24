@@ -2,7 +2,7 @@ SPDX-FileCopyrightText: The LLVM project contributors
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-build-job-pools: a fix to intel/llvm v7.1.1's build, applied by tools/intel_llvm_build.py (none in its sycl branch either, 2026-10-08).
+build-job-pools: a fix to intel/llvm v7.2.0's build, applied by tools/intel_llvm_build.py (none in its sycl branch either, 2026-10-08).
 
 xptifw, built in the tree, includes HandleLLVMOptions a second time, which appends the compile and link
 job pools again.  A pool defined twice makes Ninja refuse the build file ("duplicate pool
@@ -10,7 +10,7 @@ job pools again.  A pool defined twice makes Ninja refuse the build file ("dupli
 limited the links.  Fixed, each pool is appended only once.
 ---
 diff --git a/llvm/cmake/modules/HandleLLVMOptions.cmake b/llvm/cmake/modules/HandleLLVMOptions.cmake
-index d0a094f..e4ae4c2 100644
+index c9694e384a..c19df7f84d 100644
 --- a/llvm/cmake/modules/HandleLLVMOptions.cmake
 +++ b/llvm/cmake/modules/HandleLLVMOptions.cmake
 @@ -1,3 +1,4 @@

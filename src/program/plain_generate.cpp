@@ -13,15 +13,19 @@
 #include "strata/program/option_scope.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/conversation_memory.hpp"
+#include "strata/core/device.hpp"
 #include "strata/core/plain_model.hpp"
+#include "strata/core/runtime.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
+#include <cctype>
 #include <chrono>
+#include <cerrno>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +34,7 @@
 #include <exception>
 #include <fstream>
 #include <iterator>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -40,6 +45,9 @@
 #include <io.h>
 #else
 #include <unistd.h>
+#endif
+#if defined(__linux__)
+#include <dirent.h>
 #endif
 
 namespace strata::program {
@@ -91,19 +99,135 @@ std::vector<int32_t> eos_tokens(const std::string& path) {
     return ids;
 }
 
+// The processor's own graphics through Level Zero: with the Unified Runtime's second Level Zero adapter the UHD 770's
+// driver aborted at the first window graph's launch (its command stream full, linear_stream.h), and a thread of the
+// products' library crashed in it; with the first adapter llm-jp-4.1 Q4_K_M ran and agreed with llama.cpp over 32
+// tokens on five prompts (2026-10-19).  The adapter is chosen as the devices are listed, so before any SYCL call: the
+// first one where the GPU the engine takes has no PCIe link (sysfs reads its link speed "Unknown"), the GPU
+// STRATA_GPU_PCI names, else every display controller there is.  A value the user set stays.
+void linkless_gpu_adapter() {
+#if defined(__linux__)
+    if (std::getenv("SYCL_UR_USE_LEVEL_ZERO_V2") != nullptr) return;
+    auto linkless = [](const std::string& dev) {
+        std::ifstream f("/sys/bus/pci/devices/" + dev + "/current_link_speed");
+        std::string v;
+        return !f || !std::getline(f, v) || v.rfind("Unknown", 0) == 0;
+    };
+    bool all = true, any = false;
+    if (const char* pci = std::getenv("STRATA_GPU_PCI"); pci != nullptr && *pci != '\0') {
+        any = true;
+        all = linkless(pci);
+    } else if (DIR* d = opendir("/sys/bus/pci/devices")) {
+        while (const dirent* e = readdir(d)) {
+            if (e->d_name[0] == '.') continue;
+            std::ifstream c(std::string("/sys/bus/pci/devices/") + e->d_name + "/class");
+            std::string cls;
+            if (!std::getline(c, cls) || cls.rfind("0x03", 0) != 0) continue;   // a display controller
+            any = true;
+            all = all && linkless(e->d_name);
+        }
+        closedir(d);
+    }
+    if (any && all) setenv("SYCL_UR_USE_LEVEL_ZERO_V2", "0", 0);
+#endif
+}
+
 }  // namespace
 
 // `--serve` for these models: generate.cpp's --serve protocol (server.py's StrataEngine) for text requests.  READY
 // <context> stop; then `GEN <max_new> [temperature=F top_p=F top_k=N min_p=F seed=N] <ids>` -> RESUME <reused>,
 // one `T <id>` a token, DONE (generate.cpp's fields; the RAM, file and offload ones zero); STOP ends a request,
-// QUIT the engine.  The commands of Qwen3.8-Flash-Next's engine this one has no part for (VRAM, SAVE, RESTORE,
-// GENI, BGEN) answer ERR.  The conversation's tokens stay read between requests: a request that starts with them
-// reads only what follows (a model with a recurrent state only when it extends them all; else it starts over).
+// QUIT the engine; SAVE / RESTORE <path> a session file.  The commands of Qwen3.8-Flash-Next's engine this one has no
+// part for (VRAM, GENI, BGEN) answer ERR.  The conversation's tokens stay read between requests: a request that starts
+// with them reads only what follows (a model with a recurrent state only when it extends them all; else it starts
+// over, or from the conversation cache).
+namespace {
+
+// The conversation cache (--conversation-cache-mib, off by default as Qwen3.8-Flash-Next's): conversations set aside
+// in RAM, each its tokens and the state they left (PlainModel::save_state), so a client that comes back to one reads
+// only what it added.  A request takes the live state or a parked one, whichever holds the longer start of it (with a
+// recurrent state, all of the conversation's tokens); the live one is parked before another takes its place, the
+// least recently used one dropped past the slots or the budget, or when the RAM left would fall under the floor.
+struct ConversationCache {
+    int64_t budget = 0;           // bytes; 0: off
+    int slots = 4;
+    int64_t min_free = 2560ll << 20;
+    struct Entry {
+        std::vector<int32_t> ids;
+        strata::core::PlainModel::Snapshot snap;
+    };
+    std::list<Entry> parked;      // most recent first
+    int64_t used() const {
+        int64_t n = 0;
+        for (const Entry& e : parked) n += (int64_t) e.snap.bytes();
+        return n;
+    }
+};
+
+// A session file (SAVE / RESTORE <path>): a conversation's tokens and state, for this model file and context only
+constexpr char kSessionMagic[8] = {'X', 'S', 'P', 'L', 'A', 'I', 'N', '1'};
+
+bool session_write(const std::string& path, const std::string& model_id, const std::vector<int32_t>& ids,
+                   const strata::core::PlainModel::Snapshot& snap, size_t& bytes, std::string& err) {
+    const std::string tmp = path + ".part";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) { err = "cannot write " + tmp; return false; }
+    auto put = [&](const void* p, size_t n) { return std::fwrite(p, 1, n, f) == n; };
+    const uint64_t idn = model_id.size(), nt = ids.size(), np = snap.parts.size(), tok = (uint64_t) snap.tokens;
+    bool ok = put(kSessionMagic, 8) && put(&idn, 8) && put(model_id.data(), idn) && put(&tok, 8) && put(&nt, 8) &&
+              put(ids.data(), nt * 4) && put(&np, 8);
+    bytes = 8 + 8 + idn + 8 + 8 + nt * 4 + 8;
+    for (const auto& part : snap.parts) {
+        const uint64_t n = part.size();
+        ok = ok && put(&n, 8) && put(part.data(), n);
+        bytes += 8 + n;
+    }
+    ok = std::fflush(f) == 0 && ok;
+    ok = std::fclose(f) == 0 && ok;
+    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        err = "writing " + path + " failed";
+        return false;
+    }
+    return true;
+}
+
+bool session_read(const std::string& path, const std::string& model_id, std::vector<int32_t>& ids,
+                  strata::core::PlainModel::Snapshot& snap, size_t& bytes, std::string& err) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) { err = "cannot read " + path; return false; }
+    auto get = [&](void* p, size_t n) { return std::fread(p, 1, n, f) == n; };
+    char magic[8];
+    uint64_t idn = 0, tok = 0, nt = 0, np = 0;
+    std::string id;
+    bool ok = get(magic, 8) && std::memcmp(magic, kSessionMagic, 8) == 0 && get(&idn, 8) && idn < 4096;
+    if (ok) { id.resize(idn); ok = get(id.data(), idn) && id == model_id; }
+    if (!ok) { std::fclose(f); err = "not a session file of this model and context"; return false; }
+    ok = get(&tok, 8) && get(&nt, 8) && nt == tok && nt < (1ull << 31);
+    if (ok) { ids.resize(nt); ok = get(ids.data(), nt * 4) && get(&np, 8) && np < 4096; }
+    snap.tokens = (int64_t) tok;
+    snap.parts.assign(ok ? np : 0, {});
+    bytes = 8 + 8 + idn + 8 + 8 + nt * 4 + 8;
+    for (auto& part : snap.parts) {
+        uint64_t n = 0;
+        ok = ok && get(&n, 8) && n < (1ull << 40);
+        if (!ok) break;
+        part.resize(n);
+        ok = get(part.data(), n);
+        bytes += 8 + n;
+    }
+    std::fclose(f);
+    if (!ok) err = "a short or damaged session file";
+    return ok;
+}
+
+}  // namespace
+
 static int plain_serve(strata::core::PlainModel& model, const strata::core::PlainOptions& opt, const std::string& arch,
-                       const std::vector<int32_t>& eos, const std::string& profile_save, double save_min) {
-    // stdin: STOP takes effect mid-request, every other line queues.  The reader is detached and may sit in read(2)
-    // past QUIT, so what it touches is shared with it, never this function's locals; and it reads the descriptor,
-    // not std::cin, whose lock glibc's exit() waits for (as generate.cpp's --serve)
+                       const std::vector<int32_t>& eos, const std::string& profile_save, double save_min,
+                       ConversationCache& cache) {
+    // the reader thread outlives this function (it is detached and ends with the process), so what it shares is
+    // owned by both
     struct StdinShared {
         std::atomic<bool> stop_req{false};
         std::mutex mu;
@@ -113,11 +237,10 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     };
     const auto in_shared = std::make_shared<StdinShared>();
     std::atomic<bool>& stop_req = in_shared->stop_req;
-    std::mutex& in_mu = in_shared->mu;
-    std::condition_variable& in_cv = in_shared->cv;
-    std::deque<std::string>& in_lines = in_shared->lines;
-    bool& in_eof = in_shared->eof;
-    std::thread([st = in_shared] {
+    std::thread([st = in_shared] {   // stdin: STOP takes effect mid-request, every other line queues
+        // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for stdin's
+        // lock, which getline holds while it waits for input, so the engine hung in exit() after QUIT while the
+        // server kept its stdin open (as the main engine's serve, generate.cpp)
         std::string l, buf;
         char chunk[4096];
         auto getline_fd = [&](std::string& out) -> bool {
@@ -155,16 +278,22 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         st->cv.notify_one();
     }).detach();
     auto next_line = [&](std::string& out) {
-        std::unique_lock<std::mutex> lk(in_mu);
-        in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
-        if (in_lines.empty()) return false;
-        out = std::move(in_lines.front());
-        in_lines.pop_front();
+        std::unique_lock<std::mutex> lk(in_shared->mu);
+        in_shared->cv.wait(lk, [&] { return !in_shared->lines.empty() || in_shared->eof; });
+        if (in_shared->lines.empty()) return false;
+        out = std::move(in_shared->lines.front());
+        in_shared->lines.pop_front();
         return true;
     };
     const int64_t ctx = model.max_cells(), V = model.vocab();
     std::vector<int32_t> live;   // the tokens the state holds, positions 0 .. live.size() - 1
-    bool stale = false;          // a failed request left the state half written: the next one resets it
+    // a session file's identity: the model file (its name and size) and the context, which fix the state's shape
+    std::string model_id;
+    {
+        std::ifstream f(opt.gguf, std::ios::binary | std::ios::ate);
+        model_id = opt.gguf.substr(opt.gguf.find_last_of("/\\") + 1) + " " + std::to_string((long long) f.tellg()) +
+                   " " + std::to_string((long long) ctx);
+    }
     std::vector<int32_t> out((size_t) opt.max_t);
     std::string err;
     std::printf("INFO context=%lld expert_slots=%lld\n", (long long) ctx, (long long) model.slots());
@@ -184,6 +313,35 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         }
         if (line.empty()) continue;
         stop_req.store(false);   // a STOP between requests ends nothing
+        // SAVE / RESTORE <path>: the live conversation to a file and back (server.py's session_file)
+        if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
+            const bool save = line[0] == 'S';
+            const std::string path = line.substr(save ? 5 : 8);
+            const auto t0 = Clock::now();
+            auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
+            auto refuse = [&](const char* kind, const std::string& why) {
+                std::string one = why;
+                for (char& c : one) if (c == '\n' || c == '\r') c = ' ';
+                std::printf("SERR %s 0 %s\n", kind, one.c_str());
+                std::fflush(stdout);
+            };
+            strata::core::PlainModel::Snapshot snap;
+            size_t bytes = 0;
+            if (save) {
+                if (live.empty()) { refuse("invalid", "no conversation to save"); continue; }
+                if (!model.save_state((int64_t) live.size(), snap, err)) { refuse("io", err); continue; }
+                if (!session_write(path, model_id, live, snap, bytes, err)) { refuse("storage", err); continue; }
+                std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
+            } else {
+                std::vector<int32_t> ids;
+                if (!session_read(path, model_id, ids, snap, bytes, err)) { refuse("invalid", err); continue; }
+                if (!model.restore_state(snap, err)) { refuse("invalid", err); continue; }
+                live = std::move(ids);
+                std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());
+            }
+            std::fflush(stdout);
+            continue;
+        }
         if (line.rfind("GEN ", 0) != 0) {
             const std::string head = line.substr(0, line.find(' '));
             std::printf("ERR %s is not available for %s (this engine takes GEN, STOP and QUIT)\n", head.c_str(),
@@ -233,16 +391,60 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         }
         // what of the conversation to keep: the common prefix, at least the last prompt token read again (its
         // logits pick the first token); with a recurrent state, all of it or nothing
-        size_t common = 0;
-        while (common < live.size() && common < (size_t) n && live[common] == ids[common]) ++common;
-        int64_t resume = std::min<int64_t>((int64_t) common, n - 1);
-        if (model.recurrent() && resume != (int64_t) live.size()) resume = 0;
-        if (resume == 0 && (!live.empty() || stale) && !model.reset(err)) {
+        auto takes = [&](const std::vector<int32_t>& have) -> int64_t {   // how much of the request a state serves
+            size_t common = 0;
+            while (common < have.size() && common < (size_t) n && have[common] == ids[common]) ++common;
+            int64_t r = std::min<int64_t>((int64_t) common, n - 1);
+            if (model.recurrent() && r != (int64_t) have.size()) r = 0;
+            return r;
+        };
+        int64_t resume = takes(live);
+        // the live conversation set aside before a request that does not continue it overwrites it, as far as the
+        // budget, the slots and the RAM let it (the least recently used ones dropped first)
+        auto park_live = [&](std::list<ConversationCache::Entry>::iterator keep) {
+            if (live.empty()) return;
+            const int64_t need = (int64_t) model.state_bytes((int64_t) live.size());
+            const auto avail = strata::core::available_host_bytes();
+            if (need > cache.budget || !avail || (int64_t) *avail - need <= cache.min_free) return;
+            while (!cache.parked.empty() &&
+                   ((int) cache.parked.size() >= cache.slots || cache.used() + need > cache.budget)) {
+                if (std::prev(cache.parked.end()) == keep) break;
+                cache.parked.pop_back();
+            }
+            if ((int) cache.parked.size() >= cache.slots || cache.used() + need > cache.budget) return;
+            ConversationCache::Entry e;
+            if (!model.save_state((int64_t) live.size(), e.snap, err)) return;
+            e.ids = live;
+            cache.parked.push_front(std::move(e));
+        };
+        if (cache.budget > 0) {   // a parked conversation that serves more of it takes the live one's place
+            auto best = cache.parked.end();
+            int64_t best_r = resume;
+            for (auto it = cache.parked.begin(); it != cache.parked.end(); ++it)
+                if (const int64_t r = it->ids.size() <= (size_t) n ? takes(it->ids) : 0;
+                    r > best_r && r == (int64_t) it->ids.size()) {
+                    best = it;
+                    best_r = r;
+                }
+            if (best != cache.parked.end()) {
+                park_live(best);   // the live conversation first
+                if (!model.restore_state(best->snap, err)) {
+                    std::printf("FATAL %s\n", err.c_str());
+                    std::fflush(stdout);
+                    return 1;
+                }
+                live = std::move(best->ids);
+                cache.parked.erase(best);
+                resume = best_r;
+            } else if (resume < (int64_t) live.size()) {
+                park_live(cache.parked.end());   // the request starts another conversation: keep this one
+            }
+        }
+        if (resume == 0 && !live.empty() && !model.reset(err)) {
             std::printf("FATAL %s\n", err.c_str());
             std::fflush(stdout);
             return 1;
         }
-        if (resume == 0) stale = false;
         live.resize((size_t) resume);
         std::printf("RESUME %lld\n", (long long) resume);
         std::fflush(stdout);
@@ -268,7 +470,6 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         }
         if (!ok) {   // the state is the device's, half written: the next request starts over
             live.clear();
-            stale = true;
             std::printf("ERR %s\n", err.c_str());
             std::fflush(stdout);
             continue;
@@ -310,7 +511,6 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         }
         if (!ok) {
             live.clear();
-            stale = true;
             std::printf("ERR %s\n", err.c_str());
             std::fflush(stdout);
             continue;
@@ -357,6 +557,10 @@ static void plain_usage(const std::string& arch) {
                  "  --adapt-swaps N      the most experts one round moves into the VRAM tier (default 96)\n"
                  "  --adapt-mib-per-token N   and at most N MiB of them for each token read since the last round\n"
                  "                       (default 48; 0: no such bound)\n"
+                 "  --adapt-decay F      the routing counts are multiplied by F after each round (default 0.7)\n"
+                 "  --expert-cache N|auto   the VRAM tier's most expert slots, over all the layers (default auto)\n"
+                 "  --vram-free-mib N    size the VRAM tier from at most N MiB free\n"
+                 "  --vram-reserve-mib N leave N MiB of VRAM free beside the tier (default a 32nd of the memory)\n"
                  "  --mmap-experts       read the experts from the GGUF through mmap instead of pinned RAM\n"
                  "  --no-pcie-split      the CPU computes every expert the VRAM tier misses\n"
                  "  --prompt-chunk N     the prompt's most tokens a chunk through the batched products (default\n"
@@ -366,9 +570,16 @@ static void plain_usage(const std::string& arch) {
                  "                       the last one and N - 1 drafts (default 3; 0: off; greedy only)\n"
                  "  --draft-vocab PATH   the drafts over this token subset (int32 ids, data/draft_vocab*.bin)\n"
                  "  --rope-scaling none|linear|yarn, --rope-scale F, --yarn-orig-ctx N   context extension\n"
+                 "  --rope-freq-base F, --rope-freq-scale F   the rotation's base and frequency scale\n"
                  "  --dump-logits PATH   each generated token's logits, FP32 rows\n"
+                 "  --dump-routing PATH  the routed experts of every token and MoE layer (tools/make_profile.py)\n"
+                 "  --spec-follow PATH   benchmarks: emit this continuation (token ids) instead of the picks and\n"
+                 "                       accept the drafts that match it, so settings compare on the same text\n"
                  "  --serve              stay resident and take requests on stdin (server.py's protocol, text requests)\n"
-                 "  --gpu PCI            the GPU (its PCI address)\n",
+                 "  --gpu PCI            the GPU (its PCI address)\n"
+                 "  --layer-split K[,K2..]|auto  the blocks across the GPUs: the first runs the blocks before K, the\n"
+                 "                       next those from K on, ..; auto: in proportion to each GPU's free memory\n"
+                 "  --split-device D[,D2..]  the later GPUs (engine numbers or PCI addresses; default the other cards)\n",
                  arch.c_str());
 }
 
@@ -379,6 +590,7 @@ int plain_main(int argc, char** argv) {
     if (gguf.empty()) return -1;
     const std::string arch = architecture(gguf);
     if (arch.empty() || arch == "qwen4exp") return -1;
+    linkless_gpu_adapter();
 
     strata::core::PlainOptions opt;
     opt.gguf = gguf;
@@ -389,6 +601,8 @@ int plain_main(int argc, char** argv) {
     bool stop_eos = false, serve = false;
     std::vector<int32_t> eos;
     std::string dump_path, profile_save;
+    std::vector<int32_t> follow;   // --spec-follow: the continuation emitted instead of the picks (benchmarks)
+    ConversationCache cache;       // --serve: --conversation-cache-mib and its slots
     double save_min = 10.0;   // --expert-profile-save-every (serve)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -423,6 +637,19 @@ int plain_main(int argc, char** argv) {
         else if (a == "--spec") opt.spec = (int) std::strtol(next("--spec"), nullptr, 10);
         else if (a == "--pool-workers") opt.pool_workers = (int) std::strtol(next("--pool-workers"), nullptr, 10);
         else if (a == "--dump-logits") dump_path = next("--dump-logits");
+        else if (a == "--dump-routing") opt.dump_routing = next("--dump-routing");
+        else if (a == "--conversation-cache-mib")
+            cache.budget = std::max<int64_t>(0, std::strtoll(next("--conversation-cache-mib"), nullptr, 10)) << 20;
+        else if (a == "--conversation-cache-slots")
+            cache.slots = std::max(1, (int) std::strtol(next("--conversation-cache-slots"), nullptr, 10));
+        else if (a == "--conversation-cache-min-free-mib")
+            cache.min_free =
+                std::max<int64_t>(0, std::strtoll(next("--conversation-cache-min-free-mib"), nullptr, 10)) << 20;
+        else if (a == "--spec-follow") {
+            std::ifstream in(next("--spec-follow"));
+            const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            if (!parse_ids(text, follow)) { std::fprintf(stderr, "--spec-follow: a list of token ids\n"); return 2; }
+        }
         else if (a == "--adapt-every") opt.adapt_every = (int) std::strtol(next("--adapt-every"), nullptr, 10);
         else if (a == "--adapt-swaps") opt.adapt_swaps = (int) std::strtol(next("--adapt-swaps"), nullptr, 10);
         else if (a == "--adapt-mib-per-token")
@@ -436,6 +663,59 @@ int plain_main(int argc, char** argv) {
         else if (a == "--rope-scaling") opt.rope_scaling = next("--rope-scaling");
         else if (a == "--rope-scale") opt.rope_scale = std::strtod(next("--rope-scale"), nullptr);
         else if (a == "--yarn-orig-ctx") opt.yarn_orig_ctx = std::strtod(next("--yarn-orig-ctx"), nullptr);
+        else if (a == "--layer-split") {
+            const std::string v = next("--layer-split");
+            opt.split_auto = v == "auto";
+            opt.split_at.clear();
+            for (size_t at = 0; !opt.split_auto && at < v.size();) {
+                const size_t comma = v.find(',', at);
+                const std::string part = v.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                char* end = nullptr;
+                const long long k = std::strtoll(part.c_str(), &end, 10);
+                if (part.empty() || end == nullptr || *end != '\0') {
+                    std::fprintf(stderr, "strata (%s): --layer-split takes K[,K2..] or auto, not \"%s\"\n", arch.c_str(),
+                                 v.c_str());
+                    return 2;
+                }
+                opt.split_at.push_back(k);
+                if (comma == std::string::npos) break;
+                at = comma + 1;
+            }
+        }
+        else if (a == "--split-device") {   // engine numbers, or PCI addresses (setup writes those), as generate.cpp
+            const std::string v = next("--split-device");
+            opt.split_devices.clear();
+            for (size_t at = 0; at <= v.size();) {
+                const size_t comma = std::min(v.find(',', at), v.size());
+                std::string t = v.substr(at, comma - at);
+                int found = -1;
+                if (!t.empty() && t.find_first_not_of("0123456789") == std::string::npos) {
+                    found = (int) std::strtol(t.c_str(), nullptr, 10);
+                } else {
+                    for (auto& c : t) c = (char) std::tolower((unsigned char) c);
+                    for (int d = 0; d < strata::core::Runtime::count() && found < 0; ++d)
+                        if (strata::core::device_info(d).pci == t) found = d;
+                }
+                if (found < 0) {
+                    std::fprintf(stderr, "strata (%s): --split-device: no usable GPU at \"%s\"\n", arch.c_str(), t.c_str());
+                    return 2;
+                }
+                opt.split_devices.push_back(found);
+                at = comma + 1;
+            }
+        }
+        else if (a == "--split-order") (void) next("--split-order");   // the stages take the GPUs as given
+        else if (a == "--vram-reserve-mib")
+            opt.reserve_mib = std::max<int64_t>(0, std::strtoll(next("--vram-reserve-mib"), nullptr, 10));
+        else if (a == "--vram-free-mib")
+            opt.vram_free_mib = std::max<int64_t>(0, std::strtoll(next("--vram-free-mib"), nullptr, 10));
+        else if (a == "--expert-cache") {
+            const std::string v = next("--expert-cache");
+            opt.expert_slots = v == "auto" ? -1 : std::max<int64_t>(0, std::strtoll(v.c_str(), nullptr, 10));
+        }
+        else if (a == "--adapt-decay") opt.adapt_decay = std::strtof(next("--adapt-decay"), nullptr);
+        else if (a == "--rope-freq-base") opt.rope_freq_base = std::strtod(next("--rope-freq-base"), nullptr);
+        else if (a == "--rope-freq-scale") opt.rope_freq_scale = std::strtod(next("--rope-freq-scale"), nullptr);
         else if (a == "--expert-profile-save") profile_save = next("--expert-profile-save");
         else if (a == "--expert-profile-save-every") save_min = std::strtod(next("--expert-profile-save-every"), nullptr);
         else {
@@ -455,6 +735,7 @@ int plain_main(int argc, char** argv) {
             return 2;
         }
     }
+    if (!follow.empty()) n_new = std::min<int64_t>(n_new, (int64_t) follow.size());   // the run ends with it
     if (!serve && (prompt.empty() || n_new < 1)) {
         std::fprintf(stderr, "strata (%s): needs --tokens and --max-new >= 1\n", arch.c_str());
         return 2;
@@ -476,13 +757,15 @@ int plain_main(int argc, char** argv) {
         std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
         return 1;
     }
+    opt.prompt_chunk = model.prompt_chunk();   // the model may take the prompt in windows (short of pinned memory)
     if (opt.prompt_chunk > 0) {
         const char* experts = model.prompt_int8() ? strata::prefill::mmq::path() : nullptr;
         std::fprintf(stderr, "strata (%s): prompt matrix products on %s; the experts' in %s%s%s\n", arch.c_str(),
                      strata::prefill::Gemm::path(), experts ? "int8 (" : "FP16", experts ? experts : "",
                      experts ? ")" : "");
     }
-    if (serve) return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save, save_min);
+    if (serve)
+        return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save, save_min, cache);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> dump_file(nullptr, &std::fclose);
     if (!dump_path.empty()) {
@@ -499,7 +782,9 @@ int plain_main(int argc, char** argv) {
     std::vector<float> logits((size_t) T * (size_t) V);
     std::vector<int32_t> produced;
     auto emit = [&](int row) -> bool {
-        produced.push_back(out[(size_t) row]);
+        // --spec-follow: produced[i] is the continuation's token i, whatever the model picked
+        const size_t at = produced.size();
+        produced.push_back(at < follow.size() ? follow[at] : out[(size_t) row]);
         if (dump != nullptr &&
             std::fwrite(logits.data() + (size_t) row * (size_t) V, sizeof(float), (size_t) V, dump) != (size_t) V) {
             std::fprintf(stderr, "cannot write the logits\n");
@@ -541,7 +826,10 @@ int plain_main(int argc, char** argv) {
     while ((int64_t) produced.size() < n_new && !at_eos(produced.back())) {
         if (spec) {
             int n_emit = 0;
-            if (!model.spec_step(stop, n_new - (int64_t) produced.size(), out.data(), n_emit, lg, err)) {
+            const size_t at = produced.size();   // the continuation's tokens after the pending one
+            const bool forced = !follow.empty() && at + (size_t) model.drafts() + 1 <= follow.size();
+            if (!model.spec_step(stop, n_new - (int64_t) produced.size(), out.data(), n_emit, lg, err,
+                                 forced ? follow.data() + at : nullptr)) {
                 std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
                 return 1;
             }

@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+// SPDX-License-Identifier: MIT
 // src/kernels/cpu/tq_states.hpp - the 32 trellis states of one TQ2_T / TQK6 / TQK7 block in plain C++ (all three
 // kernels: scalar code beat byte-shuffle versions on AVX2 and AVX-512).  Internal to src/kernels/cpu/tq_*.cpp.
 //

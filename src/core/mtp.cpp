@@ -18,6 +18,7 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/core/runtime.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/native_router.hpp"
@@ -158,6 +159,12 @@ const uint16_t* MtpDrafter::bf16(const char* name) const {
     for (const auto& t : tensors_) if (t.name == name && t.kind == "bf16") return (const uint16_t*) (dense_ + t.off);
     return nullptr;
 }
+int MtpDrafter::q8_type(const char* name) const {
+    for (const auto& t : tensors_)
+        if (t.name == name && t.kind == "q8_0") return t.q8_rows ? (int) strata::kernels::kNativeQ8Rows : GGML_Q8_0;
+    return GGML_Q8_0;
+}
+
 const void* MtpDrafter::q8(const char* name) const {
     for (const auto& t : tensors_) if (t.name == name && t.kind == "q8_0") return dense_ + t.off;
     return nullptr;
@@ -211,6 +218,31 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         }
         strata::gpu::copy(dense_, blob.data(), blob.size());
         vram_ += blob.size();
+        // The projections native_mmvq reads go into kNativeQ8Rows' layout (each row's values, then its scales: every
+        // load 32-bit aligned), as the main layers' Q8_0 matrices do at load: the Q8_0 blocks' 2-byte alignment read
+        // 2560 x 10240 at 176 us a call against 34 in the rows layout (B70, 2026-10-24).  The same values reach the
+        // same dot in the same order, so the drafts are the same.  The prompt path's MTP pass reads four of them too,
+        // with the type tensor_q8_type gives (its dequantization knows the layout).  The shared expert's matrices
+        // too: its kernel reads them through native_mmvq.
+        {
+            static const char* const rows_names[] = {"fc_embedding.weight", "fc_hidden.weight", "self_attn.k_proj.weight",
+                                                     "self_attn.v_proj.weight", "self_attn.q_proj.weight",
+                                                     "self_attn.o_proj.weight", "mlp.shared_expert.gate_proj.weight",
+                                                     "mlp.shared_expert.up_proj.weight",
+                                                     "mlp.shared_expert.down_proj.weight"};
+            void* const cs0 = &Runtime::get().compute();
+            for (Tensor& t : tensors_) {
+                if (t.kind != "q8_0" || t.cols > INT_MAX || t.rows > INT_MAX ||
+                    !strata::kernels::native_q8_0_rows_ok((int) t.cols))
+                    continue;
+                bool wanted = false;
+                for (const char* n : rows_names) wanted = wanted || t.name == n;
+                if (!wanted) continue;
+                strata::kernels::native_q8_0_to_rows(dense_ + t.off, (int) t.cols, (int) t.rows, cs0);
+                t.q8_rows = true;
+            }
+            Runtime::get().finish(Runtime::get().compute());
+        }
     }
     // ---- the 512 routed experts, one blob each
     if (shared == nullptr) {
@@ -619,7 +651,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         }
         native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, cs);
         native_quantize_q8_1(en_, xq_, (int) N, T, cs);
-        native_mmvq(GGML_Q8_0, q8("fc_embedding.weight"), xq_, e2_, (int) N, (int) N, T, cs);
+        native_mmvq(q8_type("fc_embedding.weight"), q8("fc_embedding.weight"), xq_, e2_, (int) N, (int) N, T, cs);
         if (hnorm_stream_)   // --mtp-hnorm stream: one RMS per stream, each scaled by its slice of the weight
             native_qsa_rms_norm_grouped(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) N, (int) HC, (int) (T * HC), EPS, cs);
         else
@@ -627,7 +659,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         for (int c0 = 0; c0 < T * HC; c0 += 8) {
             const int nc = (int) std::min<int64_t>(8, T * HC - c0);
             native_quantize_q8_1(hn_ + (size_t) c0 * N, xq_, (int) N, nc, cs);
-            native_mmvq(GGML_Q8_0, q8("fc_hidden.weight"), xq_, h2_ + (size_t) c0 * N, (int) N, (int) N, nc, cs);
+            native_mmvq(q8_type("fc_hidden.weight"), q8("fc_hidden.weight"), xq_, h2_ + (size_t) c0 * N, (int) N, (int) N, nc, cs);
         }
         add_streams_broadcast(h2_, e2_, R_, N, (int) HC, T, cs);
         // ---- the attention hyper-connection
@@ -646,8 +678,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         }
         // ---- attention: K/V into the layer's own cache, then (full) dense attention over every cell
         native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
-        native_mmvq(GGML_Q8_0, q8("self_attn.k_proj.weight"), xq_, kcur_, (int) N, (int) (NKV * HD), T, cs);
-        native_mmvq(GGML_Q8_0, q8("self_attn.v_proj.weight"), xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
+        native_mmvq(q8_type("self_attn.k_proj.weight"), q8("self_attn.k_proj.weight"), xq_, kcur_, (int) N, (int) (NKV * HD), T, cs);
+        native_mmvq(q8_type("self_attn.v_proj.weight"), q8("self_attn.v_proj.weight"), xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
         // the T tokens' K norm, rotation and K/V append each run once over all T rows (the rope keeps each token's
         // positions); STRATA_NO_BATCH_KV_STEP=1 appends per token
         static const bool no_batch_kv = [] {
@@ -683,7 +715,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         }
       }
         if (!full) return true;
-        native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
+        native_mmvq(q8_type("self_attn.q_proj.weight"), q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
         if (fused_nr) {   // every token's q at once, read out of its q|gate rows (row-independent)
             native_qsa_rms_norm_rope(qfull_, (int) (2 * HD), f32("self_attn.q_norm.weight"), qcur_, (int) (T * NH), (int) HD,
                                      (int) s.n_rot, EPS, rope_scaling(), pos, cs);
@@ -705,7 +737,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         for (int t = 0; t < T; ++t)
             native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD, (int) NH, (int) HD, cs);
         native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), T, cs);
-        native_mmvq(GGML_Q8_0, q8("self_attn.o_proj.weight"), xq_, bo_, (int) (NH * HD), (int) N, T, cs);
+        native_mmvq(q8_type("self_attn.o_proj.weight"), q8("self_attn.o_proj.weight"), xq_, bo_, (int) (NH * HD), (int) N, T, cs);
         // ---- the MLP hyper-connection (the attention write folded in)
         {
             FusedGrArgs fa[kFusedGrMaxT];
@@ -735,9 +767,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         }
         strata::gpu::Stream sh_cs = branch ? side_ : cs;
         NativeSharedWeights nsw;
-        nsw.gate_type = GGML_Q8_0; nsw.gate_data = q8("mlp.shared_expert.gate_proj.weight");
-        nsw.up_type = GGML_Q8_0; nsw.up_data = q8("mlp.shared_expert.up_proj.weight");
-        nsw.down_type = GGML_Q8_0; nsw.down_data = q8("mlp.shared_expert.down_proj.weight");
+        nsw.gate_type = q8_type("mlp.shared_expert.gate_proj.weight"); nsw.gate_data = q8("mlp.shared_expert.gate_proj.weight");
+        nsw.up_type = q8_type("mlp.shared_expert.up_proj.weight"); nsw.up_data = q8("mlp.shared_expert.up_proj.weight");
+        nsw.down_type = q8_type("mlp.shared_expert.down_proj.weight"); nsw.down_data = q8("mlp.shared_expert.down_proj.weight");
         nsw.q8_1 = xq_;
         const SForm none{};
         for (int t = 0; t < T; ++t) {
@@ -1079,7 +1111,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
 }
 
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
-                       float* probs, float min_p, int* n_drafts) {
+                       float* probs, const More& more, int* n_drafts) {
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
@@ -1152,11 +1184,12 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (!wait_step(0)) return false;
     drafts[0] = ((volatile int32_t*) h_out_)[0];
     if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(0); }
-    float pj = ((volatile float*) h_prob_)[0];
-    if (probs) probs[0] = pj;
+    float pl[strata::kernels::kVerifyMaxT];   // the drafts' probabilities for `more`, where the caller keeps none
+    float* pr = probs != nullptr ? probs : pl;
+    pr[0] = ((volatile float*) h_prob_)[0];
     int n = 1;
-    // the chain continues while the last draft is likely enough to be verified
-    for (int j = 1; j < max_steps && pj >= min_p; ++j) {
+    // the chain continues while the window's rule wants another draft after the ones made
+    for (int j = 1; j < max_steps && (!more || more(j, pr)); ++j) {
         if (!strata::gpu::graph_launch(cp ? step_exec_c_[j] : step_exec_[j], cs_)) {
             err = std::string("mtp draft step: ") + strata::gpu::last_error();
             return false;
@@ -1166,8 +1199,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (!wait_step(j)) return false;
         drafts[j] = ((volatile int32_t*) h_out_)[j];
         if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(j); }
-        pj = ((volatile float*) h_prob_)[j];
-        if (probs) probs[j] = pj;
+        pr[j] = ((volatile float*) h_prob_)[j];
         ++n;
     }
     prefetch_ple(drafts[n - 1]);
@@ -1300,7 +1332,7 @@ int MtpDrafter::chain_poll(std::string& err) {
 }
 
 bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
-                             float* probs, float min_p, int* n_drafts) {
+                             float* probs, const More& more, int* n_drafts) {
     const OnDevice on_device(device_);
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
@@ -1310,7 +1342,7 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
             return false;
         }
     std::vector<int32_t> toks((size_t) T, token);
-    return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts);
+    return draft(T, toks.data(), cell, 0, drafts, err, probs, more, n_drafts);
 }
 
 }  // namespace strata::core

@@ -24,10 +24,10 @@ struct alignas(64) NativeAct {
     uint8_t bytes[kNativeActBytes];
 };
 /// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292; llm-jp-4.1's 960
-/// as Q8_0: 30 x 34, as BF16 1920).
-inline constexpr size_t kNativeHBytes = 2048;
-/// The widest expert intermediate a native layer may have (llm-jp-4.1: 960); the pool's row buffers are this wide.
-inline constexpr int64_t kNativeMaxFF = 1024;
+/// as Q8_0: 30 x 34, as BF16 1920; GLM-5.3-Flash's 2048 as Q8_0: 64 x 34, as Q8_K 8 x 292).
+inline constexpr size_t kNativeHBytes = 4096;
+/// The widest expert intermediate a native layer may have (GLM-5.3-Flash: 2048); the pool's row buffers are this wide.
+inline constexpr int64_t kNativeMaxFF = 2048;
 
 /// One layer's native expert geometry.
 struct NativeFmt {
@@ -42,6 +42,11 @@ struct NativeFmt {
     size_t up_off = 0, down_off = 0;    ///< inside the blob
     size_t bytes = 0;                   ///< the whole blob
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, or the ActQ; n_ff of d_act)
+    /// NVFP4 (ggml type 40) only: the blob ends with {s_gate, s_up, s_down, 0} at this offset, the per-expert
+    /// weight_scale_2 the block format has no room for (tools/iq_pack.py). 0 = no tail. Each scale goes on its own
+    /// projection's FP32 output: gate * s_gate, up * s_up, down * s_down. Do not fold s_down into up: the hidden
+    /// drops to ~1e-5 and its q8 block scale becomes an FP16 subnormal (expert error 2-12% instead of 1.1%).
+    size_t tail_off = 0;
     /// prism.hadamard (hadamard.hpp): the experts of this layer are stored in a rotated basis, and
     /// native_quant_act / native_quant_h apply y = H_block (signs * x) before quantizing.  had_block 0 = none.
     int had_block = 0;
@@ -67,9 +72,9 @@ bool native_row_to_float(int type, const void* src, float* dst, int64_t n);
 /// Bytes of one row of `n` values of ggml type `type` (0 when `n` is not whole blocks).
 size_t native_row_bytes(int type, int64_t n);
 
-/// x (n_embd floats) -> the gate/up activation the layer's rows read (act_bytes): a Q2_0 layer's is Strata's ActQ,
-/// any other layer's its vec_dot_type.  Every caller gets the right one from here, so none chooses by type.  `dst` is
-/// a NativeAct's bytes, or kNativeActBytes as aligned.  Rotated first when the layer is Hadamard-folded.
+/// x (n_embd floats) -> the gate/up activation the layer's rows read (act_bytes), rotated first when the layer is
+/// Hadamard-folded: a Q2_0 layer's is Strata's ActQ, any other layer's its vec_dot_type.  Every caller gets the right one from here, so none chooses by type.  `dst` is
+/// a NativeAct's bytes, or kNativeActBytes as aligned.
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
 /// h (n_ff floats) -> the down activation (h_bytes), rotated first when the layer is Hadamard-folded.
 void native_quant_h(const NativeFmt& f, const float* h, void* dst);

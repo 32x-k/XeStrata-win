@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // tools/vision/gguf_meta.h - open a model GGUF for its vocabulary only, whatever its weight tensors are.
 //
 // The picture reader needs the text model for one thing: its tokenizer (and the header values that go with it).  llama.cpp's
@@ -19,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -66,10 +68,10 @@ inline bool dropped_key(const std::string& k) {
 // Copy the key/value header of `src` into `dst` as a GGUF with no tensors.  False (and `err`) when the header holds
 // something this reader does not handle.
 inline bool copy_meta(const std::string& src, const std::string& dst, std::string& err) {
+    const std::unique_ptr<FILE, int (*)(FILE*)> file(std::fopen(src.c_str(), "rb"), &std::fclose);
+    if (!file) { err = "cannot open " + src; return false; }
     Reader r;
-    r.f = std::fopen(src.c_str(), "rb");
-    if (!r.f) { err = "cannot open " + src; return false; }
-    struct Closer { FILE* f; ~Closer() { if (f) std::fclose(f); } } closer{r.f};
+    r.f = file.get();
     char magic[4];
     uint32_t version = 0;
     uint64_t n_tensors = 0, n_kv = 0;

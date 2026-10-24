@@ -63,13 +63,19 @@ struct Pending {
     uint64_t tag;
 };
 
-/// The number of issuing threads: STRATA_IO_THREADS, else 4 (Windows: overlapped submits) / 16 (Linux: each
-/// thread does one blocking pread, so the thread count is the queue depth).
+/// The number of issuing threads: STRATA_IO_THREADS, else 4 (Windows: overlapped submits) / on Linux four a
+/// hardware thread, 16 to 64 (each thread does one blocking pread, so the thread count is the queue depth, and a
+/// read costs the kernel ~12 us of CPU: the n-gram table's rows of a 32K prompt, 241K page reads on a 990 Pro and an
+/// i7-14700, 16 threads 1.18 s, 32 0.71 s, 64 0.49 s, 64 with twice the slots the same; a drive that cannot serve
+/// the depth queues the reads and the threads wait).
 int io_threads(int dflt) {
     const char* v = std::getenv("STRATA_IO_THREADS");
     const int n = v ? std::atoi(v) : dflt;
     return std::clamp(n, 1, 64);
 }
+#if !defined(_WIN32)
+int io_threads_linux() { return io_threads(std::clamp(4 * (int) std::thread::hardware_concurrency(), 16, 64)); }
+#endif
 }  // namespace
 
 #if defined(_WIN32)
@@ -367,7 +373,7 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     struct stat st;
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
-    const int n = io_threads(16);
+    const int n = io_threads_linux();
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { strata::aux_cpus::pin_current_thread(); impl_->worker(); });
     return true;
 }

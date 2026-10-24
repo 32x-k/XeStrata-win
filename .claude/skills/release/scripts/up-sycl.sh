@@ -33,13 +33,13 @@ for a in "$@"; do
   case $a in /*) d=$(dirname "$a"); [ -d "$d" ] && case $d in "$UP_TREE"*|"$DATA"*|"${IDS:-/nonexistent}"*) ;; *) mounts+=(-v "$d:$d") ;; esac ;; esac
 done
 # The container ends with this script however it ends: a run stopped with SIGKILL (a bench stopping a slow upstream,
-# a server ending its engine) took only the docker client, and the engine ran on in its container at 100% of a core
+# a server ending its engine) took only the container's client, and the engine ran on in its container at 100% of a core
 # with the card's memory held (2026-10-12, two hours).  A watcher with its own stdin and stdout (the caller reads this
 # script's output to its end) kills the container by name once this script's process is gone.
 name="up-sycl-$$-$RANDOM"
 me=$$
-(while kill -0 "$me" 2>/dev/null; do sleep 2; done; docker kill "$name" >/dev/null 2>&1) </dev/null >/dev/null 2>&1 &
-docker run --rm -i --name "$name" -u "$(id -u):$(id -g)" --device /dev/dri \
-  --group-add "$(getent group render | cut -d: -f3)" --ulimit memlock=-1 \
+(while kill -0 "$me" 2>/dev/null; do sleep 2; done; podman kill "$name" >/dev/null 2>&1) </dev/null >/dev/null 2>&1 &
+# rootless Podman: this user inside as outside (keep-id), with its groups (render, for the card)
+podman run --rm -i --name "$name" --userns=keep-id --group-add keep-groups --device /dev/dri --ulimit memlock=-1 \
   -e ONEAPI_DEVICE_SELECTOR="$selector" "${envs[@]}" "${mounts[@]}" strata-sycl-dev \
   "exec $UP_TREE/build-sycl-aot/strata $(printf '%q ' "$@")"

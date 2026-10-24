@@ -16,8 +16,8 @@
 # on the GPU driver's vulkan-1.dll.
 cmake_minimum_required(VERSION 3.21)
 project(strata_vision C CXX)
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT WIN32)
-  message(FATAL_ERROR "Strata vision supports Linux and Windows only")
+if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
+  message(FATAL_ERROR "Strata vision supports Linux and Windows")
 endif()
 
 set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/main/llama.cpp" CACHE PATH "llama.cpp checkout")
@@ -53,6 +53,14 @@ add_executable(strata-vision strata_vision.cpp)
 target_link_libraries(strata-vision PRIVATE mtmd llama)
 target_compile_features(strata-vision PRIVATE cxx_std_17)
 set_target_properties(strata-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+if(WIN32)
+  # #24: the Windows package's CPU reader, cross-built as the engine is (cmake/toolchain-windows-msvc.cmake): the C
+  # runtime's deprecation of getenv and fopen off, and the UTF-8 manifest the engine takes (upstream #3202)
+  target_compile_definitions(strata-vision PRIVATE _CRT_SECURE_NO_WARNINGS)
+  target_link_options(strata-vision PRIVATE
+                      "LINKER:/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/strata-utf8.manifest")
+endif()
+
 if(WIN32 AND STRATA_VISION_VULKAN)
   # --gpu-pci on a driver without VK_EXT_pci_bus_info: the card by its adapter LUID (D3DKMT in gdi32, and Vulkan's
   # deviceLUID), see vk_index_by_pci in strata_vision.cpp

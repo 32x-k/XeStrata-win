@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Tests for tools/mtp_fetch.py (#327): a range read needs a 206 with the asked Content-Range, the pinned revision's
 tensors are checked against their sha256 (a wrong one is fetched again; a corrupt install is found by `verify` and
 setup fetches it again), and an inventory from another revision is read again.  A fake checkpoint behind a mocked
@@ -169,7 +170,8 @@ class Ranges(FetchCase):
         self.assertEqual(sorted(stamps), ["mtp.a", "mtp.b"])
         with mock.patch.object(M, "sha256_of", side_effect=AssertionError("hashed an unchanged file")):
             self.assertEqual(M.verify(str(self.out)), [])
-        with mock.patch.object(M, "REPO", "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/"):
+        with mock.patch.object(M, "REPO", "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/"), \
+                mock.patch.object(M, "REVISION", "main"):
             (self.out / "tensors" / "mtp.a.bin").write_bytes(b"x")
             self.assertEqual(M.verify(str(self.out)), [])          # STRATA_MTP_REVISION: other hashes
         self.assertEqual(M.verify(str(self.out)), ["mtp.a"])

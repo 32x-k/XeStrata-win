@@ -50,7 +50,7 @@ set(_pkg_engine ${CMAKE_INSTALL_LIBDIR}/xestrata/engine)
 set(_pkg_engine_abs ${CMAKE_INSTALL_FULL_LIBDIR}/xestrata/engine)
 
 # ---- the engine
-set_target_properties(strata PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
+set_target_properties(strata strata-image PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
 install(TARGETS strata strata-image RUNTIME DESTINATION ${_pkg_engine})
 install(PROGRAMS ${STRATA_PACKAGE_VISION_DIR}/strata-vision-cpu ${STRATA_PACKAGE_VISION_DIR}/strata-vision-vulkan
         DESTINATION ${_pkg_engine})
@@ -58,7 +58,7 @@ install(PROGRAMS ${STRATA_PACKAGE_VISION_DIR}/strata-vision-cpu ${STRATA_PACKAGE
 # (tools/intel_llvm_build.py builds no libsycl-jit: libsycl opens it only to compile kernels from source.)
 get_filename_component(_pkg_sycl_lib "${CMAKE_CXX_COMPILER}" DIRECTORY)
 get_filename_component(_pkg_sycl_lib "${_pkg_sycl_lib}/../lib" ABSOLUTE)
-set(_pkg_runtime libsycl.so.9 libur_loader.so.0 libur_adapter_level_zero.so.0 libur_adapter_level_zero_v2.so.0
+set(_pkg_runtime libsycl.so.9 libur_adapter_level_zero.so.0 libur_adapter_level_zero_v2.so.0
                  libumf.so.1)
 if(STRATA_LICENSE STREQUAL "contrib")
   list(APPEND _pkg_runtime libur_adapter_cuda.so.0)
@@ -80,6 +80,17 @@ if(TARGET onemath)
   # oneMath and its backends; libonemath opens a backend by its unversioned name (libonemath_blas_cublas.so)
   install(DIRECTORY ${CMAKE_BINARY_DIR}/lib/ DESTINATION ${_pkg_engine}/lib
           FILES_MATCHING PATTERN "libonemath*.so*")
+endif()
+if(TARGET strata_dnnl)
+  # oneDNN, the image engine's attention on Intel GPUs (built beside the engine for its SYCL runtime)
+  install(DIRECTORY ${_strata_onednn_dir}/lib/ DESTINATION ${_pkg_engine}/lib FILES_MATCHING PATTERN "libdnnl.so*")
+endif()
+if(_strata_aotriton_lib)
+  # aotriton, the image engine's attention on AMD GPUs: the engine's module that opens it (on an AMD GPU only), its
+  # library and its kernels' images, which it finds beside it
+  install(TARGETS strata_sdpa_aotriton LIBRARY DESTINATION ${_pkg_engine}/lib)
+  install(DIRECTORY ${_strata_aotriton_lib}/ DESTINATION ${_pkg_engine}/lib FILES_MATCHING PATTERN "libaotriton*.so*")
+  install(DIRECTORY ${_strata_aotriton_lib}/aotriton.images DESTINATION ${_pkg_engine}/lib)
 endif()
 # Each library finds the others in its own folder; a backend's RUNPATH into the build machine's CUDA or oneMKL is
 # replaced: the distribution's linker paths find cuBLAS (ld.so.conf.d), and setup puts oneMKL's folder on the engine's
@@ -132,10 +143,29 @@ if(TARGET onemath)
   install(FILES third_party/main/oneMath/LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}
           RENAME LICENSE.oneMath)
 endif()
+if(TARGET strata_dnnl)
+  install(FILES third_party/main/oneDNN/LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}
+          RENAME LICENSE.oneDNN)
+  install(FILES third_party/main/oneDNN/THIRD-PARTY-PROGRAMS
+          DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME THIRD-PARTY-PROGRAMS.oneDNN)
+endif()
+if(_strata_aotriton_lib)
+  install(FILES third_party/main/aotriton/LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}
+          RENAME LICENSE.aotriton)
+  foreach(part aiter FlyDSL triton)   # what its kernels' images can carry parts of
+    install(FILES third_party/main/aotriton/LICENSE.${part}
+            DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.aotriton-${part})
+  endforeach()
+endif()
+if(_strata_cudnn_frontend)   # compiled into the image engine
+  install(FILES third_party/main/cudnn-frontend/LICENSE.txt
+          DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.cudnn-frontend)
+endif()
 install(FILES NOTICE COPYING COPYING.LESSER DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME})
 
 # ---- the program
 install(FILES setup.py chat.py DESTINATION ${_pkg_share})
+# ref/: load.py, which tools/canonical_xcheck.py (strata_pack.py, the Q2_0 conversion for AVX-512) imports (#22)
 install(DIRECTORY serve tools ref DESTINATION ${_pkg_share}
         FILES_MATCHING PATTERN "*.py" PATTERN "test_*" EXCLUDE PATTERN "mcp_fake_server.py" EXCLUDE
         PATTERN "__pycache__" EXCLUDE PATTERN "lint" EXCLUDE PATTERN "vision" EXCLUDE PATTERN "package" EXCLUDE)
@@ -167,7 +197,7 @@ install(CODE "
 
 # ---- CPack
 set(CPACK_PACKAGE_NAME xestrata)
-set(CPACK_PACKAGE_VERSION ${STRATA_UPSTREAM_VERSION})
+set(CPACK_PACKAGE_VERSION ${XESTRATA_PACKAGE_UPSTREAM})
 set(CPACK_PACKAGE_VENDOR "MistVVK and the XeStrata contributors")
 set(CPACK_PACKAGE_CONTACT "MistVVK <jffyc82pzv@privaterelay.appleid.com>")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Qwen3.8-Flash-Next on a PC: a GPU, system RAM and the CPU")
@@ -202,7 +232,8 @@ set(CPACK_RPM_PACKAGE_AUTOREQPROV ON)
 # The bundled libraries are found through the engine's own RUNPATH: they neither need nor give the system anything,
 # and the GPU makers' libraries they open are suggested, not required.  No /usr/lib/.build-id links, which every
 # package would own.
-set(_pkg_not_required libsycl libur_ libumf libonemath                      # bundled
+set(_pkg_not_required libsycl libur_ libumf libonemath libdnnl libaotriton  # bundled
+                      libcudnn                                              # NVIDIA's, the user's
                       libcuda libnvidia-ml libcublas                        # NVIDIA's
                       libmkl_                                               # Intel's oneMKL
                       libamdhip64 libhsa-runtime64 libamd_comgr             # AMD's ROCm

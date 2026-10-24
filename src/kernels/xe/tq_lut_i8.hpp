@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2023-2026 The ggml authors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-// src/kernels/xe/tq_lut_i8.hpp - upstream Strata's src/kernels/cuda/tq_lut_i8.cuh for the SYCL kernels
-// (iq_kernels.cpp): the table as ordinary constant data, which device code reads where it is.
+// src/kernels/xe/tq_lut_i8.hpp - upstream's src/kernels/cuda/tq_lut_i8.cuh for the SYCL kernels (the table without
+// CUDA's __device__: a constant global the device code reads, as ggml-common.h's grids).
 #pragma once
 // int8 copy of the TQ codebook tq2t_lut_f16 (2048 2-D points): point i = (lo byte, hi byte) as int8,
 // value ~= TQ_LUT_I8_SCALE * int8. One global scale (max |point| = 3.984375 -> 127); relative RMS error

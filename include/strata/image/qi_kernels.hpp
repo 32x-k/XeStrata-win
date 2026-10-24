@@ -15,15 +15,21 @@ namespace strata::image {
 /// y16[t] = LayerNorm(x[t]) * (1 + mod[t < n_text][...]) (no affine, eps 1e-6), FP16.
 void qi_ln_mod16(const float* x, const float* mod, int64_t n_text, int64_t T, int64_t C, uint16_t* y16, void* stream);
 
-/// x[t] += h[t] * tanh(mod[t < n_text][...]).
-void qi_gate_add(float* x, const float* h, const float* mod, int64_t n_text, int64_t T, int64_t C, void* stream);
+/// A W8A8 product's output left as its int32 sums (their bits in the FP32 array): value [t][n] = sum * sx[t] * sw[n].
+struct QiI8 {
+    const float *sx = nullptr, *sw = nullptr;
+};
+
+/// x[t] += h[t] * tanh(mod[t < n_text][...]); with i8, h holds a W8A8 product's sums.
+void qi_gate_add(float* x, const float* h, const float* mod, int64_t n_text, int64_t T, int64_t C, void* stream,
+                 const QiI8* i8 = nullptr);
 
 /// For each token and head: q and k RMS-normed over the head (weights wq, wk; eps 1e-6), then rotated pairwise
 /// (2j, 2j + 1) by cos[t][j], sin[t][j] (rope tables [T][head_dim / 2]); written as FP16 q16, k16, and v as v16, all
-/// [T][heads * head_dim].
+/// [T][heads * head_dim].  With i8 (three: q's, k's and v's), q, k and v hold W8A8 products' sums.
 void qi_qk_norm_rope16(const float* q, const float* k, const float* v, const float* wq, const float* wk,
                        const float* cos, const float* sin, int64_t T, int64_t heads, int64_t head_dim,
-                       uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream);
+                       uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream, const QiI8* i8 = nullptr);
 
 /// out[t, h, :] = softmax(q . k^T / sqrt(head_dim)) . v over the rows token t sees: a prefix token (t < n_text) the
 /// tokens up to itself, or with key_lim the first key_lim[t] (never falling from row to row: an edit's reference
@@ -35,13 +41,20 @@ void qi_attention_plain(const uint16_t* q16, const uint16_t* k16, const uint16_t
 constexpr int64_t qi_attn_rows(int64_t T) { return (T + 127) / 128 * 128; }
 
 /// The same attention on the GPU's matrix engines where it has them (src/image/qi_attn.cpp), FP16 out16
-/// [T][heads * head_dim]; else qi_attention_plain through `scratch` (FP32 [T][heads * head_dim]).
+/// [T - first][heads * head_dim]: the query rows from `first` on (the rows before it, a cached prefix's, are not
+/// asked); else qi_attention_plain through `scratch` (FP32 [T][heads * head_dim]).
 void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
                   int64_t head_dim, int64_t n_text, uint16_t* out16, float* scratch, void* stream,
-                  const int32_t* key_lim = nullptr);
+                  const int32_t* key_lim = nullptr, int64_t first = 0);
 
 /// The path qi_attention takes on the current GPU, for the report.
 const char* qi_attention_path();
+
+/// The attention of query rows q0 .. q1 - 1 over all T keys (no mask), FP16 out16 [q1 - q0][heads * head_dim] (the
+/// layout of qi_attention's), through a GPU maker's kernel where the build has one for the GPU (src/image/qi_sdpa.cpp:
+/// oneDNN's SDPA on Intel GPUs); false where none takes it.
+bool qi_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t q0, int64_t q1, int64_t T,
+             int64_t heads, int64_t head_dim, uint16_t* out16, void* stream);
 
 /// The text encoder's q and k ([T][q_heads * head_dim], [T][kv_heads * head_dim]): each head RMS-normed (wq, wk; eps
 /// 1e-6), then rotated as NEOX does (pair (j, j + head_dim / 2) by a position times theta^(-2j / head_dim)); FP16 out,
@@ -58,6 +71,30 @@ void qi_attention_causal(const uint16_t* q16, const uint16_t* k16, const uint16_
 
 /// h16[t, i] = gu[t, inter + i] * silu(gu[t, i]) (the fused gate_up product: gate first, then up).
 void qi_swiglu16(const float* gu, int64_t T, int64_t inter, uint16_t* h16, void* stream);
+
+/// The activations of an int8 product (kernels::iq_mmq_quantize's layout, without the sums): rows x cols (a multiple of
+/// 32) of x16 as int8 with a scale for each 32.
+void qi_quantize_q8(const uint16_t* x16, int64_t rows, int64_t cols, void* xq, void* stream);
+
+/// The group a W8A8 product's operands are rotated in (qi_rows_i8): K must be a multiple of it.
+constexpr int64_t kQiRotate = 256;
+
+/// The operands of a W8A8 product (prefill::Gemm::i8): rows of K FP16 (or with bf16 BF16) values (K up to 32768 on a
+/// GPU of 1024-item work-groups), each group of kQiRotate times the normalized Hadamard matrix (orthogonal, so the
+/// product of two rotated operands is that of the originals; it spreads a channel's outliers over the group), then as
+/// int8 with a scale for the row: q [rows][K], s [rows], times rs [rows] where given (rows the caller scaled down).
+/// The weights' rows and the activations' tokens alike.
+void qi_rows_i8(const uint16_t* src, bool bf16, int64_t rows, int64_t K, int8_t* q, float* s, const float* rs,
+                void* stream);
+
+/// qi_rows_i8 of qi_swiglu16's values, from the gate_up product's int32 sums gu [T][2 inter] (scaled by g): the down
+/// product's int8 input in one pass.
+void qi_swiglu_i8(const int32_t* gu, const QiI8& g, int64_t T, int64_t inter, int8_t* q, float* s, void* stream);
+
+/// y [T][N] (row stride ldy) holds a W8A8 product's int32 sums (their bits): y = sum * sx[t] * sw[n] + bias[n], in
+/// place (bias null: none).
+void qi_i8_scale(float* y, int64_t T, int64_t N, int64_t ldy, const float* sx, const float* sw, const float* bias,
+                 void* stream);
 
 /// y16 = FP16(x), n elements.
 void qi_to_f16(const float* x, int64_t n, uint16_t* y16, void* stream);
@@ -79,6 +116,12 @@ void qi_tokens_latent(const float* tokens, int64_t C, int64_t HW, float* latent,
 
 /// x += a * v, n elements.
 void qi_axpy(float* x, const float* v, float a, int64_t n, void* stream);
+
+/// An edit with a mask, after a sampler's step to time s: x [C][HW] where m [HW] is 0 (the part kept) becomes the
+/// base image's latent z0 at that time, (1 - s) z0 + s noise (the flow's path from the same noise); where m is 1 it
+/// stays the DiT's.
+void qi_inpaint_blend(float* x, const float* z0, const float* noise, const float* m, float s, int64_t C, int64_t HW,
+                      void* stream);
 
 // --- the vision encoder (Qwen3-VL's ViT, src/image/qi_vision.cpp)
 

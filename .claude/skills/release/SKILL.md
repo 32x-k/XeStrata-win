@@ -29,13 +29,13 @@ Rules for the whole run:
 ```sh
 git status --short --untracked-files=no   # must be empty, on dev
 gh auth status 2>&1 | grep -v -i token    # logged in to github.com as MistVVK
-docker info --format '{{.ServerVersion}}' # the package builds run in Docker
+podman info --format '{{.Version.Version}}' # the package builds run in rootless Podman
 git fetch origin main --tags
 git merge-base --is-ancestor main dev     # main must fast-forward to dev
 git tag -l 'xe*' --sort=-v:refname | head -n 1; git ls-remote --tags origin 'xe*'
 ```
 
-Stop and report if a tracked file has changes, gh is not logged in, Docker does not answer, or `main` has commits `dev` lacks.
+Stop and report if a tracked file has changes, gh is not logged in, Podman does not answer, or `main` has commits `dev` lacks.
 Untracked files (a record not yet committed, for example) may stay: the packages are built from the tag, and the push takes only commits.
 The newest `xe*` tag is the previous release (none before the first one).
 
@@ -76,7 +76,7 @@ Steps 5 and 6 are done while it builds.
 Write `build/release/xe<VERSION>/NOTES.md`: the English section first, then the same content in Japanese (the user's decision, 2026-10-12), under a first line linking the two: `[English](#english) | [日本語](#日本語)`.
 
 - What changed for users since the previous release tag (`git log --no-merges <previous>..xe<VERSION>`; for the first release, since `origin/main`), grouped by what a user notices, not a list of commits.
-- How to install: README's install section, as it is there (the user's decision, 2026-10-11): the four numbered steps (download from the table with `SHA256SUMS`, `sha256sum -c SHA256SUMS --ignore-missing`, `sudo apt install ./…deb` or `sudo dnf install ./…rpm` with the release's file names, `xestrata --setup`, which shows the GPU makers' packages that are missing and the command that installs them: AGENTS.md, "Packages", the notes do not list them), then the `> [!NOTE]` that without an NVIDIA GPU either CUDA version works the same, then the package table (Intel, AMD (RDNA2 or later), NVIDIA (Turing or later): `xestrata-contrib-cuda13.1`, `cuda13.4` on Fedora; Intel, AMD (RDNA2 or later), NVIDIA Pascal and Volta: `xestrata-contrib-cuda12.4`), then its Windows part (download `XeStrata-<VERSION>-windows-x64.7z`, start `xestrata.exe`; what it needs, the GPUs, where things go). A change to one goes into the other.
+- How to install: README's install section, as it is there (the user's decision, 2026-10-11). On Linux two ways, in this order (the user's decision, 2026-10-19): `#### 1. Podman` (README's Podman part: the commands, `export PODMAN_COMPOSE_PROVIDER=podman-compose` among them, then its podman-compose, GPU and host lines), then `#### 2. apt / dnf`: the four numbered steps (download from the table with `SHA256SUMS`, `sha256sum -c SHA256SUMS --ignore-missing`, `sudo apt install ./…deb` or `sudo dnf install ./…rpm` with the release's file names, `xestrata --setup`, which shows the GPU makers' packages that are missing and the command that installs them: AGENTS.md, "Packages", the notes do not list them), then the `> [!NOTE]` that without an NVIDIA GPU either CUDA version works the same, then the package table (Intel, AMD (RDNA2 or later), NVIDIA (Turing or later): `xestrata-contrib-cuda13.1`, `cuda13.4` on Fedora; Intel, AMD (RDNA2 or later), NVIDIA Pascal and Volta: `xestrata-contrib-cuda12.4`), then its Windows part (download `XeStrata-<VERSION>-windows-x64.7z`, start `xestrata.exe`; what it needs, the GPUs, where things go). A change to one goes into the other.
 - When the version changed: saved conversations from another version are not read.
 - That the release has no free packages: a free build is made from the source (docs/BUILD.md).
 
@@ -87,7 +87,24 @@ In short, for when it is not there:
 - What changed, as what now works or is faster, in concrete terms (numbers where measured), ranked, at most five items a group.
 - No preamble, recap or closing, no tangents; facts only, no plans or alternatives (the stage line excepted).
 
-Each section starts with a line of the stage: 先行報: upstream との速さの比較は後で足す / Preliminary: the speed comparison with upstream follows.
+Each section starts with the warnings below (the user's decision, 2026-10-21; AGENTS.md, "Intel Graphics Compiler"), then a line of the stage: 先行報: upstream との速さの比較は後で足す / Preliminary: the speed comparison with upstream follows.
+The first paragraph is the IGC bug, the second the Level Zero driver's: they stay while Ubuntu 26.04 or Debian 13 ships an IGC from 2.27 to 2.30, and while Ubuntu 26.04 ships a compute-runtime older than 26.22; the user decides when they go.
+They name Podman, Fedora 44 and - on Ubuntu 24.04/26.04 with the HWE kernel - Intel's graphics PPA (xestrata --setup prints its commands) as the way out.
+
+```markdown
+> [!WARNING]
+> **Intel Arc B-series, Lunar Lake and Panther Lake on Linux:** the Intel graphics compiler (IGC) 2.27 to 2.30, which Ubuntu 26.04 and Debian 13 ship, miscompiles some GPU code. XeStrata turns the affected optimization off by itself, at a cost of up to 10% in the decode of short prompts. For full speed, install with **Podman** (below; its image brings a fixed IGC), use **Fedora 44**, or - on Ubuntu 24.04/26.04 with the HWE kernel - update the driver from Intel's graphics PPA: `xestrata --setup` prints the commands.
+>
+> **Every Intel GPU, a separate bug:** a compute-runtime older than 26.22 (Ubuntu 26.04 ships 26.05) can refuse device memory while the card's VRAM is free: the engine then fails to start, and only a reboot brings the card back. This release makes the engine retry the cache in pieces when the driver refuses the one big allocation, and start with what the card gives. The way out is the same: update the driver (26.22 or later), or use Fedora 44 / Podman. On Ubuntu 24.04/26.04 with the HWE kernel, `xestrata --setup` stops before starting and prints the PPA commands; `--old-driver` starts anyway.
+```
+
+```markdown
+> [!WARNING]
+> **Linux の Intel Arc B シリーズ・Lunar Lake・Panther Lake:** Ubuntu 26.04 と Debian 13 が入れる Intel のグラフィックスのコンパイラー（IGC）2.27〜2.30 は、GPU のコードの一部を誤ってコンパイルします。XeStrata は該当する最適化を自動で切るので動きますが、短い prompt の decode が最大 10% 遅くなります。本来の速さで使うには、**Podman** で入れる（下の手順。中の IGC は直った版です）、**Fedora 44** を使う、または Ubuntu 24.04/26.04 で HWE カーネルなら Intel の graphics PPA でドライバーを更新してください（`xestrata --setup` がコマンドを出します）。
+>
+> **すべての Intel GPU に、別の不具合:** 26.22 より古い compute-runtime（Ubuntu 26.04 は 26.05 を入れます）は、カードの VRAM に空きがあっても GPU メモリの確保を断ることがあります。エンジンは起動に失敗し、カードは再起動しないと戻りません。この版から、エンジンは一括の確保を断られたときに expert cache を小分けで取り直し、確保できた分だけで起動します。抜け道は同じで、ドライバーを 26.22 以降に更新するか、Fedora 44 / Podman を使ってください。Ubuntu 24.04/26.04 で HWE カーネルなら、`xestrata --setup` は起動の前に止まって PPA のコマンドを出します（`--old-driver` でそのまま起動できます）。
+```
+
 Show the notes to the user.
 
 ## 6. The AMD engines
@@ -152,7 +169,7 @@ The table's method stays fixed from release to release so the releases compare: 
 The engines, built from the tags (no package installed), each in a worktree of its own under `.claude/worktrees/`:
 
 - XeStrata: the contrib-llvm build of `xe<VERSION>` (docs/BUILD.md, with `LD_LIBRARY_PATH` to intel/llvm's `lib`); one GPU at a time with `ONEAPI_DEVICE_SELECTOR` (`level_zero:*` for the B70, `cuda:*` for the RTX 4070).
-- upstream on the B70: its `sycl/` port, built in its Docker image as its docs/INTEL.md says (`docker build -t strata-sycl-dev sycl/tools`, then its `build.sh` with `AOT=bmg-g31`), and run through `scripts/up-sycl.sh` (`UP=".claude/skills/release/scripts/up-sycl.sh"` with `UP_TREE`, `DATA` and `IDS` exported), which runs it as its setup configures an Intel card: the arguments get what its `sycl/setup_intel.py` writes (the xe cards' expert profile, the streamed experts, KV streaming from 64K, the VRAM reserve, the prompt chunks), and the engine the run-time switches of its `sycl/serve/strata-sycl.sh`.
+- upstream on the B70: its `sycl/` port, built in its container image as its docs/INTEL.md says, with Podman (`podman build -t strata-sycl-dev sycl/tools`, then its `build.sh` with `AOT=bmg-g31`), and run through `scripts/up-sycl.sh` (`UP=".claude/skills/release/scripts/up-sycl.sh"` with `UP_TREE`, `DATA` and `IDS` exported), which runs it as its setup configures an Intel card: the arguments get what its `sycl/setup_intel.py` writes (the xe cards' expert profile, the streamed experts, KV streaming from 64K, the VRAM reserve, the prompt chunks), and the engine the run-time switches of its `sycl/serve/strata-sycl.sh`.
 - upstream on the RTX 4070: its CUDA build, with the CMake options its own setup.py builds it with.
 
 Each engine's own shipped expert profile (`data/expert-profile.bin` of its tree; upstream's `sycl/` port takes the one its `sycl/setup_intel.py` writes in its place, `data/expert-profile-sycl.bin` from v0.1.43).
@@ -183,25 +200,47 @@ XE="..." UP="..." XE_ROOT=<xe tree> UP_ROOT=<up tree> XE_PROFILE=... UP_PROFILE=
 python $u/sync_collect.py $o/serve xe<VERSION> <upstream tag>                 # matrix-serve.json, matrix-usage.json
 ```
 
-`XE` and `UP` are as above; serve and everyday use pass stdin to them, so upstream's `sycl/` wrapper runs `docker run -i`.
+`XE` and `UP` are as above; serve and everyday use pass stdin to them, so upstream's `sycl/` wrapper runs `podman run -i`.
 `XE_ROOT` and `UP_ROOT` are the engines' worktrees (their `serve/server.py`), `PY` a Python with the server's packages (the data folder's `venv`); everyday use runs at a 262144 context with what setup writes for it.
+
+### Gyro-M
+
+And one more on the same GPUs and engines (the user's decision of 2026-10-22): agentionai's Gyro-M (the experts' trellis type TQ2_T), generate at 32K and 1K by the upstream merge's `bench_generate.py`, two rounds, the engines alternating and both following one text (`--spec-follow`, upstream's own first run); upstream reads its own pack through the merge's `up-pack.sh` (its references/measure.md, the files table).
+
+```sh
+G=<data>/models/Gyro/Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf
+XE="..." UP="$u/up-pack.sh" UP_REAL="<upstream's command, as above>" XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids-serve> \
+  PACK=<data>/packs/gyro-m UP_PACK=<upstream's Gyro-M pack> NATIVE=$G PLE=$G TIERS="32k 1k" ROUNDS=2 \
+  python $u/bench_generate.py $o/gyro-m <GPU>
+python $u/sync_collect.py $o/gyro-m xe<VERSION> <upstream tag>                 # matrix.json, the tables
+```
 
 ### image generation
 
-And one more on the same GPUs (the user's decision of 2026-10-15): each engine's image generator as its own setup sets it up on the GPU, one 1024x1024 image of 8 steps from a fixed prompt and seed, by the upstream merge's `bench_image.py` (its references/measure.md, "Image generation": XeStrata's resident engine measured warm, upstream's backend, how its `sd-cli` is built in its tree, the GPUs); two images per engine, alternating, after a warm-up each; a few minutes a GPU.
+And one more on the same GPUs (the user's decision of 2026-10-15; ComfyUI and Mage-Flow-Turbo from 2026-10-23): each engine's image generator as its own setup sets it up on the GPU, one 1024x1024 image from a fixed prompt and seed, of two models: Qwen-Image-2.1-Turbo (8 steps) and Mage-Flow-Turbo (4 steps).
+
+- XeStrata and upstream, by the upstream merge's `bench_image.py` (its references/measure.md, "Image generation": XeStrata's resident engine measured warm, upstream's backend, how its `sd-cli` is built in its tree, the GPUs); two images per engine, alternating, after a warm-up each. upstream has Qwen-Image-2.1-Turbo alone (its `tools/image/qimage.py`): Mage-Flow-Turbo is XeStrata's alone (`IMAGE_MODEL=mage-flow-turbo UP_ROOT=none`), upstream's cell written as not in upstream.
+- ComfyUI, by `bench_comfy.py` beside it, run after them: each image a server started, a warm-up image of another prompt and the measured one, as XeStrata's resident engine is measured. Its DiT as int8_convrot and, where ComfyUI has one (Mage-Flow-Turbo), as bf16, an arm each; its own text encoders (Qwen3-VL-8B int8_convrot, Qwen3-VL-4B bf16). ComfyUI's checkout and its venv for each GPU: `LOCAL.md`. It prints no VAE time.
+- About 15 minutes a GPU.
 
 ```sh
 XE_ROOT=<xe tree> UP_ROOT=<up tree> DATA=<data> QUANT=<Q8_0, Q6_K on a 12 GB card> UP_IMAGE_BACKEND=<vulkan|cuda|hip> \
   [XE_IMAGE_PCI=<PCI address> UP_IMAGE_GPU=N] PY=<python> ROUNDS=2 python $u/bench_image.py $o/image <GPU>
-python $u/sync_collect.py $o/image xe<VERSION> <upstream tag>                 # matrix-image.json
+IMAGE_MODEL=mage-flow-turbo UP_ROOT=none XE_ROOT=<xe tree> DATA=<data> QUANT=Q8_0 [XE_IMAGE_PCI=<PCI address>] PY=<python> \
+  ROUNDS=2 python $u/bench_image.py $o/image-mage <GPU>
+COMFY=<ComfyUI> VENV=<its venv for the GPU> [ONEAPI_DEVICE_SELECTOR=... | CUDA_VISIBLE_DEVICES=...] ROUNDS=2 \
+  python $u/bench_comfy.py $o/image <GPU>
+IMAGE_MODEL=mage-flow-turbo COMFY=<ComfyUI> VENV=<...> ROUNDS=2 python $u/bench_comfy.py $o/image-mage <GPU>
+python $u/sync_collect.py $o/image xe<VERSION> <upstream tag>                 # matrix-image.json, both in each
+python $u/sync_collect.py $o/image-mage xe<VERSION> <upstream tag>
 ```
 
-The record goes into `$o/`, in the data folder and never into git (XeStrata's own measurements are not shared, the user's decision of 2026-10-11): a README (the machines, the two engines' commits and builds, the method, the tables and what the numbers say), `matrix.json`, `serve/` (its `matrix-serve.json`, `matrix-usage.json` and runs), `image/` (its `matrix-image.json`, runs and images), and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>` (as the speed-matrix record does).
+The record goes into `$o/`, in the data folder and never into git (XeStrata's own measurements are not shared, the user's decision of 2026-10-11): a README (the machines, the two engines' commits and builds, the method, the tables and what the numbers say), `matrix.json`, `serve/` (its `matrix-serve.json`, `matrix-usage.json` and runs), `gyro-m/` (its `matrix.json` and runs), `image/` and `image-mage/` (their `matrix-image.json`, runs and images, ComfyUI's commit), and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>` (as the speed-matrix record does).
 It is not committed; the release notes carry the tables.
 
 ## 10. The final release (確定報)
 
-The final release is reached a GPU at a time (the user's decision, 2026-10-11): as soon as one GPU's tables are complete (its generate table, its serve and everyday table and its image table), add them to the notes (English and Japanese sections) and update the release (`gh release edit`, below), without waiting for the other GPUs.
+The final release is reached a GPU at a time (the user's decision, 2026-10-11): as soon as one GPU's tables are complete (its generate table, its serve and everyday table, its Gyro-M table and its image table), add them to the notes (English and Japanese sections) and update the release (`gh release edit`, below), without waiting for the other GPUs.
 
 - The comparison section comes after the notes' other sections: its opening lines (the engines' versions, the model, the method), then the note on temperatures and what counts as equal (below) right after them, once, then the GPUs in a fixed order, the B70, the RTX 4070, the RX 9060 XT, each as its tables are done.
 - While some are missing, one line under the done ones names them: B70・RTX 4070: 計測中（後で足す） / B70, RTX 4070: being measured (added later).
@@ -211,6 +250,7 @@ The final release is reached a GPU at a time (the user's decision, 2026-10-11): 
 The tables:
 
 The notes' table is one per GPU, from `bench-collect.py`'s medians (the record's README keeps `bench-collect.py`'s own tables): a row per tier, named by the model's weight type and the length (`IQ3_XXS 1K`), and for prefill and then decode three columns (the LLM terms, in both languages; the user's decision, 2026-10-11): XeStrata's value, upstream's, and the difference (the value columns named with the engine and its version, `XeStrata xe0.1.43.1-1`, `upstream v0.1.41`), marked ✅ where XeStrata is faster and ❌ where it is slower: prefill as a ratio (`✅ 2.1 倍`, `✅ ×2.1`), decode as a percentage (`✅ +14%`; slower: `❌ −3%`).
+Gyro-M's rows, from `gyro-m/`'s medians, come after IQ3_XXS's in the same generate table (`Gyro-M 32K`, `Gyro-M 1K`).
 Within ±1% (either way) the two count as equal: `≒ 同等（−0.1%）` / `≈ equal (−0.1%)`, for prefill as well.
 A value upstream was stopped in is 計測不能（低速） / not measurable (too slow), its difference `✅`, with the line saying upstream was stopped at 10 tok/s or less; a value that does not fit stays `-`.
 Above each GPU's tables: the GPU (and its memory) and which build of upstream it ran (`sycl/`, CUDA, HIP).
@@ -244,16 +284,22 @@ Equal there is the upstream merge's check (`judge.py`): prefill within ±1%, the
 | agent decode (tok/s) | 46.2 | 45.0 | ≒ 同等（+3%） |
 ```
 
-Below that, its image table from `image/`'s medians, the same columns: the seconds of an image, of its sampling and of its VAE, with which build each engine ran (its backend and the image model's quant); the difference as a ratio of the times, upstream's over XeStrata's (`✅ 1.8 倍` / `✅ ×1.8` where XeStrata is faster; slower: `❌ 0.93 倍` / `❌ ×0.93`), within ±1% equal.
+Below that, its image table from `image/`'s and `image-mage/`'s medians: a row per model and engine (XeStrata, upstream, ComfyUI's int8 and bf16), with the seconds of an image, of its sampling and of its VAE, which build each engine ran (its backend and the weights), and the difference of the image's seconds against XeStrata's as a ratio of the times, the other's over XeStrata's (`✅ 1.8 倍` / `✅ ×1.8` where XeStrata is faster; slower: `❌ 0.93 倍` / `❌ ×0.93`), within ±1% equal.
+A time that was not measured is `-` (ComfyUI's VAE); upstream's Mage-Flow-Turbo is upstream にない / not in upstream.
+Only upstream decides whether the release goes out (a release slower than upstream is not published): ComfyUI's rows are shown as they are.
 
 ```markdown
-**画像の生成**（1024×1024・8 ステップ、秒）
+**画像の生成**（1024×1024、秒）
 
-| 計測 | XeStrata xe0.1.44.1-1（Vulkan、Q6_K） | upstream v0.1.44.1（CUDA、Q6_K） | 差 |
-| --- | ---: | ---: | --- |
-| 1 枚 | 18.7 | 17.4 | ❌ 0.93 倍 |
-| サンプリング | 13.9 | 12.4 | ❌ 0.89 倍 |
-| VAE | 2.2 | 2.0 | ❌ 0.91 倍 |
+| モデル | エンジン | 1 枚 | サンプリング | VAE | XeStrata との差（1 枚） |
+| --- | --- | ---: | ---: | ---: | --- |
+| Qwen-Image-2.1-Turbo（8 ステップ） | XeStrata xe0.2.2-1（Q8_0） | 7.7 | 6.9 | 0.4 | |
+| | upstream v0.2.2（Vulkan、Q8_0） | 51.6 | 46.2 | 3.0 | ✅ 6.7 倍 |
+| | ComfyUI 7a28332（int8） | 9.7 | 8.1 | - | ✅ 1.3 倍 |
+| Mage-Flow-Turbo（4 ステップ） | XeStrata xe0.2.2-1（FP16） | 1.9 | 1.7 | 0.1 | |
+| | upstream v0.2.2 | upstream にない | | | |
+| | ComfyUI 7a28332（int8） | 1.9 | 1.5 | - | ≒ 同等（+0.5%） |
+| | ComfyUI 7a28332（bf16） | 0.8 | 0.5 | - | ❌ 0.42 倍 |
 ```
 
 Right after the section's opening lines, once (not repeated for each GPU), one note in each language section, with the temperatures and what counts as equal:
@@ -262,7 +308,7 @@ Right after the section's opening lines, once (not repeated for each GPU), one n
 > [!NOTE]
 > - **generate**：温度 0（greedy）。差が ±1% 以内なら ≒ 同等です。
 > - **serve と通常使用**：温度 0.7 で、それぞれのエンジンが自分の文を書くので、1 回ごとに中央値から 10% 前後ずれることがあります。差が prefill は ±1% 以内、待ち・decode・最初のトークンは ±5% 以内なら ≒ 同等です。
-> - **画像の生成**：決まったプロンプトと種で 1 枚ずつ作った時間です。それぞれのエンジンの setup がその GPU に選ぶ作り方で動かします。差が ±1% 以内なら ≒ 同等です。
+> - **画像の生成**：決まったプロンプトと種で 1 枚ずつ作った時間です。XeStrata と upstream はそれぞれの setup がその GPU に選ぶ作り方で、ComfyUI は起動して 1 枚作った後の 2 枚目です。差が ±1% 以内なら ≒ 同等です。
 > - どれも、交互に 2 回ずつ測った中央値です。
 ```
 
@@ -270,7 +316,7 @@ Right after the section's opening lines, once (not repeated for each GPU), one n
 > [!NOTE]
 > - **generate**: temperature 0 (greedy). Within ±1% counts as ≈ equal.
 > - **serve and everyday use**: temperature 0.7, each engine writing its own text, so a run can land about 10% off the median. Within ±1% for prefill and ±5% for the wait, decode and first token counts as ≈ equal.
-> - **image generation**: the time of an image from a fixed prompt and seed, each engine as its own setup sets it up on the GPU. Within ±1% counts as ≈ equal.
+> - **image generation**: the time of an image from a fixed prompt and seed: XeStrata and upstream as their own setups set them up on the GPU, ComfyUI the second image after its start. Within ±1% counts as ≈ equal.
 > - All are the median of two alternating runs.
 ```
 

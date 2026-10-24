@@ -241,14 +241,21 @@ function(strata_cuda_score covered sum cublas version out)
   set(${out} "${f1}${f2}${cublas_bit}${f4}" PARENT_SCOPE)
 endfunction()
 
-# A Windows cross build: the NVIDIA libspirv of the Windows SYCL build (STRATA_SYCL_WINDOWS) appended to `opts_var`, as
-# the compiler's own, built for Linux, has another wchar_t and does not link into Windows code.
-function(strata_cuda_win_spirv opts_var)
-  file(GLOB spirv
-       "${STRATA_SYCL_WINDOWS}/lib/clang/*/lib/libclc/remangled-l32-signed_char.libspirv-nvptx64-nvidia-cuda.bc")
-  if(CMAKE_CROSSCOMPILING AND WIN32 AND spirv)
-    list(GET spirv 0 spirv)
-    set(${opts_var} ${${opts_var}} "-fsycl-libspirv-path=${spirv}" PARENT_SCOPE)
+# A Windows cross build: the SYCL compiler, built for Linux, takes the libspirv of a Windows host (its long of 32 bits,
+# libspirv.l32.*) for `device_triple` from its own resource folder, where intel/llvm v7.2.0 and later build it beside
+# the Linux one (libclc's LLVM runtimes, every variant of each device target).  It carries no wchar_size, which kept
+# v7.1.1's Linux-built one out of Windows code, and differs from a Windows-built one in the SYCL image functions'
+# names alone, which the engine does not use.
+function(strata_win_spirv_check device_triple)
+  if(NOT (CMAKE_CROSSCOMPILING AND WIN32))
+    return()
+  endif()
+  execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-resource-dir OUTPUT_VARIABLE res
+                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(NOT EXISTS "${res}/lib/${device_triple}/libspirv.l32.signed_char.bc")
+    message(FATAL_ERROR "the SYCL compiler has no libspirv for ${device_triple} on a Windows host "
+                        "(${res}/lib/${device_triple}/libspirv.l32.signed_char.bc): a toolchain of intel/llvm v7.2.0 "
+                        "or later builds it (tools/intel_llvm_build.py --contrib)")
   endif()
 endfunction()
 
@@ -258,7 +265,7 @@ endfunction()
 function(strata_cuda_try dir archs explicit driver)
   set(_t_score "" PARENT_SCOPE)
   set(opts "--cuda-path=${dir}")
-  strata_cuda_win_spirv(opts)
+  strata_win_spirv_check(nvptx64-nvidia-cuda)
   strata_cuda_ptx("${dir}" "${driver}" ptx toolkit_ptx)
   if(NOT toolkit_ptx)
     set(_t_note "clang does not take it" PARENT_SCOPE)

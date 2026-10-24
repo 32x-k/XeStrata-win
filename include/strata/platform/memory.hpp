@@ -51,5 +51,12 @@ bool read_ahead_enabled();
 void advise_willneed(const void* p, uint64_t bytes);
 /// The same for [offset, offset + bytes) of an open file.
 void advise_willneed(int fd, uint64_t offset, uint64_t bytes);
+/// Asks the OS to drop the file at `path` from its file cache (the pages no process maps).  Nothing on Windows.
+void drop_file_cache(const std::string& path);
+/// The RAM the OS has free and the file cache holds, in bytes (Linux's MemFree and Cached); false elsewhere.
+bool free_and_cached(uint64_t& free, uint64_t& cached);
+/// Makes the OS free RAM until `bytes` are free (Linux's MemFree), as far as it can give them back (MemAvailable, less
+/// 1 GiB): memory taken, touched and given back, so the file cache leaves it.  Nothing on Windows.
+void make_free_ram(uint64_t bytes);
 
 }  // namespace strata::platform

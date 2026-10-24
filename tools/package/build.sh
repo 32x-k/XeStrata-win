@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-# tools/package/build.sh - the deb and rpm packages, each time in a clean container (docs/BUILD.md).
+# tools/package/build.sh - the deb and rpm packages, each time in a clean rootless Podman container (docs/BUILD.md).
 #
 #   tools/package/build.sh ubuntu26.04 free|cuda13.1|cuda12.4 [COMMIT]
 #   tools/package/build.sh fedora44    free|cuda13.4          [COMMIT]
@@ -14,7 +14,8 @@
 # the work tree's builds goes in.  The container starts from the distribution's image (its digest below), installs
 # the build tools, builds intel/llvm, the image encoders and the engine, and runs CPack (tools/package/container.sh);
 # it gets no GPU and nothing of this PC's, and is removed afterwards.  Only build/pkg/<distro>-<variant>/ comes out:
-# the packages and BUILDINFO (the commit, the image, the packages the build had).
+# the packages and BUILDINFO (the commit, the image, the packages the build had).  Rootless, the container's root is
+# this user, so what it writes to the mounted folders is this user's.
 #
 # windows builds the Windows 7z in the same way, in Ubuntu 26.04's image (tools/package/windows.sh): all of it
 # cross-built on Linux, intel/llvm's SYCL runtime for Windows included.  Its downloads that do not change between builds
@@ -46,8 +47,8 @@ case "$distro/$variant" in
 esac
 # the images as pulled on 2026-10-06: a newer one is taken by changing these lines
 case "$distro" in
-  ubuntu26.04 | windows) image=ubuntu@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7 ;;
-  fedora44) image=fedora@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80 ;;
+  ubuntu26.04 | windows) image=docker.io/library/ubuntu@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7 ;;
+  fedora44) image=docker.io/library/fedora@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80 ;;
 esac
 
 cd "$(git rev-parse --show-toplevel)"
@@ -72,12 +73,11 @@ fi
 mkdir -p "$cache" "$downloads"
 
 echo "building $distro $variant from $rev in $image ..."
-git archive --format=tar "$rev" | docker run --rm -i --pull missing \
-  -v "$PWD/$out:/out" -v "$PWD/$cache:/ccache" -v "$PWD/$downloads:/cache" -e CCACHE_DIR=/ccache \
+git archive --format=tar "$rev" | podman run --rm -i --pull=missing \
+  -v "$PWD/$out:/out:Z" -v "$PWD/$cache:/ccache:Z" -v "$PWD/$downloads:/cache:Z" -e CCACHE_DIR=/ccache \
   -e CCACHE_MAXSIZE="${XESTRATA_CCACHE_MAX:-30G}" \
   -e XESTRATA_DISTRO="$distro" -e XESTRATA_VARIANT="$variant" -e XESTRATA_COMMIT="$rev" \
-  -e XESTRATA_IMAGE="$image" -e XESTRATA_UID="$(id -u)" -e XESTRATA_GID="$(id -g)" \
-  -e XESTRATA_JOBS="${XESTRATA_JOBS:-}" \
+  -e XESTRATA_IMAGE="$image" -e XESTRATA_JOBS="${XESTRATA_JOBS:-}" \
   "$image" sh -c "mkdir -p /src && tar -x -C /src && exec sh /src/tools/package/$script"
 echo "built in $out:"
 ls -l "$out"

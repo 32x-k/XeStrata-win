@@ -24,6 +24,7 @@
 #include <future>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace strata::kernels::cpu { class ExpertPool; }
 namespace strata::gpu { struct Event; }
@@ -42,6 +43,10 @@ struct PrefillStats {
     int64_t experts_helper = 0;     ///< ...computed on a helper GPU from its own cache instead of streamed (set_helper)
     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured with `auto`)
     double ms_ple = 0;
+    /// The prompts' routings, (token, k) pairs per model layer x expert (n_layers x n_expert; empty before the first
+    /// MoE layer), and the k of a token: what the decode after a prompt is likely to route to, set against the cache
+    std::vector<int64_t> routed;
+    int64_t routed_k = 0;
 };
 
 /// --prefill-cpu-share: the CPU pool's share of a short chunk's streamed experts, fixed (0..1; negative: measured,
@@ -158,6 +163,10 @@ public:
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
     static void set_pinned_share(double share);
     static double pinned_share();
+    /// The int8 products' group scratch sized for one group's rows (on) or the chunk's (off, the default): the chunk
+    /// planner turns it on where the chunk-sized buffers do not fit.  Before any prompt; bytes_needed counts it.
+    static void set_group_cap(bool on);
+    static bool group_cap();
     /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule
     /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
     static void set_ring_override(int slots);

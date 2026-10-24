@@ -199,8 +199,8 @@ void tq_gu_rows(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, si
     thread_local std::vector<float> gbuf, ubuf;
     const size_t nr = (size_t) r1;   // row r of token t at [t * r1 + r]
     if (gbuf.size() < nr * kTqMaxTokens) { gbuf.resize(nr * kTqMaxTokens); ubuf.resize(nr * kTqMaxTokens); }
-    float* gp[kTqMaxTokens];
-    float* up[kTqMaxTokens];
+    float* gp[kTqMaxTokens] = {};
+    float* up[kTqMaxTokens] = {};
     for (int t = 0; t < nt; ++t) {
         gp[t] = gbuf.data() + (size_t) t * nr;
         up[t] = ubuf.data() + (size_t) t * nr;

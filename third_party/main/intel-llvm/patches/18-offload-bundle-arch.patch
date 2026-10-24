@@ -2,7 +2,7 @@ SPDX-FileCopyrightText: The LLVM project contributors
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-offload-bundle-arch: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+offload-bundle-arch: a fix to intel/llvm v7.2.0, applied by tools/intel_llvm_build.py.
 
 A program built for several NVIDIA or AMD architectures got another architecture's device code under each
 one's name.  SYCL's bundle IDs carry the GPU without an environment field before it
@@ -13,6 +13,7 @@ gfx1200's code under gfx1030, gfx1030's under gfx1101 and gfx1100's under gfx120
 refused as an illegal instruction.  Fixed, a fifth component that names a GPU is the target ID.
 ---
 diff --git a/clang/lib/Driver/OffloadBundler.cpp b/clang/lib/Driver/OffloadBundler.cpp
+index f51707bd88..ad910e00eb 100644
 --- a/clang/lib/Driver/OffloadBundler.cpp
 +++ b/clang/lib/Driver/OffloadBundler.cpp
 @@ -3,6 +3,7 @@
@@ -23,7 +24,7 @@ diff --git a/clang/lib/Driver/OffloadBundler.cpp b/clang/lib/Driver/OffloadBundl
  //
  //===----------------------------------------------------------------------===//
  ///
-@@ -133,6 +134,23 @@
+@@ -123,6 +124,23 @@ OffloadTargetInfo::OffloadTargetInfo(const StringRef Target,
    assert((Components.size() == 5 || Components.size() == 6) &&
           "malformed target string");
  
@@ -34,7 +35,7 @@ diff --git a/clang/lib/Driver/OffloadBundler.cpp b/clang/lib/Driver/OffloadBundl
 +  // architecture's device code.
 +  if (Components.size() == 5 &&
 +      clang::StringToOffloadArch(Components.back().split(':').first) !=
-+          clang::OffloadArch::UNKNOWN) {
++          clang::OffloadArch::Unknown) {
 +    this->OffloadKind = Components.front();
 +    this->TargetID = Components.back();
 +    ArrayRef<StringRef> TripleSlice{&Components[1], /*length=*/3};

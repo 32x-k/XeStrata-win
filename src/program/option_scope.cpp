@@ -29,21 +29,18 @@ const char* const kQwen38Only[] = {
 const char* const kNotYet[] = {
     "--slots", "--batch", "--batch-cpu-split", "--batch-groups", "--batch-mtp", "--no-batch-mtp",
     "--stream-token", "--check-logits", "--prompt-cache", "--prompt-cache-every", "--prompt-cache-root",
-    "--prompt-cache-tail", "--conversation-cache-mib", "--conversation-cache-min-free-mib",
-    "--conversation-cache-slots", "--conversation-save", "--conversation-save-checkpoints",
+    "--prompt-cache-tail", "--conversation-save", "--conversation-save-checkpoints",
     "--conversation-save-compress", "--conversation-save-hours", "--conversation-save-mib", "--session-min-free-mib",
-    "--kv", "--kv-grow", "--no-kv-grow", "--kv-resident", "--vram-reserve-mib", "--vram-free-mib",
-    "--vram-reserve-later-mib", "--vram-elastic", "--vram-segment-mib", "--expert-cache", "--adapt-async",
-    "--adapt-decay", "--pcie-frac", "--pcie-mode", "--pool-tasks", "--stats", "--stage-timing", "--spec-min-p",
-    "--spec-split", "--no-spec-split", "--spec-follow", "--spec-oracle", "--spec-corrupt", "--suffix-draft",
+    "--kv", "--kv-grow", "--no-kv-grow", "--kv-resident", "--vram-reserve-later-mib", "--vram-elastic",
+    "--vram-segment-mib", "--adapt-async", "--pcie-frac", "--pcie-mode", "--pool-tasks", "--stats", "--stage-timing", "--spec-min-p",
+    "--spec-split", "--no-spec-split", "--spec-oracle", "--spec-corrupt", "--suffix-draft",
     "--lookup-chain", "--lookup-chain-min", "--coupled-draft", "--no-coupled-draft", "--mtp", "--mtp-max-t",
-    "--mtp-window", "--layer-split", "--gpu-stages", "--split-device", "--expert-cache-device1",
+    "--mtp-window", "--gpu-stages", "--expert-cache-device1",
     "--expert-cache-device2", "--expert-cache-device3", "--expert-cache-remote-placement", "--gpu-only-full",
     "--control-vector", "--control-vector-layer-range", "--control-vector-scaled", "--cvec-dir", "--cvec-mode",
-    "--logits-stride", "--dump-routing", "--window-hashes", "--graph-only", "--no-capture", "--no-token-graph",
+    "--logits-stride", "--window-hashes", "--graph-only", "--no-capture", "--no-token-graph",
     "--no-pool", "--no-host-worker", "--no-hit-poke", "--no-publish-kernel", "--no-split-rows", "--pipeline-windows",
-    "--sync-every-layer", "--short-read", "--rope-freq-base", "--rope-freq-scale", "--yarn-attn-factor",
-    "--yarn-beta-fast", "--yarn-beta-slow", "--yarn-ext-factor", "--turn-token", "--tail-role-token",
+    "--sync-every-layer", "--short-read", "--yarn-attn-factor", "--yarn-beta-fast", "--yarn-beta-slow", "--yarn-ext-factor", "--turn-token", "--tail-role-token",
 };
 
 bool listed(const char* const* first, const char* const* last, const std::string& name) {

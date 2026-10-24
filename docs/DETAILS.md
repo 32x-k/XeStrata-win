@@ -210,7 +210,7 @@ Its license is the Swift Open License 1.0: read it on the model page.
 Its experts' gate and up are IQ3_S (IQ4_XS in one layer) and its downs IQ4_NL (Q8_0 in five layers), 59.5 GB of them.
 The dense side and the RAM budget are as UD-Q4_K_XL's below (`--resident-budget-gib N`; setup chooses the RAM less 24 GB).
 With about 80 GB of RAM every expert fits it.
-setup asks about images (off by default); the image encoder is the original model's.
+setup asks about images (on by default); the image encoder is the original model's.
 
 ```sh
 ./setup.sh --setup --family unsloth --model UD-IQ4_XS
@@ -253,38 +253,57 @@ every run from a cold OS cache:
 
 The answers were the same tokens in every run.
 
-### Or: Gyro (agentionai)
+### Or: Unsloth's UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 (EXPERIMENTAL)
 
-**[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)** is agentionai's quantization of Qwen3.8-Flash-Next in two sizes, Gyro-S and Gyro-M (upstream 0.2.0).
-Its experts are trellis-coded blocks (ggml types TQ2_T, TQK6, TQK7) in a basis rotated by a block-128 Hadamard transform.
-The engine rotates the experts' inputs (gate/up's x and down's h) the same way before it multiplies: on the CPU's experts, the GPU's decode window, the helper GPUs and the prompt's FP16 path.
-The prompt's int8 products do not rotate, so the rotated experts' layers take the FP16 path.
-Each size is one file, about half of it the n-gram table; the table is read from the SSD, so keep the file on a fast one.
+Unsloth's 5-, 6- and 8-bit files can be chosen too (six shards each, upstream 0.1.44).
+Their experts' gate and up are Q5_K, Q6_K and Q8_0, their downs Q8_0, which the engine's expert kernels read as they are.
+XeStrata has not run these files, so setup marks them experimental.
+The RAM is handled as for UD-Q4_K_XL: with less RAM than below, a RAM budget of the experts is kept in RAM and the rest read from the SSD.
 
-| | Gyro-S | Gyro-M |
-| --- | --- | --- |
-| File | `Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf` | `Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf` |
-| Download | 58.5 GB | 92.0 GB |
-| Memory it uses (VRAM and RAM together) | 27.6 GB | 35 GB |
-| Experts | gate/up TQK6, down TQK7 | TQ2_T |
-
-setup downloads the file from a pinned revision, checks its SHA-256, and packs it with `--compat-bf16`.
-The pack's `native_experts.txt` is xs2, and the rotation's signs and layers are in `hadamard.txt` beside it; an older engine, which cannot rotate, refuses the pack.
-Neither is anyone's default, and the memory figure is the VRAM and the RAM together, not the RAM. Images are read with the original model's encoder.
+| Size | Download | Experts | RAM, about |
+| --- | ---: | ---: | ---: |
+| UD-Q5_K_XL | 158 GB | 98 GB | 108 GB |
+| UD-Q6_K_XL | 169 GB | 109 GB | 118 GB |
+| Q8_0 | 188 GB | 128 GB | 136 GB |
 
 ```sh
-./setup.sh --setup --family gyro --model Gyro-S
+./setup.sh --setup --family unsloth --model UD-Q5_K_XL
 ```
 
-On a Radeon AI PRO R9700 (32 GB) with a Ryzen AI 9 HX 370 and 27.6 GB of RAM, every Gyro-S expert fit the VRAM (24,576 of them, 24.0 GiB).
-A 13,290-token prompt was read at 1,198 tokens/s, and the sentence in its middle was answered correctly.
-Six Japanese questions answered 18 times decoded at 60.0 tokens/s overall, and 5 answers had characters only Chinese uses (16 of them) (the same runs: Q2_0 107.7 tokens/s, 10 answers; IQ3_XXS 63.0 tokens/s, 1 answer).
+### Or: Gyro-S and Gyro-M
 
-### Or: models other than Qwen3.8-Flash-Next (Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B)
+**[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)** is agentionai's quantization of the original model (upstream ba64156fd).
+Its experts are rotated by Hadamard matrices and stored in trellis formats (TQ2_T, TQK6, TQK7).
+The memory it needs is VRAM and RAM together: 27.6 GB for Gyro-S, 35 GB for Gyro-M.
+The files hold the n-gram table too (read from the SSD), so the downloads are 58 GB and 92 GB.
+Gyro-M is about IQ3_XXS's quality with about 20% less GPU memory.
+Gyro-S is the smallest, of a lower quality than the 2- and 3-bit sizes, and Q2_0 decodes faster.
+Images work too. The model's license is Qwen3.8-Flash-Next's, the Qwen Community License 1.0.
 
-setup's first question also offers three MoE models built differently from Qwen3.8-Flash-Next.
-Each is one GGUF file; the experts are kept in RAM and the most used ones in the GPU's VRAM (the ones VRAM does not hold
-are handled as for Qwen3.8-Flash-Next).
+```sh
+./setup.sh --setup --family gyro --model Gyro-M
+```
+
+### Or: huihui-ai's abliterated versions
+
+**[huihui-ai's abliterated versions](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)** have the refusal direction removed from the model (abliteration).
+They refuse far less, and their safety filtering is weaker, so check what they write.
+
+- `--family huihui-swift`: Swift 1.5's IQ2_XS and IQ3_XXS, under the Swift Open License 1.0.
+- `--family huihui-unsloth`: Unsloth's UD-IQ4_XS, UD-Q4_K_XL and Q8_0, under the Qwen Community License 1.0.
+
+The files' names, shards and sizes are the originals'; the weights differ. The picture readers are the originals'.
+The experimental speed projection does not work with them.
+
+```sh
+./setup.sh --setup --family huihui-swift --model IQ2_XS
+```
+
+### Or: models other than Qwen3.8-Flash-Next (Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, GLM-5.3-Flash)
+
+setup's first question also offers four MoE models built differently from Qwen3.8-Flash-Next.
+Each is read from its GGUF file as it is (GLM-5.3-Flash's in three or four parts); the most used experts are kept in the
+GPU's VRAM and the rest in RAM (the ones VRAM does not hold are handled as for Qwen3.8-Flash-Next).
 
 - **[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)** (Ornith AI, MIT): a Qwen3.5-family
   MoE of 35B with 3B active per token, context up to 256K. The official Q4_K_M to BF16, and pfeifferj's GSQ-RCO 3 and
@@ -295,22 +314,30 @@ are handled as for Qwen3.8-Flash-Next).
 - **[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)** (Qwen, Apache-2.0): a thinking
   Qwen3.5-family MoE of 35B with 3B active per token, context up to 256K. The GGUFs are Unsloth's UD-Q4_K_XL,
   UD-Q6_K_XL and Q8_0 with the MTP layer.
+- **[GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)** (Z.ai, MIT): a thinking MoE of 320B with 18B
+  active per token; setup offers contexts up to 256K. Its attention is KDA (linear attention) and DSA (attention over
+  the tokens it selects), with four residual streams (mHC). The GGUFs are Unsloth's UD-IQ1_S, UD-IQ3_XXS and UD-IQ4_XS.
 
-| Model | Size | Download |
-| --- | --- | ---: |
-| Ornith-1.5 | **Q4_K_M** | 21.7 GB |
-| | Q5_K_M | 25.3 GB |
-| | **Q6_K** | 29.2 GB |
-| | Q8_0 | 37.8 GB |
-| | **BF16** | 71.1 GB |
-| | **GSQ-RCO-3BIT** | 13.0 GB |
-| | GSQ-RCO-3.5BIT | 15.2 GB |
-| llm-jp-4.1 | **Q4_K_M** | 21.5 GB |
-| | BF16 | 64.3 GB |
-| Qwen3.6-35B-A3B | **UD-Q4_K_XL** | 22.9 GB |
-| | **UD-Q6_K_XL** | 32.6 GB |
-| | Q8_0 | 37.8 GB |
+| Model | Size | Download | RAM, about | VRAM |
+| --- | --- | ---: | ---: | ---: |
+| Ornith-1.5 | **Q4_K_M** | 21.7 GB | 30 GB | 4 GB and up |
+| | Q5_K_M | 25.3 GB | 34 GB | 6 GB and up |
+| | **Q6_K** | 29.2 GB | 38 GB | 6 GB and up |
+| | Q8_0 | 37.8 GB | 46 GB | 6 GB and up |
+| | **BF16** | 71.1 GB | 80 GB | 8 GB and up |
+| | **GSQ-RCO-3BIT** | 13.0 GB | 21 GB | 4 GB and up |
+| | GSQ-RCO-3.5BIT | 15.2 GB | 24 GB | 6 GB and up |
+| llm-jp-4.1 | **Q4_K_M** | 21.5 GB | 30 GB | 4 GB and up |
+| | BF16 | 64.3 GB | 73 GB | 8 GB and up |
+| Qwen3.6-35B-A3B | **UD-Q4_K_XL** | 22.9 GB | 31 GB | 4 GB and up |
+| | **UD-Q6_K_XL** | 32.6 GB | 41 GB | 6 GB and up |
+| | Q8_0 | 37.8 GB | 46 GB | 6 GB and up |
+| GLM-5.3-Flash | **UD-IQ1_S** | 93.1 GB | 101 GB | 12 GB and up |
+| | **UD-IQ3_XXS** | 120.4 GB | 128 GB | 12 GB and up |
+| | UD-IQ4_XS | 156.8 GB | 165 GB | 12 GB and up |
 
+The RAM is about the download's size plus 8 GB (for GLM-5.3-Flash, RAM and VRAM together).
+With less, the experts that RAM and VRAM do not hold are read from the model's files, which is slower.
 The sizes in bold are the files whose answers this release compared with llama.cpp's.
 The others are made of the same tensor types, checked on those files and in the kernels' tests (setup marks them
 "untested").
@@ -319,14 +346,18 @@ The others are made of the same tensor types, checked on those files and in the 
 ./setup.sh --setup --family ornith --model Q4_K_M
 ./setup.sh --setup --family llmjp
 ./setup.sh --setup --family qwen36 --model UD-Q4_K_XL
+./setup.sh --setup --family glm53 --model UD-IQ3_XXS
 ```
 
 The API works, with the thinking kept apart from the answer, streaming and tool calls.
-Ornith's official versions (Q4_K_M to BF16) and Qwen3.6 draft up to two tokens ahead with the model's MTP layer and check them in a window (speculative decoding, greedy requests only; the GSQ-RCO versions and llm-jp have no MTP layer).
-Not yet: images, Intel processors' own graphics, more than one GPU (setup uses the
-first), and the options made for Qwen3.8-Flash-Next such as the KV cache's precision and the low-RAM modes.
-When RAM is short for the experts, the engine does not load them and reads them from the model file through the OS
-file cache instead (slower; setup warns of it).
+Ornith's official versions (Q4_K_M to BF16), Qwen3.6 and GLM-5.3-Flash draft up to two tokens ahead with the model's MTP layer and check them in a window (speculative decoding, greedy requests only; the GSQ-RCO versions and llm-jp have no MTP layer).
+With two or more GPUs chosen by `setup --gpus`, the layers are split across them (the first GPU runs the first layers,
+the next the later ones, the head and the MTP layer; the points follow each GPU's share of the free memory), and the
+experts in VRAM are all the GPUs' together.
+Not yet: images, and the options made for Qwen3.8-Flash-Next such as the KV cache's precision and the low-RAM modes.
+When RAM is short of all the experts, the engine keeps the ones VRAM does not hold in RAM as far as it has room and
+reads the rest from the model file through the OS file cache (slower; setup warns of it when the RAM and the VRAM
+together are short).
 
 The engine's options (added to the settings' `args`):
 
@@ -335,23 +366,25 @@ The engine's options (added to the settings' `args`):
 | `--max-context N` | the KV cache's tokens (setup picks it from the GPU's VRAM) |
 | `--expert-profile PATH` | fill the experts in VRAM in this profile's order at start |
 | `--expert-profile-save PATH` | write what this run learned as a profile |
-| `--adapt-every N` | how often the experts in VRAM are swapped: at every 4N-th token of a request, the windows cut there, so the text does not depend on the drafting (the batch slots, `--pipeline-windows` and `--adapt-async`: every N windows) (default 4; 0: no swaps) |
+| `--adapt-every N` | how often the experts in VRAM are swapped: at every 4N-th token of a request; where a layer rounds differently on the CPU and the GPU the windows are cut there, so the text does not depend on the drafting. Qwen3.8's four files decode to the same bits on the CPU and the GPU and are not cut, but serve's prompts from the second turn on round with the swaps' timing, so the text can differ from run to run (`STRATA_ADAPT_CUT=1` cuts them) (the batch slots, `--pipeline-windows` and `--adapt-async`: every N windows) (default 4; 0: no swaps). Without it, when the CPU pool took 30% or more of the checks' time at the 32nd output token, the swaps come every 4 tokens; not when the experts the GPU does not hold are read from the files (`--mmap-experts`) |
 | `--adapt-swaps N` | the most experts one swap moves (default 96; the one right after a prompt moves up to 2,048, those the prompt used most, and fills every free slot with any expert it used) |
 | `--adapt-mib-per-token N` | the swaps copy at most N MiB for each token read since the last one (default 48; 0: no bound) |
 | `--mmap-experts` | read the experts from the model file instead of loading them into RAM |
 | `--no-pcie-split` | the CPU computes every expert VRAM does not hold |
-| `--pool-workers N` | the CPU threads that compute experts (default one fewer than the physical cores) |
+| `--pool-workers N` | the CPU threads that compute experts (default one fewer than the physical cores, at most 32; in a Linux container with a CPU quota (cgroup), at most one fewer than the quota) |
 | `--prompt-chunk N` | the most tokens prefill computes at once (default 4096; 0: none at once) |
 | `--max-t N` | the decode window's most tokens (default 8) |
 | `--spec N` | the most tokens of a window checking the MTP layer's drafts (default 3: two drafts; 0: off) |
 | `--draft-vocab PATH` | the MTP layer drafts only tokens of this subset (`data/draft_vocab*.bin`), reading less of the head (setup writes it into Qwen3.6's settings, after its `--draft-vocab` choice) |
+| `--layer-split K[,K2..]` / `auto` | split the layers across the GPUs: the first runs the layers before K, the next those from K on, ... (`auto`: by each GPU's share of the free memory; setup's `--gpus` writes it) |
+| `--split-device D[,D2..]` | the later GPUs (engine numbers or PCI addresses; by default the other discrete GPUs) |
 | `--rope-scaling none\|linear\|yarn`, `--rope-scale F`, `--yarn-orig-ctx N` | context extension |
 
 ### Less RAM than the model: the low-RAM mode
 
-Every model but Unsloth's two keeps all of its experts in RAM, and the GPU holds a copy of the most-used ones.
-When the experts do not fit the RAM (with about 10 GB left for the rest) but the GPU can hold enough of them,
-setup chooses the low-RAM mode (`--low-ram auto`, the default).
+Every model but Unsloth's sizes (huihui-ai's versions of them too) keeps all of its experts in RAM, and the GPU holds a copy of the most-used ones.
+When the experts do not fit the RAM (with about 10 GB left for the rest), setup chooses the low-RAM mode (`--low-ram auto`, the default).
+The fewer experts the GPU holds, the more are read from the files, and the slower it is.
 The engine then reads the experts from the model files instead of copying them all into RAM:
 a native pack's from the GGUF files in place, the AVX-512 Q2_0 pack's from its `experts.bin`.
 An engine started by hand with neither `--resident-experts` nor `--mmap-experts` starts as with `--resident-experts`, and says so in one line, when the free RAM cannot hold all the experts and 8 GiB more (issue #10: the whole set swapped while it loaded, and on an Intel GPU, once moved into the GPU driver's memory, the OS could not take the RAM back and the host stopped).
@@ -361,7 +394,6 @@ With every expert in RAM, the move into the GPU driver's memory (host USM) for t
 - If the experts the GPU does not hold fit the RAM, they are copied into RAM once at start (`--resident-experts`).
   The copy is page-locked only when the RAM left free after it is more than 8 GiB and what is still read from the model files (the experts neither on the GPU nor in the copy) together (issue #11: a B70 with 31 GB of RAM and 17.5 GiB page-locked stalled the GPU's copies while the files were read again).
   The engine says at start which it chose, with the numbers. `STRATA_RESIDENT_PIN=0` never page-locks it, `1` always does.
-  On Windows this rule applies when HIP sees one GPU; with two or more it is not page-locked by default (`auto` for this rule, `1` always), since HIP maps page-locked memory into every GPU it sees. Choosing the GPU with `ONEAPI_DEVICE_SELECTOR=hip:N` narrows `HIP_VISIBLE_DEVICES` to the same GPU.
   The server then moves the adaptive tier's swaps (exchanges between the RAM copy and the GPU cache) on a helper
   thread between verify windows (`--adapt-async`, opt-in upstream in b437b8ea, the default here).
   No window waits for a whole round of swaps.
@@ -385,6 +417,13 @@ With every expert in RAM, the move into the GPU driver's memory (host USM) for t
   90% or more of the experts' pages are already in the page cache at the first prefill (Linux: a sample checked with
   `mincore`), it takes the RAM profile (a few threads) instead and says so in its log (upstream 83a7dbc0, #1353).
   `STRATA_STAGER_SSD=1` / `0` forces either.
+  On Linux, reading the GGUF files in place, the decode reads as follows (upstream 149).
+  An expert whose pages are all in the page cache is computed from the files' mapping, not copied (`STRATA_COLD_OVERLAP=0` copies it).
+  The others are read with pread without read-ahead; the next layer's router predicts the experts of the next two layers, and I/O threads read them ahead (`STRATA_IO_PREFETCH=0` turns this off, `STRATA_LOOKAHEAD=0` the prediction alone).
+  The read-ahead runs only while the page cache has room for 55% of the experts and what it reads is used (`STRATA_IO_PF_GATE=0` reads ahead always).
+  An experts.bin pack has its pages read ahead by the I/O threads the same way while the page cache has room for 55% of its experts.
+  Reading from the files, the adaptive tier's period is not shortened (`--adapt-every`), and the check's guesses are cut at the `--spec-min-p` floor (`--spec-window auto` sizes them by the measured times).
+  On the RX 9060 XT with 32 GiB of RAM (IQ3_XXS) the decode went from 11.6 to 26.0 tokens/s at 1K and from 11.2 to 16.8 at 32K; on the B70 from 46.9 to 56.5 at 1K, and on the RTX 4070 from 13.3 to 34.8 at 1K.
 
 `--low-ram on|off|resident|mmap` overrides the choice, and `./setup.sh --check` shows what each size would use.
 
@@ -444,6 +483,8 @@ The model files go next to the folder so that a new copy of XeStrata, unpacked e
 The place is remembered per user (`~/.config/xestrata/settings.json`); `--data-dir` chooses another.
 To move the files later, move the folder yourself and run `./setup.sh --setup --data-dir <new place>` once:
 setup finds the files there and writes the configs again.
+Given a new place with `--data-dir` while model files are elsewhere, setup leaves them where they are and uses them there, and the new place takes the new downloads (it asks whether to move them when it can ask).
+`--move-data` moves them into the new place; `--set-default-data-dir` remembers the new place without moving anything.
 
 ---
 
@@ -532,7 +573,7 @@ The experts of the pieces given back are computed on the CPU: the same answers, 
 `GET /v1/status` shows the current size under `"vram"`.
 A reserve that cannot be met (the cache at its smallest size, or no VRAM from the driver for the next segment) still answers `200`: compare the answer's `vram_free_mib` with your `reserve_mib` (upstream #1034).
 While a request runs or waits, it waits up to 300 s, then answers `409`.
-Where the GPU's runtime has no virtual memory it is off and the cache stays as it started (Intel's Level Zero and NVIDIA's CUDA have it; AMD's HIP in intel/llvm 7.1.1 does not).
+Where the GPU's runtime has no virtual memory it is off and the cache stays as it started (Intel's Level Zero and NVIDIA's CUDA have it; AMD's HIP in intel/llvm 7.2.0 does not).
 
 ### Model files downloaded by hand, or from a mirror
 
@@ -544,22 +585,32 @@ It takes a file, a folder, a URL, `ms:owner/repo` (ModelScope) or `hf:owner/repo
 A name says little: Unsloth's `UD-IQ3_XXS` stores its routed experts at 3.22 bits per weight, `UD-Q4_K_XL` at 5.10, the original `Q2_0` at 2.25 and `IQ3_S` at 3.33.
 To download from a Hugging Face mirror, set `HF_ENDPOINT` (e.g. `HF_ENDPOINT=https://hf-mirror.com ./setup.sh`):
 the pinned revisions and the checks are the same, and the MTP tensors come from the same host.
+Every model file setup downloads has a fixed size and SHA-256 (upstream e193161de).
+When the server's size is not the pinned one, setup stops before the download; a downloaded file that does not match its SHA-256 is deleted and setup stops.
+When the pinned revision is gone from the repository, setup stops (for testing, `STRATA_ALLOW_UNPINNED=1` takes the current files without the check).
 
 **From ModelScope** (mainland China, upstream #908): every repository setup downloads from (the GSQ-RCO models, Swift 1.5, the Coder, Unsloth's files, and the original checkpoint the MTP draft layer is taken from) is on [ModelScope](https://www.modelscope.cn) under the same name, with the same files.
 Setup never switches to it by itself (a download that fails says how).
 Choose it with `--source modelscope` (`STRATA_SOURCE=modelscope`).
-ModelScope serves a repository's current files (no pinned revision), so each file is checked against the SHA-256 ModelScope publishes for it, and the MTP tensors against the pinned checkpoint's own hashes.
+ModelScope serves a repository's current files (no pinned revision), so each file is checked against its pinned SHA-256 (a file without one against the SHA-256 ModelScope publishes for it), and the MTP tensors against the pinned checkpoint's own hashes.
 The published SHA-256 is ModelScope's own statement: a changed upstream repository would carry its own hash.
 Setup says so when you choose it.
 
 ### Tuning for your PC (`--calibrate`)
 
-Four engine settings depend on the PC more than on the model:
+These engine settings depend on the PC more than on the model; the calibration measures the three other than the
+window length:
 
 - the share of the experts missing from VRAM that are copied to the GPU instead of computed by the CPU (`--pcie-frac`).
   Without it the engine splits them by an expert's time on each side, measured at start
   ([XE](XE.md#splitting-the-missed-experts-between-the-cpu-and-pcie)); a fixed share is kept only when it is more than 3% faster;
-- how sure the draft layer must be to add another guess to a check (`--spec-min-p`);
+- how sure the draft layer must be to add another guess to a check, which is not measured:
+  by default (`--spec-window auto`) the engine adds a guess while the output it is expected to add, over the time of a
+  check of that size measured since the start, raises the output per ms (the expectation is the draft layer's
+  probability, corrected by the share actually accepted); a request that passes `spec_min_p` runs the `--spec-min-p`
+  floor instead, so the calibration passes none; when the experts the GPU does not hold are read from the files
+  (`--mmap-experts`) and `--spec-window` is not given, the `--spec-min-p` floor cuts them (a check's time there swings
+  with the SSD's reads, and the wider ones were priced too high);
 - how many CPU threads compute experts (`--pool-workers`): on CPUs with efficiency cores, fewer can be faster;
   it also tries one fewer than the P-cores, and one fewer than one socket's cores on a 2-socket PC;
   on a CPU with more efficiency cores than performance cores, setup writes the performance cores (but the host's
@@ -571,7 +622,8 @@ Four engine settings depend on the PC more than on the model:
 
 The defaults were measured by upstream on a Ryzen 5 7600 with an RTX 5070.
 Some have been measured again on the B70 ([XE.md](XE.md#upstream-settings-not-remeasured-on-xe)).
-setup offers to measure them on your PC after an install; `./setup.sh --calibrate` does it any time.
+The engine and setup fit them from what they measure, so this is usually not needed. They are measured only when you
+run `./setup.sh --calibrate` (it asks first whether to measure anyway; `--yes` skips the question).
 It measures the decode speed with each setting and keeps one only when it is more than 3% faster.
 The result is remembered per PC and model in the settings file, so updates keep it.
 Measuring the worker count needs a fresh engine, so the model is loaded more than once, and the PC can stop responding for a minute or two each time (upstream #1197).
@@ -585,6 +637,18 @@ More tasks can even out the cores, but cost more scheduling:
 compare against `0` with the same worker count and workload.
 It changes neither the kernels, the phase barriers nor the PCIe placement; `--calibrate` does not tune it yet.
 For the server, add `"--pool-tasks", "192"` (for example) to the `args` of its configuration and restart it.
+
+The CPU pool puts one worker on each physical core (never on an SMT sibling) and keeps the first core for the host (the thread that waits for the GPU).
+The start-up log says where they sit in one line (`CPU workers on logical processors 2,4,...,30 (15 workers, one per physical core; host on 0)`).
+Where the OS does not say which logical processors share a core (some containers), the line says so.
+The workers are named `strata-pool-N` and the host `strata-host` (the other helper threads too, `strata-adapt` and so on), so Linux's `ps -L -o tid,psr,comm` and the Windows tools that read thread names tell them apart.
+`--pool-cores LIST` (experimental, off by default, upstream 7a5599581) pins the workers to exactly these logical processors, in this order.
+`STRATA_POOL_CORES=LIST` or `"pool_cores": "2,4,6,8"` in the configuration sets it too.
+The list is numbers, ranges and `first-last:step` (`0,2,4,6`, `2-14:2`), numbered as Task Manager and `lscpu` show them.
+The worker count is the list's length; `--pool-workers N` takes its first N entries.
+Nothing is refused; the engine warns when two entries are the two threads of one core, when an entry is the host's logical processor, and when one is a processor this process may not use (left out). With nothing usable left the pool keeps its default placement, and a list that cannot be read is said and ignored.
+The host keeps the first core, so leave it out of the list. It moves threads only and does not change the answers.
+It applies to the Qwen3.8-Flash-Next engines; the other MoE models (Ornith, llm-jp, Qwen3.6, GLM-5.3-Flash) keep the default placement.
 
 `--aux-cpus` decides which CPUs run the threads that are neither CPU pool workers nor the host thread (Linux, `off` by
 default, upstream 91f1e85d): the expert cache's refills, the prefill copies, the file reads, the GPU runtime's threads
@@ -650,10 +714,10 @@ The file is a fingerprint of what you used the model for: keep it on your PC.
 Without the key nothing is counted or written.
 A setup run again keeps the key, and `--expert-profile` (a file that still exists) and `--expert-profile-save` added to `"args"` by hand (upstream #775).
 
-An expert the adaptive tier swaps in is used on the GPU by the next window, which waits for its copy first.
-`STRATA_ADAPT_LAG=2` in the engine's environment uses it from the second window, so nothing waits (upstream #764; the
-answers change by that much, and are the same run to run with the same settings).
+An expert the adaptive tier swaps in is used on the GPU from the second window, so no window waits for its copy
+(upstream #764; the answers are the same run to run with the same settings).
 Decode went from 59.1 to 64.2 tokens/s on an RTX 4070 and from 76.5 to 76.9 on the B70 (IQ2_XS).
+`STRATA_ADAPT_LAG=1` in the engine's environment makes the next window wait for the copy and use it.
 
 ### When the draft head does not fit
 
@@ -729,8 +793,6 @@ A `--reasoning-effort` in `args` is moved there by the server, with a note.
 The levels are instructions the model was trained with, not a hard token limit:
 on easy questions all three think briefly, on hard ones `high` thinks longest and is most accurate.
 
-- **Keep Windows awake while it works (opt-in, upstream #1727).** `"prevent_sleep": true` in `xestrata-<model>.json` keeps the PC from going to sleep while at least one request is running or waiting (Windows' `SetThreadExecutionState` with `ES_SYSTEM_REQUIRED`; the screen may still turn off).
-  The normal sleep rules come back when the server is idle and when it exits. Default off; on Linux it does nothing (one line at startup says so).
 - **A hard thinking budget (opt-in).** `"reasoning_budget_tokens": N` (or llama.cpp's `"thinking_budget_tokens": N`, which clients written for llama-server send) in a request (OpenAI or Anthropic) caps the thinking at N tokens.
   When it gets there the server ends it with a short wrap-up line and `</think>`, and the model answers from there.
   The engine continues from what it already holds, so nothing is read again.
@@ -756,7 +818,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   A flagged window emits none of its tokens; the engine prints a line with the position and ends the request with `DONE ... nonfinite` (a slot: `BDONE <slot> <n> nonfinite`).
   The next request first drops the live session, every checkpoint, every parked conversation and every idle slot, and reads its prompt from token 0 (a slot still running finishes its reply and is not kept after it).
   The server sends a request that has sent nothing yet again once, transparently; a reply that had started ends as `"length"`; a second fire on the retry ends the request with an error (503 before an answer, an error event in a stream).
-  When the flagged window was one that reads the prompt's short tail (the part after the last turn boundary, read through the verify windows, `--short-read`), the retry reads its whole prompt through the batched path instead, and the engine prints a line saying so (upstream #3465: a reporter's prompts failed in that tail every time and passed with `--short-read 0`).
+  When the flagged window was one that reads the prompt's short tail (the part after the last turn boundary, read through the windows, `--short-read`), the retry reads its whole prompt through the batched path instead (upstream #3465: a reporter's prompts failed in that tail every time and passed with `--short-read 0`); the engine prints a line saying so.
   The kernel only writes flags, so an answer without a NaN is the one the engine gives with `STRATA_NAN_GUARD=0` (no kernel recorded).
   Debug switch: `STRATA_NAN_INJECT=<n>[,<n>...]` reports the n-th window the engine checks as non-finite.
 - **Anthropic requests that don't ask for thinking (opt-in).** By default a `/v1/messages` request with no `"thinking"`, effort or budget thinks as the model's template does.
@@ -771,9 +833,9 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   While the model reads a long prompt the stream sends keep-alive messages, so agents do not time out.
   The server window prints progress every 15 s, and `GET /status` says what it is doing (`reading the prompt`, `answering`, tokens so far).
   Closing the connection or pressing stop in your app really stops the model, so the next request starts at once.
-- **Which tool calls come back as calls** (upstream #3075, #3441). A call counts only when it names a tool the request declared.
+- **Which tool calls come back as calls.** A call counts only when it names a tool the request declared.
   A call for another name, or any call in a Chat Completions or Anthropic request that declared no tools, is returned as the text it was written as, so a client never runs a tool it did not offer (the Responses route keeps its own rule for Codex's compaction requests).
-  A call whose opener drifted by a token, `<=NAME>`, `<function:NAME>` or `<NAME>` instead of `<function=NAME>`, is read as the call when NAME is a declared tool.
+  A call whose envelope drifted by a token, `<=NAME>`, `<function:NAME>` or `<NAME>` instead of `<function=NAME>`, is read as the call when NAME is a declared tool.
   A `<tool_call>` block that still does not read as a call is counted in the server window.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8095/v1`, any API key.
 - **OpenCode** (upstream #543). A starting point for `opencode.jsonc` (in your project, or `~/.config/opencode/`).
@@ -807,8 +869,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   ```
 
   Set `limit.context` to the context you chose in setup: OpenCode compacts the conversation before it gets there.
-  Keep `limit.output` well under it: a request whose prompt plus `max_tokens` runs past the context is refused (see **Context** below),
-  or add `"fit_max_tokens": true` to `xestrata-<model>.json`.
+  Keep `limit.output` well under it: a request whose prompt plus `max_tokens` runs past the context has its `max_tokens` shortened to the room left (see **Context** below).
   For a hard cap on the thinking, add `"reasoning_budget_tokens": N` to `xestrata-<model>.json` (see above).
   OpenCode writes an `<env>` block (working directory, today's date) near the start of its system message, ahead of ~40K characters of instructions and tool definitions that are the same in every session.
   The prefix cache only reuses a prompt's start, so every new folder and every new day reads ~14K tokens again.
@@ -820,10 +881,9 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
 - **Codex CLI**: see [the Responses API](#the-responses-api-and-codex-cli) below.
 - **Context.** Chosen in setup (8K–262K).
   Requests longer than that are refused, never silently cut.
-  A request whose `max_tokens` would run past the context is refused too (400).
-  Agents that always ask for their full output cap can instead get it shortened to the room left:
-  add `"fit_max_tokens": true` to `xestrata-<model>.json` (or pass `--fit-max-tokens` to `serve/server.py`).
-  A prompt that leaves no room at all is still refused.
+  A request whose `max_tokens` would run past the context is answered with `max_tokens` shortened to the room left (agents such as Claude Code ask for 32,000 on every request); the thinking budget follows the shortened cap (upstream f31b6efd6).
+  For the strict llama.cpp behaviour (400), set `"fit_max_tokens": false` in `xestrata-<model>.json` or pass `--no-fit-max-tokens` to `serve/server.py`.
+  A prompt that leaves no room at all is always refused.
 - **Model aliases.** `"aliases": ["qwen", "local-model"]` in `xestrata-<model>.json` lists the model under those names too in `/v1/models`
   (each with its own `id`, and in the model's `aliases`), like llama-server's `--alias`.
   A request naming one is answered under that name.
@@ -838,7 +898,6 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   Only XeStrata's own page can save (JSON, with the API key when one is set, as for the Chat settings); the network, key, MCP and program keys are not editable there.
 - **From other devices on your network.** The server listens on your PC only (`127.0.0.1`) unless you say otherwise:
   run `./setup.sh --host 0.0.0.0 --api-key some-long-secret` (kept in the model's config for the next starts), or add `"host": "0.0.0.0"` and `"api_key": "..."` to `xestrata-<model>.json`.
-  The key is recommended, not required: without one the server still starts and warns that anyone who can reach the port can use the model and its tools (upstream 2f361a37). To say it is on purpose, use `--no-api-key` on the server or `"api_key": "none"` in the config, which also silences the note about an empty key in the config.
   The server window then prints this PC's addresses (`from other devices: http://192.168.x.x:8095/`).
   Open that on the other device, or use `.../v1` as an API base URL.
 - **From the internet.** Put a tunnel in front of it, for example
@@ -848,6 +907,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   add `"api_key": "some-long-secret"` to `xestrata-<model>.json` (or set the `STRATA_API_KEY` environment variable); clients then send it as their API key.
   Several keys, separated by commas, are all accepted (`"key1,key2"`, as llama.cpp does; `--api-key key1,key2` likewise).
   An API key that is given but empty refuses to start the server (it would switch authentication off).
+  To serve on the network without a key on purpose, write `"api_key": "none"` (or pass `--no-api-key`): the server starts and warns once that it has no key (and, with MCP tools, that the tools can read and change files on this PC).
   Streamed answers carry `X-Accel-Buffering: no`, so nginx-style proxies pass each token on at once.
   The web app's settings and MCP tools only answer XeStrata's own page.
   When you open it through a proxy or tunnel whose address differs, add that address, e.g. `"trusted_origins": ["https://strata.example.com"]`.
@@ -861,7 +921,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   With a key the check is off: such a page cannot send the key, and tunnels and proxies that pass their own name on keep working.
   The names it knows, on any port:
   `localhost` (and `*.localhost`), any IP address (`127.0.0.1`, `[::1]`, `192.168.x.x`, ...), the address it listens on,
-  and, when it listens beyond this PC (`0.0.0.0` or a LAN address), this PC's name (`mypc`, `mypc.local`) and `host.docker.internal`.
+  and, when it listens beyond this PC (`0.0.0.0` or a LAN address), this PC's name (`mypc`, `mypc.local`) and the names a container reaches this PC by (Podman's `host.containers.internal`, Docker's `host.docker.internal`).
   Others get **403** naming the setting, and the server window prints one line for each.
   To reach it under another name (a reverse proxy that keeps the name, a tunnel, a DNS name on your network, another container's name for it), add the name:
   `"allowed_hosts": ["strata.example.com"]` in `xestrata-<model>.json` or `STRATA_ALLOWED_HOSTS=strata.example.com` (comma-separated).
@@ -1048,7 +1108,9 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
   A request's own fields always win.
   With no block at all, a request without sampling keys gets the sampling the model card recommends (upstream #2685).
   It is picked by the thinking state: Qwen3.8-Flash-Next (Swift and Gyro too) thinking temperature 1.0, top_p 0.95, top_k 20; not thinking temperature 0.7, top_p 0.8, top_k 20, presence_penalty 1.5; Qwen3.6-35B-A3B thinking 1.0 / 0.95 / 20 with presence_penalty 1.5, not thinking 0.7 / 0.8 / 20 with 1.5.
-  Ornith and llm-jp are not in the table and decode greedy as before.
+  Ornith-1.5 takes its card's set for general tasks, 0.6, 0.95 and 20 (with or without thinking), GLM-5.3-Flash its
+  generation_config's temperature 1.0 and top_p 0.95.
+  llm-jp's card names no sampling, so it is not in the table and decodes greedy as before.
   The order of precedence: the request, the web page's shared Chat settings, the config's `sampling` block, the card.
   Greedy is only for who asks for it: `temperature: 0` in the request, or `"sampling": {"temperature": 0}` in the config.
   The web page sends no sampling of its own until you change its Sampling settings (it showed and sent 0.6 before); an old stored 0.6 with the default top_p and top_k counts as not set.
@@ -1247,7 +1309,8 @@ This is the opposite direction from [Tools from MCP servers](#tools-from-mcp-ser
 The model has an image encoder:
 [`mmproj-Qwen3.8-Flash-Next-BF16.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
 (0.9 GB, a 27-layer ViT plus the projector into the language model).
-It is **optional**: say yes when setup asks "Images?", or run setup again with `--vision gpu` (or `--vision cpu`).
+It is **optional**, and setup's "Images?" defaults to yes for a model that reads pictures (upstream 91baead75).
+To leave it out, say no or pass `--vision no`; to add it later, run setup again with `--vision gpu` (or `--vision cpu`).
 Yes (`--vision yes`) means the GPU encoder on a card of 24 GB and more and the CPU encoder on a smaller one: the GPU encoder keeps about 1.4 GB of VRAM free, which cost 3-5% of text speed on 16 GB cards (upstream #2406's measurement). `--vision gpu` keeps the GPU encoder on a small card too.
 setup downloads the encoder, builds a small helper (`strata-vision`, from llama.cpp's `mtmd` library) and adds it to your start script.
 Nothing else changes.
@@ -1322,6 +1385,7 @@ print(r.choices[0].message.content)
 **Anthropic API:** an `image` block with a `base64` (or `url`) source, as usual.
 
 JPEG, PNG, BMP, GIF, WebP, TIFF and AVIF work (the last ones are converted to PNG first; agents such as omp send WebP).
+An `http(s)://` URL that points to the server's own PC or its LAN (a loopback, link-local or private address), or redirects there, is not fetched. To serve pictures from the LAN, start the server with `STRATA_IMAGE_URL_PRIVATE=1`.
 Chat apps with image upload work the same way.
 
 **How it works inside:** the encoder turns the picture into rows of the same width as the model's word embeddings.
@@ -1330,21 +1394,38 @@ the model uses interleaved M-RoPE.
 
 ## Image generation (optional)
 
-`./setup.sh --images qwen-image` sets up image generation with Qwen-Image-2.1-Turbo beside the text model (upstream 0.1.44).
+How to use it, its options and the API's fields are listed in [IMAGE](IMAGE.md); this section also explains how it works inside.
+
+`./setup.sh --images qwen-image-turbo` sets up image generation with Qwen-Image-2.1-Turbo beside the text model (upstream 0.1.44).
 Images are made by XeStrata's own image engine, `strata-image`, which setup builds with the text engine: the same SYCL kernels, on every maker's GPU.
+The image attention runs through oneDNN on Intel GPUs and aotriton on AMD GPUs (both in the packages), through cuDNN on NVIDIA GPUs where it is installed (contrib-llvm; `xestrata --setup` says how), and through XeStrata's own kernel elsewhere. Where the GPU's math library has int8 products (Intel and NVIDIA in the contrib-llvm mode, AMD), the image models' products take int8 weights and activations.
 Setup downloads the image model, its VAE, its text encoder (Qwen3-VL-8B) and, for the edits, its vision encoder (Qwen3-VL's mmproj), and adds an `"images"` section to the config.
 The image model is Q8_0 by default. The engine streams from RAM the layers that do not fit in VRAM, so the GPU's memory does not decide the size.
-The RAM does: when the four files (the vision encoder for the edits among them) and the engine's own (about 16.6 GB with Q8_0, 15.3 GB with Q6_K, 13.2 GB with Q4_K_M) do not fit the RAM the text model leaves, setup takes the largest that fits (Q6_K, Q4_K_M).
-With `--image-ssd-offload on` it keeps the size chosen and reads what does not fit from the SSD (slower).
+Its text encoder is Q8_0 by default too. The RAM decides both: when the four files (the vision encoder for the edits among them) and the engine's own (about 20.2 GB with both at Q8_0) do not fit the RAM the text model leaves, setup first lowers the text encoder (Q6_K, Q5_K, Q4_K), and only when that does not fit either takes the largest image model that fits (Q6_K, Q4_K_M), with the largest text encoder that fits beside it.
+With `--image-ssd-offload on` it keeps both sizes chosen and reads what does not fit from the SSD (slower).
+With `--images qwen-image-turbo-uncensored` the text encoder is AtomicChat's Qwen3-VL-8B with its refusal direction removed, its size chosen the same way; the image model, the VAE and the vision encoder stay the same. Its authors measured no change in what it can draw, only a small overall shift in the pictures.
 When setup lowers it, setup, the server at start and the web page (the Images tab) say so.
 With the same seed it makes the image stable-diffusion.cpp makes with the model card's command (within an LPIPS of 0.03).
-Qwen-Image-2.1-Turbo's weights are under the Qwen Research License, not a free software license: read it before any commercial use.
+With `--images qwen-image-base` the images are made by Qwen-Image-2.1, the model Turbo was made from (`qwen-image-base-uncensored` takes AtomicChat's text encoder above). Only the image model is another file: the VAE, the text encoder and the vision encoder are Turbo's.
+It runs 40 steps by default (the default of Qwen's diffusers pipeline, without guidance), about 5 times as long an image as Turbo; a request's `steps` (2 to 100) changes them. The steps' sigmas follow diffusers' scheduler, shifted by the image's size.
+The weights of Qwen-Image-2.1-Turbo and Qwen-Image-2.1 are under the Qwen Research License, not a free software license: read it before any commercial use.
 
-The server makes images on `POST /v1/images/generations` (OpenAI's images API, plus `seed`), and the web page gets an Images tab.
-`POST /v1/images/edits` (OpenAI's multipart form with `image` or `image[]`, or JSON with `images: [{"image_url": ...}]`) makes an image from reference images (up to 3; PNG, JPEG, GIF, BMP): it can change them, or take the people and things in them as its subject. `size` `auto` takes the first reference's shape at about 1024x1024 pixels. On the web page, an image attached in the Images tab makes an edit.
-A conversation can make images too: `/v1/chat/completions` with `"strata_images": true` (the web page sends it) gives the model the tools `generate_image` and `edit_image`, and when it calls one the server makes the image and shows it there; `edit_image` changes the conversation's last image (one attached or one made in it). On `/v1/responses`, OpenAI's hosted `image_generation` tool does the same, and the image comes back as an `image_generation_call` item (its `result` the PNG in base64).
+With `--images mage-flow-turbo` the images are made by Microsoft's Mage-Flow-Turbo (4B, 4 steps). `mage-flow` (the model tuned with reinforcement learning, 20 steps) and `mage-flow-base` (the model before it, 30 steps) take CFG (scale 5 by default).
+setup downloads the image models for generation and for edits (Comfy-Org's bf16 safetensors), the VAE, the text encoder (Qwen3-VL-4B) and the vision encoder for the edits (Qwen3-VL-4B's mmproj). The text encoder's size is chosen as for Qwen-Image-2.1; the image model comes in one size.
+When the image model's blocks all fit in VRAM with the text encoder's layers the engine keeps them 16-bit (FP16) and multiplies them as they are; when they do not, it turns them into 8 bits as it loads them and streams the blocks that do not fit from RAM (`--image-dit-q8 on` always 8 bits, `off` always 16-bit). Where the GPU's math library has int8 products (Intel and NVIDIA in the contrib-llvm mode, AMD), 8 bits are the weights rotated by Hadamard matrices in groups of 256 and made int8 with a scale for each row, and the activations rotated alike and made int8 for each token (ComfyUI's int8_convrot form; the time modulations stay Q8_0); elsewhere Q8_0, turned back into 16 bits for each product.
+With `-uncensored` the text encoder is huihui-ai's Qwen3-VL-4B with its refusal direction removed (noctrex's GGUF).
+The API takes `steps` (each model's count by default), the CFG scale as `true_cfg_scale` or `guidance_scale` (1: no CFG) and `negative_prompt` (one space by default). It has no masks and no transparent backgrounds.
+Edits (`POST /v1/images/edits`, the Images tab of the web page, the chat's `edit_image`) are made with the edit image model, which the engine switches to. An edit takes up to 3 reference images (as the edit models were trained), in 4 steps by default with Turbo and 30 with the other two. The image model not in use stays in RAM in 8 bits (`--image-dit-keep off` lets it go and reads it from the file again at each switch); a switch takes a few seconds.
+Mage-Flow's weights are under MIT, but Microsoft's README says the models are for research and not meant for products or services. XeStrata adds no content filter and no watermark for Mage-Flow.
+
+The server makes images on `POST /v1/images/generations` (OpenAI's images API, plus `seed` and `steps`), and the web page gets an Images tab.
+The image API is vLLM-Omni compatible (OpenAI compatible), vLLM-Omni's extra fields included: `num_inference_steps` is `steps` (Turbo keeps its 8 steps and ignores a number of steps asked for); `true_cfg_scale` above 1 with a `negative_prompt` puts classifier-free guidance on Qwen-Image-2.1 and Turbo (diffusers' Qwen-Image-2.1 formula; with the prompt's and the negative prompt's both computed, it takes about twice as long at 1024x1024 and 1.5 times at 512x512). Without either, there is no guidance, and `guidance_scale` has no use with Qwen-Image-2.1 and Turbo.
+`output_format` is `png` (the default), `jpeg` or `webp`, with `output_compression` (0 to 100, default 100) the quality jpeg and webp are written at. `quality` sets Qwen-Image-2.1's steps (`low` 20, `medium` and `standard` 30, `high`, `hd` and `auto` the default 40; `steps`, when given, wins); Turbo keeps its 8, and Mage-Flow does not use it. The answer's `usage` counts the image engine's tokens: the prompt's, and one for each 16x16 pixels of the reference images and of the images made.
+`background` `transparent` wraps the prompt in the form Qwen recommends for it and makes an image with a transparent background (a PNG or webp with alpha; not with jpeg); `opaque` flattens the alpha on white, and `auto` (the default) keeps what the model made. An edit's reference images reach the image model with their alpha.
+`POST /v1/images/edits` (OpenAI's multipart form with `image` or `image[]`, or JSON with `images: [{"image_url": ...}]`) makes an image from reference images (up to 10; PNG, JPEG, GIF and BMP as they are, other formats such as WebP turned into PNG first); with a `mask` (as OpenAI's: a PNG with an alpha channel, the first image's size) only its transparent part is drawn again and the rest stays the first image's pixels (each step puts the latent outside the mask back to the image's, and the end blends in its pixels). Each reference image is read at about 1024x1024 pixels in its own shape, whatever the size made (as diffusers' Qwen-Image-2.1; Mage-Flow's picture reader reads them with the long side at 384 pixels or less, its VAE at the size made). More reference images take longer and more memory (on the B70 at 1024x1024, about 46 s with 3 and 4 minutes with 10): the K and V cache of their tokens (about 2 GB for one at 1024x1024) goes, as far as it does not fit in VRAM, to pinned RAM and is copied in at each step, and an image for which even that leaves the VRAM or the RAM short is refused (400) before it starts. An edit can change them, or take the people and things in them as its subject. `size` `auto` takes the first reference's shape at about 1024x1024 pixels. On the web page, an image attached in the Images tab makes an edit.
+A conversation can make images too: `/v1/chat/completions` with `"strata_images": true` (the web page sends it) gives the model the tools `generate_image` and `edit_image`, and when it calls one the server makes the image and shows it there; `edit_image` changes the conversation's last image (one attached or one made in it). On `/v1/responses`, OpenAI's hosted `image_generation` tool does the same, and the image comes back as an `image_generation_call` item (its `result` the image in base64, with its `size`, `quality`, `background`, `output_format` and `revised_prompt`). The tool's `size`, `quality`, `output_format`, `output_compression` and `background` are used for the images it makes (`size` `auto`: the size the model asks for).
 Each side is 256 to 2048 pixels. A size whose sides are not multiples of 16 (1920x1080) is made at the sides rounded up (1920x1088) and its middle cut out; the web page says so.
-The image engine starts with the first image and stays: its kernels are prepared once, and the same prompt's text states and the layers it holds in VRAM are kept for the next image.
+The image engine starts with the first image and stays; it is a process apart from the server, stays when the text model is changed, and ends 30 minutes (the config's `daemon_idle_s`) after the last server leaves: its kernels are prepared once, and the same prompt's text states and the layers it holds in VRAM are kept for the next image.
 Image jobs run one at a time on the GPU. Before a job the engine says what the image needs in VRAM (the least, and the DiT whole with the VAE in one piece), and what the text model does meanwhile is `--image-gpu-policy`: `keep` (stays as it is), `shrink` (gives VRAM back through `--vram-elastic`), `unload` (its conversation saved, unloaded, restored at the next start), or `auto` (the default: `keep` when everything fits, else `shrink` when the engine can, else `keep` with the layers streamed when the least fits, else `unload`).
 After a job the image engine keeps its layers only under `keep` with VRAM to spare; otherwise it lets go of what it holds (idle, the process alone, about 200 MiB).
 `tools/image/install.py --config <config>` adds it to an existing install.
@@ -1372,7 +1453,7 @@ so measure it on your own prompts; the Monitor marks every request ESP or stock.
 **Turning it on (at setup).** `./setup.sh --setup` asks "Turn on the experimental speed projection?" (default: no),
 or pass `--experimental-speed-projection on` (`off`, or a path to another vector GGUF).
 The deb and rpm packages do not carry the vector: with it turned on, setup downloads the vector and its license from the installed version's tag on GitHub into `experimental-speed-projection/` in the data folder.
-Only for the original Qwen3.8-Flash-Next, not Swift 1.5.
+Only for the original Qwen3.8-Flash-Next (the Coder and Unsloth's files included), not Swift 1.5 or huihui-ai's abliterated copies.
 It writes these engine flags (llama.cpp's) into `xestrata-<model>.json`:
 
 ```text
@@ -1411,11 +1492,12 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 | `... rocBLAS ... has no code for gfx...`, `... has no code for gfx...` | The distribution's rocBLAS (in a package, its engine) has no code for that GPU. On Ubuntu 26.04, it may run on Fedora 44 ([README](../README.md#amd-gpus)). |
 | `building for the AMD GPU needs ROCm's ...` | ROCm's packages that build the AMD GPU's code are missing. Install the ones named and run setup again (see also `./setup.sh --packages`). |
 | `... has no HIP target (AMD GPUs)` | intel/llvm was built before ROCm was installed. Let setup build it again when it asks, or run `python3 tools/intel_llvm_build.py --rebuild`. |
-| `no progress for 60 s ... reading the prompt` on Linux, and the stall report says `threads waiting on the disk (state D): 16 ...` | The engine waits for the drive, not a deadlock: the n-gram table is read at random (`--ple-io direct`), which a rotational disk cannot keep up with (upstream #605). The engine warns at start when the table is on one; `--ple-io ram` (it needs RAM for the table) or the model on an SSD fixes it. Setup adds `--ple-io ram` itself on a rotational disk when the RAM holds the table. |
+| `no progress for 60 s ... reading the prompt` on Linux, and the stall report says `threads waiting on the disk (state D): 16 ...` | The engine waits for the drive, not a deadlock: the n-gram table is read at random (`--ple-io direct`), which a rotational disk cannot keep up with (upstream #605). The engine warns at start when the table is on one; `--ple-io ram` (it needs RAM for the table) or the model on an SSD fixes it. Setup adds `--ple-io ram` itself on a rotational disk when the RAM holds the table (on Linux on an SSD too, when the RAM holds the model, the table and 16 GB more). |
 | `the SYCL runtime of ... lists no GPU` | The GPU's Level Zero driver (`libze-intel-gpu1`, Intel's compute-runtime) is missing or too old for it; install a newer one ([BUILD.md](BUILD.md#packages)). |
 | `... gives this GPU no XMX` | The compiler gives the GPU no XMX; choose from setup's options. It runs without XMX, with prefill taking about 1.6 times as long ([BUILD.md](BUILD.md#the-sycl-compiler)). |
 | `no SYCL compiler for the engine` | There is no SYCL compiler: install the distribution's DPC++, or pass `--intel-llvm-build`. |
-| `alloc_device: ... refused` at start | Happens rarely on the B70 (3 in about 120 starts); starting again usually works ([XE.md](XE.md#the-output-heads-vram-refusal)). |
+| `alloc_device: ... refused` at start | A driver state that refuses device allocations while the VRAM is free (Intel's [compute-runtime #916](https://github.com/intel/compute-runtime/issues/916); compute-runtime 26.22 works around an xe kernel bug fixed in Linux 7.1 - on XeStrata's side, [#34](https://github.com/MistVVK/XeStrata/issues/34). On the B70 it happened 3 times in about 120 starts). The engine retries the allocation in pieces and starts with what it gets. While the card is in that state, only a reboot brings it back. On Ubuntu 24.04/26.04, update the driver from the [graphics PPA](BUILD.md#packages) ([XE.md](XE.md#the-output-heads-vram-refusal)). |
+| The start log says `IGC's GEP simplification is off` | Intel Graphics Compiler (IGC) 2.27 to 2.30 (Ubuntu 26.04's 2.28.4 among them) miscompile some reads for Xe2 and later GPUs (the Arc B-series, Lunar Lake, Panther Lake): the GPU reads past its buffer and stops, or the answers are wrong. On Linux, when the installed IGC is one of those and there is an Xe2 or later GPU, the engine sets `IGC_EnableGEPSimplification=0` when it starts, which turns that optimization off (on the B70 the decode of a 1K prompt is 5 to 10% slower, 32K the same). A value you set yourself, `IGC_EnableGEPSimplification=1`, is kept. For full speed, use Fedora 44 (its IGC is 2.32 or later), or [install with Podman](../README.md#podman) (Fedora 44 inside). On Ubuntu 24.04/26.04 there is also the way of moving to the HWE kernel with the [graphics PPA](BUILD.md#packages) (IGC alone cannot be updated: the PPA installs the driver with it, and that driver is for the HWE kernel). |
 | Python or the build tools could not be installed | Install what it names, then run it again. Everything already done is kept and skipped. |
 | `port 8095 is already in use` | XeStrata is already running (look for its window), or another program uses the port: `./setup.sh --port 8081`. |
 | The first start takes minutes | It is reading 23–50 GB into RAM; the second start is faster while the files are in the OS cache. |
@@ -1472,7 +1554,7 @@ Strata's design, measurements and bottlenecks are in upstream's paper, **[docs/p
 
 The whole of XeStrata is under the [LGPL-3.0-or-later](../COPYING.LESSER).
 The code from Strata and from ggml / llama.cpp (both MIT) is part of it under the LGPL too; their copyright and permission notices are in [NOTICE](../NOTICE).
-The exceptions stay under their own licenses: the patches to intel/llvm, the changes to oneMath, `ggml-common.h`, Outfit and `third_party/nonfree/` (below).
+The exceptions stay under their own licenses: the patches to intel/llvm, the changes to oneMath, the copies in `third_party/main/` (`ggml-common.h`, `ggml-common-tq.h`, `quantscope.py`, `stb_image.h`, Outfit) and the patch to AOTriton, and `third_party/nonfree/` (below and [third_party/main/README.md](../third_party/main/README.md)).
 The model files are not part of it; their licenses apply to them (below).
 
 - **The original software**: [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors.
@@ -1481,9 +1563,11 @@ The model files are not part of it; their licenses apply to them (below).
   The Coder: [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)
   (Apache-2.0 per its card); its support in Strata came from @pjgmobile's PR #54.
   Swift 1.5: [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI.
-  UD-IQ4_XS and UD-Q4_K_XL: [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) by Unsloth.
-  Gyro-S and Gyro-M: [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) by agentionai.
-  Their format (`third_party/main/ggml-tq/`, MIT) and the CPU and GPU kernels are Laurent Zuijdwijk's, for agentionai's llama.cpp fork and Strata, ported by XeStrata.
+  UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0: [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) by Unsloth.
+  Gyro: [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) by agentionai.
+  The abliterated versions: [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF) by huihui-ai.
+  The other models: [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones pfeifferj's [reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp, [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth).
+  The image models: Qwen's Qwen-Image-2.1 and Qwen-Image-2.1-Turbo (GGUFs by Unsloth), Microsoft's Mage-Flow (Comfy-Org's safetensors), and the text encoders, Qwen3-VL (Unsloth's, AtomicChat's, and huihui-ai's by noctrex) ([IMAGE](IMAGE.md#licenses)).
   Their licenses apply to the weights.
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the i-quant formats, the GPU dot products and dequantizers transcribed in `src/kernels/xe/`,
   the CPU backend linked for the i-quant experts, the `mtmd` library and the GPU backends (Vulkan, SYCL) behind the image encoder (`tools/vision/`),
@@ -1493,7 +1577,9 @@ The model files are not part of it; their licenses apply to them (below).
 - **[intel/llvm](https://github.com/intel/llvm)**'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib-llvm modes' compiler and SYCL runtime.
   It is not in the repository: `tools/intel_llvm_build.py` fetches the release and builds it,
   with XeStrata's fixes from `third_party/main/intel-llvm/patches/`, under intel/llvm's license. See `third_party/main/intel-llvm/LICENSE.TXT`.
-- **[ROCm's device libraries](https://github.com/ROCm/llvm-project/tree/rocm-7.2.4/amd/device-libs)** (University of Illinois/NCSA, by AMD): ocml, ockl and the others, which the code for AMD GPUs links.
+- **The image engine's parts**: for the attention, [oneDNN](https://github.com/uxlfoundation/oneDNN) (Apache-2.0, Intel GPUs), [AOTriton](https://github.com/ROCm/aotriton) (MIT, AMD GPUs; its kernels can carry parts of aiter (MIT), FlyDSL (Apache-2.0) and Triton (MIT)) and [cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend) (Apache-2.0, parts MIT, NVIDIA GPUs in the contrib-llvm mode); for reading reference images, [stb_image](https://github.com/nothings/stb) (MIT or the Unlicense). On Windows AOTriton links [XZ Utils](https://tukaani.org/xz/)' liblzma (0BSD).
+- **[quantscope](https://github.com/1872183316/quantscope)** (MIT or Apache-2.0): what `setup.py --inspect` reads a GGUF's contents with.
+- **[ROCm's device libraries](https://github.com/ROCm/llvm-project/tree/f30ae3e6b680ad23dcf522e668c6d4c5c90838d0/amd/device-libs)** (University of Illinois/NCSA, by AMD): ocml, ockl and the others, which the code for AMD GPUs links.
   They are not in the repository: `tools/intel_llvm_build.py` fetches them from a release of ROCm's llvm-project and builds them with intel/llvm. See `third_party/main/rocm-device-libs/LICENSE.TXT`.
   The target features their build is given are transcribed from the `debian/rules` of Debian's [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) package (Expat; its authors in NOTICE).
 - **Ideas** (references in the paper) from:

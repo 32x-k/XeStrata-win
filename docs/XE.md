@@ -10,7 +10,7 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md); how to build it, what setup does and the packages it needs, in [BUILD](BUILD.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata xe0.1.45-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.1.45-1; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
+XeStrata xe0.2.2-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.2-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
@@ -29,6 +29,80 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_VRAM_LIMIT_MIB` caps the VRAM the engine sees, `STRATA_MAX_ALLOC_MIB` the largest allocation it assumes, and
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
+
+## Integration through Strata 0.2.2
+
+The changes of upstream Strata 0.2.1.1 to 0.2.2 (`011c9e60`) are carried into Xe.
+Most of upstream's changes in this range are for the app, the terminal, the Mac and upstream's `sycl/`, and are not carried in (for the same reasons as 0.2.0-beta).
+
+Carried in:
+
+- The CPU pool: the start-up says where its workers sit, `--pool-cores` (experimental) places them, and the engine's threads carry names; serve passes the setting `pool_cores` to the engine.
+- Speculative decoding: the rule for when it starts is gathered in `spec_loop_runs`, and `STRATA_SPEC_WATCH` watches for stalls.
+- serve: when a short remaining prefill window gives non-finite logits, the next request reads the whole prompt at once; an engine that cannot start gets a 503 with its reason instead of a dropped connection; `"api_key": "none"` and `--no-api-key` choose no key.
+- serve: Anthropic's usage reports the tokens kept for the next request as `cache_creation_input_tokens`; llama.cpp's `thinking_budget_tokens` is read as the thinking limit too; a tool call whose fence is one token off is read as a call, and a call of an undeclared tool comes back as text; the done line's speed comes from the engine's decode time.
+- setup: a download whose SHA-256 does not match is not deleted, only the differing pieces are fetched again, and the check of a large file shows its progress; the user's files under `--gguf-dir` are never deleted; free space stops the install only when it cannot fit; folders in the trash are not remembered as an earlier install.
+- iq_pack: an experts.bin write that stopped halfway keeps the finished layers and goes on from the next.
+
+Fixed on XeStrata's side during this integration:
+
+- Regressions with intel/llvm v7.2.0: the XMX product and the grouped product lose `joint_matrix_prefetch` (IGC 2.28 cannot handle v7.2.0's prefetch; the B70's 1K prefill goes from 468 to 751 tok/s); AMD's libspirv gains GroupNonUniform's shuffles (the patch `hip-group-shuffle`); iq_mmq declares its work-group size by attribute, which ends the register spills on AMD (the RX 9060 XT's 32K prefill goes from 1,113 to 1,250 tok/s).
+- Speculative decoding: the round that builds a window's graph is left out of the measure the window sizes are chosen by; the time of a size not yet measured is estimated from the nearest smaller measured size; Gyro's trellis layers do not cut a window where the VRAM swaps experts (Gyro-M's decode on the B70 at 1K goes from 48.0 to 54.2 tok/s); a window size without a graph shrinks to one that fits when the VRAM is short (the B70 at 262K no longer fails).
+
+Compared with upstream v0.2.2 on the three makers' GPUs (generate with IQ3_XXS and Gyro-M on all three, Q2_0, IQ2_XS, IQ3_S and UD-Q4_K_XL on the B70 and the RTX 4070; IQ3_XXS's serve and everyday use).
+In IQ3_XXS's generate, the B70 is 1.8 to 3.0 times as fast as upstream's `sycl/` build in prefill and 12 to 61% faster in decode.
+The RTX 4070 is 1.02 to 1.16 times as fast in prefill and 25 to 37% faster in decode; the RX 9060 XT is 2.1 to 2.7 times as fast in prefill and 2 to 7% faster in decode.
+In Gyro-M's generate, the B70 is 1.3 to 2.0 times as fast in prefill and 8 to 11% faster in decode; the RX 9060 XT is 1.3 to 2.3 times as fast in prefill and 1 to 2% faster in decode.
+The RTX 4070 is 1.08 to 1.12 times as fast in prefill; its decode is even at 32K, and at 1K 3% slower when it follows upstream's text, 17% faster on XeStrata's own text.
+
+Not carried in: the CPU pool split by NUMA node (XeStrata's pool has no groundwork for nodes), the app and the terminal, the Mac, upstream's `sycl/`,
+CUDA's Gyro decode with the trellis codebook in shared memory and its Pascal kernels (tried in XeStrata's SYCL kernels: 17 to 19% slower on the RX 9060 XT, and no faster on the B70 or the RTX 4070), and HIP's fixes for gfx11 and gfx1151 alone.
+
+## Integration through Strata 0.2.1.1
+
+The changes of upstream Strata 0.2.0-beta to 0.2.1.1 (`9ae93f7b`) are carried into Xe.
+Most of upstream's changes in this range are for the new app, the terminal, Docker and the Mac, and are not carried in (for the same reasons as 0.2.0-beta).
+
+Carried in:
+
+- setup: Meteor Lake's and Arrow Lake-H's LP-E cores count as E-cores; the low-RAM fit counts the draft layer's VRAM (about 1 GB).
+- Downloads: 16 connections by default, four neighbouring pieces per request, a 0-0 range asked of a server whose HEAD gives no length; the MTP fetch goes on over a flaky link and stops with setup.
+- setup: a new `--data-dir` moves no model files by itself and keeps finding the old place (`--move-data`, `--set-default-data-dir`).
+- serve: an engine ended by signal 9 names a finite RLIMIT_RTTIME (PipeWire without rtkit) as the cause.
+- Windows: `strata.exe`, `strata-image.exe` and `strata-device.exe` carry a UTF-8 manifest, so paths with letters outside the ANSI code page arrive intact.
+- `--batch`: a layer split over two NVIDIA GPUs runs the default as one serial group (+12 to 18% in upstream's measurement).
+
+Compared with upstream v0.2.1.1 on the RX 9060 XT (IQ3_XXS's generate): 2.1 to 2.7 times as fast in prefill, 3 to 7% faster in decode.
+Upstream's engine changes do not touch the other GPUs' measured paths (one GPU, the experts in RAM), so the B70 and the RTX 4070 keep the 0.2.0-beta comparison.
+
+Not carried in: the app and the terminal, the Docker distribution, the Mac, upstream's `sycl/`, HIP's integrated-GPU defaults, hipBLASLt tables and the order the GPU queues are opened in (XeStrata's RX 9060 XT prompts stay within 1.5% from start to start: the two speeds upstream fixed do not show), the experts.bin packs' I/O read-ahead and file tier (XeStrata lacks their groundwork), and the Intel GPU picture reader (XeStrata has its Vulkan reader).
+
+## Integration through Strata 0.2.0-beta
+
+The changes of upstream Strata 0.1.45 to 0.2.0-beta (`3d1fb480`) are carried into Xe.
+When the release 0.2.0 is out, what it adds is carried in as well.
+
+The main ones:
+
+- Gyro-S and Gyro-M (agentionai): the trellis quantizations (TQ2_T, TQK6, TQK7) and the experts' Hadamard rotation, computed on the CPU (AVX2, AVX-512) and the GPU (decode and prompt), and listed by setup. The pack version is xs2.
+- setup: the model files it downloads are pinned by size and SHA-256; large files are downloaded over several connections; the build tools (cmake, ninja) are apart from the run-time requirements; `--ple-io ram` also on an SSD when the RAM has room; pictures on by default for the models that read them.
+- serve: a `max_tokens` that does not fit in the context is shortened to the room left instead of answered with 400 (`--no-fit-max-tokens` refuses it as before).
+- The CPU pool's default workers are at most 32 and the container's CPU quota; the cgroup RAM check counts the clean page cache as reclaimable.
+- The adaptive tier's swapped-in experts are used from the second window by default (`STRATA_ADAPT_LAG=2`, decode +8.6% on the RTX 4070).
+- The picture reader (strata-vision) reads only the text model's vocabulary and header (so a file of Gyro's types opens).
+
+Fixed on XeStrata's side meanwhile:
+
+- The windows are cut at the positions of the VRAM experts' swaps only for a model with a layer that the CPU and the GPU round differently (`STRATA_ADAPT_CUT=0|1`). Every layer of Qwen3.8's four files gives the same bits on the CPU and the GPU, so their windows are not cut: on one text, decode 59.3 -> 61.3 tok/s on the RTX 4070 and 80.5 -> 86.9 on the B70.
+
+Compared with upstream v0.2.0-beta on the three makers' GPUs (generate on five model files, serve, everyday use, image generation).
+In IQ3_XXS's generate, the B70 is 1.7 to 3.0 times as fast in prefill as upstream's `sycl/` port and 18 to 38% faster in decode;
+the RTX 4070 1.02 to 1.14 times in prefill and 23 to 34% faster in decode; the RX 9060 XT 2.1 to 2.7 times in prefill and equal to 8% faster in decode.
+Image generation (1024x1024, 8 steps) takes XeStrata 7.6 s on the B70, 13.9 s on the RTX 4070 and 22.5 s on the RX 9060 XT, upstream 52.0 s, 26.6 s and 73.7 s.
+
+Not carried in: upstream's new app (`apps/`) and terminal (`strata_cli`, `strata_control`), the changes to distribution (installers, signed delivery, engine part updates), NVFP4, upstream's `sycl/`,
+the CUDA- and HIP-only speed paths (the sm_120 switches and others), `--kv-grow` on HIP's virtual memory (intel/llvm's HIP adapter lacks the virtual memory extension),
+the low-RAM form that reads the GGUF in place (experts used without a copy, I/O read-ahead), and upstream's test tools and records.
 
 ## Integration through Strata 0.1.45
 
@@ -594,7 +668,7 @@ XeStrata uses them as they are; only some have been tuned on Xe.
 | --- | --- | --- |
 | `src/program/generate.cpp` | Native missed-expert PCIe share 0.55 (canonical 0.2), scaled by min(1, link GB/s / 20), the link read as the best of four 256 MiB bursts | On the new development machine 0.15 was 2–4% faster and every larger share slower; the measurement does not support 0.55 |
 | `tools/calibrate.py` | Baseline Ryzen 5 7600 + RTX 5070; PCIe candidates 0/0.2/0.35/0.55/0.75, draft floor 0.3/0.5/0.7, worker candidates; interleaved confirmation requires >3% gain | Candidates and baseline unchanged from upstream |
-| `setup.py` | `--spec 4`, `--spec-min-p 0.5`, `--expert-cache auto`, `--prefill auto` | `--prefill auto` now picks chunks up to 32768 tokens; a chunk that does not fit with the default ring takes a 96-slot ring (upstream #583; IQ3_S on the B70 limited to 8 GB: 8K and 32K prompts 1.5-2x); the rest as upstream |
+| `setup.py` | `--spec 4`, `--spec-min-p 0.5`, `--expert-cache auto`, `--prefill auto` | `--prefill auto` now picks chunks up to 32768 tokens; a chunk that does not fit with the default ring takes a 96-slot ring (upstream #583; IQ3_S on the B70 limited to 8 GB: 8K and 32K prompts 1.5-2x); one that still does not fit is planned again with the int8 products' group scratch (GU, H, Hq) sized for one group's rows instead of the chunk's (RTX 4070, IQ3_XXS 32K: the chunk 8192 -> 16384, prefill 1,194 -> 2,058 tok/s; a group's tile shape rounds its sums, so the answer can differ a little from the uncapped run's); the window's size comes from the output per ms at the measured window times and the corrected probabilities, not from the `--spec-min-p` floor (`--spec-window auto`, [DETAILS](DETAILS.md#tuning-for-your-pc---calibrate)); the rest as upstream |
 | `src/program/generate.cpp` | 700 MiB VRAM reserve (down to 300 on a small card); prefill borrowing and chunk selection; cache adaptation every 4 rounds and up to 96 swaps | As upstream |
 | `src/program/generate.cpp` and the CPU pool | Physical-core worker heuristic plus host worker; cache-hit pokes and graph/doorbell scheduling | The worker count was measured on the new machine: 7 to 19 workers decode equally fast, so the default stays |
 | `src/kernels/cpu/iq_avx512.cpp` | Software prefetch distance and AVX-512-specific tuning | Not measured: the development machine has no AVX-512 |

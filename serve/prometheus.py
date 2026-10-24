@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """GET /metrics in the Prometheus text format, with vLLM's metric names, so the dashboards and alerts written for a
 vLLM server read a Strata server unchanged.  Everything comes from the server's own record (Service.metrics(), the
 same dict the JSON /metrics returns) plus three latency histograms observed when a request finishes.
@@ -142,7 +143,7 @@ def strata(m: dict, out: list, lab: str):
            round((totals.get("prompt_ms") or 0) / 1000, 3))
     metric("totals_decode_seconds_total", "counter", "Time spent generating (totals.decode_ms).",
            round((totals.get("decode_ms") or 0) / 1000, 3))
-    last = reqs[0] if reqs else {}
+    last: dict = next((r for r in reqs if r.get("kind") != "image"), {})   # the chat's last request (image jobs aside)
     metric("last_hit_rate", "gauge", "The last request's expert cache hit rate (requests[0].hit_rate).",
            last.get("hit_rate"))
     metric("last_decode_tok_s", "gauge", "The last request's decode rate (requests[0].decode_tok_s).",

@@ -24,7 +24,7 @@ struct DeviceInfo {
     std::string name, driver_version, platform_version;
     std::string backend;            ///< "Level Zero", "CUDA" or "HIP"
     std::string pci;                ///< its PCI address (domain:bus:device.function, lower case), "?" if not reported
-    std::string arch;               ///< HIP: the gfx name it reports, without its features; empty on other backends
+    std::string arch;               ///< an AMD GPU's ISA as its HIP runtime names it (gfx1200), empty elsewhere
     int backend_ordinal = -1;       ///< its number among its backend's GPUs (ONEAPI_DEVICE_SELECTOR's, HIP's)
     uint32_t vendor_id = 0, device_id = 0;   ///< device_id: Intel GPUs only (0 elsewhere)
     uint64_t total_bytes = 0, free_bytes = 0;
@@ -43,8 +43,9 @@ DeviceInfo device_info(int ordinal = 0);
 /// STRATA_MAX_ALLOC_MIB the largest allocation it assumes.  0 when unset.
 uint64_t vram_limit_bytes();
 uint64_t max_alloc_limit_bytes();
-/// `free` and `total` as the engine sees them under STRATA_VRAM_LIMIT_MIB.
-void apply_vram_limit(uint64_t& free, uint64_t& total);
+/// `free` and `total` as the engine sees them under STRATA_VRAM_LIMIT_MIB.  `held`: the bytes this process holds on the
+/// device, when the device's report may not show them yet.
+void apply_vram_limit(uint64_t& free, uint64_t& total, uint64_t held = 0);
 /// An integrated GPU's free memory: at most what Linux can give back, less STRATA_UMA_HEADROOM_GIB (default 6).
 void apply_uma_limit(uint64_t& free);
 /// The device's largest allocation, under STRATA_MAX_ALLOC_MIB.

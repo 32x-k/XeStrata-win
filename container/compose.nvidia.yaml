@@ -7,3 +7,7 @@ services:
   xestrata:
     devices:
       - nvidia.com/gpu=all
+    # the host's /dev/dri/by-path, whole: CDI's hook makes the folder with the NVIDIA GPU's links alone, and Intel's
+    # driver, which then lists the GPUs from it, finds none of Intel's
+    volumes:
+      - /dev/dri/by-path:/dev/dri/by-path:ro

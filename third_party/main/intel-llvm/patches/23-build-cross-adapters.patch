@@ -1,0 +1,50 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+build-cross-adapters: a fix to intel/llvm v7.2.0, applied by tools/intel_llvm_build.py.
+
+Since v7.2.0 the SYCL build refuses the CUDA and HIP adapters unless libclc is built as an LLVM runtime.
+A cross build for Windows (tools/intel_llvm_build.py --windows) builds the runtime alone: it takes the
+device tools from the contrib toolchain (LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR), whose libspirv the device
+code links, and builds no libclc, so its configuration failed.  With the tools given, the adapters are
+configured without libclc; a build without them is unchanged.
+---
+diff --git a/sycl/CMakeLists.txt b/sycl/CMakeLists.txt
+index c4d08a4808..def841bb94 100644
+--- a/sycl/CMakeLists.txt
++++ b/sycl/CMakeLists.txt
+@@ -571,6 +571,15 @@ if("lld" IN_LIST LLVM_ENABLE_PROJECTS)
+ endif()
+ 
+ set(libclc_enabled FALSE)
++# Modified 2026 by MistVVK and the XeStrata contributors: with
++# LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR the device tools are given, so a build of the
++# runtime alone (a cross build for Windows) builds the adapters without libclc: the
++# libspirv their device code links comes with the toolchain that gave the tools
++# (build-cross-adapters).
++set(libclc_given FALSE)
++if(EXISTS "${LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR}")
++  set(libclc_given TRUE)
++endif()
+ foreach(target IN LISTS LLVM_RUNTIME_TARGETS)
+   if("libclc" IN_LIST RUNTIMES_${target}_LLVM_ENABLE_RUNTIMES)
+     set(libclc_enabled TRUE)
+@@ -585,7 +594,7 @@ endif()
+ 
+ if("cuda" IN_LIST SYCL_ENABLE_BACKENDS)
+   # Ensure that libclc is enabled.
+-  if(NOT libclc_enabled)
++  if(NOT libclc_enabled AND NOT libclc_given)
+     message(FATAL_ERROR
+       "CUDA support requires adding \"libclc\" to the CMake argument \"LLVM_ENABLE_PROJECTS\"")
+   endif()
+@@ -596,7 +605,7 @@ endif()
+ 
+ if("hip" IN_LIST SYCL_ENABLE_BACKENDS)
+   # Ensure that libclc is enabled.
+-  if(NOT libclc_enabled)
++  if(NOT libclc_enabled AND NOT libclc_given)
+     message(FATAL_ERROR
+       "HIP support requires adding \"libclc\" to the CMake argument \"LLVM_ENABLE_PROJECTS\"")
+   endif()

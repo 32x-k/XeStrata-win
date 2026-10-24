@@ -2,7 +2,7 @@ SPDX-FileCopyrightText: The LLVM project contributors
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-l0-static-graph: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+l0-static-graph: a fix to intel/llvm v7.2.0, applied by tools/intel_llvm_build.py.
 
 Where the system's Level Zero is older than 1.32 (Ubuntu 26.04's libze 1.28, where the packages are
 built), the Level Zero adapters link the loader statically, and the static loader forwards the stable
@@ -17,18 +17,18 @@ loader the graph functions are used only when the system's loader has them, as t
 them (libze_loader.so.1, ze_loader.dll).
 ---
 diff --git a/unified-runtime/source/adapters/level_zero/platform.cpp b/unified-runtime/source/adapters/level_zero/platform.cpp
-index 13fc407cf..5bb729805 100644
+index 0550345b8b..1c3c4dd3ce 100644
 --- a/unified-runtime/source/adapters/level_zero/platform.cpp
 +++ b/unified-runtime/source/adapters/level_zero/platform.cpp
-@@ -5,6 +5,7 @@
- // Part of the Unified-Runtime Project, under the Apache License v2.0 with LLVM
- // Exceptions. See LICENSE.TXT
+@@ -4,6 +4,7 @@
+ // Part of the LLVM Project, under the Apache License v2.0 with LLVM
+ // Exceptions. See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 +// Modified 2026 by MistVVK and the XeStrata contributors: the static loader's graph functions only when the system's loader has them (l0-static-graph)
  //
  //===----------------------------------------------------------------------===//
  
-@@ -757,6 +758,42 @@ ur_result_t ur_platform_handle_t_::initialize() {
+@@ -768,6 +769,42 @@ ur_result_t ur_platform_handle_t_::initialize() {
            (ZeGraphExt.zeGraphDumpContentsExp != nullptr) &&
            (ZeGraphExt.zeGraphDestroyExp != nullptr) &&
            (ZeGraphExt.zeExecutableGraphDestroyExp != nullptr);

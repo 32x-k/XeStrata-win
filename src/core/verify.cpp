@@ -443,6 +443,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
 
     // ---- the device arena: the same sequence counted, then carved
+    // APR: the rotated copy of the expert input (nat_xr_, T x N floats) only where a layer's gate/up is
+    // Hadamard-folded; its one reader is that layer's had_gu branch of the expert input in pre()
+    bool had_gu_any = false;
+    {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l) had_gu_any = had_gu_any || lay.fmt[l].had_gu;
+    }
     auto carve = [&](Bump& b) {
         tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
         pos_ = b.take<int32_t>(T * (NH + NKV + IQ)); commit_ = b.take<int32_t>(2 + T);
@@ -468,7 +475,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
-        nat_xr_ = b.take<float>(strata::kernels::cpu::hadamard_spec().any() ? T * N : 0);
+        nat_xr_ = had_gu_any ? b.take<float>(T * N) : nullptr;
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
             strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
             strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
@@ -507,9 +514,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const int32_t one = 1;
         if (!strata::gpu::copy(one_, &one, sizeof one)) { err = "verify: the arena could not be set"; return false; }
     }
-    if (strata::kernels::cpu::hadamard_spec().any()) {   // Gyro (hadamard.txt): the sign vectors on this device
+    try {   // APR (prism.hadamard, hadamard.txt): the sign vectors on this device, before any graph is recorded
         had_sx_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) g.n_embd), (int) g.n_embd);
         had_sh_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) g.n_ff), (int) g.n_ff);
+    } catch (const std::exception& e) {
+        err = std::string("verify: ") + e.what();
+        return false;
     }
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
@@ -982,8 +992,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 else for (int t = tb; t < te; ++t)
                     bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
                 stamp(l, 7, grp);
-                native_mmvq(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
-                native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
+                // K and V in one launch where the pair's layout applies (each row's bits unchanged; the GDN layers' qkv
+                // and gate are of different types in the packs, so they stay two launches)
+                if (wk->native_type != wv->native_type ||
+                    !native_mmvq_pair(wk->native_type, wk->native_data, wv->native_data, xq_, kcur_ + tb * NKV * HD,
+                                      vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs)) {
+                    native_mmvq(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
+                    native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
+                }
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
@@ -1159,6 +1175,13 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         }();
         bool g_ready = false;   // the shared expert's raw gates came with the router's launch
         bool qdedup = false;    // the experts' q8_1 image of the input was made before the shared expert
+        // STRATA_ROUTE_PRIOR=lambda (upstream 2de9ae06, opt-in, changes the output): the top-10 picked again with a
+        // logit bonus for the resident experts; the weights stay the router's (router.cpp)
+        static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::strtod(v, nullptr) : 0.0f; }();
+        // the top-10 and the doorbell in one launch where nothing changes the routing between them (48 nodes fewer a
+        // window; the plan's kernel runs after the doorbell, which the host does not read).  STRATA_ROUTER_PUBLISH=0: apart
+        static const bool router_publish = [] { const char* v = std::getenv("STRATA_ROUTER_PUBLISH"); return v == nullptr || *v != '0'; }();
+        bool published = false;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 // the shared expert's scalar gate as one more work-group of the router's launch (upstream b08cf3e1)
@@ -1170,7 +1193,12 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 if (!g_ready)
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE,
                                               N, NE, n, cs);
-                native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+                if (router_publish && !recording_res_ && route_prior <= 0.0f && route_resident_cfg().margin <= 0.0f) {
+                    native_router_top10_publish(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm, (int64_t) n * N,
+                                                m_x_ + tb * N, m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+                    published = true;
+                } else
+                    native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
         } else
         for (int t = tb; t < te; ++t) {
@@ -1178,9 +1206,6 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        // STRATA_ROUTE_PRIOR=lambda (upstream 2de9ae06, opt-in, changes the output): the top-10 picked again with a
-        // logit bonus for the resident experts; the weights stay the router's (router.cpp)
-        static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::strtod(v, nullptr) : 0.0f; }();
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
             try {
                 route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
@@ -1199,7 +1224,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
                           (uint32_t) ((l - lb_) * G + grp + 1), cs);
-        if (!recording_res_)   // the resident graph asks the host nothing
+        if (!recording_res_ && !published)   // the resident graph asks the host nothing
             doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                              m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
         if (route_rec_ && !batch_rec_)   // add_routing's ids: every layer's, also where the host is not asked
@@ -1245,10 +1270,10 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             }
         }
         if (strata::kernels::cpu::expert_layout().native) {
-            // Gyro: Hadamard-folded gate/up take H (s * x) (upstream fbf045eb); xm itself stays as it is for the shared
-            // expert above and the doorbell copy for the CPU pool, which rotates its own in native_quant_act.  The q8_1
-            // image of xm that STRATA_VERIFY_QDEDUP may already have written is of the unrotated input, so a folded
-            // layer always writes it again from the rotated rows (on cs, after the shared expert has read it).
+            // APR: Hadamard-folded gate/up take H (s * x); xm itself stays as it is (the shared expert above and the
+            // doorbell copy for the CPU pool, which rotates its own in native_quant_act).  The q8_1 image qdedup wrote
+            // for the shared expert is of the unrotated input, so a folded layer rewrites it from the rotated rows
+            // (the same stream, after the shared expert has read it).
             const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
             if (f.had_gu) {
                 hadamard_rows(xm, nat_xr_ + (size_t) tb * N, n, N, f.had_block, had_sx_, cs);
@@ -1302,7 +1327,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
                 NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
-                if (f.had_d) { L.had_block = f.had_block; L.d_signs = had_sh_; }   // Gyro: h is rotated in there
+                if (f.had_d) { L.had_block = f.had_block; L.d_signs = had_sh_; }   // APR: h is rotated in there
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
                                       nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs, grid_groups);
             } else {
@@ -1506,12 +1531,21 @@ std::string Verifier::profile_report() {
     return out;
 }
 
+bool Verifier::window_fits(int T) const {
+    if (T < 1 || T > max_t_) return false;
+    if (exec_[T] != nullptr || !segs_[T].empty() || exec_res_[T] != nullptr || graph_bytes_max_ == 0) return true;
+    size_t free_b = 0, total_b = 0;
+    if (!strata::gpu::mem_info(&free_b, &total_b)) return true;
+    return free_b >= graph_bytes_max_ / 2 * 3 + ((size_t) 64 << 20);
+}
+
 bool Verifier::capture(int T, std::string& err) {
     if (exec_[T] != nullptr || !segs_[T].empty()) return true;
+    size_t free0 = 0;
     {   // said before the capture: a process that exits inside it leaves this line as the trace (upstream 0f931943)
-        size_t free_b = 0, total_b = 0;
-        if (strata::gpu::mem_info(&free_b, &total_b))
-            std::fprintf(stderr, "strata verify: capturing the %d-token window (%zu MiB of VRAM free)\n", T, free_b >> 20);
+        size_t total_b = 0;
+        if (strata::gpu::mem_info(&free0, &total_b))
+            std::fprintf(stderr, "strata verify: capturing the %d-token window (%zu MiB of VRAM free)\n", T, free0 >> 20);
     }
     if (!strata::gpu::begin_capture(cs_)) {
         err = "verify: begin capture failed";
@@ -1546,6 +1580,7 @@ bool Verifier::capture(int T, std::string& err) {
     const bool synced = strata::gpu::stream_sync(cs_);
     std::fprintf(stderr, "strata verify: captured the %d-token window (sync %s)\n", T,
                  synced ? "ok" : strata::gpu::last_error());
+    graph_free0_ = free0;   // what the graph takes shows at its first run, measured once run() has the window's tokens
     return true;
 }
 
@@ -1720,6 +1755,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return false;
     }
     const bool res = res_graph_ && all_resident();
+    captured_last_ = res ? exec_res_[T] == nullptr : exec_[T] == nullptr && segs_[T].empty();
     if (!(res ? capture_res(T, err) : capture(T, err)) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
@@ -1917,6 +1953,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
     }
     VDBG("window done\n");
+    if (graph_free0_ > 0) {
+        size_t free1 = 0, total_b = 0;
+        if (strata::gpu::mem_info(&free1, &total_b) && free1 < graph_free0_)
+            graph_bytes_max_ = std::max(graph_bytes_max_, graph_free0_ - free1);
+        graph_free0_ = 0;
+    }
     ++windows;
     progress_at("decode");
     progress_beat();

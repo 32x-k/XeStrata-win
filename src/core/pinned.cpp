@@ -577,10 +577,12 @@ PinnedArena::~PinnedArena() {
             r.finish();   // no copy may still read the mapping
             for (void* p : o.second) sycl::ext::oneapi::experimental::release_from_device_copy(p, r.context());
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "Xe runtime: releasing the expert arena on GPU %d failed: %s; terminating\n", o.first,
-                         e.what());
+            // The driver can refuse the release itself when it is in the state that refused the allocations
+            // (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY, the B70's xe driver, 2026-10-22).  The exit goes on: the
+            // process's end reclaims the mapping with the driver, and a stop here would lose that message.
+            std::fprintf(stderr, "Xe runtime: releasing the expert arena on GPU %d failed: %s; the exit continues "
+                                 "(the driver reclaims it with the process)\n", o.first, e.what());
             std::fflush(stderr);
-            std::_Exit(1);
         }
     }
     if (!layer_base.empty()) {
@@ -593,9 +595,11 @@ PinnedArena::~PinnedArena() {
         runtime.finish();   // no copy may still read the mapping
         for (void* r : reg_) sycl::ext::oneapi::experimental::release_from_device_copy(r, runtime.context());
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "Xe runtime: releasing the expert arena failed: %s; terminating\n", e.what());
+        // as above: the driver can refuse the release in the state that refused the allocations - report it and
+        // let the exit finish, the process's end reclaims the mapping
+        std::fprintf(stderr, "Xe runtime: releasing the expert arena failed: %s; the exit continues (the driver "
+                             "reclaims it with the process)\n", e.what());
         std::fflush(stderr);
-        std::_Exit(1);
     }
     unmap(file_view);
 }

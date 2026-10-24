@@ -11,7 +11,7 @@ tools/bench_core.py's (ab_serve), which setup's --bench makes too.
       python .claude/skills/upstream-sync/scripts/bench_serve.py OUT GPU [--dry-run]
 
 XE, UP, XE_PROFILE, UP_PROFILE, DATA, IDS, CONFIG, PACK, NATIVE, PLE, EXTRA and TIERS (default "64k 32k 1k") as for
-bench_generate.py; a wrapper command must pass stdin through (docker run -i).  MODES (default "greedy t07"): greedy,
+bench_generate.py; a wrapper command must pass stdin through (podman run -i).  MODES (default "greedy t07"): greedy,
 and tNN = temperature NN / 10 (t07 = 0.7, t10 = 1.0), top_p 0.95, top_k 20, a seed per round.  ROUNDS (default 3):
 runs per arm, tier and mode, each a new process, the arms alternating; one discarded warm-up per arm first.  No
 --spec-follow: serve has none, so each engine writes its own text and the drafts it accepts count in its output

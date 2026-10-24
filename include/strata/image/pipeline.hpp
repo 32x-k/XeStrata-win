@@ -1,0 +1,90 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// include/strata/image/pipeline.hpp - what strata-image asks of an image model's pipeline (Qwen-Image-2.1's QiPipeline,
+// Mage-Flow's MfPipeline): its VRAM budget, what an image needs, the image itself, and letting its cache go.
+#pragma once
+
+#include <cstdint>
+#include <functional>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace strata::image {
+
+/// A request stopped on its caller's word (the step callback said so).
+struct QiStopped : std::runtime_error {
+    QiStopped() : std::runtime_error("image engine: stopped") {}
+};
+
+/// An edit's reference image: RGBA8 [height][width][4] as read (qi_image_io).
+struct QiRef {
+    std::vector<uint8_t> rgba;
+    int64_t width = 0, height = 0;
+};
+
+struct QiRequest {
+    std::vector<int32_t> ids;   // the prompt in the model's chat form, tokenized; an edit's one <|image_pad|> per ref
+    int64_t drop = 0;           // the leading ids whose states the DiT does not take (the system turn)
+    int64_t width = 1024, height = 1024;   // multiples of 16
+    uint64_t seed = 0;
+    std::vector<float> sigmas;  // empty: the model's default (its Turbo's steps)
+    std::vector<QiRef> refs;    // an edit's reference images, in the order of their pads
+    QiRef mask;                 // an edit's mask over refs[0] (OpenAI's: alpha 0 where the image changes); empty: none
+    std::vector<int32_t> neg_ids;   // classifier-free guidance's negative prompt, as ids (its pads as the prompt's)
+    float cfg = 1.0f;               // its scale (diffusers' true_cfg_scale): above 1 with neg_ids, guidance
+};
+
+struct QiTimes {
+    double text = 0, sampling = 0, decode = 0;
+};
+
+/// How a request's budget was split (bytes; the report).
+struct QiPlan {
+    uint64_t budget = 0, fixed = 0, activations = 0, blocks = 0, layers = 0, vae = 0, prefix_kv = 0;
+    int resident_blocks = 0, resident_layers = 0, resident_kv = 0;   // resident_kv: the blocks whose prefix cache is in VRAM
+    int64_t mlp_rows = 0;   // 0: all
+    bool vae_tiled = false, text_cached = false;
+};
+
+/// The VRAM an image needs (bytes): `least`, the budget it runs in at all (the layers streamed, the MLP in bands, the
+/// VAE in tiles); `full`, the budget with the DiT's blocks resident and the VAE in one piece (the encoder, run once a
+/// prompt, streamed); `held`, what the engine holds now; `free`, the device's free VRAM; `cap`, the most the engine
+/// could have (the device's memory less a margin, within STRATA_VRAM_LIMIT_MIB); `host`, what goes to pinned RAM with
+/// `cap` (Qwen-Image's prefix cache past the blocks it leaves room for).
+struct QiNeed {
+    uint64_t least = 0, full = 0, held = 0, free = 0, cap = 0, host = 0;
+};
+
+class ImagePipeline {
+public:
+    virtual ~ImagePipeline() = default;
+    /// The VRAM the engine may take (0: the free VRAM at open, less a margin, within STRATA_VRAM_LIMIT_MIB).
+    virtual void set_budget(uint64_t bytes) = 0;
+    /// The budget in force: the one set, else the free VRAM's at open.
+    virtual uint64_t budget() const = 0;
+    /// Frees what the engine holds on the GPU beyond its fixed weights (the cache): the next request loads again.
+    /// `all`: the fixed weights and the products' scratch too (the parts are opened again on the next request).
+    virtual void release(bool all = false) = 0;
+    /// The budget set to what the engine holds and the VRAM free now, less `reserve` (another program's room).
+    virtual void fit(uint64_t reserve) = 0;
+    /// What the engine holds on the GPU now (an estimate of its own buffers).
+    virtual uint64_t held() const = 0;
+    /// What an image of n_text prompt ids (after the system turn) at width x height needs (from the parts' sizes:
+    /// nothing put on the GPU); refs: an edit's reference images' sizes (width, height as read); mask: the edit has a
+    /// mask; n_neg: guidance's negative prompt's ids after the system turn (0: no guidance).
+    virtual QiNeed need(int64_t n_text, int64_t width, int64_t height,
+                        const std::vector<std::pair<int64_t, int64_t>>& refs = {}, bool mask = false,
+                        int64_t n_neg = 0) = 0;
+    /// RGBA8 [height][width][4] of the request.  `step`: the sampling's progress, false to stop (QiStopped).
+    /// `stage`: each stage as it starts ("refs", "text", "sampling", "decode").
+    virtual std::vector<uint8_t> generate(const QiRequest& r, QiTimes* times = nullptr, QiPlan* plan = nullptr,
+                                          const std::function<bool(int, int)>& step = {},
+                                          const std::function<void(const char*)>& stage = {}) = 0;
+};
+
+/// The most the engine could have: a device's memory less the driver's margin, within STRATA_VRAM_LIMIT_MIB.
+uint64_t vram_cap(uint64_t total);
+
+}  // namespace strata::image

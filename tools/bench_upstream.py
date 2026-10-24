@@ -10,8 +10,9 @@ the engine the way that tag's own setup.py gets it, with that setup.py's own fun
   the Python that runs setup).
 - AMD: compiled with HIP by its build_engine_hip, with the system's ROCm (its setup.py would otherwise install ROCm into
   the Python that runs it).
-- Intel: its sycl/ port compiled and run in its Docker image (docs/INTEL.md), JIT code (an AOT target would have to be
-  chosen by the device's ID); the data folder is mounted at /work.  The arguments get what its sycl/setup_intel.py
+- Intel: its sycl/ port compiled and run in its container image (docs/INTEL.md: Docker; here rootless Podman, its
+  sycl/serve/strata-sycl.sh's `docker` a shim that runs podman), JIT code (an AOT target would have to be chosen by
+  the device's ID); the data folder is mounted at /work.  The arguments get what its sycl/setup_intel.py
   writes for the card (sycl_setup), as its setup does.
 
 Run as a script, `bench_upstream.py --sycl-setup TREE SELECTOR -- ARGS...` prints what sycl_setup makes of ARGS for
@@ -41,7 +42,7 @@ from bench_core import Engine  # noqa: E402
 
 REPO_URL = "https://github.com/Niko1221/Strata.git"
 CLONE = "strata-upstream"            # a folder of the data folder: the Intel image mounts the data folder at /work
-DOCKER_IMAGE = "strata-sycl-dev"
+IMAGE = "strata-sycl-dev"
 
 
 class UpstreamError(Exception):
@@ -77,10 +78,15 @@ def load_setup(src: Path):
     if spec is None or spec.loader is None:
         raise UpstreamError(f"{src}/setup.py cannot be read")
     mod = importlib.util.module_from_spec(spec)
+    # its tree first on the path, as when it runs from there: 0.2.0's setup.py imports its own strata_control
+    saved = list(sys.path)
+    sys.path.insert(0, str(src))
     try:
         spec.loader.exec_module(mod)
     except (Exception, SystemExit) as e:
         raise UpstreamError(f"the tag's setup.py does not load here ({e})") from e
+    finally:
+        sys.path[:] = saved
     return mod
 
 
@@ -244,20 +250,19 @@ def amd(tag: str, src: Path, data: Path, gpu: dict, say: Callable) -> dict:
 
 
 def intel(tag: str, src: Path, data: Path, gpu: dict, say: Callable) -> dict:
-    if shutil.which("docker") is None or subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
-        raise UpstreamError("upstream's Intel engine (its sycl/ port) is built and run in Docker, and docker does not "
-                            "run here without sudo: install docker.io and add yourself to the docker group (sudo "
-                            "usermod -aG docker $USER, then log in again), as upstream's docs/INTEL.md says")
+    if shutil.which("podman") is None or subprocess.run(["podman", "info"], capture_output=True).returncode != 0:
+        raise UpstreamError("upstream's Intel engine (its sycl/ port) is built and run in a container, and podman does "
+                            "not run here: install podman (rootless, docs/DEVTOOLS.md)")
     stamp = src / "build-sycl" / "XESTRATA-TAG"
     if not (src / "build-sycl" / "strata").exists() or (stamp.read_text().strip() if stamp.exists() else "") != tag:
-        say("  Building upstream's Docker image strata-sycl-dev (about 6 minutes and 13 GB the first time) ...")
-        r = subprocess.run(["docker", "build", "-q", "-t", DOCKER_IMAGE, str(src / "sycl" / "tools")],
+        say("  Building upstream's container image strata-sycl-dev (about 6 minutes and 13 GB the first time) ...")
+        r = subprocess.run(["podman", "build", "-q", "-t", IMAGE, str(src / "sycl" / "tools")],
                            capture_output=True, text=True)
         if r.returncode != 0:
-            raise UpstreamError(f"docker build: {r.stderr.strip()[-400:]}")
+            raise UpstreamError(f"podman build: {r.stderr.strip()[-400:]}")
         say("  Compiling upstream's SYCL engine in it (about 3 minutes) ...")
-        r = subprocess.run(["docker", "run", "--rm", "-u", f"{os.getuid()}:{os.getgid()}", "-v", f"{data}:/work",
-                            "-e", f"REPO=/work/{CLONE}", "-e", f"BUILD_DIR=/work/{CLONE}/build-sycl", DOCKER_IMAGE,
+        r = subprocess.run(["podman", "run", "--rm", "--userns=keep-id", "-v", f"{data}:/work",
+                            "-e", f"REPO=/work/{CLONE}", "-e", f"BUILD_DIR=/work/{CLONE}/build-sycl", IMAGE,
                             f"cd /work/{CLONE} && bash sycl/tools/build.sh strata"], capture_output=True, text=True)
         if r.returncode != 0 or not (src / "build-sycl" / "strata").exists():
             raise UpstreamError(f"upstream's SYCL build failed: {(r.stdout + r.stderr).strip()[-400:]}")
@@ -265,11 +270,19 @@ def intel(tag: str, src: Path, data: Path, gpu: dict, say: Callable) -> dict:
     intel_cards = [x for x in gpu.get("_all", []) if x.get("vendor") == "intel"]
     index = next((i for i, x in enumerate(intel_cards) if x.get("pci") == gpu.get("pci")), 0)
     setup = SyclSetup(src, f"level_zero:{index}")
-    env = {**os.environ, **setup.env, "STRATA_SYCL_ROOT": str(data), "STRATA_SYCL_BIN": "build-sycl/strata",
+    # its strata-sycl.sh runs `docker`: a shim before the PATH runs podman (rootless, this user inside with its groups,
+    # render among them, for the card)
+    shim = data / CLONE / ".podman-shim"
+    shim.mkdir(exist_ok=True)
+    (shim / "docker").write_text('#!/bin/sh\n[ "$1" = run ] && { shift; exec podman run --userns=keep-id '
+                                 '--group-add keep-groups "$@"; }\nexec podman "$@"\n')
+    (shim / "docker").chmod(0o755)
+    env = {**os.environ, **setup.env, "PATH": f"{shim}{os.pathsep}{os.environ.get('PATH', '')}",
+           "STRATA_SYCL_ROOT": str(data), "STRATA_SYCL_BIN": "build-sycl/strata",
            "STRATA_SYCL_NAME": "xestrata-bench-upstream", "ONEAPI_DEVICE_SELECTOR": f"level_zero:{index}"}
     return {"exe": str(src / "sycl" / "serve" / "strata-sycl.sh"), "env": env, "map": (str(data), "/work"),
             "server": "sycl/serve/server_intel.py", "adapt": setup.args,
-            "how": "its sycl/ port, compiled in its Docker image (JIT), with what its sycl/setup_intel.py writes"}
+            "how": "its sycl/ port, compiled in its container image (JIT), with what its sycl/setup_intel.py writes"}
 
 
 def prepare(tag: str, data: Path, gpus: list[dict], license: str, profile: str, say: Callable) -> Engine:

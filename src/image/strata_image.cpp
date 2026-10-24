@@ -1,26 +1,42 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/strata_image.cpp - strata-image: Qwen-Image-2.1 text to image on the GPU.
+// src/image/strata_image.cpp - strata-image: Qwen-Image-2.1 or Mage-Flow text to image on the GPU.
 //
 //   strata-image --dit DIT.gguf --vae VAE.safetensors --text TEXT_ENCODER.gguf [--vision MMPROJ.gguf]
-//                [--budget-mib M] (--ids 1,2,3 [--drop N] [--width W] [--height H] [--seed S] [--ref IMAGE]...
-//                [--repeat N] --out IMAGE.rgba | --serve)
+//                [--budget-mib M] (--ids 1,2,3 [--drop N] [--width W] [--height H] [--seed S] [--sigmas 1,...,0]
+//                [--ref IMAGE]... [--mask IMAGE] [--repeat N] --out IMAGE.rgba | --serve)
+//   strata-image --dit DIT.safetensors ... [--dit-q8 auto|0|1] [--edit-dit EDIT_DIT.safetensors --vision MMPROJ.gguf]
+//                [--dit-keep 0|1]
+//
+// The DiT's file says the model: a GGUF is Qwen-Image-2.1's, a safetensors file Mage-Flow's (its bf16 weights as
+// Comfy-Org has them; its blocks FP16 on the GPU when they fit the budget with the text encoder's layers, else
+// quantized to 8 bits as they are read (MfDit: W8A8 or Q8_0): --dit-q8 auto, the default; 1 always 8 bits, 0 always
+// FP16).  Mage-Flow's edits take
+// its edit DiT (--edit-dit) and Qwen3-VL-4B's mmproj (--vision), up to three --ref; --dit-keep 1, the default, keeps the
+// DiT not in use in RAM between a generation and an edit (0: read from its file again).
 //
 // One image: --ids, the prompt in the model's chat form, tokenized (the server's tokenizer); --drop, the leading ids of
 // the system turn; --budget-mib, the VRAM the engine may take (default: the free VRAM); --repeat, the image again N
-// times in the process (the cache's effect); --ref, an edit's reference image (PNG, JPEG, BMP, GIF; its pad in --ids
-// is one <|image_pad|>, which the engine widens to the image's tokens), with the vision encoder (--vision, Qwen3-VL's
-// mmproj).  Writes RGBA8 rows to --out and a line of times and of the budget's split a run.
+// times in the process (the cache's effect); --sigmas, the sampler's sigmas from 1 down to the terminal 0, one step
+// between each two (default Turbo's 8 steps; serve/images.py's base_sigmas for the base model); --ref, an edit's
+// reference image (PNG, JPEG, BMP, GIF; its pad in --ids is one <|image_pad|>, which the engine widens to the image's
+// tokens), with the vision encoder (--vision, Qwen3-VL's mmproj); --mask, the edit's mask over the first --ref
+// (OpenAI's: a PNG whose transparent pixels are where the image changes, the rest kept as the reference has it).
+// Writes RGBA8 rows to --out and a line of times and of the budget's split a run.
 //
 // --serve: the engine stays, its layers and the last prompt's states kept between requests, and takes lines on stdin
 // (serve/images.py), one at a time, answering each on stdout:
 // A path on a request line is UTF-8 with %XX for a byte that is not printable ASCII and for % itself (a space, a
 // non-ASCII name), so that one word holds it (serve/images.py's path_word).
-//   IMG <width> <height> <seed> <drop> <out path> <ids, commas> [REF:<path>]...   -> STEP <done> <steps> lines,
-//                            then IMAGE key=value ... (times, the budget's split); REF: an edit's reference images
-//   NEED <width> <height> <n> [REF:<path>]...  the VRAM an image of n prompt ids needs (from the files)
+//   IMG <width> <height> <seed> <drop> <out path> <ids, commas> [SIGMAS:<sigmas, commas>] [REF:<path>]...
+//                            -> STAGE <refs|text|sampling|decode> as each stage starts and STEP <done> <steps> lines,
+//                            then IMAGE key=value ... (times, the budget's split); SIGMAS: as --sigmas; REF: an
+//                            edit's reference images; MASK: as --mask; NEG:<ids, commas> and CFG:<scale> (above 1):
+//                            classifier-free guidance with that negative prompt (its pads as the prompt's)
+//   NEED <width> <height> <n> [REF:<path>]... [MASK:<path>] [NEG:<n>]  the VRAM an image of n prompt ids needs (from
+//                            the files); NEG: guidance's negative prompt of n ids
 //                                                                                          -> NEED least_mib=...
-//                            full_mib=... held_mib=... free_mib=... (si::QiNeed)
+//                            full_mib=... held_mib=... free_mib=... cap_mib=... host_mib=... (si::QiNeed)
 //   FREE                     the free VRAM and what the engine holds                        -> FREE free_mib=... held_mib=...
 //   BUDGET <MiB>             the VRAM the engine may take (0: the free VRAM at its start)      -> BUDGET budget_mib=...
 //   FIT <MiB>                the budget: what the engine holds and the free VRAM, less <MiB>  -> BUDGET budget_mib=...
@@ -35,6 +51,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/image/qi_image_io.hpp"
+#include "strata/image/mf_pipeline.hpp"
 #include "strata/image/qi_pipeline.hpp"
 
 #include <atomic>
@@ -82,23 +99,52 @@ std::vector<int32_t> parse_ids(const std::string& s) {
     return ids;
 }
 
-// the REF:<path> words left on a request line: the images read, or (sizes) their sizes only
-std::vector<si::QiRef> read_refs(std::istringstream& ls) {
+// the sampler's sigmas, commas: two or more, from at most 1 down to 0, falling
+std::vector<float> parse_sigmas(const std::string& s) {
+    std::vector<float> sig;
+    std::stringstream ss(s);
+    for (std::string tok; std::getline(ss, tok, ',');)
+        if (!tok.empty()) sig.push_back(std::stof(tok));
+    bool ok = sig.size() >= 2 && sig.front() <= 1.0f && sig.back() == 0.0f;
+    for (size_t i = 1; ok && i < sig.size(); ++i) ok = sig[i] < sig[i - 1];
+    if (!ok) throw std::invalid_argument("sigmas: two or more, falling from at most 1 to 0: " + s);
+    return sig;
+}
+
+si::QiRef read_image(const std::string& path) {
+    si::QiRef f;
+    std::string err;
+    f.rgba = si::load_rgba8(path, f.width, f.height, err);
+    if (f.rgba.empty()) throw std::invalid_argument(err);
+    return f;
+}
+
+// the words left on an IMG line: its REF:<path> images (and SIGMAS:, MASK:)
+std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r) {
     std::vector<si::QiRef> refs;
     for (std::string word; ls >> word;) {
-        if (word.rfind("REF:", 0) != 0) throw std::invalid_argument("unknown word " + word);
-        si::QiRef f;
-        std::string err;
-        f.rgba = si::load_rgba8(path_of(word.substr(4)), f.width, f.height, err);
-        if (f.rgba.empty()) throw std::invalid_argument(err);
-        refs.push_back(std::move(f));
+        if (word.rfind("SIGMAS:", 0) == 0) r.sigmas = parse_sigmas(word.substr(7));
+        else if (word.rfind("MASK:", 0) == 0) r.mask = read_image(path_of(word.substr(5)));
+        else if (word.rfind("NEG:", 0) == 0) r.neg_ids = parse_ids(word.substr(4));
+        else if (word.rfind("CFG:", 0) == 0) r.cfg = std::stof(word.substr(4));
+        else if (word.rfind("REF:", 0) == 0) refs.push_back(read_image(path_of(word.substr(4))));
+        else throw std::invalid_argument("unknown word " + word);
     }
     return refs;
 }
 
-std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls) {
+// a NEED line's: the REF:<path> images' sizes; MASK:<path> sets `mask`, NEG:<n> `n_neg`
+std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls, bool& mask, int64_t& n_neg) {
     std::vector<std::pair<int64_t, int64_t>> sizes;
     for (std::string word; ls >> word;) {
+        if (word.rfind("MASK:", 0) == 0) {
+            mask = true;
+            continue;
+        }
+        if (word.rfind("NEG:", 0) == 0) {
+            n_neg = std::stoll(word.substr(4));
+            continue;
+        }
         int64_t w = 0, h = 0;
         if (word.rfind("REF:", 0) != 0 || !si::image_size(path_of(word.substr(4)), w, h))
             throw std::invalid_argument("not an image: " + word);
@@ -108,15 +154,16 @@ std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls) {
 }
 
 std::string plan_kv(const si::QiTimes& t, const si::QiPlan& p) {
-    char b[512];
+    char b[640];
     std::snprintf(b, sizeof b,
                   "text_s=%.3f sampling_s=%.3f decode_s=%.3f budget_mib=%llu blocks_mib=%llu resident_blocks=%d "
                   "layers_mib=%llu resident_layers=%d activations_mib=%llu mlp_rows=%lld vae_mib=%llu vae_tiled=%d "
-                  "text_cached=%d",
+                  "text_cached=%d prefix_kv_mib=%llu resident_kv=%d",
                   t.text, t.sampling, t.decode, (unsigned long long) (p.budget >> 20),
                   (unsigned long long) (p.blocks >> 20), p.resident_blocks, (unsigned long long) (p.layers >> 20),
                   p.resident_layers, (unsigned long long) (p.activations >> 20), (long long) p.mlp_rows,
-                  (unsigned long long) (p.vae >> 20), p.vae_tiled ? 1 : 0, p.text_cached ? 1 : 0);
+                  (unsigned long long) (p.vae >> 20), p.vae_tiled ? 1 : 0, p.text_cached ? 1 : 0,
+                  (unsigned long long) (p.prefix_kv >> 20), p.resident_kv);
     return b;
 }
 
@@ -158,7 +205,7 @@ struct Lines {
     }
 };
 
-int serve(si::QiPipeline& p) {
+int serve(si::ImagePipeline& p) {
     {   // the warm-up: a 256 x 256 image of one step from token ids the vocabulary has; where the GPU has no room
         // for it now (another program holds it), the first request builds the kernels instead
         si::QiRequest r;
@@ -191,7 +238,7 @@ int serve(si::QiPipeline& p) {
                 ls >> r.width >> r.height >> r.seed >> r.drop >> out >> ids;
                 if (!ls || out.empty()) throw std::invalid_argument("IMG <width> <height> <seed> <drop> <out> <ids>");
                 r.ids = parse_ids(ids);
-                r.refs = read_refs(ls);
+                r.refs = read_refs(ls, r);
                 in->stop = false;
                 si::QiTimes t;
                 si::QiPlan pl;
@@ -199,6 +246,9 @@ int serve(si::QiPipeline& p) {
                     std::printf("STEP %d %d\n", done, steps);
                     std::fflush(stdout);
                     return !in->stop.load();
+                }, [](const char* stage) {   // the server's progress (serve/images.py)
+                    std::printf("STAGE %s\n", stage);
+                    std::fflush(stdout);
                 });
                 const std::string utf8 = path_of(out);
                 write_file(std::filesystem::path(std::u8string(utf8.begin(), utf8.end())), img);
@@ -206,11 +256,15 @@ int serve(si::QiPipeline& p) {
             } else if (op == "NEED") {
                 int64_t w = 0, h = 0, n = 0;
                 ls >> w >> h >> n;
-                if (!ls) throw std::invalid_argument("NEED <width> <height> <n> [REF:<path>]...");
-                const si::QiNeed nd = p.need(n, w, h, ref_sizes(ls));
-                std::printf("NEED least_mib=%llu full_mib=%llu held_mib=%llu free_mib=%llu\n",
+                if (!ls) throw std::invalid_argument("NEED <width> <height> <n> [REF:<path>]... [MASK:<path>]");
+                bool mask = false;
+                int64_t n_neg = 0;
+                const auto sizes = ref_sizes(ls, mask, n_neg);
+                const si::QiNeed nd = p.need(n, w, h, sizes, mask, n_neg);
+                std::printf("NEED least_mib=%llu full_mib=%llu held_mib=%llu free_mib=%llu cap_mib=%llu host_mib=%llu\n",
                             (unsigned long long) (nd.least >> 20), (unsigned long long) (nd.full >> 20),
-                            (unsigned long long) (nd.held >> 20), (unsigned long long) (nd.free >> 20));
+                            (unsigned long long) (nd.held >> 20), (unsigned long long) (nd.free >> 20),
+                            (unsigned long long) (nd.cap >> 20), (unsigned long long) (nd.host >> 20));
             } else if (op == "FREE") {
                 size_t free = 0, total = 0;
                 strata::gpu::mem_info(&free, &total);
@@ -259,13 +313,25 @@ int serve(si::QiPipeline& p) {
 int main(int argc, char** argv) {
     strata::core::restrict_hip_to_selector();   // before the HIP runtime starts, as the text engine does
     strata::core::no_hip_resource_cache();
+    // oneMath's rocBLAS backend times hipBLASLt's first algorithms on a shape's first product and keeps the fastest:
+    // an image model's few shapes repeat every step (RX 9060 XT: its int8 products 20 to 40% faster), where the text
+    // engine's change with each prompt (it leaves the timing off)
+    if (std::getenv("ONEMATH_HIPBLASLT_TUNE") == nullptr) {
+#if defined(_WIN32)
+        _putenv_s("ONEMATH_HIPBLASLT_TUNE", "1");
+#else
+        setenv("ONEMATH_HIPBLASLT_TUNE", "1", 0);
+#endif
+    }
     try {
         std::string dit, vae, text, vision, out, ids;
         std::vector<std::string> ref_paths;
         si::QiRequest r;
         uint64_t budget = 0;
         int repeat = 1;
-        bool serving = false;
+        std::string edit_dit;
+        int dit_q8 = -1;   // Mage-Flow: by the budget
+        bool serving = false, dit_keep = true;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             auto val = [&]() -> std::string {
@@ -277,26 +343,47 @@ int main(int argc, char** argv) {
             else if (a == "--text") text = val();
             else if (a == "--vision") vision = val();
             else if (a == "--ref") ref_paths.push_back(val());
+            else if (a == "--mask") r.mask = read_image(val());
+            else if (a == "--neg-ids") r.neg_ids = parse_ids(val());
+            else if (a == "--cfg") r.cfg = std::stof(val());
             else if (a == "--out") out = val();
             else if (a == "--ids") ids = val();
             else if (a == "--drop") r.drop = std::stoll(val());
             else if (a == "--width") r.width = std::stoll(val());
             else if (a == "--height") r.height = std::stoll(val());
             else if (a == "--seed") r.seed = std::stoull(val());
+            else if (a == "--sigmas") r.sigmas = parse_sigmas(val());
             else if (a == "--budget-mib") budget = std::stoull(val()) << 20;
             else if (a == "--repeat") repeat = std::stoi(val());
             else if (a == "--serve") serving = true;
+            else if (a == "--dit-q8") {
+                const std::string v = val();
+                dit_q8 = v == "auto" ? -1 : v != "0";
+            }
+            else if (a == "--edit-dit") edit_dit = val();
+            else if (a == "--dit-keep") dit_keep = val() != "0";
             else throw std::invalid_argument("unknown option " + a);
         }
         if (dit.empty() || vae.empty() || text.empty() || (!serving && (out.empty() || ids.empty()))) {
             std::fprintf(stderr, "usage: %s --dit F --vae F --text F [--vision F] [--budget-mib M] (--ids 1,2,3 "
-                         "[--drop N] [--width W] [--height H] [--seed S] [--ref IMAGE]... [--repeat N] --out IMAGE.rgba "
-                         "| --serve)\n", argv[0]);
+                         "[--drop N] [--width W] [--height H] [--seed S] [--sigmas 1,...,0] [--ref IMAGE]... "
+                         "[--mask IMAGE] [--repeat N] --out IMAGE.rgba | --serve) [--dit-q8 auto|0|1] [--edit-dit F] "
+                         "[--dit-keep 0|1]\n", argv[0]);
             return 2;
         }
-        si::QiPipeline p;
+        std::unique_ptr<si::ImagePipeline> pipe;
         std::string err;
-        if (!p.open(dit, vae, text, err, vision)) throw std::runtime_error(err);
+        const bool mage = dit.size() > 12 && dit.compare(dit.size() - 12, 12, ".safetensors") == 0;
+        if (mage) {
+            auto m = std::make_unique<si::MfPipeline>();
+            if (!m->open(dit, vae, text, err, dit_q8, edit_dit, vision, dit_keep)) throw std::runtime_error(err);
+            pipe = std::move(m);
+        } else {
+            auto q = std::make_unique<si::QiPipeline>();
+            if (!q->open(dit, vae, text, err, vision)) throw std::runtime_error(err);
+            pipe = std::move(q);
+        }
+        si::ImagePipeline& p = *pipe;
         if (budget > 0) p.set_budget(budget);
         if (serving) return serve(p);
         r.ids = parse_ids(ids);

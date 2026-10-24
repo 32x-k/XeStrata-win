@@ -2,18 +2,18 @@ SPDX-FileCopyrightText: The LLVM project contributors
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-cuda-sync-points: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+cuda-sync-points: a fix to intel/llvm v7.2.0, applied by tools/intel_llvm_build.py.
 
 The CUDA adapter copied the command-buffer's map of sync points for every node it added, so finalizing
 a SYCL graph took the square of its node count (2600 kernels: 90 ms on an RTX 4070; Level Zero 2 ms).
 ---
 diff --git a/unified-runtime/source/adapters/cuda/command_buffer.cpp b/unified-runtime/source/adapters/cuda/command_buffer.cpp
-index c33719b..45eef0f 100644
+index abbeb6a1af..b8b0a116a2 100644
 --- a/unified-runtime/source/adapters/cuda/command_buffer.cpp
 +++ b/unified-runtime/source/adapters/cuda/command_buffer.cpp
-@@ -5,6 +5,7 @@
- // Part of the Unified-Runtime Project, under the Apache License v2.0 with LLVM
- // Exceptions. See LICENSE.TXT
+@@ -4,6 +4,7 @@
+ // Part of the LLVM Project, under the Apache License v2.0 with LLVM
+ // Exceptions. See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 +// Modified 2026 by MistVVK and the XeStrata contributors: the command-buffer's sync points are not copied for every node (cuda-sync-points)
  //

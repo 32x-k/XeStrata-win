@@ -18,7 +18,9 @@ upstream's tree, with its sd-cli in engine-image/ and the BUILD.json its setup w
 against the one asked for, and the "lib_dirs" its config takes); UP_ROOT=none: XeStrata alone.  UP_SD_CLI: an sd-cli
 elsewhere (its BUILD.json beside it).  DATA: the data folder (the image model's files in its models/).  QUANT: the
 denoiser's quant, the same for both (upstream's setup picks it by the GPU's memory: Q8_0 above 12 GB, Q6_K up to 12,
-Q4_K_M up to 8).  UP_IMAGE_GPU: the GPU's index among the backend's devices where the PC has more than one (Vulkan
+Q4_K_M up to 8).  IMAGE_MODEL (default qwen-image-turbo): setup's --images name of the model; upstream has
+Qwen-Image-2.1-Turbo alone, so another (mage-flow-turbo) takes UP_ROOT=none, and its steps are the model card's (4 for
+Mage-Flow-Turbo).  UP_IMAGE_GPU: the GPU's index among the backend's devices where the PC has more than one (Vulkan
 counts the processor's graphics too).  PY (default this Python): the Python that runs each tree's image code.  ROUNDS
 (default 2): images per engine, alternating, after a discarded warm-up per engine.
 OUT/image-runs/GPU-ARM-ROUND.json gets each run's times, .txt the log (sd-cli's, or the resident engine's figures) and
@@ -38,6 +40,7 @@ if len(args) != 2:
 models = str(Path(B.need("DATA")) / "models")
 quant = B.need("QUANT")
 py = os.environ.get("PY", sys.executable)
+model = os.environ.get("IMAGE_MODEL") or "qwen-image-turbo"
 
 
 engines, cfgs, envs = [], {}, {}
@@ -45,6 +48,8 @@ for arm in ("xe", "up"):
     root = B.need(f"{arm.upper()}_ROOT")
     if root == "none":
         continue
+    if arm == "up" and model != "qwen-image-turbo":
+        sys.exit(f"up: upstream has no {model} (UP_ROOT=none)")
     e = B.Engine(arm, arm, [], "", root=Path(root), py=py)
     if arm == "xe":
         exe = Path(os.environ.get("XE_IMAGE_EXE") or
@@ -62,7 +67,7 @@ for arm in ("xe", "up"):
             env[var] = os.pathsep.join(lib_dirs + ([os.environ[var]] if os.environ.get(var) else []))
         if os.environ.get("XE_IMAGE_PCI"):
             env["STRATA_GPU_PCI"] = os.environ["XE_IMAGE_PCI"]
-        cfg = B.image_config(e, "strata-image", quant, str(exe), models)
+        cfg = B.image_config(e, "strata-image", quant, str(exe), models, model=model)
         envs["xe"] = env
     else:
         backend = os.environ.get("UP_IMAGE_BACKEND", "")
@@ -86,4 +91,4 @@ for arm in ("xe", "up"):
     engines.append(e)
     cfgs[arm] = cfg
 B.ab_image(Path(args[0]), args[1], engines, cfgs, int(os.environ.get("ROUNDS", str(B.ROUNDS))),
-           dry="--dry-run" in sys.argv, envs=envs)
+           dry="--dry-run" in sys.argv, envs=envs, model=model)

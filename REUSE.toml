@@ -13,13 +13,20 @@ SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
 # upstream Strata's files without a comment of their own, unchanged (AGENTS.md, Licenses)
 [[annotations]]
-path = ["data/draft_vocab*.bin", "data/expert-profile.bin", "data/expert-profile-coder.bin", "data/gguf_fingerprints.json", "data/quant_quality/**", "docs/paper/**", "serve/fixtures/rcall_specimens.json", "serve/web/favicon.svg", "serve/web/sprite.svg", "tests/data/native_experts/**"]
+path = ["data/draft_vocab*.bin", "data/expert-profile.bin", "data/expert-profile-coder.bin", "data/quant_quality/**", "docs/paper/**", "serve/fixtures/rcall_specimens.json", "serve/web/favicon.svg", "serve/web/sprite.svg", "tests/data/native_experts/**"]
 SPDX-FileCopyrightText = "2026 Niko1221 and the Strata contributors"
 SPDX-License-Identifier = "MIT"
 
+# upstream Strata's files without a comment of their own, changed by XeStrata
+[[annotations]]
+path = ["data/gguf_fingerprints.json"]
+SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors"]
+SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
+
 # XeStrata's own files without a comment of their own: the expert profiles of the other models
 [[annotations]]
-path = ["data/expert-profile-llmjp.bin", "data/expert-profile-ornith.bin"]
+path = ["data/expert-profile-glm53.bin", "data/expert-profile-llmjp.bin", "data/expert-profile-ornith.bin",
+        "data/expert-profile-qwen36.bin"]
 SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"
 SPDX-License-Identifier = "LGPL-3.0-or-later"
 
@@ -42,24 +49,54 @@ SPDX-License-Identifier = "LGPL-3.0-or-later"
 
 # free third-party material: under its own license
 [[annotations]]
-path = ["tools/package/licenses/origami-LICENSE.md"]
-SPDX-FileCopyrightText = "Advanced Micro Devices, Inc."
-SPDX-License-Identifier = "MIT"
-
-[[annotations]]
 path = ["third_party/main/ggml/**"]
 SPDX-FileCopyrightText = "2023-2026 The ggml authors"
-SPDX-License-Identifier = "MIT"
-
-[[annotations]]
-path = ["third_party/main/ggml-tq/**"]
-SPDX-FileCopyrightText = ["2023-2026 The ggml authors", "2026 Niko1221 and the Strata contributors"]
 SPDX-License-Identifier = "MIT"
 
 [[annotations]]
 path = ["third_party/main/oneMath/LICENSE"]
 SPDX-FileCopyrightText = "The oneMath contributors"
 SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["third_party/main/oneDNN/LICENSE", "third_party/main/oneDNN/THIRD-PARTY-PROGRAMS"]
+SPDX-FileCopyrightText = "Intel Corporation and the oneDNN contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["third_party/main/cudnn-frontend/LICENSE.txt"]
+SPDX-FileCopyrightText = "NVIDIA CORPORATION & AFFILIATES"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["third_party/main/aotriton/LICENSE"]
+SPDX-FileCopyrightText = "Advanced Micro Devices, Inc."
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["third_party/main/aotriton/LICENSE.aiter"]
+SPDX-FileCopyrightText = "Advanced Micro Devices, Inc."
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["third_party/main/aotriton/LICENSE.FlyDSL"]
+SPDX-FileCopyrightText = "2025 FlyDSL Project Contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["third_party/main/aotriton/patches/*.patch"]
+SPDX-FileCopyrightText = ["Advanced Micro Devices, Inc.", "2026 MistVVK and the XeStrata contributors"]
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["third_party/main/xz/COPYING.0BSD"]
+SPDX-FileCopyrightText = "The XZ Utils authors and contributors"
+SPDX-License-Identifier = "0BSD"
+
+[[annotations]]
+path = ["third_party/main/aotriton/LICENSE.triton"]
+SPDX-FileCopyrightText = ["2018-2020 Philippe Tillet", "2020-2022 OpenAI"]
+SPDX-License-Identifier = "MIT"
 
 [[annotations]]
 path = ["third_party/main/intel-llvm/LICENSE.TXT"]

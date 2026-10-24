@@ -1,0 +1,84 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+hip-group-shuffle: a fix to intel/llvm v7.2.0, applied by tools/intel_llvm_build.py.
+
+Since v7.2.0 SYCL's sub-group shuffles (sycl/detail/spirv.hpp: Shuffle, ShuffleXor, ShuffleUp and
+ShuffleDown on a sub-group) call the SPIR-V GroupNonUniform forms on every target but NVIDIA's, and
+AMD's libspirv defines only the SubgroupShuffle*INTEL ones: every AMD program with a shuffle failed to
+link ("undefined symbol: __spirv_GroupNonUniformShuffleXor(int, float, unsigned int)").  Fixed, AMD's
+libspirv defines the four GroupNonUniform shuffles for the scalar types with its SubgroupShuffle*INTEL
+(the scope SYCL passes is the sub-group's).
+---
+diff --git a/libclc/libspirv/lib/amdgpu/CMakeLists.txt b/libclc/libspirv/lib/amdgpu/CMakeLists.txt
+index e032a204dd..ae8b5ebf2a 100644
+--- a/libclc/libspirv/lib/amdgpu/CMakeLists.txt
++++ b/libclc/libspirv/lib/amdgpu/CMakeLists.txt
+@@ -5,6 +5,9 @@ libclc_add_sources(${LIBCLC_LIBSPIRV_TARGET} FILES
+   atomic/atomic_or.cl
+   atomic/atomic_xor.cl
+   group/group_ballot.cl
++  # Modified 2026 by MistVVK and the XeStrata contributors: the GroupNonUniform
++  # shuffles SYCL calls on AMD GPUs (hip-group-shuffle)
++  group/group_shuffle.cl
+   group/collectives.cl
+   group/collectives_helpers.cl
+   conversion/GenericCastToPtrExplicit.cl
+diff --git a/libclc/libspirv/lib/amdgpu/group/group_shuffle.cl b/libclc/libspirv/lib/amdgpu/group/group_shuffle.cl
+new file mode 100644
+index 0000000000..e61655e2b9
+--- /dev/null
++++ b/libclc/libspirv/lib/amdgpu/group/group_shuffle.cl
+@@ -0,0 +1,51 @@
++//===----------------------------------------------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++// Added 2026 by MistVVK and the XeStrata contributors: SYCL's sub-group
++// shuffles call the SPIR-V GroupNonUniform forms on AMD GPUs (sycl/detail/
++// spirv.hpp), which AMD's libspirv did not define, so every AMD program with a
++// shuffle failed to link (hip-group-shuffle).  A sub-group's are its
++// SubgroupShuffle*INTEL; the scope is the sub-group, the one SYCL passes here.
++//
++//===----------------------------------------------------------------------===//
++
++#include <libspirv/spirv.h>
++
++#define __AMDGCN_CLC_GROUP_SHUFFLE(TYPE)                                       \
++  _CLC_OVERLOAD _CLC_DEF _CLC_CONVERGENT TYPE __spirv_GroupNonUniformShuffle(  \
++      int Execution, TYPE Value, uint Id) {                                    \
++    return __spirv_SubgroupShuffleINTEL(Value, Id);                            \
++  }                                                                            \
++  _CLC_OVERLOAD _CLC_DEF _CLC_CONVERGENT TYPE                                  \
++  __spirv_GroupNonUniformShuffleXor(int Execution, TYPE Value, uint Mask) {    \
++    return __spirv_SubgroupShuffleXorINTEL(Value, Mask);                       \
++  }                                                                            \
++  _CLC_OVERLOAD _CLC_DEF _CLC_CONVERGENT TYPE                                  \
++  __spirv_GroupNonUniformShuffleUp(int Execution, TYPE Value, uint Delta) {    \
++    return __spirv_SubgroupShuffleUpINTEL(Value, Value, Delta);                \
++  }                                                                            \
++  _CLC_OVERLOAD _CLC_DEF _CLC_CONVERGENT TYPE                                  \
++  __spirv_GroupNonUniformShuffleDown(int Execution, TYPE Value, uint Delta) {  \
++    return __spirv_SubgroupShuffleDownINTEL(Value, Value, Delta);              \
++  }
++
++__AMDGCN_CLC_GROUP_SHUFFLE(char)
++__AMDGCN_CLC_GROUP_SHUFFLE(uchar)
++__AMDGCN_CLC_GROUP_SHUFFLE(short)
++__AMDGCN_CLC_GROUP_SHUFFLE(ushort)
++__AMDGCN_CLC_GROUP_SHUFFLE(int)
++__AMDGCN_CLC_GROUP_SHUFFLE(uint)
++__AMDGCN_CLC_GROUP_SHUFFLE(long)
++__AMDGCN_CLC_GROUP_SHUFFLE(ulong)
++__AMDGCN_CLC_GROUP_SHUFFLE(float)
++__AMDGCN_CLC_GROUP_SHUFFLE(double)
++
++#ifdef cl_khr_fp16
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++__AMDGCN_CLC_GROUP_SHUFFLE(half)
++#endif
++
++#undef __AMDGCN_CLC_GROUP_SHUFFLE

@@ -669,16 +669,68 @@ def run_usage(e: Engine, cfg: dict, seed: int, agent_files: list[str], stem: Pat
         why = str(err)
     finally:
         try:
-            os.killpg(srv.pid, signal.SIGTERM)
-            srv.wait(timeout=120)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
             try:
-                os.killpg(srv.pid, signal.SIGKILL)
+                os.killpg(srv.pid, signal.SIGTERM)
+                srv.wait(timeout=120)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(srv.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                srv.wait()
+            end_group(srv.pid, f"{label or e.arm}: its server's")
+        finally:
+            log.close()
+    return {"turns": turns, "why": why}
+
+
+class EngineLeft(RuntimeError):
+    """A run's engine still runs after it was stopped and killed (stuck in its GPU driver): the next run would start
+    beside it, in what it leaves of the GPU's memory, so the measurements stop here."""
+
+
+GROUP_END = 120   # s: for the processes left in a run's group to end, and again after they are killed
+
+
+def group_left(pgid: int) -> list[str]:
+    """The processes of process group `pgid` that still run, as "PID name" (zombies left out: they hold no memory,
+    and one a container's init does not reap would stay for good)."""
+    left = []
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            stat = (p / "stat").read_text()
+        except OSError:
+            continue
+        name_end = stat.rfind(")")
+        f = stat[name_end + 2:].split()    # state, ppid, pgrp, ...
+        if len(f) > 2 and int(f[2]) == pgid and f[0] != "Z":
+            left.append(f"{p.name} {stat[stat.find('(') + 1:name_end]}")
+    return left
+
+
+def end_group(pgid: int, what: str) -> None:
+    """#34: wait until every process of a run's group has ended, not only the server: the server ends once it has
+    given up on its engine (EngineStuck), and an engine stuck after a GPU fault kept its VRAM while the next run
+    started (6674 and 838 MiB free).  The group is killed after GROUP_END s; EngineLeft when a process is still there
+    GROUP_END s later."""
+    killed = False
+    deadline = time.monotonic() + GROUP_END
+    while left := group_left(pgid):
+        if time.monotonic() > deadline:
+            if killed:
+                raise EngineLeft(f"{what} engine has not ended ({'; '.join(left[:3])}), {2 * GROUP_END} s after it "
+                                 "was stopped, and keeps its GPU memory: the next run would start beside it, so the "
+                                 "measurements stop here. The GPU's driver log (sudo dmesg) may say why; a reboot "
+                                 "frees the GPU")
+            try:
+                os.killpg(pgid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            srv.wait()
-        log.close()
-    return {"turns": turns, "why": why}
+            killed = True
+            deadline = time.monotonic() + GROUP_END
+        time.sleep(1)
 
 
 # ------------------------------------------------------------------------------------------------ the alternation
@@ -836,7 +888,8 @@ if job["do"] == "make":
     import qimage as QI
     m = job["make"]
     if hasattr(QI, "IMAGE_EXE"):
-        cfg = QI.image_config(m["quant"], Path(m["exe"]), Path(m["models"]))
+        kw = {"model": m["model"]} if m.get("model") else {}
+        cfg = QI.image_config(m["quant"], Path(m["exe"]), Path(m["models"]), **kw)
         print(json.dumps(cfg))
         sys.exit(0)
     kw = {"lib_dirs": m.get("lib_dirs") or ()}
@@ -865,7 +918,10 @@ if hasattr(IM, "ImageEngine"):
         print(json.dumps({"rc": 1, "error": str(e)}))
         sys.exit(0)
     finally:
-        g.close()
+        try:   # the daemon too: it would hold its VRAM through the next measurement (the run is warm already)
+            g.close(shutdown=True)
+        except TypeError:          # an older tree's ImageGen.close() takes no argument
+            g.close()
     Path(job["png"]).write_bytes(pngs[0])
     Path(job["log"]).write_text(json.dumps(fig, indent=1) + "\n")
     print(json.dumps({"rc": 0, "seconds": round(wall, 2), "cold_s": round(cold, 2),
@@ -902,19 +958,21 @@ def image_job(e: Engine, job: dict, timeout: float = DEADLINE) -> dict:
 
 
 def image_config(e: Engine, backend: str, quant: str, exe: str, models: str, gpu: int | None = None,
-                 lib_dirs: list[str] | None = None) -> dict:
+                 lib_dirs: list[str] | None = None, model: str | None = None) -> dict:
     """The "images" section `e`'s setup writes for this GPU (its timed choices included) -> the config, or
-    {"error": ...}."""
+    {"error": ...}.  `model`: setup's --images name, for XeStrata's tree (upstream's has Qwen-Image-2.1-Turbo
+    alone)."""
     return image_job(e, {"do": "make", "make": {"backend": backend, "quant": quant, "exe": exe, "models": models,
-                                                "gpu": gpu, "lib_dirs": lib_dirs or []}})
+                                                "gpu": gpu, "lib_dirs": lib_dirs or [], "model": model}})
 
 
 def ab_image(out: Path, gpu: str, engines: list[Engine], cfgs: dict[str, dict], rounds: int = ROUNDS,
-             on_run: Callable | None = None, dry: bool = False, envs: dict[str, dict] | None = None) -> None:
+             on_run: Callable | None = None, dry: bool = False, envs: dict[str, dict] | None = None,
+             model: str = "qwen-image-turbo") -> None:
     """OUT/image-runs/GPU-ARM-ROUND.json (the times), .txt (sd-cli's log, or the resident engine's figures) and .png:
     each engine's "images" config (`cfgs`, by arm; `envs`: what a resident engine's environment adds, by arm), one
     discarded warm-up per engine first (the files into the page cache), then the engines alternating, one process an
-    image (IMAGE_RUNNER)."""
+    image (IMAGE_RUNNER).  `model`: setup's --images name of the configs, for the tables."""
     runs = out / "image-runs"
     runs.mkdir(parents=True, exist_ok=True)
 
@@ -927,7 +985,8 @@ def ab_image(out: Path, gpu: str, engines: list[Engine], cfgs: dict[str, dict], 
             return
         r = image_job(e, {"do": "run", "cfg": cfg, "request": IMAGE_REQUEST, "png": str(runs / f"{stem}.png"),
                           "log": str(runs / f"{stem}.txt"), "env": (envs or {}).get(e.arm)})
-        rec = {"gpu": gpu, "arm": e.arm, "round": rnd, "backend": cfg.get("backend"), "quant": cfg.get("quant"),
+        rec = {"gpu": gpu, "arm": e.arm, "round": rnd, "model": model, "steps": cfg.get("steps") or 8,
+               "backend": cfg.get("backend"), "quant": cfg.get("quant"),
                "args": cfg.get("args"), "env": cfg.get("env"), **r}
         (runs / f"{stem}.json").write_text(json.dumps(rec, indent=1) + "\n")
         took = (f"{r['seconds']} s (sampling {r['sampling_s']} s, VAE {r['decode_s']} s)" if r.get("rc") == 0 else
@@ -1025,15 +1084,18 @@ def collect(out: Path, names: dict[str, str], say: Callable = print) -> None:
             continue
         ok = r.get("rc") == 0
         image.append({"gpu": r["gpu"], "arm": r["arm"], "engine": names.get(r["arm"], r["arm"]), "round": r["round"],
+                      "model": r.get("model") or "qwen-image-turbo", "steps": r.get("steps") or 8,
                       "backend": r.get("backend"), "quant": r.get("quant"),
                       **{k: r.get(k) if ok else None for k in ("seconds", "text_s", "sampling_s", "decode_s")}})
     if image:
         (out / "matrix-image.json").write_text(json.dumps(image, indent=1) + "\n")
-        for gpu in sorted({r["gpu"] for r in image}):
-            say(f"\n### {gpu} image generation (1024x1024, 8 steps)\n\n| Engine | backend | image (s) | sampling (s) | "
-                "VAE (s) |\n| --- | --- | ---: | ---: | ---: |")
-            for name in names.values():
-                c = [r for r in image if (r["gpu"], r["engine"]) == (gpu, name)]
+        for gpu, model in sorted({(r["gpu"], r["model"]) for r in image}):
+            steps = next(r["steps"] for r in image if (r["gpu"], r["model"]) == (gpu, model))
+            say(f"\n### {gpu} image generation, {model} (1024x1024, {steps} steps)\n\n| Engine | backend | image (s) | "
+                "sampling (s) | VAE (s) |\n| --- | --- | ---: | ---: | ---: |")
+            # the named arms first, then any other (bench_comfy.py's ComfyUI arms)
+            for name in dict.fromkeys([*names.values(), *sorted(r["engine"] for r in image)]):
+                c = [r for r in image if (r["gpu"], r["model"], r["engine"]) == (gpu, model, name)]
                 if not c:
                     continue
                 cells = []
@@ -1043,14 +1105,29 @@ def collect(out: Path, names: dict[str, str], say: Callable = print) -> None:
                 say(f"| {name} | {c[0]['backend']} {c[0]['quant']} | " + " | ".join(cells) + " |")
 
     usage = []
+    runs_u = []
     for f in sorted((out / "usage-runs").glob("*.json")):
         if f.name.endswith(".config.json"):
             continue
         r = json.loads(f.read_text())
         if r["round"] == 0 or (r["why"] and not r["why"].startswith("stopped")):   # warm-ups, runs that failed
             continue
+        runs_u.append(r)
+    # a conversation's turns that every engine reached on that GPU in that round: the agent goes on only while the model
+    # calls a tool, and a turn that reads a tool's file is no measure of the turns another engine stopped before
+    # (2026-10-24: upstream ended the agent at its first answer, XeStrata went on to read a 3,800-token file)
+    reached: dict = {}
+    for r in runs_u:
         for conv in dict.fromkeys(t["conv"] for t in r["turns"]):
-            ct = [x for x in r["turns"] if x["conv"] == conv]
+            rk = (r["gpu"], r["round"], conv)
+            have = {x["turn"] for x in r["turns"] if x["conv"] == conv}
+            reached[rk] = have if rk not in reached else reached[rk] & have
+    for r in runs_u:
+        for conv in dict.fromkeys(t["conv"] for t in r["turns"]):
+            common = reached[(r["gpu"], r["round"], conv)]
+            ct = [x for x in r["turns"] if x["conv"] == conv and x["turn"] in common]
+            if not ct:
+                continue
             tot = lambda k: sum(x[k] or 0 for x in ct)   # noqa: E731
             usage.append({
                 "gpu": r["gpu"], "arm": r["arm"], "engine": names.get(r["arm"], r["arm"]), "conv": conv,

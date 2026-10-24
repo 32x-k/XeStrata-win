@@ -32,6 +32,7 @@
 
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/pool_cores.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -64,6 +65,9 @@ struct ExpertJobMulti {
     float* out[MAXT] = {};
     /// Plan v0.3 P6: a native pack's activations (native_quant_act's, in a NativeAct), one per token.
     const void* nact[MAXT] = {};
+    /// Upstream 149 (zero-copy): this job's own layout (null: the layer's) - the GGUF read in place, where gate, up and
+    /// down are three tensors: `blob` is the gate rows and the offsets reach the expert's up and down rows in the mapping.
+    const NativeFmt* fmt = nullptr;
 };
 
 /// One logical processor per PHYSICAL core, so a worker is never scheduled onto an SMT sibling of another
@@ -73,6 +77,18 @@ struct ExpertJobMulti {
 ///
 /// `skip_first` drops the first core, which P2.S3 reserves for the host loop.
 std::vector<int> physical_cores(bool skip_first);
+
+/// `--pool-cores LIST` / STRATA_POOL_CORES / the config's "pool_cores" (experimental, off by default; upstream
+/// 7a5599581): pin the pool's workers to exactly these logical processors, in this order, instead of one per physical
+/// core.  An empty list (the default) leaves the placement as it has always been.  Set before the pool is built.
+/// Processors the process may not run on are left out with a warning; SMT siblings of one core and the host's processor
+/// are kept with a warning.  The worker count is the list's length unless --pool-workers says otherwise.
+void set_pool_cores(const std::vector<int>& cpus);
+const std::vector<int>& pool_cores_setting();
+
+/// Every logical processor this process may run on and the physical core it belongs to (pool_cores.hpp's
+/// LogicalCpuInfo).  Empty when the system does not say.
+std::vector<LogicalCpuInfo> logical_cpu_layout();
 
 /// **THE RESERVATION IS A FICTION UNLESS THE HOST IS ACTUALLY PUT THERE.**
 ///
@@ -132,6 +148,11 @@ public:
     bool host_works() const { return host_works_; }
     /// The logical CPUs the workers are pinned to (--aux-cpus keeps every other thread off them).
     const std::vector<int>& worker_cpus() const { return worker_cpus_; }
+    /// True when the workers sit where `--pool-cores` said (the list, less what could not be used).
+    bool explicit_cores() const { return explicit_cores_; }
+    /// The start-up line about where the workers and the host run ("CPU workers on logical processors 2,4,...,30 (15
+    /// workers, one per physical core; host on 0)"); "" without workers.
+    std::string placement_line() const;
 
     /// Publish `n` jobs, then block until every one has been claimed AND every worker has parked.
     /// `jobs` must outlive the call (it does, and the workers never touch it afterwards).
@@ -242,6 +263,8 @@ private:
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
     std::vector<std::thread> threads_;
     std::vector<int> worker_cpus_;
+    bool explicit_cores_ = false;
+    bool pinned_ = true;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
     int mode_ = 0;

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/spec/draft_policy.cpp - see include/strata/spec/draft_policy.hpp.
 #include "strata/spec/draft_policy.hpp"
 
@@ -23,6 +24,10 @@ constexpr int kProbes = 3;       // a lookup window size is tried this often bef
 // A size not measured for this many rounds is tried again when a confident lookup could use it: its cost was set in
 // one stretch (a prompt's cache refill, say) and, priced high, it would never be measured again (#1252)
 constexpr double kStaleRounds = 300.0;
+// The MTP's window: a draft's acceptance before any is observed (the same 0.7 as prior_tokens), and the chance the
+// drafts must have of holding for a size whose cost is only guessed to be tried (as chain()'s 0.6 for a lookup)
+constexpr double kDraftPrior = 0.7;
+constexpr double kProbeHeld = 0.5;
 
 }  // namespace
 
@@ -41,7 +46,12 @@ double DraftPolicy::lookup_rate(int match) const {
 double DraftPolicy::cost_ms(int t) const {
     t = std::clamp(t, 1, kMaxT);
     if (cost_n_[t] > 0) return cost_[t];
-    // scale from the measured sizes, weighting each by how often it was seen
+    // scale from the nearest measured size below: a round's fixed part flattens the measured curve at its small end,
+    // and scaled from there the wider sizes came out too dear to be tried (Gyro-M on the RX 9060 XT: 46 ms at one
+    // token, 57 at four, the six guessed at 98 against its 74)
+    for (int u = t - 1; u >= 1 && !scale_all_; --u)
+        if (cost_n_[u] > 0) return cost_[u] * kShape[t] / kShape[u];
+    // none below: scale from the measured sizes, weighting each by how often it was seen
     double num = 0.0, den = 0.0;
     for (int u = 1; u <= kMaxT; ++u)
         if (cost_n_[u] > 0) {
@@ -56,7 +66,7 @@ bool DraftPolicy::stale(int t) const { return cost_n_[t] > 0 && rounds_ - last_[
 
 double DraftPolicy::mtp_tokens(int t) const {
     if (mtp_n_[t] > 0) return mtp_tok_[t];
-    return 1.0 + 0.7 * (t - 1);       // before any MTP window of this size: a typical acceptance
+    return prior_tokens(t);
 }
 
 DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const {
@@ -106,6 +116,65 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
         const double got = accepted + 1.0;
         mtp_tok_[t] = mtp_n_[t] > 0 ? (1.0 - kTokAlpha) * mtp_tok_[t] + kTokAlpha * got : got;
         mtp_n_[t] += 1.0;
+    }
+}
+
+// The draft layer's probability is not the model's: the calibration is the accepted drafts over the probabilities
+// of the drafts tested (a draft is tested only while those before it held, so each ratio is conditional on them)
+double DraftPolicy::draft_q(float p) const {
+    const double calib = (dq_ok_ + kPriorN * kDraftPrior) / (dq_p_ + kPriorN * kDraftPrior);
+    return std::clamp((double) p * calib, 0.0, 1.0);
+}
+
+double DraftPolicy::draft_q_mean() const { return (dq_ok_ + kPriorN * kDraftPrior) / (dq_n_ + kPriorN); }
+
+// A window of t tokens, expecting `expected` committed tokens, whose drafts hold with probability `held`: does one
+// more draft of acceptance q raise its tokens per ms?  Yes when the marginal tokens over the marginal ms beat the
+// window's rate (the greedy step of a ratio).  A size whose cost is only a guess is measured instead, when likely.
+bool DraftPolicy::mtp_step_pays(int t, double held, double q, double expected) const {
+    if (t + 1 > max_t_) return false;
+    const double gain = held * q;
+    if (cost_n_[t + 1] < kProbes || stale(t + 1)) return gain >= kProbeHeld;
+    const double dc = cost_ms(t + 1) - cost_ms(t);
+    if (dc <= 0.0) return gain > 0.0;   // measured no dearer: the tokens come free
+    return gain / dc > expected / cost_ms(t);
+}
+
+int DraftPolicy::mtp_window(const float* probs, int max_t) const {
+    max_t = std::clamp(max_t, 1, max_t_);
+    int t = 1;
+    double held = 1.0, expected = 1.0;
+    while (t < max_t) {
+        const double q = draft_q(probs[t - 1]);
+        if (q <= 0.0 || !mtp_step_pays(t, held, q, expected)) break;
+        expected += held * q;
+        held *= q;
+        ++t;
+    }
+    return t;
+}
+
+bool DraftPolicy::mtp_extend(const float* probs, int n, int max_t) const {
+    max_t = std::clamp(max_t, 1, max_t_);
+    if (n < 0 || n + 1 >= max_t) return false;
+    double held = 1.0, expected = 1.0;
+    for (int t = 1; t <= n; ++t) {   // the drafts made must pay first, each at its own probability
+        const double q = draft_q(probs[t - 1]);
+        if (q <= 0.0 || !mtp_step_pays(t, held, q, expected)) return false;
+        expected += held * q;
+        held *= q;
+    }
+    return mtp_step_pays(n + 1, held, draft_q_mean(), expected);
+}
+
+void DraftPolicy::observe_mtp_drafts(const float* probs, int t, int accepted) {
+    dq_ok_ *= kDecay;
+    dq_p_ *= kDecay;
+    dq_n_ *= kDecay;
+    for (int d = 0; d < t - 1 && d <= accepted; ++d) {   // tested: reached while the drafts before it held
+        dq_n_ += 1.0;
+        dq_p_ += std::clamp((double) probs[d], 0.0, 1.0);
+        dq_ok_ += d < accepted ? 1.0 : 0.0;
     }
 }
 

@@ -1221,7 +1221,9 @@ sycl::event row_top_prob_split(sycl::queue& q, const float* logits, int n_rows, 
         sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
         sycl::group_barrier(it.get_group());
         if (it.get_local_id(0) != 0) return;
-        sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+        // relaxed, ordered by the release fence above and the acquire fence below: intel/llvm v7.2.0's NVPTX backend
+        // refuses an acquire or release atomic for sm_60 and older (Pascal, the cuda12.4 package's link stopped there)
+        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
                          sycl::access::address_space::global_space> cnt(sc.count[t]);
         if (cnt.fetch_add(1u) != TOP_SPLIT - 1) return;
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
@@ -1311,30 +1313,56 @@ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream) {
 // device-scope clock; the steady counter where it is compiled for AMD GPUs, whose HIP devices report none either;
 // elsewhere the device-scope clock.  The last two count device ticks (stamps are compared with one another, and
 // converting them to time needs the tick rate, which is not established here).
-void gpu_stamp(unsigned long long* buf, int i, void* stream) {
-    if (!gpu_stamp_available()) fail("gpu_stamp: the device has no clock a kernel reads");
-    Q(stream).single_task([=] {
+namespace {
+struct StampKernel {
+    unsigned long long* buf;
+    int i;
+    void operator()() const {
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
         unsigned long long t;
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
         buf[i] = t;
 #elif defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
         buf[i] = (unsigned long long) __builtin_readsteadycounter();
-#elif defined(SYCL_EXT_ONEAPI_CLOCK)
-        buf[i] = (unsigned long long) sycl::ext::oneapi::experimental::clock<
-            sycl::ext::oneapi::experimental::clock_scope::device>();
+#elif defined(__SYCL_DEVICE_ONLY__)
+        // the clock's SPIR-V itself, not sycl_ext_oneapi_clock's clock<>(): that one marks the kernel as needing the
+        // clock aspect, which the runtime checks before the build, and Level Zero does not list it on a GPU whose
+        // compiler runs the op (the B70, IGC 2.28); the scope is the extension's device scope
+        buf[i] = (unsigned long long) __spirv_ReadClockKHR(
+            static_cast<int>(sycl::ext::oneapi::experimental::clock_scope::device));
 #else
         buf[i] = 0;
 #endif
-    });
+    }
+};
+}  // namespace
+
+void gpu_stamp(unsigned long long* buf, int i, void* stream) {
+    if (!gpu_stamp_available()) fail("gpu_stamp: the device has no clock a kernel reads");
+    Q(stream).single_task(StampKernel{buf, i});
 }
 
+// A Level Zero device may not list the clock aspect yet run the clock's SPIR-V (the B70 with IGC 2.28: a 550 MHz
+// device clock, 2026-10-24), so where the aspect is missing the stamp kernel is built once for the device, and the
+// clock is there when the build goes through.  The HIP backend's clock reads 0 (the extension's own stub), so AMD GPUs
+// take their steady counter instead (StampKernel).
 bool gpu_stamp_available() {
+    static core::PerDevice<bool> per_device;
     const sycl::device d = core::Runtime::get().compute().get_device();
     if (d.get_backend() == sycl::backend::ext_oneapi_cuda) return true;   // %globaltimer
     if (d.get_backend() == sycl::backend::ext_oneapi_hip) return true;    // the steady counter
 #ifdef SYCL_EXT_ONEAPI_CLOCK
-    return d.has(sycl::aspect::ext_oneapi_clock_device);
+    return per_device.get(d, [&d] {
+        if (d.has(sycl::aspect::ext_oneapi_clock_device)) return true;
+        try {
+            const auto ctx = core::Runtime::get().compute().get_context();
+            (void) sycl::get_kernel_bundle<sycl::bundle_state::executable>(ctx, {d}, {sycl::get_kernel_id<StampKernel>()});
+            return true;
+        } catch (const sycl::exception& e) {
+            std::fprintf(stderr, "strata verify: the stamp kernel does not build on this device (%s)\n", e.what());
+            return false;
+        }
+    });
 #else
     return false;
 #endif

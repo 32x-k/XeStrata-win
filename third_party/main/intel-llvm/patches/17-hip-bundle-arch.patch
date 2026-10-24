@@ -2,7 +2,7 @@ SPDX-FileCopyrightText: The LLVM project contributors
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-hip-bundle-arch: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+hip-bundle-arch: a fix to intel/llvm v7.2.0, applied by tools/intel_llvm_build.py.
 
 A kernel bundle (get_kernel_bundle) of a program built for several AMD architectures got the first one's image:
 AMD images carry no compile_target, the runtime asked the HIP adapter about each image alone without handing it
@@ -13,6 +13,7 @@ the runtime hands the HIP adapter the image too, as it does the CUDA one, and th
 clang offload bundle that lacks the device's architecture.
 ---
 diff --git a/sycl/source/detail/program_manager/program_manager.cpp b/sycl/source/detail/program_manager/program_manager.cpp
+index c1f694cbf2..f1df6292c5 100644
 --- a/sycl/source/detail/program_manager/program_manager.cpp
 +++ b/sycl/source/detail/program_manager/program_manager.cpp
 @@ -6,6 +6,7 @@
@@ -23,7 +24,7 @@ diff --git a/sycl/source/detail/program_manager/program_manager.cpp b/sycl/sourc
  //
  //===----------------------------------------------------------------------===//
  
-@@ -556,6 +557,12 @@
+@@ -561,6 +562,12 @@ static bool compatibleWithDevice(const RTDeviceBinaryImage *BinImage,
        DevBin.BinaryStart, std::distance(DevBin.BinaryStart, DevBin.BinaryEnd)};
    if (DeviceImpl.getBackend() == backend::ext_oneapi_cuda)
      UrBinary.pNext = &Blob;
@@ -37,17 +38,18 @@ diff --git a/sycl/source/detail/program_manager/program_manager.cpp b/sycl/sourc
    ur_result_t Error = Adapter.call_nocheck<UrApiKind::urDeviceSelectBinary>(
        URDeviceHandle, &UrBinary,
 diff --git a/unified-runtime/source/adapters/hip/device.cpp b/unified-runtime/source/adapters/hip/device.cpp
+index 42ed5cbeaa..e7079661b0 100644
 --- a/unified-runtime/source/adapters/hip/device.cpp
 +++ b/unified-runtime/source/adapters/hip/device.cpp
-@@ -5,6 +5,7 @@
- // Part of the Unified-Runtime Project, under the Apache License v2.0 with LLVM
- // Exceptions. See LICENSE.TXT
+@@ -4,6 +4,7 @@
+ // Part of the LLVM Project, under the Apache License v2.0 with LLVM
+ // Exceptions. See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-+// Modified 2026 by MistVVK and the XeStrata contributors: a bundle for another architecture is not selected (hip-bundle-arch)
++// Modified 2026 by MistVVK and the XeStrata contributors: the HIP adapter is handed the device image too (hip-bundle-arch)
  //
  //===----------------------------------------------------------------------===//
  
-@@ -1210,6 +1211,8 @@
+@@ -1240,6 +1241,8 @@ UR_APIEXPORT ur_result_t UR_APICALL urDeviceSelectBinary(
            *pSelectedBinary = i;
            return UR_RESULT_SUCCESS;
          }

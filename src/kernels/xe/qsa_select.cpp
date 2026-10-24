@@ -16,9 +16,14 @@
 #include "strata/kernels/device_arch_tag.hpp"
 
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 #include <string>
 
 namespace strata::kernels {
+
+class TopkWideKernel;   // the wide top-k's kernel, asked for its work-group size (topk_wide_fits)
+
 namespace {
 
 constexpr int IDX_DIM = 128, IDX_HEADS = 4, R = 4;
@@ -152,7 +157,7 @@ sycl::event launch_topk_wide(sycl::queue& q, const float* scores, const int32_t*
         sycl::local_accessor<int, 1> s_gt(sycl::range<1>(TK_T / WARP), h);
         sycl::local_accessor<int, 1> s_eq(sycl::range<1>(TK_T / WARP), h);
         sycl::local_accessor<int, 1> s_digit_above(sycl::range<1>(2), h);
-        h.parallel_for(sycl::nd_range<1>(size_t(nq) * TK_T, TK_T), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        h.parallel_for<TopkWideKernel>(sycl::nd_range<1>(size_t(nq) * TK_T, TK_T), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const auto grp = it.get_group();
             const sycl::sub_group sg = it.get_sub_group();
             const int64_t qi = int64_t(it.get_group(0));
@@ -454,13 +459,38 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
     finish(stream, launch_topk_ref(q, scores, steps, nq, max_blocks, cap, ids), "qsa_block_topk_ref");
 }
 
+// Whether the wide top-k's own kernel takes TK_T work-items on q's device.  The device's largest work-group is not
+// enough (#35): on CUDA the kernel's registers bound it too - sm_90's code takes 67 a work-item, 68,608 for 1,024, past
+// the 65,536 of a block, and a GPU newer than the package's newest code (an RTX 5090 running sm_90's PTX) gets what its
+// driver compiles - so its launch failed with "Exceeded the number of registers available on the hardware".  Asked
+// of the kernel itself (kernel_device_specific::work_group_size), once a device.
+static bool topk_wide_fits(sycl::queue& q) {
+    static std::mutex mu;
+    static std::unordered_map<sycl::device, bool> fits;
+    const sycl::device dev = q.get_device();
+    std::lock_guard<std::mutex> lock(mu);
+    if (auto it = fits.find(dev); it != fits.end()) return it->second;
+    bool ok = xe::max_work_group(q) >= (size_t) TK_T;
+    if (ok) {
+        try {
+            const auto id = sycl::get_kernel_id<TopkWideKernel>();
+            const auto bundle = sycl::get_kernel_bundle<sycl::bundle_state::executable>(q.get_context(), {dev}, {id});
+            ok = bundle.get_kernel(id).get_info<sycl::info::kernel_device_specific::work_group_size>(dev) >=
+                 (size_t) TK_T;
+        } catch (const sycl::exception&) {
+            ok = false;                                // not built for this device: the other kernel
+        }
+    }
+    return fits.emplace(dev, ok).first->second;
+}
+
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream) {
-    // STRATA_TOPK_OLD=1: the kernel with one shared histogram, which a device that takes no TK_T-item work-group runs
-    // as well; the same ids
+    // STRATA_TOPK_OLD=1: the kernel with one shared histogram, which a device whose wide kernel takes no TK_T-item
+    // work-group (topk_wide_fits) runs as well; the same ids
     static const bool old = std::getenv("STRATA_TOPK_OLD") != nullptr;
     if (nq <= 0) return;
-    if (old || xe::max_work_group(queue_for(stream)) < (size_t) TK_T) {
+    if (old || !topk_wide_fits(queue_for(stream))) {
         qsa_block_topk_ref(scores, steps, nq, max_blocks, cap, s, ids, stream);
         return;
     }

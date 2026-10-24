@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_prompt_encoder.py - #567's incremental prompt encoding with #537's plain spans: every prompt's ids
 are those of a full encode, and a turn reuses the previous one's.
 
@@ -117,6 +120,7 @@ class Served(unittest.TestCase):
 
     def test_a_refused_prompt_is_not_kept(self):
         svc = self.service(max_context=4096)
+        svc.fit_max_tokens = False   # the strict mode refuses an over-long max_tokens (the default now shortens it)
         msgs = [{"role": "user", "content": "kept " * 20}]
         svc.prepare(msgs, None, {}, 16)
         refused = msgs + [{"role": "assistant", "content": "a"}, {"role": "user", "content": "more " * 20}]

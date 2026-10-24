@@ -19,6 +19,13 @@ bool native_router_enabled();
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream);
 /// n_tok rows at once (logits [n,512], ids/weights [n,10]); each row exactly as the single call.
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
+/// The multi call and the doorbell (elementwise.hpp's doorbell_publish) in one launch: the rows routed as above, the
+/// ids and weights written to the device buffers and to the mapped `ids_out`/`weights_out`, `x` (n_x floats) copied
+/// to `x_out`, then `*d_seq` incremented for the host.  n_tok sub-groups of one work-group: n_tok x 32 work-items at
+/// most the device's work-group.
+void native_router_top10_publish(const float* logits, int32_t* ids, float* weights, int n_tok, const float* x,
+                                 int64_t n_x, float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq,
+                                 void* stream);
 /// STRATA_ROUTE_RESIDENT (upstream 5df35dcb): swap non-resident tail-rank experts for resident ones within `margin`
 /// logits (see router.cpp).  `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident
 /// before, non-resident after.

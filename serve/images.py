@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""serve/images.py - image generation (Qwen-Image-2.1-Turbo) through XeStrata's own image engine, strata-image.
+"""serve/images.py - image generation (Qwen-Image-2.1-Turbo, Qwen-Image-2.1, Mage-Flow) through XeStrata's own image
+engine, strata-image.
 
 POST /v1/images/generations takes OpenAI's request shape (prompt, size, n, response_format b64_json|url) plus Strata's
 own field seed; POST /v1/images/edits the same with reference images (OpenAI's multipart form, image or image[]; or JSON
@@ -11,8 +12,17 @@ vision encoder reads them into the prompt, the VAE's encoder into the DiT's).  T
 server of the same image model and GPU finds it: a model switch does not lose it): its kernels built once, the
 prompt's text states and the layers that fit in VRAM kept between images, one image a request.  It runs Turbo's
 8 steps (CFG 1, the Euler flow sampler, the model's own sigmas), the image the one stable-diffusion.cpp makes with the
-model card's command for the same seed (within LPIPS 0.03).  A size whose sides are not multiples of 16 (1920x1080)
-is made at the sides rounded up (1920x1088) and its middle cut out.
+model card's command for the same seed (within LPIPS 0.03); the base model ("schedule": "base") the steps asked for
+(default the config's "steps", 40) on its scheduler's sigmas (base_sigmas), CFG 1 as well.  A size whose sides are
+not multiples of 16 (1920x1080) is made at the sides rounded up (1920x1088) and its middle cut out.
+
+Mage-Flow ("family": "mage-flow", "schedule": "mage"): its own prompt form (MF_PROMPT_HEAD, the 34 ids of its system
+turn dropped), the steps asked for (default the config's: Turbo 4, the RL model 20, the base model 30) on its static
+shift (mage_sigmas), and guidance by guidance_scale or true_cfg_scale (the one scale it has; default the config's
+"cfg_scale": Turbo 1, none; the others 5.0) with negative_prompt (default " ", its pipeline's).  Its edits take up to
+MF_MAX_REFS reference images, in its edit form (MF_EDIT_HEAD, "Image j: <pad>" before the instruction, the 64 ids of
+the system turn dropped) and the config's "edit_steps" (its edit models': Turbo 4, the others 30), on its edit DiT
+("edit_model"); masks and transparent images it has none of.
 
 The GPU is shared with the text engine one job at a time: an image job takes the service's turn (the FIFO every chat
 request takes), so no chat turn runs on the GPU meanwhile.  The image engine works in the VRAM it is given: what it
@@ -33,21 +43,27 @@ otherwise it lets go of everything but its process (about 200 MiB).  The daemon 
 1800) without a server.
 
 The config's "images" section (written by setup --images, tools/image/qimage.py):
-  {"exe": "engine/strata-image", "diffusion_model": "...Q8_0.gguf", "vae": "...",
-   "llm": "...Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf", "quant": "Q8_0", "gpu_policy": "auto", "reload": "lazy"|"eager",
-   "max_n": 4, "max_side": 2048, "timeout_s": 3600, "uma": false, "out_dir": null, "keep_files": 64,
-   "vision": "...mmproj-F16.gguf", "max_refs": 3, "reserve_mib": 512, "spare_mib": 1024, "ssd_offload": false,
-   "quant_lowered": {"from": "Q8_0", "to": "Q6_K", "need_gb": 15.5, "ram_left_gb": 14.0}}
-  vision: Qwen3-VL's vision encoder (mmproj), for the edits (without it they are refused); max_refs: the reference
-  images an edit takes at most; reserve_mib: VRAM the image engine leaves free when it sizes itself; spare_mib: the
-  free VRAM that must remain after a job under keep for the engine to keep its layers; quant_lowered (only when setup
-  lowered it): the size setup took instead of the one asked for, because the RAM the text model leaves was short
-  (note(): the server's log and the web page say so).
+  {"exe": "engine/strata-image", "diffusion_model": "...Q8_0.gguf", "schedule": "turbo"|"base", "steps": 8|40,
+   "vae": "...", "llm": "...Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf", "quant": "Q8_0", "gpu_policy": "auto",
+   "reload": "lazy"|"eager", "max_n": 4, "max_side": 2048, "timeout_s": 3600, "uma": false, "out_dir": null,
+   "keep_files": 64,
+   "vision": "...mmproj-F16.gguf", "max_refs": 10, "reserve_mib": 512, "spare_mib": 1024, "ssd_offload": false,
+   "text_encoder": "stock", "text_quant": "Q4_K",
+   "quant_lowered": {"from": "Q8_0", "to": "Q6_K", "text_from": "Q8_0", "text_to": "Q4_K", "need_gb": 20.2,
+                     "ram_left_gb": 14.0}}
+  schedule: Turbo's own sigmas or the base model's (base_sigmas; no "schedule" is Turbo); steps: the base model's
+  default (a request's "steps", 2 to MAX_STEPS, overrides it); vision: Qwen3-VL's vision encoder (mmproj), for the
+  edits (without it they are refused); max_refs: the reference images an edit takes at most; reserve_mib: VRAM the
+  image engine leaves free when it sizes itself; spare_mib: the free VRAM that must remain after a job under keep for
+  the engine to keep its layers; quant_lowered (only when setup lowered them): the sizes setup took instead of the ones
+  asked for, because the RAM the text model leaves was short (note(): the server's log and the web page say so).
 """
 from __future__ import annotations
 
 import base64
+import collections
 import contextlib
+import math
 import os
 import queue
 import random
@@ -59,24 +75,48 @@ import sys
 import tempfile
 import threading
 import time
-import zlib
 from pathlib import Path
 from typing import Any
 
 TURBO_STEPS = 8
+MAX_STEPS = 100                    # the base model's
+CFG_MAX = 30.0                     # guidance_scale / true_cfg_scale (vLLM-Omni: "typically 0.0-20.0")
 MODEL_NAME = "qwen-image-2.1-turbo"
 POLICIES = ("auto", "keep", "shrink", "unload")
 SIZE_STEP = 16                     # the VAE's 8x and the DiT's 2x2 patches: sides made at a multiple of 16, then cut
 MIN_SIDE = 256
-FILE_NAME = re.compile(r"^[0-9a-f]{32}\.png$")
+FILE_NAME = re.compile(r"^[0-9a-f]{32}\.(png|jpeg|webp)$")
+# OpenAI's output_format -> the file's MIME type (Pillow writes jpeg and webp; PNG is png_rgba's)
+FORMATS = {"png": "image/png", "jpeg": "image/jpeg", "webp": "image/webp"}
+# Qwen's recommended prompt for a transparent image (its README's "Transparent Image Generation (RGBA)")
+TRANSPARENT_PROMPT = ("This is an RGBA image with transparency. {prompt}. The image has alpha channel and the "
+                      "background is transparent.")
+# OpenAI's quality -> the base model's steps (None: the config's); Turbo keeps its 8 whatever it says
+QUALITY_STEPS = {"low": 20, "medium": 30, "standard": 30, "high": None, "hd": None, "auto": None}
 # the model's prompt (stable-diffusion.cpp's Qwen-Image template): the system turn, whose DROP leading ids' states the
 # DiT does not take, then the user's prompt as plain text
 PROMPT_HEAD = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n<|im_start|>user\n"
 PROMPT_TAIL = "<|im_end|>\n<|im_start|>assistant\n"
 DROP = 14
+# Mage-Flow's prompt (its pipeline's "mage-flow" template): the system turn's 34 ids are not the DiT's
+MF_PROMPT_HEAD = ("<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, "
+                  "text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n")
+MF_DROP = 34
+# its edits' (the "mage-flow-edit" template): the system turn's 64 ids dropped, each reference "Image j: <pad>"
+MF_EDIT_HEAD = ("<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, "
+                "objects, background), then explain how the user's text instruction should alter or modify the image. "
+                "Generate a new image that meets the user's requirements while maintaining consistency with the "
+                "original input where appropriate.<|im_end|>\n<|im_start|>user\n")
+MF_EDIT_DROP = 64
+MF_EDIT_REF = "Image {i}: <|vision_start|><|image_pad|><|vision_end|>"
+MF_MAX_REFS = 3                    # the edit models' training takes up to three references
+MF_SHIFT = 6.0                     # Mage-Flow's static time shift
+MF_NEG = " "                       # its pipeline's negative prompt when none is given
 # an edit's reference image in the prompt: one pad, which the engine widens to the image's tokens
 REF_PROMPT = "{sep}<image{i}><|vision_start|><|image_pad|><|vision_end|>"
 REF_MAX_BYTES = 32 << 20
+MAX_REFS = 10                      # Qwen-Image-2.1's own limit (its model card)
+RAM_SPARE_MIB = 2048               # RAM an image job leaves free beside its prefix cache (the OS, the server)
 START_TIMEOUT_S = 600              # the engine's start: the parts opened and a small image made (kernels built)
 
 
@@ -114,8 +154,12 @@ def _int_field(req: dict, key: str, lo: int, hi: int, default):
 
 
 def parse_request(req: dict, cfg: dict) -> dict:
-    """The fields of one /v1/images/generations request, checked.  Unknown OpenAI fields (quality, style, user,
-    background, moderation) are accepted and ignored; an output format other than PNG is refused."""
+    """The fields of one /v1/images/generations request, checked.  output_format png, jpeg or webp
+    (output_compression 0-100, the quality jpeg and webp are written at); quality low, medium or high (the base model's
+    steps, QUALITY_STEPS; an explicit steps wins); background transparent (the prompt in Qwen's form for it, an image
+    with alpha; not with jpeg), opaque (alpha flattened on white) or auto.  vLLM-Omni's fields too: num_inference_steps
+    (steps by its name), negative_prompt, guidance_scale and true_cfg_scale (CFG_FIELDS).  Unknown fields (style,
+    user, moderation) are accepted and ignored."""
     prompt = req.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ImageRequestError("prompt: a non-empty string")
@@ -126,18 +170,108 @@ def parse_request(req: dict, cfg: dict) -> dict:
     fmt = req.get("response_format") or "b64_json"
     if fmt not in ("b64_json", "url"):
         raise ImageRequestError("response_format: b64_json or url")
-    out_fmt = req.get("output_format")
-    if out_fmt not in (None, "png"):
-        raise ImageRequestError("output_format: only png")
+    out_fmt = req.get("output_format") or "png"
+    if out_fmt not in FORMATS:
+        raise ImageRequestError("output_format: png, jpeg or webp")
+    compression = _int_field(req, "output_compression", 0, 100, 100)
+    quality = req.get("quality")
+    if quality is not None and quality not in QUALITY_STEPS:
+        raise ImageRequestError("quality: low, medium, high or auto")
+    background = req.get("background") or "auto"
+    if background not in ("auto", "opaque", "transparent"):
+        raise ImageRequestError("background: auto, opaque or transparent")
+    if background == "transparent" and out_fmt == "jpeg":
+        raise ImageRequestError("background transparent: png or webp (jpeg has no alpha channel)")
+    if background == "transparent" and cfg.get("transparency") is False:
+        raise ImageRequestError("background transparent: this image model does not make transparent images")
     w, h = parse_size(req.get("size"), int(cfg.get("max_side") or 2048))
     n = _int_field(req, "n", 1, int(cfg.get("max_n") or 4), 1)
-    if req.get("steps") not in (None, TURBO_STEPS):
-        raise ImageRequestError(f"steps: Qwen-Image-2.1-Turbo runs its own {TURBO_STEPS}-step schedule only")
+    if "num_inference_steps" in req:            # vLLM-Omni's name for steps
+        if req.get("steps") not in (None, req["num_inference_steps"]):
+            raise ImageRequestError("steps and num_inference_steps: give one, or the same number")
+        req = {**req, "steps": req["num_inference_steps"]}
+    if cfg.get("schedule") == "base":
+        steps = _int_field(req, "steps", 2, MAX_STEPS,
+                           QUALITY_STEPS.get(quality or "auto") or int(cfg.get("steps") or 40))
+    elif cfg.get("schedule") == "mage":   # Mage-Flow: any count on its static shift, the config's by default
+        steps = _int_field(req, "steps", 1, MAX_STEPS, int(cfg.get("steps") or 4))
+    else:   # Turbo's own sigmas: steps asked for are ignored, as its diffusers pipeline (sample_sigmas) does
+        _int_field(req, "steps", 1, MAX_STEPS, None)
+        steps = TURBO_STEPS
+    cfg_fields = cfg_request(req, cfg)
     seed = _int_field(req, "seed", 0, 2**62, None)
     if seed is None:
         seed = random.SystemRandom().randrange(0, 2**31)
-    return {"prompt": prompt, "width": w, "height": h, "n": n, "steps": TURBO_STEPS, "seed": seed,
-            "response_format": fmt}
+    return {"prompt": prompt, "width": w, "height": h, "n": n, "steps": steps, "seed": seed,
+            "quality": quality or "auto", "response_format": fmt, "output_format": out_fmt,
+            "output_compression": compression, "background": background, **cfg_fields}
+
+
+def cfg_request(req: dict, cfg: dict | None = None) -> dict:
+    """vLLM-Omni's guidance fields, checked: negative_prompt, guidance_scale and true_cfg_scale.  Qwen-Image-2.1 takes
+    classifier-free guidance from true_cfg_scale above 1 with a negative_prompt, as diffusers' QwenImage21Pipeline
+    does (without one, or at 1, none: "cfg" stays out of the job); guidance_scale it has no use for, and ignores.
+    Mage-Flow (cfg "family" mage-flow) has one scale: true_cfg_scale, else guidance_scale, else the config's
+    "cfg_scale"; above 1 it guides, with negative_prompt or its pipeline's " "."""
+    out: dict = {}
+    neg = req.get("negative_prompt")
+    if neg is not None:
+        if not isinstance(neg, str) or len(neg) > 16000 or "\0" in neg:
+            raise ImageRequestError("negative_prompt: a string of at most 16000 characters")
+        out["negative_prompt"] = neg
+    for key in ("guidance_scale", "true_cfg_scale"):
+        v = req.get(key)
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= CFG_MAX:
+            raise ImageRequestError(f"{key}: a number from 0 to {CFG_MAX:g}")
+        out[key] = float(v)
+    if (cfg or {}).get("family") == "mage-flow":
+        scale = out.get("true_cfg_scale", out.get("guidance_scale", float((cfg or {}).get("cfg_scale") or 1.0)))
+        if scale > 1:
+            out["cfg"] = scale
+            out.setdefault("negative_prompt", MF_NEG)
+        return out
+    if out.get("true_cfg_scale", 1.0) > 1 and out.get("negative_prompt") is not None:
+        out["cfg"] = out["true_cfg_scale"]
+    return out
+
+
+def model_prompt(job: dict) -> str:
+    """The prompt as the model reads it: a transparent image's in Qwen's form for one (TRANSPARENT_PROMPT)."""
+    if job.get("background") == "transparent":
+        return TRANSPARENT_PROMPT.format(prompt=job["prompt"].strip().rstrip("."))
+    return job["prompt"]
+
+
+def encode_image(png: bytes, fmt: str, compression: int, opaque: bool = False) -> bytes:
+    """A made image (png_rgba's PNG) in OpenAI's output_format: PNG as it is, jpeg (no alpha: on white) and webp at
+    `compression` as their quality (Pillow); `opaque` (background opaque): its alpha flattened on white."""
+    if fmt == "png" and not opaque:
+        return png
+    import io
+    from PIL import Image
+    im = Image.open(io.BytesIO(png))
+    if fmt == "jpeg" or opaque:
+        bg = Image.new("RGB", im.size, (255, 255, 255))
+        bg.paste(im, mask=im.split()[-1])
+        im = bg
+    out = io.BytesIO()
+    im.save(out, format=fmt.upper(), **({} if fmt == "png" else {"quality": compression}))
+    return out.getvalue()
+
+
+def base_sigmas(steps: int, width: int, height: int) -> list[float]:
+    """Qwen-Image-2.1's sigmas for `steps` steps of a width x height image (the size the engine makes), and the
+    terminal 0: diffusers' QwenImage21Pipeline with the FlowMatchEulerDiscreteScheduler its scheduler_config sets up
+    (linspace(1, 1/steps), the exponential time shift by mu, a line in the image's tokens from base_shift 0.5 at 256 to
+    max_shift 0.9 at 8192, then stretched to end at shift_terminal 0.02).  An image token is a 16 x 16 pixel square."""
+    seq = (width // SIZE_STEP) * (height // SIZE_STEP)
+    mu = 0.5 + (0.9 - 0.5) / (8192 - 256) * (seq - 256)
+    t = [1.0 - i * (1.0 - 1.0 / steps) / (steps - 1) for i in range(steps)]
+    shifted = [math.exp(mu) / (math.exp(mu) + (1.0 / x - 1.0)) for x in t]
+    scale = (1.0 - shifted[-1]) / (1.0 - 0.02)
+    return [1.0 - (1.0 - x) / scale for x in shifted] + [0.0]
 
 
 def image_dims(data: bytes) -> tuple[int, int]:
@@ -167,15 +301,43 @@ def image_dims(data: bytes) -> tuple[int, int]:
     raise ImageRequestError("a reference image: PNG, JPEG, GIF or BMP")
 
 
-def parse_edit_request(req: dict, images: list[bytes], cfg: dict) -> dict:
+def _qimage():
+    """tools/image/qimage.py, the one table of setup's --images choices (setup.py takes it the same way)."""
+    tools = str(Path(__file__).resolve().parent.parent / "tools" / "image")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    import qimage
+    return qimage
+
+
+def setup_choice(cfg: dict) -> str:
+    """The setup --images value that installs the image model of the config's "images" section `cfg` (its
+    "model_name" is the model's name, which for Qwen-Image-2.1 is not the choice's)."""
+    models = _qimage().IMAGE_MODELS
+    name = cfg.get("model_name") or MODEL_NAME
+    return next((k for k, v in models.items() if v[0] == name), _qimage().DEFAULT_MODEL)
+
+
+def not_set_up_message() -> str:
+    """What a request for an image is told when the server has no image generation (the 404)."""
+    choices = [k for k in _qimage().IMAGE_MODELS if not k.endswith("-uncensored")]
+    return ("image generation is not set up on this server: run setup with --images and an image model ("
+            + ", ".join(choices) + "; -uncensored after one for its uncensored text encoder), see docs/IMAGE.md")
+
+
+def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | None = None) -> dict:
     """An edit (/v1/images/edits): parse_request's fields with `images` (the reference images' bytes, PNG, JPEG, GIF or
     BMP) as job["refs"].  size "auto" (or none): the first reference's shape at about 1024 x 1024 pixels, its sides
-    multiples of SIZE_STEP."""
-    if not cfg.get("vision"):
-        raise ImageRequestError("edits need the vision encoder: run setup with --images qwen-image again")
+    multiples of SIZE_STEP.  `mask` (OpenAI's): a PNG of the first image's size whose transparent pixels are where it
+    changes, the rest kept as it is (the engine's inpainting), as job["mask"]; refused by a model whose config says
+    "mask": false."""
+    mage = cfg.get("family") == "mage-flow"
+    if not cfg.get("vision") or (mage and not cfg.get("edit_model")):
+        raise ImageRequestError("edits need the vision encoder" + (" and the edit model" if mage else "") +
+                                f": run setup with --images {setup_choice(cfg)} again")
     if not images:
         raise ImageRequestError("image: one reference image or more")
-    max_refs = int(cfg.get("max_refs") or 3)
+    max_refs = int(cfg.get("max_refs") or (MF_MAX_REFS if mage else MAX_REFS))
     if len(images) > max_refs:
         raise ImageRequestError(f"image: at most {max_refs} reference images")
     dims = []
@@ -186,6 +348,8 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict) -> dict:
         if w < 16 or h < 16:
             raise ImageRequestError(f"image: {w}x{h} is too small")
         dims.append((w, h))
+    if mask is not None:
+        mask = check_mask(mask, dims[0], cfg)
     if req.get("size") in (None, "auto"):
         w0, h0 = dims[0]
         side = int(cfg.get("max_side") or 2048)
@@ -193,9 +357,56 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict) -> dict:
         th = tw * h0 / w0
         tw, th = (min(side, max(MIN_SIDE, round(v / SIZE_STEP) * SIZE_STEP)) for v in (tw, th))
         req = {**req, "size": f"{tw}x{th}"}
-    job = parse_request(req, cfg)
+    # Mage-Flow's edit model has its own steps
+    job = parse_request(req, {**cfg, "steps": cfg.get("edit_steps") or cfg.get("steps")} if mage else cfg)
     job["refs"] = list(images)
+    if mask is not None:
+        job["mask"] = mask
     return job
+
+
+def check_mask(data: bytes, size: tuple[int, int], cfg: dict) -> bytes:
+    """An edit's mask, checked as OpenAI checks it (a PNG with an alpha channel, the first image's size) -> RGBA PNG
+    bytes the engine reads."""
+    if cfg.get("mask") is False:          # no "mask" (configs before it) is Qwen-Image-2.1, which takes one
+        raise ImageRequestError("mask: this image model does not take a mask")
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ImageRequestError("mask: a PNG with an alpha channel")
+    import io
+    from PIL import Image
+    try:
+        im = Image.open(io.BytesIO(data))
+        im.load()
+    except Exception as e:
+        raise ImageRequestError(f"mask: the PNG could not be read ({e})") from None
+    if "A" not in im.getbands() and "transparency" not in im.info:
+        raise ImageRequestError("mask: a PNG with an alpha channel (its transparent pixels are where the image "
+                                "changes)")
+    if im.size != size:
+        raise ImageRequestError(f"mask: {im.size[0]}x{im.size[1]}, not the image's {size[0]}x{size[1]}")
+    out = io.BytesIO()
+    im.convert("RGBA").save(out, format="PNG")
+    return out.getvalue()
+
+
+def ref_size(ref_w: int, ref_h: int) -> tuple[int, int]:
+    """The size the engine works an edit's reference image at (qi_ref_size in src/image/qi_pipeline.cpp): diffusers'
+    calculate_dimensions(1024 * 1024, its width over its height)."""
+    ratio = ref_w / ref_h
+    vw = math.sqrt(1024 * 1024 * ratio)
+    return max(32, round(vw / 32) * 32), max(32, round(vw / ratio / 32) * 32)
+
+
+def usage(job: dict) -> dict:
+    """OpenAI's usage of an image job, in the image engine's tokens: the prompt's ids (the model's chat form) and the
+    reference images' DiT tokens in, the made images' DiT tokens out (a token a 16 x 16 pixel square)."""
+    mw, mh = made_size(job)
+    text = len(job.get("ids") or ())
+    sizes = (ref_size(*image_dims(r)) for r in job.get("refs") or ())
+    refs = sum((w // SIZE_STEP) * (h // SIZE_STEP) for w, h in sizes)
+    out = job["n"] * (mw // SIZE_STEP) * (mh // SIZE_STEP)
+    return {"input_tokens": text + refs, "output_tokens": out, "total_tokens": text + refs + out,
+            "input_tokens_details": {"text_tokens": text, "image_tokens": refs}}
 
 
 def made_size(job: dict) -> tuple[int, int]:
@@ -207,17 +418,17 @@ def made_size(job: dict) -> tuple[int, int]:
 
 def png_rgba(rgba: bytes, width: int, height: int, made_w: int, made_h: int) -> bytes:
     """A PNG (8-bit RGBA, as stable-diffusion.cpp writes) of the middle width x height of an RGBA8 image of
-    made_w x made_h."""
+    made_w x made_h.  Pillow's adaptive row filters at zlib's level 1: 58 ms and 1.5 MB for a 1024 x 1024 image,
+    where filter 0 at level 6 took 100 ms and 2.0 MB (a tenth of a Turbo image's time on a B70)."""
+    import io
+    from PIL import Image
     x0, y0 = (made_w - width) // 2, (made_h - height) // 2
-    rows = bytearray()
-    for y in range(y0, y0 + height):
-        o = (y * made_w + x0) * 4
-        rows += b"\0" + rgba[o:o + width * 4]           # filter type 0 a row
-
-    def chunk(kind: bytes, data: bytes) -> bytes:
-        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(bytes(rows), 6)) + chunk(b"IEND", b""))
+    im = Image.frombuffer("RGBA", (made_w, made_h), rgba, "raw", "RGBA", 0, 1)
+    if (width, height) != (made_w, made_h):
+        im = im.crop((x0, y0, x0 + width, y0 + height))
+    out = io.BytesIO()
+    im.save(out, format="PNG", compress_level=1)
+    return out.getvalue()
 
 
 def path_word(path) -> str:
@@ -226,13 +437,27 @@ def path_word(path) -> str:
     return "".join(chr(b) if 0x21 <= b <= 0x7e and b != 0x25 else f"%{b:02X}" for b in str(path).encode("utf-8"))
 
 
-def prompt_ids(tok, prompt: str, refs: int = 0) -> list[int]:
+def prompt_ids(tok, prompt: str, refs: int = 0, family: str = "qwen-image") -> list[int]:
     """The prompt in the model's chat form, tokenized (Qwen3-VL's tokenizer): the user's text plain, so a special
     token spelled in it stays text; an edit's `refs` reference images before it, one pad each (stable-diffusion.cpp's
-    prompt for Qwen-Image-2.1's edits, the pads widened by the engine)."""
-    head = PROMPT_HEAD + "".join(REF_PROMPT.format(sep=" " if i else "", i=i + 1) for i in range(refs))
+    prompt for Qwen-Image-2.1's edits, the pads widened by the engine).  Mage-Flow's in its own forms (MF_PROMPT_HEAD;
+    an edit's MF_EDIT_HEAD, each reference "Image j: <pad>" before the instruction)."""
+    if family == "mage-flow":
+        head = MF_EDIT_HEAD + "".join(MF_EDIT_REF.format(i=i + 1) for i in range(refs)) if refs else MF_PROMPT_HEAD
+    else:
+        head = PROMPT_HEAD + "".join(REF_PROMPT.format(sep=" " if i else "", i=i + 1) for i in range(refs))
     text = head + prompt + PROMPT_TAIL
     return tok.encode(text, parse_special=True, plain=[(len(head), len(head) + len(prompt))])
+
+
+def mage_sigmas(steps: int, shift: float = MF_SHIFT) -> list[float]:
+    """Mage-Flow's sigmas for `steps` and the terminal 0: shift t / (1 + (shift - 1) t), t from 1 down to 1 / steps
+    (its FlowMatchEulerDiscreteScheduler with a static shift; the engine's own default for Turbo's 4)."""
+    out = []
+    for i in range(steps):
+        t = 1.0 - (1.0 - 1.0 / steps) * i / (steps - 1) if steps > 1 else 1.0
+        out.append(shift * t / (1.0 + (shift - 1.0) * t))
+    return out + [0.0]
 
 
 def load_tokenizer(gguf: str):
@@ -287,6 +512,12 @@ class ImageEngine:
                "--text", str(self.cfg["llm"])]
         if self.cfg.get("vision"):
             cmd += ["--vision", str(self.cfg["vision"])]
+        if self.cfg.get("dit_q8") is not None:   # Mage-Flow's DiT: 8 bits or FP16 as the config says, else by the VRAM
+            cmd += ["--dit-q8", "1" if self.cfg["dit_q8"] else "0"]
+        if self.cfg.get("edit_model"):
+            cmd += ["--edit-dit", str(self.cfg["edit_model"])]
+        if self.cfg.get("dit_keep") is False:
+            cmd += ["--dit-keep", "0"]
         return cmd + ["--serve"]
 
     def alive(self) -> bool:
@@ -407,9 +638,10 @@ class ImageEngine:
             self.close()
             raise ImageJobFailed(f"the image engine is gone ({e}); its log: {self.log_path}") from e
 
-    def ask(self, line: str, want: str, timeout: float, cancel: threading.Event | None = None, step=None) -> dict:
+    def ask(self, line: str, want: str, timeout: float, cancel: threading.Event | None = None, step=None,
+            stage=None) -> dict:
         """Send a request line and wait for its answer (the line starting with `want`) -> its fields; STEP lines go to
-        `step`.  ImageJobFailed on ERROR."""
+        `step`, STAGE lines (refs, text, sampling, decode) to `stage`.  ImageJobFailed on ERROR."""
         self.send(line)
         t0 = time.monotonic()
         while True:
@@ -418,6 +650,9 @@ class ImageEngine:
                 if step is not None:
                     done, steps = got.split()[1:3]
                     step(int(done), int(steps))
+            elif got.startswith("STAGE "):
+                if stage is not None:
+                    stage(got[6:].strip())
             elif got.startswith(want):
                 return _kv(got)
             elif got.startswith("ERROR"):
@@ -460,6 +695,7 @@ class ImageGen:
             raise ValueError('the config\'s "images" section is for stable-diffusion.cpp, which XeStrata no longer '
                              "uses (run setup with --images again)")
         self.policy, self.reload = policy, reload
+        self.drop = MF_DROP if self.cfg.get("family") == "mage-flow" else DROP   # the system turn's ids
         self.model = self.cfg.get("model_name") or MODEL_NAME
         self.log = log
         out = self.cfg.get("out_dir")
@@ -475,16 +711,27 @@ class ImageGen:
         self.totals = {"images": 0, "jobs": 0, "seconds": 0.0, "failed": 0}
         self.last: dict | None = None              # the last job's figures (/v1/status)
         self.progress: tuple | None = None         # (step, steps) of the running job
+        # the job in the GPU's turn as the Monitor shows it (live()), and the jobs that ended, newest last (recent()):
+        # the one record of an image job's progress, which /metrics reads
+        self.job: dict | None = None
+        self.ended: collections.deque[dict] = collections.deque(maxlen=100)
 
     def note(self) -> str | None:
-        """What the user is told about this setup at start and on the web page: the image model's size lowered for
-        the RAM (setup's "quant_lowered"), or None."""
+        """What the user is told about this setup at start and on the web page: the sizes of the image model and its
+        text encoder lowered for the RAM (setup's "quant_lowered"), or None."""
         q = self.cfg.get("quant_lowered")
         if not isinstance(q, dict) or not q.get("from") or not q.get("to"):
             return None
-        return (f"The image model runs at {q['to']} instead of {q['from']}: {q['from']} needs about "
+        parts = []
+        if q["to"] != q["from"]:
+            parts.append(f"the image model at {q['to']} instead of {q['from']}")
+        if q.get("text_from") and q.get("text_to") and q["text_to"] != q["text_from"]:
+            parts.append(f"its text encoder at {q['text_to']} instead of {q['text_from']}")
+        if not parts:
+            return None
+        return (f"Image generation runs {' and '.join(parts)}: the larger sizes need about "
                 f"{q.get('need_gb', '?')} GB of RAM beside the text model, which leaves about "
-                f"{q.get('ram_left_gb', '?')} GB. Run setup with --image-ssd-offload on to keep {q['from']} "
+                f"{q.get('ram_left_gb', '?')} GB. Run setup with --image-ssd-offload on to keep them "
                 "(what does not fit is read from the SSD, slower).")
 
     def missing(self) -> list[str]:
@@ -501,8 +748,8 @@ class ImageGen:
                 pass
 
     def _prune(self) -> None:
-        """Keep the newest keep_files PNGs of response_format url (the oldest go)."""
-        files = sorted((p for p in self.dir.glob("*.png") if FILE_NAME.match(p.name)), key=lambda p: p.stat().st_mtime)
+        """Keep the newest keep_files images of response_format url (the oldest go)."""
+        files = sorted((p for p in self.dir.iterdir() if FILE_NAME.match(p.name)), key=lambda p: p.stat().st_mtime)
         for p in files[:max(0, len(files) - self.keep_files)]:
             with contextlib.suppress(OSError):
                 p.unlink()
@@ -524,11 +771,26 @@ class ImageGen:
         if self.tok is None:
             self.tok = load_tokenizer(self.cfg["llm"])
         if "ids" not in job:
-            job["ids"] = prompt_ids(self.tok, job["prompt"], len(job.get("refs") or ()))
+            fam = self.cfg.get("family") or "qwen-image"
+            job["ids"] = prompt_ids(self.tok, model_prompt(job), len(job.get("refs") or ()), fam)
+            if job.get("cfg"):   # guidance's negative prompt, in the same form (its pads as the prompt's)
+                job["neg_ids"] = prompt_ids(self.tok, job["negative_prompt"], len(job.get("refs") or ()), fam)
         return job["ids"]
 
+    def drop_of(self, job: dict) -> int:
+        """The system turn's ids the DiT does not take: Mage-Flow's edit form has its own."""
+        return MF_EDIT_DROP if self.cfg.get("family") == "mage-flow" and job.get("refs") else self.drop
+
+    @staticmethod
+    def _cfg_words(job: dict) -> str:
+        """IMG's guidance words: the negative prompt's ids and the scale (none without guidance)."""
+        if not job.get("cfg"):
+            return ""
+        return f" NEG:{','.join(str(i) for i in job['neg_ids'])} CFG:{job['cfg']:g}"
+
     def stage(self, job: dict) -> None:
-        """An edit's reference images into files the engine reads (job["ref_paths"]); unstage removes them."""
+        """An edit's reference images and mask into files the engine reads (job["ref_paths"], job["mask_path"]);
+        unstage removes them."""
         if job.get("refs") and not job.get("ref_paths"):
             work = Path(tempfile.mkdtemp(prefix="refs-", dir=self.dir))
             job["ref_dir"] = str(work)
@@ -537,10 +799,14 @@ class ImageGen:
                 p = work / f"ref_{i}"
                 p.write_bytes(data)
                 job["ref_paths"].append(str(p))
+            if job.get("mask"):
+                p = work / "mask"
+                p.write_bytes(job["mask"])
+                job["mask_path"] = str(p)
 
     @staticmethod
     def unstage(job: dict) -> None:
-        for p in job.pop("ref_paths", []) or []:
+        for p in (job.pop("ref_paths", []) or []) + ([job.pop("mask_path")] if job.get("mask_path") else []):
             with contextlib.suppress(OSError):
                 os.unlink(p)
         if job.get("ref_dir"):
@@ -549,16 +815,20 @@ class ImageGen:
 
     @staticmethod
     def _refs_words(job: dict) -> str:
-        return "".join(f" REF:{path_word(p)}" for p in job.get("ref_paths") or ())
+        return ("".join(f" REF:{path_word(p)}" for p in job.get("ref_paths") or ())
+                + (f" MASK:{path_word(job['mask_path'])}" if job.get("mask_path") else ""))
 
     def need(self, job: dict) -> dict:
         """What the image needs, from the engine (started when it is not running): least_mib, full_mib (every layer
-        resident), held_mib (what it holds now) and free_mib (the device's free VRAM)."""
+        resident), held_mib (what it holds now), free_mib (the device's free VRAM), cap_mib (the most the engine could
+        have) and host_mib (the prefix cache in pinned RAM at cap_mib)."""
         with self.lock:
             self._ready()
             w, h = made_size(job)
             self.stage(job)
-            return self.engine.ask(f"NEED {w} {h} {len(self.ids(job)) - DROP}{self._refs_words(job)}", "NEED", 600)
+            n = len(self.ids(job)) - self.drop_of(job)
+            neg = f" NEG:{len(job['neg_ids']) - self.drop_of(job)}" if job.get("cfg") else ""
+            return self.engine.ask(f"NEED {w} {h} {n}{self._refs_words(job)}{neg}", "NEED", 600)
 
     def free_mib(self) -> int:
         """The device's free VRAM, as the engine sees it (its parts left as they are)."""
@@ -599,18 +869,29 @@ class ImageGen:
                 self._ready()
                 self.stage(job)
                 ids = ",".join(str(i) for i in self.ids(job))
+                sched = self.cfg.get("schedule")
+                sig = (base_sigmas(job["steps"], mw, mh) if sched == "base" else
+                       mage_sigmas(job["steps"]) if sched == "mage" else [])
+                sigmas = " SIGMAS:" + ",".join(f"{x:.7g}" for x in sig) if sig else ""
                 for i in range(job["n"]):
                     if cancel is not None and cancel.is_set():
                         self.totals["failed"] += 1
                         raise ImageJobFailed("cancelled (the client left)")
-                    self.progress = (i * TURBO_STEPS, job["n"] * TURBO_STEPS)
+                    self.progress = (i * job["steps"], job["n"] * job["steps"])
+                    self._live(image=i + 1, step=0, steps=job["steps"], stage="refs" if job.get("refs") else "text",
+                               sampling_at=None)
                     out = work / f"img_{i}.rgba"
 
                     def step(done, steps, i=i):
                         self.progress = (i * steps + done, job["n"] * steps)
+                        self._live(step=done, steps=steps)
+
+                    def stage(name):
+                        self._live(stage=name, **({"sampling_at": time.monotonic()} if name == "sampling" else {}))
                     try:
-                        r = self.engine.ask(f"IMG {mw} {mh} {job['seed'] + i} {DROP} {path_word(out)} {ids}"
-                                            f"{self._refs_words(job)}", "IMAGE", timeout, cancel, step)
+                        r = self.engine.ask(f"IMG {mw} {mh} {job['seed'] + i} {self.drop_of(job)} {path_word(out)} "
+                                            f"{ids}{sigmas}{self._refs_words(job)}{self._cfg_words(job)}", "IMAGE",
+                                            timeout, cancel, step, stage)
                     except ImageJobFailed as e:
                         self.totals["failed"] += 1
                         why = "cancelled (the client left)" if str(e) == "stopped" else str(e)
@@ -627,7 +908,8 @@ class ImageGen:
             with contextlib.suppress(OSError):
                 work.rmdir()
         secs = time.monotonic() - t0
-        figures = {"seconds": round(secs, 2), "steps": job["steps"], "n": job["n"], "refs": len(job.get("refs") or ()),
+        figures = {"seconds": round(secs, 2), "steps": job["steps"], "cfg": job.get("cfg") or 1.0, "n": job["n"],
+                   "refs": len(job.get("refs") or ()),
                    "size": f"{job['width']}x{job['height']}", "seed": job["seed"], "engine": "strata-image",
                    "quant": self.cfg.get("quant"),
                    "text_encode_ms": round(sum(r.get("text_s", 0) for r in parts) * 1000, 1),
@@ -642,24 +924,76 @@ class ImageGen:
         self.last = figures
         return images, figures
 
-    def store(self, data: bytes) -> str:
-        """Keep one PNG for response_format url -> its file name (32 random hex digits: the name is the access)."""
-        name = secrets.token_hex(16) + ".png"
+    def store(self, data: bytes, fmt: str = "png") -> str:
+        """Keep one image for response_format url -> its file name (32 random hex digits: the name is the access, and
+        the output_format)."""
+        name = f"{secrets.token_hex(16)}.{fmt}"
         (self.dir / name).write_bytes(data)
         self._prune()
         return name
 
     def response(self, images: list[bytes], job: dict, figures: dict, base_url: str) -> dict:
         data = []
+        fmt = job.get("output_format") or "png"
         for i, png in enumerate(images):
-            item = {"revised_prompt": job["prompt"], "seed": job["seed"] + i}
+            item = {"revised_prompt": model_prompt(job), "seed": job["seed"] + i}
+            img = encode_image(png, fmt, job.get("output_compression", 100), job.get("background") == "opaque")
             if job["response_format"] == "url":
-                item["url"] = f"{base_url}/v1/images/files/{self.store(png)}"
+                item["url"] = f"{base_url}/v1/images/files/{self.store(img, fmt)}"
             else:
-                item["b64_json"] = base64.b64encode(png).decode("ascii")
+                item["b64_json"] = base64.b64encode(img).decode("ascii")
             data.append(item)
-        return {"created": int(time.time()), "data": data, "model": self.model,
-                "output_format": "png", "size": f"{job['width']}x{job['height']}", "strata": figures}
+        return {"created": int(time.time()), "data": data, "model": self.model, "output_format": fmt,
+                "size": f"{job['width']}x{job['height']}", "background": job.get("background") or "auto",
+                "quality": job.get("quality") or "auto", "usage": usage(job), "strata": figures}
+
+    # ---- the progress the Monitor shows (/metrics' live.image) and the jobs that ended (its Requests table)
+    STAGE_LABELS = {"waiting": "Making room on the GPU", "refs": "Reading the reference images",
+                    "text": "Reading the prompt", "sampling": "Sampling", "decode": "Decoding the image (VAE)"}
+
+    def begin(self, job: dict) -> None:
+        """The job has the GPU's turn (gpu_turn): from here it is the running job."""
+        self.job = {"started": time.time(), "t0": time.monotonic(), "stage": "waiting", "image": 1, "images": job["n"],
+                    "step": 0, "steps": job["steps"], "size": f"{job['width']}x{job['height']}",
+                    "refs": len(job.get("refs") or ()), "edit": bool(job.get("refs")), "sampling_at": None}
+
+    def _live(self, **kw) -> None:
+        if self.job is not None:
+            self.job.update(kw)
+
+    def live(self) -> dict | None:
+        """The running job's stage, step n of the steps, the seconds so far and a step, its size and image i of n, and
+        its overall progress (0..1: each image a share; its sampling by the steps, the stages around it at their
+        boundaries)."""
+        j = dict(self.job) if self.job is not None else None
+        if j is None:
+            return None
+        now = time.monotonic()
+        stage, done, steps = j["stage"], j["step"], max(1, j["steps"])
+        step_s = round((now - j["sampling_at"]) / done, 2) if j["sampling_at"] is not None and done > 0 else None
+        within = {"waiting": 0.0, "refs": 0.02, "text": 0.05, "sampling": 0.1 + 0.8 * done / steps,
+                  "decode": 0.9}.get(stage, 0.0)
+        frac = (j["image"] - 1 + within) / max(1, j["images"])
+        return {"stage": stage, "label": self.STAGE_LABELS.get(stage, stage), "step": done, "steps": j["steps"],
+                "image": j["image"], "images": j["images"], "size": j["size"], "refs": j["refs"], "edit": j["edit"],
+                "elapsed_s": round(now - j["t0"], 1), "step_s": step_s, "progress": round(min(1.0, frac), 3)}
+
+    def end(self, error: str | None, cancelled: bool = False) -> None:
+        """The running job ended: one row of the Monitor's Requests table (the time it got the GPU, its size, the
+        references, the seconds and each stage's, done or the error)."""
+        j, self.job = self.job, None
+        if j is None:
+            return
+        last = self.last if error is None and self.last is not None else {}
+        self.ended.append({"kind": "image", "time": j["started"], "duration_s": round(time.monotonic() - j["t0"], 1),
+                           "finish": "stop" if error is None else "cancel" if cancelled else "error",
+                           "error": None if cancelled else error,
+                           "size": j["size"], "n": j["images"], "refs": j["refs"], "edit": j["edit"],
+                           "seconds": last.get("seconds"), "text_encode_ms": last.get("text_encode_ms"),
+                           "sampling_s": last.get("sampling_s"), "vae_decode_s": last.get("vae_decode_s")})
+
+    def recent(self) -> list[dict]:
+        return list(self.ended)
 
     def status(self) -> dict:
         out = {"enabled": True, "model": self.model, "engine": "strata-image", "quant": self.cfg.get("quant"),
@@ -674,10 +1008,11 @@ class ImageGen:
 
 
 # ------------------------------------------------------------------------------------------- chat's image tools
-FILE_REF = re.compile(r"/v1/images/files/([0-9a-f]{32}\.png)")
+OPTION_KEYS = ("size", "quality", "output_format", "output_compression", "background")
+FILE_REF = re.compile(r"/v1/images/files/([0-9a-f]{32}\.(?:png|jpeg|webp))")
 TOOLS = [
     {"name": "generate_image",
-     "description": "Make an image from a description with the image model on this computer (Qwen-Image-2.1-Turbo). "
+     "description": "Make an image from a description with the image model on this computer. "
                     "Describe it in detail: the subject, the setting, the style, the light, and any text it shows in "
                     "quotes. The image is shown to the user; the result says where it is.",
      "parameters": {"type": "object", "properties": {
@@ -704,8 +1039,12 @@ class ImageTools:
     the server makes the image in the GPU's turn as /v1/images does, keeps it (/v1/images/files/), and the call's
     result tells the model where it is.  The hub run_with_mcp runs (template_tools, routes, call, settings)."""
 
-    def __init__(self, svc, gen: ImageGen, messages: list, load, normalize):
+    def __init__(self, svc, gen: ImageGen, messages: list, load, normalize, options: dict | None = None):
         self.svc, self.gen, self.messages, self.load, self.normalize = svc, gen, messages, load, normalize
+        # a Responses request's image_generation tool: its size, quality, output_format, output_compression and
+        # background, over what the model's call says (size "auto": the call's)
+        self.options = {k: v for k, v in (options or {}).items()
+                        if k in OPTION_KEYS and v is not None and not (k == "size" and v == "auto")}
         self.settings = {"max_rounds": 4}
         self.made: list[str] = []          # the images this request made (file names)
 
@@ -722,7 +1061,7 @@ class ImageTools:
 
     def _image(self, which: str) -> bytes | None:
         """The image an edit takes: a /v1/images/files/ link (or its file name), else the conversation's last."""
-        m = FILE_REF.search(which or "") or re.fullmatch(r"([0-9a-f]{32}\.png)", which or "")
+        m = FILE_REF.search(which or "") or re.fullmatch(r"([0-9a-f]{32}\.(?:png|jpeg|webp))", which or "")
         if m:
             return self._file(m.group(1))
         if self.made:
@@ -744,7 +1083,7 @@ class ImageTools:
         args = arguments if isinstance(arguments, dict) else {}
         urls: list[str] = []
         try:
-            req = {k: args[k] for k in ("prompt", "size", "seed") if args.get(k) not in (None, "")}
+            req = {**{k: args[k] for k in ("prompt", "size", "seed") if args.get(k) not in (None, "")}, **self.options}
             if name == "generate_image":
                 job = parse_request(req, self.gen.cfg)
             elif name == "edit_image":
@@ -756,7 +1095,9 @@ class ImageTools:
                 raise ImageRequestError(f"there is no tool named {name!r}")
             with gpu_turn(self.svc, self.gen, job, cancel):
                 images, figures = self.gen.run(job, cancel)
-            names = [self.gen.store(png) for png in images]
+            fmt = job["output_format"]
+            names = [self.gen.store(encode_image(png, fmt, job["output_compression"], job["background"] == "opaque"),
+                                    fmt) for png in images]
             self.made += names
             urls = [f"/v1/images/files/{n}" for n in names]
             text = (f"The image is made ({job['width']}x{job['height']}, seed {job['seed']}, "
@@ -766,7 +1107,10 @@ class ImageTools:
         except (ValueError, ImageJobFailed) as e:
             text, ok = f"error: {e}", False
         return {"ok": ok, "text": text, "chars": len(text), "truncated": False,
-                "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": name, "images": urls}
+                "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": name, "images": urls,
+                **({"image": {"size": f"{job['width']}x{job['height']}", "quality": job["quality"],
+                              "background": job["background"], "output_format": job["output_format"],
+                              "revised_prompt": model_prompt(job)}} if ok else {})}
 
 
 # ------------------------------------------------------------------------------------------- the GPU turn
@@ -836,6 +1180,28 @@ def _client_gone(svc) -> Exception:
     return getattr(sys.modules.get(type(svc).__module__), "ClientGone", RuntimeError)()
 
 
+def check_room(need: dict, ram_mib: int | None) -> None:
+    """An image the GPU cannot make even with the text model unloaded (its least above the engine's cap), or whose
+    prefix cache would not fit the free RAM (`ram_mib`, None: not known): refused before the job, not shrunk (the
+    user's decision, 2026-10-21)."""
+    least, cap, host = (int(need.get(k) or 0) for k in ("least_mib", "cap_mib", "host_mib"))
+    hint = "use fewer or smaller reference images, or a smaller size"
+    if cap and least > cap:
+        raise ImageRequestError(f"this image needs at least {least / 1024:.1f} GiB of VRAM and the GPU has "
+                                f"{cap / 1024:.1f} GiB for images: {hint}")
+    if ram_mib is not None and host > ram_mib - RAM_SPARE_MIB:
+        raise ImageRequestError(f"this image keeps {host / 1024:.1f} GiB of its prompt's cache in RAM and "
+                                f"{max(ram_mib, 0) / 1024:.1f} GiB is free: {hint}")
+
+
+def ram_available_mib() -> int | None:
+    try:
+        import psutil
+        return int(psutil.virtual_memory().available >> 20)
+    except (ImportError, OSError):
+        return None
+
+
 @contextlib.contextmanager
 def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None):
     """The image job's turn on the GPU: the service's FIFO (and, with parallel requests, the engine's control lines
@@ -843,11 +1209,13 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
     with svc.status_lock:
         svc.status["queued"] += 1
     queued = True
+    error: str | None = None
     try:
         with svc._turn(cancel):
             with svc.status_lock:
                 svc.status["queued"] -= 1
             queued = False
+            gen.begin(job)
             ctl = getattr(svc.engine, "ctl", None) if getattr(svc.engine, "batch", 0) else None
             if ctl is not None:
                 while not ctl.acquire(timeout=0.25):
@@ -866,6 +1234,7 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                 except ImageJobFailed:
                     gen.totals["failed"] += 1
                     raise
+                check_room(need, ram_available_mib())
                 policy = resolve_policy(svc, gen, need)
                 with svc.status_lock:
                     svc.status.update(busy=True, phase="generating an image", started=time.time(),
@@ -884,7 +1253,11 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
             finally:
                 if ctl is not None:
                     ctl.release()
+    except BaseException as e:
+        error = str(e) or type(e).__name__
+        raise
     finally:
+        gen.end(error, cancelled=cancel is not None and cancel.is_set())
         if queued:
             with svc.status_lock:
                 svc.status["queued"] -= 1

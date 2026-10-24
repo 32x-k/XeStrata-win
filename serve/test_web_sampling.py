@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_web_sampling.py - the web page sends no sampling of its own until the user changes it (0.1.45, #2685).
 
 The page used to send temperature 0.6 / top_p 0.95 / top_k 20 with every request, so the server's model-card defaults

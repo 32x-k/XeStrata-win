@@ -44,12 +44,34 @@ foreach(dir "${STRATA_XWIN}/crt/include" "${STRATA_XWIN}/sdk/include/ucrt" "${ST
   string(APPEND _strata_win_flags " -idirafter \"${dir}\"")
 endforeach()
 set(CMAKE_C_FLAGS_INIT "${_strata_win_flags}")
+# llvm-rc's (a library's version resource, xz's among them)
+set(CMAKE_RC_FLAGS_INIT "-I\"${STRATA_XWIN}/sdk/include/um\" -I\"${STRATA_XWIN}/sdk/include/shared\" \
+-I\"${STRATA_XWIN}/crt/include\" -I\"${STRATA_XWIN}/sdk/include/ucrt\"")
 set(CMAKE_CXX_FLAGS_INIT "${_strata_win_flags}")
 # CMake adds -fuse-ld=lld-link itself and clang finds it through -B: a folder with lld-link alone, as the LLVM folder's
 # other tools (clang-offload-bundler) would take the place of intel/llvm's
 set(_strata_lld_dir "${CMAKE_BINARY_DIR}/strata-lld-link")
 file(MAKE_DIRECTORY "${_strata_lld_dir}")
 file(CREATE_LINK "${STRATA_LLD_LINK}" "${_strata_lld_dir}/lld-link" SYMBOLIC)
+# the AMD device code's link (ELF) takes -fuse-ld=lld-link as the name ld.lld-link: the compiler's own ld.lld under it
+if(CMAKE_CXX_COMPILER)
+  get_filename_component(_strata_cxx_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  if(EXISTS "${_strata_cxx_bin}/ld.lld")
+    file(CREATE_LINK "${_strata_cxx_bin}/ld.lld" "${_strata_lld_dir}/ld.lld-link" SYMBOLIC)
+  endif()
+  # and its lld (-flavor gnu -m elf64_amdgpu), found here first, ignores the libraries the device objects name: the MSVC
+  # and Windows SDK headers' #pragma comment(lib, ...) and CMake's --dependent-lib=msvcrt reach the device compilation
+  # too, and intel/llvm v7.2.0's lld (LLVM 23) refuses a library it cannot find there (msvcrt, msvcprt, uuid.lib)
+  if(EXISTS "${_strata_cxx_bin}/lld")
+    file(WRITE "${_strata_lld_dir}/lld"
+         "#!/bin/sh
+case \" $* \" in *\" elf64_amdgpu \"*) exec \"${_strata_cxx_bin}/lld\" \"$@\" --no-dependent-libraries ;; esac
+"
+         "exec \"${_strata_cxx_bin}/lld\" \"$@\"
+")
+    execute_process(COMMAND chmod 755 "${_strata_lld_dir}/lld")
+  endif()
+endif()
 set(_strata_win_link "-B\"${_strata_lld_dir}\" -L\"${STRATA_XWIN}/crt/lib/x86_64\" \
 -L\"${STRATA_XWIN}/sdk/lib/um/x86_64\" -L\"${STRATA_XWIN}/sdk/lib/ucrt/x86_64\" -L\"${STRATA_SYCL_WINDOWS}/lib\"")
 set(CMAKE_EXE_LINKER_FLAGS_INIT "${_strata_win_link}")

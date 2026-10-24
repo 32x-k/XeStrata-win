@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """setup.check_shards: a metadata-only GGUF shard that ends at its header (no alignment padding, #2346) is whole;
 a shard whose tensor data runs past its end is still refused."""
 import struct

@@ -1,0 +1,55 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 864e725..100eaf2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -96,6 +96,18 @@ if(AOTRITON_MIN_PYTHON VERSION_LESS "3.10")
+ endif()
+ 
+ find_package(Python3 ${AOTRITON_MIN_PYTHON} COMPONENTS Interpreter REQUIRED)
++# AOTRITON_HIP_WINDOWS: a cross build for Windows gives HIP's headers (include/) and an import library of the HIP
++# runtime (lib/amdhip64.lib) in this folder; hip::host and hip::amdhip64 are made of them, as hip's CMake package for
++# Linux would not do
++set(AOTRITON_HIP_WINDOWS "" CACHE PATH "Windows: HIP's headers and import library (a cross build)")
++if(AOTRITON_HIP_WINDOWS)
++  add_library(hip::host INTERFACE IMPORTED)
++  set_target_properties(hip::host PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${AOTRITON_HIP_WINDOWS}/include"
++                        INTERFACE_COMPILE_DEFINITIONS "__HIP_PLATFORM_AMD__")
++  add_library(hip::amdhip64 UNKNOWN IMPORTED)
++  set_target_properties(hip::amdhip64 PROPERTIES IMPORTED_LOCATION "${AOTRITON_HIP_WINDOWS}/lib/amdhip64.lib"
++                        INTERFACE_LINK_LIBRARIES hip::host)
++else()
+ # Must set this otherwise hip-config-amd.cmake cannot find AMDDeviceLibs.
+ # Prefer ROCM_PATH (e.g. theRock SDK from `rocm-sdk path --root`) when set, so
+ # find_package(hip) does not pick up a stale /opt/rocm install.
+@@ -108,6 +120,7 @@ else()
+   list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")
+ endif()
+ find_package(hip REQUIRED)
++endif()
+ 
+ set(VENV_DIR "${CMAKE_CURRENT_BINARY_DIR}/venv" CACHE STRING "Virtual Environment Directory")
+ option(AOTRITON_NO_PYTHON "Disable python binding build" OFF)
+@@ -351,7 +364,7 @@ endif()
+ 
+ set(ENV{VIRTUAL_ENV} "${VENV_DIR}")
+ message("VENV_DIR ${VENV_DIR}")
+-if(WIN32)
++if(CMAKE_HOST_WIN32)   # the build machine's venv (a cross build's is Linux's)
+   set(VENV_REL_PYTHON "Scripts/python")
+   set(VENV_REL_TRITON "triton/_C/libtriton.pyd")
+ else()
+diff --git a/include/aotriton/util.h b/include/aotriton/util.h
+index f3b2483..43700de 100644
+--- a/include/aotriton/util.h
++++ b/include/aotriton/util.h
+@@ -36,8 +36,9 @@ TRICAT(uint16_t high, uint16_t mid, uint16_t low) {
+   return (high64 << 32) | (mid64 << 16) | low64;
+ }
+ 
++// no AOTRITON_API: a template is not imported from the DLL (clang refuses dllimport on its definition)
+ template<typename T>
+-T AOTRITON_API
++T
+ cdiv(T numerator, T denominator) {
+   return (numerator + (denominator - 1)) / denominator;
+ }

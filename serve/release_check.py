@@ -39,7 +39,7 @@ def current_version(root: Path = ROOT) -> str:
         text = (root / "CMakeLists.txt").read_text(encoding="utf-8")
     except OSError:
         return "0"
-    m = re.search(r'set\(STRATA_UPSTREAM_VERSION "([\d.]+)"\)', text)
+    m = re.search(r'set\(STRATA_UPSTREAM_VERSION "(\d[\w.-]*)"\)', text)
     r = re.search(r"set\(XESTRATA_REVISION (\d+)\)", text)
     if not m:
         return "0"
@@ -52,14 +52,16 @@ def packaged(root: Path = ROOT) -> bool:
 
 def vtuple(v) -> tuple | None:
     """A version's order: xe0.1.43.1-1 (a tag) or 0.1.43.1-1, <upstream>-<revision> since 2026-10-13, ->
-    (1, (0, 1, 43, 1), 1); a version of the earlier form, xe0.1.40.2.2 or 0.1.40.2.2 (a later release on an upstream
-    version took a number more), -> (0, (0, 1, 40, 2, 2), 0), older than any of the new form.  None for anything
-    else."""
-    m = re.fullmatch(r"(?:xe|v)?(\d+(?:\.\d+)*)(?:-(\d+))?", str(v or "").strip())
+    (1, (0, 1, 43, 1), (1, ""), 1); on an upstream pre-release, xe0.2.0-beta-1 or 0.2.0~beta-1 (a package's), ->
+    (1, (0, 2, 0), (0, "beta"), 1), older than the release 0.2.0-1; a version of the earlier form, xe0.1.40.2.2 or
+    0.1.40.2.2 (a later release on an upstream version took a number more), -> (0, (0, 1, 40, 2, 2), (1, ""), 0),
+    older than any of the new form.  None for anything else."""
+    m = re.fullmatch(r"(?:xe|v)?(\d+(?:\.\d+)*)(?:[-~]([A-Za-z][A-Za-z0-9.]*))?(?:-(\d+))?", str(v or "").strip())
     if not m:
         return None
     nums = tuple(int(x) for x in m.group(1).split("."))
-    return (1, nums, int(m.group(2))) if m.group(2) is not None else (0, nums, 0)
+    pre = (0, m.group(2)) if m.group(2) else (1, "")
+    return (1, nums, pre, int(m.group(3))) if m.group(3) is not None else (0, nums, pre, 0)
 
 
 def how_to_update(root: Path = ROOT) -> str:

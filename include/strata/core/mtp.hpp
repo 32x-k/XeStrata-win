@@ -30,6 +30,7 @@
 #include "strata/core/gpu.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -84,15 +85,19 @@ public:
     bool prepare_prefill(std::string& err);
     strata::gpu::Stream stream() const { return cs_; }
 
+    /// Whether the chain drafts one more after `n` drafts, whose probabilities are probs[0..n-1] (the window's own
+    /// rule: the policy's expected tokens per ms, or a floor on the last draft's probability); empty = every draft.
+    using More = std::function<bool(int n, const float* probs)>;
+
     /// One round: catch-up over T cells from `p` (rows = the window's final residuals, `tokens` = the window's
     /// argmaxes: row t pairs R_{p+t} with the token at p+t+1), then the draft chain from row `a` (the last
     /// accepted row) for T-1 drafts at cells p+a+1 ...  `drafts` gets T-1 tokens.
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
-               float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+               float* probs = nullptr, const More& more = {}, int* n_drafts = nullptr);
 
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
-                     float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+                     float* probs = nullptr, const More& more = {}, int* n_drafts = nullptr);
 
     /// COUPLED DRAFT SAMPLING (core/coupled_draft.hpp; STRATA_SPEC_COUPLED=1, set up by bind()): the request's
     /// sampling.  A sampled request (temperature > 0, not greedy) then drafts by SAMPLING with the target's chain and
@@ -135,6 +140,7 @@ public:
     const float* tensor_f32(const char* name) const { return f32(name); }
     const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
     const void* tensor_q8(const char* name) const { return q8(name); }
+    int tensor_q8_type(const char* name) const { return q8_type(name); }   // Q8_0, or kNativeQ8Rows once rewritten
     QsaState& kv_state_rw() { return st_; }
     int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
     int device() const { return device_; }
@@ -161,6 +167,7 @@ private:
     const float* f32(const char* name) const;
     const uint16_t* bf16(const char* name) const;
     const void* q8(const char* name) const;
+    int q8_type(const char* name) const;   // the GGML type to read a q8 tensor with: Q8_0, or kNativeQ8Rows once rewritten
 
     const ModelGeometry* g_ = nullptr;
     SessionState* ss_ = nullptr;
@@ -200,7 +207,12 @@ private:
     strata::gpu::Event* pf_ev_ = nullptr;
     strata::gpu::Graph* round_exec_[9] = {};
 
-    struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
+    struct Tensor {
+        std::string name, kind;
+        int64_t rows = 0, cols = 0;
+        uint64_t off = 0, bytes = 0;
+        bool q8_rows = false;   // a Q8_0 matrix rewritten into kNativeQ8Rows' layout at load (the aligned read)
+    };
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
     // a slot drafter borrows the immutable weights and the draft head; each still owns its state and scratch

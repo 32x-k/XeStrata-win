@@ -2,7 +2,7 @@ SPDX-FileCopyrightText: The LLVM project contributors
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-cuda-select-binary-2: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+cuda-select-binary-2: a fix to intel/llvm v7.2.0, applied by tools/intel_llvm_build.py.
 
 The SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture:
 with code for several architectures, a GPU older than that image failed and a newer one ran older code.
@@ -11,18 +11,18 @@ one; in a fatbin (CUDA 13 compresses the PTX in it) the entries' architecture fi
 the image itself (cuda-binary-to-adapter, cuda-binaries-to-adapter, cuda-binaries-to-adapter-2).
 ---
 diff --git a/unified-runtime/source/adapters/cuda/device.cpp b/unified-runtime/source/adapters/cuda/device.cpp
-index 2db2e2d..c3ff01a 100644
+index 452e559843..07a663dad1 100644
 --- a/unified-runtime/source/adapters/cuda/device.cpp
 +++ b/unified-runtime/source/adapters/cuda/device.cpp
-@@ -5,6 +5,7 @@
- // Part of the Unified-Runtime Project, under the Apache License v2.0 with LLVM
- // Exceptions. See LICENSE.TXT
+@@ -4,6 +4,7 @@
+ // Part of the LLVM Project, under the Apache License v2.0 with LLVM
+ // Exceptions. See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 +// Modified 2026 by MistVVK and the XeStrata contributors: the PTX with the highest .target the device runs is selected (cuda-select-binary-2)
  //
  //===----------------------------------------------------------------------===//
  
-@@ -1393,18 +1394,88 @@ ur_result_t UR_APICALL urDeviceGetGlobalTimestamps(ur_device_handle_t hDevice,
+@@ -1424,18 +1425,88 @@ ur_result_t UR_APICALL urDeviceGetGlobalTimestamps(ur_device_handle_t hDevice,
  
  /// \return If available, the first binary that is PTX
  ///

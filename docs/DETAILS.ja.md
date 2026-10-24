@@ -200,7 +200,7 @@ UkisAI による Qwen3.8-Flash-Next のファインチューンで、ずっと�
 エキスパートの gate・up は IQ3_S（1 層は IQ4_XS）、down は IQ4_NL（5 層は Q8_0）で、59.5 GB あります。
 密な部分と、RAM の予算の扱いは、下の UD-Q4_K_XL と同じです（`--resident-budget-gib N`、setup は RAM から 24 GB を引いた値を選びます）。
 RAM が約 80 GB あれば、すべてのエキスパートが RAM に入ります。
-setup は画像を尋ね（既定はオフ）、画像のエンコーダーは元のモデルのものです。
+setup は画像を尋ね（既定はオン）、画像のエンコーダーは元のモデルのものです。
 
 ```sh
 ./setup.sh --setup --family unsloth --model UD-IQ4_XS
@@ -243,59 +243,85 @@ Arc Pro B70（32 GB）と i7-14700、RAM 96 GB で、setup の設定のまま、
 
 答えは、どの実行でも同じトークンでした。
 
-### Gyro（agentionai）
+### Unsloth の UD-Q5_K_XL・UD-Q6_K_XL・Q8_0（実験的）
 
-**[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)** は、agentionai による Qwen3.8-Flash-Next の量子化で、Gyro-S と Gyro-M の 2 つです（upstream 0.2.0）。
-エキスパートは、トレリス符号のブロック（ggml の型 TQ2_T、TQK6、TQK7）を、ブロック 128 のアダマール回転をした基底で持ちます。
-エンジンは、エキスパートの入力（gate・up の x と down の h）を同じ回転にかけてから掛けます。CPU のエキスパート、GPU の decode の窓、補助の GPU、prompt の FP16 の経路のどれでもです。
-prompt の int8 の積は回転しないので、回転したエキスパートの層は FP16 の経路を通ります。
-ファイルはどちらも 1 つで、その半分ほどは n-gram の表です。表は SSD に置いたまま読むので、速い SSD に置いてください。
+Unsloth の 5・6・8 ビットのファイルも選べます（それぞれ 6 つのシャード、upstream 0.1.44）。
+エキスパートの gate・up は Q5_K、Q6_K、Q8_0、down は Q8_0 で、エンジンのエキスパートのカーネルがそのまま読みます。
+XeStrata ではこれらのファイルを動かしていないので、setup は実験的と表示します。
+RAM の扱いは UD-Q4_K_XL と同じで、RAM が下の目安より少なければ、エキスパートのうち RAM の予算の分だけを RAM に置き、残りを SSD から読みます。
 
-| | Gyro-S | Gyro-M |
-| --- | --- | --- |
-| ファイル | `Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf` | `Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf` |
-| ダウンロード | 58.5 GB | 92.0 GB |
-| 使うメモリ（VRAM と RAM の合計） | 27.6 GB | 35 GB |
-| エキスパート | gate・up TQK6、down TQK7 | TQ2_T |
-
-setup は、固定したリビジョンからファイルを落として SHA-256 を確かめ、`--compat-bf16` で pack にします。
-pack の `native_experts.txt` は xs2 になり、回転の符号と層は横の `hadamard.txt` に入ります。回転できない前のエンジンは、この pack を断ります。
-どちらも誰の既定でもなく、メモリの目安は RAM ではなく VRAM と RAM の合計です。画像は、元のモデルのエンコーダーで読みます。
+| 大きさ | ダウンロード | エキスパート | RAM の目安 |
+| --- | ---: | ---: | ---: |
+| UD-Q5_K_XL | 158 GB | 98 GB | 108 GB |
+| UD-Q6_K_XL | 169 GB | 109 GB | 118 GB |
+| Q8_0 | 188 GB | 128 GB | 136 GB |
 
 ```sh
-./setup.sh --setup --family gyro --model Gyro-S
+./setup.sh --setup --family unsloth --model UD-Q5_K_XL
 ```
 
-Radeon AI PRO R9700（32 GB）と Ryzen AI 9 HX 370、RAM 27.6 GB で、Gyro-S のエキスパートはすべて VRAM に入りました（24,576 個、24.0 GiB）。
-13,290 トークンの prompt は 1,198 トークン/秒で読み、その中ほどの一文を正しく答えました。
-日本語の 6 つの質問を 18 回答させると、decode は全体で 60.0 トークン/秒、中国語にしかない字が入ったのは 5 回答（16 字）でした（同じ条件で Q2_0 は 107.7 トークン/秒、10 回答、IQ3_XXS は 63.0 トークン/秒、1 回答）。
+### Gyro-S と Gyro-M
 
-### Qwen3.8-Flash-Next 以外のモデル（Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B）
+**[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)** は、agentionai による元のモデルの量子化です（upstream ba64156fd）。
+エキスパートをアダマール行列で回し、trellis の形式（TQ2_T、TQK6、TQK7）で格納しています。
+要るメモリは VRAM と RAM の合計で、Gyro-S は 27.6 GB、Gyro-M は 35 GB です。
+ファイルには n-gram の表も入っていて（SSD から読みます）、ダウンロードは 58 GB と 92 GB です。
+Gyro-M は IQ3_XXS くらいの品質で、GPU のメモリは約 20% 少なくて済みます。
+Gyro-S はいちばん小さく、品質は 2〜3 ビットの大きさより低く、decode は Q2_0 の方が速くなります。
+画像も使えます。モデルのライセンスは Qwen3.8-Flash-Next の Qwen Community License 1.0 です。
 
-setup の最初の質問では、Qwen3.8-Flash-Next とは作りの違う 3 つの MoE モデルも選べます。
-どちらも GGUF のファイル 1 つで、エキスパートを RAM に置き、よく使うものを GPU の VRAM に置きます（VRAM にないものの扱いは Qwen3.8-Flash-Next と同じです）。
+```sh
+./setup.sh --setup --family gyro --model Gyro-M
+```
+
+### huihui-ai の abliterated 版
+
+**[huihui-ai の abliterated 版](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)** は、モデルから拒否の方向を取り除いた（abliteration）版です。
+拒否はずっと少なくなり、安全のための抑えも弱まっているので、書いたものを確かめてください。
+
+- `--family huihui-swift`: Swift 1.5 の IQ2_XS と IQ3_XXS。ライセンスは Swift Open License 1.0 です。
+- `--family huihui-unsloth`: Unsloth の UD-IQ4_XS、UD-Q4_K_XL、Q8_0。ライセンスは Qwen Community License 1.0 です。
+
+ファイルの名前・シャード・大きさは元の版と同じで、重みが違います。画像の読み手は元の版のものです。
+実験的な速度向上用の射影は使えません。
+
+```sh
+./setup.sh --setup --family huihui-swift --model IQ2_XS
+```
+
+### Qwen3.8-Flash-Next 以外のモデル（Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、GLM-5.3-Flash）
+
+setup の最初の質問では、Qwen3.8-Flash-Next とは作りの違う 4 つの MoE モデルも選べます。
+どれも GGUF のファイル（GLM-5.3-Flash は 3〜4 つに分かれたもの）をそのまま読み、よく使うエキスパートを GPU の VRAM に、残りを RAM に置きます（VRAM にないものの扱いは Qwen3.8-Flash-Next と同じです）。
 
 - **[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)**（Ornith AI、MIT）: 35B、1 トークンで使うのは 3B の Qwen3.5 系の MoE です。文脈は 256K まで。
   公式の Q4_K_M〜BF16 と、pfeifferj による GSQ-RCO の 3 ビットと 3.5 ビット（[コミュニティの再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)で、ISTA-DASLab のものではありません）があります。
 - **[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)**（LLM-jp、Apache-2.0）: 32B、1 トークンで使うのは 3B の、日本語と英語の思考するモデルです。文脈は 256K まで。
 - **[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)**（Qwen、Apache-2.0）: 35B、1 トークンで使うのは 3B の Qwen3.5 系の思考する MoE です。文脈は 256K まで。
   GGUF は Unsloth が MTP の層付きで作った UD-Q4_K_XL・UD-Q6_K_XL・Q8_0 です。
+- **[GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)**（Z.ai、MIT）: 320B、1 トークンで使うのは 18B の思考する MoE です。setup で選べる文脈は 256K まで。
+  注意は KDA（線形の注意）と DSA（選んだトークンだけを見る注意）で、4 本の流れ（mHC）を持ちます。GGUF は Unsloth の UD-IQ1_S・UD-IQ3_XXS・UD-IQ4_XS です。
 
-| モデル | 大きさ | ダウンロード |
-| --- | --- | ---: |
-| Ornith-1.5 | **Q4_K_M** | 21.7 GB |
-| | Q5_K_M | 25.3 GB |
-| | **Q6_K** | 29.2 GB |
-| | Q8_0 | 37.8 GB |
-| | **BF16** | 71.1 GB |
-| | **GSQ-RCO-3BIT** | 13.0 GB |
-| | GSQ-RCO-3.5BIT | 15.2 GB |
-| llm-jp-4.1 | **Q4_K_M** | 21.5 GB |
-| | BF16 | 64.3 GB |
-| Qwen3.6-35B-A3B | **UD-Q4_K_XL** | 22.9 GB |
-| | **UD-Q6_K_XL** | 32.6 GB |
-| | Q8_0 | 37.8 GB |
+| モデル | 大きさ | ダウンロード | RAM の目安 | VRAM |
+| --- | --- | ---: | ---: | ---: |
+| Ornith-1.5 | **Q4_K_M** | 21.7 GB | 30 GB | 4 GB から |
+| | Q5_K_M | 25.3 GB | 34 GB | 6 GB から |
+| | **Q6_K** | 29.2 GB | 38 GB | 6 GB から |
+| | Q8_0 | 37.8 GB | 46 GB | 6 GB から |
+| | **BF16** | 71.1 GB | 80 GB | 8 GB から |
+| | **GSQ-RCO-3BIT** | 13.0 GB | 21 GB | 4 GB から |
+| | GSQ-RCO-3.5BIT | 15.2 GB | 24 GB | 6 GB から |
+| llm-jp-4.1 | **Q4_K_M** | 21.5 GB | 30 GB | 4 GB から |
+| | BF16 | 64.3 GB | 73 GB | 8 GB から |
+| Qwen3.6-35B-A3B | **UD-Q4_K_XL** | 22.9 GB | 31 GB | 4 GB から |
+| | **UD-Q6_K_XL** | 32.6 GB | 41 GB | 6 GB から |
+| | Q8_0 | 37.8 GB | 46 GB | 6 GB から |
+| GLM-5.3-Flash | **UD-IQ1_S** | 93.1 GB | 101 GB | 12 GB から |
+| | **UD-IQ3_XXS** | 120.4 GB | 128 GB | 12 GB から |
+| | UD-IQ4_XS | 156.8 GB | 165 GB | 12 GB から |
 
+RAM の目安は、ダウンロードの大きさに約 8 GB を足したものです（GLM-5.3-Flash は RAM と VRAM の合計）。
+それより少ないと、RAM と VRAM に入らないエキスパートをモデルのファイルから読むので、遅くなります。
 太字は、このリリースで llama.cpp と答えを比べた版です。
 ほかの版も同じ型のテンソルでできていて、その型は太字の版とカーネルの試験で確かめています（setup は「untested」と表示します）。
 
@@ -303,12 +329,14 @@ setup の最初の質問では、Qwen3.8-Flash-Next とは作りの違う 3 つ�
 ./setup.sh --setup --family ornith --model Q4_K_M
 ./setup.sh --setup --family llmjp
 ./setup.sh --setup --family qwen36 --model UD-Q4_K_XL
+./setup.sh --setup --family glm53 --model UD-IQ3_XXS
 ```
 
 API は、思考と答えの分離、ストリーミング、ツールの呼び出しを含めて使えます。
-Ornith の公式の版（Q4_K_M〜BF16）と Qwen3.6 は、モデルの MTP の層で 2 つ先までの下書きを作り、窓でまとめて確かめます（推測デコード、greedy の要求だけ。GSQ-RCO の版と llm-jp には MTP の層がありません）。
-まだ使えないのは、画像、Intel の CPU 内蔵の GPU、2 枚以上の GPU（setup は最初の GPU を使います）、KV キャッシュの精度や省 RAM モードなど Qwen3.8-Flash-Next のためのオプションです。
-RAM がエキスパートに足りないとき、エンジンはエキスパートを RAM に読み込まず、モデルのファイルから OS のファイルキャッシュ越しに読みます（遅くなります。setup はそのことを警告します）。
+Ornith の公式の版（Q4_K_M〜BF16）、Qwen3.6、GLM-5.3-Flash は、モデルの MTP の層で 2 つ先までの下書きを作り、窓でまとめて確かめます（推測デコード、greedy の要求だけ。GSQ-RCO の版と llm-jp には MTP の層がありません）。
+`setup --gpus` で 2 枚以上の GPU を選ぶと、層を GPU に分けて動かします（最初の GPU が前の層、次の GPU がその後の層と head と MTP の層。分割点は各 GPU の空いたメモリの割合から決めます）。VRAM に置けるエキスパートは GPU を合わせた分になります。
+まだ使えないのは、画像、KV キャッシュの精度や省 RAM モードなど Qwen3.8-Flash-Next のためのオプションです。
+RAM がエキスパートの全体に足りないとき、エンジンは VRAM に置かないエキスパートを RAM の空きの許す限り RAM に置き、残りをモデルのファイルから OS のファイルキャッシュ越しに読みます（遅くなります。setup は RAM と VRAM を合わせても足りないとき警告します）。
 
 エンジンのオプション（設定の `args` に足します）:
 
@@ -317,23 +345,25 @@ RAM がエキスパートに足りないとき、エンジンはエキスパー�
 | `--max-context N` | KV キャッシュのトークン数（setup が GPU の VRAM から選びます） |
 | `--expert-profile PATH` | 起動時に、このプロファイルの順で VRAM のエキスパートを埋める |
 | `--expert-profile-save PATH` | この実行で学んだことをプロファイルとして書き出す |
-| `--adapt-every N` | VRAM のエキスパートを入れ替える間隔。要求の 4N トークンごとに入れ替え、窓をそこで切るので、文章が推測の仕方で変わりません（バッチのスロット、`--pipeline-windows`、`--adapt-async` では N 窓ごと）（既定 4。0 で入れ替えない） |
+| `--adapt-every N` | VRAM のエキスパートを入れ替える間隔。要求の 4N トークンごとに入れ替えます。CPU と GPU の丸めが違う層があれば窓をそこで切り、文章が推測の仕方で変わらないようにします。Qwen3.8 の 4 つのファイルは decode が CPU と GPU で同じビットなので切りませんが、serve の 2 ターン目からの prompt の読みは入れ替えの時期で丸めが変わり、文章が実行ごとに変わることがあります（`STRATA_ADAPT_CUT=1` で切ります）（バッチのスロット、`--pipeline-windows`、`--adapt-async` では N 窓ごと）（既定 4。0 で入れ替えない）。指定がなければ、出力の 32 トークン目に CPU のプールが検証の窓の時間の 30% 以上を使っていたとき、4 トークンごとにします。ただし、GPU が持たないエキスパートをファイルから読むとき（`--mmap-experts`）は縮めません |
 | `--adapt-swaps N` | 1 回に入れ替えるエキスパートの最大の数（既定 96。prompt の直後の 1 回は、その prompt が多く使ったものを 2,048 個まで。空いた枠には、1 回でも使ったものを数に関わらず入れます） |
 | `--adapt-mib-per-token N` | 入れ替えで写す量の上限を、前の入れ替えから進んだトークンあたり N MiB にする（既定 48。0 で上限なし） |
 | `--mmap-experts` | エキスパートを RAM に読み込まず、モデルのファイルから読む |
 | `--no-pcie-split` | VRAM にないエキスパートを、すべて CPU で計算する |
-| `--pool-workers N` | エキスパートを計算する CPU のスレッドの数（既定は物理コアの数より 1 少ない） |
+| `--pool-workers N` | エキスパートを計算する CPU のスレッドの数（既定は物理コアの数より 1 少なく、多くて 32。Linux のコンテナで CPU の割り当て（cgroup）があれば、その数より 1 少ない数まで） |
 | `--prompt-chunk N` | prefill で一度にまとめて計算する最大のトークン数（既定 4096、0 でまとめない） |
 | `--max-t N` | decode の窓の最大のトークン数（既定 8） |
 | `--spec N` | MTP の層の推測デコードの窓の最大のトークン数（既定 3: 下書き 2 個。0 で使わない） |
 | `--draft-vocab PATH` | MTP の層の下書きを、このトークンの部分集合（`data/draft_vocab*.bin`）の中だけで作る。ヘッドを読む量が減ります（setup が Qwen3.6 の設定に、`--draft-vocab` の選択に従って書きます） |
+| `--layer-split K[,K2..]` / `auto` | 層を GPU に分ける。最初の GPU が層 K の前まで、次の GPU が K から、…（`auto`: 各 GPU の空いたメモリの割合で。setup の `--gpus` で書かれます） |
+| `--split-device D[,D2..]` | 2 枚目以降の GPU（エンジンの番号か PCI アドレス。既定はほかの単体の GPU） |
 | `--rope-scaling none\|linear\|yarn`、`--rope-scale F`、`--yarn-orig-ctx N` | 文脈の延長 |
 
 ### RAM がモデルより少ないとき（省 RAM モード）
 
-Unsloth の 2 つ以外のモデルは、すべてのエキスパートを RAM に置き、GPU はよく使うもののコピーを持ちます。
-エキスパートが RAM に入らない（ほかのために約 10 GB を残す）けれど、GPU が十分な数を持てるときは、setup は省 RAM モードを選びます
-（`--low-ram auto`、既定）。
+Unsloth の大きさ（huihui-ai の版を含む）以外のモデルは、すべてのエキスパートを RAM に置き、GPU はよく使うもののコピーを持ちます。
+エキスパートが RAM に入らない（ほかのために約 10 GB を残す）ときは、setup は省 RAM モードを選びます（`--low-ram auto`、既定）。
+GPU が持つエキスパートが少ないほど、ファイルから読む分が増えて遅くなります。
 このときエンジンは、エキスパートを RAM にすべてコピーせずに、モデルのファイルから読みます。
 ネイティブの pack なら GGUF のファイルから、AVX-512 用の Q2_0 の pack ならその `experts.bin` からです。
 エンジンを直接起動して `--resident-experts` も `--mmap-experts` も付けなかった場合でも、空いている RAM がエキスパートの全体と 8 GiB に足りなければ、エンジンは `--resident-experts` と同じ形で起動し、そう 1 行出します（issue #10: 全体を読み込むと swap に入り、Intel の GPU では GPU のドライバーが持つメモリへ移した後で OS が RAM を取り返せずに止まりました）。
@@ -343,7 +373,6 @@ Unsloth の 2 つ以外のモデルは、すべてのエキスパートを RAM �
 - GPU が持たないエキスパートが RAM に入るなら、起動時に一度 RAM にコピーします（`--resident-experts`）。
   このコピーをページ固定するのは、コピーの後に空く RAM が、8 GiB と、なおモデルのファイルから読む分（GPU にもコピーにもないエキスパート）を合わせた量より多いときだけです（issue #11: RAM 31 GB の B70 で 17.5 GiB をページ固定したら、ファイルの読み直しの最中に GPU のコピーが止まりました）。
   起動時に、どちらにしたかと、その数字を 1 行出します。`STRATA_RESIDENT_PIN=0` で常にページ固定せず、`1` で常にページ固定します。
-  Windows では、HIP から見える GPU が 1 台のときはこの規則で、2 台以上のときは既定でページ固定しません（`auto` でこの規則、`1` で常にページ固定）。HIP は、ページ固定したメモリを見えている GPU すべてに写すためです。`ONEAPI_DEVICE_SELECTOR=hip:N` で GPU を選ぶと、`HIP_VISIBLE_DEVICES` も同じ GPU に絞ります。
   このときサーバーでは、適応する段の入れ替え（RAM のコピーと GPU のキャッシュの交換）を、検証の窓の間に裏のスレッドで少しずつ進めます（`--adapt-async`、upstream b437b8ea では opt-in、ここでは既定）。
   窓が入れ替えの 1 回ぶん全部を待つことはなくなります。
   RTX 4070 では 1 回に約 95 個を入れ替え、decode が 14〜15% 速くなりました（B70 は計測のばらつきの範囲）。
@@ -365,6 +394,13 @@ Unsloth の 2 つ以外のモデルは、すべてのエキスパートを RAM �
   GGUF のファイルから読むとき、prefill は SSD 向けの多いスレッドと深いリングでエキスパートをコピーします。
   最初の prefill でエキスパートのページの 90% 以上がすでにページキャッシュにあれば（Linux の `mincore` で見本を調べます）、RAM 向けの少ないスレッドに切り替え、ログにそう出します（upstream 83a7dbc0、#1353）。
   `STRATA_STAGER_SSD=1`・`0` でどちらかに決められます。
+  Linux で GGUF のファイルからそのまま読むとき、decode は次のように読みます（upstream 149）。
+  ページキャッシュに全部あるエキスパートは、写さずにファイルのマッピングから直接計算します（`STRATA_COLD_OVERLAP=0` で写します）。
+  ないエキスパートは、先読みをしない pread で読みます。次の層のルーターで次の 2 層に選ばれそうなエキスパートを予測し、I/O のスレッドが先に読んでおきます（`STRATA_IO_PREFETCH=0` で切ります。`STRATA_LOOKAHEAD=0` で予測だけ切ります）。
+  先読みは、ページキャッシュに入る余地がエキスパートの 55% 以上あり、読んだものが使われている間だけ行います（`STRATA_IO_PF_GATE=0` で常に先読みします）。
+  エキスパートの pack（experts.bin）は、ページキャッシュにエキスパートの 55% が入る余地があるとき、I/O のスレッドが同じようにページを先に読みます。
+  ファイルから読むときは、入れ替えの間隔を縮めず（`--adapt-every`）、確かめる候補の数を `--spec-min-p` の下限で決めます（`--spec-window auto` を付ければ、測った時間で決めます）。
+  RX 9060 XT・RAM 32 GiB・IQ3_XXS の decode は、1K で 11.6 → 26.0 トークン/秒、32K で 11.2 → 16.8 トークン/秒、B70 の 1K で 46.9 → 56.5 トークン/秒、RTX 4070 の 1K で 13.3 → 34.8 トークン/秒になりました。
 
 `--low-ram on|off|resident|mmap` で選び直せます。
 `./setup.sh --check` は、それぞれの大きさでどうなるかを示します。
@@ -427,6 +463,8 @@ GPU、CPU、RAM、ディスクの目安は [README](../README.ja.md#必要なも
 `--data-dir` で別の場所を選べます。
 あとで移すときは、フォルダーを自分で移してから `./setup.sh --setup --data-dir <新しい場所>` を一度実行します。
 setup はそこでファイルを見つけ、設定を書き直します。
+ほかにモデルのファイルがあるときに新しい場所を `--data-dir` で与えると、setup は今のファイルを動かさず、その場所のまま使い、新しい場所には新しいダウンロードを置きます（答えられるときは、移すかどうかを聞きます）。
+`--move-data` で今のファイルを新しい場所に移し、`--set-default-data-dir` で移さずに新しい場所を記録します。
 
 ---
 
@@ -516,7 +554,7 @@ XeStrata は、GPU の空いている VRAM をエキスパートで埋め（エ�
 今の大きさは `GET /v1/status` の `"vram"` にあります。
 目標に届かなくても（キャッシュが最小の大きさに達したとき、ドライバーが次のかたまりの VRAM を出さないとき）答えは `200` なので、答えの `vram_free_mib` を `reserve_mib` と比べます（upstream #1034）。
 要求が動いているか待っているときは、300 秒まで待ってから `409` を返します。
-GPU の実行時ライブラリーが仮想メモリーを持たないときは使えず、起動時のまま動きます（Intel の Level Zero と NVIDIA の CUDA は持ち、intel/llvm 7.1.1 の AMD の HIP は持ちません）。
+GPU の実行時ライブラリーが仮想メモリーを持たないときは使えず、起動時のまま動きます（Intel の Level Zero と NVIDIA の CUDA は持ち、intel/llvm 7.2.0 の AMD の HIP は持ちません）。
 
 ### 手で取ってきたモデルのファイル、ミラーからのダウンロード
 
@@ -528,22 +566,28 @@ setup の手順 5 は、ファイルを置く場所（`XeStrata-data/models/<大
 名前はあてになりません。Unsloth の `UD-IQ3_XXS` はエキスパートを 1 重みあたり 3.22 ビット、`UD-Q4_K_XL` は 5.10 ビット、元の `Q2_0` は 2.25 ビット、`IQ3_S` は 3.33 ビットで保存しています。
 Hugging Face のミラーから取るなら、`HF_ENDPOINT` を設定します（例: `HF_ENDPOINT=https://hf-mirror.com ./setup.sh`）。
 固定したリビジョンと確認は同じで、MTP のテンソルも同じホストから取ります。
+setup がダウンロードするモデルのファイルは、どれも大きさと SHA-256 を固定しています（upstream e193161de）。
+サーバーの大きさが固定したものと違えばダウンロードの前に止まり、ダウンロードしたファイルが SHA-256 と合わなければ消して止まります。
+固定したリビジョンがリポジトリから消えていれば止まります（試験のために `STRATA_ALLOW_UNPINNED=1` を設定すると、確かめずにいまのファイルを取ります）。
 
 **ModelScope から**（中国本土、upstream #908）: setup がダウンロードするリポジトリ（GSQ-RCO のモデル、Swift 1.5、Coder、Unsloth のファイル、MTP の下書きの層を取る元のチェックポイント）は、どれも [ModelScope](https://www.modelscope.cn) に同じ名前・同じファイルであります。
 setup は自分では切り替えません（ダウンロードに失敗したときに案内します）。
 `--source modelscope`（`STRATA_SOURCE=modelscope`）で選びます。
-ModelScope はリポジトリのいまのファイルを出す（リビジョンを固定できない）ので、各ファイルを ModelScope が公開する SHA-256 で確かめ、MTP のテンソルは固定したチェックポイントのハッシュで確かめます。
+ModelScope はリポジトリのいまのファイルを出す（リビジョンを固定できない）ので、各ファイルを固定した SHA-256 で（固定のないファイルは ModelScope が公開する SHA-256 で）確かめ、MTP のテンソルは固定したチェックポイントのハッシュで確かめます。
 公開されている SHA-256 は ModelScope 自身の申告なので、元のリポジトリが変われば、そのハッシュも変わります。
 setup は、選んだときにそう言います。
 
 ### この PC に合わせて調整する（`--calibrate`）
 
-エンジンの 4 つの設定は、モデルよりも PC によって変わります。
+エンジンの次の設定は、モデルよりも PC によって変わります。調整が測るのは、そのうち窓の長さ以外の 3 つです。
 
 - VRAM にないエキスパートのうち、CPU で計算せずに GPU にコピーする割合（`--pcie-frac`）。
   指定がなければ、エンジンが起動時に、CPU と PCIe でエキスパート 1 個にかかる時間を測って分けます（[XE](XE.ja.md#外れたエキスパートの-cpu-と-pcie-への分け方)）。
   決まった割合は、その分け方より 3% を超えて速いときだけ使います。
-- 推測の層がどれだけ確かなら、確かめる候補をもう 1 つ足すか（`--spec-min-p`）。
+- 推測の層がどれだけ確かなら、確かめる候補をもう 1 つ足すか。これは測りません。
+  既定（`--spec-window auto`）では、エンジンが候補ごとに「足すと見込める出力の数」を、起動後に測った窓の大きさごとの時間で割り、1 ms あたりの出力が増える間だけ候補を足します（見込みは、推測の層の確率を、実際に受理された割合で補正したもの）。
+  要求に `spec_min_p` を渡すと、その要求だけ `--spec-min-p` の下限で切る規則になるので、調整は渡しません。
+  GPU が持たないエキスパートをファイルから読むとき（`--mmap-experts`）は、`--spec-window` を付けなければ `--spec-min-p` の下限で切ります（窓ごとの時間が SSD の読みでぶれ、広い窓の時間が高く見積もられるため）。
 - エキスパートを計算する CPU のスレッドの数（`--pool-workers`）。高効率コアのある CPU では、少ない方が速いことがあります。
   高効率コアが性能コアより多い CPU では、調整の前から、setup が性能コア（host の 1 つを除く）と高効率コアの半分を設定に書きます（upstream #642）。
   P コアの数より 1 つ少ない数と、2 ソケットの PC では 1 ソケットのコアの数より 1 つ少ない数も試します。
@@ -554,7 +598,7 @@ setup は、選んだときにそう言います。
 
 既定の値は、upstream が Ryzen 5 7600 と RTX 5070 で測ったものです。
 B70 では一部を測り直しています（[XE.ja.md](XE.ja.md#xe-で測り直していない-upstream-の設定)）。
-setup はインストールのあとにこの PC での測定を勧め、`./setup.sh --calibrate` でいつでも測れます。
+エンジンと setup が測った値から合わせるので、ふつうは要りません。測るのは `./setup.sh --calibrate` を実行したときだけです（始める前に、それでも測るかを聞きます。`--yes` を付けると聞きません）。
 それぞれの設定で decode の速さを測り、3% を超えて速いときだけその設定を残します。
 結果は PC とモデルごとに設定ファイルに記録するので、更新しても残ります。
 worker の数を測るにはエンジンを起動し直すので、モデルを何度か読み込み、そのたびに PC が 1〜2 分反応しにくくなることがあります（upstream #1197）。
@@ -568,6 +612,18 @@ worker の数を測るにはエンジンを起動し直すので、モデルを�
 同じ worker の数と同じ負荷で、`0` と比べて決めてください。
 カーネルや段の区切り、PCIe への振り分けは変わりません。`--calibrate` はまだこの値を測りません。
 サーバーでは、設定ファイルの `args` に `"--pool-tasks", "192"` のように足して起動し直します。
+
+CPU のプールは、物理コア 1 つにつき worker を 1 つ置き（SMT の相方には置きません）、最初のコアを host（GPU を待つスレッド）に残します。
+起動のログは、どこに置いたかを 1 行で言います（`CPU workers on logical processors 2,4,...,30 (15 workers, one per physical core; host on 0)`）。
+OS がどの論理プロセッサーがコアを分け合うかを言わないとき（一部のコンテナ）は、そのことを言います。
+worker は `strata-pool-N`、host は `strata-host` という名前を持ち（ほかの補助のスレッドも `strata-adapt` など）、Linux の `ps -L -o tid,psr,comm` や Windows のスレッドの名前を読む道具で見分けられます。
+`--pool-cores LIST`（実験的、既定はオフ、upstream 7a5599581）は、worker をこの論理プロセッサーに、この順で固定します。
+`STRATA_POOL_CORES=LIST` か、設定ファイルの `"pool_cores": "2,4,6,8"` でも指定できます。
+書き方は `0,2,4,6` や `2-14:2`（最初-最後:間隔）で、番号はタスクマネージャーや `lscpu` のものです。
+worker の数はリストの長さで、`--pool-workers N` ならリストの最初の N 個です。
+断ることはなく、警告だけします: 1 つのコアの 2 つのスレッドを並べたとき、host の論理プロセッサーを並べたとき、このプロセスが使えない論理プロセッサーを並べたとき（それは外します）。使えるものが残らなければ既定の置き方になり、読めないリストは警告して無視します。
+host は最初のコアのままなので、リストから外してください。スレッドを動かすだけで、答えは変わりません。
+効くのは Qwen3.8-Flash-Next 系のエンジンだけで、ほかの MoE（Ornith、llm-jp、Qwen3.6、GLM-5.3-Flash）は既定の置き方です。
 
 `--aux-cpus` は、CPU のプールの worker でも host でもないスレッドを、どの CPU で動かすかを決めます（Linux、既定は `off`、upstream 91f1e85d）。
 対象は、エキスパートのキャッシュの入れ替え、prefill のコピー、ファイルの読み込み、GPU のランタイムのスレッドなどです。
@@ -631,9 +687,9 @@ API キーを設定していればそれが要り、`application/json` で、よ
 キーがなければ、何も数えず何も書きません。
 setup を実行し直しても、このキーと、`"args"` に手で足した `--expert-profile`（まだあるファイル）と `--expert-profile-save` は残ります（upstream #775）。
 
-適応の段が入れ替えたエキスパートは、次の窓がそのコピーを待ってから GPU で使います。
-エンジンの環境に `STRATA_ADAPT_LAG=2` を置くと、2 つ目の窓から使うので待ちがなくなります（upstream #764。答えはその分だけ変わり、同じ設定なら毎回同じです）。
+適応の段が入れ替えたエキスパートは、2 つ目の窓から GPU で使うので、窓はそのコピーを待ちません（upstream #764。同じ設定なら答えは毎回同じです）。
 RTX 4070 では decode が 59.1 → 64.2 トークン/秒、B70 では 76.5 → 76.9 でした（IQ2_XS）。
+エンジンの環境に `STRATA_ADAPT_LAG=1` を置くと、次の窓がコピーを待ってから使います。
 
 ### 推測のヘッドが入らないとき
 
@@ -709,9 +765,7 @@ print(r.choices[0].message.content)
 深さは、モデルが学習した指示で、トークン数の厳密な上限ではありません。
 易しい質問では 3 つとも短く考え、難しい質問では `high` がいちばん長く考えて、いちばん正確です。
 
-- **処理中は Windows をスリープさせない（任意、upstream #1727）**: `xestrata-<model>.json` に `"prevent_sleep": true` を書くと、要求を 1 つでも処理中か待ち行列に持っている間は PC がスリープしません（Windows の `SetThreadExecutionState` の `ES_SYSTEM_REQUIRED`。画面は消えることがあります）。
-  server が何もしていないときと終わるときは、通常のスリープの設定に戻します。既定は無効で、Linux では何もしません（起動時に 1 行で知らせます）。
-- **思考の厳密な上限（任意）**: 要求に `"reasoning_budget_tokens": N`（OpenAI でも Anthropic でも。llama-server 向けのクライアントが送る llama.cpp の `"thinking_budget_tokens": N` も同じ）を付けると、思考を N トークンで打ち切ります。
+- **思考の厳密な上限（任意）**: 要求に `"reasoning_budget_tokens": N`（llama-server 向けのクライアントが送る llama.cpp の `"thinking_budget_tokens": N` でも。OpenAI でも Anthropic でも）を付けると、思考を N トークンで打ち切ります。
   そこに達すると、server は短い締めの行と `</think>` で思考を終え、モデルはそこから答えます。
   エンジンは持っている状態から続けるので、何も読み直しません。
   締めの行は、クライアントから見える思考の一部で、出力のトークンに数えます。
@@ -737,7 +791,7 @@ print(r.choices[0].message.content)
   引っかかった窓のトークンは出さず、エンジンは位置を 1 行書いて要求を `DONE ... nonfinite`（枠は `BDONE <slot> <n> nonfinite`）で終えます。
   次の要求は、生きているセッション、すべてのチェックポイント、預けた会話、空いている枠を捨ててから、プロンプトをトークン 0 から読みます（動いている枠は返答を終えますが、後で使い回しません）。
   server は、まだ何も送っていない要求を 1 回だけ黙って送り直し、送り始めていた返答は `"length"` で終えます。送り直しでもう一度起きたら要求はエラーです（答えの前なら 503、ストリームではエラーのイベント）。
-  引っかかった窓がプロンプトの短い残り（最後のターンの区切りより後の、検証の窓で読む部分。`--short-read`）だったときは、送り直しではプロンプト全体を検証の窓を使わずにまとめて読み、エンジンがそのことを 1 行書きます（upstream #3465。ある報告者のプロンプトは毎回この部分で失敗し、`--short-read 0` では通りました）。
+  引っかかったのがプロンプトの短い残り（最後のターンの境目の後、`--short-read` で窓に通す部分）を読む窓だったときは、送り直しはプロンプト全体をまとめて読みます（upstream #3465: その残りで毎回失敗し、`--short-read 0` で通った報告）。エンジンはそのことを 1 行書きます。
   カーネルはフラグを書くだけなので、NaN のない答えは `STRATA_NAN_GUARD=0`（カーネルを入れない）と同じです。
   試しのスイッチ: `STRATA_NAN_INJECT=<n>[,<n>...]` で、エンジンが確かめる n 番目の窓を NaN として扱います。
 - **思考を求めない Anthropic の要求（任意）**: 既定では、`"thinking"`、深さ、上限のどれもない `/v1/messages` の要求は、モデルのテンプレートどおりに考えます。
@@ -752,10 +806,10 @@ print(r.choices[0].message.content)
   長いプロンプトを読む間は keep-alive を送るので、エージェントがタイムアウトしません。
   server のウィンドウは 15 秒ごとに進み具合を出し、`GET /status` は何をしているか（`reading the prompt`、`answering`、そこまでのトークン数）を返します。
   接続を閉じるか、アプリで止めると、モデルも本当に止まるので、次の要求はすぐに始まります。
-- **ツールの呼び出しとして返すもの**: 呼び出しになるのは、要求が宣言したツールの名前を挙げたものだけです（upstream #3075、#3441）。
-  ほかの名前の呼び出しと、ツールを宣言していない Chat Completions や Anthropic の要求での呼び出しは、書かれたとおりの文字として返すので、クライアントが自分で出していないツールを動かすことはありません（Responses の経路は、Codex の圧縮の要求のために前の扱いのままです）。
-  `<function=NAME>` の代わりに `<=NAME>`、`<function:NAME>`、`<NAME>` と書かれた呼び出しも、NAME が宣言したツールなら呼び出しとして読みます。
-  それでも呼び出しとして読めない `<tool_call>` のブロックは、その数を server のウィンドウに出します。
+- **呼び出しとして返すツールの呼び出し**: 呼び出しになるのは、要求が宣言したツールの名前のものだけです。
+  別の名前の呼び出しや、ツールを宣言していない Chat Completions・Anthropic の要求の呼び出しは、書かれたままの文として返すので、クライアントが差し出していないツールを動かすことはありません（Responses は Codex のまとめの要求のために前のままです）。
+  囲みが 1 トークンずれた呼び出し（`<function=NAME>` でなく `<=NAME>`、`<function:NAME>`、`<NAME>`）は、NAME が宣言したツールなら呼び出しとして読みます。
+  それでも呼び出しとして読めない `<tool_call>` の塊は、server のウィンドウで数を出します。
 - **チャットのアプリ**: 「OpenAI 互換」の接続先を持つアプリなら使えます。
   ベース URL は `http://127.0.0.1:8095/v1`、API キーは何でも構いません。
 - **OpenCode**（upstream #543）: `opencode.jsonc`（プロジェクトの中か `~/.config/opencode/`）の出発点です。
@@ -790,8 +844,7 @@ print(r.choices[0].message.content)
 
   `limit.context` は setup で選んだ文脈にします。OpenCode は、そこに達する前に会話を要約します。
   `limit.output` は、それより十分小さくします。
-  プロンプトと `max_tokens` の和が文脈を超える要求は断られます（下の「文脈」）。
-  または `xestrata-<model>.json` に `"fit_max_tokens": true` を書きます。
+  プロンプトと `max_tokens` の和が文脈を超える要求は、`max_tokens` を残りの余地まで縮めて受け付けます（下の「文脈」）。
   思考に厳密な上限を付けるなら、`xestrata-<model>.json` に `"reasoning_budget_tokens": N` を書きます（上を参照）。
   OpenCode はシステムの発言の先頭近くに `<env>` の塊（作業フォルダーと今日の日付）を書き、その後に毎回同じ約 4 万文字の指示とツールの定義が続きます。
   プレフィックスのキャッシュはプロンプトの先頭しか使い回さないので、フォルダーや日が変わるたびに約 1 万 4 千トークンを読み直します。
@@ -803,10 +856,9 @@ print(r.choices[0].message.content)
 - **Codex CLI**: [下の Responses API](#responses-api-と-codex-cli) を参照してください。
 - **文脈**: setup で選びます（8K〜262K）。
   それより長い要求は断り、黙って切り詰めることはしません。
-  `max_tokens` が文脈を超える要求も断ります（400）。
-  いつも出力の上限いっぱいを求めるエージェントのために、`xestrata-<model>.json` に `"fit_max_tokens": true` を書く
-  （または `serve/server.py` に `--fit-max-tokens` を渡す）と、残りの余地まで縮めて受け付けます。
-  余地がまったくないプロンプトは、それでも断ります。
+  `max_tokens` が文脈を超える要求は、`max_tokens` を残りの余地まで縮めて受け付けます（Claude Code などのエージェントは毎回 32,000 を求めます）。思考の上限も縮めた値に従います（upstream f31b6efd6）。
+  llama.cpp と同じく断る（400）には、`xestrata-<model>.json` に `"fit_max_tokens": false` を書くか、`serve/server.py` に `--no-fit-max-tokens` を渡します。
+  余地がまったくないプロンプトは、いつも断ります。
 - **モデルの別名**: `xestrata-<model>.json` に `"aliases": ["qwen", "local-model"]` を書くと、`/v1/models` にその名前でも並びます。
   それぞれが自分の `id` を持ち、モデルの `aliases` にも入ります（llama-server の `--alias` と同じ）。
   別名で呼ばれた要求には、その名前で答えます。
@@ -821,7 +873,6 @@ print(r.choices[0].message.content)
   保存できるのは XeStrata 自身のページだけです（JSON、API キーがあればそれも。Chat の設定と同じ）。ネットワーク、キー、MCP、プログラムのキーは、そこでは変えられません。
 - **同じネットワークのほかの機器から**: 指定しなければ、server はこの PC（`127.0.0.1`）でだけ待ち受けます。
   `./setup.sh --host 0.0.0.0 --api-key 長い秘密の文字列` で起動するか（モデルの設定に保存され、次からも使われます）、`xestrata-<model>.json` に `"host": "0.0.0.0"` と `"api_key": "..."` を書きます。
-  キーは勧めるだけで、なくても server は起動し、ポートに届く人なら誰でもモデルとそのツールを使えると警告します（upstream 2f361a37）。キーなしが意図どおりなら、server に `--no-api-key` を付けるか、設定に `"api_key": "none"` と書きます。こうすると、設定のキーが空だという注意も出ません。
   server のウィンドウに、この PC のアドレスが出ます（`from other devices: http://192.168.x.x:8095/`）。
   ほかの機器でそれを開くか、`.../v1` を API のベース URL に使います。
 - **インターネットから**: 前にトンネルを置きます。
@@ -831,6 +882,7 @@ print(r.choices[0].message.content)
   `xestrata-<model>.json` に `"api_key": "長い秘密の文字列"` を書く（または環境変数 `STRATA_API_KEY`）と、クライアントはそれを API キーとして送ります。
   カンマで区切ると、複数のキーを受けます（`"key1,key2"`、llama.cpp と同じ。`--api-key key1,key2` も同じ）。
   空の API キーを指定すると、server は起動しません（認証を切ることになるためです）。
+  キーなしでネットワークに出すのを選ぶときは、`"api_key": "none"`（または `--no-api-key`）と書きます。server は起動し、キーのない警告を 1 度出します（MCP のツールがあれば、ツールがこの PC のファイルを読み書きできることも）。
   ストリーミングの答えには `X-Accel-Buffering: no` を付けるので、nginx のようなプロキシも 1 トークンずつ渡します。
   ウェブの画面の設定と MCP のツールは、XeStrata 自身のページにだけ答えます。
   アドレスの違うプロキシやトンネルから開くときは、そのアドレスを足します（例: `"trusted_origins": ["https://strata.example.com"]`）。
@@ -844,7 +896,7 @@ print(r.choices[0].message.content)
   キーがあれば確かめません（そうしたページはキーを送れず、名前をそのまま渡すトンネルやプロキシも動き続けます）。
   知っている名前は次のとおりで、ポートは問いません。
   `localhost`（と `*.localhost`）、IP アドレス（`127.0.0.1`、`[::1]`、`192.168.x.x` など）、待ち受けているアドレス、
-  この PC の外でも待ち受けているとき（`0.0.0.0` や LAN のアドレス）はこの PC の名前（`mypc`、`mypc.local`）と `host.docker.internal` です。
+  この PC の外でも待ち受けているとき（`0.0.0.0` や LAN のアドレス）はこの PC の名前（`mypc`、`mypc.local`）と、コンテナからこの PC を指す名前（Podman の `host.containers.internal`、Docker の `host.docker.internal`）です。
   それ以外には、設定の名前を示して **403** を返し、server のウィンドウにも 1 行ずつ出します。
   別の名前で届かせる（名前を残すリバースプロキシ、トンネル、ネットワークの DNS の名前、別のコンテナから見た名前）なら、その名前を足します。
   `xestrata-<model>.json` に `"allowed_hosts": ["strata.example.com"]`、または `STRATA_ALLOWED_HOSTS=strata.example.com`（カンマ区切り）です。
@@ -1032,7 +1084,8 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
   要求自身の項目がいつも優先します。
   ブロックがなければ、サンプリングの項目のない要求はモデルカードの勧める値で生成します（upstream #2685）。
   思考の有無で選び、Qwen3.8-Flash-Next（Swift・Gyro も）は思考ありで temperature 1.0・top_p 0.95・top_k 20、思考なしで temperature 0.7・top_p 0.8・top_k 20・presence_penalty 1.5、Qwen3.6-35B-A3B は思考ありで 1.0・0.95・20・presence_penalty 1.5、思考なしで 0.7・0.8・20・1.5 です。
-  Ornith と llm-jp は表になく、これまでどおり貪欲に生成します。
+  Ornith-1.5 は model card の一般用途の 0.6・0.95・20（思考の有無によらず）、GLM-5.3-Flash は generation_config の temperature 1.0・top_p 0.95 です。
+  llm-jp は model card に推奨がないので表になく、これまでどおり貪欲に生成します。
   優先は要求、web の画面の共有のチャットの設定、設定の `sampling` のブロック、モデルカードの順です。
   貪欲に生成するのは、要求の `temperature: 0` か、設定の `"sampling": {"temperature": 0}` で頼んだときだけです。
   web の画面は、サンプリングの設定を変えるまで自分の値を送りません（前は 0.6 を出して送っていました）。前に保存した 0.6 と既定の top_p・top_k は、設定していないものとして扱います。
@@ -1225,8 +1278,8 @@ Python の標準ライブラリだけを使うので、`.venv` ができる前�
 
 モデルには画像のエンコーダーがあります。
 [`mmproj-Qwen3.8-Flash-Next-BF16.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)（0.9 GB、27 層の ViT と、言語モデルへの射影）です。
-使うかどうかは**任意**です。
-setup の「Images?」に yes と答えるか、`--vision gpu`（または `--vision cpu`）を付けて setup をもう一度実行します。
+使うかどうかは**任意**で、画像を読めるモデルでは setup の「Images?」の既定は yes です（upstream 91baead75）。
+切るには no と答えるか `--vision no` を付けます。後から入れるには `--vision gpu`（または `--vision cpu`）を付けて setup をもう一度実行します。
 yes（`--vision yes`）は、24 GB 以上のカードでは GPU のエンコーダー、それより小さいカードでは CPU のエンコーダーです。GPU のエンコーダーは VRAM を約 1.4 GB 空けておくので、16 GB のカードで文章の速さが 3〜5% 落ちたためです（upstream #2406 の計測）。`--vision gpu` を付ければ、小さいカードでも GPU のエンコーダーです。
 setup はエンコーダーをダウンロードし、小さな補助のプログラム（`strata-vision`、llama.cpp の `mtmd` のライブラリから）をビルドして、起動スクリプトに足します。
 ほかは何も変わりません。
@@ -1300,6 +1353,7 @@ print(r.choices[0].message.content)
 **Anthropic の API**: いつもどおり、`base64`（または `url`）のソースを持つ `image` のブロックです。
 
 JPEG、PNG、BMP、GIF、WebP、TIFF、AVIF が使えます（後ろのいくつかは先に PNG に変えます。omp のようなエージェントは WebP を送ります）。
+`http(s)://` の URL は、サーバーの PC 自身やその LAN のアドレス（ループバック、リンクローカル、私的なアドレス）を指すもの、またはそこへリダイレクトするものは取りに行きません。LAN から画像を出すときは、サーバーを `STRATA_IMAGE_URL_PRIVATE=1` で起動します。
 画像をアップロードできるチャットのアプリも、同じように使えます。
 
 **中のしくみ**: エンコーダーは画像を、モデルの単語の埋め込みと同じ幅の行に変えます。
@@ -1308,21 +1362,38 @@ XeStrata はそれを、プロンプトの `<|image_pad|>` のトークンの位
 
 ## 画像の生成（任意）
 
-`./setup.sh --images qwen-image` で、文章のモデルとは別に Qwen-Image-2.1-Turbo で画像を作れるようにします（upstream 0.1.44）。
+使い方、オプション、API の項目の一覧は [IMAGE](IMAGE.ja.md) にあります。ここでは中のしくみも含めて説明します。
+
+`./setup.sh --images qwen-image-turbo` で、文章のモデルとは別に Qwen-Image-2.1-Turbo で画像を作れるようにします（upstream 0.1.44）。
 画像は XeStrata 自身の画像のエンジン `strata-image` が作ります。setup が文章のエンジンと一緒にビルドし、同じ SYCL のカーネルでどのメーカーの GPU でも動きます。
+画像の注意は、Intel の GPU では oneDNN、AMD の GPU では aotriton（どちらもパッケージに入ります）、NVIDIA の GPU では cuDNN が入っていれば cuDNN（contrib-llvm。`xestrata --setup` が入れ方を示します）で取り、ほかは XeStrata の核で取ります。画像のモデルの積は、GPU の計算ライブラリが int8 の積を持つとき（contrib-llvm の Intel・NVIDIA、AMD）は重みと活性を int8 にして掛けます。
 setup は画像のモデル、VAE、文の読み手（Qwen3-VL-8B）と、編集のための画像の読み手（Qwen3-VL の mmproj）をダウンロードして、設定に `"images"` を足します。
 画像のモデルは既定で Q8_0 です。VRAM に入らない層はエンジンが RAM から流し込むので、GPU のメモリでは大きさを選びません。
-選ぶのは RAM です。4 つのファイル（編集のための画像の読み手を含む）とエンジンの分（Q8_0 で約 16.6 GB、Q6_K で約 15.3 GB、Q4_K_M で約 13.2 GB）が文章のモデルの残す RAM に入らなければ、setup は入る中で最も大きいもの（Q6_K、Q4_K_M）に下げます。
-`--image-ssd-offload on` なら下げずに選んだ大きさのまま入れ、入らない分は SSD から読みます（遅くなります）。
+文の読み手も既定で Q8_0 です。選ぶのは RAM です。4 つのファイル（編集のための画像の読み手を含む）とエンジンの分（両方が Q8_0 で約 20.2 GB）が文章のモデルの残す RAM に入らなければ、setup はまず文の読み手を Q6_K、Q5_K、Q4_K の順に下げ、それでも入らないときに画像のモデルを入る中で最も大きいもの（Q6_K、Q4_K_M）に下げます。画像のモデルを下げたときは、文の読み手をその横に入る中で最も大きいものにします。
+`--image-ssd-offload on` なら下げずにどちらも選んだ大きさのまま入れ、入らない分は SSD から読みます（遅くなります）。
+`--images qwen-image-turbo-uncensored` なら、文の読み手を AtomicChat の Qwen3-VL-8B（拒否の方向を取り除いたもの）に替えます。大きさの選び方は同じです。画像のモデル、VAE、画像の読み手はそのままです。作者の計測では、描けるものは変わらず、絵が全体に少し変わるだけです。
 下げたときは、setup の画面、サーバーの起動時の表示、Web のページ（Images のタブ）がそのことを知らせます。
 同じ種なら、stable-diffusion.cpp がモデルのカードのコマンドで作る画像と同じ画像になります（LPIPS 0.03 以内）。
-Qwen-Image-2.1-Turbo の重みは Qwen Research License で、自由なソフトウェアのライセンスではありません。商用に使う前にそのライセンスを読んでください。
+`--images qwen-image-base` なら、Turbo の元のモデルの Qwen-Image-2.1 で作ります（`qwen-image-base-uncensored` なら文の読み手が上の AtomicChat のものになります）。別のファイルになるのは画像のモデルだけで、VAE、文の読み手、画像の読み手は Turbo と同じものを使います。
+既定は 40 ステップ（Qwen の diffusers の pipeline の既定で、ガイダンスはなし）で、1 枚に Turbo の約 5 倍の時間がかかります。リクエストの `steps`（2〜100）で変えられます。各ステップの sigma は diffusers の scheduler と同じ式で、画像の大きさに合わせてずらします。
+Qwen-Image-2.1-Turbo と Qwen-Image-2.1 の重みは Qwen Research License で、自由なソフトウェアのライセンスではありません。商用に使う前にそのライセンスを読んでください。
 
-サーバーは `POST /v1/images/generations`（OpenAI の images API の形。`seed` も受けます）で画像を作り、Web のページには「Images」のタブが出ます。
-`POST /v1/images/edits`（OpenAI の形の multipart で `image` か `image[]`、または JSON の `images: [{"image_url": ...}]`）は、参照画像（3 枚まで、PNG・JPEG・GIF・BMP）を元に画像を作ります。参照画像を書き換えたり、その中の人や物を主題にしたりできます。`size` を `auto` にすると、参照画像の縦横比で約 1024×1024 画素にします。Web のページでも、Images のタブで画像を添付すると編集になります。
-会話からも画像を作れます。`/v1/chat/completions` に `"strata_images": true` を付けると（Web のページは付けます）、モデルに `generate_image` と `edit_image` の道具を渡し、モデルが呼ぶとサーバーが画像を作ってその場に出します。`edit_image` は、会話の最後の画像（添付したものか、会話で作ったもの）を直します。`/v1/responses` では OpenAI の組み込みの `image_generation` の道具を付けると同じことをし、作った画像を `image_generation_call` の項目（`result` に PNG の base64）で返します。
+`--images mage-flow-turbo` なら、Microsoft の Mage-Flow-Turbo（4B、4 ステップ）で作ります。`mage-flow`（強化学習で調整した版、20 ステップ）と `mage-flow-base`（元のモデル、30 ステップ）は CFG を掛けます（既定の強さ 5）。
+setup は生成用と編集用の画像のモデル（Comfy-Org の bf16 の safetensors）、VAE、文の読み手（Qwen3-VL-4B）、編集のための画像の読み手（Qwen3-VL-4B の mmproj）をダウンロードします。文の読み手の大きさの選び方は Qwen-Image-2.1 と同じで、画像のモデルの大きさは 1 つです。
+エンジンは画像のモデルのブロックが文の読み手の層と一緒に VRAM に全部入るときは 16 ビット（FP16）のまま置いてそのまま掛け、入らないときは読み込むときに 8 ビットにして、VRAM に入らないブロックを RAM から流します（`--image-dit-q8 on` で常に 8 ビット、`off` で常に 16 ビット）。8 ビットは、GPU の計算ライブラリが int8 の積を持つとき（contrib-llvm の Intel・NVIDIA、AMD）は重みを 256 個ずつアダマール行列で回して行ごとの尺度の int8 にし、活性も同じく回してトークンごとに int8 にして掛けます（ComfyUI の int8_convrot と同じ形。時刻の変調の層だけは Q8_0）。ほかは Q8_0 で、掛けるたびに 16 ビットに戻します。
+`-uncensored` なら、文の読み手を huihui-ai の Qwen3-VL-4B（拒否の方向を取り除いたもの、noctrex の GGUF）に替えます。
+API では `steps`（既定はそれぞれのステップ数）、CFG の強さ `true_cfg_scale` か `guidance_scale`（1 なら CFG なし）、`negative_prompt`（既定は空白 1 文字）を受けます。マスクと透明な背景はありません。
+編集（`POST /v1/images/edits`、Web のページの Images のタブ、会話の `edit_image`）は、エンジンが編集用の画像のモデルに差し替えて作ります。参照画像は 3 枚まで（編集のモデルの学習と同じ）、ステップ数の既定は Turbo が 4、ほかの 2 つは 30 です。使っていない方の画像のモデルは 8 ビットのまま RAM に残し（`--image-dit-keep off` なら残さず、差し替えのたびにファイルから読み直します）、差し替えは数秒です。
+Mage-Flow の重みは MIT ですが、Microsoft の README は研究のためのモデルで、製品やサービスに使うことは想定していないとしています。XeStrata は Mage-Flow の内容のフィルターも透かしも入れていません。
+
+サーバーは `POST /v1/images/generations`（OpenAI の images API の形。`seed` と `steps` も受けます）で画像を作り、Web のページには「Images」のタブが出ます。
+画像の API は vLLM-Omni 互換（OpenAI 互換）で、vLLM-Omni の拡張の項目も受けます。`num_inference_steps` は `steps` と同じです（Turbo は 8 ステップのままで、ステップ数の指定は無視します）。`true_cfg_scale` を 1 より大きくして `negative_prompt` を付けると、Qwen-Image-2.1 と Turbo に CFG を掛けます（diffusers の Qwen-Image-2.1 と同じ式です。条件ありとネガティブの 2 つ分を計算するので、時間は 1024×1024 で約 2 倍、512×512 では約 1.5 倍です）。どちらかが欠けていればガイダンスなしで、`guidance_scale` は Qwen-Image-2.1 と Turbo では使いません。
+`output_format` は `png`（既定）、`jpeg`、`webp` で、`output_compression`（0〜100、既定 100）が jpeg と webp の画質になります。`quality` は Qwen-Image-2.1 でステップ数を決めます（`low` 20、`medium` と `standard` 30、`high`・`hd`・`auto` は既定の 40。`steps` を付けたときはそちら）。Turbo では 8 ステップのままで、Mage-Flow では使いません。応答の `usage` は画像のエンジンのトークンで数えます（プロンプトのトークンと、参照画像と作った画像の 16×16 画素で 1 つのトークン）。
+`background` を `transparent` にすると、Qwen の推奨する形でプロンプトを包み、透明な背景の画像（アルファ付きの PNG か webp）を作ります（jpeg とは組み合わせられません）。`opaque` はアルファを白の上に重ねて消し、`auto`（既定）はモデルの作ったままにします。編集の参照画像のアルファも、そのまま画像のモデルに渡します。
+`POST /v1/images/edits`（OpenAI の形の multipart で `image` か `image[]`、または JSON の `images: [{"image_url": ...}]`）は、参照画像（10 枚まで。PNG・JPEG・GIF・BMP はそのまま、WebP などほかの形式は PNG に変えて読みます）を元に画像を作ります。`mask`（OpenAI と同じく、1 枚目の画像と同じ大きさのアルファ付き PNG）を付けると、その透明な部分だけを描き直し、残りは 1 枚目の画像の画素のまま残します（各ステップでマスクの外の潜在を元の画像のものに戻し、最後に元の画素と合成します）。参照画像は、出力の大きさにかかわらず 1 枚ずつ縦横比を保った約 1024×1024 画素で読みます（diffusers の Qwen-Image-2.1 と同じ。Mage-Flow では、画像の読み手が長い辺 384 ピクセル以下で、VAE が出力の大きさで読みます）。参照画像が多いほど時間とメモリがかかります（B70 の 1024×1024 で 3 枚は約 46 秒、10 枚は約 4 分）。参照画像のトークンの K と V のキャッシュ（1024×1024 の 1 枚で約 2 GB）は、VRAM に入らない分をピン留めした RAM に置いて毎ステップ運びます。それでも VRAM か RAM が足りない画像は、作り始める前にエラー（400）で断ります。参照画像を書き換えたり、その中の人や物を主題にしたりできます。`size` を `auto` にすると、参照画像の縦横比で約 1024×1024 画素にします。Web のページでも、Images のタブで画像を添付すると編集になります。
+会話からも画像を作れます。`/v1/chat/completions` に `"strata_images": true` を付けると（Web のページは付けます）、モデルに `generate_image` と `edit_image` の道具を渡し、モデルが呼ぶとサーバーが画像を作ってその場に出します。`edit_image` は、会話の最後の画像（添付したものか、会話で作ったもの）を直します。`/v1/responses` では OpenAI の組み込みの `image_generation` の道具を付けると同じことをし、作った画像を `image_generation_call` の項目（`result` に画像の base64、`size`・`quality`・`background`・`output_format`・`revised_prompt` も）で返します。道具の `size`・`quality`・`output_format`・`output_compression`・`background` は、その道具で作る画像に使います（`size` が `auto` ならモデルの指定した大きさ）。
 大きさは一辺 256〜2048 ピクセルです。辺が 16 の倍数でない大きさ（1920×1080 など）は、16 の倍数に切り上げた大きさ（1920×1088）で作って真ん中を切り出し、Web のページはそのことを知らせます。
-画像のエンジンは最初の画像で起動して、そのまま残ります。カーネルの準備は 1 度だけで、同じプロンプトの文の状態と VRAM に載せた層は次の画像まで残ります。
+画像のエンジンは最初の画像で起動して、そのまま残ります。エンジンはサーバーとは別のプロセスで、文章のモデルを替えても残り、どのサーバーもつながらなくなって 30 分（設定の `daemon_idle_s`）たつと終わります。カーネルの準備は 1 度だけで、同じプロンプトの文の状態と VRAM に載せた層は次の画像まで残ります。
 画像の仕事は GPU で 1 つずつ動きます。エンジンは仕事の前に、その画像に要る VRAM（最低限と、DiT を全部載せて VAE を 1 回で回せる量）を答え、文章のモデルの扱いは `--image-gpu-policy` で決めます: `keep`（そのまま）、`shrink`（`--vram-elastic` で VRAM を空ける）、`unload`（会話を保存して外し、次の起動で戻す）、`auto`（既定。全部が入れば `keep`、入らなければ空けられるときは `shrink`、最低限が入るなら層を流し込んで `keep`、それも入らなければ `unload`）。
 仕事のあと、`keep` で VRAM に余裕があるときだけ画像のエンジンは層を残し、それ以外は持っているものを手放します（待機中はプロセスだけの約 200 MiB）。
 `tools/image/install.py --config <設定>` で、入っているモデルにあとから足せます。
@@ -1352,7 +1423,7 @@ Monitor は、要求ごとに ESP か stock かを示します。
 **有効にする（setup で）**: `./setup.sh --setup` が「Turn on the experimental speed projection?」と尋ねます（既定は no）。
 または `--experimental-speed-projection on`（`off`、または別のベクトルの GGUF のパス）を渡します。
 deb と rpm のパッケージにはベクトルが入っていないので、有効にすると、setup が入れた版のタグから GitHub にあるベクトルとそのライセンスをデータフォルダの `experimental-speed-projection/` にダウンロードします。
-元の Qwen3.8-Flash-Next だけで使え、Swift 1.5 では使えません。
+元の Qwen3.8-Flash-Next（Coder と Unsloth の版を含む）だけで使え、Swift 1.5 と huihui-ai の abliterated 版では使えません。
 setup は、次のエンジンの設定（llama.cpp のもの）を `xestrata-<model>.json` に書きます。
 
 ```text
@@ -1391,11 +1462,12 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | `... rocBLAS ... has no code for gfx...`、`... has no code for gfx...` | ディストリビューションの rocBLAS（パッケージではそのエンジン）が、その GPU のコードを持っていません。Ubuntu 26.04 なら、Fedora 44 で動くことがあります（[README](../README.ja.md#amd-の-gpu)）。 |
 | `building for the AMD GPU needs ROCm's ...` | AMD の GPU のコードを作る ROCm のパッケージが足りません。示されたものを入れて、setup をやり直します（`./setup.sh --packages` も参照）。 |
 | `... has no HIP target (AMD GPUs)` | intel/llvm が、ROCm を入れる前にビルドされています。setup が尋ねたら作り直すか、`python3 tools/intel_llvm_build.py --rebuild` を実行します。 |
-| Linux で `no progress for 60 s ... reading the prompt` と出て、止まったときの報告に `threads waiting on the disk (state D): 16 ...` がある | エンジンが止まったのではなく、ドライブを待っています。n-gram の表をランダムに読む（`--ple-io direct`）のに、回転ディスクが追いつきません（upstream #605）。表が回転ディスクにあると、エンジンは起動時に警告します。`--ple-io ram`（表の分の RAM が要ります）か、モデルを SSD に置くと直ります。setup は、回転ディスクで RAM に表が入るなら、自分で `--ple-io ram` を付けます。 |
+| Linux で `no progress for 60 s ... reading the prompt` と出て、止まったときの報告に `threads waiting on the disk (state D): 16 ...` がある | エンジンが止まったのではなく、ドライブを待っています。n-gram の表をランダムに読む（`--ple-io direct`）のに、回転ディスクが追いつきません（upstream #605）。表が回転ディスクにあると、エンジンは起動時に警告します。`--ple-io ram`（表の分の RAM が要ります）か、モデルを SSD に置くと直ります。setup は、回転ディスクで RAM に表が入るなら、自分で `--ple-io ram` を付けます（Linux では SSD でも、RAM がモデルの分と表と 16 GB を超えれば付けます）。 |
 | `the SYCL runtime of ... lists no GPU` | GPU の Level Zero のドライバー（`libze-intel-gpu1`、Intel の compute-runtime）がないか、その GPU には古すぎます。新しいものを入れます（[BUILD.ja.md](BUILD.ja.md#パッケージ)）。 |
 | `... gives this GPU no XMX` | そのコンパイラでは GPU の XMX が使えません。setup の選択肢から選びます。XMX なしでも動き、prefill に約 1.6 倍の時間がかかります（[BUILD.ja.md](BUILD.ja.md#sycl-のコンパイラ)）。 |
 | `no SYCL compiler for the engine` | SYCL のコンパイラがありません。ディストリビューションの DPC++ を入れるか、`--intel-llvm-build` を付けます。 |
-| 起動時に `alloc_device: ... refused` | B70 でまれに起きます（約 120 回の起動で 3 回）。もう一度起動すれば、たいていは動きます（[XE.ja.md](XE.ja.md#出力ヘッドの-vram-の確保が断られる)）。 |
+| 起動時に `alloc_device: ... refused` | VRAM に空きがあっても確保を断るドライバーの状態です（Intel の [compute-runtime #916](https://github.com/intel/compute-runtime/issues/916)。Linux 7.1 で直った xe カーネルのバグを、compute-runtime 26.22 が回避します。XeStrata の側では [#34](https://github.com/MistVVK/XeStrata/issues/34)。B70 では約 120 回の起動に 3 回起きました）。エンジンは確保を小分けにしてやり直し、確保できる分だけで起動します。カードがそのままのときは再起動でしか戻りません。Ubuntu 24.04/26.04 では [graphics PPA でドライバーを更新](BUILD.ja.md#パッケージ)してください（[XE.ja.md](XE.ja.md#出力ヘッドの-vram-の確保が断られる)）。 |
+| 起動のログに `IGC's GEP simplification is off` と出る | Intel Graphics Compiler（IGC）の 2.27〜2.30（Ubuntu 26.04 の 2.28.4 など）は、Xe2 以降の GPU（Arc B シリーズ、Lunar Lake、Panther Lake）向けに一部の読みを誤って訳し、GPU が範囲外を読んで止まるか、答えが狂います。Linux のエンジンは、入っている IGC がその版で、Xe2 以降の GPU があるとき、起動時に `IGC_EnableGEPSimplification=0` を設定してその最適化を切ります（B70 では 1K の decode が 5〜10% 遅くなり、32K は変わりません）。自分で `IGC_EnableGEPSimplification=1` を設定していれば、そちらが優先されます。元の速さで動かすには、Fedora 44 を使うか（IGC が 2.32 以降です）、[Podman で入れます](../README.ja.md#podman)（中は Fedora 44 です）。Ubuntu 24.04/26.04 では、HWE カーネルにして [Intel の graphics PPA](BUILD.ja.md#パッケージ) を入れる道もあります（IGC だけの更新はできません: PPA はドライバーも一緒に入れ、そのドライバーは HWE カーネル用です）。 |
 | Python やビルドの道具を入れられなかった | 示されたものを入れて、もう一度実行します。済んだことは残っていて、飛ばします。 |
 | `port 8095 is already in use` | XeStrata がすでに動いている（そのウィンドウを探す）か、ほかのプログラムがそのポートを使っています: `./setup.sh --port 8081`。 |
 | 初回の起動に数分かかる | RAM に 23〜50 GB を読み込んでいます。ファイルが OS のキャッシュにある間は、2 回目の方が速くなります。 |
@@ -1449,7 +1521,7 @@ Strata の設計、測定、ボトルネックは、upstream の論文 **[docs/p
 
 XeStrata は全体が [LGPL-3.0-or-later](../COPYING.LESSER) です。
 Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStrata の一部として LGPL で、著作権表示と許諾表示は [NOTICE](../NOTICE) にあります。
-例外は、元のライセンスのままの intel/llvm へのパッチと oneMath への変更、`ggml-common.h`、Outfit、`third_party/nonfree/` です（下）。
+例外は、元のライセンスのままの intel/llvm へのパッチと oneMath への変更、`third_party/main/` の写し（`ggml-common.h`、`ggml-common-tq.h`、`quantscope.py`、`stb_image.h`、Outfit）と AOTriton へのパッチ、`third_party/nonfree/` です（下と [third_party/main/README.md](../third_party/main/README.md)）。
 モデルのファイルは XeStrata に含まれず、それぞれのライセンスが適用されます（下）。
 
 - **元のソフトウェア**: Niko1221 と Strata の貢献者による [Strata](https://github.com/Niko1221/Strata)。
@@ -1458,9 +1530,11 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
   Coder は [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)
   （カードによれば Apache-2.0）で、Strata での対応は @pjgmobile の PR #54 によるものです。
   Swift 1.5 は UkisAI の [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)。
-  UD-IQ4_XS と UD-Q4_K_XL は Unsloth の [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)。
-  Gyro-S と Gyro-M は agentionai の [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)。
-  その形式（`third_party/main/ggml-tq/`、MIT）と CPU・GPU のカーネルは、Laurent Zuijdwijk が agentionai の llama.cpp のフォークと Strata に書いたものを、XeStrata が移したものです。
+  UD-IQ4_XS、UD-Q4_K_XL、UD-Q5_K_XL、UD-Q6_K_XL、Q8_0 は Unsloth の [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)。
+  Gyro は agentionai の [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)。
+  abliterated 版は huihui-ai の [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)。
+  ほかのモデルは、Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj の[再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) と Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
+  画像のモデルは、Qwen の Qwen-Image-2.1 と Qwen-Image-2.1-Turbo（GGUF は Unsloth）、Microsoft の Mage-Flow（Comfy-Org の safetensors）、文の読み手の Qwen3-VL（Unsloth、AtomicChat、huihui-ai と noctrex の版）（[IMAGE](IMAGE.ja.md#ライセンス)）。
   重みにはそれぞれのライセンスが適用されます。
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)**（MIT）: i-quant の形式、`src/kernels/xe/` に書き写した GPU の内積と展開、
   i-quant のエキスパートのためにリンクする CPU のバックエンド、画像のエンコーダー（`tools/vision/`）の `mtmd` のライブラリと GPU のバックエンド（Vulkan、SYCL）、
@@ -1470,7 +1544,9 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
 - **[intel/llvm](https://github.com/intel/llvm)** の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib-llvm のコンパイラと SYCL のランタイム。
   リポジトリには含めず、`tools/intel_llvm_build.py` がリリースを取ってきてビルドします。
   そのとき当てる XeStrata の修正は `third_party/main/intel-llvm/patches/` にあり、intel/llvm と同じライセンスです。`third_party/main/intel-llvm/LICENSE.TXT` を参照。
-- **[ROCm のデバイスライブラリ](https://github.com/ROCm/llvm-project/tree/rocm-7.2.4/amd/device-libs)**（University of Illinois/NCSA、AMD）: ocml・ockl などの、AMD の GPU 向けのコードがリンクするライブラリ。
+- **画像のエンジンの部品**: 注意の計算に [oneDNN](https://github.com/uxlfoundation/oneDNN)（Apache-2.0、Intel の GPU）、[AOTriton](https://github.com/ROCm/aotriton)（MIT、AMD の GPU。中のカーネルは aiter（MIT）、FlyDSL（Apache-2.0）、Triton（MIT）の一部を含むことがあります）、[cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend)（Apache-2.0、一部 MIT、contrib-llvm の NVIDIA の GPU）、参照画像の読み込みに [stb_image](https://github.com/nothings/stb)（MIT か Unlicense）。Windows では AOTriton に [XZ Utils](https://tukaani.org/xz/) の liblzma（0BSD）をリンクします。
+- **[quantscope](https://github.com/1872183316/quantscope)**（MIT か Apache-2.0）: `setup.py --inspect` が GGUF の中身を確かめるのに使います。
+- **[ROCm のデバイスライブラリ](https://github.com/ROCm/llvm-project/tree/f30ae3e6b680ad23dcf522e668c6d4c5c90838d0/amd/device-libs)**（University of Illinois/NCSA、AMD）: ocml・ockl などの、AMD の GPU 向けのコードがリンクするライブラリ。
   リポジトリには含めず、`tools/intel_llvm_build.py` が ROCm の llvm-project のリリースから取ってきて、intel/llvm と一緒にビルドします。`third_party/main/rocm-device-libs/LICENSE.TXT` を参照。
   そのビルドに渡す機能の指定は、Debian の [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) のパッケージ（Expat、著作者は NOTICE）の `debian/rules` から写しました。
 - **参考にした考え方**（文献は論文にあります）:

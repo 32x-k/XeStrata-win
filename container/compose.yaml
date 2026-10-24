@@ -1,13 +1,18 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-# XeStrata with rootless Podman: podman compose build, then podman compose run --rm xestrata --setup, then
-# podman compose up -d (http://127.0.0.1:8095).  Intel GPUs as it is; AMD's add compose.amd.yaml, NVIDIA's
+# XeStrata with rootless Podman (PODMAN_COMPOSE_PROVIDER=podman-compose: README, Podman): podman compose build, then
+# podman compose run --rm xestrata --setup, then podman compose up -d (http://127.0.0.1:8095).  Intel GPUs as it is; AMD's add compose.amd.yaml, NVIDIA's
 # compose.nvidia.yaml (podman compose -f compose.yaml -f compose.nvidia.yaml ...).  docs/BUILD.md#podman
 name: xestrata
+# podman-compose: no pod (a pod and the user namespace below cannot go together)
+x-podman:
+  in_pod: false
 services:
   xestrata:
     build:
       context: .
+      # named, as docker-compose (which podman compose runs where it is installed) looks for a Dockerfile only
+      dockerfile: Containerfile
       args:
         XESTRATA_VERSION: ${XESTRATA_VERSION:-latest}
         XESTRATA_VARIANT: ${XESTRATA_VARIANT:-contrib-cuda13.4}

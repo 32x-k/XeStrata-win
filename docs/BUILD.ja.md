@@ -46,12 +46,12 @@ CMake のオプション `STRATA_LICENSE` で選びます。
 
 - **free**（`-DSTRATA_LICENSE=free`）: intel/llvm の DPC++ 7 以降（SYCL ランタイムが libsycl 9）でビルドします。
   自由ソフトウェアだけで済み、oneAPI の環境は使いません。
-  `tools/intel_llvm_build.py` でソースからビルドしたもの（v7.1.1）で確かめています（[setup](#setup) を参照）。
+  `tools/intel_llvm_build.py` でソースからビルドしたもの（v7.2.0）で確かめています（[setup](#setup) を参照）。
   ディストリビューションのパッケージも 7 以降なら使えます。それより古いもの（Ubuntu 26.04 の `dpclang++` 6.2）は、CMake と setup が断ります。
   6.2 の SYCL ランタイムは Arc Pro B70 に XMX がないと報告し、prefill の経路が約 1.6 倍遅くなっていました。
   ROCm の HIP 付きでビルドした intel/llvm なら、`STRATA_HIP_ARCHS`（例 `gfx1200`）で AMD の GPU（RDNA2 以降: gfx103x、gfx11xx、gfx12xx）向けのコードも作ります。
   ROCm は自由ソフトウェアなので、free でも contrib-llvm でも同じです（[DEVTOOLS.ja.md](DEVTOOLS.ja.md#hipamd-の-gpu)）。
-  `auto`（既定）はカーネルの KFD が報告するこの PC の AMD の GPU を選び、`rocblas` はディストリビューションの rocBLAS がコードを持つ RDNA2 以降の GPU のうち、SYCL のコンパイラにターゲットのあるものをすべて選びます（パッケージはこれでビルドします。intel/llvm 7.1.1 には gfx1152 と gfx1153 のターゲットがありません）。
+  `auto`（既定）はカーネルの KFD が報告するこの PC の AMD の GPU を選び、`rocblas` はディストリビューションの rocBLAS がコードを持つ RDNA2 以降の GPU のうち、SYCL のコンパイラにターゲットのあるものをすべて選びます（パッケージはこれでビルドします。intel/llvm 7.2.0 には gfx1152 と gfx1153 のターゲットがありません）。
   ROCm のデバイスライブラリ（`ockl.bc`）は、AMD の `/opt/rocm*`、ディストリビューションのもの、SYCL のコンパイラ自身のもの（`tools/intel_llvm_build.py` が一緒にビルドします）の順に、AMD のカーネルを試しにビルドして、通った最初のものを使います。
   入っている ROCm のものが使えればそれを使い、コンパイラ自身のものは、ROCm のものがコンパイラより新しい LLVM で作られていて読めないとき（ROCm 7.14 など）に使います。
   どれも通らなければ、それぞれの理由（コンパイラより新しい LLVM のビットコード、コンパイラが求めるファイルがない）を出して止まります。
@@ -64,7 +64,7 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   `STRATA_CUDA_ARCHS`（例 `sm_89`）で NVIDIA の GPU 向けのコードも作ります。
   XeStrata のソースは free のときと同じで、自由ソフトウェアのままです。
   ただし、ビルドに NVIDIA の CUDA ツールキット、実行に NVIDIA のドライバが要り、どちらも自由ソフトウェアではありません（XeStrata には含めません）。
-  Ubuntu 26.04 の `nvidia-cuda-toolkit` 12.4 と intel/llvm v7.1.1 で、sm_89 向けのビルドが通ることを確かめています。
+  Ubuntu 26.04 の `nvidia-cuda-toolkit` 12.4 と intel/llvm v7.2.0 で、sm_89 向けのビルドが通ることを確かめています。
   RTX 4070（sm_89）で動くことを確かめています。
   エンジンはメーカーのドライバーのライブラリを直接リンクせず、SYCL のランタイムと oneMath が、あるものだけを実行時に開きます。
   そのため、Intel の GPU だけの PC では NVIDIA のドライバーと CUDA がなくても、NVIDIA の GPU だけの PC では Level Zero がなくても動きます
@@ -83,7 +83,7 @@ CUDA ツールキットがいくつもある PC（ディストリビューショ
 `STRATA_CUDA_PATH` の既定 `auto` は、見つかったツールキット（`CUDA_PATH`・`CUDA_HOME`・`CUDA_ROOT`、`/usr/local/cuda-*`、`/opt/cuda`、`/usr/lib/cuda`、PATH の `nvcc`）を1つずつ試し、この PC の NVIDIA の GPU のうち多くにコードを作れるもの、次にその GPU により新しいアーキテクチャのコードを作れるもの、次に cuBLAS を持つもの、次に新しい版を選びます（`cmake/StrataCuda.cmake`）。
 GPU のコードと oneMath の cuBLAS は、選んだ1つを使います。cuBLAS のないツールキットでは cuBLAS の後端を作らず、密な積は自前のカーネルになります。
 各 GPU には、その GPU のアーキテクチャか、作れるうちでそれより古い最も新しいものを作り、ドライバーがその PTX を GPU に合わせてコンパイルします。
-intel/llvm 7.1.1 の SYCL は sm_90 より上の名前を持たないので、名前のないアーキテクチャ（RTX 50 の sm_120）は汎用の NVIDIA のターゲット（`nvptx64-nvidia-cuda` に `--cuda-gpu-arch`）で作ります。実行ファイルに1つしか入らないので、それが要る GPU のうち最も古いもののアーキテクチャです。CUDA 12.8 より前のツールキットでは作れず、sm_90 のコードになります。
+intel/llvm 7.2.0 の SYCL は sm_90 より上の名前を持たないので、名前のないアーキテクチャ（RTX 50 の sm_120）は汎用の NVIDIA のターゲット（`nvptx64-nvidia-cuda` に `--cuda-gpu-arch`）で作ります。実行ファイルに1つしか入らないので、それが要る GPU のうち最も古いもののアーキテクチャです。CUDA 12.8 より前のツールキットでは作れず、sm_90 のコードになります。
 oneMath の cuBLAS の後端は、1つのアーキテクチャしか受けないので、最も古いもので作ります（積そのものは cuBLAS の中で走ります）。
 CUDA 13.1 で sm_89 と汎用の sm_120 を作った実行ファイルは、4070 で sm_89 の像を選び、CTest 52 件が通りました。
 ツールキットが外した古い GPU（CUDA 13 の Volta など）は、それを扱うツールキットがあればそれを選び、なければ警告を出してその GPU のコードを作りません。
@@ -93,7 +93,7 @@ NVIDIA のコードの PTX は、既定ではツールキットの版です（CU
 PTX 7.8 で作ったものは RTX 4070 で CTest 52 件が通りました。
 ドライバーには、intel/llvm の CUDA のアダプタが使う関数（SYCL のグラフの `cuGraphAddKernelNode_v2`）のため、CUDA 12.0 以上（525 以降）が要ります。
 どちらの変数も既定は `auto` で、指定すればそれを使います（別の機械向けに作るとき）。
-oneMath は configure のときに CMake が GitHub の XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、タグ `xestrata-3`）から取ってきます（アーカイブの SHA-256 を確かめます）。XeStrata の変更（cuBLAS の BF16 の積、rocBLAS の後端の hipBLASLt、cuBLAS と rocBLAS の後端を 1 つのビルドで作れるようにするターゲットの指定の分離、rocBLAS の後端からの HIP と SYCL の非推奨の API の除去）が入り、本家の `develop` をマージした oneMath です。
+oneMath は configure のときに CMake が GitHub の XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、タグ `xestrata-10`）から取ってきます（アーカイブの SHA-256 を確かめます）。XeStrata の変更（cuBLAS の BF16 の積、rocBLAS の後端の hipBLASLt、rocBLAS と cuBLAS の後端の int8 の積、cuBLAS と rocBLAS の後端を 1 つのビルドで作れるようにするターゲットの指定の分離、rocBLAS の後端からの HIP と SYCL の非推奨の API の除去、Windows のクロスビルドの GNU 形の clang++ への対応と、そこでの cuBLAS と rocBLAS の後端と Windows の import library）が入り、本家の `develop` をマージした oneMath です。
 ネットワークのない機械では、同じアーカイブを `STRATA_ONEMATH_SOURCE`（手元のファイルか URL）で渡します。
 変更の一覧は [third_party/main/README.md](../third_party/main/README.md) にあります。
 oneMath が GPU の後端を持たないときは、自前のカーネルを使います。
@@ -316,6 +316,10 @@ setup.sh は、venv の使える Python 3 がないときだけ、それを `sud
 | NVIDIA の GPU（contrib-llvm） | `nvidia-cuda-toolkit` と NVIDIA のドライバー | `cuda-toolkit-13-4`（NVIDIA の CUDA のリポジトリ）と NVIDIA のドライバー | `cuda` と NVIDIA のドライバー |
 
 - `intel-oneapi-` で始まるものは、Intel の oneAPI のリポジトリにあります（追加のしかたは Intel の手順: [APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html)、[DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)）。
+- Intel の GPU のドライバー（`libze-intel-gpu1` ほか）は、Ubuntu 24.04/26.04 では古いものが配布されます（26.04 は compute-runtime 26.05 と IGC 2.28）。
+  compute-runtime 26.22 未満には、VRAM に空きがあっても確保を断る状態になる不具合があります（Intel の [compute-runtime #916](https://github.com/intel/compute-runtime/issues/916)。xe カーネルのバグ（Linux 7.1 で修正）に 26.22 のドライバーが対応したもの。XeStrata では[#34](https://github.com/MistVVK/XeStrata/issues/34)）。
+  Ubuntu 24.04/26.04 で HWE カーネルを使っているとき、setup は [Intel の graphics PPA](https://launchpad.net/~kobuk-team/+archive/ubuntu/intel-graphics)（compute-runtime と IGC が新しい）への更新を勧めて、更新まで起動を止めます（`--old-driver` でそのまま起動もできます）。
+  GA カーネルでは、HWE カーネルにして PPA を入れるか、Fedora 44 / Podman（IGC も 2.32 以降。[困ったとき](DETAILS.ja.md#困ったとき)）を勧めます。
 - 共通の行の Vulkan のもの（`libvulkan-dev` ほか）は GPU の画像エンコーダーのため、`libblosc2-dev`（`blosc2-devel`）は保存した会話の圧縮（任意。[`conversation_save_compress`](DETAILS.ja.md#置いた会話を再起動後も使う任意)）のためです。
 - AMD の行の `clang-21` と `libclang-rt-21-dev`（Fedora は `rocm-clang` と `rocm-clang-runtime-devel`、ROCm の clang とその実行時）は、コンパイルには使いません（コンパイルは intel/llvm がします）。
   oneMath の rocBLAS の後端が読む HIP の CMake のパッケージが、clang の実行時の builtins（`libclang_rt.builtins`）をリンクに足すためにコンパイラに尋ねます。
@@ -386,7 +390,7 @@ tools/package/build.sh fedora44 cuda13.4
 | cuda13.4 | Fedora 44 | NVIDIA のリポジトリの `cuda-toolkit-13-4` | sm_75、sm_80、sm_86、sm_89、sm_90 |
 | cuda12.4 | Ubuntu 26.04 | `nvidia-cuda-toolkit` | sm_60、sm_61、sm_70、sm_75、sm_80、sm_86、sm_89、sm_90 |
 
-AMD のコードは、どの版にも、そのディストリビューションの rocBLAS（ROCm 7.1）がコードを持つ GPU の分を入れます（intel/llvm 7.1.1 にターゲットのない gfx1152 と gfx1153 を除きます）。
+AMD のコードは、どの版にも、そのディストリビューションの rocBLAS（ROCm 7.1）がコードを持つ GPU の分を入れます（intel/llvm 7.2.0 にターゲットのない gfx1152 と gfx1153 を除きます）。
 
 | ディストリビューション | AMD のコード |
 | --- | --- |
@@ -396,7 +400,7 @@ AMD のコードは、どの版にも、そのディストリビューション�
 - cuda の版の名前は、ビルドに使った CUDA の版です。
   Fedora 44 向けの NVIDIA のリポジトリには CUDA 13.3 と 13.4 しかないので、Fedora では 13.4 を使います。CUDA 12 もないので、cuda12.4 は Ubuntu だけです。
 - CUDA 13 は Pascal（sm_60・sm_61）と Volta（sm_70）のコードを作らないので、P100、P40、V100 などは cuda12.4 を使います。
-- intel/llvm 7.1.1 の SYCL には sm_90 より上の名前がないので、RTX 50 などの新しい GPU は sm_90 の PTX をドライバーがコンパイルして動かします。
+- intel/llvm 7.2.0 の SYCL には sm_90 より上の名前がないので、RTX 50 などの新しい GPU は sm_90 の PTX をドライバーがコンパイルして動かします。
 - PTX はツールキットの版なので、ドライバーはその CUDA の版に対応している必要があります。
 
 ### Windows の 7z
@@ -407,7 +411,7 @@ Windows 版の 7z も、同じ `tools/package/build.sh` で、Ubuntu 26.04 の�
 tools/package/build.sh windows cuda12.4      # XeStrata-<版>-windows-x64.7z
 ```
 
-- すべて Linux の上で Windows 向けにクロスビルドします。intel/llvm（Linux 版の contrib と、Windows 版の SYCL のランタイム）、エンジン（contrib-llvm のモード、NVIDIA のコードは cuda12.4 の deb と同じ）、.NET の入口（`dotnet-sdk-10.0`）、Python の embeddable 版と wheel を作り、`tools/package/windows_bundle.py` がフォルダーと 7z にします。
+- すべて Linux の上で Windows 向けにクロスビルドします。intel/llvm（Linux 版の contrib と、Windows 版の SYCL のランタイム）、エンジン（contrib-llvm のモード、NVIDIA のコードは cuda12.4 の deb と同じ）、CPU の画像のエンコーダー（`strata-vision-cpu.exe`。GPU の Vulkan のものは入れず、画像は CPU で読みます）、.NET の入口（`dotnet-sdk-10.0`）、Python の embeddable 版と wheel を作り、`tools/package/windows_bundle.py` がフォルダーと 7z にします。
 - MSVC の CRT と Windows SDK は xwin で Microsoft から取り、ライセンスに同意します（自由ソフトウェアではなく、7z には入れません）。CUDA の Windows 版のヘッダーとインポートライブラリも 7z には入れません。
 - Ubuntu 26.04 のパッケージと同じ ccache（`build/pkg-ccache/ubuntu26.04/`）を使い、xwin と NuGet の取得物は `build/pkg-cache/windows/` に残します。
 - 7z の中の exe・DLL・Python のパッケージは、どれも `windows_bundle.py` の部品の一覧にあるものでなければならず、Visual C++ のランタイムや NVIDIA のライブラリが入っていると止まります。
@@ -468,7 +472,7 @@ xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）�
 | --- | --- | --- |
 | `XESTRATA_VERSION` | `latest` | リリースのタグ（`xe0.1.43.1` など） |
 | `XESTRATA_VARIANT` | `contrib-cuda13.4` | 入れる rpm の版 |
-| `XESTRATA_NONFREE` | `1` | `0` で oneMKL と cuBLAS を入れません（Intel と NVIDIA の密な積は XeStrata の自前のカーネルになります） |
+| `XESTRATA_NONFREE` | `1` | `0` で oneMKL と、NVIDIA の cuBLAS・cuDNN を入れません（Intel と NVIDIA の密な積と NVIDIA の画像の注意は XeStrata の自前のカーネルになります） |
 
 - **手元の rpm**: `container/rpm/` に rpm を 1 つ置くと、Releases から取らずにそれを入れます。
   Releases にない `xestrata-free` は、`tools/package/build.sh fedora44 free` で作ってここに置きます。

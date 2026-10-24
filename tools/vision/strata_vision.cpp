@@ -172,6 +172,7 @@ int main(int argc, char** argv) {
     llama_backend_init();
 
     const auto load_t0 = std::chrono::steady_clock::now();
+#if !defined(_WIN32)   // posix_fadvise; on Windows the loader's reads go as they are (#24)
     // ask the OS for the projector file up front (128 KiB steps) so the loader's sequential reads find it cached;
     // STRATA_READ_AHEAD=0 turns it off, as in the engine.  Windows has no posix_fadvise: its cache manager reads
     // ahead of the loader's sequential reads by itself
@@ -186,11 +187,15 @@ int main(int argc, char** argv) {
         }
     }
 #endif
-    // the vocabulary and header only: the weights (and their tensor types, which can be Strata-private ones such as
-    // Gyro's TQK6 / TQK7) are never touched - see gguf_meta.h
+    // the vocabulary and header only: the weights (and their tensor types, which can be ones llama.cpp does not know,
+    // such as Gyro's TQK6 / TQK7) are never touched - see gguf_meta.h (upstream 3fe84ec28)
     std::string how;
     llama_model* text = strata_open_text_model(model, &how);
-    if (!text) { std::printf("ERR cannot open the text model %s (%s)\n", model.c_str(), how.c_str()); std::fflush(stdout); return 1; }
+    if (!text) {
+        std::printf("ERR cannot open the text model %s (%s)\n", model.c_str(), how.c_str());
+        std::fflush(stdout);
+        return 1;
+    }
 
     mtmd_context_params cp = mtmd_context_params_default();
     cp.use_gpu = gpu;

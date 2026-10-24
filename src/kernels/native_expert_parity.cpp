@@ -16,13 +16,6 @@
 //     build/native_expert_parity --bf16-embd
 //
 // The BF16 token embedding (--embd-gguf) on a random table, no model needed (in CTest).
-//
-//     build/native_expert_parity --synthetic-tq GU/DOWN [--hadamard]   (tq2_t, tqk6, tqk7: e.g. tqk6/tqk7)
-//
-// The trellis types of agentionai's Gyro files on random blocks, against a float decode written here from the format
-// (ggml-common-tq.h): the CPU's kernels (every ISA the CPU has, bit for bit against the scalar one and at any token
-// count), the GPU's grouped experts and its f32 dequantizer (every bit); --hadamard folds a block-128 rotation with
-// random signs into every role and checks hadamard_rows against the CPU's hadamard_rotate, every bit.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/cpu/canon_expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -31,11 +24,8 @@
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
-#include "strata/kernels/cpu/tq_cpu.hpp"
 #include "ggml-cpu.h"
-#include "ggml-common-tq.h"
 #include "strata/kernels/iq_kernels.hpp"
-#include "strata/kernels/xmx_gemm.hpp"
 
 #include "ggml.h"
 
@@ -126,13 +116,18 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
     std::vector<float> x((size_t) NT * H);
     for (auto& v : x) v = nd(rng);
     std::vector<float> ref((size_t) NT * H), got_c((size_t) NT * H), got_g((size_t) NT * H);
+    // APR (--synthetic-hadamard, upstream fbf045eb6): the folded expert's reference takes H (s * x) and H (s * h), as
+    // llama.cpp's graph does
+    std::vector<float> xr(x);
+    if (f.had_gu) for (int k = 0; k < NT; ++k) cpu::hadamard_rotate(xr.data() + k * H, (int) H, f.had_block, f.gu_signs);
     for (int k = 0; k < NT; ++k) {
         std::vector<float> h(FF);
         for (int64_t r = 0; r < FF; ++r) {
             double g = 0, u = 0;
-            for (int64_t i = 0; i < H; ++i) { g += (double) G[r * H + i] * x[k * H + i]; u += (double) U[r * H + i] * x[k * H + i]; }
+            for (int64_t i = 0; i < H; ++i) { g += (double) G[r * H + i] * xr[k * H + i]; u += (double) U[r * H + i] * xr[k * H + i]; }
             h[r] = (float) (g / (1.0 + std::exp(-g)) * u);
         }
+        if (f.had_d) cpu::hadamard_rotate(h.data(), (int) FF, f.had_block, f.d_signs);
         for (int64_t r = 0; r < H; ++r) {
             double o = 0;
             for (int64_t i = 0; i < FF; ++i) o += (double) D[r * FF + i] * h[i];
@@ -321,7 +316,8 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
     }
     // (c) the GPU: one group holding the NT entries
     {
-        const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF, f.up_type);
+        auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF, f.up_type);
+        if (f.had_d) { L.had_block = f.had_block; L.d_signs = strata::kernels::hadamard_device_signs(f.d_signs, (int) FF); }
         namespace par = strata::parity;
         void* dblob = par::alloc_bytes(blob.size());
         void* dx = par::alloc_bytes(x.size() * 4);
@@ -346,6 +342,29 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
             strata::kernels::native_expert_grouped_bf16(L, dptr, dstart, dn, ddst, dtok, 1, NT, (const float*) dx, dscr,
                                                         dout, s);
         } else {
+            if (f.had_gu) {   // APR: the GPU rotation of x (in place here), then its floats against the CPU's
+                const float* sx = strata::kernels::hadamard_device_signs(f.gu_signs, (int) H);
+                strata::kernels::hadamard_rows((const float*) dx, (float*) dx, NT, H, f.had_block, sx, s);
+                std::vector<float> gx(x.size());
+                par::sync();
+                par::copy_bytes_out(gx.data(), dx, gx.size() * 4);
+                const bool same = std::memcmp(gx.data(), xr.data(), gx.size() * 4) == 0;
+                std::printf("          gpu hadamard_rows vs cpu hadamard_rotate: %s (rel %.2e)\n",
+                            same ? "bitwise equal" : "differ", rel(gx, xr));
+                if (!(rel(gx, xr) < 1e-6)) ++failures;
+                // the f16 form (the prompt path) on the unrotated x: within fp16 rounding of the float rotation
+                std::vector<uint16_t> xh(x.size()), xh_out(x.size());
+                for (size_t i = 0; i < x.size(); ++i) xh[i] = ggml_fp32_to_fp16(x[i]);
+                auto* dxh = static_cast<uint16_t*>(par::alloc_bytes(xh.size() * 2));
+                par::copy_bytes_in(dxh, xh.data(), xh.size() * 2);
+                strata::kernels::hadamard_rows_f16(dxh, NT, H, f.had_block, sx, s);
+                par::sync();
+                par::copy_bytes_out(xh_out.data(), dxh, xh.size() * 2);
+                std::vector<float> xf(x.size());
+                for (size_t i = 0; i < xf.size(); ++i) xf[i] = ggml_fp16_to_fp32(xh_out[i]);
+                std::printf("          gpu hadamard_rows_f16 vs cpu float rotation: rel %.2e\n", rel(xf, xr));
+                if (!(rel(xf, xr) < 2e-3)) ++failures;
+            }
             strata::kernels::quantize_q8_1_rows((const float*) dx, NT, H, dxq, s);
             strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
         }
@@ -458,7 +477,7 @@ static uint32_t float_bits(float f) {
 // --synthetic GU/DOWN[@HxFF] (e.g. q4_K/q5_1, upstream efeffd8): one expert of random weights quantized by ggml into
 // those formats at n_embd H and width FF (2560/640 unless given), three ways as above; then the GPU's f32 dequantizer against ggml's to_float, bit for bit, on
 // the gate rows and the down rows.  A pair the GPU has no kernels for is refused (native_expert_supported): 1.
-static int check_synthetic(const std::string& arg, void* s) {
+static int check_synthetic(const std::string& arg, void* s, bool had = false) {
     const size_t at = arg.find('@');
     const std::string pair = arg.substr(0, at);
     int64_t H = 2560, FF = 640;
@@ -485,6 +504,17 @@ static int check_synthetic(const std::string& arg, void* s) {
     cpu::NativeFmt f;
     std::string err;
     if (!cpu::native_fmt(gu, dt, H, FF, f, err)) { std::printf("synthetic %s: %s\n", pair.c_str(), err.c_str()); return 1; }
+    // --synthetic-hadamard: the layer Hadamard-folded (APR, prism.hadamard): random signs, block 128
+    std::vector<float> sx((size_t) H), sh((size_t) FF);
+    if (had) {
+        XorShift32 srng{5};   // the same signs every run
+        for (auto& v : sx) v = (srng() & 1) ? 1.f : -1.f;
+        for (auto& v : sh) v = (srng() & 1) ? 1.f : -1.f;
+        f.had_block = 128;
+        f.had_gu = f.had_d = true;
+        f.gu_signs = sx.data();
+        f.d_signs = sh.data();
+    }
     XorShift32 rng{1234};   // the same weights every run
     std::normal_distribution<float> nd(0.f, 0.05f);
     std::vector<float> w((size_t) FF * H);
@@ -496,7 +526,7 @@ static int check_synthetic(const std::string& arg, void* s) {
     std::vector<float> wd((size_t) H * FF);
     for (auto& v : wd) v = nd(rng);
     ggml_quantize_chunk((ggml_type) dt, wd.data(), blob.data() + f.down_off, 0, H, FF, nullptr);
-    int failures = check_blob("synthetic", 0, blob, f, s);
+    int failures = check_blob(had ? "hadamard" : "synthetic", 0, blob, f, s);
     // the GPU dequantizers against ggml's to_float, every bit
     namespace par = strata::parity;
     auto dequant_check = [&](int t, const uint8_t* src, int64_t n, const char* what) {
@@ -521,282 +551,13 @@ static int check_synthetic(const std::string& arg, void* s) {
     return failures ? 1 : 0;
 }
 
-// ---- --synthetic-tq: the trellis types (see the top)
-namespace tqref {
-float h2f(uint16_t h) { return ggml_fp16_to_fp32((ggml_fp16_t) h); }
-// step t's 15-bit state, from the format's description (not the kernels' code): TQ2_T qs[(t + 31) % 32] << 8 | qs[t];
-// TQK the 16 stream bits from bit (31 - t) K, LSB first, circular over the block's 32 K bits
-uint32_t state(int type, const uint8_t* qs, int t) {
-    if (type == 144) return (((uint32_t) qs[(t + 31) % 32] << 8) | qs[t]) & TQ_STATE_MASK;
-    const int K = type == 145 ? 6 : 7, bits = 32 * K;
-    uint32_t v = 0;
-    for (int b = 0; b < 16; ++b) {
-        const int at = ((31 - t) * K + b) % bits;
-        v |= (uint32_t) ((qs[at / 8] >> (at % 8)) & 1) << b;
-    }
-    return v & TQ_STATE_MASK;
-}
-// one block of 128 values, d * the codebook's fp16 values in float
-void block(int type, const uint8_t* b, float* y) {
-    const float d = h2f((uint16_t) (b[0] | (b[1] << 8)));
-    for (int t = 0; t < 32; ++t) {
-        const uint32_t x = state(type, b + 2, t) * 0x9e3779b1u;
-        const uint32_t pa = x >> 21, pb = (x >> 10) & 2047u;
-        y[4 * t + 0] = d * h2f(tq_lut_f16[2 * pa]);
-        y[4 * t + 1] = d * h2f(tq_lut_f16[2 * pa + 1]);
-        y[4 * t + 2] = d * h2f(tq_lut_f16[2 * pb]);
-        y[4 * t + 3] = d * h2f(tq_lut_f16[2 * pb + 1]);
-    }
-}
-void rows(int type, const uint8_t* w, int64_t rows, int64_t n, float* y) {
-    const size_t bsz = cpu::tq_block_bytes(type);
-    for (int64_t i = 0; i < rows * n / 128; ++i) block(type, w + (size_t) i * bsz, y + i * 128);
-}
-}  // namespace tqref
-
-static int check_synthetic_tq(const std::string& pair, bool had, void* s) {
-    namespace par = strata::parity;
-    const int64_t H = 2560, FF = 640;
-    const int NT = 3;
-    auto type_of = [](const std::string& n) { return n == "tq2_t" ? 144 : n == "tqk6" ? 145 : n == "tqk7" ? 146 : -1; };
-    const size_t slash = pair.find('/');
-    const int gu = slash == std::string::npos ? -1 : type_of(pair.substr(0, slash));
-    const int dt = slash == std::string::npos ? -1 : type_of(pair.substr(slash + 1));
-    if (gu < 0 || dt < 0) { std::printf("synthetic-tq: %s is not GU/DOWN of tq2_t, tqk6, tqk7\n", pair.c_str()); return 2; }
-    if (!strata::kernels::native_expert_supported(gu, dt, H, FF)) {
-        std::printf("synthetic-tq %s: refused (no GPU expert kernels for the pair)\n", pair.c_str());
-        return 1;
-    }
-    cpu::NativeFmt f;
-    std::string err;
-    if (!cpu::native_fmt(gu, dt, H, FF, f, err)) { std::printf("synthetic-tq %s: %s\n", pair.c_str(), err.c_str()); return 1; }
-    int failures = 0;
-    // random stream bytes (every state reachable) and scales of both signs, 0.004-0.02 (an expert's magnitudes)
-    XorShift32 rng{4321};
-    std::vector<uint8_t> blob(f.bytes);
-    auto fill = [&](uint8_t* w, int type, int64_t nblocks) {
-        const size_t bsz = cpu::tq_block_bytes(type);
-        for (int64_t i = 0; i < nblocks; ++i) {
-            uint8_t* b = w + (size_t) i * bsz;
-            const float d = (0.004f + 0.016f * (float) (rng() % 1000) / 1000.0f) * (rng() & 1 ? 1.0f : -1.0f);
-            const uint16_t h = (uint16_t) ggml_fp32_to_fp16(d);
-            b[0] = (uint8_t) h;
-            b[1] = (uint8_t) (h >> 8);
-            for (size_t j = 2; j < bsz; ++j) b[j] = (uint8_t) rng();
-        }
-    };
-    fill(blob.data(), gu, 2 * FF * H / 128);
-    fill(blob.data() + f.down_off, dt, H * FF / 128);
-    std::vector<float> G((size_t) FF * H), U((size_t) FF * H), D((size_t) H * FF);
-    tqref::rows(gu, blob.data(), FF, H, G.data());
-    tqref::rows(gu, blob.data() + f.up_off, FF, H, U.data());
-    tqref::rows(dt, blob.data() + f.down_off, H, FF, D.data());
-    // --hadamard: block 128, random signs for both widths, every role folded
-    std::vector<float> sx((size_t) H), sh((size_t) FF);
-    if (had) {
-        for (auto& v : sx) v = rng() & 1 ? 1.0f : -1.0f;
-        for (auto& v : sh) v = rng() & 1 ? 1.0f : -1.0f;
-        f.had_block = 128;
-        f.had_gu = f.had_d = true;
-        f.gu_signs = sx.data();
-        f.d_signs = sh.data();
-    }
-    std::mt19937 nrng(17);
-    std::normal_distribution<float> nd(0.f, 1.f);
-    std::vector<float> x((size_t) NT * H);
-    for (auto& v : x) v = nd(nrng);
-    // (a) the float reference: the stored (folded) weights against the rotated inputs, in double
-    std::vector<float> ref((size_t) NT * H), got_c((size_t) NT * H), got_g((size_t) NT * H);
-    for (int k = 0; k < NT; ++k) {
-        std::vector<float> xr(x.begin() + k * H, x.begin() + (k + 1) * H), h((size_t) FF);
-        if (had) cpu::hadamard_rotate(xr.data(), (int) H, 128, sx.data());
-        for (int64_t r = 0; r < FF; ++r) {
-            double g = 0, u = 0;
-            for (int64_t i = 0; i < H; ++i) { g += (double) G[r * H + i] * xr[i]; u += (double) U[r * H + i] * xr[i]; }
-            h[r] = (float) (g / (1.0 + std::exp(-g)) * u);
-        }
-        if (had) cpu::hadamard_rotate(h.data(), (int) FF, 128, sh.data());
-        for (int64_t r = 0; r < H; ++r) {
-            double o = 0;
-            for (int64_t i = 0; i < FF; ++i) o += (double) D[r * FF + i] * h[i];
-            ref[k * H + r] = (float) o;
-        }
-    }
-    // (b) the CPU: the engine's entry points, then each ISA's rows against the scalar ones and one token at a time
-    std::vector<std::vector<uint8_t>> act(NT, std::vector<uint8_t>(cpu::kNativeActBytes));
-    std::vector<std::vector<uint8_t>> hq(NT, std::vector<uint8_t>(cpu::kNativeHBytes));
-    std::vector<std::vector<float>> ff(NT, std::vector<float>(FF));
-    const void* a[NT];
-    const void* hp[NT];
-    float* ffp[NT];
-    float* op[NT];
-    for (int k = 0; k < NT; ++k) {
-        cpu::native_quant_act(f, x.data() + k * H, act[k].data());
-        a[k] = act[k].data();
-        ffp[k] = ff[k].data();
-    }
-    cpu::native_gu_rows(f, blob.data(), a, NT, ffp, 0, (int) FF);
-    for (int k = 0; k < NT; ++k) {
-        cpu::native_quant_h(f, ff[k].data(), hq[k].data());
-        hp[k] = hq[k].data();
-        op[k] = got_c.data() + k * H;
-    }
-    cpu::native_down_rows(f, blob.data(), hp, NT, op, 0, (int) H);
-    auto rows_on = [&](cpu::TqIsa isa, int type, const uint8_t* w, size_t rb, int64_t n, int64_t nr, const void* const* acts,
-                       int nt, std::vector<float>& out) {
-        out.assign((size_t) nt * nr, 0.0f);
-        float* o[NT];
-        for (int k = 0; k < nt; ++k) o[k] = out.data() + k * nr;
-        cpu::tq_rows(isa, type, w, rb, (int) n, acts, nt, o, 0, (int) nr);
-    };
-    std::vector<float> base_g, base_d, alt;
-    rows_on(cpu::TqIsa::scalar, gu, blob.data(), f.gu_row, H, FF, a, NT, base_g);
-    rows_on(cpu::TqIsa::scalar, dt, blob.data() + f.down_off, f.d_row, FF, H, hp, NT, base_d);
-    for (const cpu::TqIsa isa : {cpu::TqIsa::scalar, cpu::TqIsa::avx2, cpu::TqIsa::avx512}) {
-        if (!cpu::tq_isa_ok(isa)) { std::printf("          %s: not on this CPU\n", cpu::tq_isa_name(isa)); continue; }
-        size_t diff = 0;
-        rows_on(isa, gu, blob.data(), f.gu_row, H, FF, a, NT, alt);
-        for (size_t i = 0; i < alt.size(); ++i) diff += float_bits(alt[i]) != float_bits(base_g[i]);
-        rows_on(isa, dt, blob.data() + f.down_off, f.d_row, FF, H, hp, NT, alt);
-        for (size_t i = 0; i < alt.size(); ++i) diff += float_bits(alt[i]) != float_bits(base_d[i]);
-        for (int k = 0; k < NT; ++k) {   // one token alone: the same bits as in the group
-            rows_on(isa, gu, blob.data(), f.gu_row, H, FF, &a[k], 1, alt);
-            for (int64_t r = 0; r < FF; ++r) diff += float_bits(alt[(size_t) r]) != float_bits(base_g[(size_t) (k * FF + r)]);
-        }
-        std::printf("          %s rows vs the scalar ones (%d tokens and one at a time): %zu values differ\n",
-                    cpu::tq_isa_name(isa), NT, diff);
-        if (diff) ++failures;
-    }
-    // (c) the GPU: one group holding the NT entries, the rotations on the GPU
-    {
-        auto L = strata::kernels::native_expert_layout(gu, dt, H, FF);
-        void* dblob = par::alloc_bytes(blob.size());
-        auto* dx = static_cast<float*>(par::alloc_bytes(x.size() * 4));
-        auto* dxr = static_cast<float*>(par::alloc_bytes(x.size() * 4));
-        void* dxq = par::alloc_bytes((size_t) NT * H / 32 * 36);
-        void* dscr = par::alloc_bytes(strata::kernels::native_expert_scratch_bytes(NT, FF));
-        auto* dout = static_cast<float*>(par::alloc_bytes((size_t) NT * H * 4));
-        auto* dptr = static_cast<unsigned long long*>(par::alloc_bytes(8));
-        auto* dstart = static_cast<int32_t*>(par::alloc_bytes(8));
-        auto* dn = static_cast<int32_t*>(par::alloc_bytes(4));
-        auto* ddst = static_cast<int32_t*>(par::alloc_bytes((size_t) NT * 4));
-        auto* dtok = static_cast<int32_t*>(par::alloc_bytes((size_t) NT * 4));
-        par::copy_bytes_in(dblob, blob.data(), blob.size());
-        par::copy_bytes_in(dx, x.data(), x.size() * 4);
-        const unsigned long long ptr = (unsigned long long) dblob;
-        const int32_t st[2] = {0, NT}, one = 1, idx[NT] = {0, 1, 2};
-        par::copy_bytes_in(dptr, &ptr, 8);
-        par::copy_bytes_in(dstart, st, 8);
-        par::copy_bytes_in(dn, &one, 4);
-        par::copy_bytes_in(ddst, idx, (size_t) NT * 4);
-        par::copy_bytes_in(dtok, idx, (size_t) NT * 4);
-        const float* xin = dx;
-        if (had) {
-            const float* dsx = strata::kernels::hadamard_device_signs(sx.data(), (int) H);
-            L.had_block = 128;
-            L.d_signs = strata::kernels::hadamard_device_signs(sh.data(), (int) FF);
-            strata::kernels::hadamard_rows(dx, dxr, NT, H, 128, dsx, s);
-            xin = dxr;
-            // the rotation against the CPU's, every bit: f32, and f16 against the CPU's floats rounded to fp16
-            std::vector<float> want(x), got(x.size());
-            for (int k = 0; k < NT; ++k) cpu::hadamard_rotate(want.data() + k * H, (int) H, 128, sx.data());
-            par::sync();
-            par::copy_bytes_out(got.data(), dxr, got.size() * 4);
-            size_t diff = 0;
-            for (size_t i = 0; i < got.size(); ++i) diff += float_bits(got[i]) != float_bits(want[i]);
-            std::vector<uint16_t> xh(x.size()), gh(x.size());
-            for (size_t i = 0; i < x.size(); ++i) xh[i] = (uint16_t) ggml_fp32_to_fp16(x[i]);
-            auto* dxh = static_cast<uint16_t*>(par::alloc_bytes(xh.size() * 2));
-            par::copy_bytes_in(dxh, xh.data(), xh.size() * 2);
-            strata::kernels::hadamard_rows_f16(dxh, NT, H, 128, dsx, s);
-            par::sync();
-            par::copy_bytes_out(gh.data(), dxh, gh.size() * 2);
-            std::vector<float> wh(x.size());
-            for (size_t i = 0; i < x.size(); ++i) wh[i] = ggml_fp16_to_fp32((ggml_fp16_t) xh[i]);
-            size_t diff16 = 0;
-            for (int k = 0; k < NT; ++k) cpu::hadamard_rotate(wh.data() + k * H, (int) H, 128, sx.data());
-            for (size_t i = 0; i < x.size(); ++i) diff16 += gh[i] != (uint16_t) ggml_fp32_to_fp16(wh[i]);
-            std::printf("          hadamard_rows vs hadamard_rotate: f32 %zu, f16 %zu of %zu values differ\n", diff, diff16,
-                        got.size());
-            if (diff || diff16) ++failures;
-        }
-        strata::kernels::quantize_q8_1_rows(xin, NT, H, dxq, s);
-        strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
-        par::sync();
-        par::copy_bytes_out(got_g.data(), dout, got_g.size() * 4);
-    }
-    // (d) the GPU's f32 dequantizer against the float decode, every bit (d times the fp16 codebook value)
-    auto dequant_check = [&](int t, const uint8_t* src, const std::vector<float>& want, const char* what) {
-        const int64_t n = (int64_t) want.size();
-        const size_t bytes = (size_t) (n / 128) * cpu::tq_block_bytes(t);
-        std::vector<float> got((size_t) n);
-        void* d_src = par::alloc_bytes(bytes);
-        auto* d_out = static_cast<float*>(par::alloc_bytes((size_t) n * 4));
-        par::copy_bytes_in(d_src, src, bytes);
-        strata::kernels::iq_dequant_f32(t, d_src, n, d_out, s);
-        par::sync();
-        par::copy_bytes_out(got.data(), d_out, (size_t) n * 4);
-        size_t differ = 0;
-        for (int64_t i = 0; i < n; ++i) differ += float_bits(got[(size_t) i]) != float_bits(want[(size_t) i]);
-        std::printf("          %s %s GPU dequant f32 vs the float decode: %zu of %lld values differ\n", what,
-                    strata::ggml_type_name((uint32_t) t), differ, (long long) n);
-        return differ ? 1 : 0;
-    };
-    failures += dequant_check(gu, blob.data(), G, "gate");
-    failures += dequant_check(dt, blob.data() + f.down_off, D, "down");
-    // (e) the prompt path's products straight from the blocks (iq_gemm_grouped_f16, F8's resident experts) against
-    // the dequantized weights through xmx_gemm_grouped, every bit: gate/up interleaved, and down
-    if (!strata::kernels::xmx_available(strata::kernels::XmxType::f16)) {
-        std::printf("          iq_gemm_grouped_f16: skipped (no XMX for FP16 on this GPU)\n");
-    } else {
-        void* dblob = par::alloc_bytes(blob.size());
-        par::copy_bytes_in(dblob, blob.data(), blob.size());
-        auto* dbounds = static_cast<int32_t*>(par::alloc_bytes(8));
-        const int32_t bd[2] = {0, NT};
-        par::copy_bytes_in(dbounds, bd, 8);
-        auto product = [&](int t, const uint8_t* w, int64_t inter, int64_t N, int64_t K, const char* what) {
-            std::vector<uint16_t> xh((size_t) NT * K);
-            for (auto& v : xh) v = (uint16_t) ggml_fp32_to_fp16(nd(nrng));
-            auto* dxh = static_cast<uint16_t*>(par::alloc_bytes(xh.size() * 2));
-            auto* dw16 = static_cast<uint16_t*>(par::alloc_bytes((size_t) N * K * 2));
-            auto* dy = static_cast<float*>(par::alloc_bytes((size_t) NT * N * 4));
-            auto* dy2 = static_cast<float*>(par::alloc_bytes((size_t) NT * N * 4));
-            par::copy_bytes_in(dxh, xh.data(), xh.size() * 2);
-            const void* wp[1] = {w};
-            strata::kernels::iq_gemm_grouped_f16(t, dxh, wp, inter, dy, N, dbounds, 1, NT, N, K, s);
-            if (inter) strata::kernels::iq_dequant_gu_f16(t, w, w + f.up_off, inter, K, dw16, s);
-            else strata::kernels::iq_dequant_f16(t, w, N * K, dw16, s);
-            strata::kernels::xmx_gemm_grouped(dxh, dw16, 0, dy2, dbounds, 1, NT, N, K, s);
-            par::sync();
-            std::vector<float> a((size_t) NT * N), b((size_t) NT * N);
-            par::copy_bytes_out(a.data(), dy, a.size() * 4);
-            par::copy_bytes_out(b.data(), dy2, b.size() * 4);
-            size_t differ = 0;
-            for (size_t i = 0; i < a.size(); ++i) differ += float_bits(a[i]) != float_bits(b[i]);
-            std::printf("          %s %s iq_gemm_grouped_f16 vs dequant + xmx_gemm_grouped: %zu of %zu values differ\n",
-                        what, strata::ggml_type_name((uint32_t) t), differ, a.size());
-            return differ ? 1 : 0;
-        };
-        const auto* db = static_cast<const uint8_t*>(dblob);
-        failures += product(gu, db, FF, 2 * FF, H, "gate/up");
-        failures += product(dt, db + f.down_off, 0, H, FF, "down");
-    }
-    const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
-    const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
-    std::printf("synthetic-tq %s%s  cpu rel %.2e  gpu rel %.2e  cpu-gpu %.2e  %s\n", pair.c_str(), had ? " +hadamard" : "",
-                ec, eg, ecg, ok ? "ok" : "FAIL");
-    if (!ok) ++failures;
-    std::printf("native_expert_parity --synthetic-tq %s%s: %d failures\n", pair.c_str(), had ? " --hadamard" : "", failures);
-    return failures ? 1 : 0;
-}
-
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);   // keep the trail on a crash
-    if ((argc == 3 || argc == 4) && std::string(argv[1]) == "--synthetic-tq")
-        return check_synthetic_tq(argv[2], argc == 4 && std::string(argv[3]) == "--hadamard", strata::parity::stream());
     if (argc == 2 && std::string(argv[1]) == "--bf16-embd") return check_bf16_embd(strata::parity::stream());
     if (argc == 3 && std::string(argv[1]) == "--synthetic") return check_synthetic(argv[2], strata::parity::stream());
-    if (argc < 2) { std::fprintf(stderr, "usage: native_expert_parity <shard1.gguf> [layer ...] | --bf16-embd | --synthetic GU/DOWN[@HxFF]\n"); return 2; }
+    if (argc == 3 && std::string(argv[1]) == "--synthetic-hadamard")
+        return check_synthetic(argv[2], strata::parity::stream(), true);
+    if (argc < 2) { std::fprintf(stderr, "usage: native_expert_parity <shard1.gguf> [layer ...] | --bf16-embd | --synthetic GU/DOWN[@HxFF] | --synthetic-hadamard GU/DOWN[@HxFF]\n"); return 2; }
     strata::GgufFile gguf(argv[1]);
     std::vector<int> layers;
     for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));

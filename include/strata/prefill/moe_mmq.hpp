@@ -25,7 +25,7 @@ bool built_dp4a();
 bool chosen();
 /// What runs them where chosen() (kernels::iq_mmq_path), else null.
 const char* path();
-/// They cover this ggml type (the i-quants but IQ1_S, Q2_0, Q8_0, Q5_0, Q2_K to Q6_K).
+/// They cover this ggml type (the i-quants, Q2_0, Q8_0, Q5_0, Q2_K to Q6_K).
 bool supported(int ggml_type);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);

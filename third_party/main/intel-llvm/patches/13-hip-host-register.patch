@@ -2,7 +2,7 @@ SPDX-FileCopyrightText: The LLVM project contributors
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-hip-host-register: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+hip-host-register: a fix to intel/llvm v7.2.0, applied by tools/intel_llvm_build.py.
 
 The HIP adapter's host memory registration (urUSMImportExp, urUSMReleaseExp, which
 sycl_ext_oneapi_copy_optimize's prepare_for_device_copy calls) did nothing, and the adapter left them out
@@ -11,18 +11,18 @@ cuda-host-register and cuda-host-register-table.  Fixed, the memory is page-lock
 (portable: for every device), so copies from it are DMA transfers, and the functions are in the table.
 ---
 diff --git a/unified-runtime/source/adapters/hip/ur_interface_loader.cpp b/unified-runtime/source/adapters/hip/ur_interface_loader.cpp
-index 35b7945..3e02e89 100644
+index 2b15e2f9f8..0565ce268e 100644
 --- a/unified-runtime/source/adapters/hip/ur_interface_loader.cpp
 +++ b/unified-runtime/source/adapters/hip/ur_interface_loader.cpp
-@@ -5,6 +5,7 @@
- // Part of the Unified-Runtime Project, under the Apache License v2.0 with LLVM
- // Exceptions. See LICENSE.TXT
+@@ -4,6 +4,7 @@
+ // Part of the LLVM Project, under the Apache License v2.0 with LLVM
+ // Exceptions. See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 +// Modified 2026 by MistVVK and the XeStrata contributors: host memory registration in the adapter's table (hip-host-register)
  //
  //===----------------------------------------------------------------------===//
  
-@@ -441,6 +442,8 @@ UR_DLLEXPORT ur_result_t UR_APICALL urGetUSMExpProcAddrTable(
+@@ -448,6 +449,8 @@ UR_DLLEXPORT ur_result_t UR_APICALL urGetUSMExpProcAddrTable(
    pDdiTable->pfnPoolGetDevicePoolExp = urUSMPoolGetDevicePoolExp;
    pDdiTable->pfnPoolTrimToExp = urUSMPoolTrimToExp;
    pDdiTable->pfnContextMemcpyExp = urUSMContextMemcpyExp;
@@ -32,18 +32,18 @@ index 35b7945..3e02e89 100644
  }
  
 diff --git a/unified-runtime/source/adapters/hip/usm.cpp b/unified-runtime/source/adapters/hip/usm.cpp
-index aa2b945..241a9bf 100644
+index 78bbe94348..9c1299dba4 100644
 --- a/unified-runtime/source/adapters/hip/usm.cpp
 +++ b/unified-runtime/source/adapters/hip/usm.cpp
-@@ -5,6 +5,7 @@
- // Part of the Unified-Runtime Project, under the Apache License v2.0 with LLVM
- // Exceptions. See LICENSE.TXT
+@@ -4,6 +4,7 @@
+ // Part of the LLVM Project, under the Apache License v2.0 with LLVM
+ // Exceptions. See https://llvm.org/LICENSE.txt for license information.
  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 +// Modified 2026 by MistVVK and the XeStrata contributors: host memory registration with hipHostRegister (hip-host-register)
  //
  //===----------------------------------------------------------------------===//
  
-@@ -270,14 +271,32 @@ urUSMGetMemAllocInfo(ur_context_handle_t hContext, const void *pMem,
+@@ -269,14 +270,32 @@ urUSMGetMemAllocInfo(ur_context_handle_t hContext, const void *pMem,
    return UR_RESULT_SUCCESS;
  }
  

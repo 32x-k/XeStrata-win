@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+// SPDX-License-Identifier: MIT
 // include/strata/kernels/cpu/hadamard.hpp - the activation-side transform of Hadamard-folded experts.
 //
 // Some GGUFs (Agention's APR "Gyro" files) store their routed experts in a block-Hadamard-rotated basis: the

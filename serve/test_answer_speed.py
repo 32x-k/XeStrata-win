@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""The one definition of answer speed in the server: produced tokens over the engine's decode time, never over a time that
-holds the prompt being read (no GPU or model pack).
+"""The one definition of answer speed in the server: produced tokens over the engine's decode time, never over a time
+that holds the prompt being read (no GPU or model pack).
 
     python -m unittest serve.test_answer_speed -v
 """
@@ -12,7 +12,7 @@ from serve.server import answer_speed, request_timings
 
 
 class AnswerSpeed(unittest.TestCase):
-    # A real request from upstream's test PC (Gyro-S, MTP): 308 prompt tokens read in 1212 ms, 73 generated in 1108 ms.
+    # A real request from the owner PC (Gyro-S, MTP): 308 prompt tokens read in 1212 ms, 73 generated in 1108 ms.
     REAL = {"generated": 73, "decode_ms": 1108.0, "prompt_ms": 1212.0, "drafts_accepted": 45, "drafts_offered": 68}
 
     def test_the_engines_decode_time_is_the_denominator(self):
@@ -27,7 +27,8 @@ class AnswerSpeed(unittest.TestCase):
         self.assertEqual(answer_speed(self.REAL, 73, wall), 65.9)
 
     def test_drafts_are_not_counted(self):
-        # 68 drafted, 45 accepted: the engine's count (73) is what the model kept; the speed never uses the draft figures.
+        # 68 drafted, 45 accepted: the engine's count (73) is what the model kept; the speed never uses the draft
+        # figures.
         self.assertEqual(answer_speed({**self.REAL, "drafts_offered": 500}, 73), 65.9)
 
     def test_a_one_token_reply_has_no_absurd_rate(self):

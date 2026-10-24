@@ -10,6 +10,7 @@
 // and at the end the final LayerNorm per patch and the same merger.
 
 #include "strata/image/qi_vision.hpp"
+#include "strata/image/qi_gguf.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/gpu.hpp"
@@ -54,12 +55,14 @@ QiVision::~QiVision() {
 }
 
 QiVision::W QiVision::linear(const std::string& name) {
-    const TensorInfo* t = g_->find(name + ".weight");
+    const TensorInfo* t = find_checked(*g_, name + ".weight");
     if (t == nullptr || t->shape.size() != 2) throw std::runtime_error("image engine (vision): no " + name);
     W w;
     w.k = (int64_t) t->shape[0];
     w.n = (int64_t) t->shape[1];
-    const TensorInfo* b = g_->find(name + ".bias");
+    const TensorInfo* b = find_checked(*g_, name + ".bias");
+    if (b != nullptr && ((int) b->type != kTypeF32 || (int64_t) b->elements() != w.n))   // #29: read as w.n floats
+        throw std::runtime_error("image engine (vision): " + name + ".bias does not match its weight");
     weight_bytes_ += (uint64_t) (w.n * w.k) * 2 + (b ? (uint64_t) w.n * 4 : 0);
     if (dry_) return w;
     std::vector<uint16_t> h((size_t) (w.n * w.k));
@@ -84,7 +87,7 @@ QiVision::W QiVision::linear(const std::string& name) {
 QiVision::Norm QiVision::norm(const std::string& name) {
     Norm n;
     for (const char* part : {".weight", ".bias"}) {
-        const TensorInfo* t = g_->find(name + part);
+        const TensorInfo* t = find_checked(*g_, name + part);
         if (t == nullptr || (int) t->type != kTypeF32) throw std::runtime_error("image engine (vision): no " + name);
         const auto c = (int64_t) t->elements();
         weight_bytes_ += (uint64_t) c * 4;
@@ -112,16 +115,21 @@ bool QiVision::open(const std::string& path, void* stream, std::string& err, boo
         merge_ = (int64_t) num("clip.vision.spatial_merge_size", 2);
         out_dim_ = (int64_t) num("clip.vision.projection_dim", 4096);
         eps_ = (float) num("clip.vision.attention.layer_norm_epsilon", 1e-6);
+        if (C_ <= 0 || heads_ <= 0 || patch_ <= 0) throw std::runtime_error("image engine (vision): bad shape in " + path);
         hd_ = C_ / heads_;
         if (hd_ > 128 || hd_ % 4 != 0) throw std::runtime_error("image engine (vision): head size " + std::to_string(hd_));
         const auto layers = (int64_t) num("clip.vision.block_count", 27);
         // the patch embedding: the two temporal kernels summed (the image is its own second frame)
-        const TensorInfo* p0 = g_->find("v.patch_embd.weight");
-        const TensorInfo* p1 = g_->find("v.patch_embd.weight.1");
-        const TensorInfo* pb = g_->find("v.patch_embd.bias");
+        const TensorInfo* p0 = find_checked(*g_, "v.patch_embd.weight");
+        const TensorInfo* p1 = find_checked(*g_, "v.patch_embd.weight.1");
+        const TensorInfo* pb = find_checked(*g_, "v.patch_embd.bias");
         if (p0 == nullptr || pb == nullptr || (int) p0->type != kTypeF16)
             throw std::runtime_error("image engine (vision): no FP16 patch embedding");
         const int64_t pk = 3 * patch_ * patch_;
+        // #29: the reads below take their lengths from the header, so the tensors must be that long
+        if ((int64_t) p0->elements() != C_ * pk || (p1 != nullptr && (p1->type != p0->type || p1->elements() != p0->elements()))
+            || (int) pb->type != kTypeF32 || (int64_t) pb->elements() != C_)
+            throw std::runtime_error("image engine (vision): the patch embedding does not match the header");
         weight_bytes_ += (uint64_t) (C_ * pk) * 2 + (uint64_t) C_ * 4;
         if (!dry_) {
             std::vector<uint16_t> h((size_t) (C_ * pk));
@@ -136,9 +144,12 @@ bool QiVision::open(const std::string& path, void* stream, std::string& err, boo
             put(db, g_->tensor_data(*pb), (size_t) C_ * 4);
             patch_b_ = db;
         }
-        const TensorInfo* pe = g_->find("v.position_embd.weight");
-        if (pe == nullptr || (int) pe->type != kTypeF32) throw std::runtime_error("image engine (vision): no position embeddings");
+        const TensorInfo* pe = find_checked(*g_, "v.position_embd.weight");
+        if (pe == nullptr || (int) pe->type != kTypeF32 || pe->shape.size() < 2)
+            throw std::runtime_error("image engine (vision): no position embeddings");
         grid_ = (int64_t) std::lround(std::sqrt((double) pe->shape[1]));
+        if (grid_ * grid_ * C_ > (int64_t) pe->elements())
+            throw std::runtime_error("image engine (vision): the position embeddings are shorter than the header says");
         pos_.resize((size_t) (grid_ * grid_ * C_));
         std::memcpy(pos_.data(), g_->tensor_data(*pe), pos_.size() * 4);
         for (int64_t i = 0; i < layers; ++i) {
@@ -151,7 +162,7 @@ bool QiVision::open(const std::string& path, void* stream, std::string& err, boo
             l.up = linear(p + "ffn_up");
             l.down = linear(p + "ffn_down");
             const std::string ds = "v.deepstack." + std::to_string(i) + ".";
-            if (g_->find(ds + "fc1.weight") != nullptr) {
+            if (find_checked(*g_, ds + "fc1.weight") != nullptr) {
                 l.deepstack = (int) deepstack_.size();
                 deepstack_.push_back({norm(ds + "norm"), linear(ds + "fc1"), linear(ds + "fc2")});
             }

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -132,6 +133,9 @@ uint64_t total_physical_memory() {
 bool read_ahead_enabled() { return false; }
 void advise_willneed(const void*, uint64_t) {}
 void advise_willneed(int, uint64_t, uint64_t) {}
+void drop_file_cache(const std::string&) {}
+bool free_and_cached(uint64_t&, uint64_t&) { return false; }
+void make_free_ram(uint64_t) {}
 #else
 LockResult lock_resident(void* p, uint64_t bytes) {
     LockResult r;
@@ -188,6 +192,47 @@ void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {
     if (fd < 0 || !read_ahead_enabled()) return;
     for (uint64_t at = 0; at < bytes; at += kAdviseStep)
         (void) posix_fadvise(fd, (off_t) (offset + at), (off_t) std::min(kAdviseStep, bytes - at), POSIX_FADV_WILLNEED);
+}
+
+void drop_file_cache(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    (void) posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    ::close(fd);
+}
+
+namespace {
+// /proc/meminfo's value of `key` ("MemFree:"), in bytes; false when it is not there
+bool meminfo(const char* key, uint64_t& bytes) {
+    std::FILE* f = std::fopen("/proc/meminfo", "r");
+    if (f == nullptr) return false;
+    char line[256];
+    bool found = false;
+    const size_t n = std::strlen(key);
+    while (!found && std::fgets(line, sizeof line, f) != nullptr)
+        if (std::strncmp(line, key, n) == 0) {
+            bytes = (uint64_t) std::strtoull(line + n, nullptr, 10) << 10;
+            found = true;
+        }
+    std::fclose(f);
+    return found;
+}
+}  // namespace
+
+bool free_and_cached(uint64_t& free, uint64_t& cached) {
+    return meminfo("MemFree:", free) && meminfo("Cached:", cached);
+}
+
+void make_free_ram(uint64_t bytes) {
+    uint64_t mem_free = 0, avail = 0;
+    if (!meminfo("MemFree:", mem_free) || !meminfo("MemAvailable:", avail)) return;
+    if (mem_free >= bytes || avail <= mem_free + (1ull << 30)) return;
+    const uint64_t take = std::min<uint64_t>(bytes - mem_free, avail - mem_free - (1ull << 30));
+    void* p = mmap(nullptr, (size_t) take, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return;
+    const long ps = sysconf(_SC_PAGE_SIZE);
+    for (uint64_t at = 0; at < take; at += ps > 0 ? (uint64_t) ps : 4096) static_cast<volatile char*>(p)[at] = 0;
+    munmap(p, (size_t) take);
 }
 #endif
 

@@ -37,6 +37,8 @@ public:
         f_.read(h.data(), (std::streamsize) n);
         if (!f_) throw std::runtime_error(path + ": a short header");
         base_ = 8 + n;
+        f_.seekg(0, std::ios::end);
+        size_ = (uint64_t) f_.tellg();
         parse(h);
     }
 
@@ -45,11 +47,16 @@ public:
         return it == t_.end() ? nullptr : &it->second;
     }
     const std::map<std::string, SafeTensor>& tensors() const { return t_; }
+    /// Where the data section starts in the file (a tensor's bytes are at data_base() + begin .. + end).
+    uint64_t data_base() const { return base_; }
 
     /// The tensor's values as FP32 (BF16, F16 and F32 files).
     std::vector<float> f32(const std::string& name) {
         const SafeTensor* t = find(name);
         if (t == nullptr) throw std::runtime_error(path_ + ": no tensor " + name);
+        // #30: the offsets are checked against the file before anything is allocated from them
+        if (t->end < t->begin || base_ > size_ || t->end > size_ - base_)
+            throw std::runtime_error(path_ + ": " + name + ": data_offsets outside the file");
         std::vector<char> raw(t->end - t->begin);
         f_.seekg((std::streamoff) (base_ + t->begin));
         f_.read(raw.data(), (std::streamsize) raw.size());
@@ -87,6 +94,8 @@ public:
     }
 
 private:
+    // #30: the character at i, or '\0' past the end (a header cut short reads as one that ends there)
+    static char at(const std::string& h, size_t i) { return i < h.size() ? h[i] : '\0'; }
     void ws(const std::string& h, size_t& i) {
         while (i < h.size() && (h[i] == ' ' || h[i] == '\n' || h[i] == '\r' || h[i] == '\t')) ++i;
     }
@@ -102,6 +111,7 @@ private:
             if (h[i] == '\\' && i + 1 < h.size()) ++i;
             s += h[i++];
         }
+        if (i >= h.size()) throw std::runtime_error(path_ + ": header: an unterminated string");   // #30
         ++i;
         return s;
     }
@@ -118,25 +128,25 @@ private:
         std::vector<int64_t> v;
         expect(h, i, '[');
         ws(h, i);
-        if (h[i] == ']') return ++i, v;
+        if (at(h, i) == ']') return ++i, v;
         for (;;) {
             v.push_back(num(h, i));
             ws(h, i);
-            if (h[i] == ',') { ++i; continue; }
+            if (at(h, i) == ',') { ++i; continue; }
             expect(h, i, ']');
             return v;
         }
     }
     void skip(const std::string& h, size_t& i) {   // any JSON value
         ws(h, i);
-        if (h[i] == '"') { str(h, i); return; }
-        if (h[i] == '{' || h[i] == '[') {
+        if (at(h, i) == '"') { str(h, i); return; }
+        if (at(h, i) == '{' || at(h, i) == '[') {
             const char open = h[i], close = open == '{' ? '}' : ']';
             int depth = 0;
             bool in_str = false;
             for (; i < h.size(); ++i) {
                 if (in_str) {
-                    if (h[i] == '\\') ++i;
+                    if (h[i] == '\\' && i + 1 < h.size()) ++i;
                     else if (h[i] == '"') in_str = false;
                 } else if (h[i] == '"') in_str = true;
                 else if (h[i] == open) ++depth;
@@ -151,7 +161,7 @@ private:
         expect(h, i, '{');
         for (;;) {
             ws(h, i);
-            if (h[i] == '}') return;
+            if (at(h, i) == '}') return;
             const std::string name = str(h, i);
             expect(h, i, ':');
             if (name == "__metadata__") {
@@ -161,11 +171,15 @@ private:
                 expect(h, i, '{');
                 for (;;) {
                     ws(h, i);
-                    if (h[i] == '}') { ++i; break; }
+                    if (at(h, i) == '}') { ++i; break; }
                     const std::string key = str(h, i);
                     expect(h, i, ':');
                     if (key == "dtype") t.dtype = str(h, i);
-                    else if (key == "shape") t.shape = nums(h, i);
+                    else if (key == "shape") {
+                        t.shape = nums(h, i);
+                        for (int64_t d : t.shape)
+                            if (d < 0) throw std::runtime_error(path_ + ": header: a negative dimension");
+                    }
                     else if (key == "data_offsets") {
                         const auto o = nums(h, i);
                         if (o.size() != 2) throw std::runtime_error(path_ + ": header: data_offsets");
@@ -173,18 +187,18 @@ private:
                         t.end = (uint64_t) o[1];
                     } else skip(h, i);
                     ws(h, i);
-                    if (h[i] == ',') ++i;
+                    if (at(h, i) == ',') ++i;
                 }
                 t_[name] = t;
             }
             ws(h, i);
-            if (h[i] == ',') ++i;
+            if (at(h, i) == ',') ++i;
         }
     }
 
     std::string path_;
     std::ifstream f_;
-    uint64_t base_ = 0;
+    uint64_t base_ = 0, size_ = 0;
     std::map<std::string, SafeTensor> t_;
 };
 

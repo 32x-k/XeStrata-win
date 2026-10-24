@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: MIT
 """serve/test_admit_order.py - STRATA_ADMIT_SHORT_FIRST: new requests take the control lines short prompts first
 (StrataEngine._take_control / _admit_next; no process, no GPU).
 

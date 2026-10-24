@@ -54,21 +54,22 @@ CONFIG = "xestrata-"                                  # setup's run configs: xes
 FALLBACK_MODELS = {
     "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0},
     "IQ2_XS": {"about": "2-bit i-quant, a little better quality, close in speed", "download_gb": 68.0, "ram_gb": 48,
-               "arena_gb": 35.5},
+               "arena_gb": 35.5, "families": ("qwen", "swift", "huihui-swift")},
     "IQ3_XXS": {"about": "3-bit i-quant, better quality, slower (more CPU work per token)", "download_gb": 75.8,
-                "ram_gb": 60, "arena_gb": 42.9},
+                "ram_gb": 60, "arena_gb": 42.9, "families": ("qwen", "swift", "huihui-swift")},
     "IQ3_S": {"about": "3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC "
                        "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3},
     "IQ1_M": {"about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)", "download_gb": 58.4,
               "ram_gb": 32, "arena_gb": 23.4, "families": ("coder",)},
     "UD-IQ4_XS": {"about": "~4-bit i-quant (Unsloth Dynamic), between IQ3_S and UD-Q4_K_XL in quality; on a PC with "
                            "less than ~80 GB of RAM part of its experts are read from the SSD",
-                  "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
-                  "vision": True},
+                  "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth", "huihui-unsloth"),
+                  "budget": True, "vision": True},
     "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), EXPERIMENTAL: the best quality, but on a 64 GB PC part of its "
                             "experts come from the SSD while it answers, so it is slower than the 2-3-bit models",
-                   "download_gb": 111.3, "ram_gb": 48, "arena_gb": 77.0, "families": ("unsloth",), "budget": True,
-                   "experimental": True, "vision": True},   # upstream #967: images allowed (setup warns: untested)
+                   "download_gb": 111.3, "ram_gb": 48, "arena_gb": 77.0, "families": ("unsloth", "huihui-unsloth"),
+                   # upstream #967: images allowed (setup warns: untested)
+                   "budget": True, "experimental": True, "vision": True},
     "UD-Q5_K_XL": {"about": "5-bit (Unsloth Dynamic): Q5_K experts with Q8_0 downs, close to Q8_0 in quality; not "
                             "tested in XeStrata", "download_gb": 158.3, "ram_gb": 108, "arena_gb": 98.4,
                    "families": ("unsloth",), "budget": True, "experimental": True, "vision": True},
@@ -76,8 +77,15 @@ FALLBACK_MODELS = {
                    "download_gb": 169.2, "ram_gb": 118, "arena_gb": 109.2, "families": ("unsloth",), "budget": True,
                    "experimental": True, "vision": True},
     "Q8_0": {"about": "8-bit, the reference quality (every expert Q8_0), for a 192 GB PC; not tested in XeStrata",
-             "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth",), "budget": True,
-             "experimental": True, "vision": True},
+             "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth", "huihui-unsloth"),
+             "budget": True, "experimental": True, "vision": True},
+    # Gyro (agentionai): the memory is VRAM and RAM together ("mem_total")
+    "Gyro-S": {"about": "the smallest option, for PCs with little memory (27.6 GB of VRAM + RAM together)",
+               "download_gb": 58.5, "ram_gb": 27.6, "arena_gb": 25.8, "families": ("gyro",), "mem_total": True,
+               "vision": True},
+    "Gyro-M": {"about": "about IQ3_XXS quality with about 20% less GPU memory (35 GB of VRAM + RAM together)",
+               "download_gb": 92.0, "ram_gb": 35.0, "arena_gb": 32.1, "families": ("gyro",), "mem_total": True,
+               "vision": True},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -89,12 +97,26 @@ FALLBACK_FAMILIES = {
                                                                   "of RAM part of its experts are read from the SSD "
                                                                   "(UD-Q4_K_XL, 111 GB: experimental)",
                 "tag": "unsloth-", "vision": False},
+    "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)",
+             "about": "Gyro-S (27.6 GB of memory) and Gyro-M (35 GB): the smallest sizes, for PCs with little memory",
+             "tag": "gyro-"},
+    "huihui-swift": {"title": "Swift 1.5 (abliterated)", "about": "Swift 1.5 with its refusals removed (abliteration): "
+                                                                  "far fewer refusals, and its safety filtering is "
+                                                                  "reduced, so check what it writes",
+                     "tag": "huihui-swift-"},
+    "huihui-unsloth": {"title": "Qwen3.8-Flash-Next (abliterated)",
+                       "about": "Qwen3.8-Flash-Next with its refusals removed (abliteration), as Unsloth's 4- and "
+                                "8-bit files: far fewer refusals, and its safety filtering is reduced, so check what "
+                                "it writes", "tag": "huihui-unsloth-", "vision": False},
     "ornith": {"title": "Ornith-1.5-35B-A3B", "about": "35B, 3B active; a Qwen3.5 MoE: Q4_K_M to BF16, and community "
                                                        "GSQ-RCO 3 and 3.5 bits", "tag": "ornith-"},
     "llmjp": {"title": "llm-jp-4.1-32b-a3b-thinking", "about": "32B, 3B active; Japanese and English, a thinking model",
               "tag": "llmjp-"},
     "qwen36": {"title": "Qwen3.6-35B-A3B", "about": "35B, 3B active; a Qwen3.5 MoE with the Qwen tokenizer: Unsloth's "
                                                     "4-, 6- and 8-bit files", "tag": "qwen36-"},
+    "glm53": {"title": "GLM-5.3-Flash",
+              "about": "320B, 18B active; a large MoE for the PCs whose RAM and VRAM hold 95 GB or more",
+              "tag": "glm53-"},
 }
 FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
 BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper who finds a message in a bottle. "
@@ -396,8 +418,27 @@ class Strata:
             return s.MODELS, s.FAMILIES, list(s.CONTEXTS), "setup.py"
         return FALLBACK_MODELS, FALLBACK_FAMILIES, FALLBACK_CONTEXTS, "built-in table (setup.py not importable)"
 
-    @staticmethod
-    def sizes_of(models, family) -> list:
+    def plain_family(self, family) -> dict | None:
+        """setup.py's PLAIN_FAMILIES entry (Ornith, llm-jp, Qwen3.6, GLM: a GGUF the engine runs as it is), else None.
+        Their sizes are the entry's "models", not setup.MODELS (Flash-Next's files with packs), so a list from MODELS
+        alone showed them with no sizes (upstream 83f2a2c73 for its Qwen3.6)."""
+        return (getattr(self.setup_module(), "PLAIN_FAMILIES", None) or {}).get(family)
+
+    def size_row(self, models, family, model) -> dict:
+        """One size as a model-table row: setup.MODELS's, or one made from a plain family's entry (the weights' size;
+        setup asks RAM + VRAM of it plus 8 GB, setup_plain)."""
+        fam = self.plain_family(family)
+        if fam is None or model not in fam["models"]:
+            return models[model]
+        d = fam["models"][model]
+        gb = round(d["size"] / 1e9, 1)
+        return {"about": d["about"], "download_gb": gb, "ram_gb": round(gb + 8, 1), "mem_total": True,
+                "vision": False, "experimental": not d.get("tested"), "families": (family,)}
+
+    def sizes_of(self, models, family) -> list:
+        fam = self.plain_family(family)
+        if fam is not None:
+            return list(fam["models"])
         return [m for m in models if family in models[m].get("families", ("qwen", "swift"))]
 
     # ---- paths
@@ -643,13 +684,17 @@ class Strata:
         for f, fd in families.items():
             sizes = []
             for m in self.sizes_of(models, f):
-                d = models[m]
+                d = self.size_row(models, f, m)
                 tag = (fd.get("tag", "") + m).lower()
                 verdict = None
                 if ram is not None:
-                    verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
+                    have_gb = ram + vram if d.get("mem_total") else ram   # a plain model: RAM and VRAM together
+                    verdict = "fits" if have_gb >= d["ram_gb"] else "tight" if have_gb >= d["ram_gb"] - 8 \
+                        else "does not fit"
                     try:
-                        if d.get("budget"):
+                        if d.get("mem_total"):          # a plain model: none of Flash-Next's budget or low-RAM modes
+                            pass
+                        elif d.get("budget"):
                             verdict = (("experimental: " if d.get("experimental") else "")
                                        + "part of its experts in RAM, the rest read from the SSD"
                                        if ram >= d["ram_gb"] else "does not fit")
@@ -837,7 +882,8 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
                         "script). Without confirm=true it only returns the plan (what would be downloaded, disk "
                         "space): show it to the user and call again with confirm=true once they agree. Returns at "
                         "once; call it again (no arguments needed) to see the progress, or with cancel=true to stop "
-                        "it (it resumes later). Defaults: the recommended model and context for this PC, images off. "
+                        "it (it resumes later). Defaults: the recommended model and context for this PC, pictures "
+                        "on where the model can read them. "
                         "After it finishes, start the model with strata_start.",
          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {
              "family": {"type": "string", "enum": list(families),
@@ -848,8 +894,9 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
              "context": {"type": "integer", "enum": contexts,
                          "description": "context length in tokens (more needs more VRAM)"},
              "vision": {"type": "string", "enum": ["no", "yes", "gpu", "cpu"],
-                        "description": "let the model read images (yes = the encoder on the GPU; ~0.9 GB more "
-                                       "download); default no"},
+                        "description": "let the model read images (~0.9 GB more download). Default yes where "
+                                       "the model can read them: yes = the reader for this card (the CPU under 24 GB "
+                                       "of VRAM, the GPU from 24 GB), gpu / cpu = that reader, no = text only"},
              "kv": {"type": "string", "enum": ["int8", "q4_0", "k8v4"],
                     "description": "KV cache precision above 8K context (default int8)"},
              "gpu": {"type": "integer", "minimum": 0, "maximum": 63,
@@ -1102,13 +1149,16 @@ class Tools:
             usable = [g for g in hw.get("gpus", []) if g.get("usable")]
             vram = max((g["vram_gb"] for g in usable), default=12)
             context = 32768 if vram < 14 else 65536 if vram < 20 else 131072
-        if vision in ("yes", "gpu", "cpu") and models[model].get("vision", families[family].get("vision")) is False:
+        row = s.size_row(models, family, model)
+        if vision is None:   # upstream 91baead75: pictures on wherever the model reads them (setup picks the reader)
+            vision = "no" if row.get("vision", families[family].get("vision")) is False else "yes"
+        if vision in ("yes", "gpu", "cpu") and row.get("vision", families[family].get("vision")) is False:
             raise ToolError(f"images are not available with {families[family]['title']} {model} yet: use vision=no")
         target = self.check_data_dir(data_dir) if data_dir else s.data_dir()
         tag = (families[family].get("tag", "") + model)
         have_dir = target / "models" / tag
         partly = have_dir.is_dir() and any(have_dir.glob("*.gguf*"))
-        need = (8 if partly else models[model]["download_gb"] + 8) + (1 if vision in ("yes", "gpu", "cpu") else 0)
+        need = (8 if partly else row["download_gb"] + 8) + (1 if vision in ("yes", "gpu", "cpu") else 0)
         free = s.disk_free(target)
         short = None
         if free is not None and free < need:
@@ -1126,11 +1176,16 @@ class Tools:
         fit = None
         ram = hw.get("ram_gb")
         if ram is not None:
-            need_ram = models[model]["ram_gb"]
-            fit = "fits" if ram >= need_ram else f"needs ~{need_ram} GB of RAM, this PC has {ram:.0f} GB"
+            need_ram = row["ram_gb"]
+            if row.get("mem_total"):                    # a plain model: RAM and the largest card's VRAM together
+                vram = max((g["vram_gb"] for g in hw.get("gpus", []) if g.get("usable")), default=0.0)
+                fit = "fits" if ram + vram >= need_ram else \
+                    f"needs ~{need_ram} GB of RAM and VRAM together, this PC has {ram + vram:.0f} GB"
+            else:
+                fit = "fits" if ram >= need_ram else f"needs ~{need_ram} GB of RAM, this PC has {ram:.0f} GB"
         installed = (s.root / f"{CONFIG}{tag.lower()}.json").exists()
         plan = {"title": f"{families[family]['title']} {model}", "family": family, "model": model,
-                "context": context, "images": vision or "no", "download_gb": models[model]["download_gb"],
+                "context": context, "images": vision or "no", "download_gb": row["download_gb"],
                 "partly_downloaded": partly, "ram": fit, "data_folder": str(target), "disk_free_gb": free,
                 "disk_needed_gb": round(need), "disk_short": short, "already_installed": installed,
                 "setup_command": "./setup.sh " + " ".join(args),

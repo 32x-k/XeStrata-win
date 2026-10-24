@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -59,6 +60,9 @@ public:
     const uint8_t* begin(int i);
     /// The compute stream's work on layer i is queued: its slot (if streamed) may be reused once that work is done.
     void end(int i);
+    /// Work queued on the compute stream on a layer's device region once each time it is copied there, before its
+    /// first use (the weights rewritten in place for the products that read them).
+    void set_prepare(std::function<void(int, uint8_t*)> prepare) { prepare_ = std::move(prepare); }
     /// Frees every layer's device region and the slots (the budget stays, the layers come back on use).
     void drop();
 
@@ -75,6 +79,7 @@ private:
         gpu::Event* ready = nullptr;        // its copy done (on the copy stream)
         gpu::Event* used = nullptr;         // the compute stream past its layer
         bool issued = false;                // `ready` recorded for `layer`
+        bool prepared = false;              // prepare_ queued on `layer`'s copy
     };
     void load_resident(int i);
     void fill(Slot& s, int i);              // the worker: host -> relay -> slot
@@ -99,6 +104,7 @@ private:
     std::deque<int> queue_;
     bool stop_ = false;
     std::string error_;   // a fill's failure, thrown where its layer is begun
+    std::function<void(int, uint8_t*)> prepare_;
 };
 
 }  // namespace strata::image

@@ -6,5 +6,6 @@
 # casts (the arena's alignment), which flag the code's design rather than bugs; reserved identifiers, which the SYCL
 # compiler's own kernel names (_ZTS..., __SYCLKernel) trip once per kernel instantiation.  The analyzer's padding
 # check (opt-in) too: it would have the options, the engine's state and the kernels' argument blocks ordered by size
-# rather than by meaning, for bytes that do not matter there.
-Checks: '-*,bugprone-*,performance-*,clang-analyzer-*,-bugprone-easily-swappable-parameters,-performance-enum-size,-performance-no-int-to-ptr,-bugprone-reserved-identifier,-clang-analyzer-optin.performance.Padding'
+# rather than by meaning, for bytes that do not matter there.  The unchecked optional access: its flow analysis took
+# 491 of the 590 s clang-tidy spent on src/program/generate.cpp (2026-10-24), for a type the code uses in a few places.
+Checks: '-*,bugprone-*,performance-*,clang-analyzer-*,-bugprone-easily-swappable-parameters,-performance-enum-size,-performance-no-int-to-ptr,-bugprone-reserved-identifier,-clang-analyzer-optin.performance.Padding,-bugprone-unchecked-optional-access'

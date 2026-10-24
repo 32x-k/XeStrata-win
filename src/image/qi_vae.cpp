@@ -5,6 +5,7 @@
 #include "strata/image/qi_vae.hpp"
 
 #include "strata/core/gpu.hpp"
+#include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
@@ -19,6 +20,7 @@
 namespace strata::image {
 
 namespace gpu = strata::gpu;
+namespace syclex = sycl::ext::oneapi::experimental;
 
 namespace {
 
@@ -69,10 +71,49 @@ void unnorm_tokens16(const float* z, const float* mean, const float* sd, int64_t
     });
 }
 
-// out16[p] = RMS-normed x[p] over the channels times g (SiLU after it when `silu`)
+// rms16 a sub-group of 32 a pixel, PIX pixels a work-group
+struct Rms16 {
+    static constexpr int64_t SG = 32, PIX = 8, LANES = SG * PIX;
+    const float *x, *g;
+    int64_t HW, C;
+    bool silu;
+    uint16_t* out16;
+    void operator()(sycl::nd_item<1> it) const {
+        const auto sg = it.get_sub_group();
+        const int64_t p = static_cast<int64_t>(it.get_group_linear_id()) * PIX + sg.get_group_linear_id();
+        const int64_t lane = sg.get_local_linear_id();
+        if (p >= HW) return;   // the whole sub-group
+        const float* r = x + p * C;
+        float ss = 0.f;
+        for (int64_t c = lane; c < C; c += SG) ss += r[c] * r[c];
+        const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(sg, ss, sycl::plus<float>()) / (float) C + 1e-12f);
+        for (int64_t c = lane; c < C; c += SG) {
+            float v = r[c] * inv * g[c];
+            if (silu) v = v / (1.f + sycl::exp(-v));
+            out16[p * C + c] = f16_from_f32(v);
+        }
+    }
+    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<SG>}; }
+};
+
+// out16[p] = RMS-normed x[p] over the channels times g (SiLU after it when `silu`): a sub-group of 32 a pixel, the
+// sum within it; where the GPU has no sub-groups of 32, a work-group a pixel and its sum over the work-group (through
+// local memory and barriers: RX 9060 XT 14.8 ms a call on average in a 1024 x 1024 decode)
 void rms16(const float* x, const float* g, int64_t HW, int64_t C, bool silu, uint16_t* out16, void* s) {
+    sycl::queue& q = q_of(s);
+    static core::PerDevice<bool> sg32;
+    const bool by_sg = sg32.get(q.get_device(), [&q] {
+        const auto sizes = q.get_device().get_info<sycl::info::device::sub_group_sizes>();
+        return std::find(sizes.begin(), sizes.end(), (size_t) 32) != sizes.end();
+    });
+    if (by_sg) {
+        q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((HW + Rms16::PIX - 1) / Rms16::PIX * Rms16::LANES)),
+                                         sycl::range<1>((size_t) Rms16::LANES)),
+                       Rms16{x, g, HW, C, silu, out16});
+        return;
+    }
     constexpr size_t local = 128;
-    q_of(s).parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) HW * local), sycl::range<1>(local)),
+    q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) HW * local), sycl::range<1>(local)),
                          [=](sycl::nd_item<1> it) {
         const auto p = static_cast<int64_t>(it.get_group_linear_id());
         const auto lane = static_cast<int64_t>(it.get_local_linear_id());

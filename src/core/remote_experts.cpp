@@ -14,7 +14,6 @@
 #include "strata/core/runtime.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -75,7 +74,7 @@ void RemoteExperts::close() {
         if (read_stream_) gpu::stream_sync(read_stream_);
         cache_.close();
         for (const void* p : {(const void*) d_x_, (const void*) d_out_, (const void*) d_q8_, (const void*) d_scales_,
-                              (const void*) d_xr_, (const void*) d_scratch_, (const void*) d_meta_, (const void*) h_x_,
+                              (const void*) d_scratch_, (const void*) d_meta_, (const void*) h_x_,
                               (const void*) h_out_, (const void*) h_meta_})
             gpu::free(p);
         if (stream_) gpu::stream_destroy(stream_);
@@ -90,8 +89,6 @@ void RemoteExperts::close() {
     h_meta_ = d_meta_ = nullptr;
     d_q8_ = nullptr;
     d_scales_ = nullptr;
-    d_xr_ = nullptr;
-    d_sx_ = d_sh_ = nullptr;
     d_scratch_ = nullptr;
     d_start_ = d_dst_ = d_tok_ = d_count_ = nullptr;
     d_ptr_ = nullptr;
@@ -184,13 +181,8 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                          : !gpu::alloc_device(&d_scales_, (size_t) CAP * (H / 32) * sizeof(float)) ? "activation scales"
                          : !gpu::alloc_device(&d_scratch_, scratch)             ? "scratch"
                          : !gpu::alloc_device(&d_meta_, sizeof(RemoteMeta))     ? "group metadata"
-                         : strata::kernels::cpu::hadamard_spec().any() && !gpu::alloc_device(&d_xr_, rows) ? "rotated input"
                                                                                 : nullptr;
         if (step != nullptr) { err = failed(device, step); close(); return false; }
-        if (strata::kernels::cpu::hadamard_spec().any()) {   // Gyro: this device's copies of the sign vectors
-            d_sx_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) H), (int) H);
-            d_sh_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) FF), (int) FF);
-        }
         // Zero copy: the helper's kernels read their input from, and write their compact rows into, its own host USM
         // - two copies fewer a layer, each a PCIe round trip.  STRATA_REMOTE_ZEROCOPY=0 copies.
         const char* zc = std::getenv("STRATA_REMOTE_ZEROCOPY");
@@ -293,13 +285,17 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
         const auto& lay = strata::kernels::cpu::expert_layout();
         if (lay.native) {
             const auto& fmt = lay.fmt[(size_t) layer];
-            if (fmt.had_gu) {   // Gyro: Hadamard-folded gate/up take H (s * x)
-                strata::kernels::hadamard_rows(xin, d_xr_, n_tok, H, fmt.had_block, d_sx_, s);
-                xin = d_xr_;
+            if (fmt.had_gu) {   // APR: Hadamard-folded gate/up take H (s * x), rotated into the device rows
+                strata::kernels::hadamard_rows(xin, d_x_, n_tok, H, fmt.had_block,
+                                               strata::kernels::hadamard_device_signs(fmt.gu_signs, (int) H), s);
+                xin = d_x_;
             }
             strata::kernels::quantize_q8_1_rows(xin, n_tok, H, d_q8_, s);
             auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff, fmt.up_type);
-            if (fmt.had_d) { L.had_block = fmt.had_block; L.d_signs = d_sh_; }
+            if (fmt.had_d) {   // APR: and the down weights the rotated h
+                L.had_block = fmt.had_block;
+                L.d_signs = strata::kernels::hadamard_device_signs(fmt.d_signs, (int) fmt.n_ff);
+            }
             strata::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_, groups_,
                                                    (int64_t) dst_.size(), d_q8_, d_scratch_, out, s);
         } else {

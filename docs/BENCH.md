@@ -58,9 +58,9 @@ Its engine is made as upstream's setup makes it:
 | --- | --- |
 | NVIDIA | the release's prebuilt engine (its SHA-256 checked) |
 | AMD | the tag's sources compiled with HIP |
-| Intel | upstream's `sycl/` built in Docker (docker must work without sudo), run with the settings its `sycl/setup_intel.py` writes for the card |
+| Intel | upstream's `sycl/` built in a rootless Podman container (podman must work), run with the settings its `sycl/setup_intel.py` writes for the card |
 
-- NVIDIA's prebuilt engine and the Intel Docker image are not free software: a free build does not compare on NVIDIA and Intel GPUs.
+- NVIDIA's prebuilt engine and upstream's Intel container image are not free software: a free build does not compare on NVIDIA and Intel GPUs.
 - A cell where upstream turns out to run at 10 tok/s or less is stopped in that tier and not compared (it is listed under the runs that stopped).
 - Image generation is compared only where upstream's setup built its `sd-cli` in the fetched tree (`engine-image/`), run with the settings upstream's setup writes.
 
@@ -101,7 +101,7 @@ A="..." B="..." PROFILE=... DATA=<data> IDS=<ids> python $S/ab_pair.py generate|
 
 - The model is IQ3_XXS by default. On a PC with less RAM, `CONFIG=xestrata-<model>.json`, a model config setup wrote, measures both engines with that model's files and settings (its RAM budget, the calibration's results).
   To name the files instead: `PACK`, `NATIVE`, `PLE` (and `EXTRA`, options both engines take). `CONTEXT` (default 262144) sets everyday use's context, `CONVS` (default `chat-ja chat-en agent`) its conversations, `TIERS` the tiers.
-- `XE` and `UP` are each engine's binary or wrapper, optionally after `env K=V ...`. For serve and everyday use a wrapper must pass stdin through (`docker run -i`).
+- `XE` and `UP` are each engine's binary or wrapper, optionally after `env K=V ...`. For serve and everyday use a wrapper must pass stdin through (`podman run -i`).
 - generate runs twice, serve and everyday use three times (`ROUNDS` changes it). In serve and everyday use each engine writes its own text, so at temperature 0.7 a round lands about 10% off the median.
 - generate makes both engines follow upstream's answer (`--spec-follow`), leaving the texts' difference out; serve has no such option.
 - To pass: in generate, and the first prefill's speed in serve and everyday use, XeStrata is at most 1% slower than upstream; the rest of serve and everyday use (the wait before a follow-up's answer, decode, the time to the first token) at most 5% worse.

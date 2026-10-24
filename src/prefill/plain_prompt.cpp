@@ -14,6 +14,8 @@
 #include "strata/core/plain_model.hpp"
 
 #include "strata/core/gpu.hpp"
+#include "strata/core/on_device.hpp"
+#include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -35,7 +37,7 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/kernels.hpp"
-#include "strata/prefill/moe_mmq.hpp"
+#include "plain_prompt.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -44,6 +46,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <functional>
+#include <future>
 #include <set>
 #include <tuple>
 #include <vector>
@@ -52,26 +56,6 @@ namespace strata::core {
 
 namespace k = strata::kernels;
 
-/// The products' state: Gemm over the dequantization scratch carved with the other buffers.
-struct PlainModel::PromptGemm {
-    prefill::Gemm gemm;
-    prefill::mmq::Context mmq;
-    bool identity = false;   // pb_.identity written
-    // the int8 products' copies from RAM on a stream of their own, into the staging's two halves in turn: ready[h]
-    // when half h holds its group, used[h] when that group's products are done with it
-    strata::gpu::Stream xs = nullptr;
-    strata::gpu::Event *ready[2] = {}, *used[2] = {};
-    bool used_live[2] = {};
-    ~PromptGemm() {
-        if (xs != nullptr) strata::gpu::stream_sync(xs);
-        for (int h = 0; h < 2; ++h) {
-            if (ready[h] != nullptr) strata::gpu::event_destroy(ready[h]);
-            if (used[h] != nullptr) strata::gpu::event_destroy(used[h]);
-        }
-        if (xs != nullptr) strata::gpu::stream_destroy(xs);
-    }
-    bool overlap() const { return xs != nullptr && ready[0] && ready[1] && used[0] && used[1]; }
-};
 
 void PlainModel::prompt_gemm_free(PromptGemm* g) { delete g; }
 
@@ -80,7 +64,13 @@ PlainModel::PromptGemm& PlainModel::prompt_gemm() {
         prompt_gemm_ = std::unique_ptr<PromptGemm, void (*)(PromptGemm*)>(new PromptGemm, &PlainModel::prompt_gemm_free);
         prompt_gemm_->gemm.init_external(cs_, pb_.gemm_scratch, pb_.gemm_elems);
         PromptGemm& g = *prompt_gemm_;
-        g.xs = strata::gpu::stream_create();
+        // the copies on a stream of their own, but not through the first Level Zero adapter (the processor's own
+        // graphics, plain_generate.cpp): there a product's wait on the copy stream's event hung now and then, about one
+        // prompt in ten on the UHD 770, and none in 15 without it (llm-jp-4.1 Q4_K_M, 2026-10-19)
+        const char* v2 = std::getenv("SYCL_UR_USE_LEVEL_ZERO_V2");
+        if (v2 == nullptr || std::strcmp(v2, "0") != 0 ||
+            strata::core::Runtime::get().device().get_backend() != sycl::backend::ext_oneapi_level_zero)
+            g.xs = strata::gpu::stream_create();
         for (int h = 0; h < 2; ++h) {
             if (!strata::gpu::event_create(&g.ready[h])) g.ready[h] = nullptr;
             if (!strata::gpu::event_create(&g.used[h])) g.used[h] = nullptr;
@@ -149,18 +139,18 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
 }
 
 bool PlainModel::prompt_return(std::string& err) {
-    const int64_t L = n_moe_, n = n_slots_;
-    if (borrow_first_ < 0 || L <= 0) return true;   // a borrow needs slots, and slots need MoE layers
+    const int64_t LS = (int64_t) moe_local_.size(), n = n_slots_;
+    if (borrow_first_ < 0 || LS <= 0) return true;   // a borrow needs slots, and slots need MoE layers
     const auto& lay = k::cpu::expert_layout();
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain prompt: ") + strata::gpu::last_error(); return false; }
-    for (int64_t s = borrow_first_; s < n; ++s) free_[(size_t) (s % L)].push_back((int32_t) s);
+    for (int64_t s = borrow_first_; s < n; ++s) free_[(size_t) moe_local_[(size_t) (s % LS)]].push_back((int32_t) s);
     borrow_first_ = -1;
     // the experts the prompt displaced, back into the slots: straight from pinned RAM, else through fill_slot
     for (const auto& [l, e] : borrowed_res_) {
         auto& f = free_[(size_t) l];
         if (f.empty()) break;
         const uint8_t* hb = src_->transient(l, e) ? nullptr : src_->blob(l, e);
-        if (hb != nullptr && strata::gpu::is_host_usm(hb)) {
+        if (hb != nullptr && (strata::gpu::is_host_usm(hb) || (dev_ >= 0 && src_->registered_on(dev_)))) {
             const int32_t slot = f.back();
             if (!strata::gpu::copy_async(cache_.device_slot(slot), hb, lay.blob_bytes(l), cs_)) {
                 err = std::string("plain prompt: ") + strata::gpu::last_error();
@@ -221,6 +211,10 @@ bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& expe
 }
 
 bool PlainModel::prompt_warm(std::string& err) {
+    for (auto& st : next_) {   // every GPU's products
+        const OnDevice on(st->dev_);
+        if (!st->prompt_warm(err)) return false;
+    }
     if (opt_.prompt_chunk <= 0 || prompt_host_ == nullptr) return true;
     if (!prompt_borrow(std::min<int64_t>(opt_.prompt_chunk, 512), err)) return false;
     const bool ok = prompt_warm_products(err);
@@ -233,6 +227,7 @@ bool PlainModel::prompt_warm_products(std::string& err) {
     // A library's first product of a kind loads its kernels for it, inside whichever prompt comes first (rocBLAS on
     // the RX 9060 XT: 0.5 s for the first product, 0.9 s more for the first of 32 rows): each dense shape the prompt
     // takes, once, on a chunk of zeros into the buffers the prompt overwrites.
+    if (glm_) return true;   // GLM-5.3-Flash's first prompt loads its products' kernels itself
     PromptBufs& P = pb_;
     prefill::Gemm& gm = prompt_gemm().gemm;
     const int64_t T = P.T, HV = spec_.ssm_dt_rank;
@@ -283,9 +278,342 @@ bool PlainModel::prompt_warm_products(std::string& err) {
     return true;
 }
 
+bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* routes,
+                                const std::function<void(int)>& mark, PromptRouted& st, std::string& err) {
+    PromptBufs& P = pb_;
+    const auto& lay = k::cpu::expert_layout();
+    const int64_t N = spec_.n_embd, E = spec_.n_expert, K = spec_.n_expert_used, FF = spec_.n_ff_exp;
+    strata::gpu::Stream cs = cs_;
+    PromptGemm& pg = prompt_gemm();
+    const bool use_mmq = P.int8;
+    // the routed experts grouped by expert, on the host from this layer's ids (and the normed rows, for the
+    // CPU's share)
+    if ((cpu_share && !strata::gpu::copy_async(P.h_hn, P.hn, (size_t) (T * N) * 4, cs)) ||
+        !strata::gpu::copy_async(P.h_ids, P.ids, (size_t) (T * K) * 4, cs) || !strata::gpu::stream_sync(cs)) {
+        err = std::string("plain prompt: the routes: ") + strata::gpu::last_error();
+        return false;
+    }
+    std::vector<int32_t> count((size_t) E, 0);
+    for (int64_t i = 0; i < T * K; ++i) {
+        const int32_t e = P.h_ids[i];
+        if (e < 0 || e >= E) { err = "plain prompt: a routed expert is out of range"; return false; }
+        ++count[(size_t) e];
+        heat_[(size_t) (ml * E + e)] += 1.0;
+    }
+    dump_routes(ml, P.h_ids, T, K);
+    if (routes != nullptr) std::copy(P.h_ids, P.h_ids + T * K, routes);
+    const auto& f = lay.fmt[(size_t) ml];
+    // the CPU's share of the missed experts (after Project Maya's CPU lane, as the windows split them): of
+    // the f experts not in VRAM, pcie_split_m's count over PCIe from the times measured at load, the rest
+    // on the CPU pool beside the GPU, those with the fewest rows first (a window's tokens at most: one
+    // multi-token job, its weights read once)
+    std::vector<char> on_cpu((size_t) E, 0);
+    std::vector<int32_t> cpu_experts;
+    if (cpu_share && f.gu_type != 42) {
+        std::vector<std::pair<int32_t, int32_t>> missed;
+        int hits = 0;
+        for (int64_t e = 0; e < E; ++e)
+            if (count[(size_t) e] > 0) {
+                if (res_[(size_t) (ml * E + e)] >= 0) ++hits;
+                else missed.emplace_back(count[(size_t) e], (int32_t) e);
+            }
+        int want = (int) missed.size() - pcie_split_m(split_, true, (int) missed.size(), hits);
+        std::sort(missed.begin(), missed.end());
+        int64_t rows = 0;
+        for (const auto& [c, e] : missed) {
+            if (want <= 0 || c > k::cpu::MAXT || rows + c > P.cpu_cap) break;
+            on_cpu[(size_t) e] = 1;
+            cpu_experts.push_back(e);
+            rows += c;
+            --want;
+        }
+    }
+    // rows in expert order, the GPU's experts first (their bounds one run), the CPU's after them
+    std::vector<int32_t> experts, start((size_t) E, 0);
+    int64_t gpu_rows = 0;
+    {
+        int32_t at = 0;
+        for (int pass = 0; pass < 2; ++pass)
+            for (int64_t e = 0; e < E; ++e)
+                if (count[(size_t) e] > 0 && on_cpu[(size_t) e] == pass) {
+                    start[(size_t) e] = at;
+                    at += count[(size_t) e];
+                    if (pass == 0) experts.push_back((int32_t) e);
+                }
+        for (int32_t e : experts) gpu_rows += count[(size_t) e];
+    }
+    {
+        std::vector<int32_t> fill(start);
+        for (int64_t i = 0; i < T * K; ++i) {
+            const int32_t e = P.h_ids[i], row = fill[(size_t) e]++;
+            P.h_src[row] = (int32_t) (i / K);   // the token whose row it reads
+            P.h_slot[i] = row;                  // where routing entry i finds its expert's output
+            P.h_entry[row] = (int32_t) i;       // the int8 down product's: the row it writes
+        }
+    }
+    // the group bounds: the routed rows of the experts in `experts` order, absolute
+    int64_t nb = 0;
+    for (int32_t e : experts) P.h_bounds[nb++] = start[(size_t) e];
+    P.h_bounds[nb] = (int32_t) gpu_rows;
+    if (!strata::gpu::copy_async(P.src, P.h_src, (size_t) (T * K) * 4, cs) ||
+        !(use_mmq ? strata::gpu::copy_async(P.entry, P.h_entry, (size_t) (T * K) * 4, cs)
+                  : strata::gpu::copy_async(P.slot, P.h_slot, (size_t) (T * K) * 4, cs)) ||
+        !strata::gpu::copy_async(P.bounds, P.h_bounds, (size_t) (nb + 1) * 4, cs)) {
+        err = std::string("plain prompt: the groups: ") + strata::gpu::last_error();
+        return false;
+    }
+    // a layer whose gate and up differ in type: up's rows too, into xq2 where the two repeat the
+    // blocks differently (Q2_K against another type)
+    const int up_type = k::cpu::native_mixed_gu(f) ? f.up_type : f.gu_type;
+    const bool up_xq2 = k::iq_mmq_type_dup(up_type) != k::iq_mmq_type_dup(f.gu_type);
+    if (use_mmq) prefill::mmq::quantize(P.hn, P.src, P.xq, f.gu_type, N, N, T * K, cs);
+    if (use_mmq && up_xq2) prefill::mmq::quantize(P.hn, P.src, P.xq2, up_type, N, N, T * K, cs);
+    else prefill::gather_rows16(P.x16, P.src, P.xs16, T * K, N, cs);
+    mark(1);
+    const bool transient = src_->transient(ml, experts.empty() ? 0 : experts[0]);
+    int64_t max_rows = 0;
+    for (int32_t e : experts) max_rows = std::max<int64_t>(max_rows, count[(size_t) e]);
+    // a source that assembles its experts from the files (transient: GGUF read in place): each group's missed experts
+    // read ahead on the source's threads (prefetch, its page faults side by side), the next group's while this one is
+    // copied and multiplied.  Group gi of the loop below takes the gi-th kGroup of the missed experts in order.
+    // (GLM-5.3-Flash UD-IQ3_XXS on the B70, a 1K-token prompt: its 11,735 missed experts took 22 s read one by one.)
+    std::vector<std::vector<int64_t>> ahead;
+    if (use_mmq && transient)
+        for (int32_t e : experts)
+            if (res_[(size_t) (ml * E + e)] < 0) {
+                if (ahead.empty() || (int) ahead.back().size() == PromptBufs::kGroup) ahead.emplace_back();
+                ahead.back().push_back(e);
+            }
+    std::future<void> fetch;
+    auto fetch_group = [&](size_t i) {
+        if (i < ahead.size())
+            fetch = std::async(std::launch::async, [this, ml, &ahead, i] {
+                src_->prefetch(ml, ahead[i].data(), (int64_t) ahead[i].size());
+            });
+    };
+    fetch_group(0);
+    // int8: as many experts a launch as the staging lets (those in VRAM read where they lie, kGroup from
+    // RAM at most), gate/up, the SwiGLU, its rows to int8, down
+    // a transient source's blobs through pinned host memory (h_stage's halves, as the device staging's) with the copies
+    // beside the products, instead of each copied from pageable memory before the next is read
+    const bool bounce = transient && P.h_stage != nullptr && pg.overlap();
+    for (size_t g0 = 0, gi = 0; use_mmq && g0 < experts.size(); ++gi) {
+        if (transient && !bounce && !strata::gpu::stream_sync(cs)) {   // the staging's last readers are done
+            err = std::string("plain prompt: ") + strata::gpu::last_error();
+            return false;
+        }
+        if (fetch.valid()) fetch.wait();   // this group's missed experts are assembled
+        fetch_group(gi + 1);
+        size_t g1 = g0;
+        int staged = 0;
+        int64_t mr = 0;
+        // the half of the staging this group takes; its copies wait for the products two groups back
+        const bool ovl = (!transient || bounce) && pg.overlap();
+        const int h = (int) (gi % 2);
+        if (bounce && pg.ready_live[h] && !strata::gpu::event_sync(pg.ready[h])) {   // the half's last copies are done
+            err = std::string("plain prompt: ") + strata::gpu::last_error();
+            return false;
+        }
+        strata::gpu::Stream ccs = ovl ? pg.xs : cs;
+        if (ovl && pg.used_live[h] && !strata::gpu::stream_wait_event(ccs, pg.used[h])) {
+            err = std::string("plain prompt: ") + strata::gpu::last_error();
+            return false;
+        }
+        for (; g1 < experts.size(); ++g1) {
+            const int32_t e = experts[g1];
+            const int32_t sl = res_[(size_t) (ml * E + e)];
+            const uint8_t* blob = nullptr;
+            if (sl >= 0) {
+                blob = cache_.device_slot(sl);
+            } else {
+                if (staged == PromptBufs::kGroup) break;
+                const size_t at = (size_t) ((ovl ? h * PromptBufs::kGroup : 0) + staged++) * lay.max_blob;
+                uint8_t* dst = P.stage + at;
+                const uint8_t* hb = src_->blob(ml, e);
+                if (bounce && hb != nullptr) {
+                    std::memcpy(P.h_stage + at, hb, f.bytes);
+                    hb = P.h_stage + at;
+                }
+                const bool copied = hb != nullptr && (transient && !bounce ? strata::gpu::copy(dst, hb, f.bytes)
+                                                                           : strata::gpu::copy_async(dst, hb, f.bytes, ccs));
+                if (!copied) { err = "plain prompt: an expert could not be read"; return false; }
+                blob = dst;
+            }
+            P.h_wtab[g1] = blob;
+            mr = std::max<int64_t>(mr, count[(size_t) e]);
+        }
+        if (ovl && (!strata::gpu::event_record(pg.ready[h], ccs) || !strata::gpu::stream_wait_event(cs, pg.ready[h]))) {
+            err = std::string("plain prompt: ") + strata::gpu::last_error();
+            return false;
+        }
+        if (ovl) pg.ready_live[h] = true;
+        const int G = (int) (g1 - g0);
+        const int32_t r0 = P.h_bounds[g0], nr = P.h_bounds[g1] - r0;
+        int32_t* hrb = P.h_rbounds + g0 + gi;
+        for (int q = 0; q <= G; ++q) hrb[q] = P.h_bounds[g0 + (size_t) q] - r0;
+        if (!strata::gpu::copy_async(static_cast<void*>(P.wtab + g0), static_cast<const void*>(P.h_wtab + g0),
+                                     (size_t) G * sizeof(void*), cs) ||
+            !strata::gpu::copy_async(P.rbounds + g0 + gi, hrb, (size_t) (G + 1) * 4, cs)) {
+            err = std::string("plain prompt: the groups: ") + strata::gpu::last_error();
+            return false;
+        }
+        prefill::mmq::Product gu;
+        gu.type = f.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.n = G; gu.xq = P.xq;
+        gu.bounds = P.bounds + g0; gu.ids = P.identity; gu.total_rows = T * K; gu.max_rows = mr; gu.rows = nr;
+        gu.dst = P.gu; gu.ld_dst = 2 * FF; gu.wtab = P.wtab + g0; gu.woff = 0;
+        if (k::cpu::native_mixed_gu(f)) {   // the gate rows, then the up rows in their own type
+            gu.w_rows = FF;
+            pg.mmq.run(gu, cs);
+            gu.type = up_type; gu.xq = up_xq2 ? P.xq2 : P.xq; gu.dst = P.gu + FF; gu.woff = f.up_off;
+        }
+        pg.mmq.run(gu, cs);
+        prefill::mmq::swiglu(P.gu + (int64_t) r0 * 2 * FF, P.hh + (int64_t) r0 * FF, nr, FF,
+                             /*interleaved=*/false, cs);
+        prefill::mmq::quantize(P.hh + (int64_t) r0 * FF, nullptr, P.hq, f.d_type, FF, FF, nr, cs);
+        prefill::mmq::Product dn;
+        dn.type = f.d_type; dn.w_rows = N; dn.w_cols = FF; dn.n = G; dn.xq = P.hq;
+        dn.bounds = P.rbounds + g0 + gi; dn.ids = P.entry + r0; dn.total_rows = nr; dn.max_rows = mr;
+        dn.dst = P.parts; dn.ld_dst = N; dn.wtab = P.wtab + g0; dn.woff = f.down_off;   // routing order
+        pg.mmq.run(dn, cs);
+        if (ovl) {
+            if (!strata::gpu::event_record(pg.used[h], cs)) {
+                err = std::string("plain prompt: ") + strata::gpu::last_error();
+                return false;
+            }
+            pg.used_live[h] = true;
+        }
+        g0 = g1;
+    }
+    // the CPU's rows go into parts after the GPU's products are queued (it computes beside them): here on
+    // the int8 path, which writes parts itself; after the FP16 path's gather, which writes every routing
+    // entry's row of parts (the CPU's from rows of dm no product wrote)
+    if (use_mmq && !cpu_experts.empty() && !prompt_cpu_experts(ml, cpu_experts, count, start, err))
+        return false;
+    st.cpu_n += (int64_t) cpu_experts.size();
+    for (int32_t e : cpu_experts) st.cpu_rows += count[(size_t) e];
+    for (int64_t e = 0; e < E; ++e) st.miss_n += count[(size_t) e] > 0 && res_[(size_t) (ml * E + e)] < 0;
+    for (size_t g0 = 0; !use_mmq && g0 < experts.size(); g0 += PromptBufs::kGroup) {
+        const int G = (int) std::min<size_t>(PromptBufs::kGroup, experts.size() - g0);
+        if (transient && !strata::gpu::stream_sync(cs)) {   // the staging's last readers are done
+            err = std::string("plain prompt: ") + strata::gpu::last_error();
+            return false;
+        }
+        for (int q = 0; q < G; ++q) {   // each expert's weights, then FP16
+            const int32_t e = experts[g0 + (size_t) q];
+            const int32_t sl = res_[(size_t) (ml * E + e)];
+            const uint8_t* blob = nullptr;
+            if (sl >= 0) {
+                blob = cache_.device_slot(sl);
+            } else {
+                uint8_t* dst = P.stage + (size_t) q * lay.max_blob;
+                const uint8_t* hb = src_->blob(ml, e);
+                const bool copied = hb != nullptr &&
+                    (transient ? strata::gpu::copy(dst, hb, f.bytes) : strata::gpu::copy_async(dst, hb, f.bytes, cs));
+                if (!copied) { err = "plain prompt: an expert could not be read"; return false; }
+                blob = dst;
+            }
+            uint16_t* dq = P.dq_gu + (size_t) q * P.gu_elems;
+            if (k::cpu::native_mixed_gu(f)) {   // gate and up of different types: each by its own
+                k::dequant_f16(f.gu_type, blob, 0, FF, N, dq, cs);
+                k::dequant_f16(f.up_type, blob + f.up_off, 0, FF, N, dq + FF * N, cs);
+            } else {
+                k::dequant_f16(f.gu_type, blob, 0, 2 * FF, N, dq, cs);
+            }
+            k::dequant_f16(f.d_type, blob + f.down_off, 0, N, FF, P.dq_d + (size_t) q * P.d_elems, cs);
+        }
+        const int32_t* hbnd = P.h_bounds + g0;
+        const int32_t* dbnd = P.bounds + g0;
+        const int64_t r0 = hbnd[0], r1 = hbnd[G];
+        if (!prefill::Gemm::f16_groups(P.xs16, P.dq_gu, P.gu_elems, P.gu, hbnd, G, 2 * FF, N, cs))
+            k::xmx_gemm_grouped(P.xs16, P.dq_gu, P.gu_elems, P.gu, dbnd, G, max_rows, 2 * FF, N, cs);
+        // gate rows then up rows (the GGUF order): h = silu(gate) * up, then FP16 for the down product
+        prefill::mmq::swiglu(P.gu + r0 * 2 * FF, P.hh + r0 * FF, r1 - r0, FF, /*interleaved=*/false, cs);
+        prefill::to_f16(P.hh + r0 * FF, P.h16 + r0 * FF, (r1 - r0) * FF, cs);
+        if (!prefill::Gemm::f16_groups(P.h16, P.dq_d, P.d_elems, P.dm, hbnd, G, N, FF, cs))
+            k::xmx_gemm_grouped(P.h16, P.dq_d, P.d_elems, P.dm, dbnd, G, max_rows, N, FF, cs);
+    }
+    mark(2);
+    // routing entry i's output into row i, then the weighted sum (and the gated shared expert)
+    if (!use_mmq)
+        k::gather_rows(reinterpret_cast<const uint8_t*>(P.dm), N * 4, P.slot, T * K,
+                       reinterpret_cast<uint8_t*>(P.parts), cs);
+    if (!use_mmq && !cpu_experts.empty() && !prompt_cpu_experts(ml, cpu_experts, count, start, err))
+        return false;
+    return true;
+}
+
 bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err) {
+    return next_.empty() ? prompt_one(tokens, n, pos, out, logits, err) : prompt_split(tokens, n, pos, out, logits, err);
+}
+
+// A layer split's prompt: every stage's buffers for chunks as long as its GPU's tier lends them, then each chunk of the
+// longest through the stages in turn, the rows handed on through pinned memory, a stage of shorter chunks reading them
+// in its own.  Chunks of the shortest everywhere made the RTX 4070's 1K the B70's too, which then read every missed
+// expert four times as often: GLM-5.3-Flash's 4K prompt 78 tok/s (B70 + 4070, 2026-10-20)
+bool PlainModel::prompt_split(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits,
+                              std::string& err) {
+    const std::vector<PlainModel*> c = chain();
+    int64_t T = n;
+    for (PlainModel* st : c) {
+        if (st->opt_.prompt_chunk <= 0 || n <= 0 || st->prompt_host_ == nullptr ||
+            (st->hand_host_ == nullptr && !(st->first() && st->last()))) {
+            err.clear();
+            return false;
+        }
+        T = std::min(T, st->opt_.prompt_chunk);
+    }
+    if (pos < 0 || pos + n > opt_.max_cells) { err = "plain prompt: past the context"; return false; }
+    auto give_back = [&](size_t upto) {
+        std::string e2;
+        for (size_t i = 0; i < upto; ++i) {
+            const OnDevice on(c[i]->dev_);
+            (void) c[i]->prompt_return(e2);
+        }
+    };
+    int64_t longest = 0;
+    for (size_t i = 0; i < c.size(); ++i) {
+        const OnDevice on(c[i]->dev_);
+        if (!c[i]->prompt_borrow(T, err)) {
+            give_back(i);
+            if (c[i]->borrow_short_) {   // as prompt_one: the windows read the prompt
+                static bool said = false;
+                if (!said) std::fprintf(stderr, "strata plain: %s: prompts are read through the decode windows\n", err.c_str());
+                said = true;
+                err.clear();
+            }
+            return false;
+        }
+        longest = std::max(longest, c[i]->pb_.T);
+    }
+    bool ok = true;
+    for (int64_t c0 = 0; ok && c0 < n; c0 += longest) {
+        const float* hand = nullptr;
+        for (PlainModel* st : c) {
+            const OnDevice on(st->dev_);
+            if (!st->prompt_chunks(tokens, n, pos, out, logits, err, c0, c0 + longest, hand)) { ok = false; break; }
+            hand = st->hand_host_;
+        }
+    }
+    std::string err2;
+    for (PlainModel* st : c) {
+        const OnDevice on(st->dev_);
+        if (!st->prompt_return(err2) && ok) { err = err2; ok = false; }
+    }
+    if (!ok) return false;
+    for (PlainModel* st : c) {   // each tier to the experts its layers routed most (prompt_one)
+        const OnDevice on(st->dev_);
+        int64_t n_free = 0;
+        for (const auto& f : st->free_) n_free += (int64_t) f.size();
+        if (!st->disp_.usage.empty() && !st->adapt(err, std::max<int64_t>(2048, n_free), st->opt_.adapt_swaps)) return false;
+    }
+    return true;
+}
+
+bool PlainModel::prompt_one(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits,
+                            std::string& err) {
     if (opt_.prompt_chunk <= 0 || n <= 0 || prompt_host_ == nullptr) { err.clear(); return false; }
     if (pos < 0 || pos + n > opt_.max_cells) { err = "plain prompt: past the context"; return false; }
+    const auto tb = std::chrono::steady_clock::now();
     // one chunk the prompt's length, up to prompt_chunk (prompt_borrow may take fewer)
     if (!prompt_borrow(std::min<int64_t>(n, opt_.prompt_chunk), err)) {
         // a report on WSL 2 (an RTX 2050, 4 GB): the tier lent too little for even a short chunk and every request
@@ -298,26 +626,45 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
         }
         return false;
     }
-    const bool ok = prompt_chunks(tokens, n, pos, out, logits, err);
+    static const bool profile = std::getenv("STRATA_PROMPT_PROFILE") != nullptr;
+    if (profile)
+        std::fprintf(stderr, "strata plain: borrowing the tier's slots %.1f ms\n",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tb).count());
+    auto since = [](std::chrono::steady_clock::time_point t) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+    };
+    auto tc = std::chrono::steady_clock::now();
+    const bool ok = prompt_chunks(tokens, n, pos, out, logits, err, 0, n, nullptr);
+    const double chunks_ms = since(tc);
+    tc = std::chrono::steady_clock::now();
     std::string err2;
     if (!prompt_return(err2) && ok) { err = err2; return false; }
+    if (profile)
+        std::fprintf(stderr, "strata plain: the chunks %.1f ms, giving the tier its slots back %.1f ms\n", chunks_ms, since(tc));
     // the tier to the experts the prompt routed most, at once (upstream's q36 engine: up to 2048 slot replacements
     // after a prompt): the rounds between windows move at most adapt_swaps each, so an empty tier (no profile) took
-    // a hundred windows to fill.  The copies run on the copy stream beside the first windows.
+    // a hundred windows to fill.  The copies run on the copy stream beside the first windows.  The free slots take
+    // what the prompt routed; of the experts in VRAM no more are evicted than a round between windows does: GLM-5.3-
+    // Flash's 2,048 evictions after a 1K prompt (17 GB of 8.5 MB experts) took the RAM's and the link's bandwidth from
+    // the decode, 9.5 -> 13.5 tok/s on the B70 and 11.3 -> 12.0 on the RTX 4070 with all of them left out (2026-10-20)
     int64_t n_free = 0;   // and every free slot: those copies displace nothing
     for (const auto& f : free_) n_free += (int64_t) f.size();
-    if (ok && !disp_.usage.empty() && !adapt(err, std::max<int64_t>(2048, n_free))) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (ok && !disp_.usage.empty() && !adapt(err, std::max<int64_t>(2048, n_free), opt_.adapt_swaps)) return false;
+    if (profile)
+        std::fprintf(stderr, "strata plain: the tier after the prompt: %.1f ms\n",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     return ok;
 }
 
 bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits,
-                               std::string& err) {
+                               std::string& err, int64_t c_begin, int64_t c_end, const float* hand_in) {
+    if (glm_) return prompt_chunks_glm5(tokens, n, pos, out, logits, err, c_begin, c_end, hand_in);
     PromptBufs& P = pb_;
     const ModelSpec& s = spec_;
-    const auto& lay = k::cpu::expert_layout();
     const int64_t N = s.n_embd, NH = s.n_head, HD = s.key_length, NKV = nkv_, HV = s.ssm_dt_rank, HK = s.ssm_n_group;
     const int64_t E = s.n_expert, K = s.n_expert_used;
-    const int64_t FS = s.n_ff_shexp, FF = s.n_ff_exp, qw = (has_gate_ ? 2 : 1) * NH * HD;
+    const int64_t FS = s.n_ff_shexp, qw = (has_gate_ ? 2 : 1) * NH * HD;
     const float eps = (float) s.rms_eps;
     const k::QsaShapes qs = [&] {
         k::QsaShapes q = k::qsa_real_shapes();
@@ -387,13 +734,18 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
         // the chunk's routes, every MoE layer's, for the adaptive tier's counts (below, after the chunk)
         const int64_t L = n_moe_;
         std::vector<int32_t> routes(disp_.usage.empty() ? 0 : (size_t) (L * P.T * K));
-        for (int64_t c0 = 0; c0 < n; c0 += P.T) {
-            const int64_t T = std::min<int64_t>(P.T, n - c0), p0 = pos + c0;
-            // the chunk's inputs: embedding rows, per-token step counts and rotary positions
+        const int64_t c_last = std::min(n, c_end);
+        if (!first())   // the rows handed on, into this stage's own pinned memory (and its rows out from there)
+            std::memcpy(hand_host_, hand_in, (size_t) ((c_last - c_begin) * N) * 4);
+        for (int64_t c0 = c_begin; c0 < c_last; c0 += P.T) {
+            const int64_t T = std::min<int64_t>(P.T, c_last - c0), p0 = pos + c0;
+            float* hand = hand_host_ != nullptr ? hand_host_ + (c0 - c_begin) * N : nullptr;
+            // the chunk's inputs: embedding rows (a later stage: the rows handed on), per-token step counts and rotary
+            // positions
             for (int64_t t = 0; t < T; ++t) {
                 const int32_t tok = tokens[c0 + t];
                 if (tok < 0 || tok >= n_vocab_ ||
-                    !k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tok * emb_row_, P.emb + t * N, N)) {
+                    (first() && !k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tok * emb_row_, P.emb + t * N, N))) {
                     err = "plain prompt: a token is out of the vocabulary";
                     return false;
                 }
@@ -401,7 +753,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 for (int64_t hd = 0; hd < NH; ++hd) P.h_pos[t * NH + hd] = (int32_t) (p0 + t);
                 for (int64_t hd = 0; hd < NKV; ++hd) P.h_pos[T * NH + t * NKV + hd] = (int32_t) (p0 + t);
             }
-            if (!strata::gpu::copy_async(P.x, P.emb, (size_t) (T * N) * 4, cs) ||
+            if (!strata::gpu::copy_async(P.x, first() ? P.emb : hand, (size_t) (T * N) * 4, cs) ||
                 !strata::gpu::copy_async(P.steps, P.h_steps, (size_t) (T * k::kStepCount) * 4, cs) ||
                 !strata::gpu::copy_async(P.pos_q, P.h_pos, (size_t) (T * NH) * 4, cs) ||
                 !strata::gpu::copy_async(P.pos_k, P.h_pos + T * NH, (size_t) (T * NKV) * 4, cs)) {
@@ -440,7 +792,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
             // the MTP layer after the trunk, its K/V a cell ahead: row t pairs the trunk's normed row t with the token
             // after it (the prompt's last row with a stand-in, rewritten by spec_start once the token is picked)
             const bool mtp_chunk = has_mtp_ && p0 + T < opt_.max_cells;
-            for (int64_t l = 0; l < s.n_layer + (mtp_chunk ? 1 : 0); ++l) {
+            for (int64_t l = lb_; l < le_ + (mtp_chunk ? 1 : 0); ++l) {
                 const bool is_mtp = l == s.n_layer;
                 if (is_mtp) {
                     last_logits();
@@ -566,228 +918,15 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     proj_hn(b.sh_up, P.sh_up);
                     k::f32_gemm_rows(P.hn, N, b.sh_gate_inp, P.sh_g, 1, N, 1, T, cs);
                 }
-                // the routed experts grouped by expert, on the host from this layer's ids (and the normed rows, for the
-                // CPU's share)
-                if ((cpu_share && !strata::gpu::copy_async(P.h_hn, P.hn, (size_t) (T * N) * 4, cs)) ||
-                    !strata::gpu::copy_async(P.h_ids, P.ids, (size_t) (T * K) * 4, cs) || !strata::gpu::stream_sync(cs)) {
-                    err = std::string("plain prompt: the routes: ") + strata::gpu::last_error();
-                    return false;
-                }
+                // the routed experts grouped by expert (prompt_routed), into parts in routing order
                 const int64_t ml = is_mtp ? n_moe_ - 1 : s.moe_index(l);
-                std::vector<int32_t> count((size_t) E, 0);
-                for (int64_t i = 0; i < T * K; ++i) {
-                    const int32_t e = P.h_ids[i];
-                    if (e < 0 || e >= E) { err = "plain prompt: a routed expert is out of range"; return false; }
-                    ++count[(size_t) e];
-                    heat_[(size_t) (ml * E + e)] += 1.0;
-                }
-                if (!routes.empty()) std::copy(P.h_ids, P.h_ids + T * K, routes.begin() + ml * P.T * K);
-                const auto& f = lay.fmt[(size_t) ml];
-                // the CPU's share of the missed experts (after Project Maya's CPU lane, as the windows split them): of
-                // the f experts not in VRAM, pcie_split_m's count over PCIe from the times measured at load, the rest
-                // on the CPU pool beside the GPU, those with the fewest rows first (a window's tokens at most: one
-                // multi-token job, its weights read once)
-                std::vector<char> on_cpu((size_t) E, 0);
-                std::vector<int32_t> cpu_experts;
-                if (cpu_share && f.gu_type != 42) {
-                    std::vector<std::pair<int32_t, int32_t>> missed;
-                    int hits = 0;
-                    for (int64_t e = 0; e < E; ++e)
-                        if (count[(size_t) e] > 0) {
-                            if (res_[(size_t) (ml * E + e)] >= 0) ++hits;
-                            else missed.emplace_back(count[(size_t) e], (int32_t) e);
-                        }
-                    int want = (int) missed.size() - pcie_split_m(split_, true, (int) missed.size(), hits);
-                    std::sort(missed.begin(), missed.end());
-                    int64_t rows = 0;
-                    for (const auto& [c, e] : missed) {
-                        if (want <= 0 || c > k::cpu::MAXT || rows + c > P.cpu_cap) break;
-                        on_cpu[(size_t) e] = 1;
-                        cpu_experts.push_back(e);
-                        rows += c;
-                        --want;
-                    }
-                }
-                // rows in expert order, the GPU's experts first (their bounds one run), the CPU's after them
-                std::vector<int32_t> experts, start((size_t) E, 0);
-                int64_t gpu_rows = 0;
-                {
-                    int32_t at = 0;
-                    for (int pass = 0; pass < 2; ++pass)
-                        for (int64_t e = 0; e < E; ++e)
-                            if (count[(size_t) e] > 0 && on_cpu[(size_t) e] == pass) {
-                                start[(size_t) e] = at;
-                                at += count[(size_t) e];
-                                if (pass == 0) experts.push_back((int32_t) e);
-                            }
-                    for (int32_t e : experts) gpu_rows += count[(size_t) e];
-                }
-                {
-                    std::vector<int32_t> fill(start);
-                    for (int64_t i = 0; i < T * K; ++i) {
-                        const int32_t e = P.h_ids[i], row = fill[(size_t) e]++;
-                        P.h_src[row] = (int32_t) (i / K);   // the token whose row it reads
-                        P.h_slot[i] = row;                  // where routing entry i finds its expert's output
-                        P.h_entry[row] = (int32_t) i;       // the int8 down product's: the row it writes
-                    }
-                }
-                // the group bounds: the routed rows of the experts in `experts` order, absolute
-                int64_t nb = 0;
-                for (int32_t e : experts) P.h_bounds[nb++] = start[(size_t) e];
-                P.h_bounds[nb] = (int32_t) gpu_rows;
-                if (!strata::gpu::copy_async(P.src, P.h_src, (size_t) (T * K) * 4, cs) ||
-                    !(use_mmq ? strata::gpu::copy_async(P.entry, P.h_entry, (size_t) (T * K) * 4, cs)
-                              : strata::gpu::copy_async(P.slot, P.h_slot, (size_t) (T * K) * 4, cs)) ||
-                    !strata::gpu::copy_async(P.bounds, P.h_bounds, (size_t) (nb + 1) * 4, cs)) {
-                    err = std::string("plain prompt: the groups: ") + strata::gpu::last_error();
+                PromptRouted rst;
+                if (!prompt_routed(ml, T, cpu_share, routes.empty() ? nullptr : routes.data() + ml * P.T * K,
+                                   [&](int stage) { mark(stage, t_mark); }, rst, err))
                     return false;
-                }
-                // a layer whose gate and up differ in type: up's rows too, into xq2 where the two repeat the
-                // blocks differently (Q2_K against another type)
-                const int up_type = k::cpu::native_mixed_gu(f) ? f.up_type : f.gu_type;
-                const bool up_xq2 = k::iq_mmq_type_dup(up_type) != k::iq_mmq_type_dup(f.gu_type);
-                // the shared rows carry the blocks' sums when either product reads them (Q4_K, Q5_K: gate Q6_K and
-                // up Q4_K left up's sums unwritten); the sums sit after the scales: one without them reads alike
-                const int xq_type = !up_xq2 && k::iq_mmq_type_sums(up_type) ? up_type : f.gu_type;
-                if (use_mmq) prefill::mmq::quantize(P.hn, P.src, P.xq, xq_type, N, N, T * K, cs);
-                if (use_mmq && up_xq2) prefill::mmq::quantize(P.hn, P.src, P.xq2, up_type, N, N, T * K, cs);
-                if (!use_mmq) prefill::gather_rows16(P.x16, P.src, P.xs16, T * K, N, cs);   // (only FP16 reads them)
-                mark(1, t_mark);
-                const bool transient = src_->transient(ml, experts.empty() ? 0 : experts[0]);
-                int64_t max_rows = 0;
-                for (int32_t e : experts) max_rows = std::max<int64_t>(max_rows, count[(size_t) e]);
-                // int8: as many experts a launch as the staging lets (those in VRAM read where they lie, kGroup from
-                // RAM at most), gate/up, the SwiGLU, its rows to int8, down
-                for (size_t g0 = 0, gi = 0; use_mmq && g0 < experts.size(); ++gi) {
-                    if (transient && !strata::gpu::stream_sync(cs)) {   // the staging's last readers are done
-                        err = std::string("plain prompt: ") + strata::gpu::last_error();
-                        return false;
-                    }
-                    size_t g1 = g0;
-                    int staged = 0;
-                    int64_t mr = 0;
-                    // the half of the staging this group takes; its copies wait for the products two groups back
-                    const bool ovl = !transient && pg.overlap();
-                    const int h = (int) (gi % 2);
-                    strata::gpu::Stream ccs = ovl ? pg.xs : cs;
-                    if (ovl && pg.used_live[h] && !strata::gpu::stream_wait_event(ccs, pg.used[h])) {
-                        err = std::string("plain prompt: ") + strata::gpu::last_error();
-                        return false;
-                    }
-                    for (; g1 < experts.size(); ++g1) {
-                        const int32_t e = experts[g1];
-                        const int32_t sl = res_[(size_t) (ml * E + e)];
-                        const uint8_t* blob = nullptr;
-                        if (sl >= 0) {
-                            blob = cache_.device_slot(sl);
-                        } else {
-                            if (staged == PromptBufs::kGroup) break;
-                            uint8_t* dst = P.stage + (size_t) ((ovl ? h * PromptBufs::kGroup : 0) + staged++) * lay.max_blob;
-                            const uint8_t* hb = src_->blob(ml, e);
-                            const bool copied = hb != nullptr &&
-                                (transient ? strata::gpu::copy(dst, hb, f.bytes) : strata::gpu::copy_async(dst, hb, f.bytes, ccs));
-                            if (!copied) { err = "plain prompt: an expert could not be read"; return false; }
-                            blob = dst;
-                        }
-                        P.h_wtab[g1] = blob;
-                        mr = std::max<int64_t>(mr, count[(size_t) e]);
-                    }
-                    if (ovl && (!strata::gpu::event_record(pg.ready[h], ccs) || !strata::gpu::stream_wait_event(cs, pg.ready[h]))) {
-                        err = std::string("plain prompt: ") + strata::gpu::last_error();
-                        return false;
-                    }
-                    const int G = (int) (g1 - g0);
-                    const int32_t r0 = P.h_bounds[g0], nr = P.h_bounds[g1] - r0;
-                    int32_t* hrb = P.h_rbounds + g0 + gi;
-                    for (int q = 0; q <= G; ++q) hrb[q] = P.h_bounds[g0 + (size_t) q] - r0;
-                    if (!strata::gpu::copy_async(static_cast<void*>(P.wtab + g0), static_cast<const void*>(P.h_wtab + g0),
-                                                 (size_t) G * sizeof(void*), cs) ||
-                        !strata::gpu::copy_async(P.rbounds + g0 + gi, hrb, (size_t) (G + 1) * 4, cs)) {
-                        err = std::string("plain prompt: the groups: ") + strata::gpu::last_error();
-                        return false;
-                    }
-                    prefill::mmq::Product gu;
-                    gu.type = f.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.n = G; gu.xq = P.xq;
-                    gu.bounds = P.bounds + g0; gu.ids = P.identity; gu.total_rows = T * K; gu.max_rows = mr; gu.rows = nr;
-                    gu.dst = P.gu; gu.ld_dst = 2 * FF; gu.wtab = P.wtab + g0; gu.woff = 0;
-                    if (k::cpu::native_mixed_gu(f)) {   // the gate rows, then the up rows in their own type
-                        gu.w_rows = FF;
-                        pg.mmq.run(gu, cs);
-                        gu.type = up_type; gu.xq = up_xq2 ? P.xq2 : P.xq; gu.dst = P.gu + FF; gu.woff = f.up_off;
-                    }
-                    pg.mmq.run(gu, cs);
-                    prefill::mmq::swiglu(P.gu + (int64_t) r0 * 2 * FF, P.hh + (int64_t) r0 * FF, nr, FF,
-                                         /*interleaved=*/false, cs);
-                    prefill::mmq::quantize(P.hh + (int64_t) r0 * FF, nullptr, P.hq, f.d_type, FF, FF, nr, cs);
-                    prefill::mmq::Product dn;
-                    dn.type = f.d_type; dn.w_rows = N; dn.w_cols = FF; dn.n = G; dn.xq = P.hq;
-                    dn.bounds = P.rbounds + g0 + gi; dn.ids = P.entry + r0; dn.total_rows = nr; dn.max_rows = mr;
-                    dn.dst = P.parts; dn.ld_dst = N; dn.wtab = P.wtab + g0; dn.woff = f.down_off;   // routing order
-                    pg.mmq.run(dn, cs);
-                    if (ovl) {
-                        if (!strata::gpu::event_record(pg.used[h], cs)) {
-                            err = std::string("plain prompt: ") + strata::gpu::last_error();
-                            return false;
-                        }
-                        pg.used_live[h] = true;
-                    }
-                    g0 = g1;
-                }
-                // the CPU's rows go into parts after the GPU's products are queued (it computes beside them): here on
-                // the int8 path, which writes parts itself; after the FP16 path's gather, which writes every routing
-                // entry's row of parts (the CPU's from rows of dm no product wrote)
-                if (use_mmq && !cpu_experts.empty() && !prompt_cpu_experts(ml, cpu_experts, count, start, err))
-                    return false;
-                cpu_n += (int64_t) cpu_experts.size();
-                for (int32_t e : cpu_experts) cpu_rows += count[(size_t) e];
-                for (int64_t e = 0; e < E; ++e) miss_n += count[(size_t) e] > 0 && res_[(size_t) (ml * E + e)] < 0;
-                for (size_t g0 = 0; !use_mmq && g0 < experts.size(); g0 += PromptBufs::kGroup) {
-                    const int G = (int) std::min<size_t>(PromptBufs::kGroup, experts.size() - g0);
-                    if (transient && !strata::gpu::stream_sync(cs)) {   // the staging's last readers are done
-                        err = std::string("plain prompt: ") + strata::gpu::last_error();
-                        return false;
-                    }
-                    for (int q = 0; q < G; ++q) {   // each expert's weights, then FP16
-                        const int32_t e = experts[g0 + (size_t) q];
-                        const int32_t sl = res_[(size_t) (ml * E + e)];
-                        const uint8_t* blob = nullptr;
-                        if (sl >= 0) {
-                            blob = cache_.device_slot(sl);
-                        } else {
-                            uint8_t* dst = P.stage + (size_t) q * lay.max_blob;
-                            const uint8_t* hb = src_->blob(ml, e);
-                            const bool copied = hb != nullptr &&
-                                (transient ? strata::gpu::copy(dst, hb, f.bytes) : strata::gpu::copy_async(dst, hb, f.bytes, cs));
-                            if (!copied) { err = "plain prompt: an expert could not be read"; return false; }
-                            blob = dst;
-                        }
-                        uint16_t* dq = P.dq_gu + (size_t) q * P.gu_elems;
-                        if (k::cpu::native_mixed_gu(f)) {   // gate and up of different types: each by its own
-                            k::dequant_f16(f.gu_type, blob, 0, FF, N, dq, cs);
-                            k::dequant_f16(f.up_type, blob + f.up_off, 0, FF, N, dq + FF * N, cs);
-                        } else {
-                            k::dequant_f16(f.gu_type, blob, 0, 2 * FF, N, dq, cs);
-                        }
-                        k::dequant_f16(f.d_type, blob + f.down_off, 0, N, FF, P.dq_d + (size_t) q * P.d_elems, cs);
-                    }
-                    const int32_t* hbnd = P.h_bounds + g0;
-                    const int32_t* dbnd = P.bounds + g0;
-                    const int64_t r0 = hbnd[0], r1 = hbnd[G];
-                    if (!prefill::Gemm::f16_groups(P.xs16, P.dq_gu, P.gu_elems, P.gu, hbnd, G, 2 * FF, N, cs))
-                        k::xmx_gemm_grouped(P.xs16, P.dq_gu, P.gu_elems, P.gu, dbnd, G, max_rows, 2 * FF, N, cs);
-                    // gate rows then up rows (the GGUF order): h = silu(gate) * up, then FP16 for the down product
-                    prefill::mmq::swiglu(P.gu + r0 * 2 * FF, P.hh + r0 * FF, r1 - r0, FF, /*interleaved=*/false, cs);
-                    prefill::to_f16(P.hh + r0 * FF, P.h16 + r0 * FF, (r1 - r0) * FF, cs);
-                    if (!prefill::Gemm::f16_groups(P.h16, P.dq_d, P.d_elems, P.dm, hbnd, G, N, FF, cs))
-                        k::xmx_gemm_grouped(P.h16, P.dq_d, P.d_elems, P.dm, dbnd, G, max_rows, N, FF, cs);
-                }
-                mark(2, t_mark);
-                // routing entry i's output into row i, then the weighted sum (and the gated shared expert)
-                if (!use_mmq)
-                    k::gather_rows(reinterpret_cast<const uint8_t*>(P.dm), N * 4, P.slot, T * K,
-                                   reinterpret_cast<uint8_t*>(P.parts), cs);
-                if (!use_mmq && !cpu_experts.empty() && !prompt_cpu_experts(ml, cpu_experts, count, start, err))
-                    return false;
+                cpu_n += rst.cpu_n;
+                cpu_rows += rst.cpu_rows;
+                miss_n += rst.miss_n;
                 if (has_shared_) {   // shared = down(silu(gate) * up): the SwiGLU into FP16 (x16 is free again)
                     prefill::swiglu_pair(P.sh_gate, P.sh_up, P.x16, T, cs, FS);
                     proj(b.sh_down, P.shared, T);
@@ -797,7 +936,14 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 k::add_inplace(P.x, P.moe_out, T * N, cs);
                 mark(3, t_mark);
             }
-            if (!mtp_chunk) last_logits();
+            if (!last()) {   // the rows to the next stage
+                if (!strata::gpu::copy_async(hand, P.x, (size_t) (T * N) * 4, cs)) {
+                    err = std::string("plain prompt: the rows to the next GPU: ") + strata::gpu::last_error();
+                    return false;
+                }
+            } else if (!mtp_chunk) {
+                last_logits();
+            }
             if (!routes.empty()) {
                 // each window's counts as the windows would leave them at the prompt's end: times the decay of every
                 // round that would come after it; the rounds themselves are left to the decode (their swaps would
@@ -808,7 +954,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     // the adaptive rounds after this window: whole rounds, so integer divisions
                     const int64_t rounds = (windows_ + last + 1) / opt_.adapt_every - (windows_ + win) / opt_.adapt_every;
                     const float wgt = std::pow(opt_.adapt_decay, (float) rounds);
-                    for (int64_t ml = 0; ml < L; ++ml)
+                    for (int64_t ml : moe_local_)   // this stage's layers' routes
                         for (int64_t i = t0 * K; i < std::min(T, t0 + W) * K; ++i)
                             disp_.usage[(size_t) (ml * E + routes[(size_t) (ml * P.T * K + i)])] += wgt;
                 }
@@ -822,6 +968,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
         err = std::string("plain prompt: ") + strata::gpu::last_error();
         return false;
     }
+    if (c_end < n) return true;   // a layer split's chunk: the stage's part of the prompt goes on with the next
     windows_ += (n + opt_.max_t - 1) / opt_.max_t;
     mtp_h_set_ = has_mtp_ && pos + n < opt_.max_cells;   // the trunk's last row is in mtp_h_ for spec_start
     if (profile)
@@ -835,6 +982,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     if (profile)
         std::fprintf(stderr, "strata plain: prompt experts not in VRAM %lld, of them on the CPU %lld (%lld rows)\n",
                      (long long) miss_n, (long long) cpu_n, (long long) cpu_rows);
+    if (!last()) return true;
     *out = ((volatile int32_t*) h_out_)[0];
     if (logits != nullptr && !strata::gpu::copy(logits, logits_, (size_t) n_vocab_ * 4)) {
         err = "plain prompt: reading the logits failed";

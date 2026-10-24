@@ -65,12 +65,17 @@ class Calibrate(unittest.TestCase):
         res, _ = self.run_with(lambda f, p, w: 51.0 if abs(f - 0.35) < 1e-6 else 50.0)
         self.assertEqual(res["settings"], {})
 
-    def test_finds_pcie_and_min_p(self):
+    def test_finds_pcie_without_min_p(self):
+        # the engine sizes its windows itself (--spec-window auto): no request names spec_min_p, none is written
+        floors = set()
+
         def speed(f, p, w):
+            floors.add(p)
             return 50.0 + (10.0 if abs(f - 0.2) < 1e-6 else 0.0) + (5.0 if abs(p - 0.7) < 1e-6 else 0.0)
         res, _ = self.run_with(speed)
         self.assertEqual(res["settings"].get("--pcie-frac"), "0.20")
-        self.assertEqual(res["settings"].get("--spec-min-p"), "0.70")
+        self.assertNotIn("--spec-min-p", res["settings"])
+        self.assertEqual(floors, {0.5})   # only the engine's own value from its args, never a request's
         self.assertNotIn("--pool-workers", res["settings"])
 
     def test_fewer_workers(self):

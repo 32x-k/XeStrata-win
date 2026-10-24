@@ -265,18 +265,41 @@ void test_cgroup_memory_budget() {
     constexpr uint64_t GiB = 1ull << 30;
     uint64_t bytes = 0;
 
+    // the kernel keeps min(half the clean cache, limit / 64) of it: 56 GiB / 64 = 0.875 GiB here
+    const uint64_t keep56 = 56 * GiB / 64;
     CgroupMemoryStat clean_cache{40 * GiB, 32 * GiB, 0, 0, true};
     require(cgroup_available_bytes(56 * GiB, clean_cache, bytes), "valid cgroup memory.stat was rejected");
-    require(bytes == 48 * GiB, "clean inactive file cache was not credited against the cgroup cap");
+    require(bytes == 48 * GiB - keep56, "clean inactive file cache was not credited against the cgroup cap");
 
     CgroupMemoryStat dirty_cache{40 * GiB, 32 * GiB, 4 * GiB, 2 * GiB, true};
     require(cgroup_available_bytes(56 * GiB, dirty_cache, bytes), "valid dirty-cache counters were rejected");
-    require(bytes == 42 * GiB, "dirty/writeback pages were incorrectly counted as reclaimable");
+    require(bytes == 42 * GiB - keep56, "dirty/writeback pages were incorrectly counted as reclaimable");
 
     CgroupMemoryStat oversized_inactive{10 * GiB, 20 * GiB, 0, 0, true};
     require(cgroup_available_bytes(12 * GiB, oversized_inactive, bytes),
             "valid oversized inactive-file counter was rejected");
-    require(bytes == 12 * GiB, "inactive-file accounting exceeded charged current usage");
+    require(bytes == 12 * GiB - 12 * GiB / 64, "inactive-file accounting exceeded charged current usage");
+
+    // 149: the ACTIVE page cache is reclaimable too (memory.stat "file" = active + inactive), as MemAvailable counts
+    // it: a 32 GiB group whose own reads left 26 GiB of cache, 25 GiB of it active, and 4.5 GiB of anonymous memory
+    CgroupMemoryStat active_cache{30 * GiB + GiB / 2, 1 * GiB, 0, 0, true, 26 * GiB};
+    require(cgroup_available_bytes(32 * GiB, active_cache, bytes), "a memory.stat with file was rejected");
+    require(bytes == 32 * GiB - (4 * GiB + GiB / 2) - 32 * GiB / 64, "the active page cache was not credited");
+    // without "file" (an old kernel's stat): inactive_file alone, as before
+    CgroupMemoryStat no_file{30 * GiB + GiB / 2, 1 * GiB, 0, 0, true};
+    require(cgroup_available_bytes(32 * GiB, no_file, bytes) && bytes == 32 * GiB - (29 * GiB + GiB / 2) - GiB / 2,
+            "a stat without file did not fall back to inactive_file");
+    // dirty and writeback pages of the active cache stay charged; a small cache keeps half of itself
+    CgroupMemoryStat dirty_active{20 * GiB, 1 * GiB, 2 * GiB, 1 * GiB, true, 10 * GiB};
+    require(cgroup_available_bytes(32 * GiB, dirty_active, bytes) && bytes == 32 * GiB - (20 * GiB - 7 * GiB) - GiB / 2,
+            "dirty / writeback pages of the active cache were counted as reclaimable");
+    CgroupMemoryStat tiny_cache{8 * GiB, 0, 0, 0, true, 256ull << 20};
+    require(cgroup_available_bytes(32 * GiB, tiny_cache, bytes) && bytes == 32 * GiB - 8 * GiB + (128ull << 20),
+            "a small clean cache was not kept at half");
+    // "file" larger than what is charged (a racy read) is bounded by memory.current
+    CgroupMemoryStat racy{4 * GiB, 1 * GiB, 0, 0, true, 9 * GiB};
+    require(cgroup_available_bytes(32 * GiB, racy, bytes) && bytes == 32 * GiB - GiB / 2,
+            "a file counter above memory.current escaped the bound");
 
     const uint64_t max = std::numeric_limits<uint64_t>::max();
     CgroupMemoryStat large_counters{max, max, max - 1, max, true};

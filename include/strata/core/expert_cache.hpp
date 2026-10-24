@@ -107,6 +107,10 @@ public:
     void set_max_piece(uint64_t bytes) { piece_max_ = bytes; }
     /// The first slot of the last piece (0: one allocation): the slots from it to the end lie back to back.
     int64_t last_piece_first() const { return last_piece_first_; }
+    /// Zeroes the whole arena as its layout needs: one allocation (and a virtual-memory range) in one memset, the
+    /// pieces each their own - they are not adjacent, and `alloc_pieces` has already zeroed them as it took them.
+    /// `open` leaves the arena zeroed; this is for a caller that re-checks the free VRAM once the slots are written.
+    bool zero_arena();
     void close();
 
     bool valid() const { return base_ != nullptr; }
@@ -218,8 +222,14 @@ private:
     }
     bool open_segmented(uint64_t want, std::string& err);
     bool open_pieces(const std::vector<uint64_t>& size_off, std::string& err);
+    /// The piece allocations of `open_pieces` with the piece size given (not `piece_max_`).  `best_effort`: the first
+    /// piece the device refuses ends the arena and the pieces before it stay (`fitted` out: the slots they cover);
+    /// false (and `err`) when not even the first piece was taken.  Zero otherwise, as `open_pieces`.
+    bool alloc_pieces(const std::vector<uint64_t>& size_off, uint64_t piece_max, bool best_effort, int64_t* fitted,
+                      std::string& err);
     void start_tables(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes);
     uint64_t piece_max_ = 0;              ///< set_max_piece
+    bool alloc_refused_ = false;          ///< the last open()'s failure was the allocation, not the pre-check
     std::vector<void*> pieces_;           ///< the pieces after the first (base_), when allocated in pieces
     std::vector<uint64_t> size_off_;      ///< in pieces: each slot's offset by size (off_ holds the addresses)
     int64_t last_piece_first_ = 0;

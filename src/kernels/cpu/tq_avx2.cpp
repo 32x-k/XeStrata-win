@@ -25,21 +25,24 @@ namespace {
 // four state-table rows (8 bytes each) into one YMM: a load and three broadcast loads blended in.  Broadcast loads
 // and VPBLENDD avoid the shuffle port that VPINSRQ / VINSERTI128 need (the two measure the same on Zen 5).
 inline __m256i rows4(const long long* tab, uint32_t s0, uint32_t s1, uint32_t s2, uint32_t s3) {
-    __m256i v = _mm256_castsi128_si256(_mm_loadl_epi64((const __m128i*) (tab + s0)));
+    __m256i v = _mm256_castsi128_si256(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(tab + s0)));
     v = _mm256_blend_epi32(v, _mm256_set1_epi64x(tab[s1]), 0x0C);
     v = _mm256_blend_epi32(v, _mm256_set1_epi64x(tab[s2]), 0x30);
     return _mm256_blend_epi32(v, _mm256_set1_epi64x(tab[s3]), 0xC0);
 }
 
-template <int KB>
-void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt, float* const* out, int r0,
-            int r1) {
+// NT, the token count, is a template parameter so the accumulators stay in registers: with nt at run time clang kept
+// acc[] on the stack, a store and a load in every block's chain (TQ2_T rows 13-36% slower on an i7-14700's P-core than
+// GCC's build, 2026-10-23)
+template <int KB, int NT>
+void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, float* const* out, int r0, int r1) {
+    constexpr int nt = NT;
     const int nb = n / 128;
     constexpr size_t bsz = 2 + 4 * KB;
     const long long* tab = (const long long*) tq_state_table();
     for (int r = r0; r < r1; ++r) {
         const uint8_t* x = w + (size_t) r * row_bytes;
-        __m128 acc[kTqMaxTokens];
+        __m128 acc[NT];
         for (int t = 0; t < nt; ++t) acc[t] = _mm_setzero_ps();
         for (int i = 0; i < nb; ++i) {
             const uint8_t* blk = x + (size_t) i * bsz;
@@ -78,13 +81,30 @@ void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, in
     }
 }
 
+template <int KB>
+void rows_nt(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt, float* const* out, int r0,
+             int r1) {
+    static_assert(kTqMaxTokens == 8, "one case per token count");
+    switch (nt) {
+    case 1: rows_t<KB, 1>(w, row_bytes, n, a, out, r0, r1); break;
+    case 2: rows_t<KB, 2>(w, row_bytes, n, a, out, r0, r1); break;
+    case 3: rows_t<KB, 3>(w, row_bytes, n, a, out, r0, r1); break;
+    case 4: rows_t<KB, 4>(w, row_bytes, n, a, out, r0, r1); break;
+    case 5: rows_t<KB, 5>(w, row_bytes, n, a, out, r0, r1); break;
+    case 6: rows_t<KB, 6>(w, row_bytes, n, a, out, r0, r1); break;
+    case 7: rows_t<KB, 7>(w, row_bytes, n, a, out, r0, r1); break;
+    case 8: rows_t<KB, 8>(w, row_bytes, n, a, out, r0, r1); break;
+    default: break;
+    }
+}
+
 }  // namespace
 
 void tq_rows_avx2(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                   float* const* out, int r0, int r1) {
-    if (kb == 8) rows_t<8>(w, row_bytes, n, a, nt, out, r0, r1);
-    else if (kb == 6) rows_t<6>(w, row_bytes, n, a, nt, out, r0, r1);
-    else rows_t<7>(w, row_bytes, n, a, nt, out, r0, r1);
+    if (kb == 8) rows_nt<8>(w, row_bytes, n, a, nt, out, r0, r1);
+    else if (kb == 6) rows_nt<6>(w, row_bytes, n, a, nt, out, r0, r1);
+    else rows_nt<7>(w, row_bytes, n, a, nt, out, r0, r1);
 }
 
 }  // namespace strata::kernels::cpu::tq_detail

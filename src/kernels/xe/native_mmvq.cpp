@@ -860,12 +860,24 @@ std::size_t native_q8_1_bytes(int n_in, int ncols) {
 
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, void* stream) {
     validate_shape(n_in, ncols);
+    native_quantize_q8_1_rows(x, x_q8_1, n_in, ncols, stream);
+}
+
+std::size_t native_q8_1_rows_bytes(int n_in, int64_t rows) {
+    if (n_in <= 0 || n_in % Q8K != 0 || rows < 0)
+        throw std::invalid_argument("native Q8_1 rows require n_in > 0 and divisible by 32, and rows >= 0");
+    return std::size_t(rows) * std::size_t(n_in / Q8K) * sizeof(Q81Block);
+}
+
+void native_quantize_q8_1_rows(const float* x, void* x_q8_1, int n_in, int64_t rows, void* stream) {
+    if (n_in <= 0 || n_in % Q8K != 0 || rows < 1 || (int64_t) n_in * rows > INT32_MAX)
+        throw std::invalid_argument("native Q8_1 rows require n_in > 0 and divisible by 32, and 1 <= rows");
     validate_pointer(x);
     validate_pointer(x_q8_1);
     auto& q = validate_stream(stream);
     // Columns are contiguous and n_in is a multiple of 32, so ncols columns quantize as one vector of
     // ncols * n_in elements: every 32-element block stays inside one column.
-    const int n_total = n_in * ncols;
+    const int n_total = (int) ((int64_t) n_in * rows);
     auto* y = static_cast<Q81Block*>(x_q8_1);
     const std::size_t global = (std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS * QUANT_THREADS;
     q.parallel_for(sycl::nd_range<1>(global, QUANT_THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
@@ -1010,7 +1022,7 @@ bool native_mmvq_supported(int ggml_type) noexcept {
            ggml_type == 10 || ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
-           ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
+           ggml_type == 21 || ggml_type == 22 || ggml_type == 29 || ggml_type == 19;
 }
 
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
@@ -1030,7 +1042,7 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     case kNativeQ8Rows: block_elems = 64; block_bytes = 68; break;
     case 23: block_elems = 256; block_bytes = 136; break;
     case 42: block_elems = 64; block_bytes = 18; break;
-    case 16: case 17: case 18: case 21: case 22: case 29:
+    case 16: case 17: case 18: case 19: case 21: case 22: case 29:
         block_elems = 256; block_bytes = (int) iq_row_bytes(ggml_type, 256); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
@@ -1082,7 +1094,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         break;
     case 23: native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 42: native_q2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 7: case 16: case 17: case 18: case 21: case 22: case 29:
+    case 7: case 16: case 17: case 18: case 19: case 21: case 22: case 29:
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }

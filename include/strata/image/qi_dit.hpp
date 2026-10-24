@@ -7,10 +7,14 @@
 // images' latent tokens in place of their image pads) and the image's H x W tokens (the latent's 64 channels each).
 // A text token sees the prefix up to itself, a reference image's token the prefix up to the image's end, and their
 // time is 0, so their hidden states, and their K and V in every block, are the same at every step: the first step
-// keeps the blocks' prefix K and V (the prefix cache), and the later ones compute the image's rows alone.
+// keeps the blocks' prefix K and V (the prefix cache), and the later ones compute the image's rows alone.  The cache
+// of the first blocks is in VRAM, as many as the budget gives it room for (set_prefix_vram_blocks); the rest is in
+// pinned RAM and copied in at each step (an edit with many or large reference images).
 #pragma once
 
+#include "strata/image/pipeline.hpp"
 #include "strata/image/qi_stream.hpp"
+#include "strata/image/qi_kernels.hpp"
 #include "strata/prefill/gemm.hpp"
 
 #include <cstdint>
@@ -25,11 +29,6 @@ class GgufFile;
 }
 
 namespace strata::image {
-
-/// A request stopped on its caller's word (the step callback said so).
-struct QiStopped : std::runtime_error {
-    QiStopped() : std::runtime_error("image engine: stopped") {}
-};
 
 /// Philox 4x32-10 normal values as PyTorch's CUDA randn gives them for `seed` (the generator stable-diffusion.cpp
 /// uses): value i from counter (offset, 0, i, 0) and key (seed low, seed high), Box-Muller's sine half.
@@ -59,8 +58,11 @@ public:
     };
 
     /// The text encoder's states [n_ctx][4096] (host FP32, after the system turn): projected into the sequence's
-    /// prefix, with `refs` (in order) in place of their pads; the prefix cache starts again.
-    void set_context(const float* ctx, int64_t n_ctx, const std::vector<Ref>& refs = {});
+    /// prefix, with `refs` (in order) in place of their pads; the prefix cache starts again.  `second`: the second
+    /// context (classifier-free guidance's negative prompt), which `sample` runs beside the first.
+    void set_context(const float* ctx, int64_t n_ctx, const std::vector<Ref>& refs = {}, bool second = false);
+    /// Frees the second context (a request without guidance).
+    void drop_second_context();
 
     /// out = the velocity [64][H][W] (device FP32) of the latent x (device FP32, the same shape) at time t (sigma x
     /// 1000).  `prefix`: the text rows' K and V from the cache (a step after the first of one context).
@@ -68,9 +70,12 @@ public:
 
     /// The flow sampler: x (device FP32 [64][H][W], the starting noise) through `sigmas` by Euler's steps.
     /// `step` (if set) is called after each step with (steps done, steps); it returns false to stop (the sampler then
-    /// throws QiStopped).
+    /// throws QiStopped).  `after` (if set) is given x and the step's new sigma first, on the sampler's stream (an
+    /// edit's mask: qi_inpaint_blend).  `cfg` above 1 (with a second context set): classifier-free guidance, the
+    /// velocity neg + cfg * (cond - neg) of the two contexts' (diffusers' true_cfg_scale).
     void sample(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas,
-                const std::function<bool(int, int)>& step = {});
+                const std::function<bool(int, int)>& step = {},
+                const std::function<void(float*, float)>& after = {}, float cfg = 1.0f);
 
     int64_t channels() const { return in_ch_; }
     int64_t hidden() const { return C_; }
@@ -91,10 +96,15 @@ public:
     void drop_activations();
     /// The GPU memory the activations of a T-token sequence take, the MLP computed `mlp_rows` rows at a time (0: all).
     uint64_t activation_bytes(int64_t T, int64_t mlp_rows = 0) const;
-    /// What a prefix of n rows holds while it is the context: its rows and every block's K and V (the prefix cache).
-    uint64_t prefix_bytes(int64_t n) const {
-        return (uint64_t) n * (uint64_t) C_ * (4 + (uint64_t) 4 * blocks_.size());
-    }
+    /// What a prefix of n rows holds while it is the context: its rows (always in VRAM), and one block's K and V
+    /// (the prefix cache, in VRAM or pinned RAM).
+    uint64_t prefix_row_bytes(int64_t n) const { return (uint64_t) n * (uint64_t) C_ * 4; }
+    uint64_t prefix_kv_bytes(int64_t n) const { return (uint64_t) n * (uint64_t) C_ * 4; }
+    int blocks() const { return (int) blocks_.size(); }
+    /// The blocks whose prefix cache the next set_context puts in VRAM (the first n); the rest's goes to pinned RAM.
+    void set_prefix_vram_blocks(int n) { kv_vram_ = n; }
+    /// Frees the prefix cache kept in pinned RAM (the sampling is done with it: the RAM goes back at once).
+    void drop_host_prefix();
     /// The rows the MLP takes at a time (0: all of them): its 2 x 12288-wide product is the largest activation.
     void set_mlp_rows(int64_t rows);
 
@@ -104,18 +114,35 @@ private:
         int64_t n = 0, k = 0;   // n rows of k
         const void* d = nullptr;
         uint64_t row_bytes = 0;
+        bool packed = false;    // Q8_0 rewritten for q8_mma_gemm (q8_mma_repack)
+        bool w8 = false;        // rewritten as int8 rows and a scale a row (qi_rows_i8) for prefill::Gemm::i8
     };
     struct Block {
         W q, k, v, o, gu, down;   // d: the offset within the block's region (LayerStream)
         uint64_t nq = 0, nk = 0;  // the FP32 norms' offsets
-        uint16_t *pk = nullptr, *pv = nullptr;   // the text rows' K and V (the prefix cache)
+        uint16_t *pk = nullptr, *pv = nullptr;   // the text rows' K and V (the prefix cache), device or pinned host
     };
     W upload(const std::string& name);
     const float* upload_f32(const std::string& name, float add = 0.0f);
-    void product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_t ldy = 0, int64_t row0 = 0,
-                 int64_t rows = -1);
+    // y [T][rows] (row stride ldy) = x16 . w's rows row0 .. row0 + rows - 1.  A W8A8 one (W::w8): same_input takes
+    // the previous one's int8 input again (x16 unread), and defer leaves y its int32 sums, their scales in i8_; true
+    // when it did.
+    bool product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_t ldy = 0, int64_t row0 = 0,
+                 int64_t rows = -1, bool same_input = false, bool defer = false);
+    // the int8 input of a W8A8 product of T rows of K, and the next of the two scale arrays (*sx)
+    int8_t* xq8(int64_t T, int64_t K, float** sx);
+    // the MLP's rows from m0: gate_up, SwiGLU, down, gated into x (n_text of them text rows)
+    void mlp(const W& wgu, const W& wdown, float* x, const float* gate, int64_t n_text, int64_t mr);
     void step_modulation(float t);
+    /// The rotary tables [n_text + H W][64] of a context's positions into cos and sin (device).
+    void rope_tables(const std::vector<float>& pre_pos, int64_t n_text, int64_t target_pos, int64_t H, int64_t W,
+                     float* cos, float* sin);
+    /// forward for both contexts at once, their prefixes cached (guidance after its first step): the image's rows of
+    /// the two side by side through each product, the attention one context at a time; out the first's velocity,
+    /// out2 the other's.
+    void forward_pair(const float* x, float t, int64_t H, int64_t W, float* out, float* out2);
     void ensure(int64_t T, int64_t HW);
+    void swap_context();   // the first context's state <-> other_'s
 
     std::unique_ptr<GgufFile> g_;
     void* s_ = nullptr;
@@ -124,20 +151,41 @@ private:
     uint64_t weight_bytes_ = 0;
     bool dry_ = false;
     int64_t C_ = 4096, in_ch_ = 64, heads_ = 32, inter_ = 12288, n_text_ = 0;
+    int kv_vram_ = 1 << 30;   // the blocks whose prefix cache is in VRAM (set_prefix_vram_blocks)
     W t1_, t2_, mod_, nout_, pout_, tin_, tout_, iin_;
     const float* tnorm_ = nullptr;
     std::vector<Block> blocks_;
     LayerStream blocks_stream_;
     // activations, grown on demand
     int64_t cap_T_ = 0, mlp_cap_ = 0, mlp_rows_ = 0;
+    int64_t dirty_T_ = 0;   // the most rows q16_, k16_ and v16_ were written to (the padding past a shorter T is zeroed)
     float *x_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *h_ = nullptr, *gu_ = nullptr;
     uint16_t *h16_ = nullptr, *q16_ = nullptr, *k16_ = nullptr, *v16_ = nullptr, *o16_ = nullptr;
     float *cos_ = nullptr, *sin_ = nullptr, *attn_scratch_ = nullptr;
+    // the int8 products' activations (W::packed): xq_ for xq_bytes_
+    bool packed_ = false;   // some block's products take them
+    bool w8_ = false;       // some block's products are W8A8 ones (W::w8): xq_ holds their activations
+    void* xq_ = nullptr;
+    size_t xq_bytes_ = 0;
+    float* xs_ = nullptr;    // W8A8: two arrays of xs_rows_ scales, taken in turn (xs_next_), so that a product's
+    int64_t xs_rows_ = 0;    // deferred sums keep theirs while the next input is quantized
+    int xs_next_ = 0;
+    QiI8 i8_;                // the last deferred product's scales
     int64_t rope_H_ = -1, rope_W_ = -1, rope_text_ = -1;
     float *text_ = nullptr;           // the prefix's rows [n_text][C] (the projected text, the references' tokens)
     std::vector<float> pre_pos_;      // the prefix rows' positions [n_text][3]
     int64_t target_pos_ = 0;          // the image's first position
     int32_t* key_lim_ = nullptr;      // the prefix rows' key limits, with references (null: each its own prefix)
+    // the other context (guidance's negative prompt): the same state, swapped in while it runs (swap_context)
+    struct Context {
+        float* text = nullptr;
+        int64_t n_text = 0, target_pos = 0;
+        std::vector<float> pre_pos;
+        int32_t* key_lim = nullptr;
+        std::vector<uint16_t*> pk, pv;
+        float *cos = nullptr, *sin = nullptr;   // its rotary tables (forward_pair), for this size and prefix
+        int64_t rope_H = -1, rope_W = -1, rope_text = -1, rope_cap = 0;
+    } other_;
     float *mods_ = nullptr;           // [4][2][C]: the step's modulation, row 0 the image's, row 1 the text's
     float *scale_ = nullptr;          // [2][C]: the final norm's scale (row 0)
     float *temb_ = nullptr;           // [2][C] the time embeddings (t, 0), after their SiLU

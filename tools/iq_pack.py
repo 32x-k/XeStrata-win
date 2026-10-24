@@ -32,7 +32,8 @@ shard 1).  A layer whose experts are not in shard 1 names its shard in native_ex
 may even fall inside a layer (Unsloth's UD-Q4_K_XL: layer 11's down in shard 2, its gate and up in shard 3): that
 layer's shard column is per role, `gate,up,down` (an empty field = the --gguf shard).  The file is XeStrata's
 "xs1" (its header "# xestrata native experts xs1:"): a version of XeStrata's own that upstream Strata's "v<N>" can
-never take; its lines are those of upstream's v3 / v4.  XeStrata packs written before it say "v4" and name the
+never take; its lines are those of upstream's v3 / v4.  "xs2" is xs1 with Hadamard-folded experts (prism.hadamard,
+hadamard.txt beside it), what upstream's v5 says.  XeStrata packs written before it say "v4" and name the
 three shards with spaces ("-" for the --gguf shard); the engine reads every form.  Router
 tensors stored as F32 whose values are exactly BF16 (Swift 1.5) are written as BF16, the form the engine's router
 takes (so are the other F32 tensors the engine reads as BF16, when exact); anything else is refused.
@@ -476,14 +477,31 @@ def expert_layout(model: Model, src: pathlib.Path):
     return layout, head + "".join(line + "\n" for line in lines), n_expert, offset
 
 
+NATIVE_HEAD = re.compile(r"^# xestrata native experts (xs\d+):")
+
+
+def native_experts_xs2(text: str) -> str:
+    """native_experts.txt as expert_layout writes it (xs1) -> the same table marked xs2 (Hadamard-folded experts,
+    hadamard.txt beside it), or an error string naming the version it cannot mark (upstream 4557f6805: a table of
+    another version would keep its header beside a hadamard.txt, an inconsistent pack the engine refuses)."""
+    head, rest = text.split("\n", 1) if "\n" in text else (text, "")
+    m = NATIVE_HEAD.match(head)
+    if not m or m.group(1) != "xs1":
+        found = m.group(1) if m else "without a version header (%r)" % head[:40]
+        return ("cannot mark native_experts.txt %s as xs2 for Hadamard-folded experts: only xs1 tables are "
+                "supported" % found)
+    return ("# xestrata native experts xs2:" + head[m.end():] + " - xs2: Hadamard-folded experts, see hadamard.txt\n"
+            + rest)
+
+
 HADAMARD_ROLE = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
 
 
 def hadamard_spec(meta: dict, layout, n_embd: int, n_ff: int):
-    """prism.hadamard.* (agentionai's Gyro files: routed experts stored in a block-Hadamard-rotated basis; the runtime
+    """prism.hadamard.* (Agention's APR files: routed experts stored in a block-Hadamard-rotated basis; the runtime
     must rotate their input activations, see include/strata/kernels/cpu/hadamard.hpp) -> the text of hadamard.txt,
     None for a model without the metadata, or an error string.  Anything this engine cannot apply is refused: a
-    folded weight it would run unrotated computes plausible garbage (upstream 89febede)."""
+    folded weight it would run unrotated computes plausible garbage."""
     if "prism.hadamard.version" not in meta:
         return None
     if int(meta["prism.hadamard.version"]) != 1:
@@ -547,16 +565,6 @@ def hadamard_spec(meta: dict, layout, n_embd: int, n_ff: int):
     return "\n".join(lines) + "\n"
 
 
-def mark_hadamard(text: str):
-    """native_experts.txt's header as xs2 (xs1 and hadamard.txt beside it), so an engine that cannot rotate refuses
-    the pack; None for a header other than xs1 (upstream 4557f680: never a version this packer did not write)."""
-    head, rest = text.split("\n", 1)
-    if not head.startswith("# xestrata native experts xs1:"):
-        return None
-    head = head.replace("# xestrata native experts xs1:", "# xestrata native experts xs2:", 1)
-    return head + " - xs2: Hadamard-folded experts, see hadamard.txt\n" + rest
-
-
 def experts_source(model: Model, text: str, total: int) -> dict:
     """What experts.bin is cut from: the shards (names and sizes) and the hash of native_experts.txt (every
     per-role file and offset, the formats and the blob sizes).  A same-size experts.bin of another model or
@@ -606,7 +614,7 @@ def main() -> int:
         print(got)
         return 1
     layout, text, n_expert, offset = got
-    # ---- prism.hadamard: rotated experts need hadamard.txt beside native_experts.txt, which becomes xs2 so an engine
+    # ---- prism.hadamard: rotated experts need hadamard.txt beside native_experts.txt, which becomes v5 so an engine
     # that cannot rotate refuses the pack (instead of running the folded experts on unrotated activations)
     t0 = layout[0][5]
     had = hadamard_spec(g.metadata, layout, int(t0[0].shape[0]), int(t0[2].shape[0]))
@@ -614,14 +622,13 @@ def main() -> int:
         print("prism.hadamard: " + had)
         return 1
     if had is not None:
-        marked = mark_hadamard(text)
-        if marked is None:
-            print("prism.hadamard: native_experts.txt has an unknown header: " + text.split("\n", 1)[0])
+        text = native_experts_xs2(text)
+        if not text.startswith("#"):
+            print(text)
             return 1
-        text = marked
+        n_had = sum(1 for ln in had.splitlines() if ln.startswith("layer "))
         print("prism.hadamard: %d layer(s) of Hadamard-folded experts (block %s, %s signs): hadamard.txt, "
-              "native_experts.txt xs2" % (sum(1 for ln in had.splitlines() if ln.startswith("layer ")),
-                                          g.metadata["prism.hadamard.block_size"],
+              "native_experts.txt xs2" % (n_had, g.metadata["prism.hadamard.block_size"],
                                           g.metadata["prism.hadamard.sign_mode"]))
     path = out / "experts.bin"
     sidecar = out / "experts.bin.src.json"
@@ -675,7 +682,7 @@ def main() -> int:
         had_tmp.write_text(had, encoding="utf-8", newline="\n")
         had_tmp.replace(out / "hadamard.txt")
     else:
-        (out / "hadamard.txt").unlink(missing_ok=True)      # a previous Gyro model's, packed into this folder
+        (out / "hadamard.txt").unlink(missing_ok=True)      # a previous Hadamard model's, packed into this folder
     tmp = out / "native_experts.txt.tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fo:
         fo.write(text)
@@ -691,13 +698,45 @@ def main() -> int:
     # experts.bin, and an experts.bin without its sidecar is never reused
     sidecar.unlink(missing_ok=True)
     part = out / "experts.bin.tmp"
-    with open(part, "wb") as fb:
-        for li, gt, dt, off, blob, ts in layout:
+    progress = out / "experts.bin.tmp.json"
+    # A stop part-way (a kill, a power cut) used to cost the whole write again (40 GB, minutes).  The finished layers
+    # are kept: after every layer the file is flushed to disk and experts.bin.tmp.json says how many layers are in it
+    # and which source they were cut from.  The next run continues at that layer when the source is the same and the
+    # last kept layer still matches the GGUF (upstream 970c75c8f).
+    start = 0
+    if part.exists():
+        done = read_json(progress)
+        k = done.get("layers") if isinstance(done, dict) and done.get("want") == want else None
+        if isinstance(k, int) and 0 < k <= len(layout) and \
+                part.stat().st_size >= (layout[k][3] if k < len(layout) else offset):
+            li, gt, dt, off, blob, ts = layout[k - 1]
+            with open(part, "rb") as f:
+                f.seek(off)
+                kept = f.read(n_expert * blob)
+            if kept == layer_blobs(blob, ts).tobytes():
+                start = k
+        if start:
+            print("the earlier packing was interrupted: keeping its first %d of %d layers and continuing with layer %d"
+                  % (start, len(layout), start), flush=True)
+        else:
+            print("the earlier packing was interrupted and cannot be continued: starting it again", flush=True)
+    resume_at = layout[start][3] if start < len(layout) else offset
+    with open(part, "r+b" if start else "wb") as fb:
+        if start:
+            fb.truncate(resume_at)       # whatever followed the last recorded layer is a partial write
+            fb.seek(resume_at)
+        for li, gt, dt, off, blob, ts in layout[start:]:
             fb.write(layer_blobs(blob, ts).tobytes())
+            fb.flush()
+            os.fsync(fb.fileno())
+            note = out / "experts.bin.tmp.json.new"
+            note.write_text(json.dumps({"want": want, "layers": li + 1}), encoding="utf-8")
+            note.replace(progress)
             if li % 8 == 0:
                 print("  layer %2d  %-8s/%-7s blob %8d  at %.2f GiB" % (li, ts[0].type_name, ts[2].type_name, blob,
                                                                         off / 2**30), flush=True)
     part.replace(path)
+    progress.unlink(missing_ok=True)
     side_tmp = out / "experts.bin.src.json.tmp"
     side_tmp.write_text(json.dumps(want, indent=2) + "\n", encoding="utf-8")
     side_tmp.replace(sidecar)

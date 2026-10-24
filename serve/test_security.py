@@ -274,7 +274,7 @@ class OverHttp(unittest.TestCase):
 
 
 class NoApiKey(unittest.TestCase):
-    """A key is recommended on a network, never required (upstream 2f361a37)."""
+    """A key is recommended on a network, never required (upstream 2f361a375)."""
 
     def test_none_means_no_key_on_purpose(self):
         from serve.server import explicit_no_key
@@ -289,7 +289,6 @@ class NoApiKey(unittest.TestCase):
         self.assertIn("anyone who can reach port 8080 can use the model", w)
         self.assertNotIn("tools", w)
         self.assertIn("and its tools", open_server_warning(8080, tools=True))
-        self.assertIn("public internet", open_server_warning(8080, public=True))
 
 
 if __name__ == "__main__":

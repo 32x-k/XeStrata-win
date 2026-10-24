@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: MIT
 """Tests for the server address tools/strata_bench.py polls, without starting one.
 
     python -m unittest tools.test_bench_host

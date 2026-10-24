@@ -23,18 +23,46 @@ case "$cuda_ver" in
   13.*) archs="sm_75;sm_80;sm_86;sm_89;sm_90" ;;
 esac
 
+# cuDNN's headers, for the image engine's attention: from NVIDIA's redistributable archive for the CUDA version's major
+# (neither Ubuntu nor NVIDIA's Fedora repository has them), its SHA-256 checked, kept in the downloads' cache, into
+# /opt/cudnn.  At run time the engine opens cuDNN and the CUDA runtime cudnn-frontend opens where setup tells the user
+# to put them with pip (nvidia_pip: the data folder's nvidia-libs/, on the engine's library path), the same on every
+# distribution: neither Ubuntu's nor Fedora's own repositories have cuDNN for CUDA 13, and NVIDIA's are not used
+cudnn_headers() {
+  case "${cuda_ver%%.*}" in
+    12) cudnn_tar="cudnn-linux-x86_64-9.27.0.42_cuda12-archive.tar.xz"
+        cudnn_sha=dc45f8c5fd44955c6e950c690ea92c28ea848ffb1fefbaabf3a9d175d961263a
+        nvidia_pip="nvidia-cudnn-cu12, nvidia-cuda-runtime-cu12" ;;
+    *) cudnn_tar="cudnn-linux-x86_64-9.27.0.42_cuda13-archive.tar.xz"
+       cudnn_sha=dd3245ba3aca8593934fc946d08649ad3a5ee8500e8da3870bc23bf7ddccd7f9
+       nvidia_pip="nvidia-cudnn-cu13, nvidia-cuda-runtime==13.*" ;;
+  esac
+  [ -f "/cache/$cudnn_tar" ] || curl -fsSL -o "/cache/$cudnn_tar" \
+    "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/$cudnn_tar"
+  echo "$cudnn_sha  /cache/$cudnn_tar" | sha256sum -c -
+  mkdir -p /opt/cudnn
+  tar -xJf "/cache/$cudnn_tar" -C /opt/cudnn --strip-components=1 --wildcards '*/include/*'
+  cudnn_root=/opt/cudnn
+}
+
 intel_key=https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+# oneMKL's series (setup.py's ONEMKL_SERIES: the newest whose SYCL library runs on intel/llvm 7.1.1's runtime); the
+# packages suggest the package of the library the engine links, so this series
+mkl_series=$(sed -n 's/^ONEMKL_SERIES = "\(.*\)"$/\1/p' "$src/setup.py")
 case "$distro" in
   ubuntu*)
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -q
     apt-get install -y -q --no-install-recommends git cmake ninja-build g++ libhwloc-dev libzstd-dev python3 \
-      patchelf curl ca-certificates unzip libblosc2-dev libvulkan-dev glslc spirv-headers dpkg-dev file gpg ccache lld opencl-headers
+      patchelf curl ca-certificates unzip libblosc2-dev libvulkan-dev glslc spirv-headers dpkg-dev file gpg ccache lld opencl-headers \
+      xz-utils
     python_deps="python3 (>= 3.10), python3-numpy, python3-jinja2, python3-regex, python3-yaml, python3-tqdm, \
 python3-requests, python3-pil, python3-psutil"
     # Ubuntu's libze-intel-gpu1 does not depend on the graphics compiler it opens (libigc2, libigdfcl2): without them
     # the driver aborts at the first kernel
     level_zero="libze1, libze-intel-gpu1, libigc2, libigdfcl2"
+    # oneDNN's SDPA (the image engine's attention on Intel GPUs) runs on OpenCL: Intel's driver and the ICD loader
+    opencl="intel-opencl-icd, ocl-icd-libopencl1"
     vulkan_icd="mesa-vulkan-drivers"
     if [ "$license" = contrib ]; then
       case "$cuda_ver" in
@@ -44,11 +72,12 @@ python3-requests, python3-pil, python3-psutil"
            apt-get install -y -q --no-install-recommends "cuda-toolkit-$v"
            cuda_path=/usr/local/cuda-$cuda_ver cublas=libcublas-$v ;;
       esac
+      cudnn_headers
       curl -fsSL "$intel_key" | gpg --dearmor > /usr/share/keyrings/oneapi-archive-keyring.gpg
       echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
         > /etc/apt/sources.list.d/oneAPI.list
       apt-get update -q
-      apt-get install -y -q --no-install-recommends intel-oneapi-mkl-sycl-devel
+      apt-get install -y -q --no-install-recommends "intel-oneapi-mkl-sycl-devel-$mkl_series"
     fi
     # ROCm (universe, free software), for AMD GPUs in every package: HIP for intel/llvm's HIP target and adapter, the
     # device libraries the AMD code links, ROCm's clang with its runtime (HIP's CMake package), rocBLAS and hipBLASLt
@@ -62,17 +91,18 @@ python3-requests, python3-pil, python3-psutil"
     python_deps="python3 >= 3.10, python3-numpy, python3-jinja2, python3-regex, python3-pyyaml, python3-tqdm, \
 python3-requests, python3-pillow, python3-psutil"
     level_zero="oneapi-level-zero, intel-level-zero"
+    opencl="intel-opencl, OpenCL-ICD-Loader"   # as on Ubuntu
     vulkan_icd="mesa-vulkan-drivers"
     if [ "$license" = contrib ]; then
       dnf install -y -q dnf5-plugins   # config-manager
       dnf config-manager addrepo \
         --from-repofile=https://developer.download.nvidia.com/compute/cuda/repos/fedora44/x86_64/cuda-fedora44.repo
       v=$(echo "$cuda_ver" | tr . -)
-      dnf install -y -q "cuda-toolkit-$v"
+      dnf install -y -q "cuda-toolkit-$v" xz
       cuda_path=/usr/local/cuda-$cuda_ver
-      # by its package's name, as on Ubuntu: dnf gives libcublas.so.13()(64bit) to DCGM's private copy
-      # (datacenter-gpu-manager-4-cuda13-cublas, in /usr/libexec), which the engine does not find
-      cublas=libcublas-$v
+      cudnn_headers
+      # cuBLAS too from pip at run time: Fedora's own repositories have none (the build takes NVIDIA's toolkit)
+      nvidia_pip="$nvidia_pip, nvidia-cublas==${cuda_ver%%.*}.*" cublas=
       cat > /etc/yum.repos.d/oneAPI.repo <<EOF
 [oneAPI]
 name=Intel oneAPI repository
@@ -82,7 +112,7 @@ gpgcheck=1
 repo_gpgcheck=1
 gpgkey=$intel_key
 EOF
-      dnf install -y -q intel-oneapi-mkl-sycl-devel
+      dnf install -y -q "intel-oneapi-mkl-sycl-devel-$mkl_series"
     fi
     # ROCm, for AMD GPUs in every package (as on Ubuntu above)
     dnf install -y -q rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel \
@@ -95,7 +125,6 @@ esac
 # apart; the compilers are compared by their content, as intel/llvm's clang is built anew in each container.
 if [ -n "${CCACHE_DIR:-}" ]; then
   export CMAKE_C_COMPILER_LAUNCHER=ccache CMAKE_CXX_COMPILER_LAUNCHER=ccache CCACHE_COMPILERCHECK=content
-  trap 'chown -R "$XESTRATA_UID:$XESTRATA_GID" "$CCACHE_DIR"' EXIT
   ccache -z
 fi
 if [ "$license" = contrib ]; then
@@ -139,7 +168,7 @@ set -- -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
 if [ "$license" = contrib ]; then
   # the PTX version: the toolkit's (empty); the driver must support this CUDA version
   set -- "$@" -DSTRATA_CUDA_ARCHS="$archs" -DSTRATA_ONEMKL=ON -DMKL_ROOT=/opt/intel/oneapi/mkl/latest \
-    -DSTRATA_CUDA_PATH="$cuda_path" -DSTRATA_CUDA_PTX=
+    -DSTRATA_CUDA_PATH="$cuda_path" -DSTRATA_CUDA_PTX= ${cudnn_root:+-DSTRATA_CUDNN_ROOT=$cudnn_root}
 fi
 cmake -G Ninja -S "$src" -B /build/engine "$@"
 targets="strata strata-image onemath_backend_libs"   # oneMath's backends: rocBLAS (AMD GPUs) in every package
@@ -164,7 +193,7 @@ pkg_of() {
 }
 rocm="$(pkg_of libamdhip64.so), $(pkg_of librocblas.so), $(pkg_of libhipblaslt.so)"
 if [ "$license" = free ]; then
-  recommends="$level_zero, $rocm, $vulkan_icd"
+  recommends="$level_zero, $opencl, $rocm, $vulkan_icd"
 else
   # and oneMKL's
   mkl=$(readlink -f /opt/intel/oneapi/mkl/latest/lib/libmkl_sycl_blas.so)
@@ -172,14 +201,17 @@ else
     ubuntu*) mklpkg=$(dpkg -S "$mkl" | cut -d: -f1) ;;
     fedora*) mklpkg=$(rpm -qf --qf '%{NAME}' "$mkl") ;;
   esac
-  suggests="$level_zero, $vulkan_icd, $cublas, $mklpkg, $rocm"
+  suggests="$level_zero, $opencl, $vulkan_icd${cublas:+, $cublas}, $mklpkg, $rocm"
 fi
 # the same, by GPU maker, for setup to tell what a PC lacks (BUILD.json's "runtime"): what each maker's GPUs need,
-# and in the contrib packages oneMKL and cuBLAS, which make them faster
+# and in the contrib packages oneMKL and cuBLAS, which make them faster, and pip's names of NVIDIA's libraries setup
+# names for the data folder (nvidia_pip: cuDNN and the CUDA runtime, the image engine's attention; Fedora's cuBLAS)
 json_list() { printf '["%s"]' "$(echo "$1" | sed 's/, */", "/g')"; }
-runtime="{\"intel\": $(json_list "$level_zero"), \"amd\": $(json_list "$rocm")"
+runtime="{\"intel\": $(json_list "$level_zero"), \"onednn\": $(json_list "$opencl"), \"amd\": $(json_list "$rocm")"
 if [ "$license" = contrib ]; then
-  runtime="$runtime, \"onemkl\": $(json_list "$mklpkg"), \"cublas\": $(json_list "$cublas")"
+  runtime="$runtime, \"onemkl\": $(json_list "$mklpkg")"
+  [ -n "$cublas" ] && runtime="$runtime, \"cublas\": $(json_list "$cublas")"
+  runtime="$runtime, \"nvidia_pip\": $(json_list "$nvidia_pip")"
 fi
 runtime="$runtime}"
 case "$distro" in
@@ -193,7 +225,7 @@ case "$distro" in
     # its own assignment, so that set -e stops on a failure (in a pipe the last command's status would hide it)
     # shellcheck disable=SC2046
     substvars=$(cd /stage && dpkg-shlibdeps -O --ignore-missing-info -l"$eng/lib" "$eng"/strata "$eng"/strata-image "$eng"/strata-vision-* \
-      $(find "$eng/lib" -type f \( -name 'libsycl.so*' -o -name 'libur_loader.so*' -o -name 'libumf.so*' \
+      $(find "$eng/lib" -type f \( -name 'libsycl.so*' -o -name 'libumf.so*' \
         -o -name 'libur_adapter_level_zero*' -o -name 'libonemath.so*' \)))
     shlibs=$(echo "$substvars" | sed -n 's/^shlibs:Depends=//p')
     if [ -z "$shlibs" ]; then
@@ -226,4 +258,3 @@ find . -maxdepth 1 \( -name '*.deb' -o -name '*.rpm' \) -exec cp {} /out/ \;
     fedora*) rpm -qa --qf '  %{NAME} %{VERSION}-%{RELEASE}\n' | sort ;;
   esac
 } > /out/BUILDINFO
-chown -R "$XESTRATA_UID:$XESTRATA_GID" /out

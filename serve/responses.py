@@ -668,6 +668,8 @@ class Assembler:
         elif x.get("event") == "result" and self.item is not None and self.item["type"] == "image_generation_call":
             urls = x.get("images") or []
             self.item["result"] = image_b64(urls[0]) if urls else None
+            # what OpenAI's item says of the image: its size, quality, background, format and the prompt used
+            self.item.update(x.get("image") or {})
             if x.get("ok") and self.item["result"]:
                 out.append(self.event("response.image_generation_call.completed", item_id=self.item["id"],
                                       output_index=self.index))

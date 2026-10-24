@@ -6,9 +6,8 @@ project(XeStrata LANGUAGES CXX)
 if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
   message(FATAL_ERROR "XeStrata builds for Linux and Windows")
 endif()
-# On Windows the AMD GPUs build through intel/llvm's HIP target (third_party/main/intel-llvm/patches 90-92)
-set(STRATA_UPSTREAM_VERSION "0.1.45")
-set(STRATA_UPSTREAM_COMMIT "a0116b2")
+set(STRATA_UPSTREAM_VERSION "0.2.2")
+set(STRATA_UPSTREAM_COMMIT "011c9e6")
 # XeStrata's version follows the upstream version it has integrated, marked "xe" so it is not taken for upstream's.
 # XESTRATA_REVISION counts XeStrata's releases on that upstream version from 1, as a Debian revision does, and the
 # version is <upstream>-<revision> everywhere: the version name (the tag, what the engine says) xe<upstream>-<revision>
@@ -17,6 +16,10 @@ set(STRATA_UPSTREAM_COMMIT "a0116b2")
 set(XESTRATA_REVISION 1)
 set(XESTRATA_VERSION "${STRATA_UPSTREAM_VERSION}-${XESTRATA_REVISION}")
 set(STRATA_VERSION_NAME "xe${XESTRATA_VERSION}")
+# The packages' version: an upstream pre-release (0.2.0-beta) with "~" for its "-" (0.2.0~beta), which deb and rpm
+# sort before the release it leads to (0.2.0), so the release's package upgrades it.  The version name keeps the "-":
+# a git tag cannot hold a "~".
+string(REPLACE "-" "~" XESTRATA_PACKAGE_UPSTREAM "${STRATA_UPSTREAM_VERSION}")
 add_compile_definitions(STRATA_VERSION="${STRATA_VERSION_NAME}"
   STRATA_BACKEND="xe" STRATA_UPSTREAM_VERSION="${STRATA_UPSTREAM_VERSION}"
   STRATA_UPSTREAM_COMMIT="${STRATA_UPSTREAM_COMMIT}")
@@ -111,6 +114,19 @@ if(STRATA_LICENSE STREQUAL "contrib")
   message(STATUS "contrib: NVIDIA architectures '${_strata_cuda_archs}', oneMKL backend ${_strata_onemkl}")
 endif()
 message(STATUS "AMD architectures '${_strata_hip_archs}'")
+
+# upstream #3202: Windows hands a program its command line in the system's ANSI code page (cp1251 on a Russian Windows,
+# cp1252 on an English one), but the engine reads every path as UTF-8 (the run configs and the server write UTF-8): a
+# model folder with Cyrillic letters arrived as other bytes, or as "?", and did not open.  The manifest makes the
+# process's ANSI code page UTF-8 (Windows 10 1903 and newer; older Windows ignores it), so the command line, fopen and
+# std::ifstream take UTF-8.  lld-link merges it into the manifest it embeds (/MANIFESTINPUT).
+function(strata_utf8_manifest target)
+  if(WIN32)
+    # a .manifest source reaches only MSVC's link: clang's GNU driver passes the file to lld-link itself
+    set(_manifest "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/cmake/strata-utf8.manifest")
+    target_link_options(${target} PRIVATE "LINKER:/MANIFESTINPUT:${_manifest}")
+  endif()
+endfunction()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -357,6 +373,14 @@ if(STRATA_ENABLE_XE)
   target_link_options(strata_sycl INTERFACE -fsycl ${_strata_sycl_targets} -foffload-fp32-prec-div
                       -foffload-fp32-prec-sqrt -fsycl-max-parallel-link-jobs=${_strata_link_jobs}
                       "SHELL:${_strata_spirv_translator} --spirv-ext=+SPV_KHR_integer_dot_product")
+  # The SYCL runtime's own libraries beside libsycl, for the linker to find what libsycl's libraries need: where the
+  # system's Level Zero is new enough (Fedora 44), intel/llvm v7.2.0 builds UR's loader as a library of its own, and
+  # ld.bfd warned at every link that the libumf it needs was not found.
+  if(NOT WIN32)
+    get_filename_component(_strata_sycl_lib "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(_strata_sycl_lib "${_strata_sycl_lib}/../lib" ABSOLUTE)
+    target_link_options(strata_sycl INTERFACE "LINKER:-rpath-link,${_strata_sycl_lib}")
+  endif()
 
   add_library(strata_core STATIC src/core/device.cpp src/core/pinned.cpp src/core/gpu.cpp src/core/graph.cpp
                                  src/core/weights.cpp src/core/layout.cpp)
@@ -364,6 +388,7 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata_core PUBLIC strata_sycl strata_warnings strata_plan strata_platform)
 
   add_executable(strata-device src/core/device_main.cpp)
+  strata_utf8_manifest(strata-device)
   target_link_libraries(strata-device PRIVATE strata_core strata_kernels_cpu)   # --cpu: the engine's CPU tests
   add_executable(strata-load src/core/load_main.cpp)
   target_link_libraries(strata-load PRIVATE strata_core)
@@ -387,11 +412,11 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/s2_expert_grouped.cpp src/kernels/xe/qsa_prompt_attn.cpp
                                     src/kernels/xe/xmx_gemm.cpp src/kernels/xe/dp4a_gemm.cpp
                                     src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp src/kernels/xe/prompt_attn.cpp
-                                    src/kernels/xe/matrix_report.cpp)
+                                    src/kernels/xe/q8_mma.cpp
+                                    src/kernels/xe/matrix_report.cpp src/kernels/xe/glm5.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_ngram)
-  # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/main/ggml),
-  # and the trellis formats' (third_party/main/ggml-tq)
-  target_include_directories(strata_kernels PRIVATE third_party/main/ggml third_party/main/ggml-tq)
+  # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/main/ggml)
+  target_include_directories(strata_kernels PRIVATE third_party/main/ggml)
   # Packed embeddings require separate multiply/add rounding; parity also checks signed zero.
   target_compile_options(strata_kernels PRIVATE -fno-fast-math -ffp-contract=off)
 
@@ -400,8 +425,8 @@ if(STRATA_ENABLE_XE)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/verify.cpp src/core/moe_window.cpp
-                                   src/core/plain_model.cpp src/core/pcie_split.cpp src/core/mtp.cpp
-                                   src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
+                                   src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/pcie_split.cpp
+                                   src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/vmm.cpp)
   target_include_directories(strata_engine PUBLIC include)
@@ -442,7 +467,7 @@ if(STRATA_ENABLE_XE)
       target_link_libraries(pinned_shared_test PRIVATE strata_engine)
       add_test(NAME pinned_shared_test COMMAND pinned_shared_test)
     endif()
-    foreach(core_gpu_test expert_cache_per_layer_test native_dense_ple_key_test vmm_test)
+    foreach(core_gpu_test expert_cache_per_layer_test expert_cache_pieces_test native_dense_ple_key_test vmm_test)
       add_executable(${core_gpu_test} tests/core/${core_gpu_test}.cpp)
       target_link_libraries(${core_gpu_test} PRIVATE strata_engine)
       add_test(NAME ${core_gpu_test} COMMAND ${core_gpu_test})
@@ -483,15 +508,48 @@ if(STRATA_ENABLE_XE)
   if(NOT STRATA_LICENSE STREQUAL "contrib")
     set(_strata_onemkl OFF)   # oneMKL is not free software
   endif()
-  # Windows: oneMath's FindcuBLAS finds Linux's libraries only, so there the Intel and NVIDIA GPUs take XeStrata's own
-  # kernels; the AMD GPUs' rocBLAS backend builds against the ROCm SDK (STRATA_ROCM_ROOT)
-  if(WIN32 AND (_strata_onemkl OR _strata_cuda_archs))
-    set(_strata_onemath_default OFF)
-  else()
-    set(_strata_onemath_default ON)
+  # Windows: oneMKL's backend, which runs where oneMKL is installed, and cuBLAS's where the build has Windows' import
+  # libraries for cuBLAS and the CUDA runtime (STRATA_CUDA_WINDOWS_LIBS: those of NVIDIA's redistributable archives) and
+  # the CUDA headers in its include/ (tools/package/windows.sh; a Linux toolkit's can sit among the build machine's C
+  # library's, as Ubuntu's do), which runs where cuBLAS is installed (the engine adds both's folders to the DLL search,
+  # src/prefill/gemm.cpp); and rocBLAS's where the build has rocBLAS's and hipBLASLt's headers and Windows'
+  # import libraries (STRATA_ROCM_WINDOWS_LIBS: tools/package/win_rocm.sh) and the Windows HIP's (beside the SYCL
+  # runtime for Windows, tools/intel_llvm_build.py), which runs where AMD's Python packages put rocBLAS and hipBLASLt
+  set(STRATA_CUDA_WINDOWS_LIBS "" CACHE PATH
+      "Windows: the folder of cuBLAS's, the CUDA runtime's and the CUDA driver's import libraries (oneMath's cuBLAS)")
+  set(STRATA_ROCM_WINDOWS_LIBS "" CACHE PATH
+      "Windows: rocBLAS's and hipBLASLt's headers (include/) and import libraries (lib/) (oneMath's rocBLAS)")
+  set(_strata_math_cuda "${_strata_cuda_archs}")
+  set(_strata_math_hip "${_strata_hip_archs}")
+  if(WIN32 AND CMAKE_CROSSCOMPILING)
+    set(_strata_rocm_win_hip "${STRATA_SYCL_WINDOWS}/../hip")
+    if(_strata_math_hip AND EXISTS "${STRATA_ROCM_WINDOWS_LIBS}/lib/rocblas.lib"
+       AND EXISTS "${_strata_rocm_win_hip}/lib/amdhip64.lib")
+      # the fork's rocBLAS backend takes these in a cross build for Windows
+      set(ROCM_WINDOWS_INCLUDE "${STRATA_ROCM_WINDOWS_LIBS}/include;${_strata_rocm_win_hip}/include")
+      set(HIP_WINDOWS_LIBRARY "${_strata_rocm_win_hip}/lib/amdhip64.lib")
+      set(ROCBLAS_WINDOWS_LIBRARY "${STRATA_ROCM_WINDOWS_LIBS}/lib/rocblas.lib")
+      set(HIPBLASLT_WINDOWS_LIBRARY "${STRATA_ROCM_WINDOWS_LIBS}/lib/hipblaslt.lib")
+    else()
+      set(_strata_math_hip "")
+    endif()
+    if(_strata_math_cuda AND EXISTS "${STRATA_CUDA_WINDOWS_LIBS}/cublas.lib"
+       AND EXISTS "${STRATA_CUDA_WINDOWS_LIBS}/include/cublas_v2.h")
+      set(_strata_cuda_cublas ON)
+      set(CUDA_TOOLKIT_INCLUDE "${STRATA_CUDA_WINDOWS_LIBS}/include" CACHE PATH "the CUDA headers (oneMath's cuBLAS)"
+          FORCE)
+      foreach(lib cublas CUDART CUDA)
+        string(TOLOWER ${lib} file)
+        set(CUDA_${lib}_LIBRARY "${STRATA_CUDA_WINDOWS_LIBS}/${file}.lib" CACHE FILEPATH "an import library" FORCE)
+      endforeach()
+    else()
+      set(_strata_math_cuda "")
+    endif()
   endif()
-  option(STRATA_ENABLE_ONEMATH "Build oneMath dense-product backends" ${_strata_onemath_default})
-  if(STRATA_ENABLE_ONEMATH AND (_strata_onemkl OR _strata_cuda_archs OR _strata_hip_archs))
+  # a build on Windows itself (not a cross build) finds HIP and rocBLAS as on Linux, through CMAKE_PREFIX_PATH and
+  # STRATA_ROCM_ROOT (the ROCm SDK of AMD's Python packages); STRATA_ENABLE_ONEMATH=OFF builds no backend at all
+  option(STRATA_ENABLE_ONEMATH "Build oneMath dense-product backends" ON)
+  if(STRATA_ENABLE_ONEMATH AND (_strata_onemkl OR _strata_math_cuda OR _strata_math_hip))
     if(_strata_onemkl AND NOT MKL_ROOT)
       if(DEFINED ENV{MKLROOT})
         set(MKL_ROOT $ENV{MKLROOT})
@@ -499,16 +557,22 @@ if(STRATA_ENABLE_XE)
         set(MKL_ROOT /opt/intel/oneapi/mkl/latest)
       endif()
     endif()
+    if(_strata_onemkl AND CMAKE_CROSSCOMPILING AND MKL_ROOT)
+      # a Windows cross build searches only under its roots (cmake/toolchain-windows-msvc.cmake): oneMKL's for Windows
+      list(APPEND CMAKE_FIND_ROOT_PATH "${MKL_ROOT}")
+    endif()
     # oneMath's options as plain variables (its policy CMP0077 takes them); shared libraries for this folder only, as
     # ggml is static
     set(BUILD_SHARED_LIBS ON)
     set(TARGET_DOMAINS blas)
     set(ENABLE_MKLCPU_BACKEND OFF)
     set(ENABLE_MKLGPU_BACKEND ${_strata_onemkl})
-    if(_strata_hip_archs)
+    if(_strata_math_hip)
       # the backend's own GPU code takes one architecture (the products themselves run inside rocBLAS and hipBLASLt)
       set(ENABLE_ROCBLAS_BACKEND ON)
       list(GET _strata_hip_archs 0 HIP_TARGETS)
+    endif()
+    if(_strata_math_hip AND NOT CMAKE_CROSSCOMPILING)   # a cross build has the Windows libraries above
       strata_hip_cxx(HIP_CXX_COMPILER)
       strata_hip_prefixes(_strata_rocm_prefixes)        # after what is given: AMD's trees, for find_package(hip)
       list(APPEND CMAKE_PREFIX_PATH ${_strata_rocm_prefixes})
@@ -527,7 +591,7 @@ if(STRATA_ENABLE_XE)
                                  "slower on some GPUs")
       endif()
     endif()
-    if(_strata_cuda_archs AND _strata_cuda_cublas)
+    if(_strata_math_cuda AND _strata_cuda_cublas)
       set(ENABLE_CUBLAS_BACKEND ON)
       # the backend's own GPU code for the oldest architecture, which every NVIDIA GPU here runs (its default, sm_75's
       # PTX, does not run on an sm_70 GPU)
@@ -538,7 +602,7 @@ if(STRATA_ENABLE_XE)
       # container) the toolkit's link stub, which names the same libcuda.so.1 the driver gives at run time.  It goes on
       # the library path while oneMath is added: FindCUDA clears CUDA_CUDA_LIBRARY on its first run and searches again.
       find_library(_strata_libcuda cuda NO_CACHE HINTS "${_strata_cuda_root}/lib64" "${_strata_cuda_root}/lib")
-      if(NOT _strata_libcuda)
+      if(NOT _strata_libcuda AND NOT WIN32)
         find_path(_strata_libcuda_stubs libcuda.so NO_CACHE NO_DEFAULT_PATH
                   PATHS "${_strata_cuda_root}/lib64/stubs" "${_strata_cuda_root}/lib/stubs"
                         "${_strata_cuda_root}/targets/${CMAKE_SYSTEM_PROCESSOR}-linux/lib/stubs"
@@ -563,8 +627,8 @@ if(STRATA_ENABLE_XE)
       set(_strata_onemath_url URL ${STRATA_ONEMATH_SOURCE})
     else()
       set(_strata_onemath_url
-        URL https://github.com/MistVVK/oneMath/archive/refs/tags/xestrata-3.tar.gz
-        URL_HASH SHA256=9a5203102002e5e85f1ad4a8b91b9f6134365f016bba1a430b038df95517e61d)
+        URL https://github.com/MistVVK/oneMath/archive/refs/tags/xestrata-10.tar.gz
+        URL_HASH SHA256=efda4bf89d1624fc8c70c63508489ed8eef24ad62c962d80b3f52717abd0841b)
     endif()
     # another archive is another tree: start from it again
     if(NOT "${_strata_onemath_url}" STREQUAL "${_STRATA_ONEMATH_KEY}")
@@ -576,24 +640,6 @@ if(STRATA_ENABLE_XE)
       SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_onemath-src
       SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_onemath-subbuild)
     set(_STRATA_ONEMATH_KEY "${_strata_onemath_url}" CACHE INTERNAL "the archive the oneMath tree came from")
-    if(WIN32 AND NOT STRATA_ONEMATH_SOURCE)
-      # oneMath on Windows with intel/llvm's clang++ (a GNU-style driver) and its rocBLAS backend there, until the
-      # fork carries it (third_party/main/oneMath/patches); applied once to the extracted tree, which is outside any
-      # Git repository for the command (the ceiling)
-      find_package(Git REQUIRED)
-      set(_strata_om_patch "${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/oneMath/patches/windows-gnu-driver.patch")
-      set(_strata_om_git ${CMAKE_COMMAND} -E env "GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}/_deps" ${GIT_EXECUTABLE})
-      execute_process(COMMAND ${_strata_om_git} apply --reverse --check "${_strata_om_patch}"
-                      WORKING_DIRECTORY ${strata_onemath_SOURCE_DIR} RESULT_VARIABLE _strata_om_applied
-                      OUTPUT_QUIET ERROR_QUIET)
-      if(NOT _strata_om_applied EQUAL 0)
-        execute_process(COMMAND ${_strata_om_git} apply "${_strata_om_patch}"
-                        WORKING_DIRECTORY ${strata_onemath_SOURCE_DIR} RESULT_VARIABLE _strata_om_r)
-        if(NOT _strata_om_r EQUAL 0)
-          message(FATAL_ERROR "oneMath: ${_strata_om_patch} does not apply to ${strata_onemath_SOURCE_DIR}")
-        endif()
-      endif()
-    endif()
     add_subdirectory(${strata_onemath_SOURCE_DIR} ${CMAKE_BINARY_DIR}/onemath EXCLUDE_FROM_ALL)
     unset(CMAKE_POLICY_DEFAULT_CMP0126)
     # ROCm's device libraries for the rocBLAS backend's own GPU code, and the CUDA toolkit and PTX version for the
@@ -606,6 +652,26 @@ if(STRATA_ENABLE_XE)
     if(_strata_cuda_base_opts AND TARGET onemath_blas_cublas)
       target_compile_options(onemath_blas_cublas_obj PRIVATE ${_strata_cuda_base_opts})
       target_link_options(onemath_blas_cublas PRIVATE ${_strata_cuda_base_opts})
+    endif()
+    # Windows: oneMKL's MKLConfig.cmake links its SYCL targets with -fsycl-allow-device-image-dependencies, and with it
+    # intel/llvm v7.2.0's driver puts /INCLUDE:__imp_<a symbol> of every library on the line into the link - of the MSVC
+    # runtime's, time_get<...>::_Getvals (which every SYCL object also defines: a duplicate), HUGE of oldnames.lib and a
+    # 32-bit _set_invalid_parameter_handler of msvcrt.lib (not resolved), and onemath_blas_mklgpu.dll's link stopped.
+    # The backend's device code calls no device function of another library, so the dependencies are not needed there.
+    if(WIN32)
+      foreach(mkl_t MKL::MKL_SYCL MKL::MKL_SYCL::BLAS MKL::MKL_DPCPP)
+        if(TARGET ${mkl_t})
+          get_target_property(_strata_mkl_real ${mkl_t} ALIASED_TARGET)
+          if(NOT _strata_mkl_real)
+            set(_strata_mkl_real ${mkl_t})
+          endif()
+          get_target_property(_strata_mkl_libs ${_strata_mkl_real} INTERFACE_LINK_LIBRARIES)
+          if(_strata_mkl_libs)
+            list(REMOVE_ITEM _strata_mkl_libs -fsycl-allow-device-image-dependencies)
+            set_target_properties(${_strata_mkl_real} PROPERTIES INTERFACE_LINK_LIBRARIES "${_strata_mkl_libs}")
+          endif()
+        endif()
+      endforeach()
     endif()
     unset(BUILD_SHARED_LIBS)
     if(_strata_libcuda_stubs)
@@ -620,7 +686,8 @@ if(STRATA_ENABLE_XE)
   # src/kernels/xe/iq_mmq.cpp is written for, and the FP16 GEMM path elsewhere.  Upstream 0.1.38's quantized and fused
   # expert products on the decode kernels' DP4a dots ran at 0.34x and 0.25x of it on the B70 and were dropped.
   add_library(strata_prefill STATIC src/prefill/gemm.cpp src/prefill/kernels.cpp src/prefill/prefill.cpp
-                                    src/prefill/moe_mmq.cpp src/prefill/plain_prompt.cpp)
+                                    src/prefill/moe_mmq.cpp src/prefill/plain_prompt.cpp
+                                    src/prefill/plain_prompt_glm5.cpp)
   target_include_directories(strata_prefill PUBLIC include)
   target_link_libraries(strata_prefill PUBLIC strata_engine)
   if(TARGET onemath)
@@ -628,12 +695,23 @@ if(STRATA_ENABLE_XE)
     # -fsycl-targets=nvptx64-nvidia-cuda on them, which would replace the engine's own targets
     add_dependencies(strata_prefill onemath)
     target_include_directories(strata_prefill SYSTEM PRIVATE $<TARGET_PROPERTY:onemath,INTERFACE_INCLUDE_DIRECTORIES>)
-    target_link_libraries(strata_prefill PRIVATE $<TARGET_LINKER_FILE:onemath>)
+    target_link_libraries(strata_prefill PRIVATE $<TARGET_LINKER_FILE:onemath>)   # Windows: its import library
     target_compile_definitions(strata_prefill PRIVATE STRATA_ONEMATH=1)
+    # the series of the oneMKL the build links ("2026.2", from its mkl_version.h): the Windows engine looks for that
+    # series's DLLs first (src/prefill/gemm.cpp), as another's SYCL library may not load on the engine's runtime
+    if(_strata_onemkl AND MKL_ROOT AND EXISTS "${MKL_ROOT}/include/mkl_version.h")
+      file(STRINGS "${MKL_ROOT}/include/mkl_version.h" _strata_mkl_v REGEX "#define[ \t]+INTEL_MKL_VERSION[ \t]")
+      string(REGEX MATCH "[0-9]+$" _strata_mkl_v "${_strata_mkl_v}")
+      math(EXPR _strata_mkl_year "${_strata_mkl_v} / 10000")
+      math(EXPR _strata_mkl_update "${_strata_mkl_v} / 100 % 100")
+      target_compile_definitions(strata_prefill PRIVATE
+                                 STRATA_ONEMKL_SERIES="${_strata_mkl_year}.${_strata_mkl_update}")
+    endif()
   endif()
 
   # `strata generate` (P2.S6): the program that composes the components into tokens
   add_executable(strata src/program/generate.cpp src/program/plain_generate.cpp src/program/option_scope.cpp)
+  strata_utf8_manifest(strata)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 
   # the image engine (Qwen-Image-2.1's DiT, src/image/): its kernels and the DiT; strata-image-probe, one block of the
@@ -641,8 +719,235 @@ if(STRATA_ENABLE_XE)
   # against stable-diffusion.cpp's values, timed
   add_library(strata_image STATIC src/image/qi_kernels.cpp src/image/qi_attn.cpp src/image/qi_dit.cpp
                            src/image/qi_vae.cpp src/image/qi_text.cpp src/image/qi_pipeline.cpp
-                           src/image/qi_stream.cpp src/image/qi_vision.cpp src/image/qi_image_io.cpp)
+                           src/image/mf_vae.cpp src/image/mf_dit.cpp
+                           src/image/mf_pipeline.cpp
+                           src/image/qi_stream.cpp src/image/qi_vision.cpp src/image/qi_image_io.cpp
+                           src/image/qi_sdpa.cpp)
   target_include_directories(strata_image PUBLIC include)
+  # The image attention's vendors' kernels (src/image/qi_sdpa.cpp), the engine's own kernel where none takes it.
+  # Intel GPUs: oneDNN's SDPA (Apache-2.0, https://github.com/uxlfoundation/oneDNN at the tag pinned here; Ubuntu's
+  # libdnnl-sycl is built for another SYCL runtime than intel/llvm's), built with the engine's compiler for Intel GPUs
+  # only (its SYCL GPU runtime, no CPU runtime) beside the build, and linked to the image engine alone (the text engine
+  # does not load it).  Windows: cross-built as the engine is, without its VTune hooks (their assembly is MASM's).
+  option(STRATA_ONEDNN "the image attention through oneDNN's SDPA on Intel GPUs" ON)
+  set(STRATA_ONEDNN_SOURCE "" CACHE STRING
+      "oneDNN's source archive (a local file or URL) to build from (empty: fetch the pinned one)")
+  # the projects built beside the engine for Windows (oneDNN, aotriton): cross-built as the engine is
+  if(WIN32)
+    set(_strata_win_ep -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE} -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+        -DSTRATA_XWIN=${STRATA_XWIN} -DSTRATA_SYCL_WINDOWS=${STRATA_SYCL_WINDOWS} -DCMAKE_BUILD_TYPE=Release)
+    if(CMAKE_CXX_COMPILER_LAUNCHER)
+      list(APPEND _strata_win_ep -DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}
+                                 -DCMAKE_C_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER})
+    endif()
+  endif()
+  if(STRATA_ONEDNN)
+    include(ExternalProject)
+    if(STRATA_ONEDNN_SOURCE)
+      set(_strata_onednn_url URL ${STRATA_ONEDNN_SOURCE})
+    else()
+      set(_strata_onednn_url
+        URL https://github.com/uxlfoundation/oneDNN/archive/refs/tags/v3.12.tar.gz
+        URL_HASH SHA256=efa94db6e8395daaef8e307a48e9527bbaab58a64b44e5d59a3662b4b155099d)
+    endif()
+    set(_strata_onednn_dir ${CMAKE_BINARY_DIR}/onednn)
+    set(_strata_onednn_args -DCMAKE_INSTALL_PREFIX=${_strata_onednn_dir} -DCMAKE_INSTALL_LIBDIR=lib
+        -DDNNL_CPU_RUNTIME=NONE -DDNNL_GPU_RUNTIME=SYCL -DDNNL_GPU_VENDOR=INTEL -DDNNL_LIBRARY_TYPE=SHARED
+        -DDNNL_BUILD_TESTS=OFF -DDNNL_BUILD_EXAMPLES=OFF -DDNNL_BUILD_DOC=OFF)
+    if(WIN32)
+      list(APPEND _strata_onednn_args ${_strata_win_ep} -DDNNL_ENABLE_JIT_PROFILING=OFF -DDNNL_ENABLE_ITT_TASKS=OFF)
+      set(_strata_dnnl_lib ${_strata_onednn_dir}/lib/dnnl.lib)
+    else()
+      list(APPEND _strata_onednn_args -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+                                      -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER})
+      if(CMAKE_CXX_COMPILER_LAUNCHER)
+        list(APPEND _strata_onednn_args -DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}
+                                        -DCMAKE_C_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER})
+      endif()
+      set(_strata_dnnl_lib ${_strata_onednn_dir}/lib/libdnnl.so)
+    endif()
+    ExternalProject_Add(strata_onednn ${_strata_onednn_url} DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+      PREFIX ${CMAKE_BINARY_DIR}/_deps/onednn CMAKE_ARGS ${_strata_onednn_args}
+      BUILD_BYPRODUCTS ${_strata_dnnl_lib})
+    file(MAKE_DIRECTORY ${_strata_onednn_dir}/include)
+    add_library(strata_dnnl SHARED IMPORTED)
+    set_target_properties(strata_dnnl PROPERTIES INTERFACE_INCLUDE_DIRECTORIES ${_strata_onednn_dir}/include)
+    if(WIN32)
+      set_target_properties(strata_dnnl PROPERTIES IMPORTED_IMPLIB ${_strata_dnnl_lib}
+                            IMPORTED_LOCATION ${_strata_onednn_dir}/bin/dnnl.dll)
+    else()
+      set_target_properties(strata_dnnl PROPERTIES IMPORTED_LOCATION ${_strata_dnnl_lib})
+    endif()
+    add_dependencies(strata_image strata_onednn)
+    target_sources(strata_image PRIVATE src/image/qi_sdpa_onednn.cpp)
+    target_link_libraries(strata_image PRIVATE strata_dnnl)
+    set_property(SOURCE src/image/qi_sdpa.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN=1)
+  endif()
+  # AMD GPUs: aotriton's flash attention (MIT, https://github.com/ROCm/aotriton, release 0.14.2b): its library for the
+  # build's ROCm (hip's version) and its kernels' images for the build's AMD architectures, fetched (their SHA-256
+  # checked) and unpacked beside the build, or STRATA_AOTRITON_ROOT, a folder of its own; the packages carry both.  A
+  # ROCm without its build, or an architecture without images, takes XeStrata's own kernel.
+  # Windows: AOTriton has no Windows release, and builds the library alone there (its NOIMAGE mode; the images are the
+  # same as Linux's), from its source (the tag's archive, its SHA-256 checked), with a patch of XeStrata's
+  # (third_party/main/aotriton/patches: HIP's headers and import library given, the build machine's Python) and xz's
+  # liblzma (0BSD) linked in, both cross-built with this build's toolchain; HIP's are the Windows HIP adapter's
+  # (tools/intel_llvm_build.py --windows, beside STRATA_SYCL_WINDOWS).
+  set(STRATA_AOTRITON_ROOT "" CACHE PATH "aotriton's folder (include/, lib/ with its images) for the image attention")
+  set(_strata_aot_hip_win "${STRATA_SYCL_WINDOWS}/../hip")
+  if(_strata_hip_archs AND (NOT WIN32 OR EXISTS "${_strata_aot_hip_win}/lib/amdhip64.lib"))
+    if(NOT WIN32)
+      strata_hip_prefixes(_strata_aot_prefixes)
+      find_package(hip QUIET PATHS ${_strata_aot_prefixes})
+    endif()
+    set(_strata_aot_dir "${STRATA_AOTRITON_ROOT}")
+    if(NOT _strata_aot_dir AND (hip_FOUND OR WIN32))
+      set(_strata_aot_base https://github.com/ROCm/aotriton/releases/download/0.14.2b/aotriton-0.14.2b)
+      set(_strata_aot_rocm6.4 35f598d0aabf1fca887fb8428e12f34de9e3ce852dc2aa832b76e318cf4f3940)
+      set(_strata_aot_rocm7.0 98800207360e1b688afc4fccf794b50560ef2b42bdd32ed0b71f90fdc86b0cf6)
+      set(_strata_aot_rocm7.1 d6c86838cb640d4ad1f337d061ffe10121a34424551ae8340eb1e48e55477549)
+      set(_strata_aot_rocm7.2 0b01ec5ccc55ca86059afb20f1f5764fee5edd9d7e7b456167d77dc9f691cdc9)
+      set(_strata_aot_rocm7.14 dc756824b5c63a689179f765c51f2aa747d3d5ee842b17bdd9238adcf237f91b)
+      set(_strata_aot_rocm7.15 6ed840e37b3037fd7e6677e7d29d4ab8fd1578757820ce00b40176bbb51ab053)
+      set(_strata_aot_rocm7.16 02370004391255af58141068d83df1b50786a1046df6ef49d0e2509b9537b61b)
+      set(_strata_aot_gfx110x a54fecf9b4e16425681785eba475912eb9ae761e35a4df3e3579bdbd7c6fe4db)
+      set(_strata_aot_gfx115x e4bda76fd6857a733cd7b4b3eb9ccb21c0f47b565ce304777a61bbb13d12ad6e)
+      set(_strata_aot_gfx120x f173671cc5112897e134f1d209bd6f572ecd507f4d68dc84cb6f07b67e13e851)
+      set(_strata_aot_gfx1250 6a354bf84a18d7689affaef953ea4a2d1f6943569da4a4ca26fd5e6b5eb67a0f)
+      set(_strata_aot_gfx90a 7cc293803aa73bd223554d51a77fab50fd37b0bdb9d5e874f7e2997f4390b9c5)
+      set(_strata_aot_gfx942 eae5d36c974d974f085cfbdecf77760db71324fa9814ed50d8a3fc42bfbe3e41)
+      set(_strata_aot_gfx950 23716cbf855df9df1ca7d480a90e0fb29b0356bb424015c426fc0e5a973f682b)
+      set(_strata_aot_rocm "rocm${hip_VERSION_MAJOR}.${hip_VERSION_MINOR}")
+      if(WIN32 OR DEFINED _strata_aot_${_strata_aot_rocm})
+        set(_strata_aot_files "")
+        if(NOT WIN32)
+          set(_strata_aot_files "manylinux_2_28_x86_64-${_strata_aot_rocm}-shared")
+        endif()
+        foreach(strata_arch IN LISTS _strata_hip_archs)
+          # the images' families: gfx1200 and gfx1201 are gfx120x's, gfx1100 to gfx1103 gfx110x's, and so on
+          string(REGEX REPLACE "^(gfx1[012][0-9])[0-9a-f]$" "\\1x" _strata_family "${strata_arch}")
+          if(DEFINED _strata_aot_${_strata_family})
+            list(APPEND _strata_aot_files "images-amd-${_strata_family}")
+          elseif(DEFINED _strata_aot_${strata_arch})
+            list(APPEND _strata_aot_files "images-amd-${strata_arch}")
+          endif()
+        endforeach()
+        list(REMOVE_DUPLICATES _strata_aot_files)
+        set(_strata_aot_dir ${CMAKE_BINARY_DIR}/_deps/aotriton/aotriton)
+        foreach(strata_f IN LISTS _strata_aot_files)
+          string(REGEX REPLACE "^manylinux_2_28_x86_64-(rocm[0-9.]+)-shared$" "\\1" _strata_key "${strata_f}")
+          string(REGEX REPLACE "^images-amd-" "" _strata_key "${_strata_key}")
+          set(_strata_tar ${CMAKE_BINARY_DIR}/_deps/aotriton/${strata_f}.tar.gz)
+          if(NOT EXISTS ${_strata_tar}.done)
+            file(DOWNLOAD ${_strata_aot_base}-${strata_f}.tar.gz ${_strata_tar}
+                 EXPECTED_HASH SHA256=${_strata_aot_${_strata_key}} STATUS _strata_st)
+            list(GET _strata_st 0 _strata_code)
+            if(NOT _strata_code EQUAL 0)
+              message(FATAL_ERROR "aotriton: ${strata_f}: ${_strata_st}")
+            endif()
+            execute_process(COMMAND ${CMAKE_COMMAND} -E tar xzf ${_strata_tar}
+                            WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/_deps/aotriton COMMAND_ERROR_IS_FATAL ANY)
+            file(TOUCH ${_strata_tar}.done)
+            file(REMOVE ${_strata_tar})
+          endif()
+        endforeach()
+        if(WIN32)
+          include(ExternalProject)
+          set(_strata_xz_dir ${CMAKE_BINARY_DIR}/_deps/aotriton/xz)
+          ExternalProject_Add(strata_xz
+            URL https://github.com/tukaani-project/xz/releases/download/v5.8.1/xz-5.8.1.tar.gz
+            URL_HASH SHA256=507825b599356c10dca1cd720c9d0d0c9d5400b9de300af00e4d1ea150795543
+            DOWNLOAD_EXTRACT_TIMESTAMP FALSE PREFIX ${CMAKE_BINARY_DIR}/_deps/aotriton/xz-build
+            CMAKE_ARGS ${_strata_win_ep} -DCMAKE_INSTALL_PREFIX=${_strata_xz_dir} -DBUILD_SHARED_LIBS=OFF
+              -DBUILD_TESTING=OFF -DXZ_TOOL_XZ=OFF -DXZ_TOOL_XZDEC=OFF -DXZ_TOOL_LZMADEC=OFF -DXZ_TOOL_LZMAINFO=OFF
+              -DXZ_TOOL_SCRIPTS=OFF -DXZ_DOC=OFF -DXZ_NLS=OFF -DXZ_THREADS=vista)
+          # the release's commit and tree, which its images' signatures carry (the source is its archive, no clone)
+          ExternalProject_Add(strata_aotriton_win
+            URL https://github.com/ROCm/aotriton/archive/refs/tags/0.14.2b.tar.gz
+            URL_HASH SHA256=9d64da24c877b6a8f6a7921a178d007232a5e35a908c19695e1d0a6f8c1eb0a5
+            DOWNLOAD_EXTRACT_TIMESTAMP FALSE PREFIX ${CMAKE_BINARY_DIR}/_deps/aotriton/win-build
+            PATCH_COMMAND patch -p1 -i
+              ${CMAKE_SOURCE_DIR}/third_party/main/aotriton/patches/0001-windows-cross-build.patch
+            CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env AOTRITON_CI_SUPPLIED_SHA1=c11b5b886a10a00f925f74133d38b3505e67ccd9
+              AOTRITON_GIT_TREESHA1=25d66e23104aab7a2492d40d1d326499d224dc88
+              ${CMAKE_COMMAND} -G Ninja -S <SOURCE_DIR> -B <BINARY_DIR> ${_strata_win_ep}
+              -DCMAKE_INSTALL_PREFIX=${_strata_aot_dir} -DAOTRITON_NOIMAGE_MODE=ON -DAOTRITON_NO_PYTHON=ON
+              -DAOTRITON_HIP_WINDOWS=${_strata_aot_hip_win} -Dliblzma_DIR=${_strata_xz_dir}/lib/cmake/liblzma
+              -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH
+            BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR>
+            INSTALL_COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR>
+            DEPENDS strata_xz
+            BUILD_BYPRODUCTS ${_strata_aot_dir}/lib/aotriton_v2.lib)
+        endif()
+      else()
+        message(STATUS "aotriton has no build for ROCm ${hip_VERSION}: the image attention on AMD GPUs takes "
+                       "XeStrata's own kernel")
+      endif()
+    endif()
+    set(_strata_aot_libs "")
+    if(WIN32 AND TARGET strata_aotriton_win)
+      set(_strata_aot_libs ${_strata_aot_dir}/lib/aotriton_v2.lib ${_strata_aot_hip_win}/lib/amdhip64.lib)
+      set(_strata_hip_inc ${_strata_aot_hip_win}/include)
+    elseif(NOT WIN32 AND _strata_aot_dir AND EXISTS ${_strata_aot_dir}/lib/libaotriton_v2.so AND TARGET hip::amdhip64)
+      # hip's headers for its file only (its stream type), not hip::host's options for the SYCL sources; a system
+      # folder (Fedora's /usr/include) stays out of -I, which would break the C++ headers' #include_next
+      get_target_property(_strata_hip_inc hip::amdhip64 INTERFACE_INCLUDE_DIRECTORIES)
+      list(REMOVE_ITEM _strata_hip_inc ${CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES} /usr/include)
+      set(_strata_aot_libs ${_strata_aot_dir}/lib/libaotriton_v2.so hip::amdhip64)
+    endif()
+    if(_strata_aot_libs)
+      # a module of its own, which the image engine opens on an AMD GPU only (it needs AMD's HIP runtime, which a
+      # machine with other makers' GPUs need not have), beside the engine, the same on Linux and Windows
+      add_library(strata_sdpa_aotriton SHARED src/image/qi_sdpa_aotriton.cpp)
+      # aotriton's headers as a system folder: on Windows they put dllimport on its enums, which clang ignores
+      target_include_directories(strata_sdpa_aotriton SYSTEM PRIVATE ${_strata_aot_dir}/include)
+      target_include_directories(strata_sdpa_aotriton PRIVATE ${_strata_hip_inc})
+      target_compile_definitions(strata_sdpa_aotriton PRIVATE __HIP_PLATFORM_AMD__)
+      target_link_libraries(strata_sdpa_aotriton PRIVATE strata_sycl ${_strata_aot_libs})
+      if(TARGET strata_aotriton_win)
+        add_dependencies(strata_sdpa_aotriton strata_aotriton_win)
+      endif()
+      add_dependencies(strata_image strata_sdpa_aotriton)
+      set_property(SOURCE src/image/qi_sdpa.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_AOTRITON=1)
+      target_link_libraries(strata_image PRIVATE ${CMAKE_DL_LIBS})
+      set(_strata_aotriton_lib ${_strata_aot_dir}/lib)   # for the packages
+    endif()
+  endif()
+  # NVIDIA GPUs (contrib-llvm): cuDNN's SDPA through cudnn-frontend (Apache-2.0, header-only, the tag pinned here),
+  # which opens cuDNN at run time (libcudnn.so.9, cudnn64_9.dll: the user's installation, not free software; without
+  # it the engine's own kernel).  cuDNN's headers (cudnn.h, the same for Linux and Windows) are found under
+  # STRATA_CUDNN_ROOT, CUDNN_PATH or the CUDA toolkit's folder, outside a cross build's roots too; the build goes on
+  # without them.
+  set(STRATA_CUDNN_ROOT "" CACHE PATH "cuDNN's folder (its include/cudnn.h), for the image attention on NVIDIA GPUs")
+  if(_strata_cuda_archs AND STRATA_LICENSE STREQUAL "contrib")
+    find_path(_strata_cudnn_inc cudnn.h NO_CACHE NO_CMAKE_FIND_ROOT_PATH
+              HINTS "${STRATA_CUDNN_ROOT}/include" "$ENV{CUDNN_PATH}/include" "${_strata_cuda_root}/include")
+    if(_strata_cudnn_inc)
+      include(FetchContent)
+      FetchContent_Populate(strata_cudnn_fe QUIET
+        URL https://github.com/NVIDIA/cudnn-frontend/archive/refs/tags/v1.31.0.tar.gz
+        URL_HASH SHA256=130f3e98e3f07defd60bf39b250ae7d96c61ca99443782ce77fd470964fbd899
+        DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_cudnn_fe-src
+        SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_cudnn_fe-subbuild)
+      target_sources(strata_image PRIVATE src/image/qi_sdpa_cudnn.cpp)
+      # the CUDA runtime's headers cudnn.h includes: on Windows the cross build's (above, oneMath's cuBLAS), as the
+      # toolkit's can sit among the build machine's C library's
+      set(_strata_cudnn_cuda_inc ${_strata_cuda_root}/include)
+      if(WIN32 AND EXISTS "${STRATA_CUDA_WINDOWS_LIBS}/include/cuda_runtime_api.h")
+        set(_strata_cudnn_cuda_inc ${STRATA_CUDA_WINDOWS_LIBS}/include)
+      endif()
+      set_property(SOURCE src/image/qi_sdpa_cudnn.cpp APPEND PROPERTY INCLUDE_DIRECTORIES
+                   ${strata_cudnn_fe_SOURCE_DIR}/include ${_strata_cudnn_inc} ${_strata_cudnn_cuda_inc})
+      set_property(SOURCE src/image/qi_sdpa_cudnn.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                   NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING CUDNN_FRONTEND_SKIP_JSON_LIB)
+      set_property(SOURCE src/image/qi_sdpa_cudnn.cpp APPEND PROPERTY COMPILE_OPTIONS -w)   # its headers' warnings
+      set_property(SOURCE src/image/qi_sdpa.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_CUDNN=1)
+      target_link_libraries(strata_image PRIVATE ${CMAKE_DL_LIBS})
+      set(_strata_cudnn_frontend ON)   # its license text goes with the packages
+    else()
+      message(STATUS "cuDNN's headers (cudnn.h) not found: the image attention on NVIDIA GPUs takes XeStrata's own "
+                     "kernel (STRATA_CUDNN_ROOT gives cuDNN's folder)")
+    endif()
+  endif()
   # stb_image (third_party/main/stb, MIT or the Unlicense) for an edit's reference image: its implementation in
   # qi_image_io.cpp alone, its own warnings not the build's
   target_include_directories(strata_image SYSTEM PRIVATE third_party/main/stb)
@@ -656,9 +961,12 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image-vae-probe PRIVATE strata_image)
   add_executable(strata-image-text-probe src/image/qi_text_probe.cpp)
   target_link_libraries(strata-image-text-probe PRIVATE strata_image)
+  add_executable(strata-image-mf-probe src/image/mf_probe.cpp)
+  target_link_libraries(strata-image-mf-probe PRIVATE strata_image)
   add_executable(strata-image-vision-probe src/image/qi_vision_probe.cpp)
   target_link_libraries(strata-image-vision-probe PRIVATE strata_image)
   add_executable(strata-image src/image/strata_image.cpp)
+  strata_utf8_manifest(strata-image)
   target_link_libraries(strata-image PRIVATE strata_image)
 
   if(STRATA_BUILD_TESTS)
@@ -683,6 +991,14 @@ if(STRATA_ENABLE_XE)
     add_executable(router_top10_parity src/kernels/router_top10_parity.cpp)
     target_link_libraries(router_top10_parity PRIVATE strata_kernels)
     add_test(NAME router_top10_parity COMMAND router_top10_parity --selftest)
+    add_executable(glm5_parity src/kernels/glm5_parity.cpp)
+    target_link_libraries(glm5_parity PRIVATE strata_kernels)
+    target_include_directories(glm5_parity PRIVATE third_party/main/ggml)   # IQ1_S's block and grid (ggml-common.h)
+    add_test(NAME glm5_parity COMMAND glm5_parity --selftest)
+    # the reads IGC 2.27 to 2.30 miscompile for Xe2 GPUs, through the runtime's workaround (AGENTS.md)
+    add_executable(igc_gep_probe src/kernels/igc_gep_probe.cpp)
+    target_link_libraries(igc_gep_probe PRIVATE strata_kernels)
+    add_test(NAME igc_gep_probe COMMAND igc_gep_probe)
     add_executable(bf16_gemv_parity src/kernels/bf16_gemv_parity.cpp)
     target_link_libraries(bf16_gemv_parity PRIVATE strata_kernels)
     add_test(NAME bf16_gemv_parity COMMAND bf16_gemv_parity --selftest)
@@ -793,6 +1109,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(draft_policy_test src/spec/draft_policy_test.cpp)
   target_link_libraries(draft_policy_test PRIVATE strata_spec)
   add_test(NAME draft_policy_test COMMAND draft_policy_test)
+  add_executable(spec_start_test src/spec/spec_start_test.cpp)
+  target_include_directories(spec_start_test PRIVATE include)
+  add_test(NAME spec_start_test COMMAND spec_start_test)
   add_executable(message_boundary_test src/program/message_boundary_test.cpp)
   target_include_directories(message_boundary_test PRIVATE include)
   add_test(NAME message_boundary_test COMMAND message_boundary_test)
@@ -837,14 +1156,16 @@ if(STRATA_BUILD_TESTS)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/hadamard.cpp)
+            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/hadamard.cpp
+            src/kernels/cpu/kq_avx2.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
 # `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
 set(STRATA_AVX512_FLAGS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
 set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "${STRATA_AVX512_FLAGS}")
-set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+set_source_files_properties(src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/kq_avx2.cpp
+                            PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 # AVX-VNNI (Alder Lake, Sapphire Rapids and later; upstream b211ba17): the AVX-2 expert kernels' vpdpwssd / vpdpbusd
 # copies (q2_avx2.cpp, iq_avx2.cpp; *_rows.inl), taken at run time where cpu_avxvnni_ok().  Only those functions are
 # compiled with target("avxvnni") - never -mavxvnni on a file, which would let the compiler use it anywhere.  A compiler
@@ -917,10 +1238,11 @@ if(STRATA_NATIVE_EXPERTS)
                                            src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/canon_expert.cpp
                                            src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp
                                            src/kernels/cpu/tq_avx512.cpp)
-  target_include_directories(strata_kernels_cpu PRIVATE third_party/main/ggml third_party/main/ggml-tq)
-  set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS
-                              "${STRATA_AVX512_FLAGS}")
+  # the trellis types' CPU rows (Gyro, tq_cpu.hpp): AVX2 and AVX-512 copies of the scalar kernel, chosen at run time
   set_source_files_properties(src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+  set_source_files_properties(src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${STRATA_AVX512_FLAGS}")
+  target_include_directories(strata_kernels_cpu PRIVATE third_party/main/ggml)
+  set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${STRATA_AVX512_FLAGS}")
   set_source_files_properties(src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/canon_expert.cpp
                               PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
@@ -953,16 +1275,10 @@ if(STRATA_NATIVE_EXPERTS)
   if(STRATA_ENABLE_XE AND STRATA_BUILD_TESTS)
     # one native expert three ways on real GGUF rows (float reference, CPU, GPU): needs shard 1, not in CTest
     add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
-    target_include_directories(native_expert_parity PRIVATE third_party/main/ggml third_party/main/ggml-tq)
+    target_include_directories(native_expert_parity PRIVATE third_party/main/ggml)
     target_link_libraries(native_expert_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact)
     # the BF16 token embedding (--embd-gguf) gathered and dequantized bit for bit: synthetic, so in CTest
     add_test(NAME native_expert_parity_bf16_embd COMMAND native_expert_parity --bf16-embd)
-    # the trellis types of the Gyro files (Gyro-S tqk6/tqk7, Gyro-M tq2_t), plain and Hadamard-folded: synthetic
-    foreach(_pair tqk6/tqk7 tq2_t/tq2_t)
-      string(REPLACE "/" "_" _name "${_pair}")
-      add_test(NAME native_expert_parity_${_name} COMMAND native_expert_parity --synthetic-tq ${_pair})
-      add_test(NAME native_expert_parity_hadamard_${_name} COMMAND native_expert_parity --synthetic-tq ${_pair} --hadamard)
-    endforeach()
     # UD-Q4_K_XL's expert pairs (and Q8_0 alone) and OrcaRouter Q4_K_S's q4_K/q5_0 on synthetic ggml-quantized
     # weights at 2560/640 (upstream efeffd8, d652cd6): GPU and CPU experts against the float reference, GPU
     # dequantizers against to_float
@@ -978,6 +1294,14 @@ if(STRATA_NATIVE_EXPERTS)
       string(REPLACE "@" "_" pair_name "${pair_name}")
       add_test(NAME native_expert_parity_${pair_name} COMMAND native_expert_parity --synthetic ${pair})
       set_tests_properties(native_expert_parity_${pair_name} PROPERTIES TIMEOUT 120)
+    endforeach()
+    # APR (prism.hadamard, upstream fbf045eb6): a Hadamard-folded expert, the GPU rotation (float and the prompt path's
+    # FP16) against the CPU's, and the folded expert on the GPU and the CPU against the float reference
+    foreach(pair q4_K/q8_0 iq3_xxs/iq4_nl)
+      string(REPLACE "/" "_" pair_name "${pair}")
+      add_test(NAME native_expert_parity_hadamard_${pair_name}
+               COMMAND native_expert_parity --synthetic-hadamard ${pair})
+      set_tests_properties(native_expert_parity_hadamard_${pair_name} PROPERTIES TIMEOUT 120)
     endforeach()
     # a pair native_expert_supported refuses on purpose (IQ4_NL gate/up) is refused, not run
     add_test(NAME native_expert_parity_refuses_iq4_nl_gate COMMAND native_expert_parity --synthetic iq4_nl/q8_0)
@@ -995,6 +1319,16 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(expert_multi_test PRIVATE strata_kernels_cpu)
   add_test(NAME expert_multi_test COMMAND expert_multi_test)
   set_tests_properties(expert_multi_test PROPERTIES SKIP_RETURN_CODE 77)   # a CPU without the AVX-512 kernel
+  if(STRATA_NATIVE_EXPERTS)
+    # the CPU trellis kernels (tq_cpu.hpp, Gyro; upstream d0a02fe42): AVX2 / AVX-512 vs the scalar kernel bit for bit,
+    # plain and with the Hadamard rotation; against ggml-cpu's vec_dot and to_float only on a ggml with the trellis
+    # types (agention's fork); `tq_cpu_parity --bench` is the micro-benchmark
+    add_executable(tq_cpu_parity src/kernels/cpu/tq_cpu_parity.cpp)
+    target_link_libraries(tq_cpu_parity PRIVATE strata_kernels_cpu)
+    add_test(NAME tq_cpu_parity COMMAND tq_cpu_parity)
+    add_test(NAME tq_cpu_parity_avx2 COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_AVX2=1 $<TARGET_FILE:tq_cpu_parity>)
+    set_tests_properties(tq_cpu_parity tq_cpu_parity_avx2 PROPERTIES TIMEOUT 300)
+  endif()
 
   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
   target_link_libraries(expert_parity PRIVATE strata_kernels_cpu)
@@ -1006,6 +1340,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(pool_test src/kernels/cpu/pool_test.cpp)
   target_link_libraries(pool_test PRIVATE strata_kernels_cpu)
   add_test(NAME pool_test COMMAND pool_test --selftest WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  # --pool-cores and the start-up line about where the workers run (pool_cores.hpp; real pools, no model or GPU)
+  add_executable(pool_cores_test src/kernels/cpu/pool_cores_test.cpp)
+  target_link_libraries(pool_cores_test PRIVATE strata_kernels_cpu)
+  add_test(NAME pool_cores_test COMMAND pool_cores_test)
   # issue #29: tiny batches with sleeping workers, as on a big-VRAM card; a hang fails it
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)

@@ -1,0 +1,848 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// src/image/mf_vae.cpp - see include/strata/image/mf_vae.hpp.
+
+#include "strata/image/mf_vae.hpp"
+
+#include "strata/core/gpu.hpp"
+#include "strata/core/runtime.hpp"
+#include "strata/image/qi_kernels.hpp"
+#include "strata/image/safetensors.hpp"
+#include "strata/kernels/f16_bits.hpp"
+
+#include <sycl/sycl.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
+
+namespace strata::image {
+
+namespace gpu = strata::gpu;
+
+// The kernels' helpers in a namespace of this file's own, not an anonymous one: SYCL names a lambda's kernel by its
+// mangled type, and an anonymous namespace mangles the same in every file (_GLOBAL__N_1), so a helper of the same
+// name and signature in another image file (qi_vae.cpp's to_rgba) gave its kernel to both.
+namespace mf_vae_detail {
+
+using strata::kernels::f16_from_f32;
+using strata::kernels::f32_from_f16;
+
+constexpr int64_t kPatch = 16, kPix = kPatch * kPatch;   // a latent position's pixels
+constexpr int64_t kWin = 32, kWinTok = kWin * kWin;       // the CoD decoder's attention windows
+constexpr int64_t kGroups = 32;                           // its group norms
+constexpr int64_t kX = 32;                                // the per-pixel MLP's width
+constexpr int kResBlocks = 3;
+constexpr float kEps = 1e-6f;
+
+// the per-pixel MLP's weights in one FP32 buffer (offsets in floats)
+constexpr int64_t kEmbW = 0, kEmbB = kEmbW + kX * 99, kInW = kEmbB + kX, kInB = kInW + kX * kX, kRes0 = kInB + kX;
+constexpr int64_t kAdaW = 0, kAdaB = kAdaW + 3 * kX * kX, kLnW = kAdaB + 3 * kX, kLnB = kLnW + kX, kM1W = kLnB + kX,
+                  kM1B = kM1W + kX * kX, kM2W = kM1B + kX, kM2B = kM2W + kX * kX, kResSize = kM2B + kX;
+constexpr int64_t kFnW = kRes0 + kResBlocks * kResSize, kFlW = kFnW + kX, kFlB = kFlW + 3 * kX, kPixW = kFlB + 3;
+
+sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
+
+template<class T> T* alloc(std::vector<void*>& owned, int64_t n) {
+    T* p = nullptr;
+    if (!gpu::alloc_device(&p, (size_t) std::max<int64_t>(n, 1) * sizeof(T)))
+        throw std::runtime_error(std::string("image engine (Mage-VAE): GPU memory: ") + gpu::last_error());
+    owned.push_back(p);
+    return p;
+}
+
+void release(std::vector<void*>& owned, void* p) {
+    if (p == nullptr) return;
+    owned.erase(std::remove(owned.begin(), owned.end(), p), owned.end());
+    gpu::free(p);
+}
+
+float silu(float x) { return x / (1.f + std::exp(-x)); }
+
+// col16[r][(dy * 3 + dx) * C + c] = in16[y + dy - 1][x + dx - 1][c] (0 outside), pixel p0 + r = y * W + x; C a
+// multiple of 8
+void im2col3(const uint16_t* in16, int64_t H, int64_t W, int64_t C, int64_t p0, int64_t rows, uint16_t* col16,
+             void* s) {
+    const int64_t C8 = C / 8;
+    q_of(s).parallel_for(sycl::range<1>((size_t) (rows * 9 * C8)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t rk = i / C8, r = rk / 9, kk = rk - r * 9, c8 = (i - rk * C8) * 8;
+        const int64_t p = p0 + r, y = p / W + kk / 3 - 1, x = p % W + kk % 3 - 1;
+        using V = sycl::vec<uint16_t, 8>;
+        V v(0);
+        if (y >= 0 && y < H && x >= 0 && x < W) v = *reinterpret_cast<const V*>(in16 + (y * W + x) * C + c8);
+        *reinterpret_cast<V*>(col16 + rk * C + c8) = v;
+    });
+}
+
+// the group norm's partial sums: part[p][g] = the sum over pixel p's channels of group g of x - m, or of (x - m)^2
+// with `sq`, m the group's mean in stats[2 g] (0 without `sq`)
+void gn_partial(const float* x, const float* stats, int64_t HW, int64_t C, bool sq, float* part, void* s) {
+    const int64_t cg = C / kGroups;
+    q_of(s).parallel_for(sycl::range<1>((size_t) (HW * kGroups)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t p = i / kGroups, g = i - p * kGroups;
+        const float* r = x + p * C + g * cg;
+        const float m = sq ? stats[2 * g] : 0.f;
+        float a = 0.f;
+        for (int64_t c = 0; c < cg; ++c) {
+            const float d = r[c] - m;
+            a += sq ? d * d : d;
+        }
+        part[i] = a;
+    });
+}
+
+// stats[g] = the mean of group g over every pixel from gn_partial's sums, or with `sq` 1 / std in stats[2 g + 1]: two
+// passes in FP32 (the mean, then the squares about it) where one pass would need FP64, which not every GPU has
+void gn_stats(const float* part, int64_t HW, int64_t C, bool sq, float* stats, void* s) {
+    const int64_t cg = C / kGroups;
+    const float inv_n = 1.f / (float) (HW * cg);
+    q_of(s).parallel_for(sycl::range<1>((size_t) kGroups), [=](sycl::id<1> id) {
+        const auto g = static_cast<int64_t>(id[0]);
+        float a = 0.f, comp = 0.f;   // Kahan's sum over up to 16384 pixels
+        for (int64_t p = 0; p < HW; ++p) {
+            const float y = part[p * kGroups + g] - comp, t = a + y;
+            comp = (t - a) - y;
+            a = t;
+        }
+        if (sq) stats[2 * g + 1] = 1.f / sycl::sqrt(a * inv_n + kEps);
+        else stats[2 * g] = a * inv_n;
+    });
+}
+
+void gn_apply16(const float* x, const float* stats, const float* w, const float* b, int64_t HW, int64_t C, bool silu_on,
+                uint16_t* y16, void* s) {
+    const int64_t cg = C / kGroups;
+    q_of(s).parallel_for(sycl::range<1>((size_t) (HW * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i % C, g = c / cg;
+        float v = (x[i] - stats[2 * g]) * stats[2 * g + 1] * w[c] + b[c];
+        if (silu_on) v = v / (1.f + sycl::exp(-v));
+        y16[i] = f16_from_f32(v);
+    });
+}
+
+// a window's q, k (rows: its 32 x 32 positions, the latent's edge replicated past it) and v transposed ([C][1024]),
+// from qkv [HW][3 C]
+void win_gather16(const float* qkv, int64_t H, int64_t W, int64_t C, int64_t wy, int64_t wx, uint16_t* q16,
+                  uint16_t* k16, uint16_t* vt16, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (kWinTok * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t t = i / C, c = i - t * C;
+        const int64_t y = sycl::min(wy * kWin + t / kWin, H - 1), x = sycl::min(wx * kWin + t % kWin, W - 1);
+        const float* r = qkv + (y * W + x) * 3 * C;
+        q16[i] = f16_from_f32(r[c]);
+        k16[i] = f16_from_f32(r[C + c]);
+        vt16[c * kWinTok + t] = f16_from_f32(r[2 * C + c]);
+    });
+}
+
+// p16[r] = softmax(scale sc[r]) over a row of n
+void softmax16(const float* sc, int64_t rows, int64_t n, float scale, uint16_t* p16, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) rows), [=](sycl::id<1> id) {
+        const auto r = static_cast<int64_t>(id[0]);
+        const float* row = sc + r * n;
+        float m = -INFINITY;
+        for (int64_t j = 0; j < n; ++j) m = sycl::fmax(m, row[j] * scale);
+        float sum = 0.f;
+        for (int64_t j = 0; j < n; ++j) sum += sycl::exp(row[j] * scale - m);
+        const float inv = 1.f / sum;
+        for (int64_t j = 0; j < n; ++j) p16[r * n + j] = f16_from_f32(sycl::exp(row[j] * scale - m) * inv);
+    });
+}
+
+// out[y][x] = o's row for (y, x) of a window, for the window's positions inside the latent
+void win_scatter(const float* o, int64_t H, int64_t W, int64_t C, int64_t wy, int64_t wx, float* out, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (kWinTok * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t t = i / C, c = i - t * C;
+        const int64_t y = wy * kWin + t / kWin, x = wx * kWin + t % kWin;
+        if (y < H && x < W) out[(y * W + x) * C + c] = o[i];
+    });
+}
+
+// y16[p] = LayerNorm(x[p]) over the channels (no affine) * (1 + scale) + shift
+void ln_mod16(const float* x, const float* shift, const float* scale, int64_t HW, int64_t C, uint16_t* y16, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) HW), [=](sycl::id<1> id) {
+        const auto p = static_cast<int64_t>(id[0]);
+        const float* r = x + p * C;
+        float m = 0.f;
+        for (int64_t c = 0; c < C; ++c) m += r[c];
+        m /= (float) C;
+        float v = 0.f;
+        for (int64_t c = 0; c < C; ++c) v += (r[c] - m) * (r[c] - m);
+        const float inv = 1.f / sycl::sqrt(v / (float) C + kEps);
+        for (int64_t c = 0; c < C; ++c) y16[p * C + c] = f16_from_f32((r[c] - m) * inv * (1.f + scale[c]) + shift[c]);
+    });
+}
+
+// out = GELU(depthwise 3 x 3 convolution of t (zero outside) + bias), the exact (erf) GELU
+void dw3x3_gelu(const float* t, const float* w, const float* b, int64_t H, int64_t W, int64_t C, float* out, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (H * W * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t p = i / C, c = i - p * C, y = p / W, x = p % W;
+        float a = b[c];
+        for (int64_t dy = -1; dy <= 1; ++dy)
+            for (int64_t dx = -1; dx <= 1; ++dx) {
+                const int64_t yy = y + dy, xx = x + dx;
+                if (yy >= 0 && yy < H && xx >= 0 && xx < W)
+                    a += w[c * 9 + (dy + 1) * 3 + dx + 1] * t[(yy * W + xx) * C + c];
+            }
+        out[i] = 0.5f * a * (1.f + sycl::erf(a * 0.70710678118654752f));
+    });
+}
+
+// ca[o] = sigmoid(b[o] + w[o] . mean of x's channels over the pixels): the channel attention's gate
+void channel_gate(const float* x, int64_t HW, int64_t C, const float* w, const float* b, float* mean, float* ca,
+                  void* s) {
+    sycl::queue& q = q_of(s);
+    q.parallel_for(sycl::range<1>((size_t) C), [=](sycl::id<1> id) {
+        const auto c = static_cast<int64_t>(id[0]);
+        float a = 0.f;
+        for (int64_t p = 0; p < HW; ++p) a += x[p * C + c];
+        mean[c] = a / (float) HW;
+    });
+    q.parallel_for(sycl::range<1>((size_t) C), [=](sycl::id<1> id) {
+        const auto o = static_cast<int64_t>(id[0]);
+        float a = b[o];
+        for (int64_t i = 0; i < C; ++i) a += w[o * C + i] * mean[i];
+        ca[o] = 1.f / (1.f + sycl::exp(-a));
+    });
+}
+
+// y16 = x * ca (per channel)
+void scale16(const float* x, const float* ca, int64_t HW, int64_t C, uint16_t* y16, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (HW * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        y16[i] = f16_from_f32(x[i] * ca[i % C]);
+    });
+}
+
+// x += gate * u (per channel)
+void gate_add(float* x, const float* u, const float* gate, int64_t HW, int64_t C, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (HW * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        x[i] += gate[i % C] * u[i];
+    });
+}
+
+// The per-pixel MLP of patches p0 .. p0 + np: pixel j of patch p takes the 32 values yx[p][c * 256 + j] (with the
+// noise's three zeros and the patch's DCT features) through the NerfEmbedder, the input projection, three residual
+// blocks modulated by ce[p][j * 32 ..] and the final norm and projection, into rgb [3][H][W].
+void pixel_mlp(const float* yx, const float* ce, const float* pw, const float* dct, int64_t p0, int64_t np, int64_t w,
+               int64_t H, int64_t W, float* rgb, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (np * kPix)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t pl = i / kPix, j = i - pl * kPix, p = p0 + pl;
+        const float* y = yx + pl * kX * kPix;
+        const float* d = dct + j * 64;
+        float h[kX], e[kX];
+        for (int64_t o = 0; o < kX; ++o) {   // the embedder: [3 zeros, 32 condition values, 64 DCT features]
+            const float* wr = pw + kEmbW + o * 99;
+            float a = pw[kEmbB + o];
+            for (int64_t c = 0; c < kX; ++c) a += wr[3 + c] * y[c * kPix + j];
+            for (int64_t c = 0; c < 64; ++c) a += wr[35 + c] * d[c];
+            e[o] = a;
+        }
+        for (int64_t o = 0; o < kX; ++o) {
+            float a = pw[kInB + o];
+            for (int64_t c = 0; c < kX; ++c) a += pw[kInW + o * kX + c] * e[c];
+            h[o] = a;
+        }
+        const float* cp = ce + pl * kPix * kX + j * kX;
+        float sc[kX];
+        for (int64_t c = 0; c < kX; ++c) sc[c] = cp[c] / (1.f + sycl::exp(-cp[c]));
+        for (int r = 0; r < kResBlocks; ++r) {
+            const float* rb = pw + kRes0 + r * kResSize;
+            float m = 0.f, v = 0.f;
+            for (int64_t c = 0; c < kX; ++c) m += h[c];
+            m /= (float) kX;
+            for (int64_t c = 0; c < kX; ++c) v += (h[c] - m) * (h[c] - m);
+            const float inv = 1.f / sycl::sqrt(v / (float) kX + kEps);
+            float hn[kX], t[kX];
+            for (int64_t o = 0; o < kX; ++o) {   // adaLN: shift, scale; then the gate below
+                float sh = rb[kAdaB + o], sl = rb[kAdaB + kX + o];
+                for (int64_t c = 0; c < kX; ++c) {
+                    sh += rb[kAdaW + o * kX + c] * sc[c];
+                    sl += rb[kAdaW + (kX + o) * kX + c] * sc[c];
+                }
+                hn[o] = ((h[o] - m) * inv * rb[kLnW + o] + rb[kLnB + o]) * (1.f + sl) + sh;
+            }
+            for (int64_t o = 0; o < kX; ++o) {
+                float a = rb[kM1B + o];
+                for (int64_t c = 0; c < kX; ++c) a += rb[kM1W + o * kX + c] * hn[c];
+                t[o] = a / (1.f + sycl::exp(-a));
+            }
+            for (int64_t o = 0; o < kX; ++o) {
+                float a = rb[kM2B + o], g = rb[kAdaB + 2 * kX + o];
+                for (int64_t c = 0; c < kX; ++c) {
+                    a += rb[kM2W + o * kX + c] * t[c];
+                    g += rb[kAdaW + (2 * kX + o) * kX + c] * sc[c];
+                }
+                e[o] = g * a;
+            }
+            for (int64_t o = 0; o < kX; ++o) h[o] += e[o];
+        }
+        float ss = 0.f;
+        for (int64_t c = 0; c < kX; ++c) ss += h[c] * h[c];
+        const float inv = 1.f / sycl::sqrt(ss / (float) kX + kEps);
+        const int64_t py = p / w, px = p % w, Y = py * kPatch + j / kPatch, X = px * kPatch + j % kPatch;
+        for (int64_t o = 0; o < 3; ++o) {
+            float a = pw[kFlB + o];
+            for (int64_t c = 0; c < kX; ++c) a += pw[kFlW + o * kX + c] * h[c] * inv * pw[kFnW + c];
+            rgb[(o * H + Y) * W + X] = a;
+        }
+    });
+}
+
+// y16[p][(c * 16 + ky) * 16 + kx] = rgb[c][py * 16 + ky][px * 16 + kx]: the encoder's 16 x 16 patches as rows, in its
+// patch convolution's (channel, row, column) order
+void patchify16(const float* rgb, int64_t h, int64_t w, uint16_t* y16, void* s) {
+    const int64_t H = h * kPatch, W = w * kPatch;
+    q_of(s).parallel_for(sycl::range<1>((size_t) (h * w * 3 * kPix)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t p = i / (3 * kPix), r = i - p * 3 * kPix, c = r / kPix, k = r - c * kPix;
+        const int64_t y = (p / w) * kPatch + k / kPatch, x = (p % w) * kPatch + k % kPatch;
+        y16[i] = f16_from_f32(rgb[(c * H + y) * W + x]);
+    });
+}
+
+// z[p][c] = mean + exp(logvar / 2) eps (eps null: the mean), from the moments [p][2 Z] (logvar clamped to -20 .. 10)
+void posterior(const float* mom, const float* eps, int64_t n, int64_t Z, float* z, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (n * Z)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t p = i / Z, c = i - p * Z;
+        float v = mom[p * 2 * Z + c];
+        if (eps != nullptr) v += sycl::exp(0.5f * sycl::clamp(mom[p * 2 * Z + Z + c], -20.f, 10.f)) * eps[i];
+        z[i] = v;
+    });
+}
+
+void to_rgba(const float* rgb, int64_t HW, float* rgba, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (4 * HW)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i / HW;
+        rgba[i] = c == 3 ? 1.f : sycl::clamp((rgb[i] + 1.f) * 0.5f, 0.f, 1.f);
+    });
+}
+
+}  // namespace mf_vae_detail
+
+using namespace mf_vae_detail;
+
+MfVae::MfVae() = default;
+
+MfVae::~MfVae() {
+    for (void* p : allocs_) gpu::free(p);
+}
+
+const float* MfVae::upload(const std::vector<float>& v) {
+    weight_bytes_ += v.size() * 4;
+    if (dry_) return nullptr;
+    float* d = alloc<float>(allocs_, (int64_t) v.size());
+    gpu::copy(d, v.data(), v.size() * 4);
+    return d;
+}
+
+const float* MfVae::vec(SafeTensors& st, const std::string& name) {
+    if (dry_) {
+        const SafeTensor* t = st.find(name);
+        if (t == nullptr) throw std::runtime_error("image engine (Mage-VAE): no " + name);
+        weight_bytes_ += (uint64_t) t->elements() * 4;
+        return nullptr;
+    }
+    return upload(st.f32(name));
+}
+
+// a convolution's (or linear layer's) weights as FP16 [out][k][k][in], input columns col0 .. col0 + cols of them
+MfVae::Conv MfVae::conv_w(SafeTensors& st, const std::string& name, bool bias, int64_t col0, int64_t cols) {
+    const SafeTensor* t = st.find(name + ".weight");
+    if (t == nullptr || (t->shape.size() != 4 && t->shape.size() != 2))
+        throw std::runtime_error("image engine (Mage-VAE): no " + name);
+    Conv c;
+    c.out = t->shape[0];
+    const int64_t in = t->shape[1];
+    c.in = cols < 0 ? in - col0 : cols;
+    c.k = t->shape.size() == 4 ? t->shape[2] : 1;
+    if (c.in % 8 != 0) throw std::runtime_error("image engine (Mage-VAE): " + name + ": input channels not 8s");
+    weight_bytes_ += (uint64_t) (c.out * c.k * c.k * c.in) * 2;
+    if (!dry_) {
+        const auto w = st.f32(name + ".weight");   // [out][in][k][k]
+        std::vector<uint16_t> h((size_t) (c.out * c.k * c.k * c.in));
+        for (int64_t o = 0; o < c.out; ++o)
+            for (int64_t i = 0; i < c.in; ++i)
+                for (int64_t dy = 0; dy < c.k; ++dy)
+                    for (int64_t dx = 0; dx < c.k; ++dx)
+                        h[(size_t) (((o * c.k + dy) * c.k + dx) * c.in + i)] =
+                            kernels::f16_from_f32(w[(size_t) (((o * in + col0 + i) * c.k + dy) * c.k + dx)]);
+        uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
+        gpu::copy(d, h.data(), h.size() * 2);
+        c.w = d;
+    }
+    if (bias) c.b = vec(st, name + ".bias");
+    return c;
+}
+
+bool MfVae::open(const std::string& path, void* stream, std::string& err, bool dry) {
+    try {
+        s_ = stream;
+        dry_ = dry;
+        path_ = path;
+        SafeTensors st(path);
+        const std::string d = "pipeline.y_embedder.decoder.";
+        cin_ = conv_w(st, d + "conv_in");
+        C_ = cin_.out;
+        if (C_ % kGroups != 0) throw std::runtime_error("image engine (Mage-VAE): channels not a multiple of 32");
+        for (int i = 0, r = 0, a = 0; i < 5; ++i) {   // ResBlock, attention, ResBlock, attention, ResBlock
+            const std::string p = d + "block." + std::to_string(i) + ".";
+            if (i % 2 == 0) {
+                Res& x = res_[r++];
+                x.n1w = vec(st, p + "norm1.weight");
+                x.n1b = vec(st, p + "norm1.bias");
+                x.c1 = conv_w(st, p + "conv1");
+                x.n2w = vec(st, p + "norm2.weight");
+                x.n2b = vec(st, p + "norm2.bias");
+                x.c2 = conv_w(st, p + "conv2");
+            } else {
+                Attn& x = attn_[a++];
+                x.nw = vec(st, p + "norm.weight");
+                x.nb = vec(st, p + "norm.bias");
+                if (!dry_) {   // q, k and v as one 1 x 1 convolution of 3 C outputs
+                    std::vector<uint16_t> h((size_t) (3 * C_ * C_));
+                    std::vector<float> b((size_t) (3 * C_));
+                    const char* names[] = {"q", "k", "v"};
+                    for (int j = 0; j < 3; ++j) {
+                        const auto w = st.f32(p + names[j] + ".weight");
+                        const auto bb = st.f32(p + names[j] + ".bias");
+                        for (int64_t k = 0; k < C_ * C_; ++k)
+                            h[(size_t) (j * C_ * C_ + k)] = kernels::f16_from_f32(w[(size_t) k]);
+                        std::copy(bb.begin(), bb.end(), b.begin() + j * C_);
+                    }
+                    uint16_t* dw = alloc<uint16_t>(allocs_, (int64_t) h.size());
+                    gpu::copy(dw, h.data(), h.size() * 2);
+                    x.qkv.w = dw;
+                    x.qkv.b = upload(b);
+                } else {
+                    weight_bytes_ += (uint64_t) (3 * C_ * C_) * 2 + (uint64_t) (3 * C_) * 4;
+                }
+                x.qkv.out = 3 * C_;
+                x.qkv.in = C_;
+                x.proj = conv_w(st, p + "proj_out");
+            }
+        }
+        gnw_ = vec(st, d + "norm_out.weight");
+        gnb_ = vec(st, d + "norm_out.bias");
+        cout_ = conv_w(st, d + "conv_out");
+        // the denoiser at t = 0: its timestep embedding, then each block's constant modulation
+        auto host = [&](const std::string& n) { return st.f32(n); };
+        auto linear = [](const std::vector<float>& w, const std::vector<float>& b, const std::vector<float>& x) {
+            const size_t n = b.size(), k = x.size();
+            std::vector<float> y(n);
+            for (size_t o = 0; o < n; ++o) {
+                double a = b[o];
+                for (size_t i = 0; i < k; ++i) a += (double) w[o * k + i] * x[i];
+                y[o] = (float) a;
+            }
+            return y;
+        };
+        std::vector<float> emb(256, 0.f);
+        for (int i = 0; i < 128; ++i) emb[(size_t) i] = 1.f;   // cos(0) for the 128 frequencies, then sin(0)
+        auto c = linear(host("pipeline.t_embedder.mlp.0.weight"), host("pipeline.t_embedder.mlp.0.bias"), emb);
+        for (float& v : c) v = silu(v);
+        c = linear(host("pipeline.t_embedder.mlp.2.weight"), host("pipeline.t_embedder.mlp.2.bias"), c);
+        std::vector<float> sc(c.size());
+        for (size_t i = 0; i < c.size(); ++i) sc[i] = silu(c[i]);
+        s_in_ = conv_w(st, "pipeline.s_embedder.proj2", true, 128, C_);
+        for (int i = 0;; ++i) {
+            const std::string p = "pipeline.blocks." + std::to_string(i) + ".";
+            if (st.find(p + "conv1.weight") == nullptr) break;
+            blocks_.push_back(dico_w(st, p, linear(host(p + "adaLN_modulation.1.weight"),
+                                                   host(p + "adaLN_modulation.1.bias"), sc)));
+            F_ = blocks_.back().c4.out;
+        }
+        if (blocks_.empty()) throw std::runtime_error("image engine (Mage-VAE): no denoiser blocks");
+        yx_ = conv_w(st, "pipeline.y_embedder_x");
+        ce_ = conv_w(st, "pipeline.dec_net.cond_embed");
+        if (yx_.out != kX * kPix || ce_.out != kX * kPix)
+            throw std::runtime_error("image engine (Mage-VAE): the per-pixel MLP is not 32 wide on 16 x 16 patches");
+        // the per-pixel MLP's weights, in kPixW's layout
+        std::vector<float> pw((size_t) kPixW, 0.f);
+        auto put = [&](int64_t off, const std::string& n, size_t want) {
+            const auto v = host(n);
+            if (v.size() != want) throw std::runtime_error("image engine (Mage-VAE): " + n + ": unexpected size");
+            std::copy(v.begin(), v.end(), pw.begin() + off);
+        };
+        put(kEmbW, "pipeline.x_embedder.embedder.0.weight", kX * 99);
+        put(kEmbB, "pipeline.x_embedder.embedder.0.bias", kX);
+        put(kInW, "pipeline.dec_net.input_proj.weight", kX * kX);
+        put(kInB, "pipeline.dec_net.input_proj.bias", kX);
+        for (int r = 0; r < kResBlocks; ++r) {
+            const std::string p = "pipeline.dec_net.res_blocks." + std::to_string(r) + ".";
+            const int64_t o = kRes0 + r * kResSize;
+            put(o + kAdaW, p + "adaLN_modulation.1.weight", 3 * kX * kX);
+            put(o + kAdaB, p + "adaLN_modulation.1.bias", 3 * kX);
+            put(o + kLnW, p + "in_ln.weight", kX);
+            put(o + kLnB, p + "in_ln.bias", kX);
+            put(o + kM1W, p + "mlp.0.weight", kX * kX);
+            put(o + kM1B, p + "mlp.0.bias", kX);
+            put(o + kM2W, p + "mlp.2.weight", kX * kX);
+            put(o + kM2B, p + "mlp.2.bias", kX);
+        }
+        if (st.find("pipeline.dec_net.res_blocks." + std::to_string(kResBlocks) + ".mlp.0.weight") != nullptr)
+            throw std::runtime_error("image engine (Mage-VAE): more than 3 per-pixel blocks");
+        put(kFnW, "pipeline.final_layer.norm.weight", kX);
+        put(kFlW, "pipeline.final_layer.linear.weight", 3 * kX);
+        put(kFlB, "pipeline.final_layer.linear.bias", 3);
+        px_ = upload(pw);
+        // the NerfEmbedder's features of a 16 x 16 patch: pixel (iy, ix) at (iy / 15, ix / 15), frequencies 8 k / 7
+        std::vector<float> dct((size_t) (kPix * 64));
+        const double pi = 3.14159265358979323846;
+        for (int64_t j = 0; j < kPix; ++j) {
+            const int64_t iy = j / kPatch, ix = j % kPatch;
+            const double py = (double) iy / 15.0, px = (double) ix / 15.0;
+            for (int a = 0; a < 8; ++a)
+                for (int b = 0; b < 8; ++b) {
+                    const double fa = 8.0 * a / 7.0, fb = 8.0 * b / 7.0;
+                    dct[(size_t) (j * 64 + a * 8L + b)] =
+                        (float) (std::cos(px * fa * pi) * std::cos(py * fb * pi) / (1.0 + fa * fb));
+                }
+        }
+        dct_ = upload(dct);
+        if (dry_) return true;
+        if (!gemm_.init(s_, 16, err)) return false;
+        return true;
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+}
+
+uint64_t MfVae::scratch_bytes(int64_t h, int64_t w) const {
+    const int64_t n = h * w, band = std::min<int64_t>(n, 1024);
+    return (uint64_t) n * (uint64_t) (C_ * 3 + 3 * F_ + kGroups * 2) * 4 + (uint64_t) kWinTok * C_ * 4 +
+           (uint64_t) n * (uint64_t) std::max(F_, 3 * C_) * 2 +             // a16
+           (uint64_t) n * 9 * (uint64_t) C_ * 2 +                            // the unfolded neighbourhoods
+           (uint64_t) (3 * kWinTok * C_ + kWinTok * kWinTok) * 2 + (uint64_t) kWinTok * kWinTok * 4 +
+           (uint64_t) band * 2 * kX * kPix * 4;
+}
+
+void MfVae::grow(int64_t h, int64_t w) {
+    const int64_t n = h * w;
+    if (n <= cap_hw_) return;
+    drop_scratch();
+    x_ = alloc<float>(allocs_, n * C_);
+    cond_ = alloc<float>(allocs_, n * C_);
+    s_state_ = alloc<float>(allocs_, n * C_);
+    t0_ = alloc<float>(allocs_, n * F_);
+    t1_ = alloc<float>(allocs_, n * F_);
+    t2_ = alloc<float>(allocs_, std::max(n * F_, n * C_ + kWinTok * C_));   // the attention's output and a window's
+    gn_part_ = alloc<float>(allocs_, n * kGroups * 2);
+    vec_ = alloc<float>(allocs_, 4 * F_);
+    a16_ = alloc<uint16_t>(allocs_, n * std::max(F_, 3 * C_));
+    col_cap_ = n * 9 * C_;
+    col16_ = alloc<uint16_t>(allocs_, col_cap_);
+    w16_ = alloc<uint16_t>(allocs_, 3 * kWinTok * C_ + kWinTok * kWinTok);
+    scores_ = alloc<float>(allocs_, kWinTok * kWinTok);
+    cap_band_ = std::min<int64_t>(n, 1024);
+    yxb_ = alloc<float>(allocs_, cap_band_ * kX * kPix);
+    ceb_ = alloc<float>(allocs_, cap_band_ * kX * kPix);
+    cap_hw_ = n;
+}
+
+void MfVae::drop_scratch() {
+    gpu::stream_sync(s_);
+    for (void* p : {(void*) x_, (void*) cond_, (void*) s_state_, (void*) t0_, (void*) t1_, (void*) t2_,
+                    (void*) gn_part_, (void*) vec_, (void*) a16_, (void*) col16_, (void*) w16_, (void*) scores_,
+                    (void*) yxb_, (void*) ceb_})
+        release(allocs_, p);
+    x_ = cond_ = s_state_ = t0_ = t1_ = t2_ = gn_part_ = vec_ = scores_ = yxb_ = ceb_ = nullptr;
+    a16_ = col16_ = w16_ = nullptr;
+    cap_hw_ = cap_band_ = col_cap_ = 0;
+}
+
+void MfVae::conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out) {
+    const int64_t HW = H * W;
+    if (c.k == 1) {
+        gemm_.f16(in16, c.w, out, HW, c.out, c.in);
+    } else {
+        const int64_t K = 9 * c.in, rows = std::max<int64_t>(1, col_cap_ / K);
+        for (int64_t p0 = 0; p0 < HW; p0 += rows) {
+            const int64_t n = std::min(rows, HW - p0);
+            im2col3(in16, H, W, c.in, p0, n, col16_, s_);
+            gemm_.f16(col16_, c.w, out + p0 * c.out, n, c.out, K);
+        }
+    }
+    if (c.b != nullptr) qi_bias_add(out, c.b, HW, c.out, s_);
+}
+
+void MfVae::gn_silu16(const float* x, const float* w, const float* b, int64_t HW, int64_t C, bool silu_on,
+                      uint16_t* y16) {
+    gn_partial(x, vec_, HW, C, false, gn_part_, s_);
+    gn_stats(gn_part_, HW, C, false, vec_, s_);
+    gn_partial(x, vec_, HW, C, true, gn_part_, s_);
+    gn_stats(gn_part_, HW, C, true, vec_, s_);
+    gn_apply16(x, vec_, w, b, HW, C, silu_on, y16, s_);
+}
+
+void MfVae::resblock(const Res& r, float*& x, int64_t H, int64_t W) {
+    const int64_t HW = H * W;
+    float* y = x == t0_ ? t1_ : t0_;
+    gn_silu16(x, r.n1w, r.n1b, HW, C_, true, a16_);
+    conv(r.c1, a16_, H, W, t2_);
+    gn_silu16(t2_, r.n2w, r.n2b, HW, C_, true, a16_);
+    conv(r.c2, a16_, H, W, y);
+    qi_axpy(y, x, 1.0f, HW * C_, s_);
+    x = y;
+}
+
+void MfVae::attention(const Attn& a, float* x, int64_t H, int64_t W) {
+    const int64_t HW = H * W;
+    float* qkv = x == t0_ ? t1_ : t0_;
+    gn_silu16(x, a.nw, a.nb, HW, C_, false, a16_);
+    conv(a.qkv, a16_, H, W, qkv);
+    uint16_t *q16 = w16_, *k16 = w16_ + kWinTok * C_, *vt16 = w16_ + 2 * kWinTok * C_,
+             *p16 = w16_ + 3 * kWinTok * C_;
+    float* o = t2_;   // the attention's output [HW][C]
+    float* ow = t2_ + HW * C_;   // a window's [1024][C]
+    for (int64_t wy = 0; wy * kWin < H; ++wy)
+        for (int64_t wx = 0; wx * kWin < W; ++wx) {
+            win_gather16(qkv, H, W, C_, wy, wx, q16, k16, vt16, s_);
+            gemm_.f16(q16, k16, scores_, kWinTok, kWinTok, C_);
+            softmax16(scores_, kWinTok, kWinTok, 1.0f / std::sqrt((float) C_), p16, s_);
+            gemm_.f16(p16, vt16, ow, kWinTok, C_, kWinTok);
+            win_scatter(ow, H, W, C_, wy, wx, o, s_);
+        }
+    qi_to_f16(o, HW * C_, a16_, s_);
+    conv(a.proj, a16_, H, W, qkv);
+    qi_axpy(x, qkv, 1.0f, HW * C_, s_);
+}
+
+// a DiCo block's weights under prefix p, with its modulation `mod` [6][C] (host)
+MfVae::DiCo MfVae::dico_w(SafeTensors& st, const std::string& p, const std::vector<float>& mod) {
+    DiCo b;
+    b.c1 = conv_w(st, p + "conv1");
+    b.c3 = conv_w(st, p + "conv3");
+    b.c4 = conv_w(st, p + "conv4");
+    b.c5 = conv_w(st, p + "conv5");
+    b.dw = vec(st, p + "conv2.weight");
+    b.db = vec(st, p + "conv2.bias");
+    b.caw = vec(st, p + "ca.1.weight");
+    b.cab = vec(st, p + "ca.1.bias");
+    if ((int64_t) mod.size() != 6 * b.c1.out) throw std::runtime_error("image engine (Mage-VAE): " + p + ": modulation");
+    b.mod = upload(mod);
+    return b;
+}
+
+void MfVae::dico(const DiCo& d, float* s, int64_t H, int64_t W, const DiCoBufs& b) {
+    const int64_t HW = H * W, C = d.c1.out, F = d.c4.out;
+    const float* m = d.mod;
+    ln_mod16(s, m, m + C, HW, C, b.a16, s_);
+    conv(d.c1, b.a16, H, W, b.t0);
+    dw3x3_gelu(b.t0, d.dw, d.db, H, W, C, b.t1, s_);
+    channel_gate(b.t1, HW, C, d.caw, d.cab, b.vec, b.vec + C, s_);
+    scale16(b.t1, b.vec + C, HW, C, b.a16, s_);
+    conv(d.c3, b.a16, H, W, b.t0);
+    gate_add(s, b.t0, m + 2 * C, HW, C, s_);
+    ln_mod16(s, m + 3 * C, m + 4 * C, HW, C, b.a16, s_);
+    conv(d.c4, b.a16, H, W, b.t0);
+    qi_gelu_erf16(b.t0, HW * F, b.a16, s_);
+    conv(d.c5, b.a16, H, W, b.t1);
+    gate_add(s, b.t1, m + 5 * C, HW, C, s_);
+}
+
+bool MfVae::open_encoder(std::string& err, bool dry) {
+    if (has_encoder()) return true;
+    try {
+        const bool was_dry = dry_;
+        const uint64_t before = weight_bytes_;
+        dry_ = dry;
+        SafeTensors st(path_);
+        const std::string e = "student.dconv_encoder.";
+        // the patch convolution as a product of the patch rows [h w][3 16 16] (its weight's own order)
+        const SafeTensor* pt = st.find(e + "patch_cond_embed.weight");
+        if (pt == nullptr || pt->shape.size() != 4 || pt->shape[1] != 3 || pt->shape[2] != kPatch ||
+            pt->shape[3] != kPatch)
+            throw std::runtime_error("image engine (Mage-VAE): no 16 x 16 patch convolution in the encoder");
+        e_patch_.out = pt->shape[0];
+        e_patch_.in = 3 * kPix;
+        weight_bytes_ += (uint64_t) (e_patch_.out * e_patch_.in) * 2;
+        if (!dry_) {
+            const auto w = st.f32(e + "patch_cond_embed.weight");
+            std::vector<uint16_t> h(w.size());
+            for (size_t i = 0; i < w.size(); ++i) h[i] = kernels::f16_from_f32(w[i]);
+            uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
+            gpu::copy(d, h.data(), h.size() * 2);
+            e_patch_.w = d;
+        }
+        e_patch_.b = vec(st, e + "patch_cond_embed.bias");
+        auto host = [&](const std::string& n) { return st.f32(n); };
+        // the head blocks: their affine layer norms as a modulation (shift = bias, scale = weight - 1), gates 1
+        for (int i = 0;; ++i) {
+            const std::string p = e + "head_blocks." + std::to_string(i) + ".";
+            if (st.find(p + "conv1.weight") == nullptr) break;
+            const auto n1w = host(p + "norm1.weight"), n1b = host(p + "norm1.bias");
+            const auto n2w = host(p + "norm2.weight"), n2b = host(p + "norm2.bias");
+            const size_t C = n1w.size();
+            std::vector<float> mod(6 * C, 1.f);
+            for (size_t c = 0; c < C; ++c) {
+                mod[c] = n1b[c];
+                mod[C + c] = n1w[c] - 1.f;
+                mod[3 * C + c] = n2b[c];
+                mod[4 * C + c] = n2w[c] - 1.f;
+            }
+            enc_head_.push_back(dico_w(st, p, mod));
+        }
+        e_down_ = conv_w(st, e + "proj_down");
+        // the fuse of [the patches' features, the zero latent's projection (its bias)]: the second half's product
+        // is constant, folded into the bias
+        e_fuse_ = conv_w(st, e + "fuse_proj", false, 0, e_down_.out);
+        {
+            const SafeTensor* ft = st.find(e + "fuse_proj.weight");
+            const int64_t n = ft->shape[0], k = ft->shape[1];
+            const auto fw = host(e + "fuse_proj.weight"), fb = host(e + "fuse_proj.bias"), zb = host(e + "z_proj.bias");
+            std::vector<float> b(fb);
+            for (int64_t o = 0; o < n; ++o)
+                for (int64_t i = e_down_.out; i < k; ++i)
+                    b[(size_t) o] += fw[(size_t) (o * k + i)] * zb[(size_t) (i - e_down_.out)];
+            e_fuse_.b = upload(b);
+        }
+        // the blocks at t = 0: the encoder's own timestep embedding, then each block's constant modulation
+        std::vector<float> emb(256, 0.f);
+        for (int i = 0; i < 128; ++i) emb[(size_t) i] = 1.f;
+        auto linear = [](const std::vector<float>& w, const std::vector<float>& b, const std::vector<float>& x) {
+            const size_t n = b.size(), k = x.size();
+            std::vector<float> y(n);
+            for (size_t o = 0; o < n; ++o) {
+                double a = b[o];
+                for (size_t i = 0; i < k; ++i) a += (double) w[o * k + i] * x[i];
+                y[o] = (float) a;
+            }
+            return y;
+        };
+        auto c = linear(host(e + "t_embedder.mlp.0.weight"), host(e + "t_embedder.mlp.0.bias"), emb);
+        for (float& v : c) v = silu(v);
+        c = linear(host(e + "t_embedder.mlp.2.weight"), host(e + "t_embedder.mlp.2.bias"), c);
+        for (float& v : c) v = silu(v);
+        for (int i = 0;; ++i) {
+            const std::string p = e + "blocks." + std::to_string(i) + ".";
+            if (st.find(p + "conv1.weight") == nullptr) break;
+            enc_blocks_.push_back(dico_w(st, p, linear(host(p + "adaLN_modulation.1.weight"),
+                                                       host(p + "adaLN_modulation.1.bias"), c)));
+        }
+        if (enc_head_.empty() || enc_blocks_.empty()) throw std::runtime_error("image engine (Mage-VAE): no encoder");
+        {
+            const auto nw = host(e + "norm_out.weight"), nb = host(e + "norm_out.bias");
+            std::vector<float> m(2 * nw.size());
+            for (size_t i = 0; i < nw.size(); ++i) {
+                m[i] = nb[i];
+                m[nw.size() + i] = nw[i] - 1.f;
+            }
+            e_norm_ = upload(m);
+        }
+        e_out_ = conv_w(st, e + "proj_out");
+        enc_bytes_ = weight_bytes_ - before;
+        if (dry) {   // sizes only: what was counted stays out of the weights held
+            weight_bytes_ = before;
+            enc_head_.clear();
+            enc_blocks_.clear();
+        }
+        dry_ = was_dry;
+        return true;
+    } catch (const std::exception& ex) {
+        err = ex.what();
+        return false;
+    }
+}
+
+uint64_t MfVae::encode_scratch_bytes(int64_t h, int64_t w) const {
+    const int64_t n = h * w, Ch = enc_head_.empty() ? 768 : enc_head_[0].c1.out,
+                  Fh = enc_head_.empty() ? 3072 : enc_head_[0].c4.out;
+    return (uint64_t) n * (uint64_t) (Ch + C_ + 2 * Fh) * 4 + (uint64_t) n * (uint64_t) std::max(Fh, 3 * kPix) * 2 +
+           (uint64_t) 2 * Ch * 4;
+}
+
+void MfVae::encode_moments(const float* rgb, int64_t h, int64_t w, float* moments) {
+    if (!has_encoder()) throw std::runtime_error("image engine (Mage-VAE): the encoder is not loaded");
+    const int64_t n = h * w, Ch = enc_head_[0].c1.out, Fh = enc_head_[0].c4.out;
+    std::vector<void*> tmp;
+    float* hs = alloc<float>(tmp, n * Ch);
+    float* ls = alloc<float>(tmp, n * C_);
+    DiCoBufs b;
+    b.t0 = alloc<float>(tmp, n * Fh);
+    b.t1 = alloc<float>(tmp, n * Fh);
+    b.a16 = alloc<uint16_t>(tmp, n * std::max(Fh, 3 * kPix));
+    b.vec = alloc<float>(tmp, 2 * Ch);
+    patchify16(rgb, h, w, b.a16, s_);
+    conv(e_patch_, b.a16, h, w, hs);
+    for (const DiCo& d : enc_head_) dico(d, hs, h, w, b);
+    qi_to_f16(hs, n * Ch, b.a16, s_);
+    conv(e_down_, b.a16, h, w, ls);
+    qi_to_f16(ls, n * C_, b.a16, s_);
+    conv(e_fuse_, b.a16, h, w, hs);   // the state [n][C] (in hs's room)
+    for (const DiCo& d : enc_blocks_) dico(d, hs, h, w, b);
+    ln_mod16(hs, e_norm_, e_norm_ + C_, n, C_, b.a16, s_);
+    conv(e_out_, b.a16, h, w, moments);
+    gpu::stream_sync(s_);
+    for (void* p : tmp) gpu::free(p);
+}
+
+void MfVae::encode(const float* rgb, int64_t h, int64_t w, const float* eps, float* z) {
+    const int64_t n = h * w, Z = e_out_.out / 2;
+    float* mom = nullptr;
+    if (!gpu::alloc_device(&mom, (size_t) (n * 2 * Z) * 4))
+        throw std::runtime_error(std::string("image engine (Mage-VAE): GPU memory: ") + gpu::last_error());
+    encode_moments(rgb, h, w, mom);
+    posterior(mom, eps, n, Z, z, s_);
+    gpu::stream_sync(s_);
+    gpu::free(mom);
+}
+
+void MfVae::decode_raw(const float* z, int64_t h, int64_t w, float* rgb) {
+    grow(h, w);
+    const int64_t HW = h * w, H = h * kPatch, W = w * kPatch;
+    // the CoD decoder: the condition [HW][C]
+    qi_to_f16(z, HW * cin_.in, a16_, s_);
+    float* x = x_;
+    conv(cin_, a16_, h, w, x);
+    resblock(res_[0], x, h, w);
+    attention(attn_[0], x, h, w);
+    resblock(res_[1], x, h, w);
+    attention(attn_[1], x, h, w);
+    resblock(res_[2], x, h, w);
+    gn_silu16(x, gnw_, gnb_, HW, C_, true, a16_);
+    conv(cout_, a16_, h, w, cond_);
+    // the denoiser's blocks on the per-patch state
+    qi_to_f16(cond_, HW * C_, a16_, s_);
+    conv(s_in_, a16_, h, w, s_state_);
+    DiCoBufs b;
+    b.t0 = t0_;
+    b.t1 = t1_;
+    b.a16 = a16_;
+    b.vec = vec_;
+    for (const DiCo& d : blocks_) dico(d, s_state_, h, w, b);
+    // the per-pixel MLP, a band of patches at a time
+    for (int64_t p0 = 0; p0 < HW; p0 += cap_band_) {
+        const int64_t np = std::min(cap_band_, HW - p0);
+        qi_to_f16(cond_ + p0 * C_, np * C_, a16_, s_);
+        gemm_.f16(a16_, yx_.w, yxb_, np, yx_.out, yx_.in);
+        qi_bias_add(yxb_, yx_.b, np, yx_.out, s_);
+        qi_to_f16(s_state_ + p0 * C_, np * C_, a16_, s_);
+        gemm_.f16(a16_, ce_.w, ceb_, np, ce_.out, ce_.in);
+        qi_bias_add(ceb_, ce_.b, np, ce_.out, s_);
+        pixel_mlp(yxb_, ceb_, px_, dct_, p0, np, w, H, W, rgb, s_);
+    }
+}
+
+void MfVae::decode(const float* z, int64_t h, int64_t w, float* rgba) {
+    const int64_t HW = h * w * kPix;
+    float* rgb = nullptr;
+    if (!gpu::alloc_device(&rgb, (size_t) (3 * HW) * 4))
+        throw std::runtime_error(std::string("image engine (Mage-VAE): GPU memory: ") + gpu::last_error());
+    decode_raw(z, h, w, rgb);
+    to_rgba(rgb, HW, rgba, s_);
+    gpu::stream_sync(s_);
+    gpu::free(rgb);
+}
+
+}  // namespace strata::image

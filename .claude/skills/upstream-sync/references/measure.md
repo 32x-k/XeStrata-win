@@ -5,19 +5,18 @@ The tables of step 7 of SKILL.md: how they are run. The check that reads them is
 The engines, each built in a worktree of its own under `.claude/worktrees/` (or in the AMD container):
 
 - XeStrata: `dev`'s HEAD, the contrib-llvm build; one GPU at a time with `ONEAPI_DEVICE_SELECTOR` (`level_zero:*`, `cuda:*`; `hip:*` in the container).
-- upstream on the B70: the tag's `sycl/` port (the user's decision of 2026-10-18), built in its Docker image as its docs/INTEL.md says (`docker build -t strata-sycl-dev sycl/tools`, then its `build.sh` with `AOT=bmg-g31`) and run through `.claude/skills/release/scripts/up-sycl.sh` (`UP=` that script, with `UP_TREE`, `DATA` and `IDS` exported), which runs it as its `sycl/setup_intel.py` configures the card; its expert profile is the one that setup writes (`data/expert-profile-sycl.bin`).
+- upstream on the B70: the tag's `sycl/` port (the user's decision of 2026-10-18), built in its container image as its docs/INTEL.md says, with Podman (`podman build -t strata-sycl-dev sycl/tools`, then its `build.sh` with `AOT=bmg-g31`) and run through `.claude/skills/release/scripts/up-sycl.sh` (`UP=` that script, with `UP_TREE`, `DATA` and `IDS` exported), which runs it as its `sycl/setup_intel.py` configures the card; its expert profile is the one that setup writes (`data/expert-profile-sycl.bin`).
 - upstream on the RTX 4070: the tag's CUDA build; on the RX 9060 XT: its HIP build; both with the CMake options the tag's own setup.py builds it with (`build_engine_hip`: `-DSTRATA_PREFILL_MMQ=ON`, which docs/AMD_HIP.md's plain build command leaves out; without it upstream's prefill takes a slower path).
 
 Each engine's own shipped expert profile. No other work on a machine while it measures.
 
-Every GPU runs four measurements, each with both engines, and step 8 judges all four:
+Every GPU runs three measurements, each with both engines, and step 8 judges all three:
 
 | Measurement | Script | What it covers |
 | --- | --- | --- |
 | generate | `bench_generate.py` | the kernels and the speculative loop, both engines writing one text (`--spec-follow`); every model file below |
 | serve | `bench_serve.py` | `strata --serve`'s own decode loop and the conversation checkpoints, a chat of four turns; IQ3_XXS |
 | everyday use | `bench_usage.py` | the whole path a user meets: `serve/server.py`, the chat template, streaming, chats and a coding agent; IQ3_XXS |
-| image generation | `bench_image.py` | each engine's image generator as its setup sets it up on the GPU (Qwen-Image-2.1-Turbo: XeStrata's strata-image, upstream's sd-cli); the B70 too |
 
 Each GPU is one matrix path (the B70 XMX, the RTX 4070 tensor cores, the RX 9060 XT WMMA), and every GPU runs the same model files (their paths on each machine: `LOCAL.md`):
 
@@ -28,6 +27,7 @@ Each GPU is one matrix path (the B70 XMX, the RTX 4070 tensor cores, the RX 9060
 | IQ2_XS | `32k` | the experts' IQ1_M |
 | IQ3_S | `32k` | the experts' IQ4_XS |
 | UD-Q4_K_XL | `32k` | the experts' K-quants (Q4_K, Q5_K), Q5_1 and Q8_0 |
+| Gyro-M | `32k 1k` | the experts' trellis type TQ2_T (agentionai's Gyro, from upstream 0.2.0) and its prompt and decode paths (the user's decision of 2026-10-22) |
 
 Each tier stands for a kind of prompt: 1K the chunks below 1,024 tokens (the CPU takes a share of the experts), 32K a long context whose K/V is all in VRAM, 64K the K/V streamed from RAM (the path of every tier from 64K to 262K).
 The attention over the earlier tokens grows with the context (B70, IQ3_XXS: the prompt at 1,488 tok/s at 64K, 1,099 at 262K), so a loss in the attention or the K/V reads shows smaller at 64K: the run that decides (step 8) measures IQ3_XXS at 262K too.
@@ -44,6 +44,8 @@ python .claude/skills/upstream-sync/scripts/sync_collect.py $o/<file> xe-<commit
 
 `bench_generate.py` alternates the engines after a warm-up each; the merge runs one round per tier (`ROUNDS=1`, the user's decision of 2026-10-12; the scripts' own default is more).
 A model other than IQ3_XXS comes from a model config setup wrote (`CONFIG`: its files, its draft layer and the settings setup and the calibration chose, such as the RAM budget) or from its files (`PACK`, `NATIVE`, `PLE`); the same variables work for the serve and everyday scripts.
+Gyro-M's packs differ by engine: XeStrata's (`packs/gyro-m`, xs2) and upstream's (its `tools/iq_pack.py` of the tag, its native experts; `LOCAL.md`), so `UP` is `scripts/up-pack.sh` around upstream's command (`UP_REAL`, with `UP_PACK` upstream's pack; `PACK`, `NATIVE` and `PLE` are XeStrata's, one Gyro GGUF for both shards).
+Upstream's pack is made again only when its pack format changes.
 The three scripts are entry points to `tools/bench_core.py`, which setup's `--bench` runs too: the prompts, the conversations and how the runs are made and read are defined there once.
 Both engines write one text a tier (the user's decision of 2026-10-10): upstream runs first in the tier and writes its own answer, and every later run of both engines follows it with `--spec-follow` (upstream's own tool, ac131a3a).
 The rounds and the drafts accepted are then the same, so the output speeds compare the engines and not which text each happened to write: the two engines round differently, their answers part after a few dozen tokens, and on UD-Q4_K_XL that alone moved the output by 5%.
@@ -86,20 +88,4 @@ XE="..." UP="..." XE_ROOT=<xe tree> UP_ROOT=<up tree> XE_PROFILE=... UP_PROFILE=
 `XE` and `UP` are a binary or a wrapper, after `env K=V ...` if the engine needs variables (they go to its server's environment).
 `PY` is a Python with the server's packages (the data folder's `venv`).
 
-## Image generation
-
-`bench_image.py` runs each engine's image generator as its own setup sets it up on the GPU, through the command its server runs (`serve/images.py`): one 1024x1024 image of 8 steps a run from a fixed prompt and seed, the time of the image and of its sampling and VAE in it.
-XeStrata's is its resident image engine (`strata-image`, in `engine/` beside the text engine, or `XE_IMAGE_EXE` with `XE_LIB_DIRS`), measured warm: a warm-up image of another prompt in the same process first, as the server makes its images once the engine runs (`cold_s` in the run's JSON: the warm-up's, with the start).
-Upstream's is stable-diffusion.cpp's `sd-cli` on the backend its setup picks for the GPU, `UP_IMAGE_BACKEND` (CUDA on the RTX 4070, HIP on the RX 9060 XT, Vulkan on the B70), one process an image as its server runs it, built in its tree by its setup (`python -c "import setup; setup.build_image_engine('cuda', {'arch': '89'})"` in the tag's worktree, with `STRATA_NVCC` where the default nvcc is too old; `'hip', {'arch': 'gfx1200'}` in the AMD container; `'vulkan'` on the B70).
-The B70 is compared with upstream here too (the user's decision of 2026-10-15): an image takes a minute at most.
-A discarded warm-up per engine (the files into the page cache), then `ROUNDS` images per engine (the merge: 1), alternating:
-
-```sh
-XE_ROOT=<xe tree> UP_ROOT=<up tree> DATA=<data> QUANT=<Q8_0, Q6_K on a 12 GB card> UP_IMAGE_BACKEND=<cuda|hip|vulkan> \
-  [XE_IMAGE_PCI=<the GPU's PCI address> UP_IMAGE_GPU=N] PY=<python> ROUNDS=1 \
-  python .claude/skills/upstream-sync/scripts/bench_image.py $o/IQ3_XXS <GPU>
-```
-
-`XE_IMAGE_PCI` picks XeStrata's GPU by its PCI address (`STRATA_GPU_PCI`, `LOCAL.md`); `UP_IMAGE_GPU` picks upstream's among the backend's devices where the PC has more than one (`LOCAL.md`: Vulkan counts the processor's graphics first).
-Upstream's `sd-cli` is checked against the backend asked for (its `BUILD.json`; `UP_SD_CLI`: one elsewhere).
-Both use the same quant (`QUANT`): upstream's setup would pick a smaller one on a 12 GB card, XeStrata's streams what does not fit.
+Image generation is not compared with upstream (the user's decision of 2026-10-22; `bench_image.py` stays for a run of its own).

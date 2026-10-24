@@ -303,14 +303,10 @@ void native_router_set_enabled(bool value) { native_enabled.store(value, std::me
 bool native_router_enabled() { return native_enabled.load(std::memory_order_relaxed); }
 
 namespace {
-// One sub-group per token: the pinned kernel's 32 x 8 block has only its first warp active.
-void launch_native_router(sycl::queue& q, const float* logits_all, int32_t* ids_all, float* weights_all, int n_tok) {
-    q.parallel_for(sycl::nd_range<1>((size_t) n_tok * WARP, WARP), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-        const sycl::sub_group sg = it.get_sub_group();
-        const size_t tok = it.get_group(0);
-        const float* logits = logits_all + tok * 512;
-        int32_t* ids = ids_all + tok * 10;
-        float* weights = weights_all + tok * 10;
+// One token's top-10 by one sub-group (the pinned kernel's 32 x 8 block has only its first warp active): `ids2` and
+// `weights2`, when given, get the same values (the doorbell's mapped copies, written here instead of copied after)
+inline void top10_token(const sycl::sub_group& sg, const float* logits, int32_t* ids, float* weights, int32_t* ids2,
+                        float* weights2) {
         const int lane = (int) sg.get_local_linear_id();
         float values[16];
         for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
@@ -340,6 +336,7 @@ void launch_native_router(sycl::queue& q, const float* logits_all, int32_t* ids_
             if ((expert & 31) == lane) {
                 values[expert / 32] = -INFINITY;
                 ids[rank] = expert;
+                if (ids2 != nullptr) ids2[rank] = expert;
                 // Deliberately accumulate by WINNING EXPERT lane, not output rank.
                 // Multiple selected experts in one lane add in selection order.
                 selected_sum += best;
@@ -349,10 +346,57 @@ void launch_native_router(sycl::queue& q, const float* logits_all, int32_t* ids_
         for (int mask = 16; mask; mask >>= 1) selected_sum += sycl::permute_group_by_xor(sg, selected_sum, mask);
         selected_sum = sycl::max(selected_sum, 6.103515625e-5f);
         const float inverse_selected_sum = 1.0f / selected_sum;
-        if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+        if (lane < 10) {
+            weights[lane] = selected * inverse_selected_sum;
+            if (weights2 != nullptr) weights2[lane] = selected * inverse_selected_sum;
+        }
+}
+
+void launch_native_router(sycl::queue& q, const float* logits_all, int32_t* ids_all, float* weights_all, int n_tok) {
+    q.parallel_for(sycl::nd_range<1>((size_t) n_tok * WARP, WARP), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const size_t tok = it.get_group(0);
+        top10_token(it.get_sub_group(), logits_all + tok * 512, ids_all + tok * 10, weights_all + tok * 10, nullptr,
+                    nullptr);
     });
 }
+
+// *p += 1, read and incremented in memory, as elementwise.cpp's bump_host (the doorbell's ring)
+inline void bump_host(uint32_t* p) {
+    volatile uint32_t* v = p;
+    const uint32_t n = *v + 1u;
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+    *v = n;
+}
 }  // namespace
+
+void native_router_top10_publish(const float* logits, int32_t* ids, float* weights, int n_tok, const float* x,
+                                 int64_t n_x, float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq,
+                                 void* stream) {
+    if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
+        !valid(weights, (size_t) n_tok * 10 * 4))
+        throw std::invalid_argument("native router (publish) requires a stream and aligned [n,512]/[n,10] buffers");
+    sycl::queue& q = queue_for(stream, true);
+    const int wg = xe::work_group_upto_1024(q);
+    if (n_tok * WARP > wg) throw std::invalid_argument("native router (publish): more tokens than the work-group's sub-groups");
+    const int ni = (int) n_x;
+    // one work-group: the first n_tok sub-groups route a token each (as native_router_top10_multi), every work-item
+    // copies the rows, and after the fence and the barrier one work-item rings the host (as doorbell_publish)
+    q.parallel_for(sycl::nd_range<1>((size_t) wg, (size_t) wg), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int t = (int) it.get_local_id(0);
+        const int tok = (int) sg.get_group_linear_id();
+        if (tok < n_tok)
+            top10_token(sg, logits + (size_t) tok * 512, ids + (size_t) tok * 10, weights + (size_t) tok * 10,
+                        ids_out + (size_t) tok * 10, weights_out + (size_t) tok * 10);
+        for (int i = t; i < ni; i += wg) x_out[i] = x[i];
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+        sycl::group_barrier(it.get_group());
+        if (t == 0) {
+            sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+            bump_host(d_seq);
+        }
+    });
+}
 
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream) {
     if (!stream || !valid(logits, 512 * 4) || !valid(ids, 10 * 4) || !valid(weights, 10 * 4)

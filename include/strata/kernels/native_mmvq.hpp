@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace strata::kernels {
 
@@ -44,6 +45,11 @@ bool native_mmvq_multi_exact();
 // not reconstruct that sum from the quantized integers.
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
                           void* stream);
+/// native_quantize_q8_1's layout for any number of rows (one a token per head, the MLA's per-head products): the
+/// bytes of `rows` rows (0 and more: the offset of row `rows`), and their quantization (rows >= 1).  The products
+/// then read up to 8 of them at a time.
+std::size_t native_q8_1_rows_bytes(int n_in, int64_t rows);
+void native_quantize_q8_1_rows(const float* x, void* x_q8_1, int n_in, int64_t rows, void* stream);
 /// native_quantize_q8_1 of gate / (1 + exp(-gate)) * up (the shared expert's SwiGLU) in one launch, the same bytes as
 /// the SwiGLU's stored result quantized (upstream be7889ed).
 void native_swiglu_q8_1(const float* gate, const float* up, void* x_q8_1, int n_in, int ncols, void* stream);

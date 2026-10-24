@@ -12,7 +12,8 @@
 // with one, `vpsignb`.  The arithmetic is ggml's (ggml-cpu/quants.c, the `_generic` references) - only the
 // order of the float additions differs.
 //
-// Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), IQ4_XS (23).  IQ1_M stays on ggml-cpu.
+// Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ1_S (19), IQ3_S (21), IQ2_S (22), IQ4_XS (23).  IQ1_M stays
+// on ggml-cpu.
 // The K-quants Q2_K (10), Q3_K (11), Q4_K (12), Q5_K (13), Q6_K (14) and Q8_0 (8) take the same scheme (kq256_*, q80_256_*): their values are
 // unpacked once per block, every token applies them; the mins and Q6_K's offset of 32 come from the activation's
 // bsums, as in ggml's own dots.
@@ -28,6 +29,7 @@
 // initializer at namespace scope (#391, 016ea2e), the switches are read on first use.
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/swiglu_clamp.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -245,6 +247,27 @@ template <> struct Fmt32<22> {   // IQ2_S: d, qs[64] (32 grid bytes, 32 sign byt
                               (long long) iq2s_grid[sp[1]], (long long) iq2s_grid[sp[0]]);
         sgn = sgn_vec_at(b + 2 + 32 + 8 * (ptrdiff_t) j + 4 * (ptrdiff_t) half);
         sc = scale_vec(scale_vecs.s16[b[74 + 2 * j + half]]);
+    }
+};
+
+template <> struct Fmt32<19> {   // IQ1_S: d, qs[32] (8-bit grid indices), qh[8] u16 (4 x 3 high bits, scale, delta)
+    // a value is d (2 s + 1) (grid + delta), grid in {-1, 0, 1} and delta +-1/8 (IQ1S_DELTA): eight times it,
+    // 8 grid + -1, is an odd byte of -9 .. 9, its magnitude the grid vector and the byte itself the sign
+    static constexpr int bytes = 50;
+    static constexpr float K = 0.125f;
+    static inline void decode(const uint8_t* b, int j, int half, __m256i& g, __m256i& sgn, __m256i& sc) {
+        const int ib = 2 * j + half;
+        const uint8_t* q = b + 2 + 4 * (ptrdiff_t) ib;
+        const uint32_t h = u16(b + 34 + 2 * (ptrdiff_t) ib);
+        const __m256i v = _mm256_set_epi64x((long long) iq1s_grid[q[3] | (((h >> 9) & 7) << 8)],
+                                            (long long) iq1s_grid[q[2] | (((h >> 6) & 7) << 8)],
+                                            (long long) iq1s_grid[q[1] | (((h >> 3) & 7) << 8)],
+                                            (long long) iq1s_grid[q[0] | ((h & 7) << 8)]);
+        const __m256i v2 = _mm256_add_epi8(v, v), v4 = _mm256_add_epi8(v2, v2);
+        const __m256i v8 = _mm256_add_epi8(_mm256_add_epi8(v4, v4), _mm256_set1_epi8((h & 0x8000) ? -1 : 1));
+        g = _mm256_abs_epi8(v8);
+        sgn = v8;   // never 0: vpsignb takes its sign
+        sc = sc32(2 * (int) ((h >> 12) & 7) + 1);
     }
 };
 
