@@ -63,6 +63,30 @@ int main() {
     unsetenv("DS4_TOPK");
 #endif
     CHECK_EQ(experts_test_override(5, 6), 5);
+    // prompt chunk: 4096 from 10 GiB of VRAM (12 GB cards, 16, 24, 32, 80 GB), 1024 below
+    using strata::ds4::prefill_chunk_default;
+    CHECK_EQ(prefill_chunk_default(12227ull << 20), 4096);
+    CHECK_EQ(prefill_chunk_default(12 * GiB), 4096);
+    CHECK_EQ(prefill_chunk_default(32 * GiB), 4096);
+    CHECK_EQ(prefill_chunk_default(80 * GiB), 4096);
+    CHECK_EQ(prefill_chunk_default(10 * GiB), 4096);
+    CHECK_EQ(prefill_chunk_default(10 * GiB - 1), 1024);
+    CHECK_EQ(prefill_chunk_default(8 * GiB), 1024);
+    CHECK_EQ(prefill_chunk_default(0), 1024);
+    CHECK_EQ(prefill_chunk_default(16 * GiB), 4096);
+    CHECK_EQ(prefill_chunk_default(24 * GiB), 4096);
+    CHECK_EQ(prefill_chunk_default(12 * GiB, true), 1024);   // HIP builds: 1024 until measured
+    CHECK_EQ(prefill_chunk_default(32 * GiB, true), 1024);
+    // the experts-copied-into-RAM case (fallback 2048): 4096 on 12/16/24/32 GB cards, 2048 below 10 GiB and on HIP builds
+    CHECK_EQ(prefill_chunk_default(12227ull << 20, false, 2048), 4096);
+    CHECK_EQ(prefill_chunk_default(16 * GiB, false, 2048), 4096);
+    CHECK_EQ(prefill_chunk_default(24 * GiB, false, 2048), 4096);
+    CHECK_EQ(prefill_chunk_default(32 * GiB, false, 2048), 4096);
+    CHECK_EQ(prefill_chunk_default(8 * GiB, false, 2048), 2048);
+    CHECK_EQ(prefill_chunk_default(0, false, 2048), 2048);
+    CHECK_EQ(prefill_chunk_default(32 * GiB, true, 2048), 2048);
+    // the rule takes no --max-context: a 128K session on a 12 GB card gets the same 4096, because the chunk's buffers and the KV are allocated
+    // whole at load for that context and a chunk that does not fit there is halved before the first prompt (4096 -> 2048 -> 1024 -> ...)
     if (fails == 0) std::printf("experts rule: all checks passed\n");
     return fails == 0 ? 0 : 1;
 }
