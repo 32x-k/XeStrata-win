@@ -384,7 +384,13 @@ public:
 
 private:
     static constexpr int kFree = 0, kLoading = 1, kReady = 2, kFailed = 3;
-    static constexpr size_t kChunk = 64;   // slots a chunk of the arena
+    // slots a chunk of the arena (the unit the GPU mapping registers; DS4_STORE_CHUNK_SLOTS: a test knob for the registration segment size)
+    static size_t chunk_slots() {
+        const char* e = std::getenv("DS4_STORE_CHUNK_SLOTS");
+        const long v = e ? std::atol(e) : 0;
+        return v >= 8 && v <= 4096 ? (size_t) v : 64;
+    }
+    const size_t kChunk = chunk_slots();
     struct Slot {
         uint8_t* base = nullptr;   // the blob's first byte
         int layer = -1, expert = -1, pin = 0;
