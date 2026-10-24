@@ -976,6 +976,7 @@ struct Model::Impl {
     std::atomic<int> layer_of[kRing];
     std::thread service;
     std::atomic<bool> quit{false};
+    std::thread store_bg;   // the RAM store's fill beyond the first 48 GB, read after the model is ready (preload_store)
     bool sync_decode = std::getenv("DS4_SYNC") != nullptr;
     // a window of one through moe_gate_up / moe_down (DS4_MOE_TOKEN=0: win_experts, whose down rows run
     // before the wait for the CPU lane - the same bits, no faster)
@@ -1246,6 +1247,7 @@ struct Model::Impl {
             }
         quit.store(true);
         if (service.joinable()) service.join();
+        if (store_bg.joinable()) store_bg.join();   // (the store's background fill: it checks quit between its pieces)
         {
             std::lock_guard<std::mutex> lk(pf_mu);
         }
@@ -4614,9 +4616,29 @@ struct Model::Impl {
         for (const auto& c : cand) list.push_back(c.second);
         const double t0 = now_ms();
         const size_t leave = (size_t) (std::getenv("DS4_STORE_RESERVE") ? std::atoi(std::getenv("DS4_STORE_RESERVE")) : 192) + 64;
-        const size_t n = store->preload(list, leave);
-        std::fprintf(stderr, "ds4: RAM store: %zu of the profile's hottest experts read in (%.1f GB) in %.1f s\n", n,
-                     (double) n * (double) L[0].blob / 1e9, (now_ms() - t0) / 1000.0);
+        // The first 48 GB (what a store held before it could take every expert) are read before the first token; the rest of the
+        // hottest-first list is read after it, in pieces of 128 experts on a thread of its own, behind the model's own reads (a
+        // guess's priority) - the same bytes, none of the wait.  DS4_STORE_BG=0 reads everything first.
+        const size_t first = std::getenv("DS4_STORE_BG") && std::atoi(std::getenv("DS4_STORE_BG")) == 0
+                                 ? list.size()
+                                 : std::min(list.size(), (size_t) (48e9 / (double) std::max<size_t>(1, L[0].blob)));
+        const std::vector<std::pair<int, int>> head(list.begin(), list.begin() + (long) first), tail(list.begin() + (long) first, list.end());
+        const size_t n = store->preload(head, leave);
+        std::fprintf(stderr, "ds4: RAM store: %zu of the profile's hottest experts read in (%.1f GB) in %.1f s%s\n", n,
+                     (double) n * (double) L[0].blob / 1e9, (now_ms() - t0) / 1000.0,
+                     tail.empty() ? "" : "; the rest is read in the background");
+        if (tail.empty()) return;
+        store_bg = std::thread([this, tail, leave] {
+            const double tb = now_ms();
+            size_t got = 0;
+            std::vector<std::pair<int, int>> piece;
+            for (size_t i = 0; i < tail.size() && !quit.load(std::memory_order_relaxed); i += 128) {
+                piece.assign(tail.begin() + (long) i, tail.begin() + (long) std::min(tail.size(), i + 128));
+                got += store->preload(piece, leave);
+            }
+            std::fprintf(stderr, "ds4: RAM store: %zu more experts (%.1f GB) read in the background in %.1f s\n", got,
+                         (double) got * (double) L[0].blob / 1e9, (now_ms() - tb) / 1000.0);
+        });
     }
     // at a window boundary: the store's ready slots become the device's (zero-copy) experts, taken back when it needs the room;
     // each touched layer's whole table is written again (VRAM slots, the store's, 0), in stream order before the next window
