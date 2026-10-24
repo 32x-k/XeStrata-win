@@ -12,7 +12,8 @@ path, or on Windows a file the daemon writes its loopback port and a random toke
 first).  The lines are strata-image's own (src/image/strata_image.cpp): on connecting a client gets READY (or ERROR,
 and the daemon ends); a request line (IMG, NEED, FREE, FIT, BUDGET, RELEASE) waits for the engine and gets its lines
 up to the answer (STEP lines before an IMAGE); STOP ends the client's running image after its step; QUIT closes the
-connection; SHUTDOWN ends the engine and the daemon.  Without a client and a request for --idle seconds (default 1800)
+connection; SHUTDOWN ends the engine (after a running request) and the daemon, and answers STOPPED once the engine
+is gone.  Without a client and a request for --idle seconds (default 1800)
 the daemon ends, and so it does when the engine ends.
 """
 from __future__ import annotations
@@ -135,8 +136,12 @@ class Daemon:
                 line = requests.get()
                 if line is None or line == "QUIT":
                     return
-                if line == "SHUTDOWN":
-                    self.done.set()
+                if line == "SHUTDOWN":   # the engine ended (after a running request) before the answer, so that
+                    self.done.set()      # the asker can take the GPU at once
+                    with self.lock:
+                        self.stop()
+                    with contextlib.suppress(OSError, ValueError):
+                        write(f, "STOPPED")
                     return
                 if line:
                     self.request(conn, f, line)
