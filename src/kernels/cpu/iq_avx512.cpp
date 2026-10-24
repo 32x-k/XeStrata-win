@@ -451,6 +451,12 @@ void rows_m(const uint8_t* w, size_t rb, int n, const block_q8_K* const* y, cons
     const __m256i mask = _mm256_set1_epi16(0x7), mone = _mm256_set1_epi16(1), mtwo8 = _mm256_set1_epi8(2);
     const __m256i scales_shift = _mm256_set_epi64x(9, 3, 6, 0);
     const __m512i zero = _mm512_setzero_si512();
+    // the 32 scale words a 64-weight step (8 each of chunks 4 it .. 4 it + 3) out of the 16 decoded scales (their order: 4 e + j for
+    // shift e, word j): one vpermw a step instead of two vpshufb + adds + an insert
+    __m512i sidx[4];
+    for (int it = 0; it < 4; ++it)
+        sidx[it] = _mm512_set_epi16(12 + it, 12 + it, 12 + it, 12 + it, 12 + it, 12 + it, 12 + it, 12 + it, 4 + it, 4 + it, 4 + it, 4 + it, 4 + it, 4 + it,
+                                    4 + it, 4 + it, 8 + it, 8 + it, 8 + it, 8 + it, 8 + it, 8 + it, 8 + it, 8 + it, it, it, it, it, it, it, it, it);
     for (int r = r0; r < r1; ++r) {
         __m256 a1[NT], a2[NT];
         for (int t = 0; t < NT; ++t) a1[t] = a2[t] = _mm256_setzero_ps();
@@ -469,8 +475,7 @@ void rows_m(const uint8_t* w, size_t rb, int n, const block_q8_K* const* y, cons
             __m256i scales = _mm256_set1_epi64x((long long) u64(scb));
             scales = _mm256_srlv_epi64(scales, scales_shift);
             scales = _mm256_add_epi16(_mm256_slli_epi16(_mm256_and_si256(scales, mask), 1), mone);
-            __m256i sidx1 = _mm256_set1_epi16(0x0100);
-            __m256i sidx2 = _mm256_add_epi8(sidx1, _mm256_set1_epi8(8));
+            const __m512i sctab = _mm512_castsi256_si512(scales);
             __m512i s1[NT], s2[NT];
             for (int t = 0; t < NT; ++t) s1[t] = s2[t] = zero;
             for (int it = 0; it < 4; ++it) {
@@ -483,13 +488,10 @@ void rows_m(const uint8_t* w, size_t rb, int n, const block_q8_K* const* y, cons
                 const __m512i g = _mm512_set_epi64((long long) iq1s_grid[ix[7]], (long long) iq1s_grid[ix[6]], (long long) iq1s_grid[ix[5]],
                                                    (long long) iq1s_grid[ix[4]], (long long) iq1s_grid[ix[3]], (long long) iq1s_grid[ix[2]],
                                                    (long long) iq1s_grid[ix[1]], (long long) iq1s_grid[ix[0]]);
-                const __m512i negv = _mm512_maskz_set1_epi64((__mmask8) _pext_u32(qh32, 0x88888888u), -1);
-                const __m256i sca = _mm256_shuffle_epi8(scales, sidx1);
-                const __m256i scb2 = _mm256_shuffle_epi8(scales, sidx2);
-                sidx1 = _mm256_add_epi8(sidx1, mtwo8);
-                sidx2 = _mm256_add_epi8(sidx2, mtwo8);
-                const __m512i sc = _mm512_inserti64x4(_mm512_castsi256_si512(sca), scb2, 1);
-                const __m512i ssc = _mm512_sub_epi16(_mm512_xor_si512(sc, negv), negv);
+                const __m512i sc = _mm512_permutexvar_epi16(sidx[it], sctab);
+                // the delta sign of each 8-weight group (bit 3 of its qh nibble) negates that group's 4 scale words
+                const __mmask32 dneg = (__mmask32) (_pdep_u32(_pext_u32(qh32, 0x88888888u), 0x11111111u) * 15u);
+                const __m512i ssc = _mm512_mask_sub_epi16(sc, dneg, zero, sc);
                 const __m512i ag = _mm512_abs_epi8(g);
                 const __mmask64 gneg = _mm512_movepi8_mask(g);
                 for (int t = 0; t < NT; ++t) {
