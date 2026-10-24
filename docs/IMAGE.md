@@ -48,9 +48,10 @@ xestrata --setup --images qwen-image-turbo     # installed from the source: ./se
   Every file is pinned to a revision and checked by its SHA-256.
 - Setup run interactively asks for the image models too (numbers, comma-separated; with two or more, which is the default, and whether to take the text encoder with the refusal direction removed). Run again for a model, it offers that model's present ones as the default answer.
 - It does not ask with `--images` or `--yes`. Run again with `--yes` and without `--images`, setup keeps the earlier image settings as they are.
-- The Windows launcher (`xestrata.exe`) has the image models on its page for installing a model, and an installed model's "Images ..." chooses its image models again (none takes image generation out).
+- The Windows launcher (`xestrata.exe`) has the image models (and the sizes of those with several) on its page for installing a model, and an installed model's "Images ..." chooses its image models again (none takes image generation out).
 - `--images no` removes image generation.
 - Several models can be installed, comma-separated (`--images qwen-image-turbo,magetrail`). The first is the default; the others are used through the API's `model` or the web page's choice of model.
+  A size after a model's name chooses that model's own (`--images qwen-image-turbo:Q8_0,qwen-image-base:Q4_K_M`); a model without one takes `--image-quant`'s, or the RAM decides.
   One runs on the GPU at a time: a request for another model ends the earlier model's engine and starts its own (a few seconds to a dozen or so). The RAM needed is the largest model's.
 - With several XeStrata servers on one GPU, image jobs still run one at a time on that GPU: a job waits while another server's runs (the Monitor says so), and when its turn comes it ends the other models' engines first. Servers of the same model use the same engine.
 - `tools/image/install.py --config <the config file>` also adds it to an existing config (`--model`, `--quant` and the others mean what setup's options do).
