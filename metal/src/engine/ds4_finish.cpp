@@ -18,6 +18,8 @@
 
 // called by the gpu layer's synchronisation: everything batched must reach the GPU before a host read
 extern "C" void ds4_metal_flush();
+extern "C" unsigned long long ds4_dispatch_seq();
+static unsigned long long g_q8_deduped = 0;
 
 #define DSV41_PROBE(fmt, ...) do { static bool once_ = false; if (!once_) { once_ = true; std::fprintf(stderr, "[probe] " fmt, __VA_ARGS__); } } while (0)
 

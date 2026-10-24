@@ -262,10 +262,6 @@ static std::unordered_map<void*, std::string> g_pipe_names;
 static std::unordered_map<std::string, uint64_t> g_kernel_counts;
 static void encode(id<MTLComputeCommandEncoder> enc, const Dispatch& d) {
     require_fit(d, "dispatch");
-    {
-        std::lock_guard<std::mutex> lk(g_hist_mu);
-        ++g_kernel_counts[d.p ? d.p->name : std::string("<null>")];
-    }
     [enc setComputePipelineState:P(d.p)];
     for (size_t i = 0; i < d.args.size(); ++i) {
         const Arg& a = d.args[i];
@@ -300,6 +296,8 @@ static void ds4_report_counts() {
     for (size_t i = 0; i < v.size() && i < 14; ++i)
         std::fprintf(stderr, "  %6llu  %s\n", (unsigned long long) v[i].first, v[i].second.c_str());
 }
+
+extern "C" unsigned long long ds4_dispatch_seq() { return g_disp_count.load(); }
 
 void Context::flush_runs() {
     if (!g_count_reg) { g_count_reg = true; std::atexit(ds4_report_counts); }
