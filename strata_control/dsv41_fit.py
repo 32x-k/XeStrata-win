@@ -62,10 +62,11 @@ ISTA_SETS = {
                         "ppl": "16%", "ram_ok_gb": 40.0, "ram_great_gb": 160.0, "disk_total": 257.0,
                         "quality": "about 16% above the original model's perplexity (the 2-bit price)"},
     # IQ1_M (1.75 bpw): 120,721,120,256 bytes of shards; experts = the shards minus the 6.16 GB of dense weights.  RAM class from the experts' size against
-    # the 2.00 set's measured 40 GB (not measured on a computer yet); quality: placeholder until the H100 score is in.
+    # the 2.00 set's measured 40 GB (not measured on a computer yet); quality: the H100's 4,995-position score (KL 0.217, ppl 3.80, +21%; code +8.9%, agent +10.2%, English prose +53%).
     "IST-DAS-1.75bpw": {"title": "IST-DAS 1.75 bpw", "set_bytes": 120_721_120_256, "experts_gb": 114.56, "profile": "profile-2.00.bin",
-                        "ram_ok_gb": 34.0, "disk_total": 239.0,
-                        "quality": "slightly lower than the 2.00 version (the smallest; a quality figure follows when it is measured)"},
+                        "ppl": "21%", "ram_ok_gb": 34.0, "disk_total": 239.0,
+                        "quality": "about 21% above the original model's perplexity: the smallest, fine for code and agent work, noticeably weaker "
+                                   "on plain prose; pick 2.00 if it fits"},
     "IST-DAS-2.25bpw": {"title": "IST-DAS 2.25 bpw", "set_bytes": 155_225_824_256, "experts_gb": 149.06, "profile": "profile-2.25.bin",
                         "ppl": "8%", "ram_ok_gb": 44.0, "ram_great_gb": 176.0, "disk_total": 274.0,
                         "quality": "about 8% above the original model's perplexity (code and agent work about 2.5-3.5% above), "

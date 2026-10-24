@@ -10,7 +10,7 @@ Strata now runs DeepSeek V4.1-Flash on a PC with one 12 GB graphics card and 46 
 
   | set | download | quality against the original model |
   |---|---|---|
-  | IQ1_M (1.75 bits) | 239 GB | being measured; ISTA-DASLab's model card: keeps 98.7% of the base model's task average (AIME25, GPQA-Diamond, LiveCodeBench v6) |
+  | IQ1_M (1.75 bits) | 239 GB | perplexity +21%; code and agent text +8.9% and +10.2%; weaker on plain English prose. ISTA-DASLab's model card: keeps 98.7% of the base model's task average (AIME25, GPQA-Diamond, LiveCodeBench v6) |
   | IQ2_XXS (2.00 bits) | 257 GB | perplexity +16%; code and agent text +8.5% and +5.9% |
   | IQ2_XS (2.25 bits) | 274 GB | perplexity +7.7% to +8.3%; code and agent text +3.5% and +2.5% |
   | IQ4_NL (Engram table, not a model to pick) | 111 GB, already in all three downloads above | The 4-bit Engram lookup table the model reads from RAM or SSD; all three sets use this one file |

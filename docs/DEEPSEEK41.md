@@ -29,7 +29,7 @@ with an out-of-memory message. Both are said before anything is downloaded.
 Setup offers three official sets (ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF, pinned): **IQ1_M, 1.75 bpw** (`ist-das-1.75bpw`, 121 GB, slightly lower quality; setup recommends it where 2.00 is tight in memory or disk), **IQ2_XXS, 2.00 bpw** (138 GB) and **IQ2_XS, 2.25 bpw** (155 GB). All use the
 same 111 GB n-gram table (downloaded once into `models/deepseek-v4.1-flash-shared`) and the 8 GB DSpark drafter: 257 GB of disk for
 2.00, 274 GB for 2.25, 239 GB for 1.75, 533 GB for all three. Quality against the original model: perplexity +16% on 2.00, +8% on 2.25 (code and agent work
-about +3.5% / +2.5% on 2.25). IQ1_M: our KL and perplexity are being measured; ISTA-DASLab's model card says it keeps 98.7% of the base model's task average (AIME25, GPQA-Diamond, LiveCodeBench v6).
+about +3.5% / +2.5% on 2.25). IQ1_M: perplexity +21% (KL 0.217, top-1 82.5%); code +8.9%, agent work +10.2%, multilingual +14%, docs +24%, plain English prose +53%, so it is weaker on prose. ISTA-DASLab's model card says it keeps 98.7% of the base model's task average (AIME25, GPQA-Diamond, LiveCodeBench v6).
 
 | File | Size | What it is |
 | --- | ---: | --- |
