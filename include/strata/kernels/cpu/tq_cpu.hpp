@@ -1,15 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
-// include/strata/kernels/cpu/tq_cpu.hpp - the trellis expert formats (TQ2_T / TQK6 / TQK7, ggml types 144-146 of the
-// agention llama.cpp fork) on the CPU: decode-and-dot against Q8_0 activations (ggml's block_q8_0), one or several
-// tokens per call, on AVX-512, AVX2 or plain C++.
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+// include/strata/kernels/cpu/tq_cpu.hpp - the trellis expert formats (TQ2_T / TQK6 / TQK7 / TQP5 / TQP6 / TQP7, ggml
+// types 144-149 of the agention llama.cpp fork) on the CPU: decode-and-dot against Q8_0 activations (ggml's
+// block_q8_0), one or several tokens per call, on AVX-512, AVX2 or plain C++.
 //
-// THE FORMAT (third_party/ggml/ggml-common-tq.h): a 128-weight block is {fp16 d; 32 steps of K bits} (K = 8 / 6 / 7).
-// Step t has a 15-bit state; the state's hash picks two points (pairs) of a 2048-point fp16 codebook, which are
-// weights 4t..4t+3, times d.
+// THE FORMAT (third_party/ggml/ggml-common-tq.h): a 128-weight block is {fp16 d; 32 steps of K bits} (K = 8 / 6 / 7),
+// or for TQP {fp16 d; 64 steps of K bits} (K = 5 / 6 / 7).  Step t has a 15-bit state; the state's hash picks two
+// points (pairs) of a 2048-point fp16 codebook, which are weights 4t..4t+3, times d; a TQP step takes the first point
+// only, weights 2t, 2t+1.
 //
 // THE DECODE: a 32768 x 4 int16 table maps a state straight to its four weights at scale 2^13 (256 KiB, the
-// approach of the fork's ggml-cpu vec_dot): one 8-byte lookup per four weights, no hash.  The int16 rounding is
+// approach of the fork's ggml-cpu vec_dot): one 8-byte lookup per four weights (a TQP step reads its first 4 bytes),
+// no hash.  The int16 rounding is
 // exact for codebook values >= 2^-3 in magnitude and within 2^-14 below that; it is the same table, rounded the
 // same way, as the fork's ggml-cpu kernels.
 //
@@ -33,13 +36,19 @@ namespace strata::kernels::cpu {
 
 enum class TqIsa : int { scalar = 0, avx2 = 1, avx512 = 2 };
 
-/// TQ2_T (144), TQK6 (145), TQK7 (146).
+/// TQ2_T (144), TQK6 (145), TQK7 (146), TQP5 (147), TQP6 (148), TQP7 (149).
 bool tq_supported(int ggml_type) noexcept;
-/// Bits per step: 8, 6, 7 (0 for any other type).
+/// Bits per step: 8, 6, 7, 5, 6, 7 (0 for any other type).
 int tq_kbits(int ggml_type) noexcept;
-/// Values per block of the trellis types, and bytes per block (2 + 4 * bits: 34, 26, 30).
+/// Steps per block: 32 (TQ2_T, TQK), 64 (TQP), 0 for any other type.
+inline int tq_steps(int ggml_type) noexcept {
+    return ggml_type >= 144 && ggml_type <= 146 ? 32 : ggml_type >= 147 && ggml_type <= 149 ? 64 : 0;
+}
+/// Values per block of the trellis types, and bytes per block (2 + steps * bits / 8: 34, 26, 30, 42, 50, 58).
 constexpr int kTqBlock = 128;
-inline size_t tq_block_bytes(int ggml_type) noexcept { return (size_t) (2 + 4 * tq_kbits(ggml_type)); }
+inline size_t tq_block_bytes(int ggml_type) noexcept {
+    return (size_t) (2 + tq_steps(ggml_type) * tq_kbits(ggml_type) / 8);
+}
 /// The best ISA this CPU runs (capped by STRATA_TQ_ISA).
 TqIsa tq_isa();
 /// Whether this CPU can run `isa` at all (scalar: always).
@@ -74,12 +83,12 @@ struct TqAct {
     alignas(64) float d[kTqMaxN / 32];
 };
 void unpack_act(const void* q8_0, int n, TqAct& a);
-// the per-ISA row kernels (dot products only; `out[t][r]` for rows [r0, r1))
-void tq_rows_scalar(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+// the per-ISA row kernels (dot products only; `out[t][r]` for rows [r0, r1)); `ty` the ggml type
+void tq_rows_scalar(int ty, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                     float* const* out, int r0, int r1);
-void tq_rows_avx2(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+void tq_rows_avx2(int ty, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                   float* const* out, int r0, int r1);
-void tq_rows_avx512(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+void tq_rows_avx512(int ty, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                     float* const* out, int r0, int r1);
 }  // namespace tq_detail
 

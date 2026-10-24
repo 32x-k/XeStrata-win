@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-// src/kernels/cpu/tq_avx512.cpp - the trellis expert rows (TQ2_T / TQK6 / TQK7) on AVX-512 F/BW/VL/VNNI
+// src/kernels/cpu/tq_avx512.cpp - the trellis expert rows (TQ2_T / TQK6 / TQK7 / TQP5-7) on AVX-512 F/BW/VL/VNNI
 // (tq_cpu.hpp).  Reached behind cpu_avx512_ok() only.
 //
 // Per 128-weight block: the AVX2 kernel's decode (scalar states, scalar 8-byte state-table loads, one ZMM of 32
@@ -40,23 +40,34 @@ inline __m256i rows4(const long long* tab, uint32_t s0, uint32_t s1, uint32_t s2
     return _mm256_blend_epi32(v, _mm256_set1_epi64x(tab[s3]), 0xC0);
 }
 
-template <int KB>
-inline __m512i rows8(const long long* tab, const uint8_t* qs, uint64_t wr, int t0) {
-    const __m256i lo = rows4(tab, tq_state<KB>(qs, wr, t0), tq_state<KB>(qs, wr, t0 + 1), tq_state<KB>(qs, wr, t0 + 2),
-                             tq_state<KB>(qs, wr, t0 + 3));
-    const __m256i hi = rows4(tab, tq_state<KB>(qs, wr, t0 + 4), tq_state<KB>(qs, wr, t0 + 5),
-                             tq_state<KB>(qs, wr, t0 + 6), tq_state<KB>(qs, wr, t0 + 7));
-    return _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+// weights 32k .. 32k+31 = Q8_0 sub-block k: states 8k .. 8k+7 (four weights each), or for TQP 16k .. 16k+15 (their
+// rows' first pairs, two weights each)
+template <int TY>
+inline __m512i rows8(const long long* tab, const uint8_t* qs, uint64_t wr, int k) {
+    if constexpr (TqFmt<TY>::NS == 64) {
+        const int32_t* t32 = (const int32_t*) tab;
+        const int t0 = 16 * k;
+        int32_t p[16];
+        for (int j = 0; j < 16; ++j) p[j] = t32[2 * tq_state<TY>(qs, wr, t0 + j)];
+        return _mm512_loadu_si512(p);
+    } else {
+        const int t0 = 8 * k;
+        const __m256i lo = rows4(tab, tq_state<TY>(qs, wr, t0), tq_state<TY>(qs, wr, t0 + 1),
+                                 tq_state<TY>(qs, wr, t0 + 2), tq_state<TY>(qs, wr, t0 + 3));
+        const __m256i hi = rows4(tab, tq_state<TY>(qs, wr, t0 + 4), tq_state<TY>(qs, wr, t0 + 5),
+                                 tq_state<TY>(qs, wr, t0 + 6), tq_state<TY>(qs, wr, t0 + 7));
+        return _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+    }
 }
 
 // NT, the token count, is a template parameter so the accumulators stay in registers: with nt at run time clang kept
 // acc[] on the stack, a store and a load in every block's chain (TQ2_T rows 13-36% slower on an i7-14700's P-core than
 // GCC's build, 2026-10-23)
-template <int KB, int NT>
+template <int TY, int NT>
 void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, float* const* out, int r0, int r1) {
     constexpr int nt = NT;
     const int nb = n / 128;
-    constexpr size_t bsz = 2 + 4 * KB;
+    constexpr size_t bsz = 2 + TqFmt<TY>::NB;
     const long long* tab = (const long long*) tq_state_table();
     for (int r = r0; r < r1; ++r) {
         const uint8_t* x = w + (size_t) r * row_bytes;
@@ -65,10 +76,9 @@ void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, fl
         for (int i = 0; i < nb; ++i) {
             const uint8_t* blk = x + (size_t) i * bsz;
             const uint8_t* qs = blk + 2;
-            const uint64_t wr = tq_wrap<KB>(qs);
-            // states 8k .. 8k+7 -> weights 32k .. 32k+31 = Q8_0 sub-block k
-            const __m512i w0 = rows8<KB>(tab, qs, wr, 0), w1 = rows8<KB>(tab, qs, wr, 8);
-            const __m512i w2 = rows8<KB>(tab, qs, wr, 16), w3 = rows8<KB>(tab, qs, wr, 24);
+            const uint64_t wr = tq_wrap<TY>(qs);
+            const __m512i w0 = rows8<TY>(tab, qs, wr, 0), w1 = rows8<TY>(tab, qs, wr, 1);
+            const __m512i w2 = rows8<TY>(tab, qs, wr, 2), w3 = rows8<TY>(tab, qs, wr, 3);
             const __m128 dx = _mm_set1_ps(tq_half_to_float(tq_ld16(blk)));
             for (int t = 0; t < nt; ++t) {
                 const __m512i* q = (const __m512i*) (a[t]->q + 128 * i);
@@ -89,30 +99,36 @@ void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, fl
     }
 }
 
-template <int KB>
+template <int TY>
 void rows_nt(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt, float* const* out, int r0,
              int r1) {
     static_assert(kTqMaxTokens == 8, "one case per token count");
     switch (nt) {
-    case 1: rows_t<KB, 1>(w, row_bytes, n, a, out, r0, r1); break;
-    case 2: rows_t<KB, 2>(w, row_bytes, n, a, out, r0, r1); break;
-    case 3: rows_t<KB, 3>(w, row_bytes, n, a, out, r0, r1); break;
-    case 4: rows_t<KB, 4>(w, row_bytes, n, a, out, r0, r1); break;
-    case 5: rows_t<KB, 5>(w, row_bytes, n, a, out, r0, r1); break;
-    case 6: rows_t<KB, 6>(w, row_bytes, n, a, out, r0, r1); break;
-    case 7: rows_t<KB, 7>(w, row_bytes, n, a, out, r0, r1); break;
-    case 8: rows_t<KB, 8>(w, row_bytes, n, a, out, r0, r1); break;
+    case 1: rows_t<TY, 1>(w, row_bytes, n, a, out, r0, r1); break;
+    case 2: rows_t<TY, 2>(w, row_bytes, n, a, out, r0, r1); break;
+    case 3: rows_t<TY, 3>(w, row_bytes, n, a, out, r0, r1); break;
+    case 4: rows_t<TY, 4>(w, row_bytes, n, a, out, r0, r1); break;
+    case 5: rows_t<TY, 5>(w, row_bytes, n, a, out, r0, r1); break;
+    case 6: rows_t<TY, 6>(w, row_bytes, n, a, out, r0, r1); break;
+    case 7: rows_t<TY, 7>(w, row_bytes, n, a, out, r0, r1); break;
+    case 8: rows_t<TY, 8>(w, row_bytes, n, a, out, r0, r1); break;
     default: break;
     }
 }
 
 }  // namespace
 
-void tq_rows_avx512(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+void tq_rows_avx512(int ty, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                     float* const* out, int r0, int r1) {
-    if (kb == 8) rows_nt<8>(w, row_bytes, n, a, nt, out, r0, r1);
-    else if (kb == 6) rows_nt<6>(w, row_bytes, n, a, nt, out, r0, r1);
-    else rows_nt<7>(w, row_bytes, n, a, nt, out, r0, r1);
+    switch (ty) {
+        case 144: rows_nt<144>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        case 145: rows_nt<145>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        case 146: rows_nt<146>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        case 147: rows_nt<147>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        case 148: rows_nt<148>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        case 149: rows_nt<149>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        default: break;
+    }
 }
 
 }  // namespace strata::kernels::cpu::tq_detail
