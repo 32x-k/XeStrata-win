@@ -9,7 +9,14 @@ export const DROP_EVENT = 'strata:drop-files';
 /** The pictures on the clipboard, named so each one is told apart in the composer (a pasted screenshot arrives as "image.png"). */
 export function pastedFiles(data: DataTransfer | null | undefined): File[] {
   const out: File[] = [];
-  for (const file of Array.from(data?.files ?? [])) {
+  // `files` is empty for some screenshot tools (Win+Shift+S in WebView2): the same picture is then only in `items`.
+  const found = Array.from(data?.files ?? []);
+  if (!found.some(f => f.type.startsWith('image/')))
+    for (const item of Array.from(data?.items ?? [])) {
+      const file = item.kind === 'file' && item.type.startsWith('image/') ? item.getAsFile() : null;
+      if (file) found.push(file);
+    }
+  for (const file of found) {
     if (!file.type.startsWith('image/')) continue;
     const extension = file.type.split('/')[1]?.replace('jpeg', 'jpg').replace(/[+].*/, '') || 'png';
     out.push(new File([file], `Pasted picture ${new Date().toLocaleTimeString().replace(/[^0-9]+/g, '-').replace(/-$/, '')}${out.length ? `-${out.length + 1}` : ''}.${extension}`, { type: file.type }));

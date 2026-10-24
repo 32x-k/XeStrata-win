@@ -41,6 +41,7 @@ import { relTime, cx, duration, tokens, tps } from '../lib/format';
 import { createSubagentExample, pushToast, setPreviewTabClosed, branchFrom, continueLast, markRead, resolveTool, retryLast, selectSession, rewindTo, sendMessage, stopStreaming, useStore, } from '../lib/store';
 import { getSlashCommands } from '../lib/commands';
 import { useLocation } from '../lib/router';
+import { copyAndTell } from '../lib/copy-text';
 import { composerSends } from '../lib/shortcut-bindings';
 import type { ChatMessage, Session, ToolCall } from '../lib/types';
 export function ChatScreen() {
@@ -620,7 +621,7 @@ function Message({ message: m, isLast, onEditPrompt, onPreview, onOpenLink, onOp
         <div className="st-msg__meta">
           <time dateTime={m.at} title={tr(new Date(m.at).toLocaleString(localeTag()))}>{tr(sentTime)}</time>
           <span className="st-msg__actions">
-            <IconBtn name="copy" title={tr("Copy message")} onClick={() => void navigator.clipboard.writeText(m.content)}/>
+            <IconBtn name="copy" title={tr("Copy message")} onClick={() => void copyAndTell(m.content, 'Message')}/>
             <IconBtn name="refresh" title={tr("Rewind to here")} disabled={streaming} onClick={() => {
                 const prompt = rewindTo(m.id);
                 if (prompt !== null)
@@ -659,11 +660,11 @@ function Message({ message: m, isLast, onEditPrompt, onPreview, onOpenLink, onOp
       {tr(!m.streaming && !m.timeSkipId && (m.content || m.error) ? (<div className="st-msg__meta">
           <span className="st-msg__actions">
             {tr(isLast ? <>
-              <IconBtn name="copy" title={tr("Copy response")} onClick={() => void navigator.clipboard.writeText(m.content)}/>
+              <IconBtn name="copy" title={tr("Copy response")} onClick={() => void copyAndTell(m.content, 'Message')}/>
               <IconBtn name="refresh" title={tr("Ask again")} onClick={() => void retryLast(m.id)}/>
             </> : null)}
             <MessageMenu label={tr("More response actions")}>
-              {tr(!isLast ? <><button role="menuitem" className="menu__item" onClick={() => void navigator.clipboard.writeText(m.content)}>{tr("Copy response")}</button><button role="menuitem" className="menu__item" onClick={() => void retryLast(m.id)}>{tr("Ask again")}</button></> : null)}
+              {tr(!isLast ? <><button role="menuitem" className="menu__item" onClick={() => void copyAndTell(m.content, 'Message')}>{tr("Copy response")}</button><button role="menuitem" className="menu__item" onClick={() => void retryLast(m.id)}>{tr("Ask again")}</button></> : null)}
               {tr(isLast ? <button role="menuitem" className="menu__item" onClick={() => void continueLast()}>{tr("Continue")}</button> : null)}
               <button role="menuitem" className="menu__item" onClick={() => branchFrom(m.id)}>{tr("Branch from here")}</button>
               {tr(m.tokens || m.tps || m.durationMs ? <p className="xs muted response-stats">{tr(m.tokens ? `${tokens(m.tokens)} tokens` : '')}{tr(m.tps ? ` · ${tps(m.tps)} tok/s` : '')}{tr(m.durationMs ? ` · ${duration(m.durationMs)}` : '')}{tr(m.demo ? ' · Example' : '')}</p> : null)}
