@@ -30,11 +30,16 @@ STEPS = (("model", "Model"), ("cards", "Cards"), ("folder", "Folder"), ("context
          ("parallel", "Parallel"), ("tuning", "Tuning"), ("advanced", "Advanced"), ("access", "Access"), ("save", "Save"))
 
 
+STEP_LABELS = {**dict(STEPS), "speed": "Speed"}
+
+
 def flow_for(ctx) -> list[str]:
-    """The steps of this computer: the Cards step exists only when two or more graphics cards can be used."""
+    """The steps of this computer: the Cards step exists only when two or more graphics cards can be used; the Speed step only for DeepSeek."""
     ids = [sid for sid, _ in STEPS]
     if len(ctx.computer.usable_gpus) < 2:
         ids.remove("cards")
+    if getattr(ctx.settings, "family", None) == "deepseek41":
+        ids.insert(ids.index("context") + 1, "speed")
     return ids
 
 
@@ -111,7 +116,7 @@ class Base(Screen):
         out.append("STRATA  ", style=f"bold {ACCENT}")
         out.append(f"{self.title_line}", style=f"bold {ACCENT}")
         if self.step_id in flow:
-            labels = dict(STEPS)
+            labels = STEP_LABELS
             n = flow.index(self.step_id)
             if self.width() >= 118:
                 out.append("   ")
@@ -1023,6 +1028,43 @@ class PicturesScreen(Base):
         self.ctx.settings.vision = key
 
 
+# ------------------------------------------------------------------------------------------------ DeepSeek: speed
+
+class SpeedScreen(Base):
+    step_id = "speed"
+    help_text = ("DeepSeek picks 6 experts for every word it writes. Faster uses 5 of them: answers come sooner, with a small quality change that is "
+                 "usually not noticeable. Full quality uses all 6. Faster is the default on a PC with 16 GB of graphics memory or less.")
+
+    def body(self) -> ComposeResult:
+        yield Static(Text("Speed or full quality?", style=f"bold {ACCENT}"), markup=False)
+        yield Menu(id="menu")
+
+    def default_faster(self) -> bool:
+        return S.faster_default(self.ctx.computer.total_vram_gb)
+
+    def on_mount(self) -> None:
+        s = self.ctx.settings
+        faster_default = self.default_faster()
+        here = Cell("default on this PC", "")
+        items = [Item(["Faster", here if faster_default else Cell("", "")], key="faster"),
+                 Item(["Full quality", here if not faster_default else Cell("", "")], key="full")]
+        sel = 0 if (s.speed or ("faster" if faster_default else "full")) == "faster" else 1
+        self.query_one(Menu).columns = [("", 24), ("", 0)]
+        self.query_one(Menu).set_items(items, sel)
+        self.paint()
+
+    def explain(self) -> Text:
+        key = self.menu().current.key if self.menu() and self.menu().current else "faster"
+        if key == "faster":
+            return Text(S.FASTER_NOTE + " It is the default on a PC with 16 GB of graphics memory or less.", style=MUTE)
+        return Text("Full quality uses all 6 experts per word. Answers are a little slower; pick it when the last bit of quality matters more.", style=MUTE)
+
+    def commit(self) -> None:
+        key = self.menu().current.key
+        default = "faster" if self.default_faster() else "full"
+        self.ctx.settings.speed = None if key == default else key        # the default stays "the default for this PC" in a saved preset
+
+
 # ------------------------------------------------------------------------------------------------ 6 parallel
 
 class ParallelScreen(Base):
@@ -1492,6 +1534,8 @@ class SaveScreen(Base):
         lines = [("Model", (r.title if r else (s.model or "?")) + (" (your files)" if s.model_path else "")),
                  ("Context", S.context_label(s.context) + f", memory {s.kv or 'int8'}"),
                  ("Pictures", "on" if s.vision != "off" else "off"),
+                 *([("Speed", S.speed_words(s.speed or ("faster" if S.faster_default(self.ctx.computer.total_vram_gb) else "full"),
+                                            s.speed is None))] if s.family == "deepseek41" else []),
                  ("Parallel", f"{s.parallel} at a time" if s.parallel else f"fit to your card ({S.fit_parallel(self.ctx.computer.main_vram_gb)})"),
                  ("Tuning", ({"quick": "quick (about 5-10 min)", "thorough": "thorough (about 10-15 min)", "skip": "skipped"} if s.family == "deepseek41"
                               else {"quick": "quick (about 20 min)", "thorough": "thorough (up to 2 h)", "skip": "skipped"})[s.tune]),

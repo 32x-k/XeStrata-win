@@ -152,6 +152,11 @@ class Computer:
         return None
 
     @property
+    def total_vram_gb(self) -> float:
+        """The graphics memory of all the cards that can be used together."""
+        return sum(float(g.get("vram_gb") or 0) for g in self.usable_gpus)
+
+    @property
     def main_vram_gb(self) -> float:
         return max((float(g.get("vram_gb") or 0) for g in self.usable_gpus), default=0.0)
 

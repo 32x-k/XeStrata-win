@@ -398,7 +398,25 @@ def cards_for_launch(s: S.LaunchSettings, catalog, ram_gb: float | None = None, 
         return None
 
 
-def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str], log: str | None = None, gpus: "list[int] | dict | None" = None) -> dict:
+def apply_experts(cfg: dict, experts: int | None) -> None:
+    """DeepSeek's speed choice as the engine flag: --experts 5 (Faster) or --experts 6 (Full quality), replacing one already in the saved args."""
+    if experts is None or not isinstance(cfg.get("args"), list):
+        return
+    args, out, i = [str(x) for x in cfg["args"]], [], 0
+    while i < len(args):
+        if args[i] == "--experts":
+            i += 2
+            continue
+        if args[i].startswith("--experts="):
+            i += 1
+            continue
+        out.append(args[i])
+        i += 1
+    cfg["args"] = out + ["--experts", str(int(experts))]
+
+
+def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str], log: str | None = None, gpus: "list[int] | dict | None" = None,
+                  experts: int | None = None) -> dict:
     """The private run config of this launch: the installed one plus the choices that are not setup's (host, port, key, cards, advanced)."""
     from strata_control import tune_knobs
     cfg = json.loads(json.dumps(base))
@@ -434,6 +452,7 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
             cfg["env"] = tune_knobs.apply_to_env(dict(cfg.get("env") or {}), e_changes)
     from strata_control import draft_layer
     draft_layer.apply(cfg)                                   # "mtp": false (from the installed config too) never sits beside --mtp in the saved args (B10)
+    apply_experts(cfg, experts)
     return cfg
 
 
@@ -1284,7 +1303,8 @@ class Runner:
         from strata_control import tune_knobs
         base = read_config(base_path)
         cfg = derive_config(base, self.s, bool_flags=tune_knobs.BOOL_FLAGS,
-                            log=str(launch_dir() / f"{self.name}.engine.log"), gpus=cards_for_launch(self.s, self.catalog, base=base))
+                            log=str(launch_dir() / f"{self.name}.engine.log"), gpus=cards_for_launch(self.s, self.catalog, base=base),
+                            experts=self.experts_flag())
         self.use_own_dsv41_engine(cfg)
         wait = self.start_wait()
         if wait > 600 and not cfg.get("engine_ready_s"):     # the server's own wait for the engine (900 s) must not end before the start's
@@ -1894,10 +1914,37 @@ class Runner:
         model = {"title": title, "family": s.family, "model": s.model, "model_gb": row.download_gb if row is not None else None,
                  "own_files": bool(s.model_path), "folder": s.model_path}
         out = {"profile": self.profile, "settings": s.to_dict(with_key=False), "warnings": warns,
-               "flags": S.flags_text(s), "steps": list(STAGES), "model": model, "download": download, "drafting": self.drafting_plan_line()}
+               "flags": S.flags_text(s), "steps": list(STAGES), "model": model, "download": download, "drafting": self.drafting_plan_line(),
+               "speed": self.speed_line()}
         if self.multi_file():
             out["placement"] = self.placement()
         return out
+
+    def resolved_speed(self) -> tuple[str, bool] | None:
+        """DeepSeek's speed: ("faster" | "full", whether it is the default for this PC); None for any other model. Faster is the default on a PC
+        with 16 GB of graphics memory or less."""
+        if not self.multi_file():
+            return None
+        try:
+            default = S.faster_default(self.catalog.computer().total_vram_gb)
+        except Exception:                                    # noqa: BLE001 - when the cards cannot be read, the engine's own default stands
+            default = False
+        if self.s.speed in S.SPEED_MODES:
+            return self.s.speed, (self.s.speed == "faster") == default
+        return ("faster" if default else "full"), True
+
+    def experts_flag(self) -> int | None:
+        """The value of the engine's --experts for this launch (5 or 6), None for a model that has no such choice."""
+        speed = self.resolved_speed()
+        return None if speed is None else (5 if speed[0] == "faster" else 6)
+
+    def speed_line(self) -> str:
+        """The speed line of --plan and of the summary, in plain words, with the quality note when it is Faster."""
+        speed = self.resolved_speed()
+        if speed is None:
+            return ""
+        text = "Speed: " + S.speed_words(speed[0], speed[1])
+        return text + (". " + S.FASTER_NOTE if speed[0] == "faster" else "")
 
     def drafting_plan_line(self) -> str:
         """The drafting line of --plan: what drafts, or why not what was asked for. Nothing is changed or downloaded."""

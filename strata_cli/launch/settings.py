@@ -28,6 +28,21 @@ VISION_MODES = ("off", "on", "gpu", "cpu")
 MTP_MODES = ("on", "off")
 #: strata_control/drafting.py MODES (tests/terminal/test_drafting.py keeps the two the same)
 DRAFTING_MODES = ("auto", "mtp", "dflash2", "off")
+SPEED_MODES = ("faster", "full")             # DeepSeek: 5 experts per word (Faster) or all 6 (Full quality)
+FASTER_VRAM_GB = 16.5                         # Faster is the default on a PC with this much graphics memory or less (the owner's 0.2.4.3 decision)
+FASTER_NOTE = "Faster uses 5 of 6 experts per word: a small quality change, usually not noticeable."
+
+
+def faster_default(total_vram_gb: float | None) -> bool:
+    """Faster is the default on a PC with 16 GB of graphics memory or less, in all (the cards that can be used together)."""
+    return bool(total_vram_gb) and float(total_vram_gb) <= FASTER_VRAM_GB
+
+
+def speed_words(speed: str, default: bool) -> str:
+    """The plain words for the chosen speed, for --plan and the summary."""
+    if speed == "faster":
+        return "Faster" + (" (default on this PC)" if default else "")
+    return "Full quality" + (" (default on this PC)" if default else "") + ": all 6 experts per word"
 KV_MODES = ("int8", "q4_0", "k8v4", "fp16")
 DEFAULT_PORT = 8080
 
@@ -90,6 +105,7 @@ class LaunchSettings:
     kv: str | None = None                      # None = int8 above 8K, as setup
     vision: str | None = None                  # None = the default (on when the model can read pictures and the engine has the reader), off | on | gpu | cpu
     parallel: int | None = None                # None = fit to the card
+    speed: str | None = None                   # DeepSeek only: None = the default for this PC (faster up to 16 GB of graphics memory); faster | full
     drafting: str | None = None                # None = Auto (recommended): the table in strata_control/drafting.py; mtp | dflash2 | off choose one. Saved in the launch config
     mtp: str | None = None                     # None = as installed (draft layer on); "off" starts without it (less graphics memory and RAM, slower); "on" overrides an installed "off"
     tune: str = "skip"                         # quick | thorough | skip
@@ -293,6 +309,10 @@ def flags_text(s: LaunchSettings, *, preset: str | None = None) -> str:
             parts.append(f"--mtp {s.mtp}")
         if s.drafting:
             parts.append(f"--drafting {s.drafting}")
+        if s.speed == "full":
+            parts.append("--full-quality")
+        elif s.speed == "faster":
+            parts.append("--speed faster")
         parts.append(f"--tune {s.tune}")
         if s.tune_allow_small:
             parts.append("--tune-allow-small")
