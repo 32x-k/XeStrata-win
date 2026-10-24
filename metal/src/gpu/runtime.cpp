@@ -30,6 +30,7 @@
 #include <map>
 #include <mutex>   // recursive_mutex
 #include <thread>
+#include <algorithm>
 #include <vector>
 
 namespace strata::gpu {
@@ -119,8 +120,12 @@ Error fail(Error e) {
     return e;
 }
 
+static std::vector<StreamImpl*> g_all_streams;   // every stream's queue holds pending copies until it is committed
+static std::mutex g_all_streams_mu;
+
 StreamImpl* make_stream() {
     auto* s = new StreamImpl;
+    { std::lock_guard<std::mutex> lk(g_all_streams_mu); g_all_streams.push_back(s); }
     s->q = rt().dev->newCommandQueue();
     s->q->addResidencySet(rt().rs);
     s->tl = rt().dev->newSharedEvent();
@@ -294,7 +299,8 @@ void alloc_log(const char* what, size_t n) {
 
 Error new_alloc(void** p, size_t bytes, bool host) {
     Runtime& r = rt();
-    const size_t n = bytes ? bytes : 1;
+    const size_t pg = 16384, want = bytes ? bytes : 1;
+    const size_t n = std::getenv("DS4_NO_PAD") ? want : ((want + pg - 1) / pg) * pg;
     MTL::Buffer* b = r.dev->newBuffer(n, MTL::ResourceStorageModeShared | MTL::ResourceHazardTrackingModeUntracked);
     if (!b) return fail(kErrorMemoryAllocation);
     Alloc a{b, b->gpuAddress(), (uint8_t*) b->contents(), n, host};
@@ -445,7 +451,26 @@ Error host_device_pointer_raw(void** dev, void* host) {
     *dev = (void*) (uintptr_t) (a->gpu + off);
     return kSuccess;
 }
+// A synchronising call is a barrier for BOTH queues: the dispatches deferred in mtl_rt's command buffer have to run before
+// the host reads or overwrites what they touch (a window's last layers still pending while the next window's embedding rows
+// are copied over the buffer its embed reads, measured: window 2's residual stream was window 1's stale tail).
+// commit every stream's pending copies/fills, then wait for all of them (commit first: a stream may wait on another's event)
+extern "C" void ds4_gpu_sync_all_streams() {
+    std::vector<StreamImpl*> v;
+    { std::lock_guard<std::mutex> lk(g_all_streams_mu); v = g_all_streams; }
+    for (StreamImpl* s : v) if (!s->rec) flush(s);
+    for (StreamImpl* s : v) if (!s->rec) wait_value(s->tl, s->submitted);
+}
+static thread_local bool t_in_barrier = false;
+static void both_queues_barrier() {
+    if (t_in_barrier) return;
+    t_in_barrier = true;
+    ds4_metal_flush();
+    t_in_barrier = false;
+}
+
 Error memset_device(void* p, int value, size_t bytes) {
+    both_queues_barrier();
     StreamImpl* s = S(nullptr);
     const Error e = encode_fill(s, p, value, bytes);
     flush(s);
@@ -453,6 +478,7 @@ Error memset_device(void* p, int value, size_t bytes) {
     return e;
 }
 Error memset_async(void* p, int value, size_t bytes, Stream st) {
+    if (!S(st)->rec && !std::getenv("DS4_NO_QBARRIER")) both_queues_barrier();
     StreamImpl* s = S(st);
     if (s->rec) {
         Op o;
@@ -464,6 +490,7 @@ Error memset_async(void* p, int value, size_t bytes, Stream st) {
 }
 
 Error memcpy_sync(void* dst, const void* src, size_t bytes, CopyKind) {
+    both_queues_barrier();
     StreamImpl* s = S(nullptr);
     const Error e = encode_copy(s, dst, src, bytes);
     flush(s);
@@ -482,6 +509,7 @@ Error memcpy_peer_async(void* dst, int dst_dev, const void* src, int src_dev, si
     return memcpy_async(dst, src, bytes, kDeviceToDevice, st);
 }
 Error memcpy_async(void* dst, const void* src, size_t bytes, CopyKind, Stream st) {
+    if (!S(st)->rec && !std::getenv("DS4_NO_QBARRIER")) both_queues_barrier();
     StreamImpl* s = S(st);
     if (s->rec) {
         Op o;
@@ -497,12 +525,15 @@ Error stream_destroy(Stream s) {
     if (!s) return kSuccess;
     flush(s);
     wait_value(s->tl, s->submitted);
+    { std::lock_guard<std::mutex> lk(g_all_streams_mu);
+      g_all_streams.erase(std::remove(g_all_streams.begin(), g_all_streams.end(), s), g_all_streams.end()); }
     s->tl->release();
     s->q->release();
     delete s;
     return kSuccess;
 }
 Error stream_synchronize(Stream st) {
+    both_queues_barrier();
     StreamImpl* s = S(st);
     flush(s);
     return wait_value(s->tl, s->submitted);

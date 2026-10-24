@@ -134,12 +134,15 @@ set(STRATA_DS4_SOURCES
   ${DS4}/ds4_main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/engine/ds4_finish.cpp ${DS4}/ds4_model.cu ${DS4}/ds4_gguf.cu ${DS4}/ds4_iq.cu ${DS4}/ds4_kernels.cu ${DS4}/ds4_tq.cu
   ${DS4}/ds4_vision.cu
   ${DS4}/vendor/exl3.cu ${DS4}/vendor/exl3_cpu.cpp ${DS4}/vendor/moe_win.cu ${DS4}/vendor/sampler.cu
-  ${DS4}/ds4_gg_cpu.cpp ${DS4}/ds4_gguf_cpu.cpp ${DS4}/ds4_iq_cpu.cpp ${DS4}/ds4_tq_cpu.cpp ${DS4}/ds4_packinfo.cpp)
+  ${STRATA_ROOT}/src/kernels/cpu/iq256_portable.cpp ${DS4}/ds4_gg_cpu.cpp ${DS4}/ds4_gguf_cpu.cpp ${DS4}/ds4_iq_cpu.cpp ${DS4}/ds4_tq_cpu.cpp ${DS4}/ds4_packinfo.cpp)
 set_source_files_properties(
   ${DS4}/ds4_model.cu ${DS4}/ds4_gguf.cu ${DS4}/ds4_iq.cu ${DS4}/ds4_kernels.cu ${DS4}/ds4_tq.cu ${DS4}/ds4_vision.cu
   ${DS4}/vendor/exl3.cu ${DS4}/vendor/moe_win.cu ${DS4}/vendor/sampler.cu
   PROPERTIES LANGUAGE CXX)
 list(APPEND STRATA_DS4_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/engine/exl3_legacy_stub.cpp)   # v1.1.8 EXL3: absent on Metal
+# The CPU lane for the experts the GPU does not hold (ggml-cpu's NEON row dots): without it every non-resident expert contributes
+# zero and the residual stream stays the embedding (measured: layers 0-3 changed nothing, then random tokens).
+set_source_files_properties(${DS4}/ds4_gg_cpu.cpp PROPERTIES COMPILE_DEFINITIONS "STRATA_DSV41_TQ_CPU=1")
 add_executable(strata_ds4 ${STRATA_DS4_SOURCES})
 target_include_directories(strata_ds4 PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include/metal_compat ${STRATA_ROOT}/include ${DS4} ${CMAKE_CURRENT_SOURCE_DIR}/src

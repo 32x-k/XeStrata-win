@@ -37,6 +37,7 @@ struct Context::Impl {
     id<MTLCommandBuffer> cb_def = nil;   // the open command buffer single dispatches accumulate in
     id<MTLComputeCommandEncoder> enc_def = nil;
     int def_n = 0;
+    std::recursive_mutex mu;   // helper threads (the stager, the expert cache) flush too: one writer on the open encoder
     id<MTLDevice> dev;
     id<MTLCommandQueue> q;
     std::vector<id<MTLLibrary>> libs;
@@ -300,6 +301,7 @@ static void ds4_report_counts() {
 extern "C" unsigned long long ds4_dispatch_seq() { return g_disp_count.load(); }
 
 void Context::flush_runs() {
+    std::lock_guard<std::recursive_mutex> lk_(impl_->mu);
     if (!g_count_reg) { g_count_reg = true; std::atexit(ds4_report_counts); }
     if (impl_->cb_def == nil) return;
     ++g_cb_count;
@@ -315,6 +317,7 @@ void Context::flush_runs() {
 }
 
 double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, bool barrier_between) {
+    std::lock_guard<std::recursive_mutex> lk_(impl_->mu);
     @autoreleasepool {
         if (ds.size() == 1 && reps == 1 && !barrier_between) {
             if (impl_->cb_def == nil || impl_->def_n >= 2000000) {

@@ -4745,6 +4745,18 @@ struct Model::Impl {
                 std::memcpy(d.second.first, r.dst, (size_t) hd);
                 std::memcpy(d.second.second, r.scales, (size_t) hd / 32);
             }
+            if (std::getenv("DS4_DBG_EG") && pk.eg_hd >= 32) {   // DBG: a row whose IQ4_NL block scale is not finite
+                for (size_t i = 0; i < b.reads.size(); ++i) {
+                    const EgRead& r = b.reads[i];
+                    for (int k = 0; k < hd / 32; ++k) {
+                        uint16_t hb;
+                        std::memcpy(&hb, r.dst + (size_t) k * 18, 2);
+                        if ((hb & 0x7c00) == 0x7c00)
+                            std::fprintf(stderr, "DBG eg bad scale: read %zu/%zu file=%d off=%llu n=%u block=%d half=%04x ok=%d\n", i, b.reads.size(),
+                                         r.file, (unsigned long long) r.off, r.n, k, hb, (int) b.ok[i]);
+                    }
+                }
+            }
             {
                 std::lock_guard<std::mutex> lk(eg_cache_mu);
                 for (size_t i = 0; i < b.reads.size(); ++i) {
@@ -7476,9 +7488,25 @@ struct Model::Impl {
     }
 
     // one thread: the layers device after device, the hand-offs through pinned memory and events
+    void dbg_nf(const char* tag, int il, const float* dev, size_t n) {   // DBG: non-finite count of a device buffer
+        ds4_metal_flush();
+        const float* hp = (const float*) strata::gpu::host_view(dev);
+        size_t nf = 0, first = 0; float mx = 0.0f;
+        for (size_t i = 0; i < n; ++i) { const float v = hp[i]; if (!(v == v)) { if (!nf) first = i; ++nf; } else if (std::fabs(v) > mx) mx = std::fabs(v); }
+        std::fprintf(stderr, "DBG nf il=%d %s n=%zu nonfinite=%zu first=%zu max=%.4g\n", il, tag, n, nf, first, mx);
+    }
+    void dbg_h(const char* tag, Dev& d, int T) {   // DBG: max |h| of the window's residual stream, after the queue drains
+        ds4_metal_flush();
+        const float* hp = (const float*) strata::gpu::host_view(d.h);
+        float mx = 0.0f; size_t nf = 0;
+        const size_t n = (size_t) T * g.hc * g.dim;
+        for (size_t i = 0; i < n; ++i) { const float v = hp[i]; if (!(v == v)) ++nf; else if (std::fabs(v) > mx) mx = std::fabs(v); }
+        std::fprintf(stderr, "DBG hmax %s T=%d max=%.4g nonfinite=%zu h0=%g\n", tag, T, mx, nf, hp[0]);
+    }
     bool forward_serial(int64_t p0, int T, std::string& err) {
         const int D = g.dim, H = g.hc;
         int cur = L[0].dev;
+        if (std::getenv("DS4_SYNC_WIN")) cudaDeviceSynchronize();
         {
             Dev& d = devs[(size_t) cur];
             cudaSetDevice(d.id);
@@ -7492,6 +7520,7 @@ struct Model::Impl {
                 std::fprintf(stderr, "DBG at embed site %d: h[0..3] = %g %g %g %g\n", __LINE__, hh[0], hh[1], hh[2], hh[3]);
             }
             init_pre(d.pre, T, d.st);
+            if (std::getenv("DS4_DBG_EMB")) dbg_h("after init_pre", d, T);
         }
         std::vector<float> dump;
         if (dump_h != nullptr) dump.resize((size_t) T * g.nl * H * D);
@@ -7518,6 +7547,7 @@ struct Model::Impl {
                 cur = l.dev;
             }
             if (!tap(devs[(size_t) l.dev], il, T, err)) return false;
+            if (il == 0 && std::getenv("DS4_DBG_EMB")) dbg_h("after tap", devs[(size_t) l.dev], T);
             if (!layer(l, 0, p0, T, wplan, err)) return false;
             if (dump_h != nullptr) {   // DS4_DUMP_H: every layer's residual stream, for tools/ds4/compare.py --layers
                 Dev& dd = devs[(size_t) l.dev];
@@ -7669,11 +7699,14 @@ struct Model::Impl {
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
         const ArGroup& ag = groups[(size_t) L0.grp].ar;
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
-        if (std::getenv("DS4_DBG_H") && mi == 0 && l.il < 2) {   // DBG
+        if (std::getenv("DS4_DBG_H") && mi == 0 && (l.il < 2 || std::getenv("DS4_DBG_ALL"))) {   // DBG
             std::vector<float> hv((size_t) T * H * D);
             cudaSetDevice(d.id);
             ds4_metal_flush();
-            cudaMemcpy(hv.data(), d.h, hv.size() * 4, cudaMemcpyDeviceToHost);
+            {
+                const float* hvp = (const float*) strata::gpu::host_view(d.h);
+                if (hvp) std::memcpy(hv.data(), hvp, hv.size() * 4);
+            }
             int nf = 0, nzv = 0;
             float mx = 0.0f;
             size_t firstnan = 0, lastnan = 0;
@@ -7702,8 +7735,24 @@ struct Model::Impl {
                 CK(cudaMemcpyAsync(sc + (size_t) t * cols * (ehd / 32), src + (size_t) t * per + (size_t) cols * ehd,
                                    (size_t) cols * (ehd / 32), cudaMemcpyHostToDevice, s));
             engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, (int) eg_fmt[(size_t) l.eg]);
+            if (std::getenv("DS4_DBG_EG")) {
+                dbg_nf("eg_x", l.il, d.eg_x, (size_t) T * cols * ehd);
+                const float* xv = (const float*) strata::gpu::host_view(d.eg_x);
+                for (size_t i = 0; i < (size_t) T * cols * ehd; ++i)
+                    if (!std::isfinite(xv[i])) {
+                        const size_t t = i / ((size_t) cols * ehd), c = (i / ehd) % cols;
+                        const uint8_t* dv = (const uint8_t*) strata::gpu::host_view(d.eg_rows) + (t * cols + c) * ehd;
+                        const uint8_t* hv = src + t * per + c * ehd;
+                        std::fprintf(stderr, "DBG eg bad x: t=%zu c=%zu e=%zu | dev/host row bytes:", t, c, i % ehd);
+                        for (int b = 0; b < 80; ++b) std::fprintf(stderr, "%s%02x/%02x", b % 18 == 0 ? " |" : " ", dv[b], hv[b]);
+                        std::fprintf(stderr, "\n");
+                        break;
+                    }
+            }
             if (!mv(d, {job(l.eg_wkv, d.eg_x, d.eg_kv, T, (size_t) cols * ehd, (size_t) (H + 1) * D)}, err)) return false;
+            if (std::getenv("DS4_DBG_EG")) dbg_nf("eg_kv", l.il, d.eg_kv, (size_t) T * (H + 1) * D);
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
+            if (std::getenv("DS4_DBG_EG")) dbg_nf("h_after_gate", l.il, d.h, (size_t) T * H * D);
         }
         // attention
         hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
@@ -8056,7 +8105,7 @@ struct Model::Impl {
             for (int i = 0; i < l.k_exp; ++i) {
                 const int e = h_idx[t * kPicks + i];
                 if (e < 0 || e >= l.n_exp) {
-                    err = "router picked expert " + std::to_string(e);
+                    err = "router picked expert " + std::to_string(e) + " (layer " + std::to_string(l.il) + ", token " + std::to_string(t) + ", pick " + std::to_string(i) + ", of " + std::to_string(l.k_exp) + ")";
                     return false;
                 }
                 ++pr[e];

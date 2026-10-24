@@ -214,6 +214,19 @@ bool embed_addr(const uint16_t* rows, int T, float* h, int dim, int hc) {
     d.grid[2] = 1;
     d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
     strata::dsv41::metal_host::shared_cx().run({d});
+    strata::dsv41::metal_host::shared_cx().flush_runs();
+    if (std::getenv("DS4_DBG_CMP")) {
+        const float* hv = (const float*) strata::gpu::host_view(h);
+        {
+            const size_t nv = (size_t) T * hc * dim;
+            size_t nf = 0, nz = 0;
+            for (size_t i = 0; i < nv; ++i) { const float v = hv[i]; if (!(v == v)) ++nf; else if (v == 0.0f) ++nz; }
+            std::fprintf(stderr, "DBG cmp: after embed n=%.0f nonfinite=%zu zeros=%zu\n", (double) nv, nf, nz);
+        }
+        std::fprintf(stderr, "DBG cmp: view %g %g %g | h=%g h+1=%g\n",
+                     hv ? hv[0] : -1.0f, hv ? hv[1] : -1.0f, hv ? hv[2] : -1.0f,
+                     hv ? hv[(size_t) dim * hc] : -1.0f, hv ? hv[(size_t) dim * hc + 1] : -1.0f);
+    }
     if (std::getenv("DS4_DBG_ARGS")) {
         mtl::Buffer bp = strata::dsv41::metal_host::shared_cx().wrap(
             (void*) (((uintptr_t) strata::gpu::host_view(h)) & ~(uintptr_t) 16383), 16384);

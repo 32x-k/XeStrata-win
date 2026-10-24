@@ -19,6 +19,7 @@
 
 // called by the gpu layer's synchronisation: everything batched must reach the GPU before a host read
 extern "C" void ds4_metal_flush();
+extern "C" void ds4_gpu_sync_all_streams();
 extern "C" unsigned long long ds4_dispatch_seq();
 static unsigned long long g_q8_deduped = 0;
 
@@ -1200,8 +1201,9 @@ bool engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, f
         return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
-    const size_t per = (size_t) (hd / 32) * 18;   // fmt 2: IQ4_NL blocks, 18 bytes a 32 values
-    mtl::Buffer br = wrap(hr, (size_t) n * per);
+    // (the kernel strides rows by hd bytes, as the CUDA kernel does, though an IQ4_NL row only fills hd/32*18 of them:
+    // wrapping n * 18/32 * hd left the last rows outside the buffer - garbage scales, measured as inf at row 257 of 288)
+    mtl::Buffer br = wrap(hr, (size_t) n * (size_t) hd);
     mtl::Buffer bo = wrap(ho, (size_t) n * (size_t) hd * 4);
     if (!br.handle || !bo.handle) return false;
     mtl::Pipeline pl;
@@ -1985,7 +1987,7 @@ extern "C" void ds4_metal_flush() {
     // other's work unordered: a kernel could read a feed whose blit had not run yet (emb_rows is a zeroed buffer, so
     // embed wrote exactly 0.0 into h).  The stream's queue goes first - it only carries the feeds at a token boundary,
     // the readbacks are encoded after this returns.
-    strata::gpu::stream_synchronize(nullptr);
+    ds4_gpu_sync_all_streams();
     if (g_cx) g_cx->flush_runs();
 }
 
