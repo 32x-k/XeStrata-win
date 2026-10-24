@@ -459,3 +459,174 @@ kernel void ds4_iq_dn(constant Ds4IqJob& j [[buffer(0)]], uint2 tgp [[threadgrou
         }
     }
 }
+
+// ---------------------------------------------------------------- ds4_gguf.cu:454 mx_gate_up_kernel / :519 mx_down_kernel
+//
+// The MXFP4 expert GEMM (ds4_gguf.cu's moe_gate_up / moe_down / win_experts): the same frame as ds4_iq_gu / ds4_iq_dn
+// above - a threadgroup of 256 is 8 warps, a warp a row of the gate and of the up (down: a row of the down), a lane
+// strides the 32-value blocks of the row, and the group's entries go sixteen at a pass so that a block the weights decode
+// once serves them all.  A block is 17 bytes (kMxBytes): the E8M0 scale byte, then 16 bytes whose low nibble is value j and
+// whose high nibble is value j + 16, each an index into the codebook {0, 1, 2, 3, 4, 6, 8, 12} and its negatives - the same
+// decode as ds4_init.metal's ds4_mx_block / ds4_e8m0 (ds4_gguf.cu:143 / :154), kept as int8 codes here because the
+// activations are the quantiser's int8, so the dot is integer (ds4_gguf.cu:225 mx_dot) and the two scales fold in at the
+// end.
+//
+// The group's blob and its entries are read as ds4_iq_group above reads them (ds4_gguf.cu:429 mx_group): a plan group
+// (grp_ptr null) is one expert whose entry is the group's own index and whose activation row is 0, a window group's
+// entries come from grp_ent[grp_start[g] .. grp_start[g + 1]) and an entry e's activation row is e >> 3.
+struct Ds4MxJob {
+    device const ulong* plan_ptr;   // plan_ptr[g]: the expert's blob (0: the group is skipped)
+    device const ulong* grp_ptr;    // grp_ptr[g]: a window set's blob
+    device const int* grp_start;    // a set's first entry (n_groups + 1 of them)
+    device const int* grp_ent;      // the entries (token * 8 + pick)
+    device const int* n_groups;
+    device const char* xq;          // gate / up's int8 activations (n_embd an entry)
+    device const float* xd;         // their scales (n_embd / 32 a row)
+    device const char* hq;          // down's int8 input (n_ff an entry)
+    device const float* hd;         // its scales
+    device float* h;                // [entries][n_ff]: the clamped swiglu
+    device float* part;             // [entries][n_embd]: each entry's down output
+    long tr0, tr1, tr2;             // the roles' offsets in a blob
+    int n_embd, n_ff;
+    float limit;                    // swiglu_limit (0: none)
+};
+
+// the codebook of a nibble, in index order (ds4_init.metal's lut_init: {0,1,2,3,4,6,8,12}, then its negatives)
+constant char ds4_mx_code[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+// 2^(e - 128) (ds4_init.metal:489 ds4_e8m0, ggml's GGML_E8M0_TO_FP32_HALF)
+static inline float ds4_mx_e8m0(uint e) {
+    return as_type<float>(e < 2u ? (0x00200000u << e) : ((e - 1u) << 23));
+}
+
+// a block's 16 code bytes as 8 int8 words: word j the low nibbles of bytes 4 j .. (values 4 j ..), word 4 + j their high
+// nibbles (values 16 + 4 j ..) - the pairs ds4_gguf.cu:225 mx_dot reads xp[j] and xp[j + 4] with
+static inline void ds4_mx_words(device const uchar* p, thread int* q) {
+    for (uint j = 0; j < 4u; ++j) {
+        uint lo = 0u, hi = 0u;
+        for (uint b = 0; b < 4u; ++b) {
+            const uint v = uint(p[1u + 4u * j + b]);
+            lo |= uint(uchar(ds4_mx_code[v & 15u])) << (8u * b);
+            hi |= uint(uchar(ds4_mx_code[v >> 4u])) << (8u * b);
+        }
+        q[j] = int(lo);
+        q[4u + j] = int(hi);
+    }
+}
+
+// a block's 32 int8 codes against its 32 int8 activations (8 packed words, 4 values a word)
+static inline int ds4_mx_dot(thread const int* q, device const int* xp) {
+    int s = 0;
+    for (uint t = 0; t < 8u; ++t) s += ds4_iq_dot4(q[t], xp[t]);
+    return s;
+}
+
+// the group's blob and its entry range (ds4_iq_group's MX form, ds4_gguf.cu:429 mx_group); false: nothing to do
+static inline bool ds4_mx_group(constant Ds4MxJob& j, uint g, thread ulong& blob, thread int& m0, thread int& m1) {
+    if (j.grp_ptr == nullptr) {
+        const ulong p = j.plan_ptr[g];
+        if (p == 0ul) return false;
+        blob = p;
+        m0 = int(g);
+        m1 = m0 + 1;
+        return true;
+    }
+    if (int(g) >= *j.n_groups) return false;
+    blob = j.grp_ptr[g];
+    m0 = j.grp_start[g];
+    m1 = j.grp_start[g + 1];
+    return true;
+}
+
+// mx_gate_up_kernel<NE> (a warp a row of the gate and of the up, a lane a block a step): h = the clamped swiglu
+kernel void ds4_mx_gu(constant Ds4MxJob& j [[buffer(0)]], uint2 tgp [[threadgroup_position_in_grid]],
+                      uint tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    ulong blob;
+    int m0, m1;
+    if (!ds4_mx_group(j, tgp.y, blob, m0, m1)) return;
+    const int row = int(tgp.x) * 8 + int(tid >> 5);
+    if (row >= j.n_ff) return;
+    const uint nblk = uint(j.n_embd) / 32u;
+    const size_t rb = (size_t) nblk * 17u;
+    const device uchar* g = (const device uchar*) blob + (size_t) j.tr0 + (size_t) row * rb;
+    const device uchar* u = (const device uchar*) blob + (size_t) j.tr1 + (size_t) row * rb;
+    for (int mm = m0; mm < m1; mm += 16) {
+        const int ne = min(16, m1 - mm);
+        int es[16], xr[16];
+        for (int i = 0; i < 16; ++i) {
+            if (i < ne) {
+                const int e = j.grp_ptr == nullptr ? (mm + i) : j.grp_ent[mm + i];
+                es[i] = e;
+                xr[i] = j.grp_ptr == nullptr ? 0 : (e >> 3);
+            }
+        }
+        float ag[16], au[16];
+        for (int i = 0; i < 16; ++i) {
+            ag[i] = 0.0f;
+            au[i] = 0.0f;
+        }
+        for (uint b = uint(lane); b < nblk; b += 32u) {
+            const device uchar* pg = g + (size_t) b * 17u;
+            const device uchar* pu = u + (size_t) b * 17u;
+            int wg[8], wu[8];
+            ds4_mx_words(pg, wg);
+            ds4_mx_words(pu, wu);
+            const float dg = ds4_mx_e8m0(uint(pg[0])), du = ds4_mx_e8m0(uint(pu[0]));
+            for (int i = 0; i < 16; ++i) {
+                if (i < ne) {
+                    const device int* xp =
+                        (const device int*) (j.xq + (size_t) xr[i] * (size_t) j.n_embd + (size_t) b * 32u);
+                    const float dx = j.xd[(size_t) xr[i] * nblk + b];
+                    ag[i] = fma(dg * dx, float(ds4_mx_dot(wg, xp)), ag[i]);
+                    au[i] = fma(du * dx, float(ds4_mx_dot(wu, xp)), au[i]);
+                }
+            }
+        }
+        for (int i = 0; i < 16; ++i) {
+            if (i < ne) {
+                const float gv = ds4_iq_lsum<1>(ag[i]), uv = ds4_iq_lsum<1>(au[i]);
+                if (lane == 0u) j.h[(size_t) es[i] * (size_t) j.n_ff + (size_t) row] = ds4_iq_swiglu(gv, uv, j.limit);
+            }
+        }
+    }
+}
+
+// mx_down_kernel<NE> (a warp a row of the down, a lane a block a step): part = the down against the int8 h
+kernel void ds4_mx_dn(constant Ds4MxJob& j [[buffer(0)]], uint2 tgp [[threadgroup_position_in_grid]],
+                      uint tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    ulong blob;
+    int m0, m1;
+    if (!ds4_mx_group(j, tgp.y, blob, m0, m1)) return;
+    const int row = int(tgp.x) * 8 + int(tid >> 5);
+    if (row >= j.n_embd) return;
+    const uint nblk = uint(j.n_ff) / 32u;
+    const size_t rb = (size_t) nblk * 17u;
+    const device uchar* w = (const device uchar*) blob + (size_t) j.tr2 + (size_t) row * rb;
+    for (int mm = m0; mm < m1; mm += 16) {
+        const int ne = min(16, m1 - mm);
+        int es[16];
+        for (int i = 0; i < 16; ++i)
+            if (i < ne) es[i] = j.grp_ptr == nullptr ? (mm + i) : j.grp_ent[mm + i];
+        float ad[16];
+        for (int i = 0; i < 16; ++i) ad[i] = 0.0f;
+        for (uint b = uint(lane); b < nblk; b += 32u) {
+            const device uchar* pw = w + (size_t) b * 17u;
+            int ww[8];
+            ds4_mx_words(pw, ww);
+            const float dd = ds4_mx_e8m0(uint(pw[0]));
+            for (int i = 0; i < 16; ++i) {
+                if (i < ne) {
+                    const device int* hp =
+                        (const device int*) (j.hq + (size_t) es[i] * (size_t) j.n_ff + (size_t) b * 32u);
+                    ad[i] = fma(dd * j.hd[(size_t) es[i] * nblk + b], float(ds4_mx_dot(ww, hp)), ad[i]);
+                }
+            }
+        }
+        for (int i = 0; i < 16; ++i) {
+            if (i < ne) {
+                const float v = ds4_iq_lsum<1>(ad[i]);
+                if (lane == 0u) j.part[(size_t) es[i] * (size_t) j.n_embd + (size_t) row] = v;
+            }
+        }
+    }
+}

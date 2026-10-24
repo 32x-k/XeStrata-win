@@ -1141,6 +1141,9 @@ struct Model::Impl {
     void dump_layer(Dev& d, const float* h, int il, int64_t p0, int T) {
         std::vector<float> v((size_t) T * g.hc * g.dim);
         cudaSetDevice(d.id);
+#if defined(STRATA_METAL)
+        ds4_metal_flush();   // (the residual stream is read back here: commit the batched dispatches first)
+#endif
         cudaMemcpyAsync(v.data(), h, v.size() * 4, cudaMemcpyDeviceToHost, d.st);
         cudaStreamSynchronize(d.st);
         std::lock_guard<std::mutex> lk(dump_mu);
@@ -2336,6 +2339,12 @@ struct Model::Impl {
                 err = "embed.weight: read failed";
                 return false;
             }
+            if (std::getenv("DS4_DBG_EMB")) std::fprintf(stderr,
+                    "DBG emb pinned: %04x %04x %04x %04x  (row1: %04x %04x)\n",
+                    (unsigned) embed_pinned[0], (unsigned) embed_pinned[1],
+                    (unsigned) embed_pinned[2], (unsigned) embed_pinned[3],
+                    (unsigned) embed_pinned[(size_t) g.dim], (unsigned) embed_pinned[(size_t) g.dim + 1]);
+
         }
         // the host side of the CPU lane and the Engram rows
         const int cols = (pk.eg_ngram - 1) * pk.eg_heads;
@@ -5781,8 +5790,21 @@ struct Model::Impl {
         Dev& d = devs[(size_t) d_dev];
         cudaSetDevice(d.id);
         for (int t = 0; t < T; ++t) std::memcpy(h_emb + (size_t) t * D, embed_pinned + (size_t) tk[t] * D, (size_t) D * 2);
-        CK(cudaMemcpyAsync(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice, d.st));
+        CK(cudaMemcpy(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice));
         embed(d.emb_rows, T, d.h, D, H, d.st);
+        if (std::getenv("DS4_DBG_EMB")) {
+            ds4_metal_flush();
+            float *hp = d.h;
+            float hh[4] = {0,0,0,0};
+            cudaMemcpy(hh, hp, sizeof(hh), cudaMemcpyDeviceToHost);
+            std::fprintf(stderr, "DBG at embed site %d: h[0..3] = %g %g %g %g\n", __LINE__, hh[0], hh[1], hh[2], hh[3]);
+        }
+        if (std::getenv("DS4_DBG_EMB")) {
+            ds4_metal_flush();
+            float hh[4] = {0, 0, 0, 0};
+            cudaMemcpy(hh, d.h, sizeof(hh), cudaMemcpyDeviceToHost);
+            std::fprintf(stderr, "DBG after embed: h[0..3] = %g %g %g %g\n", hh[0], hh[1], hh[2], hh[3]);
+        }
         init_pre(d.pre, T, d.st);
         WinPlan dp;   // (window attention alone: the mailbox seqs)
         dp.async = !sync_decode && T <= async_max_t;
@@ -5887,6 +5909,9 @@ struct Model::Impl {
         confidence(hd.x, d_mk_embed, d_ints, d_conf, T, D, R, d_confv, hd.st);
         int tok[kWin + 1];
         float cf[kWin];
+#if defined(STRATA_METAL)
+        ds4_metal_flush();   // (a host read of a device result: commit the batched dispatches first)
+#endif
         CK(cudaMemcpyAsync(h_idx, d_ints, (size_t) (T + 1) * 4, cudaMemcpyDeviceToHost, hd.st));
         CK(cudaMemcpyAsync(h_w, d_confv, (size_t) T * 4, cudaMemcpyDeviceToHost, hd.st));
         CK(cudaStreamSynchronize(hd.st));
@@ -5931,6 +5956,9 @@ struct Model::Impl {
         sp.logit_bias = bias;
         strata::dsv41k::sample_tokens(d.logits + (size_t) row * g.vocab, 1, g.vocab, nullptr, 0, sp, d.tok, d.st);
         int t = -1;
+#if defined(STRATA_METAL)
+        ds4_metal_flush();   // (a host read of a device result: commit the batched dispatches first)
+#endif
         cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);
         cudaStreamSynchronize(d.st);
         return t;
@@ -5963,6 +5991,9 @@ struct Model::Impl {
             sp.greedy = true;
             sp.temperature = 0.0f;
             strata::dsv41k::sample_tokens(hd.logits, T, V, nullptr, 0, sp, d_ints + 16, hd.st);   // (the T rows at once)
+#if defined(STRATA_METAL)
+        ds4_metal_flush();   // (a host read of a device result: commit the batched dispatches first)
+#endif
             CK(cudaMemcpyAsync(h_idx, d_ints + 16, (size_t) T * 4, cudaMemcpyDeviceToHost, hd.st));
             CK(cudaStreamSynchronize(hd.st));
             while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
@@ -5994,6 +6025,9 @@ struct Model::Impl {
             sp.seed = seed;
             sp.counter = counter;
             strata::dsv41k::sample_verify(hd.logits, n, V, sp, d_specq, d_ints + 32, d_ints + 16, hd.st);
+#if defined(STRATA_METAL)
+        ds4_metal_flush();   // (a host read of a device result: commit the batched dispatches first)
+#endif
             CK(cudaMemcpyAsync(h_idx, d_ints + 16, (size_t) n * 4, cudaMemcpyDeviceToHost, hd.st));
             CK(cudaStreamSynchronize(hd.st));
             while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
@@ -6491,6 +6525,13 @@ struct Model::Impl {
                     CK(cudaMemcpyAsync(c.emb, c.emb_host[slot], (size_t) T * D * 2, cudaMemcpyHostToDevice, s));
                     CK(cudaEventRecord(c.emb_ev[slot], s));
                     embed(c.emb, T, c.h, D, H, s);
+                    if (std::getenv("DS4_DBG_EMB")) {
+                        ds4_metal_flush();
+                        float *hp = c.h;
+                        float hh[4] = {0,0,0,0};
+                        cudaMemcpy(hh, hp, sizeof(hh), cudaMemcpyDeviceToHost);
+                        std::fprintf(stderr, "DBG at embed site %d: h[0..3] = %g %g %g %g\n", __LINE__, hh[0], hh[1], hh[2], hh[3]);
+                    }
                     init_pre(c.pre, T, s);
                 } else {   // or its state after the layer before
                     const Xfer x = chunk_xfer(c.lm_state + (size_t) k * hb, c, T, false);
@@ -6648,6 +6689,13 @@ struct Model::Impl {
                         CK(cudaMemcpyAsync(c.emb, c.emb_host[slot], (size_t) T * D * 2, cudaMemcpyHostToDevice, s));
                         CK(cudaEventRecord(c.emb_ev[slot], s));
                         embed(c.emb, T, c.h, D, H, s);
+                        if (std::getenv("DS4_DBG_EMB")) {
+                            ds4_metal_flush();
+                            float *hp = c.h;
+                            float hh[4] = {0,0,0,0};
+                            cudaMemcpy(hh, hp, sizeof(hh), cudaMemcpyDeviceToHost);
+                            std::fprintf(stderr, "DBG at embed site %d: h[0..3] = %g %g %g %g\n", __LINE__, hh[0], hh[1], hh[2], hh[3]);
+                        }
                         init_pre(c.pre, T, s);
                     } else {
                         Chunk& a = *chunks[(size_t) L[(size_t) il - 1].dev];
@@ -7432,8 +7480,15 @@ struct Model::Impl {
         {
             Dev& d = devs[(size_t) cur];
             cudaSetDevice(d.id);
-            CK(cudaMemcpyAsync(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice, d.st));
+            CK(cudaMemcpy(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice));
             embed(d.emb_rows, T, d.h, D, H, d.st);
+            if (std::getenv("DS4_DBG_EMB")) {
+                ds4_metal_flush();
+                float *hp = d.h;
+                float hh[4] = {0,0,0,0};
+                cudaMemcpy(hh, hp, sizeof(hh), cudaMemcpyDeviceToHost);
+                std::fprintf(stderr, "DBG at embed site %d: h[0..3] = %g %g %g %g\n", __LINE__, hh[0], hh[1], hh[2], hh[3]);
+            }
             init_pre(d.pre, T, d.st);
         }
         std::vector<float> dump;
@@ -7533,8 +7588,15 @@ struct Model::Impl {
             if (!started) {   // the window's input: the embedding rows, or the previous group's hand-off
                 started = true;
                 if (il == 0) {
-                    CK(cudaMemcpyAsync(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice, s));
+                    CK(cudaMemcpy(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice));
                     embed(d.emb_rows, T, d.h, D, H, s);
+                    if (std::getenv("DS4_DBG_EMB")) {
+                        ds4_metal_flush();
+                        float *hp = d.h;
+                        float hh[4] = {0,0,0,0};
+                        cudaMemcpy(hh, hp, sizeof(hh), cudaMemcpyDeviceToHost);
+                        std::fprintf(stderr, "DBG at embed site %d: h[0..3] = %g %g %g %g\n", __LINE__, hh[0], hh[1], hh[2], hh[3]);
+                    }
                     init_pre(d.pre, T, s);
                 } else {
                     const Dev& a = devs[(size_t) L[(size_t) il - 1].dev];
@@ -7605,6 +7667,23 @@ struct Model::Impl {
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
         const ArGroup& ag = groups[(size_t) L0.grp].ar;
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
+        if (std::getenv("DS4_DBG_H") && mi == 0 && l.il < 2) {   // DBG
+            std::vector<float> hv((size_t) T * H * D);
+            cudaSetDevice(d.id);
+            ds4_metal_flush();
+            cudaMemcpy(hv.data(), d.h, hv.size() * 4, cudaMemcpyDeviceToHost);
+            int nf = 0, nzv = 0;
+            float mx = 0.0f;
+            for (size_t i = 0; i < hv.size(); ++i) {
+                const float v = hv[i];
+                if (!(v == v)) { ++nf; continue; }
+                if (v != 0.0f) ++nzv;
+                if (std::fabs(v) > mx) mx = std::fabs(v);
+            }
+            std::fprintf(stderr, "DBG h: il=%d p0=%lld T=%d p0tok=%d zeros=%zu ninf=%d max=%.4g first=%.5g %.5g\n",
+                         l.il, (long long) p0, T, toks.empty() ? -1 : toks[(size_t) p0],
+                         hv.size() - (size_t) nzv - (size_t) nf, nf, mx, hv[0], hv.size() > 1 ? hv[1] : 0.0f);
+        }
         prof_mark(d, 0);
         // Engram
         if (l.eg >= 0) {
@@ -8070,6 +8149,9 @@ struct Model::Impl {
         strata::dsv41k::sample_tokens(d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab, 1, g.vocab, nullptr, 0,
                                        sp, d.tok, d.st);
         int t = -1;
+#if defined(STRATA_METAL)
+        ds4_metal_flush();   // (a host read of a device result: commit the batched dispatches first)
+#endif
         cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);
         cudaStreamSynchronize(d.st);
         return t;
@@ -8083,6 +8165,9 @@ struct Model::Impl {
         Dev& d = devs[(size_t) head_dev];
         cudaSetDevice(d.id);
         out.resize((size_t) std::max(1, n_logits) * g.vocab);
+#if defined(STRATA_METAL)
+        ds4_metal_flush();   // (a host read of a device result: commit the batched dispatches first)
+#endif
         return cudaMemcpy(out.data(), d.logits, out.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
     }
 

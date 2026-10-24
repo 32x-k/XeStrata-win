@@ -8,6 +8,8 @@
 
 #include <strata/gpu/runtime.hpp>
 
+
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -70,7 +72,7 @@ namespace {
 mtl::Context* g_init_cx = nullptr;
 int g_lib_init = -1;
 
-mtl::Context& init_cx() {
+mtl::Context& shared_cx() {
     if (!g_init_cx) {
         g_init_cx = new mtl::Context();
         g_lib_init = g_init_cx->compile({"../src/engine/msl/ds4_init.metal"}, "", false);
@@ -82,19 +84,19 @@ mtl::Context& init_cx() {
 
 // ds4_kernels.cu:1477 - pre[i] = (i % 8) == 0 ? 1 : 0 for i < T*8
 bool init_pre(float* pre, int T, void*) {
-    init_cx();
+    strata::dsv41::metal_host::shared_cx();
     if (g_lib_init < 0) return false;
     void* host = strata::gpu::host_view(pre);
     if (!host) { std::fprintf(stderr, "dsv41 metal: init_pre has no host view\n"); return false; }
     const size_t bytes = (size_t) T * 8 * sizeof(float);
     const size_t page = 16384;
-    mtl::Buffer bp = init_cx().wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)),
+    mtl::Buffer bp = strata::dsv41::metal_host::shared_cx().wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)),
                                     ((bytes + page - 1) / page) * page);
     if (!bp.handle) { std::fprintf(stderr, "dsv41 metal: init_pre wrap failed\n"); return false; }
     const uintptr_t delta = (uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1));
     mtl::Pipeline pl;
     try {
-        pl = init_cx().pipeline(g_lib_init, "ds4_init_pre");
+        pl = strata::dsv41::metal_host::shared_cx().pipeline(g_lib_init, "ds4_init_pre");
     } catch (...) {
         return false;
     }
@@ -105,21 +107,21 @@ bool init_pre(float* pre, int T, void*) {
     d.grid[1] = d.grid[2] = 1;
     d.tg[0] = 128;
     d.tg[1] = d.tg[2] = 1;
-    init_cx().run({d});
+    strata::dsv41::metal_host::shared_cx().run({d});
     return true;
 }
 
 
 // ds4_kernels.cu:130 - the BF16 embedding gather, hc copies a token
 bool embed(const uint16_t* rows, int T, float* h, int dim, int hc, void*) {
-    init_cx();
+    strata::dsv41::metal_host::shared_cx();
     if (g_lib_init < 0) { std::fprintf(stderr, "dsv41 metal: embed: no library\n"); return false; }
     void* hrows = strata::gpu::host_view((void*) rows);
     void* hh = strata::gpu::host_view(h);
     if (!hrows || !hh) { std::fprintf(stderr, "dsv41 metal: embed has no host view\n"); return false; }
     const size_t page = 16384;
     auto wrap = [&](void* host, size_t bytes) {
-        return init_cx().wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)), ((bytes + page - 1) / page) * page);
+        return strata::dsv41::metal_host::shared_cx().wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)), ((bytes + page - 1) / page) * page);
     };
     mtl::Buffer br = wrap(hrows, (size_t) T * dim * 2);
     mtl::Buffer bh = wrap(hh, (size_t) T * hc * dim * 4);
@@ -127,7 +129,7 @@ bool embed(const uint16_t* rows, int T, float* h, int dim, int hc, void*) {
     const size_t dro = (size_t) (((uintptr_t) hrows) - (((uintptr_t) hrows) & ~(uintptr_t) (page - 1)));
     const size_t dho = (size_t) (((uintptr_t) hh) - (((uintptr_t) hh) & ~(uintptr_t) (page - 1)));
     mtl::Pipeline pl;
-    try { pl = init_cx().pipeline(g_lib_init, "ds4_embed"); } catch (...) { return false; }
+    try { pl = strata::dsv41::metal_host::shared_cx().pipeline(g_lib_init, "ds4_embed"); } catch (...) { return false; }
     mtl::Dispatch d;
     d.p = &pl;
     d.args = {mtl::Arg::B(br, dro), mtl::Arg::B(bh, dho), mtl::Arg::V((unsigned) dim), mtl::Arg::V((unsigned) hc)};
@@ -135,14 +137,14 @@ bool embed(const uint16_t* rows, int T, float* h, int dim, int hc, void*) {
     d.grid[1] = (uint32_t) T;
     d.grid[2] = 1;
     d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
-    init_cx().run({d});
+    strata::dsv41::metal_host::shared_cx().run({d});
     return true;
 }
 
 
 // ds4_model.cu:2737 - C[t][m] = sum_k A[m][k] * B[t][k], F32 operands, alpha = 1, beta = 0
 bool sgemm_tn(const float* A, const float* B, float* C, int m, int nt, int k, int lda, int ldb, int ldc) {
-    init_cx();
+    strata::dsv41::metal_host::shared_cx();
     if (g_lib_init < 0) return false;
     void* ha = strata::gpu::host_view((void*) A);
     void* hb = strata::gpu::host_view((void*) B);
@@ -150,7 +152,7 @@ bool sgemm_tn(const float* A, const float* B, float* C, int m, int nt, int k, in
     if (!ha || !hb || !hc) { std::fprintf(stderr, "dsv41 metal: sgemm_tn has no host view\n"); return false; }
     const size_t page = 16384;
     auto wrap = [&](void* host, size_t bytes) {
-        return init_cx().wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)), ((bytes + page - 1) / page) * page);
+        return strata::dsv41::metal_host::shared_cx().wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)), ((bytes + page - 1) / page) * page);
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer ba = wrap(ha, (size_t) m * lda * 4);
@@ -158,7 +160,7 @@ bool sgemm_tn(const float* A, const float* B, float* C, int m, int nt, int k, in
     mtl::Buffer bc = wrap(hc, (size_t) nt * ldc * 4);
     if (!ba.handle || !bb.handle || !bc.handle) return false;
     mtl::Pipeline pl;
-    try { pl = init_cx().pipeline(g_lib_init, "ds4_sgemm_tn"); } catch (...) { return false; }
+    try { pl = strata::dsv41::metal_host::shared_cx().pipeline(g_lib_init, "ds4_sgemm_tn"); } catch (...) { return false; }
     mtl::Dispatch d;
     d.p = &pl;
     d.args = {mtl::Arg::B(ba, off(ha)), mtl::Arg::B(bb, off(hb)), mtl::Arg::B(bc, off(hc)),
@@ -168,7 +170,7 @@ bool sgemm_tn(const float* A, const float* B, float* C, int m, int nt, int k, in
     d.grid[0] = (uint32_t) ((total + 127) / 128);
     d.grid[1] = d.grid[2] = 1;
     d.tg[0] = 128; d.tg[1] = d.tg[2] = 1;
-    init_cx().run({d});
+    strata::dsv41::metal_host::shared_cx().run({d});
     return true;
 }
 

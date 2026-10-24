@@ -1932,3 +1932,61 @@ kernel void ds4_combine(device const float* ed [[buffer(0)]], device const float
     if (has_sh != 0u) a += sh[(size_t) t * dim + e];
     out[(size_t) t * dim + e] = a;
 }
+
+// ---------------------------------------------------------------- ds4_kernels.cu:1156 markov_kernel / :1265 confidence_kernel
+//
+// The drafter's head (DSpark's Markov chain and its confidence): markov_add is a warp a vocabulary row - the previous
+// token's E row (BF16) staged as floats in the threadgroup, then E . H[v] added to logits[v] (H is F16, the pack's
+// markov_head.head.weight); confidence is a threadgroup a token over x and the same E row against the head's weights,
+// its block sum through the logistic.
+struct Ds4MarkovJob {
+    device float* logits;       // [V]: += the bias
+    device const ushort* E;     // [vocab][R] BF16
+    device const ushort* H;     // [vocab][R] F16
+    device const int* tok;      // the previous token (one int)
+    int V, R;
+};
+
+struct Ds4ConfJob {
+    device const float* x;      // [T][dim]
+    device const ushort* E;     // [vocab][R] BF16
+    device const int* tok;      // [T]
+    device const float* w;      // [dim + R]
+    device float* out;          // [T]
+    int dim, R;
+};
+
+// a BF16 bit pattern as its float (ds4_kernels.cu:28 bf16f: the top half, no rounding)
+static inline float ds4_bf16f(ushort b) { return as_type<float>(uint(b) << 16u); }
+
+// a warp a vocabulary row: logits[v] += E[*tok] . H[v]
+kernel void ds4_markov_add(constant Ds4MarkovJob& j [[buffer(0)]], uint tg [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup float er[1024];   // (R <= 1024: the host wrapper refuses more)
+    const device ushort* erow = j.E + (size_t) (*j.tok) * (size_t) j.R;
+    for (int i = int(tid); i < j.R; i += 256) er[i] = ds4_bf16f(erow[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int v = int(tg) * 8 + int(tid >> 5);
+    if (v >= j.V) return;
+    const device ushort* hr = j.H + (size_t) v * (size_t) j.R;
+    float a = 0.0f;
+    for (int c = int(lane) * 8; c < j.R; c += 256) {
+        for (int i = 0; i < 8; ++i) a += float(as_type<half>(hr[c + i])) * er[c + i];
+    }
+    a = ds4_warp_sum(a);
+    if (lane == 0u) j.logits[v] += a;
+}
+
+// a threadgroup a token: the logistic of the head's sum over x and the token's E row
+kernel void ds4_confidence(constant Ds4ConfJob& j [[buffer(0)]], uint tg [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]],
+                           ushort w [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float red[32];
+    const int t = int(tg);
+    const device float* xt = j.x + (size_t) t * (size_t) j.dim;
+    const device ushort* er = j.E + (size_t) j.tok[t] * (size_t) j.R;
+    float a = 0.0f;
+    for (int i = int(tid); i < j.dim + j.R; i += 1024) a += j.w[i] * (i < j.dim ? xt[i] : ds4_bf16f(er[i - j.dim]));
+    a = ds4_block_sum_n(a, red, lane, w, 32u);
+    if (tid == 0u) j.out[t] = 1.0f / (1.0f + exp(-a));
+}

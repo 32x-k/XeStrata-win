@@ -641,6 +641,106 @@ bool iq_dn(const unsigned long long* plan_ptr, const unsigned long long* grp_ptr
 }
 
 
+// ds4_gguf.cu:454 mx_gate_up_kernel / :519 mx_down_kernel - the MXFP4 expert GEMM (ds4_gguf.cu's moe_gate_up / moe_down /
+// win_experts).  The same frame as iq_gu / iq_dn above: a threadgroup of 256 is 8 warps, a warp a row, a lane strides the
+// 32-value blocks, the group's entries sixteen at a pass.  The job struct is the kernel's own (metal/src/engine/msl/
+// ds4_iq.metal's Ds4MxJob); the plan / window pointer arrays travel as they are: every pointer here is a CPU address
+// (unified memory) and a kernel may take raw gpuAddresses.
+namespace {
+// (not an entry point: the generator takes only the ^bool lines) mirrors metal/src/engine/msl/ds4_iq.metal's Ds4MxJob (Metal
+// has no 'long long': 64-bit is 'long')
+struct MxJob {
+    const void* plan_ptr;
+    const void* grp_ptr;
+    const void* grp_start;
+    const void* grp_ent;
+    const void* n_groups;
+    const void* xq;
+    const void* xd;
+    const void* hq;
+    const void* hd;
+    void* h;
+    void* part;
+    int64_t tr0, tr1, tr2;   // ('long' there, so 8 a field and the float ends the struct on the same byte)
+    int n_embd, n_ff;
+    float limit;
+};
+static_assert(sizeof(MxJob) == 128, "Ds4MxJob's layout");
+
+static bool mx_gemm(const MxJob& j, const char* fn, int grid_x, int groups) {
+    if (!ensure()) return false;
+    mtl::Buffer bj = g_cx->alloc(sizeof(j));
+    if (!bj.ptr) {
+        std::fprintf(stderr, "dsv41 metal: %s job buffer failed\n", fn);
+        return false;
+    }
+    std::memcpy(bj.ptr, &j, sizeof(j));
+    mtl::Pipeline pl;
+    try { pl = g_cx->pipeline(g_lib_iq, fn); } catch (...) { g_cx->free(bj); return false; }
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.args = {mtl::Arg::B(bj)};
+    d.grid[0] = (uint32_t) grid_x;
+    d.grid[1] = (uint32_t) groups;
+    d.grid[2] = 1;
+    d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
+    g_cx->run({d});
+    g_cx->free(bj);
+    return true;
+}
+}  // namespace
+
+// gate / up of the group's experts: h = the clamped swiglu (ds4_gguf.cu's MxArgs: tr[0] gate, tr[1] up, tr[2] down)
+bool mx_gu(const unsigned long long* plan_ptr, const unsigned long long* grp_ptr, const int* grp_start,
+           const int* grp_ent, const int* n_groups, const size_t* tr, int n_embd, int n_ff, float limit,
+           const int8_t* xq, const float* xd, float* h, int groups) {
+    if (groups <= 0) return true;
+    if (n_embd <= 0 || n_ff <= 0 || n_embd % 32 != 0 || n_ff % 8 != 0) return false;
+    if (xq == nullptr || xd == nullptr || h == nullptr) return false;
+    if (plan_ptr == nullptr && grp_ptr == nullptr) return false;
+    MxJob j{};
+    j.plan_ptr = plan_ptr;
+    j.grp_ptr = grp_ptr;
+    j.grp_start = grp_start;
+    j.grp_ent = grp_ent;
+    j.n_groups = n_groups;
+    j.xq = xq;
+    j.xd = xd;
+    j.h = h;
+    j.tr0 = (int64_t) tr[0];
+    j.tr1 = (int64_t) tr[1];
+    j.tr2 = (int64_t) tr[2];
+    j.n_embd = n_embd;
+    j.n_ff = n_ff;
+    j.limit = limit;
+    return mx_gemm(j, "ds4_mx_gu", (n_ff + 7) / 8, groups);
+}
+
+// down of the group's experts against their int8 h: part (a row of n_embd an entry)
+bool mx_dn(const unsigned long long* plan_ptr, const unsigned long long* grp_ptr, const int* grp_start,
+           const int* grp_ent, const int* n_groups, const size_t* tr, int n_embd, int n_ff, const int8_t* hq,
+           const float* hd, float* part, int groups) {
+    if (groups <= 0) return true;
+    if (n_embd <= 0 || n_ff <= 0 || n_ff % 32 != 0 || n_embd % 8 != 0) return false;
+    if (hq == nullptr || hd == nullptr || part == nullptr) return false;
+    if (plan_ptr == nullptr && grp_ptr == nullptr) return false;
+    MxJob j{};
+    j.plan_ptr = plan_ptr;
+    j.grp_ptr = grp_ptr;
+    j.grp_start = grp_start;
+    j.grp_ent = grp_ent;
+    j.n_groups = n_groups;
+    j.hq = hq;
+    j.hd = hd;
+    j.part = part;
+    j.tr0 = (int64_t) tr[0];
+    j.tr1 = (int64_t) tr[1];
+    j.tr2 = (int64_t) tr[2];
+    j.n_embd = n_embd;
+    j.n_ff = n_ff;
+    return mx_gemm(j, "ds4_mx_dn", (n_embd + 7) / 8, groups);
+}
+
 // ds4_gguf.cu:577 mx_combine_kernel - a token's expert outputs summed in plan order (the experts off the device add 0),
 // the CPU lane's part when its flag is set, then the shared expert's: ds4_gguf.cu:169's combine(), 128 threads a block
 namespace {
@@ -1377,6 +1477,92 @@ bool hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_s
 }
 
 // ds4_kernels.cu:1150 iota_rows_kernel - out[t][i] = i
+// ds4_kernels.cu:1156 markov_kernel / :1265 confidence_kernel - the drafter's head.  markov_add is a warp a vocabulary
+// row (the previous token's E row staged in the threadgroup, then E . H[v] added to logits[v]); confidence a threadgroup
+// a token.  Both jobs are the kernels' own structs (metal/src/engine/msl/ds4_init.metal's Ds4MarkovJob / Ds4ConfJob).
+namespace {
+// (not an entry point: the generator takes only the ^bool lines) mirrors ds4_init.metal's Ds4MarkovJob / Ds4ConfJob
+struct MarkovJob {
+    void* logits;
+    const void* E;
+    const void* H;
+    const void* tok;
+    int V, R;
+};
+static_assert(sizeof(MarkovJob) == 40, "Ds4MarkovJob's layout");
+
+struct ConfJob {
+    const void* x;
+    const void* E;
+    const void* tok;
+    const void* w;
+    void* out;
+    int dim, R;
+};
+static_assert(sizeof(ConfJob) == 48, "Ds4ConfJob's layout");
+}  // namespace
+
+bool markov_add(const float* logits, const uint16_t* E, const uint16_t* H, const int* tok, int V, int R) {
+    if (logits == nullptr || E == nullptr || H == nullptr || tok == nullptr) return false;
+    if (V <= 0 || R <= 0 || R > 1024) return false;   // (the kernel's staged E row holds 1024 floats)
+    if (!ensure()) return false;
+    MarkovJob j{};
+    j.logits = const_cast<float*>(logits);
+    j.E = E;
+    j.H = H;
+    j.tok = tok;
+    j.V = V;
+    j.R = R;
+    mtl::Buffer bj = g_cx->alloc(sizeof(j));
+    if (!bj.ptr) {
+        std::fprintf(stderr, "dsv41 metal: markov_add job buffer failed\n");
+        return false;
+    }
+    std::memcpy(bj.ptr, &j, sizeof(j));
+    mtl::Pipeline pl;
+    try { pl = g_cx->pipeline(g_lib, "ds4_markov_add"); } catch (...) { g_cx->free(bj); return false; }
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.args = {mtl::Arg::B(bj)};
+    d.grid[0] = (uint32_t) ((V + 7) / 8);
+    d.grid[1] = d.grid[2] = 1;
+    d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
+    g_cx->run({d});
+    g_cx->free(bj);
+    return true;
+}
+
+bool confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out) {
+    if (x == nullptr || E == nullptr || tok == nullptr || w == nullptr || out == nullptr) return false;
+    if (T <= 0 || dim <= 0 || R <= 0) return false;
+    if (!ensure()) return false;
+    ConfJob j{};
+    j.x = x;
+    j.E = E;
+    j.tok = tok;
+    j.w = w;
+    j.out = out;
+    j.dim = dim;
+    j.R = R;
+    mtl::Buffer bj = g_cx->alloc(sizeof(j));
+    if (!bj.ptr) {
+        std::fprintf(stderr, "dsv41 metal: confidence job buffer failed\n");
+        return false;
+    }
+    std::memcpy(bj.ptr, &j, sizeof(j));
+    mtl::Pipeline pl;
+    try { pl = g_cx->pipeline(g_lib, "ds4_confidence"); } catch (...) { g_cx->free(bj); return false; }
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.args = {mtl::Arg::B(bj)};
+    d.grid[0] = (uint32_t) T;
+    d.grid[1] = d.grid[2] = 1;
+    d.tg[0] = 1024; d.tg[1] = d.tg[2] = 1;
+    g_cx->run({d});
+    g_cx->free(bj);
+    return true;
+}
+
 bool iota_rows(int* out, int T, int n, int stride) {
     if (T <= 0 || n <= 0) return true;
     if (out == nullptr) return false;
@@ -1744,7 +1930,20 @@ bool moe_win_group_cpu(const void* plan_ptr, void* grp_ptr, void* grp_start, voi
 
 
 extern "C" void ds4_metal_flush() {
+    // The engine's copies (the embedding rows, the streamed experts, the readbacks) are encoded on strata::gpu's default
+    // stream, its dispatched kernels on mtl_rt's deferred command buffer.  Two queues, so committing one alone leaves the
+    // other's work unordered: a kernel could read a feed whose blit had not run yet (emb_rows is a zeroed buffer, so
+    // embed wrote exactly 0.0 into h).  The stream's queue goes first - it only carries the feeds at a token boundary,
+    // the readbacks are encoded after this returns.
+    strata::gpu::stream_synchronize(nullptr);
     if (g_cx) g_cx->flush_runs();
+}
+
+
+// the one Context every dsv41 kernel dispatches through: two of them means two Metal queues and no ordering between their work
+mtl::Context& shared_cx() {
+    ensure();
+    return *g_cx;
 }
 
 }  // namespace strata::dsv41::metal_host

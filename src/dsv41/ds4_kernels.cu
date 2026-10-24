@@ -2213,6 +2213,10 @@ void iota_rows(int* out, int T, int n, int stride, cudaStream_t s) {
     strata_ds4_launch(iota_rows_kernel, T, 64, 0, s, out, n, stride);
 }
 void markov_add(float* logits, const uint16_t* E, const uint16_t* H, const int* tok, int V, int R, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    // markov_kernel on the Metal dispatch (the drafter's Markov bias); the launch below is the fallback
+    if (strata::dsv41::metal_host::markov_add(logits, E, H, tok, V, R)) return;
+#endif
     strata_ds4_launch(markov_kernel, cdiv(V, kThreads / 32), kThreads, (size_t) R * sizeof(float), s, logits, E, H, tok, V, R);
 }
 void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn, int R, cudaStream_t s) {
@@ -2227,6 +2231,10 @@ void markov_pick(const unsigned* slots, int nm, unsigned seq, int* tok, const ui
 }
 void confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out,
                 cudaStream_t s) {
+#if defined(STRATA_METAL)
+    // confidence_kernel on the Metal dispatch; the launch below is the fallback
+    if (strata::dsv41::metal_host::confidence(x, E, tok, w, T, dim, R, out)) return;
+#endif
     strata_ds4_launch(confidence_kernel, T, 1024, 0, s, x, E, tok, w, dim, R, out);
 }
 

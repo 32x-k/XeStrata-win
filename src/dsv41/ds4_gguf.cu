@@ -1250,6 +1250,14 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
     m.xq = sc->xq;
     m.xd = sc->xd;
     q8_quant(x, (size_t) a.n_embd, 1, a.n_embd, sc->xq, sc->xd, s);
+#if defined(STRATA_METAL)
+    // mx_gate_up_kernel on the Metal dispatch (the MXFP4 expert GEMM); the launch below is the fallback
+    if (::strata::dsv41::metal_host::mx_gu(a.plan_ptr, nullptr, nullptr, nullptr, nullptr, a.lay.trellis, a.n_embd,
+                                           a.n_ff, a.limit, sc->xq, sc->xd, h, a.k)) {
+        check("moe_gate_up");
+        return;
+    }
+#endif
     launch_groups<GateUpK>(m, a.n_ff, a.k, 1, s);
     check("moe_gate_up");
 }
@@ -1274,7 +1282,12 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
         ia.hd = sc->hd;
         iq::down(ia, a.k, 1, s);
     } else {
-        launch_groups<DownK>(m, a.n_embd, a.k, 1, s);
+#if defined(STRATA_METAL)
+        // mx_down_kernel on the Metal dispatch; the launch below is the fallback
+        if (!::strata::dsv41::metal_host::mx_dn(a.plan_ptr, nullptr, nullptr, nullptr, nullptr, a.lay.trellis, a.n_embd,
+                                                a.n_ff, sc->hq, sc->hd, sc->part, a.k))
+#endif
+            launch_groups<DownK>(m, a.n_embd, a.k, 1, s);
     }
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;
@@ -1334,11 +1347,27 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
         ia.hd = sc->hd;
     }
     q8_quant(a.x, a.x_stride, a.T, a.n_embd, sc->xq, sc->xd, s);
-    if (mx) launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
-    else iq::gate_up(ia, groups, a.T, s);
+    if (mx) {
+#if defined(STRATA_METAL)
+        // mx_gate_up_kernel on the Metal dispatch; the launch below is the fallback
+        if (!::strata::dsv41::metal_host::mx_gu(a.plan_ptr, a.grp_ptr, a.grp_start, a.grp_ent, a.n_groups,
+                                                a.lay.trellis, a.n_embd, a.n_ff, a.limit, sc->xq, sc->xd, a.h, groups))
+#endif
+            launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
+    } else {
+        iq::gate_up(ia, groups, a.T, s);
+    }
     q8_quant(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);   // (rows of picks not on the device: unused)
-    if (mx) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
-    else iq::down(ia, groups, a.T, s);
+    if (mx) {
+#if defined(STRATA_METAL)
+        // mx_down_kernel on the Metal dispatch; the launch below is the fallback
+        if (!::strata::dsv41::metal_host::mx_dn(a.plan_ptr, a.grp_ptr, a.grp_start, a.grp_ent, a.n_groups,
+                                                a.lay.trellis, a.n_embd, a.n_ff, sc->hq, sc->hd, a.part, groups))
+#endif
+            launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
+    } else {
+        iq::down(ia, groups, a.T, s);
+    }
 #if !defined(STRATA_METAL)
     // (this port's dispatches are synchronous and nothing is published to wait for: ds4_kernels.cu's wait_seq)
     if (a.wait_ptr != nullptr) strata_ds4_launch(mx_wait_kernel, 1, 32, 0, s, a.wait_ptr, a.wait_val);
