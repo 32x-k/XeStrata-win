@@ -214,7 +214,7 @@ test('packaged: a model id with dots (DeepSeek) is listed, loaded from its run c
     assert.deepEqual(f.calls.filter(c => ['saveProfile', 'start'].includes(c[0])).map(c => c.slice(0, 2)), [['saveProfile', 'app-1'], ['start', 'app-1']]);
     const flags = f.saved[0].args.filter(a => a.startsWith('--'));
     assert.deepEqual(flags, ['--pack', '--max-context', '--eos'], 'The own engine of DeepSeek gets none of the Flash-Next options (it ended with "unknown option --batch")');
-    assert.equal(f.calls.find(c => c[0] === 'start')[2], 3600, 'it waits as long as the config says the engine needs');
+    assert.equal(f.calls.find(c => c[0] === 'start')[2], 600, 'it waits longer than the usual 300 s, up to the 600 s Control allows');
     const instance = f.native.state().instances[0];
     assert.equal(instance.model, id);
     assert.equal(instance.status, 'ready');
