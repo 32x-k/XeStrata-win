@@ -2093,7 +2093,7 @@ def find_vcvars(cuda_v=None):
     args = [str(vswhere), "-latest", "-products", "*"]
     if cuda_v is not None:
         upper = "19.0" if tuple(cuda_v) >= (13, 3) else "18.0"
-        args += ["-version", f"[16.0,{upper})"]
+        args += ["-version", f"[17.0,{upper})"]      # 17 = Visual Studio 2022: the sources are C++20, and nvcc silently drops -std=c++20 under 2019 (#3566)
     args += ["-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]
     p = out(args).strip()
     v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
@@ -5581,8 +5581,9 @@ def cmake_build(src, bdir, target, defs, vcvars, bat_name):
     # the same command then gets past it (issue #45); a second attempt only compiles what is still missing.
     if WIN:
         if vcvars is None:                             # #881: the build needs MSVC's environment
-            fail("the Visual Studio C++ build tools were not found",
-                 "install them (Visual Studio 2019 or 2022, workload 'Desktop development with C++') and run setup again")
+            fail("the Visual Studio 2022 C++ build tools were not found (Visual Studio 2019 is too old: the sources are C++20)",
+                 "install Visual Studio 2022 Build Tools (workload 'Desktop development with C++'), then run setup again; a ready-made engine "
+                 "needs no compiler: `strata update` fetches it")
         bat = ROOT / bat_name
         q = lambda c: " ".join(f'"{x}"' if " " in str(x) else str(x) for x in c)  # noqa: E731
         bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{q(conf)} || exit /b 1\r\n{q(build)} && exit /b 0\r\n'
