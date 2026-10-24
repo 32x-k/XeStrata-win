@@ -178,8 +178,7 @@ int main(int argc, char** argv) {
     }
     if (k512) {   // --k512: Strata's AVX-512 rows (iq512x_rows) called directly against ggml-cpu's dot, bit for bit: no dispatcher in between
         const bool cpu_ok = strata::kernels::cpu::cpu_avx512_ok(), sup = strata::kernels::cpu::iq512x_supported(type);
-        std::printf("k512: type %d nt %d: cpu_avx512_ok %d, iq512x_supported %d%s
-", type, nt, (int) cpu_ok, (int) sup,
+        std::printf("k512: type %d nt %d: cpu_avx512_ok %d, iq512x_supported %d%s\n", type, nt, (int) cpu_ok, (int) sup,
                     cpu_ok && sup ? "" : "  -> the AVX-512 rows cannot run here");
         if (!cpu_ok || !sup) return 3;
         const ggml_type_traits_cpu* tc = ggml_get_type_traits_cpu((ggml_type) type);
@@ -193,9 +192,7 @@ int main(int argc, char** argv) {
         for (int t = 0; t < nt; ++t)
             for (long r = 0; r < rows; ++r)
                 if (std::memcmp(&r0v[(size_t) t][(size_t) r], &r1v[(size_t) t][(size_t) r], 4) != 0) ++dif;
-        std::printf("k512: iq512x_rows against ggml-cpu's dot: %ld of %ld differ in bits
-%s
-", dif, (long) nt * rows, dif == 0 ? "OK" : "FAIL");
+        std::printf("k512: iq512x_rows against ggml-cpu's dot: %ld of %ld differ in bits\n%s\n", dif, (long) nt * rows, dif == 0 ? "OK" : "FAIL");
         return dif == 0 ? 0 : 1;
     }
     std::vector<std::vector<float>> o0((size_t) nt, std::vector<float>((size_t) rows)), o1 = o0;
