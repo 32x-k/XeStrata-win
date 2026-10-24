@@ -6348,9 +6348,11 @@ def make_handler(svc: Service):
                 extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
                 if extra:
                     hubs.append(svc.mcp)
-            if req.get("strata_images") is True and svc.images is not None:   # opt-in: the image tools
-                image_tools = images_api.ImageTools(svc, svc.images.default, messages, Vision.load,
-                                                    lambda d: Vision.normalize(d, keep_alpha=True))
+            want = req.get("strata_images")                   # opt-in: the image tools (true, or {"model": name})
+            if (want is True or isinstance(want, dict)) and svc.images is not None:
+                image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
+                                                    lambda d: Vision.normalize(d, keep_alpha=True),
+                                                    model=want.get("model") if isinstance(want, dict) else None)
                 more = image_tools.template_tools(exclude=own | {t["name"] for t in extra})
                 if more:
                     extra += more
@@ -6534,9 +6536,20 @@ def make_handler(svc: Service):
             if "image_generation" in skipped and svc.images is not None and req.get("tool_choice") != "none":
                 spec = next((t for t in req.get("tools") or [] if isinstance(t, dict)
                              and t.get("type") == "image_generation"), {})
-                self.image_tools = images_api.ImageTools(svc, svc.images.default, messages, Vision.load,
+                # its model: one of this server's image models by name (OpenAI's own, gpt-image-1: the default or the
+                # one the words choose); its input_image_mask: the mask of the edits it makes (a data: or http(s)
+                # URL; no file_id, which OpenAI's Files API gives)
+                fixed = spec.get("model") if spec.get("model") in svc.images.gens else None
+                mask = spec.get("input_image_mask")
+                if mask is not None:
+                    url = mask.get("image_url") if isinstance(mask, dict) else None
+                    if not isinstance(url, str) or not url:
+                        raise ValueError('input_image_mask: {"image_url": a data: URL or an http(s) URL} (no file_id)')
+                    self._no_local_sources([url])
+                    mask = svc.download(url) if url.startswith(("http://", "https://")) else Vision.load(url)
+                self.image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
                                                          lambda d: Vision.normalize(d, keep_alpha=True),
-                                                         spec)
+                                                         spec, model=fixed, mask=mask)
                 tools = (tools or []) + self.image_tools.template_tools(exclude={t["name"] for t in tools or []})
                 skipped = [k for k in skipped if k != "image_generation"]
             kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})

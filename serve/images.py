@@ -1183,7 +1183,7 @@ class ImageModels:
 # ------------------------------------------------------------------------------------------- chat's image tools
 OPTION_KEYS = ("size", "quality", "output_format", "output_compression", "background")
 FILE_REF = re.compile(r"/v1/images/files/([0-9a-f]{32}\.(?:png|jpeg|webp))")
-TOOLS = [
+TOOLS: list[dict[str, Any]] = [
     {"name": "generate_image",
      "description": "Make an image from a description with the image model on this computer. "
                     "Describe it in detail: the subject, the setting, the style, the light, and any text it shows in "
@@ -1210,9 +1210,22 @@ TOOLS = [
 class ImageTools:
     """generate_image and edit_image for a chat (or Responses) request that asks for them: the model writes a call,
     the server makes the image in the GPU's turn as /v1/images does, keeps it (/v1/images/files/), and the call's
-    result tells the model where it is.  The hub run_with_mcp runs (template_tools, routes, call, settings)."""
+    result tells the model where it is.  With several image models (ImageModels) the tools take a "model" too,
+    each model named and described in it, so the user's words choose one ("draw it with MageTrail", "an anime
+    illustration"); none named is the default.  A request that names its image model (`model`) gets that one
+    alone; a Responses request's input_image_mask (`mask`) is the mask of its edits.  The hub run_with_mcp runs
+    (template_tools, routes, call, settings)."""
 
-    def __init__(self, svc, gen: ImageGen, messages: list, load, normalize, options: dict | None = None):
+    def __init__(self, svc, images, messages: list, load, normalize, options: dict | None = None,
+                 model: str | None = None, mask: bytes | None = None):
+        self.models = images if isinstance(images, ImageModels) else None
+        gen = images.default if isinstance(images, ImageModels) else images
+        if model is not None:   # the request's own image model (strata_images {"model": ...}): that one alone
+            gen = images.pick(model) if isinstance(images, ImageModels) else gen
+            if gen.model != model:
+                raise ValueError(f"strata_images: model must be one of "
+                                 f"{', '.join(images.gens if isinstance(images, ImageModels) else [gen.model])}")
+            self.models = None
         self.svc, self.gen, self.messages, self.load, self.normalize = svc, gen, messages, load, normalize
         # a Responses request's image_generation tool: its size, quality, output_format, output_compression and
         # background, over what the model's call says (size "auto": the call's)
@@ -1220,16 +1233,38 @@ class ImageTools:
                         if k in OPTION_KEYS and v is not None and not (k == "size" and v == "auto")}
         self.settings = {"max_rounds": 4}
         self.made: list[str] = []          # the images this request made (file names)
+        self.mask = mask                   # an edit's mask (Responses' input_image_mask), over the image it edits
+
+    def _gens(self, edits: bool = False) -> list[ImageGen]:
+        """The image models the tools offer (those that edit, for edit_image), the default first."""
+        gens = list(self.models.gens.values()) if self.models is not None else [self.gen]
+        return [g for g in gens if g.cfg.get("vision")] if edits else gens
 
     def template_tools(self, exclude=()) -> list[dict]:
-        names = ("generate_image", "edit_image") if self.gen.cfg.get("vision") else ("generate_image",)
-        return [dict(t) for t in TOOLS if t["name"] in names and t["name"] not in exclude]
+        out = []
+        for t in TOOLS:
+            gens = self._gens(t["name"] == "edit_image")
+            if not gens or t["name"] in exclude:
+                continue
+            t = dict(t)
+            if len(self._gens()) > 1:   # the model's choice: each one's name and what it is good for
+                about = _qimage().ABOUT
+                choice = {v[0]: k.removesuffix("-uncensored") for k, v in _qimage().IMAGE_MODELS.items()}
+                lines = "; ".join(f"{g.model}: {about.get(choice.get(g.model, ''), '')}".rstrip(": ") for g in gens)
+                params = dict(t["parameters"])
+                params["properties"] = {**params["properties"], "model": {
+                    "type": "string", "enum": [g.model for g in gens],
+                    "description": f"the image model, when the user asks for one or for what one is made for "
+                                   f"({lines}); default {gens[0].model}"}}
+                t["parameters"] = params
+            out.append(t)
+        return out
 
     def routes(self) -> dict:
         return {t["name"]: (None, t["name"]) for t in self.template_tools()}
 
     def _file(self, name: str) -> bytes | None:
-        p = self.gen.file(name)
+        p = (self.models or self.gen).file(name)
         return p.read_bytes() if p is not None else None
 
     def _image(self, which: str) -> bytes | None:
@@ -1257,23 +1292,29 @@ class ImageTools:
         urls: list[str] = []
         try:
             req = {**{k: args[k] for k in ("prompt", "size", "seed") if args.get(k) not in (None, "")}, **self.options}
+            gens = self._gens(name == "edit_image")
+            asked = args.get("model")
+            gen = next((g for g in gens if g.model == asked), gens[0] if gens else self.gen)
+            if asked not in (None, "") and gen.model != asked:
+                raise ImageRequestError(f"model: one of {', '.join(g.model for g in gens)}, not {asked!r}")
             if name == "generate_image":
-                job = parse_request(req, self.gen.cfg)
+                job = parse_request(req, gen.cfg)
             elif name == "edit_image":
                 data = self._image(str(args.get("image") or ""))
                 if data is None:
                     raise ImageRequestError("there is no image in the conversation to edit")
-                job = parse_edit_request(req, [self.normalize(data)], self.gen.cfg)
+                job = parse_edit_request(req, [self.normalize(data)], gen.cfg, self.mask)
             else:
                 raise ImageRequestError(f"there is no tool named {name!r}")
-            with gpu_turn(self.svc, self.gen, job, cancel):
-                images, figures = self.gen.run(job, cancel)
+            with gpu_turn(self.svc, gen, job, cancel):
+                images, figures = gen.run(job, cancel)
             fmt = job["output_format"]
-            names = [self.gen.store(encode_image(png, fmt, job["output_compression"], job["background"] == "opaque"),
-                                    fmt) for png in images]
+            names = [gen.store(encode_image(png, fmt, job["output_compression"], job["background"] == "opaque"),
+                               fmt) for png in images]
             self.made += names
             urls = [f"/v1/images/files/{n}" for n in names]
-            text = (f"The image is made ({job['width']}x{job['height']}, seed {job['seed']}, "
+            by = f" with {gen.model}" if len(self._gens()) > 1 else ""
+            text = (f"The image is made{by} ({job['width']}x{job['height']}, seed {job['seed']}, "
                     f"{figures['seconds']:.0f} s) and the user sees it: {urls[0]}. To change it, call edit_image "
                     f"(its image: {urls[0]}).")
             ok = True
