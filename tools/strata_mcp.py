@@ -766,6 +766,17 @@ class Strata:
         return {"models": models, "shared_bytes": shared_bytes, "shared_gb": round(shared_bytes / 1e9, 2),
                 "total_bytes": total, "total_gb": round(total / 1e9, 2)}
 
+    @staticmethod
+    def made_by_strata(p: Path, is_dir: bool) -> bool:
+        """A download or pack Strata wrote itself, even in a models folder the person picked or the app chose: a finished GGUF has its
+        .done mark beside it, a prepared pack has its conversion record. The person's own GGUF files have neither (#3716)."""
+        try:
+            if is_dir:
+                return any((p / n).is_file() for n in ("conversions.json", "experts.bin.src.json"))
+            return p.with_name(p.name + ".done").is_file()
+        except OSError:
+            return False
+
     def removal_plan(self, config: Path) -> dict:
         """What deleting this model removes and what it keeps. A file or folder another installed model's config still names
         (the shared MTP draft, a shared PLE shard) is kept; so is anything outside Strata's own folders."""
@@ -789,7 +800,7 @@ class Strata:
         for p, is_dir in [(x, False) for x in files] + [(x, True) for x in dirs]:
             if not p.exists():
                 continue
-            if not self.allowed(p):
+            if not self.allowed(p) and not self.made_by_strata(p, is_dir):
                 keep.append({"path": str(p), "reason": "outside Strata's folders"})
             elif shared(p, is_dir):
                 keep.append({"path": str(p), "reason": "another installed model still uses it"})

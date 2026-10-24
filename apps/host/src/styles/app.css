@@ -7517,3 +7517,6 @@ textarea {
 .md-math-block .md-math--display { margin: 0; }
 .md-math .katex { font-size: 1.08em; }
 .md-math .katex-display { margin: 0; }
+
+/* A message the person typed keeps its line breaks (#3720). */
+.st-bubble__text { white-space: pre-wrap; overflow-wrap: anywhere; }
