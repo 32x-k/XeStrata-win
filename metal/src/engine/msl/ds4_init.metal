@@ -2058,3 +2058,19 @@ kernel void ds4_hc_split4(device const float* mixes [[buffer(0)]], device const 
     }
     if (on) comb[(size_t) b * 64u + lane] = c;
 }
+
+// Plain byte copies and fills on the context's queue: cudaMemcpyAsync / cudaMemsetAsync between runtime allocations (unified
+// memory: a "device" and a "host" buffer are both just memory) ride in the same command buffer as the kernels around them,
+// so their order is the program order and a layer needs no queue-to-queue handshake.
+kernel void ds4_copy4(device const uint* src [[buffer(0)]], device uint* dst [[buffer(1)]], constant ulong& n4 [[buffer(2)]],
+                      uint gid [[thread_position_in_grid]]) {
+    if (ulong(gid) < n4) dst[gid] = src[gid];
+}
+kernel void ds4_copy1(device const uchar* src [[buffer(0)]], device uchar* dst [[buffer(1)]], constant ulong& n [[buffer(2)]],
+                      uint gid [[thread_position_in_grid]]) {
+    if (ulong(gid) < n) dst[gid] = src[gid];
+}
+kernel void ds4_fill1(device uchar* dst [[buffer(0)]], constant ulong& n [[buffer(1)]], constant uint& v [[buffer(2)]],
+                      uint gid [[thread_position_in_grid]]) {
+    if (ulong(gid) < n) dst[gid] = uchar(v);
+}

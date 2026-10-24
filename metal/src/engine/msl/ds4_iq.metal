@@ -746,3 +746,131 @@ kernel void ds4_iq2xxs_mv1(device const uchar* jobs [[buffer(0)]], uint2 tgp [[t
     const float v = simd_sum(acc);
     if (lane == 0u) b.y[row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
 }
+
+// The other low-bit expert types, one activation (see ds4_iq2xxs_mv1): a lane a 32-value sub-block, four blocks a pass.
+
+kernel void ds4_iq2xs_mv1(device const uchar* jobs [[buffer(0)]], uint2 tgp [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    const device Ds4MvJob& b = *(const device Ds4MvJob*) (jobs + (size_t) tgp.y * sizeof(Ds4MvJob));
+    const uint row = tgp.x * 8u + (tid >> 5);
+    if (int(row) >= b.n) return;
+    const uint nblk = uint(b.k) / 256u;
+    const device uchar* w = b.w + (size_t) row * b.ld;
+    const uint ib = lane & 7u;
+    const uint bsel = lane >> 3;
+    float acc = 0.0f;
+    for (uint blk = bsel; blk < nblk; blk += 4u) {
+        const device uchar* p = w + (size_t) blk * 74u;
+        const float d = float(as_type<half>(*(const device ushort*) p));
+        const device ushort* qs = (const device ushort*) (p + 2u + 8u * ib);
+        const uint sc = uint(p[66u + ib]);
+        const float db0 = d * (0.5f + float(sc & 0xfu)) * 0.25f, db1 = d * (0.5f + float(sc >> 4)) * 0.25f;
+        const device uint4* xq4 = (const device uint4*) (b.xq + (size_t) blk * 256u + 32u * ib);
+        const uint4 xa = xq4[0], xb = xq4[1];
+        const uint xw[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+        int s0 = 0, s1 = 0;
+        for (uint l = 0; l < 4u; ++l) {
+            const uint q = uint(qs[l]);
+            const ulong g = iq2xs_grid[q & 511u];
+            const uint sg = uint(ksigns_iq2xs[(q >> 9) & 127u]);
+            int sum = 0;
+            for (uint h = 0; h < 2u; ++h) {
+                const uint gw = uint(g >> (32u * h));
+                const uint x = xw[2u * l + h];
+                for (uint i = 0; i < 4u; ++i) {
+                    const int code = int((gw >> (8u * i)) & 0xffu);
+                    const int xv = int(char(x >> (8u * i)));
+                    sum += ((sg >> (4u * h + i)) & 1u) != 0u ? -code * xv : code * xv;
+                }
+            }
+            if (l < 2u) s0 += sum; else s1 += sum;
+        }
+        acc = fma(b.xd[blk * 8u + ib], db0 * float(s0) + db1 * float(s1), acc);
+    }
+    const float v = simd_sum(acc);
+    if (lane == 0u) b.y[row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+}
+
+kernel void ds4_iq2s_mv1(device const uchar* jobs [[buffer(0)]], uint2 tgp [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    const device Ds4MvJob& b = *(const device Ds4MvJob*) (jobs + (size_t) tgp.y * sizeof(Ds4MvJob));
+    const uint row = tgp.x * 8u + (tid >> 5);
+    if (int(row) >= b.n) return;
+    const uint nblk = uint(b.k) / 256u;
+    const device uchar* w = b.w + (size_t) row * b.ld;
+    const uint ib = lane & 7u;
+    const uint bsel = lane >> 3;
+    float acc = 0.0f;
+    for (uint blk = bsel; blk < nblk; blk += 4u) {
+        const device uchar* p = w + (size_t) blk * 82u;
+        const float d = float(as_type<half>(*(const device ushort*) p));
+        const device uchar* qs = p + 2u + 4u * ib;
+        const device uchar* sgb = p + 34u + 4u * ib;
+        const uint qh = uint(p[66u + ib]);
+        const uint sc = uint(p[74u + ib]);
+        const float db0 = d * (0.5f + float(sc & 0xfu)) * 0.25f, db1 = d * (0.5f + float(sc >> 4)) * 0.25f;
+        const device uint4* xq4 = (const device uint4*) (b.xq + (size_t) blk * 256u + 32u * ib);
+        const uint4 xa = xq4[0], xb = xq4[1];
+        const uint xw[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+        int s0 = 0, s1 = 0;
+        for (uint l = 0; l < 4u; ++l) {
+            const uint idx = uint(qs[l]) | ((qh << (8u - 2u * l)) & 0x300u);
+            const ulong g = iq2s_grid[idx];
+            const uint sg = uint(sgb[l]);
+            int sum = 0;
+            for (uint h = 0; h < 2u; ++h) {
+                const uint gw = uint(g >> (32u * h));
+                const uint x = xw[2u * l + h];
+                for (uint i = 0; i < 4u; ++i) {
+                    const int code = int((gw >> (8u * i)) & 0xffu);
+                    const int xv = int(char(x >> (8u * i)));
+                    sum += ((sg >> (4u * h + i)) & 1u) != 0u ? -code * xv : code * xv;
+                }
+            }
+            if (l < 2u) s0 += sum; else s1 += sum;
+        }
+        acc = fma(b.xd[blk * 8u + ib], db0 * float(s0) + db1 * float(s1), acc);
+    }
+    const float v = simd_sum(acc);
+    if (lane == 0u) b.y[row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+}
+
+kernel void ds4_iq3xxs_mv1(device const uchar* jobs [[buffer(0)]], uint2 tgp [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    const device Ds4MvJob& b = *(const device Ds4MvJob*) (jobs + (size_t) tgp.y * sizeof(Ds4MvJob));
+    const uint row = tgp.x * 8u + (tid >> 5);
+    if (int(row) >= b.n) return;
+    const uint nblk = uint(b.k) / 256u;
+    const device uchar* w = b.w + (size_t) row * b.ld;
+    const uint ib = lane & 7u;
+    const uint bsel = lane >> 3;
+    float acc = 0.0f;
+    for (uint blk = bsel; blk < nblk; blk += 4u) {
+        const device uchar* p = w + (size_t) blk * 98u;
+        const float d = float(as_type<half>(*(const device ushort*) p));
+        const device uchar* qs = p + 2u;
+        const uint w0 = uint(qs[8u * ib]) | (uint(qs[8u * ib + 1u]) << 8) | (uint(qs[8u * ib + 2u]) << 16) | (uint(qs[8u * ib + 3u]) << 24);
+        const uint w1 = uint(qs[8u * ib + 4u]) | (uint(qs[8u * ib + 5u]) << 8) | (uint(qs[8u * ib + 6u]) << 16) | (uint(qs[8u * ib + 7u]) << 24);
+        const uint aux = uint(qs[64u + 4u * ib]) | (uint(qs[65u + 4u * ib]) << 8) | (uint(qs[66u + 4u * ib]) << 16) | (uint(qs[67u + 4u * ib]) << 24);
+        const float db = d * (0.5f + float(aux >> 28)) * 0.5f;
+        const device uint4* xq4 = (const device uint4*) (b.xq + (size_t) blk * 256u + 32u * ib);
+        const uint4 xa = xq4[0], xb = xq4[1];
+        const uint xw[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+        int sum = 0;
+        for (uint l = 0; l < 4u; ++l) {
+            const uint wv = l < 2u ? w0 : w1, sh = 16u * (l & 1u);
+            const uint sgn = uint(ksigns_iq2xs[(aux >> (7u * l)) & 127u]);
+            const uint g0 = iq3xxs_grid[(wv >> sh) & 255u], g1 = iq3xxs_grid[(wv >> (sh + 8u)) & 255u];
+            const uint xl = xw[2u * l], xh = xw[2u * l + 1u];
+            for (uint i = 0; i < 4u; ++i) {
+                int v0 = int((g0 >> (8u * i)) & 0xffu), v1 = int((g1 >> (8u * i)) & 0xffu);
+                if ((sgn & (1u << i)) != 0u) v0 = -v0;
+                if ((sgn & (1u << (i + 4u))) != 0u) v1 = -v1;
+                sum += v0 * int(char(xl >> (8u * i))) + v1 * int(char(xh >> (8u * i)));
+            }
+        }
+        acc = fma(b.xd[blk * 8u + ib] * db, float(sum), acc);
+    }
+    const float v = simd_sum(acc);
+    if (lane == 0u) b.y[row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+}

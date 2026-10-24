@@ -68,6 +68,7 @@ struct Op {
 struct EventImpl {
     MTL::SharedEvent* ev = nullptr;   // the recording stream's timeline
     uint64_t value = 0;               // 0: never recorded (complete, as a fresh CUDA event)
+    void* token = nullptr;            // a mark on the context's queue (ds4_ctx_mark), released by the wait
 };
 
 struct GraphImpl {
@@ -195,6 +196,14 @@ void flush(StreamImpl* s) {
     s->pending = 0;
 }
 extern "C" void ds4_metal_flush();
+extern "C" bool ds4_ctx_copy(void* dst, const void* src, size_t n) __attribute__((weak_import));
+extern "C" bool ds4_ctx_fill(void* dst, int value, size_t n) __attribute__((weak_import));
+extern "C" void* ds4_ctx_mark() __attribute__((weak_import));
+extern "C" void ds4_ctx_wait(void* token) __attribute__((weak_import));
+static bool ctx_queue_ops() {   // DS4_STREAM_COPIES=1: the old way (a copy on a stream's own queue, a full barrier each)
+    static const bool on = ds4_ctx_copy != nullptr && std::getenv("DS4_STREAM_COPIES") == nullptr;
+    return on;
+}
 
 Error wait_value(MTL::SharedEvent* ev, uint64_t v) {
     while (ev->signaledValue() < v) std::this_thread::yield();
@@ -493,6 +502,10 @@ Error memset_device(void* p, int value, size_t bytes) {
     return e;
 }
 Error memset_async(void* p, int value, size_t bytes, Stream st) {
+    if (!S(st)->rec && ctx_queue_ops() && bytes > 0) {
+        size_t o1 = 0;
+        if (find(p, &o1) && ds4_ctx_fill(p, value, bytes)) return kSuccess;
+    }
     if (!S(st)->rec && !std::getenv("DS4_NO_QBARRIER")) both_queues_barrier();
     StreamImpl* s = S(st);
     if (s->rec) {
@@ -524,6 +537,10 @@ Error memcpy_peer_async(void* dst, int dst_dev, const void* src, int src_dev, si
     return memcpy_async(dst, src, bytes, kDeviceToDevice, st);
 }
 Error memcpy_async(void* dst, const void* src, size_t bytes, CopyKind, Stream st) {
+    if (!S(st)->rec && ctx_queue_ops() && bytes > 0) {
+        size_t o1 = 0, o2 = 0;
+        if (find(dst, &o1) && find(src, &o2) && ds4_ctx_copy(dst, src, bytes)) return kSuccess;
+    }
     if (!S(st)->rec && !std::getenv("DS4_NO_QBARRIER")) both_queues_barrier();
     StreamImpl* s = S(st);
     if (s->rec) {
@@ -582,6 +599,12 @@ Error launch_host_func(Stream st, HostFn fn, void* arg) {
 Error event_create(Event* e, unsigned) { *e = new EventImpl; return kSuccess; }
 Error event_destroy(Event e) { delete e; return kSuccess; }
 Error event_record(Event e, Stream st) {
+    if (ctx_queue_ops() && !S(st)->rec) {   // the work the event follows is in the context's command buffer: end it, wait later
+        e->token = ds4_ctx_mark();
+        e->ev = nullptr;
+        e->value = 0;
+        return kSuccess;
+    }
     StreamImpl* s = S(st);
     if (s->rec) {
         Op o;
@@ -591,8 +614,19 @@ Error event_record(Event e, Stream st) {
     }
     return record_event(e, s);
 }
-Error event_query(Event e) { return !e->ev || e->ev->signaledValue() >= e->value ? kSuccess : kNotReady; }
-Error event_synchronize(Event e) { return e->ev ? wait_value(e->ev, e->value) : kSuccess; }
+Error event_query(Event e) {
+    if (e->token) return kNotReady;   // (a mark waits for its wait)
+    return !e->ev || e->ev->signaledValue() >= e->value ? kSuccess : kNotReady;
+}
+Error event_synchronize(Event e) {
+    if (e->token) {
+        void* t = e->token;
+        e->token = nullptr;
+        ds4_ctx_wait(t);
+        return kSuccess;
+    }
+    return e->ev ? wait_value(e->ev, e->value) : kSuccess;
+}
 Error event_elapsed_ms(float* ms, Event, Event) { *ms = 0.0f; return fail(kErrorUnsupported); }
 
 Error begin_capture(Stream st) {

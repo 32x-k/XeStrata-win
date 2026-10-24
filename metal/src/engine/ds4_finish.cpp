@@ -584,7 +584,7 @@ bool iq_mv(const void* jobs, int nj) {
     if (nj <= 0) return true;
     if (!ensure()) return false;
     const Ds4IqMvJob* src = (const Ds4IqMvJob*) jobs;
-    std::vector<Ds4IqMvJob> exp_iq, exp_k, exp_q5, exp_x1;
+    std::vector<Ds4IqMvJob> exp_iq, exp_k, exp_q5, exp_x1, exp_x2, exp_x3, exp_x4;
     exp_iq.reserve((size_t) nj);
     exp_k.reserve((size_t) nj);
     int max_n = 0;
@@ -605,6 +605,9 @@ bool iq_mv(const void* jobs, int nj) {
             static const bool fast1 = std::getenv("DS4_NO_MV1") == nullptr;
             if (fast1 && b.ncol == 1 && b.type == 13) exp_q5.push_back(b);        // the decode step's one-activation kernels
             else if (fast1 && b.ncol == 1 && b.type == 16) exp_x1.push_back(b);
+            else if (fast1 && b.ncol == 1 && b.type == 17) exp_x2.push_back(b);
+            else if (fast1 && b.ncol == 1 && b.type == 22) exp_x3.push_back(b);
+            else if (fast1 && b.ncol == 1 && b.type == 18) exp_x4.push_back(b);
             else (b.type == 13 || b.type == 14 ? exp_k : exp_iq).push_back(b);
         }
     }
@@ -643,6 +646,9 @@ bool iq_mv(const void* jobs, int nj) {
     };
     if (!run_group(exp_q5, "ds4_q5k_mv1")) return false;
     if (!run_group(exp_x1, "ds4_iq2xxs_mv1")) return false;
+    if (!run_group(exp_x2, "ds4_iq2xs_mv1")) return false;
+    if (!run_group(exp_x3, "ds4_iq2s_mv1")) return false;
+    if (!run_group(exp_x4, "ds4_iq3xxs_mv1")) return false;
     if (!run_group(exp_k, "ds4_iq_mv_k")) return false;
     if (!run_group(exp_iq, "ds4_iq_mv")) return false;
     return true;
@@ -2035,6 +2041,68 @@ bool moe_win_group_cpu(const void* plan_ptr, void* grp_ptr, void* grp_start, voi
     return true;
 }
 
+
+
+// ---- copies, fills and event marks on the context's queue (see ds4_copy4 in ds4_init.metal) -------------------------------
+// strata::gpu routes cudaMemcpyAsync / cudaMemsetAsync here when both ends are its allocations; ds4_ctx_mark ends the batched
+// command buffer without waiting and returns a token the matching ds4_ctx_wait blocks on (cudaEventRecord / EventSynchronize).
+extern "C" bool ds4_ctx_copy(void* dst, const void* src, size_t n) {
+    if (n == 0) return true;
+    if (!ensure()) return false;
+    void* hd = strata::gpu::host_view(dst);
+    void* hs = strata::gpu::host_view((void*) src);
+    if (!hd || !hs) return false;
+    const size_t page = 16384;
+    auto wrap = [&](void* host, size_t bytes) {
+        const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
+        const size_t end = (size_t) ((uintptr_t) host) + bytes;
+        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+    };
+    auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
+    mtl::Buffer bs = wrap(hs, n);
+    mtl::Buffer bd = wrap(hd, n);
+    if (!bs.handle || !bd.handle) return false;
+    const bool w4 = (((uintptr_t) hd | (uintptr_t) hs | n) & 3u) == 0;
+    mtl::Pipeline pl;
+    try { pl = g_cx->pipeline(g_lib, w4 ? "ds4_copy4" : "ds4_copy1"); } catch (...) { return false; }
+    const size_t items = w4 ? n / 4 : n;
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.args = {mtl::Arg::B(bs, off(hs)), mtl::Arg::B(bd, off(hd)), mtl::Arg::V((unsigned long) items)};
+    d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
+    d.grid[0] = (uint32_t) ((items + 255) / 256);
+    d.grid[1] = d.grid[2] = 1;
+    g_cx->run({d});
+    return true;
+}
+extern "C" bool ds4_ctx_fill(void* dst, int value, size_t n) {
+    if (n == 0) return true;
+    if (!ensure()) return false;
+    void* hd = strata::gpu::host_view(dst);
+    if (!hd) return false;
+    const size_t page = 16384;
+    const size_t base = (size_t) ((uintptr_t) hd) & ~(size_t) (page - 1);
+    const size_t end = (size_t) ((uintptr_t) hd) + n;
+    mtl::Buffer bd = g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+    if (!bd.handle) return false;
+    mtl::Pipeline pl;
+    try { pl = g_cx->pipeline(g_lib, "ds4_fill1"); } catch (...) { return false; }
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.args = {mtl::Arg::B(bd, (size_t) ((uintptr_t) hd - base)), mtl::Arg::V((unsigned long) n), mtl::Arg::V((unsigned) (value & 0xff))};
+    d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
+    d.grid[0] = (uint32_t) ((n + 255) / 256);
+    d.grid[1] = d.grid[2] = 1;
+    g_cx->run({d});
+    return true;
+}
+extern "C" void* ds4_ctx_mark() {
+    if (!g_cx) return nullptr;
+    return g_cx->mark();
+}
+extern "C" void ds4_ctx_wait(void* token) {
+    if (g_cx && token) g_cx->wait_mark(token);
+}
 
 extern "C" void ds4_metal_flush() {
     // The engine's copies (the embedding rows, the streamed experts, the readbacks) are encoded on strata::gpu's default

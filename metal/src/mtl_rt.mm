@@ -6,6 +6,7 @@
 #include "resource_path.h"
 
 #include <chrono>
+#include <execinfo.h>
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -38,6 +39,8 @@ struct Context::Impl {
     id<MTLCommandBuffer> cb_def = nil;   // the open command buffer single dispatches accumulate in
     id<MTLComputeCommandEncoder> enc_def = nil;
     int def_n = 0;
+    id<MTLSharedEvent> qev = nil;          // consecutive deferred buffers are chained through it (untracked buffers: the queue alone does not order them)
+    uint64_t qev_v = 0;
     id<MTLCommandBuffer> inflight = nil;   // the last committed-but-not-waited deferred buffer (the queue runs them in order)
     std::vector<void*> graveyard;   // buffers freed while the deferred command buffer still references them (it holds none)
     std::recursive_mutex mu;   // helper threads (the stager, the expert cache) flush too: one writer on the open encoder
@@ -318,6 +321,7 @@ static void encode(id<MTLComputeCommandEncoder> enc, const Dispatch& d) {
 }
 
 static double g_gpu_ms = 0.0;   // GPU time of every committed command buffer, summed
+static std::atomic<uint64_t> g_wait_ns{0}, g_enc_ns{0}, g_wait_n{0};   // host time: waiting on command buffers; encoding dispatches
 static std::mutex g_prof_mu;
 static std::unordered_map<std::string, std::pair<double, uint64_t>> g_prof;   // DS4_PROF: kernel -> (GPU us, dispatches)
 static std::string g_prof_last;
@@ -327,6 +331,7 @@ static bool g_count_reg = false;
 static void ds4_report_counts() {
     std::fprintf(stderr, "mtl: %.1f ms GPU, %llu dispatches, %llu command buffers\n", g_gpu_ms,
                  (unsigned long long) g_disp_count.load(), (unsigned long long) g_cb_count.load());
+    std::fprintf(stderr, "mtl: host waited %.1f ms for the GPU in %llu waits; encoding the dispatches took %.1f ms\n", g_wait_ns.load() / 1e6, (unsigned long long) g_wait_n.load(), g_enc_ns.load() / 1e6);
     if (!g_prof.empty()) {
         std::vector<std::pair<double, std::string>> pv;
         double tot = 0;
@@ -359,11 +364,30 @@ void Context::split_runs() {
     if (impl_->cb_def == nil) return;
     ++g_cb_count;
     [impl_->enc_def endEncoding];
+    if (impl_->qev == nil) impl_->qev = [impl_->dev newSharedEvent];
+    [impl_->cb_def encodeSignalEvent:impl_->qev value:++impl_->qev_v];
     [impl_->cb_def commit];
     impl_->inflight = impl_->cb_def;
     impl_->cb_def = nil;
     impl_->enc_def = nil;
     impl_->def_n = 0;
+}
+
+void* Context::mark() {
+    std::lock_guard<std::recursive_mutex> lk_(impl_->mu);
+    if (impl_->cb_def != nil) split_runs();   // (the streams' pending work goes first, inside)
+    if (impl_->inflight == nil) return nullptr;
+    return (__bridge_retained void*) impl_->inflight;
+}
+
+void Context::wait_mark(void* token) {
+    id<MTLCommandBuffer> cb = (__bridge_transfer id<MTLCommandBuffer>) token;
+    const auto tw0 = std::chrono::steady_clock::now();
+    [cb waitUntilCompleted];
+    g_wait_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tw0).count();
+    ++g_wait_n;
+    if (cb.status != MTLCommandBufferStatusCompleted)
+        std::fprintf(stderr, "mtl: deferred command buffer failed: %s\n", [[cb.error localizedDescription] UTF8String]);
 }
 
 void Context::flush_runs() {
@@ -373,6 +397,8 @@ void Context::flush_runs() {
     if (impl_->cb_def != nil) {
         ++g_cb_count;
         [impl_->enc_def endEncoding];
+        if (impl_->qev == nil) impl_->qev = [impl_->dev newSharedEvent];
+        [impl_->cb_def encodeSignalEvent:impl_->qev value:++impl_->qev_v];
         [impl_->cb_def commit];
         impl_->inflight = impl_->cb_def;
         impl_->cb_def = nil;
@@ -380,7 +406,11 @@ void Context::flush_runs() {
         impl_->def_n = 0;
     }
     if (impl_->inflight != nil) {
+        if (std::getenv("DS4_TRACE_WAIT")) { void* fr[8]; const int nf = backtrace(fr, 8); std::fprintf(stderr, "WAIT flush_runs:\n"); backtrace_symbols_fd(fr + 1, nf - 1, 2); }
+        const auto tw0 = std::chrono::steady_clock::now();
         [impl_->inflight waitUntilCompleted];
+        g_wait_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tw0).count();
+        ++g_wait_n;
         { const double d = impl_->inflight.GPUEndTime - impl_->inflight.GPUStartTime; if (d > 0) g_gpu_ms += d * 1000.0;
           if (!g_prof_last.empty()) { std::lock_guard<std::mutex> pl(g_prof_mu); auto& e = g_prof[g_prof_last]; e.first += d * 1e6; e.second += 1; g_prof_last.clear(); } }
         if (impl_->inflight.status != MTLCommandBufferStatusCompleted)
@@ -396,11 +426,14 @@ double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, 
     @autoreleasepool {
         if (ds.size() == 1 && reps == 1 && !barrier_between) {
             if (impl_->cb_def == nil || impl_->def_n >= 2000000) {
-                flush_runs();
+                if (impl_->cb_def != nil) split_runs();   // (a buffer committed earlier may still be running: the queue keeps the order)
                 impl_->cb_def = [impl_->q commandBufferWithUnretainedReferences];
+                if (impl_->qev != nil && impl_->qev_v > 0) [impl_->cb_def encodeWaitForEvent:impl_->qev value:impl_->qev_v];
                 impl_->enc_def = [impl_->cb_def computeCommandEncoderWithDispatchType:std::getenv("DS4_CONCURRENT") ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
             }
+            const auto te0 = std::chrono::steady_clock::now();
             encode(impl_->enc_def, ds[0]);
+            g_enc_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - te0).count();
             static const bool trace = std::getenv("DS4_TRACE_DISP") != nullptr;
             if (trace) { std::lock_guard<std::mutex> lk(g_hist_mu); std::fprintf(stderr, "TRACE disp %s\n", ds[0].p->name.c_str()); }
             // Every wrapper binds its own MTLBuffer over the same memory, so Metal's hazard tracking cannot see that one
