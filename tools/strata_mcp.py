@@ -551,6 +551,15 @@ class Strata:
                       "vision": bool(d.get("vision", False)), "own_path": True, "multi_file": True}
         return out
 
+    def own_size_names(self) -> list:
+        """The size names of the families that have an engine path of their own (Qwen3.6, DeepSeek-V4.1-Flash): the install tool accepts them as `model`."""
+        s = self.setup_module()
+        names = []
+        for table in ("OWN_PATH_FAMILIES", "MULTI_FILE_FAMILIES"):
+            for fam in (getattr(s, table, None) or {}).values():
+                names.extend(n for n in fam.get("models", {}) if n not in names)
+        return names
+
     def multi_family(self, family) -> dict | None:
         """setup.py's MULTI_FILE_FAMILIES entry (DeepSeek-V4.1-Flash), else None."""
         return (getattr(self.setup_module(), "MULTI_FILE_FAMILIES", None) or {}).get(family)
@@ -1933,7 +1942,8 @@ class Tools:
         self.s = strata
 
     def defs(self) -> list:
-        return tool_defs(*self.s.tables()[:3])
+        models, families, contexts = self.s.tables()[:3]
+        return tool_defs({**{name: {} for name in self.s.own_size_names() if name not in models}, **models}, families, contexts)
 
     def call(self, name: str, args) -> dict:
         defs = {d["name"]: d for d in self.defs()}
