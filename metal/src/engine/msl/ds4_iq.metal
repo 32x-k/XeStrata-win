@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 // ds4_iq.cu:809  mv_kernel - the I-quant expert matvec.  Same frame as the MXFP4/Q8_0 ones (a warp a row, a lane strides the
-// 256-value blocks, eight accumulator columns for the token window), with the block decoder chosen per job by b.type:
+// 256-value blocks, sixteen accumulator columns for the token window), with the block decoder chosen per job by b.type:
 // 16 IQ2_XXS (66 B), 17 IQ2_XS (74 B), 22 IQ2_S (82 B).  The activations are the quantiser's int8 (xq) with their scales (xd),
 // so each sub-group's dot is integer and the two scales fold in at the end - the same arithmetic as the float probes, at a
 // quarter of the traffic.
@@ -26,8 +26,8 @@ kernel void ds4_iq_mv(device const uchar* jobs [[buffer(0)]], uint2 tgp [[thread
     const uint nblk = uint(b.k) / 256u;
     const uint bs = b.type == 16 ? 66u : (b.type == 17 ? 74u : 82u);
     const device uchar* w = b.w + (size_t) row * b.ld;
-    float acc[8];
-    for (uint c = 0; c < 8u; ++c) acc[c] = 0.0f;
+    float acc[16];
+    for (uint c = 0; c < 16u; ++c) acc[c] = 0.0f;
     for (uint blk = lane; blk < nblk; blk += 32u) {
         const device uchar* p = w + (size_t) blk * bs;
         const float d = float(as_type<half>(*(const device ushort*) p));
@@ -75,7 +75,7 @@ kernel void ds4_iq_mv(device const uchar* jobs [[buffer(0)]], uint2 tgp [[thread
                 else g = iq2s_grid[idx[l] & 1023u];
                 const float db = (l < 2u) ? db0 : db1;
                 const uint off = (size_t) blk * 256u + ib * 32u + l * 8u;
-                for (uint c = 0; c < 8u; ++c) {
+                for (uint c = 0; c < 16u; ++c) {
                     if (int(c) >= b.ncol) break;
                     const device char* xq = b.xq + (size_t) c * b.k + off;
                     int sum = 0;
@@ -90,7 +90,107 @@ kernel void ds4_iq_mv(device const uchar* jobs [[buffer(0)]], uint2 tgp [[thread
             }
         }
     }
-    for (uint c = 0; c < 8u; ++c) {
+    for (uint c = 0; c < 16u; ++c) {
+        if (int(c) >= b.ncol) break;
+        float v = acc[c];
+        v += simd_shuffle_xor(v, 16);
+        v += simd_shuffle_xor(v, 8);
+        v += simd_shuffle_xor(v, 4);
+        v += simd_shuffle_xor(v, 2);
+        v += simd_shuffle_xor(v, 1);
+        if (lane == 0u) b.y[(size_t) c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+    }
+}
+
+// Q5_K / Q6_K (the dense matrices' K-quants; ggml blocks of 176 / 210 bytes): the same warp a row frame, a lane a
+// 256-value block, each value's code times its activation's int8.  Q5_K's weight is d*sc*q - dmin*m (both parts of the
+// 32-value group's scales), Q6_K's d*sc*(q - 32).
+static inline void ds4_k_scale(const device uchar* q, int j, thread int& d, thread int& m) {
+    if (j < 4) {
+        d = int(q[j]) & 63;
+        m = int(q[j + 4]) & 63;
+    } else {
+        d = (int(q[j + 4]) & 0xf) | ((int(q[j - 4]) >> 6) << 4);
+        m = (int(q[j + 4]) >> 4) | ((int(q[j]) >> 6) << 4);
+    }
+}
+
+kernel void ds4_iq_mv_k(device const uchar* jobs [[buffer(0)]], uint2 tgp [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    const device Ds4MvJob& b = *(const device Ds4MvJob*) (jobs + (size_t) tgp.y * sizeof(Ds4MvJob));
+    const uint row = tgp.x * 8u + (tid >> 5);
+    if (int(row) >= b.n) return;
+    const uint nsb = uint(b.k) / 32u;
+    const uint nblk = uint(b.k) / 256u;
+    const uint bs = b.type == 13 ? 176u : 210u;
+    const device uchar* w = b.w + (size_t) row * b.ld;
+    float acc[16];
+    for (uint c = 0; c < 16u; ++c) acc[c] = 0.0f;
+    for (uint blk = lane; blk < nblk; blk += 32u) {
+        const device uchar* p = w + (size_t) blk * bs;
+        if (b.type == 13) {
+            const float d = float(as_type<half>(*(const device ushort*) p));
+            const float dmin = float(as_type<half>(*(const device ushort*) (p + 2)));
+            const device uchar* scales = p + 4;
+            const device uchar* qh = p + 16;
+            const device uchar* qs = p + 48;
+            for (uint ib = 0; ib < 8u; ++ib) {
+                int sc, mm;
+                ds4_k_scale(scales, int(ib), sc, mm);
+                const device uchar* qsp = qs + 32u * (ib >> 1);
+                const uint sh = 4u * (ib & 1u);
+                for (uint t = 0; t < 8u; ++t) {
+                    const uint q4 = (*(const device uint*) (qsp + 4u * t) >> sh) & 0x0f0f0f0fu;
+                    const uint h4 = (*(const device uint*) (qh + 4u * t) >> ib) & 0x01010101u;
+                    const uint q = q4 | (h4 << 4);
+                    const uint off = blk * 256u + ib * 32u + t * 4u;
+                    for (uint c = 0; c < 16u; ++c) {
+                        if (int(c) >= b.ncol) break;
+                        const device char* xq = b.xq + (size_t) c * b.k + off;
+                        int sumq = 0, sumx = 0;
+                        for (uint j = 0; j < 4u; ++j) {
+                            const int code = int((q >> (8u * j)) & 0xffu);
+                            const int xv = int(xq[j]);
+                            sumq += code * xv;
+                            sumx += xv;
+                        }
+                        const float dot = d * float(sc) * float(sumq) - dmin * float(mm) * float(sumx);
+                        acc[c] = fma(b.xd[(size_t) c * nsb + (off / 32u)], dot, acc[c]);
+                    }
+                }
+            }
+        } else {
+            const float d = float(as_type<half>(*(const device ushort*) (p + 208)));
+            const device uchar* ql = p;
+            const device uchar* qh = p + 128;
+            const device uchar* scl = p + 192;
+            for (uint ib = 0; ib < 8u; ++ib) {
+                const uint h = ib >> 2, quarter = ib & 3u;
+                const device uchar* qlp = ql + 64u * h + ((quarter & 1u) ? 32u : 0u);
+                const device uchar* qhp = qh + 32u * h;
+                const uint sh = 4u * (quarter >> 1);
+                const int s0 = int(((const device char*) scl)[8u * h + 2u * quarter]);
+                const int s1 = int(((const device char*) scl)[8u * h + 2u * quarter + 1u]);
+                for (uint t = 0; t < 8u; ++t) {
+                    const uint x = ((*(const device uint*) (qlp + 4u * t) >> sh) & 0x0f0f0f0fu) |
+                                   (((*(const device uint*) (qhp + 4u * t) >> (2u * quarter)) & 0x03030303u) << 4);
+                    const uint off = blk * 256u + ib * 32u + t * 4u;
+                    const float s = float(t < 4u ? s0 : s1);
+                    for (uint c = 0; c < 16u; ++c) {
+                        if (int(c) >= b.ncol) break;
+                        const device char* xq = b.xq + (size_t) c * b.k + off;
+                        int sumq = 0;
+                        for (uint j = 0; j < 4u; ++j) {
+                            const int code = int((x >> (8u * j)) & 0xffu) - 32;
+                            sumq += code * int(xq[j]);
+                        }
+                        acc[c] = fma(b.xd[(size_t) c * nsb + (off / 32u)] * d * s, float(sumq), acc[c]);
+                    }
+                }
+            }
+        }
+    }
+    for (uint c = 0; c < 16u; ++c) {
         if (int(c) >= b.ncol) break;
         float v = acc[c];
         v += simd_shuffle_xor(v, 16);

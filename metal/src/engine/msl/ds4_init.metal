@@ -1519,3 +1519,416 @@ kernel void ds4_sampler_greedy(device const float* logits [[buffer(0)]], constan
         if (lane == 0u) out[t] = (wi < n_vocab) ? wi : 0;   // (a tie between two -inf candidates: 0)
     }
 }
+
+// ---------------------------------------------------------------- sparse attention (the prompt path)
+//
+// ds4_kernels.cu:954 sparse_attn_packed_kernel<G> and :774 sparse_attn_kernel<false>.  The packed kernel stages sixteen
+// rows of a tile in threadgroup memory (the window rows as they are, the compressed rows decoded to BF16) once for all
+// G heads of a threadgroup, then does each head's dots, softmax and weighted sum.  The BF16 kernel is the same arithmetic
+// for row sets already stored as BF16 (a DSpark block); one head and query a threadgroup.
+struct Ds4AttnRows {   // ds4_kernels.cuh:149 AttnRows (kWin = 16)
+    int win0[16], nwin[16], nsel[16];
+    int gen, t0, win, R, kcap;
+    long p0;
+};
+
+static inline void ds4_attn_counts(constant Ds4AttnRows& ar, int t, thread int& n_win, thread int& n_sel, thread int& w0) {
+    if (ar.gen != 0) {
+        const long ta = (long) ar.t0 + (long) t;
+        const long pa = ar.p0 + ta;
+        const long a = (long) ar.win - ar.p0, b = ta + 1;
+        const long first = a > b ? a : b;   // max(win - p0, ta + 1)
+        w0 = int(first);
+        n_win = int((long) ar.win + ta - first + 1);
+        n_sel = ar.R > 0 ? int(((pa + 1) / (long) ar.R) < (long) ar.kcap ? (pa + 1) / (long) ar.R : (long) ar.kcap) : 0;
+    } else {
+        w0 = ar.win0[t];
+        n_win = ar.nwin[t];
+        n_sel = ar.nsel[t];
+    }
+    if (n_win < 0) n_win = 0;
+    if (n_sel < 0) n_sel = 0;
+}
+
+static inline float ds4_bf16_u32(uint v) { return as_type<float>(v << 16); }
+
+// 32 values of a packed compressed row (kKvFp4, 512 values) as BF16 in four uint4s
+static inline void ds4_attn_unpack32(const device uchar* rr, int part, threadgroup uint4* dst) {
+    const uint4 cw = *(const device uint4*) (rr + (size_t) part * 16u);
+    const float k0 = ds4_e4m3(uint(rr[256u + uint(part) * 2u])) * 16384.0f;
+    const float k1 = ds4_e4m3(uint(rr[256u + uint(part) * 2u + 1u])) * 16384.0f;
+    const uint wv[4] = {cw.x, cw.y, cw.z, cw.w};
+    uint o[16];
+    for (uint k = 0; k < 16u; ++k) {
+        const uint b = wv[k >> 2] >> (8u * (k & 3u));
+        const float ks = k < 8u ? k0 : k1;
+        const float lo = ds4_e2m1_val14(b) * ks, hi = ds4_e2m1_val14(b >> 4) * ks;
+        o[k] = (as_type<uint>(lo) >> 16) | (as_type<uint>(hi) & 0xffff0000u);
+    }
+    dst[0] = uint4(o[0], o[1], o[2], o[3]);
+    dst[1] = uint4(o[4], o[5], o[6], o[7]);
+    dst[2] = uint4(o[8], o[9], o[10], o[11]);
+    dst[3] = uint4(o[12], o[13], o[14], o[15]);
+}
+
+// rows [s0, s0 + n) of the tile at t0 into tile4; a thread stages one row's 32 values
+static inline void ds4_attn_stage(device const ushort* wbase, device const uchar* ckv, device const int* sl,
+                                  int n_win, int t0, int s0, int n, int sr, int part, threadgroup uint4* tile4) {
+    if (sr >= n) return;
+    const int j = s0 + sr;
+    threadgroup uint4* dst = tile4 + (size_t) sr * 64u + (size_t) part * 4u;
+    const int jj = t0 + j;
+    if (jj < n_win) {
+        const device uint4* src = (const device uint4*) (wbase + (size_t) jj * 512u + (size_t) part * 32u);
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = src[3];
+        return;
+    }
+    const device uchar* rr = ckv + (size_t) sl[jj - n_win] * 288u;
+    ds4_attn_unpack32(rr, part, dst);
+}
+
+static inline float ds4_attn_warp_max(float v) {
+    v = fmax(v, simd_shuffle_xor(v, 16));
+    v = fmax(v, simd_shuffle_xor(v, 8));
+    v = fmax(v, simd_shuffle_xor(v, 4));
+    v = fmax(v, simd_shuffle_xor(v, 2));
+    v = fmax(v, simd_shuffle_xor(v, 1));
+    return v;
+}
+
+template <int G>
+static inline void ds4_sparse_packed_run(device const float* q, device const ushort* win, device const uchar* ckv,
+                                         device const int* sel, uint sel_stride, constant Ds4AttnRows& ar,
+                                         device const float* sink, uint heads, float scale, device float* out,
+                                         threadgroup uint4* tile4, threadgroup float* sc, threadgroup float* m_run_s,
+                                         threadgroup float* tscale_s, threadgroup float* den_s, uint2 tgp, uint tid,
+                                         ushort lane_in, ushort wp_in) {
+    constexpr int W = 8 / G;   // warps a head
+    const int hb = int(tgp.x) * G, t = int(tgp.y);
+    int n_win, n_sel, w0;
+    ds4_attn_counts(ar, t, n_win, n_sel, w0);
+    const device ushort* wbase = win + (size_t) w0 * 512u;
+    const device int* sl = sel + (size_t) t * (size_t) sel_stride;
+    const uint lane = uint(lane_in), wp = uint(wp_in);
+    const uint gw = wp / uint(W), wr = wp % uint(W);
+    float qr[16];
+    for (int x = 0; x < 16; ++x)
+        qr[x] = q[((size_t) t * heads + uint(hb) + gw) * 512u + lane * 16u + uint(x)];
+    if (tid < uint(G)) {
+        m_run_s[tid] = -1e30f;
+        den_s[tid] = 0.0f;
+    }
+    float o0[G], o1[G];
+    for (int g = 0; g < G; ++g) o0[g] = o1[g] = 0.0f;
+    const int c = int(tid) * 2;
+    const int sr = int(tid) >> 4, part = int(tid) & 15;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int total = n_win + n_sel;
+    for (int t0 = 0; t0 < total; t0 += 64) {
+        const int nt = min(64, total - t0);
+        for (int s0 = 0; s0 < nt; s0 += 16) {   // the dots
+            const int n = min(16, nt - s0);
+            ds4_attn_stage(wbase, ckv, sl, n_win, t0, s0, n, sr, part, tile4);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int r = int(wr); r < n; r += W) {
+                const threadgroup uint4* rp = tile4 + (size_t) r * 64u + lane * 2u;
+                const uint4 a = rp[0], b = rp[1];
+                const uint av[4] = {a.x, a.y, a.z, a.w}, bv[4] = {b.x, b.y, b.z, b.w};
+                float s = 0.0f;
+                for (int x = 0; x < 4; ++x) {
+                    s += qr[2 * x] * ds4_bf16_u32(av[x] & 0xffffu);
+                    s += qr[2 * x + 1] * ds4_bf16_u32(av[x] >> 16);
+                }
+                for (int x = 0; x < 4; ++x) {
+                    s += qr[8 + 2 * x] * ds4_bf16_u32(bv[x] & 0xffffu);
+                    s += qr[8 + 2 * x + 1] * ds4_bf16_u32(bv[x] >> 16);
+                }
+                s = ds4_warp_sum(s);
+                if (lane == 0u) sc[uint(gw) * 64u + uint(s0 + r)] = s * scale;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (wp < uint(G)) {   // head wp's softmax over the tile
+            threadgroup float* scg = sc + wp * 64u;
+            float m = -INFINITY;
+            for (int j = int(lane); j < nt; j += 32) m = fmax(m, scg[j]);
+            m = ds4_attn_warp_max(m);
+            const float m_old = m_run_s[wp];
+            const float m_new = fmax(m_old, m);
+            float s = 0.0f;
+            for (int j = int(lane); j < nt; j += 32) {
+                const float p = exp(scg[j] - m_new);
+                scg[j] = p;
+                s += p;
+            }
+            s = ds4_warp_sum(s);
+            if (lane == 0u) {
+                tscale_s[wp] = exp(m_old - m_new);
+                den_s[wp] = den_s[wp] * tscale_s[wp] + s;
+                m_run_s[wp] = m_new;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int g = 0; g < G; ++g) {
+            const float cs = tscale_s[g];
+            o0[g] *= cs;
+            o1[g] *= cs;
+        }
+        const threadgroup uint* tu = (const threadgroup uint*) tile4;
+        for (int s0 = 0; s0 < nt; s0 += 16) {   // the weighted sums
+            const int n = min(16, nt - s0);
+            ds4_attn_stage(wbase, ckv, sl, n_win, t0, s0, n, sr, part, tile4);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int r = 0; r < n; ++r) {
+                const uint pr = tu[(size_t) r * 256u + uint(tid)];
+                const float v0 = ds4_bf16_u32(pr & 0xffffu), v1 = ds4_bf16_u32(pr >> 16);
+                for (int g = 0; g < G; ++g) {
+                    const float p = sc[uint(g) * 64u + uint(s0 + r)];
+                    o0[g] = fma(p, v0, o0[g]);
+                    o1[g] = fma(p, v1, o1[g]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    for (int g = 0; g < G; ++g) {
+        const float den = den_s[g] + exp(sink[hb + g] - m_run_s[g]);
+        device float* ov = out + ((size_t) t * heads + uint(hb + g)) * 512u;
+        ov[c] = o0[g] / den;
+        ov[c + 1] = o1[g] / den;
+    }
+}
+
+#define DS4_SPARSE_PACKED_SIG(NAME)                                                                                    \
+    kernel void NAME(device const float* q [[buffer(0)]], device const ushort* win [[buffer(1)]],                      \
+                     device const uchar* ckv [[buffer(2)]], device const int* sel [[buffer(3)]],                       \
+                     constant uint& sel_stride [[buffer(4)]], constant Ds4AttnRows& ar [[buffer(5)]],                  \
+                     device const float* sink [[buffer(6)]], constant uint& heads [[buffer(7)]],                       \
+                     constant float& scale [[buffer(8)]], device float* out [[buffer(9)]],                            \
+                     uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],             \
+                     ushort lane [[thread_index_in_simdgroup]], ushort wp [[simdgroup_index_in_threadgroup]])
+
+#define DS4_SPARSE_PACKED_BODY(G)                                                                                      \
+    {                                                                                                                  \
+        threadgroup uint4 tile4[16u * 64u];                                                                            \
+        threadgroup float sc[8u * 64u];                                                                                \
+        threadgroup float m_run_s[8u], tscale_s[8u], den_s[8u];                                                        \
+        ds4_sparse_packed_run<G>(q, win, ckv, sel, sel_stride, ar, sink, heads, scale, out, tile4, sc, m_run_s,        \
+                                 tscale_s, den_s, tgp, tid, lane, wp);                                                 \
+    }
+
+DS4_SPARSE_PACKED_SIG(ds4_sparse_attn_g8) DS4_SPARSE_PACKED_BODY(8)
+DS4_SPARSE_PACKED_SIG(ds4_sparse_attn_g4) DS4_SPARSE_PACKED_BODY(4)
+DS4_SPARSE_PACKED_SIG(ds4_sparse_attn_g2) DS4_SPARSE_PACKED_BODY(2)
+DS4_SPARSE_PACKED_SIG(ds4_sparse_attn_g1) DS4_SPARSE_PACKED_BODY(1)
+
+#undef DS4_SPARSE_PACKED_SIG
+#undef DS4_SPARSE_PACKED_BODY
+
+// kContig == false (the row set is BF16 already): one head and query a threadgroup, a warp a row's dot and warp 0 the
+// softmax, every thread two output values.
+static inline void ds4_sparse_bf16_run(device const float* q, device const ushort* win, device const ushort* ckv,
+                                       device const int* sel, uint sel_stride, constant Ds4AttnRows& ar,
+                                       device const float* sink, uint heads, float scale, device float* out,
+                                       threadgroup float* qs, threadgroup float* sc, threadgroup int* rowix,
+                                       threadgroup float* m_run_s, threadgroup float* tscale_s,
+                                       threadgroup float* den_s, uint2 tgp, uint tid, ushort lane_in,
+                                       ushort wp_in) {
+    const int h = int(tgp.x), t = int(tgp.y);
+    int n_win, n_sel, w0;
+    ds4_attn_counts(ar, t, n_win, n_sel, w0);
+    const device ushort* wbase = win + (size_t) w0 * 512u;
+    const device int* sl = sel + (size_t) t * (size_t) sel_stride;
+    const uint lane = uint(lane_in), wp = uint(wp_in);
+    for (uint i = tid; i < 512u; i += 256u) qs[i] = q[((size_t) t * heads + uint(h)) * 512u + i];
+    if (tid == 0u) {
+        m_run_s[0] = -1e30f;
+        den_s[0] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float o0 = 0.0f, o1 = 0.0f;
+    const int c = int(tid) * 2;
+    const int total = n_win + n_sel;
+    for (int t0 = 0; t0 < total; t0 += 64) {
+        const int nt = min(64, total - t0);
+        if (tid < uint(nt)) {
+            const int j = t0 + int(tid);
+            rowix[tid] = j < n_win ? -1 - j : sl[j - n_win];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int jj = int(wp); jj < nt; jj += 8) {
+            const int code = rowix[jj];
+            const device ushort* row = code < 0 ? wbase + (size_t) (-1 - code) * 512u
+                                                : ckv + (size_t) code * 512u;
+            const device uint4* rp = (const device uint4*) (row + lane * 16u);
+            const uint4 a = rp[0], b = rp[1];
+            const uint av[4] = {a.x, a.y, a.z, a.w}, bv[4] = {b.x, b.y, b.z, b.w};
+            float s = 0.0f;
+            for (int x = 0; x < 4; ++x) {
+                s += qs[lane * 16u + uint(2 * x)] * ds4_bf16_u32(av[x] & 0xffffu);
+                s += qs[lane * 16u + uint(2 * x + 1)] * ds4_bf16_u32(av[x] >> 16);
+            }
+            for (int x = 0; x < 4; ++x) {
+                s += qs[lane * 16u + uint(8 + 2 * x)] * ds4_bf16_u32(bv[x] & 0xffffu);
+                s += qs[lane * 16u + uint(9 + 2 * x)] * ds4_bf16_u32(bv[x] >> 16);
+            }
+            s = ds4_warp_sum(s);
+            if (lane == 0u) sc[jj] = s * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (wp == 0u) {
+            float m = -INFINITY;
+            for (int j = int(lane); j < nt; j += 32) m = fmax(m, sc[j]);
+            m = ds4_attn_warp_max(m);
+            const float m_old = m_run_s[0];
+            const float m_new = fmax(m_old, m);
+            float s = 0.0f;
+            for (int j = int(lane); j < nt; j += 32) {
+                const float p = exp(sc[j] - m_new);
+                sc[j] = p;
+                s += p;
+            }
+            s = ds4_warp_sum(s);
+            if (lane == 0u) {
+                tscale_s[0] = exp(m_old - m_new);
+                den_s[0] = den_s[0] * tscale_s[0] + s;
+                m_run_s[0] = m_new;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float cs = tscale_s[0];
+        o0 *= cs;
+        o1 *= cs;
+        for (int j = 0; j < nt; ++j) {
+            const int code = rowix[j];
+            const device ushort* row = code < 0 ? wbase + (size_t) (-1 - code) * 512u
+                                                : ckv + (size_t) code * 512u;
+            const uint pr = *(const device uint*) (row + c);
+            o0 = fma(sc[j], ds4_bf16_u32(pr & 0xffffu), o0);
+            o1 = fma(sc[j], ds4_bf16_u32(pr >> 16), o1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float den = den_s[0] + exp(sink[h] - m_run_s[0]);
+    device float* ov = out + ((size_t) t * heads + uint(h)) * 512u;
+    ov[c] = o0 / den;
+    ov[c + 1] = o1 / den;
+}
+
+kernel void ds4_sparse_attn_bf16(device const float* q [[buffer(0)]], device const ushort* win [[buffer(1)]],
+                                 device const ushort* ckv [[buffer(2)]], device const int* sel [[buffer(3)]],
+                                 constant uint& sel_stride [[buffer(4)]], constant Ds4AttnRows& ar [[buffer(5)]],
+                                 device const float* sink [[buffer(6)]], constant uint& heads [[buffer(7)]],
+                                 constant float& scale [[buffer(8)]], device float* out [[buffer(9)]],
+                                 uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                                 ushort lane [[thread_index_in_simdgroup]], ushort wp [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float qs[512];
+    threadgroup float sc[64];
+    threadgroup int rowix[64];
+    threadgroup float m_run_s, tscale_s, den_s;
+    ds4_sparse_bf16_run(q, win, ckv, sel, sel_stride, ar, sink, heads, scale, out, qs, sc, rowix, &m_run_s,
+                        &tscale_s, &den_s, tgp, tid, lane, wp);
+}
+
+// ds4_kernels.cu:461 route_kernel - softplus scores, their top k with bias, weights from the unbiased scores.  One
+// threadgroup (512) a token, as the CUDA kernel; rows 1024 values apart, the picks kPicks = 8 apart.
+kernel void ds4_route(device const float* logits [[buffer(0)]], device const float* bias [[buffer(1)]],
+                      constant uint& n [[buffer(2)]], constant uint& k [[buffer(3)]], constant float& route_scale [[buffer(4)]],
+                      device int* idx [[buffer(5)]], device float* w [[buffer(6)]], device const float* bias_vl [[buffer(7)]],
+                      constant uint& has_vl [[buffer(8)]], device const uint* vlw [[buffer(9)]],
+                      uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                      ushort lane [[thread_index_in_simdgroup]], ushort wp [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sc[1024], bs[1024];
+    threadgroup float bv[32];
+    threadgroup int bi[32];
+    threadgroup int pick[16];
+    const uint t = tg;
+    device const float* l = logits + (size_t) t * 1024u;
+    device const float* bp = bias;
+    if (has_vl != 0u && ((vlw[t >> 5u] >> (t & 31u)) & 1u) != 0u) bp = bias_vl;
+    for (uint i = tid; i < n; i += 512u) {
+        const float v = l[i];
+        const float sp = v > 20.0f ? v : log(1.0f + exp(v));
+        sc[i] = sqrt(sp);
+        bs[i] = sc[i] + bp[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint r = 0; r < k; ++r) {
+        float best = -INFINITY;
+        int bix = 0x7fffffff;
+        for (uint i = tid; i < n; i += 512u)
+            if (bs[i] > best || (bs[i] == best && int(i) < bix)) {
+                best = bs[i];
+                bix = int(i);
+            }
+        for (uint o = 16u; o > 0u; o >>= 1u) {
+            const float ov = simd_shuffle_xor(best, o);
+            const int oi = simd_shuffle_xor(bix, o);
+            if (ov > best || (ov == best && oi < bix)) {
+                best = ov;
+                bix = oi;
+            }
+        }
+        if (lane == 0u) {
+            bv[wp] = best;
+            bi[wp] = bix;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            float b = -INFINITY;
+            int ix = 0x7fffffff;
+            for (uint q = 0; q < 16u; ++q)
+                if (bv[q] > b || (bv[q] == b && bi[q] < ix)) {
+                    b = bv[q];
+                    ix = bi[q];
+                }
+            pick[r] = ix;
+            bs[ix] = -INFINITY;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        float s = 0.0f;
+        for (uint r = 0; r < k; ++r) s += sc[pick[r]];
+        for (uint r = 0; r < k; ++r) {
+            idx[(size_t) t * 8u + r] = pick[r];
+            w[(size_t) t * 8u + r] = sc[pick[r]] / (s + 1e-20f) * route_scale;
+        }
+    }
+}
+
+// ds4_kernels.cu:1336 gather_kernel and :1342 combine_kernel - a token's gathered expert-output rows and the MoE's sum.
+struct Ds4Gather {
+    int src[16 * 8];
+};
+struct Ds4Combine {
+    int n[16];
+    int row[16][8];
+    float w[16][8];
+    int cpu[16];
+};
+
+kernel void ds4_gather(device const float* x [[buffer(0)]], constant Ds4Gather& g [[buffer(1)]],
+                       constant uint& cols [[buffer(2)]], device float* out [[buffer(3)]],
+                       uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    const uint r = tgp.y;
+    const uint c = tgp.x * 256u + tid;
+    if (c < cols) out[(size_t) r * cols + c] = x[(size_t) g.src[r] * cols + c];
+}
+
+kernel void ds4_combine(device const float* ed [[buffer(0)]], device const float* cpu [[buffer(1)]],
+                        device const float* sh [[buffer(2)]], constant Ds4Combine& cm [[buffer(3)]],
+                        constant uint& dim [[buffer(4)]], constant uint& has_cpu [[buffer(5)]],
+                        constant uint& has_sh [[buffer(6)]], device float* out [[buffer(7)]],
+                        uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    const uint e = tgp.x * 256u + tid, t = tgp.y;
+    if (e >= dim) return;
+    float a = 0.0f;
+    for (int j = 0; j < cm.n[t]; ++j) a = fma(cm.w[t][j], ed[(size_t) cm.row[t][j] * dim + e], a);
+    if (has_cpu != 0u && cm.cpu[t] != 0) a += cpu[(size_t) t * dim + e];
+    if (has_sh != 0u) a += sh[(size_t) t * dim + e];
+    out[(size_t) t * dim + e] = a;
+}

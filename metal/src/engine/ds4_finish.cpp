@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
+#include <vector>
 
 // called by the gpu layer's synchronisation: everything batched must reach the GPU before a host read
 extern "C" void ds4_metal_flush();
@@ -236,8 +238,8 @@ bool hc_split(const float* mixes, const float* scale, const float* base, int hc,
     void* hb = strata::gpu::host_view((void*) base);
     if (!hs || !hb) { std::fprintf(stderr, "dsv41 metal: hc_split scale/base have no host view\n"); return false; }
     const size_t nbase = (size_t) (2 * hc + hc * hc);
-    mtl::Buffer bs = wrap(hs, 256);
-    mtl::Buffer bb = wrap(hb, (nbase * 4 + 65535) / 65536 * 65536 );
+    mtl::Buffer bs = wrap(hs, 3 * sizeof(float));
+    mtl::Buffer bb = wrap(hb, nbase * sizeof(float));
     if (!bs.handle || !bb.handle) return false;
     mtl::Pipeline pl;
     try { pl = g_cx->pipeline(g_lib, "ds4_hc_split"); } catch (...) { return false; }
@@ -271,7 +273,7 @@ bool moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds
         return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
-    const size_t t_bytes = (size_t) T * k * 4 + 65536;
+    const size_t t_bytes = (size_t) T * (size_t) k * 4;
     mtl::Buffer bi = wrap(hi, t_bytes);
     mtl::Buffer bv = wrap(hv, (size_t) n_vs * 4 );
     mtl::Buffer bb = wrap(hb, (size_t) (n_vs + 2) * 4 );
@@ -455,32 +457,82 @@ bool mx_mv(const void* jobs, int nj, int max_n, size_t job_bytes, int fmt) {
 
 // ds4_iq.cu:809 - the I-quant expert matvec.  The jobs are the engine's own MvJob array (80 bytes each, type included), so they
 // travel as an opaque constant copy and the kernel picks the decoder per job; one launch covers every type in it.
+static inline void* cpu_addr(void* p);
+namespace {
+// mirrors ds4_iq.cuh's MvJob (and ds4_iq.metal's Ds4MvJob): 80 bytes on arm64
+struct Ds4IqMvJob {
+    const uint8_t* w;
+    uint64_t ld;
+    int type, k, n, ncol;
+    const int8_t* xq;
+    const float* xd;
+    float* y;
+    uint64_t ycs;
+    const float* bias;
+    float alpha;
+};
+static_assert(sizeof(Ds4IqMvJob) == 80, "Ds4IqMvJob layout must match ds4_iq.cuh's MvJob");
+}  // namespace
+
 bool iq_mv(const void* jobs, int nj) {
     if (nj <= 0) return true;
     if (!ensure()) return false;
-    // max rows across the jobs: the grid's x extent
-    const unsigned char* jb = (const unsigned char*) jobs;
+    const Ds4IqMvJob* src = (const Ds4IqMvJob*) jobs;
+    std::vector<Ds4IqMvJob> exp_iq, exp_k;
+    exp_iq.reserve((size_t) nj);
+    exp_k.reserve((size_t) nj);
     int max_n = 0;
     for (int i = 0; i < nj; ++i) {
-        int n = 0;
-        std::memcpy(&n, jb + (size_t) i * 80 + 24, sizeof(int));   // MvJob::n
-        if (n > max_n) max_n = n;
+        const Ds4IqMvJob& q = src[i];
+        if (q.n > max_n) max_n = q.n;
+        const int ncol = q.ncol > 0 ? q.ncol : 1;
+        const int step = ncol > 16 ? 16 : ncol;   // both kernels keep 16 accumulators
+        for (int c0 = 0; c0 < ncol; c0 += step) {
+            Ds4IqMvJob b = q;
+            b.ncol = (c0 + step < ncol) ? step : ncol - c0;
+            if (c0 != 0) {
+                b.xq = q.xq + (size_t) c0 * (size_t) q.k;
+                b.xd = q.xd + (size_t) c0 * (size_t) (q.k / 32);
+                b.y = q.y + (size_t) c0 * (size_t) q.ycs;
+            }
+            (b.type == 13 || b.type == 14 ? exp_k : exp_iq).push_back(b);
+        }
     }
     if (max_n <= 0) return true;
-    mtl::Buffer bj = g_cx->alloc((size_t) nj * 80);
-    if (!bj.ptr) { std::fprintf(stderr, "dsv41 metal: iq_mv job buffer failed\n"); return false; }
-    std::memcpy(bj.ptr, jobs, (size_t) nj * 80);
-    mtl::Pipeline pl;
-    try { pl = g_cx->pipeline(g_lib_iq, "ds4_iq_mv"); } catch (...) { return false; }
-    mtl::Dispatch d;
-    d.p = &pl;
-    d.args = {mtl::Arg::B(bj)};
-    d.grid[0] = (uint32_t) ((max_n + 7) / 8);
-    d.grid[1] = (uint32_t) nj;
-    d.grid[2] = 1;
-    d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
-    g_cx->run({d});
-    g_cx->free(bj);
+    const size_t kBatch = 64;   // the CUDA host's job-array limit; one command buffer a group
+    auto run_group = [&](std::vector<Ds4IqMvJob>& v, const char* fn) -> bool {
+        if (v.empty()) return true;
+        mtl::Buffer bj = g_cx->alloc(v.size() * sizeof(Ds4IqMvJob));
+        if (!bj.ptr) {
+            std::fprintf(stderr, "dsv41 metal: iq_mv job buffer failed\n");
+            return false;
+        }
+        std::memcpy(bj.ptr, v.data(), v.size() * sizeof(Ds4IqMvJob));
+        mtl::Pipeline pl;
+        try {
+            pl = g_cx->pipeline(g_lib_iq, fn);
+        } catch (...) {
+            g_cx->free(bj);
+            return false;
+        }
+        std::vector<mtl::Dispatch> ds;
+        for (size_t base = 0; base < v.size(); base += kBatch) {
+            const size_t cnt = std::min(kBatch, v.size() - base);
+            mtl::Dispatch d;
+            d.p = &pl;
+            d.args = {mtl::Arg::B(bj, base * sizeof(Ds4IqMvJob))};
+            d.grid[0] = (uint32_t) ((max_n + 7) / 8);
+            d.grid[1] = (uint32_t) cnt;
+            d.grid[2] = 1;
+            d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
+            ds.push_back(d);
+        }
+        g_cx->run(ds);
+        g_cx->free(bj);
+        return true;
+    };
+    if (!run_group(exp_k, "ds4_iq_mv_k")) return false;
+    if (!run_group(exp_iq, "ds4_iq_mv")) return false;
     return true;
 }
 
@@ -710,6 +762,268 @@ bool ext_to_ring(const void* ext, void* ring, long long p0, int n, int T, int d,
 
 // ds4_kernels.cu:937 - the selected compressed rows into the scratch (MXFP4 -> BF16, 16 threads a row)
 
+namespace {
+// mirrors metal/src/engine/msl/ds4_init.metal's Ds4AttnRows (ds4_kernels.cuh:149 AttnRows, kWin = 16)
+struct Ds4AttnRowsJob {
+    int win0[16], nwin[16], nsel[16];
+    int gen, t0, win, R, kcap;
+    int64_t p0;
+};
+static_assert(sizeof(Ds4AttnRowsJob) == 224, "Ds4AttnRowsJob layout must match the MSL struct");
+}  // namespace
+
+// ds4_kernels.cu:954 sparse_attn_packed_kernel<G> and :774 sparse_attn_kernel<false> - the prompt path's sparse attention.
+// The packed kernel stages rows once for G heads of a query; the BF16 kernel handles rows already in BF16 (a DSpark block).
+bool sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride, const void* rows,
+                 const float* sink, int heads, int d, int T, float scale, float* out, int ckv_fmt) {
+    if (T <= 0 || heads <= 0) return true;
+    if (d != 512 || rows == nullptr || (ckv_fmt != 0 && ckv_fmt != 2)) { std::fprintf(stderr, "dsv41 metal: sparse_attn unsupported\n"); return false; }
+    Ds4AttnRowsJob ar{};
+    std::memcpy(&ar, rows, sizeof(ar));
+    if (q == nullptr || out == nullptr) return false;
+    if (ar.gen == 0 && T > 16) { std::fprintf(stderr, "dsv41 metal: sparse_attn gen0 T>16\n"); return false; }
+    if (!ensure()) return false;
+
+    void* hq = cpu_addr((void*) q);
+    void* hw = cpu_addr((void*) win);
+    void* hc = cpu_addr((void*) ckv);
+    void* hs = cpu_addr((void*) sel);
+    void* hk = cpu_addr((void*) sink);
+    void* ho = cpu_addr((void*) out);
+    if (!hq || !ho) {
+        std::fprintf(stderr, "dsv41 metal: sparse_attn has no host view\n");
+        return false;
+    }
+    const size_t page = 16384;
+    auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
+        const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
+        const size_t end = (size_t) ((uintptr_t) host) + bytes;
+        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+    };
+    auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
+
+    int wmax = 0;
+    if (ar.gen != 0) {
+        wmax = ar.win + T + 1;
+    } else {
+        for (int t = 0; t < T; ++t) wmax = ar.win0[t] + ar.nwin[t] > wmax ? ar.win0[t] + ar.nwin[t] : wmax;
+        wmax += 1;
+    }
+    if (wmax > 0 && hw == nullptr) { std::fprintf(stderr, "dsv41 metal: sparse_attn win null (wmax %d)\n", wmax); return false; }
+    const size_t wrows = (size_t) (wmax > 0 ? wmax : 1);
+    size_t crows = 0;
+    if (ckv_fmt == 2) {
+        if (ar.gen != 0 && ar.R > 0) {
+            crows = (size_t) ((ar.p0 + ar.t0 + T + 1) / ar.R) + 2;   // every selected row is below this position
+        } else {
+            int maxrow = -1;   // the selected rows, not the cache's whole cap
+            if (hs != nullptr && sel_stride > 0)
+                for (int t = 0; t < T; ++t)
+                    for (int i = 0; i < ar.nsel[t]; ++i) {
+                        const int r = ((const int*) hs)[(size_t) t * (size_t) sel_stride + (size_t) i];
+                        if (r > maxrow) maxrow = r;
+                    }
+            crows = (size_t) (maxrow + 1);
+        }
+        if (crows < 1) crows = 1;
+    } else {
+        crows = (size_t) (T > 16 ? T : 16);
+    }
+    const size_t qbytes = (size_t) T * (size_t) heads * 512 * 4;
+    const size_t wbytes = wrows * 512 * 2;
+    const size_t cbytes = crows * (ckv_fmt == 2 ? 288 : 1024);
+    const size_t obytes = (size_t) T * (size_t) heads * 512 * 4;
+    const size_t sbytes = (size_t) T * (size_t) (sel_stride > 0 ? sel_stride : 1) * 4;
+    mtl::Buffer bq = wrap(hq, qbytes);
+    mtl::Buffer bw = hw != nullptr ? wrap(hw, wbytes) : g_cx->alloc(64);
+    mtl::Buffer bc = hc != nullptr ? wrap(hc, cbytes) : g_cx->alloc(64);
+    mtl::Buffer bs = hs != nullptr ? wrap(hs, sbytes) : g_cx->alloc(4);
+    mtl::Buffer bk = hk != nullptr ? wrap(hk, (size_t) heads * 4) : g_cx->alloc((size_t) heads * 4);
+    mtl::Buffer bo = wrap(ho, obytes);
+    if (!bq.handle || !bw.handle || !bc.handle || !bs.handle || !bk.handle || !bo.handle) {
+        std::fprintf(stderr, "dsv41 metal: sparse_attn wrap failed\n");
+        return false;
+    }
+
+    int G = 8;
+    if (heads % 8 != 0) G = heads % 4 == 0 ? 4 : (heads % 2 == 0 ? 2 : 1);
+    while (G > 1 && (heads / G) * T < 64) G /= 2;   // keep enough threadgroups on the GPU (CUDA's 2 * SMs, in effect)
+
+    const char* fn = ckv_fmt == 2 ? (G == 8 ? "ds4_sparse_attn_g8" : G == 4 ? "ds4_sparse_attn_g4"
+                                            : G == 2 ? "ds4_sparse_attn_g2" : "ds4_sparse_attn_g1")
+                                  : "ds4_sparse_attn_bf16";
+    mtl::Pipeline pl;
+    try {
+        pl = g_cx->pipeline(g_lib, fn);
+    } catch (...) {
+        std::fprintf(stderr, "dsv41 metal: sparse_attn pipeline %s unavailable\n", fn);
+        return false;
+    }
+    mtl::Dispatch dsp;
+    dsp.p = &pl;
+    dsp.args = {mtl::Arg::B(bq, off(hq)), mtl::Arg::B(bw, off(hw != nullptr ? hw : bw.ptr)),
+                mtl::Arg::B(bc, off(hc != nullptr ? hc : bc.ptr)),
+                mtl::Arg::B(bs, off(hs != nullptr ? hs : bs.ptr)),
+                mtl::Arg::V((unsigned) (sel_stride > 0 ? sel_stride : 1)), mtl::Arg::V(ar),
+                mtl::Arg::B(bk, off(hk != nullptr ? hk : bk.ptr)), mtl::Arg::V((unsigned) heads), mtl::Arg::V(scale),
+                mtl::Arg::B(bo, off(ho))};
+    dsp.grid[0] = (uint32_t) (ckv_fmt == 2 ? heads / G : heads);
+    dsp.grid[1] = (uint32_t) T;
+    dsp.grid[2] = 1;
+    dsp.tg[0] = 256;
+    dsp.tg[1] = dsp.tg[2] = 1;
+    g_cx->run({dsp});
+    return true;
+}
+
+
+// ds4_kernels.cu:461 route_kernel - sqrt(softplus(logits)) top k with bias, then the unbiased weights.  vl is a VlBits
+// (1024 bytes) or null; bias_vl applies to the rows its bits select.
+bool route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
+           const float* bias_vl, const void* vl) {
+    if (T <= 0) return true;
+    if (logits == nullptr || bias == nullptr || idx == nullptr || w == nullptr || n <= 0 || n > 1024 || k <= 0 || k > 8)
+        return false;
+    if (!ensure()) return false;
+    void* hl = cpu_addr((void*) logits);
+    void* hb = cpu_addr((void*) bias);
+    void* hi = cpu_addr((void*) idx);
+    void* hw = cpu_addr((void*) w);
+    void* hv = bias_vl != nullptr ? cpu_addr((void*) bias_vl) : nullptr;
+    if (!hl || !hb || !hi || !hw) {
+        std::fprintf(stderr, "dsv41 metal: route has no host view\n");
+        return false;
+    }
+    const size_t page = 16384;
+    auto wrap = [&](void* host, size_t bytes) {
+        const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
+        const size_t end = (size_t) ((uintptr_t) host) + bytes;
+        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+    };
+    auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
+    mtl::Buffer bl = wrap(hl, (size_t) T * 1024 * 4);
+    mtl::Buffer bb = wrap(hb, (size_t) n * 4);
+    mtl::Buffer bi = wrap(hi, (size_t) T * 8 * 4);
+    mtl::Buffer bw = wrap(hw, (size_t) T * 8 * 4);
+    mtl::Buffer bv = hv != nullptr ? wrap(hv, (size_t) n * 4) : g_cx->alloc(4);
+    mtl::Buffer bbv = g_cx->alloc(1024);
+    if (!bl.handle || !bb.handle || !bi.handle || !bw.handle || !bv.handle || !bbv.ptr) return false;
+    const bool has_vl = vl != nullptr;
+    if (has_vl) std::memcpy(bbv.ptr, vl, 1024);
+    mtl::Pipeline pl;
+    try {
+        pl = g_cx->pipeline(g_lib, "ds4_route");
+    } catch (...) {
+        std::fprintf(stderr, "dsv41 metal: route pipeline unavailable\n");
+        return false;
+    }
+    mtl::Dispatch dsp;
+    dsp.p = &pl;
+    dsp.args = {mtl::Arg::B(bl, off(hl)), mtl::Arg::B(bb, off(hb)), mtl::Arg::V((unsigned) n), mtl::Arg::V((unsigned) k),
+                mtl::Arg::V(route_scale), mtl::Arg::B(bi, off(hi)), mtl::Arg::B(bw, off(hw)),
+                mtl::Arg::B(bv, hv != nullptr ? off(hv) : 0), mtl::Arg::V(has_vl ? 1u : 0u), mtl::Arg::B(bbv)};
+    dsp.grid[0] = (uint32_t) T;
+    dsp.grid[1] = dsp.grid[2] = 1;
+    dsp.tg[0] = 512;
+    dsp.tg[1] = dsp.tg[2] = 1;
+    g_cx->run({dsp});
+    g_cx->free(bbv);
+    return true;
+}
+
+
+namespace {
+struct Ds4GatherJob {
+    int src[16 * 8];
+};
+struct Ds4CombineJob {
+    int n[16];
+    int row[16][8];
+    float w[16][8];
+    int cpu[16];
+};
+static_assert(sizeof(Ds4GatherJob) == 512, "Ds4GatherJob layout must match the MSL struct");
+static_assert(sizeof(Ds4CombineJob) == 1152, "Ds4CombineJob layout must match the MSL struct");
+}  // namespace
+
+// ds4_kernels.cu:1336 gather_kernel - out[r] = x[g.src[r]] for n rows of cols floats
+bool gather_rows(const float* x, const void* g, int n, int cols, float* out) {
+    if (n <= 0 || cols <= 0) return true;
+    if (x == nullptr || g == nullptr || out == nullptr || n > 16 * 8) return false;
+    if (!ensure()) return false;
+    void* hx = cpu_addr((void*) x);
+    void* ho = cpu_addr((void*) out);
+    if (!hx || !ho) return false;
+    Ds4GatherJob gj{};
+    std::memcpy(&gj, g, sizeof(gj));
+    const size_t page = 16384;
+    auto wrap = [&](void* host, size_t bytes) {
+        const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
+        const size_t end = (size_t) ((uintptr_t) host) + bytes;
+        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+    };
+    auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
+    int max_src = 0;
+    for (int i = 0; i < n; ++i) max_src = gj.src[i] > max_src ? gj.src[i] : max_src;
+    mtl::Buffer bx = wrap(hx, (size_t) (max_src + 1) * cols * 4);   // src rows may be beyond the n output rows
+    mtl::Buffer bo = wrap(ho, (size_t) n * cols * 4);
+    if (!bx.handle || !bo.handle) return false;
+    mtl::Pipeline pl;
+    try { pl = g_cx->pipeline(g_lib, "ds4_gather"); } catch (...) { return false; }
+    mtl::Dispatch dsp;
+    dsp.p = &pl;
+    dsp.args = {mtl::Arg::B(bx, off(hx)), mtl::Arg::V(gj), mtl::Arg::V((unsigned) cols), mtl::Arg::B(bo, off(ho))};
+    dsp.grid[0] = (uint32_t) ((cols + 255) / 256);
+    dsp.grid[1] = (uint32_t) n;
+    dsp.grid[2] = 1;
+    dsp.tg[0] = 256; dsp.tg[1] = dsp.tg[2] = 1;
+    g_cx->run({dsp});
+    return true;
+}
+
+// ds4_kernels.cu:1342 combine_kernel - out[t] = sum_j w[t][j] ed[row[t][j]] + cpu[t] (when set) + sh[t]
+bool combine(const float* ed, const float* cpu, const float* sh, const void* c, int T, int dim, float* out) {
+    if (T <= 0 || dim <= 0) return true;
+    if (ed == nullptr || c == nullptr || out == nullptr || T > 16) return false;
+    if (!ensure()) return false;
+    void* he = cpu_addr((void*) ed);
+    void* hc = cpu != nullptr ? cpu_addr((void*) cpu) : nullptr;
+    void* hs = sh != nullptr ? cpu_addr((void*) sh) : nullptr;
+    void* ho = cpu_addr((void*) out);
+    if (!he || !ho) return false;
+    Ds4CombineJob cj{};
+    std::memcpy(&cj, c, sizeof(cj));
+    const size_t page = 16384;
+    auto wrap = [&](void* host, size_t bytes) {
+        const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
+        const size_t end = (size_t) ((uintptr_t) host) + bytes;
+        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+    };
+    auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
+    int max_row = 0;
+    for (int t = 0; t < T; ++t)
+        for (int j = 0; j < cj.n[t]; ++j) max_row = cj.row[t][j] > max_row ? cj.row[t][j] : max_row;
+    mtl::Buffer be = wrap(he, (size_t) (max_row + 1) * dim * 4);   // rows may be beyond T * kPicks
+    mtl::Buffer bc = hc != nullptr ? wrap(hc, (size_t) T * dim * 4) : g_cx->alloc(4);
+    mtl::Buffer bs = hs != nullptr ? wrap(hs, (size_t) T * dim * 4) : g_cx->alloc(4);
+    mtl::Buffer bo = wrap(ho, (size_t) T * dim * 4);
+    if (!be.handle || !bc.handle || !bs.handle || !bo.handle) return false;
+    mtl::Pipeline pl;
+    try { pl = g_cx->pipeline(g_lib, "ds4_combine"); } catch (...) { return false; }
+    mtl::Dispatch dsp;
+    dsp.p = &pl;
+    dsp.args = {mtl::Arg::B(be, off(he)), mtl::Arg::B(bc, hc != nullptr ? off(hc) : 0),
+                mtl::Arg::B(bs, hs != nullptr ? off(hs) : 0), mtl::Arg::V(cj), mtl::Arg::V((unsigned) dim),
+                mtl::Arg::V(hc != nullptr ? 1u : 0u), mtl::Arg::V(hs != nullptr ? 1u : 0u), mtl::Arg::B(bo, off(ho))};
+    dsp.grid[0] = (uint32_t) ((dim + 255) / 256);
+    dsp.grid[1] = (uint32_t) T;
+    dsp.grid[2] = 1;
+    dsp.tg[0] = 256; dsp.tg[1] = dsp.tg[2] = 1;
+    g_cx->run({dsp});
+    return true;
+}
+
+
 // On Apple silicon every device pointer is a CPU address (unified memory), so a pointer the gpu allocator does not know about
 // (the engine builds some of its small arrays itself) still wraps correctly: host_view when it has one, the pointer otherwise.
 static inline void* cpu_addr(void* p) {
@@ -734,7 +1048,8 @@ bool engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, f
         return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
-    mtl::Buffer br = wrap(hr, (size_t) n * (size_t) hd);
+    const size_t per = (size_t) (hd / 32) * 18;   // fmt 2: IQ4_NL blocks, 18 bytes a 32 values
+    mtl::Buffer br = wrap(hr, (size_t) n * per);
     mtl::Buffer bo = wrap(ho, (size_t) n * (size_t) hd * 4);
     if (!br.handle || !bo.handle) return false;
     mtl::Pipeline pl;
@@ -1155,7 +1470,17 @@ bool unpack_sel(const void* ckv, const int* sel, int sel_stride, int gen, long l
         return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
-    mtl::Buffer bc = wrap(hc, (size_t) 4096 * row_bytes );
+    int maxrow = -1;
+    if (gen != 0 && R > 0) {
+        maxrow = (int) ((p0 + t0 + T) / R) + 1;
+    } else if (gen == 0 && nsel != nullptr) {
+        for (int t = 0; t < T && t < nsel_count; ++t)
+            for (int i = 0; i < nsel[t]; ++i) {
+                const int r = sel[(size_t) t * (size_t) sel_stride + (size_t) i];
+                if (r > maxrow) maxrow = r;
+            }
+    }
+    mtl::Buffer bc = wrap(hc, (size_t) (maxrow + 1 > 0 ? maxrow + 1 : 1) * row_bytes);
     mtl::Buffer bsl = wrap(hs, (size_t) T * sel_stride * 4 );
     mtl::Buffer bo = wrap(ho, (size_t) T * cap * 512 * 2 );
     if (!bc.handle || !bsl.handle || !bo.handle) return false;
@@ -1349,8 +1674,9 @@ bool swiglu(const float* g, const float* u, int n, float lim, float* h) {
     if (!hg || !hu || !hh) { std::fprintf(stderr, "dsv41 metal: swiglu has no host view\n"); return false; }
     const size_t page = 16384;
     auto wrap = [&](void* host) {
-        const size_t bytes = (size_t) n * 4 + 65536;
-        return g_cx->wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)), ((bytes + page - 1) / page) * page);
+        const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
+        const size_t end = (size_t) ((uintptr_t) host) + (size_t) n * 4;
+        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bg = wrap(hg), bu = wrap(hu), bh = wrap(hh);

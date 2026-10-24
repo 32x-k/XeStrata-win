@@ -54,6 +54,7 @@ bool unpack_sel(const void* ckv, const int* sel, int sel_stride, int gen, long l
 
 // the entry points, as metal/src/engine/ds4_finish.cpp defines them
 bool block_max(const float* score, long long stride, int T, const void* rows, int blk, float* bm, long long bm_stride, int nb_max);
+bool combine(const float* ed, const float* cpu, const float* sh, const void* c, int T, int dim, float* out);
 bool compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T, int d, const float* w, float eps, float* latent);
 bool embed(const uint16_t* rows, int T, float* h, int dim, int hc, void*);
 bool engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, int fmt);
@@ -61,6 +62,7 @@ bool engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd,
 bool engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int T, float eps);
 bool ext_to_ring(const void* ext, void* ring, long long p0, int n, int T, int d, size_t row_bytes, void* backup);
 bool finish(float* x, int n_vec, int len, long long stride, const FinishIn& f);
+bool gather_rows(const float* x, const void* g, int n, int cols, float* out);
 bool gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T, float alpha, float* y, size_t ldy);
 bool gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy);
 bool hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_stride);
@@ -83,9 +85,11 @@ bool mx_combine(const void* plan_ptr, const void* plan_w, const void* part, cons
 bool mx_mv(const void* jobs, int nj, int max_n, size_t job_bytes, int fmt);
 bool q8_quant_rows(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d);
 bool ring_to_ext(const void* ring, void* ext, long long p0, int n, int d, size_t row_bytes);
+bool route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w, const float* bias_vl, const void* vl);
 bool route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale, const void* vram, int* idx, float* w, void* plan_ptr, const float* bias_vl, unsigned vl);
 bool sample_greedy(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len, int penalty_last_n, float penalty_repeat, float penalty_freq, float penalty_present, const float* logit_bias, int* out);
 bool sgemm_tn(const float* A, const float* B, float* C, int m, int nt, int k, int lda, int ldb, int ldc);
+bool sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride, const void* rows, const float* sink, int heads, int d, int T, float scale, float* out, int ckv_fmt);
 bool swiglu(const float* g, const float* u, int n, float lim, float* h);
 bool topk(const float* vals, long long stride, int T, const void* rows, const int* cand, int cand_stride, int blk, int* out, int out_stride);
 bool unpack_sel(const void* ckv, const int* sel, int sel_stride, int gen, long long p0, int t0, int R, int kcap, const int* nsel, int cap, void* out, int T, int nsel_count, size_t row_bytes);

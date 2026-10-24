@@ -1103,7 +1103,10 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
         if (m.fmt == kFmtGG) {   // the activations rounded to int8 (job i's rows of the scratch), then ds4_iq's GEMV
             Scratch* sc = scratch(s);
             if (sc == nullptr || m.raw == nullptr || q.xf == nullptr || q.y == nullptr || q.ncol < 1 ||
-                q.ncol > x3::kMaxMvCols || m.k > kMaxQK || type_row_bytes(m.K, m.k) == 0) {
+#if !defined(STRATA_METAL)
+                q.ncol > x3::kMaxMvCols ||
+#endif
+                m.k > kMaxQK || type_row_bytes(m.K, m.k) == 0) {
                 std::fprintf(stderr, "ds4 gguf mv: job %d unsupported (type %s k %d n %d)\n", i, type_name(m.K), m.k, m.n);
                 g_errors.fetch_add(1, std::memory_order_relaxed);
                 return false;

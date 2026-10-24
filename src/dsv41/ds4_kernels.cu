@@ -2012,6 +2012,10 @@ void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
            cudaStream_t s, const float* bias_vl, const VlBits* vl) {
     static const VlBits none = {};
+#if defined(STRATA_METAL)
+    // route_kernel on the Metal dispatch; the launch below is the fallback
+    if (strata::dsv41::metal_host::route(logits, bias, n, k, T, route_scale, idx, w, bias_vl, vl)) return;
+#endif
     strata_ds4_launch(route_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, idx, w, vl != nullptr ? bias_vl : nullptr,
                                    vl != nullptr ? *vl : none);
 }
@@ -2109,6 +2113,11 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
         std::fprintf(stderr, "ds4 sparse_attn: head dim %d (rows %d) not covered\n", d, ckv_fmt);
         return;
     }
+#if defined(STRATA_METAL)
+    // sparse_attn_packed_kernel<G> / sparse_attn_kernel<false> on the Metal dispatch; the launches below are the fallback
+    if (strata::dsv41::metal_host::sparse_attn(q, win, ckv, sel, sel_stride, &a, sink, heads, d, T, scale, out, ckv_fmt))
+        return;
+#endif
     if (ckv_fmt == kKvBf16) {
         strata_ds4_launch(sparse_attn_kernel<false>, dim3(heads, T), kThreads, 0, s, q, win, (const uint16_t*) ckv, sel, sel_stride, a,
                                                                        sink, heads, d, scale, out);
@@ -2238,11 +2247,19 @@ void engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int
 }
 
 void gather_rows(const float* x, const Gather& g, int n, int cols, float* out, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    // gather_kernel on the Metal dispatch; the launch below is the fallback
+    if (strata::dsv41::metal_host::gather_rows(x, &g, n, cols, out)) return;
+#endif
     if (n > 0) strata_ds4_launch(gather_kernel, dim3(cdiv(cols, kThreads), n), kThreads, 0, s, x, g, cols, out);
 }
 
 void combine(const float* ed, const float* cpu, const float* sh, const Combine& c, int T, int dim, float* out,
              cudaStream_t s) {
+#if defined(STRATA_METAL)
+    // combine_kernel on the Metal dispatch; the launch below is the fallback
+    if (strata::dsv41::metal_host::combine(ed, cpu, sh, &c, T, dim, out)) return;
+#endif
     strata_ds4_launch(combine_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, ed, cpu, sh, c, dim, out);
 }
 
