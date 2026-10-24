@@ -81,6 +81,7 @@ struct Timeline {
     std::vector<std::string> names;        // per encoder
     uint64_t cpu0 = 0, gpu0 = 0;
     bool reg = false;
+    bool gate = true;                      // ds4_timeline_gate: record only while open
     bool att = false;                      // the encoder just made carries a sample slot
 } g_tl;
 
@@ -119,8 +120,9 @@ id<MTLComputeCommandEncoder> tl_make_encoder(id<MTLDevice> dev, id<MTLCommandBuf
         g_tl.gpu0 = g0;
         g_tl.names.assign(g_tl.cap, std::string());
         g_tl.after = std::getenv("DS4_TL_AFTER") ? std::atol(std::getenv("DS4_TL_AFTER")) : 0;
+        if (std::getenv("DS4_TL_DRAFT")) g_tl.gate = false;
     }
-    if (g_tl.n >= g_tl.cap || (long) g_disp_count.load() < g_tl.after) return [cb computeCommandEncoderWithDispatchType:dt];
+    if (!g_tl.gate || g_tl.n >= g_tl.cap || (long) g_disp_count.load() < g_tl.after) return [cb computeCommandEncoderWithDispatchType:dt];
     const size_t bi = g_tl.n / g_tl.per, si = g_tl.n % g_tl.per;
     if (bi >= g_tl.bufs.size()) {
         MTLCounterSampleBufferDescriptor* d = [MTLCounterSampleBufferDescriptor new];
@@ -202,6 +204,71 @@ void tl_report(id<MTLDevice> dev) {
     }
 }
 }  // namespace
+
+extern "C" void ds4_timeline_gate(int open) { g_tl.gate = open != 0; }
+
+
+// ---- ds4_busy_begin / ds4_busy_end: a one-threadgroup kernel on a second queue that spins on a shared flag while the host works
+// (the CPU lane), so the GPU is not idle between two bursts (idle -> the next kernels run 2-3x slower); the host sets the flag the
+// moment it is done and the kernel leaves within microseconds.  DS4_BUSY=0 turns it off.
+namespace {
+struct Busy {
+    bool init = false, ok = false;
+    id<MTLCommandQueue> q = nil;
+    id<MTLComputePipelineState> ps = nil;
+    id<MTLBuffer> flag = nil;
+    id<MTLCommandBuffer> last = nil;
+};
+Busy g_busy;
+}  // namespace
+
+extern "C" void ds4_busy_begin() {
+    static const bool off = std::getenv("DS4_BUSY") && std::string(std::getenv("DS4_BUSY")) == "0";
+    if (off) return;
+    @autoreleasepool {
+        if (!g_busy.init) {
+            g_busy.init = true;
+            id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+            static const char* kSrc = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+kernel void busy_spin(device volatile atomic_uint* flag [[buffer(0)]], constant uint& cap [[buffer(1)]], uint t [[thread_position_in_grid]]) {
+    uint x = t;
+    for (uint i = 0; i < cap; ++i) {
+        for (uint j = 0; j < 64; ++j) x = x * 1664525u + 1013904223u;
+        if (atomic_load_explicit(flag, memory_order_relaxed) != 0u) break;
+    }
+    if (x == 0xdeadbeefu) atomic_store_explicit(flag, 2u, memory_order_relaxed);
+}
+)MSL";
+            NSError* err = nil;
+            id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:kSrc] options:nil error:&err];
+            if (lib) g_busy.ps = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"busy_spin"] error:&err];
+            if (g_busy.ps) {
+                g_busy.q = [dev newCommandQueue];
+                g_busy.flag = [dev newBufferWithLength:64 options:MTLResourceStorageModeShared];
+                g_busy.ok = true;
+            }
+        }
+        if (!g_busy.ok) return;
+        if (g_busy.last != nil) [g_busy.last waitUntilCompleted];   // (the previous spin has left)
+        *(volatile uint32_t*) [g_busy.flag contents] = 0;
+        uint32_t cap = std::getenv("DS4_BUSY_CAP") ? (uint32_t) std::atoi(std::getenv("DS4_BUSY_CAP")) : 20000u;   // ~ tens of ms at most
+        id<MTLCommandBuffer> cb = [g_busy.q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_busy.ps];
+        [enc setBuffer:g_busy.flag offset:0 atIndex:0];
+        [enc setBytes:&cap length:4 atIndex:1];
+        [enc dispatchThreads:MTLSizeMake(256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        g_busy.last = cb;
+    }
+}
+extern "C" void ds4_busy_end() {
+    if (!g_busy.ok || g_busy.last == nil) return;
+    *(volatile uint32_t*) [g_busy.flag contents] = 1;
+}
 
 Context::Context() : impl_(new Impl) {
     impl_->dev = MTLCreateSystemDefaultDevice();

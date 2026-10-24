@@ -160,6 +160,15 @@ struct RoundTimes {   // DS4_ROUND_TIMES: where a decode round's time goes (ms, 
 #if defined(STRATA_METAL)
 extern "C" unsigned long long ds4_dispatch_seq();
 #endif
+#if defined(STRATA_METAL)
+extern "C" void ds4_timeline_gate(int);
+#endif
+static void tl_gate(bool open) {
+#if defined(STRATA_METAL)
+    static const bool only_draft = std::getenv("DS4_TL_DRAFT") != nullptr;
+    if (only_draft) ds4_timeline_gate(open ? 1 : 0);
+#endif
+}
 static unsigned long long rt_seq() {
 #if defined(STRATA_METAL)
     return ds4_dispatch_seq();
@@ -177,10 +186,14 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         std::vector<int> drafts;
         std::vector<float> conf;
         ++g_rt.rounds;
+        static const bool tl_init = (tl_gate(false), true);
+        (void) tl_init;
+        tl_gate(true);
         const double rt0 = rt_now();
         const unsigned long long rs0 = rt_seq();
         if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter)) return false;
         g_rt.draft += rt_now() - rt0;
+        tl_gate(false);
         g_rt.draft_d += rt_seq() - rs0;
         g_round_conf = conf;
         g_round_nd = (int) drafts.size();

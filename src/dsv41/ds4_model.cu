@@ -32,6 +32,8 @@
 #include <cuda_runtime.h>
 
 #if defined(STRATA_METAL)
+extern "C" void ds4_busy_begin();
+extern "C" void ds4_busy_end();
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #endif
@@ -8388,10 +8390,14 @@ struct Model::Impl {
             const double tc = now_ms();
 #if defined(STRATA_METAL)
             ds4_metal_kick();   // (the VRAM experts run on the GPU while the CPU lane works)
+            ds4_busy_begin();   // (and the GPU is kept out of its idle clocks until the lane is done)
 #endif
             static const bool skip_cpu = std::getenv("DS4_SKIP_CPU") != nullptr;   // (timing only: the CPU lane's experts left out)
             if (!skip_cpu) cpu_experts(l, h_x, ents);
             else if (const char* fk = std::getenv("DS4_FAKE_CPU_US")) std::this_thread::sleep_for(std::chrono::microseconds(std::atoi(fk)));   // (timing only)
+#if defined(STRATA_METAL)
+            ds4_busy_end();
+#endif
             std::fill(h_part, h_part + (size_t) T * D, 0.0f);
             for (int sl = 0; sl < nslots; ++sl) {
                 float* o = h_part + (size_t) cpu_rows[(size_t) sl].first * D;
