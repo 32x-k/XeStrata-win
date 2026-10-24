@@ -1309,9 +1309,64 @@ function imgNegHint() {
   $("img-neg-hint").textContent = msg;
   $("img-neg-hint").hidden = !msg;
 }
+// the edit's mask (models whose edits take one): the first reference image under a canvas of its own size, painted
+// where it is to change; sent as OpenAI's mask, a PNG of that size transparent where it was painted
+let imgMaskURL = null;
+function imgMaskSetup() {
+  const d = health.image_defaults || {};
+  const f = ($("img-ref").files || [])[0];
+  if (imgMaskURL) URL.revokeObjectURL(imgMaskURL);
+  imgMaskURL = null;
+  $("img-mask").hidden = !(f && d.mask);
+  if ($("img-mask").hidden) return;
+  imgMaskURL = URL.createObjectURL(f);
+  const img = $("img-mask-img"), c = $("img-mask-paint");
+  img.onload = () => { c.width = img.naturalWidth; c.height = img.naturalHeight; };
+  img.src = imgMaskURL;
+}
+(() => {
+  const c = $("img-mask-paint");
+  let last = null;
+  const at = (ev) => {
+    const r = c.getBoundingClientRect();
+    return [(ev.clientX - r.left) * c.width / r.width, (ev.clientY - r.top) * c.height / r.height, c.width / r.width];
+  };
+  const stroke = (a, b) => {
+    const g = c.getContext("2d");
+    g.globalCompositeOperation = $("img-erase").checked ? "destination-out" : "source-over";
+    g.strokeStyle = "#e11d48";
+    g.lineCap = g.lineJoin = "round";
+    g.lineWidth = Number($("img-brush").value) * b[2];   // the brush in screen pixels, at the image's size
+    g.beginPath();
+    g.moveTo(a[0], a[1]);
+    g.lineTo(b[0], b[1]);
+    g.stroke();
+  };
+  c.onpointerdown = (ev) => { c.setPointerCapture(ev.pointerId); last = at(ev); stroke(last, last); };
+  c.onpointermove = (ev) => { if (!last) return; const p = at(ev); stroke(last, p); last = p; };
+  c.onpointerup = c.onpointercancel = () => { last = null; };
+})();
+$("img-mask-clear").onclick = () => { const c = $("img-mask-paint"); c.getContext("2d").clearRect(0, 0, c.width, c.height); };
+// the mask as a data: URL, or null where nothing is painted
+function imgMask() {
+  const c = $("img-mask-paint");
+  if ($("img-mask").hidden || !c.width) return null;
+  const px = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+  let painted = false;
+  for (let i = 3; i < px.length && !painted; i += 4) painted = px[i] > 0;
+  if (!painted) return null;
+  const m = document.createElement("canvas");
+  m.width = c.width;
+  m.height = c.height;
+  const g = m.getContext("2d");
+  g.fillRect(0, 0, m.width, m.height);
+  g.globalCompositeOperation = "destination-out";
+  g.drawImage(c, 0, 0);
+  return m.toDataURL("image/png");
+}
 $("img-neg").oninput = imgNegHint;
 $("img-cfg").oninput = imgNegHint;
-$("img-ref").onchange = imgDefaults;
+$("img-ref").onchange = () => { imgDefaults(); imgMaskSetup(); };
 $("img-form").onsubmit = async (ev) => {
   ev.preventDefault();
   const prompt = $("img-prompt").value.trim();
@@ -1332,6 +1387,8 @@ $("img-form").onsubmit = async (ev) => {
     // with reference images: an edit, in JSON with data: URLs (without an API key the server takes only JSON from a
     // browser page, so that another site's form cannot use it)
     if (refs.length) body.images = await Promise.all(refs.map(async f => ({image_url: await readAsDataURL(f)})));
+    const mask = refs.length ? imgMask() : null;
+    if (mask) body.mask = {image_url: mask};
     const url = refs.length ? "v1/images/edits" : "v1/images/generations";
     const r = await fetch(url, {method: "POST", headers: headers(true), body: JSON.stringify(body)});
     const j = await r.json();
@@ -1357,5 +1414,6 @@ $("img-form").onsubmit = async (ev) => {
     $("img-go").disabled = false;
     $("img-ref").value = "";   // the reference images go with this job only: the next Generate is a new image
     imgDefaults();
+    imgMaskSetup();
   }
 };

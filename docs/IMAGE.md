@@ -109,6 +109,7 @@ The config file's (`xestrata-<model>.json`) `"images"` also has entries to set b
 - A negative prompt (what the image should not have), the steps and the CFG strength can be given too. Left empty, they are the model's defaults (the API's), which the fields show greyed out.
   The steps are not shown for Turbo (fixed at 8). The negative prompt takes effect only with CFG above 1, and a line under it says so when it does not.
 - With Qwen-Image-2.1, a transparent background can be chosen as well.
+- With Qwen-Image-2.1 and a reference image attached, the part of the first image to draw again can be painted on it (brush size, eraser, clear). Only the painted part is drawn again, and the rest keeps the image's pixels (the API's `mask`). Unpainted, the edit takes the whole image.
 - Attaching reference images makes it an edit (PNG, JPEG, GIF, BMP, WebP).
 - Images are made one at a time; a chat request waits meanwhile (and the other way round).
 - The **Monitor** tab shows the stage, the step and the seconds a step takes.

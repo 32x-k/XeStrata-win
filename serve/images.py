@@ -154,8 +154,8 @@ def model_defaults(cfg: dict) -> dict:
     """What a request leaves out gets from the image model of the config's "images" section `cfg` (parse_request and
     cfg_request take theirs from here; the web page shows them): steps (Turbo's fixed, steps_fixed; Mage-Flow's edit
     model's for an edit), the least steps,
-    the guidance scale (1: none), the negative prompt when none is given (None: none, so no guidance without one), and
-    whether it makes transparent images."""
+    the guidance scale (1: none), the negative prompt when none is given (None: none, so no guidance without one),
+    whether it makes transparent images, and whether its edits take a mask."""
     mage = cfg.get("family") == "mage-flow"
     if cfg.get("schedule") == "base":
         steps, least, fixed = int(cfg.get("steps") or 40), 2, False
@@ -166,7 +166,8 @@ def model_defaults(cfg: dict) -> dict:
     edit = int(cfg.get("edit_steps") or steps) if cfg.get("edit_model") else steps
     return {"steps": steps, "edit_steps": edit, "steps_min": least, "steps_max": MAX_STEPS, "steps_fixed": fixed,
             "guidance": float(cfg.get("cfg_scale") or 1.0) if mage else 1.0,
-            "negative_prompt": MF_NEG if mage else None, "transparency": cfg.get("transparency") is not False}
+            "negative_prompt": MF_NEG if mage else None, "transparency": cfg.get("transparency") is not False,
+            "mask": cfg.get("mask") is not False}
 
 
 def parse_request(req: dict, cfg: dict) -> dict:

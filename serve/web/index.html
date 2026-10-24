@@ -115,6 +115,15 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             <input type="checkbox" id="img-bg"> Transparent background</label>
           <button type="submit" class="st-btn st-btn--primary" id="img-go">Generate</button>
         </div>
+        <div class="img-mask" id="img-mask" hidden>
+          <span class="img-mask-title">Mask (optional): paint the part of the first image to draw again; the rest stays as it is</span>
+          <div class="img-mask-tools">
+            <label class="img-check">Brush <input type="range" id="img-brush" min="4" max="200" value="40" aria-label="Brush size"></label>
+            <label class="img-check"><input type="checkbox" id="img-erase"> Erase</label>
+            <button type="button" class="st-btn" id="img-mask-clear">Clear</button>
+          </div>
+          <div class="img-mask-stage"><img id="img-mask-img" src="data:," alt="The image to edit"><canvas id="img-mask-paint" aria-label="Paint the mask"></canvas></div>
+        </div>
         <span class="composer-hint" id="img-hint">One image at a time; a chat request waits for it (and the other way round).</span>
         <span class="composer-hint" id="img-note" hidden></span>
       </form>
