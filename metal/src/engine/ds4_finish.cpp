@@ -485,9 +485,50 @@ bool q8_quant_rows(const float* x, size_t ldx, int rows, int k, int8_t* q, float
 
 // ds4_gguf.cu:371 - the MXFP4 expert matvec.  The engine builds its BfJobs array on the HOST (with device pointers inside), so
 // the jobs go to the kernel as an opaque constant copy: same bytes, same layout, indexed by threadgroup_position_in_grid.y.
-bool mx_mv(const void* jobs, int nj, int max_n, size_t job_bytes, int fmt) {
-    if (nj <= 0 || max_n <= 0) return true;
+namespace {
+// mirrors ds4_gguf.cu's BfJob (and the kernels' Ds4MxJob)
+struct HostBfJob {
+    const void* w;
+    uint64_t ld;
+    const float* x;
+    uint64_t xcs;
+    float* y;
+    uint64_t ycs;
+    const float* bias;
+    float alpha;
+    int k, n, ncol;
+    const int8_t* xq;
+    const float* xd;
+};
+}  // namespace
+
+bool mx_mv(const void* jobs_in, int nj_in, int max_n, size_t job_bytes, int fmt) {
+    if (nj_in <= 0 || max_n <= 0) return true;
     if (!ensure()) return false;
+    // The matvec kernels keep 8 accumulators (the T=8 window): a job of more activations (a 16-token window) is cut into
+    // jobs of at most 8, each reading its own activations and writing its own rows of y.  (Left whole, the columns past the
+    // eighth were never computed: rows of zeros in every projection of a prompt window.)
+    std::vector<HostBfJob> cut;
+    if (job_bytes == sizeof(HostBfJob)) {
+        const HostBfJob* src = (const HostBfJob*) jobs_in;
+        for (int i = 0; i < nj_in; ++i) {
+            const HostBfJob& q = src[i];
+            const int ncol = q.ncol > 0 ? q.ncol : 1;
+            for (int c0 = 0; c0 < ncol; c0 += 8) {
+                HostBfJob b = q;
+                b.ncol = std::min(8, ncol - c0);
+                if (c0 != 0) {
+                    if (q.x) b.x = q.x + (size_t) c0 * (size_t) q.xcs;
+                    b.y = q.y + (size_t) c0 * (size_t) q.ycs;
+                    if (q.xq) b.xq = q.xq + (size_t) c0 * (size_t) q.k;
+                    if (q.xd) b.xd = q.xd + (size_t) c0 * (size_t) (q.k / 32);
+                }
+                cut.push_back(b);
+            }
+        }
+    }
+    const void* jobs = cut.empty() ? jobs_in : (const void*) cut.data();
+    const int nj = cut.empty() ? nj_in : (int) cut.size();
     mtl::Buffer bj = g_cx->alloc((size_t) nj * job_bytes);
     if (!bj.ptr) { std::fprintf(stderr, "dsv41 metal: mx_mv job buffer failed\n"); return false; }
     std::memcpy(bj.ptr, jobs, (size_t) nj * job_bytes);

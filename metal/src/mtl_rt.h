@@ -22,6 +22,7 @@ struct Buffer {
     // a buffer longer than maxBufferLength: overlapping chunks every `stride` bytes (see Context::wrap)
     std::shared_ptr<std::vector<void*>> chunks;
     size_t stride = 0;
+    size_t bias = 0;          // bytes from the MTLBuffer's start to ptr (a view onto an allocation the runtime owns)
     template <class T> T* as() const { return static_cast<T*>(ptr); }
 };
 

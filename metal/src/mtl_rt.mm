@@ -37,6 +37,7 @@ struct Context::Impl {
     id<MTLCommandBuffer> cb_def = nil;   // the open command buffer single dispatches accumulate in
     id<MTLComputeCommandEncoder> enc_def = nil;
     int def_n = 0;
+    std::vector<void*> graveyard;   // buffers freed while the deferred command buffer still references them (it holds none)
     std::recursive_mutex mu;   // helper threads (the stager, the expert cache) flush too: one writer on the open encoder
     id<MTLDevice> dev;
     id<MTLCommandQueue> q;
@@ -48,7 +49,7 @@ struct Context::Impl {
 static inline id<MTLBuffer> B(const Buffer& b) { return (__bridge id<MTLBuffer>)b.handle; }
 // the MTLBuffer and offset that bind byte `off` of b (a chunked buffer: the chunk the offset selects)
 static inline id<MTLBuffer> BO(const Buffer& b, size_t off, size_t& o) {
-    if (!b.chunks) { o = off; return B(b); }
+    if (!b.chunks) { o = off + b.bias; return B(b); }
     const size_t k = std::min(off / b.stride, b.chunks->size() - 1);
     o = off - k * b.stride;
     return (__bridge id<MTLBuffer>)(*b.chunks)[k];
@@ -231,7 +232,23 @@ Buffer Context::wrap(void* p, size_t bytes, size_t max_span) {
     return r;
 }
 
+// The runtime's own MTLBuffer under a CPU address (strata::gpu's allocations), when [p, p + bytes) lies inside one.  Binding it
+// - the same MTLBuffer, so the same GPU address, as every other kernel that touches this memory - instead of a fresh no-copy
+// buffer per call.  (Each fresh wrapper is a second GPU mapping of the same pages: the quantiser read the activations through
+// one mapping while the norm that produced them had written through another, and saw the previous layer's.)
+extern "C" void* ds4_gpu_buffer_for_cpu(const void* cpu, size_t bytes, size_t* off) __attribute__((weak_import));
 Buffer Context::wrap(void* p, size_t bytes) {
+    if (ds4_gpu_buffer_for_cpu && !std::getenv("DS4_WRAP_COPY")) {
+        size_t off = 0;
+        if (void* mb = ds4_gpu_buffer_for_cpu(p, bytes, &off)) {
+            Buffer r;
+            r.handle = (__bridge_retained void*)((__bridge id<MTLBuffer>)mb);
+            r.ptr = p;
+            r.bytes = bytes;
+            r.bias = off;
+            return r;
+        }
+    }
     id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:p length:bytes options:MTLResourceStorageModeShared deallocator:nil];
     if (!b) {
         std::fprintf(stderr, "mtl: wrap %zu failed\n", bytes);
@@ -246,14 +263,22 @@ Buffer Context::wrap(void* p, size_t bytes) {
 }
 
 void Context::free(Buffer& b) {
+    // The deferred command buffer is made WITHOUT retained references: a buffer released here while a dispatch that names it
+    // is still queued is read after it is gone (or after another alloc took its memory: the job arrays of iq_mv read the
+    // NEXT call's jobs, measured as rows of zeros and different tokens every run).  Hold it until the buffer has completed.
+    std::lock_guard<std::recursive_mutex> lk_(impl_->mu);
+    const bool hold = impl_->cb_def != nil;
     if (b.chunks) {
-        for (void* h : *b.chunks) { id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
+        for (void* h : *b.chunks) {
+            if (hold) impl_->graveyard.push_back(h);
+            else { id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
+        }
         b = Buffer{};
         return;
     }
     if (b.handle) {
-        id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)b.handle;
-        x = nil;
+        if (hold) impl_->graveyard.push_back(b.handle);
+        else { id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)b.handle; x = nil; }
     }
     b = Buffer{};
 }
@@ -302,6 +327,7 @@ extern "C" unsigned long long ds4_dispatch_seq() { return g_disp_count.load(); }
 
 extern "C" void ds4_gpu_sync_all_streams_weak() __asm("_ds4_gpu_sync_all_streams") __attribute__((weak_import));
 void Context::flush_runs() {
+    if (std::getenv("DS4_TRACE_DISP") && impl_->cb_def != nil) std::fprintf(stderr, "TRACE flush_runs (%d queued)\n", impl_->def_n);
     std::lock_guard<std::recursive_mutex> lk_(impl_->mu);
     if (!g_count_reg) { g_count_reg = true; std::atexit(ds4_report_counts); }
     if (impl_->cb_def == nil) return;
@@ -315,6 +341,8 @@ void Context::flush_runs() {
     impl_->cb_def = nil;
     impl_->enc_def = nil;
     impl_->def_n = 0;
+    for (void* h : impl_->graveyard) { id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
+    impl_->graveyard.clear();
 }
 
 double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, bool barrier_between) {
@@ -324,9 +352,21 @@ double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, 
             if (impl_->cb_def == nil || impl_->def_n >= 2000000) {
                 flush_runs();
                 impl_->cb_def = [impl_->q commandBufferWithUnretainedReferences];
-                impl_->enc_def = [impl_->cb_def computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+                impl_->enc_def = [impl_->cb_def computeCommandEncoderWithDispatchType:std::getenv("DS4_CONCURRENT") ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
             }
             encode(impl_->enc_def, ds[0]);
+            static const bool trace = std::getenv("DS4_TRACE_DISP") != nullptr;
+            if (trace) { std::lock_guard<std::mutex> lk(g_hist_mu); std::fprintf(stderr, "TRACE disp %s\n", ds[0].p->name.c_str()); }
+            // Every wrapper binds its own MTLBuffer over the same memory, so Metal's hazard tracking cannot see that one
+            // dispatch reads what the previous wrote: without an explicit barrier the reader saw the stale value (measured: the
+            // second matvec's activation quantiser read the previous layer's x).
+            static const bool no_mb = std::getenv("DS4_NO_MBARRIER") != nullptr;
+            if (!no_mb) [impl_->enc_def memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            static const bool enc_each = std::getenv("DS4_ENC_EACH") != nullptr;   // a new encoder per dispatch (debugging)
+            if (enc_each) {
+                [impl_->enc_def endEncoding];
+                impl_->enc_def = [impl_->cb_def computeCommandEncoderWithDispatchType:(std::getenv("DS4_CONCURRENT") ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial)];
+            }
             ++impl_->def_n;
             ++g_disp_count;
             static const bool each = std::getenv("DS4_FLUSH_EACH") != nullptr;   // debugging: every dispatch alone, in order

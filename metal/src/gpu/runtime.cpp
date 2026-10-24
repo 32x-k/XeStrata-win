@@ -337,6 +337,18 @@ Error free_alloc(void* p) {
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------------- runtime.hpp
+void* buffer_for_cpu_impl(const void* cpu, size_t bytes, size_t* off) {
+    Runtime& r = rt();
+    std::lock_guard<std::mutex> lk(r.mu);
+    auto ic = r.by_cpu.upper_bound((uintptr_t) cpu);
+    if (ic == r.by_cpu.begin()) return nullptr;
+    --ic;
+    const Alloc& a = r.by_gpu[ic->second];
+    if ((uintptr_t) cpu < ic->first || (uintptr_t) cpu + bytes > ic->first + a.bytes) return nullptr;
+    *off = (uintptr_t) cpu - ic->first;
+    return (void*) a.buf;
+}
+
 void* host_view(const void* p) {
     size_t off = 0;
     const Alloc* a = find(p, &off);
@@ -687,3 +699,7 @@ Stats stats() { return rt().stats; }
 
 }  // namespace metal
 }  // namespace strata::gpu
+
+extern "C" void* ds4_gpu_buffer_for_cpu(const void* cpu, size_t bytes, size_t* off) {
+    return strata::gpu::buffer_for_cpu_impl(cpu, bytes, off);
+}

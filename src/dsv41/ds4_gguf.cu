@@ -1161,13 +1161,69 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
             const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
             b.xq = sc->mq + at;
             b.xd = sc->md + at / 32;
+#if defined(STRATA_METAL)
+            if (std::getenv("DS4_DBG_Q8_PRE")) ds4_metal_flush();   // everything before the quantiser has finished
+#endif
             q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+#if defined(STRATA_METAL)
+            if (std::getenv("DS4_DBG_Q8")) {   // DBG: the quantiser against a host recompute
+                ds4_metal_flush();
+                if (std::getenv("DS4_DBG_Q8_TWICE")) {   // the same dispatch again: does the first one get lost?
+                    q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+                    ds4_metal_flush();
+                }
+                const float* xf = (const float*) strata::gpu::host_view(q.xf);
+                const int8_t* xq = (const int8_t*) strata::gpu::host_view(sc->mq + at);
+                const float* xd = (const float*) strata::gpu::host_view(sc->md + at / 32);
+                const size_t cs = q.ncol > 1 ? q.xf_cs : (size_t) m.k;
+                int bad = 0;
+                for (int c = 0; c < q.ncol && bad < 3; ++c)
+                    for (int kb = 0; kb < m.k / 32 && bad < 3; ++kb) {
+                        float am = 0.0f;
+                        for (int j = 0; j < 32; ++j) am = std::max(am, std::fabs(xf[c * cs + kb * 32 + j]));
+                        const float sc_ = am / 127.0f;
+                        if (std::fabs(xd[(size_t) c * (m.k / 32) + kb] - sc_) > 1e-6f * (sc_ + 1e-30f)) {
+                            std::fprintf(stderr, "DBG q8quant mismatch job %d col %d blk %d: scale host %g got %g (x0=%g xq0=%d)\n", i, c, kb, sc_,
+                                         xd[(size_t) c * (m.k / 32) + kb], xf[c * cs + kb * 32], (int) xq[(size_t) c * m.k + kb * 32]);
+                            ++bad;
+                        }
+                    }
+                std::fprintf(stderr, "DBG q8quant job %d ncol %d k %d xf=%p xcs=%zu mismatches(first 3)=%d\n", i, q.ncol, m.k, (const void*) q.xf, cs, bad);
+            }
+#endif
             vec[f] = vec[f] && b.ld % 4 == 0 && ((uintptr_t) b.w & 3u) == 0 && (m.k / 32) % 2 == 0;
         } else {
             vec[f] = vec[f] && xa && (f != 0 || (m.k % 8 == 0 && b.ld % 8 == 0 && ((uintptr_t) b.w & 15u) == 0));
         }
     }
     for (int f = 0; f < 3; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s);
+#if defined(STRATA_METAL)
+    if (std::getenv("DS4_DBG_Q8") && nj[2] > 0) {   // DBG: the Q8_0 matvec's first job against a host recompute
+        ds4_metal_flush();
+        const BfJob& b = J[2].j[0];
+        const uint8_t* w = (const uint8_t*) strata::gpu::host_view(b.w);
+        const int8_t* xq = (const int8_t*) strata::gpu::host_view(b.xq);
+        const float* xd = (const float*) strata::gpu::host_view(b.xd);
+        const float* y = (const float*) strata::gpu::host_view(b.y);
+        const float* xf = (const float*) strata::gpu::host_view(b.x);
+        for (int c = 0; c < std::min(b.ncol, 2); ++c)
+            for (int r = 0; r < 2; ++r) {
+                double acc = 0.0, accf = 0.0;
+                for (int kb = 0; kb < b.k / 32; ++kb) {
+                    const uint8_t* p = w + (size_t) r * b.ld + (size_t) kb * 34;
+                    uint16_t dh;
+                    std::memcpy(&dh, p, 2);
+                    float dw = __half2float(*(const __half*) &dh);
+                    int sum = 0;
+                    for (int j = 0; j < 32; ++j) sum += (int) (int8_t) p[2 + j] * (int) xq[(size_t) c * b.k + kb * 32 + j];
+                    acc += (double) dw * xd[(size_t) c * (b.k / 32) + kb] * sum;
+                    for (int j = 0; j < 32; ++j) accf += (double) dw * (int) (int8_t) p[2 + j] * xf[(size_t) c * b.xcs + kb * 32 + j];
+                }
+                std::fprintf(stderr, "DBG q8 job0 k=%d n=%d ncol=%d ld=%zu xcs=%zu c=%d r=%d recompute=%.5g exactf=%.5g kernel_y=%.5g xd0=%g xq0=%d\n", b.k, b.n, b.ncol,
+                             b.ld, b.xcs, c, r, acc, accf, y[(size_t) c * b.ycs + r], xd[(size_t) c * (b.k / 32)], (int) xq[(size_t) c * b.k]);
+            }
+    }
+#endif
     if (nij > 0 && !iq::mv(IJ, nij, s)) {
         fail("mv: a low-bit job not covered");
         return false;
