@@ -40,6 +40,7 @@
 #include "strata/platform/thread_name.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/canon_expert.hpp"
+#include "strata/kernels/cpu/tq_cpu.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -1304,7 +1305,7 @@ bool adapt_device_table_lags() { return adapt_nowait() || adapt_lag() > 1; }
 /// the second turn on are not computed in the canonical rows, so there the swaps' timing changes the rounding and a
 /// greedy chat can differ from run to run (the fourth turn did on the RTX 4070, 1K, 2026-10-20; cut, two runs gave the
 /// same text).  STRATA_ADAPT_CUT=0|1 forces it.
-/// Gyro's trellis layers (TQ2_T, TQK6, TQK7, rotated) are not cut either, though their two sides round differently:
+/// Gyro's trellis layers (TQ2_T to TQP7, rotated) are not cut either, though their two sides round differently:
 /// cut, the windows that the draft policy and the lookups would make long were held to the next position, and Gyro-M
 /// lost decode to upstream, which does not cut (RX 9060 XT, 1K, upstream's text: 48.0 tok/s cut against 54.2 uncut
 /// and upstream's 52.9, 2026-10-22).  So a greedy reply of Gyro's can differ from run to run where a swap's timing
@@ -1315,9 +1316,9 @@ bool adapt_cuts_windows() {
         if (e && *e) return e[0] != '0';
         const auto& lay = strata::kernels::cpu::expert_layout();
         if (!lay.native || lay.fmt.empty()) return true;
-        const auto trellis = [](int t) { return t == 144 || t == 145 || t == 146; };
         for (const auto& f : lay.fmt)
-            if ((f.had_gu || !strata::kernels::cpu::canon_layer(f)) && !trellis(f.gu_type)) return true;
+            if ((f.had_gu || !strata::kernels::cpu::canon_layer(f)) && !strata::kernels::cpu::tq_supported(f.gu_type))
+                return true;
         return false;
     }();
     return v;
