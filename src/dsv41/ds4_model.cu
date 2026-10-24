@@ -4618,8 +4618,10 @@ struct Model::Impl {
         const size_t leave = (size_t) (std::getenv("DS4_STORE_RESERVE") ? std::atoi(std::getenv("DS4_STORE_RESERVE")) : 192) + 64;
         // The first 48 GB (what a store held before it could take every expert) are read before the first token; the rest of the
         // hottest-first list is read after it, in pieces of 128 experts on a thread of its own, behind the model's own reads (a
-        // guess's priority) - the same bytes, none of the wait.  DS4_STORE_BG=0 reads everything first.
-        const size_t first = std::getenv("DS4_STORE_BG") && std::atoi(std::getenv("DS4_STORE_BG")) == 0
+        // guess's priority) - the same bytes.  Opt-in (DS4_STORE_BG=1): "ready" comes 9 s sooner on the 251 GB R9700 box (24 s against 34), but a prompt sent at
+        // once then waits for the same SSD (200 tokens: 18.7 s against 9.0), so the first answer starts no sooner and decode after
+        // it measured 3.7% lower; it only pays when the first prompt comes more than ~10 s after ready.
+        const size_t first = !(std::getenv("DS4_STORE_BG") && std::atoi(std::getenv("DS4_STORE_BG")) == 1)
                                  ? list.size()
                                  : std::min(list.size(), (size_t) (48e9 / (double) std::max<size_t>(1, L[0].blob)));
         const std::vector<std::pair<int, int>> head(list.begin(), list.begin() + (long) first), tail(list.begin() + (long) first, list.end());
