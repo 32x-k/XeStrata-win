@@ -86,6 +86,14 @@ FALLBACK_MODELS = {
     "Gyro-M": {"about": "about IQ3_XXS quality with about 20% less GPU memory (35 GB of VRAM + RAM together)",
                "download_gb": 92.0, "ram_gb": 35.0, "arena_gb": 32.1, "families": ("gyro",), "mem_total": True,
                "vision": True},
+    "Gyro-Coder-L": {"about": "half the experts, kept for code, at 3.2 bits (27.5 GB of VRAM + RAM together); weaker "
+                              "outside coding",
+                     "download_gb": 84.0, "ram_gb": 27.5, "arena_gb": 24.2, "families": ("gyro-coder",),
+                     "mem_total": True, "vision": True},
+    "Gyro-Coder": {"about": "half the experts, kept for code, at 2.1 bits (19.9 GB of VRAM + RAM together); lower "
+                            "quality than Gyro-Coder-L",
+                   "download_gb": 75.8, "ram_gb": 19.9, "arena_gb": 16.0, "families": ("gyro-coder",),
+                   "mem_total": True, "vision": True},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -100,6 +108,9 @@ FALLBACK_FAMILIES = {
     "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)",
              "about": "Gyro-S (27.6 GB of memory) and Gyro-M (35 GB): the smallest sizes, for PCs with little memory",
              "tag": "gyro-"},
+    "gyro-coder": {"title": "Qwen3.8-Flash-Next Gyro-Coder",
+                   "about": "half the experts (kept for code): Gyro-Coder-L (27.5 GB of memory) and Gyro-Coder "
+                            "(19.9 GB); weaker outside coding", "tag": "gyro-coder-"},
     "huihui-swift": {"title": "Swift 1.5 (abliterated)", "about": "Swift 1.5 with its refusals removed (abliteration): "
                                                                   "far fewer refusals, and its safety filtering is "
                                                                   "reduced, so check what it writes",

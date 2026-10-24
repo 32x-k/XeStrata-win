@@ -104,6 +104,7 @@ HF_REVISIONS = {
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",                  # 2026-10-12
     "unsloth/GLM-5.3-Flash-GGUF": "a38483c8cd5df544f53d70fb281afe97369d5ab6",                        # 2026-10-09
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": "1ada08422e404aca51ab9df665f089f34c419c6b",          # 2026-10-13
+    "agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF": "b32c7399b57f7a627b8aa9403ef06767e9a444e8",    # 2026-10-24
     "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF": "06a318de4011598a142ee54bcfec47c6921c958e",  # 2026-10-22
 }
 
@@ -249,6 +250,14 @@ GYRO_FILES = {
     "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf":
         (91965774272, "7aa36d15131d255179ab6c87fa9c9f81a0b541fc9e81e959d4c3e29eb20feb5f"),
 }
+# agentionai's Gyro-Coder (2026-10-21): 256 of each layer's 512 experts kept for code, the rest as Gyro's.  Coder-L's
+# experts are TQP5 / TQP6 / TQP7 (pair trellis, 3.2 bits a weight), Coder's TQ2_T (2.1 bits).
+GYRO_CODER_FILES = {
+    "Qwen3.8-Flash-Next-Gyro-Coder-L-TQ3_0.gguf":
+        (83975625024, "184481733a1fc1341a05008fd0cff4fdc0cad1a1d6d12f63d7bb72cd5c69331d"),
+    "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf":
+        (75796732256, "2ecaf3ba6ed7f142ce00bc4a3172052f01bcf4e10d3ff617d8ab4755f4f2d4c4"),
+}
 
 MODELS: dict[str, dict[str, Any]] = {
     "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0},
@@ -305,6 +314,17 @@ MODELS: dict[str, dict[str, Any]] = {
     "Gyro-M": {"about": "about IQ3_XXS quality with about 20% less GPU memory (35 GB of VRAM + RAM together)",
                "download_gb": 92.0, "ram_gb": 35.0, "arena_gb": 32.1, "families": ("gyro",), "mem_total": True,
                "file": "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf", "shards": 1, "vision": True},
+    # Gyro-Coder (agentionai): the same memory rule; "ram_gb" the GPU memory of the weights by agentionai's card
+    "Gyro-Coder-L": {"about": "half the experts, kept for code, at 3.2 bits (27.5 GB of VRAM + RAM together); weaker "
+                              "outside coding",
+                     "download_gb": 84.0, "ram_gb": 27.5, "arena_gb": 24.2, "families": ("gyro-coder",),
+                     "mem_total": True, "file": "Qwen3.8-Flash-Next-Gyro-Coder-L-TQ3_0.gguf", "shards": 1,
+                     "vision": True},
+    "Gyro-Coder": {"about": "half the experts, kept for code, at 2.1 bits (19.9 GB of VRAM + RAM together); lower "
+                            "quality than Gyro-Coder-L",
+                   "download_gb": 75.8, "ram_gb": 19.9, "arena_gb": 16.0, "families": ("gyro-coder",),
+                   "mem_total": True, "file": "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf", "shards": 1,
+                   "vision": True},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (check_shards reads the other model files' directories; these are also hashed once).
@@ -518,6 +538,20 @@ FAMILIES: dict[str, dict[str, Any]] = {
              "sha256": GYRO_FILES,
              "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the Gyro files are agentionai's quantization): "
                         "https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"},
+    # agentionai's Gyro-Coder (GYRO_CODER_FILES): Gyro's format with half the experts, for code; never the default.
+    # Images: the original's vision encoder, as the Gyro files take it (agentionai ships none for the Coder)
+    "gyro-coder": {"title": "Qwen3.8-Flash-Next Gyro-Coder", "by": "agentionai's coding version, Gyro quantized",
+                   "about": "half the experts (kept for code): Gyro-Coder-L (27.5 GB of memory) and Gyro-Coder "
+                            "(19.9 GB); 84 and 76 GB downloads (the files include the n-gram table); weaker outside "
+                            "coding",
+                   "hf": hf("agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF"), "file": "Qwen3.8-Flash-Next-{q}.gguf",
+                   "shards": 1, "tag": "gyro-coder-", "name": "qwen3.8-flash-next-gyro-coder", "vision": True,
+                   "pack_args": ["--compat-bf16"], "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
+                   "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "sha256": GYRO_CODER_FILES,
+                   "profile": "expert-profile-gyro-coder.bin",
+                   "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the Gyro-Coder files are agentionai's "
+                              "pruning and quantization): "
+                              "https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF"},
     # huihui-ai's abliterated copies (HUIHUI_FILES): Swift 1.5's and Unsloth's files with the refusals removed, in
     # folders of one repository ("dirs": the folder of each size); after the regular families, never the default
     "huihui-swift": {"title": "Swift 1.5 (abliterated)", "by": "huihui-ai's uncensored version of Swift 1.5",
@@ -673,6 +707,7 @@ REPO_PINS: dict[str, dict[str, tuple[int, str]]] = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": CODER_FILES,
     "unsloth/Qwen3.8-Flash-Next-GGUF": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS},
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": GYRO_FILES,
+    "agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF": GYRO_CODER_FILES,
     "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF": HUIHUI_FILES,
 }
 for _fam in PLAIN_FAMILIES.values():                 # the other models' files, from their own tables

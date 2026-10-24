@@ -25,8 +25,8 @@ SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
 # XeStrata's own files without a comment of their own: the expert profiles of the other models
 [[annotations]]
-path = ["data/expert-profile-glm53.bin", "data/expert-profile-llmjp.bin", "data/expert-profile-ornith.bin",
-        "data/expert-profile-qwen36.bin"]
+path = ["data/expert-profile-glm53.bin", "data/expert-profile-gyro-coder.bin", "data/expert-profile-llmjp.bin",
+        "data/expert-profile-ornith.bin", "data/expert-profile-qwen36.bin"]
 SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"
 SPDX-License-Identifier = "LGPL-3.0-or-later"
 
