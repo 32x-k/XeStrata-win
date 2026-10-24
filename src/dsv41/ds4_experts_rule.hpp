@@ -24,6 +24,25 @@ inline int experts_per_word(int requested, uint64_t vram_bytes, int model_k) {
     return n < 1 ? 1 : n;
 }
 
+// Prompt chunk (--prefill-chunk) default, one rule decided once at load from bytes (no timing).  The chunk's buffers come out of the VRAM the
+// expert tier would have, and every chunk streams the experts the cards do not hold once, so a bigger chunk is fewer passes.  Measured (8K prompt):
+//   - the GPUs hold most of the experts (4 x R9700, share 0.86): 1024 370 tok/s, 8192 214  -> small chunk;
+//   - the experts are read in place and the CPU lane streams most of them (RTX 5070 / 3060 12 GB, 1 x R9700): 8192 best (5070 244 against 186
+//     at 1024, 3060 228 against 175, 1 x R9700 431 against 200) -> the big chunk (the GGUF pack's long-standing default);
+//   - the experts copied into RAM (--mmap-experts off): H100 32 GiB 2048 502, 4096 538, 8192 495 -> 4096 (not measured on HIP: no).
+// Reference KL against the original model does not move with the chunk (1024 0.1705, 2048 0.1692, 4096 0.1688, 8192 0.1695).
+// Alloc failure halves the chunk at load (4096 -> 2048 -> 1024 ...), KV and score buffers are allocated whole at the full --max-context.
+constexpr uint64_t kChunk4096MinVram = 10ull << 30;
+// own_default: a single-card run (no --threads, tp 1); gpu_share: the share of the routed experts the cards can hold (1 = all);
+// gguf_copy: a GGUF pack with --mmap-experts off; file_experts: the experts stay in the files; hip: a HIP build; min_vram_bytes: the
+// smallest card; big: the chunk of the streamed case (the engine's kVlRows, 8192)
+inline int prefill_chunk_default(bool own_default, double gpu_share, bool gguf_copy, bool file_experts, bool hip, uint64_t min_vram_bytes,
+                                 int big = 8192) {
+    if (own_default && gpu_share >= 0.5) return 1024;
+    if (gguf_copy && !hip && min_vram_bytes >= kChunk4096MinVram) return 4096;
+    return file_experts ? big : 2048;
+}
+
 // DS4_TOPK=N (a test, not for users): over the flag and the rule; returns the count to use
 inline int experts_test_override(int chosen, int model_k) {
     if (const char* v = std::getenv("DS4_TOPK")) {
