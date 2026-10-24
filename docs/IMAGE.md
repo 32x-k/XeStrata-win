@@ -48,6 +48,8 @@ xestrata --setup --images qwen-image-turbo     # installed from the source: ./se
   Every file is pinned to a revision and checked by its SHA-256.
 - Image generation is set up only when `--images` is given. Running setup again without it keeps the earlier image settings as they are.
 - `--images no` removes image generation.
+- Several models can be installed, comma-separated (`--images qwen-image-turbo,magetrail`). The first is the default; the others are used through the API's `model` or the web page's choice of model.
+  One runs on the GPU at a time: a request for another model ends the earlier model's engine and starts its own (a few seconds to a dozen or so). The RAM needed is the largest model's.
 - `tools/image/install.py --config <the config file>` also adds it to an existing config (`--model`, `--quant` and the others mean what setup's options do).
 
 ## Sizes and memory
@@ -105,6 +107,7 @@ The config file's (`xestrata-<model>.json`) `"images"` also has entries to set b
 
 **The Images tab:** with image generation set up, the web page (`http://127.0.0.1:8095`) has an Images tab.
 
+- With several models installed, the model can be chosen; the fields' defaults and which fields there are (steps, transparent background, edits, mask) follow it.
 - Choose the prompt, the size (1024x1024, 1536x1024, 1024x1536, 768x768, 512x512, 1920x1080, 1080x1920, auto, or any size with sides of 256 to 2048) and the seed, and press Generate.
 - A negative prompt (what the image should not have), the steps and the CFG strength can be given too. Left empty, they are the model's defaults (the API's), which the fields show greyed out.
   The steps are not shown for Turbo (fixed at 8). The negative prompt takes effect only with CFG above 1, and a line under it says so when it does not.
@@ -132,6 +135,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `prompt` | — | Required; up to 16,000 characters |
+| `model` | the default model | The image model's name (as `/v1/models` lists it), to choose one where several are installed. An unknown name (OpenAI's `gpt-image-1`, for example) is the default model |
 | `size` | `auto` (1024x1024) | `WIDTHxHEIGHT`, sides of 256 to 2048. A size whose sides are not multiples of 16 (1920x1080 and the like) is made at the multiples of 16 above it and its middle cut out |
 | `n` | 1 | 1 to 4; image i uses the seed `seed + i` |
 | `seed` | random | 0 to 2^62 |
