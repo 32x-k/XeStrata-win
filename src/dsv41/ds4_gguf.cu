@@ -1093,6 +1093,15 @@ x3::Mat view(const x3::Mat& m, int c0, int nc) {
 
 bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
     if (n <= 0 || n > x3::kMaxMvJobs) return false;
+#if defined(STRATA_METAL)
+    // the jobs' int8 activations are quantised in one dispatch before the matvecs (a dispatch a job was 45% of the decode token's)
+    struct Q8Batch { const float* x; uint64_t ldx; uint32_t rows, k; int8_t* q; float* d; } q8_batch[x3::kMaxMvJobs];
+    int nq8 = 0;
+    const bool q8_deferred = std::getenv("DS4_NO_Q8_BATCH") == nullptr && std::getenv("DS4_DBG_Q8") == nullptr;
+#define Q8_QUANT(XF, LDX, ROWS, KK, Q, D, S)                                                                             do {                                                                                                                     if (q8_deferred) q8_batch[nq8++] = Q8Batch{XF, (uint64_t) (LDX), (uint32_t) (ROWS), (uint32_t) (KK), Q, D};           else q8_quant(XF, LDX, ROWS, KK, Q, D, S);                                                                       } while (0)
+#else
+#define Q8_QUANT(XF, LDX, ROWS, KK, Q, D, S) q8_quant(XF, LDX, ROWS, KK, Q, D, S)
+#endif
     BfJobs J[3] = {};   // the BF16 jobs, the MXFP4 ones, the Q8_0 ones: a launch each
     int nj[3] = {0, 0, 0}, max_n[3] = {0, 0, 0}, max_c[3] = {1, 1, 1};
     bool vec[3] = {true, true, true};
@@ -1113,7 +1122,7 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
                 return false;
             }
             const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
-            q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+            Q8_QUANT(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
             iq::MvJob& b = IJ[nij++];
             b.w = (const uint8_t*) m.raw;
             b.ld = row_stride(m);
@@ -1165,7 +1174,7 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
 #if defined(STRATA_METAL)
             if (std::getenv("DS4_DBG_Q8_PRE")) ds4_metal_flush();   // everything before the quantiser has finished
 #endif
-            q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+            Q8_QUANT(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
 #if defined(STRATA_METAL)
             if (std::getenv("DS4_DBG_Q8")) {   // DBG: the quantiser against a host recompute
                 ds4_metal_flush();
@@ -1197,6 +1206,9 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
             vec[f] = vec[f] && xa && (f != 0 || (m.k % 8 == 0 && b.ld % 8 == 0 && ((uintptr_t) b.w & 15u) == 0));
         }
     }
+#if defined(STRATA_METAL)
+    if (nq8 > 0) ::strata::dsv41::metal_host::q8_quant_multi(q8_batch, nq8);
+#endif
     for (int f = 0; f < 3; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s);
 #if defined(STRATA_METAL)
     if (std::getenv("DS4_DBG_Q8") && nj[2] > 0) {   // DBG: the Q8_0 matvec's first job against a host recompute

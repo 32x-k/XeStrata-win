@@ -3552,6 +3552,30 @@ struct Model::Impl {
         return true;
     }
 
+#if defined(STRATA_METAL)
+    // Metal (unified memory): a CPU-lane expert's matrices through no-copy buffers over the model's own pages, so the GPU computes it
+    // like a VRAM one (no CPU lane, no second pass).  false: not mappable / the cap is reached (the CPU lane has it).
+    bool zc_try(Layer& l, int e) {
+        static const bool on = std::getenv("DS4_ZC") != nullptr;   // (measured: no faster than the CPU lane - cold pages come from the SSD either way)
+        if (!on || l.lay.fmt != gg::kFmtMXFP4 || l.nm != 1 || l.vm.empty()) return false;
+        if (l.vm[(size_t) e][0].raw != nullptr) return true;
+        uint64_t a[3];
+        for (int r = 0; r < 3; ++r) {
+            a[r] = ::strata::dsv41::metal_host::zc_map(mx_mat(l, e, r), mx_part_bytes(l, r));
+            if (a[r] == 0) return false;
+        }
+        for (int r = 0; r < 3; ++r) {
+            x3::Mat& m = l.vm[(size_t) e][(size_t) r];
+            m = x3::Mat{};
+            m.K = gg::expert_type(l.lay, r);
+            m.fmt = m.K == gg::kTypeMXFP4 ? gg::kFmtMXFP4 : gg::kFmtGG;
+            m.raw = (const void*) a[r];
+            m.k = r < 2 ? g.dim : g.ff;
+            m.n = r < 2 ? g.ff : g.dim;
+        }
+        return true;
+    }
+#endif
     void set_vm(Layer& l, int e, int slot) {
         uint8_t* b = l.vram_base + (size_t) slot * l.blob;
         if (l.lay.fmt == gg::kFmtMXFP4) {
@@ -8256,7 +8280,12 @@ struct Model::Impl {
         for (int e = 0; e < l.n_exp; ++e) {
             const auto& pe = per[(size_t) e];
             if (pe.empty()) continue;
-            if (l.slot[(size_t) e] >= 0) {
+#if defined(STRATA_METAL)
+            const bool on_gpu = l.slot[(size_t) e] >= 0 || (T == 1 && zc_try(l, e));
+#else
+            const bool on_gpu = l.slot[(size_t) e] >= 0;
+#endif
+            if (on_gpu) {
                 vex[nvex] = e;
                 vrow0[nvex] = nrows;
                 vn[nvex] = (int) pe.size();
@@ -8316,7 +8345,8 @@ struct Model::Impl {
 #if defined(STRATA_METAL)
             ds4_metal_kick();   // (the VRAM experts run on the GPU while the CPU lane works)
 #endif
-            cpu_experts(l, h_x, ents);
+            static const bool skip_cpu = std::getenv("DS4_SKIP_CPU") != nullptr;   // (timing only: the CPU lane's experts left out)
+            if (!skip_cpu) cpu_experts(l, h_x, ents);
             std::fill(h_part, h_part + (size_t) T * D, 0.0f);
             for (int sl = 0; sl < nslots; ++sl) {
                 float* o = h_part + (size_t) cpu_rows[(size_t) sl].first * D;

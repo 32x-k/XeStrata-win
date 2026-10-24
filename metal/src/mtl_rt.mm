@@ -13,6 +13,8 @@
 #include <unordered_map>
 #include <string>
 #include <deque>
+#include <map>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -125,6 +127,90 @@ int Context::compile(const std::vector<std::string>& files, const std::string& p
     impl_->libs.push_back(lib);
     return (int)impl_->libs.size() - 1;
 }
+
+
+// ---- the keep-alive spin (see mtl_rt.h)
+static std::atomic<int64_t> g_last_act_ns{0};
+static inline int64_t ka_now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+static std::atomic<bool> g_ka_on{false};
+
+void Context::start_keepalive() {
+    if (!std::getenv("DS4_KEEPALIVE") || g_ka_on.exchange(true)) return;   // (measured slower in the decode loop)
+    id<MTLDevice> dev = impl_->dev;
+    std::thread([dev]() {
+        @autoreleasepool {
+            static const char* kSpin = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+kernel void ka_spin(device atomic_uint* c [[buffer(0)]], constant uint& n [[buffer(1)]], uint t [[thread_position_in_grid]]) {
+    uint x = t;
+    for (uint i = 0; i < n; ++i) x = x * 1664525u + 1013904223u;
+    if (x == 0xdeadbeefu) atomic_fetch_add_explicit(c, 1u, memory_order_relaxed);
+}
+)MSL";
+            NSError* err = nil;
+            id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:kSpin] options:nil error:&err];
+            if (!lib) return;
+            id<MTLComputePipelineState> ps = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"ka_spin"] error:&err];
+            if (!ps) return;
+            id<MTLCommandQueue> q = [dev newCommandQueue];
+            id<MTLBuffer> cbuf = [dev newBufferWithLength:64 options:MTLResourceStorageModeShared];
+            uint32_t iters = std::getenv("DS4_KEEPALIVE_ITERS") ? (uint32_t) std::atoi(std::getenv("DS4_KEEPALIVE_ITERS")) : 20000u;
+            for (;;) {
+                if (ka_now_ns() - g_last_act_ns.load(std::memory_order_relaxed) > 50000000LL) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    continue;
+                }
+                @autoreleasepool {
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    [enc setComputePipelineState:ps];
+                    [enc setBuffer:cbuf offset:0 atIndex:0];
+                    [enc setBytes:&iters length:4 atIndex:1];
+                    [enc dispatchThreads:MTLSizeMake(256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                    [cb commit];
+                    [cb waitUntilCompleted];
+                }
+            }
+        }
+    }).detach();
+}
+
+
+// ---- zero-copy weights (see mtl_rt.h)
+namespace {
+struct ZcBuf { size_t len; void* handle; uint64_t addr; };
+std::map<uintptr_t, ZcBuf> g_zc;
+std::mutex g_zc_mu;
+}  // namespace
+
+uint64_t Context::zc_map(const void* p, size_t bytes) {
+    const size_t pg = 16384;
+    const uintptr_t lo = (uintptr_t) p & ~(uintptr_t) (pg - 1);
+    const uintptr_t hi = ((uintptr_t) p + bytes + pg - 1) & ~(uintptr_t) (pg - 1);
+    std::lock_guard<std::mutex> lk(g_zc_mu);
+    auto it = g_zc.upper_bound(lo);
+    if (it != g_zc.begin()) {
+        --it;
+        if (it->first <= lo && hi <= it->first + it->second.len) return it->second.addr + ((uintptr_t) p - it->first);
+    }
+    static const size_t cap = std::getenv("DS4_ZC_MAX") ? (size_t) std::atoll(std::getenv("DS4_ZC_MAX")) : 9000;
+    if (g_zc.size() >= cap) return 0;
+    id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:(void*) lo length:hi - lo options:MTLResourceStorageModeShared deallocator:nil];
+    if (!b) return 0;
+    if (ds4_gpu_residency_set) {
+        id<MTLResidencySet> rs = (__bridge id<MTLResidencySet>)ds4_gpu_residency_set();
+        if (rs) {
+            [rs addAllocation:b];
+            [rs commit];
+        }
+    }
+    ZcBuf z{hi - lo, (__bridge_retained void*) b, (uint64_t) [b gpuAddress]};
+    g_zc[lo] = z;
+    return z.addr + ((uintptr_t) p - lo);
+}
+size_t Context::zc_count() const { std::lock_guard<std::mutex> lk(g_zc_mu); return g_zc.size(); }
 
 Pipeline Context::pipeline(int lib, const std::string& fn, const Constants& c) {
     NSError* err = nil;
@@ -324,7 +410,12 @@ static void encode(id<MTLComputeCommandEncoder> enc, const Dispatch& d) {
 
 static std::deque<std::string> g_recent;   // the last dispatches encoded (printed with a command buffer failure)
 static std::string recent_str() { std::string r; for (auto& n : g_recent) r += n + " "; return r; }
-static double g_gpu_ms = 0.0;   // GPU time of every committed command buffer, summed
+static double g_gpu_ms = 0.0;
+static std::atomic<uint64_t> g_gpu_busy_us{0};   // DS4_GPU_TOTAL: the GPU time of every committed command buffer
+static void add_busy_handler(id<MTLCommandBuffer> cb) {
+    static const bool on = std::getenv("DS4_GPU_TOTAL") != nullptr;
+    if (on) [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { const double d = c.GPUEndTime - c.GPUStartTime; if (d > 0) g_gpu_busy_us += (uint64_t) (d * 1e6); }];
+}   // GPU time of every committed command buffer, summed
 static std::atomic<uint64_t> g_wait_ns{0}, g_enc_ns{0}, g_wait_n{0};   // host time: waiting on command buffers; encoding dispatches
 static std::mutex g_prof_mu;
 static std::unordered_map<std::string, std::pair<double, uint64_t>> g_prof;   // DS4_PROF: kernel -> (GPU us, dispatches)
@@ -333,6 +424,7 @@ static std::atomic<uint64_t> g_disp_count{0};   // dispatches encoded, and comma
 static std::atomic<uint64_t> g_cb_count{0};
 static bool g_count_reg = false;
 static void ds4_report_counts() {
+    if (g_gpu_busy_us.load()) std::fprintf(stderr, "mtl: GPU busy (every command buffer) %.1f ms\n", g_gpu_busy_us.load() / 1000.0);
     std::fprintf(stderr, "mtl: %.1f ms GPU, %llu dispatches, %llu command buffers\n", g_gpu_ms,
                  (unsigned long long) g_disp_count.load(), (unsigned long long) g_cb_count.load());
     std::fprintf(stderr, "mtl: host waited %.1f ms for the GPU in %llu waits; encoding the dispatches took %.1f ms\n", g_wait_ns.load() / 1e6, (unsigned long long) g_wait_n.load(), g_enc_ns.load() / 1e6);
@@ -370,12 +462,27 @@ void Context::split_runs() {
     [impl_->enc_def endEncoding];
     if (impl_->qev == nil) impl_->qev = [impl_->dev newSharedEvent];
     [impl_->cb_def encodeSignalEvent:impl_->qev value:++impl_->qev_v];
+    add_busy_handler(impl_->cb_def);
     [impl_->cb_def commit];
     impl_->inflight = impl_->cb_def;
     impl_->inflight_names = std::move(impl_->def_names); impl_->def_names.clear();
     impl_->cb_def = nil;
     impl_->enc_def = nil;
     impl_->def_n = 0;
+}
+
+// Waiting for a committed command buffer: spin on its status for a while (the thread wake of waitUntilCompleted costs
+// ~1 ms a wait; the decode token waits ~100 times), then block.  DS4_NO_SPIN=1: always block.
+static void wait_spin(id<MTLCommandBuffer> cb) {
+    static const bool no_spin = std::getenv("DS4_NO_SPIN") != nullptr;
+    static const double budget = std::getenv("DS4_SPIN_US") ? std::atof(std::getenv("DS4_SPIN_US")) * 1e-6 : 20e-3;
+    if (!no_spin) {
+        const auto t0 = std::chrono::steady_clock::now();
+        while (cb.status < MTLCommandBufferStatusCompleted) {
+            if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > budget) break;
+        }
+    }
+    if (cb.status < MTLCommandBufferStatusCompleted) [cb waitUntilCompleted];
 }
 
 void* Context::mark() {
@@ -388,7 +495,7 @@ void* Context::mark() {
 void Context::wait_mark(void* token) {
     id<MTLCommandBuffer> cb = (__bridge_transfer id<MTLCommandBuffer>) token;
     const auto tw0 = std::chrono::steady_clock::now();
-    [cb waitUntilCompleted];
+    wait_spin(cb);
     g_wait_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tw0).count();
     ++g_wait_n;
     if (cb.status != MTLCommandBufferStatusCompleted)
@@ -405,6 +512,7 @@ void Context::flush_runs() {
         [impl_->enc_def endEncoding];
         if (impl_->qev == nil) impl_->qev = [impl_->dev newSharedEvent];
         [impl_->cb_def encodeSignalEvent:impl_->qev value:++impl_->qev_v];
+    add_busy_handler(impl_->cb_def);
         [impl_->cb_def commit];
         impl_->inflight = impl_->cb_def;
         impl_->inflight_names = std::move(impl_->def_names); impl_->def_names.clear();
@@ -415,7 +523,7 @@ void Context::flush_runs() {
     if (impl_->inflight != nil) {
         if (std::getenv("DS4_TRACE_WAIT")) { void* fr[8]; const int nf = backtrace(fr, 8); std::fprintf(stderr, "WAIT flush_runs:\n"); backtrace_symbols_fd(fr + 1, nf - 1, 2); }
         const auto tw0 = std::chrono::steady_clock::now();
-        [impl_->inflight waitUntilCompleted];
+        wait_spin(impl_->inflight);
         g_wait_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tw0).count();
         ++g_wait_n;
         { const double d = impl_->inflight.GPUEndTime - impl_->inflight.GPUStartTime; if (d > 0) g_gpu_ms += d * 1000.0;
@@ -447,6 +555,7 @@ double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, 
             }
             const auto te0 = std::chrono::steady_clock::now();
             encode(impl_->enc_def, ds[0]);
+            g_last_act_ns.store(ka_now_ns(), std::memory_order_relaxed);
             g_recent.push_back(ds[0].p->name); if (g_recent.size() > 8) g_recent.pop_front();
             if (std::getenv("DS4_ERRINFO")) impl_->def_names += ds[0].p->name + " ";
             g_enc_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - te0).count();

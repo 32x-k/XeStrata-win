@@ -2161,3 +2161,27 @@ kernel void ds4_axpby_rows(device const float* t [[buffer(0)]], device float* y 
     const ulong yi = (ulong) tgp.y * ldy + c;
     y[yi] = alpha * t[(ulong) tgp.y * n + c] + (beta != 0.0f ? beta * y[yi] : 0.0f);
 }
+
+// ds4_q8_quant for several jobs in one dispatch (a matvec call's activations): grid (groups, max rows, jobs)
+struct Ds4Q8Spec {
+    device const float* x;
+    ulong ldx;
+    uint rows;
+    uint k;
+    device char* q;
+    device float* d;
+};
+kernel void ds4_q8_quant_multi(device const Ds4Q8Spec* specs [[buffer(0)]], uint3 tgp [[threadgroup_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]]) {
+    const device Ds4Q8Spec& s = specs[tgp.z];
+    const uint warp = tid / 32u, lane = tid % 32u;
+    const uint b = tgp.x * 8u + warp;
+    const uint r = tgp.y;
+    if (r >= s.rows || (size_t) b * 32u >= (size_t) s.k) return;
+    const device float* xr = s.x + (size_t) r * s.ldx;
+    const float v = xr[(size_t) b * 32u + lane];
+    const float am = simd_max(fabs(v));
+    const float sc = am / 127.0f;
+    s.q[(size_t) r * s.k + (size_t) b * 32u + lane] = char(am > 0.0f ? rint(v / sc) : 0.0f);
+    if (lane == 0u) s.d[(size_t) r * (s.k / 32u) + b] = sc;
+}

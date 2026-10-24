@@ -67,6 +67,7 @@ bool ensure() {
     }
     if (g_cx) return g_lib >= 0;
     g_cx = new mtl::Context();
+    g_cx->start_keepalive();
     g_lib = g_cx->compile({"../src/engine/msl/ds4_init.metal"}, "", false);
     if (g_lib < 0) std::fprintf(stderr, "dsv41 metal: compiling ds4_init.metal failed\n");
     g_lib_iq = g_cx->compile({"../src/engine/msl/ds4_iq.metal"}, "", false);
@@ -524,6 +525,53 @@ bool q8_quant_rows(const float* x, size_t ldx, int rows, int k, int8_t* q, float
 }
 
 
+// the GPU address of host weight memory (see mtl::Context::zc_map); 0: not available
+uint64_t zc_map(const void* p, size_t bytes) {
+    if (!ensure()) return 0;
+    return g_cx->zc_map(p, bytes);
+}
+
+// Several ds4_q8_quant calls in one dispatch (specs: {x, ldx, rows, k, q, d} with the engine's device pointers, which are the
+// kernels' own addresses, as iq_mv's jobs carry them)
+namespace {
+struct HostQ8Spec {
+    const float* x;
+    uint64_t ldx;
+    uint32_t rows, k;
+    int8_t* q;
+    float* d;
+};
+}  // namespace
+bool q8_quant_multi(const void* specs, int n) {
+    if (n <= 0) return true;
+    if (!ensure()) return false;
+    const HostQ8Spec* sp = (const HostQ8Spec*) specs;
+    uint32_t max_rows = 1, max_k = 32;
+    for (int i = 0; i < n; ++i) {
+        max_rows = std::max(max_rows, sp[i].rows);
+        max_k = std::max(max_k, sp[i].k);
+    }
+    mtl::Buffer bj = g_cx->alloc((size_t) n * sizeof(HostQ8Spec));
+    std::memcpy(bj.ptr, sp, (size_t) n * sizeof(HostQ8Spec));
+    static mtl::Pipeline pl;
+    static bool have = false;
+    if (!have) {
+        try { pl = g_cx->pipeline(g_lib, "ds4_q8_quant_multi"); } catch (...) { g_cx->free(bj); return false; }
+        have = true;
+    }
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.args = {mtl::Arg::B(bj)};
+    d.grid[0] = (max_k / 32 + 7) / 8;
+    d.grid[1] = max_rows;
+    d.grid[2] = (uint32_t) n;
+    d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
+    g_cx->run({d});
+    g_cx->free(bj);
+    return true;
+}
+
+
 // ds4_gguf.cu:371 - the MXFP4 expert matvec.  The engine builds its BfJobs array on the HOST (with device pointers inside), so
 // the jobs go to the kernel as an opaque constant copy: same bytes, same layout, indexed by threadgroup_position_in_grid.y.
 namespace {
@@ -617,9 +665,15 @@ bool iq_mv(const void* jobs, int nj) {
     // (ds4_*_mvn<NC>); a job of more columns is cut into pieces of 8.  Other types keep the 16-column kernels.
     std::map<std::string, std::vector<Ds4IqMvJob>> groups;
     int max_n = 0;
+    if (std::getenv("DS4_DBG_JOBS")) {
+        std::fprintf(stderr, "iq_mv call:");
+        for (int i = 0; i < nj; ++i) std::fprintf(stderr, " [t%d n%d k%d c%d]", src[i].type, src[i].n, src[i].k, src[i].ncol);
+        std::fprintf(stderr, "\n");
+    }
     static const bool old_only = std::getenv("DS4_NO_MVN") != nullptr;
     for (int i = 0; i < nj; ++i) {
         const Ds4IqMvJob& q = src[i];
+        { static const char* sk = std::getenv("DS4_SKIP_TYPES"); if (sk != nullptr && std::strstr(sk, ("," + std::to_string(q.type) + ",").c_str()) != nullptr) continue; }   // (timing only)
         if (q.n > max_n) max_n = q.n;
         const int ncol = q.ncol > 0 ? q.ncol : 1;
         const char* tn = nullptr;

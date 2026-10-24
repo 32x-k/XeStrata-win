@@ -50,6 +50,8 @@ bool ring_to_ext(const void* ring, void* ext, long long p0, int n, int d, size_t
 bool route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale, const void* vram, int* idx, float* w, void* plan_ptr, const float* bias_vl, unsigned vl);
 bool sgemm_tn(const float* A, const float* B, float* C, int m, int nt, int k, int lda, int ldb, int ldc);
 bool rows_f16(const float* x, int ldx, const int* idx, int nrows, int ncols, uint16_t* out);
+uint64_t zc_map(const void* p, size_t bytes);   // zero-copy weights: the GPU address of host memory, 0 if not mappable
+bool q8_quant_multi(const void* specs, int n);   // {const float* x; uint64 ldx; uint32 rows, k; int8* q; float* d} each
 bool iq_set_gu(const uint8_t* wbase, size_t stride, const size_t* tr, const int* hbounds, int n_exp, int total_rows, int n_embd, int n_ff, float limit, const float* xf, int ldx, const int* idx, uint16_t* h, int ldh, int tg, int td);
 bool iq_set_dn(const uint8_t* wbase, size_t stride, const size_t* tr, const int* hbounds, int n_exp, int total_rows, int n_embd, int n_ff, float limit, const uint16_t* h16, int ldh, float* y, int ldy, int tg, int td);
 bool dequant_rows(int kind, const void* raw, size_t ld, int k, int n, uint16_t* out);
