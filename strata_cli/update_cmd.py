@@ -56,7 +56,10 @@ def add_parsers(sp, components_sp) -> list:
     comp_update.add_argument("--no-control", action="store_true")
     rollback = components_sp.add_parser("rollback", help="return to the previous engine version the last update kept")
     _common(rollback)
-    return [update, comp_update, rollback]
+    install_file = components_sp.add_parser("install-file", help="install an engine package you downloaded yourself (no network; the package's signature is checked)")
+    install_file.add_argument("file", help="the engine package (.tar.gz or .zip) from the release page")
+    _common(install_file)
+    return [update, comp_update, rollback, install_file]
 
 
 def _emit_factory(a, lines: list):
@@ -200,6 +203,16 @@ def run(a) -> int:
                 print("Saved tuning presets are marked for the short re-check; none were deleted." if out["presets_marked"] else
                       "Saved tuning presets are unchanged.")
                 print("Run `strata update --force` to try the newer version again.")
+            return 0
+        if getattr(a, "components_command", None) == "install-file":
+            ctx.trusted = signing.load_trusted_keys()
+            ctx.serving = updater.serving_now
+            _maybe_wait(a, ctx, machine)
+            out = updater.install_engine_file(ctx, Path(a.file))
+            if machine:
+                print(json.dumps({"schema_version": 1, "ok": True, **out}, ensure_ascii=False))
+            else:
+                print(out.get("note") or _line("Engine", out))
             return 0
         acquisition.require("the update", "`strata update` from a terminal")
         trusted = signing.load_trusted_keys()
