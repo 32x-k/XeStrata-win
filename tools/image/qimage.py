@@ -28,7 +28,9 @@ encoder (Unsloth's GGUF, or with -uncensored huihui-ai's abliterated one as noct
 
 MageTrail (RicemanT, MIT; magetrail): a finetune of Mage-Flow on Danbooru and e621 images, its DiT 12 blocks with a
 shared low-rank modulation (the engine reads it as it is), decoded with the Flux2 VAE its author uses (Mage-VAE's
-latent space); Mage-Flow's text encoders, no edit model.
+latent space): taken from FLUX.2-klein-4B (Apache 2.0; the same weights in bf16), not the copy in MageTrail's
+repository, which is FLUX.2-dev's ae.safetensors under its non-commercial license.  Mage-Flow's text encoders, no edit
+model.
 """
 from __future__ import annotations
 
@@ -43,6 +45,7 @@ REVISIONS = {                                       # the `sha` of https://huggi
     "unsloth/Qwen-Image-2.1-GGUF": "2c31ccd392b367a6637841a143813320a02dff55",                    # 2026-10-21
     "Comfy-Org/Mage-Flow": "6ff68fbf3c667325e961d551691b246791d5eec0",                            # 2026-10-21
     "RicemanT/MageTrail": "da7a696ac65772108f793e09fef6a29afaa9c7c0",                             # 2026-10-24
+    "black-forest-labs/FLUX.2-klein-4B": "e7b7dc27f91deacad38e78976d1f2b499d76a294",              # 2026-10-24
     "unsloth/Qwen3-VL-4B-Instruct-GGUF": "00c00da0690c4b14b5539b02c4ea5d7c9102b35e",              # 2026-10-21
     "noctrex/Huihui-Qwen3-VL-4B-Instruct-abliterated-GGUF": "0e204140ef43727fb4ee4d4bbd88c948c64719df",  # 2026-10-21
 }
@@ -52,6 +55,7 @@ _VL = "unsloth/Qwen3-VL-8B-Instruct-GGUF"
 _AC = "AtomicChat/Qwen-Image-2.1-Turbo-Uncensored-GGUF"
 _MF = "Comfy-Org/Mage-Flow"
 _MT = "RicemanT/MageTrail"
+_F2K = "black-forest-labs/FLUX.2-klein-4B"
 _VL4 = "unsloth/Qwen3-VL-4B-Instruct-GGUF"
 _HH4 = "noctrex/Huihui-Qwen3-VL-4B-Instruct-abliterated-GGUF"
 # name -> (repo, path in the repo, bytes, sha256): the Hub's LFS pointers at the pinned revisions
@@ -110,11 +114,11 @@ FILES = {
                   "1b9f4e92f0fbda14d7d7b58baed86039b8a980fe503d9d6a9393f25c0028f1fc"),
     "mf-vae": (_MF, "vae/mage_flow_vae_bf16.safetensors", 345_053_056,
                "34e076dc1e8a15321e1e07be5111d59cf16dd10b804b7c7e20b4de29013427e0"),
-    # MageTrail's DiT (V0.4, its latest) and the Flux2 VAE it ships
+    # MageTrail's DiT (V0.4, its latest) and the Flux2 VAE (FLUX.2-klein-4B's, diffusers' names)
     "mf-trail-bf16": (_MT, "V0.4/MageTrail-V0.4-100ArtistTuneTest.safetensors", 5_970_852_800,
                       "085535e6499d30083bcbc2060c112dc41ec8710f79831dea5f7ac5f897c3cd00"),
-    "mf-trail-vae": (_MT, "flux2-vae.safetensors", 336_211_292,
-                     "868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3"),
+    "mf-trail-vae": (_F2K, "vae/diffusion_pytorch_model.safetensors", 168_120_878,
+                     "ca70d2202afe6415bdbcb8793ba8cd99fd159cfe6192381504d6c4d3036e0f04"),
     "llm-mf-stock-Q8_0": (_VL4, "Qwen3-VL-4B-Instruct-Q8_0.gguf", 4_280_406_816,
                           "e30b41d2f2cc48149dfbba1b3fb2c023c7e6bf2def75833d4d43820df75efeb3"),
     "llm-mf-stock-Q6_K": (_VL4, "Qwen3-VL-4B-Instruct-UD-Q6_K_XL.gguf", 3_658_224_416,
@@ -164,6 +168,7 @@ MF_CFG = {"mf-turbo": 1.0, "mf-rl": 5.0, "mf-base": 5.0, "mf-trail": 5.0}   # Ma
 # each Mage-Flow DiT's edit model and its steps (its README: Edit-Turbo 4, Edit (RL) and Edit-Base 30)
 MF_EDIT = {"mf-turbo": ("mf-edit-turbo", 4), "mf-rl": ("mf-edit-rl", 30), "mf-base": ("mf-edit-base", 30)}
 MF_VAE = {"mf-trail": "mf-trail-vae"}   # a DiT's VAE where it is not Mage-VAE ("mf-vae")
+LOCAL_NAMES = {"mf-trail-vae": "flux2-klein-vae.safetensors"}   # files whose own name says too little
 MF_DIR = "mage-flow"
 MF_Q8_SHARE = 34 / 64      # Mage-Flow's DiT in RAM: its bf16 blocks quantized to Q8_0 (34 bytes a 32 values)
 # every model's files in one folder (named after the first one): they share all but the DiT
@@ -187,7 +192,8 @@ def license_note(dit: str) -> str:
     name, _, repo = DITS[dit]
     if dit == "mf-trail":
         return (f"{name} (RicemanT's finetune of Mage-Flow on Danbooru and e621 images) is under the MIT license: "
-                f"https://huggingface.co/{repo}")
+                f"https://huggingface.co/{repo}; its VAE, Black Forest Labs' Flux2 VAE from FLUX.2-klein-4B, under "
+                "Apache 2.0")
     if is_mage(dit):
         return (f"{name} is under the MIT license; Microsoft released it for research, and asks those who deploy it "
                 f"more widely to add their own safeguards (content moderation): https://github.com/{repo}")
@@ -247,7 +253,7 @@ def file_url(name: str, endpoint: str = "https://huggingface.co") -> str:
 
 def local_path(models_dir: Path, name: str) -> Path:
     folder = MF_DIR if name.startswith(("mf-", "llm-mf-")) else MODEL_DIR
-    return Path(models_dir) / folder / Path(FILES[name][1]).name
+    return Path(models_dir) / folder / LOCAL_NAMES.get(name, Path(FILES[name][1]).name)
 
 
 def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAULT_MODEL, uma: bool = False,
