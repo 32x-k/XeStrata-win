@@ -1642,7 +1642,7 @@ struct Model::Impl {
             return false;
         }
         l.blob = off;
-        // a type the device kernels do not take (IQ1_S / IQ1_M / IQ4_NL today): the layer stays on the CPU lane, where
+        // a type the device kernels do not take (none of the i-quants now: gg::type_on_device lists them): the layer stays on the CPU lane, where
         // ggml-cpu's row dots read it - one warning, then the placement code keeps it out of VRAM
         for (int r = 0; r < 3; ++r)
             if (!gg::type_on_device(l.lay.K[r])) {
