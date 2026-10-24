@@ -4632,6 +4632,17 @@ struct Model::Impl {
                              L[0].nm == 1;
         if (want_zc) {   // the arena's chunks registered for the GPU to read in place (zero-copy over PCIe)
             const int dev0 = devs[0].id;
+            {   // (a unified-memory GPU whose budget the weights already fill: the registered store is the same RAM, past the budget the GPU faults)
+                cudaDeviceProp zp{};
+                size_t zfree = 0, ztotal = 0;
+                cudaSetDevice(dev0);
+                if (cudaGetDeviceProperties(&zp, dev0) == cudaSuccess && zp.integrated && cudaMemGetInfo(&zfree, &ztotal) == cudaSuccess &&
+                    (double) zfree < gb * 1e9)
+                    std::fprintf(stderr,
+                                 "ds4: DS4_STORE_ZC=1 on a GPU that shares the PC's RAM: the weights already fill its memory budget (%.1f GB left, the store would "
+                                 "register up to %.1f GB more), so this will likely fail with a GPU fault. The store is the same RAM either way, zero-copy gains nothing here; "
+                                 "leave DS4_STORE_ZC off.\n", (double) zfree / 1e9, gb);
+            }
             cfg.map_chunk = [dev0](void* h, size_t n) -> void* {
                 cudaSetDevice(dev0);
                 unsigned reg_flags = cudaHostRegisterMapped | cudaHostRegisterPortable;
