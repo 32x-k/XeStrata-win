@@ -121,7 +121,7 @@ test('the Settings check says so, in plain words, when the own update check of t
 });
 
 test('the Settings update check maps the feed to the existing result shape', async () => {
-  const report = overrides => ({ ok: true, feed: { sequence: 3 }, engine: { installed: { version: '0.1.45' }, offered: { version: '0.1.46' }, status: 'available', download_bytes: 505 * (1 << 20) }, control: { installed: '0.1.45', offered: '0.1.45', status: 'current' }, app: { status: 'not-in-feed' }, ...overrides });
+  const report = overrides => ({ ok: true, feed: { sequence: 3 }, engine: { installed: { version: '0.1.45' }, offered: { version: '0.1.46' }, status: 'available', download_bytes: 505_000_000 }, control: { installed: '0.1.45', offered: '0.1.45', status: 'current' }, app: { status: 'not-in-feed' }, ...overrides });
   const make = value => ({ version: '0.1.45', async updateCheck() { if (value instanceof Error) throw value; return value; } });
   let result = await checkComponentUpdates({ control: make(report()), appVersion: '0.1.0' });
   assert.equal(result.engine.status, 'available');
@@ -130,7 +130,7 @@ test('the Settings update check maps the feed to the existing result shape', asy
   assert.doesNotMatch(result.engine.message, /0\.1\.4|sha|exit/i);
   assert.equal(result.engine.canInstall, true);
   assert.equal(result.strata.status, 'current');
-  result = await checkComponentUpdates({ control: make(report({ engine: { installed: null, offered: { version: '0.1.46' }, status: 'install', download_bytes: 505 * (1 << 20) } })) });
+  result = await checkComponentUpdates({ control: make(report({ engine: { installed: null, offered: { version: '0.1.46' }, status: 'install', download_bytes: 505_000_000 } })) });
   assert.equal(result.engine.status, 'available');
   assert.match(result.engine.message, /needs an engine to run models\. Press Update engine/);
   result = await checkComponentUpdates({ control: make(report({ engine: { installed: { version: '0.1.46' }, offered: { version: '0.1.46' }, status: 'current' } })) });

@@ -70,7 +70,7 @@ import { createImageModels } from './image-models.mjs';
 import { createRuntimeModels } from './runtime-models.mjs';
 import { createNativeControl } from './native-control.mjs';
 import { nativeUnloadPlan } from './storage-check.mjs';
-import { installBundledEngine } from './bundled-engine.mjs';
+import { installBundledEngine, removeVerifiedBundle } from './bundled-engine.mjs';
 import { findControl, createControl, componentsDirectory } from './control-runtime.mjs';
 import { forbidden as acquisitionForbidden } from './acquisition.mjs';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
@@ -131,6 +131,9 @@ const appUpdater = appUi.updater;
 const bundledEngine = control && !process.env.STRATA_NO_BUNDLED_ENGINE
   ? installBundledEngine({ bundleDir: process.env.STRATA_ENGINE_BUNDLE_DIR || resolve(HERE, '..', '..', 'engine-bundle'), components: componentsDirectory(), log: line => console.log(line) })
   : Promise.resolve({ action: 'none' });
+const engineBundleDir = process.env.STRATA_ENGINE_BUNDLE_DIR || resolve(HERE, '..', '..', 'engine-bundle');
+/* An update from a per-GPU installer leaves its engine-bundle behind; it goes only when the same engine is complete in the store (sizes and hashes). */
+bundledEngine.then(result => { if (['installed', 'kept', 'repaired'].includes(result?.action)) return removeVerifiedBundle({ bundleDir: engineBundleDir, components: componentsDirectory(), log: line => console.log(line) }); }, () => {});
 let bundledEngineSettled = !(control && !process.env.STRATA_NO_BUNDLED_ENGINE);
 bundledEngine.then(() => { bundledEngineSettled = true; }, () => { bundledEngineSettled = true; });
 /* A build made for another make of graphics card is not unpacked; Control's answer then carries the plain sentence (with the right download) instead of its own. */

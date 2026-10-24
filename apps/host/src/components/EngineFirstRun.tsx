@@ -5,6 +5,7 @@ import { Bar, Btn, Icon } from './ui';
 import { api } from '../lib/client';
 import { useDownloadEta } from '../lib/download-eta';
 import type { NativeJob } from '../lib/native';
+import { megabytes } from '../lib/format';
 
 /** What the host says about this PC's engine (GET /api/engine/first-run). */
 export interface FirstRunInfo {
@@ -18,8 +19,7 @@ export interface FirstRunInfo {
     freeBytes?: number;
 }
 
-const MB = 1024 * 1024;
-export const mb = (bytes: number) => Math.max(1, Math.round(bytes / MB));
+export const mb = megabytes;
 
 /**
  * Whether this PC still needs its engine. Reads only Control's local answer (no network): the engine is missing and the engine that came

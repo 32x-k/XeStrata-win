@@ -59,7 +59,7 @@ export async function checkComponentUpdates({ control, appUpdater = null, appVer
     const message = /update server|aren't available|No internet/.test(plain.headline) ? plain.message : `Couldn't check for updates. Try again in a moment.`;
     return { checkedAt, strata: { installedVersion: appVersion ?? control.version ?? null, status: 'error', message, details: plain.details, canInstall: false }, engine: { installedVersion: null, status: 'error', message, details: plain.details, canInstall: false } };
   }
-  const mib = bytes => `${Math.round((bytes ?? 0) / (1 << 20))} MB`;
+  const mib = bytes => `${Math.round((bytes ?? 0) / 1_000_000)} MB`;      // decimal megabytes, like the Terminal and the release page
   const engine = report.engine ?? {};
   const installedEngine = engine.installed?.version ?? null;
   const offered = engine.offered?.version ?? null;
