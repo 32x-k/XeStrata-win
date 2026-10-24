@@ -50,7 +50,7 @@ MEASURED = ("4 x Radeon AI PRO R9700 (32 GB) with 251 GB of RAM: prompts of 3,00
 
 # The two official IST-DAS sets (ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF, setup.py DSV41_ISTA_FILES): 4 shards each (the experts as IQ1_M / IQ2 / IQ3 types, the
 # dense weights Q8_0 / Q5_K), plus ONE Engram (110.6 GB, IQ4_NL, shared by both sets, stays on the SSD) and the DSpark drafter (8.0 GB).
-# Measured 2026-10-23 (f-dsv41-rel): quality against the original model (ppl +16% for 2.00, +7.7-8.3% for 2.25; code / agent +3.5% / +2.5%
+# Measured 2026-10-23 (f-dsv41-rel): quality against the original model (final files, 4,995 positions: ppl +15.5% for 2.00 [code +8.6%, agent +5.3%], +7.3% for 2.25 [code +3.2%, agent +2.2%]
 # on 2.25); speed on the owner PC (RTX 5070 12 GB, 64 GB RAM, 3.6 GB/s NVMe): answers ~4.7 tokens a second, prompts 121 tokens a second at 4K and
 # 231 tokens a second at 8K; RTX 3060 12 GB with 46 GB of RAM (the engine held to 36 GB): answers ~7.2 tokens a second on 2.00; 4 x Radeon AI PRO
 # R9700: answers ~31 tokens a second, prompts 330-373 tokens a second at 8K.
@@ -59,8 +59,8 @@ ISTA_DSPARK_BYTES = 7_976_914_240
 ISTA_META_BYTES = 5_780_589          # the first shard of Unsloth's UD-Q8_K_XL: only the metadata --engram-meta reads
 ISTA_SETS = {
     "IST-DAS-2.00bpw": {"title": "IST-DAS 2.00 bpw", "set_bytes": 138_238_893_056, "experts_gb": 132.07, "profile": "profile-2.00.bin",
-                        "ppl": "16%", "ram_ok_gb": 40.0, "ram_great_gb": 160.0, "disk_total": 257.0,
-                        "quality": "about 16% above the original model's perplexity (the 2-bit price)"},
+                        "ppl": "15.5%", "ram_ok_gb": 40.0, "ram_great_gb": 160.0, "disk_total": 257.0,
+                        "quality": "about 15.5% above the original model's perplexity (code and agent work about 5-9% above)"},
     # IQ1_M (1.75 bpw): 120,721,120,256 bytes of shards; experts = the shards minus the 6.16 GB of dense weights.  RAM class from the experts' size against
     # the 2.00 set's measured 40 GB (not measured on a computer yet); quality: the H100's 4,995-position score (KL 0.217, ppl 3.80, +21%; code +8.9%, agent +10.2%, English prose +53%).
     "IST-DAS-1.75bpw": {"title": "IST-DAS 1.75 bpw", "set_bytes": 120_721_120_256, "experts_gb": 114.56, "profile": "profile-2.00.bin",
@@ -68,8 +68,8 @@ ISTA_SETS = {
                         "quality": "about 21% above the original model's perplexity: the smallest, fine for code and agent work, noticeably weaker "
                                    "on plain prose; pick 2.00 if it fits"},
     "IST-DAS-2.25bpw": {"title": "IST-DAS 2.25 bpw", "set_bytes": 155_225_824_256, "experts_gb": 149.06, "profile": "profile-2.25.bin",
-                        "ppl": "8%", "ram_ok_gb": 44.0, "ram_great_gb": 176.0, "disk_total": 274.0,
-                        "quality": "about 8% above the original model's perplexity (code and agent work about 2.5-3.5% above), "
+                        "ppl": "7.3%", "ram_ok_gb": 44.0, "ram_great_gb": 176.0, "disk_total": 274.0,
+                        "quality": "about 7.3% above the original model's perplexity (code and agent work about 2-3% above), "
                                    "the better of the two, 17 GB more disk"},
 }
 ISTA_DENSE_GB = 6.16                  # the dense weights in the shards (attention, router, shared experts, the head; the embedding stays on the CPU)

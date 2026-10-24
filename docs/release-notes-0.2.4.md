@@ -10,9 +10,9 @@ Strata now runs DeepSeek V4.1-Flash on a PC with one 12 GB graphics card and 46 
 
   | set | download | quality against the original model |
   |---|---|---|
-  | IQ1_M (1.75 bits) | 239 GB | perplexity +21%; code and agent text +8.9% and +10.2%; weaker on plain English prose. ISTA-DASLab's model card: keeps 98.7% of the base model's task average (AIME25, GPQA-Diamond, LiveCodeBench v6) |
-  | IQ2_XXS (2.00 bits) | 257 GB | perplexity +16%; code and agent text +8.5% and +5.9% |
-  | IQ2_XS (2.25 bits) | 274 GB | perplexity +7.7% to +8.3%; code and agent text +3.5% and +2.5% |
+  | IQ1_M (1.75 bits) | 239 GB | perplexity +21% (KL 0.217); code and agent text +8.9% and +10.2%; weaker on plain English prose. ISTA-DASLab's model card: keeps 98.7% of the base model's task average (AIME25, GPQA-Diamond, LiveCodeBench v6) |
+  | IQ2_XXS (2.00 bits) | 257 GB | perplexity +15.5% (KL 0.170); code and agent text +8.6% and +5.3% |
+  | IQ2_XS (2.25 bits) | 274 GB | perplexity +7.3% (KL 0.107); code and agent text +3.2% and +2.2% |
   | IQ4_NL (Engram table, not a model to pick) | 111 GB, already in all three downloads above | The 4-bit Engram lookup table the model reads from RAM or SSD; all three sets use this one file |
 
   "Perplexity" is how surprised the model is by a fixed set of 4,995 test texts; lower is closer to the original. Pick IQ2_XS for coding and agent work when you have the disk. Setup shows all three sizes and warns if your PC is short of disk or RAM. It does not stop you.
