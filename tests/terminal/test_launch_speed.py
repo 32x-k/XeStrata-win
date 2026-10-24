@@ -37,6 +37,46 @@ class Words(unittest.TestCase):
         self.assertIn("--speed faster", S.flags_text(S.LaunchSettings(family="deepseek41", model="IST-DAS-2.00bpw", speed="faster")))
 
 
+class Units(unittest.TestCase):
+    """The catalog's vram_gb is GiB, the engine's unit: checked through the code that reads the cards (#3843-style: exact MiB values)."""
+
+    def nvidia(self, *mib):
+        text = "\n".join(f"{i}, NVIDIA GeForce RTX {i}, {m}, 8.9, 580.97" for i, m in enumerate(mib))
+        import setup
+        from tools import strata_mcp
+        with mock.patch.object(setup, "out", return_value=text), mock.patch.object(strata_mcp, "run_quiet", return_value=text):
+            return setup.gpus(), strata_mcp.own_nvidia_gpus()
+
+    def total(self, cards):
+        return sum(round(c["vram_gb"], 1) for c in cards)             # the catalog rounds each card to 0.1 GiB
+
+    def test_nvidia_mib_is_divided_by_1024(self):
+        for cards in self.nvidia(16376):
+            self.assertAlmostEqual(cards[0]["vram_gb"], 16376 / 1024)
+
+    def test_16_gb_cards_count_as_16_gib_or_less(self):
+        for mib in (16376, 16384, 16380):                              # RTX 4080 / 4060 Ti 16 GB, an exact 16 GiB card, in between
+            for cards in self.nvidia(mib):
+                self.assertTrue(S.faster_default(self.total(cards)), mib)
+        for mib in (12288, 12282, 8188):                               # RTX 3060, 12 GiB, 8 GB
+            for cards in self.nvidia(mib):
+                self.assertTrue(S.faster_default(self.total(cards)), mib)
+
+    def test_bigger_cards_and_sums_over_16_gib_do_not(self):
+        for mib in (24564, 24576, 20475, 32607):
+            for cards in self.nvidia(mib):
+                self.assertFalse(S.faster_default(self.total(cards)), mib)
+        for cards in self.nvidia(8188, 8188):                          # two 8 GB cards: 15.99 GiB together
+            self.assertTrue(S.faster_default(self.total(cards)))
+        for cards in self.nvidia(12288, 8188):                         # 12 + 8: over
+            self.assertFalse(S.faster_default(self.total(cards)))
+
+    def test_an_amd_16_gb_card_counts(self):
+        for size in (17179869184, 17163091968):                        # 16 GiB exactly, and a 16 GB card's 16,368 MiB
+            self.assertTrue(S.faster_default(round(size / 2 ** 30, 1)), size)
+        self.assertFalse(S.faster_default(round(34342961152 / 2 ** 30, 1)))     # a 32 GB card
+
+
 class EngineFlag(unittest.TestCase):
     def test_experts_replaces_the_saved_value_and_goes_last(self):
         cfg = {"args": ["--pack", "p", "--experts", "6", "--dspark", "auto"]}

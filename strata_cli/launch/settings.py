@@ -36,7 +36,9 @@ FASTER_NOTE = "Faster uses 5 of 6 experts per word: a small quality change, usua
 def faster_default(total_vram_gb: float | None) -> bool:
     """Mirrors the engine's `--experts auto`: Faster (5 experts) when the cards the launch uses total 16 GiB (17,179,869,184 bytes) or less.
     The engine decides at its start; this only says the same thing in the screens and in --plan, so the two never disagree."""
-    return bool(total_vram_gb) and float(total_vram_gb) <= FASTER_VRAM_GIB
+    # The catalog's vram_gb is already GiB: nvidia-smi's memory.total in MiB / 1024 (setup.py gpus(), tools/strata_mcp.py), an AMD card's bytes / 2**30,
+    # Windows registry bytes / 2**30. Compared in whole MiB so a 16 GB card (RTX 4080 / 4060 Ti 16 GB: 16376 MiB = 15.99 GiB) counts as 16 GiB or less.
+    return bool(total_vram_gb) and round(float(total_vram_gb) * 1024) <= round(FASTER_VRAM_GIB * 1024)
 
 
 def speed_words(speed: str, default: bool) -> str:
