@@ -227,6 +227,11 @@ def tune_words(result: dict | None, code: int | None = None) -> tuple[str, str]:
 
 # ----------------------------------------------------------------------------------------------- run config
 
+def runtime_max_wait() -> int:
+    from strata_control import runtime
+    return int(runtime.MAX_START_WAIT)
+
+
 def read_config(path: Path) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
@@ -883,6 +888,17 @@ class Runner:
         except Exception:                                    # noqa: BLE001
             return 0.0
 
+    def start_wait(self) -> int:
+        """How long the start waits for the model to be ready (#3949 #3459): 10 minutes, more for a big model, which a slow disk needs
+        longer to read (about 8 more seconds per GB above 40 GB, at most 30 minutes). Automatic: nobody sets a variable for it."""
+        gb = 0.0
+        try:
+            row = next((r for r in self.catalog.rows() if r.family == self.s.family and r.model == self.s.model), None)
+            gb = float(getattr(row, "download_gb", 0) or 0)
+        except Exception:                                    # noqa: BLE001
+            gb = 0.0
+        return int(min(runtime_max_wait(), max(600, 600 + (gb - 40.0) * 8.0)))
+
     def download_question(self) -> tuple[str, str]:
         """(title, text) of the question before a download starts, naming exactly what is fetched."""
         return self.model_state().question()
@@ -1249,6 +1265,9 @@ class Runner:
         cfg = derive_config(base, self.s, bool_flags=tune_knobs.BOOL_FLAGS,
                             log=str(launch_dir() / f"{self.name}.engine.log"), gpus=cards_for_launch(self.s, self.catalog, base=base))
         self.use_own_dsv41_engine(cfg)
+        wait = self.start_wait()
+        if wait > 600 and not cfg.get("engine_ready_s"):     # the server's own wait for the engine (900 s) must not end before the start's
+            cfg["engine_ready_s"] = wait + 60
         out = launch_dir() / f"{self.name}.json"
         write_private(out, cfg)
         self.config_path = out
@@ -1588,7 +1607,7 @@ class Runner:
 
         def go() -> None:
             try:
-                box["r"] = runtime.start(name, wait=600)
+                box["r"] = runtime.start(name, wait=self.start_wait())
             except Exception as e:                           # noqa: BLE001
                 box["e"] = e
             finally:
