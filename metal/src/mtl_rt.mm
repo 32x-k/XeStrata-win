@@ -218,6 +218,7 @@ struct Busy {
     id<MTLComputePipelineState> ps = nil;
     id<MTLBuffer> flag = nil;
     id<MTLCommandBuffer> last = nil;
+    bool running = false;
 };
 Busy g_busy;
 }  // namespace
@@ -250,7 +251,8 @@ kernel void busy_spin(device volatile atomic_uint* flag [[buffer(0)]], constant 
                 g_busy.ok = true;
             }
         }
-        if (!g_busy.ok) return;
+        if (!g_busy.ok || g_busy.running) return;
+        g_busy.running = true;
         if (g_busy.last != nil) [g_busy.last waitUntilCompleted];   // (the previous spin has left)
         *(volatile uint32_t*) [g_busy.flag contents] = 0;
         uint32_t cap = std::getenv("DS4_BUSY_CAP") ? (uint32_t) std::atoi(std::getenv("DS4_BUSY_CAP")) : 20000u;   // ~ tens of ms at most
@@ -266,8 +268,9 @@ kernel void busy_spin(device volatile atomic_uint* flag [[buffer(0)]], constant 
     }
 }
 extern "C" void ds4_busy_end() {
-    if (!g_busy.ok || g_busy.last == nil) return;
+    if (!g_busy.ok || g_busy.last == nil || !g_busy.running) return;
     *(volatile uint32_t*) [g_busy.flag contents] = 1;
+    g_busy.running = false;
 }
 
 Context::Context() : impl_(new Impl) {

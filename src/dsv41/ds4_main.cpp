@@ -991,6 +991,14 @@ int main(int argc, char** argv) {
             out.push_back(tok);
             std::printf("%d,", tok);
             std::fflush(stdout);
+            if (std::getenv("DS4_PROGRESS") && out.size() % 200 == 0) {   // (sustained-run time series)
+                static double tp = now_ms();
+                static size_t np = 0;
+                const double tn = now_ms();
+                std::fprintf(stderr, "progress %zu tokens: %.2f tok/s over the last %zu\n", out.size(), 1000.0 * (double) (out.size() - np) / (tn - tp), out.size() - np);
+                tp = tn;
+                np = out.size();
+            }
             if ((tok == 1 && std::getenv("DS4_NO_EOS") == nullptr) || (int) out.size() >= n) break;   // (DS4_NO_EOS: decode n tokens whatever)
             if (got.empty()) {
                 int off = 0, acc = 0;

@@ -7584,6 +7584,13 @@ struct Model::Impl {
     }
 
     bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1) {
+#if defined(STRATA_METAL)
+        struct BusyAll {   // DS4_BUSY_ALL: the GPU is held busy for the whole step (the host gaps between its bursts too)
+            bool on;
+            BusyAll() : on(std::getenv("DS4_BUSY_ALL") != nullptr) { if (on) ds4_busy_begin(); }
+            ~BusyAll() { if (on) ds4_busy_end(); }
+        } busy_all;
+#endif
         if (T < 1 || T > kWin) {
             err = "a window of " + std::to_string(T) + " tokens";
             return false;
