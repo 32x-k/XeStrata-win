@@ -283,13 +283,15 @@ bool hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float 
     mtl::Buffer bm = wrap(hm, (size_t) T * 32 * 4 );
     if (!bh.handle || !bf.handle || !bm.handle) return false;
     mtl::Pipeline pl;
-    try { pl = g_cx->pipeline(g_lib, "ds4_hc_mix"); } catch (...) { return false; }
+    const bool all = T >= 16 && n_mix <= 32 && !std::getenv("DS4_NO_HC_ALL");   // a prompt chunk: a threadgroup a token, 4 mixes a pass
+    try { pl = g_cx->pipeline(g_lib, all ? "ds4_hc_mix_all" : "ds4_hc_mix"); } catch (...) { return false; }
     mtl::Dispatch d;
     d.p = &pl;
     d.args = {mtl::Arg::B(bh, off(hh)), mtl::Arg::B(bf, off(hf)), mtl::Arg::B(bm, off(hm)),
               mtl::Arg::V((unsigned) hcdim), mtl::Arg::V(eps)};
-    d.grid[0] = (uint32_t) n_mix;
-    d.grid[1] = (uint32_t) T;
+    if (all) d.args.push_back(mtl::Arg::V((unsigned) n_mix));
+    d.grid[0] = all ? (uint32_t) T : (uint32_t) n_mix;
+    d.grid[1] = all ? 1u : (uint32_t) T;
     d.grid[2] = 1;
     d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
     g_cx->run({d});

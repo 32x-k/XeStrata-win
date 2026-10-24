@@ -248,6 +248,54 @@ kernel void ds4_hc_mix(device const float* h [[buffer(0)]], device const float* 
     if (tid == 0) mixes[(size_t) t * 32u + m] = acc * rsqrt(ss / float(hcdim) + eps);
 }
 
+// hc_mix for a prompt chunk: one threadgroup a token for four mixes a pass (the token's row is read once per four mixes instead of once per
+// mix).  Every mix's partial sums keep the single-mix kernel's order, so the result is bit-identical.
+kernel void ds4_hc_mix_all(device const float* h [[buffer(0)]], device const float* fn [[buffer(1)]],
+                           device float* mixes [[buffer(2)]], constant uint& hcdim [[buffer(3)]],
+                           constant float& eps [[buffer(4)]], constant uint& n_mix [[buffer(5)]],
+                           uint t [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]],
+                           ushort w [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float red[8];
+    const device float* x = h + (size_t) t * hcdim;
+    float ss = 0.0f;
+    for (uint k = tid * 4u; k < hcdim; k += 256u * 4u) {
+        const float4 hv = *(const device float4*) (x + k);
+        ss += hv.x * hv.x + hv.y * hv.y + hv.z * hv.z + hv.w * hv.w;
+    }
+    ss = ds4_block_sum(ss, red, lane, w);
+    const float inv = rsqrt(ss / float(hcdim) + eps);
+    for (uint m0 = 0; m0 < n_mix; m0 += 4u) {
+        const uint nm = min(4u, n_mix - m0);
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        const device float* f0 = fn + (size_t) m0 * hcdim;
+        const device float* f1 = f0 + (nm > 1u ? hcdim : 0u);
+        const device float* f2 = f0 + (nm > 2u ? 2u * hcdim : 0u);
+        const device float* f3 = f0 + (nm > 3u ? 3u * hcdim : 0u);
+        for (uint k = tid * 4u; k < hcdim; k += 256u * 4u) {
+            const float4 hv = *(const device float4*) (x + k);
+            const float4 v0 = *(const device float4*) (f0 + k);
+            const float4 v1 = *(const device float4*) (f1 + k);
+            const float4 v2 = *(const device float4*) (f2 + k);
+            const float4 v3 = *(const device float4*) (f3 + k);
+            a0 += hv.x * v0.x + hv.y * v0.y + hv.z * v0.z + hv.w * v0.w;
+            a1 += hv.x * v1.x + hv.y * v1.y + hv.z * v1.z + hv.w * v1.w;
+            a2 += hv.x * v2.x + hv.y * v2.y + hv.z * v2.z + hv.w * v2.w;
+            a3 += hv.x * v3.x + hv.y * v3.y + hv.z * v3.z + hv.w * v3.w;
+        }
+        a0 = ds4_block_sum(a0, red, lane, w);
+        a1 = ds4_block_sum(a1, red, lane, w);
+        a2 = ds4_block_sum(a2, red, lane, w);
+        a3 = ds4_block_sum(a3, red, lane, w);
+        if (tid == 0) {
+            mixes[(size_t) t * 32u + m0] = a0 * inv;
+            if (nm > 1u) mixes[(size_t) t * 32u + m0 + 1u] = a1 * inv;
+            if (nm > 2u) mixes[(size_t) t * 32u + m0 + 2u] = a2 * inv;
+            if (nm > 3u) mixes[(size_t) t * 32u + m0 + 3u] = a3 * inv;
+        }
+    }
+}
+
 // ds4_kernels.cu:268  hc_split_kernel - the sinkhorn normalisation of the hyper-connection mix.
 // This is the SCALAR path of the CUDA kernel (lane 0 of the threadgroup does the token, a local 8x8 matrix), applied for every
 // hc including 4: it computes the same mathematics as the warp-lane version, only without the shuffles.  Correctness first -
