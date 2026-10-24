@@ -125,6 +125,8 @@ The config file's (`xestrata-<model>.json`) `"images"` also has entries to set b
 **The chat:** in the web page's chat the model can make and change images itself.
 Ask "draw a cat", and the model calls the image tools; the image appears in the conversation.
 Ask "make the background night", and it changes the conversation's last image (one attached or one made in the conversation).
+With several image models installed, ask in words ("draw it with MageTrail", "like a photograph") and the model picks the image model that fits (none asked for: the default; for a change, one of those that edit).
+"Images" under the message box chooses the chat's images: `auto` (as above), `off` (no images), or a model's name (the chat's images always with that model); the browser keeps the choice.
 
 ## API
 
