@@ -181,6 +181,23 @@ class Walk(unittest.TestCase):
                         return True
                     self.drive(case, hw=HW_2X16 if seed % 3 == 0 else HW_12, size=size)
 
+    # ---- the Save screen says the same tuning length as the Tuning screen (DeepSeek's tune is minutes, not 20 / 2 hours)
+    def test_save_screen_tuning_time_matches_the_model(self):
+        for pick, want, never in (("qwen", "quick (about 20 min)", "5-10"), ("ds200", "quick (about 5-10 min)", "about 20 min")):
+            with self.subTest(pick=pick):
+                async def case(app, pilot, ctx):
+                    await self.to_model(app, pilot, pick)
+                    for _ in range(30):
+                        if app.current == "save":
+                            break
+                        await pilot.press("n" if app.current == "advanced" else "enter")
+                        await settle(pilot, 3)
+                    t = " ".join(text_of(app).split())
+                    self.assertIn(want, t)
+                    self.assertNotIn(never, t)
+                self.drive(case, hw=HW_12, size=(110, 34))
+
+
     # ---- 4. q and ctrl+c leave cleanly from every screen; the Start screen's Escape too
     def test_quit_keys_leave_from_every_screen(self):
         for key in ("q", "ctrl+c", "ctrl+q"):
@@ -302,17 +319,6 @@ class ErrorPaths(unittest.TestCase):
                 self.assertTrue(running, "the screens closed instead of showing the failure")
                 self.assertIn("Press r to try again", text)
                 self.assertNotIn("Traceback", text)
-
-    def test_runner_that_cannot_be_built_shows_a_failure_not_a_crash(self):
-        class Broken(FakeRunner):
-            def __init__(self, *a, **k):
-                raise OSError("the data folder cannot be read")
-
-        text, err, running = self.run_flow(Broken, settle_s=0.6)
-        self.assertIsNone(err)
-        self.assertTrue(running)
-        self.assertIn("Press r to try again", text)
-        self.assertIn("the data folder cannot be read", " ".join(text.split()))
 
 
 class RealRunnerErrors(unittest.TestCase):

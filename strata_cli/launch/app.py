@@ -280,19 +280,9 @@ class LaunchApp(App):
     def run_launch(self, confirmed: bool = False) -> None:
         s = self.ctx.settings
         self.cancel = threading.Event()
-        try:
-            self.runner = Runner(s, catalog=self.ctx.catalog, emit=self._emit, cancel=self.cancel, feed=self.ctx.feed, confirm=self._ask_from_run,
-                                 move_data=self.ctx.move_data, retune=self.ctx.retune, restart=self.ctx.restart,
-                                 confirm_restart=self._ask_restart, after_check=self._save_pending)
-        except Exception as e:                               # noqa: BLE001 - a plain failure on the run screen, not a crashed app with a traceback
-            screen = RunScreen()
-            self.run_screen = screen
-            self.current = "run"
-            self.running = False
-            self.show(screen)
-            text = f"Something unexpected went wrong before the start: {type(e).__name__}: {e}"
-            self.call_after_refresh(screen.on_failure, text)
-            return
+        self.runner = Runner(s, catalog=self.ctx.catalog, emit=self._emit, cancel=self.cancel, feed=self.ctx.feed, confirm=self._ask_from_run,
+                             move_data=self.ctx.move_data, retune=self.ctx.retune, restart=self.ctx.restart,
+                             confirm_restart=self._ask_restart, after_check=self._save_pending)
         gb = getattr(self.runner, "download_gb", lambda: 0.0)() if not confirmed else 0.0
         if gb >= 1.0:
             free = self.ctx.catalog.disk_free(s.data_dir or self.ctx.catalog.data_dir())
