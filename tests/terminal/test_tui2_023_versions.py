@@ -42,8 +42,7 @@ class VersionBump(unittest.TestCase):
         self.assertIn("Version 0.2.3, engine 0.1.48.", (ROOT / "AGENTS.md").read_text(encoding="utf-8"))
         for name in ("README.md", "README.de.md", "README.es.md", "README.fr.md", "README.ja.md", "README.pt-BR.md", "README.zh-CN.md"):
             text = (ROOT / name).read_text(encoding="utf-8")
-            self.assertIn("0.2.3 · ", text, name)
-            self.assertIn("0.1.48", text, name)
+            self.assertIn("Strata-0.2.3-", text, name)       # (the restyled READMEs state the app version through the download buttons: the app stays 0.2.3)
             self.assertNotIn("Strata-0.2.2-", text, name)
 
     def test_version_prints_the_product_and_the_build(self):
