@@ -85,13 +85,13 @@ test('runCli passes the arguments untouched (no shell) and reads JSON', async ()
 
 // ---------------------------------------------------------------------------------- native-control in packaged mode
 
-function packagedFixture({ engineUsable = true, updater = null, repair = false } = {}) {
+function packagedFixture({ engineUsable = true, updater = null, repair = false, ids = ['iq2_xs', 'iq3_s'] } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'strata-packaged-test-'));
   const install = join(root, 'install'), data = join(root, 'data');
   mkdirSync(install, { recursive: true });
   const earlierInstallEnv = process.env.STRATA_INSTALL_DIR;
   process.env.STRATA_INSTALL_DIR = install;      // the app's own install folder (the host always tells Control which one; it never falls back to an older CLI folder)
-  const configs = ['iq2_xs', 'iq3_s'].map(id => {
+  const configs = ids.map(id => {
     const path = join(install, `strata-${id}.json`);
     writeFileSync(path, JSON.stringify({ exe: 'component:strata-engine', tokenizer: join(install, 'tok'), args: ['--max-context', '32768'], model_name: `Qwen ${id}`, port: 8080 }));
     return { id, path };
@@ -198,6 +198,26 @@ test('packaged: load = saved profile + runtime start under Control; unload = run
     assert.deepEqual(f.calls.filter(c => c[0] === 'stop').at(-1), ['stop', 'app-1']);
     assert.equal(f.native.state().instances.length, 1);
     assert.equal(f.others().length, 0, 'the host never spawned anything itself');
+  } finally { await f.native.close(); f.cleanup(); }
+});
+
+test('packaged: a model id with dots (DeepSeek) is listed, loaded from its run config, and unloaded', async () => {
+  const id = 'deepseek-v4.1-flash-ist-das-2.00bpw';
+  const f = packagedFixture({ ids: [id] });
+  try {
+    const state = await f.native.refresh(true);
+    assert.deepEqual(state.installed.models.map(m => m.model), [id], 'listed (the install finished but the app used to show nothing)');
+    assert.equal(state.installed.models[0].ready, true);
+    const job = await finish(f.native, f.native.operation('load', { model: id }).id);
+    assert.equal(job.state, 'done', job.error);                    // used to end with "The model configuration is outside the Strata installation."
+    assert.deepEqual(f.calls.filter(c => ['saveProfile', 'start'].includes(c[0])).map(c => c.slice(0, 2)), [['saveProfile', 'app-1'], ['start', 'app-1']]);
+    const instance = f.native.state().instances[0];
+    assert.equal(instance.model, id);
+    assert.equal(instance.status, 'ready');
+    await f.native.unload(instance.id);
+    assert.deepEqual(f.calls.filter(c => c[0] === 'stop').at(-1), ['stop', 'app-1']);
+    assert.equal(f.native.state().instances.length, 0);
+    for (const odd of ['a..b', '../x', 'x/y', '.hidden']) assert.equal((await finish(f.native, f.native.operation('load', { model: odd }).id)).state, 'error', odd);
   } finally { await f.native.close(); f.cleanup(); }
 });
 
