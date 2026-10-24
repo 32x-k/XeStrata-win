@@ -153,3 +153,26 @@ class OwnEngine(unittest.TestCase):
         cfg2 = {"arch": "deepseek41", "exe": "/old/strata-dsv41.exe", "lib_dirs": []}
         fn2(f2, cfg2)
         self.assertEqual(cfg2["exe"], "/old/strata-dsv41.exe")
+
+
+class MissingEngine(unittest.TestCase):
+    """This install has no DeepSeek engine package and the model config's exe is gone: not 'already installed'; setup decides (feed or a plain line)."""
+
+    def check(self, cfg, found):
+        from strata_cli.launch import runner as R
+        f = mock.MagicMock()
+        f.dsv41_engine_found.return_value = (found, True)
+        return R.Runner.dsv41_engine_missing(f, cfg)
+
+    def test_gone_exe_and_no_package_means_setup_runs(self):
+        self.assertTrue(self.check({"arch": "deepseek41", "exe": "C:/gone/engine-dsv41/0.1.48/strata-dsv41.exe"}, None))
+        self.assertTrue(self.check({"arch": "deepseek41"}, None))
+
+    def test_an_existing_exe_or_an_own_package_or_qwen_is_left_alone(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            exe = Path(d) / "strata-dsv41.exe"
+            exe.write_bytes(b"x")
+            self.assertFalse(self.check({"arch": "deepseek41", "exe": str(exe)}, None))
+            self.assertFalse(self.check({"arch": "deepseek41", "exe": "C:/gone/x.exe"}, exe))
+        self.assertFalse(self.check({"arch": "qwen4exp", "exe": "component:strata-engine"}, None))
