@@ -6,6 +6,11 @@
 #include "resource_path.h"
 
 #include <chrono>
+#include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <unordered_map>
+#include <string>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -252,8 +257,15 @@ void Context::free(Buffer& b) {
     b = Buffer{};
 }
 
+static std::mutex g_hist_mu;
+static std::unordered_map<void*, std::string> g_pipe_names;
+static std::unordered_map<std::string, uint64_t> g_kernel_counts;
 static void encode(id<MTLComputeCommandEncoder> enc, const Dispatch& d) {
     require_fit(d, "dispatch");
+    {
+        std::lock_guard<std::mutex> lk(g_hist_mu);
+        ++g_kernel_counts[d.p ? d.p->name : std::string("<null>")];
+    }
     [enc setComputePipelineState:P(d.p)];
     for (size_t i = 0; i < d.args.size(); ++i) {
         const Arg& a = d.args[i];
@@ -275,8 +287,25 @@ static void encode(id<MTLComputeCommandEncoder> enc, const Dispatch& d) {
             threadsPerThreadgroup:MTLSizeMake(d.tg[0], d.tg[1], d.tg[2])];
 }
 
+static double g_gpu_ms = 0.0;   // GPU time of every committed command buffer, summed
+static std::atomic<uint64_t> g_disp_count{0};   // dispatches encoded, and command buffers committed
+static std::atomic<uint64_t> g_cb_count{0};
+static bool g_count_reg = false;
+static void ds4_report_counts() {
+    std::fprintf(stderr, "mtl: %.1f ms GPU, %llu dispatches, %llu command buffers\n", g_gpu_ms,
+                 (unsigned long long) g_disp_count.load(), (unsigned long long) g_cb_count.load());
+    std::vector<std::pair<uint64_t, std::string>> v;
+    { std::lock_guard<std::mutex> lk(g_hist_mu); for (auto& kv : g_kernel_counts) v.emplace_back(kv.second, kv.first); }
+    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    for (size_t i = 0; i < v.size() && i < 14; ++i)
+        std::fprintf(stderr, "  %6llu  %s\n", (unsigned long long) v[i].first, v[i].second.c_str());
+}
+
 void Context::flush_runs() {
+    if (!g_count_reg) { g_count_reg = true; std::atexit(ds4_report_counts); }
     if (impl_->cb_def == nil) return;
+    ++g_cb_count;
+    { const double d = impl_->cb_def.GPUEndTime - impl_->cb_def.GPUStartTime; if (d > 0) g_gpu_ms += d * 1000.0; }
     [impl_->enc_def endEncoding];
     [impl_->cb_def commit];
     [impl_->cb_def waitUntilCompleted];
@@ -290,13 +319,14 @@ void Context::flush_runs() {
 double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, bool barrier_between) {
     @autoreleasepool {
         if (ds.size() == 1 && reps == 1 && !barrier_between) {
-            if (impl_->cb_def == nil || impl_->def_n >= 20000) {
+            if (impl_->cb_def == nil || impl_->def_n >= 2000000) {
                 flush_runs();
                 impl_->cb_def = [impl_->q commandBufferWithUnretainedReferences];
                 impl_->enc_def = [impl_->cb_def computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
             }
             encode(impl_->enc_def, ds[0]);
             ++impl_->def_n;
+            ++g_disp_count;
             return 0.0;
         }
         flush_runs();
@@ -306,6 +336,7 @@ double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, 
         for (int r = 0; r < reps; ++r)
             for (const auto& d : ds) {
                 encode(enc, d);
+                ++g_disp_count;
                 if (barrier_between) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
         [enc endEncoding];
