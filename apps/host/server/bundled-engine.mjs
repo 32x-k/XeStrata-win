@@ -276,3 +276,11 @@ function keepBundle(log, why) {
   log(`engine bundle: kept in the install folder (${why})`);
   return { removed: false, reason: why };
 }
+
+/**
+ * What the host does once its engine step has settled: for an engine that is (or was) there, look at the install folder's leftover bundle.
+ * The lines go to the host's output (console.log), which the desktop shell copies to its log file (`[host] engine bundle: ...`).
+ */
+export function cleanupAfterInstall(settled, { bundleDir, components, log = line => console.log(line) } = {}) {
+  return Promise.resolve(settled).then(result => (['installed', 'kept', 'repaired'].includes(result?.action) ? removeVerifiedBundle({ bundleDir, components, log }) : null), () => null);
+}

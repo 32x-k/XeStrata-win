@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdi
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { installBundledEngine, removeVerifiedBundle, compareVersions, wrongMakeNotice } from '../server/bundled-engine.mjs';
+import { installBundledEngine, removeVerifiedBundle, cleanupAfterInstall, compareVersions, wrongMakeNotice } from '../server/bundled-engine.mjs';
 
 // the make of card is read from this computer unless a test names it; the existing tests are written for an NVIDIA PC
 process.env.STRATA_ENGINE_BACKEND = 'cuda';
@@ -228,4 +228,31 @@ test('after an update, the engine bundle of the old install folder is removed on
     assert.equal((await removeVerifiedBundle({ bundleDir: t.bundle, components: t.components })).removed, false);
     assert.ok(existsSync(join(t.bundle, other)));
   } finally { t.cleanup(); }
+});
+
+test('the bundle cleanup lines reach the output of the host (the desktop log copies it), for "removed" and for "kept"', async () => {
+  const t = setup();
+  const seen = [], real = console.log;
+  try {
+    const name = makePackage(t.bundle, '0.1.48');
+    console.log = line => { seen.push(String(line)); };
+    // kept: the engine is not in the store yet
+    await cleanupAfterInstall(Promise.resolve({ action: 'kept' }), { bundleDir: t.bundle, components: t.components });
+    assert.equal(seen.length, 1);
+    assert.match(seen[0], /^engine bundle: kept in the install folder/);
+    // removed: the engine is in the store and whole
+    const installed = await installBundledEngine({ bundleDir: t.bundle, components: t.components });
+    assert.equal(installed.action, 'installed');
+    seen.length = 0;
+    await cleanupAfterInstall(Promise.resolve({ action: 'kept' }), { bundleDir: t.bundle, components: t.components });
+    assert.equal(seen.length, 1);
+    assert.match(seen[0], /^engine bundle: the copy that came with the installer \(.*\) was removed/);
+    assert.equal(existsSync(join(t.bundle, name)), false);
+    // nothing to say when the engine step did nothing (no bundle) or was refused
+    seen.length = 0;
+    await cleanupAfterInstall(Promise.resolve({ action: 'none' }), { bundleDir: t.bundle, components: t.components });
+    await cleanupAfterInstall(Promise.resolve({ action: 'wrong-make' }), { bundleDir: t.bundle, components: t.components });
+    await cleanupAfterInstall(Promise.reject(new Error('boom')), { bundleDir: t.bundle, components: t.components });
+    assert.deepEqual(seen, []);
+  } finally { console.log = real; t.cleanup(); }
 });
