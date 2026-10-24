@@ -631,7 +631,9 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
                 wspan[j] = spans.size() - 1;
             }
             auto vec = [&](const std::string& name, size_t* span) {
-                const auto v = dry_ ? std::vector<float>((size_t) tensor(name).elements()) : st.f32(name);
+                const SafeTensor* t = st.find(name);   // bf16, or F32 (the low-rank modulations' biases)
+                if (t == nullptr) throw std::runtime_error("image engine (Mage-Flow DiT): no " + name);
+                const auto v = dry_ ? std::vector<float>((size_t) t->elements()) : st.f32(name);
                 if (!dry_) std::memcpy(host.data() + at, v.data(), v.size() * 4);
                 spans.push_back({host.data() + at, v.size() * 4, 0});
                 at += v.size() * 4;
