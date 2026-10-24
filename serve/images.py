@@ -60,6 +60,7 @@ from __future__ import annotations
 import base64
 import collections
 import contextlib
+import json
 import math
 import os
 import queue
@@ -508,6 +509,100 @@ def daemon_address(cmd: list[str], env: dict) -> str:
     return str(Path(tempfile.gettempdir()) / f"xestrata-image-{user}-{key}.{'port' if os.name == 'nt' else 'sock'}")
 
 
+def gpu_key(env: dict) -> str:
+    """The GPU an engine environment names (its device selection; none: the system's first), for GpuTurn."""
+    import hashlib
+    sel = [env.get(k) for k in ("STRATA_GPU_PCI", "CUDA_VISIBLE_DEVICES", "ONEAPI_DEVICE_SELECTOR",
+                                "HIP_VISIBLE_DEVICES", "ZE_AFFINITY_MASK")]
+    return hashlib.sha256(json.dumps(sel).encode()).hexdigest()[:16]
+
+
+class GpuTurn:
+    """Every server's image jobs on one GPU, one at a time, and the image daemons started on it.  A file lock in the
+    temp folder (the GPU's, gpu_key) is held for a job's whole turn, so a job of another server waits for it; a
+    file beside it lists the daemons of the GPU, and the job that holds the turn ends every one but its own model's
+    (another model's, or another server's: they are idle, having no turn), so two engines do not share the VRAM.
+    Servers of the same model share its daemon, which is never ended for them."""
+
+    def __init__(self, env: dict):
+        user = str(os.getuid()) if hasattr(os, "getuid") else re.sub(r"\W", "", os.environ.get("USERNAME", "user"))
+        base = Path(tempfile.gettempdir()) / f"xestrata-image-gpu-{user}-{gpu_key(env)}"
+        self.lock_path, self.list_path = Path(str(base) + ".lock"), Path(str(base) + ".daemons")
+        self.f: Any = None
+
+    def _try(self, f) -> bool:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+    def acquire(self, cancel: threading.Event | None = None, waiting=None) -> None:
+        """Take the GPU's turn, waiting while another server's job holds it (`waiting()` once, when it does);
+        ImageJobFailed when `cancel` is set meanwhile."""
+        f = open(self.lock_path, "a+b")
+        told = False
+        while not self._try(f):
+            if not told and waiting is not None:
+                waiting()
+                told = True
+            if cancel is not None and cancel.is_set():
+                f.close()
+                raise ImageJobFailed("cancelled while another server's image job had the GPU")
+            time.sleep(0.25)
+        self.f = f
+
+    def release(self) -> None:
+        f, self.f = self.f, None
+        if f is None:
+            return
+        with contextlib.suppress(OSError):
+            if sys.platform == "win32":
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        f.close()                                     # flock's lock goes with the file
+
+    def daemons(self) -> list[str]:
+        try:
+            got = json.loads(self.list_path.read_text(encoding="utf-8"))
+            return [a for a in got if isinstance(a, str)] if isinstance(got, list) else []
+        except (OSError, ValueError):
+            return []
+
+    def keep_only(self, addr: str) -> list[str]:
+        """End every listed daemon but `addr` (the caller holds the turn) and list `addr` -> those that were ended."""
+        ended = [a for a in self.daemons() if a != addr and stop_daemon_at(a)]
+        tmp = self.list_path.with_suffix(".tmp")
+        with contextlib.suppress(OSError):
+            tmp.write_text(json.dumps([addr]), encoding="utf-8")
+            os.replace(tmp, self.list_path)
+        return ended
+
+
+def stop_daemon_at(addr: str) -> bool:
+    """End the image daemon at `addr` and its engine (SHUTDOWN: the engine frees its memory itself) -> whether one
+    was there.  Its READY is read first (a connection closed before it ends the daemon's handling unread) and its
+    STOPPED, the engine gone, waited for (a daemon without it closes the connection instead)."""
+    e = ImageEngine({}, {}, Path(os.devnull), lambda text: None)
+    if not e._connect(addr):
+        return False
+    try:
+        e._next(0, 30)
+        e.send("SHUTDOWN")
+        while e._next(0, 60) != "STOPPED":
+            pass
+    except ImageJobFailed:
+        pass
+    e.close()
+    return True
+
+
 class ImageEngine:
     """The image engine, `strata-image --serve`, through the image daemon (serve/image_daemon.py): started outside the
     server the first time and found again by the next server of the same image model and GPU, so a model switch does
@@ -518,6 +613,7 @@ class ImageEngine:
         self.sock: Any = None
         self.f: Any = None
         self.lines: queue.Queue = queue.Queue()
+        self.ended = threading.Event()              # the daemon closed this connection
 
     def command(self) -> list[str]:
         cmd = [str(self.cfg["exe"]), "--dit", str(self.cfg["diffusion_model"]), "--vae", str(self.cfg["vae"]),
@@ -533,6 +629,10 @@ class ImageEngine:
         return cmd + ["--serve"]
 
     def alive(self) -> bool:
+        """Connected, and the daemon has not closed the connection (another server's job may have ended it, GpuTurn):
+        a closed one is let go, so the next job starts the engine again."""
+        if self.f is not None and self.ended.is_set():
+            self.close()
         return self.f is not None
 
     def _connect(self, addr: str) -> bool:
@@ -554,15 +654,17 @@ class ImageEngine:
             self.f.write(token + "\n")
             self.f.flush()
         self.lines = queue.Queue()
+        self.ended = threading.Event()
 
-        def pump(f, q):
+        def pump(f, q, ended):
             try:
                 for line in f:
                     q.put(line.rstrip("\r\n"))
             except (OSError, ValueError):
                 pass
+            ended.set()
             q.put(None)                               # the daemon closed the connection
-        threading.Thread(target=pump, args=(self.f, self.lines), daemon=True).start()
+        threading.Thread(target=pump, args=(self.f, self.lines, self.ended), daemon=True).start()
         return True
 
     def _spawn(self, addr: str):
@@ -669,14 +771,6 @@ class ImageEngine:
                 return _kv(got)
             elif got.startswith("ERROR"):
                 raise ImageJobFailed(got[6:] or "the image engine failed")
-
-    def stop_daemon(self) -> bool:
-        """End this model's daemon and its engine, connected or left running by an earlier server -> whether there
-        was one."""
-        if self.f is None and not self._connect(daemon_address(self.command(), self.env)):
-            return False
-        self.close(shutdown=True)
-        return True
 
     def close(self, shutdown: bool = False) -> None:
         """Leave the daemon (it stays for the next server); `shutdown`: end it and its engine."""
@@ -880,11 +974,6 @@ class ImageGen:
         with self.lock:
             self.engine.close(shutdown)
 
-    def stop_engine(self) -> bool:
-        """End this model's engine (and a daemon an earlier server left for it), freeing its VRAM -> whether one ran."""
-        with self.lock:
-            return self.engine.stop_daemon()
-
     def run(self, job: dict, cancel: threading.Event | None = None) -> tuple[list[bytes], dict]:
         """Make `job`'s images (parse_request's dict) -> (the PNG files' bytes in order, figures).  The caller holds
         the GPU turn.  ImageJobFailed when the engine fails, times out or the job is cancelled."""
@@ -1039,9 +1128,9 @@ class ImageGen:
 class ImageModels:
     """The config's image models: its "images" section (the default) and those of "image_models", one engine on the
     GPU at a time.  A request names its model by "model" (pick: an unknown name or none is the default's, as OpenAI's
-    clients send their own); a job for another model than the last one's ends that one's engine first, in the GPU's
-    turn (gpu_turn), and the first job ends what daemons an earlier server left for the others.  Anything else is
-    the model of the last job's (the Monitor's, /v1/status)."""
+    clients send their own); its job takes the GPU's turn (GpuTurn: other servers' jobs on the GPU wait for it, and
+    it for theirs) and ends every other daemon of the GPU first, this server's other models' and other servers'.
+    Anything else is the model of the last job's (the Monitor's, /v1/status)."""
 
     def __init__(self, cfgs: list[dict], log=None, env: dict | None = None):
         self.gens: dict[str, ImageGen] = {}
@@ -1051,7 +1140,7 @@ class ImageModels:
                 raise ValueError(f'two image models are named {g.model!r} ("images" and "image_models")')
             self.gens[g.model] = g
         self.default = self.current = next(iter(self.gens.values()))
-        self.swept = len(self.gens) == 1           # the other models' daemons ended once (an earlier server's)
+        self.gpu = GpuTurn(self.default.engine.env)   # the models share the text engine's environment, so its GPU
 
     def __getattr__(self, name):
         return getattr(self.current, name)
@@ -1060,13 +1149,13 @@ class ImageModels:
         return self.gens.get(name, self.default) if isinstance(name, str) else self.default
 
     def activate(self, gen: ImageGen) -> None:
-        """Make `gen` the model on the GPU: the others' engines ended (the caller holds the GPU's turn)."""
-        if gen is self.current and self.swept:
-            return
-        for g in self.gens.values():
-            if g is not gen and g.stop_engine():
-                gen._say(f"image model: {g.model}'s engine ended for {gen.model}")
-        self.current, self.swept = gen, True
+        """Make `gen` the model on the GPU: every other daemon of the GPU ended, this server's other models' and other
+        servers' (the caller holds the GPU's turn, GpuTurn)."""
+        mine = daemon_address(gen.engine.command(), gen.engine.env)
+        names = {daemon_address(g.engine.command(), g.engine.env): g.model for g in self.gens.values()}
+        for addr in self.gpu.keep_only(mine):
+            gen._say(f"image model: {names.get(addr, 'another server')}'s engine ended for {gen.model}")
+        self.current = gen
 
     def missing(self) -> list[str]:
         return [f for g in self.gens.values() for f in g.missing()]
@@ -1266,13 +1355,21 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
         svc.status["queued"] += 1
     queued = True
     error: str | None = None
+    held_gpu: GpuTurn | None = None
     try:
         with svc._turn(cancel):
             with svc.status_lock:
                 svc.status["queued"] -= 1
             queued = False
-            if isinstance(getattr(svc, "images", None), ImageModels):
-                svc.images.activate(gen)
+            models = getattr(svc, "images", None)
+            if isinstance(models, ImageModels):   # every server's image jobs on this GPU in turn
+                def waiting():
+                    gen._say("image job: waiting for another server's image job on this GPU")
+                    with svc.status_lock:
+                        svc.status["phase"] = "waiting for another server's image job"
+                models.gpu.acquire(cancel, waiting)
+                held_gpu = models.gpu
+                models.activate(gen)
             gen.begin(job)
             ctl = getattr(svc.engine, "ctl", None) if getattr(svc.engine, "batch", 0) else None
             if ctl is not None:
@@ -1313,6 +1410,8 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
         error = str(e) or type(e).__name__
         raise
     finally:
+        if held_gpu is not None:
+            held_gpu.release()
         gen.end(error, cancelled=cancel is not None and cancel.is_set())
         if queued:
             with svc.status_lock:
