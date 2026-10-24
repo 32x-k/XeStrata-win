@@ -2804,6 +2804,12 @@ struct Model::Impl {
     // hc_mix over a chunk: the dots by an F32 GEMM, then the rms scale
     bool hc_mix_chunk(Dev& d, Chunk& c, const float* h, const float* fn, int T, float* mixes, std::string& err) {
         const int hcd = g.hc * g.dim, n_mix = (2 + g.hc) * g.hc;
+#if defined(STRATA_METAL)
+        if (!std::getenv("DS4_CHUNK_SGEMM")) {   // the window path's fused kernel: no F32 GEMM, no second pass
+            hc_mix(h, fn, hcd, n_mix, T, g.eps, mixes, d.st);
+            return true;
+        }
+#endif
         const float one = 1.0f, zero = 0.0f;
         if (cublasSgemm(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, n_mix, T, hcd, &one, fn, hcd, h, hcd, &zero, mixes, 32) !=
             CUBLAS_STATUS_SUCCESS) {
