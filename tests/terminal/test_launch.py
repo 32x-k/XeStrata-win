@@ -952,6 +952,11 @@ class FlagsCommand(unittest.TestCase):
         self.assertIn("Nothing was changed.", out)
         self.assertEqual(store.list_presets(), [])
 
+    def test_the_access_help_names_the_flags_for_showing_and_setting_a_key(self):             # #3713 #3951
+        from strata_cli.launch import screens
+        self.assertIn("strata launch --show-key", screens.AccessScreen.help_text)
+        self.assertIn("--api-key YOUR-KEY", screens.AccessScreen.help_text)
+
     def test_the_summary_says_where_the_engine_log_is(self):                                  # #3656
         import tempfile
         with tempfile.TemporaryDirectory() as d:

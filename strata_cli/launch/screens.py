@@ -1328,7 +1328,8 @@ class AccessScreen(Base):
     step_id = "access"
     hints = "↑↓ choose   Enter next   p port   k new key   t key on/off   Esc back   ? help"
     help_text = ("Who can use the model. 'This computer only' is the safe default and never needs a key. Beyond it Strata makes an API key "
-                 "for you (recommended); press t if you would rather have no key: it still starts, but anyone who can reach it can use it.")
+                 "for you (recommended); press t if you would rather have no key: it still starts, but anyone who can reach it can use it. "
+                 "To see the key later: strata launch --show-key. To use a key of your own: strata launch --api-key YOUR-KEY (or --api-key-env NAME).")
 
     BINDINGS = Base.BINDINGS + [Binding("p", "port", show=False), Binding("k", "newkey", show=False), Binding("t", "keytoggle", show=False)]
 
