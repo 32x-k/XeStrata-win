@@ -2101,7 +2101,12 @@ extern "C" void* ds4_ctx_mark() {
     return g_cx->mark();
 }
 extern "C" void ds4_ctx_wait(void* token) {
+    if (g_cx) g_cx->split_runs();   // (what is queued after the mark starts on the GPU while the host waits)
     if (g_cx && token) g_cx->wait_mark(token);
+}
+// commit the batched dispatches without waiting: the GPU starts on them while the host goes on (the CPU lane)
+extern "C" void ds4_metal_kick() {
+    if (g_cx) g_cx->split_runs();
 }
 
 extern "C" void ds4_metal_flush() {

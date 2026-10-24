@@ -8285,6 +8285,9 @@ struct Model::Impl {
         }
         if (!ents.empty()) {
             const double tc = now_ms();
+#if defined(STRATA_METAL)
+            ds4_metal_kick();   // (the VRAM experts run on the GPU while the CPU lane works)
+#endif
             cpu_experts(l, h_x, ents);
             std::fill(h_part, h_part + (size_t) T * D, 0.0f);
             for (int sl = 0; sl < nslots; ++sl) {
