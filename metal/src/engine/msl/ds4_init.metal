@@ -1990,3 +1990,35 @@ kernel void ds4_confidence(constant Ds4ConfJob& j [[buffer(0)]], uint tg [[threa
     a = ds4_block_sum_n(a, red, lane, w, 32u);
     if (tid == 0u) j.out[t] = 1.0f / (1.0f + exp(-a));
 }
+
+// embed by raw device addresses (the runtime's MTLResidencySet makes gpuAddress pointers valid kernel arguments)
+struct Ds4EmbedArgs {
+    device ushort* rows;
+    device float* h;
+    uint dim;
+    uint hc;
+};
+kernel void ds4_embed_j(device const Ds4EmbedArgs* a [[buffer(0)]], uint2 tgp [[threadgroup_position_in_grid]],
+                        ushort lane [[thread_index_in_threadgroup]]) {
+    const uint e = tgp.x * 256u + uint(lane);
+    if (e >= a->dim) return;
+    const uint t = tgp.y;
+    const uint bits = uint(a->rows[(size_t) t * a->dim + e]) << 16;
+    const float v = as_type<float>(bits);
+    for (uint s = 0; s < a->hc; ++s) a->h[((size_t) t * a->hc + s) * a->dim + e] = v;
+}
+
+// (diagnostic) write a constant through a device pointer passed as a value, and one passed in a buffer
+kernel void ds4_test_write(device float* out [[buffer(0)]], constant uint& n [[buffer(1)]], uint gid [[thread_position_in_grid]]) {
+    if (gid < n) out[gid] = 3.0f;
+}
+kernel void ds4_test_write_v(device const uint64_t* p [[buffer(0)]], constant uint& n [[buffer(1)]], uint gid [[thread_position_in_grid]]) {
+    device float* out = (device float*) (uintptr_t) p[0];
+    if (gid < n) out[gid] = 7.0f;
+}
+
+// (diagnostic) report the arguments the kernel received
+kernel void ds4_args_probe(device float* out [[buffer(0)]], constant uint& dim [[buffer(1)]],
+                           constant uint& hc [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+    if (gid == 0) { out[0] = float(dim); out[1] = float(hc); out[2] = 1.0f; }
+}

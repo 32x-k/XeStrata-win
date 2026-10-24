@@ -9,6 +9,7 @@
 #include "mtl_rt.h"
 
 #include <strata/gpu/runtime.hpp>
+#include <cuda_runtime.h>
 
 #include <cstdio>
 #include <cstdint>
@@ -44,12 +45,61 @@ int g_lib = -1;
 int g_lib_iq = -1;
 
 bool ensure() {
+    if (std::getenv("DS4_DBG_MEM")) {   // does a write through host_view read back through cudaMemcpy?
+        void* p = nullptr;
+        const size_t tsz = std::getenv("DS4_MEM_GB") ? 64u << 20 : 4096u;
+        if (cudaMalloc(&p, tsz) == cudaSuccess) {
+            void* v = strata::gpu::host_view(p);
+            if (v) {
+                ((float*) v)[0] = 42.0f;
+                float out = 0.0f;
+                cudaMemcpy(&out, p, 4, cudaMemcpyDeviceToHost);
+                std::fprintf(stderr, "DBG mem: gpu=%p view=%p  wrote 42 through the view, cudaMemcpy gives %g\n", p, v, out);
+            } else {
+                std::fprintf(stderr, "DBG mem: gpu=%p has no host view\n", p);
+            }
+            cudaFree(p);
+        }
+    }
     if (g_cx) return g_lib >= 0;
     g_cx = new mtl::Context();
     g_lib = g_cx->compile({"../src/engine/msl/ds4_init.metal"}, "", false);
     if (g_lib < 0) std::fprintf(stderr, "dsv41 metal: compiling ds4_init.metal failed\n");
     g_lib_iq = g_cx->compile({"../src/engine/msl/ds4_iq.metal"}, "", false);
     if (g_lib_iq < 0) std::fprintf(stderr, "dsv41 metal: compiling ds4_iq.metal failed\n");
+    if (g_lib >= 0 && std::getenv("DS4_DBG_BIND")) {   // write a constant by each route, copy it back
+        void* p = nullptr;
+        const size_t tsz = std::getenv("DS4_MEM_GB") ? 64u << 20 : 4096u;
+        if (cudaMalloc(&p, tsz) == cudaSuccess) {
+            void* v = strata::gpu::host_view(p);
+            float got[4] = {0, 0, 0, 0};
+            {
+                mtl::Buffer b = g_cx->wrap((void*) (((uintptr_t) v) & ~(uintptr_t) 16383), 16384);
+                mtl::Pipeline pl = g_cx->pipeline(g_lib, "ds4_test_write");
+                mtl::Dispatch d;
+                d.p = &pl;
+                d.args = {mtl::Arg::B(b, ((uintptr_t) v) & 16383), mtl::Arg::V((unsigned) 4)};
+                d.grid[0] = 1; d.grid[1] = d.grid[2] = 1; d.tg[0] = 32; d.tg[1] = d.tg[2] = 1;
+                g_cx->run({d});
+                g_cx->flush_runs();
+                cudaMemcpy(got, p, sizeof(got), cudaMemcpyDeviceToHost);
+                std::fprintf(stderr, "DBG bind A (wrap host_view + Arg::B): %g %g %g %g\n", got[0], got[1], got[2], got[3]);
+            }
+            {
+                uint64_t pp = (uint64_t) (uintptr_t) p;
+                mtl::Pipeline pl = g_cx->pipeline(g_lib, "ds4_test_write_v");
+                mtl::Dispatch d;
+                d.p = &pl;
+                d.args = {mtl::Arg::V(pp), mtl::Arg::V((unsigned) 4)};
+                d.grid[0] = 1; d.grid[1] = d.grid[2] = 1; d.tg[0] = 32; d.tg[1] = d.tg[2] = 1;
+                g_cx->run({d});
+                g_cx->flush_runs();
+                cudaMemcpy(got, p, sizeof(got), cudaMemcpyDeviceToHost);
+                std::fprintf(stderr, "DBG bind B (device pointer by value): %g %g %g %g\n", got[0], got[1], got[2], got[3]);
+            }
+            cudaFree(p);
+        }
+    }
     return g_lib >= 0;
 }
 }  // namespace
@@ -1944,6 +1994,11 @@ extern "C" void ds4_metal_flush() {
 mtl::Context& shared_cx() {
     ensure();
     return *g_cx;
+}
+
+int shared_lib() {
+    ensure();
+    return g_lib;
 }
 
 }  // namespace strata::dsv41::metal_host

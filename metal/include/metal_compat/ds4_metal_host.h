@@ -52,12 +52,13 @@ bool sgemm_tn(const float* A, const float* B, float* C, int m, int nt, int k, in
 bool swiglu(const float* g, const float* u, int n, float lim, float* h);
 bool unpack_sel(const void* ckv, const int* sel, int sel_stride, int gen, long long p0, int t0, int R, int kcap, const int* nsel, int cap, void* out, int T, int nsel_count, size_t row_bytes);
 
-// the entry points, as metal/src/engine/ds4_finish.cpp defines them
+// generated from ds4_host.cpp and ds4_finish.cpp
 bool block_max(const float* score, long long stride, int T, const void* rows, int blk, float* bm, long long bm_stride, int nb_max);
 bool combine(const float* ed, const float* cpu, const float* sh, const void* c, int T, int dim, float* out);
 bool compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T, int d, const float* w, float eps, float* latent);
 bool confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out);
 bool embed(const uint16_t* rows, int T, float* h, int dim, int hc, void*);
+bool embed_addr(const uint16_t* rows, int T, float* h, int dim, int hc);
 bool engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, int fmt);
 bool engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, int fmt);
 bool engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int T, float eps);

@@ -1892,6 +1892,9 @@ void init_pre(float* pre, int T, cudaStream_t s) {
 
 void embed(const uint16_t* rows, int T, float* h, int dim, int hc, cudaStream_t s) {
 #if defined(STRATA_METAL)
+    if (strata::dsv41::metal_host::embed_addr(rows, T, h, dim, hc)) return;
+#endif
+#if defined(STRATA_METAL)
     if (strata::dsv41::metal_host::embed(rows, T, h, dim, hc, s)) return;
 #endif
     strata_ds4_launch(embed_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, rows, h, dim, hc);

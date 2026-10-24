@@ -19,6 +19,8 @@
 #include <vector>
 
 namespace strata::dsv41::metal_host {
+int shared_lib();   // from ds4_finish.cpp: the library the shared Context compiled
+
 
 namespace {
 mtl::Context* g_cx = nullptr;
@@ -85,7 +87,8 @@ mtl::Context& shared_cx() {
 // ds4_kernels.cu:1477 - pre[i] = (i % 8) == 0 ? 1 : 0 for i < T*8
 bool init_pre(float* pre, int T, void*) {
     strata::dsv41::metal_host::shared_cx();
-    if (g_lib_init < 0) return false;
+    const int lib = shared_lib();
+    if (lib < 0) return false;
     void* host = strata::gpu::host_view(pre);
     if (!host) { std::fprintf(stderr, "dsv41 metal: init_pre has no host view\n"); return false; }
     const size_t bytes = (size_t) T * 8 * sizeof(float);
@@ -108,6 +111,7 @@ bool init_pre(float* pre, int T, void*) {
     d.tg[0] = 128;
     d.tg[1] = d.tg[2] = 1;
     strata::dsv41::metal_host::shared_cx().run({d});
+    strata::dsv41::metal_host::shared_cx().flush_runs();
     return true;
 }
 
@@ -116,9 +120,16 @@ bool init_pre(float* pre, int T, void*) {
 bool embed(const uint16_t* rows, int T, float* h, int dim, int hc, void*) {
     strata::dsv41::metal_host::shared_cx();
     if (g_lib_init < 0) { std::fprintf(stderr, "dsv41 metal: embed: no library\n"); return false; }
-    void* hrows = strata::gpu::host_view((void*) rows);
-    void* hh = strata::gpu::host_view(h);
+    // host_view() returns a different address from the device pointer on this runtime, so wrapping it wrote into a mapping the
+    // engine never reads.  On Apple silicon a device pointer is a valid CPU address for shared storage: wrap that instead.
+    // DS4_HOSTVIEW=1 restores the old behaviour.
+    const bool use_hv = std::getenv("DS4_HOSTVIEW") != nullptr;
+    void* hrows = use_hv ? strata::gpu::host_view((void*) rows) : (void*) rows;
+    void* hh = use_hv ? strata::gpu::host_view(h) : (void*) h;
     if (!hrows || !hh) { std::fprintf(stderr, "dsv41 metal: embed has no host view\n"); return false; }
+    if (std::getenv("DS4_DBG_HV"))
+        std::fprintf(stderr, "DBG hostview: rows %p -> %p   h %p -> %p\n",
+                     (void*) rows, hrows, (void*) h, hh);
     const size_t page = 16384;
     auto wrap = [&](void* host, size_t bytes) {
         return strata::dsv41::metal_host::shared_cx().wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)), ((bytes + page - 1) / page) * page);
@@ -154,7 +165,8 @@ bool embed(const uint16_t* rows, int T, float* h, int dim, int hc, void*) {
 // ds4_model.cu:2737 - C[t][m] = sum_k A[m][k] * B[t][k], F32 operands, alpha = 1, beta = 0
 bool sgemm_tn(const float* A, const float* B, float* C, int m, int nt, int k, int lda, int ldb, int ldc) {
     strata::dsv41::metal_host::shared_cx();
-    if (g_lib_init < 0) return false;
+    const int lib = shared_lib();
+    if (lib < 0) return false;
     void* ha = strata::gpu::host_view((void*) A);
     void* hb = strata::gpu::host_view((void*) B);
     void* hc = strata::gpu::host_view((void*) C);
@@ -180,6 +192,62 @@ bool sgemm_tn(const float* A, const float* B, float* C, int m, int nt, int k, in
     d.grid[1] = d.grid[2] = 1;
     d.tg[0] = 128; d.tg[1] = d.tg[2] = 1;
     strata::dsv41::metal_host::shared_cx().run({d});
+    return true;
+}
+
+
+// embed through raw device addresses: the struct carries the gpuAddress of rows and h, which the runtime's residency set keeps
+// resident, so the kernel writes the engine's own memory instead of a CPU mirror.
+struct Ds4EmbedArgsHost {
+    uint64_t rows;
+    uint64_t h;
+    uint32_t dim;
+    uint32_t hc;
+};
+
+bool embed_addr(const uint16_t* rows, int T, float* h, int dim, int hc) {
+    // the engine uploads emb_rows on ITS stream; this kernel runs on mtl::Context queue.  Order the two before reading.
+    strata::gpu::stream_synchronize(nullptr);
+    if (std::getenv("DS4_DBG_ROWS")) {   // what is the engine actually handing us as the embedding rows?
+        const uint16_t* rv = (const uint16_t*) strata::gpu::host_view((void*) rows);
+        std::fprintf(stderr, "DBG rows_in: ptr=%p view=%p first=%04x %04x %04x %04x\n",
+                     (const void*) rows, (const void*) rv,
+                     rv ? (unsigned) rv[0] : 0u, rv ? (unsigned) rv[1] : 0u,
+                     rv ? (unsigned) rv[2] : 0u, rv ? (unsigned) rv[3] : 0u);
+    }
+    strata::dsv41::metal_host::shared_cx();
+    const int lib = shared_lib();
+    if (lib < 0) return false;
+    Ds4EmbedArgsHost a{};
+    a.rows = (uint64_t) (uintptr_t) rows;
+    a.h = (uint64_t) (uintptr_t) h;
+    a.dim = (uint32_t) dim;
+    a.hc = (uint32_t) hc;
+    mtl::Pipeline pl;
+    try { pl = strata::dsv41::metal_host::shared_cx().pipeline(lib, "ds4_embed_j"); } catch (...) { return false; }
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.args = {mtl::Arg::V(a)};
+    d.grid[0] = (uint32_t) ((dim + 255) / 256);
+    d.grid[1] = (uint32_t) T;
+    d.grid[2] = 1;
+    d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
+    strata::dsv41::metal_host::shared_cx().run({d});
+    if (std::getenv("DS4_DBG_ARGS")) {
+        mtl::Buffer bp = strata::dsv41::metal_host::shared_cx().wrap(
+            (void*) (((uintptr_t) strata::gpu::host_view(h)) & ~(uintptr_t) 16383), 16384);
+        mtl::Pipeline pp = strata::dsv41::metal_host::shared_cx().pipeline(lib, "ds4_args_probe");
+        mtl::Dispatch pd;
+        pd.p = &pp;
+        pd.args = {mtl::Arg::B(bp, ((uintptr_t) strata::gpu::host_view(h)) & 16383),
+                   mtl::Arg::V((unsigned) dim), mtl::Arg::V((unsigned) hc)};
+        pd.grid[0] = 1; pd.grid[1] = pd.grid[2] = 1; pd.tg[0] = 32; pd.tg[1] = pd.tg[2] = 1;
+        strata::dsv41::metal_host::shared_cx().run({pd});
+        strata::dsv41::metal_host::shared_cx().flush_runs();
+        float got[3] = {0, 0, 0};
+        { const float* hv2 = (const float*) strata::gpu::host_view(h); if (hv2) { got[0] = hv2[0]; got[1] = hv2[1]; } }
+        std::fprintf(stderr, "DBG args: kernel sees dim=%g hc=%g\n", got[0], got[1]);
+    }
     return true;
 }
 
