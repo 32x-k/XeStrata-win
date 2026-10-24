@@ -137,6 +137,7 @@ std::string per_position(const strata::ds4::Stats& s0, const strata::ds4::Stats&
 
 static std::FILE* g_round_log = nullptr;
 static std::string g_round_tag;
+static int g_spec_depth = 64;   // --dspark-depth: at most this many drafts a round
 static std::vector<float> g_round_conf;
 static int g_round_nd = 0;
 
@@ -145,14 +146,27 @@ static int g_round_nd = 0;
 // tok (the accepted drafts, then the trunk's next), the last of them the next round's tok.
 struct RoundTimes {   // DS4_ROUND_TIMES: where a decode round's time goes (ms, summed), printed at exit
     double draft = 0, verify = 0, step = 0;
+    unsigned long long draft_d = 0, verify_d = 0, step_d = 0;
     long rounds = 0, spec_rounds = 0, steps = 0;
     ~RoundTimes() {
         if (std::getenv("DS4_ROUND_TIMES") && rounds > 0)
             std::fprintf(stderr, "rounds: %ld (%ld speculative, %ld plain steps): draft %.1f ms (%.2f a round), verify %.1f ms (%.2f), plain step %.1f ms (%.2f)\n",
                          rounds, spec_rounds, steps, draft, spec_rounds ? draft / (double) spec_rounds : 0.0, verify, spec_rounds ? verify / (double) spec_rounds : 0.0,
                          step, steps ? step / (double) steps : 0.0);
+        if (std::getenv("DS4_ROUND_TIMES") && rounds > 0)
+            std::fprintf(stderr, "dispatches a round: draft %.0f, verify %.0f, plain step %.0f\n", spec_rounds ? (double) draft_d / (double) spec_rounds : 0.0, spec_rounds ? (double) verify_d / (double) spec_rounds : 0.0, steps ? (double) step_d / (double) steps : 0.0);
     }
 } g_rt;
+#if defined(STRATA_METAL)
+extern "C" unsigned long long ds4_dispatch_seq();
+#endif
+static unsigned long long rt_seq() {
+#if defined(STRATA_METAL)
+    return ds4_dispatch_seq();
+#else
+    return 0;
+#endif
+}
 static double rt_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, float temperature, float top_p, int top_k,
            float min_p, unsigned long long seed, unsigned long long& counter, std::vector<int>& out, int& offered,
@@ -164,18 +178,22 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         std::vector<float> conf;
         ++g_rt.rounds;
         const double rt0 = rt_now();
+        const unsigned long long rs0 = rt_seq();
         if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter)) return false;
         g_rt.draft += rt_now() - rt0;
+        g_rt.draft_d += rt_seq() - rs0;
         g_round_conf = conf;
         g_round_nd = (int) drafts.size();
         int keep = 0;
-        while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min) ++keep;
+        while (keep < (int) drafts.size() && keep < room - 1 && keep < g_spec_depth && conf[(size_t) keep] >= conf_min) ++keep;
         if (keep > 0) {
             drafts.resize((size_t) keep);
             int acc = 0, next = -1;
             const double rt1 = rt_now();
+            const unsigned long long rs1 = rt_seq();
             if (!m.verify(tok, drafts, temperature, top_p, top_k, min_p, seed, counter, acc, next, err)) return false;
             g_rt.verify += rt_now() - rt1;
+            g_rt.verify_d += rt_seq() - rs1;
             ++g_rt.spec_rounds;
             if (g_round_log != nullptr) {   // DS4_ROUND_LOG: tag, drafts offered, accepted, the confidences
                 std::fprintf(g_round_log, "%s\t%d\t%d", g_round_tag.c_str(), keep, acc);
@@ -191,9 +209,11 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         }
     }
     const double rt2 = rt_now();
+    const unsigned long long rs2 = rt_seq();
     if (!m.step(tok, true, err)) return false;
     out.push_back(m.sample(temperature, top_p, top_k, min_p, seed, counter++));
     g_rt.step += rt_now() - rt2;
+    g_rt.step_d += rt_seq() - rs2;
     ++g_rt.steps;
     return true;
 }
@@ -813,6 +833,7 @@ int main(int argc, char** argv) {
             spec = v != "off";
             o.dspark = v != "none";   // none: not even loaded
         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
+        else if (a == "--dspark-depth") g_spec_depth = std::max(1, std::atoi(val("--dspark-depth").c_str()));
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
         else if (a == "--prefill-chunk") o.prefill_chunk = std::max(0, std::atoi(val("--prefill-chunk").c_str()));
         else if (a == "--threads") o.threads = val("--threads") != "off";
