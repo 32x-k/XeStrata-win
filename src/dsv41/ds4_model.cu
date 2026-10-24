@@ -13,6 +13,7 @@
 //   h = post * moe + comb^T h;  pre = f_pre
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "ds4_model.hpp"
+#include "ds4_pick_rule.hpp"
 #include "ds4_experts_rule.hpp"
 #include "ds4_engram_io.hpp"
 
@@ -1240,6 +1241,8 @@ struct Model::Impl {
     }
 
     ~Impl() {
+        quit.store(true);
+        if (warm_bg.joinable()) warm_bg.join();   // (the warm-up uses the BLAS handles destroyed below)
         eg_io.stop();   // (its threads write into h_eg)
         for (auto& w : workers) w->stop();
         for (size_t i = 0; i < chunks.size(); ++i)
@@ -2813,7 +2816,9 @@ struct Model::Impl {
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
         preload_store();
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
+        if (chunk > 0) (void) pick_flow_min();   // (the startup line)
         reset();
+        start_warm();
         return true;
     }
 
@@ -2824,6 +2829,47 @@ struct Model::Impl {
     size_t ckv_rb() const { return kv_row_bytes(kKvFp4, g.hd); }
     size_t ik_rb() const { return kv_row_bytes(kKvFp4p, g.ix_hd); }
 
+    // The chunked prompt's first GEMM of each kind pays the BLAS library's start (its handle's heuristics, the code objects of its
+    // kernels loaded on first use): ~1 s of hipModuleLoad plus ~2.5 s of library time on the R9700 (rocprofv3), 1-2 s on CUDA, once a
+    // process - 3.6 s on the first prompt that went through the flow, measured as 4.9 s for a 25-token pass against 1.0 s for the
+    // next one.  Paid here instead, at load, on a thread beside the store's read: the chunk GEMMs on tiny inputs into the chunk's own
+    // scratch buffers (the mHC mix GEMM in F32, the FP16 GEMM the projections and the indexer weights use) - no engine state is
+    // touched (heat, profile, stats, positions, KV), so the answers are what they were.  DS4_WARM=0 turns it off.
+    void warm_flow() {
+        const int T = 16, D = g.dim, hcd = g.hc * g.dim, n_mix = (2 + g.hc) * g.hc;
+        const float one = 1.0f, zero = 0.0f;
+        for (size_t di = 0; di < chunks.size(); ++di) {
+            if (!chunks[di] || chunks[di]->blas == nullptr) continue;
+            Chunk& c = *chunks[di];
+            if (c.C < T) continue;
+            cudaSetDevice(devs[di].id);
+            (void) cublasSgemm(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, n_mix, T, hcd, &one, c.h, hcd, c.h, hcd, &zero, c.mix, 32);
+            const int ns[2] = {256, 32};
+            for (int n : ns)
+                (void) cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, T, D, &one, c.w16, CUDA_R_16F, D, c.x16, CUDA_R_16F, D, &zero,
+                                    c.y, CUDA_R_32F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            (void) cudaStreamSynchronize(devs[di].st);
+            (void) cudaGetLastError();
+        }
+    }
+    // The warm-up runs once the model is loaded, on a thread of its own: HIP serialises the BLAS start with the store's page-locked
+    // arena (measured: beside the store's read it finished only when the read did, 21 s, and load still grew by its 3.5 s), so
+    // it cannot hide inside the load; after it, a person typing gives it the seconds it needs.  A chunked pass that starts first
+    // waits for it (warm_mu) - never later than that pass would have been without it - and a warm-up that finds the flow already
+    // used does nothing.  DS4_WARM=0 turns it off.
+    std::mutex warm_mu;
+    std::atomic<bool> flow_used{false};
+    std::thread warm_bg;
+    void start_warm() {
+        if (chunk <= 0 || (std::getenv("DS4_WARM") && std::atoi(std::getenv("DS4_WARM")) == 0)) return;
+        warm_bg = std::thread([this] {
+            std::lock_guard<std::mutex> lk(warm_mu);
+            if (flow_used.load() || quit.load()) return;
+            const double tw = now_ms();
+            warm_flow();
+            if (o.verbose) std::fprintf(stderr, "ds4: prompt path warmed up in %.0f ms\n", now_ms() - tw);
+        });
+    }
     // ---- the chunked prompt path
     size_t x_cap() const { return (size_t) std::max<int>(kWin, chunk + 2); }   // a window's / chunk's new source rows
     size_t chunk_hand_bytes() const {
@@ -7873,8 +7919,28 @@ struct Model::Impl {
     // this PC's speeds - the flow's times what it really took against its predictions so far for prompts of that size
     // (pm_k), windows' once some ran what a window took times the windows; the flow unless windows are predicted
     // faster (by half, with less than kPickRes in RAM); said with --verbose
+    // The choice is made from the prompt's length alone (pick_flow_min): the same prompt takes the same path - and so
+    // gives the same bits, the two paths round differently - in every session and on every restart.  The timing prediction below
+    // (DS4_PICK=adaptive) used measured speeds and sampled page residency, so it flipped between runs: r9700, one 16-token feed
+    // through the flow in one run, another feed in the next, three different logits checksums in six runs.  Measured on 4 and 1 R9700
+    // (first prompt of a run, windows against the flow, ms): 28 tokens 594 / 4966 (4 cards), 1094 / 5588 (1 card); 100: 1164 / 5375,
+    // 3279 / 7299; 300: 2831 / 5874, 9018 / 9803; 600: 5304 / 6808, 16969 / 11327; 1500: 13325 / 8012, 41547 / 18187 - the flow pays a
+    // fixed ~5 s the first time (its buffers and GEMM libraries), then wins from about 400 tokens up.
+    // The length from which the flow is taken: one number for every box (ds4_pick_rule.hpp says why 96), DS4_PICK_MIN=N overrides.
+    int pick_flow_min() {
+        if (pick_min_ > 0) return pick_min_;
+        pick_min_ = prompt_flow_min(std::getenv("DS4_PICK_MIN"));
+        std::fprintf(stderr, "ds4: prompt path: the chunked pass from %d tokens, windows of 16 below\n", pick_min_);
+        return pick_min_;
+    }
+    int pick_min_ = 0;
     bool pick_path(int n) {
+        static const bool adaptive = [] {
+            const char* e = std::getenv("DS4_PICK");
+            return e != nullptr && std::strcmp(e, "adaptive") == 0;
+        }();
         pm.last = -1;
+        if (!adaptive) return n >= pick_flow_min();
         if (!pm.on || n >= kPickMax) return true;
         double f_res = 0, f_cold = 0, w = 0;
         const int nw = n / kWin, rem = n % kWin;
@@ -8069,6 +8135,8 @@ struct Model::Impl {
     // the last min(logits_rows, 16) rows (logits_rows > 16: a run of one chunk, every row's into chunk_logits)
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1) {
         if (n < 1) return true;
+        flow_used.store(true);
+        std::lock_guard<std::mutex> warm_lk(warm_mu);   // (the warm-up, if it is running, finishes first)
         if (pos + n > o.max_context) {
             err = "the context is full";
             return false;
