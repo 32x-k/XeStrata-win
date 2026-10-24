@@ -294,6 +294,28 @@ test('packaged: an app update that ends the app is recorded as finished by the n
   } finally { if (before === undefined) delete process.env.STRATA_APP_VERSION; else process.env.STRATA_APP_VERSION = before; await f.native.close(); f.cleanup(); }
 });
 
+test('packaged: an update job an OLDER host left running is finished when the app program file is newer than the job', async () => {
+  const exe = new URL('../../strata-desktop.exe', import.meta.url);          // <install>/strata-desktop.exe as seen from <install>/host
+  const f = fixture({ withApp: true });
+  try {
+    const { fileURLToPath } = await import('node:url');
+    const old = { id: 'old-1', kind: 'update-strata', state: 'running', startedAt: new Date(Date.now() - 60_000).toISOString(), summary: 'Starting…', result: null, error: null };
+    writeFileSync(join(f.data, 'native-jobs.json'), JSON.stringify([old]));
+    const mk = () => createNativeControl({ control: f.control, directory: f.data, spawnProcess: () => { throw new Error('no process'); }, fetcher: async () => Response.json({}), requests: () => [] });
+    const before = mk();
+    assert.equal(before.state().jobs[0].state, 'error', 'no new program file: still an interruption');
+    await before.close();
+    writeFileSync(join(f.data, 'native-jobs.json'), JSON.stringify([old]));
+    writeFileSync(fileURLToPath(exe), 'new program');
+    try {
+      const after = mk();
+      assert.equal(after.state().jobs[0].state, 'done');
+      assert.match(after.state().jobs[0].summary, /updated/i);
+      await after.close();
+    } finally { rmSync(fileURLToPath(exe), { force: true }); }
+  } finally { await f.native.close(); f.cleanup(); }
+});
+
 test('packaged: "Update engine" works in the first seconds, before the native snapshot has connected', async () => {
   const f = fixture();
   try {
