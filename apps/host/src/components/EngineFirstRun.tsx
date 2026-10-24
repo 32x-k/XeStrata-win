@@ -41,7 +41,8 @@ export function useEngineNeeded(): boolean | null {
 }
 
 function gpuLine(info: FirstRunInfo) {
-    const first = info.gpus[0];
+    // a processor's own tiny graphics (no memory of its own) is not "a card"
+    const first = info.gpus.find(g => (g.vramGb ?? 0) >= 1) ?? info.gpus[0];
     if (!first) return '';
     const vram = first.vramGb ? `, ${Math.round(first.vramGb)} GB` : '';
     const driver = info.driver ? `, driver ${info.driver}` : '';
@@ -122,7 +123,7 @@ export function EngineFirstRun({ onDone }: { onDone: () => void }) {
     const bytes = info?.offer?.bytes ?? 0;
     const doneMb = Math.round(mb(bytes) * percent / 100);
     const eta = useDownloadEta(running && bytes ? { done_gb: bytes * percent / 100 / 1e9, remaining_gb: bytes * (100 - percent) / 100 / 1e9 } : undefined, job?.id);
-    const cards = info?.gpus.length ?? 0;
+    const cards = (info?.gpus ?? []).filter(g => (g.vramGb ?? 0) >= 1).length;
     const hidden = <input ref={file} type="file" accept=".gz,.tgz,.xz,.zip" hidden onChange={e => void chosen(e.target.files)}/>;
     const pick = (label: string) => <button type="button" className="onboard-continue-anyway" disabled={busy || running} onClick={() => file.current?.click()}>{tr(label)}</button>;
 
