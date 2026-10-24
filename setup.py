@@ -2978,6 +2978,16 @@ def _hash_file(s: Path, size: int) -> str:
     return h.hexdigest()
 
 
+def own_gguf_is_whole(path: Path) -> bool:
+    """The person's own GGUF reads as a whole file: its header parses and every tensor lies inside the file (a cut-short copy fails this)."""
+    try:
+        from strata_control import gguf_preflight
+        gguf_preflight.inspect_metadata(Path(path))
+        return True
+    except Exception:                                  # noqa: BLE001 - anything unreadable is "not whole"
+        return False
+
+
 def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None) -> None:
     """A shard's size and SHA-256 against the pinned values (the Unsloth file); the result is kept in its finish mark,
     so the ~5 minutes of hashing 111 GB happen once.  A wrong file is deleted, so the next run downloads it again.
@@ -2987,6 +2997,11 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None) 
     if m.exists() and f"sha256 {sha}" in m.read_text(encoding="utf-8", errors="replace"):
         return
     have = s.stat().st_size if s.exists() else -1
+    if own and have > 0 and have != size and own_gguf_is_whole(s):
+        # a fine-tune or another build with the layout of the published file (#3777: 96 bytes apart): recommend, never refuse
+        warn(f"{s.name} is {have:,} bytes; the published file is {size:,}. It is a complete GGUF file, so Strata uses it as it is; "
+             "it may be another version or a fine-tune, so check a few answers before you rely on it")
+        return
     if have != size:
         if own:                                        # --gguf-dir: the person's own file is never deleted by setup
             fail(f"{s.name} is {have:,} bytes; the published file is {size:,}",
@@ -3003,6 +3018,10 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None) 
         else:
             say("  The damaged parts could not be found this way.")
     if digest != sha:
+        if own and own_gguf_is_whole(s):
+            warn(f"{s.name} is not the published file (SHA-256 {digest[:12]}..., expected {sha[:12]}...) but it is a complete GGUF file, so "
+                 "Strata uses it as it is; it may be another version or a fine-tune, so check a few answers before you rely on it")
+            return
         if own:
             fail(f"{s.name} does not match the published file (SHA-256 {digest}, expected {sha})",
                  "it may be damaged or another version; your file was left as it is. Copy the whole published file into the folder")
