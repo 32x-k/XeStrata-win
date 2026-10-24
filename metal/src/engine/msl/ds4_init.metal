@@ -2022,3 +2022,39 @@ kernel void ds4_args_probe(device float* out [[buffer(0)]], constant uint& dim [
                            constant uint& hc [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
     if (gid == 0) { out[0] = float(dim); out[1] = float(hc); out[2] = 1.0f; }
 }
+
+// hc == 4 (every layer of this model): the warp-lane form of the CUDA kernel - lane j*4+k holds comb[j][k], the row and column
+// sums are xor-shuffles (1, 2 within a row; 4, 8 within a column).  One simdgroup a token instead of one lane.
+kernel void ds4_hc_split4(device const float* mixes [[buffer(0)]], device const float* scale [[buffer(1)]],
+                          device const float* base [[buffer(2)]], device float* pre [[buffer(3)]],
+                          device float* post [[buffer(4)]], device float* comb [[buffer(5)]],
+                          constant uint& hc [[buffer(6)]], constant uint& iters [[buffer(7)]],
+                          constant float& eps [[buffer(8)]], uint b [[threadgroup_position_in_grid]],
+                          uint lane [[thread_index_in_threadgroup]]) {
+    const device float* mx = mixes + (size_t) b * 32u;
+    if (lane < 4u) {
+        pre[(size_t) b * 8u + lane] = 1.0f / (1.0f + exp(-(mx[lane] * scale[0] + base[lane]))) + eps;
+        post[(size_t) b * 8u + lane] = 2.0f / (1.0f + exp(-(mx[4u + lane] * scale[1] + base[4u + lane])));
+    }
+    const bool on = lane < 16u;
+    float c = on ? mx[8u + lane] * scale[2] + base[8u + lane] : -3.402823466e+38f;
+    float m = fmax(c, simd_shuffle_xor(c, ushort(1)));
+    m = fmax(m, simd_shuffle_xor(m, ushort(2)));
+    c = on ? exp(c - m) : 0.0f;
+    float rs = c + simd_shuffle_xor(c, ushort(1));
+    rs += simd_shuffle_xor(rs, ushort(2));
+    c = c / rs + eps;
+    c = on ? c : 0.0f;
+    float cs = c + simd_shuffle_xor(c, ushort(4));
+    cs += simd_shuffle_xor(cs, ushort(8));
+    c = c / (cs + eps);
+    for (uint it = 1; it < iters; ++it) {
+        float r = c + simd_shuffle_xor(c, ushort(1));
+        r += simd_shuffle_xor(r, ushort(2));
+        c = c / (r + eps);
+        float s = c + simd_shuffle_xor(c, ushort(4));
+        s += simd_shuffle_xor(s, ushort(8));
+        c = c / (s + eps);
+    }
+    if (on) comb[(size_t) b * 64u + lane] = c;
+}

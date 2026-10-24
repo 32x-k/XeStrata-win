@@ -307,7 +307,7 @@ bool hc_split(const float* mixes, const float* scale, const float* base, int hc,
     mtl::Buffer bb = wrap(hb, nbase * sizeof(float));
     if (!bs.handle || !bb.handle) return false;
     mtl::Pipeline pl;
-    try { pl = g_cx->pipeline(g_lib, "ds4_hc_split"); } catch (...) { return false; }
+    try { pl = g_cx->pipeline(g_lib, hc == 4 && !std::getenv("DS4_NO_HCS4") ? "ds4_hc_split4" : "ds4_hc_split"); } catch (...) { return false; }
     mtl::Dispatch d;
     d.p = &pl;
     d.args = {mtl::Arg::B(bm, off(hm)), mtl::Arg::B(bs, off(hs)), mtl::Arg::B(bb, off(hb)), mtl::Arg::B(bp, off(hp)),
@@ -584,7 +584,7 @@ bool iq_mv(const void* jobs, int nj) {
     if (nj <= 0) return true;
     if (!ensure()) return false;
     const Ds4IqMvJob* src = (const Ds4IqMvJob*) jobs;
-    std::vector<Ds4IqMvJob> exp_iq, exp_k;
+    std::vector<Ds4IqMvJob> exp_iq, exp_k, exp_q5, exp_x1;
     exp_iq.reserve((size_t) nj);
     exp_k.reserve((size_t) nj);
     int max_n = 0;
@@ -602,7 +602,10 @@ bool iq_mv(const void* jobs, int nj) {
                 b.xd = q.xd + (size_t) c0 * (size_t) (q.k / 32);
                 b.y = q.y + (size_t) c0 * (size_t) q.ycs;
             }
-            (b.type == 13 || b.type == 14 ? exp_k : exp_iq).push_back(b);
+            static const bool fast1 = std::getenv("DS4_NO_MV1") == nullptr;
+            if (fast1 && b.ncol == 1 && b.type == 13) exp_q5.push_back(b);        // the decode step's one-activation kernels
+            else if (fast1 && b.ncol == 1 && b.type == 16) exp_x1.push_back(b);
+            else (b.type == 13 || b.type == 14 ? exp_k : exp_iq).push_back(b);
         }
     }
     if (max_n <= 0) return true;
@@ -638,6 +641,8 @@ bool iq_mv(const void* jobs, int nj) {
         g_cx->free(bj);
         return true;
     };
+    if (!run_group(exp_q5, "ds4_q5k_mv1")) return false;
+    if (!run_group(exp_x1, "ds4_iq2xxs_mv1")) return false;
     if (!run_group(exp_k, "ds4_iq_mv_k")) return false;
     if (!run_group(exp_iq, "ds4_iq_mv")) return false;
     return true;

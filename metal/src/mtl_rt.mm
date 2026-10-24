@@ -318,12 +318,26 @@ static void encode(id<MTLComputeCommandEncoder> enc, const Dispatch& d) {
 }
 
 static double g_gpu_ms = 0.0;   // GPU time of every committed command buffer, summed
+static std::mutex g_prof_mu;
+static std::unordered_map<std::string, std::pair<double, uint64_t>> g_prof;   // DS4_PROF: kernel -> (GPU us, dispatches)
+static std::string g_prof_last;
 static std::atomic<uint64_t> g_disp_count{0};   // dispatches encoded, and command buffers committed
 static std::atomic<uint64_t> g_cb_count{0};
 static bool g_count_reg = false;
 static void ds4_report_counts() {
     std::fprintf(stderr, "mtl: %.1f ms GPU, %llu dispatches, %llu command buffers\n", g_gpu_ms,
                  (unsigned long long) g_disp_count.load(), (unsigned long long) g_cb_count.load());
+    if (!g_prof.empty()) {
+        std::vector<std::pair<double, std::string>> pv;
+        double tot = 0;
+        for (auto& kv : g_prof) { pv.emplace_back(kv.second.first, kv.first); tot += kv.second.first; }
+        std::sort(pv.begin(), pv.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        std::fprintf(stderr, "prof: kernel                          GPU ms    n   us/dispatch   (total %.1f ms)\n", tot / 1000.0);
+        for (size_t i = 0; i < pv.size() && i < 30; ++i) {
+            auto& e = g_prof[pv[i].second];
+            std::fprintf(stderr, "prof: %-30s %8.1f %6llu %8.1f\n", pv[i].second.c_str(), e.first / 1000.0, (unsigned long long) e.second, e.first / (double) e.second);
+        }
+    }
     std::vector<std::pair<uint64_t, std::string>> v;
     { std::lock_guard<std::mutex> lk(g_hist_mu); for (auto& kv : g_kernel_counts) v.emplace_back(kv.second, kv.first); }
     std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -367,7 +381,8 @@ void Context::flush_runs() {
     }
     if (impl_->inflight != nil) {
         [impl_->inflight waitUntilCompleted];
-        { const double d = impl_->inflight.GPUEndTime - impl_->inflight.GPUStartTime; if (d > 0) g_gpu_ms += d * 1000.0; }
+        { const double d = impl_->inflight.GPUEndTime - impl_->inflight.GPUStartTime; if (d > 0) g_gpu_ms += d * 1000.0;
+          if (!g_prof_last.empty()) { std::lock_guard<std::mutex> pl(g_prof_mu); auto& e = g_prof[g_prof_last]; e.first += d * 1e6; e.second += 1; g_prof_last.clear(); } }
         if (impl_->inflight.status != MTLCommandBufferStatusCompleted)
             std::fprintf(stderr, "mtl: deferred command buffer failed: %s\n", [[impl_->inflight.error localizedDescription] UTF8String]);
         impl_->inflight = nil;
@@ -400,6 +415,8 @@ double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, 
             }
             ++impl_->def_n;
             ++g_disp_count;
+            static const bool prof = std::getenv("DS4_PROF") != nullptr;   // every dispatch alone, its GPU time kept per kernel
+            if (prof) { g_prof_last = ds[0].p->name; if (ds4_gpu_sync_all_streams_weak) ds4_gpu_sync_all_streams_weak(); flush_runs(); return 0.0; }
             static const bool each = std::getenv("DS4_FLUSH_EACH") != nullptr;   // debugging: every dispatch alone, in order
             static const std::string only = std::getenv("DS4_FLUSH_AFTER") ? std::getenv("DS4_FLUSH_AFTER") : "";   // ",name1,name2,"
             const bool listed = !only.empty() && only.find("," + ds[0].p->name + ",") != std::string::npos;
