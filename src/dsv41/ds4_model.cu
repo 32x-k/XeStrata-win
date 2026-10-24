@@ -7688,11 +7688,7 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         // (an EXL3 head: as many activations at a time as its split-K partials fit the scratch - 8 for a shared head, 4
         // for a whole one, each pass reading the whole share; a GGUF's: 4 at a time, as before)
-#if defined(STRATA_METAL)
-        const int per = d.head.fmt != 0 ? 8 : std::max(1, x3::mv_cols(d.head));   // (the matvec kernels take 8 columns in one pass over the head)
-#else
-        const int per = d.head.fmt != 0 ? 4 : std::max(1, x3::mv_cols(d.head));
-#endif
+        const int per = d.head.fmt != 0 ? 4 : std::max(1, x3::mv_cols(d.head));   // (8 columns a pass on Metal moved the KL by +0.002: the mvn8 kernel sums in another order)
         for (int c = 0; c < rows; c += per)
             if (!mv(d, {job(d.head, xn + (size_t) c * D, out + (size_t) c * ld, std::min(per, rows - c), D, ld)}, err))
                 return false;
