@@ -117,3 +117,39 @@ class FinalHint(unittest.TestCase):
         from strata_cli.launch import settings as S
         s = S.LaunchSettings(name="Office")
         self.assertIn('--stop --preset "Office"', "\n".join(cmd.final_hint_lines(s, True)))
+
+
+class OwnEngine(unittest.TestCase):
+    """The run config of an installed DeepSeek model may name another install's (or an older) engine folder: the launch uses this install's package."""
+
+    def fake(self, own_root, found):
+        from strata_cli.launch import runner as R
+        f = mock.MagicMock()
+        f.notices = []
+        f.dsv41_engine_found.return_value = (found, True)
+        return R.Runner.use_own_dsv41_engine, f
+
+    def test_a_stale_path_in_the_config_is_replaced_by_this_installs_package(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            own = Path(d) / "mine" / "engine-dsv41" / "0.1.49-x" / "strata-dsv41.exe"
+            own.parent.mkdir(parents=True)
+            own.write_bytes(b"x")
+            fn, f = self.fake(d, own)
+            cfg = {"arch": "deepseek41", "exe": str(Path(d) / "other" / "engine-dsv41" / "0.1.48-x" / "strata-dsv41.exe"),
+                   "lib_dirs": [str(Path(d) / "other" / "engine-dsv41" / "0.1.48-x"), "C:/cuda"]}
+            fn(f, cfg)
+            self.assertEqual(cfg["exe"], str(own))
+            self.assertEqual(cfg["lib_dirs"], ["C:/cuda", str(own.parent)])
+            self.assertTrue(f.notices)
+
+    def test_nothing_changes_for_qwen_or_when_this_install_has_no_package(self):
+        fn, f = self.fake("x", Path("/p/strata-dsv41.exe"))
+        cfg = {"arch": "qwen4exp", "exe": "component:strata-engine", "lib_dirs": ["a"]}
+        before = dict(cfg)
+        fn(f, cfg)
+        self.assertEqual(cfg, before)
+        fn2, f2 = self.fake("x", None)
+        cfg2 = {"arch": "deepseek41", "exe": "/old/strata-dsv41.exe", "lib_dirs": []}
+        fn2(f2, cfg2)
+        self.assertEqual(cfg2["exe"], "/old/strata-dsv41.exe")
