@@ -26,6 +26,20 @@ __device__ __forceinline__ fv8 wmma16(hv8 a, hv8 b, fv8 c) {
     return c;
 #endif
 }
+using hv16 = _Float16 __attribute__((ext_vector_type(16)));
+// RDNA3 / RDNA3.5 (gfx11): the same v_wmma_f32_16x16x16_f16 on wave32, but a lane holds ALL 16 k of its row / column (the two
+// half-waves the same values) and the D rows a lane holds are 2 q + hi (gfx12: 8 hi + q).  DS4_HIPK_G11 is set in the device pass only.
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || \
+    defined(__gfx1151__) || defined(__gfx1152__)
+#define DS4_HIPK_G11 1
+#endif
+__device__ __forceinline__ fv8 wmma16g11(hv16 a, hv16 b, fv8 c) {
+#if defined(DS4_HIPK_G11)
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#else
+    return c;
+#endif
+}
 __device__ __forceinline__ uint32_t as_u32(hv2 v) { return __builtin_bit_cast(uint32_t, v); }
 __device__ __forceinline__ hv2 as_hv2(uint32_t v) { return __builtin_bit_cast(hv2, v); }
 // 4 int8 codes (a word) -> 4 halves times the scale: 1024 + (code + 128) is exact in a half's mantissa, less 1152
@@ -225,10 +239,31 @@ inline bool ok_device() {   // gfx12 unless STRATA_DS4_HIPK=0
     int v = state[dev].load(std::memory_order_relaxed);
     if (v == 0) {
         cudaDeviceProp prop{};
-        const bool gfx12 = cudaGetDeviceProperties(&prop, dev) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx12", 5) == 0;
+        const bool ok = cudaGetDeviceProperties(&prop, dev) == cudaSuccess;
+        const bool gfx12 = ok && std::strncmp(prop.gcnArchName, "gfx12", 5) == 0;
+        const bool gfx11 = ok && std::strncmp(prop.gcnArchName, "gfx11", 5) == 0;
         const char* e = std::getenv("STRATA_DS4_HIPK");
         v = gfx12 && !(e != nullptr && e[0] == '0') ? 1 : 2;   // (on by default on gfx12; STRATA_DS4_HIPK=0 off)
+        // gfx11: the register-weights tiles only.  On by default on gfx1151 (Strix Halo: prompts +22..29% at the same KL, measured), opt-in
+        // (STRATA_DS4_HIPK=1) on the other gfx11 parts, which were not measured; STRATA_DS4_HIPK=0 turns it off everywhere
+        if (gfx11) {
+            const bool halo = std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+            v = (e != nullptr ? e[0] == '1' : halo) ? 3 : 2;
+        }
         state[dev].store(v, std::memory_order_relaxed);
+    }
+    return v == 1 || v == 3;
+}
+inline bool is_g11() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceProp prop{};
+    static std::atomic<int> g[16];
+    if (dev < 0 || dev >= 16) return false;
+    int v = g[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        v = cudaGetDeviceProperties(&prop, dev) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx11", 5) == 0 ? 1 : 2;
+        g[dev].store(v, std::memory_order_relaxed);
     }
     return v == 1;
 }
@@ -252,6 +287,7 @@ inline bool launch(const SetArgs& a, cudaStream_t s) {
         if (K % 256 != 0 || N % 64 != 0 || a.ldx % 8 != 0 || a.ldo % 2 != 0) return false;
         if (((uintptr_t) (GU ? (const void*) a.xf : (const void*) a.xh) & 15) != 0) return false;
         static const int var = std::getenv("STRATA_DS4_HIPK") ? std::atoi(std::getenv("STRATA_DS4_HIPK")) : 0;
+        if (is_g11() && var == 2) return false;   // (the shared-memory weights kernel is gfx12 only)
         if (var != 2) {   // 2: the shared-memory weights kernel
             static const int cfg = std::getenv("HIPK_CFG") ? std::atoi(std::getenv("HIPK_CFG")) : 0;
             if (cfg == 1 && a.max_rows <= 32) return runr<T, GU, 32, 4, 1>(a, s);
