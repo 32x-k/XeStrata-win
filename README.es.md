@@ -109,7 +109,7 @@ La Terminal es el comando `strata`, pensado para scripts, servidores y agentes d
 Linux y Mac:
 
 ```sh
-curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
 ```
 
 Windows (PowerShell):

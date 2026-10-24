@@ -108,7 +108,7 @@ Das Terminal ist der Befehl `strata`, gedacht für Skripte, Server und KI-Agents
 Linux und Mac:
 
 ```sh
-curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
 ```
 
 Windows (PowerShell):

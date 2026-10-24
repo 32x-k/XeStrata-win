@@ -105,7 +105,7 @@ O Terminal é o comando `strata`, para scripts, servidores e agentes de IA.
 Linux e Mac:
 
 ```sh
-curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
 ```
 
 Windows (PowerShell):

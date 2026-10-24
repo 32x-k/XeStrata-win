@@ -20,10 +20,16 @@ def exe_name() -> str:
     return NAME + (".exe" if os.name == "nt" else "")
 
 
+def version_key(folder_name: str) -> tuple:
+    """The version at the front of a package folder's name ("0.1.49-windows-x86_64-cuda-cuda13" -> (0, 1, 49)), for choosing the newest."""
+    head = str(folder_name).split("-")[0]
+    return tuple(int(x) for x in head.split(".") if x.isdigit())
+
+
 def find(dest: Path) -> Path | None:
     """The newest installed package's strata-dsv41 in `dest` (engine-dsv41/), or None."""
     try:
-        folders = sorted((d for d in Path(dest).iterdir() if d.is_dir() and (d / exe_name()).is_file()), key=lambda d: d.name)
+        folders = sorted((d for d in Path(dest).iterdir() if d.is_dir() and (d / exe_name()).is_file()), key=lambda d: (version_key(d.name), d.name))
     except OSError:
         return None
     return folders[-1] / exe_name() if folders else None

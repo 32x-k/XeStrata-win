@@ -116,7 +116,7 @@ def setup_failure(lines: list[str], err: str, hint: str, details: str | None, ow
                                "Pick a folder you own for the model files (the Folder step, or --data-dir D:\\Strata-models) and start again. "
                                "Nothing was downloaded." + where, 6)
         return LaunchError(f"The model could not be installed. Setup stopped with an error ({crashed}).", "Run it again." + where, 6)
-    return LaunchError("The model could not be installed." + (f" {err}." if err else ""),
+    return LaunchError("The model could not be installed." + (f" {err.rstrip('.')}." if err else ""),
                        (hint or ("Run it again: finished steps are skipped." if own_files else
                                  "Run it again: finished steps are skipped and a download continues where it stopped."))
                        + (f" Details: {details}" if details else ""), 6)
@@ -543,6 +543,9 @@ class Runner:
 
     # ---- 1. the engine
     def ensure_engine(self) -> None:
+        if self.multi_file():                                # DeepSeek: its own engine package (setup fetches it); the Strata engine is not used
+            self.emit("engine", "DeepSeek runs on its own engine package, so the Strata engine is not downloaded for it.", 100)
+            return
         self.emit("engine", "Checking the engine for this computer…")
         from strata_control import engine_component as ec
         root = Path(self.components_dir) if self.components_dir else None
@@ -947,7 +950,7 @@ class Runner:
         env.pop("STRATA_NEED_ENGINE", None)
         if self.engine_problem:
             env["STRATA_ALLOW_NO_ENGINE"] = "1"              # the person said go on: setup warns about the engine instead of stopping
-        else:
+        elif not self.multi_file():                          # (DeepSeek does not use the Strata engine: nothing to require)
             env["STRATA_NEED_ENGINE"] = "1"
         for k in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV"):
             env.pop(k, None)
@@ -1726,6 +1729,11 @@ class Runner:
             parts = [p for p in parts if p["kind"] != "weights"] + [{"kind": "weights", "label": "the ready-made pack", "gb": gap["gb"]}]
         gb = round(sum(p["gb"] for p in parts), 1)
         engine, here = True, []
+        if self.multi_file():                                # DeepSeek does not use the Strata engine: nothing about it in the plan (its own package is in the placement)
+            return {"gb": gb, "parts": parts, "engine_missing": False, "engine_usable": True, "own_files": st.own_files,
+                    "text": ("Nothing to download: your model files are used where they are." if gb < 0.05 and st.own_files else
+                             "Nothing to download: the model is already on this computer." if gb < 0.05 else
+                             f"About {gb:.1f} GB to download.")}
         try:
             report = engine_component.status(Path(self.components_dir) if self.components_dir else None)
             engine = bool(report.get("usable"))
@@ -1860,6 +1868,9 @@ class Runner:
         if found is None:
             return
         old = str(cfg.get("exe") or "")
+        choice = getattr(self, "dsv41_choice", None)
+        if choice and choice[0] == str(found):
+            self.emit("engine", f"DeepSeek engine: {found} ({choice[1]}).", None)
         if os.path.normcase(os.path.normpath(old)) != os.path.normcase(os.path.normpath(str(found))):
             cfg["exe"] = str(found)
             if old:
@@ -1874,7 +1885,26 @@ class Runner:
         own = (os.environ.get("STRATA_DSV41_EXE") or "").strip()
         if own:
             return (Path(own) if Path(own).is_file() else None), True
-        folders: list[Path] = [Path(self.catalog.root) / dsv41_engine.DIR]       # this install's own package first
+        # The install this Terminal RUNS from (STRATA_INSTALL_DIR, else the folder its strata_cli comes from) and the install the model's settings live in
+        # (catalog.root: the first remembered install, which after an update or on a computer with several installs can be an older one) can both hold a
+        # DeepSeek engine package: the NEWEST version wins, the running Terminal's own on a tie, and the answer is logged.
+        roots: list[Path] = []
+        for r in (os.environ.get("STRATA_INSTALL_DIR"), self.catalog.src, self.catalog.root):
+            if r and not any(os.path.normcase(os.path.normpath(str(r))) == os.path.normcase(os.path.normpath(str(x))) for x in roots):
+                roots.append(Path(r))
+        picks = []
+        for i, r in enumerate(roots):
+            exe = dsv41_engine.find(r / dsv41_engine.DIR)
+            if exe is not None:
+                picks.append((dsv41_engine.version_key(exe.parent.name), -i, exe, r))
+        if picks:
+            best = max(picks, key=lambda t: (t[0], t[1]))
+            why = ("this Terminal's own folder" if best[3] == roots[0] or best[3] == Path(self.catalog.src) else "the install the model's settings came from")
+            if len(picks) > 1:
+                why += f", the newest of {len(picks)} packages"
+            self.dsv41_choice = (str(best[2]), why)
+            return best[2], True
+        folders: list[Path] = [Path(self.catalog.root) / dsv41_engine.DIR]       # (nothing there: the older places, as before)
         try:
             from strata_control import engine_component as ec
             rep = ec.status()
