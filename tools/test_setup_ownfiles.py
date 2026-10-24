@@ -60,8 +60,12 @@ class OwnFileChecks(unittest.TestCase):
         self.assertFalse(self.file.exists())
 
     def test_a_complete_own_gguf_of_another_size_or_hash_is_used_with_a_warning(self):     # #3777
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))                  # `discover -s tools` puts only tools/ on the path
-        from tests.terminal.test_own_files import gguf_bytes
+        import importlib.util                                                          # by path: another `tests` package may already be loaded
+        spec = importlib.util.spec_from_file_location("own_files_helper", Path(__file__).resolve().parents[1] / "tests" / "terminal" / "test_own_files.py")
+        helper = importlib.util.module_from_spec(spec)
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        spec.loader.exec_module(helper)
+        gguf_bytes = helper.gguf_bytes
         gguf = Path(self.tmp.name) / "fine-tune.gguf"
         gguf.write_bytes(gguf_bytes(["Q8_0"]))
         for size, sha in ((gguf.stat().st_size + 96, "0" * 64), (gguf.stat().st_size, "0" * 64)):
