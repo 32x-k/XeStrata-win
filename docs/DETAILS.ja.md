@@ -1376,7 +1376,7 @@ setup は画像のモデル、VAE、文の読み手（Qwen3-VL-8B）と、編集
 既定は 40 ステップ（Qwen の diffusers の pipeline の既定で、ガイダンスはなし）で、1 枚に Turbo の約 5 倍の時間がかかります。リクエストの `steps`（2〜100）で変えられます。各ステップの sigma は diffusers の scheduler と同じ式で、画像の大きさに合わせてずらします。
 Qwen-Image-2.1-Turbo と Qwen-Image-2.1 の重みは Qwen Research License で、自由なソフトウェアのライセンスではありません。商用に使う前にそのライセンスを読んでください。
 
-`--images mage-flow-turbo` なら、Microsoft の Mage-Flow-Turbo（4B、4 ステップ）で作ります。`mage-flow`（強化学習で調整した版、20 ステップ）と `mage-flow-base`（元のモデル、30 ステップ）は CFG を掛けます（既定の強さ 5）。
+`--images mage-flow-turbo` なら、Microsoft の Mage-Flow-Turbo（4B、4 ステップ）で作ります。`mage-flow`（強化学習で調整した版、20 ステップ）と `mage-flow-base`（元のモデル、30 ステップ）は CFG を掛けます（既定の強さ 5）。`--images magetrail` は、Mage-Flow を Danbooru と e621 の画像で微調整した RicemanT の MageTrail（30 ステップ、CFG 5、編集なし）で作ります。
 setup は生成用と編集用の画像のモデル（Comfy-Org の bf16 の safetensors）、VAE、文の読み手（Qwen3-VL-4B）、編集のための画像の読み手（Qwen3-VL-4B の mmproj）をダウンロードします。文の読み手の大きさの選び方は Qwen-Image-2.1 と同じで、画像のモデルの大きさは 1 つです。
 エンジンは画像のモデルのブロックが文の読み手の層と一緒に VRAM に全部入るときは 16 ビット（FP16）のまま置いてそのまま掛け、入らないときは読み込むときに 8 ビットにして、VRAM に入らないブロックを RAM から流します（`--image-dit-q8 on` で常に 8 ビット、`off` で常に 16 ビット）。8 ビットは、GPU の計算ライブラリが int8 の積を持つとき（contrib-llvm の Intel・NVIDIA、AMD）は重みを 256 個ずつアダマール行列で回して行ごとの尺度の int8 にし、活性も同じく回してトークンごとに int8 にして掛けます（ComfyUI の int8_convrot と同じ形。時刻の変調の層だけは Q8_0）。ほかは Q8_0 で、掛けるたびに 16 ビットに戻します。
 `-uncensored` なら、文の読み手を huihui-ai の Qwen3-VL-4B（拒否の方向を取り除いたもの、noctrex の GGUF）に替えます。
@@ -1532,7 +1532,7 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
   Gyro は agentionai の [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)。
   abliterated 版は huihui-ai の [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)。
   ほかのモデルは、Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj の[再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) と Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
-  画像のモデルは、Qwen の Qwen-Image-2.1 と Qwen-Image-2.1-Turbo（GGUF は Unsloth）、Microsoft の Mage-Flow（Comfy-Org の safetensors）、文の読み手の Qwen3-VL（Unsloth、AtomicChat、huihui-ai と noctrex の版）（[IMAGE](IMAGE.ja.md#ライセンス)）。
+  画像のモデルは、Qwen の Qwen-Image-2.1 と Qwen-Image-2.1-Turbo（GGUF は Unsloth）、Microsoft の Mage-Flow（Comfy-Org の safetensors）、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE（FLUX.2-klein-4B のもの）、文の読み手の Qwen3-VL（Unsloth、AtomicChat、huihui-ai と noctrex の版）（[IMAGE](IMAGE.ja.md#ライセンス)）。
   重みにはそれぞれのライセンスが適用されます。
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)**（MIT）: i-quant の形式、`src/kernels/xe/` に書き写した GPU の内積と展開、
   i-quant のエキスパートのためにリンクする CPU のバックエンド、画像のエンコーダー（`tools/vision/`）の `mtmd` のライブラリと GPU のバックエンド（Vulkan、SYCL）、

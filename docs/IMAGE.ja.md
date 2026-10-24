@@ -23,16 +23,20 @@ Qwen3.8-Flash-Next のどの版とも組み合わせられ（BETA のモデル�
 | `mage-flow-turbo` | [Mage-Flow-Turbo](https://huggingface.co/Comfy-Org/Mage-Flow) | 4 | いちばん速い小さなモデル（4B）。RAM や VRAM の少ない PC 向け |
 | `mage-flow` | [Mage-Flow](https://huggingface.co/Comfy-Org/Mage-Flow) | 20（CFG） | 強化学習で、指示への従い方と文字の描き方を調整した版 |
 | `mage-flow-base` | [Mage-Flow-Base](https://huggingface.co/Comfy-Org/Mage-Flow) | 30（CFG） | 調整の前の元のモデル |
+| `magetrail` | [MageTrail](https://huggingface.co/RicemanT/MageTrail) | 30（CFG） | Mage-Flow を Danbooru と e621 の画像で微調整した版。booru のタグで描くイラスト向け。編集はできない |
 
 この文書で「Qwen-Image-2.1」は Turbo と元のモデルの両方を指し、片方だけのことは「Turbo」「元のモデル」と書きます。
 
-- **文の読み手**: プロンプトを読むモデルです。Qwen-Image-2.1 は Qwen3-VL-8B、Mage-Flow は Qwen3-VL-4B を使います。
+- **文の読み手**: プロンプトを読むモデルです。Qwen-Image-2.1 は Qwen3-VL-8B、Mage-Flow と MageTrail は Qwen3-VL-4B を使います。
 - **`-uncensored`**: 名前の後ろに付けると（`qwen-image-turbo-uncensored`、`mage-flow-turbo-uncensored` など）、文の読み手を拒否の方向を取り除いたものに替えます。
-  Qwen-Image-2.1 は AtomicChat の Qwen3-VL-8B、Mage-Flow は huihui-ai の Qwen3-VL-4B（noctrex の GGUF）です。画像のモデルと VAE はそのままです。
-- **CFG**: `mage-flow` と `mage-flow-base` は、既定で強さ 5 の CFG（ネガティブのプロンプトとの差でプロンプトに寄せる方法）を掛けるので、1 ステップに 2 回分の計算をします。
+  Qwen-Image-2.1 は AtomicChat の Qwen3-VL-8B、Mage-Flow と MageTrail は huihui-ai の Qwen3-VL-4B（noctrex の GGUF）です。画像のモデルと VAE はそのままです。
+- **CFG**: `mage-flow`、`mage-flow-base`、`magetrail` は、既定で強さ 5 の CFG（ネガティブのプロンプトとの差でプロンプトに寄せる方法）を掛けるので、1 ステップに 2 回分の計算をします。
 - **Qwen-Image-2.1 と Mage-Flow の違い**: Qwen-Image-2.1 は編集の参照画像を 10 枚まで受け、マスクと透明な背景も使えます。
   Mage-Flow は参照画像が 3 枚まで（編集のモデルの学習と同じ）で、マスクと透明な背景はありません。
   Mage-Flow は生成用と編集用で画像のモデルが別で、setup は両方を入れ、編集のときだけエンジンが差し替えます。
+- **MageTrail**: Mage-Flow の画像のモデルを作り替えて微調整したもので、生成のモデルだけがあり、編集はできません。
+  プロンプトは booru のタグ（`1girl, solo, silver hair, ...`）と文のどちらでも書け、`masterpiece, best quality, very aesthetic, aesthetic` を足すと画質が上がり、`Drawn by <画家名>` を先頭に置くとその画風になります（画家は MageTrail の作者が公開している一覧の 100 人）。
+  VAE は作者が使っている Flux2 VAE（Black Forest Labs が FLUX.2-klein-4B で公開しているもの）です。
 
 ## 入れ方
 
@@ -57,8 +61,10 @@ Qwen-Image-2.1 の画像のモデルは 3 つの大きさから選べます（`-
 | Q4_K_M | 14.7 GB | 17 GB | 4 GB から |
 
 Mage-Flow は大きさが 1 つ（bf16）で、ダウンロードは 21.9 GB、RAM の目安は 16 GB（`--image-dit-keep off` で 12 GB）です。
+MageTrail も大きさが 1 つで、ダウンロードは 10.4 GB、RAM の目安は 10 GB です。
+Flux2 VAE は 1024×1024 で約 4.3 GB の VRAM を使い、入らないときは画像をタイルに分けて読みます（遅くなり、色味がわずかに変わることがあります）。
 
-- **ダウンロード**: 画像のモデル（Mage-Flow は生成用と編集用の 2 つ）、VAE、文の読み手（Q8_0）、編集のための画像の読み手の合計です。
+- **ダウンロード**: 画像のモデル（Mage-Flow は生成用と編集用の 2 つ）、VAE、文の読み手（Q8_0）、編集のための画像の読み手（MageTrail にはありません）の合計です。
 - **RAM の目安**: 文章のモデルとは別に要る量です。ファイルの大きさに、エンジン自身の約 2 GB を足したものです。
 - **足りないとき**: setup は、文章のモデルの残す RAM に入るまで、まず文の読み手を Q6_K、Q5_K、Q4_K の順に下げ、それでも入らなければ画像のモデルを Q6_K、Q4_K_M に下げます（画像のモデルを下げたときは、文の読み手をその横に入る中で最も大きいものにします）。
   Mage-Flow では文の読み手だけを下げます。
@@ -216,4 +222,6 @@ Turbo（`qwen-image-turbo`）で 1024x1024、8 ステップの画像 1 枚（エ
 - Qwen-Image-2.1-Turbo と Qwen-Image-2.1 の重みは Qwen Research License で、自由なソフトウェアのライセンスではありません。商用に使う前にそのライセンスを読んでください。
 - Mage-Flow の重みは MIT ですが、Microsoft の README は研究のためのモデルで、製品やサービスに使うことは想定していないとしています。
   XeStrata は Mage-Flow の内容のフィルターも透かしも入れていません。
+- MageTrail の重みは MIT です。MageTrail は Danbooru と e621 の画像で学習されていて、XeStrata はその内容のフィルターも入れていません。
+  VAE は Black Forest Labs が FLUX.2-klein-4B で公開している Flux2 VAE で、Apache 2.0 です（MageTrail のリポジトリにある同じ VAE は FLUX.2-dev の非商用のライセンスなので、setup はそちらを使いません）。
 - 文の読み手（Qwen3-VL、AtomicChat と huihui-ai の版）には、それぞれのライセンスが適用されます。
