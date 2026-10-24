@@ -1580,7 +1580,7 @@ def named_gpus(gpu, gpus) -> list:
         return []
 
 
-def cuda_choice(archs, cuda=None):
+def cuda_choice(archs, cuda=None, driver=None):
     """The CUDA toolkit of one model's engine: (12 or 13, why).  13 (the ready-made engine) unless a card is older
     than CUDA 13 supports (Pascal / Volta: CUDA 13 cannot compile for them) - one engine runs per model, so its oldest
     card decides.  `cuda` (--cuda 12|13) overrides it; setup recommends, it does not refuse (the caller warns)."""
@@ -1595,6 +1595,9 @@ def cuda_choice(archs, cuda=None):
     if old:
         return 12, (f"sm_{old[0]} is older than CUDA 13 supports (it dropped Pascal and Volta): this model runs the "
                     "experimental CUDA 12 engine")
+    if driver and CUDA12_MIN_DRIVER <= int(driver) < MIN_DRIVER:      # #3843: a driver too old for CUDA 13 still runs the CUDA 12 engine
+        return 12, (f"the NVIDIA driver {driver} is older than CUDA 13 needs ({MIN_DRIVER}): this model runs the CUDA 12 engine "
+                    f"(it works with driver {CUDA12_MIN_DRIVER} or newer; a newer driver from https://www.nvidia.com/drivers gives the CUDA 13 engine)")
     return 13, None
 
 
@@ -8801,15 +8804,13 @@ def main() -> int:
         if multi:
             ok("GPUs: " + " + ".join(gpu_name(x) for x in chosen) + " together (the model's layers are split across them)")
         ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {cc(gpu)}, driver {gpu['driver']}")
-        cuda_tk, why = cuda_choice(gpu["archs"], a.cuda)   # one engine per model: its oldest card decides
+        cuda_tk, why = cuda_choice(gpu["archs"], a.cuda, driver_major(gpu))   # one engine per model: its oldest card decides
         if why:
             (warn if cuda_tk == 13 or str(a.cuda) == "12" else ok)(f"CUDA {cuda_tk}: {why}")
         min_driver = CUDA12_MIN_DRIVER if cuda_tk == 12 else MIN_DRIVER
         if driver_major(gpu) < min_driver:
             fail(f"the NVIDIA driver is too old ({gpu['driver']}; {min_driver} or newer is needed)",
-                 "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again" +
-                 ("" if cuda_tk == 12 else f" (or --cuda 12: the experimental CUDA 12 engine runs with driver "
-                                           f"{CUDA12_MIN_DRIVER} or newer, docs/OLDER_GPUS.md)"))
+                 "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again")
     if gpu["vram_gb"] < 11:
         warn("less than 12 GB of " + ("GPU memory (this APU's carve-out + shared memory)" if gpu.get("uma") else "VRAM")
              + ": Strata will run, but most experts stay on the CPU and it will be slow")
