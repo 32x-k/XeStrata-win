@@ -543,6 +543,9 @@ class Runner:
 
     # ---- 1. the engine
     def ensure_engine(self) -> None:
+        if self.multi_file():                                # DeepSeek: its own engine package (setup fetches it); the Strata engine is not used
+            self.emit("engine", "DeepSeek runs on its own engine package, so the Strata engine is not downloaded for it.", 100)
+            return
         self.emit("engine", "Checking the engine for this computer…")
         from strata_control import engine_component as ec
         root = Path(self.components_dir) if self.components_dir else None
@@ -947,7 +950,7 @@ class Runner:
         env.pop("STRATA_NEED_ENGINE", None)
         if self.engine_problem:
             env["STRATA_ALLOW_NO_ENGINE"] = "1"              # the person said go on: setup warns about the engine instead of stopping
-        else:
+        elif not self.multi_file():                          # (DeepSeek does not use the Strata engine: nothing to require)
             env["STRATA_NEED_ENGINE"] = "1"
         for k in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV"):
             env.pop(k, None)
