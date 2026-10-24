@@ -47,7 +47,7 @@ inline int tq_steps(int ggml_type) noexcept {
 /// Values per block of the trellis types, and bytes per block (2 + steps * bits / 8: 34, 26, 30, 42, 50, 58).
 constexpr int kTqBlock = 128;
 inline size_t tq_block_bytes(int ggml_type) noexcept {
-    return (size_t) (2 + tq_steps(ggml_type) * tq_kbits(ggml_type) / 8);
+    return 2u + (size_t) tq_steps(ggml_type) * (size_t) tq_kbits(ggml_type) / 8u;
 }
 /// The best ISA this CPU runs (capped by STRATA_TQ_ISA).
 TqIsa tq_isa();
