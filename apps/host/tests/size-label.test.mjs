@@ -12,4 +12,6 @@ test('engine sizes are decimal megabytes: 606,513,890 bytes is 607 MB, not 578',
   assert.equal(megabytes(581299508), 581);
   assert.equal(megabytes(1), 1);
   assert.equal(megabytes(0), 1);
+  // the same samples as tests/terminal/test_size_label.py: the Terminal and the app agree
+  for (const [bytes, expected] of [[606513890, 607], [581299508, 581], [1, 1], [0, 1], [999_999, 1], [1_500_000, 2], [2_499_999, 2]]) assert.equal(megabytes(bytes), expected, String(bytes));
 });

@@ -75,7 +75,7 @@ def _emit_factory(a, lines: list):
         if event.get("event") == "progress":
             pct = event.get("percent", 0)
             if sys.stdout.isatty():
-                print(f"\r  downloading {event.get('label', '')}: {pct}%  ({event['done'] / (1 << 20):.0f} of {event['total'] / (1 << 20):.0f} MiB)   ",
+                print(f"\r  downloading {event.get('label', '')}: {pct}%  ({event['done'] // 1_000_000} of {event['total'] // 1_000_000} MB)   ",
                       end="" if pct < 100 else "\n", flush=True)
             elif pct >= state["pct"] + 10 or pct == 100:
                 state["pct"] = pct
@@ -105,7 +105,8 @@ def _may_be_remembered(source) -> bool:
 
 
 def _mib(n: int | None) -> str:
-    return f"{(n or 0) / (1 << 20):.0f} MiB"
+    from strata_control.updater import megabytes
+    return f"{megabytes(n)} MB"
 
 
 def _line(name: str, result: dict) -> str:

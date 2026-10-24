@@ -51,6 +51,12 @@ STAGE_DIR = ".s"                 # staging is short on purpose: <components>\.s\
 SKEW_FREE_BYTES = 1.15
 
 
+def megabytes(n) -> int:
+    """Decimal megabytes (1 MB = 1,000,000 bytes), rounded half up, at least 1: the one figure for an engine's size in the Terminal, the app
+    (apps/host/src/lib/format.ts megabytes) and the release page. Both sides are tested on the same numbers."""
+    return max(1, int((n or 0) / 1_000_000 + 0.5))
+
+
 class UpdateError(RuntimeError):
     """An update step stopped. `exit_code` is the CLI's; the old engine is untouched unless the message says otherwise."""
 
@@ -482,7 +488,7 @@ def _download(ctx: Context, state_name: str, url_ref: str, size: int, sha256: st
             ctx.emit({"event": "progress", "phase": "download", "component": state_name, "label": label,
                       "done": done, "total": total, "percent": pct, "bytes_per_second": int(rate)})
 
-    ctx.say("download", f"Downloading {label} ({size / (1 << 20):.0f} MiB)", component=state_name)
+    ctx.say("download", f"Downloading {label} ({megabytes(size)} MB)", component=state_name)
     try:
         return transfer.download(feed.url(url_ref), partial, size=size, sha256=sha256, progress=progress, cancel=ctx.cancel)
     except transfer.Cancelled:
