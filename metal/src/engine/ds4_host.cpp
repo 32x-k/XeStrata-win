@@ -138,6 +138,15 @@ bool embed(const uint16_t* rows, int T, float* h, int dim, int hc, void*) {
     d.grid[2] = 1;
     d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
     strata::dsv41::metal_host::shared_cx().run({d});
+    if (std::getenv("DS4_DBG_EMBWRITE")) {
+        strata::dsv41::metal_host::shared_cx().flush_runs();
+        const float* f0 = (const float*) hh;
+        const uint16_t* r16 = (const uint16_t*) hrows;
+        std::fprintf(stderr, "DBG embwrite: h=%p rows=%p h_off=%zu rows_off=%zu\n", hh, hrows, dho, dro);
+        std::fprintf(stderr, "DBG embwrite: rows[0..3]=%04x %04x %04x %04x  h[0..3]=%g %g %g %g\n",
+                     (unsigned) r16[0], (unsigned) r16[1], (unsigned) r16[2], (unsigned) r16[3],
+                     f0[0], f0[1], f0[2], f0[3]);
+    }
     return true;
 }
 
