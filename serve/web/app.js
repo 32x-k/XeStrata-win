@@ -117,7 +117,7 @@ async function loadHealth() {
     $("tab-btn-images").hidden = !health.image_generation;
     $("img-note").hidden = !health.image_note;
     $("img-note").textContent = health.image_note || "";
-    imgDefaults();
+    imgModels();
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
     setTimeout(loadHealth, 2000);
@@ -1287,8 +1287,27 @@ function readAsDataURL(f) {
 $("img-size").onchange = () => { $("img-custom").hidden = $("img-size").value !== "custom"; };
 // the image model's defaults (/health's image_defaults, what the API gives a request that leaves a field out): the
 // fields' placeholders, the steps hidden where they are fixed (Turbo), the transparent background where it has one
+// the image models (/health's image_models, the default first): a choice where there are several, its defaults and
+// whether it edits; one with no edit model hides the reference images
+function imgModel() {
+  const ms = health.image_models || [];
+  return ms.find(m => m.id === $("img-model").value) || ms[0] || {defaults: health.image_defaults || {}, edits: true};
+}
+function imgModels() {
+  const ms = health.image_models || [], sel = $("img-model"), was = sel.value;
+  sel.replaceChildren(...ms.map(m => new Option(m.id, m.id)));
+  if (ms.some(m => m.id === was)) sel.value = was;
+  $("img-model-f").hidden = ms.length < 2;
+  imgDefaults();
+}
+$("img-model").onchange = () => {
+  if (!imgModel().edits) $("img-ref").value = "";
+  imgDefaults();
+  imgMaskSetup();
+};
 function imgDefaults() {
-  const d = health.image_defaults || {};
+  const d = imgModel().defaults || {};
+  $("img-ref-f").hidden = !imgModel().edits;
   const refs = ($("img-ref").files || []).length > 0;
   $("img-steps-f").hidden = !!d.steps_fixed;
   $("img-steps").min = d.steps_min || 1;
@@ -1300,7 +1319,7 @@ function imgDefaults() {
 }
 // whether the negative prompt is used: only with guidance above 1, and some models guide only with one
 function imgNegHint() {
-  const d = health.image_defaults || {};
+  const d = imgModel().defaults || {};
   const g = $("img-cfg").value !== "" ? Number($("img-cfg").value) : (d.guidance || 1);
   const neg = $("img-neg").value.trim() !== "";
   let msg = "";
@@ -1313,7 +1332,7 @@ function imgNegHint() {
 // where it is to change; sent as OpenAI's mask, a PNG of that size transparent where it was painted
 let imgMaskURL = null;
 function imgMaskSetup() {
-  const d = health.image_defaults || {};
+  const d = imgModel().defaults || {};
   const f = ($("img-ref").files || [])[0];
   if (imgMaskURL) URL.revokeObjectURL(imgMaskURL);
   imgMaskURL = null;
@@ -1374,6 +1393,7 @@ $("img-form").onsubmit = async (ev) => {
   const size = $("img-size").value === "custom" ? `${$("img-w").value}x${$("img-h").value}` : $("img-size").value;
   const refs = Array.from($("img-ref").files || []);
   const body = {prompt, size: size === "auto" && !refs.length ? "1024x1024" : size, response_format: "b64_json"};
+  if (!$("img-model-f").hidden) body.model = $("img-model").value;
   if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
   const neg = $("img-neg").value.trim();
   if (neg) body.negative_prompt = neg;
@@ -1400,7 +1420,8 @@ $("img-form").onsubmit = async (ev) => {
       img.alt = prompt;
       const cap = document.createElement("figcaption");
       const made = j.strata && j.strata.made_size ? ` (made at ${j.strata.made_size}, middle cut out)` : "";
-      cap.textContent = `${j.size}${made}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
+      const by = $("img-model-f").hidden ? "" : `${j.model}, `;
+      cap.textContent = `${by}${j.size}${made}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
       fig.append(img, cap);
       $("img-results").prepend(fig);
     }

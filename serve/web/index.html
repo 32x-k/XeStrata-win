@@ -93,6 +93,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
           <textarea class="st-input img-prompt" id="img-neg" rows="2" placeholder="What the image should not have&hellip;"></textarea></label>
         <span class="composer-hint" id="img-neg-hint" hidden></span>
         <div class="img-row">
+          <label class="st-field" id="img-model-f" hidden>Model
+            <select class="st-input" id="img-model"></select></label>
           <label class="st-field">Size
             <select class="st-input" id="img-size">
               <option>1024x1024</option><option>1536x1024</option><option>1024x1536</option>
@@ -103,7 +105,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
           <label class="st-field" id="img-custom" hidden>Width &times; height
             <span class="img-wh"><input class="st-input" id="img-w" type="number" min="256" max="2048" step="1" value="1024" aria-label="Width">
             <input class="st-input" id="img-h" type="number" min="256" max="2048" step="1" value="1024" aria-label="Height"></span></label>
-          <label class="st-field">Edit an image (optional)
+          <label class="st-field" id="img-ref-f">Edit an image (optional)
             <input class="st-input" id="img-ref" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" multiple></label>
           <label class="st-field" id="img-steps-f">Steps
             <input class="st-input" id="img-steps" type="number" min="1" max="100" step="1"></label>
