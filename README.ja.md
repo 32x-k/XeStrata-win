@@ -109,6 +109,7 @@ BETA の 4 つは、画像（読ませることも作ることも）にまだ対
 | Coder | **IQ1_M** | 58 GB | 32 GB | 速い。コードでは良く、ほかは弱い |
 | Gyro | **Gyro-S** | 58 GB | 36 GB（RAM と VRAM で 38 GB） | 遅い。2〜3 ビットの大きさより低い |
 | Gyro | **Gyro-M** | 92 GB | 43 GB（RAM と VRAM で 45 GB） | 遅い。IQ3_XXS くらい |
+| Gyro | **Gyro-L** | 108 GB | 59 GB（RAM と VRAM で 61 GB） | Gyro-M より遅い。Gyro の中でいちばん良い |
 | Gyro-Coder | **Gyro-Coder-L** | 84 GB | 35 GB（RAM と VRAM で 37 GB） | Gyro-M より遅い。コードでは良く、ほかは弱い |
 | Gyro-Coder | **Gyro-Coder** | 76 GB | 26 GB（RAM と VRAM で 28 GB） | Gyro-M くらいの速さ。Gyro-Coder-L より低い |
 | Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | RAM が約 80 GB より少ないと遅い。IQ3_S より良い |

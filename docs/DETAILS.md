@@ -270,13 +270,14 @@ The RAM is handled as for UD-Q4_K_XL: with less RAM than below, a RAM budget of 
 ./setup.sh --setup --family unsloth --model UD-Q5_K_XL
 ```
 
-### Or: Gyro-S and Gyro-M
+### Or: Gyro-S, Gyro-M and Gyro-L
 
 **[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)** is agentionai's quantization of the original model (upstream ba64156fd).
-Its experts are rotated by Hadamard matrices and stored in trellis formats (TQ2_T, TQK6, TQK7).
-In RAM alone, Gyro-S needs 36 GB and Gyro-M 43 GB. With less RAM it runs in the [low-RAM mode](#less-ram-than-the-model-the-low-ram-mode), where the experts the VRAM holds are not kept in RAM, so 38 GB and 45 GB of RAM and VRAM together are enough.
-The files hold the n-gram table too (read from the SSD), so the downloads are 58 GB and 92 GB.
+Its experts are rotated by Hadamard matrices and stored in trellis formats (TQ2_T, TQK6, TQK7; TQP5, TQP6 and TQP7 for Gyro-L).
+In RAM alone, Gyro-S needs 36 GB, Gyro-M 43 GB and Gyro-L 59 GB. With less RAM it runs in the [low-RAM mode](#less-ram-than-the-model-the-low-ram-mode), where the experts the VRAM holds are not kept in RAM, so 38 GB, 45 GB and 61 GB of RAM and VRAM together are enough.
+The files hold the n-gram table too (read from the SSD), so the downloads are 58 GB, 92 GB and 108 GB.
 Gyro-M is about IQ3_XXS's quality with about 20% less GPU memory.
+Gyro-L is the best of the Gyro sizes, and decodes slower than Gyro-M.
 Gyro-S is the smallest, of a lower quality than the 2- and 3-bit sizes, and Q2_0 decodes faster.
 Images work too. The model's license is Qwen3.8-Flash-Next's, the Qwen Community License 1.0.
 

@@ -260,13 +260,14 @@ RAM の扱いは UD-Q4_K_XL と同じで、RAM が下の目安より少なけれ
 ./setup.sh --setup --family unsloth --model UD-Q5_K_XL
 ```
 
-### Gyro-S と Gyro-M
+### Gyro-S、Gyro-M、Gyro-L
 
 **[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)** は、agentionai による元のモデルの量子化です（upstream ba64156fd）。
-エキスパートをアダマール行列で回し、trellis の形式（TQ2_T、TQK6、TQK7）で格納しています。
-RAM だけで動かすなら、Gyro-S は 36 GB、Gyro-M は 43 GB 要ります。RAM がそれより少なければ[省 RAM モード](#ram-がモデルより少ないとき省-ram-モード)になり、VRAM が持つエキスパートは RAM に置かないので、RAM と VRAM の合計で 38 GB と 45 GB あれば動きます。
-ファイルには n-gram の表も入っていて（SSD から読みます）、ダウンロードは 58 GB と 92 GB です。
+エキスパートをアダマール行列で回し、trellis の形式（TQ2_T、TQK6、TQK7、Gyro-L は TQP5、TQP6、TQP7）で格納しています。
+RAM だけで動かすなら、Gyro-S は 36 GB、Gyro-M は 43 GB、Gyro-L は 59 GB 要ります。RAM がそれより少なければ[省 RAM モード](#ram-がモデルより少ないとき省-ram-モード)になり、VRAM が持つエキスパートは RAM に置かないので、RAM と VRAM の合計で 38 GB、45 GB、61 GB あれば動きます。
+ファイルには n-gram の表も入っていて（SSD から読みます）、ダウンロードは 58 GB、92 GB、108 GB です。
 Gyro-M は IQ3_XXS くらいの品質で、GPU のメモリは約 20% 少なくて済みます。
+Gyro-L は Gyro の中でいちばん品質が高く、decode は Gyro-M より遅くなります。
 Gyro-S はいちばん小さく、品質は 2〜3 ビットの大きさより低く、decode は Q2_0 の方が速くなります。
 画像も使えます。モデルのライセンスは Qwen3.8-Flash-Next の Qwen Community License 1.0 です。
 

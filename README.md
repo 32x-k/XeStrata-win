@@ -113,6 +113,7 @@ The size: the same model, compressed more or less.
 | Coder | **IQ1_M** | 58 GB | 32 GB | fast; good at code, weaker elsewhere |
 | Gyro | **Gyro-S** | 58 GB | 36 GB (38 GB of RAM and VRAM) | slow; below the 2-3-bit sizes |
 | Gyro | **Gyro-M** | 92 GB | 43 GB (45 GB of RAM and VRAM) | slow; about IQ3_XXS |
+| Gyro | **Gyro-L** | 108 GB | 59 GB (61 GB of RAM and VRAM) | slower than Gyro-M; the best of the Gyro sizes |
 | Gyro-Coder | **Gyro-Coder-L** | 84 GB | 35 GB (37 GB of RAM and VRAM) | slower than Gyro-M; good at code, weaker elsewhere |
 | Gyro-Coder | **Gyro-Coder** | 76 GB | 26 GB (28 GB of RAM and VRAM) | about Gyro-M's speed; below Gyro-Coder-L |
 | Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | slow with less than about 80 GB of RAM; better than IQ3_S |
