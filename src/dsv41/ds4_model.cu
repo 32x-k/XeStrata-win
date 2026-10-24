@@ -559,6 +559,7 @@ struct Chunk {
     struct Item {
         int il = 0, k = 0, e = 0, v = 0, stage = -1;   // layer, chunk, expert, virtual slot, staging slot (-1: RAM)
         int mi = 0;                                    // the device's member index in the layer's group
+        bool direct = false;                           // (Metal) read straight into its ring slot: no staging, no DMA
         const uint8_t* src[3] = {nullptr, nullptr, nullptr};   // where its gate / up / down (its parts) lie once read
         const uint8_t* ram = nullptr;                  // its RAM-tier blob, copied into staging (not pinned there)
         uint8_t* keep = nullptr;                       // (layer-major) its layer-cache slot: what is read kept there
@@ -567,6 +568,7 @@ struct Chunk {
         std::atomic<bool> bad{false};
     };
     bool flow = false;
+    bool direct = false;                     // (Metal, unified memory) the flow reads the files straight into the ring
     int dev = -1;                            // the device (index into devs) this chunk state belongs to
     std::unique_ptr<IoQueue> io;
     std::deque<Item> items;                  // items[0] is item `base`; the indices below are absolute
@@ -2590,6 +2592,9 @@ struct Model::Impl {
                     if (!fl) continue;
                     cudaSetDevice(devs[di].id);
                     cp->flow = true;
+#if defined(STRATA_METAL)
+                    cp->direct = std::getenv("DS4_FLOW_DIRECT") == nullptr || std::atoi(std::getenv("DS4_FLOW_DIRECT")) != 0;
+#endif
                     cp->dev = (int) di;
                     cp->io = std::make_unique<IoQueue>(n_readers);
                     cp->stage_item.assign((size_t) cp->S, -1);
@@ -3109,6 +3114,13 @@ struct Model::Impl {
                 it.after = (int64_t) c.lc_first - 1;
             }
         }
+        if (c.direct && l.nm == 1 && !(in_ram && copy_mode)) {   // (the ring slot is the destination: filled by flow_pump when its turn comes)
+            it.direct = true;
+            it.stage = -1;
+            it.left.store(3, std::memory_order_relaxed);
+            ++(in_ram ? c.it_ram : hit ? c.it_lc : c.it_file);
+            return;
+        }
         it.stage = (int) (c.n_file++ % (uint64_t) c.S);
         uint8_t* sb = c.stage + (size_t) it.stage * c.stage_stride;
         for (int r = 0; r < 3; ++r) {
@@ -3231,7 +3243,38 @@ struct Model::Impl {
                 }
                 if (wait) break;
             }
-            if (it.stage >= 0) {
+            if (it.direct) {
+                const size_t R = (size_t) c.ring_n, r = c.n_read % R;
+                if (c.n_read >= R) {   // the slot's last use has to be computed - and finished: the CPU writes it
+                    if (c.n_comp <= c.n_read - R) break;
+                    CK(cudaEventSynchronize(c.ring_free[r]));
+                }
+                const Layer& l = L[(size_t) it.il];
+#if defined(STRATA_METAL)
+                uint8_t* dst = (uint8_t*) strata::gpu::host_view(c.ring + r * c.ring_stride);   // (device addresses are the GPU's: the CPU writes through the host view)
+#else
+                uint8_t* dst = c.ring + r * c.ring_stride;
+#endif
+                const x3::ExpertLayout& lay = l.lay;
+                int nj = 0;
+                for (int q = 0; q < 3; ++q) {
+                    IoQueue::Job& j = jobs[nj++];
+                    j = IoQueue::Job{};
+                    const os::fd_t pf = pk.pfds.empty() ? os::kBadFd : pk.pfds[(size_t) l.mx_file[q]];
+                    j.fd = pf != os::kBadFd ? pf : pk.fds[(size_t) l.mx_file[q]];
+                    j.dfd = pk.dfds.empty() ? os::kBadFd : pk.dfds[(size_t) l.mx_file[q]];
+                    j.off = l.mx_off[q] + (uint64_t) it.e * l.mx_stride[q];
+                    j.len = mx_part_bytes(l, q);
+                    j.dst = dst + lay.trellis[q];
+                    j.exact = true;
+                    j.left = &it.left;
+                    j.bad = &it.bad;
+                    j.mem = it.ram != nullptr ? it.ram + lay.trellis[q] : nullptr;
+                    j.map = pk.at(l.mx_file[q], j.off);
+                    j.keep = it.keep != nullptr ? it.keep + lay.trellis[q] : nullptr;
+                }
+                c.io->push(jobs, nj);
+            } else if (it.stage >= 0) {
                 const int64_t prev = c.stage_item[(size_t) it.stage];
                 if (prev >= 0) {
                     if ((size_t) prev >= c.n_dma) break;
@@ -3298,6 +3341,12 @@ struct Model::Impl {
             const Layer& l = L[(size_t) it.il];
             uint8_t* dst = c.ring + r * c.ring_stride;
             const x3::ExpertLayout& lay = l.nm > 1 ? l.hlay : l.lay;
+            if (it.direct) {   // (already in the slot)
+                CK(cudaEventRecord(c.ring_fill[r], c.cs));
+                c.stream_bytes += (double) unit(l);
+                ++c.n_dma;
+                continue;
+            }
             for (int p = 0; p < 2; ++p)
                 CK(cudaMemcpyAsync(dst + lay.trellis[p], it.src[p], mx_read_len(l, p), cudaMemcpyHostToDevice, c.cs));
             if (l.nm > 1) {   // (the down's part: in each of its rows the member's blocks)
@@ -7639,7 +7688,11 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         // (an EXL3 head: as many activations at a time as its split-K partials fit the scratch - 8 for a shared head, 4
         // for a whole one, each pass reading the whole share; a GGUF's: 4 at a time, as before)
+#if defined(STRATA_METAL)
+        const int per = d.head.fmt != 0 ? 8 : std::max(1, x3::mv_cols(d.head));   // (the matvec kernels take 8 columns in one pass over the head)
+#else
         const int per = d.head.fmt != 0 ? 4 : std::max(1, x3::mv_cols(d.head));
+#endif
         for (int c = 0; c < rows; c += per)
             if (!mv(d, {job(d.head, xn + (size_t) c * D, out + (size_t) c * ld, std::min(per, rows - c), D, ld)}, err))
                 return false;
