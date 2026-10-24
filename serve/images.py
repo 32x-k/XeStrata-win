@@ -670,6 +670,14 @@ class ImageEngine:
             elif got.startswith("ERROR"):
                 raise ImageJobFailed(got[6:] or "the image engine failed")
 
+    def stop_daemon(self) -> bool:
+        """End this model's daemon and its engine, connected or left running by an earlier server -> whether there
+        was one."""
+        if self.f is None and not self._connect(daemon_address(self.command(), self.env)):
+            return False
+        self.close(shutdown=True)
+        return True
+
     def close(self, shutdown: bool = False) -> None:
         """Leave the daemon (it stays for the next server); `shutdown`: end it and its engine."""
         f, sock, self.f, self.sock = self.f, self.sock, None, None
@@ -872,6 +880,11 @@ class ImageGen:
         with self.lock:
             self.engine.close(shutdown)
 
+    def stop_engine(self) -> bool:
+        """End this model's engine (and a daemon an earlier server left for it), freeing its VRAM -> whether one ran."""
+        with self.lock:
+            return self.engine.stop_daemon()
+
     def run(self, job: dict, cancel: threading.Event | None = None) -> tuple[list[bytes], dict]:
         """Make `job`'s images (parse_request's dict) -> (the PNG files' bytes in order, figures).  The caller holds
         the GPU turn.  ImageJobFailed when the engine fails, times out or the job is cancelled."""
@@ -1021,6 +1034,61 @@ class ImageGen:
         if self.last:
             out["last"] = self.last
         return out
+
+
+class ImageModels:
+    """The config's image models: its "images" section (the default) and those of "image_models", one engine on the
+    GPU at a time.  A request names its model by "model" (pick: an unknown name or none is the default's, as OpenAI's
+    clients send their own); a job for another model than the last one's ends that one's engine first, in the GPU's
+    turn (gpu_turn), and the first job ends what daemons an earlier server left for the others.  Anything else is
+    the model of the last job's (the Monitor's, /v1/status)."""
+
+    def __init__(self, cfgs: list[dict], log=None, env: dict | None = None):
+        self.gens: dict[str, ImageGen] = {}
+        for c in cfgs:
+            g = ImageGen(c, log=log, env=env)
+            if g.model in self.gens:
+                raise ValueError(f'two image models are named {g.model!r} ("images" and "image_models")')
+            self.gens[g.model] = g
+        self.default = self.current = next(iter(self.gens.values()))
+        self.swept = len(self.gens) == 1           # the other models' daemons ended once (an earlier server's)
+
+    def __getattr__(self, name):
+        return getattr(self.current, name)
+
+    def pick(self, name) -> ImageGen:
+        return self.gens.get(name, self.default) if isinstance(name, str) else self.default
+
+    def activate(self, gen: ImageGen) -> None:
+        """Make `gen` the model on the GPU: the others' engines ended (the caller holds the GPU's turn)."""
+        if gen is self.current and self.swept:
+            return
+        for g in self.gens.values():
+            if g is not gen and g.stop_engine():
+                gen._say(f"image model: {g.model}'s engine ended for {gen.model}")
+        self.current, self.swept = gen, True
+
+    def missing(self) -> list[str]:
+        return [f for g in self.gens.values() for f in g.missing()]
+
+    def recent(self) -> list[dict]:
+        """The jobs that ended, every model's, oldest first."""
+        return sorted((r for g in self.gens.values() for r in g.recent()), key=lambda r: r.get("time", 0))
+
+    def status(self) -> dict:
+        return {**self.current.status(), "models": list(self.gens), "default": self.default.model}
+
+    def file(self, name: str) -> Path | None:
+        return next((f for g in self.gens.values() if (f := g.file(name)) is not None), None)
+
+    def close(self, shutdown: bool = False) -> None:
+        for g in self.gens.values():
+            g.close(shutdown)
+
+    def models(self) -> list[dict]:
+        """Each model's name, defaults and whether it edits (the web page's choice), the default first."""
+        return [{"id": g.model, "defaults": g.defaults(), "edits": bool(g.cfg.get("vision"))}
+                for g in self.gens.values()]
 
 
 # ------------------------------------------------------------------------------------------- chat's image tools
@@ -1203,6 +1271,8 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
             with svc.status_lock:
                 svc.status["queued"] -= 1
             queued = False
+            if isinstance(getattr(svc, "images", None), ImageModels):
+                svc.images.activate(gen)
             gen.begin(job)
             ctl = getattr(svc.engine, "ctl", None) if getattr(svc.engine, "batch", 0) else None
             if ctl is not None:

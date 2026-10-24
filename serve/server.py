@@ -3298,7 +3298,7 @@ class Service:
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
-        self.images: Any = None                           # serve/images.py's ImageGen when the config has "images"
+        self.images: Any = None                           # serve/images.py's ImageModels when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = stop_token_ids(tokenizer)
         if hasattr(engine, "eos_ids"):
@@ -5774,7 +5774,8 @@ def make_handler(svc: Service):
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
                                  "image_note": svc.images.note() if svc.images is not None else None,
-                                 "image_defaults": svc.images.defaults() if svc.images is not None else None,
+                                 "image_defaults": svc.images.default.defaults() if svc.images is not None else None,
+                                 "image_models": svc.images.models() if svc.images is not None else None,
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path == "/update":                         # whether a newer release is out (About > Updates)
                 if not self._authorized():
@@ -5822,9 +5823,10 @@ def make_handler(svc: Service):
                         model["aliases"] = list(svc.aliases)
                     data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
                     data = data if loaded else []
-                    if svc.images is not None:            # the image model: POST /v1/images/generations
-                        data.append({"id": svc.images.model, "object": "model", "status": {"value": "loaded"},
-                                     "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
+                    if svc.images is not None:            # the image models: POST /v1/images/generations
+                        data += [{"id": m["id"], "object": "model", "status": {"value": "loaded"},
+                                  "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}}
+                                 for m in svc.images.models()]
                     self._json(200, {"object": "list", "data": data})
             elif path == "/props":
                 if self._authorized():
@@ -6039,11 +6041,11 @@ def make_handler(svc: Service):
 
         def _images(self, req):
             """POST /v1/images/generations (serve/images.py): one image job in the GPU's turn."""
-            gen = svc.images
-            if gen is None:
+            if svc.images is None:
                 self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
                                            "message": images_api.not_set_up_message()}})
                 return
+            gen = svc.images.pick(req.get("model"))             # the image model it names, else the default
             job = images_api.parse_request(req, gen.cfg)        # ImageRequestError (a ValueError): 400
             self._image_job(gen, job)
 
@@ -6052,8 +6054,7 @@ def make_handler(svc: Service):
             or image[]), or JSON (images: [{"image_url": ...}], or image: a URL or a list), one image job in the GPU's
             turn.  The images are read as a chat's are (data: URLs, http(s) URLs, local paths; formats stb_image does
             not read converted to PNG)."""
-            gen = svc.images
-            if gen is None:
+            if svc.images is None:
                 self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
                                            "message": images_api.not_set_up_message()}})
                 return
@@ -6089,6 +6090,7 @@ def make_handler(svc: Service):
                         raise ValueError("mask: {\"image_url\": a data: URL, an http(s) URL or a path}")
                     self._no_local_sources([mask])
                     mask = svc.download(mask) if mask.startswith(("http://", "https://")) else Vision.load(mask)
+            gen = svc.images.pick(req.get("model"))             # the image model it names, else the default
             job = images_api.parse_edit_request(req, [Vision.normalize(d, keep_alpha=True) for d in files], gen.cfg,
                                                 mask)
             self._image_job(gen, job)
@@ -6347,7 +6349,7 @@ def make_handler(svc: Service):
                 if extra:
                     hubs.append(svc.mcp)
             if req.get("strata_images") is True and svc.images is not None:   # opt-in: the image tools
-                image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
+                image_tools = images_api.ImageTools(svc, svc.images.default, messages, Vision.load,
                                                     lambda d: Vision.normalize(d, keep_alpha=True))
                 more = image_tools.template_tools(exclude=own | {t["name"] for t in extra})
                 if more:
@@ -6532,7 +6534,7 @@ def make_handler(svc: Service):
             if "image_generation" in skipped and svc.images is not None and req.get("tool_choice") != "none":
                 spec = next((t for t in req.get("tools") or [] if isinstance(t, dict)
                              and t.get("type") == "image_generation"), {})
-                self.image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
+                self.image_tools = images_api.ImageTools(svc, svc.images.default, messages, Vision.load,
                                                          lambda d: Vision.normalize(d, keep_alpha=True),
                                                          spec)
                 tools = (tools or []) + self.image_tools.template_tools(exclude={t["name"] for t in tools or []})
@@ -7468,22 +7470,28 @@ def main() -> int:
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
-        icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
-                    if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
-                    and not os.path.isabs(v) else v)
-                for k, v in cfg["images"].items()}
+        # the default image model ("images") and the others a request can name ("image_models")
+        extra = cfg.get("image_models") or []
+        if not isinstance(extra, list) or not all(isinstance(m, dict) for m in extra):
+            raise SystemExit('[strata] config: "image_models" must be a list of "images" sections')
+        icfgs = [{k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                      if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
+                      and not os.path.isabs(v) else v)
+                  for k, v in section.items()} for section in [cfg["images"], *extra]]
         try:
             ilog = open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None
             # the text engine's environment: the same GPU (STRATA_GPU_PCI, CUDA_VISIBLE_DEVICES) and libraries
-            svc.images = images_api.ImageGen(icfg, log=ilog, env=child_env(cfg))
+            svc.images = images_api.ImageModels(icfgs, log=ilog, env=child_env(cfg))
         except ValueError as e:
             raise SystemExit(f"[strata] config: {e}")
         gone = svc.images.missing()
         if gone:
             print(f"[strata] image generation: missing {', '.join(gone)} - requests fail until setup --images has run "
                   "again", flush=True)
-        print(f"[strata] image generation: {svc.images.model} {icfg.get('quant') or ''} on strata-image "
-              f"(POST /v1/images/generations; GPU policy {svc.images.policy})", flush=True)
+        for g in svc.images.gens.values():
+            print(f"[strata] image generation: {g.model} {g.cfg.get('quant') or ''} on strata-image "
+                  f"(POST /v1/images/generations{'' if g is svc.images.default else ', model ' + g.model}; "
+                  f"GPU policy {g.policy})", flush=True)
         if svc.images.note():
             print(f"[strata] image generation: {svc.images.note()}", flush=True)
         import atexit
