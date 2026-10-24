@@ -264,7 +264,7 @@ RAM の扱いは UD-Q4_K_XL と同じで、RAM が下の目安より少なけれ
 
 **[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)** は、agentionai による元のモデルの量子化です（upstream ba64156fd）。
 エキスパートをアダマール行列で回し、trellis の形式（TQ2_T、TQK6、TQK7）で格納しています。
-要るメモリは VRAM と RAM の合計で、Gyro-S は 27.6 GB、Gyro-M は 35 GB です。
+RAM だけで動かすなら、Gyro-S は 36 GB、Gyro-M は 43 GB 要ります。RAM がそれより少なければ[省 RAM モード](#ram-がモデルより少ないとき省-ram-モード)になり、VRAM が持つエキスパートは RAM に置かないので、RAM と VRAM の合計で 38 GB と 45 GB あれば動きます。
 ファイルには n-gram の表も入っていて（SSD から読みます）、ダウンロードは 58 GB と 92 GB です。
 Gyro-M は IQ3_XXS くらいの品質で、GPU のメモリは約 20% 少なくて済みます。
 Gyro-S はいちばん小さく、品質は 2〜3 ビットの大きさより低く、decode は Q2_0 の方が速くなります。
@@ -279,7 +279,7 @@ Gyro-S はいちばん小さく、品質は 2〜3 ビットの大きさより低
 **[Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)** は、agentionai によるコード向けの版です。
 各層 512 個のエキスパートのうち、コードに効く 256 個を残し（1 トークンで使うのは 10 個のまま）、Gyro と同じくアダマール行列で回して trellis の形式で格納しています。
 Gyro-Coder-L のエキスパートは 1 ステップで重み 2 つを決める TQP5、TQP6、TQP7（重み 1 個あたり約 3.2 ビット）、Gyro-Coder は TQ2_T（約 2.1 ビット）です。
-要るメモリは VRAM と RAM の合計で、Gyro-Coder-L は 27.5 GB、Gyro-Coder は 19.9 GB です。
+RAM だけで動かすなら、Gyro-Coder-L は 35 GB、Gyro-Coder は 26 GB 要ります。Gyro と同じく、RAM がそれより少なければ[省 RAM モード](#ram-がモデルより少ないとき省-ram-モード)になり、RAM と VRAM の合計で 37 GB と 28 GB あれば動きます。
 ファイルには n-gram の表も入っていて（SSD から読みます）、ダウンロードは 84 GB と 76 GB です。
 2 つは同じエキスパートを残しているので、XeStrata は 1 つのエキスパートの順位（`data/expert-profile-gyro-coder.bin`）を同梱しています。コードの依頼の答えのルーティングから作ったものです。
 コード以外の依頼では弱くなります。画像も使えます（画像のエンコーダーは元のモデルのものです）。モデルのライセンスは Qwen Community License 1.0 です。

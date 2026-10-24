@@ -274,7 +274,7 @@ The RAM is handled as for UD-Q4_K_XL: with less RAM than below, a RAM budget of 
 
 **[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)** is agentionai's quantization of the original model (upstream ba64156fd).
 Its experts are rotated by Hadamard matrices and stored in trellis formats (TQ2_T, TQK6, TQK7).
-The memory it needs is VRAM and RAM together: 27.6 GB for Gyro-S, 35 GB for Gyro-M.
+In RAM alone, Gyro-S needs 36 GB and Gyro-M 43 GB. With less RAM it runs in the [low-RAM mode](#less-ram-than-the-model-the-low-ram-mode), where the experts the VRAM holds are not kept in RAM, so 38 GB and 45 GB of RAM and VRAM together are enough.
 The files hold the n-gram table too (read from the SSD), so the downloads are 58 GB and 92 GB.
 Gyro-M is about IQ3_XXS's quality with about 20% less GPU memory.
 Gyro-S is the smallest, of a lower quality than the 2- and 3-bit sizes, and Q2_0 decodes faster.
@@ -289,7 +289,7 @@ Images work too. The model's license is Qwen3.8-Flash-Next's, the Qwen Community
 **[Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)** is agentionai's version for code.
 Each layer keeps 256 of its 512 experts, the ones code needs (a token still uses 10), rotated by Hadamard matrices and stored in trellis formats as Gyro's are.
 Gyro-Coder-L's experts are TQP5, TQP6 and TQP7, which set two weights a step (about 3.2 bits a weight); Gyro-Coder's are TQ2_T (about 2.1 bits).
-The memory it needs is VRAM and RAM together: 27.5 GB for Gyro-Coder-L, 19.9 GB for Gyro-Coder.
+In RAM alone, Gyro-Coder-L needs 35 GB and Gyro-Coder 26 GB. As for Gyro, with less RAM it runs in the [low-RAM mode](#less-ram-than-the-model-the-low-ram-mode), and 37 GB and 28 GB of RAM and VRAM together are enough.
 The files hold the n-gram table too (read from the SSD), so the downloads are 84 GB and 76 GB.
 The two keep the same experts, so XeStrata ships one expert profile for them (`data/expert-profile-gyro-coder.bin`), made from the routing of answers to coding requests.
 It is weaker outside code. Images work too (with the original model's image encoder). The model's license is the Qwen Community License 1.0.

@@ -42,7 +42,7 @@ GPU の計算を CUDA から SYCL と Level Zero に書き直し、同じコー�
 | --- | --- |
 | GPU | Intel Arc（A シリーズ、B シリーズ）、AMD Radeon（RDNA2 以降、[AMD の GPU](#amd-の-gpu)）か、NVIDIA の GPU（Pascal 以降。Tensor Core のない Pascal は遅い経路で動きます）。VRAM は 12 GB 以上を勧めます（それより少なくても動きますが、遅くなります）。 |
 | CPU | x86-64 で AVX2 があるもの。AVX-512（F、BW、VL、VNNI、VBMI）があれば、CPU の計算に AVX-512 を使います。 |
-| RAM | ふつうは 32〜62 GB（[モデルの選び方](#モデルの選び方)）。いちばん小さな Gyro-Coder は RAM と VRAM の合計で 20 GB、大きな版は 100 GB 以上です。 |
+| RAM | ふつうは 32〜62 GB（[モデルの選び方](#モデルの選び方)）。いちばん小さな Gyro-Coder は 26 GB（VRAM が補えば RAM と VRAM の合計で 28 GB）、大きな版は 100 GB 以上です。 |
 | ディスク | モデルに 60〜110 GB ほど（大きな版は 190 GB まで）、ほかに MTP 層に約 5 GB。SSD（NVMe）を強く勧めます。 |
 | OS | Linux（パッケージは Ubuntu 26.04 と Fedora 44 向け。ほかのディストリビューションでは [Podman](#podman) か[ソースから](docs/BUILD.ja.md#ソースから入れる)）、Windows 10 と 11（x64、[Windows](#windows)）。WSL 2 は動くかもしれません（プルリクエスト歓迎）。 |
 | BIOS | 単体の GPU では Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
@@ -83,7 +83,7 @@ AMD の GPU では、prefill の密な行列積をディストリビューショ
 ## モデルの選び方
 
 **迷ったら、`xestrata --setup` の質問で Enter を押してください。** 元の Qwen3.8-Flash-Next の **Q2_0** を選び、RAM が 60 GB 以上なら **IQ3_XXS** を選びます（Ryzen AI Max で RAM が 80 GB 以上なら UD-IQ4_XS）。
-RAM がそれより少ない PC では、Coder（32 GB）、Gyro（RAM と VRAM の合計で 28 GB から）、Gyro-Coder（20 GB から）、BETA のモデルが選べます。
+RAM がそれより少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM と VRAM の合計なら 38 GB から）、Gyro-Coder（26 GB、合計なら 28 GB から）、BETA のモデルが選べます。
 あとから別のモデルを足すときも `xestrata --setup` を実行します。
 
 | モデル | パラメーター | RAM の目安 | 向いていること |
@@ -107,10 +107,10 @@ BETA の 4 つは、画像（読ませることも作ることも）にまだ対
 | 元のモデル、Swift 1.5 | **IQ3_XXS** | 76 GB | 60 GB | 遅め。とても良い |
 | 元のモデル、Swift 1.5 | **IQ3_S** | 84 GB | 62 GB | 遅い。元のモデルと同等 |
 | Coder | **IQ1_M** | 58 GB | 32 GB | 速い。コードでは良く、ほかは弱い |
-| Gyro | **Gyro-S** | 58 GB | RAM と VRAM で 28 GB | 遅い。2〜3 ビットの大きさより低い |
-| Gyro | **Gyro-M** | 92 GB | RAM と VRAM で 35 GB | 遅い。IQ3_XXS くらい |
-| Gyro-Coder | **Gyro-Coder-L** | 84 GB | RAM と VRAM で 28 GB | Gyro-M より遅い。コードでは良く、ほかは弱い |
-| Gyro-Coder | **Gyro-Coder** | 76 GB | RAM と VRAM で 20 GB | Gyro-M くらいの速さ。Gyro-Coder-L より低い |
+| Gyro | **Gyro-S** | 58 GB | 36 GB（RAM と VRAM で 38 GB） | 遅い。2〜3 ビットの大きさより低い |
+| Gyro | **Gyro-M** | 92 GB | 43 GB（RAM と VRAM で 45 GB） | 遅い。IQ3_XXS くらい |
+| Gyro-Coder | **Gyro-Coder-L** | 84 GB | 35 GB（RAM と VRAM で 37 GB） | Gyro-M より遅い。コードでは良く、ほかは弱い |
+| Gyro-Coder | **Gyro-Coder** | 76 GB | 26 GB（RAM と VRAM で 28 GB） | Gyro-M くらいの速さ。Gyro-Coder-L より低い |
 | Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | RAM が約 80 GB より少ないと遅い。IQ3_S より良い |
 | Unsloth（実験的） | **UD-Q4_K_XL** | 111 GB | 48 GB | RAM 64 GB の PC では遅い。さらに良い |
 | Unsloth（実験的） | **UD-Q5_K_XL**、**UD-Q6_K_XL**、**Q8_0** | 158〜188 GB | 108〜136 GB | RAM の多い PC 向け。Q8_0 が元のモデルにいちばん近い |
@@ -118,8 +118,8 @@ BETA の 4 つは、画像（読ませることも作ることも）にまだ対
 - **元のモデル**: Qwen の [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) を、ISTA-DASLab が[圧縮](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)したものです。
 - **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)**: UkisAI による調整版です。答える前の思考が短く、答えが早く出ます。品質はほぼ同じです。
 - **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)**: ISTA-DASLab によるコード向けの版です。エキスパートが半分なので、コード以外や、英語以外の言語では弱くなります。
-- **[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)**: agentionai による、メモリの少ない PC 向けの量子化です。要るメモリは RAM と VRAM の合計です。
-- **[Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)**: agentionai によるコード向けの版です。エキスパートを半分にし、Gyro の形式で量子化しています。コード以外では弱くなります。要るメモリは RAM と VRAM の合計です。
+- **[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)**: agentionai による、メモリの少ない PC 向けの量子化です。RAM が足りなければ、VRAM が補います（括弧の中の、RAM と VRAM の合計）。
+- **[Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)**: agentionai によるコード向けの版です。エキスパートを半分にし、Gyro の形式で量子化しています。コード以外では弱くなります。RAM が足りなければ、Gyro と同じく VRAM が補います。
 - **[Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**: 元のモデルの 4〜8 ビットの版です。RAM に入りきらないエキスパートは、答えている間に SSD から読みます。
   UD-Q4_K_XL より大きなものは実験的で、XeStrata では動かしていません。
 - **[huihui-ai の abliterated 版](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)**: Swift 1.5（IQ2_XS、IQ3_XXS）と Unsloth（UD-IQ4_XS、UD-Q4_K_XL、Q8_0）から拒否の方向を取り除いた版です。
