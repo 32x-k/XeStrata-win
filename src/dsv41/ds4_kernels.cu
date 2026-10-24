@@ -2196,10 +2196,26 @@ void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, i
     strata_ds4_launch(ext_to_ring_kernel, T, kThreads, 0, s, ext, ring, (long long) p0, n, T, d, backup);
 }
 void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    {   // (row copies on the context queue: the drafter's rollback is a few rows)
+        const size_t rb = kv_row_bytes(kKvFp8, d);
+        for (int t = keep; t < T; ++t) cudaMemcpyAsync(ring + (size_t) ((p0 + t) % n) * rb, backup + (size_t) t * rb, rb, cudaMemcpyDeviceToDevice, s);
+        return;
+    }
+#endif
     if (T > keep)
         strata_ds4_launch(ring_restore_kernel, T - keep, kThreads, 0, s, ring, backup, (long long) p0, n, keep, kv_row_bytes(kKvFp8, d));
 }
 void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    {
+        const size_t rb = kv_row_bytes(kKvFp8, d);
+        for (int li = 0; li < b.n; ++li)
+            for (int t = keep; t < T; ++t)
+                cudaMemcpyAsync(b.ring[li] + (size_t) ((p0 + t) % n) * rb, b.bak[li] + (size_t) t * rb, rb, cudaMemcpyDeviceToDevice, s);
+        return;
+    }
+#endif
     if (T > keep && b.n > 0)
         strata_ds4_launch(ring_restore_batch_kernel, dim3(T - keep, b.n), kThreads, 0, s, b, (long long) p0, n, keep,
                                                                              kv_row_bytes(kKvFp8, d));

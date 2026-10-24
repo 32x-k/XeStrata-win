@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <string>
 #include <deque>
+#include <mach/mach_time.h>
 #include <map>
 #include <thread>
 #include <cstdio>
@@ -66,8 +67,150 @@ static inline id<MTLBuffer> BO(const Buffer& b, size_t off, size_t& o) {
 static inline id<MTLComputePipelineState> P(const Pipeline* p) { return (__bridge id<MTLComputePipelineState>)p->handle; }
 static std::string g_device_name = "unknown GPU";
 
+
+// ---- DS4_TIMELINE=1: every deferred dispatch in its own encoder with start / end GPU timestamps; the report at exit gives, per kernel,
+// its GPU time and the gap the GPU sat idle before it (host waits, event waits, launch).  DS4_TL_FROM=N: only from dispatch N on.
+static std::atomic<uint64_t> g_disp_count{0};   // dispatches encoded
+namespace {
+struct Timeline {
+    bool on = false;
+    id<MTLCounterSet> tset = nil;
+    std::vector<id<MTLCounterSampleBuffer>> bufs;   // a sample buffer holds only ~1500 encoders: they rotate
+    size_t per = 0, cap = 0, n = 0;        // encoders per buffer / in all (the buffers' limit) / recorded
+    long after = 0;                        // DS4_TL_AFTER: record from the Nth dispatch on
+    std::vector<std::string> names;        // per encoder
+    uint64_t cpu0 = 0, gpu0 = 0;
+    bool reg = false;
+    bool att = false;                      // the encoder just made carries a sample slot
+} g_tl;
+
+id<MTLComputeCommandEncoder> tl_make_encoder(id<MTLDevice> dev, id<MTLCommandBuffer> cb, MTLDispatchType dt) {
+    g_tl.att = false;
+    if (!g_tl.on) return [cb computeCommandEncoderWithDispatchType:dt];
+    if (g_tl.tset == nil) {
+        for (id<MTLCounterSet> cs in dev.counterSets)
+            if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) g_tl.tset = cs;
+        if (g_tl.tset == nil) {
+            std::fprintf(stderr, "mtl: DS4_TIMELINE: no timestamp counter set\n");
+            g_tl.on = false;
+            return [cb computeCommandEncoderWithDispatchType:dt];
+        }
+        for (size_t c = 4096; c >= 64 && g_tl.per == 0; c /= 2) {
+            MTLCounterSampleBufferDescriptor* d = [MTLCounterSampleBufferDescriptor new];
+            d.counterSet = g_tl.tset;
+            d.storageMode = MTLStorageModeShared;
+            d.sampleCount = c * 2;
+            NSError* err = nil;
+            id<MTLCounterSampleBuffer> b = [dev newCounterSampleBufferWithDescriptor:d error:&err];
+            if (b != nil) {
+                g_tl.per = c;
+                g_tl.bufs.push_back(b);
+            }
+        }
+        if (g_tl.per == 0) {
+            std::fprintf(stderr, "mtl: DS4_TIMELINE: no counter sample buffer\n");
+            g_tl.on = false;
+            return [cb computeCommandEncoderWithDispatchType:dt];
+        }
+        g_tl.cap = g_tl.per * 120;
+        MTLTimestamp c0 = 0, g0 = 0;
+        [dev sampleTimestamps:&c0 gpuTimestamp:&g0];
+        g_tl.cpu0 = c0;
+        g_tl.gpu0 = g0;
+        g_tl.names.assign(g_tl.cap, std::string());
+        g_tl.after = std::getenv("DS4_TL_AFTER") ? std::atol(std::getenv("DS4_TL_AFTER")) : 0;
+    }
+    if (g_tl.n >= g_tl.cap || (long) g_disp_count.load() < g_tl.after) return [cb computeCommandEncoderWithDispatchType:dt];
+    const size_t bi = g_tl.n / g_tl.per, si = g_tl.n % g_tl.per;
+    if (bi >= g_tl.bufs.size()) {
+        MTLCounterSampleBufferDescriptor* d = [MTLCounterSampleBufferDescriptor new];
+        d.counterSet = g_tl.tset;
+        d.storageMode = MTLStorageModeShared;
+        d.sampleCount = g_tl.per * 2;
+        NSError* err = nil;
+        id<MTLCounterSampleBuffer> b = [dev newCounterSampleBufferWithDescriptor:d error:&err];
+        if (b == nil) {
+            g_tl.cap = g_tl.n;
+            return [cb computeCommandEncoderWithDispatchType:dt];
+        }
+        g_tl.bufs.push_back(b);
+    }
+    MTLComputePassDescriptor* pd = [MTLComputePassDescriptor computePassDescriptor];
+    pd.dispatchType = dt;
+    pd.sampleBufferAttachments[0].sampleBuffer = g_tl.bufs[bi];
+    pd.sampleBufferAttachments[0].startOfEncoderSampleIndex = 2 * si;
+    pd.sampleBufferAttachments[0].endOfEncoderSampleIndex = 2 * si + 1;
+    g_tl.att = true;
+    return [cb computeCommandEncoderWithDescriptor:pd];
+}
+
+void tl_report(id<MTLDevice> dev) {
+    if (!g_tl.on && g_tl.bufs.empty()) return;
+    const size_t n = std::min(g_tl.n, g_tl.cap);
+    if (n < 2) return;
+    std::vector<MTLCounterResultTimestamp> tsv(2 * n);
+    for (size_t b = 0; b * g_tl.per < n; ++b) {
+        const size_t cnt = std::min(g_tl.per, n - b * g_tl.per);
+        NSData* data = [g_tl.bufs[b] resolveCounterRange:NSMakeRange(0, 2 * cnt)];
+        if (data == nil) { std::fprintf(stderr, "mtl: DS4_TIMELINE: resolve failed\n"); return; }
+        std::memcpy(&tsv[2 * b * g_tl.per], [data bytes], 2 * cnt * sizeof(MTLCounterResultTimestamp));
+    }
+    const MTLCounterResultTimestamp* ts = tsv.data();
+    MTLTimestamp c1 = 0, g1 = 0;
+    [dev sampleTimestamps:&c1 gpuTimestamp:&g1];
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    const double cpu_ns_per_tick = (double) tb.numer / (double) tb.denom;
+    (void) cpu_ns_per_tick;   // (sampleTimestamps' CPU value is in ns already)
+    const double ns_per_gpu = (g1 > g_tl.gpu0) ? (double) (c1 - g_tl.cpu0) / (double) (g1 - g_tl.gpu0) : 1.0;
+    std::fprintf(stderr, "timeline: cap %zu n %zu scale %.6f ns/tick first ts %llu %llu last %llu\n", g_tl.cap, g_tl.n, ns_per_gpu, (unsigned long long) ts[0].timestamp, (unsigned long long) ts[1].timestamp, (unsigned long long) ts[2 * n - 1].timestamp);
+    size_t from = std::getenv("DS4_TL_FROM") ? (size_t) std::atoll(std::getenv("DS4_TL_FROM")) : 0;
+    struct Acc { double busy = 0, gap = 0, gap_big = 0; size_t n = 0, n_big = 0; };
+    std::map<std::string, Acc> acc;
+    double t_first = 0, t_last = 0, total_busy = 0, total_gap = 0, total_big = 0;
+    double prev_end = -1;
+    size_t used = 0;
+    for (size_t k = from; k < n; ++k) {
+        if (g_tl.names[k].empty()) continue;
+        const double st = (double) ts[2 * k].timestamp * ns_per_gpu * 1e-3, en = (double) ts[2 * k + 1].timestamp * ns_per_gpu * 1e-3;   // us
+        if (!(en >= st)) continue;
+        if (prev_end < 0) t_first = st;
+        Acc& a = acc[g_tl.names[k]];
+        a.busy += en - st;
+        ++a.n;
+        total_busy += en - st;
+        if (prev_end >= 0 && st >= prev_end) {
+            const double gp = st - prev_end;
+            a.gap += gp;
+            total_gap += gp;
+            if (gp > 300.0) { a.gap_big += gp; ++a.n_big; total_big += gp; }
+        }
+        prev_end = en;
+        t_last = en;
+        ++used;
+    }
+    std::vector<std::pair<double, std::string>> v;
+    for (auto& kv : acc) v.emplace_back(kv.second.busy + kv.second.gap, kv.first);
+    std::sort(v.begin(), v.end(), [](auto& x, auto& y) { return x.first > y.first; });
+    std::fprintf(stderr, "timeline: %zu dispatches, wall %.1f ms, GPU busy %.1f ms, idle gaps %.1f ms (of it > 300 us: %.1f ms)\n", used,
+                 (t_last - t_first) / 1000.0, total_busy / 1000.0, total_gap / 1000.0, total_big / 1000.0);
+    std::fprintf(stderr, "timeline: kernel                          n   busy ms  us/disp   gap ms  gap/disp  big-gap ms (n)\n");
+    for (size_t i = 0; i < v.size() && i < 40; ++i) {
+        const Acc& a = acc[v[i].second];
+        std::fprintf(stderr, "timeline: %-28s %6zu %9.1f %8.1f %8.1f %8.1f %10.1f (%zu)\n", v[i].second.c_str(), a.n, a.busy / 1000.0, a.busy / (double) a.n,
+                     a.gap / 1000.0, a.gap / (double) a.n, a.gap_big / 1000.0, a.n_big);
+    }
+}
+}  // namespace
+
 Context::Context() : impl_(new Impl) {
     impl_->dev = MTLCreateSystemDefaultDevice();
+    if (std::getenv("DS4_TIMELINE") && !g_tl.reg) {
+        g_tl.on = true;
+        g_tl.reg = true;
+        static id<MTLDevice> tl_dev = impl_->dev;
+        std::atexit([] { tl_report(tl_dev); });
+    }
     if (!impl_->dev) {
         std::fprintf(stderr, "mtl: no Metal device\n");
         std::exit(2);
@@ -420,7 +563,6 @@ static std::atomic<uint64_t> g_wait_ns{0}, g_enc_ns{0}, g_wait_n{0};   // host t
 static std::mutex g_prof_mu;
 static std::unordered_map<std::string, std::pair<double, uint64_t>> g_prof;   // DS4_PROF: kernel -> (GPU us, dispatches)
 static std::string g_prof_last;
-static std::atomic<uint64_t> g_disp_count{0};   // dispatches encoded, and command buffers committed
 static std::atomic<uint64_t> g_cb_count{0};
 static bool g_count_reg = false;
 static void ds4_report_counts() {
@@ -551,10 +693,11 @@ double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, 
                 } else
                 impl_->cb_def = [impl_->q commandBufferWithUnretainedReferences];
                 if (impl_->qev != nil && impl_->qev_v > 0) [impl_->cb_def encodeWaitForEvent:impl_->qev value:impl_->qev_v];
-                impl_->enc_def = [impl_->cb_def computeCommandEncoderWithDispatchType:std::getenv("DS4_CONCURRENT") ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
+                impl_->enc_def = tl_make_encoder(impl_->dev, impl_->cb_def, std::getenv("DS4_CONCURRENT") ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial);
             }
             const auto te0 = std::chrono::steady_clock::now();
             encode(impl_->enc_def, ds[0]);
+            if (g_tl.on && g_tl.att && g_tl.n < g_tl.cap) { g_tl.names[g_tl.n++] = ds[0].p->name; g_tl.att = false; }
             g_last_act_ns.store(ka_now_ns(), std::memory_order_relaxed);
             g_recent.push_back(ds[0].p->name); if (g_recent.size() > 8) g_recent.pop_front();
             if (std::getenv("DS4_ERRINFO")) impl_->def_names += ds[0].p->name + " ";
@@ -566,10 +709,10 @@ double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, 
             // second matvec's activation quantiser read the previous layer's x).
             static const bool no_mb = std::getenv("DS4_NO_MBARRIER") != nullptr;
             if (!no_mb) [impl_->enc_def memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            static const bool enc_each = std::getenv("DS4_ENC_EACH") != nullptr;   // a new encoder per dispatch (debugging)
+            static const bool enc_each = std::getenv("DS4_ENC_EACH") != nullptr || g_tl.on;   // a new encoder per dispatch (debugging, the timeline)
             if (enc_each) {
                 [impl_->enc_def endEncoding];
-                impl_->enc_def = [impl_->cb_def computeCommandEncoderWithDispatchType:(std::getenv("DS4_CONCURRENT") ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial)];
+                impl_->enc_def = tl_make_encoder(impl_->dev, impl_->cb_def, (std::getenv("DS4_CONCURRENT") ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial));
             }
             ++impl_->def_n;
             ++g_disp_count;

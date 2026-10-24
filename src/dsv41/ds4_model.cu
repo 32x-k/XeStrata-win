@@ -8391,6 +8391,7 @@ struct Model::Impl {
 #endif
             static const bool skip_cpu = std::getenv("DS4_SKIP_CPU") != nullptr;   // (timing only: the CPU lane's experts left out)
             if (!skip_cpu) cpu_experts(l, h_x, ents);
+            else if (const char* fk = std::getenv("DS4_FAKE_CPU_US")) std::this_thread::sleep_for(std::chrono::microseconds(std::atoi(fk)));   // (timing only)
             std::fill(h_part, h_part + (size_t) T * D, 0.0f);
             for (int sl = 0; sl < nslots; ++sl) {
                 float* o = h_part + (size_t) cpu_rows[(size_t) sl].first * D;
