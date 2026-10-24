@@ -89,6 +89,9 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       <form class="st-card img-form" id="img-form">
         <span class="card-title" id="img-title">Make an image</span>
         <textarea class="st-input img-prompt" id="img-prompt" rows="3" placeholder="Describe the image&hellip;" aria-label="Prompt"></textarea>
+        <label class="st-field">Negative prompt (optional)
+          <textarea class="st-input img-prompt" id="img-neg" rows="2" placeholder="What the image should not have&hellip;"></textarea></label>
+        <span class="composer-hint" id="img-neg-hint" hidden>This image model does not use a negative prompt unless guidance is on (the API's true_cfg_scale above 1).</span>
         <div class="img-row">
           <label class="st-field">Size
             <select class="st-input" id="img-size">

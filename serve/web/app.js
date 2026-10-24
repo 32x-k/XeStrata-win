@@ -117,6 +117,7 @@ async function loadHealth() {
     $("tab-btn-images").hidden = !health.image_generation;
     $("img-note").hidden = !health.image_note;
     $("img-note").textContent = health.image_note || "";
+    $("img-neg-hint").hidden = !(health.image_generation && health.image_guidance <= 1);
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
     setTimeout(loadHealth, 2000);
@@ -1292,6 +1293,8 @@ $("img-form").onsubmit = async (ev) => {
   const refs = Array.from($("img-ref").files || []);
   const body = {prompt, size: size === "auto" && !refs.length ? "1024x1024" : size, response_format: "b64_json"};
   if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
+  const neg = $("img-neg").value.trim();
+  if (neg) body.negative_prompt = neg;
   $("img-go").disabled = true;
   const t0 = performance.now();
   $("img-hint").textContent = "Generating\u2026 (a minute or more on a small GPU)";

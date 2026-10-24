@@ -106,6 +106,7 @@ The config file's (`xestrata-<model>.json`) `"images"` also has entries to set b
 **The Images tab:** with image generation set up, the web page (`http://127.0.0.1:8095`) has an Images tab.
 
 - Choose the prompt, the size (1024x1024, 1536x1024, 1024x1536, 768x768, 512x512, 1920x1080, 1080x1920, auto, or any size with sides of 256 to 2048) and the seed, and press Generate.
+- A negative prompt (what the image should not have) can be written too. It takes effect with the models that apply CFG (`mage-flow`, `mage-flow-base`, `magetrail`); with the others, a line under it says so.
 - Attaching reference images makes it an edit (PNG, JPEG, GIF, BMP, WebP).
 - Images are made one at a time; a chat request waits meanwhile (and the other way round).
 - The **Monitor** tab shows the stage, the step and the seconds a step takes.

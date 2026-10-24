@@ -725,6 +725,11 @@ class ImageGen:
                 f"{q.get('ram_left_gb', '?')} GB. Run setup with --image-ssd-offload on to keep them "
                 "(what does not fit is read from the SSD, slower).")
 
+    def guidance(self) -> float:
+        """The guidance scale a request without one gets (cfg_request): Mage-Flow's config's, else 1 (none, so its
+        negative prompt is not used)."""
+        return float(self.cfg.get("cfg_scale") or 1.0) if self.cfg.get("family") == "mage-flow" else 1.0
+
     def missing(self) -> list[str]:
         keys = ("exe", "diffusion_model", "vae", "llm") + (("vision",) if self.cfg.get("vision") else ())
         return [self.cfg[k] for k in keys if not Path(self.cfg[k]).exists()]

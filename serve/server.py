@@ -5774,6 +5774,7 @@ def make_handler(svc: Service):
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
                                  "image_note": svc.images.note() if svc.images is not None else None,
+                                 "image_guidance": svc.images.guidance() if svc.images is not None else None,
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path == "/update":                         # whether a newer release is out (About > Updates)
                 if not self._authorized():
