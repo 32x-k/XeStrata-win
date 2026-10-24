@@ -13,9 +13,10 @@ inside the normal setup (setup.py's setup_images).
 --gpu-policy auto|keep|shrink|unload: what the text model does during an image job (serve/images.py).
 --quant: Qwen-Image-2.1's image model's size, lowered (after its text encoder's) when the files would not fit the RAM
 the config's text model leaves, unless --ssd-offload on; Mage-Flow's comes in one size (bf16).
---model qwen-image-turbo|qwen-image-base|mage-flow-turbo|mage-flow|mage-flow-base[-uncensored]: the image model
-(setup.py --images); -uncensored: its text encoder with the refusal direction removed.  The text encoder is Q8_0, or
-lowered first.
+--model qwen-image-turbo|qwen-image-base|mage-flow-turbo|mage-flow|mage-flow-base|magetrail[-uncensored]: the image
+model (setup.py --images), or several, comma-separated (the first the default, the others named by a request's
+"model"); -uncensored: its text encoder with the refusal direction removed.  The text encoder is Q8_0, or lowered
+first.
 --dit-q8, --dit-keep: Mage-Flow's image model in 8 or 16 bits, and the one not in use kept in RAM (as setup's
 --image-dit-q8 and --image-dit-keep).
 """
@@ -39,10 +40,11 @@ def main(argv=None) -> int:
     ap.add_argument("--gpu-policy", choices=["auto", "keep", "shrink", "unload"], default="auto")
     ap.add_argument("--ssd-offload", choices=["on", "off"],
                     help="on: keep the size even when the RAM is short (the rest read from the SSD)")
-    ap.add_argument("--model", choices=list(QI.IMAGE_MODELS), default=QI.DEFAULT_MODEL,
+    ap.add_argument("--model", default=QI.DEFAULT_MODEL,
                     help="qwen-image-turbo (default: Qwen-Image-2.1-Turbo, 8 steps), qwen-image-base "
                          "(Qwen-Image-2.1, 40 steps), mage-flow-turbo (Mage-Flow-Turbo, 4 steps), mage-flow (its RL "
-                         "model, 20 steps) or mage-flow-base (its base model, 30 steps); -uncensored: the text encoder "
+                         "model, 20 steps), mage-flow-base (its base model, 30 steps) or magetrail (30 steps), or "
+                         "several, comma-separated (the first the default); -uncensored: the text encoder "
                          "(Qwen3-VL-8B, Mage-Flow's 4B) with the refusal direction removed")
     ap.add_argument("--dit-q8", choices=["auto", "on", "off"],
                     help="Mage-Flow: its DiT 16-bit in VRAM when it fits there with the text encoder, else 8 bits "
@@ -52,6 +54,9 @@ def main(argv=None) -> int:
     ap.add_argument("--print", action="store_true", help="print the images section instead of writing it")
     ap.add_argument("--yes", action="store_true")
     a = ap.parse_args(argv)
+    asked = a.model.split(",")
+    if len(set(asked)) != len(asked) or not set(asked) <= set(QI.IMAGE_MODELS):
+        ap.error(f"--model {a.model}: each of {', '.join(QI.IMAGE_MODELS)} at most once")
     import setup as S
     gpu = S.gpu_info() or {}
     if a.models_dir is None:
@@ -67,14 +72,16 @@ def main(argv=None) -> int:
     model = next((m for m in sorted(S.MODELS, key=len, reverse=True)
                   if m.lower() in str(cfg.get("model_name", "")).lower()), None)
     text_gb = S.text_ram_gb(cfg.get("args") or [], S.ram_gb(), model) if cfg else None
-    section = S.setup_images(ns, gpu, Path(a.models_dir), eng, text_gb)
-    if section is None:
+    got = S.setup_images(ns, gpu, Path(a.models_dir), eng, text_gb)
+    if got is None:
         return 1
+    section, more = got
     if a.print or not a.config:
-        print(json.dumps({"images": section}, indent=1))
+        print(json.dumps({"images": section, **({"image_models": more} if more else {})}, indent=1))
         return 0
     assert path is not None
     cfg["images"] = section
+    cfg["image_models"] = more or None
     S.write_config(path, cfg)
     S.ok(f"{path.name}: image generation added (POST /v1/images/generations once the server starts again)")
     return 0

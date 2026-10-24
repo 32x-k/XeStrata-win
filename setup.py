@@ -35,7 +35,8 @@ answers, no questions), --setup (install another model / change settings instead
 generation on XeStrata's image engine, POST /v1/images/generations: Qwen-Image-2.1-Turbo in 8 steps, or its base
 model Qwen-Image-2.1 in 40; mage-flow-turbo|mage-flow|mage-flow-base[-uncensored]: Mage-Flow in 4, 20 or 30;
 magetrail[-uncensored]: MageTrail, Mage-Flow tuned on Danbooru and e621 images, in 30; -uncensored: the text
-encoder with the refusal direction removed; --image-quant Q4_K_M|Q6_K|Q8_0 (Qwen-Image),
+encoder with the refusal direction removed; several, comma-separated: the first the default, the others named by a
+request's "model"; --image-quant Q4_K_M|Q6_K|Q8_0 (Qwen-Image),
 --image-dit-q8 auto|on|off and --image-dit-keep on|off (Mage-Flow), --image-ssd-offload on|off, --image-gpu-policy
 auto|keep|shrink|unload).
 
@@ -3746,20 +3747,14 @@ def text_ram_gb(args: list, ram: float, model: str | None = None) -> float:
     return gb
 
 
-def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | None = None) -> dict | None:
-    """--images (qimage.IMAGE_MODELS): the image model's four files for the image engine in `eng` -> the run
-    config's "images" section (serve/images.py); None for --images no, or when not wanted after all.  `text_gb`:
-    the RAM the text model keeps (text_ram_gb): the denoiser's and the text encoder's quants are the largest whose
-    files fit the rest (the user's decision of 2026-10-15), the encoder lowered first (2026-10-19), or the ones asked
-    for with --image-ssd-offload on (what does not fit read from the SSD)."""
-    if not a.images or a.images == "no":
-        return None
-    remove_old_image_engine()
+def image_plan(a, choice: str, text_gb: float | None) -> dict:
+    """One --images choice (qimage.IMAGE_MODELS): its sizes and files -> {choice, quant, tquant, lowered, names}.
+    `text_gb`: the RAM the text model keeps (text_ram_gb): the denoiser's and the text encoder's quants are the largest
+    whose files fit the rest (the user's decision of 2026-10-15), the encoder lowered first (2026-10-19), or the ones
+    asked for with --image-ssd-offload on (what does not fit read from the SSD).  One image model runs at a time, so
+    each is fitted to that RAM on its own."""
     QI = _qimage()
-    exe = eng / IMAGE_EXE
-    if not exe.exists():
-        fail(f"the image engine is missing ({exe})", "run setup again to compile the engine (it builds both)")
-    _, dit, enc = QI.IMAGE_MODELS[a.images]
+    _, dit, enc = QI.IMAGE_MODELS[choice]
     label, steps, _ = QI.DITS[dit]
     asked = a.image_quant or QI.DEFAULT_QUANT
     if QI.is_mage(dit):   # Mage-Flow's DiT comes in one size (bf16: the engine's FP16 or 8 bits of it, --image-dit-q8)
@@ -3767,7 +3762,6 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
             warn(f"--image-quant {a.image_quant}: {label} comes in one size, which the engine quantizes itself "
                  "(--image-dit-q8 auto|on|off)")
         asked = QI.dit_quants(dit)[-1]
-    dit_q8 = {"on": True, "off": False}.get(getattr(a, "image_dit_q8", None) or "auto")   # None: by the VRAM
     dit_keep = getattr(a, "image_dit_keep", None) != "off"
     tasked = QI.DEFAULT_TEXT_QUANT
     ssd = getattr(a, "image_ssd_offload", None) == "on"
@@ -3781,18 +3775,17 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
             need = QI.ram_need_gb(asked, enc, tasked, dit, dit_keep)
             lowered = {"from": asked, "to": quant, "text_from": tasked, "text_to": tquant,
                        "need_gb": round(need, 1), "ram_left_gb": round(max(left, 0.0), 1)}
-            warn(f"image model lowered from {asked} (text encoder {tasked}) to {quant} (text encoder {tquant}): "
+            warn(f"{label} lowered from {asked} (text encoder {tasked}) to {quant} (text encoder {tquant}): "
                  f"{asked} with a {tasked} text encoder needs ~{need:.0f} GB of RAM beside the text model, which "
                  f"leaves ~{max(left, 0):.0f} GB. --image-ssd-offload on keeps both and reads what does not fit "
                  "from the SSD (slower)")
         if not fits:
             least = QI.ram_need_gb(quant, enc, tquant, dit, dit_keep)
-            warn(f"even {quant} with a {tquant} text encoder (~{least:.0f} GB) "
+            warn(f"even {label} {quant} with a {tquant} text encoder (~{least:.0f} GB) "
                  f"does not fit the ~{max(left, 0):.0f} GB of RAM the text model leaves: images read part of the model "
                  "from the SSD (slower), and the PC may run short of RAM while one is made")
     elif ssd:
-        ok(f"image model {quant} (text encoder {tquant}) with SSD offload: what does not fit in RAM is read from "
-           "the SSD")
+        ok(f"{label} {quant} (text encoder {tquant}) with SSD offload: what does not fit in RAM is read from the SSD")
     say(f"  Image generation: {label} {quant} on XeStrata's image engine ({steps} steps; "
         "POST /v1/images/generations)")
     tfile = QI.FILES[QI.text_file(enc, tquant)]
@@ -3800,25 +3793,50 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
         + (f", Qwen3-VL-{'4B' if QI.is_mage(dit) else '8B'} with its refusal direction removed)"
            if enc.endswith("uncensored") else ")"))
     say("  " + QI.license_note(dit))
-    names = QI.file_names(quant, enc, tquant, dit)
+    return {"choice": choice, "quant": quant, "tquant": tquant, "lowered": lowered,
+            "names": QI.file_names(quant, enc, tquant, dit)}
+
+
+def setup_images(a, gpu: dict, models_dir: Path, eng: Path,
+                 text_gb: float | None = None) -> tuple[dict, list[dict]] | None:
+    """--images (one choice of qimage.IMAGE_MODELS, or several, comma-separated): their files for the image engine in
+    `eng` -> the run config's "images" section (serve/images.py; the first choice, the default) and its
+    "image_models" (the others, which a request names by "model"); None for --images no, or when not wanted after
+    all.  The models' sizes as image_plan fits them to the RAM."""
+    if not a.images or a.images == "no":
+        return None
+    remove_old_image_engine()
+    QI = _qimage()
+    exe = eng / IMAGE_EXE
+    if not exe.exists():
+        fail(f"the image engine is missing ({exe})", "run setup again to compile the engine (it builds both)")
+    plans = [image_plan(a, choice, text_gb) for choice in a.images.split(",")]
+    names = list(dict.fromkeys(n for p in plans for n in p["names"]))   # the files the models share, once
     need = sum(QI.FILES[k][2] for k in names) / 1e9
-    if ask(f"Download the image model ({need:.1f} GB) and set up image generation?", ["y", "n"], "y", a.yes) != "y":
+    what = "the image model" if len(plans) == 1 else f"the {len(plans)} image models"
+    if ask(f"Download {what} ({need:.1f} GB) and set up image generation?", ["y", "n"], "y", a.yes) != "y":
         return None
     models_dir.mkdir(parents=True, exist_ok=True)
     if free_gb(models_dir) < need + 5:
-        warn(f"less than {need + 5:.0f} GB free for the image model: the download may run out of disk space")
+        warn(f"less than {need + 5:.0f} GB free for {what}: the download may run out of disk space")
     for name in names:
         repo, path, size, sha = QI.FILES[name]
         dst = QI.local_path(models_dir, name)
         download(QI.file_url(name, hf_endpoint()), dst, f"image model: {Path(path).name}")
         verify_sha256(dst, size, sha)
-    cfg = QI.image_config(quant, exe, models_dir, model=a.images, uma=bool((gpu or {}).get("integrated")),
-                          policy=a.image_gpu_policy or "auto", ssd_offload=ssd, text_quant=tquant, dit_q8=dit_q8,
-                          dit_keep=dit_keep)
-    if lowered:
-        cfg["quant_lowered"] = lowered
-    ok(f"image generation: {quant}, text encoder {tquant}, GPU policy {cfg['gpu_policy']}")
-    return cfg
+    dit_q8 = {"on": True, "off": False}.get(getattr(a, "image_dit_q8", None) or "auto")   # None: by the VRAM
+    cfgs = []
+    for p in plans:
+        cfg = QI.image_config(p["quant"], exe, models_dir, model=p["choice"],
+                              uma=bool((gpu or {}).get("integrated")), policy=a.image_gpu_policy or "auto",
+                              ssd_offload=getattr(a, "image_ssd_offload", None) == "on", text_quant=p["tquant"],
+                              dit_q8=dit_q8, dit_keep=getattr(a, "image_dit_keep", None) != "off")
+        if p["lowered"]:
+            cfg["quant_lowered"] = p["lowered"]
+        cfgs.append(cfg)
+        ok(f"image generation: {cfg['model_name']} {p['quant']}, text encoder {p['tquant']}, "
+           f"GPU policy {cfg['gpu_policy']}" + ("" if p is plans[0] else " (a request names it by \"model\")"))
+    return cfgs[0], cfgs[1:]
 
 
 # ------------------------------------------------------------------------------------------------ the data folder
@@ -5761,8 +5779,9 @@ def main() -> int:
                          "text model leaves); mage-flow-turbo (Mage-Flow-Turbo, 4 steps), mage-flow (20 steps, "
                          "guidance 5) or mage-flow-base (30 steps, guidance 5), or magetrail (MageTrail, Mage-Flow "
                          "tuned on Danbooru and e621 images, 30 steps, guidance 5; no edits), the text encoder "
-                         "Unsloth's Qwen3-VL-4B or, -uncensored, huihui-ai's abliterated one; no = take it out of the "
-                         "config")
+                         "Unsloth's Qwen3-VL-4B or, -uncensored, huihui-ai's abliterated one; several, comma-separated "
+                         "(qwen-image-turbo,magetrail): the first the default, the others named by a request's "
+                         "\"model\" (one on the GPU at a time); no = take it out of the config")
     ap.add_argument("--image-quant", choices=["Q4_K_M", "Q6_K", "Q8_0"],
                     help="the image model's size (default Q8_0, lowered when its files would not fit the RAM the "
                          "text model leaves, after its text encoder; the GPU's memory does not decide it)")
@@ -5924,7 +5943,11 @@ def main() -> int:
         fail("--license contrib-icpx: the contrib-icpx mode (Intel oneAPI's icpx) was removed",
              "use --license contrib (contrib-llvm: intel/llvm, for Intel, AMD and NVIDIA GPUs), or --license free")
     images = ("no", *_qimage().IMAGE_MODELS)
-    if a.image_text_encoder is not None or (a.images is not None and a.images not in images):
+    asked = (a.images or "").split(",")
+    if a.images is not None and (len(set(asked)) != len(asked) or (len(asked) > 1 and "no" in asked)):
+        fail(f"--images {a.images}: each image model once, and no alone",
+             "use --images qwen-image-turbo,magetrail for two models (the first the default), or --images no")
+    if a.image_text_encoder is not None or (a.images is not None and not set(asked) <= set(images)):
         fail(f"--images {a.images}: no such choice" if a.image_text_encoder is None
              else "--image-text-encoder was removed: --images names the text encoder",
              "use --images " + "|".join(images) + " (qwen-image is qwen-image-turbo, --image-text-encoder "
@@ -6742,8 +6765,10 @@ def main() -> int:
     elif a.vision_tokens is not None:
         warn("--vision-tokens: images are off for this model, so it is not used")
     if a.images:                                       # only when given: else an earlier "images" is carried over
-        cfg["images"] = setup_images(a, gpu, Path(a.models_dir), Path(cfg["exe"]).parent,
-                                     text_ram_gb(cfg["args"], ram, model))
+        got = setup_images(a, gpu, Path(a.models_dir), Path(cfg["exe"]).parent, text_ram_gb(cfg["args"], ram, model))
+        cfg["images"], cfg["image_models"] = got if got is not None else (None, None)
+        if not cfg["image_models"]:
+            cfg["image_models"] = None
     return finish_setup(a, cfg, tag, port, adopted, vision != "none",
                         notes=agent_cache_note(cfg["args"], ram, MODELS[model]["ram_gb"]))
 
