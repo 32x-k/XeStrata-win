@@ -12,6 +12,11 @@
 // continues the state (the conversation so far) reuses it; one that only shares the last prompt's start goes back to
 // that prompt's end; anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
 // (the file: see read_pics); the state is shared only where the same picture sits at the same place.
+#if defined(__APPLE__)
+#include <execinfo.h>
+#include <csignal>
+#include <unistd.h>
+#endif
 #include "ds4_model.hpp"
 #include "ds4_packinfo.hpp"
 
@@ -734,6 +739,14 @@ int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int win
 }  // namespace
 
 int main(int argc, char** argv) {
+#if defined(__APPLE__)
+    if (std::getenv("DS4_BT")) {   // a crash prints where it was (no debugger on the Mac box)
+        signal(SIGSEGV, [](int) { void* fr[40]; const int n = backtrace(fr, 40); backtrace_symbols_fd(fr, n, 2); _exit(139); });
+        signal(SIGBUS, [](int) { void* fr[40]; const int n = backtrace(fr, 40); backtrace_symbols_fd(fr, n, 2); _exit(138); });
+        signal(SIGABRT, [](int) { void* fr[40]; const int n = backtrace(fr, 40); backtrace_symbols_fd(fr, n, 2); _exit(134); });
+    }
+#endif
+
     strata::ds4::Options o;
     std::string ids_s, dump, eos = "1";
     int n = 0, window = 16;

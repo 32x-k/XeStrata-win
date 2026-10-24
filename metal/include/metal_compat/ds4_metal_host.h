@@ -49,6 +49,11 @@ bool q8_quant_rows(const float* x, size_t ldx, int rows, int k, int8_t* q, float
 bool ring_to_ext(const void* ring, void* ext, long long p0, int n, int d, size_t row_bytes);
 bool route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale, const void* vram, int* idx, float* w, void* plan_ptr, const float* bias_vl, unsigned vl);
 bool sgemm_tn(const float* A, const float* B, float* C, int m, int nt, int k, int lda, int ldb, int ldc);
+bool rows_f16(const float* x, int ldx, const int* idx, int nrows, int ncols, uint16_t* out);
+bool iq_set_gu(const uint8_t* wbase, size_t stride, const size_t* tr, const int* hbounds, int n_exp, int total_rows, int n_embd, int n_ff, float limit, const float* xf, int ldx, const int* idx, uint16_t* h, int ldh, int tg, int td);
+bool iq_set_dn(const uint8_t* wbase, size_t stride, const size_t* tr, const int* hbounds, int n_exp, int total_rows, int n_embd, int n_ff, float limit, const uint16_t* h16, int ldh, float* y, int ldy, int tg, int td);
+bool dequant_rows(int kind, const void* raw, size_t ld, int k, int n, uint16_t* out);
+bool gemm_f16_nt(const uint16_t* W16, const uint16_t* X16, int ldx, float* Y, int ldy, int rows, int N, int K, float alpha, float beta);
 bool swiglu(const float* g, const float* u, int n, float lim, float* h);
 bool unpack_sel(const void* ckv, const int* sel, int sel_stride, int gen, long long p0, int t0, int R, int kcap, const int* nsel, int cap, void* out, int T, int nsel_count, size_t row_bytes);
 

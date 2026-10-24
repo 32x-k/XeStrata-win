@@ -1888,6 +1888,9 @@ struct Model::Impl {
         // to 1 (a 256-value type's: Maya's quants), which left every prompt in windows of 16
         par = o.threads || tp > 1;
         prompt_par = par || o.tp > 1;
+#if defined(STRATA_METAL)
+        if (std::getenv("DS4_NO_CHUNKS") == nullptr) prompt_par = true;   // the chunked prompt path on one device, the decode steps stay on the host-routed path
+#endif
         const bool tp_all = tp > 1 && tp == (int) devs.size();
         for (size_t i = 0; i < devs.size();) {
             Group G;
@@ -2726,7 +2729,7 @@ struct Model::Impl {
                       dalloc(d, c.rw, C * kPicks, err) && dalloc(d, c.bounds, 2048, err) &&
                       dalloc(d, c.row_tok, C * kPicks, err) && dalloc(d, c.pos, C * kPicks, err) &&
                       dalloc(d, c.sg, C * FF, err) && dalloc(d, c.su, C * FF, err) && dalloc(d, c.sh16, C * FF, err) &&
-                      dalloc(d, c.h16, C * FF, err) && dalloc(d, c.y, C * D, err) && dalloc(d, c.w16, c.w16_elems, err) &&
+                      dalloc(d, c.h16, (C + 16) * FF, err) && dalloc(d, c.y, C * D, err) && dalloc(d, c.w16, c.w16_elems, err) &&
                       halloc(c.bounds_pin, 2048, err);
             if (!ok) return false;
             if (has_first && !dalloc(d, c.emb, C * D, err)) return false;
@@ -3373,6 +3376,8 @@ struct Model::Impl {
                 sa.bounds = d_bounds + i0;
                 sa.row0 = a;
                 sa.max_rows = max_rows;
+                sa.hbounds = b + i0;
+                sa.total_rows = nrows;
                 sa.n_embd = D;
                 sa.n_ff = FF;
                 sa.limit = g.lim;

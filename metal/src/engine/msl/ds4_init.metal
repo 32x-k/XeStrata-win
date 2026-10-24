@@ -2074,3 +2074,90 @@ kernel void ds4_fill1(device uchar* dst [[buffer(0)]], constant ulong& n [[buffe
                       uint gid [[thread_position_in_grid]]) {
     if (ulong(gid) < n) dst[gid] = uchar(v);
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The prompt chunk's dense GEMM operands (see ds4_gemm_f16_nt on the host): float rows -> half, a quantized matrix -> half rows,
+// strided half rows packed, and the float result scattered into the engine's strided output.
+
+kernel void ds4_rows_f16(device const float* x [[buffer(0)]], constant ulong& ldx [[buffer(1)]],
+                         device const int* idx [[buffer(2)]], constant uint& has_idx [[buffer(3)]],
+                         constant uint& ncols [[buffer(4)]], device half* out [[buffer(5)]],
+                         uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    const uint r = tgp.y, c = tgp.x * 256u + tid;
+    if (c >= ncols) return;
+    const ulong row = has_idx != 0u ? ulong(idx[r]) : ulong(r);
+    out[(ulong) r * ncols + c] = half(x[row * ldx + c]);
+}
+
+static inline void ds4_kscale2(const device uchar* q, int j, thread int& d, thread int& m) {
+    if (j < 4) {
+        d = int(q[j]) & 63;
+        m = int(q[j + 4]) & 63;
+    } else {
+        d = (int(q[j + 4]) & 0xf) | ((int(q[j - 4]) >> 6) << 4);
+        m = (int(q[j + 4]) >> 4) | ((int(q[j]) >> 6) << 4);
+    }
+}
+
+// a thread a 32-value sub-block of a Q5_K matrix (n rows of k values, ld bytes a row) -> out[n][k] half
+kernel void ds4_dq_q5k(device const uchar* W [[buffer(0)]], constant ulong& ld [[buffer(1)]], constant uint& k [[buffer(2)]],
+                       constant uint& n [[buffer(3)]], device half* out [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+    const uint nb = k / 256u;
+    const ulong total = (ulong) n * nb * 8ul;
+    if (ulong(gid) >= total) return;
+    const uint ib = gid & 7u;
+    const uint blk = (gid >> 3) % nb;
+    const uint row = uint(ulong(gid) / (8ul * nb));
+    const device uchar* p = W + (ulong) row * ld + (ulong) blk * 176ul;
+    const float d = float(as_type<half>(*(const device ushort*) p));
+    const float dmin = float(as_type<half>(*(const device ushort*) (p + 2)));
+    int sc, mm;
+    ds4_kscale2(p + 4, int(ib), sc, mm);
+    const device uchar* qh = p + 16;
+    const device uchar* qs = p + 48 + 32u * (ib >> 1);
+    const uint sh = 4u * (ib & 1u);
+    device half* o = out + (ulong) row * k + (ulong) blk * 256ul + ib * 32u;
+    for (uint l = 0; l < 32u; ++l) {
+        const uint q = ((uint(qs[l]) >> sh) & 15u) | (((uint(qh[l]) >> ib) & 1u) << 4);
+        o[l] = half(d * float(sc) * float(q) - dmin * float(mm));
+    }
+}
+
+// Q8_0: 34-byte blocks (fp16 d, 32 int8)
+kernel void ds4_dq_q8(device const uchar* W [[buffer(0)]], constant ulong& ld [[buffer(1)]], constant uint& k [[buffer(2)]],
+                      constant uint& n [[buffer(3)]], device half* out [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+    const uint ng = k / 32u;
+    const ulong total = (ulong) n * ng;
+    if (ulong(gid) >= total) return;
+    const uint g = gid % ng, row = gid / ng;
+    const device uchar* p = W + (ulong) row * ld + (ulong) g * 34ul;
+    const float d = float(as_type<half>(*(const device ushort*) p));
+    device half* o = out + (ulong) row * k + (ulong) g * 32ul;
+    for (uint l = 0; l < 32u; ++l) o[l] = half(d * float(char(p[2 + l])));
+}
+
+// BF16 values (ld values a row) -> half
+kernel void ds4_dq_bf16(device const ushort* W [[buffer(0)]], constant ulong& ld [[buffer(1)]], constant uint& k [[buffer(2)]],
+                        constant uint& n [[buffer(3)]], device half* out [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+    const ulong total = (ulong) n * k;
+    if (ulong(gid) >= total) return;
+    const ulong r = ulong(gid) / k, c = ulong(gid) - r * k;
+    out[gid] = half(as_type<float>(uint(W[r * ld + c]) << 16));
+}
+
+// half rows with a row stride -> contiguous rows
+kernel void ds4_pack_h16(device const ushort* x [[buffer(0)]], constant ulong& ld [[buffer(1)]], constant uint& k [[buffer(2)]],
+                         device ushort* out [[buffer(3)]], uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    const uint c = tgp.x * 256u + tid;
+    if (c < k) out[(ulong) tgp.y * k + c] = x[(ulong) tgp.y * ld + c];
+}
+
+// y[r][c] = alpha * t[r][c] + beta * y[r][c]
+kernel void ds4_axpby_rows(device const float* t [[buffer(0)]], device float* y [[buffer(1)]], constant ulong& ldy [[buffer(2)]],
+                           constant uint& n [[buffer(3)]], constant float& alpha [[buffer(4)]], constant float& beta [[buffer(5)]],
+                           uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    const uint c = tgp.x * 256u + tid;
+    if (c >= n) return;
+    const ulong yi = (ulong) tgp.y * ldy + c;
+    y[yi] = alpha * t[(ulong) tgp.y * n + c] + (beta != 0.0f ? beta * y[yi] : 0.0f);
+}

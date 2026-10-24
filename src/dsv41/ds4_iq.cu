@@ -1225,6 +1225,10 @@ bool light_down(const SetArgs& a, cudaStream_t s) {
 }
 
 bool set_gate_up(const SetArgs& a, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    if (a.hbounds != nullptr && ::strata::dsv41::metal_host::iq_set_gu(a.wbase, a.stride, a.tr, a.hbounds, a.n_exp, a.total_rows, a.n_embd, a.n_ff, a.limit, a.xf, a.ldx, a.idx, a.h, a.ldo, a.tg, a.td))
+        return true;
+#endif
     if (is_tq(a.tg)) return tq::set_gate_up(a, s);
     if (a.n_embd % 256 != 0 || a.n_ff % BN != 0) return false;
     SetArgs t = a;
@@ -1240,6 +1244,10 @@ bool set_gate_up(const SetArgs& a, cudaStream_t s) {
 }
 
 bool set_down(const SetArgs& a, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    if (a.hbounds != nullptr && ::strata::dsv41::metal_host::iq_set_dn(a.wbase, a.stride, a.tr, a.hbounds, a.n_exp, a.total_rows, a.n_embd, a.n_ff, a.limit, a.xh, a.ldx, a.y, a.ldo, a.tg, a.td))
+        return true;
+#endif
     if (is_tq(a.td)) return tq::set_down(a, s);
     if (a.n_ff % 256 != 0 || a.n_embd % BN != 0) return false;
     SetArgs t = a;

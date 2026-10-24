@@ -54,7 +54,19 @@ static inline cublasStatus_t cublasSgemm(cublasHandle_t, cublasOperation_t opA, 
 
 // the mixed-precision form: any argument list, because the engine passes cuBLAS's full 19-argument spelling; the body
 // names kernels/dense_mm.metal, which is where the real implementation goes.
+// the chunk path's call (F16 weights [m][k] x F16 rows [n][k] -> F32 rows [n][m]): the MPP tile GEMM
+static inline cublasStatus_t cublasGemmEx(cublasHandle_t, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                                          const void* alpha, const void* A, cudaDataType_t at, int lda, const void* B,
+                                          cudaDataType_t bt, int ldb, const void* beta, void* C, cudaDataType_t ct, int ldc,
+                                          cublasComputeType_t, cublasGemmAlgo_t) {
+    if (ta == CUBLAS_OP_T && tb == CUBLAS_OP_N && at == CUDA_R_16F && bt == CUDA_R_16F && ct == CUDA_R_32F && lda == k &&
+        strata::dsv41::metal_host::gemm_f16_nt((const uint16_t*) A, (const uint16_t*) B, ldb, (float*) C, ldc, n, m, k, *(const float*) alpha,
+                                               *(const float*) beta))
+        return CUBLAS_STATUS_SUCCESS;
+    strata_metal_dense_gemm_missing("cublasGemmEx (this operand combination)");
+}
+
 template <typename... A>
-static inline cublasStatus_t cublasGemmEx(A...) {
+static inline cublasStatus_t cublasGemmEx_unsupported(A...) {
     strata_metal_dense_gemm_missing("cublasGemmEx");
 }

@@ -19,6 +19,9 @@
 // NVIDIA GPUs before sm_80 (V100, T4, RTX 20) decode with v1.1.8's kernels instead (exl3_legacy.cu, use_legacy
 // below): this file's CUDA-core fallback was slower there (a V100 with EXL3-3.05bpw: decode 4.9 -> 4.4 tok/s).  The
 // prompt path below is this file's on every GPU.
+#if defined(STRATA_METAL)
+#include <ds4_metal_host.h>
+#endif
 #include "strata/dsv41/exl3.hpp"
 
 #include <cuda_fp16.h>
@@ -1728,6 +1731,9 @@ void rows_rot_out(float* y, int ldy, int nrows, int ncols, const uint16_t* svh, 
 
 void rows_f16(const float* x, int ldx, const int* idx, int nrows, int ncols, uint16_t* out, cudaStream_t s) {
     if (nrows <= 0) return;
+#if defined(STRATA_METAL)
+    if (::strata::dsv41::metal_host::rows_f16(x, ldx, idx, nrows, ncols, out)) return;
+#endif
     strata_ds4_launch(rows_f16_kernel, dim3((unsigned) std::min(8, (ncols + 255) / 256), (unsigned) nrows), 256, 0, s, x, ldx, idx,
                                                                                                          ncols, out);
     launch_check("rows_f16");

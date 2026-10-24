@@ -15,11 +15,13 @@
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <map>
 #include <vector>
 
 // called by the gpu layer's synchronisation: everything batched must reach the GPU before a host read
 extern "C" void ds4_metal_flush();
 extern "C" size_t ds4_gpu_alloc_remaining(const void* cpu);
+extern "C" void* ds4_gpu_buffer_for_cpu(const void* cpu, size_t bytes, size_t* off);
 extern "C" void ds4_gpu_sync_all_streams();
 extern "C" unsigned long long ds4_dispatch_seq();
 static unsigned long long g_q8_deduped = 0;
@@ -191,17 +193,18 @@ bool hc_post(const float* y, float* h, const float* post, const float* comb, int
     mtl::Buffer by = wrap(hy, (size_t) T * dim * 4 );
     mtl::Buffer bh = wrap(hh, (size_t) T * hc * dim * 4 );
     if (!by.handle || !bh.handle) return false;
-    // post is [T][8], comb is [T][64], straight from the caller's host/shared memory
-    mtl::Buffer bp = g_cx->alloc((size_t) T * 8 * 4);
-    mtl::Buffer bc = g_cx->alloc((size_t) T * 64 * 4);
-    if (!bp.ptr || !bc.ptr) return false;
-    std::memcpy(bp.ptr, post, (size_t) T * 8 * 4);
-    std::memcpy(bc.ptr, comb, (size_t) T * 64 * 4);
+    // post is [T][8], comb is [T][64]: device operands like the others (reached through their host views)
+    void* hpost = strata::gpu::host_view((void*) post);
+    void* hcomb = strata::gpu::host_view((void*) comb);
+    if (!hpost || !hcomb) { std::fprintf(stderr, "dsv41 metal: hc_post has no host view for post / comb\n"); return false; }
+    mtl::Buffer bp = wrap(hpost, (size_t) T * 8 * 4);
+    mtl::Buffer bc = wrap(hcomb, (size_t) T * 64 * 4);
+    if (!bp.handle || !bc.handle) return false;
     mtl::Pipeline pl;
     try { pl = g_cx->pipeline(g_lib, "ds4_hc_post"); } catch (...) { return false; }
     mtl::Dispatch d;
     d.p = &pl;
-    d.args = {mtl::Arg::B(by, off(hy)), mtl::Arg::B(bh, off(hh)), mtl::Arg::B(bp), mtl::Arg::B(bc),
+    d.args = {mtl::Arg::B(by, off(hy)), mtl::Arg::B(bh, off(hh)), mtl::Arg::B(bp, off(hpost)), mtl::Arg::B(bc, off(hcomb)),
               mtl::Arg::V((unsigned) dim), mtl::Arg::V((unsigned) hc)};
     d.grid[0] = (uint32_t) ((dim + 255) / 256);
     d.grid[1] = (uint32_t) T;
@@ -584,16 +587,26 @@ bool iq_mv(const void* jobs, int nj) {
     if (nj <= 0) return true;
     if (!ensure()) return false;
     const Ds4IqMvJob* src = (const Ds4IqMvJob*) jobs;
-    std::vector<Ds4IqMvJob> exp_iq, exp_k, exp_q5, exp_x1, exp_x2, exp_x3, exp_x4;
-    exp_iq.reserve((size_t) nj);
-    exp_k.reserve((size_t) nj);
+    // Each job goes to the kernel of its type and column count: NC = 1, 2, 4 or 8 activations decode the row's weights once
+    // (ds4_*_mvn<NC>); a job of more columns is cut into pieces of 8.  Other types keep the 16-column kernels.
+    std::map<std::string, std::vector<Ds4IqMvJob>> groups;
     int max_n = 0;
+    static const bool old_only = std::getenv("DS4_NO_MVN") != nullptr;
     for (int i = 0; i < nj; ++i) {
         const Ds4IqMvJob& q = src[i];
         if (q.n > max_n) max_n = q.n;
         const int ncol = q.ncol > 0 ? q.ncol : 1;
-        static const int maxstep = std::getenv("DS4_IQ_STEP") ? std::atoi(std::getenv("DS4_IQ_STEP")) : 16;
-        const int step = ncol > maxstep ? maxstep : ncol;   // both kernels keep 16 accumulators
+        const char* tn = nullptr;
+        switch (q.type) {
+            case 13: tn = "ds4_q5k_mvn"; break;
+            case 16: tn = "ds4_iq2xxs_mvn"; break;
+            case 17: tn = "ds4_iq2xs_mvn"; break;
+            case 18: tn = "ds4_iq3xxs_mvn"; break;
+            case 22: tn = "ds4_iq2s_mvn"; break;
+            default: break;
+        }
+        const bool grid = tn != nullptr && !old_only;
+        const int step = grid ? 8 : (ncol > 16 ? 16 : ncol);
         for (int c0 = 0; c0 < ncol; c0 += step) {
             Ds4IqMvJob b = q;
             b.ncol = (c0 + step < ncol) ? step : ncol - c0;
@@ -602,19 +615,20 @@ bool iq_mv(const void* jobs, int nj) {
                 b.xd = q.xd + (size_t) c0 * (size_t) (q.k / 32);
                 b.y = q.y + (size_t) c0 * (size_t) q.ycs;
             }
-            static const bool fast1 = std::getenv("DS4_NO_MV1") == nullptr;
-            if (fast1 && b.ncol == 1 && b.type == 13) exp_q5.push_back(b);        // the decode step's one-activation kernels
-            else if (fast1 && b.ncol == 1 && b.type == 16) exp_x1.push_back(b);
-            else if (fast1 && b.ncol == 1 && b.type == 17) exp_x2.push_back(b);
-            else if (fast1 && b.ncol == 1 && b.type == 22) exp_x3.push_back(b);
-            else if (fast1 && b.ncol == 1 && b.type == 18) exp_x4.push_back(b);
-            else (b.type == 13 || b.type == 14 ? exp_k : exp_iq).push_back(b);
+            std::string fn;
+            if (grid) {
+                const int nc = b.ncol <= 1 ? 1 : (b.ncol <= 2 ? 2 : (b.ncol <= 4 ? 4 : 8));
+                fn = std::string(tn) + std::to_string(nc);
+            } else {
+                fn = (b.type == 13 || b.type == 14) ? "ds4_iq_mv_k" : "ds4_iq_mv";
+            }
+            groups[fn].push_back(b);
         }
     }
     if (max_n <= 0) return true;
     const size_t kBatch = 64;   // the CUDA host's job-array limit; one command buffer a group
-    auto run_group = [&](std::vector<Ds4IqMvJob>& v, const char* fn) -> bool {
-        if (v.empty()) return true;
+    for (auto& kv : groups) {
+        std::vector<Ds4IqMvJob>& v = kv.second;
         mtl::Buffer bj = g_cx->alloc(v.size() * sizeof(Ds4IqMvJob));
         if (!bj.ptr) {
             std::fprintf(stderr, "dsv41 metal: iq_mv job buffer failed\n");
@@ -623,7 +637,7 @@ bool iq_mv(const void* jobs, int nj) {
         std::memcpy(bj.ptr, v.data(), v.size() * sizeof(Ds4IqMvJob));
         mtl::Pipeline pl;
         try {
-            pl = g_cx->pipeline(g_lib_iq, fn);
+            pl = g_cx->pipeline(g_lib_iq, kv.first);
         } catch (...) {
             g_cx->free(bj);
             return false;
@@ -642,15 +656,7 @@ bool iq_mv(const void* jobs, int nj) {
         }
         g_cx->run(ds);
         g_cx->free(bj);
-        return true;
-    };
-    if (!run_group(exp_q5, "ds4_q5k_mv1")) return false;
-    if (!run_group(exp_x1, "ds4_iq2xxs_mv1")) return false;
-    if (!run_group(exp_x2, "ds4_iq2xs_mv1")) return false;
-    if (!run_group(exp_x3, "ds4_iq2s_mv1")) return false;
-    if (!run_group(exp_x4, "ds4_iq3xxs_mv1")) return false;
-    if (!run_group(exp_k, "ds4_iq_mv_k")) return false;
-    if (!run_group(exp_iq, "ds4_iq_mv")) return false;
+    }
     return true;
 }
 
@@ -1075,11 +1081,11 @@ bool sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     }
     mtl::Dispatch dsp;
     dsp.p = &pl;
-    dsp.args = {mtl::Arg::B(bq, off(hq)), mtl::Arg::B(bw, off(hw != nullptr ? hw : bw.ptr)),
-                mtl::Arg::B(bc, off(hc != nullptr ? hc : bc.ptr)),
-                mtl::Arg::B(bs, off(hs != nullptr ? hs : bs.ptr)),
+    dsp.args = {mtl::Arg::B(bq, off(hq)), mtl::Arg::B(bw, (hw != nullptr ? off(hw) : (size_t) 0)),
+                mtl::Arg::B(bc, (hc != nullptr ? off(hc) : (size_t) 0)),
+                mtl::Arg::B(bs, (hs != nullptr ? off(hs) : (size_t) 0)),
                 mtl::Arg::V((unsigned) (sel_stride > 0 ? sel_stride : 1)), mtl::Arg::V(ar),
-                mtl::Arg::B(bk, off(hk != nullptr ? hk : bk.ptr)), mtl::Arg::V((unsigned) heads), mtl::Arg::V(scale),
+                mtl::Arg::B(bk, (hk != nullptr ? off(hk) : (size_t) 0)), mtl::Arg::V((unsigned) heads), mtl::Arg::V(scale),
                 mtl::Arg::B(bo, off(ho))};
     dsp.grid[0] = (uint32_t) (ckv_fmt == 2 ? heads / G : heads);
     dsp.grid[1] = (uint32_t) T;
@@ -2042,6 +2048,349 @@ bool moe_win_group_cpu(const void* plan_ptr, void* grp_ptr, void* grp_start, voi
 }
 
 
+
+
+// ---- the prompt chunk's dense GEMM: float rows -> half, a quantized matrix -> half rows, MPP matmul2d (kernels/dense_mm.metal)
+namespace {
+mtl::Buffer g_gm_xs, g_gm_yt;   // grow-only scratch: packed activations, the contiguous result
+int g_lib_mm = -2;
+mtl::Buffer scratch(mtl::Buffer& b, size_t bytes) {
+    if (!b.handle || b.bytes < bytes) {
+        if (b.handle) g_cx->free(b);
+        b = g_cx->alloc(bytes + (bytes >> 2));
+    }
+    return b;
+}
+}  // namespace
+
+bool rows_f16(const float* x, int ldx, const int* idx, int nrows, int ncols, uint16_t* out) {
+    if (nrows <= 0 || ncols <= 0) return true;
+    if (!ensure()) return false;
+    void* hx = strata::gpu::host_view((void*) x);
+    void* ho = strata::gpu::host_view(out);
+    void* hi = idx ? strata::gpu::host_view((void*) idx) : nullptr;
+    if (!hx || !ho) return false;
+    const size_t page = 16384;
+    auto wrap = [&](void* host, size_t bytes) {
+        const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
+        const size_t end = (size_t) ((uintptr_t) host) + bytes;
+        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+    };
+    auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
+    mtl::Buffer bx = wrap(hx, ((size_t) (nrows - 1) * (size_t) ldx + (size_t) ncols) * 4);
+    mtl::Buffer bo = wrap(ho, (size_t) nrows * (size_t) ncols * 2);
+    mtl::Buffer bi = hi ? wrap(hi, (size_t) nrows * 4) : bx;
+    if (!bx.handle || !bo.handle || !bi.handle) return false;
+    mtl::Pipeline pl;
+    try { pl = g_cx->pipeline(g_lib, "ds4_rows_f16"); } catch (...) { return false; }
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.args = {mtl::Arg::B(bx, off(hx)), mtl::Arg::V((unsigned long) ldx), mtl::Arg::B(bi, hi ? off(hi) : off(hx)),
+              mtl::Arg::V((unsigned) (hi ? 1 : 0)), mtl::Arg::V((unsigned) ncols), mtl::Arg::B(bo, off(ho))};
+    d.grid[0] = (uint32_t) ((ncols + 255) / 256);
+    d.grid[1] = (uint32_t) nrows;
+    d.grid[2] = 1;
+    d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
+    g_cx->run({d});
+    return true;
+}
+
+// kind: 0 BF16 values, 8 Q8_0, 13 Q5_K.  n rows of k values, ld the row stride (bytes; values for BF16), out half rows.
+bool dequant_rows(int kind, const void* raw, size_t ld, int k, int n, uint16_t* out) {
+    if (n <= 0 || k <= 0) return true;
+    if (!ensure()) return false;
+    const char* fn = kind == 13 ? "ds4_dq_q5k" : kind == 8 ? "ds4_dq_q8" : kind == 0 ? "ds4_dq_bf16" : nullptr;
+    if (!fn) return false;
+    if ((kind == 13 && k % 256 != 0) || (kind == 8 && k % 32 != 0)) return false;
+    void* hw = strata::gpu::host_view((void*) raw);
+    void* ho = strata::gpu::host_view(out);
+    if (!hw || !ho) return false;
+    const size_t page = 16384;
+    auto wrap = [&](void* host, size_t bytes) {
+        const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
+        const size_t end = (size_t) ((uintptr_t) host) + bytes;
+        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+    };
+    auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
+    const size_t wbytes = (size_t) (n - 1) * ld * (kind == 0 ? 2 : 1) + (kind == 0 ? (size_t) k * 2 : (kind == 13 ? (size_t) (k / 256) * 176 : (size_t) (k / 32) * 34));
+    if (!std::getenv("DS4_NO_TOUCH")) {   // (the matrix may be file-backed pages not read yet: the GPU does not page them in, it stalls)
+        volatile unsigned char sink = 0;
+        for (size_t o = 0; o < wbytes; o += 4096) sink = sink + ((const volatile unsigned char*) hw)[o];
+        (void) sink;
+    }
+    mtl::Buffer bw = wrap(hw, wbytes);
+    mtl::Buffer bo = wrap(ho, (size_t) n * (size_t) k * 2);
+    if (!bw.handle || !bo.handle) return false;
+    mtl::Pipeline pl;
+    try { pl = g_cx->pipeline(g_lib, fn); } catch (...) { return false; }
+    size_t items = kind == 13 ? (size_t) n * (k / 256) * 8 : kind == 8 ? (size_t) n * (k / 32) : (size_t) n * k;
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.args = {mtl::Arg::B(bw, off(hw)), mtl::Arg::V((unsigned long) ld), mtl::Arg::V((unsigned) k), mtl::Arg::V((unsigned) n),
+              mtl::Arg::B(bo, off(ho))};
+    d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
+    d.grid[0] = (uint32_t) ((items + 255) / 256);
+    d.grid[1] = d.grid[2] = 1;
+    g_cx->run({d});
+    return true;
+}
+
+// Y[r][c] = alpha * (X16[r] . W16[c]) + beta * Y[r][c]: X16 rows x K (stride ldx halves), W16 N x K contiguous, Y rows x N float
+// (stride ldy).  The cuBLAS call's operands in row-major terms; the MPP tile kernel wants contiguous operands and result.
+bool gemm_f16_nt(const uint16_t* W16, const uint16_t* X16, int ldx, float* Y, int ldy, int rows, int N, int K, float alpha,
+                 float beta) {
+    if (rows <= 0 || N <= 0) return true;
+    if (!ensure()) return false;
+    if (g_lib_mm == -2) {
+        g_lib_mm = g_cx->compile({"quant.metal", "units.metal", "mma.metal", "dense_mm.metal"});
+        if (g_lib_mm < 0) std::fprintf(stderr, "dsv41 metal: compiling dense_mm.metal failed\n");
+    }
+    if (g_lib_mm < 0) return false;
+    const size_t page = 16384;
+    auto wrap = [&](void* host, size_t bytes) {
+        const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
+        const size_t end = (size_t) ((uintptr_t) host) + bytes;
+        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+    };
+    auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
+    void* hw = strata::gpu::host_view((void*) W16);
+    void* hx = strata::gpu::host_view((void*) X16);
+    void* hy = strata::gpu::host_view(Y);
+    if (!hw || !hx || !hy) return false;
+    mtl::Buffer bw = wrap(hw, (size_t) N * K * 2);
+    mtl::Buffer bx = wrap(hx, ((size_t) (rows - 1) * (size_t) ldx + (size_t) K) * 2);
+    mtl::Buffer by = wrap(hy, ((size_t) (rows - 1) * (size_t) ldy + (size_t) N) * 4);
+    if (!bw.handle || !bx.handle || !by.handle) return false;
+    // activations contiguous
+    mtl::Buffer ax = bx;
+    size_t ax_off = off(hx);
+    if (ldx != K) {
+        ax = scratch(g_gm_xs, (size_t) rows * K * 2);
+        ax_off = 0;
+        mtl::Pipeline pp;
+        try { pp = g_cx->pipeline(g_lib, "ds4_pack_h16"); } catch (...) { return false; }
+        mtl::Dispatch d;
+        d.p = &pp;
+        d.args = {mtl::Arg::B(bx, off(hx)), mtl::Arg::V((unsigned long) ldx), mtl::Arg::V((unsigned) K), mtl::Arg::B(ax)};
+        d.grid[0] = (uint32_t) ((K + 255) / 256);
+        d.grid[1] = (uint32_t) rows;
+        d.grid[2] = 1;
+        d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
+        g_cx->run({d});
+    }
+    const bool direct = ldy == N && alpha == 1.0f && beta == 0.0f;
+    mtl::Buffer ty = by;
+    size_t ty_off = off(hy);
+    if (!direct) {
+        ty = scratch(g_gm_yt, (size_t) rows * N * 4);
+        ty_off = 0;
+    }
+    const int tm = 64, tn = N <= 64 ? 32 : 64;
+    const std::string fn = "gemm_f16_" + std::to_string(tm) + "_" + std::to_string(tn) + "_4";
+    mtl::Pipeline pl;
+    try { pl = g_cx->pipeline(g_lib_mm, fn); } catch (...) { return false; }
+    struct GemmArgs { int M, N, K, pad; } ga{rows, N, K, 0};
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.args = {mtl::Arg::B(ax, ax_off), mtl::Arg::B(bw, off(hw)), mtl::Arg::B(ty, ty_off), mtl::Arg::V(ga)};
+    d.grid[0] = (uint32_t) ((N + tn - 1) / tn);
+    d.grid[1] = (uint32_t) ((rows + tm - 1) / tm);
+    d.grid[2] = 1;
+    d.tg[0] = 128; d.tg[1] = d.tg[2] = 1;
+    g_cx->run({d});
+    if (!direct) {
+        mtl::Pipeline pa;
+        try { pa = g_cx->pipeline(g_lib, "ds4_axpby_rows"); } catch (...) { return false; }
+        mtl::Dispatch e;
+        e.p = &pa;
+        e.args = {mtl::Arg::B(ty), mtl::Arg::B(by, off(hy)), mtl::Arg::V((unsigned long) ldy), mtl::Arg::V((unsigned) N),
+                  mtl::Arg::V(alpha), mtl::Arg::V(beta)};
+        e.grid[0] = (uint32_t) ((N + 255) / 256);
+        e.grid[1] = (uint32_t) rows;
+        e.grid[2] = 1;
+        e.tg[0] = 256; e.tg[1] = e.tg[2] = 1;
+        g_cx->run({e});
+    }
+    return true;
+}
+
+
+// ---- the prompt chunk's expert GEMMs (ds4_mm.metal): a set = n_exp consecutive expert slots, their rows sorted by expert ----
+namespace {
+int g_lib_moe = -2;
+mtl::Buffer g_mm_xs, g_mm_hs, g_mm_ys;   // grow-only scratch: the sorted rows' half activations; the gate/up's swiglu rows (the down's input)
+bool g_mm_hs_ok = false;
+size_t iq_bs(int type) { return type == 16 ? 66 : type == 17 ? 74 : type == 22 ? 82 : type == 18 ? 98 : 0; }
+struct DsMmArgsH {
+    unsigned long gate_off, up_off, down_off, stride;
+    unsigned gu_row, d_row, n_embd, n_ff;
+    float limit;
+    unsigned pad0;
+};
+bool mm_prepare() {
+    if (!ensure()) return false;
+    if (g_lib_moe == -2) {
+        g_lib_moe = g_cx->compile({"quant.metal", "units.metal", "mma.metal", "moe_mm.metal", "../src/engine/msl/ds4_mm.metal"});
+        if (g_lib_moe < 0) std::fprintf(stderr, "dsv41 metal: compiling ds4_mm.metal failed\n");
+    }
+    return g_lib_moe >= 0;
+}
+}  // namespace
+
+static bool mm_set(bool gate_up, const uint8_t* wbase, size_t stride, const size_t* tr, const int* hb, int n_exp, int total_rows,
+                   int n_embd, int n_ff, float limit, const float* xf, int ldx, const int* idx, const uint16_t* hin, uint16_t* hout,
+                   int ldh, float* yout, int ldy, int tg, int td) {
+    const int type = gate_up ? tg : td;
+    if (n_exp <= 0 || total_rows <= 0) return true;
+    if (iq_bs(tg) == 0 || iq_bs(td) == 0 || n_embd % 256 != 0 || n_ff % 256 != 0) return false;
+    if (ldh != n_ff || (!gate_up && ldy != n_embd)) return false;
+    if (gate_up ? (n_ff % 128 != 0) : (n_embd % 128 != 0)) return false;
+    if (!mm_prepare()) return false;
+    constexpr int TM = 16;
+    // the tile list: (slot, first row, valid rows) a TM-row piece of one expert
+    std::vector<int> tiles;
+    for (int e = 0; e < n_exp; ++e) {
+        const int lo = hb[e] - hb[0], hi = hb[e + 1] - hb[0];
+        for (int r = lo; r < hi; r += TM) { tiles.push_back(e); tiles.push_back(r); tiles.push_back(std::min(TM, hi - r)); tiles.push_back(0); }
+    }
+    const int ntiles = (int) (tiles.size() / 4);
+    if (ntiles == 0) return true;
+    const size_t page = 16384;
+    auto wrap = [&](void* host, size_t bytes) {
+        const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
+        const size_t end = (size_t) ((uintptr_t) host) + bytes;
+        const size_t len = ((end - base + page - 1) / page) * page;
+        if (std::getenv("DS4_MM_DBG")) { size_t o2 = 0; std::fprintf(stderr, "mm wrap %p len %zu own=%d rem=%zu\n", (void*) base, len, ds4_gpu_buffer_for_cpu((void*) base, len, &o2) != nullptr, ds4_gpu_alloc_remaining((void*) base)); }
+        return g_cx->wrap((void*) base, len);
+    };
+    auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
+    void* hw = strata::gpu::host_view((void*) wbase);
+    if (!hw) return false;
+    mtl::Buffer bw = wrap(hw, (size_t) n_exp * stride);
+    mtl::Buffer bt = g_cx->alloc(tiles.size() * 4);
+    std::memcpy(bt.ptr, tiles.data(), tiles.size() * 4);
+    DsMmArgsH a{tr[0], tr[1], tr[2], (unsigned long) stride, (unsigned) ((size_t) n_embd / 256 * iq_bs(tg)), (unsigned) ((size_t) n_ff / 256 * iq_bs(td)),
+                (unsigned) n_embd, (unsigned) n_ff, limit, std::getenv("DS4_MM_ABL") ? (unsigned) std::atoi(std::getenv("DS4_MM_ABL")) : 0u};
+    if (std::getenv("DS4_MM_DBG")) std::fprintf(stderr, "mm %s embd %d ff %d tg %d td %d lim %g stride %zu tr %zu %zu %zu gu_row %u d_row %u\n", gate_up ? "gu" : "dn", n_embd, n_ff, tg, td, limit, stride, tr[0], tr[1], tr[2], a.gu_row, a.d_row);
+    mtl::Pipeline pl;
+    try { pl = g_cx->pipeline(g_lib_moe, std::string(gate_up ? "ds4_mm_gu_" : "ds4_mm_dn_") + std::to_string(type)); } catch (...) { g_cx->free(bt); return false; }
+    if (std::getenv("DS4_MM_DBG")) std::fprintf(stderr, "pipe %s max_threads %d tgmem %d width %d\n", pl.name.c_str(), pl.max_threads, pl.static_tg_mem, pl.simd_width);
+    mtl::Dispatch d;
+    d.p = &pl;
+    d.tg[0] = 128; d.tg[1] = d.tg[2] = 1;
+    d.grid[2] = 1;
+    d.grid[1] = (uint32_t) ntiles;
+    if (gate_up) {
+        // the sorted rows' activations, half
+        const size_t xs_bytes = ((size_t) total_rows + TM) * (size_t) n_embd * 2;
+        if (!g_mm_xs.handle || g_mm_xs.bytes < xs_bytes) {
+            if (g_mm_xs.handle) g_cx->free(g_mm_xs);
+            g_mm_xs = g_cx->alloc(xs_bytes + (xs_bytes >> 2));
+        }
+        void* hx = strata::gpu::host_view((void*) xf);
+        void* hi = strata::gpu::host_view((void*) idx);
+        void* ho = strata::gpu::host_view(hout);
+        if (!hx || !hi || !ho) { g_cx->free(bt); return false; }
+        // (the float rows: the whole token slab the engine's c.x holds; its extent is the allocation's)
+        const size_t xrem = ds4_gpu_alloc_remaining(hx);
+        mtl::Buffer bxf = wrap(hx, xrem > 0 ? xrem : (size_t) ldx * 4);
+        mtl::Buffer bix = wrap(hi, (size_t) total_rows * 4);
+        mtl::Pipeline pg;
+        try { pg = g_cx->pipeline(g_lib_moe, "ds4_mm_gather"); } catch (...) { g_cx->free(bt); return false; }
+        mtl::Dispatch dg;
+        dg.p = &pg;
+        dg.args = {mtl::Arg::B(bxf, off(hx)), mtl::Arg::V((unsigned long) ldx), mtl::Arg::B(bix, off(hi)), mtl::Arg::V((unsigned) n_embd), mtl::Arg::B(g_mm_xs)};
+        dg.grid[0] = (uint32_t) ((n_embd + 255) / 256);
+        dg.grid[1] = (uint32_t) total_rows;
+        dg.grid[2] = 1;
+        dg.tg[0] = 256; dg.tg[1] = dg.tg[2] = 1;
+        g_cx->run({dg});
+        const size_t hs_bytes = ((size_t) total_rows + TM) * (size_t) n_ff * 2;
+        if (!g_mm_hs.handle || g_mm_hs.bytes < hs_bytes) {
+            if (g_mm_hs.handle) g_cx->free(g_mm_hs);
+            g_mm_hs = g_cx->alloc(std::max<size_t>(hs_bytes + (hs_bytes >> 2), std::getenv("DS4_MM_BIG") ? (size_t) 1 << 26 : 0));
+        }
+        g_mm_hs_ok = true;
+        {   // (the down's result rows are made here too)
+            const size_t ys_bytes = ((size_t) total_rows + TM) * (size_t) n_embd * 4;
+            if (!g_mm_ys.handle || g_mm_ys.bytes < ys_bytes) {
+                if (g_mm_ys.handle) g_cx->free(g_mm_ys);
+                g_mm_ys = g_cx->alloc(std::max<size_t>(ys_bytes + (ys_bytes >> 2), std::getenv("DS4_MM_BIG") ? (size_t) 1 << 26 : 0));
+            }
+        }
+        (void) ho;
+        d.args = {mtl::Arg::B(bw, off(hw)), mtl::Arg::B(g_mm_xs), mtl::Arg::B(g_mm_hs), mtl::Arg::B(bt), mtl::Arg::V(a), mtl::Arg::V((unsigned) ntiles)};
+        d.grid[0] = (uint32_t) (n_ff / 128);
+    } else {
+        void* hh = strata::gpu::host_view((void*) hin);
+        void* hy = strata::gpu::host_view(yout);
+        void* hy_real = nullptr;
+        if (!hh || !hy) { g_cx->free(bt); return false; }
+        const size_t hrem = ds4_gpu_alloc_remaining(hh);
+        if (!g_mm_hs_ok) { g_cx->free(bt); return false; }
+        g_mm_hs_ok = false;
+        (void) hrem;
+        mtl::Buffer& bh = g_mm_hs;
+        const size_t ys_bytes = ((size_t) total_rows + TM) * (size_t) n_embd * 4;
+        if (!g_mm_ys.handle || g_mm_ys.bytes < ys_bytes) {
+            if (g_mm_ys.handle) g_cx->free(g_mm_ys);
+            g_mm_ys = g_cx->alloc(std::max<size_t>(ys_bytes + (ys_bytes >> 2), std::getenv("DS4_MM_BIG") ? (size_t) 1 << 26 : 0));
+        }
+        mtl::Buffer by = g_mm_ys;
+        hy_real = hy;
+        hy = by.ptr;
+        if (std::getenv("DS4_MM_YALT")) { hy = hh; by = wrap(hh, (size_t) total_rows * (size_t) n_ff * 2); }
+        if (std::getenv("DS4_MM_EXP1")) { by = g_cx->alloc((size_t) total_rows * (size_t) n_embd * 4 + 4096); hy = by.ptr; }
+        d.args = {mtl::Arg::B(bw, off(hw)), mtl::Arg::B(g_mm_ys), mtl::Arg::B(g_mm_hs), mtl::Arg::B(bt), mtl::Arg::V(a), mtl::Arg::V((unsigned) ntiles)};
+        d.grid[0] = (uint32_t) (n_embd / 128);
+    }
+    if (!gate_up && std::getenv("DS4_MM_ASGU")) {   // test: the gate/up kernel on the down's buffers
+        static mtl::Pipeline pgu;
+        pgu = g_cx->pipeline(g_lib_moe, "ds4_mm_gu_" + std::to_string(tg));
+        d.p = &pgu;
+        d.args[1] = mtl::Arg::B(g_mm_xs);
+        d.args[2] = mtl::Arg::B(g_mm_ys);
+        if (std::atoi(std::getenv("DS4_MM_ASGU")) == 1) d.grid[0] = (uint32_t) (n_ff / 128);
+    }
+    if (!gate_up && std::getenv("DS4_MM_DROP")) {
+        const char* dk = std::getenv("DS4_MM_DROP");
+        static mtl::Buffer dummy;
+        if (!dummy.handle) dummy = g_cx->alloc(1 << 26);
+        static mtl::Buffer dummy2;
+        if (!dummy2.handle) dummy2 = g_cx->alloc(1 << 26);
+        for (int k = 0; k < 4; ++k) if (std::strchr(dk, '0' + k)) d.args[k] = mtl::Arg::B(std::getenv("DS4_MM_D2") && k == std::atoi(std::getenv("DS4_MM_D2")) ? dummy2 : dummy);
+    }
+    if (!gate_up && std::getenv("DS4_MM_ONE")) { d.grid[1] = 1; if (std::getenv("DS4_MM_DBG")) std::fprintf(stderr, "dn tile0 %d %d %d ntiles %d x %u rows %d\n", tiles[0], tiles[1], tiles[2], ntiles, d.grid[0], total_rows); }
+    if (std::getenv("DS4_MM_DBG")) for (size_t q = 0; q < d.args.size(); ++q) if (d.args[q].buf) std::fprintf(stderr, "arg %s %zu bytes %zu bias %zu off %zu ptr %p\n", gate_up ? "gu" : "dn", q, d.args[q].buf->bytes, (size_t) d.args[q].buf->bias, (size_t) d.args[q].off, d.args[q].buf->ptr);
+    if (std::getenv(gate_up ? "DS4_MM_NOGU" : "DS4_MM_NODN")) { g_cx->free(bt); return true; }
+    g_cx->run({d});
+    if (!std::getenv("DS4_MM_LEAK")) g_cx->free(bt);
+    if (!gate_up) {   // the result into the engine's rows
+        void* hyr = strata::gpu::host_view(yout);
+        const size_t n4 = (size_t) total_rows * (size_t) n_embd;
+        const size_t base = (size_t) ((uintptr_t) hyr) & ~(size_t) (page - 1);
+        mtl::Buffer bd = g_cx->wrap((void*) base, ((((size_t) (uintptr_t) hyr + n4 * 4 - base) + page - 1) / page) * page);
+        mtl::Pipeline pc;
+        try { pc = g_cx->pipeline(g_lib, "ds4_copy4"); } catch (...) { return false; }
+        mtl::Dispatch c;
+        c.p = &pc;
+        c.args = {mtl::Arg::B(g_mm_ys), mtl::Arg::B(bd, (size_t) ((uintptr_t) hyr - base)), mtl::Arg::V((unsigned long) n4)};
+        c.tg[0] = 256; c.tg[1] = c.tg[2] = 1;
+        c.grid[0] = (uint32_t) ((n4 + 255) / 256);
+        c.grid[1] = c.grid[2] = 1;
+        g_cx->run({c});
+    }
+    return true;
+}
+
+bool iq_set_gu(const uint8_t* wbase, size_t stride, const size_t* tr, const int* hbounds, int n_exp, int total_rows, int n_embd, int n_ff,
+               float limit, const float* xf, int ldx, const int* idx, uint16_t* h, int ldh, int tg, int td) {
+    return mm_set(true, wbase, stride, tr, hbounds, n_exp, total_rows, n_embd, n_ff, limit, xf, ldx, idx, nullptr, h, ldh, nullptr, 0, tg, td);
+}
+bool iq_set_dn(const uint8_t* wbase, size_t stride, const size_t* tr, const int* hbounds, int n_exp, int total_rows, int n_embd, int n_ff,
+               float limit, const uint16_t* h16, int ldh, float* y, int ldy, int tg, int td) {
+    return mm_set(false, wbase, stride, tr, hbounds, n_exp, total_rows, n_embd, n_ff, limit, nullptr, 0, nullptr, h16, nullptr, ldh, y, ldy, tg, td);
+}
 
 // ---- copies, fills and event marks on the context's queue (see ds4_copy4 in ds4_init.metal) -------------------------------
 // strata::gpu routes cudaMemcpyAsync / cudaMemsetAsync here when both ends are its allocations; ds4_ctx_mark ends the batched

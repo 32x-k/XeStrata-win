@@ -12,6 +12,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <string>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -39,6 +40,7 @@ struct Context::Impl {
     id<MTLCommandBuffer> cb_def = nil;   // the open command buffer single dispatches accumulate in
     id<MTLComputeCommandEncoder> enc_def = nil;
     int def_n = 0;
+    std::string def_names, inflight_names;   // (DS4_ERRINFO) the kernels of the open / the committed command buffer
     id<MTLSharedEvent> qev = nil;          // consecutive deferred buffers are chained through it (untracked buffers: the queue alone does not order them)
     uint64_t qev_v = 0;
     id<MTLCommandBuffer> inflight = nil;   // the last committed-but-not-waited deferred buffer (the queue runs them in order)
@@ -320,6 +322,8 @@ static void encode(id<MTLComputeCommandEncoder> enc, const Dispatch& d) {
             threadsPerThreadgroup:MTLSizeMake(d.tg[0], d.tg[1], d.tg[2])];
 }
 
+static std::deque<std::string> g_recent;   // the last dispatches encoded (printed with a command buffer failure)
+static std::string recent_str() { std::string r; for (auto& n : g_recent) r += n + " "; return r; }
 static double g_gpu_ms = 0.0;   // GPU time of every committed command buffer, summed
 static std::atomic<uint64_t> g_wait_ns{0}, g_enc_ns{0}, g_wait_n{0};   // host time: waiting on command buffers; encoding dispatches
 static std::mutex g_prof_mu;
@@ -368,6 +372,7 @@ void Context::split_runs() {
     [impl_->cb_def encodeSignalEvent:impl_->qev value:++impl_->qev_v];
     [impl_->cb_def commit];
     impl_->inflight = impl_->cb_def;
+    impl_->inflight_names = std::move(impl_->def_names); impl_->def_names.clear();
     impl_->cb_def = nil;
     impl_->enc_def = nil;
     impl_->def_n = 0;
@@ -388,6 +393,7 @@ void Context::wait_mark(void* token) {
     ++g_wait_n;
     if (cb.status != MTLCommandBufferStatusCompleted)
         std::fprintf(stderr, "mtl: deferred command buffer failed: %s\n", [[cb.error localizedDescription] UTF8String]);
+    if (cb.status != MTLCommandBufferStatusCompleted && std::getenv("DS4_ERRINFO")) std::fprintf(stderr, "mtl: recent: %s\n", recent_str().c_str()), std::fprintf(stderr, "mtl: info: %s\n", [[[cb.error userInfo] description] UTF8String]);
 }
 
 void Context::flush_runs() {
@@ -401,6 +407,7 @@ void Context::flush_runs() {
         [impl_->cb_def encodeSignalEvent:impl_->qev value:++impl_->qev_v];
         [impl_->cb_def commit];
         impl_->inflight = impl_->cb_def;
+        impl_->inflight_names = std::move(impl_->def_names); impl_->def_names.clear();
         impl_->cb_def = nil;
         impl_->enc_def = nil;
         impl_->def_n = 0;
@@ -415,6 +422,7 @@ void Context::flush_runs() {
           if (!g_prof_last.empty()) { std::lock_guard<std::mutex> pl(g_prof_mu); auto& e = g_prof[g_prof_last]; e.first += d * 1e6; e.second += 1; g_prof_last.clear(); } }
         if (impl_->inflight.status != MTLCommandBufferStatusCompleted)
             std::fprintf(stderr, "mtl: deferred command buffer failed: %s\n", [[impl_->inflight.error localizedDescription] UTF8String]);
+        if (impl_->inflight.status != MTLCommandBufferStatusCompleted && std::getenv("DS4_ERRINFO")) std::fprintf(stderr, "mtl: failed cb held: %s\n", impl_->inflight_names.c_str());
         impl_->inflight = nil;
     }
     for (void* h : impl_->graveyard) { id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
@@ -427,12 +435,20 @@ double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, 
         if (ds.size() == 1 && reps == 1 && !barrier_between) {
             if (impl_->cb_def == nil || impl_->def_n >= 2000000) {
                 if (impl_->cb_def != nil) split_runs();   // (a buffer committed earlier may still be running: the queue keeps the order)
+                if (std::getenv("DS4_ERRINFO")) {
+                    MTLCommandBufferDescriptor* cd = [MTLCommandBufferDescriptor new];
+                    cd.retainedReferences = NO;
+                    cd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+                    impl_->cb_def = [impl_->q commandBufferWithDescriptor:cd];
+                } else
                 impl_->cb_def = [impl_->q commandBufferWithUnretainedReferences];
                 if (impl_->qev != nil && impl_->qev_v > 0) [impl_->cb_def encodeWaitForEvent:impl_->qev value:impl_->qev_v];
                 impl_->enc_def = [impl_->cb_def computeCommandEncoderWithDispatchType:std::getenv("DS4_CONCURRENT") ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
             }
             const auto te0 = std::chrono::steady_clock::now();
             encode(impl_->enc_def, ds[0]);
+            g_recent.push_back(ds[0].p->name); if (g_recent.size() > 8) g_recent.pop_front();
+            if (std::getenv("DS4_ERRINFO")) impl_->def_names += ds[0].p->name + " ";
             g_enc_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - te0).count();
             static const bool trace = std::getenv("DS4_TRACE_DISP") != nullptr;
             if (trace) { std::lock_guard<std::mutex> lk(g_hist_mu); std::fprintf(stderr, "TRACE disp %s\n", ds[0].p->name.c_str()); }

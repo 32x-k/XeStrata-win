@@ -1256,6 +1256,12 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
 }
 
 void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    if (!bf16 && m.raw != nullptr) {   // the prompt chunk's dense matrices: F16 rows for the MPP GEMM
+        const int kind = m.fmt == kFmtGG ? m.K : m.fmt == kFmtQ8_0 ? 8 : m.fmt == kFmtBF16 ? 0 : -1;
+        if (kind >= 0 && ::strata::dsv41::metal_host::dequant_rows(kind, m.raw, row_stride(m), m.k, m.n, dst)) return;
+    }
+#endif
     if (m.fmt == kFmtGG && m.raw != nullptr) {   // a K-quant / i-quant dense matrix (the IST-DAS sets' Q5_K): its own dequantizer
         if (!iq::dequant_rows(m.K, m.raw, row_stride(m), m.k, m.n, dst, bf16, s)) fail("rows: a low-bit type not covered");
         return;
@@ -1486,6 +1492,8 @@ iq::SetArgs iq_set(const x3::SetArgs& sa) {   // a set as ds4_iq's arguments (th
     q.n_embd = sa.n_embd;
     q.n_ff = sa.n_ff;
     q.limit = sa.limit;
+    q.hbounds = sa.hbounds;
+    q.total_rows = sa.total_rows;
     return q;
 }
 }  // namespace

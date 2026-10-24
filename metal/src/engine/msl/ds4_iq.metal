@@ -874,3 +874,187 @@ kernel void ds4_iq3xxs_mv1(device const uchar* jobs [[buffer(0)]], uint2 tgp [[t
     const float v = simd_sum(acc);
     if (lane == 0u) b.y[row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Matvecs for NC activations at once (1, 2, 4, 8): the prompt windows' and the drafter's verify windows' columns.  A lane takes a
+// 32-value sub-block (a 64-value pair for Q5_K) of the row, decodes its weights ONCE and dots them with each of the NC columns'
+// int8 activations, so the weight bytes (the cost) are read once for the window.  ncol <= NC (the rest of the accumulators idle).
+
+template <uint NC>
+static inline void ds4_mvn_store(const device Ds4MvJob& b, uint row, ushort lane, thread float (&acc)[NC]) {
+    for (uint c = 0; c < NC; ++c) {
+        const float v = simd_sum(acc[c]);
+        if (lane == 0u && int(c) < b.ncol) b.y[(size_t) c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+    }
+}
+
+template <uint NC>
+kernel void ds4_q5k_mvn(device const uchar* jobs [[buffer(0)]], uint2 tgp [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    const device Ds4MvJob& b = *(const device Ds4MvJob*) (jobs + (size_t) tgp.y * sizeof(Ds4MvJob));
+    const uint row = tgp.x * 8u + (tid >> 5);
+    if (int(row) >= b.n) return;
+    const uint nblk = uint(b.k) / 256u, nsb = uint(b.k) / 32u;
+    const device uchar* w = b.w + (size_t) row * b.ld;
+    const uint j = lane & 3u;
+    const uint bsel = lane >> 2;
+    float acc[NC];
+    for (uint c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (uint blk = bsel; blk < nblk; blk += 8u) {
+        const device uchar* p = w + (size_t) blk * 176u;
+        const float d = float(as_type<half>(*(const device ushort*) p));
+        const float dmin = float(as_type<half>(*(const device ushort*) (p + 2)));
+        int sc0, mm0, sc1, mm1;
+        ds4_k_scale(p + 4, int(2u * j), sc0, mm0);
+        ds4_k_scale(p + 4, int(2u * j + 1u), sc1, mm1);
+        const device uint4* qs4 = (const device uint4*) (p + 48u + 32u * j);
+        const device uint4* qh4 = (const device uint4*) (p + 16);
+        const uint4 qa = qs4[0], qb = qs4[1], ha = qh4[0], hb = qh4[1];
+        const uint qsw[8] = {qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w};
+        const uint qhw[8] = {ha.x, ha.y, ha.z, ha.w, hb.x, hb.y, hb.z, hb.w};
+        uint q0w[8], q1w[8];
+        for (uint t = 0; t < 8u; ++t) {
+            q0w[t] = (qsw[t] & 0x0f0f0f0fu) | (((qhw[t] >> (2u * j)) & 0x01010101u) << 4);
+            q1w[t] = ((qsw[t] >> 4) & 0x0f0f0f0fu) | (((qhw[t] >> (2u * j + 1u)) & 0x01010101u) << 4);
+        }
+        for (uint c = 0; c < NC; ++c) {
+            const device uint4* xq4 = (const device uint4*) (b.xq + (size_t) c * b.k + (size_t) blk * 256u + 64u * j);
+            const uint4 xa = xq4[0], xb = xq4[1], xc = xq4[2], xd4 = xq4[3];
+            const uint xlo[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+            const uint xhi[8] = {xc.x, xc.y, xc.z, xc.w, xd4.x, xd4.y, xd4.z, xd4.w};
+            int sq0 = 0, sx0 = 0, sq1 = 0, sx1 = 0;
+            for (uint t = 0; t < 8u; ++t) {
+                for (uint i = 0; i < 4u; ++i) {
+                    const int x0 = int(char(xlo[t] >> (8u * i))), x1 = int(char(xhi[t] >> (8u * i)));
+                    sq0 += int((q0w[t] >> (8u * i)) & 0xffu) * x0;
+                    sq1 += int((q1w[t] >> (8u * i)) & 0xffu) * x1;
+                    sx0 += x0;
+                    sx1 += x1;
+                }
+            }
+            acc[c] = fma(b.xd[(size_t) c * nsb + blk * 8u + 2u * j], d * float(sc0) * float(sq0) - dmin * float(mm0) * float(sx0), acc[c]);
+            acc[c] = fma(b.xd[(size_t) c * nsb + blk * 8u + 2u * j + 1u], d * float(sc1) * float(sq1) - dmin * float(mm1) * float(sx1), acc[c]);
+        }
+    }
+    ds4_mvn_store<NC>(b, row, lane, acc);
+}
+
+// the grid-coded types: decode the sub-block's 32 weights (signs applied) into w[32] ...
+static inline void ds4_w32_iq2xxs(const device uchar* p, uint ib, thread int (&w)[32], thread float& db) {
+    const float d = float(as_type<half>(*(const device ushort*) p));
+    const device ushort* us = (const device ushort*) (p + 2u + 8u * ib);
+    const uint aux0 = uint(us[0]) | (uint(us[1]) << 16);
+    const uint aux1 = uint(us[2]) | (uint(us[3]) << 16);
+    db = d * (0.5f + float(aux1 >> 28)) * 0.25f;
+    for (uint l = 0; l < 4u; ++l) {
+        const ulong g = iq2xxs_grid[(aux0 >> (8u * l)) & 0xffu];
+        const uint sg = uint(ksigns_iq2xs[(aux1 >> (7u * l)) & 127u]);
+        for (uint i = 0; i < 8u; ++i) {
+            const int code = int((g >> (8u * i)) & 0xffu);
+            w[l * 8u + i] = ((sg >> i) & 1u) != 0u ? -code : code;
+        }
+    }
+}
+static inline void ds4_w32_iq2xs(const device uchar* p, uint ib, thread int (&w)[32], thread float& db0, thread float& db1) {
+    const float d = float(as_type<half>(*(const device ushort*) p));
+    const device ushort* qs = (const device ushort*) (p + 2u + 8u * ib);
+    const uint sc = uint(p[66u + ib]);
+    db0 = d * (0.5f + float(sc & 0xfu)) * 0.25f;
+    db1 = d * (0.5f + float(sc >> 4)) * 0.25f;
+    for (uint l = 0; l < 4u; ++l) {
+        const uint q = uint(qs[l]);
+        const ulong g = iq2xs_grid[q & 511u];
+        const uint sg = uint(ksigns_iq2xs[(q >> 9) & 127u]);
+        for (uint i = 0; i < 8u; ++i) {
+            const int code = int((g >> (8u * i)) & 0xffu);
+            w[l * 8u + i] = ((sg >> i) & 1u) != 0u ? -code : code;
+        }
+    }
+}
+static inline void ds4_w32_iq2s(const device uchar* p, uint ib, thread int (&w)[32], thread float& db0, thread float& db1) {
+    const float d = float(as_type<half>(*(const device ushort*) p));
+    const device uchar* qs = p + 2u + 4u * ib;
+    const device uchar* sgb = p + 34u + 4u * ib;
+    const uint qh = uint(p[66u + ib]);
+    const uint sc = uint(p[74u + ib]);
+    db0 = d * (0.5f + float(sc & 0xfu)) * 0.25f;
+    db1 = d * (0.5f + float(sc >> 4)) * 0.25f;
+    for (uint l = 0; l < 4u; ++l) {
+        const uint idx = uint(qs[l]) | ((qh << (8u - 2u * l)) & 0x300u);
+        const ulong g = iq2s_grid[idx];
+        const uint sg = uint(sgb[l]);
+        for (uint i = 0; i < 8u; ++i) {
+            const int code = int((g >> (8u * i)) & 0xffu);
+            w[l * 8u + i] = ((sg >> i) & 1u) != 0u ? -code : code;
+        }
+    }
+}
+static inline void ds4_w32_iq3xxs(const device uchar* p, uint ib, thread int (&w)[32], thread float& db) {
+    const float d = float(as_type<half>(*(const device ushort*) p));
+    const device uchar* qs = p + 2u;
+    const uint w0 = uint(qs[8u * ib]) | (uint(qs[8u * ib + 1u]) << 8) | (uint(qs[8u * ib + 2u]) << 16) | (uint(qs[8u * ib + 3u]) << 24);
+    const uint w1 = uint(qs[8u * ib + 4u]) | (uint(qs[8u * ib + 5u]) << 8) | (uint(qs[8u * ib + 6u]) << 16) | (uint(qs[8u * ib + 7u]) << 24);
+    const uint aux = uint(qs[64u + 4u * ib]) | (uint(qs[65u + 4u * ib]) << 8) | (uint(qs[66u + 4u * ib]) << 16) | (uint(qs[67u + 4u * ib]) << 24);
+    db = d * (0.5f + float(aux >> 28)) * 0.5f;
+    for (uint l = 0; l < 4u; ++l) {
+        const uint wv = l < 2u ? w0 : w1, sh = 16u * (l & 1u);
+        const uint sgn = uint(ksigns_iq2xs[(aux >> (7u * l)) & 127u]);
+        const uint g0 = iq3xxs_grid[(wv >> sh) & 255u], g1 = iq3xxs_grid[(wv >> (sh + 8u)) & 255u];
+        for (uint i = 0; i < 4u; ++i) {
+            int v0 = int((g0 >> (8u * i)) & 0xffu), v1 = int((g1 >> (8u * i)) & 0xffu);
+            if ((sgn & (1u << i)) != 0u) v0 = -v0;
+            if ((sgn & (1u << (i + 4u))) != 0u) v1 = -v1;
+            w[l * 8u + i] = v0;
+            w[l * 8u + 4u + i] = v1;
+        }
+    }
+}
+
+// ... and dot them with each column (the sub-block's four 8-value groups: l < 2 use db0, l >= 2 db1)
+template <uint NC, uint TYPE>
+kernel void ds4_iqg_mvn(device const uchar* jobs [[buffer(0)]], uint2 tgp [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    const device Ds4MvJob& b = *(const device Ds4MvJob*) (jobs + (size_t) tgp.y * sizeof(Ds4MvJob));
+    const uint row = tgp.x * 8u + (tid >> 5);
+    if (int(row) >= b.n) return;
+    const uint nblk = uint(b.k) / 256u, nsb = uint(b.k) / 32u;
+    constexpr uint bs = TYPE == 16 ? 66u : (TYPE == 17 ? 74u : (TYPE == 18 ? 98u : 82u));
+    const device uchar* w0p = b.w + (size_t) row * b.ld;
+    const uint ib = lane & 7u;
+    const uint bsel = lane >> 3;
+    float acc[NC];
+    for (uint c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (uint blk = bsel; blk < nblk; blk += 4u) {
+        const device uchar* p = w0p + (size_t) blk * bs;
+        int w[32];
+        float db0, db1;
+        if (TYPE == 16) { ds4_w32_iq2xxs(p, ib, w, db0); db1 = db0; }
+        else if (TYPE == 17) ds4_w32_iq2xs(p, ib, w, db0, db1);
+        else if (TYPE == 22) ds4_w32_iq2s(p, ib, w, db0, db1);
+        else { ds4_w32_iq3xxs(p, ib, w, db0); db1 = db0; }
+        for (uint c = 0; c < NC; ++c) {
+            const device uint4* xq4 = (const device uint4*) (b.xq + (size_t) c * b.k + (size_t) blk * 256u + 32u * ib);
+            const uint4 xa = xq4[0], xb = xq4[1];
+            const uint xw[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+            int s0 = 0, s1 = 0;
+            for (uint t = 0; t < 8u; ++t) {
+                int part = 0;
+                for (uint i = 0; i < 4u; ++i) part += w[t * 4u + i] * int(char(xw[t] >> (8u * i)));
+                if (t < 4u) s0 += part; else s1 += part;
+            }
+            acc[c] = fma(b.xd[(size_t) c * nsb + blk * 8u + ib], db0 * float(s0) + db1 * float(s1), acc[c]);
+        }
+    }
+    ds4_mvn_store<NC>(b, row, lane, acc);
+}
+
+#define DS4_MVN_INST(NC)                                                                                                    \
+    template [[host_name("ds4_q5k_mvn" #NC)]] kernel void ds4_q5k_mvn<NC>(device const uchar*, uint2, uint, ushort);        \
+    template [[host_name("ds4_iq2xxs_mvn" #NC)]] kernel void ds4_iqg_mvn<NC, 16>(device const uchar*, uint2, uint, ushort); \
+    template [[host_name("ds4_iq2xs_mvn" #NC)]] kernel void ds4_iqg_mvn<NC, 17>(device const uchar*, uint2, uint, ushort);  \
+    template [[host_name("ds4_iq2s_mvn" #NC)]] kernel void ds4_iqg_mvn<NC, 22>(device const uchar*, uint2, uint, ushort);   \
+    template [[host_name("ds4_iq3xxs_mvn" #NC)]] kernel void ds4_iqg_mvn<NC, 18>(device const uchar*, uint2, uint, ushort);
+DS4_MVN_INST(1)
+DS4_MVN_INST(2)
+DS4_MVN_INST(4)
+DS4_MVN_INST(8)
