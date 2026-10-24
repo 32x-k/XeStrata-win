@@ -34,7 +34,8 @@ answers, no questions), --setup (install another model / change settings instead
 (whether a newer XeStrata release is out), --images qwen-image-turbo|qwen-image-base|...-uncensored|no (image
 generation on XeStrata's image engine, POST /v1/images/generations: Qwen-Image-2.1-Turbo in 8 steps, or its base
 model Qwen-Image-2.1 in 40; mage-flow-turbo|mage-flow|mage-flow-base[-uncensored]: Mage-Flow in 4, 20 or 30;
--uncensored: the text encoder with the refusal direction removed; --image-quant Q4_K_M|Q6_K|Q8_0 (Qwen-Image),
+magetrail[-uncensored]: MageTrail, Mage-Flow tuned on Danbooru and e621 images, in 30; -uncensored: the text
+encoder with the refusal direction removed; --image-quant Q4_K_M|Q6_K|Q8_0 (Qwen-Image),
 --image-dit-q8 auto|on|off and --image-dit-keep on|off (Mage-Flow), --image-ssd-offload on|off, --image-gpu-policy
 auto|keep|shrink|unload).
 
@@ -5751,15 +5752,17 @@ def main() -> int:
                          "the CPU): more reads small text and charts better, and takes longer to encode; remembered "
                          "for this model")
     ap.add_argument("--images", metavar="qwen-image-turbo|qwen-image-base|mage-flow-turbo|mage-flow|"
-                    "mage-flow-base[-uncensored]|no",
+                    "mage-flow-base|magetrail[-uncensored]|no",
                     help="image generation (POST /v1/images/generations) on XeStrata's image engine: "
                          "qwen-image-turbo (Qwen-Image-2.1-Turbo, 8 steps) or qwen-image-base (its base model "
                          "Qwen-Image-2.1, 40 steps by default, about 5 times as long an image); the text encoder "
                          "Unsloth's Qwen3-VL-8B or, -uncensored, AtomicChat's with its refusal direction removed "
                          "(either Q8_0, lowered first (Q6_K, Q5_K, Q4_K) when the files would not fit the RAM the "
                          "text model leaves); mage-flow-turbo (Mage-Flow-Turbo, 4 steps), mage-flow (20 steps, "
-                         "guidance 5) or mage-flow-base (30 steps, guidance 5), the text encoder Unsloth's "
-                         "Qwen3-VL-4B or, -uncensored, huihui-ai's abliterated one; no = take it out of the config")
+                         "guidance 5) or mage-flow-base (30 steps, guidance 5), or magetrail (MageTrail, Mage-Flow "
+                         "tuned on Danbooru and e621 images, 30 steps, guidance 5; no edits), the text encoder "
+                         "Unsloth's Qwen3-VL-4B or, -uncensored, huihui-ai's abliterated one; no = take it out of the "
+                         "config")
     ap.add_argument("--image-quant", choices=["Q4_K_M", "Q6_K", "Q8_0"],
                     help="the image model's size (default Q8_0, lowered when its files would not fit the RAM the "
                          "text model leaves, after its text encoder; the GPU's memory does not decide it)")

@@ -25,6 +25,10 @@ one size: the engine keeps its blocks FP16 in VRAM when they fit, else quantizes
 encoder (Unsloth's GGUF, or with -uncensored huihui-ai's abliterated one as noctrex quantized it), with its edit model
 (the DiT the engine switches to for an edit, "edit_model") and Qwen3-VL-4B's vision encoder, in its own folder
 (mage-flow).  Only its text encoder is lowered for the RAM.
+
+MageTrail (RicemanT, MIT; magetrail): a finetune of Mage-Flow on Danbooru and e621 images, its DiT 12 blocks with a
+shared low-rank modulation (the engine reads it as it is), decoded with the Flux2 VAE its author uses (Mage-VAE's
+latent space); Mage-Flow's text encoders, no edit model.
 """
 from __future__ import annotations
 
@@ -38,6 +42,7 @@ REVISIONS = {                                       # the `sha` of https://huggi
     "AtomicChat/Qwen-Image-2.1-Turbo-Uncensored-GGUF": "df96693dbdfb8738c0bf1bbd0337d149808db948",  # 2026-10-19
     "unsloth/Qwen-Image-2.1-GGUF": "2c31ccd392b367a6637841a143813320a02dff55",                    # 2026-10-21
     "Comfy-Org/Mage-Flow": "6ff68fbf3c667325e961d551691b246791d5eec0",                            # 2026-10-21
+    "RicemanT/MageTrail": "da7a696ac65772108f793e09fef6a29afaa9c7c0",                             # 2026-10-24
     "unsloth/Qwen3-VL-4B-Instruct-GGUF": "00c00da0690c4b14b5539b02c4ea5d7c9102b35e",              # 2026-10-21
     "noctrex/Huihui-Qwen3-VL-4B-Instruct-abliterated-GGUF": "0e204140ef43727fb4ee4d4bbd88c948c64719df",  # 2026-10-21
 }
@@ -46,6 +51,7 @@ _BASE = "unsloth/Qwen-Image-2.1-GGUF"
 _VL = "unsloth/Qwen3-VL-8B-Instruct-GGUF"
 _AC = "AtomicChat/Qwen-Image-2.1-Turbo-Uncensored-GGUF"
 _MF = "Comfy-Org/Mage-Flow"
+_MT = "RicemanT/MageTrail"
 _VL4 = "unsloth/Qwen3-VL-4B-Instruct-GGUF"
 _HH4 = "noctrex/Huihui-Qwen3-VL-4B-Instruct-abliterated-GGUF"
 # name -> (repo, path in the repo, bytes, sha256): the Hub's LFS pointers at the pinned revisions
@@ -104,6 +110,11 @@ FILES = {
                   "1b9f4e92f0fbda14d7d7b58baed86039b8a980fe503d9d6a9393f25c0028f1fc"),
     "mf-vae": (_MF, "vae/mage_flow_vae_bf16.safetensors", 345_053_056,
                "34e076dc1e8a15321e1e07be5111d59cf16dd10b804b7c7e20b4de29013427e0"),
+    # MageTrail's DiT (V0.4, its latest) and the Flux2 VAE it ships
+    "mf-trail-bf16": (_MT, "V0.4/MageTrail-V0.4-100ArtistTuneTest.safetensors", 5_970_852_800,
+                      "085535e6499d30083bcbc2060c112dc41ec8710f79831dea5f7ac5f897c3cd00"),
+    "mf-trail-vae": (_MT, "flux2-vae.safetensors", 336_211_292,
+                     "868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3"),
     "llm-mf-stock-Q8_0": (_VL4, "Qwen3-VL-4B-Instruct-Q8_0.gguf", 4_280_406_816,
                           "e30b41d2f2cc48149dfbba1b3fb2c023c7e6bf2def75833d4d43820df75efeb3"),
     "llm-mf-stock-Q6_K": (_VL4, "Qwen3-VL-4B-Instruct-UD-Q6_K_XL.gguf", 3_658_224_416,
@@ -134,7 +145,9 @@ IMAGE_MODELS = {"qwen-image-turbo": ("qwen-image-2.1-turbo", "turbo", "stock"),
                 "mage-flow": ("mage-flow", "mf-rl", "mf-stock"),
                 "mage-flow-uncensored": ("mage-flow-uncensored", "mf-rl", "mf-uncensored"),
                 "mage-flow-base": ("mage-flow-base", "mf-base", "mf-stock"),
-                "mage-flow-base-uncensored": ("mage-flow-base-uncensored", "mf-base", "mf-uncensored")}
+                "mage-flow-base-uncensored": ("mage-flow-base-uncensored", "mf-base", "mf-uncensored"),
+                "magetrail": ("magetrail", "mf-trail", "mf-stock"),
+                "magetrail-uncensored": ("magetrail-uncensored", "mf-trail", "mf-uncensored")}
 DEFAULT_MODEL = "qwen-image-turbo"
 # the DiT -> its name, its steps (Turbo's are its own 8 sigmas; the base model's, the default of its pipeline,
 # diffusers' QwenImage21Pipeline, sampled without guidance as Qwen meant it), its Hugging Face model
@@ -144,10 +157,13 @@ DITS = {"turbo": ("Qwen-Image-2.1-Turbo", 8, "Qwen/Qwen-Image-2.1-Turbo"),
         # 30 with guidance 5.0), all on its static-shift schedule
         "mf-turbo": ("Mage-Flow-Turbo", 4, "microsoft/Mage"),
         "mf-rl": ("Mage-Flow", 20, "microsoft/Mage"),
-        "mf-base": ("Mage-Flow-Base", 30, "microsoft/Mage")}
-MF_CFG = {"mf-turbo": 1.0, "mf-rl": 5.0, "mf-base": 5.0}   # Mage-Flow's guidance scale by DiT
+        "mf-base": ("Mage-Flow-Base", 30, "microsoft/Mage"),
+        # MageTrail: its README's faster settings (30 steps, guidance 5; 50 and 8 at most)
+        "mf-trail": ("MageTrail", 30, "RicemanT/MageTrail")}
+MF_CFG = {"mf-turbo": 1.0, "mf-rl": 5.0, "mf-base": 5.0, "mf-trail": 5.0}   # Mage-Flow's guidance scale by DiT
 # each Mage-Flow DiT's edit model and its steps (its README: Edit-Turbo 4, Edit (RL) and Edit-Base 30)
 MF_EDIT = {"mf-turbo": ("mf-edit-turbo", 4), "mf-rl": ("mf-edit-rl", 30), "mf-base": ("mf-edit-base", 30)}
+MF_VAE = {"mf-trail": "mf-trail-vae"}   # a DiT's VAE where it is not Mage-VAE ("mf-vae")
 MF_DIR = "mage-flow"
 MF_Q8_SHARE = 34 / 64      # Mage-Flow's DiT in RAM: its bf16 blocks quantized to Q8_0 (34 bytes a 32 values)
 # every model's files in one folder (named after the first one): they share all but the DiT
@@ -169,6 +185,9 @@ def dit_quants(dit: str) -> tuple[str, ...]:
 
 def license_note(dit: str) -> str:
     name, _, repo = DITS[dit]
+    if dit == "mf-trail":
+        return (f"{name} (RicemanT's finetune of Mage-Flow on Danbooru and e621 images) is under the MIT license: "
+                f"https://huggingface.co/{repo}")
     if is_mage(dit):
         return (f"{name} is under the MIT license; Microsoft released it for research, and asks those who deploy it "
                 f"more widely to add their own safeguards (content moderation): https://github.com/{repo}")
@@ -184,9 +203,12 @@ def text_file(text_encoder: str, text_quant: str) -> str:
 def file_names(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant: str = DEFAULT_TEXT_QUANT,
                dit: str = "turbo") -> tuple[str, ...]:
     """The FILES entries an image install with that DiT at `quant` and that text encoder uses (Mage-Flow: the DiT and
-    its edit model, and Qwen3-VL-4B's vision encoder)."""
+    its edit model, and Qwen3-VL-4B's vision encoder, where it has an edit model)."""
     if is_mage(dit):
-        return (f"{dit}-bf16", f"{MF_EDIT[dit][0]}-bf16", "mf-vae", text_file(text_encoder, text_quant), "mf-mmproj")
+        vae, text = MF_VAE.get(dit, "mf-vae"), text_file(text_encoder, text_quant)
+        if dit not in MF_EDIT:
+            return (f"{dit}-bf16", vae, text)
+        return (f"{dit}-bf16", f"{MF_EDIT[dit][0]}-bf16", vae, text, "mf-mmproj")
     return (f"{dit}-{quant}", "vae", text_file(text_encoder, text_quant), "mmproj")
 
 
@@ -196,7 +218,7 @@ def ram_need_gb(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant
     the OS file cache (the engine maps them), and the engine's own; Mage-Flow's DiTs as the Q8_0 their blocks become
     (the file's pages dropped once read), its edit model's too with `keep` (else one DiT at a time)."""
     names = file_names(quant, text_encoder, text_quant, dit)
-    if is_mage(dit) and not keep:
+    if is_mage(dit) and not keep and dit in MF_EDIT:
         names = tuple(k for k in names if k != f"{MF_EDIT[dit][0]}-bf16")
     return sum(FILES[k][2] * (MF_Q8_SHARE if k.endswith("-bf16") and is_mage(dit) else 1) for k in names) / 1e9 \
         + HOST_GB
@@ -237,12 +259,12 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
     name, dit, text_encoder = IMAGE_MODELS[model]
     if is_mage(dit):
         q8 = {"dit_q8": bool(dit_q8)} if dit_q8 is not None else {}
+        edit = {"edit_model": str(local_path(models_dir, f"{MF_EDIT[dit][0]}-bf16")), "edit_steps": MF_EDIT[dit][1],
+                "vision": str(local_path(models_dir, "mf-mmproj"))} if dit in MF_EDIT else {}
         return {**q8, "model_name": name, "family": "mage-flow", "exe": str(exe), "quant": "bf16",
                 "diffusion_model": str(local_path(models_dir, f"{dit}-bf16")), "steps": DITS[dit][1],
-                "schedule": "mage", "cfg_scale": MF_CFG[dit], "mask": False,
-                "edit_model": str(local_path(models_dir, f"{MF_EDIT[dit][0]}-bf16")), "edit_steps": MF_EDIT[dit][1],
-                "vision": str(local_path(models_dir, "mf-mmproj")), "dit_keep": bool(dit_keep),
-                "transparency": False, "vae": str(local_path(models_dir, "mf-vae")),
+                "schedule": "mage", "cfg_scale": MF_CFG[dit], "mask": False, **edit, "dit_keep": bool(dit_keep),
+                "transparency": False, "vae": str(local_path(models_dir, MF_VAE.get(dit, "mf-vae"))),
                 "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))), "text_encoder": text_encoder,
                 "text_quant": text_quant, "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
     return {"model_name": name, "exe": str(exe), "quant": quant,
