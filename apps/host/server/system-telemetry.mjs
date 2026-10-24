@@ -1,6 +1,7 @@
 /** Host counters. CPU sockets are measured only when their logical CPU IDs are known. */
 import os from 'node:os';
 import { spawn } from 'node:child_process';
+import { createPowerShellLoop, endWithHost } from './windows-poll.mjs';
 import { readFile, readdir } from 'node:fs/promises';
 import { availableMemoryGb } from './hardware.mjs';
 import { probe } from './util.mjs';
@@ -47,45 +48,25 @@ export function parseWindowsDiskLine(line) {
   return m?{read:Number(m[1]),write:Number(m[2])}:null;
 }
 
-/**
- * One long-lived PowerShell reads the disk counters in a loop. A new PowerShell per sample
- * paid the cold WMI start every time, missed its timeout and burned WmiPrvSE (#3939).
- * Gives up after repeated early exits, so a broken counter stays quiet.
- */
+/** The disk counters, read by one long-lived PowerShell (windows-poll.mjs; #3939). */
 export function createWindowsDiskReader({ spawnFn=spawn, intervalSec=4, maxStarts=3, now=Date.now }={}) {
-  let child=null,latest=null,starts=0,buffer='';
+  let latest=null;
   const script=`while($true){$d=Get-CimInstance Win32_PerfRawData_PerfDisk_PhysicalDisk -Filter "Name='_Total'";if($d){[Console]::Out.WriteLine(([string]$d.DiskReadBytesPersec)+' '+([string]$d.DiskWriteBytesPersec));[Console]::Out.Flush()};Start-Sleep -Seconds ${intervalSec}}`;
-  function start() {
-    if(child||starts>=maxStarts)return;
-    starts++;
-    let proc;
-    try { proc=spawnFn('powershell.exe',['-NoProfile','-NonInteractive','-Command',script],{windowsHide:true,stdio:['ignore','pipe','ignore']}); }
-    catch { return; }
-    child=proc;
-    proc.on?.('error',()=>{ if(child===proc)child=null; });
-    proc.on?.('exit',()=>{ if(child===proc){child=null;latest=null;} });
-    proc.stdout?.on('data',chunk=>{
-      buffer+=chunk;
-      let i;
-      while((i=buffer.indexOf('\n'))>=0){
-        const parsed=parseWindowsDiskLine(buffer.slice(0,i));
-        buffer=buffer.slice(i+1);
-        if(parsed){latest={...parsed,at:now()};starts=0;}
-      }
-    });
-    proc.unref?.();
-    proc.stdout?.unref?.();
-  }
+  const loop=createPowerShellLoop({script,spawnFn,maxStarts,onLine:line=>{
+    const parsed=parseWindowsDiskLine(line);
+    if(parsed)latest={...parsed,at:now()};
+    return !!parsed;
+  }});
   return {
-    read() { start(); return latest; },
-    stop() { try{child?.kill();}catch{} child=null; },
-    get starts() { return starts; },
+    read() { loop.start(); return latest&&now()-latest.at<5*intervalSec*1000?latest:null; },
+    stop() { loop.stop(); },
+    get starts() { return loop.starts; },
   };
 }
 
 let windowsReader=null;
 function windowsDisks() {
-  if(!windowsReader){windowsReader=createWindowsDiskReader();process.once('exit',()=>windowsReader.stop());}
+  windowsReader??=endWithHost(createWindowsDiskReader());
   return windowsReader.read();
 }
 
