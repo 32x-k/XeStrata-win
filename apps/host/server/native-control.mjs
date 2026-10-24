@@ -55,7 +55,7 @@ export function createNativeControl({directory,requests=()=>[],changed=()=>{},sp
  const defaultInstall=()=>process.env.STRATA_INSTALL_DIR?resolve(process.env.STRATA_INSTALL_DIR):join(dirname(componentsDirectory()),'install');
  let packagedInstall=null;
  /* The component updates and the rollback go through Control, not through the native snapshot, so they work in the first seconds after the app starts and on a PC that has no engine yet. */
- const COMPONENT_KINDS=['update-engine','update-strata','rollback'];
+ const COMPONENT_KINDS=['update-engine','update-strata','rollback','install-engine-file'];
  const updateLog=line=>{try{console.log(`update · ${line}`);}catch{/* no console */}};
  const NO_INSTALL='Installing, updating, tuning with calibration or rolling back model files and engines happens from the Terminal (strata install), never while the app runs.';
  let defaultId=null,timer=null,closing=false,polling=false;
@@ -338,7 +338,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
  function ensurePoll(){if(!timer){timer=setInterval(()=>void poll(),2000);timer.unref?.();}void poll();}
  async function benchmark(job,args){const instance=resolveInstance(args.instanceId);job.instanceId=instance.id;if(busy(requests().filter(r=>r.instanceId===instance.id)))throw new Error('Wait for this model to finish before benchmarking.');const started=Date.now();job.abort=new AbortController();const response=await fetcher(`http://127.0.0.1:${instance.port}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${instance.key}`},signal:AbortSignal.any([job.abort.signal,AbortSignal.timeout(180000)]),body:JSON.stringify({model:instance.apiModelId,messages:[{role:'user',content:'Explain how a rainbow forms in clear, simple language.'}],temperature:0,reasoning_effort:'none',max_tokens:200,stream:false})});const body=await response.json();if(!response.ok)throw new Error(body.error?.message??'Benchmark failed.');if(job.state!=='running')return;const result={summary:'Measured benchmark complete.',at:new Date().toISOString(),model:instance.apiModelId,durationMs:Date.now()-started,tokensIn:body.usage?.prompt_tokens??null,tokensOut:body.usage?.completion_tokens??null,outputTps:body.timings?.predicted_per_second??null,promptTps:body.timings?.prompt_per_second??null,source:'engine',settings:'Greedy · thinking off · up to 200 output tokens'};writeFileSync(join(directory,'native-benchmark.json'),JSON.stringify(result,null,2),{mode:0o600});return result;}
  function resolveInstance(id){const aliases=[...instances.values()].filter(i=>i.aliases?.includes(id));if(aliases.length>1&&!instances.has(id)&&![...instances.values()].some(i=>i.apiModelId===id))throw new Error('This alias matches more than one instance. Choose its exact model ID.');const i=instances.get(id)??[...instances.values()].find(i=>i.apiModelId===id)??aliases[0]??(!id&&instances.size===1?[...instances.values()][0]:undefined);if(!i)throw new Error('Choose a loaded model ID.');if(i.status!=='ready')throw new Error('This model is not ready.');return i;}
- async function program(job,args){if(packaged)return componentProgram(job);if(externalRunning().length)throw new Error('Stop the native server running outside this UI before changing engine files.');if(instances.size)throw new Error('Unload native models before changing engine files.');const folder=repo();let {command,args:prefix}=python(),argv;
+ async function program(job,args){if(packaged)return componentProgram(job,args);if(externalRunning().length)throw new Error('Stop the native server running outside this UI before changing engine files.');if(instances.size)throw new Error('Unload native models before changing engine files.');const folder=repo();let {command,args:prefix}=python(),argv;
   if(job.kind==='calibrate'||job.kind==='tune'){if(!state().capabilities.calibration)throw new Error('This installation calibrates NVIDIA GPUs only. Use the short benchmark on other devices.');const model=args.model??snapshot.installed?.models?.[0]?.model;const chosen=record(model);if(!chosen.entry.ready)throw new Error('Prepare this model before calibrating.');command=venvPython(folder);prefix=[];if(!existsSync(command))throw new Error('Prepare the Python environment first.');argv=['-c','import sys; from pathlib import Path; import setup; sys.exit(0 if setup.calibrate_config(Path(sys.argv[1])) else 1)',chosen.path];}
   else if(job.kind==='rollback'){if(!previousEngine())throw new Error('No saved previous engine is available.');argv=[join(folder,'setup.py'),'--rollback-engine'];}
   else if(job.kind==='update-engine'){if(!snapshot.installed?.models?.length)throw new Error('Prepare a model first. Its installer downloads the matching engine.');argv=[join(folder,'setup.py'),'--update'];}
@@ -349,14 +349,14 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
  /* Packaged app: engine and Control updates and the engine rollback go through Control's explicit update step (`strata update`,
     `strata components rollback`), never through git, setup.py or a download in this process. The app itself is updated by the
     shell's signed Tauri updater. Models are not part of any of it. */
- async function componentProgram(job){
-  if(!['update-engine','update-strata','rollback'].includes(job.kind)||typeof control.update!=='function')throw new Error(NO_INSTALL);
+ async function componentProgram(job,args={}){
+  if(!COMPONENT_KINDS.includes(job.kind)||typeof control.update!=='function')throw new Error(NO_INSTALL);
   if(instances.size)throw new Error('Unload native models before changing engine files.');
   job.abort=new AbortController();
   const subject=job.kind==='update-strata'?'Strata':'engine';
-  try{return await componentSteps(job,subject);}catch(error){updateLog(`${job.kind} failed: ${String(error?.message??error).slice(0,400)}`);throw error?.details!==undefined&&error.message?error:plainError(error,subject);}
+  try{return await componentSteps(job,subject,args);}catch(error){updateLog(`${job.kind} failed: ${String(error?.message??error).slice(0,400)}`);throw error?.details!==undefined&&error.message?error:plainError(error,subject);}
  }
- async function componentSteps(job,subject){
+ async function componentSteps(job,subject,args={}){
   const onEvent=event=>{
    if(event.event==='progress'){job.summary=`Downloading: ${event.percent}%`;job.result={install:{step:job.summary,download:{file:event.label,percent:event.percent}}};}
    else if(event.event==='phase'&&PHASE_TEXT[event.phase])job.summary=PHASE_TEXT[event.phase];
@@ -364,6 +364,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
    emit();
   };
   updateLog(`${job.kind} started (app ${thisAppVersion()??'unknown'})`);
+  if(job.kind==='install-engine-file'){if(typeof args.path!=='string'||!args.path)throw new Error('Choose the engine file first.');let done;try{done=await control.installEngineFile(args.path,{onEvent,signal:job.abort.signal});}finally{try{const own=resolve(directory,'incoming-engine')+sep;if(resolve(args.path).startsWith(own))rmSync(args.path,{force:true});}catch{/* the copy in the host's own folder; a leftover is harmless */}}return {summary:updateSummary(done)==='Everything is already up to date.'?(done.results?.[0]?.note??'Nothing was changed.'):updateSummary(done),result:done};}
   if(job.kind==='rollback'){const done=await control.rollbackEngine();return {summary:'The previous engine is back. Your models and settings are unchanged.',result:done};}
   if(job.kind==='update-engine'){const done=await control.update({engine:true,control:false,onEvent,signal:job.abort.signal});return {summary:updateSummary(done),result:done};}
   const done=await control.update({engine:false,control:true,onEvent,signal:job.abort.signal});
@@ -420,7 +421,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   const room=args.resourceProfile==='work';
   return autotuner.start(job,job.kind==='recheck'?'recheck':'tune',{configPath:path,presetId:args.presetId,mode:args.mode,use:args.use,goal:room?'room':'speed',leaveRam:room?20:0,allowSmallDifferences:args.allowSmallDifferences===true,name:args.name},{onProgress:p=>{job.summary=p.text??job.summary;emit();}});
  }
- function operation(kind,args={}){if(!['install','load','benchmark','tune','autotune','recheck','calibrate','update-engine','update-strata','rollback','remove'].includes(kind))throw new Error('Choose a supported native operation.');if(!snapshot.available&&!(packaged&&COMPONENT_KINDS.includes(kind)))throw new Error(snapshot.error??'Connect the native Strata installation first.');if(kind==='install'||kind==='load'){const refusal=engineRefusal(snapshot.catalog,args.model,snapshot.engineInfo);if(refusal)throw new Error(refusal);}return begin(kind,job=>kind==='install'?install(job,args):kind==='load'?loadEngine(job,args):kind==='benchmark'?benchmark(job,args):kind==='tune'?tune(job,args):kind==='autotune'||kind==='recheck'?autotune(job,args):kind==='remove'?removeModel(job,args):program(job,args),{guided:args.guided===true,model:args.model,...(args.family?{family:args.family}:{})});}
+ function operation(kind,args={}){if(!['install','load','benchmark','tune','autotune','recheck','calibrate','update-engine','update-strata','rollback','install-engine-file','remove'].includes(kind))throw new Error('Choose a supported native operation.');if(!snapshot.available&&!(packaged&&COMPONENT_KINDS.includes(kind)))throw new Error(snapshot.error??'Connect the native Strata installation first.');if(kind==='install'||kind==='load'){const refusal=engineRefusal(snapshot.catalog,args.model,snapshot.engineInfo);if(refusal)throw new Error(refusal);}return begin(kind,job=>kind==='install'?install(job,args):kind==='load'?loadEngine(job,args):kind==='benchmark'?benchmark(job,args):kind==='tune'?tune(job,args):kind==='autotune'||kind==='recheck'?autotune(job,args):kind==='remove'?removeModel(job,args):program(job,args),{guided:args.guided===true,model:args.model,...(args.family?{family:args.family}:{})});}
  /* ---- The models folder card (0.2.2): what a picked folder means, and the three choices. The copying is Control's (strata models move). ---- */
  const currentModelsFolder=()=>preferences.downloadDirectory??(modelsDirectory?modelsDirectory():snapshot.installed?.data_folder)??null;
  const moveFile=()=>join(directory,'models-move.cancel');

@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { bundledPython, controlEnvironment, createControl, findControl, runCli, updatedControlDirectory } from '../server/control-runtime.mjs';
-import { checkComponentUpdates } from '../server/updates.mjs';
+import { checkComponentUpdates, engineFirstRun } from '../server/updates.mjs';
 import { createAppUpdater } from '../server/app-updater.mjs';
 import { createNativeControl } from '../server/native-control.mjs';
 
@@ -187,6 +187,7 @@ function fixture({ withApp = false, update, appInstall } = {}) {
       previous = '0.1.45-windows-x86_64-cuda';
       return { ok: true, results: [{ component: 'engine', status: 'updated', installed_after: { version: '0.1.46' } }] };
     },
+    async installEngineFile(path, options) { calls.push(['install-file', path]); options.onEvent?.({ event: 'phase', phase: 'verify', message: 'Checking' }); return { ok: true, results: [{ component: 'engine', status: 'updated', installed_after: { version: '0.1.46' } }] }; },
     async rollbackEngine() { calls.push(['rollback']); previous = null; return { ok: true, to: '0.1.45' }; },
   };
   const spawned = [];
@@ -301,6 +302,40 @@ test('packaged: "Update engine" works in the first seconds, before the native sn
     const job = await finish(f.native, started.id);
     assert.equal(job.state, 'done', job.error);
   } finally { await f.native.close(); f.cleanup(); }
+});
+
+test('packaged: a chosen engine file goes to Control; only a file in the own incoming folder is deleted afterwards', async () => {
+  const f = fixture();
+  try {
+    const incoming = join(f.data, 'incoming-engine');
+    mkdirSync(incoming, { recursive: true });
+    const mine = join(incoming, 'strata-engine-x.tar.gz'), theirs = join(f.data, 'keep-me.tar.gz');
+    writeFileSync(mine, 'x'); writeFileSync(theirs, 'y');
+    const job = await finish(f.native, f.native.operation('install-engine-file', { path: mine }).id);
+    assert.equal(job.state, 'done', job.error);
+    assert.deepEqual(f.calls.at(-1), ['install-file', mine]);
+    assert.equal(existsSync(mine), false, 'the copy the page uploaded is removed');
+    const other = await finish(f.native, f.native.operation('install-engine-file', { path: theirs }).id);
+    assert.equal(other.state, 'done', other.error);
+    assert.equal(existsSync(theirs), true, 'a file anywhere else is never deleted');
+    const none = await finish(f.native, f.native.operation('install-engine-file', {}).id);
+    assert.equal(none.state, 'error');
+    assert.equal(f.calls.filter(c => c[0] === 'install-file').length, 2, 'no file, no install');
+  } finally { await f.native.close(); f.cleanup(); }
+});
+
+test('first-run card data: an offer with its size, nothing-fits with reasons, offline, and an engine already there', async () => {
+  const gpus = [{ name: 'NVIDIA GeForce RTX 5070', vramGb: 12 }];
+  const report = engine => ({ ok: true, hardware: { nvidia_driver: '581.15', backend: 'cuda' }, engine });
+  const offer = await engineFirstRun({ control: { updateCheck: async () => report({ status: 'install', installed: null, offered: { version: '0.1.48', variant: 'cuda13', backend: 'cuda' }, download_bytes: 581299508 }) }, gpus });
+  assert.deepEqual([offer.status, offer.offer.bytes, offer.driver, offer.gpus[0].name], ['offer', 581299508, '581.15', 'NVIDIA GeForce RTX 5070']);
+  const none = await engineFirstRun({ control: { updateCheck: async () => report({ status: 'none-for-this-pc', installed: null, offered: null, reasons: ['needs NVIDIA driver 580.65 or newer, this PC has 560.1'] }) }, gpus });
+  assert.equal(none.status, 'none');
+  assert.match(none.reasons[0], /driver 580/);
+  const installed = await engineFirstRun({ control: { updateCheck: async () => report({ status: 'current', installed: { version: '0.1.48' }, offered: null }) }, gpus });
+  assert.equal(installed.status, 'installed');
+  const offline = await engineFirstRun({ control: { updateCheck: async () => { throw new Error('the update feed could not be read: could not read https://github.com/x (URLError: [WinError 10060] timed out)'); } }, gpus });
+  assert.equal(offline.status, 'offline');
 });
 
 test('without the shell bridge "Update Strata" still updates Control and says nothing false about the app', async () => {

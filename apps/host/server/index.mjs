@@ -32,7 +32,8 @@ import { findBrowser, findPlaywrightMcp } from './agent/browser-probe.mjs';
  */
 import http from 'node:http';
 import { homedir } from 'node:os';
-import { cpSync, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
 import { spawn } from 'node:child_process';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -61,7 +62,7 @@ import { createForkTimeskip } from './timeskip-fork.mjs';
 import { prepareOversized } from './oversize.mjs';
 import { createChatFolders, chatRootOf, openFile, resolveChatFile, previewFile, rawFile, createAttachments, withAttachments } from './chat-files.mjs';
 import { createLlmProxy, samplingFromExpert } from './agent/llm-shape.mjs';
-import { checkUpdates, checkComponentUpdates } from './updates.mjs';
+import { checkUpdates, checkComponentUpdates, engineFirstRun } from './updates.mjs';
 import { plainNoModel } from './no-model-text.mjs';
 import { createAppUi } from './app-ui.mjs';
 import { appVersionFrom, appVersionToShow } from './app-version.mjs';
@@ -1327,6 +1328,25 @@ async function api(req, res, path, method, url) {
   }
 
   if (path === '/api/setup' && method === 'GET') return json(res, 200, setupState());
+  if (path === '/api/engine/first-run' && method === 'GET') {
+    if (!control?.updateCheck) return json(res, 200, { status: 'unavailable', gpus: [] });
+    return json(res, 200, await engineFirstRun({ control, gpus: hardware.cachedHardware()?.gpus ?? [] }));
+  }
+  if (path === '/api/engine/job' && method === 'GET') {
+    // The newest engine download / file install, read without waiting for the native snapshot to connect (the first-run card needs it before that).
+    const kinds = ['update-engine', 'install-engine-file'];
+    return json(res, 200, { job: native.state().jobs.filter(j => kinds.includes(j.kind)).slice(-1)[0] ?? null });
+  }
+  if (path === '/api/engine/from-file' && method === 'POST') {
+    // The person chose an engine package in the page (the offline path). The bytes come here; Control checks and installs them.
+    const name = String(req.headers['x-file-name'] ?? 'engine.tar.gz').replace(/[^A-Za-z0-9._-]/g, '_').slice(-120);
+    if (!/\.(tar\.gz|tgz|tar\.xz|zip)$/i.test(name)) return error(res, 400, 'This is not a Strata engine package. Choose the .tar.gz or .zip file from the release page.');
+    const folder = join(store.DATA_DIR, 'incoming-engine');
+    mkdirSync(folder, { recursive: true, mode: 0o700 });
+    const target = join(folder, name);
+    await pipeline(req, createWriteStream(target, { mode: 0o600 }));
+    return json(res, 202, native.operation('install-engine-file', { path: target }));
+  }
   if (path === '/api/updates/check' && method === 'GET' && control?.updateCheck) return json(res, 200, await checkComponentUpdates({ control, appUpdater, appVersion: process.env.STRATA_APP_VERSION || null }));
   if (path === '/api/updates/check' && method === 'GET') return json(res, 200, await checkUpdates({ appVersion:appVersionToShow(setupState().app.version,native.state().version), engineVersion:native.state().available?(native.state().installed?.engine?.version??null):(await engine.config()).engine.version }));
 

@@ -90,3 +90,28 @@ export async function checkComponentUpdates({ control, appUpdater = null, appVer
   else Object.assign(strata, { status: 'current', message: 'Strata is up to date.' });
   return { checkedAt, feed: report.feed, strata, engine: engineView, serving: report.serving ?? [] };
 }
+
+/**
+ * What the first-run card shows: this PC's graphics card(s), the engine package the signed feed offers for it and how big it is.
+ * One feed read, nothing downloaded. `status`: offer (a package fits), none (nothing fits; `reasons` say why), offline (the feed could not be
+ * read), installed (an engine is already here), wrong-make (an engine for another make of card is installed).
+ */
+export async function engineFirstRun({ control, gpus = [] }) {
+  const cards = gpus.map(g => ({ name: g.name ?? 'Graphics card', vramGb: g.vramGb ?? null }));
+  let report;
+  try {
+    report = await control.updateCheck({});
+  } catch (error) {
+    const plain = plainUpdateError(error, 'Strata');
+    return { status: looksOffline(error) || /update server|No internet/.test(plain.headline ?? '') ? 'offline' : 'error', gpus: cards, message: plain.message, details: plain.details };
+  }
+  const engine = report.engine ?? {};
+  const hardware = report.hardware ?? {};
+  const base = { gpus: cards, driver: hardware.nvidia_driver ?? null, backend: hardware.backend ?? null };
+  if (engine.installed) return { ...base, status: 'installed', installedVersion: engine.installed.version ?? null };
+  if (engine.status === 'wrong-make') return { ...base, status: 'wrong-make', message: engine.note ?? null, reasons: engine.reasons ?? [] };
+  if (engine.offered && (engine.status === 'install' || engine.status === 'available')) {
+    return { ...base, status: 'offer', offer: { version: engine.offered.version, bytes: engine.download_bytes || engine.offered.size || 0, variant: engine.offered.variant ?? '', backend: engine.offered.backend ?? null } };
+  }
+  return { ...base, status: 'none', message: engine.note ?? null, reasons: engine.reasons ?? [] };
+}
