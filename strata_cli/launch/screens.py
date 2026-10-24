@@ -1050,15 +1050,15 @@ class PicturesScreen(Base):
 class SpeedScreen(Base):
     step_id = "speed"
     help_text = ("DeepSeek picks 6 experts for every word it writes. Faster uses 5 of them: answers come sooner, with a small quality change that is "
-                 "usually not noticeable. Full quality uses all 6. Faster is the default on a PC whose graphics cards total 16 GB or less (the engine decides the same way).")
+                 "usually not noticeable. Full quality uses all 6. Faster is the default on a PC whose graphics cards total 16 GB or less, and on an integrated GPU such as Strix Halo (the engine decides the same way).")
 
     def body(self) -> ComposeResult:
         yield Static(Text("Speed or full quality?", style=f"bold {ACCENT}"), markup=False)
         yield Menu(id="menu")
 
     def default_faster(self) -> bool:
-        from strata_cli.launch.runner import used_vram_gb
-        return S.faster_default(used_vram_gb(self.ctx.computer, self.ctx.settings))
+        from strata_cli.launch.runner import faster_by_default
+        return faster_by_default(self.ctx.computer, self.ctx.settings)
 
     def on_mount(self) -> None:
         s = self.ctx.settings
@@ -1549,11 +1549,11 @@ class SaveScreen(Base):
     def summary_lines(self) -> list[tuple[str, str]]:
         s = self.ctx.settings
         r = next((x for x in self.ctx.rows if (x.family, x.model) == (s.family, s.model)), None)
-        from strata_cli.launch.runner import used_vram_gb
+        from strata_cli.launch.runner import faster_by_default
         lines = [("Model", (r.title if r else (s.model or "?")) + (" (your files)" if s.model_path else "")),
                  ("Context", S.context_label(s.context) + f", memory {s.kv or 'int8'}"),
                  ("Pictures", "on" if s.vision != "off" else "off"),
-                 *([("Speed", S.speed_words(s.speed or ("faster" if S.faster_default(used_vram_gb(self.ctx.computer, s)) else "full"),
+                 *([("Speed", S.speed_words(s.speed or ("faster" if faster_by_default(self.ctx.computer, s) else "full"),
                                             s.speed is None))] if s.family == "deepseek41" and speed_choice_available(self.ctx) else []),
                  ("Parallel", f"{s.parallel} at a time" if s.parallel else f"fit to your card ({S.fit_parallel(self.ctx.computer.main_vram_gb)})"),
                  ("Tuning", ({"quick": "quick (about 5-10 min)", "thorough": "thorough (about 10-15 min)", "skip": "skipped"} if s.family == "deepseek41"
