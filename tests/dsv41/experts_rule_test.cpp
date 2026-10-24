@@ -63,30 +63,36 @@ int main() {
     unsetenv("DS4_TOPK");
 #endif
     CHECK_EQ(experts_test_override(5, 6), 5);
-    // prompt chunk: 4096 from 10 GiB of VRAM (12 GB cards, 16, 24, 32, 80 GB), 1024 below
+    // prompt chunk: prefill_chunk_default(own_default, gpu_share, gguf_copy, file_experts, hip, min_vram, big=8192).  What `strata launch` runs on one card
+    // passes neither --tp nor --threads, but the engine's default tp is 2, so own_default is false there; a launch with several cards passes --tp 1.
     using strata::ds4::prefill_chunk_default;
-    CHECK_EQ(prefill_chunk_default(12227ull << 20), 4096);
-    CHECK_EQ(prefill_chunk_default(12 * GiB), 4096);
-    CHECK_EQ(prefill_chunk_default(32 * GiB), 4096);
-    CHECK_EQ(prefill_chunk_default(80 * GiB), 4096);
-    CHECK_EQ(prefill_chunk_default(10 * GiB), 4096);
-    CHECK_EQ(prefill_chunk_default(10 * GiB - 1), 1024);
-    CHECK_EQ(prefill_chunk_default(8 * GiB), 1024);
-    CHECK_EQ(prefill_chunk_default(0), 1024);
-    CHECK_EQ(prefill_chunk_default(16 * GiB), 4096);
-    CHECK_EQ(prefill_chunk_default(24 * GiB), 4096);
-    CHECK_EQ(prefill_chunk_default(12 * GiB, true), 1024);   // HIP builds: 1024 until measured
-    CHECK_EQ(prefill_chunk_default(32 * GiB, true), 1024);
-    // the experts-copied-into-RAM case (fallback 2048): 4096 on 12/16/24/32 GB cards, 2048 below 10 GiB and on HIP builds
-    CHECK_EQ(prefill_chunk_default(12227ull << 20, false, 2048), 4096);
-    CHECK_EQ(prefill_chunk_default(16 * GiB, false, 2048), 4096);
-    CHECK_EQ(prefill_chunk_default(24 * GiB, false, 2048), 4096);
-    CHECK_EQ(prefill_chunk_default(32 * GiB, false, 2048), 4096);
-    CHECK_EQ(prefill_chunk_default(8 * GiB, false, 2048), 2048);
-    CHECK_EQ(prefill_chunk_default(0, false, 2048), 2048);
-    CHECK_EQ(prefill_chunk_default(32 * GiB, true, 2048), 2048);
-    // the rule takes no --max-context: a 128K session on a 12 GB card gets the same 4096, because the chunk's buffers and the KV are allocated
-    // whole at load for that context and a chunk that does not fit there is halved before the first prompt (4096 -> 2048 -> 1024 -> ...)
+    // RTX 5070 / RTX 3060 (12 GB), launch default: experts in place -> 8192 (their logs say "prompts in chunks of 8192")
+    CHECK_EQ(prefill_chunk_default(false, 0.06, false, true, false, 12227ull << 20), 8192);
+    CHECK_EQ(prefill_chunk_default(false, 0.06, false, true, false, 12 * GiB), 8192);
+    // the same cards with --tp 1 on one card: share 0.06 < 0.5 -> 8192 as well (the streamed case)
+    CHECK_EQ(prefill_chunk_default(true, 0.06, false, true, false, 12 * GiB), 8192);
+    // a 5090-class card (32 GB, share 0.19): in place 8192; with the experts copied into RAM 4096
+    CHECK_EQ(prefill_chunk_default(false, 0.19, false, true, false, 32 * GiB), 8192);
+    CHECK_EQ(prefill_chunk_default(false, 0.19, true, true, false, 32 * GiB), 4096);
+    CHECK_EQ(prefill_chunk_default(true, 0.19, true, true, false, 32 * GiB), 4096);
+    CHECK_EQ(prefill_chunk_default(false, 0.10, true, true, false, 16 * GiB), 4096);
+    CHECK_EQ(prefill_chunk_default(false, 0.05, true, true, false, 24 * GiB), 4096);
+    CHECK_EQ(prefill_chunk_default(false, 0.06, true, true, false, 12227ull << 20), 4096);
+    // copied into RAM on a card under 10 GiB (short VRAM): the streamed default, never the 4096 rule
+    CHECK_EQ(prefill_chunk_default(false, 0.0, true, true, false, 8 * GiB), 8192);
+    CHECK_EQ(prefill_chunk_default(false, 0.0, true, true, false, 0), 8192);
+    // 1 x R9700 (HIP, 32 GB, share 0.19), single-card default run (tp 1 passed by a multi-card box): 8192, also when copied (HIP is not measured at 4096)
+    CHECK_EQ(prefill_chunk_default(true, 0.19, false, true, true, 32 * GiB), 8192);
+    CHECK_EQ(prefill_chunk_default(true, 0.19, true, true, true, 32 * GiB), 8192);
+    // 4 x R9700 (share 0.86), single-card default run (--tp 1 --threads off): the small chunk
+    CHECK_EQ(prefill_chunk_default(true, 0.86, false, true, true, 32 * GiB), 1024);
+    CHECK_EQ(prefill_chunk_default(true, 0.50, false, true, true, 32 * GiB), 1024);
+    CHECK_EQ(prefill_chunk_default(true, 0.49, false, true, true, 32 * GiB), 8192);
+    // threads / tp runs (own_default false) keep their defaults whatever the share: 8192 streamed, 2048 for a pack that is not a GGUF
+    CHECK_EQ(prefill_chunk_default(false, 0.86, false, true, true, 32 * GiB), 8192);
+    CHECK_EQ(prefill_chunk_default(false, 0.30, false, false, false, 24 * GiB), 2048);
+    // the rule takes no --max-context: a 128K session on a 12 GB card gets the same chunk, because the chunk's buffers and the KV are
+    // allocated whole at load for that context and a chunk that does not fit there is halved before the first prompt (4096 -> 2048 -> 1024 ...)
     if (fails == 0) std::printf("experts rule: all checks passed\n");
     return fails == 0 ? 0 : 1;
 }
