@@ -286,9 +286,21 @@ test('packaged: an app update that ends the app is recorded as finished by the n
     // the same record read by an app that did NOT change version stays an interruption
     process.env.STRATA_APP_VERSION = '0.2.2';
     const same = createNativeControl({ control: f.control, directory: f.data, spawnProcess: () => { throw new Error('no process'); }, fetcher: async () => Response.json({}), requests: () => [] });
-    assert.equal(same.state().jobs.find(j => j.id === started.id).state, 'error');
+    const unfinished = same.state().jobs.find(j => j.id === started.id);
+    assert.equal(unfinished.state, 'error');
+    assert.match(unfinished.error, /update to 0\.2\.[0-9] did not finish.*releases/s, 'the app came back as the old version: the installer did not finish, and the alert says so');
     await same.close();
   } finally { if (before === undefined) delete process.env.STRATA_APP_VERSION; else process.env.STRATA_APP_VERSION = before; await f.native.close(); f.cleanup(); }
+});
+
+test('packaged: "Update engine" works in the first seconds, before the native snapshot has connected', async () => {
+  const f = fixture();
+  try {
+    assert.equal(f.native.state().available, false, 'nothing has been read yet');
+    const started = f.native.operation('update-engine', {});      // used to throw "Connect the native Strata installation first."
+    const job = await finish(f.native, started.id);
+    assert.equal(job.state, 'done', job.error);
+  } finally { await f.native.close(); f.cleanup(); }
 });
 
 test('without the shell bridge "Update Strata" still updates Control and says nothing false about the app', async () => {

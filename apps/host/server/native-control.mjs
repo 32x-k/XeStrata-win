@@ -41,7 +41,8 @@ export function createNativeControl({directory,requests=()=>[],changed=()=>{},sp
  const savedJobs=readJson(join(directory,'native-jobs.json'),[]);/* An app update ends the app on purpose: the installer replaces it and starts it again. The job that asked for it was saved as running together with the app version it started from (appUpdateFrom); a start that finds a different version knows the update finished, instead of calling it an interrupted operation. */
  const thisAppVersion=()=>process.env.STRATA_APP_VERSION||null;
  const settledByAppUpdate=j=>j.state==='running'&&j.kind==='update-strata'&&typeof j.appUpdateFrom==='string'&&!!thisAppVersion()&&thisAppVersion()!==j.appUpdateFrom;
- for(const j of (Array.isArray(savedJobs)?savedJobs:[]).slice(-12))jobs.set(j.id,{...j,...(settledByAppUpdate(j)?{state:'done',error:null,summary:`Strata is updated to ${thisAppVersion()}.`,finishedAt:new Date().toISOString()}:j.state==='running'?{state:'error',error:'The host restarted before completion. Check diagnostics, then retry; completed files are kept.',summary:'Interrupted operation'}:{})});
+ const neverFinishedAppUpdate=j=>j.state==='running'&&j.kind==='update-strata'&&typeof j.appUpdateFrom==='string'&&!!thisAppVersion()&&thisAppVersion()===j.appUpdateFrom;
+ for(const j of (Array.isArray(savedJobs)?savedJobs:[]).slice(-12))jobs.set(j.id,{...j,...(settledByAppUpdate(j)?{state:'done',error:null,summary:`Strata is updated to ${thisAppVersion()}.`,finishedAt:new Date().toISOString()}:neverFinishedAppUpdate(j)?{state:'error',error:`The update to ${j.appUpdateTo??'the new version'} did not finish: the app closed for the installer, but the old version ${j.appUpdateFrom} started again. Try Update again, or download the installer from the Strata release page (https://github.com/Niko1221/Strata/releases/latest).`,summary:'The app update did not finish',finishedAt:new Date().toISOString()}:j.state==='running'?{state:'error',error:'The host restarted before completion. Check diagnostics, then retry; completed files are kept.',summary:'Interrupted operation'}:{})});
  /* Packaged mode: the app ships Strata Control (control-runtime.mjs). Models are run configs in an install folder, the engine
     comes from the component folder, and a start is `strata runtime start` under the owner runtime. Nothing is installed,
     updated or fetched from here. Without `control` (a source checkout) every path below is the original one. */
@@ -53,6 +54,9 @@ export function createNativeControl({directory,requests=()=>[],changed=()=>{},sp
     The install only runs when the user clicks Download; starting and serving (control.start) keep STRATA_NO_ACQUIRE. */
  const defaultInstall=()=>process.env.STRATA_INSTALL_DIR?resolve(process.env.STRATA_INSTALL_DIR):join(dirname(componentsDirectory()),'install');
  let packagedInstall=null;
+ /* The component updates and the rollback go through Control, not through the native snapshot, so they work in the first seconds after the app starts and on a PC that has no engine yet. */
+ const COMPONENT_KINDS=['update-engine','update-strata','rollback'];
+ const updateLog=line=>{try{console.log(`update · ${line}`);}catch{/* no console */}};
  const NO_INSTALL='Installing, updating, tuning with calibration or rolling back model files and engines happens from the Terminal (strata install), never while the app runs.';
  let defaultId=null,timer=null,closing=false,polling=false;
  const emit=()=>{const value=state();writeFileSync(join(directory,'native-jobs.json'),JSON.stringify(value.jobs),{mode:0o600});changed(value);};
@@ -350,7 +354,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   if(instances.size)throw new Error('Unload native models before changing engine files.');
   job.abort=new AbortController();
   const subject=job.kind==='update-strata'?'Strata':'engine';
-  try{return await componentSteps(job,subject);}catch(error){throw error?.details!==undefined&&error.message?error:plainError(error,subject);}
+  try{return await componentSteps(job,subject);}catch(error){updateLog(`${job.kind} failed: ${String(error?.message??error).slice(0,400)}`);throw error?.details!==undefined&&error.message?error:plainError(error,subject);}
  }
  async function componentSteps(job,subject){
   const onEvent=event=>{
@@ -359,15 +363,18 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
    else if(event.event==='waiting')job.summary='Waiting for the running model to stop…';
    emit();
   };
+  updateLog(`${job.kind} started (app ${thisAppVersion()??'unknown'})`);
   if(job.kind==='rollback'){const done=await control.rollbackEngine();return {summary:'The previous engine is back. Your models and settings are unchanged.',result:done};}
   if(job.kind==='update-engine'){const done=await control.update({engine:true,control:false,onEvent,signal:job.abort.signal});return {summary:updateSummary(done),result:done};}
   const done=await control.update({engine:false,control:true,onEvent,signal:job.abort.signal});
+  updateLog(`Control step finished: ${updateSummary(done)}`);
   const notes=[updateSummary(done)];
   if(appUpdater){
    job.summary='Looking for a new version of the app…';emit();
    let verdict;
    try{verdict=await appUpdater.check();}catch(error){if(error?.code!=='app-update-unavailable')throw error;verdict={available:false};notes.push(appUpdater.unavailable||error.message);}
-   if(verdict.available){job.appUpdateFrom=thisAppVersion();emit();await appUpdater.install({signal:job.abort.signal,onProgress:p=>{if(p.total){job.summary=`Downloading the app update: ${Math.round(100*p.downloaded/p.total)}%`;job.result={install:{step:job.summary,download:{file:'Strata app',percent:Math.round(100*p.downloaded/p.total)}}};emit();}}});notes.push('The app update is installed. Strata will restart.');}
+   updateLog(`app check: ${verdict.available?`version ${verdict.version} is available`:'no newer app version'}`);
+   if(verdict.available){job.appUpdateFrom=thisAppVersion();job.appUpdateTo=verdict.version??null;emit();updateLog(`app update to ${verdict.version??'?'} starting; the installer will end this app`);await appUpdater.install({signal:job.abort.signal,onProgress:p=>{if(p.total){job.summary=`Downloading the app update: ${Math.round(100*p.downloaded/p.total)}%`;job.result={install:{step:job.summary,download:{file:'Strata app',percent:Math.round(100*p.downloaded/p.total)}}};emit();}}});notes.push('The app update is installed. Strata will restart.');}
   }
   return {summary:notes.filter(Boolean).join(' '),result:done};
  }
@@ -413,7 +420,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   const room=args.resourceProfile==='work';
   return autotuner.start(job,job.kind==='recheck'?'recheck':'tune',{configPath:path,presetId:args.presetId,mode:args.mode,use:args.use,goal:room?'room':'speed',leaveRam:room?20:0,allowSmallDifferences:args.allowSmallDifferences===true,name:args.name},{onProgress:p=>{job.summary=p.text??job.summary;emit();}});
  }
- function operation(kind,args={}){if(!['install','load','benchmark','tune','autotune','recheck','calibrate','update-engine','update-strata','rollback','remove'].includes(kind))throw new Error('Choose a supported native operation.');if(!snapshot.available)throw new Error(snapshot.error??'Connect the native Strata installation first.');if(kind==='install'||kind==='load'){const refusal=engineRefusal(snapshot.catalog,args.model,snapshot.engineInfo);if(refusal)throw new Error(refusal);}return begin(kind,job=>kind==='install'?install(job,args):kind==='load'?loadEngine(job,args):kind==='benchmark'?benchmark(job,args):kind==='tune'?tune(job,args):kind==='autotune'||kind==='recheck'?autotune(job,args):kind==='remove'?removeModel(job,args):program(job,args),{guided:args.guided===true,model:args.model,...(args.family?{family:args.family}:{})});}
+ function operation(kind,args={}){if(!['install','load','benchmark','tune','autotune','recheck','calibrate','update-engine','update-strata','rollback','remove'].includes(kind))throw new Error('Choose a supported native operation.');if(!snapshot.available&&!(packaged&&COMPONENT_KINDS.includes(kind)))throw new Error(snapshot.error??'Connect the native Strata installation first.');if(kind==='install'||kind==='load'){const refusal=engineRefusal(snapshot.catalog,args.model,snapshot.engineInfo);if(refusal)throw new Error(refusal);}return begin(kind,job=>kind==='install'?install(job,args):kind==='load'?loadEngine(job,args):kind==='benchmark'?benchmark(job,args):kind==='tune'?tune(job,args):kind==='autotune'||kind==='recheck'?autotune(job,args):kind==='remove'?removeModel(job,args):program(job,args),{guided:args.guided===true,model:args.model,...(args.family?{family:args.family}:{})});}
  /* ---- The models folder card (0.2.2): what a picked folder means, and the three choices. The copying is Control's (strata models move). ---- */
  const currentModelsFolder=()=>preferences.downloadDirectory??(modelsDirectory?modelsDirectory():snapshot.installed?.data_folder)??null;
  const moveFile=()=>join(directory,'models-move.cancel');
