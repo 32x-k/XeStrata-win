@@ -26,15 +26,16 @@ with an out-of-memory message. Both are said before anything is downloaded.
 
 ## The official 2-bit versions (the ones for a normal PC)
 
-Setup offers two official sets (ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF, pinned): **IST-DAS 2.00 bpw** (138 GB) and **IST-DAS 2.25 bpw** (155 GB). Both use the
+Setup offers three official sets (ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF, pinned): **IST-DAS 2.00 bpw** (138 GB), **IST-DAS 2.25 bpw** (155 GB) and the smallest, **IST-DAS 1.75 bpw** (121 GB, slightly lower quality; setup recommends it where 2.00 is tight in memory or disk). All use the
 same 111 GB n-gram table (downloaded once into `models/deepseek-v4.1-flash-shared`) and the 8 GB DSpark drafter: 257 GB of disk for
-2.00, 274 GB for 2.25, 412 GB for both. Quality against the original model: perplexity +16% on 2.00, +8% on 2.25 (code and agent work
+2.00, 274 GB for 2.25, 239 GB for 1.75, 412 GB for 2.00 and 2.25 together. Quality against the original model: perplexity +16% on 2.00, +8% on 2.25 (code and agent work
 about +3.5% / +2.5% on 2.25).
 
 | File | Size | What it is |
 | --- | ---: | --- |
 | IQ2_XXS shards (2.00 bpw), 4 files | 138 GB | the model, first set |
 | IQ2_XS shards (2.25 bpw), 4 files | 155 GB | the model, second set |
+| IQ1_M shards (1.75 bpw), 4 files | 121 GB | the model, smallest set |
 | IQ4_NL: `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` | 111 GB | the 4-bit Engram lookup table the model reads from RAM or SSD. Not a third model: both sets use this one file, and it is already in their download sizes |
 | DSpark drafter (Q8_0) | 8 GB | the small draft model (Unsloth) |
 
@@ -56,6 +57,7 @@ and its 7 GB of experts take the graphics memory); the RAM store sizes itself. L
 ```
 ./setup.sh --family deepseek41 --model IST-DAS-2.00bpw   # 257 GB: the official 2.00 set + Engram + drafter (resumable, SHA-256 checked)
 ./setup.sh --family deepseek41 --model IST-DAS-2.25bpw   # 274 GB (the Engram is shared with 2.00)
+./setup.sh --family deepseek41 --model IST-DAS-1.75bpw   # 239 GB, the smallest
 ./setup.sh --family deepseek41 --model UD-Q8_K_XL        # Unsloth's 508 GB set, for hundreds of GB of RAM or several cards
 ./setup.sh --family deepseek41 --gguf-dir DIR            # files you already have: the shards (or the folder with 2.00bpw / 2.25bpw / UD-Q8_K_XL inside); the Engram and drafter are looked for beside them
 strata launch --model ist-das-2.00bpw --plan             # where it would go on this computer, nothing changed
