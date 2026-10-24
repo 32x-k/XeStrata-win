@@ -1108,7 +1108,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         // window; the plan's kernel runs after the doorbell, which the host does not read).  STRATA_ROUTER_PUBLISH=0: apart
         static const bool router_publish = [] { const char* v = std::getenv("STRATA_ROUTER_PUBLISH"); return v == nullptr || *v != '0'; }();
         bool published = false;
-        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && native_router_takes((int) NE, (int) K)) {
             try {
                 // the shared expert's scalar gate as one more work-group of the router's launch (upstream b08cf3e1)
                 const WeightRef* w_sg = v.get("ffn_gate_inp_shexp.weight");
@@ -1121,10 +1121,10 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                               N, NE, n, cs);
                 if (router_publish && !recording_res_ && route_prior <= 0.0f && route_resident_cfg().margin <= 0.0f) {
                     native_router_top10_publish(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm, (int64_t) n * N,
-                                                m_x_ + tb * N, m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+                                                m_x_ + tb * N, m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs, (int) NE);
                     published = true;
                 } else
-                    native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+                    native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs, (int) NE);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
         } else
         for (int t = tb; t < te; ++t) {
@@ -1132,17 +1132,18 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+        if (route_prior > 0.0f && native_router_takes((int) NE, (int) K) && hits_.d_res != nullptr) {
             try {
-                route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
+                route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs,
+                                  (int) NE);
             } catch (const std::exception& e) { err = "verify route-prior: " + std::string(e.what()); return false; }
         }
-        if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+        if (route_resident_cfg().margin > 0.0f && native_router_takes((int) NE, (int) K) && hits_.d_res != nullptr) {
             // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
             try {
                 native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
                                       route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
-                                      rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
+                                      rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs, (int) NE);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host

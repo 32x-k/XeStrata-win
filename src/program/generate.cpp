@@ -289,7 +289,7 @@ struct Options {
     bool native_qsa = false;          // pinned F32 QSA norms and gate
     bool native_rope = false;         // pinned text-only CUDA rotary arithmetic
     bool native_ple_postops = false;  // pinned PLE postprojection arithmetic
-    bool native_router = false;       // pinned fused 512-expert top-10 router
+    bool native_router = false;       // pinned fused top-10 router (512 or 256 experts)
     bool cpu_oracle_q8_0 = false;      // pinned x86 activation scales/codes at both expert stages
     std::string native_head_gguf;      // native output.weight experiment; same model shard as the pack
     std::vector<std::string> native_dense_gguf; // repeat for native GDN/QSA projection shards

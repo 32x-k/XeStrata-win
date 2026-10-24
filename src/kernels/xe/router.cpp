@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/router.cpp - the Xe ports of Strata's src/kernels/cuda/router_top10.cu (the reference-faithful router) and
-// Strata's src/kernels/cuda/native_router.cu (the pinned ggml topk-moe contract for 512 experts, top 10).
+// Strata's src/kernels/cuda/native_router.cu (the pinned ggml topk-moe contract for 512 experts, top 10; here also for
+// 256, a pruned model's, 8 values a lane instead of 16).
 //
 // native_router follows ggml-cuda's topk-moe at llama.cpp 3cf03257; MIT License, Copyright (c) 2023-2026 The ggml
 // authors, see third_party/main/ggml/LICENSE.  CUDA compiled it with --use_fast_math; here exp is the precise function.
@@ -168,24 +169,26 @@ void native_router_set_enabled(bool value) { native_enabled.store(value, std::me
 bool native_router_enabled() { return native_enabled.load(std::memory_order_relaxed); }
 
 namespace {
-// One token's top-10 by one sub-group (the pinned kernel's 32 x 8 block has only its first warp active): `ids2` and
-// `weights2`, when given, get the same values (the doorbell's mapped copies, written here instead of copied after)
+// One token's top-10 by one sub-group (the pinned kernel's 32 x 8 block has only its first warp active), NPL = n_expert
+// / 32 values a lane: `ids2` and `weights2`, when given, get the same values (the doorbell's mapped copies, written here
+// instead of copied after)
+template <int NPL>
 inline void top10_token(const sycl::sub_group& sg, const float* logits, int32_t* ids, float* weights, int32_t* ids2,
                         float* weights2) {
         const int lane = (int) sg.get_local_linear_id();
-        float values[16];
-        for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
+        float values[NPL];
+        for (int i = 0; i < NPL; ++i) values[i] = logits[lane + i * 32];
         float maximum = -INFINITY;
-        for (int i = 0; i < 16; ++i) maximum = sycl::max(maximum, values[i]);
+        for (int i = 0; i < NPL; ++i) maximum = sycl::max(maximum, values[i]);
         for (int mask = 16; mask; mask >>= 1) maximum = sycl::fmax(maximum, sycl::permute_group_by_xor(sg, maximum, mask));
         float sum = 0.0f;
-        for (int i = 0; i < 16; ++i) {
+        for (int i = 0; i < NPL; ++i) {
             values[i] = sycl::exp(values[i] - maximum);
             sum += values[i];
         }
         for (int mask = 16; mask; mask >>= 1) sum += sycl::permute_group_by_xor(sg, sum, mask);
         const float reciprocal = 1.0f / sum;
-        for (int i = 0; i < 16; ++i) {
+        for (int i = 0; i < NPL; ++i) {
             values[i] *= reciprocal;
             if (sycl::isnan(values[i])) values[i] = -FLT_MAX;
         }
@@ -193,7 +196,7 @@ inline void top10_token(const sycl::sub_group& sg, const float* logits, int32_t*
         for (int rank = 0; rank < 10; ++rank) {
             float best = values[0];
             int expert = lane;
-            for (int i = 1; i < 16; ++i) {
+            for (int i = 1; i < NPL; ++i) {
                 if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
             }
             for (int mask = 16; mask; mask >>= 1)
@@ -217,12 +220,23 @@ inline void top10_token(const sycl::sub_group& sg, const float* logits, int32_t*
         }
 }
 
+template <int NPL>
 void launch_native_router(sycl::queue& q, const float* logits_all, int32_t* ids_all, float* weights_all, int n_tok) {
     q.parallel_for(sycl::nd_range<1>((size_t) n_tok * WARP, WARP), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
         const size_t tok = it.get_group(0);
-        top10_token(it.get_sub_group(), logits_all + tok * 512, ids_all + tok * 10, weights_all + tok * 10, nullptr,
-                    nullptr);
+        top10_token<NPL>(it.get_sub_group(), logits_all + tok * NPL * 32, ids_all + tok * 10, weights_all + tok * 10,
+                         nullptr, nullptr);
     });
+}
+
+void launch_native_router_n(sycl::queue& q, const float* logits, int32_t* ids, float* weights, int n_tok, int n_expert) {
+    if (n_expert == 512) launch_native_router<16>(q, logits, ids, weights, n_tok);
+    else launch_native_router<8>(q, logits, ids, weights, n_tok);
+}
+
+void require_shape(int n_expert, const char* what) {
+    if (!native_router_takes(n_expert, 10))
+        throw std::invalid_argument(std::string(what) + ": " + std::to_string(n_expert) + " experts (256 or 512 only)");
 }
 
 // *p += 1, read and incremented in memory, as elementwise.cpp's bump_host (the doorbell's ring)
@@ -236,10 +250,11 @@ inline void bump_host(uint32_t* p) {
 
 void native_router_top10_publish(const float* logits, int32_t* ids, float* weights, int n_tok, const float* x,
                                  int64_t n_x, float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq,
-                                 void* stream) {
-    if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
+                                 void* stream, int n_expert) {
+    require_shape(n_expert, "native router (publish)");
+    if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * n_expert * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
         !valid(weights, (size_t) n_tok * 10 * 4))
-        throw std::invalid_argument("native router (publish) requires a stream and aligned [n,512]/[n,10] buffers");
+        throw std::invalid_argument("native router (publish) requires a stream and aligned [n,E]/[n,10] buffers");
     sycl::queue& q = queue_for(stream, true);
     const int wg = xe::work_group_upto_1024(q);
     if (n_tok * WARP > wg) throw std::invalid_argument("native router (publish): more tokens than the work-group's sub-groups");
@@ -250,9 +265,14 @@ void native_router_top10_publish(const float* logits, int32_t* ids, float* weigh
         const sycl::sub_group sg = it.get_sub_group();
         const int t = (int) it.get_local_id(0);
         const int tok = (int) sg.get_group_linear_id();
-        if (tok < n_tok)
-            top10_token(sg, logits + (size_t) tok * 512, ids + (size_t) tok * 10, weights + (size_t) tok * 10,
-                        ids_out + (size_t) tok * 10, weights_out + (size_t) tok * 10);
+        if (tok < n_tok) {
+            if (n_expert == 512)
+                top10_token<16>(sg, logits + (size_t) tok * 512, ids + (size_t) tok * 10, weights + (size_t) tok * 10,
+                                ids_out + (size_t) tok * 10, weights_out + (size_t) tok * 10);
+            else
+                top10_token<8>(sg, logits + (size_t) tok * 256, ids + (size_t) tok * 10, weights + (size_t) tok * 10,
+                               ids_out + (size_t) tok * 10, weights_out + (size_t) tok * 10);
+        }
         for (int i = t; i < ni; i += wg) x_out[i] = x[i];
         sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
         sycl::group_barrier(it.get_group());
@@ -263,36 +283,40 @@ void native_router_top10_publish(const float* logits, int32_t* ids, float* weigh
     });
 }
 
-void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream) {
-    if (!stream || !valid(logits, 512 * 4) || !valid(ids, 10 * 4) || !valid(weights, 10 * 4)
-        || overlap(logits, 512 * 4, ids, 10 * 4) || overlap(logits, 512 * 4, weights, 10 * 4)
+bool native_router_takes(int n_expert, int k) { return (n_expert == 512 || n_expert == 256) && k == 10; }
+
+void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream, int n_expert) {
+    require_shape(n_expert, "native router");
+    const size_t lb = (size_t) n_expert * 4;
+    if (!stream || !valid(logits, lb) || !valid(ids, 10 * 4) || !valid(weights, 10 * 4)
+        || overlap(logits, lb, ids, 10 * 4) || overlap(logits, lb, weights, 10 * 4)
         || overlap(ids, 10 * 4, weights, 10 * 4))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
-    launch_native_router(queue_for(stream, true), logits, ids, weights, 1);
+    launch_native_router_n(queue_for(stream, true), logits, ids, weights, 1, n_expert);
 }
 
 // STRATA_ROUTE_PRIOR=lambda (upstream 2de9ae06, opt-in, changes the output): cache-conditioned routing, after "Mixture
 // of Cache-Conditional Experts" (arXiv 2412.00099) without training.  When a token's 10 experts are picked, an expert
 // already in VRAM gets a `lambda` bonus on its logit: the SELECTION uses the biased logits, the WEIGHTS stay the
 // router's (softmax over the 512 unbiased logits) renormalised over the 10 picked.  One sub-group per token, 16 values
-// a lane, as the native router.
-void route_prior_top10(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
-                       int n_tok, void* stream) {
-    if (n_tok <= 0) return;
-    if (!stream || res_layer == nullptr) throw std::invalid_argument("route-prior requires a stream and the residency row");
-    queue_for(stream, true).parallel_for(sycl::nd_range<1>((size_t) n_tok * WARP, WARP), [=](sycl::nd_item<1> it)
-                                         [[sycl::reqd_sub_group_size(WARP)]] {
+// a lane (8 for 256 experts), as the native router.
+namespace {
+template <int NPL>
+void route_prior_launch(sycl::queue& q, const float* logits, const int32_t* res_layer, float lambda, int32_t* ids,
+                        float* weights, int n_tok) {
+    q.parallel_for(sycl::nd_range<1>((size_t) n_tok * WARP, WARP), [=](sycl::nd_item<1> it)
+                   [[sycl::reqd_sub_group_size(WARP)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const size_t tok = it.get_group(0);
-        const float* lg = logits + tok * 512;
+        const float* lg = logits + tok * NPL * 32;
         int32_t* id = ids + tok * 10;
         float* w = weights + tok * 10;
         const int lane = (int) sg.get_local_linear_id();
-        float p[16], s[16];
+        float p[NPL], s[NPL];
         float mx = -INFINITY;
-        for (int i = 0; i < 16; ++i) { p[i] = lg[lane + 32 * i]; mx = sycl::fmax(mx, p[i]); }
+        for (int i = 0; i < NPL; ++i) { p[i] = lg[lane + 32 * i]; mx = sycl::fmax(mx, p[i]); }
         for (int m = 16; m; m >>= 1) mx = sycl::fmax(mx, sycl::permute_group_by_xor(sg, mx, m));
-        for (int i = 0; i < 16; ++i) {
+        for (int i = 0; i < NPL; ++i) {
             const int e = lane + 32 * i;
             s[i] = p[i] + (res_layer[e] >= 0 ? lambda : 0.0f);   // the selection score
             p[i] = sycl::exp(p[i] - mx);                         // the router's probability (unnormalised)
@@ -301,7 +325,7 @@ void route_prior_top10(const float* logits, const int32_t* res_layer, float lamb
         for (int rank = 0; rank < 10; ++rank) {
             float best = -FLT_MAX, bp = 0.0f;
             int be = 1 << 30;
-            for (int i = 0; i < 16; ++i)
+            for (int i = 0; i < NPL; ++i)
                 if (s[i] > best) { best = s[i]; be = lane + 32 * i; bp = p[i]; }
             for (int m = 16; m; m >>= 1) {
                 const float ob = sycl::permute_group_by_xor(sg, best, m);
@@ -316,6 +340,17 @@ void route_prior_top10(const float* logits, const int32_t* res_layer, float lamb
         if (lane < 10) w[lane] = sel_p / sycl::fmax(sel_sum, 1e-30f);
     });
 }
+}  // namespace
+
+void route_prior_top10(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
+                       int n_tok, void* stream, int n_expert) {
+    if (n_tok <= 0) return;
+    if (!stream || res_layer == nullptr) throw std::invalid_argument("route-prior requires a stream and the residency row");
+    require_shape(n_expert, "route-prior");
+    sycl::queue& q = queue_for(stream, true);
+    if (n_expert == 512) route_prior_launch<16>(q, logits, res_layer, lambda, ids, weights, n_tok);
+    else route_prior_launch<8>(q, logits, res_layer, lambda, ids, weights, n_tok);
+}
 
 // STRATA_ROUTE_RESIDENT (upstream 5df35dcb, EXPERIMENTAL, opt-in, changes the output): residency-biased routing for
 // 512 x 10.  After the top-10: for the ranks lo..hi a non-resident expert is replaced by the best resident expert not
@@ -323,10 +358,11 @@ void route_prior_top10(const float* logits, const int32_t* res_layer, float lamb
 // logits (the router's renormalisation).  Tokens without a swap keep the router's exact bits.
 // stats (device, 4 x uint64): [0] tail entries seen, [1] swaps, [2] non-resident entries before, [3] after.
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
-                           float margin, int rank_lo, int rank_hi, unsigned long long* stats, void* stream) {
+                           float margin, int rank_lo, int rank_hi, unsigned long long* stats, void* stream, int n_expert) {
     if (!stream || n_tok < 1 || res_layer == nullptr)
         throw std::invalid_argument("route-resident requires a stream, tokens and the residency row");
-    const int lo = rank_lo, hi = rank_hi;
+    require_shape(n_expert, "route-resident");
+    const int lo = rank_lo, hi = rank_hi, ne = n_expert;
     // upstream 33fd01b4: a sub-group a token, lane j scanning experts j, j + 32, ...; the serial scan per token was the
     // window's own cost (upstream: 2.75 ms of a 22 ms window).  The same choice bit for bit: a strictly greater logit
     // wins, the smaller expert index breaks a tie, the ranks in order (a swap changes the set already picked).
@@ -341,7 +377,7 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
                 const sycl::sub_group sg = it.get_sub_group();
                 const int lane = (int) sg.get_local_linear_id();
                 const size_t t = it.get_group_linear_id();
-                const float* l = logits + t * 512;
+                const float* l = logits + t * ne;
                 int32_t* idp = ids + t * 10;
                 int32_t id[10];
                 for (int r = 0; r < 10; ++r) id[r] = idp[r];
@@ -353,7 +389,7 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
                     ++tail;
                     int best = -1;
                     float bl = -INFINITY;
-                    for (int f = lane; f < 512; f += WARP) {   // ascending: the lane keeps its first maximum
+                    for (int f = lane; f < ne; f += WARP) {   // ascending: the lane keeps its first maximum
                         if (res_layer[f] < 0 || l[f] <= bl) continue;
                         bool used = false;
                         for (int q = 0; q < 10; ++q) used |= id[q] == f;
@@ -390,7 +426,7 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
     }
     queue_for(stream, true).parallel_for(sycl::range<1>((size_t) n_tok), [=](sycl::id<1> i) {
         const size_t t = i[0];
-        const float* l = logits + t * 512;
+        const float* l = logits + t * ne;
         int32_t* id = ids + t * 10;
         int swaps = 0, tail = 0, before = 0;
         for (int r = 0; r < 10; ++r) before += res_layer[id[r]] < 0;
@@ -400,7 +436,7 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
             ++tail;
             int best = -1;
             float bl = -INFINITY;
-            for (int f = 0; f < 512; ++f) {
+            for (int f = 0; f < ne; ++f) {
                 if (res_layer[f] < 0 || l[f] <= bl) continue;
                 bool used = false;
                 for (int q = 0; q < 10; ++q) used |= id[q] == f;
@@ -428,11 +464,13 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
     });
 }
 
-void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream) {
-    if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
+void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream,
+                               int n_expert) {
+    require_shape(n_expert, "native router (multi)");
+    if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * n_expert * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
         !valid(weights, (size_t) n_tok * 10 * 4))
-        throw std::invalid_argument("native router (multi) requires a stream and aligned [n,512]/[n,10] buffers");
-    launch_native_router(queue_for(stream, true), logits, ids, weights, n_tok);
+        throw std::invalid_argument("native router (multi) requires a stream and aligned [n,E]/[n,10] buffers");
+    launch_native_router_n(queue_for(stream, true), logits, ids, weights, n_tok, n_expert);
 }
 
 }  // namespace strata::kernels
