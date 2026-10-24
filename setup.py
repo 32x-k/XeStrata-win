@@ -303,28 +303,28 @@ MODELS: dict[str, dict[str, Any]] = {
              "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth", "huihui-unsloth"),
              "budget": True, "experimental": True, "shards": 6, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00006.gguf",
              "vision": True, "vision_untested": True},
-    # Gyro (agentionai): "ram_gb" is the memory the weights need in total, VRAM and RAM together ("mem_total"): Gyro-S
-    # 27.6 GB, Gyro-M 35 GB (the rest of the download is the n-gram table, read from the SSD).  Neither is anyone's
+    # Gyro (agentionai): "ram_gb" is the RAM that holds every expert with the usual room beside them ("arena_gb" +
+    # LOW_RAM_HEADROOM_GB); with less, the low-RAM mode needs RAM and VRAM together of "arena_gb" + 12 (low_ram_fits:
+    # 6 GB of each for the rest).  The rest of the download is the n-gram table, read from the SSD.  Neither is anyone's
     # default.  Images: the same mmproj as every Flash-Next model; strata-vision reads only the vocabulary and header of
     # the Gyro GGUF (tools/vision/gguf_meta.h), whose TQK6 / TQK7 tensors llama.cpp does not know.
-    "Gyro-S": {"about": "the smallest option, for PCs with little memory (27.6 GB of VRAM + RAM together); lower "
+    "Gyro-S": {"about": "for PCs with little memory (36 GB of RAM, or 38 GB of RAM and VRAM together); lower "
                         "quality than the 2-3-bit sizes, and the 2-bit Q2_0 decodes faster",
-               "download_gb": 58.5, "ram_gb": 27.6, "arena_gb": 25.8, "families": ("gyro",), "mem_total": True,
+               "download_gb": 58.5, "ram_gb": 35.8, "arena_gb": 25.8, "families": ("gyro",),
                "file": "Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf", "shards": 1, "vision": True},
-    "Gyro-M": {"about": "about IQ3_XXS quality with about 20% less GPU memory (35 GB of VRAM + RAM together)",
-               "download_gb": 92.0, "ram_gb": 35.0, "arena_gb": 32.1, "families": ("gyro",), "mem_total": True,
+    "Gyro-M": {"about": "about IQ3_XXS quality with about 20% less GPU memory (43 GB of RAM, or 45 GB of RAM and "
+                        "VRAM together)",
+               "download_gb": 92.0, "ram_gb": 42.1, "arena_gb": 32.1, "families": ("gyro",),
                "file": "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf", "shards": 1, "vision": True},
-    # Gyro-Coder (agentionai): the same memory rule; "ram_gb" the GPU memory of the weights by agentionai's card
-    "Gyro-Coder-L": {"about": "half the experts, kept for code, at 3.2 bits (27.5 GB of VRAM + RAM together); weaker "
-                              "outside coding",
-                     "download_gb": 84.0, "ram_gb": 27.5, "arena_gb": 24.2, "families": ("gyro-coder",),
-                     "mem_total": True, "file": "Qwen3.8-Flash-Next-Gyro-Coder-L-TQ3_0.gguf", "shards": 1,
-                     "vision": True},
-    "Gyro-Coder": {"about": "half the experts, kept for code, at 2.1 bits (19.9 GB of VRAM + RAM together); lower "
-                            "quality than Gyro-Coder-L",
-                   "download_gb": 75.8, "ram_gb": 19.9, "arena_gb": 16.0, "families": ("gyro-coder",),
-                   "mem_total": True, "file": "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf", "shards": 1,
-                   "vision": True},
+    # Gyro-Coder (agentionai): the same memory rule
+    "Gyro-Coder-L": {"about": "half the experts, kept for code, at 3.2 bits (35 GB of RAM, or 37 GB of RAM and VRAM "
+                              "together); weaker outside coding",
+                     "download_gb": 84.0, "ram_gb": 34.2, "arena_gb": 24.2, "families": ("gyro-coder",),
+                     "file": "Qwen3.8-Flash-Next-Gyro-Coder-L-TQ3_0.gguf", "shards": 1, "vision": True},
+    "Gyro-Coder": {"about": "half the experts, kept for code, at 2.1 bits (26 GB of RAM, or 28 GB of RAM and VRAM "
+                            "together); lower quality than Gyro-Coder-L",
+                   "download_gb": 75.8, "ram_gb": 26.0, "arena_gb": 16.0, "families": ("gyro-coder",),
+                   "file": "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf", "shards": 1, "vision": True},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (check_shards reads the other model files' directories; these are also hashed once).
@@ -530,8 +530,8 @@ FAMILIES: dict[str, dict[str, Any]] = {
                 "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS}},
     # agentionai's Gyro quantizations (see GYRO_FILES): after the regular families, never the default
     "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)", "by": "Gyro quantizations by agentionai",
-             "about": "Gyro-S (27.6 GB of memory) and Gyro-M (35 GB): the smallest sizes, for PCs with little memory; "
-                      "58 and 92 GB downloads (the files include the n-gram table)",
+             "about": "Gyro-S (36 GB of RAM, or 38 GB of RAM and VRAM together) and Gyro-M (43 or 45 GB): for PCs "
+                      "with little memory; 58 and 92 GB downloads (the files include the n-gram table)",
              "hf": hf("agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"), "file": "Qwen3.8-Flash-Next-{q}.gguf", "shards": 1,
              "tag": "gyro-", "name": "qwen3.8-flash-next-gyro", "vision": True, "pack_args": ["--compat-bf16"],
              "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"), "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
@@ -541,9 +541,9 @@ FAMILIES: dict[str, dict[str, Any]] = {
     # agentionai's Gyro-Coder (GYRO_CODER_FILES): Gyro's format with half the experts, for code; never the default.
     # Images: the original's vision encoder, as the Gyro files take it (agentionai ships none for the Coder)
     "gyro-coder": {"title": "Qwen3.8-Flash-Next Gyro-Coder", "by": "agentionai's coding version, Gyro quantized",
-                   "about": "half the experts (kept for code): Gyro-Coder-L (27.5 GB of memory) and Gyro-Coder "
-                            "(19.9 GB); 84 and 76 GB downloads (the files include the n-gram table); weaker outside "
-                            "coding",
+                   "about": "half the experts (kept for code): Gyro-Coder-L (35 GB of RAM, or 37 GB of RAM and VRAM "
+                            "together) and Gyro-Coder (26 or 28 GB); 84 and 76 GB downloads (the files include the "
+                            "n-gram table); weaker outside coding",
                    "hf": hf("agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF"), "file": "Qwen3.8-Flash-Next-{q}.gguf",
                    "shards": 1, "tag": "gyro-coder-", "name": "qwen3.8-flash-next-gyro-coder", "vision": True,
                    "pack_args": ["--compat-bf16"], "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),

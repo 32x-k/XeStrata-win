@@ -79,21 +79,20 @@ FALLBACK_MODELS = {
     "Q8_0": {"about": "8-bit, the reference quality (every expert Q8_0), for a 192 GB PC; not tested in XeStrata",
              "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth", "huihui-unsloth"),
              "budget": True, "experimental": True, "vision": True},
-    # Gyro (agentionai): the memory is VRAM and RAM together ("mem_total")
-    "Gyro-S": {"about": "the smallest option, for PCs with little memory (27.6 GB of VRAM + RAM together)",
-               "download_gb": 58.5, "ram_gb": 27.6, "arena_gb": 25.8, "families": ("gyro",), "mem_total": True,
-               "vision": True},
-    "Gyro-M": {"about": "about IQ3_XXS quality with about 20% less GPU memory (35 GB of VRAM + RAM together)",
-               "download_gb": 92.0, "ram_gb": 35.0, "arena_gb": 32.1, "families": ("gyro",), "mem_total": True,
-               "vision": True},
-    "Gyro-Coder-L": {"about": "half the experts, kept for code, at 3.2 bits (27.5 GB of VRAM + RAM together); weaker "
-                              "outside coding",
-                     "download_gb": 84.0, "ram_gb": 27.5, "arena_gb": 24.2, "families": ("gyro-coder",),
-                     "mem_total": True, "vision": True},
-    "Gyro-Coder": {"about": "half the experts, kept for code, at 2.1 bits (19.9 GB of VRAM + RAM together); lower "
-                            "quality than Gyro-Coder-L",
-                   "download_gb": 75.8, "ram_gb": 19.9, "arena_gb": 16.0, "families": ("gyro-coder",),
-                   "mem_total": True, "vision": True},
+    # Gyro (agentionai): "ram_gb" in RAM alone; with less, RAM and VRAM together of "arena_gb" + 12 (setup.py)
+    "Gyro-S": {"about": "for PCs with little memory (36 GB of RAM, or 38 GB of RAM and VRAM together)",
+               "download_gb": 58.5, "ram_gb": 35.8, "arena_gb": 25.8, "families": ("gyro",), "vision": True},
+    "Gyro-M": {"about": "about IQ3_XXS quality with about 20% less GPU memory (43 GB of RAM, or 45 GB of RAM and "
+                        "VRAM together)",
+               "download_gb": 92.0, "ram_gb": 42.1, "arena_gb": 32.1, "families": ("gyro",), "vision": True},
+    "Gyro-Coder-L": {"about": "half the experts, kept for code, at 3.2 bits (35 GB of RAM, or 37 GB of RAM and VRAM "
+                              "together); weaker outside coding",
+                     "download_gb": 84.0, "ram_gb": 34.2, "arena_gb": 24.2, "families": ("gyro-coder",),
+                     "vision": True},
+    "Gyro-Coder": {"about": "half the experts, kept for code, at 2.1 bits (26 GB of RAM, or 28 GB of RAM and VRAM "
+                            "together); lower quality than Gyro-Coder-L",
+                   "download_gb": 75.8, "ram_gb": 26.0, "arena_gb": 16.0, "families": ("gyro-coder",),
+                   "vision": True},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -106,11 +105,12 @@ FALLBACK_FAMILIES = {
                                                                   "(UD-Q4_K_XL, 111 GB: experimental)",
                 "tag": "unsloth-", "vision": False},
     "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)",
-             "about": "Gyro-S (27.6 GB of memory) and Gyro-M (35 GB): the smallest sizes, for PCs with little memory",
+             "about": "Gyro-S (36 GB of RAM, or 38 GB of RAM and VRAM together) and Gyro-M (43 or 45 GB): for PCs "
+                      "with little memory",
              "tag": "gyro-"},
     "gyro-coder": {"title": "Qwen3.8-Flash-Next Gyro-Coder",
-                   "about": "half the experts (kept for code): Gyro-Coder-L (27.5 GB of memory) and Gyro-Coder "
-                            "(19.9 GB); weaker outside coding", "tag": "gyro-coder-"},
+                   "about": "half the experts (kept for code): Gyro-Coder-L (35 GB of RAM, or 37 GB of RAM and VRAM "
+                            "together) and Gyro-Coder (26 or 28 GB); weaker outside coding", "tag": "gyro-coder-"},
     "huihui-swift": {"title": "Swift 1.5 (abliterated)", "about": "Swift 1.5 with its refusals removed (abliteration): "
                                                                   "far fewer refusals, and its safety filtering is "
                                                                   "reduced, so check what it writes",
