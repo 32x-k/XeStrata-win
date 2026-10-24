@@ -5,7 +5,8 @@
 //
 //   strata-image-mf-probe text TEXT_ENCODER.gguf GOLDEN_DIR [MMPROJ.gguf]   (an edit's run: its images vl0.png ..
 //       through the vision encoder, the system turn 64 ids)
-//   strata-image-mf-probe vae VAE.safetensors GOLDEN_DIR   (golden_vae.py's vae_cond, vae_s, vae_img)
+//   strata-image-mf-probe vae VAE.safetensors GOLDEN_DIR   (golden_vae.py's vae_cond, vae_s, vae_img; the Flux2 VAE:
+//       golden_f2vae.py's f2_img of the run's latent)
 //   strata-image-mf-probe vae-enc VAE.safetensors GOLDEN_DIR   (golden_edit.py's ref0_pix: its posterior's mean,
 //       log-variance and, with the run's own noise, the sample)
 //   strata-image-mf-probe dit DIT.safetensors GOLDEN_DIR [q8|bf16 [VAE.safetensors OUT.f32]]
@@ -197,6 +198,17 @@ float* put(const std::vector<float>& h) {
 }
 
 // the VAE's decode of the run's latent, its condition, blocks' state and image against golden_vae.py's
+// the image's PSNR (8-bit) against the reference's, both clamped to -1 .. 1
+void psnr(const std::vector<float>& got, const std::vector<float>& img) {
+    double se = 0;
+    for (size_t i = 0; i < img.size(); ++i) {
+        const double a = std::min(1.0, std::max(-1.0, (double) got[i]));
+        const double b = std::min(1.0, std::max(-1.0, (double) img[i]));
+        se += (a - b) * (a - b) * 127.5 * 127.5;
+    }
+    std::printf("image PSNR %.2f dB (8-bit)\n", 10 * std::log10(255.0 * 255.0 / (se / (double) img.size())));
+}
+
 int vae(const std::string& path, const std::string& dir) {
     void* s = strata::core::Runtime::get().create_stream();
     strata::image::MfVae v;
@@ -204,6 +216,26 @@ int vae(const std::string& path, const std::string& dir) {
     if (!v.open(path, s, err)) throw std::runtime_error(err);
     std::vector<int64_t> shape;
     const auto lat = npy<float>(dir + "/latent.npy", &shape);   // [1][h w][128]
+    if (v.flux2()) {   // the image alone: [1][3][H][W]
+        std::vector<int64_t> is;
+        const auto img = npy<float>(dir + "/f2_img.npy", &is);
+        const int64_t h = is[2] / 16, w = is[3] / 16;
+        if (shape.size() != 3 || shape[1] != h * w) throw std::runtime_error("latent.npy is not [1][h w][128]");
+        float* z = put(lat);
+        float* rgb = nullptr;
+        if (!strata::gpu::alloc_device(&rgb, img.size() * 4)) throw std::runtime_error("GPU memory");
+        v.decode_raw(z, h, w, rgb);   // warm
+        strata::gpu::stream_sync(s);
+        const auto t0 = std::chrono::steady_clock::now();
+        v.decode_raw(z, h, w, rgb);
+        strata::gpu::stream_sync(s);
+        std::printf("decode %lld x %lld: %.1f ms (Flux2 VAE, scratch %.0f MiB)\n", 16 * (long long) h,
+                    16 * (long long) w, 1e3 * seconds_since(t0), (double) v.scratch_bytes(h, w) / 1048576.0);
+        const auto got = fetch(rgb, img.size());
+        compare("image", got.data(), img.data(), img.size());
+        psnr(got, img);
+        return 0;
+    }
     std::vector<int64_t> cs;
     const auto cond = npy<float>(dir + "/vae_cond.npy", &cs);   // [1][384][h][w]
     const int64_t h = cs[2], w = cs[3], C = cs[1], HW = h * w;
@@ -223,13 +255,7 @@ int vae(const std::string& path, const std::string& dir) {
     const auto img = npy<float>(dir + "/vae_img.npy");
     const auto got = fetch(rgb, img.size());
     compare("image", got.data(), img.data(), img.size());
-    double se = 0;
-    for (size_t i = 0; i < img.size(); ++i) {
-        const double a = std::min(1.0, std::max(-1.0, (double) got[i]));
-        const double b = std::min(1.0, std::max(-1.0, (double) img[i]));
-        se += (a - b) * (a - b) * 127.5 * 127.5;
-    }
-    std::printf("image PSNR %.2f dB (8-bit)\n", 10 * std::log10(255.0 * 255.0 / (se / (double) img.size())));
+    psnr(got, img);
     return 0;
 }
 

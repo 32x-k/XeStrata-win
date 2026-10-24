@@ -13,6 +13,14 @@
 // The encoder (an edit's reference images, loaded by open_encoder) is the reference's DConvEncoder at t = 0 from a zero
 // latent: 16 x 16 patches to 768 channels, two DiCo blocks without modulation, 384 channels fused with the zero
 // latent's projection, 21 DiCo blocks (constant modulation), and the posterior's mean and log-variance [h w][256].
+//
+// The same class decodes with Black Forest Labs' Flux2 VAE (flux2-vae.safetensors, whose latent space Mage-VAE was made
+// to share; MageTrail's author decodes with it): each latent token's 128 values un-normalized by the VAE's batch norm
+// statistics and spread over 2 x 2 positions of 32 channels, then the LDM decoder (a 1 x 1 convolution, ResNet blocks
+// with group norms, one self-attention over every position in the middle, three nearest 2x upsamplings: 8 x 8 pixels
+// a position).  It has no encoder here (no edit model takes it).  Its activations are channels-last FP32 at each
+// level's size, not tiled: the largest, 256 channels at the full size after the last upsampling, holds 1 GiB at
+// 1024 x 1024.
 #pragma once
 
 #include "strata/prefill/gemm.hpp"
@@ -30,8 +38,9 @@ public:
     MfVae(const MfVae&) = delete;
     MfVae& operator=(const MfVae&) = delete;
 
-    /// Reads the VAE's safetensors (the reference's names: pipeline.* the decoder, student.* the encoder) and puts the
-    /// decoder's weights on the current GPU.  `dry`: read for its sizes only, nothing put on the GPU.
+    /// Reads the VAE's safetensors (Mage-VAE: the reference's names, pipeline.* the decoder, student.* the encoder; or
+    /// the Flux2 VAE: decoder.* and bn.*) and puts the decoder's weights on the current GPU.  `dry`: read for its sizes
+    /// only, nothing put on the GPU.
     bool open(const std::string& path, void* stream, std::string& err, bool dry = false);
 
     /// rgba [4][16 h][16 w] (device FP32, 0 .. 1) from the DiT's latent tokens z [h w][128] (device FP32).
@@ -42,6 +51,8 @@ public:
     /// Puts the encoder's weights (the file open read) on the GPU.  `dry`: their sizes only.
     bool open_encoder(std::string& err, bool dry = false);
     bool has_encoder() const { return !enc_blocks_.empty(); }
+    /// The file is the Flux2 VAE (no encoder).
+    bool flux2() const { return f2_; }
     uint64_t encoder_bytes() const { return enc_bytes_; }
     /// The posterior's mean and log-variance [h w][256] (device FP32) of rgb [3][16 h][16 w] (device FP32, -1 .. 1).
     void encode_moments(const float* rgb, int64_t h, int64_t w, float* moments);
@@ -54,7 +65,10 @@ public:
     /// The GPU memory a decode of an h x w latent works in (its buffers, besides the weights).
     uint64_t scratch_bytes(int64_t h, int64_t w) const;
     void drop_scratch();
-    uint64_t scratch_held() const { return cap_hw_ > 0 ? scratch_bytes(cap_hw_, 1) : 0; }
+    uint64_t scratch_held() const {
+        const int64_t n = f2_ ? f2_cap_ : cap_hw_;
+        return n > 0 ? scratch_bytes(n, 1) : 0;
+    }
     uint64_t weight_bytes() const { return weight_bytes_; }
 
     /// The CoD decoder's output [h w][384] and the 21 blocks' output [h w][384] of the last decode (device FP32), for
@@ -91,6 +105,7 @@ private:
                 int64_t cols = -1);
     const float* vec(class SafeTensors& st, const std::string& name);
     const float* upload(const std::vector<float>& v);
+    Attn attn_w(class SafeTensors& st, const std::string& p, int64_t C);
     void conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out);
     void gn_silu16(const float* x, const float* w, const float* b, int64_t HW, int64_t C, bool silu, uint16_t* y16);
     void resblock(const Res& r, float*& x, int64_t H, int64_t W);
@@ -98,6 +113,22 @@ private:
     void dico(const DiCo& d, float* s, int64_t H, int64_t W, const DiCoBufs& b);
     DiCo dico_w(class SafeTensors& st, const std::string& p, const std::vector<float>& mod);
     void grow(int64_t h, int64_t w);
+    // the Flux2 VAE's decoder
+    struct F2Res {
+        const float *n1w = nullptr, *n1b = nullptr, *n2w = nullptr, *n2b = nullptr;
+        Conv c1, c2, nin;   // nin: the 1 x 1 shortcut where the channels change (out 0: none)
+    };
+    struct F2Level {
+        std::vector<F2Res> blocks;
+        Conv up;            // the convolution after the 2x upsampling (out 0: the last level, none)
+    };
+    void open_flux2(class SafeTensors& st);
+    void f2_others(const float* x, float*& a, float*& b) const;
+    void f2_resblock(const F2Res& r, float*& x, int64_t H, int64_t W);
+    void f2_attention(float* x, int64_t H, int64_t W);
+    void f2_decode_raw(const float* z, int64_t h, int64_t w, float* rgb);
+    uint64_t f2_scratch_bytes(int64_t h, int64_t w) const;
+    void f2_grow(int64_t h, int64_t w);
 
     void* s_ = nullptr;
     prefill::Gemm gemm_;
@@ -128,6 +159,18 @@ private:
     Conv e_patch_, e_down_, e_fuse_, e_out_;   // e_patch_: [768][3 * 16 * 16] in (channel, row, column) order
     std::vector<DiCo> enc_head_, enc_blocks_;
     const float* e_norm_ = nullptr;           // norm_out as a modulation: shift (its bias), scale (its weight - 1)
+    // the Flux2 VAE (f2_): its batch norm's mean and std (sqrt(var + 1e-4)) by the token's 128 values, the 1 x 1
+    // convolution after it, conv_in, the middle (two ResNet blocks around the attention), the levels from the
+    // smallest, and norm_out / conv_out in gnw_, gnb_ and cout_
+    bool f2_ = false;
+    const float *f2_mean_ = nullptr, *f2_std_ = nullptr;
+    Conv f2_pq_;
+    F2Res f2_mid_[2];
+    Attn f2_attn_;
+    std::vector<F2Level> f2_levels_;
+    int64_t f2_cap_ = 0, f2_rows_ = 0;   // the latent positions (h w) the scratch holds; the attention's query band
+    float *f2_x_ = nullptr, *f2_y_ = nullptr, *f2_t_ = nullptr, *f2_q_ = nullptr;
+    uint16_t *f2_qk16_ = nullptr, *f2_p16_ = nullptr;
 };
 
 }  // namespace strata::image
