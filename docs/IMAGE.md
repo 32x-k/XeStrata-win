@@ -46,7 +46,9 @@ xestrata --setup --images qwen-image-turbo     # installed from the source: ./se
 
 - Setup downloads the image model, the VAE, the text encoder and the picture reader for edits (Qwen3-VL's mmproj), and adds `"images"` to the config.
   Every file is pinned to a revision and checked by its SHA-256.
-- Image generation is set up only when `--images` is given. Running setup again without it keeps the earlier image settings as they are.
+- Setup run interactively asks for the image models too (numbers, comma-separated; with two or more, which is the default, and whether to take the text encoder with the refusal direction removed). Run again for a model, it offers that model's present ones as the default answer.
+- It does not ask with `--images` or `--yes`. Run again with `--yes` and without `--images`, setup keeps the earlier image settings as they are.
+- The Windows launcher (`xestrata.exe`) has the image models on its page for installing a model, and an installed model's "Images ..." chooses its image models again (none takes image generation out).
 - `--images no` removes image generation.
 - Several models can be installed, comma-separated (`--images qwen-image-turbo,magetrail`). The first is the default; the others are used through the API's `model` or the web page's choice of model.
   One runs on the GPU at a time: a request for another model ends the earlier model's engine and starts its own (a few seconds to a dozen or so). The RAM needed is the largest model's.
