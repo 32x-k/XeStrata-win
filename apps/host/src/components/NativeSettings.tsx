@@ -6,6 +6,8 @@ import { useEffect, useState } from 'react';
 import { api } from '../lib/client';
 import { refreshNative, useNative, type NativeField } from '../lib/native';
 import { Btn, ErrorNotice, Select } from './ui';
+import { speedOptions } from '../lib/deepseek-speed';
+import type { RunCard } from '../lib/native-fit';
 import { NativeMcpEditor } from './NativeMcpEditor';
 export function NativeSettings({ model }: {
     model: string;
@@ -117,16 +119,12 @@ function NativeFieldInput({ field, value, onChange }: {
         return <DecimalInput disabled={field.supported === false} ariaLabel={tr(field.label)} placeholder={tr("Default")} value={value === null || value === undefined || value === '' || !Number.isFinite(Number(value)) ? null : Number(value)} onChange={onChange}/>;
     return <input disabled={field.supported === false} className="st-input" aria-label={tr(field.label)} placeholder={tr("Default")} value={Array.isArray(value) ? value.join(', ') : value ?? ''} onChange={e => onChange(e.target.value === '' ? null : field.type === 'array' ? e.target.value.split(',').map(s => s.trim()).filter(Boolean) : field.type === 'number' ? Number(e.target.value) : e.target.value)}/>;
 }
-/** DeepSeek's Speed choice. The engine's own rule (--experts auto): Faster (5 experts) when the graphics cards in use total 16 GB (17,179,869,184 bytes) or less, else Full quality (6). */
-const SIXTEEN_GIB = 17179869184;
+/** DeepSeek's Speed choice. The engine decides the default itself (--experts auto); the labels name the same default (lib/deepseek-speed.ts). */
 function DeepSeekSpeed({ field, value, onChange }: { field: NativeField; value: any; onChange: (v: any) => void }) {
     const native = useNative();
-    const cards = (native?.hardware?.gpus ?? []).filter(g => g.usable !== false);
-    const total = cards.reduce((sum, g) => sum + (g.vram_gb ?? 0) * 1073741824, 0);
-    const faster = total > 0 && total <= SIXTEEN_GIB;
+    const options = speedOptions(native?.hardware?.gpus as RunCard[] | undefined).map(o => ({ ...o, label: tr(o.label) }));
     return <Select disabled={field.supported === false} ariaLabel={tr(field.label)} value={value === null || value === undefined ? '' : String(value)}
-      options={[{ value: '', label: tr(faster ? 'Default (Faster on this PC)' : 'Default (Full quality on this PC)') }, { value: '5', label: tr('Faster') }, { value: '6', label: tr('Full quality') }]}
-      onChange={v => onChange(v === '' ? null : v)}/>;
+      options={options} onChange={v => onChange(v === '' ? null : v)}/>;
 }
 function NativeAliases({ field, value, onChange }: {
     field: NativeField;
