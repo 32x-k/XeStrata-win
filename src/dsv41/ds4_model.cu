@@ -461,7 +461,9 @@ std::vector<float> rope_freqs(int dim, int original, double base, double factor,
 struct Dev {
     int id = 0;
     cudaStream_t st = nullptr;
-    cudaEvent_t ev = nullptr;
+    cudaEvent_t ev = nullptr, ev2 = nullptr;   // (ev2: the lookahead's guesses are on the host)
+    int* ridx_a = nullptr;                      // (Metal) the next layers' guessed picks (2 x kPicks)
+    float* rw_a = nullptr;
     size_t free0 = 0, total = 0, weights = 0, experts = 0, caches = 0, scratch = 0;
     std::vector<void*> allocs;
     // a window's scratch, rows of up to kWin tokens (the routed experts' rows: kWin * kPicks)
@@ -890,6 +892,7 @@ struct Model::Impl {
     // host side of the CPU lane, a window's rows
     float *h_x = nullptr, *h_w = nullptr, *h_part = nullptr;
     int* h_idx = nullptr;
+    int* h_idx_a = nullptr;   // (Metal) the lookahead's guessed picks, 2 x kPicks
     uint8_t* h_eg = nullptr;          // the window's Engram rows: [engram layer][token] of [cols][hd] then the scales
     // the Engram rows' reader (its own threads and file handles), the rows already fetched, the window's batches (one
     // an Engram layer: asked for when the window's tokens are known, collected right before that layer)
@@ -1863,6 +1866,7 @@ struct Model::Impl {
             CK(cudaSetDevice(d.id));
             CK(cudaStreamCreateWithFlags(&d.st, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&d.ev, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&d.ev2, cudaEventDisableTiming));
             if (!x3::prepare(d.st) || (pk.gguf && !gg::prepare(d.st))) {
                 err = "exl3 scratch on CUDA" + std::to_string(d.id);
                 return false;
@@ -2230,7 +2234,8 @@ struct Model::Impl {
                       dalloc(d, d.f_post, W * 8, err) && dalloc(d, d.f_comb, W * 64, err) && dalloc(d, d.pre, W * 8, err) &&
                       dalloc(d, d.glog, W * 1024, err) && dalloc(d, d.glog_a, 2 * W * 1024, err) &&
                       dalloc(d, d.rw, W * kPicks, err) &&
-                      dalloc(d, d.ridx, W * kPicks, err) && dalloc(d, d.moe_out, W * D, err) &&
+                      dalloc(d, d.ridx, W * kPicks, err) && dalloc(d, d.ridx_a, 2 * kPicks, err) && dalloc(d, d.rw_a, 2 * kPicks, err) &&
+                      dalloc(d, d.moe_out, W * D, err) &&
                       dalloc(d, d.sg, W * g.ff, err) && dalloc(d, d.su, W * g.ff, err) && dalloc(d, d.sh, W * g.ff, err) &&
                       dalloc(d, d.sh_out, W * D, err) && dalloc(d, d.cpu_part, W * D, err) &&
                       dalloc(d, d.freqs_win, 64, err) && dalloc(d, d.freqs_comp, 64, err) &&
@@ -2417,7 +2422,7 @@ struct Model::Impl {
         // the host side of the CPU lane and the Engram rows
         const int cols = (pk.eg_ngram - 1) * pk.eg_heads;
         if (!halloc(h_x, (size_t) kWin * g.dim, err) || !halloc(h_w, (size_t) kWin * kPicks, err) ||
-            !halloc(h_part, (size_t) kWin * g.dim, err) || !halloc(h_idx, (size_t) kWin * kPicks, err) ||
+            !halloc(h_part, (size_t) kWin * g.dim, err) || !halloc(h_idx, (size_t) kWin * kPicks, err) || !halloc(h_idx_a, (size_t) 2 * kPicks, err) ||
             !halloc(h_emb, (size_t) std::max(kWin, chunk) * g.dim, err) ||
             !halloc(h_eg, (size_t) std::max(1, pk.eg_layers) * eg_cap * cols * (pk.eg_hd + pk.eg_hd / 32) + 64, err))
             return false;
@@ -5045,6 +5050,88 @@ struct Model::Impl {
     }
     // ... the low-bit ones (ds4_iq's types): as above, through ggml-cpu's dots (gg::iq_cpu_*) - each token's input
     // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same
+#if defined(STRATA_METAL)
+    // The CPU lane's cold reads were 78% of its time (a madvise(WILLNEED) of a range that is not in the page cache blocks while the SSD
+    // reads it).  Stale-router lookahead (no training): the GPU applies layer L+a's gate (+ bias, the router's own rule) to layer L's FFN
+    // input (a gemv and a route a layer, queued behind the shared expert) and the host reads the guessed picks with the real ones; the
+    // guessed CPU-lane experts whose pages are not in the page cache are read in on helper threads while this layer computes.  Bytes per
+    // layer capped (DS4_LA_MAX experts, default 4); DS4_LOOKAHEAD layers ahead (default 2; 0 off).
+    static bool la_enabled() { return la_depth() > 0; }
+    static int la_depth() {
+        static const int d = std::getenv("DS4_LOOKAHEAD") ? std::atoi(std::getenv("DS4_LOOKAHEAD")) : 0;   // (off by default until it is measured faster)
+        return std::min(d, 2);
+    }
+    struct LaPool {
+        std::mutex m;
+        std::condition_variable cv;
+        std::deque<std::pair<const void*, size_t>> q;
+        LaPool() {
+            const int nth = std::getenv("DS4_LA_THREADS") ? std::atoi(std::getenv("DS4_LA_THREADS")) : 3;
+            for (int i = 0; i < nth; ++i)
+                std::thread([this] {
+                    for (;;) {
+                        std::pair<const void*, size_t> r;
+                        {
+                            std::unique_lock<std::mutex> lk(m);
+                            cv.wait(lk, [&] { return !q.empty(); });
+                            r = q.front();
+                            q.pop_front();
+                            while (q.size() > 64) q.pop_front();   // (stale reads are worth nothing)
+                        }
+                        const uintptr_t a = (uintptr_t) r.first & ~(uintptr_t) 16383;
+                        const size_t len = r.second + ((uintptr_t) r.first - a);
+                        std::vector<unsigned char> vec((len + 16383) / 16384);
+                        bool cold = true;
+                        if (mincore((void*) a, len, (char*) vec.data()) == 0) {
+                            cold = false;
+                            for (unsigned char c : vec) if (!(c & 1)) { cold = true; break; }
+                        }
+                        if (cold) os::prefetch({r});
+                    }
+                }).detach();
+        }
+        void push(const void* p, size_t n) {
+            { std::lock_guard<std::mutex> lk(m); q.push_back({p, n}); }
+            cv.notify_one();
+        }
+    };
+    std::mutex la_mu;
+    std::vector<std::vector<int>> la_guess;   // per layer: the CPU-lane experts its last lookahead guessed
+    long la_hit = 0, la_all = 0, la_issued = 0;
+    void lookahead_prefetch(Layer& l, cudaEvent_t ev2, int la_n, const std::vector<Ent>& ents) {
+        if (l.nm != 1) return;
+        static LaPool* pool = nullptr;
+        static bool reg = false;
+        if (pool == nullptr) {
+            la_guess.assign(L.size(), {});
+            pool = new LaPool();
+        }
+        if (std::getenv("DS4_CPU_LOG") && !reg) {
+            reg = true;
+            static Impl* self = this;
+            std::atexit([] { std::fprintf(stderr, "lookahead: %ld of %ld CPU-lane experts were guessed; %ld matrices queued\n", self->la_hit, self->la_all, self->la_issued); });
+        }
+        for (const Ent& en : ents) {
+            ++la_all;
+            const auto& gs = la_guess[(size_t) l.il];
+            if (std::find(gs.begin(), gs.end(), en.e) != gs.end()) ++la_hit;
+        }
+        if (la_n <= 0) return;
+        cudaEventSynchronize(ev2);
+        static const int cap = std::getenv("DS4_LA_MAX") ? std::atoi(std::getenv("DS4_LA_MAX")) : 4;
+        for (int a = 1; a <= la_n; ++a) {
+            Layer& nx = L[(size_t) (l.il + a)];
+            std::vector<int> cpu;
+            for (int r = 0; r < nx.k_exp; ++r) {
+                const int e = h_idx_a[(a - 1) * kPicks + r];
+                if (e >= 0 && e < nx.n_exp && nx.slot[(size_t) e] < 0 && (int) cpu.size() < cap) cpu.push_back(e);
+            }
+            la_guess[nx.il] = cpu;
+            for (int e : cpu)
+                for (int r = 0; r < 3; ++r) { pool->push(mx_mat(nx, e, r), mx_part_bytes(nx, r)); ++la_issued; }
+        }
+    }
+#endif
     void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
         constexpr int RB = 64;   // rows a job
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
@@ -8322,6 +8409,23 @@ struct Model::Impl {
         CK(cudaEventRecord(d.ev, s));
         // the shared expert while the host looks at the picks
         if (!mv(d, {job(l.s1, d.x, d.sg, T, D, g.ff), job(l.s3, d.x, d.su, T, D, g.ff)}, err)) return false;
+#if defined(STRATA_METAL)
+        int la_n = 0;   // the next layers' guessed picks (their gate on this FFN input), on the GPU: a gemv and a route a layer
+        if (T == 1 && la_enabled()) {
+            for (int a = 1; a <= la_depth(); ++a) {
+                const int il = l.il + a;
+                if (il >= g.nl) break;
+                const Layer& nx = L[(size_t) il];
+                if (nx.nm != 1 || nx.lay.fmt != gg::kFmtMXFP4 || nx.gate_bias == nullptr || nx.gate_w == nullptr) break;
+                gemv_f32(nx.gate_w, d.x, nx.n_exp, D, 1, d.glog_a + (size_t) (a - 1) * kWin * 1024, 1024, s);
+                route(d.glog_a + (size_t) (a - 1) * kWin * 1024, nx.gate_bias, nx.n_exp, nx.k_exp, 1, g.route_scale, d.ridx_a + (a - 1) * kPicks,
+                      d.rw_a + (a - 1) * kPicks, s, nullptr, nullptr);
+                CK(cudaMemcpyAsync(h_idx_a + (a - 1) * kPicks, d.ridx_a + (a - 1) * kPicks, (size_t) kPicks * 4, cudaMemcpyDeviceToHost, s));
+                la_n = a;
+            }
+            if (la_n > 0) CK(cudaEventRecord(d.ev2, s));
+        }
+#endif
         if (std::getenv("DS4_DBG_MOE")) { dbg_nf("x", l.il, d.x, (size_t) T * D); dbg_nf("sg", l.il, d.sg, (size_t) T * g.ff); dbg_nf("su", l.il, d.su, (size_t) T * g.ff);
             std::fprintf(stderr, "DBG s1 fmt=%d K=%d k=%d n=%d ld=%d raw=%p\n", l.s1.fmt, l.s1.K, l.s1.k, l.s1.n, l.s1.ld, (void*) l.s1.raw); }
         swiglu(d.sg, d.su, T * g.ff, g.lim, d.sh, s);
@@ -8399,6 +8503,9 @@ struct Model::Impl {
         }
         st.experts += (int64_t) T * l.k_exp;
         st.cpu_experts += nslots;
+#if defined(STRATA_METAL)
+        if (T == 1) lookahead_prefetch(l, d.ev2, la_n, ents);
+#endif
         if (nrows > 0) {
             gather_rows(d.x, ga, nrows, D, d.xe, s);
             dump_sub(d, "xe", l.il, p0, nrows, d.xe, (size_t) nrows * D * 4);
