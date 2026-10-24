@@ -5,8 +5,9 @@
 //
 //   strata-image-mf-probe text TEXT_ENCODER.gguf GOLDEN_DIR [MMPROJ.gguf]   (an edit's run: its images vl0.png ..
 //       through the vision encoder, the system turn 64 ids)
-//   strata-image-mf-probe vae VAE.safetensors GOLDEN_DIR   (golden_vae.py's vae_cond, vae_s, vae_img; the Flux2 VAE:
-//       golden_f2vae.py's f2_img of the run's latent)
+//   strata-image-mf-probe vae VAE.safetensors GOLDEN_DIR [OUT.f32]   (golden_vae.py's vae_cond, vae_s, vae_img;
+//       the Flux2 VAE: golden_f2vae.py's f2_img of the run's latent, whole and in tiles, the tiled image as FP32
+//       [3][H][W] to OUT.f32)
 //   strata-image-mf-probe vae-enc VAE.safetensors GOLDEN_DIR   (golden_edit.py's ref0_pix: its posterior's mean,
 //       log-variance and, with the run's own noise, the sample)
 //   strata-image-mf-probe dit DIT.safetensors GOLDEN_DIR [q8|bf16 [VAE.safetensors OUT.f32]]
@@ -209,7 +210,7 @@ void psnr(const std::vector<float>& got, const std::vector<float>& img) {
     std::printf("image PSNR %.2f dB (8-bit)\n", 10 * std::log10(255.0 * 255.0 / (se / (double) img.size())));
 }
 
-int vae(const std::string& path, const std::string& dir) {
+int vae(const std::string& path, const std::string& dir, const std::string& out_path = "") {
     void* s = strata::core::Runtime::get().create_stream();
     strata::image::MfVae v;
     std::string err;
@@ -234,6 +235,23 @@ int vae(const std::string& path, const std::string& dir) {
         const auto got = fetch(rgb, img.size());
         compare("image", got.data(), img.data(), img.size());
         psnr(got, img);
+        // in tiles: decode within a quarter of the whole's scratch (rgba 0 .. 1, back to -1 .. 1 for the PSNR)
+        const uint64_t limit = v.scratch_bytes(h, w) / 4;
+        float* rgba = nullptr;
+        if (!strata::gpu::alloc_device(&rgba, img.size() / 3 * 4 * 4)) throw std::runtime_error("GPU memory");
+        v.drop_scratch();
+        const auto t1 = std::chrono::steady_clock::now();
+        v.decode(z, h, w, rgba, limit);
+        strata::gpu::stream_sync(s);
+        std::printf("tiled within %.0f MiB: %.1f ms, scratch held %.0f MiB\n", (double) limit / 1048576.0,
+                    1e3 * seconds_since(t1), (double) v.scratch_held() / 1048576.0);
+        auto tiled = fetch(rgba, img.size());
+        for (float& x : tiled) x = 2.f * x - 1.f;
+        psnr(tiled, img);
+        if (!out_path.empty()) {
+            std::ofstream o(out_path, std::ios::binary);
+            o.write(reinterpret_cast<const char*>(tiled.data()), (std::streamsize) (tiled.size() * 4));
+        }
         return 0;
     }
     std::vector<int64_t> cs;
@@ -418,12 +436,12 @@ int main(int argc, char** argv) {
     try {
         const std::string what = argc > 1 ? argv[1] : "";
         if (what == "text" && (argc == 4 || argc == 5)) return text(argv[2], argv[3], argc == 5 ? argv[4] : "");
-        if (what == "vae" && argc == 4) return vae(argv[2], argv[3]);
+        if (what == "vae" && (argc == 4 || argc == 5)) return vae(argv[2], argv[3], argc == 5 ? argv[4] : "");
         if (what == "vae-enc" && argc == 4) return vae_enc(argv[2], argv[3]);
         if (what == "dit" && (argc == 4 || argc == 5 || argc == 7))
             return dit(argv[2], argv[3], argc == 4 || std::string(argv[4]) != "bf16", argc == 7 ? argv[5] : "",
                        argc == 7 ? argv[6] : "");
-        std::fprintf(stderr, "usage: %s text TEXT_ENCODER.gguf GOLDEN_DIR | vae VAE.safetensors GOLDEN_DIR | "
+        std::fprintf(stderr, "usage: %s text TEXT_ENCODER.gguf GOLDEN_DIR | vae VAE.safetensors GOLDEN_DIR [OUT.f32] | "
                      "vae-enc VAE.safetensors GOLDEN_DIR | "
                      "dit DIT.safetensors GOLDEN_DIR [q8|bf16 [VAE.safetensors OUT.f32]]\n", argv[0]);
         return 2;

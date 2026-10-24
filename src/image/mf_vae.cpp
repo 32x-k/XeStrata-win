@@ -31,6 +31,7 @@ using strata::kernels::f32_from_f16;
 constexpr int64_t kPatch = 16, kPix = kPatch * kPatch;   // a latent position's pixels
 constexpr int64_t kWin = 32, kWinTok = kWin * kWin;       // the CoD decoder's attention windows
 constexpr int64_t kGroups = 32;                           // its group norms
+constexpr int64_t kF2Overlap = 4, kF2TileMin = 16;        // the Flux2 VAE's tiles: tokens shared, the least side
 constexpr int64_t kX = 32;                                // the per-pixel MLP's width
 constexpr int kResBlocks = 3;
 constexpr float kEps = 1e-6f;
@@ -379,6 +380,43 @@ void softmax_wg16(const float* sc, int64_t rows, int64_t n, float scale, uint16_
     });
 }
 
+// the latent tokens of a tile: zt [th tw][128] = z's rows y0 .. y0 + th, columns x0 .. x0 + tw (z w wide)
+void tile_gather(const float* z, int64_t w, int64_t y0, int64_t x0, int64_t th, int64_t tw, float* zt, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (th * tw * 128)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t p = i / 128, c = i - p * 128, y = p / tw, x = p - y * tw;
+        zt[i] = z[((y0 + y) * w + x0 + x) * 128 + c];
+    });
+}
+
+// a tile's image trgb [3][TH][TW] (at Y0, X0 of the image [3][H][W]) into acc (3 planes, then the weights' plane),
+// weighted by a linear ramp over `ramp` pixels on each side that another tile shares (top, bottom, left, right)
+void tile_blend(const float* trgb, int64_t TH, int64_t TW, int64_t Y0, int64_t X0, int64_t H, int64_t W, int64_t ramp,
+                bool top, bool bottom, bool left, bool right, float* acc, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (TH * TW)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t y = i / TW, x = i - y * TW;
+        const float r = (float) ramp;
+        float wy = 1.f, wx = 1.f;
+        if (top) wy = sycl::fmin(wy, ((float) y + 0.5f) / r);
+        if (bottom) wy = sycl::fmin(wy, ((float) (TH - y) - 0.5f) / r);
+        if (left) wx = sycl::fmin(wx, ((float) x + 0.5f) / r);
+        if (right) wx = sycl::fmin(wx, ((float) (TW - x) - 0.5f) / r);
+        const float wt = wy * wx;
+        const int64_t o = (Y0 + y) * W + X0 + x, HW = H * W;
+        for (int64_t c = 0; c < 3; ++c) acc[c * HW + o] += wt * trgb[c * TH * TW + i];
+        acc[3 * HW + o] += wt;
+    });
+}
+
+// rgb [3][HW] = acc's planes over its weights
+void tile_finish(const float* acc, int64_t HW, float* rgb, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (3 * HW)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        rgb[i] = acc[i] / acc[3 * HW + i % HW];
+    });
+}
+
 // rgb [3][HW] from x [HW][3]
 void hwc3_to_chw(const float* x, int64_t HW, float* rgb, void* s) {
     q_of(s).parallel_for(sycl::range<1>((size_t) (3 * HW)), [=](sycl::id<1> id) {
@@ -596,6 +634,11 @@ bool MfVae::open(const std::string& path, void* stream, std::string& err, bool d
         err = e.what();
         return false;
     }
+}
+
+uint64_t MfVae::least_scratch_bytes(int64_t h, int64_t w) const {
+    if (!f2_) return scratch_bytes(h, w);
+    return std::min(f2_scratch_bytes(h, w), f2_tiled_bytes(h, w, std::min({h, w, kF2TileMin})));
 }
 
 uint64_t MfVae::scratch_bytes(int64_t h, int64_t w) const {
@@ -928,12 +971,17 @@ void MfVae::decode_raw(const float* z, int64_t h, int64_t w, float* rgb) {
     }
 }
 
-void MfVae::decode(const float* z, int64_t h, int64_t w, float* rgba) {
+void MfVae::decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t limit) {
     const int64_t HW = h * w * kPix;   // the Flux2 VAE's 8 x 8 a position of 2 x 2 positions a token: 16 x 16 too
     float* rgb = nullptr;
     if (!gpu::alloc_device(&rgb, (size_t) (3 * HW) * 4))
         throw std::runtime_error(std::string("image engine (Mage-VAE): GPU memory: ") + gpu::last_error());
-    decode_raw(z, h, w, rgb);
+    int64_t t = 0;   // the Flux2 VAE's tile side in tokens, where the whole does not fit: the largest that does
+    if (f2_ && f2_scratch_bytes(h, w) > limit)
+        for (t = std::max(h, w) - 1; t > kF2TileMin && f2_tiled_bytes(h, w, t) > limit; --t) {
+        }
+    if (t > 0) f2_decode_tiled(z, h, w, rgb, std::max(t, kF2TileMin));
+    else decode_raw(z, h, w, rgb);
     to_rgba(rgb, HW, rgba, s_);
     gpu::stream_sync(s_);
     gpu::free(rgb);
@@ -1149,6 +1197,45 @@ void MfVae::f2_decode_raw(const float* z, int64_t h, int64_t w, float* rgb) {
     f2_others(x, y, unused);
     conv(cout_, a16_, H, W, y);
     hwc3_to_chw(y, H * W, rgb, s_);
+}
+
+// the scratch of a tiled decode with tiles of t x t tokens: a tile's own, its latent and image, and the blend's planes
+uint64_t MfVae::f2_tiled_bytes(int64_t h, int64_t w, int64_t t) const {
+    const int64_t th = std::min(h, t), tw = std::min(w, t);
+    return f2_scratch_bytes(th, tw) + (uint64_t) (th * tw * 128) * 4 + (uint64_t) (3 * th * tw * kPix) * 4 +
+           (uint64_t) (4 * h * w * kPix) * 4;
+}
+
+void MfVae::f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, int64_t t) {
+    const int64_t th = std::min(h, t), tw = std::min(w, t), H = h * kPatch, W = w * kPatch;
+    std::vector<void*> tmp;
+    float* zt = alloc<float>(tmp, th * tw * 128);
+    float* trgb = alloc<float>(tmp, 3 * th * tw * kPix);
+    float* acc = alloc<float>(tmp, 4 * H * W);
+    gpu::memset_async(acc, 0, (size_t) (4 * H * W) * 4, s_);
+    // the tiles' corners: t apart less the overlap, the last flush with the edge
+    auto starts = [](int64_t n, int64_t side) {
+        std::vector<int64_t> v;
+        for (int64_t a = 0;; a += side - kF2Overlap) {
+            if (a + side >= n) {
+                v.push_back(n - side);
+                break;
+            }
+            v.push_back(a);
+        }
+        return v;
+    };
+    const auto ys = starts(h, th), xs = starts(w, tw);
+    for (const int64_t y0 : ys)
+        for (const int64_t x0 : xs) {
+            tile_gather(z, w, y0, x0, th, tw, zt, s_);
+            f2_decode_raw(zt, th, tw, trgb);
+            tile_blend(trgb, th * kPatch, tw * kPatch, y0 * kPatch, x0 * kPatch, H, W, kF2Overlap * kPatch, y0 > 0,
+                       y0 + th < h, x0 > 0, x0 + tw < w, acc, s_);
+        }
+    tile_finish(acc, H * W, rgb, s_);
+    gpu::stream_sync(s_);
+    for (void* p : tmp) gpu::free(p);
 }
 
 }  // namespace strata::image

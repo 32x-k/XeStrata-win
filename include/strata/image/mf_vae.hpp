@@ -19,8 +19,10 @@
 // statistics and spread over 2 x 2 positions of 32 channels, then the LDM decoder (a 1 x 1 convolution, ResNet blocks
 // with group norms, one self-attention over every position in the middle, three nearest 2x upsamplings: 8 x 8 pixels
 // a position).  It has no encoder here (no edit model takes it).  Its activations are channels-last FP32 at each
-// level's size, not tiled: the largest, 256 channels at the full size after the last upsampling, holds 1 GiB at
-// 1024 x 1024.
+// level's size: the largest, 256 channels at the full size after the last upsampling, holds 1 GiB at 1024 x 1024.
+// Where the whole does not fit the room decode is given, it decodes overlapping tiles of the latent (4 tokens, 64
+// pixels, on each side shared) and blends them linearly across the overlap, as ComfyUI's tiled decode does; the
+// group norms then take each tile's statistics.
 #pragma once
 
 #include "strata/prefill/gemm.hpp"
@@ -43,8 +45,9 @@ public:
     /// only, nothing put on the GPU.
     bool open(const std::string& path, void* stream, std::string& err, bool dry = false);
 
-    /// rgba [4][16 h][16 w] (device FP32, 0 .. 1) from the DiT's latent tokens z [h w][128] (device FP32).
-    void decode(const float* z, int64_t h, int64_t w, float* rgba);
+    /// rgba [4][16 h][16 w] (device FP32, 0 .. 1) from the DiT's latent tokens z [h w][128] (device FP32), its
+    /// scratch within `limit` bytes where it can be (the Flux2 VAE in tiles).
+    void decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t limit = UINT64_MAX);
     /// The image before the clamp, [3][16 h][16 w] (device FP32, about -1 .. 1): the reference's decode output.
     void decode_raw(const float* z, int64_t h, int64_t w, float* rgb);
 
@@ -64,6 +67,8 @@ public:
 
     /// The GPU memory a decode of an h x w latent works in (its buffers, besides the weights).
     uint64_t scratch_bytes(int64_t h, int64_t w) const;
+    /// The least of it: the Flux2 VAE's in its smallest tiles; Mage-VAE's whole.
+    uint64_t least_scratch_bytes(int64_t h, int64_t w) const;
     void drop_scratch();
     uint64_t scratch_held() const {
         const int64_t n = f2_ ? f2_cap_ : cap_hw_;
@@ -127,6 +132,8 @@ private:
     void f2_resblock(const F2Res& r, float*& x, int64_t H, int64_t W);
     void f2_attention(float* x, int64_t H, int64_t W);
     void f2_decode_raw(const float* z, int64_t h, int64_t w, float* rgb);
+    void f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, int64_t t);
+    uint64_t f2_tiled_bytes(int64_t h, int64_t w, int64_t t) const;
     uint64_t f2_scratch_bytes(int64_t h, int64_t w) const;
     void f2_grow(int64_t h, int64_t w);
 

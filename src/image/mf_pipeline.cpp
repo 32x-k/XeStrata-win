@@ -266,7 +266,8 @@ QiNeed MfPipeline::need(int64_t n_text, int64_t width, int64_t height,
     const int n = n_neg > 0 ? 2 : 1;
     const uint64_t te_act = te.activation_bytes(std::max(n_text, n_neg) + 64);   // the system turn's ids too
     QiNeed nd;
-    nd.least = fixed + std::max({dit.activation_bytes(hw, n, max_text, 512), vae.scratch_bytes(h, w), te_act, edit}) +
+    nd.least = fixed +
+               std::max({dit.activation_bytes(hw, n, max_text, 512), vae.least_scratch_bytes(h, w), te_act, edit}) +
                dit.block_min() + te.layer_min();
     nd.full = fixed - dit.weight_bytes() + full.weight_bytes() + full.block_bytes() + te.layer_min() +
               std::max({full.activation_bytes(hw, n, max_text), vae.scratch_bytes(h, w), te_act, edit});
@@ -528,17 +529,18 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
         const auto t2 = clock::now();
         if (stage) stage("decode");
         // the VAE beside the DiT's activations when it fits there; else they give way to it, then the encoder's
-        // layers (the next prompt streams them back)
+        // layers (the next prompt streams them back); what still does not fit, the Flux2 VAE decodes in tiles
         uint64_t room = p.vae > p.activations ? p.vae - p.activations : 0;
         if (vae_->scratch_bytes(h, w) > room) {
             d.drop_activations();
             room = p.vae;
         }
         if (vae_->scratch_bytes(h, w) > room && te_->layers_vram() > 0) {
+            room += te_->layers_vram();
             te_->drop_layers();
             te_set_ = 0;
         }
-        vae_->decode(x, h, w, rgba);
+        vae_->decode(x, h, w, rgba, room);
         if (vae_->scratch_bytes(h, w) > p.vae) vae_->drop_scratch();
         gpu::copy(out.data(), rgba, out.size() * 4);
         const auto t3 = clock::now();
