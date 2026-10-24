@@ -214,6 +214,8 @@ export function createNativeControl({directory,requests=()=>[],changed=()=>{},sp
   if(still.length)throw new Error(`Some files could not be removed: ${still.slice(0,3).map(p=>basename(p)).join('; ')}`);
 return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
  /* The configuration a load starts the engine with (before its port and key): the saved model config, the user's choices and the resource profile. The tuner measures exactly this, so a saved tuning belongs to the same choices a load makes. */
+ /* DeepSeek-V4.1-Flash runs on its own engine (strata-dsv41) that takes none of the Flash-Next options the app adds on its own (request slots, the RAM budget, the output clamp, the resource profile): a flag it does not know ends the start with "unknown option". */
+ const ownEngine=config=>config?.arch==='deepseek41'||/strata-dsv41/i.test(String(config?.exe??''));
  function buildConfig(args,config){
   const vision=runtimeVision(config,args.vision);
   const visionPreferences=args.vision!==undefined?{ui_vision_enabled:args.vision!=='no',ui_vision_device:args.vision==='no'?config.ui_vision_device??'yes':args.vision}:{};
@@ -222,7 +224,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   const values0=args.values??{},cleared='vram_reserve_mib' in values0&&(values0.vram_reserve_mib===null||values0.vram_reserve_mib===''),base0=cleared?{...config,vram_reserve_mib:undefined,[USER_KEY]:setUserFlag(config[USER_KEY],'--vram-reserve-mib',null)}:config;
   let mine=captureUserArgs(base0);const asked=cleared?null:reserveChoice({...base0,[USER_KEY]:mine},snapshot.hardware,values0).asked;
   if(asked!==null)mine=setUserFlag(mine,'--vram-reserve-mib',asked);
-  const resources=args.resourceProfile?resourceSettings({...base0,[USER_KEY]:mine,vision},snapshot.hardware,args.resourceProfile,modelArena(args.model),values0):null;
+  const resources=args.resourceProfile&&!ownEngine(config)?resourceSettings({...base0,[USER_KEY]:mine,vision},snapshot.hardware,args.resourceProfile,modelArena(args.model),values0):null;
   const cfg={...config,...visionPreferences,...(resources?{...resources,ui_resource_profile:args.resourceProfile}:{}),host:'127.0.0.1',open_browser:false,...validateNativeSettings(args.values??{}),vision};
   /* The app's suggested cards only fill a gap: a model whose settings file already names its GPUs ("gpu": [1, 0], with "gpu_order": "as_given") keeps them (#3256). A card the person picked in the screen always wins. */
   const namedInFile=(Array.isArray(config.gpu)?config.gpu.length>0:config.gpu!==undefined&&config.gpu!==null&&config.gpu!=='')||!!config.gpu_roles;
@@ -237,10 +239,10 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   if(!cfg.vision&&Array.isArray(cfg.args))cfg.args=cfg.args.filter(a=>a!=='--vision');
   for(const arg of cfg.args??[])if(arg.endsWith('.gguf')&&!existsSync(resolve(repo(),arg)))throw new Error('An engine argument names a missing GGUF. Restore the saved arguments or repair the files.');
   /* The app's own choice of request slots (4, fewer where the card has no room) is part of the configuration, so a tune measures the engine a load will start: slots take VRAM from the expert cache. */
-  const parallelChoice=packaged?chooseParallel({config:cfg,values:args.values??{},hardware:snapshot.hardware?.gpus?.length?snapshot.hardware:{gpus:hardwareProbe()??[]}}):null;
+  const parallelChoice=packaged&&!ownEngine(config)?chooseParallel({config:cfg,values:args.values??{},hardware:snapshot.hardware?.gpus?.length?snapshot.hardware:{gpus:hardwareProbe()??[]}}):null;
   let parallelNote=null;
   /* The agent asks for long answers (a thinking model can use most of the window): let the engine clamp the output to what is left of the context instead of refusing the request. */
-  if(packaged&&cfg.fit_max_tokens===undefined)cfg.fit_max_tokens=true;
+  if(packaged&&!ownEngine(config)&&cfg.fit_max_tokens===undefined)cfg.fit_max_tokens=true;
   if(parallelChoice){const applied=applyParallel(cfg,parallelChoice);for(const k of Object.keys(cfg))if(!(k in applied.cfg))delete cfg[k];Object.assign(cfg,applied.cfg);parallelNote=applied.note;}
   return {cfg,resources,visionPreferences,parallelChoice,parallelNote};
  }
@@ -293,7 +295,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
    /* The engine starts under Control's owner runtime, not as our child: a saved profile per slot, then `runtime start`. */
    const used=new Set([...instances.values()].map(i=>i.profile));let slot=1;while(used.has('app-'+slot))slot++;instance.profile='app-'+slot;
    instances.set(id,instance);if(!defaultId||!args.multiple||wasDefault)defaultId=id;emit();
-   const startWith=value=>{writeFileSync(configPath,JSON.stringify(value,null,2),{mode:0o600});return control.stop(instance.profile).catch(()=>{}).then(()=>control.saveProfile(instance.profile,configPath)).then(()=>control.start(instance.profile,{waitSeconds:300}));};
+   const startWith=value=>{writeFileSync(configPath,JSON.stringify(value,null,2),{mode:0o600});return control.stop(instance.profile).catch(()=>{}).then(()=>control.saveProfile(instance.profile,configPath)).then(()=>control.start(instance.profile,{waitSeconds:ownEngine(config)?Math.max(300,Number(config.engine_ready_s)||300):300}));};
    started=startWith(cfg);
    started.then(()=>append(id,'Strata Control reports the engine is ready.'),error=>{append(id,error.message);});
    try{await started;}catch(firstError){let error=firstError;
@@ -306,7 +308,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
     /* ONE automatic second try in all, never saved, never repeated (args.retrySafer false turns it off): with a safer memory setting when the
        failure looks like a memory stop, and without several-requests-at-once when that was the app's own default (not a number the user chose).
        Both changes ride on the same single try, with the plain sentence of the memory change when there is one. */
-    const allowed=args.retrySafer!==false&&job.state==='running';
+    const allowed=args.retrySafer!==false&&job.state==='running'&&!ownEngine(config);
     const safer=allowed?saferStart(cfg,snapshot.hardware,modelArena(args.model),said):null;
     const dropParallel=allowed&&cfg.parallel>1&&!parallelChoice?.explicit;
     if(!safer&&!dropParallel){instance.status='error';instance.error=said;emit();throw new Error(said);}

@@ -205,12 +205,16 @@ test('packaged: a model id with dots (DeepSeek) is listed, loaded from its run c
   const id = 'deepseek-v4.1-flash-ist-das-2.00bpw';
   const f = packagedFixture({ ids: [id] });
   try {
+    writeFileSync(join(f.install, `strata-${id}.json`), JSON.stringify({ exe: join(f.install, 'engine-dsv41', 'strata-dsv41'), arch: 'deepseek41', tokenizer: join(f.install, 'tok'), args: ['--pack', join(f.install, 'pack'), '--max-context', '8192', '--eos', '1'], model_name: 'deepseek-v4.1-flash', port: 8080, engine_ready_s: 3600 }));
     const state = await f.native.refresh(true);
     assert.deepEqual(state.installed.models.map(m => m.model), [id], 'listed (the install finished but the app used to show nothing)');
     assert.equal(state.installed.models[0].ready, true);
     const job = await finish(f.native, f.native.operation('load', { model: id }).id);
     assert.equal(job.state, 'done', job.error);                    // used to end with "The model configuration is outside the Strata installation."
     assert.deepEqual(f.calls.filter(c => ['saveProfile', 'start'].includes(c[0])).map(c => c.slice(0, 2)), [['saveProfile', 'app-1'], ['start', 'app-1']]);
+    const flags = f.saved[0].args.filter(a => a.startsWith('--'));
+    assert.deepEqual(flags, ['--pack', '--max-context', '--eos'], 'The own engine of DeepSeek gets none of the Flash-Next options (it ended with "unknown option --batch")');
+    assert.equal(f.calls.find(c => c[0] === 'start')[2], 3600, 'it waits as long as the config says the engine needs');
     const instance = f.native.state().instances[0];
     assert.equal(instance.model, id);
     assert.equal(instance.status, 'ready');
