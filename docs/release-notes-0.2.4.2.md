@@ -17,10 +17,13 @@ Fixes for `strata launch` with DeepSeek and for the one-line installer. The Term
 ## Updating
 
 - **DeepSeek engine:** it updates itself on the next launch. When the signed feed has a newer DeepSeek engine package for your PC (0.1.49.2 over 0.1.49), `strata launch` downloads it, checks it, starts it once, switches to it and removes the old one. If that fails you see one line and the engine you have keeps running; with no internet the launch goes on without waiting. An engine you gave with `--dsv41-package` or `STRATA_DSV41_EXE` is never replaced.
-
 - **From 0.2.4 or 0.2.4.1:** run `strata update` in the Terminal. It fetches Control 0.1.49.2 and the next `strata` command runs it (`strata --version` says 0.2.4.2).
 - **New installs:** use the command in the README (download `install.sh`, then run it).
 - **Mac:** the Mac Terminal gets Control 0.1.49.2 too. DeepSeek is not on the Mac yet.
+
+## Downloads
+
+Everything from 0.2.4.1 is attached again, so the release page still holds every file. New in this release: the three Control packages (`strata-control-0.1.49.2-windows-x86_64.zip`, `-linux-x86_64.tar.gz`, `-macos-arm64.tar.gz`), the three DeepSeek engine packages (`strata-dsv41-0.1.49.2-windows-x86_64-cuda-cuda13.tar.gz`, `-linux-x86_64-cuda-cuda13.tar.gz`, `-linux-x86_64-hip-rx9070.tar.gz`), `install.sh`, the feed and `SHA256SUMS.txt`. The installers, AppImages, dmg and Qwen engine packages are the 0.2.3 files.
 
 ---
 
