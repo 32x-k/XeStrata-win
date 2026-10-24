@@ -33,12 +33,29 @@ STEPS = (("model", "Model"), ("cards", "Cards"), ("folder", "Folder"), ("context
 STEP_LABELS = {**dict(STEPS), "speed": "Speed"}
 
 
+def speed_choice_available(ctx) -> bool:
+    """The Speed step is an active choice only when the DeepSeek engine launch will run takes --experts (0.1.50 or newer); otherwise it is not
+    there, with no error. Asked once per run of the screens (the engine files are looked up once)."""
+    cached = getattr(ctx, "_speed_ok", None)
+    if cached is None:
+        try:
+            from strata_cli.launch.runner import Runner
+            cached = bool(Runner(ctx.settings, catalog=ctx.catalog, emit=lambda e: None).speed_engine_ok())
+        except Exception:                                    # noqa: BLE001
+            cached = False
+        try:
+            ctx._speed_ok = cached
+        except AttributeError:
+            pass
+    return cached
+
+
 def flow_for(ctx) -> list[str]:
     """The steps of this computer: the Cards step exists only when two or more graphics cards can be used; the Speed step only for DeepSeek."""
     ids = [sid for sid, _ in STEPS]
     if len(ctx.computer.usable_gpus) < 2:
         ids.remove("cards")
-    if getattr(ctx.settings, "family", None) == "deepseek41":
+    if getattr(ctx.settings, "family", None) == "deepseek41" and speed_choice_available(ctx):
         ids.insert(ids.index("context") + 1, "speed")
     return ids
 
@@ -1537,7 +1554,7 @@ class SaveScreen(Base):
                  ("Context", S.context_label(s.context) + f", memory {s.kv or 'int8'}"),
                  ("Pictures", "on" if s.vision != "off" else "off"),
                  *([("Speed", S.speed_words(s.speed or ("faster" if S.faster_default(used_vram_gb(self.ctx.computer, s)) else "full"),
-                                            s.speed is None))] if s.family == "deepseek41" else []),
+                                            s.speed is None))] if s.family == "deepseek41" and speed_choice_available(self.ctx) else []),
                  ("Parallel", f"{s.parallel} at a time" if s.parallel else f"fit to your card ({S.fit_parallel(self.ctx.computer.main_vram_gb)})"),
                  ("Tuning", ({"quick": "quick (about 5-10 min)", "thorough": "thorough (about 10-15 min)", "skip": "skipped"} if s.family == "deepseek41"
                               else {"quick": "quick (about 20 min)", "thorough": "thorough (up to 2 h)", "skip": "skipped"})[s.tune]),

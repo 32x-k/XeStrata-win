@@ -398,6 +398,33 @@ def cards_for_launch(s: S.LaunchSettings, catalog, ram_gb: float | None = None, 
         return None
 
 
+EXPERTS_MIN_ENGINE = (0, 1, 50)      # the first DeepSeek engine that accepts --experts (0.1.49.2, the one shipped before, does not)
+
+
+def dsv41_engine_version(exe) -> tuple:
+    """The version of a DeepSeek engine: from its package folder's name ("0.1.50-windows-x86_64-cuda-cuda13"), else what `--version` prints;
+    () when neither says."""
+    if not exe:
+        return ()
+    from strata_control import dsv41_engine
+    folder = Path(str(exe)).parent.name
+    version = dsv41_engine.version_key(folder) if folder[:1].isdigit() else ()
+    if version:
+        return version
+    try:
+        done = subprocess.run([str(exe), "--version"], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+        found = re.search(r"(\d+\.\d+\.\d+(?:\.\d+)?)", (done.stdout or "") + (done.stderr or ""))
+        return tuple(int(x) for x in found.group(1).split(".")) if found else ()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ()
+
+
+def engine_takes_experts(exe) -> bool:
+    """Does this DeepSeek engine accept --experts (0.1.50 or newer)? An engine whose version cannot be told counts as not: nothing is passed,
+    nothing is shown, no error."""
+    return dsv41_engine_version(exe) >= EXPERTS_MIN_ENGINE
+
+
 def used_vram_gb(computer, s: "S.LaunchSettings") -> float:
     """Graphics memory (GiB) of the cards this launch uses, summed as the engine sums it: the cards named (--gpu, the Cards step; a role other than
     off), else every card that can be used."""
@@ -1330,9 +1357,9 @@ class Runner:
         from strata_control import tune_knobs
         base = read_config(base_path)
         cfg = derive_config(base, self.s, bool_flags=tune_knobs.BOOL_FLAGS,
-                            log=str(launch_dir() / f"{self.name}.engine.log"), gpus=cards_for_launch(self.s, self.catalog, base=base),
-                            experts=self.experts_flag())
+                            log=str(launch_dir() / f"{self.name}.engine.log"), gpus=cards_for_launch(self.s, self.catalog, base=base))
         self.use_own_dsv41_engine(cfg)
+        apply_experts(cfg, self.experts_flag(cfg.get("exe")))   # after the engine is settled: only a 0.1.50+ engine is given --experts
         wait = self.start_wait()
         if wait > 600 and not cfg.get("engine_ready_s"):     # the server's own wait for the engine (900 s) must not end before the start's
             cfg["engine_ready_s"] = wait + 60
@@ -1950,7 +1977,7 @@ class Runner:
     def resolved_speed(self) -> tuple[str, bool] | None:
         """DeepSeek's speed: ("faster" | "full", whether it is the default for this PC); None for any other model. The default is the engine's own
         rule (`--experts auto`: 5 when the cards used total 16 GiB or less); only an explicit choice is written as --experts."""
-        if not self.multi_file():
+        if not self.multi_file() or not self.speed_engine_ok():
             return None
         try:
             default = S.faster_default(used_vram_gb(self.catalog.computer(), self.s))
@@ -1960,10 +1987,20 @@ class Runner:
             return self.s.speed, (self.s.speed == "faster") == default
         return ("faster" if default else "full"), True
 
-    def experts_flag(self) -> int | None:
-        """The engine's --experts for this launch: 5 or 6 only when the person chose; None (nothing is passed, the engine's `--experts auto`
-        decides) when they did not, and for a model that has no such choice."""
-        if self.resolved_speed() is None or self.s.speed not in S.SPEED_MODES:
+    def speed_engine_ok(self, exe=None) -> bool:
+        """The DeepSeek engine this launch will run takes --experts (0.1.50 or newer; the self-upgrade normally brings it first, but nothing relies
+        on that). `exe`: the engine a config names; else the one launch finds. No engine yet, or an older one: False, and the Speed choice stays out."""
+        if exe is None:
+            try:
+                exe = self.dsv41_engine_found()[0]
+            except Exception:                                # noqa: BLE001
+                exe = None
+        return engine_takes_experts(exe)
+
+    def experts_flag(self, exe=None) -> int | None:
+        """The engine's --experts for this launch: 5 or 6 only when the person chose and the engine takes it; None (nothing is passed, the engine's
+        `--experts auto` decides) when they did not, for an engine that is too old, and for a model that has no such choice."""
+        if not self.multi_file() or self.s.speed not in S.SPEED_MODES or not self.speed_engine_ok(exe):
             return None
         return 5 if self.s.speed == "faster" else 6
 

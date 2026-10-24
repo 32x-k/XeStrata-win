@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from strata_cli.launch import settings as S
 from strata_cli.launch.app import LaunchApp
-from strata_cli.launch.runner import Runner, apply_experts, derive_config, experts_from_log, used_vram_gb
+from strata_cli.launch.runner import (Runner, apply_experts, derive_config, dsv41_engine_version, engine_takes_experts, experts_from_log,
+                                      used_vram_gb)
 from strata_cli.launch.screens import SpeedScreen, flow_for
 from tests.terminal import test_launch as TL
 from tests.terminal.launch_support import Home, text_of
@@ -102,7 +104,11 @@ class Resolve(unittest.TestCase):
         cat.strata.multi_family.return_value = True
         gpus = [{"index": i, "vram_gb": gb} for i, gb in enumerate(cards)]
         cat.computer.return_value = mock.Mock(usable_gpus=gpus)
-        return Runner(S.LaunchSettings(family="deepseek41", model="IST-DAS-2.00bpw", **kw), catalog=cat, emit=lambda e: None)
+        r = Runner(S.LaunchSettings(family="deepseek41", model="IST-DAS-2.00bpw", **kw), catalog=cat, emit=lambda e: None)
+        r.dsv41_engine_found = lambda: (Path(self.engine), True)
+        return r
+
+    engine = "/x/engine-dsv41/0.1.50-linux-x86_64-cuda-cuda13/strata-dsv41"
 
     def test_a_12_gb_pc_gets_faster_and_a_big_one_full_quality_in_the_words(self):
         self.assertEqual(self.runner(12).resolved_speed(), ("faster", True))
@@ -146,6 +152,35 @@ class Resolve(unittest.TestCase):
         self.assertIn(S.FASTER_NOTE, self.runner(12).speed_line())
         self.assertIn("Faster (default on this PC)", self.runner(12).speed_line())
         self.assertEqual(self.runner(12, speed="full").speed_line(), "Speed: Full quality: all 6 experts per word")
+
+    def test_an_engine_older_than_0_1_50_gets_no_experts_flag_and_no_speed(self):
+        old = "/x/engine-dsv41/0.1.49.2-linux-x86_64-cuda-cuda13/strata-dsv41"
+        r = self.runner(12, speed="full")
+        r.dsv41_engine_found = lambda: (Path(old), True)
+        self.assertFalse(r.speed_engine_ok())
+        self.assertIsNone(r.experts_flag())                    # an explicit choice too: this engine would not understand the flag
+        self.assertIsNone(r.resolved_speed())
+        self.assertEqual(r.speed_line(), "")                    # no line in --plan, no error
+        r.dsv41_engine_found = lambda: (None, None)            # no engine yet: nothing either
+        self.assertIsNone(r.experts_flag())
+        self.assertEqual(self.runner(12, speed="full").experts_flag(), 6)
+        self.assertEqual(r.experts_flag(self.engine), 6)       # the config's engine decides in build_config (after the self-upgrade)
+
+    def test_the_version_comes_from_the_package_folder(self):
+        for name, want in (("0.1.49.2", False), ("0.1.49.9", False), ("0.1.50", True), ("0.1.50.1", True), ("0.2.0", True), ("0.1.49", False)):
+            exe = f"/x/engine-dsv41/{name}-windows-x86_64-cuda-cuda13/strata-dsv41.exe"
+            self.assertEqual(engine_takes_experts(exe), want, name)
+        self.assertEqual(dsv41_engine_version("/x/engine-dsv41/0.1.50-a/strata-dsv41"), (0, 1, 50))
+        self.assertFalse(engine_takes_experts(None))
+        self.assertFalse(engine_takes_experts("/nowhere/strata-dsv41"))        # a name that says nothing and a program that is not there
+
+    def test_a_build_of_your_own_is_asked_for_its_version(self):
+        done = mock.Mock(stdout="strata-dsv41 0.1.50.1 (abc)\n", stderr="")
+        with mock.patch("strata_cli.launch.runner.subprocess.run", return_value=done):
+            self.assertTrue(engine_takes_experts("/home/me/build/strata-dsv41"))
+        done = mock.Mock(stdout="strata-dsv41 0.1.49.2\n", stderr="")
+        with mock.patch("strata_cli.launch.runner.subprocess.run", return_value=done):
+            self.assertFalse(engine_takes_experts("/home/me/build/strata-dsv41"))
 
     def test_another_model_has_no_speed(self):
         cat = mock.Mock()
@@ -200,13 +235,18 @@ class Screen(unittest.TestCase):
         ctx = make_ctx()
         self.assertNotIn("speed", flow_for(ctx))
         ctx.settings.family = "deepseek41"
-        flow = flow_for(ctx)
+        with mock.patch.object(Runner, "speed_engine_ok", return_value=False):          # engine 0.1.49.2 or none: the step is not there
+            self.assertNotIn("speed", flow_for(ctx))
+        ctx._speed_ok = None
+        with mock.patch.object(Runner, "speed_engine_ok", return_value=True):
+            flow = flow_for(ctx)
         self.assertEqual(flow[flow.index("context") + 1], "speed")
 
     def test_the_screen_offers_two_choices_and_remembers_only_a_change(self):
         ctx = make_ctx()
         ctx.settings.family, ctx.settings.model = "deepseek41", "IST-DAS-2.00bpw"
         faster_here = S.faster_default(used_vram_gb(ctx.computer, ctx.settings))
+        ctx._speed_ok = True
         app = LaunchApp(ctx)
 
         async def go():
