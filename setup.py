@@ -3760,8 +3760,10 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None) -
     QI = _qimage()
     _, dit, enc = QI.IMAGE_MODELS[choice]
     label, steps, _ = QI.DITS[dit]
+    q8 = {"on": True, "off": False}.get(getattr(a, "image_dit_q8", None) or "auto")   # None: by the VRAM
     asked = size or a.image_quant or QI.DEFAULT_QUANT
     if QI.is_mage(dit):   # Mage-Flow's DiT comes in one size (bf16: the engine's FP16 or 8 bits of it, --image-dit-q8)
+        q8 = QI.mage_q8(size) if size else q8      # :int8 / :bf16 after its name, for this model alone
         if a.image_quant and not size:
             warn(f"--image-quant {a.image_quant}: {label} comes in one size, which the engine quantizes itself "
                  "(--image-dit-q8 auto|on|off)")
@@ -3773,10 +3775,10 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None) -
     lowered = None
     if not ssd and text_gb is not None:
         left = ram_gb() - text_gb
-        quant, tquant, fits = QI.fit_ram(left, enc, asked, tasked, dit, dit_keep)
+        quant, tquant, fits = QI.fit_ram(left, enc, asked, tasked, dit, dit_keep, q8)
         if (quant, tquant) != (asked, tasked):
             # kept in the config: the server says it at start and on the web page (the user's decision, 2026-10-15)
-            need = QI.ram_need_gb(asked, enc, tasked, dit, dit_keep)
+            need = QI.ram_need_gb(asked, enc, tasked, dit, dit_keep, q8)
             lowered = {"from": asked, "to": quant, "text_from": tasked, "text_to": tquant,
                        "need_gb": round(need, 1), "ram_left_gb": round(max(left, 0.0), 1)}
             warn(f"{label} lowered from {asked} (text encoder {tasked}) to {quant} (text encoder {tquant}): "
@@ -3784,7 +3786,7 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None) -
                  f"leaves ~{max(left, 0):.0f} GB. --image-ssd-offload on keeps both and reads what does not fit "
                  "from the SSD (slower)")
         if not fits:
-            least = QI.ram_need_gb(quant, enc, tquant, dit, dit_keep)
+            least = QI.ram_need_gb(quant, enc, tquant, dit, dit_keep, q8)
             warn(f"even {label} {quant} with a {tquant} text encoder (~{least:.0f} GB) "
                  f"does not fit the ~{max(left, 0):.0f} GB of RAM the text model leaves: images read part of the model "
                  "from the SSD (slower), and the PC may run short of RAM while one is made")
@@ -3797,7 +3799,7 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None) -
         + (f", Qwen3-VL-{'4B' if QI.is_mage(dit) else '8B'} with its refusal direction removed)"
            if enc.endswith("uncensored") else ")"))
     say("  " + QI.license_note(dit))
-    return {"choice": choice, "quant": quant, "tquant": tquant, "lowered": lowered,
+    return {"choice": choice, "quant": quant, "tquant": tquant, "lowered": lowered, "q8": q8,
             "names": QI.file_names(quant, enc, tquant, dit)}
 
 
@@ -3880,13 +3882,12 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path,
         dst = QI.local_path(models_dir, name)
         download(QI.file_url(name, hf_endpoint()), dst, f"image model: {Path(path).name}")
         verify_sha256(dst, size, sha)
-    dit_q8 = {"on": True, "off": False}.get(getattr(a, "image_dit_q8", None) or "auto")   # None: by the VRAM
     cfgs = []
     for p in plans:
         cfg = QI.image_config(p["quant"], exe, models_dir, model=p["choice"],
                               uma=bool((gpu or {}).get("integrated")), policy=a.image_gpu_policy or "auto",
                               ssd_offload=getattr(a, "image_ssd_offload", None) == "on", text_quant=p["tquant"],
-                              dit_q8=dit_q8, dit_keep=getattr(a, "image_dit_keep", None) != "off")
+                              dit_q8=p["q8"], dit_keep=getattr(a, "image_dit_keep", None) != "off")
         if p["lowered"]:
             cfg["quant_lowered"] = p["lowered"]
         cfgs.append(cfg)
@@ -5791,8 +5792,9 @@ def describe() -> dict:
                        "ram_gb": round(QI.ram_need_gb(QI.dit_quants(dit)[-1], enc, QI.DEFAULT_TEXT_QUANT, dit), 1),
                        "edits": dit in QI.MF_EDIT or not QI.is_mage(dit), "license": QI.license_note(dit),
                        "uncensored": choice + "-uncensored" in QI.IMAGE_MODELS,
-                       # the sizes one can ask for after its name (--images qwen-image-turbo:Q6_K), largest first
-                       "quants": list(reversed(QI.dit_quants(dit))) if len(QI.dit_quants(dit)) > 1 else []})
+                       # the sizes one can ask for after its name (--images qwen-image-turbo:Q6_K, magetrail:int8),
+                       # largest first; Mage-Flow's: 8 bits always (int8) or 16 (bf16), not the file's
+                       "quants": list(QI.size_choices(dit)) if QI.is_mage(dit) else list(reversed(QI.QUANTS))})
     by_name = {v[0]: k for k, v in QI.IMAGE_MODELS.items()}   # a config's model_name -> its --images choice
     installed = []
     for c in installed_configs():
@@ -6026,7 +6028,7 @@ def main() -> int:
             fail(f"--images {a.images}: {e}",
                  "use --images " + "|".join(images) + " (qwen-image is qwen-image-turbo); several, comma-separated "
                  "(qwen-image-turbo,magetrail: the first the default); a size after a model's name to choose it "
-                 "(qwen-image-turbo:Q6_K)")
+                 "(qwen-image-turbo:Q6_K; Mage-Flow's and MageTrail's :int8 or :bf16, 8 or 16 bits on the GPU)")
     if a.image_text_encoder is not None:
         fail("--image-text-encoder was removed: --images names the text encoder",
              "use --images " + "|".join(images) + " (--image-text-encoder uncensored is qwen-image-turbo-uncensored)")

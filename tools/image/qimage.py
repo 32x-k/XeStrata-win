@@ -195,16 +195,28 @@ def dit_quants(dit: str) -> tuple[str, ...]:
     return ("bf16",) if is_mage(dit) else QUANTS
 
 
+def size_choices(dit: str) -> tuple[str, ...]:
+    """The sizes one can ask for after a model's name: Qwen-Image-2.1's files (QUANTS); Mage-Flow's one bf16 file
+    turned to 8 bits as the engine reads it (int8: always, as --image-dit-q8 on) or kept 16-bit (bf16: as off)."""
+    return ("int8", "bf16") if is_mage(dit) else QUANTS
+
+
+def mage_q8(size: str | None) -> bool | None:
+    """A Mage-Flow model's 8 bits from its size after its name: True (int8), False (bf16), None (not said)."""
+    return {"int8": True, "bf16": False}.get(size or "")
+
+
 def parse_choices(value: str) -> list[tuple[str, str | None]]:
     """--images (setup) / --model (install.py): image models, comma-separated, the first the default, each with its
-    image model's size after a colon or not (qwen-image-turbo:Q8_0,qwen-image-base:Q4_K_M; without one, the size
-    --image-quant or the RAM gives) -> [(choice, size or None)].  ValueError naming what is wrong."""
+    image model's size after a colon or not (qwen-image-turbo:Q8_0,qwen-image-base:Q4_K_M,magetrail:int8; without
+    one, the size --image-quant or the RAM gives, and Mage-Flow's 8 bits --image-dit-q8 or the VRAM) -> [(choice,
+    size or None)].  ValueError naming what is wrong."""
     out = []
     for part in value.split(","):
         name, _, size = part.strip().partition(":")
         if name not in IMAGE_MODELS:
             raise ValueError(f"{name or part!r} is no image model (one of {', '.join(IMAGE_MODELS)})")
-        sizes = dit_quants(IMAGE_MODELS[name][1])
+        sizes = size_choices(IMAGE_MODELS[name][1])
         if size and size not in sizes:
             raise ValueError(f"{name} comes in {', '.join(sizes)}, not {size}")
         out.append((name, size or None))
@@ -244,19 +256,22 @@ def file_names(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant:
 
 
 def ram_need_gb(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant: str = DEFAULT_TEXT_QUANT,
-                dit: str = "turbo", keep: bool = True) -> float:
+                dit: str = "turbo", keep: bool = True, q8: bool | None = None) -> float:
     """The RAM (GB) an image job keeps busy with that DiT at `quant` and that text encoder: the files, read through
     the OS file cache (the engine maps them), and the engine's own; Mage-Flow's DiTs as the Q8_0 their blocks become
-    (the file's pages dropped once read), its edit model's too with `keep` (else one DiT at a time)."""
+    (the file's pages dropped once read) unless kept 16-bit (`q8` False: the whole file mapped), its edit model's
+    too with `keep` (else one DiT at a time)."""
+    share = 1.0 if q8 is False else MF_Q8_SHARE
     names = file_names(quant, text_encoder, text_quant, dit)
     if is_mage(dit) and not keep and dit in MF_EDIT:
         names = tuple(k for k in names if k != f"{MF_EDIT[dit][0]}-bf16")
-    return sum(FILES[k][2] * (MF_Q8_SHARE if k.endswith("-bf16") and is_mage(dit) else 1) for k in names) / 1e9 \
+    return sum(FILES[k][2] * (share if k.endswith("-bf16") and is_mage(dit) else 1) for k in names) / 1e9 \
         + HOST_GB
 
 
 def fit_ram(ram_left_gb: float, text_encoder: str = DEFAULT_TEXT_ENCODER, quant: str = DEFAULT_QUANT,
-            text_quant: str = DEFAULT_TEXT_QUANT, dit: str = "turbo", keep: bool = True) -> tuple[str, str, bool]:
+            text_quant: str = DEFAULT_TEXT_QUANT, dit: str = "turbo", keep: bool = True,
+            q8: bool | None = None) -> tuple[str, str, bool]:
     """The DiT and text encoder quants whose files fit `ram_left_gb` (the RAM the text model leaves), from `quant`
     and `text_quant` down -> (quant, text_quant, fits): the encoder is lowered first and the DiT only when the
     smallest encoder does not fit, the encoder then the largest that fits beside that DiT.  The smallest of both, not
@@ -266,7 +281,7 @@ def fit_ram(ram_left_gb: float, text_encoder: str = DEFAULT_TEXT_ENCODER, quant:
         quant = quants[-1]
     for q in reversed(quants[:quants.index(quant) + 1]):
         for t in reversed(TEXT_QUANTS[:TEXT_QUANTS.index(text_quant) + 1]):
-            if ram_need_gb(q, text_encoder, t, dit, keep) <= ram_left_gb:
+            if ram_need_gb(q, text_encoder, t, dit, keep, q8) <= ram_left_gb:
                 return q, t, True
     return quants[0], TEXT_QUANTS[0], False
 
