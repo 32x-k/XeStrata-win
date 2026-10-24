@@ -1,10 +1,10 @@
 # Strata 0.2.4.2: DeepSeek launch and install fixes
 
-Fixes for `strata launch` with DeepSeek and for the one-line installer. The Terminal's Control (0.1.49.2), `install.sh` and the three DeepSeek engine packages (0.1.49.1) changed. The app stays 0.2.3 and every Qwen engine package stays as it was, so there is nothing new to download for them.
+Fixes for `strata launch` with DeepSeek and for the one-line installer. The Terminal's Control (0.1.49.2), `install.sh` and the three DeepSeek engine packages (0.1.49.2) changed. The app stays 0.2.3 and every Qwen engine package stays as it was, so there is nothing new to download for them.
 
 ## What is fixed
 
-- **Faster DeepSeek on AMD Ryzen 3000 / Threadripper 3000 / EPYC 7002 CPUs.** The 2.00 and IQ1_M sets answered up to 3x slower there; the answers are unchanged. The DeepSeek engine is now 0.1.49.1 (`strata-dsv41-0.1.49.1-windows-x86_64-cuda-cuda13`, `-linux-x86_64-cuda-cuda13` and `-linux-x86_64-hip-rx9070`).
+- **Faster DeepSeek on AMD Ryzen 3000 / Threadripper 3000 / EPYC 7002 CPUs.** The 2.00 and IQ1_M sets answered up to 3x slower there; the answers are unchanged. The DeepSeek engine is now 0.1.49.2 (`strata-dsv41-0.1.49.2-windows-x86_64-cuda-cuda13`, `-linux-x86_64-cuda-cuda13` and `-linux-x86_64-hip-rx9070`).
 - **The right DeepSeek engine runs when you have more than one Strata install.** Launch now picks the newest DeepSeek engine package of the install that is running, and of the install your model's settings came from, instead of an old path saved in the model's settings.
 - **A plain message when GitHub cannot be reached.** DeepSeek setup checks for 10 seconds before it downloads anything and says in one line that GitHub is not reachable, instead of retrying for minutes.
 - **Faster returns to a conversation.** DeepSeek keeps recent conversations (and a shared system prompt) on disk, so a returning agent or a sub-agent with the same system prompt answers sooner; up to 2 GB, cleaned after a week; `STRATA_DS4_SLOT_KEEP=0` turns it off.
@@ -16,7 +16,7 @@ Fixes for `strata launch` with DeepSeek and for the one-line installer. The Term
 
 ## Updating
 
-- **DeepSeek engine:** it updates itself on the next launch. When the signed feed has a newer DeepSeek engine package for your PC (0.1.49.1 over 0.1.49), `strata launch` downloads it, checks it, starts it once, switches to it and removes the old one. If that fails you see one line and the engine you have keeps running; with no internet the launch goes on without waiting. An engine you gave with `--dsv41-package` or `STRATA_DSV41_EXE` is never replaced.
+- **DeepSeek engine:** it updates itself on the next launch. When the signed feed has a newer DeepSeek engine package for your PC (0.1.49.2 over 0.1.49), `strata launch` downloads it, checks it, starts it once, switches to it and removes the old one. If that fails you see one line and the engine you have keeps running; with no internet the launch goes on without waiting. An engine you gave with `--dsv41-package` or `STRATA_DSV41_EXE` is never replaced.
 
 - **From 0.2.4 or 0.2.4.1:** run `strata update` in the Terminal. It fetches Control 0.1.49.2 and the next `strata` command runs it (`strata --version` says 0.2.4.2).
 - **New installs:** use the command in the README (download `install.sh`, then run it).
