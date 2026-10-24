@@ -81,11 +81,10 @@ The server speaks to the engine as it does for the other models, so `/v1/chat/co
   server turns them into OpenAI `tool_calls` and Anthropic `tool_use`, including `tool_choice`, streamed arguments and calls written inside the thinking.
   A value marked `string="true"` stays a string.
 - Defaults when a request names none: temperature 1.0, top_p 1.0.
-- Agents and sub-agents that take turns can skip reading their prompts again (off in this version, a switch for testing). With
-  `STRATA_DS4_SLOT_KEEP=1` the engine sets a conversation aside when another request takes the model (about 17 MB per 6.5K tokens) and takes it
+- Agents and sub-agents that take turns do not read their prompts again. The engine sets a conversation aside when another request takes the model (about 17 MB per 6.5K tokens) and takes it
   back when the next prompt continues it, also after a restart. Slots live in `ds4-slots` next to the run log, are capped at 2 GB
-  (`STRATA_DS4_SLOT_GB`) and are removed after a week. `STRATA_DS4_AUTO_PIN=1` also keeps the system prompt and tools shared by an agent
-  and its sub-agents as a checkpoint.
+  (`STRATA_DS4_SLOT_GB`) and are removed after a week. The system prompt and tools shared by an agent
+  and its sub-agents are kept as a checkpoint too. `STRATA_DS4_SLOT_KEEP=0` and `STRATA_DS4_AUTO_PIN=0` turn this off.
 
 Not in this version: several requests at once (`--parallel` is ignored with a warning) and pictures (`--vision` is ignored with a warning).
 
