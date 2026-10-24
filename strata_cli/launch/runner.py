@@ -1729,6 +1729,11 @@ class Runner:
             parts = [p for p in parts if p["kind"] != "weights"] + [{"kind": "weights", "label": "the ready-made pack", "gb": gap["gb"]}]
         gb = round(sum(p["gb"] for p in parts), 1)
         engine, here = True, []
+        if self.multi_file():                                # DeepSeek does not use the Strata engine: nothing about it in the plan (its own package is in the placement)
+            return {"gb": gb, "parts": parts, "engine_missing": False, "engine_usable": True, "own_files": st.own_files,
+                    "text": ("Nothing to download: your model files are used where they are." if gb < 0.05 and st.own_files else
+                             "Nothing to download: the model is already on this computer." if gb < 0.05 else
+                             f"About {gb:.1f} GB to download.")}
         try:
             report = engine_component.status(Path(self.components_dir) if self.components_dir else None)
             engine = bool(report.get("usable"))
