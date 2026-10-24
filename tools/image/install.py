@@ -57,7 +57,6 @@ def main(argv=None) -> int:
                     help="setup.py's --json output (one JSON object a line, for the Windows launcher)")
     ap.add_argument("--yes", action="store_true")
     a = ap.parse_args(argv)
-    asked = a.model.split(",")
     if a.model == "no":   # image generation taken out of the config
         if not a.config:
             ap.error("--model no needs --config")
@@ -68,8 +67,10 @@ def main(argv=None) -> int:
         S.write_config(off, cfg)
         S.ok(f"{off.name}: image generation taken out (once the server starts again)")
         return 0
-    if len(set(asked)) != len(asked) or not set(asked) <= set(QI.IMAGE_MODELS):
-        ap.error(f"--model {a.model}: each of {', '.join(QI.IMAGE_MODELS)} at most once")
+    try:
+        QI.parse_choices(a.model)
+    except ValueError as e:
+        ap.error(f"--model {a.model}: {e}")
     import setup as S
     gpu = S.gpu_info() or {}
     if a.models_dir is None:

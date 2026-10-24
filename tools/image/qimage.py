@@ -195,6 +195,24 @@ def dit_quants(dit: str) -> tuple[str, ...]:
     return ("bf16",) if is_mage(dit) else QUANTS
 
 
+def parse_choices(value: str) -> list[tuple[str, str | None]]:
+    """--images (setup) / --model (install.py): image models, comma-separated, the first the default, each with its
+    image model's size after a colon or not (qwen-image-turbo:Q8_0,qwen-image-base:Q4_K_M; without one, the size
+    --image-quant or the RAM gives) -> [(choice, size or None)].  ValueError naming what is wrong."""
+    out = []
+    for part in value.split(","):
+        name, _, size = part.strip().partition(":")
+        if name not in IMAGE_MODELS:
+            raise ValueError(f"{name or part!r} is no image model (one of {', '.join(IMAGE_MODELS)})")
+        sizes = dit_quants(IMAGE_MODELS[name][1])
+        if size and size not in sizes:
+            raise ValueError(f"{name} comes in {', '.join(sizes)}, not {size}")
+        out.append((name, size or None))
+    if len({n for n, _ in out}) != len(out):
+        raise ValueError("each image model once")
+    return out
+
+
 def license_note(dit: str) -> str:
     name, _, repo = DITS[dit]
     if dit == "mf-trail":

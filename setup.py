@@ -3750,8 +3750,9 @@ def text_ram_gb(args: list, ram: float, model: str | None = None) -> float:
     return gb
 
 
-def image_plan(a, choice: str, text_gb: float | None) -> dict:
-    """One --images choice (qimage.IMAGE_MODELS): its sizes and files -> {choice, quant, tquant, lowered, names}.
+def image_plan(a, choice: str, text_gb: float | None, size: str | None = None) -> dict:
+    """One --images choice (qimage.IMAGE_MODELS) and the size asked after its name (`size`; else --image-quant's):
+    its sizes and files -> {choice, quant, tquant, lowered, names}.
     `text_gb`: the RAM the text model keeps (text_ram_gb): the denoiser's and the text encoder's quants are the largest
     whose files fit the rest (the user's decision of 2026-10-15), the encoder lowered first (2026-10-19), or the ones
     asked for with --image-ssd-offload on (what does not fit read from the SSD).  One image model runs at a time, so
@@ -3759,9 +3760,9 @@ def image_plan(a, choice: str, text_gb: float | None) -> dict:
     QI = _qimage()
     _, dit, enc = QI.IMAGE_MODELS[choice]
     label, steps, _ = QI.DITS[dit]
-    asked = a.image_quant or QI.DEFAULT_QUANT
+    asked = size or a.image_quant or QI.DEFAULT_QUANT
     if QI.is_mage(dit):   # Mage-Flow's DiT comes in one size (bf16: the engine's FP16 or 8 bits of it, --image-dit-q8)
-        if a.image_quant:
+        if a.image_quant and not size:
             warn(f"--image-quant {a.image_quant}: {label} comes in one size, which the engine quantizes itself "
                  "(--image-dit-q8 auto|on|off)")
         asked = QI.dit_quants(dit)[-1]
@@ -3865,7 +3866,7 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path,
     exe = eng / IMAGE_EXE
     if not exe.exists():
         fail(f"the image engine is missing ({exe})", "run setup again to compile the engine (it builds both)")
-    plans = [image_plan(a, choice, text_gb) for choice in a.images.split(",")]
+    plans = [image_plan(a, choice, text_gb, size) for choice, size in QI.parse_choices(a.images)]
     names = list(dict.fromkeys(n for p in plans for n in p["names"]))   # the files the models share, once
     need = sum(QI.FILES[k][2] for k in names) / 1e9
     what = "the image model" if len(plans) == 1 else f"the {len(plans)} image models"
@@ -6016,15 +6017,17 @@ def main() -> int:
         fail("--license contrib-icpx: the contrib-icpx mode (Intel oneAPI's icpx) was removed",
              "use --license contrib (contrib-llvm: intel/llvm, for Intel, AMD and NVIDIA GPUs), or --license free")
     images = ("no", *_qimage().IMAGE_MODELS)
-    asked = (a.images or "").split(",")
-    if a.images is not None and (len(set(asked)) != len(asked) or (len(asked) > 1 and "no" in asked)):
-        fail(f"--images {a.images}: each image model once, and no alone",
-             "use --images qwen-image-turbo,magetrail for two models (the first the default), or --images no")
-    if a.image_text_encoder is not None or (a.images is not None and not set(asked) <= set(images)):
-        fail(f"--images {a.images}: no such choice" if a.image_text_encoder is None
-             else "--image-text-encoder was removed: --images names the text encoder",
-             "use --images " + "|".join(images) + " (qwen-image is qwen-image-turbo, --image-text-encoder "
-             "uncensored is qwen-image-turbo-uncensored)")
+    if a.images is not None and a.images != "no" and a.image_text_encoder is None:
+        try:
+            _qimage().parse_choices(a.images)
+        except ValueError as e:
+            fail(f"--images {a.images}: {e}",
+                 "use --images " + "|".join(images) + " (qwen-image is qwen-image-turbo); several, comma-separated "
+                 "(qwen-image-turbo,magetrail: the first the default); a size after a model's name to choose it "
+                 "(qwen-image-turbo:Q6_K)")
+    if a.image_text_encoder is not None:
+        fail("--image-text-encoder was removed: --images names the text encoder",
+             "use --images " + "|".join(images) + " (--image-text-encoder uncensored is qwen-image-turbo-uncensored)")
     if a.source:
         os.environ["STRATA_SOURCE"] = a.source
     if a.inspect:                                      # upstream #911: headers only, nothing is installed
