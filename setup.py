@@ -5683,8 +5683,9 @@ def describe() -> dict:
     """What a front end (the Windows launcher) shows before it asks anything, as one object: this PC (RAM, CPU, the
     GPUs and why one cannot be used, the one setup takes by default), every model family and size with the RAM it
     needs, whether it fits and which is recommended (the rules the questions of step 2 use, for that GPU), the data
-    folder and the installed models.  It reports only: nothing is made, moved or saved.  The front end passes its
-    choices back as --family, --model, --context, --gpu and --data-dir."""
+    folder, the installed models (and their image models), and the image models one can add.  It reports only:
+    nothing is made, moved or saved.  The front end passes its choices back as --family, --model, --context, --gpu,
+    --data-dir and --images (an installed model's image models through tools/image/install.py)."""
     ram = ram_gb()
     found = gpus()
     # the card choose_gpus takes without --gpu: the supported one with the most VRAM
@@ -5721,20 +5722,37 @@ def describe() -> dict:
             max_ctx = CONTEXTS[-1]
         families.append({"id": f, "title": fam["title"], "by": fam["by"], "about": fam["about"],
                          "license": fam.get("license"), "experimental": bool(fam.get("experimental")),
+                         "images": not fam.get("plain"),             # setup_plain sets up no image generation
                          "contexts": [c for c in CONTEXTS if c <= max_ctx], "models": models})
+    QI = _qimage()
+    images = []
+    for choice, (_, dit, enc) in QI.IMAGE_MODELS.items():
+        if choice.endswith("-uncensored"):
+            continue
+        names = QI.file_names(QI.dit_quants(dit)[-1], enc, QI.DEFAULT_TEXT_QUANT, dit)
+        images.append({"id": choice, "title": QI.DITS[dit][0], "about": QI.ABOUT.get(choice, ""),
+                       "download_gb": round(sum(QI.FILES[n][2] for n in names) / 1e9, 1),
+                       "ram_gb": round(QI.ram_need_gb(QI.dit_quants(dit)[-1], enc, QI.DEFAULT_TEXT_QUANT, dit), 1),
+                       "edits": dit in QI.MF_EDIT or not QI.is_mage(dit), "license": QI.license_note(dit),
+                       "uncensored": choice + "-uncensored" in QI.IMAGE_MODELS})
+    by_name = {v[0]: k for k, v in QI.IMAGE_MODELS.items()}   # a config's model_name -> its --images choice
     installed = []
     for c in installed_configs():
         ch = choices_from_config(c)
         cfg = json.loads(c.read_text(encoding="utf-8-sig"))
+        secs = [cfg.get("images"), *(cfg.get("image_models") or [])] if isinstance(cfg.get("images"), dict) else []
         installed.append({"config": str(c), "model_name": cfg.get("model_name", c.stem), "family": ch["family"],
-                          "model": ch["model"], "context": ch["context"], "port": ch["port"] or 8095})
+                          "model": ch["model"], "context": ch["context"], "port": ch["port"] or 8095,
+                          "images": [by_name[s["model_name"]] for s in secs
+                                     if isinstance(s, dict) and s.get("model_name") in by_name]})
     return {"type": "describe", "version": source_version(), "packaged": bool(PACKAGED),
             "ram_gb": round(ram, 1), "cpu": dict(zip(("name", "avx2", "avx512"), cpu_info())),
             "gpu": gpu["index"] if gpu else None,
             "gpus": [{"index": g["index"], "name": g["name"], "vendor": g.get("vendor"),
                       "vram_gb": round(g["vram_gb"], 1), "integrated": bool(g.get("integrated")), "pci": g.get("pci"),
                       "problem": gpu_problem(g)} for g in found],
-            "data_dir": str(data_folder_path(None, load_settings())), "families": families, "installed": installed}
+            "data_dir": str(data_folder_path(None, load_settings())), "families": families, "installed": installed,
+            "images": images}
 
 
 def main() -> int:

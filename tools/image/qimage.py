@@ -153,6 +153,13 @@ IMAGE_MODELS = {"qwen-image-turbo": ("qwen-image-2.1-turbo", "turbo", "stock"),
                 "magetrail": ("magetrail", "mf-trail", "mf-stock"),
                 "magetrail-uncensored": ("magetrail-uncensored", "mf-trail", "mf-uncensored")}
 DEFAULT_MODEL = "qwen-image-turbo"
+# what a front end (setup --describe, the Windows launcher) says of each choice without -uncensored
+ABOUT = {"qwen-image-turbo": "Everyday images and edits (recommended), 8 steps",
+         "qwen-image-base": "Turbo's base model: the steps can be changed, about 5 times as long an image",
+         "mage-flow-turbo": "The fastest, a small model (4B) for PCs with little RAM or VRAM, 4 steps",
+         "mage-flow": "Mage-Flow tuned to follow instructions and draw text better, 20 steps with guidance",
+         "mage-flow-base": "Mage-Flow's base model, 30 steps with guidance",
+         "magetrail": "Mage-Flow tuned on Danbooru and e621 images, for illustrations from booru tags; no edits"}
 # the DiT -> its name, its steps (Turbo's are its own 8 sigmas; the base model's, the default of its pipeline,
 # diffusers' QwenImage21Pipeline, sampled without guidance as Qwen meant it), its Hugging Face model
 DITS = {"turbo": ("Qwen-Image-2.1-Turbo", 8, "Qwen/Qwen-Image-2.1-Turbo"),

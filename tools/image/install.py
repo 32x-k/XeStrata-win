@@ -15,7 +15,8 @@ inside the normal setup (setup.py's setup_images).
 the config's text model leaves, unless --ssd-offload on; Mage-Flow's comes in one size (bf16).
 --model qwen-image-turbo|qwen-image-base|mage-flow-turbo|mage-flow|mage-flow-base|magetrail[-uncensored]: the image
 model (setup.py --images), or several, comma-separated (the first the default, the others named by a request's
-"model"); -uncensored: its text encoder with the refusal direction removed.  The text encoder is Q8_0, or lowered
+"model"), or no (image generation taken out of --config); -uncensored: its text encoder with the refusal direction
+removed.  The text encoder is Q8_0, or lowered
 first.
 --dit-q8, --dit-keep: Mage-Flow's image model in 8 or 16 bits, and the one not in use kept in RAM (as setup's
 --image-dit-q8 and --image-dit-keep).
@@ -52,9 +53,21 @@ def main(argv=None) -> int:
     ap.add_argument("--dit-keep", choices=["on", "off"],
                     help="Mage-Flow: keep the DiT not in use (the generation's or the edit's) in RAM (on, the default)")
     ap.add_argument("--print", action="store_true", help="print the images section instead of writing it")
+    ap.add_argument("--json", action="store_true",
+                    help="setup.py's --json output (one JSON object a line, for the Windows launcher)")
     ap.add_argument("--yes", action="store_true")
     a = ap.parse_args(argv)
     asked = a.model.split(",")
+    if a.model == "no":   # image generation taken out of the config
+        if not a.config:
+            ap.error("--model no needs --config")
+        import setup as S
+        off = Path(a.config)
+        cfg = json.loads(off.read_text(encoding="utf-8-sig"))
+        cfg["images"] = cfg["image_models"] = None
+        S.write_config(off, cfg)
+        S.ok(f"{off.name}: image generation taken out (once the server starts again)")
+        return 0
     if len(set(asked)) != len(asked) or not set(asked) <= set(QI.IMAGE_MODELS):
         ap.error(f"--model {a.model}: each of {', '.join(QI.IMAGE_MODELS)} at most once")
     import setup as S
