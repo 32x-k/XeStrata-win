@@ -920,7 +920,13 @@ struct Model::Impl {
     std::atomic<int> layer_of[kRing];
     std::thread service;
     std::atomic<bool> quit{false};
+#if defined(STRATA_METAL)
+    // (the async decode has the GPU wait on flags the CPU lane sets while it runs: the Metal queue cannot be waited on in the
+    // middle of a command buffer, so a decode step takes the host-routed path, as the prompt windows do)
+    bool sync_decode = std::getenv("DS4_ASYNC") == nullptr;
+#else
     bool sync_decode = std::getenv("DS4_SYNC") != nullptr;
+#endif
     // a window of one through moe_gate_up / moe_down (DS4_MOE_TOKEN=0: win_experts, whose down rows run
     // before the wait for the CPU lane - the same bits, no faster)
     bool moe_token_path = std::getenv("DS4_MOE_TOKEN") == nullptr || std::atoi(std::getenv("DS4_MOE_TOKEN")) != 0;
@@ -1175,8 +1181,12 @@ struct Model::Impl {
             if (x == il) return true;
         return false;
     }
+    bool dump_s_name(const char* name) const {   // DS4_DUMP_S_NAMES=a,b,c: only these points (default all)
+        static const std::string names = [] { const char* e = std::getenv("DS4_DUMP_S_NAMES"); return std::string(e ? "," : "") + (e ? e : "") + (e ? "," : ""); }();
+        return names.empty() || names.find(std::string(",") + name + ",") != std::string::npos;
+    }
     void dump_sub(Dev& d, const char* name, int il, int64_t p0, int T, const void* dev, size_t nbytes) {
-        if (!dump_s_on(il)) return;
+        if (!dump_s_on(il) || !dump_s_name(name)) return;
         std::vector<uint8_t> v(nbytes);
         cudaSetDevice(d.id);
 #if defined(STRATA_METAL)
@@ -1187,7 +1197,7 @@ struct Model::Impl {
         dump_sub_host(name, il, p0, T, v.data(), nbytes);
     }
     void dump_sub_host(const char* name, int il, int64_t p0, int T, const void* host, size_t nbytes) {
-        if (!dump_s_on(il)) return;
+        if (!dump_s_on(il) || !dump_s_name(name)) return;
         std::lock_guard<std::mutex> lk(dump_mu);
         char nm[16] = {};
         std::strncpy(nm, name, 15);
@@ -7744,6 +7754,7 @@ struct Model::Impl {
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
         const ArGroup& ag = groups[(size_t) L0.grp].ar;
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
+        if (std::getenv("DS4_TRACE_DISP")) std::fprintf(stderr, "TRACE layer %d p0=%lld T=%d\n", l.il, (long long) p0, T);
         if (std::getenv("DS4_DBG_H") && mi == 0 && (l.il < 2 || std::getenv("DS4_DBG_ALL"))) {   // DBG
             std::vector<float> hv((size_t) T * H * D);
             cudaSetDevice(d.id);
@@ -7806,6 +7817,7 @@ struct Model::Impl {
             if (std::getenv("DS4_DBG_EG")) dbg_nf("h_after_gate", l.il, d.h, (size_t) T * H * D);
         }
         dump_sub(d, "h_in", l.il, p0, T, d.h, (size_t) T * H * D * 4);
+        dump_sub(d, "ring_in", l.il, p0, T, l.win, (size_t) g.win * kv_row_bytes(kKvFp8, HD));
         // attention
         hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
         hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, s);
@@ -7897,6 +7909,8 @@ struct Model::Impl {
                         CK(cudaMemcpyAsync(l.c_rows + (size_t) kWin * HD, d.cgr, nr, cudaMemcpyDeviceToDevice, s));
                     }
                     compress_win(d.ckr, d.cgr, l.c_kv, l.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, d.latent, s);
+                    dump_sub(d, "ckr", l.il, p0, T, d.ckr, (size_t) T * HD * 4);
+                    dump_sub(d, "cgr", l.il, p0, T, d.cgr, (size_t) T * HD * 4);
                 }
             }
             Rows lim;
@@ -8001,6 +8015,8 @@ struct Model::Impl {
                     xfer_put(x, sr.x_flag, wp.win, d.xcnt, s);
                 }
             }
+            if (ng > 0) dump_sub(d, "latent", l.il, p0, ng, d.latent, (size_t) ng * HD * 4);
+            dump_sub(d, "topk", l.il, p0, T, d.topk, (size_t) T * topk_stride() * 4);
             for (int t = 0; t < T; ++t) ar.nsel[t] = lim.n[t] > 0 ? wp.topk[l.il][t] : 0;
             ckv = sr.ckv[(size_t) l.dev];
         }

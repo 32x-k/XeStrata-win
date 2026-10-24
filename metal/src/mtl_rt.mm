@@ -335,6 +335,9 @@ extern "C" unsigned long long ds4_dispatch_seq() { return g_disp_count.load(); }
 
 extern "C" void ds4_gpu_sync_all_streams_weak() __asm("_ds4_gpu_sync_all_streams") __attribute__((weak_import));
 void Context::split_runs() {
+    // (the streams' pending copies come first, as in a full flush: they are queued on another MTLCommandQueue and would
+    // otherwise not have run when the commands committed here read what they write)
+    if (ds4_gpu_sync_all_streams_weak) ds4_gpu_sync_all_streams_weak();
     // Commit the batched dispatches as their own command buffer WITHOUT waiting: the queue runs buffers in order and makes each
     // one's writes visible to the next.  (Measured: a producer kernel's output was read stale by the next dispatch of the same
     // buffer for two kernels in a layer; ending the buffer after them is enough, no wait needed.)

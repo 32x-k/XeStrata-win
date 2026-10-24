@@ -611,11 +611,11 @@ static inline uint ds4_e4m3_code(float v, int k) {
 kernel void ds4_ext_to_ring(device const ushort* ext [[buffer(0)]], device uchar* ring [[buffer(1)]],
                             device uchar* backup [[buffer(2)]], constant long& p0 [[buffer(3)]],
                             constant uint& n [[buffer(4)]], constant uint& T [[buffer(5)]],
-                            constant uint& d [[buffer(6)]], constant ulong& rb [[buffer(7)]],
+                            constant uint& d [[buffer(6)]], constant ulong& rb [[buffer(7)]], constant uint& has_backup [[buffer(8)]],
                             uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
     if (T - t > n) return;                       // overwritten by a later row of the window anyway
     device uchar* row = ring + (size_t) ((size_t(p0) + t) % n) * rb;
-    if (backup != nullptr) {
+    if (has_backup != 0u) {   // (a bound buffer is never a null pointer here: the host says whether there is a backup)
         for (size_t i = tid; i < rb; i += 256u) backup[(size_t) t * rb + i] = row[i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }

@@ -19,6 +19,7 @@
 
 // called by the gpu layer's synchronisation: everything batched must reach the GPU before a host read
 extern "C" void ds4_metal_flush();
+extern "C" size_t ds4_gpu_alloc_remaining(const void* cpu);
 extern "C" void ds4_gpu_sync_all_streams();
 extern "C" unsigned long long ds4_dispatch_seq();
 static unsigned long long g_q8_deduped = 0;
@@ -956,7 +957,7 @@ bool ext_to_ring(const void* ext, void* ring, long long p0, int n, int T, int d,
     dsp.p = &pl;
     dsp.args = {mtl::Arg::B(be, off(he)), mtl::Arg::B(br, off(hr)), mtl::Arg::B(bb, b_off),
                 mtl::Arg::V((long) p0), mtl::Arg::V((unsigned) n), mtl::Arg::V((unsigned) T),
-                mtl::Arg::V((unsigned) d), mtl::Arg::V((unsigned long) row_bytes)};
+                mtl::Arg::V((unsigned) d), mtl::Arg::V((unsigned long) row_bytes), mtl::Arg::V((unsigned) (hb ? 1 : 0))};
     dsp.grid[0] = (uint32_t) T;
     dsp.grid[1] = dsp.grid[2] = 1;
     dsp.tg[0] = 256; dsp.tg[1] = dsp.tg[2] = 1;
@@ -1021,14 +1022,10 @@ bool sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
         if (ar.gen != 0 && ar.R > 0) {
             crows = (size_t) ((ar.p0 + ar.t0 + T + 1) / ar.R) + 2;   // every selected row is below this position
         } else {
-            int maxrow = -1;   // the selected rows, not the cache's whole cap
-            if (hs != nullptr && sel_stride > 0)
-                for (int t = 0; t < T; ++t)
-                    for (int i = 0; i < ar.nsel[t]; ++i) {
-                        const int r = ((const int*) hs)[(size_t) t * (size_t) sel_stride + (size_t) i];
-                        if (r > maxrow) maxrow = r;
-                    }
-            crows = (size_t) (maxrow + 1);
+            // (the rows the selection names are on the device and not read back here: an earlier build read them on the
+            // host while the kernel that wrote them was still queued, and sized the binding from stale zeros)
+            const size_t rem = ds4_gpu_alloc_remaining(hc);
+            crows = rem > 0 ? rem / 288 : (size_t) (ar.nsel[0] > 0 ? ar.nsel[0] : 1);
         }
         if (crows < 1) crows = 1;
     } else {

@@ -711,3 +711,11 @@ extern "C" void* ds4_gpu_buffer_for_cpu(const void* cpu, size_t bytes, size_t* o
 // dereference raw gpuAddresses (weights, ring buffers, job arrays) that no setBuffer names, and memory that is not resident
 // reads as zeros.
 extern "C" void* ds4_gpu_residency_set() { return (void*) strata::gpu::residency_set_impl(); }
+
+// bytes from `cpu` to the end of the allocation that holds it (0: not an allocation)
+extern "C" size_t ds4_gpu_alloc_remaining(const void* cpu) {
+    size_t off = 0;
+    void* b = strata::gpu::buffer_for_cpu_impl(cpu, 1, &off);
+    if (!b) return 0;
+    return ((MTL::Buffer*) b)->length() - off;
+}
