@@ -56,7 +56,9 @@ type ImageModel =
       RamGb: float
       Edits: bool
       License: string
-      Uncensored: bool }
+      Uncensored: bool
+      /// the sizes one can choose (--images name:size), largest first; empty: one size
+      Quants: string[] }
 
 type Installed =
     { Config: string

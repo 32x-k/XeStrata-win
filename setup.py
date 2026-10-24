@@ -5790,7 +5790,9 @@ def describe() -> dict:
                        "download_gb": round(sum(QI.FILES[n][2] for n in names) / 1e9, 1),
                        "ram_gb": round(QI.ram_need_gb(QI.dit_quants(dit)[-1], enc, QI.DEFAULT_TEXT_QUANT, dit), 1),
                        "edits": dit in QI.MF_EDIT or not QI.is_mage(dit), "license": QI.license_note(dit),
-                       "uncensored": choice + "-uncensored" in QI.IMAGE_MODELS})
+                       "uncensored": choice + "-uncensored" in QI.IMAGE_MODELS,
+                       # the sizes one can ask for after its name (--images qwen-image-turbo:Q6_K), largest first
+                       "quants": list(reversed(QI.dit_quants(dit))) if len(QI.dit_quants(dit)) > 1 else []})
     by_name = {v[0]: k for k, v in QI.IMAGE_MODELS.items()}   # a config's model_name -> its --images choice
     installed = []
     for c in installed_configs():

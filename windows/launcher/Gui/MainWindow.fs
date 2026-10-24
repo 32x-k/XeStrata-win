@@ -188,10 +188,13 @@ type MainWindow() as this =
     let runPage = runScriptPage Places.setupPy
 
     /// The image models to choose from (describe's), `current` checked (--images names: the default first) -> the
-    /// control and its --images value (None: none checked).  A choice of the default where several are, and of the
-    /// text encoder with the refusal direction removed (-uncensored) where the models have one.
+    /// control and its --images value (None: none checked).  A choice of the default where several are, of the size
+    /// where a model has several (Auto: by the RAM), and of the text encoder with the refusal direction removed
+    /// (-uncensored) where the models have one.
     let imagePicker (models: ImageModel[]) (current: string[]) =
-        let plain (id: string) = if id.EndsWith "-uncensored" then id.Substring(0, id.Length - 11) else id
+        let plain (id: string) =
+            let id = id.Split(':')[0]
+            if id.EndsWith "-uncensored" then id.Substring(0, id.Length - 11) else id
         let had = current |> Array.map plain
         let boxes =
             [| for m in models ->
@@ -206,6 +209,14 @@ type MainWindow() as this =
                                muted (sprintf "%s; download %s, needs ~%s of RAM besides the text model" m.About (gb m.DownloadGb) (gb m.RamGb))
                            ]
                    ) |]
+        // each model's size where it has several: Auto (the largest that fits the RAM) or one of them
+        let sizes =
+            [| for m in models ->
+                   let c = ComboBox(ItemsSource = Array.append [| "Auto" |] m.Quants, SelectedIndex = 0, MinWidth = 110.0)
+                   let was = current |> Array.tryFind (fun id -> plain id = m.Id && id.Contains ":")
+                   was |> Option.iter (fun id -> c.SelectedItem <- id.Split(':')[1])
+                   c.IsVisible <- m.Quants.Length > 0
+                   c |]
         let uncensored =
             CheckBox(
                 Content = text "Text encoder with its refusal direction removed (-uncensored)",
@@ -236,11 +247,16 @@ type MainWindow() as this =
                 let def = match defaultBox.SelectedItem with :? string as t -> t | _ -> ms.Head.Title
                 let ordered = (ms |> List.filter (fun m -> m.Title = def)) @ (ms |> List.filter (fun m -> m.Title <> def))
                 let name (m: ImageModel) =
-                    if uncensored.IsChecked = Nullable true && m.Uncensored then m.Id + "-uncensored" else m.Id
+                    let id = if uncensored.IsChecked = Nullable true && m.Uncensored then m.Id + "-uncensored" else m.Id
+                    let size = sizes[Array.findIndex (fun (x: ImageModel) -> x.Id = m.Id) models]
+                    match size.SelectedItem with
+                    | :? string as q when q <> "Auto" -> id + ":" + q
+                    | _ -> id
                 Some(ordered |> List.map name |> String.concat ",")
         let control =
             stack 8.0 [
-                yield! (boxes |> Array.map (fun b -> b :> Control))
+                for i, b in Array.indexed boxes do
+                    yield row 12.0 [ b :> Control; sizes[i] :> Control ] :> Control
                 yield defaultField :> Control
                 yield uncensored :> Control
             ]
