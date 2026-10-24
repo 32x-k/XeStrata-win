@@ -210,7 +210,18 @@ bool hc_post(const float* y, float* h, const float* post, const float* comb, int
     d.grid[1] = (uint32_t) T;
     d.grid[2] = 1;
     d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
+    const bool dbg = std::getenv("DS4_DBG_SG") != nullptr;
+    if (dbg) {
+        g_cx->flush_runs();
+        const float* fy = (const float*) hy; const float* fh = (const float*) hh; const float* fp = (const float*) hpost; const float* fc = (const float*) hcomb;
+        std::fprintf(stderr, "hc_post in: y %g %g h %g %g | %g %g post %g %g %g %g comb %g %g %g %g\n", fy[0], fy[1], fh[0], fh[1], fh[(size_t) dim], fh[(size_t) dim + 1], fp[0], fp[1], fp[2], fp[3], fc[0], fc[1], fc[2], fc[3]);
+    }
     g_cx->run({d});
+    if (dbg) {
+        g_cx->flush_runs();
+        const float* fh = (const float*) hh;
+        std::fprintf(stderr, "hc_post out: h %g %g | %g %g\n", fh[0], fh[1], fh[(size_t) dim], fh[(size_t) dim + 1]);
+    }
     g_cx->free(bp);
     g_cx->free(bc);
     return true;
@@ -243,6 +254,11 @@ bool hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float*
     d.grid[1] = d.grid[2] = 1;
     d.tg[0] = 256; d.tg[1] = d.tg[2] = 1;
     g_cx->run({d});
+    if (std::getenv("DS4_DBG_SG")) {
+        g_cx->flush_runs();
+        const float* fc = (const float*) hm;
+        std::fprintf(stderr, "hc_mix_scale T %d hcdim %d n_mix %d eps %g -> %g %g %g\n", T, hcdim, n_mix, eps, fc[0], fc[1], fc[2]);
+    }
     return true;
 }
 
@@ -319,7 +335,17 @@ bool hc_split(const float* mixes, const float* scale, const float* base, int hc,
     d.grid[0] = (uint32_t) T;
     d.grid[1] = d.grid[2] = 1;
     d.tg[0] = 32; d.tg[1] = d.tg[2] = 1;
+    if (std::getenv("DS4_DBG_SG")) {
+        g_cx->flush_runs();
+        const float* fm = (const float*) hm; const float* fs = (const float*) hs; const float* fb = (const float*) hb;
+        std::fprintf(stderr, "hc_split in: mix %g %g %g scale %g %g %g base %g %g\n", fm[0], fm[1], fm[2], fs[0], fs[1], fs[2], fb[0], fb[1]);
+    }
     g_cx->run({d});
+    if (std::getenv("DS4_DBG_SG")) {
+        g_cx->flush_runs();
+        const float* fp = (const float*) hp;
+        std::fprintf(stderr, "hc_split out: pre %g %g %g %g\n", fp[0], fp[1], fp[2], fp[3]);
+    }
     return true;
 }
 
@@ -2471,6 +2497,10 @@ extern "C" void ds4_metal_flush() {
 
 // the one Context every dsv41 kernel dispatches through: two of them means two Metal queues and no ordering between their work
 mtl::Context& shared_cx() {
+    ensure();
+    return *g_cx;
+}
+mtl::Context& finish_cx() {
     ensure();
     return *g_cx;
 }

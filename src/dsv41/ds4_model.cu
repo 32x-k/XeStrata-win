@@ -1165,6 +1165,7 @@ struct Model::Impl {
         cudaSetDevice(d.id);
 #if defined(STRATA_METAL)
         ds4_metal_flush();   // (the residual stream is read back here: commit the batched dispatches first)
+        cudaDeviceSynchronize();
 #endif
         cudaMemcpyAsync(v.data(), h, v.size() * 4, cudaMemcpyDeviceToHost, d.st);
         cudaStreamSynchronize(d.st);
@@ -1191,6 +1192,7 @@ struct Model::Impl {
         cudaSetDevice(d.id);
 #if defined(STRATA_METAL)
         ds4_metal_flush();
+        cudaDeviceSynchronize();   // (the batched dispatches have finished before the read)
 #endif
         cudaMemcpyAsync(v.data(), dev, nbytes, cudaMemcpyDeviceToHost, d.st);
         cudaStreamSynchronize(d.st);
@@ -6198,14 +6200,22 @@ struct Model::Impl {
         }
         // attention
         if (!hc_mix_chunk(d, c, c.h, l.hca_fn, T, c.mix, err)) return false;
+        dump_sub(d, "mix0", l.il, p0, T, c.mix, (size_t) T * 32 * 4);
         hc_split(c.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, c.a_pre, c.a_post, c.a_comb, s);
         hc_pre_norm(c.h, c.pre, l.attn_norm, D, H, T, g.eps, c.x, s);
+        dump_sub(d, "a_mix", l.il, p0, T, c.mix, (size_t) T * 32 * 4);
+        dump_sub(d, "a_pre", l.il, p0, T, c.a_pre, (size_t) T * 8 * 4);
+        dump_sub(d, "a_post", l.il, p0, T, c.a_post, (size_t) T * 8 * 4);
+        dump_sub(d, "a_comb", l.il, p0, T, c.a_comb, (size_t) T * 64 * 4);
+        dump_sub(d, "attn_x", l.il, p0, T, c.x, (size_t) T * D * 4);
         x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
         if (!gemm(d, c, l.wq_a, c.x16, D, T, c.qr, g.q_lora, 0.0f, err) ||
             !gemm(d, c, l.wkv, c.x16, D, T, c.kvr, HD, 0.0f, err))
             return false;
         if (l.kv_src && !gemm(d, c, l.c_wkv, c.x16, D, T, c.ckr, HD, 0.0f, err)) return false;
         if (l.kv_src && l.ratio > 1 && !gemm(d, c, l.c_wgate, c.x16, D, T, c.cgr, HD, 0.0f, err)) return false;
+        dump_sub(d, "qr_raw", l.il, p0, T, c.qr, (size_t) T * g.q_lora * 4);
+        dump_sub(d, "kvr_raw", l.il, p0, T, c.kvr, (size_t) T * HD * 4);
         Finish fq;
         fq.w = l.q_norm;
         fq.eps = g.eps;
@@ -6369,6 +6379,7 @@ struct Model::Impl {
             fr.vpp = NHL;
             fr.freqs = freqs;
             finish(c.q, na * NHL, HD, HD, fr, s);
+            if (a0 == 0 && na == T) dump_sub(d, "q", l.il, p0, T, c.q, (size_t) T * HQ * 4);
             AttnRows ar;
             ar.gen = 1;
             ar.p0 = p0;
@@ -6378,6 +6389,7 @@ struct Model::Impl {
             ar.kcap = g.ix_topk;
             sparse_attn(c.q, c.ext, ckv, c.topk + (size_t) a0 * topk_stride(), (int) topk_stride(), ar, l.sink, NHL, HD,
                         na, 1.0f / std::sqrt((float) HD), c.o, s, kKvFp4, 0, &d.attn_scr);   // (a short last slab)
+            if (a0 == 0 && na == T) dump_sub(d, "o", l.il, p0, T, c.o, (size_t) T * HQ * 4);
             Finish fo;
             fo.rd = g.rd;
             fo.pos = (int) (p0 + a0);
@@ -6386,6 +6398,7 @@ struct Model::Impl {
             fo.inverse = 1;
             fo.quant = 1;
             finish(c.o, na * NHL, HD, HD, fo, s);
+            if (a0 == 0 && na == T) dump_sub(d, "o_fin", l.il, p0, T, c.o, (size_t) T * HQ * 4);
             x3::rows_f16(c.o, HQ, nullptr, na, HQ, c.o16, s);
             const int per = HQ / OG;
             for (int gi = 0; gi < OG; ++gi)
@@ -6394,9 +6407,12 @@ struct Model::Impl {
                     return false;
             x3::rows_f16(c.oa, OG * g.o_lora, nullptr, na, OG * g.o_lora, c.oa16, s);
             if (!gemm(d, c, l.wo_b, c.oa16, OG * g.o_lora, na, c.acc + (size_t) a0 * D, D, 0.0f, err)) return false;
+            if (a0 == 0 && na == T) dump_sub(d, "ao", l.il, p0, T, c.acc, (size_t) T * D * 4);
         }
         if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
+        dump_sub(d, "h_in", l.il, p0, T, c.h, (size_t) T * H * D * 4);
         hc_post_inplace(c.acc, c.h, c.a_post, c.a_comb, D, H, T, s);
+        if (dump_l != nullptr && mi == 0) dump_layer(d, c.h, 1000 + l.il, p0, T);   // (after the attention, as the window path)
         prof_mark(d, 1);
         // the MoE
         if (!hc_mix_chunk(d, c, c.h, l.hcf_fn, T, c.mix, err)) return false;
@@ -7208,6 +7224,7 @@ struct Model::Impl {
                 return false;
             }
         const int nc = (n + chunk - 1) / chunk, per = (n + nc - 1) / nc;
+        if (std::getenv("DS4_DBG_CHUNK")) std::fprintf(stderr, "forward_chunks n %d nc %d per %d\n", n, nc, per);
         Run run;
         for (int a = 0; a < n; a += per) {
             run.p0.push_back(pos + a);
@@ -8317,6 +8334,7 @@ struct Model::Impl {
         hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         dump_sub(d, "h_out", l.il, p0, T, d.h, (size_t) T * H * D * 4);
+        if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, l.il, p0, T);   // (post-layer residual, as the chunk path writes it)
         CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
         // (h_part / h_x are written again only after the next layer's route has synchronized, which follows these)
         return true;
@@ -8421,6 +8439,7 @@ bool Model::step(int token, bool logits, std::string& err) { return p_->step(tok
 bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     Impl& p = *p_;
     p.pm.last = -1;
+    if (std::getenv("DS4_DBG_CHUNK")) std::fprintf(stderr, "feed n %d chunk %d chunk_min %d\n", n, p.chunk, p.chunk_min);
     if (p.chunk > 0 && n >= p.chunk_min) {   // a long run - or one the flow could take, if it is the faster path here
         const double t0 = now_ms();   // (every row's logits (tests): the chunked path, which keeps them all)
         const bool ok = logits_rows > kWin || p.pick_path(n) ? p.forward_chunks(tokens, n, logits_rows, err)

@@ -19,6 +19,7 @@
 #include <vector>
 
 namespace strata::dsv41::metal_host {
+mtl::Context& finish_cx();   // ds4_finish.cpp's Context: every kernel that orders with the chunk path's dispatches uses it
 int shared_lib();   // from ds4_finish.cpp: the library the shared Context compiled
 
 
@@ -145,7 +146,7 @@ bool embed(const uint16_t* rows, int T, float* h, int dim, int hc, void*) {
 
 // ds4_model.cu:2737 - C[t][m] = sum_k A[m][k] * B[t][k], F32 operands, alpha = 1, beta = 0
 bool sgemm_tn(const float* A, const float* B, float* C, int m, int nt, int k, int lda, int ldb, int ldc) {
-    strata::dsv41::metal_host::shared_cx();
+    finish_cx();
     const int lib = shared_lib();
     if (lib < 0) return false;
     void* ha = strata::gpu::host_view((void*) A);
@@ -154,7 +155,7 @@ bool sgemm_tn(const float* A, const float* B, float* C, int m, int nt, int k, in
     if (!ha || !hb || !hc) { std::fprintf(stderr, "dsv41 metal: sgemm_tn has no host view\n"); return false; }
     const size_t page = 16384;
     auto wrap = [&](void* host, size_t bytes) {
-        return strata::dsv41::metal_host::shared_cx().wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)), ((bytes + page - 1) / page) * page);
+        return finish_cx().wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)), ((bytes + page - 1) / page) * page);
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer ba = wrap(ha, (size_t) m * lda * 4);
@@ -162,7 +163,7 @@ bool sgemm_tn(const float* A, const float* B, float* C, int m, int nt, int k, in
     mtl::Buffer bc = wrap(hc, (size_t) nt * ldc * 4);
     if (!ba.handle || !bb.handle || !bc.handle) return false;
     mtl::Pipeline pl;
-    try { pl = strata::dsv41::metal_host::shared_cx().pipeline(g_lib_init, "ds4_sgemm_tn"); } catch (...) { return false; }
+    try { pl = finish_cx().pipeline(lib, "ds4_sgemm_tn"); } catch (...) { return false; }
     mtl::Dispatch d;
     d.p = &pl;
     d.args = {mtl::Arg::B(ba, off(ha)), mtl::Arg::B(bb, off(hb)), mtl::Arg::B(bc, off(hc)),
@@ -172,7 +173,12 @@ bool sgemm_tn(const float* A, const float* B, float* C, int m, int nt, int k, in
     d.grid[0] = (uint32_t) ((total + 127) / 128);
     d.grid[1] = d.grid[2] = 1;
     d.tg[0] = 128; d.tg[1] = d.tg[2] = 1;
-    strata::dsv41::metal_host::shared_cx().run({d});
+    finish_cx().run({d});
+    if (std::getenv("DS4_DBG_SG")) {
+        finish_cx().flush_runs();
+        const float* fa = (const float*) ha; const float* fb = (const float*) hb; const float* fc = (const float*) hc;
+        std::fprintf(stderr, "sgemm m %d nt %d k %d lda %d ldb %d ldc %d A %g %g B %g %g C %g %g %g\n", m, nt, k, lda, ldb, ldc, fa[0], fa[1], fb[0], fb[1], fc[0], fc[1], fc[2]);
+    }
     return true;
 }
 
