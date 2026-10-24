@@ -613,8 +613,8 @@ if(STRATA_ENABLE_XE)
       set(_strata_onemath_url URL ${STRATA_ONEMATH_SOURCE})
     else()
       set(_strata_onemath_url
-        URL https://github.com/MistVVK/oneMath/archive/refs/tags/xestrata-10.tar.gz
-        URL_HASH SHA256=efda4bf89d1624fc8c70c63508489ed8eef24ad62c962d80b3f52717abd0841b)
+        URL https://github.com/MistVVK/oneMath/archive/refs/tags/xestrata-12.tar.gz
+        URL_HASH SHA256=ce060040a8a710618856717f994ee00480e872877ac4bbaf815e9b55e8b849de)
     endif()
     # another archive is another tree: start from it again
     if(NOT "${_strata_onemath_url}" STREQUAL "${_STRATA_ONEMATH_KEY}")
@@ -638,26 +638,6 @@ if(STRATA_ENABLE_XE)
     if(_strata_cuda_base_opts AND TARGET onemath_blas_cublas)
       target_compile_options(onemath_blas_cublas_obj PRIVATE ${_strata_cuda_base_opts})
       target_link_options(onemath_blas_cublas PRIVATE ${_strata_cuda_base_opts})
-    endif()
-    # Windows: oneMKL's MKLConfig.cmake links its SYCL targets with -fsycl-allow-device-image-dependencies, and with it
-    # intel/llvm v7.2.0's driver puts /INCLUDE:__imp_<a symbol> of every library on the line into the link - of the MSVC
-    # runtime's, time_get<...>::_Getvals (which every SYCL object also defines: a duplicate), HUGE of oldnames.lib and a
-    # 32-bit _set_invalid_parameter_handler of msvcrt.lib (not resolved), and onemath_blas_mklgpu.dll's link stopped.
-    # The backend's device code calls no device function of another library, so the dependencies are not needed there.
-    if(WIN32)
-      foreach(mkl_t MKL::MKL_SYCL MKL::MKL_SYCL::BLAS MKL::MKL_DPCPP)
-        if(TARGET ${mkl_t})
-          get_target_property(_strata_mkl_real ${mkl_t} ALIASED_TARGET)
-          if(NOT _strata_mkl_real)
-            set(_strata_mkl_real ${mkl_t})
-          endif()
-          get_target_property(_strata_mkl_libs ${_strata_mkl_real} INTERFACE_LINK_LIBRARIES)
-          if(_strata_mkl_libs)
-            list(REMOVE_ITEM _strata_mkl_libs -fsycl-allow-device-image-dependencies)
-            set_target_properties(${_strata_mkl_real} PROPERTIES INTERFACE_LINK_LIBRARIES "${_strata_mkl_libs}")
-          endif()
-        endif()
-      endforeach()
     endif()
     unset(BUILD_SHARED_LIBS)
     if(_strata_libcuda_stubs)
