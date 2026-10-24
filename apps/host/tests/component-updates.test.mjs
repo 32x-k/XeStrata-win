@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { bundledPython, controlEnvironment, createControl, findControl, runCli, updatedControlDirectory } from '../server/control-runtime.mjs';
@@ -165,7 +165,7 @@ test('the shell bridge client exists only inside the desktop app, speaks to loop
 
 // ---------------------------------------------------------------------------------- the Settings buttons in the packaged app
 
-function fixture({ withApp = false, update } = {}) {
+function fixture({ withApp = false, update, appInstall } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'strata-update-ops-'));
   const install = join(root, 'install'), data = join(root, 'data');
   mkdirSync(install, { recursive: true });
@@ -192,10 +192,10 @@ function fixture({ withApp = false, update } = {}) {
   const spawned = [];
   const appUpdater = withApp ? {
     check: async () => ({ available: true, version: '0.2.0' }),
-    install: async ({ onProgress }) => { calls.push(['app-install']); onProgress({ downloaded: 50, total: 100 }); return { state: 'done' }; },
+    install: appInstall ?? (async ({ onProgress }) => { calls.push(['app-install']); onProgress({ downloaded: 50, total: 100 }); return { state: 'done' }; }),
   } : null;
   const native = createNativeControl({ control, appUpdater, directory: data, spawnProcess: (...args) => { if (!args[1]?.some(a => String(a).endsWith('strata_mcp.py'))) spawned.push(args); throw new Error('no process but the installer tool (Control strata_mcp.py, absent in this fixture) may be started by the host in packaged mode'); }, fetcher: async () => Response.json({}), requests: () => [] });
-  return { native, calls, spawned, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  return { native, calls, spawned, data, control, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 const finish = async (native, id) => { for (let i = 0; i < 400; i++) { const job = native.state().jobs.find(j => j.id === id); if (job.state !== 'running') return job; await new Promise(r => setTimeout(r, 10)); } throw new Error('job did not finish'); };
 
@@ -262,6 +262,33 @@ test('packaged: "Update Strata" updates Control through the feed, then the app t
     assert.deepEqual(f.calls[0], ['update', false, true]);
     assert.match(job.summary, /app update is installed\. Strata will restart/);
   } finally { await f.native.close(); f.cleanup(); }
+});
+
+test('packaged: an app update that ends the app is recorded as finished by the new version, not as an interrupted operation', async () => {
+  const before = process.env.STRATA_APP_VERSION;
+  process.env.STRATA_APP_VERSION = '0.2.2';
+  const f = fixture({ withApp: true, appInstall: () => new Promise(() => {}) });      // the installer ends the app: install() never returns
+  try {
+    await f.native.refresh(true);
+    const started = f.native.operation('update-strata', {});
+    await new Promise(r => setTimeout(r, 60));
+    assert.equal(f.native.state().jobs.find(j => j.id === started.id).state, 'running');
+    const saved = JSON.parse(readFileSync(join(f.data, 'native-jobs.json'), 'utf8')).find(j => j.id === started.id);
+    assert.equal(saved.appUpdateFrom, '0.2.2', 'the job was saved with the version it started from before the app was ended');
+    // the app is gone; the installer starts the new one (0.2.3) on the same data
+    process.env.STRATA_APP_VERSION = '0.2.3';
+    const again = createNativeControl({ control: f.control, directory: f.data, spawnProcess: () => { throw new Error('no process'); }, fetcher: async () => Response.json({}), requests: () => [] });
+    const job = again.state().jobs.find(j => j.id === started.id);
+    assert.equal(job.state, 'done');
+    assert.equal(job.error, null);
+    assert.match(job.summary, /updated to 0\.2\.3/);
+    await again.close();
+    // the same record read by an app that did NOT change version stays an interruption
+    process.env.STRATA_APP_VERSION = '0.2.2';
+    const same = createNativeControl({ control: f.control, directory: f.data, spawnProcess: () => { throw new Error('no process'); }, fetcher: async () => Response.json({}), requests: () => [] });
+    assert.equal(same.state().jobs.find(j => j.id === started.id).state, 'error');
+    await same.close();
+  } finally { if (before === undefined) delete process.env.STRATA_APP_VERSION; else process.env.STRATA_APP_VERSION = before; await f.native.close(); f.cleanup(); }
 });
 
 test('without the shell bridge "Update Strata" still updates Control and says nothing false about the app', async () => {

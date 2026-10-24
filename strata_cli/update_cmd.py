@@ -91,7 +91,14 @@ def _feed_source(a, root: Path) -> str:
     if os.environ.get(ENV_FEED):
         return os.environ[ENV_FEED]
     remembered = (updater.State(root).data.get("feed") or {}).get("source")
-    return remembered or DEFAULT_FEED
+    return remembered if _may_be_remembered(remembered) else DEFAULT_FEED
+
+
+def _may_be_remembered(source) -> bool:
+    """Only an https address is carried over to later runs. A loopback address or a folder is what a test of an update feed uses; once
+    one such run had been made on a PC, every later check (the app's Settings included) tried that dead address and said "No internet
+    connection". Those runs name their feed again each time (--feed or STRATA_UPDATE_FEED)."""
+    return isinstance(source, str) and source.lower().startswith("https://")
 
 
 def _mib(n: int | None) -> str:
