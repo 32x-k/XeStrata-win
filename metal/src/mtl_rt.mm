@@ -300,6 +300,7 @@ static void ds4_report_counts() {
 
 extern "C" unsigned long long ds4_dispatch_seq() { return g_disp_count.load(); }
 
+extern "C" void ds4_gpu_sync_all_streams_weak() __asm("_ds4_gpu_sync_all_streams") __attribute__((weak_import));
 void Context::flush_runs() {
     std::lock_guard<std::recursive_mutex> lk_(impl_->mu);
     if (!g_count_reg) { g_count_reg = true; std::atexit(ds4_report_counts); }
@@ -328,6 +329,11 @@ double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, 
             encode(impl_->enc_def, ds[0]);
             ++impl_->def_n;
             ++g_disp_count;
+            static const bool each = std::getenv("DS4_FLUSH_EACH") != nullptr;   // debugging: every dispatch alone, in order
+            if (each) {
+                if (ds4_gpu_sync_all_streams_weak) ds4_gpu_sync_all_streams_weak();
+                flush_runs();
+            }
             return 0.0;
         }
         flush_runs();

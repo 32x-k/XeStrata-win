@@ -1068,6 +1068,22 @@ struct Model::Impl {
     // DS4_DUMP_L: (threads) every layer's residual streams as records [layer, p0, T, T x hc x dim floats], window or
     // chunk path (tests: where the two part)
     std::FILE* dump_l = std::getenv("DS4_DUMP_L") ? std::fopen(std::getenv("DS4_DUMP_L"), "wb") : nullptr;
+    // DS4_DUMP_S: the sub-steps inside the layers named by DS4_DUMP_S_LAYERS (default 0,1,2,3), records
+    // [char name[16], int64 il, p0, T, nbytes][nbytes raw bytes] (window path, the same on CUDA and Metal)
+    std::FILE* dump_s = std::getenv("DS4_DUMP_S") ? std::fopen(std::getenv("DS4_DUMP_S"), "wb") : nullptr;
+    std::vector<int> dump_s_layers = [] {
+        std::vector<int> v;
+        const char* e = std::getenv("DS4_DUMP_S_LAYERS");
+        std::string str = e ? e : "0,1,2,3";
+        size_t a = 0;
+        while (a < str.size()) {
+            size_t b = str.find(',', a);
+            if (b == std::string::npos) b = str.size();
+            if (b > a) v.push_back(std::atoi(str.substr(a, b - a).c_str()));
+            a = b + 1;
+        }
+        return v;
+    }();
     // DS4_DUMP_R: the chunk path's routing, a record a layer [layer, p0, T, k, n_exp, n_vs, n_slots, kPicks] (int64),
     // then the picks' experts [T kPicks] (the first k of each token's), each expert's virtual slot [n_exp], the
     // slots' row bounds [n_vs + 1], the sorted rows' tokens [T k] (int32), the gate's logits [T n_exp] and its bias
@@ -1151,6 +1167,35 @@ struct Model::Impl {
         std::fwrite(hdr, 8, 3, dump_l);
         std::fwrite(v.data(), 4, v.size(), dump_l);
         std::fflush(dump_l);
+    }
+
+    bool dump_s_on(int il) const {
+        if (dump_s == nullptr) return false;
+        for (int x : dump_s_layers)
+            if (x == il) return true;
+        return false;
+    }
+    void dump_sub(Dev& d, const char* name, int il, int64_t p0, int T, const void* dev, size_t nbytes) {
+        if (!dump_s_on(il)) return;
+        std::vector<uint8_t> v(nbytes);
+        cudaSetDevice(d.id);
+#if defined(STRATA_METAL)
+        ds4_metal_flush();
+#endif
+        cudaMemcpyAsync(v.data(), dev, nbytes, cudaMemcpyDeviceToHost, d.st);
+        cudaStreamSynchronize(d.st);
+        dump_sub_host(name, il, p0, T, v.data(), nbytes);
+    }
+    void dump_sub_host(const char* name, int il, int64_t p0, int T, const void* host, size_t nbytes) {
+        if (!dump_s_on(il)) return;
+        std::lock_guard<std::mutex> lk(dump_mu);
+        char nm[16] = {};
+        std::strncpy(nm, name, 15);
+        const int64_t hdr[4] = {il, p0, T, (int64_t) nbytes};
+        std::fwrite(nm, 1, 16, dump_s);
+        std::fwrite(hdr, 8, 4, dump_s);
+        std::fwrite(host, 1, nbytes, dump_s);
+        std::fflush(dump_s);
     }
 
     ~Impl() {
@@ -7754,10 +7799,17 @@ struct Model::Impl {
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
             if (std::getenv("DS4_DBG_EG")) dbg_nf("h_after_gate", l.il, d.h, (size_t) T * H * D);
         }
+        dump_sub(d, "h_in", l.il, p0, T, d.h, (size_t) T * H * D * 4);
         // attention
         hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
         hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, s);
+        dump_sub(d, "a_mix", l.il, p0, T, d.mix, (size_t) T * 32 * 4);
+        dump_sub(d, "a_pre", l.il, p0, T, d.a_pre, (size_t) T * 8 * 4);
+        dump_sub(d, "a_post", l.il, p0, T, d.a_post, (size_t) T * 8 * 4);
+        dump_sub(d, "a_comb", l.il, p0, T, d.a_comb, (size_t) T * 64 * 4);
         hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
+        dump_sub(d, "pre_in", l.il, p0, T, d.pre, (size_t) T * 8 * 4);
+        dump_sub(d, "attn_x", l.il, p0, T, d.x, (size_t) T * D * 4);
         {
             x3::MvJob j[4];
             int nj = 0;
@@ -7767,10 +7819,13 @@ struct Model::Impl {
             if (l.kv_src && l.ratio > 1) j[nj++] = job(l.c_wgate, d.x, d.cgr, T, D, HD);
             if (!mv_n(d, j, nj, err)) return false;
         }
+        dump_sub(d, "qr_raw", l.il, p0, T, d.qr, (size_t) T * g.q_lora * 4);
+        dump_sub(d, "kvr_raw", l.il, p0, T, d.kvr, (size_t) T * HD * 4);
         Finish fq;
         fq.w = l.q_norm;
         fq.eps = g.eps;
         finish(d.qr, T, g.q_lora, g.q_lora, fq, s);
+        dump_sub(d, "qr", l.il, p0, T, d.qr, (size_t) T * g.q_lora * 4);
         if (NHL > 0) {
             if (!mv(d, {job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ)}, err)) return false;
             Finish fr;
@@ -7780,6 +7835,7 @@ struct Model::Impl {
             fr.freqs = freqs;
             finish(d.q, T * NHL, HD, HD, fr, s);
         }
+        if (NHL > 0) dump_sub(d, "q", l.il, p0, T, d.q, (size_t) T * HQ * 4);
         // the window rows: the ring's (positions p0 - win ..) then this window's, each query its own 128.  A DSpark
         // block's ring holds the trunk's main KV (positions <= p0 - 1, seeded); its block of drafts attends to all of
         // that ring and to the whole block, and leaves the ring as it was
@@ -7795,6 +7851,7 @@ struct Model::Impl {
         fk.dst_stride = HD;
         finish(d.kvr, T, HD, HD, fk, s);
         if (!l.mtp) ext_to_ring(d.ext, l.win, p0, g.win, T, HD, s, spec_win ? l.ring_bak : nullptr);
+        dump_sub(d, "kv_win", l.il, p0, T, d.ext + (size_t) g.win * HD, (size_t) T * HD * 4);
         AttnRows ar;
         for (int t = 0; t < T; ++t) {
             if (l.mtp) {
@@ -7948,6 +8005,7 @@ struct Model::Impl {
         if (NHL > 0) {
             sparse_attn(d.q, d.ext, ckv, d.topk, (int) topk_stride(), ar, l.sink, NHL, HD, T,
                         1.0f / std::sqrt((float) HD), d.o, s, ckv_fmt, 0, &d.attn_scr);
+            dump_sub(d, "o", l.il, p0, T, d.o, (size_t) T * HQ * 4);
             Finish fo;
             fo.rd = g.rd;
             fo.pos = (int) p0;
@@ -7956,6 +8014,7 @@ struct Model::Impl {
             fo.inverse = 1;
             fo.quant = 1;
             finish(d.o, T * NHL, HD, HD, fo, s);
+            dump_sub(d, "o_fin", l.il, p0, T, d.o, (size_t) T * HQ * 4);
             x3::MvJob j[16];
             const int per = HQ / OG;
             for (int gi = 0; gi < OG; ++gi)
@@ -7963,15 +8022,21 @@ struct Model::Impl {
             if (!mv_n(d, j, OG, err)) return false;
             if (!mv(d, {job(l.wo_b, d.oa, d.ao, T, (size_t) OG * g.o_lora, D)}, err)) return false;
         } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
+        dump_sub(d, "ao", l.il, p0, T, d.ao, (size_t) T * D * 4);
         if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
+        dump_sub(d, "h_attn", l.il, p0, T, d.h, (size_t) T * H * D * 4);
         prof_mark(d, 1);
         // the MoE
         hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
         hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, s);
         hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
+        dump_sub(d, "f_pre", l.il, p0, T, d.f_pre, (size_t) T * 8 * 4);
+        dump_sub(d, "f_post", l.il, p0, T, d.f_post, (size_t) T * 8 * 4);
+        dump_sub(d, "f_comb", l.il, p0, T, d.f_comb, (size_t) T * 64 * 4);
+        dump_sub(d, "ffn_x", l.il, p0, T, d.x, (size_t) T * D * 4);
         if (wp.async) {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
@@ -8084,11 +8149,18 @@ struct Model::Impl {
         CK(cudaEventRecord(d.ev, s));
         // the shared expert while the host looks at the picks
         if (!mv(d, {job(l.s1, d.x, d.sg, T, D, g.ff), job(l.s3, d.x, d.su, T, D, g.ff)}, err)) return false;
+        if (std::getenv("DS4_DBG_MOE")) { dbg_nf("x", l.il, d.x, (size_t) T * D); dbg_nf("sg", l.il, d.sg, (size_t) T * g.ff); dbg_nf("su", l.il, d.su, (size_t) T * g.ff);
+            std::fprintf(stderr, "DBG s1 fmt=%d K=%d k=%d n=%d ld=%d raw=%p\n", l.s1.fmt, l.s1.K, l.s1.k, l.s1.n, l.s1.ld, (void*) l.s1.raw); }
         swiglu(d.sg, d.su, T * g.ff, g.lim, d.sh, s);
+        if (std::getenv("DS4_DBG_MOE")) dbg_nf("sh", l.il, d.sh, (size_t) T * g.ff);
         if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, g.ff, D)}, err)) return false;
         const double tw = now_ms();
         CK(cudaEventSynchronize(d.ev));
         st.gpu_wait_ms += now_ms() - tw;
+        dump_sub(d, "glog", l.il, p0, T, d.glog, (size_t) T * 1024 * 4);
+        dump_sub_host("ridx", l.il, p0, T, h_idx, (size_t) T * kPicks * 4);
+        dump_sub_host("rw", l.il, p0, T, h_w, (size_t) T * kPicks * 4);
+        dump_sub(d, "sh_out", l.il, p0, T, d.sh_out, (size_t) T * D * 4);
         // the picks by expert: the VRAM ones' rows (gathered inputs, one GEMV per matrix for all their tokens), the
         // CPU lane's entries
         Combine cm;
@@ -8177,11 +8249,21 @@ struct Model::Impl {
                 for (int e = 0; e < D; ++e) o[e] += wv * y[e];
             }
             st.cpu_ms += now_ms() - tc;
+            dump_sub_host("cpu_part", l.il, p0, T, h_part, (size_t) T * D * 4);
             CK(cudaMemcpyAsync(d.cpu_part, h_part, (size_t) T * D * 4, cudaMemcpyHostToDevice, s));
         }
         combine(d.ed, ents.empty() ? nullptr : d.cpu_part, d.sh_out, cm, T, D, d.moe_out, s);
+        dump_sub(d, "moe_out", l.il, p0, T, d.moe_out, (size_t) T * D * 4);
+        if (std::getenv("DS4_DBG_MOE")) {
+            float hp = 0.0f;
+            for (size_t i = 0; i < (size_t) T * D; ++i) hp = std::max(hp, std::fabs(h_part[i]));
+            std::fprintf(stderr, "DBG moe il=%d T=%d vram_rows=%d cpu_slots=%d max|h_part|=%.4g", l.il, T, nrows, nslots, (double) hp);
+            dbg_nf("moe_out", l.il, d.moe_out, (size_t) T * D);
+            dbg_nf("sh_out", l.il, d.sh_out, (size_t) T * D);
+        }
         hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
+        dump_sub(d, "h_out", l.il, p0, T, d.h, (size_t) T * H * D * 4);
         CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
         // (h_part / h_x are written again only after the next layer's route has synchronized, which follows these)
         return true;
