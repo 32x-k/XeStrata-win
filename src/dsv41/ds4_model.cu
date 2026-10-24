@@ -2046,8 +2046,13 @@ struct Model::Impl {
             if (!l.mtp) {   // experts a word takes: --experts N / the faster-mode rule (ds4_experts_rule.hpp), DS4_TOPK=N over both (a test)
                 if (il == 0) {
                     uint64_t vram_all = 0;
-                    for (const Dev& dv : devs) vram_all += (uint64_t) dv.total;
-                    const int n = experts_test_override(experts_per_word(o.experts, vram_all, l.k_exp), l.k_exp);
+                    bool integrated = false;   // (a GPU that shares the PC's RAM: Strix Halo)
+                    for (const Dev& dv : devs) {
+                        vram_all += (uint64_t) dv.total;
+                        cudaDeviceProp ip{};
+                        if (cudaGetDeviceProperties(&ip, dv.id) == cudaSuccess && ip.integrated) integrated = true;
+                    }
+                    const int n = experts_test_override(experts_per_word(o.experts, vram_all, l.k_exp, integrated), l.k_exp);
                     experts_used = n;
                     if (n < l.k_exp)
                         std::fprintf(stderr, "ds4: experts per word: %d (%s; full quality: --experts %d)\n", n,
