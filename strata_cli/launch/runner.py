@@ -1860,6 +1860,9 @@ class Runner:
         if found is None:
             return
         old = str(cfg.get("exe") or "")
+        choice = getattr(self, "dsv41_choice", None)
+        if choice and choice[0] == str(found):
+            self.emit("engine", f"DeepSeek engine: {found} ({choice[1]}).", None)
         if os.path.normcase(os.path.normpath(old)) != os.path.normcase(os.path.normpath(str(found))):
             cfg["exe"] = str(found)
             if old:
@@ -1874,7 +1877,26 @@ class Runner:
         own = (os.environ.get("STRATA_DSV41_EXE") or "").strip()
         if own:
             return (Path(own) if Path(own).is_file() else None), True
-        folders: list[Path] = [Path(self.catalog.root) / dsv41_engine.DIR]       # this install's own package first
+        # The install this Terminal RUNS from (STRATA_INSTALL_DIR, else the folder its strata_cli comes from) and the install the model's settings live in
+        # (catalog.root: the first remembered install, which after an update or on a computer with several installs can be an older one) can both hold a
+        # DeepSeek engine package: the NEWEST version wins, the running Terminal's own on a tie, and the answer is logged.
+        roots: list[Path] = []
+        for r in (os.environ.get("STRATA_INSTALL_DIR"), self.catalog.src, self.catalog.root):
+            if r and not any(os.path.normcase(os.path.normpath(str(r))) == os.path.normcase(os.path.normpath(str(x))) for x in roots):
+                roots.append(Path(r))
+        picks = []
+        for i, r in enumerate(roots):
+            exe = dsv41_engine.find(r / dsv41_engine.DIR)
+            if exe is not None:
+                picks.append((dsv41_engine.version_key(exe.parent.name), -i, exe, r))
+        if picks:
+            best = max(picks, key=lambda t: (t[0], t[1]))
+            why = ("this Terminal's own folder" if best[3] == roots[0] or best[3] == Path(self.catalog.src) else "the install the model's settings came from")
+            if len(picks) > 1:
+                why += f", the newest of {len(picks)} packages"
+            self.dsv41_choice = (str(best[2]), why)
+            return best[2], True
+        folders: list[Path] = [Path(self.catalog.root) / dsv41_engine.DIR]       # (nothing there: the older places, as before)
         try:
             from strata_control import engine_component as ec
             rep = ec.status()

@@ -176,3 +176,72 @@ class MissingEngine(unittest.TestCase):
             self.assertFalse(self.check({"arch": "deepseek41", "exe": str(exe)}, None))
             self.assertFalse(self.check({"arch": "deepseek41", "exe": "C:/gone/x.exe"}, exe))
         self.assertFalse(self.check({"arch": "qwen4exp", "exe": "component:strata-engine"}, None))
+
+
+class WhichInstallsEngine(unittest.TestCase):
+    """The DeepSeek engine package that runs: the newest of the running Terminal's own install and the install the model's settings came from."""
+
+    def runner(self, own, root):
+        f = mock.MagicMock()
+        f.catalog.src = Path(own)
+        f.catalog.root = Path(root)
+        f.catalog.strata.setup_module.side_effect = RuntimeError("none")
+        f.catalog.data_dir.return_value = Path(root) / "data"
+        f.s.data_dir = None
+        return f
+
+    def make(self, base, version):
+        d = Path(base) / "engine-dsv41" / f"{version}-windows-x86_64-cuda-cuda13"
+        d.mkdir(parents=True)
+        exe = d / ("strata-dsv41.exe" if sys.platform == "win32" else "strata-dsv41")
+        exe.write_bytes(b"x")
+        return exe
+
+    def found(self, own, root):
+        from strata_cli.launch import runner as R
+        f = self.runner(own, root)
+        with mock.patch.dict("os.environ", {"STRATA_DSV41_EXE": "", "STRATA_INSTALL_DIR": ""}), \
+                mock.patch("strata_control.engine_component.status", return_value={"usable": False}):
+            out = R.Runner.dsv41_engine_found(f)
+        return out[0], getattr(f, "dsv41_choice", None)
+
+    def test_the_running_terminals_newer_package_beats_an_older_first_install(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            old = self.make(Path(d) / "inst5", "0.1.48")
+            new = self.make(Path(d) / "inst8", "0.1.49")
+            exe, choice = self.found(Path(d) / "inst8", Path(d) / "inst5")
+            self.assertEqual(exe, new)
+            self.assertIn("own folder", choice[1])
+            self.assertIn("newest of 2", choice[1])
+
+    def test_an_older_package_in_the_running_terminal_does_not_beat_a_newer_one_in_the_settings_install(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            self.make(Path(d) / "inst8", "0.1.48")
+            new = self.make(Path(d) / "inst5", "0.1.49")
+            exe, _ = self.found(Path(d) / "inst8", Path(d) / "inst5")
+            self.assertEqual(exe, new)
+
+    def test_the_same_version_in_both_means_the_running_terminals_own(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            self.make(Path(d) / "inst5", "0.1.49")
+            own = self.make(Path(d) / "inst8", "0.1.49")
+            exe, choice = self.found(Path(d) / "inst8", Path(d) / "inst5")
+            self.assertEqual(exe, own)
+            self.assertIn("own folder", choice[1])
+
+    def test_only_the_settings_install_has_one(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            only = self.make(Path(d) / "inst5", "0.1.49")
+            (Path(d) / "inst8").mkdir()
+            exe, choice = self.found(Path(d) / "inst8", Path(d) / "inst5")
+            self.assertEqual(exe, only)
+            self.assertIn("settings came from", choice[1])
+
+    def test_versions_compare_as_numbers(self):
+        from strata_control import dsv41_engine
+        self.assertGreater(dsv41_engine.version_key("0.1.49-x"), dsv41_engine.version_key("0.1.9-x"))
+        self.assertGreater(dsv41_engine.version_key("0.1.49.1-x"), dsv41_engine.version_key("0.1.49-x"))
