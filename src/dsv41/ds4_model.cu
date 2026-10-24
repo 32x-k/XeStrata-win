@@ -7674,15 +7674,16 @@ struct Model::Impl {
             cudaMemcpy(hv.data(), d.h, hv.size() * 4, cudaMemcpyDeviceToHost);
             int nf = 0, nzv = 0;
             float mx = 0.0f;
+            size_t firstnan = 0, lastnan = 0;
             for (size_t i = 0; i < hv.size(); ++i) {
                 const float v = hv[i];
-                if (!(v == v)) { ++nf; continue; }
+                if (!(v == v)) { if (nf == 0) firstnan = i; lastnan = i; ++nf; continue; }
                 if (v != 0.0f) ++nzv;
                 if (std::fabs(v) > mx) mx = std::fabs(v);
             }
-            std::fprintf(stderr, "DBG h: il=%d p0=%lld T=%d p0tok=%d zeros=%zu ninf=%d max=%.4g first=%.5g %.5g\n",
-                         l.il, (long long) p0, T, toks.empty() ? -1 : toks[(size_t) p0],
-                         hv.size() - (size_t) nzv - (size_t) nf, nf, mx, hv[0], hv.size() > 1 ? hv[1] : 0.0f);
+            std::fprintf(stderr, "DBG h: il=%d dev=%d h=%p p0=%lld T=%d p0tok=%d zeros=%zu ninf=%d max=%.4g first=%.5g %.5g nan_range=%zu..%zu\n",
+                         l.il, (int) l.dev, (void*) d.h, (long long) p0, T, toks.empty() ? -1 : toks[(size_t) p0],
+                         hv.size() - (size_t) nzv - (size_t) nf, nf, mx, hv[0], hv.size() > 1 ? hv[1] : 0.0f, firstnan, lastnan);
         }
         prof_mark(d, 0);
         // Engram
