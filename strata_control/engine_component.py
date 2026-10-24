@@ -627,7 +627,15 @@ def windows_display_adapters() -> list[dict]:
     """The display adapters Windows has a driver for: the display-class registry key (readable without admin and without running
     anything), then Win32_VideoController when the key lists nothing: {"vendor": "10de"|"1002"|"8086"|..., "device": int, "name",
     "vram_gb"}. Empty off Windows or when neither can be read."""
-    return _windows_display_adapters_registry() or _windows_adapters_cim()
+    found = _windows_display_adapters_registry()
+    if len({a.get("vendor") for a in found} & {"10de", "1002"}) > 1:
+        # The registry keeps the driver entry of a card that was taken out (an NVIDIA card swapped for a Radeon, #3892): when two makes are
+        # listed, only the adapters Windows reports as present now count.
+        present = {(a["vendor"], a["device"]) for a in _windows_adapters_cim()}
+        now = [a for a in found if (a["vendor"], a["device"]) in present]
+        if now:
+            return now
+    return found or _windows_adapters_cim()
 
 
 def _windows_display_adapters_registry() -> list[dict]:

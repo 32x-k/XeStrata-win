@@ -294,6 +294,33 @@ def _candidate_by_header(shards: list[Path], tensors: int, payload: int, experts
     return None
 
 
+def _candidate_by_layout(shards: list[Path], tensors: int, payload: int, experts: set[str]) -> dict | None:
+    """A qwen4exp file set that is no build Strata has tested (a fine-tune, a K-quant mix from another maker) but has the layout of one
+    (#3651 #3777): the closest row by expert formats, then by size. Strata uses the files as that model and says so; it never refuses a
+    working file for not being on the list (recommend, never force)."""
+    try:
+        catalog = json.loads((ROOT / "data" / "gguf_fingerprints.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    best = None
+    for selection in sorted(SUPPORTED_SELECTIONS):
+        row = catalog.get(selection) if isinstance(catalog, dict) else None
+        if not isinstance(row, dict) or row.get("tensors") != tensors or not isinstance(row.get("expert_bytes"), dict):
+            continue
+        have = set(row["expert_bytes"])
+        union = have | experts
+        score = (len(have & experts) / len(union)) if union else 0.0
+        key = (-score, abs(int(row.get("bytes") or 0) - payload), selection)
+        if score > 0 and (best is None or key < best[0]):
+            best = (key, selection, have)
+    if best is None:
+        return None
+    family, model = best[1].split("/", 1)
+    return {"family": family, "model": model, "basis": "same_layout_other_build",
+            "expected_expert_types": sorted(best[2] | experts), "expected_tensor_count": tensors,
+            "setup_args_hint": ["--family", family, "--model", model, "--gguf-dir", str(shards[0].parent)]}
+
+
 def _already_set_up(shards: list[Path], candidate: dict | None) -> dict | None:
     """Is this model already installed (a run config of any known install names the file) and what was prepared beside it (pack, draft
     layer, picture reader)? Read-only; None when the file set is not one Strata knows."""
@@ -709,6 +736,11 @@ def plan_import(raw_path: str) -> dict:
     candidate = _candidate_selection(shards)
     if candidate is None and metadata is not None and not issues:
         candidate = _candidate_by_header(shards, observed_tensor_count, observed_payload, observed_experts)
+        if candidate is None:
+            candidate = _candidate_by_layout(shards, observed_tensor_count, observed_payload, observed_experts)
+            if candidate is not None:
+                messages.append(f"These files are not exactly a build Strata has tested; they have the layout of {candidate['family']} "
+                                f"{candidate['model']}, so Strata uses them as that model. Check a few answers before you rely on them.")
     if "multiple_model_groups" in issues:
         candidate = None                                  # nothing is chosen for the person
     if candidate is None and not {"multiple_model_groups", "incomplete_or_invalid_shard_set"} & set(issues):

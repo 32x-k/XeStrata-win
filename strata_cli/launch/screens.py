@@ -387,7 +387,7 @@ class ModelScreen(Base):
         w = self.width()
         if w >= 100:
             return [("Model", 42), ("Download", 10), ("Needs (RAM + VRAM)", 20), ("On this computer", 0)]
-        return [("Model", 41), ("Download", 9), ("Needs (RAM+VRAM)", 17), ("On this computer", 0)]
+        return [("Model", 41), ("Size", 8), ("Needs", 7), ("Fits?", 0)]      # 80 columns: the verdict column keeps room (the long words are below the list)
 
     def build_menu(self, initial: bool = False) -> None:
         s = self.ctx.settings
@@ -402,7 +402,11 @@ class ModelScreen(Base):
             tag = (" (recommended)" if r.recommended else "") + (" (installed)" if r.installed else "") + (" [experimental]" if r.experimental else "")
             need = f"{r.memory_gb:.0f} GB" if r.memory_gb else "-"
             ssd = f" · SSD {r.spill_gb:.0f} GB" if r.spill_gb >= 1 else ""
-            items.append(Item([r.title, f"{r.download_gb:.0f} GB", need, Cell((r.words.split(",")[0].split(":")[0] if ssd and "SSD" in r.words else r.words) + ssd + tag, col)], key=(r.family, r.model)))
+            verdict = (r.words.split(",")[0].split(":")[0] if ssd and "SSD" in r.words else r.words) + ssd + tag
+            if self.width() < 100:                           # a short verdict that fits the column; the full sentence is shown under the list
+                extra = " (recommended)" if r.recommended else " (installed)" if r.installed else " [experimental]" if r.experimental else ""
+                verdict = {"fits": "fits", "tight": "tight", "no": "too big"}[r.verdict] + extra
+            items.append(Item([r.title, f"{r.download_gb:.0f} GB", need, Cell(verdict, col)], key=(r.family, r.model)))
             if (s.family, s.model) == (r.family, r.model):
                 sel = i
         m = self.query_one(Menu)
@@ -1328,7 +1332,8 @@ class AccessScreen(Base):
     step_id = "access"
     hints = "↑↓ choose   Enter next   p port   k new key   t key on/off   Esc back   ? help"
     help_text = ("Who can use the model. 'This computer only' is the safe default and never needs a key. Beyond it Strata makes an API key "
-                 "for you (recommended); press t if you would rather have no key: it still starts, but anyone who can reach it can use it.")
+                 "for you (recommended); press t if you would rather have no key: it still starts, but anyone who can reach it can use it. "
+                 "To see the key later: strata launch --show-key. To use a key of your own: strata launch --api-key YOUR-KEY (or --api-key-env NAME).")
 
     BINDINGS = Base.BINDINGS + [Binding("p", "port", show=False), Binding("k", "newkey", show=False), Binding("t", "keytoggle", show=False)]
 

@@ -77,6 +77,30 @@ def python_failure(lines: list[str]) -> str | None:
     return None
 
 
+DEEPSEEK_ENGINE_LINE = re.compile(r"(A newer DeepSeek engine (?:is available|may be available)[^\r\n]*|DeepSeek engine updated from [^\r\n]*)")
+
+
+def deepseek_engine_note(line: str) -> tuple[str, str] | None:
+    """setup's line about the DeepSeek engine upgrade ("A newer DeepSeek engine is available but could not be installed: ...; still using X",
+    or "DeepSeek engine updated from X to Y"): ("warn" | "info", the sentence), None for any other line. The failure line must reach the
+    person: the model starts with the engine they have, and they should know there is a newer one."""
+    found = DEEPSEEK_ENGINE_LINE.search(line)
+    if not found:
+        return None
+    text = found.group(1).strip()
+    return ("info" if text.startswith("DeepSeek engine updated") else "warn", text)
+
+
+def argparse_failure(lines: list[str]) -> str:
+    """setup.py's own refusal of an option ("setup.py: error: argument --kv: invalid choice: ..."), which is neither an [X] line nor a
+    traceback (#3785): the words after "error:" are the cause."""
+    for line in reversed(lines):
+        found = re.match(r"\s*(?:setup|strata)(?:\.py)?: error: (.+)", line)
+        if found:
+            return found.group(1).strip()[:300]
+    return ""
+
+
 def missing_file(failure: str) -> bool:
     """An import or file error: the install itself is short of a file, which an update of Strata brings back."""
     return failure.startswith(("ModuleNotFoundError", "ImportError", "FileNotFoundError"))
@@ -99,6 +123,7 @@ def setup_failure(lines: list[str], err: str, hint: str, details: str | None, ow
     """The error for a setup.py run that exited non-zero. setup.py's own `[X]` line (err) is the message when there is one; when it
     stopped with a Python error instead, that error's last line is (#3613, #3467: a file missing from the Terminal's tools/ ended every
     launch after a tune with only "The model could not be installed"). `details` is the file that holds the rest of its output."""
+    err = err or argparse_failure(lines)
     crashed = python_failure(lines) if not err else None
     if crashed:
         where = f" The whole setup output is in {details}." if details else ""
@@ -215,6 +240,11 @@ def tune_words(result: dict | None, code: int | None = None) -> tuple[str, str]:
 
 
 # ----------------------------------------------------------------------------------------------- run config
+
+def runtime_max_wait() -> int:
+    from strata_control import runtime
+    return int(runtime.MAX_START_WAIT)
+
 
 def read_config(path: Path) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
@@ -482,6 +512,7 @@ class Runner:
         self.hardware_override = hardware
         self.children: list[subprocess.Popen] = []
         self.notices: list[str] = []
+        self._engine_notes: set[str] = set()
         self.identity_notes: list[str] = []
         self.tune_result: dict | None = None
         self.config_path: Path | None = None
@@ -872,6 +903,17 @@ class Runner:
         except Exception:                                    # noqa: BLE001
             return 0.0
 
+    def start_wait(self) -> int:
+        """How long the start waits for the model to be ready (#3949 #3459): 10 minutes, more for a big model, which a slow disk needs
+        longer to read (about 8 more seconds per GB above 40 GB, at most 30 minutes). Automatic: nobody sets a variable for it."""
+        gb = 0.0
+        try:
+            row = next((r for r in self.catalog.rows() if r.family == self.s.family and r.model == self.s.model), None)
+            gb = float(getattr(row, "download_gb", 0) or 0)
+        except Exception:                                    # noqa: BLE001
+            gb = 0.0
+        return int(min(runtime_max_wait(), max(600, 600 + (gb - 40.0) * 8.0)))
+
     def download_question(self) -> tuple[str, str]:
         """(title, text) of the question before a download starts, naming exactly what is fetched."""
         return self.model_state().question()
@@ -976,6 +1018,12 @@ class Runner:
                 continue
             lines.append(line)
             lines[:] = lines[-1500:]
+            note = deepseek_engine_note(line)
+            if note and note[1] not in self._engine_notes:   # setup's DeepSeek engine lines are shown, not condensed away (0.2.5 list)
+                self._engine_notes.add(note[1])
+                if note[0] == "warn":
+                    self.notices.append(note[1])
+                self.emit("model", note[1], None, level=note[0], step=step_seen)
             prog = cat.mcp.install_progress(lines)
             prog = cat.mcp.combined_progress(prog, job)
             dl, phase, label = prog.get("download"), prog.get("phase"), prog.get("label")
@@ -1238,6 +1286,9 @@ class Runner:
         cfg = derive_config(base, self.s, bool_flags=tune_knobs.BOOL_FLAGS,
                             log=str(launch_dir() / f"{self.name}.engine.log"), gpus=cards_for_launch(self.s, self.catalog, base=base))
         self.use_own_dsv41_engine(cfg)
+        wait = self.start_wait()
+        if wait > 600 and not cfg.get("engine_ready_s"):     # the server's own wait for the engine (900 s) must not end before the start's
+            cfg["engine_ready_s"] = wait + 60
         out = launch_dir() / f"{self.name}.json"
         write_private(out, cfg)
         self.config_path = out
@@ -1334,12 +1385,12 @@ class Runner:
             if s.tuned_preset:
                 try:
                     presets.find(s.tuned_preset)
-                    self.emit("tune", "This preset is already tuned for this computer.", 100)
+                    self.emit("tune", "This preset is already tuned for this computer. Add --retune to measure again.", 100)
                     return
                 except presets.PresetError:
                     pass
             elif s.tuned_at:                                 # measured before: the standard settings were already the fastest, nothing was saved
-                self.emit("tune", f"Already tuned on {s.tuned_at}: this computer runs best with the standard settings. Nothing to do.", 100)
+                self.emit("tune", f"Already tuned on {s.tuned_at}: this computer runs best with the standard settings. Nothing to do; add --retune to measure again.", 100)
                 return
             stored = self.stored_tuning()
             if stored:                                       # the same model and choices were tuned on this computer before (a run by flags, no preset)
@@ -1577,7 +1628,7 @@ class Runner:
 
         def go() -> None:
             try:
-                box["r"] = runtime.start(name, wait=600)
+                box["r"] = runtime.start(name, wait=self.start_wait())
             except Exception as e:                           # noqa: BLE001
                 box["e"] = e
             finally:
