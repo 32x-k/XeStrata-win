@@ -245,3 +245,60 @@ class WhichInstallsEngine(unittest.TestCase):
         from strata_control import dsv41_engine
         self.assertGreater(dsv41_engine.version_key("0.1.49-x"), dsv41_engine.version_key("0.1.9-x"))
         self.assertGreater(dsv41_engine.version_key("0.1.49.1-x"), dsv41_engine.version_key("0.1.49-x"))
+
+
+class DiskCountsOnlyTheRest(unittest.TestCase):
+    """The menu's disk check asks only for what is still to be downloaded: files already in the models folder count as done (P2003)."""
+
+    def setUp(self):
+        import strata_mcp as M
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.s = M.Strata(ROOT)
+        self.s.data_dir = lambda: Path(self.tmp.name)
+        self.hw = {"ram_gb": 64.0, "gpus": [CARD], "engine_vendor": "nvidia", "disk_free_gb": 176.0}
+
+    def put_files(self, model="IST-DAS-2.00bpw", legacy=False):
+        S = self.s.setup_module()
+        fam = S.MULTI_FILE_FAMILIES["deepseek41"]
+        md = fam["models"][model]
+        models = Path(self.tmp.name) / "models"
+        sizes = {}
+        for where, names in ((models / (fam["tag"] + model), md["shards"]), (models / (fam["tag"] + "shared"), md["shared"])):
+            where.mkdir(parents=True, exist_ok=True)
+            for n in names:
+                name = S.DSV41_LEGACY_NAMES.get(n, n) if legacy and n in S.DSV41_LEGACY_NAMES else n
+                real = S.DSV41_ALL_FILES[name][0]
+                (where / name).write_bytes(b"x" * 8)
+                sizes[name] = (8, S.DSV41_ALL_FILES[name][1])
+        return sizes
+
+    def test_with_every_file_in_place_a_small_disk_is_not_tight(self):
+        S = self.s.setup_module()
+        with mock.patch.dict(S.DSV41_ALL_FILES, self.put_files()):
+            words = self.s.dsv41_words(self.hw, "IST-DAS-2.00bpw")
+        self.assertNotIn("free disk space", words)
+
+    def test_the_first_releases_names_count_too(self):
+        S = self.s.setup_module()
+        with mock.patch.dict(S.DSV41_ALL_FILES, self.put_files(legacy=True)):
+            self.assertNotIn("free disk space", self.s.dsv41_words(self.hw, "IST-DAS-2.00bpw"))
+
+    def test_with_nothing_in_place_176_gb_is_tight_for_the_257_gb_set(self):
+        words = self.s.dsv41_words(self.hw, "IST-DAS-2.00bpw")
+        self.assertIn("free disk space", words)
+        self.assertTrue(words.startswith("tight"))
+
+    def test_only_part_of_the_files_means_only_the_rest_is_counted(self):
+        S = self.s.setup_module()
+        sizes = self.put_files()
+        first = S.MULTI_FILE_FAMILIES["deepseek41"]["models"]["IST-DAS-2.00bpw"]["shards"][0]
+        part = dict(sizes)
+        part[first] = (S.DSV41_ALL_FILES[first][0], sizes[first][1])          # shard 1 is not here at its real size: the rest of the files are
+        (Path(self.tmp.name) / "models" / ("deepseek-v4.1-flash-IST-DAS-2.00bpw") / first).unlink()
+        with mock.patch.dict(S.DSV41_ALL_FILES, part):
+            hw = {**self.hw, "disk_free_gb": 46.0}                               # shard 1 is 39.1 GB: 46 GB is enough for it plus the 6 GB of room
+            self.assertNotIn("free disk space", self.s.dsv41_words(hw, "IST-DAS-2.00bpw"))
+            hw = {**self.hw, "disk_free_gb": 44.0}
+            self.assertIn("free disk space", self.s.dsv41_words(hw, "IST-DAS-2.00bpw"))
