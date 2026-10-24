@@ -970,6 +970,12 @@ class FlagsCommand(unittest.TestCase):
         self.assertEqual(code, 0)                                              # the preset's own key
         self.assertTrue(out.strip().startswith("sk-strata-"))
 
+    def test_a_reason_joined_after_a_sentence_starts_with_a_capital(self):
+        from strata_cli.launch.runner import capital
+        self.assertEqual(capital("the update feed could not be read: no route"), "The update feed could not be read: no route")
+        self.assertEqual(capital("Already fine."), "Already fine.")
+        self.assertEqual(capital(""), "")
+
     def test_launch_error_is_one_plain_sentence(self):
         from strata_cli.launch.runner import LaunchError
         with mock.patch.object(Runner, "run", side_effect=LaunchError("The engine could not be installed.", "Check your internet.", 6)):

@@ -81,6 +81,11 @@ def missing_file(failure: str) -> bool:
     return failure.startswith(("ModuleNotFoundError", "ImportError", "FileNotFoundError"))
 
 
+def capital(text: str) -> str:
+    """A reason that was written to stand alone ("the update feed could not be read: ...") starts the sentence it is joined to with a capital."""
+    return text[:1].upper() + text[1:]
+
+
 class LaunchError(RuntimeError):
     """A step could not be done. `text` says what it means; `next` says what to do."""
 
@@ -615,6 +620,7 @@ class Runner:
                             why = str(res["error"])
                             break
             why = why or (tail[-1] if tail else "")
+            why = capital(why)                         # (joined after a sentence: "the update feed could not be read ..." starts a new one)
             raise LaunchError("The engine could not be installed." + (f" {why}" if why else ""),
                               "Check your internet connection, or point Strata at an update source with --feed, then try again.", 6)
         self.emit("engine", "The engine is installed.", 100)
