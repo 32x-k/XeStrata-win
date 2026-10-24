@@ -481,6 +481,11 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     const int64_t n_ctx = (int64_t) ids.size() - r.drop, n_neg = guided ? (int64_t) neg_ids.size() - r.drop : 0;
     QiPlan p = plan(h * w + e.rows, guided ? 2 : 1, std::max(n_ctx, n_neg),
                     (int64_t) std::max(ids.size(), neg_ids.size()));
+    {   // the VAE's scratch the last image kept stays only beside this one's work: the Flux2 VAE's, GiBs, does not
+        const int64_t n_ids = (int64_t) std::max(ids.size(), neg_ids.size());
+        const uint64_t work = std::max(p.activations, te_->activation_bytes(n_ids));
+        if (vae_->scratch_held() > (p.vae > work ? p.vae - work : 0)) vae_->drop_scratch();
+    }
     // the states: an edit's afresh (its images are not in the ids), a generation's kept for the same prompt
     if (editing) {
         last_states_ = te_->encode(ids, e.te);
