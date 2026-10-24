@@ -66,11 +66,19 @@ int main() {
     // prompt chunk: prefill_chunk_default(own_default, gpu_share, gguf_copy, file_experts, hip, min_vram, big=8192).  What `strata launch` runs on one card
     // passes neither --tp nor --threads, but the engine's default tp is 2, so own_default is false there; a launch with several cards passes --tp 1.
     using strata::ds4::prefill_chunk_default;
-    // RTX 5070 / RTX 3060 (12 GB), launch default: experts in place -> 8192 (their logs say "prompts in chunks of 8192")
-    CHECK_EQ(prefill_chunk_default(false, 0.06, false, true, false, 12227ull << 20), 8192);
-    CHECK_EQ(prefill_chunk_default(false, 0.06, false, true, false, 12 * GiB), 8192);
-    // the same cards with --tp 1 on one card: share 0.06 < 0.5 -> 8192 as well (the streamed case)
-    CHECK_EQ(prefill_chunk_default(true, 0.06, false, true, false, 12 * GiB), 8192);
+    // RTX 5070 / RTX 3060 (12 GB), launch default: experts in place on a card under 16 GiB -> 4096 (their logs said 8192 before this rule)
+    CHECK_EQ(prefill_chunk_default(false, 0.06, false, true, false, 12227ull << 20), 4096);
+    CHECK_EQ(prefill_chunk_default(false, 0.06, false, true, false, 12 * GiB), 4096);
+    // the same cards with --tp 1 on one card: share 0.06 < 0.5 -> the same 4096
+    CHECK_EQ(prefill_chunk_default(true, 0.06, false, true, false, 12 * GiB), 4096);
+    // 16 GB cards (15.9 GiB total) 4096; a card with exactly 16 GiB or more keeps the big chunk; short VRAM (8 GB) 4096; unknown VRAM the big one
+    CHECK_EQ(prefill_chunk_default(false, 0.10, false, true, false, 16 * GiB - 1), 4096);
+    CHECK_EQ(prefill_chunk_default(false, 0.10, false, true, false, 16 * GiB), 8192);
+    CHECK_EQ(prefill_chunk_default(false, 0.10, false, true, false, 24 * GiB), 8192);
+    CHECK_EQ(prefill_chunk_default(false, 0.0, false, true, false, 8 * GiB), 4096);
+    CHECK_EQ(prefill_chunk_default(false, 0.0, false, true, false, 0), 8192);
+    // a 12 GB HIP card is not measured: the big chunk
+    CHECK_EQ(prefill_chunk_default(false, 0.06, false, true, true, 12 * GiB), 8192);
     // a 5090-class card (32 GB, share 0.19): in place 8192; with the experts copied into RAM 4096
     CHECK_EQ(prefill_chunk_default(false, 0.19, false, true, false, 32 * GiB), 8192);
     CHECK_EQ(prefill_chunk_default(false, 0.19, true, true, false, 32 * GiB), 4096);
@@ -78,8 +86,8 @@ int main() {
     CHECK_EQ(prefill_chunk_default(false, 0.10, true, true, false, 16 * GiB), 4096);
     CHECK_EQ(prefill_chunk_default(false, 0.05, true, true, false, 24 * GiB), 4096);
     CHECK_EQ(prefill_chunk_default(false, 0.06, true, true, false, 12227ull << 20), 4096);
-    // copied into RAM on a card under 10 GiB (short VRAM): the streamed default, never the 4096 rule
-    CHECK_EQ(prefill_chunk_default(false, 0.0, true, true, false, 8 * GiB), 8192);
+    // copied into RAM on a card under 10 GiB (short VRAM): not the copy rule; the in-place rule for a small card gives 4096, unknown VRAM 8192
+    CHECK_EQ(prefill_chunk_default(false, 0.0, true, true, false, 8 * GiB), 4096);
     CHECK_EQ(prefill_chunk_default(false, 0.0, true, true, false, 0), 8192);
     // 1 x R9700 (HIP, 32 GB, share 0.19), single-card default run (tp 1 passed by a multi-card box): 8192, also when copied (HIP is not measured at 4096)
     CHECK_EQ(prefill_chunk_default(true, 0.19, false, true, true, 32 * GiB), 8192);

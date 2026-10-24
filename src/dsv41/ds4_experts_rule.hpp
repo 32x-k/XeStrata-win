@@ -33,6 +33,7 @@ inline int experts_per_word(int requested, uint64_t vram_bytes, int model_k) {
 // Reference KL against the original model does not move with the chunk (1024 0.1705, 2048 0.1692, 4096 0.1688, 8192 0.1695).
 // Alloc failure halves the chunk at load (4096 -> 2048 -> 1024 ...), KV and score buffers are allocated whole at the full --max-context.
 constexpr uint64_t kChunk4096MinVram = 10ull << 30;
+constexpr uint64_t kChunkInPlace4096Below = 16ull << 30;
 // own_default: a single-card run (no --threads, tp 1); gpu_share: the share of the routed experts the cards can hold (1 = all);
 // gguf_copy: a GGUF pack with --mmap-experts off; file_experts: the experts stay in the files; hip: a HIP build; min_vram_bytes: the
 // smallest card; big: the chunk of the streamed case (the engine's kVlRows, 8192)
@@ -40,6 +41,11 @@ inline int prefill_chunk_default(bool own_default, double gpu_share, bool gguf_c
                                  int big = 8192) {
     if (own_default && gpu_share >= 0.5) return 1024;
     if (gguf_copy && !hip && min_vram_bytes >= kChunk4096MinVram) return 4096;
+    // the experts read in place on a card under 16 GiB (the 12 GB PCs; not measured on HIP): 4096 keeps ~120 more experts resident than 8192 (RTX 5070
+    // 287 against 165, RTX 3060 386 against 277) - 5 interleaved pairs, 4096 against 8192, decode: 5070 agent x1.020 (5/5) code x1.004 (3/5), 3060
+    // agent x1.018 (4/5) code x1.091 (5/5); an agent turn of 3K new tokens on a 16K context takes the same time (5070 18.9-19.2 s against 19.1-19.4 s,
+    // 3060 21.4 s against 20.9-21.4 s) - for 9% less speed on a cold 8K prompt (5070 223 against 244 tok/s)
+    if (file_experts && !hip && min_vram_bytes != 0 && min_vram_bytes < kChunkInPlace4096Below) return 4096;
     return file_experts ? big : 2048;
 }
 
