@@ -169,7 +169,7 @@ NVIDIA、AMD、Intel Arc、Apple Silicon で動きます。
 
 ずっと大きなモデルで、12 GB のグラフィックスカード 1 枚と 46 から 64 GB の RAM で動きます。Strata はよく使う部分をメモリに置き、
 残りは SSD から読みます。セットは [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) が作りました。
-NVIDIA RTX 30 から 50 シリーズのカードと Radeon AI PRO R9700 で動きます。`strata launch` で選んでください。デスクトップアプリはまだ対応していません。
+NVIDIA RTX 30、40、50 シリーズのカードと Radeon AI PRO R9700 で動きます。`strata launch` で選んでください。デスクトップアプリはまだ対応していません。
 
 | セット | ダウンロード | 品質 | コードの出力速度 |
 | --- | ---: | --- | --- |

@@ -758,19 +758,28 @@ def nvidia_driver_version() -> str | None:
     return min(versions, key=_version_key) if versions else None
 
 
+def _capability(number: str) -> tuple[int, int]:
+    """``86`` -> (8, 6), ``120`` -> (12, 0): the last digit is the minor version."""
+    return int(number[:-1] or 0), int(number[-1])
+
+
 def arch_covers(archs, present: list[str]) -> bool:
     """Whether a build with `archs` (``sm_86`` = machine code for that card, ``compute_89`` = PTX that any card of
-    that generation or newer can JIT) can run on at least one of the `present` cards (``sm_XX``)."""
-    cards = {int(item[3:]) for item in present if item.startswith("sm_") and item[3:].isdigit()}
+    that generation or newer can JIT) can run on at least one of the `present` cards (``sm_XX``).
+    Machine code also runs on a card of the same major version with an equal or newer minor version (CUDA's cubin
+    compatibility rule): ``sm_86`` code runs on an ``sm_89`` card (RTX 40) but not on ``sm_80`` (older minor),
+    ``sm_90`` (other major) or ``sm_75``; ``sm_120`` code runs on ``sm_121``."""
+    cards = {item[3:] for item in present if item.startswith("sm_") and item[3:].isdigit()}
     if not cards:
         return True              # cannot tell: not a refusal
     for arch in archs:
         kind, _, number = arch.partition("_")
         if not number.isdigit():
             continue
-        if kind == "sm" and int(number) in cards:
+        if kind == "sm" and any(number == card or (len(number) > 1 and len(card) > 1 and _capability(card)[0] == _capability(number)[0]
+                                                   and _capability(card)[1] >= _capability(number)[1]) for card in cards):
             return True
-        if kind == "compute" and any(card >= int(number) for card in cards):
+        if kind == "compute" and any(int(card) >= int(number) for card in cards):
             return True
     return False
 

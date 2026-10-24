@@ -166,7 +166,7 @@ Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow doc
 
 一个大得多的模型，用一块 12 GB 显卡加 46 到 64 GB 内存就能运行。Strata 把最常用的部分留在内存里，其余的从你的固态硬盘读取。
 这些版本由 [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) 制作。它可在
-NVIDIA RTX 30 到 50 系列显卡和 Radeon AI PRO R9700 上运行。请在 `strata launch` 里选择它。桌面应用暂时不提供。
+NVIDIA RTX 30、40、50 系列显卡和 Radeon AI PRO R9700 上运行。请在 `strata launch` 里选择它。桌面应用暂时不提供。
 
 | 版本 | 下载大小 | 质量 | 写代码速度 |
 | --- | ---: | --- | --- |

@@ -174,7 +174,7 @@ Auch mit weniger RAM, als eine Zeile nennt, kann es funktionieren, nur langsamer
 
 Ein deutlich größeres Modell, das auf einer Grafikkarte mit 12 GB und 46 bis 64 GB RAM läuft. Strata hält die meistgenutzten
 Teile im Speicher und liest den Rest von deiner SSD. [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)
-hat die Sets gebaut. Es läuft auf NVIDIA-RTX-Karten der Serien 30 bis 50 und auf der Radeon AI PRO R9700. Wähle es in
+hat die Sets gebaut. Es läuft auf NVIDIA-RTX-Karten der Serien 30, 40 und 50 und auf der Radeon AI PRO R9700. Wähle es in
 `strata launch`. Die Desktop-App bietet es noch nicht an.
 
 | Set | Download | Qualität | Schreibt Code mit |
