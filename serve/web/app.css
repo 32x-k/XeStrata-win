@@ -212,6 +212,7 @@ main { flex: 1; min-height: 0; display: flex; }
 .img-form{display:flex;flex-direction:column;gap:12px}
 .img-prompt{height:auto;padding:10px 14px;resize:vertical}
 .img-row{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}
+.chat-images{width:auto;max-width:220px;height:36px;padding:0 10px;font-size:13px}
 .img-row input[type=number]{width:120px}
 .img-check{flex-direction:row;align-items:center;min-height:44px}
 .img-mask{display:flex;flex-direction:column;gap:8px}

@@ -986,7 +986,9 @@ async function send() {
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
-  if (health.image_generation) body.strata_images = true;   // and make images when the conversation asks for one
+  // and make images when the conversation asks for one: by the model the words choose (auto), by one, or none
+  const ci = $("chat-images").value;
+  if (health.image_generation && ci !== "off") body.strata_images = ci === "auto" || !ci ? true : {model: ci};
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
@@ -1293,7 +1295,19 @@ function imgModel() {
   const ms = health.image_models || [];
   return ms.find(m => m.id === $("img-model").value) || ms[0] || {defaults: health.image_defaults || {}, edits: true};
 }
+// the chat's image choice: auto (the words choose the model; the default otherwise), off, or one model; kept here
+function chatImages() {
+  const ms = health.image_models || [], sel = $("chat-images");
+  const was = sel.value || store.get("chat_images", "auto");
+  const opts = [new Option(ms.length > 1 ? "Images: auto" : "Images: on", "auto"), new Option("Images: off", "off")];
+  if (ms.length > 1) opts.push(...ms.map(m => new Option("Images: " + m.id, m.id)));
+  sel.replaceChildren(...opts);
+  sel.value = [...sel.options].some(o => o.value === was) ? was : "auto";
+  sel.hidden = !health.image_generation;
+}
+$("chat-images").onchange = () => store.set("chat_images", $("chat-images").value);
 function imgModels() {
+  chatImages();
   const ms = health.image_models || [], sel = $("img-model"), was = sel.value;
   sel.replaceChildren(...ms.map(m => new Option(m.id, m.id)));
   if (ms.some(m => m.id === was)) sel.value = was;
