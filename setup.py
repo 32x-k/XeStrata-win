@@ -3361,6 +3361,20 @@ def control_missing_packages() -> list:
             if importlib.util.find_spec(m) is None]
 
 
+def pip_stamp_is_ours(stamp: Path) -> bool:
+    """The list of installed packages was written for THIS system (#3634). A .venv on a disk that Windows and Linux both start from keeps
+    the stamp of the other one, which then says "already installed" about packages this Python does not have. A marker beside the stamp
+    names the system that wrote it; an older stamp without a marker is believed only while the packages every run needs can be imported."""
+    marker = stamp.with_name(stamp.name + ".os")
+    try:
+        if marker.exists():
+            return marker.read_text(encoding="utf-8").strip() == sys.platform
+    except OSError:
+        return False
+    import importlib.util
+    return all(importlib.util.find_spec(m) is not None for m in ("numpy", "jinja2", "regex", "yaml"))
+
+
 def pip_install(packages, what, extra=()):
     """pip install into .venv, skipped when the same list was installed before.  An install from before the pinned
     requirements (#214) recorded bare names: those packages are kept as they are (nothing is reinstalled), and the
@@ -3372,7 +3386,7 @@ def pip_install(packages, what, extra=()):
         ok(f"{what}: bundled with the app")
         return
     stamp = Path(sys.prefix) / ".strata-pip.json"
-    have = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else []
+    have = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() and pip_stamp_is_ours(stamp) else []
     bare = {p.lower() for p in have if req_name(p) == p.lower()}
     need = [p for p in packages if p not in have and req_name(p) not in bare
             and not (bare and "==" in p and _installed(req_name(p)))]
@@ -3383,6 +3397,7 @@ def pip_install(packages, what, extra=()):
     say(f"  Installing {what} ...")
     run([sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *extra, *need])
     stamp.write_text(json.dumps(sorted(set(have) | set(need)), indent=0))
+    stamp.with_name(stamp.name + ".os").write_text(sys.platform, encoding="utf-8")
     ok(f"{what} installed")
 
 
