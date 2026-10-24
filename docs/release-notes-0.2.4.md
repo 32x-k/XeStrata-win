@@ -6,15 +6,16 @@ Strata now runs DeepSeek V4.1-Flash on a PC with one 12 GB graphics card and 46 
 
 ## What you get
 
-- **DeepSeek V4.1-Flash** in the model list of Setup, in two sizes from [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF):
+- **DeepSeek V4.1-Flash** in the model list of Setup, in three sizes from [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF):
 
   | set | download | quality against the original model |
   |---|---|---|
+  | IQ1_M (1.75 bits) | 239 GB | being measured; ISTA-DASLab's model card: keeps 98.7% of the base model's task average (AIME25, GPQA-Diamond, LiveCodeBench v6) |
   | IQ2_XXS (2.00 bits) | 257 GB | perplexity +16%; code and agent text +8.5% and +5.9% |
   | IQ2_XS (2.25 bits) | 274 GB | perplexity +7.7% to +8.3%; code and agent text +3.5% and +2.5% |
-  | IQ4_NL (Engram table, not a third model) | 111 GB, already in both downloads above | The 4-bit Engram lookup table the model reads from RAM or SSD; both sets use this one file |
+  | IQ4_NL (Engram table, not a third model) | 111 GB, already in all three downloads above | The 4-bit Engram lookup table the model reads from RAM or SSD; all three sets use this one file |
 
-  "Perplexity" is how surprised the model is by a fixed set of 4,995 test texts; lower is closer to the original. Pick 2.25 for coding and agent work when you have the disk. Setup shows both sizes and warns if your PC is short of disk or RAM. It does not stop you.
+  "Perplexity" is how surprised the model is by a fixed set of 4,995 test texts; lower is closer to the original. Pick IQ2_XS for coding and agent work when you have the disk. Setup shows both sizes and warns if your PC is short of disk or RAM. It does not stop you.
 - Setup downloads the files, builds the model folder and starts the engine. You set no flags.
 
 ## Speed on real PCs
@@ -44,7 +45,7 @@ These are the 2.00-bit set. The 2.25-bit set reads 13% more data per token, so e
 
 ## Needs
 
-- Disk: 257 GB (2.00) or 274 GB (2.25). The download includes the Engram table and the DSpark drafter.
+- Disk: 239 GB (IQ1_M), 257 GB (IQ2_XXS) or 274 GB (IQ2_XS). The download includes the Engram table and the DSpark drafter.
 - RAM: 46 GB worked on the RTX 3060; 64 GB is the tested comfortable size. More RAM means a bigger store and faster answers.
 - Graphics card: 12 GB or more.
 
