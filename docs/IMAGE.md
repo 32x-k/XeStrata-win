@@ -52,6 +52,7 @@ xestrata --setup --images qwen-image-turbo     # installed from the source: ./se
 - `--images no` removes image generation.
 - Several models can be installed, comma-separated (`--images qwen-image-turbo,magetrail`). The first is the default; the others are used through the API's `model` or the web page's choice of model.
   A size after a model's name chooses that model's own (`--images qwen-image-turbo:Q8_0,qwen-image-base:Q4_K_M`); a model without one takes `--image-quant`'s, or the RAM decides.
+  Mage-Flow and MageTrail come in one bf16 file each, so theirs is `:int8` (the engine turns it to 8 bits as it reads it, always) or `:bf16` (kept 16-bit, always; it needs more RAM). Without one, `--image-dit-q8` says, or the VRAM decides.
   One runs on the GPU at a time: a request for another model ends the earlier model's engine and starts its own (a few seconds to a dozen or so). The RAM needed is the largest model's.
 - With several XeStrata servers on one GPU, image jobs still run one at a time on that GPU: a job waits while another server's runs (the Monitor says so), and when its turn comes it ends the other models' engines first. Servers of the same model use the same engine.
 - `tools/image/install.py --config <the config file>` also adds it to an existing config (`--model`, `--quant` and the others mean what setup's options do).
