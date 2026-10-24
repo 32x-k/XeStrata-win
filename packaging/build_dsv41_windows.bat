@@ -15,7 +15,8 @@ if "%DSV41_ARCH%"=="" set "DSV41_ARCH=86-real;120"
 if "%BUILD_JOBS%"=="" set "BUILD_JOBS=4"
 if "%STRATA_GGML_DIR%"=="" ( echo set STRATA_GGML_DIR to the llama.cpp checkout & exit /b 2 )
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
-if not exist "%BD%\build.ninja" (
+rem configure every time: cmake bakes the build id (the commit) in at configure, so a build dir left from an older commit would print the old one
+if exist "%SRCD%\CMakeLists.txt" (
   cmake -G Ninja -S "%SRCD%" -B "%BD%" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_DSV41=ON -DSTRATA_PORTABLE=ON "-DCMAKE_CUDA_ARCHITECTURES=%DSV41_ARCH%" "-DCMAKE_CUDA_COMPILER=%CUDA_ROOT%/bin/nvcc.exe" "-DCUDAToolkit_ROOT=%CUDA_ROOT%" "-DSTRATA_GGML_DIR=%STRATA_GGML_DIR%"
   if errorlevel 1 exit /b 1
 )
