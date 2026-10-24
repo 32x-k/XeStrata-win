@@ -1384,6 +1384,10 @@ API では `steps`（既定はそれぞれのステップ数）、CFG の強さ 
 編集（`POST /v1/images/edits`、Web のページの Images のタブ、会話の `edit_image`）は、エンジンが編集用の画像のモデルに差し替えて作ります。参照画像は 3 枚まで（編集のモデルの学習と同じ）、ステップ数の既定は Turbo が 4、ほかの 2 つは 30 です。使っていない方の画像のモデルは 8 ビットのまま RAM に残し（`--image-dit-keep off` なら残さず、差し替えのたびにファイルから読み直します）、差し替えは数秒です。
 Mage-Flow の重みは MIT ですが、Microsoft の README は研究のためのモデルで、製品やサービスに使うことは想定していないとしています。XeStrata は Mage-Flow の内容のフィルターも透かしも入れていません。
 
+`--images magetrail` の MageTrail は、Mage-Flow の DiT を 12 ブロックに作り替えて微調整したもので、各ブロックの modulation を全ブロック共有の低ランクの射影（3072 から 256 へ、1 ステップに 1 回）とブロックごとの小さな射影に分けています（bluvoll の mageflow-lowrank-modulation-v1）。エンジンはこの形をそのまま読み、modulation の重みは形式の指定どおり FP32 のまま使います。
+VAE は作者が使っている Black Forest Labs の Flux2 VAE です。Mage-Flow の潜在はもともと Flux2 VAE の潜在空間（Mage-VAE もそれに合わせて作られています）なので、DiT の出力をそのまま渡せます。setup は、Black Forest Labs が Apache 2.0 で FLUX.2-klein-4B に置いている bf16 の版を取ります（MageTrail のリポジトリにある同じ VAE は FLUX.2-dev の非商用のライセンスのファイルです）。
+Flux2 VAE は 1024x1024 で約 4.3 GB の作業領域を使います。VRAM に入らないときは、入る限り深い段（中央の注意を含む）までを画像全体で計算し、残りの大きな段を 4 トークン（64 ピクセル）ずつ重ねたタイルに分けて、重なりを線形に混ぜます。タイルの段の GroupNorm はタイルごとの統計になるので、色味がわずかに変わることがあります。
+
 サーバーは `POST /v1/images/generations`（OpenAI の images API の形。`seed` と `steps` も受けます）で画像を作り、Web のページには「Images」のタブが出ます。
 画像の API は vLLM-Omni 互換（OpenAI 互換）で、vLLM-Omni の拡張の項目も受けます。`num_inference_steps` は `steps` と同じです（Turbo は 8 ステップのままで、ステップ数の指定は無視します）。`true_cfg_scale` を 1 より大きくして `negative_prompt` を付けると、Qwen-Image-2.1 と Turbo に CFG を掛けます（diffusers の Qwen-Image-2.1 と同じ式です。条件ありとネガティブの 2 つ分を計算するので、時間は 1024×1024 で約 2 倍、512×512 では約 1.5 倍です）。どちらかが欠けていればガイダンスなしで、`guidance_scale` は Qwen-Image-2.1 と Turbo では使いません。
 `output_format` は `png`（既定）、`jpeg`、`webp` で、`output_compression`（0〜100、既定 100）が jpeg と webp の画質になります。`quality` は Qwen-Image-2.1 でステップ数を決めます（`low` 20、`medium` と `standard` 30、`high`・`hd`・`auto` は既定の 40。`steps` を付けたときはそちら）。Turbo では 8 ステップのままで、Mage-Flow では使いません。応答の `usage` は画像のエンジンのトークンで数えます（プロンプトのトークンと、参照画像と作った画像の 16×16 画素で 1 つのトークン）。
@@ -1395,6 +1399,10 @@ Mage-Flow の重みは MIT ですが、Microsoft の README は研究のため�
 画像の仕事は GPU で 1 つずつ動きます。エンジンは仕事の前に、その画像に要る VRAM（最低限と、DiT を全部載せて VAE を 1 回で回せる量）を答え、文章のモデルの扱いは `--image-gpu-policy` で決めます: `keep`（そのまま）、`shrink`（`--vram-elastic` で VRAM を空ける）、`unload`（会話を保存して外し、次の起動で戻す）、`auto`（既定。全部が入れば `keep`、入らなければ空けられるときは `shrink`、最低限が入るなら層を流し込んで `keep`、それも入らなければ `unload`）。
 仕事のあと、`keep` で VRAM に余裕があるときだけ画像のエンジンは層を残し、それ以外は持っているものを手放します（待機中はプロセスだけの約 200 MiB）。
 `tools/image/install.py --config <設定>` で、入っているモデルにあとから足せます。
+
+いくつもの画像のモデル（`--images qwen-image-turbo,magetrail`）を入れると、設定の `"images"` が既定のモデル、`"image_models"` がほかのモデルになり、要求の `model`（Web のページではモデルの選択）で選びます。名前がないか知らない名前は既定のモデルです。チャットの画像の道具は既定のモデルを使います。
+同じ GPU では、画像の仕事はどのサーバーのものでも 1 つずつ順番に動きます。一時フォルダーの GPU ごと（エンジンの環境が名指す GPU）のロックのファイルを、仕事が終わるまで持ち、別のサーバーの仕事はそれを待ちます。順番を取った仕事は、同じ GPU の画像のエンジンの記録（同じ一時フォルダー）を見て、自分のモデルのもの以外を止めてから（エンジンが VRAM を放し終えるのを待って）動きます。止められたサーバーは、次の仕事でエンジンを起動し直します。同じモデルのサーバーどうしは、同じエンジンを共有します。数えるのは画像のエンジンだけで、別のサーバーの文章のエンジンの VRAM は数えません。
+Web のページの Images のタブは、モデルごとの既定値（`/health` の `image_models`）を欄に出し、ネガティブのプロンプト、ステップ数、CFG の強さ、透明な背景、編集のマスク（参照画像の上で塗る）を送れます。
 
 ---
 
