@@ -116,7 +116,7 @@ def setup_failure(lines: list[str], err: str, hint: str, details: str | None, ow
                                "Pick a folder you own for the model files (the Folder step, or --data-dir D:\\Strata-models) and start again. "
                                "Nothing was downloaded." + where, 6)
         return LaunchError(f"The model could not be installed. Setup stopped with an error ({crashed}).", "Run it again." + where, 6)
-    return LaunchError("The model could not be installed." + (f" {err.rstrip('.')}." if err else ""),
+    return LaunchError("The model could not be installed." + (f" {capital(err.rstrip('.'))}." if err else ""),
                        (hint or ("Run it again: finished steps are skipped." if own_files else
                                  "Run it again: finished steps are skipped and a download continues where it stopped."))
                        + (f" Details: {details}" if details else ""), 6)
