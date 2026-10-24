@@ -212,6 +212,8 @@ main { flex: 1; min-height: 0; display: flex; }
 .img-form{display:flex;flex-direction:column;gap:12px}
 .img-prompt{height:auto;padding:10px 14px;resize:vertical}
 .img-row{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}
+.img-row input[type=number]{width:120px}
+.img-check{flex-direction:row;align-items:center;min-height:44px}
 .img-wh{display:flex;gap:6px}
 .img-wh .st-input{width:6.5em}
 .img-results{display:flex;flex-direction:column;gap:12px}

@@ -117,7 +117,7 @@ async function loadHealth() {
     $("tab-btn-images").hidden = !health.image_generation;
     $("img-note").hidden = !health.image_note;
     $("img-note").textContent = health.image_note || "";
-    $("img-neg-hint").hidden = !(health.image_generation && health.image_guidance <= 1);
+    imgDefaults();
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
     setTimeout(loadHealth, 2000);
@@ -1285,6 +1285,33 @@ function readAsDataURL(f) {
   });
 }
 $("img-size").onchange = () => { $("img-custom").hidden = $("img-size").value !== "custom"; };
+// the image model's defaults (/health's image_defaults, what the API gives a request that leaves a field out): the
+// fields' placeholders, the steps hidden where they are fixed (Turbo), the transparent background where it has one
+function imgDefaults() {
+  const d = health.image_defaults || {};
+  const refs = ($("img-ref").files || []).length > 0;
+  $("img-steps-f").hidden = !!d.steps_fixed;
+  $("img-steps").min = d.steps_min || 1;
+  $("img-steps").max = d.steps_max || 100;
+  $("img-steps").placeholder = String((refs ? d.edit_steps : d.steps) || "");
+  $("img-cfg").placeholder = d.guidance > 1 ? String(d.guidance) : "off";
+  $("img-bg-f").hidden = !d.transparency;
+  imgNegHint();
+}
+// whether the negative prompt is used: only with guidance above 1, and some models guide only with one
+function imgNegHint() {
+  const d = health.image_defaults || {};
+  const g = $("img-cfg").value !== "" ? Number($("img-cfg").value) : (d.guidance || 1);
+  const neg = $("img-neg").value.trim() !== "";
+  let msg = "";
+  if (neg && g <= 1) msg = "The negative prompt is used only with guidance above 1.";
+  else if (!neg && g > 1 && d.negative_prompt == null) msg = "This image model guides only with a negative prompt.";
+  $("img-neg-hint").textContent = msg;
+  $("img-neg-hint").hidden = !msg;
+}
+$("img-neg").oninput = imgNegHint;
+$("img-cfg").oninput = imgNegHint;
+$("img-ref").onchange = imgDefaults;
 $("img-form").onsubmit = async (ev) => {
   ev.preventDefault();
   const prompt = $("img-prompt").value.trim();
@@ -1295,6 +1322,9 @@ $("img-form").onsubmit = async (ev) => {
   if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
   const neg = $("img-neg").value.trim();
   if (neg) body.negative_prompt = neg;
+  if ($("img-steps").value !== "" && !$("img-steps-f").hidden) body.steps = Number($("img-steps").value);
+  if ($("img-cfg").value !== "") body.true_cfg_scale = Number($("img-cfg").value);
+  if ($("img-bg").checked && !$("img-bg-f").hidden) body.background = "transparent";
   $("img-go").disabled = true;
   const t0 = performance.now();
   $("img-hint").textContent = "Generating\u2026 (a minute or more on a small GPU)";
@@ -1326,5 +1356,6 @@ $("img-form").onsubmit = async (ev) => {
   } finally {
     $("img-go").disabled = false;
     $("img-ref").value = "";   // the reference images go with this job only: the next Generate is a new image
+    imgDefaults();
   }
 };

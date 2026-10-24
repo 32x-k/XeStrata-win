@@ -91,7 +91,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         <textarea class="st-input img-prompt" id="img-prompt" rows="3" placeholder="Describe the image&hellip;" aria-label="Prompt"></textarea>
         <label class="st-field">Negative prompt (optional)
           <textarea class="st-input img-prompt" id="img-neg" rows="2" placeholder="What the image should not have&hellip;"></textarea></label>
-        <span class="composer-hint" id="img-neg-hint" hidden>This image model does not use a negative prompt unless guidance is on (the API's true_cfg_scale above 1).</span>
+        <span class="composer-hint" id="img-neg-hint" hidden></span>
         <div class="img-row">
           <label class="st-field">Size
             <select class="st-input" id="img-size">
@@ -105,8 +105,14 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             <input class="st-input" id="img-h" type="number" min="256" max="2048" step="1" value="1024" aria-label="Height"></span></label>
           <label class="st-field">Edit an image (optional)
             <input class="st-input" id="img-ref" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" multiple></label>
+          <label class="st-field" id="img-steps-f">Steps
+            <input class="st-input" id="img-steps" type="number" min="1" max="100" step="1"></label>
+          <label class="st-field">Guidance (CFG)
+            <input class="st-input" id="img-cfg" type="number" min="0" max="30" step="0.5"></label>
           <label class="st-field">Seed
             <input class="st-input" id="img-seed" type="number" min="0" placeholder="random"></label>
+          <label class="st-field img-check" id="img-bg-f" hidden>
+            <input type="checkbox" id="img-bg"> Transparent background</label>
           <button type="submit" class="st-btn st-btn--primary" id="img-go">Generate</button>
         </div>
         <span class="composer-hint" id="img-hint">One image at a time; a chat request waits for it (and the other way round).</span>

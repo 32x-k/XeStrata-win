@@ -150,6 +150,25 @@ def _int_field(req: dict, key: str, lo: int, hi: int, default):
     return v
 
 
+def model_defaults(cfg: dict) -> dict:
+    """What a request leaves out gets from the image model of the config's "images" section `cfg` (parse_request and
+    cfg_request take theirs from here; the web page shows them): steps (Turbo's fixed, steps_fixed; Mage-Flow's edit
+    model's for an edit), the least steps,
+    the guidance scale (1: none), the negative prompt when none is given (None: none, so no guidance without one), and
+    whether it makes transparent images."""
+    mage = cfg.get("family") == "mage-flow"
+    if cfg.get("schedule") == "base":
+        steps, least, fixed = int(cfg.get("steps") or 40), 2, False
+    elif cfg.get("schedule") == "mage":
+        steps, least, fixed = int(cfg.get("steps") or 4), 1, False
+    else:
+        steps, least, fixed = TURBO_STEPS, TURBO_STEPS, True
+    edit = int(cfg.get("edit_steps") or steps) if cfg.get("edit_model") else steps
+    return {"steps": steps, "edit_steps": edit, "steps_min": least, "steps_max": MAX_STEPS, "steps_fixed": fixed,
+            "guidance": float(cfg.get("cfg_scale") or 1.0) if mage else 1.0,
+            "negative_prompt": MF_NEG if mage else None, "transparency": cfg.get("transparency") is not False}
+
+
 def parse_request(req: dict, cfg: dict) -> dict:
     """The fields of one /v1/images/generations request, checked.  output_format png, jpeg or webp
     (output_compression 0-100, the quality jpeg and webp are written at); quality low, medium or high (the base model's
@@ -187,14 +206,14 @@ def parse_request(req: dict, cfg: dict) -> dict:
         if req.get("steps") not in (None, req["num_inference_steps"]):
             raise ImageRequestError("steps and num_inference_steps: give one, or the same number")
         req = {**req, "steps": req["num_inference_steps"]}
+    dflt = model_defaults(cfg)
     if cfg.get("schedule") == "base":
-        steps = _int_field(req, "steps", 2, MAX_STEPS,
-                           QUALITY_STEPS.get(quality or "auto") or int(cfg.get("steps") or 40))
+        steps = _int_field(req, "steps", 2, MAX_STEPS, QUALITY_STEPS.get(quality or "auto") or dflt["steps"])
     elif cfg.get("schedule") == "mage":   # Mage-Flow: any count on its static shift, the config's by default
-        steps = _int_field(req, "steps", 1, MAX_STEPS, int(cfg.get("steps") or 4))
+        steps = _int_field(req, "steps", 1, MAX_STEPS, dflt["steps"])
     else:   # Turbo's own sigmas: steps asked for are ignored, as its diffusers pipeline (sample_sigmas) does
         _int_field(req, "steps", 1, MAX_STEPS, None)
-        steps = TURBO_STEPS
+        steps = dflt["steps"]
     cfg_fields = cfg_request(req, cfg)
     seed = _int_field(req, "seed", 0, 2**62, None)
     if seed is None:
@@ -224,10 +243,11 @@ def cfg_request(req: dict, cfg: dict | None = None) -> dict:
             raise ImageRequestError(f"{key}: a number from 0 to {CFG_MAX:g}")
         out[key] = float(v)
     if (cfg or {}).get("family") == "mage-flow":
-        scale = out.get("true_cfg_scale", out.get("guidance_scale", float((cfg or {}).get("cfg_scale") or 1.0)))
+        dflt = model_defaults(cfg or {})
+        scale = out.get("true_cfg_scale", out.get("guidance_scale", dflt["guidance"]))
         if scale > 1:
             out["cfg"] = scale
-            out.setdefault("negative_prompt", MF_NEG)
+            out.setdefault("negative_prompt", dflt["negative_prompt"])
         return out
     if out.get("true_cfg_scale", 1.0) > 1 and out.get("negative_prompt") is not None:
         out["cfg"] = out["true_cfg_scale"]
@@ -725,10 +745,9 @@ class ImageGen:
                 f"{q.get('ram_left_gb', '?')} GB. Run setup with --image-ssd-offload on to keep them "
                 "(what does not fit is read from the SSD, slower).")
 
-    def guidance(self) -> float:
-        """The guidance scale a request without one gets (cfg_request): Mage-Flow's config's, else 1 (none, so its
-        negative prompt is not used)."""
-        return float(self.cfg.get("cfg_scale") or 1.0) if self.cfg.get("family") == "mage-flow" else 1.0
+    def defaults(self) -> dict:
+        """What a request leaves out gets from this image model (model_defaults)."""
+        return model_defaults(self.cfg)
 
     def missing(self) -> list[str]:
         keys = ("exe", "diffusion_model", "vae", "llm") + (("vision",) if self.cfg.get("vision") else ())
