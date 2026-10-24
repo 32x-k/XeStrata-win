@@ -42,7 +42,7 @@ The models, the install, the app and the API are much the same as Strata's.
 | --- | --- |
 | GPU | Intel Arc (A series, B series), AMD Radeon (RDNA2 or later, [AMD GPUs](#amd-gpus)), or an NVIDIA GPU (Pascal or later; Pascal has no tensor cores and runs the slower paths). 12 GB of VRAM or more is recommended (less works, but slower). |
 | CPU | x86-64 with AVX2. With AVX-512 (F, BW, VL, VNNI, VBMI) the CPU's part runs on AVX-512. |
-| RAM | Usually 32-62 GB ([Choosing a model](#choosing-a-model)). The smallest, Gyro-S, needs 28 GB of RAM and VRAM together; the largest sizes 100 GB or more. |
+| RAM | Usually 32-62 GB ([Choosing a model](#choosing-a-model)). The smallest, Gyro-Coder, needs 20 GB of RAM and VRAM together; the largest sizes 100 GB or more. |
 | Disk | About 60-110 GB for the model (up to 190 GB for the largest sizes), and about 5 GB for the MTP layer. An SSD (NVMe) is strongly recommended. |
 | OS | Linux (the packages are for Ubuntu 26.04 and Fedora 44; on other distributions, [Podman](#podman) or [from the source](docs/BUILD.md#installing-from-the-source)), Windows 10 and 11 (x64, [Windows](#windows)). WSL 2 may work (pull requests welcome). |
 | BIOS | For a discrete GPU: Above 4G Decoding and Re-Size BAR on, CSM off. |
@@ -86,7 +86,7 @@ So XeStrata runs only on the GPUs the distribution's rocBLAS has code for.
 ## Choosing a model
 
 **Not sure? Press Enter at `xestrata --setup`'s questions.** It takes the original Qwen3.8-Flash-Next at **Q2_0**, or at **IQ3_XXS** with 60 GB of RAM or more (UD-IQ4_XS on a Ryzen AI Max with 80 GB or more).
-With less RAM than that, the Coder (32 GB), Gyro (from 28 GB of RAM and VRAM together) and the BETA models are there to choose.
+With less RAM than that, the Coder (32 GB), Gyro (from 28 GB of RAM and VRAM together), Gyro-Coder (from 20 GB) and the BETA models are there to choose.
 To add another model later, run `xestrata --setup` too.
 
 | Model | Parameters | RAM (about) | Good for |
@@ -113,6 +113,8 @@ The size: the same model, compressed more or less.
 | Coder | **IQ1_M** | 58 GB | 32 GB | fast; good at code, weaker elsewhere |
 | Gyro | **Gyro-S** | 58 GB | 28 GB of RAM and VRAM | slow; below the 2-3-bit sizes |
 | Gyro | **Gyro-M** | 92 GB | 35 GB of RAM and VRAM | slow; about IQ3_XXS |
+| Gyro-Coder | **Gyro-Coder-L** | 84 GB | 28 GB of RAM and VRAM | slower than Gyro-M; good at code, weaker elsewhere |
+| Gyro-Coder | **Gyro-Coder** | 76 GB | 20 GB of RAM and VRAM | about Gyro-M's speed; below Gyro-Coder-L |
 | Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | slow with less than about 80 GB of RAM; better than IQ3_S |
 | Unsloth (experimental) | **UD-Q4_K_XL** | 111 GB | 48 GB | slow on a 64 GB PC; better still |
 | Unsloth (experimental) | **UD-Q5_K_XL**, **UD-Q6_K_XL**, **Q8_0** | 158-188 GB | 108-136 GB | for PCs with a lot of RAM; Q8_0 the closest to the original model |
@@ -121,6 +123,7 @@ The size: the same model, compressed more or less.
 - **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF):** UkisAI's fine-tune. It thinks shorter before it answers, so the answer comes sooner, at much the same quality.
 - **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF):** ISTA-DASLab's version for code. With half the experts, it is weaker outside code and in languages other than English.
 - **[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF):** agentionai's quantization for PCs with little memory; the memory it needs is RAM and VRAM together.
+- **[Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF):** agentionai's version for code: half the experts, quantized in Gyro's formats. It is weaker outside code; the memory it needs is RAM and VRAM together.
 - **[Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF):** 4- to 8-bit versions of the original. The experts that do not fit the RAM are read from the SSD while it answers.
   Those larger than UD-Q4_K_XL are experimental and have not been run in XeStrata.
 - **[huihui-ai's abliterated versions](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF):** Swift 1.5 (IQ2_XS, IQ3_XXS) and Unsloth's (UD-IQ4_XS, UD-Q4_K_XL, Q8_0) with the refusal direction removed.
@@ -371,7 +374,7 @@ permission under GPL section 7, what goes in, and how to report).
      [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF);
    - [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF), by UkisAI;
    - UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0, by [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF);
-   - [Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF), by agentionai;
+   - [Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) and [Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF), by agentionai;
    - the [abliterated versions](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF), by huihui-ai;
    - [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones by pfeifferj), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp,
      [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth);

@@ -284,6 +284,20 @@ Images work too. The model's license is Qwen3.8-Flash-Next's, the Qwen Community
 ./setup.sh --setup --family gyro --model Gyro-M
 ```
 
+### Or: Gyro-Coder-L and Gyro-Coder
+
+**[Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)** is agentionai's version for code.
+Each layer keeps 256 of its 512 experts, the ones code needs (a token still uses 10), rotated by Hadamard matrices and stored in trellis formats as Gyro's are.
+Gyro-Coder-L's experts are TQP5, TQP6 and TQP7, which set two weights a step (about 3.2 bits a weight); Gyro-Coder's are TQ2_T (about 2.1 bits).
+The memory it needs is VRAM and RAM together: 27.5 GB for Gyro-Coder-L, 19.9 GB for Gyro-Coder.
+The files hold the n-gram table too (read from the SSD), so the downloads are 84 GB and 76 GB.
+The two keep the same experts, so XeStrata ships one expert profile for them (`data/expert-profile-gyro-coder.bin`), made from the routing of answers to coding requests.
+It is weaker outside code. Images work too (with the original model's image encoder). The model's license is the Qwen Community License 1.0.
+
+```sh
+./setup.sh --setup --family gyro-coder --model Gyro-Coder-L
+```
+
 ### Or: huihui-ai's abliterated versions
 
 **[huihui-ai's abliterated versions](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)** have the refusal direction removed from the model (abliteration).
@@ -1570,7 +1584,8 @@ The model files are not part of it; their licenses apply to them (below).
   (Apache-2.0 per its card); its support in Strata came from @pjgmobile's PR #54.
   Swift 1.5: [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI.
   UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0: [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) by Unsloth.
-  Gyro: [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) by agentionai.
+  Gyro: [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) by agentionai;
+  Gyro-Coder: [agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF), also by agentionai.
   The abliterated versions: [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF) by huihui-ai.
   The other models: [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones pfeifferj's [reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp, [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth).
   The image models: Qwen's Qwen-Image-2.1 and Qwen-Image-2.1-Turbo (GGUFs by Unsloth), Microsoft's Mage-Flow (Comfy-Org's safetensors), RicemanT's MageTrail with Black Forest Labs' Flux2 VAE (FLUX.2-klein-4B's), and the text encoders, Qwen3-VL (Unsloth's, AtomicChat's, and huihui-ai's by noctrex) ([IMAGE](IMAGE.md#licenses)).

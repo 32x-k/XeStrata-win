@@ -274,6 +274,20 @@ Gyro-S はいちばん小さく、品質は 2〜3 ビットの大きさより低
 ./setup.sh --setup --family gyro --model Gyro-M
 ```
 
+### Gyro-Coder-L と Gyro-Coder
+
+**[Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)** は、agentionai によるコード向けの版です。
+各層 512 個のエキスパートのうち、コードに効く 256 個を残し（1 トークンで使うのは 10 個のまま）、Gyro と同じくアダマール行列で回して trellis の形式で格納しています。
+Gyro-Coder-L のエキスパートは 1 ステップで重み 2 つを決める TQP5、TQP6、TQP7（重み 1 個あたり約 3.2 ビット）、Gyro-Coder は TQ2_T（約 2.1 ビット）です。
+要るメモリは VRAM と RAM の合計で、Gyro-Coder-L は 27.5 GB、Gyro-Coder は 19.9 GB です。
+ファイルには n-gram の表も入っていて（SSD から読みます）、ダウンロードは 84 GB と 76 GB です。
+2 つは同じエキスパートを残しているので、XeStrata は 1 つのエキスパートの順位（`data/expert-profile-gyro-coder.bin`）を同梱しています。コードの依頼の答えのルーティングから作ったものです。
+コード以外の依頼では弱くなります。画像も使えます（画像のエンコーダーは元のモデルのものです）。モデルのライセンスは Qwen Community License 1.0 です。
+
+```sh
+./setup.sh --setup --family gyro-coder --model Gyro-Coder-L
+```
+
 ### huihui-ai の abliterated 版
 
 **[huihui-ai の abliterated 版](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)** は、モデルから拒否の方向を取り除いた（abliteration）版です。
@@ -1537,7 +1551,8 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
   （カードによれば Apache-2.0）で、Strata での対応は @pjgmobile の PR #54 によるものです。
   Swift 1.5 は UkisAI の [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)。
   UD-IQ4_XS、UD-Q4_K_XL、UD-Q5_K_XL、UD-Q6_K_XL、Q8_0 は Unsloth の [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)。
-  Gyro は agentionai の [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)。
+  Gyro は agentionai の [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)、
+  Gyro-Coder は同じく [agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)。
   abliterated 版は huihui-ai の [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)。
   ほかのモデルは、Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj の[再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) と Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
   画像のモデルは、Qwen の Qwen-Image-2.1 と Qwen-Image-2.1-Turbo（GGUF は Unsloth）、Microsoft の Mage-Flow（Comfy-Org の safetensors）、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE（FLUX.2-klein-4B のもの）、文の読み手の Qwen3-VL（Unsloth、AtomicChat、huihui-ai と noctrex の版）（[IMAGE](IMAGE.ja.md#ライセンス)）。
