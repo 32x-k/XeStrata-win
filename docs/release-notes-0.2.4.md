@@ -13,9 +13,9 @@ Strata now runs DeepSeek V4.1-Flash on a PC with one 12 GB graphics card and 46 
   | IQ1_M (1.75 bits) | 239 GB | being measured; ISTA-DASLab's model card: keeps 98.7% of the base model's task average (AIME25, GPQA-Diamond, LiveCodeBench v6) |
   | IQ2_XXS (2.00 bits) | 257 GB | perplexity +16%; code and agent text +8.5% and +5.9% |
   | IQ2_XS (2.25 bits) | 274 GB | perplexity +7.7% to +8.3%; code and agent text +3.5% and +2.5% |
-  | IQ4_NL (Engram table, not a third model) | 111 GB, already in all three downloads above | The 4-bit Engram lookup table the model reads from RAM or SSD; all three sets use this one file |
+  | IQ4_NL (Engram table, not a model to pick) | 111 GB, already in all three downloads above | The 4-bit Engram lookup table the model reads from RAM or SSD; all three sets use this one file |
 
-  "Perplexity" is how surprised the model is by a fixed set of 4,995 test texts; lower is closer to the original. Pick IQ2_XS for coding and agent work when you have the disk. Setup shows both sizes and warns if your PC is short of disk or RAM. It does not stop you.
+  "Perplexity" is how surprised the model is by a fixed set of 4,995 test texts; lower is closer to the original. Pick IQ2_XS for coding and agent work when you have the disk. Setup shows all three sizes and warns if your PC is short of disk or RAM. It does not stop you.
 - Setup downloads the files, builds the model folder and starts the engine. You set no flags.
 
 ## Speed on real PCs
@@ -41,7 +41,7 @@ These are the 2.00-bit set. The 2.25-bit set reads 13% more data per token, so e
 - **Thinking budget.** When neither your request nor your config sets one, DeepSeek thinks for at most 32,768 tokens. A request can set its own budget; 0 turns the limit off.
 - **DSpark** (a small draft model from Unsloth) is on where it measured faster and off on CPU-bound PCs. On the RTX 3060 PC (20 threads) it raised decode from 6.1-6.7 to 8.2-8.7 tokens/s. On the 4x R9700 box it raised 31 tokens/s to 55 to 69. On the RTX 5070 PC with a 6-core Ryzen 5 7600 it gave no gain at any setting (code 4.64 tokens/s with it off against 4.33 at best with it on; agent 3.41 against 2.86 to 3.21), because checking the drafts costs the CPU about what the saved tokens are worth. There `--dspark auto` does not load the drafter.
 - **Faster CPU rows.** The engine has new exact rows for the experts the CPU computes: AVX-512 on Zen 4 and Zen 5, AVX2 on other CPUs, chosen automatically. On the Ryzen 5 7600 PC with an RTX 5070 (2.00 set, DSpark on, three alternating pairs, identical text in all six runs), decode went from 4.08 to 5.11 tokens/s (+25%) and prompt reading rose 26%. This was measured on one CPU, a Zen 4. Zen 5 gained more in the kernel tests.
-- **Cards and engines:** tested on an RTX 3060 (Linux, full model), an RTX 5070 (Windows) and the Radeon AI PRO R9700 (gfx1201, Linux). The RTX 30 kernels (sm_86) were also checked on an RTX A4000. Windows on RTX 30 is built but was not run here. RX 9070 (gfx1200) is built but untested. The engine packages carry `strata-dsv41` next to `strata`.
+- **Cards and engines:** tested on an RTX 3060 (Linux, full model), an RTX 5070 (Windows) and the Radeon AI PRO R9700 (gfx1201, Linux). The RTX 30 kernels (sm_86) were also checked on an RTX A4000. Windows on RTX 30 is built but was not run here. RX 9070 (gfx1200) is built but untested. DeepSeek runs on its own engine package (see below).
 
 ## Needs
 
@@ -60,7 +60,7 @@ These are the 2.00-bit set. The 2.25-bit set reads 13% more data per token, so e
 ## Updating
 
 - **From 0.2.3 or 0.2.3.1:** run `strata update` in the Terminal. It fetches Control 0.1.49. Your Qwen engine does not change: every engine package is still the 0.1.48 file, byte for byte.
-- **Mac:** the Mac Terminal and engine stay on 0.1.48. DeepSeek is not on the Mac yet.
+- **Mac:** the Mac Terminal gets Control 0.1.49 too. The Mac engine stays 0.1.48, and DeepSeek is not on the Mac yet.
 - **New installs:** the install command (`install.ps1` on Windows, `install.sh` on Linux) installs this version.
 
 ## The DeepSeek engine is a separate download
@@ -78,11 +78,11 @@ DeepSeek runs on its own engine package, `strata-dsv41`, which sits beside your 
 
 ## Downloads
 
-Everything from 0.2.3 is attached again, so the release page still holds every file. New in this release: `strata-control-0.1.49-windows-x86_64.zip`, `strata-control-0.1.49-linux-x86_64.tar.gz` and the three DeepSeek packages above. The installers, AppImages, dmg and the Qwen engine packages are the 0.2.3 files.
+Everything from 0.2.3 is attached again, so the release page still holds every file. New in this release: the three Control packages (`strata-control-0.1.49-windows-x86_64.zip`, `-linux-x86_64.tar.gz`, `-macos-arm64.tar.gz`) and the three DeepSeek packages above. The installers, AppImages, dmg and the Qwen engine packages are the 0.2.3 files.
 
 ## Thanks
 
-- **ISTA-DASLab** for the IQ2_XXS and IQ2_XS sets of DeepSeek V4.1-Flash ([ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)).
+- **ISTA-DASLab** for the IQ1_M, IQ2_XXS and IQ2_XS sets of DeepSeek V4.1-Flash ([ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)).
 - **Unsloth** for the DSpark drafter GGUF.
 
 ---
