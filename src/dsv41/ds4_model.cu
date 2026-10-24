@@ -31,6 +31,10 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
+#if defined(STRATA_METAL)
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <condition_variable>
@@ -3553,6 +3557,36 @@ struct Model::Impl {
     }
 
 #if defined(STRATA_METAL)
+    // The most the VRAM experts may add on a Mac: the engine's anonymous memory (Metal buffers + host memory, all counted) stays
+    // under the cap metal/src/engine/arena_budget.h derived from the freezes of the 128 GB M5 Max (macOS keeps a file-cache floor and
+    // compresses / swaps anonymous memory past it): max(15% of the RAM, 40% of the RAM, the floor + 12 GB) left to macOS, at most
+    // the GPU working set; what the process holds now (task_info phys_footprint) is already inside it.
+    double metal_expert_cap() const {
+        uint64_t phys = 0;
+        size_t len = sizeof phys;
+        sysctlbyname("hw.memsize", &phys, &len, nullptr, 0);
+        unsigned long long pages = 0;
+        size_t pl = sizeof pages;
+        double floor_b = 0;
+        if (sysctlbyname("vm.vm_page_filecache_min", &pages, &pl, nullptr, 0) == 0) floor_b = (double) pages * (double) vm_page_size;
+        size_t fr = 0, tot = 0;
+        cudaMemGetInfo(&fr, &tot);
+        const double gb = 1e9, P = (double) phys;
+        double keep = std::max(7.0 * gb, 0.15 * P);
+        if (const char* e = std::getenv("STRATA_METAL_KEEP_FREE_GB")) keep = std::atof(e) * gb;
+        double share = 0.40;
+        if (const char* e = std::getenv("STRATA_METAL_LEAVE_SHARE")) share = std::atof(e);
+        double leave = keep;
+        if (P >= 64.0 * gb) leave = std::max({leave, share * P, floor_b > 0 ? floor_b + 12.0 * gb : 0.0});
+        const double cap = std::min((double) tot, P - leave);
+        task_vm_info_data_t ti;
+        mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+        double foot = 0;
+        if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t) &ti, &cnt) == KERN_SUCCESS) foot = (double) ti.phys_footprint;
+        return std::max(4.0 * gb, cap - foot - 1.0 * gb);
+    }
+#endif
+#if defined(STRATA_METAL)
     // Metal (unified memory): a CPU-lane expert's matrices through no-copy buffers over the model's own pages, so the GPU computes it
     // like a VRAM one (no CPU lane, no second pass).  false: not mappable / the cap is reached (the CPU lane has it).
     bool zc_try(Layer& l, int e) {
@@ -3690,6 +3724,16 @@ struct Model::Impl {
                 CK(cudaMemGetInfo(&fr, &tot));
                 budget = std::min(budget, std::max(0.0, ((double) fr - (double) ((size_t) o.reserve_mib << 20))) *
                                               o.vram_experts);
+#if defined(STRATA_METAL)
+                if (o.vram_experts_auto && std::getenv("DS4_NO_AUTO_VX") == nullptr) {
+                    const double cap = metal_expert_cap();
+                    if (cap < budget) {
+                        std::fprintf(stderr, "ds4: expert share: %.1f GB of VRAM experts (the RAM cap leaves %.1f GB; --vram-experts sets it)\n",
+                                     cap / 1e9, cap / 1e9);
+                        budget = cap;
+                    }
+                }
+#endif
                 charged = charged || commit_charged(devs[(size_t) m]);
             }
             if (charged && room < 1e300) {   // (each member's slots charged: the group's share of the room)
