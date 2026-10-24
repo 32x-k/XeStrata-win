@@ -14,8 +14,9 @@
 // latent: 16 x 16 patches to 768 channels, two DiCo blocks without modulation, 384 channels fused with the zero
 // latent's projection, 21 DiCo blocks (constant modulation), and the posterior's mean and log-variance [h w][256].
 //
-// The same class decodes with Black Forest Labs' Flux2 VAE (flux2-vae.safetensors, whose latent space Mage-VAE was made
-// to share; MageTrail's author decodes with it): each latent token's 128 values un-normalized by the VAE's batch norm
+// The same class decodes with Black Forest Labs' Flux2 VAE (whose latent space Mage-VAE was made to share; MageTrail's
+// author decodes with it), as its LDM checkpoint names it (flux2-vae.safetensors) or as diffusers does (FLUX.2-klein's
+// vae/, the same weights in bf16): each latent token's 128 values un-normalized by the VAE's batch norm
 // statistics and spread over 2 x 2 positions of 32 channels, then the LDM decoder (a 1 x 1 convolution, ResNet blocks
 // with group norms, one self-attention over every position in the middle, three nearest 2x upsamplings: 8 x 8 pixels
 // a position).  It has no encoder here (no edit model takes it).  Its activations are channels-last FP32 at each
@@ -115,7 +116,8 @@ private:
                 int64_t cols = -1);
     const float* vec(class SafeTensors& st, const std::string& name);
     const float* upload(const std::vector<float>& v);
-    Attn attn_w(class SafeTensors& st, const std::string& p, int64_t C);
+    Attn attn_w(class SafeTensors& st, const std::string& norm, const std::string (&qkv)[3], const std::string& proj,
+                int64_t C);
     void conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out);
     void gn_silu16(const float* x, const float* w, const float* b, int64_t HW, int64_t C, bool silu, uint16_t* y16);
     void resblock(const Res& r, float*& x, int64_t H, int64_t W);

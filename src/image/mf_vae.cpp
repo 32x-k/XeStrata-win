@@ -492,19 +492,20 @@ MfVae::Conv MfVae::conv_w(SafeTensors& st, const std::string& name, bool bias, i
     return c;
 }
 
-// a self-attention block's weights under p (its norm, q, k, v and proj_out), q, k and v as one 1 x 1 convolution
-MfVae::Attn MfVae::attn_w(SafeTensors& st, const std::string& p, int64_t C) {
+// a self-attention block's weights (its norm, q, k, v and output projection, by name), q, k and v as one 1 x 1
+// convolution
+MfVae::Attn MfVae::attn_w(SafeTensors& st, const std::string& norm, const std::string (&qkv)[3],
+                          const std::string& proj, int64_t C) {
     Attn x;
-    x.nw = vec(st, p + "norm.weight");
-    x.nb = vec(st, p + "norm.bias");
+    x.nw = vec(st, norm + ".weight");
+    x.nb = vec(st, norm + ".bias");
     if (!dry_) {   // q, k and v as one 1 x 1 convolution of 3 C outputs
         std::vector<uint16_t> h((size_t) (3 * C * C));
         std::vector<float> b((size_t) (3 * C));
-        const char* names[] = {"q", "k", "v"};
         for (int j = 0; j < 3; ++j) {
-            const auto w = st.f32(p + names[j] + ".weight");
-            const auto bb = st.f32(p + names[j] + ".bias");
-            if ((int64_t) w.size() != C * C) throw std::runtime_error("image engine (VAE): " + p + names[j]);
+            const auto w = st.f32(qkv[j] + ".weight");
+            const auto bb = st.f32(qkv[j] + ".bias");
+            if ((int64_t) w.size() != C * C) throw std::runtime_error("image engine (VAE): " + qkv[j]);
             for (int64_t k = 0; k < C * C; ++k) h[(size_t) (j * C * C + k)] = kernels::f16_from_f32(w[(size_t) k]);
             std::copy(bb.begin(), bb.end(), b.begin() + j * C);
         }
@@ -517,7 +518,7 @@ MfVae::Attn MfVae::attn_w(SafeTensors& st, const std::string& p, int64_t C) {
     }
     x.qkv.out = 3 * C;
     x.qkv.in = C;
-    x.proj = conv_w(st, p + "proj_out");
+    x.proj = conv_w(st, proj);
     return x;
 }
 
@@ -547,7 +548,8 @@ bool MfVae::open(const std::string& path, void* stream, std::string& err, bool d
                 x.n2b = vec(st, p + "norm2.bias");
                 x.c2 = conv_w(st, p + "conv2");
             } else {
-                attn_[a++] = attn_w(st, p, C_);
+                const std::string qkv[3] = {p + "q", p + "k", p + "v"};
+                attn_[a++] = attn_w(st, p + "norm", qkv, p + "proj_out", C_);
             }
         }
         gnw_ = vec(st, d + "norm_out.weight");
@@ -1007,44 +1009,81 @@ void MfVae::open_flux2(SafeTensors& st) {
         f2_mean_ = upload(m);
         f2_std_ = upload(sd);
     }
+    // the names as the LDM checkpoint has them (BFL's ae.safetensors, ComfyUI's flux2-vae), or as diffusers' (the vae/
+    // folder of FLUX.2-klein): nm takes the first to the file's
+    const bool df = st.find("decoder.mid_block.resnets.0.conv1.weight") != nullptr;
+    int dl = 0;
+    while (df && st.find("decoder.up_blocks." + std::to_string(dl) + ".resnets.0.conv1.weight") != nullptr) ++dl;
+    auto nm = [df, dl](const std::string& k) -> std::string {
+        if (!df) return k;
+        static const std::pair<const char*, const char*> fixed[] = {
+            {"decoder.post_quant_conv", "post_quant_conv"},
+            {"decoder.mid.block_1.", "decoder.mid_block.resnets.0."},
+            {"decoder.mid.block_2.", "decoder.mid_block.resnets.1."},
+            {"decoder.mid.attn_1.norm", "decoder.mid_block.attentions.0.group_norm"},
+            {"decoder.mid.attn_1.q", "decoder.mid_block.attentions.0.to_q"},
+            {"decoder.mid.attn_1.k", "decoder.mid_block.attentions.0.to_k"},
+            {"decoder.mid.attn_1.v", "decoder.mid_block.attentions.0.to_v"},
+            {"decoder.mid.attn_1.proj_out", "decoder.mid_block.attentions.0.to_out.0"},
+            {"decoder.norm_out", "decoder.conv_norm_out"}};
+        for (const auto& [from, to] : fixed) {   // a whole name, or a prefix of the names under it
+            const std::string f(from);
+            if (k.rfind(f, 0) == 0 && (k.size() == f.size() || f.back() == '.' || k[f.size()] == '.'))
+                return to + k.substr(f.size());
+        }
+        if (k.rfind("decoder.up.", 0) == 0) {   // diffusers counts the levels the other way, from the largest
+            const size_t e = k.find('.', 11);
+            std::string rest = k.substr(e + 1);
+            if (rest.rfind("block.", 0) == 0) {
+                rest = "resnets." + rest.substr(6);
+                const size_t n = rest.find("nin_shortcut");
+                if (n != std::string::npos) rest.replace(n, 12, "conv_shortcut");
+            } else if (rest.rfind("upsample.", 0) == 0) {
+                rest = "upsamplers.0." + rest.substr(9);
+            }
+            return "decoder.up_blocks." + std::to_string(dl - 1 - std::stoi(k.substr(11, e - 11))) + "." + rest;
+        }
+        return k;
+    };
     const std::string d = "decoder.";
-    f2_pq_ = conv_w(st, d + "post_quant_conv");
-    cin_ = conv_w(st, d + "conv_in");
+    f2_pq_ = conv_w(st, nm(d + "post_quant_conv"));
+    cin_ = conv_w(st, nm(d + "conv_in"));
     if (f2_pq_.in != 32 || cin_.in != 32)
         throw std::runtime_error("image engine (Flux2 VAE): the latent is not 32 wide");
     auto res = [&](const std::string& p) {
         F2Res r;
-        r.n1w = vec(st, p + "norm1.weight");
-        r.n1b = vec(st, p + "norm1.bias");
-        r.c1 = conv_w(st, p + "conv1");
-        r.n2w = vec(st, p + "norm2.weight");
-        r.n2b = vec(st, p + "norm2.bias");
-        r.c2 = conv_w(st, p + "conv2");
-        if (st.find(p + "nin_shortcut.weight") != nullptr) r.nin = conv_w(st, p + "nin_shortcut");
+        r.n1w = vec(st, nm(p + "norm1.weight"));
+        r.n1b = vec(st, nm(p + "norm1.bias"));
+        r.c1 = conv_w(st, nm(p + "conv1"));
+        r.n2w = vec(st, nm(p + "norm2.weight"));
+        r.n2b = vec(st, nm(p + "norm2.bias"));
+        r.c2 = conv_w(st, nm(p + "conv2"));
+        if (st.find(nm(p + "nin_shortcut.weight")) != nullptr) r.nin = conv_w(st, nm(p + "nin_shortcut"));
         if (r.c1.in % kGroups != 0 || r.c1.out % kGroups != 0)
             throw std::runtime_error("image engine (Flux2 VAE): " + p + ": channels not a multiple of 32");
         return r;
     };
     f2_mid_[0] = res(d + "mid.block_1.");
-    f2_attn_ = attn_w(st, d + "mid.attn_1.", cin_.out);
+    const std::string a = d + "mid.attn_1.", qkv[3] = {nm(a + "q"), nm(a + "k"), nm(a + "v")};
+    f2_attn_ = attn_w(st, nm(a + "norm"), qkv, nm(a + "proj_out"), cin_.out);
     f2_mid_[1] = res(d + "mid.block_2.");
     int levels = 0;
-    while (st.find(d + "up." + std::to_string(levels) + ".block.0.conv1.weight") != nullptr) ++levels;
+    while (st.find(nm(d + "up." + std::to_string(levels) + ".block.0.conv1.weight")) != nullptr) ++levels;
     if (levels == 0) throw std::runtime_error("image engine (Flux2 VAE): no up levels");
     for (int i = levels - 1; i >= 0; --i) {   // the decoder runs them from the last (the smallest size)
         const std::string p = d + "up." + std::to_string(i) + ".";
         F2Level l;
-        for (int j = 0; st.find(p + "block." + std::to_string(j) + ".conv1.weight") != nullptr; ++j)
+        for (int j = 0; st.find(nm(p + "block." + std::to_string(j) + ".conv1.weight")) != nullptr; ++j)
             l.blocks.push_back(res(p + "block." + std::to_string(j) + "."));
-        if (st.find(p + "upsample.conv.weight") != nullptr) l.up = conv_w(st, p + "upsample.conv");
+        if (st.find(nm(p + "upsample.conv.weight")) != nullptr) l.up = conv_w(st, nm(p + "upsample.conv"));
         f2_levels_.push_back(std::move(l));
     }
     int ups = 0;
     for (const F2Level& l : f2_levels_) ups += l.up.out > 0;
     if (ups != 3) throw std::runtime_error("image engine (Flux2 VAE): not three upsamplings (8 x 8 pixels a position)");
-    gnw_ = vec(st, d + "norm_out.weight");
-    gnb_ = vec(st, d + "norm_out.bias");
-    cout_ = conv_w(st, d + "conv_out");
+    gnw_ = vec(st, nm(d + "norm_out.weight"));
+    gnb_ = vec(st, nm(d + "norm_out.bias"));
+    cout_ = conv_w(st, nm(d + "conv_out"));
     C_ = cin_.out;
 }
 
