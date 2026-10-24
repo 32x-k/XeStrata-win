@@ -4462,13 +4462,34 @@ struct Model::Impl {
         if (!pk.gguf) gb = 0.0;
         else if (gb < 0.0) {   // auto: the RAM free now less 12 GB for the system and the owner's programs, 48 GB at most
             const uint64_t avail = ram_avail();
+            avail0_ = avail;
             const double room = avail == ~uint64_t{0} ? 0.0 : (double) avail / 1e9 - 12.0;
             gb = room >= 4.0 ? std::min(48.0, room) : 0.0;
         }
         return cached = gb;
     }
-    void init_store() {
+    // The auto size is decided again here, after the weights are on the GPU: on a unified-memory machine (Strix Halo) the GPU's
+    // allocations come out of the same RAM the store would use, and the first estimate (made at the layout, before any upload)
+    // saw all of it free.  The explicit sizes (--ssd-cache, DS4_STORE_GB) stand.
+    mutable uint64_t avail0_ = ~uint64_t{0};   // (free RAM when the first estimate was made, before the weights went to the GPU)
+    double store_gb_now() const {
         const double gb = store_gb();
+        if (gb <= 0.0 || o.ssd_cache_gb >= 0.0 || std::getenv("DS4_STORE_GB")) return gb;
+        const uint64_t avail = ram_avail();
+        if (avail == ~uint64_t{0}) return gb;
+        // (the prompt buffers and the context's caches are touched after this point and, on such a machine, take RAM too: measured on
+        // Strix Halo about 0.11 MB a token of context beyond 16384, a 40960 context ending 2.5 GB lower than a 16384 one)
+        const bool uma = avail0_ != ~uint64_t{0} && avail0_ > avail && (double) (avail0_ - avail) / 1e9 >= 4.0;
+        const double ctx_gb = uma ? 1.1e-4 * std::max(0.0, (double) o.max_context - 16384.0) : 0.0;
+        const double room = (double) avail / 1e9 - 12.0 - ctx_gb;
+        const double now = room >= 4.0 ? std::min(48.0, room) : 0.0;
+        if (now < gb)
+            std::fprintf(stderr, "ds4: RAM store: %.1f GB of RAM free after the GPU's weights: store sized %.1f GB, not %.1f\n",
+                         (double) avail / 1e9, now, gb);
+        return std::min(gb, now);
+    }
+    void init_store() {
+        const double gb = store_gb_now();
         if (gb <= 0.0 || L.empty() || L[0].lay.fmt != gg::kFmtMXFP4 || !file_experts) return;
         std::vector<ExpertStore::LayerGeo> geo((size_t) g.nl);   // (the trunk's layers: the drafter's bigger experts stay in place)
         for (const Layer& l : L) {
