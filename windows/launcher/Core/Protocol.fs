@@ -41,8 +41,22 @@ type Family =
       About: string
       License: string
       Experimental: bool
+      /// whether setup can add image generation to its models
+      Images: bool
       Contexts: int[]
       Models: Model[] }
+
+/// An image model setup can add (--images), its -uncensored text encoder a choice of its own where it has one.
+type ImageModel =
+    { Id: string
+      Title: string
+      About: string
+      DownloadGb: float
+      /// besides the text model's
+      RamGb: float
+      Edits: bool
+      License: string
+      Uncensored: bool }
 
 type Installed =
     { Config: string
@@ -50,7 +64,9 @@ type Installed =
       Family: string
       Model: string
       Context: Nullable<int>
-      Port: int }
+      Port: int
+      /// its image models as --images names them, the default first (empty: none)
+      Images: string[] }
 
 type Describe =
     { Version: string
@@ -62,7 +78,8 @@ type Describe =
       Gpus: Gpu[]
       DataDir: string
       Families: Family[]
-      Installed: Installed[] }
+      Installed: Installed[]
+      Images: ImageModel[] }
 
 type Update =
     { Current: string

@@ -16,6 +16,9 @@ let app = Path.Combine(root, "app")
 
 let setupPy = Path.Combine(app, "setup.py")
 
+/// An installed model's image generation changed (setup.py's setup_images, the config's "images" rewritten).
+let imageInstallPy = Path.Combine(app, "tools", "image", "install.py")
+
 let python = Path.Combine(root, "python", "python.exe")
 
 /// What is missing of the 7z's parts (empty: none), for the message that stops the launcher.
