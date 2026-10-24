@@ -378,6 +378,7 @@ class Requirements(unittest.TestCase):
 
         with mock.patch.object(setup, "WIN", False), \
                 mock.patch.object(setup, "find_tool", side_effect=find_tool), \
+                mock.patch.object(setup, "_tool_version", return_value=(True, (3, 28, 1))), \
                 mock.patch.object(setup, "pip_install", side_effect=pip_install), \
                 mock.patch.object(setup, "run", side_effect=run):
             setup.cmake_build(ROOT, ROOT / "build-test", "strata", [], None, "unused.bat")

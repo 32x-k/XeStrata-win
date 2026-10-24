@@ -2100,22 +2100,43 @@ def find_vcvars(cuda_v=None):
     return v if v and v.exists() else None
 
 
+CMAKE_MIN = (3, 24)                    # CMakeLists.txt: cmake_minimum_required(VERSION 3.24)
+
+
+def _tool_version(path, name):
+    """(ok, version tuple) of `path --version`: ok False when it does not run (a pip launcher whose Python is gone)."""
+    try:
+        done = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False, ()
+    if done.returncode != 0:
+        return False, ()
+    found = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", done.stdout or "")
+    return True, tuple(int(x) for x in found.groups() if x) if found else ()
+
+
 def find_tool(name):
-    """A tool on PATH, or the one pip installed next to this Python (cmake, ninja).  A PATH copy that does not run
-    (a pip launcher whose Python is gone) is skipped for the one next to this Python."""
-    p = shutil.which(name)
-    if p:
-        try:
-            if subprocess.run([p, "--version"], capture_output=True, timeout=30).returncode == 0:
-                return p
-        except (OSError, subprocess.SubprocessError):
-            pass
-    for d in (Path(sys.executable).parent / "Scripts", Path(sys.executable).parent,
-              Path.home() / ".local" / "bin"):
-        c = d / (name + (".exe" if WIN else ""))
-        if c.exists():
-            return str(c)
-    return None
+    """The tool the build uses (cmake, ninja): the one pip installed next to THIS Python first (the virtualenv's own, #3822), then PATH,
+    then ~/.local/bin.  One that does not run (a pip launcher whose Python is gone) is skipped, and so is a cmake older than the
+    one CMakeLists.txt needs while another is found; with only an older one it is returned and the build says so."""
+    exe = name + (".exe" if WIN else "")
+    candidates = [str(d / exe) for d in (Path(sys.executable).parent / "Scripts", Path(sys.executable).parent) if (d / exe).exists()]
+    on_path = shutil.which(name)
+    if on_path and on_path not in candidates:
+        candidates.append(on_path)
+    local = Path.home() / ".local" / "bin" / exe
+    if local.exists() and str(local) not in candidates:
+        candidates.append(str(local))
+    older = None
+    for c in candidates:
+        runs, version = _tool_version(c, name)
+        if not runs:
+            continue
+        if name == "cmake" and version and version[:2] < CMAKE_MIN:
+            older = older or c
+            continue
+        return c
+    return older
 
 
 def free_gb(path):
@@ -5483,13 +5504,24 @@ def install_build_tools(gpu, yes):
     return nvcc, find_vcvars(cuda_v) if WIN else None
 
 
+def tool_usable(name):
+    """find_tool found one that runs and (cmake) is new enough: an older system cmake counts as missing, so pip puts the right one in the venv."""
+    found = find_tool(name)
+    if found is None:
+        return False
+    if name == "cmake":
+        runs, version = _tool_version(found, name)
+        return runs and (not version or version[:2] >= CMAKE_MIN)
+    return True
+
+
 def ensure_build_tools():
     """cmake and ninja for a local compile, installed from requirements-build.txt when missing (#3403: the Mac setup
     compiles without cmake_build(), so it calls this too).  Returns (cmake, ninja)."""
     # The ready-made engine path never calls this function. Keep build helpers out of
     # the normal serving environment, and use already installed tools offline.
     build_packages = requirement_lines(BUILD_REQUIREMENTS) if BUILD_REQUIREMENTS.exists() else BUILD_PACKAGES
-    missing = [package for package in build_packages if find_tool(req_name(package)) is None]
+    missing = [package for package in build_packages if not tool_usable(req_name(package))]
     if missing:
         pip_install(missing, "CMake and Ninja build tools")
     cmake, ninja = find_tool("cmake"), find_tool("ninja")
