@@ -141,11 +141,11 @@ static int g_round_nd = 0;
 // The drafts' cut on the product of their confidences (DeepInfer's cumulative rule): a draft is verified while the chance
 // that it and every draft before it are kept stays at least this - a long window whose later drafts are likely lost is
 // not verified whole.  STRATA_DS4_DSPARK_CUM=F, a request's dspark_cum key; 0: off, only the floor on each draft's own
-// confidence (dspark_conf).  Project Maya's default 0.5 (a Radeon 8065S: decode +6.5%, the same tokens)
+// confidence (dspark_conf).  Off by default (not measured faster on code: H100 / owner PC); Project Maya runs 0.5 (a Radeon 8065S: decode +6.5%, the same tokens)
 float dspark_cum_default() {
     static const float v = [] {
         const char* e = std::getenv("STRATA_DS4_DSPARK_CUM");
-        return e != nullptr ? (float) std::atof(e) : 0.5f;
+        return e != nullptr ? (float) std::atof(e) : 0.0f;
     }();
     return v;
 }

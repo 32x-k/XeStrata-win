@@ -2420,13 +2420,12 @@ struct Model::Impl {
             // the row cache a small share of the RAM free (DS4_ENGRAM_CACHE_MB: its size, 0 off; DS4_ENGRAM_THREADS)
             const size_t row = (size_t) pk.eg_hd + pk.eg_hd / 32;
 #if defined(_WIN32)
-            // (Windows: each thread's ReadFile is synchronous, so the threads are the queue depth - a 28K-token prompt
-            //  in one chunk, 1.36M rows before layer 1: 10 threads 17.1 s, 32 14.1 s, 64 13.4 s on a 20-core PC)
-            int nth = 64;
-#else
+            // (Windows: each thread's ReadFile is synchronous, so the threads are the queue depth - Project Maya: a 28K-token
+            //  prompt in one chunk, 10 threads 17.1 s, 64 13.4 s on a 20-core PC.  Here (6 cores, shipped profile) 64 readers
+            //  gave +4.5% on a 4K prompt but no decode gain in every pair: DS4_ENGRAM_THREADS=64 turns them on)
+#endif
             const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
             int nth = (int) std::min(16u, std::max(4u, hw / 2));
-#endif
             if (const char* e = std::getenv("DS4_ENGRAM_THREADS")) nth = std::max(1, std::atoi(e));
             const uint64_t avail = ram_avail();
             uint64_t mb = avail == ~uint64_t{0} ? 64 : std::min<uint64_t>(256, std::max<uint64_t>(16, (avail >> 20) / 64));
@@ -2437,10 +2436,10 @@ struct Model::Impl {
             // Windows: the Engram tables' files that hold nothing else are unmapped and read unbuffered - an SSD's
             // queue kept by the reader threads instead of the page cache's (whose reads of one file from many threads
             // went ~255K rows a second here); unbuffered reads of a mapped file take a slow path, so only unmapped
-            // ones (DS4_EG_DIRECT=0: buffered, mapped, as before)
+            // ones (off by default: -8% on a 4K prompt here; DS4_EG_DIRECT=1 turns it on)
             std::vector<char> eg_direct(pk.files.size(), 0);
 #if defined(_WIN32)
-            if (pk.gguf && (std::getenv("DS4_EG_DIRECT") == nullptr || std::atoi(std::getenv("DS4_EG_DIRECT")) != 0)) {
+            if (pk.gguf && std::getenv("DS4_EG_DIRECT") != nullptr && std::atoi(std::getenv("DS4_EG_DIRECT")) != 0) {
                 std::vector<char> eg_file(pk.files.size(), 0), other(pk.files.size(), 0);
                 for (const auto& kt : pk.t)
                     if (kt.second.file >= 0 && (size_t) kt.second.file < pk.files.size())
@@ -5084,12 +5083,12 @@ struct Model::Impl {
         const float lim = g.lim;
         {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
             // range, ~0.13 ms an IQ2_XXS expert, on the lane's critical path before the first entry computes.
-            // DS4_IQ_PF_ALL=1: every range, as before)
+            // off by default (the mmap path, owner PC: not faster in every pair); DS4_IQ_PF_COLD=1 turns it on)
             std::vector<std::pair<const void*, size_t>> want;
             for (const Ent& en : ents)
                 if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
                     for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
-            static const bool pf_all = std::getenv("DS4_IQ_PF_ALL") != nullptr && std::atoi(std::getenv("DS4_IQ_PF_ALL")) != 0;
+            static const bool pf_all = std::getenv("DS4_IQ_PF_COLD") == nullptr || std::atoi(std::getenv("DS4_IQ_PF_COLD")) == 0;
             if (pf_all) os::prefetch(want);
             else os::prefetch_cold(want);
         }
