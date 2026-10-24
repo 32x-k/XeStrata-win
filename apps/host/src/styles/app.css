@@ -4083,6 +4083,8 @@ textarea.st-input {
 .st-msg--user .st-bubble {
   background: var(--st-accent-surface);
   color: var(--st-accent-surface-ink);
+  white-space: pre-wrap;   /* a typed or pasted message keeps its line breaks (#3720) */
+  overflow-wrap: anywhere;
 }
 
 /* October 2026 clarity pass. App-specific extensions survive design-kit sync. */

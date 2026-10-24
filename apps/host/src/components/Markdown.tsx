@@ -1,4 +1,5 @@
 import { tr } from '../lib/i18n';
+import { copyAndTell } from '../lib/copy-text';
 /** Safe, dependency-free rendering of the Markdown structures used in answers. */
 import { Fragment, type ReactNode } from 'react';
 import { Btn, IconBtn } from './ui';
@@ -78,7 +79,7 @@ export function Markdown({ text, onOpenLink, onPreviewHtml, imageSession }: {
             while (i < lines.length && !/^\s*```/.test(lines[i]))
                 body.push(lines[i++]);
             i++;
-            nodes.push(<div className="st-code" key={key}><div className="st-code__head"><span>{language || tr('code')}</span>{tr(/^html$/i.test(language) && onPreviewHtml ? <Btn size="sm" onClick={() => onPreviewHtml(body.join('\n'))}>{tr("Open preview")}</Btn> : null)}<IconBtn name="copy" title={tr("Copy code")} onClick={() => void navigator.clipboard.writeText(body.join('\n'))}/></div><SyntaxCode text={body.join('\n')} language={language}/></div>);
+            nodes.push(<div className="st-code" key={key}><div className="st-code__head"><span>{language || tr('code')}</span>{tr(/^html$/i.test(language) && onPreviewHtml ? <Btn size="sm" onClick={() => onPreviewHtml(body.join('\n'))}>{tr("Open preview")}</Btn> : null)}<IconBtn name="copy" title={tr("Copy code")} onClick={() => void copyAndTell(body.join('\n'), 'Code')}/></div><SyntaxCode text={body.join('\n')} language={language}/></div>);
             continue;
         }
         const block = displayBlock(lines, i);
