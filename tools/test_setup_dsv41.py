@@ -84,6 +84,19 @@ class Fit(unittest.TestCase):
         self.assertAlmostEqual(dsv41_fit.DOWNLOAD_GB, 508.4, delta=0.1)
         self.assertEqual(dsv41_fit.EXPERTS, 15360)
 
+    def test_four_amd_cards_run_the_ista_sets_with_a_plain_layer_split(self):
+        # r9700, 2026-10-23: 8K prompt 370 tokens a second with --tp 1 against 196 with the engine's default (2)
+        for model in ("IST-DAS-2.00bpw", "IST-DAS-2.25bpw"):
+            p = dsv41_fit.plan(FOUR, 251.0, 900.0, model=model)
+            self.assertEqual((p["tp"], p["args"]), (1, ["--tp", "1"]), model)
+        # two and three cards keep pairs; other makes keep pairs; one card needs no flag; the Unsloth set is not changed
+        self.assertEqual(dsv41_fit.plan(FOUR[:2], 251.0, 900.0, model="IST-DAS-2.00bpw")["args"], ["--tp", "2"])
+        self.assertEqual(dsv41_fit.plan(FOUR[:3], 251.0, 900.0, model="IST-DAS-2.00bpw")["args"], ["--tp", "2"])
+        nv = [{"name": "NVIDIA GeForce RTX 3090", "vram_gb": 24.0, "vendor": "nvidia", "index": i} for i in range(4)]
+        self.assertEqual(dsv41_fit.plan(nv, 251.0, 900.0, model="IST-DAS-2.00bpw")["args"], ["--tp", "2"])
+        self.assertEqual(dsv41_fit.plan(FOUR[:1], 251.0, 900.0, model="IST-DAS-2.00bpw")["args"], [])
+        self.assertEqual(dsv41_fit.plan(FOUR, 251.0, 900.0)["args"], ["--tp", "2"])
+
     def test_four_r9700_match_the_measured_run(self):
         # r9700, 2026-10-20: 1,558 + 1,559 + 1,575 + 1,505 = 6,197 experts in graphics memory, 9,163 (172.3 GB) on the CPU lane
         p = dsv41_fit.plan(FOUR, 251.0, 900.0)

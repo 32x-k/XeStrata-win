@@ -122,10 +122,20 @@ def split_layers(weights: list[float], layers: int = LAYERS) -> list[tuple[int, 
     return out
 
 
-def tp_for(n_cards: int) -> int:
-    """--tp for this many cards: pairs of cards share each layer's matrices (measured 2x faster prompts than a plain layer split).
-    The engine's own check refuses 4 (576 is not a multiple of 128) and drops to 2, so 2 is what is written for two or more cards."""
+def tp_for(n_cards: int, cards: list[dict] | None = None) -> int:
+    """--tp for this many cards.  Pairs of cards sharing each layer's matrices (--tp 2, the engine's default for two or more cards) were
+    measured 2x faster for prompts than a plain layer split on the first rig; on four AMD Radeon AI PRO R9700 cards the plain layer split
+    (--tp 1) is faster for both: 8K prompt 370 against 196 tokens a second and 32 against 29 for answers (2026-10-23, r9700), so the IST-DAS plans give four
+    or more AMD cards 1 (cards passed); the Unsloth plan is unmeasured and keeps 2.  Two and three cards keep 2 (two R9700: prompts 220 against 140, answers slower; not changed).
+    (The engine's own check refuses 4 - 576 is not a multiple of 128 - and drops to 2.)"""
+    if n_cards >= 4 and cards and all(str(c.get("vendor") or "").lower() == "amd" for c in cards):
+        return 1
     return 2 if n_cards >= 2 else 1
+
+
+def _tp_args(n_cards: int, tp: int) -> list[str]:
+    """The engine's --tp when it is not the engine's own pick: it takes 2 with two or more cards when told nothing, so 1 is written out."""
+    return ["--tp", str(tp)] if tp > 1 or n_cards >= 2 else []
 
 
 def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_free_gb: float | None, context: int,
@@ -144,7 +154,7 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
     out: dict[str, Any] = {"variant": model, "cards": [], "experts_total": EXPERTS, "experts_in_vram": 0, "vram_experts_gb": 0.0,
                            "cpu_experts_gb": v["experts_gb"], "weights_gb": _round1(set_gb), "experts_gb": _round1(v["experts_gb"]),
                            "dense_gb": _round1(ISTA_DENSE_GB), "engram_gb": _round1(ISTA_ENGRAM_BYTES / GB), "download_gb": _round1(download),
-                           "tp": tp_for(n), "args": [], "measured": ISTA_MEASURED, "lines": [], "warnings": [], "ram_gb": ram_gb,
+                           "tp": tp_for(n, keep), "args": [], "measured": ISTA_MEASURED, "lines": [], "warnings": [], "ram_gb": ram_gb,
                            "context": context, "disk_total_gb": v["disk_total"]}
     need_disk = download + DISK_HEADROOM_GB
     out["disk_need_gb"] = _round1(need_disk)
@@ -173,13 +183,13 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
         out["experts_in_vram"] = in_vram
         out["vram_experts_gb"] = _round1(in_vram * expert_gb)
         out["cpu_experts_gb"] = _round1(v["experts_gb"] - in_vram * expert_gb)
-        out["tp"] = tp_for(n)
-        out["args"] = ["--tp", str(out["tp"])] if out["tp"] > 1 else []
+        out["tp"] = tp_for(n, keep)
+        out["args"] = _tp_args(n, out["tp"])
         names = " + ".join(f"{c['name'] or 'card ' + str(c['index'])} ({c['vram_gb']:.0f} GB)" for c in out["cards"])
         lines.append(f"Graphics memory: {names}. About {in_vram:,} of the {EXPERTS:,} experts ({out['vram_experts_gb']:.0f} GB) stay on "
                      f"the card{'s' if n > 1 else ''}; the other {EXPERTS - in_vram:,} ({out['cpu_experts_gb']:.0f} GB) are computed on the "
                      "CPU from RAM, and the ones RAM cannot hold are read from the SSD when a word needs them.")
-        if n >= 2:
+        if n >= 2 and out["tp"] == 2:
             lines.append("Two cards share each layer's matrices (--tp 2): measured about twice as fast at reading prompts.")
         if ram_gb:
             all_cached = out["cpu_experts_gb"] + REST_RAM_GB
