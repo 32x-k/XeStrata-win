@@ -197,7 +197,7 @@ Alle Größen, Downloads und was wo läuft: [docs/MODELS.md](docs/MODELS.md).
 | Set | Download | Qualität im Vergleich zum Originalmodell | Antwortet mit |
 | --- | ---: | --- | --- |
 | **IQ1_M** (1,75 Bit) | 239 GB | KL 0,217, Perplexität 3,80 (+21 %); Code +8,9 %, Agent-Aufgaben +10,2 %; schwächer bei einfacher englischer Prosa. Laut Modellkarte von ISTA-DASLab behält es 98,7 % des Aufgabendurchschnitts des Basismodells (AIME25, GPQA-Diamond, LiveCodeBench v6). | noch nicht gemessen |
-| **IQ2_XXS** (2.00 Bit) | 257 GB | KL 0,170, Perplexität 3,63 (+15,5 %); Code +8,6 %, Agent-Aufgaben +5,3 % | 6 bis 9 Tokens/s auf einer RTX 3060, etwa 5 auf einer RTX 5070 |
+| **IQ2_XXS** (2.00 Bit) | 257 GB | KL 0,170, Perplexität 3,63 (+15,5 %); Code +8,6 %, Agent-Aufgaben +5,3 % | etwa 8 bis 10 Tokens/s auf einer RTX 3060 (Code 9,9, Agent-Aufgaben 7,8), etwa 5 auf einer RTX 5070 |
 | **IQ2_XS** (2.25 Bit) | 274 GB | KL 0,107, Perplexität 3,37 (+7,3 %); Code +3,2 %, Agent-Aufgaben +2,2 % | etwa 11 Tokens/s auf einer Radeon AI PRO R9700 |
 | **IQ4_NL** (Engram-Tabelle, kein drittes Modell) | 111 GB, schon in allen drei Downloads oben enthalten | Die 4-Bit-Engram-Nachschlagetabelle, die das Modell aus RAM oder SSD liest. Alle drei Sets nutzen diese eine Datei (`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`). | n/a |
 
