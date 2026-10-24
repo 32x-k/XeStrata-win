@@ -7,6 +7,7 @@
 #endif
 
 #include "ds4_iq.cuh"
+#include "ds4_gguf_cpu.hpp"
 #include "ds4_numerics.cuh"
 
 #include <cuda_fp16.h>
@@ -1228,6 +1229,28 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
         fail("mv: a low-bit job not covered");
         return false;
     }
+#if defined(STRATA_METAL)
+    if (std::getenv("DS4_DBG_IQ") && nij > 0) {   // DBG: the low-bit matvec's first job against a host decode of its rows
+        ds4_metal_flush();
+        for (int ji = 0; ji < std::min(nij, 2); ++ji) {
+            const iq::MvJob& b = IJ[ji];
+            const uint8_t* w = (const uint8_t*) strata::gpu::host_view(b.w);
+            const int8_t* xq = (const int8_t*) strata::gpu::host_view(b.xq);
+            const float* xd = (const float*) strata::gpu::host_view(b.xd);
+            const float* y = (const float*) strata::gpu::host_view(b.y);
+            std::vector<uint16_t> row((size_t) b.k);
+            for (int r = 0; r < 3; ++r) {
+                if (!gg_row_to_bf16(b.type, w + (size_t) r * b.ld, b.k, row.data())) { std::fprintf(stderr, "DBG iq: no host decode for type %d\n", b.type); break; }
+                double acc = 0.0;
+                for (int i = 0; i < b.k; ++i) {
+                    uint32_t u = (uint32_t) row[(size_t) i] << 16; float wf; std::memcpy(&wf, &u, 4);
+                    acc += (double) wf * xq[i] * xd[i / 32];
+                }
+                std::fprintf(stderr, "DBG iq job %d type %d k=%d n=%d ncol=%d ld=%zu r=%d host=%.5g kernel=%.5g w=%p\n", ji, b.type, b.k, b.n, b.ncol, b.ld, r, acc, y[r], (const void*) b.w);
+            }
+        }
+    }
+#endif
     check("mv");
     return true;
 }

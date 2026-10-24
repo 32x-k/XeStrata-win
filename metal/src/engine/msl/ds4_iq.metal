@@ -24,7 +24,7 @@ kernel void ds4_iq_mv(device const uchar* jobs [[buffer(0)]], uint2 tgp [[thread
     if (int(row) >= b.n) return;
     const uint nsb = uint(b.k) / 32u;
     const uint nblk = uint(b.k) / 256u;
-    const uint bs = b.type == 16 ? 66u : (b.type == 17 ? 74u : 82u);
+    const uint bs = b.type == 16 ? 66u : (b.type == 17 ? 74u : (b.type == 18 ? 98u : 82u));
     const device uchar* w = b.w + (size_t) row * b.ld;
     float acc[16];
     for (uint c = 0; c < 16u; ++c) acc[c] = 0.0f;
@@ -32,14 +32,40 @@ kernel void ds4_iq_mv(device const uchar* jobs [[buffer(0)]], uint2 tgp [[thread
         const device uchar* p = w + (size_t) blk * bs;
         const float d = float(as_type<half>(*(const device ushort*) p));
         for (uint ib = 0; ib < 8u; ++ib) {
+            if (b.type == 18) {   // IQ3_XXS: d, qs[64] (two grid bytes a 8 values), scales_and_signs[8] words (top nibble the scale)
+                const device uchar* qs = p + 2;
+                const uint w0 = uint(qs[8 * ib]) | (uint(qs[8 * ib + 1]) << 8) | (uint(qs[8 * ib + 2]) << 16) | (uint(qs[8 * ib + 3]) << 24);
+                const uint w1 = uint(qs[8 * ib + 4]) | (uint(qs[8 * ib + 5]) << 8) | (uint(qs[8 * ib + 6]) << 16) | (uint(qs[8 * ib + 7]) << 24);
+                const uint aux = uint(qs[64 + 4 * ib]) | (uint(qs[65 + 4 * ib]) << 8) | (uint(qs[66 + 4 * ib]) << 16) | (uint(qs[67 + 4 * ib]) << 24);
+                const float db3 = d * (0.5f + float(aux >> 28)) * 0.5f;
+                for (uint l = 0; l < 4u; ++l) {
+                    const uint wv = l < 2u ? w0 : w1, sh = 16u * (l & 1u);
+                    const uint sgn = uint(ksigns_iq2xs[(aux >> (7u * l)) & 127u]);
+                    const uint g0 = iq3xxs_grid[(wv >> sh) & 255u], g1 = iq3xxs_grid[(wv >> (sh + 8u)) & 255u];
+                    const uint off = (size_t) blk * 256u + ib * 32u + l * 8u;
+                    for (uint c = 0; c < 16u; ++c) {
+                        if (int(c) >= b.ncol) break;
+                        const device char* xq = b.xq + (size_t) c * b.k + off;
+                        int sum = 0;
+                        for (uint j = 0; j < 4u; ++j) {
+                            int v0 = int((g0 >> (8u * j)) & 0xffu), v1 = int((g1 >> (8u * j)) & 0xffu);
+                            if ((sgn & (1u << j)) != 0u) v0 = -v0;
+                            if ((sgn & (1u << (j + 4u))) != 0u) v1 = -v1;
+                            sum += v0 * int(xq[j]) + v1 * int(xq[j + 4u]);
+                        }
+                        acc[c] = fma(b.xd[(size_t) c * nsb + (off / 32u)] * db3, float(sum), acc[c]);
+                    }
+                }
+                continue;
+            }
             float db0, db1;
             uint idx[4];
             uint sg[4];
             if (b.type == 16) {
-                const uint aux0 = uint(p[2 + 4 * ib]) | (uint(p[3 + 4 * ib]) << 8) | (uint(p[4 + 4 * ib]) << 16) |
-                                  (uint(p[5 + 4 * ib]) << 24);
-                const uint aux1 = uint(p[6 + 4 * ib]) | (uint(p[7 + 4 * ib]) << 8) | (uint(p[8 + 4 * ib]) << 16) |
-                                  (uint(p[9 + 4 * ib]) << 24);
+                const uint aux0 = uint(p[2 + 8 * ib]) | (uint(p[3 + 8 * ib]) << 8) | (uint(p[4 + 8 * ib]) << 16) |
+                                  (uint(p[5 + 8 * ib]) << 24);   // (8 bytes a sub-block: grid bytes, then signs and scale)
+                const uint aux1 = uint(p[6 + 8 * ib]) | (uint(p[7 + 8 * ib]) << 8) | (uint(p[8 + 8 * ib]) << 16) |
+                                  (uint(p[9 + 8 * ib]) << 24);
                 const float db = d * (0.5f + float(aux1 >> 28)) * 0.25f;
                 db0 = db1 = db;
                 for (uint l = 0; l < 4u; ++l) {
@@ -54,7 +80,7 @@ kernel void ds4_iq_mv(device const uchar* jobs [[buffer(0)]], uint2 tgp [[thread
                 for (uint l = 0; l < 4u; ++l) {
                     const uint q = uint(qs[4u * ib + l]);
                     idx[l] = q & 511u;
-                    sg[l] = 0xffffffffu ^ ((q >> 9) * 0x00204081u);   // the 7 sign bits, expanded (ggml's sign trick)
+                    sg[l] = uint(ksigns_iq2xs[(q >> 9) & 127u]);   // the sign byte of the 7 stored bits (bit j set: value j negated)
                 }
             } else {
                 const device uchar* qs = p + 2;

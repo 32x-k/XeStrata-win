@@ -592,7 +592,8 @@ bool iq_mv(const void* jobs, int nj) {
         const Ds4IqMvJob& q = src[i];
         if (q.n > max_n) max_n = q.n;
         const int ncol = q.ncol > 0 ? q.ncol : 1;
-        const int step = ncol > 16 ? 16 : ncol;   // both kernels keep 16 accumulators
+        static const int maxstep = std::getenv("DS4_IQ_STEP") ? std::atoi(std::getenv("DS4_IQ_STEP")) : 16;
+        const int step = ncol > maxstep ? maxstep : ncol;   // both kernels keep 16 accumulators
         for (int c0 = 0; c0 < ncol; c0 += step) {
             Ds4IqMvJob b = q;
             b.ncol = (c0 + step < ncol) ? step : ncol - c0;

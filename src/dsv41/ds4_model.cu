@@ -7754,6 +7754,21 @@ struct Model::Impl {
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
         const ArGroup& ag = groups[(size_t) L0.grp].ar;
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
+        if (std::getenv("DS4_DBG_SLOTS") && l.il < 2 && l.lay.fmt == gg::kFmtMXFP4) {   // DBG: a resident expert's bytes against its file's
+            ds4_metal_flush();
+            int shown = 0;
+            for (int e = 0; e < l.n_exp && shown < 3; ++e) {
+                if (l.slot[(size_t) e] < 0) continue;
+                std::vector<uint8_t> want(l.blob, 0);
+                read_mx_file(l, e, want.data());
+                const uint8_t* have = (const uint8_t*) strata::gpu::host_view(l.vram_base + (size_t) l.slot[(size_t) e] * unit(l));
+                size_t bad = 0, first = 0;
+                for (size_t i = 0; i < l.blob; ++i)
+                    if (want[i] != have[i]) { if (!bad) first = i; ++bad; }
+                std::fprintf(stderr, "DBG slot il=%d e=%d slot=%d blob=%zu mismatching bytes=%zu first=%zu\n", l.il, e, l.slot[(size_t) e], l.blob, bad, first);
+                ++shown;
+            }
+        }
         if (std::getenv("DS4_TRACE_DISP")) std::fprintf(stderr, "TRACE layer %d p0=%lld T=%d\n", l.il, (long long) p0, T);
         if (std::getenv("DS4_DBG_H") && mi == 0 && (l.il < 2 || std::getenv("DS4_DBG_ALL"))) {   // DBG
             std::vector<float> hv((size_t) T * H * D);
@@ -8246,6 +8261,9 @@ struct Model::Impl {
         st.cpu_experts += nslots;
         if (nrows > 0) {
             gather_rows(d.x, ga, nrows, D, d.xe, s);
+            dump_sub(d, "xe", l.il, p0, nrows, d.xe, (size_t) nrows * D * 4);
+            { std::vector<int> vmap; for (int i = 0; i < nvex; ++i) { vmap.push_back(vex[i]); vmap.push_back(vrow0[i]); vmap.push_back(vn[i]); }
+              dump_sub_host("vmap", l.il, p0, nvex, vmap.data(), vmap.size() * 4); }
             x3::MvJob j[2 * kWin * kPicks];
             int nj = 0;
             for (int i = 0; i < nvex; ++i) {
@@ -8254,12 +8272,16 @@ struct Model::Impl {
                 j[nj++] = job(vm[1], d.xe + (size_t) vrow0[i] * D, d.xu + (size_t) vrow0[i] * g.ff, vn[i], D, g.ff);
             }
             if (!mv_n(d, j, nj, err)) return false;
+            dump_sub(d, "xg", l.il, p0, nrows, d.xg, (size_t) nrows * g.ff * 4);
+            dump_sub(d, "xu", l.il, p0, nrows, d.xu, (size_t) nrows * g.ff * 4);
             swiglu(d.xg, d.xu, nrows * g.ff, g.lim, d.xhh, s);
+            dump_sub(d, "xhh", l.il, p0, nrows, d.xhh, (size_t) nrows * g.ff * 4);
             nj = 0;
             for (int i = 0; i < nvex; ++i)
                 j[nj++] = job(l.vm[(size_t) vex[i]][2], d.xhh + (size_t) vrow0[i] * g.ff, d.ed + (size_t) vrow0[i] * D,
                               vn[i], g.ff, D);
             if (!mv_n(d, j, nj, err)) return false;
+            dump_sub(d, "ed", l.il, p0, nrows, d.ed, (size_t) nrows * D * 4);
         }
         if (!ents.empty()) {
             const double tc = now_ms();
