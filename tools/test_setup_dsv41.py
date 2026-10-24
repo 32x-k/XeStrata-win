@@ -288,7 +288,7 @@ class Catalog(unittest.TestCase):
         s = M.Strata(ROOT)
         fam = next(f for f in s.model_table({"ram_gb": 251.0, "gpus": [{**c, "usable": True} for c in FOUR], "engine_vendor": "amd"})
                    if f["family"] == "deepseek41")
-        self.assertEqual([x["model"] for x in fam["sizes"]], ["IST-DAS-2.00bpw", "IST-DAS-2.25bpw", "UD-Q8_K_XL"])
+        self.assertEqual([x["model"] for x in fam["sizes"]], ["IST-DAS-2.00bpw", "IST-DAS-2.25bpw", "IST-DAS-1.75bpw", "UD-Q8_K_XL"])
         small_sets = {x["model"]: x for x in fam["sizes"]}
         self.assertEqual((small_sets["IST-DAS-2.00bpw"]["download_gb"], small_sets["IST-DAS-2.25bpw"]["download_gb"]), (256.8, 273.8))
         self.assertTrue(small_sets["IST-DAS-2.00bpw"]["on_this_pc"].startswith("fits"))
@@ -326,21 +326,22 @@ class OfficialSets(unittest.TestCase):
 
     def test_the_pinned_files(self):
         fam = setup.MULTI_FILE_FAMILIES["deepseek41"]
-        self.assertEqual(list(fam["models"]), ["IST-DAS-2.00bpw", "IST-DAS-2.25bpw", "UD-Q8_K_XL"])         # the official sets first
+        self.assertEqual(list(fam["models"]), ["IST-DAS-2.00bpw", "IST-DAS-2.25bpw", "IST-DAS-1.75bpw", "UD-Q8_K_XL"])         # the official sets first
         repo = "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF"
-        self.assertEqual(setup.HF_REVISIONS[repo], "0d8f49fb15df73789a9c237a1b8b7b088423dbc0")
+        self.assertEqual(setup.HF_REVISIONS[repo], "cb02422c900df489cea5833e8a92171224059b3c")
         self.assertIs(setup.REPO_PINS[repo], setup.DSV41_ISTA_FILES)
         self.assertNotIn("helcig/tmp-oct26-2", setup.HF_REVISIONS)           # the first release's repository is only remembered as local names
         self.assertEqual(setup.DSV41_ISTA_REPO, repo)
-        self.assertEqual(len(setup.DSV41_ISTA_FILES), 9)                       # 2 x 4 shards + the Engram
+        self.assertEqual(len(setup.DSV41_ISTA_FILES), 13)                      # 3 x 4 shards + the Engram
         for n, (size, sha) in setup.DSV41_ISTA_FILES.items():
             self.assertRegex(sha, r"^[0-9a-f]{64}$", n)
         eng = setup.DSV41_ISTA_FILES["DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"]
         self.assertEqual(eng, (110_595_290_816, "eb19f30d368d393784e1fc54fdfaffc427ebb2110bf3762fdf5a8fbb9a2d740a"))
         self.assertEqual(setup.DSV41_ALL_FILES["dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"],
                          (7_976_914_240, "6ba6ac1b331c540691a209e7fc97dec2a24e295acb1e755c84c7d24a4373927a"))
-        sums = {m: sum(setup.DSV41_ALL_FILES[n][0] for n in fam["models"][m]["shards"]) for m in list(fam["models"])[:2]}
-        self.assertEqual(sums, {"IST-DAS-2.00bpw": 138238893056, "IST-DAS-2.25bpw": 155225824256})
+        sums = {m: sum(setup.DSV41_ALL_FILES[n][0] for n in fam["models"][m]["shards"]) for m in list(fam["models"])[:3]}
+        self.assertEqual(sums, {"IST-DAS-2.00bpw": 138238893056, "IST-DAS-2.25bpw": 155225824256, "IST-DAS-1.75bpw": 120721120256})
+        self.assertEqual(sums["IST-DAS-1.75bpw"], dsv41_fit.ISTA_SETS["IST-DAS-1.75bpw"]["set_bytes"])
         self.assertEqual(sums["IST-DAS-2.00bpw"], dsv41_fit.ISTA_SETS["IST-DAS-2.00bpw"]["set_bytes"])
         self.assertEqual(sums["IST-DAS-2.25bpw"], dsv41_fit.ISTA_SETS["IST-DAS-2.25bpw"]["set_bytes"])
         self.assertEqual(setup.DSV41_ISTA_FILES["DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"][0], dsv41_fit.ISTA_ENGRAM_BYTES)
@@ -349,8 +350,8 @@ class OfficialSets(unittest.TestCase):
             for n in fam["models"][m]["shared"]:
                 self.assertIn(n, setup.DSV41_SHARED)
                 self.assertIn(n, setup.DSV41_ALL_FILES)
-        self.assertRegex(setup.DSV41_SHARED[setup.DSV41_ISTA_ENGRAM], r"ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF/resolve/0d8f49fb[0-9a-f]{32}/$")
-        self.assertRegex(fam["models"]["IST-DAS-2.25bpw"]["hf"], r"ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF/resolve/0d8f49fb[0-9a-f]{32}/$")
+        self.assertRegex(setup.DSV41_SHARED[setup.DSV41_ISTA_ENGRAM], r"ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF/resolve/cb02422c[0-9a-f]{32}/$")
+        self.assertRegex(fam["models"]["IST-DAS-2.25bpw"]["hf"], r"ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF/resolve/cb02422c[0-9a-f]{32}/$")
 
     def test_shipped_profiles_match_their_hashes(self):
         import hashlib
@@ -468,6 +469,49 @@ class LegacyFiles(unittest.TestCase):
             self.assertEqual(got, old)
 
 
+class Smallest(unittest.TestCase):
+    """IST-DAS 1.75 bpw (IQ1_M): the smallest official set, recommended where 2.00 is tight, never forced."""
+
+    def test_the_files_the_pins_and_the_recipe(self):
+        fam = setup.MULTI_FILE_FAMILIES["deepseek41"]
+        d = fam["models"]["IST-DAS-1.75bpw"]
+        self.assertEqual(d["recipe"], "ista")
+        self.assertEqual(d["shards"], [f"DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-{i:05d}-of-00004.gguf" for i in range(1, 5)])
+        self.assertEqual(d["shared"], fam["models"]["IST-DAS-2.00bpw"]["shared"])              # the same Engram, drafter and metadata shard
+        self.assertEqual(setup.DSV41_ISTA_FILES[d["shards"][0]],
+                         (39358830464, "6e3f0d5ff53d00428ec32c079db9e8255cb410ccaa435e5342aaa8a47fe1339d"))
+        self.assertEqual(setup.DSV41_ISTA_FILES[d["shards"][3]][0], 2188841824)
+        self.assertEqual(sum(setup.DSV41_ISTA_FILES[n][0] for n in d["shards"]), 120_721_120_256)
+        self.assertTrue(all(n not in setup.DSV41_LEGACY_NAMES.values() for n in d["shards"]))     # no first-release names for it
+        cmd = setup.dsv41_pack_cmd(Path("/m"), d["shards"], Path("/s/e.gguf"), Path("/s/m.gguf"), Path("/s/d.gguf"), Path("/p"))
+        self.assertIn("--dspark-noise-token", cmd)
+        self.assertNotIn("--skip-tensors", cmd)
+
+    def test_it_is_the_smallest_and_warns_never_refuses(self):
+        sizes = {m: dsv41_fit.ista_download_bytes(m) / 1e9 for m in dsv41_fit.ISTA_SETS}
+        self.assertEqual(min(sizes, key=sizes.get), "IST-DAS-1.75bpw")
+        self.assertAlmostEqual(sizes["IST-DAS-1.75bpw"], 239.3, delta=0.1)
+        for ram in (24.0, 36.0, 64.0):
+            p = dsv41_fit.plan([RTX5070], ram, None, model="IST-DAS-1.75bpw")
+            self.assertIn(p["verdict"], ("fits", "tight", "spills"))
+            self.assertTrue(p["lines"])
+        self.assertEqual(dsv41_fit.plan([RTX5070], 36.0, None, model="IST-DAS-1.75bpw")["verdict"], "tight")      # runs where 2.00 spills
+        self.assertEqual(dsv41_fit.plan([RTX5070], 36.0, None, model="IST-DAS-2.00bpw")["verdict"], "spills")
+
+    def test_it_is_recommended_where_2_00_is_tight(self):
+        self.assertEqual(dsv41_fit.recommend(64.0, 900.0), "IST-DAS-2.00bpw")
+        self.assertEqual(dsv41_fit.recommend(None, None), "IST-DAS-2.00bpw")                   # unknown: the usual one
+        self.assertEqual(dsv41_fit.recommend(32.0, 900.0), "IST-DAS-1.75bpw")                  # less RAM than 2.00 was measured with
+        self.assertEqual(dsv41_fit.recommend(64.0, 250.0), "IST-DAS-1.75bpw")                  # disk fits 1.75 (239 + 6) but not 2.00 (257 + 6)
+        self.assertEqual(dsv41_fit.recommend(64.0, 100.0), "IST-DAS-2.00bpw")                  # fits neither: no reason to prefer it
+
+    def test_the_menu_marks_the_recommendation_and_still_lets_anyone_choose(self):
+        import io
+        names = list(setup.MULTI_FILE_FAMILIES["deepseek41"]["models"])
+        self.assertIn("IST-DAS-1.75bpw", names)
+        self.assertEqual(names.index(dsv41_fit.recommend(32.0, 900.0)) + 1, 3)
+
+
 class InstallOfficial(Install):
     """install_dsv41 for an official set, the engine and the tools mocked."""
 
@@ -579,6 +623,19 @@ class InstallOfficial(Install):
             rc, out = self.install_ista()
         self.assertEqual(rc, 1, out)
         self.assertIn("not enough free disk space", out)
+
+
+class InstallSmallest(InstallOfficial):
+    def test_downloads_the_iq1_m_files_and_the_shared_ones(self):
+        rc, out = self.install_ista(model="IST-DAS-1.75bpw", ram=36.0)
+        self.assertEqual(rc, 0, out)
+        get = [c for c in self.calls if c[0] == "get"]
+        self.assertEqual([c[2].name for c in get][:4], [f"DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-{i:05d}-of-00004.gguf" for i in range(1, 5)])
+        self.assertTrue(get[0][1].startswith(setup.hf(setup.DSV41_ISTA_REPO)))
+        self.assertIn("cb02422c900df489cea5833e8a92171224059b3c", get[0][1])
+        self.assertIn("239 GB", out)
+        a = self.cfg["args"]
+        self.assertEqual(a[a.index("--dspark") + 1], "auto")
 
 
 if __name__ == "__main__":

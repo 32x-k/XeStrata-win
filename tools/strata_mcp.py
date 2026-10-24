@@ -1290,7 +1290,8 @@ class Strata:
         if pl.get("variant"):                   # an official IST-DAS set (strata_control/dsv41_fit.py): measured on 46-64 GB, never a refusal
             if v == "spills":
                 return (f"slow here: this computer has {pl['ram_gb']:.0f} GB of RAM and the set was measured with 46-64 GB, so most of its "
-                        "experts are read from the SSD; it can still be installed")
+                        "experts are read from the SSD; it can still be installed"
+                        + ("" if pl["variant"] == "IST-DAS-1.75bpw" else " (the smaller 1.75 bpw version suits this computer better)"))
             if v == "tight":
                 return ("tight: runs, with the experts RAM cannot hold read from the SSD (about 5-7 tokens a second measured on 46-64 GB "
                         "of RAM and a 12 GB card)")

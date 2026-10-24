@@ -61,6 +61,11 @@ ISTA_SETS = {
     "IST-DAS-2.00bpw": {"title": "IST-DAS 2.00 bpw", "set_bytes": 138_238_893_056, "experts_gb": 132.07, "profile": "profile-2.00.bin",
                         "ppl": "16%", "ram_ok_gb": 40.0, "ram_great_gb": 160.0, "disk_total": 257.0,
                         "quality": "about 16% above the original model's perplexity (the 2-bit price)"},
+    # IQ1_M (1.75 bpw): 120,721,120,256 bytes of shards; experts = the shards minus the 6.16 GB of dense weights.  RAM class from the experts' size against
+    # the 2.00 set's measured 40 GB (not measured on a computer yet); quality: placeholder until the H100 score is in.
+    "IST-DAS-1.75bpw": {"title": "IST-DAS 1.75 bpw", "set_bytes": 120_721_120_256, "experts_gb": 114.56, "profile": "profile-2.00.bin",
+                        "ram_ok_gb": 34.0, "disk_total": 239.0,
+                        "quality": "slightly lower than the 2.00 version (the smallest; a quality figure follows when it is measured)"},
     "IST-DAS-2.25bpw": {"title": "IST-DAS 2.25 bpw", "set_bytes": 155_225_824_256, "experts_gb": 149.06, "profile": "profile-2.25.bin",
                         "ppl": "8%", "ram_ok_gb": 44.0, "ram_great_gb": 176.0, "disk_total": 274.0,
                         "quality": "about 8% above the original model's perplexity (code and agent work about 2.5-3.5% above), "
@@ -87,6 +92,20 @@ def variant_key(model: str | None) -> str | None:
 def ista_download_bytes(model: str, have_engram: bool = False) -> int:
     v = variant(model)
     return v["set_bytes"] + ISTA_DSPARK_BYTES + ISTA_META_BYTES + (0 if have_engram else ISTA_ENGRAM_BYTES)
+
+
+def recommend(ram_gb: float | None, disk_free_gb: float | None = None) -> str:
+    """The official set that suits this computer: 2.00 bpw, unless its memory (under the measured 40 GB of RAM) or its disk (under 2.00's need but
+    enough for the smaller one) make the 1.75 bpw set the better start.  Only a recommendation: every set can still be chosen."""
+    big, small = "IST-DAS-2.00bpw", "IST-DAS-1.75bpw"
+    if ram_gb is not None and float(ram_gb) < ISTA_SETS[big]["ram_ok_gb"]:
+        return small
+    if disk_free_gb is not None:
+        need_big = ista_download_bytes(big) / GB + DISK_HEADROOM_GB
+        need_small = ista_download_bytes(small) / GB + DISK_HEADROOM_GB
+        if float(disk_free_gb) < need_big and float(disk_free_gb) >= need_small:
+            return small
+    return big
 
 
 def _round1(x: float) -> float:
@@ -153,7 +172,7 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
     lines.append(f"DeepSeek-V4.1-Flash, {v['title']}: a {download:.0f} GB download ({set_gb:.0f} GB of model, {ISTA_ENGRAM_BYTES / GB:.0f} GB "
                  f"n-gram table, {ISTA_DSPARK_BYTES / GB:.0f} GB drafter). Quality: {v['quality']}.")
     lines.append("The n-gram table stays on the SSD and is read a few rows for each word: use an NVMe drive for the model files (a slow "
-                 "disk makes every word slower). The same table serves both IST-DAS sets, so installing the second one downloads it once.")
+                 "disk makes every word slower). The same table serves every IST-DAS set, so installing another one downloads it once.")
     if n == 0:
         out["verdict"] = "no_card"
         warns.append("No graphics card Strata can use was found: this model needs one or more cards (8 GB or more; 12 GB is what it was "
@@ -219,7 +238,7 @@ def plan(cards: list[dict] | None, ram_gb: float | None, disk_free_gb: float | N
          vendor: str | None = None, model: str | None = None) -> dict[str, Any]:
     """Where the model goes on this computer.  `cards`: the graphics cards ({"index", "name", "vram_gb", ...}, as gpu_fit takes them),
     `ram_gb` the RAM, `disk_free_gb` the free space where the files go (None: not checked).  `model`: an official IST-DAS set
-    (ISTA_SETS: "IST-DAS-2.00bpw" / "IST-DAS-2.25bpw") gets its own numbers; None or "UD-Q8_K_XL" is Unsloth's 508 GB set.
+    (ISTA_SETS: "IST-DAS-2.00bpw" / "IST-DAS-2.25bpw" / "IST-DAS-1.75bpw") gets its own numbers; None or "UD-Q8_K_XL" is Unsloth's 508 GB set.
 
     Keys: cards (per card: index, name, vram_gb, layers, dense_gb, experts_gb, experts), experts_in_vram, experts_total, vram_experts_gb,
     cpu_experts_gb, ram_needed_gb, spill_gb, spare_ram_gb, verdict (fits / tight / spills / unknown / no_card), tp, args,
