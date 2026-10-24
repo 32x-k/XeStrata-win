@@ -47,6 +47,15 @@ function inline(text: string, onOpenLink?: (url: string) => void, imageSession?:
             : <Fragment key={p}>{inlineMarks(part.text, onOpenLink, imageSession)}</Fragment>)}</Fragment>;
     });
 }
+/** Does this line continue the paragraph above it, or does it start a block of its own? */
+export function continuesParagraph(lines: string[], at: number): boolean {
+    const line = lines[at];
+    if (!line.trim() || /^\s*```/.test(line) || /^(#{1,6})\s+(.+)$/.test(line) || /^\s*[-*+]\s+\S/.test(line) || /^\s*\d+[.)]\s+\S/.test(line) || /^>\s?/.test(line))
+        return false;
+    if (line.includes('|') && at + 1 < lines.length && /^\s*\|?\s*:?-{3,}/.test(lines[at + 1]))
+        return false;
+    return !displayBlock(lines, at);
+}
 export function Markdown({ text, onOpenLink, onPreviewHtml, imageSession }: {
     text: string;
     onOpenLink?: (url: string) => void;
@@ -113,8 +122,19 @@ export function Markdown({ text, onOpenLink, onPreviewHtml, imageSession }: {
             i++;
             continue;
         }
-        nodes.push(<p key={i}>{tr(inline(line, onOpenLink, imageSession))}</p>);
+        // One paragraph: a single newline inside it is a soft break (a space); two spaces or a backslash at the end of a line is a hard break (#3818).
+        const key = i, parts: ReactNode[] = [];
+        let current = line;
         i++;
+        while (true) {
+            const hard = /( {2,}|\\)$/.test(current);
+            parts.push(<Fragment key={parts.length}>{tr(inline(current.replace(/( {2,}|\\)$/, ''), onOpenLink, imageSession))}</Fragment>);
+            if (i >= lines.length || !continuesParagraph(lines, i))
+                break;
+            parts.push(hard ? <br key={`b${parts.length}`}/> : ' ');
+            current = lines[i++].trimStart();
+        }
+        nodes.push(<p key={key}>{tr(parts)}</p>);
     }
     return <>{tr(nodes)}</>;
 }
