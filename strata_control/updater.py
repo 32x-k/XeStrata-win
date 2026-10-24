@@ -571,7 +571,7 @@ def _choose_engine(feed: feedmod.Feed, ctx: Context, state: State) -> tuple[dict
                 "download_bytes": 0, "previous": state.section("engine").get("previous"), "pinned": state.section("engine").get("pinned"),
                 "problem": None}, None
     installed, missing_reason = installed_engine(ctx.components, ctx.hardware)
-    sticky = {**ctx.hardware, "installed_variant": installed.variant if installed is not None and installed.backend == "hip" else ""}
+    sticky = {**ctx.hardware, "installed_variant": installed.variant if installed is not None and installed.backend in ("hip", "cuda") else ""}
     offered, reasons = feedmod.select_engine([p for p in feed.engine], sticky)
     section = state.section("engine")
     report = {"installed": _engine_view(installed), "offered": offered.to_dict() if offered else None,
@@ -839,6 +839,36 @@ def _test_start_failure(component: ec.EngineComponent, started: dict, ctx: Conte
     return TestStartFailed(component.version, f"it did not answer a one-token probe ({error or started.get('state')}){tail}")
 
 
+TEST_CONTEXT = 4096
+_TEST_DROP_WITH_VALUE = ("--kv-resident", "--vision-tokens")
+_TEST_DROP_FLAGS = ("--vision",)
+
+
+def light_test_args(args: list) -> list:
+    """The saved model's engine options made light for the test start (#3842): a short context, no KV kept in VRAM and no picture reader. The
+    test asks whether the NEW engine loads and answers one token, not whether this card holds the model's 262,144-token settings next to the
+    desktop and the running model; a 16 GB card refused good engines with 'out of memory' at the first weight upload."""
+    out, i = [], 0
+    values = [str(x) for x in args]
+    while i < len(values):
+        item = values[i]
+        nxt = values[i + 1] if i + 1 < len(values) else None
+        if item == "--max-context" and nxt is not None:
+            try:
+                out += [item, str(min(int(nxt), TEST_CONTEXT))]
+            except ValueError:
+                out += [item, nxt]
+            i += 2
+        elif item in _TEST_DROP_WITH_VALUE and nxt is not None:
+            i += 2
+        elif item in _TEST_DROP_FLAGS:
+            i += 2 if nxt is not None and not nxt.startswith("--") else 1
+        else:
+            out.append(item)
+            i += 1
+    return out
+
+
 def default_test_start(stage_root: Path, component: ec.EngineComponent, ctx: Context) -> dict:
     """Start the staged engine through the real start path (owner runtime, `component:strata-engine`, a saved model), wait for
     the one-token generation probe, and stop it. Everything runs in an isolated runtime, profile and component folder, so a
@@ -855,6 +885,8 @@ def default_test_start(stage_root: Path, component: ec.EngineComponent, ctx: Con
         cfg["exe"] = ec.REFERENCE_PREFIX + ec.COMPONENT_ID
         cfg["backend"] = component.backend
         cfg.pop("lib_dirs", None)
+        if isinstance(cfg.get("args"), list):
+            cfg["args"] = light_test_args(cfg["args"])
         cfg["host"] = "127.0.0.1"
         cfg["port"] = _free_port()
         cfg["log"] = str(sandbox / "engine.log")

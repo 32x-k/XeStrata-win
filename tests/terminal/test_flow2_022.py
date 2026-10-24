@@ -364,6 +364,7 @@ class StoredTuning(Base):
         self.assertFalse(started)
         text = seen[-1]
         self.assertIn("already tuned for this computer", text)
+        self.assertIn("Add --retune to measure again", text)
         self.assertIn("Q2 32K - Full speed", text)
         self.assertIn("--retune", text)
         self.assertEqual(r.s.tuned_preset, saved["id"])

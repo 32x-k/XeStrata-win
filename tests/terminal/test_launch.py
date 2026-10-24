@@ -952,6 +952,19 @@ class FlagsCommand(unittest.TestCase):
         self.assertIn("Nothing was changed.", out)
         self.assertEqual(store.list_presets(), [])
 
+    def test_the_summary_says_where_the_engine_log_is(self):                                  # #3656
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "x.json"
+            cfg.write_text(json.dumps({"log": str(Path(d) / "office.engine.log"), "args": []}), encoding="utf-8")
+            fake = Result(profile="launch-office", urls=["http://127.0.0.1:8080"], key=None, tune_word=None, notices=[], config=str(cfg))
+            with mock.patch.object(Runner, "run", return_value=fake):
+                code, out, err = run_cli(["launch", "--no-tui", "--model", "q2_0"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Engine log", out)
+        self.assertIn("office.engine.log", out)
+        self.assertIn("strata logs --follow", out)
+
     def test_run_without_screens_prints_the_address_and_saves_the_preset(self):
         fake = Result(profile="launch-office", urls=["http://127.0.0.1:8080", "http://192.168.1.5:8080"], key="sk-strata-abcdefghijkl",
                       tune_word=None, notices=[], config="/x")

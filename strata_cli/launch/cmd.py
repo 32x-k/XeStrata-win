@@ -413,6 +413,15 @@ def gpu_notices(s: S.LaunchSettings, comp) -> list[S.Notice]:
 
 # ------------------------------------------------------------------------------------------------ plain-text run
 
+def _engine_log_of(config) -> str:
+    """Where this launch writes the engine's log (#3656): the config's own "log", printed so a failure can be read without a search."""
+    try:
+        from strata_cli.launch.runner import read_config
+        return str(read_config(Path(config)).get("log") or "")
+    except (OSError, ValueError, TypeError):
+        return ""
+
+
 def _say(line: str = "") -> None:
     sys.stdout.write(line + "\n")
     sys.stdout.flush()
@@ -815,6 +824,9 @@ def run_launch(a: argparse.Namespace) -> int:
             from strata_cli.launch import access
             _say(f"  {'API key':<14} {access.mask_key(result.key)}   (show it: strata launch --show-key"
                  + (f" --preset \"{s.name}\")" if (a.preset or a.save_preset) else ")"))
+        engine_log = _engine_log_of(result.config)
+        if engine_log:
+            _say(f"  {'Engine log':<14} {engine_log}   (follow it: strata logs --follow)")
         for n in result.notices:
             _say(f"[!] {n}")
         local = next((u for u in result.urls if "127.0.0.1" in u), result.urls[0] if result.urls else "")

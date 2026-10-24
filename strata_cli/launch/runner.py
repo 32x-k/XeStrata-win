@@ -1345,12 +1345,12 @@ class Runner:
             if s.tuned_preset:
                 try:
                     presets.find(s.tuned_preset)
-                    self.emit("tune", "This preset is already tuned for this computer.", 100)
+                    self.emit("tune", "This preset is already tuned for this computer. Add --retune to measure again.", 100)
                     return
                 except presets.PresetError:
                     pass
             elif s.tuned_at:                                 # measured before: the standard settings were already the fastest, nothing was saved
-                self.emit("tune", f"Already tuned on {s.tuned_at}: this computer runs best with the standard settings. Nothing to do.", 100)
+                self.emit("tune", f"Already tuned on {s.tuned_at}: this computer runs best with the standard settings. Nothing to do; add --retune to measure again.", 100)
                 return
             stored = self.stored_tuning()
             if stored:                                       # the same model and choices were tuned on this computer before (a run by flags, no preset)
