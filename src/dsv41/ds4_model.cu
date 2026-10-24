@@ -5058,14 +5058,40 @@ struct Model::Impl {
             for (const Ent& en : ents) std::memset(c_yd.data() + (size_t) en.slot0 * E, 0, (size_t) en.n * E * 4);
             return;
         }
+        static double t_pre = 0, t_q1 = 0, t_r1 = 0, t_q2 = 0, t_r2 = 0; static long n_calls = 0; static bool reg = false;
+        if (std::getenv("DS4_CPU_LOG") && !reg) { reg = true; std::atexit([] { std::fprintf(stderr, "cpu_experts_iq phases (ms over %ld calls): prefetch %.1f, quant1 %.1f, gate_up %.1f, quant2 %.1f, down %.1f\n", n_calls, t_pre, t_q1, t_r1, t_q2, t_r2); }); }
+        ++n_calls;
+        double tp0 = now_ms();
         const float lim = g.lim;
         {   // (os::prefetch, as above)
             std::vector<std::pair<const void*, size_t>> want;
             for (const Ent& en : ents)
                 if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
                     for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
+            if (std::getenv("DS4_CPU_LOG")) {   // how many of the experts' matrices are in the page cache (mincore, the first 64 pages)
+                static long cold_n = 0, warm_n = 0; static double cold_ms = 0, warm_ms = 0; static bool reg2 = false;
+                if (!reg2) { reg2 = true; std::atexit([] { std::fprintf(stderr, "prefetch: %ld matrices cold (%.1f ms), %ld warm (%.1f ms)\n", cold_n, cold_ms, warm_n, warm_ms); }); }
+                for (const auto& w : want) {
+                    const uintptr_t a = (uintptr_t) w.first & ~(uintptr_t) 16383;
+                    unsigned char vec[64];
+                    const size_t len = std::min<size_t>(w.second, 64 * 16384);
+                    bool cold = false;
+                    if (mincore((void*) a, len, (char*) vec) == 0) for (size_t i = 0; i < (len + 16383) / 16384; ++i) if (!(vec[i] & 1)) cold = true;
+                    const double t0 = now_ms();
+                    os::prefetch({w});
+                    (cold ? cold_ms : warm_ms) += now_ms() - t0;
+                    (cold ? cold_n : warm_n)++;
+                }
+            } else if (want.size() > 1 && std::getenv("DS4_SERIAL_PREFETCH") == nullptr) {
+                // (a madvise(WILLNEED) of a cold range blocks while the SSD reads it: queue depth 1 reads 3.9 GB/s; the matrices of
+                // all the call's experts at once keep the SSD busy)
+                std::function<void(int)> pf[4];
+                for (int X = 0; X < NH; ++X) pf[X] = [&](int j) { os::prefetch({want[(size_t) j]}); };
+                run_nodes((int) want.size(), pf);
+            } else
             os::prefetch(want);
         }
+        double tp1 = now_ms(); t_pre += tp1 - tp0;
         // the activations in c_xh's bytes, E 4 apart: token t's (t < kWin) at row t - quantized once, whatever number of
         // entries take it - then a row a slot (kWin + slot): a token past the window's input (none on the decode or
         // chunk paths), then (x no longer needed) the slot's h
@@ -5084,6 +5110,7 @@ struct Model::Impl {
                     gg::iq_cpu_quant(fm.gu_act, x + (size_t) t * ldx, E, x_act(en, i));
                 }
         }
+        double tq1 = now_ms(); t_q1 += tq1 - tp1;
         std::function<void(int)> f[4];
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
@@ -5101,10 +5128,12 @@ struct Model::Impl {
                                    r0 - X * FFh, r1 - X * FFh, lim);
             };
         run_nodes(ne * GB, f);
+        double tr1 = now_ms(); t_r1 += tr1 - tq1;
         for (const Ent& en : ents)
             for (int i = 0; i < en.n; ++i)
                 gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
                                  aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+        double tq2 = now_ms(); t_q2 += tq2 - tr1;
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
@@ -5118,6 +5147,7 @@ struct Model::Impl {
                 gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
             };
         run_nodes(ne * DB, f);
+        t_r2 += now_ms() - tq2;
     }
 
     // the window's CPU-lane experts made ready (and pinned) in the store for the length of the call
@@ -8412,6 +8442,10 @@ struct Model::Impl {
                 const float* y = c_yd.data() + (size_t) sl * D;
                 for (int e = 0; e < D; ++e) o[e] += wv * y[e];
             }
+            { static double ms = 0; static long calls = 0, exps = 0; static bool reg = false;
+              ms += now_ms() - tc; ++calls; exps += (long) ents.size();
+              if (std::getenv("DS4_CPU_LOG") && !reg) { reg = true; std::atexit([] { std::fprintf(stderr, "cpu lane calls: %ld, experts %ld, %.1f ms (%.3f ms a call, %.3f ms an expert)%c", calls, exps, ms, ms / (double) calls, ms / (double) exps, 10); }); }
+              (void) 0; (void) ms; }
             st.cpu_ms += now_ms() - tc;
             dump_sub_host("cpu_part", l.il, p0, T, h_part, (size_t) T * D * 4);
             CK(cudaMemcpyAsync(d.cpu_part, h_part, (size_t) T * D * 4, cudaMemcpyHostToDevice, s));
