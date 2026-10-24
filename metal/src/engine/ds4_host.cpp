@@ -86,32 +86,13 @@ mtl::Context& shared_cx() {
 
 // ds4_kernels.cu:1477 - pre[i] = (i % 8) == 0 ? 1 : 0 for i < T*8
 bool init_pre(float* pre, int T, void*) {
-    strata::dsv41::metal_host::shared_cx();
-    const int lib = shared_lib();
-    if (lib < 0) return false;
+    // cpu path (T*8 floats of a fixed pattern): the GPU route had to wrap a whole page to reach 32 bytes, and that aliasing
+    // buffer overlapped the pages holding h
     void* host = strata::gpu::host_view(pre);
     if (!host) { std::fprintf(stderr, "dsv41 metal: init_pre has no host view\n"); return false; }
-    const size_t bytes = (size_t) T * 8 * sizeof(float);
-    const size_t page = 16384;
-    mtl::Buffer bp = strata::dsv41::metal_host::shared_cx().wrap((void*) (((uintptr_t) host) & ~(uintptr_t) (page - 1)),
-                                    ((bytes + page - 1) / page) * page);
-    if (!bp.handle) { std::fprintf(stderr, "dsv41 metal: init_pre wrap failed\n"); return false; }
-    const uintptr_t delta = (uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1));
-    mtl::Pipeline pl;
-    try {
-        pl = strata::dsv41::metal_host::shared_cx().pipeline(g_lib_init, "ds4_init_pre");
-    } catch (...) {
-        return false;
-    }
-    mtl::Dispatch d;
-    d.p = &pl;
-    d.args = {mtl::Arg::B(bp, delta), mtl::Arg::V((unsigned) T)};
-    d.grid[0] = (uint32_t) ((T * 8 + 127) / 128);
-    d.grid[1] = d.grid[2] = 1;
-    d.tg[0] = 128;
-    d.tg[1] = d.tg[2] = 1;
-    strata::dsv41::metal_host::shared_cx().run({d});
-    strata::dsv41::metal_host::shared_cx().flush_runs();
+    float* p = (float*) host;
+    for (int t = 0; t < T; ++t)
+        for (int i = 0; i < 8; ++i) p[t * 8 + i] = (i == 0) ? 1.0f : 0.0f;
     return true;
 }
 
