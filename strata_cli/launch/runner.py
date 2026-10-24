@@ -77,6 +77,20 @@ def python_failure(lines: list[str]) -> str | None:
     return None
 
 
+DEEPSEEK_ENGINE_LINE = re.compile(r"(A newer DeepSeek engine (?:is available|may be available)[^\r\n]*|DeepSeek engine updated from [^\r\n]*)")
+
+
+def deepseek_engine_note(line: str) -> tuple[str, str] | None:
+    """setup's line about the DeepSeek engine upgrade ("A newer DeepSeek engine is available but could not be installed: ...; still using X",
+    or "DeepSeek engine updated from X to Y"): ("warn" | "info", the sentence), None for any other line. The failure line must reach the
+    person: the model starts with the engine they have, and they should know there is a newer one."""
+    found = DEEPSEEK_ENGINE_LINE.search(line)
+    if not found:
+        return None
+    text = found.group(1).strip()
+    return ("info" if text.startswith("DeepSeek engine updated") else "warn", text)
+
+
 def argparse_failure(lines: list[str]) -> str:
     """setup.py's own refusal of an option ("setup.py: error: argument --kv: invalid choice: ..."), which is neither an [X] line nor a
     traceback (#3785): the words after "error:" are the cause."""
@@ -498,6 +512,7 @@ class Runner:
         self.hardware_override = hardware
         self.children: list[subprocess.Popen] = []
         self.notices: list[str] = []
+        self._engine_notes: set[str] = set()
         self.identity_notes: list[str] = []
         self.tune_result: dict | None = None
         self.config_path: Path | None = None
@@ -1003,6 +1018,12 @@ class Runner:
                 continue
             lines.append(line)
             lines[:] = lines[-1500:]
+            note = deepseek_engine_note(line)
+            if note and note[1] not in self._engine_notes:   # setup's DeepSeek engine lines are shown, not condensed away (0.2.5 list)
+                self._engine_notes.add(note[1])
+                if note[0] == "warn":
+                    self.notices.append(note[1])
+                self.emit("model", note[1], None, level=note[0], step=step_seen)
             prog = cat.mcp.install_progress(lines)
             prog = cat.mcp.combined_progress(prog, job)
             dl, phase, label = prog.get("download"), prog.get("phase"), prog.get("label")
