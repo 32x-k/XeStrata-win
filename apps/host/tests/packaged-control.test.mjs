@@ -225,25 +225,33 @@ test('packaged: a model id with dots (DeepSeek) is listed, loaded from its run c
   } finally { await f.native.close(); f.cleanup(); }
 });
 
-test('packaged: the Speed choice of DeepSeek passes --experts 5 or 6 only when chosen; "Default" passes nothing', async () => {
+test('packaged: the Speed choice of DeepSeek passes --experts 5 or 6 only when chosen and only for an engine that knows it (0.1.50 or newer)', async () => {
   const id = 'deepseek-v4.1-flash-ist-das-2.00bpw';
-  const run = async (values, extraArgs = []) => {
+  const run = async (values, extraArgs = [], engine = '0.1.50-windows-x86_64-cuda-cuda13') => {
     const f = packagedFixture({ ids: [id] });
     try {
-      writeFileSync(join(f.install, `strata-${id}.json`), JSON.stringify({ exe: join(f.install, 'engine-dsv41', 'strata-dsv41'), arch: 'deepseek41', tokenizer: join(f.install, 'tok'), args: ['--pack', join(f.install, 'pack'), '--max-context', '8192', ...extraArgs], model_name: 'deepseek-v4.1-flash', port: 8080 }));
+      writeFileSync(join(f.install, `strata-${id}.json`), JSON.stringify({ exe: join(f.install, 'engine-dsv41', engine, 'strata-dsv41'), arch: 'deepseek41', tokenizer: join(f.install, 'tok'), args: ['--pack', join(f.install, 'pack'), '--max-context', '8192', ...extraArgs], model_name: 'deepseek-v4.1-flash', port: 8080 }));
       await f.native.refresh(true);
+      const capability = f.native.settings(id).capabilities.dsExperts;
       const job = await finish(f.native, f.native.operation('load', { model: id, ...(values ? { values } : {}) }).id);
       assert.equal(job.state, 'done', job.error);
-      return f.saved[0];
+      return { cfg: f.saved[0], capability };
     } finally { await f.native.close(); f.cleanup(); }
   };
-  const flags = cfg => { const i = cfg.args.indexOf('--experts'); return i < 0 ? null : cfg.args[i + 1]; };
-  assert.equal(flags(await run(null)), null, 'nothing chosen: the engine decides (--experts auto)');
-  assert.equal(flags(await run({ ds_experts: '5' })), '5');
-  assert.equal(flags(await run({ ds_experts: '6' }, ['--experts', '5'])), '6', 'the choice replaces an older flag');
-  assert.equal(flags(await run({ ds_experts: null }, ['--experts', '5'])), null, 'Default clears an older flag');
-  const cfg = await run({ ds_experts: '5' });
-  assert.equal('ds_experts' in cfg, false, 'the app-only key is not handed to the engine');
+  const flag = cfg => { const i = cfg.args.indexOf('--experts'); return i < 0 ? null : cfg.args[i + 1]; };
+  const none = await run(null);
+  assert.equal(flag(none.cfg), null, 'nothing chosen: the engine decides (--experts auto)');
+  assert.equal(none.capability, true);
+  assert.equal(flag((await run({ ds_experts: '5' })).cfg), '5');
+  assert.equal(flag((await run({ ds_experts: '6' }, ['--experts', '5'])).cfg), '6', 'the choice replaces an older flag');
+  assert.equal(flag((await run({ ds_experts: null }, ['--experts', '5'])).cfg), null, 'Default clears an older flag');
+  assert.equal('ds_experts' in (await run({ ds_experts: '5' })).cfg, false, 'the app-only key is not handed to the engine');
+  assert.equal(flag((await run({ ds_experts: '5' }, [], '0.1.60-windows-x86_64-cuda-cuda13')).cfg), '5', 'a newer engine knows it');
+  for (const old of ['0.1.49.2-windows-x86_64-cuda-cuda13', '0.1.49-linux-x86_64-cuda-cuda13']) {
+    const r = await run({ ds_experts: '5' }, [], old);
+    assert.equal(r.capability, false, `${old}: the choice is hidden`);
+    assert.equal(flag(r.cfg), null, `${old}: nothing is passed (it would end the start with "unknown option --experts")`);
+  }
 });
 
 test('packaged: no engine for this PC is the notice, and nothing is started', async () => {
