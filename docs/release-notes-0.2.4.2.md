@@ -7,6 +7,7 @@ Fixes for `strata launch` with DeepSeek and for the one-line installer. The Term
 - **Faster DeepSeek on AMD Ryzen 3000 / Threadripper 3000 / EPYC 7002 CPUs.** The 2.00 and IQ1_M sets answered up to 3x slower there; the answers are unchanged. The DeepSeek engine is now 0.1.49.1 (`strata-dsv41-0.1.49.1-windows-x86_64-cuda-cuda13`, `-linux-x86_64-cuda-cuda13` and `-linux-x86_64-hip-rx9070`).
 - **The right DeepSeek engine runs when you have more than one Strata install.** Launch now picks the newest DeepSeek engine package of the install that is running, and of the install your model's settings came from, instead of an old path saved in the model's settings.
 - **A plain message when GitHub cannot be reached.** DeepSeek setup checks for 10 seconds before it downloads anything and says in one line that GitHub is not reachable, instead of retrying for minutes.
+- **The DeepSeek engine updates itself.** A newer DeepSeek engine package in the signed feed is installed on the next `strata launch` (see Updating).
 - **DeepSeek no longer downloads the Qwen engine.** A DeepSeek launch does not fetch or test-start the Strata (Qwen) engine, the llama.cpp source or CUDA libraries it never uses. `strata launch --plan` no longer promises that download.
 - **The disk check counts only what is still to download.** If most of the model files are already in your models folder (also under the first release's file names), the model list no longer says "tight: needs more disk space". The room for the prepared model is still counted.
 - **Smaller wording fixes.** A setup message that ended with a full stop no longer gets a second one ("engine.."), and the second sentence of "The model could not be installed. The model does not answer sensibly after the preparation: ..." starts with a capital.
@@ -14,7 +15,7 @@ Fixes for `strata launch` with DeepSeek and for the one-line installer. The Term
 
 ## Updating
 
-- **DeepSeek engine:** `strata launch` fetches the DeepSeek engine package when none is installed. If you already have 0.1.49 installed and use one of the CPUs above, remove the `engine-dsv41` folder (or download the 0.1.49.1 package from this page and give it to `strata launch --dsv41-package PATH`) to get the faster one.
+- **DeepSeek engine:** it updates itself on the next launch. When the signed feed has a newer DeepSeek engine package for your PC (0.1.49.1 over 0.1.49), `strata launch` downloads it, checks it, starts it once, switches to it and removes the old one. If that fails you see one line and the engine you have keeps running; with no internet the launch goes on without waiting. An engine you gave with `--dsv41-package` or `STRATA_DSV41_EXE` is never replaced.
 
 - **From 0.2.4 or 0.2.4.1:** run `strata update` in the Terminal. It fetches Control 0.1.49.2 and the next `strata` command runs it (`strata --version` says 0.2.4.2).
 - **New installs:** use the command in the README (download `install.sh`, then run it).

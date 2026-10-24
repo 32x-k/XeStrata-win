@@ -7796,6 +7796,22 @@ def get_dsv41_engine(eng: Path, hip: bool, package: str | None = None) -> Path |
     return exe
 
 
+def upgrade_dsv41_engine(eng: Path, exe: Path) -> Path:
+    """The installed DeepSeek engine package is older than the signed feed's: updated next to it, switched after its test start, the old one removed
+    (strata_control.dsv41_engine.upgrade).  Silent when the feed cannot be reached; a failure is one plain line and `exe` keeps running."""
+    from strata_control import dsv41_engine
+    try:
+        from strata_cli import update_cmd
+        root = dsv41_engine_dir(eng)
+        source = update_cmd._feed_source(argparse.Namespace(feed=None), root.parent)
+        if not dsv41_engine.source_reachable(source):
+            return exe
+        new = dsv41_engine.upgrade(root, source, installed=exe, emit=lambda m: say("  " + m))
+    except Exception:                                      # noqa: BLE001 - never stop a setup for this
+        return exe
+    return new or exe
+
+
 def dsv41_exe(eng: Path) -> Path | None:
     """The DeepSeek-V4.1 engine (strata-dsv41): STRATA_DSV41_EXE (a build of your own), else its own package folder beside the engine (engine-dsv41/),
     else beside the engine in `eng` (an older all-in-one package); None when there is none."""
@@ -8029,6 +8045,9 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     if exe is None and not getattr(a, "build", False):
         get_dsv41_engine(eng, hip, getattr(a, "dsv41_package", None))
         exe = dsv41_exe(eng)
+    if (exe is not None and not getattr(a, "dsv41_package", None) and not getattr(a, "build", False)
+            and not (os.environ.get("STRATA_DSV41_EXE") or "").strip() and exe.parent.parent == dsv41_engine_dir(eng)):
+        exe = upgrade_dsv41_engine(eng, exe)               # an installed package older than the signed feed's: updated next to it, switched after it starts
     if exe is not None and exe.parent != Path(eng):
         lib_dirs = [*lib_dirs, str(exe.parent)]            # its own package carries the libraries it needs
     if exe is None:

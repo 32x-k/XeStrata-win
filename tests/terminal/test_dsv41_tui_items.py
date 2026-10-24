@@ -127,6 +127,7 @@ class OwnEngine(unittest.TestCase):
         f = mock.MagicMock()
         f.notices = []
         f.dsv41_engine_found.return_value = (found, True)
+        f.upgrade_dsv41_engine.side_effect = lambda path: path          # (the upgrade has its own tests: tests/terminal/test_dsv41_upgrade.py)
         return R.Runner.use_own_dsv41_engine, f
 
     def test_a_stale_path_in_the_config_is_replaced_by_this_installs_package(self):
