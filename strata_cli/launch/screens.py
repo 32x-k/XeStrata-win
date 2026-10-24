@@ -1455,7 +1455,8 @@ class SaveScreen(Base):
                  ("Context", S.context_label(s.context) + f", memory {s.kv or 'int8'}"),
                  ("Pictures", "on" if s.vision != "off" else "off"),
                  ("Parallel", f"{s.parallel} at a time" if s.parallel else f"fit to your card ({S.fit_parallel(self.ctx.computer.main_vram_gb)})"),
-                 ("Tuning", {"quick": "quick (about 20 min)", "thorough": "thorough (up to 2 h)", "skip": "skipped"}[s.tune]),
+                 ("Tuning", ({"quick": "quick (about 5-10 min)", "thorough": "thorough (about 10-15 min)", "skip": "skipped"} if s.family == "deepseek41"
+                              else {"quick": "quick (about 20 min)", "thorough": "thorough (up to 2 h)", "skip": "skipped"})[s.tune]),
                  ("Access", f"{S.ACCESS_WORDS[s.access]}, port {s.port}" + (", API key on" if s.api_key else ", no API key")),
                  ("Storage", s.data_dir or str(self.ctx.default_folder()))]
         if s.extra:
