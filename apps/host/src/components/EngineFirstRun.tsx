@@ -146,7 +146,7 @@ export function EngineFirstRun({ onDone }: { onDone: () => void }) {
             : <p>{tr("Strata did not recognise a supported graphics card.")}</p>;
         let main, actions;
         if (info.status === 'offer' && info.offer) {
-            main = <>{found}<p>{tr("To run models on it, Strata needs one download:")}<br/><strong>{tr("The engine for this card")} {'—'} {mb(info.offer.bytes)} MB</strong></p>
+            main = <>{found}<p>{tr("To run models on it, Strata needs one download:")}<br/><strong>{tr("The engine for this card")}: {mb(info.offer.bytes)} MB</strong></p>
                 <p className="small muted">{tr("It comes from Strata’s own update server and is checked before it is used. Your models and chats are never touched by it.")}</p></>;
             actions = <><Btn variant="primary" disabled={busy} onClick={() => void start()}>{tr(failed ? 'Continue' : 'Download the engine')}</Btn>{pick("I already have the file…")}</>;
         }
