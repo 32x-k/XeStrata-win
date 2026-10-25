@@ -7883,9 +7883,10 @@ def dsv41_manual_steps(eng: Path) -> str:
             "and run it again. Strata checks it before it is used.")
 
 
-def get_dsv41_engine(eng: Path, hip: bool, package: str | None = None) -> Path | None:
+def get_dsv41_engine(eng: Path, hip: bool, package: str | None = None, feed: str | None = None) -> Path | None:
     """The DeepSeek engine package next to the engine `eng`: one the person gave (--dsv41-package) or put in engine-dsv41/ by hand, else downloaded from
-    the signed feed.  Checked first either way; its strata-dsv41, or None when it cannot be had."""
+    the signed feed `feed` (--feed; else STRATA_UPDATE_FEED, a remembered https feed, or the release's).  Checked first either way; its
+    strata-dsv41, or None when it cannot be had."""
     from strata_control import dsv41_engine
     root = dsv41_engine_dir(eng)
     if package:
@@ -7900,7 +7901,7 @@ def get_dsv41_engine(eng: Path, hip: bool, package: str | None = None) -> Path |
             return exe
     acquisition.require("the DeepSeek engine")
     from strata_cli import update_cmd
-    source = update_cmd._feed_source(argparse.Namespace(feed=None), root.parent)
+    source = update_cmd._feed_source(argparse.Namespace(feed=feed), root.parent)
     say("  Downloading the DeepSeek engine (its own package, separate from the Strata engine) ...")
     hw = None
     if hip:
@@ -7912,14 +7913,15 @@ def get_dsv41_engine(eng: Path, hip: bool, package: str | None = None) -> Path |
     return exe
 
 
-def upgrade_dsv41_engine(eng: Path, exe: Path) -> Path:
-    """The installed DeepSeek engine package is older than the signed feed's: updated next to it, switched after its test start, the old one removed
-    (strata_control.dsv41_engine.upgrade).  Silent when the feed cannot be reached; a failure is one plain line and `exe` keeps running."""
+def upgrade_dsv41_engine(eng: Path, exe: Path, feed: str | None = None) -> Path:
+    """The installed DeepSeek engine package is older than the signed feed's (--feed, else STRATA_UPDATE_FEED, a remembered https feed,
+    or the release's): updated next to it, switched after its test start, the old one removed (strata_control.dsv41_engine.upgrade).
+    Silent when the feed cannot be reached; a failure is one plain line and `exe` keeps running."""
     from strata_control import dsv41_engine
     try:
         from strata_cli import update_cmd
         root = dsv41_engine_dir(eng)
-        source = update_cmd._feed_source(argparse.Namespace(feed=None), root.parent)
+        source = update_cmd._feed_source(argparse.Namespace(feed=feed), root.parent)
         if not dsv41_engine.source_reachable(source):
             return exe
         new = dsv41_engine.upgrade(root, source, installed=exe, emit=lambda m: say("  " + m))
@@ -8160,11 +8162,11 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
         fail("Strata can't reach GitHub to download the DeepSeek engine.",
              "Check the internet connection and run the same command again. " + dsv41_manual_steps(eng))
     if exe is None and not getattr(a, "build", False):
-        get_dsv41_engine(eng, hip, getattr(a, "dsv41_package", None))
+        get_dsv41_engine(eng, hip, getattr(a, "dsv41_package", None), getattr(a, "feed", None))
         exe = dsv41_exe(eng)
     if (exe is not None and not getattr(a, "dsv41_package", None) and not getattr(a, "build", False)
             and not (os.environ.get("STRATA_DSV41_EXE") or "").strip() and exe.parent.parent == dsv41_engine_dir(eng)):
-        exe = upgrade_dsv41_engine(eng, exe)               # an installed package older than the signed feed's: updated next to it, switched after it starts
+        exe = upgrade_dsv41_engine(eng, exe, getattr(a, "feed", None))   # an installed package older than the signed feed's: updated next to it, switched after it starts
     if exe is not None and exe.parent != Path(eng):
         from strata_control import dsv41_engine
         lib_dirs = [*lib_dirs, *dsv41_engine.lib_dirs(exe)]   # its own package, and the rocm/bin an AMD package keeps the ROCm DLLs in

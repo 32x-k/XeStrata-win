@@ -1,11 +1,11 @@
-# Which model? Sizes, versions and what fits
+﻿# Which model? Sizes, versions and what fits
 
 This page helps you choose a model and check that your computer can run it. It covers DeepSeek V4.1-Flash,
 Qwen3.8-Flash-Next (and its variants) and Qwen3.6-35B-A3B. For installing, see [INSTALL.md](INSTALL.md).
 
-> **On this page:** [Quick start](#quick-start) · [Pick by memory](#pick-by-memory) ·
-> [DeepSeek V4.1-Flash](#deepseek-v41-flash) · [Qwen3.8-Flash-Next](#qwen38-flash-next) ·
-> [Qwen3.6-35B-A3B](#qwen36-35b-a3b) · [Adding or switching models](#adding-or-switching-models) ·
+> **On this page:** [Quick start](#quick-start) Â· [Pick by memory](#pick-by-memory) Â·
+> [DeepSeek V4.1-Flash](#deepseek-v41-flash) Â· [Qwen3.8-Flash-Next](#qwen38-flash-next) Â·
+> [Qwen3.6-35B-A3B](#qwen36-35b-a3b) Â· [Adding or switching models](#adding-or-switching-models) Â·
 > [History](#history--older-measurements)
 
 ## Quick start
@@ -70,9 +70,9 @@ you have the disk. Perplexity is measured on a fixed set of 4,995 test texts; lo
 | --- | --- |
 | NVIDIA RTX 30, 40 and 50 series, 12 GB or more | Windows, Linux |
 | AMD Radeon AI PRO R9700 | Linux |
-| AMD Ryzen AI Max (Strix Halo, gfx1151, 64 GB or more shared) | Windows |
+| AMD Ryzen AI Max (Strix Halo, gfx1151, 128 GB unified; 64 GB or more shared with Windows) | Windows |
 
-Tested on an RTX 3060 (Linux), an RTX 5070 (Windows), four R9700 cards (Linux) and a Ryzen AI Max+ 395 with 64 GB (Windows:
+Tested on an RTX 3060 (Linux), an RTX 5070 (Windows), four R9700 cards (Linux) and a Ryzen AI Max+ 395 with 128 GB unified (Windows:
 14 to 16 tokens a second on code with the default Faster mode, 10 to 11 on chat, 78 tokens a second on a 4K prompt and 109 on
 8K). The RTX 30 kernels were also checked on an RTX A4000. Windows on RTX 30 and the RX 9070 are built but were not run. Mac
 and Strix Halo on Linux do not run it yet; on Strix Halo Windows the graphics memory is the RAM, so most of the experts are
@@ -344,3 +344,4 @@ above setup's RAM estimate for 47 GB and was installed with `--model Q2_0 --yes`
 | **UD-Q6_K_XL** | 54 | 76 | 1,020 |
 | **Q8_0** | 53 to 57 | 66 to 74 | 1,230 to 1,300 |
 | *IQ3_S, same card* | 75 | 95 | - |
+

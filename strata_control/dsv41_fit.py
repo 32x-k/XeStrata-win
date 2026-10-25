@@ -79,9 +79,10 @@ ISTA_MEASURED = ("an RTX 5070 (12 GB) with 64 GB of RAM and a 3.6 GB/s NVMe driv
                  "about 31 tokens a second")
 # A unified-memory APU (Ryzen AI Max "Strix Halo", gfx1151, Windows): the graphics chip and the CPU share one pool of RAM, so the
 # engine's expert tiers are one pool too.  The measured 64 GB box: 2.00 bpw, Faster (5 experts), DSpark auto, Adrenalin 26.10.1.
-UMA_RESERVE_GB = 8.0                  # kept for Windows, the desktop and the engine's buffers (measured min free 6.5-11 GB)
-UMA_MEASURED = ("a Ryzen AI Max+ 395 (Radeon 8060S, 64 GB shared with the CPU) on Windows: answers 14-16 tokens a second on code in the "
-                "default Faster mode (5 experts) and 10-11 on chat; a 4,000-token prompt 77-81 tokens a second, 8,000 tokens 108-111")
+UMA_RESERVE_GB = 12.0                 # kept for Windows, the desktop and the engine's buffers (the engine's own RAM store margin)
+UMA_MEASURED = ("a Ryzen AI Max+ 395 (Radeon 8060S, 128 GB unified: a 64 GB BIOS carve-out plus 64 GB seen by Windows) on Windows: answers "
+                "14-16 tokens a second on code in the default Faster mode (5 experts) and 10-11 on chat; a 4,000-token prompt 77-81 tokens a "
+                "second, 8,000 tokens 108-111")
 
 
 def variant(model: str | None) -> dict | None:
@@ -95,6 +96,21 @@ def uma_card(cards: list[dict] | None) -> dict | None:
     """The integrated Radeon a run uses, when the graphics memory is the PC's RAM (Ryzen AI Max, gfx1151): setup marks it `uma` (and
     `integrated`); a discrete card never is.  None on every other computer."""
     return next((c for c in cards or [] if c.get("uma") or c.get("integrated")), None)
+
+
+def uma_total_gb(card: dict, ram_gb: float | None) -> float:
+    """The one pool of a unified-memory PC, counted once: the RAM Windows sees plus the BIOS carve-out the GPU owns (the "shared"
+    part of the GPU's figure is that same RAM).  On the owner's Strix Halo: 64 GB + a 64 GB carve-out = 128 GB.  Without the carve-out
+    in the card's data, the GPU's figure less its shared part, or the larger of the two, is the best that can be said."""
+    ram = float(ram_gb or 0.0)
+    dedicated = float(card.get("dedicated_gb") or 0.0)
+    if dedicated > 0:
+        return ram + dedicated
+    vram = float(card.get("vram_gb") or 0.0)
+    shared = float(card.get("shared_gb") or 0.0)
+    if vram > 0 and shared > 0:
+        return ram + max(0.0, vram - shared)
+    return max(ram, vram)
 
 
 def variant_key(model: str | None) -> str | None:
@@ -261,7 +277,7 @@ def _plan_uma(key: str, model: str, card: dict, ram_gb: float | None, disk_free_
     counted once.  The engine holds what fits beside the dense weights and the reserve and reads the rest from the SSD; the numbers in
     UMA_MEASURED are the measured 64 GB box.  Never a refusal."""
     v = ISTA_SETS[key]
-    total = float(ram_gb or 0.0) or float(card.get("vram_gb") or 0.0)
+    total = uma_total_gb(card, ram_gb)
     expert_gb = v["experts_gb"] / EXPERTS
     set_gb = v["set_bytes"] / GB
     download = ista_download_bytes(model) / GB
@@ -289,8 +305,8 @@ def _plan_uma(key: str, model: str, card: dict, ram_gb: float | None, disk_free_
     lines.append("The n-gram table stays on the SSD and is read a few rows for each word: use an NVMe drive for the model files (a slow "
                  "disk makes every word slower). The same table serves every IST-DAS set, so installing another one downloads it once.")
     name = card.get("name") or "the built-in Radeon"
-    lines.append(f"{name} shares this PC's RAM: one pool of {total:.0f} GB holds the model and the graphics memory together. About "
-                 f"{resident:.0f} GB of the {float(v['experts_gb']):.0f} GB of experts stay in memory beside {ISTA_DENSE_GB:.1f} GB of "
+    lines.append(f"{name} shares this PC's memory: the RAM and the GPU's BIOS carve-out are one pool of {total:.0f} GB. About "
+                 f"{resident:.0f} GB of the {float(v['experts_gb']):.0f} GB of experts stay in it beside {ISTA_DENSE_GB:.1f} GB of "
                  f"dense weights and {UMA_RESERVE_GB:.0f} GB kept for Windows; the other {streamed:.0f} GB are read from the SSD while it answers.")
     lines.append(f"Measured on this kind of PC: {UMA_MEASURED}.")
     if streamed > 0.5:
@@ -300,11 +316,11 @@ def _plan_uma(key: str, model: str, card: dict, ram_gb: float | None, disk_free_
     elif total >= float(v.get("ram_ok_gb") or 0):
         out["verdict"] = "tight"
         if total < 48:
-            warns.append(f"This PC has {total:.0f} GB of memory shared with the graphics chip and the model was measured on 64 GB: with less, "
+            warns.append(f"This PC has {total:.0f} GB of memory shared with the graphics chip and the model was measured on 128 GB: with less, "
                          "more experts come from the SSD and each word takes longer. It still runs.")
     else:
         out["verdict"] = "spills"
-        warns.append(f"This PC has {total:.0f} GB of memory shared with the graphics chip and the model was measured on 64 GB: most of its "
+        warns.append(f"This PC has {total:.0f} GB of memory shared with the graphics chip and the model was measured on 128 GB: most of its "
                      "experts are read from the SSD while it answers, so it is slow (a word can take seconds). The smaller 1.75 bpw set "
                      "suits this computer better. It is still allowed.")
     if disk_free_gb is not None and disk_free_gb < need_disk:

@@ -889,6 +889,8 @@ class Runner:
             args += ["--gguf-dir", str(p if p.is_dir() else p.parent)]
         if s.dsv41_package and s.family == "deepseek41":
             args += ["--dsv41-package", s.dsv41_package]
+        if self.feed:                                     # --feed / STRATA_UPDATE_FEED: setup fetches the DeepSeek engine from it too
+            args += ["--feed", str(self.feed)]
         if s.gpu_roles:
             args += ["--gpu-roles", ",".join(f"{k}={v}" for k, v in sorted(s.gpu_roles.items(), key=lambda kv: int(kv[0])))]
         elif s.gpus:
