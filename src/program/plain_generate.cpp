@@ -597,6 +597,7 @@ static void plain_usage(const std::string& arch) {
                  "  --max-t N            the decode window's most tokens (default 8)\n"
                  "  --spec N             speculative decoding with the model's MTP layer: windows of up to N tokens,\n"
                  "                       the last one and N - 1 drafts (default 3; 0: off; greedy only)\n"
+                 "  --kv-ram on|off      GLM-5.3-Flash: the DSA layers' latent cells in RAM, their VRAM to the experts (on)\n"
                  "  --spec-window all|auto|min-p  how many drafts a window checks: all (default); auto while each is\n"
                  "                       expected to raise the tokens per ms at the measured window costs; or while\n"
                  "                       each is at least --spec-min-p P likely under the MTP layer\n"
@@ -754,6 +755,14 @@ int plain_main(int argc, char** argv) {
             opt.expert_slots = v == "auto" ? -1 : std::max<int64_t>(0, std::strtoll(v.c_str(), nullptr, 10));
         }
         else if (a == "--adapt-decay") opt.adapt_decay = std::strtof(next("--adapt-decay"), nullptr);
+        else if (a == "--kv-ram") {
+            const std::string v = next("--kv-ram");
+            if (v != "on" && v != "off") {
+                std::fprintf(stderr, "strata (%s): --kv-ram takes on or off\n", arch.c_str());
+                return 2;
+            }
+            opt.kv_ram = v == "on";
+        }
         else if (a == "--kv") {   // fp16 or int8; Qwen3.8-Flash-Next's q4 and k8v4 have no kernels here
             const std::string v = next("--kv");
             if (v != "fp16" && v != "int8") {

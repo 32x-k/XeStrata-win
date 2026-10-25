@@ -58,6 +58,13 @@ struct PlainOptions {
     /// --kv int8: the attention layers' K and V as int8 codes with an FP16 scale per 64 values (kv_q8.hpp), half the
     /// FP16 cache's bytes; the answers differ slightly.  Not GLM-5.3-Flash's DSA caches.
     bool kv_int8 = false;
+    /// --kv-ram on|off (GLM-5.3-Flash): the DSA layers' MLA latent cells in host memory instead of VRAM, which goes to
+    /// the expert tier: a window copies the cells each token selected into VRAM once (glm5_latent_gather), a prompt
+    /// chunk the layer's cells up to it (Project Maya #86's idea, written anew: there the cells live in VRAM slots).
+    /// On by default: with 128K cells the B70's tier went 2,150 -> 2,322 slots and decode 3.84 -> 3.94 tok/s at 56 GB
+    /// of RAM; the RTX 4070 started at all (it had 161 MiB left for the tier), and at 64K went 86 -> 172 slots, its
+    /// prompt 3.3 -> 7.1 tok/s and decode 2.32 -> 2.30 (UD-IQ3_XXS, 1K + 256, 2026-10-26).  The other models: off.
+    bool kv_ram = true;
     /// --vram-elastic (#533; --serve, one GPU with virtual memory): the expert slots in physical segments of
     /// vram_segment_mib that `vram` gives back to the driver and maps again between requests
     bool vram_elastic = false;
@@ -570,6 +577,9 @@ private:
     // the drafts' head over opt_.draft_vocab's subset (null: the whole head); a draft's pick is its index there
     void* dhead_ = nullptr;
     std::unique_ptr<DraftHeadInt2> int2_;   ///< the drafts' head at 2 bits (null: as it is)
+    /// --kv-ram: a window's gathered latent rows [max_t][g_gather_stride_][L] and a prompt chunk's layer of cells
+    uint16_t *g_lat_gather_ = nullptr, *g_lat_stage_ = nullptr;
+    int64_t g_gather_stride_ = 0;
     int64_t n_dvocab_ = 0;
     std::vector<int32_t> dvocab_;
     bool mtp_h_set_ = false;   ///< prompt() left the trunk's last row in mtp_h_ (else forward's last row in hn_)

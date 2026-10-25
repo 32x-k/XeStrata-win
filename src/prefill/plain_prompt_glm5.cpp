@@ -224,7 +224,16 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                         prod(b.k_b.type, (const uint8_t*) b.k_b.data + h * kb, QK, KVR, P.g_qbT + h * T * QK, QK,
                              P.g_absT + h * T * KVR, T, KVR);
                     k::glm5_transpose_abd(P.g_absT, P.g_abs, H, T, KVR, cs);
-                    k::glm5_mla_attn(P.g_abs, g_latent_[(size_t) d], P.g_ids, g_cap_, P.g_steps, (int) H,
+                    // --kv-ram: the layer's cells up to the chunk's last into VRAM, read there
+                    const uint16_t* lat = g_latent_[(size_t) d];
+                    if (g_lat_stage_ != nullptr) {
+                        if (!strata::gpu::copy_async(g_lat_stage_, lat, (size_t) ((p0 + T) * KVR) * 2, cs)) {
+                            err = std::string("plain prompt: --kv-ram's cells: ") + strata::gpu::last_error();
+                            return false;
+                        }
+                        lat = g_lat_stage_;
+                    }
+                    k::glm5_mla_attn(P.g_abs, lat, P.g_ids, g_cap_, P.g_steps, (int) H,
                                      1.0f / std::sqrt((float) QK), T, P.g_lat, cs,
                                      s.idx_kpool_select_tail ? (int) s.idx_kpool : 0);
                     k::glm5_transpose_abd(P.g_lat, P.g_latT, T, H, KVR, cs);

@@ -294,15 +294,18 @@ bool PlainModel::load_glm5(std::string& err) {
         if (!mine(false, i)) continue;
         float *ic = nullptr, *pl = nullptr;
         uint16_t* lat = nullptr;
+        void* lat_host = nullptr;   // --kv-ram: the cells in host memory the GPU reads (lat its device address)
         if (!strata::gpu::alloc_device(&ic, (size_t) (cells * 2 * ID) * 4) ||
             !strata::gpu::alloc_device(&pl, (size_t) (g_max_blocks_ * ID) * 4) ||
-            !strata::gpu::alloc_device(&lat, (size_t) (cells * KVR) * 2)) {
-            err = "plain model: no VRAM for the DSA caches (" + std::to_string(cells) + " cells)";
+            !(opt_.kv_ram ? mapped((size_t) (cells * KVR) * 2, &lat_host, (void**) &lat)
+                          : strata::gpu::alloc_device(&lat, (size_t) (cells * KVR) * 2))) {
+            err = "plain model: no " + std::string(opt_.kv_ram ? "RAM" : "VRAM") + " for the DSA caches (" +
+                  std::to_string(cells) + " cells)";
             return false;
         }
         allocs_.push_back(ic);
         allocs_.push_back(pl);
-        allocs_.push_back(lat);
+        allocs_.push_back(opt_.kv_ram ? lat_host : (void*) lat);
         g_idx_cache_[(size_t) i] = ic;
         g_pooled_[(size_t) i] = pl;
         g_latent_[(size_t) i] = lat;
@@ -312,6 +315,19 @@ bool PlainModel::load_glm5(std::string& err) {
         qs.idx_block = s.idx_kpool;
         qs.idx_top_k = s.idx_top_k;
         g_cap_ = k::qsa_selection_width(k::kTopkMaxCells, qs);
+    }
+    if (opt_.kv_ram && n_dsa > 0) {   // the window's gathered rows and the prompt's layer of cells, in VRAM
+        g_gather_stride_ = g_cap_ + (s.idx_kpool_select_tail && s.idx_kpool > 1 ? s.idx_kpool - 1 : 0);
+        if (!strata::gpu::alloc_device(&g_lat_gather_, (size_t) (opt_.max_t * g_gather_stride_ * KVR) * 2) ||
+            !strata::gpu::alloc_device(&g_lat_stage_, (size_t) (cells * KVR) * 2)) {
+            err = "plain model: no VRAM for --kv-ram's buffers";
+            return false;
+        }
+        allocs_.push_back(g_lat_gather_);
+        allocs_.push_back(g_lat_stage_);
+        std::fprintf(stderr, "strata plain: --kv-ram: the DSA latent cells in RAM (%.1f MiB), %.1f MiB of VRAM for them\n",
+                     (double) (n_dsa * cells * KVR * 2) / 1048576.0,
+                     (double) ((opt_.max_t * g_gather_stride_ + cells) * KVR * 2) / 1048576.0);
     }
 
     // the window's buffers
@@ -514,8 +530,16 @@ void PlainModel::record_dsa(const GBlock& b, int T, strata::gpu::Stream cs) {
                            g_xq_ + k::native_q8_1_rows_bytes((int) QK, h * T), g_absT_ + h * T * KVR, (int) QK,
                            (int) KVR, T, cs);
         k::glm5_transpose_abd(g_absT_, g_abs_, H, T, KVR, cs);
-        k::glm5_mla_attn(g_abs_, g_latent_[(size_t) d], g_ids_, g_cap_, g_steps_, (int) H, 1.0f / std::sqrt((float) QK),
-                         T, g_lat_, cs, s.idx_kpool_select_tail ? (int) s.idx_kpool : 0);
+        const int tail = s.idx_kpool_select_tail ? (int) s.idx_kpool : 0;
+        if (g_lat_gather_ != nullptr) {   // --kv-ram: each token's cells from RAM once, the attention over them
+            k::glm5_latent_gather(g_latent_[(size_t) d], g_ids_, g_cap_, g_steps_, T, tail, g_gather_stride_, g_lat_gather_,
+                                  cs);
+            k::glm5_mla_attn(g_abs_, g_lat_gather_, g_ids_, g_cap_, g_steps_, (int) H, 1.0f / std::sqrt((float) QK), T,
+                             g_lat_, cs, tail, g_gather_stride_);
+        } else {
+            k::glm5_mla_attn(g_abs_, g_latent_[(size_t) d], g_ids_, g_cap_, g_steps_, (int) H,
+                             1.0f / std::sqrt((float) QK), T, g_lat_, cs, tail);
+        }
         k::glm5_transpose_abd(g_lat_, g_latT_, T, H, KVR, cs);
         k::native_quantize_q8_1_rows(g_latT_, g_xq_, (int) KVR, H * T, cs);
         for (int64_t h = 0; h < H; ++h)
