@@ -26,6 +26,16 @@
 // moves the output by 0.0), so open() keeps 1 / 3 of the weights of the twelve T = 1 convolutions, 340 M
 // numbers of them no image ever reads.  The activations are channels-last ([pixel][channel]) like the other
 // VAEs', the pixels the linear (t, y, x) index.
+//
+// The ENCODER (an edit's reference image into its latent, the reference's `vae_encode`) is the same graph the
+// other way (VAE.md's section 4, held to the reference at rel 3.1e-6 on the moments): the image replicated into
+// four frames -> conv_in (3 -> 128) -> five down levels of two ResnetBlocks each with a DownsampleDCAE after the
+// first four (space /2 each; time /2 at the third and fourth, 4 -> 1) -> mid block_1, attn_1, block_2 -> a
+// shortcut that averages the 1024 channels in 16s to 64 -> norm_out, swish, conv_out (1024 -> 64) + the shortcut
+// = the moments, whose first 32 channels are the posterior's mean.  A DownsampleDCAE is a conv to out / factor
+// channels, then "b c (f r1) (h r2) (w r3) -> b (r1 r2 r3 c) f h w", plus the input folded the same way and
+// averaged in groups of factor * in / out channels.  encode() gives the mean times scaling_factor: the reference
+// samples the posterior with a generator, and the mean is the deterministic choice (the golden takes it too).
 #pragma once
 
 #include "strata/prefill/gemm.hpp"
@@ -46,13 +56,22 @@ public:
     /// Reads the VAE's safetensors (the data folder's hy3/vae/hunyuan_image_3_vae_fp16.safetensors: 280 tensors, all F16, the
     /// reference's decoder.* names) and puts the decoder's weights on the current GPU.  `dry`: sizes only,
     /// nothing uploaded; such a part cannot run.
-    bool open(const std::string& path, void* stream, std::string& err, bool dry = false);
+    bool open(const std::string& path, void* stream, std::string& err, bool dry = false, bool encoder = false);
+    /// Whether open() read the encoder's weights too (encode() needs them).
+    bool has_encoder() const { return enc_open_; }
 
     /// rgb [3][16 h][16 w] (device FP32, about -1 .. 1 - the reference's decoder's own output, the last frame)
     /// from the DiT's latent z [32][h][w] (device FP32, model space: the decode divides by scaling_factor
     /// first, where the reference's pipeline does).  `dump` (empty, or a directory): the probe's stage-by-stage
     /// look - every stage boundary is also written to <dump>/NN_name.bin as FP32 [pixels][channels].
     void decode(const float* z, int64_t h, int64_t w, float* rgb, const std::string& dump = std::string());
+
+    /// z [32][H/16][W/16] (device FP32, model space: the posterior's mean times scaling_factor, as the DiT's latent
+    /// is) from an image rgb [3][H][W] (device FP32, -1 .. 1; H and W multiples of 16): the reference's `vae_encode`
+    /// with the mean in place of a sample.  Needs open(..., encoder = true).
+    void encode(const float* rgb, int64_t H, int64_t W, float* z, const std::string& dump = std::string());
+    /// The GPU memory an encode of an H x W image works in (the buffers, besides the weights).
+    uint64_t encode_scratch_bytes(int64_t H, int64_t W) const;
 
     /// The model's vae scaling_factor: the data folder's hy3/config.json `vae.scaling_factor`, what the decode divides by.
     static double scaling_factor() { return kScalingFactor; }
@@ -79,8 +98,14 @@ private:
         Conv up;                            // up.out 0: no upsample
         int temporal = 0;                   // 1: r1 = 2 (the time doubles too), 0: r1 = 1
     };
+    struct Down {                           // a down level: two blocks, then a DCAE downsample (down.4: none)
+        Res r[2];
+        Conv down;                          // down.out 0: no downsample; else its conv's out = level out / factor
+        int64_t out = 0;                    // the level's output channels after the downsample
+        int temporal = 0;                   // 1: r1 = 2 (the time halves too), 0: r1 = 1
+    };
 
-    Conv conv_w(class SafeTensors& st, const std::string& name, int64_t kt);
+    Conv conv_w(class SafeTensors& st, const std::string& name, int64_t kt, int64_t pad_in = 0);
     Conv point_w(class SafeTensors& st, const std::string& name);
     const float* vec(class SafeTensors& st, const std::string& name);
     Res res_w(class SafeTensors& st, const std::string& p, int64_t kt);
@@ -94,6 +119,9 @@ private:
                   const std::string& tag = std::string());
     void attention(float* x, int64_t P, int64_t C, const std::string& tag = std::string());
     void upsample(const Up& u, const float* x, int64_t T, int64_t H, int64_t W, int64_t C, float* y);
+    void downsample(const Down& d, const float* x, int64_t T, int64_t H, int64_t W, int64_t C, float* y);
+    void attention_w(const float* g, const float* b, const Conv& q, const Conv& k, const Conv& v, const Conv& proj,
+                     float* x, int64_t P, int64_t C, const std::string& tag);
     void dump_stage(const std::string& dir, int index, const std::string& name, const float* p, int64_t n);
 
     void* s_ = nullptr;
@@ -108,6 +136,14 @@ private:
     Conv aq_, ak_, av_, aproj_;
     Up up_[5];
     const float *gout_ = nullptr, *bout_ = nullptr;
+    // the encoder (open(..., encoder = true))
+    bool enc_open_ = false;
+    Conv ecin_, ecout_;
+    Down down_[5];
+    Res emid0_, emid2_;
+    const float *eag_ = nullptr, *eab_ = nullptr;
+    Conv eaq_, eak_, eav_, eaproj_;
+    const float *egout_ = nullptr, *ebout_ = nullptr;
     // scratch, grown on demand
     int64_t cap32_ = 0, cap16_ = 0, col_cap_ = 0, score_cap_ = 0;
     float *t0_ = nullptr, *t1_ = nullptr, *tmp32_ = nullptr, *scores_ = nullptr, *gn_ws_ = nullptr;

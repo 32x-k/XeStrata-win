@@ -174,6 +174,55 @@ void dcae_split(const float* conv, const float* x, int64_t T, int64_t H, int64_t
     });
 }
 
+// The encoder's input: rgb [3][HW] (-1 .. 1, FP32) as the T replicated frames' FP16 rows in16 [T HW][Cp], the
+// three channels in the first of the Cp (8: the unfold's vec8) and zeros in the rest.  The reference's encode
+// expands a one-frame image to ffactor_temporal frames before conv_in.
+void rgb_frames16(const float* rgb, int64_t HW, int64_t T, int64_t Cp, uint16_t* in16, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (T * HW * Cp)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i % Cp, p = (i / Cp) % HW;
+        in16[i] = c < 3 ? f16_from_f32(rgb[c * HW + p]) : (uint16_t) 0;
+    });
+}
+
+// The DownsampleDCAE's fold: out [(f, hh, ww)][m Cc + c] = conv[(f r1 + i1, 2 hh + i2, 2 ww + i3)][c] with
+// m = (i1 2 + i2) 2 + i3, plus the shortcut: the input x [P][I] folded the same way into factor * I channels
+// and averaged in groups of `group` = factor I / (factor Cc) consecutive folded channels - einops "b c (f r1)
+// (h r2) (w r3) -> b (r1 r2 r3 c) f h w" on both, then view(out, group).mean(2) on the input's
+void dcae_fold_down(const float* conv, const float* x, int64_t T, int64_t H, int64_t W, int64_t Cc, int64_t I,
+                    int64_t r1, int64_t group, float* out, void* s) {
+    const int64_t TP = T / r1, HP = H / 2, WP = W / 2, O = 4 * r1 * Cc;
+    q_of(s).parallel_for(sycl::range<1>((size_t) (TP * HP * WP * O)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t o = i % O, op = i / O;
+        const int64_t ww = op % WP, hh = (op / WP) % HP, f = op / (WP * HP);
+        const int64_t m = o / Cc, c = o % Cc;
+        const int64_t i1 = m / 4, i2 = (m / 2) % 2, i3 = m % 2;
+        const int64_t p = ((f * r1 + i1) * H + 2 * hh + i2) * W + 2 * ww + i3;
+        float sum = 0.f;
+        for (int64_t g = 0; g < group; ++g) {
+            const int64_t fc = o * group + g, mm = fc / I, ci = fc % I;
+            const int64_t j1 = mm / 4, j2 = (mm / 2) % 2, j3 = mm % 2;
+            sum += x[(((f * r1 + j1) * H + 2 * hh + j2) * W + 2 * ww + j3) * I + ci];
+        }
+        out[i] = conv[p * Cc + c] + sum / (float) group;
+    });
+}
+
+// The encoder's head: z[c][p] = sf * (conv_out[p][c] + mean_{r < group} h[p][c group + r]) for c < zc - the
+// reference's shortcut "b (c r) f h w -> b c r f h w".mean(2) added to conv_out's 2 zc channels, of which the
+// first zc are the posterior's mean; channels-first, as the DiT's latent is
+void encoder_head(const float* conv, const float* h, int64_t P, int64_t Cin, int64_t Cout, int64_t group, int64_t zc,
+                  float sf, float* z, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (P * zc)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i / P, p = i % P;
+        float sum = 0.f;
+        for (int64_t r = 0; r < group; ++r) sum += h[p * Cin + c * group + r];
+        z[i] = sf * (conv[p * Cout + c] + sum / (float) group);
+    });
+}
+
 // rgb [3][H W] = the LAST of the T frames: the reference's decode keeps decoded[:, :, -1:] (the four frames are
 // different pictures 13 - 22 dB apart, VAE.md's measurement - the wrong one is a wrong image, not a detail)
 void last_frame(const float* x, int64_t T, int64_t H, int64_t W, float* rgb, void* s) {
@@ -195,13 +244,15 @@ HunyuanImage3Vae::~HunyuanImage3Vae() {
 
 // A 3 x 3 x 3 convolution's weight [O][I][3][3][3] (F16 in the file) as the product's W[O][kt * 9 I] with the
 // taps in (dt, dy, dx) order, matching im2col3d.  kt 1 keeps the center time tap alone.
-HunyuanImage3Vae::Conv HunyuanImage3Vae::conv_w(SafeTensors& st, const std::string& name, int64_t kt) {
+HunyuanImage3Vae::Conv HunyuanImage3Vae::conv_w(SafeTensors& st, const std::string& name, int64_t kt,
+                                                int64_t pad_in) {
     const SafeTensor* t = st.find(name + ".weight");
     if (t == nullptr || t->shape.size() != 5 || t->shape[2] != 3 || t->shape[3] != 3 || t->shape[4] != 3)
         throw std::runtime_error("image engine (HunyuanImage 3.0 VAE): no 3x3x3 " + name);
     Conv c;
     c.out = t->shape[0];
-    c.in = t->shape[1];
+    const int64_t in_file = t->shape[1];
+    c.in = std::max(in_file, pad_in);   // pad_in: the product reads this many channels, the extra ones zero
     c.kt = kt;
     const int64_t K = kt * 9 * c.in;
     if (dry_) {
@@ -210,14 +261,14 @@ HunyuanImage3Vae::Conv HunyuanImage3Vae::conv_w(SafeTensors& st, const std::stri
         return c;
     }
     const auto w = st.f32(name + ".weight");   // [O][I][3][3][3]
-    std::vector<uint16_t> h((size_t) (c.out * K));
+    std::vector<uint16_t> h((size_t) (c.out * K), 0);
     for (int64_t o = 0; o < c.out; ++o)
-        for (int64_t i = 0; i < c.in; ++i)
+        for (int64_t i = 0; i < in_file; ++i)
             for (int64_t tap = 0; tap < kt * 9; ++tap) {
                 const int64_t dt = kt == 3 ? tap / 9 : 1;   // kt 1 takes the center tap
                 const int64_t dy = (tap % 9) / 3, dx = tap % 3;
                 h[(size_t) (o * K + tap * c.in + i)] =
-                    kernels::f16_from_f32(w[((size_t) (o * c.in + i) * 3 + dt) * 9 + dy * 3 + dx]);
+                    kernels::f16_from_f32(w[((size_t) (o * in_file + i) * 3 + dt) * 9 + dy * 3 + dx]);
             }
     uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
     gpu::copy(d, h.data(), h.size() * 2);
@@ -278,11 +329,40 @@ HunyuanImage3Vae::Res HunyuanImage3Vae::res_w(SafeTensors& st, const std::string
     return r;
 }
 
-bool HunyuanImage3Vae::open(const std::string& path, void* stream, std::string& err, bool dry) {
+bool HunyuanImage3Vae::open(const std::string& path, void* stream, std::string& err, bool dry, bool encoder) {
     try {
         s_ = stream;
         dry_ = dry;
         SafeTensors st(path);
+        if (encoder) {
+            // The encoder's time depth (VAE.md's section 4): four frames through conv_in, the down.0 - down.2 levels
+            // and down.2's downsample (temporal: 4 -> 2), two through down.3 and its downsample (2 -> 1), one from
+            // down.4 to the head.  conv_in reads the image's 3 channels padded to the unfold's 8.
+            ecin_ = conv_w(st, "encoder.conv_in", 3, 8);
+            for (int64_t i = 0; i < 5; ++i) {
+                const std::string p = "encoder.down." + std::to_string(i) + ".";
+                const int64_t kt = i <= 3 ? 3 : 1;
+                for (int64_t j = 0; j < 2; ++j)
+                    down_[i].r[j] = res_w(st, p + "block." + std::to_string(j) + ".", kt);
+                if (i < 4) {
+                    down_[i].down = conv_w(st, p + "downsample.conv", kt);
+                    down_[i].temporal = i >= 2 ? 1 : 0;
+                    down_[i].out = down_[i].down.out * 4 * (down_[i].temporal ? 2 : 1);
+                }
+            }
+            emid0_ = res_w(st, "encoder.mid.block_1.", 1);
+            emid2_ = res_w(st, "encoder.mid.block_2.", 1);
+            eag_ = vec(st, "encoder.mid.attn_1.norm.weight");
+            eab_ = vec(st, "encoder.mid.attn_1.norm.bias");
+            eaq_ = point_w(st, "encoder.mid.attn_1.q");
+            eak_ = point_w(st, "encoder.mid.attn_1.k");
+            eav_ = point_w(st, "encoder.mid.attn_1.v");
+            eaproj_ = point_w(st, "encoder.mid.attn_1.proj_out");
+            egout_ = vec(st, "encoder.norm_out.weight");
+            ebout_ = vec(st, "encoder.norm_out.bias");
+            ecout_ = conv_w(st, "encoder.conv_out", 1);
+            enc_open_ = true;
+        }
         // The grid's time depth per stage (VAE.md's decode table): T = 1 through conv_in, the mid blocks and the
         // up.0 level; 2 at up.1; 4 from up.2 to the head - the two temporal DCAE upsamples (ffactor_temporal 4)
         // sit after up.0 and up.1, the spatial ones (x2 each, ffactor_spatial 16) after up.2 and up.3.  So the
@@ -399,14 +479,19 @@ void HunyuanImage3Vae::resblock(const Res& r, const float* x, int64_t T, int64_t
 // turn, q16 / k16 / vt16 a16_ past the normed tokens (a16_ is read by the three products only until the split
 // overwrites its head again), the probabilities the head of col16_ (no unfold band is live here).
 void HunyuanImage3Vae::attention(float* x, int64_t P, int64_t C, const std::string& tag) {
-    groupnorm(x, ag_, ab_, P, C, false, a16_, tag);
+    attention_w(ag_, ab_, aq_, ak_, av_, aproj_, x, P, C, tag);
+}
+
+void HunyuanImage3Vae::attention_w(const float* g, const float* b, const Conv& aq, const Conv& ak, const Conv& av,
+                                   const Conv& aproj, float* x, int64_t P, int64_t C, const std::string& tag) {
+    groupnorm(x, g, b, P, C, false, a16_, tag);
     float* qkv = tmp32_;
-    gemm_.f16(a16_, aq_.w, qkv, P, C, C, 3 * C);
-    gemm_.f16(a16_, ak_.w, qkv + C, P, C, C, 3 * C);
-    gemm_.f16(a16_, av_.w, qkv + 2 * C, P, C, C, 3 * C);
-    bias_add_ld(qkv, aq_.b, P, C, 3 * C, s_);
-    bias_add_ld(qkv + C, ak_.b, P, C, 3 * C, s_);
-    bias_add_ld(qkv + 2 * C, av_.b, P, C, 3 * C, s_);
+    gemm_.f16(a16_, aq.w, qkv, P, C, C, 3 * C);
+    gemm_.f16(a16_, ak.w, qkv + C, P, C, C, 3 * C);
+    gemm_.f16(a16_, av.w, qkv + 2 * C, P, C, C, 3 * C);
+    bias_add_ld(qkv, aq.b, P, C, 3 * C, s_);
+    bias_add_ld(qkv + C, ak.b, P, C, 3 * C, s_);
+    bias_add_ld(qkv + 2 * C, av.b, P, C, 3 * C, s_);
     uint16_t *q16 = a16_ + P * C, *k16 = a16_ + 2 * P * C, *vt16 = a16_ + 3 * P * C;
     split_qkv16(qkv, P, C, q16, k16, vt16, s_);
     gemm_.f16(q16, k16, scores_, P, P, C);
@@ -414,9 +499,20 @@ void HunyuanImage3Vae::attention(float* x, int64_t P, int64_t C, const std::stri
     softmax16(scores_, P, P, 1.0f / std::sqrt((float) C), p16, s_);
     gemm_.f16(p16, vt16, tmp32_, P, C, P);   // O = P . V (V^T's rows are V's columns)
     qi_to_f16(tmp32_, P * C, a16_, s_);
-    gemm_.f16(a16_, aproj_.w, tmp32_, P, C, C);
-    bias_add(tmp32_, aproj_.b, P, C, s_);
+    gemm_.f16(a16_, aproj.w, tmp32_, P, C, C);
+    bias_add(tmp32_, aproj.b, P, C, s_);
     hunyuanimage3_add(x, tmp32_, P * C, s_);
+}
+
+// The DCAE downsample: the conv (its input's T decides the time taps), then the fold and the averaged shortcut in
+// one gather over the conv's output - the reference's rearrange of both and the view(...).mean(2)
+void HunyuanImage3Vae::downsample(const Down& d, const float* x, int64_t T, int64_t H, int64_t W, int64_t C,
+                                  float* y) {
+    const int64_t P = T * H * W;
+    qi_to_f16(x, P * C, a16_, s_);
+    conv(d.down, a16_, T, H, W, tmp32_);
+    const int64_t r1 = d.temporal ? 2 : 1, factor = 4 * r1;
+    dcae_fold_down(tmp32_, x, T, H, W, d.down.out, C, r1, factor * C / d.out, y, s_);
 }
 
 // The DCAE upsample: the conv (its input's T decides the time taps), then the split and the shortcut in one
@@ -511,6 +607,66 @@ void HunyuanImage3Vae::decode(const float* z, int64_t h, int64_t w, float* rgb, 
     last_frame(tmp32_, T, H, W, rgb, s_);
     gpu::stream_sync(s_);
     dump_.clear();
+}
+
+void HunyuanImage3Vae::encode(const float* rgb, int64_t H, int64_t W, float* z, const std::string& dump) {
+    if (!enc_open_) throw std::runtime_error("image engine (HunyuanImage 3.0 VAE): the encoder is not open");
+    if (H % 16 != 0 || W % 16 != 0 || H <= 0 || W <= 0)
+        throw std::invalid_argument("image engine (HunyuanImage 3.0 VAE): the image's sides must be multiples of 16");
+    dump_ = dump;
+    const int64_t HW = H * W, hw = HW / 256;
+    // the widest stage: conv_in's four frames of 128 channels over the image = 512 HW (the decoder's widest is
+    // the same count at that latent); the attention is the T = 1 grid of h x w positions
+    const int64_t big32 = 512 * HW, p_attn = hw;
+    grow(big32, big32, std::max(kColBytes / 2, p_attn * p_attn), p_attn * p_attn);
+    int64_t T = 4;
+    rgb_frames16(rgb, HW, T, ecin_.in, a16_, s_);
+    conv(ecin_, a16_, T, H, W, t0_);
+    float* x = t0_;
+    int64_t C = ecin_.out, Hc = H, Wc = W;
+    dump_stage(1, "enc_conv_in", x, T * Hc * Wc * C);
+    for (int64_t i = 0; i < 5; ++i) {
+        for (int64_t j = 0; j < 2; ++j) {
+            float* y = x == t0_ ? t1_ : t0_;
+            const std::string tag = "down" + std::to_string(i) + "_b" + std::to_string(j);
+            resblock(down_[i].r[j], x, T, Hc, Wc, C, y, tag);
+            x = y;
+            dump_stage(10 + (int) (i * 3 + j), tag, x, T * Hc * Wc * C);
+        }
+        if (down_[i].out > 0) {
+            float* y = x == t0_ ? t1_ : t0_;
+            downsample(down_[i], x, T, Hc, Wc, C, y);
+            x = y;
+            C = down_[i].out;
+            if (down_[i].temporal) T /= 2;
+            Hc /= 2;
+            Wc /= 2;
+            dump_stage(30 + (int) i, "down" + std::to_string(i) + "_down", x, T * Hc * Wc * C);
+        }
+    }
+    {
+        float* y = x == t0_ ? t1_ : t0_;
+        resblock(emid0_, x, T, Hc, Wc, C, y, "enc_mid0");
+        x = y;
+    }
+    attention_w(eag_, eab_, eaq_, eak_, eav_, eaproj_, x, T * Hc * Wc, C, "enc_mid_attn");
+    {
+        float* y = x == t0_ ? t1_ : t0_;
+        resblock(emid2_, x, T, Hc, Wc, C, y, "enc_mid2");
+        x = y;
+    }
+    dump_stage(40, "enc_mid2", x, T * Hc * Wc * C);
+    groupnorm(x, egout_, ebout_, T * Hc * Wc, C, true, a16_, "enc_head");
+    conv(ecout_, a16_, T, Hc, Wc, tmp32_);
+    dump_stage(50, "enc_conv_out", tmp32_, T * Hc * Wc * ecout_.out);
+    encoder_head(tmp32_, x, T * Hc * Wc, C, ecout_.out, C / ecout_.out, ecout_.out / 2, (float) kScalingFactor, z,
+                 s_);
+    gpu::stream_sync(s_);
+    dump_.clear();
+}
+
+uint64_t HunyuanImage3Vae::encode_scratch_bytes(int64_t H, int64_t W) const {
+    return scratch_bytes(H / 16, W / 16);   // the widest stage and the attention's grid are the decode's at that latent
 }
 
 uint64_t HunyuanImage3Vae::scratch_bytes(int64_t h, int64_t w) const {
