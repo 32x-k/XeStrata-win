@@ -84,8 +84,8 @@ uint64_t hunyuanimage3_scratch_bytes(int64_t T, const HunyuanImage3Dims& d);
 /// or with `key_lim` (device [T]) the first key_lim[t] keys: an edit's reference image spans see all of themselves
 /// (hunyuanimage3_positions_of builds it) - and `pos_y`, `pos_x` are its device 2D rope positions ([T], or null
 /// for y = x = the index).  The products are
-/// prefill::Gemm's FP16 ones, the attention `qi_attention`'s, and the router's logits come back to the host for
-/// the softmax and the top-k, which the reference runs there too.  False with `err`.
+/// prefill::Gemm's FP16 ones, the attention `qi_attention`'s, and the router's softmax and top-k on the device (only
+/// the experts' row counts come back, for the products' sizes).  False with `err`.
 bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Experts& experts, HunyuanImage3Scratch& sc, const float* x, float* out,
                    int64_t T, const int32_t* pos_y, const int32_t* pos_x, int64_t n_img, const HunyuanImage3Dims& d,
                    prefill::Gemm& gemm, void* stream, std::string& err, const int32_t* key_lim = nullptr);
