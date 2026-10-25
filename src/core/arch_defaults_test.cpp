@@ -45,11 +45,19 @@ int main() {
                 CHECK(kv.first != bits);
         }
     }
-    // gfx12: the five prompt switches only, no decode switch, no bit-changing one
+    // gfx12: the five prompt switches and four bit-identical decode switches, no bit-changing one
     unset("STRATA_GFX12_DEFAULTS");
     for (const char* a : {"gfx1200", "gfx1201", "gfx1201:sramecc-:xnack-"}) {
         const auto t = arch_default_env(a);
-        CHECK(t.size() == 5);
+        CHECK(t.size() == 9);
+        bool attn_lane = false, attn_merge = false, tsum = false, expdec = false;
+        for (const auto& kv : t) {
+            if (kv.first == "STRATA_ATTN_LANECELL") attn_lane = kv.second == "1";
+            if (kv.first == "STRATA_ATTN_MERGE_V2") attn_merge = kv.second == "1";
+            if (kv.first == "STRATA_TSUM") tsum = kv.second == "1";
+            if (kv.first == "STRATA_EXPDEC") expdec = kv.second == "1";
+        }
+        CHECK(attn_lane && attn_merge && tsum && expdec);   // the 0.2.7 R9700 decode measurement, bit-identical
         for (const auto& kv : t) CHECK(kv.first != "STRATA_HCD_EXACT");
         for (const auto& kv : t) {
             CHECK(kv.first != "STRATA_Q8_PACKED" && kv.first != "STRATA_SH_STREAM" && kv.first != "STRATA_PF_GEMM" &&
