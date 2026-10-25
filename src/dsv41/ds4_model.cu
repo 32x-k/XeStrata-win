@@ -4410,6 +4410,14 @@ struct Model::Impl {
             nh += l.n_exp - l.n_vram;
             hb_ += (size_t) (l.n_exp - l.n_vram) * l.blob;
         }
+        if (std::getenv("DS4_PLACE_HASH")) {   // debugging: which experts hold a VRAM slot, as one hash (is the placement the same from run to run?)
+            uint64_t h = 1469598103934665603ull;
+            for (const Layer& l : L)
+                for (int e = 0; e < l.n_exp; ++e) { h ^= (uint64_t) (l.slot[(size_t) e] >= 0 ? 1 + l.il * 1000 + e : 0); h *= 1099511628211ull; }
+            char hl[96];
+            std::snprintf(hl, sizeof hl, "ds4: placement hash %016llx\n", (unsigned long long) h);
+            s << hl;
+        }
         char line[200];
         if (copy_mode)
             std::snprintf(line, sizeof line, "ds4: %d routed experts on the CPU lane (%.1f GB): %d copied into RAM (%d NUMA "
