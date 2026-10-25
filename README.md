@@ -98,6 +98,8 @@ Not sure what fits? [Choose a model for your computer](docs/MODELS.md#pick-by-me
 Install the app, choose a model, and start chatting. There is one installer for each system. On first start the app
 downloads the engine for your graphics card. [Help with the installer](docs/INSTALL.md#the-app).
 
+<sub>Files: `Strata-0.2.5-windows-x64-setup.exe` · `Strata-0.2.5-linux-x86_64.AppImage` · `Strata-0.2.5-macos-arm64.dmg`</sub>
+
 <p align="center">
   <img src="docs/media/app-chat.png" width="900" alt="Strata desktop app with a chat and live code preview side by side">
   <br><sub>Chat, files and a live preview in one window.</sub>
@@ -141,7 +143,7 @@ Follow the prompts to download and start a model. [Terminal guide](docs/TERMINAL
 
 <a id="build-from-source"></a>
 
-[Build from source](docs/INSTALL.md#from-source-windows) · [Docker](docs/DOCKER.md) · [Full install guide](docs/INSTALL.md)
+[Build from source](docs/SOURCE_INSTALL.md) · [Docker](docs/DOCKER.md) · [Full install guide](docs/INSTALL.md)
 
 <a id="what-you-need"></a>
 
