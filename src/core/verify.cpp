@@ -126,6 +126,132 @@ RouteResidentCfg& route_resident_cfg() {
     (void) parsed;
     return c;
 }
+// STRATA_ROUTE_DUMP=<path>: every verify window's routed experts and weights, after the router and every option that
+// changes them; STRATA_ROUTE_REPLAY=<path> (opt-in, changes the output): a dump's experts and weights in place of the
+// router's, so a quant is scored with the reference's routing and its KL is the rounding alone (tools/quant_quality.py
+// --route-lock).  Record: int32 request, int32 position, int32 layer, int32 k, k int32 ids, k float weights; a request
+// begins where a window's position does not pass the last one's (pos0 rises within one).  Windows of one request at a
+// time only (not the batch slots, not the pipelined windows), and only the windows: positions the prompt path read
+// have no records, and replaying them is an error.
+struct RouteTrace {
+    std::FILE* dump = nullptr;
+    std::mutex mu;
+    bool replay = false;
+    std::string error;
+    struct Req {
+        int64_t k = 0, layers = 0;
+        std::vector<int32_t> ids;
+        std::vector<float> w;
+        std::vector<uint8_t> have;   // [pos * layers + layer]
+    };
+    std::vector<Req> reqs;
+
+    bool load(const char* path) {
+        std::FILE* f = std::fopen(path, "rb");
+        if (f == nullptr) { error = std::string("STRATA_ROUTE_REPLAY: cannot read ") + path; return false; }
+        int32_t h[4];
+        std::vector<int32_t> ids;
+        std::vector<float> w;
+        while (std::fread(h, sizeof h, 1, f) == 1) {
+            const int32_t r = h[0], pos = h[1], l = h[2], k = h[3];
+            if (r < 0 || r > 1 << 20 || pos < 0 || l < 0 || l >= 1024 || k < 1 || k > 64) {
+                error = std::string("STRATA_ROUTE_REPLAY: ") + path + ": a malformed record";
+                break;
+            }
+            ids.resize((size_t) k);
+            w.resize((size_t) k);
+            if (std::fread(ids.data(), 4, (size_t) k, f) != (size_t) k || std::fread(w.data(), 4, (size_t) k, f) != (size_t) k) {
+                error = std::string("STRATA_ROUTE_REPLAY: ") + path + ": a truncated record";
+                break;
+            }
+            if ((size_t) r >= reqs.size()) reqs.resize((size_t) r + 1);
+            Req& q = reqs[(size_t) r];
+            if (q.k == 0) q.k = k;
+            if (q.k != k) { error = std::string("STRATA_ROUTE_REPLAY: ") + path + ": records of two k"; break; }
+            if (l >= q.layers) {   // re-strided to the deeper layer count
+                const int64_t L2 = l + 1, P = q.layers > 0 ? (int64_t) q.have.size() / q.layers : 0;
+                Req n;
+                n.k = k; n.layers = L2;
+                n.ids.assign((size_t) (P * L2 * k), 0); n.w.assign(n.ids.size(), 0.0f); n.have.assign((size_t) (P * L2), 0);
+                for (int64_t p = 0; p < P; ++p)
+                    for (int64_t j = 0; j < q.layers; ++j) {
+                        const size_t a = (size_t) (p * q.layers + j), b = (size_t) (p * L2 + j);
+                        n.have[b] = q.have[a];
+                        std::memcpy(&n.ids[b * (size_t) k], &q.ids[a * (size_t) k], (size_t) k * 4);
+                        std::memcpy(&n.w[b * (size_t) k], &q.w[a * (size_t) k], (size_t) k * 4);
+                    }
+                q = std::move(n);
+            }
+            const size_t slot = (size_t) pos * (size_t) q.layers + (size_t) l;
+            if (slot >= q.have.size()) {
+                q.have.resize(slot + 1, 0);
+                q.ids.resize((slot + 1) * (size_t) k, 0);
+                q.w.resize((slot + 1) * (size_t) k, 0.0f);
+            }
+            q.have[slot] = 1;   // a position read again (a rejected draft) keeps its last routing
+            std::memcpy(&q.ids[slot * (size_t) k], ids.data(), (size_t) k * 4);
+            std::memcpy(&q.w[slot * (size_t) k], w.data(), (size_t) k * 4);
+        }
+        std::fclose(f);
+        return error.empty();
+    }
+
+    /// rows [0, T) of layers [lb, le) of request `r` from position pos0 into the window's staging (stride MT rows)
+    bool fill(int r, int64_t pos0, int T, int64_t lb, int64_t le, int64_t K, int64_t MT, int32_t* ids, float* w,
+              std::string& err) const {
+        const Req* q = r >= 0 && (size_t) r < reqs.size() ? &reqs[(size_t) r] : nullptr;
+        if (q != nullptr && q->k != K) {
+            err = "STRATA_ROUTE_REPLAY: the dump routes " + std::to_string(q->k) + " experts a token, this model " +
+                  std::to_string(K);
+            return false;
+        }
+        for (int64_t l = lb; l < le; ++l)
+            for (int t = 0; t < T; ++t) {
+                const size_t slot = (size_t) (pos0 + t) * (size_t) (q ? q->layers : 0) + (size_t) l;
+                if (q == nullptr || l >= q->layers || slot >= q->have.size() || !q->have[slot]) {
+                    err = "STRATA_ROUTE_REPLAY: no routing for request " + std::to_string(r) + ", position " +
+                          std::to_string(pos0 + t) + ", layer " + std::to_string(l);
+                    return false;
+                }
+                const size_t d = ((size_t) l * (size_t) MT + (size_t) t) * (size_t) K;
+                std::memcpy(ids + d, &q->ids[slot * (size_t) K], (size_t) K * 4);
+                std::memcpy(w + d, &q->w[slot * (size_t) K], (size_t) K * 4);
+            }
+        return true;
+    }
+
+    void write(int r, int64_t pos0, int T, int64_t lb, int64_t le, int64_t K, int64_t MT, const int32_t* ids,
+               const float* w) {
+        std::lock_guard<std::mutex> lk(mu);
+        for (int t = 0; t < T; ++t)
+            for (int64_t l = lb; l < le; ++l) {
+                const size_t s = ((size_t) l * (size_t) MT + (size_t) t) * (size_t) K;
+                const int32_t h[4] = {r, (int32_t) (pos0 + t), (int32_t) l, (int32_t) K};
+                std::fwrite(h, sizeof h, 1, dump);
+                std::fwrite((const void*) (ids + s), 4, (size_t) K, dump);
+                std::fwrite((const void*) (w + s), 4, (size_t) K, dump);
+            }
+        std::fflush(dump);
+    }
+};
+RouteTrace& route_trace() {
+    static RouteTrace t;
+    static const bool parsed = [] {
+        if (const char* p = std::getenv("STRATA_ROUTE_DUMP"); p != nullptr && *p) {
+            t.dump = std::fopen(p, "wb");
+            if (t.dump == nullptr) t.error = std::string("STRATA_ROUTE_DUMP: cannot write ") + p;
+        }
+        if (const char* p = std::getenv("STRATA_ROUTE_REPLAY"); p != nullptr && *p) {
+            t.replay = t.load(p);
+            if (t.replay)
+                std::fprintf(stderr, "route replay: %zu requests from %s (the reference's experts and weights)\n",
+                             t.reqs.size(), p);
+        }
+        return true;
+    }();
+    (void) parsed;
+    return t;
+}
 // A one-token window always keeps its token, so its graph advances the GDN conv history and recurrence state itself
 // (its indexer append and PLE history are final already) and Verifier::commit launches no commit graph after it
 // (upstream 352cad8f): the draft round then runs alone instead of beside the commit's kernels, which read and write
@@ -246,7 +372,7 @@ Verifier::~Verifier() {
     if (commit_done_) strata::gpu::event_destroy(commit_done_);
     if (arena_) strata::gpu::free(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_nf_, h_route_};
+                     h_flagA_, h_plan_, h_flagB_, h_nf_, h_route_, h_rw_, h_rpl_ids_, h_rpl_w_};
     for (void* h : hosts)
         if (h) strata::gpu::free(h);
 }
@@ -361,6 +487,19 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    {
+        RouteTrace& rt = route_trace();
+        if (!rt.error.empty()) { err = rt.error; return false; }
+        rt_dump_ = rt.dump != nullptr;
+        rt_replay_ = rt.replay;
+        const size_t lk = (size_t) g.n_layers * (size_t) T * (size_t) K * 4;
+        if ((rt_dump_ && !mapped(lk, (void**) &h_rw_, (void**) &m_rw_)) ||
+            (rt_replay_ && (!mapped(lk, (void**) &h_rpl_ids_, (void**) &m_rpl_ids_) ||
+                            !mapped(lk, (void**) &h_rpl_w_, (void**) &m_rpl_w_)))) {
+            err = "verify: the route trace's staging allocation failed";
+            return false;
+        }
+    }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
         const int64_t cap = (int64_t) (T * K);
@@ -1119,7 +1258,8 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 if (!g_ready)
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE,
                                               N, NE, n, cs);
-                if (router_publish && !recording_res_ && route_prior <= 0.0f && route_resident_cfg().margin <= 0.0f) {
+                if (router_publish && !recording_res_ && route_prior <= 0.0f && route_resident_cfg().margin <= 0.0f &&
+                    !rt_replay_) {
                     native_router_top10_publish(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm, (int64_t) n * N,
                                                 m_x_ + tb * N, m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs, (int) NE);
                     published = true;
@@ -1146,6 +1286,13 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                       rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs, (int) NE);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
+        if (rt_replay_ && !batch_rec_) {   // STRATA_ROUTE_REPLAY: the dump's experts and weights for these rows (RouteTrace)
+            copy_i32_from_mapped(ids_ + tb * K, m_rpl_ids_ + ((size_t) l * (size_t) MT + (size_t) tb) * (size_t) K,
+                                 (int64_t) n * K, cs);
+            copy_i32_from_mapped((int32_t*) (w_ + tb * K),
+                                 (const int32_t*) (m_rpl_w_ + ((size_t) l * (size_t) MT + (size_t) tb) * (size_t) K),
+                                 (int64_t) n * K, cs);
+        }
         if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -1154,9 +1301,12 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         if (!recording_res_ && !published)   // the resident graph asks the host nothing
             doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                              m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
-        if (route_rec_ && !batch_rec_)   // add_routing's ids: every layer's, also where the host is not asked
+        if ((route_rec_ || rt_dump_) && !batch_rec_)   // add_routing's ids: every layer's, also where the host is not asked
             copy_i32_from_mapped(m_route_ + ((size_t) l * (size_t) MT + (size_t) tb) * (size_t) K, ids_ + tb * K,
                                  (int64_t) n * K, cs);
+        if (rt_dump_ && !batch_rec_)   // STRATA_ROUTE_DUMP: the weights beside them
+            copy_i32_from_mapped((int32_t*) (m_rw_ + ((size_t) l * (size_t) MT + (size_t) tb) * (size_t) K),
+                                 (const int32_t*) (w_ + tb * K), (int64_t) n * K, cs);
         stamp(l, 17, grp);
         {
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
@@ -1681,6 +1831,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         err = "verify: the window runs past the context";
         return false;
     }
+    if (rt_dump_ || rt_replay_) {   // RouteTrace: a window whose position does not pass the last one's begins a request
+        if (pos0 <= rt_pos0_) ++rt_req_;
+        rt_pos0_ = pos0;
+        if (rt_replay_ && !route_trace().fill(rt_req_, pos0, T, lb_, le_, ss.k, max_t_, h_rpl_ids_, h_rpl_w_, err))
+            return false;
+    }
     const bool res = res_graph_ && all_resident();
     captured_last_ = res ? exec_res_[T] == nullptr : exec_[T] == nullptr && segs_[T].empty();
     if (!(res ? capture_res(T, err) : capture(T, err)) || !capture_commit(err)) return false;
@@ -1816,6 +1972,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (!se) { err = std::string("verify: ") + strata::gpu::last_error(); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     strata::gpu::stream_sync(copy_);   // no host function of this window may raise flag B in the next one
+    if (rt_dump_) route_trace().write(rt_req_, pos0, T, lb_, le_, ss.k, max_t_, h_route_, h_rw_);
     if (prof_on_ && G == 1) {       // the window's GPU stage stamps
         strata::gpu::copy(prof_h_.data(), prof_, prof_h_.size() * 8);
         accumulate_profile(prof_h_.data());
@@ -2143,6 +2300,7 @@ bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolM
 bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
                            std::string& err) {
     using namespace strata::kernels;
+    if (rt_dump_ || rt_replay_) { err = "STRATA_ROUTE_DUMP / STRATA_ROUTE_REPLAY: one request at a time (no batch slots)"; return false; }
     // a slot may own a contiguous group of rows (--batch-mtp), also across the stages of a layer split, whose hand-off
     // buffers hold kVerifyMaxT rows (a stage that hands rows on or takes them; upstream 48f2c47d)
     if (S < 1 || S > max_t_ || hbase < 0 || ((next_ != nullptr || lb_ > 0) && hbase + S > kVerifyMaxT)) {
@@ -2665,6 +2823,7 @@ bool Verifier::capture_all(std::string& err) {
     if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
     if (segmented_) { err = "verify: pipelined windows need a GPU whose running kernels see the host's writes"; return false; }
     if (!always_publish_) { err = "verify: pipelined windows need set_always_publish before init"; return false; }
+    if (rt_dump_ || rt_replay_) { err = "STRATA_ROUTE_DUMP / STRATA_ROUTE_REPLAY: not with pipelined windows"; return false; }
     for (int T = 1; T <= max_t_; ++T)
         if (!capture(T, err)) return false;
     if (!capture_commit(err)) return false;

@@ -499,6 +499,14 @@ private:
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
     int32_t* h_route_ = nullptr; int32_t* m_route_ = nullptr;   // n_layers * T * k: each layer's ids (add_routing)
     bool route_rec_ = false;
+    // STRATA_ROUTE_DUMP / STRATA_ROUTE_REPLAY (verify.cpp's RouteTrace): the routed weights beside h_route_'s ids, the
+    // replayed ids and weights (n_layers * T * k each), and the request and position the last window was in
+    float* h_rw_ = nullptr;      float* m_rw_ = nullptr;
+    int32_t* h_rpl_ids_ = nullptr; int32_t* m_rpl_ids_ = nullptr;
+    float* h_rpl_w_ = nullptr;   float* m_rpl_w_ = nullptr;
+    bool rt_dump_ = false, rt_replay_ = false;
+    int rt_req_ = -1;
+    int64_t rt_pos0_ = INT64_MAX;
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
     uint32_t* h_seq_ = nullptr;  uint32_t* m_seq_ = nullptr;
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
