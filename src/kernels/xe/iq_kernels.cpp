@@ -810,6 +810,18 @@ template<> struct TqInfo<148> { using block_t = block_tqp6; static constexpr int
 template<> struct TqInfo<149> { using block_t = block_tqp7; static constexpr int K = 7, NS = 64; };
 constexpr bool is_tq(int t) { return t >= 144 && t <= 149; }
 inline float tq_h2f(uint32_t bits) { return (float) sycl::bit_cast<sycl::half>((uint16_t) bits); }
+// The u16 words the four states of tq_states4 span at most: the window's offset into its first word (0..15, set by
+// t0 and K) plus 3 K + 16 bits.  K = 5 and 6 need three words wherever t0 falls; IGC proved it for K = 5 only and
+// read a fourth for K = 6, and TQP6's grouped products ran 35% slower than TQP5's and TQP7's (B70, 2026-10-25).
+template<int TY>
+constexpr int tq_window_words() {
+    int bits = 0;
+    for (int t0 = 0; t0 + 4 <= TqInfo<TY>::NS; t0 += 4) {
+        const int b = (((TqInfo<TY>::NS - 4 - t0) * TqInfo<TY>::K) & 15) + 3 * TqInfo<TY>::K + 16;
+        bits = b > bits ? b : bits;
+    }
+    return (bits + 15) / 16;
+}
 // the states of steps t0 .. t0 + 3 of one block, t0 a multiple of 4 (qs is 2-byte aligned: every trellis block has an
 // even size)
 template<int TY>
@@ -826,14 +838,16 @@ inline void tq_states4(const uint8_t* qs, int t0, uint32_t s[4]) {
         s[3] = (b2 << 8) | b3;
     } else {
         // step t's state: the 16 stream bits from bit (NS - 1 - t) K, circular over NS K / 16 u16 words; steps
-        // t0 .. t0 + 3 all lie in the four words from (NS - 4 - t0) K >> 4
+        // t0 .. t0 + 3 all lie in the tq_window_words words from (NS - 4 - t0) K >> 4
         constexpr int K = TqInfo<TY>::K, nwords = TqInfo<TY>::NS * K / 16;
         const int off3 = (TqInfo<TY>::NS - 4 - t0) * K, wb = off3 >> 4, r = off3 & 15;
         const int wi1 = wb + 1 >= nwords ? wb + 1 - nwords : wb + 1;
         const int wi2 = wb + 2 >= nwords ? wb + 2 - nwords : wb + 2;
-        const int wi3 = wb + 3 >= nwords ? wb + 3 - nwords : wb + 3;
-        const uint64_t v = (uint64_t) qs16[wb] | ((uint64_t) qs16[wi1] << 16) | ((uint64_t) qs16[wi2] << 32) |
-                           ((uint64_t) qs16[wi3] << 48);
+        uint64_t v = (uint64_t) qs16[wb] | ((uint64_t) qs16[wi1] << 16) | ((uint64_t) qs16[wi2] << 32);
+        if constexpr (tq_window_words<TY>() > 3) {
+            const int wi3 = wb + 3 >= nwords ? wb + 3 - nwords : wb + 3;
+            v |= (uint64_t) qs16[wi3] << 48;
+        }
         for (int i = 0; i < 4; ++i) s[i] = (uint32_t) (v >> (r + (3 - i) * K)) & 0xFFFFu;
     }
 }
