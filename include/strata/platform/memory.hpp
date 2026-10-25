@@ -29,6 +29,15 @@ void unlock_resident(void* p, uint64_t bytes);
 /// False (and `why` says so) when the query is not possible - always elsewhere than Windows.
 bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why);
 
+/// Windows: the GPU's own memory (VRAM) budget for this process and its use of it, from DXGI
+/// (DXGI_MEMORY_SEGMENT_GROUP_LOCAL), for the adapter at the PCI address `pci` ("0000:0c:00.0", as the SYCL runtime
+/// gives it; the adapter's bus, device and function from D3DKMT).  WDDM moves what a process holds past this budget
+/// into system memory instead of refusing it, so a device's own free memory can say more than the process can take:
+/// an RX 9060 XT (16 GB) reported 1.5 GB free through HIP while WDDM had moved 0.8 GB of the process out, and an
+/// image's decode took 121 s instead of 12.6 (Windows 11, 2026-10-26).  False (and `why` says so) when the query is
+/// not possible - always elsewhere than Windows.
+bool gpu_local_memory_budget(const std::string& pci, uint64_t& budget, uint64_t& usage, std::string& why);
+
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
 

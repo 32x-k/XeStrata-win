@@ -8,10 +8,14 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <winternl.h>
+#include <d3dkmthk.h>
 #include <dxgi1_4.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 #else
 #include <algorithm>
 #include <chrono>
@@ -115,6 +119,72 @@ bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usag
     return ok;
 }
 
+bool gpu_local_memory_budget(const std::string& pci, uint64_t& budget, uint64_t& usage, std::string& why) {
+    budget = usage = 0;
+    // the adapters found once, by their PCI addresses; dxgi.dll and gdi32.dll are loaded when first asked, not linked
+    static std::mutex mu;
+    static std::map<std::string, IDXGIAdapter3*> found;
+    static bool listed = false;
+    static std::string list_why;
+    std::lock_guard<std::mutex> lock(mu);
+    if (!listed) {
+        listed = true;
+        HMODULE dxgi = LoadLibraryA("dxgi.dll"), gdi = LoadLibraryA("gdi32.dll");
+        using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
+        using OpenFromLuid = NTSTATUS(APIENTRY*)(D3DKMT_OPENADAPTERFROMLUID*);
+        using QueryInfo = NTSTATUS(APIENTRY*)(const D3DKMT_QUERYADAPTERINFO*);
+        using Close = NTSTATUS(APIENTRY*)(const D3DKMT_CLOSEADAPTER*);
+        const auto create = dxgi ? (CreateFactory) (void*) GetProcAddress(dxgi, "CreateDXGIFactory1") : nullptr;
+        const auto open = gdi ? (OpenFromLuid) (void*) GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid") : nullptr;
+        const auto query = gdi ? (QueryInfo) (void*) GetProcAddress(gdi, "D3DKMTQueryAdapterInfo") : nullptr;
+        const auto close = gdi ? (Close) (void*) GetProcAddress(gdi, "D3DKMTCloseAdapter") : nullptr;
+        IDXGIFactory1* factory = nullptr;
+        if (create == nullptr || open == nullptr || query == nullptr || close == nullptr ||
+            FAILED(create(__uuidof(IDXGIFactory1), (void**) &factory)) || factory == nullptr) {
+            list_why = "DXGI or D3DKMT not available";
+        } else {
+            for (UINT i = 0;; ++i) {
+                IDXGIAdapter1* a = nullptr;
+                if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND || a == nullptr) break;
+                DXGI_ADAPTER_DESC1 d{};
+                D3DKMT_OPENADAPTERFROMLUID o{};
+                IDXGIAdapter3* a3 = nullptr;
+                if (SUCCEEDED(a->GetDesc1(&d)) && (o.AdapterLuid = d.AdapterLuid, open(&o) >= 0)) {
+                    D3DKMT_ADAPTERADDRESS addr{};
+                    D3DKMT_QUERYADAPTERINFO q{};
+                    q.hAdapter = o.hAdapter;
+                    q.Type = KMTQAITYPE_ADAPTERADDRESS;
+                    q.pPrivateDriverData = &addr;
+                    q.PrivateDriverDataSize = sizeof addr;
+                    const bool known = query(&q) >= 0;
+                    D3DKMT_CLOSEADAPTER c{};
+                    c.hAdapter = o.hAdapter;
+                    close(&c);
+                    char key[32];
+                    std::snprintf(key, sizeof key, "0000:%02x:%02x.%x", addr.BusNumber, addr.DeviceNumber,
+                                  addr.FunctionNumber);
+                    if (known && !found.count(key) &&
+                        SUCCEEDED(a->QueryInterface(__uuidof(IDXGIAdapter3), (void**) &a3)) && a3 != nullptr)
+                        found[key] = a3;   // kept for the process's life
+                }
+                a->Release();
+            }
+            factory->Release();
+            list_why = "no DXGI adapter at that PCI address";
+        }
+    }
+    const auto it = found.find(pci);
+    if (it == found.end()) { why = list_why; return false; }
+    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+    if (FAILED(it->second->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)) || info.Budget == 0) {
+        why = "QueryVideoMemoryInfo gave no local budget";
+        return false;
+    }
+    budget = info.Budget;
+    usage = info.CurrentUsage;
+    return true;
+}
+
 uint64_t total_physical_memory() {
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof ms;
@@ -144,6 +214,12 @@ void unlock_resident(void* p, uint64_t bytes) {
 }
 
 bool gpu_shared_memory_budget(const void*, uint64_t& budget, uint64_t& usage, std::string& why) {
+    budget = usage = 0;
+    why = "DXGI is Windows-only";
+    return false;
+}
+
+bool gpu_local_memory_budget(const std::string&, uint64_t& budget, uint64_t& usage, std::string& why) {
     budget = usage = 0;
     why = "DXGI is Windows-only";
     return false;
