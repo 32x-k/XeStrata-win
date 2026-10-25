@@ -324,7 +324,9 @@ if(STRATA_ENABLE_XE)
     string(JOIN " " _strata_cuda_str ${_strata_cuda_opts})
     string(MD5 _strata_ckey "${_strata_sycl_targets} ${_strata_cuda_str}")
     list(JOIN _strata_sycl_targets "," _strata_sycl_targets)
-    set(CMAKE_REQUIRED_FLAGS "-fsycl -fsycl-targets=${_strata_sycl_targets} ${_strata_cuda_str}")
+    strata_try_compile_defs("${_strata_cuda_opts}" _strata_cuda_req)   # a command line: a toolkit path's space quoted
+    string(JOIN " " _strata_cuda_req ${_strata_cuda_req})
+    set(CMAKE_REQUIRED_FLAGS "-fsycl -fsycl-targets=${_strata_sycl_targets} ${_strata_cuda_req}")
     check_cxx_source_compiles("#include <sycl/sycl.hpp>\nint main() { sycl::queue q; q.single_task([] {}); }"
                               STRATA_HAVE_SYCL_CUDA_${_strata_ckey})
     unset(CMAKE_REQUIRED_FLAGS)
