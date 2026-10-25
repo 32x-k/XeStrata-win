@@ -5927,7 +5927,11 @@ def make_handler(svc: Service):
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
                     loaded = svc.loaded()
-                    model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
+                    # OpenAI's model object has created and owned_by: clients with a strict parser (Android apps)
+                    # listed no model without them
+                    now_s = int(time.time())
+                    model = {"id": svc.model, "object": "model", "created": now_s, "owned_by": "xestrata",
+                             "status": {"value": "loaded"},
                              "meta": {"n_ctx": svc.reported_ctx()},
                              "architecture": {"input_modalities": (["text", "image"] if svc.vision is not None
                                                                    else ["text"]),
@@ -5940,7 +5944,8 @@ def make_handler(svc: Service):
                     data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
                     data = data if loaded else []
                     if svc.images is not None:            # the image model: POST /v1/images/generations
-                        data.append({"id": svc.images.model, "object": "model", "status": {"value": "loaded"},
+                        data.append({"id": svc.images.model, "object": "model", "created": now_s,
+                                     "owned_by": "xestrata", "status": {"value": "loaded"},
                                      "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
                     self._json(200, {"object": "list", "data": data})
             elif path == "/props":
