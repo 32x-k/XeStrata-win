@@ -8826,6 +8826,7 @@ int main(int argc, char** argv) {
         }
         strata::core::progress_at("idle");
         strata::gpu::pin_reserve_release();   // the engine is up: the pinned memory's last reserve goes back
+        strata::platform::settle_before_ready();
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;

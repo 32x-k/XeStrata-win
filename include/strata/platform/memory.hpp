@@ -50,5 +50,11 @@ bool free_and_cached(uint64_t& free, uint64_t& cached);
 /// Makes the OS free RAM until `bytes` are free (Linux's MemFree), as far as it can give them back (MemAvailable, less
 /// 1 GiB): memory taken, touched and given back, so the file cache leaves it.  Nothing on Windows.
 void make_free_ram(uint64_t bytes);
+/// Waits until the kernel has stopped migrating host pages (Linux's /proc/vmstat pgmigrate_success: below `quiet_rate`
+/// pages a second for `quiet_s` seconds), at most `cap_s` seconds; the seconds waited, and the highest rate seen in
+/// `peak`.  0 at once where the counter cannot be read (Windows, a kernel without it).
+double settle_page_migration(double cap_s, double quiet_s, double quiet_rate, double& peak);
+/// The engine's wait for that before it says READY (STRATA_SETTLE_S, memory.cpp), with a line on stderr.
+void settle_before_ready();
 
 }  // namespace strata::platform

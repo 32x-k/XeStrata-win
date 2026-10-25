@@ -18,6 +18,7 @@
 #include "strata/core/plain_model.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/platform/memory.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 
@@ -297,6 +298,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     std::vector<int32_t> out((size_t) opt.max_t);
     std::string err;
     std::printf("INFO context=%lld expert_slots=%lld\n", (long long) ctx, (long long) model.slots());
+    strata::platform::settle_before_ready();
     std::printf("READY %lld stop\n", (long long) ctx);
     std::fflush(stdout);
     std::string line;

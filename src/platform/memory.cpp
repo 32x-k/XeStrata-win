@@ -9,12 +9,16 @@
 #define NOMINMAX
 #include <windows.h>
 #include <dxgi1_4.h>
-#include <cstring>
-#else
-#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#else
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <thread>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -123,6 +127,7 @@ void advise_willneed(int, uint64_t, uint64_t) {}
 void drop_file_cache(const std::string&) {}
 bool free_and_cached(uint64_t&, uint64_t&) { return false; }
 void make_free_ram(uint64_t) {}
+double settle_page_migration(double, double, double, double& peak) { peak = 0.0; return 0.0; }
 #else
 LockResult lock_resident(void* p, uint64_t bytes) {
     LockResult r;
@@ -215,6 +220,47 @@ void make_free_ram(uint64_t bytes) {
     for (uint64_t at = 0; at < take; at += ps > 0 ? (uint64_t) ps : 4096) static_cast<volatile char*>(p)[at] = 0;
     munmap(p, (size_t) take);
 }
+
+namespace {
+bool pgmigrate_success(uint64_t& n) {
+    std::FILE* f = std::fopen("/proc/vmstat", "r");
+    if (f == nullptr) return false;
+    char line[256];
+    bool found = false;
+    while (!found && std::fgets(line, sizeof line, f) != nullptr)
+        if (std::strncmp(line, "pgmigrate_success ", 18) == 0) {
+            n = (uint64_t) std::strtoull(line + 18, nullptr, 10);
+            found = true;
+        }
+    std::fclose(f);
+    return found;
+}
+}  // namespace
+
+double settle_page_migration(double cap_s, double quiet_s, double quiet_rate, double& peak) {
+    peak = 0.0;
+    uint64_t last = 0;
+    if (cap_s <= 0.0 || !pgmigrate_success(last)) return 0.0;
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point t0 = Clock::now();
+    Clock::time_point tl = t0;
+    double calm = 0.0;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        uint64_t cur = 0;
+        if (!pgmigrate_success(cur)) break;
+        const Clock::time_point now = Clock::now();
+        const double dt = std::max(std::chrono::duration<double>(now - tl).count(), 1e-3);
+        const double rate = (double) (cur - last) / dt;
+        peak = std::max(peak, rate);
+        calm = rate < quiet_rate ? calm + dt : 0.0;
+        last = cur;
+        tl = now;
+        const double waited = std::chrono::duration<double>(now - t0).count();
+        if (calm >= quiet_s || waited >= cap_s) return waited;
+    }
+    return std::chrono::duration<double>(Clock::now() - t0).count();
+}
 #endif
 
 bool under_wsl() {
@@ -232,6 +278,24 @@ bool under_wsl() {
 #else
     return false;
 #endif
+}
+
+void settle_before_ready() {
+    // A large load leaves the kernel compacting host memory as the engine comes up, and memory registered for the GPU
+    // (the expert arena's user pointers) is what it migrates: the xe driver invalidated and bound such a mapping again
+    // 83K-134K times under low free RAM (B70, 2026-10-22), and Paiton saw such pools stall the GPU for seconds after its
+    // server was ready (two R9700).  The first requests land after it.  The rate and the quiet time are Paiton's launcher's
+    // (10,000 pages a second for 5 s, here 2 s), not measured here; they count host pages, no GPU's.
+    // STRATA_SETTLE_S: the most it waits (default 30, 0: not at all).
+    static const double cap = [] {
+        const char* v = std::getenv("STRATA_SETTLE_S");
+        return v != nullptr ? std::strtod(v, nullptr) : 30.0;
+    }();
+    double peak = 0.0;
+    const double waited = settle_page_migration(cap, 2.0, 10000.0, peak);
+    if (waited > 0.0)
+        std::fprintf(stderr, "strata: host page migration settled in %.1f s (peak %.0f pages/s; STRATA_SETTLE_S=0: no wait)\n",
+                     waited, peak);
 }
 
 }  // namespace strata::platform

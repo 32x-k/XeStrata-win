@@ -582,6 +582,8 @@ Before, it was a share from the link's speed alone (0.55 from 20 GB/s, below tha
   On the RX 9060 XT, IQ3_XXS decodes at 52.2 instead of 50.3 tok/s at 1K, 51.3 instead of 48.5 at 64K and 44.7 instead of 42.5 at 262K; on the B70 and the RTX 4070, whose times at start match the decode's, nothing changes. `STRATA_PCIE_SPLIT_REFINE=0` keeps the times taken at start.
 - **The arena**: on Level Zero, GPU kernels cannot read the arena registered for device copies.
   Only when the split reads experts over PCIe, the arena moves into host USM a layer at a time (about 7.5 s for IQ3_XXS's 40 GB). `STRATA_ARENA_HOST_USM=1` puts it in host USM from the start.
+- **The wait before READY**: the engine waits, before it says READY, until the kernel has stopped moving host pages (`pgmigrate_success` in `/proc/vmstat` below 10,000 pages a second for 2 seconds, at most 30 seconds; Linux only).
+  The compaction right after the load can move the registered arena's pages as well, so it is over before the first request. `STRATA_SETTLE_S` sets the most seconds, 0 no wait.
 - **The share stays**: with `--pcie-frac` (also as `--calibrate` saved it), over a layer split, with `--pcie-mode dma` or `direct`, and when the times cannot be measured.
 
 The RTX 4070 (PCIe 4.0 x4) now computes every miss on the CPU: IQ3_XXS 32K 49.9 -> 57-58.6 tok/s, UD-Q4_K_XL 32K 22.0 -> 25.7.
