@@ -30,10 +30,14 @@ struct QiRequest {
     int64_t width = 1024, height = 1024;   // multiples of 16
     uint64_t seed = 0;
     std::vector<float> sigmas;  // empty: the model's default (its Turbo's steps)
+    int64_t steps = 0;          // with no sigmas: the sampler's steps (0: the model's own).  HunyuanImage 3.0's
+                                // schedule is the shift of its own sampler; a fixed-schedule model leaves this.
     std::vector<QiRef> refs;    // an edit's reference images, in the order of their pads
     QiRef mask;                 // an edit's mask over refs[0] (OpenAI's: alpha 0 where the image changes); empty: none
     std::vector<int32_t> neg_ids;   // classifier-free guidance's negative prompt, as ids (its pads as the prompt's)
     float cfg = 1.0f;               // its scale (diffusers' true_cfg_scale): above 1 with neg_ids, guidance
+    float guidance = 0.0f;          // HunyuanImage 3.0's: the scale its guidance token embeds (the model's own 2.5
+                                    // when 0, the number the model sees being 1000 times it).  The other models leave it.
 };
 
 struct QiTimes {
@@ -45,6 +49,7 @@ struct QiPlan {
     uint64_t budget = 0, fixed = 0, activations = 0, blocks = 0, layers = 0, vae = 0, prefix_kv = 0;
     int resident_blocks = 0, resident_layers = 0, resident_kv = 0;   // resident_kv: the blocks whose prefix cache is in VRAM
     int64_t mlp_rows = 0;   // 0: all
+    uint64_t streamed = 0;  // HunyuanImage 3.0's: the expert banks' bytes one pass reads past what is resident
     bool vae_tiled = false, text_cached = false;
 };
 
@@ -77,6 +82,11 @@ public:
     virtual QiNeed need(int64_t n_text, int64_t width, int64_t height,
                         const std::vector<std::pair<int64_t, int64_t>>& refs = {}, bool mask = false,
                         int64_t n_neg = 0) = 0;
+    /// The request `serve` warms the engine up with.  The default is the generic one (a plain token-id ramp at
+    /// 256 x 256, one step), which the models whose DiT reads any ids take; a model whose sequence must carry its
+    /// image block's markers (HunyuanImage 3.0) fills `r` with a sequence of its own and returns true.
+    virtual bool warm_up_request(QiRequest& r) const { (void) r; return false; }
+
     /// RGBA8 [height][width][4] of the request.  `step`: the sampling's progress, false to stop (QiStopped).
     /// `stage`: each stage as it starts ("refs", "text", "sampling", "decode").
     virtual std::vector<uint8_t> generate(const QiRequest& r, QiTimes* times = nullptr, QiPlan* plan = nullptr,

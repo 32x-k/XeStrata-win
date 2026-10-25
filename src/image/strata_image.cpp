@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/strata_image.cpp - strata-image: Qwen-Image-2.1 or Mage-Flow text to image on the GPU.
+// src/image/strata_image.cpp - strata-image: Qwen-Image-2.1, Mage-Flow or HunyuanImage 3.0 text to image on the GPU.
 //
 //   strata-image --dit DIT.gguf --vae VAE.safetensors --text TEXT_ENCODER.gguf [--vision MMPROJ.gguf]
 //                [--budget-mib M] (--ids 1,2,3 [--drop N] [--width W] [--height H] [--seed S] [--sigmas 1,...,0]
@@ -11,7 +11,12 @@
 // The DiT's file says the model: a GGUF is Qwen-Image-2.1's, a safetensors file Mage-Flow's (its bf16 weights as
 // Comfy-Org has them; its blocks FP16 on the GPU when they fit the budget with the text encoder's layers, else
 // quantized to 8 bits as they are read (MfDit: W8A8 or Q8_0): --dit-q8 auto, the default; 1 always 8 bits, 0 always
-// FP16).  Mage-Flow's edits take
+// FP16).  A safetensors file whose header is a HunyuanImage 3.0 save - its `format`, or the `comfy_quant` beside
+// its matrices, or the model's own `model.wte.weight` beside `patch_embed` - is HunyuanImage 3.0's, and takes no
+// --text: its DiT reads the ids itself (`wte`, with three rows its embedders write over), so its entry is
+//   strata-image --dit QUANTIZED.safetensors --vae VAE.safetensors (--ids ... | --serve) [--out F] [--width W]
+//                [--height H] [--seed S] [--steps N] [--sigmas 1,...,0] [--guidance G] [--budget-mib M]
+// and its guidance is a token's value (`--guidance`, the model's own 2.5 unset) rather than a second pass.  Mage-Flow's edits take
 // its edit DiT (--edit-dit) and Qwen3-VL-4B's mmproj (--vision), up to three --ref; --dit-keep 1, the default, keeps the
 // DiT not in use in RAM between a generation and an edit (0: read from its file again).
 //
@@ -30,7 +35,8 @@
 //                            -> STAGE <refs|text|sampling|decode> as each stage starts and STEP <done> <steps> lines,
 //                            then IMAGE key=value ... (times, the budget's split); SIGMAS: as --sigmas; REF: an
 //                            edit's reference images; MASK: as --mask; NEG:<ids, commas> and CFG:<scale> (above 1):
-//                            classifier-free guidance with that negative prompt (its pads as the prompt's)
+//                            classifier-free guidance with that negative prompt (its pads as the prompt's); GUID:
+//                            <scale> is HunyuanImage 3.0's guidance token instead (it samples once: no NEG:, no CFG:)
 //   NEED <width> <height> <n> [REF:<path>]... [MASK:<path>] [NEG:<n>]  the VRAM an image of n prompt ids needs (from
 //                            the files); NEG: guidance's negative prompt of n ids
 //                                                                                          -> NEED least_mib=...
@@ -44,9 +50,12 @@
 //   QUIT                     ends the engine
 // A request that fails answers ERROR <message> and the engine goes on.  Before the first line it makes a small image
 // (its kernels built and the library's first products set up; skipped when the GPU has no room) and lets its buffers
-// go, then says READY budget_mib=<M>.
+// go, then says READY budget_mib=<M>.  A model whose sequence has a shape of its own (HunyuanImage 3.0, whose ids
+// carry the image block) warms up with one of its own: the pipeline says so in warm_up_request.
 
 #include "strata/core/gpu.hpp"
+#include "strata/image/hunyuanimage3_file.hpp"
+#include "strata/image/hunyuanimage3_pipeline.hpp"
 #include "strata/image/qi_image_io.hpp"
 #include "strata/image/mf_pipeline.hpp"
 #include "strata/image/qi_pipeline.hpp"
@@ -105,6 +114,8 @@ std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r) {
         else if (word.rfind("MASK:", 0) == 0) r.mask = read_image(word.substr(5));
         else if (word.rfind("NEG:", 0) == 0) r.neg_ids = parse_ids(word.substr(4));
         else if (word.rfind("CFG:", 0) == 0) r.cfg = std::stof(word.substr(4));
+        else if (word.rfind("GUID:", 0) == 0) r.guidance = std::stof(word.substr(5));
+        else if (word.rfind("STEPS:", 0) == 0) r.steps = std::stoll(word.substr(6));
         else if (word.rfind("REF:", 0) == 0) refs.push_back(read_image(word.substr(4)));
         else throw std::invalid_argument("unknown word " + word);
     }
@@ -136,12 +147,13 @@ std::string plan_kv(const si::QiTimes& t, const si::QiPlan& p) {
     std::snprintf(b, sizeof b,
                   "text_s=%.3f sampling_s=%.3f decode_s=%.3f budget_mib=%llu blocks_mib=%llu resident_blocks=%d "
                   "layers_mib=%llu resident_layers=%d activations_mib=%llu mlp_rows=%lld vae_mib=%llu vae_tiled=%d "
-                  "text_cached=%d prefix_kv_mib=%llu resident_kv=%d",
+                  "text_cached=%d prefix_kv_mib=%llu resident_kv=%d streamed_mib=%llu",
                   t.text, t.sampling, t.decode, (unsigned long long) (p.budget >> 20),
                   (unsigned long long) (p.blocks >> 20), p.resident_blocks, (unsigned long long) (p.layers >> 20),
                   p.resident_layers, (unsigned long long) (p.activations >> 20), (long long) p.mlp_rows,
                   (unsigned long long) (p.vae >> 20), p.vae_tiled ? 1 : 0, p.text_cached ? 1 : 0,
-                  (unsigned long long) (p.prefix_kv >> 20), p.resident_kv);
+                  (unsigned long long) (p.prefix_kv >> 20), p.resident_kv,
+                  (unsigned long long) (p.streamed >> 20));
     return b;
 }
 
@@ -184,12 +196,16 @@ struct Lines {
 };
 
 int serve(si::ImagePipeline& p) {
-    {   // the warm-up: a 256 x 256 image of one step from token ids the vocabulary has; where the GPU has no room
-        // for it now (another program holds it), the first request builds the kernels instead
+    {
+        // the warm-up: a 256 x 256 image of one step from token ids the vocabulary has; where the GPU has no room
+        // for it now (another program holds it), the first request builds the kernels instead.  A model whose
+        // sequence has a shape of its own asks for its own request instead (HunyuanImage 3.0's ids carry the block).
         si::QiRequest r;
-        for (int32_t i = 1; i <= 16; ++i) r.ids.push_back(i * 100);
-        r.width = r.height = 256;
-        r.sigmas = {1.0f, 0.0f};
+        if (!p.warm_up_request(r)) {
+            for (int32_t i = 1; i <= 16; ++i) r.ids.push_back(i * 100);
+            r.width = r.height = 256;
+            r.sigmas = {1.0f, 0.0f};
+        }
         try {
             p.generate(r);
         } catch (const std::exception& e) {
@@ -327,6 +343,8 @@ int main(int argc, char** argv) {
             else if (a == "--height") r.height = std::stoll(val());
             else if (a == "--seed") r.seed = std::stoull(val());
             else if (a == "--sigmas") r.sigmas = parse_sigmas(val());
+            else if (a == "--steps") r.steps = std::stoll(val());
+            else if (a == "--guidance") r.guidance = std::stof(val());
             else if (a == "--budget-mib") budget = std::stoull(val()) << 20;
             else if (a == "--repeat") repeat = std::stoi(val());
             else if (a == "--serve") serving = true;
@@ -338,17 +356,32 @@ int main(int argc, char** argv) {
             else if (a == "--dit-keep") dit_keep = val() != "0";
             else throw std::invalid_argument("unknown option " + a);
         }
-        if (dit.empty() || vae.empty() || text.empty() || (!serving && (out.empty() || ids.empty()))) {
+        // the model is in the DiT's file, not in its extension: both Mage-Flow and HunyuanImage 3.0 are
+        // safetensors, and HunyuanImage 3.0's says so in its header (hunyuanimage3_is_dit_file reads the header
+        // alone, no weights)
+        const bool safetensors = dit.size() > 12 && dit.compare(dit.size() - 12, 12, ".safetensors") == 0;
+        const bool hunyuanimage3 = safetensors && si::hunyuanimage3_is_dit_file(dit);
+        const bool mage = safetensors && !hunyuanimage3;
+        const bool need_text = !hunyuanimage3;
+        if (dit.empty() || vae.empty() || (need_text && text.empty()) ||
+            (!serving && (out.empty() || ids.empty()))) {
             std::fprintf(stderr, "usage: %s --dit F --vae F --text F [--vision F] [--budget-mib M] (--ids 1,2,3 "
                          "[--drop N] [--width W] [--height H] [--seed S] [--sigmas 1,...,0] [--ref IMAGE]... "
                          "[--mask IMAGE] [--repeat N] --out IMAGE.rgba | --serve) [--dit-q8 auto|0|1] [--edit-dit F] "
-                         "[--dit-keep 0|1]\n", argv[0]);
+                         "[--dit-keep 0|1]\n",
+                         argv[0]);
+            std::fprintf(stderr, "       %s: HunyuanImage 3.0 (a quantized .safetensors --dit) takes no --text "
+                         "(its DiT reads the ids itself); [--steps N] [--guidance G] stand for [--sigmas] [--cfg]\n",
+                         argv[0]);
             return 2;
         }
         std::unique_ptr<si::ImagePipeline> pipe;
         std::string err;
-        const bool mage = dit.size() > 12 && dit.compare(dit.size() - 12, 12, ".safetensors") == 0;
-        if (mage) {
+        if (hunyuanimage3) {
+            auto h = std::make_unique<si::HunyuanImage3Pipeline>();
+            if (!h->open(dit, vae, err)) throw std::runtime_error(err);
+            pipe = std::move(h);
+        } else if (mage) {
             auto m = std::make_unique<si::MfPipeline>();
             if (!m->open(dit, vae, text, err, dit_q8, edit_dit, vision, dit_keep)) throw std::runtime_error(err);
             pipe = std::move(m);
