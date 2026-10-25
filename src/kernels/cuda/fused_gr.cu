@@ -2695,7 +2695,7 @@ void hc_q8_to_bf16(const void* codes, const float* scales, uint16_t* out, long l
     hc_q8_bf16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>((const int8_t*) codes, scales, out, n);
 }
 
-// ===================================== the read as ONE persistent kernel (opt-in STRATA_HC_PERSIST=1, HIP) ==============
+// ================================== the read as ONE persistent kernel (opt-in STRATA_HC_PERSIST=1, CUDA + HIP) ==============
 // 80 blocks that must all be resident (a start-up run per T decides; larger T keep the default read) and two grid
 // barriers on an atomic counter.  Block b: (A) stages R' * w_norm for columns [128 b, 128 b + 128) (one stream) and writes
 // that slice's sum of squares and the UNSCALED partial dots of the 320 down + 4 inject rows (the v3 identity
@@ -2703,9 +2703,18 @@ void hc_q8_to_bf16(const void* codes, const float* scales, uint16_t* out, long l
 // barrier; (C) the up projection read straight from VRAM, a thread pair per row, the epilogue as gr_up_kernel.
 // ANOTHER SUMMATION ORDER than the default read (not bitwise; the init check bounds the difference).  Only the verifier's hyper-connection reads use it: they run on one stream per card (both pipeline
 // verifiers share it), so two of these kernels never wait on each other; the drafter's reads keep the default kernels.
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) || defined(__CUDACC__)
 namespace {
 namespace hcp {
+// CUDA spells the shuffle with an explicit mask; HIP without.  One helper so the kernel body below stays portable.
+template <typename T>
+__device__ __forceinline__ T shfl_xor_persist(T v, int mask) {
+#if defined(__HIPCC__)
+    return __shfl_xor(v, mask);
+#else
+    return __shfl_xor_sync(0xffffffffu, v, mask);
+#endif
+}
 // Measured on gfx1030 (bench/results/2026-10-12-hc-persist-gfx1030): the gain over the three-kernel read is (1) the down
 // projection split by column slices over all 80 blocks (the default read runs 41 blocks staging the activations through
 // LDS) and (2) one launch with two grid barriers instead of three launches and the gaps between them.  Prefetching the
@@ -2733,6 +2742,35 @@ __device__ __forceinline__ bool grid_sync(unsigned* bar, unsigned long long tick
     (void) ticks;
     if (threadIdx.x == 0) __hip_atomic_store(&bar[48], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     return false;
+#elif defined(__CUDACC__)
+    // CUDA: the same generation barrier.  clock64() counts SM clocks (~2 GHz), so the tick constants below are scaled;
+    // the timeout turns a card that cannot hold all NB blocks resident into a wrong-but-slow read rather than a hang.
+    __shared__ int s_abort;
+    volatile unsigned* vb = bar;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int ab = 0;
+        const unsigned gen = vb[32];
+        __threadfence();
+        const unsigned arrived = atomicAdd(&bar[0], 1u);
+        if (arrived == NB - 1) {
+            atomicExch(&bar[0], 0u);
+            __threadfence();
+            atomicAdd(&bar[32], 1u);
+        } else {
+            const long long t0 = clock64();
+            while (vb[32] == gen) {
+                if (vb[48] != 0u) { ab = 1; break; }
+                if (clock64() - t0 > (long long) ticks) { atomicExch(&bar[48], 1u); ab = 1; break; }
+                __nanosleep(64);
+            }
+        }
+        if (vb[48] != 0u) ab = 1;
+        s_abort = ab;
+    }
+    __syncthreads();
+    __threadfence();
+    return s_abort == 0;
 #else
     __shared__ int s_abort;
     __syncthreads();
@@ -2801,7 +2839,7 @@ __global__ void __launch_bounds__(THREADS) persist_kernel(PArgs f) {
         if constexpr (DP) {
             double ss = (double) r.x * r.x + (double) r.y * r.y + (double) r.z * r.z + (double) r.w * r.w;
 #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor(ss, o);
+            for (int o = 16; o > 0; o >>= 1) ss += shfl_xor_persist(ss, o);
             if (lane == 0) f.sspd[k * NB + b] = ss;
         } else {
             const float ss = warp_sum(r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w);   // warp k = token k
@@ -2823,7 +2861,7 @@ __global__ void __launch_bounds__(THREADS) persist_kernel(PArgs f) {
             A v;
             if constexpr (DP) v = dot8d(w, &xs[k][hl * 8]); else v = dot8(w, &xs[k][hl * 8]);
 #pragma unroll
-            for (int o = 8; o > 0; o >>= 1) v += __shfl_xor(v, o);
+            for (int o = 8; o > 0; o >>= 1) v += shfl_xor_persist(v, o);
             acc[k] = v;
         }
 #pragma unroll
@@ -2911,7 +2949,7 @@ __global__ void __launch_bounds__(THREADS) persist_kernel(PArgs f) {
         }
         float acc[T];
 #pragma unroll
-        for (int k = 0; k < T; ++k) acc[k] = (float) (v[k] + __shfl_xor(v[k], 1));
+        for (int k = 0; k < T; ++k) acc[k] = (float) (v[k] + shfl_xor_persist(v[k], 1));
         if (uh == 0) {
             const float wn = a0.w_norm[ui];
 #pragma unroll
@@ -2967,7 +3005,13 @@ bool dp_on() {
 KFn kernel_for(int T) { return dp_on() ? kernel_t<true>(T) : kernel_t<false>(T); }
 // s_memrealtime runs at 100 MHz on RDNA: a barrier gives up after 2 s in a read (never in a working run; it only turns a
 // hang into a wrong read) and after 50 ms in the start-up check (where a timeout means "not resident here")
+#if defined(__CUDACC__)
+// clock64() counts SM clocks (~2 GHz on these cards): 2 s a read, 50 ms the start-up check, the same wall times the
+// HIP constants give at s_memrealtime's 100 MHz
+constexpr unsigned long long kTicksRun = 4000000000ULL, kTicksCheck = 100000000ULL;
+#else
 constexpr unsigned long long kTicksRun = 200000000ULL, kTicksCheck = 5000000ULL;
+#endif
 void launch(const FusedGrArgs* a, int n_tok, const DevState& st, cudaStream_t s, unsigned long long ticks) {
     PArgs f;
     for (int t = 0; t < n_tok; ++t) f.a[t] = a[t];
@@ -2995,11 +3039,13 @@ void fused_gr_persist_init() {
                              "(this card runs %d)\n", dev, prop.warpSize);
         return;
     }
+#if defined(__HIPCC__)
     if (strata::kernels::gfx_arch_is_gfx12(prop.gcnArchName) || strata::kernels::gfx_arch_is_gfx11_wmma(prop.gcnArchName)) {
         std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: gfx11 / gfx12 have no s_memrealtime for the barrier "
                              "timeout (written and measured for gfx1030; an R9700 saw no gain from it, #2226)\n", dev);
         return;
     }
+#endif
     const int mp = prop.multiProcessorCount;   // only for the confirmation line (WGPs on RDNA)
     bool ok = cudaMalloc((void**) &st.part, (size_t) kFusedGrMaxT * hcp::NR * hcp::NB * sizeof(float)) == cudaSuccess &&
               cudaMalloc((void**) &st.ssp, (size_t) kFusedGrMaxT * hcp::NB * sizeof(float)) == cudaSuccess &&
@@ -3139,3 +3185,6 @@ bool fused_gr_read_persist(const FusedGrArgs*, int, void*) { return false; }
 #endif
 
 }  // namespace strata::kernels
+
+
+
