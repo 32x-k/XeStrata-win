@@ -1134,6 +1134,8 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
 // dims) is the A operand of the scores' product, the key tile is B, and the same tile is B of the values' product (the
 // heads' softmaxes and their 512-dim outputs are its rows).  The QK and PV sums are the matrix cores' order, not
 // sparse_attn_packed_kernel's scalar lanes' - hence opt-in (DS4_FAST_ATTN).
+// (HIP only: the CUDA build keeps the scalar kernels, so this and the dispatch below compile out there.)
+#if defined(STRATA_USE_HIP)
 constexpr int kFaHeads = 16;   // heads a tile (the matrix's rows)
 constexpr int kFaKeys = 16;    // keys a tile
 constexpr int kFaD = 512;      // the head dim
@@ -1283,6 +1285,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
             out[((size_t) t * heads + hb + h) * kFaD + dm] = o[f][i] / dv;
         }
 }
+#endif   // STRATA_USE_HIP
 
 // the ring's rows are kKvFp8: E4M3 codes, a UE8M0 scale per 32 (decoded: exactly the BF16 values they were made from)
 __global__ void ring_to_ext_kernel(const uint8_t* __restrict__ ring, uint16_t* __restrict__ ext, long long p0, int n,
@@ -2262,11 +2265,13 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     }
     // DS4_FAST_ATTN=1: the chunked prompt's matrix-core path (16 heads a block, a 16-key tile).  The decode and the
     // verify windows keep the scalar kernels: one query's heads are not the matrix's rows there.
+#if defined(STRATA_USE_HIP)
     if (fast_attn_enabled() && a.gen != 0 && T >= kFaKeys && heads % kFaHeads == 0) {
         sparse_attn_wmma_kernel<<<dim3(heads / kFaHeads, T), kThreads, 0, s>>>(q, win, (const uint8_t*) ckv, sel, sel_stride,
                                                                               a, sink, heads, scale, out);
         return;
     }
+#endif
     // packed rows: as many heads a block as still leaves two blocks a multiprocessor (a decoded row serves them all)
     int G = heads_per_block;    if (G != 1 && G != 2 && G != 4 && G != 8) {
         G = 8;

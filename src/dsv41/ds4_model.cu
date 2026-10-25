@@ -4354,6 +4354,16 @@ struct Model::Impl {
             for (int X = 0; X < NH && ok; ++X) {
                 size_t got = bytes;
                 base[(size_t) X] = (uint8_t*) (huge ? os::huge_alloc(bytes, &got) : node_map(bytes, X, NH));
+                if (huge && base[(size_t) X] == nullptr) {   // no pool on this machine: the ordinary arena instead
+                    static bool warned = false;
+                    if (!warned) {
+                        std::fprintf(stderr, "ds4: DS4_COPY_HUGETLB=1 but no 2 MB huge pages are free (reserve them: sysctl "
+                                             "vm.nr_hugepages=N); using the ordinary arena\n");
+                        warned = true;
+                    }
+                    got = bytes;
+                    base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH);
+                }
                 ok = base[(size_t) X] != nullptr;
                 if (ok) {
                     ram_chunks.push_back(base[(size_t) X]);
