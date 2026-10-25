@@ -12,6 +12,7 @@
 // The state is left as the windows leave it: the GDN recurrent state and conv history (the same layouts), the K/V
 // cells of the chunk's positions.  The decode then continues at the next position.
 #include "strata/core/plain_model.hpp"
+#include "strata/core/expert_tier.hpp"
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
@@ -312,24 +313,18 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     std::vector<char> on_cpu((size_t) E, 0);
     std::vector<int32_t> cpu_experts;
     if (cpu_share && f.gu_type != 42) {
-        std::vector<std::pair<int32_t, int32_t>> missed;
-        int hits = 0, n_missed = 0;
-        for (int64_t e = 0; e < E; ++e)
-            if (count[(size_t) e] > 0) {
-                if (res_[(size_t) (ml * E + e)] >= 0) {
-                    ++hits;
-                    continue;
-                }
-                ++n_missed;
-                // the CPU's jobs keep their blob pointers while the GPU's groups stage the rest: an expert assembled
-                // into a short-lived buffer (`transient`) stays on the GPU (upstream 92bce20e)
-                if (src_->pinned(ml, e) || !src_->transient(ml, e)) missed.emplace_back(count[(size_t) e], (int32_t) e);
-            }
+        int hits = 0;
+        for (int64_t e = 0; e < E; ++e) hits += count[(size_t) e] > 0 && res_[(size_t) (ml * E + e)] >= 0;
+        // the candidates (core/expert_tier, as Qwen3.8-Flash-Next's prompt path takes them)
+        const CpuShareCandidates cc = cpu_share_candidates(
+            count.data(), E, ml, *src_, [&](int32_t e) { return res_[(size_t) (ml * E + e)] >= 0; },
+            [](int32_t) { return false; });
+        const std::vector<std::pair<int32_t, int32_t>>& missed = cc.cand;
+        const int n_missed = (int) cc.missed;
         // a fixed share (--prefill-cpu-share S) gives the CPU S of the missed experts, else the times decide
         const double fixed = strata::prefill::cpu_share_setting();
         int want = fixed > 0.0 ? (int) std::lround(fixed * (double) n_missed)
                                : n_missed - pcie_split_m(split_, true, n_missed, hits);
-        std::sort(missed.begin(), missed.end());
         int64_t rows = 0;
         for (const auto& [c, e] : missed) {
             if (want <= 0 || c > k::cpu::MAXT || rows + c > P.cpu_cap) break;

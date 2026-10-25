@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
+#include "strata/core/expert_tier.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
@@ -2502,19 +2503,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     std::vector<const uint8_t*> cpu_blob;   // their blobs, taken here (the CPU thread calls no ExpertSource)
                     int64_t rows_cpu = 0, n_cpu = 0, n_stream = 0;
                     if (cpu_maybe) {
-                        std::vector<std::pair<int32_t, int32_t>> cand;   // (tokens, expert)
-                        for (int32_t e = 0; e < m.g->n_expert; ++e) {
-                            const int32_t c = m.cnt[(size_t) e];
-                            if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) ||
-                                helped(e))
-                                continue;
-                            ++n_stream;
-                            // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
-                            // short-lived buffer (the arena's unpinned part, the mapped files' pages; upstream 92bce20e)
-                            if (c <= strata::kernels::cpu::MAXT && (m.src->pinned(l, e) || !m.src->transient(l, e)))
-                                cand.emplace_back(c, e);
-                        }
-                        std::sort(cand.begin(), cand.end());
+                        // the candidates (core/expert_tier, as the other models' prompt path takes them)
+                        const strata::core::CpuShareCandidates cc = strata::core::cpu_share_candidates(
+                            m.cnt.data(), m.g->n_expert, l, *m.src,
+                            [&](int32_t e) {
+                                return m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                            },
+                            helped);
+                        const std::vector<std::pair<int32_t, int32_t>>& cand = cc.cand;   // (tokens, expert)
+                        n_stream = cc.missed;
                         const double share = cpu_share_env() >= 0.0 ? cpu_share_env() : cpu_arm ? m.cpu_share_now : 0.0;
                         const size_t take = std::min(cand.size(), (size_t) std::llround(share * (double) n_stream));
                         // the MoE input for the CPU's experts, only when it takes some (a layer whose experts all have

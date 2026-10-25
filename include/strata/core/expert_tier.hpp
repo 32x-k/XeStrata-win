@@ -12,6 +12,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
@@ -98,6 +99,29 @@ inline std::vector<TierSwap> choose_ram_swaps(const float* usage, const int32_t*
     std::sort(swaps.begin(), swaps.end(), [](const TierSwap& a, const TierSwap& b) { return a.gain > b.gain; });
     if ((int) swaps.size() > n) swaps.resize((size_t) std::max(n, 0));
     return swaps;
+}
+
+/// A prompt chunk's layer, for the CPU's share of the experts the GPU does not hold: `missed` the routed experts not in
+/// VRAM, `cand` (rows, expert) those the CPU may take, fewest rows first - at most MAXT rows (one multi-token job) and a
+/// blob the CPU reads where it lies, page-locked or not assembled into a short-lived buffer (the CPU's jobs keep their
+/// pointers while the GPU's groups stage the rest; upstream 92bce20e).  How many of them the CPU takes is each engine's
+/// (a share of `missed`).  `in_vram(e)`, `skip(e)`: an expert another part computes (a helper GPU's).
+struct CpuShareCandidates {
+    int64_t missed = 0;
+    std::vector<std::pair<int32_t, int32_t>> cand;
+};
+template <class InVram, class Skip>
+CpuShareCandidates cpu_share_candidates(const int32_t* counts, int64_t n_expert, int64_t layer, const ExpertSource& src,
+                                        InVram in_vram, Skip skip) {
+    CpuShareCandidates r;
+    for (int32_t e = 0; e < (int32_t) n_expert; ++e) {
+        const int32_t c = counts[e];
+        if (c == 0 || in_vram(e) || skip(e)) continue;
+        ++r.missed;
+        if (c <= kernels::cpu::MAXT && (src.pinned(layer, e) || !src.transient(layer, e))) r.cand.emplace_back(c, e);
+    }
+    std::sort(r.cand.begin(), r.cand.end());
+    return r;
 }
 
 // The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
