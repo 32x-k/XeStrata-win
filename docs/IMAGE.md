@@ -84,11 +84,11 @@ HunyuanImage 3.0 comes in Tencent's two quantizations (`--image-quant`; w4a8 by 
 
 | Size | Download | RAM, about | VRAM |
 | --- | ---: | ---: | ---: |
-| w4a8 (default) | 52.8 GB | 52 GB | 10 GB and up (edits about 14 GB and up) |
-| int8 | 87.7 GB | 87 GB | 12 GB and up (edits about 16 GB and up) |
+| w4a8 (default) | 52.8 GB | 52 GB | 12 GB and up (edits about 20 GB and up) |
+| int8 | 87.7 GB | 87 GB | about 14 GB and up (edits about 22 GB and up) |
 
 w4a8 is 4-bit weights with 8-bit activations (Tencent's quantization for ComfyUI), a step about 2.5 times as fast as int8's; int8 (convrot's int8) comes nearer the bf16 weights' images.
-A GPU that does not hold the weights that always stay in VRAM (about 6.7 GB; with edits, SigLIP2's and the VAE encoder's 1.3 GB too) and two slots for the streamed experts (2.7 GB for w4a8, 4.8 GB for int8) cannot run it. While an edit's reference images are read, the VAE encoder works in buffers of its own (about 6 GB for a 1024x1024 reference, given back once they are read). More VRAM keeps more experts resident and is faster. The VAE takes about 7.5 GB of working memory at 1024x1024 and is not tiled, so a size whose decode does not fit is refused.
+A GPU that does not hold the weights that always stay in VRAM (about 6.7 GB; with edits, SigLIP2's and the VAE encoder's 1.6 GB too, put there with the first reference image) and two slots for the streamed experts (2.7 GB for w4a8, 4.8 GB for int8) cannot run it. More VRAM keeps more experts resident and is faster. The VAE takes about 7.5 GB of working memory at 1024x1024; where that does not fit, it decodes in tiles as the reference implementation does (slower, and the picture differs slightly from the whole decode's). While an edit's reference images are read, the VAE encoder works in buffers of its own (about 7.5 GB for a 1024x1024 reference, given back once they are read); that is not tiled, so an edit that does not fit is refused.
 
 - **The download** is the image model (for Mage-Flow, the generation and edit models), the VAE, the text encoder (Q8_0) and the picture reader for edits (none for MageTrail) together (for HunyuanImage 3.0, its tokenizer and system prompt instead of a text encoder, and the SigLIP2 shard for its edits).
 - **The RAM** is needed besides the text model's: the files' sizes plus about 2 GB for the engine itself.
