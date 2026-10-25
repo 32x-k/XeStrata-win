@@ -55,7 +55,8 @@ class TemplateTests(unittest.TestCase):
 @unittest.skipUnless(MAKENSIS.is_file(), "NSIS (the Tauri bundler's copy) is not installed here")
 class MigrationTests(unittest.TestCase):
     def run_nsis(self, body: str, work: Path):
-        block = re.search(r"; STRATA-MIGRATE-BEGIN.*?; STRATA-MIGRATE-END", TEMPLATE.read_text(encoding="utf-8"), re.S).group(0)
+        template = TEMPLATE.read_text(encoding="utf-8")
+        block = chr(10).join(re.search(rf"; STRATA-{name}-BEGIN.*?; STRATA-{name}-END", template, re.S).group(0) for name in ("MIGRATE", "STOP"))
         script = work / "t.nsi"
         script.write_text('Unicode true\nOutFile "t.exe"\nRequestExecutionLevel user\nSilentInstall silent\n' + block + "\nSection\n" + body + "\nSectionEnd\n", encoding="utf-8")
         done = subprocess.run([str(MAKENSIS), "/V1", str(script)], cwd=work, capture_output=True, text=True)
@@ -107,6 +108,39 @@ class MigrationTests(unittest.TestCase):
             for name in DATA:
                 self.assertTrue((old / name).is_file(), name)
             self.assertFalse((old / "strata-desktop.exe").exists())
+
+
+    def test_the_uninstaller_stops_only_the_processes_started_from_the_install_folder(self):
+        ping = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "PING.EXE"
+        if not ping.is_file():
+            self.skipTest("no PING.EXE to stand in for a running Strata process")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            inst, other = base / "Programs" / "Strata", base / "Elsewhere"
+            for folder in (inst / "node", other):
+                folder.mkdir(parents=True)
+            mine = inst / "node" / "node.exe"
+            theirs = other / "node.exe"
+            for target in (mine, theirs):
+                target.write_bytes(ping.read_bytes())
+            procs = [subprocess.Popen([str(p), "-t", "127.0.0.1"], stdout=subprocess.DEVNULL) for p in (mine, theirs)]
+            try:
+                self.run_nsis(f'!insertmacro StrataStopOwnProcesses "{inst}"', base)
+                procs[0].wait(timeout=20)
+                self.assertIsNotNone(procs[0].poll(), "the process from the install folder was stopped")
+                self.assertIsNone(procs[1].poll(), "a process of the same name elsewhere is left running")
+            finally:
+                for proc in procs:
+                    if proc.poll() is None:
+                        proc.kill()
+                    proc.wait()
+
+
+class StopOrderTests(unittest.TestCase):
+    def test_the_uninstaller_stops_them_before_it_removes_files(self):
+        text = TEMPLATE.read_text(encoding="utf-8")
+        uninstall = text[text.index("Section Uninstall"):]
+        self.assertLess(uninstall.index("StrataStopOwnProcesses"), uninstall.index(r'Delete "$INSTDIR\${MAINBINARYNAME}.exe"'))
 
 
 if __name__ == "__main__":

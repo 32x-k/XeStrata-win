@@ -701,6 +701,19 @@ SectionEnd
 !macroend
 ; STRATA-MIGRATE-END
 
+; STRATA-STOP-BEGIN
+; Stop what Strata itself started from the install folder (the app, its host, the node runtime, the engine) before files are removed:
+; a running copy keeps its files open, so the folder stayed behind after use. Only processes whose image path is inside INSTDIR are
+; stopped; this uninstaller's own process and any program elsewhere are left alone.
+!macro StrataStopOwnProcesses INSTALLDIR
+  System::Call 'kernel32::SetEnvironmentVariableW(w "STRATA_INSTDIR", w "${INSTALLDIR}")'
+  System::Call 'kernel32::GetCurrentProcessId()i.r9'
+  System::Call 'kernel32::SetEnvironmentVariableW(w "STRATA_SELFPID", w "$9")'
+  nsExec::Exec 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$d = $$env:STRATA_INSTDIR.TrimEnd([char]92) + [char]92; Get-CimInstance Win32_Process | Where-Object { $$_.ExecutablePath -and $$_.ExecutablePath.StartsWith($$d, [StringComparison]::OrdinalIgnoreCase) -and $$_.ProcessId -ne [int]$$env:STRATA_SELFPID } | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force -ErrorAction SilentlyContinue }; Start-Sleep -Milliseconds 500"'
+  Pop $9
+!macroend
+; STRATA-STOP-END
+
 Section Install
   SetOutPath $INSTDIR
 
@@ -847,6 +860,7 @@ Section Uninstall
     !insertmacro NSIS_HOOK_PREUNINSTALL
   !endif
 
+  !insertmacro StrataStopOwnProcesses "$INSTDIR"
   !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
   ; Delete the app directory and its content from disk
