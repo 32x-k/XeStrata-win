@@ -957,6 +957,8 @@ bool PlainModel::open_experts(std::string& err) {
         } else {
             auto file = std::make_unique<FileExpertSource>();
             file->set_gguf(opt_.gguf);
+            if (const char* v = std::getenv("STRATA_FETCH_THREADS"))   // the prompt's read-ahead threads, as generate.cpp
+                if (const long n = std::strtol(v, nullptr, 10); n > 0) file->set_fetch_threads((int) std::min<long>(n, 256));
             if (!file->open(std::string(), L, E, err)) return false;
             src_own_ = std::move(file);
         }
