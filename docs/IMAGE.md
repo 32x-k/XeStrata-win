@@ -40,7 +40,7 @@ In this document "Qwen-Image-2.1" means both Turbo and the base model; what hold
 - **MageTrail** is Mage-Flow's image model reshaped and tuned; it has a generation model only, and makes no edits.
   Its prompts can be booru tags (`1girl, solo, silver hair, ...`) or sentences; `masterpiece, best quality, very aesthetic, aesthetic` raises the quality, and `Drawn by <artist>` at the start takes that artist's style (the 100 artists of the list MageTrail's author publishes).
   Its VAE is the Flux2 VAE its author uses (as Black Forest Labs publishes it with FLUX.2-klein-4B).
-- **HunyuanImage 3.0** edits with up to 3 reference images (the model's own way: a reference goes in as its VAE latent and as SigLIP2's features, before the prompt); it has no masks or transparent backgrounds. The size is made at the one of the model's own 37 sizes (buckets) whose shape is nearest the one asked for (512x512 becomes 1024x1024).
+- **HunyuanImage 3.0** edits with up to 3 reference images (the model's own way: a reference goes in as its VAE latent and as SigLIP2's features, before the prompt); it has no masks or transparent backgrounds. The size is made at the one of the model's own 37 sizes (buckets) whose shape is nearest the one asked for (512x512 becomes 1024x1024). With the size `auto`, or none, the model chooses the aspect ratio itself from the prompt (and an edit's reference images), as Tencent's `image_size="auto"` does; the choice takes 4 to 13 seconds on a B70.
   The weights are Tencent's two quantizations (w4a8 and int8). It draws from the prompt at once, not the way Tencent runs it by default (the model reasoning and rewriting the prompt before it draws).
 
 ## Installing
@@ -51,7 +51,7 @@ xestrata --setup --images qwen-image-turbo     # installed from the source: ./se
 
 - Setup downloads the image model, the VAE, the text encoder and the picture reader for edits (Qwen3-VL's mmproj), and adds `"images"` to the config.
   Every file is pinned to a revision and checked by its SHA-256.
-- HunyuanImage 3.0 downloads five files: its image model (Tencent's quantization), the VAE, the model's own `tokenizer.json`, the `system_prompt.py` that holds its system prompt, and the last of the model's bf16 shards, which holds the SigLIP2 that reads an edit's reference images (3.3 GB, of which the engine reads 0.9 GB).
+- HunyuanImage 3.0 downloads five files: its image model (Tencent's quantization), the VAE, the model's own `tokenizer.json`, the `system_prompt.py` that holds its system prompt, and the last of the model's bf16 shards, which holds the SigLIP2 that reads an edit's reference images (3.3 GB, of which the engine reads 0.9 GB). It also takes what the model chooses its size with (the final norm and the output rows of the 37 aspect-ratio tokens) out of the bf16 shards by range requests, into `ratio_head.safetensors` (311 KB).
   Setup reads the system prompt out of `system_prompt.py` into `en_unified.txt` beside them (it never runs the file). It has no text encoder.
   Tencent publishes the weights in bf16 only, so XeStrata takes Tencent's quantized files (single checkpoints made for ComfyUI) pinned where they are published.
 - Setup run interactively asks for the image models too (numbers, comma-separated; with two or more, which is the default, and whether to take the text encoder with the refusal direction removed). Run again for a model, it offers that model's present ones as the default answer.
@@ -128,7 +128,7 @@ The config file's (`xestrata-<model>.json`) `"images"` also has entries to set b
 | `keep_files` | 64 | How many `response_format: "url"` images are kept |
 | `out_dir` | a temporary folder | The folder for the images and the engine's log (`strata-image.log`) |
 
-HunyuanImage 3.0's `"images"` also has `steps` (8), `guidance` (2.5), `resolutions` (the resolution buckets' parameters) and `vision` (the shard with SigLIP2); its `max_refs` defaults to 3.
+HunyuanImage 3.0's `"images"` also has `steps` (8), `guidance` (2.5), `resolutions` (the resolution buckets' parameters), `vision` (the shard with SigLIP2) and `ratio_head` (what it chooses its size with; without it `auto` is 1024x1024); its `max_refs` defaults to 3.
 
 ## The web page and the chat
 
@@ -136,7 +136,7 @@ HunyuanImage 3.0's `"images"` also has `steps` (8), `guidance` (2.5), `resolutio
 
 - With several models installed, the model can be chosen; the fields' defaults and which fields there are (steps, transparent background, edits, mask) follow it.
 - Choose the prompt, the size (1024x1024, 1536x1024, 1024x1536, 768x768, 512x512, 1920x1080, 1080x1920, auto, or any size with sides of 256 to 2048) and the seed, and press Generate.
-  HunyuanImage 3.0 makes the image at the one of its 37 sizes (buckets) whose shape is nearest the one asked for, and says so when the size differs.
+  HunyuanImage 3.0 makes the image at the one of its 37 sizes (buckets) whose shape is nearest the one asked for, and says so when the size differs. With `auto` it makes the image at the size the model chooses.
 - The number of images and the format (PNG, JPEG, WebP or JPEG XL; all but PNG with a quality) can be chosen; a transparent background takes no JPEG.
   The number goes up to what fits in `budget_s` at the size and steps chosen (`max_n` at most), with the estimated time beside it.
   The format is JPEG XL by default (quality 100, lossless) when the browser shows it and the server writes it, PNG otherwise. The format and quality chosen are kept in the browser.
@@ -170,7 +170,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | --- | --- | --- |
 | `prompt` | — | Required; up to 16,000 characters |
 | `model` | the default model | The image model's name (as `/v1/models` lists it), to choose one where several are installed. An unknown name (OpenAI's `gpt-image-1`, for example) is the default model |
-| `size` | `auto` (1024x1024) | `WIDTHxHEIGHT`, sides of 256 to 2048. A size whose sides are not multiples of 16 (1920x1080 and the like) is made at the multiples of 16 above it and its middle cut out. HunyuanImage 3.0 makes the image at the bucket (of its 37) whose shape is nearest, and the answer's `size` is that one |
+| `size` | `auto` (1024x1024) | `WIDTHxHEIGHT`, sides of 256 to 2048. A size whose sides are not multiples of 16 (1920x1080 and the like) is made at the multiples of 16 above it and its middle cut out. HunyuanImage 3.0 makes the image at the bucket (of its 37) whose shape is nearest, and the answer's `size` is that one; with `auto` or none, at the bucket the model chooses |
 | `n` | 1 | 1 to `max_n` (16); a number that does not fit in `budget_s` is refused with the estimated time. Image i uses the seed `seed + i` |
 | `seed` | random | 0 to 2^62 |
 | `steps` (`num_inference_steps`) | the model's steps | 2 to 100 for Qwen-Image-2.1's base model, 1 to 100 for Mage-Flow and HunyuanImage 3.0 (8 by default there); Turbo stays at 8 |
@@ -194,7 +194,7 @@ Makes an image from reference images: rewriting a reference image, or making a p
   PNG, JPEG, GIF and BMP are read as they are, other formats (WebP and others) are turned into PNG first.
 - **The model:** `model` chooses it. Without one the default model edits, or, where the default makes images only (MageTrail), the first model that edits, and the answer's `model` says which.
   An edit that names MageTrail is refused.
-- **The size:** `size` `auto`, or none, gives the first reference image's aspect ratio at about 1024x1024 pixels.
+- **The size:** `size` `auto`, or none, gives the first reference image's aspect ratio at about 1024x1024 pixels. HunyuanImage 3.0 makes the size the model chooses from the reference images and the prompt.
 - **How the references are read:** Qwen-Image-2.1 reads each at about 1024x1024 pixels with its aspect ratio kept, whatever the output's size; more references take more time and memory.
   Mage-Flow's picture reader reads them with the long side at 384 pixels or less, and its VAE at the output's size.
   HunyuanImage 3.0 cuts a reference to the bucket whose shape is nearest and reads it with its VAE (4,096 tokens at 1024x1024) and with SigLIP2 (at most 1,024 patches): about 5,000 tokens a reference, which lengthen each step.
@@ -206,7 +206,7 @@ Makes an image from reference images: rewriting a reference image, or making a p
 
 - `data[]`: the images (`b64_json` or `url`), with `revised_prompt` and `seed`.
 - `usage`: counted in the image engine's tokens (the prompt's tokens, and one token for each 16x16 pixels of the reference images and the image made). For HunyuanImage 3.0: the prompt's ids, one for each 16x16 pixels of the image made, and a reference image's VAE tokens and 1,024 SigLIP2 slots.
-- `strata`: the seconds taken, the steps, CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`) and, when the size asked for was another, that size (`requested_size`).
+- `strata`: the seconds taken, the steps, CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`), when the size asked for was another, that size (`requested_size`), and when the model chose the size, the seconds the choice took (`size_choice_s`).
 - The image model is listed in `/v1/models` too.
 
 ### From the chat
