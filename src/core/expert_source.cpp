@@ -2889,9 +2889,17 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // only when no other token of the window needed it, so a token's output depended on the window's other rows
         // (window-invariant output, #152).  Not with a helper GPU, which may hold it.
         const int tail_rank = tail_skip_rank();
+        // STRATA_DISK_SKIP_FROM=R (Project Maya's STRATA_GLM_DISK_SKIP_FROM, #109; opt-in, changes the output): the
+        // same for a missed expert the RAM copy does not hold either, read from the model file (`transient`), routed at
+        // rank >= R by every token of the window: the SSD is not waited for.  Maya also skips such an expert by its
+        // route weight; the dispatch has the ids only, so the rank alone here
+        static const int disk_rank = [] {
+            const char* v = std::getenv("STRATA_DISK_SKIP_FROM");
+            return v != nullptr ? std::max(0, (int) std::strtol(v, nullptr, 10)) : 0;
+        }();
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
-        if (tail_rank > 0 && tail_rank < k && d.remote_count == 0) {
+        if (((tail_rank > 0 && tail_rank < k) || (disk_rank > 0 && disk_rank < k)) && d.remote_count == 0) {
             int minr[kMaxWindowEntries];
             for (int q = 0; q < nd; ++q) minr[q] = 99;
             for (int64_t i = 0; i < n; ++i) {
@@ -2901,8 +2909,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             for (int q = 0; q < nd; ++q) {
                 const int32_t e = ids[distinct[q]];
-                if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
+                if (e < 0 || e >= d.n_expert) continue;
                 if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
+                const bool tail = tail_rank > 0 && minr[q] >= tail_rank;
+                const bool disk = disk_rank > 0 && minr[q] >= disk_rank && d.src->transient(d.layers, e);
+                if (!tail && !disk) continue;
                 skip_d[q] = true;
                 --nmiss;
                 ++d.tail_experts;
@@ -2973,9 +2984,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     ++miss_rank;
                 }
             }
+            // a tail entry of a missed expert (above); STRATA_DISK_SKIP_FROM's of one read from the file, per entry too
+            const bool on_disk = kd != 0 && disk_rank > 0 && d.src->transient(d.layers, e);
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) kind[i] = kd != 0 && tail_rank > 0 && d.remote_count == 0 && i % k >= tail_rank
-                                                     ? -2 : kd;   // a tail entry of a missed expert (above)
+                if (first_of[i] == i0)
+                    kind[i] = kd != 0 && d.remote_count == 0 &&
+                                      ((tail_rank > 0 && i % k >= tail_rank) || (on_disk && i % k >= disk_rank))
+                                  ? -2 : kd;
             if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
             P.ptr[groups] = ptr;
             P.start[groups] = entries;

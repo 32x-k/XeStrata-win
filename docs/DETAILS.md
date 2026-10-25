@@ -374,6 +374,7 @@ When RAM is short of all the experts, the engine keeps the ones VRAM does not ho
 reads the rest from the model file through the OS file cache (slower; setup warns of it when the RAM and the VRAM
 together are short).
 `STRATA_RAM_ADAPT=<n>` (above) makes the RAM copy follow the conversation then, on one GPU.
+`STRATA_DISK_SKIP_FROM=R` (opt-in, changes the answer, after Project Maya's #109): an expert held neither in VRAM nor in the RAM copy, read from the file, contributes zero to the tokens that route it at rank R or lower, and one that every token of the window routes that low is not read (the SSD is not waited for). GLM-5.3-Flash UD-IQ3_XXS on the B70 with its RAM held to 56 GB decoded 4.33 -> 5.11 tokens/s with R=6 (the same 128 tokens) and 5.93 with R=4 (parting at the 13th token).
 
 The engine's options (added to the settings' `args`):
 
