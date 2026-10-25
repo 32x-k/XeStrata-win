@@ -84,7 +84,7 @@ PlainModel::PromptGemm& PlainModel::prompt_gemm() {
 
 bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     if (!settle_swaps(true, err)) return false;   // the tier's copies may still be writing the slots lent below
-    const int64_t L = n_moe_, E = spec_.n_expert, n = n_slots_;
+    const int64_t L = n_moe_, E = spec_.n_expert, n = cache_.slots();   // the live slots (--vram-elastic's shrinks)
     const uint64_t* off = cache_.slot_offsets();
     if (borrow_first_ >= 0 || off == nullptr || L <= 0 || n < 2) { err = "plain prompt: no tier to borrow from"; return false; }
     // the chunk's device bytes from the tier's last slots: halved until they take at most half the tier, within its
@@ -141,7 +141,7 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
 }
 
 bool PlainModel::prompt_return(std::string& err) {
-    const int64_t LS = (int64_t) moe_local_.size(), n = n_slots_;
+    const int64_t LS = (int64_t) moe_local_.size(), n = cache_.slots();
     if (borrow_first_ < 0 || LS <= 0) return true;   // a borrow needs slots, and slots need MoE layers
     const auto& lay = k::cpu::expert_layout();
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain prompt: ") + strata::gpu::last_error(); return false; }

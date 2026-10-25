@@ -56,6 +56,10 @@ struct PlainOptions {
     /// --kv int8: the attention layers' K and V as int8 codes with an FP16 scale per 64 values (kv_q8.hpp), half the
     /// FP16 cache's bytes; the answers differ slightly.  Not GLM-5.3-Flash's DSA caches.
     bool kv_int8 = false;
+    /// --vram-elastic (#533; --serve, one GPU with virtual memory): the expert slots in physical segments of
+    /// vram_segment_mib that `vram` gives back to the driver and maps again between requests
+    bool vram_elastic = false;
+    int64_t vram_segment_mib = 512;
     int max_t = 8;                  ///< the largest window
     int pool_workers = 0;           ///< CPU pool workers (0: every physical core but the first)
     int64_t reserve_mib = -1;       ///< VRAM left free after the expert slots (-1: from the device's memory)
@@ -194,6 +198,11 @@ public:
     int64_t ram_reads() const;
     int64_t file_reads() const;
     uint64_t file_read_bytes() const;
+    /// #533, `VRAM <reserve_mib>` between requests (--vram-elastic): shrinks the VRAM tier until that much VRAM is
+    /// free, or grows it back towards its full size when more is free (reserve_mib < 0: the reserve it started with).
+    /// `answer` gets the protocol line (VRAM reserve_mib=... expert_slots=...); false with `err` when not elastic.
+    bool vram(int64_t reserve_mib, std::string& answer, std::string& err);
+    bool vram_elastic() const { return cache_.segmented(); }
     /// STRATA_RAM_ADAPT's moves into the RAM copy so far
     int64_t ram_adapts() const { return complement_ != nullptr ? complement_->ram_adapts() : 0; }
     /// The layer split's first blocks after GPU 0's (empty: one GPU).
@@ -547,6 +556,7 @@ private:
     int64_t spec_windows_ = 0, spec_drafted_ = 0, spec_accepted_ = 0;
     double spec_ms_check_ = 0, spec_ms_draft_ = 0;
     std::vector<uint16_t*> k_pool_, v_pool_;      ///< per attention block (FP16; null with kv_int8)
+    std::vector<std::pair<int32_t, int32_t>> vram_evicted_;   ///< `vram`'s shrinks: (residency index, slot)
     std::vector<int8_t*> k_q_, v_q_;              ///< ...kv_int8's codes
     std::vector<uint16_t*> k_scale_, v_scale_;    ///< ...and their scales
     /// The attention block a's pools, for the kernels

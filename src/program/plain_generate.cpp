@@ -140,7 +140,7 @@ void linkless_gpu_adapter() {
 // <context> stop; then `GEN <max_new> [temperature=F top_p=F top_k=N min_p=F seed=N] <ids>` -> RESUME <reused>,
 // one `T <id>` a token, DONE (generate.cpp's fields); STOP ends a request,
 // QUIT the engine; SAVE / RESTORE <path> a session file.  The commands of Qwen3.8-Flash-Next's engine this one has no
-// part for (VRAM, GENI, BGEN) answer ERR.  The conversation's tokens stay read between requests: a request that starts
+// part for (GENI, BGEN) answer ERR; VRAM needs --vram-elastic.  The conversation's tokens stay read between requests: a request that starts
 // with them reads only what follows (a model with a recurrent state only when it extends them all; else it starts
 // over, or from the conversation cache).
 namespace {
@@ -298,7 +298,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     }
     std::vector<int32_t> out((size_t) opt.max_t);
     std::string err;
-    std::printf("INFO context=%lld expert_slots=%lld\n", (long long) ctx, (long long) model.slots());
+    std::printf("INFO context=%lld expert_slots=%lld vram_elastic=%d\n", (long long) ctx, (long long) model.slots(),
+                model.vram_elastic() ? 1 : 0);
     strata::platform::settle_before_ready();
     std::printf("READY %lld stop\n", (long long) ctx);
     std::fflush(stdout);
@@ -316,6 +317,19 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         }
         if (line.empty()) continue;
         stop_req.store(false);   // a STOP between requests ends nothing
+        // VRAM [reserve_mib] (#533, --vram-elastic): the tier shrinks or grows between requests (server.py's vram)
+        if (line == "VRAM" || line.rfind("VRAM ", 0) == 0) {
+            char* end = nullptr;
+            const bool bare = line.size() <= 5;
+            const long long reserve = bare ? -1 : std::strtoll(line.c_str() + 5, &end, 10);
+            std::string answer;
+            if (!bare && (end == line.c_str() + 5 || reserve < 0)) std::printf("ERR expected: VRAM [reserve_mib]\n");
+            else if (!model.vram(reserve, answer, err)) std::printf("ERR %s\n", err.c_str());
+            else std::printf("%s\n", answer.c_str());
+            err.clear();
+            std::fflush(stdout);
+            continue;
+        }
         // SAVE / RESTORE <path>: the live conversation to a file and back (server.py's session_file)
         if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
             const bool save = line[0] == 'S';
@@ -570,6 +584,8 @@ static void plain_usage(const std::string& arch) {
                  "  --expert-cache N|auto   the VRAM tier's most expert slots, over all the layers (default auto)\n"
                  "  --vram-free-mib N    size the VRAM tier from at most N MiB free\n"
                  "  --vram-reserve-mib N leave N MiB of VRAM free beside the tier (default a 32nd of the memory)\n"
+                 "  --vram-elastic       --serve, one GPU (#533): the tier in segments (--vram-segment-mib, default 512)\n"
+                 "                       that the VRAM command gives back and maps again between requests\n"
                  "  --mmap-experts       read the experts from the GGUF through mmap instead of pinned RAM\n"
                  "  --no-pcie-split      the CPU computes every expert the VRAM tier misses\n"
                  "  --kv fp16|int8       the attention layers' K/V cache: FP16 (the default) or int8 codes with a scale\n"
@@ -740,6 +756,9 @@ int plain_main(int argc, char** argv) {
             const std::string v = next("--prefill-cpu-share");
             strata::prefill::set_cpu_share(v == "auto" ? -1.0 : std::max(0.0, std::strtod(v.c_str(), nullptr)));
         }
+        else if (a == "--vram-elastic") opt.vram_elastic = true;
+        else if (a == "--vram-segment-mib")
+            opt.vram_segment_mib = std::strtoll(next("--vram-segment-mib"), nullptr, 10);
         else if (a == "--adapt-min-gain") opt.adapt_min_gain = std::strtof(next("--adapt-min-gain"), nullptr);
         else if (a == "--rope-freq-base") opt.rope_freq_base = std::strtod(next("--rope-freq-base"), nullptr);
         else if (a == "--rope-freq-scale") opt.rope_freq_scale = std::strtod(next("--rope-freq-scale"), nullptr);
@@ -778,6 +797,10 @@ int plain_main(int argc, char** argv) {
     strata::core::PlainModel model;
     model.set_sampler(sp);
     std::string err;
+    if (opt.vram_elastic && !serve) {   // the VRAM command comes between requests
+        std::fprintf(stderr, "strata (%s): --vram-elastic is off: it works between requests of --serve\n", arch.c_str());
+        opt.vram_elastic = false;
+    }
     const Clock::time_point t0 = Clock::now();
     if (opt.prompt_chunk > 0) strata::prefill::Gemm::prepare();   // the products' library loads beside the model
     if (!model.load(opt, err) || !model.prompt_warm(err)) {

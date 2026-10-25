@@ -1040,6 +1040,17 @@ bool PlainModel::open_experts(std::string& err) {
         }
     for (auto& f : free_) std::reverse(f.begin(), f.end());   // taken from the back: the lowest slot first
     cache_.set_max_piece(max_alloc_bytes());   // in pieces where the tier passes the device's largest allocation
+    if (opt_.vram_elastic) {   // #533: in segments, as generate.cpp's cache; one GPU only (a split has a tier per GPU)
+        const char* why = !(first() && last()) ? "a layer split has a tier per GPU"
+                        : opt_.vram_segment_mib < 64 ? "--vram-segment-mib is below 64"
+                        : !strata::gpu::vmem_supported() ? "this GPU's runtime has no virtual memory" : nullptr;
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata plain: --vram-elastic is off: %s\n", why);
+            opt_.vram_elastic = false;
+        } else {
+            cache_.set_segment_bytes(opt_.vram_segment_mib << 20);
+        }
+    }
     if (!slot_bytes.empty() && !cache_.open_sized(slot_bytes, L, E, err)) return false;
     n_slots_ = (int64_t) slot_bytes.size();
     // every expert has its slot and VRAM is left beside the tier: the prompt's buffers there, for the longest chunk
@@ -1306,7 +1317,7 @@ int64_t PlainModel::resident() const {
 }
 
 int64_t PlainModel::slots() const {
-    int64_t n = n_slots_;
+    int64_t n = cache_.slots();   // the live ones: --vram-elastic's shrinks give the tail back
     for (const auto& st : next_) n += st->slots();
     return n;
 }
@@ -1339,6 +1350,94 @@ k::QsaAttnPools PlainModel::kv_pools(size_t a) const {
     pools.v_scale = v_scale_[a];
     pools.page_table = page_table_;
     return pools;
+}
+
+// #533, as generate.cpp's VRAM command: a shrink gives back the cache's last segments, the experts in their slots
+// become misses (the CPU's or PCIe's, as any expert outside the tier) and the slots leave the layers' free lists; the
+// prompt's loan takes the end of what is left (prompt_borrow).  A grow maps them again and puts each slot's expert
+// back, or, when the adaptive tier already brought that one back, the layer's most-routed missing expert.
+bool PlainModel::vram(int64_t reserve_mib, std::string& answer, std::string& err) {
+    if (!cache_.segmented()) {
+        err = "VRAM needs an engine started with --vram-elastic (--serve, one GPU with virtual memory)";
+        return false;
+    }
+    if (reserve_mib < 0) reserve_mib = opt_.reserve_mib >= 0 ? opt_.reserve_mib : (int64_t) (total_b_ >> 20) / 32;
+    if (!settle_swaps(true, err)) return false;   // the adaptive tier's copies land first
+    if (!strata::gpu::device_sync()) { err = std::string("VRAM: ") + strata::gpu::last_error(); return false; }
+    const auto t0 = std::chrono::steady_clock::now();
+    const int64_t E = spec_.n_expert, LS = (int64_t) moe_local_.size();
+    size_t free_b = 0, total_b = 0;
+    strata::gpu::mem_info(&free_b, &total_b);
+    const int64_t want_free = reserve_mib << 20, mapped = cache_.mapped_bytes(), before = cache_.slots();
+    // what stays at least: two slots a layer, so the prompt's loan has room (it halves its chunk down to 16 tokens)
+    const int64_t floor_slots = std::min<int64_t>(cache_.full_slots(), 2 * LS);
+    std::string note;
+    if ((int64_t) free_b < want_free) {
+        int64_t keep = mapped - (want_free - (int64_t) free_b);
+        if (keep < cache_.bytes_of(floor_slots)) {
+            keep = cache_.bytes_of(floor_slots);
+            note = " (the tier keeps its smallest size)";
+        }
+        if (!cache_.shrink(keep, err)) return false;
+        const int64_t live = cache_.slots();
+        for (size_t i = 0; i < res_.size(); ++i)
+            if (res_[i] >= live) {
+                vram_evicted_.emplace_back((int32_t) i, res_[i]);
+                res_[i] = -1;
+            }
+        for (auto& f : free_) f.erase(std::remove_if(f.begin(), f.end(), [&](int32_t s) { return s >= live; }), f.end());
+    } else if (mapped < cache_.full_bytes()) {
+        const int64_t had = cache_.slots();
+        std::string gerr;
+        if (!cache_.grow(mapped + ((int64_t) free_b - want_free), gerr)) note = " (" + gerr + ")";
+        const int64_t live = cache_.slots();
+        std::vector<char> taken((size_t) cache_.full_slots(), 0);
+        std::vector<std::pair<int32_t, int32_t>> keep_out;
+        for (const auto& [i, slot] : vram_evicted_) {
+            if (slot >= live) { keep_out.emplace_back(i, slot); continue; }
+            const int64_t layer = i / E;
+            int64_t pick = i;
+            if (res_[(size_t) i] >= 0) {   // back already (the adaptive tier): the layer's most-routed miss
+                pick = -1;
+                float best = -1.0f;
+                for (int64_t e = 0; e < E; ++e) {
+                    const size_t j = (size_t) (layer * E + e);
+                    if (res_[j] >= 0) continue;
+                    const float u = disp_.usage.empty() ? 0.0f : disp_.usage[j];
+                    if (u > best) { best = u; pick = (int64_t) j; }
+                }
+            }
+            if (pick < 0) continue;
+            if (!src_->copy_blob(layer, pick % E, fill_tmp_) ||
+                !cache_.fill_slot_queued(slot, fill_tmp_, err, (int64_t) k::cpu::expert_layout().blob_bytes(layer)) ||
+                !cache_.sync_queued(err)) {   // one staging buffer: each fill lands before the next is read
+                err.insert(0, err.empty() ? "VRAM: refilling the tier failed: an expert could not be read"
+                                          : "VRAM: refilling the tier failed: ");
+                return false;
+            }
+            res_[(size_t) pick] = slot;
+            taken[(size_t) slot] = 1;
+        }
+        vram_evicted_.swap(keep_out);
+        // the slots mapped again that held no expert: back to their layers' free lists (slot s is moe_local_[s % LS]'s)
+        for (int64_t s = had; s < live; ++s)
+            if (!taken[(size_t) s]) free_[(size_t) moe_local_[(size_t) (s % LS)]].push_back((int32_t) s);
+    }
+    strata::gpu::mem_info(&free_b, &total_b);
+    std::fprintf(stderr, "strata plain: VRAM %lld MiB kept free: the expert tier %lld -> %lld of %lld slots (%.2f of "
+                         "%.2f GiB), %lld MiB free now, in %.0f ms%s\n", (long long) reserve_mib, (long long) before,
+                 (long long) cache_.slots(), (long long) cache_.full_slots(),
+                 (double) cache_.mapped_bytes() / 1073741824.0, (double) cache_.full_bytes() / 1073741824.0,
+                 (long long) (free_b >> 20),
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), note.c_str());
+    char line[256];
+    std::snprintf(line, sizeof line, "VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld "
+                  "expert_cache_mib=%lld expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld",
+                  (long long) reserve_mib, (long long) cache_.slots(), (long long) cache_.full_slots(),
+                  (long long) (cache_.mapped_bytes() >> 20), (long long) (cache_.full_bytes() >> 20),
+                  (long long) (free_b >> 20), (long long) opt_.prompt_chunk);
+    answer = line;
+    return true;
 }
 
 int64_t PlainModel::offloaded() const {

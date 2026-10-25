@@ -389,6 +389,7 @@ The engine's options (added to the settings' `args`):
 | `--adapt-min-gain F` | the bar a swap must clear: the decayed routing count of the expert coming in against the one going out (default 1.5) |
 | `--mmap-experts` | read the experts from the model file instead of loading them into RAM (setup writes it with `--low-ram on` or `mmap`) |
 | `--no-pcie-split` | the CPU computes every expert VRAM does not hold |
+| `--vram-elastic` | with `--serve` on one GPU: the experts' VRAM tier in segments (`--vram-segment-mib`, default 512), given back before an image job and taken again after it (`--image-gpu-policy shrink`) |
 | `--prefill-cpu-share S` | the CPU pool's share of the experts outside VRAM in prefill (0-1; the default `auto` takes it from the times measured at start; 0: all on the GPU) |
 | `--pool-workers N` | the CPU threads that compute experts (default one fewer than the physical cores, at most 32; in a Linux container with a CPU quota (cgroup), at most one fewer than the quota) |
 | `--prompt-chunk N` | the most tokens prefill computes at once (default 4096; 0: none at once) |

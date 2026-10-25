@@ -368,6 +368,7 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--adapt-min-gain F` | 入れ替えに要る差（入れるエキスパートと出すエキスパートの、減衰させた使用回数の差。既定 1.5） |
 | `--mmap-experts` | エキスパートを RAM に読み込まず、モデルのファイルから読む（setup の `--low-ram on` か `mmap` で書かれます） |
 | `--no-pcie-split` | VRAM にないエキスパートを、すべて CPU で計算する |
+| `--vram-elastic` | `--serve` で 1 GPU のとき、VRAM のエキスパートの段をセグメント（`--vram-segment-mib`、既定 512）に分けて持ち、画像の仕事の前に空けて後で戻す（`--image-gpu-policy shrink`） |
 | `--prefill-cpu-share S` | prefill で VRAM にないエキスパートのうち、CPU のプールが計算する割合（0〜1。既定の `auto` は起動時に測った時間から決める。0 ですべて GPU） |
 | `--pool-workers N` | エキスパートを計算する CPU のスレッドの数（既定は物理コアの数より 1 少なく、多くて 32。Linux のコンテナで CPU の割り当て（cgroup）があれば、その数より 1 少ない数まで） |
 | `--prompt-chunk N` | prefill で一度にまとめて計算する最大のトークン数（既定 4096、0 でまとめない） |
