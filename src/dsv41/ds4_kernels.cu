@@ -1215,10 +1215,14 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
             const int k0 = wp * 64;
             for (int kk = k0; kk < k0 + 64; kk += 16) {
                 h16v a, b;
+                const uint32_t* qa = (const uint32_t*) (qs + l16 * kFaLd + kk);
+                const uint32_t* kb = (const uint32_t*) (ks + l16 * kFaLd + kk);
 #pragma unroll
-                for (int i = 0; i < 16; ++i) {
-                    a[i] = __builtin_bit_cast(_Float16, qs[l16 * kFaLd + kk + i]);
-                    b[i] = __builtin_bit_cast(_Float16, ks[l16 * kFaLd + kk + i]);
+                for (int i = 0; i < 8; ++i) {   // (two halves a load)
+                    a[2 * i] = __builtin_bit_cast(_Float16, (uint16_t) (qa[i] & 0xffffu));
+                    a[2 * i + 1] = __builtin_bit_cast(_Float16, (uint16_t) (qa[i] >> 16));
+                    b[2 * i] = __builtin_bit_cast(_Float16, (uint16_t) (kb[i] & 0xffffu));
+                    b[2 * i + 1] = __builtin_bit_cast(_Float16, (uint16_t) (kb[i] >> 16));
                 }
                 acc = set_wmma(a, b, acc);
             }
@@ -1232,20 +1236,22 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
             sc[h][k] = t0 + k < total ? a * scale : -INFINITY;
         }
         __syncthreads();
-        if (tid < kFaHeads) {   // the online softmax, a head a thread
-            float m = -INFINITY;
-            for (int j = 0; j < nt; ++j) m = fmaxf(m, sc[tid][j]);
-            const float mo = m_run[tid], mn = fmaxf(mo, m);
-            float s = 0.0f;
-            for (int j = 0; j < nt; ++j) {
-                const float p = expf(sc[tid][j] - mn);
-                ps[tid][j] = __builtin_bit_cast(uint16_t, (_Float16) p);
-                s += p;
+        {   // the online softmax: a warp per 2 heads, a lane a key (16 lanes a head)
+            const int h = 2 * wp + (lane >> 4), k = lane & 15;
+            float m = sc[h][k];
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+            const float mo = m_run[h], mn = fmaxf(mo, m);
+            const float p = expf(sc[h][k] - mn);
+            ps[h][k] = __builtin_bit_cast(uint16_t, (_Float16) p);
+            float s = p;
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+            if (k == 0) {
+                ts[h] = expf(mo - mn);
+                den[h] = den[h] * ts[h] + s;
+                m_run[h] = mn;
             }
-            for (int j = nt; j < kFaKeys; ++j) ps[tid][j] = 0;   // (the stale rows: the values' product reads them)
-            ts[tid] = expf(mo - mn);
-            den[tid] = den[tid] * ts[tid] + s;
-            m_run[tid] = mn;
         }
         __syncthreads();
         const int dim0 = wp * 64;
@@ -1256,10 +1262,13 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
 #pragma unroll
         for (int f = 0; f < 4; ++f) {   // the values: P (16 heads x 16 keys) x V (16 keys x 64 dims this warp)
             h16v a, b;
+            const uint32_t* pp = (const uint32_t*) ps[l16];
 #pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                a[i] = __builtin_bit_cast(_Float16, ps[l16][i]);
-                b[i] = __builtin_bit_cast(_Float16, ks[i * kFaLd + dim0 + f * 16 + l16]);
+            for (int i = 0; i < 8; ++i) {
+                a[2 * i] = __builtin_bit_cast(_Float16, (uint16_t) (pp[i] & 0xffffu));
+                a[2 * i + 1] = __builtin_bit_cast(_Float16, (uint16_t) (pp[i] >> 16));
+                b[2 * i] = __builtin_bit_cast(_Float16, ks[(2 * i) * kFaLd + dim0 + f * 16 + l16]);
+                b[2 * i + 1] = __builtin_bit_cast(_Float16, ks[(2 * i + 1) * kFaLd + dim0 + f * 16 + l16]);
             }
             o[f] = set_wmma(a, b, o[f]);
         }
