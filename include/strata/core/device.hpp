@@ -47,6 +47,9 @@ uint64_t max_alloc_limit_bytes();
 void apply_vram_limit(uint64_t& free, uint64_t& total, uint64_t held = 0);
 /// An integrated GPU's free memory: at most what Linux can give back, less STRATA_UMA_HEADROOM_GIB (default 6).
 void apply_uma_limit(uint64_t& free);
+/// A discrete GPU's free memory on Windows: at most what the OS's budget for this process leaves it
+/// (platform::gpu_local_memory_budget), for the GPU at the PCI address `pci`.  Elsewhere `free` stays as it is.
+void apply_os_budget(const std::string& pci, uint64_t& free);
 /// The device's largest allocation, under STRATA_MAX_ALLOC_MIB.
 uint64_t max_alloc_bytes();
 
