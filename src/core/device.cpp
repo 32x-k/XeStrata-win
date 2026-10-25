@@ -753,6 +753,10 @@ DeviceInfo device_info(int ordinal) {
     if (out.free_bytes_known) out.free_bytes = free;
     out.compute_units = d.get_info<sycl::info::device::max_compute_units>();
     out.pci = pci_of(d);
+    if (d.get_backend() == sycl::backend::ext_oneapi_hip) {   // gcnArchName: "gfx1030:sramecc-:xnack-" on some
+        const std::string v = d.get_info<sycl::info::device::version>();
+        out.arch = v.substr(0, v.find(':'));
+    }
     out.integrated = integrated(d);
     out.subgroup_sizes = d.get_info<sycl::info::device::sub_group_sizes>();
     out.fp64 = d.has(sycl::aspect::fp64);
