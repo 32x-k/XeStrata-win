@@ -249,15 +249,16 @@ One 1024x1024 image with Turbo (`qwen-image-turbo`), 8 steps, with the engine wa
 - A Qwen-Image-2.1 edit at 1024x1024 on the B70 takes about 46 s with 3 reference images and about 4 minutes with 10.
 - `xestrata --bench` measures it on your PC last ([BENCH](BENCH.md)).
 
-HunyuanImage 3.0 (`hunyuan-image-3-distil`, w4a8 on the B70, 8 steps, the engine's start included):
+HunyuanImage 3.0 (`hunyuan-image-3-distil`, w4a8, 1024x1024, 8 steps, one image once the engine is warm):
 
-| Size | XeStrata |
-| --- | ---: |
-| 1024x1024 (64x64 tokens) | 78 s |
-| 1280x720 (45x80 tokens) | 70 s |
+| GPU | An image | Sampling | VAE decode |
+| --- | ---: | ---: | ---: |
+| Arc Pro B70 (32 GB) | 32 s | 29.4 s | 2.5 s |
+| RTX 4070 (12 GB) | 78 s | 74.1 s | 4.1 s (tiled) |
+| RX 9060 XT (16 GB, Windows) | 98 s | 85.3 s | 12.6 s (tiled) |
 
-- Of the 78 s at 1024x1024, the engine's start is 18 s, the prompt's reading (5,370 ids) 7 s, the sampling 50 s (6.1 s a step) and the VAE's decoding 3 s.
-- int8 takes about 2.5 times as long a step as w4a8.
+- The first image after the engine starts takes longer by the prompt's reading and the like (about 19 s on the B70).
+- int8 takes about 1.6 times as long an image as w4a8 on the B70.
 - Most of a step is the streaming of the experts that do not fit the VRAM (43.6 GB over the 32 layers in w4a8) from the RAM and their turning back to 16 bits. More VRAM is faster.
 
 ## When something goes wrong
