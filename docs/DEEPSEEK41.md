@@ -39,6 +39,13 @@ perplexity +7.3% (code +3.2%, agent work +2.2%). IQ1_M: perplexity +21% (KL 0.21
 | IQ4_NL: `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` | 111 GB | the 4-bit Engram lookup table the model reads from RAM or SSD. Not a model to pick: all three sets use this one file, and it is already in their download sizes |
 | DSpark drafter (Q8_0) | 8 GB | the small draft model (Unsloth) |
 
+**On a Ryzen AI Max "Strix Halo" (Windows)** the graphics chip and the CPU share one pool of memory, so the engine counts it once: the
+128 GB box (a 64 GB BIOS carve-out plus the 64 GB Windows sees) keeps about 109 GB of the 2.00 set's experts in that pool (the dense
+weights and 12 GB for Windows and the desktop aside) and reads the other 23 GB from the SSD. Measured there (2.00 bpw, default Faster
+mode, DSpark auto): answers 14-16 tokens/s on code and 10-11 on chat; a 4,000-token prompt 78 tokens/s, 8,000 tokens 109. The tested
+driver is AMD Adrenalin 26.10.1 (driver 32.0.32015.7029); the 2025-03 driver failed at 32K context, so 26.10.1 is the minimum to use.
+The 32K and 64K contexts work on it; an 8-hour 32K soak passed on this box.
+
 121 + 111 + 8 = 239 GB for 1.75; 138 + 111 + 8 = 257 GB for 2.00; 155 + 111 + 8 = 274 GB for 2.25.
 
 Measured: an RTX 5070 (12 GB) with 64 GB of RAM and a 3.6 GB/s NVMe drive answers at about 4.7 tokens/s and reads prompts at 121
@@ -108,7 +115,8 @@ says so. The RAM store (`--ssd-cache`) sizes itself when the model starts, so th
 DeepSeek's engine, `strata-dsv41`, is a separate download from the Strata engine: when you choose DeepSeek, setup (or `strata launch`) fetches the
 package for your computer from the signed update feed (resumable, signature and every file checked) and installs it in `engine-dsv41/` beside
 `engine/`. The Qwen engine's files are never changed. If the feed has no package for your graphics card, setup says so in plain words and stops before
-anything big is downloaded.
+anything big is downloaded. The Windows AMD package (`...-windows-x86_64-hip-rdna3`) carries the ROCm 10.2 runtime and the
+rocBLAS / hipBLASLt kernels for gfx1151 in `rocm/bin`, which Strata puts on the engine's library path.
 
 ### Getting the engine by hand
 

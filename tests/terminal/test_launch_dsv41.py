@@ -122,6 +122,15 @@ class LaunchDeepSeek(unittest.TestCase):
         self.assertNotIn("--parallel", args)
         self.assertIsNone(Runner(s, catalog=catalog(self.hw)).catalog_parallel())
 
+    def test_the_feed_reaches_setup_so_the_deepseek_engine_comes_from_it(self):
+        """`strata launch --feed DIR` must hand the feed to setup: the DeepSeek engine package is fetched by setup, not by `strata update`
+        (found on strix, 2026-10-25: the launch read the local feed for its own checks and setup went to GitHub for the engine)."""
+        s = S.LaunchSettings(family="deepseek41", model="IST-DAS-2.00bpw", context=8192, vision="off", tune="skip")
+        args = Runner(s, catalog=catalog(self.hw), feed="/data/feed").setup_args()
+        self.assertIn("--feed", args)
+        self.assertEqual(args[args.index("--feed") + 1], "/data/feed")
+        self.assertNotIn("--feed", Runner(s, catalog=catalog(self.hw)).setup_args())
+
 
 class OwnShards(unittest.TestCase):
     def setUp(self):
