@@ -6263,11 +6263,15 @@ struct Model::Impl {
         }
         if (store && env_f("DS4_SETTLE_STORE", 1.0f) != 0.0f) {   // the RAM store too: a window prompt fills it through the CPU
             // lane's picks, a chunked one streams past it - the hottest CPU-lane experts of the prompt into its free slots
+            // (copy_mode: an expert already in the CPU lane's RAM copy gains nothing from a second copy of the same bytes -
+            // measured on the R9700 12 GB cell: 4152 such experts, 40 GB read at 6.4 GB/s, 6.2 s of an 8K prompt, 0.0 store
+            // hits in the decode after it; the VRAM swaps above already read them from the copy)
             std::vector<std::pair<float, std::pair<int, int>>> hot;
             for (const Layer& l : L) {
                 if (l.mtp) continue;
                 for (int e = 0; e < l.n_exp; ++e)
-                    if (l.slot[(size_t) e] < 0 && l.heat[(size_t) e] >= 4.0f) hot.push_back({l.heat[(size_t) e], {l.il, e}});
+                    if (l.slot[(size_t) e] < 0 && !(copy_mode && !l.ram.empty() && l.ram[(size_t) e] >= 0) &&
+                        l.heat[(size_t) e] >= 4.0f) hot.push_back({l.heat[(size_t) e], {l.il, e}});
             }
             std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             std::vector<std::pair<int, int>> list;
