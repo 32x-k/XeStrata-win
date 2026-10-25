@@ -20,6 +20,7 @@
 #include "strata/core/runtime.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/expert_tier.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_file.hpp"
@@ -175,17 +176,6 @@ const char* pipe_dbg_env(const char* name) {
     return on ? std::getenv(name) : nullptr;
 }
 
-// The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
-// by that slot).  Before the slot is overwritten, `out`'s bytes are copied back from it into an exchange buffer, so
-// the CPU computes `out` from RAM while the swap is in flight; when the swap has landed, `commit_exchanges` moves
-// them into `in`'s place in RAM.  The RAM copy then again holds exactly the experts no core slot does, and no swap
-// reads the file.  Swaps that need no exchange (`out` in the lend region is held in RAM already; or `in` is not) go
-// on as before; ones beyond the buffers' room wait for a later round.  Runs on the adaptive tier's thread while the
-// GPU commits and drafts: the copies back are on its stream, and waited for before the refills are queued.
-//
-// With a layer split, `host_res` holds slot numbers of WHICHEVER cache owns the layer, so the copy back reads the
-// owning card's cache on that card's stream: `locate(layer)` names them (upstream fe9c10ca: reading a later stage's
-// slot number out of the first card's cache put another expert's bytes in RAM, and the answers turned to garbage).
 // Upstream #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tier leaves an expert a helper GPU holds out of the
 // primary's promotion candidates (it would sit in both caches).  Asked live, from the helper's own cache
 // (RemoteExperts::holds), so an expert the helper's tier swaps in or out later is followed.
@@ -200,48 +190,8 @@ bool helper_holds(const strata::core::ExpertDispatch& d, int64_t layer, int32_t 
     return false;
 }
 
-struct SwapHome {
-    strata::core::ExpertCache* cache;
-    strata::gpu::Stream stream;
-    int dev;   ///< -1: the first card
-};
-
-template <class Swap, class Locate>
-bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector<int32_t>& host_res, int64_t n_expert,
-                          std::vector<Swap>& swaps, Locate locate) {
-    if (!src.complement_ready() || swaps.empty()) return true;
-    struct Staged { int32_t layer, in, out; int64_t q; };
-    std::vector<Staged> staged;
-    std::vector<SwapHome> used;   // the streams the copies back went on
-    std::vector<Swap> kept;
-    kept.reserve(swaps.size());
-    for (const Swap& s : swaps) {
-        if (!src.has_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
-        const int64_t q = (int64_t) staged.size();
-        if (q >= src.exchange_capacity()) continue;
-        const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
-        if (slot < 0) continue;
-        const SwapHome home = locate(s.layer);
-        const strata::core::OnDevice on(home.dev);
-        if (strata::gpu::copy_async(src.exchange_buffer(q, s.layer), home.cache->device_slot(slot),
-                                    (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), home.stream) != true)
-            return false;
-        if (std::find_if(used.begin(), used.end(), [&](const SwapHome& h) { return h.stream == home.stream; }) == used.end())
-            used.push_back(home);
-        staged.push_back({s.layer, s.in, s.out, q});
-        kept.push_back(s);
-    }
-    if (!staged.empty()) {
-        for (const SwapHome& h : used) {
-            const strata::core::OnDevice on(h.dev);
-            if (strata::gpu::stream_sync(h.stream) != true) return false;
-        }
-        for (const Staged& x : staged)
-            if (!src.stage_exchange(x.layer, x.in, x.out, x.q)) return false;
-    }
-    swaps.swap(kept);
-    return true;
-}
+using strata::core::SwapHome;
+using strata::core::resident_stage_swaps;
 
 struct Options {
     std::string pack = "pack/full";
@@ -8102,29 +8052,10 @@ int main(int argc, char** argv) {
         int64_t adapt_swaps_n = 0, adapt_sync_n = 0;   // STRATA_DECODE_TIMING: swaps issued, of them synchronous
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
-            struct Swap { float gain; int32_t layer, in, out; };
-            std::vector<Swap> swaps;
-            std::vector<std::pair<float, int32_t>> cand, vict;
-            for (int64_t l = 0; l < g.n_layers; ++l) {
-                cand.clear();
-                vict.clear();
-                const float* u = drive.d.usage.data() + l * g.n_expert;
-                const int32_t* r = host_res.data() + l * g.n_expert;
-                for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !helper_holds(drive.d, l, e)) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
-                }
-                if (cand.empty() || vict.empty()) continue;
-                std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
-                const size_t nc = std::min(cand.size(), vict.size());
-                std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
-                                  [](auto& a, auto& b) { return a.first < b.first; });
-                for (size_t i = 0; i < nc; ++i) {
-                    if (cand[i].first < vict[i].first + o.adapt_min_gain) break;
-                    swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
-                }
-            }
-            std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+            using Swap = strata::core::TierSwap;
+            std::vector<Swap> swaps = strata::core::choose_swaps(
+                drive.d.usage.data(), host_res.data(), g.n_layers, g.n_expert, o.adapt_min_gain, [](int64_t) { return 0; },
+                [&](int64_t l, int32_t e) { return helper_holds(drive.d, l, e); });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
             bool main_live = false;
             auto swap_home = [&](int32_t layer) {   // the cache that owns the layer, on its card's stream
@@ -8277,29 +8208,9 @@ int main(int argc, char** argv) {
             h.used = true;
         };
         auto a_pick = [&]() {   // step 1's choice (host work)
-            struct C { float gain; int32_t layer, in, out; };
-            std::vector<C> all;
-            std::vector<std::pair<float, int32_t>> cand, vict;
-            for (int64_t l = 0; l < g.n_layers; ++l) {
-                cand.clear();
-                vict.clear();
-                const float* u = a_usage.data() + l * g.n_expert;
-                const int32_t* r = a_res.data() + l * g.n_expert;
-                for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
-                }
-                if (cand.empty() || vict.empty()) continue;
-                std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
-                const size_t nc = std::min(cand.size(), vict.size());
-                std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
-                                  [](auto& a, auto& b) { return a.first < b.first; });
-                for (size_t i = 0; i < nc; ++i) {
-                    if (cand[i].first < vict[i].first + o.adapt_min_gain) break;
-                    all.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
-                }
-            }
-            std::sort(all.begin(), all.end(), [](const C& a, const C& b) { return a.gain > b.gain; });
+            using C = strata::core::TierSwap;
+            const std::vector<C> all =
+                strata::core::choose_swaps(a_usage.data(), a_res.data(), g.n_layers, g.n_expert, o.adapt_min_gain);
             aswaps.clear();
             for (const C& c : all) {
                 if ((int64_t) aswaps.size() >= a_cap) break;
@@ -11772,25 +11683,9 @@ int main(int argc, char** argv) {
                 if (ram_adapt_n > 0 && !first_window && !drive.d.usage.empty() && pending.empty() &&
                     (!ajob || astate == AState::Idle) && src.complement_ready() && !multi_gpu &&
                     drive.d.remote_count == 0 && o.batch == 0) {
-                    constexpr float kRamAdaptRouted = 2.0f, kRamAdaptUnused = 0.5f;
-                    struct RamSwap { float gain; int32_t layer, in, out; };
-                    std::vector<RamSwap> swaps;
-                    for (int64_t l = 0; l < g.n_layers; ++l) {
-                        const float* u = drive.d.usage.data() + l * g.n_expert;
-                        const int32_t* r = host_res.data() + l * g.n_expert;
-                        int32_t in = -1, out = -1;
-                        for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                            if (r[e] >= 0) continue;   // in VRAM: the RAM copy does not hold it
-                            if (src.has_resident(l, e)) { if (out < 0 || u[e] < u[out]) out = e; }
-                            else if (u[e] >= kRamAdaptRouted && (in < 0 || u[e] > u[in])) in = e;
-                        }
-                        if (in >= 0 && out >= 0 && u[out] < kRamAdaptUnused)
-                            swaps.push_back({u[in] - u[out], (int32_t) l, in, out});
-                    }
-                    std::sort(swaps.begin(), swaps.end(),
-                              [](const RamSwap& a, const RamSwap& b) { return a.gain > b.gain; });
-                    if ((int) swaps.size() > ram_adapt_n) swaps.resize((size_t) ram_adapt_n);
-                    for (const RamSwap& x : swaps) src.replace_resident(x.layer, x.in, x.out);
+                    for (const strata::core::TierSwap& x : strata::core::choose_ram_swaps(
+                             drive.d.usage.data(), host_res.data(), g.n_layers, g.n_expert, src, ram_adapt_n))
+                        src.replace_resident(x.layer, x.in, x.out);
                 }
                 if (!adapt_tick(false)) {   // --adapt-async: the round in flight moves on a step when it can
                     std::printf("ERR an adaptive refill failed\n");
@@ -12776,29 +12671,10 @@ int main(int argc, char** argv) {
                 return true;   // the previous swaps are still in flight
             }
             if (trace_adapt) std::fprintf(stderr, "strata: ADAPT round=%lld considering\n", (long long) adapt_rounds);
-            struct Swap { float gain; int32_t layer, in, out; };
-            std::vector<Swap> swaps;
-            std::vector<std::pair<float, int32_t>> cand, vict;
-            for (int64_t l = 0; l < g.n_layers; ++l) {
-                cand.clear();
-                vict.clear();
-                const float* u = drive.d.usage.data() + l * g.n_expert;
-                const int32_t* r = host_res.data() + l * g.n_expert;
-                for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !helper_holds(drive.d, l, e)) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
-                }
-                if (cand.empty() || vict.empty()) continue;
-                std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
-                const size_t nc = std::min(cand.size(), vict.size());
-                std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
-                                  [](auto& a, auto& b) { return a.first < b.first; });
-                for (size_t i = 0; i < nc; ++i) {
-                    if (cand[i].first < vict[i].first + o.adapt_min_gain) break;
-                    swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
-                }
-            }
-            std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+            using Swap = strata::core::TierSwap;
+            std::vector<Swap> swaps = strata::core::choose_swaps(
+                drive.d.usage.data(), host_res.data(), g.n_layers, g.n_expert, o.adapt_min_gain, [](int64_t) { return 0; },
+                [&](int64_t l, int32_t e) { return helper_holds(drive.d, l, e); });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
             if (!resident_stage_swaps(src, host_res, g.n_expert, swaps,   // this loop refills the first card only
                                       [&](int32_t) { return SwapHome{&xcache, adapt_stream, -1}; }))

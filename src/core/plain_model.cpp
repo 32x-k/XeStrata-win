@@ -20,6 +20,7 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/device.hpp"
+#include "strata/core/expert_tier.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -1951,24 +1952,8 @@ void PlainModel::ram_adapt() {
     if (n <= 0 || complement_ == nullptr || !complement_->complement_ready() || disp_.usage.empty() ||
         !next_.empty() || root_ != this || !pending_.empty() || windows_ < 2)
         return;
-    constexpr float kRouted = 2.0f, kUnused = 0.5f;
-    struct RamSwap { float gain; int32_t layer, in, out; };
-    std::vector<RamSwap> swaps;
-    const int64_t E = spec_.n_expert;
-    for (int64_t l = 0; l < n_moe_; ++l) {
-        const float* u = disp_.usage.data() + l * E;
-        const int32_t* r = res_.data() + l * E;
-        int32_t in = -1, out = -1;
-        for (int32_t e = 0; e < (int32_t) E; ++e) {
-            if (r[e] >= 0) continue;   // in VRAM: the RAM copy does not hold it
-            if (complement_->has_resident(l, e)) { if (out < 0 || u[e] < u[out]) out = e; }
-            else if (u[e] >= kRouted && (in < 0 || u[e] > u[in])) in = e;
-        }
-        if (in >= 0 && out >= 0 && u[out] < kUnused) swaps.push_back({u[in] - u[out], (int32_t) l, in, out});
-    }
-    std::sort(swaps.begin(), swaps.end(), [](const RamSwap& a, const RamSwap& b) { return a.gain > b.gain; });
-    if ((int) swaps.size() > n) swaps.resize((size_t) n);
-    for (const RamSwap& x : swaps) complement_->replace_resident(x.layer, x.in, x.out);
+    for (const TierSwap& x : choose_ram_swaps(disp_.usage.data(), res_.data(), n_moe_, spec_.n_expert, *complement_, n))
+        complement_->replace_resident(x.layer, x.in, x.out);
 }
 
 // The decode's PCIe share, measured: whether the GPU reading a share of the missed experts over PCIe beats the CPU
@@ -2163,36 +2148,10 @@ bool PlainModel::adapt(std::string& err, int64_t max_swaps, int64_t max_evict) {
         }
     if (!settle_swaps(max_swaps > 0, err)) return false;
     if (!pending_.empty()) return true;   // the last round's copies are still landing: no new round yet
-    struct Swap { float gain; int32_t layer, in, out; };   // out < 0: a free slot
-    std::vector<Swap> swaps;
-    std::vector<std::pair<float, int32_t>> cand, vict;
-    for (int64_t l = 0; l < L; ++l) {
-        cand.clear();
-        vict.clear();
-        const float* u = disp_.usage.data() + l * E;
-        const int32_t* r = res_.data() + l * E;
-        for (int32_t e = 0; e < (int32_t) E; ++e) {
-            if (r[e] < 0) { if (u[e] > 0.0f) cand.emplace_back(u[e], e); }
-            else vict.emplace_back(u[e], e);
-        }
-        // a free slot takes any expert routed since (an empty slot only costs a copy); one held, a missing expert
-        // routed at least twice
-        const size_t n_free = free_[(size_t) l].size();
-        for (size_t i = 0; i < n_free; ++i) vict.emplace_back(-1.0f, -1);
-        if (cand.empty() || vict.empty()) continue;
-        std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
-        size_t keep = 0;
-        while (keep < cand.size() && (keep < n_free || cand[keep].first >= 2.0f)) ++keep;
-        cand.resize(keep);
-        const size_t nc = std::min(cand.size(), vict.size());
-        std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
-                          [](auto& a, auto& b) { return a.first < b.first; });
-        for (size_t i = 0; i < nc; ++i) {
-            if (cand[i].first < vict[i].first + opt_.adapt_min_gain) break;
-            swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
-        }
-    }
-    std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+    using Swap = TierSwap;   // out < 0: a free slot
+    std::vector<Swap> swaps = choose_swaps(
+        disp_.usage.data(), res_.data(), L, E, opt_.adapt_min_gain,
+        [&](int64_t l) { return (int64_t) free_[(size_t) l].size(); }, [](int64_t, int32_t) { return false; });
     // with the RAM copy of what VRAM does not hold (complement_), an expert evicted for one the RAM has goes back into
     // the RAM in its place through an exchange buffer; past the buffers it would be read from the files from then on
     // while the one that came in is held twice, so such a swap waits for a round with room.  The round after a prompt
@@ -2225,35 +2184,10 @@ bool PlainModel::adapt(std::string& err, int64_t max_swaps, int64_t max_evict) {
     // the RAM tier of what VRAM does not hold: an evicted expert goes back into the RAM copy, in the place of the one
     // that comes in (FileExpertSource's exchanges), read back from its slot before the slot is written; the copy
     // keeps it from the exchange buffer until the new one has landed (settle_swaps commits them)
-    if (complement_ != nullptr && complement_->exchange_capacity() > 0) {
-        int64_t q = 0;
-        for (const Swap& w : swaps) {
-            if (w.out < 0 || q >= complement_->exchange_capacity() || !complement_->has_resident(w.layer, w.in) ||
-                complement_->has_resident(w.layer, w.out))
-                continue;
-            const int32_t slot = res_[(size_t) (w.layer * E + w.out)];
-            if (!strata::gpu::copy_async(complement_->exchange_buffer(q, w.layer), cache_.device_slot(slot),
-                                         k::cpu::expert_layout().blob_bytes(w.layer), swap_cs_)) {
-                err = std::string("plain model: the adaptive tier's copy back: ") + strata::gpu::last_error();
-                return false;
-            }
-            ++q;
-        }
-        if (q > 0 && !strata::gpu::stream_sync(swap_cs_)) {
-            err = std::string("plain model: the adaptive tier's copy back: ") + strata::gpu::last_error();
-            return false;
-        }
-        q = 0;
-        for (const Swap& w : swaps) {
-            if (w.out < 0 || q >= complement_->exchange_capacity() || !complement_->has_resident(w.layer, w.in) ||
-                complement_->has_resident(w.layer, w.out))
-                continue;
-            if (!complement_->stage_exchange(w.layer, w.in, w.out, q)) {
-                err = "plain model: the adaptive tier's exchange";
-                return false;
-            }
-            ++q;
-        }
+    if (complement_ != nullptr &&
+        !resident_stage_swaps(*complement_, res_, E, swaps, [&](int32_t) { return SwapHome{&cache_, swap_cs_, dev_}; })) {
+        err = std::string("plain model: the adaptive tier's copy back: ") + strata::gpu::last_error();
+        return false;
     }
     for (const Swap& w : swaps) {
         if (w.out < 0) {

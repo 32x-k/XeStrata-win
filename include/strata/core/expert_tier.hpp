@@ -1,0 +1,161 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+// include/strata/core/expert_tier.hpp - the rules of the expert tiers that Qwen3.8-Flash-Next's engine
+// (generate.cpp) and the other models' (PlainModel) share: which experts an adaptive round swaps into the VRAM tier,
+// which ones STRATA_RAM_ADAPT moves into the RAM copy, and the copies back into the RAM copy's exchange buffers.
+// When a round runs, how many swaps it may take and how its copies are issued stay with each engine: those were
+// measured apart (plain_model.hpp's adapt_mib_per_token, generate.cpp's adapt_lag and --adapt-async).
+#pragma once
+
+#include "strata/core/expert_cache.hpp"
+#include "strata/core/expert_source.hpp"
+#include "strata/core/gpu.hpp"
+#include "strata/core/on_device.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
+
+#include <algorithm>
+#include <cstdint>
+#include <utility>
+#include <vector>
+
+namespace strata::core {
+
+/// One swap of a round: `in` (not in VRAM) takes the slot of `out` (in VRAM), or a free slot when `out` < 0.
+struct TierSwap {
+    float gain;
+    int32_t layer, in, out;
+};
+
+/// The adaptive tier's rule.  In each layer the missing experts routed at least twice since the last round (their
+/// decayed count; with free slots, any routed one for each free slot first) pair with the least routed experts in
+/// VRAM, the most routed with the least, while the one coming in leads by `min_gain` (--adapt-min-gain); then every
+/// layer's pairs by gain, the largest first.  `usage` and `res` are layer-major (`res` the slot of an expert in VRAM,
+/// -1 when it is not); `free_slots(layer)` the layer's free slots; `skip(layer, expert)` leaves an expert out of the
+/// candidates (STRATA_DISJOINT_ADAPT: one a helper GPU holds).
+template <class FreeSlots, class Skip>
+std::vector<TierSwap> choose_swaps(const float* usage, const int32_t* res, int64_t layers, int64_t n_expert,
+                                   float min_gain, FreeSlots free_slots, Skip skip) {
+    constexpr float kRouted = 2.0f;
+    std::vector<TierSwap> swaps;
+    std::vector<std::pair<float, int32_t>> cand, vict;
+    for (int64_t l = 0; l < layers; ++l) {
+        cand.clear();
+        vict.clear();
+        const float* u = usage + l * n_expert;
+        const int32_t* r = res + l * n_expert;
+        for (int32_t e = 0; e < (int32_t) n_expert; ++e) {
+            if (r[e] < 0) { if (u[e] > 0.0f && !skip(l, e)) cand.emplace_back(u[e], e); }
+            else vict.emplace_back(u[e], e);
+        }
+        // a free slot takes any expert routed since (an empty slot only costs a copy); one held, a missing expert
+        // routed at least twice
+        const size_t n_free = (size_t) free_slots(l);
+        for (size_t i = 0; i < n_free; ++i) vict.emplace_back(-1.0f, -1);
+        if (cand.empty() || vict.empty()) continue;
+        std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        size_t keep = 0;
+        while (keep < cand.size() && (keep < n_free || cand[keep].first >= kRouted)) ++keep;
+        cand.resize(keep);
+        const size_t nc = std::min(cand.size(), vict.size());
+        std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
+                          [](auto& a, auto& b) { return a.first < b.first; });
+        for (size_t i = 0; i < nc; ++i) {
+            if (cand[i].first < vict[i].first + min_gain) break;
+            swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
+        }
+    }
+    std::sort(swaps.begin(), swaps.end(), [](const TierSwap& a, const TierSwap& b) { return a.gain > b.gain; });
+    return swaps;
+}
+
+/// choose_swaps for a tier without free slots and with every missing expert a candidate.
+inline std::vector<TierSwap> choose_swaps(const float* usage, const int32_t* res, int64_t layers, int64_t n_expert,
+                                          float min_gain) {
+    return choose_swaps(usage, res, layers, n_expert, min_gain, [](int64_t) { return 0; },
+                        [](int64_t, int32_t) { return false; });
+}
+
+/// STRATA_RAM_ADAPT's rule (upstream d7298883): the RAM copy is chosen once, at start, so an expert it does not hold is
+/// read from the file every time the conversation routes to it.  In each layer the expert the windows route to most
+/// (a decayed count of 2 or more) of those neither in VRAM nor in the RAM copy takes the RAM place of the copy's least
+/// routed one (below 0.5): one pair a layer, the `n` with the largest difference.  `res` as choose_swaps'.
+inline std::vector<TierSwap> choose_ram_swaps(const float* usage, const int32_t* res, int64_t layers, int64_t n_expert,
+                                              const FileExpertSource& src, int n) {
+    constexpr float kRouted = 2.0f, kUnused = 0.5f;
+    std::vector<TierSwap> swaps;
+    for (int64_t l = 0; l < layers; ++l) {
+        const float* u = usage + l * n_expert;
+        const int32_t* r = res + l * n_expert;
+        int32_t in = -1, out = -1;
+        for (int32_t e = 0; e < (int32_t) n_expert; ++e) {
+            if (r[e] >= 0) continue;   // in VRAM: the RAM copy does not hold it
+            if (src.has_resident(l, e)) { if (out < 0 || u[e] < u[out]) out = e; }
+            else if (u[e] >= kRouted && (in < 0 || u[e] > u[in])) in = e;
+        }
+        if (in >= 0 && out >= 0 && u[out] < kUnused) swaps.push_back({u[in] - u[out], (int32_t) l, in, out});
+    }
+    std::sort(swaps.begin(), swaps.end(), [](const TierSwap& a, const TierSwap& b) { return a.gain > b.gain; });
+    if ((int) swaps.size() > n) swaps.resize((size_t) std::max(n, 0));
+    return swaps;
+}
+
+// The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
+// by that slot).  Before the slot is overwritten, `out`'s bytes are copied back from it into an exchange buffer, so
+// the CPU computes `out` from RAM while the swap is in flight; when the swap has landed, `commit_exchanges` moves
+// them into `in`'s place in RAM.  The RAM copy then again holds exactly the experts no core slot does, and no swap
+// reads the file.  Swaps that need no exchange (`out` in the lend region is held in RAM already; or `in` is not; or
+// a free slot) go on as before; ones beyond the buffers' room wait for a later round.  Runs on the adaptive tier's
+// thread while the GPU commits and drafts: the copies back are on its stream, and waited for before the refills are
+// queued.
+//
+// With a layer split, `host_res` holds slot numbers of WHICHEVER cache owns the layer, so the copy back reads the
+// owning card's cache on that card's stream: `locate(layer)` names them (upstream fe9c10ca: reading a later stage's
+// slot number out of the first card's cache put another expert's bytes in RAM, and the answers turned to garbage).
+struct SwapHome {
+    ExpertCache* cache;
+    gpu::Stream stream;
+    int dev;   ///< -1: the first card
+};
+
+template <class Swap, class Locate>
+bool resident_stage_swaps(FileExpertSource& src, const std::vector<int32_t>& host_res, int64_t n_expert,
+                          std::vector<Swap>& swaps, Locate locate) {
+    if (!src.complement_ready() || swaps.empty()) return true;
+    struct Staged { int32_t layer, in, out; int64_t q; };
+    std::vector<Staged> staged;
+    std::vector<SwapHome> used;   // the streams the copies back went on
+    std::vector<Swap> kept;
+    kept.reserve(swaps.size());
+    for (const Swap& s : swaps) {
+        if (s.out < 0 || !src.has_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) {
+            kept.push_back(s);
+            continue;
+        }
+        const int64_t q = (int64_t) staged.size();
+        if (q >= src.exchange_capacity()) continue;
+        const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
+        if (slot < 0) continue;
+        const SwapHome home = locate(s.layer);
+        const OnDevice on(home.dev);
+        if (gpu::copy_async(src.exchange_buffer(q, s.layer), home.cache->device_slot(slot),
+                            (size_t) kernels::cpu::expert_layout().blob_bytes(s.layer), home.stream) != true)
+            return false;
+        if (std::find_if(used.begin(), used.end(), [&](const SwapHome& h) { return h.stream == home.stream; }) == used.end())
+            used.push_back(home);
+        staged.push_back({s.layer, s.in, s.out, q});
+        kept.push_back(s);
+    }
+    if (!staged.empty()) {
+        for (const SwapHome& h : used) {
+            const OnDevice on(h.dev);
+            if (gpu::stream_sync(h.stream) != true) return false;
+        }
+        for (const Staged& x : staged)
+            if (!src.stage_exchange(x.layer, x.in, x.out, x.q)) return false;
+    }
+    swaps.swap(kept);
+    return true;
+}
+
+}  // namespace strata::core
