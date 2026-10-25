@@ -61,7 +61,7 @@ struct HunyuanImage3Scratch {
     float *qkv32 = nullptr, *o32 = nullptr, *gu32 = nullptr, *eg32 = nullptr, *ed32 = nullptr,
           *logits = nullptr, *ang = nullptr, *attn_scratch = nullptr, *d_w = nullptr, *d_tw = nullptr;
     /// the routing: each token's experts and weights (d_idx, d_tw), then grouped by expert (d_rows, d_w, d_bounds)
-    int32_t *d_rows = nullptr, *d_idx = nullptr, *d_bounds = nullptr;
+    int32_t *d_rows = nullptr, *d_idx = nullptr, *d_bounds = nullptr, *d_cursor = nullptr;
 };
 
 /// One routed expert's FP16 weights for the layer's two expert products: gate_up [egu_n][egu_k] and down

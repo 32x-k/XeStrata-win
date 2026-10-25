@@ -76,7 +76,7 @@ uint64_t hunyuanimage3_scratch_bytes(int64_t T, const HunyuanImage3Dims& d) {
     f32(rows * d.heads * d.head_dim);         // attn_scratch: the plain attention's FP32 output
     f32(2 * T * d.topk);                      // d_w, d_tw
     b += (uint64_t) std::max<int64_t>(2 * T * d.topk, 1) * sizeof(int32_t);   // d_rows, d_idx
-    b += (uint64_t) (d.experts + 1) * sizeof(int32_t);                     // d_bounds
+    b += (uint64_t) (2 * d.experts + 1) * sizeof(int32_t);                 // d_bounds, d_cursor
     return b;
 }
 
@@ -119,6 +119,7 @@ bool hunyuanimage3_scratch_alloc(int64_t T, const HunyuanImage3Dims& d, HunyuanI
         sc.d_tw = take_as<float>(owned, T * d.topk, "d_tw");
         sc.d_idx = take_as<int32_t>(owned, T * d.topk, "d_idx");
         sc.d_bounds = take_as<int32_t>(owned, d.experts + 1, "d_bounds");
+        sc.d_cursor = take_as<int32_t>(owned, d.experts, "d_cursor");
         return true;
     } catch (const std::exception& e) {
         for (size_t i = owned.size(); i-- > 0;) gpu::free(owned[i]);
@@ -131,7 +132,7 @@ bool hunyuanimage3_scratch_alloc(int64_t T, const HunyuanImage3Dims& d, HunyuanI
 void hunyuanimage3_scratch_free(HunyuanImage3Scratch& sc) {
     const void* ps[] = {sc.xr16, sc.ar16, sc.xr216, sc.a16, sc.gx16, sc.q16, sc.k16, sc.v16, sc.act16, sc.gact16,
                         sc.egu16, sc.edn16, sc.qkv32, sc.o32, sc.gu32, sc.eg32, sc.ed32, sc.logits, sc.ang,
-                        sc.attn_scratch, sc.d_rows, sc.d_w, sc.xn32, sc.xn232, sc.d_tw, sc.d_idx, sc.d_bounds};
+                        sc.attn_scratch, sc.d_rows, sc.d_w, sc.xn32, sc.xn232, sc.d_tw, sc.d_idx, sc.d_bounds, sc.d_cursor};
     for (const void* p : ps)
         if (p != nullptr) gpu::free(p);
     sc = HunyuanImage3Scratch{};
@@ -198,7 +199,8 @@ bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Ex
         // softmax, the top `topk`, renormalized over them (norm_topk_prob), and the rows grouped by expert, on the
         // device: only the experts' bounds come back, for the products' sizes
         hunyuanimage3_router_topk(sc.logits, T, d.experts, d.topk, sc.d_idx, sc.d_tw, stream);
-        hunyuanimage3_route_lists(sc.d_idx, sc.d_tw, T, d.topk, d.experts, sc.d_bounds, sc.d_rows, sc.d_w, stream);
+        hunyuanimage3_route_lists(sc.d_idx, sc.d_tw, T, d.topk, d.experts, sc.d_bounds, sc.d_rows, sc.d_w, sc.d_cursor,
+                                  stream);
         gpu::device_sync();
         std::vector<int32_t> begin((size_t) d.experts + 1);
         down(begin.data(), sc.d_bounds, begin.size() * sizeof(int32_t));

@@ -128,7 +128,7 @@ void hunyuanimage3_embed_bf16_16(const uint16_t* table_bf16, const int32_t* ids,
 void hunyuanimage3_copy16(const uint16_t* src16, uint16_t* dst16, int64_t n, void* stream);
 
 /// logits[t][e] = x[t][:] . w[e][:] (rows of C by E rows of C): the router, which decides where every token goes, so
-/// it keeps FP32 all the way in (`hunyuanimage3_rms_norm32`) and sums in partial sums of 64 terms (FP32, the
+/// it keeps FP32 all the way in (`hunyuanimage3_rms_norm32`) and sums over 32 lanes' partial sums (FP32, the
 /// reference's type; no FP64, which not every GPU has).  A FP16 operand there swaps near-tied experts and costs a
 /// few percent of the layer's output.
 void hunyuanimage3_router_logits(const float* x32, const float* w, int64_t T, int64_t C, int64_t E, float* logits,
@@ -141,9 +141,10 @@ void hunyuanimage3_router_topk(const float* logits, int64_t T, int64_t E, int64_
                                void* stream);
 
 /// The routed rows grouped by expert: bounds[e] .. bounds[e + 1] (E + 1, from 0) of rows and w are expert e's tokens
-/// in token order and their weights.  On the device: the caller reads `bounds` back for the experts' products.
+/// (in the order the device's atomics give, which changes no row's product) and their weights; `cursor` (E) is the
+/// fill's.  On the device: the caller reads `bounds` back for the experts' products.
 void hunyuanimage3_route_lists(const int32_t* idx, const float* wt, int64_t T, int64_t K, int64_t E, int32_t* bounds,
-                               int32_t* rows, float* w, void* stream);
+                               int32_t* rows, float* w, int32_t* cursor, void* stream);
 
 /// y[t][:] = FP16(x[t][:] / rs[t]) - a row-scaled read of FP32 products into the FP16 the next product takes.
 void hunyuanimage3_scale_rows16(const float* x, const float* rs, int64_t n_rows, int64_t C, uint16_t* y16, void* stream);
