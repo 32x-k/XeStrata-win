@@ -256,3 +256,37 @@ test('the bundle cleanup lines reach the output of the host (the desktop log cop
     assert.deepEqual(seen, []);
   } finally { console.log = real; t.cleanup(); }
 });
+
+test('macOS: the engine bundle inside a signed .app stays (deleting it breaks the signature); outside an .app, or on another system, it is removed as before', async () => {
+  const t = setup();
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  const as = value => Object.defineProperty(process, 'platform', { value, configurable: true });
+  try {
+    const app = join(t.base, 'Strata.app', 'Contents', 'Resources', 'engine-bundle');
+    mkdirSync(app, { recursive: true });
+    const inApp = makePackage(app, '0.1.48');
+    const outside = makePackage(t.bundle, '0.1.48');
+    // the engine is in the store (the app's own first start copies it), so the bundle would be removable
+    assert.equal((await installBundledEngine({ bundleDir: t.bundle, components: t.components })).action, 'installed');
+    const lines = [];
+    // 1. macOS, bundle inside Strata.app: kept, with one line that says why
+    as('darwin');
+    let r = await removeVerifiedBundle({ bundleDir: app, components: t.components, log: l => lines.push(l) });
+    assert.equal(r.removed, false);
+    assert.ok(existsSync(join(app, inApp, 'strata.exe')), 'the signed app keeps its engine files');
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /kept in the install folder.*macOS app bundles must remain unchanged after signing/);
+    // 2. macOS, bundle outside an .app: removed as before
+    r = await removeVerifiedBundle({ bundleDir: t.bundle, components: t.components, log: () => {} });
+    assert.equal(r.removed, true);
+    assert.equal(existsSync(join(t.bundle, outside)), false);
+    // 3. another system, bundle inside a folder called .app: removed as before (the guard is for macOS only)
+    as('linux');
+    r = await removeVerifiedBundle({ bundleDir: app, components: t.components, log: () => {} });
+    assert.equal(r.removed, true);
+    assert.equal(existsSync(join(app, inApp)), false);
+  } finally {
+    Object.defineProperty(process, 'platform', platform);
+    t.cleanup();
+  }
+});
