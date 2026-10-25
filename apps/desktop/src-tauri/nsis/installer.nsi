@@ -709,7 +709,11 @@ SectionEnd
   System::Call 'kernel32::SetEnvironmentVariableW(w "STRATA_INSTDIR", w "${INSTALLDIR}")'
   System::Call 'kernel32::GetCurrentProcessId()i.r9'
   System::Call 'kernel32::SetEnvironmentVariableW(w "STRATA_SELFPID", w "$9")'
-  nsExec::Exec 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$d = $$env:STRATA_INSTDIR.TrimEnd([char]92) + [char]92; Get-CimInstance Win32_Process | Where-Object { $$_.ExecutablePath -and $$_.ExecutablePath.StartsWith($$d, [StringComparison]::OrdinalIgnoreCase) -and $$_.ProcessId -ne [int]$$env:STRATA_SELFPID } | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force -ErrorAction SilentlyContinue }; Start-Sleep -Milliseconds 500"'
+  ; the installer is a 32-bit program, so plain powershell.exe is the 32-bit one, which cannot read the image path of a 64-bit process: use the 64-bit one
+  StrCpy $8 "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+  IfFileExists $8 +2 0
+    StrCpy $8 "powershell.exe"
+  nsExec::Exec '"$8" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$d = [IO.Path]::GetFullPath($$env:STRATA_INSTDIR).TrimEnd([char]92) + [char]92; $$ids = @(); $$ids += Get-Process -ErrorAction SilentlyContinue | Where-Object { $$_.Path -and [IO.Path]::GetFullPath($$_.Path).StartsWith($$d, [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { $$_.Id }; try { $$ids += Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $$_.ExecutablePath -and [IO.Path]::GetFullPath($$_.ExecutablePath).StartsWith($$d, [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { $$_.ProcessId } } catch {}; $$ids | Sort-Object -Unique | Where-Object { $$_ -ne [int]$$env:STRATA_SELFPID } | ForEach-Object { Stop-Process -Id $$_ -Force -ErrorAction SilentlyContinue }; Start-Sleep -Milliseconds 1500"'
   Pop $9
 !macroend
 ; STRATA-STOP-END
