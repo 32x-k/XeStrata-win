@@ -165,8 +165,10 @@ bool finish(float* x, int n_vec, int len, long long stride, const FinishIn& f) {
     g_cx->run({d});
     // The fp8-rounding finishes (the KV rows, the attention output) are read stale by the next dispatch when it shares their
     // command buffer: end the buffer after them (committed, not waited for: the queue orders the buffers).
-    static const bool no_split = std::getenv("DS4_NO_FINISH_SPLIT") != nullptr;
-    if (f.quant && !no_split) g_cx->split_runs();
+    // (it once ended the command buffer after every fp8-rounding finish, 2 a layer, against a stale read; each extra buffer costs the GPU ~0.3 ms idle, a third of a decode token.
+    // The decode-path score is bit-identical without it, the dispatch barrier after every dispatch orders the readers. DS4_FINISH_SPLIT=1 brings it back.)
+    static const bool split_after = std::getenv("DS4_FINISH_SPLIT") != nullptr;
+    if (f.quant && split_after) g_cx->split_runs();
     if (const char* fm2 = std::getenv("DS4_FLUSH_FINISH_CTX")) { if (f.quant) { if (std::atoi(fm2) == 2) g_cx->split_runs(); else g_cx->flush_runs(); } }
     if (const char* fm = std::getenv("DS4_FLUSH_FINISH")) {   // debugging: which finish calls need a drain after them
         const int m = std::atoi(fm);
