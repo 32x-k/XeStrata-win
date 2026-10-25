@@ -382,6 +382,14 @@ signed dot4 instruction and a 100 MHz wall clock. Switch defaults for gfx12 are 
   `ple_reader_selftest` proves the mapped rows are the same bytes as the direct ones. The table is 26.8 GiB
   (320,001,536 rows of 90 B), so a start reads it once: about 3 s when it is in the file cache, up to a minute
   from a cold disk, and it needs the RAM for it while the engine runs.
+- **Decode: the miss split pays on this card (0.2.7, opt-in).** `--pcie-frac` decides how many of the missing
+  expert rows are fetched over PCIe and how many are computed by the CPU pool; the probe's default is 0.55. With
+  30 idle cores during decode, more CPU is faster here: IQ3_S, 3 rotated pairs, PLE direct, **8K decode 86.1 ->
+  94.6 tok/s at 0.15 (+9.9%) and 96.3 at 0.0 (+11.8%), 32K 67.2 -> 84.4 (+25.6%)**, prompt speed unchanged at 8K.
+  The CPU lane rounds a missing expert's FP32 rows differently from the GPU lane, so this changes bits: the
+  first-token KL against the default is 0.0013 mean (top-1 identical in 12 of 12 prompts), below the engine's own
+  implementation-noise scale. It stays a recommendation (the owner decides a default), and it is the same class of
+  finding as the pcie-frac default being wrong on the 3060 and P100 in the CUDA plan.
 - **Not validated:** answer-quality benchmarks and contexts beyond 16K on the 9070 XT.
 
 > **Measured on:** Radeon AI PRO R9700 32 GB and RX 9070 XT 16 GB (gfx1201), Ryzen 9 3900X, 47 GB RAM, Ubuntu 24.04
