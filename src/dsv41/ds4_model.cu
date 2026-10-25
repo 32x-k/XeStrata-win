@@ -8455,6 +8455,9 @@ struct Model::Impl {
             return false;
         }
         // (glog rows are 1024 apart: route reads them so)
+        static const bool phases = std::getenv("DS4_PHASES") != nullptr;   // debugging: where a decode layer's host time goes
+        static double ph[8] = {0}, ph_prev = 0; static long ph_n = 0;
+        const double ph0 = phases ? now_ms() : 0.0;
         gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
         VlBits vb = {};
         vb.w[0] = l.mtp ? 0u : wp.vl;
@@ -8491,6 +8494,7 @@ struct Model::Impl {
         const double tw = now_ms();
         CK(cudaEventSynchronize(d.ev));
         st.gpu_wait_ms += now_ms() - tw;
+        const double ph2 = phases ? now_ms() : 0.0;
         dump_sub(d, "glog", l.il, p0, T, d.glog, (size_t) T * 1024 * 4);
         dump_sub_host("ridx", l.il, p0, T, h_idx, (size_t) T * kPicks * 4);
         dump_sub_host("rw", l.il, p0, T, h_w, (size_t) T * kPicks * 4);
@@ -8587,6 +8591,7 @@ struct Model::Impl {
             if (!mv_n(d, j, nj, err)) return false;
             dump_sub(d, "ed", l.il, p0, nrows, d.ed, (size_t) nrows * D * 4);
         }
+        const double ph3 = phases ? now_ms() : 0.0;
         if (!ents.empty()) {
             const double tc = now_ms();
 #if defined(STRATA_METAL)
@@ -8627,7 +8632,13 @@ struct Model::Impl {
         std::swap(d.h, d.h2);
         dump_sub(d, "h_out", l.il, p0, T, d.h, (size_t) T * H * D * 4);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, l.il, p0, T);   // (post-layer residual, as the chunk path writes it)
-        CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
+        CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
+        if (phases && T == 1) {
+            const double ph4 = now_ms();
+            ph[0] += ph2 - ph0; ph[1] += ph3 - ph2; ph[2] += ph4 - ph3; if (ph_prev > 0 && ph0 - ph_prev < 5.0) ph[3] += ph0 - ph_prev; ph_prev = ph4; ++ph_n;
+            static bool reg = false;
+            if (!reg) { reg = true; std::atexit([] { std::fprintf(stderr, "phases per layer call (%ld): route enqueue + shared expert + wait %.3f ms, routing analysis + GPU experts enqueue %.3f ms, CPU lane + combine + hc_post %.3f ms, attention enqueue %.3f ms%s", ph_n, ph[0] / ph_n, ph[1] / ph_n, ph[2] / ph_n, ph[3] / ph_n, "\n"); }); }
+        }
         // (h_part / h_x are written again only after the next layer's route has synchronized, which follows these)
         return true;
     }
