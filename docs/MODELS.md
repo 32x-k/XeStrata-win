@@ -3,9 +3,9 @@
 This page helps you choose a model and check that your computer can run it. It covers DeepSeek V4.1-Flash,
 Qwen3.8-Flash-Next (and its variants) and Qwen3.6-35B-A3B. For installing, see [INSTALL.md](INSTALL.md).
 
-> **On this page:** [Quick start](#quick-start) Â· [Pick by memory](#pick-by-memory) Â·
-> [DeepSeek V4.1-Flash](#deepseek-v41-flash) Â· [Qwen3.8-Flash-Next](#qwen38-flash-next) Â·
-> [Qwen3.6-35B-A3B](#qwen36-35b-a3b) Â· [Adding or switching models](#adding-or-switching-models) Â·
+> **On this page:** [Quick start](#quick-start) · [Pick by memory](#pick-by-memory) ·
+> [DeepSeek V4.1-Flash](#deepseek-v41-flash) · [Qwen3.8-Flash-Next](#qwen38-flash-next) ·
+> [Qwen3.6-35B-A3B](#qwen36-35b-a3b) · [Adding or switching models](#adding-or-switching-models) ·
 > [History](#history--older-measurements)
 
 ## Quick start
