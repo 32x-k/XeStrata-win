@@ -244,6 +244,8 @@ export async function installBundledEngine({ bundleDir, components, platform = n
 export async function removeVerifiedBundle({ bundleDir, components, log = () => {} } = {}) {
   try {
     if (!bundleDir || !components || !existsSync(bundleDir)) return { removed: false, reason: 'no bundle' };
+    // Files inside a signed macOS app must stay intact after installation.
+    if (process.platform === 'darwin' && resolve(bundleDir).split(sep).some(part => part.toLowerCase().endsWith('.app'))) return keepBundle(log, 'macOS app bundles must remain unchanged after signing');
     const packages = [];
     for (const entry of await readdir(bundleDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
