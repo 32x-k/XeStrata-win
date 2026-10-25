@@ -69,6 +69,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -1708,18 +1709,58 @@ def rocm_win_family(gfx: str):
 
 
 def windows_amd_libs(gfx: set) -> list:
-    """pip's commands for AMD's rocBLAS and hipBLASLt the engine would not find on Windows for the AMD GPUs of `gfx`,
-    where it looks (add_library_dirs in src/prefill/gemm.cpp): the PATH, the Python beside the engine."""
+    """pip's arguments (after `pip install`) for AMD's rocBLAS and hipBLASLt the engine would not find on Windows for
+    the AMD GPUs of `gfx`, one install a family, where it looks (add_library_dirs in src/prefill/gemm.cpp): the PATH,
+    the Python beside the engine."""
     path = [Path(d) for d in os.environ.get("PATH", "").split(os.pathsep) if d]
     site = Path(sys.executable).parent / "Lib" / "site-packages"
-    commands = []
+    installs = []
     for family in sorted({f for g in gfx if g and (f := rocm_win_family(g))}):
         dirs = path + [site / f"_rocm_sdk_libraries_{family.replace('-', '_')}" / "bin"]
         if not any((d / "rocblas.dll").is_file() and (d / "libhipblaslt.dll").is_file() for d in dirs):
             # --no-deps: the HIP runtime is the AMD driver's (amdhip64_7.dll), not the SDK's core package
-            commands.append(f'"{sys.executable}" -m pip install --no-deps --index-url {ROCM_WIN_INDEX}{family}/ '
-                            f"rocm-sdk-libraries-{family.lower()}=={ROCM_WIN_VERSION}")
-    return commands
+            installs.append(["--no-deps", "--index-url", f"{ROCM_WIN_INDEX}{family}/",
+                             f"rocm-sdk-libraries-{family.lower()}=={ROCM_WIN_VERSION}"])
+    return installs
+
+
+def windows_libs(makers: set, gfx: set, yes: bool, install: bool) -> None:
+    """Windows: Intel's oneMKL, NVIDIA's cuBLAS, CUDA runtime and cuDNN, and AMD's rocBLAS and hipBLASLt for the AMD
+    GPUs' families (`gfx`), where the engine would not find them, installed with pip into the Python the 7z carries,
+    where the engine looks (add_library_dirs in src/prefill/gemm.cpp), when the user agrees; `install` false (--check)
+    only names them.  A new 7z's Python has none of them, so setup there asks again.  A failed install does not stop
+    setup: XeStrata's own kernels do the work."""
+    contrib = packaged_engine().get("license") == "contrib"
+
+    def amd_missing(args: list) -> Callable[[], list]:
+        return lambda: [x for x in windows_amd_libs(gfx) if x == args]
+    wanted: list[tuple[str, list, Callable[[], list]]] = []   # (what, pip's arguments, what is still missing after)
+    if "intel" in makers and contrib and (mkl := windows_intel_libs()):
+        wanted.append(("Intel's oneMKL for the matrix products (not free software)", ["--no-deps", *mkl],
+                       windows_intel_libs))
+    if "nvidia" in makers and contrib and (nv := windows_nvidia_libs()):
+        wanted.append(("NVIDIA's " + ", ".join(nv) + " (not free software: cuBLAS for the matrix products, cuDNN for "
+                       "the image engine's attention)", nv, windows_nvidia_libs))
+    if "amd" in makers:
+        for args in windows_amd_libs(gfx):
+            wanted.append(("AMD's rocBLAS and hipBLASLt for the matrix products", args, amd_missing(args)))
+    site = Path(sys.executable).parent / "Lib" / "site-packages"
+    writable = os.access(site, os.W_OK)
+    for what, args, missing in wanted:
+        warn(f"faster with {what}; without it XeStrata's own kernels do the work")
+        cmd = [sys.executable, "-m", "pip", "install", *args]
+        if install and not writable:
+            warn(f"the 7z's folder cannot be written ({site}), where the engine looks for it: unpack the 7z where you "
+                 "can write, or install it as a user who can:")
+        if not install or not writable or ask("  Install it now with pip, into the 7z's Python?", ["y", "n"], "y",
+                                              yes) != "y":
+            say("  " + subprocess.list2cmdline(cmd))
+            continue
+        if run(cmd, check=False).returncode != 0 or missing():
+            warn("the install did not complete (pip's lines above say why); XeStrata's own kernels do the work. "
+                 "To try again: " + subprocess.list2cmdline(cmd))
+        else:
+            ok(f"installed {what.split(' (')[0]}")
 
 
 def nvidia_libs_dir(data: Path) -> Path:
@@ -1790,30 +1831,15 @@ def linux_nvidia_libs(makers: set, data: Path, names: list) -> None:
         + " ".join(shlex.quote(n) for n in names))
 
 
-def check_runtime(makers: set, gfx: set, data: Path, yes: bool = False, explicit: bool = False) -> None:
+def check_runtime(makers: set, gfx: set, data: Path, yes: bool = False, explicit: bool = False,
+                  install: bool = True) -> None:
     """Stops when the GPUs of `makers` lack their makers' packages, and says how to install them; names oneMKL and
     cuBLAS too when they are missing, without stopping (XeStrata's own kernels do their work).  Windows: the GPU
     makers' drivers bring what the engine runs on (Level Zero, the CUDA driver), the 7z the rest, and the launcher
-    checks the Visual C++ runtime.  Intel's oneMKL, NVIDIA's cuBLAS, CUDA runtime and cuDNN, and AMD's rocBLAS and
-    hipBLASLt for the AMD GPUs' families (`gfx`, their gfx names), are named when the engine would not find them, with
-    pip's command for the Python the 7z carries."""
+    checks the Visual C++ runtime; the makers' math libraries (windows_libs) are installed with pip when the user
+    agrees (`install`: not with --check)."""
     if WIN:
-        mkl = windows_intel_libs() if "intel" in makers and packaged_engine().get("license") == "contrib" else []
-        if mkl:
-            warn("faster with Intel's oneMKL for the matrix products (not free software; without it XeStrata's own "
-                 "kernels do the work):")
-            say(f'  "{sys.executable}" -m pip install --no-deps ' + " ".join(f'"{n}"' for n in mkl))
-        missing = windows_nvidia_libs() if "nvidia" in makers and packaged_engine().get("license") == "contrib" else []
-        if missing:
-            warn("faster with NVIDIA's " + ", ".join(missing) + " (not free software: cuBLAS for the matrix products, "
-                 "cuDNN for the image engine's attention; without them XeStrata's own kernels do the work):")
-            say(f'  "{sys.executable}" -m pip install ' + " ".join(missing))
-        amd = windows_amd_libs(gfx) if "amd" in makers else []
-        if amd:
-            warn("faster with AMD's rocBLAS and hipBLASLt for the matrix products (without them XeStrata's own kernels "
-                 "do the work):")
-            for c in amd:
-                say("  " + c)
+        windows_libs(makers, gfx, yes, install)
         return
     check_igc(makers)
     check_level_zero(makers, yes, explicit)
@@ -6279,7 +6305,7 @@ def main() -> int:
     makers = {x["vendor"] for x in chosen} | {gpu_info(i)["vendor"] for i in sel[1:]}
     amd_gfx = {x.get("gfx") for x in [*chosen, *(gpu_info(i) for i in sel[1:])] if x["vendor"] == "amd"}
     if PACKAGED:                                       # the GPU makers' packages the package only suggests
-        check_runtime(makers, amd_gfx, data, a.yes, a.old_driver)
+        check_runtime(makers, amd_gfx, data, a.yes, a.old_driver, install=not a.check)
     elif not WIN and (majors := [v for t in cuda_toolkits() if (v := cuda_major(t))]):   # a contrib build: its CUDA
         linux_nvidia_libs(makers, data, nvidia_pip_names(max(majors)))
     if not WIN and (gpu["render"] is None or not os.access(gpu["render"], os.R_OK | os.W_OK)):
