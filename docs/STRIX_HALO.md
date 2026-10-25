@@ -1,19 +1,19 @@
-﻿# Strix Halo (Ryzen AI Max, gfx1151)
+# Strix Halo (Ryzen AI Max, gfx1151)
 
 This page is for people with a Ryzen AI Max "Strix Halo" PC (Radeon 8060S / 8050S, RDNA 3.5, `gfx1151`, one pool of LPDDR5X
 shared by the CPU and the GPU). Strata runs there through the same HIP backend as the Radeon cards in [AMD_HIP.md](AMD_HIP.md).
 **Status: experimental.**
 
 **DeepSeek V4.1-Flash runs here on Windows** (since 0.2.7): its own engine package is built for gfx1151 and the official IST-DAS
-1.75 / 2.00 / 2.25 bpw sets run through it. Measured on the 128 GB box (64 GB BIOS carve-out plus 64 GB seen by Windows) with 2.00 bpw and the default Faster mode: answers 14-16
-tokens/s on code, 10-11 on chat; a 4K prompt 78 tokens/s and an 8K prompt 109. The graphics chip and the CPU share the RAM, so the
+1.75 / 2.00 / 2.25 bpw sets run through it. Measured on the 128 GB box (64 GB BIOS carve-out plus 64 GB seen by Windows) with 2.00 bpw and the default Faster mode: answers 15-17
+tokens/s on code, 10-11 on chat; a 4K prompt 87 tokens/s, an 8K prompt 125 and a 32K prompt 177. The graphics chip and the CPU share the RAM, so the
 engine counts it once and reads the rest of the experts from the SSD. [DeepSeek on Strix Halo](#deepseek-v41-flash) has the details,
 the driver it needs and the limits.
 
-> **On this page:** [Quick start](#quick-start) Â· [DeepSeek](#deepseek-v41-flash) Â· [What the engine does differently](#what-the-engine-does-differently) Â·
-> [1. Toolchain](#1-the-toolchain-no-root-needed) Â· [2. Engine](#2-the-engine) Â· [3. Tuning table](#3-the-prompt-table-and-running) Â·
-> [4. Defaults](#4-what-is-on-by-default-on-gfx1151) Â· [5. Opt-in](#5-what-is-not-on-by-default-it-changes-bits) Â·
-> [5b. Desktop and RAM](#5b-the-desktop-the-ram-and-a-discrete-card-beside-the-strix-halo-linux) Â· [6. Measured](#6-measured) Â·
+> **On this page:** [Quick start](#quick-start) · [DeepSeek](#deepseek-v41-flash) · [What the engine does differently](#what-the-engine-does-differently) ·
+> [1. Toolchain](#1-the-toolchain-no-root-needed) · [2. Engine](#2-the-engine) · [3. Tuning table](#3-the-prompt-table-and-running) ·
+> [4. Defaults](#4-what-is-on-by-default-on-gfx1151) · [5. Opt-in](#5-what-is-not-on-by-default-it-changes-bits) ·
+> [5b. Desktop and RAM](#5b-the-desktop-the-ram-and-a-discrete-card-beside-the-strix-halo-linux) · [6. Measured](#6-measured) ·
 > [History](#history--older-measurements)
 
 ## Quick start
@@ -49,11 +49,17 @@ Measured on the maintainers' box (Ryzen AI Max+ 395, 128 GB unified, Windows 11,
 
 | Workload | Result |
 | --- | --- |
-| Code answer | 14-16 tokens/s |
+| Code answer | 15-17 tokens/s |
 | Chat answer | 10-11 tokens/s |
-| 4K prompt | about 78 tokens/s |
-| 8K prompt | about 109 tokens/s |
+| 4K prompt | about 87 tokens/s |
+| 8K prompt | about 125 tokens/s |
+| 32K prompt | about 177 tokens/s |
 | Stability | 100-request, 1-hour (243 requests) and 8-hour 32K (646 requests) soaks passed on the engine line this package is built from |
+
+Prompts are read in 8,192-token chunks: setup writes `--prefill-chunk 8192` on this PC (STRATA_DSV41_NO_BIG_CHUNK=1 leaves the
+engine's 1,024-token default). Measured 2026-10-25: 4K 78.7 → 87.2, 8K 108.9 → 125.1, 32K 155.2 → 176.9 tok/s; decode unchanged
+(16.53 → 16.59), because the chunk buffers take ~5 GB from the GPU expert tier and the RAM store's hit rate rises to compensate. The
+chunk's summation order changes, not the model (the repo's chunk-size KL check: 1024 0.1705, 2048 0.1692, 4096 0.1688, 8192 0.1695).
 
 How it uses the memory: the GPU's expert tier and the RAM store are the same memory, so the engine keeps a store of about 22-23 GB,
 sized after the weights are on the GPU, and reads the other experts from the model files when a word needs them. It does not copy the
