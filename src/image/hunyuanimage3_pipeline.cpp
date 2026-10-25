@@ -110,7 +110,7 @@ void HunyuanImage3Pipeline::ensure_open() {
         around_.reset();
         throw std::runtime_error(err);
     }
-    if (!vae_->open(vae_path_, s_, err, false, edits())) {
+    if (!vae_->open(vae_path_, s_, err, false)) {   // the encoder comes with an edit's first reference (ensure_vision)
         dit_.reset();
         vae_.reset();
         around_.reset();
@@ -182,6 +182,7 @@ void HunyuanImage3Pipeline::ensure_vision() {
     auto v = std::make_unique<HunyuanImage3Vision>();
     if (!v->open(vision_path_, dit_path_, s_, err)) throw std::runtime_error("image engine: " + err);
     vision_ = std::move(v);
+    if (!vae_->open_encoder(vae_path_, err)) throw std::runtime_error("image engine: " + err);
 }
 
 // The reference images' rows, in the sequence's constant part: for each reference block, the image's VAE copy
@@ -198,41 +199,45 @@ void HunyuanImage3Pipeline::reference_rows(const QiRequest& r, const std::vector
         const QiRef& f = r.refs[k];
         const int64_t H = b.vae_h * kDownsample, W = b.vae_w * kDownsample;
         const std::vector<float> img = hunyuanimage3_vae_copy(f, W, H);
-        float *d_img = nullptr, *d_z = nullptr;
-        if (!gpu::alloc_device(&d_img, img.size() * sizeof(float)) ||
-            !gpu::alloc_device(&d_z, (size_t) (kLatentChannels * b.vae_n) * sizeof(float))) {
-            if (d_img != nullptr) gpu::free(d_img);
-            if (d_z != nullptr) gpu::free(d_z);
-            throw std::runtime_error(std::string("image engine: GPU memory for a reference image: ") +
-                                     gpu::last_error());
-        }
         // the posterior sampled as the reference's generator does, with noise of the seed's own: each reference its
         // stream, apart from the target's (Mage-Flow's references take the same)
         std::vector<float> z((size_t) (kLatentChannels * b.vae_n));
-        float* d_eps = nullptr;
-        if (!gpu::alloc_device(&d_eps, z.size() * sizeof(float))) {
-            gpu::free(d_img);
-            gpu::free(d_z);
-            throw std::runtime_error(std::string("image engine: GPU memory for a reference image: ") +
-                                     gpu::last_error());
+        const auto n = philox_randn(r.seed ^ (0x9E3779B97F4A7C15ull * (k + 1)), (uint64_t) z.size());
+        // the resident banks give way to the encode where it does not fit beside them (size_plan made sure the
+        // card has room for it)
+        const uint64_t have = held();
+        if (refs_encode_bytes(blocks, r.refs.size()) > (budget() > have ? budget() - have : 0) &&
+            dit_->bank_vram() > dit_->bank_min()) {
+            dit_->set_bank_budget(dit_->bank_min());
+            banks_set_ = dit_->bank_min();
         }
-        try {
-            gpu::copy(d_img, img.data(), img.size() * sizeof(float));
-            const auto n = philox_randn(r.seed ^ (0x9E3779B97F4A7C15ull * (k + 1)), (uint64_t) z.size());
-            gpu::copy(d_eps, n.data(), n.size() * sizeof(float));
-            vae_->encode(d_img, H, W, d_z, d_eps);
-            gpu::copy(z.data(), d_z, z.size() * sizeof(float));
-        } catch (...) {
+        {
+            float *d_img = nullptr, *d_z = nullptr, *d_eps = nullptr;
+            if (!gpu::alloc_device(&d_img, img.size() * sizeof(float)) ||
+                !gpu::alloc_device(&d_z, z.size() * sizeof(float)) ||
+                !gpu::alloc_device(&d_eps, z.size() * sizeof(float))) {
+                if (d_img != nullptr) gpu::free(d_img);
+                if (d_z != nullptr) gpu::free(d_z);
+                throw std::runtime_error(std::string("image engine: GPU memory for a reference image: ") +
+                                         gpu::last_error());
+            }
+            try {
+                gpu::copy(d_img, img.data(), img.size() * sizeof(float));
+                gpu::copy(d_eps, n.data(), n.size() * sizeof(float));
+                vae_->encode(d_img, H, W, d_z, d_eps);
+                gpu::copy(z.data(), d_z, z.size() * sizeof(float));
+            } catch (...) {
+                gpu::free(d_img);
+                gpu::free(d_z);
+                gpu::free(d_eps);
+                vae_->drop_scratch();
+                throw;
+            }
             gpu::free(d_img);
             gpu::free(d_z);
             gpu::free(d_eps);
             vae_->drop_scratch();
-            throw;
         }
-        gpu::free(d_img);
-        gpu::free(d_z);
-        gpu::free(d_eps);
-        vae_->drop_scratch();
         if (!around_->set_grid(b.vae_h, b.vae_w, err) ||
             !around_->patch_embed(z.data(), b.vae_h, b.vae_w, 0.0f, hid + b.vae_start * hidden, err))
             throw std::runtime_error("image engine: a reference image's entry: " + err);
@@ -358,27 +363,35 @@ QiNeed HunyuanImage3Pipeline::need(int64_t n_text, int64_t width, int64_t height
     if (th <= 0 || tw <= 0 || n_text < th * tw + 1) {
         throw std::invalid_argument("image engine: the ids do not hold the image block and some text");
     }
-    uint64_t fixed = dit_size_->dense_bytes() + vae_size_->weight_bytes() + around_size_->weight_bytes();
+    // the VAE's decoder alone for a picture; its encoder (and the vision model) with an edit
+    uint64_t fixed = dit_size_->dense_bytes() + vae_size_->weight_bytes() - vae_size_->encoder_bytes() +
+                     around_size_->weight_bytes();
     const uint64_t act = dit_size_->activation_bytes(n_text) + around_size_->scratch_bytes(th, tw);
+    // the VAE's decode (and an edit's encode) in the reference's tiles where the whole does not fit: the least is
+    // the tiled one's, the full the whole one's
+    const uint64_t vae_tiled = vae_size_->tiled_scratch_bytes();
     uint64_t vae = vae_size_->scratch_bytes(th, tw);
+    uint64_t vae_least = std::min(vae, vae_tiled);
     if (!refs.empty() && vision_size_) {
         // an edit: the vision model stays with the weights; each reference's encoding (the VAE encoder's buffers
         // at the bucket nearest its shape, SigLIP2's) comes and goes before the walk, so it counts as the decode
         // does - the larger of the two workers
-        fixed += vision_size_->weight_bytes();
+        fixed += vision_size_->weight_bytes() + vae_size_->encoder_bytes();
         const std::vector<HunyuanImage3Bucket> table = hunyuanimage3_buckets(1024);
         for (const auto& wh : refs) {
             const HunyuanImage3Bucket& b = hunyuanimage3_nearest_bucket(table, std::max<int64_t>(wh.first, 1),
                                                                         std::max<int64_t>(wh.second, 1));
-            vae = std::max(vae, vae_size_->encode_scratch_bytes(b.height, b.width) +
-                                    around_size_->scratch_bytes(b.height / kDownsample, b.width / kDownsample) +
-                                    vision_size_->scratch_bytes());
+            const uint64_t ref = around_size_->scratch_bytes(b.height / kDownsample, b.width / kDownsample) +
+                                 vision_size_->scratch_bytes();
+            const uint64_t enc = vae_size_->encode_scratch_bytes(b.height, b.width);
+            vae = std::max(vae, enc + ref);
+            vae_least = std::max(vae_least, enc + ref);   // the encode is never tiled (hunyuanimage3_vae.hpp)
         }
     }
     QiNeed n;
     // least: every bank streamed (two slots of the largest), the DiT's sequence buffers and the VAE's taken in
     // turn - the decode runs after the walk gives them back.  full: every bank resident as well, both buffers kept.
-    n.least = fixed + dit_size_->bank_min() + std::max(act, vae);
+    n.least = fixed + dit_size_->bank_min() + std::max(act, vae_least);
     n.full = fixed + dit_size_->bank_bytes() + act + vae;
     n.held = held();
     size_t free = 0, total = 0;
@@ -391,10 +404,40 @@ QiNeed HunyuanImage3Pipeline::need(int64_t n_text, int64_t width, int64_t height
 }
 
 QiPlan HunyuanImage3Pipeline::plan(int64_t T, int64_t th, int64_t tw) {
+    QiPlan p = size_plan(T, th, tw, vision_ != nullptr, 0);
+    p.resident_blocks = 0;   // this model's streamed units are its layers' banks
+    p.layers = dit_->bank_bytes();
+    p.resident_layers = 0;   // set when the budget is applied
+    p.streamed = 0;          // as above: the bytes a pass reads for the banks that are not resident
+    if (p.blocks != banks_set_) {
+        dit_->set_bank_budget(p.blocks);
+        banks_set_ = p.blocks;
+    }
+    p.resident_layers = dit_->resident_banks();
+    // the banks past the resident prefix, by their sizes: bank_vram() counts a resident bank only once it is
+    // loaded, which the walk does, not this plan
+    for (int64_t l = p.resident_layers; l < dit_->layers(); ++l) p.streamed += dit_->bank_bytes(l);
+    return p;
+}
+
+uint64_t HunyuanImage3Pipeline::refs_encode_bytes(const std::vector<HunyuanImage3Block>& blocks, size_t n) const {
+    uint64_t b = 0;
+    for (size_t k = 0; k < n; ++k) {
+        const int64_t H = blocks[k].vae_h * kDownsample, W = blocks[k].vae_w * kDownsample;
+        b = std::max(b, vae_size_->encode_scratch_bytes(H, W) +
+                            (uint64_t) (3 * H * W + 2 * kLatentChannels * blocks[k].vae_n) * sizeof(float));
+    }
+    return b;
+}
+
+QiPlan HunyuanImage3Pipeline::size_plan(int64_t T, int64_t th, int64_t tw, bool refs, uint64_t encode) const {
     QiPlan p;
     p.budget = budget_ > 0 ? budget_ : auto_budget_;
+    const HunyuanImage3Vision* vision = vision_ ? vision_.get() : vision_size_.get();
+    // the VAE's encoder and the vision model are an edit's: put on the card with its first reference image
     p.fixed = dit_->dense_bytes() + vae_->weight_bytes() + around_->weight_bytes() +
-              (vision_ ? vision_->weight_bytes() : 0);
+              (refs && vision != nullptr ? vision->weight_bytes() : 0) +
+              (refs && !vae_->has_encoder() ? vae_size_->encoder_bytes() : 0);
     if (p.budget <= p.fixed)
         throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
                                  " MiB) is below the weights that always stay (" +
@@ -405,25 +448,17 @@ QiPlan HunyuanImage3Pipeline::plan(int64_t T, int64_t th, int64_t tw) {
     p.activations = T > 0 ? dit_->activation_bytes(T) : 0;
     p.activations += around_->scratch_bytes(th, tw);   // the entry and the exit's grid, alive over the same walk
     p.vae = th > 0 ? vae_->scratch_bytes(th, tw) : 0;
-    const uint64_t work = std::max(p.activations, p.vae);
-    if (avail < work + dit_->bank_min())
+    // the decode in the reference's tiles where the whole one does not fit beside the slots
+    p.vae_tiled = th > 0 && p.vae + dit_->bank_min() > avail;
+    const uint64_t work = std::max(p.activations, p.vae_tiled ? std::min(p.vae, vae_->tiled_scratch_bytes()) : p.vae);
+    // an edit's reference images are encoded before the walk, beside the two slots (the banks give back the rest):
+    // the larger of the two
+    const uint64_t least = std::max(work, encode) + dit_->bank_min();
+    if (avail < least)
         throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
-                                 " MiB) is too small for this image: its walk needs " +
-                                 std::to_string((work + dit_->bank_min()) >> 20) + " MiB beside the weights");
+                                 " MiB) is too small for this image: its walk needs " + std::to_string(least >> 20) +
+                                 " MiB beside the weights");
     p.blocks = clampu(avail - work, dit_->bank_min(), dit_->bank_bytes());
-    p.resident_blocks = 0;   // this model's streamed units are its layers' banks
-    p.layers = dit_->bank_bytes();
-    p.resident_layers = 0;   // set when the budget is applied
-    p.streamed = 0;          // as above: the bytes a pass reads for the banks that are not resident
-    p.vae_tiled = false;     // the DCAE VAE is not tiled: its group norms take the whole image
-    if (p.blocks != banks_set_) {
-        dit_->set_bank_budget(p.blocks);
-        banks_set_ = p.blocks;
-    }
-    p.resident_layers = dit_->resident_banks();
-    // the banks past the resident prefix, by their sizes: bank_vram() counts a resident bank only once it is
-    // loaded, which the walk does, not this plan
-    for (int64_t l = p.resident_layers; l < dit_->layers(); ++l) p.streamed += dit_->bank_bytes(l);
     return p;
 }
 
@@ -482,6 +517,7 @@ int HunyuanImage3Pipeline::choose_ratio(const QiRequest& r, double* seconds) {
     if (!reference_grids(r, blocks, err) || !hunyuanimage3_positions_of(T, blocks, y, x, key_lim, err))
         throw std::invalid_argument(err);
     ensure_open();
+    size_plan(T, 0, 0, !blocks.empty(), refs_encode_bytes(blocks, blocks.size()));   // refused before the refs' reading
     const int64_t hidden = dit_->dims().hidden;
     std::vector<float> hid((size_t) (T * hidden));
     bool cached = false;
@@ -538,6 +574,8 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
     // reference re-gathers them per step (`hidden_in_host`), which is why the two paths agree at one step and only
     // there when this copy is missed.  The references are encoded before the plan takes the card for the banks.
     if (stage) stage(r.refs.empty() ? "text" : "refs");
+    size_plan(T, r.height / kDownsample, r.width / kDownsample, !r.refs.empty(),
+              refs_encode_bytes(blocks, r.refs.size()));   // refused before the reference images' reading
     std::vector<float> hid((size_t) (T * hidden));
     bool cached = false;
     text_rows(r, ids, start, blocks, hidden, hid.data(), cached);
@@ -616,21 +654,29 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
         // QiPipeline frees the blocks and the encoder's layers the VAE lacks room beside).
         dit_->drop_sequence();
         around_->drop_grid();   // the entry and the exit's buffers too: the decode is the bigger worker
-        uint64_t vae_room = 0;
         const uint64_t vae_need = vae_->scratch_bytes(th, tw);
-        if (vae_need <= p.budget - p.fixed)
-            vae_room = p.budget - p.fixed - std::min(p.budget - p.fixed, dit_->bank_vram());
-        if (vae_need > vae_room && dit_->bank_vram() > dit_->bank_min()) {
-            dit_->set_bank_budget(dit_->bank_min());   // every resident bank gives way to the decode
+        auto room = [&] {
+            const uint64_t used = p.fixed + dit_->bank_vram();
+            return p.budget > used ? p.budget - used : 0;
+        };
+        uint64_t vae_room = room();
+        // the resident banks give way to a whole decode that then fits; one that cannot fit anyway goes in tiles
+        // and leaves them
+        if (vae_need > vae_room && vae_need + dit_->bank_min() <= p.budget - p.fixed &&
+            dit_->bank_vram() > dit_->bank_min()) {
+            dit_->set_bank_budget(dit_->bank_min());
             banks_set_ = dit_->bank_min();
-            vae_room = p.budget > p.fixed + dit_->bank_vram() ? p.budget - p.fixed - dit_->bank_vram() : 0;
+            vae_room = room();
         }
-        if (vae_need > vae_room)
+        // the whole decode where it fits, else the reference's tiles
+        const bool tiled = vae_need > vae_room;
+        if (tiled && vae_->tiled_scratch_bytes() > vae_room)
             throw std::runtime_error("image engine: the VAE's decode of a " + std::to_string(r.width) + " x " +
                                      std::to_string(r.height) + " image needs " +
-                                     std::to_string(vae_need >> 20) + " MiB beside the weights and the streamed "
-                                     "slots, and the budget leaves " + std::to_string(vae_room >> 20) +
-                                     " (the VAE's tiled decode is not built)");
+                                     std::to_string(vae_->tiled_scratch_bytes() >> 20) +
+                                     " MiB in tiles beside the weights and the streamed slots, and the budget leaves " +
+                                     std::to_string(vae_room >> 20));
+        p.vae_tiled = tiled;
         if (stage) stage("decode");
         const auto t2 = clock::now();
         const int64_t HW = r.width * r.height;
@@ -641,7 +687,8 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
             throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
         }
         gpu::copy(dz, lat.data(), (size_t) n_lat * sizeof(float));
-        vae_->decode(dz, th, tw, drgb);
+        if (tiled) vae_->decode_tiled(dz, th, tw, drgb);
+        else vae_->decode(dz, th, tw, drgb);
         std::vector<float> rgb((size_t) (3 * HW));
         gpu::copy(rgb.data(), drgb, rgb.size() * sizeof(float));
         gpu::free(dz);

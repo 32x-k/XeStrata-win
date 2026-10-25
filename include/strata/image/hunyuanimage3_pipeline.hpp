@@ -122,6 +122,13 @@ public:
 private:
     /// How the budget is split for a `T`-token sequence at a `th` x `tw` latent grid.
     QiPlan plan(int64_t T, int64_t th, int64_t tw);
+    /// plan's sizes alone, nothing applied: throws when the least the image takes (the weights that always stay -
+    /// the vision model's and the VAE encoder's with `refs` - the two slots, the sequence's buffers, the VAE's in
+    /// tiles where the whole does not fit, or `encode`, the largest reference's encode) is over the budget.  A
+    /// request asks it before it reads its reference images.
+    QiPlan size_plan(int64_t T, int64_t th, int64_t tw, bool refs, uint64_t encode) const;
+    /// The GPU memory the largest of the first `n` blocks' reference encodes works in (their grids set).
+    uint64_t refs_encode_bytes(const std::vector<HunyuanImage3Block>& blocks, size_t n) const;
     void ensure_open();
     /// The request's sequence: trimmed, its image blocks read (the reference images' grids from the buckets the ids
     /// name and the images' naflex sizes, the generated block's from the size), positioned, with the attention's
