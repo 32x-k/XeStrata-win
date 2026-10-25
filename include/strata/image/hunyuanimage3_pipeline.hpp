@@ -21,9 +21,8 @@
 // 4096-wide products over one row each).  `patch_embed` and `final_layer` are the card's (HunyuanImage3EntryExit):
 // measured on the B70, the host's FP32 convolutions were 30 s of a 33 s step, the layers and the VAE the rest, and
 // the card does them in 0.07 s.  `STRATA_HUNYUANIMAGE3_HOST_ENDS=patch|final|both` puts the host FP32 pieces back
-// for a check: on the B70 with the golden's latent start and 8 steps the picture held PSNR 30.07 dB (both on the
-// card) against 35.78 (both on the host), 34.25 (the exit on the card) and 37.14 (the entry on the card) - the
-// card's FP16 activations are ~2.1e-4 of the entry's rows, which the decoder amplifies.
+// for a check (the card's products take each operand as two FP16 halves, about 2e-6 of the host's: with the
+// golden's latent start and 8 steps the B70's picture holds PSNR 35.67 dB, the host's 35.78).
 //
 // An edit (reference images) is the model's own: each reference stands in the sequence before the prompt as the
 // reference's `cond_joint_image` - `<boi> <img_size_N> <img_ratio_i> <timestep> <img> * (its VAE grid)
